@@ -2444,6 +2444,10 @@ pub async fn run(
                 || PANEL_MUTE.load(std::sync::atomic::Ordering::Relaxed)
                 || voice.crashed();
             feed_surface_wind();
+            // The oxygen valve follows the oxygen master (crew hands only).
+            if crate::mode::crew_actuates() {
+                let _ = crate::tools::cabin_air::sync_valve(&xp).await;
+            }
             // Cabin crew watches (crew-side, airframes with a cabin crew
             // only): the owed "cabin secure" report after an acknowledged
             // prepare call, and the seatbelt-sign interphone call. The

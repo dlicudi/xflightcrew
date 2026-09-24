@@ -1175,14 +1175,19 @@ impl Station {
         )
     }
 
-    /// Remember the runway an ARRIVAL names for itself, for the pick this
-    /// call is about to make (see `pick_runway_with`). Arrival calls only: a
-    /// departure is told its runway, it does not choose one.
+    /// Remember the runway a call names for itself, for the pick this call is
+    /// about to make (see `pick_runway_with`): an arrival's, and a departure's
+    /// asked for AT THE TAXI REQUEST ("request taxi, runway two six"), where a
+    /// pilot with a planned departure asks for it. The ready-for-departure
+    /// call is told its runway. LOWI (2026-09-24): calm, the pick could have
+    /// been 08, and the planned MOGT3H exists only from 26. The wind still
+    /// wins when it really favours the other end.
     fn note_stated_runway(&mut self, transcript: &str, intent: tower::Intent) {
         self.stated_runway = match intent {
             tower::Intent::ReportFinal
             | tower::Intent::ReportDownwind
             | tower::Intent::ReportBase
+            | tower::Intent::RequestTaxi
             | tower::Intent::RequestLanding { .. } => tower::stated_runway(transcript),
             _ => None,
         };
@@ -8095,10 +8100,22 @@ mod tests {
         let mut st = Station::load(lxgb_apt_file().to_str().unwrap(), "LXGB").expect("LXGB loads");
         st.note_stated_runway("final runway two seven", tower::Intent::ReportFinal);
         assert_eq!(st.pick_runway(90.0, 12.0), "09");
-        // A departure does not choose its runway.
+        // A departure ready to go does not choose its runway...
         let mut st = Station::load(lxgb_apt_file().to_str().unwrap(), "LXGB").expect("LXGB loads");
         st.note_stated_runway("ready for departure runway two seven", tower::Intent::RequestTakeoff);
         assert_eq!(st.stated_runway, None);
+        // ...but asks for one at the taxi request, honoured when the wind
+        // does not argue (LOWI, calm, MOGT3H only from 26).
+        assert_eq!(
+            tower::parse_intent("november two five one charlie victor, request taxi, runway two six"),
+            tower::Intent::RequestTaxi
+        );
+        let mut st = Station::load(lxgb_apt_file().to_str().unwrap(), "LXGB").expect("LXGB loads");
+        st.note_stated_runway("request taxi, runway two seven", tower::Intent::RequestTaxi);
+        assert_eq!(st.pick_runway(0.0, 2.0), "27");
+        let mut st = Station::load(lxgb_apt_file().to_str().unwrap(), "LXGB").expect("LXGB loads");
+        st.note_stated_runway("request taxi, runway two seven", tower::Intent::RequestTaxi);
+        assert_eq!(st.pick_runway(90.0, 12.0), "09", "a real headwind on the other end wins");
         // And once an arrival is on a runway the pick is frozen, through the
         // go-around's Inbound, whatever the wind does.
         let mut st = Station::load(lxgb_apt_file().to_str().unwrap(), "LXGB").expect("LXGB loads");

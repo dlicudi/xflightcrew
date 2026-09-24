@@ -5926,3 +5926,53 @@ the plan's cruise against the ceiling.
 - **Stands**: the lead-in's back point is only taken when the turn onto the
   stand line is 90 degrees or less (LOWI circled on a reversal), and parked
   for securing is within 35 m whatever the heading.
+
+## 2026-09-24: LOWI-LSZS, making the copilot able to fly into the mountains
+
+The SimBrief plan LOWI 26 MOGT3H to LSZS 03 exposed three gaps. The follower
+flew SID fixes as plain waypoints at cruise speed: MOGT3H's 7,850 ft at
+WI506 (8.3 nm from the departure end, 714 ft/nm) would have been crossed
+about 2,200 ft low at the 375 ft/nm the SF50 made climbing at 190 kt. In calm
+air the tower could have picked 08, which the SID does not serve. And LSZS's
+only approaches end at a missed approach point two miles short, so the
+arrival fell back to a visual autoland into the Engadin valley (sectors
+15,500/13,500 ft). Now: SID minimums from the CIFP (plus a gradient gate at
+the arm and a crossing watch that warns and hands over); the SID's runway
+asked for at the taxi request; `earth_msa.dat` defines a mountain field, which
+is an approach or a hand-over; MAP approaches flown from their transition
+(PELAD 16,000, ZS700 13,000, ZS716, ZS701 12,400, ZS702 11,800) to the MAP on
+the published 4.49 degree path, and landed from the MAP at 4.4 degrees to the
+aim point by an autoland whose glidepath is now per approach; a go-around
+there flies the published missed approach (ZS706, RONAG 14,000). Also fixed
+on the way: CIFP turn direction read from field 9, not 12. Unflown: the
+SF50's best climb (2,000 fpm, profile VERIFY) behind the gradient gate, and a
+4.4 degree SF50 flare.
+
+## 2026-09-24: the SF50's takeoff swing was our own rudder
+
+LOWI 26, both SF50 takeoffs of the day: the heading error built to the right
+as the power came up, 18 degrees with the steering pinned at -0.55 and the
+aircraft 60 m right of the centreline by 60 kt, on a 45 m runway. The roll
+law's power lead (`power_lead`, up to 0.25 of right rudder with the
+throttle) exists for a propeller's left-turning tendency; the SF50 has no
+propeller, so the copilot was flying the swing itself. A jet (profile
+`reference.kind` containing "jet") now takes no power lead
+(`RollSteer::for_airframe`). The brake steering added earlier the same day
+did its job below 20 kt (-13 degrees to 0 by 10 kt).
+
+## 2026-09-24: the first LOWI-LSZS departure, handed back at 3,000 ft
+
+The new minimum watch fired one second after the takeoff handed over at
+1,000 ft: its climb-rate estimate started at ZERO, so it predicted arriving at
+WI505 (4,000, 1.3 nm) at the present 2,990 ft and handed the aircraft back
+("Unable 4,000 at WI505 ... Your aircraft"), full auto gave up, and the pilot
+was left in the valley with the altitude dial at 3,000. The resume refusal
+then advised "steer 343 for WI506" from below the ridges, and the next
+samples show 971 ft above the ground in 28 degrees of bank. Also: the
+takeoff's climb-out was capped at the enroute 1,500 fpm, 750 ft a mile
+against WI505's 816. Now: the rate is seeded from the first real sample and
+judged only after ten; a predicted miss while climbing is SAID and flown on at
+best rate (only an aircraft not climbing is handed back); the takeoff climbs
+at the best rate holding its initial climb speed while SID minimums are ahead
+(`autotakeoff::DEPARTURE_MINIMUMS`); and a rejoin refusal below either field's
+sector altitude says "climb first" before any heading.

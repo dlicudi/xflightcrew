@@ -503,12 +503,32 @@ impl FullAuto {
             &fp.destination,
             fp.cruise_alt_ft,
         );
+        // Below the sector altitude of either field, a rejoin heading is
+        // never advice on its own: "steer 343 for WI506" from 3,000 ft west
+        // of Innsbruck pointed across the ridges, and the next thing the log
+        // shows is 971 ft above the ground in 28 degrees of bank (LOWI,
+        // 2026-09-24). Climb first, then the heading.
+        let msa_path = std::path::Path::new(&ctx.config.fix_data_path)
+            .with_file_name("earth_msa.dat")
+            .to_string_lossy()
+            .into_owned();
+        let low_msa = [&fp.origin, &fp.destination].into_iter().find_map(|icao| {
+            let msa = crate::nav::airport_msa_ft(&msa_path, icao)?;
+            (altitude < msa).then_some(msa)
+        });
         let index = crate::interaction::rejoin_index(
             &legs,
             lat,
             lon,
             mag_var.ok().filter(|v| v.is_finite()),
-        )?;
+        )
+        .map_err(|why| match low_msa {
+            Some(msa) => format!(
+                "Climb to {} first, the sector altitude, before turning. {why}",
+                crate::flightplan::spoken_feet(msa)
+            ),
+            None => why,
+        })?;
         legs.drain(..index);
         let first = legs.first().unwrap();
         let fix = first.fix.as_ref().unwrap();
@@ -596,6 +616,8 @@ impl FullAuto {
             Mission::Resume(Route {
                 dest_icao: fp.destination.clone(),
                 dest_name: fp.destination,
+                climb_minimums: Vec::new(),
+                departure_rwy: None,
                 legs,
                 fms_payload: payload,
                 local_runway: None,
@@ -752,6 +774,61 @@ impl FullAuto {
             ));
         }
 
+        // The planned SID's minimum altitudes, where its fixes are on this
+        // route (SimBrief flies the SID as plain waypoints with its own
+        // predicted altitudes; the chart's minimums are what keep a climb out
+        // of the rocks).
+        let climb_minimums: Vec<crate::nav::ClimbMinimum> =
+            match (&fp.procedures.sid, &fp.procedures.origin_rwy) {
+                (Some(sid), Some(rwy)) => {
+                    crate::nav::sid_minimums(&ctx.config.cifp_dir, &fp.origin, sid, rwy)
+                        .into_iter()
+                        .filter(|m| legs.iter().any(|l| l.fix_ident.eq_ignore_ascii_case(&m.fix)))
+                        .collect()
+                }
+                _ => Vec::new(),
+            };
+        // The gradient each minimum needs from the runway's departure end,
+        // against the climb at Vy: refused when it cannot be made, said when
+        // it is tight, briefed either way.
+        let departure_line = match (&fp.procedures.sid, &fp.procedures.origin_rwy, &origin_apt) {
+            (Some(sid), Some(rwy), Some(apt)) if !climb_minimums.is_empty() => {
+                let der = apt.runways.iter().find_map(|r| {
+                    if r.ident_a.eq_ignore_ascii_case(rwy) {
+                        Some((r.lat_b, r.lon_b))
+                    } else if r.ident_b.eq_ignore_ascii_case(rwy) {
+                        Some((r.lat_a, r.lon_a))
+                    } else {
+                        None
+                    }
+                });
+                match der {
+                    Some(der) => {
+                        let checks = crate::full_auto::departure_gradients(
+                            der,
+                            apt.elev_ft,
+                            &legs,
+                            &climb_minimums,
+                            self.vy_kts,
+                            crate::procedure::best_climb_fpm(),
+                        );
+                        crate::full_auto::event(
+                            "departure_gradient",
+                            json!({ "checks": checks.iter().map(|c| json!({"fix": c.fix, "min_ft": c.min_ft,
+                                "dist_nm": c.dist_nm, "need": c.need_ft_per_nm, "have": c.have_ft_per_nm})).collect::<Vec<_>>() }),
+                        );
+                        crate::full_auto::gradient_verdict(sid, &checks)?
+                    }
+                    None => None,
+                }
+            }
+            _ => None,
+        };
+        crate::full_auto::event(
+            "sid_minimums",
+            json!({ "sid": fp.procedures.sid, "runway": fp.procedures.origin_rwy,
+                    "minimums": climb_minimums.iter().map(|m| (m.fix.clone(), m.min_ft)).collect::<Vec<_>>() }),
+        );
         let dest_name = dest_apt
             .as_ref()
             .map(|a| a.name.trim().to_string())
@@ -853,6 +930,10 @@ impl FullAuto {
         // pilot who says "fly the flight plan" knows what happens next, and
         // the arrival line already names the destination (EGSS-LFPG,
         // 2026-09-22, a paragraph the panel ran out of room for).
+        let preflight = match &departure_line {
+            Some(l) => format!("{preflight}{l} "),
+            None => preflight,
+        };
         let ack = format!(
             "Full auto, {} to {}. {}Cruise {}, {} enroute {}. {} Cancel or my controls any time.",
             fp.origin,
@@ -867,6 +948,8 @@ impl FullAuto {
             Mission::Flight(Route {
                 dest_icao: fp.destination.clone(),
                 dest_name,
+                departure_rwy: fp.procedures.sid.as_ref().and(fp.procedures.origin_rwy.clone()),
+                climb_minimums,
                 legs,
                 fms_payload,
                 local_runway,

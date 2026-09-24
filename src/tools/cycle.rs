@@ -1080,13 +1080,16 @@ impl Tool for StopTurbines {
         let secured = !self.start.shutdown_commands.is_empty();
         for cmd in &self.start.shutdown_commands {
             let _ = ctx.xplane.run_command(cmd).await;
+            // A sequence (knob, then button) is read one step at a time by
+            // the aircraft's script: a beat between them.
+            tokio::time::sleep(Duration::from_millis(400)).await;
         }
         let done = if secured {
             "Roger — fuel cutoff and the ignition off. Engines shut down and secured."
         } else {
             "Roger — condition levers to fuel cutoff. Engines shut down."
         };
-        for _ in 0..6 {
+        for _ in 0..20 {
             tokio::time::sleep(Duration::from_millis(600)).await;
             // EVERY engine must be down before "shut down" is spoken —
             // element 0 alone can read stopped with the other still turning.
@@ -1101,7 +1104,12 @@ impl Tool for StopTurbines {
                 return Ok(done.to_string());
             }
         }
-        Ok("Condition levers to cutoff, engines winding down.".to_string())
+        // Still running after twelve seconds: said as it is, never "winding
+        // down" (the SF50's script rewrites the cutoff lever and the engine
+        // ran on while the tool claimed success, LSZS 2026-09-24).
+        Ok("The engine is still running; the shutdown didn't take. Check the ignition \
+            and the start/stop control."
+            .to_string())
     }
 }
 

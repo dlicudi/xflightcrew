@@ -33,6 +33,7 @@ use crate::aircraft::AircraftProfile;
 /// its airframe, and a selector that is only set when present is the bug.
 pub(crate) fn publish_airframe(p: &AircraftProfile) {
     crate::aircraft::publish_live_profile(p);
+    crate::autotakeoff::DEPARTURE_MINIMUMS.store(false, std::sync::atomic::Ordering::SeqCst);
     crate::tools::cabin_air::publish(p.cabin_air.clone());
     crate::tools::radio::publish_mode_knob(p.transponder_mode_knob.clone());
     crate::takeoff_config::publish(p.takeoff_config.clone());

@@ -4116,6 +4116,7 @@ mod tests {
         crate::simbrief::FlightPlan {
             transition_altitude_ft: None,
             transition_level_ft: None,
+            procedures: Default::default(),
             source: crate::simbrief::PlanSource::SimBrief,
             origin: origin.into(),
             destination: dest.into(),
@@ -4662,12 +4663,17 @@ mod tests {
         // release (the Citation X's starter is the opposite case).
         assert!(!s.starter_held, "the SF50's controls are momentary presses");
         assert!(s.start_dn.is_empty());
-        // Securing the aircraft is the KNOB, not the mixture: `ignition_down`
-        // is what drops the boost pump and igniter and fires the sim's own
-        // shutdown. Cutting fuel alone leaves both live with the knob at RUN.
+        // Securing the aircraft is the KNOB, then the START/STOP button, not
+        // the mixture (the script rewrites it): `ignition_down` drops the boost
+        // pump and igniter, and only a button press with the knob at OFF sets
+        // the button state the script's shutdown runs on. The knob alone left
+        // the engine running at LSZS (2026-09-24).
         assert_eq!(
             s.shutdown_commands,
-            vec!["laminar/SF50/ignition_down".to_string()]
+            vec![
+                "laminar/SF50/ignition_down".to_string(),
+                "laminar/SF50/eng_start_stop_toggle".to_string()
+            ]
         );
         // ...and every airframe that has no such control keeps the old
         // lever-only shutdown untouched.
@@ -5521,6 +5527,7 @@ mod gap_tests_2026_09_12 {
         simbrief::FlightPlan {
             transition_altitude_ft: None,
             transition_level_ft: None,
+            procedures: Default::default(),
             source: simbrief::PlanSource::Local,
             origin: "LXGB".into(),
             destination: "LEMG".into(),

@@ -741,6 +741,7 @@ impl Planned {
         FlightPlan {
             transition_altitude_ft: None,
             transition_level_ft: None,
+            procedures: Default::default(),
             source: PlanSource::Local,
             origin: self.origin.icao.clone(),
             destination: self.dest.icao.clone(),

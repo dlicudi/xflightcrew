@@ -55,6 +55,8 @@ const CMD_SERVOS_ON: &str = "sim/autopilot/servos_on";
 const CMD_HDG_MODE: &str = "sim/autopilot/heading";
 const CMD_VS_MODE: &str = "sim/autopilot/vertical_speed";
 const VS_DIAL: &str = "sim/cockpit/autopilot/vertical_velocity";
+const GEAR_HANDLE: &str = "sim/cockpit2/controls/gear_handle_down";
+const FLAP_RATIO: &str = "sim/cockpit2/controls/flap_ratio";
 const VS_STATUS: &str = "sim/cockpit2/autopilot/vvi_status";
 const ALT_DIAL: &str = "sim/cockpit2/autopilot/altitude_dial_ft";
 const HDG_BUG: &str = "sim/cockpit2/autopilot/heading_dial_deg_mag_pilot";
@@ -344,6 +346,113 @@ pub struct Plan {
     /// mis-flown altitude. `None` (approach plans) leaves the knob alone; the
     /// monitor's cross-check keeps it right from there.
     pub transition_altitude_ft: Option<f64>,
+    /// The departure procedure's minimum altitudes, by fix (`nav::sid_minimums`).
+    /// While one ahead is unmet the climb is flown at Vy and the best rate, every
+    /// crossing is predicted, a short one is said, and one that will not be made
+    /// hands the aircraft back with the numbers (`watch_minimum`).
+    pub climb_minimums: Vec<crate::nav::ClimbMinimum>,
+    /// An approach to a missed approach point short of the runway (LSZS): the
+    /// angle of its visual segment, handed to the landing at the MAP.
+    pub visual_deg: Option<f64>,
+    /// ...and its published missed approach, straight legs only, flown by
+    /// the follower if that landing goes around (never a self-flown pattern
+    /// in a valley).
+    pub missed_legs: Vec<ProcLeg>,
+}
+
+/// The published missed approach of the approach being landed, stashed at the
+/// MAP handoff for the landing's go-around (`take_missed_legs`).
+static MISSED_LEGS: std::sync::Mutex<Option<Vec<ProcLeg>>> = std::sync::Mutex::new(None);
+
+/// Take the stashed missed approach (autoland, at a go-around).
+pub fn take_missed_legs() -> Option<Vec<ProcLeg>> {
+    MISSED_LEGS.lock().unwrap_or_else(|e| e.into_inner()).take()
+}
+
+fn stash_missed_legs(legs: Vec<ProcLeg>) {
+    *MISSED_LEGS.lock().unwrap_or_else(|e| e.into_inner()) = (!legs.is_empty()).then_some(legs);
+}
+
+/// On the leg to a missed approach point, the published path: the altitude it
+/// wants at `dist_nm` from the MAP and the descent rate that stays on it at
+/// this groundspeed (fpm, negative). A P law cannot track a ramp; the rate is
+/// fed forward. `None` off such a leg. Pure.
+pub fn map_path(leg: &ProcLeg, dist_nm: Option<f64>, gs_kts: f64) -> Option<(f64, f64)> {
+    if !leg.is_map {
+        return None;
+    }
+    let t = leg.vpa_deg?.to_radians().tan();
+    let map_ft = leg.alt1_ft?;
+    let d = dist_nm?;
+    Some((map_ft + d * 6076.12 * t, -gs_kts.max(0.0) * 6076.12 / 60.0 * t))
+}
+
+/// The first departure minimum still ahead of the aircraft and not yet met:
+/// (leg index of its fix, minimum ft). Legs before `idx` are behind us.
+pub fn unmet_minimum(
+    minimums: &[crate::nav::ClimbMinimum],
+    legs: &[ProcLeg],
+    idx: usize,
+    alt_ft: f64,
+) -> Option<(usize, f64)> {
+    legs.iter().enumerate().skip(idx).find_map(|(i, leg)| {
+        minimums
+            .iter()
+            .find(|m| m.fix.eq_ignore_ascii_case(&leg.fix_ident))
+            .filter(|m| alt_ft < m.min_ft)
+            .map(|m| (i, m.min_ft))
+    })
+}
+
+/// Along-route distance, nm, from the aircraft to leg `target`'s fix: to the
+/// current leg's fix, then fix to fix.
+pub fn distance_to_leg_nm(lat: f64, lon: f64, legs: &[ProcLeg], idx: usize, target: usize) -> f64 {
+    let mut d = 0.0;
+    let mut from = (lat, lon);
+    for leg in legs.iter().take(target + 1).skip(idx) {
+        if let Some(f) = &leg.fix {
+            d += crate::nav::haversine_nm(from.0, from.1, f.lat, f.lon);
+            from = (f.lat, f.lon);
+        }
+    }
+    d
+}
+
+/// What a departure minimum's watch says this tick.
+#[derive(Debug, Clone, PartialEq)]
+pub enum MinimumWatch {
+    OnTrack,
+    /// Predicted to cross short: said once, the climb is already at its best.
+    Short { predicted_ft: f64 },
+    /// Will not be made: the aircraft goes back to the pilot, with the numbers.
+    Unable { predicted_ft: f64 },
+}
+
+/// Altitude samples (about half a second apart) before the climb rate is a
+/// measurement the minimum watch may judge on.
+const MIN_RATE_SAMPLES: u32 = 10;
+/// Below this the aircraft is not climbing, and a minimum it will miss goes
+/// back to the pilot.
+const NOT_CLIMBING_FPM: f64 = 200.0;
+
+/// Feet short of a minimum that is still only a warning...
+const MIN_WARN_FT: f64 = 100.0;
+/// ...and short by this, within [`MIN_UNABLE_NM`] of the fix, is unable.
+const MIN_UNABLE_FT: f64 = 300.0;
+const MIN_UNABLE_NM: f64 = 3.0;
+
+/// Judge one minimum from the present climb: altitude now, rate (fpm),
+/// groundspeed and the distance to the fix. Pure.
+pub fn watch_minimum(alt_ft: f64, vs_fpm: f64, gs_kts: f64, dist_nm: f64, min_ft: f64) -> MinimumWatch {
+    let predicted_ft = alt_ft + vs_fpm.max(0.0) * dist_nm / gs_kts.max(40.0) * 60.0;
+    let short = min_ft - predicted_ft;
+    if short >= MIN_UNABLE_FT && dist_nm <= MIN_UNABLE_NM {
+        MinimumWatch::Unable { predicted_ft }
+    } else if short >= MIN_WARN_FT {
+        MinimumWatch::Short { predicted_ft }
+    } else {
+        MinimumWatch::OnTrack
+    }
 }
 
 /// The true great-circle bearing to a leg's fix, or `None` for a to-altitude
@@ -554,6 +663,7 @@ const GA_VS_FPM: f64 = 700.0;
 /// process-wide fact must never outlive its airframe.
 static CLIMB_FPM: std::sync::Mutex<f64> = std::sync::Mutex::new(GA_VS_FPM);
 static DESCENT_FPM: std::sync::Mutex<f64> = std::sync::Mutex::new(GA_VS_FPM);
+static BEST_CLIMB_FPM: std::sync::Mutex<Option<f64>> = std::sync::Mutex::new(None);
 
 /// Publish the airframe's enroute vertical rates. Called on EVERY swap, with
 /// the GA figure when the profile is silent, so the last aircraft's rates can
@@ -564,6 +674,18 @@ pub fn publish_vs_limits(r: Option<&crate::aircraft::ReferenceProfile>) {
         pick(r.and_then(|r| r.enroute_climb_fpm));
     *DESCENT_FPM.lock().unwrap_or_else(|e| e.into_inner()) =
         pick(r.and_then(|r| r.enroute_descent_fpm));
+    *BEST_CLIMB_FPM.lock().unwrap_or_else(|e| e.into_inner()) =
+        r.and_then(|r| r.best_climb_fpm).filter(|f| f.is_finite() && *f > 0.0);
+}
+
+/// The rate a climb to a departure minimum is flown at: the airframe's best
+/// climb where it declares one, never less than the enroute rate.
+pub fn best_climb_fpm() -> f64 {
+    BEST_CLIMB_FPM
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .unwrap_or(0.0)
+        .max(climb_fpm())
 }
 
 /// The live airframe's enroute climb rate, fpm.
@@ -755,6 +877,13 @@ pub fn handoff_index(legs: &[ProcLeg]) -> Option<usize> {
     if legs.is_empty() {
         return None;
     }
+    // An approach to a MAP short of the runway is flown TO the MAP: its final
+    // is the published valley track, and the runway's extended centreline
+    // from the FAF lies across the slopes beside it (LSZS 03: two miles off,
+    // toward Piz Corvatsch).
+    if legs.last().is_some_and(|l| l.is_map) {
+        return Some(legs.len() - 1);
+    }
     if let Some(i) = legs.iter().position(|l| l.is_faf) {
         return Some(i);
     }
@@ -797,22 +926,58 @@ pub fn approach_plan_for(
     // Prefer a full CIFP approach; fall back to a straight-in reconstructed from
     // the runway's published DME fixes (the way a pilot flies the DME approach
     // when there's no coded procedure — Gibraltar's whole story).
-    let (legs, name) = match crate::nav::best_approach(cifp, icao, rwy_id) {
-        Some(appch) => {
-            // As far as the threshold: the missed approach is never the
-            // approach (`straight_in_legs`, which `best_approach` already
-            // required of this one).
-            let legs =
-                crate::nav::load_proc_legs(cifp, icao, crate::nav::ProcKind::Appch, &appch, None);
-            let mut legs = crate::nav::straight_in_legs(legs, rwy_id).unwrap_or_default();
+    let mut visual: Option<crate::nav::VisualSegment> = None;
+    let mut missed_legs: Vec<ProcLeg> = Vec::new();
+    let mut found: Option<(Vec<ProcLeg>, String)> = None;
+    for appch in crate::nav::approach_candidates(cifp, icao, rwy_id) {
+        let raw = crate::nav::load_proc_legs(cifp, icao, crate::nav::ProcKind::Appch, &appch, None);
+        // As far as the threshold: the missed approach is never the approach
+        // (`straight_in_legs`).
+        if let Some(mut legs) = crate::nav::straight_in_legs(raw.clone(), rwy_id) {
             crate::nav::resolve_proc_fixes(fix_path, nav_path, airport, icao, &mut legs, lat, lon);
-            (
+            found = Some((legs, format!("the {} approach runway {spoken}", approach_kind(&appch))));
+            break;
+        }
+        // An approach to a missed approach point short of the runway (LSZS):
+        // flown from its TRANSITION, the published way in over the terrain,
+        // to the MAP on its own path, and landed from there on a visual
+        // segment the landing can fly. Judged once the fixes are resolved.
+        let Some((legs, missed)) =
+            map_approach_legs(cifp, fix_path, nav_path, airport, icao, &appch, lat, lon)
+        else {
+            continue;
+        };
+        let Some(seg) = runway_end(airport, rwy_id).and_then(|(thr, course)| {
+            crate::nav::visual_segment(&legs, thr, course, airport.elev_ft)
+        }) else {
+            continue;
+        };
+        crate::blackbox::record(
+            "procedure",
+            serde_json::json!({"event": "visual_segment", "approach": appch, "runway": rwy_id,
+                "dist_nm": seg.dist_nm, "lateral_nm": seg.lateral_nm,
+                "course_diff": seg.course_diff_deg, "angle": seg.angle_deg, "flyable": seg.flyable()}),
+        );
+        if seg.flyable() {
+            visual = Some(seg);
+            missed_legs = missed;
+            found = Some((
                 legs,
                 format!("the {} approach runway {spoken}", approach_kind(&appch)),
-            )
+            ));
+            break;
         }
-        None => (Vec::new(), String::new()),
-    };
+    }
+    let (legs, name) = found.unwrap_or_default();
+    // The angle handed to the landing is measured to ITS aim point (the
+    // touchdown zone past the threshold), so the MAP sits on its path rather
+    // than under it: LSZS 03, 4.74 to the threshold, 4.4 to the aim point.
+    let visual_deg = visual.map(|v| {
+        let height_ft = v.dist_nm * 6076.12 * v.angle_deg.to_radians().tan();
+        (height_ft / ((v.dist_nm + crate::autoland::TOUCHDOWN_AIM_NM) * 6076.12))
+            .atan()
+            .to_degrees()
+    });
     let (legs, name) = if legs.is_empty() {
         let recon = crate::nav::reconstruct_approach(fix_path, airport, icao, rwy_id);
         if recon.is_empty() {
@@ -827,9 +992,12 @@ pub fn approach_plan_for(
     };
     // The FAF is where autoland takes the aircraft, so it has to be somewhere
     // autoland can land FROM. A published approach's FAF is on the course by
-    // definition; a reconstructed one is only as good as its fixes.
-    if let Some(why) = faf_off_course(&legs, airport, rwy_id) {
-        return Err(why);
+    // definition; a reconstructed one is only as good as its fixes. A visual
+    // segment is handed over at the MAP instead, judged above.
+    if visual.is_none() {
+        if let Some(why) = faf_off_course(&legs, airport, rwy_id) {
+            return Err(why);
+        }
     }
     // Approaches descend; the climb protection reference stays off unless the
     // caller sets one (e.g. the enroute follower).
@@ -840,6 +1008,71 @@ pub fn approach_plan_for(
         vy_kts: 0.0,
         cruise_ias_kts: None, // the follower holds the clean approach speed
         transition_altitude_ft: None,
+        climb_minimums: Vec::new(),
+        visual_deg,
+        missed_legs,
+    })
+}
+
+/// A MAP approach's legs from its best TRANSITION: the one whose first fix is
+/// nearest the aircraft, straight legs only (a hold or a procedure turn is not
+/// flown), joined to the final and cut at the MAP. Resolved. `None` when the
+/// approach does not end at a MAP or no transition can be flown (the final's
+/// IF alone could lie across the ridges the transition goes round: LSZS's
+/// ZS701 is 39 nm from RONAG, over the Bernina).
+#[allow(clippy::too_many_arguments)]
+fn map_approach_legs(
+    cifp: &str,
+    fix_path: &str,
+    nav_path: &str,
+    airport: &crate::nav::AirportInfo,
+    icao: &str,
+    appch: &str,
+    lat: f64,
+    lon: f64,
+) -> Option<(Vec<ProcLeg>, Vec<ProcLeg>)> {
+    let flyable = |l: &ProcLeg| matches!(l.leg_type.as_str(), "IF" | "TF" | "CF" | "DF");
+    let mut best: Option<(f64, Vec<ProcLeg>)> = None;
+    for t in crate::nav::approach_transitions(cifp, icao, appch) {
+        let raw = crate::nav::load_proc_legs(cifp, icao, crate::nav::ProcKind::Appch, appch, Some(&t));
+        let Some(mut legs) = crate::nav::map_final_legs(raw) else { continue };
+        if !legs.iter().all(flyable) {
+            continue;
+        }
+        // The transition's last fix is the final's IF: flown once.
+        legs.dedup_by(|b, a| !a.fix_ident.is_empty() && a.fix_ident == b.fix_ident);
+        crate::nav::resolve_proc_fixes(fix_path, nav_path, airport, icao, &mut legs, lat, lon);
+        let Some(first) = legs.iter().find_map(|l| l.fix.as_ref()) else { continue };
+        let d = crate::nav::haversine_nm(lat, lon, first.lat, first.lon);
+        if best.as_ref().is_none_or(|(bd, _)| d < *bd) {
+            best = Some((d, legs));
+        }
+    }
+    let (_, legs) = best?;
+    // The published missed approach: the final's legs after the MAP, straight
+    // legs only (the hold at its end is not flown; the follower levels at the
+    // last constraint and hands over there).
+    let all = crate::nav::load_proc_legs(cifp, icao, crate::nav::ProcKind::Appch, appch, None);
+    let mut missed: Vec<ProcLeg> = all
+        .iter()
+        .position(|l| l.is_map)
+        .map(|at| all[at + 1..].iter().filter(|l| flyable(l) && !l.fix_ident.is_empty()).cloned().collect())
+        .unwrap_or_default();
+    missed.dedup_by(|b, a| a.fix_ident == b.fix_ident);
+    crate::nav::resolve_proc_fixes(fix_path, nav_path, airport, icao, &mut missed, lat, lon);
+    Some((legs, missed))
+}
+
+/// The threshold of runway end `rwy_id` and its course, degrees true.
+fn runway_end(airport: &crate::nav::AirportInfo, rwy_id: &str) -> Option<((f64, f64), f64)> {
+    airport.runways.iter().find_map(|r| {
+        if r.ident_a.eq_ignore_ascii_case(rwy_id) {
+            Some(((r.lat_a, r.lon_a), r.heading_a_deg()))
+        } else if r.ident_b.eq_ignore_ascii_case(rwy_id) {
+            Some(((r.lat_b, r.lon_b), r.heading_b_deg()))
+        } else {
+            None
+        }
     })
 }
 
@@ -964,6 +1197,8 @@ pub fn enroute_legs(
             ),
             alt2_ft: None,
             is_faf: false,
+            is_map: false,
+            vpa_deg: None,
         })
         .collect()
 }
@@ -1095,6 +1330,9 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, plan: Pla
         vy_kts,
         cruise_ias_kts,
         transition_altitude_ft,
+        climb_minimums,
+        visual_deg,
+        missed_legs,
     } = plan;
     let handoff = handoff_index(&legs);
     let _detail = crate::auto_status::DetailGuard::hold(&DETAIL);
@@ -1210,6 +1448,14 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, plan: Pla
     let mut terrain_misses: u32 = 0;
     let mut said_floor: Option<f64> = None;
     let mut said_alt_hold = false;
+    let mut said_short: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut gear_set = false;
+    let mut last_flap: Option<f64> = None;
+    let mut prev_alt_sample: Option<(f64, std::time::Instant)> = None;
+    let mut climb_rate_fpm = 0.0_f64;
+    let mut rate_samples = 0u32;
+    let mut said_unable: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut said_warned_unable = 0usize;
     while idx < legs.len() {
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         if xp.cancelled() || ABORT.load(Ordering::SeqCst) {
@@ -1290,8 +1536,130 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, plan: Pla
         // climb (2026-09-20). Re-armed only when the cap actually changes;
         // `arm_flight` is idempotent and a running hold just takes the new
         // number, so this costs nothing per tick.
+        let unmet = unmet_minimum(&climb_minimums, &legs, idx, alt_ft);
+        // The climb rate, from the altimeter itself (smoothed): what the
+        // minimum watch predicts with.
+        if let Some((a0, t0)) = prev_alt_sample {
+            let span = now.duration_since(t0).as_secs_f64();
+            if (0.3..=5.0).contains(&span) {
+                let inst = (alt_ft - a0) / span * 60.0;
+                // Seeded from the first real sample, never from zero: the
+                // watch judged its first tick at a zero climb rate, predicted
+                // arriving at WI505 at the present altitude and handed the
+                // aircraft back one second after the takeoff did, at 3,000 ft
+                // in the valley (LOWI, 2026-09-24).
+                climb_rate_fpm = if rate_samples == 0 { inst } else { 0.7 * climb_rate_fpm + 0.3 * inst };
+                rate_samples += 1;
+            }
+        }
+        prev_alt_sample = Some((alt_ft, now));
+        // No judgement until the rate is a measurement (several seconds).
+        let unmet_judged = unmet.filter(|_| rate_samples >= MIN_RATE_SAMPLES);
+        if let Some((at, min_ft)) = unmet_judged {
+            let fix = legs[at].fix_ident.clone();
+            let dist = distance_to_leg_nm(lat, lon, &legs, idx, at);
+            match watch_minimum(alt_ft, climb_rate_fpm, gs * MS_TO_KTS, dist, min_ft) {
+                MinimumWatch::OnTrack => {}
+                MinimumWatch::Short { predicted_ft } => {
+                    if said_short.insert(fix.clone()) {
+                        crate::blackbox::record(
+                            "procedure",
+                            serde_json::json!({"event": "minimum_short", "fix": fix,
+                                "min_ft": min_ft, "predicted_ft": predicted_ft, "dist_nm": dist}),
+                        );
+                        alert(
+                            &voice,
+                            Priority::Caution,
+                            &format!(
+                                "We'll cross {fix} about {:.0} feet under its {} minimum. Climbing at best rate.",
+                                ((min_ft - predicted_ft) / 50.0).round() * 50.0,
+                                crate::flightplan::spoken_feet(min_ft)
+                            ),
+                        );
+                    }
+                }
+                MinimumWatch::Unable { predicted_ft } => {
+                    // A miss predicted while CLIMBING is flown on, at best
+                    // rate: that is the most anyone could do, and a hand-over
+                    // near the ground mid-departure is the worst moment for
+                    // it (LOWI, 2026-09-24). Said, once per fix. Only an
+                    // aircraft that is not climbing at all is handed back.
+                    let climbing = climb_rate_fpm >= NOT_CLIMBING_FPM;
+                    if said_unable.insert(fix.clone()) || !climbing {
+                        crate::blackbox::record(
+                            "procedure",
+                            serde_json::json!({"event": "minimum_unable", "fix": fix,
+                                "min_ft": min_ft, "predicted_ft": predicted_ft, "alt_ft": alt_ft,
+                                "dist_nm": dist, "rate_fpm": climb_rate_fpm, "climbing": climbing}),
+                        );
+                    }
+                    if !climbing {
+                        stand_down(
+                            &voice,
+                            &format!(
+                                "We're not climbing and {fix} needs {}. Your aircraft. Climb now.",
+                                crate::flightplan::spoken_feet(min_ft),
+                            ),
+                            "minimum_unable",
+                        );
+                        return;
+                    }
+                    if said_unable.len() > said_warned_unable {
+                        said_warned_unable = said_unable.len();
+                        alert(
+                            &voice,
+                            Priority::Warning,
+                            &format!(
+                                "We won't make {} at {fix}, about {:.0} feet under. Climbing at best rate.",
+                                crate::flightplan::spoken_feet(min_ft),
+                                ((min_ft - predicted_ft) / 50.0).round() * 50.0,
+                            ),
+                        );
+                    }
+                }
+            }
+        }
         if let Some(planned) = power_hold_target(&end, cruise_ias_kts) {
-            let want = crate::tools::speedhold::airspace_limited(alt_ft, planned);
+            // A departure minimum ahead is climbed at Vy, the steepest the
+            // airframe goes up: at cruise speed the SF50 made 375 ft a mile
+            // where MOGT3H asks 600 (LOWI, 2026-09-24).
+            let planned = if unmet.is_some() && vy_kts > 0.0 { vy_kts } else { planned };
+            // On the final to a MAP: landing speed and configuration, so the
+            // visual segment is flown stabilised (a jet cannot slow down and
+            // go down 4.7 degrees in two miles).
+            let on_map_final = legs[idx].is_map;
+            let planned = match (&end, on_map_final) {
+                (EndAction::Approach { approach_ias, .. }, true) => *approach_ias,
+                _ => planned,
+            };
+            if on_map_final {
+                if !gear_set && crate::autoland::gear_may_extend(ias, crate::aircraft::gear_limit_kts()) {
+                    gear_set = xp.set_float(GEAR_HANDLE, 1.0).await.is_ok();
+                }
+                let flap = crate::autoland::flap_within_limits(1.0, ias, &crate::aircraft::flap_limits());
+                if last_flap.is_none_or(|f: f64| (f - flap).abs() > 0.01)
+                    && xp.set_float(FLAP_RATIO, flap).await.is_ok()
+                {
+                    last_flap = Some(flap);
+                    crate::blackbox::record(
+                        "procedure",
+                        serde_json::json!({"event": "map_config", "flap": flap, "gear": gear_set, "ias": ias}),
+                    );
+                }
+            }
+            // Floored HERE, against the floor for the configuration flown
+            // (landing on the final to a MAP, clean otherwise), and compared
+            // floored: comparing the raw 87 with the governor's floored 96
+            // re-armed, and re-said the floor, every tick (LSZS, 2026-09-24).
+            let floor = if on_map_final {
+                crate::aircraft::approach_floor_kts()
+            } else {
+                crate::aircraft::speed_floor_kts()
+            };
+            let want = crate::aircraft::floored_target(
+                crate::tools::speedhold::airspace_limited(alt_ft, planned),
+                floor,
+            );
             if crate::tools::speedhold::flight_target().is_some_and(|t| (t - want).abs() > 0.5) {
                 crate::blackbox::record(
                     "procedure",
@@ -1300,7 +1668,7 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, plan: Pla
                         "planned": planned, "target": want,
                     }),
                 );
-                crate::tools::speedhold::arm_flight(base_url.clone(), voice.clone(), want);
+                crate::tools::speedhold::arm_flight_with_floor(base_url.clone(), voice.clone(), want, floor);
             }
         }
 
@@ -1488,7 +1856,10 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, plan: Pla
             terrain_floor_ahead_ft().map(|f| floor_indicated(f, true_alt_ft, alt_ft)),
             descent_fpm(),
         );
-        let want_alt = v.want_alt;
+        // The leg to a MAP flies the published path, rate fed forward
+        // (`map_path`); every other leg the constraint law above.
+        let path = map_path(leg, dist_nm, gs_kts);
+        let want_alt = path.map_or(v.want_alt, |(a, _)| a);
         carry_alt = v.carry;
         prev_cmd_alt = v.prev_cmd;
         // The follower's own top of descent, for the advisor and the spoken
@@ -1563,7 +1934,16 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, plan: Pla
             }
         });
         prev_ias = Some((ias, now_ias));
-        let mut vs_cmd = ((want_alt - alt_ft) * 3.0).clamp(-descent_fpm(), climb_fpm());
+        let climb_cap = if unmet_minimum(&climb_minimums, &legs, idx, alt_ft).is_some() {
+            best_climb_fpm()
+        } else {
+            climb_fpm()
+        };
+        let mut vs_cmd = match path {
+            Some((path_ft, ff_fpm)) => (ff_fpm + (path_ft - alt_ft) * 2.0)
+                .clamp(-descent_fpm().max(ff_fpm.abs() * 1.4), 300.0),
+            None => ((want_alt - alt_ft) * 3.0).clamp(-descent_fpm(), climb_cap),
+        };
         if vs_cmd > 0.0 && vy_kts > 0.0 {
             vs_cmd = vs_cmd.min(crate::autotakeoff::climb_vs_fpm(ias, vy_kts, vs_cmd));
             // ...and the circuit's own fade to NOTHING at the airframe's speed
@@ -1677,7 +2057,15 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, plan: Pla
                     "procedure",
                     serde_json::json!({"event": "handoff_autoland", "idx": idx, "agl_ft": agl_ft}),
                 );
-                alert(&voice, Priority::Advisory, "At the fix. Landing us.");
+                if leg.is_map {
+                    // The visual segment: its own angle to the landing, and
+                    // the published missed approach for its go-around.
+                    crate::autoland::set_next_glidepath_deg(visual_deg);
+                    stash_missed_legs(missed_legs.clone());
+                    alert(&voice, Priority::Advisory, "Missed approach point. Runway ahead, landing us.");
+                } else {
+                    alert(&voice, Priority::Advisory, "At the fix. Landing us.");
+                }
                 // The governor lets go BEFORE autoland's throttle law starts,
                 // so no tick has two writers on the lever.
                 crate::tools::speedhold::release();
@@ -1792,6 +2180,86 @@ pub fn terrain_probe_fatal(misses: &mut u32, frozen: bool) -> bool {
 
 #[cfg(test)]
 mod tests {
+    fn fix_leg(ident: &str, lat: f64, lon: f64) -> ProcLeg {
+        ProcLeg {
+            seq: 0,
+            transition: String::new(),
+            leg_type: "TF".into(),
+            fix_ident: ident.into(),
+            fix_region: String::new(),
+            fix: Some(crate::nav::Fix { ident: ident.into(), lat, lon }),
+            course_mag: None,
+            dist_nm: None,
+            turn: None,
+            alt_desc: ' ',
+            alt1_ft: Some(20_000.0),
+            alt2_ft: None,
+            is_faf: false,
+            is_map: false,
+            vpa_deg: None,
+        }
+    }
+
+    /// LSZS RNAV 03: FAF ZS702 at 11,800, MAP ZS705 at 6,598 on a 4.49
+    /// degree path. The final is flown on the path with its rate fed forward,
+    /// and handed over at the MAP, not the FAF.
+    #[test]
+    fn a_map_final_is_flown_on_its_path_and_handed_over_at_the_map() {
+        let mut faf = fix_leg("ZS702", 46.357, 9.688);
+        faf.is_faf = true;
+        let mut map = fix_leg("ZS705", 46.500, 9.851);
+        map.is_map = true;
+        map.vpa_deg = Some(4.49);
+        map.alt1_ft = Some(6598.0);
+        let legs = vec![fix_leg("ZS701", 46.327, 9.576), faf, map.clone()];
+        assert_eq!(super::handoff_index(&legs), Some(2), "at the MAP, not the FAF");
+        // 5 nm out: 6,598 + 5 x 477 = 8,983 ft, and at 100 kt ~795 fpm down.
+        let (alt, ff) = super::map_path(&map, Some(5.0), 100.0).unwrap();
+        assert!((alt - 8983.0).abs() < 15.0, "{alt}");
+        assert!((ff + 795.0).abs() < 10.0, "{ff}");
+        assert_eq!(super::map_path(&legs[1], Some(5.0), 100.0), None, "not the MAP leg");
+    }
+
+    /// LOWI MOGT3H (2026-09-24): 7,850 at WI506, about nine miles from the
+    /// runway. At cruise speed the SF50 made 375 ft a mile (1,500 fpm at
+    /// 240 kt); at Vy it makes the minimum.
+    #[test]
+    fn a_departure_minimum_is_watched_and_an_unmakeable_one_hands_back() {
+        let mins = vec![
+            crate::nav::ClimbMinimum { fix: "WI505".into(), min_ft: 4000.0 },
+            crate::nav::ClimbMinimum { fix: "WI506".into(), min_ft: 7850.0 },
+        ];
+        let legs = vec![
+            fix_leg("WI505", 47.252, 11.269),
+            fix_leg("WI506", 47.290, 11.139),
+            fix_leg("WI507", 47.306, 11.086),
+        ];
+        // Past WI505 at 4,500: WI506 is the one ahead and unmet.
+        assert_eq!(super::unmet_minimum(&mins, &legs, 1, 4500.0), Some((1, 7850.0)));
+        assert_eq!(super::unmet_minimum(&mins, &legs, 1, 8000.0), None, "met");
+        // Behind us is not ahead.
+        assert_eq!(super::unmet_minimum(&mins, &legs, 2, 4500.0), None);
+        let d = super::distance_to_leg_nm(47.252, 11.269, &legs, 1, 1);
+        assert!((d - 5.8).abs() < 0.3, "WI505 to WI506 ~5.8 nm: {d}");
+        // Cruise-speed climb, 6 nm out at 4,500: short, said.
+        assert!(matches!(
+            super::watch_minimum(4500.0, 1500.0, 240.0, 6.0, 7850.0),
+            super::MinimumWatch::Short { .. }
+        ));
+        // Vy climb: 2,000 fpm at 130 kt makes it.
+        assert_eq!(super::watch_minimum(4500.0, 2000.0, 130.0, 6.0, 7850.0), super::MinimumWatch::OnTrack);
+        // Two miles out and 1,400 short: unable.
+        assert!(matches!(
+            super::watch_minimum(6000.0, 1200.0, 200.0, 2.0, 7850.0),
+            super::MinimumWatch::Unable { .. }
+        ));
+        // A descent is not a climb that will make it.
+        assert!(matches!(
+            super::watch_minimum(6000.0, -500.0, 150.0, 2.0, 7850.0),
+            super::MinimumWatch::Unable { .. }
+        ));
+    }
+
     /// EGPH-EGTE, 2026-09-21: 2,000 fpm down at idle, 258 kt through ten
     /// thousand against 250, 278 at the last fix.
     #[test]
@@ -2017,6 +2485,8 @@ mod tests {
             alt1_ft: None,
             alt2_ft: None,
             is_faf: false,
+            is_map: false,
+            vpa_deg: None,
         }
     }
 
@@ -2172,6 +2642,8 @@ mod tests {
             alt1_ft: Some(alt),
             alt2_ft: None,
             is_faf: false,
+            is_map: false,
+            vpa_deg: None,
         }
     }
 
@@ -2644,6 +3116,9 @@ mod tests {
             vy_kts: 0.0,
             cruise_ias_kts: None,
             transition_altitude_ft: None,
+            climb_minimums: Vec::new(),
+            visual_deg: None,
+            missed_legs: Vec::new(),
         };
         // Tight circuit: 0.3 nm from the FAF at 700 ft — NOT flyable (autoland).
         let (near_lat, near_lon) = crate::nav::project_latlon(36.0, -5.0, 0.0, 0.3);

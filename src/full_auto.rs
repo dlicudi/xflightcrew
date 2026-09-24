@@ -128,6 +128,12 @@ pub struct Route {
     /// Enroute legs (origin and destination airports already dropped), fixes
     /// resolved from the plan's own lat/lons.
     pub legs: Vec<crate::nav::ProcLeg>,
+    /// The planned SID's minimum altitudes for the departure runway, the ones
+    /// on this route (`nav::sid_minimums`). Empty for a resume or a plan with
+    /// no SID.
+    pub climb_minimums: Vec<crate::nav::ClimbMinimum>,
+    /// The runway the planned SID departs from, asked for at the taxi request.
+    pub departure_rwy: Option<String>,
     /// The plugin FMS-mailbox payload ("IDENT,lat,lon,alt|...") for the whole
     /// plan, so the GPS shows the route too. Best-effort — the follower flies
     /// the plan's own fixes, not the FMS.
@@ -1195,7 +1201,19 @@ async fn fly(xp: XPlaneClient, config: Config, voice: Option<Voice>, tools: SubT
                     ]),
                 );
             }
-            crate::circuit::transmit(crate::circuit::radio_call(&callsign, "request taxi"));
+            // The planned departure's runway, asked for (the tower honours it
+            // unless the wind really favours another end): a SID exists for
+            // one runway, and in calm air the pick could have been the other.
+            let ask = match &tools.mission {
+                Mission::Flight(r) => r.departure_rwy.as_deref().map(|rwy| {
+                    format!("request taxi, runway {}", crate::circuit::spell_runway(rwy))
+                }),
+                _ => None,
+            };
+            crate::circuit::transmit(crate::circuit::radio_call(
+                &callsign,
+                ask.as_deref().unwrap_or("request taxi"),
+            ));
             event("request_taxi", json!({}));
             // The call queues behind our own intercom lines AND anyone the
             // tower is already working — the clock must outlast a worked
@@ -1344,6 +1362,29 @@ async fn fly(xp: XPlaneClient, config: Config, voice: Option<Voice>, tools: SubT
             }
         }
         bail_if_abort!();
+
+        // The cleared runway against the planned departure: a SID exists for
+        // its runway, and taking off on another would fly its fixes backwards
+        // (at LOWI a turn back through the valley). Said and handed back here,
+        // on the ramp, with the brakes on, never discovered in the climb.
+        if let Some(why) = departure_runway_mismatch(
+            match &tools.mission {
+                Mission::Flight(r) => r.departure_rwy.as_deref(),
+                _ => None,
+            },
+            crate::party_line::clearance_runway().as_deref(),
+        ) {
+            event("departure_runway_mismatch", json!({ "why": why }));
+            give_up(
+                &xp,
+                tools.taxi.park_brake_valve_set,
+                &voice,
+                &format!("{why} Your aircraft."),
+                "departure_runway_mismatch",
+            )
+            .await;
+            return;
+        }
 
         // Drive the cleared route to the holding point. The taxi light, or
         // on an airframe that has none the landing light: the SR22 carries
@@ -1606,6 +1647,11 @@ async fn fly(xp: XPlaneClient, config: Config, voice: Option<Voice>, tools: SubT
             }
         }
         event("lined_up", json!({}));
+        // A SID with minimums: the takeoff's own climb-out at best rate.
+        crate::autotakeoff::DEPARTURE_MINIMUMS.store(
+            matches!(&tools.mission, Mission::Flight(r) if !r.climb_minimums.is_empty()),
+            SeqCst,
+        );
         ensure_squawk(&xp, &ctx, &voice).await;
         // On the runway: strobes and landing lights. These are the two that
         // say "this aeroplane is about to move fast", which is why they go on
@@ -1831,6 +1877,7 @@ async fn fly_route(
             return;
         }
         event("airborne", json!({ "agl_ft": agl_ft }));
+        crate::autotakeoff::DEPARTURE_MINIMUMS.store(false, SeqCst);
     } else {
         let (ground, agl) = tokio::join!(
             xp.get_float(crate::datarefs::ON_GROUND_ANY),
@@ -1874,6 +1921,9 @@ async fn fly_route(
             vy_kts: tools.takeoff.vy_kts,
             cruise_ias_kts: tools.cruise_ias_kts,
             transition_altitude_ft: Some(tools.transition_altitude_ft),
+            climb_minimums: route.climb_minimums.clone(),
+            visual_deg: None,
+            missed_legs: Vec::new(),
         },
         xp.cancellation(),
     ) {
@@ -2029,6 +2079,7 @@ async fn fly_route(
                 plan: None,
                 rwy_id: None,
                 tower_khz: None,
+                mountain_msa_ft: None,
             })
         }
     };
@@ -2187,6 +2238,35 @@ async fn fly_route(
                 .await;
                 return;
             }
+        }
+        _ if route.local_runway.is_none() && built.mountain_msa_ft.is_some() => {
+            // A mountain field with no approach we can fly: never a visual
+            // autoland into the valley. The follower has finished the route;
+            // hold at or above the sector altitude and hand over, saying why.
+            // (LSZS, 2026-09-24: its RNAV approaches end at a missed-approach
+            // point before the runway; the old fallback was a visual autoland
+            // into the Engadin with 15,500 ft sectors.)
+            let msa = built.mountain_msa_ft.unwrap_or(0.0);
+            let hold_ft = (alt_msl_ft.max(msa + 500.0) / 500.0).ceil() * 500.0;
+            let thr = crate::aircraft::throttle_dataref();
+            let _ = tokio::join!(
+                xp.set_float("sim/cockpit2/autopilot/altitude_dial_ft", hold_ft),
+                xp.set_float(VS_DIAL, if alt_msl_ft < hold_ft { 1000.0 } else { 0.0 }),
+                xp.set_float(&thr, GIVE_UP_THROTTLE),
+            );
+            event(
+                "arrival_handover",
+                json!({ "runway": built.rwy_id, "msa_ft": msa, "hold_ft": hold_ft }),
+            );
+            give_up(
+                xp,
+                tools.taxi.park_brake_valve_set,
+                voice,
+                &mountain_handover_line(&route.dest_name, msa, hold_ft),
+                "arrival_unflyable",
+            )
+            .await;
+            return;
         }
         _ => {
             event(
@@ -2533,15 +2613,73 @@ pub fn brief_arrival(
     }
     // (kind, spoken runway) per end with a published approach; the spoken
     // runway per end with only a DME-fix straight-in.
-    let (mut published, mut straight_in) = (Vec::new(), Vec::new());
+    let (mut published, mut straight_in, mut visual) = (Vec::new(), Vec::new(), Vec::new());
+    let nav_path = std::path::Path::new(fix_path)
+        .with_file_name("earth_nav.dat")
+        .to_string_lossy()
+        .into_owned();
+    let (alat, alon) = airport.position().unwrap_or((airport.runways[0].lat_a, airport.runways[0].lon_a));
     for r in &airport.runways {
         for id in [&r.ident_a, &r.ident_b] {
             let spoken = crate::circuit::spell_runway(id);
-            if let Some(appch) = crate::nav::best_approach(cifp, dest, id) {
-                published.push((crate::procedure::approach_kind(&appch), spoken));
-            } else if !crate::nav::reconstruct_approach(fix_path, &airport, dest, id).is_empty() {
-                straight_in.push(spoken);
+            // Built exactly as the arrival builds it: an approach the brief
+            // names is one the arrival can fly (LSZS's RNAV 21 has a 5.3
+            // degree visual segment, too steep, and is not named).
+            match crate::nav::best_approach(cifp, dest, id).and_then(|appch| {
+                crate::procedure::approach_plan_for(
+                    cifp,
+                    fix_path,
+                    &nav_path,
+                    &airport,
+                    dest,
+                    id,
+                    alat,
+                    alon,
+                    crate::procedure::EndAction::Level,
+                )
+                .ok()
+                .map(|p| (appch, p))
+            }) {
+                Some((appch, plan)) if plan.visual_deg.is_some() => {
+                    visual.push((crate::procedure::approach_kind(&appch), spoken))
+                }
+                Some((appch, _)) => published.push((crate::procedure::approach_kind(&appch), spoken)),
+                None if !crate::nav::reconstruct_approach(fix_path, &airport, dest, id).is_empty() => {
+                    straight_in.push(spoken)
+                }
+                None => {}
             }
+        }
+    }
+    if published.is_empty() && straight_in.is_empty() && !visual.is_empty() {
+        let (kind, rwy) = &visual[0];
+        return Ok(format!(
+            "{} has the {kind} to runway {rwy}: I'll fly it to the missed approach point and \
+             land visually from there, on its own steep path.",
+            airport.name
+        ));
+    }
+    if published.is_empty() && straight_in.is_empty() {
+        let charted = crate::nav::list_procedures(cifp, dest, crate::nav::ProcKind::Appch);
+        let msa = crate::nav::airport_msa_ft(&msa_path_for(fix_path), dest);
+        if mountain_field(msa, airport.elev_ft) {
+            return Ok(format!(
+                "{} is a mountain field, and {}. I'll fly the route and hand over at its end, \
+                 above the sector altitude of {}.",
+                airport.name,
+                if charted.is_empty() {
+                    "it has no published approach".to_string()
+                } else {
+                    "its published approaches end short of the runway, which I can't fly".to_string()
+                },
+                crate::flightplan::spoken_feet(msa.unwrap_or(0.0))
+            ));
+        }
+        if !charted.is_empty() {
+            return Ok(format!(
+                "{}'s published approaches end short of the runway, which I can't fly, so I'll land visually.",
+                airport.name
+            ));
         }
     }
     Ok(arrival_brief_line(
@@ -2550,6 +2688,34 @@ pub fn brief_arrival(
         &published,
         &straight_in,
     ))
+}
+
+/// Sector altitude this far above the field makes it a mountain field: no
+/// visual fallback, the arrival is an approach we can fly or a hand-over.
+const MOUNTAIN_MSA_MARGIN_FT: f64 = 3_000.0;
+
+fn mountain_field(msa_ft: Option<f64>, elev_ft: f64) -> bool {
+    msa_ft.is_some_and(|m| m - elev_ft >= MOUNTAIN_MSA_MARGIN_FT)
+}
+
+/// `earth_msa.dat` beside the fix file (both in Custom Data, or both in the
+/// default data).
+fn msa_path_for(fix_path: &str) -> String {
+    std::path::Path::new(fix_path)
+        .with_file_name("earth_msa.dat")
+        .to_string_lossy()
+        .into_owned()
+}
+
+/// The hand-over at the end of the route into a mountain field we cannot fly
+/// an approach to. Pure.
+pub fn mountain_handover_line(dest: &str, msa_ft: f64, hold_ft: f64) -> String {
+    format!(
+        "End of the route. I can't fly an approach into {dest}. Your aircraft. The autopilot \
+         is holding {}, above the sector altitude of {}.",
+        crate::flightplan::spoken_feet(hold_ft),
+        crate::flightplan::spoken_feet(msa_ft)
+    )
 }
 
 /// One line, sized to the field: a big airport's approaches are SUMMARISED
@@ -2599,6 +2765,10 @@ struct Arrival {
     /// not a plan came with it (the visual fallback and the final call need it).
     rwy_id: Option<String>,
     tower_khz: Option<i64>,
+    /// The field's highest sector altitude when it is a MOUNTAIN field
+    /// (`mountain_field`): with no approach we can fly, the arrival hands the
+    /// aircraft over above it instead of landing visually.
+    mountain_msa_ft: Option<f64>,
 }
 
 /// The inbound call to the destination's tower, once its station is the one
@@ -2701,9 +2871,12 @@ fn build_arrival(
             plan: None,
             rwy_id: None,
             tower_khz: None,
+            mountain_msa_ft: None,
         };
     };
     let tower_khz = airport.freq(crate::nav::FREQ_TOWER).map(|f| f.khz);
+    let mountain_msa_ft = crate::nav::airport_msa_ft(&msa_path_for(fixp), dest)
+        .filter(|m| mountain_field(Some(*m), airport.elev_ft));
     // The tower's runway when it has named one (no fallback to another end:
     // the caller keeps its own plan if this one cannot be flown)...
     if let Some(forced) = forced_rwy {
@@ -2721,6 +2894,7 @@ fn build_arrival(
             plan,
             rwy_id: Some(forced.to_string()),
             tower_khz,
+            mountain_msa_ft,
         };
     }
     // Into the wind when it's strong enough to matter...
@@ -2755,6 +2929,7 @@ fn build_arrival(
             plan: None,
             rwy_id: None,
             tower_khz,
+            mountain_msa_ft,
         };
     };
     let plan_for = |id: &str| {
@@ -2772,6 +2947,7 @@ fn build_arrival(
             plan: Some(plan),
             rwy_id: Some(rwy_id),
             tower_khz,
+            mountain_msa_ft,
         };
     }
     // No approach we can fly to that end: another end that HAS one, if its
@@ -2785,6 +2961,7 @@ fn build_arrival(
                 plan: Some(plan),
                 rwy_id: Some(id),
                 tower_khz,
+                mountain_msa_ft,
             };
         }
     }
@@ -2792,6 +2969,7 @@ fn build_arrival(
         plan: None,
         rwy_id: Some(rwy_id),
         tower_khz,
+        mountain_msa_ft,
     }
 }
 
@@ -2821,6 +2999,95 @@ async fn tower_arrival_runway(dest_khz: Option<i64>) -> Option<String> {
 
 /// How long the arrival waits for the tower's answer to the inbound call.
 const TOWER_RUNWAY_WAIT_SECS: f64 = 10.0;
+
+/// The line said when the tower clears a runway the planned SID does not
+/// depart from; `None` when they agree or either is unknown. Pure.
+pub fn departure_runway_mismatch(planned: Option<&str>, cleared: Option<&str>) -> Option<String> {
+    let (p, c) = (planned?, cleared?);
+    (!p.eq_ignore_ascii_case(c)).then(|| {
+        format!(
+            "The tower has given us runway {}, and the planned departure is from runway {}. \
+             I can't fly that departure from here.",
+            crate::circuit::spell_runway(c),
+            crate::circuit::spell_runway(p)
+        )
+    })
+}
+
+/// One departure minimum judged against the climb: the gradient it needs from
+/// the departure end of the runway, and what the airframe makes at Vy.
+#[derive(Debug, Clone, PartialEq)]
+pub struct GradientCheck {
+    pub fix: String,
+    pub min_ft: f64,
+    pub dist_nm: f64,
+    pub need_ft_per_nm: f64,
+    pub have_ft_per_nm: f64,
+}
+
+/// Refused above this share of the airframe's climb gradient...
+const GRADIENT_REFUSE_FRAC: f64 = 0.90;
+/// ...said as a caution above this.
+const GRADIENT_CAUTION_FRAC: f64 = 0.75;
+
+/// Every departure minimum on the route, from the runway's departure end
+/// `der` at `field_ft`, against `best_climb_fpm` at `vy_kts` (true airspeed
+/// rising 2 % a thousand feet, no wind credit). Pure.
+pub fn departure_gradients(
+    der: (f64, f64),
+    field_ft: f64,
+    legs: &[crate::nav::ProcLeg],
+    minimums: &[crate::nav::ClimbMinimum],
+    vy_kts: f64,
+    best_climb_fpm: f64,
+) -> Vec<GradientCheck> {
+    let mut out = Vec::new();
+    let mut dist = 0.0;
+    let mut from = der;
+    for leg in legs {
+        let Some(f) = &leg.fix else { continue };
+        dist += crate::nav::haversine_nm(from.0, from.1, f.lat, f.lon);
+        from = (f.lat, f.lon);
+        if let Some(m) = minimums.iter().find(|m| m.fix.eq_ignore_ascii_case(&leg.fix_ident)) {
+            let mid_kft = (field_ft + m.min_ft) / 2.0 / 1000.0;
+            let tas = vy_kts * (1.0 + 0.02 * mid_kft);
+            out.push(GradientCheck {
+                fix: m.fix.clone(),
+                min_ft: m.min_ft,
+                dist_nm: dist,
+                need_ft_per_nm: (m.min_ft - field_ft).max(0.0) / dist.max(0.1),
+                have_ft_per_nm: best_climb_fpm / (tas / 60.0),
+            });
+        }
+    }
+    out
+}
+
+/// The departure's verdict: `Err` a refusal naming the binding minimum,
+/// `Ok(Some(line))` a caution for the brief, `Ok(None)` comfortable.
+pub fn gradient_verdict(sid: &str, checks: &[GradientCheck]) -> Result<Option<String>, String> {
+    let Some(worst) = checks
+        .iter()
+        .max_by(|a, b| (a.need_ft_per_nm / a.have_ft_per_nm).total_cmp(&(b.need_ft_per_nm / b.have_ft_per_nm)))
+    else {
+        return Ok(None);
+    };
+    let share = worst.need_ft_per_nm / worst.have_ft_per_nm.max(1.0);
+    let line = format!(
+        "{sid} needs {} at {}, {:.0} feet a mile; we climb about {:.0} at best rate.",
+        crate::flightplan::spoken_feet(worst.min_ft),
+        worst.fix,
+        worst.need_ft_per_nm,
+        worst.have_ft_per_nm
+    );
+    if share > GRADIENT_REFUSE_FRAC {
+        Err(format!("Negative. {line} Not flying that departure."))
+    } else if share > GRADIENT_CAUTION_FRAC {
+        Ok(Some(format!("{line} Tight, I'll climb at Vy until it's made.")))
+    } else {
+        Ok(Some(format!("{line} I'll climb at Vy until it's made.")))
+    }
+}
 
 /// The most tailwind an arrival accepts to fly a published approach rather
 /// than a visual landing.
@@ -3303,6 +3570,7 @@ mod tests {
         crate::simbrief::FlightPlan {
             transition_altitude_ft: None,
             transition_level_ft: None,
+            procedures: Default::default(),
             source: crate::simbrief::PlanSource::SimBrief,
             origin: "LXGB".into(),
             destination: "LEAX".into(),
@@ -3350,6 +3618,60 @@ mod tests {
             dest_longest_ft: 3280.0,
             service_ceiling_ft: None,
         }
+    }
+
+    /// LOWI 26 MOGT3H in the SF50 (the SimBrief plan of 2026-09-24): the
+    /// binding minimum is WI506, 714 ft a mile over 8.3 nm from the departure
+    /// end; at Vy 120 kt and 2,000 fpm the SF50 makes about 911 (78 %). Tight,
+    /// briefed, flown at Vy.
+    #[test]
+    fn a_sid_gradient_is_judged_against_the_climb_at_vy() {
+        let leg = |id: &str, lat: f64, lon: f64| crate::nav::ProcLeg {
+            seq: 0,
+            transition: String::new(),
+            leg_type: "TF".into(),
+            fix_ident: id.into(),
+            fix_region: String::new(),
+            fix: Some(crate::nav::Fix { ident: id.into(), lat, lon }),
+            course_mag: None,
+            dist_nm: None,
+            turn: None,
+            alt_desc: ' ',
+            alt1_ft: None,
+            alt2_ft: None,
+            is_faf: false,
+            is_map: false,
+            vpa_deg: None,
+        };
+        let legs = vec![
+            leg("WI505", 47.252, 11.269),
+            leg("WI506", 47.290, 11.139),
+            leg("WI507", 47.306, 11.086),
+            leg("WI802", 47.296, 10.840),
+            leg("MOGTI", 47.389, 10.717),
+        ];
+        let m = |f: &str, a: f64| crate::nav::ClimbMinimum { fix: f.into(), min_ft: a };
+        let mins = vec![m("WI505", 4000.0), m("WI506", 7850.0), m("WI507", 8400.0), m("WI802", 11350.0), m("MOGTI", 13000.0)];
+        let der = (47.2587834, 11.3308736); // the 08 end: 26's departure end
+        let checks = super::departure_gradients(der, 1907.0, &legs, &mins, 120.0, 2000.0);
+        assert_eq!(checks.len(), 5);
+        let wi506 = &checks[1];
+        assert!((wi506.dist_nm - 8.3).abs() < 0.3, "{wi506:?}");
+        assert!((wi506.need_ft_per_nm - 714.0).abs() < 20.0, "{wi506:?}");
+        let line = super::gradient_verdict("MOGT3H", &checks).expect("flyable").expect("briefed");
+        assert!(line.contains("MOGT3H needs") && line.contains("Tight"), "{line}");
+        // At the cruise-speed climb flown today (1,500 fpm at 190 kt ~ 470 ft/nm
+        // equivalent) the same departure is refused.
+        let weak = super::departure_gradients(der, 1907.0, &legs, &mins, 190.0, 1500.0);
+        assert!(super::gradient_verdict("MOGT3H", &weak).is_err());
+    }
+
+    #[test]
+    fn a_cleared_runway_that_is_not_the_sids_is_said_on_the_ramp() {
+        assert!(super::departure_runway_mismatch(Some("26"), Some("08")).unwrap().contains("zero eight"));
+        assert_eq!(super::departure_runway_mismatch(Some("26"), Some("26")), None);
+        assert_eq!(super::departure_runway_mismatch(None, Some("08")), None, "no SID, no rule");
+        assert_eq!(super::departure_runway_mismatch(Some("26"), None), None, "no tower, no rule");
     }
 
     #[test]
@@ -3779,6 +4101,23 @@ mod arrival_watch_tests {
         let cifp = "/Users/duanelicudi/X-Plane 12/Custom Data/CIFP";
         let fix = "/Users/duanelicudi/X-Plane 12/Custom Data/earth_fix.dat";
         let nav = "/Users/duanelicudi/X-Plane 12/Custom Data/earth_nav.dat";
+        println!("MOGT3H 26 minimums: {:?}", crate::nav::sid_minimums(cifp, "LOWI", "MOGT3H", "26"));
+        for wind in [Some((360.0, 17.0)), None] {
+            let a = super::build_arrival(
+                apt, cifp, fix, nav, "LSZS", 46.779, 10.259,
+                crate::tools::autopilot::ApConfig::default(), 87.0, wind, None,
+            );
+            println!("LSZS wind {wind:?}: runway {:?} plan {:?}", a.rwy_id, a.plan.as_ref().map(|p| p.name.clone()));
+            if let Some(p) = &a.plan {
+                println!("   visual {:?} missed {:?}", p.visual_deg, p.missed_legs.iter().map(|l| (l.fix_ident.clone(), l.alt1_ft, l.fix.is_some())).collect::<Vec<_>>());
+                for l in &p.legs {
+                    println!("   {} {} {:?} map={} vpa={:?} fix={}", l.leg_type, l.fix_ident, l.alt1_ft, l.is_map, l.vpa_deg, l.fix.is_some());
+                }
+            }
+        }
+        match super::brief_arrival(apt, cifp, fix, "LSZS") {
+            Ok(l) | Err(l) => println!("LSZS brief: {l}"),
+        }
         for forced in ["08", "26"] {
             let a = super::build_arrival(
                 apt, cifp, fix, nav, "LOWI", 47.77, 11.79,

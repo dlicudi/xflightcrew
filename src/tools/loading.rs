@@ -443,6 +443,7 @@ mod tests {
             }),
             transition_altitude_ft: None,
             transition_level_ft: None,
+            procedures: Default::default(),
         }
     }
 

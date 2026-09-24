@@ -664,6 +664,16 @@ pub fn run_autoland_scoped(
                 floored
             };
 
+            // This approach's path angle: a steeper one handed down for a
+            // visual segment (LSZS), else 3. Taken now so no approach
+            // inherits another's.
+            let gp_deg = arm_glidepath();
+            if (gp_deg - 3.0).abs() > 1e-9 {
+                crate::blackbox::record(
+                    "autoland",
+                    serde_json::json!({"event": "glidepath", "deg": gp_deg}),
+                );
+            }
             // Find the runway (a full apt.dat pass, a few seconds — that's why the
             // tool says "searching"). Needs a valid position first.
             let (Ok(lat0), Ok(lon0), Ok(track0)) = (
@@ -1246,9 +1256,14 @@ pub fn run_autoland_scoped(
                     } else {
                         FAP_NM
                     };
+                    // A steep, visual-segment approach (LSZS) is never
+                    // repositioned by a pattern of our own: that is a valley.
+                    // A go-around there flies the PUBLISHED missed approach.
+                    let steep = glidepath_deg() > 3.0 + 1e-9;
                     let wanted = match missed {
                         Some(MissedStage::Reposition) => true,
                         Some(MissedStage::Climb) => false,
+                        None if steep => false,
                         None => {
                             raw.phase != ApproachPhase::Flare
                                 && radio_ft >= TERRAIN_FLOOR_AGL_FT
@@ -1262,6 +1277,53 @@ pub fn run_autoland_scoped(
                                 )
                         }
                     };
+                    if wanted && steep {
+                        gave_up = true;
+                        let missed_legs = crate::procedure::take_missed_legs();
+                        let vy = crate::aircraft::live_profile()
+                            .and_then(|p| p.reference.as_ref().and_then(|r| r.vy_kts))
+                            .unwrap_or(approach_ias * 1.3);
+                        let flying = match missed_legs {
+                            Some(legs) => crate::procedure::start_scoped(
+                                base_url.clone(),
+                                voice.clone(),
+                                crate::procedure::Plan {
+                                    name: "the missed approach".to_string(),
+                                    legs,
+                                    end: crate::procedure::EndAction::Level,
+                                    vy_kts: vy,
+                                    cruise_ias_kts: None,
+                                    transition_altitude_ft: None,
+                                    climb_minimums: Vec::new(),
+                                    visual_deg: None,
+                                    missed_legs: Vec::new(),
+                                },
+                                Vec::new(),
+                            ),
+                            None => false,
+                        };
+                        crate::blackbox::record(
+                            "autoland",
+                            serde_json::json!({"event": "missed_procedure", "flying": flying, "radio": radio_ft}),
+                        );
+                        if flying {
+                            announce(
+                                "Flying the published missed approach.".to_string(),
+                                Priority::Caution,
+                            );
+                        } else {
+                            let thr_dref = throttle_dref();
+                            let _ = tokio::join!(
+                                xp.set_float(&thr_dref, GIVE_UP_THROTTLE),
+                                xp.set_float(VS_DIAL, 1000.0),
+                            );
+                            announce(
+                                "Going around, climbing straight ahead. Your aircraft.".to_string(),
+                                Priority::Warning,
+                            );
+                        }
+                        break;
+                    }
                     if wanted && reversals_flown >= crate::reversal::MAX_REVERSALS {
                         gave_up = true;
                         let thr_dref = throttle_dref();
@@ -2337,6 +2399,58 @@ impl TrackTrim {
 /// pattern that hands over 500 ft below it has already lost the approach.
 pub const GLIDEPATH_FT_PER_NM: f64 = 318.0;
 
+/// This approach's glidepath angle, degrees: 3 unless an approach handed a
+/// steeper one down for its visual segment (`set_next_glidepath_deg`; LSZS
+/// RNAV 03's MAP is 996 ft above the threshold two miles out, 4.7 degrees).
+/// Set at every arm, so no approach inherits another's.
+static GLIDEPATH_DEG: std::sync::Mutex<f64> = std::sync::Mutex::new(3.0);
+/// The angle the NEXT arm takes, consumed there.
+static NEXT_GLIDEPATH_DEG: std::sync::Mutex<Option<f64>> = std::sync::Mutex::new(None);
+/// The steepest path the landing will fly.
+pub const MAX_GLIDEPATH_DEG: f64 = 5.5;
+
+/// Hand the next autoland arm a glidepath angle (the follower does, at a MAP).
+pub fn set_next_glidepath_deg(deg: Option<f64>) {
+    *NEXT_GLIDEPATH_DEG.lock().unwrap_or_else(|e| e.into_inner()) = deg;
+}
+
+/// Take the handed-down angle for this arm (3 without one), clamped.
+fn arm_glidepath() -> f64 {
+    let deg = NEXT_GLIDEPATH_DEG
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .take()
+        .filter(|d| d.is_finite())
+        .map_or(3.0, |d| d.clamp(3.0, MAX_GLIDEPATH_DEG));
+    *GLIDEPATH_DEG.lock().unwrap_or_else(|e| e.into_inner()) = deg;
+    deg
+}
+
+fn glidepath_deg() -> f64 {
+    *GLIDEPATH_DEG.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Feet of path per nautical mile for this approach (318 at 3 degrees, the
+/// constant every law was tuned on, returned exactly).
+pub fn gp_ft_per_nm() -> f64 {
+    let deg = glidepath_deg();
+    if (deg - 3.0).abs() < 1e-9 {
+        GLIDEPATH_FT_PER_NM
+    } else {
+        6076.12 * deg.to_radians().tan()
+    }
+}
+
+/// tan of this approach's path angle (the 3 degree constant returned exactly).
+fn gp_tan() -> f64 {
+    let deg = glidepath_deg();
+    if (deg - 3.0).abs() < 1e-9 {
+        GLIDEPATH_TAN
+    } else {
+        deg.to_radians().tan()
+    }
+}
+
 /// The glidepath correction, fpm per foot of path error, sized to close the
 /// error over a fixed DISTANCE of final rather than a fixed time. 1.2 fpm/ft
 /// is a 50 s time constant: 0.9 nm on a 172 at 65 kt, but 2.4 nm on a 737 at
@@ -2361,7 +2475,7 @@ const GLIDEPATH_GAIN_MAX_MULT: f64 = 3.0;
 /// threshold — it's the same centreline, just a farther aim along it — and the
 /// flare still triggers off actual radio height, so it simply engages a little
 /// farther in, over the touchdown zone.
-const TOUCHDOWN_AIM_NM: f64 = 300.0 / M_PER_NM;
+pub const TOUCHDOWN_AIM_NM: f64 = 300.0 / M_PER_NM;
 /// Final approach point: intercept the extended centreline this far out (nm).
 const FAP_NM: f64 = 5.0;
 /// Can a final still be made from `xtk_nm` off the centreline with `along_nm`
@@ -2557,7 +2671,7 @@ pub fn overflight_allowance_nm(
         .unwrap_or(FLOAT_MIN_REMAINING_M)
         .max(FLOAT_MIN_REMAINING_M);
     let low_m = (length_m - need_m).min(0.5 * length_m);
-    let run_to_band_m = (radio_alt_ft - band_ft).max(0.0) * M_PER_FT / GLIDEPATH_TAN;
+    let run_to_band_m = (radio_alt_ft - band_ft).max(0.0) * M_PER_FT / gp_tan();
     ((low_m - run_to_band_m) / M_PER_NM).max(OVERFLIGHT_GO_AROUND_NM)
 }
 const M_PER_FT: f64 = 0.3048;
@@ -2682,7 +2796,7 @@ const ROUNDOUT_LEAD_S: f64 = 6.5;
 const FLARE_LEAD_S: f64 = 3.0;
 /// The gates for this approach: (flare height, roundout band top), feet.
 pub fn arrest_gates_ft(flare_radio_ft: f64, gs_kts: f64) -> (f64, f64) {
-    let sink_fps = (gs_kts.max(0.0) / 60.0) * GLIDEPATH_FT_PER_NM / 60.0;
+    let sink_fps = (gs_kts.max(0.0) / 60.0) * gp_ft_per_nm() / 60.0;
     let flare = flare_radio_ft.max(sink_fps * FLARE_LEAD_S);
     let band = (flare * ROUNDOUT_MULT).max(sink_fps * ROUNDOUT_LEAD_S);
     (flare, band)
@@ -3343,7 +3457,7 @@ impl GoAroundLatch {
 /// The 1.15 is margin — arriving exactly on a 3° path with no slack leaves
 /// nothing for the capture.
 pub fn join_point_nm(cur_alt_ft: f64, rwy_elev_ft: f64) -> f64 {
-    ((cur_alt_ft - rwy_elev_ft) / GLIDEPATH_FT_PER_NM * 1.15).clamp(FAP_NM, 40.0)
+    ((cur_alt_ft - rwy_elev_ft) / gp_ft_per_nm() * 1.15).clamp(FAP_NM, 40.0)
 }
 
 /// The command a latched go-around flies.
@@ -3527,7 +3641,7 @@ pub fn hold_flare(
             ..g
         };
     }
-    let nominal_vs = -(gs_kts / 60.0) * GLIDEPATH_FT_PER_NM;
+    let nominal_vs = -(gs_kts / 60.0) * gp_ft_per_nm();
     let (_, flare_vs) = arrest_targets_fpm(nominal_vs);
     Guidance {
         phase: ApproachPhase::Flare,
@@ -3580,7 +3694,7 @@ pub fn commit_flare(
     if radio_ft > ceiling_ft || remaining_m < need_m {
         return g;
     }
-    let nominal_vs = -(gs_kts / 60.0) * GLIDEPATH_FT_PER_NM;
+    let nominal_vs = -(gs_kts / 60.0) * gp_ft_per_nm();
     let (roundout_vs, flare_vs) = arrest_targets_fpm(nominal_vs);
     Guidance {
         // The overflight turned the heading back to the FAP; a landing
@@ -3623,7 +3737,7 @@ pub fn guidance(
 
     // 3° glidepath altitude at this distance (+ = we're above it). Aimed at the
     // touchdown zone, so it crosses the threshold at ~50 ft, not zero.
-    let glidepath_alt_ft = rwy.elev_ft + (dist_nm + TOUCHDOWN_AIM_NM) * GLIDEPATH_FT_PER_NM;
+    let glidepath_alt_ft = rwy.elev_ft + (dist_nm + TOUCHDOWN_AIM_NM) * gp_ft_per_nm();
     let alt_err = cur_alt_ft - glidepath_alt_ft;
 
     // Above this much excess, we can't just dive onto the path — fly to the JOIN
@@ -3641,7 +3755,7 @@ pub fn guidance(
     let along_nm = along_track_nm(cur_lat, cur_lon, rwy);
     // The arrest's gates and targets for THIS groundspeed (seconds of sink,
     // never bare feet: see `arrest_gates_ft`). `flare_radio_ft` is the floor.
-    let nominal_vs = -(gs_kts / 60.0) * GLIDEPATH_FT_PER_NM;
+    let nominal_vs = -(gs_kts / 60.0) * gp_ft_per_nm();
     let (flare_ft, band_ft) = arrest_gates_ft(flare_radio_ft, gs_kts);
     let (roundout_vs, flare_vs) = arrest_targets_fpm(nominal_vs);
     let float_nm = overflight_allowance_nm(
@@ -7126,5 +7240,45 @@ mod approach_power_floor_tests {
         let bad = crate::aircraft::FlareElevatorProfile { max: 2.0, ..p };
         assert_eq!(super::FlareGains::from_profile(Some(bad)), d);
         assert_eq!(super::FlareGains::from_profile(None), d);
+    }
+
+    /// LSZS RNAV 03 (2026-09-24): the MAP is 1.98 nm from the threshold,
+    /// 996 ft above it, 380 m right of the extended centreline. Handed the
+    /// visual segment's 4.74 degrees, the landing takes it from there on its
+    /// own path; at 3 degrees the same point would be 300 ft high.
+    #[test]
+    fn a_visual_segment_is_flown_on_its_own_path() {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let rwy = super::Runway {
+            icao: "LSZS".into(),
+            id: "03".into(),
+            thr_lat: 46.5270195,
+            thr_lon: 9.8780890,
+            course_deg: 29.0,
+            length_m: 1842.0,
+            surface: 1,
+            dist_nm: 0.0,
+            elev_ft: 5602.0,
+        };
+        let (map_lat, map_lon) = (46.5, 9.850666667);
+        // 996 ft over the threshold at 1.98 nm, measured to the aim point
+        // 300 m past it: what the follower hands down.
+        let aim = super::TOUCHDOWN_AIM_NM;
+        let deg = (996.0_f64 / ((1.98 + aim) * 6076.12)).atan().to_degrees();
+        super::set_next_glidepath_deg(Some(deg));
+        assert!((super::arm_glidepath() - deg).abs() < 1e-9);
+        assert!(deg > 4.2 && deg < 4.6, "{deg}");
+        let g = super::guidance(map_lat, map_lon, 6598.0, 996.0, 80.0, 90.0, &rwy, 87.0, 25.0, 0.0);
+        let above = 6598.0 - g.glidepath_alt_ft;
+        assert!(above.abs() < 40.0, "on the steep path at the MAP: {above:.0} ft");
+        assert_eq!(g.balk, None, "no balk at the MAP");
+        assert_eq!(g.phase, super::ApproachPhase::Final);
+        assert!(g.target_vs_fpm < -450.0 && g.target_vs_fpm > -1000.0, "{}", g.target_vs_fpm);
+        // The next arm without a handed angle is 3 degrees again.
+        assert_eq!(super::arm_glidepath(), 3.0);
+        assert_eq!(super::gp_ft_per_nm(), super::GLIDEPATH_FT_PER_NM);
+        let g3 = super::guidance(map_lat, map_lon, 6598.0, 996.0, 80.0, 90.0, &rwy, 87.0, 25.0, 0.0);
+        assert!(6598.0 - g3.glidepath_alt_ft > 250.0, "a 3 degree path calls it high");
     }
 }

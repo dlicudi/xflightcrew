@@ -2265,6 +2265,11 @@ pub struct ProcLeg {
     pub alt2_ft: Option<f64>,
     /// True when this leg's fix is the final approach fix.
     pub is_faf: bool,
+    /// The missed approach point (description code M): an approach that ends
+    /// here, short of the runway, has a visual segment to fly (LSZS).
+    pub is_map: bool,
+    /// The published vertical path angle, degrees (field 28: "-449" = 4.49).
+    pub vpa_deg: Option<f64>,
 }
 
 impl ProcLeg {
@@ -2340,7 +2345,9 @@ pub fn parse_proc_legs<'a>(
             fix: None,
             course_mag: arinc_tenths(cifp_field(&f, 20)),
             dist_nm: arinc_tenths(cifp_field(&f, 21)),
-            turn: cifp_field(&f, 12)
+            // The turn direction is field 9; 12 is only its "valid" flag
+            // (LOWI R26-Z's RF leg: "L" in 9, blank in 12).
+            turn: cifp_field(&f, 9)
                 .chars()
                 .next()
                 .filter(|c| *c == 'L' || *c == 'R'),
@@ -2348,6 +2355,12 @@ pub fn parse_proc_legs<'a>(
             alt1_ft: arinc_alt_ft(cifp_field(&f, 23)),
             alt2_ft: arinc_alt_ft(cifp_field(&f, 24)),
             is_faf: cifp_field(&f, 8).chars().nth(3) == Some('F'),
+            is_map: cifp_field(&f, 8).chars().nth(3) == Some('M'),
+            vpa_deg: cifp_field(&f, 28)
+                .parse::<f64>()
+                .ok()
+                .map(|v| v.abs() / 100.0)
+                .filter(|v| (1.0..=8.0).contains(v)),
         });
     }
     // Transition (runway) legs first, then the common portion, each by sequence.
@@ -2434,6 +2447,19 @@ fn runway_matches(a: &str, b: &str) -> bool {
 /// then RNAV/GPS ('R'/'X'/'Q'), then LOC ('L'), then anything else. `None` if the
 /// field publishes no approach to that runway.
 pub fn best_approach(cifp_dir: &str, icao: &str, runway: &str) -> Option<String> {
+    approach_candidates(cifp_dir, icao, runway).into_iter().next()
+}
+
+/// Every approach to `runway` the follower can fly, best first: by class
+/// (ILS, RNAV, LOC, VOR), a straight-in to the threshold ahead of one that
+/// ends at a missed approach point with a visual segment (`map_final_legs`),
+/// then file order. Only an approach that ENDS on this runway or at a MAP on
+/// straight legs qualifies: LOWI's RNAV 08 V and 26 E are circling procedures
+/// with no runway fix, 08 Z turns onto the runway on RF arcs, and picked by
+/// rank alone the circling one won and its missed approach was flown as the
+/// approach (2026-09-24). The geometry of a visual segment is the caller's to
+/// judge once the fixes are resolved (`visual_segment`).
+pub fn approach_candidates(cifp_dir: &str, icao: &str, runway: &str) -> Vec<String> {
     let rank = |id: &str| match id.chars().next() {
         Some('I') => 0,
         Some('X') | Some('R') | Some('Q') => 1,
@@ -2442,20 +2468,117 @@ pub fn best_approach(cifp_dir: &str, icao: &str, runway: &str) -> Option<String>
         _ => 4,
     };
     let path = std::path::Path::new(cifp_dir).join(format!("{icao}.dat"));
-    let text = std::fs::read_to_string(path).ok()?;
-    list_procedures(cifp_dir, icao, ProcKind::Appch)
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    let mut out: Vec<(u8, u8, String)> = list_procedures(cifp_dir, icao, ProcKind::Appch)
         .into_iter()
         .filter(|id| approach_runway(id).is_some_and(|r| runway_matches(&r, runway)))
-        // Only an approach that ENDS on this runway and can be flown on
-        // straight legs (`straight_in_legs`): LOWI's RNAV 08 V and 26 E are
-        // circling procedures with no runway fix, and 08 Z turns onto the
-        // runway on RF arcs. Picked by rank alone the circling one won, and
-        // its missed approach was flown as the approach (2026-09-24).
-        .filter(|id| {
-            straight_in_legs(parse_proc_legs(text.lines(), ProcKind::Appch, id, None), runway)
-                .is_some()
+        .filter_map(|id| {
+            let legs = parse_proc_legs(text.lines(), ProcKind::Appch, &id, None);
+            if straight_in_legs(legs.clone(), runway).is_some() {
+                Some((rank(&id), 0, id))
+            } else if map_final_legs(legs).is_some() {
+                Some((rank(&id), 1, id))
+            } else {
+                None
+            }
         })
-        .min_by_key(|id| rank(id))
+        .collect();
+    out.sort_by_key(|(r, m, _)| (*r, *m));
+    out.into_iter().map(|(_, _, id)| id).collect()
+}
+
+/// An approach that ends at a missed approach point SHORT of the runway (no
+/// runway fix before it), legs as far as the MAP, with no RF arc before it.
+/// LSZS's RNAV 03 and 21: a 4.5 degree final to a MAP about two miles out,
+/// then a visual segment. `None` otherwise.
+pub fn map_final_legs(legs: Vec<ProcLeg>) -> Option<Vec<ProcLeg>> {
+    let at = legs.iter().position(|l| l.is_map || l.fix_ident.starts_with("RW"))?;
+    if !legs[at].is_map || legs[..=at].iter().any(|l| l.leg_type == "RF") {
+        return None;
+    }
+    let mut legs = legs;
+    legs.truncate(at + 1);
+    Some(legs)
+}
+
+/// The visual segment from a MAP to the threshold: how far, how far off the
+/// extended centreline, how far the final course is from the runway's, and
+/// the angle down to the threshold.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct VisualSegment {
+    pub dist_nm: f64,
+    pub lateral_nm: f64,
+    pub course_diff_deg: f64,
+    pub angle_deg: f64,
+}
+
+/// A visual segment the landing can fly from: MAP within this of the threshold...
+pub const VISUAL_MAX_NM: f64 = 3.0;
+/// ...this close to the extended centreline...
+pub const VISUAL_MAX_LATERAL_NM: f64 = 0.4;
+/// ...on a final course within this of the runway's (straight-in criteria)...
+pub const VISUAL_MAX_COURSE_DEG: f64 = 30.0;
+/// ...and no steeper than this down to the threshold.
+pub const VISUAL_MAX_ANGLE_DEG: f64 = 5.0;
+
+/// Judge the visual segment of resolved `legs` (ending at the MAP) onto the
+/// threshold at `thr`, runway course `course_deg` true, elevation `thr_ft`.
+pub fn visual_segment(
+    legs: &[ProcLeg],
+    thr: (f64, f64),
+    course_deg: f64,
+    thr_ft: f64,
+) -> Option<VisualSegment> {
+    let map = legs.last()?;
+    let mf = map.fix.as_ref()?;
+    let map_ft = map.alt1_ft?;
+    let prev = legs[..legs.len() - 1].iter().rev().find_map(|l| l.fix.as_ref())?;
+    let final_course = bearing_deg(prev.lat, prev.lon, mf.lat, mf.lon);
+    let dist_nm = haversine_nm(mf.lat, mf.lon, thr.0, thr.1);
+    // Position relative to the runway: the MAP lies BEFORE the threshold on
+    // the approach side, so from the threshold it bears the reciprocal.
+    let from_thr = bearing_deg(thr.0, thr.1, mf.lat, mf.lon);
+    let off = angle_diff_deg(from_thr, (course_deg + 180.0).rem_euclid(360.0));
+    let lateral_nm = dist_nm * off.to_radians().sin().abs();
+    let height_ft = map_ft - thr_ft;
+    Some(VisualSegment {
+        dist_nm,
+        lateral_nm,
+        course_diff_deg: angle_diff_deg(final_course, course_deg).abs(),
+        angle_deg: (height_ft / (dist_nm * 6076.12)).atan().to_degrees(),
+    })
+}
+
+impl VisualSegment {
+    /// Flyable as a straight-in visual segment by the landing.
+    pub fn flyable(&self) -> bool {
+        self.dist_nm <= VISUAL_MAX_NM
+            && self.lateral_nm <= VISUAL_MAX_LATERAL_NM
+            && self.course_diff_deg <= VISUAL_MAX_COURSE_DEG
+            && (2.5..=VISUAL_MAX_ANGLE_DEG).contains(&self.angle_deg)
+    }
+}
+
+/// The named transitions (route type A) of approach `ident`, file order.
+pub fn approach_transitions(cifp_dir: &str, icao: &str, ident: &str) -> Vec<String> {
+    let path = std::path::Path::new(cifp_dir).join(format!("{icao}.dat"));
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    let mut out: Vec<String> = Vec::new();
+    for line in text.lines() {
+        let Some(body) = line.strip_prefix("APPCH:") else { continue };
+        let f: Vec<&str> = body.split(',').collect();
+        if cifp_field(&f, 1) == "A" && cifp_field(&f, 2) == ident {
+            let t = cifp_field(&f, 3).to_string();
+            if !t.is_empty() && !out.contains(&t) {
+                out.push(t);
+            }
+        }
+    }
+    out
 }
 
 /// An approach's legs as far as the runway threshold, when it is a straight-in
@@ -2480,6 +2603,116 @@ pub fn straight_in_legs(legs: Vec<ProcLeg>, runway: &str) -> Option<Vec<ProcLeg>
 
 fn side_letter(rwy: &str) -> Option<char> {
     rwy.chars().rev().find(|c| matches!(c, 'L' | 'R' | 'C'))
+}
+
+/// The highest minimum sector altitude published for `icao` (the airport's
+/// own record in `earth_msa.dat`, else any record belonging to it), feet.
+/// LSZS: sectors of 15,500 and 13,500 ft out to 25 nm. `None` without a record.
+pub fn airport_msa_ft(msa_path: &str, icao: &str) -> Option<f64> {
+    let text = std::fs::read_to_string(msa_path).ok()?;
+    airport_msa_in(text.lines(), icao)
+}
+
+/// [`airport_msa_ft`] over the file's lines (pure, for tests).
+pub fn airport_msa_in<'a>(lines: impl Iterator<Item = &'a str>, icao: &str) -> Option<f64> {
+    let mut own: Option<f64> = None;
+    let mut any: Option<f64> = None;
+    for line in lines {
+        let f: Vec<&str> = line.split_whitespace().collect();
+        if f.len() < 8 || !f[3].eq_ignore_ascii_case(icao) {
+            continue;
+        }
+        let mut max: Option<f64> = None;
+        for t in f[5..].chunks(3) {
+            if t.len() < 3 {
+                break;
+            }
+            let (Ok(alt), Ok(radius)) = (t[1].parse::<f64>(), t[2].parse::<f64>()) else {
+                break;
+            };
+            if alt <= 0.0 && radius <= 0.0 {
+                break;
+            }
+            max = Some(max.unwrap_or(0.0).max(alt * 100.0));
+        }
+        let Some(m) = max else { continue };
+        if f[1].eq_ignore_ascii_case(icao) {
+            own = Some(own.unwrap_or(0.0).max(m));
+        } else {
+            any = Some(any.unwrap_or(0.0).max(m));
+        }
+    }
+    own.or(any)
+}
+
+/// A minimum altitude a departure must cross a fix at or above.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ClimbMinimum {
+    pub fix: String,
+    pub min_ft: f64,
+}
+
+/// The minimum altitudes of SID `sid` at `icao` for `runway`, in procedure
+/// order: its runway transition (a parallel "RW26B" included), the common
+/// part and any enroute transition. `+` and "at" constraints are minimums, a
+/// `B` window's lower bound is; `-` constraints bound nothing from below.
+/// LOWI's MOGT3H needs 7,850 ft at WI506 nine miles out, and the follower
+/// flew SimBrief's predicted profile at cruise speed, about 2,200 ft under it
+/// (2026-09-24).
+pub fn sid_minimums(cifp_dir: &str, icao: &str, sid: &str, runway: &str) -> Vec<ClimbMinimum> {
+    let path = std::path::Path::new(cifp_dir).join(format!("{icao}.dat"));
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    sid_minimums_in(text.lines(), sid, runway)
+}
+
+/// [`sid_minimums`] over the file's lines (pure, for tests).
+pub fn sid_minimums_in<'a>(
+    lines: impl Iterator<Item = &'a str>,
+    sid: &str,
+    runway: &str,
+) -> Vec<ClimbMinimum> {
+    let mut out: Vec<ClimbMinimum> = Vec::new();
+    for line in lines {
+        let Some(body) = line.strip_prefix("SID:") else {
+            continue;
+        };
+        let f: Vec<&str> = body.split(',').collect();
+        if !cifp_field(&f, 2).eq_ignore_ascii_case(sid) {
+            continue;
+        }
+        let tr = cifp_field(&f, 3);
+        let ours = match tr.strip_prefix("RW") {
+            // "RW26B" serves both parallels: its number is enough.
+            Some(r) if r.ends_with('B') => runway_number(r) == runway_number(runway),
+            Some(r) => runway_matches(r, runway) && r.len() == runway.len(),
+            None => true, // the common part, or an enroute transition
+        };
+        if !ours {
+            continue;
+        }
+        let fix = cifp_field(&f, 4);
+        if fix.is_empty() {
+            continue;
+        }
+        let (a1, a2) = (arinc_alt_ft(cifp_field(&f, 23)), arinc_alt_ft(cifp_field(&f, 24)));
+        let min = match cifp_field(&f, 22).chars().next().unwrap_or(' ') {
+            '+' | ' ' => a1,
+            'B' => a2,
+            _ => None,
+        };
+        if let Some(min_ft) = min {
+            match out.iter_mut().find(|m| m.fix == fix) {
+                Some(m) => m.min_ft = m.min_ft.max(min_ft),
+                None => out.push(ClimbMinimum {
+                    fix: fix.to_string(),
+                    min_ft,
+                }),
+            }
+        }
+    }
+    out
 }
 
 /// A SID that departs `runway` at `icao` — the first ident with a leg whose
@@ -2719,6 +2952,8 @@ pub fn reconstruct_approach(
             alt1_ft: Some((elev + dist_nm * GLIDE_FT_PER_NM).round()),
             alt2_ft: None,
             is_faf: i == last, // the innermost DME fix
+            is_map: false,
+            vpa_deg: None,
         });
     }
     // The threshold itself, so the follower has a fix to fly to after the FAF
@@ -2741,6 +2976,8 @@ pub fn reconstruct_approach(
         alt1_ft: Some(elev),
         alt2_ft: None,
         is_faf: false,
+        is_map: false,
+        vpa_deg: None,
     });
     legs
 }
@@ -2954,6 +3191,8 @@ mod tests {
             alt1_ft: None,
             alt2_ft: None,
             is_faf: false,
+            is_map: false,
+            vpa_deg: None,
         };
         let circling = vec![leg("IF", "WI813"), leg("TF", "WI814"), leg("TF", "WI006"), leg("TF", "RTT")];
         assert!(straight_in_legs(circling, "08").is_none());
@@ -2965,6 +3204,76 @@ mod tests {
         assert_eq!(got.len(), 3);
         // A "26" approach is not the grass 26R's.
         assert!(straight_in_legs(z, "26R").is_none());
+    }
+
+    #[test]
+    fn an_airports_msa_is_its_highest_sector() {
+        let file = " 1  LSZS LS LSZS M 261 155 25 045 135 25 000 000  0
+ 1  LOWI LO LOWI M 180 107 25 270 135 25 015 143 25 100 113 25 000 000  0
+ 2   RTT LO LOWI M 270 142 25 045 116 25 120 103 25 000 000  0
+ 2   MNW ED EDDM M 180 037 25 000 000  0";
+        assert_eq!(airport_msa_in(file.lines(), "LSZS"), Some(15_500.0));
+        assert_eq!(airport_msa_in(file.lines(), "LOWI"), Some(14_300.0), "its own record");
+        assert_eq!(airport_msa_in(file.lines(), "EDDM"), Some(3_700.0), "a fix's record");
+        assert_eq!(airport_msa_in(file.lines(), "EGLL"), None);
+    }
+
+    /// LOWI MOGT3H (AIRAC 2609): its RW26 transition's minimums, in order.
+    #[test]
+    fn a_sids_minimums_are_read_for_its_runway() {
+        let file = "\
+SID:010,5,MOGT3H,RW26,WI505,LO,P,C,E   , ,   ,CF, ,OEV,LO,D, ,      ,2570,0030,2570,0030,+,04000,     ,18000,-,210,    ,   , , , , , , , , ;
+SID:020,5,MOGT3H,RW26,WI506,LO,P,C,E   , ,   ,TF, , , , , ,      ,    ,    ,    ,    ,+,07850,     ,18000,-,210,    ,   , , , , , , , , ;
+SID:030,5,MOGT3H,RW26,WI507,LO,P,C,E   , ,   ,TF, , , , , ,      ,    ,    ,    ,    ,+,08400,     ,18000, ,   ,    ,   , , , , , , , , ;
+SID:010,5,MOGT3H,RW08,WI900,LO,P,C,E   , ,   ,TF, , , , , ,      ,    ,    ,    ,    ,+,09999,     ,18000, ,   ,    ,   , , , , , , , , ;
+SID:100,5,MOGT3H,RW26,MOGTI,LO,E,A,E   , ,   ,TF, , , , , ,      ,    ,    ,    ,    ,-,13000,     ,18000, ,   ,    ,   , , , , , , , , ;";
+        let m = sid_minimums_in(file.lines(), "MOGT3H", "26");
+        let got: Vec<(&str, f64)> = m.iter().map(|m| (m.fix.as_str(), m.min_ft)).collect();
+        assert_eq!(got, vec![("WI505", 4000.0), ("WI506", 7850.0), ("WI507", 8400.0)]);
+        assert!(sid_minimums_in(file.lines(), "OTHER1A", "26").is_empty());
+    }
+
+    /// LSZS RNAV 03 (AIRAC 2609): a final to a MAP two miles short, then a
+    /// visual segment; RNAV 21's MAP is 0.7 nm out at 5.3 degrees, too steep.
+    #[test]
+    fn a_map_approach_is_judged_on_its_visual_segment() {
+        let leg = |id: &str, lat: f64, lon: f64, map: bool, alt: Option<f64>| ProcLeg {
+            seq: 0,
+            transition: String::new(),
+            leg_type: "TF".into(),
+            fix_ident: id.into(),
+            fix_region: String::new(),
+            fix: Some(Fix { ident: id.into(), lat, lon }),
+            course_mag: None,
+            dist_nm: None,
+            turn: None,
+            alt_desc: ' ',
+            alt1_ft: alt,
+            alt2_ft: None,
+            is_faf: false,
+            is_map: map,
+            vpa_deg: None,
+        };
+        let raw = vec![
+            leg("ZS701", 46.3265, 9.575944, false, Some(12400.0)),
+            leg("ZS702", 46.357417, 9.687639, false, Some(11800.0)),
+            leg("ZS705", 46.5, 9.850667, true, Some(6598.0)),
+            leg("ZS706", 46.567778, 9.915667, false, None),
+        ];
+        let legs = map_final_legs(raw.clone()).expect("ends at a MAP");
+        assert_eq!(legs.last().unwrap().fix_ident, "ZS705", "missed approach cut");
+        let seg = visual_segment(&legs, (46.5270195, 9.8780890), 28.9, 5602.0).unwrap();
+        assert!((seg.dist_nm - 1.98).abs() < 0.05, "{seg:?}");
+        assert!(seg.lateral_nm < 0.25 && seg.course_diff_deg < 12.0, "{seg:?}");
+        assert!((seg.angle_deg - 4.74).abs() < 0.05, "{seg:?}");
+        assert!(seg.flyable());
+        // Too steep: RNAV 21's MAP, 394 ft up at 0.7 nm.
+        let steep = VisualSegment { dist_nm: 0.7, lateral_nm: 0.05, course_diff_deg: 15.0, angle_deg: 5.3 };
+        assert!(!steep.flyable());
+        // A runway fix first is a straight-in, not a MAP approach.
+        let mut rw = raw;
+        rw.insert(2, leg("RW03", 46.527, 9.878, false, Some(5602.0)));
+        assert!(map_final_legs(rw).is_none());
     }
 
     #[test]

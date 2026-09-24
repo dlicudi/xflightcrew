@@ -253,6 +253,9 @@ fn build_plan(
                 vy_kts,
                 cruise_ias_kts: None, // a SID/approach manages its own speed
                 transition_altitude_ft: None,
+                climb_minimums: Vec::new(),
+                visual_deg: None,
+                missed_legs: Vec::new(),
             },
             ack,
         ));

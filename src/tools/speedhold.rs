@@ -173,11 +173,24 @@ pub fn airspace_limited(alt_ft: f64, wanted: f64) -> f64 {
 /// target and, if the governor isn't already running, starts it on its own
 /// thread. Idempotent; a running hold just picks up the new target.
 pub fn arm_flight(base_url: String, voice: Option<crate::voice::Voice>, target_kts: f64) {
+    arm_flight_with_floor(base_url, voice, target_kts, crate::aircraft::speed_floor_kts())
+}
+
+/// [`arm_flight`] against a given floor: the LANDING configuration's
+/// (`aircraft::approach_floor_kts`) for a caller flying configured, the clean
+/// one otherwise. LSZS final (2026-09-24): 87 kt with the flaps out floored
+/// to the clean 96, said on every tick.
+pub fn arm_flight_with_floor(
+    base_url: String,
+    voice: Option<crate::voice::Voice>,
+    target_kts: f64,
+    floor: Option<f64>,
+) {
     // The airframe's stall floor outranks whoever is asking: a wrong number
     // handed down from a profile, a plan or a pilot is still a wrong number
     // (the RV-10's 65 kt "approach speed", 2026-09-11).
     let asked = clamp_target(target_kts);
-    let target = crate::aircraft::floored_target(asked, crate::aircraft::speed_floor_kts());
+    let target = crate::aircraft::floored_target(asked, floor);
     if target > asked {
         tracing::warn!(
             asked,

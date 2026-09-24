@@ -205,15 +205,20 @@ turboprop_start:
   # Shutdown. The POM's Parking checklist says "ENGINE START / STOP - STOP",
   # which is this knob back to OFF, and the knob is what actually secures the
   # aircraft: `SF50_ignition_down_CMDhandler` sets knob_state = 0, drops
-  # `fuel_pump_on[0]` and `igniter_on[0]`, and stops the starter, after which
-  # `update_button_systems` sees button_state == 0 and fires
-  # `sim/starters/shut_down_1` itself.
+  # `fuel_pump_on[0]` and `igniter_on[0]`, and stops the starter. But
+  # `update_button_systems` fires `sim/starters/shut_down_1` only while
+  # button_state == 0, and after a start it stays 1 until START/STOP is
+  # pressed with the knob at OFF (`SF50_eng_start_stop_CMDhandler`).
   #
   # Cutting the mixture alone does wind the engine down, but leaves the knob at
   # RUN with the boost pump and igniter still live. The shared `stop_engines`
   # does the cutoff first and then fires this, so the lever remains the backstop
   # if the command ever stops working.
-  shutdown_commands: [laminar/SF50/ignition_down]
+  # The knob to OFF, THEN the START/STOP button: sf50_ignition.lua only runs
+  # the sim's shutdown while the button state is 0, and the button drops to 0
+  # only when pressed with the knob already OFF. The knob alone left the
+  # engine running at LSZS while the tool said "winding down" (2026-09-24).
+  shutdown_commands: [laminar/SF50/ignition_down, laminar/SF50/eng_start_stop_toggle]
 
 # Electrical. BATTERY 1, BATTERY 2, GENERATOR 1, GENERATOR 2 are the POM's own
 # labels (the cold-and-dark checklist p.42 and the parking checklist p.60 name

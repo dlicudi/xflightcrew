@@ -2521,6 +2521,7 @@ mod tests {
     fn every_speed_and_rate_in_the_laws_is_classified() {
         // (module, NAME) -> why it may be a shared constant.
         const REVIEWED: &[(&str, &str, &str)] = &[
+            ("procedure", "NOT_CLIMBING_FPM", "a rate that is not a climb, any airframe"),
             ("autotakeoff", "ROLL_BRAKE_FULL_KTS", "brake-steer fade band, groundspeed; only brake_steer airframes"),
             ("autotakeoff", "ROLL_BRAKE_OFF_KTS", "brake-steer fade band, groundspeed; only brake_steer airframes"),
             ("speedhold", "IDLE_FAST_KTS", "margin over the pilot's own target, not an airframe speed"),

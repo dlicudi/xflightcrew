@@ -117,6 +117,19 @@ pub struct FlightPlan {
     /// to each new QNH all the way down England (2026-09-21).
     pub transition_altitude_ft: Option<f64>,
     pub transition_level_ft: Option<f64>,
+    /// The departure and arrival procedures and runways the plan was built
+    /// for (OFP `general/sid_ident`, `general/star_ident`, `origin/plan_rwy`,
+    /// `destination/plan_rwy`). Empty on a local plan.
+    pub procedures: PlanProcedures,
+}
+
+/// See [`FlightPlan::procedures`].
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct PlanProcedures {
+    pub sid: Option<String>,
+    pub star: Option<String>,
+    pub origin_rwy: Option<String>,
+    pub dest_rwy: Option<String>,
 }
 
 /// The OFP's load sheet, in kilograms. SimBrief plans in the user's unit
@@ -255,6 +268,12 @@ pub async fn fetch(user_id: &str) -> Result<FlightPlan> {
     Ok(FlightPlan {
         transition_altitude_ft: Some(n("/origin/trans_alt")).filter(|v| *v >= 1000.0),
         transition_level_ft: Some(n("/destination/trans_level")).filter(|v| *v >= 1000.0),
+        procedures: PlanProcedures {
+            sid: ident_of(s("/general/sid_ident")),
+            star: ident_of(s("/general/star_ident")),
+            origin_rwy: ident_of(s("/origin/plan_rwy")),
+            dest_rwy: ident_of(s("/destination/plan_rwy")),
+        },
         source: PlanSource::SimBrief,
         origin,
         destination,
@@ -621,4 +640,12 @@ mod tests {
             "{payload}"
         );
     }
+}
+
+/// An OFP identifier field, or `None` when it is empty or a placeholder
+/// (SimBrief writes `{}` for "none": LOWI-LSZS has no STAR).
+fn ident_of(raw: String) -> Option<String> {
+    let t = raw.trim();
+    (!t.is_empty() && t != "{}" && t.chars().all(|c| c.is_ascii_alphanumeric()))
+        .then(|| t.to_ascii_uppercase())
 }

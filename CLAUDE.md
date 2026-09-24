@@ -901,6 +901,26 @@ history):
   (`recede_ref_nm`). **Flaps do not cycle on a placard**
   (`flap_held_within_limits`). **A give-up hands the SPEED to the governor**
   (`hand_back_speed_kts`): the flat 0.75 lever took a level 737 to 346 kt.
+- **A departure is flown to its chart** (LOWI MOGT3H, 2026-09-24): the
+  planned SID's CIFP minimums (`nav::sid_minimums`, SimBrief `sid_ident` /
+  `plan_rwy`) ride the plan as `climb_minimums`; the arm judges each one's
+  gradient from the departure end against Vy and the best climb
+  (`departure_gradients`, refused past 90 %, said past 75 %); the follower
+  climbs at Vy and the best rate while one is unmet, predicts every crossing,
+  says a short one and hands over when one will not be made
+  (`watch_minimum`). The taxi request names the SID's runway (the tower
+  honours it unless the wind really favours another end), and a different
+  cleared runway is said and handed back on the ramp.
+- **A mountain field is an approach we can fly or a hand-over, never a
+  visual autoland** (`mountain_field`: MSA from `earth_msa.dat` 3,000 ft or
+  more above the field). An approach that ends at a MAP short of the runway
+  (LSZS RNAV 03) is flown from its transition to the MAP on its published
+  path (`map_path`, rate fed forward), configured at landing speed, and
+  landed from the MAP on a visual segment the landing can fly
+  (`nav::visual_segment`: within 3 nm, 0.4 nm of the centreline, 30 degrees,
+  5 degrees), autoland on that segment's own angle (`gp_ft_per_nm`, 3
+  degrees exactly otherwise). A go-around there flies the PUBLISHED missed
+  approach (`take_missed_legs`), never a reversal pattern.
 - **An approach is a straight-in to THIS runway or it is not offered**
   (`nav::straight_in_legs`, LOWI 2026-09-24): a runway fix for the exact
   designator (a grass "26R" never inherits "26"), no RF arc before it, the

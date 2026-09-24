@@ -140,6 +140,36 @@ pub async fn ensure_on(xp: &dyn XPlane) -> CabinAir {
     out
 }
 
+/// Seconds between valve syncs.
+const VALVE_SYNC_S: f64 = 2.0;
+static LAST_SYNC: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
+
+/// The valve behind an oxygen button FOLLOWS the button, both ways. On the
+/// SF50 the button only sets the demand setting and the stock valve is what
+/// flows, with no control of its own in the cockpit: opened for the FL260
+/// rescue and by the mission start, it went on hissing after the pilot
+/// switched the oxygen master off (LOWI, 2026-09-24). Rate-limited, read
+/// first, written only when they disagree. `Some(on)` when it wrote.
+pub async fn sync_valve(xp: &dyn XPlane) -> Option<bool> {
+    let p = declared()?;
+    let (r, valve) = (p.oxygen_read.as_ref()?, p.oxygen_valve.as_ref()?);
+    {
+        let mut last = LAST_SYNC.lock().unwrap_or_else(|e| e.into_inner());
+        if last.is_some_and(|t| t.elapsed().as_secs_f64() < VALVE_SYNC_S) {
+            return None;
+        }
+        *last = Some(std::time::Instant::now());
+    }
+    let want = read(xp, r).await? >= 1.0;
+    let open = read(xp, valve).await? >= 0.5;
+    if want == open {
+        return None;
+    }
+    xp.set_float(valve, if want { 1.0 } else { 0.0 }).await.ok()?;
+    crate::blackbox::record("cabin_air", serde_json::json!({ "event": "valve_sync", "open": want }));
+    Some(want)
+}
+
 /// The altitude a hypoxic cabin descends to, handed to a flying follower
 /// (whose terrain floor still outranks it).
 pub const HYPOXIA_DESCENT_FT: f64 = 10_000.0;
@@ -209,6 +239,24 @@ mod tests {
         let got = ensure_on(&xp).await;
         assert_eq!(got.oxygen, Some(true));
         assert_eq!(got.line().as_deref(), Some("Oxygen on."));
+
+        // The valve follows the button: master off closes it (the hiss
+        // after the pilot switched the SF50's oxygen off).
+        *LAST_SYNC.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        let xp = FakeXPlane::with_reads(&[
+            (p.oxygen_read.as_deref().unwrap(), 0.0),
+            (p.oxygen_valve.as_deref().unwrap(), 1.0),
+        ]);
+        assert_eq!(sync_valve(&xp).await, Some(false));
+        assert_eq!(xp.last_write(p.oxygen_valve.as_deref().unwrap()), Some(0.0));
+        // Agreeing, nothing is written.
+        *LAST_SYNC.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        let xp = FakeXPlane::with_reads(&[
+            (p.oxygen_read.as_deref().unwrap(), 2.0),
+            (p.oxygen_valve.as_deref().unwrap(), 1.0),
+        ]);
+        assert_eq!(sync_valve(&xp).await, None);
+        assert!(!xp.wrote(p.oxygen_valve.as_deref().unwrap()));
 
         // An undeclared airframe touches nothing.
         publish(None);

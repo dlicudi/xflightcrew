@@ -793,6 +793,9 @@ pub struct RollSteer {
     trim: f64,
     prev_err: Option<f64>,
     out: f64,
+    /// No propeller, no P-factor to lead: a jet takes no power lead
+    /// (`for_airframe`). The default is the propeller law.
+    jet: bool,
 }
 
 /// The rudder led in WITH the power: proportional to the throttle
@@ -802,6 +805,25 @@ pub fn power_lead(thr: f64, gs_kts: f64) -> f64 {
 }
 
 impl RollSteer {
+    /// The law for the live airframe: a JET gets no power lead. The lead is
+    /// right rudder against a propeller's left-turning tendency, and fed
+    /// into the SF50's roll it WAS the swing: 0.1 to 0.25 of right rudder at
+    /// full power, the heading error building to 18 degrees against a
+    /// saturated command and the aircraft 60 m right of the centreline by
+    /// 60 kt (LOWI 26, 2026-09-24).
+    pub fn for_airframe() -> Self {
+        let jet = crate::aircraft::live_profile().is_some_and(|p| {
+            p.reference
+                .as_ref()
+                .and_then(|r| r.kind.as_deref())
+                .is_some_and(|k| k.to_ascii_lowercase().contains("jet"))
+        });
+        Self {
+            jet,
+            ..Self::default()
+        }
+    }
+
     /// One control tick: heading error (deg, right positive), the time
     /// since the last tick, groundspeed, and the throttle being
     /// commanded (for the power feed-forward). Returns the deflection.
@@ -818,7 +840,8 @@ impl RollSteer {
         let cap = LOW_SPEED_STEER_CAP
             + (MAX_ROLL_STEER - LOW_SPEED_STEER_CAP)
                 * (gs_kts / LOW_SPEED_FULL_KTS).clamp(0.0, 1.0);
-        let want = (pd + self.trim + power_lead(thr, gs_kts)).clamp(-cap, cap);
+        let lead = if self.jet { 0.0 } else { power_lead(thr, gs_kts) };
+        let want = (pd + self.trim + lead).clamp(-cap, cap);
         // The trim integrates unconditionally ON THE ROLL — its own small
         // cap bounds wind-up, and a saturated command with a persisting
         // error is exactly when the standing rudder must build. Below
@@ -1214,6 +1237,11 @@ pub fn climb_throttle(ias_kts: f64, vne_kts: Option<f64>) -> f64 {
 /// the flaps running up on speed alone at 400, 500 and 740 ft, 240 kt through
 /// 1,000 ft. A crew holds V2 + 20 to the acceleration height by PITCH, then
 /// lowers the nose and cleans up on the schedule.
+/// Full auto has a departure's minimum altitudes ahead: the takeoff climbs at
+/// best rate. Set by full auto for its takeoff, cleared after.
+pub static DEPARTURE_MINIMUMS: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ClimbOut {
     pub accel_agl_ft: f64,
@@ -1576,7 +1604,7 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, p: Params) {
     // The roll section's heading error, one tick stale, for the throttle's
     // swinging-nose hold (throttle is commanded before position is read).
     let mut last_err = 0.0_f64;
-    let mut steer_law = RollSteer::default();
+    let mut steer_law = RollSteer::for_airframe();
     let brake_steer = brake_steers();
     // Previous cross-track, for the roll's own closure rate (see
     // [`roll_target_heading`]). Metres, right-positive.
@@ -1997,10 +2025,20 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, p: Params) {
                 }),
             );
         }
+        // With departure minimums ahead (full auto's SID), the climb-out is
+        // flown at the airframe's BEST rate, holding its initial climb speed
+        // by climbing harder: capped at the enroute 1,500 fpm the SF50 made
+        // 750 ft a mile where MOGT3H's WI505 wanted 816 (LOWI, 2026-09-24).
+        let (base_fpm, climb_out) = if DEPARTURE_MINIMUMS.load(Ordering::Relaxed) {
+            let best = crate::procedure::best_climb_fpm().max(p.climb_fpm);
+            (best, Some(ClimbOut { accel_agl_ft: f64::INFINITY, max_fpm: best }))
+        } else {
+            (p.climb_fpm, climb_out)
+        };
         let vs = climb_out_vs_fpm(
             ias,
             p.initial_climb_kts,
-            p.climb_fpm,
+            base_fpm,
             climb_guard_vne(p.vne_kts),
             agl_ft,
             climb_out,
@@ -3832,5 +3870,20 @@ mod tests {
         assert!((l30 - 0.5 * l).abs() < 1e-9, "half by 30 kt: {l30}");
         assert_eq!(super::roll_brake_split(-0.85, 45.0), (0.0, 0.0), "the rudder's above 40");
         assert_eq!(super::roll_brake_split(0.02, 12.0), (0.0, 0.0), "no brake for a breath of steer");
+    }
+
+    #[test]
+    fn a_jet_takes_no_propeller_power_lead() {
+        // LOWI 26 (2026-09-24): full power, straight, parked: the propeller
+        // law leads right rudder, the jet law nothing.
+        let mut prop = super::RollSteer::default();
+        let mut jet = super::RollSteer { jet: true, ..Default::default() };
+        let (mut p, mut j) = (0.0, 0.0);
+        for _ in 0..20 {
+            p = prop.step(0.0, 0.2, 5.0, 1.0);
+            j = jet.step(0.0, 0.2, 5.0, 1.0);
+        }
+        assert!(p > 0.05, "prop leads right: {p}");
+        assert!(j.abs() < 1e-9, "jet leads nothing: {j}");
     }
 }
