@@ -155,6 +155,24 @@ impl OnnxTts {
         }
     }
 
+    /// Render one line at a tempo: `length` and `noise_w` MULTIPLY the voice's
+    /// current scales for this render only, then the voice is put back as it
+    /// was (`tempo::line_tempo`: a warning quick and flat, chat looser).
+    pub fn render_at_tempo(
+        &mut self,
+        text: &str,
+        length: f32,
+        noise_w: f32,
+        fx: impl FnOnce(&mut Vec<f32>, u32),
+    ) -> Result<Vec<f32>> {
+        let saved = self.scales;
+        self.scales[1] *= length;
+        self.scales[2] *= noise_w;
+        let out = self.render_with(text, fx);
+        self.scales = saved;
+        out
+    }
+
     fn ids_of(&self, key: &str) -> Vec<i64> {
         self.phoneme_ids.get(key).cloned().unwrap_or_default()
     }

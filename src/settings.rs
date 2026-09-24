@@ -523,6 +523,52 @@ pub const ALL: &[Setting] = &[
             true
         },
     },
+    Setting {
+        key: "crew_chatter",
+        env: "XCOPILOT_CREW_CHATTER",
+        label: "copilot chat",
+        help: "what the copilot volunteers: landing word, offers, remarks; answers and safety calls always",
+        kind: Kind::Choice(&["quiet", "normal", "chatty"]),
+        tier: Tier::Live,
+        persist: Persist::Map,
+        get: || {
+            Value::Choice(
+                crate::persona::Chatter::parse(&live().crew_chatter)
+                    .as_str()
+                    .to_string(),
+            )
+        },
+        apply: |v| {
+            let Some(c) = v.as_choice() else { return false };
+            let c = crate::persona::Chatter::parse(c).as_str().to_string();
+            update(|cfg| cfg.crew_chatter = c);
+            true
+        },
+    },
+    Setting {
+        key: "crew_dialect",
+        env: "XCOPILOT_CREW_DIALECT",
+        label: "copilot idiom",
+        help: "auto follows the voice's accent (\"cheers\" or \"you bet\"); british or american picks one",
+        kind: Kind::Choice(&["auto", "british", "american"]),
+        tier: Tier::Live,
+        persist: Persist::Map,
+        get: || {
+            let d = live().crew_dialect.trim().to_ascii_lowercase();
+            let d = if d == "british" || d == "american" {
+                d
+            } else {
+                "auto".to_string()
+            };
+            Value::Choice(d)
+        },
+        apply: |v| {
+            let Some(d) = v.as_choice() else { return false };
+            let d = d.to_string();
+            update(|cfg| cfg.crew_dialect = d);
+            true
+        },
+    },
 ];
 
 /// Both channel volumes go to the audio layer together (it takes a pair), so a

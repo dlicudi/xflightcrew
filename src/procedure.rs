@@ -799,8 +799,12 @@ pub fn approach_plan_for(
     // when there's no coded procedure — Gibraltar's whole story).
     let (legs, name) = match crate::nav::best_approach(cifp, icao, rwy_id) {
         Some(appch) => {
-            let mut legs =
+            // As far as the threshold: the missed approach is never the
+            // approach (`straight_in_legs`, which `best_approach` already
+            // required of this one).
+            let legs =
                 crate::nav::load_proc_legs(cifp, icao, crate::nav::ProcKind::Appch, &appch, None);
+            let mut legs = crate::nav::straight_in_legs(legs, rwy_id).unwrap_or_default();
             crate::nav::resolve_proc_fixes(fix_path, nav_path, airport, icao, &mut legs, lat, lon);
             (
                 legs,
@@ -1160,6 +1164,7 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, plan: Pla
     // always showed one honest 8,000 followed by the dive.
     let mut prev_cmd_alt = carry_alt;
     let mut last_vs_cmd: Option<f64> = None;
+    let mut prev_ias: Option<(f64, std::time::Instant)> = None;
     // The altitude PRESELECT is driven to the leg target too: a stale dial
     // with capture armed (1,122 ft on the Jerez departure, from nobody's
     // loop) would otherwise level the climb wherever it happened to sit —
@@ -1548,9 +1553,28 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, plan: Pla
         // 37-minute job burning low-altitude fuel (2026-09-20). The descent
         // rate is the SAME one that placed the top of descent, so the point
         // and the rate can never disagree.
+        let now_ias = std::time::Instant::now();
+        let ias_trend = prev_ias.map_or(0.0, |(p, t0): (f64, std::time::Instant)| {
+            let dt = now_ias.duration_since(t0).as_secs_f64();
+            if (0.2..=5.0).contains(&dt) {
+                (ias - p) / dt
+            } else {
+                0.0
+            }
+        });
+        prev_ias = Some((ias, now_ias));
         let mut vs_cmd = ((want_alt - alt_ft) * 3.0).clamp(-descent_fpm(), climb_fpm());
         if vs_cmd > 0.0 && vy_kts > 0.0 {
             vs_cmd = vs_cmd.min(crate::autotakeoff::climb_vs_fpm(ias, vy_kts, vs_cmd));
+            // ...and the circuit's own fade to NOTHING at the airframe's speed
+            // floor. The takeoff law above takes 60 fpm a knot off its cap and
+            // never goes under 150, so against the SF50's 1,500 fpm cap it
+            // still asked about 1,000 fpm at 104 kt and FL260, 16 kt under Vy
+            // and falling (EDLP-LOWI, 2026-09-24). A climb is never worth more
+            // than the airspeed left.
+            if let Some(floor) = crate::aircraft::speed_floor_kts() {
+                vs_cmd = crate::circuit::climb_limit_fpm(vs_cmd, ias, ias_trend, vy_kts, floor);
+            }
         }
         if vs_cmd < -DRAG_MIN_DESCENT_FPM {
             // Down from cruise: the destination's transition level rules.

@@ -156,6 +156,21 @@ pub struct Config {
     /// default; `XCOPILOT_ATC_CHATTER=false` silences the flavor calls
     /// (the go-around/held-clearance safety watches stay on regardless).
     pub atc_chatter: bool,
+    /// How much the copilot volunteers (`persona::Chatter`): `quiet` answers
+    /// and calls what matters, `normal` adds the landing word, the offers
+    /// and the flight's memory, `chatty` a little more. Answers and safety
+    /// calls are never gated by it. `XCOPILOT_CREW_CHATTER`.
+    pub crew_chatter: String,
+    /// The copilot's idiom (`persona::Dialect`): `auto` follows the voice's
+    /// own accent (an en_GB model says "cheers", an en_US one "you bet"),
+    /// or `british` / `american`. `XCOPILOT_CREW_DIALECT`.
+    pub crew_dialect: String,
+    /// What the copilot calls the pilot, now and then ("Nice one, Sam").
+    /// Empty = never by name. `XCOPILOT_PILOT_NAME`.
+    pub pilot_name: String,
+    /// The copilot's own name, for "what's your name". Empty = none on the
+    /// roster. `XCOPILOT_COPILOT_NAME`.
+    pub copilot_name: String,
     /// Mute X-Plane's own radio voice (built-in ATC + its ATIS) at startup
     /// while our ATC is on — both spoke on the same frequencies at once
     /// (two ATIS voices, 2026-07-10). Also silences nav-aid morse idents.
@@ -320,6 +335,10 @@ impl Config {
             atc_airport: env_or("XCOPILOT_ATC_AIRPORT", "LXGB"),
             atc_region: env_or("XCOPILOT_ATC_REGION", "auto"),
             atc_chatter: env_or("XCOPILOT_ATC_CHATTER", "true") != "false",
+            crew_chatter: env_or("XCOPILOT_CREW_CHATTER", "normal"),
+            crew_dialect: env_or("XCOPILOT_CREW_DIALECT", "auto"),
+            pilot_name: env_or("XCOPILOT_PILOT_NAME", "").trim().to_string(),
+            copilot_name: env_or("XCOPILOT_COPILOT_NAME", "").trim().to_string(),
             mute_xp_radio: env_or("XCOPILOT_MUTE_XP_RADIO", "true") != "false",
             atc_readback: env_or("XCOPILOT_ATC_READBACK", "true") != "false",
             taxi_guide: env_or("XCOPILOT_TAXI_GUIDE", "true") != "false",

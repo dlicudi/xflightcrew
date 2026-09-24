@@ -780,6 +780,7 @@ pub fn start(
                 ends.taxi.prop,
                 ends.taxi.pace,
                 None,
+                true,
             );
         }
     });

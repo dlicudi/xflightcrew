@@ -1190,6 +1190,7 @@ mod tests {
                 lat_b: 1.23,
                 lon_b: 0.0,
                 width_m: 30.0,
+                surface: 0,
             }],
         };
         let route = local_route(&fp, &airport, &airport, 100.0, 700.0, 2000.0, None).unwrap();

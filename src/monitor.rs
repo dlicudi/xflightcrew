@@ -1488,14 +1488,31 @@ impl AltimeterSetting {
         if pa <= 0.0 {
             return None;
         }
-        let want = crate::tools::instruments::correct_setting_inhg(
-            s.alt_ft,
-            crate::tools::instruments::transition_in_force_ft(self.transition_altitude_ft),
-            pa,
-        );
-        ((baro - want).abs() >= crate::tools::instruments::ALTIMETER_TOLERANCE_INHG)
-            .then_some((baro, want))
+        let ta = crate::tools::instruments::transition_in_force_ft(self.transition_altitude_ft);
+        let want = crate::tools::instruments::correct_setting_inhg(s.alt_ft, ta, pa);
+        let tol = crate::tools::instruments::ALTIMETER_TOLERANCE_INHG;
+        // Near the transition either setting is right: hovering at FL180 on a
+        // FL180 transition reset the knob QNH, standard, QNH inside two
+        // minutes (EDLP-LOWI, 2026-09-24). Inside the band, a knob on either
+        // one is left alone; the change is made clear of it.
+        if in_transition_band(s.alt_ft, ta) {
+            let qnh = (pa / crate::tools::instruments::PA_PER_INHG).clamp(28.0, 31.5);
+            let std = crate::tools::instruments::STANDARD_INHG;
+            if (baro - qnh).abs() < tol || (baro - std).abs() < tol {
+                return None;
+            }
+        }
+        ((baro - want).abs() >= tol).then_some((baro, want))
     }
+}
+
+/// Feet either side of the transition where either setting stands: more than
+/// the ~260 ft the knob change itself moves the indicated altitude, which is
+/// what made it flip.
+const TRANSITION_BAND_FT: f64 = 500.0;
+
+fn in_transition_band(alt_ft: f64, transition_ft: f64) -> bool {
+    (alt_ft - transition_ft).abs() < TRANSITION_BAND_FT
 }
 
 impl Check for AltimeterSetting {
@@ -2080,6 +2097,11 @@ pub async fn run(
     let mut airspeed_recovery = crate::interaction::Recovery::default();
     let mut cabin_recovery = crate::interaction::Recovery::default();
     let mut landing_summary = crate::interaction::Landing::default();
+    // The copilot as a person who was there: the flight's memory, the word
+    // after the landing, the offers, the asides held for a quiet moment.
+    let mut rapport = crate::rapport::Rapport::new();
+    let mut rapport_airframe = crate::rapport::Airframe::from_profile(&live.get());
+    let rapport_epoch = Instant::now();
     // The checklist flow's phase-boundary detector: climb, cruise, descent,
     // before landing, after landing, each once per flight.
     let mut flow_tracker = crate::flow::Tracker::default();
@@ -2105,6 +2127,8 @@ pub async fn run(
             cockpit_auto = crate::cockpit_auto::CockpitAuto::default();
             flow_tracker = crate::flow::Tracker::default();
             landing_summary = crate::interaction::Landing::default();
+            rapport = crate::rapport::Rapport::new();
+            rapport_airframe = crate::rapport::Airframe::from_profile(&live.get());
             airspeed_recovery = crate::interaction::Recovery::default();
             cabin_recovery = crate::interaction::Recovery::default();
             had_flying_control = false;
@@ -3355,6 +3379,51 @@ pub async fn run(
                 }
             }
 
+            // How busy the flight deck is, for the voice's pace, the reply's
+            // pause and the asides below (`tempo::busy_now`).
+            let busy = crate::tempo::busy_now(&crate::tempo::Load {
+                on_ground: snap.on_ground,
+                groundspeed_kts: snap.groundspeed_kts,
+                agl_ft: snap.agl_ft,
+                critical_loop: crate::autoland::ACTIVE.load(std::sync::atomic::Ordering::Relaxed)
+                    || crate::autotakeoff::ACTIVE.load(std::sync::atomic::Ordering::Relaxed)
+                    || crate::tools::recover::ACTIVE.load(std::sync::atomic::Ordering::Relaxed),
+                crew_busy: crate::flow::ACTIVE.load(std::sync::atomic::Ordering::Relaxed)
+                    || crate::instructor::active(),
+            });
+            crate::tempo::set_workload(busy);
+            // The rapport SEES every tick, a wreck included (it drops the
+            // landing word for one), and speaks only what its tick returns.
+            if crew_on {
+                let view = crate::rapport::View {
+                    t_s: now.duration_since(rapport_epoch).as_secs_f64(),
+                    on_ground: snap.on_ground,
+                    groundspeed_kts: snap.groundspeed_kts,
+                    agl_ft: snap.agl_ft,
+                    vsi_fpm: snap.vsi_fpm,
+                    ias_kts: snap.ias_kts,
+                    lat: snap.lat,
+                    lon: snap.lon,
+                    flap_ratio: snap.flap_ratio,
+                    gear_down: snap.gear_down,
+                    automation_flying: snap.automation_flying
+                        || crate::autotakeoff::ACTIVE.load(std::sync::atomic::Ordering::Relaxed),
+                    dest_dist_nm: snap.dest_dist_nm,
+                    crashed: voice.crashed(),
+                    instructing: crate::mode::instructing(),
+                    busy,
+                    quiet,
+                };
+                let persona = crate::persona::Persona::live();
+                for line in rapport.tick(&view, &rapport_airframe, &persona) {
+                    crate::blackbox::record(
+                        "rapport",
+                        serde_json::json!({ "event": "said", "line": line.text() }),
+                    );
+                    voice.alert(Priority::Advisory, line.text().to_string());
+                }
+            }
+
             // A wreck gets no advice: the flight model freezes at the impact
             // values (the 2026-07-13 crash read 106 kts and -1,463 fpm
             // forever), so the checks would evaluate a flight that already
@@ -3387,10 +3456,10 @@ pub async fn run(
                     crate::autoland::ACTIVE.load(std::sync::atomic::Ordering::Relaxed),
                     xtk,
                 ) {
+                    // The record for the debrief; the SPOKEN word about the
+                    // landing is the rapport's, said the way a person would
+                    // ("Nice one, about 180 feet a minute"), not a report.
                     crate::blackbox::record("landing_summary", serde_json::json!({"msg": &line}));
-                    if !quiet {
-                        voice.alert(Priority::Advisory, line);
-                    }
                 }
                 let mut speed_bad = false;
                 let mut speed_spoke = false;
@@ -3426,6 +3495,32 @@ pub async fn run(
                             if spoke && crate::mode::crew_actuates() {
                                 if let Some(cmd) = check.fix_action() {
                                     let _ = xp.run_command(cmd).await;
+                                }
+                                // A cabin climbing through ten thousand: the
+                                // crew's own air first (bleed, oxygen), and
+                                // past the warning band a follower that is
+                                // flying goes DOWN (its terrain floor still
+                                // rules). Two "cabin altitude" callouts went by
+                                // unanswered on EDLP-LOWI and the pilot blacked
+                                // out at FL260 (2026-09-24).
+                                if cabin {
+                                    let air = crate::tools::cabin_air::ensure_on(&xp).await;
+                                    if let Some(line) = air.line() {
+                                        voice.alert(Priority::Warning, line);
+                                    }
+                                    if check.id() == "cabin_alt_warning"
+                                        && snap.alt_ft > crate::tools::cabin_air::HYPOXIA_DESCENT_FT + 500.0
+                                        && crate::procedure::take_altitude(
+                                            crate::tools::cabin_air::HYPOXIA_DESCENT_FT,
+                                        )
+                                    {
+                                        voice.alert(
+                                            Priority::Warning,
+                                            "Descending to ten thousand for the cabin. \
+                                             Ask for a new level once it holds."
+                                                .to_string(),
+                                        );
+                                    }
                                 }
                                 if let Some((dref, value)) = check.fix_write(&snap) {
                                     // The altimeter goes through the proving
@@ -4229,6 +4324,31 @@ mod tests {
             said.starts_with("Altimeter check, standard is two niner niner two"),
             "{said}"
         );
+    }
+
+    /// EDLP-LOWI (2026-09-24): hovering at FL180 on an 18,000 ft transition
+    /// the knob was reset QNH, standard, QNH. Inside the band either setting
+    /// stands; a knob on neither is still corrected.
+    #[test]
+    fn altimeter_check_leaves_either_setting_alone_near_the_transition() {
+        let c = AltimeterSetting {
+            transition_altitude_ft: 18_000.0,
+        };
+        let mut s = linto_altimeter(false);
+        let qnh = s.qnh_pa.unwrap() / crate::tools::instruments::PA_PER_INHG;
+        for alt in [17_700.0, 18_000.0, 18_300.0] {
+            s.alt_ft = alt;
+            s.baro_inhg = Some(qnh);
+            assert!(c.eval(&s).is_none(), "QNH at {alt}");
+            s.baro_inhg = Some(29.92);
+            assert!(c.eval(&s).is_none(), "standard at {alt}");
+        }
+        s.alt_ft = 18_000.0;
+        s.baro_inhg = Some(28.50);
+        assert!(c.eval(&s).is_some(), "a knob on neither is still wrong");
+        s.alt_ft = 20_000.0;
+        s.baro_inhg = Some(qnh);
+        assert!(c.eval(&s).is_some(), "clear of the band, QNH is wrong");
     }
 
     /// Airborne at cruise with a known destination — the descent-advisor base.

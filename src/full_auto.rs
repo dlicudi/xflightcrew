@@ -1063,6 +1063,24 @@ async fn fly(xp: XPlaneClient, config: Config, voice: Option<Voice>, tools: SubT
     }
     bail_if_abort!();
 
+    // The cabin's air, on EVERY mission including an airborne resume: the
+    // bleed that pressurises and the crew oxygen, where the airframe declares
+    // them. It used to ride the engine start alone, so a departure with the
+    // engine already running climbed an unpressurised SF50 to FL260 and the
+    // pilot blacked out (EDLP-LOWI, 2026-09-24). Read first, left alone in
+    // state, read back.
+    if engine_running(&xp).await {
+        let air = crate::tools::cabin_air::ensure_on(&xp).await;
+        if let Some(line) = air.line() {
+            announce(&voice, Priority::Advisory, &line);
+        }
+        event(
+            "cabin_air",
+            json!({"bleed": air.bleed, "oxygen": air.oxygen, "changed": air.changed()}),
+        );
+    }
+    bail_if_abort!();
+
     // --- Stage 2: altimeter ---------------------------------------------------
     // NO brake release here, deliberately. The brakes used to come off at this
     // stage — engine just started, taxi clearance not yet requested — which is
@@ -1989,7 +2007,7 @@ async fn fly_route(
         "dir": wind.map(|(d, _)| d.round()),
         "kts": wind.map(|(_, k)| k.round()),
     });
-    let built = {
+    let build = |forced: Option<String>| {
         let (apt_dat, cifp, fixp, navp) = (
             crate::tools::autoland::apt_dat_path(),
             config.cifp_dir.clone(),
@@ -1999,17 +2017,23 @@ async fn fly_route(
         let dest = route.dest_icao.clone();
         let cfg = tools.circuit.cfg.clone();
         let ias = tools.circuit.approach_ias;
-        tokio::task::spawn_blocking(move || {
-            build_arrival(
-                &apt_dat, &cifp, &fixp, &navp, &dest, lat, lon, cfg, ias, wind,
-            )
-        })
-        .await
-        .unwrap_or(Arrival {
-            plan: None,
-            rwy_id: None,
-            tower_khz: None,
-        })
+        async move {
+            tokio::task::spawn_blocking(move || {
+                build_arrival(
+                    &apt_dat, &cifp, &fixp, &navp, &dest, lat, lon, cfg, ias, wind,
+                    forced.as_deref(),
+                )
+            })
+            .await
+            .unwrap_or(Arrival {
+                plan: None,
+                rwy_id: None,
+                tower_khz: None,
+            })
+        }
+    };
+    let mut built = {
+        build(None).await
     };
     if route
         .local_runway
@@ -2079,6 +2103,47 @@ async fn fly_route(
             // latest.
             inbound_owed = Some(khz);
             event("inbound_deferred", json!({ "khz": khz }));
+        }
+    }
+    // The TOWER's runway, once the inbound call has one. LOWI (2026-09-24):
+    // "join final runway two six" came back two seconds after the crew had
+    // armed the 08 approach, and nothing reconciled them. The tower's end is
+    // flown when there is an approach to it we can fly; otherwise ours stands
+    // and the crew says why (autoland still watches the landing clearance).
+    if let Some(tower_rwy) = tower_arrival_runway(built.tower_khz).await {
+        if built.rwy_id.as_deref() != Some(tower_rwy.as_str()) {
+            let theirs = build(Some(tower_rwy.clone())).await;
+            let spoken = crate::circuit::spell_runway(&tower_rwy);
+            if theirs.plan.is_some() {
+                event(
+                    "arrival_runway_from_tower",
+                    json!({ "was": built.rwy_id, "now": tower_rwy }),
+                );
+                announce(
+                    voice,
+                    Priority::Advisory,
+                    &format!("Tower wants runway {spoken}. Setting up for it."),
+                );
+                built = theirs;
+            } else {
+                event(
+                    "tower_runway_unflyable",
+                    json!({ "ours": built.rwy_id, "tower": tower_rwy }),
+                );
+                announce(
+                    voice,
+                    Priority::Caution,
+                    &format!(
+                        "Tower wants runway {spoken}, but there's no approach I can fly to it. \
+                         Staying with runway {}.",
+                        built
+                            .rwy_id
+                            .as_deref()
+                            .map(crate::circuit::spell_runway)
+                            .unwrap_or_default()
+                    ),
+                );
+            }
         }
     }
     // The wind-chosen end (build_arrival) drives BOTH the published-approach
@@ -2436,6 +2501,8 @@ async fn taxi_in_after_landing(
         tools.taxi.pace,
         // We have just landed, so the first thing owed is the runway itself.
         crate::taxi_in::vacate_runway(),
+        // The mission ends shut down on the stand.
+        true,
     );
     RUN.record(sim::run::Outcome::HandedOff);
 }
@@ -2627,6 +2694,7 @@ fn build_arrival(
     cfg: crate::tools::autopilot::ApConfig,
     approach_ias: f64,
     wind: Option<(f64, f64)>,
+    forced_rwy: Option<&str>,
 ) -> Arrival {
     let Some(airport) = crate::nav::find_airport(apt_dat, dest).ok().flatten() else {
         return Arrival {
@@ -2636,6 +2704,25 @@ fn build_arrival(
         };
     };
     let tower_khz = airport.freq(crate::nav::FREQ_TOWER).map(|f| f.khz);
+    // The tower's runway when it has named one (no fallback to another end:
+    // the caller keeps its own plan if this one cannot be flown)...
+    if let Some(forced) = forced_rwy {
+        let end = crate::procedure::EndAction::Approach {
+            apt_dat: apt_dat.to_string(),
+            cfg,
+            approach_ias,
+            rwy_id: Some(crate::autoland::PlannedRunway::at(dest, forced)),
+        };
+        let plan = crate::procedure::approach_plan_for(
+            cifp, fixp, navp, &airport, dest, forced, lat, lon, end,
+        )
+        .ok();
+        return Arrival {
+            plan,
+            rwy_id: Some(forced.to_string()),
+            tower_khz,
+        };
+    }
     // Into the wind when it's strong enough to matter...
     let by_wind = wind
         .filter(|(_, kts)| *kts >= WIND_DECISIVE_KTS)
@@ -2645,7 +2732,8 @@ fn build_arrival(
     let rwy_id = by_wind.or_else(|| {
         let diff = |a: f64, b: f64| ((a - b + 540.0).rem_euclid(360.0) - 180.0).abs();
         let (mut best_id, mut best_score) = (None::<String>, f64::MAX);
-        for r in &airport.runways {
+        // Hard runways only: LOWI's alignment pick was the grass "26R".
+        for r in crate::nav::assignable_runways(&airport.runways) {
             let hdg_a = crate::nav::bearing_deg(r.lat_a, r.lon_a, r.lat_b, r.lon_b);
             let hdg_b = (hdg_a + 180.0).rem_euclid(360.0);
             for (id, thr_lat, thr_lon, hdg) in [
@@ -2669,21 +2757,95 @@ fn build_arrival(
             tower_khz,
         };
     };
-    let end = crate::procedure::EndAction::Approach {
-        apt_dat: apt_dat.to_string(),
-        cfg,
-        approach_ias,
-        rwy_id: Some(crate::autoland::PlannedRunway::at(dest, &rwy_id)),
+    let plan_for = |id: &str| {
+        let end = crate::procedure::EndAction::Approach {
+            apt_dat: apt_dat.to_string(),
+            cfg: cfg.clone(),
+            approach_ias,
+            rwy_id: Some(crate::autoland::PlannedRunway::at(dest, id)),
+        };
+        crate::procedure::approach_plan_for(cifp, fixp, navp, &airport, dest, id, lat, lon, end)
+            .ok()
     };
-    let plan = crate::procedure::approach_plan_for(
-        cifp, fixp, navp, &airport, dest, &rwy_id, lat, lon, end,
-    )
-    .ok();
+    if let Some(plan) = plan_for(&rwy_id) {
+        return Arrival {
+            plan: Some(plan),
+            rwy_id: Some(rwy_id),
+            tower_khz,
+        };
+    }
+    // No approach we can fly to that end: another end that HAS one, if its
+    // tailwind is acceptable, before a visual landing. LOWI at 080/6: 08's
+    // approaches are a circling one and an RF arc, 26's RNAV Z is a
+    // straight-in down the valley; the visual landing at Innsbruck is not an
+    // option anyone should take (2026-09-24).
+    for id in approach_fallback_ends(&airport, &rwy_id, wind) {
+        if let Some(plan) = plan_for(&id) {
+            return Arrival {
+                plan: Some(plan),
+                rwy_id: Some(id),
+                tower_khz,
+            };
+        }
+    }
     Arrival {
-        plan,
+        plan: None,
         rwy_id: Some(rwy_id),
         tower_khz,
     }
+}
+
+/// The runway the destination's tower has given an arrival (its `Inbound`
+/// clearance), waited for up to [`TOWER_RUNWAY_WAIT_SECS`] after the inbound
+/// call; `None` with no reply, another station on the frequency, or no call.
+async fn tower_arrival_runway(dest_khz: Option<i64>) -> Option<String> {
+    let dest_khz = dest_khz?;
+    let deadline = Instant::now() + Duration::from_secs_f64(TOWER_RUNWAY_WAIT_SECS);
+    loop {
+        if crate::party_line::home_tower_khz() == Some(dest_khz)
+            && matches!(
+                crate::party_line::clearance_state(),
+                Some(crate::tower::State::Inbound | crate::tower::State::ClearedToLand)
+            )
+        {
+            if let Some(r) = crate::party_line::clearance_runway() {
+                return Some(r);
+            }
+        }
+        if Instant::now() >= deadline || !INBOUND_MADE.load(SeqCst) {
+            return None;
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+}
+
+/// How long the arrival waits for the tower's answer to the inbound call.
+const TOWER_RUNWAY_WAIT_SECS: f64 = 10.0;
+
+/// The most tailwind an arrival accepts to fly a published approach rather
+/// than a visual landing.
+const APPROACH_TAILWIND_MAX_KTS: f64 = 10.0;
+
+/// The other hard runway ends, most headwind first, whose tailwind is within
+/// [`APPROACH_TAILWIND_MAX_KTS`]. With no wind every end qualifies.
+fn approach_fallback_ends(
+    airport: &crate::nav::AirportInfo,
+    tried: &str,
+    wind: Option<(f64, f64)>,
+) -> Vec<String> {
+    let mut ends: Vec<(String, f64)> = crate::nav::assignable_runways(&airport.runways)
+        .flat_map(|r| [r.ident_a.clone(), r.ident_b.clone()])
+        .filter(|id| id != tried)
+        .map(|id| {
+            let hw = wind
+                .and_then(|(d, k)| crate::nav::headwind_for(&airport.runways, &id, d, k))
+                .unwrap_or(0.0);
+            (id, hw)
+        })
+        .filter(|(_, hw)| *hw >= -APPROACH_TAILWIND_MAX_KTS)
+        .collect();
+    ends.sort_by(|a, b| b.1.total_cmp(&a.1));
+    ends.into_iter().map(|(id, _)| id).collect()
 }
 
 /// Call the tower for departure and wait for it to move us to a departure
@@ -2818,6 +2980,8 @@ pub struct PreflightFacts {
     pub takeoff_distance_ft: Option<f64>,
     pub origin_longest_ft: f64,
     pub dest_longest_ft: f64,
+    /// The airframe's ceiling; `None` skips the cruise check.
+    pub service_ceiling_ft: Option<f64>,
 }
 
 const LB_PER_KG: f64 = 2.204_62;
@@ -2852,6 +3016,19 @@ pub fn preflight(fp: &crate::simbrief::FlightPlan, f: &PreflightFacts) -> Result
         None => crate::simbrief::spoken_weight(kg * LB_PER_KG, "pounds"),
     };
 
+    // A cruise the aircraft cannot reach is not a plan: EDLP-LOWI's FL290
+    // was armed on an airframe declared to 28,000 ft, and the refusal came
+    // in the air, at the resume after a pilot takeover (2026-09-24).
+    if let Some(ceiling) = f.service_ceiling_ft.filter(|c| *c > 0.0) {
+        if fp.cruise_alt_ft > ceiling {
+            return Err(format!(
+                "Negative. The plan cruises at {}, above this aircraft's ceiling of {}. \
+                 Replan lower.",
+                spoken_feet(fp.cruise_alt_ft),
+                spoken_feet(ceiling)
+            ));
+        }
+    }
     // The far end first: a field we cannot land at is not a destination.
     if let Some(need) =
         crate::flightplan::runway_needed_ft(f.landing_distance_ft, f.takeoff_distance_ft)
@@ -3171,7 +3348,26 @@ mod tests {
             takeoff_distance_ft: Some(1630.0),
             origin_longest_ft: 5900.0,
             dest_longest_ft: 3280.0,
+            service_ceiling_ft: None,
         }
+    }
+
+    #[test]
+    fn a_cruise_above_the_ceiling_is_refused_at_the_arm() {
+        // EDLP-LOWI (2026-09-24): FL290 on an airframe declared to 28,000.
+        let mut fp = plan(false);
+        fp.cruise_alt_ft = 29_000.0;
+        let f = super::PreflightFacts {
+            service_ceiling_ft: Some(28_000.0),
+            ..facts()
+        };
+        let why = super::preflight(&fp, &f).expect_err("refused");
+        assert!(why.contains("ceiling"), "{why}");
+        let ok = super::PreflightFacts {
+            service_ceiling_ft: Some(31_000.0),
+            ..facts()
+        };
+        assert!(super::preflight(&fp, &ok).map_or_else(|e| !e.contains("ceiling"), |_| true));
     }
 
     #[test]
@@ -3572,5 +3768,45 @@ mod arrival_watch_tests {
         assert!(!w.stalled(None, None, 0.0));
         assert!(!w.stalled(None, None, ARRIVAL_STALL_SECS * 3.0));
         assert!(!w.stalled(Some("CI24"), Some(9.0), ARRIVAL_STALL_SECS * 3.0 + 1.0));
+    }
+
+    /// What full auto will fly into Innsbruck from where the aircraft is:
+    /// `cargo test -- --ignored real_install_lowi_arrival --nocapture`
+    #[test]
+    #[ignore]
+    fn real_install_lowi_arrival() {
+        let apt = "/Users/duanelicudi/X-Plane 12/Global Scenery/Global Airports/Earth nav data/apt.dat";
+        let cifp = "/Users/duanelicudi/X-Plane 12/Custom Data/CIFP";
+        let fix = "/Users/duanelicudi/X-Plane 12/Custom Data/earth_fix.dat";
+        let nav = "/Users/duanelicudi/X-Plane 12/Custom Data/earth_nav.dat";
+        for forced in ["08", "26"] {
+            let a = super::build_arrival(
+                apt, cifp, fix, nav, "LOWI", 47.77, 11.79,
+                crate::tools::autopilot::ApConfig::default(), 87.0, Some((80.0, 6.0)), Some(forced),
+            );
+            println!("tower wants {forced}: plan {:?}", a.plan.as_ref().map(|p| p.name.clone()));
+        }
+        for wind in [Some((80.0, 6.0)), Some((110.0, 4.0)), Some((260.0, 12.0)), None] {
+            let a = super::build_arrival(
+                apt, cifp, fix, nav, "LOWI", 47.77, 11.79,
+                crate::tools::autopilot::ApConfig::default(), 87.0, wind, None,
+            );
+            println!("wind {wind:?}: runway {:?}", a.rwy_id);
+            match &a.plan {
+                None => println!("  NO PLAN (visual landing)"),
+                Some(p) => {
+                    println!("  {}", p.name);
+                    for l in &p.legs {
+                        println!(
+                            "  {} {} {:?} fix={}",
+                            l.leg_type,
+                            l.fix_ident,
+                            l.alt1_ft,
+                            l.fix.is_some()
+                        );
+                    }
+                }
+            }
+        }
     }
 }

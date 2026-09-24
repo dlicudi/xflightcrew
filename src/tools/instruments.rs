@@ -27,7 +27,7 @@ const BARO_MAX_ROUNDS: usize = 10;
 /// How long a frame takes to overwrite a write that will not stand.
 const BARO_SETTLE_MS: u64 = 120;
 /// Pascals per inch of mercury (1013.25 hPa ≈ 29.92 inHg).
-const PA_PER_INHG: f64 = 3386.389;
+pub const PA_PER_INHG: f64 = 3386.389;
 const DG_SYNC: &str = "sim/instruments/DG_sync_mag";
 const DG_DRIFT: &str = "sim/cockpit/gyros/dg_drift_vac_deg";
 // Low-vacuum annunciator: the DG is vacuum-driven, so a sync won't hold if the
@@ -161,7 +161,7 @@ impl Tool for SetBarometer {
 
 /// Standard pressure (inHg) — what the altimeter is set to above the transition
 /// altitude (1013.25 hPa).
-const STANDARD_INHG: f64 = 29.92;
+pub const STANDARD_INHG: f64 = 29.92;
 
 /// An altimeter error worth a word or a hand: 0.03 inHg is about 30 ft. The
 /// sim's QNH drifts a hundredth at a time under real weather, so anything

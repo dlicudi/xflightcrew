@@ -833,6 +833,8 @@ pub fn run_autoland_scoped(
             *TRACKING_ERROR.lock().unwrap_or_else(|e| e.into_inner()) = None;
             let mut last_phase: Option<ApproachPhase> = None;
             let mut flare_power = FlarePower::default();
+            // The lever the approach was flown on, for a balloon to hold.
+            let mut approach_thr: Option<f64> = None;
             let mut go_around = GoAroundLatch::new();
             // Drain any go-around order left on the party line before this
             // approach existed. The flag is a latch, not a queue: an order
@@ -864,7 +866,8 @@ pub fn run_autoland_scoped(
             let mut prev_vvi: Option<(f64, std::time::Instant)> = None;
             // The flare's elevator law. Its integrator is per-approach: a
             // standing pull must not survive a go-around into the next one.
-            let mut flare_pitch = FlarePitch::default();
+            let mut flare_pitch =
+                FlarePitch::with_gains(FlareGains::from_profile(crate::aircraft::flare_elevator()));
             // Last tick was the flare: a balloon stays in it (`hold_flare`).
             let mut flaring = false;
             let mut pitch_yielded = false;
@@ -1178,6 +1181,25 @@ pub fn run_autoland_scoped(
                 // guidance turns back to the FAP immediately, which is a killer
                 // at 50 ft (see [`GoAroundLatch`]).
                 let along_nm = along_track_nm(lat, lon, &rwy);
+                let committed = commit_flare(
+                    raw,
+                    flaring,
+                    radio_ft,
+                    gs_kts,
+                    25.0,
+                    rwy.length_m + along_nm.min(0.0) * M_PER_NM,
+                    crate::aircraft::landing_distance_m(),
+                    rwy.course_deg,
+                );
+                if committed.phase != raw.phase {
+                    crate::blackbox::record(
+                        "autoland",
+                        serde_json::json!({"event": "committed_flare", "radio": radio_ft,
+                                           "past_m": (-along_nm * M_PER_NM).max(0.0),
+                                           "remaining_m": rwy.length_m + along_nm.min(0.0) * M_PER_NM}),
+                    );
+                }
+                let raw = committed;
                 // A controller's order beats anything the approach thinks of
                 // itself. Consumed here rather than in the main loop because
                 // this is the thing that can ACT on it; the flag is drained
@@ -1835,6 +1857,21 @@ pub fn run_autoland_scoped(
                     // sticky version, Luton 2026-07-28) the MD-82 accelerated to
                     // 284 KIAS on the outbound leg and was still gaining.
                     Some(1.0)
+                } else if let Some(hold) = g
+                    .phase
+                    .eq(&ApproachPhase::Flare)
+                    .then(|| {
+                        balloon_power(
+                            vvi,
+                            approach_thr,
+                            radio_ft > arrest_gates_ft(25.0, gs_kts).1,
+                        )
+                    })
+                    .flatten()
+                {
+                    // A balloon at idle only bleeds the speed the settle
+                    // needs: hold the approach's own thrust until it sinks.
+                    Some(hold)
                 } else if g.phase == ApproachPhase::Flare {
                     match cfg.flare_power {
                         Some(power) => match (thr_now, vvi) {
@@ -1867,6 +1904,11 @@ pub fn run_autoland_scoped(
                     );
                     thr_now.map(|throttle| (throttle + adj).clamp(min_thr, 1.0))
                 };
+                if g.phase != ApproachPhase::Flare && missed.is_none() {
+                    if let Some(t) = thr {
+                        approach_thr = Some(t);
+                    }
+                }
                 let throttle_written = match thr {
                     Some(throttle) => Some(xp.set_float(&throttle_dref(), throttle).await.is_ok()),
                     None => None,
@@ -2776,6 +2818,24 @@ impl FlarePower {
     }
 }
 
+/// The lever in a flare that is CLIMBING: the approach's own thrust, never
+/// more, while the vertical speed is above zero; `None` otherwise (the flare's
+/// usual idle or progressive law). Pure.
+/// `above_band` holds it too: a committed balloon still above the roundout
+/// band comes back down on approach power, not at idle.
+pub fn balloon_power(
+    vvi_fpm: Option<f64>,
+    approach_thr: Option<f64>,
+    above_band: bool,
+) -> Option<f64> {
+    match (vvi_fpm, approach_thr) {
+        (Some(v), Some(t)) if (v > 0.0 || above_band) && t.is_finite() => {
+            Some(t.clamp(0.0, 1.0))
+        }
+        _ => None,
+    }
+}
+
 /// What to dial into the VS mode so the aircraft actually FLIES `target_fpm`.
 /// The plugin's direct elevator channel, and the pilot's take-back latch —
 /// the SAME pair the takeoff rotates on. `override_joystick_pitch` bypasses
@@ -2826,6 +2886,55 @@ const FLARE_ROLL_YIELD: &str = "xcopilot/roll_yield";
 pub struct FlarePitch {
     trim: f64,
     held: f64,
+    gains: FlareGains,
+}
+
+/// The flare law's numbers for THIS airframe (the profile's
+/// `flare_elevator:`, [`crate::aircraft::FlareElevatorProfile`]). The default
+/// is the law as the 172 and the 737 have flown it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct FlareGains {
+    /// Elevator per 100 fpm of sink error.
+    pub p: f64,
+    /// Elevator per 100 fpm per second of sink trend.
+    pub d: f64,
+    /// The integrator's rate, elevator per 100 fpm of error per second.
+    pub trim_rate: f64,
+    /// Most pull, and most push.
+    pub max: f64,
+    pub min: f64,
+    /// In a balloon the held pull eases toward the free law at most this
+    /// fast (elevator per second); `None` lets go at once.
+    pub balloon_ease_per_s: Option<f64>,
+}
+
+impl Default for FlareGains {
+    fn default() -> Self {
+        Self {
+            p: FLARE_P_PER_100FPM,
+            d: FLARE_D_PER_100FPM_S,
+            trim_rate: FLARE_TRIM_PER_100FPM_S,
+            max: FLARE_PITCH_MAX,
+            min: FLARE_PITCH_MIN,
+            balloon_ease_per_s: None,
+        }
+    }
+}
+
+impl FlareGains {
+    /// The airframe's declared numbers over the default law.
+    pub fn from_profile(p: Option<crate::aircraft::FlareElevatorProfile>) -> Self {
+        let mut g = Self::default();
+        if let Some(p) = p.and_then(|p| p.valid()) {
+            g.p *= p.gain;
+            g.d *= p.gain;
+            g.trim_rate *= p.trim_gain;
+            g.max = p.max;
+            g.min = -p.max_push;
+            g.balloon_ease_per_s = p.balloon_ease_per_s;
+        }
+        g
+    }
 }
 
 /// Elevator per 100 fpm of sink error. A flare corrects hundreds of fpm with
@@ -2842,6 +2951,9 @@ const FLARE_TRIM_PER_100FPM_S: f64 = 0.015;
 const FLARE_PITCH_MAX: f64 = 0.35;
 /// ...and the push, which is deliberately far smaller: the ground is there.
 const FLARE_PITCH_MIN: f64 = -0.10;
+/// The ratchet lets go this far ahead of a balloon: the sink PREDICTED this
+/// many seconds out (the trend) above zero counts as climbing.
+const BALLOON_LEAD_S: f64 = 0.5;
 
 impl FlarePitch {
     /// `vvi_trend` is fpm per second, positive = sink easing (the same sign
@@ -2858,38 +2970,55 @@ impl FlarePitch {
         ratchet: bool,
     ) -> f64 {
         let dt = dt_s.clamp(0.02, 0.5);
+        let g = self.gains;
         // Positive error = sinking FASTER than wanted = pull.
         let err = (target_fpm - vvi_fpm) / 100.0;
-        self.trim = (self.trim + err * FLARE_TRIM_PER_100FPM_S * dt)
-            .clamp(FLARE_PITCH_MIN, FLARE_PITCH_MAX);
-        let want = (err * FLARE_P_PER_100FPM - (vvi_trend / 100.0) * FLARE_D_PER_100FPM_S
-            + self.trim)
-            .clamp(FLARE_PITCH_MIN, FLARE_PITCH_MAX);
+        self.trim = (self.trim + err * g.trim_rate * dt).clamp(g.min, g.max);
+        let want = (err * g.p - (vvi_trend / 100.0) * g.d + self.trim).clamp(g.min, g.max);
         if !ratchet {
             // The roundout is still ordinary flying: the law is free both ways.
             self.held = 0.0;
             return want;
         }
-        if vvi_fpm > 0.0 {
-            // A BALLOON: the pull has beaten the ground and the aircraft is
+        if vvi_fpm > 0.0 || vvi_fpm + vvi_trend * BALLOON_LEAD_S > 0.0 {
+            // A BALLOON (or one BALLOON_LEAD_S away: the SF50's 0.3 was held
+            // while the sink vanished at +400 fpm a second, and let go only
+            // once it was climbing, which was already a balloon to 52 ft;
+            // EDLP 24, 2026-09-24): the pull has beaten the ground and the aircraft is
             // climbing. The ratchet exists for a sink that is being arrested,
             // and held through a climb it kept the Citation going up, 28 to
             // 58 ft at +545 fpm with the speed bleeding away (EDDV 27L,
             // 2026-09-22). The pull eases toward neutral and never becomes a
             // push, so the aircraft settles; the ratchet takes over again
             // from there as soon as it sinks.
-            self.held = want.max(0.0);
+            let eased = want.max(0.0);
+            self.held = match g.balloon_ease_per_s {
+                // Eased, not dropped: neutral is the TRIMMED approach
+                // attitude, and at a flare's speed that sinks at once. The
+                // SF50's 0.35 went to 0 in one tick at +190 fpm and the sink
+                // was back at -590 two seconds later (EDLP 24, 2026-09-24).
+                Some(rate) => eased.max(self.held - rate * dt),
+                None => eased,
+            };
             return self.held;
         }
         self.held = self.held.max(want);
         self.held
     }
 
+    /// The law with this airframe's numbers.
+    pub fn with_gains(gains: FlareGains) -> Self {
+        Self {
+            gains,
+            ..Self::default()
+        }
+    }
+
     /// Let go — the channel expires on its own within a second, but neither
     /// the integrator nor the ratchet may carry a standing pull into the
-    /// next approach.
+    /// next approach. The airframe's numbers stay.
     pub fn reset(&mut self) {
-        *self = Self::default();
+        *self = Self::with_gains(self.gains);
     }
 }
 
@@ -3403,6 +3532,69 @@ pub fn hold_flare(
     Guidance {
         phase: ApproachPhase::Flare,
         target_vs_fpm: flare_vs,
+        arresting: true,
+        ..g
+    }
+}
+
+/// A balloon out of the flare is landed, not gone around from, below this
+/// height (with room to stop). EDLP 24 (2026-09-24): the SF50's flare held
+/// 0.3 of elevator until it was already climbing, ballooned to 52 ft at +850
+/// fpm, balked `balloon` above the 50 ft band, and the go-around from idle at
+/// 81 kt and slowing was given 0 fpm and stalled onto the runway at -1,568
+/// fpm. A pilot holds a balloon, adds a little power and lets it settle.
+pub const BALLOON_COMMIT_FT: f64 = 100.0;
+
+/// COMMITTED, ONCE FLARING LOW. A flare below the roundout band is at idle,
+/// slow and nose up, and the go-around the overflight balk hands it cannot
+/// climb: the vertical law climbs only with speed in hand, a flare has none,
+/// and a jet's engines are a few seconds from thrust. ETND 26 (2026-09-23):
+/// the SF50 ballooned to 32 ft, the float allowance (1,244 m of runway less the
+/// Baron's 900 m floor) ran out at 344 m, it went around with 900 m of runway
+/// ahead, the law gave it 0 fpm at 80 kt, and it met the runway at about -740
+/// fpm. So below the band, an `overflew_the_runway` verdict does not stand
+/// while the pavement left still covers the airframe's OWN landing distance
+/// (the 900 m floor is for the float's judgement above, not for a landing
+/// already in its last seconds). A BALLOON is committed the same way up to
+/// [`BALLOON_COMMIT_FT`] (EDLP 24, the crash). No room to stop is still a
+/// go-around; every other balk stands. Pure.
+pub fn commit_flare(
+    g: Guidance,
+    was_flaring: bool,
+    radio_ft: f64,
+    gs_kts: f64,
+    flare_radio_ft: f64,
+    remaining_m: f64,
+    landing_m: Option<f64>,
+    course_deg: f64,
+) -> Guidance {
+    let (_, band_ft) = arrest_gates_ft(flare_radio_ft, gs_kts);
+    let ceiling_ft = match g.balk {
+        Some("overflew_the_runway") if was_flaring => band_ft,
+        Some("balloon") if was_flaring => BALLOON_COMMIT_FT,
+        _ => return g,
+    };
+    let need_m = landing_m
+        .filter(|v| v.is_finite() && *v > 0.0)
+        .unwrap_or(FLOAT_MIN_REMAINING_M);
+    if radio_ft > ceiling_ft || remaining_m < need_m {
+        return g;
+    }
+    let nominal_vs = -(gs_kts / 60.0) * GLIDEPATH_FT_PER_NM;
+    let (roundout_vs, flare_vs) = arrest_targets_fpm(nominal_vs);
+    Guidance {
+        // The overflight turned the heading back to the FAP; a landing
+        // keeps the runway's.
+        target_heading_deg: course_deg,
+        phase: ApproachPhase::Flare,
+        // Above the band (a balloon's top) come back down at the roundout's
+        // sink: the flare's -100 from 60 ft is half a minute of runway.
+        target_vs_fpm: if radio_ft > band_ft {
+            roundout_vs
+        } else {
+            flare_vs
+        },
+        balk: None,
         arresting: true,
         ..g
     }
@@ -4012,6 +4204,89 @@ mod tests {
         let balked = hold_flare(at(high), true, high, 140.0, 25.0);
         assert_eq!(balked.phase, ApproachPhase::Intercept);
         assert_eq!(balked.balk, Some("balloon"));
+    }
+
+    /// ETND 26, 2026-09-23: 1,244 m of runway, the SF50 flaring at 32 ft and
+    /// 344 m past the threshold, 900 m ahead, a 525 m landing distance. The
+    /// overflight balk stood and the go-around hit the runway at -740 fpm.
+    #[test]
+    fn a_low_flare_with_room_to_stop_is_committed() {
+        let g = Guidance {
+            target_heading_deg: 265.0,
+            target_vs_fpm: 1500.0,
+            target_ias_kts: 87.0,
+            dist_nm: 0.186,
+            glidepath_alt_ft: 0.0,
+            phase: ApproachPhase::Intercept,
+            balk: Some("overflew_the_runway"),
+            arresting: false,
+        };
+        let sf50_m = Some(1721.0 * 0.3048);
+        let c = commit_flare(g, true, 32.0, 77.0, 25.0, 900.0, sf50_m, 265.0);
+        assert_eq!(c.phase, ApproachPhase::Flare);
+        assert_eq!(c.balk, None);
+        assert!(c.arresting && c.target_vs_fpm < 0.0);
+        assert_eq!(c.target_heading_deg, 265.0, "the runway's heading, not the FAP's");
+        // Not flaring (crossed the numbers high and fast): the balk stands.
+        assert_eq!(commit_flare(g, false, 32.0, 77.0, 25.0, 900.0, sf50_m, 265.0).balk, g.balk);
+        // Above the band: the float's own geometry judges it.
+        let (_, band) = arrest_gates_ft(25.0, 77.0);
+        assert_eq!(commit_flare(g, true, band + 5.0, 77.0, 25.0, 900.0, sf50_m, 265.0).balk, g.balk);
+        // No room to stop: still a go-around.
+        assert_eq!(commit_flare(g, true, 20.0, 77.0, 25.0, 400.0, sf50_m, 265.0).balk, g.balk);
+        // No declared distance: the 900 m floor.
+        assert_eq!(commit_flare(g, true, 20.0, 77.0, 25.0, 850.0, None, 265.0).balk, g.balk);
+        // A balloon (EDLP 24: 52 ft, 2,180 m of runway, 1,900 ahead) is
+        // landed below the commit height and balked above it.
+        let balloon = Guidance {
+            balk: Some("balloon"),
+            ..g
+        };
+        let c = commit_flare(balloon, true, 52.0, 81.0, 25.0, 1900.0, sf50_m, 240.0);
+        assert_eq!((c.phase, c.balk), (ApproachPhase::Flare, None));
+        let (roundout_vs, flare_vs) = arrest_targets_fpm(-(81.0 / 60.0) * GLIDEPATH_FT_PER_NM);
+        assert_eq!(c.target_vs_fpm, roundout_vs, "down to the band at the roundout's sink");
+        assert!(roundout_vs < flare_vs);
+        assert_eq!(
+            commit_flare(balloon, true, BALLOON_COMMIT_FT + 1.0, 81.0, 25.0, 1900.0, sf50_m, 240.0)
+                .balk,
+            Some("balloon")
+        );
+        assert_eq!(
+            commit_flare(balloon, true, 52.0, 81.0, 25.0, 300.0, sf50_m, 240.0).balk,
+            Some("balloon"),
+            "no room to stop"
+        );
+        // Any other balk is not ours to overrule.
+        let off = Guidance {
+            balk: Some("off_centreline_at_flare"),
+            ..g
+        };
+        assert_eq!(commit_flare(off, true, 20.0, 77.0, 25.0, 900.0, sf50_m, 265.0).balk, off.balk);
+    }
+
+    #[test]
+    fn a_balloon_holds_the_approach_thrust_and_the_ratchet_lets_go_ahead_of_it() {
+        assert_eq!(balloon_power(Some(300.0), Some(0.32), false), Some(0.32));
+        assert_eq!(
+            balloon_power(Some(-200.0), Some(0.32), false),
+            None,
+            "sinking in the band: the flare's law"
+        );
+        assert_eq!(
+            balloon_power(Some(-200.0), Some(0.32), true),
+            Some(0.32),
+            "coming back down to the band on power"
+        );
+        assert_eq!(balloon_power(Some(300.0), None, false), None, "nothing measured");
+        // EDLP 24: 0.3 held, vvi -192 easing at +480 fpm/s is a balloon in
+        // 0.4 s. The ratchet lets go now instead of at the climb.
+        let mut p = FlarePitch::default();
+        let held = p.step(-107.0, -451.0, -200.0, 0.2, true);
+        assert!(held > 0.2, "{held}");
+        let next = p.step(-107.0, -192.0, 480.0, 0.2, true);
+        assert!(next < held, "released ahead of the balloon: {held} -> {next}");
+        assert!(next >= 0.0, "never a push");
     }
 
     /// The ratchet is the flare's, not the roundout's, and it never outlives
@@ -6798,5 +7073,58 @@ mod approach_power_floor_tests {
         let xp = FakeXPlane::with_reads(&[(super::SERVOS_ON, 0.0)]);
         assert_eq!(super::disconnect_autopilot(&xp).await, None);
         assert!(!xp.ran(super::CMD_SERVOS_OFF));
+    }
+
+    /// EDLP 24 (2026-09-24): the SF50's 0.35 went to neutral in one tick at
+    /// +190 fpm, and neutral is the TRIMMED approach attitude: the sink was
+    /// back at -590 two seconds later. A declared ease walks the pull down.
+    #[test]
+    fn a_declared_balloon_ease_walks_the_pull_down_instead_of_dropping_it() {
+        let gains = super::FlareGains {
+            balloon_ease_per_s: Some(0.15),
+            ..Default::default()
+        };
+        let mut law = super::FlarePitch::with_gains(gains);
+        // Sinking hard: the ratchet builds the pull to the cap.
+        for _ in 0..10 {
+            law.step(-100.0, -600.0, 0.0, 0.22, true);
+        }
+        let held = law.step(-100.0, -600.0, 0.0, 0.22, true);
+        assert!(held > 0.3, "{held}");
+        // Now climbing: one tick eases 0.15 x 0.22, it does not let go.
+        let next = law.step(-100.0, 150.0, 400.0, 0.22, true);
+        assert!((held - next - 0.033).abs() < 1e-6, "{held} -> {next}");
+        // The default law (the 172, the 737, the Citation) still lets go.
+        let mut old = super::FlarePitch::default();
+        for _ in 0..10 {
+            old.step(-100.0, -600.0, 0.0, 0.22, true);
+        }
+        assert_eq!(old.step(-100.0, 150.0, 400.0, 0.22, true), 0.0);
+        // And a reset keeps the airframe's numbers.
+        law.reset();
+        for _ in 0..10 {
+            law.step(-100.0, -600.0, 0.0, 0.22, true);
+        }
+        let h = law.step(-100.0, -600.0, 0.0, 0.22, true);
+        assert!(h - law.step(-100.0, 150.0, 400.0, 0.22, true) < 0.05);
+    }
+
+    #[test]
+    fn a_flare_elevator_block_scales_the_law_and_a_bad_one_is_the_default() {
+        let p = crate::aircraft::FlareElevatorProfile {
+            gain: 0.5,
+            trim_gain: 3.0,
+            max: 0.30,
+            max_push: 0.05,
+            balloon_ease_per_s: Some(0.15),
+        };
+        let g = super::FlareGains::from_profile(Some(p));
+        let d = super::FlareGains::default();
+        assert!((g.p - 0.5 * d.p).abs() < 1e-12 && (g.d - 0.5 * d.d).abs() < 1e-12);
+        assert!((g.trim_rate - 3.0 * d.trim_rate).abs() < 1e-12);
+        assert_eq!((g.max, g.min, g.balloon_ease_per_s), (0.30, -0.05, Some(0.15)));
+        let bad = crate::aircraft::FlareElevatorProfile { max: 2.0, ..p };
+        assert_eq!(super::FlareGains::from_profile(Some(bad)), d);
+        assert_eq!(super::FlareGains::from_profile(None), d);
     }
 }

@@ -536,6 +536,8 @@ impl Tool for TaxiToParking {
             self.prop.clone(),
             self.pace,
             vacate_from,
+            // Asked for by voice: the shutdown stays the pilot's.
+            false,
         );
         Ok("Taxiing to parking — getting the clearance.".to_string())
     }

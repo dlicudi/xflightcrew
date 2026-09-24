@@ -68,6 +68,7 @@ pub fn start(
     prop: Option<crate::aircraft::PropProfile>,
     pace: crate::autotaxi::Pace,
     vacate_from: Option<String>,
+    shut_down: bool,
 ) {
     std::thread::spawn(move || {
         let Ok(rt) = tokio::runtime::Builder::new_current_thread()
@@ -84,6 +85,7 @@ pub fn start(
             prop,
             pace,
             vacate_from,
+            shut_down,
         ));
     });
 }
@@ -128,10 +130,20 @@ fn stand_route_ready() -> bool {
     crate::party_line::taxi_to_stand() && crate::party_line::with_taxi_route(|r| r.is_some())
 }
 
-/// How long to give the drive off the runway before pressing on regardless.
-/// A vacate is a hundred metres at taxi pace; well past that, something has
-/// gone wrong and continuing to the taxi-in request beats waiting silently.
+/// How long to give the drive off the runway before pressing on regardless:
+/// at least this, and more for a longer vacate (`vacate_budget_secs`).
+/// Well past it something has gone wrong, and continuing to the taxi-in
+/// request beats waiting silently.
 const VACATE_MAX_SECS: f64 = 120.0;
+
+/// The vacate's budget, sized on its own route: half as long again as the
+/// drive at `kts`, never under [`VACATE_MAX_SECS`]. "A vacate is a hundred
+/// metres" was the flat figure's premise, and EDLP's was 1,217 m at 8 kt:
+/// halted on the runway with 714 m to go (2026-09-24).
+fn vacate_budget_secs(route_m: f64, kts: f64) -> f64 {
+    let mps = kts.max(3.0) * 0.514_444;
+    (1.5 * route_m.max(0.0) / mps).max(VACATE_MAX_SECS)
+}
 
 /// Phase one: drive clear of `rwy`, then report it.
 ///
@@ -228,6 +240,7 @@ async fn vacate(
     // Props out of feather before the drive rolls (the same wall auto taxi
     // and the line-up hit): a turboprop with feathered blades makes no thrust.
     crate::tools::prop::advance_for_ground_roll(xp, &prop).await;
+    let budget = vacate_budget_secs(route.total_m(), drive_kts);
     crate::autotaxi::start(
         config.xplane_base_url.clone(),
         voice.clone(),
@@ -237,7 +250,7 @@ async fn vacate(
 
     // Wait for it to finish. Bounded, and a timeout is not fatal: the taxi-in
     // request goes out regardless, which is the other way off the pavement.
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs_f64(VACATE_MAX_SECS);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs_f64(budget);
     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
     while crate::autotaxi::driving() {
         if std::time::Instant::now() >= deadline {
@@ -286,6 +299,7 @@ async fn fly(
     prop: Option<crate::aircraft::PropProfile>,
     pace: crate::autotaxi::Pace,
     vacate_from: Option<String>,
+    shut_down: bool,
 ) {
     // --- Phase one: get off the runway. No clearance, no request, no wait. ---
     if let Some(rwy) = vacate_from {
@@ -482,19 +496,26 @@ async fn fly(
         }
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     }
-    if crate::autotaxi::LAST_ARRIVED.load(Relaxed) {
-        secure(&xp, &voice, park_brake_valve_set).await;
+    if crate::autotaxi::LAST_ARRIVED.load(Relaxed)
+        && secure(&xp, &voice, park_brake_valve_set, shut_down).await
+        && shut_down
+    {
+        shut_down_at_stand(&xp, &config, &voice).await;
     }
 }
 
 /// Arrival securing at the stand. STOCK-safe items only — they work on every
 /// airframe with no profile: park brake set, transponder to standby, and the
 /// exterior lights you don't want on at the gate (strobes, taxi and landing).
-/// The beacon and nav lights stay for the ground crew, and ENGINE SHUTDOWN is
-/// deliberately left to the pilot for now — it's airframe-specific (a piston's
-/// mixture cutoff vs a turboprop's condition levers) and wants sim validation
-/// before the copilot cuts an engine on its own.
-async fn secure(xp: &XPlaneClient, voice: &Option<Voice>, park_brake_valve_set: Option<f64>) {
+/// The beacon and nav lights stay for the ground crew. The ENGINES are a
+/// mission's to cut (`shut_down_at_stand`), never a spoken "taxi to parking".
+/// Returns whether the aircraft is parked ON the stand.
+async fn secure(
+    xp: &XPlaneClient,
+    voice: &Option<Voice>,
+    park_brake_valve_set: Option<f64>,
+    shut_down: bool,
+) -> bool {
     // Are we actually ON a stand? The claim was never checked: any arrival
     // latch at all earned "At the gate", and at BIKF (2026-09-20) that was
     // said 140 m from the nearest stand, ninety degrees across it, on a
@@ -510,9 +531,8 @@ async fn secure(xp: &XPlaneClient, voice: &Option<Voice>, park_brake_valve_set: 
         xp.get_float(crate::autotaxi::PSI_TRUE),
     );
     let at_stand = match (lat_r, lon_r, psi_r) {
-        (Ok(lat), Ok(lon), Ok(psi)) => crate::pushback::on_a_stand(
+        (Ok(lat), Ok(lon), Ok(_)) => crate::pushback::parked_at_stand(
             crate::party_line::nearest_stand(lat, lon).map(|s| (s.dist_m, s.heading)),
-            psi,
             crate::party_line::stands_known(),
         ),
         // A failed read is no measurement: say nothing we cannot support, and
@@ -535,7 +555,7 @@ async fn secure(xp: &XPlaneClient, voice: &Option<Voice>, park_brake_valve_set: 
              and I've left the lights and transponder alone. Your aircraft.",
         );
         crate::full_auto::release_arrival_station();
-        return;
+        return false;
     }
     announce(
         voice,
@@ -567,9 +587,165 @@ async fn secure(xp: &XPlaneClient, voice: &Option<Voice>, park_brake_valve_set: 
     crate::blackbox::record("taxi_in", json!({ "event": "secured" }));
     // The arrival is over: hand the station back to the region's own pick.
     crate::full_auto::release_arrival_station();
-    announce(
-        voice,
-        Priority::Advisory,
-        "Parking items done. Shut down when you're ready. Your aircraft.",
+    if !shut_down {
+        announce(
+            voice,
+            Priority::Advisory,
+            "Parking items done. Shut down when you're ready. Your aircraft.",
+        );
+    }
+    true
+}
+
+/// How long the engines get to wind down after the shutdown tool returns.
+const SHUTDOWN_CONFIRM_SECS: f64 = 60.0;
+
+/// A MISSION ends shut down on the stand: the engines through the airframe's
+/// own shutdown tool (whichever the registry built for its class: the piston
+/// cutoff, a turboprop's condition levers, a jet's fuel levers, the
+/// helicopter's), confirmed from `ENGN_running` for EVERY engine, and only
+/// then every electrical system off through `set_electrical`. Engines still
+/// turning leave the electrics on and say so. Asked 2026-09-24: full auto
+/// ended at "Parking items done. Shut down when you're ready."
+async fn shut_down_at_stand(xp: &XPlaneClient, config: &Config, voice: &Option<Voice>) {
+    let Some(profile) = crate::aircraft::live_profile() else {
+        announce(voice, Priority::Advisory, "Parked. Your aircraft for the shutdown.");
+        return;
+    };
+    let reg = crate::tools::Registry::for_aircraft(&profile);
+    let ctx = ToolCtx {
+        xplane: xp,
+        config,
+        voice: voice.as_ref(),
+        status: None,
+        reminders: None,
+    };
+    let Some(stop) = reg.get("stop_engines").or_else(|| reg.get("stop_engine")) else {
+        crate::blackbox::record("taxi_in", json!({ "event": "shutdown", "tool": null }));
+        announce(
+            voice,
+            Priority::Advisory,
+            "Parked. I have no shutdown for this airframe, so the engines are yours. Your aircraft.",
+        );
+        return;
+    };
+    let line = match stop.execute(&json!({}), &ctx).await {
+        Ok(l) => l,
+        Err(e) => format!("The shutdown failed: {e}."),
+    };
+    let engines = profile.engines.max(1);
+    let deadline =
+        std::time::Instant::now() + std::time::Duration::from_secs_f64(SHUTDOWN_CONFIRM_SECS);
+    let stopped = loop {
+        // A failed read is no measurement: keep asking until the deadline.
+        if let Ok(r) = xp.get_float_array("sim/flightmodel/engine/ENGN_running").await {
+            if engines_stopped(&r, engines) {
+                break true;
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            break false;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
+    };
+    crate::blackbox::record(
+        "taxi_in",
+        json!({ "event": "shutdown", "tool": stop.name(), "line": line, "stopped": stopped }),
     );
+    if !stopped {
+        announce(
+            voice,
+            Priority::Caution,
+            &format!(
+                "{line} The engines are still turning, so I've left the electrics on. \
+                 Your aircraft."
+            ),
+        );
+        return;
+    }
+    let electrics = match reg.get("set_electrical") {
+        Some(t) => Some(
+            t.execute(&json!({ "system": "all", "on": false }), &ctx)
+                .await
+                .unwrap_or_else(|e| format!("The electrics did not switch off: {e}.")),
+        ),
+        None => None,
+    };
+    crate::blackbox::record(
+        "taxi_in",
+        json!({ "event": "electrics_off", "line": electrics }),
+    );
+    announce(voice, Priority::Advisory, &shutdown_line(electrics.as_deref()));
+}
+
+/// Every engine the airframe has reads stopped. A short array is not a
+/// verdict on the engines it does not cover.
+fn engines_stopped(running: &[f64], engines: usize) -> bool {
+    running.len() >= engines && running.iter().take(engines).all(|&v| v < 0.5)
+}
+
+/// The closing line: the electrics' own readback when one of them did not
+/// move, never "all off" over a switch that stayed on.
+fn shutdown_line(electrics: Option<&str>) -> String {
+    match electrics {
+        Some(l) if l.starts_with("Roger") => {
+            "Engines shut down and the electrics are off. That's us parked.".to_string()
+        }
+        Some(l) => format!("Engines shut down. {l}"),
+        None => "Engines shut down. The electrics are yours; I can't switch them here.".to_string(),
+    }
+}
+
+#[cfg(test)]
+mod shutdown_tests {
+    use super::{engines_stopped, shutdown_line, vacate_budget_secs, VACATE_MAX_SECS};
+
+    #[test]
+    fn a_long_vacate_gets_the_time_its_route_needs() {
+        // EDLP 24 (2026-09-24): 1,217 m at 8 kt is about 296 s of driving.
+        assert!(vacate_budget_secs(1_217.0, 8.0) >= 400.0);
+        assert_eq!(vacate_budget_secs(100.0, 8.0), VACATE_MAX_SECS);
+        assert_eq!(vacate_budget_secs(f64::NAN.max(0.0), 0.0), VACATE_MAX_SECS);
+    }
+
+    #[test]
+    fn every_engine_must_read_stopped_and_a_short_array_is_no_verdict() {
+        assert!(engines_stopped(&[0.0, 0.0, 1.0], 2));
+        assert!(!engines_stopped(&[0.0, 1.0], 2), "the LAST engine too");
+        assert!(!engines_stopped(&[0.0], 2));
+        assert!(engines_stopped(&[0.0; 8], 1));
+    }
+
+    #[test]
+    fn the_closing_line_never_claims_electrics_that_did_not_move() {
+        assert!(shutdown_line(Some("Roger, all electrical systems off.")).contains("electrics are off"));
+        let l = shutdown_line(Some("The avionics didn't move."));
+        assert!(l.contains("avionics didn't move") && !l.contains("electrics are off"), "{l}");
+        assert!(shutdown_line(None).contains("electrics are yours"));
+    }
+
+    /// A mission ends shut down on the stand, so every airframe full auto
+    /// can fly must have a shutdown the registry built.
+    #[test]
+    fn every_full_auto_airframe_has_a_shutdown_for_the_stand() {
+        let mut checked = 0;
+        for entry in std::fs::read_dir("profiles").unwrap() {
+            let path = entry.unwrap().path();
+            if path.extension().and_then(|e| e.to_str()) != Some("yaml") {
+                continue;
+            }
+            let id = path.file_stem().unwrap().to_str().unwrap().to_string();
+            let Some(p) = crate::aircraft::load(&id) else { continue };
+            let reg = crate::tools::Registry::for_aircraft(&p);
+            if reg.get("full_auto").is_none() {
+                continue;
+            }
+            checked += 1;
+            assert!(
+                reg.get("stop_engines").is_some() || reg.get("stop_engine").is_some(),
+                "{id}: full auto can fly it but nothing can shut it down at the stand"
+            );
+        }
+        assert!(checked > 3, "only {checked} full-auto airframes found");
+    }
 }

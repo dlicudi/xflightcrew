@@ -113,6 +113,17 @@ pub(crate) fn generic_profile_id(icao: &str) -> String {
     format!("generic_{}", icao.to_lowercase())
 }
 
+/// The loaded airframe's `.acf` text: the sim names the file
+/// (`acf_relative_path`, relative to the install). `None` when unreadable.
+pub(crate) async fn acf_text(xp: &XPlaneClient) -> Option<String> {
+    let rel = xp
+        .get_string("sim/aircraft/view/acf_relative_path")
+        .await
+        .ok()
+        .filter(|r| !r.is_empty())?;
+    std::fs::read_to_string(format!("{}/{}", tools::autoland::xplane_root(), rel)).ok()
+}
+
 /// A profile for an unknown airframe from its own `.acf`: the sim names the
 /// file (`acf_relative_path`, relative to the install), the placards come
 /// out of it. `None` when the file can't be found or read — the caller then
@@ -249,6 +260,18 @@ pub(crate) fn spawn_aircraft_detector(
                         }
                         if id == live.id() && probed != id {
                             last_plugin_probe = std::time::Instant::now();
+                            // The gear-warning envelope is the airframe's own
+                            // (its .acf), when the profile does not declare
+                            // one: the takeoff raises the gear only once the
+                            // horn will not sound (SF50, 2026-09-23).
+                            let prof = live.get();
+                            if prof.retractable_gear && prof.gear_warning.is_none() {
+                                if let Some(text) = acf_text(&xp).await {
+                                    let w = aircraft::gear_warning_from_acf(&text);
+                                    tracing::info!(?w, "gear warning envelope from the .acf");
+                                    crate::autotakeoff::publish_gear_warning(w);
+                                }
+                            }
                             let mut names = aircraft::profile_references(&live.get());
                             let profile_total = names.len();
                             // The plugin's side of the wire contract rides

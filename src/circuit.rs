@@ -942,6 +942,14 @@ const TURN_IN_PROGRESS_BANK_DEG: f64 = 3.0;
 /// A wanted turn smaller than this against the bank in progress is left to
 /// the AP: it is finishing a capture, not going the long way round.
 const REVERSAL_MIN_DEG: f64 = 10.0;
+/// Until the autopilot is banked INTO the wanted turn, the bug leads the
+/// nose by no more than this: a small bug on the right side starts the turn
+/// the right way, and once the turn is in progress the sim's refusal to
+/// reverse it works for us. The rectangle circuit slewed the bug 90 degrees
+/// off the nose from wings level, and the SF50 went round the long way on 13
+/// of its 30 circuit turns (the A330 on 2 of 4), each a 270 right for a 90
+/// left (ETND, 2026-09-23).
+const TURN_ENTRY_LEAD_DEG: f64 = 25.0;
 
 /// Step the bug toward `want_mag` (as [`slew_bug`]) unless the aircraft is
 /// banked INTO a turn the other way, in which case hold the bug ON THE NOSE
@@ -970,6 +978,12 @@ pub fn bug_toward(
         && (turn > 0.0) != (phi_deg > 0.0);
     if banked_other_way {
         return slew_bug(current_bug, heading_mag, max_step);
+    }
+    let committed =
+        phi_deg.abs() > TURN_IN_PROGRESS_BANK_DEG && (turn > 0.0) == (phi_deg > 0.0);
+    if !committed && turn.abs() > TURN_ENTRY_LEAD_DEG {
+        let entry = (heading_mag + turn.signum() * TURN_ENTRY_LEAD_DEG).rem_euclid(360.0);
+        return slew_bug(current_bug, entry, max_step);
     }
     slew_bug(current_bug, want_mag, max_step)
 }
@@ -2217,11 +2231,12 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, p: Params
             xp.get_float(VS_STATUS),
         );
         let thr_dref = throttle_dref();
-        let (ias_r, thr_r, dial_r, alt_hold_r) = tokio::join!(
+        let (ias_r, thr_r, dial_r, alt_hold_r, phi_r) = tokio::join!(
             xp.get_float(IAS),
             xp.get_float(&thr_dref),
             xp.get_float(ALT_DIAL),
             xp.get_float(ALT_HOLD_STATUS),
+            xp.get_float(PHI),
         );
         let (Ok(lat), Ok(lon)) = (lat, lon) else {
             continue;
@@ -2316,7 +2331,21 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, p: Params
         };
         let want_hdg = leg_hdg + crab;
         let target_mag = true_to_mag(want_hdg, mag_var);
-        bug_mag = slew_bug(bug_mag, target_mag, BUG_SLEW_PER_TICK);
+        // Through the one door every pursuit steer takes: the bug leads the
+        // nose gently until the autopilot is banked the right way. A bare
+        // slew put it 90 degrees off from wings level in 1.5 s, and the SF50
+        // flew 13 of its 30 circuit turns the long way round (ETND 26,
+        // 2026-09-23: crosswind, downwind and base each a 270 right).
+        bug_mag = match (psi_v, phi_r.as_ref().ok()) {
+            (Some(psi), Some(phi)) => bug_toward(
+                bug_mag,
+                target_mag,
+                true_to_mag(psi, mag_var),
+                *phi,
+                BUG_SLEW_PER_TICK,
+            ),
+            _ => slew_bug(bug_mag, target_mag, BUG_SLEW_PER_TICK),
+        };
         let _ = xp.set_float(HDG_BUG, bug_mag).await;
         // The lateral mode must actually be ON for the bug to mean anything —
         // re-engage like the takeoff's VS guard, never press blind.
@@ -3812,6 +3841,41 @@ mod tests {
             (b - 355.0).abs() < 0.01,
             "on the nose across the seam, got {b}"
         );
+    }
+
+    /// ETND 26 (2026-09-23), the SF50's crosswind: wings level on 265, the
+    /// leg wants 174. The bug used to reach 174 in three ticks and the
+    /// autopilot went round to the right. Now it leads the nose by 25 until
+    /// the bank is established left, then goes the whole way.
+    #[test]
+    fn a_big_turn_from_level_is_started_the_right_way_first() {
+        let mut bug = 263.4;
+        let mut heading = 264.7;
+        let mut phi: f64 = 0.3;
+        let mut max_lead: f64 = 0.0;
+        for _ in 0..30 {
+            bug = bug_toward(bug, 173.7, heading, phi, BUG_SLEW_PER_TICK);
+            if (bug - 173.7).abs() < 0.01 {
+                break; // committed and handed to the leg: the capture is the AP's
+            }
+            let lead = ((bug - heading + 540.0).rem_euclid(360.0)) - 180.0;
+            assert!(lead <= 0.5, "never right of the nose: {lead:.1}");
+            if phi > -TURN_IN_PROGRESS_BANK_DEG {
+                max_lead = max_lead.max(-lead);
+                assert!(-lead <= TURN_ENTRY_LEAD_DEG + 0.01, "entry lead {lead:.1}");
+            }
+            // A plant that banks toward the bug and turns with the bank.
+            phi = (phi + (lead.clamp(-25.0, 25.0) - phi) * 0.3).clamp(-25.0, 25.0);
+            heading = (heading + phi * 0.25).rem_euclid(360.0);
+        }
+        assert!((max_lead - TURN_ENTRY_LEAD_DEG).abs() < 0.5, "{max_lead}");
+        assert!(
+            (bug - 173.7).abs() < 0.01,
+            "committed, the bug goes to the leg: {bug:.1}"
+        );
+        // Right turns the same, across the north seam.
+        let b = bug_toward(355.0, 90.0, 355.0, 0.0, BUG_SLEW_PER_TICK);
+        assert!((b - 20.0).abs() < 0.01, "25 right of the nose: {b}");
     }
 
     /// The takeoff handed off 1.8 km past the climb-out point; the follower

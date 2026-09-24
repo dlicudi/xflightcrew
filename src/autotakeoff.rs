@@ -285,6 +285,57 @@ pub fn flap_retract_step(schedule: &[(f64, f64)], current: f64, ias: f64) -> Opt
 
 /// Raise the gear (when there is one) above this, climbing.
 const GEAR_UP_AGL_FT: f64 = 200.0;
+/// Above this the gear comes up whatever its warning says: drag and the
+/// gear placard matter more than a horn. The handoff raises it too.
+const GEAR_UP_LATEST_AGL_FT: f64 = 1000.0;
+/// Knots over the warning speed before the gear comes up, so it does not
+/// sound on the first gust.
+const GEAR_WARN_MARGIN_KTS: f64 = 3.0;
+/// Knots under the gear placard at which the gear comes up regardless.
+const GEAR_VLO_MARGIN_KTS: f64 = 10.0;
+
+/// The airframe's gear-warning envelope, from its profile or its `.acf`.
+static GEAR_WARNING: std::sync::Mutex<Option<crate::aircraft::GearWarning>> =
+    std::sync::Mutex::new(None);
+
+/// Republished on every swap, including to `None`
+/// ([`crate::flight_state::publish_airframe`]); the detector publishes the
+/// `.acf`'s envelope over a silent profile once per airframe.
+pub fn publish_gear_warning(w: Option<crate::aircraft::GearWarning>) {
+    *GEAR_WARNING.lock().unwrap_or_else(|e| e.into_inner()) = w;
+}
+
+fn gear_warning() -> Option<crate::aircraft::GearWarning> {
+    *GEAR_WARNING.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Is it time to raise the gear after takeoff? Above [`GEAR_UP_AGL_FT`]
+/// climbing, once raising it will not sound the airframe's own gear warning
+/// (`warning`, at takeoff thrust so only the speed and flap clauses apply),
+/// and in any case by [`GEAR_UP_LATEST_AGL_FT`] or near the gear placard.
+/// The SF50's warning fires below 125 kt with its 0.5 takeoff flap: the flat
+/// 200 ft rule raised the gear at 122 kt and the horn ran to 335 ft on every
+/// departure (ETND 26, 2026-09-23). Pure.
+pub fn gear_up_due(
+    agl_ft: f64,
+    ias_kts: f64,
+    flap_ratio: f64,
+    warning: Option<crate::aircraft::GearWarning>,
+    vlo_kts: Option<f64>,
+) -> bool {
+    if agl_ft <= GEAR_UP_AGL_FT {
+        return false;
+    }
+    if agl_ft >= GEAR_UP_LATEST_AGL_FT
+        || vlo_kts.is_some_and(|v| ias_kts >= v - GEAR_VLO_MARGIN_KTS)
+    {
+        return true;
+    }
+    match warning {
+        None => true,
+        Some(w) => !w.would_sound(ias_kts - GEAR_WARN_MARGIN_KTS, flap_ratio, 1.0),
+    }
+}
 
 /// True while the takeoff loop runs. Cleared by the loop, the release path
 /// in main ("my controls" — silent stand-down), or the tool's off switch.
@@ -679,6 +730,55 @@ pub fn roll_target_heading(course_deg: f64, xtk_m: f64, xtk_rate_m_s: f64, gs_kt
 /// Slew limit: move from `prev` toward `want` by at most `max_step`.
 pub fn slew(prev: f64, want: f64, max_step: f64) -> f64 {
     prev + (want - prev).clamp(-max_step, max_step)
+}
+
+/// The transponder to ALT (mode C) through the shared writer, so an add-on's
+/// own box (the Twin Otter's KT73) has its KNOB turned; on its own task, since
+/// a stepped knob takes a few hundred milliseconds. The result is kept and a
+/// failure said: the A330 flew out in standby to two "recycle transponder"
+/// calls with nothing said on the flight deck (EGPH, 2026-09-20).
+fn squawk_altitude(base_url: String, v: Option<Voice>) {
+    tokio::spawn(async move {
+        let xp = XPlaneClient::new(base_url);
+        let ok = crate::tools::radio::set_mode(&xp, crate::tools::radio::XpdrMode::Altitude).await;
+        crate::blackbox::record(
+            "autotakeoff",
+            serde_json::json!({"event": "transponder_alt", "ok": ok}),
+        );
+        if !ok {
+            alert(
+                &v,
+                Priority::Caution,
+                "The transponder didn't take altitude mode. Check the knob.",
+            );
+        }
+    });
+}
+
+/// Differential brake on the takeoff roll, for an airframe that steers on its
+/// brakes ([`crate::aircraft::TaxiProfile::brake_steer`]): the taxi's own
+/// split of the steer command, faded out between [`ROLL_BRAKE_FULL_KTS`] and
+/// [`ROLL_BRAKE_OFF_KTS`] as the rudder comes alive. EDLP 24 (2026-09-24): the
+/// SF50's castoring nosewheel and a rudder with no airflow gave the roll no
+/// steering at all; the heading error grew from 8 to 27 degrees with the
+/// channel at full deflection until the pilot took the pedals at 21 kt.
+pub fn roll_brake_split(steer: f64, gs_kts: f64) -> (f64, f64) {
+    let fade = ((ROLL_BRAKE_OFF_KTS - gs_kts) / (ROLL_BRAKE_OFF_KTS - ROLL_BRAKE_FULL_KTS))
+        .clamp(0.0, 1.0);
+    let (l, r) = crate::autotaxi::brake_steer_split(steer, gs_kts);
+    (l * fade, r * fade)
+}
+
+/// Full brake-steering authority on the roll below this groundspeed...
+const ROLL_BRAKE_FULL_KTS: f64 = 20.0;
+/// ...and none above this, where the rudder steers.
+const ROLL_BRAKE_OFF_KTS: f64 = 40.0;
+
+/// Whether the live airframe steers on its brakes.
+fn brake_steers() -> bool {
+    crate::aircraft::live_profile()
+        .and_then(|p| p.taxi.as_ref().map(|t| t.brake_steer))
+        .unwrap_or(false)
 }
 
 /// The roll steering law: P on the error, a lead term on its rate (damps
@@ -1410,6 +1510,12 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, p: Params) {
             "remaining_m": remaining_m, "vr": p.vr_kts,
         }),
     );
+    // Transponder to ALT as the roll starts, the way a crew sets it lining up:
+    // set at liftoff alone, a takeoff handed back on the roll left it on
+    // standby and the tower called "negative radar contact" with the pilot
+    // climbing out (EDLP 24, 2026-09-24). Liftoff asks again (a no-op when
+    // it took).
+    squawk_altitude(p.base_url.clone(), voice.clone());
     alert(
         &voice,
         Priority::Advisory,
@@ -1471,6 +1577,7 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, p: Params) {
     // swinging-nose hold (throttle is commanded before position is read).
     let mut last_err = 0.0_f64;
     let mut steer_law = RollSteer::default();
+    let brake_steer = brake_steers();
     // Previous cross-track, for the roll's own closure rate (see
     // [`roll_target_heading`]). Metres, right-positive.
     let mut prev_xtk_m: Option<f64> = None;
@@ -1659,6 +1766,19 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, p: Params) {
             let err = ((target - psi + 540.0).rem_euclid(360.0)) - 180.0;
             last_err = err;
             let steer = steer_law.step(err, dt, gs_kts, thr_cmd);
+            // The brake half, on an airframe that has no other low-speed
+            // steering; zero once rotated (the channel expires anyway).
+            let (bl, br) = if brake_steer && !rotated {
+                roll_brake_split(steer, gs_kts)
+            } else {
+                (0.0, 0.0)
+            };
+            if brake_steer {
+                let _ = tokio::join!(
+                    xp.set_float(crate::autotaxi::LEFT_BRAKE, bl),
+                    xp.set_float(crate::autotaxi::RIGHT_BRAKE, br),
+                );
+            }
             if xp.set_float(TAXI_STEER, steer).await.is_err() {
                 reject(
                     &xp,
@@ -1686,6 +1806,7 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, p: Params) {
                     "theta": theta_deg, "pitch_tgt": pitch_law.target_deg(),
                     "q": pitch_rate,
                     "steer": steer, "trim": steer_law.trim(), "xtk_m": xtk_m,
+                    "bl": bl, "br": br,
                     "xtk_rate": xtk_rate,
                     "thr": thr_cmd, "remaining_m": remaining, "dt": dt,
                 }),
@@ -1743,24 +1864,7 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, p: Params) {
                 // the result is KEPT: it was discarded, and the A330 flew out
                 // in standby to two "recycle transponder" calls with nothing
                 // said on the flight deck (EGPH, 2026-09-20).
-                let (url, v) = (p.base_url.clone(), voice.clone());
-                tokio::spawn(async move {
-                    let xp = XPlaneClient::new(url);
-                    let ok =
-                        crate::tools::radio::set_mode(&xp, crate::tools::radio::XpdrMode::Altitude)
-                            .await;
-                    crate::blackbox::record(
-                        "autotakeoff",
-                        serde_json::json!({"event": "transponder_alt", "ok": ok}),
-                    );
-                    if !ok {
-                        alert(
-                            &v,
-                            Priority::Caution,
-                            "The transponder didn't take altitude mode. Check the knob.",
-                        );
-                    }
-                });
+                squawk_altitude(p.base_url.clone(), voice.clone());
                 crate::blackbox::record(
                     "autotakeoff",
                     serde_json::json!({"event": "liftoff", "ias": ias}),
@@ -1775,10 +1879,23 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, p: Params) {
             positive_called = true;
             alert(&voice, Priority::Advisory, "Positive rate.");
         }
-        if !gear_raised && agl_ft > GEAR_UP_AGL_FT {
+        if !gear_raised
+            && gear_up_due(
+                agl_ft,
+                ias,
+                flap_cmd,
+                gear_warning(),
+                crate::aircraft::gear_limit_kts(),
+            )
+        {
             gear_raised = true;
             let _ = xp.set_float(GEAR_HANDLE, 0.0).await;
             alert(&voice, Priority::Advisory, "Gear up.");
+            crate::blackbox::record(
+                "autotakeoff",
+                serde_json::json!({"event": "gear_up", "agl": agl_ft, "ias": ias,
+                                   "flap": flap_cmd, "warning": gear_warning().is_some()}),
+            );
             crate::takeoff_config::after_liftoff(&xp).await;
         }
         // Clean up the takeoff flaps once safely climbing — after the gear,
@@ -1944,6 +2061,18 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, p: Params) {
                     serde_json::json!({"event": "flaps_handoff", "ias": ias,
                                        "floor": floor, "up": up}),
                 );
+            }
+            // Nobody takes an aircraft with the gear still hanging: a gear
+            // held for its warning speed comes up at the handoff at the latest.
+            if !gear_raised {
+                let _ = xp.set_float(GEAR_HANDLE, 0.0).await;
+                alert(&voice, Priority::Advisory, "Gear up.");
+                crate::blackbox::record(
+                    "autotakeoff",
+                    serde_json::json!({"event": "gear_up", "agl": agl_ft, "ias": ias,
+                                       "flap": flap_cmd, "at_handoff": true}),
+                );
+                crate::takeoff_config::after_liftoff(&xp).await;
             }
             // Say the height we ACTUALLY reached, not a hardcoded thousand: a
             // circuit hands off at 500 ft, and it announced "one thousand
@@ -2240,6 +2369,38 @@ mod tests {
         assert_eq!(flap_retract_step(&sched, 0.375, 300.0), Some(0.25));
         // An airframe with no declared speeds keeps the one-shot clean-up.
         assert_eq!(flap_retract_step(&[], 0.375, 300.0), None);
+    }
+
+    #[test]
+    fn the_gear_waits_for_its_own_warning_to_clear() {
+        // The SF50's .acf: below 125 kt, flaps past 0.5 or thrust under 50%.
+        let sf50 = crate::aircraft::gear_warning_from_acf(
+            "P acf/_gear_warn_above_flap_rat 0.500000000\n\
+             P acf/_gear_warn_below_kias 125.000000000\n\
+             P acf/_gear_warn_below_thro_pct 50.000000000\n",
+        );
+        assert_eq!(
+            sf50,
+            Some(crate::aircraft::GearWarning {
+                below_kias: 125.0,
+                below_throttle_pct: Some(50.0),
+                above_flap_ratio: Some(0.5),
+            })
+        );
+        let vlo = Some(160.0);
+        // ETND 26: 200 ft and 122 kt with the takeoff flap, the horn.
+        assert!(!gear_up_due(203.0, 122.0, 0.5, sf50, vlo));
+        assert!(!gear_up_due(340.0, 125.6, 0.5, sf50, vlo), "inside the margin");
+        assert!(gear_up_due(380.0, 128.7, 0.5, sf50, vlo));
+        // Clean, the flap clause is gone and full thrust is not the power one.
+        assert!(gear_up_due(203.0, 110.0, 0.0, sf50, vlo));
+        // Never below the floor, always by the latest height or the placard.
+        assert!(!gear_up_due(150.0, 150.0, 0.0, sf50, vlo));
+        assert!(gear_up_due(1000.0, 110.0, 0.5, sf50, vlo));
+        assert!(gear_up_due(400.0, 151.0, 0.5, sf50, vlo));
+        // An airframe with no declared warning keeps the old 200 ft rule.
+        assert!(gear_up_due(201.0, 80.0, 0.5, None, None));
+        assert_eq!(crate::aircraft::gear_warning_from_acf("P acf/_Vle_kts 150\n"), None);
     }
     #[tokio::test]
     async fn paused_missing_or_refused_modes_cannot_complete_the_takeoff_handoff() {
@@ -3660,5 +3821,16 @@ mod tests {
             };
             assert_eq!(ClimbOut::from_profile(&p).is_some(), want, "{id}");
         }
+    }
+
+    #[test]
+    fn a_brake_steered_roll_uses_the_brakes_until_the_rudder_bites() {
+        // EDLP 24: full left steer at 10-21 kt with nothing answering.
+        let (l, r) = super::roll_brake_split(-0.85, 12.0);
+        assert!(l > 0.2 && r == 0.0, "inside (left) brake: {l} {r}");
+        let (l30, _) = super::roll_brake_split(-0.85, 30.0);
+        assert!((l30 - 0.5 * l).abs() < 1e-9, "half by 30 kt: {l30}");
+        assert_eq!(super::roll_brake_split(-0.85, 45.0), (0.0, 0.0), "the rudder's above 40");
+        assert_eq!(super::roll_brake_split(0.02, 12.0), (0.0, 0.0), "no brake for a breath of steer");
     }
 }

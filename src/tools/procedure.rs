@@ -314,3 +314,36 @@ mod tests {
         assert_eq!(spell_ident("BLN4L"), "B L N 4 L");
     }
 }
+
+#[cfg(test)]
+mod divert_probe {
+    /// `cargo test -- --ignored real_install_eddm_divert --nocapture`
+    #[test]
+    #[ignore]
+    fn real_install_eddm_divert() {
+        let apt = "/Users/duanelicudi/X-Plane 12/Global Scenery/Global Airports/Earth nav data/apt.dat";
+        let cifp = "/Users/duanelicudi/X-Plane 12/Custom Data/CIFP";
+        let fix = "/Users/duanelicudi/X-Plane 12/Custom Data/earth_fix.dat";
+        let nav = "/Users/duanelicudi/X-Plane 12/Custom Data/earth_nav.dat";
+        for (label, lat, lon, trk, rwy) in [
+            ("now", 47.77, 11.79, 0.0, None),
+            ("20 nm S of EDDM", 48.02, 11.80, 0.0, None),
+            ("20 nm S forced 26R", 48.02, 11.80, 0.0, Some("26R".to_string())),
+            ("12 nm E of EDDM forced 26R", 48.36, 12.08, 270.0, Some("26R".to_string())),
+        ] {
+            let r = super::build_plan(
+                apt, cifp, fix, nav, lat, lon, trk, false, rwy,
+                crate::tools::autopilot::ApConfig::default(), 87.0, 120.0,
+            );
+            match r {
+                Err(e) => println!("{label}: REFUSED {e}"),
+                Ok((p, ack)) => {
+                    println!("{label}: {ack}");
+                    for l in &p.legs {
+                        println!("   {} {} {:?}", l.leg_type, l.fix_ident, l.alt1_ft);
+                    }
+                }
+            }
+        }
+    }
+}

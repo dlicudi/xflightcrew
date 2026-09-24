@@ -477,7 +477,16 @@ fn radio_interrupts(priority: Priority) -> bool {
 }
 
 /// Push onto the intercom queue from anywhere that holds the arbiter.
+/// Every line ever queued, either channel: the standby filler's evidence that
+/// SOMETHING answered the pilot's turn (`tempo::Turn`).
+static LINES_QUEUED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+pub fn lines_queued() -> u64 {
+    LINES_QUEUED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 fn push_intercom(inner: &Inner, mut utt: Utterance) {
+    LINES_QUEUED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let mut q = inner.queue.lock().unwrap_or_else(|e| e.into_inner());
     utt.seq = q.seq;
     q.seq += 1;
@@ -1344,6 +1353,7 @@ impl Voice {
         if utt.station.is_none() {
             return push_intercom(&self.inner, utt);
         }
+        LINES_QUEUED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let mut q = self.inner.radio_queue.lock().unwrap();
         utt.seq = q.seq;
         q.seq += 1;
@@ -1831,20 +1841,25 @@ impl Speaker {
     /// `on_start` returns whether to go ahead and play: a line stepped on
     /// during its own render has already been re-queued whole, and playing
     /// this copy too would be the double speech the step-on exists to stop.
+    ///
+    /// `tempo` is `(length, noise_w)` multipliers for this line alone
+    /// (`tempo::line_tempo`); the subprocess voices have no scales to move.
     fn speak(
         &mut self,
         text: &str,
+        tempo: (f32, f32),
         on_start: impl FnOnce(Arc<Vec<f32>>, u32) -> bool,
     ) -> anyhow::Result<()> {
         match self {
             Speaker::Subprocess(config) => {
-                let _ = on_start;
+                let _ = (on_start, tempo);
                 tts::speak(config, text)
             }
             #[cfg(feature = "onnx-tts")]
             Speaker::Onnx(engine) => {
                 let rate = engine.sample_rate();
-                let samples = Arc::new(engine.render_with(text, |_, _| {})?);
+                let samples =
+                    Arc::new(engine.render_at_tempo(text, tempo.0, tempo.1, |_, _| {})?);
                 if !on_start(samples.clone(), rate) {
                     return Ok(());
                 }
@@ -2093,8 +2108,15 @@ fn intercom_loop(inner: &Arc<Inner>, config: Config, gate: MicGate) {
             }
             None => {
                 register(None);
+                // The copilot says a warning quick and level and chat a
+                // little looser; the cabin keeps its own voice's pace.
+                let tempo = if utt.cabin {
+                    (1.0, 1.0)
+                } else {
+                    crate::tempo::line_tempo(utt.priority, crate::tempo::workload_high())
+                };
                 std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    who.speak(&utt.text, |samples, rate| {
+                    who.speak(&utt.text, tempo, |samples, rate| {
                         // Stepped on during the render: the interrupt has
                         // already queued this line again whole. Don't play
                         // this copy under the transmission as well.

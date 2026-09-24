@@ -41,6 +41,7 @@ mod livestate;
 mod mic;
 mod mode;
 mod monitor;
+mod persona;
 mod phrase;
 mod plan;
 mod plugin_status;
@@ -49,6 +50,7 @@ mod prefs;
 mod procedure;
 mod pushback;
 mod radiofx;
+mod rapport;
 mod readback;
 mod reversal;
 mod router;
@@ -59,6 +61,7 @@ mod stt_eval;
 mod takeoff_config;
 mod taxi_guide;
 mod taxi_in;
+mod tempo;
 mod terrain;
 mod tools;
 mod tts;
@@ -1637,6 +1640,20 @@ async fn run_session(
             continue;
         }
 
+        // The copilot's turn: the first reply waits a human beat, and a turn
+        // that goes quiet past `tempo::STANDBY_AFTER` hears "stand by"
+        // instead of silence. Dropped on every `continue` below.
+        let _turn = {
+            let voice = voice.clone();
+            tempo::Turn::begin(!from_text, move || {
+                if mode::copilot_enabled() {
+                    let line = persona::standby_line(persona::dialect());
+                    tracing::info!(spoke = %line, "standby filler");
+                    voice.alert(Priority::Readback, line);
+                }
+            })
+        };
+
         // Everything below is the COPILOT's business — intercom commands,
         // corrections, tools, questions. In ATC-only mode there is no crew,
         // but content routing must survive: with no radio key bound it is
@@ -1852,6 +1869,43 @@ async fn run_session(
                 }
                 continue;
             }
+        }
+        // A standing offer from the copilot ("Want the arrival brief?") owns
+        // the same closed yes/no words as a checklist proposal; anything else
+        // routes on. And the brief asked for by name.
+        let brief_asked = rapport::arrival_brief_request(&command);
+        let offer_answer = rapport::offer().and_then(|o| {
+            flow::proposal_reply(&command).map(|a| (o, a != flow::ProposalReply::Decline))
+        });
+        if brief_asked || offer_answer.is_some() {
+            rapport::clear_offer();
+            if matches!(offer_answer, Some((_, false))) && !brief_asked {
+                tracing::info!(path = "rapport-offer", "declined");
+                say(
+                    &voice,
+                    &reporter,
+                    ui::LogKind::Readback,
+                    readback::one_of(&["Okay.", "No problem. Just ask."]),
+                );
+                continue;
+            }
+            tracing::info!(path = "arrival-brief", "command path");
+            if !config.simbrief_id.trim().is_empty() {
+                let _ = ensure_plan(&config, &mut fp_cache, PlanFetch::Cached).await;
+            }
+            let (apt, cifp, fixes) = (
+                config.apt_data_path.clone(),
+                config.cifp_dir.clone(),
+                config.fix_data_path.clone(),
+            );
+            let line = tokio::task::spawn_blocking(move || {
+                rapport::arrival_brief(&apt, &cifp, &fixes, &tools::autoland::xplane_root())
+            })
+            .await
+            .unwrap_or_else(|_| "I couldn't put the arrival brief together.".to_string());
+            conversation.observe(&command, &line, Instant::now());
+            say(&voice, &reporter, ui::LogKind::Readback, &line);
+            continue;
         }
         // "Talk me through the descent checklist": the instructor flavour, by
         // name. It never writes; it says each item and watches you do it.
@@ -3600,6 +3654,9 @@ fn listen_once(
     if audio.is_empty() {
         return None; // idle timeout (continuous) or empty capture
     }
+    // The pilot has stopped talking: the reply's human beat is timed from
+    // here, so the transcription itself counts toward it.
+    tempo::note_capture_end();
     // The transmit key's state is known BEFORE decoding: only a keyed
     // transmission carries the (GPU-expensive) tower prompt.
     match stt.transcribe_gated(&audio, from_radio) {
@@ -3670,6 +3727,9 @@ fn next_input(
 static LAST_READBACK: std::sync::Mutex<Option<(String, Instant)>> = std::sync::Mutex::new(None);
 
 fn say(voice: &Voice, reporter: &Reporter, kind: ui::LogKind, line: &str) {
+    // The first reply of a turn waits a human beat after the pilot stopped
+    // talking (never when busy, never for typed input): `tempo`.
+    tempo::reaction_pause();
     tracing::info!(spoke = %line, "spoke");
     reporter.status(ui::Phase::Speaking);
     reporter.log(kind, line);
@@ -3884,7 +3944,11 @@ async fn try_route_content_atc(
     {
         return true;
     }
+    // While the station decides, the words may be a radio call: no copilot
+    // "stand by" over it. Handed back if the station declines them.
+    tempo::set_radio_turn(true);
     let Some((reply, who)) = st.try_handle(tl, xplane.view()).await else {
+        tempo::set_radio_turn(false);
         return false;
     };
     reporter.status(ui::Phase::Speaking);

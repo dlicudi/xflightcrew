@@ -14,6 +14,7 @@
 pub mod approach;
 pub mod autoland;
 pub mod autopilot;
+pub mod cabin_air;
 pub mod circuit;
 pub mod controls;
 pub mod cycle;

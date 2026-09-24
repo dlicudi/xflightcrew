@@ -409,6 +409,15 @@ pub fn on_a_stand(stand: Option<(f64, f64)>, psi: f64, known: bool) -> bool {
     }
 }
 
+/// Is the aircraft PARKED at a stand: within [`STAND_M`] of one, whichever
+/// way the nose points. The heading is the tug's question (which way to
+/// push), not the securing's: EDLP 7C was reached 2 m from its spot and 147
+/// degrees across it, and "stopped short of the stand" left the aircraft
+/// unsecured (2026-09-24). A field with no stand rows counts as parked.
+pub fn parked_at_stand(stand: Option<(f64, f64)>, known: bool) -> bool {
+    !known || stand.is_some_and(|(dist_m, _)| dist_m <= STAND_M)
+}
+
 /// Smallest signed angle a−b, degrees, in −180..180.
 fn angle_diff_deg(a: f64, b: f64) -> f64 {
     (a - b + 540.0).rem_euclid(360.0) - 180.0
@@ -1084,6 +1093,16 @@ fn r1(v: f64) -> f64 {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn parked_is_near_the_stand_whatever_the_heading() {
+        // EDLP 7C: 2 m from the spot, 147 degrees across it. Parked; no tug.
+        assert!(super::parked_at_stand(Some((2.0, 237.5)), true));
+        assert!(!super::on_a_stand(Some((2.0, 237.5)), 91.0, true));
+        assert!(!super::parked_at_stand(Some((140.0, 90.0)), true));
+        assert!(!super::parked_at_stand(None, true));
+        assert!(super::parked_at_stand(None, false));
+    }
+
     #[test]
     fn a_tug_is_only_for_a_stand() {
         use super::on_a_stand;

@@ -75,8 +75,8 @@ const TAXI_STEER: &str = "xcopilot/taxi_steer";
 /// override at frame rate, and it arbitrates these against the governor's
 /// stopping brake per wheel. The channels expire a second after writes stop,
 /// so a dead app frees the pedals by silence.
-const LEFT_BRAKE: &str = "xcopilot/taxi_brake_l";
-const RIGHT_BRAKE: &str = "xcopilot/taxi_brake_r";
+pub(crate) const LEFT_BRAKE: &str = "xcopilot/taxi_brake_l";
+pub(crate) const RIGHT_BRAKE: &str = "xcopilot/taxi_brake_r";
 /// The plugin's pilot-feet latch: 1 = the yaw axis moved, override dropped.
 const STEER_YIELD: &str = "xcopilot/steer_yield";
 /// The tug on the bar, blackboxed per tick as EVIDENCE only: the taxi that
@@ -365,6 +365,11 @@ pub fn runway_spans(seg: &[(String, bool)], cum: &[f64]) -> Vec<(f64, f64)> {
 }
 
 impl Route {
+    /// The route's whole length, metres.
+    pub fn total_m(&self) -> f64 {
+        self.total
+    }
+
     /// Digest a published route. `None` when it's too short to drive.
     pub fn build(watch: &TaxiWatch) -> Option<Route> {
         if watch.path.len() < 2 {
@@ -605,6 +610,60 @@ pub fn damped_err_deg(err_deg: f64, yaw_rate_dps: f64, required_dps: f64, lead_s
     // exceeds it — this can subtract damping, never add drive.
     let credit = required_dps.clamp(yaw_rate_dps.min(0.0), yaw_rate_dps.max(0.0));
     err_deg - (yaw_rate_dps - credit) * lead_s
+}
+
+/// The standing steer a straight leg needs, learned from the offset it
+/// leaves. The pursuit law is proportional, so any steady bias (a crosswind
+/// weathervaning the tail, a castoring nosewheel steered by one brake) is
+/// paid for with a steady ERROR: EDLP (2026-09-24) the SF50 held 0.08-0.09
+/// of steer and 3-4 degrees toward the line for minutes at a time and never
+/// closed 4 m of offset, every straight of the taxi. A slow integral on the
+/// signed cross-track, on straights only: frozen through corners, joins,
+/// big excursions, the stop and a crawl, and bled away through a bend (a
+/// new heading is a new crosswind).
+#[derive(Debug, Default, Clone, Copy)]
+pub struct StraightTrim {
+    trim: f64,
+}
+
+/// Steer per metre of offset per second. Slow on purpose: 4 m of offset
+/// builds a 0.09 trim in about fifteen seconds, longer than the SF50's
+/// fourteen-second weave, so the trim cannot join an oscillation.
+const TRIM_PER_M_S: f64 = 0.0015;
+/// The most standing steer the trim may hold.
+const TRIM_MAX: f64 = 0.15;
+/// Offsets beyond this are a corner or a join, not a bias.
+const TRIM_MAX_OFFSET_M: f64 = 8.0;
+/// The route's own turn rate above which a leg is a bend.
+const TRIM_BEND_DPS: f64 = 1.0;
+/// Time constant of the bleed through a bend.
+const TRIM_BLEED_S: f64 = 3.0;
+
+impl StraightTrim {
+    /// `lat_m` right of the route positive, as the blackbox logs it; the
+    /// result adds to the steer command (right positive).
+    pub fn step(
+        &mut self,
+        lat_m: f64,
+        route_turn_dps: f64,
+        gs_kts: f64,
+        joining: bool,
+        remaining_m: f64,
+        dt: f64,
+    ) -> f64 {
+        let dt = dt.clamp(0.0, 1.0);
+        if !lat_m.is_finite() || joining {
+            return self.trim;
+        }
+        if route_turn_dps.abs() > TRIM_BEND_DPS {
+            self.trim *= (-dt / TRIM_BLEED_S).exp();
+            return self.trim;
+        }
+        if gs_kts >= 4.0 && remaining_m > 30.0 && lat_m.abs() <= TRIM_MAX_OFFSET_M {
+            self.trim = (self.trim - TRIM_PER_M_S * lat_m * dt).clamp(-TRIM_MAX, TRIM_MAX);
+        }
+        self.trim
+    }
 }
 
 /// Steering authority vs groundspeed: a fully deflected nosewheel at a
@@ -1430,6 +1489,7 @@ async fn drive(xp: XPlaneClient, voice: Option<Voice>, route: Route, base_kts: f
     let mut yaw_rate = 0.0f64;
     // Last steering command, so the slew limiter has something to move FROM.
     let mut prev_steer = 0.0f64;
+    let mut straight_trim = StraightTrim::default();
     // Whether the brake-steer assist currently has a wheel braked, so every
     // exit path can release it exactly once — and the last commanded pair,
     // so the assist's own slew has something to move from.
@@ -1736,11 +1796,21 @@ async fn drive(xp: XPlaneClient, voice: Option<Voice>, route: Route, base_kts: f
         });
         prev_psi = Some((psi, now));
         yaw_rate = yaw_rate * 0.5 + raw_rate.clamp(-90.0, 90.0) * 0.5;
+        let trim = straight_trim.step(
+            offset,
+            route_turn_dps,
+            gs_kts,
+            join_allow.unwrap_or(0.0) > 0.0,
+            remaining,
+            dt,
+        );
         let want = stop_straighten(
-            steer_cmd_with(
+            (steer_cmd_with(
                 damped_err_deg(err, yaw_rate, route_turn_dps, route.pace.steer_lead_s),
                 route.pace.steer_full_deg,
-            ) * steer_authority(gs_kts),
+            ) + trim)
+                .clamp(-1.0, 1.0)
+                * steer_authority(gs_kts),
             remaining,
             gs_kts,
         );
@@ -1786,7 +1856,7 @@ async fn drive(xp: XPlaneClient, voice: Option<Voice>, route: Route, base_kts: f
                 // from a swing in the trace.
                 "event": "drive", "gs": gs_kts, "err": err, "yaw_dps": yaw_rate,
                 "turn_dps": route_turn_dps,
-                "steer": steer, "lat_m": offset, "remaining_m": remaining,
+                "steer": steer, "lat_m": offset, "remaining_m": remaining, "trim": trim,
                 "bs": bs_on, "bl": bl, "br": br, "tug": tug_on,
             }),
         );
@@ -3149,5 +3219,75 @@ mod tests {
             STOP_HEADING_HOLD_M > 0.0 && STOP_HEADING_HOLD_M < 20.0,
             "the hold zone is the last few metres, not the whole leg"
         );
+    }
+
+    /// EDLP (2026-09-24): with a standing steer bias the proportional law
+    /// parks off the line (the SF50 held 4 m on every straight). Flown with
+    /// the SF50's own pace through a lagged yaw plant that needs 0.09 of
+    /// steer to run straight: the trim takes the offset out, and it does not
+    /// start a weave.
+    #[test]
+    fn a_straight_trim_takes_out_the_offset_a_standing_bias_leaves() {
+        let pace = Pace::from_profile(
+            crate::aircraft::load("cirrus_vision_sf50")
+                .expect("sf50")
+                .taxi
+                .as_ref(),
+        );
+        // (final |offset| over the last 20 s, peak |offset| after 60 s)
+        let fly = |trimmed: bool| -> (f64, f64) {
+            let (bias, k_dps, tau, gs) = (0.09, 6.9, 0.8, 12.0);
+            let v = gs * 0.514_444;
+            let (mut y, mut psi, mut r, mut prev) = (0.0_f64, 0.0_f64, 0.0_f64, 0.0_f64);
+            let mut trim = StraightTrim::default();
+            let dt = 0.2;
+            let (mut late, mut after) = (0.0_f64, 0.0_f64);
+            let look = lookahead_m_with(gs, pace.lookahead_s);
+            for i in 0..900 {
+                let t = i as f64 * dt;
+                let err = (-y).atan2(look).to_degrees() - psi;
+                let tr = if trimmed { trim.step(y, 0.0, gs, false, 1000.0, dt) } else { 0.0 };
+                let want = (steer_cmd_with(
+                    damped_err_deg(err, r, 0.0, pace.steer_lead_s),
+                    pace.steer_full_deg,
+                ) + tr)
+                    .clamp(-1.0, 1.0);
+                let steer = slew_steer(prev, want, pace.steer_slew_per_s, dt);
+                prev = steer;
+                r += (k_dps * (steer - bias) - r) * (dt / tau).min(1.0);
+                psi += r * dt;
+                y += v * psi.to_radians().sin() * dt;
+                if t > 60.0 {
+                    after = after.max(y.abs());
+                }
+                if t > 160.0 {
+                    late = late.max(y.abs());
+                }
+            }
+            (late, after)
+        };
+        let (untrimmed, _) = fly(false);
+        assert!(untrimmed > 2.0, "the plant must reproduce the offset: {untrimmed:.1} m");
+        let (trimmed, peak) = fly(true);
+        assert!(trimmed < 0.5, "trimmed out: {trimmed:.2} m");
+        assert!(peak < untrimmed, "no weave bigger than the offset it replaced: {peak:.1} m");
+    }
+
+    #[test]
+    fn the_trim_holds_through_joins_and_bleeds_through_bends() {
+        let mut t = StraightTrim::default();
+        for _ in 0..100 {
+            t.step(-4.0, 0.0, 12.0, false, 500.0, 0.2);
+        }
+        let built = t.step(-4.0, 0.0, 12.0, false, 500.0, 0.2);
+        assert!(built > 0.1 && built <= TRIM_MAX, "{built}");
+        assert_eq!(t.step(-4.0, 0.0, 12.0, true, 500.0, 0.2), built, "a join is not a bias");
+        assert_eq!(t.step(-20.0, 0.0, 12.0, false, 500.0, 0.2), built, "an excursion is not a bias");
+        assert_eq!(t.step(-4.0, 0.0, 2.0, false, 500.0, 0.2), built, "a crawl is not a bias");
+        let mut bled = built;
+        for _ in 0..30 {
+            bled = t.step(-4.0, 3.0, 8.0, false, 500.0, 0.2);
+        }
+        assert!(bled < 0.2 * built, "a bend bleeds it: {bled}");
     }
 }

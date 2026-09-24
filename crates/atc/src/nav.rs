@@ -228,9 +228,23 @@ pub struct Runway {
     pub lon_b: f64,
     /// Pavement width from the 100-row, metres; 0.0 = unknown.
     pub width_m: f64,
+    /// The 100-row's surface code (1 asphalt, 2 concrete, 3 grass, 4 dirt,
+    /// 5 gravel, 20-38 / 50-57 the XP12 asphalt and concrete shades);
+    /// 0 = unknown, read as hard.
+    pub surface: u32,
 }
 
 impl Runway {
+    /// Asphalt or concrete (or unknown). Grass, dirt, gravel, lakebed, water
+    /// and snow are not.
+    pub fn is_hard(&self) -> bool {
+        matches!(self.surface, 0 | 1 | 2 | 15 | 20..=38 | 50..=57)
+    }
+
+    pub fn length_m(&self) -> f64 {
+        haversine_nm(self.lat_a, self.lon_a, self.lat_b, self.lon_b) * 1852.0
+    }
+
     /// Landing/takeoff heading for end A (the direction you fly when using it).
     pub fn heading_a_deg(&self) -> f64 {
         bearing_deg(self.lat_a, self.lon_a, self.lat_b, self.lon_b)
@@ -445,6 +459,7 @@ fn parse_runway_row<'a>(fields: impl Iterator<Item = &'a str>) -> Option<Runway>
             lat_b,
             lon_b,
             width_m: f[0].parse().unwrap_or(0.0),
+            surface: f[1].parse().unwrap_or(0),
         }),
         _ => None,
     }
@@ -638,6 +653,44 @@ const STAND_LEAD_IN_MAX_M: f64 = 120.0;
 /// is inside the tolerance of where the aircraft parks anyway.
 const STAND_LEAD_IN_MIN_M: f64 = 6.0;
 
+/// A stand is entered along its parking line from this far back.
+const STAND_ALIGN_M: f64 = 25.0;
+
+/// ...when the turn at that point is no more than this.
+const STAND_ALIGN_MAX_TURN_DEG: f64 = 90.0;
+
+/// ...unless the straight lead-in already arrives within this of the stand's
+/// heading.
+const STAND_ALIGN_OK_DEG: f64 = 30.0;
+
+/// The lead-in's points from the route's last node `end` to the stand: the
+/// straight line when it already arrives on the stand's heading, else via a
+/// point [`STAND_ALIGN_M`] back along the parking line.
+fn stand_lead_in(end: (f64, f64), stand: &Stand, m_per_deg_lon: f64) -> Vec<(f64, f64)> {
+    let spot = (stand.lat, stand.lon);
+    if !stand.heading.is_finite() || m_per_deg_lon <= 0.0 {
+        return vec![end, spot];
+    }
+    let straight = bearing_deg(end.0, end.1, spot.0, spot.1);
+    if angle_diff_deg(straight, stand.heading).abs() <= STAND_ALIGN_OK_DEG {
+        return vec![end, spot];
+    }
+    let h = stand.heading.to_radians();
+    let back = (
+        spot.0 - STAND_ALIGN_M * h.cos() / 111_320.0,
+        spot.1 - STAND_ALIGN_M * h.sin() / m_per_deg_lon,
+    );
+    // Only a turn the aircraft can make: the leg to the back point must not
+    // double back on the stand line. LOWI (2026-09-24) put the back point
+    // BEHIND the route's end, the drive needed a 140-170 degree reversal at
+    // walking pace, circled, and stopped "off the cleared route" 25 m out.
+    let to_back = bearing_deg(end.0, end.1, back.0, back.1);
+    if angle_diff_deg(to_back, stand.heading).abs() > STAND_ALIGN_MAX_TURN_DEG {
+        return vec![end, spot];
+    }
+    vec![end, back, spot]
+}
+
 /// The default hold-short standoff: how far back from the runway-junction
 /// node a planned route ends. Clears the painted line at GA fields
 /// (30-50 m from the centreline); callers pass more for instrument
@@ -677,9 +730,12 @@ const VACATE_ON_RUNWAY_M: f64 = 60.0;
 /// A right-angle turn-off is standard and a rapid exit is 30 to 45 degrees;
 /// past this the link is one built for the OTHER end of the strip and taking
 /// it means reversing on the runway (EGLL's N4W, 169 degrees off a 27L
-/// rollout, 2026-09-17). Deliberately the same generosity as
-/// [`AHEAD_OF_ABEAM_DEG`]: abeam is a turn, backwards is not.
-const VACATE_TURN_MAX_DEG: f64 = 100.0;
+/// rollout, 2026-09-17). But a turn-off a little past abeam is an ordinary
+/// turn at taxi pace: EDLP's B leaves 24 at 108 degrees, 406 m ahead of an
+/// SF50 rolling at 9 kt, and at 100 it was refused for C, 970 m further
+/// down; the vacate drove 1,217 m at turn pace, ran out of time on the
+/// runway, and the taxi-in began with a backtrack (2026-09-24).
+const VACATE_TURN_MAX_DEG: f64 = 120.0;
 
 /// The exit snap's distance bound — the same 3 km every other snap in this
 /// file caps at (`snap_within`, `runway_entrance_near`). Without it a stale
@@ -1166,11 +1222,16 @@ impl TaxiNet {
         // is followed where there is one. The leg carries no NAME: an apron
         // lead-in is not a taxiway, and the guide would otherwise invent a
         // turn "onto" something the pilot cannot see on the chart.
-        let (lead, lead_seg) = ride_paint(
-            &self.paint,
-            &[end, (stand.lat, stand.lon)],
-            &[(String::new(), false)],
-        );
+        //
+        // And the lead-in ARRIVES on the stand's own heading: the stand is
+        // entered along its parking line through a point [`STAND_ALIGN_M`]
+        // back from it. Straight from the last taxiway node, EDLP 7C was
+        // reached 2 m from its spot and 147 degrees across it, so the
+        // securing check (nose within 60 degrees) said "stopped short of the
+        // stand" (2026-09-24).
+        let pts = stand_lead_in(end, stand, m_per_deg_lon);
+        let segs = vec![(String::new(), false); pts.len() - 1];
+        let (lead, lead_seg) = ride_paint(&self.paint, &pts, &segs);
         plan.path.extend(lead.into_iter().skip(1));
         plan.seg.extend(lead_seg);
         Some(plan)
@@ -2029,7 +2090,7 @@ pub fn best_runway_for_wind(
     wind_kts: f64,
 ) -> Option<(String, f64, f64)> {
     let mut best: Option<(String, f64, f64)> = None;
-    for r in runways {
+    for r in assignable_runways(runways) {
         for (ident, hdg) in [
             (&r.ident_a, r.heading_a_deg()),
             (&r.ident_b, r.heading_b_deg()),
@@ -2042,6 +2103,26 @@ pub fn best_runway_for_wind(
         }
     }
     best
+}
+
+/// The runways a wind pick may choose from: the field's MAIN runways. A hard
+/// runway where the field has one, and never under half the longest of its
+/// kind. ETND at 260/6 (2026-09-24): 26R, 446 m of grass beside the 1,240 m
+/// asphalt 26, faced the wind a hair better, the tower cleared an SF50 onto
+/// it, and the line-up found no runway 26R near the paved hold it had taxied
+/// to. A grass strip is a runway a pilot ASKS for, not one a tower hands out.
+pub fn assignable_runways(runways: &[Runway]) -> impl Iterator<Item = &Runway> {
+    let any_hard = runways.iter().any(Runway::is_hard);
+    let kind = move |r: &&Runway| !any_hard || r.is_hard();
+    let longest = runways
+        .iter()
+        .filter(kind)
+        .map(Runway::length_m)
+        .fold(0.0, f64::max);
+    runways
+        .iter()
+        .filter(kind)
+        .filter(move |r| r.length_m() >= 0.5 * longest)
 }
 
 /// The headwind component on one named runway END, for comparing a candidate
@@ -2360,10 +2441,45 @@ pub fn best_approach(cifp_dir: &str, icao: &str, runway: &str) -> Option<String>
         Some('D') | Some('S') | Some('V') => 3,
         _ => 4,
     };
+    let path = std::path::Path::new(cifp_dir).join(format!("{icao}.dat"));
+    let text = std::fs::read_to_string(path).ok()?;
     list_procedures(cifp_dir, icao, ProcKind::Appch)
         .into_iter()
         .filter(|id| approach_runway(id).is_some_and(|r| runway_matches(&r, runway)))
+        // Only an approach that ENDS on this runway and can be flown on
+        // straight legs (`straight_in_legs`): LOWI's RNAV 08 V and 26 E are
+        // circling procedures with no runway fix, and 08 Z turns onto the
+        // runway on RF arcs. Picked by rank alone the circling one won, and
+        // its missed approach was flown as the approach (2026-09-24).
+        .filter(|id| {
+            straight_in_legs(parse_proc_legs(text.lines(), ProcKind::Appch, id, None), runway)
+                .is_some()
+        })
         .min_by_key(|id| rank(id))
+}
+
+/// An approach's legs as far as the runway threshold, when it is a straight-in
+/// the follower can fly: a runway fix for THIS runway (exact designator, so a
+/// grass "26R" never inherits a "26" approach), and no RF (constant-radius
+/// arc) leg before it, which the follower would chord across. The missed
+/// approach after the threshold is dropped: it is never the approach.
+/// `None` for a circling procedure or an arc.
+pub fn straight_in_legs(legs: Vec<ProcLeg>, runway: &str) -> Option<Vec<ProcLeg>> {
+    let at = legs.iter().position(|l| {
+        l.fix_ident
+            .strip_prefix("RW")
+            .is_some_and(|r| r.eq_ignore_ascii_case(runway) || (runway_number(r) == runway_number(runway) && side_letter(r) == side_letter(runway)))
+    })?;
+    if legs[..at].iter().any(|l| l.leg_type == "RF") {
+        return None;
+    }
+    let mut legs = legs;
+    legs.truncate(at + 1);
+    Some(legs)
+}
+
+fn side_letter(rwy: &str) -> Option<char> {
+    rwy.chars().rev().find(|c| matches!(c, 'L' | 'R' | 'C'))
 }
 
 /// A SID that departs `runway` at `icao` — the first ident with a leg whose
@@ -2783,6 +2899,94 @@ mod tests {
         let none = find_runways(path.to_str().unwrap(), "LEMD").unwrap();
         assert!(none.is_empty());
         assert!(best_runway_for_wind(&none, 157.0, 6.0).is_none());
+    }
+
+    #[test]
+    fn a_stand_is_entered_along_its_parking_line() {
+        let stand = Stand {
+            lat: 51.610610,
+            lon: 8.617635,
+            heading: 237.5,
+            name: "7C".into(),
+            kind: "tie_down".into(),
+            accepts: vec![],
+        };
+        let mpl = 111_320.0 * stand.lat.to_radians().cos();
+        let h = 237.5_f64.to_radians();
+        // A point `along` metres back up the parking line and `side` metres
+        // to its right.
+        let at = |along: f64, side: f64| {
+            let (n, e) = (-along * h.cos() - side * h.sin(), -along * h.sin() + side * h.cos());
+            (stand.lat + n / 111_320.0, stand.lon + e / mpl)
+        };
+        // Arriving from behind the line and off to one side: entered along
+        // it through the back point, arriving on 237.5.
+        let pts = stand_lead_in(at(70.0, 60.0), &stand, mpl);
+        assert_eq!(pts.len(), 3, "via the parking line");
+        let last = bearing_deg(pts[1].0, pts[1].1, pts[2].0, pts[2].1);
+        assert!(angle_diff_deg(last, 237.5).abs() < 1.0, "arrives on 237.5: {last:.1}");
+        let back = haversine_nm(pts[1].0, pts[1].1, pts[2].0, pts[2].1) * 1852.0;
+        assert!((back - STAND_ALIGN_M).abs() < 0.5, "{back:.1} m back");
+        // EDLP 7C (2026-09-24): the route ends WEST of the stand, so the back
+        // point needs a 158 degree reversal; LOWI circled on exactly that.
+        // Straight in instead.
+        assert_eq!(stand_lead_in((51.610600, 8.616800), &stand, mpl).len(), 2);
+        // Already on the line: straight.
+        assert_eq!(stand_lead_in(at(60.0, 0.0), &stand, mpl).len(), 2);
+    }
+
+    /// LOWI (2026-09-24): a circling procedure (no runway fix), an RF arc
+    /// before the threshold, and a straight-in whose missed approach must
+    /// not be flown as the approach.
+    #[test]
+    fn only_a_straight_in_to_this_runway_is_an_approach() {
+        let leg = |t: &str, f: &str| ProcLeg {
+            seq: 0,
+            transition: String::new(),
+            leg_type: t.into(),
+            fix_ident: f.into(),
+            fix_region: String::new(),
+            fix: None,
+            course_mag: None,
+            dist_nm: None,
+            turn: None,
+            alt_desc: ' ',
+            alt1_ft: None,
+            alt2_ft: None,
+            is_faf: false,
+        };
+        let circling = vec![leg("IF", "WI813"), leg("TF", "WI814"), leg("TF", "WI006"), leg("TF", "RTT")];
+        assert!(straight_in_legs(circling, "08").is_none());
+        let arc = vec![leg("IF", "WI749"), leg("RF", "WI752"), leg("TF", "RW08"), leg("TF", "RTT")];
+        assert!(straight_in_legs(arc, "08").is_none());
+        let z = vec![leg("IF", "WI002"), leg("TF", "WI103"), leg("TF", "RW26"), leg("TF", "WI005"), leg("HM", "RTT")];
+        let got = straight_in_legs(z.clone(), "26").expect("straight-in");
+        assert_eq!(got.last().unwrap().fix_ident, "RW26", "missed approach dropped");
+        assert_eq!(got.len(), 3);
+        // A "26" approach is not the grass 26R's.
+        assert!(straight_in_legs(z, "26R").is_none());
+    }
+
+    #[test]
+    fn the_wind_pick_hands_out_the_main_runway_not_the_grass_strip() {
+        // ETND's own two rows (2026-09-24): 08L/26R grass, 446 m; 08/26
+        // asphalt, 1,240 m. At 260/6 the grass strip faces the wind better.
+        let grass = parse_runway_row(
+            "50.00 3 0 0.00 0 0 0 08L 52.5862935 8.3393953 0 0 1 0 0 0 26R 52.5866670 8.3459906 0 0 1 0 0 0"
+                .split_whitespace(),
+        )
+        .unwrap();
+        let paved = parse_runway_row(
+            "45.11 1 0 0.25 0 2 0 08 52.5850000 8.3318780 12 0 1 0 0 0 26 52.5859870 8.3501930 0 0 1 3 0 0"
+                .split_whitespace(),
+        )
+        .unwrap();
+        assert!(!grass.is_hard() && paved.is_hard());
+        let rw = vec![grass.clone(), paved];
+        assert_eq!(best_runway_for_wind(&rw, 260.0, 6.0).unwrap().0, "26");
+        assert_eq!(best_runway_for_wind(&rw, 80.0, 6.0).unwrap().0, "08");
+        // A grass field still gets its grass runway.
+        assert_eq!(best_runway_for_wind(&[grass], 260.0, 6.0).unwrap().0, "26R");
     }
 
     #[test]
@@ -4434,6 +4638,47 @@ SID:030,5,BLN4L,RW30,BLN,LE,D, ,VE  , ,   ,TF, , , , , ,      ,    ,    ,    ,  
                 .is_none(),
             "no exit is better than a reversal"
         );
+    }
+
+    /// EDLP 24 (2026-09-24): B leaves the runway 108 degrees off the SF50's
+    /// rollout, 400 m ahead; C is 74 degrees off, 970 m ahead. At a 100
+    /// degree limit B was refused and the vacate drove 1,217 m at turn pace.
+    #[test]
+    fn a_vacate_takes_a_turn_off_a_little_past_abeam() {
+        let mut net = TaxiNet::default();
+        let m = |east_m: f64| -1.0 + east_m / (111_320.0 * 51.0_f64.to_radians().cos());
+        let north = |n_m: f64| 51.0 + n_m / 111_320.0;
+        net.nodes.insert(1, (51.0, m(0.0)));
+        net.nodes.insert(2, (51.0, m(-400.0)));
+        net.nodes.insert(3, (51.0, m(-970.0)));
+        // B: from node 2, 108 degrees off a westbound (270) rollout, i.e. on
+        // 162: south and a little east.
+        let b = 162.0_f64.to_radians();
+        net.nodes.insert(12, (north(80.0 * b.cos()), m(-400.0 + 80.0 * b.sin())));
+        net.nodes.insert(22, (north(160.0 * b.cos()), m(-400.0 + 160.0 * b.sin())));
+        // C: from node 3, 74 degrees off, on 196.
+        let c = 196.0_f64.to_radians();
+        net.nodes.insert(13, (north(80.0 * c.cos()), m(-970.0 + 80.0 * c.sin())));
+        net.nodes.insert(23, (north(160.0 * c.cos()), m(-970.0 + 160.0 * c.sin())));
+        let e = |a, b, name: &str, runway, zone: &[&str]| TaxiEdge {
+            a,
+            b,
+            name: name.into(),
+            runway,
+            oneway: false,
+            zone_of: zone.iter().map(|s| s.to_string()).collect(),
+        };
+        net.edges.push(e(1, 2, "06/24", true, &["06", "24"]));
+        net.edges.push(e(2, 3, "06/24", true, &["06", "24"]));
+        net.edges.push(e(2, 12, "B", false, &["06", "24"]));
+        net.edges.push(e(12, 22, "B", false, &[]));
+        net.edges.push(e(3, 13, "C", false, &["06", "24"]));
+        net.edges.push(e(13, 23, "C", false, &[]));
+        let zone = ["24".to_string(), "06".to_string()];
+        let plan = net
+            .plan_vacate(51.0, m(0.0), 270.0, &zone, VACATE_CLEAR_M)
+            .expect("an exit");
+        assert_eq!(plan.exit_name, "B", "{:?}", plan.seg);
     }
 
     /// The two ways the data can be thin. Neither is a reason to sit on a

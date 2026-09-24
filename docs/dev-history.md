@@ -5770,3 +5770,159 @@ speed. Whisper's "hover" arrives as "how about", "over at", "prove at",
 "hova"; "execute the flight plan" read the plan's brief instead of flying
 it. Restarting the app mid hover taxi forced a manual landing: restarts wait
 for the ground.
+
+## 2026-09-23: the copilot as a person, and the SF50's turns and gear
+
+Asked "how do we make the copilot more human", the answer was not the words
+(`vary_ack` already varied them) but timing, memory and judgement: a reply
+that starts a beat after the pilot stops talking, "stand by" instead of three
+silent seconds, a warning said quicker and flatter, a word about the landing
+from the instructor's own sink scorer, offers of the next flap and the gear
+as the speed allows, the arrival brief thirty miles out, small talk from a
+closed set in the voice's own idiom, and anything that can wait held until
+the flight deck is quiet (`tempo`, `persona`, `rapport`). The monitor's
+spoken "Landing summary: last airborne sample about N feet per minute down;
+exact touchdown rate unavailable" was the clearest machine tell left; it is
+blackboxed now and the rapport says the landing instead.
+
+The same evening the SF50 at ETND showed two older faults. Its gear came up
+at 200 ft and 122 kt with the takeoff flap at 0.5, inside the `.acf`'s own
+gear-warning envelope (below 125 kt, flaps past 0.5), and the horn ran to
+335 ft on every departure: the gear now waits for its warning to be silent.
+And its circuit went round the long way on 13 of 30 turns: the rectangle
+circuit slewed the bug 90 degrees off the nose from wings level without the
+`bug_toward` door, the autopilot turned 270 right for a 90 left at crosswind,
+downwind and base, the base ended 1.9 km short of plan, the final was handed
+to autoland 170 m off at 357 ft, and it balked `off_centreline_low` at
+0.1 nm. The bug now leads the nose by 25 degrees until the bank is
+established the right way.
+
+The second approach flew the reposition well and crossed the numbers on the
+centreline, then the landing came apart: the arrest pulled the sink to -50
+fpm at 41 ft (target -250), the roundout pushed, the flare at idle ballooned
+to +158 fpm at 32 ft, and the overflight gate, allowing only 344 m of float on
+a 1,244 m runway because of the Baron's 900 m floor, went around with 900 m
+ahead. The go-around could not climb (80 kt against an 87 kt approach speed,
+idle engines) and the aircraft met the runway at about -740 fpm, then rolled
+out. A low flare with room to stop on the airframe's own landing distance is
+now committed; the flare law's balloon is still owed.
+
+The next landing crashed, at EDLP 24 (2026-09-24). Arrest at 49 ft, the
+roundout pushed to -0.10 and the sink rebuilt; the flare took 0.3 of elevator
+at 24 ft and the ratchet held it while the sink vanished at +400 fpm a second,
+releasing only once the aircraft was climbing; it ballooned to 52 ft at +850
+fpm, above the 50 ft band, and balked `balloon`. The go-around went from idle
+at 81 kt and slowing; the vertical law, which climbs only with speed over the
+approach figure, gave it 0 fpm, and the SF50 stalled onto the runway at
+-1,568 fpm. Low balloons with room to stop are now landed (100 ft), on
+approach power, and the ratchet lets go half a second ahead of a balloon.
+
+## 2026-09-24: the tower cleared an SF50 onto the grass
+
+ETND at 260/6: the field has 08/26, 1,240 m of asphalt, and 08L/26R, 446 m
+of grass beside it. The tower's wind pick weighed only headwind, the grass
+strip faced the wind a hair better, and the SF50 was taxied to holding point
+Alpha "runway two six right", and
+the line-up found no 26R near the hold it reached ("08L is 152 metres away") and full
+auto gave up. `nav::best_runway_for_wind` now picks only from the field's
+main runways (`assignable_runways`: hard surface where the field has one,
+never under half the longest of that kind); a grass field keeps its grass.
+Still owed: the crew's line-up refusal named the reciprocal end, not the
+cleared one, and the crew never judged the cleared runway's LENGTH against
+the airframe before taxiing (a 446 m clearance should be refused and a
+longer runway requested at the taxi call).
+
+## 2026-09-24: ETND-EDLP in the SF50, the flare, the vacate and the stand
+
+The first full flight after the runway fix went ETND 26 to EDLP 24 with no
+go-around: the balloon commit held (the flare climbed to 24 ft at +190 and
+landed instead of balking). But the arrival was -421 fpm "firm" and the
+elevator porpoised between its limits: 0.18 at 49 ft took -572 fpm to +36
+in two seconds against a -250 target and the damping then pushed; 0.35 at 22
+ft ballooned it; the release dropped it to neutral in one tick (neutral is
+the trimmed approach attitude) and the sink was -590 at the wheels while the
+last full pull did nothing at 70 kt against a 67 kt Vso. The SF50's engine is
+high on the tail, so the lever is a pitch input: cut to idle at 22 ft, back
+to approach thrust in the balloon, cut again. A plant fitted to the tick log
+did not reproduce it (RMS 170-195 fpm; thrust pitch and spool lag are not in
+it), so the numbers were chosen from the trace, not tuned against a model:
+the flare's elevator law is now per airframe (`flare_elevator:`,
+`autoland::FlareGains`), the SF50 at half gain, three times the integrator,
+0.30 cap, a balloon easing the pull at 0.15/s instead of letting go; and a
+progressive `flare_power` instead of the step to idle.
+
+Taxi in: the vacate refused B (108 degrees off the rollout, 400 m ahead) at
+the 100 degree limit set against EGLL's 169 degree N4W, took C 970 m further
+down, drove 1,217 m at turn pace, and timed out on the runway at the flat
+120 s with 714 m to go; the stand route then started from the runway with a
+backtrack the tower phrased as "cross runway zero six". The limit is 120
+degrees and the budget scales with the route (`vacate_budget_secs`). The
+drive reached 7C 2 m from its spot but 147 degrees across it (the lead-in ran
+straight from the last taxiway node), so securing said "stopped short of the
+stand"; the lead-in now enters along the stand's parking line through a
+point 25 m back (`stand_lead_in`). And a mission (full auto, the helicopter
+route) now ends shut down: at the stand the registry's own shutdown for the
+airframe's class runs, every engine is confirmed stopped from `ENGN_running`,
+then every electrical system goes off (`taxi_in::shut_down_at_stand`); a
+spoken "taxi to parking" still leaves the shutdown to the pilot.
+Still owed: a stand route planned from ON a runway snaps to the nearest node
+regardless of heading (the backtrack), and a backtrack along the strip we
+occupy is phrased as a crossing.
+
+## 2026-09-24: EDLP-LOWI, a hypoxic climb in the SF50
+
+The takeoff roll drifted off the centreline and the pilot took over; "resume
+flight plan" was then refused because the plan's FL290 was over the profile's
+28,000 ft ceiling (the Vision Jet's is FL310; the arm had never checked it,
+the resume did). After a restart the resume climbed on, and at FL253 the
+screen went black: the cabin was at 24,000 ft. Full auto had started with the
+engine already running from the previous flight, so the bleed, which only
+ever came on as part of an engine start, was never switched; two "cabin
+altitude" callouts went by unanswered; the oxygen button read on and the
+stock valve behind it was shut. And the follower's climb protection
+(`climb_vs_fpm`, 60 fpm a knot off its cap, never under 150) still asked
+about 1,000 fpm at 104 kt and FL260 against a 120 kt Vy. Rescued live over
+the Web API (bleed on, valve opened, felt altitude 24,400 to 15,000 ft; a
+typed "descend to one eight thousand"). Now: `cabin_air:` in the profile and
+[src/tools/cabin_air.rs](../src/tools/cabin_air.rs) switch bleed and oxygen on
+for every mission and at the cabin callout, the warning band hands a flying
+follower 10,000 ft, and the follower's climb also fades to nothing at the
+airframe's speed floor (`circuit::climb_limit_fpm`, the circuit's own rule).
+Still owed: the takeoff roll's centreline on the SF50, and the arm checking
+the plan's cruise against the ceiling.
+
+## 2026-09-24: the EDLP-LOWI debrief, fixed
+
+- **The arrival picked approaches with no runway.** LOWI's RNAV 08 V and 26 E
+  are circling procedures (no runway fix), 08 Z turns onto the runway on RF
+  arcs, and the loaded legs carried the missed approach, so full auto would
+  have flown the missed approach into the valley as its approach; the
+  alignment pick chose the grass "26R", which a "26" approach matched.
+  `nav::straight_in_legs` now requires a runway fix for the exact runway and
+  no RF leg before it, and cuts the legs at the threshold; `best_approach`
+  only offers such approaches; the arrival picks hard runways and, when the
+  wind's end has nothing flyable, another end with one inside 10 kt of
+  tailwind (`approach_fallback_ends`) before a visual landing. LOWI now plans
+  RNAV 26 Z at every wind: WI002 9,500, WI103, RW26.
+- **The tower's runway is flown when we can** (`tower_arrival_runway`): the
+  inbound reply's "join final runway two six" came two seconds after the crew
+  armed 08; now the arrival is rebuilt on the tower's end if it has a
+  flyable approach, and otherwise the crew says it is staying with its own.
+- **The SF50's takeoff roll had no steering**: castoring nosewheel, no air
+  over the rudder, the heading error grew 8 to 27 degrees at full deflection
+  until the pilot took the pedals at 21 kt. The roll now brake-steers like the
+  taxi on a `brake_steer` airframe, fading out 20 to 40 kt
+  (`autotakeoff::roll_brake_split`); and the transponder goes to ALT as the
+  roll starts, not at liftoff (a handed-back roll left it on standby).
+- **The speed hold sat at idle, silent**, 234 kt against 180 descending into
+  the valley; it had already closed the lever the pilot then pulled.
+  `IdleStillFast` says once, after 15 s, how fast and to shallow the descent.
+- **The altimeter flipped QNH/standard/QNH at FL180**: a resume never
+  published the flight's transition (Germany's 5,000 ran as the profile's US
+  18,000), and the knob change itself moves the indicated altitude ~260 ft
+  across the line. The resume publishes it now, and within 500 ft of the
+  transition either setting stands.
+- **A cruise above the ceiling is refused at the arm** (`preflight`).
+- **Stands**: the lead-in's back point is only taken when the turn onto the
+  stand line is 90 degrees or less (LOWI circled on a reversal), and parked
+  for securing is within 35 m whatever the heading.

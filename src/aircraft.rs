@@ -39,6 +39,72 @@ pub struct ArrestLeadProfile {
     pub trend_seconds: f64,
 }
 
+/// The cabin's air: how THIS airframe's bleed (pressurisation) and crew
+/// oxygen are switched and read. Declared, never guessed: the SF50's bleed is
+/// an xlua slider behind `laminar/SF50/fresh_air_on` (the stock pack dataref
+/// is its output), and its oxygen button is a toggle command in front of a
+/// stock valve that can sit shut behind a set button. EDLP-LOWI
+/// (2026-09-24): full auto resumed with the engine already running, the bleed
+/// was never switched, the cabin followed the aircraft to 24,000 ft and the
+/// pilot blacked out; the oxygen button read on and the valve was shut.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CabinAirProfile {
+    /// Fired to put the bleed ON.
+    pub bleed_on_command: String,
+    /// Reads at or above 0.5 with the bleed on.
+    pub bleed_read: String,
+    /// The crew oxygen: a TOGGLE (read first, fired only when off).
+    #[serde(default)]
+    pub oxygen_toggle: Option<String>,
+    /// Reads at or above 1 with the oxygen on.
+    #[serde(default)]
+    pub oxygen_read: Option<String>,
+    /// A valve behind the button, written 1.
+    #[serde(default)]
+    pub oxygen_valve: Option<String>,
+}
+
+/// The flare's ELEVATOR law for this airframe (`autoland::FlareGains`): the
+/// default was fitted to the 172 and the 737. The SF50 answers the column
+/// about twice as hard and needs a standing pull at a flare's speed: on the
+/// default 0.18 took -572 fpm to +36 in two seconds, 0.35 ballooned it, and
+/// the release to neutral sank it at -590 onto the runway (EDLP 24,
+/// 2026-09-24).
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct FlareElevatorProfile {
+    /// Scale on the law's P and D terms.
+    pub gain: f64,
+    /// Scale on its integrator (the standing pull it finds).
+    #[serde(default = "one")]
+    pub trim_gain: f64,
+    /// Most pull the flare may command.
+    pub max: f64,
+    /// Most push, as a positive number.
+    #[serde(default = "default_max_push")]
+    pub max_push: f64,
+    /// A balloon eases the held pull at most this fast, elevator per second.
+    #[serde(default)]
+    pub balloon_ease_per_s: Option<f64>,
+}
+
+fn default_max_push() -> f64 {
+    0.10
+}
+
+impl FlareElevatorProfile {
+    /// Used only when every number is a sane one.
+    pub fn valid(self) -> Option<Self> {
+        ((0.1..=3.0).contains(&self.gain)
+            && (0.0..=10.0).contains(&self.trim_gain)
+            && (0.05..=0.6).contains(&self.max)
+            && (0.0..=0.3).contains(&self.max_push)
+            && self
+                .balloon_ease_per_s
+                .is_none_or(|r| r.is_finite() && r > 0.0))
+        .then_some(self)
+    }
+}
+
 impl Default for ArrestLeadProfile {
     fn default() -> Self {
         Self {
@@ -85,6 +151,13 @@ pub struct AircraftProfile {
     /// tool refuses cycling the gear above it. `None` = no gear speed gate.
     #[serde(default)]
     pub vlo_kts: Option<f64>,
+    /// The airframe's own landing-gear warning envelope (the horn and the
+    /// warning annunciator), from its `.acf` at detection when the profile
+    /// is silent. The takeoff raises the gear only once doing so will not
+    /// sound it: the SF50's fires below 125 kt with the takeoff flap set,
+    /// and the gear came up at 200 ft and 122 kt (ETND, 2026-09-23).
+    #[serde(default)]
+    pub gear_warning: Option<GearWarning>,
     /// Nominal DC bus voltage (12 or 24). The engine-start "battery's low"
     /// gate scales with it: a healthy 12 volt RV-10 read "only 12 volts"
     /// against the 172's 24 volt threshold (2026-09-11). `None` = 24.
@@ -102,6 +175,12 @@ pub struct AircraftProfile {
     /// 172's fitted numbers (see [`ArrestLeadProfile`]).
     #[serde(default)]
     pub arrest_lead: Option<ArrestLeadProfile>,
+    /// The flare's elevator law, when the default does not fit.
+    #[serde(default)]
+    pub flare_elevator: Option<FlareElevatorProfile>,
+    /// Bleed air and crew oxygen, where the airframe has them.
+    #[serde(default)]
+    pub cabin_air: Option<CabinAirProfile>,
     /// None = unknown; do not invent a pressurisation system in warnings.
     #[serde(default)]
     pub pressurised: Option<bool>,
@@ -1672,6 +1751,68 @@ pub fn publish_throttle_dataref(dref: Option<String>) {
     *THROTTLE_DREF.lock().unwrap_or_else(|e| e.into_inner()) = dref;
 }
 
+/// X-Plane's landing-gear warning, as Plane Maker models it: with the gear
+/// not down and the speed below `below_kias`, the horn sounds when the
+/// throttle is under `below_throttle_pct` or the flaps are past
+/// `above_flap_ratio`. The `.acf` keys are `acf/_gear_warn_below_kias`,
+/// `acf/_gear_warn_below_thro_pct`, `acf/_gear_warn_above_flap_rat`.
+#[derive(Debug, Clone, Copy, PartialEq, Deserialize, Serialize)]
+pub struct GearWarning {
+    pub below_kias: f64,
+    #[serde(default)]
+    pub below_throttle_pct: Option<f64>,
+    #[serde(default)]
+    pub above_flap_ratio: Option<f64>,
+}
+
+impl GearWarning {
+    /// Would the warning sound with the gear up in this state? A flap AT
+    /// the threshold counts (a handle written to 0.5 reads back a whisker
+    /// either side of it). Pure.
+    pub fn would_sound(&self, ias_kts: f64, flap_ratio: f64, throttle_ratio: f64) -> bool {
+        if ias_kts >= self.below_kias {
+            return false;
+        }
+        let flaps = self
+            .above_flap_ratio
+            .is_some_and(|f| flap_ratio >= f - 0.005);
+        let power = self
+            .below_throttle_pct
+            .is_some_and(|t| throttle_ratio * 100.0 < t);
+        flaps || power
+    }
+}
+
+/// The gear-warning envelope from an `.acf`'s text, or `None` when it
+/// declares no warning speed. Pure.
+pub fn gear_warning_from_acf(acf_text: &str) -> Option<GearWarning> {
+    let mut kias = None;
+    let mut thro = None;
+    let mut flap = None;
+    for l in acf_text.lines() {
+        let mut it = l.split_whitespace();
+        if it.next() != Some("P") {
+            continue;
+        }
+        let (Some(k), Some(v)) = (it.next(), it.next()) else {
+            continue;
+        };
+        let v = v.parse::<f64>().ok();
+        match k {
+            "acf/_gear_warn_below_kias" => kias = v,
+            "acf/_gear_warn_below_thro_pct" => thro = v,
+            "acf/_gear_warn_above_flap_rat" => flap = v,
+            _ => {}
+        }
+    }
+    let below_kias = kias.filter(|k| *k > 0.0)?;
+    Some(GearWarning {
+        below_kias,
+        below_throttle_pct: thro.filter(|t| *t > 0.0),
+        above_flap_ratio: flap.filter(|f| *f > 0.0 && *f <= 1.0),
+    })
+}
+
 /// The configuration placards autoland extends the gear and flaps against:
 /// VLO/VLE, and each flap detent's `(ratio, Vfe)`. Republished on every
 /// profile swap like the thrust lever, so a fast handoff on the next airframe
@@ -1968,6 +2109,36 @@ pub fn arrest_lead() -> ArrestLeadProfile {
     *ARREST_LEAD.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// The live airframe's whole profile, for the few consumers that need the
+/// tool surface itself away from the command loop (the stand shutdown builds
+/// the registry from it). Republished on EVERY swap by `publish_airframe`.
+static LIVE_PROFILE: std::sync::Mutex<Option<std::sync::Arc<AircraftProfile>>> =
+    std::sync::Mutex::new(None);
+
+pub fn publish_live_profile(p: &AircraftProfile) {
+    *LIVE_PROFILE.lock().unwrap_or_else(|e| e.into_inner()) = Some(std::sync::Arc::new(p.clone()));
+}
+
+pub fn live_profile() -> Option<std::sync::Arc<AircraftProfile>> {
+    LIVE_PROFILE.lock().unwrap_or_else(|e| e.into_inner()).clone()
+}
+
+/// The flare's elevator law for the live airframe (see
+/// [`FlareElevatorProfile`]); `None` is the default law.
+static FLARE_ELEVATOR: std::sync::Mutex<Option<FlareElevatorProfile>> =
+    std::sync::Mutex::new(None);
+
+/// Publish it. Called on EVERY profile swap; absent is the default law,
+/// never the previous airframe's.
+pub fn publish_flare_elevator(p: Option<FlareElevatorProfile>) {
+    *FLARE_ELEVATOR.lock().unwrap_or_else(|e| e.into_inner()) =
+        p.and_then(FlareElevatorProfile::valid);
+}
+
+pub fn flare_elevator() -> Option<FlareElevatorProfile> {
+    *FLARE_ELEVATOR.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 /// The live airframe's landing distance in metres, if its profile recites
 /// one. The autoland's float rule asks it how much pavement a landing from
 /// here still needs; `None` is the old GA figure.
@@ -2069,6 +2240,7 @@ pub fn generic_from_acf(icao: &str, acf_text: &str) -> AircraftProfile {
     let vle = kts("acf/_Vle_kts");
     p.retractable_gear = vle.is_some();
     p.vlo_kts = vle;
+    p.gear_warning = gear_warning_from_acf(acf_text);
     let injected = vals
         .get("_engn/0/_type")
         .is_some_and(|t| t.contains("INJ") || !t.starts_with("RCP"));
@@ -2349,6 +2521,9 @@ mod tests {
     fn every_speed_and_rate_in_the_laws_is_classified() {
         // (module, NAME) -> why it may be a shared constant.
         const REVIEWED: &[(&str, &str, &str)] = &[
+            ("autotakeoff", "ROLL_BRAKE_FULL_KTS", "brake-steer fade band, groundspeed; only brake_steer airframes"),
+            ("autotakeoff", "ROLL_BRAKE_OFF_KTS", "brake-steer fade band, groundspeed; only brake_steer airframes"),
+            ("speedhold", "IDLE_FAST_KTS", "margin over the pilot's own target, not an airframe speed"),
             // --- Properties of the SIM or the SENSORS, not the airframe ---
             (
                 "autotakeoff",
@@ -2551,6 +2726,16 @@ mod tests {
                 "procedure",
                 "DRAG_IN_KTS",
                 "MARGIN: over the governor's own target",
+            ),
+            (
+                "autotakeoff",
+                "GEAR_WARN_MARGIN_KTS",
+                "MARGIN: over the airframe's own .acf gear-warning speed",
+            ),
+            (
+                "autotakeoff",
+                "GEAR_VLO_MARGIN_KTS",
+                "MARGIN: under the airframe's own gear placard",
             ),
             (
                 "procedure",
@@ -3756,6 +3941,8 @@ fn cessna_172sp() -> AircraftProfile {
         flare_power: None,
         approach_thrust_min: None,
         arrest_lead: None,
+        flare_elevator: None,
+        cabin_air: None,
         pressurised: Some(false),
         park_brake_valve_set: None,
         electrical: {
@@ -3859,6 +4046,7 @@ fn cessna_172sp() -> AircraftProfile {
         // 172SP Vne (never-exceed) 163 KIAS.
         vne_kts: Some(163.0),
         vlo_kts: None,
+        gear_warning: None,
         // The GA pace is the built-in default — nothing to declare.
         taxi: None,
         throttle_dataref: None,
@@ -4058,6 +4246,8 @@ fn cirrus_sr22() -> AircraftProfile {
         flare_power: None,
         approach_thrust_min: None,
         arrest_lead: None,
+        flare_elevator: None,
+        cabin_air: None,
         pressurised: Some(false),
         park_brake_valve_set: None,
         pitot_heat: true,
@@ -4221,6 +4411,7 @@ fn cirrus_sr22() -> AircraftProfile {
         // SR22 Vne (never-exceed) 204 KIAS.
         vne_kts: Some(204.0),
         vlo_kts: None,
+        gear_warning: None,
         taxi: None,
         throttle_dataref: None,
         tail_strike_deg: None,

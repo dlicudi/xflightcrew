@@ -319,6 +319,46 @@ pub fn clamp_taxi_target(kts: f64) -> f64 {
     kts.clamp(0.0, 25.0)
 }
 
+/// Idle and still fast: the flight hold at the bottom of the lever while the
+/// speed does not come down. A throttle cannot slow a descending jet, and the
+/// hold used to sit at idle saying nothing: 234 kt against a 180 kt target at
+/// -1,400 fpm into the Inn valley, the pilot pulling a lever that was already
+/// closed (LOWI, 2026-09-24). Said once per episode, after it has lasted.
+#[derive(Debug, Default)]
+pub struct IdleStillFast {
+    since: Option<f64>,
+    said: bool,
+}
+
+/// Knots over the target that count as fast at idle.
+const IDLE_FAST_KTS: f64 = 15.0;
+/// ...for this long, not slowing, before it is said.
+const IDLE_FAST_SECS: f64 = 15.0;
+
+impl IdleStillFast {
+    /// `now_s` any monotonic clock. Returns the line to say, once.
+    pub fn tick(&mut self, now_s: f64, ias: f64, target: f64, thr: f64, trend_kts_s: f64) -> Option<String> {
+        let fast = thr <= 0.02 && ias > target + IDLE_FAST_KTS && trend_kts_s > -0.3;
+        if ias < target + 5.0 || thr > 0.1 {
+            *self = Self::default();
+            return None;
+        }
+        if !fast {
+            self.since = None;
+            return None;
+        }
+        let since = *self.since.get_or_insert(now_s);
+        if self.said || now_s - since < IDLE_FAST_SECS {
+            return None;
+        }
+        self.said = true;
+        Some(format!(
+            "Throttle's at idle and we're still {:.0} knots fast. Shallow the descent to slow down.",
+            ias - target
+        ))
+    }
+}
+
 /// Above this spoken target on the ground, the pilot means a flight hold, not a
 /// taxi — and below it airborne, they don't (55-kt floor applies).
 const TAXI_MAX_KTS: f64 = 30.0;
@@ -766,6 +806,8 @@ async fn governor(xp: XPlaneClient, voice: Option<crate::voice::Voice>) {
     // anticipation term. Smoothed on purpose: the 2.5 s lead amplifies any
     // read noise 25x if fed raw tick-to-tick differences.
     let mut prev_gs: Option<(f64, std::time::Instant)> = None;
+    let mut idle_fast = IdleStillFast::default();
+    let clock = std::time::Instant::now();
     let mut gs_trend = 0.0_f64;
     loop {
         if !ACTIVE.load(Ordering::Relaxed) {
@@ -840,6 +882,17 @@ async fn governor(xp: XPlaneClient, voice: Option<crate::voice::Voice>) {
                     };
                     prev_ias = Some((ias, now_t));
                     *ACTUAL.lock().unwrap_or_else(|e| e.into_inner()) = ias;
+                    if let Some(line) =
+                        idle_fast.tick(clock.elapsed().as_secs_f64(), ias, target, thr, trend)
+                    {
+                        crate::blackbox::record(
+                            "speedhold",
+                            serde_json::json!({"event": "idle_still_fast", "ias": ias, "target": target}),
+                        );
+                        if let Some(v) = &voice {
+                            v.say(crate::voice::Priority::Caution, line);
+                        }
+                    }
                     let adj = throttle_adjust(target - ias, trend);
                     if adj != 0.0 {
                         let cmd = (thr + adj).clamp(0.0, 1.0);
@@ -1106,6 +1159,29 @@ async fn governor(xp: XPlaneClient, voice: Option<crate::voice::Voice>) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn idle_and_still_fast_is_said_once_after_it_lasts() {
+        // LOWI: 234 kt against 180 at idle, speed not coming down.
+        let mut w = super::IdleStillFast::default();
+        assert_eq!(w.tick(0.0, 234.0, 180.0, 0.0, 0.5), None);
+        assert_eq!(w.tick(10.0, 234.0, 180.0, 0.0, 0.5), None, "not yet 15 s");
+        let line = w.tick(16.0, 234.0, 180.0, 0.0, 0.5).expect("said");
+        assert!(line.contains("54 knots fast"), "{line}");
+        assert_eq!(w.tick(30.0, 234.0, 180.0, 0.0, 0.5), None, "once per episode");
+        // Back near the target: the episode ends, a new one can be said.
+        assert_eq!(w.tick(40.0, 182.0, 180.0, 0.0, -1.0), None);
+        // Slowing at idle is the throttle working: nothing to say.
+        let mut s = super::IdleStillFast::default();
+        for t in 0..30 {
+            assert_eq!(s.tick(t as f64, 220.0, 180.0, 0.0, -1.5), None);
+        }
+        // Not at idle: the hold still has lever to use.
+        let mut p = super::IdleStillFast::default();
+        for t in 0..30 {
+            assert_eq!(p.tick(t as f64, 220.0, 180.0, 0.3, 0.5), None);
+        }
+    }
+
 
     /// 255 KIAS is the 737's cruise hold and correct at altitude — M0.78 at
     /// FL360. Armed at 1,031 ft on departure and held, it was a five knot

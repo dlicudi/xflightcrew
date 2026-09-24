@@ -5549,6 +5549,7 @@ mod tests {
         ));
         *ACTIVE_RUNWAYS.lock().unwrap() = vec![nav::Runway {
             width_m: 0.0,
+            surface: 0,
             ident_a: "09".into(),
             ident_b: "27".into(),
             lat_a: 36.1512,
@@ -5664,6 +5665,7 @@ mod tests {
         *ACTIVE_FIELD.lock().unwrap() = Some(("Gibraltar".into(), 36.1512, -5.3554));
         *ACTIVE_RUNWAYS.lock().unwrap() = vec![nav::Runway {
             width_m: 0.0,
+            surface: 0,
             ident_a: "09".into(),
             ident_b: "27".into(),
             lat_a: 36.1512,
@@ -5803,6 +5805,7 @@ mod tests {
         *ACTIVE_FIELD.lock().unwrap() = Some(("Gibraltar".into(), 36.1512, -5.3554));
         *ACTIVE_RUNWAYS.lock().unwrap() = vec![nav::Runway {
             width_m: 0.0,
+            surface: 0,
             ident_a: "09".into(),
             ident_b: "27".into(),
             lat_a: 36.1512,
@@ -5870,6 +5873,7 @@ mod tests {
         // Geometry backfills the designator from the physical strip.
         let runways = vec![nav::Runway {
             width_m: 0.0,
+            surface: 0,
             ident_a: "09".into(),
             ident_b: "27".into(),
             lat_a: 36.1512,
@@ -6111,6 +6115,7 @@ mod tests {
         // The real LEJR 02/20 100-row: 45 m wide.
         *ACTIVE_RUNWAYS.lock().unwrap() = vec![nav::Runway {
             width_m: 45.0,
+            surface: 0,
             ident_a: "02".into(),
             ident_b: "20".into(),
             lat_a: 36.7349761,
@@ -6199,6 +6204,7 @@ mod tests {
         *GHOSTS.lock().unwrap() = None;
         *ACTIVE_RUNWAYS.lock().unwrap() = vec![nav::Runway {
             width_m: 0.0,
+            surface: 0,
             ident_a: "09".into(),
             ident_b: "27".into(),
             lat_a: 36.1512,
@@ -6407,6 +6413,7 @@ mod tests {
         let _guard = SIDE_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         *ACTIVE_RUNWAYS.lock().unwrap() = vec![nav::Runway {
             width_m: 0.0,
+            surface: 0,
             ident_a: "09".into(),
             ident_b: "27".into(),
             lat_a: 36.1512,
@@ -6505,6 +6512,7 @@ mod tests {
         // A ghost on the PARALLEL strip is not our conflict: no cancel.
         ACTIVE_RUNWAYS.lock().unwrap().push(nav::Runway {
             width_m: 0.0,
+            surface: 0,
             ident_a: "09L".into(),
             ident_b: "27R".into(),
             lat_a: 36.1692,
@@ -6617,6 +6625,7 @@ mod tests {
         // Our strip: 09/27. The watches only care about THIS pavement.
         *ACTIVE_RUNWAYS.lock().unwrap() = vec![nav::Runway {
             width_m: 0.0,
+            surface: 0,
             ident_a: "09".into(),
             ident_b: "27".into(),
             lat_a: 36.1512,
@@ -6744,6 +6753,7 @@ mod tests {
         // Gatwick's main strip.
         *ACTIVE_RUNWAYS.lock().unwrap() = vec![nav::Runway {
             width_m: 45.0,
+            surface: 0,
             ident_a: "08R".into(),
             ident_b: "26L".into(),
             lat_a: 51.1512,
@@ -6882,6 +6892,7 @@ mod tests {
         let elev = 83.0;
         *ACTIVE_RUNWAYS.lock().unwrap() = vec![nav::Runway {
             width_m: 50.0,
+            surface: 0,
             ident_a: "09R".into(),
             ident_b: "27L".into(),
             lat_a: 51.4647701,
@@ -6994,6 +7005,7 @@ mod tests {
         *ACTIVE_RUNWAYS.lock().unwrap() = vec![
             nav::Runway {
                 width_m: 0.0,
+                surface: 0,
                 ident_a: "12".into(),
                 ident_b: "30".into(),
                 lat_a: 36.1512,
@@ -7003,6 +7015,7 @@ mod tests {
             },
             nav::Runway {
                 width_m: 0.0,
+                surface: 0,
                 ident_a: "13".into(),
                 ident_b: "31".into(),
                 lat_a: 36.1692,
@@ -7446,6 +7459,7 @@ mod tests {
             lat_b: lb,
             lon_b: lob,
             width_m: 45.0,
+            surface: 0,
         };
         let mut anc = region_apt("Ted Stevens Anchorage Intl", 61.1678, -150.0429);
         anc.apt.runways = vec![
@@ -7844,6 +7858,7 @@ mod tests {
         // LXGB 09/27, real-ish geometry: ~1.7 km east-west at 36.151N.
         *ACTIVE_RUNWAYS.lock().unwrap() = vec![nav::Runway {
             width_m: 0.0,
+            surface: 0,
             ident_a: "09".into(),
             ident_b: "27".into(),
             lat_a: 36.1512,
@@ -7996,6 +8011,7 @@ mod tests {
     fn the_arrival_end_is_the_threshold_the_traffic_is_beyond() {
         let runways = vec![nav::Runway {
             width_m: 45.0,
+            surface: 0,
             ident_a: "09".into(),
             ident_b: "27".into(),
             lat_a: 36.1512,
@@ -8108,6 +8124,7 @@ mod tests {
         st.apt.runways = vec![
             nav::Runway {
                 width_m: 50.0,
+                surface: 0,
                 ident_a: "09L".into(),
                 ident_b: "27R".into(),
                 lat_a: 51.4774781,
@@ -8117,6 +8134,7 @@ mod tests {
             },
             nav::Runway {
                 width_m: 50.0,
+                surface: 0,
                 ident_a: "09R".into(),
                 ident_b: "27L".into(),
                 lat_a: 51.4647701,
@@ -8583,6 +8601,7 @@ mod tests {
 
         *ACTIVE_RUNWAYS.lock().unwrap() = vec![nav::Runway {
             width_m: 0.0,
+            surface: 0,
             ident_a: "09".into(),
             ident_b: "27".into(),
             lat_a: 36.1508156,
@@ -8682,6 +8701,7 @@ mod tests {
         *ACTIVE_PANEL.lock().unwrap() = Some(("Gibraltar".into(), 11.0, Vec::new()));
         *ACTIVE_RUNWAYS.lock().unwrap() = vec![nav::Runway {
             width_m: 0.0,
+            surface: 0,
             ident_a: "09".into(),
             ident_b: "27".into(),
             lat_a: 36.1508156,
@@ -8759,6 +8779,7 @@ mod tests {
         ));
         *ACTIVE_RUNWAYS.lock().unwrap() = vec![nav::Runway {
             width_m: 0.0,
+            surface: 0,
             ident_a: "09".into(),
             ident_b: "27".into(),
             lat_a: 36.1508156,
@@ -8849,6 +8870,7 @@ mod tests {
         let _guard = SIDE_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         *ACTIVE_RUNWAYS.lock().unwrap() = vec![nav::Runway {
             width_m: 0.0,
+            surface: 0,
             ident_a: "09".into(),
             ident_b: "27".into(),
             lat_a: 36.1508156,

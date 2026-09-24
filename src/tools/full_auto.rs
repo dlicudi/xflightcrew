@@ -580,6 +580,18 @@ impl FullAuto {
         // the plan it composed — "invalid destination airport: ELVUM". The
         // arm got this right at 07:30 and the resume undid it at 07:49.
         let payload = crate::simbrief::fms_route_payload(&fp.waypoints);
+        // The flight's transition, as the arm publishes it: a resume after a
+        // restart ran on the profile's US 18,000 ft and reset the knob to
+        // QNH at FL180 over Germany, whose transition is 5,000 (EDLP-LOWI,
+        // 2026-09-24). Already descending past the top of descent is the
+        // follower's to note.
+        crate::tools::instruments::publish_flight_transition(Some(
+            crate::tools::instruments::FlightTransition {
+                altitude_ft: fp.transition_altitude_ft,
+                level_ft: fp.transition_level_ft,
+                descending: false,
+            },
+        ));
         Ok((
             Mission::Resume(Route {
                 dest_icao: fp.destination.clone(),
@@ -768,6 +780,7 @@ impl FullAuto {
             dest_longest_ft: dest_apt
                 .as_ref()
                 .map_or(0.0, crate::flightplan::longest_runway_ft),
+            service_ceiling_ft: Some(self.cfg.service_ceiling_ft),
         };
         let preflight = crate::full_auto::preflight(&fp, &facts);
         crate::full_auto::event(

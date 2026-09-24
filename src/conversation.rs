@@ -146,10 +146,12 @@ impl Conversation {
                 .into(),
             ));
         }
-        if matches!(
-            t,
-            "thanks" | "thank you" | "okay" | "ok" | "understood" | "got it"
-        ) {
+        // Small talk is a closed set with its own idiom (`persona`): "thanks"
+        // gets "cheers" from a British voice, a greeting gets one back.
+        if let Some(line) = crate::persona::reply_now(t) {
+            return Some(Response::Say(line));
+        }
+        if matches!(t, "okay" | "ok" | "understood" | "got it") {
             return Some(Response::Say("Standing by.".into()));
         }
         // The existing speech-replay handler owns these. Keep the evidence that

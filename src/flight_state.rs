@@ -32,9 +32,12 @@ use crate::aircraft::AircraftProfile;
 /// the profile, including to `None`: a process-wide fact must never outlive
 /// its airframe, and a selector that is only set when present is the bug.
 pub(crate) fn publish_airframe(p: &AircraftProfile) {
+    crate::aircraft::publish_live_profile(p);
+    crate::tools::cabin_air::publish(p.cabin_air.clone());
     crate::tools::radio::publish_mode_knob(p.transponder_mode_knob.clone());
     crate::takeoff_config::publish(p.takeoff_config.clone());
     crate::autotakeoff::publish_climb_out(crate::autotakeoff::ClimbOut::from_profile(p));
+    crate::autotakeoff::publish_gear_warning(p.gear_warning);
     crate::tools::signs::publish(p.seat_belt_signs.clone(), p.cabin_crew);
     crate::circuit::publish_ap_altitude_capture(p.ap_altitude_capture);
     crate::tools::lights::publish_exterior(&p.lights);
@@ -49,6 +52,7 @@ pub(crate) fn publish_airframe(p: &AircraftProfile) {
     );
     crate::aircraft::publish_approach_thrust_min(p.approach_thrust_min);
     crate::aircraft::publish_arrest_lead(p.arrest_lead);
+    crate::aircraft::publish_flare_elevator(p.flare_elevator);
     crate::aircraft::publish_landing_distance(
         p.reference.as_ref().and_then(|r| r.landing_distance_ft),
     );

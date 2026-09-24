@@ -31,6 +31,7 @@
 #include "XPLMUtilities.h"
 
 #include "common.h"
+#include "cursor.h"
 #include "drefs.h"
 #include "fms.h"
 #include "panel.h"
@@ -52,6 +53,7 @@ PLUGIN_API int XPluginStart(char* name, char* sig, char* desc) {
 
     drefs::start();
     panel::create();
+    cursor::start();
 
     fms::read_airac_cycle(); // for stamping generated flight plans with the matching cycle
 
@@ -67,6 +69,7 @@ PLUGIN_API int XPluginStart(char* name, char* sig, char* desc) {
 PLUGIN_API void XPluginStop(void) {
     // Teardown mirrors the original single-file order: the flight loop and the
     // panel-feed datarefs first, then the panel itself, then the rest.
+    cursor::stop();
     drefs::stop_first();
     panel::destroy();
     drefs::stop_rest();

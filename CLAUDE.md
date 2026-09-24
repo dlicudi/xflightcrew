@@ -191,6 +191,14 @@ tools; YAML carries per-airframe config. Standing rules:
   be a command; read-only switch positions need read-before-fire toggle tools
   (`*_toggle`), carried through full auto's copies too. Paired lights are
   written together (one pod lit is a readback confirming the half it looked at).
+  **The gear comes up outside its own warning** (`autotakeoff::gear_up_due`,
+  `aircraft::GearWarning`, read from the `.acf`'s `_gear_warn_*` keys at
+  detection when the profile is silent): X-Plane sounds the horn below
+  `below_kias` with the throttle under its percentage or the flaps past
+  their ratio, and the flat 200 ft rule raised the SF50's gear at 122 kt
+  with its 0.5 takeoff flap, a warning on every departure (ETND 26,
+  2026-09-23). Above 200 ft, once raising it is silent (+3 kt), and always
+  by 1,000 ft, 10 kt under Vlo, or at the handoff.
   **A read-only KNOB is stepped by its commands** (`TransponderModeKnob`
   `up_command`/`down_command`, `radio::step_knob`: read, one step, read
   again, bounded): the A330's transponder knob reports `is_writable: false`
@@ -223,7 +231,14 @@ tools; YAML carries per-airframe config. Standing rules:
   `on_reject`), and spoilers armed for a roll are disarmed after the gear
   (`after_liftoff`; the 737 climbed through 7,000 ft with SPEED BRAKE ARMED
   lit, EGPH 2026-09-21). Read first, left alone in state,
-  read back, named when it did not take, one milestone line. **Seat belt
+  read back, named when it did not take, one milestone line. **The cabin's
+  air** ([src/tools/cabin_air.rs](src/tools/cabin_air.rs), profile
+  `cabin_air:`): bleed and crew oxygen on for EVERY full-auto mission, an
+  airborne resume included, and at the monitor's cabin-altitude callout;
+  past the warning band a flying follower is handed 10,000 ft. An oxygen
+  button that is a TOGGLE is fired only when it reads off, and the valve
+  behind it is written too (EDLP-LOWI 2026-09-24: bleed never switched,
+  cabin at 24,000 ft, the pilot blacked out at FL260). **Seat belt
   signs** ([src/tools/signs.rs](src/tools/signs.rs)): on before anything
   turns, off through ten thousand, on again through ten thousand, on for the
   arrival; an add-on's own switch is declared (`seat_belt_signs:`) and
@@ -448,7 +463,7 @@ laws battle-test as plain `cargo test`; everything blackboxes to
 `logs/blackbox.jsonl` (kinds: `atc`, `autotaxi`, `autotakeoff`, `pushback`, `checklist`,
 `taxi_guide`, `cockpit_auto`, `full_auto`, `circuit`, `procedure`, `cabin`,
 `instructor`, `loading`, `turbine_start`, `heli_start`, `hover`, `heli_circuit`,
-`heli_route`, `api_load`). Cross-cutting rules, each learned the hard way (details in
+`heli_route`, `rapport`, `cabin_air`, `api_load`). Cross-cutting rules, each learned the hard way (details in
 history):
 
 - **A stage that is not moving the aircraft is holding it**: brakes set for
@@ -506,7 +521,10 @@ history):
   how aircraft end up in the grass - same for backtracks); crosschecked
   against `party_line::clearance_runway`; refuses with <400 m remaining.
 - **Auto takeoff** ([src/autotakeoff.rs](src/autotakeoff.rs)): refuses
-  without a takeoff clearance when a tower runs; throttle ramps and holds
+  without a takeoff clearance when a tower runs; a `brake_steer` airframe
+  (castoring nosewheel) brake-steers the roll like the taxi, faded out 20 to
+  40 kt (`roll_brake_split`; the SF50 had no low-speed steering at all,
+  EDLP 2026-09-24); the transponder goes to ALT as the roll starts; throttle ramps and holds
   while the nose swings; `RollSteer` = P + lead damping + slow clamped
   integrator, tiny deflection cap parked growing by 15 kt (prop wash);
   stagnation reject watches GROUNDSPEED (ASI is dead below ~20 kt); rotation
@@ -576,7 +594,14 @@ history):
   runway needing a 180 on a taxiway (2026-09-22). Stands on both sides pick
   the near apron; no stands in the data keeps the distance-only rule.
   `vacate_runway` falls back to `autoland::landed_runway` (landing without a
-  clearance makes vacating more urgent, not less). Any vacate failure after a
+  clearance makes vacating more urgent, not less). A turn-off up to 120 degrees
+  off the rollout is an exit (EDLP's B at 108; EGLL's N4W at 169 is not),
+  the vacate's budget is sized on its route (`vacate_budget_secs`), a stand
+  is entered along its parking line (`nav::stand_lead_in`, 25 m back), and
+  **a mission ends shut down** (`taxi_in::shut_down_at_stand`, full auto
+  and the helicopter route only): the registry's own shutdown for the class,
+  every engine confirmed from `ENGN_running`, then all electrics off; a
+  spoken "taxi to parking" leaves the engines to the pilot. Any vacate failure after a
   rolling handoff arrests the roll before the minutes-long wait.
 - **A jump in a projection is never a movement of the aircraft**
   (`taxi_guide::project_signed_facing`): the facing filter used to be
@@ -640,7 +665,11 @@ history):
   2026-09-14, five minutes of orbits): a bug stepped to the OUTSIDE of a
   bank goes round the long way, so every pursuit steer goes through
   `circuit::bug_toward` (bug on the nose until the wings are level, then the
-  short way) and the authored follower has a closure watchdog
+  short way), and from level the bug leads the nose by at most 25 degrees
+  until the bank is established the right way (`TURN_ENTRY_LEAD_DEG`): the
+  rectangle circuit bypassed the door and slewed 90 degrees off the nose
+  from wings level, and the SF50 flew 13 of its 30 circuit turns as a 270
+  right for a 90 left (ETND 26, 2026-09-23, a final handed over 170 m off) and the authored follower has a closure watchdog
   (`authored_stalled`). The authored LXGB route JOINS at the nearest leg
   (`join_waypoint`), climbs through `climb_limit_fpm` like the rectangle,
   and is terrain-probed along its LEGS every 150 m (six waypoints on sea
@@ -769,7 +798,26 @@ history):
   it differs from the apt.dat header by more than 20 ft and less than 300,
   said aloud, blackboxed `threshold_elev`): LEAX's header says 160 ft, its
   30 threshold lies at 117, and the 172 crossed the numbers 99 ft up and
-  balked "overflew the runway" 300 m in. **A tower's go-around order outranks
+  balked "overflew the runway" 300 m in. **A low flare with room to stop is COMMITTED**
+  (`autoland::commit_flare`, blackbox `committed_flare`): below the roundout
+  band an `overflew_the_runway` verdict does not stand while the pavement
+  left covers the airframe's OWN landing distance, because a go-around from
+  an idle flare cannot climb (the vertical law climbs only with speed in
+  hand). ETND 26 (2026-09-23): the SF50 ballooned to 32 ft, the float
+  allowance (1,244 m less the Baron's 900 m floor) ran out at 344 m with
+  900 m ahead, and the go-around met the runway at about -740 fpm. A BALLOON is
+  committed the same way below `BALLOON_COMMIT_FT` (100 ft), coming back
+  down at the roundout's sink on the approach's own thrust
+  (`balloon_power`), and the flare's ratchet lets go when a balloon is
+  `BALLOON_LEAD_S` away, not once it is climbing: EDLP 24 (2026-09-24) the
+  SF50 held 0.3 of elevator to +850 fpm and 52 ft, balked `balloon`, and the
+  go-around from idle at 81 kt, given 0 fpm by a law that climbs only with
+  speed in hand, stalled onto the runway at -1,568 fpm. **The flare's elevator law is per airframe** (`flare_elevator:`,
+  `autoland::FlareGains`: gain, integrator, cap, push, and a balloon that
+  EASES the pull instead of dropping it to the trimmed attitude); the SF50's
+  numbers were read off the EDLP 24 trace, not fitted (2026-09-24). Still
+  owed: a go-around law that pitches for SPEED when a
+  balk is slow and low instead of holding 0 fpm into a stall. **A tower's go-around order outranks
   everything** (`GoAroundLatch::order`): consumed in the autoland loop,
   drained at arm time, refused on the ground; a fresh "final" report is owed
   after any go-around, made inside the FAP. **The wind crab fed forward on
@@ -853,6 +901,15 @@ history):
   (`recede_ref_nm`). **Flaps do not cycle on a placard**
   (`flap_held_within_limits`). **A give-up hands the SPEED to the governor**
   (`hand_back_speed_kts`): the flat 0.75 lever took a level 737 to 346 kt.
+- **An approach is a straight-in to THIS runway or it is not offered**
+  (`nav::straight_in_legs`, LOWI 2026-09-24): a runway fix for the exact
+  designator (a grass "26R" never inherits "26"), no RF arc before it, the
+  legs cut at the threshold (the missed approach is never the approach);
+  circling procedures are not approaches. The arrival picks hard runways and
+  tries another end with a flyable approach (tailwind 10 kt or less) before
+  a visual landing, and flies the tower's inbound runway when it has one it
+  can fly (`tower_arrival_runway`). A plan cruising above the ceiling is
+  refused at the arm.
 - **A straight-in is only as good as its fixes** (LXGB 09, 2026-09-11): a
   DME-fix reconstruction keeps only fixes ON the final approach course
   (`RECON_ALIGN_DEG`), and `approach_plan_for` refuses any FAF autoland could
@@ -1225,6 +1282,44 @@ cabin call (`take_open_line`); "take your seats", "you're released" and
 second picker (`xcopilot/opt/cabin_voice`, same roster; the copilot's own
 voice is refused, `pollers::cabin_pick`). On a crewless airframe: an honest "no cabin
 crew on this airframe", never an improvisation.
+
+## The copilot as a person: timing, persona, rapport
+
+The words stopped being the machine tell once `readback::vary_ack` shipped;
+TIMING, memory and judgement were what remained (2026-09-23). Three modules,
+every rule deterministic and built from a measured fact:
+
+- **Timing** ([src/tempo.rs](src/tempo.rs)): a `Turn` per intercom
+  utterance. The first reply waits a jittered 280-480 ms from the end of the
+  CAPTURE (so the transcription counts toward it; never when busy, never
+  typed), and a turn with nothing queued on either channel after 1.6 s hears
+  "stand by" (never over a content-routed radio call: `set_radio_turn`).
+  The monitor publishes `busy_now` (the roll, under 1,000 ft, a landing,
+  takeoff or recovery loop, a checklist or lesson talking); the copilot voice
+  renders each line at `line_tempo` (a warning quick and flat, chat a touch
+  looser, brisk when busy; ONNX only, the cabin untouched).
+- **Persona** ([src/persona.rs](src/persona.rs)): `XCOPILOT_CREW_CHATTER`
+  (quiet / normal / chatty) gates what is VOLUNTEERED, never an answer, a
+  readback or a safety call. The idiom follows the VOICE's accent (en_GB
+  "cheers", en_US "you bet"; `XCOPILOT_CREW_DIALECT` overrides), because one
+  person does not change accent at a border. Small talk is a CLOSED set (the
+  whole utterance less address words); "thanks, gear up" is still gear up.
+  `XCOPILOT_PILOT_NAME` is used on the first praise of a session only.
+- **Rapport** ([src/rapport.rs](src/rapport.rs), blackbox `rapport`): a state
+  machine fed by the monitor tick that SEES every tick, autoland included.
+  The landing word is the instructor's own touchdown scorer, said once the
+  roll is under 30 kt, and replaces the old spoken "Landing summary: last
+  airborne sample..." report (still blackboxed as `landing_summary`). Praise
+  goes to the pilot, never an automation; a hard landing (600 fpm) is said at
+  every level; a bounce is counted at the SECOND contact, so a touch and go
+  is not one. Memory: go-arounds per flight (detected, pilot or automation),
+  landings per field, "back where we started". Offers (pilot flying only, a
+  sentence and never an action): the NEXT flap once the speed comes down
+  through its placard, the gear under its limit, the arrival brief 20-40 nm
+  out (`rapport::arrival_brief`, METAR, runway into the wind, approaches,
+  elevation; answered with the checklist proposal's closed yes/no words).
+  Anything deferrable that arrives busy is an ASIDE, said after 8 s of calm,
+  several joined, "By the way" once held over 20 s, dropped after 5 min.
 
 ## Panel, terminal, settings
 
