@@ -747,6 +747,48 @@ pub fn brake_steer_split(steer: f64, gs_kts: f64) -> (f64, f64) {
     }
 }
 
+/// A reversal is flown ONE way. Pointing almost exactly backwards the error
+/// flips between +177 and -179 on noise, and the steering followed it: LOWI 26's
+/// backtrack turn (2026-09-24) steered right, then left, then full left, and
+/// swung 19 m off the centreline of a 45 m runway. Past [`TURN_COMMIT_DEG`] the
+/// first sign is kept until the error is back under [`TURN_RELEASE_DEG`].
+pub fn committed_err(err_deg: f64, dir: &mut Option<f64>) -> f64 {
+    let mag = err_deg.abs();
+    if mag >= TURN_COMMIT_DEG {
+        let d = *dir.get_or_insert(if err_deg >= 0.0 { 1.0 } else { -1.0 });
+        return d * mag;
+    }
+    if mag < TURN_RELEASE_DEG {
+        *dir = None;
+        return err_deg;
+    }
+    match *dir {
+        Some(d) => d * mag,
+        None => err_deg,
+    }
+}
+const TURN_COMMIT_DEG: f64 = 150.0;
+const TURN_RELEASE_DEG: f64 = 90.0;
+
+/// The brake half of a PIVOT (a join turned through more than
+/// [`PIVOT_MIN_ERR_DEG`]): a castoring nosewheel turns on its inside brake at
+/// walking pace, which is exactly where the taxi split fades to nothing (0.06
+/// of brake at full lock through LOWI's 180, 2026-09-24). Authority from 1 kt,
+/// full by 2, capped at [`PIVOT_BRAKE_MAX`].
+pub fn pivot_brake_split(steer: f64, gs_kts: f64) -> (f64, f64) {
+    let authority = ((gs_kts - 1.0) / 1.0).clamp(0.0, 1.0);
+    let excess = ((steer.abs() - BRAKE_STEER_DEADBAND) / (BRAKE_STEER_SAT - BRAKE_STEER_DEADBAND))
+        .clamp(0.0, 1.0);
+    let b = excess * PIVOT_BRAKE_MAX * authority;
+    if steer > 0.0 {
+        (0.0, b)
+    } else {
+        (b, 0.0)
+    }
+}
+const PIVOT_MIN_ERR_DEG: f64 = 60.0;
+const PIVOT_BRAKE_MAX: f64 = 0.45;
+
 /// Steering held while still rolling, even after the distance fade has run
 /// out. Enough for the yaw damper to arrest a rotation, far short of the
 /// full deflection that carves.
@@ -1490,6 +1532,7 @@ async fn drive(xp: XPlaneClient, voice: Option<Voice>, route: Route, base_kts: f
     // Last steering command, so the slew limiter has something to move FROM.
     let mut prev_steer = 0.0f64;
     let mut straight_trim = StraightTrim::default();
+    let mut turn_dir: Option<f64> = None;
     // Whether the brake-steer assist currently has a wheel braked, so every
     // exit path can release it exactly once — and the last commanded pair,
     // so the assist's own slew has something to move from.
@@ -1676,6 +1719,7 @@ async fn drive(xp: XPlaneClient, voice: Option<Voice>, route: Route, base_kts: f
         } else {
             route.heading_err_deg(lat, lon, psi, progress, look)
         };
+        let err = committed_err(err, &mut turn_dir);
         // The turn the route asks for over that same aim span, for the rate
         // lead to credit. Zero inside the stop zone: there the error is held
         // against a FIXED final bearing, which is a straight line by
@@ -1833,7 +1877,12 @@ async fn drive(xp: XPlaneClient, voice: Option<Voice>, route: Route, base_kts: f
         // three. The 2026-07-28 lesson was about sequential awaits dragging
         // the loop to a second, not about the number of writes.)
         let (bl, br) = if route.pace.brake_steer {
-            let (wl, wr) = brake_steer_split(steer, gs_kts);
+            let pivot = join_allow.unwrap_or(0.0) > 0.0 && err.abs() > PIVOT_MIN_ERR_DEG;
+            let (wl, wr) = if pivot {
+                pivot_brake_split(steer, gs_kts)
+            } else {
+                brake_steer_split(steer, gs_kts)
+            };
             let bl = slew_steer(bs_prev.0, wl, Some(BRAKE_STEER_SLEW_PER_S), dt);
             let br = slew_steer(bs_prev.1, wr, Some(BRAKE_STEER_SLEW_PER_S), dt);
             bs_prev = (bl, br);
@@ -3289,5 +3338,26 @@ mod tests {
             bled = t.step(-4.0, 3.0, 8.0, false, 500.0, 0.2);
         }
         assert!(bled < 0.2 * built, "a bend bleeds it: {bled}");
+    }
+
+    #[test]
+    fn a_reversal_is_turned_one_way() {
+        // LOWI 26's backtrack turn: +177, then -179 on noise.
+        let mut dir = None;
+        assert_eq!(super::committed_err(177.0, &mut dir), 177.0);
+        assert_eq!(super::committed_err(-179.0, &mut dir), 179.0, "kept turning right");
+        assert_eq!(super::committed_err(-120.0, &mut dir), 120.0, "still the same way");
+        assert_eq!(super::committed_err(-40.0, &mut dir), -40.0, "released once nearly round");
+        assert_eq!(dir, None);
+    }
+
+    #[test]
+    fn a_pivot_gets_brake_at_walking_pace() {
+        // Full lock at 4.7 kt: the taxi split gave 0.06, a pivot 0.45.
+        let (l, _) = super::brake_steer_split(-1.0, 4.7);
+        let (pl, pr) = super::pivot_brake_split(-1.0, 4.7);
+        assert!(l < 0.1, "{l}");
+        assert!((pl - 0.45).abs() < 1e-9 && pr == 0.0, "{pl}");
+        assert_eq!(super::pivot_brake_split(-1.0, 0.5), (0.0, 0.0), "not while stopped");
     }
 }

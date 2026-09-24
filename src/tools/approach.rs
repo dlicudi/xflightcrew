@@ -222,6 +222,7 @@ impl Tool for VisualApproach {
             thr_lon: rw.thr_lon,
             course_deg: rw.course_deg,
             elev_ft: rw.elev_ft,
+            ft_per_nm: crate::approach_guide::FT_PER_NM,
         });
         Ok(format!(
             "Talk-down armed: runway {} at {}, field elevation {:.0}. Fly the needles in your ears — I'll call course and glidepath.",

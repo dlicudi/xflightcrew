@@ -2654,8 +2654,8 @@ pub fn brief_arrival(
     if published.is_empty() && straight_in.is_empty() && !visual.is_empty() {
         let (kind, rwy) = &visual[0];
         return Ok(format!(
-            "{} has the {kind} to runway {rwy}: I'll fly it to the missed approach point and \
-             land visually from there, on its own steep path.",
+            "{} has the {kind} to runway {rwy}: I'll fly it to the missed approach point, hand \
+             it to you there and talk you down the visual segment.",
             airport.name
         ));
     }

@@ -373,6 +373,37 @@ fn stash_missed_legs(legs: Vec<ProcLeg>) {
     *MISSED_LEGS.lock().unwrap_or_else(|e| e.into_inner()) = (!legs.is_empty()).then_some(legs);
 }
 
+/// Autoland flies the visual segment from a MAP. Off until it is proven: at
+/// LSZS (2026-09-24) the steep path in 18 kt of mountain wind porpoised
+/// +/-1,500 fpm, levelled at 238 ft for no reason yet found, and climbed away
+/// over the runway. The MAP is where a crew goes visual; the pilot takes it
+/// there, talked down (`map_handover_path`).
+pub const MAP_AUTOLAND: bool = false;
+
+/// The talk-down's path for a hand-over at a MAP: from where the aircraft is
+/// to 50 ft over the threshold, so the first call is "on glidepath" and every
+/// later one measures the segment actually being flown. Slope clamped to
+/// 3..6 degrees. Pure.
+pub fn map_handover_path(
+    rwy: &crate::autoland::Runway,
+    lat: f64,
+    lon: f64,
+    alt_ft: f64,
+) -> crate::approach_guide::ApproachPath {
+    let dist_nm = crate::nav::haversine_nm(lat, lon, rwy.thr_lat, rwy.thr_lon).max(0.2);
+    let height = alt_ft - (rwy.elev_ft + crate::approach_guide::THRESHOLD_CROSSING_FT);
+    let (lo, hi) = (6076.12 * 3f64.to_radians().tan(), 6076.12 * 6f64.to_radians().tan());
+    crate::approach_guide::ApproachPath {
+        icao: rwy.icao.clone(),
+        runway_id: rwy.id.clone(),
+        thr_lat: rwy.thr_lat,
+        thr_lon: rwy.thr_lon,
+        course_deg: rwy.course_deg,
+        elev_ft: rwy.elev_ft,
+        ft_per_nm: (height / dist_nm).clamp(lo, hi),
+    }
+}
+
 /// On the leg to a missed approach point, the published path: the altitude it
 /// wants at `dist_nm` from the MAP and the descent rate that stays on it at
 /// this groundspeed (fpm, negative). A P law cannot track a ramp; the rate is
@@ -2057,6 +2088,47 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, plan: Pla
                     "procedure",
                     serde_json::json!({"event": "handoff_autoland", "idx": idx, "agl_ft": agl_ft}),
                 );
+                if leg.is_map && !MAP_AUTOLAND {
+                    // The visual segment is the pilot's, talked down: the
+                    // aircraft configured and on speed, the autopilot still
+                    // holding the descent, the talk-down armed on THIS path
+                    // (from here to 50 ft over the threshold, not 3 degrees).
+                    let rwy = match rwy_id.clone() {
+                        Some(r) => {
+                            let apt = apt_dat.clone();
+                            tokio::task::spawn_blocking(move || {
+                                crate::autoland::runway_by_id(&apt, lat, lon, &r.id, 10.0, r.icao.as_deref())
+                                    .ok()
+                                    .flatten()
+                            })
+                            .await
+                            .ok()
+                            .flatten()
+                        }
+                        None => None,
+                    };
+                    let path = rwy.as_ref().map(|r| map_handover_path(r, lat, lon, alt_ft));
+                    crate::blackbox::record(
+                        "procedure",
+                        serde_json::json!({"event": "map_handover", "agl_ft": agl_ft,
+                            "ft_per_nm": path.as_ref().map(|p| p.ft_per_nm),
+                            "dist_nm": rwy.as_ref().map(|r| crate::nav::haversine_nm(lat, lon, r.thr_lat, r.thr_lon))}),
+                    );
+                    let line = match (&path, &rwy) {
+                        (Some(p), Some(r)) => {
+                            crate::approach_guide::arm(p.clone());
+                            format!(
+                                "Missed approach point. Runway {} ahead, {:.1} miles. Your aircraft. \
+                                 The autopilot is holding the descent; I'll talk you down.",
+                                crate::circuit::spell_runway(&r.id),
+                                crate::nav::haversine_nm(lat, lon, r.thr_lat, r.thr_lon)
+                            )
+                        }
+                        _ => "Missed approach point, runway ahead. Your aircraft.".to_string(),
+                    };
+                    stand_down(&voice, &line, "map_handover");
+                    return;
+                }
                 if leg.is_map {
                     // The visual segment: its own angle to the landing, and
                     // the published missed approach for its go-around.
@@ -2198,6 +2270,31 @@ mod tests {
             is_map: false,
             vpa_deg: None,
         }
+    }
+
+    /// LSZS 03 hand-over at the MAP (1.98 nm, 6,598 ft, threshold 5,602):
+    /// the talk-down's path runs from here to 50 ft over the threshold, so it
+    /// starts "on glidepath" on the steep segment instead of 300 ft high on 3.
+    #[test]
+    fn a_map_handover_talks_down_the_path_actually_flown() {
+        let rwy = crate::autoland::Runway {
+            icao: "LSZS".into(),
+            id: "03".into(),
+            thr_lat: 46.5270195,
+            thr_lon: 9.8780890,
+            course_deg: 29.0,
+            length_m: 1842.0,
+            surface: 1,
+            dist_nm: 0.0,
+            elev_ft: 5602.0,
+        };
+        let (lat, lon) = (46.5, 9.850666667);
+        let path = super::map_handover_path(&rwy, lat, lon, 6598.0);
+        assert!((path.ft_per_nm - 478.0).abs() < 10.0, "{}", path.ft_per_nm);
+        let d = crate::approach_guide::deviations(&path, lat, lon, 6598.0);
+        assert!(d.vdev_ft.abs() < 60.0, "on glidepath at the MAP: {}", d.vdev_ft);
+        assert!(crate::approach_guide::callout(&d).unwrap().contains("on glidepath"));
+        assert!(!super::MAP_AUTOLAND, "the steep autoland stays off until proven");
     }
 
     /// LSZS RNAV 03: FAF ZS702 at 11,800, MAP ZS705 at 6,598 on a 4.49

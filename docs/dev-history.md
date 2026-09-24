@@ -5976,3 +5976,17 @@ best rate (only an aircraft not climbing is handed back); the takeoff climbs
 at the best rate holding its initial climb speed while SID minimums are ahead
 (`autotakeoff::DEPARTURE_MINIMUMS`); and a rejoin refusal below either field's
 sector altitude says "climb first" before any heading.
+
+## 2026-09-24: the backtrack turn at LOWI 26
+
+Entering 26 at an intersection, the line-up backtracked 460 m cleanly and
+then turned 180 on the runway badly: pointing backwards the heading error
+flipped between +177 and -179 on noise and the steering followed it (right,
+left, full left), and the castoring SF50 got 0.06 of inside brake at full
+lock because the taxi's brake split fades out below 7 kt. It swung 19 m off
+the centreline of a 45 m runway. Now a reversal keeps its first direction past
+150 degrees until back under 90 (`committed_err`), and a join turned through
+more than 60 degrees brakes like a pivot: inside brake from 1 kt, up to 0.45
+(`pivot_brake_split`). Neither behaviour was changed by the day's other work.
+Also the same afternoon: the talk-down takes a per-path slope and arms at a
+MAP hand-over; the steep MAP autoland is off (`MAP_AUTOLAND`).

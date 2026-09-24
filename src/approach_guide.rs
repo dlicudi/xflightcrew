@@ -21,6 +21,9 @@ pub struct ApproachPath {
     pub course_deg: f64,
     /// Field elevation, ft MSL.
     pub elev_ft: f64,
+    /// The path's slope, feet per nautical mile: 300 for the ordinary 3
+    /// degrees, steeper for a visual segment from a MAP (LSZS 03, about 500).
+    pub ft_per_nm: f64,
 }
 
 /// The armed talk-down, if any. Set by the `visual_approach` tool, read by the
@@ -44,8 +47,8 @@ pub fn armed() -> Option<ApproachPath> {
 }
 
 /// Glidepath: 3° ≈ 300 ft/nm, aimed 50 ft over the threshold.
-const FT_PER_NM: f64 = 300.0;
-const THRESHOLD_CROSSING_FT: f64 = 50.0;
+pub const FT_PER_NM: f64 = 300.0;
+pub const THRESHOLD_CROSSING_FT: f64 = 50.0;
 
 /// Where the aircraft sits relative to the approach: distance to the threshold,
 /// cross-track (positive = LEFT of centerline, i.e. correct right), and height
@@ -68,7 +71,7 @@ pub fn deviations(path: &ApproachPath, lat: f64, lon: f64, alt_ft: f64) -> Devia
     let dev = angle_diff_deg(brg, path.course_deg);
     let xtk_nm = dist_nm * dev.to_radians().sin();
     let along_nm = dist_nm * dev.to_radians().cos();
-    let ideal = path.elev_ft + THRESHOLD_CROSSING_FT + along_nm.max(0.0) * FT_PER_NM;
+    let ideal = path.elev_ft + THRESHOLD_CROSSING_FT + along_nm.max(0.0) * path.ft_per_nm;
     Deviations {
         dist_nm,
         xtk_nm,
@@ -157,6 +160,7 @@ mod tests {
             thr_lon: -3.9475728,
             course_deg: 283.0,
             elev_ft: 2084.0,
+            ft_per_nm: FT_PER_NM,
         }
     }
 
