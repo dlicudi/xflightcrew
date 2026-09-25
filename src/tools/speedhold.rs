@@ -39,6 +39,19 @@ const IAS: &str = "sim/cockpit2/gauges/indicators/airspeed_kts_pilot";
 fn throttle_dref() -> String {
     crate::aircraft::throttle_dataref()
 }
+/// The combined lever, -1..0 beta and 0..1 alpha: the taxi hold's lever on
+/// an airframe that taxis in beta, read and written as one, so our own beta
+/// can never read as the pilot's hand on the throttle.
+const BETA_LEVER: &str = "sim/cockpit2/engine/actuators/throttle_beta_rev_ratio_all";
+
+/// The taxi hold's lever for the live airframe.
+fn taxi_lever() -> String {
+    if crate::aircraft::taxi_beta_max().is_some() {
+        BETA_LEVER.to_string()
+    } else {
+        throttle_dref()
+    }
+}
 const GS_MS: &str = "sim/flightmodel/position/groundspeed";
 const ON_GROUND: &str = "sim/flightmodel/failures/onground_any";
 const LEFT_BRAKE: &str = "sim/cockpit2/controls/left_brake_ratio";
@@ -496,6 +509,53 @@ pub fn taxi_control(
         (None, 0.0) // in the groove: hands off, brakes released
     }
 }
+
+/// The taxi law with a BETA range below idle ([`crate::aircraft::TaxiProfile::beta_max`]):
+/// `lever` is X-Plane's combined lever (-1..0 beta, 0..1 alpha). A rolling
+/// overspeed goes into beta, never the brakes; the brakes stay for a stop
+/// and for an overspeed past [`BETA_BRAKE_KTS`]. Out of beta, the lever
+/// comes back to idle quickly when the pace is wanted again. Pure.
+pub fn taxi_control_beta(
+    target_kts: f64,
+    gs_kts: f64,
+    lever: f64,
+    trend_kts_s: f64,
+    beta_max: f64,
+) -> (Option<f64>, f64) {
+    let beta_max = beta_max.clamp(0.0, 0.9);
+    let (thr, brake) = taxi_control(target_kts, gs_kts, lever.max(0.0), trend_kts_s);
+    if target_kts < 1.0 {
+        // A stop: idle and the brakes, as ever (beta cannot hold it still).
+        return (thr.map(|t| t.max(0.0)).or(Some(0.0)), brake);
+    }
+    let eff = (target_kts - gs_kts) - trend_kts_s * 2.5;
+    if eff > 1.0 && lever < 0.0 {
+        // Wanted the pace again: out of beta toward idle, briskly.
+        return (Some((lever + BETA_STEP_OUT).min(0.0)), 0.0);
+    }
+    let fast_at_idle = thr.is_some_and(|t| t <= 0.0) && eff < -1.0;
+    if brake > 0.0 || fast_at_idle {
+        let depth = ((-eff - 1.0) * BETA_PER_KT).clamp(BETA_MIN, beta_max);
+        // Walk into it, a foot on a lever, not a stab.
+        let want = -depth;
+        let next = if want < lever { (lever - BETA_STEP_IN).max(want) } else { want };
+        let emergency = -eff >= BETA_BRAKE_KTS;
+        return (Some(next.max(-beta_max)), if emergency { brake } else { 0.0 });
+    }
+    if lever < 0.0 && eff >= -1.0 {
+        // On pace again while in beta: ease back toward idle.
+        return (Some((lever + BETA_STEP_IN).min(0.0)), 0.0);
+    }
+    (thr, brake)
+}
+/// Beta depth per knot of overspeed, and the shallowest worth commanding.
+const BETA_PER_KT: f64 = 0.06;
+const BETA_MIN: f64 = 0.08;
+/// Per tick into beta, and out of it when the pace is wanted back.
+const BETA_STEP_IN: f64 = 0.03;
+const BETA_STEP_OUT: f64 = 0.06;
+/// Overspeed (kt, projected) that still earns the brakes with beta in.
+pub const BETA_BRAKE_KTS: f64 = 8.0;
 
 /// A build of speed this fast (kt/s) is a surge — downhill, a gust — and
 /// earns idle-and-brake on the projection alone, before the speed gets there.
@@ -1008,7 +1068,7 @@ async fn governor(xp: XPlaneClient, voice: Option<crate::voice::Voice>) {
                     tracing::info!(
                         "speed governor: parking brake set, closing throttle, standing down"
                     );
-                    glide(&xp, &throttle_dref(), 0.0, 400).await;
+                    glide(&xp, &taxi_lever(), 0.0, 400).await;
                     ACTIVE.store(false, Ordering::Relaxed);
                     break;
                 }
@@ -1021,7 +1081,7 @@ async fn governor(xp: XPlaneClient, voice: Option<crate::voice::Voice>) {
                     let lb = xp.get_float(LEFT_BRAKE).await.unwrap_or(0.0);
                     let rb = xp.get_float(RIGHT_BRAKE).await.unwrap_or(0.0);
                     if lb.max(rb).max(pb) > PILOT_BRAKE_RESUME {
-                        if xp.get_float(&throttle_dref()).await.is_ok_and(|t| t > 0.15) {
+                        if xp.get_float(&taxi_lever()).await.is_ok_and(|t| t > 0.15) {
                             tracing::info!(
                                 "speed governor: throttle advanced while brake-paused, releasing"
                             );
@@ -1059,7 +1119,7 @@ async fn governor(xp: XPlaneClient, voice: Option<crate::voice::Voice>) {
                             brake = lb.max(rb).max(pb),
                             "speed governor: pilot braking, throttle idle, paused"
                         );
-                        glide(&xp, &throttle_dref(), 0.0, 300).await;
+                        glide(&xp, &taxi_lever(), 0.0, 300).await;
                         last_cmd = Some(0.0);
                         paused = true;
                         if let Some(v) = &voice {
@@ -1073,7 +1133,7 @@ async fn governor(xp: XPlaneClient, voice: Option<crate::voice::Voice>) {
                 }
                 if let (Ok(gs_ms), Ok(thr)) = (
                     xp.get_float(GS_MS).await,
-                    xp.get_float(&throttle_dref()).await,
+                    xp.get_float(&taxi_lever()).await,
                 ) {
                     if let Some(lc) = last_cmd.filter(|lc| (thr - lc).abs() > 0.15) {
                         if override_pending {
@@ -1087,7 +1147,7 @@ async fn governor(xp: XPlaneClient, voice: Option<crate::voice::Voice>) {
                             lc,
                             "speed governor: throttle deviated, challenging once"
                         );
-                        let _ = xp.set_float(&throttle_dref(), lc).await;
+                        let _ = xp.set_float(&taxi_lever(), lc).await;
                         tokio::time::sleep(std::time::Duration::from_millis(250)).await;
                         continue;
                     }
@@ -1108,10 +1168,13 @@ async fn governor(xp: XPlaneClient, voice: Option<crate::voice::Voice>) {
                     };
                     prev_gs = Some((gs_kts, now_t));
                     gs_trend = gs_trend * 0.7 + raw_trend * 0.3;
-                    let (new_thr, brake) = taxi_control(target, gs_kts, thr, gs_trend);
+                    let (new_thr, brake) = match crate::aircraft::taxi_beta_max() {
+                        Some(b) => taxi_control_beta(target, gs_kts, thr, gs_trend, b),
+                        None => taxi_control(target, gs_kts, thr, gs_trend),
+                    };
                     let wrote = new_thr.is_some() || brake > 0.0 || braking;
                     if let Some(t) = new_thr {
-                        glide(&xp, &throttle_dref(), t, 200).await;
+                        glide(&xp, &taxi_lever(), t, 200).await;
                         last_cmd = Some(t);
                     }
                     // Brakes go through the plugin's proportional channel —
@@ -1138,6 +1201,7 @@ async fn governor(xp: XPlaneClient, voice: Option<crate::voice::Voice>) {
                             serde_json::json!({
                                 "event": "brake", "cmd": brake, "out": brake_out,
                                 "gs": gs_kts, "target": target, "trend": gs_trend,
+                                "lever": new_thr.unwrap_or(thr),
                             }),
                         );
                     }
@@ -1198,6 +1262,11 @@ async fn governor(xp: XPlaneClient, voice: Option<crate::voice::Voice>) {
         }
     }
     tracing::info!("speed governor stopped");
+    // A lever left in beta goes back to idle: the next thing on this lever
+    // may be a takeoff, and a roll must never start with the prop in beta.
+    if crate::aircraft::taxi_beta_max().is_some() && last_cmd.is_some_and(|c| c < 0.0) {
+        let _ = xp.set_float(BETA_LEVER, 0.0).await;
+    }
     // The held brake COMMAND expires by itself within BRAKE_HOLD_SECS, and
     // that is all this used to say. The proportional CHANNEL is the other
     // half and it does not clean up after itself: its override expires, its
@@ -1426,6 +1495,36 @@ mod tests {
         let (thr, brake) = taxi_control(0.0, 1.0, 0.0, 0.0);
         assert_eq!(thr, Some(0.0));
         assert!(brake > 0.0 && brake < 0.25, "gentle finish: {brake}");
+    }
+
+    /// The Evolution idles too fast to taxi (POH: "Don't ride the brakes in
+    /// taxi. Ease the throttle into beta instead"): a rolling overspeed goes
+    /// into beta with no brake; a stop still brakes; a runaway still brakes;
+    /// wanting the pace back comes out of beta.
+    #[test]
+    fn a_beta_taxi_slows_on_the_propeller_not_the_brakes() {
+        // 14 kt at idle for a 10 kt pace: beta, no brake.
+        let (lever, brake) = taxi_control_beta(10.0, 14.0, 0.0, 0.0, 0.5);
+        assert!(lever.is_some_and(|l| l < 0.0 && l >= -0.5), "{lever:?}");
+        assert_eq!(brake, 0.0);
+        // Deeper each tick, never past the profile's depth.
+        let mut l = 0.0;
+        for _ in 0..40 {
+            l = taxi_control_beta(10.0, 16.0, l, 0.0, 0.5).0.unwrap();
+        }
+        assert!((-0.5..0.0).contains(&l), "{l}");
+        // A stop brakes as before.
+        let (_, brake) = taxi_control_beta(0.0, 3.0, 0.0, 0.0, 0.5);
+        assert!(brake > 0.0);
+        // A runaway, 10 kt over, still earns the brakes on top of beta.
+        let (_, brake) = taxi_control_beta(10.0, 21.0, -0.3, 0.0, 0.5);
+        assert!(brake > 0.0, "the emergency keeps its brakes");
+        // Slow again in beta: out toward idle, no brake.
+        let (lever, brake) = taxi_control_beta(10.0, 7.0, -0.3, 0.0, 0.5);
+        assert!(lever.unwrap() > -0.3 && lever.unwrap() <= 0.0);
+        assert_eq!(brake, 0.0);
+        // In the groove at idle: the plain law's answer.
+        assert_eq!(taxi_control_beta(10.0, 10.5, 0.15, 0.0, 0.5), (None, 0.0));
     }
 
     #[test]

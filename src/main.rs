@@ -28,6 +28,7 @@ mod dialogue;
 mod failures;
 #[allow(dead_code)] // shadow run: the consumers move over next
 mod flight;
+mod duty;
 mod flight_state;
 mod flightplan;
 mod flow;
@@ -1994,6 +1995,9 @@ async fn run_session(
                 conversation::Response::Status => {
                     conversation::status_answer(&auto_status::active_managers())
                 }
+                conversation::Response::FlightStatus => flight::published()
+                    .map(|s| flight::status_line(&s))
+                    .unwrap_or_else(|| "I don't have the flight picture yet.".to_string()),
                 conversation::Response::Reference(query) => {
                     match reference_limits(&profile, query) {
                         Some(line) => {

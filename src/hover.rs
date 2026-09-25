@@ -817,6 +817,23 @@ pub fn drift_action(goal: Goal, err_mps: f64) -> Drift {
     }
 }
 
+/// A new KIND of goal settles before "stopped following" may judge it. The
+/// route handed its final to the loop at 35 kt, the hover mode was still
+/// capturing the vector 3.5 s later (5.2 m/s off), the Stop fired, and the
+/// route read the loop's own hover as someone else's and ended 1.3 km short
+/// of LIME's pad (2026-09-25). The set-down and hand-back limits hold
+/// throughout. Keyed on the goal's kind: the route re-aims `Fly` every tick.
+pub const GOAL_SETTLE_S: f64 = 8.0;
+
+/// `action` once the goal has had `since_s` to settle. Pure.
+pub fn settled(action: Drift, since_s: f64) -> Drift {
+    if action == Drift::Stop && since_s < GOAL_SETTLE_S {
+        Drift::Fine
+    } else {
+        action
+    }
+}
+
 /// The hover mode's target is not the one we set: put it back.
 fn vector_moved(v: &[f64], want: [f64; 2]) -> bool {
     v.iter()
@@ -1009,6 +1026,8 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, collective: String) {
     let mut ff_speed: Option<f64> = None;
     let rotor_cfg = rotor();
     let mut droop_since: Option<Instant> = None;
+    let mut goal_kind: Option<std::mem::Discriminant<Goal>> = None;
+    let mut goal_since = Instant::now();
     while ACTIVE.load(Ordering::SeqCst) {
         tokio::time::sleep(TICK).await;
         if crate::xplane::sim_frozen(&xp).await {
@@ -1225,7 +1244,13 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, collective: String) {
         if hs.is_some_and(|v| v >= 1.5) && hv.as_deref().is_some_and(|v| vector_moved(v, target)) {
             set_vector(&xp, target).await;
         }
-        match err.or(gs).map_or(Drift::Fine, |e| drift_action(g, e)) {
+        let kind = std::mem::discriminant(&g);
+        if goal_kind != Some(kind) {
+            goal_kind = Some(kind);
+            goal_since = Instant::now();
+        }
+        let action = err.or(gs).map_or(Drift::Fine, |e| drift_action(g, e));
+        match settled(action, goal_since.elapsed().as_secs_f64()) {
             Drift::Fine => {}
             Drift::Stop => {
                 let hold = h_ft.round().max(10.0);
@@ -1690,6 +1715,12 @@ mod tests {
         assert!(target_vs_fpm(Goal::Land, 200.0, 1.0) < 0.0);
         assert_eq!(drift_action(d, 6.0), Drift::Stop);
         assert_eq!(drift_action(d, 3.0), Drift::Fine);
+        // LIME 2026-09-25: 5.2 m/s off 3.5 s after the route's handover is
+        // a capture, not a departure that stopped following.
+        assert_eq!(settled(Drift::Stop, 3.5), Drift::Fine);
+        assert_eq!(settled(Drift::Stop, 9.0), Drift::Stop);
+        assert_eq!(settled(Drift::SetDown, 1.0), Drift::SetDown, "the hard limits hold");
+        assert_eq!(settled(Drift::HandBack, 1.0), Drift::HandBack);
         // A hover taxi at 10 kt rounds a corner with more lag than that.
         let taxi = Goal::Fly {
             height_ft: 12.0,

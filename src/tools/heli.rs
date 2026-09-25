@@ -376,7 +376,7 @@ impl Tool for Hover {
         json!({
             "type": "object",
             "properties": {
-                "action": { "type": "string", "enum": ["up", "down", "move", "hold", "depart", "circuit", "speed", "route"] },
+                "action": { "type": "string", "enum": ["up", "down", "land", "pad", "move", "hold", "depart", "circuit", "speed", "route"] },
                 "right": { "type": "boolean" },
                 "height_ft": { "type": "number" },
                 "direction": { "type": "string", "enum": ["forward", "back", "left", "right"] },
@@ -405,7 +405,22 @@ impl Tool for Hover {
         if action == Some("circuit") {
             return circuit(args, ctx).await;
         }
-        let down = action == Some("down");
+        // "Land at the airport": the destination's pad. "Land the aircraft":
+        // the pad when one is in reach, else here. Never cancels a route
+        // that is already taking us to the pad (LIME 2026-09-25).
+        if matches!(action, Some("pad") | Some("land")) {
+            if crate::heli_route::ACTIVE.load(std::sync::atomic::Ordering::SeqCst) {
+                return Ok(
+                    "We're on the way to the pad. Say land here to set it down now.".to_string(),
+                );
+            }
+            match arrival(self, ctx).await? {
+                Ok(line) => return Ok(line),
+                Err(why) if action == Some("pad") => return Ok(why),
+                Err(_) => {}
+            }
+        }
+        let down = matches!(action, Some("down") | Some("land"));
         if down {
             if !crate::hover::ACTIVE.load(std::sync::atomic::Ordering::SeqCst)
                 && ctx.xplane.get_float(ONGROUND).await? > 0.5
@@ -460,6 +475,71 @@ impl Tool for Hover {
             format!("Lifting to a {h:.0} foot hover.")
         })
     }
+}
+
+/// The destination's pad, from the air near it: the route's final only
+/// ([`crate::heli_route::Route::arrive_only`]). `Err` says why not, for the
+/// pilot who asked for the pad by name.
+async fn arrival(tool: &Hover, ctx: &ToolCtx<'_>) -> Result<std::result::Result<String, String>> {
+    if ctx.xplane.get_float(ONGROUND).await? > 0.5 {
+        return Ok(Err("We're on the ground. Say fly the flight plan for the whole flight.".into()));
+    }
+    if !crate::hover::ACTIVE.load(std::sync::atomic::Ordering::SeqCst) {
+        if let Some(no) = takeover_refusal(ctx).await {
+            return Ok(Err(no));
+        }
+    }
+    let Some(plan) = crate::simbrief::loaded_plan() else {
+        return Ok(Err("No flight plan loaded, so I don't know which airport. Load the flight plan first.".into()));
+    };
+    let (lat, lon) = tokio::join!(
+        ctx.xplane.get_float(crate::datarefs::LATITUDE),
+        ctx.xplane.get_float(crate::datarefs::LONGITUDE)
+    );
+    let (Ok(lat), Ok(lon)) = (lat, lon) else {
+        return Ok(Err("I can't read our position.".into()));
+    };
+    let dest = plan.destination.clone();
+    let pads = crate::heli_route::helipads(&ctx.config.apt_data_path, &dest);
+    let apt = crate::nav::find_airport(&ctx.config.apt_data_path, &dest).ok().flatten();
+    let on_pad = !pads.is_empty();
+    let spot = crate::heli_route::pick_pad(&pads, (lat, lon))
+        .or_else(|| apt.as_ref().and_then(|a| crate::heli_route::runway_spot(a, (lat, lon))));
+    let Some((plat, plon, name)) = spot else {
+        return Ok(Err(format!("I can't find a place to land at {dest}.")));
+    };
+    let geo = crate::taxi_guide::Geo::new(lat);
+    let d = crate::taxi_guide::dist((0.0, 0.0), geo.to_m((lat, lon), (plat, plon)));
+    if d > crate::heli_route::ARRIVE_ONLY_MAX_M {
+        return Ok(Err(format!(
+            "The pad at {dest} is {:.0} miles away, too far to join the final from here.",
+            d / 1852.0
+        )));
+    }
+    crate::hover::set_motion(crate::hover::Motion::default());
+    crate::heli_route::start(
+        ctx.voice.cloned(),
+        ctx.config.clone(),
+        tool.collective.clone(),
+        crate::heli_route::Route {
+            points: vec![(format!("{dest} {name}"), plat, plon)],
+            on_pad,
+            fast_climb: false,
+            destination: dest.clone(),
+            dest_tower_khz: apt.as_ref().and_then(|a| a.staffed_tower().map(|f| f.khz)),
+            arrive_only: true,
+        },
+        crate::heli_route::Ends {
+            start: None,
+            lift: false,
+            taxi: tool.taxi.clone(),
+        },
+    );
+    Ok(Ok(format!(
+        "To the {} at {dest}, {name}, {:.0} metres.",
+        if on_pad { "pad" } else { "runway" },
+        d
+    )))
 }
 
 /// Move the hover along the ground ("move forward at five knots") or stop it
@@ -703,6 +783,7 @@ async fn route(tool: &Hover, ctx: &ToolCtx<'_>) -> Result<String> {
             fast_climb,
             destination: dest.clone(),
             dest_tower_khz,
+            arrive_only: false,
         },
         crate::heli_route::Ends {
             start: (on_ground && from_cold).then(|| tool.start.clone()),

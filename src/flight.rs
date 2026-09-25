@@ -230,6 +230,8 @@ pub struct Situation {
     /// When the pilot last took the aircraft back from a loop, and from
     /// which ([`note_pilot_takeover`]).
     pub pilot_takeover: Option<(f64, &'static str)>,
+    /// A simulated tower reaches us (`party_line::station_reaches`, ATC on).
+    pub towered: Option<bool>,
 }
 
 /// The one piece of this module that is not the pure model: the mailbox a
@@ -1396,6 +1398,98 @@ impl Replay {
     }
 }
 
+/// The flight as the crew would sum it up: the model's view after the last
+/// tick, published by the monitor for the question "how are we doing?".
+#[derive(Debug, Clone)]
+pub struct Status {
+    pub phase: Phase,
+    pub control: Control,
+    pub abnormal: Abnormal,
+    pub situation: Situation,
+    pub alt_ft: f64,
+    pub ias_kts: f64,
+    pub gs_kts: f64,
+}
+
+impl Flight {
+    /// The summary after the last tick; `None` before the first sample.
+    pub fn status(&self) -> Option<Status> {
+        let s = self.last.as_ref()?;
+        Some(Status {
+            phase: self.phase,
+            control: self.control,
+            abnormal: self.abnormal.clone(),
+            situation: self.situation.clone(),
+            alt_ft: s.alt_ft,
+            ias_kts: s.ias_kts,
+            gs_kts: s.gs_kts,
+        })
+    }
+}
+
+static PUBLISHED: std::sync::Mutex<Option<Status>> = std::sync::Mutex::new(None);
+
+/// The monitor's latest summary, for the command loop.
+pub fn publish(s: Option<Status>) {
+    *PUBLISHED.lock().unwrap_or_else(|e| e.into_inner()) = s;
+}
+
+pub fn published() -> Option<Status> {
+    PUBLISHED.lock().unwrap_or_else(|e| e.into_inner()).clone()
+}
+
+/// "How are we doing?", answered from the flight: where we are, who is
+/// flying, the plan, and whether anything has failed. Pure. The open question
+/// earned silence five times in a row over LILB (2026-09-25).
+pub fn status_line(s: &Status) -> String {
+    let mut out = Vec::new();
+    let mut first = s.phase.spoken().to_string();
+    if let Some(c) = first.get_mut(0..1) {
+        c.make_ascii_uppercase();
+    }
+    if s.phase.airborne() {
+        let alt = (s.alt_ft / 100.0).round() * 100.0;
+        out.push(format!(
+            "{first} through {} feet at {:.0} knots.",
+            crate::flightplan::spoken_feet(alt).trim_end_matches(" feet"),
+            s.ias_kts
+        ));
+    } else if s.gs_kts >= 3.0 {
+        out.push(format!("{first} at {:.0} knots.", s.gs_kts));
+    } else {
+        out.push(format!("{first}."));
+    }
+    let who = match (s.situation.mission, s.control) {
+        (Some(m), _) => Some(format!("{} is flying.", capitalise(m))),
+        (None, Control::Automation(n)) => Some(format!("{} is flying.", capitalise(n))),
+        (None, Control::Autopilot) => Some("The autopilot has it.".to_string()),
+        (None, Control::Pilot) => Some("You're flying.".to_string()),
+        (None, Control::Unknown) => None,
+    };
+    out.extend(who);
+    if let Some(p) = &s.situation.plan {
+        match &s.situation.active_fix {
+            Some(fix) => out.push(format!("{} to {}, next fix {fix}.", p.origin, p.destination)),
+            None => out.push(format!("Plan {} to {}.", p.origin, p.destination)),
+        }
+    }
+    out.push(match &s.abnormal {
+        Abnormal::Normal => "No failures.".to_string(),
+        Abnormal::Failure(f) => format!("Failed: {}.", f.join(", ")),
+        Abnormal::Emergency => "We've declared an emergency.".to_string(),
+        Abnormal::Crashed => "We've crashed.".to_string(),
+    });
+    out.join(" ")
+}
+
+fn capitalise(s: &str) -> String {
+    let mut c = s.chars();
+    match c.next() {
+        Some(f) => f.to_ascii_uppercase().to_string() + c.as_str(),
+        None => String::new(),
+    }
+}
+
 /// Most phases listed in the shadow trail, so a long flight stays readable.
 const SHADOW_TRAIL_MAX: usize = 40;
 /// A ground/air disagreement shorter than this is the model confirming.
@@ -1851,6 +1945,35 @@ mod tests {
             .iter()
             .any(|e| matches!(e, Event::PilotTookOver { .. })));
         assert_eq!(f.memory().pilot_takeovers, 1);
+    }
+
+    #[test]
+    fn how_are_we_doing_is_answered_from_the_flight() {
+        let s = Status {
+            phase: Phase::Climb,
+            control: Control::Automation("hover"),
+            abnormal: Abnormal::Normal,
+            situation: Situation {
+                mission: Some("helicopter route"),
+                plan: Some(PlanFact {
+                    source: "local",
+                    origin: "LILB".into(),
+                    destination: "LIMC".into(),
+                    cruise_alt_ft: 3000.0,
+                }),
+                active_fix: None,
+                ..Situation::default()
+            },
+            alt_ft: 2028.9,
+            ias_kts: 75.8,
+            gs_kts: 74.6,
+        };
+        let line = status_line(&s);
+        assert!(line.starts_with("Climbing through"), "{line}");
+        assert!(line.contains("76 knots"), "{line}");
+        assert!(line.contains("Helicopter route is flying."), "{line}");
+        assert!(line.contains("Plan LILB to LIMC."), "{line}");
+        assert!(line.ends_with("No failures."), "{line}");
     }
 
     /// The replay reads a `crash` record as the flag on the samples after it.

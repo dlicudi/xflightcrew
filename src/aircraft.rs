@@ -1480,6 +1480,14 @@ pub struct TaxiProfile {
     /// are steered exactly this way — a touch of inside brake.
     #[serde(default)]
     pub brake_steer: bool,
+    /// The taxi hold's speed control below idle: the deepest share of the
+    /// BETA range (0..1, of X-Plane's -1..0) the lever may go, before any
+    /// brake is used on a rolling taxi. For a turboprop whose idle is a
+    /// taxi too fast: "Don't ride the brakes in taxi. Ease the throttle into
+    /// beta instead" (Lancair Evolution POH). `None`: the brakes, as before.
+    /// A hypothesis until a blackboxed taxi measures it.
+    #[serde(default)]
+    pub beta_max: Option<f64>,
 }
 
 /// A switch whose only control is a TOGGLE command, paired with the dataref
@@ -1834,6 +1842,14 @@ pub fn publish_nose_free(on: bool) {
 
 pub fn nose_free() -> bool {
     NOSE_FREE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// The live airframe's taxi beta depth (`taxi.beta_max`), when it taxis in
+/// beta.
+pub fn taxi_beta_max() -> Option<f64> {
+    live_profile()
+        .and_then(|p| p.taxi.as_ref().and_then(|t| t.beta_max))
+        .filter(|b| *b > 0.0)
 }
 
 /// Whether an `.acf`'s nose castors with no steering angle at all. Pure.

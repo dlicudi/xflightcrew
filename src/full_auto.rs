@@ -456,7 +456,13 @@ pub(crate) async fn get_zone_clearance(
     voice: &Option<Voice>,
     callsign: &Option<String>,
 ) {
-    if !crate::mode::atc_enabled() || crate::party_line::assigned_squawk().is_some() {
+    // No station in reach (an uncontrolled field): nobody to ask, and the
+    // squawk wait would only burn a minute (every mission that leaves a
+    // field calls this, the helicopter route included).
+    if !crate::mode::atc_enabled()
+        || crate::party_line::assigned_squawk().is_some()
+        || !crate::party_line::station_reaches()
+    {
         return;
     }
     if let Some(khz) = crate::party_line::home_tower_khz() {
@@ -1703,7 +1709,17 @@ async fn fly(xp: XPlaneClient, config: Config, voice: Option<Voice>, tools: SubT
                 Err(why) => why,
             };
             // A runway that is too short stays too short: no second line-up.
-            let hopeless = matches!(why, Some(crate::autotakeoff::NoFit::RunwayTooShort { .. }));
+            // ...and neither does a runway with too little of it AHEAD: the
+            // second attempt is a forward line-up, and at LILB 03
+            // (2026-09-25) it drove 110 m further down from 508 m left to
+            // 398.
+            let hopeless = matches!(
+                why,
+                Some(
+                    crate::autotakeoff::NoFit::RunwayTooShort { .. }
+                        | crate::autotakeoff::NoFit::TooLittleLeft { .. }
+                )
+            );
             if attempt == 1 || hopeless {
                 // Say which gate failed. "I couldn't get us onto the runway"
                 // was said to an A330 on Edinburgh 24's centreline, aligned
@@ -1724,11 +1740,36 @@ async fn fly(xp: XPlaneClient, config: Config, voice: Option<Voice>, tools: SubT
                     ) => true,
                     _ => false,
                 };
+                // Only the MARGIN short: the pilot's to waive, as at the arm.
+                // The arm measures the whole runway and the line-up only the
+                // runway ahead, so this is where a short field is found.
+                let waivable = match (&why, &tools.mission) {
+                    (
+                        Some(NoFit::TooLittleLeft { remaining_m, needed_m, .. }),
+                        Mission::Flight(r) | Mission::Resume(r),
+                    ) => margin_only_short(
+                        *remaining_m,
+                        *needed_m,
+                        crate::aircraft::TAKEOFF_MARGIN_WAIVED.load(SeqCst),
+                    )
+                    .map(|bare| (bare, r.origin_icao.clone(), r.dest_icao.clone())),
+                    _ => None,
+                };
                 let line = match (&why, named) {
-                    (Some(w), true) => format!(
-                        "{} Your aircraft.",
-                        crate::autotakeoff::no_fit_line(w, false).0
-                    ),
+                    (Some(w), true) => match &waivable {
+                        Some((bare, origin, dest)) => {
+                            note_refusal_for(Gate::OriginRunway, origin, dest);
+                            format!(
+                                "{} Without the margin we need {:.0}. If you've checked it yourself, say fly it anyway.",
+                                crate::autotakeoff::no_fit_line(w, false).0,
+                                bare
+                            )
+                        }
+                        None => format!(
+                            "{} Your aircraft.",
+                            crate::autotakeoff::no_fit_line(w, false).0
+                        ),
+                    },
                     _ => "I couldn't get us onto the runway. Your aircraft.".to_string(),
                 };
                 give_up(
@@ -3444,8 +3485,26 @@ pub fn waived_for(fp: &crate::simbrief::FlightPlan) -> Vec<Gate> {
 
 /// A waivable refusal was just said.
 pub fn note_refusal(gate: Gate, fp: &crate::simbrief::FlightPlan) {
-    *lock(&REFUSED) = Some((gate, fp.origin.clone(), fp.destination.clone(), Instant::now()));
+    note_refusal_for(gate, &fp.origin, &fp.destination);
 }
+
+/// [`note_refusal`] from a mission, which carries the plan's two ends.
+pub fn note_refusal_for(gate: Gate, origin: &str, destination: &str) {
+    *lock(&REFUSED) = Some((gate, origin.to_string(), destination.to_string(), Instant::now()));
+}
+
+/// Lined up with too little runway ahead: the unfactored need, metres, when
+/// the runway ahead covers it and only the margin is short (and the margin
+/// is not already waived). `None` = short without the margin too. Pure.
+pub fn margin_only_short(remaining_m: f64, needed_m: f64, waived: bool) -> Option<f64> {
+    if waived {
+        return None;
+    }
+    let bare = (needed_m / crate::aircraft::TAKEOFF_FACTOR).max(LINE_UP_FLOOR_M);
+    (bare < needed_m && remaining_m >= bare).then_some(bare)
+}
+/// The takeoff fit's own floor (`runway_check`'s `takeoff_needed_now_m`).
+const LINE_UP_FLOOR_M: f64 = 500.0;
 
 /// The pilot said "fly it anyway": waive the refusal just said, if one is
 /// inside the window, and return the words that re-arm, with the gate.
@@ -3891,6 +3950,16 @@ mod tests {
             dest_longest_ft: 3280.0,
             service_ceiling_ft: None,
         }
+    }
+
+    /// LILB 03 (2026-09-25): lined up with 508 m ahead, 595 needed with the
+    /// margin, 500 without: the pilot's call. 398 ahead is short either way.
+    #[test]
+    fn a_line_up_short_only_by_the_margin_is_the_pilots_call() {
+        assert_eq!(super::margin_only_short(508.0, 594.8, false), Some(500.0));
+        assert_eq!(super::margin_only_short(398.0, 594.8, false), None);
+        assert_eq!(super::margin_only_short(508.0, 594.8, true), None, "already waived");
+        assert_eq!(super::margin_only_short(450.0, 500.0, false), None, "the floor is no margin");
     }
 
     /// LILB 2026-09-25: a runway the book roll fits but the factored one does

@@ -306,6 +306,10 @@ taxi:
   steer_lead_s: 2.0
   lookahead_s: 9.0
   brake_steer: true
+  # POH: "It idles so high that you might wind up taxiing too fast ... Don't
+  # ride the brakes in taxi. Ease the throttle into beta instead." The taxi
+  # hold slows in beta, at most half of the range, before any brake.
+  beta_max: 0.5
 
 # The takeoff power limit, from the manuals: "For take-off in N844X, you are
 # only allowed to use about HALF power, since more power would over-power the

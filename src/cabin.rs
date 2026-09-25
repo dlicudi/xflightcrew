@@ -60,6 +60,20 @@ pub struct View {
     pub vsi_fpm: f64,
     pub engine_running: bool,
     pub pushing_back: bool,
+    /// The flight model's facts (`flight.rs`), when the monitor has them.
+    /// They outrank the cabin's own reading of one late tick: at Liege the
+    /// first ground sample it saw was the vacate taxi at 26 kt and it read
+    /// the landing as a reposition (2026-09-22).
+    pub flight: Option<FlightFacts>,
+}
+
+/// What the flight model knows that one sample cannot.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct FlightFacts {
+    /// A real touchdown this flight (never an impact), and we are down.
+    pub landed: bool,
+    /// The sim moved the aircraft this tick: the flight is over, silently.
+    pub repositioned: bool,
 }
 
 /// Something the cabin did unasked: blackboxed by name, spoken when it has
@@ -225,6 +239,14 @@ impl Cabin {
     /// the doors are disarmed at the stand. Each once per flight, and never
     /// after the flight deck made the same call itself.
     pub fn watch(&mut self, now: Instant, v: View) -> Option<Initiative> {
+        if v.flight.is_some_and(|f| f.repositioned) {
+            // Moved by the sim: nobody deplanes, nothing is announced. The
+            // new position is judged from the next tick.
+            self.end_flight();
+            self.last_on_ground = v.on_ground;
+            self.seen_ground = v.on_ground;
+            return None;
+        }
         let was_on_ground = std::mem::replace(&mut self.last_on_ground, v.on_ground);
         if v.on_ground {
             self.seen_ground = true;
@@ -246,7 +268,11 @@ impl Cabin {
             // (`landing_done`) has landed whatever speed the tick catches; a
             // reposition mid-cruise has no such gate behind it.
             if self.flown && !was_on_ground {
-                if v.groundspeed_kts > LANDING_ROLL_KTS || self.landing_done {
+                let landed = match v.flight {
+                    Some(f) => f.landed,
+                    None => v.groundspeed_kts > LANDING_ROLL_KTS || self.landing_done,
+                };
+                if landed {
                     self.landed = true;
                 } else {
                     self.end_flight();
@@ -775,7 +801,36 @@ mod tests {
             vsi_fpm: vsi,
             engine_running: engine,
             pushing_back: false,
+            flight: None,
         }
+    }
+
+    /// The model's facts outrank one late tick: a landing it saw is a
+    /// landing whatever speed the cabin's first ground sample shows, and a
+    /// reposition ends the flight without a word.
+    #[test]
+    fn the_flight_models_facts_decide_landing_and_reposition() {
+        let mut c = Cabin::new();
+        let t = t0();
+        let s = Duration::from_secs;
+        let facts = |landed, repositioned| Some(FlightFacts { landed, repositioned });
+        c.watch(t, view(0.0, true, 12.0, 0.0, true));
+        c.watch(t + s(200), view(500.0, false, 160.0, 2000.0, true));
+        c.watch(t + s(900), view(33_000.0, false, 450.0, 0.0, true));
+        // Down, first seen at taxi speed, but the model saw the touchdown.
+        let v = View { flight: facts(true, false), ..view(0.0, true, 12.0, 0.0, true) };
+        c.watch(t + s(2500), v);
+        let v = View { flight: facts(true, false), ..view(0.0, true, 0.0, 0.0, false) };
+        let end = c.watch(t + s(2900), v);
+        assert_eq!(end.map(|i| i.event), Some("deplaning"));
+        // A reposition mid-cruise: silent, and nobody deplanes after it.
+        let mut c = Cabin::new();
+        c.watch(t, view(0.0, true, 12.0, 0.0, true));
+        c.watch(t + s(200), view(5_000.0, false, 160.0, 0.0, true));
+        let v = View { flight: facts(false, true), ..view(0.0, true, 0.0, 0.0, false) };
+        assert!(c.watch(t + s(300), v).is_none());
+        let v = View { flight: facts(false, false), ..view(0.0, true, 0.0, 0.0, false) };
+        assert!(c.watch(t + s(301), v).is_none());
     }
 
     /// An autoland arrival, where the cabin is not called for the whole

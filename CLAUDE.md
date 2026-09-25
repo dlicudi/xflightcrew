@@ -1250,11 +1250,16 @@ wreck (impact or the crash flag) has no phases until it is at rest (the
 S-76's ridge strike at LILO read as a touchdown at +491 fpm, then its slide
 as a takeoff roll and a reject). Live: `fphase` and `crashed` ride the
 `state` record, events are blackboxed `flight`; `xvl debrief` prints the
-shadow against the old estimate (ground/air must agree). **Nothing reads it
-yet.** Next: move the tracker, cabin and rapport onto it and delete
-`estimate_phase`; then a pure "what is owed next" over the whole state,
-shadowed (logged, never acting) before it may act, toward a copilot that
-flies the flight without being asked.
+shadow against the old estimate. It is now READ: it ticks first in the
+monitor, the checks' coarse phase is `monitor::coarse_phase` of it
+(`estimate_phase` is gone), the checklist tracker's flight is the model's,
+the cabin takes its `FlightFacts` (landed, repositioned), and "how are we
+doing?" answers from `flight::status_line`. Rapport still keeps its own
+touchdown bookkeeping (owed). **The duty engine** ([src/duty.rs](src/duty.rs),
+pure) answers "what does the flight owe next" from that state every tick;
+SHADOW ONLY: blackboxed `duty` on change with whether the running
+automation agrees, listed by the debrief. It earns the right to act once
+its logs agree with flights actually flown.
 
 ## Checklist flows: the list at its phase, three flavours
 

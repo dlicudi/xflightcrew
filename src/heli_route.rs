@@ -718,7 +718,15 @@ pub struct Route {
     pub destination: String,
     /// The destination's staffed tower (apt.dat), for the inbound call.
     pub dest_tower_khz: Option<i64>,
+    /// From a hover near the pad: the final and the landing only, flown by
+    /// the same final that put the S-76 1.9 and 6.4 m from its spots. The
+    /// pilot's "not here, land at the airport" at LIME had nothing to call
+    /// (2026-09-25).
+    pub arrive_only: bool,
 }
+
+/// An arrival-only route starts this close to the pad, or not at all.
+pub const ARRIVE_ONLY_MAX_M: f64 = 5_000.0;
 
 /// The FMS's copy of the route (`xcopilot/fms/route`, then a load), so the
 /// GPS and the panel's Route tab show the plan the helicopter is flying: the
@@ -1253,7 +1261,10 @@ async fn fly(
     );
 
     publish_fms(&xp, &route, cruise_alt_ft).await;
-    fms_goto(&xp, &route, 1).await;
+    if !route.arrive_only {
+        fms_goto(&xp, &route, 1).await;
+    }
+    if !route.arrive_only {
     say(
         &voice,
         Priority::Readback,
@@ -1265,6 +1276,7 @@ async fn fly(
             ),
         },
     );
+    }
     let mut phase = Phase::Depart;
     let mut climbing = false;
     let mut cruise_speed = cruise_kts();
@@ -1278,6 +1290,28 @@ async fn fly(
     let mut unheld_since: Option<std::time::Instant> = None;
     let mut last = std::time::Instant::now();
     let mut tick_n = 0u64;
+    if route.arrive_only {
+        // Straight to the final, from where the aircraft is: the hover loop
+        // takes (or keeps) it at its height and speed, aimed at the pad.
+        let goal = Goal::Fly {
+            height_ft: s0.agl_ft,
+            speed_mps: s0.gs,
+            track_deg: bearing((0.0, 0.0), pad),
+        };
+        if hover::ACTIVE.load(Ordering::SeqCst) {
+            hover::retarget(goal);
+        } else {
+            hover::request(base_url.clone(), voice.clone(), collective.clone(), goal);
+        }
+        final_from = Some((s0.agl_ft, s0.gs));
+        phase = Phase::Arrive;
+        crate::blackbox::record(
+            "heli_route",
+            serde_json::json!({ "event": "arrive_only", "to_pad_m": dist((0.0, 0.0), pad), "agl": s0.agl_ft }),
+        );
+        say(&voice, Priority::Readback, "Final for the pad.");
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+    }
     while ACTIVE.load(Ordering::SeqCst) {
         tokio::time::sleep(TICK).await;
         if crate::xplane::sim_frozen(&xp).await {

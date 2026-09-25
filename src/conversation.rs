@@ -24,6 +24,44 @@ pub enum Response {
     Checklist(String),
     /// Refresh the existing crew automation status, without inferring AP state.
     Status,
+    /// "How are we doing?": the flight as the model sees it.
+    FlightStatus,
+}
+
+/// The open "how are we doing" question, whole utterance, less a trailing
+/// address word ("How are we doing, man?", LILB 2026-09-25). CLOSED.
+fn flight_status_question(t: &str) -> bool {
+    let t = ["man", "mate", "buddy", "copilot", "then", "now", "so far"]
+        .iter()
+        .fold(t.to_string(), |t, w| t.strip_suffix(&format!(" {w}")).map(str::to_string).unwrap_or(t));
+    matches!(
+        t.as_str(),
+        "how are we doing"
+            | "how are we"
+            | "how are we looking"
+            | "how are things"
+            | "hows it going"
+            | "hows it looking"
+            | "hows everything"
+            | "hows the flight"
+            | "hows the flight going"
+            | "how is the flight"
+            | "how is the flight going"
+            | "hows the aircraft"
+            | "how is the aircraft"
+            | "hows the plane"
+            | "hows the helicopter"
+            | "status"
+            | "status report"
+            | "status check"
+            | "give me a status"
+            | "give me a status report"
+            | "are we ok"
+            | "are we okay"
+            | "everything ok"
+            | "everything okay"
+            | "all good"
+    )
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -293,6 +331,11 @@ impl Conversation {
             return Some(Response::Say(
                 "Airspeed, groundspeed, or vertical speed?".into(),
             ));
+        }
+        if flight_status_question(t) {
+            self.topic = Some((Evidence::Status, now));
+            self.remember();
+            return Some(Response::FlightStatus);
         }
         if matches!(
             t,
@@ -883,6 +926,13 @@ mod tests {
     #[test]
     fn live_status_does_not_invent_a_wait_reason_or_control_ownership() {
         assert!(status_answer(&[]).contains("doesn't tell me"));
+        let now = Instant::now();
+        for q in ["How are we doing man?", "How are we doing?", "How's the flight going?", "How's the aircraft?"] {
+            let mut c = Conversation::default();
+            assert_eq!(c.respond(q, now), Some(Response::FlightStatus), "{q}");
+        }
+        let mut c = Conversation::default();
+        assert_ne!(c.respond("how are we doing on fuel", now), Some(Response::FlightStatus));
         assert!(
             status_answer(&["full auto: wait for clearance".into()]).contains("wait for clearance")
         );

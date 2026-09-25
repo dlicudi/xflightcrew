@@ -406,18 +406,32 @@ pub fn try_parse(
 /// "Lift to a hover", "hover at fifteen feet", "lift off"; "set it down",
 /// "set us down", "put it down". A height is feet.
 fn hover_call(t: &str) -> Option<ToolCall> {
+    // The destination, never here: "land at the airport", "not here, land at
+    // the airport", "take us to the pad" (LIME 2026-09-25, where the words
+    // earned nothing and the set-down went on).
+    let pad_word = ["airport", "pad", "helipad", "heliport", "destination"]
+        .iter()
+        .any(|w| has(t, w));
+    if pad_word
+        && !t.contains("light")
+        && ["land", "take us to", "fly to", "go to", "fly us to"]
+            .iter()
+            .any(|p| t.contains(p))
+    {
+        return Some(call("hover", json!({ "action": "pad" })));
+    }
     // "Land" on a helicopter is the set-down: autoland is withheld there, and
     // "land the aircraft" / "let's land" went nowhere at the S-76's first
     // hover (2026-09-22). Whole phrases only: "landing light" and "landing
     // gear" are other tools.
+    // "Land the aircraft": the pad when one is in reach, else here (the
+    // tool decides). "Land here", "land now": here.
     let land = t == "land"
         || [
             "land the aircraft",
             "land the helicopter",
             "land it",
             "land us",
-            "land here",
-            "land now",
             "lets land",
             "let's land",
         ]
@@ -426,6 +440,11 @@ fn hover_call(t: &str) -> Option<ToolCall> {
         // Whisper's "land 3 helicopter?" for "land the helicopter" (EDDV,
         // 2026-09-23): a land word and the airframe's name is the request.
         || (t.starts_with("land ") && t.contains("helicopter"));
+    let here = t.contains("land here") || t.contains("land now");
+    if land && !here {
+        return Some(call("hover", json!({ "action": "land" })));
+    }
+    let land = here;
     // "Willis on the ground" is whisper's "put us on the ground".
     let down = land
         || t.contains("willis on the ground")
@@ -2541,6 +2560,18 @@ mod tests {
         // outside the band).
         let c = first("Hover at 0 feet.").expect("zero");
         assert_eq!(c.arguments, json!({ "action": "down" }));
+        // The pad is not here, and "land the aircraft" lets the tool choose.
+        let c = first("Not here, land at the airport.").expect("pad");
+        assert_eq!(c.arguments, json!({ "action": "pad" }));
+        let c = first("take us to the pad").expect("pad");
+        assert_eq!(c.arguments, json!({ "action": "pad" }));
+        let c = first("Let's land the aircraft.").expect("land");
+        assert_eq!(c.arguments, json!({ "action": "land" }));
+        let c = first("land here").expect("here");
+        assert_eq!(c.arguments, json!({ "action": "down" }));
+        let c = first("set it down").expect("down");
+        assert_eq!(c.arguments, json!({ "action": "down" }));
+        assert!(first("landing light on").is_none_or(|c| c.name != "hover"));
         let c = first("Lift to a hover.").expect("hover");
         assert_eq!(
             (c.name.as_str(), c.arguments["action"].as_str()),
@@ -2550,17 +2581,19 @@ mod tests {
         assert_eq!(c.arguments["height_ft"].as_f64(), Some(15.0));
         let c = first("Set it down.").expect("down");
         assert_eq!(c.arguments["action"].as_str(), Some("down"));
-        for w in [
-            "Land the aircraft.",
-            "Let's land.",
-            "land",
-            "Put it on the ground.",
-            "Land 3 helicopter?",
+        // A general "land" lets the tool choose the pad when one is in reach
+        // (LIME 2026-09-25); putting it on the ground is here.
+        for (w, action) in [
+            ("Land the aircraft.", "land"),
+            ("Let's land.", "land"),
+            ("land", "land"),
+            ("Land 3 helicopter?", "land"),
+            ("Put it on the ground.", "down"),
         ] {
             let c = first(w).unwrap_or_else(|| panic!("{w}"));
             assert_eq!(
                 (c.name.as_str(), c.arguments["action"].as_str()),
-                ("hover", Some("down")),
+                ("hover", Some(action)),
                 "{w}"
             );
         }

@@ -284,6 +284,28 @@ fn summarise(flight: &[&Value]) -> String {
         ));
     }
 
+    // --- The duty engine's shadow: what the flight owed, in order, and
+    // where the automation running disagreed.
+    let duties: Vec<String> = flight
+        .iter()
+        .filter(|e| s(e, "kind") == "duty")
+        .map(|e| {
+            let mark = match e.get("agrees").and_then(Value::as_bool) {
+                Some(false) => " (DISAGREED)",
+                _ => "",
+            };
+            format!("{}{mark}", s(e, "duty"))
+        })
+        .collect();
+    if !duties.is_empty() {
+        let disagreed = duties.iter().filter(|d| d.contains("DISAGREED")).count();
+        out.push_str(&format!(
+            "Duty engine (shadow): {} change(s), {disagreed} disagreement(s).\n  {}\n",
+            duties.len(),
+            duties.iter().take(40).cloned().collect::<Vec<_>>().join(" > ")
+        ));
+    }
+
     // --- The flight model's shadow run beside the old phase estimate.
     let shadow = crate::flight::shadow_report(flight);
     if !shadow.is_empty() {

@@ -484,7 +484,7 @@ impl Snapshot {
             .await
             .ok();
 
-        let mut s = Snapshot {
+        let s = Snapshot {
             on_ground,
             groundspeed_kts,
             ias_kts,
@@ -538,29 +538,36 @@ impl Snapshot {
             automation_flying,
             phase: Phase::Ground,
         };
-        s.phase = estimate_phase(&s);
+        // The coarse phase is the flight model's, set by the monitor tick
+        // once the model has seen this snapshot (`coarse_phase`).
         Some(s)
     }
 }
 
-/// Rough flight-phase estimate. Deliberately simple; refined as more checks need
-/// finer distinctions.
-fn estimate_phase(s: &Snapshot) -> Phase {
-    if s.on_ground {
-        // Rolling fast enough to be a takeoff/landing roll vs sitting/taxiing.
-        if s.groundspeed_kts > 35.0 {
-            Phase::Takeoff
-        } else {
-            Phase::Ground
-        }
-    } else if s.vsi_fpm > 300.0 {
-        Phase::Climb
-    } else if s.agl_ft < 1500.0 && s.vsi_fpm < -100.0 {
-        Phase::Landing
-    } else if s.agl_ft < 3000.0 && s.vsi_fpm < -300.0 {
-        Phase::Approach
-    } else {
-        Phase::Cruise
+/// The coarse phase the checks are written against, from the flight
+/// model (`flight.rs`): its memory and sustained edges, where the old
+/// estimate read one snapshot (a gust at cruise height was an approach).
+/// The old boundaries stand: a descent is an approach under 3,000 ft AGL,
+/// an approach a landing under 1,500.
+pub fn coarse_phase(p: crate::flight::Phase, agl_ft: f64) -> Phase {
+    use crate::flight::Phase as F;
+    match p {
+        F::Parked
+        | F::EngineStart
+        | F::Ready
+        | F::Pushback
+        | F::TaxiOut
+        | F::Holding
+        | F::LinedUp
+        | F::TaxiIn => Phase::Ground,
+        F::TakeoffRoll | F::RejectedTakeoff | F::Rollout => Phase::Takeoff,
+        F::InitialClimb | F::Climb | F::GoAround => Phase::Climb,
+        F::Cruise | F::Hover => Phase::Cruise,
+        F::Descent if agl_ft < 3000.0 => Phase::Approach,
+        F::Descent => Phase::Cruise,
+        F::Approach if agl_ft < 1500.0 => Phase::Landing,
+        F::Approach => Phase::Approach,
+        F::Landing => Phase::Landing,
     }
 }
 
@@ -633,6 +640,7 @@ fn situation() -> crate::flight::Situation {
         active_fix: crate::procedure::active_leg().map(|l| l.fix),
         clearance,
         pilot_takeover: crate::flight::pilot_takeover(),
+        towered: Some(crate::mode::atc_enabled() && crate::party_line::station_reaches()),
     }
 }
 
@@ -2119,8 +2127,10 @@ pub async fn run(
     // single noisy sample doesn't read as a sharp washout.
     let mut prev_ias: Option<(f64, Instant)> = None;
     let mut trend = 0.0_f64;
-    // The flight model (`flight::Flight`), shadow-run beside `estimate_phase`.
+    // The flight model (`flight::Flight`): the one state every consumer reads.
     let mut flight = crate::flight::Flight::new();
+    // The duty engine's last answer, logged on change (`duty.rs`).
+    let mut last_duty: Option<crate::duty::Duty> = None;
     // Pushback progress is a sequence of *events*, not a sustained condition, so
     // it's called out on transitions here rather than as Checks.
     let mut prev_attached = false;
@@ -2295,6 +2305,27 @@ pub async fn run(
             crate::station::note_aircraft(snap.lat, snap.lon, snap.on_ground);
             let crashed = voice.crashed();
             let flight_events = flight.tick(&flight_sample(&snap, wall_t, crashed));
+            snap.phase = coarse_phase(flight.phase(), snap.agl_ft);
+            let flight_status = flight.status();
+            // The duty engine, in SHADOW: what the flight owes next, logged
+            // when it changes beside whether the running automation agrees.
+            // It acts on nothing (`duty.rs`).
+            if let Some(st) = &flight_status {
+                let landed = flight.memory().landings > 0;
+                let (d, why) = crate::duty::next(st, landed, wall_t);
+                if last_duty != Some(d) {
+                    last_duty = Some(d);
+                    crate::blackbox::record(
+                        "duty",
+                        serde_json::json!({
+                            "duty": d.name(), "why": why,
+                            "phase": format!("{:?}", st.phase),
+                            "agrees": crate::duty::agrees(d, st.control),
+                        }),
+                    );
+                }
+            }
+            crate::flight::publish(flight_status);
             for ev in &flight_events {
                 crate::blackbox::record("flight", ev.to_json());
             }
@@ -2583,6 +2614,13 @@ pub async fn run(
                                 vsi_fpm: snap.vsi_fpm,
                                 engine_running: snap.engine_running,
                                 pushing_back: snap.pushing_back || snap.tug_attached,
+                                flight: Some(crate::cabin::FlightFacts {
+                                    landed: flight.memory().landings > 0
+                                        && !flight.phase().airborne(),
+                                    repositioned: flight_events.iter().any(|e| {
+                                        matches!(e, crate::flight::Event::Reposition { .. })
+                                    }),
+                                }),
                             },
                         ),
                         snap.seatbelt_sign
@@ -5225,17 +5263,16 @@ mod tests {
     }
 
     #[test]
-    fn phase_estimate_basic() {
-        let mut s = snap(true, true);
-        s.on_ground = true;
-        s.groundspeed_kts = 0.0;
-        assert_eq!(estimate_phase(&s), Phase::Ground);
-        s.groundspeed_kts = 60.0;
-        assert_eq!(estimate_phase(&s), Phase::Takeoff);
-        s.on_ground = false;
-        s.groundspeed_kts = 0.0;
-        s.vsi_fpm = 700.0;
-        assert_eq!(estimate_phase(&s), Phase::Climb);
+    fn the_coarse_phase_is_the_flight_models() {
+        use crate::flight::Phase as F;
+        assert_eq!(coarse_phase(F::TaxiOut, 0.0), Phase::Ground);
+        assert_eq!(coarse_phase(F::TakeoffRoll, 0.0), Phase::Takeoff);
+        assert_eq!(coarse_phase(F::InitialClimb, 400.0), Phase::Climb);
+        assert_eq!(coarse_phase(F::Descent, 9000.0), Phase::Cruise, "high: no approach checks");
+        assert_eq!(coarse_phase(F::Descent, 2500.0), Phase::Approach);
+        assert_eq!(coarse_phase(F::Approach, 2000.0), Phase::Approach);
+        assert_eq!(coarse_phase(F::Approach, 900.0), Phase::Landing);
+        assert_eq!(coarse_phase(F::TaxiIn, 0.0), Phase::Ground);
     }
 }
 
