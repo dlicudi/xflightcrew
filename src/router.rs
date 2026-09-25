@@ -459,6 +459,21 @@ pub(crate) fn release_intent(t: &str) -> bool {
         "im taking",
         "i am taking",
         "taking control",
+        // The pilot taking the aircraft by naming what they will do
+        // (2026-09-25), in both the raw and the apostrophe-stripped form.
+        "i'll taxi",
+        "ill taxi",
+        "i will taxi",
+        "let me taxi",
+        "i'll fly",
+        "ill fly",
+        "i will fly",
+        "let me fly",
+        "i'll take it",
+        "ill take it",
+        "i will take it",
+        "i'll take over",
+        "ill take over",
     ];
     CUES.iter().any(|c| t.contains(c))
 }
@@ -862,6 +877,18 @@ pub(crate) fn looks_like_command(text: &str) -> bool {
         || t.contains("take us to")
         || t.contains("take me to")
         || t.contains("get us to")
+        // "Shut down." at the LIPK stand (2026-09-25) earned the miss tone
+        // from this gate; neither "shut" nor "down" is a keyword.
+        || t.contains("shut down")
+        || t.contains("shutdown")
+        // The hand-over, both ways (2026-09-25): "take over" and "I'll take
+        // it" carried no keyword and were dropped here without a sound.
+        || t.contains("take over")
+        || t.contains("take it")
+        || t.contains("you have it")
+        || t.contains("you fly")
+        || t.contains("your aircraft")
+        || t.contains("your airplane")
     {
         return true;
     }
@@ -1151,6 +1178,28 @@ mod unregistered_tool_tests {
             recall_line(RecallAsk::Interrupted, &cut, None, None),
             Some(("Two. Three. Four.".to_string(), true))
         );
+    }
+
+    /// LIPK stand (2026-09-25): "Shut down." earned the miss tone from the
+    /// domain gate, before the grammar that knows it ever saw it.
+    #[test]
+    fn a_shutdown_is_a_command() {
+        for w in ["Shut down.", "shutdown"] {
+            assert!(looks_like_command(w), "{w}");
+        }
+    }
+
+    /// The hand-over both ways reaches the grammar, and the pilot's side is
+    /// a release while a loop holds anything.
+    #[test]
+    fn the_hand_over_passes_the_gate() {
+        for w in ["Take over.", "Please take over", "I'll take it.", "You have it.", "You fly.", "Your aircraft."] {
+            assert!(looks_like_command(w), "{w}");
+        }
+        for w in ["i'll taxi", "let me fly", "i will take it", "ill take over"] {
+            assert!(release_intent(w), "{w}");
+        }
+        assert!(!release_intent("taxi for me"));
     }
 
     #[test]

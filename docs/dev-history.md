@@ -5990,3 +5990,43 @@ more than 60 degrees brakes like a pivot: inside brake from 1 kt, up to 0.45
 (`pivot_brake_split`). Neither behaviour was changed by the day's other work.
 Also the same afternoon: the talk-down takes a per-path slope and arms at a
 MAP hand-over; the steep MAP autoland is off (`MAP_AUTOLAND`).
+
+## 2026-09-25: LIPE-LIPK in the 172, the approach stood down 10 nm out
+
+Full auto flew LUMA1U to LUMAV and the plan ended there, 51 nm from ESFOK,
+the ILS 30 IF (a correct direct-to, 30 minutes at 95 kt). Two things broke
+it. At the start of that leg the heading bug alternated tick by tick between
+the nose and 25 degrees right of it for 50 s: the aircraft was banked 2 to 5
+degrees LEFT for a right turn, `bug_toward` put the bug on the nose past 3
+degrees and the entry lead back on under 3, and the 172 turned 35 degrees the
+wrong way (why the first left bank came from a lead set wings-level is not
+found; the same lead worked at FI30). That was two `leg_stalled`. Thirty
+minutes later the 141 degree turn onto FI30 was judged "not closing" 45 s in,
+still turning: the third stall, counted across legs, stood the approach down
+at 3,000 ft 5 nm from the FAF. Resume then refused below the 7,500 ft MSA,
+and "land the aircraft" self-picked Cervia 11 over Forli 30 at the same
+6.4 nm with LIPK on the shelf. The pilot hand-flew it into Forli.
+
+Fixed, offline: the stall count is per leg and a leg's first turn is given
+`leg_turn_grace_s` (the turn at 2 degrees a second) before any verdict
+(`Closure::with_grace`); a bug on the nose for a big turn holds until the
+wings are level (1 degree), not 3; the self-pick takes 8 nm off the plan's
+destination (`DESTINATION_BONUS_NM`, blackbox `self_pick.destination`); a
+ground advisor row owing a switch ON waits for a running engine (the taxi
+light was lit before the start and after the shutdown); "Shut down." passes
+the domain gate; "switch off the aircraft" and its shapes are all electrics
+off.
+
+## 2026-09-25: "you have control" was the upset recovery
+
+Asked whether the copilot could take the aircraft by voice, the grammar
+answered for itself: "take the controls", "you have control", "you have the
+aircraft" and "take over" all armed `recover`, the upset recovery (joystick
+overrides, unstall, roll upright, altitude hold), with no ground check, so a
+hand-over on the taxiway would have flown a recovery. "I'll taxi", "let me
+fly", "I'll take it", "you fly" and "your aircraft" parsed to nothing, and
+"take over" did not pass the domain gate at all. Now the hand-over is
+`handover::decide` over the flight model's status, run as the ordinary calls
+the phase needs; the recovery is kept for an actual upset and the distress
+words, and the panel's RECOVER button injects "recover the aircraft". The
+pilot's phrases release like "my controls". Offline only.

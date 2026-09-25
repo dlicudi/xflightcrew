@@ -253,6 +253,14 @@ pub fn note_pilot_takeover(what: &'static str) {
     sim::blackbox::record("intervention", serde_json::json!({ "what": what }));
 }
 
+/// The pilot handed the aircraft TO the crew ("you have control",
+/// `handover::decide`): any standing pilot takeover is over, so the duty
+/// engine stops reading "the pilot has it".
+pub fn note_crew_takeover(why: &'static str) {
+    *PILOT_TAKEOVER.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    sim::blackbox::record("handover", serde_json::json!({ "to": "crew", "why": why }));
+}
+
 pub fn pilot_takeover() -> Option<(f64, &'static str)> {
     *PILOT_TAKEOVER.lock().unwrap_or_else(|e| e.into_inner())
 }

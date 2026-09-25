@@ -29,6 +29,7 @@ mod failures;
 #[allow(dead_code)] // shadow run: the consumers move over next
 mod flight;
 mod duty;
+mod handover;
 mod flight_state;
 mod flightplan;
 mod flow;
@@ -3049,6 +3050,60 @@ async fn run_session(
             continue;
         };
 
+        // "You have control": the crew hand-over, resolved against the flight
+        // model into what the flight needs now (`handover::decide`), then run
+        // as ordinary calls so every gate and readback still applies.
+        let calls = if calls
+            .first()
+            .is_some_and(|c| c.name == grammar::TAKE_OVER)
+        {
+            let (bank, pitch) = tokio::join!(
+                xplane.get_float(datarefs::BANK_DEG),
+                xplane.get_float(datarefs::PITCH_DEG),
+            );
+            let hand_live = handover::Live {
+                upset: matches!((bank, pitch), (Ok(b), Ok(p)) if handover::upset(b, p)),
+                running: monitor::flying_loop(),
+                // The recovery is withheld exactly where a helicopter is.
+                rotorcraft: registry.get("recover").is_none(),
+            };
+            let status = flight::published();
+            let decision = handover::decide(status.as_ref(), &hand_live);
+            let (took, why) = match &decision {
+                handover::Handover::Take { why, .. } => (true, *why),
+                handover::Handover::Decline { why, .. } => (false, *why),
+            };
+            blackbox::record(
+                "handover",
+                serde_json::json!({
+                    "event": "decide", "took": took, "why": why,
+                    "phase": status.as_ref().map(|s| format!("{:?}", s.phase)),
+                    "upset": hand_live.upset, "running": hand_live.running,
+                }),
+            );
+            match decision {
+                handover::Handover::Decline { line, .. } => {
+                    say(&voice, &reporter, ui::LogKind::Readback, &line);
+                    continue;
+                }
+                handover::Handover::Take { calls, lead, why } => {
+                    flight::note_crew_takeover(why);
+                    if let Some(lead) = lead {
+                        say(&voice, &reporter, ui::LogKind::Readback, lead);
+                    }
+                    calls
+                        .into_iter()
+                        .map(|(name, arguments)| tools::ToolCall {
+                            name: name.to_string(),
+                            arguments,
+                        })
+                        .collect()
+                }
+            }
+        } else {
+            calls
+        };
+
         // Readbacks from this utterance's actions, recorded as the assistant
         // turn afterwards so the next command can refer back to what was done.
         let mut turn_readbacks: Vec<String> = Vec::new();
@@ -3059,6 +3114,21 @@ async fn run_session(
         let mut turn_disengage_ap = false;
         let mut turn_inverse: Vec<(String, serde_json::Value)> = Vec::new();
         for mut call in calls {
+            // A hand-over's fallback: only if the calls before it left the
+            // aircraft to nobody (a refused resume).
+            if let Some(args) = call.arguments.as_object_mut() {
+                if args.remove(handover::IF_IDLE).is_some() {
+                    if monitor::flying_loop().is_some() {
+                        continue;
+                    }
+                    say(
+                        &voice,
+                        &reporter,
+                        ui::LogKind::Readback,
+                        "Then I'll hold the level. I have control.",
+                    );
+                }
+            }
             // On aircraft with a procedural power-up, "all electrical on" must run the
             // step-by-step procedure, not set_electrical's one-shot "all" (which would
             // skip the APU start and the callouts). Remap it here so it's caught

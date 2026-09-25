@@ -185,10 +185,24 @@ pub fn best_landing_runway(
     max_nm: f64,
     min_length_m: f64,
 ) -> std::io::Result<Option<Runway>> {
-    best_landing_runway_in_wind(apt_dat, lat, lon, track_deg, max_nm, min_length_m, &|_| {
-        None
-    })
+    best_landing_runway_in_wind(
+        apt_dat,
+        lat,
+        lon,
+        track_deg,
+        max_nm,
+        min_length_m,
+        &|_| None,
+        None,
+    )
 }
+
+/// What landing at the plan's DESTINATION is worth, nm. "Land the aircraft"
+/// with a plan to LIPK on the shelf picked Cervia's 11 over Forli's 30 at the
+/// same six miles (2026-09-25): the self-pick knew nothing of where the
+/// flight was going. A diversion field still wins when the destination is
+/// much further, behind, or downwind.
+pub const DESTINATION_BONUS_NM: f64 = 8.0;
 
 /// The shortest strip the self-pick will take, metres: the airframe's landing
 /// distance with a 1.3 margin, never under the 1,200 m every airframe was
@@ -240,6 +254,7 @@ pub fn best_landing_runway_in_wind(
     max_nm: f64,
     min_length_m: f64,
     wind_at: &dyn Fn(&str) -> Option<(f64, f64)>,
+    destination: Option<&str>,
 ) -> std::io::Result<Option<Runway>> {
     let mut cands = nearby_runways(apt_dat, lat, lon, max_nm)?;
     // Suitability: hard surface and long enough.
@@ -260,7 +275,11 @@ pub fn best_landing_runway_in_wind(
             winds.get(&r.icao).copied().flatten(),
             r.length_m,
             min_length_m,
-        )
+        ) - if destination.is_some_and(|d| d.eq_ignore_ascii_case(r.icao.trim())) {
+            DESTINATION_BONUS_NM
+        } else {
+            0.0
+        }
     };
     let best = cands.iter().min_by(|a, b| {
         score(a)
@@ -278,12 +297,21 @@ fn self_pick(apt_dat: &str, lat: f64, lon: f64, track_deg: f64) -> std::io::Resu
     let min_length_m = self_pick_min_length_m(crate::aircraft::landing_distance_m());
     let root = crate::tools::autoland::xplane_root();
     let wind_at = |icao: &str| crate::weather::surface_wind(&root, icao);
-    let picked =
-        best_landing_runway_in_wind(apt_dat, lat, lon, track_deg, 40.0, min_length_m, &wind_at)?;
+    let destination = crate::simbrief::loaded_plan().map(|p| p.destination);
+    let picked = best_landing_runway_in_wind(
+        apt_dat,
+        lat,
+        lon,
+        track_deg,
+        40.0,
+        min_length_m,
+        &wind_at,
+        destination.as_deref(),
+    )?;
     crate::blackbox::record(
         "autoland",
         serde_json::json!({
-            "event": "self_pick", "min_length_m": min_length_m,
+            "event": "self_pick", "min_length_m": min_length_m, "destination": destination,
             "rwy": picked.as_ref().map(|r| format!("{} {}", r.icao.trim(), r.id)),
             "length_m": picked.as_ref().map(|r| r.length_m),
             "wind": picked.as_ref().and_then(|r| wind_at(r.icao.trim())),
@@ -7212,6 +7240,34 @@ mod tests {
             landing_score(6.0, 5.0, 130.0, None, 1500.0, 1200.0)
                 < landing_score(7.0, 5.0, 130.0, None, 4000.0, 1200.0)
         );
+    }
+
+    /// LIPK (2026-09-25): "land the aircraft" 6.4 nm from both Forli 30 and
+    /// Cervia 11, with LIPE-LIPK on the shelf, went to Cervia. The plan's
+    /// destination is now worth [`DESTINATION_BONUS_NM`].
+    #[test]
+    fn the_self_pick_prefers_the_plans_destination() {
+        let apt = std::env::temp_dir().join(format!("xvl_selfpick_{}.dat", std::process::id()));
+        std::fs::write(
+            &apt,
+            "1     97 0 0 LIPK Forli\n\
+             100 45.00 23 1 0.25 0 3 0  12 44.2001695 12.0562203 0 0 3 3 0 1 30 44.1897225 12.0848141 147 8 3 1 0 0\n\
+             1     18 0 0 LIPC Cervia Pisignano\n\
+             100 45.00 1 701 0.25 0 3 1  11 44.2303638 12.2901111 119 0 3 1 0 0 29 44.2182383 12.3243840 116 0 3 7 0 0\n",
+        )
+        .unwrap();
+        let path = apt.to_str().unwrap();
+        let pick = |dest: Option<&str>| {
+            best_landing_runway_in_wind(path, 44.1447, 12.2021, 8.0, 40.0, 1200.0, &|_| None, dest)
+                .unwrap()
+                .map(|r| format!("{} {}", r.icao.trim(), r.id))
+        };
+        assert_eq!(pick(None).as_deref(), Some("LIPC 11"), "the old pick, no plan");
+        assert_eq!(pick(Some("LIPK")).as_deref(), Some("LIPK 30"));
+        assert_eq!(pick(Some("lipk")).as_deref(), Some("LIPK 30"));
+        // A destination out of range changes nothing.
+        assert_eq!(pick(Some("EGLL")).as_deref(), Some("LIPC 11"));
+        let _ = std::fs::remove_file(&apt);
     }
 
     #[test]

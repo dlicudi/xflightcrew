@@ -320,7 +320,7 @@ pub fn cancel_phrase() -> Option<&'static str> {
 /// LLM. Code 11 (CANCEL) is absent by design: its phrase is context-chosen by
 /// [`cancel_phrase`].
 pub const REQUEST_PHRASES: &[(i64, &str)] = &[
-    (1, "take control"),
+    (1, "recover the aircraft"),
     (2, "land the aircraft"),
     (3, "my controls"),
     (4, "full auto"),

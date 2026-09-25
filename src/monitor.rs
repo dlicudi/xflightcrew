@@ -575,7 +575,7 @@ pub fn coarse_phase(p: crate::flight::Phase, agl_ft: f64) -> Phase {
 /// (full auto flies through autoland, the takeoff, the taxi; it is named
 /// itself only between them, an engine start). A checklist flow is not
 /// flying anything.
-fn flying_loop() -> Option<&'static str> {
+pub(crate) fn flying_loop() -> Option<&'static str> {
     use std::sync::atomic::Ordering::Relaxed;
     [
         (crate::autoland::ACTIVE.load(Relaxed), "autoland"),
@@ -1216,6 +1216,12 @@ impl Check for PhaseExpectation {
     }
     fn eval(&self, s: &Snapshot) -> Option<String> {
         if !self.phases.contains(&s.phase) {
+            return None;
+        }
+        // On the ground a switch is only owed ON with an engine running: the
+        // 172's "taxi light on" row lit the lamp before the start and again
+        // six seconds after the shutdown at the LIPK stand (2026-09-25).
+        if self.expect_on && s.phase == Phase::Ground && !s.engine_running {
             return None;
         }
         let on = (*s.advisor_values.get(self.index)?)? > 0.5;
@@ -4898,6 +4904,29 @@ mod tests {
         // Failed read → silent, never advise off stale air.
         s.advisor_values = vec![None];
         assert!(c.eval(&s).is_none());
+    }
+
+    /// LIPK stand (2026-09-25): "Taxi light on." six seconds after the
+    /// engine was shut down. A ground row wanting a switch ON waits for an
+    /// engine.
+    #[test]
+    fn a_ground_row_is_silent_with_the_engine_off() {
+        let c = PhaseExpectation {
+            id: "advisor_test",
+            index: 0,
+            expect_on: true,
+            phases: vec![Phase::Ground],
+            say: "Taxi light on.".into(),
+            command: Some("sim/lights/taxi_lights_on".into()),
+        };
+        let mut s = snap(false, false);
+        s.phase = Phase::Ground;
+        s.advisor_values = vec![Some(0.0)];
+        assert!(c.eval(&s).is_none(), "parked, engine off");
+        let mut s = snap(true, true);
+        s.phase = Phase::Ground;
+        s.advisor_values = vec![Some(0.0)];
+        assert_eq!(c.eval(&s).as_deref(), Some("Taxi light on."));
     }
 
     #[test]

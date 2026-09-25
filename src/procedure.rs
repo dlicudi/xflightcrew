@@ -719,6 +719,13 @@ pub fn capture_radius_nm(gs_kts: f64, turn_deg: f64) -> f64 {
 /// `None` when either end has no fix to measure between — a to-altitude leg,
 /// an unresolved fix, or the last leg of the route, none of which are turns
 /// this anticipates.
+/// Seconds a leg's first turn is given before the closure watchdog may judge
+/// it: the turn at 2 degrees a second, slower than standard rate because the
+/// bug leads the nose by only 25 degrees until the bank is established.
+pub fn leg_turn_grace_s(turn_deg: f64) -> f64 {
+    turn_deg.abs().min(180.0) / 2.0
+}
+
 pub fn leg_turn_deg(lat: f64, lon: f64, leg: &ProcLeg, next: Option<&ProcLeg>) -> Option<f64> {
     let here = leg.fix.as_ref()?;
     let there = next?.fix.as_ref()?;
@@ -2007,7 +2014,22 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, plan: Pla
         };
         if let Some(d) = dist_nm.filter(|_| !leg_captured(leg, dist_nm, alt_ft, capture_nm)) {
             if closure.as_ref().is_none_or(|(i, _)| *i != idx) {
-                closure = Some((idx, crate::circuit::Closure::new(d * 1852.0, progress_s)));
+                // A new leg is judged on its own: stalls on an earlier leg
+                // that was later flown are not this one's (LIPK 2026-09-25:
+                // two at the start of the 51 nm leg to ESFOK, thirty minutes
+                // later a third on FI30 stood the approach down). And the
+                // turn onto it is given its time before any verdict.
+                if closure.is_some() {
+                    stalls = 0;
+                }
+                let turn = bearing_to_fix(lat, lon, leg)
+                    .map(|b| ((b - psi + 540.0).rem_euclid(360.0) - 180.0).abs())
+                    .unwrap_or(0.0);
+                let grace = leg_turn_grace_s(turn);
+                closure = Some((
+                    idx,
+                    crate::circuit::Closure::with_grace(d * 1852.0, progress_s, grace),
+                ));
             }
             if closure.as_mut().unwrap().1.stalled(d * 1852.0, progress_s) {
                 stalls += 1;

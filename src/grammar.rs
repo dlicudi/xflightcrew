@@ -568,6 +568,9 @@ fn hover_call(t: &str) -> Option<ToolCall> {
     Some(call("hover", args))
 }
 
+/// "You have control": the crew hand-over, resolved in the main loop.
+pub const TAKE_OVER: &str = "take_over";
+
 fn call(name: &str, args: Value) -> ToolCall {
     ToolCall {
         name: name.to_string(),
@@ -2005,6 +2008,28 @@ fn parse_one(t: &str) -> Option<ToolCall> {
         return None;
     }
 
+    // The whole aircraft off, the pilot's last words at the stand ("switch
+    // off the aircraft", LIPK 2026-09-25, a miss; "electrics off" a second
+    // later worked). Before the power-up shapes: "power the aircraft down"
+    // contains "power the aircraft". Exact shapes, so "switch off the
+    // aircraft lights" stays the lights'.
+    if [
+        "switch off the aircraft",
+        "turn off the aircraft",
+        "switch the aircraft off",
+        "turn the aircraft off",
+        "power down the aircraft",
+        "power the aircraft down",
+        "power down",
+    ]
+    .contains(&t.trim_end_matches(['.', '!']))
+    {
+        return Some(call(
+            "set_electrical",
+            json!({ "system": "all", "on": false }),
+        ));
+    }
+
     // "power up" / "powering up" / "bring the electrical up" → bring everything up.
     // No on/off token, so it'd otherwise miss the block below and fall to the LLM.
     // The main loop remaps set_electrical:all to the step-by-step power_up tool on
@@ -2175,6 +2200,9 @@ fn parse_one(t: &str) -> Option<ToolCall> {
     // themselves. "Let me take controls" once engaged a full recovery against
     // the pilot — the exact inversion of what was said.
     let pilot_takes = t.contains("let me")
+        || has(t, "ill")
+        || t.starts_with("i will ")
+        || t.contains(" i will ")
         || t.contains("i take")
         || t.contains("ill take")
         || t.contains("i will take")
@@ -2193,19 +2221,40 @@ fn parse_one(t: &str) -> Option<ToolCall> {
             .iter()
             .any(|sys| has(t, sys));
     // The pilot taking over is a release: autopilot off, recovery dropped.
+    // "I'll taxi", "let me fly", "I'll take it" (2026-09-25): the pilot
+    // taking the aircraft, not asking for anything.
     if pilot_takes
         && (t.contains("control")
             || t.contains("the aircraft")
             || t.contains("the plane")
-            || t.contains("take over"))
+            || t.contains("take over")
+            || t.ends_with("take it")
+            || t.ends_with("taxi")
+            || t.ends_with("fly")
+            || t.ends_with("fly it"))
     {
         return Some(call("autopilot_off", json!({})));
     }
+    // The crew hand-over: the copilot takes the aircraft and does what the
+    // flight needs now (taxi, rejoin the plan, land, hold the level), read
+    // from the flight model. Until 2026-09-25 every one of these armed the
+    // upset RECOVERY, on a calm cruise or on the taxiway alike; an actual
+    // upset still gets it from the hand-over itself.
     if whole_aircraft_takeover
         || t.contains("you have control")
         || t.contains("you have the aircraft")
+        || t.contains("you have the airplane")
         || t.contains("your controls")
-        || has(t, "recover")
+        || t.contains("your aircraft")
+        || t.contains("your airplane")
+        || t == "you have it"
+        || t == "you fly"
+        || t == "you fly it"
+    {
+        return Some(call(TAKE_OVER, json!({})));
+    }
+    // Distress: fly us out of it.
+    if has(t, "recover")
         || has(t, "stabilize")
         || has(t, "stabilise")
         || t.contains("save it")
@@ -2404,6 +2453,11 @@ fn parse_one(t: &str) -> Option<ToolCall> {
 /// is routed to the tool to teach the right one, not swallowed. Unknown tools and
 /// unknown arg keys still fail closed.
 fn valid(c: &ToolCall, registry: &Registry, _profile: &AircraftProfile) -> bool {
+    // Not a tool: the main loop resolves it against the flight model
+    // (`handover::decide`) into the calls the flight needs now.
+    if c.name == TAKE_OVER {
+        return true;
+    }
     let Some(tool) = registry.get(&c.name) else {
         return false;
     };
@@ -3068,6 +3122,21 @@ mod tests {
             one("electrics off").unwrap(),
             ("set_electrical".into(), json!({"system":"all","on":false}))
         );
+        // The whole aircraft, at the stand (LIPK 2026-09-25), and never the
+        // power-up that "power the aircraft" means.
+        for words in [
+            "Switch off the aircraft.",
+            "Turn the aircraft off.",
+            "Power the aircraft down.",
+            "Power down.",
+        ] {
+            assert_eq!(
+                one(words).unwrap(),
+                ("set_electrical".into(), json!({"system":"all","on":false})),
+                "{words}"
+            );
+        }
+        assert_eq!(one("Shut down.").unwrap().0, "stop_engine");
         assert_eq!(
             one("switch off electrical systems").unwrap().1,
             json!({"system":"all","on":false})
@@ -3248,16 +3317,17 @@ mod tests {
         assert_eq!(one("let me take controls").unwrap().0, "autopilot_off");
         assert_eq!(one("ill take control").unwrap().0, "autopilot_off");
         assert_eq!(one("im taking control").unwrap().0, "autopilot_off");
-        // ...while asking the COPILOT to take over still recovers.
-        assert_eq!(one("take control").unwrap().0, "recover");
-        assert_eq!(one("please take over").unwrap().0, "recover");
-        assert_eq!(one("can you take over").unwrap().0, "recover");
+        // ...while asking the COPILOT to take over is the crew hand-over
+        // (resolved against the flight model), no longer the recovery.
+        assert_eq!(one("take control").unwrap().0, TAKE_OVER);
+        assert_eq!(one("please take over").unwrap().0, TAKE_OVER);
+        assert_eq!(one("can you take over").unwrap().0, TAKE_OVER);
         assert_eq!(one("let me take over").unwrap().0, "autopilot_off");
         assert_ne!(
             one("take over the radios").map(|(t, _)| t).as_deref(),
             Some("recover")
         );
-        assert_eq!(one("you have the aircraft").unwrap().0, "recover");
+        assert_eq!(one("you have the aircraft").unwrap().0, TAKE_OVER);
         // Talk-down arm/cancel phrasings, including the live whisper garbles
         // ("top me down", "toadown") and the natural landing-help ask.
         assert_eq!(
@@ -4160,12 +4230,38 @@ mod tests {
 
     #[test]
     fn emergency_recover_and_release_resolve() {
-        // Emergency phrases → recover; calm "level off" stays level_off.
-        assert_eq!(one("take control").unwrap().0, "recover");
+        // Distress phrases → recover; a crew hand-over → take_over (which
+        // recovers only in an actual upset); calm "level off" stays level_off.
         assert_eq!(one("recover the aircraft").unwrap().0, "recover");
         assert_eq!(one("stabilize").unwrap().0, "recover");
-        assert_eq!(one("you have control").unwrap().0, "recover");
         assert_eq!(one("save it").unwrap().0, "recover");
+        assert_eq!(one("help").unwrap().0, "recover");
+        for words in [
+            "take control",
+            "take the controls",
+            "you have control",
+            "your controls",
+            "your aircraft",
+            "you have it",
+            "you fly",
+            "take over",
+        ] {
+            assert_eq!(one(words).unwrap().0, TAKE_OVER, "{words}");
+        }
+        // The pilot taking it: a release, whatever the verb.
+        for words in [
+            "I'll taxi",
+            "I will taxi",
+            "let me taxi",
+            "I'll fly",
+            "let me fly",
+            "I'll take it",
+            "I will take it",
+        ] {
+            assert_eq!(one(words).unwrap().0, "autopilot_off", "{words}");
+        }
+        // "Will you take over?" is the copilot's, not the pilot's.
+        assert_eq!(one("will you take over").unwrap().0, TAKE_OVER);
         assert_eq!(one("level off").unwrap().0, "level_off");
         // Handing it back → autopilot_off (which also aborts an active recovery).
         assert_eq!(one("my controls").unwrap().0, "autopilot_off");

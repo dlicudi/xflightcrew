@@ -950,6 +950,10 @@ const REVERSAL_MIN_DEG: f64 = 10.0;
 /// of its 30 circuit turns (the A330 on 2 of 4), each a 270 right for a 90
 /// left (ETND, 2026-09-23).
 const TURN_ENTRY_LEAD_DEG: f64 = 25.0;
+/// Wings level, for [`bug_toward`]'s roll-out hysteresis.
+const LEVEL_BANK_DEG: f64 = 1.0;
+/// A bug this close to the heading is "on the nose".
+const ON_NOSE_DEG: f64 = 5.0;
 
 /// Step the bug toward `want_mag` (as [`slew_bug`]) unless the aircraft is
 /// banked INTO a turn the other way, in which case hold the bug ON THE NOSE
@@ -973,7 +977,21 @@ pub fn bug_toward(
     max_step: f64,
 ) -> f64 {
     let turn = (want_mag - heading_mag + 540.0).rem_euclid(360.0) - 180.0;
-    let banked_other_way = phi_deg.abs() > TURN_IN_PROGRESS_BANK_DEG
+    // Hysteresis for a big turn: once the bug is on the nose to roll the
+    // wrong-way bank out, it stays there until the wings are LEVEL, not merely
+    // under the in-turn threshold. LIPK (2026-09-25): at 2 to 3 degrees of
+    // left bank the 25 degree right lead went back on, the autopilot kept
+    // turning left, the bank passed 3, the bug went back to the nose, and the
+    // two alternated tick by tick for 50 s while the 172 turned 35 degrees
+    // the wrong way.
+    let on_nose =
+        ((current_bug - heading_mag + 540.0).rem_euclid(360.0) - 180.0).abs() < ON_NOSE_DEG;
+    let reversal_bank = if on_nose && turn.abs() > TURN_ENTRY_LEAD_DEG {
+        LEVEL_BANK_DEG
+    } else {
+        TURN_IN_PROGRESS_BANK_DEG
+    };
+    let banked_other_way = phi_deg.abs() > reversal_bank
         && turn.abs() > REVERSAL_MIN_DEG
         && (turn > 0.0) != (phi_deg > 0.0);
     if banked_other_way {
@@ -1010,6 +1028,18 @@ impl Closure {
         Closure {
             best_m: d_m,
             best_at_s: now_s,
+        }
+    }
+
+    /// A watchdog for a leg that BEGINS with a turn: no verdict for
+    /// `grace_s`, because an aircraft turning to the fix opens the distance
+    /// before it closes it. The follower's leg to FI30 at LIPK started with a
+    /// 141 degree turn, was judged "not closing" 45 s in, still turning, and
+    /// the whole approach stood down 5 nm from the fix (2026-09-25).
+    pub fn with_grace(d_m: f64, now_s: f64, grace_s: f64) -> Self {
+        Closure {
+            best_m: d_m,
+            best_at_s: now_s + grace_s.max(0.0),
         }
     }
 
@@ -3878,6 +3908,26 @@ mod tests {
         assert!((b - 20.0).abs() < 0.01, "25 right of the nose: {b}");
     }
 
+    /// LIPK (2026-09-25), the start of the leg to ESFOK: nose 37, wanted
+    /// 141, banked 2 to 5 degrees LEFT. The bug alternated between the nose
+    /// (bank past 3) and 25 right of it (bank back under 3) every tick for
+    /// 50 s. On the nose, it now stays on the nose until the wings are level.
+    #[test]
+    fn a_wrong_way_bank_is_rolled_out_to_level_before_the_lead() {
+        // Past 3 degrees the other way: the nose.
+        let b = bug_toward(62.0, 141.0, 37.0, -3.8, BUG_SLEW_PER_TICK);
+        assert!((b - 37.0).abs() < 0.01, "{b}");
+        // Rolling out through 2.5: still the nose, not the lead.
+        let b = bug_toward(37.0, 141.0, 36.0, -2.5, BUG_SLEW_PER_TICK);
+        assert!((b - 36.0).abs() < 0.01, "held on the nose at -2.5: {b}");
+        // Level: the lead, the right way.
+        let b = bug_toward(36.0, 141.0, 35.5, -0.6, BUG_SLEW_PER_TICK);
+        assert!((b - 60.5).abs() < 0.01, "25 right of the nose: {b}");
+        // With the lead ON, a wobble under 3 degrees does not snatch it back.
+        let b = bug_toward(60.5, 141.0, 35.5, -2.0, BUG_SLEW_PER_TICK);
+        assert!((b - 60.5).abs() < 0.01, "lead kept: {b}");
+    }
+
     /// The takeoff handed off 1.8 km past the climb-out point; the follower
     /// must join at the first waypoint still ahead, never steer back.
     #[test]
@@ -4073,6 +4123,24 @@ mod tests {
         for t in 1..70 {
             assert!(!c.stalled(2500.0 - 35.0 * t as f64, t as f64));
         }
+    }
+
+    /// LIPK FI30 (2026-09-25): a 141 degree turn onto the leg opened the
+    /// distance for 45 s. With the turn's grace it is not a stall; a leg
+    /// that never closes still is.
+    #[test]
+    fn a_leg_that_begins_with_a_turn_is_given_the_turn() {
+        let mut c = Closure::with_grace(9470.0, 0.0, 70.0);
+        for t in 1..60 {
+            assert!(!c.stalled(9470.0 + 10.0 * t as f64, t as f64), "t={t}");
+        }
+        for t in 60..115 {
+            let d = 10_000.0 - 45.0 * (t - 60) as f64;
+            assert!(!c.stalled(d, t as f64), "closing t={t}");
+        }
+        let mut c = Closure::with_grace(9470.0, 0.0, 70.0);
+        let fired = (1..200).any(|t| c.stalled(9470.0 + 10.0 * t as f64, t as f64));
+        assert!(fired, "a leg that never closes is still caught");
     }
 }
 

@@ -489,7 +489,7 @@ laws battle-test as plain `cargo test`; everything blackboxes to
 `logs/blackbox.jsonl` (kinds: `atc`, `autotaxi`, `autotakeoff`, `pushback`, `checklist`,
 `taxi_guide`, `cockpit_auto`, `full_auto`, `circuit`, `procedure`, `cabin`,
 `instructor`, `loading`, `turbine_start`, `heli_start`, `hover`, `heli_circuit`,
-`heli_route`, `rapport`, `cabin_air`, `api_load`, `plan_audit`). Cross-cutting rules, each learned the hard way (details in
+`heli_route`, `rapport`, `cabin_air`, `api_load`, `plan_audit`, `handover`). Cross-cutting rules, each learned the hard way (details in
 history):
 
 - **A stage that is not moving the aircraft is holding it**: brakes set for
@@ -1325,6 +1325,18 @@ pure) answers "what does the flight owe next" from that state every tick;
 SHADOW ONLY: blackboxed `duty` on change with whether the running
 automation agrees, listed by the debrief. It earns the right to act once
 its logs agree with flights actually flown.
+**The hand-over reads the model** ([src/handover.rs](src/handover.rs),
+2026-09-25, pure): "you have control" / "take over" / "your aircraft" is
+`grammar::TAKE_OVER`, resolved in the main loop from `flight::published()`
+into the calls the phase needs (taxi out, taxi to parking, hold at the hold
+or on the runway, autoland on the approach, resume the plan with
+`level_off` as the `if_idle` fallback, level off with no plan, the hover
+hold), or a spoken decline (parked, on the roll, in the flare, a loop
+already flying). The upset RECOVERY is only for an actual upset (bank past
+45, pitch outside -20..25) or the distress words; every hand-over used to
+arm it. The pilot's side ("I'll taxi", "let me fly", "I'll take it") is the
+release guard. Both directions land in the model (`note_crew_takeover`
+clears the pilot's takeover; blackbox `handover`).
 
 ## Checklist flows: the list at its phase, three flavours
 
