@@ -1883,9 +1883,26 @@ fn parse_one(t: &str) -> Option<ToolCall> {
     // off ("can we set up ILS for runway 28" heard live, twice). "ils" appears
     // in no other command; the number (if any) is the runway. The tool answers
     // honestly when the field has no ILS, which beats a silent miss.
-    if has(t, "ils") {
-        let runway = num.map(|n| n.to_string()).unwrap_or_default();
-        return Some(call("prepare_ils", json!({ "runway": runway })));
+    // "Couple the approach" / "arm the approach" is the explicit ask for the
+    // autopilot to fly it (a pilot hand flying keeps the aircraft through a
+    // plain setup). The side of a parallel is kept: "two four left".
+    let couple = has(t, "couple")
+        || has(t, "coupled")
+        || t.contains("arm the approach")
+        || t.contains("arm approach")
+        || t.contains("approach mode");
+    if has(t, "ils") || (couple && (has(t, "approach") || has(t, "localizer") || has(t, "localiser"))) {
+        let side = if has(t, "left") {
+            "L"
+        } else if has(t, "right") {
+            "R"
+        } else if has(t, "center") || has(t, "centre") {
+            "C"
+        } else {
+            ""
+        };
+        let runway = num.map(|n| format!("{n:02}{side}")).unwrap_or_default();
+        return Some(call("prepare_ils", json!({ "runway": runway, "couple": couple })));
     }
 
     // Talk-down: spoken visual-approach guidance to any runway (the approach a
@@ -3556,12 +3573,22 @@ mod tests {
         // ILS setup, both live phrasings: with a runway and without.
         assert_eq!(
             one("set up ils for runway 28").unwrap(),
-            ("prepare_ils".into(), json!({"runway":"28"}))
+            ("prepare_ils".into(), json!({"runway":"28", "couple": false}))
         );
-        assert_eq!(one("can we set up ils").unwrap().1, json!({"runway":""}));
+        assert_eq!(one("can we set up ils").unwrap().1, json!({"runway":"", "couple": false}));
+        assert_eq!(
+            one("set up the ils runway two four left").unwrap().1,
+            json!({"runway":"24L", "couple": false})
+        );
+        assert_eq!(
+            one("couple the approach").unwrap(),
+            ("prepare_ils".into(), json!({"runway":"", "couple": true}))
+        );
+        assert_eq!(one("arm the approach").unwrap().0, "prepare_ils");
+        assert_eq!(one("couple the ils runway 9").unwrap().1, json!({"runway":"09", "couple": true}));
         assert_eq!(
             one("prepare the ils for runway 10").unwrap().1,
-            json!({"runway":"10"})
+            json!({"runway":"10", "couple": false})
         );
         // AP-coupling phrasings, both missed live before "navigation mode" landed.
         assert_eq!(one("set ap to nav").unwrap().0, "navigate");

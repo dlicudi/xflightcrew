@@ -1245,6 +1245,10 @@ fn parse_phase(name: &str) -> Option<Phase> {
     })
 }
 
+/// Above this the aircraft is climbing, not a level cruise with a descent
+/// ahead or behind it.
+const CLIMBING_FPM: f64 = 300.0;
+
 /// Descent advisor, part 1: top of descent coming up. The anticipatory version
 /// of the "when is TOD" question — the copilot volunteers it while there's
 /// still time to act, instead of answering after being asked. Fires once as
@@ -1259,8 +1263,11 @@ impl Check for TodAhead {
         Severity::Advisory
     }
     fn eval(&self, s: &Snapshot) -> Option<String> {
-        if s.on_ground || s.vsi_fpm.abs() > 500.0 {
-            return None; // only when level — a climb/descent has its own plan
+        // Only when level: a climb or descent has its own plan. A CLIMB is
+        // never announced a top of descent (09-24: "top of descent 11 miles
+        // ahead" three times at 1,000 ft climbing out of a short hop).
+        if s.on_ground || s.vsi_fpm.abs() > 500.0 || s.vsi_fpm > CLIMBING_FPM {
+            return None;
         }
         // A follower flying: ITS point, to ITS altitude (LEJR-LXGB,
         // 2026-09-14: the ring said "past", the hands waited 3 more minutes).
@@ -1271,6 +1278,15 @@ impl Check for TodAhead {
             let to_tod = p.to_tod_nm;
             let alt = crate::auto_status::commas((p.target_ft / 100.0).round() as i64 * 100);
             let mins = (s.groundspeed_kts > 60.0).then(|| to_tod / s.groundspeed_kts * 60.0);
+            // The pilot's altitude holds the follower: the plan's descent,
+            // said once as the plan's, with who holds the level.
+            if let Some(h) = p.held_ft {
+                let held = crate::auto_status::commas((h / 100.0).round() as i64 * 100);
+                return Some(format!(
+                    "The plan starts down to {alt} feet for {}, {to_tod:.0} miles ahead. You've got {held} held, give me an altitude when you want to go down.",
+                    p.fix
+                ));
+            }
             return Some(match mins {
                 Some(m) => format!(
                     "Descent coming up. Top of descent in about {}, {to_tod:.0} miles ahead, down to {alt} feet.",
@@ -1320,14 +1336,19 @@ impl Check for TodPassed {
         Severity::Caution
     }
     fn eval(&self, s: &Snapshot) -> Option<String> {
-        if s.on_ground || s.vsi_fpm < -400.0 {
-            return None; // descending → the message is moot
+        // Descending: moot. Climbing: "still level" is false, and on a short
+        // hop the ring can be behind before the climb ends (09-24: "past the
+        // descent point" at 51 ft AGL, climbing out).
+        if s.on_ground || s.vsi_fpm < -400.0 || s.vsi_fpm > CLIMBING_FPM {
+            return None;
         }
         // A follower flying is judged against ITS OWN point: a miss is the
         // follower a mile past it with the descent still uncommanded, never
         // the plan's ring passing while the hands are correctly waiting.
+        // Nor a level the PILOT is holding it at (`held_ft`): that is a
+        // choice, reminded once by `TodAhead`, not a missed descent.
         if let Some(p) = &s.follower_tod {
-            if p.started || p.to_tod_nm > -1.0 || s.groundspeed_kts < 60.0 {
+            if p.started || p.held_ft.is_some() || p.to_tod_nm > -1.0 || s.groundspeed_kts < 60.0 {
                 return None;
             }
             let height = s.alt_ft - p.target_ft;
@@ -4503,6 +4524,7 @@ mod tests {
                 to_tod_nm: 12.0,
                 target_ft: 20_200.0,
                 started: false,
+                held_ft: None,
             }),
             ..mid_atlantic_737(62_935.0, 34_000.0)
         };
@@ -4719,6 +4741,7 @@ mod tests {
             to_tod_nm,
             target_ft: 3143.0,
             started,
+            held_ft: None,
         };
         // The ring says "past" (38 nm out, ring 42); the follower says 8 to go.
         let mut s = cruise_with_dest(38.0);
@@ -4754,6 +4777,35 @@ mod tests {
             HighOnProfile.eval(&s).is_none(),
             "the follower owns its profile"
         );
+    }
+
+    /// LIME-LIPE, 2026-09-25: "climb to 19,000" held the follower level over
+    /// the plan's descents. One reminder that names who holds the level, and
+    /// no "past the descent point" Caution about a level the pilot chose.
+    /// And no top of descent is ever called in a climb.
+    #[test]
+    fn a_pilot_held_level_is_no_missed_descent_and_a_climb_has_no_tod() {
+        let held = |to_tod_nm: f64| crate::procedure::PlannedTod {
+            fix: "IDREK".into(),
+            dist_nm: to_tod_nm + 3.0,
+            to_tod_nm,
+            target_ft: 18_000.0,
+            started: false,
+            held_ft: Some(19_000.0),
+        };
+        let mut s = cruise_with_dest(38.0);
+        s.follower_tod = Some(held(5.0));
+        let msg = TodAhead.eval(&s).expect("the plan's descent, reminded");
+        assert!(msg.contains("19,000 held") && msg.contains("IDREK"), "{msg}");
+        s.follower_tod = Some(held(-3.0));
+        assert!(TodPassed.eval(&s).is_none(), "the pilot chose the level");
+        // Climbing: neither, ring or follower.
+        let mut s = cruise_with_dest(38.0);
+        s.vsi_fpm = 700.0;
+        assert!(TodPassed.eval(&s).is_none(), "a climb is not 'still level'");
+        let mut s = cruise_with_dest(50.0);
+        s.vsi_fpm = 450.0;
+        assert!(TodAhead.eval(&s).is_none(), "no top of descent in a climb");
     }
 
     /// EGLF-LFPB, 2026-09-22: between the legs that HAVE a descent the

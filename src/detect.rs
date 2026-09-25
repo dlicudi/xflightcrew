@@ -265,7 +265,27 @@ pub(crate) fn spawn_aircraft_detector(
                             // one: the takeoff raises the gear only once the
                             // horn will not sound (SF50, 2026-09-23).
                             let prof = live.get();
-                            if let Some(text) = acf_text(&xp).await {
+                            let acf = acf_text(&xp).await;
+                            // What this airframe's systems ARE: the copilot
+                            // consults the survey before it reaches for a
+                            // facility (the ILS setup first, 2026-09-25).
+                            {
+                                let mut sys = acf
+                                    .as_deref()
+                                    .map(crate::systems::Systems::from_acf)
+                                    .unwrap_or_else(|| crate::systems::Systems { surveyed: true, ..Default::default() });
+                                sys.ap_type = xp
+                                    .get_float(crate::systems::AP_TYPE)
+                                    .await
+                                    .ok()
+                                    .and_then(|c| crate::systems::ApType::from_code(c.round() as i64));
+                                tracing::info!(profile = %id, systems = ?sys, "systems survey");
+                                let mut rec = sys.blackbox();
+                                rec["profile"] = serde_json::json!(id);
+                                blackbox::record("systems", rec);
+                                crate::systems::publish(Some(sys));
+                            }
+                            if let Some(text) = acf {
                                 if prof.retractable_gear && prof.gear_warning.is_none() {
                                     let w = aircraft::gear_warning_from_acf(&text);
                                     tracing::info!(?w, "gear warning envelope from the .acf");

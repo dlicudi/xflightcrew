@@ -165,6 +165,13 @@ pub struct PlannedTod {
     pub target_ft: f64,
     /// True once the follower has commanded the descent.
     pub started: bool,
+    /// The PILOT's altitude is holding the follower above this descent
+    /// (`take_altitude`, sticky by design): the point is the plan's, and the
+    /// hands will not move at it. LIME-LIPE (2026-09-25): "climb to 19,000"
+    /// held the follower level over four of the plan's descents while the
+    /// monitor said "descent coming up" and "past the descent point and
+    /// still level" at each of them, a Caution about a level the pilot chose.
+    pub held_ft: Option<f64>,
 }
 
 static TOD: std::sync::Mutex<Option<PlannedTod>> = std::sync::Mutex::new(None);
@@ -181,6 +188,32 @@ pub fn planned_tod() -> Option<PlannedTod> {
 
 fn publish_tod(tod: Option<PlannedTod>) {
     *TOD.lock().unwrap_or_else(|e| e.into_inner()) = tod;
+}
+
+/// The point to publish when the pilot's altitude (`held`) may be holding
+/// the follower above the plan's descent: the FIRST such descent is published
+/// marked held (the monitor reminds the pilot once, never a "past the descent
+/// point" Caution); later ones under the same held altitude publish nothing.
+/// Pure.
+pub fn held_tod(
+    tod: Option<PlannedTod>,
+    held: Option<f64>,
+    held_leg: &mut Option<(f64, String)>,
+) -> Option<PlannedTod> {
+    let mut t = tod?;
+    let Some(h) = held else {
+        return Some(t);
+    };
+    if let Some((a, f)) = held_leg.as_ref() {
+        if (*a - h).abs() < 1.0 && *f != t.fix {
+            return None;
+        }
+    }
+    if t.to_tod_nm <= 12.0 && held_leg.as_ref().is_none_or(|(a, _)| (*a - h).abs() >= 1.0) {
+        *held_leg = Some((h, t.fix.clone()));
+    }
+    t.held_ft = Some(h);
+    Some(t)
 }
 
 /// The plugin's `xcopilot/fms/goto` mailbox: sequences the LOADED plan to the
@@ -1613,6 +1646,11 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, plan: Pla
 
     let mut said_star_speed: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut star_ceiling_logged: Option<usize> = None;
+    // The one descent a pilot-held altitude is reminded about: (the pilot's
+    // altitude, the fix). The plan's later descents under the same held
+    // altitude are silent; a new altitude from the pilot is a new hold.
+    let mut held_leg: Option<(f64, String)> = None;
+    let on_approach = matches!(end, EndAction::Approach { .. });
     if !arrival_constraints.is_empty() {
         crate::blackbox::record(
             "procedure",
@@ -2100,15 +2138,23 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, plan: Pla
         // The follower's own top of descent, for the advisor and the spoken
         // answer: the same point the law above paces against. `carry` is the
         // leg's constraint (carried across unconstrained fixes).
-        publish_tod(dist_nm.and_then(|d| {
-            descent_point_nm(v.carry, alt_ft, gs_kts, descent_fpm()).map(|tod| PlannedTod {
-                fix: leg.fix_ident.clone(),
-                dist_nm: d,
-                to_tod_nm: d - tod,
-                target_ft: v.carry,
-                started: want_alt < alt_ft - 100.0,
-            })
-        }));
+        // No top of descent on an approach: its descent is the procedure's
+        // platform altitudes and path, and "descent coming up, down to 200
+        // feet" was said four times down the LIPE 12 ILS (2026-09-25).
+        let tod = dist_nm
+            .filter(|_| !on_approach && path.is_none())
+            .and_then(|d| {
+                descent_point_nm(v.carry, alt_ft, gs_kts, descent_fpm()).map(|tod| PlannedTod {
+                    fix: leg.fix_ident.clone(),
+                    dist_nm: d,
+                    to_tod_nm: d - tod,
+                    target_ft: v.carry,
+                    started: want_alt < alt_ft - 100.0,
+                    held_ft: None,
+                })
+            });
+        let pilot_holds = v.pilot && want_alt > v.carry + 100.0;
+        publish_tod(held_tod(tod, pilot_holds.then_some(want_alt), &mut held_leg));
         match v.floored {
             Some(floor) => {
                 if said_floor.is_none_or(|p| floor > p + TERRAIN_RESAY_FT) {
@@ -2753,10 +2799,37 @@ mod tests {
             to_tod_nm: 8.0,
             target_ft: 3_000.0,
             started: false,
+            held_ft: None,
         }));
         assert_eq!(planned_tod(), None);
         publish_tod(None);
     }
+    #[test]
+    fn a_pilot_held_altitude_is_reminded_once_and_never_called_a_missed_descent() {
+        let t = |fix: &str, to: f64| PlannedTod {
+            fix: fix.into(),
+            dist_nm: to + 3.0,
+            to_tod_nm: to,
+            target_ft: 18_000.0,
+            started: false,
+            held_ft: None,
+        };
+        let mut held = None;
+        // No pilot altitude: the plan's point, untouched.
+        assert_eq!(held_tod(Some(t("IDREK", 5.0)), None, &mut held), Some(t("IDREK", 5.0)));
+        // LIME-LIPE: 19,000 held over IDREK, ADOSA, OSTEG, BENUS.
+        let a = held_tod(Some(t("IDREK", 20.0)), Some(19_000.0), &mut held).unwrap();
+        assert_eq!(a.held_ft, Some(19_000.0));
+        assert_eq!(held, None, "not yet in the reminder's window");
+        let a = held_tod(Some(t("IDREK", 5.0)), Some(19_000.0), &mut held).unwrap();
+        assert_eq!(a.held_ft, Some(19_000.0));
+        assert_eq!(held_tod(Some(t("IDREK", -2.0)), Some(19_000.0), &mut held).unwrap().fix, "IDREK");
+        assert_eq!(held_tod(Some(t("ADOSA", 4.0)), Some(19_000.0), &mut held), None, "said once");
+        assert_eq!(held_tod(Some(t("OSTEG", 9.0)), Some(19_000.0), &mut held), None);
+        // A new altitude from the pilot is a new hold.
+        assert!(held_tod(Some(t("BENUS", 6.0)), Some(17_000.0), &mut held).is_some());
+    }
+
     use crate::nav::Fix;
 
     /// The crew's "next waypoint" answer while a procedure flies: distance to

@@ -1,9 +1,22 @@
-//! `prepare_ils` — set up an ILS approach for a runway.
+//! `prepare_ils`: set up an ILS approach the way a pilot monitoring does.
 //!
-//! Resolves "runway 28" to a frequency + course by looking up the nearest
-//! matching ILS in the nav database (see [`crate::nav`]), then tunes NAV1, sets
-//! the course, and arms the autopilot approach mode (localizer + glideslope
-//! capture). The pilot just names the runway.
+//! Rebuilt 2026-09-25 on the systems survey ([`crate::systems`]): the old
+//! tool tuned NAV1, then fired servos-on, APPR and ALT hold blind on every
+//! airframe. APPR is a toggle (a second "set up the ILS" disarmed it), it was
+//! never read back, the course source was never checked, a pilot hand flying
+//! had the autopilot engaged under them, and a bare "set up the ILS" asked
+//! "which runway?" with a landing clearance on the frequency.
+//!
+//! Now: the runway is the pilot's, else the tower's arrival clearance, else
+//! the plan's; NAV1 and the course are tuned and read back
+//! ([`crate::ils::tune`]); the course source goes to NAV1; the chart's
+//! decision altitude is said (and the radio altimeter bug set on transport
+//! avionics); the missed approach altitude is set at glideslope capture; and
+//! APPR is armed from OFF, with the servos already in, inside the
+//! localiser's coverage on an intercept heading, and read back. A pilot
+//! hand flying keeps the aircraft: "couple the approach" is the explicit ask
+//! for the autopilot. The watch ([`crate::ils::SetupWatch`]) calls the
+//! needles alive and the modes captured.
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -11,14 +24,9 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use super::{Tool, ToolCtx, CMD_SERVOS_ON};
+use crate::ils::{self, ArmVerdict};
 use crate::nav;
 
-const NAV1_FREQ: &str = "sim/cockpit2/radios/actuators/nav1_frequency_hz";
-const NAV1_OBS: &str = "sim/cockpit2/radios/actuators/nav1_obs_deg_mag_pilot";
-const CMD_APPROACH: &str = "sim/autopilot/approach";
-const CMD_ALT_HOLD: &str = "sim/autopilot/altitude_hold";
-const ALT_DIAL: &str = "sim/cockpit2/autopilot/altitude_dial_ft";
-const CUR_ALT: &str = "sim/cockpit2/gauges/indicators/altitude_ft_pilot";
 const LAT: &str = "sim/flightmodel/position/latitude";
 const LON: &str = "sim/flightmodel/position/longitude";
 /// Only consider ILS records within this distance. An ILS approach is briefed
@@ -30,13 +38,102 @@ const MAX_NM: f64 = 30.0;
 /// field you're at": a matching runway at a *different*, farther field is then a
 /// mistake (e.g. parked at LXGB, "runway 13" must not tune Málaga 60nm away).
 const AT_FIELD_NM: f64 = 10.0;
+/// The CAT I decision height on the radio altimeter.
+const CAT1_DH_FT: f64 = 200.0;
 
 pub struct PrepareIls;
 
 #[derive(Deserialize)]
 struct Args {
-    /// Runway designator, e.g. "28" or "16L".
+    /// Runway designator, e.g. "28" or "16L"; empty = the flight's runway.
+    #[serde(default)]
     runway: String,
+    /// "Couple the approach": the pilot asks for the autopilot to fly it,
+    /// so the servos go in if they are out.
+    #[serde(default)]
+    couple: bool,
+}
+
+/// Where the runway came from, for the line.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum RunwaySource {
+    Spoken,
+    Clearance,
+    Plan,
+}
+
+/// The runway to set up for, when none was spoken: the tower's arrival
+/// clearance first (it is what we will land on), then the plan's. Pure.
+fn flight_runway(
+    clearance: Option<String>,
+    arrival_clearance: bool,
+    plan_rwy: Option<String>,
+) -> Option<(String, RunwaySource)> {
+    clearance
+        .filter(|_| arrival_clearance)
+        .map(|r| (r, RunwaySource::Clearance))
+        .or_else(|| plan_rwy.map(|r| (r, RunwaySource::Plan)))
+}
+
+/// What the arming part of the line says, from the state read. Pure.
+#[derive(Debug, Clone, PartialEq)]
+enum ArmPlan {
+    /// Already armed or captured: left alone (APPR is a toggle).
+    AlreadyArmed,
+    /// The watcher arms it (now or on the intercept).
+    Arm(ArmVerdict),
+    /// Not armed, and why (said).
+    Not(String),
+}
+
+#[allow(clippy::too_many_arguments)]
+fn arm_plan(
+    on_ground: bool,
+    automation: Option<&'static str>,
+    ap_power: bool,
+    servos: bool,
+    appr_status: Option<f64>,
+    tracks_loc: Option<bool>,
+    verdict: ArmVerdict,
+) -> ArmPlan {
+    if let Some(who) = automation {
+        return ArmPlan::Not(format!(
+            "{who} is flying the approach, tuned for the cross-check."
+        ));
+    }
+    if on_ground {
+        return ArmPlan::Not("Approach mode stays off on the ground.".to_string());
+    }
+    if appr_status.is_some_and(|a| a >= 0.5) {
+        return ArmPlan::AlreadyArmed;
+    }
+    if tracks_loc == Some(false) {
+        return ArmPlan::Not(
+            "This autopilot has no approach mode, the needles are yours.".to_string(),
+        );
+    }
+    if !ap_power {
+        return ArmPlan::Not("The autopilot has no power, fly the needles.".to_string());
+    }
+    if !servos {
+        return ArmPlan::Not("Autopilot's off, so it's yours to fly. I'll call the needles. Say couple the approach if you want it on.".to_string());
+    }
+    match verdict {
+        ArmVerdict::Never(why) => ArmPlan::Not(format!("I won't arm the approach, {why}.")),
+        v => ArmPlan::Arm(v),
+    }
+}
+
+fn automation_flying() -> Option<&'static str> {
+    use std::sync::atomic::Ordering::Relaxed;
+    [
+        (crate::autoland::ACTIVE.load(Relaxed), "Autoland"),
+        (crate::procedure::ACTIVE.load(Relaxed), "The follower"),
+        (crate::circuit::ACTIVE.load(Relaxed), "The circuit"),
+        (crate::full_auto::ACTIVE.load(Relaxed), "Full auto"),
+    ]
+    .into_iter()
+    .find_map(|(on, who)| on.then_some(who))
 }
 
 #[async_trait]
@@ -46,83 +143,326 @@ impl Tool for PrepareIls {
     }
 
     fn description(&self) -> &str {
-        "Prepare an ILS approach for a runway: look up the ILS frequency and \
-         course for the nearest matching runway, tune NAV1, set the course, arm \
-         the autopilot approach mode, and hold the current altitude until the \
-         glideslope captures. Use for 'prepare the ILS for runway 28', 'set up \
-         the ILS runway one six left'."
+        "Set up an ILS approach: the runway spoken, else the tower's arrival \
+         clearance, else the plan's; NAV1 and the course tuned and read back, \
+         the course source on NAV1, minimums, the approach mode armed when the \
+         autopilot is flying and we're on the intercept, the needles called. \
+         'Couple the approach' also engages the autopilot."
     }
 
     fn parameters(&self) -> Value {
         json!({
             "type": "object",
             "properties": {
-                "runway": {"type": "string", "description": "Runway designator, e.g. '28' or '16L'"}
-            },
-            "required": ["runway"]
+                "runway": {"type": "string", "description": "Runway designator, e.g. '28' or '16L'; empty for the flight's runway"},
+                "couple": {"type": "boolean", "description": "Engage the autopilot to fly it"}
+            }
         })
     }
 
     async fn execute(&self, args: &Value, ctx: &ToolCtx<'_>) -> Result<String> {
         let args: Args = serde_json::from_value(args.clone())?;
-        // A bare "set up the ILS" names no runway — ask, don't guess one.
-        if args.runway.trim().is_empty() {
-            return Ok("Which runway? Say, set up the ILS for runway 28.".to_string());
-        }
         let lat = ctx.xplane.get_float(LAT).await?;
         let lon = ctx.xplane.get_float(LON).await?;
+        let plan = crate::simbrief::loaded_plan();
 
-        let ils = match nav::find_ils(&ctx.config.nav_data_path, &args.runway, lat, lon, MAX_NM) {
-            Ok(Some(i)) => i,
-            Ok(None) => {
-                return Ok(format!(
-                    "I can't find an ILS for runway {} nearby.",
-                    args.runway
-                ))
+        // The runway: spoken, else the flight's own.
+        let (runway, source) = if !args.runway.trim().is_empty() {
+            (args.runway.trim().to_uppercase(), RunwaySource::Spoken)
+        } else {
+            let arrival = matches!(
+                crate::party_line::clearance_state(),
+                Some(crate::tower::State::Inbound | crate::tower::State::ClearedToLand)
+            );
+            match flight_runway(
+                crate::party_line::clearance_runway(),
+                arrival,
+                plan.as_ref().and_then(|p| p.procedures.dest_rwy.clone()),
+            ) {
+                Some(r) => r,
+                None => return Ok("Which runway? Say, set up the ILS for runway 28.".to_string()),
             }
-            Err(e) => {
-                tracing::error!("nav lookup failed: {e:#}");
-                return Ok("Navigation data is unavailable.".to_string());
-            }
+        };
+
+        // Where to look: around us, or around the plan's destination when
+        // the runway is the plan's (set up in the cruise, 100 miles out).
+        let dest_pos = plan.as_ref().and_then(|p| {
+            p.waypoints
+                .iter()
+                .rev()
+                .find(|w| w.ident.eq_ignore_ascii_case(&p.destination))
+                .map(|w| (p.destination.clone(), w.lat, w.lon))
+        });
+        let nav_path = ctx.config.nav_data_path.clone();
+        let near = nav::find_ils(&nav_path, &runway, lat, lon, MAX_NM)
+            .ok()
+            .flatten();
+        let at_dest = dest_pos.as_ref().and_then(|(icao, dlat, dlon)| {
+            nav::find_ils(&nav_path, &runway, *dlat, *dlon, 10.0)
+                .ok()
+                .flatten()
+                .filter(|i| i.airport.eq_ignore_ascii_case(icao))
+                .map(|i| (i, *dlat, *dlon))
+        });
+        let found = match source {
+            RunwaySource::Plan => at_dest.or(near.map(|i| (i, lat, lon))),
+            _ => near.map(|i| (i, lat, lon)).or(at_dest),
+        };
+        let Some((ils, slat, slon)) = found else {
+            let whose = match source {
+                RunwaySource::Clearance => " the tower gave us",
+                RunwaySource::Plan => " in the plan",
+                RunwaySource::Spoken => "",
+            };
+            return Ok(format!("I can't find an ILS for runway {runway}{whose}."));
         };
 
         // Airport sanity check: if we're sitting at an ILS-equipped field but the
         // matched runway belongs to a *different*, farther field, that's almost
         // certainly not what the pilot meant — don't silently tune it.
-        if let Ok(Some((near_icao, near_nm))) =
-            nav::nearest_ils_airport(&ctx.config.nav_data_path, lat, lon)
+        if source == RunwaySource::Spoken {
+            if let Ok(Some((near_icao, near_nm))) = nav::nearest_ils_airport(&nav_path, lat, lon) {
+                if near_nm <= AT_FIELD_NM && ils.airport != near_icao {
+                    return Ok(format!(
+                        "{} has no ILS for runway {}. The nearest one is {} runway {}, {:.0} miles away. Say again if that's the one you want.",
+                        near_icao, runway, ils.airport, ils.runway, ils.distance_nm
+                    ));
+                }
+            }
+        }
+
+        // Tune and set the course, read back.
+        if ils::tune(ctx.xplane, &ils.airport, &ils.runway, slat, slon)
+            .await
+            .is_none()
         {
-            if near_nm <= AT_FIELD_NM && ils.airport != near_icao {
-                return Ok(format!(
-                    "{} has no ILS for runway {}. The nearest one is {} runway {}, {:.0} miles away — say again if that's the one you want.",
-                    near_icao, args.runway, ils.airport, ils.runway, ils.distance_nm
+            return Ok(format!(
+                "NAV1 didn't take the ILS for runway {} at {}, {:.2}. Tune it by hand.",
+                ils.runway,
+                ils.airport,
+                ils.freq_mhz()
+            ));
+        }
+        let mut line = format!(
+            "ILS runway {} at {}, {:.2}, course {:03.0}, set.",
+            ils.runway,
+            ils.airport,
+            ils.freq_mhz(),
+            ils.course_mag
+        );
+        if source == RunwaySource::Clearance {
+            line = format!("The runway we're cleared for. {line}");
+        }
+
+        // The course source: the approach mode follows the HSI, and a panel
+        // left on GPS tracks the GPS whatever NAV1 says.
+        let mut source_fixed = None;
+        if let Ok(src) = ctx.xplane.get_float(ils::HSI_SOURCE).await {
+            if src.round() as i64 != 0 {
+                let _ = ctx.xplane.run_command(ils::CMD_HSI_NAV1).await;
+                let now = ctx.xplane.get_float(ils::HSI_SOURCE).await;
+                let ok = now.is_ok_and(|v| v.round() as i64 == 0);
+                source_fixed = Some(ok);
+                line.push_str(if ok {
+                    " Course source to NAV1."
+                } else {
+                    " The course source won't go to NAV1, check it."
+                });
+            }
+        }
+
+        // Minimums from the chart, the missed approach from its legs.
+        let systems = crate::systems::current();
+        let chart = nav::ils_chart(&ctx.config.cifp_dir, &ils.airport, &ils.runway);
+        let mut dh_set = None;
+        if systems.transport_avionics() {
+            let _ = ctx.xplane.set_float(ils::RA_DH, CAT1_DH_FT).await;
+            let ok = ctx
+                .xplane
+                .get_float(ils::RA_DH)
+                .await
+                .is_ok_and(|v| (v - CAT1_DH_FT).abs() < 5.0);
+            dh_set = Some(ok);
+        }
+        match (chart.and_then(|c| c.decision_alt_ft()), dh_set) {
+            (Some(da), Some(true)) => line.push_str(&format!(
+                " Minimums {}, radio altimeter {CAT1_DH_FT:.0}.",
+                crate::answers::with_commas(da)
+            )),
+            (Some(da), _) => {
+                line.push_str(&format!(" Minimums {}.", crate::answers::with_commas(da)))
+            }
+            (None, Some(true)) => line.push_str(&format!(" Radio altimeter {CAT1_DH_FT:.0}.")),
+            _ => {}
+        }
+        let missed = chart.and_then(|c| c.missed_alt_ft);
+
+        // The autopilot: read, never assumed.
+        let (on_ground, ap_power, mut servos, appr, vdef, gs_valid, hdg) = tokio::join!(
+            ctx.xplane.get_float(crate::datarefs::ON_GROUND_ANY),
+            ctx.xplane.get_float(ils::AP_POWER),
+            ctx.xplane.get_float(ils::SERVOS),
+            ctx.xplane.get_float(ils::APPR_STATUS),
+            ctx.xplane.get_float(ils::VDEF),
+            ctx.xplane.get_float(ils::GS_VALID),
+            ctx.xplane.get_float(crate::datarefs::COMPASS_HEADING_DEG),
+        );
+        let on_ground = on_ground.is_ok_and(|v| v > 0.5);
+        // Fail open on power: a sim without the dataref still has an autopilot.
+        let ap_power = ap_power.map_or(true, |v| v > 0.5);
+        let automation = automation_flying();
+        let tracks_loc = systems.ap_type.and_then(|a| a.tracks_localizer());
+        let flies_gs = systems.ap_type.and_then(|a| a.flies_glideslope());
+        let mut engaged = false;
+        if args.couple
+            && automation.is_none()
+            && !on_ground
+            && ap_power
+            && tracks_loc != Some(false)
+            && !servos.as_ref().is_ok_and(|v| *v > 0.5)
+        {
+            let _ = ctx.xplane.run_command(CMD_SERVOS_ON).await;
+            servos = ctx.xplane.get_float(ils::SERVOS).await;
+            engaged = servos.as_ref().is_ok_and(|v| *v > 0.5);
+            line.push_str(if engaged {
+                " Autopilot on."
+            } else {
+                " The autopilot didn't engage."
+            });
+        }
+        let servos = servos.is_ok_and(|v| v > 0.5);
+        let verdict = match hdg {
+            Ok(h) => ils::arm_verdict(lat, lon, h, &ils),
+            Err(_) => ArmVerdict::Wait("I can't read our heading"),
+        };
+        let plan_arm = arm_plan(
+            on_ground,
+            automation,
+            ap_power,
+            servos,
+            appr.as_ref().ok().copied(),
+            tracks_loc,
+            verdict,
+        );
+        let arm_wanted = matches!(plan_arm, ArmPlan::Arm(_));
+        match &plan_arm {
+            ArmPlan::AlreadyArmed => line.push_str(" Approach already armed."),
+            ArmPlan::Arm(ArmVerdict::Now) => line.push_str(" Arming the approach."),
+            ArmPlan::Arm(ArmVerdict::Wait(why)) => line.push_str(&format!(
+                " Approach not armed yet, {why}. I'll arm it on the intercept."
+            )),
+            ArmPlan::Arm(ArmVerdict::Never(_)) => {}
+            ArmPlan::Not(why) => {
+                line.push(' ');
+                line.push_str(why);
+            }
+        }
+        if (arm_wanted || matches!(plan_arm, ArmPlan::AlreadyArmed)) && flies_gs == Some(false) {
+            line.push_str(" This autopilot flies the localiser only, the glideslope is yours.");
+        }
+        if gs_valid.is_ok_and(|v| v > 0.5) && vdef.as_ref().is_ok_and(|v| *v < -1.0) && !on_ground {
+            line.push_str(" We're above the glideslope, it won't capture from above.");
+        }
+        if let (Some(m), true) = (
+            missed,
+            arm_wanted || matches!(plan_arm, ArmPlan::AlreadyArmed),
+        ) {
+            if flies_gs != Some(false) {
+                line.push_str(&format!(
+                    " Missed approach {}, I'll set it at glideslope capture.",
+                    crate::answers::with_commas(m)
                 ));
             }
         }
 
-        ctx.xplane.set_int(NAV1_FREQ, ils.freq_10khz).await?;
-        ctx.xplane.set_float(NAV1_OBS, ils.course_mag).await?;
+        crate::blackbox::record(
+            "ils",
+            json!({
+                "event": "setup", "icao": ils.airport, "rwy": ils.runway, "source": format!("{source:?}"),
+                "freq_mhz": ils.freq_mhz(), "course": ils.course_mag, "source_fixed": source_fixed,
+                "dh_set": dh_set, "da": chart.and_then(|c| c.decision_alt_ft()), "missed": missed,
+                "ap_type": systems.ap_type.map(|a| format!("{a:?}")), "servos": servos, "engaged": engaged,
+                "arm": format!("{plan_arm:?}"), "verdict": format!("{verdict:?}"),
+            }),
+        );
 
-        // Engage the autopilot and arm the approach (localizer + glideslope).
-        ctx.xplane.run_command(CMD_SERVOS_ON).await?;
-        ctx.xplane.run_command(CMD_APPROACH).await?;
+        // The watch, unless an automation owns the approach or we are on
+        // the ground.
+        if automation.is_none() && !on_ground {
+            let armed_now = matches!(plan_arm, ArmPlan::AlreadyArmed);
+            let watch =
+                ils::SetupWatch::new(arm_wanted, armed_now, missed.filter(|_| servos), flies_gs);
+            ils::spawn_setup_watch(
+                ctx.config.xplane_base_url.clone(),
+                ils.clone(),
+                watch,
+                ctx.voice.cloned(),
+            );
+        }
+        Ok(line)
+    }
+}
 
-        // Hold the current altitude level until the glideslope captures — without
-        // a pitch mode the aircraft would climb/descend through the glidepath.
-        // When the glideslope comes alive, it supersedes altitude hold.
-        let alt = ctx.xplane.get_float(CUR_ALT).await?;
-        ctx.xplane.set_float(ALT_DIAL, alt).await?;
-        ctx.xplane.run_command(CMD_ALT_HOLD).await?;
+#[cfg(test)]
+mod prepare_ils_tests {
+    use super::*;
 
-        Ok(format!(
-            "Roger, {} runway {}, {:.0} miles, ILS {:.2}, course {:03.0}, approach armed, holding {:.0} feet.",
-            ils.airport,
-            ils.runway,
-            ils.distance_nm,
-            ils.freq_mhz(),
-            ils.course_mag,
-            alt
-        ))
+    #[test]
+    fn the_flight_names_the_runway_when_the_pilot_does_not() {
+        assert_eq!(
+            flight_runway(Some("09".into()), true, Some("27".into())),
+            Some(("09".into(), RunwaySource::Clearance)),
+            "the landing clearance outranks the plan"
+        );
+        assert_eq!(
+            flight_runway(Some("27".into()), false, Some("24".into())),
+            Some(("24".into(), RunwaySource::Plan)),
+            "a DEPARTURE clearance is not the runway we land on"
+        );
+        assert_eq!(flight_runway(None, false, None), None);
+    }
+
+    #[test]
+    fn approach_mode_is_armed_only_from_off_with_the_autopilot_flying() {
+        let now = ArmVerdict::Now;
+        assert_eq!(
+            arm_plan(false, None, true, true, Some(0.0), Some(true), now),
+            ArmPlan::Arm(now)
+        );
+        assert_eq!(
+            arm_plan(false, None, true, true, Some(1.0), Some(true), now),
+            ArmPlan::AlreadyArmed,
+            "APPR is a toggle: armed is left alone"
+        );
+        assert!(
+            matches!(arm_plan(false, None, true, false, Some(0.0), Some(true), now), ArmPlan::Not(w) if w.contains("yours")),
+            "a pilot hand flying keeps the aircraft"
+        );
+        assert!(matches!(
+            arm_plan(true, None, true, true, Some(0.0), Some(true), now),
+            ArmPlan::Not(_)
+        ));
+        assert!(
+            matches!(arm_plan(false, Some("Autoland"), true, true, Some(0.0), Some(true), now), ArmPlan::Not(w) if w.contains("cross-check"))
+        );
+        assert!(
+            matches!(arm_plan(false, None, true, true, Some(0.0), Some(false), now), ArmPlan::Not(w) if w.contains("no approach mode"))
+        );
+        assert!(
+            matches!(arm_plan(false, None, false, true, Some(0.0), Some(true), now), ArmPlan::Not(w) if w.contains("no power"))
+        );
+        assert!(matches!(
+            arm_plan(
+                false,
+                None,
+                true,
+                true,
+                Some(0.0),
+                None,
+                ArmVerdict::Never("past it")
+            ),
+            ArmPlan::Not(_)
+        ));
     }
 }
 

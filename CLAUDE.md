@@ -1005,6 +1005,28 @@ history):
   runway fix is a landing** (`map_short_of_runway`): LIPE I12 codes its MAP
   on RW12, and a high arrival that never captured the FAF was handed over as
   a "visual segment" 0.8 nm out.
+- **The copilot knows the aircraft's systems before it reaches for one**
+  ([src/systems.rs](src/systems.rs), 2026-09-25): at detection the `.acf`
+  (glass HSI, TCAS, auto pressurisation, APU bleed) and the live
+  `preconfigured_ap_type` (which modes the autopilot HAS: a single-axis
+  KAP 140 flies no glideslope) are surveyed, blackboxed `systems`, reset per
+  swap, and answered for "what autopilot have we got". A survey is a fact to
+  consult, never a licence: a facility is still read back when used.
+  **"Set up the ILS" is a pilot monitoring's setup**
+  ([src/tools/approach.rs](src/tools/approach.rs), [src/ils.rs](src/ils.rs)
+  `SetupWatch`): the runway spoken, else the tower's ARRIVAL clearance, else
+  the plan's (found at the destination, so it can be set up in the cruise);
+  tuned through `ils::tune`; the course source to NAV1; the chart's decision
+  altitude said (threshold + 200) and the radio altimeter bug set on
+  transport avionics; APPR armed only from OFF (a toggle: the old tool
+  disarmed it on a second ask), only with the servos ALREADY in, only inside
+  the localiser's coverage on an intercept (`arm_verdict`), read back within
+  6 s and never retried; the needles called alive and the modes captured;
+  the missed approach altitude set at glideslope capture. A pilot hand
+  flying keeps the aircraft ("couple the approach" is the ask for the
+  autopilot); an automation flying gets a tune for the cross-check only.
+  A localiser row's bearing is `magnetic x 360 + true` (`nav::loc_courses`;
+  the old divide read EGPH 24 as 239.66).
 - **An approach is a straight-in to THIS runway or it is not offered**
   (`nav::straight_in_legs`, LOWI 2026-09-24): a runway fix for the exact
   designator (a grass "26R" never inherits "26"), no RF arc before it, the
@@ -1090,7 +1112,13 @@ history):
   that have a descent the follower publishes no point at all, and the ring
   filled the gap on its own geometry - four calls on one arrival, from two
   geometries, one of them a Caution, over a descent flown correctly leg by
-  leg (EGLF-LFPB 2026-09-22). **And a level the plan handed down is not a
+  leg (EGLF-LFPB 2026-09-22). **Nor over a level the PILOT holds**
+  (`PlannedTod.held_ft`, `procedure::held_tod`): a spoken altitude is sticky
+  and outranks the plan, so its descents are the plan's, reminded ONCE with
+  who holds the level, never "past the descent point" (LIME-LIPE
+  2026-09-25: eight descent calls over a 19,000 ft the pilot had asked
+  for). No top of descent is published on an approach, and none is called
+  in a climb (`CLIMBING_FPM`). **And a level the plan handed down is not a
   level to argue with**: the step-climb advisory is silent while the
   follower has a top of descent published, and a cruise that wanders under
   the autopilot is still a cruise (`CRUISE_WANDER_FPM`; at the old 300 fpm

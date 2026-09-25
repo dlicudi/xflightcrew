@@ -64,6 +64,7 @@ mod settings;
 mod simbrief;
 mod stt;
 mod stt_eval;
+mod systems;
 mod takeoff_config;
 mod taxi_guide;
 mod taxi_in;
@@ -2540,6 +2541,11 @@ async fn run_session(
             }
             if let Some(line) = reference_limits(&profile, &tl) {
                 conversation.reference(&profile.display_name, &line, Instant::now());
+                say(&voice, &reporter, ui::LogKind::Readback, &line);
+                continue;
+            }
+            if systems::is_systems_query(&tl) {
+                let line = systems::current().line();
                 say(&voice, &reporter, ui::LogKind::Readback, &line);
                 continue;
             }

@@ -33,6 +33,9 @@ use crate::aircraft::AircraftProfile;
 /// its airframe, and a selector that is only set when present is the bug.
 pub(crate) fn publish_airframe(p: &AircraftProfile) {
     crate::aircraft::publish_live_profile(p);
+    // The systems survey is the detector's, from the sim; a new airframe
+    // starts knowing nothing about its avionics.
+    crate::systems::publish(None);
     // The .acf's castoring nose is read at detection; a new airframe starts
     // from its profile alone.
     crate::aircraft::publish_nose_castors(false);
@@ -80,6 +83,7 @@ pub(crate) fn stand_down() {
     crate::autoland::abort();
     crate::tools::recover::abort();
     crate::approach_guide::cancel();
+    crate::ils::stop_setup_watch();
     crate::autotakeoff::cancel();
     crate::flow::abort();
     crate::heli_circuit::abort();

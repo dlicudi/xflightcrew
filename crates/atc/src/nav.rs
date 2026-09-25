@@ -16,6 +16,12 @@ use anyhow::{Context, Result};
 pub struct Ils {
     pub freq_10khz: i64,
     pub course_mag: f64,
+    /// The localizer's true course, degrees: the geometry (which side of the
+    /// antenna we are on) is true, the course set on the OBS magnetic.
+    pub course_true: f64,
+    /// The localizer antenna (the FAR end of the runway it serves).
+    pub lat: f64,
+    pub lon: f64,
     pub airport: String,
     pub runway: String,
     pub distance_nm: f64,
@@ -46,7 +52,8 @@ pub fn find_ils(path: &str, runway: &str, lat: f64, lon: f64, max_nm: f64) -> Re
         if f.len() < 11 || f[0] != "4" {
             continue;
         }
-        if runway_number(f[10]) != Some(want) {
+        // "28" matches 28L and 28R (the nearest wins); "28L" only 28L.
+        if runway_number(f[10]) != Some(want) || !runway_matches(f[10], runway) {
             continue;
         }
         let (rlat, rlon) = match (f[1].parse::<f64>(), f[2].parse::<f64>()) {
@@ -58,9 +65,13 @@ pub fn find_ils(path: &str, runway: &str, lat: f64, lon: f64, max_nm: f64) -> Re
             continue;
         }
         if best.as_ref().is_none_or(|b| d < b.distance_nm) {
+            let (course_mag, course_true) = loc_courses(f[6].parse::<f64>().unwrap_or(0.0));
             best = Some(Ils {
                 freq_10khz: f[4].parse().unwrap_or(0),
-                course_mag: (f[6].parse::<f64>().unwrap_or(0.0) / 360.0).rem_euclid(360.0),
+                course_mag,
+                course_true,
+                lat: rlat,
+                lon: rlon,
                 airport: f[8].to_string(),
                 runway: f[10].to_string(),
                 distance_nm: d,
@@ -68,6 +79,63 @@ pub fn find_ils(path: &str, runway: &str, lat: f64, lon: f64, max_nm: f64) -> Re
         }
     }
     Ok(best)
+}
+
+/// A localizer row's bearing field: `magnetic x 360 + true` since XP 11.50
+/// (EGPH 24: 86278.824 = 239 x 360 + 238.824). Dividing the whole field by 360
+/// read 239.66 for a 239 course. Returns (magnetic, true). A plain bearing
+/// (older data, under 360) is both.
+pub fn loc_courses(field: f64) -> (f64, f64) {
+    if field < 360.0 {
+        let c = field.rem_euclid(360.0);
+        return (c, c);
+    }
+    let mag = (field / 360.0).floor().rem_euclid(360.0);
+    let tru = field.rem_euclid(360.0);
+    (mag, tru)
+}
+
+/// What an ILS chart tells a crew beyond the frequency: the threshold (so
+/// the decision altitude, 200 ft above it) and the missed approach altitude.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct IlsChart {
+    pub threshold_ft: Option<f64>,
+    pub missed_alt_ft: Option<f64>,
+}
+
+impl IlsChart {
+    /// The CAT I decision altitude: 200 ft above the threshold.
+    pub fn decision_alt_ft(&self) -> Option<f64> {
+        self.threshold_ft.map(|t| t + 200.0)
+    }
+}
+
+/// The chart figures from one approach's legs: the runway fix's altitude
+/// is the threshold, and the highest altitude on the legs AFTER it is the
+/// missed approach altitude. Pure.
+pub fn ils_chart_from_legs(legs: &[ProcLeg], runway: &str) -> IlsChart {
+    let rw = legs
+        .iter()
+        .position(|l| l.fix_ident.strip_prefix("RW").is_some_and(|r| runway_matches(r, runway)));
+    let threshold_ft = rw.and_then(|i| legs[i].alt1_ft);
+    let missed_alt_ft = rw.and_then(|i| {
+        legs[i + 1..]
+            .iter()
+            .filter_map(|l| l.alt1_ft)
+            .fold(None, |m: Option<f64>, a| Some(m.map_or(a, |m| m.max(a))))
+    });
+    IlsChart { threshold_ft, missed_alt_ft }
+}
+
+/// The ILS chart for `runway` at `icao` from the CIFP: the first ILS
+/// approach ('I' ident) to that runway. `None` without one.
+pub fn ils_chart(cifp_dir: &str, icao: &str, runway: &str) -> Option<IlsChart> {
+    let ident = approach_candidates(cifp_dir, icao, runway)
+        .into_iter()
+        .find(|id| id.starts_with('I'))?;
+    let legs = load_proc_legs(cifp_dir, icao, ProcKind::Appch, &ident, None);
+    let chart = ils_chart_from_legs(&legs, runway);
+    (chart.threshold_ft.is_some() || chart.missed_alt_ft.is_some()).then_some(chart)
 }
 
 /// The airport (ICAO) of the ILS record nearest `(lat, lon)`, with its distance
@@ -134,7 +202,7 @@ pub fn airport_ils(path: &str, icao: &str) -> Result<Vec<AirportIls>> {
             "4" | "5" => out.push(AirportIls {
                 runway: f[10].to_string(),
                 freq_10khz: f[4].parse().unwrap_or(0),
-                course_mag: (f[6].parse::<f64>().unwrap_or(0.0) / 360.0).rem_euclid(360.0),
+                course_mag: loc_courses(f[6].parse::<f64>().unwrap_or(0.0)).0,
                 gs_deg: None,
             }),
             "6" => {
@@ -3540,10 +3608,11 @@ SID:070,5,LEGL1W,RW10,LEGLO,LI,E,A,EE  ,R,010,TF, , , , , ,      ,    ,    ,    
         let mut f = std::fs::File::create(&path).unwrap();
         writeln!(f, "I").unwrap();
         writeln!(f, "1200 Version - test").unwrap();
-        // near (lat 36.71, lon -4.55): freq 10950 -> 109.50, bearing 281.785*360=101442.6
+        // near (lat 36.71, lon -4.55): freq 10950 -> 109.50, bearing field
+        // magnetic x 360 + true: 281 x 360 + 281.9 = 101441.9
         writeln!(
             f,
-            " 4  36.710000000   -4.550000000  100 10950 18 101442.600 ITST LXXX LX 28 ILS-cat-I"
+            " 4  36.710000000   -4.550000000  100 10950 18 101441.900 ITST LXXX LX 28 ILS-cat-I"
         )
         .unwrap();
         // far (KSEA-ish)
@@ -3564,7 +3633,7 @@ SID:070,5,LEGL1W,RW10,LEGLO,LI,E,A,EE  ,R,010,TF, , , , , ,      ,    ,    ,    
             ils.freq_mhz()
         );
         assert!(
-            (ils.course_mag - 281.785).abs() < 0.5,
+            (ils.course_mag - 281.0).abs() < 0.01 && (ils.course_true - 281.9).abs() < 0.01,
             "course {}",
             ils.course_mag
         );
@@ -4850,8 +4919,8 @@ STAR:030,6,ALWYS3,RW28B,ARRTU,K2,P,C,E   , ,   ,TF, , , , , ,      ,    ,    ,  
         let l = ils.iter().find(|i| i.runway == "09L").expect("09L");
         assert_eq!(l.freq_10khz, 11030);
         assert!(
-            (l.course_mag - 31769.709 / 360.0).abs() < 0.01,
-            "{}",
+            (l.course_mag - 88.0).abs() < 0.01,
+            "magnetic 088 (x 360 + true 89.709): {}",
             l.course_mag
         );
         assert_eq!(l.gs_deg, Some(3.0), "row-6 encoding: angle×100000 + course");
@@ -4973,6 +5042,25 @@ APPCH:010,A,I27R,BIG,BIG,EG,D, ,V  C, ,   ,IF, , , , , ,      ,    ,    ,    ,  
         assert_eq!(miss.alt_desc, '+');
         assert_eq!(miss.alt1_ft, Some(3000.0));
         assert_eq!(miss.course_mag, Some(315.0));
+    }
+
+    #[test]
+    fn the_ils_chart_gives_the_threshold_and_the_missed_approach_altitude() {
+        let legs = parse_proc_legs(EGLL_I27R.lines(), ProcKind::Appch, "I27R", None);
+        let c = ils_chart_from_legs(&legs, "27R");
+        assert_eq!(c.threshold_ft, Some(136.0));
+        assert_eq!(c.missed_alt_ft, Some(3000.0), "the CA leg after RW27R");
+        assert_eq!(c.decision_alt_ft(), Some(336.0));
+        // The platform before the runway fix is never the missed approach.
+        assert_eq!(ils_chart_from_legs(&legs[..3], "27R").missed_alt_ft, None);
+    }
+
+    #[test]
+    fn a_localizer_bearing_is_magnetic_times_360_plus_true() {
+        let (m, t) = loc_courses(86278.824);
+        assert_eq!(m, 239.0);
+        assert!((t - 238.824).abs() < 1e-6);
+        assert_eq!(loc_courses(268.0), (268.0, 268.0));
     }
 
     #[test]
