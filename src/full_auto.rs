@@ -670,7 +670,7 @@ async fn wait_enroute_working_the_radio(
                             "challenged": challenged,
                         }),
                     );
-                    call_inbound(xp, ctx, voice, callsign, dkhz, true).await;
+                    call_inbound(xp, ctx, voice, callsign, dkhz, true, None).await;
                 }
             }
         } else if challenged {
@@ -2375,7 +2375,7 @@ async fn fly_route(
         if INBOUND_MADE.load(SeqCst) {
             event("inbound_already_made", json!({ "khz": khz }));
         } else if swapped {
-            call_inbound(xp, ctx, voice, callsign, khz, true).await;
+            call_inbound(xp, ctx, voice, callsign, khz, true, built.rwy_id.as_deref()).await;
         } else {
             // Not yet the destination's frequency: the call would go into
             // the void (LEJR-LXGB, 2026-09-14: made 10 minutes before the
@@ -2552,7 +2552,7 @@ async fn fly_route(
             let swapped = crate::party_line::home_tower_khz() == Some(khz);
             if swapped || challenged {
                 inbound_owed = None;
-                call_inbound(xp, ctx, voice, callsign, khz, swapped).await;
+                call_inbound(xp, ctx, voice, callsign, khz, swapped, built.rwy_id.as_deref()).await;
             }
         }
         if crate::autoland::ACTIVE.load(Relaxed) || !crate::procedure::ACTIVE.load(Relaxed) {
@@ -2612,7 +2612,7 @@ async fn fly_route(
         // Never swapped (a field with no region of its own): the inbound
         // still precedes the final, on whatever tower is listening.
         if let Some(khz) = inbound_owed.take() {
-            call_inbound(xp, ctx, voice, callsign, khz, false).await;
+            call_inbound(xp, ctx, voice, callsign, khz, false, built.rwy_id.as_deref()).await;
         }
         let call = match &landing_rwy {
             Some(rwy) => format!("final runway {}", crate::circuit::spell_runway(&rwy.id)),
@@ -3013,6 +3013,16 @@ struct Arrival {
 /// final report. The swap IS the region handoff: the frequency is already
 /// ours and the readback would be a garbled call to the NEW tower, but a
 /// discrete code still goes back to seven thousand.
+/// The active station's field wind from its METAR, published now: the
+/// tower picks its runway from it, never from the air the aircraft is in.
+fn publish_field_wind() {
+    if let Some((icao, lat, lon)) = crate::station::active_icao() {
+        let wind = crate::weather::surface_wind(&crate::tools::autoland::xplane_root(), &icao);
+        event("field_wind", json!({ "icao": icao, "wind": wind }));
+        crate::station::set_surface_wind(lat, lon, wind);
+    }
+}
+
 async fn call_inbound(
     xp: &XPlaneClient,
     ctx: &ToolCtx<'_>,
@@ -3020,6 +3030,7 @@ async fn call_inbound(
     callsign: &Option<String>,
     khz: i64,
     swapped: bool,
+    runway: Option<&str>,
 ) {
     if let Some(h) = crate::party_line::take_region_handoff() {
         obey_region_handoff(xp, ctx, voice, callsign, h, false).await;
@@ -3040,7 +3051,17 @@ async fn call_inbound(
         let _ = xp.set_float(COM1_FREQ_KHZ, khz as f64).await;
         event("inbound_retune", json!({ "khz": khz, "was": tuned }));
     }
-    crate::circuit::transmit(crate::circuit::radio_call(callsign, "inbound for landing"));
+    // The field's OWN wind before the tower hears us: the station may have
+    // become this field a moment ago, and until the monitor's next feed its
+    // wind is the winds aloft at the aircraft (LIPK 2026-09-25: 053 at 12 at
+    // 5,000 ft against the field's 240 at 4, and "join final runway one two"
+    // to a crew set up for the ILS 30).
+    publish_field_wind();
+    let words = match runway {
+        Some(r) => format!("inbound for landing, runway {}", crate::circuit::spell_runway(r)),
+        None => "inbound for landing".to_string(),
+    };
+    crate::circuit::transmit(crate::circuit::radio_call(callsign, &words));
     INBOUND_MADE.store(true, SeqCst);
     // From here the destination's tower is OURS: the region's service-weighted
     // nearest-field pick may not hand the station to a closer field while we

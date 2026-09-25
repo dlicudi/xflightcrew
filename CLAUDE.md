@@ -1552,6 +1552,13 @@ every rule deterministic and built from a measured fact:
   enforcement). A knob is declared once (render/validate/step/apply/persist);
   precedence is env > saved pref > default, and an env-pinned knob is REFUSED
   on screen with the variable named. Stored forms carry no unit.
+- **Only settings persist** (`prefs.json`, env, the plugin's window
+  geometry); every mission, clearance and pilot-held target is in memory,
+  and a restart mid-flight is recovered by "resume" from the sim. Considered
+  and parked (2026-09-25, super low priority): a narrow `mission.json` (plan,
+  mission kind, held altitude/speed; offered at boot, never applied, dropped
+  if stale). Never a general state dump: persisting process-wide facts is
+  the outlives-its-context bug class across a process boundary.
 
 ## Web API load is a sim cost
 

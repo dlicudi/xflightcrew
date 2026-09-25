@@ -468,6 +468,9 @@ pub fn map_path(leg: &ProcLeg, dist_nm: Option<f64>, gs_kts: f64) -> Option<(f64
 
 /// The first departure minimum still ahead of the aircraft and not yet met:
 /// (leg index of its fix, minimum ft). Legs before `idx` are behind us.
+/// A departure minimum is met this close under it, feet.
+pub const MINIMUM_MET_TOL_FT: f64 = 100.0;
+
 pub fn unmet_minimum(
     minimums: &[crate::nav::ClimbMinimum],
     legs: &[ProcLeg],
@@ -478,7 +481,12 @@ pub fn unmet_minimum(
         minimums
             .iter()
             .find(|m| m.fix.eq_ignore_ascii_case(&leg.fix_ident))
-            .filter(|m| alt_ft < m.min_ft)
+            // Met within the autopilot's own hold: levelled AT the minimum
+            // is meeting it. Compared exactly, a 5,000 ft minimum at a 5,000
+            // ft cruise flipped met/unmet on the altimeter's last foot and
+            // the target with it, 74 to 108 knots and back (LIPE-LIPK,
+            // 2026-09-25).
+            .filter(|m| alt_ft < m.min_ft - MINIMUM_MET_TOL_FT)
             .map(|m| (i, m.min_ft))
     })
 }
@@ -837,6 +845,33 @@ pub fn pilot_altitude() -> Option<f64> {
 
 fn clear_pilot_altitude() {
     *PILOT_ALT.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    *PILOT_SPEED.lock().unwrap_or_else(|e| e.into_inner()) = None;
+}
+
+/// A speed the PILOT asked for while the follower flies, the altitude's twin:
+/// the follower owns the throttle (one writer), so "set speed 110" was refused
+/// with "the approach has the throttle" in an enroute cruise the pilot could
+/// see was slow, and there was no way to change it (LIPE-LIPK, 2026-09-25).
+/// Flown as the plan's cruise speed, still floored, capped by the airframe's
+/// ceiling, 250 below 10,000 and a STAR's limits; cleared with the altitude.
+static PILOT_SPEED: std::sync::Mutex<Option<f64>> = std::sync::Mutex::new(None);
+
+/// Hand the follower a speed. `false` (nothing taken) when no procedure flies.
+pub fn take_speed(kts: f64) -> bool {
+    if !ACTIVE.load(Ordering::Relaxed) {
+        return false;
+    }
+    *PILOT_SPEED.lock().unwrap_or_else(|e| e.into_inner()) = Some(kts);
+    crate::blackbox::record("procedure", serde_json::json!({"event": "pilot_speed", "kts": kts}));
+    true
+}
+
+/// The pilot's speed, if they have given one.
+pub fn pilot_speed() -> Option<f64> {
+    if !ACTIVE.load(Ordering::Relaxed) {
+        return None;
+    }
+    *PILOT_SPEED.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 /// Points along the ground track from `lat`/`lon` on `brg_true`, out to
@@ -1849,6 +1884,8 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, plan: Pla
             // airframe goes up: at cruise speed the SF50 made 375 ft a mile
             // where MOGT3H asks 600 (LOWI, 2026-09-24).
             let planned = if unmet.is_some() && vy_kts > 0.0 { vy_kts } else { planned };
+            // The pilot's speed outranks the plan's, as their altitude does.
+            let planned = pilot_speed().unwrap_or(planned);
             // The STAR's speed limits: slowed in time for each, held after.
             let star_cap = arrival_speed_cap(&legs, &arrival_constraints, idx, lat, lon, ias, gs * MS_TO_KTS);
             let planned = match &star_cap {
@@ -2609,6 +2646,8 @@ mod tests {
         // Past WI505 at 4,500: WI506 is the one ahead and unmet.
         assert_eq!(super::unmet_minimum(&mins, &legs, 1, 4500.0), Some((1, 7850.0)));
         assert_eq!(super::unmet_minimum(&mins, &legs, 1, 8000.0), None, "met");
+        assert_eq!(super::unmet_minimum(&mins, &legs, 1, 7849.0), None, "levelled at it is met");
+        assert_eq!(super::unmet_minimum(&mins, &legs, 1, 7700.0), Some((1, 7850.0)));
         // Behind us is not ahead.
         assert_eq!(super::unmet_minimum(&mins, &legs, 2, 4500.0), None);
         let d = super::distance_to_leg_nm(47.252, 11.269, &legs, 1, 1);

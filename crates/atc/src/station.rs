@@ -8445,6 +8445,14 @@ mod tests {
         let mut st = Station::load(lxgb_apt_file().to_str().unwrap(), "LXGB").expect("LXGB loads");
         st.note_stated_runway("request taxi, runway two seven", tower::Intent::RequestTaxi);
         assert_eq!(st.pick_runway(90.0, 12.0), "09", "a real headwind on the other end wins");
+        // The crew's inbound call names the runway it set up for (LIPK
+        // 2026-09-25: "inbound for landing" alone, then "join final runway
+        // one two" to a crew flying the ILS 30).
+        let inbound = "november one seven two sierra papa, inbound for landing, runway two seven";
+        assert!(matches!(tower::parse_intent(inbound), tower::Intent::RequestLanding { .. }));
+        let mut st = Station::load(lxgb_apt_file().to_str().unwrap(), "LXGB").expect("LXGB loads");
+        st.note_stated_runway(inbound, tower::parse_intent(inbound));
+        assert_eq!(st.pick_runway(0.0, 4.0), "27");
         // And once an arrival is on a runway the pick is frozen, through the
         // go-around's Inbound, whatever the wind does.
         let mut st = Station::load(lxgb_apt_file().to_str().unwrap(), "LXGB").expect("LXGB loads");

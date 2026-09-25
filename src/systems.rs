@@ -143,12 +143,11 @@ impl Systems {
     }
 
     /// Transport-category avionics: the panel has a radio altimeter with a
-    /// decision-height bug worth setting. Any one of the airliner markers.
+    /// decision-height bug worth setting. An airliner autopilot, or TCAS in
+    /// a pressurised cabin: the 172 G1000's `.acf` declares TCAS and radio
+    /// altimeter callouts (LIPE, 2026-09-25) and has no radio altimeter.
     pub fn transport_avionics(&self) -> bool {
-        self.glass_hsi
-            || self.tcas
-            || self.radio_alt_callouts
-            || self.ap_type == Some(ApType::Airliner)
+        self.ap_type == Some(ApType::Airliner) || (self.tcas && self.auto_pressurization)
     }
 
     /// The spoken answer to "what systems / autopilot have we got".
@@ -273,6 +272,13 @@ P acf/_auto_pressurization 0\nP acf/_has_APU_bleed_air 0\nP acf/_has_radio_alt_c
             "a 172 has no radio altimeter to set"
         );
         assert!(!c.tcas && !c.apu_bleed);
+        // The 172 G1000 as flown at LIPE: TCAS and RA callouts declared, no
+        // radio altimeter to set.
+        let mut g = Systems::from_acf(C172);
+        g.tcas = true;
+        g.radio_alt_callouts = true;
+        g.ap_type = Some(ApType::Gfc700);
+        assert!(!g.transport_avionics());
     }
 
     #[test]

@@ -4241,17 +4241,26 @@ fn spoken_minutes(m: f64) -> String {
 /// gate on purpose: an autoland in progress is exactly when the tower's wind
 /// matters.
 fn feed_surface_wind() {
-    static LAST: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
-    {
-        let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
-        if last.is_some_and(|t| t.elapsed().as_secs() < 60) {
-            return;
-        }
-        *last = Some(std::time::Instant::now());
-    }
+    // Once a minute, and AT ONCE when the station changes: the wind held
+    // until then is the last field's, filtered out as not this one's, and
+    // the tower answers from the winds aloft at the aircraft. Forli took the
+    // station two seconds before the inbound call, read 053 at 12 at 5,000
+    // ft over Ferrara, and gave runway 12 against its own 24004KT
+    // (LIPE-LIPK, 2026-09-25).
+    static LAST: std::sync::Mutex<Option<(std::time::Instant, String)>> = std::sync::Mutex::new(None);
     let Some((icao, lat, lon)) = crate::station::active_icao() else {
         return;
     };
+    {
+        let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+        if last
+            .as_ref()
+            .is_some_and(|(t, i)| *i == icao && t.elapsed().as_secs() < 60)
+        {
+            return;
+        }
+        *last = Some((std::time::Instant::now(), icao.clone()));
+    }
     tokio::task::spawn_blocking(move || {
         let wind = crate::weather::surface_wind(&crate::tools::autoland::xplane_root(), &icao);
         crate::station::set_surface_wind(lat, lon, wind);

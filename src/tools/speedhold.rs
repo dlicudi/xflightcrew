@@ -127,6 +127,18 @@ pub static ACTIVE: AtomicBool = AtomicBool::new(false);
 /// True while the governor is actively TAXIING (not a flight hold) — the
 /// parking-brake tool uses this to tell the pilot the throttle is coming to
 /// idle with the brake.
+/// The readback for a speed handed to the follower: the number flown, and
+/// why it is not the one asked when a limit moved it. Pure.
+pub fn follower_speed_line(asked: f64, flown: f64) -> String {
+    if (asked - flown).abs() < 0.5 {
+        format!("{flown:.0} knots, on the flight plan.")
+    } else if flown > asked {
+        format!("{flown:.0} knots, the floor for this aircraft. {asked:.0} is too slow.")
+    } else {
+        format!("{flown:.0} knots, the limit for this aircraft. {asked:.0} is too fast.")
+    }
+}
+
 pub fn taxi_hold_active() -> bool {
     ACTIVE.load(Ordering::Relaxed) && *MODE.lock().unwrap_or_else(|e| e.into_inner()) == Mode::Taxi
 }
@@ -726,11 +738,23 @@ impl Tool for HoldSpeed {
                         .to_string(),
                 );
             }
+            // The follower owns the lever, so a number goes TO it (as a
+            // spoken altitude does), never onto a second governor. It said
+            // "the approach has the throttle" in an enroute cruise and would
+            // not take 110 knots (LIPE-LIPK, 2026-09-25).
             if crate::procedure::ACTIVE.load(Ordering::Relaxed) {
-                return Ok(
-                    "The approach has the throttle. Say cancel the approach if you want the speed."
+                return Ok(match a.knots {
+                    Some(k) => {
+                        let floor = crate::aircraft::speed_floor_kts();
+                        let ceiling = crate::aircraft::speed_ceiling_kts();
+                        let want = crate::aircraft::floored_target(k, floor);
+                        let want = ceiling.map_or(want, |c| want.min(c));
+                        crate::procedure::take_speed(want);
+                        follower_speed_line(k, want)
+                    }
+                    None => "The flight plan has the throttle. Give me a number in knots and I'll fly it."
                         .to_string(),
-                );
+                });
             }
         }
         // Mode by context: a small number on the ground is a taxi; airborne (or
@@ -1387,6 +1411,16 @@ mod tests {
         assert_eq!(airspace_limited(f64::NAN, 255.0), 255.0);
     }
     use super::*;
+
+    /// LIPE-LIPK, 2026-09-25: "set speed to 110 knots" in the cruise was
+    /// refused with "the approach has the throttle". A number goes to the
+    /// follower, and the readback says the number flown and why.
+    #[test]
+    fn a_speed_for_the_follower_is_read_back_as_flown() {
+        assert_eq!(follower_speed_line(110.0, 110.0), "110 knots, on the flight plan.");
+        assert!(follower_speed_line(50.0, 58.0).contains("floor"));
+        assert!(follower_speed_line(200.0, 148.0).contains("too fast"));
+    }
 
     #[test]
     fn brakes_squeeze_on_and_let_go_quickly() {
