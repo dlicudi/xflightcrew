@@ -33,11 +33,16 @@ use crate::aircraft::AircraftProfile;
 /// its airframe, and a selector that is only set when present is the bug.
 pub(crate) fn publish_airframe(p: &AircraftProfile) {
     crate::aircraft::publish_live_profile(p);
+    // The .acf's castoring nose is read at detection; a new airframe starts
+    // from its profile alone.
+    crate::aircraft::publish_nose_castors(false);
+    crate::aircraft::publish_nose_free(false);
     crate::autotakeoff::DEPARTURE_MINIMUMS.store(false, std::sync::atomic::Ordering::SeqCst);
     crate::tools::cabin_air::publish(p.cabin_air.clone());
     crate::tools::radio::publish_mode_knob(p.transponder_mode_knob.clone());
     crate::takeoff_config::publish(p.takeoff_config.clone());
     crate::autotakeoff::publish_climb_out(crate::autotakeoff::ClimbOut::from_profile(p));
+    crate::autotakeoff::publish_takeoff_power(p.takeoff_power.clone());
     crate::autotakeoff::publish_gear_warning(p.gear_warning);
     crate::tools::signs::publish(p.seat_belt_signs.clone(), p.cabin_crew);
     crate::circuit::publish_ap_altitude_capture(p.ap_altitude_capture);

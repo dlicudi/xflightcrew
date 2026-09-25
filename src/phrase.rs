@@ -48,8 +48,10 @@ pub fn word_value(w: &str) -> Option<(i64, bool)> {
         "eighteen" => 18, "nineteen" => 19, "twenty" => 20, "thirty" => 30,
         "forty" => 40, "fifty" => 50, "sixty" => 60, "seventy" => 70,
         "eighty" => 80, "ninety" => 90,
-        "hundred" => return Some((100, true)),
-        "thousand" => return Some((1000, true)),
+        // Whisper pluralises: "Vertical speed 1 thousands" set 1 fpm
+        // (LILB 2026-09-25).
+        "hundred" | "hundreds" => return Some((100, true)),
+        "thousand" | "thousands" => return Some((1000, true)),
         _ => return None,
     };
     Some((n, false))
@@ -68,7 +70,7 @@ fn digit_word(w: &str) -> Option<char> {
 /// Magnitude words mark an *additive* number ("five hundred", "two thousand"),
 /// which we leave for the LLM rather than folding digit-by-digit.
 fn is_magnitude(w: &str) -> bool {
-    matches!(w, "hundred" | "thousand" | "million")
+    matches!(w, "hundred" | "hundreds" | "thousand" | "thousands" | "million")
 }
 
 /// A collapsible digit at `idx`: a single-digit word that is NOT immediately

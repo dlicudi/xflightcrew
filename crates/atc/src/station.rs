@@ -232,6 +232,8 @@ impl Station {
     /// never by `from_airport` itself, so offline sweeps and tests stay
     /// side-effect free.
     pub fn install(&self) {
+        // A new station starts in reach; the next monitor tick judges it.
+        OUT_OF_REACH.store(false, std::sync::atomic::Ordering::Relaxed);
         *ACTIVE_FIELD.lock().unwrap_or_else(|e| e.into_inner()) = self
             .apt
             .position()
@@ -315,6 +317,8 @@ impl Station {
         *SURFACE_WIND.lock().unwrap_or_else(|e| e.into_inner()) = None;
         *ACTIVE_FIELD.lock().unwrap_or_else(|e| e.into_inner()) = None;
         *CONTROLLER_FREQS.lock().unwrap_or_else(|e| e.into_inner()) = Vec::new();
+        OUT_OF_REACH.store(false, std::sync::atomic::Ordering::Relaxed);
+        *SELF_TAXI.lock().unwrap_or_else(|e| e.into_inner()) = None;
         *ACTIVE_PANEL.lock().unwrap_or_else(|e| e.into_inner()) = None;
         *ACTIVE_RUNWAYS.lock().unwrap_or_else(|e| e.into_inner()) = Vec::new();
         *ATIS.lock().unwrap_or_else(|e| e.into_inner()) = None;
@@ -579,6 +583,12 @@ impl Station {
     /// Which service COM1 is tuned to. 8.33 channel names can sit 5 kHz off
     /// the carrier; adjacent channels are 8 kHz apart, so 5 can't cross.
     async fn tuned_service(&self, xp: SimView<'_>) -> Option<Service> {
+        // A field beyond reach hears nothing, whatever is tuned: Gibraltar
+        // cleared a 172 parked at LILB, 1,000 nm away, and handed it a taxi
+        // route to its own runway 09 (2026-09-25).
+        if out_of_reach() {
+            return None;
+        }
         let com1 = xp.get_float(datarefs::COM1_FREQ_KHZ).await.ok()?.round() as i64;
         if (com1 - self.tower_khz).abs() <= 5 {
             return Some(Service::Tower);
@@ -657,6 +667,7 @@ impl Station {
                     lead_on: r.lead_on.clone(),
                 });
             *TAXI_TO_STAND.lock().unwrap_or_else(|e| e.into_inner()) = false;
+            *SELF_TAXI.lock().unwrap_or_else(|e| e.into_inner()) = None;
         }
         // The arrival taxi-in publishes its stand route the same way, so the
         // crew's auto_taxi drives it to parking. `was` is the pre-transition
@@ -1720,6 +1731,9 @@ pub fn compliance_tick(
     tuned: bool,
     now: Instant,
 ) -> Option<ComplianceCall> {
+    if out_of_reach() {
+        return None;
+    }
     let (field_lat, field_lon) = {
         let f = ACTIVE_FIELD.lock().unwrap_or_else(|e| e.into_inner());
         let (_, la, lo) = f.as_ref()?;
@@ -2155,6 +2169,9 @@ pub fn atis_retune(com1_khz: i64, lat: f64, lon: f64, alt_msl_ft: f64) {
 /// Cuts a new edition — advancing the letter — when the weather has genuinely
 /// moved (see `atis::new_edition`).
 pub fn atis_tick(com1_khz: i64, wx: &AtisWx, now: Instant) -> Option<String> {
+    if out_of_reach() {
+        return None;
+    }
     let mut guard = ATIS.lock().unwrap_or_else(|e| e.into_inner());
     let st = guard.as_mut()?;
     if (com1_khz - st.khz).abs() > 5 {
@@ -2677,6 +2694,224 @@ pub fn active_station_in_range(
 /// the monitor each tick. `None` = no active station installed; ground
 /// distance, not slant (the altitude term is noise at the ranges where
 /// quality changes).
+/// On the ground this far from the station's field, the station is out of
+/// reach: a tower clears the aircraft on its own field, not one ten miles
+/// away (the ground's line of sight is 8.7 nm, `vhf_range_nm(0.0)`).
+/// Airborne the station keeps the flight ("enroute over nowhere keeps the
+/// last controller", [`SWITCH_MAX_NM`]).
+pub const GROUND_REACH_NM: f64 = 10.0;
+
+/// The active station cannot hear or be heard: set per monitor tick by
+/// [`note_aircraft`] from the aircraft's position.
+static OUT_OF_REACH: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub(crate) fn out_of_reach() -> bool {
+    OUT_OF_REACH.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// The world's view of where the aircraft is, once per monitor tick. On the
+/// ground beyond [`GROUND_REACH_NM`] of the station's field the station goes
+/// silent, and what it had issued is retired: a clearance from a field we
+/// are not at is nobody's (the crew then departs as from an uncontrolled
+/// field). A route the crew planned for itself is left alone.
+pub fn note_aircraft(lat: f64, lon: f64, on_ground: bool) {
+    use std::sync::atomic::Ordering::Relaxed;
+    // The crew's own route and runway end at the liftoff: a departure's
+    // runway must never read as a cleared one at the destination (autoland
+    // takes the cleared runway).
+    if !on_ground {
+        let mut own = SELF_TAXI.lock().unwrap_or_else(|e| e.into_inner());
+        if own.take().is_some() {
+            *TAXI_ROUTE.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        }
+    }
+    let far = on_ground
+        && active_station_range_nm(lat, lon).is_some_and(|d| d > GROUND_REACH_NM);
+    let was = OUT_OF_REACH.swap(far, Relaxed);
+    if far && !was {
+        let station = ACTIVE_FIELD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .map(|f| f.0.clone());
+        tracing::info!(?station, "ATC station out of reach on the ground: standing it down here");
+        sim::blackbox::record("atc", serde_json::json!({ "route": "reach", "station": station, "out": true }));
+        *CLEARANCE.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        *ASSIGNED_SQUAWK.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        *TAKEOFF_HOLD.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        *LINE_UP_CONDITION.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        if SELF_TAXI.lock().unwrap_or_else(|e| e.into_inner()).is_none() {
+            *TAXI_ROUTE.lock().unwrap_or_else(|e| e.into_inner()) = None;
+            *TAXI_TO_STAND.lock().unwrap_or_else(|e| e.into_inner()) = false;
+        }
+    } else if was && !far {
+        sim::blackbox::record("atc", serde_json::json!({ "route": "reach", "out": false }));
+    }
+}
+
+/// A planned runway is kept for an uncontrolled departure unless the wind
+/// puts more than this on its tail.
+pub const SELF_TAXI_TAILWIND_KTS: f64 = 5.0;
+
+/// The field the aircraft is on: the nearest by pavement within
+/// [`AT_FIELD_NM`], any field (not only towered ones). A full apt.dat pass.
+fn field_at(apt_path: &str, lat: f64, lon: f64) -> Option<(String, nav::AirportInfo)> {
+    let mut best: Option<(f64, String, nav::AirportInfo)> = None;
+    let _ = nav::scan_airports(apt_path, |icao, apt| {
+        let Some(d) = apt.ground_distance_nm(lat, lon) else {
+            return;
+        };
+        if d <= AT_FIELD_NM && best.as_ref().is_none_or(|(b, ..)| d < *b) {
+            best = Some((d, icao.to_string(), apt));
+        }
+    });
+    best.map(|(_, icao, apt)| (icao, apt))
+}
+
+/// The published [`TAXI_ROUTE`] is the crew's own (an uncontrolled field),
+/// not a controller's, to this runway end. Cleared by any controller's
+/// route. It stands where a controller's cleared runway would for the
+/// line-up: with none, the line-up took the nearest end and lined the
+/// Evolution up on LILB 21 for a route planned to 03 (2026-09-25).
+static SELF_TAXI: Mutex<Option<String>> = Mutex::new(None);
+
+/// The runway of the crew's own route, when there is one.
+pub(crate) fn self_taxi_runway() -> Option<String> {
+    SELF_TAXI.lock().unwrap_or_else(|e| e.into_inner()).clone()
+}
+
+/// A name a pilot could say: a taxiway designator ("A", "B2", "TL").
+/// An uncontrolled field's apt.dat names are whatever its author typed
+/// ("Taxy", "21_hold" at LILB), and no controller turns them into words.
+fn designator(name: &str) -> bool {
+    let n = name.trim();
+    let letters = n.chars().take_while(|c| c.is_ascii_alphabetic()).count();
+    let digits = n.chars().skip(letters).take_while(|c| c.is_ascii_digit()).count();
+    (1..=2).contains(&letters) && digits <= 2 && letters + digits == n.len()
+}
+
+/// An uncontrolled departure's route, as the crew announces it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SelfTaxi {
+    pub field: String,
+    pub runway: String,
+    /// Spoken taxiway names, in order ("Alpha, Bravo").
+    pub via: String,
+    /// Runways crossed on the way, spoken idents.
+    pub crossings: Vec<String>,
+}
+
+/// Plan the crew's own taxi at an uncontrolled field (no tower, or none in
+/// reach): `icao`'s taxi network from `apt_path` (no ICAO = the field we
+/// are at, found by a scan), to the holding point of `runway` (the plan's
+/// departure runway) unless the wind puts more than [`SELF_TAXI_TAILWIND_KTS`]
+/// on its tail, else the end the wind favours, else the longest main runway. Published to the party line like a tower's
+/// route, so the taxi drive, the line-up's lead-on and the guide read one
+/// route. `Err` says why, in words the crew can say. A full apt.dat pass:
+/// call it off the realtime loop.
+pub fn plan_self_taxi(
+    apt_path: &str,
+    icao: Option<&str>,
+    lat: f64,
+    lon: f64,
+    runway: Option<&str>,
+    wind: Option<(f64, f64)>,
+) -> Result<SelfTaxi, String> {
+    let found = match icao {
+        Some(icao) => nav::find_airport(apt_path, icao)
+            .ok()
+            .flatten()
+            .map(|a| (icao.to_string(), a))
+            .ok_or_else(|| format!("I can't find {icao} in the scenery data."))?,
+        None => field_at(apt_path, lat, lon).ok_or_else(|| {
+            "I can't tell which field we're at, so the taxi is yours.".to_string()
+        })?,
+    };
+    let (icao, apt) = (found.0.as_str(), found.1);
+    let dist = apt
+        .ground_distance_nm(lat, lon)
+        .or_else(|| apt.position().map(|(a, b)| crate::nav::haversine_nm(lat, lon, a, b)))
+        .unwrap_or(f64::MAX);
+    if dist > AT_FIELD_NM {
+        return Err(format!("We're not at {icao}, so I can't plan its taxi."));
+    }
+    let net = nav::find_taxi_net(apt_path, icao)
+        .ok()
+        .flatten()
+        .ok_or_else(|| format!("{icao} has no taxiways drawn, so the taxi is yours."))?;
+    let tail_ok = |r: &str| {
+        wind.and_then(|(from, kts)| nav::headwind_for(&apt.runways, r, from, kts))
+            .is_none_or(|hw| hw >= -SELF_TAXI_TAILWIND_KTS)
+    };
+    let asked = runway
+        .filter(|r| strip(&apt.runways, r).is_some() && tail_ok(r))
+        .map(str::to_string);
+    let ident = asked
+        .or_else(|| {
+            wind.filter(|(_, kts)| *kts >= 1.0)
+                .and_then(|(from, kts)| nav::best_runway_for_wind(&apt.runways, from, kts))
+                .map(|(id, _, _)| id)
+        })
+        .or_else(|| {
+            nav::assignable_runways(&apt.runways)
+                .max_by(|a, b| a.length_m().total_cmp(&b.length_m()))
+                .map(|r| r.ident_a.clone())
+        })
+        .ok_or_else(|| format!("{icao} has no runway I can pick."))?;
+    let r = strip(&apt.runways, &ident).ok_or_else(|| format!("No runway {ident} at {icao}."))?;
+    let (tlat, tlon) = if r.ident_a == ident {
+        (r.lat_a, r.lon_a)
+    } else {
+        (r.lat_b, r.lon_b)
+    };
+    let standoff = (r.width_m / 2.0 + 30.0).max(nav::HOLD_SHORT_STANDOFF_M);
+    let zone = [r.ident_a.clone(), r.ident_b.clone()];
+    let mut plan = net
+        .plan_to_runway(lat, lon, tlat, tlon, standoff, &zone, Some(r))
+        .filter(|p| p.path.len() >= 2)
+        .ok_or_else(|| {
+            format!(
+                "I can't find a taxi route to runway {} from here.",
+                atis::spoken_runway(&ident)
+            )
+        })?;
+    mark_runway_crossings(&mut plan, &apt.runways);
+    // Only names a pilot could say ride the route: the drive, the guide
+    // and the announcements read them.
+    let raw_via = plan.via.join(", ");
+    let named: Vec<String> = plan.via.iter().filter(|n| designator(n)).cloned().collect();
+    let via = spoken_via(&named).join(", ");
+    let seg = plan
+        .seg
+        .iter()
+        .map(|(n, rwy)| (if *rwy || designator(n) { n.clone() } else { String::new() }, *rwy))
+        .collect();
+    let holding_point = if designator(&plan.holding_point) {
+        plan.holding_point.clone()
+    } else {
+        String::new()
+    };
+    *TAXI_ROUTE.lock().unwrap_or_else(|e| e.into_inner()) = Some(TaxiWatch {
+        path: plan.path.clone(),
+        via: via.clone(),
+        seg,
+        holding_point,
+        lead_on: plan.lead_on.clone(),
+    });
+    *TAXI_TO_STAND.lock().unwrap_or_else(|e| e.into_inner()) = false;
+    *SELF_TAXI.lock().unwrap_or_else(|e| e.into_inner()) = Some(ident.clone());
+    sim::blackbox::record(
+        "atc",
+        serde_json::json!({ "route": "self_taxi", "field": icao, "runway": ident, "via": raw_via }),
+    );
+    Ok(SelfTaxi {
+        field: apt.name.clone(),
+        runway: ident,
+        via,
+        crossings: plan.crossings.iter().map(|c| atis::spoken_runway(c)).collect(),
+    })
+}
+
 pub fn active_station_range_nm(lat: f64, lon: f64) -> Option<f64> {
     let (_, alat, alon) = ACTIVE_FIELD
         .lock()
@@ -3563,6 +3798,9 @@ pub fn chatter_tick(
     blocked_ident: Option<&str>,
     now: Instant,
 ) -> Option<PartyExchange> {
+    if out_of_reach() {
+        return None;
+    }
     let mut guard = GHOSTS.lock().unwrap_or_else(|e| e.into_inner());
     let mem = guard.get_or_insert_with(std::collections::HashMap::new);
     mem.retain(|_, m| now.duration_since(m.last_seen).as_secs() < 180);
@@ -3856,6 +4094,9 @@ pub fn takeoff_hold_tick(
     player_on_ground: bool,
     now: Instant,
 ) -> Option<String> {
+    if out_of_reach() {
+        return None;
+    }
     let mut guard = TAKEOFF_HOLD.lock().unwrap_or_else(|e| e.into_inner());
     let hold = guard.as_mut()?;
     // Airborne, the hold is moot: either the pilot departed through the
@@ -7698,6 +7939,94 @@ mod tests {
             }],
         };
         assert!(apt.staffed_tower().is_some());
+    }
+
+    /// LILB 2026-09-25: parked in Italy with the Gibraltar station active,
+    /// the station answered, cleared us and handed over a taxi to its own
+    /// runway. On the ground out of reach the station is silent and what it
+    /// issued is retired; the crew's own route is left alone; airborne the
+    /// last controller keeps the flight.
+    #[test]
+    fn a_station_out_of_reach_on_the_ground_is_silent_and_retires_its_clearance() {
+        let _guard = SIDE_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let cleared = || ClearanceSnap {
+            state: tower::State::TaxiCleared,
+            callsign: "N172SP".into(),
+            runway_ident: "09".into(),
+            pending_readback: None,
+        };
+        *ACTIVE_FIELD.lock().unwrap() = Some(("Gibraltar".into(), 36.15, -5.35));
+        *CLEARANCE.lock().unwrap() = Some(cleared());
+        *ASSIGNED_SQUAWK.lock().unwrap() = Some(4503);
+        *SELF_TAXI.lock().unwrap() = None;
+        OUT_OF_REACH.store(false, std::sync::atomic::Ordering::Relaxed);
+        // At the field: in reach, nothing retired.
+        note_aircraft(36.15, -5.34, true);
+        assert!(!out_of_reach());
+        assert!(CLEARANCE.lock().unwrap().is_some());
+        // Parked at LILB: out of reach, the clearance and squawk are gone.
+        note_aircraft(45.77, 9.16, true);
+        assert!(out_of_reach());
+        assert!(CLEARANCE.lock().unwrap().is_none());
+        assert!(ASSIGNED_SQUAWK.lock().unwrap().is_none());
+        assert_eq!(crate::party_line::home_tower_khz(), None);
+        assert!(!crate::party_line::station_reaches());
+        // Airborne the station keeps the flight, and the crew's own route
+        // and runway are over.
+        *SELF_TAXI.lock().unwrap() = Some("03".into());
+        assert_eq!(crate::party_line::clearance_runway().as_deref(), Some("03"));
+        note_aircraft(45.77, 9.16, false);
+        assert!(!out_of_reach());
+        assert_eq!(crate::party_line::clearance_runway(), None);
+        // The crew's own route survives the station going out of reach.
+        *SELF_TAXI.lock().unwrap() = Some("03".into());
+        *TAXI_ROUTE.lock().unwrap() = Some(TaxiWatch {
+            path: vec![(45.77, 9.16), (45.771, 9.161)],
+            via: "Alpha".into(),
+            seg: Vec::new(),
+            holding_point: "A".into(),
+            lead_on: Vec::new(),
+        });
+        note_aircraft(45.77, 9.16, true);
+        assert!(TAXI_ROUTE.lock().unwrap().is_some());
+        *TAXI_ROUTE.lock().unwrap() = None;
+        *SELF_TAXI.lock().unwrap() = None;
+        OUT_OF_REACH.store(false, std::sync::atomic::Ordering::Relaxed);
+        *ACTIVE_FIELD.lock().unwrap() = None;
+    }
+
+    #[test]
+    fn only_a_designator_is_a_taxiway_name() {
+        for yes in ["A", "B2", "TL", "A13", "k"] {
+            assert!(designator(yes), "{yes}");
+        }
+        for no in ["Taxy", "21_hold", "", "A123", "Main apron", "12"] {
+            assert!(!designator(no), "{no}");
+        }
+    }
+
+    /// The real scenery: LILB's own taxi to runway 03, planned and published.
+    /// `cargo test -p atc -- --ignored real_install_self_taxi_lilb --nocapture`
+    #[test]
+    #[ignore]
+    fn real_install_self_taxi_lilb() {
+        let _guard = SIDE_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let apt = std::env::var("XPLANE_APT_DATA").unwrap_or_else(|_| {
+            "/Users/duanelicudi/X-Plane 12/Global Scenery/Global Airports/Earth nav data/apt.dat"
+                .into()
+        });
+        // Where the 172 sat on 2026-09-25.
+        let (lat, lon) = (45.771_275, 9.164_289);
+        let t = plan_self_taxi(&apt, Some("LILB"), lat, lon, Some("03"), Some((20.0, 4.0)));
+        println!("{t:?}");
+        let t = t.expect("planned");
+        assert_eq!(t.runway, "03");
+        assert!(TAXI_ROUTE.lock().unwrap().as_ref().is_some_and(|w| w.path.len() >= 2));
+        // No ICAO: the field found by the scan is the same one.
+        let found = plan_self_taxi(&apt, None, lat, lon, None, None).expect("found");
+        println!("{found:?}");
+        *TAXI_ROUTE.lock().unwrap() = None;
+        *SELF_TAXI.lock().unwrap() = None;
     }
 
     #[test]

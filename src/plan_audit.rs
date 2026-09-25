@@ -439,6 +439,9 @@ pub struct Suitability {
     pub plan_type: String,
     /// The loaded aircraft's `acf_ICAO`.
     pub acf_type: Option<String>,
+    /// Other types a plan for this airframe may be filed as (the profile's
+    /// `simbrief_types`).
+    pub plan_types: Vec<String>,
     pub distance_nm: f64,
     pub block_fuel_kg: f64,
     pub trip_fuel_kg: f64,
@@ -484,7 +487,10 @@ pub fn suitability(s: &Suitability, cruise_alt_ft: f64, af: &Airframe) -> Vec<Fi
     let mut out = Vec::new();
     // The type: every number in a plan for another aircraft is its numbers.
     if let Some(acf) = s.acf_type.as_deref().map(str::trim).filter(|a| !a.is_empty()) {
-        if !s.plan_type.trim().is_empty() && !s.plan_type.trim().eq_ignore_ascii_case(acf) {
+        let plan = s.plan_type.trim();
+        let ours = plan.eq_ignore_ascii_case(acf)
+            || s.plan_types.iter().any(|t| t.trim().eq_ignore_ascii_case(plan));
+        if !plan.is_empty() && !ours {
             out.push(stop(
                 "type_mismatch",
                 format!(
@@ -585,13 +591,34 @@ pub async fn gather_suitability(
     origin: Option<&crate::nav::AirportInfo>,
     dest: Option<&crate::nav::AirportInfo>,
 ) -> Suitability {
-    let (acf, cap) = tokio::join!(
+    let (acf, cap, weight) = tokio::join!(
         xp.aircraft_icao(),
-        xp.get_float("sim/aircraft/weight/acf_m_fuel_tot")
+        xp.get_float("sim/aircraft/weight/acf_m_fuel_tot"),
+        xp.get_float(crate::datarefs::TOTAL_WEIGHT_KG),
     );
     let p = crate::aircraft::live_profile();
     let r = p.as_ref().and_then(|p| p.reference.as_ref());
     let takeoff_ft = r.and_then(|r| r.takeoff_distance_ft);
+    // The departure end is the ONE runway rule (`aircraft::takeoff_needed_m`:
+    // the roll at this weight, the margin, the floor) and the pilot's waiver
+    // of the margin for this plan. The raw recited distance here refused the
+    // Evolution at LILB right after the preflight had taken the waiver
+    // (2026-09-25): two rules, two answers.
+    let (roll_m, mtow_kg) = p
+        .as_ref()
+        .map(|p| crate::aircraft::profile_takeoff_roll(p))
+        .unwrap_or((None, None));
+    let waived = crate::full_auto::waived_for(fp).contains(&crate::full_auto::Gate::OriginRunway);
+    let factor = if waived { 1.0 } else { crate::aircraft::TAKEOFF_FACTOR };
+    let takeoff_needed_ft = roll_m.map(|_| {
+        crate::aircraft::takeoff_needed_factored_m(
+            roll_m,
+            weight.ok().filter(|w| w.is_finite() && *w > 0.0),
+            mtow_kg,
+            500.0,
+            factor,
+        ) * 3.280_84
+    });
     let landing_ft = crate::aircraft::landing_distance_m().map(|m| m * 3.280_84);
     let hdgs = dest.map_or_else(Vec::new, |a| {
         a.runways
@@ -620,6 +647,7 @@ pub async fn gather_suitability(
             fp.aircraft.clone()
         },
         acf_type: acf.ok(),
+        plan_types: p.as_ref().map(|p| p.simbrief_types.clone()).unwrap_or_default(),
         distance_nm: fp.distance_nm,
         block_fuel_kg: fp.block_fuel_kg,
         trip_fuel_kg: fp.trip_fuel_kg,
@@ -630,7 +658,7 @@ pub async fn gather_suitability(
         max_landing_kg: fp.weights.as_ref().map(|w| w.max_ldw_kg).filter(|w| *w > 0.0),
         origin_longest_ft: origin.map(crate::flightplan::longest_runway_ft),
         dest_longest_ft: dest.map(crate::flightplan::longest_runway_ft),
-        takeoff_needed_ft: takeoff_ft,
+        takeoff_needed_ft,
         landing_needed_ft: crate::flightplan::runway_needed_ft(landing_ft, takeoff_ft),
         dest_wind: wind,
         dest_runway_hdgs: hdgs,
@@ -1042,6 +1070,14 @@ mod tests {
     fn a_plan_for_another_type_is_refused_first() {
         let mut s = suits();
         s.acf_type = Some("C172".into());
+        // A custom SimBrief airframe filed under another type is ours when
+        // the profile says so (the Evolution on the Piper M500).
+        let mut evo = s.clone();
+        evo.acf_type = Some("EVOT".into());
+        evo.plan_type = "P46T".into();
+        assert!(suitability(&evo, 3000.0, &jet()).iter().any(|f| f.kind == "type_mismatch"));
+        evo.plan_types = vec!["P46T".into()];
+        assert!(!suitability(&evo, 3000.0, &jet()).iter().any(|f| f.kind == "type_mismatch"));
         let f = suitability(&s, 35_000.0, &jet());
         assert_eq!(f.len(), 1);
         assert_eq!(f[0].kind, "type_mismatch");

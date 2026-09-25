@@ -75,6 +75,8 @@ const TAKEOFF_PITCH: &str = "xcopilot/pitch";
 const PITCH_YIELD: &str = "xcopilot/pitch_yield";
 const TAKEOFF_ROLL: &str = "xcopilot/roll";
 const ROLL_YIELD: &str = "xcopilot/roll_yield";
+/// Engine torque, N m per engine.
+const ENGN_TRQ: &str = "sim/flightmodel/engine/ENGN_TRQ";
 const THETA: &str = "sim/flightmodel/position/true_theta";
 const PHI: &str = "sim/flightmodel/position/true_phi";
 /// The sim's own pitch rate, deg/s — what the rotation law damps on. Measured,
@@ -171,7 +173,9 @@ const POWER_LEAD_FADE_KTS: f64 = 40.0;
 /// Throttle advances to full over this long — slamming it at a standstill
 /// is the maximum yaw moment at the exact moment steering authority is
 /// highest and airflow over the rudder is zero.
-const THROTTLE_RAMP_S: f64 = 2.5;
+/// A pilot advances the lever over seconds, never in one movement: 2.5 s
+/// from 30% to full was the "0 to 100" the pilot called out (2026-09-25).
+const THROTTLE_RAMP_S: f64 = 6.0;
 /// Centreline correction: degrees of cut per meter of offset, clamped. The
 /// figure is quoted AT [`XTK_GAIN_REF_KTS`] and scaled down above it - see
 /// [`roll_target_heading`].
@@ -776,9 +780,10 @@ const ROLL_BRAKE_OFF_KTS: f64 = 40.0;
 
 /// Whether the live airframe steers on its brakes.
 fn brake_steers() -> bool {
-    crate::aircraft::live_profile()
-        .and_then(|p| p.taxi.as_ref().map(|t| t.brake_steer))
-        .unwrap_or(false)
+    crate::aircraft::nose_castors()
+        || crate::aircraft::live_profile()
+            .and_then(|p| p.taxi.as_ref().map(|t| t.brake_steer))
+            .unwrap_or(false)
 }
 
 /// The roll steering law: P on the error, a lead term on its rate (damps
@@ -1264,6 +1269,51 @@ impl ClimbOut {
 
 static CLIMB_OUT: std::sync::Mutex<Option<ClimbOut>> = std::sync::Mutex::new(None);
 
+/// The live airframe's manual takeoff power limit
+/// ([`crate::aircraft::TakeoffPowerProfile`]), republished on every swap.
+static TAKEOFF_POWER: std::sync::Mutex<Option<crate::aircraft::TakeoffPowerProfile>> =
+    std::sync::Mutex::new(None);
+
+pub fn publish_takeoff_power(p: Option<crate::aircraft::TakeoffPowerProfile>) {
+    *TAKEOFF_POWER.lock().unwrap_or_else(|e| e.into_inner()) = p;
+}
+
+fn takeoff_power() -> Option<crate::aircraft::TakeoffPowerProfile> {
+    TAKEOFF_POWER.lock().unwrap_or_else(|e| e.into_inner()).clone()
+}
+
+/// Newton-metres to foot-pounds (`ENGN_TRQ` is in N m).
+const NM_TO_FTLB: f64 = 0.737_562;
+/// Over the limit by this share, the lever comes back a step per tick.
+const TORQUE_OVER_FRAC: f64 = 0.05;
+const TORQUE_BACKOFF_STEP: f64 = 0.02;
+
+/// The lever under the manual's torque limit: below the limit the law's own
+/// want; at it the lever holds; past it by [`TORQUE_OVER_FRAC`] it comes
+/// back a step. Past `until_kias`, or with no torque read or no limit, the
+/// want as asked. Pure.
+pub fn torque_limited(
+    want: f64,
+    last: f64,
+    torque_ftlb: Option<f64>,
+    ias_kts: f64,
+    limit: Option<&crate::aircraft::TakeoffPowerProfile>,
+) -> f64 {
+    let (Some(l), Some(tq)) = (limit, torque_ftlb) else {
+        return want;
+    };
+    if ias_kts >= l.until_kias || !tq.is_finite() {
+        return want;
+    }
+    if tq > l.torque_ftlb * (1.0 + TORQUE_OVER_FRAC) {
+        (last - TORQUE_BACKOFF_STEP).max(0.0).min(want)
+    } else if tq >= l.torque_ftlb {
+        want.min(last)
+    } else {
+        want
+    }
+}
+
 /// Republished on every swap, including to `None`
 /// ([`crate::flight_state::publish_airframe`]).
 pub fn publish_climb_out(c: Option<ClimbOut>) {
@@ -1316,6 +1366,31 @@ pub const SCHEDULE_WAIT_S: f64 = 45.0;
 pub fn handoff_waits_for_schedule(retracted: bool, has_schedule: bool, waited_s: f64) -> bool {
     !retracted && has_schedule && waited_s < SCHEDULE_WAIT_S
 }
+
+/// A roll leaving the centreline is rejected while it is still on the
+/// pavement. LILB 03 (2026-09-25): the Evolution swung left at full power
+/// with the steering pinned right, and the only reject in the roll was the
+/// runway's END: it came at 68 kt, 129 m left of the centreline. Above
+/// [`EXCURSION_MIN_KTS`], more than [`EXCURSION_XTK_M`] off the centreline
+/// or [`EXCURSION_HDG_DEG`] off the runway's course is no takeoff. Pure.
+pub fn lateral_excursion(xtk_m: f64, heading_off_deg: f64, gs_kts: f64) -> Option<&'static str> {
+    if gs_kts < EXCURSION_MIN_KTS {
+        return None;
+    }
+    if xtk_m.abs() > EXCURSION_XTK_M {
+        Some("off_centreline")
+    } else if heading_off_deg.abs() > EXCURSION_HDG_DEG {
+        Some("off_heading")
+    } else {
+        None
+    }
+}
+/// Below this the line-up's own straightening owns the error.
+pub const EXCURSION_MIN_KTS: f64 = 10.0;
+/// Half the narrowest runway anything here departs from (18 m), less a
+/// wingtip's worth of margin.
+pub const EXCURSION_XTK_M: f64 = 10.0;
+pub const EXCURSION_HDG_DEG: f64 = 20.0;
 
 /// Reject when the runway is running out and rotation speed is still short:
 /// inside the margin with less than 90% of Vr there is no takeoff today.
@@ -1601,6 +1676,8 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, p: Params) {
     let mut wings = WingsLevel::default();
     let mut last_vs_cmd: Option<f64> = None;
     let mut last_thr_cmd = 0.3_f64;
+    // The manual's takeoff torque, for this airframe, read once per roll.
+    let power_limit = takeoff_power();
     // The roll section's heading error, one tick stale, for the throttle's
     // swinging-nose hold (throttle is commanded before position is read).
     let mut last_err = 0.0_f64;
@@ -1671,6 +1748,7 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, p: Params) {
             pitch_q,
             pitch_yield,
             roll_yield,
+            torque_nm,
         ) = tokio::join!(
             xp.get_float(LAT),
             xp.get_float(LON),
@@ -1686,7 +1764,13 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, p: Params) {
             xp.get_float(PITCH_RATE),
             xp.get_float(PITCH_YIELD),
             xp.get_float(ROLL_YIELD),
+            xp.get_float_array(ENGN_TRQ),
         );
+        let torque_ftlb = torque_nm
+            .ok()
+            .and_then(|v| v.first().copied())
+            .filter(|v| v.is_finite())
+            .map(|v| v * NM_TO_FTLB);
         let Some([lat, lon, psi, gs_ms, ias, agl_m, on_ground, theta_deg, phi_deg, q]) =
             crate::control::measurements(
                 "autotakeoff",
@@ -1711,6 +1795,7 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, p: Params) {
         // already): the takeoff continues as a manual one, power set.
         if !airborne && steer_yield.is_ok_and(|v| v > 0.5) {
             RUN.record(sim::run::Outcome::PilotOverride);
+            crate::flight::note_pilot_takeover("takeoff: pedals");
             alert(&voice, Priority::Caution, "Your aircraft. Power is set.");
             crate::blackbox::record("autotakeoff", serde_json::json!({"event": "pedal_yield"}));
             return;
@@ -1723,6 +1808,7 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, p: Params) {
             && (pitch_yield.is_ok_and(|v| v > 0.5) || roll_yield.is_ok_and(|v| v > 0.5))
         {
             RUN.record(sim::run::Outcome::PilotOverride);
+            crate::flight::note_pilot_takeover("takeoff: yoke");
             alert(&voice, Priority::Caution, "Your aircraft. Power is set.");
             crate::blackbox::record("autotakeoff", serde_json::json!({"event": "yoke_yield"}));
             return;
@@ -1736,7 +1822,13 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, p: Params) {
         // re-drives jitters; a hand keeps winning), then it's a pilot
         // reject — hands off everything.
         let elapsed = roll_start.elapsed().as_secs_f64() - frozen_secs;
-        let thr_want = tick_throttle_want(airborne, elapsed, last_err, gs_kts, ias, p.vne_kts);
+        let thr_want = torque_limited(
+            tick_throttle_want(airborne, elapsed, last_err, gs_kts, ias, p.vne_kts),
+            last_thr_cmd,
+            torque_ftlb,
+            ias,
+            power_limit.as_ref(),
+        );
         let thr_cmd = throttle_slew(last_thr_cmd, thr_want, dt);
         // FAIL OPEN, deliberately: a failed throttle read impersonates our own
         // command, so an API blink can never register as a pilot pull mid-roll.
@@ -1793,6 +1885,24 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, p: Params) {
             let target = roll_target_heading(rwy.course_deg, xtk_m, xtk_rate, gs_kts);
             let err = ((target - psi + 540.0).rem_euclid(360.0)) - 180.0;
             last_err = err;
+            if !rotated {
+                let off_course = ((psi - rwy.course_deg + 540.0).rem_euclid(360.0)) - 180.0;
+                if let Some(why) = lateral_excursion(xtk_m, off_course, gs_kts) {
+                    crate::blackbox::record(
+                        "autotakeoff",
+                        serde_json::json!({"event": "excursion", "why": why,
+                            "xtk_m": xtk_m, "off_course": off_course, "gs": gs_kts}),
+                    );
+                    reject(
+                        &xp,
+                        &voice,
+                        "We're leaving the centreline. Rejecting takeoff. Your aircraft.",
+                        "lateral_excursion",
+                    )
+                    .await;
+                    return;
+                }
+            }
             let steer = steer_law.step(err, dt, gs_kts, thr_cmd);
             // The brake half, on an airframe that has no other low-speed
             // steering; zero once rotated (the channel expires anyway).
@@ -1836,7 +1946,7 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, p: Params) {
                     "steer": steer, "trim": steer_law.trim(), "xtk_m": xtk_m,
                     "bl": bl, "br": br,
                     "xtk_rate": xtk_rate,
-                    "thr": thr_cmd, "remaining_m": remaining, "dt": dt,
+                    "thr": thr_cmd, "remaining_m": remaining, "dt": dt, "trq_ftlb": torque_ftlb,
                 }),
             );
             // Rotate: ELEVATOR, through the plugin's pitch channel — the AP
@@ -3359,9 +3469,11 @@ mod tests {
         // Throttle: rolling at 30% immediately, full by the ramp's end,
         // never over.
         assert_eq!(throttle_ramp(0.0), 0.3);
-        let mid = throttle_ramp(1.25);
+        let mid = throttle_ramp(THROTTLE_RAMP_S / 2.0);
         assert!(mid > 0.5 && mid < 0.9, "{mid}");
-        assert_eq!(throttle_ramp(2.5), 1.0);
+        // Gradual: no more than half the travel in the first two seconds.
+        assert!(throttle_ramp(2.0) < 0.6, "{}", throttle_ramp(2.0));
+        assert_eq!(throttle_ramp(THROTTLE_RAMP_S), 1.0);
         assert_eq!(throttle_ramp(60.0), 1.0);
     }
 
@@ -3443,6 +3555,21 @@ mod tests {
     fn runway_end_reject_fires_only_slow_and_short() {
         // 200 m left at 30 kt against a 55 kt Vr: no takeoff today.
         assert!(must_reject(200.0, 30.0, 55.0));
+        // The Evolution's manual torque: below it the ramp, at it the lever
+        // holds, past it the lever comes back; past 150 kt, the ramp again.
+        let evo = crate::aircraft::TakeoffPowerProfile { torque_ftlb: 1250.0, until_kias: 150.0 };
+        assert_eq!(torque_limited(0.8, 0.5, Some(900.0), 40.0, Some(&evo)), 0.8);
+        assert_eq!(torque_limited(0.8, 0.5, Some(1260.0), 40.0, Some(&evo)), 0.5);
+        assert!((torque_limited(0.8, 0.5, Some(1400.0), 40.0, Some(&evo)) - 0.48).abs() < 1e-9);
+        assert_eq!(torque_limited(1.0, 0.5, Some(1400.0), 155.0, Some(&evo)), 1.0);
+        assert_eq!(torque_limited(1.0, 0.5, None, 40.0, Some(&evo)), 1.0, "no read: the ramp");
+        assert_eq!(torque_limited(1.0, 0.5, Some(2000.0), 40.0, None), 1.0, "no limit declared");
+        // LILB 03 (2026-09-25): 11 m left at 30 kt is a reject there, not
+        // 129 m left at 68 kt at the far end.
+        assert_eq!(lateral_excursion(-11.1, -22.3, 29.9), Some("off_centreline"));
+        assert_eq!(lateral_excursion(-4.0, -21.0, 21.4), Some("off_heading"));
+        assert_eq!(lateral_excursion(-1.5, 14.1, 1.2), None, "the line-up's crawl");
+        assert_eq!(lateral_excursion(-3.0, 5.0, 60.0), None);
         // 200 m left but nearly at Vr: keep going, rotation is imminent.
         assert!(!must_reject(200.0, 52.0, 55.0));
         // Plenty of runway, any speed: no reject.

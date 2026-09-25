@@ -142,7 +142,33 @@ fn lock<T>(m: &'static Mutex<T>) -> MutexGuard<'static, T> {
 /// The active tower's frequency (kHz), so the crew can tune COM1 to it before
 /// calling — the full-auto orchestrator does this before requesting taxi.
 pub fn home_tower_khz() -> Option<i64> {
+    // A tower out of reach is no tower to tune (`station::note_aircraft`).
+    if crate::station::out_of_reach() {
+        return None;
+    }
     crate::station::active_tower_khz()
+}
+
+/// A station reaches the aircraft: one is running and it is not out of
+/// reach on the ground. False = the crew departs as from an uncontrolled
+/// field ([`plan_self_taxi`]).
+pub fn station_reaches() -> bool {
+    !crate::station::out_of_reach() && crate::station::active_tower_khz().is_some()
+}
+
+/// The crew's own taxi at an uncontrolled field, planned from the field's
+/// taxi network and published like a controller's route
+/// ([`crate::station::plan_self_taxi`]). A full apt.dat pass: off the
+/// realtime loop.
+pub fn plan_self_taxi(
+    apt_path: &str,
+    icao: Option<&str>,
+    lat: f64,
+    lon: f64,
+    runway: Option<&str>,
+    wind: Option<(f64, f64)>,
+) -> Result<crate::station::SelfTaxi, String> {
+    crate::station::plan_self_taxi(apt_path, icao, lat, lon, runway, wind)
 }
 
 pub fn clearance_state() -> Option<tower::State> {
@@ -157,6 +183,9 @@ pub fn clearance_runway() -> Option<String> {
         .as_ref()
         .map(|c| c.runway_ident.clone())
         .filter(|r| !r.is_empty())
+        // An uncontrolled departure's own runway stands in for a cleared
+        // one: the line-up and the takeoff cross-check it the same way.
+        .or_else(crate::station::self_taxi_runway)
 }
 
 /// The readback the tower is still waiting for, phrased ("Cleared to land

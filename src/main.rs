@@ -26,6 +26,8 @@ mod debrief;
 mod detect;
 mod dialogue;
 mod failures;
+#[allow(dead_code)] // shadow run: the consumers move over next
+mod flight;
 mod flight_state;
 mod flightplan;
 mod flow;
@@ -2074,6 +2076,16 @@ async fn run_session(
             }
         }
 
+        // A pilot waiving the refusal just said ("fly it anyway"): the gate
+        // is waived for that plan and the arm is asked again in the same
+        // words the button uses. Words with no refusal on offer fall through.
+        if grammar::waiver_request(&command) {
+            if let Some(gate) = full_auto::take_waiver() {
+                say(&voice, &reporter, ui::LogKind::Readback, &full_auto::waiver_ack(gate));
+                command = "fly my flight plan".to_string();
+            }
+        }
+
         // From here the utterance is resolved deterministically: the grammar
         // (one call per distinct action, so "taxi and nav lights on" makes
         // two), the dialogue stack for back-references, the state and
@@ -2333,6 +2345,7 @@ async fn run_session(
                         released.push("stowing reverse");
                     }
                     if !released.is_empty() {
+                        crate::flight::note_pilot_takeover("my controls");
                         let line = format!("Copy — {}.", released.join("; "));
                         say(&voice, &reporter, ui::LogKind::Readback, &line);
                         continue;

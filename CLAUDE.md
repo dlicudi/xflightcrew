@@ -311,7 +311,17 @@ pax, bags, cargo, payload, TOW/LDW limits, converted to kilos from the
 plan's own unit). A refusal names the number; an unknown figure is skipped,
 never guessed; the pilot hears the fuel and who is aboard in the arming
 ack. Until 2026-09-15 the arm checked only geography: the fuel was found at
-the enroute caution and the runway at the hold. **A spoken ask for the
+the enroute caution and the runway at the hold. **A MARGIN is the pilot's to
+waive, the airframe never** (`full_auto::Gate`, 2026-09-25): a refusal
+offers "say fly it anyway" only for the runway's 1.4 factor
+(`OriginRunway`; waived, the unfactored roll and the 500 m floor still
+hold, `BookRoll`) and the plan's operational weight limit (`PlanWeight`;
+the profile's max gross still holds). A closed phrase
+(`grammar::waiver_request`) inside 120 s waives THAT gate for THAT plan and
+re-arms; the ack names what was given up, the runway waiver lives only as
+long as the mission (`aircraft::TAKEOFF_MARGIN_WAIVED`, set by a successful
+`start`, cleared by every stop), blackbox `waiver`. Fuel, ceiling and the
+destination runway (already unfactored) are never waivable. **A spoken ask for the
 plan ("load / what's the flight plan") re-fetches a SimBrief plan EVERY
 time** (`PlanFetch::Asked`; the 10 min TTL is only for the implicit
 consumers: fuel, TOD, ETA): the pilot regenerates on the website and says
@@ -437,6 +447,18 @@ that request instead.
   back, even straight after a takeoff clearance. "What did the tower say?"
   on the intercom reports the same line (5 min); with external ATC the crew
   says it cannot hear the frequency.
+- **A station hears only its own field on the ground**
+  (`station::note_aircraft`, `GROUND_REACH_NM` 10 nm, every monitor tick):
+  beyond it the station is silent (`tuned_service`, the ground ticks) and
+  retires what it issued, and `party_line::station_reaches()` is false, so
+  full auto departs as from an UNCONTROLLED field: no clearance call, its
+  own taxi planned from the field's network (`party_line::plan_self_taxi`,
+  the plan's runway unless 5 kt of tailwind, else the wind's), published
+  like a tower's route so the push, drive and line-up are unchanged
+  (LILB 2026-09-25: Gibraltar cleared a 172 parked in Italy and full auto
+  waited three minutes for a route that could be ours). Airborne the last
+  controller still keeps the flight. The via names are not spoken (an
+  untowered field's apt.dat names are an author's typing).
 - The radio needs POWER both directions (station audio dropped, transmissions
   go nowhere, copilot says "radios are dead"). **FAIL OPEN, and the flag is
   RESTORED every tick** - a process-wide fact that merely stops being
@@ -1209,6 +1231,30 @@ helicopter flies on its own loop ([src/hover.rs](src/hover.rs), blackbox
   at N knots", "hold position", "take off" / "depart to N feet", "turn
   heading N" and "speed N knots" during a departure (the AP's mode tools are
   refused while the loop flies: `hover::blocks`), "fly a circuit".
+
+## The flight model: one state, read by everyone (in SHADOW)
+
+[src/flight.rs](src/flight.rs) (2026-09-25) is the ONE answer to "where are
+we and what do we hold", replacing `monitor::estimate_phase` (one snapshot,
+no memory) and the private peak/airborne/landed flags of the checklist
+tracker, the cabin and rapport. Pure, fed once per monitor tick, time from
+the sample so recorded flights replay exactly (`flight::Replay`). Tracks:
+the `Phase` (every edge sustained and in the `legal` table), `Control`
+(the innermost loop with hands on, the AP, the pilot), `Abnormal`,
+`Memory` per flight, and the crew's `Situation` (the outermost mission,
+the plan on the shelf, the active fix, the party line's clearance, the
+pilot's last takeover via `flight::note_pilot_takeover`, set by "my
+controls" and every yield stand-down). **A ground strike is not a landing**:
+climbing into it, or a sink past `IMPACT_SINK_FPM`, is an `Impact`, and a
+wreck (impact or the crash flag) has no phases until it is at rest (the
+S-76's ridge strike at LILO read as a touchdown at +491 fpm, then its slide
+as a takeoff roll and a reject). Live: `fphase` and `crashed` ride the
+`state` record, events are blackboxed `flight`; `xvl debrief` prints the
+shadow against the old estimate (ground/air must agree). **Nothing reads it
+yet.** Next: move the tracker, cabin and rapport onto it and delete
+`estimate_phase`; then a pure "what is owed next" over the whole state,
+shadowed (logged, never acting) before it may act, toward a copilot that
+flies the flight without being asked.
 
 ## Checklist flows: the list at its phase, three flavours
 

@@ -133,6 +133,12 @@ impl ArrestLeadProfile {
 pub struct AircraftProfile {
     pub id: String,
     pub display_name: String,
+    /// Other ICAO types a SimBrief plan for THIS airframe may be filed as,
+    /// when SimBrief has no base type of its own for it (the Lancair
+    /// Evolution, acf_ICAO EVOT, is planned as a custom airframe on the
+    /// Piper M500, P46T). The plan audit's type check accepts them.
+    #[serde(default)]
+    pub simbrief_types: Vec<String>,
     /// Flap system, if any. `None` means no `set_flaps` tool.
     #[serde(default)]
     pub flaps: Option<FlapProfile>,
@@ -329,6 +335,10 @@ pub struct AircraftProfile {
     /// flaps, trim and the altitude selector (see [`crate::takeoff_config`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub takeoff_config: Option<TakeoffConfigProfile>,
+    /// The manual's takeoff power limit, where it has one (see
+    /// [`TakeoffPowerProfile`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub takeoff_power: Option<TakeoffPowerProfile>,
     /// The seat belt sign switch, where it is the add-on's own (see
     /// [`crate::tools::signs`]). `None` with `cabin_crew` is the stock switch.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1627,6 +1637,20 @@ pub struct SeatBeltSigns {
 /// The configuration items an airliner's crew owns and a trainer has not got.
 /// Stock datarefs on purpose (`speedbrake_ratio`, `auto_brake_level`): the
 /// profile declares THAT the airframe has them, never a name.
+/// The takeoff power the MANUAL allows, as engine torque, until a speed:
+/// the Lancair Evolution takes off at 1,250 ft-lb of its 2,230 "since more
+/// power would over-power the rudders' and ailerons' ability to counter the
+/// engine torque" (N844X POH), more only as the speed builds past 150 kt
+/// (POM). The takeoff put in full power 2.5 s into the roll and the aircraft
+/// left LILB 03's centreline by 129 m with the steering pinned against it
+/// (2026-09-25). Held on the MEASURED torque (`ENGN_TRQ`), never a guessed
+/// lever position.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TakeoffPowerProfile {
+    pub torque_ftlb: f64,
+    pub until_kias: f64,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct TakeoffConfigProfile {
     /// Ground spoilers armed for landing, and for takeoff unless
@@ -1781,6 +1805,56 @@ impl GearWarning {
             .is_some_and(|t| throttle_ratio * 100.0 < t);
         flaps || power
     }
+}
+
+/// The live airframe's nose gear CASTORS (its `.acf`): it turns on the
+/// ground by differential brake only, whatever the profile declares. Read
+/// at detection, reset per swap (`flight_state::publish_airframe`). The
+/// Evolution's profile never said `brake_steer`, and full rudder at 6 kt
+/// turned it 3.7 degrees a second, off LILB's route three times
+/// (2026-09-25); the RV-10's never did either.
+static NOSE_CASTORS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn publish_nose_castors(on: bool) {
+    NOSE_CASTORS.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn nose_castors() -> bool {
+    NOSE_CASTORS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// The castoring nose has NO steering of its own either (`_steerdeg_lospeed`
+/// 0: the Evolution, the SR22, the RV-10; the SF50's castors with 40 degrees
+/// of it): at walking pace the brakes are the only thing that turns it.
+static NOSE_FREE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn publish_nose_free(on: bool) {
+    NOSE_FREE.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn nose_free() -> bool {
+    NOSE_FREE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Whether an `.acf`'s nose castors with no steering angle at all. Pure.
+pub fn nose_free_from_acf(acf_text: &str) -> bool {
+    let steer_lo = acf_text.lines().find_map(|l| {
+        let mut it = l.split_whitespace();
+        (it.next() == Some("P") && it.next() == Some("_gear/0/_steerdeg_lospeed"))
+            .then(|| it.next().and_then(|v| v.parse::<f64>().ok()))
+            .flatten()
+    });
+    nose_castors_from_acf(acf_text) && steer_lo.is_none_or(|d| d.abs() < 1.0)
+}
+
+/// Whether an `.acf`'s first gear (the nose of a tricycle) castors. Pure.
+pub fn nose_castors_from_acf(acf_text: &str) -> bool {
+    acf_text.lines().any(|l| {
+        let mut it = l.split_whitespace();
+        it.next() == Some("P")
+            && it.next() == Some("_gear/0/_gear_castors")
+            && it.next().and_then(|v| v.parse::<f64>().ok()).is_some_and(|v| v > 0.5)
+    })
 }
 
 /// The gear-warning envelope from an `.acf`'s text, or `None` when it
@@ -1962,8 +2036,40 @@ pub fn takeoff_needed_m(
     mtow_kg: Option<f64>,
     floor_m: f64,
 ) -> f64 {
+    takeoff_needed_factored_m(roll_at_mtow_m, weight_kg, mtow_kg, floor_m, takeoff_factor())
+}
+
+/// The margin on the book roll every runway gate applies.
+pub const TAKEOFF_FACTOR: f64 = 1.4;
+
+/// The pilot waived the runway margin for the full-auto mission flying the
+/// plan it was waived for (`full_auto::Gate::OriginRunway`): set at that
+/// arm, cleared at every other arm, wherever full auto stops, and by the
+/// airframe swap, so no other takeoff ever inherits it.
+pub static TAKEOFF_MARGIN_WAIVED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// [`TAKEOFF_FACTOR`], or none while a waived full-auto mission flies.
+fn takeoff_factor() -> f64 {
+    use std::sync::atomic::Ordering::Relaxed;
+    if TAKEOFF_MARGIN_WAIVED.load(Relaxed) {
+        1.0
+    } else {
+        TAKEOFF_FACTOR
+    }
+}
+
+/// [`takeoff_needed_m`] with the factor given (the preflight asks both
+/// ways to say what a waiver gives up).
+pub fn takeoff_needed_factored_m(
+    roll_at_mtow_m: Option<f64>,
+    weight_kg: Option<f64>,
+    mtow_kg: Option<f64>,
+    floor_m: f64,
+    factor: f64,
+) -> f64 {
     roll_at_mtow_m.map_or(floor_m, |m| {
-        (takeoff_roll_m(m, weight_kg, mtow_kg) * 1.4).max(floor_m)
+        (takeoff_roll_m(m, weight_kg, mtow_kg) * factor).max(floor_m)
     })
 }
 
@@ -2600,6 +2706,16 @@ mod tests {
                 "autotaxi",
                 "BRAKE_STEER_FULL_KTS",
                 "...and is fully effective above this",
+            ),
+            (
+                "autotaxi",
+                "FREE_NOSE_MIN_KTS",
+                "a nose with no steering of its own (from the .acf) is brake-steered from walking pace",
+            ),
+            (
+                "autotaxi",
+                "FREE_NOSE_FULL_KTS",
+                "...and fully by this",
             ),
             // --- Handling conventions, flown the same in anything ---
             (
@@ -3641,6 +3757,42 @@ mod tests {
         assert_eq!(r.vr_kts, Some(90.0));
     }
 
+    /// Every installed airframe whose nose castors declares brake steering
+    /// (the Evolution and the RV-10 did not, 2026-09-25). Needs the install:
+    /// `cargo test -- --ignored real_install_castoring_noses_brake_steer`.
+    #[test]
+    #[ignore]
+    fn real_install_castoring_noses_brake_steer() {
+        let root = std::env::var("XCOPILOT_XPLANE_ROOT")
+            .unwrap_or_else(|_| "/Users/duanelicudi/X-Plane 12".to_string());
+        for (id, dir, acf) in [
+            ("lancair_evolution", "Laminar Research/Lancair Evolution", "N844X.acf"),
+            ("vans_rv10", "Laminar Research/Van's Aircraft RV-10", "RV-10.acf"),
+            ("cirrus_sr22", "Laminar Research/Cirrus SR22", "Cirrus SR22.acf"),
+            ("cirrus_vision_sf50", "Laminar Research/Cirrus Vision SF50", "CirrusSF50.acf"),
+            ("cessna_172sp", "Laminar Research/Cessna 172 SP", "Cessna_172SP.acf"),
+            ("king_air_c90b", "Laminar Research/Beechcraft King Air C90B", "C90B.acf"),
+        ] {
+            let path = std::path::Path::new(&root).join("Aircraft").join(dir).join(acf);
+            let text = String::from_utf8_lossy(&std::fs::read(&path).expect("acf on disk")).to_string();
+            let p = load(id).unwrap_or_else(|| panic!("{id} loads"));
+            let declared = p.taxi.as_ref().is_some_and(|t| t.brake_steer);
+            assert_eq!(nose_castors_from_acf(&text), declared, "{id}");
+        }
+    }
+
+    #[test]
+    fn a_castoring_nose_is_read_from_the_acf() {
+        assert!(nose_castors_from_acf("P _gear/0/_gear_castors 1\nP _gear/1/_gear_castors 0"));
+        assert!(!nose_castors_from_acf("P _gear/0/_gear_castors 0\nP _gear/1/_gear_castors 1"));
+        assert!(!nose_castors_from_acf(""));
+        let evo = "P _gear/0/_gear_castors 1\nP _gear/0/_steerdeg_lospeed 0.000000000";
+        let sf50 = "P _gear/0/_gear_castors 1\nP _gear/0/_steerdeg_lospeed 40.000000000";
+        assert!(nose_free_from_acf(evo));
+        assert!(!nose_free_from_acf(sf50));
+        assert!(!nose_free_from_acf("P _gear/0/_gear_castors 0\nP _gear/0/_steerdeg_lospeed 0.0"));
+    }
+
     #[test]
     fn lancair_evolution_yaml_loads() {
         // YAML-only profile. Deserialize directly so a malformed field fails here
@@ -3894,6 +4046,7 @@ fn cessna_172sp() -> AircraftProfile {
     AircraftProfile {
         id: "cessna_172sp".into(),
         display_name: "Cessna 172SP Skyhawk".into(),
+        simbrief_types: Vec::new(),
         engines: 1,
         magnetos_per_engine: false,
         flood_lights_dataref: None,
@@ -3934,6 +4087,7 @@ fn cessna_172sp() -> AircraftProfile {
         // Stock actuator: both builtins model a sim-native transponder.
         transponder_mode_knob: None,
         takeoff_config: None,
+        takeoff_power: None,
         seat_belt_signs: None,
         ap_altitude_capture: false,
         ils: true,
@@ -4207,6 +4361,7 @@ fn cirrus_sr22() -> AircraftProfile {
     AircraftProfile {
         id: "cirrus_sr22".into(),
         display_name: "Cirrus SR22".into(),
+        simbrief_types: Vec::new(),
         engines: 1,
         magnetos_per_engine: false,
         flood_lights_dataref: None,
@@ -4239,6 +4394,7 @@ fn cirrus_sr22() -> AircraftProfile {
         // Stock actuator: both builtins model a sim-native transponder.
         transponder_mode_knob: None,
         takeoff_config: None,
+        takeoff_power: None,
         seat_belt_signs: None,
         ap_altitude_capture: false,
         ils: true,

@@ -564,6 +564,104 @@ fn estimate_phase(s: &Snapshot) -> Phase {
     }
 }
 
+/// The loop with its hands on the aircraft now, by name: the innermost
+/// (full auto flies through autoland, the takeoff, the taxi; it is named
+/// itself only between them, an engine start). A checklist flow is not
+/// flying anything.
+fn flying_loop() -> Option<&'static str> {
+    use std::sync::atomic::Ordering::Relaxed;
+    [
+        (crate::autoland::ACTIVE.load(Relaxed), "autoland"),
+        (crate::autotakeoff::ACTIVE.load(Relaxed), "takeoff"),
+        (crate::pushback::ACTIVE.load(Relaxed), "pushback"),
+        (crate::autotaxi::ACTIVE.load(Relaxed), "taxi"),
+        (crate::hover::ACTIVE.load(Relaxed), "hover"),
+        (crate::procedure::ACTIVE.load(Relaxed), "follower"),
+        (crate::circuit::ACTIVE.load(Relaxed), "circuit"),
+        (crate::heli_circuit::ACTIVE.load(Relaxed), "helicopter circuit"),
+        (crate::heli_route::ACTIVE.load(Relaxed), "helicopter route"),
+        (crate::full_auto::ACTIVE.load(Relaxed), "full auto"),
+    ]
+    .into_iter()
+    .find_map(|(on, name)| on.then_some(name))
+}
+
+/// The outermost mission armed: what the flight is FOR, the missions first
+/// (they own every loop under them). A lesson is a mission with its hands
+/// off. `None` = the pilot's own flight.
+fn mission() -> Option<&'static str> {
+    use std::sync::atomic::Ordering::Relaxed;
+    [
+        (crate::full_auto::ACTIVE.load(Relaxed), "full auto"),
+        (crate::heli_route::ACTIVE.load(Relaxed), "helicopter route"),
+        (crate::circuit::ACTIVE.load(Relaxed), "circuit"),
+        (crate::heli_circuit::ACTIVE.load(Relaxed), "helicopter circuit"),
+        (crate::instructor::active(), "lesson"),
+        (crate::procedure::ACTIVE.load(Relaxed), "follower"),
+        (crate::autoland::ACTIVE.load(Relaxed), "autoland"),
+        (crate::autotakeoff::ACTIVE.load(Relaxed), "takeoff"),
+        (crate::autotaxi::ACTIVE.load(Relaxed), "taxi"),
+        (crate::pushback::ACTIVE.load(Relaxed), "pushback"),
+        (crate::hover::ACTIVE.load(Relaxed), "hover"),
+    ]
+    .into_iter()
+    .find_map(|(on, name)| on.then_some(name))
+}
+
+/// The crew's side of the situation, from the process-wide facts that
+/// already carry it (the shelf, the follower's leg, the party line).
+fn situation() -> crate::flight::Situation {
+    use crate::flight::{ClearanceFact, PlanFact, Situation};
+    let plan = crate::simbrief::loaded_plan().map(|p| PlanFact {
+        source: match p.source {
+            crate::simbrief::PlanSource::SimBrief => "simbrief",
+            crate::simbrief::PlanSource::Local => "local",
+        },
+        origin: p.origin,
+        destination: p.destination,
+        cruise_alt_ft: p.cruise_alt_ft,
+    });
+    let clearance = crate::party_line::clearance_state().map(|st| ClearanceFact {
+        state: format!("{st:?}"),
+        runway: crate::party_line::clearance_runway(),
+        squawk: crate::party_line::assigned_squawk(),
+        readback_owed: crate::party_line::readback_owed().is_some(),
+    });
+    Situation {
+        mission: mission(),
+        plan,
+        active_fix: crate::procedure::active_leg().map(|l| l.fix),
+        clearance,
+        pilot_takeover: crate::flight::pilot_takeover(),
+    }
+}
+
+/// The flight model's sample from this tick: the `state` record's numbers
+/// plus the evidence only the live tick has. What the monitor does not read
+/// stays `None` (the model never enters a phase on a guess).
+fn flight_sample(s: &Snapshot, t: f64, crashed: bool) -> crate::flight::Sample {
+    crate::flight::Sample {
+        t,
+        on_ground: s.on_ground,
+        gs_kts: s.groundspeed_kts,
+        ias_kts: s.ias_kts,
+        vsi_fpm: s.vsi_fpm,
+        agl_ft: s.agl_ft,
+        alt_ft: s.alt_ft,
+        engine_running: s.engine_running,
+        fuel_kg: s.fuel_kg,
+        lat: Some(s.lat),
+        lon: Some(s.lon),
+        tug_attached: Some(s.tug_attached),
+        approach: Some(crate::autoland::ACTIVE.load(std::sync::atomic::Ordering::Relaxed)),
+        automation: flying_loop(),
+        autopilot: Some(s.ap_servos_on),
+        crashed: Some(crashed),
+        situation: Some(situation()),
+        ..crate::flight::Sample::default()
+    }
+}
+
 /// Severity of a callout. Maps onto the speech arbiter's priority.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[allow(dead_code)] // Advisory/Caution arrive with the M3 check set
@@ -2021,6 +2119,8 @@ pub async fn run(
     // single noisy sample doesn't read as a sharp washout.
     let mut prev_ias: Option<(f64, Instant)> = None;
     let mut trend = 0.0_f64;
+    // The flight model (`flight::Flight`), shadow-run beside `estimate_phase`.
+    let mut flight = crate::flight::Flight::new();
     // Pushback progress is a sequence of *events*, not a sustained condition, so
     // it's called out on transitions here rather than as Checks.
     let mut prev_attached = false;
@@ -2181,6 +2281,23 @@ pub async fn run(
         }
         if let Some(mut snap) = Snapshot::read(&xp, &drefs).await {
             let now = Instant::now();
+            // The flight model FIRST, every tick whatever is quiet: the
+            // consumers below read its phase, memory and this tick's events
+            // (`flight.rs`). Its events are blackboxed `flight`, its phase
+            // rides the state record as `fphase`.
+            let wall_t = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs_f64())
+                .unwrap_or(0.0);
+            // The world's reach: a station whose field we are not at (on the
+            // ground) neither hears nor answers, and an uncontrolled
+            // departure plans its own taxi.
+            crate::station::note_aircraft(snap.lat, snap.lon, snap.on_ground);
+            let crashed = voice.crashed();
+            let flight_events = flight.tick(&flight_sample(&snap, wall_t, crashed));
+            for ev in &flight_events {
+                crate::blackbox::record("flight", ev.to_json());
+            }
             seen_sim = true;
             lost_since = None;
             if disconnected {
@@ -2237,12 +2354,10 @@ pub async fn run(
             // decides who is flying and never acts on a proposal by itself.
             if crew_on {
                 let sample = crate::flow::Sample {
-                    on_ground: snap.on_ground,
                     agl_ft: snap.agl_ft,
                     vsi_fpm: snap.vsi_fpm,
-                    groundspeed_kts: snap.groundspeed_kts,
                 };
-                if let Some(section) = flow_tracker.tick(&sample, now) {
+                if let Some(section) = flow_tracker.tick(&sample, &flight, &flight_events, now) {
                     crate::flow::phase_boundary(section, &config, &voice);
                 }
             }
@@ -3334,6 +3449,7 @@ pub async fn run(
                     "park": r1(snap.park_brake), "cabin": r1(snap.cabin_altitude_ft),
                     "fuel_kg": snap.fuel_kg, "eng": snap.engine_running,
                     "phase": format!("{:?}", snap.phase),
+                    "fphase": format!("{:?}", flight.phase()), "crashed": crashed,
                 }),
             );
 

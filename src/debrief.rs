@@ -284,6 +284,16 @@ fn summarise(flight: &[&Value]) -> String {
         ));
     }
 
+    // --- The flight model's shadow run beside the old phase estimate.
+    let shadow = crate::flight::shadow_report(flight);
+    if !shadow.is_empty() {
+        out.push_str("Flight model (shadow):\n");
+        for l in shadow {
+            out.push_str(&l);
+            out.push('\n');
+        }
+    }
+
     // --- The narrative: everything an instructor would write down.
     out.push_str("Events:\n");
     let mut lines = Vec::new();

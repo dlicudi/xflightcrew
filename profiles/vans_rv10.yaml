@@ -149,3 +149,16 @@ lights:
   - { key: strobe,  spoken: strobe lights,     dataref: sim/cockpit2/switches/strobe_lights_on,     command_on: sim/lights/strobe_lights_on,  command_off: sim/lights/strobe_lights_off }
   - { key: landing, spoken: landing light,     dataref: sim/cockpit2/switches/landing_lights_on,    command_on: sim/lights/landing_lights_on, command_off: sim/lights/landing_lights_off }
   - { key: taxi,    spoken: taxi light,        dataref: sim/cockpit2/switches/taxi_light_on,        command_on: sim/lights/taxi_lights_on,    command_off: sim/lights/taxi_lights_off }
+
+# The nose gear CASTORS (.acf `_gear/0/_gear_castors 1`, no steering): it
+# turns on differential brake through the plugin channels, the SR22's way,
+# with the SR22's tuning until a taxi here is measured. Detection reads the
+# castor from the .acf anyway; declared here so the file says it (LILB
+# 2026-09-25: full rudder turned the Evolution 3.7 degrees a second at 6 kt
+# and it left the route three times).
+taxi:
+  steer_full_deg: 42.0
+  steer_slew_per_s: 0.8
+  steer_lead_s: 2.0
+  lookahead_s: 9.0
+  brake_steer: true

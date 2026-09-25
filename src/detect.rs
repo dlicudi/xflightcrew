@@ -265,11 +265,24 @@ pub(crate) fn spawn_aircraft_detector(
                             // one: the takeoff raises the gear only once the
                             // horn will not sound (SF50, 2026-09-23).
                             let prof = live.get();
-                            if prof.retractable_gear && prof.gear_warning.is_none() {
-                                if let Some(text) = acf_text(&xp).await {
+                            if let Some(text) = acf_text(&xp).await {
+                                if prof.retractable_gear && prof.gear_warning.is_none() {
                                     let w = aircraft::gear_warning_from_acf(&text);
                                     tracing::info!(?w, "gear warning envelope from the .acf");
                                     crate::autotakeoff::publish_gear_warning(w);
+                                }
+                                // A castoring nose steers on the brakes,
+                                // declared or not.
+                                let castors = aircraft::nose_castors_from_acf(&text);
+                                aircraft::publish_nose_castors(castors);
+                                aircraft::publish_nose_free(aircraft::nose_free_from_acf(&text));
+                                let declared = prof.taxi.as_ref().is_some_and(|t| t.brake_steer);
+                                tracing::info!(castors, declared, "nose gear from the .acf");
+                                if castors && !declared {
+                                    blackbox::record(
+                                        "profile_probe",
+                                        serde_json::json!({ "profile": id, "nose_castors": true, "brake_steer_declared": false }),
+                                    );
                                 }
                             }
                             let mut names = aircraft::profile_references(&live.get());

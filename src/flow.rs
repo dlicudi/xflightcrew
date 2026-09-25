@@ -229,10 +229,8 @@ pub fn find_titled(lists: &[Checklist], request: &str) -> Result<usize, Vec<Stri
 
 /// What the tracker needs from a monitor tick.
 pub struct Sample {
-    pub on_ground: bool,
     pub agl_ft: f64,
     pub vsi_fpm: f64,
-    pub groundspeed_kts: f64,
 }
 
 /// Climb list once the climb is established, not at liftoff, and AFTER the
@@ -256,25 +254,30 @@ pub const DESCENT_SECS: f64 = 20.0;
 /// Before-landing list: descending below this, sustained.
 pub const BEFORE_LANDING_AGL_FT: f64 = 1500.0;
 pub const BEFORE_LANDING_SECS: f64 = 10.0;
-/// After-landing list: rolled out below this speed for this long.
-pub const AFTER_LANDING_KTS: f64 = 30.0;
+/// After-landing list: this long after the rollout slowed through 30 kt
+/// (the model's taxi-in).
 pub const AFTER_LANDING_SECS: f64 = 10.0;
 
 /// Phase-boundary detector, one per monitor loop. Each section fires ONCE per
-/// flight (a flight starts at the takeoff roll and ends with the after-landing
-/// list), on sustained conditions rather than a single tick, so a gust does
-/// not read as a descent. Pure: the monitor feeds it, it names a section.
+/// flight, on sustained conditions rather than a single tick, so a gust does
+/// not read as a descent. The FLIGHT is the model's (`flight::Flight`): it
+/// begins at the model's takeoff (or a reposition), its peak height is the
+/// model's memory, on the ground or airborne is the model's phase (a bounce
+/// is not a new flight), and the after-landing list needs the model's taxi-in
+/// after a real touchdown (an impact or a wreck runs no list). The sustained
+/// thresholds stay the tracker's own: each carries a sortie behind it.
 #[derive(Default)]
 pub struct Tracker {
     fired: Vec<&'static str>,
-    airborne_seen: bool,
-    peak_agl_ft: f64,
     climbing_since: Option<Instant>,
     level_since: Option<Instant>,
     descending_since: Option<Instant>,
     low_descent_since: Option<Instant>,
-    stopped_since: Option<Instant>,
+    taxi_in_since: Option<Instant>,
 }
+
+/// The model's rollout ends 3 s under 30 kt; the list waited 10 s under it.
+const AFTER_LANDING_TAXI_IN_SECS: f64 = AFTER_LANDING_SECS - 3.0;
 
 impl Tracker {
     fn fired(&self, s: &str) -> bool {
@@ -286,8 +289,27 @@ impl Tracker {
         Some(s)
     }
 
-    /// Feed one tick; the section whose boundary was just crossed, if any.
-    pub fn tick(&mut self, s: &Sample, now: Instant) -> Option<&'static str> {
+    /// Feed one tick with the model as it stands after this tick and the
+    /// events the tick produced; the section whose boundary was just
+    /// crossed, if any.
+    pub fn tick(
+        &mut self,
+        s: &Sample,
+        f: &crate::flight::Flight,
+        events: &[crate::flight::Event],
+        now: Instant,
+    ) -> Option<&'static str> {
+        use crate::flight::{Abnormal, Event, Phase};
+        if events
+            .iter()
+            .any(|e| matches!(e, Event::Takeoff | Event::Reposition { .. }))
+        {
+            // A new flight arms every section.
+            *self = Tracker::default();
+        }
+        if matches!(f.abnormal(), Abnormal::Crashed) {
+            return None;
+        }
         let held = |since: &mut Option<Instant>, on: bool, secs: f64| -> bool {
             if !on {
                 *since = None;
@@ -296,37 +318,25 @@ impl Tracker {
             let t = *since.get_or_insert(now);
             now.duration_since(t).as_secs_f64() >= secs
         };
-        if s.on_ground {
+        let phase = f.phase();
+        let m = f.memory();
+        if !phase.airborne() {
             self.climbing_since = None;
             self.level_since = None;
             self.descending_since = None;
             self.low_descent_since = None;
-            if !self.airborne_seen {
-                // A new takeoff roll arms every section for the flight ahead.
-                if s.groundspeed_kts > 35.0 {
-                    self.fired.clear();
-                }
-                self.stopped_since = None;
-                return None;
-            }
-            let stopped = held(
-                &mut self.stopped_since,
-                s.groundspeed_kts.abs() < AFTER_LANDING_KTS,
-                AFTER_LANDING_SECS,
-            );
+            let landed = phase == Phase::TaxiIn && m.landings > 0;
+            let stopped = held(&mut self.taxi_in_since, landed, AFTER_LANDING_TAXI_IN_SECS);
             if stopped && !self.fired("after landing") {
                 // The flight is over: the next one starts from scratch.
-                self.airborne_seen = false;
-                self.peak_agl_ft = 0.0;
-                self.stopped_since = None;
                 self.fired.clear();
+                self.taxi_in_since = None;
                 return self.fire("after landing");
             }
             return None;
         }
-        self.airborne_seen = true;
-        self.stopped_since = None;
-        self.peak_agl_ft = self.peak_agl_ft.max(s.agl_ft);
+        self.taxi_in_since = None;
+        let peak = m.peak_agl_ft;
         let climbing = held(
             &mut self.climbing_since,
             s.vsi_fpm > 300.0 && s.agl_ft >= CLIMB_AGL_FT,
@@ -345,7 +355,7 @@ impl Tracker {
         }
         let descending = held(
             &mut self.descending_since,
-            s.vsi_fpm < -300.0 && self.peak_agl_ft >= CRUISE_MIN_AGL_FT,
+            s.vsi_fpm < -300.0 && peak >= CRUISE_MIN_AGL_FT,
             DESCENT_SECS,
         );
         if descending && !self.fired("descent") {
@@ -353,7 +363,7 @@ impl Tracker {
         }
         let low = held(
             &mut self.low_descent_since,
-            s.agl_ft < BEFORE_LANDING_AGL_FT && s.vsi_fpm < -100.0 && self.peak_agl_ft >= 1000.0,
+            s.agl_ft < BEFORE_LANDING_AGL_FT && s.vsi_fpm < -100.0 && peak >= 1000.0,
             BEFORE_LANDING_SECS,
         );
         if low && !self.fired("before landing") {
@@ -1339,15 +1349,6 @@ mod tests {
         checklist::load(&p172()).expect("172 checklist file")
     }
 
-    fn sample(on_ground: bool, agl: f64, vsi: f64, gs: f64) -> Sample {
-        Sample {
-            on_ground,
-            agl_ft: agl,
-            vsi_fpm: vsi,
-            groundspeed_kts: gs,
-        }
-    }
-
     #[test]
     fn every_phase_section_is_found_in_the_172_file() {
         let lists = lists172();
@@ -1459,119 +1460,129 @@ mod tests {
         assert!(find_titled(&lists, "holding").is_err());
     }
 
+    /// The tracker flown through the real flight model at 1 Hz: the model
+    /// decides the flight (takeoff, peak, taxi-in), the tracker its
+    /// sustained boundaries.
+    struct Rig {
+        f: crate::flight::Flight,
+        t: Tracker,
+        t0: Instant,
+        secs: f64,
+        agl: f64,
+        fired: Vec<(f64, &'static str)>,
+    }
+
+    impl Rig {
+        fn new() -> Rig {
+            Rig {
+                f: crate::flight::Flight::new(),
+                t: Tracker::default(),
+                t0: Instant::now(),
+                secs: 0.0,
+                agl: 0.0,
+                fired: Vec::new(),
+            }
+        }
+        /// `n` seconds on the ground at `gs`, or airborne at `vsi` (the
+        /// height integrates), one sample a second.
+        fn fly(&mut self, n: usize, ground: bool, vsi: f64, gs: f64) -> &mut Rig {
+            for _ in 0..n {
+                self.secs += 1.0;
+                if ground {
+                    self.agl = 0.0;
+                } else {
+                    self.agl = (self.agl + vsi / 60.0).max(60.0);
+                }
+                let fs = crate::flight::Sample {
+                    t: self.secs,
+                    on_ground: ground,
+                    gs_kts: gs,
+                    ias_kts: gs,
+                    vsi_fpm: vsi,
+                    agl_ft: self.agl,
+                    alt_ft: self.agl + 100.0,
+                    engine_running: true,
+                    ..crate::flight::Sample::default()
+                };
+                let ev = self.f.tick(&fs);
+                let now = self.t0 + Duration::from_secs_f64(self.secs);
+                let s = Sample { agl_ft: self.agl, vsi_fpm: vsi };
+                if let Some(sec) = self.t.tick(&s, &self.f, &ev, now) {
+                    self.fired.push((self.agl, sec));
+                }
+            }
+            self
+        }
+        fn names(&self) -> Vec<&'static str> {
+            self.fired.iter().map(|(_, n)| *n).collect()
+        }
+    }
+
     #[test]
     fn tracker_fires_each_section_once_in_flight_order() {
-        let mut t = Tracker::default();
-        let t0 = Instant::now();
-        let s = |secs: f64| t0 + Duration::from_secs_f64(secs);
-        // Parked, then the roll.
-        assert_eq!(t.tick(&sample(true, 0.0, 0.0, 0.0), s(0.0)), None);
-        assert_eq!(t.tick(&sample(true, 0.0, 0.0, 50.0), s(5.0)), None);
-        // Liftoff: not yet a climb list.
-        assert_eq!(t.tick(&sample(false, 100.0, 700.0, 70.0), s(10.0)), None);
-        // Through 1,200 ft climbing - and it WAITS. The single tick used to
-        // fire here, straight into the automation's own thousand-foot flap
-        // and light actions, and audited them half done (EGLF, 2026-09-22).
-        assert_eq!(t.tick(&sample(false, 1300.0, 700.0, 75.0), s(60.0)), None);
-        assert_eq!(t.tick(&sample(false, 1900.0, 700.0, 75.0), s(70.0)), None);
+        let mut r = Rig::new();
+        r.fly(5, true, 0.0, 0.0).fly(8, true, 0.0, 50.0);
+        // Climb at 700 fpm to 4,500 ft: the climb list waits for 1,200 ft
+        // AND fifteen seconds of it (EGLF, 2026-09-22).
+        r.fly(380, false, 700.0, 75.0);
+        let climb_at = r.fired.iter().find(|(_, n)| *n == "climb").map(|(a, _)| *a);
+        assert!(climb_at.is_some_and(|a| a >= 1200.0 + 700.0 / 4.0 - 20.0), "{:?}", r.fired);
+        // Level: cruise after the hold. A five second sink is not a descent.
+        r.fly(40, false, 0.0, 110.0).fly(5, false, -500.0, 110.0).fly(10, false, 0.0, 110.0);
+        assert_eq!(r.names(), vec!["climb", "cruise"]);
+        // A sustained descent is; then low and descending, before landing.
+        r.fly(560, false, -500.0, 110.0);
+        assert_eq!(r.names(), vec!["climb", "cruise", "descent", "before landing"]);
+        assert!(r.agl <= 60.0, "on short final: {}", r.agl);
+        // Touchdown, rollout, slow: after landing, once.
+        r.fly(8, true, 0.0, 55.0).fly(30, true, 0.0, 15.0);
         assert_eq!(
-            t.tick(&sample(false, 2600.0, 700.0, 75.0), s(76.0)),
-            Some("climb")
+            r.names(),
+            vec!["climb", "cruise", "descent", "before landing", "after landing"]
         );
-        assert_eq!(t.tick(&sample(false, 3000.0, 700.0, 75.0), s(80.0)), None);
-        // Level at 4,500: cruise after the hold.
-        assert_eq!(t.tick(&sample(false, 4500.0, 0.0, 110.0), s(300.0)), None);
-        assert_eq!(t.tick(&sample(false, 4500.0, 50.0, 110.0), s(320.0)), None);
-        assert_eq!(
-            t.tick(&sample(false, 4500.0, -50.0, 110.0), s(331.0)),
-            Some("cruise")
-        );
-        // A brief sink is not a descent.
-        assert_eq!(
-            t.tick(&sample(false, 4400.0, -500.0, 110.0), s(400.0)),
-            None
-        );
-        assert_eq!(t.tick(&sample(false, 4500.0, 0.0, 110.0), s(405.0)), None);
-        // A sustained one is.
-        assert_eq!(
-            t.tick(&sample(false, 4300.0, -500.0, 115.0), s(900.0)),
-            None
-        );
-        assert_eq!(
-            t.tick(&sample(false, 4000.0, -500.0, 115.0), s(921.0)),
-            Some("descent")
-        );
-        // Low and descending: before landing.
-        assert_eq!(
-            t.tick(&sample(false, 1400.0, -400.0, 90.0), s(1200.0)),
-            None
-        );
-        assert_eq!(
-            t.tick(&sample(false, 1300.0, -400.0, 90.0), s(1211.0)),
-            Some("before landing")
-        );
-        // Touchdown, rollout, slow: after landing.
-        assert_eq!(t.tick(&sample(true, 0.0, 0.0, 55.0), s(1400.0)), None);
-        assert_eq!(t.tick(&sample(true, 0.0, 0.0, 20.0), s(1405.0)), None);
-        assert_eq!(
-            t.tick(&sample(true, 0.0, 0.0, 15.0), s(1416.0)),
-            Some("after landing")
-        );
-        // Sitting there says nothing more; the next roll re-arms the flight.
-        assert_eq!(t.tick(&sample(true, 0.0, 0.0, 0.0), s(1500.0)), None);
-        assert_eq!(t.tick(&sample(true, 0.0, 0.0, 50.0), s(1600.0)), None);
-        assert_eq!(t.tick(&sample(false, 1300.0, 700.0, 75.0), s(1700.0)), None);
-        assert_eq!(
-            t.tick(&sample(false, 1900.0, 700.0, 75.0), s(1716.0)),
-            Some("climb")
-        );
+        // The next flight arms them all again.
+        r.fly(10, true, 0.0, 0.0).fly(8, true, 0.0, 50.0).fly(160, false, 700.0, 75.0);
+        assert_eq!(r.names().last(), Some(&"climb"));
+        assert_eq!(r.names().iter().filter(|n| **n == "climb").count(), 2);
     }
 
     /// A climb that stops being one before the hold is up starts the clock
     /// again: levelling at 1,300 ft is not the climb the list belongs to.
     #[test]
     fn the_climb_list_needs_a_sustained_climb_not_a_moment_of_one() {
-        let mut t = Tracker::default();
-        let t0 = Instant::now();
-        let s = |secs: f64| t0 + Duration::from_secs_f64(secs);
-        t.tick(&sample(true, 0.0, 0.0, 50.0), s(0.0));
-        assert_eq!(t.tick(&sample(false, 1300.0, 700.0, 75.0), s(10.0)), None);
-        // Levels off: the climb is over and the clock is thrown away.
-        assert_eq!(t.tick(&sample(false, 1400.0, 0.0, 75.0), s(18.0)), None);
-        assert_eq!(t.tick(&sample(false, 1400.0, 0.0, 75.0), s(30.0)), None);
-        // Climbing again: the hold starts from HERE, not from the first pass.
-        assert_eq!(t.tick(&sample(false, 1500.0, 700.0, 75.0), s(31.0)), None);
-        assert_eq!(t.tick(&sample(false, 2000.0, 700.0, 75.0), s(40.0)), None);
-        assert_eq!(
-            t.tick(&sample(false, 2600.0, 700.0, 75.0), s(47.0)),
-            Some("climb")
-        );
+        let mut r = Rig::new();
+        r.fly(5, true, 0.0, 0.0).fly(8, true, 0.0, 50.0);
+        r.fly(110, false, 700.0, 75.0); // to ~1,300 ft, 5 s past 1,200
+        r.fly(20, false, 0.0, 75.0);
+        assert!(r.names().is_empty(), "{:?}", r.fired);
+        r.fly(14, false, 700.0, 75.0);
+        assert!(r.names().is_empty(), "the hold restarts: {:?}", r.fired);
+        r.fly(3, false, 700.0, 75.0);
+        assert_eq!(r.names(), vec!["climb"]);
     }
 
     #[test]
     fn a_pattern_never_earns_a_cruise_or_descent_list() {
-        let mut t = Tracker::default();
-        let t0 = Instant::now();
-        let s = |secs: f64| t0 + Duration::from_secs_f64(secs);
-        t.tick(&sample(true, 0.0, 0.0, 50.0), s(0.0));
-        assert_eq!(t.tick(&sample(false, 1300.0, 700.0, 75.0), s(30.0)), None);
-        assert_eq!(
-            t.tick(&sample(false, 1400.0, 700.0, 75.0), s(46.0)),
-            Some("climb")
-        );
-        // Downwind at 1,000 ft for two minutes.
-        for k in 0..24 {
-            assert_eq!(
-                t.tick(&sample(false, 1000.0, 0.0, 95.0), s(60.0 + k as f64 * 5.0)),
-                None
-            );
-        }
+        let mut r = Rig::new();
+        r.fly(5, true, 0.0, 0.0).fly(8, true, 0.0, 50.0);
+        r.fly(130, false, 700.0, 75.0);
+        assert_eq!(r.names(), vec!["climb"]);
+        // Downwind at circuit height for two minutes.
+        r.fly(120, false, 0.0, 95.0);
         // Base and final: before landing only.
-        assert_eq!(t.tick(&sample(false, 800.0, -500.0, 80.0), s(200.0)), None);
-        assert_eq!(
-            t.tick(&sample(false, 600.0, -500.0, 75.0), s(211.0)),
-            Some("before landing")
-        );
+        r.fly(100, false, -500.0, 80.0);
+        assert_eq!(r.names(), vec!["climb", "before landing"]);
+    }
+
+    /// An impact is no landing, and a wreck runs no list (the S-76 at LILB,
+    /// 2026-09-24, would have been offered its after-landing checklist).
+    #[test]
+    fn a_crash_runs_no_after_landing_list() {
+        let mut r = Rig::new();
+        r.fly(5, true, 0.0, 0.0).fly(8, true, 0.0, 50.0).fly(60, false, 900.0, 70.0);
+        // Straight in at 2,900 fpm.
+        r.fly(20, false, -2900.0, 60.0).fly(30, true, 0.0, 2.0);
+        assert!(!r.names().contains(&"after landing"), "{:?}", r.fired);
     }
 
     #[test]

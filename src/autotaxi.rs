@@ -718,6 +718,12 @@ const BRAKE_STEER_SLEW_PER_S: f64 = 0.4;
 /// near-stopped aircraft asymmetrically is a lurch.
 const BRAKE_STEER_MIN_KTS: f64 = 4.0;
 const BRAKE_STEER_FULL_KTS: f64 = 7.0;
+/// The band on a nose with NO steering of its own (`aircraft::nose_free`):
+/// under 4 kt nothing turned the Evolution, and the propeller's pull swung
+/// it 35 degrees off LILB 03's centreline at 3 kt after the line-up
+/// (2026-09-25).
+const FREE_NOSE_MIN_KTS: f64 = 1.5;
+const FREE_NOSE_FULL_KTS: f64 = 4.0;
 
 /// Differential-brake steering: the (left, right) brake ratios for a steer
 /// command, for airframes flagged [`Pace::brake_steer`].
@@ -735,8 +741,18 @@ const BRAKE_STEER_FULL_KTS: f64 = 7.0;
 /// the pilot slowing the aircraft. The governor's speed loop simply carries
 /// the extra drag.
 pub fn brake_steer_split(steer: f64, gs_kts: f64) -> (f64, f64) {
-    let authority = ((gs_kts - BRAKE_STEER_MIN_KTS) / (BRAKE_STEER_FULL_KTS - BRAKE_STEER_MIN_KTS))
-        .clamp(0.0, 1.0);
+    brake_steer_split_band(steer, gs_kts, false)
+}
+
+/// [`brake_steer_split`], with the low-speed band of a nose that cannot
+/// steer itself when `free_nose`.
+pub fn brake_steer_split_band(steer: f64, gs_kts: f64, free_nose: bool) -> (f64, f64) {
+    let (lo, hi) = if free_nose {
+        (FREE_NOSE_MIN_KTS, FREE_NOSE_FULL_KTS)
+    } else {
+        (BRAKE_STEER_MIN_KTS, BRAKE_STEER_FULL_KTS)
+    };
+    let authority = ((gs_kts - lo) / (hi - lo)).clamp(0.0, 1.0);
     let excess = ((steer.abs() - BRAKE_STEER_DEADBAND) / (BRAKE_STEER_SAT - BRAKE_STEER_DEADBAND))
         .clamp(0.0, 1.0);
     let b = excess * BRAKE_STEER_MAX * authority;
@@ -787,6 +803,34 @@ pub fn pivot_brake_split(steer: f64, gs_kts: f64) -> (f64, f64) {
     }
 }
 const PIVOT_MIN_ERR_DEG: f64 = 60.0;
+
+/// The brake half of the taxi steering follows the steer command through
+/// this lag. The steer carries the rate lead's reading of a yaw rate
+/// differenced at 5 Hz, and the brake copied it tick for tick: on LILB's
+/// straights (2026-09-25) the Evolution's right brake pulsed 0.02 to 0.14
+/// every second, the yaw swung +/-1.7 deg/s and the governor surged a knot
+/// against each pulse. A foot holds a pressure; it does not tap.
+pub const BRAKE_STEER_TAU_S: f64 = 0.8;
+
+/// One step of a first-order lag toward `want`.
+pub fn smooth_toward(prev: f64, want: f64, tau_s: f64, dt: f64) -> f64 {
+    prev + (want - prev) * (dt / (tau_s + dt)).clamp(0.0, 1.0)
+}
+
+/// A pivot's brake eases above this yaw rate, in the direction it is
+/// turning, and is gone [`PIVOT_RATE_SPAN_DPS`] above it: the Evolution's
+/// join spun at 35 deg/s on 0.36 of brake, overshot the route by 23 degrees
+/// and reversed at full opposite steer (LILB 2026-09-25).
+pub const PIVOT_RATE_DPS: f64 = 15.0;
+const PIVOT_RATE_SPAN_DPS: f64 = 10.0;
+
+/// The share of a pivot's brake still wanted at `yaw_dps`. Pure.
+pub fn pivot_rate_scale(steer: f64, yaw_dps: f64) -> f64 {
+    if steer * yaw_dps <= 0.0 {
+        return 1.0;
+    }
+    (1.0 - (yaw_dps.abs() - PIVOT_RATE_DPS) / PIVOT_RATE_SPAN_DPS).clamp(0.0, 1.0)
+}
 
 /// Whether a castoring nosewheel's turn is a PIVOT: a join past
 /// [`PIVOT_MIN_ERR_DEG`], or ANY error that big at a pace under the taxi
@@ -890,6 +934,37 @@ pub fn line_up_path(
     let b = project_latlon(rwy.thr_lat, rwy.thr_lon, rwy.course_deg, stop_m / M_PER_NM);
     Some(vec![(lat, lon), e, b])
 }
+
+/// A backtrack's leg two: the aircraft has turned round ON the strip and
+/// points down it already, so it only settles its offset and straightens.
+/// It used the hold-short geometry (an entry 30 to 60 m ahead, then
+/// [`LINE_UP_ALIGN_M`]) and the Evolution drove 114 m of LILB's 600 m
+/// runway after its turn; the takeoff then found 448 m left against 599
+/// needed (2026-09-25). At most [`BACKTRACK_SETTLE_MAX_M`] plus
+/// [`BACKTRACK_ALIGN_M`].
+pub fn backtrack_leg_two_path(
+    rwy: &crate::autoland::Runway,
+    lat: f64,
+    lon: f64,
+) -> Option<Vec<(f64, f64)>> {
+    use crate::autoland::{along_track_nm, cross_track_nm, project_latlon};
+    let lateral = (cross_track_nm(lat, lon, rwy) * M_PER_NM).abs();
+    if lateral > LINE_UP_MAX_LATERAL_M {
+        return None;
+    }
+    let a0 = (-along_track_nm(lat, lon, rwy) * M_PER_NM).max(0.0);
+    let entry_m = a0 + (lateral * 4.0).clamp(BACKTRACK_SETTLE_MIN_M, BACKTRACK_SETTLE_MAX_M);
+    let stop_m = entry_m + BACKTRACK_ALIGN_M;
+    if rwy.length_m - stop_m < LINE_UP_MIN_REMAINING_M.min(rwy.length_m * 0.5) {
+        return None;
+    }
+    let e = project_latlon(rwy.thr_lat, rwy.thr_lon, rwy.course_deg, entry_m / M_PER_NM);
+    let b = project_latlon(rwy.thr_lat, rwy.thr_lon, rwy.course_deg, stop_m / M_PER_NM);
+    Some(vec![(lat, lon), e, b])
+}
+const BACKTRACK_SETTLE_MIN_M: f64 = 10.0;
+const BACKTRACK_SETTLE_MAX_M: f64 = 30.0;
+const BACKTRACK_ALIGN_M: f64 = 30.0;
 
 /// Where a plain line-up from this position would enter and stop (meters
 /// past the threshold), or `None` when the position isn't a hold-short
@@ -1452,9 +1527,9 @@ pub fn start_backtrack(
                 return;
             };
             // Leg two of a backtrack: the aircraft has turned around and is
-            // already aligned down the strip, so the diagonal fallback (None)
-            // is correct — there is no lead-on to follow here.
-            let Some(path) = line_up_path(&rwy, lat, lon, None) else {
+            // already on the strip pointing down it; settle and straighten
+            // in the least runway that does it.
+            let Some(path) = backtrack_leg_two_path(&rwy, lat, lon) else {
                 BACKTRACKING.store(false, Ordering::Relaxed);
                 alert(
                     &voice,
@@ -1549,6 +1624,8 @@ async fn drive(xp: XPlaneClient, voice: Option<Voice>, route: Route, base_kts: f
     // so the assist's own slew has something to move from.
     let mut bs_on = false;
     let mut bs_prev = (0.0f64, 0.0f64);
+    // The steer the BRAKES follow ([`BRAKE_STEER_TAU_S`]).
+    let mut bs_steer = 0.0f64;
     // Stagnation watch: commanding motion but not moving (see below).
     let mut stalled_since: Option<std::time::Instant> = None;
     loop {
@@ -1664,6 +1741,7 @@ async fn drive(xp: XPlaneClient, voice: Option<Voice>, route: Route, base_kts: f
         if yield_r.is_ok_and(|v| v > 0.5) {
             tracing::info!("auto taxi: pilot on the pedals, steering released");
             crate::blackbox::record("autotaxi", serde_json::json!({"event": "pedal_yield"}));
+            crate::flight::note_pilot_takeover("taxi: pedals");
             alert(
                 &voice,
                 Priority::Advisory,
@@ -1887,12 +1965,15 @@ async fn drive(xp: XPlaneClient, voice: Option<Voice>, route: Route, base_kts: f
         // together, so the whole steering output costs ONE round trip, not
         // three. The 2026-07-28 lesson was about sequential awaits dragging
         // the loop to a second, not about the number of writes.)
-        let (bl, br) = if route.pace.brake_steer {
+        let (bl, br) = if route.pace.brake_steer || crate::aircraft::nose_castors() {
             let pivot = pivot_due(err, gs_kts, join_allow.unwrap_or(0.0) > 0.0);
+            bs_steer = smooth_toward(bs_steer, steer, BRAKE_STEER_TAU_S, dt);
             let (wl, wr) = if pivot {
-                pivot_brake_split(steer, gs_kts)
+                let (l, r) = pivot_brake_split(steer, gs_kts);
+                let k = pivot_rate_scale(steer, yaw_rate);
+                (l * k, r * k)
             } else {
-                brake_steer_split(steer, gs_kts)
+                brake_steer_split_band(bs_steer, gs_kts, crate::aircraft::nose_free())
             };
             let bl = slew_steer(bs_prev.0, wl, Some(BRAKE_STEER_SLEW_PER_S), dt);
             let br = slew_steer(bs_prev.1, wr, Some(BRAKE_STEER_SLEW_PER_S), dt);
@@ -1920,7 +2001,7 @@ async fn drive(xp: XPlaneClient, voice: Option<Voice>, route: Route, base_kts: f
                 "bs": bs_on, "bl": bl, "br": br, "tug": tug_on,
             }),
         );
-        let steer_write = if route.pace.brake_steer {
+        let steer_write = if route.pace.brake_steer || crate::aircraft::nose_castors() {
             let (s, a, b) = tokio::join!(
                 xp.set_float(TAXI_STEER, steer),
                 xp.set_float(LEFT_BRAKE, bl),
@@ -3109,6 +3190,35 @@ mod tests {
         assert!(pick_line_up(&cands, hlat, hlon, Some("18"), None).is_none());
     }
 
+    /// LILB 03 (2026-09-25): turned round 38 m past the numbers on a 600 m
+    /// strip, leg two used to drive 114 m and leave 448. Now it settles and
+    /// straightens inside 60 m.
+    #[test]
+    fn a_backtracks_leg_two_spends_little_runway() {
+        use crate::autoland::{along_track_nm, Runway};
+        let rwy = Runway {
+            icao: "LILB".into(),
+            id: "03".into(),
+            thr_lat: 0.0,
+            thr_lon: 0.0,
+            course_deg: 0.0,
+            length_m: 600.0,
+            surface: 1,
+            dist_nm: 0.0,
+            elev_ft: 0.0,
+        };
+        let on = crate::autoland::project_latlon(0.0, 0.0, 0.0, 38.0 / 1852.0);
+        let (lat, lon) = crate::autoland::project_latlon(on.0, on.1, 90.0, 3.0 / 1852.0);
+        let path = backtrack_leg_two_path(&rwy, lat, lon).expect("fits");
+        let stop = path.last().unwrap();
+        let stop_m = -along_track_nm(stop.0, stop.1, &rwy) * 1852.0;
+        assert!(stop_m <= 38.0 + 60.0 + 0.5, "stops by {stop_m:.0} m");
+        assert!(600.0 - stop_m >= 500.0, "leaves {:.0} m", 600.0 - stop_m);
+        // The old hold-short geometry spent nearly twice that.
+        let (_, old_stop) = line_up_stops_m(&rwy, lat, lon, None).unwrap();
+        assert!(old_stop > stop_m + 40.0, "old {old_stop:.0} vs new {stop_m:.0}");
+    }
+
     #[test]
     fn backtrack_drives_to_a_pocket_beside_the_numbers() {
         use crate::autoland::{along_track_nm, cross_track_nm, Runway};
@@ -3331,6 +3441,84 @@ mod tests {
         let (trimmed, peak) = fly(true);
         assert!(trimmed < 0.5, "trimmed out: {trimmed:.2} m");
         assert!(peak < untrimmed, "no weave bigger than the offset it replaced: {peak:.1} m");
+    }
+
+    /// LILB (2026-09-25): the Evolution's brake pulsed with every flicker of
+    /// the rate lead. Flown on its own pace through a brake-steered yaw plant
+    /// that pulls left (0.05 of right brake to run straight), with the yaw
+    /// rate read through the loop's own filter from a heading that carries
+    /// +/-0.15 degrees of noise: the smoothed brake moves far less, and the
+    /// aircraft tracks no worse.
+    #[test]
+    fn a_smoothed_brake_holds_a_straight_without_pulsing() {
+        let pace = Pace::from_profile(
+            crate::aircraft::load("lancair_evolution").expect("evot").taxi.as_ref(),
+        );
+        assert!(pace.brake_steer);
+        // (total brake travel over the run, peak |offset| after 30 s)
+        let fly = |tau: f64| -> (f64, f64) {
+            let (k_dps, pull, tau_plant, gs, dt) = (60.0, 3.0, 0.6, 12.0, 0.2);
+            let v = gs * 0.514_444;
+            let (mut y, mut psi, mut r) = (1.5_f64, 0.0_f64, 0.0_f64);
+            let (mut prev, mut bs, mut yaw, mut prev_meas) = (0.0_f64, 0.0_f64, 0.0_f64, 0.0_f64);
+            let mut trim = StraightTrim::default();
+            let (mut travel, mut last_b, mut peak) = (0.0_f64, 0.0_f64, 0.0_f64);
+            let mut seed = 7u64;
+            let look = lookahead_m_with(gs, pace.lookahead_s);
+            for i in 0..900 {
+                seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                let noise = ((seed >> 33) as f64 / (1u64 << 31) as f64 - 0.5) * 0.3;
+                let meas = psi + noise;
+                yaw = yaw * 0.5 + ((meas - prev_meas) / dt) * 0.5;
+                prev_meas = meas;
+                let err = (-y).atan2(look).to_degrees() - psi;
+                let tr = trim.step(y, 0.0, gs, false, 1000.0, dt);
+                let want = (steer_cmd_with(damped_err_deg(err, yaw, 0.0, pace.steer_lead_s), pace.steer_full_deg) + tr)
+                    .clamp(-1.0, 1.0);
+                let steer = slew_steer(prev, want, pace.steer_slew_per_s, dt);
+                prev = steer;
+                bs = if tau > 0.0 { smooth_toward(bs, steer, tau, dt) } else { steer };
+                let (bl, br) = brake_steer_split(bs, gs);
+                let b = br - bl;
+                travel += (b - last_b).abs();
+                last_b = b;
+                r += (k_dps * b - pull - r) * (dt / tau_plant).min(1.0);
+                psi += r * dt;
+                y += v * psi.to_radians().sin() * dt;
+                if i as f64 * dt > 30.0 {
+                    peak = peak.max(y.abs());
+                }
+            }
+            (travel, peak)
+        };
+        let (raw_travel, raw_peak) = fly(0.0);
+        let (smooth_travel, smooth_peak) = fly(BRAKE_STEER_TAU_S);
+        assert!(
+            smooth_travel < raw_travel * 0.6,
+            "the brake must move far less: {smooth_travel:.2} vs {raw_travel:.2}"
+        );
+        assert!(
+            smooth_peak <= raw_peak.max(1.0),
+            "and track no worse: {smooth_peak:.2} m vs {raw_peak:.2} m"
+        );
+    }
+
+    #[test]
+    fn a_nose_that_cannot_steer_is_brake_steered_down_to_walking_pace() {
+        // The LILB line-up's last metres: 3 kt, 0.3 of steer, 30 degrees off.
+        assert_eq!(brake_steer_split_band(0.3, 3.0, false), (0.0, 0.0), "the old band: nothing");
+        let (_, r) = brake_steer_split_band(0.3, 3.0, true);
+        assert!(r > 0.05, "a free nose gets its brake: {r:.3}");
+        assert_eq!(brake_steer_split_band(0.3, 1.0, true), (0.0, 0.0), "stopped is the stop's");
+    }
+
+    #[test]
+    fn a_pivot_lets_go_of_the_brake_as_the_turn_rate_builds() {
+        assert_eq!(pivot_rate_scale(-0.7, -10.0), 1.0, "under the ceiling");
+        assert!((pivot_rate_scale(-0.7, -20.0) - 0.5).abs() < 1e-9);
+        assert_eq!(pivot_rate_scale(-0.7, -35.0), 0.0, "the LILB join spin");
+        assert_eq!(pivot_rate_scale(-0.7, 30.0), 1.0, "turning the wrong way keeps it all");
+        assert!((smooth_toward(0.0, 1.0, 0.8, 0.2) - 0.2).abs() < 1e-9);
     }
 
     #[test]

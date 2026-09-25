@@ -20,6 +20,9 @@
 
 id: lancair_evolution
 display_name: Lancair Evolution
+# SimBrief has no Evolution: the pilot's custom airframe is built on the
+# Piper M500 and files as P46T (2026-09-25).
+simbrief_types: [P46T]
 
 # Universal-dataref tools.
 throttle: true         # power lever (set_throttle -> throttle_ratio_all) — NOT piston
@@ -183,8 +186,16 @@ reference:
   service_ceiling_ft: 28000.0
   fuel_capacity_gal: 168.0 # wet wing, Jet-A
   endurance_hours: 4.3     # 168 gal at the 39 gal/hr book burn
-  takeoff_distance_ft: 2000.0 # "comfortable takeoff and landing distance of
-  landing_distance_ft: 2000.0 # about 2,000 feet" (POM introduction)
+  # Published figures for the turbine Evolution (Plane & Pilot, 2026-09-25):
+  # takeoff roll 1,200 to 1,500 ft, a rolling takeoff using about 1,500;
+  # landing 1,000 to 1,200 ft, 1,000 with reverse. The CONSERVATIVE end of
+  # each is the max-gross figure the gates use (roll x 1.4, weight-scaled,
+  # 500 m floor). The POM's "comfortable ... about 2,000 feet" as a ROLL
+  # refused LILB's 1,970 ft at 2,644 needed. Hypotheses until a blackboxed
+  # takeoff and landing measure them.
+  takeoff_distance_ft: 2000.0  # recited field length: the POM's comfortable figure
+  takeoff_roll_ft: 1500.0
+  landing_distance_ft: 1200.0
   max_rpm: 2000.0          # prop redline
   # Oil normal bands from the POH emergency checklists: below 75 PSI is the
   # low-pressure drill, above 105 the high; temps 0..99 C (32..210 F).
@@ -210,6 +221,10 @@ flaps:
     - { label: up,   spoken: up,            ratio: 0.0 }
     - { label: "50", spoken: fifty percent, ratio: 0.5, vfe_kts: 160.0 }
     - { label: full, spoken: full,          ratio: 1.0, vfe_kts: 140.0 }
+  # POM Before Takeoff: "FLAPS - SET (25 Degrees)"; the nearest detent the
+  # aircraft has is 50% (20 degrees). Undeclared until 2026-09-25, so full
+  # auto took off with whatever flap was left set.
+  takeoff_ratio: 0.5
 
 # Switchable lights. NO beacon (POM: strobes are used in its place, FAA-legal)
 # and NO separate taxi light (the landing lights double for taxi) — so neither
@@ -278,3 +293,26 @@ locations:
   elevator trim: "electric trim only, no trim wheel. The trim indicator is on the MFD"
   beacon: "this aircraft has no beacon light. The strobes are used in its place"
   taxi light: "no separate taxi light. The landing lights double for taxi"
+
+# The nose gear CASTORS (.acf `_gear/0/_gear_castors 1`, no steering): it
+# turns on differential brake through the plugin channels, the SR22's way,
+# with the SR22's tuning until a taxi here is measured. Detection reads the
+# castor from the .acf anyway; declared here so the file says it (LILB
+# 2026-09-25: full rudder turned the Evolution 3.7 degrees a second at 6 kt
+# and it left the route three times).
+taxi:
+  steer_full_deg: 42.0
+  steer_slew_per_s: 0.8
+  steer_lead_s: 2.0
+  lookahead_s: 9.0
+  brake_steer: true
+
+# The takeoff power limit, from the manuals: "For take-off in N844X, you are
+# only allowed to use about HALF power, since more power would over-power the
+# rudders' and ailerons' ability to counter the engine torque. So, we take off
+# at 1250 ft-lb of torque" (N844X POH, Flight Handling); "only increase power
+# as the speed builds above 150 knots" (X-Plane POM). Full power at 2.5 s put
+# the aircraft 129 m off LILB 03 with the steering pinned (2026-09-25).
+takeoff_power:
+  torque_ftlb: 1250.0
+  until_kias: 150.0

@@ -102,7 +102,14 @@ pub fn abort() -> bool {
     crate::circuit::abort();
     crate::procedure::abort();
     crate::autoland::abort();
+    crate::aircraft::TAKEOFF_MARGIN_WAIVED.store(false, SeqCst);
     ACTIVE.swap(false, SeqCst)
+}
+
+/// Full auto stops: the flag, and the runway waiver that lived only for it.
+fn stop_active() {
+    crate::aircraft::TAKEOFF_MARGIN_WAIVED.store(false, SeqCst);
+    ACTIVE.store(false, SeqCst);
 }
 
 /// What the flight IS once we're lined up: the proving-ground circuit, or the
@@ -137,6 +144,10 @@ pub struct Route {
     pub arrival_constraints: Vec<crate::nav::StarConstraint>,
     /// The runway the planned SID departs from, asked for at the taxi request.
     pub departure_rwy: Option<String>,
+    /// The plan's origin, and the runway the plan departs from with or
+    /// without a SID: an uncontrolled departure plans its own taxi to it.
+    pub origin_icao: String,
+    pub origin_rwy: Option<String>,
     /// The plugin FMS-mailbox payload ("IDENT,lat,lon,alt|...") for the whole
     /// plan, so the GPS shows the route too. Best-effort — the follower flies
     /// the plan's own fixes, not the FMS.
@@ -219,6 +230,9 @@ pub fn start(base_url: String, config: Config, voice: Option<Voice>, tools: SubT
     if ACTIVE.swap(true, SeqCst) {
         return false;
     }
+    // The runway margin the pilot waived at THIS arm's preflight, if any,
+    // lives exactly as long as the mission (`stop_active`).
+    crate::aircraft::TAKEOFF_MARGIN_WAIVED.store(RUNWAY_WAIVER_PENDING.swap(false, SeqCst), SeqCst);
     ABORT.store(false, SeqCst);
     INBOUND_MADE.store(false, SeqCst);
     if let Ok(mut m) = MISSION.lock() {
@@ -233,7 +247,7 @@ pub fn start(base_url: String, config: Config, voice: Option<Voice>, tools: SubT
             .enable_all()
             .build()
         else {
-            ACTIVE.store(false, SeqCst);
+            stop_active();
             return;
         };
         rt.block_on(fly(
@@ -242,7 +256,7 @@ pub fn start(base_url: String, config: Config, voice: Option<Voice>, tools: SubT
             voice,
             tools,
         ));
-        ACTIVE.store(false, SeqCst);
+        stop_active();
         clear_stage();
     });
     true
@@ -319,7 +333,7 @@ async fn give_up(
     reason: &str,
 ) {
     RUN.fail(reason);
-    ACTIVE.store(false, SeqCst);
+    stop_active();
     // "Your aircraft" means every lever: the mixture manager stands down with
     // the rest, never quietly re-trimming under the pilot's hand.
     crate::tools::engine::MIX_MANAGED.store(false, SeqCst);
@@ -787,6 +801,64 @@ fn confirmed_ground(agl_m: anyhow::Result<f64>, on_ground: anyhow::Result<f64>) 
 /// 200 m of us. The same test gates the initial check and the wait for a new
 /// clearance — they used to differ, and the weaker one accepted the stale
 /// route it had just rejected (Edinburgh, 2026-09-20).
+/// An uncontrolled departure: the crew plans its own taxi from the field's
+/// taxi network to the plan's runway (or the wind's) and says so on the
+/// intercom. The route is published like a tower's, so everything after
+/// this (the push, the drive, the line-up) is the towered path unchanged.
+async fn self_taxi(
+    xp: &XPlaneClient,
+    config: &Config,
+    voice: &Option<Voice>,
+    tools: &SubTools,
+) -> Result<(), String> {
+    let (lat_r, lon_r, dir_r, spd_r) = tokio::join!(
+        xp.get_float(LAT),
+        xp.get_float(LON),
+        xp.get_float(crate::datarefs::WIND_DIR_DEG_TRUE),
+        xp.get_float(crate::datarefs::WIND_SPEED_MSC),
+    );
+    let (Ok(lat), Ok(lon)) = (lat_r, lon_r) else {
+        return Err("I can't read our position to plan the taxi.".to_string());
+    };
+    let wind = dir_r.ok().zip(spd_r.ok().map(|ms| ms * 1.943_844));
+    let (icao, rwy) = match &tools.mission {
+        Mission::Flight(r) | Mission::Resume(r) => (
+            Some(r.origin_icao.clone()).filter(|i| !i.is_empty()),
+            r.origin_rwy.clone().or_else(|| r.departure_rwy.clone()),
+        ),
+        _ => (None, None),
+    };
+    announce(voice, Priority::Advisory, "No tower here. Planning our own taxi.");
+    waiting("the taxi plan");
+    let apt_path = config.apt_data_path.clone();
+    let planned = tokio::task::spawn_blocking(move || {
+        crate::party_line::plan_self_taxi(&apt_path, icao.as_deref(), lat, lon, rwy.as_deref(), wind)
+    })
+    .await
+    .map_err(|_| "The taxi plan failed.".to_string())??;
+    event(
+        "self_taxi",
+        json!({ "field": planned.field, "runway": planned.runway, "via": planned.via }),
+    );
+    // The via names stay in the blackbox: an uncontrolled field's apt.dat
+    // names are whatever the author typed ("Taxy", "21_hold" at LILB), and
+    // no controller has turned them into words.
+    let cross = if planned.crossings.is_empty() {
+        String::new()
+    } else {
+        format!(", crossing runway {}", planned.crossings.join(" and "))
+    };
+    announce(
+        voice,
+        Priority::Advisory,
+        &format!(
+            "Taxiing to runway {}{cross}.",
+            crate::atis::spoken_runway(&planned.runway)
+        ),
+    );
+    Ok(())
+}
+
 async fn taxi_route_is_ours(xp: &XPlaneClient) -> bool {
     if crate::party_line::taxi_to_stand() {
         return false;
@@ -1138,10 +1210,19 @@ async fn fly(xp: XPlaneClient, config: Config, voice: Option<Voice>, tools: SubT
     // --- Stage 3: onto the runway ---------------------------------------------
     // Already lined up (the pilot put us on)? Skip straight to the circuit.
     if !lined_up(&xp, &tools, &config).await {
+        // A tower that can hear us, or an uncontrolled departure: no
+        // simulated ATC, or no station in reach of this field (LILB,
+        // 2026-09-25: Gibraltar, 1,000 nm away, cleared the 172 and gave it a
+        // taxi to its own runway 09, and full auto waited three minutes for
+        // a route that could be ours).
+        let towered = crate::mode::atc_enabled() && crate::party_line::station_reaches();
+        event("departure_field", json!({ "towered": towered }));
         // Clearance first — the real order is clearance, THEN taxi. Only with a
         // simulated tower to answer (real/external ATC and copilot-only leave the
         // clearance to the pilot), and only if we don't already hold a squawk.
-        get_zone_clearance(&xp, &ctx, &voice, &callsign).await;
+        if towered {
+            get_zone_clearance(&xp, &ctx, &voice, &callsign).await;
+        }
         bail_if_abort!();
         // The taxi route is the tower's. Ask for it if we don't already hold
         // one — or if the one we hold WAS PLANNED FROM SOMEWHERE ELSE. A
@@ -1165,7 +1246,19 @@ async fn fly(xp: XPlaneClient, config: Config, voice: Option<Voice>, tools: SubT
         // then failed (2026-08-05). The party line already knows which kind
         // of route it published; nobody had asked it.
         let route_is_ours = taxi_route_is_ours(&xp).await;
-        if !route_is_ours {
+        if !route_is_ours && !towered {
+            if let Err(why) = self_taxi(&xp, &config, &voice, &tools).await {
+                give_up(
+                    &xp,
+                    tools.taxi.park_brake_valve_set,
+                    &voice,
+                    &format!("{why} Your aircraft."),
+                    "no_self_taxi",
+                )
+                .await;
+                return;
+            }
+        } else if !route_is_ours {
             if crate::party_line::with_taxi_route(|r| r.is_some()) {
                 let arrival = crate::party_line::taxi_to_stand();
                 announce(
@@ -1761,7 +1854,7 @@ async fn fly(xp: XPlaneClient, config: Config, voice: Option<Voice>, tools: SubT
             // ninety seconds holding Southampton's 02 with an arrival at half
             // a mile is what "our job is done" used to mean here.
             taxi_in_after_landing(&xp, &config, &voice, &tools, true).await;
-            ACTIVE.store(false, SeqCst);
+            stop_active();
         }
         Mission::Flight(route) | Mission::Resume(route) => {
             fly_route(&xp, &config, &voice, &ctx, &tools, route, &callsign).await;
@@ -2406,7 +2499,7 @@ async fn fly_route(
         taxi_in_after_landing(xp, config, voice, tools, false).await;
     }
     event("arrival_owns", json!({}));
-    ACTIVE.store(false, SeqCst);
+    stop_active();
 }
 
 /// How long the arrival may stop closing on the fix the follower is steering
@@ -3272,7 +3365,129 @@ const PAYLOAD_MATCH_KG: f64 = 20.0;
 /// with no load sheet is briefed on fuel alone. The pilot asked "does the
 /// copilot check the fuel and the runway" (2026-09-15); it did neither at the
 /// arm, and found the fuel at the enroute caution and the runway at the hold.
+#[cfg(test)]
 pub fn preflight(fp: &crate::simbrief::FlightPlan, f: &PreflightFacts) -> Result<String, String> {
+    preflight_gated(fp, f, &[]).map_err(|(_, why)| why)
+}
+
+/// The preflight gate that refused, so the pilot can waive the ones that
+/// are a MARGIN and never the ones that are the airframe.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Gate {
+    Ceiling,
+    /// The destination's longest runway under the book landing distance:
+    /// unfactored already, so there is no margin to give up.
+    DestRunway,
+    /// This field's runway under the FACTORED roll. Waived, the unfactored
+    /// book roll must still fit.
+    OriginRunway,
+    /// This field's runway under the book roll itself: no margin left to
+    /// give up.
+    BookRoll,
+    /// Over the plan's operational takeoff limit. Waived, the airframe's
+    /// own max gross still holds.
+    PlanWeight,
+    MaxWeight,
+    Fuel,
+}
+
+impl Gate {
+    pub fn waivable(self) -> bool {
+        matches!(self, Gate::OriginRunway | Gate::PlanWeight)
+    }
+    fn spoken(self) -> &'static str {
+        match self {
+            Gate::OriginRunway => "the runway margin",
+            Gate::PlanWeight => "the plan's weight limit",
+            _ => "that",
+        }
+    }
+}
+
+/// A pilot's waiver: named gates, for ONE plan (origin and destination).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Waiver {
+    pub origin: String,
+    pub destination: String,
+    pub gates: Vec<Gate>,
+}
+
+/// The waivers the pilot has given, for the plan they were given for.
+static WAIVER: std::sync::Mutex<Option<Waiver>> = std::sync::Mutex::new(None);
+/// The last waivable refusal: what "fly it anyway" answers, for
+/// [`WAIVE_WINDOW`] after it was said.
+static REFUSED: std::sync::Mutex<Option<(Gate, String, String, Instant)>> =
+    std::sync::Mutex::new(None);
+/// The arm's preflight passed on a waived runway margin; `start` hands it
+/// to the mission (`aircraft::TAKEOFF_MARGIN_WAIVED`) or it dies here.
+pub static RUNWAY_WAIVER_PENDING: AtomicBool = AtomicBool::new(false);
+/// How long after a refusal "fly it anyway" still means that refusal.
+pub const WAIVE_WINDOW: Duration = Duration::from_secs(120);
+
+fn lock<T>(m: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// The gates the pilot waived for this plan (another plan's waiver is
+/// dropped here: it never carries to a different flight).
+pub fn waived_for(fp: &crate::simbrief::FlightPlan) -> Vec<Gate> {
+    let mut w = lock(&WAIVER);
+    match w.as_ref() {
+        Some(v) if v.origin == fp.origin && v.destination == fp.destination => v.gates.clone(),
+        Some(_) => {
+            *w = None;
+            Vec::new()
+        }
+        None => Vec::new(),
+    }
+}
+
+/// A waivable refusal was just said.
+pub fn note_refusal(gate: Gate, fp: &crate::simbrief::FlightPlan) {
+    *lock(&REFUSED) = Some((gate, fp.origin.clone(), fp.destination.clone(), Instant::now()));
+}
+
+/// The pilot said "fly it anyway": waive the refusal just said, if one is
+/// inside the window, and return the words that re-arm, with the gate.
+/// `None` = nothing to waive (the words are then nobody's).
+pub fn take_waiver() -> Option<Gate> {
+    let (gate, origin, destination, at) = lock(&REFUSED).take()?;
+    if at.elapsed() > WAIVE_WINDOW {
+        return None;
+    }
+    let mut w = lock(&WAIVER);
+    match w.as_mut() {
+        Some(v) if v.origin == origin && v.destination == destination => {
+            if !v.gates.contains(&gate) {
+                v.gates.push(gate);
+            }
+        }
+        _ => {
+            *w = Some(Waiver {
+                origin,
+                destination,
+                gates: vec![gate],
+            })
+        }
+    }
+    event("waiver", json!({ "gate": format!("{gate:?}") }));
+    Some(gate)
+}
+
+/// The acknowledgement of a waiver: what was given up, and that it is the
+/// pilot's call.
+pub fn waiver_ack(gate: Gate) -> String {
+    format!("Your call, {} waived for this plan. Arming.", gate.spoken())
+}
+
+/// The arm's preflight with the pilot's waivers applied; a refusal names
+/// its gate.
+pub fn preflight_gated(
+    fp: &crate::simbrief::FlightPlan,
+    f: &PreflightFacts,
+    waived: &[Gate],
+) -> Result<String, (Gate, String)> {
+    let mut waived_lines: Vec<String> = Vec::new();
     use crate::flightplan::spoken_feet;
     // Fuel in the plan's own unit when it carries a load sheet, otherwise the
     // AIRFRAME's — never the app's avgas gallons, which is what a local plan
@@ -3292,11 +3507,14 @@ pub fn preflight(fp: &crate::simbrief::FlightPlan, f: &PreflightFacts) -> Result
     // in the air, at the resume after a pilot takeover (2026-09-24).
     if let Some(ceiling) = f.service_ceiling_ft.filter(|c| *c > 0.0) {
         if fp.cruise_alt_ft > ceiling {
-            return Err(format!(
-                "Negative. The plan cruises at {}, above this aircraft's ceiling of {}. \
-                 Replan lower.",
-                spoken_feet(fp.cruise_alt_ft),
-                spoken_feet(ceiling)
+            return Err((
+                Gate::Ceiling,
+                format!(
+                    "Negative. The plan cruises at {}, above this aircraft's ceiling of {}. \
+                     Replan lower.",
+                    spoken_feet(fp.cruise_alt_ft),
+                    spoken_feet(ceiling)
+                ),
             ));
         }
     }
@@ -3305,11 +3523,14 @@ pub fn preflight(fp: &crate::simbrief::FlightPlan, f: &PreflightFacts) -> Result
         crate::flightplan::runway_needed_ft(f.landing_distance_ft, f.takeoff_distance_ft)
     {
         if f.dest_longest_ft > 0.0 && f.dest_longest_ft < need {
-            return Err(format!(
-                "Negative. {}'s longest runway is {}, and we need {} to land. Not flying that.",
-                fp.destination,
-                spoken_feet(f.dest_longest_ft),
-                spoken_feet(need)
+            return Err((
+                Gate::DestRunway,
+                format!(
+                    "Negative. {}'s longest runway is {}, and we need {} to land. Not flying that.",
+                    fp.destination,
+                    spoken_feet(f.dest_longest_ft),
+                    spoken_feet(need)
+                ),
             ));
         }
     }
@@ -3317,27 +3538,66 @@ pub fn preflight(fp: &crate::simbrief::FlightPlan, f: &PreflightFacts) -> Result
     // find out at the hold after the start and the taxi.
     // The roll is quoted at the PROFILE's max gross, whatever the plan's
     // operational limit is; scaled to the weight on the wheels now.
-    let need_ft = crate::aircraft::takeoff_needed_m(
-        f.takeoff_roll_m,
-        f.total_kg,
-        f.max_gross_lb.map(|lb| lb / LB_PER_KG),
-        500.0,
-    ) * M_TO_FT;
+    let need_at = |factor: f64| {
+        crate::aircraft::takeoff_needed_factored_m(
+            f.takeoff_roll_m,
+            f.total_kg,
+            f.max_gross_lb.map(|lb| lb / LB_PER_KG),
+            500.0,
+            factor,
+        ) * M_TO_FT
+    };
+    let need_ft = need_at(crate::aircraft::TAKEOFF_FACTOR);
     if f.takeoff_roll_m.is_some() && f.origin_longest_ft > 0.0 && f.origin_longest_ft < need_ft {
-        return Err(format!(
-            "Negative. {}'s longest runway is {}, and the takeoff needs {}. Not flying that.",
-            fp.origin,
+        // Waived, the margin goes and the book roll itself must still fit.
+        let bare_ft = need_at(1.0);
+        if !waived.contains(&Gate::OriginRunway) {
+            return Err((
+                Gate::OriginRunway,
+                format!(
+                    "Negative. {}'s longest runway is {}, and the takeoff needs {}. Not flying that.",
+                    fp.origin,
+                    spoken_feet(f.origin_longest_ft),
+                    spoken_feet(need_ft)
+                ),
+            ));
+        }
+        if f.origin_longest_ft < bare_ft {
+            return Err((
+                Gate::BookRoll,
+                format!(
+                    "Negative. Even with no margin we need {}, and {}'s longest runway is {}. Not flying that.",
+                    spoken_feet(bare_ft),
+                    fp.origin,
+                    spoken_feet(f.origin_longest_ft)
+                ),
+            ));
+        }
+        waived_lines.push(format!(
+            "No runway margin, your call: {} of runway, {} needed without it.",
             spoken_feet(f.origin_longest_ft),
-            spoken_feet(need_ft)
+            spoken_feet(bare_ft)
         ));
     }
     // Weight: the plan's max takeoff weight, else the profile's max gross.
-    let max_tow_kg = fp
-        .weights
-        .as_ref()
-        .map(|w| w.max_tow_kg)
-        .filter(|m| *m > 0.0)
-        .or(f.max_gross_lb.map(|lb| lb / LB_PER_KG));
+    // A waived plan limit falls back to the profile's, which always holds.
+    let plan_tow_kg = fp.weights.as_ref().map(|w| w.max_tow_kg).filter(|m| *m > 0.0);
+    let gross_kg = f.max_gross_lb.map(|lb| lb / LB_PER_KG);
+    let plan_waived = waived.contains(&Gate::PlanWeight);
+    let max_tow_kg = if plan_waived {
+        gross_kg
+    } else {
+        plan_tow_kg.or(gross_kg)
+    };
+    if let (true, Some(total), Some(plan)) = (plan_waived, f.total_kg, plan_tow_kg) {
+        if total > plan * 1.005 {
+            waived_lines.push(format!(
+                "Over the plan's weight limit, your call: {} against {}.",
+                spoken_weight(total),
+                spoken_weight(plan)
+            ));
+        }
+    }
     if let (Some(total), Some(max)) = (f.total_kg, max_tow_kg) {
         if total > max * 1.005 {
             // SimBrief's max_tow is the OPERATIONAL limit, the least of the
@@ -3347,7 +3607,7 @@ pub fn preflight(fp: &crate::simbrief::FlightPlan, f: &PreflightFacts) -> Result
             // airframe, and the pilot asked whether that was right). Name it
             // as the plan's, and when the load sheet says why, say that too:
             // the excess there was 9.4 t of payload over the OFP's, not fuel.
-            let from_plan = fp.weights.as_ref().is_some_and(|w| w.max_tow_kg > 0.0);
+            let from_plan = !plan_waived && plan_tow_kg.is_some();
             let mut why = format!(
                 "Negative. We're at {}, over the {} of {}.",
                 spoken_weight(total),
@@ -3370,7 +3630,12 @@ pub fn preflight(fp: &crate::simbrief::FlightPlan, f: &PreflightFacts) -> Result
                 }
             }
             why.push_str(" Not flying that.");
-            return Err(why);
+            let gate = if from_plan && gross_kg.is_none_or(|g| total <= g * 1.005) {
+                Gate::PlanWeight
+            } else {
+                Gate::MaxWeight
+            };
+            return Err((gate, why));
         }
     }
     let mut lines = Vec::new();
@@ -3381,10 +3646,13 @@ pub fn preflight(fp: &crate::simbrief::FlightPlan, f: &PreflightFacts) -> Result
     if let Some(fuel) = f.fuel_kg.filter(|_| fp.block_fuel_kg > 0.0) {
         let min = fp.min_takeoff_fuel_kg;
         if min > 0.0 && fuel < min * (1.0 - FUEL_MATCH_FRAC) {
-            return Err(format!(
-                "Negative. {} of fuel aboard, and the plan needs at least {} to go. Say load the aircraft and I'll fuel it from the plan, then say it again.",
-                spoken_fuel(fuel),
-                spoken_fuel(min)
+            return Err((
+                Gate::Fuel,
+                format!(
+                    "Negative. {} of fuel aboard, and the plan needs at least {} to go. Say load the aircraft and I'll fuel it from the plan, then say it again.",
+                    spoken_fuel(fuel),
+                    spoken_fuel(min)
+                ),
             ));
         }
         let bare = |s: String| {
@@ -3435,7 +3703,8 @@ pub fn preflight(fp: &crate::simbrief::FlightPlan, f: &PreflightFacts) -> Result
         load.push('.');
         lines.push(load);
     }
-    Ok(lines.join(" "))
+    waived_lines.extend(lines);
+    Ok(waived_lines.join(" "))
 }
 
 /// Whether we're already sitting on a runway ready to depart — then taxi and
@@ -3623,6 +3892,91 @@ mod tests {
             service_ceiling_ft: None,
         }
     }
+
+    /// LILB 2026-09-25: a runway the book roll fits but the factored one does
+    /// not is the pilot's to waive; the book roll itself never is.
+    #[test]
+    fn the_runway_margin_is_waivable_and_the_book_roll_is_not() {
+        use super::Gate;
+        let short = super::PreflightFacts {
+            origin_longest_ft: 1970.0,
+            ..facts()
+        };
+        let (gate, _) = super::preflight_gated(&plan(true), &short, &[]).expect_err("refused");
+        assert_eq!(gate, Gate::OriginRunway);
+        assert!(gate.waivable());
+        let brief = super::preflight_gated(&plan(true), &short, &[Gate::OriginRunway]).expect("waived");
+        assert!(
+            brief.starts_with("No runway margin, your call: 1,970 feet of runway, 1,640 feet needed without it."),
+            "{brief}"
+        );
+        let shorter = super::PreflightFacts {
+            origin_longest_ft: 1400.0,
+            ..facts()
+        };
+        let (gate, why) =
+            super::preflight_gated(&plan(true), &shorter, &[Gate::OriginRunway]).expect_err("refused");
+        assert_eq!(gate, Gate::BookRoll);
+        assert!(!gate.waivable());
+        assert!(why.contains("Even with no margin"), "{why}");
+    }
+
+    /// The plan's operational limit is waivable; the airframe's max gross
+    /// holds whatever was waived.
+    #[test]
+    fn the_plans_weight_limit_is_waivable_and_the_airframes_is_not() {
+        use super::Gate;
+        // 2,550 lb against the plan's 2,450 and the 172SP's 2,558.
+        let heavy = super::PreflightFacts {
+            total_kg: Some(1156.7),
+            ..facts()
+        };
+        let (gate, _) = super::preflight_gated(&plan(true), &heavy, &[]).expect_err("refused");
+        assert_eq!(gate, Gate::PlanWeight);
+        let brief = super::preflight_gated(&plan(true), &heavy, &[Gate::PlanWeight]).expect("waived");
+        assert!(brief.contains("Over the plan's weight limit, your call"), "{brief}");
+        let over_gross = super::PreflightFacts {
+            total_kg: Some(1180.0),
+            ..facts()
+        };
+        let (gate, why) =
+            super::preflight_gated(&plan(true), &over_gross, &[Gate::PlanWeight]).expect_err("refused");
+        assert_eq!(gate, Gate::MaxWeight);
+        assert!(why.contains("max takeoff weight of 2,560 pounds"), "{why}");
+        // Over the plan AND the airframe, unwaived: the airframe's gate.
+        let (gate, _) = super::preflight_gated(&plan(true), &over_gross, &[]).expect_err("refused");
+        assert_eq!(gate, Gate::MaxWeight);
+        assert!(!Gate::Fuel.waivable() && !Gate::Ceiling.waivable() && !Gate::DestRunway.waivable());
+    }
+
+    /// "Fly it anyway" waives the refusal just said, once, inside the window,
+    /// for that plan only.
+    #[test]
+    fn a_waiver_answers_the_refusal_just_said_for_that_plan_only() {
+        use super::Gate;
+        let _g = WAIVER_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        *super::lock(&super::WAIVER) = None;
+        *super::lock(&super::REFUSED) = None;
+        assert_eq!(super::take_waiver(), None, "nothing on offer");
+        super::note_refusal(Gate::OriginRunway, &plan(true));
+        assert_eq!(super::take_waiver(), Some(Gate::OriginRunway));
+        assert_eq!(super::take_waiver(), None, "once");
+        assert_eq!(super::waived_for(&plan(true)), vec![Gate::OriginRunway]);
+        let mut other = plan(true);
+        other.destination = "LEMG".into();
+        assert!(super::waived_for(&other).is_empty(), "never another plan's");
+        assert!(super::waived_for(&plan(true)).is_empty(), "and it is gone");
+        // Outside the window: stale.
+        *super::lock(&super::REFUSED) = Some((
+            Gate::PlanWeight,
+            "LXGB".into(),
+            "LEAX".into(),
+            std::time::Instant::now() - super::WAIVE_WINDOW - std::time::Duration::from_secs(1),
+        ));
+        assert_eq!(super::take_waiver(), None);
+    }
+
+    static WAIVER_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     /// LOWI 26 MOGT3H in the SF50 (the SimBrief plan of 2026-09-24): the
     /// binding minimum is WI506, 714 ft a mile over 8.3 nm from the departure

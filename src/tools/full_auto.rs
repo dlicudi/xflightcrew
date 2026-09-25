@@ -101,6 +101,10 @@ impl StartKind {
     }
 }
 
+/// A resume this near the plan's origin, abeam no leg, is a departure
+/// joining its first fix.
+const DEPARTURE_REJOIN_NM: f64 = 15.0;
+
 pub struct FullAuto {
     // engine start
     /// Engine count, so a piston TWIN gets both starters cranked. The piston
@@ -244,6 +248,8 @@ impl Tool for FullAuto {
 
     async fn execute(&self, args: &Value, ctx: &ToolCtx<'_>) -> Result<String> {
         let a: Args = serde_json::from_value(args.clone()).unwrap_or_default();
+        // A waiver is only ever this arm's preflight's to hand on.
+        crate::full_auto::RUNWAY_WAIVER_PENDING.store(false, std::sync::atomic::Ordering::SeqCst);
         if a.off {
             return Ok(if crate::full_auto::abort() {
                 "Full auto cancelled. You have the aircraft.".to_string()
@@ -516,19 +522,36 @@ impl FullAuto {
             let msa = crate::nav::airport_msa_ft(&msa_path, icao)?;
             (altitude < msa).then_some(msa)
         });
-        let index = crate::interaction::rejoin_index(
+        let index = match crate::interaction::rejoin_index(
             &legs,
             lat,
             lon,
             mag_var.ok().filter(|v| v.is_finite()),
-        )
-        .map_err(|why| match low_msa {
-            Some(msa) => format!(
-                "Climb to {} first, the sector altitude, before turning. {why}",
-                crate::flightplan::spoken_feet(msa)
-            ),
-            None => why,
-        })?;
+        ) {
+            Ok(i) => i,
+            // Just departed: the enroute legs start at the first fix, so an
+            // aircraft climbing out of the origin is abeam none of them and
+            // every resume was refused (LILB, 2026-09-25). Near the origin it
+            // goes direct to the first fix; the join's terrain probe below
+            // is the gate, as for any rejoin.
+            Err(_)
+                if !legs.is_empty()
+                    && fp.waypoints.first().is_some_and(|o| {
+                        crate::nav::haversine_nm(lat, lon, o.lat, o.lon) <= DEPARTURE_REJOIN_NM
+                    }) =>
+            {
+                0
+            }
+            Err(why) => {
+                return Err(match low_msa {
+                    Some(msa) => format!(
+                        "Climb to {} first, the sector altitude, before turning. {why}",
+                        crate::flightplan::spoken_feet(msa)
+                    ),
+                    None => why,
+                })
+            }
+        };
         // Clamped before the drain: a resume inside the arrival still owes
         // the restrictions ahead, and the profile rule runs from the STAR's
         // first fix.
@@ -624,6 +647,8 @@ impl FullAuto {
                 climb_minimums: Vec::new(),
                 arrival_constraints,
                 departure_rwy: None,
+                origin_icao: fp.origin.clone(),
+                origin_rwy: None,
                 legs,
                 fms_payload: payload,
                 local_runway: None,
@@ -867,7 +892,8 @@ impl FullAuto {
                 .map_or(0.0, crate::flightplan::longest_runway_ft),
             service_ceiling_ft: Some(self.cfg.service_ceiling_ft),
         };
-        let preflight = crate::full_auto::preflight(&fp, &facts);
+        let waived = crate::full_auto::waived_for(&fp);
+        let preflight = crate::full_auto::preflight_gated(&fp, &facts, &waived);
         crate::full_auto::event(
             "preflight",
             json!({
@@ -882,10 +908,25 @@ impl FullAuto {
                 "max_tow_kg": fp.weights.as_ref().map(|w| w.max_tow_kg),
                 "origin_longest_ft": facts.origin_longest_ft,
                 "dest_longest_ft": facts.dest_longest_ft,
-                "refused": preflight.as_ref().err(),
+                "refused": preflight.as_ref().err().map(|(_, why)| why),
+                "gate": preflight.as_ref().err().map(|(g, _)| format!("{g:?}")),
+                "waived": waived.iter().map(|g| format!("{g:?}")).collect::<Vec<_>>(),
             }),
         );
-        let preflight = preflight?;
+        // A refusal that is only a MARGIN is the pilot's to waive: offered,
+        // never taken ("fly it anyway" inside the window re-arms).
+        let preflight = preflight.map_err(|(gate, why)| {
+            if gate.waivable() {
+                crate::full_auto::note_refusal(gate, &fp);
+                format!("{why} If you've checked it yourself, say fly it anyway.")
+            } else {
+                why
+            }
+        })?;
+        crate::full_auto::RUNWAY_WAIVER_PENDING.store(
+            waived.contains(&crate::full_auto::Gate::OriginRunway),
+            std::sync::atomic::Ordering::SeqCst,
+        );
 
         // The whole flight, dry-run before anything moves: is this aircraft
         // fit for this plan, does the climb clear the ground here, does the
@@ -999,6 +1040,8 @@ impl FullAuto {
                 dest_icao: fp.destination.clone(),
                 dest_name,
                 departure_rwy: fp.procedures.sid.as_ref().and(fp.procedures.origin_rwy.clone()),
+                origin_icao: fp.origin.clone(),
+                origin_rwy: fp.procedures.origin_rwy.clone(),
                 climb_minimums,
                 arrival_constraints,
                 legs,

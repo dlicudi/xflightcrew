@@ -112,7 +112,8 @@ reference:
   fuel_capacity_gal: 56.0
   fuel_useable_gal: 53.0
   endurance_hours: 4.0
-  takeoff_distance_ft: 1630.0
+  takeoff_distance_ft: 1630.0   # over a 50 ft obstacle: the recited field length
+  takeoff_roll_ft: 960.0        # POH ground roll, 2,550 lb, sea level, 15 C: what the runway gates check
   landing_distance_ft: 1335.0
   max_rpm: 2700.0
   oil_temp_min_f: 100.0

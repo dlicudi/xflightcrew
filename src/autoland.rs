@@ -1852,6 +1852,7 @@ pub fn run_autoland_scoped(
                 if yield_r.is_ok_and(|v| v > 0.5) {
                     if !pitch_yielded {
                         pitch_yielded = true;
+                        crate::flight::note_pilot_takeover("autoland: yoke");
                         crate::blackbox::record(
                             "autoland",
                             serde_json::json!({"event": "pitch_yield", "radio": radio_ft}),

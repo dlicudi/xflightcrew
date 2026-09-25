@@ -790,6 +790,83 @@ pub fn plan_check_request(t: &str) -> bool {
     checking && plan && !has("fly") && !has("load") && !has("checklist")
 }
 
+/// Is this the pilot waiving a refusal they were just offered ("fly it
+/// anyway", "I've checked the runway", "override")? CLOSED: the whole
+/// utterance is one of these, less address words and filler, so "fly it"
+/// or "override the autopilot" is never a waiver. Only meaningful inside
+/// `full_auto::WAIVE_WINDOW` of a waivable refusal; the main loop asks.
+pub fn waiver_request(t: &str) -> bool {
+    const WAIVERS: &[&str] = &[
+        "fly it anyway",
+        // Whisper, live (LILB 2026-09-25).
+        "play it anyway",
+        "do it anyway",
+        "go anyway",
+        "go ahead anyway",
+        "take off anyway",
+        "fly anyway",
+        "override",
+        "override it",
+        "override that",
+        "override the runway",
+        "override the weight",
+        "ive checked the runway",
+        "i have checked the runway",
+        "i checked the runway",
+        "ive checked the weight",
+        "i have checked the weight",
+        "i checked the weight",
+        "ive checked it",
+        "i have checked it",
+        "i checked it",
+        "my responsibility",
+        "on my responsibility",
+        "my call",
+    ];
+    // The answer to the offer is an ASSENT as often as the offered words:
+    // "Yes, it's fine. Let's go ahead." earned nothing at LILB (2026-09-25).
+    // Only asked inside the window of a refusal that offered a waiver.
+    const ASSENTS: &[&str] = &[
+        "go ahead",
+        "lets go ahead",
+        "go for it",
+        "lets go",
+        "its fine",
+        "thats fine",
+        "its ok",
+        "its okay",
+        "proceed",
+        "continue",
+        "do it",
+        "affirmative",
+        "confirmed",
+        "confirm",
+        "send it",
+    ];
+    const FILLER: &[&str] = &["okay", "ok", "copilot", "please", "yes", "yeah", "then", "just", "sure"];
+    const YES: &[&str] = &["yes", "yeah", "affirmative", "sure"];
+    let t = t.to_ascii_lowercase().replace(['\'', '\u{2019}'], "");
+    let words = |clause: &str| -> String {
+        clause
+            .split(|c: char| !c.is_ascii_alphanumeric())
+            .filter(|w| !w.is_empty() && !FILLER.contains(w))
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    if WAIVERS.contains(&words(&t).as_str()) {
+        return true;
+    }
+    // Clause by clause: each one an assent (or bare filler), and at least
+    // one real word of assent in the whole ("okay" alone is not an answer).
+    let clauses: Vec<String> = t.split(['.', ',', '!', '?', ';']).map(words).collect();
+    let all_assent = clauses
+        .iter()
+        .all(|c| c.is_empty() || ASSENTS.contains(&c.as_str()) || WAIVERS.contains(&c.as_str()));
+    let any_assent = clauses.iter().any(|c| !c.is_empty())
+        || t.split(|c: char| !c.is_ascii_alphanumeric()).any(|w| YES.contains(&w));
+    all_assent && any_assent
+}
+
 /// Is this the load-sheet request ("load the aircraft", "set the fuel and
 /// payload from the plan")? The main loop asks before its FMS-load branch,
 /// whose "load ... plan" shape these words also have.
@@ -3764,6 +3841,7 @@ mod tests {
         assert_eq!(number("two hundred and forty"), Some(240));
         assert_eq!(number("twenty two"), Some(22));
         assert_eq!(number("two thousand five hundred"), Some(2500));
+        assert_eq!(number("1 thousands"), Some(1000), "LILB 2026-09-25: set 1 fpm");
         assert_eq!(
             one("hold two two zero knots").unwrap(),
             ("hold_speed".into(), json!({"knots": 220}))
@@ -4174,4 +4252,35 @@ mod tests {
         }
     }
 
+    #[test]
+    fn a_waiver_is_the_whole_utterance_and_nothing_else() {
+        for yes in [
+            "Fly it anyway.",
+            "Play it anyway.",
+            "Yes, it's fine. Let's go ahead.",
+            "Yes.",
+            "Go ahead",
+            "Okay, fly it anyway",
+            "I've checked the runway.",
+            "I have checked the weight",
+            "Override.",
+            "copilot, my call",
+        ] {
+            assert!(super::waiver_request(yes), "{yes}");
+        }
+        for no in [
+            "fly it",
+            "fly the flight plan",
+            "override the autopilot",
+            "check the runway",
+            "is the runway long enough",
+            "anyway",
+            "okay",
+            "yes, flaps up",
+            "go ahead and lower the gear",
+            "no",
+        ] {
+            assert!(!super::waiver_request(no), "{no}");
+        }
+    }
 }
