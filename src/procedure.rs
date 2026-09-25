@@ -1650,7 +1650,6 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, plan: Pla
     // altitude, the fix). The plan's later descents under the same held
     // altitude are silent; a new altitude from the pilot is a new hold.
     let mut held_leg: Option<(f64, String)> = None;
-    let on_approach = matches!(end, EndAction::Approach { .. });
     if !arrival_constraints.is_empty() {
         crate::blackbox::record(
             "procedure",
