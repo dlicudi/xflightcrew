@@ -1466,6 +1466,7 @@ pub fn start(base_url: String, voice: Option<Voice>, route: Route, base_kts: f64
     if ACTIVE.swap(true, Ordering::Relaxed) {
         return; // already driving — the tool retargets instead
     }
+    let gen = DRIVE_GEN.fetch_add(1, Ordering::SeqCst) + 1;
     LAST_ARRIVED.store(false, Ordering::Relaxed);
     std::thread::spawn(move || {
         let Ok(rt) = tokio::runtime::Builder::new_current_thread()
@@ -1475,9 +1476,17 @@ pub fn start(base_url: String, voice: Option<Voice>, route: Route, base_kts: f64
             ACTIVE.store(false, Ordering::Relaxed);
             return;
         };
-        rt.block_on(drive(XPlaneClient::new(base_url), voice, route, base_kts));
+        rt.block_on(drive(XPlaneClient::new(base_url), voice, route, base_kts, gen));
     });
 }
+
+/// Which drive owns [`ACTIVE`]: bumped by every [`start`]. A drive that is
+/// finishing clears the flag only while it is still the newest: a
+/// backtrack's leg one finished its exit AFTER the supervisor had started
+/// leg two, its late clear cancelled leg two 40 ms into the turn, and full
+/// auto then lined up from the wrong heading and 136 m down a 600 m strip
+/// (LILB 03, 2026-09-25).
+static DRIVE_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Drive a backtrack: leg one (down the strip to the turn pocket) now, and
 /// when it ARRIVES, leg two — a plain line-up from wherever the aircraft
@@ -1581,7 +1590,7 @@ fn alert(voice: &Option<Voice>, priority: Priority, line: &str) {
 /// every exit path — including a panic or kill -9 — releases the override
 /// within a second by silence alone; the explicit zero write on the way out
 /// is just politeness.
-async fn drive(xp: XPlaneClient, voice: Option<Voice>, route: Route, base_kts: f64) {
+async fn drive(xp: XPlaneClient, voice: Option<Voice>, route: Route, base_kts: f64, gen: u64) {
     let _detail = crate::auto_status::DetailGuard::hold(&DETAIL);
     // The landing light over runway spans, decided once for the drive: none
     // when the airframe's landing lamp is already its taxi light tonight.
@@ -1629,7 +1638,11 @@ async fn drive(xp: XPlaneClient, voice: Option<Voice>, route: Route, base_kts: f
     // Stagnation watch: commanding motion but not moving (see below).
     let mut stalled_since: Option<std::time::Instant> = None;
     loop {
-        if !ACTIVE.load(Ordering::Relaxed) {
+        if !ACTIVE.load(Ordering::Relaxed) || DRIVE_GEN.load(Ordering::SeqCst) != gen {
+            crate::blackbox::record(
+                "autotaxi",
+                serde_json::json!({"event": "stopped_from_outside", "superseded": DRIVE_GEN.load(Ordering::SeqCst) != gen}),
+            );
             break;
         }
         // Speed authority gone — steering alone must not keep driving. This
@@ -2066,8 +2079,11 @@ async fn drive(xp: XPlaneClient, voice: Option<Voice>, route: Route, base_kts: f
         let _ = xp.set_float(LEFT_BRAKE, 0.0).await;
         let _ = xp.set_float(RIGHT_BRAKE, 0.0).await;
     }
-    ACTIVE.store(false, Ordering::Relaxed);
-    tracing::info!("auto taxi stopped");
+    // Only the newest drive may clear the flag (see [`DRIVE_GEN`]).
+    if DRIVE_GEN.load(Ordering::SeqCst) == gen {
+        ACTIVE.store(false, Ordering::Relaxed);
+    }
+    tracing::info!(gen, "auto taxi stopped");
 }
 
 #[cfg(test)]
