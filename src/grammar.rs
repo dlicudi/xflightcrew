@@ -726,6 +726,12 @@ pub fn resume_plan_request(t: &str) -> bool {
         .trim_end_matches(['.', '?', '!'])
         .replace("site plan", "flight plan")
         .replace("flight plans", "flight plan");
+    // "I said resume" (LIME 2026-09-25, said once it had been ignored).
+    let t = t
+        .strip_prefix("i said ")
+        .or_else(|| t.strip_prefix("i said, "))
+        .map(str::to_string)
+        .unwrap_or(t);
     matches!(
         t.as_str(),
         "resume the flight plan"
@@ -733,12 +739,51 @@ pub fn resume_plan_request(t: &str) -> bool {
             | "resume my flight plan"
             | "resume the route"
             | "continue the flight plan"
+            // The bare word, and the flight or mission (LIME 2026-09-25:
+            // "Resume." earned nothing after a taxi stand-down).
+            | "resume"
+            | "resume the flight"
+            | "continue the flight"
+            | "resume the mission"
+            | "continue the mission"
     )
+}
+
+/// "Take us to Bologna", "fly us to lima india papa echo": arm the flight,
+/// with the place the pilot named for the tool to check against the plan's
+/// destination. Never a place on the ground ("take us to the runway"), an
+/// altitude or a number.
+fn take_us_to(t: &str) -> Option<ToolCall> {
+    const GROUND: &[&str] = &[
+        "runway", "gate", "stand", "parking", "ramp", "apron", "hold", "holding", "pad",
+        "helipad", "heliport", "hangar", "taxiway",
+    ];
+    let lead = ["take us to ", "fly us to ", "take me to ", "get us to "]
+        .iter()
+        .find_map(|l| t.find(l).map(|i| &t[i + l.len()..]))?;
+    if GROUND.iter().any(|g| has(lead, g)) {
+        return None;
+    }
+    let d = crate::flightplan::parse_destination(lead)?;
+    Some(call(
+        "full_auto",
+        json!({ "flight": true, "to": d.spoken(), "to_codes": d.codes }),
+    ))
 }
 
 fn flight_plan_call(t: &str) -> Option<ToolCall> {
     if resume_plan_request(t) {
         return Some(call("full_auto", json!({ "resume": true })));
+    }
+    if matches!(
+        t.trim_end_matches(['.', '!']),
+        "start the flight" | "begin the flight" | "commence the flight" | "start the mission"
+            | "begin the mission"
+    ) {
+        return Some(call("full_auto", json!({ "flight": true })));
+    }
+    if let Some(c) = take_us_to(t) {
+        return Some(c);
     }
     // Whisper garbles the last word and keeps the shape: "fly the flight
     // gun / path / bluff / class / time", "fly the flat band" (737 and S-76,
@@ -1601,7 +1646,10 @@ fn parse_one(t: &str) -> Option<ToolCall> {
     // taxi vs flight mode from being on the ground + the number). Requires the
     // number so "taxi light on" (no knots) stays with the lights.
     if has(t, "taxi") && (has(t, "knots") || has(t, "knot")) {
-        if let Some(n) = num {
+        // The number AFTER "taxi" is the speed: "6? Taxi at 20 knots" (LIPE,
+        // 2026-09-25) was a stray word, then the call, and took the 6.
+        let after = t.find("taxi").and_then(|i| number(&t[i..]));
+        if let Some(n) = after.or(num) {
             return Some(call("hold_speed", json!({ "knots": n })));
         }
     }
@@ -2572,6 +2620,8 @@ mod tests {
         let c = first("set it down").expect("down");
         assert_eq!(c.arguments, json!({ "action": "down" }));
         assert!(first("landing light on").is_none_or(|c| c.name != "hover"));
+        // A helicopter's pad is not a flight's destination.
+        assert!(first("take us to the pad").is_some_and(|c| c.name == "hover"));
         let c = first("Lift to a hover.").expect("hover");
         assert_eq!(
             (c.name.as_str(), c.arguments["action"].as_str()),
@@ -3240,6 +3290,7 @@ mod tests {
             ("hold_speed".into(), json!({"knots":10}))
         );
         assert_eq!(one("taxi 12 knots").unwrap().1, json!({"knots":12}));
+        assert_eq!(one("6? Taxi at 20 knots.").unwrap().1, json!({"knots":20}));
         assert_eq!(one("hold short").unwrap().1, json!({"knots":0}));
         // STOP brakes to a halt and holds; "stop taxiing" means stop the
         // AIRCRAFT, not drop the hold and coast (2026-07-11).
@@ -4092,6 +4143,28 @@ mod tests {
         // Handing it back → autopilot_off (which also aborts an active recovery).
         assert_eq!(one("my controls").unwrap().0, "autopilot_off");
         assert_eq!(one("i have the aircraft").unwrap().0, "autopilot_off");
+    }
+
+    /// The pilot's own words for "fly the flight plan" (LIME 2026-09-25:
+    /// "I don't like that command").
+    #[test]
+    fn the_flight_is_armed_in_a_pilots_words() {
+        let (n, a) = one("Take us to Bologna.").expect("take us to");
+        assert_eq!(n, "full_auto");
+        assert_eq!(a["flight"], json!(true));
+        assert_eq!(a["to"].as_str(), Some("bologna"));
+        let (_, a) = one("fly us to lima india papa echo").expect("spelled");
+        assert_eq!(a["to_codes"], json!(["LIPE"]));
+        assert_eq!(one("start the flight").unwrap(), ("full_auto".into(), json!({"flight": true})));
+        assert_eq!(one("Begin the flight.").unwrap(), ("full_auto".into(), json!({"flight": true})));
+        assert_eq!(one("Resume.").unwrap(), ("full_auto".into(), json!({"resume": true})));
+        assert_eq!(one("I said resume.").unwrap(), ("full_auto".into(), json!({"resume": true})));
+        for w in ["Resume.", "I said resume.", "Begin the flight.", "Take us to Bologna."] {
+            assert!(crate::router::looks_like_command(w), "the gate drops {w}");
+        }
+        assert_eq!(one("continue the flight").unwrap(), ("full_auto".into(), json!({"resume": true})));
+        assert!(one("take us to the runway").is_none_or(|(n, _)| n != "full_auto"));
+        assert!(one("take us to five thousand feet").is_none_or(|(n, _)| n != "full_auto"));
     }
 
     #[test]

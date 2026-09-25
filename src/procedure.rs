@@ -410,6 +410,15 @@ pub fn map_handover_path(
     }
 }
 
+/// A missed approach point SHORT of the runway: a visual segment follows
+/// (LSZS RNAV 03). A MAP coded on the runway fix itself is the landing, and
+/// autoland's: LIPE's ILS 12 codes its MAP on RW12, the aircraft (high) never
+/// captured the FAF, the follower reached RW12 0.8 nm out and handed the
+/// pilot a "visual segment" onto an ILS runway (2026-09-25).
+pub fn map_short_of_runway(leg: &ProcLeg) -> bool {
+    leg.is_map && !leg.fix_ident.to_ascii_uppercase().starts_with("RW")
+}
+
 /// On the leg to a missed approach point, the published path: the altitude it
 /// wants at `dist_nm` from the MAP and the descent rate that stays on it at
 /// this groundspeed (fpm, negative). A P law cannot track a ramp; the rate is
@@ -554,6 +563,29 @@ pub fn arrival_ceiling_ft(
     }
     let floor = restriction_at(cons, &legs[idx]).and_then(|c| c.min_ft);
     ceiling.map(|c| floor.map_or(c, |f| c.max(f)))
+}
+
+/// The plan's OWN altitudes ahead as ceilings, the same way: this fix's
+/// target is lowered to what still makes every later fix's planned altitude
+/// at `ft_per_nm`. Only fixes after `idx`, and only a plain or "at or below"
+/// altitude (an approach's "at or above" is a floor, never a ceiling).
+/// LIME-LIPE (2026-09-25): each leg was paced only to its own fix, so the
+/// descent to PE725's 8,000 ft could not start until PE730 was behind, with
+/// four miles to lose six thousand feet: 14,200 ft at 11 nm from the field
+/// and the pilot stepping the dial down by hand.
+pub fn profile_ceiling_ft(legs: &[ProcLeg], idx: usize, ft_per_nm: f64) -> Option<f64> {
+    let from = legs.get(idx)?.fix.as_ref()?;
+    let mut ceiling: Option<f64> = None;
+    for (k, leg) in legs.iter().enumerate().skip(idx + 1) {
+        if !matches!(leg.alt_desc, ' ' | '@' | '-') {
+            continue;
+        }
+        let Some(alt) = leg.alt1_ft else { continue };
+        let d = distance_to_leg_nm(from.lat, from.lon, legs, idx, k);
+        let c = alt + d * ft_per_nm;
+        ceiling = Some(ceiling.map_or(c, |x: f64| x.min(c)));
+    }
+    ceiling
 }
 
 /// Descent gradient the ceiling is planned at, as a share of what the law
@@ -2023,10 +2055,15 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, plan: Pla
         // The STAR's "at or below"s ahead, kept reachable: this fix's target
         // comes down to whatever still makes the tightest one further on.
         let star_leg;
-        let leg_for_vertical = match (
-            leg.alt1_ft,
-            arrival_ceiling_ft(&legs, &arrival_constraints, idx, arrival_ft_per_nm(descent_fpm(), gs_kts)),
+        let grad = arrival_ft_per_nm(descent_fpm(), gs_kts);
+        let ceiling = match (
+            arrival_ceiling_ft(&legs, &arrival_constraints, idx, grad),
+            profile_ceiling_ft(&legs, idx, grad),
         ) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
+        let leg_for_vertical = match (leg.alt1_ft, ceiling) {
             (Some(a), Some(c)) if c < a - 50.0 => {
                 if star_ceiling_logged != Some(idx) {
                     star_ceiling_logged = Some(idx);
@@ -2255,7 +2292,7 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, plan: Pla
                     "procedure",
                     serde_json::json!({"event": "handoff_autoland", "idx": idx, "agl_ft": agl_ft}),
                 );
-                if leg.is_map && !MAP_AUTOLAND {
+                if map_short_of_runway(leg) && !MAP_AUTOLAND {
                     // The visual segment is the pilot's, talked down: the
                     // aircraft configured and on speed, the autopilot still
                     // holding the descent, the talk-down armed on THIS path
@@ -2296,7 +2333,7 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, plan: Pla
                     stand_down(&voice, &line, "map_handover");
                     return;
                 }
-                if leg.is_map {
+                if map_short_of_runway(leg) {
                     // The visual segment: its own angle to the landing, and
                     // the published missed approach for its go-around.
                     crate::autoland::set_next_glidepath_deg(visual_deg);
@@ -2462,6 +2499,32 @@ mod tests {
         assert!(d.vdev_ft.abs() < 60.0, "on glidepath at the MAP: {}", d.vdev_ft);
         assert!(crate::approach_guide::callout(&d).unwrap().contains("on glidepath"));
         assert!(!super::MAP_AUTOLAND, "the steep autoland stays off until proven");
+    }
+
+    #[test]
+    fn a_map_on_the_runway_is_a_landing_not_a_visual_segment() {
+        let mut leg = super::ProcLeg {
+            seq: 30,
+            transition: String::new(),
+            leg_type: "CF".into(),
+            fix_ident: "RW12".into(),
+            fix_region: String::new(),
+            fix: None,
+            course_mag: None,
+            dist_nm: None,
+            turn: None,
+            alt_desc: ' ',
+            alt1_ft: None,
+            alt2_ft: None,
+            is_faf: false,
+            is_map: true,
+            vpa_deg: None,
+        };
+        assert!(!super::map_short_of_runway(&leg), "LIPE I12: MAP on RW12");
+        leg.fix_ident = "MA03".into();
+        assert!(super::map_short_of_runway(&leg), "LSZS: MAP short of the runway");
+        leg.is_map = false;
+        assert!(!super::map_short_of_runway(&leg));
     }
 
     /// LSZS RNAV 03: FAF ZS702 at 11,800, MAP ZS705 at 6,598 on a 4.49
@@ -2792,6 +2855,24 @@ mod tests {
         // ...and a fix's own "at" stands over it.
         assert_eq!(arrival_ceiling_ft(&legs, &cons, 0, grad), Some(26_000.0));
         assert_eq!(arrival_ceiling_ft(&legs, &cons, 4, grad), None, "nothing ahead");
+    }
+
+    #[test]
+    fn the_plans_own_altitudes_ahead_bring_the_descent_forward() {
+        // No STAR at all: the plan says 8,000 two fixes on.
+        let (mut legs, _) = star_route();
+        for (l, a) in legs.iter_mut().zip([19_000.0, 19_000.0, 16_600.0, 8_000.0, 8_000.0]) {
+            l.alt1_ft = Some(a);
+        }
+        let grad = arrival_ft_per_nm(1_300.0, 200.0);
+        let c = profile_ceiling_ft(&legs, 2, grad).unwrap();
+        assert!(c < 16_600.0, "the fix before must already be coming down: {c}");
+        // An approach's "at or above" is no ceiling.
+        legs[3].alt_desc = '+';
+        legs[4].alt_desc = '+';
+        assert_eq!(profile_ceiling_ft(&legs, 2, grad), None);
+        // Nothing ahead, nothing to keep.
+        assert_eq!(profile_ceiling_ft(&legs, 4, grad), None);
     }
 
     /// Fly the loop's vertical bookkeeping down the route at 300 kt and

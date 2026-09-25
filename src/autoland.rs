@@ -774,6 +774,11 @@ pub fn run_autoland_scoped(
                 format!("Autoland to {} runway {}, {:.0} miles. Flying the approach.", rwy.icao, rwy.id, rwy.dist_nm),
                 Priority::Warning,
             );
+            // The runway's ILS on NAV1 for every landing that has one: the
+            // raw data cross-checks our path, and flies it where the
+            // airframe allows (`ils`).
+            let ils = crate::ils::tune(&xp, &rwy.icao, &rwy.id, lat0, lon0).await;
+            let coupled_ok = ils.is_some() && crate::ils::coupled_allowed();
 
             // The pavement's OWN elevation, not the field's. apt.dat carries one
             // elevation per airport and the glidepath aimed at it: LEAX's
@@ -923,6 +928,9 @@ pub fn run_autoland_scoped(
             // A give-up happened: the speed is handed to the flight governor
             // once the loop has ended (see below).
             let mut gave_up = false;
+            let mut ils_xcheck = crate::ils::XCheck::default();
+            let mut coupling = crate::ils::Coupling::Off;
+            let mut coupling_armed_s = 0.0_f64;
             loop {
                 if xp.cancelled() || GEN.load(Ordering::SeqCst) != my_gen || ABORT.load(Ordering::SeqCst) {
                     break;
@@ -1822,11 +1830,109 @@ pub fn run_autoland_scoped(
                 // change-gate would drop it exactly where it sits still), and
                 // simply not written otherwise — which hands the pitch back
                 // inside a second with nothing to remember.
+                // The ILS: its needles against our path, and the coupled
+                // approach where the airframe allows it.
+                let on_final = g.phase == ApproachPhase::Final && pattern.is_none() && !ga;
+                let needles = if ils.is_some() {
+                    let (h, v, lv, gv, ap, gs) = tokio::join!(
+                        xp.get_float(crate::ils::HDEF),
+                        xp.get_float(crate::ils::VDEF),
+                        xp.get_float(crate::ils::LOC_VALID),
+                        xp.get_float(crate::ils::GS_VALID),
+                        xp.get_float(crate::ils::APPR_STATUS),
+                        xp.get_float(crate::ils::GS_STATUS),
+                    );
+                    Some((
+                        crate::ils::Needles {
+                            hdef: h.ok(),
+                            vdef: v.ok(),
+                            loc_valid: lv.is_ok_and(|x| x > 0.5),
+                            gs_valid: gv.is_ok_and(|x| x > 0.5),
+                        },
+                        ap.ok(),
+                        gs.ok(),
+                    ))
+                } else {
+                    None
+                };
+                let cpl = match needles {
+                    Some((n, ap, gs)) => {
+                        if let Some(line) = ils_xcheck.step(n, on_final, radio_ft, tick_dt) {
+                            crate::blackbox::record(
+                                "ils",
+                                serde_json::json!({"event": "xcheck", "line": line, "hdef": n.hdef,
+                                    "vdef": n.vdef, "xtk_m": xtk_now * M_PER_NM, "radio": radio_ft}),
+                            );
+                            announce(line, Priority::Caution);
+                        }
+                        let before = coupling;
+                        let out = coupling.step(
+                            crate::ils::CouplingIn {
+                                allowed: coupled_ok,
+                                on_final,
+                                arresting: g.arresting,
+                                go_around: ga,
+                                dist_nm: g.dist_nm,
+                                needles: n,
+                                appr: ap,
+                                gs,
+                            },
+                            &mut coupling_armed_s,
+                            tick_dt,
+                        );
+                        if out.press_appr {
+                            let _ = xp.run_command(crate::ils::CMD_APPROACH).await;
+                        }
+                        if out.decouple {
+                            let _ = xp.run_command(CMD_HDG_MODE).await;
+                            let _ = xp.run_command(CMD_VS_MODE).await;
+                            let _ = xp.set_float(VS_DIAL, vs_dial).await;
+                        }
+                        if coupling != before {
+                            crate::blackbox::record(
+                                "ils",
+                                serde_json::json!({"event": "coupling", "from": format!("{before:?}"),
+                                    "to": format!("{coupling:?}"), "hdef": n.hdef, "vdef": n.vdef,
+                                    "radio": radio_ft, "dist": g.dist_nm}),
+                            );
+                            match coupling {
+                                crate::ils::Coupling::Coupled => announce(
+                                    "Localizer and glideslope captured. The autopilot has the ILS.".into(),
+                                    Priority::Advisory,
+                                ),
+                                crate::ils::Coupling::Abandoned if out.decouple => announce(
+                                    "Off the ILS coupling. I'm flying the approach myself.".into(),
+                                    Priority::Caution,
+                                ),
+                                _ => {}
+                            }
+                        }
+                        out
+                    }
+                    None => crate::ils::CouplingOut {
+                        press_appr: false,
+                        decouple: false,
+                        own_lateral: true,
+                        own_vertical: true,
+                    },
+                };
                 let (_, hdg_st, vs_st, _, yield_r, roll_yield_r) = tokio::join!(
-                    crate::tools::autopilot::drive_heading_bug_step(&xp, mag_hdg, 30.0),
+                    async {
+                        if cpl.own_lateral {
+                            crate::tools::autopilot::drive_heading_bug_step(&xp, mag_hdg, 30.0).await
+                        } else {
+                            0.0
+                        }
+                    },
                     xp.get_float(HDG_STATUS),
                     xp.get_float(VS_STATUS),
-                    xp.set_float(VS_DIAL, vs_dial),
+                    async {
+                        if cpl.own_vertical {
+                            xp.set_float(VS_DIAL, vs_dial).await
+                        } else {
+                            Ok(())
+                        }
+                    },
                     async {
                         match flare_elev {
                             Some(e) => {
@@ -1881,12 +1987,15 @@ pub fn run_autoland_scoped(
                 // the arrest on the channels a mode press is at best nothing
                 // and at worst (an MCP that engages the master with the
                 // mode) the servo back on the yoke mid-flare.
+                // A coupled ILS's captured modes are the autopilot's:
+                // re-engaging HDG or VS would drop the localizer or the
+                // glideslope it just captured.
                 if !arrest_hands {
-                    if hdg_st.unwrap_or(0.0) <= 0.5 {
+                    if cpl.own_lateral && hdg_st.unwrap_or(0.0) <= 0.5 {
                         let _ = xp.run_command(CMD_HDG_MODE).await;
                     }
                     // Vertical: VS mode to the glidepath rate.
-                    if vs_st.unwrap_or(0.0) <= 0.5 {
+                    if cpl.own_vertical && vs_st.unwrap_or(0.0) <= 0.5 {
                         let _ = xp.run_command(CMD_VS_MODE).await;
                         // The engage syncs the dial to the CURRENT rate, so the
                         // rate we want has to be written again after it.

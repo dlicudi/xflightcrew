@@ -2896,6 +2896,225 @@ pub fn star_constraints_in<'a>(
 
 /// A SID that departs `runway` at `icao` — the first ident with a leg whose
 /// transition is `RW<runway>`. `None` if the field publishes no SID for it.
+/// A departure procedure the crew can fly from the runway it was given, and
+/// where it joins the planned route.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SidChoice {
+    pub ident: String,
+    /// The runway transition ("RW10", "RW26B").
+    pub transition: String,
+    /// The last SID fix that is also on the route: from here the route goes on.
+    pub join: String,
+    /// Its index in the route idents given.
+    pub join_index: usize,
+    /// The SID's fixes up to and including the join.
+    pub fixes: Vec<String>,
+}
+
+/// The SIDs that serve `runway` and join `route` (its fix idents in order),
+/// best first: the one that joins furthest along the route, then the one
+/// with the fewest fixes. The crew chooses its own departure from the
+/// runway actually in use: at LIME (2026-09-25) the tower gave runway 10 and
+/// the plan's LEGL1P departs 28; LEGL1R and LEGL1W depart 10 to the same
+/// LEGLO. Pure over the CIFP file's lines.
+pub fn sids_for_route_in<'a>(
+    lines: impl Iterator<Item = &'a str> + Clone,
+    runway: &str,
+    route: &[String],
+) -> Vec<SidChoice> {
+    let mut idents: Vec<(String, String)> = Vec::new();
+    for line in lines.clone() {
+        let Some(body) = line.strip_prefix("SID:") else { continue };
+        let f: Vec<&str> = body.split(',').collect();
+        let (id, tr) = (cifp_field(&f, 2), cifp_field(&f, 3));
+        let serves = tr
+            .strip_prefix("RW")
+            .is_some_and(|r| runway_matches(r.trim_end_matches('B'), runway) || r.eq_ignore_ascii_case(runway));
+        if serves && !idents.iter().any(|(i, t)| i == id && t == tr) {
+            idents.push((id.to_string(), tr.to_string()));
+        }
+    }
+    let mut out: Vec<SidChoice> = Vec::new();
+    for (id, tr) in idents {
+        let fixes: Vec<String> = parse_proc_legs(lines.clone(), ProcKind::Sid, &id, Some(&tr))
+            .into_iter()
+            .map(|l| l.fix_ident)
+            .filter(|f| !f.is_empty() && !f.starts_with("RW"))
+            .collect();
+        let join = fixes.iter().enumerate().filter_map(|(k, f)| {
+            route
+                .iter()
+                .position(|r| r.eq_ignore_ascii_case(f))
+                .map(|ri| (k, ri))
+        });
+        let Some((k, ri)) = join.max_by_key(|(_, ri)| *ri) else { continue };
+        out.push(SidChoice {
+            ident: id,
+            transition: tr,
+            join: fixes[k].clone(),
+            join_index: ri,
+            fixes: fixes[..=k].to_vec(),
+        });
+    }
+    out.sort_by(|a, b| b.join_index.cmp(&a.join_index).then(a.fixes.len().cmp(&b.fixes.len())));
+    out
+}
+
+/// [`sids_for_route_in`] from the airport's CIFP file.
+pub fn sids_for_route(cifp_dir: &str, icao: &str, runway: &str, route: &[String]) -> Vec<SidChoice> {
+    let path = std::path::Path::new(cifp_dir).join(format!("{icao}.dat"));
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    sids_for_route_in(text.lines(), runway, route)
+}
+
+/// An arrival procedure the crew can fly to the runway it expects, and where
+/// it leaves the planned route.
+#[derive(Debug, Clone)]
+pub struct StarChoice {
+    pub ident: String,
+    /// The first STAR fix on the route: the route is flown to here, the
+    /// STAR from here.
+    pub entry: String,
+    pub entry_index: usize,
+    /// The STAR's legs from the entry on (fixes only, unresolved): its
+    /// enroute transition, common part and runway transition, in order.
+    pub legs: Vec<ProcLeg>,
+    /// Legs the follower cannot fly as published from the entry on: arcs
+    /// (AF/RF) flown as chords, vector legs dropped.
+    pub bent: usize,
+}
+
+/// Every STAR at the field that serves `runway` and meets `route`, the one
+/// entering earliest first (the most of the route flown as published), then
+/// the one with fewest legs that fix-to-fix flying bends (BAME6N's DME arc
+/// against BAME5M's straight RNAV legs, LIPE 12), then the shortest. A STAR's rows are three parts by route type (field 1):
+/// 1/4/7 an enroute transition named for its first fix, 2/5/8 the common
+/// part (named for its runway, "ALL" or blank), 3/6/9 a runway transition.
+/// Vector legs (no fix) are dropped: the follower flies fix to fix, and the
+/// approach picks up where the fixes end.
+pub fn stars_for_route_in<'a>(
+    lines: impl Iterator<Item = &'a str> + Clone,
+    runway: &str,
+    route: &[String],
+) -> Vec<StarChoice> {
+    let serves = |tr: &str| {
+        tr.strip_prefix("RW").is_some_and(|r| {
+            if r.ends_with('B') {
+                runway_number(r) == runway_number(runway)
+            } else {
+                runway_matches(r, runway) && r.len() == runway.len()
+            }
+        })
+    };
+    let group = |t: &str| match t {
+        "1" | "4" | "7" => 0,
+        "2" | "5" | "8" => 1,
+        "3" | "6" | "9" => 2,
+        _ => 3,
+    };
+    // ident -> (group, transition) in file order.
+    let mut parts: Vec<(String, Vec<(u8, String)>)> = Vec::new();
+    for line in lines.clone() {
+        let Some(body) = line.strip_prefix("STAR:") else { continue };
+        let f: Vec<&str> = body.split(',').collect();
+        let (id, tr, g) = (cifp_field(&f, 2), cifp_field(&f, 3), group(cifp_field(&f, 1)));
+        if id.is_empty() || g == 3 {
+            continue;
+        }
+        let entry = match parts.iter_mut().find(|(i, _)| i == id) {
+            Some(e) => e,
+            None => {
+                parts.push((id.to_string(), Vec::new()));
+                parts.last_mut().expect("just pushed")
+            }
+        };
+        if !entry.1.iter().any(|(gg, t)| *gg == g && t == tr) {
+            entry.1.push((g, tr.to_string()));
+        }
+    }
+    let on_route = |f: &str| route.iter().position(|r| r.eq_ignore_ascii_case(f));
+    let legs_of = |id: &str, tr: &str| -> Vec<ProcLeg> {
+        parse_proc_legs(lines.clone(), ProcKind::Star, id, Some(tr))
+            .into_iter()
+            .filter(|l| l.transition == tr)
+            .collect()
+    };
+    let mut out = Vec::new();
+    for (id, trs) in parts {
+        let common: Vec<&String> = trs
+            .iter()
+            .filter(|(g, t)| *g == 1 && (t.is_empty() || t.eq_ignore_ascii_case("ALL") || serves(t)))
+            .map(|(_, t)| t)
+            .collect();
+        let rw_tr = trs.iter().find(|(g, t)| *g == 2 && serves(t)).map(|(_, t)| t);
+        let has_rw_trs = trs.iter().any(|(g, _)| *g == 2);
+        let common_for_rw = common.iter().any(|t| serves(t));
+        if !(common_for_rw || rw_tr.is_some() || (!common.is_empty() && !has_rw_trs)) {
+            continue;
+        }
+        // The enroute transition the route enters by: the one with a fix
+        // earliest on the route.
+        let enroute = trs
+            .iter()
+            .filter(|(g, _)| *g == 0)
+            .filter_map(|(_, t)| {
+                let legs = legs_of(&id, t);
+                let first = legs.iter().filter_map(|l| on_route(&l.fix_ident)).min()?;
+                Some((first, legs))
+            })
+            .min_by_key(|(first, _)| *first)
+            .map(|(_, legs)| legs)
+            .unwrap_or_default();
+        let mut path: Vec<ProcLeg> = enroute;
+        for t in &common {
+            path.extend(legs_of(&id, t));
+        }
+        if let Some(t) = rw_tr {
+            path.extend(legs_of(&id, t));
+        }
+        path.retain(|l| !l.fix_ident.starts_with("RW"));
+        path.dedup_by(|b, a| a.fix_ident.eq_ignore_ascii_case(&b.fix_ident));
+        let Some((p, ri)) = path
+            .iter()
+            .enumerate()
+            .find_map(|(p, l)| on_route(&l.fix_ident).map(|ri| (p, ri)))
+        else {
+            continue;
+        };
+        let mut legs = path.split_off(p);
+        let bent = legs
+            .iter()
+            .filter(|l| l.fix_ident.is_empty() || matches!(l.leg_type.as_str(), "AF" | "RF"))
+            .count();
+        legs.retain(|l| !l.fix_ident.is_empty());
+        out.push(StarChoice {
+            ident: id,
+            entry: legs[0].fix_ident.clone(),
+            entry_index: ri,
+            legs,
+            bent,
+        });
+    }
+    out.sort_by(|a, b| {
+        a.entry_index
+            .cmp(&b.entry_index)
+            .then(a.bent.cmp(&b.bent))
+            .then(a.legs.len().cmp(&b.legs.len()))
+    });
+    out
+}
+
+/// [`stars_for_route_in`] from the airport's CIFP file.
+pub fn stars_for_route(cifp_dir: &str, icao: &str, runway: &str, route: &[String]) -> Vec<StarChoice> {
+    let path = std::path::Path::new(cifp_dir).join(format!("{icao}.dat"));
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    stars_for_route_in(text.lines(), runway, route)
+}
+
 pub fn sid_for_runway(cifp_dir: &str, icao: &str, runway: &str) -> Option<String> {
     let path = std::path::Path::new(cifp_dir).join(format!("{icao}.dat"));
     let text = std::fs::read_to_string(path).ok()?;
@@ -3210,6 +3429,98 @@ const RECON_ALIGN_DEG: f64 = 10.0;
 
 #[cfg(test)]
 mod tests {
+    /// LIME (2026-09-25): the plan's LEGL1P departs 28; with runway 10 in
+    /// use the crew picks a runway-10 SID to the same LEGLO. The real file's
+    /// lines.
+    #[test]
+    fn a_star_is_chosen_for_the_runway_expected_and_the_route() {
+        // LIPE: SimBrief planned BAME2S for 30; the wind says 12.
+        let lipe = "\
+STAR:010,2,BAME2S,RW30,BAMEK,LI,E,A,E C , ,   ,IF, , , , , ,      ,    ,    ,    ,    , ,     ,     ,     , ,   ,    ,   ,BOA,LI,D, , , , , ;
+STAR:020,2,BAME2S,RW30,D352R,LI,P,C,E   , ,   ,TF, , , , , ,      ,    ,    ,    ,    , ,     ,     ,     , ,   ,    ,   , , , , , , , , ;
+STAR:030,2,BAME2S,RW30, , , , ,    , ,   ,CI, , , , , ,      ,    ,    ,1930,    , ,     ,     ,     , ,   ,    ,   , , , , , , , , ;
+STAR:040,2,BAME2S,RW30,D108O,LI,P,C,E   ,R,   ,AF, ,BOA,LI,D, ,      ,1080,0150,3490,    , ,     ,     ,     , ,   ,    ,   , , , , , , , , ;
+STAR:050,2,BAME2S,RW30,D114M,LI,P,C,E   , ,   ,CF, ,BOA,LI,D, ,      ,1144,0130,2940,0020, ,     ,     ,     ,-,210,    ,   , , , , , , , , ;
+STAR:060,2,BAME2S,RW30,ABLEX,LI,P,C,EECH, ,   ,TF, , , , , ,      ,    ,    ,    ,    , ,     ,     ,     , ,   ,    ,   , , , , , , , , ;
+STAR:010,5,BAME5M,RW12,BAMEK,LI,E,A,E   , ,010,IF, , , , , ,      ,    ,    ,    ,    , ,     ,     ,     , ,   ,    ,   ,LIPE,LI,P,A,B, , , ;
+STAR:020,5,BAME5M,RW12,KREVA,LI,E,A,E   , ,010,TF, , , , , ,      ,    ,    ,    ,    ,+,05000,     ,     , ,   ,    ,   , , , , , , , , ;
+STAR:030,5,BAME5M,RW12,PE730,LI,P,C,E   , ,010,TF, , , , , ,      ,    ,    ,    ,    ,+,04000,     ,     ,-,230,    ,   , , , , , , , , ;
+STAR:040,5,BAME5M,RW12,PE725,LI,P,C,E   ,R,010,TF, , , , , ,      ,    ,    ,    ,    ,+,04000,     ,     ,-,230,    ,   , , , , , , , , ;
+STAR:050,5,BAME5M,RW12,PE721,LI,P,C,E   , ,010,TF, , , , , ,      ,    ,    ,    ,    ,+,04000,     ,     ,-,230,    ,   , , , , , , , , ;
+STAR:060,5,BAME5M,RW12,PE515,LI,P,C,E   ,L,010,TF,Y, , , , ,      ,    ,    ,    ,    ,+,03500,     ,     ,-,210,    ,   , , , , , , , , ;
+STAR:070,5,BAME5M,RW12,EMDUD,LI,P,C,EE H, ,010,TF, , , , , ,      ,    ,    ,    ,    ,+,02500,     ,     ,-,200,    ,   , , , , , , , , ;";
+        let route: Vec<String> = ["LUMAV", "BAMEK", "D352R", "D108O", "D114M", "ABLEX"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let c = stars_for_route_in(lipe.lines(), "12", &route);
+        assert_eq!(c.len(), 1, "{c:?}");
+        assert_eq!((c[0].ident.as_str(), c[0].entry.as_str(), c[0].entry_index), ("BAME5M", "BAMEK", 1));
+        let fixes: Vec<&str> = c[0].legs.iter().map(|l| l.fix_ident.as_str()).collect();
+        assert_eq!(fixes, ["BAMEK", "KREVA", "PE730", "PE725", "PE721", "PE515", "EMDUD"]);
+        let c = stars_for_route_in(lipe.lines(), "30", &route);
+        assert_eq!(c[0].ident, "BAME2S");
+        assert!(stars_for_route_in(lipe.lines(), "12", &["XXXXX".to_string()]).is_empty());
+    }
+
+    #[test]
+    fn a_star_enters_by_its_transition_and_ends_on_the_runway_part() {
+        let ksfo = "\
+STAR:010,4,ALWYS3,INYOE,INYOE,K2,E,A,E  H, ,   ,IF, , , , , ,      ,    ,    ,    ,    , ,     ,     ,18000, ,   ,    ,   , , , , , , , , ;
+STAR:020,4,ALWYS3,INYOE,DYAMD,K2,P,C,EE  , ,   ,TF, , , , , ,      ,    ,    ,    ,    ,+,FL270,     ,     , ,270,    ,   , , , , , , , , ;
+STAR:020,4,ALWYS3,RUSME,DYAMD,K2,P,C,EE  , ,   ,TF, , , , , ,      ,    ,    ,    ,    ,+,FL300,     ,     , ,270,    ,   , , , , , , , , ;
+STAR:010,4,ALWYS3,RUSME,RUSME,K2,E,A,E  H, ,   ,IF, , , , , ,      ,    ,    ,    ,    , ,     ,     ,18000, ,   ,    ,   , , , , , , , , ;
+STAR:010,5,ALWYS3, ,DYAMD,K2,P,C,E   , ,   ,IF, , , , , ,      ,    ,    ,    ,    , ,     ,     ,     , ,   ,    ,   , , , , , , , , ;
+STAR:020,5,ALWYS3, ,LAANE,K2,P,C,E   , ,   ,TF, , , , , ,      ,    ,    ,    ,    ,B,FL260,FL220,     , ,260,    ,   , , , , , , , , ;
+STAR:010,6,ALWYS3,RW10B,LAANE,K2,P,C,E   , ,   ,IF, , , , , ,      ,    ,    ,    ,    , ,     ,     ,     , ,   ,    ,   , , , , , , , , ;
+STAR:020,6,ALWYS3,RW10B,ARRTU,K2,P,C,E   , ,   ,TF, , , , , ,      ,    ,    ,    ,    , ,10000,     ,     , ,240,    ,   , , , , , , , , ;
+STAR:010,6,ALWYS3,RW28B,LAANE,K2,P,C,E   , ,   ,IF, , , , , ,      ,    ,    ,    ,    , ,     ,     ,     , ,   ,    ,   , , , , , , , , ;
+STAR:020,6,ALWYS3,RW28B,SERFR,K2,P,C,E   , ,   ,TF, , , , , ,      ,    ,    ,    ,    , ,12000,     ,     , ,250,    ,   , , , , , , , , ;";
+        let route: Vec<String> = ["OAL", "RUSME", "DYAMD"].iter().map(|s| s.to_string()).collect();
+        let c = stars_for_route_in(ksfo.lines(), "28L", &route);
+        let fixes: Vec<&str> = c[0].legs.iter().map(|l| l.fix_ident.as_str()).collect();
+        assert_eq!(c[0].entry, "RUSME");
+        assert_eq!(fixes, ["RUSME", "DYAMD", "LAANE", "SERFR"]);
+        let c = stars_for_route_in(ksfo.lines(), "10R", &route);
+        assert_eq!(c[0].legs.last().map(|l| l.fix_ident.as_str()), Some("ARRTU"));
+    }
+
+    #[test]
+    fn a_sid_is_chosen_for_the_runway_in_use_and_the_route() {
+        let text = r#"SID:005,2,BRL2Y,RW10, , , , ,    , ,   ,CD, ,BRL,LI,D, ,      ,    ,    ,1020,0032, ,     ,     ,06000, ,   ,    ,   ,BRL,LI,D, , , , , ;
+SID:010,2,BRL2Y,RW10, , , , ,    , ,   ,CA, , , , , ,      ,    ,    ,1020,    ,+,01500,     ,     , ,   ,    ,   , , , , , , , , ;
+SID:020,2,BRL2Y,RW10, , , , ,    ,R,   ,CI, , , , , ,      ,    ,    ,2300,    , ,     ,     ,     ,-,220,    ,   , , , , , , , , ;
+SID:030,2,BRL2Y,RW10,D185L,LI,P,C,EY  , ,   ,CF, ,BRL,LI,D, ,      ,1848,0120,1850,0040,+,06000,     ,     , ,   ,    ,   , , , , , , , , ;
+SID:040,2,BRL2Y,RW10,BRL,LI,D, ,VE  ,R,   ,CF,Y,BRL,LI,D, ,      ,0000,0000,0230,0120,+,FL120,     ,     ,-,220,    ,   , , , , , , , , ;
+SID:010,5,LEGL1P,RW28, , , , ,    , ,010,CA, , , , , ,      ,    ,    ,2820,    ,+,01180,     ,06000,-,180,    ,   ,LIME,LI,P,A, , , , ;
+SID:040,5,LEGL1P,RW28,ME609,LI,P,C,E   , ,010,CF, ,BRL,LI,D, ,      ,2262,0050,2220,0040,+,04000,     ,     ,-,180,    ,   , , , , , , , , ;
+SID:050,5,LEGL1P,RW28,ME611,LI,P,C,EY  , ,010,CF, ,BRL,LI,D, ,      ,2250,0070,2220,0020,+,05000,     ,     ,-,200,    ,   , , , , , , , , ;
+SID:060,5,LEGL1P,RW28,LEGLO,LI,E,A,EE  ,L,010,DF, , , , , ,      ,    ,    ,    ,    ,+,FL120,     ,     ,-,200,    ,   , , , , , , , , ;
+SID:010,5,LEGL1R,RW10, , , , ,    , ,010,CA, , , , , ,      ,    ,    ,1020,    ,+,01500,     ,06000,-,200,    ,   ,LIME,LI,P,A, , , , ;
+SID:020,5,LEGL1R,RW10,ME684,LI,P,C,E   ,R,010,CF, ,BRL,LI,D, ,      ,1848,0080,2300,0050, ,     ,     ,     ,-,220,    ,   , , , , , , , , ;
+SID:040,5,LEGL1R,RW10,ME685,LI,P,C,EY  , ,010,CF, ,BRL,LI,D, ,      ,1848,0120,1850,0040,+,06000,     ,     ,-,220,    ,   , , , , , , , , ;
+SID:050,5,LEGL1R,RW10,ME606,LI,P,C,E   ,L,010,DF, , , , , ,      ,    ,    ,    ,    , ,     ,     ,     ,-,220,    ,   , , , , , , , , ;
+SID:060,5,LEGL1R,RW10,LEGLO,LI,E,A,EE  , ,010,TF, , , , , ,      ,    ,    ,    ,    ,+,FL120,     ,     ,-,220,    ,   , , , , , , , , ;
+SID:010,5,LEGL1W,RW10, , , , ,    , ,010,CA, , , , , ,      ,    ,    ,1020,    ,+,01500,     ,06000,-,230,    ,   ,LIME,LI,P,A, , , , ;
+SID:020,5,LEGL1W,RW10,ME686,LI,P,C,E   , ,010,DF, , , , , ,      ,    ,    ,    ,    , ,     ,     ,     ,-,230,    ,   , , , , , , , , ;
+SID:040,5,LEGL1W,RW10,ME687,LI,P,C,E   , ,010,TF, , , , , ,      ,    ,    ,    ,    ,+,03500,     ,     ,-,230,    ,   , , , , , , , , ;
+SID:050,5,LEGL1W,RW10,ME606,LI,P,C,E   , ,010,TF, , , , , ,      ,    ,    ,    ,    ,+,06000,     ,     ,-,230,    ,   , , , , , , , , ;
+SID:060,5,LEGL1W,RW10,ME685,LI,P,C,E   , ,010,TF, , , , , ,      ,    ,    ,    ,    , ,     ,     ,     ,-,230,    ,   , , , , , , , , ;
+SID:070,5,LEGL1W,RW10,LEGLO,LI,E,A,EE  ,R,010,TF, , , , , ,      ,    ,    ,    ,    ,+,FL120,     ,     ,-,230,    ,   , , , , , , , , ;"#;
+        let route: Vec<String> = ["ME609", "ME611", "LEGLO", "SRN", "IXORA", "ARLES"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let ten = sids_for_route_in(text.lines(), "10", &route);
+        assert!(!ten.is_empty(), "a runway-10 SID to LEGLO exists");
+        assert!(ten.iter().all(|c| c.join == "LEGLO"), "{ten:?}");
+        assert_eq!(ten[0].ident, "LEGL1R", "fewest fixes first: {ten:?}");
+        assert!(!ten.iter().any(|c| c.ident == "LEGL1P"), "28's SID never serves 10");
+        assert!(!ten.iter().any(|c| c.ident == "BRL2Y"), "a SID off the route never joins it");
+        let twenty_eight = sids_for_route_in(text.lines(), "28", &route);
+        assert_eq!(twenty_eight[0].ident, "LEGL1P");
+    }
+
     use super::*;
     use std::io::Write;
 

@@ -375,6 +375,9 @@ pub fn spoken_flight_target(
     }
 }
 
+/// A flight hold that has had its wheels down this long has landed.
+const TOUCHDOWN_HOLD_S: f64 = 1.0;
+
 /// Sanity bounds for a taxi target. 0 is legitimate ("hold short" = stop).
 pub fn clamp_taxi_target(kts: f64) -> f64 {
     kts.clamp(0.0, 25.0)
@@ -483,7 +486,9 @@ pub fn taxi_control(
         // is a bit jerky", 2026-07-28) — the third airframe to say so, and
         // every complaint has moved these numbers the same direction. A stop
         // keeps its 0.6 authority; a rolling trim is passengers' comfort.
-        let cap = if target_kts < 1.0 { 0.6 } else { 0.22 };
+        // ...but comfort is for TRIMS. A runaway (the Evolution at 23 kt for
+        // 10, into a wall at LIME 2026-09-25) gets a stop's authority.
+        let cap = if target_kts < 1.0 || raw < -RUNAWAY_OVER_KTS { 0.6 } else { 0.22 };
         (Some(0.0), ((-eff - 3.0) * 0.09 + 0.08).clamp(0.08, cap))
     } else if eff < -1.0 {
         // A little fast: power off is the whole correction for a rolling
@@ -535,10 +540,19 @@ pub fn taxi_control_beta(
     }
     let fast_at_idle = thr.is_some_and(|t| t <= 0.0) && eff < -1.0;
     if brake > 0.0 || fast_at_idle {
-        let depth = ((-eff - 1.0) * BETA_PER_KT).clamp(BETA_MIN, beta_max);
-        // Walk into it, a foot on a lever, not a stab.
-        let want = -depth;
-        let next = if want < lever { (lever - BETA_STEP_IN).max(want) } else { want };
+        // At least the depth the overspeed asks for, and DEEPER each tick
+        // the speed is not falling: a fixed depth per knot held the
+        // Evolution at 17.7 kt for a 10 kt taxi with beta engaged at -0.43
+        // (LIME 2026-09-25). A foot on a lever, walked back until it bites.
+        let floor = ((-eff - 1.0) * BETA_PER_KT).clamp(BETA_MIN, beta_max);
+        let falling = trend_kts_s < BETA_BITING_KTS_S;
+        let next = if lever > -floor {
+            (lever - BETA_STEP_IN).max(-floor)
+        } else if falling {
+            lever
+        } else {
+            lever - BETA_STEP_IN
+        };
         let emergency = -eff >= BETA_BRAKE_KTS;
         return (Some(next.max(-beta_max)), if emergency { brake } else { 0.0 });
     }
@@ -554,8 +568,14 @@ const BETA_MIN: f64 = 0.08;
 /// Per tick into beta, and out of it when the pace is wanted back.
 const BETA_STEP_IN: f64 = 0.03;
 const BETA_STEP_OUT: f64 = 0.06;
+/// Slowing at least this fast (kt/s): the beta depth has bitten, hold it.
+const BETA_BITING_KTS_S: f64 = -0.2;
 /// Overspeed (kt, projected) that still earns the brakes with beta in.
 pub const BETA_BRAKE_KTS: f64 = 8.0;
+
+/// Over the target by this much is a runaway, not a trim: the brake gets a
+/// stop's authority.
+const RUNAWAY_OVER_KTS: f64 = 8.0;
 
 /// A build of speed this fast (kt/s) is a surge — downhill, a gust — and
 /// earns idle-and-brake on the projection alone, before the speed gets there.
@@ -939,6 +959,8 @@ async fn governor(xp: XPlaneClient, voice: Option<crate::voice::Voice>) {
     // read noise 25x if fed raw tick-to-tick differences.
     let mut prev_gs: Option<(f64, std::time::Instant)> = None;
     let mut idle_fast = IdleStillFast::default();
+    // When a FLIGHT hold first found the wheels on the ground (a landing).
+    let mut ground_since: Option<std::time::Instant> = None;
     let clock = std::time::Instant::now();
     let mut gs_trend = 0.0_f64;
     loop {
@@ -996,6 +1018,32 @@ async fn governor(xp: XPlaneClient, voice: Option<crate::voice::Voice>) {
                     // exact path once ate three arm requests invisibly.)
                     if on_ground == Some(true) && xp.get_float(GS_MS).await.unwrap_or(0.0) < 5.0 {
                         tracing::info!("speed governor: parked, standing down");
+                        ACTIVE.store(false, Ordering::Relaxed);
+                        break;
+                    }
+                    // A flight hold on the runway is a landing: idle and hand
+                    // back. LIPE 12 (2026-09-25): an 80 kt hold asked for in
+                    // the flare stayed on through the touchdown, the roll went
+                    // 64 to 75 kt with a bounce to 5 ft, and the pilot's
+                    // "taxi at 6" was judged against the stall margin.
+                    ground_since = match on_ground {
+                        Some(true) => ground_since.or(Some(std::time::Instant::now())),
+                        Some(false) => None,
+                        None => ground_since,
+                    };
+                    if ground_since.is_some_and(|t| t.elapsed().as_secs_f64() >= TOUCHDOWN_HOLD_S) {
+                        let _ = xp.set_float(&throttle_dref(), 0.0).await;
+                        tracing::info!(ias, "speed governor: touchdown, idle and standing down");
+                        crate::blackbox::record(
+                            "speedhold",
+                            serde_json::json!({"event": "touchdown_idle", "ias": ias, "target": target}),
+                        );
+                        if let Some(v) = &voice {
+                            v.alert(
+                                crate::voice::Priority::Caution,
+                                "Touchdown. Throttle idle, speed hold off.",
+                            );
+                        }
                         ACTIVE.store(false, Ordering::Relaxed);
                         break;
                     }
@@ -1507,6 +1555,16 @@ mod tests {
         let (lever, brake) = taxi_control_beta(10.0, 14.0, 0.0, 0.0, 0.5);
         assert!(lever.is_some_and(|l| l < 0.0 && l >= -0.5), "{lever:?}");
         assert_eq!(brake, 0.0);
+        // A steady overspeed that beta has not bitten walks deeper each tick
+        // (LIME: -0.43 held 17.7 kt for a 10 kt taxi).
+        let mut l = -0.43;
+        for _ in 0..5 {
+            l = taxi_control_beta(10.0, 17.7, l, 0.15, 0.8).0.unwrap();
+        }
+        assert!(l < -0.5, "went deeper: {l}");
+        // Once it bites (slowing), it holds the depth.
+        let held = taxi_control_beta(10.0, 15.0, -0.6, -0.5, 0.8).0.unwrap();
+        assert_eq!(held, -0.6);
         // Deeper each tick, never past the profile's depth.
         let mut l = 0.0;
         for _ in 0..40 {

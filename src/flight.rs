@@ -232,6 +232,9 @@ pub struct Situation {
     pub pilot_takeover: Option<(f64, &'static str)>,
     /// A simulated tower reaches us (`party_line::station_reaches`, ATC on).
     pub towered: Option<bool>,
+    /// The taxi drive ARRIVED at its departure holding point (a stop short
+    /// of it is not the hold). `None` when unknown.
+    pub at_hold: Option<bool>,
 }
 
 /// The one piece of this module that is not the pure model: the mailbox a
@@ -246,6 +249,8 @@ pub fn note_pilot_takeover(what: &'static str) {
         .map(|d| d.as_secs_f64())
         .unwrap_or(0.0);
     *PILOT_TAKEOVER.lock().unwrap_or_else(|e| e.into_inner()) = Some((t, what));
+    // An unattended sortie is only unattended if every takeover is on file.
+    sim::blackbox::record("intervention", serde_json::json!({ "what": what }));
 }
 
 pub fn pilot_takeover() -> Option<(f64, &'static str)> {
@@ -1482,6 +1487,75 @@ pub fn status_line(s: &Status) -> String {
     out.join(" ")
 }
 
+/// The panel's State tab: the flight model and the duty engine, one line
+/// each, for the pilot to glance at while it flies. `phase_s` is the time in
+/// the phase (shown to the nearest 10 s, so the feed is not re-sent every
+/// second). Pure.
+pub fn state_lines(
+    s: &Status,
+    m: &Memory,
+    phase_s: f64,
+    duty: (&str, &str, Option<bool>),
+) -> String {
+    let mut out = Vec::new();
+    out.push(format!(
+        "Phase: {:?}, {} s",
+        s.phase,
+        ((phase_s / 10.0).floor() * 10.0).max(0.0) as i64
+    ));
+    out.push(format!(
+        "Flying: {}",
+        match s.control {
+            Control::Automation(n) => n.to_string(),
+            Control::Autopilot => "autopilot".to_string(),
+            Control::Pilot => "you".to_string(),
+            Control::Unknown => "unknown".to_string(),
+        }
+    ));
+    out.push(format!("Mission: {}", s.situation.mission.unwrap_or("none")));
+    out.push(match (&s.situation.plan, &s.situation.active_fix) {
+        (Some(p), Some(f)) => format!("Plan: {}-{}, fix {f}", p.origin, p.destination),
+        (Some(p), None) => format!("Plan: {}-{}", p.origin, p.destination),
+        (None, _) => "Plan: none".to_string(),
+    });
+    let tower = match s.situation.towered {
+        Some(true) => "tower in reach",
+        Some(false) => "no tower in reach",
+        None => "tower unknown",
+    };
+    out.push(match &s.situation.clearance {
+        Some(c) => format!(
+            "Clearance: {}{}{}, {tower}{}",
+            c.state,
+            c.runway.as_ref().map(|r| format!(" rwy {r}")).unwrap_or_default(),
+            c.squawk.map(|q| format!(", squawk {q}")).unwrap_or_default(),
+            if c.readback_owed { ", readback owed" } else { "" }
+        ),
+        None => format!("Clearance: none, {tower}"),
+    });
+    let (name, why, agrees) = duty;
+    out.push(format!(
+        "Next duty: {} ({why}){}",
+        name.replace('_', " "),
+        match agrees {
+            Some(true) => ", automation agrees",
+            Some(false) => ", automation DISAGREES",
+            None => "",
+        }
+    ));
+    out.push(match &s.abnormal {
+        Abnormal::Normal => "Status: normal".to_string(),
+        Abnormal::Failure(f) => format!("Status: failed {}", f.join(", ")),
+        Abnormal::Emergency => "Status: EMERGENCY".to_string(),
+        Abnormal::Crashed => "Status: CRASHED".to_string(),
+    });
+    out.push(format!(
+        "This flight: {} landing(s), {} go-around(s), {} takeover(s), peak {:.0} ft",
+        m.landings, m.go_arounds, m.pilot_takeovers, m.peak_alt_ft
+    ));
+    out.join("\n")
+}
+
 fn capitalise(s: &str) -> String {
     let mut c = s.chars();
     match c.next() {
@@ -1945,6 +2019,29 @@ mod tests {
             .iter()
             .any(|e| matches!(e, Event::PilotTookOver { .. })));
         assert_eq!(f.memory().pilot_takeovers, 1);
+    }
+
+    #[test]
+    fn the_state_tab_shows_the_flight_and_the_next_duty() {
+        let s = Status {
+            phase: Phase::TaxiOut,
+            control: Control::Automation("taxi"),
+            abnormal: Abnormal::Normal,
+            situation: Situation {
+                mission: Some("full auto"),
+                towered: Some(true),
+                ..Situation::default()
+            },
+            alt_ft: 700.0,
+            ias_kts: 10.0,
+            gs_kts: 10.0,
+        };
+        let t = state_lines(&s, &Memory::default(), 47.0, ("taxi", "engines running", Some(true)));
+        assert!(t.starts_with("Phase: TaxiOut, 40 s"), "{t}");
+        assert!(t.contains("Flying: taxi"), "{t}");
+        assert!(t.contains("Next duty: taxi (engines running), automation agrees"), "{t}");
+        assert!(t.contains("Clearance: none, tower in reach"), "{t}");
+        assert!(t.len() < 500, "fits the plugin's buffer: {}", t.len());
     }
 
     #[test]

@@ -641,6 +641,11 @@ fn situation() -> crate::flight::Situation {
         clearance,
         pilot_takeover: crate::flight::pilot_takeover(),
         towered: Some(crate::mode::atc_enabled() && crate::party_line::station_reaches()),
+        at_hold: Some(
+            !crate::autotaxi::driving()
+                && crate::autotaxi::LAST_ARRIVED.load(std::sync::atomic::Ordering::Relaxed)
+                && !crate::party_line::taxi_to_stand(),
+        ),
     }
 }
 
@@ -2017,6 +2022,120 @@ static PANEL_MUTE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool
 /// (if any), then cabin altitude airborne, then fuel endurance. " | " separators
 /// (ASCII-safe for the panel font). Empty hides the row.
 /// Round to 0.1 for compact black-box records.
+/// The pilot's controls, the levers and the conditions, for the `state`
+/// record's `in` object. A failed read is `None`, never a number.
+#[derive(Debug, Clone, Default)]
+struct Inputs {
+    throttle: Option<f64>,
+    beta: Option<f64>,
+    brake_l: Option<f64>,
+    brake_r: Option<f64>,
+    yoke_pitch: Option<f64>,
+    yoke_roll: Option<f64>,
+    yoke_yaw: Option<f64>,
+    ap_on: Option<f64>,
+    ap_state: Option<f64>,
+    wind_dir: Option<f64>,
+    wind_kts: Option<f64>,
+    sim_speed: Option<f64>,
+    trq: Option<f64>,
+    steer_yield: Option<f64>,
+    pitch_yield: Option<f64>,
+    brake_yield: Option<f64>,
+}
+
+impl Inputs {
+    fn json(&self) -> serde_json::Value {
+        let r2 = |v: Option<f64>| v.map(|x| (x * 100.0).round() / 100.0);
+        serde_json::json!({
+            "thr": r2(self.throttle), "beta": r2(self.beta),
+            "bl": r2(self.brake_l), "br": r2(self.brake_r),
+            "yp": r2(self.yoke_pitch), "yr": r2(self.yoke_roll), "yy": r2(self.yoke_yaw),
+            "ap": self.ap_on.map(|v| v > 0.5), "ap_state": self.ap_state.map(|v| v as i64),
+            "wind": [self.wind_dir.map(r1), self.wind_kts.map(r1)],
+            "sim_speed": self.sim_speed, "trq": self.trq.map(r1),
+            "yield": [self.steer_yield.map(|v| v > 0.5), self.pitch_yield.map(|v| v > 0.5),
+                      self.brake_yield.map(|v| v > 0.5)],
+        })
+    }
+}
+
+async fn read_inputs(xp: &crate::xplane::XPlaneClient) -> Inputs {
+    let ok = |r: anyhow::Result<f64>| r.ok().filter(|v| v.is_finite());
+    let (throttle, beta, brake_l, brake_r, yoke_pitch, yoke_roll, yoke_yaw, ap_on) = tokio::join!(
+        xp.get_float("sim/cockpit2/engine/actuators/throttle_ratio_all"),
+        xp.get_float("sim/cockpit2/engine/actuators/throttle_beta_rev_ratio_all"),
+        xp.get_float("sim/cockpit2/controls/left_brake_ratio"),
+        xp.get_float("sim/cockpit2/controls/right_brake_ratio"),
+        xp.get_float("sim/joystick/yoke_pitch_ratio"),
+        xp.get_float("sim/joystick/yoke_roll_ratio"),
+        xp.get_float("sim/joystick/yoke_heading_ratio"),
+        xp.get_float("sim/cockpit2/autopilot/autopilot_on"),
+    );
+    let (ap_state, wind_dir, wind_ms, sim_speed, trq, steer_yield, pitch_yield, brake_yield) = tokio::join!(
+        xp.get_float("sim/cockpit/autopilot/autopilot_state"),
+        xp.get_float(crate::datarefs::WIND_DIR_DEG_TRUE),
+        xp.get_float(crate::datarefs::WIND_SPEED_MSC),
+        xp.get_float("sim/time/sim_speed"),
+        xp.get_float_array("sim/flightmodel/engine/ENGN_TRQ"),
+        xp.get_float("xcopilot/steer_yield"),
+        xp.get_float("xcopilot/pitch_yield"),
+        xp.get_float("xcopilot/brake_yield"),
+    );
+    Inputs {
+        throttle: ok(throttle),
+        beta: ok(beta),
+        brake_l: ok(brake_l),
+        brake_r: ok(brake_r),
+        yoke_pitch: ok(yoke_pitch),
+        yoke_roll: ok(yoke_roll),
+        yoke_yaw: ok(yoke_yaw),
+        ap_on: ok(ap_on),
+        ap_state: ok(ap_state),
+        wind_dir: ok(wind_dir),
+        wind_kts: ok(wind_ms).map(|m| m * 1.943_844),
+        sim_speed: ok(sim_speed),
+        trq: trq.ok().and_then(|v| v.first().copied()).filter(|v| v.is_finite()),
+        steer_yield: ok(steer_yield),
+        pitch_yield: ok(pitch_yield),
+        brake_yield: ok(brake_yield),
+    }
+}
+
+/// Past this deflection a yoke under an autopilot is a hand on it.
+const YOKE_HANDS: f64 = 0.15;
+
+/// Interventions the tick can see: a plugin yield latch rising (feet on the
+/// pedals, hands on the yoke, a toe brake during a steered drive), or the yoke
+/// deflected while the autopilot flies for an automation. Each is blackboxed
+/// `intervention` once per episode; "my controls" and the loops' own yield
+/// stand-downs record through `flight::note_pilot_takeover`.
+fn note_interventions(i: &Inputs, control: crate::flight::Control) {
+    static PREV: std::sync::Mutex<[bool; 4]> = std::sync::Mutex::new([false; 4]);
+    let automation = matches!(control, crate::flight::Control::Automation(_));
+    let hands = automation
+        && i.ap_on.is_some_and(|v| v > 0.5)
+        && [i.yoke_pitch, i.yoke_roll].iter().any(|v| v.is_some_and(|x| x.abs() > YOKE_HANDS));
+    let now = [
+        i.steer_yield.is_some_and(|v| v > 0.5),
+        i.pitch_yield.is_some_and(|v| v > 0.5),
+        i.brake_yield.is_some_and(|v| v > 0.5),
+        hands,
+    ];
+    let names = ["steer_yield", "pitch_yield", "brake_yield", "yoke_under_ap"];
+    let mut prev = PREV.lock().unwrap_or_else(|e| e.into_inner());
+    for k in 0..4 {
+        if now[k] && !prev[k] {
+            crate::blackbox::record(
+                "intervention",
+                serde_json::json!({ "what": names[k], "ctl": format!("{control:?}"),
+                    "yp": i.yoke_pitch, "yr": i.yoke_roll }),
+            );
+        }
+    }
+    *prev = now;
+}
+
 fn r1(v: f64) -> f64 {
     (v * 10.0).round() / 10.0
 }
@@ -2131,6 +2250,9 @@ pub async fn run(
     let mut flight = crate::flight::Flight::new();
     // The duty engine's last answer, logged on change (`duty.rs`).
     let mut last_duty: Option<crate::duty::Duty> = None;
+    // The State tab's last text, and its resend countdown.
+    let mut last_state_text = String::new();
+    let mut state_resend: u8 = 0;
     // Pushback progress is a sequence of *events*, not a sustained condition, so
     // it's called out on transitions here rather than as Checks.
     let mut prev_attached = false;
@@ -2313,6 +2435,22 @@ pub async fn run(
             if let Some(st) = &flight_status {
                 let landed = flight.memory().landings > 0;
                 let (d, why) = crate::duty::next(st, landed, wall_t);
+                // The State tab, change-gated with a resend every 20 ticks
+                // (a plugin reload zeroes its buffer).
+                if let Some(sink) = status.as_ref() {
+                    let text = crate::flight::state_lines(
+                        st,
+                        flight.memory(),
+                        flight.in_phase_secs(wall_t),
+                        (d.name(), why, crate::duty::agrees(d, st.control)),
+                    );
+                    state_resend = state_resend.saturating_sub(1);
+                    if text != last_state_text || state_resend == 0 {
+                        sink.state(&text);
+                        last_state_text = text;
+                        state_resend = 20;
+                    }
+                }
                 if last_duty != Some(d) {
                     last_duty = Some(d);
                     crate::blackbox::record(
@@ -3476,6 +3614,11 @@ pub async fn run(
             // Bank and track ride along for the offline ACS grade
             // (`instructor::grade_flight`: steep turns, touchdown drift).
             let (lat, lon, alt) = (snap.lat, snap.lon, snap.alt_ft);
+            // The hands and the levers, batched in one join: what the pilot
+            // and the loops were doing, so a sortie can prove nobody touched
+            // it and a complaint ("jerky braking") has a number.
+            let inputs = read_inputs(&xp).await;
+            note_interventions(&inputs, flight.control());
             crate::blackbox::record(
                 "state",
                 serde_json::json!({
@@ -3488,6 +3631,8 @@ pub async fn run(
                     "fuel_kg": snap.fuel_kg, "eng": snap.engine_running,
                     "phase": format!("{:?}", snap.phase),
                     "fphase": format!("{:?}", flight.phase()), "crashed": crashed,
+                    "ctl": format!("{:?}", flight.control()),
+                    "in": inputs.json(),
                 }),
             );
 

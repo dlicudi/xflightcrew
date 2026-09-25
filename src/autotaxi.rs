@@ -810,7 +810,11 @@ const PIVOT_MIN_ERR_DEG: f64 = 60.0;
 /// straights (2026-09-25) the Evolution's right brake pulsed 0.02 to 0.14
 /// every second, the yaw swung +/-1.7 deg/s and the governor surged a knot
 /// against each pulse. A foot holds a pressure; it does not tap.
-pub const BRAKE_STEER_TAU_S: f64 = 0.8;
+///
+/// 0.4 s, not the first 0.8: the longer lag let a corner's correction
+/// arrive late, and the Evolution rocked +/-17 deg/s for twenty seconds
+/// out of a bend at LIME (2026-09-25).
+pub const BRAKE_STEER_TAU_S: f64 = 0.4;
 
 /// One step of a first-order lag toward `want`.
 pub fn smooth_toward(prev: f64, want: f64, tau_s: f64, dt: f64) -> f64 {
@@ -1029,6 +1033,11 @@ fn roll_forward_entry_m(
 /// its centreline stop (m past the threshold). `None` when the lead-on isn't
 /// THIS hold or THIS runway: it must start near the aircraft and end on the
 /// centreline with runway enough beyond the stop.
+/// How far from the centreline a lead-on may end and still be on the runway
+/// (half the widest strip, 60 m, plus slack), and how far before the end.
+const LEAD_ON_JUNCTION_XT_M: f64 = 35.0;
+const LEAD_ON_BEHIND_END_M: f64 = 30.0;
+
 pub fn line_up_path_from_lead_on(
     rwy: &crate::autoland::Runway,
     lat: f64,
@@ -1043,22 +1052,40 @@ pub fn line_up_path_from_lead_on(
     // hold sits ~90 m from its own junction (LXGB Echo: 92 m; the old 80 m
     // straight-line guard silently rejected it and the diagonal came back,
     // 2026-07-24, probed). A foreign stub is displaced ALONG the runway.
+    // Every rejection says which test and the numbers: a remote hold at
+    // LIME 28 (200 m off the centreline) was refused as "can't find runway
+    // 28" with nothing to say whether the lead-on had failed and why
+    // (2026-09-25).
+    let reject = |why: &str, v: f64| {
+        crate::blackbox::record(
+            "autotaxi",
+            serde_json::json!({"event": "lead_on_rejected", "rwy": rwy.id, "why": why, "value": v, "pts": lead_on.len()}),
+        );
+        None
+    };
     let a_air = -along_track_nm(lat, lon, rwy) * M_PER_NM;
     let a_first = -along_track_nm(first.0, first.1, rwy) * M_PER_NM;
     if (a_first - a_air).abs() > 80.0 {
-        return None;
+        return reject("not_this_hold", a_first - a_air);
     }
-    // ...and ends ON this runway's centreline (the junction node).
-    if (cross_track_nm(last.0, last.1, rwy) * M_PER_NM).abs() > 20.0 {
-        return None;
+    // ...and ends ON this runway's pavement (the junction node): a
+    // connector that meets the runway at its end can stop at the edge of a
+    // 45 m strip, not on the centreline; the fillet below finishes it.
+    let junction_xt = (cross_track_nm(last.0, last.1, rwy) * M_PER_NM).abs();
+    if junction_xt > LEAD_ON_JUNCTION_XT_M {
+        return reject("junction_off_the_runway", junction_xt);
     }
+    // A junction a little before the end is the end: a hold beside the
+    // runway's first metres (and a displaced threshold is usable for
+    // takeoff).
     let junction_a = -along_track_nm(last.0, last.1, rwy) * M_PER_NM;
-    if junction_a < 0.0 {
-        return None;
+    if junction_a < -LEAD_ON_BEHIND_END_M {
+        return reject("junction_behind_the_end", junction_a);
     }
+    let junction_a = junction_a.max(0.0);
     let stop_m = junction_a + LINE_UP_ALIGN_M;
     if rwy.length_m - stop_m < LINE_UP_MIN_REMAINING_M {
-        return None;
+        return reject("too_little_runway_left", rwy.length_m - stop_m);
     }
     // Aircraft, then the authored points (skipping any we're already on top
     // of), then a FILLET ARC around the junction corner onto the centreline,
@@ -1076,7 +1103,7 @@ pub fn line_up_path_from_lead_on(
     let stop = project_latlon(rwy.thr_lat, rwy.thr_lon, rwy.course_deg, stop_m / M_PER_NM);
     let corner = path.pop()?; // the junction (or the aircraft itself — refused below)
     if path.is_empty() {
-        return None;
+        return reject("already_at_the_junction", 0.0);
     }
     path.extend(fillet_corner(*path.last()?, corner, stop, 18.0));
     path.push(stop);
@@ -1385,6 +1412,25 @@ pub fn lookahead_m_with(gs_kts: f64, aim_s: f64) -> f64 {
     (gs_kts * 0.514 * aim_s).clamp(16.0, 10.0 * aim_s)
 }
 
+/// Pure pursuit on a curve cuts inside it by about L^2 / 2R. A long aim in a
+/// GENTLE bend is where that bites: the Evolution's 9 s aim at 12 kt is 55 m,
+/// and a 107 m radius bend at LIME put it 8.5 m inside the line with the
+/// steering near zero, 13 m on another (2026-09-25). The aim is capped so the
+/// geometric cut stays under [`BEND_MAX_CUT_M`]; never under the ordinary
+/// 16 m minimum, so sharp corners and straights are exactly as they were.
+pub fn bend_lookahead_cap_m(gs_kts: f64, turn_dps: f64) -> f64 {
+    let v = gs_kts * 0.514_444;
+    if v < 0.5 || turn_dps.abs() < 0.2 {
+        return f64::INFINITY;
+    }
+    let radius_m = v / turn_dps.abs().to_radians();
+    (2.0 * radius_m * BEND_MAX_CUT_M).sqrt().max(16.0)
+}
+/// The most a gentle bend may be cut, m.
+pub const BEND_MAX_CUT_M: f64 = 1.5;
+/// The route span the bend's curvature is read over, m.
+pub const BEND_PROBE_M: f64 = 25.0;
+
 /// Deceleration the stop ramp plans for, m/s².
 ///
 /// NOT the deceleration the brakes can achieve — that is about 0.7 m/s² at the
@@ -1478,6 +1524,25 @@ pub fn start(base_url: String, voice: Option<Voice>, route: Route, base_kts: f64
         };
         rt.block_on(drive(XPlaneClient::new(base_url), voice, route, base_kts, gen));
     });
+}
+
+/// Past this groundspeed a drive is no taxi at all, whatever the target.
+pub const OVERSPEED_ABS_KTS: f64 = 25.0;
+/// This far over the target, held [`OVERSPEED_HOLD_S`], stops the drive.
+pub const OVERSPEED_OVER_KTS: f64 = 8.0;
+pub const OVERSPEED_HOLD_S: f64 = 3.0;
+
+/// Whether the taxi is running away: `Some("absolute")` past
+/// [`OVERSPEED_ABS_KTS`] (stop now), `Some("over_target")` past the target
+/// by [`OVERSPEED_OVER_KTS`] (stop once held). Pure.
+pub fn taxi_overspeed(gs_kts: f64, target_kts: f64) -> Option<&'static str> {
+    if gs_kts > OVERSPEED_ABS_KTS {
+        Some("absolute")
+    } else if target_kts >= 1.0 && gs_kts > target_kts + OVERSPEED_OVER_KTS {
+        Some("over_target")
+    } else {
+        None
+    }
 }
 
 /// Which drive owns [`ACTIVE`]: bumped by every [`start`]. A drive that is
@@ -1637,6 +1702,8 @@ async fn drive(xp: XPlaneClient, voice: Option<Voice>, route: Route, base_kts: f
     let mut bs_steer = 0.0f64;
     // Stagnation watch: commanding motion but not moving (see below).
     let mut stalled_since: Option<std::time::Instant> = None;
+    // Over the taxi pace since (see [`taxi_overspeed`]).
+    let mut overspeed_since: Option<std::time::Instant> = None;
     loop {
         if !ACTIVE.load(Ordering::Relaxed) || DRIVE_GEN.load(Ordering::SeqCst) != gen {
             crate::blackbox::record(
@@ -1809,7 +1876,9 @@ async fn drive(xp: XPlaneClient, voice: Option<Voice>, route: Route, base_kts: f
         // stop_straighten then froze the leftover angle (LXGB Echo,
         // 2026-07-24, twice). Only bites close-in, where the stop ramp has
         // already slowed us below weave speeds.
-        let look = lookahead_m_with(gs_kts, route.pace.lookahead_s).min((remaining * 0.6).max(6.0));
+        let look = lookahead_m_with(gs_kts, route.pace.lookahead_s)
+            .min(bend_lookahead_cap_m(gs_kts, route.route_turn_rate_dps(progress, BEND_PROBE_M, gs_kts)))
+            .min((remaining * 0.6).max(6.0));
         // Inside the stop zone, fly the route's FINAL BEARING instead of
         // pursuing an aim point that has stopped moving. See
         // `final_bearing_deg`: past the end the pursuit error runs to 160°+
@@ -1920,6 +1989,44 @@ async fn drive(xp: XPlaneClient, voice: Option<Voice>, route: Route, base_kts: f
         } else {
             stalled_since = None;
         }
+        // Too fast to be a taxi: stop, never press on into a corner. The
+        // Evolution taxied at 17 to 23 kt against a 10 kt target, took a
+        // corner at that pace, ground-looped off the pavement and hit a wall
+        // (LIME 2026-09-25). Sustained over the target by
+        // [`OVERSPEED_OVER_KTS`], or ever past [`OVERSPEED_ABS_KTS`].
+        // Against the drive's PACE, never a bend's momentary target: slowing
+        // from 14 kt toward a 6 kt bend is the governor working, and judged
+        // against the 6 it stopped a good taxi at LIME (2026-09-25).
+        let target_now = speedhold::taxi_target().unwrap_or(base_kts).max(base);
+        let over = taxi_overspeed(gs_kts, target_now);
+        let over_held = match over {
+            Some("absolute") => true,
+            Some(_) => overspeed_since
+                .get_or_insert_with(std::time::Instant::now)
+                .elapsed()
+                .as_secs_f64()
+                >= OVERSPEED_HOLD_S,
+            None => {
+                overspeed_since = None;
+                false
+            }
+        };
+        if over_held {
+            tracing::warn!(gs_kts, target_now, "auto taxi: too fast, stopping");
+            crate::blackbox::record(
+                "autotaxi",
+                serde_json::json!({"event": "overspeed_stop", "gs": gs_kts, "target": target_now, "why": over}),
+            );
+            speedhold::set_taxi_target(0.0);
+            let _ = xp.set_float(TAXI_STEER, 0.0).await;
+            alert(
+                &voice,
+                Priority::Warning,
+                &format!("Too fast for the taxi, {gs_kts:.0} knots. Stopping. Your aircraft."),
+            );
+            ACTIVE.store(false, Ordering::Relaxed);
+            break;
+        }
         // Steering: aim at the route ahead, command the error down — led by
         // the yaw rate so a laggy plant (castoring nosewheel steering by
         // rudder) can't snake — with the lock tapered by groundspeed so a
@@ -1981,13 +2088,16 @@ async fn drive(xp: XPlaneClient, voice: Option<Voice>, route: Route, base_kts: f
         let (bl, br) = if route.pace.brake_steer || crate::aircraft::nose_castors() {
             let pivot = pivot_due(err, gs_kts, join_allow.unwrap_or(0.0) > 0.0);
             bs_steer = smooth_toward(bs_steer, steer, BRAKE_STEER_TAU_S, dt);
+            // The turn-rate ceiling holds for every brake turn, not only a
+            // pivot: out of a LIME corner at 8 to 12 kt the brake spun the
+            // Evolution at 35 deg/s where the bend asked 14 (2026-09-25).
             let (wl, wr) = if pivot {
-                let (l, r) = pivot_brake_split(steer, gs_kts);
-                let k = pivot_rate_scale(steer, yaw_rate);
-                (l * k, r * k)
+                pivot_brake_split(steer, gs_kts)
             } else {
                 brake_steer_split_band(bs_steer, gs_kts, crate::aircraft::nose_free())
             };
+            let k = pivot_rate_scale(if pivot { steer } else { bs_steer }, yaw_rate);
+            let (wl, wr) = (wl * k, wr * k);
             let bl = slew_steer(bs_prev.0, wl, Some(BRAKE_STEER_SLEW_PER_S), dt);
             let br = slew_steer(bs_prev.1, wr, Some(BRAKE_STEER_SLEW_PER_S), dt);
             bs_prev = (bl, br);
@@ -3526,6 +3636,33 @@ mod tests {
         let (_, r) = brake_steer_split_band(0.3, 3.0, true);
         assert!(r > 0.05, "a free nose gets its brake: {r:.3}");
         assert_eq!(brake_steer_split_band(0.3, 1.0, true), (0.0, 0.0), "stopped is the stop's");
+    }
+
+    /// LIME 2026-09-25: 23 kt against a 10 kt target, into a corner, off
+    /// the pavement and into a wall. That is a stop, not a trim.
+    #[test]
+    fn a_runaway_taxi_is_stopped() {
+        assert_eq!(taxi_overspeed(23.4, 10.0), Some("over_target"));
+        assert_eq!(taxi_overspeed(26.0, 30.0), Some("absolute"));
+        assert_eq!(taxi_overspeed(17.7, 10.0), None, "7.7 over is the brakes' to fix");
+        assert_eq!(taxi_overspeed(12.0, 10.0), None);
+        assert_eq!(taxi_overspeed(5.0, 0.0), None, "a stop in progress is the stop's");
+    }
+
+    #[test]
+    fn a_gentle_bend_shortens_the_aim_and_a_straight_does_not() {
+        // LIME: 12 kt, a 3.3 deg/s bend (radius ~107 m).
+        let cap = bend_lookahead_cap_m(12.0, -3.3);
+        assert!((17.0..19.5).contains(&cap), "{cap}");
+        let full = lookahead_m_with(12.0, 9.0);
+        assert!(full > 50.0 && full.min(cap) < 20.0);
+        // The cut the capped aim leaves: under the limit.
+        let r = 12.0 * 0.514_444 / 3.3_f64.to_radians();
+        assert!(cap * cap / (2.0 * r) <= BEND_MAX_CUT_M + 1e-9);
+        // Straight, or crawling: no cap. A sharp corner: never under 16.
+        assert!(bend_lookahead_cap_m(12.0, 0.1).is_infinite());
+        assert!(bend_lookahead_cap_m(0.5, 10.0).is_infinite());
+        assert_eq!(bend_lookahead_cap_m(8.0, 30.0), 16.0);
     }
 
     #[test]

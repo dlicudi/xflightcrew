@@ -156,6 +156,10 @@ tools; YAML carries per-airframe config. Standing rules:
   already set is passed over; every step is blackboxed and on the panel,
   only a profile `say:` milestone is spoken, and a switch that never took
   is named in the closing line. Twenty presses in two seconds is a macro.
+- **A flight speed hold on the runway has landed** (`speedhold`
+  `TOUCHDOWN_HOLD_S`, blackbox `touchdown_idle`): a second on the wheels and
+  it closes the throttle, says so and lets go. An 80 kt hold asked for in the
+  flare powered LIPE's rollout from 64 to 75 kt (2026-09-25).
 - **No automation target goes below the airframe's speed floor**
   (`aircraft::speed_floor_kts`, 1.2 x clean Vs, republished per swap):
   `speedhold::arm_flight` and `run_autoland` raise the target to it, say so,
@@ -523,7 +527,10 @@ history):
   native push = stop command + brakes; airborne = heal the stale flag and
   route the words on).
 - **Auto taxi** ([src/autotaxi.rs](src/autotaxi.rs)): speed via the taxi
-  governor through `hold_speed`'s front door; pure-pursuit steering; an
+  governor through `hold_speed`'s front door; pure-pursuit steering whose aim
+  is capped in a gentle bend so the L^2/2R cut stays under 1.5 m
+  (`bend_lookahead_cap_m`, never under the 16 m minimum; the Evolution's
+  55 m aim ran 8 to 13 m inside LIME's bends, 2026-09-25); an
   off-route engage is a JOIN, not a refusal (refuse only past `MAX_JOIN_M`);
   cross-track/heading error cap the pace every tick (can only slow); governor
   evaporating on the ground ARRESTS (throttle closed, expiring brake pulse,
@@ -938,8 +945,24 @@ history):
   clamped into the plan's altitudes at the arm (`apply_arrival_constraints`,
   never climbed back out of), every fix's target is capped so each "at or
   below" further on stays reachable at the descent rate
-  (`arrival_ceiling_ft`, blackbox `star_ceiling`), and each speed limit is
+  (`arrival_ceiling_ft`, blackbox `star_ceiling`; the plan's own later
+  altitudes are ceilings the same way, `profile_ceiling_ft`, since LIME-LIPE
+  2026-09-25 paced each leg to its own fix and arrived 14,200 ft at 11 nm),
+  and each speed limit is
   slowed for in time and held after (`arrival_speed_cap`, `star_speed`).
+  **The crew picks its own procedures** (LIME 2026-09-25: the tower gave
+  10 to a plan built on LEGL1P from 28, and full auto gave up): a cleared
+  runway the plan's SID does not serve gets the SID from THAT runway that
+  joins the route furthest along (`nav::sids_for_route`,
+  `full_auto::choose_departure`, gradient-checked like the planned one; none
+  flyable: direct to the PLANNED SID's exit, the one the route starts on).
+  At the arm, a destination METAR wind that favours another end than
+  SimBrief's gets the STAR serving it that enters the route earliest,
+  straight legs before arcs and vectors (`nav::stars_for_route`,
+  `plan_audit::choose_arrival`, blackbox `star_chosen`), the planned STAR
+  kept when it serves the runway. Either choice reloads the GPS with the
+  procedure flown (`full_auto::payload_with_legs`). Still owed: a re-pick
+  in flight (the METAR moves, the tower names a runway).
 - **The whole plan is dry-run before it is flown**
   ([src/plan_audit.rs](src/plan_audit.rs), at the full-auto arm and on
   "check the flight plan" / "is the plan safe" / "is the aircraft suitable",
@@ -968,6 +991,20 @@ history):
   PUBLISHED missed approach, `take_missed_legs`) is off behind
   `MAP_AUTOLAND` since LSZS 2026-09-24: it porpoised in 18 kt of mountain
   wind and levelled at 238 ft for a reason not yet found.
+- **The ILS is tuned, watched and, per airframe, flown**
+  ([src/ils.rs](src/ils.rs), 2026-09-25: full auto "flew the ILS" at LIPE
+  with NAV1 never tuned): `ils::tune` sets NAV1 and the course (read back,
+  blackbox `ils` `tuned`) at the approach setup and at every autoland arm;
+  `XCheck` says a needle held past a dot for 8 s on final (the copilot's path
+  and the ILS disagree); `Coupling`, only with the profile's `ils_coupled`
+  (off everywhere until a capture is flown on the type), arms APPR on final
+  inside 15 nm and 2 dots, stops writing the bug at localizer capture and
+  the VS dial at glideslope capture (and never re-engages HDG/VS over them),
+  hands back to HDG/VS on a go-around or a lost capture, and leaves the
+  roundout gate's arrest to take the servos as always. **A MAP on the
+  runway fix is a landing** (`map_short_of_runway`): LIPE I12 codes its MAP
+  on RW12, and a high arrival that never captured the FAF was handed over as
+  a "visual segment" 0.8 nm out.
 - **An approach is a straight-in to THIS runway or it is not offered**
   (`nav::straight_in_legs`, LOWI 2026-09-24): a runway fix for the exact
   designator (a grass "26R" never inherits "26"), no RF arc before it, the
@@ -1518,7 +1555,17 @@ flight: aircraft, the numbers, the lessons and the ACS grade of every
 straight segment and the landing (`instructor::grade_flight`), every
 callout, and the narrative of events an instructor would write down
 (crashes, balks, void calls, floored targets, taxi stops). Run it before
-diagnosing by hand. **Run tests with `XCOPILOT_BLACKBOX=off`**: any test
+diagnosing by hand. **A sortie is one file with a verdict** (2026-09-25, for unattended
+testing): every mission is a sortie (`full_auto::SortieGuard`, blackbox
+`sortie` begin/end, every record tagged `sortie`, copied to
+`logs/sorties/<id>.jsonl`); [src/scorecard.rs](src/scorecard.rs) turns the
+ticks into `stage_result` (taxi, line_up, alignment, takeoff, landing: a
+number and a limit each) and a `sortie_result` (PASS only with no failed
+stage, no give-up and no `intervention`), live through a blackbox tap and
+in `xvl debrief`. `state` carries the hands and levers (`in`: throttle,
+beta, brakes, yoke, AP, wind, sim speed, torque, the plugin's yield
+latches) and `ctl`; every spoken line is `said`. The main file rotates past
+200 MB. A complaint that is not yet a scorecard number is not yet testable. **Run tests with `XCOPILOT_BLACKBOX=off`**: any test
 that walks a real path records into the live log (22 test lines landed as
 "flight 117" on 2026-09-13).
 

@@ -469,6 +469,14 @@ pub(crate) fn release_intent(t: &str) -> bool {
 /// ("Nautilapuku") before it reaches the LLM, which would otherwise force-match
 /// it to the nearest tool. Whole-word, case-insensitive.
 pub(crate) const COMMAND_KEYWORDS: &[&str] = &[
+    // the mission's own words: "Resume." was dropped here as "not a
+    // command" after a restart at LIME's hold (2026-09-25), silently; so
+    // would "begin the flight" and "take us to Bologna" have been
+    "resume",
+    "continue",
+    "execute",
+    "commence",
+    "begin",
     // a helicopter's hover ("lift to a hover" was dropped here as "not a
     // command", twice, on the S-76's first hover, 2026-09-22)
     "hover",
@@ -849,6 +857,11 @@ pub(crate) fn looks_like_command(text: &str) -> bool {
         || t.contains("set us down")
         || t.contains("put it down")
         || t.contains("put us down")
+        // "take us to Bologna": the phrase, never the word "take" alone
+        // ("take a look at the video" is not a command).
+        || t.contains("take us to")
+        || t.contains("take me to")
+        || t.contains("get us to")
     {
         return true;
     }

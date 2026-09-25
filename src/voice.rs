@@ -1350,6 +1350,21 @@ impl Voice {
     /// FIFO seq under the lock): station utterances go to the radio, everything
     /// else to the intercom. The single enqueue chokepoint for speech and tones.
     fn push(&self, mut utt: Utterance) {
+        // Every line the crew, the cabin or a station says, in the blackbox
+        // beside what was heard, so one file tells the whole flight.
+        crate::blackbox::record(
+            "said",
+            serde_json::json!({
+                "who": match (&utt.station, utt.cabin) {
+                    (Some(s), _) => s.tag().to_string(),
+                    (None, true) => "cabin".to_string(),
+                    (None, false) => "crew".to_string(),
+                },
+                "text": &utt.text,
+                "prio": format!("{:?}", utt.priority),
+                "overheard": utt.overheard,
+            }),
+        );
         if utt.station.is_none() {
             return push_intercom(&self.inner, utt);
         }

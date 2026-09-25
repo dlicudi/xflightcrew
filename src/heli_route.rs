@@ -1195,6 +1195,10 @@ async fn fly(
     route: Route,
 ) -> bool {
     let _detail = crate::auto_status::DetailGuard::hold(&DETAIL);
+    let _sortie = crate::full_auto::SortieGuard::begin(
+        "heli_route",
+        serde_json::json!({ "points": route.points.len() }),
+    );
     let Some(s0) = read(&xp).await else {
         say(
             &voice,

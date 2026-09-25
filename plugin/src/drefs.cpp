@@ -182,6 +182,10 @@ static TextRef g_auto = {{0}, 0};
 // The plan's side of the load sheet, for the Route tab:
 // "ORIGIN|DEST|block_kg|payload_kg|max_tow_kg|pax|unit". Empty = no plan.
 static TextRef g_loadsheet = {{0}, 0};
+// The Route tab's mission brief and the State tab's lines (the app's flight
+// model and duty engine), written by the app, read by the panel.
+static TextRef g_brief = {{0}, 0};
+static TextRef g_state = {{0}, 0};
 
 static XPLMDataRef g_phase_dref = nullptr;
 static XPLMDataRef g_heard_dref = nullptr;
@@ -195,6 +199,8 @@ static XPLMDataRef g_atc_dref = nullptr;
 static XPLMDataRef g_coach_dref = nullptr;
 static XPLMDataRef g_auto_dref = nullptr;
 static XPLMDataRef g_loadsheet_dref = nullptr;
+static XPLMDataRef g_brief_dref = nullptr;
+static XPLMDataRef g_state_dref = nullptr;
 // COM1 active frequency (integer kHz despite the sim's `hz` name) — read for
 // the ATC tab's tuned highlight, written by its click-to-tune.
 static XPLMDataRef g_com1_dref = nullptr;
@@ -417,7 +423,7 @@ int ReadText(void* ref, void* out, int offset, int max) {
 void StoreText(TextRef* t, void* in, int offset, int len) {
     g_last_status_time = XPLMGetElapsedTime();
     if (offset != 0) return;
-    if (len > 511) len = 511;
+    if (len > static_cast<int>(sizeof t->buf) - 1) len = static_cast<int>(sizeof t->buf) - 1;
     if (len < 0) len = 0;
     std::memset(t->buf, 0, sizeof t->buf);
     std::memcpy(t->buf, in, static_cast<size_t>(len));
@@ -803,6 +809,13 @@ static void WriteStrip(void*, void* in, int offset, int len) {
 static void WriteLoadSheet(void*, void* in, int offset, int len) {
     StoreText(&g_loadsheet, in, offset, len);
 }
+// The mission brief and the state lines — refreshed, not logged.
+static void WriteBrief(void*, void* in, int offset, int len) {
+    StoreText(&g_brief, in, offset, len);
+}
+static void WriteState(void*, void* in, int offset, int len) {
+    StoreText(&g_state, in, offset, len);
+}
 // Radio row — refreshed continuously like the strip, not logged.
 static void WriteRadio(void*, void* in, int offset, int len) {
     StoreText(&g_radio, in, offset, len);
@@ -1025,6 +1038,14 @@ void start() {
         "xcopilot/status/loadsheet", xplmType_Data, 1,
         nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
         nullptr, nullptr, nullptr, nullptr, ReadText, WriteLoadSheet, &g_loadsheet, &g_loadsheet);
+    g_brief_dref = XPLMRegisterDataAccessor(
+        "xcopilot/status/brief", xplmType_Data, 1,
+        nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
+        nullptr, nullptr, nullptr, nullptr, ReadText, WriteBrief, &g_brief, &g_brief);
+    g_state_dref = XPLMRegisterDataAccessor(
+        "xcopilot/status/state", xplmType_Data, 1,
+        nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
+        nullptr, nullptr, nullptr, nullptr, ReadText, WriteState, &g_state, &g_state);
     g_opt_ui_scale_dref = XPLMRegisterDataAccessor(
         "xcopilot/opt/ui_scale", xplmType_Int, 1,
         ReadOptUiScale, WriteOptUiScale, nullptr, nullptr, nullptr, nullptr,
@@ -1163,6 +1184,8 @@ void stop_first() {
     if (g_typed_dref) { XPLMUnregisterDataAccessor(g_typed_dref); g_typed_dref = nullptr; }
     if (g_opt_ui_scale_dref) { XPLMUnregisterDataAccessor(g_opt_ui_scale_dref); g_opt_ui_scale_dref = nullptr; }
     if (g_loadsheet_dref) { XPLMUnregisterDataAccessor(g_loadsheet_dref); g_loadsheet_dref = nullptr; }
+    if (g_brief_dref) { XPLMUnregisterDataAccessor(g_brief_dref); g_brief_dref = nullptr; }
+    if (g_state_dref) { XPLMUnregisterDataAccessor(g_state_dref); g_state_dref = nullptr; }
     if (g_auto_dref) { XPLMUnregisterDataAccessor(g_auto_dref); g_auto_dref = nullptr; }
     if (g_coach_dref) { XPLMUnregisterDataAccessor(g_coach_dref); g_coach_dref = nullptr; }
     if (g_atc_dref) { XPLMUnregisterDataAccessor(g_atc_dref); g_atc_dref = nullptr; }
@@ -1210,6 +1233,8 @@ bool coach_urgent() { return g_coach_urgent; }
 char coach_group() { return g_coach_group; }
 const TextRef& auto_status() { return g_auto; }
 const TextRef& load_sheet() { return g_loadsheet; }
+const TextRef& brief() { return g_brief; }
+const TextRef& state_lines() { return g_state; }
 bool auto_active() { return g_auto_active; }
 const std::vector<AtcField>& atc_fields() { return g_atc_fields; }
 

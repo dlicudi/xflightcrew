@@ -125,6 +125,7 @@ pub enum Mission {
 }
 
 /// The flyable distillation of a SimBrief OFP, built by the arming tool.
+#[derive(Clone)]
 pub struct Route {
     /// A local route was terrain-checked for this final; changed wind needs replanning.
     pub local_runway: Option<String>,
@@ -325,6 +326,23 @@ async fn light(tools: &SubTools, ctx: &ToolCtx<'_>, key: &str, on: bool) -> bool
 /// a park brake is a chock, not a stopping device.
 const HAND_BACK_BRAKE_MAX_KTS: f64 = 25.0;
 
+/// A mission's sortie in the blackbox: begun at the mission's start, ended
+/// by `give_up` ("gave_up") or, on any other exit, when this drops ("ended").
+pub struct SortieGuard;
+
+impl SortieGuard {
+    pub fn begin(label: &str, detail: serde_json::Value) -> Self {
+        crate::blackbox::begin_sortie(label, detail);
+        SortieGuard
+    }
+}
+
+impl Drop for SortieGuard {
+    fn drop(&mut self) {
+        crate::blackbox::end_sortie("ended", json!({}));
+    }
+}
+
 async fn give_up(
     xp: &XPlaneClient,
     valve_set: Option<f64>,
@@ -338,6 +356,7 @@ async fn give_up(
     // the rest, never quietly re-trimming under the pilot's hand.
     crate::tools::engine::MIX_MANAGED.store(false, SeqCst);
     event("give_up", json!({ "reason": reason }));
+    crate::blackbox::end_sortie("gave_up", json!({ "reason": reason, "line": line }));
     // Held before it is said: the line claims the pilot has the aircraft, so
     // whatever is going to hold it should already be holding it.
     hand_back_brakes(xp, valve_set).await;
@@ -865,6 +884,29 @@ async fn self_taxi(
     Ok(())
 }
 
+/// A running turboprop's condition levers at the profile's run setting
+/// (`turboprop_start.condition_run`): the Evolution's is low idle, per its
+/// POH, and at high idle it taxied at 17 kt for 10 with full beta and the
+/// brakes on (LIME 2026-09-25). A lever at cutoff is an engine that is off:
+/// never touched here.
+async fn condition_to_run(xp: &XPlaneClient) {
+    let Some(p) = crate::aircraft::live_profile() else { return };
+    let Some(ts) = p.turboprop_start.as_ref() else { return };
+    let Ok(levers) = xp.get_float_array(&ts.condition_lever).await else { return };
+    for (i, v) in levers.iter().take(p.engines.max(1)).enumerate() {
+        if *v > 0.05 && (v - ts.condition_run).abs() > 0.05 {
+            let ok = xp
+                .set_float_array_elem(&ts.condition_lever, i, ts.condition_run)
+                .await
+                .is_ok();
+            event(
+                "condition_run",
+                json!({ "engine": i, "was": v, "set": ts.condition_run, "ok": ok }),
+            );
+        }
+    }
+}
+
 async fn taxi_route_is_ours(xp: &XPlaneClient) -> bool {
     if crate::party_line::taxi_to_stand() {
         return false;
@@ -886,6 +928,20 @@ async fn taxi_route_is_ours(xp: &XPlaneClient) -> bool {
 }
 
 async fn fly(xp: XPlaneClient, config: Config, voice: Option<Voice>, tools: SubTools) {
+    // Mutable: the crew re-chooses the departure when the tower's runway is
+    // not the plan's (`choose_departure`).
+    let mut tools = tools;
+    // One mission is one sortie in the blackbox (`logs/sorties/<id>.jsonl`).
+    let _sortie = SortieGuard::begin(
+        "full_auto",
+        match &tools.mission {
+            Mission::Flight(r) | Mission::Resume(r) => json!({
+                "origin": r.origin_icao, "dest": r.dest_icao,
+                "resume": matches!(tools.mission, Mission::Resume(_)),
+            }),
+            _ => json!({}),
+        },
+    );
     // A new mission starts owing nothing to the last one's destination: a pin
     // left by the previous arrival would keep the region from ever handing
     // this departure on (see `release_arrival_station`).
@@ -921,14 +977,24 @@ async fn fly(xp: XPlaneClient, config: Config, voice: Option<Voice>, tools: SubT
         return;
     }
 
+    // "Starting cold" to a running engine (a re-arm after a give-up at the
+    // hold, LIME 2026-09-25) is a line the pilot knows is false.
+    let already_running = engine_running(&xp).await;
     announce(
         &voice,
         Priority::Advisory,
-        crate::readback::one_of(&[
-            "Full auto. Starting from cold.",
-            "Full auto it is. Taking her from cold and dark.",
-            "Alright, full auto. Starting cold.",
-        ]),
+        if already_running {
+            crate::readback::one_of(&[
+                "Full auto. Picking up from here.",
+                "Full auto it is. Engine's running, carrying on from here.",
+            ])
+        } else {
+            crate::readback::one_of(&[
+                "Full auto. Starting from cold.",
+                "Full auto it is. Taking her from cold and dark.",
+                "Alright, full auto. Starting cold.",
+            ])
+        },
     );
     event("start", json!({}));
     // Full auto is a GATE-to-gate chain: armed in the air it walks its ground
@@ -1469,25 +1535,53 @@ async fn fly(xp: XPlaneClient, config: Config, voice: Option<Voice>, tools: SubT
         // its runway, and taking off on another would fly its fixes backwards
         // (at LOWI a turn back through the valley). Said and handed back here,
         // on the ramp, with the brakes on, never discovered in the climb.
+        // ...but first the crew CHOOSES its own departure from the runway it
+        // was given: a SID from that runway that joins the route, or direct
+        // to the planned SID's exit (LIME 2026-09-25: the tower gave 10 for
+        // a plan departing 28, and full auto handed back on the ramp).
+        let cleared = crate::party_line::clearance_runway();
         if let Some(why) = departure_runway_mismatch(
             match &tools.mission {
                 Mission::Flight(r) => r.departure_rwy.as_deref(),
                 _ => None,
             },
-            crate::party_line::clearance_runway().as_deref(),
+            cleared.as_deref(),
         ) {
-            event("departure_runway_mismatch", json!({ "why": why }));
-            give_up(
-                &xp,
-                tools.taxi.park_brake_valve_set,
-                &voice,
-                &format!("{why} Your aircraft."),
-                "departure_runway_mismatch",
-            )
-            .await;
-            return;
+            let vy = tools.takeoff.vy_kts;
+            let replanned = match (&mut tools.mission, cleared.as_deref()) {
+                (Mission::Flight(r), Some(c)) => choose_departure(&config, r, c, vy).await,
+                _ => Err(String::new()),
+            };
+            match replanned {
+                Ok(line) => {
+                    event("departure_rechosen", json!({ "line": line }));
+                    announce(&voice, Priority::Advisory, &line);
+                    // The GPS shows the departure we will fly, not SimBrief's.
+                    if let Mission::Flight(r) = &tools.mission {
+                        if !r.fms_payload.is_empty() {
+                            let _ = xp.set_data("xcopilot/fms/route", r.fms_payload.as_bytes()).await;
+                            let _ = xp.set_int("xcopilot/fms/load", 1).await;
+                        }
+                    }
+                }
+                Err(no) => {
+                    event("departure_runway_mismatch", json!({ "why": why, "no": no }));
+                    give_up(
+                        &xp,
+                        tools.taxi.park_brake_valve_set,
+                        &voice,
+                        &format!("{why} {no} Your aircraft."),
+                        "departure_runway_mismatch",
+                    )
+                    .await;
+                    return;
+                }
+            }
         }
 
+        // A running turboprop taxis at the profile's run idle, whatever the
+        // lever was left at (a re-arm skips the start that sets it).
+        condition_to_run(&xp).await;
         // Drive the cleared route to the holding point. The taxi light, or
         // on an airframe that has none the landing light: the SR22 carries
         // only nav, strobe and landing, and the taxi ran dark because the
@@ -1916,7 +2010,7 @@ const MS_TO_KTS: f64 = 1.943_844;
 /// wind isn't worth a big turn onto final. At or above it the wind decides —
 /// landing INTO it — because a real tailwind is what put the arrival on
 /// Gibraltar's 09 into 17 kt while the tower worked 27 (2026-07-24).
-const WIND_DECISIVE_KTS: f64 = 4.0;
+pub(crate) const WIND_DECISIVE_KTS: f64 = 4.0;
 
 /// An airborne AGL below this after the takeoff loop exits means it REJECTED
 /// (never flew) — same reading the circuit uses.
@@ -2360,6 +2454,11 @@ async fn fly_route(
                 Priority::Advisory,
                 &format!("Setting up {}.", plan.name),
             );
+            // The ILS on NAV1 now, so the needles are alive for the whole
+            // approach, not only autoland's final (`ils::tune`).
+            if let Some(id) = built.rwy_id.as_deref() {
+                let _ = crate::ils::tune(xp, &route.dest_icao, id, lat, lon).await;
+            }
             if !crate::procedure::start_scoped(
                 config.xplane_base_url.clone(),
                 voice.clone(),
@@ -3150,6 +3249,166 @@ pub fn departure_runway_mismatch(planned: Option<&str>, cleared: Option<&str>) -
             crate::circuit::spell_runway(p)
         )
     })
+}
+
+/// The crew's own departure from `cleared`, spliced into the route: the
+/// SID from that runway that joins the route furthest along and whose
+/// minimums this airframe can climb to (`nav::sids_for_route`,
+/// `departure_gradients`), else direct to the planned SID's exit, where
+/// the follower's ground-ahead floor guards the climb. `Ok` is the line to
+/// say; `Err` why neither works.
+async fn choose_departure(
+    config: &Config,
+    route: &mut Route,
+    cleared: &str,
+    vy_kts: f64,
+) -> Result<String, String> {
+    use crate::nav::ProcKind;
+    let idents: Vec<String> = route.legs.iter().map(|l| l.fix_ident.clone()).collect();
+    let (cifp, apt_path, fix_path, nav_path) = (
+        config.cifp_dir.clone(),
+        config.apt_data_path.clone(),
+        config.fix_data_path.clone(),
+        config.nav_data_path.clone(),
+    );
+    let origin = route.origin_icao.clone();
+    let planned = route.departure_rwy.clone();
+    let cl = cleared.to_string();
+    let best_climb = crate::procedure::best_climb_fpm();
+    let found = tokio::task::spawn_blocking(move || {
+        let apt = crate::nav::find_airport(&apt_path, &origin).ok().flatten()?;
+        let (alat, alon) = apt.position()?;
+        let der = apt.runways.iter().find_map(|r| {
+            if r.ident_a.eq_ignore_ascii_case(&cl) {
+                Some((r.lat_b, r.lon_b))
+            } else if r.ident_b.eq_ignore_ascii_case(&cl) {
+                Some((r.lat_a, r.lon_a))
+            } else {
+                None
+            }
+        })?;
+        for choice in crate::nav::sids_for_route(&cifp, &origin, &cl, &idents) {
+            let mut legs =
+                crate::nav::load_proc_legs(&cifp, &origin, ProcKind::Sid, &choice.ident, Some(&choice.transition));
+            crate::nav::resolve_proc_fixes(&fix_path, &nav_path, &apt, &origin, &mut legs, alat, alon);
+            let mut sid: Vec<crate::nav::ProcLeg> = Vec::new();
+            for l in legs {
+                if l.fix_ident.is_empty() || l.fix_ident.starts_with("RW") {
+                    continue;
+                }
+                if l.fix.is_none() {
+                    sid.clear();
+                    break;
+                }
+                let last = l.fix_ident.eq_ignore_ascii_case(&choice.join);
+                sid.push(l);
+                if last {
+                    break;
+                }
+            }
+            if sid.last().is_none_or(|l| !l.fix_ident.eq_ignore_ascii_case(&choice.join)) {
+                continue;
+            }
+            let mins = crate::nav::sid_minimums(&cifp, &origin, &choice.ident, &cl);
+            let checks = departure_gradients(der, apt.elev_ft, &sid, &mins, vy_kts, best_climb);
+            match gradient_verdict(&choice.ident, &checks) {
+                Ok(note) => return Some(Ok((choice, sid, mins, note))),
+                Err(_) => continue,
+            }
+        }
+        // No SID from this runway to the route: direct to the planned SID's
+        // exit. The planned SID is the one the route STARTS on (its first
+        // fix is one of the SID's); the furthest-joining SID from that
+        // runway is a different departure (LIME 28: SRN1Z, not LEGL1P).
+        let exit = planned.as_deref().and_then(|p| {
+            let all = crate::nav::sids_for_route(&cifp, &origin, p, &idents);
+            let first = idents.first()?;
+            all.iter()
+                .find(|c| c.fixes.iter().any(|f| f.eq_ignore_ascii_case(first)))
+                .or_else(|| all.iter().min_by_key(|c| c.join_index))
+                .map(|c| c.join.clone())
+        });
+        Some(Err(exit))
+    })
+    .await
+    .ok()
+    .flatten()
+    .ok_or_else(|| "I can't read the departure data for this field.".to_string())?;
+    let spoken = crate::circuit::spell_runway(cleared);
+    match found {
+        Ok((choice, sid, mins, note)) => {
+            let idx = route
+                .legs
+                .iter()
+                .position(|l| l.fix_ident.eq_ignore_ascii_case(&choice.join))
+                .ok_or_else(|| "The new departure doesn't meet the route.".to_string())?;
+            let mut legs = sid;
+            legs.extend(route.legs.drain(idx + 1..));
+            route.legs = legs;
+            route.fms_payload = payload_with_legs(&route.fms_payload, &route.legs);
+            route.climb_minimums = mins;
+            route.departure_rwy = Some(cleared.to_string());
+            route.origin_rwy = Some(cleared.to_string());
+            Ok(format!(
+                "Runway {spoken} in use, so the {} departure to {}.{}",
+                choice.ident,
+                choice.join,
+                note.map(|n| format!(" {n}")).unwrap_or_default()
+            ))
+        }
+        Err(Some(exit)) => {
+            let idx = route
+                .legs
+                .iter()
+                .position(|l| l.fix_ident.eq_ignore_ascii_case(&exit))
+                .ok_or_else(|| "The planned departure doesn't meet the route.".to_string())?;
+            route.legs.drain(..idx);
+            route.fms_payload = payload_with_legs(&route.fms_payload, &route.legs);
+            route.climb_minimums = Vec::new();
+            route.departure_rwy = Some(cleared.to_string());
+            route.origin_rwy = Some(cleared.to_string());
+            Ok(format!(
+                "Runway {spoken} in use and no departure from it joins our route, so direct to {exit}, watching the terrain."
+            ))
+        }
+        Err(None) => Err("No departure from that runway joins our route.".to_string()),
+    }
+}
+
+/// The GPS payload for `legs`, keeping the old payload's first and last
+/// entries (the origin and destination fields that fill the CDU's
+/// ORIGIN/DEST). The old payload unchanged when it has no ends to keep.
+pub fn payload_with_legs(old: &str, legs: &[crate::nav::ProcLeg]) -> String {
+    let point = |e: &str| {
+        let f: Vec<&str> = e.split(',').collect();
+        Some(crate::simbrief::Waypoint {
+            ident: f.first()?.to_string(),
+            lat: f.get(1)?.parse().ok()?,
+            lon: f.get(2)?.parse().ok()?,
+            alt: f.get(3).and_then(|a| a.parse().ok()).unwrap_or(0.0),
+        })
+    };
+    let entries: Vec<&str> = old.split('|').collect();
+    let (Some(first), Some(last)) = (
+        entries.first().and_then(|e| point(e)),
+        entries.last().and_then(|e| point(e)),
+    ) else {
+        return old.to_string();
+    };
+    if entries.len() < 2 {
+        return old.to_string();
+    }
+    let mut ws = vec![first];
+    ws.extend(legs.iter().filter_map(|l| {
+        l.fix.as_ref().map(|f| crate::simbrief::Waypoint {
+            ident: l.fix_ident.clone(),
+            lat: f.lat,
+            lon: f.lon,
+            alt: l.alt1_ft.unwrap_or(0.0),
+        })
+    }));
+    ws.push(last);
+    crate::simbrief::fms_route_payload(&ws)
 }
 
 /// One departure minimum judged against the climb: the gradient it needs from
@@ -3950,6 +4209,66 @@ mod tests {
             dest_longest_ft: 3280.0,
             service_ceiling_ft: None,
         }
+    }
+
+    /// LIME (2026-09-25), the real install: a route flying LEGL1P off 28 to
+    /// LEGLO and on; the tower gives 10. The crew picks a runway-10 SID to
+    /// LEGLO, its fixes resolved, and the route goes on from LEGLO.
+    /// `cargo test -- --ignored real_install_lime_departure_rechosen --nocapture`
+    #[tokio::test]
+    #[ignore]
+    async fn real_install_lime_departure_rechosen() {
+        use crate::nav::ProcKind;
+        let config = crate::config::Config::from_env().expect("config");
+        let mut legs: Vec<crate::nav::ProcLeg> =
+            crate::nav::load_proc_legs(&config.cifp_dir, "LIME", ProcKind::Sid, "LEGL1P", Some("RW28"))
+                .into_iter()
+                .filter(|l| !l.fix_ident.is_empty() && !l.fix_ident.starts_with("RW"))
+                .collect();
+        legs.extend(
+            crate::nav::load_proc_legs(&config.cifp_dir, "LIME", ProcKind::Sid, "LEGL1P", Some("ARL1D"))
+                .into_iter()
+                .filter(|l| l.transition == "ARL1D" && l.fix_ident != "LEGLO"),
+        );
+        println!("before: {:?}", legs.iter().map(|l| l.fix_ident.clone()).collect::<Vec<_>>());
+        let mut route = super::Route {
+            local_runway: None,
+            dest_icao: "LIPE".into(),
+            dest_name: "Bologna".into(),
+            legs,
+            climb_minimums: Vec::new(),
+            arrival_constraints: Vec::new(),
+            departure_rwy: Some("28".into()),
+            origin_icao: "LIME".into(),
+            origin_rwy: Some("28".into()),
+            fms_payload: "LIME,45.6689,9.7003,0|ME609,45.7,9.8,5000|LIPE,44.5354,11.2887,0".into(),
+        };
+        let fallback_route = route.clone();
+        // The Evolution's own climb (profile best_climb_fpm); the GA default
+        // of 700 fpm cannot make LEGLO's FL120 from either runway.
+        let evo = crate::aircraft::ReferenceProfile { best_climb_fpm: Some(5000.0), ..Default::default() };
+        crate::procedure::publish_vs_limits(Some(&evo));
+        let line = super::choose_departure(&config, &mut route, "10", 105.0).await;
+        println!("{line:?}");
+        let after: Vec<String> = route.legs.iter().map(|l| l.fix_ident.clone()).collect();
+        println!("after: {after:?}");
+        let line = line.expect("a departure from 10");
+        assert!(line.contains("LEGLO"), "{line}");
+        assert_eq!(route.departure_rwy.as_deref(), Some("10"));
+        let join = after.iter().position(|f| f == "LEGLO").expect("joins LEGLO");
+        assert!(!after[..join].iter().any(|f| f == "ME609" || f == "ME611"), "28's fixes are gone");
+        assert!(route.legs[..=join].iter().all(|l| l.fix.is_some()), "every new fix resolved");
+        assert!(after.contains(&"ARLES".to_string()), "the route goes on");
+        assert!(route.fms_payload.starts_with("LIME,") && route.fms_payload.contains("|ME684,"), "{}", route.fms_payload);
+        assert!(!route.fms_payload.contains("ME609"), "the GPS drops 28's SID");
+        // A climb that makes no runway-10 SID: direct to the PLANNED SID's
+        // exit (LEGL1P's LEGLO), never another SID's further join (SRN).
+        crate::procedure::publish_vs_limits(None);
+        let mut route = fallback_route;
+        let line = super::choose_departure(&config, &mut route, "10", 105.0).await.expect("fallback");
+        println!("{line}");
+        assert!(line.contains("direct to LEGLO"), "{line}");
+        assert_eq!(route.legs.first().map(|l| l.fix_ident.as_str()), Some("LEGLO"));
     }
 
     /// LILB 03 (2026-09-25): lined up with 508 m ahead, 595 needed with the

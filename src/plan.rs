@@ -666,6 +666,7 @@ pub(crate) async fn flight_plan_report(
     cache: &mut Option<(Instant, simbrief::FlightPlan)>,
     fetch: PlanFetch,
     want_route: bool,
+    panel: Option<&crate::plugin_status::StatusSink>,
 ) -> String {
     if let Err(msg) = ensure_plan(config, cache, fetch).await {
         return msg;
@@ -683,6 +684,10 @@ pub(crate) async fn flight_plan_report(
     }
 
     let mut line = fp.summary();
+    // What is SAID, when the panel can hold the rest: the flight in one
+    // line, and anything the pilot must act on (LIME 2026-09-25: "we want
+    // the verbose stuff in some sort of debrief tab").
+    let mut act = String::new();
     // Where we are vs planned cruise.
     // On the ground the whole climb is ahead and the summary already said
     // the cruise: "You're at 49, 4951 to climb to cruise" is a number
@@ -730,13 +735,42 @@ pub(crate) async fn flight_plan_report(
                 crate::aircraft::fuel_figure_kg(fp.block_fuel_kg),
                 crate::aircraft::say_fuel_figure(need - aboard),
             ));
+            act = format!(
+                " Short about {} of fuel.",
+                crate::aircraft::say_fuel_figure(need - aboard)
+            );
             // The crew can do the load sheet, on the ground only.
             if on_ground {
                 line.push_str(" Say load the aircraft and I'll set it from the plan.");
+                act.push_str(" Say load the aircraft and I'll set it from the plan.");
             }
         }
     }
-    line
+    match panel {
+        Some(p) => {
+            p.brief(&format!("Flight plan\n{line}"));
+            format!("{}{act} Details on the Brief tab.", short_plan_line(fp))
+        }
+        None => line,
+    }
+}
+
+/// The plan in one spoken line: where, how far, how long, how high. Pure.
+pub(crate) fn short_plan_line(fp: &simbrief::FlightPlan) -> String {
+    let h = (fp.ete_min / 60.0).floor() as i32;
+    let m = (fp.ete_min % 60.0).round() as i32;
+    let ete = match h {
+        0 => format!("{m} minutes"),
+        1 => format!("1 hour {m}"),
+        _ => format!("{h} hours {m}"),
+    };
+    format!(
+        "Plan {} to {}, {:.0} miles, {ete}, cruise {}.",
+        fp.origin,
+        fp.destination,
+        fp.distance_nm,
+        crate::flightplan::spoken_feet(fp.cruise_alt_ft)
+    )
 }
 
 /// "Check the flight plan": the arm's whole-flight audit, spoken in full,

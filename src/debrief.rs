@@ -284,6 +284,16 @@ fn summarise(flight: &[&Value]) -> String {
         ));
     }
 
+    // --- The scorecard: a verdict per stage, re-derived from the ticks (so
+    // flights recorded before it existed are graded too).
+    let card = crate::scorecard::score_all(flight.iter().copied());
+    if !card.is_empty() {
+        out.push_str("Scorecard:\n");
+        for v in &card {
+            out.push_str(&format!("  {}\n", crate::scorecard::line(v)));
+        }
+    }
+
     // --- The duty engine's shadow: what the flight owed, in order, and
     // where the automation running disagreed.
     let duties: Vec<String> = flight

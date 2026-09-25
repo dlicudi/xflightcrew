@@ -44,6 +44,8 @@ mod livestate;
 mod mic;
 mod mode;
 mod monitor;
+mod ils;
+mod scorecard;
 mod persona;
 mod phrase;
 mod plan;
@@ -139,6 +141,9 @@ use xplane::XPlaneClient;
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
     use tracing_subscriber::prelude::*;
+    // Every blackbox record through the live scorer: `stage_result` beside
+    // the ticks, `sortie_result` at each mission's end.
+    blackbox::set_tap(scorecard::tap);
     let config = Config::from_env()?;
     let tui = config.ui == "tui";
 
@@ -2847,6 +2852,7 @@ async fn run_session(
                     &mut fp_cache,
                     plan_fetch_for(&tl),
                     want_route,
+                    reporter.status_sink(),
                 )
                 .await;
                 say(&voice, &reporter, ui::LogKind::Readback, &line);

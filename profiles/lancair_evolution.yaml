@@ -125,11 +125,12 @@ turboprop_start:
   ignition_arm: [sim/igniters/igniter_contin_on_1]
   condition_lever: sim/cockpit2/engine/actuators/mixture_ratio
   condition_start: 0.5   # middle / LOW IDLE
-  # The sim POM's checklist runs condition FULL FORWARD (high idle) after
-  # start, so that's what the tool does. Worth knowing: the real POH says the
-  # opposite — "full forward is high idle, which we do not use in this plane;
-  # middle is low idle, where we set that lever for flight".
-  condition_run: 1.0
+  # The REAL POH, over the sim POM's checklist (which runs it full forward):
+  # "full forward is high idle, which we do not use in this plane; middle is
+  # low idle, where we set that lever for flight". At high idle (N1 63%) the
+  # Evolution taxied at 17 kt for 10 with beta at 0.8 and the brakes on (LIME
+  # 2026-09-25). The lever sets idle only; takeoff power is the throttle's.
+  condition_run: 0.5
   n1_idle: 50.0
   crank_secs: 30.0
   start_up: [sim/starters/engage_starter_1]
@@ -248,6 +249,27 @@ fuel_selector:
     - { key: left,  spoken: left,  command: sim/fuel/fuel_selector_lft,  value: 1.0 }
     - { key: right, spoken: right, command: sim/fuel/fuel_selector_rgt,  value: 3.0 }
 
+# The normal checklist (checklists/lancair_evolution.txt, 2026-09-25), from
+# the sim POM's Checklists section (p.44-62) with the POH's low idle for the
+# condition lever, and Taxi / Climb / Descent lists the POM lacks. Section
+# titles are the phase keys, so the tracker's climb / cruise / descent /
+# before landing / after landing lists resolve without a checklist_flow.
+# The condition lever (mixture_ratio) is deliberately NOT mapped: this is a
+# turbine (engine: false) and set_mixture is a piston tool; its items are
+# CHECK reads only.
+checklist: checklists/lancair_evolution.txt
+checklist_map:
+  - { match: electrical/battery_on,     action: !electrical battery1 }
+  - { match: electrical/generator_on,   action: !electrical generator }
+  - { match: electrical/cross_tie,      action: !electrical dc_power }
+  - { match: parking_brake_ratio,       action: parking_brake }
+  - { match: transponder_mode,          action: transponder }
+  - { match: fuel_pump_on,              action: fuel_pump }
+  - { match: flap_handle,               action: flaps }
+  - { match: landing_lights,            action: !light landing }
+  - { match: strobe_lights,             action: !light strobe }
+  - { match: navigation_lights,         action: !light nav }
+
 # Cockpit geography — panel names from the sim POM's "Tour of the Cockpit",
 # left/bottom/right geography from the POH's panel-layout section ("switches
 # for generators and batteries are all grouped on the left; switches for
@@ -309,7 +331,7 @@ taxi:
   # POH: "It idles so high that you might wind up taxiing too fast ... Don't
   # ride the brakes in taxi. Ease the throttle into beta instead." The taxi
   # hold slows in beta, at most half of the range, before any brake.
-  beta_max: 0.5
+  beta_max: 0.8   # 0.5 held 17.7 kt at LIME with beta engaged (2026-09-25); 1.0 is the edge of reverse
 
 # The takeoff power limit, from the manuals: "For take-off in N844X, you are
 # only allowed to use about HALF power, since more power would over-power the

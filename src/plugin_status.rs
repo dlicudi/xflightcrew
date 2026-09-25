@@ -30,10 +30,14 @@ const DR_ATC: &str = "xcopilot/status/atc";
 const DR_COACH: &str = "xcopilot/status/coach";
 const DR_AUTO: &str = "xcopilot/status/auto";
 const DR_LOADSHEET: &str = "xcopilot/status/loadsheet";
+const DR_BRIEF: &str = "xcopilot/status/brief";
+const DR_STATE: &str = "xcopilot/status/state";
 
 /// Keep text within the plugin's fixed display buffer (512 bytes, NUL-terminated)
 /// — long enough for a full engine/weather summary readback.
 pub(crate) const TEXT_MAX: usize = 500;
+/// The Brief tab's slot is 2 KB (the plugin's buffer); a whole read-out fits.
+pub(crate) const BRIEF_MAX: usize = 2000;
 
 /// One status change to mirror into the sim.
 enum Update {
@@ -67,6 +71,11 @@ enum Update {
     Auto(String),
     /// The Route tab's load sheet feed (`simbrief::loadsheet_payload`).
     LoadSheet(String),
+    /// The Route tab's mission brief (full auto's arming brief), shown to
+    /// read rather than recited.
+    Brief(String),
+    /// The State tab: the flight model and the duty engine, one line each.
+    State(String),
 }
 
 /// Severity of a panel alert — drives the chip colour/label in the plugin.
@@ -165,16 +174,29 @@ impl StatusSink {
     pub fn load_sheet(&self, payload: &str) {
         let _ = self.0.send(Update::LoadSheet(clip(payload)));
     }
+    /// The Route tab's mission brief.
+    pub fn brief(&self, text: &str) {
+        let _ = self.0.send(Update::Brief(clip_to(text, BRIEF_MAX)));
+    }
+    /// The State tab's lines ('\n'-separated).
+    pub fn state(&self, text: &str) {
+        let _ = self.0.send(Update::State(clip(text)));
+    }
 }
 
 /// Scrub em/en dashes (the panel font can't render them) and trim to the plugin
 /// buffer, on a char boundary so base64 of the bytes stays valid UTF-8.
 fn clip(s: &str) -> String {
+    clip_to(s, TEXT_MAX)
+}
+
+/// [`clip`] to a given length.
+fn clip_to(s: &str, max: usize) -> String {
     let s = crate::phrase::scrub_dashes(s);
-    if s.len() <= TEXT_MAX {
+    if s.len() <= max {
         return s;
     }
-    let mut end = TEXT_MAX;
+    let mut end = max;
     while end > 0 && !s.is_char_boundary(end) {
         end -= 1;
     }
@@ -197,6 +219,8 @@ enum Slot {
     Coach,
     Auto,
     LoadSheet,
+    Brief,
+    State,
 }
 
 /// The resolved numeric ids of the plugin's status datarefs. All `None` until a
@@ -215,6 +239,8 @@ struct Ids {
     coach: Option<i64>,
     auto: Option<i64>,
     loadsheet: Option<i64>,
+    brief: Option<i64>,
+    state: Option<i64>,
 }
 
 impl Ids {
@@ -232,6 +258,8 @@ impl Ids {
             Slot::Coach => self.coach,
             Slot::Auto => self.auto,
             Slot::LoadSheet => self.loadsheet,
+            Slot::Brief => self.brief,
+            Slot::State => self.state,
         }
     }
     /// True once at least one dataref resolved (i.e. the plugin is present).
@@ -256,6 +284,8 @@ fn resolve_all(http: &reqwest::blocking::Client, rest: &str) -> Ids {
         coach: resolve_id(http, rest, DR_COACH),
         auto: resolve_id(http, rest, DR_AUTO),
         loadsheet: resolve_id(http, rest, DR_LOADSHEET),
+        brief: resolve_id(http, rest, DR_BRIEF),
+        state: resolve_id(http, rest, DR_STATE),
     }
 }
 
@@ -359,6 +389,8 @@ fn run(base: String, rx: Receiver<Update>) {
                 Update::LoadSheet(text) => {
                     (Slot::LoadSheet, json!(STANDARD.encode(text.as_bytes())))
                 }
+                Update::Brief(text) => (Slot::Brief, json!(STANDARD.encode(text.as_bytes()))),
+                Update::State(text) => (Slot::State, json!(STANDARD.encode(text.as_bytes()))),
             };
             healthy = patch(&http, &rest, &ids, slot, value);
         }

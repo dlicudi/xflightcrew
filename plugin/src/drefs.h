@@ -60,6 +60,10 @@ bool auto_active();
 // The plan's side of the load sheet ("ORIGIN|DEST|block_kg|payload_kg|
 // max_tow_kg|pax|unit", kilos; empty = no plan), for the Route tab.
 const TextRef& load_sheet();
+// Full auto's mission brief, for the Route tab (empty = none armed).
+const TextRef& brief();
+// The State tab: the flight model and the duty engine, '\n'-separated lines.
+const TextRef& state_lines();
 const std::vector<AtcField>& atc_fields();
 
 // COM1, for the ATC tab: khz read (0 if the sim dataref is missing) and the

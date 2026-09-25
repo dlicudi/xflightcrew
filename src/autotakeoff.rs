@@ -773,6 +773,32 @@ pub fn roll_brake_split(steer: f64, gs_kts: f64) -> (f64, f64) {
     (l * fade, r * fade)
 }
 
+/// [`roll_brake_split`], plus the start of a roll that begins crooked: below
+/// [`ROLL_ALIGN_KTS`] a heading error past [`ROLL_ALIGN_ERR_DEG`] pivots on
+/// the inside brake in proportion to the ERROR, not the roll law's steer,
+/// whose deflection is capped tiny at walking pace (prop wash) and whose brake
+/// split has no authority under 2 kt. LIME 28 (2026-09-25): the Evolution
+/// started its roll 21 degrees off the runway, the steer sat at 0.17 with no
+/// brake at all, the error grew to 30 at 6 kt and the pilot's pedals ended
+/// it. The pivot's own yaw-rate ceiling applies, so it cannot spin.
+pub fn roll_brake_split_aligning(steer: f64, gs_kts: f64, err_deg: f64, yaw_dps: f64) -> (f64, f64) {
+    let (l, r) = roll_brake_split(steer, gs_kts);
+    if gs_kts >= ROLL_ALIGN_KTS || err_deg.abs() <= ROLL_ALIGN_ERR_DEG {
+        return (l, r);
+    }
+    let want = (err_deg / ROLL_ALIGN_FULL_DEG).clamp(-1.0, 1.0);
+    // Full pivot authority from a standstill: power is coming up behind it.
+    let (pl, pr) = crate::autotaxi::pivot_brake_split(want, gs_kts.max(2.0));
+    let k = crate::autotaxi::pivot_rate_scale(want, yaw_dps);
+    (l.max(pl * k), r.max(pr * k))
+}
+/// The aligning pivot works below this groundspeed...
+const ROLL_ALIGN_KTS: f64 = 15.0;
+/// ...on a heading error past this...
+const ROLL_ALIGN_ERR_DEG: f64 = 3.0;
+/// ...at full pivot brake from this error.
+const ROLL_ALIGN_FULL_DEG: f64 = 15.0;
+
 /// Full brake-steering authority on the roll below this groundspeed...
 const ROLL_BRAKE_FULL_KTS: f64 = 20.0;
 /// ...and none above this, where the rudder steers.
@@ -1686,6 +1712,9 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, p: Params) {
     // Previous cross-track, for the roll's own closure rate (see
     // [`roll_target_heading`]). Metres, right-positive.
     let mut prev_xtk_m: Option<f64> = None;
+    // The heading error's last value, for the yaw rate an aligning pivot
+    // is capped on (the roll reads no yaw rate of its own).
+    let mut prev_align_err: Option<f64> = None;
     let mut last_tick: Option<std::time::Instant> = None;
     let roll_start = std::time::Instant::now();
     let mut frozen_secs = 0.0_f64;
@@ -1906,8 +1935,10 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, p: Params) {
             let steer = steer_law.step(err, dt, gs_kts, thr_cmd);
             // The brake half, on an airframe that has no other low-speed
             // steering; zero once rotated (the channel expires anyway).
+            let yaw_dps = prev_align_err.map_or(0.0, |p| -(err - p) / dt.max(0.05));
+            prev_align_err = Some(err);
             let (bl, br) = if brake_steer && !rotated {
-                roll_brake_split(steer, gs_kts)
+                roll_brake_split_aligning(steer, gs_kts, err, yaw_dps)
             } else {
                 (0.0, 0.0)
             };
@@ -3997,6 +4028,28 @@ mod tests {
         assert!((l30 - 0.5 * l).abs() < 1e-9, "half by 30 kt: {l30}");
         assert_eq!(super::roll_brake_split(-0.85, 45.0), (0.0, 0.0), "the rudder's above 40");
         assert_eq!(super::roll_brake_split(0.02, 12.0), (0.0, 0.0), "no brake for a breath of steer");
+    }
+
+    #[test]
+    fn a_crooked_roll_start_pivots_on_the_inside_brake() {
+        // LIME 28: 21 degrees right of the nose at 1 kt, steer 0.17, no brake.
+        let (l, r) = super::roll_brake_split_aligning(0.17, 0.9, 21.0, 0.0);
+        assert!(r > 0.3 && l == 0.0, "right brake, from a standstill: {l} {r}");
+        // Proportional: small errors get less.
+        let (_, r6) = super::roll_brake_split_aligning(0.17, 0.9, 6.0, 0.0);
+        assert!(r6 < r, "{r6} < {r}");
+        // Aligned: the ordinary split, nothing added.
+        assert_eq!(
+            super::roll_brake_split_aligning(0.17, 0.9, 2.0, 0.0),
+            super::roll_brake_split(0.17, 0.9)
+        );
+        // Already turning right fast: the rate ceiling lets go.
+        assert_eq!(super::roll_brake_split_aligning(0.17, 0.9, 21.0, 30.0).1, 0.0);
+        // Rolling fast: the rudder's, not a pivot.
+        assert_eq!(
+            super::roll_brake_split_aligning(0.17, 16.0, 21.0, 0.0),
+            super::roll_brake_split(0.17, 16.0)
+        );
     }
 
     #[test]

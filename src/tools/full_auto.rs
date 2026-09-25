@@ -215,6 +215,24 @@ struct Args {
     flight: bool,
     #[serde(default)]
     resume: bool,
+    /// The place the pilot named ("take us to Bologna"), checked against the
+    /// plan's destination: its name, and ICAO candidates when spelled.
+    #[serde(default)]
+    to: Option<String>,
+    #[serde(default)]
+    to_codes: Vec<String>,
+}
+
+/// Whether the place the pilot named is the plan's destination: an ICAO
+/// candidate that matches, or every word of the name found in the airport's
+/// name ("bologna" in "Bologna Borgo Panigale"). Pure.
+pub fn names_destination(to: &str, to_codes: &[String], icao: &str, name: &str) -> bool {
+    if to_codes.iter().any(|c| c.eq_ignore_ascii_case(icao)) || to.eq_ignore_ascii_case(icao) {
+        return true;
+    }
+    let name = name.to_ascii_lowercase();
+    let words: Vec<String> = to.to_ascii_lowercase().split_whitespace().map(str::to_string).collect();
+    !words.is_empty() && words.iter().all(|w| name.split(|c: char| !c.is_alphanumeric()).any(|n| n == w))
 }
 
 #[async_trait]
@@ -269,7 +287,21 @@ impl Tool for FullAuto {
             return Ok("We're in replay. Go back to live and ask again.".to_string());
         }
 
-        let (mission, ack) = if a.resume {
+        // "Resume" on the ground is the mission from where we are: the same
+        // arm as "fly the flight plan", which picks up at whatever stage the
+        // aircraft is in. Refused as "resume is for the air" three times at
+        // LIME after a taxi stand-down (2026-09-25).
+        let on_ground = ctx
+            .xplane
+            .get_float(crate::datarefs::ON_GROUND_ANY)
+            .await
+            .is_ok_and(|g| g > 0.5);
+        let (mission, ack) = if a.resume && on_ground {
+            match self.build_flight_mission(ctx).await {
+                Ok(v) => v,
+                Err(why) => return Ok(why),
+            }
+        } else if a.resume {
             match self.build_resume_mission(ctx).await {
                 Ok(v) => v,
                 Err(why) => return Ok(why),
@@ -294,6 +326,15 @@ impl Tool for FullAuto {
             )
         };
 
+        // "Take us to X": X must be where the plan goes, or nothing arms.
+        if let (Some(to), Mission::Flight(r)) = (&a.to, &mission) {
+            if !names_destination(to, &a.to_codes, &r.dest_icao, &r.dest_name) {
+                return Ok(format!(
+                    "The plan goes to {} ({}), not {to}. Load a plan for {to} first.",
+                    r.dest_name, r.dest_icao
+                ));
+            }
+        }
         let kind = start_kind(
             self.turboprop_start.is_some(),
             self.jet_start,
@@ -798,8 +839,24 @@ impl FullAuto {
             &fp.destination,
             fp.cruise_alt_ft,
         );
+        // The arrival is the crew's: the STAR to the runway the wind will
+        // give us, when SimBrief planned the other end.
+        let star_line = crate::plan_audit::choose_arrival(
+            &ctx.config.cifp_dir,
+            &ctx.config.fix_data_path,
+            &ctx.config.nav_data_path,
+            &ctx.config.apt_data_path,
+            crate::weather::surface_wind(&super::autoland::xplane_root(), &fp.destination),
+            &mut fp,
+            &mut legs,
+        );
+        let star_rechosen = star_line.is_some();
         let (arrival_constraints, arrival_line) =
             crate::plan_audit::arrival_restrictions(&ctx.config.cifp_dir, &fp, &mut legs);
+        let arrival_line = match (star_line, arrival_line) {
+            (Some(a), Some(b)) => Some(format!("{a} {b}")),
+            (a, b) => a.or(b),
+        };
         if legs.is_empty() {
             return Err(format!(
                 "Your plan to {} has no enroute waypoints I can fly. Generate it with a route.",
@@ -976,7 +1033,11 @@ impl FullAuto {
 
         // The GPS route payload — written by the orchestrator (only the
         // concrete client can set a byte-array dataref).
-        let fms_payload = crate::simbrief::fms_route_payload(&fp.waypoints);
+        let mut fms_payload = crate::simbrief::fms_route_payload(&fp.waypoints);
+        // The crew's own STAR goes into the GPS too, not SimBrief's.
+        if star_rechosen {
+            fms_payload = crate::full_auto::payload_with_legs(&fms_payload, &legs);
+        }
 
         // The arrival, briefed NOW: what the destination offers and what
         // full auto will do there. Found at the gate, it is a briefing item;
@@ -1025,8 +1086,12 @@ impl FullAuto {
             Some(l) => format!("{preflight}{l} "),
             None => preflight,
         };
-        let ack = format!(
-            "Full auto, {} to {}. {}Cruise {}, {} enroute {}. {} Cancel or my controls any time.",
+        // The whole brief is READ, on the Route tab; what is SAID is the
+        // flight, anything the pilot waived and the plan's cautions. The
+        // recited brief was a paragraph in the pilot's ear every arm (LIME
+        // 2026-09-25: "this would be better in a tab").
+        let brief = format!(
+            "{} to {}. {}Cruise {}, {} enroute {}. {}",
             fp.origin,
             fp.destination,
             preflight,
@@ -1034,6 +1099,21 @@ impl FullAuto {
             n,
             if n == 1 { "fix" } else { "fixes" },
             arrival,
+        );
+        if let Some(st) = ctx.status {
+            st.brief(&format!("Full auto brief\n{brief}"));
+        }
+        let waived: String = preflight
+            .split_inclusive(". ")
+            .filter(|s| s.contains("your call"))
+            .collect();
+        let ack = spoken_arm_line(
+            &fp.origin,
+            &fp.destination,
+            fp.cruise_alt_ft,
+            &waived,
+            audit_line.as_deref(),
+            ctx.status.is_some(),
         );
         Ok((
             Mission::Flight(Route {
@@ -1053,9 +1133,65 @@ impl FullAuto {
     }
 }
 
+/// The arming ack as SPOKEN: the flight, the pilot's own waivers, the
+/// plan's cautions, and where the rest is. Without a panel the brief has
+/// nowhere to be read, so it says only the essentials. Pure.
+pub fn spoken_arm_line(
+    origin: &str,
+    dest: &str,
+    cruise_ft: f64,
+    waived: &str,
+    cautions: Option<&str>,
+    panel: bool,
+) -> String {
+    let mut line = format!(
+        "Full auto, {origin} to {dest}, cruise {}. ",
+        crate::flightplan::spoken_feet(cruise_ft)
+    );
+    line.push_str(waived.trim());
+    if !waived.trim().is_empty() {
+        line.push(' ');
+    }
+    if let Some(c) = cautions {
+        line.push_str(c.trim());
+        line.push(' ');
+    }
+    if panel {
+        line.push_str("The brief is on the Brief tab. ");
+    }
+    line.push_str("Cancel or my controls any time.");
+    line
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn take_us_to_is_checked_against_the_plan() {
+        assert!(names_destination("bologna", &[], "LIPE", "Bologna Borgo Panigale"));
+        assert!(names_destination("LIPE", &["LIPE".into()], "LIPE", "Bologna Borgo Panigale"));
+        assert!(!names_destination("milan", &[], "LIPE", "Bologna Borgo Panigale"));
+        assert!(!names_destination("lipk", &["LIPK".into()], "LIPE", "Bologna Borgo Panigale"));
+    }
+
+    #[test]
+    fn the_arm_says_the_flight_and_the_route_tab_holds_the_brief() {
+        let l = spoken_arm_line("LIME", "LIPE", 19000.0, "", None, true);
+        assert_eq!(
+            l,
+            "Full auto, LIME to LIPE, cruise 19,000 feet. The brief is on the Brief tab. Cancel or my controls any time."
+        );
+        let w = spoken_arm_line(
+            "LILB",
+            "LIPK",
+            25000.0,
+            "No runway margin, your call: 1,970 feet of runway, 1,640 feet needed without it. ",
+            Some("One thing on the plan."),
+            true,
+        );
+        assert!(w.contains("your call") && w.contains("One thing on the plan"), "{w}");
+    }
 
     /// Every shipped profile is exactly ONE airframe class, and full auto
     /// picks that class's start. The MD-82 is the case that found the gap:

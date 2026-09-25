@@ -31,4 +31,6 @@ static const ImU32 COL_RED   = IM_COL32(240, 90, 80, 255);
 static const ImU32 COL_MAGENTA = IM_COL32(235, 110, 235, 255);
 
 // Fixed buffer for a text dataref the app PATCHes over the Web API.
-struct TextRef { char buf[512]; int len; };
+// 2 KB: the Brief tab carries a whole plan read-out. Slots whose payload the
+// app keeps short (the FMS route mailbox thins itself to 511) are unchanged.
+struct TextRef { char buf[2048]; int len; };

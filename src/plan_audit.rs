@@ -705,6 +705,104 @@ pub fn arrival_restrictions(
     (cons, line)
 }
 
+/// The crew's own arrival: the STAR to the runway the destination's wind
+/// will give us, spliced in where it meets the route, when SimBrief planned
+/// another end. The arrival stage picks its runway by the same rule (the
+/// destination's METAR, [`crate::full_auto::WIND_DECISIVE_KTS`]), so the STAR
+/// flown ends where the approach begins; LIME's tower gave 10 to a plan for
+/// 28 and full auto gave up (2026-09-25). The planned STAR is kept when it
+/// serves the runway too (only its runway part changes); otherwise the STAR
+/// entering the route earliest. The new fixes descend in a straight line
+/// from the entry's altitude to the old route's last, and the STAR's own
+/// windows then clamp them. `None` when nothing changed: calm or no METAR,
+/// SimBrief's runway already, no STAR data, a local plan.
+pub fn choose_arrival(
+    cifp_dir: &str,
+    fix_path: &str,
+    nav_path: &str,
+    apt_dat: &str,
+    wind: Option<(f64, f64)>,
+    fp: &mut crate::simbrief::FlightPlan,
+    legs: &mut Vec<crate::nav::ProcLeg>,
+) -> Option<String> {
+    if fp.source == crate::simbrief::PlanSource::Local || legs.is_empty() {
+        return None;
+    }
+    let apt = crate::nav::find_airport(apt_dat, &fp.destination).ok().flatten()?;
+    let (dir, kts) = wind.filter(|(_, k)| *k >= crate::full_auto::WIND_DECISIVE_KTS)?;
+    let (runway, _, _) = crate::nav::best_runway_for_wind(&apt.runways, dir, kts)?;
+    let planned = fp.procedures.dest_rwy.clone();
+    if planned.as_deref().and_then(crate::nav::runway_number) == crate::nav::runway_number(&runway) {
+        return None;
+    }
+    let idents: Vec<String> = legs.iter().map(|l| l.fix_ident.clone()).collect();
+    let mut choices = crate::nav::stars_for_route(cifp_dir, &fp.destination, &runway, &idents);
+    if let Some(star) = &fp.procedures.star {
+        if let Some(k) = choices.iter().position(|c| c.ident.eq_ignore_ascii_case(star)) {
+            let same = choices.remove(k);
+            choices.insert(0, same);
+        }
+    }
+    let (alat, alon) = apt.position()?;
+    let chosen = choices.into_iter().find_map(|mut c| {
+        crate::nav::resolve_proc_fixes(fix_path, nav_path, &apt, &fp.destination, &mut c.legs, alat, alon);
+        c.legs.iter().all(|l| l.fix.is_some()).then_some(c)
+    });
+    let spoken = crate::circuit::spell_runway(&runway);
+    let Some(c) = chosen else {
+        crate::blackbox::record(
+            "plan_audit",
+            serde_json::json!({ "event": "star_unchosen", "runway": runway, "planned": planned,
+                "star": fp.procedures.star, "wind": [dir.round(), kts.round()] }),
+        );
+        fp.procedures.dest_rwy = Some(runway);
+        return Some(format!(
+            "The wind at {} favours runway {spoken}, and no arrival from our route serves it; I'll fly the route and set up from there.",
+            fp.destination
+        ));
+    };
+    let entry_alt = legs[c.entry_index].alt1_ft;
+    let last_alt = legs.last().and_then(|l| l.alt1_ft);
+    let mut star_legs = c.legs;
+    let pos: Vec<(f64, f64)> = star_legs.iter().filter_map(|l| l.fix.as_ref().map(|f| (f.lat, f.lon))).collect();
+    let along: Vec<f64> = pos
+        .iter()
+        .scan((0.0, None::<(f64, f64)>), |(d, prev), p| {
+            if let Some(q) = *prev {
+                *d += crate::nav::haversine_nm(q.0, q.1, p.0, p.1);
+            }
+            *prev = Some(*p);
+            Some(*d)
+        })
+        .collect();
+    let total = along.last().copied().unwrap_or(0.0).max(0.1);
+    for (i, l) in star_legs.iter_mut().enumerate() {
+        l.alt1_ft = match (entry_alt, last_alt) {
+            (Some(a), Some(b)) => Some(a + (b - a) * along[i] / total),
+            (a, b) => a.or(b),
+        };
+        l.alt_desc = ' ';
+        l.alt2_ft = None;
+        l.transition = String::new();
+        l.leg_type = "TF".to_string();
+        l.seq = (c.entry_index + i) as u32;
+    }
+    legs.truncate(c.entry_index);
+    legs.extend(star_legs);
+    crate::blackbox::record(
+        "plan_audit",
+        serde_json::json!({ "event": "star_chosen", "star": c.ident, "entry": c.entry, "runway": runway,
+            "planned_star": fp.procedures.star, "planned_runway": planned, "wind": [dir.round(), kts.round()],
+            "fixes": legs[c.entry_index..].iter().map(|l| l.fix_ident.clone()).collect::<Vec<_>>() }),
+    );
+    fp.procedures.star = Some(c.ident.clone());
+    fp.procedures.dest_rwy = Some(runway);
+    Some(format!(
+        "The wind at {} favours runway {spoken}, so the {} arrival from {}.",
+        fp.destination, c.ident, c.entry
+    ))
+}
+
 /// The fix nearest `d` nm along, for naming a place.
 fn nearest_fix(profile: &[Crossing], d: f64) -> String {
     profile
@@ -911,6 +1009,79 @@ pub async fn check(
 
 #[cfg(test)]
 mod tests {
+
+    /// LIPE, SimBrief's BAME2S for 30 with the wind straight down 12: the
+    /// crew flies BAME5M from BAMEK. Needs the X-Plane install.
+    /// `cargo test -- --ignored real_install_lipe_star_rechosen --nocapture`
+    #[test]
+    #[ignore]
+    fn real_install_lipe_star_rechosen() {
+        use crate::nav::ProcKind;
+        let config = crate::config::Config::from_env().expect("config");
+        let apt = crate::nav::find_airport(&config.apt_data_path, "LIPE").unwrap().unwrap();
+        let (alat, alon) = apt.position().unwrap();
+        let mut star =
+            crate::nav::load_proc_legs(&config.cifp_dir, "LIPE", ProcKind::Star, "BAME2S", Some("RW30"));
+        crate::nav::resolve_proc_fixes(
+            &config.fix_data_path, &config.nav_data_path, &apt, "LIPE", &mut star, alat, alon,
+        );
+        let waypoints: Vec<crate::simbrief::Waypoint> = star
+            .iter()
+            .filter_map(|l| l.fix.as_ref().map(|f| (l.fix_ident.clone(), f.lat, f.lon)))
+            .enumerate()
+            .map(|(i, (ident, lat, lon))| crate::simbrief::Waypoint { ident, lat, lon, alt: 12000.0 - 1500.0 * i as f64 })
+            .collect();
+        let mut fp = crate::simbrief::FlightPlan {
+            transition_altitude_ft: None,
+            transition_level_ft: None,
+            procedures: Default::default(),
+            source: crate::simbrief::PlanSource::SimBrief,
+            origin: "LIME".into(),
+            destination: "LIPE".into(),
+            alternate: String::new(),
+            aircraft: String::new(),
+            cruise_alt_ft: 12000.0,
+            distance_nm: 100.0,
+            ete_min: 0.0,
+            trip_fuel_kg: 0.0,
+            reserve_kg: 0.0,
+            block_fuel_kg: 0.0,
+            min_takeoff_fuel_kg: 0.0,
+            weights: None,
+            route: String::new(),
+            wind_comp_kts: 0.0,
+            wind_dir: 0.0,
+            wind_spd_kts: 0.0,
+            tod_to_dest_nm: 0.0,
+            waypoints: Vec::new(),
+        };
+        fp.procedures.star = Some("BAME2S".into());
+        fp.procedures.dest_rwy = Some("30".into());
+        let mut legs = crate::procedure::enroute_legs(&waypoints, "LIME", "LIPE", 12000.0);
+        println!("before {:?}", legs.iter().map(|l| (l.fix_ident.clone(), l.alt1_ft)).collect::<Vec<_>>());
+        let line = super::choose_arrival(
+            &config.cifp_dir, &config.fix_data_path, &config.nav_data_path, &config.apt_data_path,
+            Some((120.0, 15.0)), &mut fp, &mut legs,
+        );
+        let (cons, _) = super::arrival_restrictions(&config.cifp_dir, &fp, &mut legs);
+        println!("{line:?}");
+        println!("after {:?}", legs.iter().map(|l| (l.fix_ident.clone(), l.alt1_ft)).collect::<Vec<_>>());
+        assert!(line.unwrap().contains("BAME5M"));
+        assert_eq!(fp.procedures.dest_rwy.as_deref(), Some("12"));
+        assert_eq!(legs.last().map(|l| l.fix_ident.as_str()), Some("EMDUD"));
+        assert!(legs.iter().all(|l| l.fix.is_some() && l.alt1_ft.is_some()));
+        assert!(!cons.is_empty(), "BAME5M's windows for 12 apply");
+        let emdud = legs.last().unwrap().alt1_ft.unwrap();
+        assert!(emdud >= 2500.0, "{emdud}");
+        // Calm: SimBrief's arrival stands.
+        let mut fp2 = fp.clone();
+        fp2.procedures.dest_rwy = Some("30".into());
+        let mut legs2 = crate::procedure::enroute_legs(&waypoints, "LIME", "LIPE", 12000.0);
+        assert!(super::choose_arrival(
+            &config.cifp_dir, &config.fix_data_path, &config.nav_data_path, &config.apt_data_path,
+            Some((120.0, 2.0)), &mut fp2, &mut legs2,
+        ).is_none());
+    }
     use super::*;
     use crate::nav::Fix;
 

@@ -361,6 +361,12 @@ pub struct AircraftProfile {
     /// testing on anything.
     #[serde(default)]
     pub cabin_crew: bool,
+    /// Fly an ILS COUPLED on this airframe's own approach mode (see
+    /// `ils::Coupling`): armed on final, the bug and VS dial handed over as
+    /// the localizer and glideslope capture. Off until a capture has been
+    /// flown on the type; the copilot's own path otherwise.
+    #[serde(default)]
+    pub ils_coupled: bool,
     /// The `park_brake_valve` value that means SET on this airframe, where the
     /// valve is modeled. The sense is PER-AIRCRAFT (C90B: 0 = set, verified live;
     /// SR22: 1 = set — the opposite, seen as an "inverted" handle). `None` = don't
@@ -2647,6 +2653,7 @@ mod tests {
             ("procedure", "ARRIVAL_DECEL_KTS_S", "planning slow-down for a STAR speed limit: a jet's descent rate, so a slower airframe only starts early"),
             ("autotakeoff", "ROLL_BRAKE_FULL_KTS", "brake-steer fade band, groundspeed; only brake_steer airframes"),
             ("autotakeoff", "ROLL_BRAKE_OFF_KTS", "brake-steer fade band, groundspeed; only brake_steer airframes"),
+            ("autotakeoff", "ROLL_ALIGN_KTS", "walking-pace pivot at a crooked roll start; only brake_steer airframes"),
             ("speedhold", "IDLE_FAST_KTS", "margin over the pilot's own target, not an airframe speed"),
             // --- Properties of the SIM or the SENSORS, not the airframe ---
             (
@@ -2722,6 +2729,16 @@ mod tests {
                 "autotaxi",
                 "BRAKE_STEER_FULL_KTS",
                 "...and is fully effective above this",
+            ),
+            (
+                "speedhold",
+                "RUNAWAY_OVER_KTS",
+                "a taxi this far over its target is a runaway: the brake gets a stop's authority",
+            ),
+            (
+                "speedhold",
+                "BETA_BITING_KTS_S",
+                "slowing this fast, a beta depth has bitten: hold it (any turboprop taxi)",
             ),
             (
                 "autotaxi",
@@ -3836,7 +3853,8 @@ mod tests {
         assert!(ts.boost_pumps);
         assert_eq!(ts.ignition_arm.len(), 1);
         assert_eq!(ts.condition_start, 0.5);
-        assert_eq!(ts.condition_run, 1.0);
+        // The real POH: low idle for flight, never high idle (LIME taxi).
+        assert_eq!(ts.condition_run, 0.5);
         // Dual battery + generator + standby alternator + DC power. No "both
         // generators" pair (POM: GEN and ALT are not normally used together) and
         // no avionics switch (the xlua forces avionics on at flight start).
@@ -4109,6 +4127,7 @@ fn cessna_172sp() -> AircraftProfile {
         ils: true,
         parking_brake: true,
         cabin_crew: false,
+        ils_coupled: false,
         bus_volts_nominal: None,
         flare_power: None,
         approach_thrust_min: None,
@@ -4416,6 +4435,7 @@ fn cirrus_sr22() -> AircraftProfile {
         ils: true,
         parking_brake: true,
         cabin_crew: false,
+        ils_coupled: false,
         bus_volts_nominal: None,
         flare_power: None,
         approach_thrust_min: None,

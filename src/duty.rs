@@ -103,6 +103,11 @@ pub fn next(s: &Status, landed: bool, now_s: f64) -> (Duty, &'static str) {
             (Duty::RequestClearance, "engines running, a tower, no clearance")
         }
         Ready | Pushback | TaxiOut => (Duty::Taxi, "engines running, to the runway"),
+        // Stopped on the way out but not AT the hold (the taxi stood down
+        // short of it at LIME and this read "at the hold", 2026-09-25).
+        Holding if s.situation.at_hold == Some(false) => {
+            (Duty::Taxi, "stopped short of the holding point")
+        }
         Holding if towered && !matches!(clearance, Some("LinedUp" | "TakeoffCleared")) => {
             (Duty::RequestTakeoff, "at the hold, the tower's word needed")
         }
@@ -197,6 +202,15 @@ mod tests {
         assert_eq!(d(Phase::Ready, false, None), Duty::Taxi);
         assert_eq!(d(Phase::Holding, false, None), Duty::LineUp);
         assert_eq!(d(Phase::LinedUp, false, None), Duty::TakeOff);
+    }
+
+    #[test]
+    fn a_stop_short_of_the_hold_is_still_the_taxi() {
+        let mut s = status(Phase::Holding, true, Some("TaxiCleared"));
+        s.situation.at_hold = Some(false);
+        assert_eq!(next(&s, false, 0.0).0, Duty::Taxi);
+        s.situation.at_hold = Some(true);
+        assert_eq!(next(&s, false, 0.0).0, Duty::RequestTakeoff);
     }
 
     #[test]

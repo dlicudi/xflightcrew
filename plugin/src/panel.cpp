@@ -387,8 +387,16 @@ protected:
                 mTab = 3;
                 ImGui::EndTabItem();
             }
-            if (ImGui::BeginTabItem("Settings")) {
+            if (ImGui::BeginTabItem("Brief")) {
                 mTab = 4;
+                ImGui::EndTabItem();
+            }
+            if (ImGui::BeginTabItem("State")) {
+                mTab = 5;
+                ImGui::EndTabItem();
+            }
+            if (ImGui::BeginTabItem("Settings")) {
+                mTab = 6;
                 ImGui::EndTabItem();
             }
             ImGui::EndTabBar();
@@ -410,6 +418,8 @@ protected:
             case 1: buildLogTab(connected); break;
             case 2: buildAtcTab(connected); break;
             case 3: buildRouteTab(); break;
+            case 4: buildBriefTab(); break;
+            case 5: buildStateTab(); break;
             default: buildSettingsTab(); break;
         }
         ImGui::EndChild();
@@ -846,6 +856,52 @@ protected:
                                "  %03d M   %.1f nm", deg, nm);
         }
         return a.row;
+    }
+
+    // The app's view of the flight: the flight model and the duty engine,
+    // one line each. A line with DISAGREES, EMERGENCY or CRASHED is amber.
+    void buildStateTab() {
+        const TextRef& feed = drefs::state_lines();
+        if (feed.len <= 0) {
+            ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(COL_DIM),
+                               "No flight state yet (is the copilot running?).");
+            return;
+        }
+        std::string text(feed.buf, feed.len);
+        size_t start = 0;
+        while (start <= text.size()) {
+            size_t end = text.find('\n', start);
+            if (end == std::string::npos) end = text.size();
+            std::string line = text.substr(start, end - start);
+            const bool alarm = line.find("DISAGREES") != std::string::npos
+                || line.find("EMERGENCY") != std::string::npos
+                || line.find("CRASHED") != std::string::npos;
+            ImGui::PushStyleColor(ImGuiCol_Text,
+                ImGui::ColorConvertU32ToFloat4(alarm ? COL_AMBER : COL_WHITE));
+            ImGui::TextWrapped("%s", line.c_str());
+            ImGui::PopStyleColor();
+            start = end + 1;
+        }
+    }
+
+    // The latest long report, read rather than recited: its first line is
+    // the title ("Flight plan", "Full auto brief"), the rest the report.
+    void buildBriefTab() {
+        const TextRef& feed = drefs::brief();
+        if (feed.len <= 0) {
+            ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(COL_DIM),
+                               "No brief yet. Ask for the flight plan, or arm full auto.");
+            return;
+        }
+        std::string text(feed.buf, feed.len);
+        size_t nl = text.find('\n');
+        std::string title = nl == std::string::npos ? std::string("Brief") : text.substr(0, nl);
+        std::string body = nl == std::string::npos ? text : text.substr(nl + 1);
+        ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(COL_DIM), "%s", title.c_str());
+        ImGui::Separator();
+        ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(COL_WHITE));
+        ImGui::TextWrapped("%s", body.c_str());
+        ImGui::PopStyleColor();
     }
 
     void buildRouteTab() {
