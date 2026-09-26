@@ -590,7 +590,7 @@ async fn secure(
     if !shut_down {
         announce(
             voice,
-            Priority::Advisory,
+            Priority::Readback,
             "Parking items done. Shut down when you're ready. Your aircraft.",
         );
     }
@@ -609,7 +609,10 @@ const SHUTDOWN_CONFIRM_SECS: f64 = 60.0;
 /// ended at "Parking items done. Shut down when you're ready."
 pub(crate) async fn shut_down_at_stand(xp: &XPlaneClient, config: &Config, voice: &Option<Voice>) {
     let Some(profile) = crate::aircraft::live_profile() else {
-        announce(voice, Priority::Advisory, "Parked. Your aircraft for the shutdown.");
+        // A hand-back and the flight's last word are never perishable: the
+        // closing line was dropped stale behind the frequency at LIPR
+        // (2026-09-26) and the pilot never heard the flight end.
+        announce(voice, Priority::Readback, "Parked. Your aircraft for the shutdown.");
         return;
     };
     let reg = crate::tools::Registry::for_aircraft(&profile);
@@ -624,7 +627,7 @@ pub(crate) async fn shut_down_at_stand(xp: &XPlaneClient, config: &Config, voice
         crate::blackbox::record("taxi_in", json!({ "event": "shutdown", "tool": null }));
         announce(
             voice,
-            Priority::Advisory,
+            Priority::Readback,
             "Parked. I have no shutdown for this airframe, so the engines are yours. Your aircraft.",
         );
         return;
@@ -675,7 +678,7 @@ pub(crate) async fn shut_down_at_stand(xp: &XPlaneClient, config: &Config, voice
         "taxi_in",
         json!({ "event": "electrics_off", "line": electrics }),
     );
-    announce(voice, Priority::Advisory, &shutdown_line(electrics.as_deref()));
+    announce(voice, Priority::Readback, &shutdown_line(electrics.as_deref()));
 }
 
 /// Every engine the airframe has reads stopped. A short array is not a

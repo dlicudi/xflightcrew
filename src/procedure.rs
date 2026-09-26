@@ -2670,7 +2670,7 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, plan: Pla
             crate::blackbox::record("procedure", serde_json::json!({"event": "complete_level"}));
             alert(
                 &voice,
-                Priority::Advisory,
+                Priority::Readback,
                 "Procedure complete. Level, the autopilot is holding. Your aircraft.",
             );
         }
