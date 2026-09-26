@@ -24,6 +24,7 @@ mod control;
 mod crew_pace;
 mod conversation;
 mod debrief;
+mod test_card;
 mod detect;
 mod dialogue;
 mod failures;
