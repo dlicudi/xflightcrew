@@ -3231,11 +3231,18 @@ pub async fn run(
                             // and played 17 s late, 130 m past the junction
                             // (2026-07-13). Dropped cues are covered by the
                             // guide's missed-turn nudge and the panel strip.
-                            voice.alert_stale_by(
-                                Priority::Advisory,
-                                cue,
-                                now + std::time::Duration::from_secs(8),
-                            );
+                            // The copilot driving says only the safety
+                            // calls; its own steering is on the panel.
+                            let copilot_driving = crate::autotaxi::driving();
+                            if !copilot_driving
+                                || taxi_guide.as_ref().is_some_and(|g| g.last_cue_is_safety())
+                            {
+                                voice.alert_stale_by(
+                                    Priority::Advisory,
+                                    cue,
+                                    now + std::time::Duration::from_secs(8),
+                                );
+                            }
                         }
                     } else {
                         taxi_guide = None;

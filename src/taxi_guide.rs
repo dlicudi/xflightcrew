@@ -128,6 +128,9 @@ pub struct Guide {
     stopped_at: Option<Instant>,
     /// A long stop just ended — re-orient on the next taxiing tick.
     reorient_armed: bool,
+    /// Whether the last cue [`Guide::tick`] returned is one the pilot needs
+    /// even when the copilot is driving: a runway ahead, the holding point.
+    last_safety: bool,
 }
 
 impl Guide {
@@ -330,6 +333,7 @@ impl Guide {
             prev_fix: None,
             stopped_at: None,
             reorient_armed: false,
+            last_safety: false,
         })
     }
 
@@ -397,6 +401,7 @@ impl Guide {
                     self.nudged[i] = true;
                     self.called[i] = true; // the moment has passed either way
                     self.last_call = Some(now);
+                    self.last_safety = false;
                     return Some(format!(
                         "We've missed our {dir} back there. Let's get back on the route."
                     ));
@@ -409,6 +414,7 @@ impl Guide {
         if self.reorient_armed {
             self.reorient_armed = false;
             self.last_call = Some(now);
+            self.last_safety = false;
             let name = self
                 .names
                 .iter()
@@ -446,11 +452,21 @@ impl Guide {
         self.called[i] = true;
         self.last_call = Some(now);
         let cue = &self.cues[i];
+        self.last_safety = matches!(cue.kind, CueKind::RunwayAhead | CueKind::HoldingPoint);
         // Fast into a sharp bend: the words carry the speed advice too.
         if cue.kind == CueKind::Turn && cue.sharp && gs_kts > EASY_KTS {
             return Some(format!("Easy now. {}", cue.line));
         }
         Some(cue.line.clone())
+    }
+
+    /// The last cue is a safety call (a runway ahead, the holding point),
+    /// spoken whoever is driving. The rest is guidance for a pilot's hands:
+    /// with the copilot driving, "follow it around to the right" eight times
+    /// down one taxi is the copilot narrating its own steering (LIBP
+    /// 2026-09-26), so the monitor shows those on the panel and says nothing.
+    pub fn last_cue_is_safety(&self) -> bool {
+        self.last_safety
     }
 
     /// The glanceable next-decision-point line for the plugin panel strip —
@@ -902,6 +918,7 @@ mod tests {
         let (lat, lon) = ll(130.0, 0.0);
         let cue = g.tick(lat, lon, 10.0, t0 + s(10)).expect("turn cue");
         assert!(cue.contains("left"), "{cue}");
+        assert!(!g.last_cue_is_safety(), "a turn is guidance for the pilot's hands");
         assert!(cue.contains("Sierra five Whiskey"), "{cue}");
         // Same spot again: spoken once.
         assert_eq!(g.tick(lat, lon, 10.0, t0 + s(20)), None);
@@ -910,6 +927,7 @@ mod tests {
         let (lat, lon) = ll(200.0, 10.0);
         let cue = g.tick(lat, lon, 10.0, t0 + s(30)).expect("runway cue");
         assert!(cue.contains("Runway zero niner left"), "{cue}");
+        assert!(g.last_cue_is_safety(), "a runway ahead is said whoever drives");
         // Off the crossing: the fresh name.
         let (lat, lon) = ll(200.0, 115.0);
         let cue = g.tick(lat, lon, 10.0, t0 + s(40)).expect("name cue");
