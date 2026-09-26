@@ -149,6 +149,13 @@ electrical:
     on_commands:  [sim/electrical/battery_1_on]
     off_commands: [sim/electrical/battery_1_off]
     readback:     [sim/cockpit/electrical/battery_on]
+    # The battery switch is GUARDED: B738.systems.lua `B738_guard_cover_logic`
+    # sets battery_on[0] = 1 every frame while guard_cover_pos[0] < 0.5, so
+    # battery_1_off under a shut guard is undone the next frame ("The battery
+    # didn't move", 17:07Z 2026-09-26). The cover is the xlua's own toggle
+    # command; its position array is created by B738.switches.lua.
+    guards:
+      - { command: laminar/B738/guard_cover00, dataref: "laminar/B738/button_switch/guard_cover_pos[0]" }
   - key: generators
     spoken: generators
     on_commands:  [sim/electrical/generator_1_on, sim/electrical/generator_2_on]
