@@ -2331,6 +2331,7 @@ pub async fn run(
     // Alpha") — the loop speaks every repeat, the transcript records once.
     let mut atis_logged: Option<String> = None;
     let mut traffic_open = false;
+    let mut traffic_called: Option<crate::station::TrafficFactor> = None;
     // Runway-incursion shout cadence: it repeats while the conflict persists
     // (a safety shout may nag), but not every tick.
     let mut incursion_last: Option<Instant> = None;
@@ -3532,10 +3533,20 @@ pub async fn run(
                     let due = traffic_last.is_none_or(|t| now.duration_since(t).as_secs() >= 45)
                         && near_miss_last.is_none_or(|t| now.duration_since(t).as_secs() >= 45);
                     if due {
-                        let advisory = crate::station::traffic_advisory(xp.view()).await;
+                        // Called once, and again only when it is more of a
+                        // factor (`traffic_worth_recalling`).
+                        let factor = crate::station::nearest_traffic_factor(xp.view()).await;
+                        let fresh = factor.as_ref().filter(|f| {
+                            traffic_called.as_ref().is_none_or(|c| crate::station::traffic_worth_recalling(c, f))
+                        });
+                        let advisory = fresh.map(crate::station::advisory_line);
+                        if let Some(f) = fresh {
+                            traffic_called = Some(f.clone());
+                        }
                         // Close the loop: the last factor is gone.
-                        if advisory.is_none() && traffic_open {
+                        if factor.is_none() && traffic_open {
                             traffic_open = false;
+                            traffic_called = None;
                             traffic_last = Some(now);
                             let line = "clear of traffic.".to_string();
                             if let Some(s) = status.as_ref() {

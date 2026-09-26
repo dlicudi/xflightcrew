@@ -466,6 +466,51 @@ pub fn map_path(leg: &ProcLeg, dist_nm: Option<f64>, gs_kts: f64) -> Option<(f64
     Some((map_ft + d * 6076.12 * t, -gs_kts.max(0.0) * 6076.12 / 60.0 * t))
 }
 
+/// What goes on the ALTITUDE DIAL: the level this climb or descent ends at,
+/// set once, the way a pilot sets the preselect and flies the rate. The
+/// follower used to write its paced target (`want_alt`) every tick: on a
+/// continuous descent that is a dial walking just under the aircraft, the
+/// autopilot captured it, levelled, the dial stepped 50 ft lower, and the
+/// descent went down a staircase 60 to 120 ft above its own path (LIPR 30,
+/// 2026-09-26, handed to autoland 120 ft high at 0.8 nm). Descending, the
+/// dial is the leg's constraint (`carry`), never under a terrain floor or a
+/// pilot's level; climbing, the higher of the target and the constraint;
+/// level, the level held; on a published path, the bottom of it. Whole
+/// hundreds, rounded UP so a floor or a minimum is never under-set. Pure.
+pub fn dial_target_ft(
+    want_ft: f64,
+    alt_ft: f64,
+    carry_ft: f64,
+    held_ft: Option<f64>,
+    path_bottom_ft: Option<f64>,
+) -> f64 {
+    const BAND_FT: f64 = 100.0;
+    let up = |v: f64| (v / 100.0).ceil() * 100.0;
+    if let Some(b) = path_bottom_ft {
+        return up(b.max(held_ft.unwrap_or(f64::MIN)));
+    }
+    if want_ft < alt_ft - BAND_FT {
+        up(carry_ft.max(held_ft.unwrap_or(f64::MIN)))
+    } else if want_ft > alt_ft + BAND_FT {
+        up(want_ft.max(carry_ft))
+    } else {
+        (want_ft / 100.0).round() * 100.0
+    }
+}
+
+/// Split a departure's minimums into the ones this plan can fly and the ones
+/// above its cruise. A minimum over the planned cruise is a level the
+/// follower was never going to climb to (the plan owns the target), and
+/// judging the aircraft against it handed a 172 back to its pilot at 5,000
+/// ft, three miles from D121Z, for not climbing to ANC8A's 9,500
+/// (LIPR-LIBP 2026-09-26). Pure.
+pub fn minimums_within_cruise(
+    mins: Vec<crate::nav::ClimbMinimum>,
+    cruise_ft: f64,
+) -> (Vec<crate::nav::ClimbMinimum>, Vec<crate::nav::ClimbMinimum>) {
+    mins.into_iter().partition(|m| m.min_ft <= cruise_ft + MINIMUM_MET_TOL_FT)
+}
+
 /// The first departure minimum still ahead of the aircraft and not yet met:
 /// (leg index of its fix, minimum ft). Legs before `idx` are behind us.
 /// A departure minimum is met this close under it, feet.
@@ -1634,6 +1679,21 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, plan: Pla
         visual_deg,
         missed_legs,
     } = plan;
+    // Never judge the aircraft against a minimum above the level it is
+    // flying to (`minimums_within_cruise`); the arm says so, and this
+    // covers every other way into the follower.
+    let cruise_ft = legs.iter().filter_map(|l| l.alt1_ft).fold(f64::MIN, f64::max);
+    let (climb_minimums, above) = if cruise_ft > 0.0 {
+        minimums_within_cruise(climb_minimums, cruise_ft)
+    } else {
+        (climb_minimums, Vec::new())
+    };
+    for m in &above {
+        crate::blackbox::record(
+            "procedure",
+            serde_json::json!({"event": "minimum_above_cruise", "fix": m.fix, "min_ft": m.min_ft, "cruise_ft": cruise_ft}),
+        );
+    }
     let handoff = handoff_index(&legs);
     let _detail = crate::auto_status::DetailGuard::hold(&DETAIL);
     // Process-wide facts must never outlive the flight that set them.
@@ -1972,7 +2032,23 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, plan: Pla
                 if !gear_set && crate::autoland::gear_may_extend(ias, crate::aircraft::gear_limit_kts()) {
                     gear_set = xp.set_float(GEAR_HANDLE, 1.0).await.is_ok();
                 }
-                let flap = crate::autoland::flap_within_limits(1.0, ias, &crate::aircraft::flap_limits());
+                // A MAP ON the runway is an ordinary final: flap as the
+                // approach goes (half inside 6 nm, full inside 3 nm on the
+                // path, `autoland::flap_schedule`), as a pilot flies an ILS.
+                // Full flap from the FAF flew LIPR's 9 nm final at 65 kt for
+                // eight minutes (2026-09-26). A MAP short of the runway keeps
+                // the whole landing configuration for its visual segment.
+                let wanted = if map_short_of_runway(&legs[idx]) {
+                    1.0
+                } else {
+                    let d = legs[idx]
+                        .fix
+                        .as_ref()
+                        .map(|f| crate::nav::haversine_nm(lat, lon, f.lat, f.lon));
+                    let err = map_path(&legs[idx], d, gs * MS_TO_KTS).map_or(0.0, |(p, _)| alt_ft - p);
+                    crate::autoland::flap_schedule(d.unwrap_or(9.9), err)
+                };
+                let flap = crate::autoland::flap_within_limits(wanted, ias, &crate::aircraft::flap_limits());
                 if last_flap.is_none_or(|f: f64| (f - flap).abs() > 0.01)
                     && xp.set_float(FLAP_RATIO, flap).await.is_ok()
                 {
@@ -2301,11 +2377,23 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, plan: Pla
                 }
             }
         }
+        // The dial is the level this movement ends at, set once
+        // (`dial_target_ft`); the path itself is flown on the VS dial below.
+        // A terrain floor or a pilot's level is a level the dial must not
+        // go under.
+        let held = if v.pilot || v.floored.is_some() { Some(want_alt) } else { None };
+        let dial = dial_target_ft(
+            want_alt,
+            alt_ft,
+            v.carry,
+            held,
+            path.and(leg.alt1_ft),
+        );
         if !set_confirmed(
             "procedure",
             &xp,
             ALT_DIAL,
-            want_alt,
+            dial,
             &mut last_alt_dial,
             50.0,
         )
@@ -2850,6 +2938,34 @@ mod tests {
         async fn set_float_array_elem(&self, _: &str, _: usize, _: f64) -> anyhow::Result<()> {
             unreachable!()
         }
+    }
+
+    /// LIPR 30 (2026-09-26): the dial written with the paced target every
+    /// tick made a staircase; it is the level the movement ends at.
+    #[test]
+    fn the_altitude_dial_is_where_the_descent_ends_not_where_it_is_now() {
+        // A descent from 2,100 toward a 1,500 constraint, paced: the target
+        // walks down, the dial stays at 1,500 the whole way.
+        for (want, alt) in [(1990.0, 2105.0), (1850.0, 2000.0), (1600.0, 1750.0)] {
+            assert_eq!(super::dial_target_ft(want, alt, 1500.0, None, None), 1500.0);
+        }
+        // Held level before the top of descent: the level held.
+        assert_eq!(super::dial_target_ft(4020.0, 4000.0, 1500.0, None, None), 4000.0);
+        // A terrain floor above the constraint: never under the floor.
+        assert_eq!(super::dial_target_ft(2340.0, 3000.0, 1500.0, Some(2340.0), None), 2400.0);
+        // Climbing to a minimum above the plan's altitude: the minimum.
+        assert_eq!(super::dial_target_ft(4000.0, 1200.0, 3000.0, None, None), 4000.0);
+        // Down a published path: its bottom, once.
+        assert_eq!(super::dial_target_ft(800.0, 900.0, 1500.0, None, Some(147.0)), 200.0);
+    }
+
+    #[test]
+    fn a_minimum_above_the_cruise_is_not_the_followers_to_judge() {
+        let m = |f: &str, a: f64| crate::nav::ClimbMinimum { fix: f.into(), min_ft: a };
+        let (keep, above) = super::minimums_within_cruise(vec![m("RIM", 4000.0), m("D121Z", 9500.0)], 5000.0);
+        assert_eq!(keep.len(), 1);
+        assert_eq!(keep[0].fix, "RIM");
+        assert_eq!(above[0].fix, "D121Z");
     }
 
     /// LIPR 2026-09-26: set the heading, leave it. One write per leg, a

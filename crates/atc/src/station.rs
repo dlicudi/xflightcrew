@@ -5128,6 +5128,7 @@ pub fn vector_tick(
 /// The nearest airborne factor from the TCAS picture: range, clock position,
 /// and relative altitude (positive = traffic above us), rounded to the
 /// hundred feet a pilot scans in.
+#[derive(Debug, Clone, PartialEq)]
 pub struct TrafficFactor {
     pub nm: f64,
     pub clock: i32,
@@ -5211,16 +5212,31 @@ fn vert_phrase(ft: f64) -> String {
 /// `None` = no factor, frequency stays quiet.
 pub async fn traffic_advisory(xp: SimView<'_>) -> Option<String> {
     let f = nearest_traffic_factor(xp).await?;
+    Some(advisory_line(&f))
+}
+
+/// Is `now` worth calling again after `called`? A controller calls a
+/// target once and again only when it has become MORE of a factor: two
+/// miles closer, or 500 ft less between us. At the old 45 s cadence one
+/// diverging target was called ten times across a cruise ("3 o'clock, 6
+/// miles, 900 feet below", then 700, 1,000, 1,400 below; LIPK-LIPR
+/// 2026-09-26). Pure.
+pub fn traffic_worth_recalling(called: &TrafficFactor, now: &TrafficFactor) -> bool {
+    now.nm <= called.nm - 2.0 || called.ft.abs() - now.ft.abs() >= 500.0
+}
+
+/// The advisory's words for a factor.
+pub fn advisory_line(f: &TrafficFactor) -> String {
     let range = if f.nm < 1.0 {
         "under a mile".to_string()
     } else {
         format!("{:.0} miles", f.nm)
     };
-    Some(format!(
+    format!(
         "traffic, {} o'clock, {range}, {}.",
         f.clock,
         vert_phrase(f.ft)
-    ))
+    )
 }
 
 /// Is this factor a NEAR MISS — unsafe proximity, not just a factor to scan
@@ -5506,6 +5522,16 @@ fn spoken_wind(from_deg: f64, kts: f64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn traffic_is_called_again_only_when_it_is_more_of_a_factor() {
+        let f = |nm: f64, ft: f64| TrafficFactor { nm, clock: 3, ft };
+        let called = f(6.0, -900.0);
+        assert!(!traffic_worth_recalling(&called, &f(6.0, -700.0)), "200 ft closer is the same call");
+        assert!(!traffic_worth_recalling(&called, &f(6.0, -1400.0)), "diverging");
+        assert!(traffic_worth_recalling(&called, &f(4.0, -900.0)), "two miles closer");
+        assert!(traffic_worth_recalling(&called, &f(5.5, -300.0)), "600 ft less between us");
+    }
 
     #[test]
     fn traffic_advisory_skips_ground_targets() {

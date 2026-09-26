@@ -878,6 +878,19 @@ impl FullAuto {
                 }
                 _ => Vec::new(),
             };
+        // A minimum above the plan's cruise is not flown (the plan owns the
+        // level); said here, so it is no surprise three miles from the fix.
+        let (climb_minimums, above_cruise) =
+            crate::procedure::minimums_within_cruise(climb_minimums, fp.cruise_alt_ft);
+        let above_line = above_cruise.iter().max_by(|a, b| a.min_ft.total_cmp(&b.min_ft)).map(|m| {
+            format!(
+                "{} wants {} at {}, above our cruise. I'll hold the plan's {} there.",
+                fp.procedures.sid.as_deref().unwrap_or("The departure"),
+                crate::flightplan::spoken_feet(m.min_ft),
+                m.fix,
+                crate::flightplan::spoken_feet(fp.cruise_alt_ft),
+            )
+        });
         // The gradient each minimum needs from the runway's departure end,
         // against the climb at Vy: refused when it cannot be made, said when
         // it is tight, briefed either way.
@@ -1084,6 +1097,10 @@ impl FullAuto {
         // the arrival line already names the destination (EGSS-LFPG,
         // 2026-09-22, a paragraph the panel ran out of room for).
         let preflight = match &departure_line {
+            Some(l) => format!("{preflight}{l} "),
+            None => preflight,
+        };
+        let preflight = match &above_line {
             Some(l) => format!("{preflight}{l} "),
             None => preflight,
         };

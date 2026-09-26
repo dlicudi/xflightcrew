@@ -1044,7 +1044,13 @@ pub fn ride_paint(
         let (a, b) = (path[i], path[i + 1]);
         let s = seg.get(i).cloned().unwrap_or_default();
         let len = dist_m(a, b);
-        if s.1 || len < 0.5 {
+        // A zero-length leg is no leg: kept, it reads as a bearing of 0,
+        // due north, to anything that asks a segment its direction (the
+        // LIPR stop swerved on one, 2026-09-26).
+        if len < 0.5 {
+            continue;
+        }
+        if s.1 {
             out_path.push(a);
             out_seg.push(s);
             prefer = None;
@@ -1089,6 +1095,11 @@ pub fn ride_paint(
         let brg = bearing_deg(prev.0, prev.1, last.0, last.1);
         nearest_paint(paint, last, brg, prefer, m_per_deg_lon).map_or(last, |(_, q)| q)
     };
+    // The end snapped onto the last sample is the same point twice: merge.
+    if out_path.len() >= 2 && out_path.last().is_some_and(|&p| dist_m(p, end) < 0.5) {
+        out_path.pop();
+        out_seg.pop();
+    }
     out_path.push(end);
     (out_path, out_seg)
 }
@@ -4702,6 +4713,28 @@ STAR:030,6,ALWYS3,RW28B,ARRTU,K2,P,C,E   , ,   ,TF, , , , , ,      ,    ,    ,  
     /// runway 13, tracking the planned route to 0.12 m and the drawn line to
     /// nothing better than 1.7 m. The assertion is on the route, not on the
     /// aircraft — where the route runs is the only part of that we own.
+    /// LIPR gate 210 to Alpha for 30 (2026-09-26): the route ended on a
+    /// repeated point and the stop swerved right toward "due north".
+    #[test]
+    #[ignore] // needs the real X-Plane install; run with --ignored
+    fn live_lipr_route_has_no_zero_length_legs() {
+        let p = "/Users/duanelicudi/X-Plane 12/Global Scenery/Global Airports/Earth nav data/apt.dat";
+        let (Ok(Some(net)), Ok(Some(apt))) = (find_taxi_net(p, "LIPR"), find_airport(p, "LIPR")) else {
+            return;
+        };
+        let r = apt.runways.iter().find(|r| r.ident_b == "30" || r.ident_a == "30").unwrap();
+        let (tlat, tlon) = if r.ident_b == "30" { (r.lat_b, r.lon_b) } else { (r.lat_a, r.lon_a) };
+        let zone = [r.ident_a.clone(), r.ident_b.clone()];
+        let plan = net
+            .plan_to_runway(44.02164715953246, 12.619642408739669, tlat, tlon, 100.0, &zone, Some(r))
+            .expect("a route");
+        let k = 111_320.0 * 44.0f64.to_radians().cos();
+        for w in plan.path.windows(2) {
+            let d = (((w[1].1 - w[0].1) * k).powi(2) + ((w[1].0 - w[0].0) * 111_320.0).powi(2)).sqrt();
+            assert!(d >= 0.5, "a {d:.2} m leg");
+        }
+    }
+
     /// LIPK 2026-09-26: the tug's pattern left a 172 at the second point, on
     /// the grass; the first is the stand it was pushed off.
     #[test]
@@ -4715,6 +4748,22 @@ STAR:030,6,ALWYS3,RW28B,ARRTU,K2,P,C,E   , ,   ,TF, , , , , ,      ,    ,    ,  
         assert!(!net.pavement.is_empty(), "LIPK draws pavement");
         assert_eq!(net.on_pavement(44.19580628655603, 12.075011968589756), Some(true));
         assert_eq!(net.on_pavement(44.19488911712411, 12.074242855216026), Some(false));
+    }
+
+    /// LIPR Alpha (2026-09-26): a route ending on a repeated point. No leg
+    /// of a painted route is ever zero length.
+    #[test]
+    fn a_painted_route_has_no_zero_length_legs() {
+        let paint = vec![vec![(44.0, 12.0), (44.0, 12.01)]];
+        let path = vec![(44.0, 12.0), (44.0, 12.005), (44.0, 12.005), (44.0, 12.009), (44.0, 12.009)];
+        let seg: Vec<(String, bool)> = (0..path.len() - 1).map(|_| ("A".to_string(), false)).collect();
+        let (out, out_seg) = ride_paint(&paint, &path, &seg);
+        assert_eq!(out_seg.len(), out.len() - 1, "one seg per leg");
+        let k = 111_320.0 * 44.0f64.to_radians().cos();
+        for w in out.windows(2) {
+            let d = (((w[1].1 - w[0].1) * k).powi(2) + ((w[1].0 - w[0].0) * 111_320.0).powi(2)).sqrt();
+            assert!(d >= 0.5, "a {d:.2} m leg in {out:?}");
+        }
     }
 
     #[test]

@@ -98,7 +98,19 @@ pub struct Scorer {
     airborne_since: Option<f64>,
     interventions: usize,
     results: Vec<(String, bool)>,
+    /// The taxi drive is joining its route; its offset is not judged yet.
+    joining: bool,
 }
+
+/// The takeoff events that mean the roll was STOPPED, not finished.
+const ROLL_FAILURES: &[&str] = &[
+    "reject",
+    "wrong_runway",
+    "no_runway_fit",
+    "pedal_yield",
+    "throttle_yield",
+    "released",
+];
 
 fn angle(a: f64) -> f64 {
     (a + 540.0).rem_euclid(360.0) - 180.0
@@ -129,13 +141,21 @@ impl Scorer {
                 self.close_taxi(event, &mut out)
             }
             ("autotakeoff", "roll") => self.roll_tick(r, t),
-            ("autotakeoff", "climb" | "climb_manual") => self.close_roll(None, &mut out),
-            ("autotakeoff", e)
-                if self.roll.is_some()
-                    && !matches!(e, "takeoff_config" | "engaged" | "transponder_alt" | "") =>
-            {
+            // The roll ends in the air: liftoff (or the climb, for a stream
+            // that never logged one) is the pass. Only a roll that was STOPPED
+            // is a failure; every other milestone (rotate, trim, flap steps)
+            // is the roll going as it should. Any unknown event used to close
+            // it as failed, so "rotate" failed every takeoff and the roll
+            // ticks after it opened a second one (LIPK 2026-09-26).
+            ("autotakeoff", "liftoff" | "climb" | "climb_manual") => self.close_roll(None, &mut out),
+            ("autotakeoff", e) if self.roll.is_some() && ROLL_FAILURES.contains(&e) => {
                 self.close_roll(Some(e), &mut out)
             }
+            // A join onto the route is not "off the line": the lateral
+            // offset is judged once the drive has joined (LIPK 2026-09-26:
+            // a 69 m join from the push scored the taxi as failed).
+            ("autotaxi", "join") => self.joining = true,
+            ("autotaxi", "joined") => self.joining = false,
             ("autoland", "rollout") => {
                 if let Some(l) = self.landing.as_mut() {
                     if let Some(x) = f(r, "xtk_m") {
@@ -192,7 +212,9 @@ impl Scorer {
             f(r, "yaw_dps").unwrap_or(0.0),
         );
         x.max_gs = x.max_gs.max(gs);
-        x.max_lat = x.max_lat.max(lat.abs());
+        if !self.joining {
+            x.max_lat = x.max_lat.max(lat.abs());
+        }
         x.last_err = f(r, "err").unwrap_or(0.0);
         x.last_lat = lat;
         if let Some((t1, bl1, br1, yaw1)) = x.last {
@@ -213,6 +235,7 @@ impl Scorer {
     }
 
     fn close_taxi(&mut self, by: &str, out: &mut Vec<(String, Value)>) {
+        self.joining = false;
         let Some(mut x) = self.taxi.take() else { return };
         if x.ticks < 5 {
             return;
