@@ -6807,7 +6807,13 @@ history):
   at 0.0, a 350-press cap moved it 3.5 inHg per ask, every caller said
   "set", and the follower "levelled at 4,600 ft" at 17,000: `set_altimeter`
   now steps in rounds EARNED by progress, `keep_stepping`, and
-  `AltimeterSync::line` says "did not take" with both numbers), so the crew
+  `AltimeterSync::line` says "did not take" with both numbers; LIBP
+  2026-09-26: QNH 1024, the 737's dial read 30.06 after the write, 30.23
+  after eighteen presses with the eighteenth still in the sim's queue,
+  30.25 after the "correcting" nineteenth, and a knob one step PAST the ask
+  looked like no progress, so the crew said "set it by hand" over a
+  hundredth: the post-round settle is 300 ms and a dial one step past the
+  ask that moved this round earns the one press back), so the crew
   keeps it right: ONE rule for the
   correct setting (`instruments::correct_setting_inhg`: QNH below the
   profile's transition altitude, standard above) behind the spoken tool,

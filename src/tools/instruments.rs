@@ -24,8 +24,15 @@ const BARO_MAX_STEPS: usize = 350;
 /// five asks left it at 17.5, the altimeter read 12,500 ft low, and the
 /// follower "levelled at 4,600 ft" at 17,000.
 const BARO_MAX_ROUNDS: usize = 10;
-/// How long a frame takes to overwrite a write that will not stand.
-const BARO_SETTLE_MS: u64 = 120;
+/// How long a frame takes to overwrite a write that will not stand, and how
+/// long a round of presses takes to all land: the API runs a command in a
+/// flight loop AFTER acknowledging it, and the 737's xlua copies its memory
+/// into the dial a frame later again. At LIBP (2026-09-26) eighteen presses
+/// were read 120 ms later as seventeen (30.06 to 30.23 for 30.24); the
+/// eighteenth landed with the "correcting" press and the dial stopped at
+/// 30.25, judged as not taken. A set happens a few times a flight: the wait
+/// is cheap, the wrong verdict is a Warning and a wrong altimeter.
+const BARO_SETTLE_MS: u64 = 300;
 /// Pascals per inch of mercury (1013.25 hPa ≈ 29.92 inHg).
 pub const PA_PER_INHG: f64 = 3386.389;
 const DG_SYNC: &str = "sim/instruments/DG_sync_mag";
@@ -99,13 +106,25 @@ pub async fn set_altimeter(xp: &dyn crate::xplane::XPlane, inhg: f64) -> Result<
 /// Another round of presses is earned only by a dial that is not there yet
 /// AND answered the last round: it closed on the ask by at least half of what
 /// was pressed. A bad read, a dead knob or a box that owns its own number
-/// shows no progress and gets no second round. Pure.
+/// shows no progress and gets no second round.
+///
+/// A dial ONE step past the ask that moved this round earns the one press
+/// back: that is a press read a frame early, not a knob that missed (LIBP,
+/// 2026-09-26: 30.23 read after eighteen presses, 30.25 after the nineteenth,
+/// and the old rule saw an overshoot as no progress and left it there). A
+/// dead knob does not move and still gets no second round; the rounds are
+/// bounded either way. Pure.
 pub fn keep_stepping(before: f64, now: f64, wanted: f64, pressed: usize) -> bool {
     if altimeter_took(now, wanted) || pressed == 0 {
         return false;
     }
     let closed = (before - wanted).abs() - (now - wanted).abs();
-    closed >= pressed as f64 * BARO_STEP_INHG / 2.0
+    if closed >= pressed as f64 * BARO_STEP_INHG / 2.0 {
+        return true;
+    }
+    let one_step_past = (now - wanted).abs() < BARO_STEP_INHG * 1.5;
+    let moved = (now - before).abs() >= BARO_STEP_INHG / 2.0;
+    one_step_past && moved
 }
 
 pub struct SetBarometer;
@@ -577,6 +596,49 @@ mod tests {
         assert!(keep_stepping(0.0, 3.5, 30.4, 350));
         assert!(!keep_stepping(0.0, 0.0, 30.4, 350));
         assert!(!keep_stepping(30.39, 30.40, 30.4, 1));
+    }
+
+    /// LIBP, 2026-09-26, QNH 1024 (30.238): the 737's dial read 30.06 after
+    /// the write, 30.23 after eighteen presses (one still in the sim's
+    /// queue), 30.25 after the nineteenth. The round after presses ONE back
+    /// and the dial takes; a dead knob one step off still gets nothing.
+    #[test]
+    fn one_step_past_the_ask_is_pressed_back_when_the_dial_moved() {
+        assert!(keep_stepping(30.06, 30.23, 30.238, 18), "closing: earned");
+        assert!(
+            keep_stepping(30.23, 30.25, 30.238, 1),
+            "a step past after a press that moved it: one back"
+        );
+        assert!(
+            !keep_stepping(30.23, 30.23, 30.238, 1),
+            "one step short and not moving: a dead knob"
+        );
+        assert!(
+            !keep_stepping(30.21, 30.27, 30.238, 6),
+            "three past is a knob that runs, not a frame's lag"
+        );
+        assert_eq!(baro_steps(30.25, 30.238), (CMD_BARO_DOWN, 1));
+    }
+
+    #[tokio::test]
+    async fn a_press_the_sim_lands_late_is_corrected_not_reported() {
+        use crate::xplane::FakeXPlane;
+        let fake = FakeXPlane::with_reads(&[(BARO, 30.06)]);
+        fake.step_on_command(CMD_BARO_UP, BARO, BARO_STEP_INHG);
+        fake.step_on_command(CMD_BARO_DOWN, BARO, -BARO_STEP_INHG);
+        fake.land_press_late(18);
+        let want = 1024.0 * 100.0 / PA_PER_INHG;
+        let now = set_altimeter(&fake, want).await.unwrap();
+        assert!(altimeter_took(now, want), "{now}");
+        assert_eq!(fake.ran_count(CMD_BARO_UP), 19);
+        assert_eq!(fake.ran_count(CMD_BARO_DOWN), 1);
+        let sync = AltimeterSync {
+            was: 30.06,
+            now,
+            want,
+        };
+        assert!(sync.took());
+        assert_eq!(sync.line(), "Altimeter set, three zero two four.");
     }
 
     #[test]

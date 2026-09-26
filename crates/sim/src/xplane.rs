@@ -952,6 +952,13 @@ pub struct FakeXPlane {
     /// A command that moves a read: (dataref, delta per press). A stepped
     /// knob whose dial write does not stand (the 737's altimeter) is this.
     command_steps: std::sync::Mutex<HashMap<String, (String, f64)>>,
+    /// Presses (by ordinal, 1-based, over every command run) whose step lands
+    /// one read LATE: a command the sim executes in a flight loop after the
+    /// read that followed it. `presses` counts them; `held` are the late
+    /// steps, with whether a read has already gone by since the press.
+    late_presses: std::sync::Mutex<std::collections::HashSet<usize>>,
+    presses: std::sync::Mutex<usize>,
+    held: std::sync::Mutex<Vec<(String, f64, bool)>>,
 }
 
 impl FakeXPlane {
@@ -962,7 +969,19 @@ impl FakeXPlane {
             writes: std::sync::Mutex::new(Vec::new()),
             commands: std::sync::Mutex::new(Vec::new()),
             command_steps: std::sync::Mutex::new(HashMap::new()),
+            late_presses: std::sync::Mutex::new(std::collections::HashSet::new()),
+            presses: std::sync::Mutex::new(0),
+            held: std::sync::Mutex::new(Vec::new()),
         }
+    }
+
+    /// The `nth` command run (1-based, counted over every command) moves its
+    /// stepped read one read late: the read straight after it still shows the
+    /// dial without it, the read after that has it. This is the sim as it
+    /// was at LIBP (2026-09-26): eighteen altimeter presses, a read 120 ms
+    /// later showing seventeen, the eighteenth landing before the next read.
+    pub fn land_press_late(&self, nth: usize) {
+        self.late_presses.lock().unwrap().insert(nth);
     }
 
     /// Make `command` move the read of `dataref` by `delta` per press.
@@ -1049,6 +1068,21 @@ impl Default for FakeXPlane {
 #[async_trait]
 impl XPlane for FakeXPlane {
     async fn get_float(&self, name: &str) -> Result<f64> {
+        // A late press lands on the SECOND read after it: the first read
+        // marks it seen, the next applies it.
+        {
+            let mut held = self.held.lock().unwrap();
+            let mut reads = self.reads.lock().unwrap();
+            held.retain(|(dref, delta, seen)| {
+                if *seen {
+                    *reads.entry(dref.clone()).or_insert(0.0) += delta;
+                }
+                !*seen
+            });
+            for h in held.iter_mut() {
+                h.2 = true;
+            }
+        }
         self.reads
             .lock()
             .unwrap()
@@ -1069,13 +1103,25 @@ impl XPlane for FakeXPlane {
     }
     async fn run_command(&self, name: &str) -> Result<()> {
         self.commands.lock().unwrap().push(name.to_string());
+        let nth = {
+            let mut n = self.presses.lock().unwrap();
+            *n += 1;
+            *n
+        };
         if let Some((dref, delta)) = self.command_steps.lock().unwrap().get(name) {
-            *self
-                .reads
-                .lock()
-                .unwrap()
-                .entry(dref.clone())
-                .or_insert(0.0) += delta;
+            if self.late_presses.lock().unwrap().contains(&nth) {
+                self.held
+                    .lock()
+                    .unwrap()
+                    .push((dref.clone(), *delta, false));
+            } else {
+                *self
+                    .reads
+                    .lock()
+                    .unwrap()
+                    .entry(dref.clone())
+                    .or_insert(0.0) += delta;
+            }
         }
         Ok(())
     }
