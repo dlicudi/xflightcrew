@@ -764,7 +764,16 @@ impl Tool for HoldSpeed {
             if crate::procedure::ACTIVE.load(Ordering::Relaxed) {
                 return Ok(match a.knots {
                     Some(k) => {
-                        let floor = crate::aircraft::speed_floor_kts();
+                        // The floor for the configuration flown: the clean
+                        // 167 refused 120 and 140 on a 737 with the flaps
+                        // out (LEMG, 2026-09-26).
+                        let flaps = ctx
+                            .xplane
+                            .get_float(crate::datarefs::FLAP_RATIO)
+                            .await
+                            .unwrap_or(0.0);
+                        let floor = crate::aircraft::config_floor_kts(flaps)
+                            .or(crate::aircraft::speed_floor_kts());
                         let ceiling = crate::aircraft::speed_ceiling_kts();
                         let want = crate::aircraft::floored_target(k, floor);
                         let want = ceiling.map_or(want, |c| want.min(c));

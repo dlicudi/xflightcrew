@@ -2884,6 +2884,11 @@ mod tests {
                 "MARGIN: over the airframe's own .acf gear-warning speed",
             ),
             (
+                "procedure",
+                "FLAPS_ON_SPEED_MARGIN_KTS",
+                "MARGIN: over the airframe's own clean floor",
+            ),
+            (
                 "autotakeoff",
                 "TRIM_SCALE_FROM_KTS",
                 "PHYSICS: where a rudder is aerodynamic, on any airframe",

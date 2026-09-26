@@ -511,6 +511,9 @@ pub fn minimums_within_cruise(
     mins.into_iter().partition(|m| m.min_ft <= cruise_ft + MINIMUM_MET_TOL_FT)
 }
 
+/// Within this of the clean floor, the approach's flaps come out on speed.
+const FLAPS_ON_SPEED_MARGIN_KTS: f64 = 15.0;
+
 /// A commanded rate as the VS wheel sets it: the nearest 100 fpm. Pure.
 pub fn vs_dial_fpm(vs: f64) -> f64 {
     (vs / 100.0).round() * 100.0
@@ -2072,7 +2075,17 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, plan: Pla
                         .as_ref()
                         .map(|f| crate::nav::haversine_nm(lat, lon, f.lat, f.lon));
                     let err = map_path(&legs[idx], d, gs * MS_TO_KTS).map_or(0.0, |(p, _)| alt_ft - p);
-                    crate::autoland::flap_schedule(d.unwrap_or(9.9), err)
+                    let by_distance = crate::autoland::flap_schedule(d.unwrap_or(9.9), err);
+                    // And FLAPS ON SPEED: slowing toward the approach speed
+                    // under the clean floor with the flaps up is a stall on
+                    // a jet. By distance alone the 737 went from 217 to 150
+                    // kt clean from 12 nm out and earned "Airspeed! Lower the
+                    // nose" at LEMG 13 (2026-09-26). Near the clean floor,
+                    // every detent the placards allow (`flap_within_limits`
+                    // below steps them out as the speed comes down).
+                    let near_clean_floor = crate::aircraft::speed_floor_kts()
+                        .is_some_and(|f| ias < f + FLAPS_ON_SPEED_MARGIN_KTS);
+                    if near_clean_floor { 1.0 } else { by_distance }
                 };
                 let flap = crate::autoland::flap_within_limits(wanted, ias, &crate::aircraft::flap_limits());
                 if last_flap.is_none_or(|f: f64| (f - flap).abs() > 0.01)
