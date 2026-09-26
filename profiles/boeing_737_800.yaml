@@ -54,6 +54,11 @@ flare_power:
   # idle at the wheels. Keyed on the sink, it cut to idle in the float at
   # LEMG 13 and the 737 arrived at -859 fpm, 2.4 g (2026-09-26).
   retard_below_ft: 20.0
+  # ...and not until the flare has the sink inside 185 fpm: at LEMG 12
+  # (2026-09-26) it was still sinking 300 at 20 ft, the retard took the
+  # lever 0.44 to 0.16, and the speed it cost came back as sink at the
+  # wheels (407). A lever still up at the wheels is the rollout's to close.
+  retard_inside_fpm: 185.0
 # The flare's elevator: the default 0.35 of pull ran out with the nose at 1
 # degree at LEMG 13 (a 737 lands at 4 to 6, strikes its tail near 11).
 flare_elevator:
@@ -66,31 +71,37 @@ flare_elevator:
   max_push: 0.0
   # Exponential flare: the sink target falls with the height, so the
   # arrest keeps descending instead of floating. The flat -175 floated LEMG
-  # 13 from 36 to 19 ft (2026-09-26). 5 s, taken 3.5 s ahead by the model
-  # below: 4 s at the present height asked -335 at 10 ft and the pull
-  # settled there (-409 and -390 at the wheels).
-  tau_s: 5.0
+  # 13 from 36 to 19 ft (2026-09-26). 6 s, to 150 fpm at the wheels (the
+  # model below), taken at the height predicted at the model's horizon.
+  tau_s: 6.0
   # A bounce eases the pull, never drops it: dropped to neutral, the nose
   # came down and the 737 met the runway again (LEMG circuit, 2026-09-26).
   balloon_ease_per_s: 0.15
-  # How the sink answers the column with the servos out, fitted to the six
-  # LEMG 13 flares of 2026-09-26 (the elevator written against the sink
-  # that followed, 36 fpm rms): a STANDING change of sink per unit of pull
-  # (0.23 held -350, 0.084 held -590; per flare 2,250 to 3,080), two 1 s
-  # lags, 1.8 s of dead time. Declared, the whole arrest from the roundout
-  # gate is flown on this model (autoland::FlareModel) instead of the
-  # tracker above; gain, trim and ratchet are then unused. Through the
-  # fitted plant from all six recorded gates, with the plant's gain from
-  # 2,250 to 3,080 and its delay 0.3 s either side: 361 fpm at worst,
-  # 302 to 326 as fitted, no balloon (lemg_737_flare_tests in autoland.rs).
-  # VERIFY: blackbox autoland ticks carry flare_target, flare_ahead and
-  # flare_unexplained from the arrest_hands event to the wheels.
+  # How the sink answers the column with the servos out, fitted to the
+  # seven LEMG flares of 2026-09-26 (six on 13, one on 12; the elevator
+  # written against the sink that followed, 35 fpm rms): 4,970 fpm of
+  # standing sink change per unit of pull through lags of 0.84 and 3.1 s
+  # after 1.35 s of dead time, and the aircraft's own nose-down near the
+  # runway, 405 fpm of sink at the wheels growing from 43 ft. Per flare
+  # the gain ran 4,020 to 6,430 and the dead time 1.16 to 2.17 s; the LEMG
+  # 12 flare was the weak slow end (4,021, 1.77). Declared, the whole
+  # arrest from the roundout gate is flown on this model (autoland::
+  # FlareModel, a prediction to the horizon) instead of the tracker above;
+  # gain, trim and ratchet are then unused. The law's gain is 3,500 on
+  # purpose, under every flare's own: it pulls for the weakest.
+  # Replayed from all seven recorded gates through each flare's own plant
+  # (49 landings): 181 to 310 fpm, no balloon; LEMG 12's own gate and plant
+  # 248 (the first model law, 408 there, flew 407). VERIFY: autoland ticks
+  # carry flare_target, flare_ahead, flare_unexplained to the wheels.
   model:
-    fpm_per_elevator: 2600.0
-    lag_s: 1.0
-    dead_s: 1.8
-    lead_s: 3.5
-    settle_s: 0.6
+    fpm_per_elevator: 3500.0
+    lag_s: 0.84
+    lag2_s: 3.1
+    dead_s: 1.5
+    ground_fpm: 405.0
+    ground_ft: 43.0
+    horizon_s: 2.5
+    touchdown_fpm: 150.0
     observer_s: 0.3
 # How the landing arrest leads THIS autopilot. The 172's law (gain 2, dial
 # cap +300, no trend term) was fitted to a first-order 4.5 s lag; this
