@@ -272,7 +272,7 @@ impl Pace {
     ///
     /// The bend caps read the paint and nothing else: they answer "how sharp is
     /// what's coming", never "are we on it". Between them and `join_cap_kts`
-    /// there was a hole — the join cap stops at the `join_done` latch (then 15 m,
+    /// there was a hole: the join cap stops at the `join_done` latch (then 15 m,
     /// 45 deg), which is loose enough to fire in the middle of a capture that
     /// has not happened, and past it the schedule went straight back to the
     /// open-taxiway pace. Southampton, 2026-07-30: the SF50 latched joined at
