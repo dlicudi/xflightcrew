@@ -978,6 +978,9 @@ pub fn run_autoland_scoped(
             // ...or, where the airframe declares its elevator's response,
             // the arrest flown on that model (`FlareModel`, the 737).
             let mut flare_model = FlareModel::from_profile(crate::aircraft::flare_elevator());
+            // The lever the loop last commanded, for the tick record (the
+            // flare's table had the elevator and the sink but not the power).
+            let mut last_lever: Option<f64> = None;
             // Last tick was the flare: a balloon stays in it (`hold_flare`).
             let mut flaring = false;
             let mut pitch_yielded = false;
@@ -1971,6 +1974,7 @@ pub fn run_autoland_scoped(
                     "flare_target": model_out.map(|o| o.target_fpm),
                     "flare_ahead": model_out.map(|o| o.ahead_ft),
                     "flare_unexplained": model_out.map(|o| o.unexplained_fpm),
+                    "lever": last_lever,
                     "phi": phi_r.as_ref().ok().copied(),
                     // The arrest's lateral: the track it closes on, the
                     // sideways velocity and the bank it asked for.
@@ -2273,6 +2277,9 @@ pub fn run_autoland_scoped(
                     if let Some(t) = thr {
                         approach_thr = Some(t);
                     }
+                }
+                if thr.is_some() {
+                    last_lever = thr;
                 }
                 let throttle_written = match thr {
                     Some(throttle) => Some(xp.set_float(&throttle_dref(), throttle).await.is_ok()),
@@ -3314,7 +3321,10 @@ impl FlarePower {
             .map_or(0.0, |old| ((sink - old) / dt).max(0.0));
         self.previous_sink = Some(sink);
         self.inside |= cfg.retard_inside_fpm.is_some_and(|f| sink <= f);
-        let waiting = cfg.retard_inside_fpm.is_some() && !self.inside;
+        let floor_reached = cfg
+            .retard_by_ft
+            .is_some_and(|h| radio_ft.is_finite() && radio_ft <= h);
+        let waiting = cfg.retard_inside_fpm.is_some() && !self.inside && !floor_reached;
         // First flare tick preserves the observed approach power. Readback may
         // lag a write, but it must never restart the ramp or increase power.
         let current = measured
@@ -3329,7 +3339,12 @@ impl FlarePower {
             Some(h) if radio_ft.is_finite() && radio_ft > h => 0.0,
             Some(_) if radio_ft.is_finite() => {
                 let to_touch_s = radio_ft.max(0.0) / sink.max(100.0) * 60.0;
-                (current / to_touch_s.max(0.5)).clamp(RETARD_MIN_PER_S, cfg.reduction_per_second * 4.0)
+                let fastest = cfg
+                    .retard_max_per_s
+                    .filter(|r| r.is_finite() && *r > 0.0)
+                    .unwrap_or(cfg.reduction_per_second * 4.0)
+                    .max(RETARD_MIN_PER_S);
+                (current / to_touch_s.max(0.5)).clamp(RETARD_MIN_PER_S, fastest)
             }
             _ => cfg.reduction_per_second,
         };
@@ -5431,6 +5446,8 @@ mod tests {
             lead_seconds: 1.0,
             retard_below_ft: Some(20.0),
             retard_inside_fpm: None,
+            retard_by_ft: None,
+            retard_max_per_s: None,
         };
         let mut power = FlarePower::default();
         // First tick keeps the approach power; at 36 ft in a float, still held.
@@ -8358,8 +8375,10 @@ mod lemg_737_flare_tests {
     }
 
     /// 16:29, 17:04 (its FIRST contact; the scored 278 is after a bounce),
-    /// 17:17, 17:25, 17:32, 17:43Z on 13, and 18:59Z on 12.
-    const GATES: [Gate; 7] = [
+    /// 17:17, 17:25, 17:32, 17:43Z on 13, 18:59Z on 12, and 20:03Z on 13
+    /// (the first prediction flare: 277 at the wheels, the lever never
+    /// retarded).
+    const GATES: [Gate; 8] = [
         Gate {
             radio_ft: 79.2,
             vvi_fpm: -727.0,
@@ -8423,8 +8442,18 @@ mod lemg_737_flare_tests {
             trimmed_sink_fpm: -496.0,
             flown_fpm: -407.0,
         },
+        Gate {
+            radio_ft: 79.2,
+            vvi_fpm: -797.0,
+            trend_fpm_s: -2.0,
+            ias_kts: 143.6,
+            throttle: 0.304,
+            trimmed_sink_fpm: -779.0,
+            flown_fpm: -277.0,
+        },
     ];
     const LEMG_12: usize = 6;
+    const PREDICTION_FLOWN: usize = 7;
 
     #[derive(Clone, Copy, Debug)]
     struct Fit {
@@ -8437,7 +8466,7 @@ mod lemg_737_flare_tests {
     const GROUND_FT: f64 = 43.2;
     const FPM_PER_KT: f64 = 62.7;
     /// Each flare's own gain and dead time, in the order of [`GATES`].
-    const PLANTS: [Fit; 7] = [
+    const PLANTS: [Fit; 8] = [
         Fit {
             fpm_per_elevator: 4814.0,
             dead_s: 1.37,
@@ -8465,6 +8494,10 @@ mod lemg_737_flare_tests {
         Fit {
             fpm_per_elevator: 4021.0,
             dead_s: 1.77,
+        },
+        Fit {
+            fpm_per_elevator: 4099.0,
+            dead_s: 1.63,
         },
     ];
 
@@ -8725,11 +8758,22 @@ mod lemg_737_flare_tests {
     /// `flare_power` below it (the model's) or LEMG 12's height-only retard
     /// (the first law's), the elevator reaching the aircraft a dead time
     /// after it is written, the speed on the fitted speed model.
-    fn fly(g: Gate, fit: Fit, mut law: Law) -> Landing {
+    fn fly(g: Gate, fit: Fit, law: Law) -> Landing {
         let mut power_cfg = profile_737().flare_power.expect("the 737 retards");
         if matches!(law, Law::First(_)) {
             power_cfg.retard_inside_fpm = None;
+            power_cfg.retard_by_ft = None;
+            power_cfg.retard_max_per_s = None;
         }
+        fly_with(g, fit, law, power_cfg)
+    }
+
+    fn fly_with(
+        g: Gate,
+        fit: Fit,
+        mut law: Law,
+        power_cfg: crate::aircraft::FlarePowerProfile,
+    ) -> Landing {
         let mut power = FlarePower::default();
         let mut p = Plant::at(g, fit);
         let (tick, dt) = (0.22, 0.01);
@@ -8842,6 +8886,20 @@ mod lemg_737_flare_tests {
             "LEMG 12 on the new law: {:.0}",
             l.sink_fpm
         );
+        // The prediction flare as flown (277 at the wheels, 0.30 of lever):
+        // with the retard's 10 ft floor the lever is coming off at the
+        // wheels and the sink it rebuilds is small.
+        let l = fly(
+            GATES[PREDICTION_FLOWN],
+            PLANTS[PREDICTION_FLOWN],
+            Law::Model(model()),
+        );
+        assert!(l.sink_fpm < 300.0, "{:.0}", l.sink_fpm);
+        assert!(
+            l.lever_at_wheels < 0.2 && l.lever_at_wheels > 0.0,
+            "walking off, not cut: {:.2}",
+            l.lever_at_wheels
+        );
     }
 
     /// The retard waits for the flare: LEMG 12 was still sinking 300 at
@@ -8855,13 +8913,21 @@ mod lemg_737_flare_tests {
         let mut power = FlarePower::default();
         assert_eq!(power.step(cfg, 0.44, -300.0, 0.22, 20.0), Some(0.44));
         assert_eq!(power.step(cfg, 0.44, -300.0, 0.22, 17.0), Some(0.44));
-        assert_eq!(power.step(cfg, 0.44, -295.0, 0.22, 10.0), Some(0.44));
+        assert_eq!(power.step(cfg, 0.44, -295.0, 0.22, 11.0), Some(0.44));
         // Inside: the ramp starts, and a sink that grows again after it
         // does not stop it (the flare has been inside once).
         let a = power.step(cfg, 0.44, -180.0, 0.22, 8.0).unwrap();
         assert!(a < 0.44, "{a}");
         let b = power.step(cfg, 0.44, -200.0, 0.22, 7.0).unwrap();
         assert!(b < a, "{a} -> {b}");
+        // Never inside (LEMG 13, the first prediction flare: 0.30 of lever
+        // at the wheels): by 10 ft it goes anyway, at no more than 0.08 a
+        // second.
+        assert_eq!(cfg.retard_by_ft, Some(10.0));
+        let mut power = FlarePower::default();
+        assert_eq!(power.step(cfg, 0.30, -270.0, 0.22, 12.0), Some(0.30));
+        let c = power.step(cfg, 0.30, -270.0, 0.22, 10.0).unwrap();
+        assert!(c < 0.30 && c >= 0.30 - 0.08 * 0.22 - 1e-9, "{c}");
         // Undeclared (every other airframe): by height alone.
         let old = crate::aircraft::FlarePowerProfile {
             retard_inside_fpm: None,

@@ -35,6 +35,16 @@ pub struct FlarePowerProfile {
     /// `None` retards by height alone.
     #[serde(default)]
     pub retard_inside_fpm: Option<f64>,
+    /// ...but by this height the retard starts whatever the sink (ft): at
+    /// LEMG 13 (2026-09-26, the first prediction flare) the sink never came
+    /// inside 185 and the 737 touched down at 138 kt with 0.30 of lever.
+    #[serde(default)]
+    pub retard_by_ft: Option<f64>,
+    /// The fastest the height retard walks the lever, per second (absent:
+    /// four times `reduction_per_second`). Slower, the thrust leaving does
+    /// not rebuild the sink in the last second.
+    #[serde(default)]
+    pub retard_max_per_s: Option<f64>,
 }
 
 /// How the landing arrest's vertical-speed dial leads THIS autopilot's lag
