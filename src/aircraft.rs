@@ -2884,6 +2884,16 @@ mod tests {
                 "MARGIN: over the airframe's own .acf gear-warning speed",
             ),
             (
+                "autotakeoff",
+                "TRIM_SCALE_FROM_KTS",
+                "PHYSICS: where a rudder is aerodynamic, on any airframe",
+            ),
+            (
+                "autotakeoff",
+                "REJECT_HANDOVER_KTS",
+                "STANDSTILL-ISH: a rejected roll slow enough to hand over",
+            ),
+            (
                 "speedhold",
                 "BREAKAWAY_BELOW_KTS",
                 "STANDSTILL: the wheels are not turning, on any airframe",

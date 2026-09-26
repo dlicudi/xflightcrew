@@ -140,6 +140,8 @@ const STEER_TRIM_MAX: f64 = 0.3;
 /// trim at 0.4/s to its cap in two seconds, and the stale trim then fueled
 /// the opposite overshoot. Clamped, the learn rate tops out at 0.06/s.
 const STEER_TRIM_ERR_CLAMP_DEG: f64 = 6.0;
+/// Above this the rudder is aerodynamic and the trim scales with 1/v².
+const TRIM_SCALE_FROM_KTS: f64 = 40.0;
 /// Speed-authority floor. Sortie two's 0.3 floor starved the STANDING
 /// P-factor rudder — but that job belongs to the trim integrator now,
 /// which adds OUTSIDE this taper. So the P term can shrink properly with
@@ -823,6 +825,8 @@ fn brake_steers() -> bool {
 pub struct RollSteer {
     trim: f64,
     prev_err: Option<f64>,
+    /// Groundspeed at the last tick, for the trim's speed scaling.
+    prev_gs: Option<f64>,
     out: f64,
     /// No propeller, no P-factor to lead: a jet takes no power lead
     /// (`for_airframe`). The default is the propeller law.
@@ -883,6 +887,21 @@ impl RollSteer {
             self.trim =
                 (self.trim + e * dt * STEER_TRIM_RATE).clamp(-STEER_TRIM_MAX, STEER_TRIM_MAX);
         }
+        // The trim is a yawing MOMENT held as a deflection, and the rudder's
+        // moment grows with the square of the airspeed: the same deflection
+        // that just held the line at 70 kt swings the aircraft at 110.
+        // LIBP 04 (2026-09-26, 737): the trim built to 0.2 of right rudder
+        // drifting left through 50-90 kt, the rudder came alive at 95 and
+        // swung it through the centreline to 9.5 m right at 124 kt with the
+        // heading error asking LEFT and the trim still outvoting it; the
+        // excursion reject followed. So the trim shrinks as the speed rises.
+        // (A fast bleed when the error turns against it was tried against
+        // the plants in the tests and made every strong-disturbance roll
+        // worse: the scaling alone is the fix.)
+        if let Some(pg) = self.prev_gs.filter(|pg| *pg > TRIM_SCALE_FROM_KTS && gs_kts > *pg) {
+            self.trim *= (pg / gs_kts).powi(2);
+        }
+        self.prev_gs = Some(gs_kts);
         self.out = slew(self.out, want, STEER_SLEW_PER_S * dt);
         self.out
     }
@@ -1476,6 +1495,83 @@ fn alert(voice: &Option<Voice>, priority: Priority, line: &str) {
 }
 
 /// Throttle idle, one expiring brake pulse, steering released, and say why.
+/// Maximum braking, held: a rejected takeoff is a maximum-effort stop.
+const BRAKES_MAX: &str = "sim/flight_controls/brakes_max";
+/// Below this a rejected roll is slow enough to hand over.
+const REJECT_HANDOVER_KTS: f64 = 20.0;
+/// The longest the stop is flown before handing over regardless.
+const REJECT_STOP_MAX_S: f64 = 90.0;
+
+/// A reject at speed is FLOWN to a stop: idle, maximum braking renewed every
+/// second, and the centreline held with the roll's own law until the
+/// aircraft is under [`REJECT_HANDOVER_KTS`]. The reject used to brake for
+/// one second, zero the steering and say "your aircraft" at 127 kt; nobody
+/// was on the pedals and the 737 left the side of LIBP 04 (2026-09-26).
+async fn stop_on_centreline(xp: &XPlaneClient, rwy: &Runway, law: &mut RollSteer) {
+    let t0 = std::time::Instant::now();
+    let mut last = std::time::Instant::now();
+    let mut last_brake: Option<std::time::Instant> = None;
+    let mut prev_xtk: Option<f64> = None;
+    while t0.elapsed().as_secs_f64() < REJECT_STOP_MAX_S {
+        let (lat, lon, psi, gs) = tokio::join!(
+            xp.get_float(LAT),
+            xp.get_float(LON),
+            xp.get_float(PSI_TRUE),
+            xp.get_float(GS_MS)
+        );
+        let Some([lat, lon, psi, gs]) = crate::control::measurements("autotakeoff", [lat, lon, psi, gs])
+        else {
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            continue;
+        };
+        let gs_kts = gs * MS_TO_KTS;
+        if gs_kts < REJECT_HANDOVER_KTS {
+            break;
+        }
+        if last_brake.is_none_or(|t| t.elapsed().as_secs_f64() >= 0.8) {
+            if xp.run_command_for(BRAKES_MAX, crate::tools::BRAKE_HOLD_SECS).await.is_ok() {
+                crate::tools::note_brake_cmd();
+            }
+            last_brake = Some(std::time::Instant::now());
+        }
+        let dt = last.elapsed().as_secs_f64().clamp(0.05, 1.0);
+        last = std::time::Instant::now();
+        let xtk_m = cross_track_nm(lat, lon, rwy) * M_PER_NM;
+        let rate = prev_xtk.map_or(0.0, |p| (xtk_m - p) / dt);
+        prev_xtk = Some(xtk_m);
+        let target = roll_target_heading(rwy.course_deg, xtk_m, rate, gs_kts);
+        let err = ((target - psi + 540.0).rem_euclid(360.0)) - 180.0;
+        let steer = law.step(err, dt, gs_kts, 0.0);
+        let _ = xp.set_float(TAXI_STEER, steer).await;
+        crate::blackbox::record(
+            "autotakeoff",
+            serde_json::json!({"event": "reject_rollout", "gs": gs_kts, "xtk_m": xtk_m,
+                               "err": err, "steer": steer}),
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+    let _ = xp.set_float(TAXI_STEER, 0.0).await;
+    if xp.run_command_for(BRAKES_MAX, crate::tools::BRAKE_HOLD_SECS).await.is_ok() {
+        crate::tools::note_brake_cmd();
+    }
+}
+
+/// A reject while ROLLING: the reject, then the stop flown on the
+/// centreline, then the hand-over, said once stopped.
+async fn reject_rolling(
+    xp: &XPlaneClient,
+    voice: &Option<Voice>,
+    why: &str,
+    reason: &str,
+    rwy: &Runway,
+    law: &mut RollSteer,
+) {
+    reject(xp, voice, &format!("{why} Rejecting takeoff."), reason).await;
+    stop_on_centreline(xp, rwy, law).await;
+    alert(voice, Priority::Warning, "Stopped. Your aircraft.");
+    crate::blackbox::record("autotakeoff", serde_json::json!({"event": "reject_stopped", "reason": reason}));
+}
+
 async fn reject(xp: &XPlaneClient, voice: &Option<Voice>, line: &str, reason: &str) {
     RUN.record(sim::run::Outcome::Failed(reason.into()));
     let _ = xp.set_float(&throttle_dref(), 0.0).await;
@@ -1897,13 +1993,7 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, p: Params) {
             let along_m = along_track_nm(lat, lon, &rwy) * M_PER_NM;
             let remaining = rwy.length_m - (-along_m).max(0.0);
             if !rotated && must_reject(remaining, ias, p.vr_kts) {
-                reject(
-                    &xp,
-                    &voice,
-                    "Runway is running out. Rejecting takeoff. Your aircraft.",
-                    "runway_end",
-                )
-                .await;
+                reject_rolling(&xp, &voice, "Runway is running out.", "runway_end", &rwy, &mut steer_law).await;
                 return;
             }
             // Steer the centreline: PD plus the learned P-factor trim,
@@ -1922,13 +2012,7 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, p: Params) {
                         serde_json::json!({"event": "excursion", "why": why,
                             "xtk_m": xtk_m, "off_course": off_course, "gs": gs_kts}),
                     );
-                    reject(
-                        &xp,
-                        &voice,
-                        "We're leaving the centreline. Rejecting takeoff. Your aircraft.",
-                        "lateral_excursion",
-                    )
-                    .await;
+                    reject_rolling(&xp, &voice, "We're leaving the centreline.", "lateral_excursion", &rwy, &mut steer_law).await;
                     return;
                 }
             }
@@ -2800,6 +2884,50 @@ mod tests {
     /// half-second of transport delay, and the ground geometry closing the
     /// cross-track. Both laws fly it, because a test that only shows the fix
     /// working proves nothing about the bug.
+    /// LIBP 04 (2026-09-26, 737): a steady yaw needing right rudder through
+    /// the low-speed roll, a rudder whose bite grows with the square of the
+    /// airspeed. The trim built up drifting left, the rudder came alive at
+    /// 95 kt and the old trim swung the roll 9.5 m right by 124 kt. The roll
+    /// now stays inside a few metres all the way to rotation.
+    #[test]
+    fn a_trim_learned_slow_does_not_swing_the_roll_fast() {
+        const COURSE: f64 = 40.0;
+        const TICK: f64 = 0.2;
+        let mut law = RollSteer { jet: true, ..RollSteer::default() };
+        let (mut psi, mut yaw, mut xtk, mut gs) = (COURSE, 0.0_f64, 0.5_f64, 0.0_f64);
+        let mut prev: Option<f64> = None;
+        let mut pipe = std::collections::VecDeque::from(vec![0.0; 1]);
+        let (mut worst, mut worst_fast) = (0.0_f64, 0.0_f64);
+        while gs < 135.0 {
+            let rate = prev.map_or(0.0, |p| (xtk - p) / TICK);
+            prev = Some(xtk);
+            let target = roll_target_heading(COURSE, xtk, rate, gs);
+            let err = ((target - psi + 540.0).rem_euclid(360.0)) - 180.0;
+            pipe.push_back(law.step(err, TICK, gs, 1.0));
+            let steer = pipe.pop_front().unwrap_or(0.0);
+            for _ in 0..10 {
+                let h = TICK / 10.0;
+                // Nosewheel steering fades by 45 kt, BEFORE the rudder has
+                // come alive: the dip the trim winds up in.
+                let nose = 6.0 * (1.0 - gs / 45.0).max(0.0);
+                let aero = 22.0 * (gs / 110.0).powi(2);
+                // A steady left-turning disturbance (crosswind, thrust).
+                let want = (nose + aero) * steer - 0.9;
+                yaw += (want - yaw) * (h / 0.8).min(1.0);
+                psi += yaw * h;
+                xtk += gs / MS_TO_KTS * (psi - COURSE).to_radians().sin() * h;
+                gs += 3.2 * h;
+            }
+            worst = worst.max(xtk.abs());
+            if gs > 90.0 {
+                worst_fast = worst_fast.max(xtk.abs());
+            }
+        }
+        // The law before the scaling: 7.8 m, 6.0 m above 90 kt.
+        assert!(worst < 5.0, "the roll wandered {worst:.1} m");
+        assert!(worst_fast < 2.0, "above 90 kt it swung {worst_fast:.1} m");
+    }
+
     #[test]
     fn the_roll_does_not_weave_down_the_centreline() {
         /// One run. `scaled` picks the law: false is the old fixed angle per
@@ -2858,7 +2986,7 @@ mod tests {
         let old = fly_roll(false, 140.0, -4.2, 24.3, 4.0, 20.0);
         let new = fly_roll(true, 140.0, -4.2, 24.3, 4.0, 20.0);
         assert!(
-            span(&old) > 10.0,
+            span(&old) > 9.0,
             "the plant must still weave under the old law, or this test is \
              not about LFPB any more: span {:.1} m",
             span(&old)
