@@ -73,9 +73,14 @@ const BEHIND_DEG: f64 = 100.0;
 /// no longer pushing off a stand but taxiing backwards down an apron.
 const MIN_BACK_M: f64 = 12.0;
 const MAX_BACK_M: f64 = 120.0;
-/// Heading deadband — inside it the tug pushes straight. Chasing the last few
-/// degrees costs metres of apron and the taxi's own steering owns them.
-const DEAD_DEG: f64 = 6.0;
+/// Heading band inside which the tug pushes STRAIGHT back. A swing pattern
+/// is a whole manoeuvre of about 90 degrees whatever was wanted, so asked for
+/// 45 it overshoots by as much as it was meant to fix, and it swings the
+/// tail sideways across whatever is beside the stand: LIBP (2026-09-26)
+/// asked "tail left" for a 46-degree change and swung a 737 toward the
+/// buildings. Under 60 degrees the push goes straight back and the taxi
+/// turns the rest under its own steering, which it does from any angle.
+const DEAD_DEG: f64 = 60.0;
 /// Close enough to "pointing down the lane" to let the tug go.
 const ALIGN_DEG: f64 = 20.0;
 /// What ONE pattern delivers. X-Plane's commands are whole manoeuvres named
@@ -606,10 +611,13 @@ async fn run_inner(
     else {
         return Err("no_position".into());
     };
-    // Only where the drawn pavement covers the stand's surroundings: an
-    // undrawn push lane is not grass (`party_line::pavement_covers`).
-    let started_on_pavement = crate::party_line::on_pavement(start_lat, start_lon)
-        .filter(|_| crate::party_line::pavement_covers(start_lat, start_lon));
+    // Trusted wherever the stand itself is drawn. A "coverage" gate (most
+    // nearby taxi nodes inside the polygons) was tried at LIBP, where 25 of
+    // 66 nodes are: it switched the guard off, and the tug's straight leg
+    // ran a 737 into the buildings behind the stand the guard had stopped
+    // it short of one flight earlier (2026-09-26). An edge in the data is an
+    // edge: the taxi turns the aircraft from there.
+    let started_on_pavement = crate::party_line::on_pavement(start_lat, start_lon);
     // The MANOEUVRE, picked once and up front — X-Plane's three pushback
     // commands are not a steering channel, they are whole-push patterns the
     // tug executes and finishes ("Nose 90 left" / "Straight back" / "Nose 90
@@ -966,6 +974,11 @@ async fn run_inner(
                 break;
             }
         }
+        // A straight push never aligns the nose (by design: the taxi turns
+        // it), so it ends at the planned distance, not 25 m past it.
+        if cmd == Steer::Straight && back_m >= plan.back_m {
+            break;
+        }
         if done(back_m, err, plan) {
             if swing_in_progress(attached, err_then, err) {
                 // Far enough by the numbers, but the tug is mid-swing: it
@@ -1270,8 +1283,8 @@ mod tests {
         assert_eq!(learn_sense(1, 20.0, 20.0 + SENSE_TOL_DEG), 1);
         assert_eq!(learn_sense(-1, 20.0, 60.0), 1);
         // And the learned sense is what steers afterwards.
-        assert_eq!(steer_for(20.0, 1), Steer::Right);
-        assert_eq!(steer_for(20.0, -1), Steer::Left);
+        assert_eq!(steer_for(80.0, 1), Steer::Right);
+        assert_eq!(steer_for(80.0, -1), Steer::Left);
     }
 
     /// The lesson is only worth anything against a MOVING aircraft. Luton
@@ -1454,7 +1467,8 @@ mod tests {
         assert_eq!(steer_for(0.0, 1), Steer::Straight);
         assert_eq!(steer_for(DEAD_DEG - 0.1, 1), Steer::Straight);
         assert_eq!(steer_for(-(DEAD_DEG - 0.1), 1), Steer::Straight);
-        assert_eq!(steer_for(-12.0, 1), Steer::Left);
+        assert_eq!(steer_for(-46.0, 1), Steer::Straight, "LIBP: straight back, the taxi turns");
+        assert_eq!(steer_for(-70.0, 1), Steer::Left);
     }
 
     /// The push ends when it's back far enough AND aligned — but it never
