@@ -2160,6 +2160,7 @@ pub fn run_autoland_scoped(
                         radio_ft,
                         target - ias,
                         crate::aircraft::approach_thrust_min(),
+                        last_flap.is_some_and(|f| f >= LANDING_FLAP_RATIO),
                     );
                     thr_now.map(|throttle| (throttle + adj).clamp(min_thr, 1.0))
                 };
@@ -2938,13 +2939,21 @@ const TERRAIN_FLOOR_AGL_FT: f64 = 500.0;
 
 /// Fast by more than this on final and the speed law may still idle a jet.
 const APPROACH_FAST_KTS: f64 = 10.0;
+/// The flap ratio that is the landing configuration (the schedule's full).
+const LANDING_FLAP_RATIO: f64 = 0.999;
 /// The lever's idle stop in the speed law.
 const IDLE_THROTTLE: f64 = 0.1;
 
 /// The least the speed law may pull the lever to. On FINAL, not more than
 /// `APPROACH_FAST_KTS` fast, it is the airframe's approach thrust floor
 /// (jets fly the approach on thrust: the 737 idled its last mile and touched
-/// down 17 kt under Vref, LFLL 2026-09-17). In a REPOSITION below the
+/// down 17 kt under Vref, LFLL 2026-09-17) - but only in the LANDING
+/// configuration (`landing_flaps`), the one the floor was measured in (0.4
+/// at Vref with flaps 40). With flaps 10 the same 0.3 is more than the
+/// path needs: from the FAP to 3 nm every LEMG 13 final of 2026-09-26 sat
+/// at 161 to 164 kt, the lever flipping 0.1 / 0.3 on the ten-knot edge of
+/// the flaps-10 floor (152), so the landing flaps came out late and the
+/// final was still 155 to 158 kt through 800 ft. In a REPOSITION below the
 /// terrain floor it is full power: excess speed there is spent on the
 /// climb, never on the lever ("land the aircraft" from 140 ft at 237 kt
 /// pulled the throttle to idle for its 179 kt target and the aircraft
@@ -2955,12 +2964,15 @@ pub fn approach_power_floor(
     radio_alt_ft: f64,
     err_kts: f64,
     approach_thrust_min: Option<f64>,
+    landing_flaps: bool,
 ) -> f64 {
     match phase {
         ApproachPhase::Intercept if radio_alt_ft < TERRAIN_FLOOR_AGL_FT => 1.0,
-        ApproachPhase::Final if err_kts > -APPROACH_FAST_KTS => approach_thrust_min
-            .unwrap_or(IDLE_THROTTLE)
-            .max(IDLE_THROTTLE),
+        ApproachPhase::Final if err_kts > -APPROACH_FAST_KTS && landing_flaps => {
+            approach_thrust_min
+                .unwrap_or(IDLE_THROTTLE)
+                .max(IDLE_THROTTLE)
+        }
         _ => IDLE_THROTTLE,
     }
 }
@@ -7606,19 +7618,49 @@ mod approach_power_floor_tests {
     /// reposition under 500 ft is full power whatever the speed.
     #[test]
     fn the_lever_floor_follows_the_phase_and_the_airframe() {
-        assert_eq!(approach_power_floor(Final, 300.0, 0.0, Some(0.3)), 0.3);
-        assert_eq!(approach_power_floor(Final, 300.0, -6.0, Some(0.3)), 0.3);
-        assert_eq!(approach_power_floor(Final, 300.0, -20.0, Some(0.3)), 0.1);
-        assert_eq!(approach_power_floor(Final, 300.0, 0.0, None), 0.1);
         assert_eq!(
-            approach_power_floor(Intercept, 140.0, -58.0, Some(0.3)),
+            approach_power_floor(Final, 300.0, 0.0, Some(0.3), true),
+            0.3
+        );
+        assert_eq!(
+            approach_power_floor(Final, 300.0, -6.0, Some(0.3), true),
+            0.3
+        );
+        assert_eq!(
+            approach_power_floor(Final, 300.0, -20.0, Some(0.3), true),
+            0.1
+        );
+        assert_eq!(approach_power_floor(Final, 300.0, 0.0, None, true), 0.1);
+        assert_eq!(
+            approach_power_floor(Intercept, 140.0, -58.0, Some(0.3), false),
             1.0
         );
         assert_eq!(
-            approach_power_floor(Intercept, 1500.0, -58.0, Some(0.3)),
+            approach_power_floor(Intercept, 1500.0, -58.0, Some(0.3), false),
             0.1
         );
-        assert_eq!(approach_power_floor(Flare, 20.0, 0.0, Some(0.3)), 0.1);
+        assert_eq!(approach_power_floor(Flare, 20.0, 0.0, Some(0.3), true), 0.1);
+    }
+
+    /// LEMG 13, 2026-09-26, every final: flaps 10 out from the FAP, the
+    /// target floored to that configuration's 152 kt, and the 737 sat at 161
+    /// to 164 kt for a minute with the lever flipping 0.1 and 0.3 on the
+    /// ten-knot edge (0.3 on a 3 degree path with flaps 10 accelerates it).
+    /// Short of the landing flaps the speed law may idle; with them out the
+    /// floor stands as before. An airframe with no floor never had one.
+    #[test]
+    fn the_thrust_floor_is_the_landing_configurations() {
+        // 161 kt against the flaps-10 floor of 152: nine knots fast.
+        assert_eq!(
+            approach_power_floor(Final, 1200.0, -9.0, Some(0.3), false),
+            0.1
+        );
+        assert_eq!(
+            approach_power_floor(Final, 1200.0, -9.0, Some(0.3), true),
+            0.3
+        );
+        assert_eq!(approach_power_floor(Final, 1200.0, -9.0, None, false), 0.1);
+        assert_eq!(approach_power_floor(Final, 1200.0, -9.0, None, true), 0.1);
     }
 
     /// EGCC 23L, 2026-09-21: the servos stayed on through the rollout and the
