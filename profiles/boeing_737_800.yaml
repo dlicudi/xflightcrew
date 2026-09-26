@@ -341,3 +341,9 @@ advisor:
   - dataref: sim/cockpit2/switches/fasten_seat_belts
     phases: [takeoff, approach, landing]
     say: Seat belt signs are off.
+
+# The ILS is flown on the autopilot's own approach mode: localiser and
+# glideslope captured, the heading and VS dials left alone after capture.
+# On the heading knob the 737 wove 10 to 15 m either side of LEMG 13's
+# centreline all the way down (2026-09-26). First flown on this type then.
+ils_coupled: true

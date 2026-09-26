@@ -145,6 +145,11 @@ pub async fn drive_heading_bug(xp: &dyn crate::xplane::XPlane, target: f64) -> f
 /// no VS or throttle updates the whole time (2026-07-14). A capped call gets
 /// there over successive ticks; the direct-write fallback (knob unbound) still
 /// jumps straight to the full target.
+/// Below this a heading change is SET, to a tenth of a degree, not pressed.
+const FINE_BUG_DEG: f64 = 3.0;
+/// ...and below this it is left alone.
+const FINE_BUG_MIN_DEG: f64 = 0.2;
+
 pub async fn drive_heading_bug_step(
     xp: &dyn crate::xplane::XPlane,
     target: f64,
@@ -156,6 +161,20 @@ pub async fn drive_heading_bug_step(
         return target;
     };
     let full = ((target - start) % 360.0 + 540.0) % 360.0 - 180.0;
+    // A small correction is set to a tenth of a degree, not pressed: a press
+    // is a whole degree and a change under half of one is no press at all,
+    // so autoland's final command hovering at 131.5 flipped the bug between
+    // 131 and 132 and the 737 wove 10 to 15 m either side of the centreline
+    // all the way down (LEMG 13, 2026-09-26). Under a fifth of a degree the
+    // knob is left alone.
+    if full.abs() < FINE_BUG_DEG {
+        if full.abs() >= FINE_BUG_MIN_DEG {
+            let fine = ((start + full) * 10.0).round() / 10.0;
+            let _ = xp.set_float(HEADING_BUG, fine.rem_euclid(360.0)).await;
+            return xp.get_float(HEADING_BUG).await.unwrap_or(fine);
+        }
+        return start;
+    }
     let delta = full.clamp(-max_step_deg.abs(), max_step_deg.abs());
     let leg = (start + delta).rem_euclid(360.0);
     let presses = delta.round().abs() as i64;
