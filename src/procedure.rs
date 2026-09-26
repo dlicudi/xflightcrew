@@ -1051,18 +1051,31 @@ pub fn descent_target_ft(
     let Some(dist_nm) = dist_nm else {
         return leg_alt;
     };
-    let Some(tod_nm) = descent_point_nm(leg_alt, alt_ft, gs_kts, descent_fpm) else {
-        return leg_alt;
-    };
-    if dist_nm <= tod_nm {
+    if descent_point_nm(leg_alt, alt_ft, gs_kts, descent_fpm).is_none() {
         return leg_alt;
     }
-    if carry <= alt_ft + 100.0 {
+    let held = if carry <= alt_ft + 100.0 {
         carry
     } else {
         (alt_ft / 100.0).round() * 100.0
-    }
+    };
+    // Down a PATH at the planning rate, not a dive at the maximum: the
+    // constraint plus the distance still to run times the planned gradient,
+    // never above the level held, never below the constraint. Stepping the
+    // target straight to the constraint at the top of descent made the VS
+    // law ask the airframe's full rate at once, and the 737 went down its
+    // LEMG arrival in 2,000 fpm dives with the speedbrake out between level
+    // segments (2026-09-26). A late start still catches the path at the
+    // full rate; the path itself is the gentler one.
+    let ft_per_nm = descent_fpm * DESCENT_PLAN_FRACTION / (gs_kts.max(60.0) / 60.0);
+    let path = leg_alt + (dist_nm - TOD_LEAD_NM).max(0.0) * ft_per_nm;
+    path.min(held).max(leg_alt)
 }
+
+/// The share of the airframe's descent rate a descent is PLANNED at: the
+/// rest is margin to catch up with, as a crew plans 3 miles per thousand
+/// feet and keeps the idle-and-speedbrake rate in hand.
+pub const DESCENT_PLAN_FRACTION: f64 = 0.75;
 
 /// Where the descent to `leg_alt` begins: miles BEFORE the fix, at the rate
 /// the VS law flies and the groundspeed we have, plus the lead. `None` when
@@ -1073,7 +1086,7 @@ pub fn descent_point_nm(leg_alt: f64, alt_ft: f64, gs_kts: f64, descent_fpm: f64
     if drop_ft <= 100.0 {
         return None;
     }
-    Some(drop_ft / descent_fpm.max(1.0) * (gs_kts.max(60.0) / 60.0) + TOD_LEAD_NM)
+    Some(drop_ft / (descent_fpm * DESCENT_PLAN_FRACTION).max(1.0) * (gs_kts.max(60.0) / 60.0) + TOD_LEAD_NM)
 }
 
 /// One tick of the follower's vertical bookkeeping, pure so every rule below
@@ -3079,18 +3092,25 @@ mod tests {
 
     /// The one formula the follower's law, the advisor and the spoken answer
     /// all read: LEJR-LXGB, 7,000 ft to 27D10 at 3,143 ft, 113 kt over the
-    /// ground, is 11.4 nm before the fix (10.4 of descent plus the lead).
+    /// ground, planned at 75% of the 700 fpm: 13.8 nm of descent plus the lead.
     #[test]
     fn descent_point_is_one_formula() {
         let tod = descent_point_nm(3_143.0, 7_000.0, 113.0, GA_VS_FPM).unwrap();
-        assert!((tod - 11.38).abs() < 0.05, "{tod}");
+        assert!((tod - 14.84).abs() < 0.05, "{tod}");
         // The law starts down exactly there, not before.
         assert_eq!(
             descent_target_ft(3_143.0, 7_000.0, 7_000.0, Some(tod + 0.1), 113.0, GA_VS_FPM),
             7_000.0
         );
+        // Inside it, down a PATH (2026-09-26), not straight to the
+        // constraint: a little under the level, and the constraint itself
+        // only at the fix's lead.
+        let just_in = descent_target_ft(3_143.0, 7_000.0, 7_000.0, Some(tod - 0.1), 113.0, GA_VS_FPM);
+        assert!(just_in < 7_000.0 && just_in > 6_900.0, "{just_in}");
+        let halfway = descent_target_ft(3_143.0, 7_000.0, 5_200.0, Some((tod + 1.0) / 2.0), 113.0, GA_VS_FPM);
+        assert!((halfway - 5_070.0).abs() < 50.0, "{halfway}");
         assert_eq!(
-            descent_target_ft(3_143.0, 7_000.0, 7_000.0, Some(tod - 0.1), 113.0, GA_VS_FPM),
+            descent_target_ft(3_143.0, 7_000.0, 3_300.0, Some(1.0), 113.0, GA_VS_FPM),
             3_143.0
         );
         // Nothing to descend to: no point to announce.
@@ -3381,11 +3401,14 @@ mod tests {
             carry = v.carry;
             prev = v.prev_cmd;
         }
-        // Inside it, the constraint is commanded and stays commanded.
+        // Inside it, down the path and staying on it: under the cruise,
+        // above the constraint, lower each tick, the constraint at the fix.
         let v = tick(&leg, carry, prev, 8000.0, 17.0, None, None);
-        assert_eq!(v.want_alt, 2700.0);
-        let v = tick(&leg, v.carry, v.prev_cmd, 7000.0, 15.0, None, None);
-        assert_eq!(v.want_alt, 2700.0);
+        assert!(v.want_alt < 8000.0 && v.want_alt > 2700.0, "{}", v.want_alt);
+        let w = tick(&leg, v.carry, v.prev_cmd, 7000.0, 15.0, None, None);
+        assert!(w.want_alt < v.want_alt && w.want_alt > 2700.0, "{}", w.want_alt);
+        let x = tick(&leg, w.carry, w.prev_cmd, 2900.0, 1.0, None, None);
+        assert_eq!(x.want_alt, 2700.0);
     }
 
     /// The ground outranks the plan. Grazalema probes at 3,861 ft under the
@@ -3651,7 +3674,9 @@ mod tests {
         );
         // Concretely: the GA rate would start this jet down 228 nm out, which
         // is before the fix it is descending TO.
-        assert!(ga > 200.0 && jet < 90.0, "{ga:.0} nm vs {jet:.0} nm");
+        // (Planned at 75% of each rate since 2026-09-26: the jet's point is
+        // about 100 nm out, still well inside the GA one.)
+        assert!(ga > 250.0 && jet < 110.0, "{ga:.0} nm vs {jet:.0} nm");
     }
 
     /// The rates are the airframe's, republished on every swap, and a profile
@@ -3906,13 +3931,17 @@ mod tests {
             descent_target_ft(1397.0, 3900.0, 3888.0, Some(25.0), 200.0, GA_VS_FPM),
             3900.0
         );
-        // TOD: 2,491 ft at 700 fpm is 3.6 min, 11.9 nm at 200 kt, plus the lead.
+        // TOD: 2,491 ft planned at 525 fpm is 4.7 min, 15.8 nm at 200 kt,
+        // plus the lead: level at 17.5, on the path at 12, at the constraint
+        // at the fix's lead.
         assert_eq!(
-            descent_target_ft(1397.0, 3900.0, 3888.0, Some(13.5), 200.0, GA_VS_FPM),
+            descent_target_ft(1397.0, 3900.0, 3888.0, Some(17.5), 200.0, GA_VS_FPM),
             3900.0
         );
+        let on_path = descent_target_ft(1397.0, 3900.0, 3500.0, Some(12.0), 200.0, GA_VS_FPM);
+        assert!((on_path - 3130.0).abs() < 20.0, "{on_path}");
         assert_eq!(
-            descent_target_ft(1397.0, 3900.0, 3888.0, Some(12.0), 200.0, GA_VS_FPM),
+            descent_target_ft(1397.0, 3900.0, 1500.0, Some(1.0), 200.0, GA_VS_FPM),
             1397.0
         );
         // Climbs, small steps and fix-less legs go straight to the constraint.
