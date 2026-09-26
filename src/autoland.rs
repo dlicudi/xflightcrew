@@ -1872,6 +1872,9 @@ pub fn run_autoland_scoped(
                     "alt": alt, "gp_alt": g.glidepath_alt_ft, "cmd_vs": g.target_vs_fpm,
                     "vs_dial": vs_dial, "vvi": vvi, "vvi_trend": vvi_trend, "arresting": g.arresting,
                     "cmd_hdg": g.target_heading_deg, "ias": ias, "radio": radio_ft,
+                    // The wheels, so a first contact the rollout latch never
+                    // saw (a bounce) is on the tape: the scorecard judges it.
+                    "ground": on_ground > 0.5,
                     "phase": format!("{:?}", g.phase), "ga": ga, "crab": crab, "crab_raw": crab_raw,
                     "trim": trim, "xtk_m": xtk_now * M_PER_NM,
                     "flare_elev": flare_elev, "flare_ail": flare_ail, "hands": arrest_hands,

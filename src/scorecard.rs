@@ -43,6 +43,18 @@ pub const ROLL_MAX_XTK_M: f64 = 5.0;
 /// Touchdown: firmer than this fails; crabbed more than this fails.
 pub const TOUCHDOWN_MAX_SINK_FPM: f64 = 400.0;
 pub const TOUCHDOWN_MAX_DRIFT_DEG: f64 = 5.0;
+/// The first contact is judged, not the one the state record happens to
+/// catch. The 1 Hz `state` sample never saw the wheels on LEMG 13
+/// (1790441293): the 737 met the runway at 17:04:34Z at -794 fpm (the
+/// autoland flare tick, radio -0.5 ft), bounced to 11.8 ft, and the stage
+/// scored the SECOND contact's 278 fpm, a pass on sink. An autoland tick
+/// with the wheels on (`ground`, logged since 2026-09-26) or, in older
+/// logs, the radio height at or under this is a contact.
+const CONTACT_RADIO_FT: f64 = 1.0;
+/// Back up past this after a contact is a bounce (rapport's own 2 ft).
+const BOUNCE_FT: f64 = 2.0;
+/// A contact this long before the state record's touchdown belongs to it.
+const CONTACT_WITHIN_S: f64 = 30.0;
 /// Rollout: most off the centreline.
 pub const ROLLOUT_MAX_XTK_M: f64 = 5.0;
 /// A stream quiet this long has ended.
@@ -127,6 +139,19 @@ struct Landing {
     max_xtk: Option<f64>,
     t_last: f64,
     sortie: Option<String>,
+    /// Off the runway again after the first contact: the height reached
+    /// and the sink at the contact the state record caught.
+    bounce: Option<(f64, f64)>,
+}
+
+/// The first time the wheels met the runway, from the autoland ticks.
+#[derive(Debug, Clone, Copy)]
+struct Contact {
+    t: f64,
+    /// Steepest sink in the [`instructor::TOUCHDOWN_WINDOW_S`] before it.
+    sink: f64,
+    /// Highest radio height since (a bounce past [`BOUNCE_FT`]).
+    up_ft: f64,
 }
 
 #[derive(Debug, Default)]
@@ -154,6 +179,9 @@ pub struct Scorer {
     crew_yoke_t: Option<f64>,
     /// The takeoff has rotated: its roll ticks now write the elevator.
     rotated: bool,
+    /// Recent autoland (t, vvi) for the first contact's sink.
+    flare_vvi: Vec<(f64, f64)>,
+    contact: Option<Contact>,
 }
 
 /// The taxi events that mean the drive STOPPED short, not arrived. Each used
@@ -256,13 +284,16 @@ impl Scorer {
                     l.t_last = t;
                 }
             }
-            // The arrest and the flare write the elevator and aileron channels.
-            ("autoland", _)
+            ("autoland", "") => {
+                // The arrest and the flare write the elevator and aileron
+                // channels.
                 if ["flare_elev", "flare_ail"]
                     .iter()
-                    .any(|k| r.get(*k).is_some_and(|v| !v.is_null())) =>
-            {
-                self.crew_yoke_t = Some(t)
+                    .any(|k| r.get(*k).is_some_and(|v| !v.is_null()))
+                {
+                    self.crew_yoke_t = Some(t);
+                }
+                self.contact_tick(r, t);
             }
             ("state", _) => self.state_tick(r, t, &mut out),
             ("full_auto", _) if s(r, "stage") == "give_up" => {
@@ -474,6 +505,33 @@ impl Scorer {
         }), out);
     }
 
+    /// One autoland guidance tick: the first contact and any bounce after it.
+    fn contact_tick(&mut self, r: &Value, t: f64) {
+        let (Some(radio), Some(vvi)) = (f(r, "radio"), f(r, "vvi")) else { return };
+        let window = crate::instructor::TOUCHDOWN_WINDOW_S;
+        self.flare_vvi.push((t, vvi));
+        self.flare_vvi.retain(|(tv, _)| t - tv <= window);
+        if self.contact.is_some_and(|c| t - c.t > CONTACT_WITHIN_S) {
+            self.contact = None;
+        }
+        let wheels = match r.get("ground").and_then(Value::as_bool) {
+            Some(g) => g,
+            None => radio <= CONTACT_RADIO_FT,
+        };
+        match self.contact.as_mut() {
+            None if wheels => {
+                let recent: Vec<(f64, f64)> = self.flare_vvi.clone();
+                self.contact = Some(Contact {
+                    t,
+                    sink: crate::instructor::touchdown_sink_fpm(&recent, t, vvi).abs(),
+                    up_ft: 0.0,
+                })
+            }
+            Some(c) => c.up_ft = c.up_ft.max(radio),
+            None => {}
+        }
+    }
+
     fn state_tick(&mut self, r: &Value, t: f64, out: &mut Vec<(String, Value)>) {
         let ground = r.get("ground").and_then(Value::as_bool).unwrap_or(true);
         let crashed = r.get("crashed").and_then(Value::as_bool).unwrap_or(false);
@@ -508,13 +566,23 @@ impl Scorer {
             .unwrap_or(0.0);
         self.air.clear();
         self.close_landing(out);
+        // The first contact, when the autoland ticks saw one before this
+        // sample, is the touchdown; this sample is then the second contact.
+        let first = self.contact.take().filter(|c| t - c.t <= CONTACT_WITHIN_S && c.t >= since);
+        let (t_td, sink, bounce) = match first {
+            Some(c) if c.up_ft > BOUNCE_FT => (c.t, c.sink, Some((c.up_ft, sink))),
+            Some(c) => (c.t, c.sink.max(sink), None),
+            None => (t, sink, None),
+        };
+        self.flare_vvi.clear();
         self.landing = Some(Landing {
-            t_td: t,
+            t_td,
             sink,
             drift,
             max_xtk: None,
             t_last: t,
             sortie: self.sortie.clone(),
+            bounce,
         });
         if crashed {
             self.close_landing(out);
@@ -527,6 +595,9 @@ impl Scorer {
         if l.sink > TOUCHDOWN_MAX_SINK_FPM {
             fails.push(format!("touched down at {:.0} fpm", l.sink));
         }
+        if let Some((up, _)) = l.bounce {
+            fails.push(format!("bounced to {up:.0} ft"));
+        }
         if l.drift > TOUCHDOWN_MAX_DRIFT_DEG {
             fails.push(format!("{:.0} degrees of drift", l.drift));
         }
@@ -536,6 +607,8 @@ impl Scorer {
         self.push("landing", l.sortie.clone(), fails, json!({
             "sink_fpm": l.sink.round(), "drift_deg": r1(l.drift),
             "rollout_max_xtk_m": l.max_xtk.map(r1), "t_touchdown": l.t_td,
+            "bounce_ft": l.bounce.map(|(up, _)| r1(up)),
+            "second_contact_sink_fpm": l.bounce.map(|(_, s2)| s2.round()),
         }), out);
     }
 
@@ -737,9 +810,9 @@ mod tests {
         assert_eq!(l["rollout_max_xtk_m"], 1.2);
     }
 
-    /// The 737's LEMG sortie (1790441293), trimmed to 491 of its 3,871
+    /// The 737's LEMG sortie (1790441293), trimmed to 518 of its 3,871
     /// records (every tenth taxi tick and every one far off the line, every
-    /// third roll tick, the touchdown's state records whole, the crew's yoke
+    /// third roll tick, the touchdown's state and flare ticks whole, the crew's yoke
     /// writes before each intervention). Pinned so any change to a verdict is
     /// a changed line here; `xvl debrief` prints the same block from the same
     /// file (asserted below), so the two agree by construction.
@@ -762,7 +835,7 @@ mod tests {
              \x20   line_up   FAIL: 6.0 m off the line\n\
              \x20   alignment pass\n\
              \x20   takeoff   FAIL: 6.9 m off the centreline\n\
-             \x20   landing   FAIL: 12.0 m off the centreline rolling out\n\
+             \x20   landing   FAIL: touched down at 794 fpm, bounced to 12 ft, 12.0 m off the centreline rolling out\n\
              \x20   SORTIE FAIL: 5 stages, failed taxi, line_up, takeoff, landing, \
              0 interventions (4 crew yoke not counted), 0 commands, unattended, outcome ended\n"
         );
@@ -770,7 +843,12 @@ mod tests {
         // The join closed at 14.5 m; the line is judged from its first tick
         // inside 3 m (6.7 s in the whole file, the next kept tick here).
         assert_eq!(stage("taxi")["capture_secs"], 8.2);
-        assert_eq!(stage("landing")["sink_fpm"], 278.0);
+        // The first contact at 17:04:34Z, not the 278 fpm of the second.
+        let landing = stage("landing");
+        assert_eq!(landing["sink_fpm"], 794.0);
+        assert_eq!(landing["t_touchdown"], 1790442274.5);
+        assert_eq!(landing["bounce_ft"], 11.8);
+        assert_eq!(landing["second_contact_sink_fpm"], 278.0);
         let sortie = card.last().unwrap();
         assert_eq!(sortie["interventions"], 0, "the flare's own pull is not a hand");
         assert_eq!(sortie["crew_yoke_discounted"], 4);
@@ -901,6 +979,76 @@ mod tests {
         let sortie = card.iter().find(|v| s(v, "kind") == "sortie_result").unwrap();
         assert_eq!(sortie["unattended"], false);
         assert_eq!(sortie["pass"], false, "a flown-by-voice sortie is not an unattended pass");
+    }
+
+    /// LEMG 13, 17:04:34Z (1790441293): the autoland flare ticks as recorded
+    /// (t, radio ft, vvi fpm) and the 1 Hz state samples around them. The
+    /// state record never had the wheels on until the second contact, and
+    /// the stage scored that one's 278 fpm; the first contact was -794.
+    #[test]
+    fn a_bounced_landing_is_judged_on_its_first_contact() {
+        let flare = [
+            (1790442273.6, 11.8, -598.0),
+            (1790442273.9, 8.1, -664.0),
+            (1790442274.1, 5.1, -724.0),
+            (1790442274.3, 1.7, -773.0),
+            (1790442274.5, -0.5, -794.0),
+            (1790442274.7, 0.5, -697.0),
+            (1790442274.9, 1.8, -512.0),
+            (1790442275.1, 3.0, -303.0),
+            (1790442275.5, 4.8, -68.0),
+            (1790442276.1, 7.3, 99.0),
+            (1790442276.8, 11.2, 213.0),
+            (1790442277.2, 11.8, 191.0),
+            (1790442277.7, 10.4, 78.0),
+            (1790442278.2, 5.4, -162.0),
+        ];
+        let state = [
+            (1790442240.0, false, -700.0),
+            (1790442272.5, false, -398.8),
+            (1790442273.5, false, -413.4),
+            (1790442274.6, false, -663.8),
+            (1790442275.7, false, -385.9),
+            (1790442276.9, false, 117.9),
+            (1790442277.9, false, 191.2),
+            (1790442279.2, false, -277.9),
+            (1790442280.4, false, -42.7),
+            (1790442281.7, true, -36.6),
+            (1790442283.1, true, 1.0),
+        ];
+        let mut recs: Vec<Value> = flare
+            .iter()
+            .map(|(t, radio, vvi)| {
+                json!({"t": t, "kind": "autoland", "radio": radio, "vvi": vvi, "phase": "Flare"})
+            })
+            .chain(state.iter().map(|(t, g, vsi)| {
+                json!({"t": t, "kind": "state", "ground": g, "vsi": vsi, "hdg": 131.0, "track": 131.0})
+            }))
+            .collect();
+        recs.sort_by(|a, b| f(a, "t").partial_cmp(&f(b, "t")).unwrap());
+        recs.push(json!({"t": 1790442290.0, "kind": "sortie", "event": "end", "outcome": "ended"}));
+        let out = score_all(recs.iter());
+        let l = out.iter().find(|v| v["stage"] == "landing").unwrap();
+        assert_eq!(l["sink_fpm"], 794.0, "{l}");
+        assert_eq!(l["t_touchdown"], 1790442274.5);
+        assert_eq!(l["bounce_ft"], 11.8);
+        assert_eq!(l["second_contact_sink_fpm"], 278.0);
+        assert_eq!(l["pass"], false);
+        assert_eq!(l["why"][1], "bounced to 12 ft");
+
+        // A clean arrival that latched the rollout at 2 ft has no contact in
+        // the flare ticks: judged on the state sample as before.
+        let recs = [
+            json!({"t": 0.0, "kind": "state", "ground": false, "vsi": -300.0}),
+            json!({"t": 39.0, "kind": "autoland", "radio": 2.1, "vvi": -250.0}),
+            json!({"t": 39.5, "kind": "state", "ground": false, "vsi": -240.0}),
+            json!({"t": 40.0, "kind": "state", "ground": true, "vsi": -200.0}),
+            json!({"t": 50.0, "kind": "sortie", "event": "end"}),
+        ];
+        let out = score_all(recs.iter());
+        let l = out.iter().find(|v| v["stage"] == "landing").unwrap();
+        assert_eq!(l["sink_fpm"], 240.0, "{l}");
+        assert!(l["bounce_ft"].is_null());
     }
 
     /// The offline twin of the monitor's rule: a `yoke_under_ap` inside the
