@@ -3064,10 +3064,21 @@ mod tests {
                 .map(|(_, v)| v["max_lat_m"].as_f64().unwrap())
                 .unwrap()
         };
-        let old = score(&mut |lat, err, _| lat < 15.0 && err.abs() < 45.0);
-        assert!(old > 14.0, "the recorded latch scored {old} m");
+        // The old latch fired mid-swing, 14.5 m off and 42 degrees out.
+        let old_at = TICKS.iter().find(|&&(_, lat, err)| lat.abs() < 15.0 && err.abs() < 45.0);
+        assert!(matches!(old_at, Some(&(_, lat, _)) if lat > 14.0), "old latch: {old_at:?}");
+        // The new one waits for the line (the scorer discounts a join's ticks
+        // on its own since the same day, so it is scored through it too).
         let mut c = JoinCapture::default();
-        let new = score(&mut |lat, err, t| c.step(lat, err, t));
+        let mut fired_at = None;
+        let new = score(&mut |lat, err, t| {
+            let done = c.step(lat, err, t);
+            if done && fired_at.is_none() {
+                fired_at = Some(lat);
+            }
+            done
+        });
+        assert!(matches!(fired_at, Some(lat) if lat < 3.0), "new latch fired at {fired_at:?} m");
         assert!(new < 3.0, "joined on the line, the taxi scores {new} m");
     }
 
