@@ -969,6 +969,26 @@ const ON_NOSE_DEG: f64 = 5.0;
 /// happened to pass within the capture radius. A bug on the nose is a
 /// capture, and a capture is the one thing that rolls that AP level; from
 /// level the next slew starts the turn the right way.
+/// Put the bug on a WHOLE degree, and only when that degree changes. The
+/// laws above keep their fine value for their own arithmetic; the knob a
+/// pilot sees moves in the steps a pilot's hand makes, not a tenth of a
+/// degree every tick (the pilot, 2026-09-26: "a human pilot would never use
+/// the heading bug like that"). Half a degree of rounding is inside what the
+/// autopilot's own heading hold settles to.
+async fn write_bug(xp: &dyn crate::xplane::XPlane, bug_mag: f64) {
+    let whole = bug_mag.round().rem_euclid(360.0);
+    let bits = whole.to_bits();
+    if LAST_BUG.swap(bits, std::sync::atomic::Ordering::Relaxed) == bits {
+        return;
+    }
+    if xp.set_float(HDG_BUG, whole).await.is_err() {
+        LAST_BUG.store(u64::MAX, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// The last whole degree written, as f64 bits (`u64::MAX`: none).
+static LAST_BUG: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
+
 pub fn bug_toward(
     current_bug: f64,
     want_mag: f64,
@@ -1570,6 +1590,8 @@ async fn fly_authored_route(
 ) {
     let rwy_id = rwy.id.clone();
     let mut bug_mag = xp.get_float(HDG_BUG).await.unwrap_or(rwy.course_deg);
+    // A new flight of the laws: whatever the knob holds now is unknown.
+    LAST_BUG.store(u64::MAX, std::sync::atomic::Ordering::Relaxed);
     let mut last_vs_cmd: Option<f64> = None;
     let mut prev_ias: Option<(f64, std::time::Instant)> = None;
     let mut ias_trend = 0.0_f64;
@@ -1653,7 +1675,7 @@ async fn fly_authored_route(
             ),
             None => slew_bug(bug_mag, want_mag, BUG_SLEW_PER_TICK),
         };
-        let _ = xp.set_float(HDG_BUG, bug_mag).await;
+        write_bug(&xp, bug_mag).await;
         if !hdg_on {
             let _ = xp.run_command(CMD_SERVOS_ON).await;
             let _ = xp.run_command(CMD_HDG_MODE).await;
@@ -1759,7 +1781,7 @@ async fn fly_authored_route(
             );
             if let Some(psi) = psi_r {
                 bug_mag = true_to_mag(psi, mag_var);
-                let _ = xp.set_float(HDG_BUG, bug_mag).await;
+                write_bug(&xp, bug_mag).await;
             }
         }
     }
@@ -2190,6 +2212,7 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, p: Params
     let _detail = crate::auto_status::DetailGuard::hold(&DETAIL);
     // The dial's CURRENT value seeds the slew (the takeoff left it near the
     // runway heading); every subsequent write moves it the short way only.
+    LAST_BUG.store(u64::MAX, std::sync::atomic::Ordering::Relaxed);
     let mut bug_mag = match xp.get_float(HDG_BUG).await {
         Ok(v) => v,
         Err(_) => true_to_mag(rwy_course, mag_var),
@@ -2199,7 +2222,7 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, p: Params
         true_to_mag(leg_heading(rwy_course, Leg::Upwind, left), mag_var),
         BUG_SLEW_PER_TICK,
     );
-    let _ = xp.set_float(HDG_BUG, bug_mag).await;
+    write_bug(&xp, bug_mag).await;
     // Forward terrain guard cadence + throttle; a fired guard raises the
     // vertical target floor for a while instead of pressing dead buttons.
     let mut tick: u32 = 0;
@@ -2376,7 +2399,7 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, p: Params
             ),
             _ => slew_bug(bug_mag, target_mag, BUG_SLEW_PER_TICK),
         };
-        let _ = xp.set_float(HDG_BUG, bug_mag).await;
+        write_bug(&xp, bug_mag).await;
         // The lateral mode must actually be ON for the bug to mean anything —
         // re-engage like the takeoff's VS guard, never press blind.
         if !hdg_on {
