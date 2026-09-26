@@ -1095,15 +1095,29 @@ pub fn climb_bank_target(hdg_err_deg: f64) -> f64 {
 pub struct WingsLevel {
     out: f64,
     prev_bank: Option<f64>,
+    /// Bank error for full aileron, degrees; `None` is [`AIL_FULL_BANK_DEG`].
+    full_bank_deg: Option<f64>,
 }
 
 impl WingsLevel {
+    /// A stiffer loop: full aileron at `full_bank_deg` of bank error. The
+    /// climb-out's 15 degrees is a gentle track-keeper; over the runway the
+    /// landing arrest needs the bank to arrive in about a second, and at 15
+    /// the 737 rolled at 2 deg/s on 0.17 of aileron (LEMG 13, 2026-09-26).
+    pub fn stiff(full_bank_deg: f64) -> Self {
+        Self {
+            full_bank_deg: Some(full_bank_deg.clamp(2.0, AIL_FULL_BANK_DEG)),
+            ..Self::default()
+        }
+    }
+
     pub fn step(&mut self, bank_deg: f64, target_deg: f64, dt_s: f64) -> f64 {
         let dt = dt_s.clamp(0.05, 1.0);
         let rate = self.prev_bank.map_or(0.0, |p| (bank_deg - p) / dt);
         self.prev_bank = Some(bank_deg);
         let err = target_deg - bank_deg - AIL_LEAD_S * rate;
-        let want = (err / AIL_FULL_BANK_DEG).clamp(-1.0, 1.0) * AIL_MAX;
+        let full = self.full_bank_deg.unwrap_or(AIL_FULL_BANK_DEG);
+        let want = (err / full).clamp(-1.0, 1.0) * AIL_MAX;
         self.out = slew(self.out, want, AIL_SLEW_PER_S * dt);
         self.out
     }
