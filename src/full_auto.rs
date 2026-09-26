@@ -3466,6 +3466,73 @@ const GRADIENT_CAUTION_FRAC: f64 = 0.75;
 /// Every departure minimum on the route, from the runway's departure end
 /// `der` at `field_ft`, against `best_climb_fpm` at `vy_kts` (true airspeed
 /// rising 2 % a thousand feet, no wind credit). Pure.
+/// The departure as the CHART flies it, up to `join` (a fix both the chart
+/// and `plan` have), ready for the follower: fix legs, course or heading to
+/// an altitude (CA, VA) and course to a DME distance (CD, VD). The plan
+/// lists only a SID's named fixes, so ANC8A's climb out on 304 and the 6-mile
+/// out-and-back to RIM were flown as "direct RIM", back over the field
+/// (LIPR 2026-09-26). `None` when the chart has a leg the follower cannot
+/// fly (arcs, holds, vectors) or a fix or navaid it cannot place: then the
+/// plan's own fixes are flown, as before.
+///
+/// A chart altitude is a MINIMUM, not a level: the minimums are guarded by
+/// the departure's `climb_minimums`. So a fix the plan also has keeps the
+/// plan's altitude; a climb-to-altitude leg keeps its own (it is where the
+/// leg ends); everything else takes the plan's altitude at the join, for one
+/// continuous climb. Pure.
+pub fn charted_departure_legs(
+    chart: &[crate::nav::ProcLeg],
+    plan: &[crate::nav::ProcLeg],
+    join: &str,
+) -> Option<Vec<crate::nav::ProcLeg>> {
+    let join_plan = plan.iter().find(|l| l.fix_ident.eq_ignore_ascii_case(join))?;
+    let mut out = Vec::new();
+    for l in chart {
+        let mut leg = l.clone();
+        let ident = l.fix_ident.to_ascii_uppercase();
+        if ident.starts_with("RW") {
+            continue; // the runway threshold the roll starts from
+        }
+        match l.leg_type.as_str() {
+            "IF" | "TF" | "CF" | "DF" => {
+                l.fix.as_ref()?;
+                match plan.iter().find(|p| p.fix_ident.eq_ignore_ascii_case(&l.fix_ident)) {
+                    Some(p) => {
+                        leg.alt1_ft = p.alt1_ft;
+                        leg.alt_desc = p.alt_desc;
+                    }
+                    None => {
+                        leg.alt1_ft = join_plan.alt1_ft;
+                        leg.alt_desc = ' ';
+                    }
+                }
+            }
+            "CA" | "VA" => {
+                l.course_mag?;
+                l.alt1_ft?;
+                leg.fix = None;
+                leg.fix_ident.clear();
+            }
+            "CD" | "VD" => {
+                l.course_mag?;
+                l.navaid.as_ref()?;
+                l.dist_nm.filter(|d| *d > 0.0)?;
+                leg.fix = None;
+                leg.fix_ident.clear();
+                leg.alt1_ft = join_plan.alt1_ft;
+                leg.alt_desc = ' ';
+            }
+            _ => return None,
+        }
+        let last = l.fix_ident.eq_ignore_ascii_case(join);
+        out.push(leg);
+        if last {
+            return Some(out);
+        }
+    }
+    None
+}
+
 /// SID `sid` from `rwy` as CHARTED: its runway transition and common legs,
 /// the climb-to-altitude and course legs included, fixes resolved. What the
 /// gradient check must walk: the flight plan lists only the SID's named
@@ -4475,6 +4542,9 @@ mod tests {
             is_faf: false,
             is_map: false,
             vpa_deg: None,
+            navaid_ident: String::new(),
+            navaid_region: String::new(),
+            navaid: None,
         };
         let legs = vec![
             leg("WI505", 47.252, 11.269),
@@ -4523,6 +4593,82 @@ mod tests {
         assert!(rim.dist_nm > 12.0, "{rim:?}");
         assert!(rim.need_ft_per_nm < 350.0, "{rim:?}");
         assert!(super::gradient_verdict("ANC8A", &checks).is_ok(), "a 172 flies it");
+    }
+
+    /// LIPR 30 ANC8A: the climb out, the out-and-back to 6 DME, RIM, then
+    /// the plan. The chart's altitudes are minimums: the plan's stand.
+    #[test]
+    fn a_departure_is_flown_as_charted_up_to_where_it_joins_the_plan() {
+        let rows = [
+            "SID:010,2,ANC8A,RW30, , , , ,    , ,   ,CA, , , , , ,      ,    ,    ,3040,    ,+,00450,     ,06000, ,   ,    ,   ,RIM,LI,D, , , , , ;",
+            "SID:020,2,ANC8A,RW30, , , , ,    , ,   ,CD, ,RIM,LI,D, ,      ,    ,    ,2910,0060,+,01500,     ,     ,-,210,    ,   , , , , , , , , ;",
+            "SID:030,2,ANC8A,RW30,RIM,LI,D, ,V   ,R,   ,CF,Y,RIM,LI,D, ,      ,0000,0000,1610,0060,+,04000,     ,     ,-,210,    ,   , , , , , , , , ;",
+            "SID:040,2,ANC8A,RW30,D121Z,LI,P,C,E   , ,   ,TF, , , , , ,      ,    ,    ,    ,    ,+,FL095,     ,     , ,   ,    ,   , , , , , , , , ;",
+        ];
+        let mut chart = crate::nav::parse_proc_legs(rows.into_iter(), crate::nav::ProcKind::Sid, "ANC8A", Some("RW30"));
+        let rim = crate::nav::Fix { ident: "RIM".into(), lat: 44.015167, lon: 12.616639 };
+        for l in chart.iter_mut() {
+            if l.fix_ident == "RIM" {
+                l.fix = Some(rim.clone());
+            }
+            if l.navaid_ident == "RIM" {
+                l.navaid = Some(rim.clone());
+            }
+            if l.fix_ident == "D121Z" {
+                l.fix = Some(crate::nav::Fix { ident: "D121Z".into(), lat: 43.8, lon: 12.95 });
+            }
+        }
+        assert_eq!(chart[1].navaid_ident, "RIM");
+        let plan_leg = |id: &str, alt: f64| {
+            let mut l = chart[2].clone();
+            l.fix_ident = id.into();
+            l.leg_type = "TF".into();
+            l.alt1_ft = Some(alt);
+            l.alt_desc = ' ';
+            l
+        };
+        let plan = vec![plan_leg("RIM", 3000.0), plan_leg("D121Z", 5000.0)];
+        let dep = super::charted_departure_legs(&chart, &plan, "D121Z").expect("flyable");
+        let kinds: Vec<&str> = dep.iter().map(|l| l.leg_type.as_str()).collect();
+        assert_eq!(kinds, ["CA", "CD", "CF", "TF"]);
+        assert_eq!(dep[0].alt1_ft, Some(450.0), "a climb-to-altitude leg ends at its altitude");
+        assert_eq!(dep[1].alt1_ft, Some(5000.0), "the out-leg climbs on toward the join");
+        assert_eq!(dep[2].alt1_ft, Some(3000.0), "RIM at the plan's altitude, not the chart's minimum");
+        assert_eq!(dep[3].alt1_ft, Some(5000.0), "never FL095 over a 5,000 ft plan");
+        // The CD leg ends at 6 DME from RIM, not at its 1,500 ft minimum.
+        let out = crate::nav::project_latlon(rim.lat, rim.lon, 291.0, 5.0);
+        assert_eq!(crate::procedure::dme_leg_done(&dep[1], out.0, out.1), Some(false));
+        let out = crate::nav::project_latlon(rim.lat, rim.lon, 291.0, 6.0);
+        assert_eq!(crate::procedure::dme_leg_done(&dep[1], out.0, out.1), Some(true));
+        // An arc on the chart: not flown from the chart at all.
+        let mut arc = chart.clone();
+        arc[1].leg_type = "AF".into();
+        assert!(super::charted_departure_legs(&arc, &plan, "D121Z").is_none());
+    }
+
+    /// LIPR 30 ANC8A from the installed data: every leg resolves, the DME
+    /// leg knows RIM, and the chart comes out flyable.
+    /// `cargo test -- --ignored real_install_lipr_anc8a --nocapture`
+    #[test]
+    #[ignore]
+    fn real_install_lipr_anc8a_is_flyable_as_charted() {
+        let Ok(cfg) = crate::config::Config::from_env() else {
+            return;
+        };
+        let Ok(Some(apt)) = crate::nav::find_airport(&cfg.apt_data_path, "LIPR") else {
+            return;
+        };
+        let chart = super::sid_chart_legs(&cfg.cifp_dir, &cfg.fix_data_path, &cfg.nav_data_path, &apt, "LIPR", "ANC8A", "30");
+        assert!(!chart.is_empty(), "the chart loads");
+        for l in &chart {
+            println!("{} {} fix={:?} navaid={} {:?} dist={:?} alt={:?}", l.leg_type, l.fix_ident, l.fix.as_ref().map(|f| (f.lat, f.lon)), l.navaid_ident, l.navaid.as_ref().map(|f| (f.lat, f.lon)), l.dist_nm, l.alt1_ft);
+        }
+        let cd = chart.iter().find(|l| l.leg_type == "CD").expect("the out-leg");
+        assert!(cd.navaid.is_some(), "RIM resolved for the DME leg");
+        let mut plan_rim = chart.iter().find(|l| l.fix_ident == "RIM").unwrap().clone();
+        plan_rim.alt1_ft = Some(3000.0);
+        let dep = super::charted_departure_legs(&chart, &[plan_rim], "RIM").expect("flyable");
+        assert_eq!(dep.iter().map(|l| l.leg_type.as_str()).collect::<Vec<_>>(), ["CA", "CD", "CF"]);
     }
 
     #[test]

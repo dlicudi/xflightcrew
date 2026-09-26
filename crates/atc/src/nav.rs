@@ -2429,6 +2429,13 @@ pub struct ProcLeg {
     pub is_map: bool,
     /// The published vertical path angle, degrees (field 28: "-449" = 4.49).
     pub vpa_deg: Option<f64>,
+    /// The recommended navaid (field 13): what a DME-terminated leg (CD, VD,
+    /// FD) measures its distance from. Empty when the record names none.
+    pub navaid_ident: String,
+    /// Its ICAO region (field 14), which narrows namesakes at resolve time.
+    pub navaid_region: String,
+    /// That navaid resolved, once [`resolve_proc_fixes`] has run.
+    pub navaid: Option<Fix>,
 }
 
 impl ProcLeg {
@@ -2520,6 +2527,9 @@ pub fn parse_proc_legs<'a>(
                 .ok()
                 .map(|v| v.abs() / 100.0)
                 .filter(|v| (1.0..=8.0).contains(v)),
+            navaid_ident: cifp_field(&f, 13).to_string(),
+            navaid_region: cifp_field(&f, 14).to_string(),
+            navaid: None,
         });
     }
     // Transition (runway) legs first, then the common portion, each by sequence.
@@ -3342,6 +3352,11 @@ pub fn resolve_proc_fixes(
         .iter()
         .filter(|l| l.fix.is_none() && !l.fix_ident.is_empty())
         .map(|l| (l.fix_ident.clone(), l.fix_region.clone()))
+        .chain(
+            legs.iter()
+                .filter(|l| l.navaid.is_none() && !l.navaid_ident.is_empty())
+                .map(|l| (l.navaid_ident.clone(), l.navaid_region.clone())),
+        )
         .collect();
     if wanted.is_empty() {
         return;
@@ -3400,6 +3415,18 @@ pub fn resolve_proc_fixes(
         if let Some(&(lat, lon, _)) = found.get(&(leg.fix_ident.clone(), leg.fix_region.clone())) {
             leg.fix = Some(Fix {
                 ident: leg.fix_ident.clone(),
+                lat,
+                lon,
+            });
+        }
+    }
+    for leg in legs.iter_mut() {
+        if leg.navaid.is_some() || leg.navaid_ident.is_empty() {
+            continue;
+        }
+        if let Some(&(lat, lon, _)) = found.get(&(leg.navaid_ident.clone(), leg.navaid_region.clone())) {
+            leg.navaid = Some(Fix {
+                ident: leg.navaid_ident.clone(),
                 lat,
                 lon,
             });
@@ -3511,6 +3538,9 @@ pub fn reconstruct_approach(
             is_faf: i == last, // the innermost DME fix
             is_map: false,
             vpa_deg: None,
+            navaid_ident: String::new(),
+            navaid_region: String::new(),
+            navaid: None,
         });
     }
     // The threshold itself, so the follower has a fix to fly to after the FAF
@@ -3535,6 +3565,9 @@ pub fn reconstruct_approach(
         is_faf: false,
         is_map: false,
         vpa_deg: None,
+        navaid_ident: String::new(),
+        navaid_region: String::new(),
+        navaid: None,
     });
     legs
 }
@@ -3843,6 +3876,9 @@ SID:070,5,LEGL1W,RW10,LEGLO,LI,E,A,EE  ,R,010,TF, , , , , ,      ,    ,    ,    
             is_faf: false,
             is_map: false,
             vpa_deg: None,
+            navaid_ident: String::new(),
+            navaid_region: String::new(),
+            navaid: None,
         };
         let circling = vec![leg("IF", "WI813"), leg("TF", "WI814"), leg("TF", "WI006"), leg("TF", "RTT")];
         assert!(straight_in_legs(circling, "08").is_none());
@@ -3958,6 +3994,9 @@ STAR:030,6,ALWYS3,RW28B,ARRTU,K2,P,C,E   , ,   ,TF, , , , , ,      ,    ,    ,  
             is_faf: false,
             is_map: map,
             vpa_deg: None,
+            navaid_ident: String::new(),
+            navaid_region: String::new(),
+            navaid: None,
         };
         let raw = vec![
             leg("ZS701", 46.3265, 9.575944, false, Some(12400.0)),

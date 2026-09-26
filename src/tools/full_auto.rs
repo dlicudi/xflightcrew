@@ -1133,6 +1133,42 @@ impl FullAuto {
             .split_inclusive(". ")
             .filter(|s| s.contains("your call"))
             .collect();
+        // The departure flown as charted, where the follower can fly every
+        // leg of it (`charted_departure_legs`): spliced in after the audit,
+        // which judges the plan's own fixes.
+        if let (Some(sid), Some(rwy), Some(apt)) =
+            (&fp.procedures.sid, &fp.procedures.origin_rwy, &origin_apt)
+        {
+            let chart = crate::full_auto::sid_chart_legs(
+                &ctx.config.cifp_dir,
+                &ctx.config.fix_data_path,
+                &ctx.config.nav_data_path,
+                apt,
+                &fp.origin,
+                sid,
+                rwy,
+            );
+            // The join: the last charted fix the plan also flies.
+            let join = chart.iter().rev().find_map(|c| {
+                legs.iter()
+                    .position(|l| !c.fix_ident.is_empty() && l.fix_ident.eq_ignore_ascii_case(&c.fix_ident))
+                    .map(|i| (i, c.fix_ident.clone()))
+            });
+            if let Some((i, join)) = join {
+                if let Some(dep) = crate::full_auto::charted_departure_legs(&chart, &legs, &join) {
+                    if dep.iter().any(|l| l.fix.is_none()) {
+                        crate::full_auto::event(
+                            "departure_charted",
+                            json!({ "sid": sid, "join": join,
+                                    "legs": dep.iter().map(|l| format!("{} {}", l.leg_type, l.fix_ident)).collect::<Vec<_>>() }),
+                        );
+                        let rest: Vec<crate::nav::ProcLeg> = legs.drain(i + 1..).collect();
+                        legs = dep;
+                        legs.extend(rest);
+                    }
+                }
+            }
+        }
         let ack = spoken_arm_line(
             &fp.origin,
             &fp.destination,

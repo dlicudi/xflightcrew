@@ -1133,6 +1133,9 @@ mod tests {
             is_faf: false,
             is_map: false,
             vpa_deg: None,
+            navaid_ident: String::new(),
+            navaid_region: String::new(),
+            navaid: None,
         }
     }
 

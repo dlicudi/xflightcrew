@@ -790,6 +790,24 @@ pub fn leg_turn_deg(lat: f64, lon: f64, leg: &ProcLeg, next: Option<&ProcLeg>) -
 /// the altitude constraint is satisfied. Pure and position-based, so
 /// sequencing is immune to how slow the AP's turns are (the same lesson that
 /// drove the circuit off timers).
+/// A DME-terminated leg (CD, VD, FD: "the 291 course to 6 DME from RIM") is
+/// done when the aircraft is that far from its navaid. `None` for any other
+/// leg. Its altitude is a CONSTRAINT, not the terminator: judged by altitude
+/// alone, ANC8A's "to 6 DME, at or above 1,500" would have turned back at
+/// 1,500 feet, two miles out. Pure.
+pub fn dme_leg_done(leg: &ProcLeg, lat: f64, lon: f64) -> Option<bool> {
+    if !matches!(leg.leg_type.as_str(), "CD" | "VD" | "FD") {
+        return None;
+    }
+    let (n, d) = (leg.navaid.as_ref()?, leg.dist_nm.filter(|d| *d > 0.0)?);
+    Some(crate::nav::haversine_nm(lat, lon, n.lat, n.lon) >= d - 0.1)
+}
+
+/// [`leg_captured`], DME-terminated legs first.
+pub fn leg_done(leg: &ProcLeg, dist_to_fix_nm: Option<f64>, alt_ft: f64, capture_nm: f64, lat: f64, lon: f64) -> bool {
+    dme_leg_done(leg, lat, lon).unwrap_or_else(|| leg_captured(leg, dist_to_fix_nm, alt_ft, capture_nm))
+}
+
 pub fn leg_captured(
     leg: &ProcLeg,
     dist_to_fix_nm: Option<f64>,
@@ -1502,6 +1520,9 @@ pub fn enroute_legs(
             is_faf: false,
             is_map: false,
             vpa_deg: None,
+            navaid_ident: String::new(),
+            navaid_region: String::new(),
+            navaid: None,
         })
         .collect()
 }
@@ -2141,7 +2162,7 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, plan: Pla
             // course is already magnetic; add crab to hold it as a track.
             leg.course_mag.map(|c| (c + crab).rem_euclid(360.0))
         };
-        if let Some(d) = dist_nm.filter(|_| !leg_captured(leg, dist_nm, alt_ft, capture_nm)) {
+        if let Some(d) = dist_nm.filter(|_| !leg_done(leg, dist_nm, alt_ft, capture_nm, lat, lon)) {
             if closure.as_ref().is_none_or(|(i, _)| *i != idx) {
                 // A new leg is judged on its own: stalls on an earlier leg
                 // that was later flown are not this one's (LIPK 2026-09-25:
@@ -2332,6 +2353,15 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, plan: Pla
         // (`map_path`); every other leg the constraint law above.
         let path = map_path(leg, dist_nm, gs_kts);
         let want_alt = path.map_or(v.want_alt, |(a, _)| a);
+        // An unmet departure minimum ahead is a level to climb TO, not only
+        // a reason to climb faster: a plan predicting 3,000 ft at RIM against
+        // the chart's 4,000 levelled at 3,000 and the minimum watch then
+        // called "not climbing" and handed the aircraft back. Minimums above
+        // the cruise were dropped at the start (`minimums_within_cruise`).
+        let want_alt = match unmet_minimum(&climb_minimums, &legs, idx, alt_ft) {
+            Some((_, min_ft)) if path.is_none() && min_ft > want_alt => min_ft,
+            _ => want_alt,
+        };
         carry_alt = v.carry;
         prev_cmd_alt = v.prev_cmd;
         // The follower's own top of descent, for the advisor and the spoken
@@ -2548,7 +2578,7 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, plan: Pla
             Some(hi),
         ) = (&end, handoff)
         {
-            if idx >= hi && leg_captured(leg, dist_nm, alt_ft, capture_nm) {
+            if idx >= hi && leg_done(leg, dist_nm, alt_ft, capture_nm, lat, lon) {
                 crate::blackbox::record(
                     "procedure",
                     serde_json::json!({"event": "handoff_autoland", "idx": idx, "agl_ft": agl_ft}),
@@ -2643,14 +2673,15 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, plan: Pla
             }
         }
 
-        if leg_captured(leg, dist_nm, alt_ft, capture_nm) {
+        if leg_done(leg, dist_nm, alt_ft, capture_nm, lat, lon) {
             idx += 1;
             if idx < legs.len() {
                 let next = &legs[idx];
-                let label = if next.fix_ident.is_empty() {
-                    "next leg".to_string()
-                } else {
-                    next.fix_ident.clone()
+                // A course leg is named by its course, the way it is flown.
+                let label = match (next.fix_ident.is_empty(), next.course_mag) {
+                    (false, _) => next.fix_ident.clone(),
+                    (true, Some(c)) => format!("course {}", crate::flightplan::spell_code(&format!("{:03}", c.round().rem_euclid(360.0) as i64))),
+                    (true, None) => "the next leg".to_string(),
                 };
                 alert(&voice, Priority::Advisory, &format!("Next, {label}."));
             }
@@ -2734,6 +2765,9 @@ mod tests {
             is_faf: false,
             is_map: false,
             vpa_deg: None,
+            navaid_ident: String::new(),
+            navaid_region: String::new(),
+            navaid: None,
         }
     }
 
@@ -2780,6 +2814,9 @@ mod tests {
             is_faf: false,
             is_map: true,
             vpa_deg: None,
+            navaid_ident: String::new(),
+            navaid_region: String::new(),
+            navaid: None,
         };
         assert!(!super::map_short_of_runway(&leg), "LIPE I12: MAP on RW12");
         leg.fix_ident = "MA03".into();
@@ -3279,6 +3316,9 @@ mod tests {
             is_faf: false,
             is_map: false,
             vpa_deg: None,
+            navaid_ident: String::new(),
+            navaid_region: String::new(),
+            navaid: None,
         }
     }
 
@@ -3436,6 +3476,9 @@ mod tests {
             is_faf: false,
             is_map: false,
             vpa_deg: None,
+            navaid_ident: String::new(),
+            navaid_region: String::new(),
+            navaid: None,
         }
     }
 
