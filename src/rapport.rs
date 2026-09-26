@@ -762,7 +762,7 @@ pub fn arrival_brief(apt_dat: &str, cifp: &str, fixes: &str, xplane_root: &str) 
             crate::circuit::spell_runway(&end)
         ));
     }
-    if let Ok(line) = crate::full_auto::brief_arrival(apt_dat, cifp, fixes, &dest) {
+    if let Ok(line) = crate::full_auto::brief_arrival(apt_dat, cifp, fixes, &dest, None) {
         parts.push(line);
     }
     parts.push(format!("Field elevation {:.0} feet.", airport.elev_ft));

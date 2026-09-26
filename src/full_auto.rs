@@ -57,6 +57,35 @@ static STAGE: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
 /// must say circuit, not just the orchestrator's name. Empty between runs.
 static MISSION: std::sync::Mutex<&'static str> = std::sync::Mutex::new("");
 
+/// THE arrival runway of the mission flying: chosen at the arm (the crew's
+/// own STAR pick, else the plan's `destination/plan_rwy`), and the one value
+/// the inbound calls, the arrival's setup, the ILS tune and the landing read.
+/// LIBP-LEMG (2026-09-26): the arm chose UNTO2A for 12 on a 120/9 wind, and
+/// the arrival re-picked from the METAR 45 minutes later, tuned and flew the
+/// ILS 13, so the STAR flown and the runway landed on were decided twice.
+/// Written only through [`set_arrival_runway`]: the arm, the arrival's own
+/// safety overrule (tailwind, no approach we can fly), the tower's runway.
+/// The re-pick in flight (the METAR moves, the tower names a runway) is still
+/// owed; when it comes it writes here and nowhere else. Cleared with the
+/// mission (`stop_active`).
+static ARRIVAL_RUNWAY: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+/// The mission's arrival runway ([`ARRIVAL_RUNWAY`]); `None` with no mission,
+/// a circuit, or a plan that names none.
+pub fn arrival_runway() -> Option<String> {
+    ARRIVAL_RUNWAY.lock().unwrap_or_else(|e| e.into_inner()).clone()
+}
+
+/// Set the mission's arrival runway, blackboxed `arrival_runway` with who
+/// set it whenever it changes.
+pub fn set_arrival_runway(rwy: Option<String>, why: &str) {
+    let mut cur = ARRIVAL_RUNWAY.lock().unwrap_or_else(|e| e.into_inner());
+    if *cur != rwy {
+        event("arrival_runway", json!({ "was": *cur, "now": rwy, "why": why }));
+        *cur = rwy;
+    }
+}
+
 /// The human-readable current stage, empty when idle or not yet staged.
 pub fn stage() -> String {
     STAGE.lock().map(|s| s.clone()).unwrap_or_default()
@@ -109,6 +138,7 @@ pub fn abort() -> bool {
 /// Full auto stops: the flag, and the runway waiver that lived only for it.
 fn stop_active() {
     crate::aircraft::TAKEOFF_MARGIN_WAIVED.store(false, SeqCst);
+    set_arrival_runway(None, "mission_ended");
     ACTIVE.store(false, SeqCst);
 }
 
@@ -153,6 +183,10 @@ pub struct Route {
     /// plan, so the GPS shows the route too. Best-effort — the follower flies
     /// the plan's own fixes, not the FMS.
     pub fms_payload: String,
+    /// The landing runway chosen at the arm: the one the STAR flown serves
+    /// (`plan_audit::choose_arrival`'s pick, else the plan's own), published
+    /// as [`arrival_runway`] for the whole mission.
+    pub arrival_rwy: Option<String>,
 }
 
 /// The tested sub-tools the orchestrator invokes, built from the profile by the
@@ -236,6 +270,13 @@ pub fn start(base_url: String, config: Config, voice: Option<Voice>, tools: SubT
     crate::aircraft::TAKEOFF_MARGIN_WAIVED.store(RUNWAY_WAIVER_PENDING.swap(false, SeqCst), SeqCst);
     ABORT.store(false, SeqCst);
     INBOUND_MADE.store(false, SeqCst);
+    set_arrival_runway(
+        match &tools.mission {
+            Mission::Flight(r) | Mission::Resume(r) => r.arrival_rwy.clone(),
+            Mission::Circuit { .. } => None,
+        },
+        "arm",
+    );
     if let Ok(mut m) = MISSION.lock() {
         *m = match tools.mission {
             Mission::Circuit { .. } => "circuit",
@@ -696,7 +737,8 @@ async fn wait_enroute_working_the_radio(
                             "challenged": challenged,
                         }),
                     );
-                    call_inbound(xp, ctx, voice, callsign, dkhz, true, None).await;
+                    call_inbound(xp, ctx, voice, callsign, dkhz, true, arrival_runway().as_deref())
+                        .await;
                 }
             }
         } else if challenged {
@@ -2316,7 +2358,11 @@ async fn fly_route(
         "dir": wind.map(|(d, _)| d.round()),
         "kts": wind.map(|(_, k)| k.round()),
     });
+    // The runway chosen at the arm, flown unless the arrival's own safety
+    // rules overrule it (said) or the tower names another (said).
+    let planned = arrival_runway();
     let build = |forced: Option<String>| {
+        let planned = planned.clone();
         let (apt_dat, cifp, fixp, navp) = (
             crate::tools::autoland::apt_dat_path(),
             config.cifp_dir.clone(),
@@ -2331,6 +2377,7 @@ async fn fly_route(
                 build_arrival(
                     &apt_dat, &cifp, &fixp, &navp, &dest, lat, lon, cfg, ias, wind,
                     forced.as_deref(),
+                    planned.as_deref(),
                 )
             })
             .await
@@ -2339,12 +2386,23 @@ async fn fly_route(
                 rwy_id: None,
                 tower_khz: None,
                 mountain_msa_ft: None,
+                overruled: None,
             })
         }
     };
     let mut built = {
         build(None).await
     };
+    if let (Some(was), Some(why)) = (planned.as_deref(), built.overruled) {
+        event(
+            "arrival_runway_overruled",
+            json!({ "planned": was, "now": built.rwy_id, "why": why, "wind": wind_detail }),
+        );
+        if let Some(line) = overruled_line(was, built.rwy_id.as_deref(), why) {
+            announce(voice, Priority::Advisory, &line);
+        }
+    }
+    set_arrival_runway(built.rwy_id.clone(), "arrival");
     if route
         .local_runway
         .as_ref()
@@ -2434,6 +2492,7 @@ async fn fly_route(
                     Priority::Advisory,
                     &format!("Tower wants runway {spoken}. Setting up for it."),
                 );
+                set_arrival_runway(Some(tower_rwy.clone()), "tower");
                 built = theirs;
             } else {
                 event(
@@ -2862,6 +2921,7 @@ pub fn brief_arrival(
     cifp: &str,
     fix_path: &str,
     dest: &str,
+    runway: Option<&str>,
 ) -> Result<String, String> {
     let airport = crate::nav::find_airport(apt_dat, dest)
         .ok()
@@ -2946,12 +3006,28 @@ pub fn brief_arrival(
             ));
         }
     }
-    Ok(arrival_brief_line(
+    let line = arrival_brief_line(
         &airport.name,
         airport.runways.len() * 2,
         &published,
         &straight_in,
-    ))
+    );
+    // The runway chosen at the arm, the one the arrival flies
+    // ([`arrival_runway`]), named with the approach it has.
+    Ok(match runway {
+        Some(r) => format!("{line} {}", planned_runway_line(r, &published, &straight_in)),
+        None => line,
+    })
+}
+
+/// "Planned runway one two, the ILS." Pure.
+fn planned_runway_line(runway: &str, published: &[(&str, String)], straight_in: &[String]) -> String {
+    let spoken = crate::circuit::spell_runway(runway);
+    match published.iter().find(|(_, s)| *s == spoken) {
+        Some((kind, _)) => format!("Planned runway {spoken}, the {kind}."),
+        None if straight_in.contains(&spoken) => format!("Planned runway {spoken}, the straight-in."),
+        None => format!("Planned runway {spoken}."),
+    }
 }
 
 /// Sector altitude this far above the field makes it a mountain field: no
@@ -3033,6 +3109,9 @@ struct Arrival {
     /// (`mountain_field`): with no approach we can fly, the arrival hands the
     /// aircraft over above it instead of landing visually.
     mountain_msa_ft: Option<f64>,
+    /// Why the runway chosen at the arm is not `rwy_id` ([`planned_end_verdict`]
+    /// or "no_approach"); `None` when it stands or there was none.
+    overruled: Option<&'static str>,
 }
 
 /// The inbound call to the destination's tower, once its station is the one
@@ -3150,6 +3229,7 @@ fn build_arrival(
     approach_ias: f64,
     wind: Option<(f64, f64)>,
     forced_rwy: Option<&str>,
+    planned_rwy: Option<&str>,
 ) -> Arrival {
     let Some(airport) = crate::nav::find_airport(apt_dat, dest).ok().flatten() else {
         return Arrival {
@@ -3157,6 +3237,7 @@ fn build_arrival(
             rwy_id: None,
             tower_khz: None,
             mountain_msa_ft: None,
+            overruled: None,
         };
     };
     let tower_khz = airport.freq(crate::nav::FREQ_TOWER).map(|f| f.khz);
@@ -3180,15 +3261,25 @@ fn build_arrival(
             rwy_id: Some(forced.to_string()),
             tower_khz,
             mountain_msa_ft,
+            overruled: None,
         };
     }
-    // Into the wind when it's strong enough to matter...
+    // The runway chosen at the arm, which the STAR flown serves, while it is
+    // one we may land on in this wind...
+    let (planned, mut overruled) = match planned_rwy {
+        Some(p) => match planned_end_verdict(&airport, p, wind) {
+            Ok(()) => (Some(p.to_string()), None),
+            Err(why) => (None, Some(why)),
+        },
+        None => (None, None),
+    };
+    // ...else into the wind when it's strong enough to matter...
     let by_wind = wind
         .filter(|(_, kts)| *kts >= WIND_DECISIVE_KTS)
         .and_then(|(dir, kts)| crate::nav::best_runway_for_wind(&airport.runways, dir, kts))
         .map(|(id, _, _)| id);
     // ...otherwise the end most aligned with our arrival bearing.
-    let rwy_id = by_wind.or_else(|| {
+    let rwy_id = planned.or(by_wind).or_else(|| {
         let diff = |a: f64, b: f64| ((a - b + 540.0).rem_euclid(360.0) - 180.0).abs();
         let (mut best_id, mut best_score) = (None::<String>, f64::MAX);
         // Hard runways only: LOWI's alignment pick was the grass "26R".
@@ -3215,6 +3306,7 @@ fn build_arrival(
             rwy_id: None,
             tower_khz,
             mountain_msa_ft,
+            overruled,
         };
     };
     let plan_for = |id: &str| {
@@ -3233,6 +3325,7 @@ fn build_arrival(
             rwy_id: Some(rwy_id),
             tower_khz,
             mountain_msa_ft,
+            overruled,
         };
     }
     // No approach we can fly to that end: another end that HAS one, if its
@@ -3242,11 +3335,15 @@ fn build_arrival(
     // option anyone should take (2026-09-24).
     for id in approach_fallback_ends(&airport, &rwy_id, wind) {
         if let Some(plan) = plan_for(&id) {
+            if planned_rwy == Some(rwy_id.as_str()) {
+                overruled = Some("no_approach");
+            }
             return Arrival {
                 plan: Some(plan),
                 rwy_id: Some(id),
                 tower_khz,
                 mountain_msa_ft,
+                overruled,
             };
         }
     }
@@ -3255,7 +3352,48 @@ fn build_arrival(
         rwy_id: Some(rwy_id),
         tower_khz,
         mountain_msa_ft,
+        overruled,
     }
+}
+
+/// May the arrival land on the runway chosen at the arm? Only an end of this
+/// field's landable runways, and only with no more tailwind than an approach
+/// is flown with ([`APPROACH_TAILWIND_MAX_KTS`]): the METAR at the arm is
+/// 45 minutes old at the arrival, and a safety limit is not a re-pick.
+/// `Err` names why ("not_at_field", "tailwind").
+fn planned_end_verdict(
+    airport: &crate::nav::AirportInfo,
+    planned: &str,
+    wind: Option<(f64, f64)>,
+) -> Result<(), &'static str> {
+    if !crate::nav::assignable_runways(&airport.runways)
+        .any(|r| r.ident_a.eq_ignore_ascii_case(planned) || r.ident_b.eq_ignore_ascii_case(planned))
+    {
+        return Err("not_at_field");
+    }
+    match wind.and_then(|(d, k)| crate::nav::headwind_for(&airport.runways, planned, d, k)) {
+        Some(hw) if hw < -APPROACH_TAILWIND_MAX_KTS => Err("tailwind"),
+        _ => Ok(()),
+    }
+}
+
+/// What the crew says when the arrival cannot keep the runway chosen at the
+/// arm. Pure.
+fn overruled_line(planned: &str, now: Option<&str>, why: &str) -> Option<String> {
+    let now = now.filter(|n| !n.eq_ignore_ascii_case(planned))?;
+    let (was, now) = (
+        crate::circuit::spell_runway(planned),
+        crate::circuit::spell_runway(now),
+    );
+    Some(match why {
+        "tailwind" => format!(
+            "The wind has gone round: too much tailwind for runway {was}. Setting up for runway {now}."
+        ),
+        "no_approach" => format!(
+            "There's no approach I can fly to runway {was}. Setting up for runway {now}."
+        ),
+        _ => format!("Runway {was} isn't one we can land on. Setting up for runway {now}."),
+    })
 }
 
 /// The runway the destination's tower has given an arrival (its `Inbound`
@@ -4411,6 +4549,7 @@ mod tests {
             origin_icao: "LIME".into(),
             origin_rwy: Some("28".into()),
             fms_payload: "LIME,45.6689,9.7003,0|ME609,45.7,9.8,5000|LIPE,44.5354,11.2887,0".into(),
+            arrival_rwy: None,
         };
         let fallback_route = route.clone();
         // The Evolution's own climb (profile best_climb_fpm); the GA default
@@ -4888,6 +5027,77 @@ mod tests {
 
     use super::departure_check_in;
 
+    /// The runway chosen at the arm is the runway the arrival sets up for
+    /// (LIBP-LEMG 2026-09-26: UNTO2A chosen for 12, the ILS 13 flown after a
+    /// re-pick from a METAR that had moved 20 degrees), unless landing there
+    /// breaks the arrival's own limits: more tailwind than an approach is
+    /// flown with, or no approach we can fly. Gibraltar as the brief test
+    /// has it: a straight-in on 27 only.
+    #[test]
+    fn the_arrival_flies_the_runway_the_arm_chose() {
+        use std::io::Write;
+        let dir = std::env::temp_dir().join("xvl-arrival-planned");
+        std::fs::create_dir_all(&dir).unwrap();
+        let apt = dir.join("apt.dat");
+        let mut f = std::fs::File::create(&apt).unwrap();
+        writeln!(f, "1 11 0 0 LXGB Gibraltar").unwrap();
+        writeln!(f, "100 46 0 0 0 0 0 0 09 36.1509000 -5.3581000 0 0 0 0 0 0 27 36.1515000 -5.3412000 0 0 0 0 0 0").unwrap();
+        f.flush().unwrap();
+        let fix = dir.join("earth_fix.dat");
+        let mut f = std::fs::File::create(&fix).unwrap();
+        writeln!(f, "36.157361111 -5.240083333 27D05 LXGB LX 5906505 RWY27 D05").unwrap();
+        writeln!(f, "36.104666667 -5.405333333 09D05 LXGB LX 5906505 RWY09 D05").unwrap();
+        f.flush().unwrap();
+        let (apt, fix) = (apt.to_str().unwrap().to_string(), fix.to_str().unwrap().to_string());
+        let cifp = dir.join("no-cifp").to_str().unwrap().to_string();
+        let nav = dir.join("earth_nav.dat").to_str().unwrap().to_string();
+        let build = |wind: Option<(f64, f64)>, planned: Option<&str>| {
+            super::build_arrival(
+                &apt, &cifp, &fix, &nav, "LXGB", 36.16, -5.05,
+                crate::tools::autopilot::ApConfig::default(), 87.0, wind, None, planned,
+            )
+        };
+        // Eight knots of tailwind: inside an approach's limit, the arm's 27
+        // stands.
+        let a = build(Some((90.0, 8.0)), Some("27"));
+        assert_eq!((a.rwy_id.as_deref(), a.overruled), (Some("27"), None));
+        assert!(a.plan.is_some(), "the straight-in to 27");
+        // Fifteen knots of it is past an approach's limit: overruled, said.
+        let a = build(Some((90.0, 15.0)), Some("27"));
+        assert_eq!((a.rwy_id.as_deref(), a.overruled), (Some("09"), Some("tailwind")));
+        assert_eq!(
+            super::overruled_line("27", a.rwy_id.as_deref(), "tailwind").unwrap(),
+            "The wind has gone round: too much tailwind for runway two seven. Setting up for runway zero nine."
+        );
+        // An end with no approach we can fly hands over to one that has.
+        let a = build(None, Some("09"));
+        assert_eq!((a.rwy_id.as_deref(), a.overruled), (Some("27"), Some("no_approach")));
+        // A runway the field does not have is no runway.
+        let a = build(Some((270.0, 10.0)), Some("13"));
+        assert_eq!((a.rwy_id.as_deref(), a.overruled), (Some("27"), Some("not_at_field")));
+        // The tower's runway outranks the arm's.
+        let a = super::build_arrival(
+            &apt, &cifp, &fix, &nav, "LXGB", 36.16, -5.05,
+            crate::tools::autopilot::ApConfig::default(), 87.0, None, Some("09"), Some("27"),
+        );
+        assert_eq!((a.rwy_id.as_deref(), a.overruled), (Some("09"), None));
+        // Nothing is said when nothing changed.
+        assert_eq!(super::overruled_line("27", Some("27"), "tailwind"), None);
+    }
+
+    /// The seam every reader of the arrival runway shares: set at the arm,
+    /// overwritten only through `set_arrival_runway`, cleared with the
+    /// mission.
+    #[test]
+    fn the_arrival_runway_is_one_value() {
+        super::set_arrival_runway(Some("12".into()), "arm");
+        assert_eq!(super::arrival_runway().as_deref(), Some("12"));
+        super::set_arrival_runway(Some("13".into()), "tower");
+        assert_eq!(super::arrival_runway().as_deref(), Some("13"));
+        super::stop_active();
+        assert_eq!(super::arrival_runway(), None);
+    }
+
     // The arrival is briefed at the gate. Gibraltar, as the data has it: no
     // coded approach, DME fixes on 27's centreline, 09's off it.
     #[test]
@@ -4919,15 +5129,36 @@ mod tests {
             cifp.to_str().unwrap(),
             fix.to_str().unwrap(),
             "LXGB",
+            None,
         )
         .expect("a brief");
         assert_eq!(brief, "Gibraltar has a straight-in on two seven.");
+        // The runway the arm chose is briefed with what it offers.
+        let planned = |rwy| {
+            super::brief_arrival(
+                apt.to_str().unwrap(),
+                cifp.to_str().unwrap(),
+                fix.to_str().unwrap(),
+                "LXGB",
+                Some(rwy),
+            )
+            .unwrap()
+        };
+        assert_eq!(
+            planned("27"),
+            "Gibraltar has a straight-in on two seven. Planned runway two seven, the straight-in."
+        );
+        assert_eq!(
+            planned("09"),
+            "Gibraltar has a straight-in on two seven. Planned runway zero nine."
+        );
         // A destination the data doesn't have is a refusal, at the gate.
         let why = super::brief_arrival(
             apt.to_str().unwrap(),
             cifp.to_str().unwrap(),
             fix.to_str().unwrap(),
             "ZZZZ",
+            None,
         )
         .expect_err("refused");
         assert!(why.contains("ZZZZ"), "{why}");
@@ -5125,7 +5356,7 @@ mod arrival_watch_tests {
         for wind in [Some((360.0, 17.0)), None] {
             let a = super::build_arrival(
                 apt, cifp, fix, nav, "LSZS", 46.779, 10.259,
-                crate::tools::autopilot::ApConfig::default(), 87.0, wind, None,
+                crate::tools::autopilot::ApConfig::default(), 87.0, wind, None, None,
             );
             println!("LSZS wind {wind:?}: runway {:?} plan {:?}", a.rwy_id, a.plan.as_ref().map(|p| p.name.clone()));
             if let Some(p) = &a.plan {
@@ -5135,20 +5366,20 @@ mod arrival_watch_tests {
                 }
             }
         }
-        match super::brief_arrival(apt, cifp, fix, "LSZS") {
+        match super::brief_arrival(apt, cifp, fix, "LSZS", None) {
             Ok(l) | Err(l) => println!("LSZS brief: {l}"),
         }
         for forced in ["08", "26"] {
             let a = super::build_arrival(
                 apt, cifp, fix, nav, "LOWI", 47.77, 11.79,
-                crate::tools::autopilot::ApConfig::default(), 87.0, Some((80.0, 6.0)), Some(forced),
+                crate::tools::autopilot::ApConfig::default(), 87.0, Some((80.0, 6.0)), Some(forced), None,
             );
             println!("tower wants {forced}: plan {:?}", a.plan.as_ref().map(|p| p.name.clone()));
         }
         for wind in [Some((80.0, 6.0)), Some((110.0, 4.0)), Some((260.0, 12.0)), None] {
             let a = super::build_arrival(
                 apt, cifp, fix, nav, "LOWI", 47.77, 11.79,
-                crate::tools::autopilot::ApConfig::default(), 87.0, wind, None,
+                crate::tools::autopilot::ApConfig::default(), 87.0, wind, None, None,
             );
             println!("wind {wind:?}: runway {:?}", a.rwy_id);
             match &a.plan {
