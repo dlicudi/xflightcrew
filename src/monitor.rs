@@ -3180,7 +3180,7 @@ pub async fn run(
                 // speaks; otherwise the copilot flags it as crew — a
                 // controller can't berate a radio that isn't listening.
                 {
-                    if let Some(call) = crate::station::compliance_tick(
+                    if let Some(call) = crate::station::compliance_tick_facing(
                         snap.lat,
                         snap.lon,
                         snap.alt_ft,
@@ -3188,6 +3188,7 @@ pub async fn run(
                         snap.groundspeed_kts,
                         tuned_speaker.is_some(),
                         now,
+                        Some(snap.heading_deg).filter(|h| *h != 0.0),
                     ) {
                         crate::blackbox::record(
                             "atc",
