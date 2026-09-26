@@ -52,6 +52,10 @@ pub fn report<'a>(lines: impl Iterator<Item = &'a str>) -> String {
         hms(flight[flight.len() - 1]["t"].as_f64().unwrap_or(0.0)),
     ));
     out.push_str(&summarise(flight));
+    // The flight-test card reads the WHOLE file, not the last flight: an
+    // item is retired by whichever sortie exercised it.
+    let all: Vec<&Value> = events.iter().collect();
+    out.push_str(&crate::test_card::report(&all));
     out
 }
 
@@ -555,6 +559,8 @@ mod tests {
         );
         assert!(r.contains("CRASH at 114 ft"), "{r}");
         assert!(r.contains("full auto: airborne (agl_ft=1019.6)"), "{r}");
+        // The flight-test card closes the debrief, judged over the file.
+        assert!(r.contains("Flight-test card ("), "{r}");
     }
 
     /// LFPG 09R, 2026-09-22: the last airborne sample was already on the
