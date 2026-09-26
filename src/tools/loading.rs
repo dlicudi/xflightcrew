@@ -151,7 +151,7 @@ impl Tool for LoadAircraft {
 /// a SimBrief plan is fetched again, because the pilot regenerates it on the
 /// website and says the same words (`PlanFetch::Asked`'s rule), with the
 /// shelf as the fallback when the site does not answer.
-async fn plan_for_loading(simbrief_id: &str) -> std::result::Result<FlightPlan, String> {
+pub(crate) async fn plan_for_loading(simbrief_id: &str) -> std::result::Result<FlightPlan, String> {
     if let Some(local) = crate::simbrief::local_plan() {
         return Ok(local);
     }

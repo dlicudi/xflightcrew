@@ -36,6 +36,7 @@ pub mod radio;
 pub mod recover;
 pub mod reminder;
 pub mod reverse;
+pub mod setup;
 pub mod signs;
 pub mod speedhold;
 pub mod takeoff;
@@ -693,6 +694,7 @@ impl Registry {
         // The load sheet is the plan's, not an airframe system: every
         // aircraft has tanks and a payload.
         tools.push(Box::new(loading::LoadAircraft));
+        tools.push(Box::new(setup::SetUpFlight));
 
         // Reminders ("wake me at top of descent", "tell me at the next waypoint") are
         // crew memory, not an airframe system, so available on any aircraft.

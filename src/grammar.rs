@@ -794,7 +794,28 @@ fn take_us_to(t: &str) -> Option<ToolCall> {
     ))
 }
 
+/// "Set up the flight": the plan's aircraft at its origin (`set_up_flight`).
+/// CLOSED: it ends the current flight, so nothing near it ("set up the ILS",
+/// "set up for landing") may land here.
+pub fn set_up_flight_request(t: &str) -> bool {
+    matches!(
+        t.trim_end_matches(['.', '!', '?']),
+        "set up the flight"
+            | "set up my flight"
+            | "set up the flight plan"
+            | "set up my flight plan"
+            | "set up for the flight"
+            | "prepare the flight"
+            | "prepare my flight"
+            | "set up the flight from the plan"
+            | "load the flight and the aircraft"
+    )
+}
+
 fn flight_plan_call(t: &str) -> Option<ToolCall> {
+    if set_up_flight_request(t) {
+        return Some(call("set_up_flight", json!({})));
+    }
     if resume_plan_request(t) {
         return Some(call("full_auto", json!({ "resume": true })));
     }
@@ -2851,6 +2872,16 @@ mod tests {
             let c = v.remove(0);
             (c.name, c.arguments)
         })
+    }
+
+    #[test]
+    fn set_up_the_flight_is_a_closed_phrase() {
+        for w in ["set up the flight", "Set up my flight.", "prepare the flight"] {
+            assert_eq!(one(w).unwrap().0, "set_up_flight", "{w}");
+        }
+        for w in ["set up the ils", "set up for landing", "set up the approach"] {
+            assert!(!set_up_flight_request(w), "{w}");
+        }
     }
 
     #[test]

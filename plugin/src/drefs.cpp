@@ -16,6 +16,7 @@
 #include "XPLMUtilities.h"
 
 #include "fms.h"
+#include "flightinit.h"
 #include "audio.h"
 #include "panel.h"
 
@@ -973,6 +974,7 @@ void start() {
         nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
         nullptr, nullptr, nullptr, nullptr, ReadText, WriteAircraft, &g_aircraft, &g_aircraft);
     fms::register_datarefs();
+    flightinit::start();
     audio::register_datarefs();
     g_request_dref = XPLMRegisterDataAccessor(
         "xcopilot/request", xplmType_Int, 1,
@@ -1205,6 +1207,7 @@ void stop_rest() {
     if (g_strip_dref) { XPLMUnregisterDataAccessor(g_strip_dref); g_strip_dref = nullptr; }
     if (g_request_dref) { XPLMUnregisterDataAccessor(g_request_dref); g_request_dref = nullptr; }
     audio::unregister_datarefs();
+    flightinit::stop();
     fms::unregister_datarefs();
     if (g_aircraft_dref) { XPLMUnregisterDataAccessor(g_aircraft_dref); g_aircraft_dref = nullptr; }
     if (g_alert_dref) { XPLMUnregisterDataAccessor(g_alert_dref); g_alert_dref = nullptr; }
