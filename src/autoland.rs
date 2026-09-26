@@ -3261,6 +3261,9 @@ pub struct FlarePitch {
     trim: f64,
     held: f64,
     gains: FlareGains,
+    /// The gentlest sink the flare has reached (fpm, negative), since it
+    /// began: the target never asks for more sink than that again.
+    best_vvi: Option<f64>,
 }
 
 /// The flare law's numbers for THIS airframe (the profile's
@@ -3321,6 +3324,9 @@ const FLARE_D_PER_100FPM_S: f64 = 0.050;
 /// it is there to find the standing pull, not to fly the arrest — wound
 /// harder it carried the 737 through its target into a 66 fpm float.
 const FLARE_TRIM_PER_100FPM_S: f64 = 0.015;
+/// The flare holds the gentlest sink it has reached, but never asks for
+/// less than this (fpm): a float is not a landing either.
+const FLARE_HOLD_MIN_SINK_FPM: f64 = 150.0;
 /// Total elevator the flare may command. Up is positive.
 const FLARE_PITCH_MAX: f64 = 0.35;
 /// ...and the push, which is deliberately far smaller: the ground is there.
@@ -3345,6 +3351,19 @@ impl FlarePitch {
     ) -> f64 {
         let dt = dt_s.clamp(0.02, 0.5);
         let g = self.gains;
+        // In the flare the sink never grows again: the target is held to the
+        // gentlest sink reached (no gentler than FLARE_HOLD_MIN_SINK). The
+        // roundout had the 737 at -300 by 29 ft; the exponential target was
+        // still -660 there, the law saw nothing to pull for, and the sink
+        // built back to -587 at the wheels (LEMG 13, 2026-09-26).
+        let target_fpm = if ratchet {
+            let best = self.best_vvi.map_or(vvi_fpm, |b| b.max(vvi_fpm));
+            self.best_vvi = Some(best);
+            target_fpm.max(best.min(-FLARE_HOLD_MIN_SINK_FPM))
+        } else {
+            self.best_vvi = None;
+            target_fpm
+        };
         // Positive error = sinking FASTER than wanted = pull.
         let err = (target_fpm - vvi_fpm) / 100.0;
         self.trim = (self.trim + err * g.trim_rate * dt).clamp(g.min, g.max);
@@ -4917,6 +4936,20 @@ mod tests {
     /// retard took the lever to idle IN the float, and the sink came back to
     /// -859 fpm. A jet retards by height: nothing above it, and below it a
     /// ramp that reaches idle as the wheels arrive.
+    /// LEMG 13, the approach test (2026-09-26): -300 by 29 ft, then the sink
+    /// built back to -587 against a target still steeper than the aircraft.
+    /// Held to the best sink reached, the law pulls as soon as it grows.
+    #[test]
+    fn the_flare_never_lets_the_sink_grow_again() {
+        let mut law = FlarePitch::default();
+        law.step(-450.0, -700.0, 0.0, 0.2, false);
+        // Flare: reaches -300 while the target is -636.
+        let a = law.step(-636.0, -300.0, 0.0, 0.2, true);
+        // The sink grows to -400 with the target still -580: pull more.
+        let b = law.step(-580.0, -400.0, -200.0, 0.2, true);
+        assert!(b > a, "pulled for the growing sink: {a} -> {b}");
+    }
+
     /// LEMG circuit (2026-09-26): the roundout's pull is where the flare
     /// starts. The flare's first ask (a path target the aircraft is already
     /// shallower than) must not take the column forward at the hand-over.

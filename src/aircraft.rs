@@ -2897,6 +2897,11 @@ mod tests {
                 "MARGIN: over the airframe's own .acf gear-warning speed",
             ),
             (
+                "autoland",
+                "FLARE_HOLD_MIN_SINK_FPM",
+                "FLOOR: a touchdown sink, not a speed; the flare's own gentlest ask",
+            ),
+            (
                 "procedure",
                 "FLAPS_ON_SPEED_MARGIN_KTS",
                 "MARGIN: over the airframe's own clean floor",
