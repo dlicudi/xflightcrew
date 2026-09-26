@@ -911,6 +911,9 @@ pub fn run_autoland_scoped(
             // standing pull must not survive a go-around into the next one.
             let mut flare_pitch =
                 FlarePitch::with_gains(FlareGains::from_profile(crate::aircraft::flare_elevator()));
+            // ...or, where the airframe declares its elevator's response,
+            // the arrest flown on that model (`FlareModel`, the 737).
+            let mut flare_model = FlareModel::from_profile(crate::aircraft::flare_elevator());
             // Last tick was the flare: a balloon stays in it (`hold_flare`).
             let mut flaring = false;
             let mut pitch_yielded = false;
@@ -1772,22 +1775,39 @@ pub fn run_autoland_scoped(
                 // measurements in hand: anywhere else the dial is right and
                 // proven. The channel is a 1 s expiring heartbeat, so simply
                 // ceasing to write it hands the pitch back by itself.
+                let mut model_out: Option<FlareModelOut> = None;
                 let flare_elev = match (g.arresting, vvi, pitch_yielded) {
                     // Once the pilot has taken the pitch it stays taken for
                     // this approach — the debounce the taxi and takeoff
                     // channels learned: a latch that re-arms is a fight over
                     // a control with a person on the other end.
-                    (true, Some(v), false) => {
-                        Some(flare_pitch.step(
+                    (true, Some(v), false) => match flare_model.as_mut() {
+                        Some(m) => {
+                            let o = m.step(radio_ft, gs_kts, v, tick_dt);
+                            model_out = Some(o);
+                            Some(o.elev)
+                        }
+                        None => Some(flare_pitch.step(
                             g.target_vs_fpm,
                             v,
                             vvi_trend,
                             tick_dt,
                             g.phase == ApproachPhase::Flare,
-                        ))
+                        )),
+                    },
+                    // No sink read: no decision. The model keeps time with
+                    // what is on the channel (it expires by itself).
+                    (true, None, false) if flare_model.is_some() => {
+                        if let Some(m) = flare_model.as_mut() {
+                            m.coast(tick_dt);
+                        }
+                        None
                     }
                     _ => {
                         flare_pitch.reset();
+                        if let Some(m) = flare_model.as_mut() {
+                            m.reset();
+                        }
                         None
                     }
                 };
@@ -1875,6 +1895,12 @@ pub fn run_autoland_scoped(
                     "phase": format!("{:?}", g.phase), "ga": ga, "crab": crab, "crab_raw": crab_raw,
                     "trim": trim, "xtk_m": xtk_now * M_PER_NM,
                     "flare_elev": flare_elev, "flare_ail": flare_ail, "hands": arrest_hands,
+                    // The model flare's own numbers: the sink it flew toward,
+                    // the height that was taken at, and the sink the
+                    // elevator did not explain.
+                    "flare_target": model_out.map(|o| o.target_fpm),
+                    "flare_ahead": model_out.map(|o| o.ahead_ft),
+                    "flare_unexplained": model_out.map(|o| o.unexplained_fpm),
                     "phi": phi_r.as_ref().ok().copied(),
                     // Which leg of a reversal is flying: every pattern tick
                     // reports phase Intercept, so without this the outbound,
@@ -2055,6 +2081,9 @@ pub fn run_autoland_scoped(
                         );
                     }
                     flare_pitch.reset();
+                    if let Some(m) = flare_model.as_mut() {
+                        m.reset();
+                    }
                 }
                 // Likewise the roll: the plugin dropped that override the
                 // frame the hand moved, and the elevator keeps flying.
@@ -3464,6 +3493,198 @@ impl FlarePitch {
     /// next approach. The airframe's numbers stay.
     pub fn reset(&mut self) {
         *self = Self::with_gains(self.gains);
+    }
+}
+
+/// The flare flown on a MODEL of the airframe's elevator, for an airframe
+/// that declares one (`flare_elevator.model`,
+/// [`crate::aircraft::FlareModelProfile`]).
+///
+/// The P+D tracker above treats the sink as something the elevator
+/// accelerates: pull and it keeps arresting, let go and it keeps what it
+/// got. The 737's six LEMG 13 flares of 2026-09-26 say otherwise. A
+/// constant pull HOLDS a sink (0.23 settled it at -350 fpm, 0.084 at -590),
+/// and the aircraft followed the column 1.8 s late through two 1 s lags.
+/// Against that plant the tracker could only be too soft or ring: 0.084
+/// held from the roundout let the sink grow back to -587 (17:17Z); at gain
+/// 1.0 the roundout overshot to -156 at 42 ft, pushed, and the re-pull came
+/// 1.8 s too late for -769 (17:25Z); at gain 0.6 the pull settled the sink
+/// at -345 by 10 ft against a target that was -335 there, so the law saw
+/// nothing to do, and the retard and the bleeding speed took it to -409 and
+/// -390 (17:32Z, 17:43Z).
+///
+/// So the law asks the model, not the error: the elevator is the pull the
+/// model says HOLDS the sink wanted, against the sink the elevator does not
+/// explain (the measured sink less the model's own delayed answer to what
+/// has been written: the trim the autopilot left, the thrust leaving, the
+/// speed bleeding all land there, a dead time late). The lags are inverted
+/// over `settle_s`, so the gate kicks the column and the model's own
+/// arrival takes it back, with no ringing to wait for. And the sink wanted
+/// is the exponential flare's at the height the aircraft WILL have `lead_s`
+/// ahead, because anything asked now arrives then. Never a push past the
+/// airframe's `max_push`, never a pull past its `max`.
+#[derive(Debug, Clone)]
+pub struct FlareModel {
+    cfg: crate::aircraft::FlareModelProfile,
+    max: f64,
+    min: f64,
+    tau_s: f64,
+    /// Model time, seconds, and the elevator at each substep, for the
+    /// delayed copy.
+    t: f64,
+    hist: std::collections::VecDeque<(f64, f64)>,
+    /// The model's delayed answer to the elevator (two lag states), fpm.
+    b1: f64,
+    b2: f64,
+    /// The elevator the model believes is on the channel.
+    el: f64,
+    /// The sink wanted, filtered through the settle time (two states).
+    r1: Option<f64>,
+    r2: f64,
+    /// The sink the elevator does not explain, smoothed.
+    unexplained: Option<f64>,
+    /// Seconds since the last write (a failed read coasts).
+    coasting_s: f64,
+}
+
+/// One tick of [`FlareModel`], for the blackbox as much as the channel.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct FlareModelOut {
+    /// The elevator to write.
+    pub elev: f64,
+    /// The sink the law flew toward, fpm.
+    pub target_fpm: f64,
+    /// The height the target was taken at, ft.
+    pub ahead_ft: f64,
+    /// The sink the elevator does not explain, fpm.
+    pub unexplained_fpm: f64,
+}
+
+/// The model's own integration step, seconds.
+const FLARE_MODEL_STEP_S: f64 = 0.02;
+/// The pitch channel expires this long after its last write.
+const FLARE_CHANNEL_EXPIRY_S: f64 = 1.0;
+
+impl FlareModel {
+    /// The law for this airframe's model, pull cap, push cap (negative) and
+    /// flare time constant.
+    pub fn new(cfg: crate::aircraft::FlareModelProfile, max: f64, min: f64, tau_s: f64) -> Self {
+        Self {
+            cfg,
+            max,
+            min,
+            tau_s: if tau_s.is_finite() && tau_s > 0.5 {
+                tau_s
+            } else {
+                5.0
+            },
+            t: 0.0,
+            hist: std::collections::VecDeque::new(),
+            b1: 0.0,
+            b2: 0.0,
+            el: 0.0,
+            r1: None,
+            r2: 0.0,
+            unexplained: None,
+            coasting_s: 0.0,
+        }
+    }
+
+    /// From the airframe's `flare_elevator:`; `None` unless it declares a
+    /// model (every other airframe keeps [`FlarePitch`]).
+    pub fn from_profile(p: Option<crate::aircraft::FlareElevatorProfile>) -> Option<Self> {
+        let p = p.and_then(|p| p.valid())?;
+        let gains = FlareGains::from_profile(Some(p));
+        p.model
+            .map(|m| Self::new(m, gains.max, gains.min, p.tau_s.unwrap_or(5.0)))
+    }
+
+    /// A new approach: nothing written, nothing owed.
+    pub fn reset(&mut self) {
+        *self = Self::new(self.cfg, self.max, self.min, self.tau_s);
+    }
+
+    /// Advance the model `dt` with the elevator on the channel.
+    fn advance(&mut self, dt: f64) {
+        let n = (dt / FLARE_MODEL_STEP_S).round().max(1.0) as usize;
+        let h = dt / n as f64;
+        let (k, lag, dead) = (self.cfg.fpm_per_elevator, self.cfg.lag_s, self.cfg.dead_s);
+        for _ in 0..n {
+            self.t += h;
+            self.hist.push_back((self.t, self.el));
+            while self.hist.len() > 1 && self.hist[1].0 <= self.t - dead {
+                self.hist.pop_front();
+            }
+            let delayed = match self.hist.front() {
+                Some(&(t0, e)) if t0 <= self.t - dead => e,
+                _ => 0.0,
+            };
+            self.b1 += (k * delayed - self.b1) * h / lag;
+            self.b2 += (self.b1 - self.b2) * h / lag;
+        }
+    }
+
+    /// No measurement this tick: nothing is decided, the model keeps time
+    /// with what is on the channel, and the channel itself runs out after
+    /// [`FLARE_CHANNEL_EXPIRY_S`].
+    pub fn coast(&mut self, dt_s: f64) {
+        let dt = dt_s.clamp(0.02, 3.0);
+        self.advance(dt);
+        self.coasting_s += dt;
+        if self.coasting_s >= FLARE_CHANNEL_EXPIRY_S {
+            self.el = 0.0;
+        }
+    }
+
+    /// The sink wanted at this height and groundspeed (the exponential
+    /// flare's, taken `lead_s` ahead), and the height it was taken at. Pure.
+    pub fn target_fpm(&self, radio_ft: f64, gs_kts: f64, vvi_fpm: f64) -> (f64, f64) {
+        let nominal = -(gs_kts.max(0.0) / 60.0) * gp_ft_per_nm();
+        let (_, flare_vs) = arrest_targets_fpm(nominal);
+        let ahead = (radio_ft + vvi_fpm.min(0.0) * self.cfg.lead_s / 60.0).max(0.0);
+        (
+            flare_target_with(ahead, flare_vs, nominal, Some(self.tau_s)),
+            ahead,
+        )
+    }
+
+    /// One tick: the elevator for this measured sink.
+    pub fn step(&mut self, radio_ft: f64, gs_kts: f64, vvi_fpm: f64, dt_s: f64) -> FlareModelOut {
+        let dt = dt_s.clamp(0.02, 3.0);
+        self.advance(dt);
+        self.coasting_s = 0.0;
+        let now = vvi_fpm - self.b2;
+        let unexplained = match self.unexplained {
+            Some(u) => u + (now - u) * (dt / self.cfg.observer_s).min(1.0),
+            None => now,
+        };
+        self.unexplained = Some(unexplained);
+        let (target, ahead) = self.target_fpm(radio_ft, gs_kts, vvi_fpm);
+        // The wanted sink starts where the aircraft IS, so the step at the
+        // gate is what the lag inversion kicks the column for.
+        let lam = self.cfg.settle_s;
+        let r1 = match self.r1 {
+            Some(r) => r,
+            None => {
+                self.r2 = vvi_fpm;
+                vvi_fpm
+            }
+        };
+        let d1 = (r1 - self.r2) / lam;
+        let d2 = ((target - r1) / lam - d1) / lam;
+        let a = (dt / lam).min(1.0);
+        self.r1 = Some(r1 + (target - r1) * a);
+        self.r2 += (r1 - self.r2) * a;
+        let lag = self.cfg.lag_s;
+        let wanted = self.r2 + 2.0 * lag * d1 + lag * lag * d2;
+        let elev = ((wanted - unexplained) / self.cfg.fpm_per_elevator).clamp(self.min, self.max);
+        self.el = elev;
+        FlareModelOut {
+            elev,
+            target_fpm: target,
+            ahead_ft: ahead,
+            unexplained_fpm: unexplained,
+        }
     }
 }
 
@@ -7721,6 +7942,7 @@ mod approach_power_floor_tests {
             max_push: 0.05,
             balloon_ease_per_s: Some(0.15),
             tau_s: None,
+            model: None,
         };
         let g = super::FlareGains::from_profile(Some(p));
         let d = super::FlareGains::default();
@@ -7770,5 +7992,490 @@ mod approach_power_floor_tests {
         assert_eq!(super::gp_ft_per_nm(), super::GLIDEPATH_FT_PER_NM);
         let g3 = super::guidance(map_lat, map_lon, 6598.0, 996.0, 80.0, 90.0, &rwy, 87.0, 25.0, 0.0);
         assert!(6598.0 - g3.glidepath_alt_ft > 250.0, "a 3 degree path calls it high");
+    }
+}
+
+/// The 737's flare against a plant FITTED to its own flares (LEMG 13,
+/// 2026-09-26, six landings flown with the servos out on the elevator
+/// channel). The old flare tests fly "elevator to vertical acceleration",
+/// an integrator: hold a pull and the sink keeps easing for ever. The
+/// recorded aircraft does not: a held pull HOLDS a sink (0.232 settled
+/// -350 at 17:32Z, 0.266 settled -345 at 17:43Z, 0.084 let it grow back to
+/// -590 at 17:17Z). Fitted to the elevator written against the sink that
+/// followed (all six arrests, gate to wheels, 36 fpm rms): 2,586 fpm of
+/// standing sink change per unit of elevator through two lags of 0.98 and
+/// 0.96 s after 1.8 s of dead time; 502 fpm per unit of lever through a
+/// 5 s lag; 23 fpm per knot of speed; each landing's own trimmed sink (the
+/// sink at zero elevator the autopilot's trim left behind) and the trend it
+/// was already on at the gate.
+#[cfg(test)]
+mod lemg_737_flare_tests {
+    use super::{
+        arrest_gates_ft, arrest_targets_fpm, flare_target_with, FlareGains, FlareModel, FlarePitch,
+        FlarePower,
+    };
+    use std::collections::VecDeque;
+
+    /// Where each recorded arrest began: the `arrest_hands` tick.
+    #[derive(Clone, Copy)]
+    struct Gate {
+        radio_ft: f64,
+        vvi_fpm: f64,
+        trend_fpm_s: f64,
+        ias_kts: f64,
+        throttle: f64,
+        /// Fitted per landing: the sink this approach's trim held with the
+        /// elevator at zero.
+        trimmed_sink_fpm: f64,
+        /// The sink at the wheels, as scored.
+        scored_fpm: f64,
+    }
+
+    /// 16:29, 17:04 (its FIRST contact, -794: the scored 278 is the second,
+    /// after a bounce to 12 ft), 17:17, 17:25, 17:32, 17:43Z.
+    const GATES: [Gate; 6] = [
+        Gate {
+            radio_ft: 79.2,
+            vvi_fpm: -727.0,
+            trend_fpm_s: -4.0,
+            ias_kts: 145.6,
+            throttle: 0.309,
+            trimmed_sink_fpm: -729.0,
+            scored_fpm: -445.0,
+        },
+        Gate {
+            radio_ft: 81.2,
+            vvi_fpm: -862.0,
+            trend_fpm_s: -3.0,
+            ias_kts: 147.8,
+            throttle: 0.300,
+            trimmed_sink_fpm: -931.0,
+            scored_fpm: -794.0,
+        },
+        Gate {
+            radio_ft: 79.5,
+            vvi_fpm: -748.0,
+            trend_fpm_s: -26.0,
+            ias_kts: 143.6,
+            throttle: 0.357,
+            trimmed_sink_fpm: -760.0,
+            scored_fpm: -537.0,
+        },
+        Gate {
+            radio_ft: 82.5,
+            vvi_fpm: -705.0,
+            trend_fpm_s: -56.0,
+            ias_kts: 146.1,
+            throttle: 0.372,
+            trimmed_sink_fpm: -645.0,
+            scored_fpm: -769.0,
+        },
+        Gate {
+            radio_ft: 81.7,
+            vvi_fpm: -752.0,
+            trend_fpm_s: -72.0,
+            ias_kts: 145.3,
+            throttle: 0.301,
+            trimmed_sink_fpm: -875.0,
+            scored_fpm: -411.0,
+        },
+        Gate {
+            radio_ft: 78.9,
+            vvi_fpm: -789.0,
+            trend_fpm_s: -53.0,
+            ias_kts: 145.1,
+            throttle: 0.301,
+            trimmed_sink_fpm: -958.0,
+            scored_fpm: -408.0,
+        },
+    ];
+
+    /// The plant's numbers; `FITTED` is the fit, the others bracket it.
+    #[derive(Clone, Copy, Debug)]
+    struct Fit {
+        fpm_per_elevator: f64,
+        lag1_s: f64,
+        lag2_s: f64,
+        dead_s: f64,
+    }
+    const FITTED: Fit = Fit {
+        fpm_per_elevator: 2586.0,
+        lag1_s: 0.98,
+        lag2_s: 0.96,
+        dead_s: 1.8,
+    };
+    const FPM_PER_LEVER: f64 = 502.0;
+    const LEVER_LAG_S: f64 = 5.0;
+    const FPM_PER_KT: f64 = 23.4;
+    /// The spread the six flares fitted one by one (the gain 2,250 to
+    /// 3,080), and the delay a third of a second either side.
+    fn plants() -> Vec<Fit> {
+        let f = FITTED;
+        vec![
+            f,
+            Fit {
+                fpm_per_elevator: 2250.0,
+                ..f
+            },
+            Fit {
+                fpm_per_elevator: 3080.0,
+                ..f
+            },
+            Fit {
+                dead_s: f.dead_s + 0.3,
+                ..f
+            },
+            Fit {
+                dead_s: f.dead_s - 0.3,
+                ..f
+            },
+            Fit {
+                fpm_per_elevator: 2250.0,
+                lag1_s: f.lag1_s * 1.2,
+                lag2_s: f.lag2_s * 1.2,
+                dead_s: f.dead_s + 0.3,
+            },
+            Fit {
+                fpm_per_elevator: 3080.0,
+                dead_s: f.dead_s - 0.3,
+                ..f
+            },
+        ]
+    }
+
+    struct Plant {
+        fit: Fit,
+        trimmed: f64,
+        x1: f64,
+        x2: f64,
+        lever_sink: f64,
+        lever0: f64,
+        ias: f64,
+        ias0: f64,
+        t: f64,
+        /// Elevator written, and when it reaches the aircraft.
+        queue: VecDeque<(f64, f64)>,
+        elev: f64,
+        vvi: f64,
+    }
+
+    impl Plant {
+        fn at(g: Gate, fit: Fit) -> Self {
+            let x2 = g.vvi_fpm - g.trimmed_sink_fpm;
+            Plant {
+                fit,
+                trimmed: g.trimmed_sink_fpm,
+                x1: x2 + g.trend_fpm_s * fit.lag2_s,
+                x2,
+                lever_sink: 0.0,
+                lever0: g.throttle,
+                ias: g.ias_kts,
+                ias0: g.ias_kts,
+                t: 0.0,
+                queue: VecDeque::new(),
+                elev: 0.0,
+                vvi: g.vvi_fpm,
+            }
+        }
+        fn write(&mut self, elev: f64) {
+            self.queue.push_back((self.t + self.fit.dead_s, elev));
+        }
+        fn step(&mut self, lever: f64, dt: f64) {
+            while self.queue.front().is_some_and(|&(t, _)| t <= self.t) {
+                self.elev = self.queue.pop_front().map_or(0.0, |(_, e)| e);
+            }
+            // Speed: what the thrust leaving and the pull cost (1.35 kt/s
+            // at idle with 0.3 of pull, as the 16:29Z flare lost it; 0.4
+            // kt/s on approach thrust at 0.25, as 17:32Z and 17:43Z did).
+            self.ias += (-(0.35 - lever.min(0.35)) * 3.0 - self.elev) * dt;
+            let f = self.fit;
+            self.x1 += (f.fpm_per_elevator * self.elev - self.x1) * dt / f.lag1_s;
+            self.x2 += (self.x1 - self.x2) * dt / f.lag2_s;
+            self.lever_sink +=
+                (FPM_PER_LEVER * (lever - self.lever0) - self.lever_sink) * dt / LEVER_LAG_S;
+            self.vvi =
+                self.trimmed + self.x2 + self.lever_sink + FPM_PER_KT * (self.ias - self.ias0);
+            self.t += dt;
+        }
+    }
+
+    /// The fitted plant IS the recorded aircraft: the 17:25Z arrest's own
+    /// elevator, replayed open loop, gives back its sink (the -769 landing).
+    #[test]
+    fn the_737_plant_is_fitted_to_its_own_flares() {
+        // (seconds from the gate, sink recorded, elevator written).
+        const REC: [(f64, f64, f64); 29] = [
+            (0.00, -705.0, 0.182),
+            (0.40, -727.0, 0.213),
+            (0.70, -744.0, 0.236),
+            (1.10, -758.0, 0.253),
+            (1.40, -759.0, 0.252),
+            (1.80, -737.0, 0.224),
+            (2.10, -694.0, 0.172),
+            (2.50, -637.0, 0.124),
+            (2.80, -558.0, 0.046),
+            (3.10, -453.0, -0.035),
+            (3.50, -361.0, -0.098),
+            (3.80, -284.0, -0.100),
+            (4.10, -196.0, -0.100),
+            (4.50, -156.0, -0.100),
+            (4.80, -157.0, -0.100),
+            (5.20, -200.0, -0.059),
+            (5.50, -267.0, 0.142),
+            (5.80, -347.0, 0.230),
+            (6.00, -410.0, 0.292),
+            (6.20, -483.0, 0.373),
+            (6.50, -557.0, 0.387),
+            (6.70, -640.0, 0.450),
+            (7.00, -708.0, 0.450),
+            (7.20, -745.0, 0.450),
+            (7.40, -769.0, 0.450),
+            (7.60, -775.0, 0.450),
+            (7.80, -763.0, 0.450),
+            (8.00, -722.0, 0.450),
+            (8.20, -671.0, 0.450),
+        ];
+        let g = GATES[3];
+        let mut p = Plant::at(g, FITTED);
+        let dt = 0.01;
+        let (mut sq, mut worst_model, mut i) = (0.0, 0.0_f64, 0);
+        while i < REC.len() {
+            if p.t + 1e-9 >= REC[i].0 {
+                sq += (p.vvi - REC[i].1).powi(2);
+                if REC[i].0 >= 6.5 {
+                    worst_model = worst_model.min(p.vvi);
+                }
+                p.write(REC[i].2);
+                i += 1;
+            }
+            p.step(g.throttle, dt);
+        }
+        let rms = (sq / REC.len() as f64).sqrt();
+        assert!(
+            rms < 50.0,
+            "the replay follows the record: {rms:.0} fpm rms"
+        );
+        assert!(
+            (worst_model + 775.0).abs() < 60.0,
+            "and gives back the -775 it met the runway with: {worst_model:.0}"
+        );
+
+        // A held pull holds a sink, which is what the old integrator plant
+        // could not do: 0.232 from the 17:32Z gate settles near -350.
+        let g = GATES[4];
+        let mut p = Plant::at(g, FITTED);
+        p.write(0.232);
+        let mut at_6s = 0.0;
+        for k in 0..900 {
+            p.step(g.throttle, 0.01);
+            if k == 600 {
+                at_6s = p.vvi;
+            }
+        }
+        assert!((-420.0..-300.0).contains(&at_6s), "{at_6s:.0}");
+        assert!(
+            (p.vvi - at_6s).abs() < 60.0,
+            "settled, not still arresting: {at_6s:.0} then {:.0}",
+            p.vvi
+        );
+    }
+
+    enum Law {
+        /// The profile's tracker as flown at 17:32Z and 17:43Z.
+        Tracker(FlarePitch),
+        Model(FlareModel),
+    }
+
+    struct Landing {
+        sink_fpm: f64,
+        float_m: f64,
+        climbed: bool,
+        max_elev: f64,
+        min_elev: f64,
+    }
+
+    fn profile_737() -> crate::aircraft::AircraftProfile {
+        crate::aircraft::load("boeing_737_800").expect("the 737 profile loads")
+    }
+
+    /// Fly one recorded gate to the wheels: the loop's 0.25 s tick, the
+    /// flare gate and targets from the loop's own functions, the 737's
+    /// `flare_power` retard below the flare gate, the elevator reaching the
+    /// aircraft a dead time after it is written.
+    fn fly(g: Gate, fit: Fit, mut law: Law) -> Landing {
+        let power_cfg = profile_737().flare_power.expect("the 737 retards");
+        let mut power = FlarePower::default();
+        let mut p = Plant::at(g, fit);
+        let (tick, dt) = (0.25, 0.01);
+        let mut h = g.radio_ft;
+        let mut lever = g.throttle;
+        let mut next = 0.0;
+        let mut prev_vvi: Option<f64> = None;
+        let mut out = Landing {
+            sink_fpm: 0.0,
+            float_m: 0.0,
+            climbed: false,
+            max_elev: 0.0,
+            min_elev: 0.0,
+        };
+        while h > 0.0 && p.t < 30.0 {
+            if p.t + 1e-9 >= next {
+                next += tick;
+                let gs = p.ias - 8.0;
+                let v = p.vvi;
+                let trend = prev_vvi.map_or(0.0, |pv| (v - pv) / tick);
+                prev_vvi = Some(v);
+                let (flare_ft, _) = arrest_gates_ft(25.0, gs);
+                let flaring = h <= flare_ft;
+                let nominal = -(gs / 60.0) * super::gp_ft_per_nm();
+                let (roundout_vs, flare_vs) = arrest_targets_fpm(nominal);
+                let e = match &mut law {
+                    Law::Tracker(t) => {
+                        let target = if flaring {
+                            flare_target_with(h, flare_vs, nominal, Some(4.0))
+                        } else {
+                            roundout_vs
+                        };
+                        t.step(target, v, trend, tick, flaring)
+                    }
+                    Law::Model(m) => m.step(h, gs, v, tick).elev,
+                };
+                out.max_elev = out.max_elev.max(e);
+                out.min_elev = out.min_elev.min(e);
+                p.write(e);
+                if flaring {
+                    if let Some(l) = power.step(power_cfg, lever, v, tick, h) {
+                        lever = l;
+                    }
+                }
+            }
+            p.step(lever, dt);
+            h += p.vvi / 60.0 * dt;
+            out.float_m += (p.ias - 8.0) * 0.514_444 * dt;
+            out.climbed |= p.vvi > 0.0;
+        }
+        out.sink_fpm = -p.vvi;
+        out
+    }
+
+    fn tracker() -> Law {
+        // The numbers flown at 17:32Z and 17:43Z: gain 0.6, max 0.45, no
+        // push, the bounce ease (the profile's own before the model).
+        let p = crate::aircraft::FlareElevatorProfile {
+            gain: 0.6,
+            trim_gain: 1.0,
+            max: 0.45,
+            max_push: 0.0,
+            balloon_ease_per_s: Some(0.15),
+            tau_s: Some(4.0),
+            model: None,
+        };
+        Law::Tracker(FlarePitch::with_gains(FlareGains::from_profile(Some(p))))
+    }
+
+    fn model() -> Law {
+        let p = profile_737().flare_elevator;
+        Law::Model(FlareModel::from_profile(p).expect("the 737 declares its model"))
+    }
+
+    /// The tracker the 737 flew today, from every recorded gate through the
+    /// fitted plant: firm, as it was (17:32Z scored 411, 17:43Z 408).
+    #[test]
+    fn the_737_tracker_lands_firm_from_the_recorded_gates() {
+        let sinks: Vec<f64> = GATES
+            .iter()
+            .map(|g| fly(*g, FITTED, tracker()).sink_fpm)
+            .collect();
+        let worst = sinks.iter().cloned().fold(0.0, f64::max);
+        assert!(
+            worst > crate::scorecard::TOUCHDOWN_MAX_SINK_FPM,
+            "the plant must still fail the old law, or it is not today's aircraft: {sinks:.0?}"
+        );
+        for (g, s) in GATES.iter().zip(&sinks).skip(4) {
+            assert!(
+                (s - -g.scored_fpm).abs() < 60.0,
+                "the law flown at 17:32Z and 17:43Z lands where it did ({:.0}): {s:.0}",
+                -g.scored_fpm
+            );
+        }
+    }
+
+    /// The model flare from all six recorded gates, through the fitted
+    /// plant and the spread around it: every one under the scorecard's 400,
+    /// none climbing, the column never pushed nor past its stop, and no
+    /// float longer than the tracker's.
+    #[test]
+    fn the_737_model_flare_lands_every_recorded_gate_under_400() {
+        let limit = crate::scorecard::TOUCHDOWN_MAX_SINK_FPM;
+        for (k, fit) in plants().into_iter().enumerate() {
+            for (i, g) in GATES.iter().enumerate() {
+                let l = fly(*g, fit, model());
+                assert!(
+                    l.sink_fpm < limit - 30.0,
+                    "gate {i}, plant {k} {fit:?}: {:.0} fpm",
+                    l.sink_fpm
+                );
+                assert!(
+                    l.sink_fpm > 100.0,
+                    "gate {i}, plant {k}: a landing, not a float: {:.0}",
+                    l.sink_fpm
+                );
+                assert!(!l.climbed, "gate {i}, plant {k}: ballooned");
+                assert!(
+                    l.min_elev >= 0.0 && l.max_elev <= 0.45 + 1e-9,
+                    "gate {i}: {} {}",
+                    l.min_elev,
+                    l.max_elev
+                );
+                assert!(
+                    l.float_m < 900.0,
+                    "gate {i}, plant {k}: floated {:.0} m",
+                    l.float_m
+                );
+            }
+        }
+        // As fitted, comfortably inside.
+        for g in GATES {
+            let l = fly(g, FITTED, model());
+            assert!(l.sink_fpm < 340.0, "{:.0}", l.sink_fpm);
+        }
+    }
+
+    /// Only an airframe that declares a model flies it; the SF50 and every
+    /// profile without one keep the tracker (and a bad model is dropped,
+    /// never the rest of the block).
+    #[test]
+    fn only_a_declared_model_flies_the_model_flare() {
+        assert!(FlareModel::from_profile(profile_737().flare_elevator).is_some());
+        let sf50 = crate::aircraft::load("cirrus_vision_sf50").expect("sf50");
+        assert!(sf50.flare_elevator.is_some());
+        assert!(FlareModel::from_profile(sf50.flare_elevator).is_none());
+        assert!(FlareModel::from_profile(None).is_none());
+        let mut p = profile_737().flare_elevator.unwrap();
+        if let Some(m) = p.model.as_mut() {
+            m.dead_s = 9.0;
+        }
+        let v = p.valid().expect("the block stands");
+        assert!(v.model.is_none(), "the bad model is dropped");
+        assert_eq!(v.max, 0.45);
+    }
+
+    /// A read that fails is no measurement: the model coasts, nothing is
+    /// written, and once the channel has expired the model knows it.
+    #[test]
+    fn a_missed_read_coasts_the_model() {
+        let Law::Model(mut m) = model() else {
+            unreachable!()
+        };
+        let first = m.step(79.0, 138.0, -789.0, 0.25);
+        assert!(
+            first.elev > 0.1,
+            "the gate kicks the column: {}",
+            first.elev
+        );
+        m.coast(0.25);
+        let again = m.step(76.0, 138.0, -800.0, 0.25);
+        assert!(again.elev > 0.0 && again.elev <= 0.45);
+        assert!(again.unexplained_fpm.is_finite());
     }
 }

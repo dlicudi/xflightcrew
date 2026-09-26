@@ -98,6 +98,63 @@ pub struct FlareElevatorProfile {
     /// the gate. Only for an airframe whose flare is flown on the elevator.
     #[serde(default)]
     pub tau_s: Option<f64>,
+    /// How THIS airframe's sink answers the elevator, fitted to its own
+    /// flares (`autoland::FlareModel`). Declared, the whole arrest is flown
+    /// on the model (the elevator that HOLDS the sink wanted, against the
+    /// sink the elevator does not explain) instead of the P+D tracker.
+    #[serde(default)]
+    pub model: Option<FlareModelProfile>,
+}
+
+/// The elevator-to-sink response of an airframe with the servos out, as its
+/// own flares recorded it: a standing pull holds a standing change of sink
+/// (`fpm_per_elevator`), arriving through two equal lags (`lag_s`) after a
+/// dead time (`dead_s`, the tick and the pitch response together). The 737
+/// fitted to its six LEMG 13 flares of 2026-09-26 is 2,600 fpm, 1.0 s and
+/// 1.8 s: a constant 0.23 of pull settled its sink at -350 (it does not keep
+/// arresting, as the old test plant's integrator did), and the sink turned
+/// 1.8 s after the column moved.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct FlareModelProfile {
+    /// Standing change of sink per unit of elevator, fpm.
+    pub fpm_per_elevator: f64,
+    /// Each of the two lags, seconds.
+    pub lag_s: f64,
+    /// The dead time, seconds.
+    pub dead_s: f64,
+    /// The sink target is taken at the height the aircraft will have this
+    /// many seconds ahead (the response is that late).
+    #[serde(default = "default_model_lead_s")]
+    pub lead_s: f64,
+    /// How fast the law asks the model to arrive, seconds (smaller kicks the
+    /// column harder at the gate).
+    #[serde(default = "default_model_settle_s")]
+    pub settle_s: f64,
+    /// Smoothing on the unexplained sink, seconds.
+    #[serde(default = "default_model_observer_s")]
+    pub observer_s: f64,
+}
+
+fn default_model_lead_s() -> f64 {
+    3.5
+}
+fn default_model_settle_s() -> f64 {
+    0.6
+}
+fn default_model_observer_s() -> f64 {
+    0.3
+}
+
+impl FlareModelProfile {
+    pub fn valid(self) -> Option<Self> {
+        ((500.0..=10_000.0).contains(&self.fpm_per_elevator)
+            && (0.1..=5.0).contains(&self.lag_s)
+            && (0.0..=4.0).contains(&self.dead_s)
+            && (0.0..=8.0).contains(&self.lead_s)
+            && (0.1..=5.0).contains(&self.settle_s)
+            && (0.05..=3.0).contains(&self.observer_s))
+        .then_some(self)
+    }
 }
 
 fn default_max_push() -> f64 {
@@ -114,7 +171,10 @@ impl FlareElevatorProfile {
             && self
                 .balloon_ease_per_s
                 .is_none_or(|r| r.is_finite() && r > 0.0))
-        .then_some(self)
+        .then_some(Self {
+            model: self.model.and_then(FlareModelProfile::valid),
+            ..self
+        })
     }
 }
 
