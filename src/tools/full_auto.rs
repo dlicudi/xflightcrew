@@ -637,8 +637,9 @@ impl FullAuto {
         let cifp = ctx.config.cifp_dir.clone();
         let fixes = ctx.config.fix_data_path.clone();
         let dest = fp.destination.clone();
+        let rwy = fp.procedures.dest_rwy.clone();
         let arrival = tokio::task::spawn_blocking(move || {
-            crate::full_auto::brief_arrival(&apt, &cifp, &fixes, &dest)
+            crate::full_auto::brief_arrival(&apt, &cifp, &fixes, &dest, rwy.as_deref())
         })
         .await
         .map_err(|_| "Arrival verification failed; you have control.".to_string())??;
@@ -683,6 +684,7 @@ impl FullAuto {
         ));
         Ok((
             Mission::Resume(Route {
+                arrival_rwy: fp.procedures.dest_rwy.clone(),
                 dest_icao: fp.destination.clone(),
                 dest_name: fp.destination,
                 climb_minimums: Vec::new(),
@@ -1071,14 +1073,16 @@ impl FullAuto {
                 crate::circuit::spell_runway(runway)
             )
         } else {
-            let (apt, cifp, fixp, dest) = (
+            // Briefed on the runway the arm chose, the one the arrival flies.
+            let (apt, cifp, fixp, dest, rwy) = (
                 ctx.config.apt_data_path.clone(),
                 ctx.config.cifp_dir.clone(),
                 ctx.config.fix_data_path.clone(),
                 fp.destination.clone(),
+                fp.procedures.dest_rwy.clone(),
             );
             tokio::task::spawn_blocking(move || {
-                crate::full_auto::brief_arrival(&apt, &cifp, &fixp, &dest)
+                crate::full_auto::brief_arrival(&apt, &cifp, &fixp, &dest, rwy.as_deref())
             })
             .await
             .map_err(|e| format!("The arrival brief failed: {e}"))??
@@ -1179,6 +1183,9 @@ impl FullAuto {
         );
         Ok((
             Mission::Flight(Route {
+                // The arm's runway, carried to the approach: the local
+                // route's checked final, else the one the STAR flown serves.
+                arrival_rwy: local_runway.clone().or_else(|| fp.procedures.dest_rwy.clone()),
                 dest_icao: fp.destination.clone(),
                 dest_name,
                 departure_rwy: fp.procedures.sid.as_ref().and(fp.procedures.origin_rwy.clone()),

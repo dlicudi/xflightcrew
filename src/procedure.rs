@@ -1092,6 +1092,7 @@ const TOD_LEAD_NM: f64 = 1.0;
 /// at 1,400 ft across the Strait, past Europa Point (2026-09-11). Climbs are
 /// untouched (the climb law owns them), so is a small step, and a leg with no
 /// fix has nothing to pace against.
+#[cfg(test)]
 pub fn descent_target_ft(
     leg_alt: f64,
     carry: f64,
