@@ -511,6 +511,11 @@ pub fn minimums_within_cruise(
     mins.into_iter().partition(|m| m.min_ft <= cruise_ft + MINIMUM_MET_TOL_FT)
 }
 
+/// A commanded rate as the VS wheel sets it: the nearest 100 fpm. Pure.
+pub fn vs_dial_fpm(vs: f64) -> f64 {
+    (vs / 100.0).round() * 100.0
+}
+
 /// The first departure minimum still ahead of the aircraft and not yet met:
 /// (leg index of its fix, minimum ft). Legs before `idx` are behind us.
 /// A departure minimum is met this close under it, feet.
@@ -2496,7 +2501,11 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, plan: Pla
                 }
             }
         }
-        if !set_confirmed("procedure", &xp, VS_DIAL, vs_cmd, &mut last_vs_cmd, 40.0).await {
+        // The VS wheel in the 100 fpm clicks an autopilot has, moved only
+        // when the click changes: the law's fine value every tick was the
+        // same twitching the heading bug did (2026-09-26).
+        let vs_cmd = vs_dial_fpm(vs_cmd);
+        if !set_confirmed("procedure", &xp, VS_DIAL, vs_cmd, &mut last_vs_cmd, 50.0).await {
             continue;
         }
         let owner = if v.floored.is_some() {
