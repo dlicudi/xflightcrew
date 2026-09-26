@@ -13,6 +13,26 @@ use serde_json::{json, Value};
 
 /// Taxi: most off the centreline.
 pub const TAXI_MAX_LAT_M: f64 = 3.0;
+/// Taxi: after a JOIN (the drive engaged off its route and turned onto it)
+/// the line is judged from the first tick inside [`TAXI_MAX_LAT_M`]; getting
+/// there may take this long from the `joined` record. The join's own record
+/// fires at 15 m and 45 degrees, so every judged join opened with up to 15 m
+/// "off the line" that the law was still closing (1790441293: 14.5 m at the
+/// `joined` tick, 6.7 s and 23 m to be inside 3 m). Measured over 211 joins
+/// in the logs: median 6 s, 90th percentile 12 s.
+pub const TAXI_CAPTURE_MAX_S: f64 = 30.0;
+/// Taxi: a drive tick PAST the planned stop (`remaining_m` below zero; the
+/// stop is `STOP_SHORT_M`, 5 m, before the route's last point) is not a
+/// lateral sample. The drive is only stopping there (`stop_straighten` has
+/// faded the steering to its floor from 1 m before the stop), and the projection runs onto the route's last stub or clamps to its end
+/// point, so the "offset" is the distance to that point, overrun included:
+/// 1790426786 read 2.8 to 3.8 m at err 0 creeping onto the hold at
+/// `remaining_m` -5, and 1790414806 3.0 to 4.4 m against a final stub 106
+/// degrees off the nose at -2 to -4.
+const TAXI_PAST_END_M: f64 = 0.0;
+/// A `yoke_under_ap` within this of the crew's own yoke-channel write is the
+/// loop's output read back, never a hand (the monitor's own window).
+const CREW_YOKE_FRESH_S: f64 = 1.5;
 /// Taxi: fastest the brake command may move (ratio per second) outside a stop.
 pub const TAXI_MAX_BRAKE_RATE: f64 = 1.5;
 /// A takeoff starts aligned or it is a line-up failure.
@@ -23,6 +43,18 @@ pub const ROLL_MAX_XTK_M: f64 = 5.0;
 /// Touchdown: firmer than this fails; crabbed more than this fails.
 pub const TOUCHDOWN_MAX_SINK_FPM: f64 = 400.0;
 pub const TOUCHDOWN_MAX_DRIFT_DEG: f64 = 5.0;
+/// The first contact is judged, not the one the state record happens to
+/// catch. The 1 Hz `state` sample never saw the wheels on LEMG 13
+/// (1790441293): the 737 met the runway at 17:04:34Z at -794 fpm (the
+/// autoland flare tick, radio -0.5 ft), bounced to 11.8 ft, and the stage
+/// scored the SECOND contact's 278 fpm, a pass on sink. An autoland tick
+/// with the wheels on (`ground`, logged since 2026-09-26) or, in older
+/// logs, the radio height at or under this is a contact.
+const CONTACT_RADIO_FT: f64 = 1.0;
+/// Back up past this after a contact is a bounce (rapport's own 2 ft).
+const BOUNCE_FT: f64 = 2.0;
+/// A contact this long before the state record's touchdown belongs to it.
+const CONTACT_WITHIN_S: f64 = 30.0;
 /// Rollout: most off the centreline.
 pub const ROLLOUT_MAX_XTK_M: f64 = 5.0;
 /// A stream quiet this long has ended.
@@ -60,6 +92,26 @@ struct Taxi {
     last_err: f64,
     last_lat: f64,
     ended_by: String,
+    /// Not yet on the line: joining, or joined and still closing.
+    capture: Capture,
+    /// Closest to the line while not yet judged (for the never-captured line).
+    closest_uncaptured: Option<f64>,
+    /// Seconds from `joined` to the first tick on the line.
+    capture_secs: Option<f64>,
+    past_end_ticks: usize,
+    sortie: Option<String>,
+}
+
+/// Where a taxi drive stands against its line.
+#[derive(Debug, Default, Clone, Copy, PartialEq)]
+enum Capture {
+    /// On the line: every tick is judged.
+    #[default]
+    Tracking,
+    /// Turning onto the route (`join` .. `joined`): not judged.
+    Joining,
+    /// `joined` at this time, still closing on the line: not judged.
+    Closing(f64),
 }
 
 /// One takeoff roll, from `autotakeoff` `roll` ticks.
@@ -75,6 +127,7 @@ struct Roll {
     last_ias: f64,
     ticks: usize,
     t_last: f64,
+    sortie: Option<String>,
 }
 
 /// The landing, from `state` (touchdown) and `autoland` `rollout` ticks.
@@ -85,6 +138,20 @@ struct Landing {
     drift: f64,
     max_xtk: Option<f64>,
     t_last: f64,
+    sortie: Option<String>,
+    /// Off the runway again after the first contact: the height reached
+    /// and the sink at the contact the state record caught.
+    bounce: Option<(f64, f64)>,
+}
+
+/// The first time the wheels met the runway, from the autoland ticks.
+#[derive(Debug, Clone, Copy)]
+struct Contact {
+    t: f64,
+    /// Steepest sink in the [`instructor::TOUCHDOWN_WINDOW_S`] before it.
+    sink: f64,
+    /// Highest radio height since (a bounce past [`BOUNCE_FT`]).
+    up_ft: f64,
 }
 
 #[derive(Debug, Default)]
@@ -97,10 +164,39 @@ pub struct Scorer {
     air: Vec<(f64, f64, f64, Option<f64>)>,
     airborne_since: Option<f64>,
     interventions: usize,
+    /// `yoke_under_ap` records that were the crew's own channel write.
+    crew_yoke_discounted: usize,
+    /// The pilot's commands to the crew during the sortie (`tool` records).
+    commands: usize,
     results: Vec<(String, bool)>,
-    /// The taxi drive is joining its route; its offset is not judged yet.
-    joining: bool,
+    /// A `join` (or `joined`) arrived before the drive's first tick: the
+    /// drive logs both before its first `drive` record when the engage is
+    /// already inside the join-done gate.
+    capture_pending: Option<Capture>,
+    /// The sortie the last record belonged to (untagged: none).
+    sortie: Option<String>,
+    /// Last time a loop of ours wrote the elevator/aileron channel.
+    crew_yoke_t: Option<f64>,
+    /// The takeoff has rotated: its roll ticks now write the elevator.
+    rotated: bool,
+    /// Recent autoland (t, vvi) for the first contact's sink.
+    flare_vvi: Vec<(f64, f64)>,
+    contact: Option<Contact>,
 }
+
+/// The taxi events that mean the drive STOPPED short, not arrived. Each used
+/// to end the stream only by the 5 s gap, and the drive was judged on its
+/// offset alone: 1790408535 stood `stagnant` 32 m off its route (the join
+/// never done) and scored "taxi pass".
+const TAXI_FAILURES: &[&str] = &[
+    "stagnant",
+    "off_route",
+    "pedal_yield",
+    "hold_gone",
+    "overspeed_stop",
+    "tug_never_released",
+    "stopped_from_outside",
+];
 
 /// The takeoff events that mean the roll was STOPPED, not finished.
 const ROLL_FAILURES: &[&str] = &[
@@ -126,6 +222,7 @@ impl Scorer {
     pub fn feed(&mut self, r: &Value) -> Vec<(String, Value)> {
         let mut out = Vec::new();
         let t = f(r, "t").unwrap_or(0.0);
+        self.sortie = r.get("sortie").and_then(Value::as_str).map(str::to_string);
         // A stream that went quiet has ended, whatever record says so.
         if self.taxi.as_ref().is_some_and(|x| t - x.t_last > GAP_S) {
             self.close_taxi("gap", &mut out);
@@ -135,27 +232,50 @@ impl Scorer {
         }
         let (kind, event) = (s(r, "kind"), s(r, "event"));
         match (kind, event) {
-            ("autotaxi", "line_up_path") => self.line_up_next = true,
+            // The backtrack's turn is the line-up's second leg.
+            ("autotaxi", "line_up_path" | "backtrack_turn") => self.line_up_next = true,
             ("autotaxi", "drive") => self.taxi_tick(r, t),
-            ("autotaxi", "holding_point" | "arrived" | "stopped" | "disengaged" | "gave_up") => {
-                self.close_taxi(event, &mut out)
+            ("autotaxi", "holding_point") => self.close_taxi(event, &mut out),
+            ("autotaxi", e) if TAXI_FAILURES.contains(&e) => {
+                // A drive replaced by the next one was not stopped short.
+                let superseded = r.get("superseded").and_then(Value::as_bool) == Some(true);
+                self.close_taxi_as(e, !superseded, &mut out)
             }
-            ("autotakeoff", "roll") => self.roll_tick(r, t),
+            // A new drive is a new stream, whatever the old one was doing.
+            ("autotaxi", "engaged") => self.close_taxi("reengaged", &mut out),
+            ("autotakeoff", "roll") => {
+                if self.rotated {
+                    self.crew_yoke_t = Some(t);
+                }
+                self.roll_tick(r, t)
+            }
+            ("autotakeoff", "rotate") => self.rotated = true,
+            ("autotakeoff", "climb_manual") => {
+                if r.get("pitch").is_some_and(|v| !v.is_null()) {
+                    self.crew_yoke_t = Some(t);
+                }
+                self.close_roll(None, &mut out)
+            }
             // The roll ends in the air: liftoff (or the climb, for a stream
             // that never logged one) is the pass. Only a roll that was STOPPED
             // is a failure; every other milestone (rotate, trim, flap steps)
             // is the roll going as it should. Any unknown event used to close
             // it as failed, so "rotate" failed every takeoff and the roll
             // ticks after it opened a second one (LIPK 2026-09-26).
-            ("autotakeoff", "liftoff" | "climb" | "climb_manual") => self.close_roll(None, &mut out),
+            ("autotakeoff", "liftoff" | "climb") => self.close_roll(None, &mut out),
             ("autotakeoff", e) if self.roll.is_some() && ROLL_FAILURES.contains(&e) => {
                 self.close_roll(Some(e), &mut out)
             }
             // A join onto the route is not "off the line": the lateral
             // offset is judged once the drive has joined (LIPK 2026-09-26:
             // a 69 m join from the push scored the taxi as failed).
-            ("autotaxi", "join") => self.joining = true,
-            ("autotaxi", "joined") => self.joining = false,
+            ("autotaxi", "join" | "joined") => {
+                let c = if event == "join" { Capture::Joining } else { Capture::Closing(t) };
+                match self.taxi.as_mut() {
+                    Some(x) => x.capture = c,
+                    None => self.capture_pending = Some(c),
+                }
+            }
             ("autoland", "rollout") => {
                 if let Some(l) = self.landing.as_mut() {
                     if let Some(x) = f(r, "xtk_m") {
@@ -164,6 +284,17 @@ impl Scorer {
                     l.t_last = t;
                 }
             }
+            ("autoland", "") => {
+                // The arrest and the flare write the elevator and aileron
+                // channels.
+                if ["flare_elev", "flare_ail"]
+                    .iter()
+                    .any(|k| r.get(*k).is_some_and(|v| !v.is_null()))
+                {
+                    self.crew_yoke_t = Some(t);
+                }
+                self.contact_tick(r, t);
+            }
             ("state", _) => self.state_tick(r, t, &mut out),
             ("full_auto", _) if s(r, "stage") == "give_up" => {
                 if self.roll.is_some() {
@@ -171,28 +302,48 @@ impl Scorer {
                 }
                 self.close_taxi("give_up", &mut out);
             }
+            // A yoke read back while our own channel holds it is the loop's
+            // output, not a hand: the live monitor no longer records these
+            // (`monitor::interventions_now`), and older sorties are re-judged
+            // here (1790441293: four, all the takeoff's and the flare's pull).
+            ("intervention", _)
+                if s(r, "what") == "yoke_under_ap"
+                    && self.crew_yoke_t.is_some_and(|c| t - c <= CREW_YOKE_FRESH_S) =>
+            {
+                self.crew_yoke_discounted += 1
+            }
             ("intervention", _) => self.interventions += 1,
+            ("tool", _) => self.commands += 1,
             ("sortie", "begin") => {
                 self.results.clear();
                 self.interventions = 0;
+                self.crew_yoke_discounted = 0;
+                self.commands = 0;
             }
             ("sortie", "end") => {
                 self.close_taxi("sortie_end", &mut out);
                 self.close_landing(&mut out);
                 let failed: Vec<&str> =
                     self.results.iter().filter(|(_, ok)| !ok).map(|(n, _)| n.as_str()).collect();
-                out.push((
-                    "sortie_result".into(),
-                    json!({
-                        "outcome": s(r, "outcome"),
-                        "stages": self.results.len(),
-                        "failed": failed,
-                        "interventions": self.interventions,
-                        "unattended": self.interventions == 0,
-                        "pass": failed.is_empty() && self.interventions == 0
-                            && s(r, "outcome") != "gave_up",
-                    }),
-                ));
+                // Unattended means nobody's hands AND nobody's words acted
+                // on the aircraft: a pilot who said "set power 100%" mid
+                // mission (1790366657) flew part of it, and the flag said
+                // unattended because only yield latches were counted.
+                let unattended = self.interventions == 0 && self.commands == 0;
+                let mut v = json!({
+                    "outcome": s(r, "outcome"),
+                    "stages": self.results.len(),
+                    "failed": failed,
+                    "interventions": self.interventions,
+                    "crew_yoke_discounted": self.crew_yoke_discounted,
+                    "commands": self.commands,
+                    "unattended": unattended,
+                    "pass": failed.is_empty() && unattended && s(r, "outcome") != "gave_up",
+                });
+                if let (Some(o), Some(id)) = (v.as_object_mut(), self.sortie.clone()) {
+                    o.insert("sortie".into(), id.into());
+                }
+                out.push(("sortie_result".into(), v));
             }
             _ => {}
         }
@@ -201,7 +352,14 @@ impl Scorer {
 
     fn taxi_tick(&mut self, r: &Value, t: f64) {
         let line_up = std::mem::take(&mut self.line_up_next);
-        let x = self.taxi.get_or_insert_with(|| Taxi { t0: t, ..Taxi::default() });
+        let capture = self.capture_pending.take().unwrap_or_default();
+        let sortie = self.sortie.clone();
+        let x = self.taxi.get_or_insert_with(|| Taxi {
+            t0: t,
+            capture,
+            sortie,
+            ..Taxi::default()
+        });
         x.line_up |= line_up;
         x.ticks += 1;
         x.t_last = t;
@@ -212,8 +370,22 @@ impl Scorer {
             f(r, "yaw_dps").unwrap_or(0.0),
         );
         x.max_gs = x.max_gs.max(gs);
-        if !self.joining {
-            x.max_lat = x.max_lat.max(lat.abs());
+        let past_end = f(r, "remaining_m").is_some_and(|m| m < TAXI_PAST_END_M);
+        if past_end {
+            x.past_end_ticks += 1;
+        } else {
+            if let Capture::Closing(tj) = x.capture {
+                if lat.abs() <= TAXI_MAX_LAT_M {
+                    x.capture = Capture::Tracking;
+                    x.capture_secs = Some(t - tj);
+                }
+            }
+            if x.capture == Capture::Tracking {
+                x.max_lat = x.max_lat.max(lat.abs());
+            } else {
+                x.closest_uncaptured =
+                    Some(x.closest_uncaptured.map_or(lat.abs(), |c: f64| c.min(lat.abs())));
+            }
         }
         x.last_err = f(r, "err").unwrap_or(0.0);
         x.last_lat = lat;
@@ -235,13 +407,38 @@ impl Scorer {
     }
 
     fn close_taxi(&mut self, by: &str, out: &mut Vec<(String, Value)>) {
-        self.joining = false;
+        // Only an arrival passes: a give-up or a sortie that ends while a
+        // drive is still going is a drive that did not arrive.
+        let stopped = matches!(by, "give_up" | "sortie_end");
+        self.close_taxi_as(by, stopped, out)
+    }
+
+    /// Close the drive, `stopped` when it ended short of its end point.
+    fn close_taxi_as(&mut self, by: &str, stopped: bool, out: &mut Vec<(String, Value)>) {
+        self.capture_pending = None;
         let Some(mut x) = self.taxi.take() else { return };
         if x.ticks < 5 {
             return;
         }
         x.ended_by = by.to_string();
         let mut fails = Vec::new();
+        if stopped {
+            fails.push(format!("ended by {by}"));
+        }
+        match x.capture {
+            Capture::Tracking => {}
+            Capture::Joining => fails.push(format!(
+                "never joined the line (closest {:.1} m)",
+                x.closest_uncaptured.unwrap_or(0.0)
+            )),
+            Capture::Closing(_) => fails.push(format!(
+                "never within {TAXI_MAX_LAT_M:.0} m of the line (closest {:.1} m)",
+                x.closest_uncaptured.unwrap_or(0.0)
+            )),
+        }
+        if let Some(c) = x.capture_secs.filter(|c| *c > TAXI_CAPTURE_MAX_S) {
+            fails.push(format!("{c:.0} s to reach the line after the join"));
+        }
         if x.max_lat > TAXI_MAX_LAT_M {
             fails.push(format!("{:.1} m off the line", x.max_lat));
         }
@@ -249,16 +446,19 @@ impl Scorer {
             fails.push(format!("brake moved {:.1}/s", x.brake_rate));
         }
         let stage = if x.line_up { "line_up" } else { "taxi" };
-        self.push(stage, fails, json!({
+        let sortie = x.sortie.clone();
+        self.push(stage, sortie, fails, json!({
             "secs": r1(x.t_last - x.t0), "max_gs": r1(x.max_gs), "max_lat_m": r1(x.max_lat),
             "brake_rate": r2(x.brake_rate), "brake_reversals": x.brake_reversals,
             "yaw_swings": x.yaw_swings, "end_err_deg": r1(x.last_err),
             "end_lat_m": r1(x.last_lat), "ended_by": x.ended_by,
+            "capture_secs": x.capture_secs.map(r1), "past_end_ticks": x.past_end_ticks,
         }), out);
     }
 
     fn roll_tick(&mut self, r: &Value, t: f64) {
-        let x = self.roll.get_or_insert_with(|| Roll { t0: t, ..Roll::default() });
+        let sortie = self.sortie.clone();
+        let x = self.roll.get_or_insert_with(|| Roll { t0: t, sortie, ..Roll::default() });
         x.ticks += 1;
         x.t_last = t;
         let (err, xtk, gs) = (f(r, "err"), f(r, "xtk_m"), f(r, "gs").unwrap_or(0.0));
@@ -278,6 +478,7 @@ impl Scorer {
     }
 
     fn close_roll(&mut self, ended: Option<&str>, out: &mut Vec<(String, Value)>) {
+        self.rotated = false;
         let Some(x) = self.roll.take() else { return };
         let (e0, x0) = (x.start_err.unwrap_or(0.0).abs(), x.start_xtk.unwrap_or(0.0).abs());
         // The line-up is judged where it hands over: the roll's first tick.
@@ -288,7 +489,7 @@ impl Scorer {
         if x0 > LINEUP_MAX_XTK_M {
             lu.push(format!("{x0:.1} m off the centreline"));
         }
-        self.push("alignment", lu, json!({ "err_deg": r1(e0), "xtk_m": r1(x0) }), out);
+        self.push("alignment", x.sortie.clone(), lu, json!({ "err_deg": r1(e0), "xtk_m": r1(x0) }), out);
         let mut fails = Vec::new();
         if let Some(e) = ended {
             fails.push(format!("ended by {e}"));
@@ -296,12 +497,39 @@ impl Scorer {
         if x.max_xtk > ROLL_MAX_XTK_M {
             fails.push(format!("{:.1} m off the centreline", x.max_xtk));
         }
-        self.push("takeoff", fails, json!({
+        self.push("takeoff", x.sortie.clone(), fails, json!({
             "ticks": x.ticks, "max_xtk_m": r1(x.max_xtk), "liftoff_xtk_m": r1(x.last_xtk),
             "max_err_fast_deg": r1(x.max_err_fast), "max_brake": r2(x.max_brake),
             "last_ias": r1(x.last_ias), "ended_by": ended.unwrap_or("climb"),
             "secs": r1(x.t_last - x.t0),
         }), out);
+    }
+
+    /// One autoland guidance tick: the first contact and any bounce after it.
+    fn contact_tick(&mut self, r: &Value, t: f64) {
+        let (Some(radio), Some(vvi)) = (f(r, "radio"), f(r, "vvi")) else { return };
+        let window = crate::instructor::TOUCHDOWN_WINDOW_S;
+        self.flare_vvi.push((t, vvi));
+        self.flare_vvi.retain(|(tv, _)| t - tv <= window);
+        if self.contact.is_some_and(|c| t - c.t > CONTACT_WITHIN_S) {
+            self.contact = None;
+        }
+        let wheels = match r.get("ground").and_then(Value::as_bool) {
+            Some(g) => g,
+            None => radio <= CONTACT_RADIO_FT,
+        };
+        match self.contact.as_mut() {
+            None if wheels => {
+                let recent: Vec<(f64, f64)> = self.flare_vvi.clone();
+                self.contact = Some(Contact {
+                    t,
+                    sink: crate::instructor::touchdown_sink_fpm(&recent, t, vvi).abs(),
+                    up_ft: 0.0,
+                })
+            }
+            Some(c) => c.up_ft = c.up_ft.max(radio),
+            None => {}
+        }
     }
 
     fn state_tick(&mut self, r: &Value, t: f64, out: &mut Vec<(String, Value)>) {
@@ -338,7 +566,24 @@ impl Scorer {
             .unwrap_or(0.0);
         self.air.clear();
         self.close_landing(out);
-        self.landing = Some(Landing { t_td: t, sink, drift, max_xtk: None, t_last: t });
+        // The first contact, when the autoland ticks saw one before this
+        // sample, is the touchdown; this sample is then the second contact.
+        let first = self.contact.take().filter(|c| t - c.t <= CONTACT_WITHIN_S && c.t >= since);
+        let (t_td, sink, bounce) = match first {
+            Some(c) if c.up_ft > BOUNCE_FT => (c.t, c.sink, Some((c.up_ft, sink))),
+            Some(c) => (c.t, c.sink.max(sink), None),
+            None => (t, sink, None),
+        };
+        self.flare_vvi.clear();
+        self.landing = Some(Landing {
+            t_td,
+            sink,
+            drift,
+            max_xtk: None,
+            t_last: t,
+            sortie: self.sortie.clone(),
+            bounce,
+        });
         if crashed {
             self.close_landing(out);
         }
@@ -350,24 +595,41 @@ impl Scorer {
         if l.sink > TOUCHDOWN_MAX_SINK_FPM {
             fails.push(format!("touched down at {:.0} fpm", l.sink));
         }
+        if let Some((up, _)) = l.bounce {
+            fails.push(format!("bounced to {up:.0} ft"));
+        }
         if l.drift > TOUCHDOWN_MAX_DRIFT_DEG {
             fails.push(format!("{:.0} degrees of drift", l.drift));
         }
         if l.max_xtk.is_some_and(|x| x > ROLLOUT_MAX_XTK_M) {
             fails.push(format!("{:.1} m off the centreline rolling out", l.max_xtk.unwrap_or(0.0)));
         }
-        self.push("landing", fails, json!({
+        self.push("landing", l.sortie.clone(), fails, json!({
             "sink_fpm": l.sink.round(), "drift_deg": r1(l.drift),
             "rollout_max_xtk_m": l.max_xtk.map(r1), "t_touchdown": l.t_td,
+            "bounce_ft": l.bounce.map(|(up, _)| r1(up)),
+            "second_contact_sink_fpm": l.bounce.map(|(_, s2)| s2.round()),
         }), out);
     }
 
-    fn push(&mut self, stage: &str, fails: Vec<String>, mut metrics: Value, out: &mut Vec<(String, Value)>) {
+    /// One stage's verdict, tagged with the sortie it was flown in (none:
+    /// a stand-alone tool, and the key is left out).
+    fn push(
+        &mut self,
+        stage: &str,
+        sortie: Option<String>,
+        fails: Vec<String>,
+        mut metrics: Value,
+        out: &mut Vec<(String, Value)>,
+    ) {
         let ok = fails.is_empty();
         if let Some(o) = metrics.as_object_mut() {
             o.insert("stage".into(), stage.into());
             o.insert("pass".into(), ok.into());
             o.insert("why".into(), fails.into());
+            if let Some(id) = sortie {
+                o.insert("sortie".into(), id.into());
+            }
         }
         self.results.push((stage.to_string(), ok));
         out.push(("stage_result".into(), metrics));
@@ -402,6 +664,28 @@ pub fn score_all<'a>(records: impl Iterator<Item = &'a Value>) -> Vec<Value> {
     out
 }
 
+/// The Scorecard block: conclusions grouped by the mission they were flown
+/// in, in order, each group headed. A stage outside any mission (a spoken
+/// "land the aircraft", a stand-alone taxi) is labelled as such: they used
+/// to sit between the missions' verdicts with nothing to tell a mission's
+/// landing from a stand-alone autoland.
+pub fn block(card: &[Value]) -> String {
+    let mut out = String::new();
+    let mut group: Option<Option<&str>> = None;
+    for v in card {
+        let key = v.get("sortie").and_then(Value::as_str);
+        if group != Some(key) {
+            match key {
+                Some(id) => out.push_str(&format!("  Mission {id}:\n")),
+                None => out.push_str("  Outside a mission (stand-alone tools):\n"),
+            }
+            group = Some(key);
+        }
+        out.push_str(&format!("    {}\n", line(v)));
+    }
+    out
+}
+
 /// One line per conclusion for the debrief.
 pub fn line(v: &Value) -> String {
     let why: Vec<&str> = v
@@ -410,12 +694,35 @@ pub fn line(v: &Value) -> String {
         .map(|a| a.iter().filter_map(Value::as_str).collect())
         .unwrap_or_default();
     if s(v, "kind") == "sortie_result" {
+        // The stage NAMES, never the JSON value's debug form (it printed
+        // `failed Array [String("taxi")]`).
+        let failed: Vec<&str> = v
+            .get("failed")
+            .and_then(Value::as_array)
+            .map(|a| a.iter().filter_map(Value::as_str).collect())
+            .unwrap_or_default();
+        let n = |k: &str| v.get(k).and_then(Value::as_u64).unwrap_or(0);
+        let discounted = match n("crew_yoke_discounted") {
+            0 => String::new(),
+            d => format!(" ({d} crew yoke not counted)"),
+        };
         return format!(
-            "SORTIE {}: {} stages, failed {:?}, {} interventions, outcome {}",
+            "SORTIE {}: {} stages, {}, {} interventions{}, {} commands, {}, outcome {}",
             if v.get("pass").and_then(Value::as_bool) == Some(true) { "PASS" } else { "FAIL" },
-            v.get("stages").and_then(Value::as_u64).unwrap_or(0),
-            v.get("failed").cloned().unwrap_or_default(),
-            v.get("interventions").and_then(Value::as_u64).unwrap_or(0),
+            n("stages"),
+            if failed.is_empty() {
+                "none failed".to_string()
+            } else {
+                format!("failed {}", failed.join(", "))
+            },
+            n("interventions"),
+            discounted,
+            n("commands"),
+            if v.get("unattended").and_then(Value::as_bool) == Some(true) {
+                "unattended"
+            } else {
+                "attended"
+            },
             s(v, "outcome"),
         );
     }
@@ -501,5 +808,264 @@ mod tests {
         assert_eq!(l["pass"], false, "{l}");
         assert_eq!(l["sink_fpm"], 650.0);
         assert_eq!(l["rollout_max_xtk_m"], 1.2);
+    }
+
+    /// The 737's LEMG sortie (1790441293), trimmed to 518 of its 3,871
+    /// records (every tenth taxi tick and every one far off the line, every
+    /// third roll tick, the touchdown's state and flare ticks whole, the crew's yoke
+    /// writes before each intervention). Pinned so any change to a verdict is
+    /// a changed line here; `xvl debrief` prints the same block from the same
+    /// file (asserted below), so the two agree by construction.
+    const LEMG_737: &str = include_str!("../bench/sorties/1790441293-full_auto.trimmed.jsonl");
+
+    fn records(text: &str) -> Vec<Value> {
+        text.lines().filter_map(|l| serde_json::from_str(l).ok()).collect()
+    }
+
+    #[test]
+    fn the_recorded_lemg_sortie_scores_as_pinned() {
+        let recs = records(LEMG_737);
+        let card = score_all(recs.iter());
+        let text = block(&card);
+        print!("{text}");
+        assert_eq!(
+            text,
+            "  Mission 1790441293-full_auto:\n\
+             \x20   taxi      FAIL: 5.8 m off the line\n\
+             \x20   line_up   FAIL: 6.0 m off the line\n\
+             \x20   alignment pass\n\
+             \x20   takeoff   FAIL: 6.9 m off the centreline\n\
+             \x20   landing   FAIL: touched down at 794 fpm, bounced to 12 ft, 12.0 m off the centreline rolling out\n\
+             \x20   SORTIE FAIL: 5 stages, failed taxi, line_up, takeoff, landing, \
+             0 interventions (4 crew yoke not counted), 0 commands, unattended, outcome ended\n"
+        );
+        let stage = |n: &str| card.iter().find(|v| s(v, "stage") == n).cloned().unwrap();
+        // The join closed at 14.5 m; the line is judged from its first tick
+        // inside 3 m (6.7 s in the whole file, the next kept tick here).
+        assert_eq!(stage("taxi")["capture_secs"], 8.2);
+        // The first contact at 17:04:34Z, not the 278 fpm of the second.
+        let landing = stage("landing");
+        assert_eq!(landing["sink_fpm"], 794.0);
+        assert_eq!(landing["t_touchdown"], 1790442274.5);
+        assert_eq!(landing["bounce_ft"], 11.8);
+        assert_eq!(landing["second_contact_sink_fpm"], 278.0);
+        let sortie = card.last().unwrap();
+        assert_eq!(sortie["interventions"], 0, "the flare's own pull is not a hand");
+        assert_eq!(sortie["crew_yoke_discounted"], 4);
+        // The recorded (live, older) verdicts are never trusted twice.
+        assert!(recs.iter().all(|r| s(r, "kind") != "stage_result"));
+    }
+
+    #[test]
+    fn the_debrief_prints_the_same_scorecard() {
+        let recs = records(LEMG_737);
+        let text = crate::debrief::report(LEMG_737.lines());
+        assert!(text.contains(&block(&score_all(recs.iter()))), "{text}");
+        assert!(!text.contains("Array"), "{text}");
+    }
+
+    /// A join is judged from the first tick ON the line, not from the
+    /// `joined` record (15 m, 45 degrees); one that never gets there fails.
+    #[test]
+    fn a_join_is_judged_once_it_reaches_the_line() {
+        let mut recs = vec![json!({"t": 0.0, "kind": "autotaxi", "event": "join"})];
+        let lat = [30.0, 25.0, 20.0, 14.5, 12.0, 9.0, 6.0, 4.0, 2.9, 2.0, 1.5, 1.0];
+        for (i, l) in lat.iter().enumerate() {
+            let t = 1.0 + i as f64;
+            if *l == 14.5 {
+                recs.push(json!({"t": t - 0.01, "kind": "autotaxi", "event": "joined"}));
+            }
+            recs.push(drive(t, 6.0, *l, 0.0, 0.0, 0.0, 0.0));
+        }
+        recs.push(json!({"t": 20.0, "kind": "autotaxi", "event": "holding_point"}));
+        let out = score_all(recs.iter());
+        assert_eq!(out[0]["pass"], true, "{}", out[0]);
+        assert_eq!(out[0]["max_lat_m"], 2.9);
+        assert_eq!(out[0]["capture_secs"], 5.0);
+
+        // Joined, and never within the limit: that is the failure.
+        let mut recs = vec![json!({"t": 0.0, "kind": "autotaxi", "event": "join"})];
+        recs.push(json!({"t": 0.5, "kind": "autotaxi", "event": "joined"}));
+        for i in 0..10 {
+            recs.push(drive(1.0 + i as f64, 6.0, 8.0, 0.0, 0.0, 0.0, 0.0));
+        }
+        recs.push(json!({"t": 20.0, "kind": "autotaxi", "event": "holding_point"}));
+        let out = score_all(recs.iter());
+        assert_eq!(out[0]["pass"], false);
+        assert_eq!(out[0]["why"][0], "never within 3 m of the line (closest 8.0 m)");
+    }
+
+    /// Past the planned stop the projection measures the distance to the
+    /// route's end point, overrun included (1790426786: 2.8 to 3.8 m at err
+    /// 0, `remaining_m` -5): not a lateral sample.
+    #[test]
+    fn creeping_past_the_stop_is_not_off_the_line() {
+        let mut recs = Vec::new();
+        for i in 0..10 {
+            let mut d = drive(i as f64 * 0.2, 8.0, 0.5, 0.0, 0.0, 0.0, 0.0);
+            d["remaining_m"] = json!(100.0 - i as f64);
+            recs.push(d);
+        }
+        for (i, l) in [2.8, 3.0, 3.4, 3.8].iter().enumerate() {
+            let mut d = drive(2.0 + i as f64 * 0.2, 2.1, *l, 0.0, 0.0, 0.0, 0.0);
+            d["remaining_m"] = json!(-5.0);
+            recs.push(d);
+        }
+        recs.push(json!({"t": 3.0, "kind": "autotaxi", "event": "holding_point"}));
+        let out = score_all(recs.iter());
+        assert_eq!(out[0]["pass"], true, "{}", out[0]);
+        assert_eq!(out[0]["past_end_ticks"], 4);
+    }
+
+    /// 1790408535: the drive stood `stagnant` 32 m off its route and the
+    /// taxi scored a pass, judged on an offset it never reached.
+    #[test]
+    fn a_drive_that_stops_short_fails() {
+        let mut recs = vec![json!({"t": 0.0, "kind": "autotaxi", "event": "join"})];
+        for i in 0..20 {
+            recs.push(drive(i as f64, 0.1, 32.6, 0.0, 0.0, 0.0, -79.0));
+        }
+        recs.push(json!({"t": 20.0, "kind": "autotaxi", "event": "stagnant"}));
+        let out = score_all(recs.iter());
+        assert_eq!(out[0]["pass"], false);
+        assert_eq!(out[0]["ended_by"], "stagnant");
+        assert_eq!(out[0]["why"][0], "ended by stagnant");
+        // A drive superseded by the next one was not stopped short.
+        let mut recs = Vec::new();
+        for i in 0..10 {
+            recs.push(drive(i as f64 * 0.2, 6.0, 0.5, 0.0, 0.0, 0.0, 0.0));
+        }
+        recs.push(json!({"t": 2.1, "kind": "autotaxi", "event": "stopped_from_outside",
+                         "superseded": true}));
+        assert_eq!(score_all(recs.iter())[0]["pass"], true);
+    }
+
+    /// Stages outside a mission are labelled and never mixed into the
+    /// mission's verdict; a pilot's command makes a sortie attended.
+    #[test]
+    fn stages_group_by_mission_and_commands_attend_it() {
+        let taxi = |t0: f64, sortie: Option<&str>| {
+            let mut v: Vec<Value> = (0..10)
+                .map(|i| drive(t0 + i as f64 * 0.2, 6.0, 0.5, 0.0, 0.0, 0.0, 0.0))
+                .collect();
+            v.push(json!({"t": t0 + 2.1, "kind": "autotaxi", "event": "holding_point"}));
+            if let Some(id) = sortie {
+                for r in &mut v {
+                    r["sortie"] = json!(id);
+                }
+            }
+            v
+        };
+        let mut recs = taxi(0.0, None);
+        recs.push(json!({"t": 10.0, "kind": "sortie", "event": "begin", "sortie": "9-full_auto"}));
+        recs.extend(taxi(11.0, Some("9-full_auto")));
+        recs.push(json!({"t": 14.0, "kind": "tool", "name": "set_throttle", "sortie": "9-full_auto"}));
+        recs.push(json!({"t": 15.0, "kind": "sortie", "event": "end", "outcome": "ended",
+                         "sortie": "9-full_auto"}));
+        recs.extend(taxi(20.0, None));
+        let card = score_all(recs.iter());
+        let text = block(&card);
+        print!("{text}");
+        assert_eq!(
+            text,
+            "  Outside a mission (stand-alone tools):\n\
+             \x20   taxi      pass\n\
+             \x20 Mission 9-full_auto:\n\
+             \x20   taxi      pass\n\
+             \x20   SORTIE FAIL: 1 stages, none failed, 0 interventions, 1 commands, attended, outcome ended\n\
+             \x20 Outside a mission (stand-alone tools):\n\
+             \x20   taxi      pass\n"
+        );
+        let sortie = card.iter().find(|v| s(v, "kind") == "sortie_result").unwrap();
+        assert_eq!(sortie["unattended"], false);
+        assert_eq!(sortie["pass"], false, "a flown-by-voice sortie is not an unattended pass");
+    }
+
+    /// LEMG 13, 17:04:34Z (1790441293): the autoland flare ticks as recorded
+    /// (t, radio ft, vvi fpm) and the 1 Hz state samples around them. The
+    /// state record never had the wheels on until the second contact, and
+    /// the stage scored that one's 278 fpm; the first contact was -794.
+    #[test]
+    fn a_bounced_landing_is_judged_on_its_first_contact() {
+        let flare = [
+            (1790442273.6, 11.8, -598.0),
+            (1790442273.9, 8.1, -664.0),
+            (1790442274.1, 5.1, -724.0),
+            (1790442274.3, 1.7, -773.0),
+            (1790442274.5, -0.5, -794.0),
+            (1790442274.7, 0.5, -697.0),
+            (1790442274.9, 1.8, -512.0),
+            (1790442275.1, 3.0, -303.0),
+            (1790442275.5, 4.8, -68.0),
+            (1790442276.1, 7.3, 99.0),
+            (1790442276.8, 11.2, 213.0),
+            (1790442277.2, 11.8, 191.0),
+            (1790442277.7, 10.4, 78.0),
+            (1790442278.2, 5.4, -162.0),
+        ];
+        let state = [
+            (1790442240.0, false, -700.0),
+            (1790442272.5, false, -398.8),
+            (1790442273.5, false, -413.4),
+            (1790442274.6, false, -663.8),
+            (1790442275.7, false, -385.9),
+            (1790442276.9, false, 117.9),
+            (1790442277.9, false, 191.2),
+            (1790442279.2, false, -277.9),
+            (1790442280.4, false, -42.7),
+            (1790442281.7, true, -36.6),
+            (1790442283.1, true, 1.0),
+        ];
+        let mut recs: Vec<Value> = flare
+            .iter()
+            .map(|(t, radio, vvi)| {
+                json!({"t": t, "kind": "autoland", "radio": radio, "vvi": vvi, "phase": "Flare"})
+            })
+            .chain(state.iter().map(|(t, g, vsi)| {
+                json!({"t": t, "kind": "state", "ground": g, "vsi": vsi, "hdg": 131.0, "track": 131.0})
+            }))
+            .collect();
+        recs.sort_by(|a, b| f(a, "t").partial_cmp(&f(b, "t")).unwrap());
+        recs.push(json!({"t": 1790442290.0, "kind": "sortie", "event": "end", "outcome": "ended"}));
+        let out = score_all(recs.iter());
+        let l = out.iter().find(|v| v["stage"] == "landing").unwrap();
+        assert_eq!(l["sink_fpm"], 794.0, "{l}");
+        assert_eq!(l["t_touchdown"], 1790442274.5);
+        assert_eq!(l["bounce_ft"], 11.8);
+        assert_eq!(l["second_contact_sink_fpm"], 278.0);
+        assert_eq!(l["pass"], false);
+        assert_eq!(l["why"][1], "bounced to 12 ft");
+
+        // A clean arrival that latched the rollout at 2 ft has no contact in
+        // the flare ticks: judged on the state sample as before.
+        let recs = [
+            json!({"t": 0.0, "kind": "state", "ground": false, "vsi": -300.0}),
+            json!({"t": 39.0, "kind": "autoland", "radio": 2.1, "vvi": -250.0}),
+            json!({"t": 39.5, "kind": "state", "ground": false, "vsi": -240.0}),
+            json!({"t": 40.0, "kind": "state", "ground": true, "vsi": -200.0}),
+            json!({"t": 50.0, "kind": "sortie", "event": "end"}),
+        ];
+        let out = score_all(recs.iter());
+        let l = out.iter().find(|v| v["stage"] == "landing").unwrap();
+        assert_eq!(l["sink_fpm"], 240.0, "{l}");
+        assert!(l["bounce_ft"].is_null());
+    }
+
+    /// The offline twin of the monitor's rule: a `yoke_under_ap` inside the
+    /// crew's own write window is not counted; one with no write of ours is.
+    #[test]
+    fn a_yoke_the_crew_is_writing_is_not_an_intervention() {
+        let recs = vec![
+            json!({"t": 0.0, "kind": "sortie", "event": "begin"}),
+            json!({"t": 10.0, "kind": "autoland", "flare_elev": 0.3, "flare_ail": 0.0}),
+            json!({"t": 11.0, "kind": "intervention", "what": "yoke_under_ap", "yp": 0.3}),
+            json!({"t": 30.0, "kind": "autoland", "flare_elev": null, "flare_ail": null}),
+            json!({"t": 30.5, "kind": "intervention", "what": "yoke_under_ap", "yp": -0.4}),
+            json!({"t": 40.0, "kind": "sortie", "event": "end", "outcome": "ended"}),
+        ];
+        let out = score_all(recs.iter());
+        let sortie = out.last().unwrap();
+        assert_eq!(sortie["interventions"], 1, "{sortie}");
+        assert_eq!(sortie["crew_yoke_discounted"], 1);
     }
 }

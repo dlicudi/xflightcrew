@@ -289,9 +289,7 @@ fn summarise(flight: &[&Value]) -> String {
     let card = crate::scorecard::score_all(flight.iter().copied());
     if !card.is_empty() {
         out.push_str("Scorecard:\n");
-        for v in &card {
-            out.push_str(&format!("  {}\n", crate::scorecard::line(v)));
-        }
+        out.push_str(&crate::scorecard::block(&card));
     }
 
     // --- The duty engine's shadow: what the flight owed, in order, and

@@ -3132,6 +3132,13 @@ async fn run_session(
                 call.arguments = serde_json::json!({});
             }
             tracing::info!(tool = %call.name, args = %call.arguments, "tool selected");
+            // The pilot asked the crew to act: a sortie with one of these in
+            // it was attended, whatever the yield latches saw ("set power
+            // 100%" mid full auto left no record but a readback line).
+            blackbox::record(
+                "tool",
+                serde_json::json!({ "name": call.name, "args": call.arguments }),
+            );
             reporter.log(
                 ui::LogKind::Tool,
                 format!("{} {}", call.name, call.arguments),
