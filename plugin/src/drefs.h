@@ -48,6 +48,11 @@ bool ptt_active();
 bool radio_ptt_active();
 const TextRef& aircraft();
 const TextRef& strip();
+// The taxi turn card: "kind|dist_m|label|aim_true_deg|xtk_m|turn_deg|
+// remaining_m", empty = hide.
+const TextRef& taxi_card();
+// TRUE heading in degrees (sim/flightmodel/position/psi), 0 if missing.
+float heading_true();
 const TextRef& radio_row();
 const TextRef& coach();
 bool coach_urgent();

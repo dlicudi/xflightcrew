@@ -7685,3 +7685,19 @@ GPL-compatible. Sole-author relicensing stays free only until outside
 contributions merge: settle any change of heart BEFORE accepting a PR.
 `crates/atc` could become LGPL-3.0 if it should ever be broadly embeddable -
 deliberately not done now.
+
+## 2026-09-26: taxi turn card (GPS-style arrow) on the panel
+
+The strip's next-turn hint was a line of text; the Flight tab now carries a
+turn card the plugin can draw. The app publishes `xcopilot/status/taxi` as
+`kind|dist_m|label|aim_true_deg|xtk_m|turn_deg|remaining_m` from
+`taxi_guide::TurnCard`: the same geometry as the strip hint, computed by
+`Guide::turn_card` every monitor tick, change-gated and riding the periodic
+resend, empty when there is no guide. Off the route past 60 m the card is
+kind X and points nowhere, so the compliance watch keeps that conversation
+(never two voices on one mistake). The aim bearing is the route 25 m ahead
+of the projection (`AIM_AHEAD_M`), and the plugin rotates it against the
+live true heading each frame, so the arrow moves at the sim's rate while the
+app ticks at the monitor's. The plugin draws the arrow, the distance, the
+label and a cross-track bar on the Flight tab. Layer two, arrows on the
+pavement through XPLMInstance, is still owed. Offline only.

@@ -106,6 +106,9 @@ struct Cue {
     dir: Option<&'static str>,
     /// A sharp bend — slow-down territory.
     sharp: bool,
+    /// The bend's signed angle, degrees (positive = right); zero for cues
+    /// that are not turns. The panel's arrow is drawn from it.
+    turn_deg: f64,
 }
 
 /// The per-clearance guide: cues precomputed from the published route, each
@@ -113,6 +116,10 @@ struct Cue {
 pub struct Guide {
     /// The route this guide was built for — the monitor rebuilds on change.
     path: Vec<(f64, f64)>,
+    /// The same route in the local metre frame (x east, y north from
+    /// `path[0]`) with cumulative distances, for the turn card's aim point.
+    pts: Vec<(f64, f64)>,
+    cum: Vec<f64>,
     cues: Vec<Cue>,
     called: Vec<bool>,
     /// Missed-turn nudge spoken, per cue — once each, like the cues.
@@ -183,6 +190,7 @@ impl Guide {
                     short: format!("cross rwy {}", first_designator(&leg_name)),
                     dir: None,
                     sharp: false,
+                    turn_deg: 0.0,
                 });
                 continue;
             }
@@ -220,6 +228,7 @@ impl Guide {
                     },
                     dir: Some(if delta < 0.0 { "left" } else { "right" }),
                     sharp,
+                    turn_deg: delta,
                 });
             } else if new_name && !spoken.is_empty() {
                 // Crossing exits fold into this naturally: the leg after a
@@ -232,6 +241,7 @@ impl Guide {
                     short: format!("onto {leg_name}"),
                     dir: None,
                     sharp: false,
+                    turn_deg: 0.0,
                 });
             }
         }
@@ -278,6 +288,7 @@ impl Guide {
             short,
             dir: None,
             sharp: false,
+            turn_deg: 0.0,
         });
         // Prep calls: a NAMED turn at the end of a long straight gets an
         // early heads-up as well — on a 400 m leg the pilot has tuned out by
@@ -304,6 +315,7 @@ impl Guide {
                         short: cue.short.clone(),
                         dir: cue.dir,
                         sharp: cue.sharp,
+                        turn_deg: cue.turn_deg,
                     });
                 }
             }
@@ -325,6 +337,8 @@ impl Guide {
         let nudged = vec![false; cues.len()];
         Some(Guide {
             path: watch.path.clone(),
+            pts,
+            cum,
             cues,
             called,
             nudged,
@@ -483,6 +497,108 @@ impl Guide {
             .find(|c| c.kind != CueKind::Prep && c.at_m - progress > -PASSED_M)?;
         let d = (cue.at_m - progress).max(0.0);
         Some(format!("NEXT {d:.0}m: {}", cue.short))
+    }
+}
+
+/// The panel's GPS-style turn card: the next decision point with its
+/// distance and bend, the route's bearing a little ahead of the aircraft
+/// (the plugin turns it against the live heading every frame, so the arrow
+/// is smooth at the sim's rate while this side ticks at the monitor's), and
+/// the signed cross-track. Geometry only, like [`Guide::strip_hint`]: the
+/// card shows what pavement comes next whether or not the cue was spoken.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TurnCard {
+    /// One letter for the plugin: T turn, C runway crossing, N new taxiway
+    /// name, H the holding point or stand, X off the route.
+    pub kind: char,
+    /// Metres to the decision point along the route (0 off route).
+    pub dist_m: f64,
+    /// The decision point's terse ASCII label (`Cue::short`).
+    pub label: String,
+    /// True bearing of the route [`AIM_AHEAD_M`] ahead of the projection.
+    pub aim_true_deg: f64,
+    /// Signed cross-track, metres, positive right of the route.
+    pub xtk_m: f64,
+    /// The bend at the decision point, degrees, positive right; 0 unless a
+    /// turn.
+    pub turn_deg: f64,
+    /// Metres of route left to its end.
+    pub remaining_m: f64,
+}
+
+/// How far ahead of the aircraft the card's aim bearing is taken: enough to
+/// lead into a bend the way a pilot looks, not so far that a 90 degree turn
+/// reads as a diagonal from the leg before it.
+const AIM_AHEAD_M: f64 = 25.0;
+
+impl TurnCard {
+    /// The wire form for `xcopilot/status/taxi`:
+    /// `kind|dist_m|label|aim_true_deg|xtk_m|turn_deg|remaining_m`, every
+    /// number an integer but the cross-track (one decimal). ASCII only; the
+    /// label never carries a '|'.
+    pub fn payload(&self) -> String {
+        format!(
+            "{}|{:.0}|{}|{:.0}|{:.1}|{:.0}|{:.0}",
+            self.kind,
+            self.dist_m,
+            self.label.replace('|', "/"),
+            self.aim_true_deg.rem_euclid(360.0),
+            self.xtk_m,
+            self.turn_deg,
+            self.remaining_m,
+        )
+    }
+}
+
+impl Guide {
+    /// The turn card for a position, `None` on a degenerate route. Off the
+    /// route (past the compliance watch's line) the card says so and points
+    /// nowhere: the controller owns that conversation, and an arrow back to
+    /// the paint would be a second voice on one mistake.
+    pub fn turn_card(&self, lat: f64, lon: f64) -> Option<TurnCard> {
+        let (progress, xtk) = project_signed(&self.path, lat, lon)?;
+        let total = *self.cum.last()?;
+        let remaining = (total - progress).max(0.0);
+        if xtk.abs() > OFF_ROUTE_M {
+            return Some(TurnCard {
+                kind: 'X',
+                dist_m: 0.0,
+                label: "off route".into(),
+                aim_true_deg: 0.0,
+                xtk_m: xtk,
+                turn_deg: 0.0,
+                remaining_m: remaining,
+            });
+        }
+        let here = point_at(&self.pts, &self.cum, progress);
+        let ahead = point_at(&self.pts, &self.cum, progress + AIM_AHEAD_M);
+        // At the very end the route has no "ahead": hold the last leg's
+        // bearing rather than a zero-length one.
+        let aim = if dist(here, ahead) < 1.0 {
+            bearing(point_at(&self.pts, &self.cum, total - AIM_AHEAD_M), ahead)
+        } else {
+            bearing(here, ahead)
+        };
+        let cue = self
+            .cues
+            .iter()
+            .find(|c| c.kind != CueKind::Prep && c.at_m - progress > -PASSED_M)?;
+        let kind = match cue.kind {
+            CueKind::Turn => 'T',
+            CueKind::RunwayAhead => 'C',
+            CueKind::NameChange => 'N',
+            CueKind::HoldingPoint => 'H',
+            CueKind::Prep => unreachable!("preps are filtered above"),
+        };
+        Some(TurnCard {
+            kind,
+            dist_m: (cue.at_m - progress).max(0.0),
+            label: cue.short.clone(),
+            aim_true_deg: aim,
+            xtk_m: xtk,
+            turn_deg: cue.turn_deg,
+            remaining_m: remaining,
+        })
     }
 }
 
@@ -1183,6 +1299,65 @@ mod tests {
         let (lat, lon) = ll(200.0, 30.0);
         let hint = g.strip_hint(lat, lon).expect("hint");
         assert!(hint.contains("cross rwy 09L"), "{hint}");
+    }
+
+    #[test]
+    fn turn_card_reads_the_next_decision_point_and_the_route_ahead() {
+        let g = Guide::build(&route()).expect("guide");
+        // 100 m along the eastbound leg, 3 m right (south) of the paint: the
+        // left turn onto S5W is 100 m ahead, the route ahead runs east.
+        let (lat, lon) = ll(100.0, -3.0);
+        let c = g.turn_card(lat, lon).expect("card");
+        assert_eq!(c.kind, 'T');
+        assert!((c.dist_m - 100.0).abs() < 1.0, "{c:?}");
+        assert_eq!(c.label, "left onto S5W");
+        assert!((c.aim_true_deg - 90.0).abs() < 1.0, "{c:?}");
+        assert!((c.xtk_m - 3.0).abs() < 0.5, "{c:?}");
+        assert!((c.turn_deg + 90.0).abs() < 1.0, "left is negative: {c:?}");
+        assert!((c.remaining_m - 400.0).abs() < 1.0, "{c:?}");
+        assert_eq!(c.payload(), "T|100|left onto S5W|90|3.0|-90|400");
+        // Nearing the corner the aim point goes round it and the arrow
+        // leans into the turn, more the closer we get: a lead, not a flip.
+        let (lat, lon) = ll(180.0, 0.0);
+        let c = g.turn_card(lat, lon).expect("card");
+        assert!((60.0..89.0).contains(&c.aim_true_deg), "{c:?}");
+        let (lat, lon) = ll(195.0, 0.0);
+        let c = g.turn_card(lat, lon).expect("card");
+        assert!(c.aim_true_deg < 30.0, "{c:?}");
+        // Past the turn the crossing is next, then the name, then the hold.
+        let (lat, lon) = ll(200.0, 30.0);
+        let c = g.turn_card(lat, lon).expect("card");
+        assert_eq!((c.kind, c.label.as_str()), ('C', "cross rwy 09L"));
+        assert!(
+            (c.aim_true_deg).abs() < 1.0 || (c.aim_true_deg - 360.0).abs() < 1.0,
+            "{c:?}"
+        );
+        let (lat, lon) = ll(200.0, 200.0);
+        let c = g.turn_card(lat, lon).expect("card");
+        assert_eq!((c.kind, c.label.as_str()), ('H', "hold N5W"));
+        assert!((c.dist_m - 100.0).abs() < 1.0, "{c:?}");
+        // At the end the aim holds the last leg's bearing, no zero-length leg.
+        let (lat, lon) = ll(200.0, 300.0);
+        let c = g.turn_card(lat, lon).expect("card");
+        assert!(
+            c.aim_true_deg.abs() < 1.0 || (c.aim_true_deg - 360.0).abs() < 1.0,
+            "{c:?}"
+        );
+        assert!(c.remaining_m < 1.0, "{c:?}");
+    }
+
+    #[test]
+    fn turn_card_off_route_points_nowhere() {
+        let g = Guide::build(&route()).expect("guide");
+        let (lat, lon) = ll(100.0, -200.0);
+        let c = g.turn_card(lat, lon).expect("card");
+        assert_eq!(c.kind, 'X');
+        assert!(c.xtk_m > 60.0, "right of the paint is positive: {c:?}");
+        assert!(
+            c.payload().starts_with("X|0|off route|0|"),
+            "{}",
+            c.payload()
+        );
     }
 
     #[test]

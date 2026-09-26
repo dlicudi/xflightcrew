@@ -142,6 +142,7 @@ pub const PLUGIN_DATAREFS: &[&str] = &[
     "xcopilot/status/radio",
     "xcopilot/status/state",
     "xcopilot/status/strip",
+    "xcopilot/status/taxi",
     "xcopilot/steer_yield",
     "xcopilot/taxi_brake",
     "xcopilot/taxi_brake_l",

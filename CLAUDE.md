@@ -665,6 +665,9 @@ every loop down.
   (`src/auto_status.rs`), change-gated with a periodic resend (plugin reloads zero buffers). Lines
   carry live detail (`auto_status::Detail`, `DetailGuard`, `wait_status`); panel-only
   `set_ap_targets`, `note_said`.
+- **The taxi turn card** (`taxi_guide::TurnCard`, `xcopilot/status/taxi`): the guide's next decision
+  point, aim bearing and cross-track, drawn as a GPS-style arrow by the plugin (rotated against live
+  heading per frame); kind X off route points nowhere.
 - Buttons inject pilot English (`REQUEST_PHRASES`, grammar-test-pinned); CANCEL ALWAYS aborts
   something. The typed line is `xcopilot/typed`. Route tab: `xcopilot/status/loadsheet`,
   `fms::active_fix`. Native panel-graphics API (SDK 4.4.0; `plugin/src/imgui_xp.cpp`).

@@ -162,6 +162,9 @@ static TextRef g_aircraft = {{0}, 0};
 // Live flight strip — one compact status line the app refreshes (emergency
 // phase/runway, cabin altitude, fuel endurance). Empty = hidden.
 static TextRef g_strip = {{0}, 0};
+// Taxi turn card, GPS style: "kind|dist_m|label|aim_true_deg|xtk_m|turn_deg|
+// remaining_m" (empty = hide), refreshed like the strip.
+static TextRef g_taxi = {{0}, 0};
 // On-screen callout — WHAT the copilot is changing ("FLAPS > 10"), flashed in a
 // floating toast over the sim for a couple of seconds after each action.
 static TextRef g_callout = {{0}, 0};
@@ -194,6 +197,7 @@ static XPLMDataRef g_action_dref = nullptr;
 static XPLMDataRef g_alert_dref = nullptr;
 static XPLMDataRef g_aircraft_dref = nullptr;
 static XPLMDataRef g_strip_dref = nullptr;
+static XPLMDataRef g_taxi_dref = nullptr;
 static XPLMDataRef g_callout_dref = nullptr;
 static XPLMDataRef g_radio_dref = nullptr;
 static XPLMDataRef g_atc_dref = nullptr;
@@ -205,6 +209,8 @@ static XPLMDataRef g_state_dref = nullptr;
 // COM1 active frequency (integer kHz despite the sim's `hz` name) — read for
 // the ATC tab's tuned highlight, written by its click-to-tune.
 static XPLMDataRef g_com1_dref = nullptr;
+// TRUE heading, for the taxi card's arrow (its aim bearing is true too).
+static XPLMDataRef g_psi_dref = nullptr;
 // Proportional taxi brake. The app writes xcopilot/taxi_brake (0..1) and the
 // flight loop drives the toe-brake ratios from it every frame, holding
 // override_toe_brakes only while a fresh value wants brake; writes stopping
@@ -806,6 +812,10 @@ static float TaxiAssistLoop(float, float, int, void*) {
 static void WriteStrip(void*, void* in, int offset, int len) {
     StoreText(&g_strip, in, offset, len);
 }
+// The taxi turn card, refreshed like the strip, not logged.
+static void WriteTaxi(void*, void* in, int offset, int len) {
+    StoreText(&g_taxi, in, offset, len);
+}
 // The load sheet feed — refreshed like the strip, not logged.
 static void WriteLoadSheet(void*, void* in, int offset, int len) {
     StoreText(&g_loadsheet, in, offset, len);
@@ -984,6 +994,10 @@ void start() {
         "xcopilot/status/strip", xplmType_Data, 1,
         nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
         nullptr, nullptr, nullptr, nullptr, ReadText, WriteStrip, &g_strip, &g_strip);
+    g_taxi_dref = XPLMRegisterDataAccessor(
+        "xcopilot/status/taxi", xplmType_Data, 1,
+        nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
+        nullptr, nullptr, nullptr, nullptr, ReadText, WriteTaxi, &g_taxi, &g_taxi);
     g_opt_snap_dref = XPLMRegisterDataAccessor(
         "xcopilot/opt/camera_snap", xplmType_Int, 1,
         ReadOptSnap, WriteOptSnap, nullptr, nullptr, nullptr, nullptr,
@@ -1057,6 +1071,7 @@ void start() {
         nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
         nullptr, nullptr, nullptr, nullptr, ReadText, WriteTyped, &g_typed, &g_typed);
     g_com1_dref = XPLMFindDataRef("sim/cockpit2/radios/actuators/com1_frequency_hz_833");
+    g_psi_dref = XPLMFindDataRef("sim/flightmodel/position/psi");
     g_taxi_brake_dref = XPLMRegisterDataAccessor(
         "xcopilot/taxi_brake", xplmType_Float, 1,
         nullptr, nullptr, ReadTaxiBrake, WriteTaxiBrake, nullptr, nullptr,
@@ -1204,6 +1219,7 @@ void stop_rest() {
     if (g_opt_mute_dref) { XPLMUnregisterDataAccessor(g_opt_mute_dref); g_opt_mute_dref = nullptr; }
     if (g_opt_tone_dref) { XPLMUnregisterDataAccessor(g_opt_tone_dref); g_opt_tone_dref = nullptr; }
     if (g_opt_snap_dref) { XPLMUnregisterDataAccessor(g_opt_snap_dref); g_opt_snap_dref = nullptr; }
+    if (g_taxi_dref) { XPLMUnregisterDataAccessor(g_taxi_dref); g_taxi_dref = nullptr; }
     if (g_strip_dref) { XPLMUnregisterDataAccessor(g_strip_dref); g_strip_dref = nullptr; }
     if (g_request_dref) { XPLMUnregisterDataAccessor(g_request_dref); g_request_dref = nullptr; }
     audio::unregister_datarefs();
@@ -1230,6 +1246,8 @@ bool ptt_active() { return g_ptt_active != 0; }
 bool radio_ptt_active() { return g_radio_ptt_active != 0; }
 const TextRef& aircraft() { return g_aircraft; }
 const TextRef& strip() { return g_strip; }
+const TextRef& taxi_card() { return g_taxi; }
+float heading_true() { return g_psi_dref ? XPLMGetDataf(g_psi_dref) : 0.0f; }
 const TextRef& radio_row() { return g_radio; }
 const TextRef& coach() { return g_coach; }
 bool coach_urgent() { return g_coach_urgent; }

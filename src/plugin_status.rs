@@ -32,6 +32,7 @@ const DR_AUTO: &str = "xcopilot/status/auto";
 const DR_LOADSHEET: &str = "xcopilot/status/loadsheet";
 const DR_BRIEF: &str = "xcopilot/status/brief";
 const DR_STATE: &str = "xcopilot/status/state";
+const DR_TAXI: &str = "xcopilot/status/taxi";
 
 /// Keep text within the plugin's fixed display buffer (512 bytes, NUL-terminated)
 /// — long enough for a full engine/weather summary readback.
@@ -76,6 +77,9 @@ enum Update {
     Brief(String),
     /// The State tab: the flight model and the duty engine, one line each.
     State(String),
+    /// The Flight tab's taxi turn card (`taxi_guide::TurnCard::payload`).
+    /// Empty hides it.
+    Taxi(String),
 }
 
 /// Severity of a panel alert — drives the chip colour/label in the plugin.
@@ -182,6 +186,10 @@ impl StatusSink {
     pub fn state(&self, text: &str) {
         let _ = self.0.send(Update::State(clip(text)));
     }
+    /// The Flight tab's taxi turn card. Empty hides it.
+    pub fn taxi(&self, payload: &str) {
+        let _ = self.0.send(Update::Taxi(clip(payload)));
+    }
 }
 
 /// Scrub em/en dashes (the panel font can't render them) and trim to the plugin
@@ -221,6 +229,7 @@ enum Slot {
     LoadSheet,
     Brief,
     State,
+    Taxi,
 }
 
 /// The resolved numeric ids of the plugin's status datarefs. All `None` until a
@@ -241,6 +250,7 @@ struct Ids {
     loadsheet: Option<i64>,
     brief: Option<i64>,
     state: Option<i64>,
+    taxi: Option<i64>,
 }
 
 impl Ids {
@@ -260,6 +270,7 @@ impl Ids {
             Slot::LoadSheet => self.loadsheet,
             Slot::Brief => self.brief,
             Slot::State => self.state,
+            Slot::Taxi => self.taxi,
         }
     }
     /// True once at least one dataref resolved (i.e. the plugin is present).
@@ -286,6 +297,7 @@ fn resolve_all(http: &reqwest::blocking::Client, rest: &str) -> Ids {
         loadsheet: resolve_id(http, rest, DR_LOADSHEET),
         brief: resolve_id(http, rest, DR_BRIEF),
         state: resolve_id(http, rest, DR_STATE),
+        taxi: resolve_id(http, rest, DR_TAXI),
     }
 }
 
@@ -391,6 +403,7 @@ fn run(base: String, rx: Receiver<Update>) {
                 }
                 Update::Brief(text) => (Slot::Brief, json!(STANDARD.encode(text.as_bytes()))),
                 Update::State(text) => (Slot::State, json!(STANDARD.encode(text.as_bytes()))),
+                Update::Taxi(text) => (Slot::Taxi, json!(STANDARD.encode(text.as_bytes()))),
             };
             healthy = patch(&http, &rest, &ids, slot, value);
         }

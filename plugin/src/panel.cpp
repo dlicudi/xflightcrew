@@ -118,6 +118,128 @@ static void Chip(const char* label, ImU32 col) {
     ImGui::Dummy(size);
 }
 
+// The taxi turn card, GPS style: a dial with an arrow pointing where the
+// route runs 25 m ahead RELATIVE TO THE NOSE (recomputed every frame from the
+// live true heading, so it turns smoothly as the aircraft does), the distance
+// to the next decision big, its label under it, then a cross-track bar.
+// Payload: "kind|dist_m|label|aim_true_deg|xtk_m|turn_deg|remaining_m".
+static void TaxiCard(const TextRef& card, float scale) {
+    char buf[256];
+    const int n = card.len < static_cast<int>(sizeof buf) - 1
+                      ? card.len : static_cast<int>(sizeof buf) - 1;
+    std::memcpy(buf, card.buf, static_cast<size_t>(n));
+    buf[n] = '\0';
+    // Split on '|' by hand (strtok would swallow an empty field).
+    const char* f[7] = {"", "0", "", "0", "0", "0", "0"};
+    int nf = 0;
+    char* p = buf;
+    while (nf < 7) {
+        f[nf++] = p;
+        char* bar = std::strchr(p, '|');
+        if (bar == nullptr) break;
+        *bar = '\0';
+        p = bar + 1;
+    }
+    const char kind = f[0][0];
+    if (kind == '\0') return;
+    const int dist_m = std::atoi(f[1]);
+    const char* label = f[2];
+    const float aim = static_cast<float>(std::atof(f[3]));
+    const float xtk = static_cast<float>(std::atof(f[4]));
+    const float turn = static_cast<float>(std::atof(f[5]));
+
+    const float headPx = kHeadPx * scale;
+    const float bodyPx = kBodyPx * scale;
+    const float S = headPx * 3.2f;
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    const ImVec2 o = ImGui::GetCursorScreenPos();
+    const ImVec2 c(o.x + S * 0.5f, o.y + S * 0.5f);
+    const float R = S * 0.42f;
+    const ImU32 ring = (COL_DIM & 0x00FFFFFFu) | 0x50000000u;
+    dl->AddCircle(c, R, ring, 48, 1.5f * scale);
+
+    const bool off = (kind == 'X');
+    const ImU32 accent = off ? COL_RED
+                       : kind == 'C' ? COL_AMBER
+                       : kind == 'H' ? COL_GREEN
+                       : COL_CYAN;
+    if (!off) {
+        // Clockwise positive, straight up when the route runs along the nose.
+        float rel = std::fmod(aim - drefs::heading_true(), 360.0f);
+        if (rel < -180.0f) rel += 360.0f;
+        if (rel > 180.0f) rel -= 360.0f;
+        const float a = rel * 3.14159265f / 180.0f;
+        const ImVec2 fw(std::sin(a), -std::cos(a));   // forward on screen
+        const ImVec2 rt(std::cos(a), std::sin(a));    // right on screen
+        auto P = [&](float x, float y) {
+            return ImVec2(c.x + (x * rt.x + y * fw.x) * R, c.y + (x * rt.y + y * fw.y) * R);
+        };
+        dl->AddQuadFilled(P(-0.17f, 0.15f), P(0.17f, 0.15f),
+                          P(0.17f, -0.75f), P(-0.17f, -0.75f), accent);
+        dl->AddTriangleFilled(P(0.0f, 0.85f), P(0.52f, 0.12f), P(-0.52f, 0.12f), accent);
+    }
+    ImGui::Dummy(ImVec2(S, S));
+    ImGui::SameLine();
+
+    ImGui::BeginGroup();
+    char big[48];
+    ImU32 bigCol = COL_WHITE;
+    if (off) {
+        std::snprintf(big, sizeof big, "OFF ROUTE");
+        bigCol = COL_RED;
+    } else {
+        std::snprintf(big, sizeof big, "%d m", dist_m);
+        if (kind == 'C' || dist_m < 50) bigCol = COL_AMBER;
+        if (kind == 'H') bigCol = COL_GREEN;
+    }
+    ImGui::PushFont(g_font_head, headPx);
+    ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(bigCol), "%s", big);
+    ImGui::PopFont();
+    if (kind == 'C') {
+        ImGui::SameLine();
+        Chip("RWY", COL_AMBER);
+    }
+
+    ImGui::PushTextWrapPos(0.0f);
+    if (off) {
+        ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(COL_AMBER), "%.0f m %s",
+                           std::fabs(xtk), xtk >= 0.0f ? "R" : "L");
+    } else {
+        char line[160];
+        if (kind == 'T' && turn != 0.0f) {
+            std::snprintf(line, sizeof line, "%s%s%s", turn < 0.0f ? "< " : "> ",
+                          std::fabs(turn) >= 100.0f ? "sharp " : "", label);
+        } else {
+            std::snprintf(line, sizeof line, "%s", label);
+        }
+        ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(COL_CYAN));
+        ImGui::TextUnformatted(line);
+        ImGui::PopStyleColor();
+    }
+    ImGui::PopTextWrapPos();
+
+    // Cross-track bar: centre tick, marker offset by xtk (clamped to 20 m),
+    // positive xtk (aircraft right of the route) to the right of centre.
+    if (!off) {
+        float w = ImGui::GetContentRegionAvail().x;
+        if (w > bodyPx * 12.0f) w = bodyPx * 12.0f;
+        if (w < bodyPx * 3.0f) w = bodyPx * 3.0f;
+        const float h = 8.0f * scale;
+        const ImVec2 b = ImGui::GetCursorScreenPos();
+        const float mid = b.x + w * 0.5f, cy = b.y + h * 0.5f;
+        dl->AddLine(ImVec2(b.x, cy), ImVec2(b.x + w, cy), ring, 2.0f * scale);
+        dl->AddLine(ImVec2(mid, b.y), ImVec2(mid, b.y + h), COL_DIM, 1.5f * scale);
+        float x = xtk;
+        if (x > 20.0f) x = 20.0f;
+        if (x < -20.0f) x = -20.0f;
+        const float mx = mid + x / 20.0f * (w * 0.5f);
+        dl->AddCircleFilled(ImVec2(mx, cy), h * 0.5f,
+                            std::fabs(xtk) <= 3.0f ? COL_GREEN : COL_AMBER, 12);
+        ImGui::Dummy(ImVec2(w, h));
+    }
+    ImGui::EndGroup();
+}
+
 // Log speaker tag: a fixed-width filled pill so every row's text starts at the
 // same column — the log reads as a transcript, not a ragged debug feed. Fill
 // is the tag's own hue at low alpha; the label carries the color.
@@ -489,6 +611,10 @@ protected:
             ImGui::PopStyleColor();
             ImGui::PopFont();
         }
+
+        // The taxi turn card, while a taxi guide or auto taxi has a route.
+        const TextRef& taxi = drefs::taxi_card();
+        if (taxi.len > 0) TaxiCard(taxi, kUiScale[mScaleIdx]);
 
         // Reserve the button block below the well: CANCEL + two arm rows +
         // the guarded row; the status bar is drawn by buildInterface after

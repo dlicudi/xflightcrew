@@ -2370,6 +2370,7 @@ pub async fn run(
     let mut push_called = false;
     // Last strip pushed to the panel — only re-send on change.
     let mut last_strip = String::new();
+    let mut last_card = String::new();
     // Last automation feed pushed, plus a tick countdown that forces a
     // periodic resend: a plugin reload zeroes its buffers, and a purely
     // change-gated publish would leave the Flight tab blank until the next
@@ -3800,6 +3801,19 @@ pub async fn run(
                 if strip != last_strip {
                     s.strip(&strip);
                     last_strip = strip;
+                }
+                // The turn card behind the panel's arrow: the same geometry
+                // as the strip's hint, structured, and empty (card hidden)
+                // whenever there is no guide. It rides the periodic resend
+                // below so a plugin reload gets it back.
+                let card = taxi_guide
+                    .as_ref()
+                    .and_then(|g| g.turn_card(snap.lat, snap.lon))
+                    .map(|c| c.payload())
+                    .unwrap_or_default();
+                if card != last_card || auto_resend == 0 {
+                    s.taxi(&card);
+                    last_card = card;
                 }
                 // The Flight tab's automation feed, published here rather than
                 // the 1 Hz radio poller because that thread only exists when
