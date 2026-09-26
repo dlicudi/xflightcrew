@@ -1835,35 +1835,27 @@ pub fn run_autoland_scoped(
                     }
                     ArrestHands::Off | ArrestHands::Keep => {}
                 }
-                // The wings while the arrest has the servos: a shallow bank
-                // toward the crabbed heading, wings level with no heading
+                // The wings while the arrest has the servos: a bank that
+                // closes the centreline by the TRACK over the runway (see
+                // `arrest_bank_target`), the sim's ground track against the
+                // course, the smoothed cross-track rate when no track was
                 // read. No bank read is no command (the channel expires).
-                // Over the runway with the servos out, the heading is the
-                // CENTRELINE's (the takeoff and rollout law: sized for a
-                // closure time, the drift rate smoothed), plus the wind's
-                // crab. The approach's pursuit aims far down the runway: the
-                // 737 went from 9 m right at 55 ft to 16 m left at the
-                // wheels, crossing at 4 m/s (LEMG 13, 2026-09-26).
+                // The approach's pursuit aimed far down the runway (9 m right
+                // at 55 ft, 16 m left at the wheels), and the rollout's
+                // heading law after it closed in nine seconds what the flare
+                // has eight for (LEMG 13, 2026-09-26).
                 let xtk_m_now = xtk_now * M_PER_NM;
                 let arrest_rate_now = arrest_rate.update(
                     arrest_prev_xtk.map_or(0.0, |p: f64| (xtk_m_now - p) / tick_dt.max(0.05)),
                     tick_dt.max(0.05),
                 );
                 arrest_prev_xtk = Some(xtk_m_now);
-                let arrest_heading = (crate::autotakeoff::roll_target_heading(
-                    rwy.course_deg,
-                    xtk_m_now,
-                    arrest_rate_now,
-                    gs_kts,
-                ) + crab)
-                    .rem_euclid(360.0);
+                let track_now = hpath_r.as_ref().ok().copied();
+                let side_now = side_velocity_m_s(track_now, rwy.course_deg, gs_kts)
+                    .unwrap_or(arrest_rate_now);
+                let bank_tgt = arrest_bank_target(xtk_m_now, side_now, radio_ft);
                 let flare_ail = match (arrest_hands, phi_r.as_ref().ok().copied(), roll_yielded) {
-                    (true, Some(phi), false) => {
-                        let hdg_err = psi_r.as_ref().ok().map_or(0.0, |psi| {
-                            ((arrest_heading - psi + 540.0).rem_euclid(360.0)) - 180.0
-                        });
-                        Some(wings.step(phi, crate::autotakeoff::climb_bank_target(hdg_err), tick_dt))
-                    }
+                    (true, Some(phi), false) => Some(wings.step(phi, bank_tgt, tick_dt)),
                     _ => None,
                 };
                 *TRACKING_ERROR.lock().unwrap_or_else(|e| e.into_inner()) = Some(xtk_now * M_PER_NM);
@@ -1876,6 +1868,10 @@ pub fn run_autoland_scoped(
                     "trim": trim, "xtk_m": xtk_now * M_PER_NM,
                     "flare_elev": flare_elev, "flare_ail": flare_ail, "hands": arrest_hands,
                     "phi": phi_r.as_ref().ok().copied(),
+                    // The arrest's lateral: the track it closes on, the
+                    // sideways velocity and the bank it asked for.
+                    "trk": track_now, "side_m_s": side_now,
+                    "bank_tgt": arrest_hands.then_some(bank_tgt),
                     // Which leg of a reversal is flying: every pattern tick
                     // reports phase Intercept, so without this the outbound,
                     // the base and the inbound are one undifferentiated block
@@ -3480,6 +3476,61 @@ pub fn arrest_hands_step(taken: bool, arresting: bool) -> ArrestHands {
         (true, true) => ArrestHands::Keep,
         (true, false) => ArrestHands::Return,
     }
+}
+
+/// The closure the arrest asks for: the offset over this many seconds.
+const ARREST_CLOSE_S: f64 = 4.0;
+/// ...and never faster than this sideways, m/s.
+const ARREST_CLOSE_MAX_M_S: f64 = 2.5;
+/// How quickly a sideways-velocity error is taken out by the bank, seconds.
+const ARREST_VEL_TAU_S: f64 = 2.0;
+/// The steepest bank over the runway, degrees, tapering toward the wheels.
+const ARREST_BANK_MAX_DEG: f64 = 5.0;
+const ARREST_BANK_WHEELS_DEG: f64 = 2.0;
+const G_M_S2: f64 = 9.81;
+
+/// The bank the arrest flies with the servos out, from the centreline offset
+/// (`xtk_m`, right positive) and the SIDEWAYS VELOCITY over the runway
+/// (`side_m_s`, right positive: the ground track's angle off the course
+/// times the groundspeed). A velocity loop inside a position loop: the offset
+/// asks for a closure rate, the bank takes out the difference.
+///
+/// It flew a HEADING (the rollout's centreline law plus the crab), and over
+/// the runway a heading is the wrong thing to fly. The rollout law is sized
+/// for a closure time of about nine seconds at 140 kt, longer than the whole
+/// arrest; and the 737's nose did not follow its bank: LEMG 13 (2026-09-26,
+/// 17:43Z) went into the gate 3.9 m right and crossing left at 2.3 m/s, the
+/// bank built to 4.6 degrees right while the heading fell from 130.5 to
+/// 129.1, the track came right only 1 degree, and it touched down 15.3 m
+/// left and rolled out 16.8 m left. The same crossing flew four landings in
+/// a row (100 ft to the wheels: +5.6 to -11.9, +5.9 to -14.7, +13.0 to
+/// -5.6, +7.2 to -10.4). The track is what moves the aircraft over the
+/// paint, so the track is what this closes.
+pub fn arrest_bank_target(xtk_m: f64, side_m_s: f64, radio_ft: f64) -> f64 {
+    if !xtk_m.is_finite() || !side_m_s.is_finite() {
+        return 0.0;
+    }
+    let want = (-xtk_m / ARREST_CLOSE_S).clamp(-ARREST_CLOSE_MAX_M_S, ARREST_CLOSE_MAX_M_S);
+    let bank = ((want - side_m_s) / (G_M_S2 * ARREST_VEL_TAU_S)).atan().to_degrees();
+    let cap = if radio_ft.is_finite() {
+        (ARREST_BANK_WHEELS_DEG + radio_ft.max(0.0) / 10.0).min(ARREST_BANK_MAX_DEG)
+    } else {
+        ARREST_BANK_WHEELS_DEG
+    };
+    bank.clamp(-cap, cap)
+}
+
+/// The sideways velocity over the runway, m/s right positive, from the sim's
+/// ground track (`hpath`, true) against the runway course (true). `None`
+/// without a track read: no measurement, and the caller falls back to the
+/// smoothed cross-track rate.
+pub fn side_velocity_m_s(track_true: Option<f64>, course_true: f64, gs_kts: f64) -> Option<f64> {
+    let trk = track_true.filter(|t| t.is_finite())?;
+    if !gs_kts.is_finite() {
+        return None;
+    }
+    let off = (((trk - course_true + 540.0).rem_euclid(360.0)) - 180.0).to_radians();
+    Some(gs_kts * 0.514_444 * off.sin())
 }
 
 /// Outside a landing arrest (`arresting` false) the dial is the target, as it
@@ -5692,6 +5743,85 @@ mod tests {
         assert_eq!(arrest_hands_step(false, true), ArrestHands::Take);
         assert_eq!(arrest_hands_step(true, true), ArrestHands::Keep);
         assert_eq!(arrest_hands_step(true, false), ArrestHands::Return);
+    }
+
+    /// The servos-out arrest over the runway, flown from the gate of the LEMG
+    /// 13 landing at 17:43Z (2026-09-26, a 737): 79 ft radio, 3.9 m right of
+    /// the centreline and crossing left at 2.3 m/s, 1.4 degrees of left bank,
+    /// 144 kt, 8.5 s to the wheels. It touched down 15.3 m left and the
+    /// rollout scored 16.8 m.
+    ///
+    /// The plant is second order in roll (aileron to roll rate with a 0.5 s
+    /// lag, 20 deg/s per unit of aileron: the recorded 1 deg/s at 0.035 to
+    /// 0.08 of aileron), bank to sideways acceleration, and the arrest's own
+    /// tick of 0.25 s with one tick of transport delay. The number asserted is
+    /// the offset at the wheels, where the scorer's rollout begins, and the
+    /// worst overshoot past the centreline on the way down.
+    #[test]
+    fn the_arrest_closes_the_centreline_by_the_track_over_the_runway() {
+        use crate::autotakeoff::{climb_bank_target, roll_target_heading, WingsLevel, XtkRate};
+        let fly = |track_law: bool, x0: f64, v0: f64, phi0: f64| -> (f64, f64) {
+            let (gs_kts, t_end, dt) = (144.0, 8.5, 0.25);
+            let v_air = gs_kts * 0.514_444;
+            let (mut x, mut v, mut phi, mut p) = (x0, v0, phi0, 0.0_f64);
+            let mut wings = WingsLevel::default();
+            let mut rate = XtkRate::default();
+            let mut prev_x: Option<f64> = None;
+            let mut queued = 0.0_f64;
+            let (mut t, mut worst) = (0.0, 0.0_f64);
+            while t < t_end {
+                let radio = 79.0 * (1.0 - t / t_end);
+                let rate_now = rate.update(prev_x.map_or(0.0, |px| (x - px) / dt), dt);
+                prev_x = Some(x);
+                // Coordinated: the heading is the track (no wind, no crab).
+                let track_deg = (v / v_air).asin().to_degrees();
+                let bank_tgt = if track_law {
+                    let side = side_velocity_m_s(Some(track_deg), 0.0, gs_kts).unwrap();
+                    arrest_bank_target(x, side, radio)
+                } else {
+                    let hdg = roll_target_heading(0.0, x, rate_now, gs_kts);
+                    let err = ((hdg - track_deg + 540.0).rem_euclid(360.0)) - 180.0;
+                    climb_bank_target(err)
+                };
+                let ail = wings.step(phi, bank_tgt, dt);
+                let applied = std::mem::replace(&mut queued, ail);
+                for _ in 0..10 {
+                    let h = dt / 10.0;
+                    p += (20.0 * applied - p) / 0.5 * h;
+                    phi += p * h;
+                    v += 9.81 * phi.to_radians().tan() * h;
+                    x += v * h;
+                }
+                worst = worst.max(-x * x0.signum());
+                t += dt;
+            }
+            (x, worst)
+        };
+        let (old_wheels, _) = fly(false, 3.9, -2.3, -1.4);
+        assert!(old_wheels.abs() > 5.0, "the heading law lands {old_wheels:.1} m off");
+        let (wheels, worst) = fly(true, 3.9, -2.3, -1.4);
+        assert!(wheels.abs() < 2.0, "the track law lands {wheels:.1} m off");
+        assert!(worst < 5.0, "and never overshoots {worst:.1} m past the line");
+        // The 17:25Z landing: 5.9 m right at 100 ft, crossing at 2.5 m/s.
+        let (old_wheels, _) = fly(false, 5.9, -2.5, 0.0);
+        assert!(old_wheels.abs() > 5.0, "{old_wheels:.1}");
+        let (wheels, worst) = fly(true, 5.9, -2.5, 0.0);
+        assert!(wheels.abs() < 2.0 && worst < 5.0, "{wheels:.1} / {worst:.1}");
+    }
+
+    /// The bank is shallow near the wheels and nothing without a reading.
+    #[test]
+    fn the_arrest_bank_tapers_to_the_wheels() {
+        assert_eq!(arrest_bank_target(-30.0, 0.0, 80.0), ARREST_BANK_MAX_DEG);
+        assert_eq!(arrest_bank_target(-30.0, 0.0, 0.0), ARREST_BANK_WHEELS_DEG);
+        assert!(arrest_bank_target(30.0, 0.0, 80.0) < 0.0, "right of the line banks left");
+        assert_eq!(arrest_bank_target(f64::NAN, 0.0, 50.0), 0.0);
+        assert_eq!(arrest_bank_target(0.0, 0.0, 50.0), 0.0);
+        // Crossing left at 2.3 m/s over the centreline: bank right now.
+        assert!(arrest_bank_target(0.0, -2.3, 50.0) > 3.0);
+        assert!(side_velocity_m_s(None, 130.0, 140.0).is_none());
+        let v = side_velocity_m_s(Some(129.0), 130.0, 140.0).unwrap();
+        assert!((v + 1.26).abs() < 0.05, "1 degree left at 140 kt: {v}");
     }
 
     /// The overflight rule must know a landing float from an overflight. At
