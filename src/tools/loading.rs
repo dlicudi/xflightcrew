@@ -69,6 +69,18 @@ impl What {
 /// their capacity, the centreline tanks with the remainder. With no lateral
 /// positions (or no wing tanks at all) every tank is filled in proportion.
 /// `None` when the tanks cannot hold it or there are none.
+/// The fuel to load so `zero_fuel_kg` plus fuel sits at the plan's takeoff
+/// limit, when the plan's block would put it over and trimming stays at or
+/// above the plan's minimum takeoff fuel. `None`: no trim needed, or none
+/// that keeps the minimum (then the block is loaded and the limit said). Pure.
+pub fn trim_fuel_to_limit(zero_fuel_kg: f64, block_kg: f64, max_tow_kg: f64, min_fuel_kg: f64) -> Option<f64> {
+    if max_tow_kg <= 0.0 || min_fuel_kg <= 0.0 || zero_fuel_kg + block_kg <= max_tow_kg * 1.005 {
+        return None;
+    }
+    let fuel = max_tow_kg - zero_fuel_kg;
+    (fuel >= min_fuel_kg && fuel < block_kg).then_some(fuel)
+}
+
 pub fn distribute_fuel(target_kg: f64, capacity_kg: &[f64], lateral_m: &[f64]) -> Option<Vec<f64>> {
     let total: f64 = capacity_kg.iter().sum();
     if total <= 0.0 || !target_kg.is_finite() || target_kg < 0.0 || target_kg > total * 1.005 {
@@ -217,6 +229,35 @@ pub async fn load_from_plan(xp: &dyn XPlane, fp: &FlightPlan, what: What) -> Res
         return Ok(notes.join(" "));
     }
 
+    // The plan's payload on an aircraft that is heavier empty than the plan
+    // assumed goes over the plan's own takeoff limit. A dispatcher trims the
+    // FUEL, never below the plan's minimum takeoff fuel, rather than load an
+    // aircraft the crew will then refuse to fly: "Loaded... over the plan's
+    // takeoff limit", then "Negative... over the plan's takeoff limit" at the
+    // arm (LIPR 172, 2026-09-26, 100 lb over with 220 lb of fuel aboard).
+    let mut fuel_want = fuel_want;
+    let mut trimmed_from: Option<f64> = None;
+    // Only for a plan that fits its own limit on its own numbers: the excess
+    // is then the airframe's empty weight, not a plan that never added up.
+    let plan_fits = fp
+        .weights
+        .as_ref()
+        .is_some_and(|w| w.est_tow_kg > 0.0 && w.est_tow_kg <= w.max_tow_kg * 1.005);
+    if let (Some(want), Some(w), Ok(empty), true) = (fuel_want, fp.weights.as_ref(), empty.as_ref(), plan_fits) {
+        let payload = payload_want.or(payload_now.as_ref().ok().copied()).unwrap_or(0.0);
+        // Over the AIRFRAME's maximum is the refusal below, never a trim.
+        let within_airframe = max
+            .as_ref()
+            .is_ok_and(|m| *m <= 0.0 || *empty + payload + want <= m * 1.005);
+        if let Some(fuel) = within_airframe
+            .then(|| trim_fuel_to_limit(*empty + payload, want, w.max_tow_kg, fp.min_takeoff_fuel_kg))
+            .flatten()
+        {
+            trimmed_from = Some(want);
+            fuel_want = Some(fuel);
+        }
+    }
+
     // The tanks must hold it, and the airframe must carry it.
     let mut per_tank = None;
     if let Some(want) = fuel_want {
@@ -282,11 +323,18 @@ pub async fn load_from_plan(xp: &dyn XPlane, fp: &FlightPlan, what: What) -> Res
     let mut lines = vec![format!("Loaded for {} to {}.", fp.origin, fp.destination)];
     if let Some(want) = fuel_want {
         match fuel_after {
-            Ok(f) if matches(f, want) => lines.push(format!(
-                "Fuel {}{}.",
-                spoken(f),
-                if fuel_set { ", already aboard" } else { "" }
-            )),
+            Ok(f) if matches(f, want) => lines.push(match trimmed_from {
+                Some(block) => format!(
+                    "Fuel {}, trimmed from the plan's {} to stay inside its takeoff limit.",
+                    spoken(f),
+                    spoken(block)
+                ),
+                None => format!(
+                    "Fuel {}{}.",
+                    spoken(f),
+                    if fuel_set { ", already aboard" } else { "" }
+                ),
+            }),
             Ok(f) => {
                 ok = false;
                 lines.push(format!(
@@ -353,7 +401,7 @@ pub async fn load_from_plan(xp: &dyn XPlane, fp: &FlightPlan, what: What) -> Res
         json!({
             "event": "load_aircraft", "what": format!("{what:?}"),
             "origin": fp.origin, "destination": fp.destination,
-            "fuel_want_kg": fuel_want, "fuel_before_kg": fuel_now,
+            "fuel_want_kg": fuel_want, "fuel_trimmed_from_kg": trimmed_from, "fuel_before_kg": fuel_now,
             "fuel_after_kg": fuel_after.ok(), "per_tank_kg": per_tank,
             "payload_want_kg": payload_want, "payload_before_kg": payload_now.ok(),
             "payload_after_kg": payload_after.ok(), "total_kg": total_after.ok(),
@@ -365,6 +413,18 @@ pub async fn load_from_plan(xp: &dyn XPlane, fp: &FlightPlan, what: What) -> Res
 
 #[cfg(test)]
 mod tests {
+    /// LIPR-LIBP 172 (2026-09-26): 2,550 lb all up with the plan's block,
+    /// the plan's limit 2,450: trimmed by 100 lb, still over the minimum.
+    #[test]
+    fn a_block_over_the_plans_limit_is_trimmed_never_below_the_minimum() {
+        let lb = |v: f64| v / 2.20462;
+        let zfw = lb(2550.0 - 220.0);
+        let fuel = super::trim_fuel_to_limit(zfw, lb(220.0), lb(2450.0), lb(90.0)).expect("trimmed");
+        assert!((fuel * 2.20462 - 120.0).abs() < 1.0, "{}", fuel * 2.20462);
+        assert_eq!(super::trim_fuel_to_limit(zfw, lb(220.0), lb(2450.0), lb(150.0)), None, "the minimum wins");
+        assert_eq!(super::trim_fuel_to_limit(zfw, lb(100.0), lb(2450.0), lb(90.0)), None, "under the limit");
+    }
+
     use super::*;
     use crate::simbrief::{PlanSource, PlanWeights};
     use crate::xplane::FakeXPlane;
