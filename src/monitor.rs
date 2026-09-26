@@ -670,6 +670,11 @@ fn flight_sample(s: &Snapshot, t: f64, crashed: bool) -> crate::flight::Sample {
         lat: Some(s.lat),
         lon: Some(s.lon),
         tug_attached: Some(s.tug_attached),
+        on_runway: if s.on_ground {
+            crate::party_line::on_runway(s.lat, s.lon)
+        } else {
+            None
+        },
         approach: Some(crate::autoland::ACTIVE.load(std::sync::atomic::Ordering::Relaxed)),
         automation: flying_loop(),
         autopilot: Some(s.ap_servos_on),
@@ -2354,7 +2359,7 @@ pub async fn run(
     // The flight model (`flight::Flight`): the one state every consumer reads.
     let mut flight = crate::flight::Flight::new();
     // The duty engine's last answer, logged on change (`duty.rs`).
-    let mut last_duty: Option<crate::duty::Duty> = None;
+    let mut duty_trail = crate::duty::DutyTrail::default();
     // The State tab's last text, and its resend countdown.
     let mut last_state_text = String::new();
     let mut state_resend: u8 = 0;
@@ -2558,14 +2563,16 @@ pub async fn run(
                         state_resend = 20;
                     }
                 }
-                if last_duty != Some(d) {
-                    last_duty = Some(d);
+                // Written once the verdict has settled (`duty::SETTLE_S`): a
+                // hand-over between loops is not a disagreement.
+                let phase = format!("{:?}", st.phase);
+                if let Some(r) = duty_trail.step(d, why, &phase, st.control, wall_t) {
                     crate::blackbox::record(
                         "duty",
                         serde_json::json!({
-                            "duty": d.name(), "why": why,
-                            "phase": format!("{:?}", st.phase),
-                            "agrees": crate::duty::agrees(d, st.control),
+                            "duty": r.duty.name(), "why": r.why,
+                            "phase": r.phase, "began_t": r.began_t,
+                            "agrees": r.agrees,
                         }),
                     );
                 }
