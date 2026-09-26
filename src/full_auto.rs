@@ -396,7 +396,9 @@ async fn give_up(
 /// check is `taxi_hold_active`, and the governor's own next tick then sees the
 /// brake, closes the throttle, stands down and releases its own squeeze.
 async fn hand_back_brakes(xp: &XPlaneClient, valve_set: Option<f64>) {
-    hand_back_brakes_if(xp, crate::tools::speedhold::taxi_hold_active(), valve_set).await;
+    // Unscoped: the give-up has already cancelled this mission's client.
+    let free = xp.unscoped();
+    hand_back_brakes_if(&free, crate::tools::speedhold::taxi_hold_active(), valve_set).await;
 }
 
 /// [`hand_back_brakes`] with the governor's flavour handed in, so the gates are

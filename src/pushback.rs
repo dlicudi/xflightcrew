@@ -606,7 +606,10 @@ async fn run_inner(
     else {
         return Err("no_position".into());
     };
-    let started_on_pavement = crate::party_line::on_pavement(start_lat, start_lon);
+    // Only where the drawn pavement covers the stand's surroundings: an
+    // undrawn push lane is not grass (`party_line::pavement_covers`).
+    let started_on_pavement = crate::party_line::on_pavement(start_lat, start_lon)
+        .filter(|_| crate::party_line::pavement_covers(start_lat, start_lon));
     // The MANOEUVRE, picked once and up front — X-Plane's three pushback
     // commands are not a steering channel, they are whole-push patterns the
     // tug executes and finishes ("Nose 90 left" / "Straight back" / "Nose 90
@@ -1072,6 +1075,12 @@ async fn run_inner(
         att.unwrap_or(0.0) <= 0.5 && tow.unwrap_or(0.0) <= 0.5
     })
     .await;
+    // Off the toe brakes we put on: the channel's override expires but the
+    // ratios keep their last value on an airframe with no toe-brake axis,
+    // and the taxi governor then read our 0.4 as the PILOT braking and
+    // held the throttle at idle for 25 s (LIBP 737, 2026-09-26). A fresh
+    // zero makes the plugin write the ratios back to zero.
+    let _ = xp.set_float(TAXI_BRAKE, 0.0).await;
     // Brakes SET now, and set they STAY until the taxi drive arms and its
     // governor releases them itself. The gap between the tug letting go and
     // the taxi engaging is exactly the window the stand creep happened in.

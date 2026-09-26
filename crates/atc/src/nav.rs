@@ -903,6 +903,10 @@ fn bezier(p0: (f64, f64), p1: (f64, f64), p2: (f64, f64), p3: (f64, f64), t: f64
 /// beziers sampled. A feature can mix types (a taxiway line that becomes a
 /// hold bar), so this emits a run per unbroken stretch of centreline rather
 /// than one polyline per feature.
+/// The share of nearby taxi nodes that must lie on the drawn pavement for it
+/// to be trusted there ([`TaxiNet::pavement_covers`]).
+const PAVEMENT_COVER_FRAC: f64 = 0.8;
+
 /// Even-odd point in a closed ring of (lat, lon).
 fn ring_contains(ring: &[(f64, f64)], lat: f64, lon: f64) -> bool {
     let mut inside = false;
@@ -1314,6 +1318,38 @@ pub fn find_taxi_net(path: &str, icao: &str) -> Result<Option<TaxiNet>> {
 }
 
 impl TaxiNet {
+    /// Does the drawn pavement actually COVER the taxiways around this point?
+    /// The taxi network's own nodes (runway edges aside, which are drawn by
+    /// the runway rows, not pavement polygons) should lie on it: at LIBP
+    /// only 25 of 66 do, the stands' push-back lanes are simply not drawn,
+    /// and trusting the polygons stopped a 737's push 23 m into 55 on
+    /// "grass" that is really concrete (2026-09-26). LIPK's stand area is
+    /// drawn and the same guard saved a 172 from real grass that morning.
+    pub fn pavement_covers(&self, lat: f64, lon: f64, radius_m: f64) -> bool {
+        let m_per_deg_lon = 111_320.0 * lat.to_radians().cos();
+        let runway_nodes: std::collections::HashSet<i64> = self
+            .edges
+            .iter()
+            .filter(|e| e.runway)
+            .flat_map(|e| [e.a, e.b])
+            .collect();
+        let near: Vec<(f64, f64)> = self
+            .nodes
+            .iter()
+            .filter(|(id, _)| !runway_nodes.contains(id))
+            .map(|(_, p)| *p)
+            .filter(|p| {
+                let (dx, dy) = ((p.1 - lon) * m_per_deg_lon, (p.0 - lat) * 111_320.0);
+                (dx * dx + dy * dy).sqrt() <= radius_m
+            })
+            .collect();
+        if near.len() < 3 {
+            return false;
+        }
+        let on = near.iter().filter(|p| self.on_pavement(p.0, p.1) == Some(true)).count();
+        on as f64 >= near.len() as f64 * PAVEMENT_COVER_FRAC
+    }
+
     /// Is this point on the field's drawn pavement? `None` when the field
     /// draws none, so a caller never reads "no data" as "grass".
     pub fn on_pavement(&self, lat: f64, lon: f64) -> Option<bool> {
@@ -4787,6 +4823,21 @@ STAR:030,6,ALWYS3,RW28B,ARRTU,K2,P,C,E   , ,   ,TF, , , , , ,      ,    ,    ,  
         assert!(!net.pavement.is_empty(), "LIPK draws pavement");
         assert_eq!(net.on_pavement(44.19580628655603, 12.075011968589756), Some(true));
         assert_eq!(net.on_pavement(44.19488911712411, 12.074242855216026), Some(false));
+        assert!(net.pavement_covers(44.19580628655603, 12.075011968589756, 200.0), "LIPK's stands are drawn");
+    }
+
+    /// LIBP (2026-09-26): the stand's push lane is not drawn; the pavement
+    /// is no authority there.
+    #[test]
+    #[ignore] // needs the real X-Plane install; run with --ignored
+    fn live_libp_pavement_does_not_cover_its_stands() {
+        let path =
+            "/Users/duanelicudi/X-Plane 12/Global Scenery/Global Airports/Earth nav data/apt.dat";
+        let Ok(Some(net)) = find_taxi_net(path, "LIBP") else {
+            return;
+        };
+        let (lat, lon) = (42.431905167561986, 14.188689582813048);
+        assert!(!net.pavement_covers(lat, lon, 200.0));
     }
 
     /// LIPR Alpha (2026-09-26): a route ending on a repeated point. No leg

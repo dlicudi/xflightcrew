@@ -1566,6 +1566,9 @@ async fn reject_rolling(
     rwy: &Runway,
     law: &mut RollSteer,
 ) {
+    // Unscoped: a reject is how the run ENDS, and a cancelled scope must
+    // never refuse the brakes that stop it.
+    let xp = &xp.unscoped();
     reject(xp, voice, &format!("{why} Rejecting takeoff."), reason).await;
     stop_on_centreline(xp, rwy, law).await;
     alert(voice, Priority::Warning, "Stopped. Your aircraft.");
@@ -1573,6 +1576,9 @@ async fn reject_rolling(
 }
 
 async fn reject(xp: &XPlaneClient, voice: &Option<Voice>, line: &str, reason: &str) {
+    // The throttle and brakes of a reject are never refused by the scope
+    // the abort itself just cancelled.
+    let xp = &xp.unscoped();
     RUN.record(sim::run::Outcome::Failed(reason.into()));
     let _ = xp.set_float(&throttle_dref(), 0.0).await;
     if xp

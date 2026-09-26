@@ -2013,9 +2013,10 @@ async fn drive(xp: XPlaneClient, voice: Option<Voice>, route: Route, base_kts: f
                     xp.get_float(LON),
                 );
                 let (thr, here) = (thr.ok(), la.ok().zip(lo.ok()));
-                let off_pavement = here
-                    .and_then(|(la, lo)| crate::party_line::on_pavement(la, lo))
-                    == Some(false);
+                let off_pavement = here.is_some_and(|(la, lo)| {
+                    crate::party_line::on_pavement(la, lo) == Some(false)
+                        && crate::party_line::pavement_covers(la, lo)
+                });
                 tracing::warn!(err, ?thr, off_pavement, "auto taxi: stagnant, standing down");
                 crate::blackbox::record(
                     "autotaxi",

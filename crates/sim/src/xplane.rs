@@ -408,6 +408,19 @@ impl XPlaneClient {
         self.cancel.extend(parents);
         self
     }
+    /// The same connection with NO cancellation scope: for the moves that
+    /// make the aircraft safe as an automation ends (the hand-back's parking
+    /// brake, a reject's stop). Scoped, they were refused as "automation
+    /// cancelled" by the very give-up they belong to, and a 172 was held on
+    /// its wheel brakes for fifteen minutes instead (LIPK 2026-09-26).
+    pub fn unscoped(&self) -> Self {
+        Self {
+            http: self.http.clone(),
+            base: self.base.clone(),
+            cancel: Vec::new(),
+        }
+    }
+
     pub fn cancellation(&self) -> Vec<std::sync::Arc<std::sync::atomic::AtomicBool>> {
         self.cancel.clone()
     }

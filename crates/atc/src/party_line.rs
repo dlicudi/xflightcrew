@@ -246,6 +246,12 @@ pub fn on_pavement(lat: f64, lon: f64) -> Option<bool> {
     crate::station::taxi_net()?.on_pavement(lat, lon)
 }
 
+/// Whether the drawn pavement is an authority around this point (see
+/// `nav::TaxiNet::pavement_covers`): false with no field loaded.
+pub fn pavement_covers(lat: f64, lon: f64) -> bool {
+    crate::station::taxi_net().is_some_and(|n| n.pavement_covers(lat, lon, 200.0))
+}
+
 /// Whether the active field publishes any parking positions at all.
 pub fn stands_known() -> bool {
     crate::station::taxi_net().is_some_and(|n| !n.stands.is_empty())
