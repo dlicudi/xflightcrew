@@ -197,6 +197,10 @@ taxi:
   kts: 18.0
   turn_kts: 10.0
   sharp_kts: 6.0
+  # Full lock turns it at about 20 deg/s under 7 kt (LEMG, LIBP 2026-09-26);
+  # a corner is taken at 15 of them times its radius. LEMG's Alpha, drawn at
+  # 9 m, went in at 11.5 kt asking 38 and swung 5.8 m wide.
+  max_yaw_dps: 15.0
 
 # Fuel-endurance alerting. 6,875 US gal capacity; cruise burn about 5,500
 # lb/hr (2,500 kg/hr) for the pair. Reserves are airline final-reserve shaped.

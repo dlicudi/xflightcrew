@@ -161,6 +161,27 @@ const STEER_FULL_DEG: f64 = 30.0;
 /// schedule to the pace's turn cap; at/above `SHARP_DEG`, to its sharp cap.
 const TURN_DEG: f64 = 30.0;
 const SHARP_DEG: f64 = 100.0;
+/// A corner's radius is the circle through the route this far either side
+/// of its vertex.
+const BEND_RADIUS_SPAN_M: f64 = 8.0;
+/// The deceleration the bend caps are anticipated at: the stop ramp's own.
+const BEND_DECEL_MS2: f64 = STOP_DECEL_MS2;
+/// How far before a corner's own window its approach is shaped: enough for
+/// 18 kt down to 6 at [`BEND_DECEL_MS2`].
+const BEND_ENVELOPE_M: f64 = 160.0;
+/// No corner cap below a walking pace: the governor needs a speed to hold.
+const CORNER_MIN_KTS: f64 = 3.0;
+
+/// The radius of the circle through three points (metres), or infinity when
+/// they lie on a line.
+fn circle_radius_m(a: (f64, f64), b: (f64, f64), c: (f64, f64)) -> f64 {
+    let (ab, bc, ca) = (taxi_guide::dist(a, b), taxi_guide::dist(b, c), taxi_guide::dist(c, a));
+    let cross = ((b.0 - a.0) * (c.1 - a.1) - (b.1 - a.1) * (c.0 - a.0)).abs();
+    if cross < 1e-6 {
+        return f64::INFINITY;
+    }
+    ab * bc * ca / (2.0 * cross)
+}
 /// The GA pace, tuned on the 172 and the default for any airframe whose
 /// profile declares nothing. See [`Pace`].
 const STRAIGHT_KTS: f64 = 10.0;
@@ -185,6 +206,9 @@ pub struct Pace {
     pub brake_steer: bool,
     /// Pure-pursuit aim time, seconds — see [`lookahead_m_with`].
     pub lookahead_s: f64,
+    /// The yaw rate a corner may ask, deg/s, when the profile declares one
+    /// (`taxi.max_yaw_dps`); see [`Route::bend_cap_kts`].
+    pub max_yaw_dps: Option<f64>,
 }
 
 impl Default for Pace {
@@ -198,6 +222,7 @@ impl Default for Pace {
             steer_slew_per_s: None,
             brake_steer: false,
             lookahead_s: 5.0,
+            max_yaw_dps: None,
         }
     }
 }
@@ -227,6 +252,7 @@ impl Pace {
             steer_slew_per_s: t.steer_slew_per_s.map(|v| v.clamp(0.5, 10.0)),
             brake_steer: t.brake_steer,
             lookahead_s: t.lookahead_s.map_or(5.0, |v| v.clamp(3.0, 12.0)),
+            max_yaw_dps: t.max_yaw_dps.map(|v| v.clamp(5.0, 60.0)),
         }
     }
 
@@ -340,8 +366,9 @@ pub struct Route {
     /// Cumulative along-route distance per vertex.
     cum: Vec<f64>,
     total: f64,
-    /// (along-route m, |bend| degrees) per real corner, for the slow-down.
-    bends: Vec<(f64, f64)>,
+    /// (along-route m, |bend| degrees, radius m) per real corner, for the
+    /// slow-down.
+    bends: Vec<(f64, f64, f64)>,
     /// Spoken holding point ("November five Whiskey"), may be empty.
     pub holding_point: String,
     /// Overrides the arrival line when set — a LINE-UP drive ends with
@@ -409,7 +436,7 @@ impl Route {
         if total < STOP_SHORT_M + 15.0 {
             return None;
         }
-        let mut bends: Vec<(f64, f64)> = Vec::new();
+        let mut bends: Vec<(f64, f64, f64)> = Vec::new();
         for i in 1..pts.len() - 1 {
             let b_in =
                 taxi_guide::bearing(taxi_guide::point_at(&pts, &cum, cum[i] - WINDOW_M), pts[i]);
@@ -417,7 +444,12 @@ impl Route {
                 taxi_guide::bearing(pts[i], taxi_guide::point_at(&pts, &cum, cum[i] + WINDOW_M));
             let delta = taxi_guide::angle_diff(b_out, b_in).abs();
             if delta >= TURN_DEG {
-                bends.push((cum[i], delta));
+                let radius = circle_radius_m(
+                    taxi_guide::point_at(&pts, &cum, cum[i] - BEND_RADIUS_SPAN_M),
+                    pts[i],
+                    taxi_guide::point_at(&pts, &cum, cum[i] + BEND_RADIUS_SPAN_M),
+                );
+                bends.push((cum[i], delta, radius));
             }
         }
         let runway_spans = runway_spans(&watch.seg, &cum);
@@ -559,17 +591,34 @@ impl Route {
     /// The bend-imposed speed cap near `progress`, if a corner is close
     /// enough to matter: inside a speed-scaled lead distance before the
     /// corner, and until 15 m past it (mid-turn is no place to accelerate).
+    ///
+    /// Before that window the cap is the corner's speed plus what
+    /// [`BEND_DECEL_MS2`] can take off in the distance left to the window,
+    /// so the governor arrives AT the corner's pace instead of being handed
+    /// it at the corner: on a 737 the cap arrived about 30 m out and it went
+    /// into LEMG's Alpha at 11.5 kt against 10 (2026-09-26). And where the
+    /// airframe declares the yaw rate it can turn at (`Pace::max_yaw_dps`),
+    /// no corner is taken faster than that rate times its radius: the same
+    /// corner was drawn at 9 m and asked 38 deg/s of an aircraft that turns
+    /// at 20, and it swung 5.8 m wide.
     pub fn bend_cap_kts(&self, progress: f64, gs_kts: f64) -> Option<f64> {
         let lead = (gs_kts * 0.514 * 6.0).clamp(25.0, 90.0);
         self.bends
             .iter()
-            .filter(|(at, _)| progress < at + 15.0 && at - progress < lead)
-            .map(|&(_, deg)| {
-                if deg >= SHARP_DEG {
+            .filter(|(at, ..)| progress < at + 15.0 && at - progress < lead + BEND_ENVELOPE_M)
+            .map(|&(at, deg, radius)| {
+                let class = if deg >= SHARP_DEG {
                     self.pace.sharp
                 } else {
                     self.pace.turn
-                }
+                };
+                let corner = self
+                    .pace
+                    .max_yaw_dps
+                    .map_or(class, |w| class.min(w.to_radians() * radius * MS_TO_KTS).max(CORNER_MIN_KTS));
+                let before = (at - progress - lead).max(0.0);
+                let v = corner / MS_TO_KTS;
+                MS_TO_KTS * (v * v + 2.0 * BEND_DECEL_MS2 * before).sqrt()
             })
             .fold(None, |acc: Option<f64>, cap| {
                 Some(acc.map_or(cap, |a| a.min(cap)))
@@ -2448,6 +2497,57 @@ mod tests {
         assert_eq!(schedule_kts(10.0, &r, r.total - STOP_SHORT_M, 3.0), 0.0);
     }
 
+    /// LEMG's Alpha (2026-09-26, sortie 1790441293, a 737): an 80-degree
+    /// corner drawn at about a 9 m radius (the route asked 38 deg/s at
+    /// 11.5 kt), entered at 11.5 kt against the 10 kt turn cap that arrived
+    /// 30 m out; full lock gave 14 to 22 deg/s and it swung 5.8 m wide. With
+    /// the 737's yaw rate declared the corner is taken at the rate times the
+    /// radius, and the approach to it is shaped from well out.
+    #[test]
+    fn a_tight_corner_is_taken_at_the_yaw_rate_the_airframe_has() {
+        let mut path = vec![ll(0.0, 0.0), ll(200.0, 0.0)];
+        let (r, turn) = (9.0_f64, 80.0_f64.to_radians());
+        // Left turn: centre 9 m north of the arc's start.
+        for i in 1..=20 {
+            let a = turn * i as f64 / 20.0;
+            path.push(ll(200.0 + r * a.sin(), r - r * a.cos()));
+        }
+        let end = *path.last().unwrap();
+        path.push((end.0 + 100.0 / 111_320.0 * turn.sin(), end.1 + 100.0 / 90_000.0 * turn.cos()));
+        let watch = TaxiWatch {
+            seg: vec![(String::new(), false); path.len() - 1],
+            path,
+            via: String::new(),
+            holding_point: String::new(),
+            lead_on: Vec::new(),
+        };
+        let profile = |yaw: Option<f64>| crate::aircraft::TaxiProfile {
+            kts: Some(18.0),
+            turn_kts: Some(10.0),
+            sharp_kts: Some(6.0),
+            max_yaw_dps: yaw,
+            ..Default::default()
+        };
+        let mut old = Route::build(&watch).expect("route");
+        old.pace = Pace::from_profile(Some(&profile(None)));
+        let mut jet = Route::build(&watch).expect("route");
+        jet.pace = Pace::from_profile(Some(&profile(Some(15.0))));
+        // At the corner: the angle alone says the 10 kt turn pace; the yaw
+        // rate says 15 deg/s round 9 m, 4.6 kt.
+        assert_eq!(schedule_kts(18.0, &old, 205.0, 10.0), 10.0);
+        let at = schedule_kts(18.0, &jet, 205.0, 5.0);
+        assert!(at < 5.0 && at >= CORNER_MIN_KTS, "the corner's own pace: {at:.1} kt");
+        // And the approach is shaped: 60 m out (recorded 10.5 kt with a 10 kt
+        // target) it is coming down, and by 30 m out (where the old 10 kt cap
+        // first arrived) it is within a few metres of braking of the corner.
+        let out = schedule_kts(18.0, &jet, 140.0, 9.0);
+        assert!(out < 10.0, "60 m out: {out:.1} kt");
+        let window = schedule_kts(18.0, &jet, 172.0, 5.0);
+        assert!(window < 6.5, "30 m out: {window:.1} kt");
+        let far = schedule_kts(18.0, &jet, 0.0, 18.0);
+        assert!(far > 17.0, "a corner 200 m on barely touches the pace: {far:.1} kt");
+    }
+
     #[test]
     fn an_airframes_own_pace_drives_the_bend_caps() {
         // The 172 default is unchanged by the profile hook existing at all.
@@ -2464,7 +2564,10 @@ mod tests {
             ..Default::default()
         }));
         assert_eq!(jet.pace.straight, 18.0);
-        assert_eq!(schedule_kts(18.0, &jet, 50.0, 18.0), 18.0, "open taxiway");
+        assert_eq!(schedule_kts(18.0, &jet, 0.0, 18.0), 18.0, "open taxiway");
+        // 150 m out the jet is already coming down toward the bend's pace.
+        let shaped = schedule_kts(18.0, &jet, 50.0, 18.0);
+        assert!(shaped < 18.0 && shaped > 10.0, "{shaped}");
         assert_eq!(schedule_kts(18.0, &jet, 170.0, 18.0), 10.0, "into the bend");
         // The stop is still a stop, at any pace.
         assert_eq!(schedule_kts(18.0, &jet, jet.total - STOP_SHORT_M, 3.0), 0.0);
