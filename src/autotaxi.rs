@@ -3440,6 +3440,47 @@ mod tests {
         }
     }
 
+    /// LEMG 13 (2026-09-26, sortie 1790441293, a 737): the line-up rode the
+    /// drawn lead-on and its projection jumped 6 m and 11 m forward in single
+    /// ticks while the heading error went -6 to -43 degrees; the scorer read
+    /// 6.0 m. `cargo test -- --ignored live_lemg_13_lead_on --nocapture`
+    #[test]
+    #[ignore] // needs the real X-Plane install
+    fn live_lemg_13_lead_on_runs_one_way() {
+        let apt = "/Users/duanelicudi/X-Plane 12/Global Scenery/Global Airports/Earth nav data/apt.dat";
+        let Ok(Some(net)) = atc::nav::find_taxi_net(apt, "LEMG") else {
+            return;
+        };
+        let (hlat, hlon) = (36.684854, -4.511439);
+        let rwy = crate::autoland::runway_by_id(apt, hlat, hlon, "13", 5.0, Some("LEMG"))
+            .unwrap()
+            .expect("LEMG 13");
+        let runways = atc::nav::find_runways(apt, "LEMG").unwrap();
+        let strip = runways.iter().find(|r| r.ident_a == "13" || r.ident_b == "13").expect("13/31");
+        let zone: Vec<String> = vec!["13".into(), "31".into()];
+        let plan = net
+            .plan_to_runway(36.673087, -4.491381, rwy.thr_lat, rwy.thr_lon, 60.0, &zone, Some(strip))
+            .expect("a route");
+        println!("holding point {} via {:?}, lead-on {} pts", plan.holding_point, plan.via, plan.lead_on.len());
+        let (path, stop) = line_up_path_from_lead_on(&rwy, hlat, hlon, &plan.lead_on).expect("the lead-on");
+        let geo = taxi_guide::Geo::new(path[0].0);
+        let pts: Vec<(f64, f64)> = path.iter().map(|&p| geo.to_m(path[0], p)).collect();
+        let mut prev_brg: Option<f64> = None;
+        let mut worst_turn = 0.0_f64;
+        for w in pts.windows(2) {
+            let d = taxi_guide::dist(w[0], w[1]);
+            let b = taxi_guide::bearing(w[0], w[1]);
+            let turn = prev_brg.map_or(0.0, |p| taxi_guide::angle_diff(b, p));
+            println!("  {:7.1} {:7.1}  len {:5.1}  brg {:6.1}  turn {:+6.1}", w[1].0, w[1].1, d, b, turn);
+            if d > 0.5 {
+                worst_turn = worst_turn.max(turn.abs());
+                prev_brg = Some(b);
+            }
+        }
+        println!("stop {stop:.0} m, sharpest vertex {worst_turn:.0} deg");
+        assert!(worst_turn < 90.0, "a lead-on never doubles back: {worst_turn:.0} degrees at one vertex");
+    }
+
     #[test]
     fn line_up_drives_the_authored_lead_on_when_it_is_ours() {
         use crate::autoland::{project_latlon, Runway};
