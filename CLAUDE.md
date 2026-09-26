@@ -489,7 +489,8 @@ laws battle-test as plain `cargo test`; everything blackboxes to
 `logs/blackbox.jsonl` (kinds: `atc`, `autotaxi`, `autotakeoff`, `pushback`, `checklist`,
 `taxi_guide`, `cockpit_auto`, `full_auto`, `circuit`, `procedure`, `cabin`,
 `instructor`, `loading`, `turbine_start`, `heli_start`, `hover`, `heli_circuit`,
-`heli_route`, `rapport`, `cabin_air`, `api_load`, `plan_audit`, `handover`). Cross-cutting rules, each learned the hard way (details in
+`heli_route`, `rapport`, `cabin_air`, `api_load`, `plan_audit`, `handover`, `start_item`,
+`sim_radio`). Cross-cutting rules, each learned the hard way (details in
 history):
 
 - **A stage that is not moving the aircraft is holding it**: brakes set for

@@ -500,9 +500,20 @@ impl Route {
     /// Steering pinned at its limit and the nose came round: 0.07 m off the
     /// line to 3.00 m in four seconds. Every stop did it — hold, line-up,
     /// backtrack, taxi-in — because they all drive this one loop.
+    /// The direction of the route's last REAL segment. The planner can end a
+    /// route on a repeated point (LIPR Alpha, 2026-09-26: the last segment
+    /// was 0.00 m), and the bearing of a zero-length segment is 0, due north:
+    /// with 8 m to run the taxi steered a 220-degree aircraft 140 degrees
+    /// toward it, full right, and it swung to 255 as it braked. Ten such
+    /// jumps at 8 m to go are in the logs. Segments under a metre are no
+    /// direction at all.
     pub fn final_bearing_deg(&self) -> Option<f64> {
-        let n = self.pts.len();
-        (n >= 2).then(|| taxi_guide::bearing(self.pts[n - 2], self.pts[n - 1]))
+        const MIN_SEG_M: f64 = 1.0;
+        self.pts
+            .windows(2)
+            .rev()
+            .find(|w| taxi_guide::dist(w[0], w[1]) >= MIN_SEG_M)
+            .map(|w| taxi_guide::bearing(w[0], w[1]))
     }
 
     /// Heading error against the route's final bearing — what to fly once the
@@ -1645,6 +1656,27 @@ pub fn start_backtrack(
 
 /// Say a line without blocking the loop (queued; gated off in ATC-only mode
 /// like every crew alert).
+/// How long a drive may command motion without moving before it stands down.
+const STAGNANT_SECS: f64 = 30.0;
+
+/// What a stuck drive says. Each clause is what the log can actually show:
+/// "the nose is pointing away" used to be said for every stall with a big
+/// heading error, including a 172 sat on the grass at breakaway power that
+/// no heading could have moved (LIPK 2026-09-26).
+fn stagnant_line(off_pavement: bool, facing_away: bool) -> &'static str {
+    match (off_pavement, facing_away) {
+        (true, _) => {
+            "I can't get us moving, we're off the pavement and on the grass. \
+             Your aircraft. Get us back onto the taxiway, then ask me to taxi again."
+        }
+        (false, true) => {
+            "I can't get us moving with the nosewheel hard over. Your aircraft. \
+             Turn us toward the taxiway, then ask me to taxi again."
+        }
+        (false, false) => "I can't get us moving. Standing down. Your aircraft.",
+    }
+}
+
 fn alert(voice: &Option<Voice>, priority: Priority, line: &str) {
     if let Some(v) = voice {
         v.alert(priority, line);
@@ -1812,8 +1844,10 @@ async fn drive(xp: XPlaneClient, voice: Option<Voice>, route: Route, base_kts: f
         } else if tug_held {
             tug_held = false;
             tug_since = None;
+            // Not said: the monitor's "Pushback done, tug's clear" is the
+            // one voice for the bar coming off (both were heard, LIPK
+            // 2026-09-26).
             crate::blackbox::record("autotaxi", serde_json::json!({"event": "tug_released"}));
-            alert(&voice, Priority::Advisory, "Tug's clear. Rolling.");
         }
         // The pilot's feet moved the yaw axis: the plugin already dropped
         // the override — stand the loop down and keep the speed hold, which
@@ -1966,22 +2000,31 @@ async fn drive(xp: XPlaneClient, voice: Option<Voice>, route: Route, base_kts: f
         // voice line, until the pilot's pedals rescued it (16:48Z,
         // 2026-07-24). Twenty seconds of commanded-but-stationary says so out
         // loud and hands back, instead of pirouetting in place.
+        // The window covers the governor's ramp to its BREAKAWAY ceiling
+        // (`speedhold::taxi_throttle_cap`), about 20 s from idle at its
+        // usual step: judged at 20 s the 172 at LIPK was still at 0.35.
         if !ext_stopped && gs_kts < 0.7 {
             let t0 = *stalled_since.get_or_insert_with(std::time::Instant::now);
-            if t0.elapsed().as_secs_f64() > 20.0 {
-                tracing::warn!(err, "auto taxi: stagnant, standing down");
+            if t0.elapsed().as_secs_f64() > STAGNANT_SECS {
+                let thr_dref = throttle_dref();
+                let (thr, la, lo) = tokio::join!(
+                    xp.get_float(&thr_dref),
+                    xp.get_float(LAT),
+                    xp.get_float(LON),
+                );
+                let (thr, here) = (thr.ok(), la.ok().zip(lo.ok()));
+                let off_pavement = here
+                    .and_then(|(la, lo)| crate::party_line::on_pavement(la, lo))
+                    == Some(false);
+                tracing::warn!(err, ?thr, off_pavement, "auto taxi: stagnant, standing down");
                 crate::blackbox::record(
                     "autotaxi",
-                    serde_json::json!({"event": "stagnant", "err_deg": err, "remaining_m": remaining}),
+                    serde_json::json!({"event": "stagnant", "err_deg": err, "remaining_m": remaining,
+                                       "throttle": thr, "off_pavement": off_pavement}),
                 );
                 speedhold::set_taxi_target(0.0);
                 let _ = xp.set_float(TAXI_STEER, 0.0).await;
-                let line = if err.abs() > JOIN_ERR_SLOW_DEG {
-                    "I can't get us moving, the nose is pointing away from the taxiway. \
-                     Turn us toward it, then ask me to taxi again."
-                } else {
-                    "I can't get us moving. Standing down. Your aircraft."
-                };
+                let line = stagnant_line(off_pavement, err.abs() > JOIN_ERR_SLOW_DEG);
                 alert(&voice, Priority::Caution, line);
                 ACTIVE.store(false, Ordering::Relaxed);
                 break;
@@ -2198,6 +2241,13 @@ async fn drive(xp: XPlaneClient, voice: Option<Voice>, route: Route, base_kts: f
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_stuck_taxi_says_what_the_log_can_show() {
+        assert!(super::stagnant_line(true, true).contains("grass"));
+        assert!(super::stagnant_line(false, true).contains("hard over"));
+        assert!(!super::stagnant_line(false, false).contains("nose"));
+    }
+
     #[test]
     fn runway_spans_merge_and_the_light_leads_the_crossing() {
         use super::{on_runway_span, runway_spans};
@@ -3468,6 +3518,23 @@ mod tests {
     /// 0.07 m off the line to 3.00 m in four seconds, steering pinned. It hit
     /// the hold, the line-up, the backtrack and the taxi-in alike, because all
     /// four drive this one loop.
+    /// LIPR Alpha (2026-09-26): the planned route ended on a repeated point,
+    /// the zero-length last segment read as due north, and with 8 m to run
+    /// the stop steered a 220-degree aircraft full right toward it.
+    #[test]
+    fn a_repeated_last_point_is_not_a_final_bearing() {
+        let w = TaxiWatch {
+            path: vec![ll(0.0, 0.0), ll(0.0, -120.0), ll(0.0, -120.0)],
+            via: String::new(),
+            seg: vec![(String::new(), false), (String::new(), false)],
+            holding_point: String::new(),
+            lead_on: Vec::new(),
+        };
+        let r = Route::build(&w).expect("drives");
+        let bearing = r.final_bearing_deg().expect("a real segment exists");
+        assert!((bearing - 180.0).abs() < 2.0, "due south route, got {bearing:.1}");
+    }
+
     #[test]
     fn the_stop_holds_the_routes_heading_instead_of_chasing_a_passed_point() {
         // A straight route heading due east, 120 m long.

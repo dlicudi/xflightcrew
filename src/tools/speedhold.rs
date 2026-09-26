@@ -454,6 +454,25 @@ const TAXI_MAX_KTS: f64 = 30.0;
 /// spool the correction has to ride through; the caller must hand in a
 /// SMOOTHED trend (the governor EMAs it) — raw tick-to-tick differences of a
 /// noisy groundspeed read turn the lead into phantom brake stabs.
+/// The taxi governor's throttle ceiling: 0.35 rolling (never takeoff power),
+/// more to BREAK AWAY from a standstill. At the old flat 0.35 a 172 on the
+/// grass with the nosewheel at full lock sat at 0.0 kt for 20 s, twice
+/// (LIPK 2026-09-26), as a Jerez stand join did on pavement (2026-07-24).
+/// A person adds power until it moves, then takes it off: the ceiling drops
+/// back the moment the wheels turn, and the ramp to it is the governor's
+/// usual 0.02 a tick, so pavement breaks away long before it gets there.
+pub const TAXI_ROLLING_CAP: f64 = 0.35;
+pub const TAXI_BREAKAWAY_CAP: f64 = 0.55;
+const BREAKAWAY_BELOW_KTS: f64 = 0.7;
+
+pub fn taxi_throttle_cap(gs_kts: f64) -> f64 {
+    if gs_kts < BREAKAWAY_BELOW_KTS {
+        TAXI_BREAKAWAY_CAP
+    } else {
+        TAXI_ROLLING_CAP
+    }
+}
+
 pub fn taxi_control(
     target_kts: f64,
     gs_kts: f64,
@@ -485,7 +504,7 @@ pub fn taxi_control(
         // bang-bang thermostat; well behind the pace the step doubles so the
         // rebuild from idle doesn't undershoot for ten seconds.
         let step = (eff * 0.003).min(if eff > 3.0 { 0.02 } else { 0.01 });
-        (Some((throttle + step).min(0.35)), 0.0)
+        (Some((throttle + step).min(taxi_throttle_cap(gs_kts))), 0.0)
     } else if eff < -3.0 && (target_kts < 1.0 || raw < -2.0 || surge) {
         // WELL past the target: idle now and brake in proportion, together —
         // the polite step-down let an SR22 run a 10-knot taxi through 20
@@ -1547,6 +1566,18 @@ mod tests {
         assert_eq!(clamp_taxi_target(10.0), 10.0);
         assert_eq!(clamp_taxi_target(60.0), 25.0, "no takeoff-roll 'taxi'");
         assert_eq!(clamp_taxi_target(0.0), 0.0, "hold short is a real target");
+    }
+
+    #[test]
+    fn taxi_law_breaks_away_then_takes_the_power_off() {
+        // Stuck at full lock: past the rolling cap, up to the breakaway one.
+        let (thr, _) = taxi_control(8.0, 0.0, 0.35, 0.0);
+        assert!(thr.unwrap() > 0.35 && thr.unwrap() <= TAXI_BREAKAWAY_CAP);
+        let (thr, _) = taxi_control(8.0, 0.0, TAXI_BREAKAWAY_CAP, 0.0);
+        assert_eq!(thr, Some(TAXI_BREAKAWAY_CAP), "never beyond the breakaway cap");
+        // Rolling: back under the rolling cap at once.
+        let (thr, _) = taxi_control(8.0, 2.0, 0.5, 0.0);
+        assert!(thr.unwrap() <= TAXI_ROLLING_CAP);
     }
 
     #[test]

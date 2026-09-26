@@ -2884,6 +2884,11 @@ mod tests {
                 "MARGIN: over the airframe's own .acf gear-warning speed",
             ),
             (
+                "speedhold",
+                "BREAKAWAY_BELOW_KTS",
+                "STANDSTILL: the wheels are not turning, on any airframe",
+            ),
+            (
                 "autotakeoff",
                 "GEAR_VLO_MARGIN_KTS",
                 "MARGIN: under the airframe's own gear placard",

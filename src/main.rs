@@ -21,6 +21,7 @@ mod circuit;
 mod cockpit_auto;
 mod config;
 mod control;
+mod crew_pace;
 mod conversation;
 mod debrief;
 mod detect;
@@ -845,18 +846,11 @@ async fn run_session(
     // Mode-aware, boot AND live toggles: copilot-only means the radio — and
     // its soundscape — belongs to whatever external ATC the pilot uses, so
     // leaving OUR world gives X-Plane its voice back.
+    // Applied by `SimRadioSync` in the loop, not once here: the boot write
+    // failed silently whenever X-Plane was not up yet, and the audio bus
+    // changes what the right answer is (see `tts::sim_radio`).
     let xp_radio_muted = config.mute_xp_radio && !config.atc_airport.trim().is_empty();
-    if xp_radio_muted && mode::atc_enabled() {
-        match xplane
-            .set_float("sim/operation/sound/radio_volume_ratio", 0.0)
-            .await
-        {
-            Ok(()) => tracing::info!(
-                "muted X-Plane's radio voice (XCOPILOT_MUTE_XP_RADIO=false to keep it)"
-            ),
-            Err(e) => tracing::debug!("could not mute X-Plane radio audio: {e:#}"),
-        }
-    }
+    let mut sim_radio_sync = SimRadioSync::default();
     // Subscribe to the continuously-read state over the WebSocket so snapshots are
     // instant cache reads instead of a REST burst. Best-effort: reads fall back to
     // REST until (or unless) the subscription warms up.
@@ -1030,6 +1024,13 @@ async fn run_session(
         // the idle tick too, so a flip lands within ~2 s of the click even
         // in a silent cockpit. The world side is torn down/brought up here;
         // the monitor's ticks and the routing gates below read mode::* live.
+        sim_radio_sync
+            .follow(
+                &xplane,
+                xp_radio_muted && mode::atc_enabled(),
+                tts::AUDIO_BUS.load(std::sync::atomic::Ordering::Relaxed),
+            )
+            .await;
         let now_mode = mode::get();
         if now_mode != applied_mode {
             tracing::info!(
@@ -1044,12 +1045,7 @@ async fn run_session(
             // World side.
             if mode::atc_enabled() && atc_station.is_none() {
                 atc_station = install_home_station(&config, &voice);
-                // Reclaim the radio soundscape from X-Plane's own ATC voice.
-                if xp_radio_muted {
-                    let _ = xplane
-                        .set_float("sim/operation/sound/radio_volume_ratio", 0.0)
-                        .await;
-                }
+                // The radio soundscape is reclaimed by `sim_radio_sync`.
                 let line = match atc_station.as_ref() {
                     Some(st) => format!(
                         "ATC is on. {} is up.",
@@ -1065,14 +1061,8 @@ async fn run_session(
                 // state) and cut whatever the station was saying mid-word.
                 station::Station::uninstall();
                 tts::stop_channel(tts::Channel::Radio);
-                // And give X-Plane its radio voice back — the pilot may be
-                // switching to the sim's OWN ATC, whose controllers we muted
-                // at boot so two ATISes wouldn't share one frequency.
-                if xp_radio_muted {
-                    let _ = xplane
-                        .set_float("sim/operation/sound/radio_volume_ratio", 1.0)
-                        .await;
-                }
+                // X-Plane gets its radio voice back through `sim_radio_sync`:
+                // the pilot may be switching to the sim's OWN ATC.
                 reporter.log(
                     ui::LogKind::Info,
                     "ATC off; the radio belongs to the real world now".to_string(),
@@ -4210,6 +4200,66 @@ fn whisper_model_label(path: &str) -> String {
     let file = path.rsplit(['/', '\\']).next().unwrap_or(path);
     let stem = file.strip_suffix(".bin").unwrap_or(file);
     stem.strip_prefix("ggml-").unwrap_or(stem).to_string()
+}
+
+/// Keeps the sim's own radio audio in line with [`tts::sim_radio`]: applied
+/// when the wanted state changes, retried every 5 s until the writes land
+/// (the sim may not be up yet at boot). Undoes only what it did itself: the
+/// slider is raised only from a mute (ours, or one left by an earlier
+/// session: under 5 %), the ATIS switched back on only if we switched it off.
+#[derive(Default)]
+struct SimRadioSync {
+    applied: Option<(bool, bool)>,
+    last_try: Option<std::time::Instant>,
+    atis_off_by_us: bool,
+}
+
+impl SimRadioSync {
+    const VOLUME: &'static str = "sim/operation/sound/radio_volume_ratio";
+    const ATIS: &'static str = "sim/atc/atis_enabled";
+
+    async fn follow(&mut self, xp: &XPlaneClient, own_atc: bool, bus: bool) {
+        if self.applied == Some((own_atc, bus))
+            || self
+                .last_try
+                .is_some_and(|t| t.elapsed() < std::time::Duration::from_secs(5))
+        {
+            return;
+        }
+        self.last_try = Some(std::time::Instant::now());
+        let want = tts::sim_radio(own_atc, bus);
+        let volume_ok = if want.volume_pct == 0 {
+            xp.set_float(Self::VOLUME, 0.0).await.is_ok()
+        } else {
+            match xp.get_float(Self::VOLUME).await {
+                Ok(v) if v < 0.05 => xp.set_float(Self::VOLUME, 1.0).await.is_ok(),
+                Ok(_) => true,
+                Err(_) => false,
+            }
+        };
+        let atis_ok = match want.atis {
+            Some(false) => {
+                let ok = xp.set_int(Self::ATIS, 0).await.is_ok();
+                self.atis_off_by_us |= ok;
+                ok
+            }
+            Some(true) if self.atis_off_by_us => {
+                let ok = xp.set_int(Self::ATIS, 1).await.is_ok();
+                self.atis_off_by_us &= !ok;
+                ok
+            }
+            _ => true,
+        };
+        if volume_ok && atis_ok {
+            self.applied = Some((own_atc, bus));
+            tracing::info!(own_atc, bus, volume_pct = want.volume_pct, atis = ?want.atis, "sim radio audio set");
+            blackbox::record(
+                "sim_radio",
+                serde_json::json!({ "own_atc": own_atc, "bus": bus,
+                                   "volume_pct": want.volume_pct, "atis": want.atis }),
+            );
+        }
+    }
 }
 
 #[cfg(test)]

@@ -878,7 +878,10 @@ pub fn spoken(a: &Audit, full: bool) -> String {
     if cautions.is_empty() {
         return format!("The plan checks out: {}.{unchecked}", join(&a.checked));
     }
-    let shown = if full { cautions.len() } else { cautions.len().min(2) };
+    if !full {
+        return arm_heads_up(&cautions, &unchecked);
+    }
+    let shown = cautions.len();
     let mut line = match cautions.len() {
         1 => "One thing on the plan. ".to_string(),
         n => format!("{n} things on the plan. "),
@@ -891,6 +894,34 @@ pub fn spoken(a: &Audit, full: bool) -> String {
         line.push_str("Ask me to check the plan for the rest. ");
     }
     format!("{}{unchecked}", line.trim_end())
+}
+
+/// A caution as the ARM says it: what, not the survey. The whole finding
+/// ("The climb out is tight: 850 feet over the ground 2 miles out, near
+/// D300R, where it rises to 100 feet") read into a 231-character arming
+/// reply held every line behind it for fifteen seconds, and three of them
+/// were dropped stale (LIPK 2026-09-26). The numbers are on the Brief tab
+/// and in "check the plan"; a kind with no short form keeps its line.
+fn brief_caution(f: &Finding) -> String {
+    match f.kind {
+        "climb_terrain_tight" => "the climb out is tight over the ground".into(),
+        "under_grid_mora" => "a leg runs under the grid minimum".into(),
+        "star_high" => "we'll be high on the arrival".into(),
+        "star_low" => "we'll be low on the arrival".into(),
+        "star_speed_below_floor" => "an arrival speed is under our clean minimum".into(),
+        "cruise_not_reached" => "we won't make the cruise level".into(),
+        "unpressurised_cruise" => "the cruise is high without pressurisation".into(),
+        "fix_unresolved" => "there's a fix I can't find".into(),
+        _ => f.line.trim_end_matches('.').to_string(),
+    }
+}
+
+fn arm_heads_up(cautions: &[&Finding], unchecked: &str) -> String {
+    let items: Vec<String> = cautions.iter().take(2).map(|c| brief_caution(c)).collect();
+    let refs: Vec<&str> = items.iter().map(String::as_str).collect();
+    let more = if cautions.len() > 2 { ", and more on the brief" } else { "" };
+    let first = refs.join(" and ");
+    format!("Heads up: {first}{more}.{unchecked}")
 }
 
 fn join(items: &[&str]) -> String {
@@ -1213,13 +1244,21 @@ mod tests {
     }
 
     #[test]
-    fn the_arm_names_two_cautions_and_points_at_the_rest() {
+    fn the_arm_says_two_cautions_short_and_points_at_the_rest() {
         let f = |k| Finding { severity: Severity::Caution, kind: k, line: format!("{k}.") };
         let a = Audit { findings: vec![f("a"), f("b"), f("c")], ..Default::default() };
         let arm = spoken(&a, false);
-        assert!(arm.starts_with("3 things") && arm.contains("a. b.") && !arm.contains("c."), "{arm}");
-        assert!(arm.contains("check the plan"));
+        assert_eq!(arm, "Heads up: a and b, and more on the brief.");
         assert!(spoken(&a, true).contains("c."));
+        // A known kind is said short at the arm: what, never the survey.
+        let tight = Finding {
+            severity: Severity::Caution,
+            kind: "climb_terrain_tight",
+            line: "The climb out is tight: 850 feet over the ground 2 miles out, near D300R, where it rises to 100 feet.".into(),
+        };
+        let a = Audit { findings: vec![tight], ..Default::default() };
+        assert_eq!(spoken(&a, false), "Heads up: the climb out is tight over the ground.");
+        assert!(spoken(&a, true).contains("850 feet"), "the full report keeps the numbers");
     }
 
     fn suits() -> Suitability {

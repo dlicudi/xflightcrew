@@ -894,10 +894,19 @@ impl FullAuto {
                 });
                 match der {
                     Some(der) => {
+                        let chart = crate::full_auto::sid_chart_legs(
+                            &ctx.config.cifp_dir,
+                            &ctx.config.fix_data_path,
+                            &ctx.config.nav_data_path,
+                            apt,
+                            &fp.origin,
+                            sid,
+                            rwy,
+                        );
                         let checks = crate::full_auto::departure_gradients(
                             der,
                             apt.elev_ft,
-                            &legs,
+                            if chart.is_empty() { &legs } else { &chart },
                             &climb_minimums,
                             self.vy_kts,
                             crate::procedure::best_climb_fpm(),
@@ -1156,11 +1165,16 @@ pub fn spoken_arm_line(
         line.push_str(c.trim());
         line.push(' ');
     }
-    if panel {
-        line.push_str("The brief is on the Brief tab. ");
+    if panel && cautions.is_some() {
+        line.push_str("Details on the brief. ");
     }
-    line.push_str("Cancel or my controls any time.");
-    line
+    // How to take it back, the first arm of a session only (the taxi's
+    // `take_back_hint` rule: a person says it once).
+    static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if !SAID.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        line.push_str("Cancel or my controls any time.");
+    }
+    line.trim_end().to_string()
 }
 
 #[cfg(test)]
@@ -1177,11 +1191,12 @@ mod tests {
 
     #[test]
     fn the_arm_says_the_flight_and_the_route_tab_holds_the_brief() {
+        // The first arm of a session says how to take it back; the next
+        // does not. No caution, no pointer to a brief with nothing in it.
         let l = spoken_arm_line("LIME", "LIPE", 19000.0, "", None, true);
-        assert_eq!(
-            l,
-            "Full auto, LIME to LIPE, cruise 19,000 feet. The brief is on the Brief tab. Cancel or my controls any time."
-        );
+        assert_eq!(l, "Full auto, LIME to LIPE, cruise 19,000 feet. Cancel or my controls any time.");
+        let again = spoken_arm_line("LIME", "LIPE", 19000.0, "", None, true);
+        assert_eq!(again, "Full auto, LIME to LIPE, cruise 19,000 feet.");
         let w = spoken_arm_line(
             "LILB",
             "LIPK",
@@ -1191,6 +1206,7 @@ mod tests {
             true,
         );
         assert!(w.contains("your call") && w.contains("One thing on the plan"), "{w}");
+        assert!(w.contains("Details on the brief"), "{w}");
     }
 
     /// Every shipped profile is exactly ONE airframe class, and full auto

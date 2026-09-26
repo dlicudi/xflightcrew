@@ -930,10 +930,21 @@ impl Tool for StartEngine {
             fuel_note = format!("{} on, ", crate::join_and(&cycled));
         }
 
-        // Pre-start configuration.
-        ctx.xplane.set_float(MIXTURE, 1.0).await?; // full rich
+        // Pre-start configuration, in the STARTING ENGINE checklist's order
+        // and at a person's pace (`crew_pace`): all three used to land in
+        // the same few milliseconds.
+        let voice = ctx.voice;
+        if !fuel_note.is_empty() {
+            crate::crew_pace::item(voice, &format!("Fuel, {}.", fuel_note.trim_end_matches(", "))).await;
+        }
         ctx.xplane.set_float(THROTTLE, 0.1).await?; // crack the throttle
+        crate::crew_pace::item(voice, "Throttle, cracked.").await;
+        ctx.xplane.set_float(MIXTURE, 1.0).await?; // full rich
+        crate::crew_pace::item(voice, "Mixture, full rich.").await;
         ctx.xplane.run_command(CMD_MAGS_BOTH).await?;
+        crate::crew_pace::item(voice, "Mags, both.").await;
+        crate::crew_pace::item(voice, "Clear prop!").await;
+        crate::crew_pace::pause(crate::crew_pace::CLEAR_PROP_MS).await;
 
         // Crank each DEAD engine in turn, one starter at a time (they share a
         // battery, and a real start sequence is sequential anyway). A twin
@@ -943,6 +954,9 @@ impl Tool for StartEngine {
         // never cranked: a starter into a live engine is the mirror bug.
         let mut failed: Vec<usize> = Vec::new();
         for &i in &dead {
+            if engines > 1 {
+                crate::crew_pace::item(voice, &format!("Starting number {}.", i + 1)).await;
+            }
             ctx.xplane.run_command_for(&starter_command(i), 3.0).await?;
             let mut lit = false;
             for _ in 0..6 {
@@ -963,6 +977,11 @@ impl Tool for StartEngine {
                 // when this only fired generator 1), so we charge the bus
                 // instead of draining the battery (and so the monitor doesn't
                 // immediately call out an offline alternator).
+                crate::crew_pace::item(
+                    voice,
+                    if engines > 1 { "Engines running, oil pressure rising." } else { "Engine running, oil pressure rising." },
+                )
+                .await;
                 let n_alts = if self.alternator_on_cmds.is_empty() {
                     ctx.xplane.run_command(CMD_ALTERNATOR_ON).await?;
                     1
@@ -978,6 +997,15 @@ impl Tool for StartEngine {
                     .await
                     .unwrap_or_default();
                 let alt_on = gens.len() >= n_alts && gens.iter().take(n_alts).all(|g| *g > 0.5);
+                crate::crew_pace::item(
+                    voice,
+                    match (alt_on, n_alts > 1) {
+                        (true, true) => "Alternators, on.",
+                        (true, false) => "Alternator, on.",
+                        (false, _) => "Alternator did not come on.",
+                    },
+                )
+                .await;
                 // Bring the avionics master online now the engine's running and
                 // the alternator is charging — matches the STARTING ENGINE
                 // checklist (avionics OFF for the start, ON after) and closes the
@@ -991,20 +1019,33 @@ impl Tool for StartEngine {
                     .run_command("sim/systems/avionics_on")
                     .await
                     .is_ok();
+                if avionics_on {
+                    crate::crew_pace::item(voice, "Avionics, on.").await;
+                }
+                // Called item by item already: the closing line is the result.
+                if crate::crew_pace::items_spoken(crate::persona::chatter()) {
+                    return Ok(if alt_on {
+                        "Start complete.".to_string()
+                    } else {
+                        "Start complete, but the alternator didn't come on, check it.".to_string()
+                    });
+                }
                 // Narrate the start sequence so the pilot hears what was done on
                 // their behalf, not just the end state.
+                // The result, not a recap: every step was done at its own
+                // beat, and "Roger, mixture rich, throttle cracked, mags
+                // both, cranking. Engine started, alternator on, avionics on"
+                // after the fact was the machine tell (LIPK 2026-09-26). What
+                // is still worth saying is what the pilot would not expect:
+                // a fuel selector we moved, a charging source that did not
+                // come on.
+                let _ = (n_alts, avionics_on);
                 let alt = if alt_on {
-                    if n_alts > 1 {
-                        "alternators on"
-                    } else {
-                        "alternator on"
-                    }
+                    ""
                 } else {
-                    "but the alternator didn't come on, check it"
+                    ", but the alternator didn't come on, check it"
                 };
-                let avi = if avionics_on { ", avionics on" } else { "" };
-                // A partial relight names the engine it started; a full cold
-                // start keeps the familiar wording.
+                // A partial relight names the engine it started.
                 let started = if engines == 1 {
                     "Engine started".to_string()
                 } else if dead.len() == engines {
@@ -1012,10 +1053,12 @@ impl Tool for StartEngine {
                 } else {
                     format!("Engine {} started, all engines running", dead[0] + 1)
                 };
-                return Ok(format!(
-                    "Roger — {fuel_note}mixture rich, throttle cracked, mags both, cranking. \
-                     {started}, {alt}{avi}."
-                ));
+                let fuel = fuel_note.trim_end_matches(", ");
+                let fuel = match fuel.chars().next() {
+                    Some(c) => format!("{}{}. ", c.to_uppercase(), &fuel[c.len_utf8()..]),
+                    None => String::new(),
+                };
+                return Ok(format!("{fuel}{started}{alt}."));
             }
         }
         // Say WHICH engine on a twin: "the engine hasn't caught" sends the
@@ -1482,7 +1525,7 @@ mod tests {
     /// dry engines and report that neither caught (Baron 58, 2026-08-01). The
     /// aircraft's own selector dataref is read-only, so the cycle command is
     /// the only thing that can do it.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_cold_start_opens_cycle_fuel_selectors_first() {
         let profile = crate::aircraft::load("beechcraft_baron_58").expect("baron profile");
         let cfg = crate::config::Config::default();
@@ -1561,7 +1604,7 @@ mod tests {
     /// The old entry gate read element 0 alone, so left-running/right-cold
     /// answered "already running" and the dead engine could never be started,
     /// while the mirror case cranked a starter into a live engine.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_twin_relight_cranks_only_the_dead_engine() {
         let profile = crate::aircraft::load("beechcraft_baron_58").expect("baron profile");
         let cfg = crate::config::Config::default();

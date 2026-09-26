@@ -1431,6 +1431,20 @@ impl Voice {
         self.enqueue(priority, text, None, false, stale_by);
     }
 
+    /// [`Voice::alert`] with its own shelf life: mirrored to the panel the
+    /// same way, dropped at dequeue once `stale_s` has passed. For a
+    /// mission's narration, where a line heard late is worse than none.
+    pub fn narrate(&self, priority: Priority, text: impl Into<String>, stale_s: u64) {
+        if !crate::mode::copilot_enabled() {
+            return;
+        }
+        let text = text.into();
+        crate::auto_status::note_said(&text);
+        self.mirror_to_panel(priority, &text);
+        let stale_by = Instant::now() + std::time::Duration::from_secs(stale_s);
+        self.enqueue(priority, text, None, false, Some(stale_by));
+    }
+
     /// Wire the panel transcript sink, so background-loop speech shows there.
     pub fn set_status(&self, sink: crate::plugin_status::StatusSink) {
         *self.inner.status.lock().unwrap_or_else(|e| e.into_inner()) = Some(sink);

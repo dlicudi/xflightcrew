@@ -20,6 +20,19 @@ use crate::autotaxi;
 use crate::party_line;
 use crate::tower;
 
+/// " Your pedals or my controls take it back any time." on the first drive
+/// of a session only. Said on every engage it was the same eleven words at
+/// the push, the taxi and the line-up (LIPK 2026-09-26): a person says how
+/// to take it back once, and the pilot knows from then on.
+fn take_back_hint() -> &'static str {
+    static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if SAID.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        ""
+    } else {
+        " Your pedals or my controls take it back any time."
+    }
+}
+
 pub struct AutoTaxi {
     /// The airframe's park-brake valve SET sense, passed through to the
     /// inner `hold_speed` arm so its release gates work unchanged.
@@ -223,11 +236,13 @@ impl Tool for AutoTaxi {
         };
         Ok(if joining {
             format!(
-                "My taxi. I'll get us onto the route first, then {dest}{via}. Your pedals or my controls take it back any time.",
+                "My taxi. I'll get us onto the route first, then {dest}{via}.{}",
+                take_back_hint(),
             )
         } else {
             format!(
-                "My taxi. {dest}{via}, {base:.0} knots. Your pedals or my controls take it back any time.",
+                "My taxi. {dest}{via}, {base:.0} knots.{}",
+                take_back_hint(),
             )
         })
     }
@@ -453,7 +468,8 @@ impl Tool for LineUp {
                 drive_kts,
             );
             return Ok(format!(
-                "Backtracking runway {spoken} for the full length. Your pedals or my controls take it back any time."
+                "Backtracking runway {spoken} for the full length.{}",
+                take_back_hint()
             ));
         }
         autotaxi::start(
@@ -463,7 +479,8 @@ impl Tool for LineUp {
             drive_kts,
         );
         Ok(format!(
-            "Lining us up, runway {spoken}. Your pedals or my controls take it back any time."
+            "Lining us up, runway {spoken}.{}",
+            take_back_hint()
         ))
     }
 }

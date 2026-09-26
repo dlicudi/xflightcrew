@@ -686,6 +686,13 @@ pub struct TaxiNet {
     /// onto the strip is DRAWN, and inventing it is how an aircraft ends up
     /// in the grass. See [`TaxiNet::ride_paint`].
     pub paint: Vec<Vec<(f64, f64)>>,
+    /// The PAVEMENT: every apt.dat 110 polygon at the field, each as its
+    /// rings (the first the outline, the rest holes), beziers sampled. Empty
+    /// where the field draws none. A tug's pattern is the sim's geometry,
+    /// not ours, and at LIPK it ran 98 m straight and left a 172 on the
+    /// grass, where the taxi could not move it (2026-09-26): the push stops
+    /// at the pavement's edge ([`TaxiNet::on_pavement`]).
+    pub pavement: Vec<Vec<Vec<(f64, f64)>>>,
 }
 
 /// How far a drawn centreline may be from the planned route and still be the
@@ -896,6 +903,20 @@ fn bezier(p0: (f64, f64), p1: (f64, f64), p2: (f64, f64), p3: (f64, f64), t: f64
 /// beziers sampled. A feature can mix types (a taxiway line that becomes a
 /// hold bar), so this emits a run per unbroken stretch of centreline rather
 /// than one polyline per feature.
+/// Even-odd point in a closed ring of (lat, lon).
+fn ring_contains(ring: &[(f64, f64)], lat: f64, lon: f64) -> bool {
+    let mut inside = false;
+    let n = ring.len();
+    for i in 0..n {
+        let (y1, x1) = ring[i];
+        let (y2, x2) = ring[(i + 1) % n];
+        if (y1 > lat) != (y2 > lat) && lon < x1 + (lat - y1) * (x2 - x1) / (y2 - y1) {
+            inside = !inside;
+        }
+    }
+    inside
+}
+
 fn flush_paint_feature(nodes: &mut Vec<PaintNode>, out: &mut Vec<Vec<(f64, f64)>>) {
     let mut run: Vec<(f64, f64)> = Vec::new();
     for i in 0..nodes.len().saturating_sub(1) {
@@ -1089,6 +1110,9 @@ pub fn find_taxi_net(path: &str, icao: &str) -> Result<Option<TaxiNet>> {
     // airport perimeter (130), and a boundary is not a line to taxi down.
     let mut in_feature = false;
     let mut feature: Vec<PaintNode> = Vec::new();
+    // The pavement polygon being read (a 110 block), and its current ring.
+    let mut in_pavement = false;
+    let mut ring: Vec<PaintNode> = Vec::new();
     loop {
         buf.clear();
         if reader.read_until(b'\n', &mut buf).unwrap_or(0) == 0 {
@@ -1106,8 +1130,50 @@ pub fn find_taxi_net(path: &str, icao: &str) -> Result<Option<TaxiNet>> {
         if !matches!(row, Some("111" | "112" | "113" | "114" | "115" | "116")) {
             flush_paint_feature(&mut feature, &mut net.paint);
             in_feature = in_airport && row == Some("120");
+            ring.clear();
+            in_pavement = in_airport && row == Some("110");
+            if in_pavement {
+                net.pavement.push(Vec::new());
+            }
         }
         match row {
+            Some("111" | "112" | "113" | "114" | "115" | "116") if in_pavement => {
+                let (Some(lat), Some(lon)) = (
+                    f.next().and_then(|s| s.parse::<f64>().ok()),
+                    f.next().and_then(|s| s.parse::<f64>().ok()),
+                ) else {
+                    continue;
+                };
+                let ctrl = if matches!(row, Some("112" | "114" | "116")) {
+                    match (
+                        f.next().and_then(|s| s.parse::<f64>().ok()),
+                        f.next().and_then(|s| s.parse::<f64>().ok()),
+                    ) {
+                        (Some(a), Some(b)) => Some((a, b)),
+                        _ => None,
+                    }
+                } else {
+                    None
+                };
+                ring.push(PaintNode {
+                    p: (lat, lon),
+                    ctrl,
+                    centre: true,
+                });
+                // 113/114 close a ring; the next ring of the same polygon
+                // is a hole.
+                if matches!(row, Some("113" | "114")) {
+                    if let Some(&first) = ring.first() {
+                        ring.push(first);
+                    }
+                    let mut sampled: Vec<Vec<(f64, f64)>> = Vec::new();
+                    flush_paint_feature(&mut ring, &mut sampled);
+                    if let (Some(r), Some(poly)) = (sampled.into_iter().next(), net.pavement.last_mut()) {
+                        poly.push(r);
+                    }
+                    ring.clear();
+                }
+            }
             Some("111" | "112" | "113" | "114" | "115" | "116") if in_feature => {
                 let (Some(lat), Some(lon)) = (
                     f.next().and_then(|s| s.parse::<f64>().ok()),
@@ -1237,6 +1303,20 @@ pub fn find_taxi_net(path: &str, icao: &str) -> Result<Option<TaxiNet>> {
 }
 
 impl TaxiNet {
+    /// Is this point on the field's drawn pavement? `None` when the field
+    /// draws none, so a caller never reads "no data" as "grass".
+    pub fn on_pavement(&self, lat: f64, lon: f64) -> Option<bool> {
+        if self.pavement.iter().all(|p| p.is_empty()) {
+            return None;
+        }
+        Some(self.pavement.iter().any(|rings| {
+            rings
+                .first()
+                .is_some_and(|outer| ring_contains(outer, lat, lon))
+                && !rings[1..].iter().any(|hole| ring_contains(hole, lat, lon))
+        }))
+    }
+
     /// The nearest SUITABLE parking stand (excludes hangars) by straight-line
     /// distance — the destination an arrival taxi routes to. `None` when the
     /// field publishes no stands.
@@ -4622,6 +4702,32 @@ STAR:030,6,ALWYS3,RW28B,ARRTU,K2,P,C,E   , ,   ,TF, , , , , ,      ,    ,    ,  
     /// runway 13, tracking the planned route to 0.12 m and the drawn line to
     /// nothing better than 1.7 m. The assertion is on the route, not on the
     /// aircraft — where the route runs is the only part of that we own.
+    /// LIPK 2026-09-26: the tug's pattern left a 172 at the second point, on
+    /// the grass; the first is the stand it was pushed off.
+    #[test]
+    #[ignore] // needs the real X-Plane install; run with --ignored
+    fn live_lipk_pavement_knows_the_grass() {
+        let path =
+            "/Users/duanelicudi/X-Plane 12/Global Scenery/Global Airports/Earth nav data/apt.dat";
+        let Ok(Some(net)) = find_taxi_net(path, "LIPK") else {
+            return;
+        };
+        assert!(!net.pavement.is_empty(), "LIPK draws pavement");
+        assert_eq!(net.on_pavement(44.19580628655603, 12.075011968589756), Some(true));
+        assert_eq!(net.on_pavement(44.19488911712411, 12.074242855216026), Some(false));
+    }
+
+    #[test]
+    fn pavement_holes_are_not_pavement_and_no_data_is_no_verdict() {
+        let mut net = TaxiNet::default();
+        assert_eq!(net.on_pavement(0.5, 0.5), None);
+        let sq = |a: f64, b: f64| vec![(a, a), (a, b), (b, b), (b, a), (a, a)];
+        net.pavement.push(vec![sq(0.0, 1.0), sq(0.4, 0.6)]);
+        assert_eq!(net.on_pavement(0.2, 0.2), Some(true));
+        assert_eq!(net.on_pavement(0.5, 0.5), Some(false), "a hole");
+        assert_eq!(net.on_pavement(1.5, 0.5), Some(false));
+    }
+
     #[test]
     #[ignore] // needs the real X-Plane install; run with --ignored
     fn live_lemg_route_rides_the_paint() {

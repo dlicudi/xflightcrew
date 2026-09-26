@@ -263,10 +263,21 @@ pub fn start(base_url: String, config: Config, voice: Option<Voice>, tools: SubT
     true
 }
 
+/// How long a line of the mission's OWN narration may wait to be said.
+/// "Battery on" heard twelve seconds after the battery, with the engine
+/// already turning, is worse than silence; behind a long reply or a tower
+/// transmission the old 12 s let a whole queue form and play late (LIPK
+/// 2026-09-26). Anything sterner than Advisory is never perishable.
+const NARRATION_STALE_S: u64 = 6;
+
 fn announce(voice: &Option<Voice>, priority: Priority, line: &str) {
     tracing::info!(target: "xvoicelayer::full_auto", spoke = %line, "copilot");
     if let Some(v) = voice {
-        v.alert(priority, line.to_string());
+        if priority == Priority::Advisory {
+            v.narrate(priority, line, NARRATION_STALE_S);
+        } else {
+            v.alert(priority, line.to_string());
+        }
     }
 }
 
@@ -410,14 +421,33 @@ async fn hand_back_brakes_if(
     if !matches!(gs, Ok(v) if v.is_finite() && v.abs() * MS_TO_KTS < HAND_BACK_BRAKE_MAX_KTS) {
         return;
     }
-    let held = crate::tools::controls::drive_park_brake(xp, true, valve_set)
-        .await
-        .unwrap_or(false);
+    // Tried three times, and the failure KEPT: at LIPK (2026-09-26) one
+    // attempt read back unset with its error swallowed, and the governor
+    // went on squeezing a 172 on its wheel brakes for fifteen minutes (the
+    // pilot has no toe-brake axis to release them). The same command, sent
+    // by hand afterwards, set at once.
+    let mut held = false;
+    let mut err: Option<String> = None;
+    let mut tries = 0;
+    while tries < 3 && !held {
+        tries += 1;
+        match crate::tools::controls::drive_park_brake(xp, true, valve_set).await {
+            Ok(h) => held = h,
+            Err(e) => err = Some(format!("{e:#}")),
+        }
+        if !held {
+            tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+        }
+    }
+    if !held {
+        tracing::warn!(?err, "full auto: the parking brake did not set at the hand-back");
+    }
     // Recorded, not `event`: the mission is over, so this must not reappear as
     // a stage on the panel the moment `clear_stage` has run.
     crate::blackbox::record(
         "full_auto",
-        json!({ "stage": "hand_back_brakes", "detail": { "held": held } }),
+        json!({ "stage": "hand_back_brakes",
+                "detail": { "held": held, "tries": tries, "err": err } }),
     );
 }
 
@@ -487,15 +517,9 @@ pub(crate) async fn get_zone_clearance(
     if let Some(khz) = crate::party_line::home_tower_khz() {
         let _ = xp.set_float(COM1_FREQ_KHZ, khz as f64).await;
     }
-    announce(
-        voice,
-        Priority::Advisory,
-        crate::readback::one_of(&[
-            "Requesting clearance.",
-            "Getting our clearance.",
-            "Calling for our clearance.",
-        ]),
-    );
+    // The call itself is heard; a line announcing it first is a crew narrating
+    // its own hands (LIPK 2026-09-26: said, queued behind the tower, and
+    // dropped stale, or heard after the call it announced).
     crate::circuit::transmit(crate::circuit::radio_call(callsign, "request clearance"));
     event("request_clearance", json!({}));
     // The tower answers with a discrete squawk; wait for it, then dial it
@@ -983,17 +1007,12 @@ async fn fly(xp: XPlaneClient, config: Config, voice: Option<Voice>, tools: SubT
     announce(
         &voice,
         Priority::Advisory,
+        // The arming reply has just said "Full auto, X to Y"; a second
+        // "Full auto it is" straight after it was the same news twice.
         if already_running {
-            crate::readback::one_of(&[
-                "Full auto. Picking up from here.",
-                "Full auto it is. Engine's running, carrying on from here.",
-            ])
+            crate::readback::one_of(&["Picking up from here.", "Carrying on from here."])
         } else {
-            crate::readback::one_of(&[
-                "Full auto. Starting from cold.",
-                "Full auto it is. Taking her from cold and dark.",
-                "Alright, full auto. Starting cold.",
-            ])
+            crate::readback::one_of(&["Starting from cold.", "From cold, then.", "Starting her up."])
         },
     );
     event("start", json!({}));
@@ -1088,11 +1107,15 @@ async fn fly(xp: XPlaneClient, config: Config, voice: Option<Voice>, tools: SubT
         // custom command the stock write can't set — so a cold start read 0 V
         // and never turned a blade (2026-07-26). No-op for pistons (empty).
         if !tools.bus_power_on_cmds.is_empty() {
-            announce(&voice, Priority::Advisory, "Battery on.");
             for cmd in &tools.bus_power_on_cmds {
                 let _ = xp.run_command(cmd).await;
             }
-            tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+            // The one ramp line said at every chatter; the beat is the
+            // bus coming alive (it used to be a flat 600 ms).
+            if !crate::crew_pace::items_spoken(crate::persona::chatter()) {
+                announce(&voice, Priority::Advisory, "Battery on.");
+            }
+            crate::crew_pace::item(voice.as_ref(), "Battery, on.").await;
             event(
                 "bus_power",
                 json!({ "cmds": tools.bus_power_on_cmds.len() }),
@@ -1103,8 +1126,15 @@ async fn fly(xp: XPlaneClient, config: Config, voice: Option<Voice>, tools: SubT
         // Beacon BEFORE the propeller moves — that is what it is for, and it
         // is the one light with an actual safety job on a ramp. Nav lights with
         // it, since they belong on whenever the master is.
+        // One item at a time, at a person's pace (`crew_pace`): the whole
+        // ramp used to be done in the same second.
         let beacon = light(&tools, &ctx, "beacon", true).await;
-        light(&tools, &ctx, "nav", true).await;
+        if beacon {
+            crate::crew_pace::item(voice.as_ref(), "Beacon, on.").await;
+        }
+        if light(&tools, &ctx, "nav", true).await {
+            crate::crew_pace::item(voice.as_ref(), "Nav lights, on.").await;
+        }
         // Panel lighting with them. The bus is live and the pilot is about to
         // be asked to read instruments.
         {
@@ -1115,18 +1145,24 @@ async fn fly(xp: XPlaneClient, config: Config, voice: Option<Voice>, tools: SubT
                 .await
                 .is_ok();
             event("lights_panel", json!({ "on": lit }));
+            if lit {
+                crate::crew_pace::item(voice.as_ref(), "Panel lights, on.").await;
+            }
         }
         event("lights_beacon", json!({ "beacon": beacon }));
         // Seat belt signs on before anything turns (see `tools::signs`).
         if let Some(ok) = crate::tools::signs::set(&xp, true).await {
             event("seat_belt_signs", json!({ "on": true, "ok": ok }));
+            if ok {
+                crate::crew_pace::item(voice.as_ref(), "Seat belt signs, on.").await;
+            }
         }
         // Only claim the beacon on an airframe that has one — the Lancair's
         // switch row is NAV / LAND / STRB and nothing else.
         announce(
             &voice,
             Priority::Advisory,
-            if beacon {
+            if beacon && !crate::crew_pace::items_spoken(crate::persona::chatter()) {
                 crate::readback::one_of(&[
                     "Beacon on. Starting the engine.",
                     "Beacon's on, spinning up the engine.",
@@ -1170,6 +1206,7 @@ async fn fly(xp: XPlaneClient, config: Config, voice: Option<Voice>, tools: SubT
             for cmd in &tools.all_electrical_on_cmds {
                 let _ = xp.run_command(cmd).await;
             }
+            crate::crew_pace::pause(crate::crew_pace::beat_ms()).await;
             // Toggle-only systems have no ON command, so a bulk power-up that
             // fires command lists skips them SILENTLY. That left the Citation's
             // avionics master off after "electrical set", and the radios dead.
@@ -1181,7 +1218,13 @@ async fn fly(xp: XPlaneClient, config: Config, voice: Option<Voice>, tools: SubT
             // What was set is the profile's list; "generators and bleeds"
             // on a 172 was an airliner's line (2026-09-15), and the start
             // line has already named the alternator and avionics.
-            announce(&voice, Priority::Advisory, "Electrical set.");
+            // Said where it adds something: a turbine's generators and
+            // bleeds. A piston's start has just brought the alternator and
+            // avionics on at their own beats, and "Electrical set" after it
+            // was a second recap of the same switches.
+            if tools.start_engine.name() != "start_engine" {
+                announce(&voice, Priority::Advisory, "Electrical set.");
+            }
             event(
                 "electrical_set",
                 json!({
@@ -1349,25 +1392,6 @@ async fn fly(xp: XPlaneClient, config: Config, voice: Option<Voice>, tools: SubT
             if let Some(khz) = crate::party_line::home_tower_khz() {
                 let _ = xp.set_float(COM1_FREQ_KHZ, khz as f64).await;
                 event("tuned_tower", json!({ "khz": khz }));
-                announce(
-                    &voice,
-                    Priority::Advisory,
-                    crate::readback::one_of(&[
-                        "Tuning the tower, requesting taxi.",
-                        "Getting the tower, asking for taxi.",
-                        "On the tower now, requesting taxi.",
-                    ]),
-                );
-            } else {
-                announce(
-                    &voice,
-                    Priority::Advisory,
-                    crate::readback::one_of(&[
-                        "Requesting taxi.",
-                        "Asking for taxi.",
-                        "Calling for taxi.",
-                    ]),
-                );
             }
             // The planned departure's runway, asked for (the tower honours it
             // unless the wind really favours another end): a SID exists for
@@ -1599,15 +1623,8 @@ async fn fly(xp: XPlaneClient, config: Config, voice: Option<Voice>, tools: SubT
             "lights_taxi",
             json!({ "on": taxi_lit, "light": taxi_key, "dark": dark }),
         );
-        announce(
-            &voice,
-            Priority::Advisory,
-            crate::readback::one_of(&[
-                "Taxiing to the runway.",
-                "Rolling out to the runway.",
-                "Taking us to the runway.",
-            ]),
-        );
+        // The taxi tool's own reply ("My taxi. Holding point Delta via ...")
+        // is the line; "Rolling out to the runway" ahead of it said it twice.
         if let Ok(reply) = tools.taxi.execute(&json!({}), &ctx).await {
             announce(&voice, Priority::Advisory, &reply);
         }
@@ -1686,7 +1703,7 @@ async fn fly(xp: XPlaneClient, config: Config, voice: Option<Voice>, tools: SubT
         // crew-radio drain (with the tower's reply), so we only transmit here.
         let atc_running = crate::party_line::clearance_state().is_some();
         if atc_running {
-            request_departure(&voice, &callsign).await;
+            request_departure(&callsign).await;
             bail_if_abort!();
         }
 
@@ -1767,13 +1784,8 @@ async fn fly(xp: XPlaneClient, config: Config, voice: Option<Voice>, tools: SubT
             // then the turn onto the line), and the tool's own reply names
             // each leg. "Taking the runway" twice in ninety seconds, LXGB 27,
             // 2026-09-15.
-            if attempt == 0 {
-                announce(
-                    &voice,
-                    Priority::Advisory,
-                    crate::readback::one_of(&["Lining up.", "Lining us up.", "Taking the runway."]),
-                );
-            }
+            // The line-up tool's own reply names the runway; a "Taking the
+            // runway" ahead of it said it twice.
             if let Ok(reply) = tools.line_up.execute(&json!({}), &ctx).await {
                 announce(&voice, Priority::Advisory, &reply);
             }
@@ -1927,7 +1939,7 @@ async fn fly(xp: XPlaneClient, config: Config, voice: Option<Voice>, tools: SubT
             if let Some(khz) = crate::party_line::home_tower_khz() {
                 let _ = xp.set_float(COM1_FREQ_KHZ, khz as f64).await;
             }
-            request_departure(&voice, &callsign).await;
+            request_departure(&callsign).await;
             bail_if_abort!();
             let mut read_back = false;
             waiting("the takeoff clearance");
@@ -3312,6 +3324,9 @@ async fn choose_departure(
             let mut legs =
                 crate::nav::load_proc_legs(&cifp, &origin, ProcKind::Sid, &choice.ident, Some(&choice.transition));
             crate::nav::resolve_proc_fixes(&fix_path, &nav_path, &apt, &origin, &mut legs, alat, alon);
+            // The whole chart for the gradient, fixless legs included; the
+            // flown copy below keeps only what the follower can steer at.
+            let chart = legs.clone();
             let mut sid: Vec<crate::nav::ProcLeg> = Vec::new();
             for l in legs {
                 if l.fix_ident.is_empty() || l.fix_ident.starts_with("RW") {
@@ -3331,7 +3346,7 @@ async fn choose_departure(
                 continue;
             }
             let mins = crate::nav::sid_minimums(&cifp, &origin, &choice.ident, &cl);
-            let checks = departure_gradients(der, apt.elev_ft, &sid, &mins, vy_kts, best_climb);
+            let checks = departure_gradients(der, apt.elev_ft, &chart, &mins, vy_kts, best_climb);
             match gradient_verdict(&choice.ident, &checks) {
                 Ok(note) => return Some(Ok((choice, sid, mins, note))),
                 Err(_) => continue,
@@ -3451,6 +3466,30 @@ const GRADIENT_CAUTION_FRAC: f64 = 0.75;
 /// Every departure minimum on the route, from the runway's departure end
 /// `der` at `field_ft`, against `best_climb_fpm` at `vy_kts` (true airspeed
 /// rising 2 % a thousand feet, no wind credit). Pure.
+/// SID `sid` from `rwy` as CHARTED: its runway transition and common legs,
+/// the climb-to-altitude and course legs included, fixes resolved. What the
+/// gradient check must walk: the flight plan lists only the SID's named
+/// fixes, and at LIPR the one fix with a minimum is a VOR on the field that
+/// the procedure reaches after a 12-mile out-and-back. Empty when the chart
+/// or the airport is missing (the caller falls back to the plan's legs).
+pub fn sid_chart_legs(
+    cifp_dir: &str,
+    fix_path: &str,
+    nav_path: &str,
+    apt: &crate::nav::AirportInfo,
+    origin: &str,
+    sid: &str,
+    rwy: &str,
+) -> Vec<crate::nav::ProcLeg> {
+    let Some((alat, alon)) = apt.position() else {
+        return Vec::new();
+    };
+    let tr = format!("RW{rwy}");
+    let mut legs = crate::nav::load_proc_legs(cifp_dir, origin, crate::nav::ProcKind::Sid, sid, Some(&tr));
+    crate::nav::resolve_proc_fixes(fix_path, nav_path, apt, origin, &mut legs, alat, alon);
+    legs
+}
+
 pub fn departure_gradients(
     der: (f64, f64),
     field_ft: f64,
@@ -3462,10 +3501,43 @@ pub fn departure_gradients(
     let mut out = Vec::new();
     let mut dist = 0.0;
     let mut from = der;
+    // Distance is measured ALONG the procedure. Only the legs with a fix used
+    // to count, straight from one fix to the next, so a departure that flies
+    // out and turns back to a VOR on the field measured as the mile between
+    // them: LIPR's ANC8A (climb to 450 ft on 304, the 291 course to 6 DME,
+    // back 6 nm to RIM at 4,000 or above) read as 3,388 feet a mile for a
+    // 172 that climbs 569, and the flight was refused (2026-09-26). A leg's
+    // own published distance wins; a climb-to-altitude leg is as long as
+    // this airframe takes to reach the altitude; a fix-to-fix leg with no
+    // distance is the straight line.
+    let low_tas = vy_kts * (1.0 + 0.02 * field_ft / 1000.0);
+    let low_have = best_climb_fpm / (low_tas / 60.0);
+    let mut alt_now = field_ft;
     for leg in legs {
-        let Some(f) = &leg.fix else { continue };
-        dist += crate::nav::haversine_nm(from.0, from.1, f.lat, f.lon);
-        from = (f.lat, f.lon);
+        let leg_nm = match (leg.dist_nm.filter(|d| *d > 0.0), &leg.fix) {
+            (Some(d), fix) => {
+                if let Some(f) = fix {
+                    from = (f.lat, f.lon);
+                }
+                d
+            }
+            (None, Some(f)) => {
+                let d = crate::nav::haversine_nm(from.0, from.1, f.lat, f.lon);
+                from = (f.lat, f.lon);
+                d
+            }
+            (None, None) => match leg.alt1_ft {
+                Some(a) if matches!(leg.leg_type.as_str(), "CA" | "VA" | "FA") => {
+                    (a - alt_now).max(0.0) / low_have.max(1.0)
+                }
+                _ => 0.0,
+            },
+        };
+        dist += leg_nm;
+        alt_now = alt_now.max(leg.alt1_ft.unwrap_or(alt_now).min(alt_now + leg_nm * low_have));
+        if leg.fix.is_none() {
+            continue;
+        }
         if let Some(m) = minimums.iter().find(|m| m.fix.eq_ignore_ascii_case(&leg.fix_ident)) {
             let mid_kft = (field_ft + m.min_ft) / 2.0 / 1000.0;
             let tas = vy_kts * (1.0 + 0.02 * mid_kft);
@@ -3536,17 +3608,11 @@ fn approach_fallback_ends(
 /// Call the tower for departure and wait for it to move us to a departure
 /// clearance (line-up-and-wait or cleared for takeoff). The call itself is
 /// voiced + transcribed by the crew-radio drain, along with the tower's reply.
-async fn request_departure(voice: &Option<Voice>, callsign: &Option<String>) {
+async fn request_departure(callsign: &Option<String>) {
     use crate::tower::State::{LinedUp, TakeoffCleared};
-    announce(
-        voice,
-        Priority::Advisory,
-        crate::readback::one_of(&[
-            "Calling for departure.",
-            "Calling the tower for departure.",
-            "Getting our departure clearance.",
-        ]),
-    );
+    // The call itself is heard; a line announcing it first is a crew narrating
+    // its own hands (LIPK 2026-09-26: said, queued behind the tower, and
+    // dropped stale, or heard after the call it announced).
     crate::circuit::transmit(crate::circuit::radio_call(callsign, "ready for departure"));
     event("request_departure", json!({}));
     waiting("departure clearance");
@@ -4431,6 +4497,32 @@ mod tests {
         // equivalent) the same departure is refused.
         let weak = super::departure_gradients(der, 1907.0, &legs, &mins, 190.0, 1500.0);
         assert!(super::gradient_verdict("MOGT3H", &weak).is_err());
+    }
+
+    /// LIPR 30 ANC8A (2026-09-26): climb to 450 on 304, the 291 course to 6
+    /// DME, back 6 nm to RIM at 4,000 or above. RIM is a VOR on the field, so
+    /// measured fix to fix it was 1.2 nm from the departure end, 3,388 feet a
+    /// mile, and a 172 was refused a departure it climbs easily.
+    #[test]
+    fn a_sid_gradient_is_measured_along_the_procedure_not_fix_to_fix() {
+        let rows = [
+            "SID:010,2,ANC8A,RW30, , , , ,    , ,   ,CA, , , , , ,      ,    ,    ,3040,    ,+,00450,     ,06000, ,   ,    ,   ,RIM,LI,D, , , , , ;",
+            "SID:020,2,ANC8A,RW30, , , , ,    , ,   ,CD, ,RIM,LI,D, ,      ,    ,    ,2910,0060,+,01500,     ,     ,-,210,    ,   , , , , , , , , ;",
+            "SID:030,2,ANC8A,RW30,RIM,LI,D, ,V   ,R,   ,CF,Y,RIM,LI,D, ,      ,0000,0000,1610,0060,+,04000,     ,     ,-,210,    ,   , , , , , , , , ;",
+        ];
+        let mut legs = crate::nav::parse_proc_legs(rows.into_iter(), crate::nav::ProcKind::Sid, "ANC8A", Some("RW30"));
+        assert_eq!(legs.len(), 3);
+        for l in legs.iter_mut().filter(|l| l.fix_ident == "RIM") {
+            l.fix = Some(crate::nav::Fix { ident: "RIM".into(), lat: 44.015167, lon: 12.616639 });
+        }
+        let mins = vec![crate::nav::ClimbMinimum { fix: "RIM".into(), min_ft: 4000.0 }];
+        let der = (44.0285304, 12.5969644); // the 12 end: 30's departure end
+        let checks = super::departure_gradients(der, 40.0, &legs, &mins, 74.0, 700.0);
+        assert_eq!(checks.len(), 1);
+        let rim = &checks[0];
+        assert!(rim.dist_nm > 12.0, "{rim:?}");
+        assert!(rim.need_ft_per_nm < 350.0, "{rim:?}");
+        assert!(super::gradient_verdict("ANC8A", &checks).is_ok(), "a 172 flies it");
     }
 
     #[test]

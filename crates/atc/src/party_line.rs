@@ -240,6 +240,12 @@ pub fn nearest_stand(lat: f64, lon: f64) -> Option<StandFix> {
         .min_by(|a, b| a.dist_m.total_cmp(&b.dist_m))
 }
 
+/// Is this point on the active field's drawn pavement? `None` when no
+/// field is loaded or it draws no pavement: no data is never "grass".
+pub fn on_pavement(lat: f64, lon: f64) -> Option<bool> {
+    crate::station::taxi_net()?.on_pavement(lat, lon)
+}
+
 /// Whether the active field publishes any parking positions at all.
 pub fn stands_known() -> bool {
     crate::station::taxi_net().is_some_and(|n| !n.stands.is_empty())

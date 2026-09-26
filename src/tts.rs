@@ -285,6 +285,31 @@ pub fn configure_audio_bus(enabled: bool, base_url: &str) {
     AUDIO_BUS_PINNED.store(enabled, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// What the sim's own radio audio should be, given whether OUR stations own
+/// the frequencies (`own_atc`: ATC mode on with `XCOPILOT_MUTE_XP_RADIO`)
+/// and whether our voices ride the sim's audio bus.
+///
+/// The mute (2026-07-10: two ATIS voices on one frequency) zeroes the sim's
+/// Radio slider, and the station on the bus plays on COM1, which FOLLOWS
+/// that slider: with both on, our own controller spoke at volume zero and the
+/// pilot heard no ATC at all (LIPK, 2026-09-26). With the bus on, the slider
+/// stays up and the sim's ATIS is switched off instead.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct SimRadio {
+    /// `sim/operation/sound/radio_volume_ratio`, x100.
+    pub volume_pct: u8,
+    /// `sim/atc/atis_enabled`; `None` leaves it alone.
+    pub atis: Option<bool>,
+}
+
+pub fn sim_radio(own_atc: bool, bus: bool) -> SimRadio {
+    match (own_atc, bus) {
+        (true, false) => SimRadio { volume_pct: 0, atis: None },
+        (true, true) => SimRadio { volume_pct: 100, atis: Some(false) },
+        (false, _) => SimRadio { volume_pct: 100, atis: Some(true) },
+    }
+}
+
 /// The panel's pick. Refused (false) when the environment pinned it on.
 pub fn set_audio_bus(on: bool) -> bool {
     if AUDIO_BUS_PINNED.load(std::sync::atomic::Ordering::Relaxed) {
@@ -418,4 +443,20 @@ pub(crate) fn play(path: &std::path::Path) -> Result<()> {
     let mut cmd = Command::new("aplay");
     cmd.arg(path);
     run_audible(cmd, "aplay")
+}
+
+#[cfg(test)]
+mod sim_radio_tests {
+    use super::*;
+
+    /// LIPK 2026-09-26: our station on the bus played on COM1 at the
+    /// zero the mute had put on the Radio slider.
+    #[test]
+    fn our_station_on_the_bus_is_never_muted_by_our_own_mute() {
+        let r = sim_radio(true, true);
+        assert_eq!(r.volume_pct, 100);
+        assert_eq!(r.atis, Some(false), "the sim's ATIS goes instead");
+        assert_eq!(sim_radio(true, false).volume_pct, 0, "local player: the slider mute stands");
+        assert_eq!(sim_radio(false, true).atis, Some(true));
+    }
 }

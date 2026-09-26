@@ -2284,6 +2284,7 @@ pub async fn run(
     // it's called out on transitions here rather than as Checks.
     let mut prev_attached = false;
     let mut prev_pushing = false;
+    let mut push_called = false;
     // Last strip pushed to the panel — only re-send on change.
     let mut last_strip = String::new();
     // Last automation feed pushed, plus a tick countdown that forces a
@@ -2603,7 +2604,11 @@ pub async fn run(
                         "Ground's connected, ready when you are.",
                     ]));
                 }
-                if snap.pushing_back && !prev_pushing {
+                // Once per hook-up: `pushing_back` is motion over 0.3 kt with
+                // the bar on, and a tug nudging at the edge of it flickered
+                // "Pushing back" three times in five seconds (LIPK 2026-09-26).
+                if snap.pushing_back && !prev_pushing && !push_called {
+                    push_called = true;
                     say(crate::readback::one_of(&[
                         "Pushing back.",
                         "Here we go, pushing back.",
@@ -2613,6 +2618,9 @@ pub async fn run(
                 // Clear is the BAR coming off, not the rolling stopping: now
                 // that `pushing_back` is motion-based, a pause mid-push would
                 // otherwise announce a tug that is still hooked to the nose.
+                if !snap.tug_attached {
+                    push_called = false;
+                }
                 if !snap.tug_attached && prev_attached {
                     say(crate::readback::one_of(&[
                         "Pushback complete, tug clear.",

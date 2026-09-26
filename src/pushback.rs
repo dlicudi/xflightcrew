@@ -453,6 +453,19 @@ pub fn back_along(start_lat: f64, start_lon: f64, start_psi: f64, lat: f64, lon:
     d_m * off.cos()
 }
 
+/// How far behind the aircraft the pavement is looked for. A tug honours
+/// "stop" on its straight segment, not mid-swing, so the edge has to be seen
+/// before the swing that carries the aircraft over it: at LIPK (2026-09-26)
+/// the 172 left the apron at 102 m, the second its swing began, and this
+/// much look-behind finds that edge at about 92 m, still straight.
+pub const PAVEMENT_LOOK_M: f64 = 10.0;
+
+/// Is the push at the pavement's edge? Only for a push that STARTED on drawn
+/// pavement (a grass parking row is left alone), and never on no data.
+pub fn at_pavement_edge(started_on: Option<bool>, here: Option<bool>, behind: Option<bool>) -> bool {
+    started_on == Some(true) && (here == Some(false) || behind == Some(false))
+}
+
 /// Should this tick squeeze the brake channel against forward creep? Only
 /// while NOBODY is pushing (a tug mid-arc can carry the reference point
 /// forward, and a push already under way must never be braked against) and
@@ -593,6 +606,7 @@ async fn run_inner(
     else {
         return Err("no_position".into());
     };
+    let started_on_pavement = crate::party_line::on_pavement(start_lat, start_lon);
     // The MANOEUVRE, picked once and up front — X-Plane's three pushback
     // commands are not a steering channel, they are whole-push patterns the
     // tug executes and finishes ("Nose 90 left" / "Straight back" / "Nose 90
@@ -934,6 +948,21 @@ async fn run_inner(
             err_hist.pop_front();
         }
         let err_then = err_hist.front().map(|(_, e)| *e).unwrap_or(err);
+        // The tug's pattern is the sim's geometry: stop it before it takes
+        // us off the pavement, whatever the plan still owed. The residual is
+        // the taxi's, and a taxi can turn on pavement; on grass it could not
+        // move at all (LIPK 2026-09-26).
+        if towed && started_on_pavement == Some(true) {
+            let (blat, blon) =
+                nav::project_latlon(lat, lon, psi + 180.0, PAVEMENT_LOOK_M / M_PER_NM);
+            let here = crate::party_line::on_pavement(lat, lon);
+            let behind = crate::party_line::on_pavement(blat, blon);
+            if at_pavement_edge(started_on_pavement, here, behind) {
+                event(json!({ "event": "pavement_edge", "back_m": r1(back_m), "err": r1(err),
+                              "here": here, "swinging": swing_in_progress(attached, err_then, err) }));
+                break;
+            }
+        }
         if done(back_m, err, plan) {
             if swing_in_progress(attached, err_then, err) {
                 // Far enough by the numbers, but the tug is mid-swing: it
@@ -1025,23 +1054,30 @@ async fn run_inner(
 
     send(ctx, "stop").await;
     event(json!({ "event": "stopped", "back_m": r1(back_m) }));
-    // Push complete: brakes SET while the tug unhooks — "parking brake set,
-    // disconnect" — and set they STAY until the taxi drive arms and its
-    // governor releases them itself. The gap between the tug letting go and
-    // the taxi engaging is exactly the window the stand creep happened in.
-    let _ = crate::tools::controls::drive_park_brake(ctx.xplane, true, valve_set).await;
-    event(json!({ "event": "brakes_set" }));
     // Wait for the tug to unhook and drive clear before any power goes on —
     // taxiing into your own tug is a way to end a flight on the stand. Watch
     // the BAR: gating this on tow_in_progress alone made it a no-op, because
     // that dataref is 0 for the whole push (see PUSH_ATTACHED), so the "wait"
     // returned true on its first read with the tug still hooked on.
-    if !wait_for(TUG_CLEAR_SECS, abort, || async {
+    //
+    // Held on the TOE brakes while it unhooks, the parking brake only once
+    // it has: with the handle set the sim's tug does not let go. Nine pushes
+    // in the logs set it first and waited out the whole 30 s with the tug on
+    // the bar, and every one was released 5 to 10 s after the taxi drive let
+    // the handle off (LIPK 2026-09-26 among them). The toe channel is an
+    // expiring heartbeat, so it is written every poll.
+    let cleared = wait_for(TUG_CLEAR_SECS, abort, || async {
+        let _ = xp.set_float(TAXI_BRAKE, HOLD_BRAKE).await;
         let (att, tow) = tokio::join!(xp.get_float(PUSH_ATTACHED), xp.get_float(TOW_IN_PROGRESS));
         att.unwrap_or(0.0) <= 0.5 && tow.unwrap_or(0.0) <= 0.5
     })
-    .await
-    {
+    .await;
+    // Brakes SET now, and set they STAY until the taxi drive arms and its
+    // governor releases them itself. The gap between the tug letting go and
+    // the taxi engaging is exactly the window the stand creep happened in.
+    let _ = crate::tools::controls::drive_park_brake(ctx.xplane, true, valve_set).await;
+    event(json!({ "event": "brakes_set", "tug_clear": cleared }));
+    if !cleared {
         // It never cleared: say so, but the push itself happened.
         tracing::warn!("pushback: the tug never showed clear");
         event(json!({ "event": "tug_not_clear" }));
@@ -1093,6 +1129,16 @@ fn r1(v: f64) -> f64 {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_push_stops_at_the_pavement_edge_only_from_pavement() {
+        use super::at_pavement_edge;
+        assert!(at_pavement_edge(Some(true), Some(true), Some(false)), "edge behind");
+        assert!(at_pavement_edge(Some(true), Some(false), Some(false)), "already over");
+        assert!(!at_pavement_edge(Some(true), Some(true), Some(true)));
+        assert!(!at_pavement_edge(Some(false), Some(false), Some(false)), "a grass stand");
+        assert!(!at_pavement_edge(None, None, None), "no data is no verdict");
+    }
+
     #[test]
     fn parked_is_near_the_stand_whatever_the_heading() {
         // EDLP 7C: 2 m from the spot, 147 degrees across it. Parked; no tug.

@@ -1561,17 +1561,63 @@ fn stand_down(voice: &Option<Voice>, line: &str, reason: &str) {
     alert(voice, Priority::Caution, line);
 }
 
-/// Share the circuit's turn reversal law, preserving the slew anchor on failure.
-async fn steer_heading(
-    xp: &dyn crate::xplane::XPlane,
-    bug: &mut f64,
-    target: f64,
-    heading: f64,
-    bank: f64,
-) {
-    let next = crate::circuit::bug_toward(*bug, target, heading, bank, 40.0);
-    if xp.set_float(HDG_BUG, next).await.is_ok() {
-        *bug = next;
+/// How the follower handles the heading bug: the way a pilot does. It was
+/// rewritten every tick (bearing to the fix plus a live crab, stepped 25
+/// degrees ahead of the nose through every turn), and the pilot watched it
+/// twitch for the whole flight (LIPR 2026-09-26): "if we want to go a certain
+/// heading, just set the heading". So: a leg's heading is SET once, a whole
+/// degree, wind correction included; it is touched again only when the
+/// track has drifted enough to need it, wings level, not more than twice a
+/// minute; and a new heading on the far side of a turn still in progress
+/// waits for the wings to come level (the autopilot turns the short way
+/// from where the nose is, and a bug set against the bank went round the
+/// long way, LXGB 2026-09-14).
+#[derive(Debug, Default)]
+pub struct HeadingHold {
+    leg: Option<usize>,
+    set: Option<f64>,
+    last_write_s: f64,
+}
+
+/// A correction smaller than this is not worth reaching for the knob.
+const BUG_CORRECT_DEG: f64 = 5.0;
+/// And not more often than this.
+const BUG_CORRECT_EVERY_S: f64 = 30.0;
+/// Wings this level count as level for a correction.
+const BUG_LEVEL_BANK_DEG: f64 = 5.0;
+/// Banked past this the other way, a new heading waits for the roll-out.
+const BUG_WAIT_BANK_DEG: f64 = 10.0;
+
+impl HeadingHold {
+    /// The heading to set now, or `None` to leave the knob alone. Pure.
+    pub fn decide(&mut self, leg: usize, want_mag: f64, heading_mag: f64, bank_deg: f64, now_s: f64) -> Option<f64> {
+        let want = want_mag.round().rem_euclid(360.0);
+        let diff = |a: f64, b: f64| ((a - b + 540.0).rem_euclid(360.0)) - 180.0;
+        let turn = diff(want, heading_mag);
+        let against_bank = bank_deg.abs() > BUG_WAIT_BANK_DEG
+            && turn.abs() > 10.0
+            && (turn > 0.0) != (bank_deg > 0.0);
+        let write = if self.leg != Some(leg) || self.set.is_none() {
+            !against_bank
+        } else {
+            let off = diff(want, self.set.unwrap_or(want)).abs();
+            off >= BUG_CORRECT_DEG
+                && bank_deg.abs() < BUG_LEVEL_BANK_DEG
+                && now_s - self.last_write_s >= BUG_CORRECT_EVERY_S
+        };
+        if !write {
+            return None;
+        }
+        self.leg = Some(leg);
+        self.set = Some(want);
+        self.last_write_s = now_s;
+        Some(want)
+    }
+
+    /// Forget the leg, so the next tick sets its heading afresh (a rejoin).
+    pub fn reset(&mut self) {
+        self.leg = None;
+        self.set = None;
     }
 }
 
@@ -1633,6 +1679,8 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, plan: Pla
         return;
     };
     let mut bug_mag = true_to_mag(psi_seed, mag_var);
+    let mut heading_hold = HeadingHold::default();
+    let started = std::time::Instant::now();
     if !set_confirmed("procedure", &xp, HDG_BUG, bug_mag, &mut None, 0.0).await {
         stand_down(
             &voice,
@@ -2044,6 +2092,7 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, plan: Pla
                 if xp.set_float(HDG_BUG, heading).await.is_ok() {
                     bug_mag = heading;
                 }
+                heading_hold.reset();
                 if stalls < 3 {
                     alert(
                         &voice,
@@ -2062,7 +2111,18 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, plan: Pla
             }
         }
         if let Some(t) = target_mag {
-            steer_heading(&xp, &mut bug_mag, t, true_to_mag(psi, mag_var), phi).await;
+            let now_s = started.elapsed().as_secs_f64();
+            if let Some(h) = heading_hold.decide(idx, t, true_to_mag(psi, mag_var), phi, now_s) {
+                if xp.set_float(HDG_BUG, h).await.is_ok() {
+                    bug_mag = h;
+                    crate::blackbox::record(
+                        "procedure",
+                        serde_json::json!({"event": "heading_set", "idx": idx, "hdg": h, "crab": crab}),
+                    );
+                } else {
+                    heading_hold.reset();
+                }
+            }
         }
         // The lateral mode must actually be ON for the bug to mean anything —
         // the circuit's guard, which this follower LACKED: an AP disconnect
@@ -2792,23 +2852,32 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn follower_rolls_out_before_reversing_and_preserves_failed_slew_anchor() {
-        let io = DialIo {
-            value: std::sync::Mutex::new(302.4),
-            writes: std::sync::atomic::AtomicUsize::new(0),
-            failure: std::sync::atomic::AtomicUsize::new(0),
-        };
-        let mut bug = 302.4;
-        steer_heading(&io, &mut bug, 276.5, 300.5, 4.3).await;
-        assert!((bug - 300.5).abs() < 0.01);
-        assert!((*io.value.lock().unwrap() - 300.5).abs() < 0.01);
-        io.failure.store(1, Ordering::SeqCst);
-        steer_heading(&io, &mut bug, 276.5, 300.5, 2.0).await;
-        assert!((bug - 300.5).abs() < 0.01);
-        io.failure.store(0, Ordering::SeqCst);
-        steer_heading(&io, &mut bug, 276.5, 300.5, 2.0).await;
-        assert!((bug - 276.5).abs() < 0.01);
+    /// LIPR 2026-09-26: set the heading, leave it. One write per leg, a
+    /// whole degree; small drift and a banked aircraft leave the knob alone.
+    #[test]
+    fn the_heading_is_set_once_per_leg_like_a_pilot_sets_it() {
+        let mut h = HeadingHold::default();
+        assert_eq!(h.decide(0, 127.4, 125.0, 0.0, 0.0), Some(127.0), "a new leg: set, whole degrees");
+        for t in 1..60 {
+            let wobble = 127.0 + (t as f64 * 0.7).sin() * 2.5;
+            assert_eq!(h.decide(0, wobble, 127.0, 1.0, t as f64), None, "under 5 degrees: leave it");
+        }
+        assert_eq!(h.decide(0, 134.0, 127.0, 8.0, 70.0), None, "a correction waits for level wings");
+        assert_eq!(h.decide(0, 134.0, 127.0, 1.0, 71.0), Some(134.0), "drifted 7, level: correct");
+        assert_eq!(h.decide(0, 141.0, 134.0, 1.0, 80.0), None, "not twice inside 30 s");
+        assert_eq!(h.decide(1, 250.0, 130.0, 0.0, 81.0), Some(250.0), "the next leg: set at once");
+    }
+
+    #[test]
+    fn a_new_heading_against_the_bank_waits_for_the_roll_out() {
+        let mut h = HeadingHold::default();
+        // Banked 20 right, the new leg is 60 left: setting it now would send
+        // the autopilot round the long way.
+        assert_eq!(h.decide(3, 240.0, 300.0, 20.0, 0.0), None);
+        assert_eq!(h.decide(3, 240.0, 305.0, 2.0, 5.0), Some(240.0), "level: set");
+        // With the bank, it goes in at once.
+        let mut h = HeadingHold::default();
+        assert_eq!(h.decide(3, 340.0, 300.0, 20.0, 0.0), Some(340.0));
     }
 
     #[tokio::test]
