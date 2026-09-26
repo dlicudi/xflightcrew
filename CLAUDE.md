@@ -1612,8 +1612,16 @@ testing): every mission is a sortie (`full_auto::SortieGuard`, blackbox
 `logs/sorties/<id>.jsonl`); [src/scorecard.rs](src/scorecard.rs) turns the
 ticks into `stage_result` (taxi, line_up, alignment, takeoff, landing: a
 number and a limit each) and a `sortie_result` (PASS only with no failed
-stage, no give-up and no `intervention`), live through a blackbox tap and
-in `xvl debrief`. `state` carries the hands and levers (`in`: throttle,
+stage, no give-up and UNATTENDED: no `intervention` and no `tool` record,
+the pilot's command to the crew), live through a blackbox tap and
+in `xvl debrief`, grouped by mission (stand-alone stages labelled).
+**A verdict that is wrong hides the real failures** (2026-09-26): the
+crew's own flare and rotation read back through the yoke are not a hand
+(`monitor::note_crew_yoke`, the scorer discounts the same window in old
+logs); a taxi is judged from the first tick ON its line after a join and
+never past its planned stop, and a drive that stops short (`stagnant`,
+`off_route`, a give-up) fails. `bench/sorties/` holds trimmed real sorties
+whose verdicts `cargo test` pins. `state` carries the hands and levers (`in`: throttle,
 beta, brakes, yoke, AP, wind, sim speed, torque, the plugin's yield
 latches) and `ctl`; every spoken line is `said`. The main file rotates past
 200 MB. A complaint that is not yet a scorecard number is not yet testable. **Run tests with `XCOPILOT_BLACKBOX=off`**: any test
