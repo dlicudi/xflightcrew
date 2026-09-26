@@ -1301,7 +1301,7 @@ pub fn run_autoland_scoped(
                         Some(MissedStage::Climb) => false,
                         None if steep => false,
                         None => {
-                            raw.phase != ApproachPhase::Flare
+                            let needed = raw.phase != ApproachPhase::Flare
                                 && radio_ft >= TERRAIN_FLOOR_AGL_FT
                                 && crate::reversal::needed(
                                     &rwy,
@@ -1310,7 +1310,30 @@ pub fn run_autoland_scoped(
                                     track_true,
                                     aim_along_nm,
                                     raw.phase == ApproachPhase::Final,
-                                )
+                                );
+                            // Inside the FAP and pointing down the runway, a
+                            // pattern is not the answer to "too high": a crew
+                            // GOES AROUND, straight ahead, and the latch's own
+                            // reposition follows the climb. Armed at 2.6 nm
+                            // 800 ft high, the 737 turned straight onto a
+                            // downwind from 1,600 ft at LEMG 13 (2026-09-26).
+                            if needed
+                                && late_go_around(along_nm, heading_diff(track_true, rwy.course_deg))
+                                && go_around.order(on_ground > 0.5)
+                            {
+                                crate::blackbox::record(
+                                    "autoland",
+                                    serde_json::json!({"event": "late_go_around", "dist": raw.dist_nm,
+                                        "radio": radio_ft, "above_path_ft": alt - raw.glidepath_alt_ft}),
+                                );
+                                announce(
+                                    "Too high to land from here. Going around.".to_string(),
+                                    Priority::Caution,
+                                );
+                                false
+                            } else {
+                                needed
+                            }
                         }
                     };
                     if wanted && steep {
@@ -3398,6 +3421,16 @@ fn roundout_reaches_pavement(along_nm: f64, radio_alt_ft: f64, gs_kts: f64) -> b
 /// touching down there is how the LXGB 09 rollout ended in wreckage
 /// (2026-07-22). A balked landing straight ahead is always the better trade.
 const FLARE_MAX_XTK_NM: f64 = 0.02;
+
+/// Inside the FAP and within this of the runway's course, an approach that
+/// needs repositioning goes around first instead of turning at once.
+const LATE_GO_AROUND_TRACK_DEG: f64 = 45.0;
+
+/// Is a reposition this late a go-around? `along_nm` is the distance still
+/// to the threshold along the approach (positive short of it). Pure.
+pub fn late_go_around(along_nm: f64, track_off_deg: f64) -> bool {
+    along_nm > 0.0 && along_nm < FAP_NM && track_off_deg.abs() < LATE_GO_AROUND_TRACK_DEG
+}
 
 /// Flap setting for the approach: half inside 6 nm, full inside 3 nm — but full
 /// only once established ON the glidepath. While holding level BELOW the path
@@ -5614,6 +5647,17 @@ mod tests {
 
     /// EGTE 2026-09-21: handed back at 152 kt with half flap and a flat 0.75
     /// lever; 346 kt followed.
+    /// LEMG 13 (2026-09-26): armed at 2.6 nm, 800 ft high, lined up: a
+    /// go-around, not a turn onto the downwind. Far out or pointing the
+    /// wrong way, the pattern stands.
+    #[test]
+    fn a_late_high_approach_goes_around_before_it_repositions() {
+        assert!(super::late_go_around(2.6, 7.0));
+        assert!(!super::late_go_around(2.6, 120.0), "pointing away: the pattern");
+        assert!(!super::late_go_around(super::FAP_NM + 2.0, 5.0), "outside the FAP: the pattern");
+        assert!(!super::late_go_around(-0.5, 5.0), "past the threshold");
+    }
+
     #[test]
     fn a_give_up_hands_back_a_speed_the_configuration_allows() {
         let limits = [
