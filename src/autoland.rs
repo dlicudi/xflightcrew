@@ -919,6 +919,8 @@ pub fn run_autoland_scoped(
             // pilot has taken the roll for this approach.
             let mut arrest_hands = false;
             let mut wings = crate::autotakeoff::WingsLevel::default();
+            let mut arrest_rate = crate::autotakeoff::XtkRate::default();
+            let mut arrest_prev_xtk: Option<f64> = None;
             let mut roll_yielded = false;
             let mut last_arresting = false;
             // Airspeed history for the throttle governor's derivative term — the
@@ -1836,10 +1838,29 @@ pub fn run_autoland_scoped(
                 // The wings while the arrest has the servos: a shallow bank
                 // toward the crabbed heading, wings level with no heading
                 // read. No bank read is no command (the channel expires).
+                // Over the runway with the servos out, the heading is the
+                // CENTRELINE's (the takeoff and rollout law: sized for a
+                // closure time, the drift rate smoothed), plus the wind's
+                // crab. The approach's pursuit aims far down the runway: the
+                // 737 went from 9 m right at 55 ft to 16 m left at the
+                // wheels, crossing at 4 m/s (LEMG 13, 2026-09-26).
+                let xtk_m_now = xtk_now * M_PER_NM;
+                let arrest_rate_now = arrest_rate.update(
+                    arrest_prev_xtk.map_or(0.0, |p: f64| (xtk_m_now - p) / tick_dt.max(0.05)),
+                    tick_dt.max(0.05),
+                );
+                arrest_prev_xtk = Some(xtk_m_now);
+                let arrest_heading = (crate::autotakeoff::roll_target_heading(
+                    rwy.course_deg,
+                    xtk_m_now,
+                    arrest_rate_now,
+                    gs_kts,
+                ) + crab)
+                    .rem_euclid(360.0);
                 let flare_ail = match (arrest_hands, phi_r.as_ref().ok().copied(), roll_yielded) {
                     (true, Some(phi), false) => {
                         let hdg_err = psi_r.as_ref().ok().map_or(0.0, |psi| {
-                            ((crabbed_true - psi + 540.0).rem_euclid(360.0)) - 180.0
+                            ((arrest_heading - psi + 540.0).rem_euclid(360.0)) - 180.0
                         });
                         Some(wings.step(phi, crate::autotakeoff::climb_bank_target(hdg_err), tick_dt))
                     }
