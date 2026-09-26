@@ -175,6 +175,8 @@ pub const ROTORCRAFT_WITHHELD: &[&str] = &[
     "line_up",
     "pushback",
     "reverse_thrust",
+    // A new flight on a runway final is landed by autoland.
+    "setup_approach",
 ];
 
 impl Registry {
@@ -225,6 +227,10 @@ impl Registry {
             )));
         }
 
+        // What autoland flies with, for the new flight on a final
+        // (`setup_approach`): set with the autoland below, `None` without an
+        // autopilot (the new flight is then the pilot's).
+        let mut approach_land: Option<(autopilot::ApConfig, f64)> = None;
         if profile.autopilot {
             // Per-airframe engagement prerequisites (FD switch, AC power) — the C90
             // needs them; the GA singles leave this default (plain servos-on).
@@ -270,6 +276,7 @@ impl Registry {
                 approach_ias,
                 prop: profile.prop.clone(),
             }));
+            approach_land = Some((ap.clone(), approach_ias));
             // Auto takeoff — the departure sibling: the roll steers through
             // the plugin's channel, the climb-out rides this same AP. Speeds
             // from the airframe's reference figures, conservative fallbacks
@@ -695,6 +702,7 @@ impl Registry {
         // aircraft has tanks and a payload.
         tools.push(Box::new(loading::LoadAircraft));
         tools.push(Box::new(setup::SetUpFlight));
+        tools.push(Box::new(setup::SetUpApproach { land: approach_land }));
 
         // Reminders ("wake me at top of descent", "tell me at the next waypoint") are
         // crew memory, not an airframe system, so available on any aircraft.
