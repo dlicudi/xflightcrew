@@ -2980,6 +2980,16 @@ pub fn on_active_runway_facing(lat: f64, lon: f64, heading_true: Option<f64>) ->
     })
 }
 
+/// [`on_active_runway`] with "unknown" kept apart from "no": `None` when no
+/// field's runways are published (no station yet), never a guessed `false`.
+pub fn on_active_runway_known(lat: f64, lon: f64) -> Option<bool> {
+    let runways = ACTIVE_RUNWAYS.lock().unwrap_or_else(|e| e.into_inner());
+    if runways.is_empty() {
+        return None;
+    }
+    Some(runways.iter().any(|r| on_runway(r, lat, lon).is_some()))
+}
+
 /// Is this position ON one strip? The shared segment test behind
 /// [`on_active_runway`] and the per-runway traffic watches. Returns the
 /// spoken-able ident of the nearer end.

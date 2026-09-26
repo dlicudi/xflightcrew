@@ -1909,11 +1909,14 @@ async fn drive(xp: XPlaneClient, voice: Option<Voice>, route: Route, base_kts: f
                 crate::blackbox::record("autotaxi", serde_json::json!({"event": "tug_hold"}));
                 speedhold::set_taxi_target(0.0);
                 last_sched = 0.0;
-                alert(
-                    &voice,
-                    Priority::Advisory,
-                    "The tug's still on the nose. Holding until it lets go.",
-                );
+                // Once per tug: the push may have just said it.
+                if !crate::pushback::take_tug_warned() {
+                    alert(
+                        &voice,
+                        Priority::Advisory,
+                        "The tug's still on the nose. Holding until it lets go.",
+                    );
+                }
             }
             if t0.elapsed().as_secs_f64() > TUG_WAIT_SECS {
                 tracing::warn!("auto taxi: the tug never let go, standing down");

@@ -12,7 +12,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use super::{Tool, ToolCtx};
-use crate::aircraft::ElectricalSystem;
+use crate::aircraft::{ElectricalSystem, ToggleSwitch};
 
 pub struct SetElectrical {
     systems: Vec<ElectricalSystem>,
@@ -88,6 +88,17 @@ impl SetElectrical {
 
     /// Fire a system's commands and read its state back.
     async fn switch(&self, sys: &ElectricalSystem, on: bool, ctx: &ToolCtx<'_>) -> Result<String> {
+        // A guarded switch going OFF: open its guard first, and wait for the
+        // guard to READ open, because the aircraft's own logic holds the
+        // switch on for as long as the guard reads shut.
+        let mut guard_stuck = false;
+        if !on {
+            for g in &sys.guards {
+                if !self.move_guard(g, true, ctx).await? {
+                    guard_stuck = true;
+                }
+            }
+        }
         let cmds = if on {
             &sys.on_commands
         } else {
@@ -111,6 +122,18 @@ impl SetElectrical {
         for d in &sys.write_datarefs {
             ctx.xplane.set_int(d, i64::from(on)).await?;
         }
+        if on {
+            // Guard back down over a switch that is on: the crew's habit, and
+            // on the 737 what holds the battery on.
+            for g in &sys.guards {
+                self.move_guard(g, false, ctx).await?;
+            }
+        }
+        if !sys.guards.is_empty() {
+            // Give the aircraft's per-frame logic a few frames to undo the
+            // switch if it is going to, so the readback sees what stays.
+            tokio::time::sleep(std::time::Duration::from_millis(GUARD_SETTLE_MS)).await;
+        }
         // Confirm from the readback datarefs, AGAINST THE INTENT. Reporting
         // whatever came back answered "Roger, avionics master on" to "avionics
         // off" when the command silently failed — the readback confirming
@@ -127,7 +150,7 @@ impl SetElectrical {
         } else if states.iter().all(|&s| s == on) {
             format!("Roger, {} {}.", sys.spoken, if on { "on" } else { "off" })
         } else if states.iter().all(|&s| s != on) {
-            format!("The {} didn't move.", sys.spoken)
+            stuck_line(&sys.spoken, guard_stuck)
         } else {
             // Mixed — report rather than lie. (e.g. one of a pair didn't move.)
             let on_n = states.iter().filter(|&&s| s).count();
@@ -138,6 +161,53 @@ impl SetElectrical {
                 states.len()
             )
         })
+    }
+
+    /// Put one guard cover open (`open`) or shut, read first and toggled only
+    /// on a difference, then read until it agrees (bounded). `Ok(true)` when
+    /// it reads as wanted. A failed read is no measurement: the toggle is
+    /// never fired blind (it could shut an open guard), and the switch's own
+    /// readback then says what happened.
+    async fn move_guard(&self, g: &ToggleSwitch, open: bool, ctx: &ToolCtx<'_>) -> Result<bool> {
+        match Self::read(ctx, &g.dataref).await {
+            None => return Ok(false),
+            Some(pos) if guard_is_open(pos) == open => return Ok(true),
+            Some(_) => ctx.xplane.run_command(&g.command).await?,
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(GUARD_WAIT_MS);
+        loop {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            if let Some(pos) = Self::read(ctx, &g.dataref).await {
+                if guard_is_open(pos) == open {
+                    return Ok(true);
+                }
+            }
+            if std::time::Instant::now() >= deadline {
+                return Ok(false);
+            }
+        }
+    }
+}
+
+/// How long a guard gets to swing (the 737's covers animate at 20 a second,
+/// about 50 ms end to end; the rest is Web API round trips).
+const GUARD_WAIT_MS: u64 = 1_500;
+/// Frames for the aircraft's own logic to re-assert a guarded switch before
+/// the readback.
+const GUARD_SETTLE_MS: u64 = 300;
+
+/// The 737's own test (`B738_guard_cover_logic`): a cover under 0.5 is shut.
+fn guard_is_open(pos: f64) -> bool {
+    pos >= 0.5
+}
+
+/// A switch that did not move, said honestly, naming the guard when that is
+/// what held it.
+fn stuck_line(spoken: &str, guard_stuck: bool) -> String {
+    if guard_stuck {
+        format!("The {spoken} didn't move; its guard stayed shut.")
+    } else {
+        format!("The {spoken} didn't move.")
     }
 }
 
@@ -226,6 +296,7 @@ mod tests {
         ElectricalSystem {
             write_datarefs: vec![],
             toggles: vec![],
+            guards: vec![],
             key: key.into(),
             spoken: key.into(),
             on_commands: vec![],
@@ -255,5 +326,172 @@ mod tests {
         assert_eq!(single.find_system("battery1").unwrap().key, "battery");
         assert_eq!(single.find_system("alternator").unwrap().key, "alternator");
         assert!(single.find_system("inverter").is_none());
+    }
+
+    /// The stock 737's battery as its xlua keeps it: `B738_guard_cover_logic`
+    /// sets `battery_on[0]` to 1 every frame while `guard_cover_pos[0]` reads
+    /// under 0.5, `battery_1_off` is replaced by a handler that sets it to 0,
+    /// and `laminar/B738/guard_cover00` toggles the cover.
+    struct B738Battery {
+        guard: std::sync::Mutex<f64>,
+        switch: std::sync::Mutex<f64>,
+        commands: std::sync::Mutex<Vec<String>>,
+    }
+
+    const GUARD_CMD: &str = "laminar/B738/guard_cover00";
+    const GUARD_POS: &str = "laminar/B738/button_switch/guard_cover_pos";
+    const BATTERY_ON: &str = "sim/cockpit/electrical/battery_on";
+
+    impl B738Battery {
+        /// At the stand after the flight: guard shut, battery on.
+        fn at_the_stand() -> Self {
+            Self {
+                guard: std::sync::Mutex::new(0.0),
+                switch: std::sync::Mutex::new(1.0),
+                commands: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+        fn battery(&self) -> f64 {
+            if *self.guard.lock().unwrap() < 0.5 {
+                1.0
+            } else {
+                *self.switch.lock().unwrap()
+            }
+        }
+    }
+
+    #[async_trait]
+    impl crate::xplane::XPlane for B738Battery {
+        async fn get_float(&self, name: &str) -> Result<f64> {
+            match name {
+                BATTERY_ON => Ok(self.battery()),
+                _ => Err(anyhow::anyhow!("no read for {name}")),
+            }
+        }
+        async fn set_float(&self, _: &str, _: f64) -> Result<()> {
+            Ok(())
+        }
+        async fn set_int(&self, _: &str, _: i64) -> Result<()> {
+            Ok(())
+        }
+        async fn run_command(&self, name: &str) -> Result<()> {
+            self.commands.lock().unwrap().push(name.to_string());
+            match name {
+                GUARD_CMD => {
+                    let mut g = self.guard.lock().unwrap();
+                    *g = if *g < 0.5 { 1.0 } else { 0.0 };
+                }
+                "sim/electrical/battery_1_off" => *self.switch.lock().unwrap() = 0.0,
+                "sim/electrical/battery_1_on" => *self.switch.lock().unwrap() = 1.0,
+                _ => {}
+            }
+            Ok(())
+        }
+        async fn run_command_for(&self, name: &str, _: f64) -> Result<()> {
+            self.run_command(name).await
+        }
+        async fn get_float_array(&self, name: &str) -> Result<Vec<f64>> {
+            match name {
+                GUARD_POS => Ok(vec![*self.guard.lock().unwrap(), 0.0]),
+                _ => Err(anyhow::anyhow!("no read for {name}")),
+            }
+        }
+        async fn set_int_array_elem(&self, _: &str, _: usize, _: i64) -> Result<()> {
+            Ok(())
+        }
+        async fn set_float_array_elem(&self, _: &str, _: usize, _: f64) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    fn b738_battery() -> ElectricalSystem {
+        crate::aircraft::load("boeing_737_800")
+            .expect("737 profile loads")
+            .electrical
+            .into_iter()
+            .find(|s| s.key == "battery")
+            .expect("the 737 has a battery")
+    }
+
+    fn ctx<'a>(xp: &'a B738Battery, cfg: &'a crate::config::Config) -> ToolCtx<'a> {
+        ToolCtx {
+            xplane: xp,
+            config: cfg,
+            voice: None,
+            status: None,
+            reminders: None,
+        }
+    }
+
+    /// 17:07Z 2026-09-26: "All electrical systems off, except: The battery
+    /// didn't move." The profile without its guard reproduces the line; with
+    /// the guard it opens the cover first and the battery goes off.
+    #[tokio::test(start_paused = true)]
+    async fn the_737_battery_goes_off_through_its_guard() {
+        let cfg = crate::config::Config::default();
+        let mut unguarded = b738_battery();
+        unguarded.guards.clear();
+        let xp = B738Battery::at_the_stand();
+        let line = SetElectrical::new(vec![unguarded])
+            .execute(&json!({"system": "battery", "on": false}), &ctx(&xp, &cfg))
+            .await
+            .unwrap();
+        assert_eq!(line, "The battery didn't move.", "the recorded failure");
+
+        let xp = B738Battery::at_the_stand();
+        let line = SetElectrical::new(vec![b738_battery()])
+            .execute(&json!({"system": "all", "on": false}), &ctx(&xp, &cfg))
+            .await
+            .unwrap();
+        assert_eq!(line, "Roger, all electrical systems off.");
+        assert_eq!(xp.battery(), 0.0);
+        let cmds = xp.commands.lock().unwrap().clone();
+        assert_eq!(
+            cmds,
+            vec![GUARD_CMD, "sim/electrical/battery_1_off"],
+            "guard FIRST"
+        );
+
+        // Back on: the switch, then the guard shut over it.
+        let line = SetElectrical::new(vec![b738_battery()])
+            .execute(&json!({"system": "battery", "on": true}), &ctx(&xp, &cfg))
+            .await
+            .unwrap();
+        assert_eq!(line, "Roger, battery on.");
+        assert!(*xp.guard.lock().unwrap() < 0.5, "guard closed again");
+    }
+
+    /// Cold and dark the guard is already open: it is never toggled shut by a
+    /// blind press on the way off.
+    #[tokio::test(start_paused = true)]
+    async fn an_open_guard_is_left_open() {
+        let cfg = crate::config::Config::default();
+        let xp = B738Battery::at_the_stand();
+        *xp.guard.lock().unwrap() = 1.0;
+        let line = SetElectrical::new(vec![b738_battery()])
+            .execute(&json!({"system": "battery", "on": false}), &ctx(&xp, &cfg))
+            .await
+            .unwrap();
+        assert_eq!(line, "Roger, battery off.");
+        assert!(!xp.commands.lock().unwrap().iter().any(|c| c == GUARD_CMD));
+    }
+
+    /// A guard whose position cannot be read is not pressed blind, and the
+    /// switch that stays on is said, naming the guard.
+    #[tokio::test(start_paused = true)]
+    async fn a_guard_that_will_not_open_is_named() {
+        let cfg = crate::config::Config::default();
+        let xp = B738Battery::at_the_stand();
+        let mut sys = b738_battery();
+        sys.guards[0].dataref = "laminar/B738/nowhere[0]".into();
+        let line = SetElectrical::new(vec![sys])
+            .execute(&json!({"system": "all", "on": false}), &ctx(&xp, &cfg))
+            .await
+            .unwrap();
+        assert_eq!(
+            line,
+            "All electrical systems off, except: The battery didn't move; its guard stayed shut."
+        );
+        assert!(!xp.commands.lock().unwrap().iter().any(|c| c == GUARD_CMD));
     }
 }

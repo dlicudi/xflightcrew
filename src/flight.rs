@@ -2396,4 +2396,43 @@ mod tests {
         refused.extend_from_slice(r.flight.refused());
         assert!(refused.is_empty(), "illegal edges: {refused:?}");
     }
+
+    /// LEMG 13, 2026-09-26 (sortie 1790441293): full auto lined up, stopped
+    /// on the runway, and the takeoff rolled. The `state` records' ground
+    /// speed from the taxi's last metres to past the roll speed. The live
+    /// monitor never fed `on_runway`, so the model read the stop as
+    /// "Holding" and the roll as "TaxiOut" for 11 s, and the duty engine
+    /// asked for a line-up and then a taxi under the running takeoff. With
+    /// the runway fed the same ticks read LinedUp, then the roll.
+    #[test]
+    fn a_lined_up_stop_and_its_roll_with_the_runway_fed() {
+        let gs = [
+            (-24.5, 9.8), (-23.2, 10.6), (-21.8, 11.2), (-20.3, 11.0), (-18.9, 11.0),
+            (-17.5, 10.1), (-16.1, 9.7), (-14.8, 8.9), (-13.4, 7.0), (-12.1, 6.6),
+            (-10.8, 2.6), (-9.4, 2.5), (-8.1, 1.6), (-6.7, 1.5), (-5.3, 0.1),
+            (-3.9, 0.0), (-2.5, 0.0), (-1.2, 0.0), (0.2, 0.0), (1.7, 0.0),
+            (3.0, 0.0), (4.4, 0.2), (5.7, 1.2), (7.0, 4.5), (8.5, 10.5),
+            (9.8, 19.2), (11.1, 27.7), (12.4, 35.6), (13.7, 44.1), (14.9, 54.2),
+            (16.2, 64.0), (17.5, 74.0),
+        ];
+        let run = |runway: Option<bool>| {
+            // Taxiing out from the start, then the recorded ticks. The last
+            // 20 m of the taxi were the line-up leg, on the runway.
+            let mut v: Vec<Sample> = (0..30)
+                .map(|i| Sample { on_runway: Some(false), ..ground(-60.0 + i as f64, 10.0, true) })
+                .collect();
+            v.extend(gs.iter().map(|&(t, g)| Sample { on_runway: runway, ..ground(t, g, true) }));
+            phases(v).0
+        };
+        let blind = run(None);
+        assert!(
+            blind.ends_with(&[Phase::Holding, Phase::TaxiOut, Phase::TakeoffRoll]),
+            "the recorded failure: {blind:?}"
+        );
+        let fed = run(Some(true));
+        assert!(
+            fed.ends_with(&[Phase::TaxiOut, Phase::LinedUp, Phase::TakeoffRoll]),
+            "{fed:?}"
+        );
+    }
 }

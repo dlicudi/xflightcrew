@@ -1675,6 +1675,16 @@ pub struct ElectricalSystem {
     /// this is the only way to switch it.
     #[serde(default)]
     pub toggles: Vec<ToggleSwitch>,
+    /// Guard covers over this system's switch, each a TOGGLE command and the
+    /// dataref that reads its position (0 closed, 1 open). A guarded switch
+    /// is held ON by its closed guard: the stock 737's xlua forces
+    /// `battery_on[0]` to 1 every frame while `guard_cover_pos[0]` is under
+    /// 0.5, so `battery_1_off` with the guard shut is undone the next frame
+    /// and the mission's shutdown said "The battery didn't move" (17:07Z,
+    /// 2026-09-26). Switching OFF opens each guard first and waits for it to
+    /// read open; switching ON closes it after the switch, as a crew does.
+    #[serde(default)]
+    pub guards: Vec<ToggleSwitch>,
     #[serde(default)]
     pub readback: Vec<String>,
 }
@@ -4262,6 +4272,7 @@ fn cessna_172sp() -> AircraftProfile {
                 ElectricalSystem {
                     write_datarefs: Vec::new(),
                     toggles: Vec::new(),
+                    guards: Vec::new(),
                     key: key.into(),
                     spoken: spoken.into(),
                     on_commands: on.iter().map(|s| s.to_string()).collect(),
@@ -4591,6 +4602,7 @@ fn cirrus_sr22() -> AircraftProfile {
                 ElectricalSystem {
                     write_datarefs: Vec::new(),
                     toggles: Vec::new(),
+                    guards: Vec::new(),
                     key: key.into(),
                     spoken: spoken.into(),
                     on_commands: on.iter().map(|s| s.to_string()).collect(),

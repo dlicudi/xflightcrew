@@ -902,6 +902,7 @@ mod power_cmd_tests {
         ElectricalSystem {
             write_datarefs: vec![],
             toggles: vec![],
+            guards: vec![],
             key: key.into(),
             spoken: key.into(),
             on_commands: on.iter().map(|s| s.to_string()).collect(),

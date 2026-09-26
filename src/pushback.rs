@@ -149,8 +149,16 @@ const STALL_SECS: f64 = 12.0;
 /// Whole-push timeout: something is wrong (a tug pushing us nowhere, a stuck
 /// dataref) and the sequence must not sit at the gate forever.
 const MAX_SECS: f64 = 300.0;
-/// How long to wait for the tug to unhook and clear before taxiing.
+/// How long to wait for the tug to unhook and clear before taxiing, counted
+/// from the last moment the tug MOVED the aircraft, not from our "stop": a
+/// tug mid-swing finishes its pattern whatever it is told. At 13:39Z
+/// 2026-09-26 the push loop stopped at 60.9 m with the nose at 204, the tug
+/// swung it on to 262 over the next 31 s, stood still, and let go 3 s
+/// later; a wait counted from the stop had timed out 4 s before that and
+/// said "the tug's still showing connected".
 const TUG_CLEAR_SECS: f64 = 30.0;
+/// The whole tug wait, however long the tug keeps moving us.
+const TUG_CLEAR_MAX_SECS: f64 = 120.0;
 /// The nose turning by this much over `SWING_WINDOW_S` is the tug SWINGING
 /// us: a manoeuvre in progress, which no distance test may cut short. A
 /// Nose 90 at LXGB stand 1 ran 45 m straight before it began to turn, so
@@ -452,6 +460,78 @@ pub fn on_a_stand(stand: Option<(f64, f64)>, psi: f64, known: bool) -> bool {
 /// unsecured (2026-09-24). A field with no stand rows counts as parked.
 pub fn parked_at_stand(stand: Option<(f64, f64)>, known: bool) -> bool {
     !known || stand.is_some_and(|(dist_m, _)| dist_m <= STAND_M)
+}
+
+/// Where the wait for the tug to let go stands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TugWait {
+    /// Off the bar: the parking brake may go on.
+    Clear,
+    Waiting,
+    /// Still on the bar at the deadline.
+    TimedOut,
+}
+
+/// The wait for the tug to unhook, pure over (time, reads) so the recorded
+/// push replays through it. The deadline runs from the last moment the nose
+/// was still being swung (`SWING_DEG` over `SWING_WINDOW_S`, the push loop's
+/// own swing test), capped at `TUG_CLEAR_MAX_SECS` from the start. A failed
+/// read of the bar is no measurement, never "clear": the old wait read a
+/// failure as 0.0, off the bar. `tow_in_progress` is dead on this sim (see
+/// [`TOW_IN_PROGRESS`]) and only blocks when it actually reads on.
+#[derive(Debug, Clone)]
+pub struct TugClearWatch {
+    began: f64,
+    last_moved: f64,
+    hdg_hist: std::collections::VecDeque<(f64, f64)>,
+}
+
+impl TugClearWatch {
+    pub fn new(t: f64) -> Self {
+        Self {
+            began: t,
+            last_moved: t,
+            hdg_hist: Default::default(),
+        }
+    }
+
+    /// Is the tug still turning us? The rate over the last window.
+    pub fn swinging(&self) -> bool {
+        match (self.hdg_hist.front(), self.hdg_hist.back()) {
+            (Some(&(t0, h0)), Some(&(t1, h1))) if t1 - t0 >= 0.5 * SWING_WINDOW_S => {
+                angle_diff_deg(h1, h0).abs() / (t1 - t0) >= SWING_DEG / SWING_WINDOW_S
+            }
+            _ => false,
+        }
+    }
+
+    pub fn step(
+        &mut self,
+        t: f64,
+        attached: Option<f64>,
+        tow: Option<f64>,
+        hdg: Option<f64>,
+    ) -> TugWait {
+        if let Some(h) = hdg {
+            self.hdg_hist.push_back((t, h));
+            // Keep one sample at or beyond the window so the rate always
+            // spans it (the poll is 0.5 s, the recorded states 1.3 s).
+            while self.hdg_hist.len() > 2 && t - self.hdg_hist[1].0 >= SWING_WINDOW_S {
+                self.hdg_hist.pop_front();
+            }
+            if self.swinging() {
+                self.last_moved = t;
+            }
+        }
+        let off_bar = attached.is_some_and(|a| a <= 0.5) && !tow.is_some_and(|w| w > 0.5);
+        if off_bar {
+            TugWait::Clear
+        } else if t - self.last_moved >= TUG_CLEAR_SECS || t - self.began >= TUG_CLEAR_MAX_SECS {
+            TugWait::TimedOut
+        } else {
+            TugWait::Waiting
+        }
+    }
 }
 
 /// Smallest signed angle a−b, degrees, in −180..180.
@@ -1116,33 +1196,41 @@ async fn run_inner(
     // the bar, and every one was released 5 to 10 s after the taxi drive let
     // the handle off (LIPK 2026-09-26 among them). The toe channel is an
     // expiring heartbeat, so it is written every poll.
-    let cleared = wait_for(TUG_CLEAR_SECS, abort, || async {
-        let _ = xp.set_float(TAXI_BRAKE, HOLD_BRAKE).await;
-        let (att, tow) = tokio::join!(xp.get_float(PUSH_ATTACHED), xp.get_float(TOW_IN_PROGRESS));
-        att.unwrap_or(0.0) <= 0.5 && tow.unwrap_or(0.0) <= 0.5
-    })
-    .await;
+    let cleared = wait_for_tug(xp, abort).await;
     // Off the toe brakes we put on: the channel's override expires but the
     // ratios keep their last value on an airframe with no toe-brake axis,
     // and the taxi governor then read our 0.4 as the PILOT braking and
     // held the throttle at idle for 25 s (LIBP 737, 2026-09-26). A fresh
     // zero makes the plugin write the ratios back to zero.
     let _ = xp.set_float(TAXI_BRAKE, 0.0).await;
-    // Brakes SET now, and set they STAY until the taxi drive arms and its
-    // governor releases them itself. The gap between the tug letting go and
-    // the taxi engaging is exactly the window the stand creep happened in.
-    let _ = crate::tools::controls::drive_park_brake(ctx.xplane, true, valve_set).await;
-    event(json!({ "event": "brakes_set", "tug_clear": cleared }));
-    if !cleared {
-        // It never cleared: say so, but the push itself happened.
+    if cleared {
+        // Brakes SET now, and set they STAY until the taxi drive arms and its
+        // governor releases them itself. The gap between the tug letting go
+        // and the taxi engaging is exactly the window the stand creep
+        // happened in.
+        let _ = crate::tools::controls::drive_park_brake(ctx.xplane, true, valve_set).await;
+        event(json!({ "event": "brakes_set", "tug_clear": true, "held_on": "park" }));
+    } else {
+        // Still on the bar: NEVER the parking brake against a tug (with the
+        // handle set the sim's tug does not let go), and no last squeeze on
+        // the toe channel either (the ratios would keep it, the LIBP lesson
+        // above). The tug on the bar holds us, and the taxi drive's tug hold
+        // (`tug_hold`) brakes on its governor from its first tick until the
+        // bar comes off.
+        event(json!({ "event": "brakes_set", "tug_clear": false, "held_on": "toe" }));
         tracing::warn!("pushback: the tug never showed clear");
         event(json!({ "event": "tug_not_clear" }));
         if let Some(v) = voice {
             v.alert(
                 Priority::Advisory,
-                "The tug's still showing connected. Watch for it before we roll.".to_string(),
+                "The tug's still on the bar, so I'm holding us on the brakes, not the \
+                 parking brake. Watch for it before we roll."
+                    .to_string(),
             );
         }
+        // Said once: the taxi drive's own tug hold, a second later, stays
+        // silent about the same tug.
+        *TUG_WARNED.lock().unwrap_or_else(|e| e.into_inner()) = Some(Instant::now());
     }
     Ok(back_m)
 }
@@ -1157,26 +1245,58 @@ async fn send(ctx: &ToolCtx<'_>, action: &str) {
         .await;
 }
 
-/// Poll `cond` until it's true, the deadline passes, or the caller aborts.
-async fn wait_for<F, Fut>(secs: f64, abort: &AtomicBool, mut cond: F) -> bool
-where
-    F: FnMut() -> Fut,
-    Fut: std::future::Future<Output = bool>,
-{
-    let deadline = Instant::now() + Duration::from_secs_f64(secs);
+/// The tug wait itself: the toe brakes written every poll (an expiring
+/// heartbeat), the bar, the dead tow flag and the heading read, and the
+/// deadline [`TugClearWatch`]'s. `true` when the bar came off.
+async fn wait_for_tug(xp: &XPlaneClient, abort: &AtomicBool) -> bool {
+    let t0 = Instant::now();
+    let mut watch = TugClearWatch::new(0.0);
+    let mut logged_at = -TUG_LOG_SECS;
     loop {
         if stopping(abort) {
             return false;
         }
-        if cond().await {
-            return true;
+        let _ = xp.set_float(TAXI_BRAKE, HOLD_BRAKE).await;
+        let (att, tow, psi) = tokio::join!(
+            xp.get_float(PUSH_ATTACHED),
+            xp.get_float(TOW_IN_PROGRESS),
+            xp.get_float(PSI_TRUE),
+        );
+        let t = t0.elapsed().as_secs_f64();
+        let (att, tow, psi) = (att.ok(), tow.ok(), psi.ok());
+        let verdict = watch.step(t, att, tow, psi);
+        if t - logged_at >= TUG_LOG_SECS || verdict != TugWait::Waiting {
+            logged_at = t;
+            let rec = json!({ "event": "tug_wait", "s": r1(t), "att": att, "tow": tow,
+                              "hdg": psi.map(r1), "swinging": watch.swinging(),
+                              "verdict": format!("{verdict:?}") });
+            event(rec);
         }
-        if Instant::now() >= deadline {
-            return false;
+        match verdict {
+            TugWait::Clear => return true,
+            TugWait::TimedOut => return false,
+            TugWait::Waiting => tokio::time::sleep(Duration::from_millis(TICK_MS)).await,
         }
-        tokio::time::sleep(Duration::from_millis(TICK_MS)).await;
     }
 }
+
+/// When the push last said the tug was still on the bar, so the taxi's tug
+/// hold does not say it again (13:39Z 2026-09-26 would have heard it twice).
+static TUG_WARNED: std::sync::Mutex<Option<Instant>> = std::sync::Mutex::new(None);
+
+/// Did the push just say the tug is still on? Consumed, and only fresh
+/// within a minute, so a later push's tug is always announced.
+pub fn take_tug_warned() -> bool {
+    TUG_WARNED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .take()
+        .is_some_and(|at| at.elapsed().as_secs_f64() < 60.0)
+}
+
+/// How often the tug wait leaves a trace (the 13:39Z wait left none, and its
+/// story had to be read off the 1 Hz state records).
+const TUG_LOG_SECS: f64 = 2.0;
 
 /// Round to 0.1 for compact black-box records.
 fn r1(v: f64) -> f64 {
@@ -1618,5 +1738,94 @@ mod tests {
 
         // And the creep guard fires before the aircraft can get going.
         const { assert!(CREEP_M > MOVED_M) } // jitter must not trip the creep guard
+    }
+
+    /// 13:39Z 2026-09-26 (sortie 1790429680): "stopped" at 60.9 m with the
+    /// nose at 204, the heading from the 1 Hz `state` records after it, and
+    /// the bar off at +34.0 s (`autotaxi` `tug_released`). The old wait,
+    /// counted from the stop, timed out at +30 s with the tug still swinging
+    /// us and set the parking brake against it; counted from the swing's end
+    /// the same ticks see the tug let go.
+    #[test]
+    fn the_tug_wait_runs_from_the_end_of_the_swing() {
+        let hdg = [
+            (1.0, 205.9),
+            (2.2, 208.6),
+            (3.4, 209.4),
+            (4.8, 210.4),
+            (6.0, 211.8),
+            (7.2, 213.0),
+            (8.6, 214.5),
+            (9.9, 216.4),
+            (11.3, 218.8),
+            (12.6, 221.8),
+            (14.0, 225.1),
+            (15.3, 229.2),
+            (16.5, 231.6),
+            (17.8, 235.2),
+            (19.2, 238.6),
+            (20.5, 241.8),
+            (21.8, 244.7),
+            (23.1, 247.6),
+            (24.4, 250.1),
+            (25.7, 253.3),
+            (26.9, 255.8),
+            (28.2, 258.1),
+            (29.5, 259.9),
+            (30.9, 262.1),
+            (32.2, 262.2),
+            (33.5, 262.2),
+            (34.6, 262.2),
+            (35.9, 262.2),
+            (37.2, 262.0),
+        ];
+        const RELEASED_S: f64 = 34.0;
+        let replay = |with_heading: bool| {
+            let mut w = TugClearWatch::new(0.0);
+            // The live wait polls every 0.5 s; the heading is the nearest
+            // recorded sample at or before the poll.
+            let mut t = 0.0;
+            while t <= 40.0 {
+                let h = hdg.iter().rev().find(|(ts, _)| *ts <= t).map(|(_, h)| *h);
+                let att = if t >= RELEASED_S { 0.0 } else { 1.0 };
+                let v = w.step(t, Some(att), Some(0.0), h.filter(|_| with_heading));
+                if v != TugWait::Waiting {
+                    return (v, t);
+                }
+                t += 0.5;
+            }
+            (TugWait::Waiting, t)
+        };
+        let (old, at) = replay(false);
+        assert_eq!((old, at), (TugWait::TimedOut, 30.0), "the recorded failure");
+        let (new, at) = replay(true);
+        assert_eq!(new, TugWait::Clear);
+        assert_eq!(at, RELEASED_S);
+    }
+
+    /// A bar that cannot be read is not off the bar, and a tug that sits
+    /// still on it times out 30 s after it stopped moving us; one that keeps
+    /// swinging is capped at the whole wait's two minutes.
+    #[test]
+    fn the_tug_wait_never_reads_a_failure_as_clear() {
+        let mut w = TugClearWatch::new(0.0);
+        assert_eq!(w.step(0.5, None, None, Some(90.0)), TugWait::Waiting);
+        assert_eq!(w.step(29.5, None, Some(0.0), Some(90.0)), TugWait::Waiting);
+        assert_eq!(w.step(30.0, None, Some(0.0), Some(90.0)), TugWait::TimedOut);
+        // The dead tow flag blocks only when it actually reads on.
+        let mut w = TugClearWatch::new(0.0);
+        assert_eq!(w.step(1.0, Some(0.0), Some(1.0), None), TugWait::Waiting);
+        assert_eq!(w.step(1.5, Some(0.0), None, None), TugWait::Clear);
+        // Swinging forever: the cap.
+        let mut w = TugClearWatch::new(0.0);
+        let mut t = 0.0;
+        let v = loop {
+            let v = w.step(t, Some(1.0), Some(0.0), Some((t * 2.0) % 360.0));
+            if v != TugWait::Waiting {
+                break v;
+            }
+            t += 0.5;
+        };
+        assert_eq!((v, t), (TugWait::TimedOut, TUG_CLEAR_MAX_SECS));
     }
 }

@@ -142,7 +142,11 @@ pub fn agrees(d: Duty, control: Control) -> Option<bool> {
     };
     let ok: &[&str] = match d {
         Duty::StartEngines | Duty::RequestClearance | Duty::RequestTakeoff => &["full auto"],
-        Duty::Taxi | Duty::TaxiToStand | Duty::Vacate => &["taxi", "pushback", "full auto"],
+        Duty::Taxi | Duty::TaxiToStand => &["taxi", "pushback", "full auto"],
+        // Autoland's rollout IS the vacate's first half: it brakes on the
+        // runway and hands over rolling at the vacate speed. Nine of the
+        // fifteen 2026-09-26 disagreements were autoland on its own rollout.
+        Duty::Vacate => &["autoland", "taxi", "full auto"],
         Duty::LineUp => &["taxi", "full auto"],
         Duty::TakeOff | Duty::Climb => &["takeoff", "circuit", "full auto", "follower"],
         Duty::FlyThePlan | Duty::Rejoin => &["follower", "full auto", "helicopter route"],
@@ -153,6 +157,67 @@ pub fn agrees(d: Duty, control: Control) -> Option<bool> {
         _ => return None,
     };
     Some(ok.contains(&running))
+}
+
+/// How long a new duty's verdict waits for control to settle. Hand-overs
+/// between loops take a tick or two: the flight model entered TaxiIn at 12
+/// kt while autoland was still handing the rollout to the taxi, 1.2 s
+/// later (sortie 1790416823), and a verdict judged on that one tick said
+/// "disagrees" about a hand-over that was going exactly right.
+pub const SETTLE_S: f64 = 3.0;
+
+/// One entry of the shadow's trail: a duty, why, the phase it began in,
+/// when it began, and the running automation's verdict once settled.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DutyRecord {
+    pub duty: Duty,
+    pub why: &'static str,
+    pub phase: String,
+    pub began_t: f64,
+    pub agrees: Option<bool>,
+}
+
+/// The trail the monitor blackboxes: one record per duty, written once the
+/// duty has stood [`SETTLE_S`] (or when the next one begins sooner), with
+/// the agreement of the automation running at that moment. Pure over its
+/// inputs, so the recorded ticks replay through it.
+#[derive(Debug, Default)]
+pub struct DutyTrail {
+    current: Option<Duty>,
+    pending: Option<DutyRecord>,
+}
+
+impl DutyTrail {
+    pub fn step(
+        &mut self,
+        d: Duty,
+        why: &'static str,
+        phase: &str,
+        control: Control,
+        now_s: f64,
+    ) -> Option<DutyRecord> {
+        let mut out = None;
+        if self.current != Some(d) {
+            self.current = Some(d);
+            // A duty that did not stand its settle time is still written,
+            // with the last verdict it saw.
+            out = self.pending.take();
+            self.pending = Some(DutyRecord {
+                duty: d,
+                why,
+                phase: phase.to_string(),
+                began_t: now_s,
+                agrees: agrees(d, control),
+            });
+        }
+        if let Some(p) = &mut self.pending {
+            p.agrees = agrees(p.duty, control);
+            if now_s - p.began_t >= SETTLE_S && out.is_none() {
+                out = self.pending.take();
+            }
+        }
+        out
+    }
 }
 
 #[cfg(test)]
@@ -252,5 +317,52 @@ mod tests {
         assert_eq!(agrees(Duty::TakeOff, Control::Automation("taxi")), Some(false));
         assert_eq!(agrees(Duty::Taxi, Control::Pilot), None);
         assert_eq!(agrees(Duty::Monitor, Control::Automation("taxi")), None);
+        // Autoland on its own rollout is doing the vacate.
+        assert_eq!(agrees(Duty::Vacate, Control::Automation("autoland")), Some(true));
+        assert_eq!(agrees(Duty::TaxiToStand, Control::Automation("autoland")), Some(false));
+    }
+
+    /// The 2026-09-26 transition ticks, from the `state` records' `ctl`:
+    /// sortie 1790416823 entered TaxiIn under autoland, the taxi took over
+    /// 1.2 s later; the 16:58Z spoken autoland handed to the pilot 1.3 s
+    /// after TaxiIn. Judged on the first tick both read "disagrees".
+    #[test]
+    fn a_verdict_waits_for_the_hand_over_to_settle() {
+        let replay = |ctl: &[(f64, Control)]| {
+            let mut trail = DutyTrail::default();
+            let mut out = Vec::new();
+            // The rollout under autoland first (settled, agreeing).
+            for i in 0..8 {
+                let t = i as f64;
+                out.extend(trail.step(Duty::Vacate, "", "Rollout", Control::Automation("autoland"), t));
+            }
+            for &(t, c) in ctl {
+                out.extend(trail.step(Duty::TaxiToStand, "", "TaxiIn", c, 8.0 + t));
+            }
+            out
+        };
+        let taxi = replay(&[
+            (0.0, Control::Automation("autoland")),
+            (0.1, Control::Automation("autoland")),
+            (1.5, Control::Automation("taxi")),
+            (2.9, Control::Automation("taxi")),
+            (4.2, Control::Automation("taxi")),
+        ]);
+        assert_eq!(taxi.len(), 2, "{taxi:?}");
+        assert_eq!((taxi[0].duty, taxi[0].agrees), (Duty::Vacate, Some(true)));
+        assert_eq!((taxi[1].duty, taxi[1].agrees), (Duty::TaxiToStand, Some(true)));
+        assert_eq!(taxi[1].began_t, 8.0, "the trail keeps the duty's own start");
+        let pilot = replay(&[
+            (0.0, Control::Automation("autoland")),
+            (1.6, Control::Pilot),
+            (3.0, Control::Pilot),
+        ]);
+        assert_eq!(pilot[1].agrees, None, "handed to the pilot: no verdict");
+        // A real disagreement that stands is still written as one.
+        let wrong = replay(&[
+            (0.0, Control::Automation("takeoff")),
+            (3.0, Control::Automation("takeoff")),
+        ]);
+        assert_eq!(wrong[1].agrees, Some(false));
     }
 }

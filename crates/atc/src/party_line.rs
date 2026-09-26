@@ -252,6 +252,16 @@ pub fn on_pavement(lat: f64, lon: f64) -> Option<bool> {
     crate::station::taxi_net()?.on_pavement(lat, lon)
 }
 
+/// Is this point on one of the active field's runway strips? `None` when no
+/// field's runways are published: no data is never "off the runway". The
+/// flight model's `LinedUp` evidence, which the live monitor never fed, so
+/// a lined-up aircraft read "Holding" and its roll "TaxiOut" (LIBP 04 and
+/// LEMG 13, 2026-09-26: the duty engine asked for a taxi and a line-up
+/// under the running takeoff).
+pub fn on_runway(lat: f64, lon: f64) -> Option<bool> {
+    crate::station::on_active_runway_known(lat, lon)
+}
+
 /// Whether the active field publishes any parking positions at all.
 pub fn stands_known() -> bool {
     crate::station::taxi_net().is_some_and(|n| !n.stands.is_empty())
