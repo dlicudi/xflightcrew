@@ -204,6 +204,9 @@ pub struct Plan {
     pub target_hdg: f64,
     /// The route node the push aims at (the lane), for the log.
     pub node: (f64, f64),
+    /// Planned off the stand's PAINTED lane ([`lane_plan`]): the push ends at
+    /// the lane's length, whatever the heading, and the taxi turns the rest.
+    pub lane: bool,
 }
 
 /// Which way the tug is being asked to swing us.
@@ -260,6 +263,34 @@ pub fn plan(lat: f64, lon: f64, psi: f64, path: &[(f64, f64)]) -> Option<Plan> {
         back_m: from_us(node).clamp(MIN_BACK_M, MAX_BACK_M),
         target_hdg,
         node: *node,
+        lane: false,
+    })
+}
+
+/// The push planned off the stand's painted lane (`party_line::push_lane`,
+/// the lead-in read backwards): as far as the lane runs, and the heading the
+/// nose has at its end (the reverse of the lane's last direction). The route
+/// plan above aims at the cleared route's first leg: at LIBP stand 1 that was
+/// 217, a swing to the RIGHT that took a 737's tail into the buildings, where
+/// the painted lane says the nose ends at 127, a turn to the LEFT
+/// (2026-09-26). Pure.
+pub fn lane_plan(lane: &[(f64, f64)]) -> Option<Plan> {
+    if lane.len() < 2 {
+        return None;
+    }
+    let seg = |a: (f64, f64), b: (f64, f64)| nav::haversine_nm(a.0, a.1, b.0, b.1) * M_PER_NM;
+    let length: f64 = lane.windows(2).map(|w| seg(w[0], w[1])).sum();
+    let (a, b) = lane
+        .windows(2)
+        .rev()
+        .find(|w| seg(w[0], w[1]) >= 1.0)
+        .map(|w| (w[0], w[1]))?;
+    let travel = nav::bearing_deg(a.0, a.1, b.0, b.1);
+    Some(Plan {
+        back_m: length.clamp(MIN_BACK_M, MAX_BACK_M),
+        target_hdg: (travel + 180.0).rem_euclid(360.0),
+        node: *lane.last()?,
+        lane: true,
     })
 }
 
@@ -976,7 +1007,10 @@ async fn run_inner(
         }
         // A straight push never aligns the nose (by design: the taxi turns
         // it), so it ends at the planned distance, not 25 m past it.
-        if cmd == Steer::Straight && back_m >= plan.back_m {
+        if (cmd == Steer::Straight || plan.lane)
+            && back_m >= plan.back_m
+            && !swing_in_progress(attached, err_then, err)
+        {
             break;
         }
         if done(back_m, err, plan) {
@@ -1159,6 +1193,19 @@ mod tests {
         assert!(!at_pavement_edge(Some(true), Some(true), Some(true)));
         assert!(!at_pavement_edge(Some(false), Some(false), Some(false)), "a grass stand");
         assert!(!at_pavement_edge(None, None, None), "no data is no verdict");
+    }
+
+    /// LIBP stand 1's painted lane, as read from the install: back north
+    /// from the stand, then north-west to the taxiway. The nose ends at 127
+    /// (a turn LEFT), never the route's 217.
+    #[test]
+    fn a_painted_lane_plans_the_push() {
+        let lane = [(42.431840, 14.188786), (42.431840, 14.188786), (42.431984, 14.188531)];
+        let p = super::lane_plan(&lane).expect("a plan");
+        assert!(p.lane);
+        assert!((p.target_hdg - 127.4).abs() < 1.5, "{}", p.target_hdg);
+        assert!((p.back_m - 26.3).abs() < 1.0, "{}", p.back_m);
+        assert_eq!(super::steer_for(super::angle_diff_deg(p.target_hdg, 171.8), 1), super::Steer::Straight);
     }
 
     #[test]
@@ -1359,6 +1406,7 @@ mod tests {
             back_m: 56.35,
             target_hdg: 265.9,
             node: (LAT0, LON0),
+            lane: false,
         };
         // What the tug actually delivered, and what the loop asked next.
         assert!(
@@ -1399,6 +1447,7 @@ mod tests {
             back_m: 88.7,
             target_hdg: 85.1,
             node: (LAT0, LON0),
+            lane: false,
         };
         assert!(
             push_delivered(77.4, 1.1, &long),
@@ -1410,6 +1459,7 @@ mod tests {
             back_m: 56.35,
             target_hdg: 265.9,
             node: (LAT0, LON0),
+            lane: false,
         };
         assert!(!push_delivered(20.0, 2.0, &short), "still in the stand");
         // And the other push that day: twelve metres PAST the plan with the
@@ -1418,6 +1468,7 @@ mod tests {
             back_m: 65.7,
             target_hdg: 157.2,
             node: (LAT0, LON0),
+            lane: false,
         };
         assert!(
             !push_delivered(78.0, 71.3, &stand),
@@ -1479,6 +1530,7 @@ mod tests {
             back_m: 40.0,
             target_hdg: 0.0,
             node: (LAT0, LON0),
+            lane: false,
         };
         assert!(!done(20.0, 2.0, &p), "not back far enough yet");
         assert!(!done(41.0, 45.0, &p), "back far enough but pointing across");
@@ -1499,6 +1551,7 @@ mod tests {
             back_m: 40.1,
             target_hdg: 176.6,
             node: (LAT0, LON0),
+            lane: false,
         };
         assert!(
             done(65.3, 139.6, &p),

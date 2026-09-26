@@ -6262,6 +6262,7 @@ mod tests {
             stands: vec![],
             paint: vec![],
             pavement: vec![],
+            stand_lines: vec![],
         }));
         *TAXI_ROUTE.lock().unwrap() = Some(TaxiWatch {
             path: vec![

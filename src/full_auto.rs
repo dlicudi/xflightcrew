@@ -1463,7 +1463,20 @@ async fn fly(xp: XPlaneClient, config: Config, voice: Option<Voice>, tools: SubT
             let path = crate::party_line::with_taxi_route(|r| r.map(|w| w.path.clone()))
                 .unwrap_or_default();
             if let (Ok(lat), Ok(lon), Ok(psi)) = (lat_r, lon_r, psi_r) {
-                let plan = crate::pushback::plan(lat, lon, psi, &path);
+                // A push is owed by the route; where the stand's lane is
+                // PAINTED, the push is planned off the paint.
+                let plan = crate::pushback::plan(lat, lon, psi, &path).map(|route_plan| {
+                    match crate::party_line::push_lane(lat, lon, psi)
+                        .and_then(|l| crate::pushback::lane_plan(&l))
+                    {
+                        Some(lp) => {
+                            event("push_lane", json!({ "back_m": lp.back_m, "target_hdg": lp.target_hdg,
+                                                        "route_target_hdg": route_plan.target_hdg }));
+                            lp
+                        }
+                        None => route_plan,
+                    }
+                });
                 let stand = crate::party_line::nearest_stand(lat, lon);
                 let at_stand = crate::pushback::on_a_stand(
                     stand.as_ref().map(|s| (s.dist_m, s.heading)),

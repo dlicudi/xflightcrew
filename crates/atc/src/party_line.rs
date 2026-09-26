@@ -242,6 +242,12 @@ pub fn nearest_stand(lat: f64, lon: f64) -> Option<StandFix> {
 
 /// Is this point on the active field's drawn pavement? `None` when no
 /// field is loaded or it draws no pavement: no data is never "grass".
+/// The painted way out of the stand the aircraft is on, read backwards from
+/// it (see `nav::TaxiNet::push_lane`); `None` with no field or no paint.
+pub fn push_lane(lat: f64, lon: f64, psi_deg: f64) -> Option<Vec<(f64, f64)>> {
+    crate::station::taxi_net()?.push_lane(lat, lon, psi_deg)
+}
+
 pub fn on_pavement(lat: f64, lon: f64) -> Option<bool> {
     crate::station::taxi_net()?.on_pavement(lat, lon)
 }

@@ -693,6 +693,13 @@ pub struct TaxiNet {
     /// grass, where the taxi could not move it (2026-09-26): the push stops
     /// at the pavement's edge ([`TaxiNet::on_pavement`]).
     pub pavement: Vec<Vec<Vec<(f64, f64)>>>,
+    /// The stands' LEAD-IN lines (apt.dat line type 60, the painted curve
+    /// from a taxiway into a stand), beziers sampled. Read backwards from the
+    /// stand it is the way a push should go ([`TaxiNet::push_lane`]); the
+    /// push used to aim at the route's first node instead, and swung a 737's
+    /// tail into the buildings beside LIBP's stand 1 (2026-09-26). Type 60
+    /// ends at 650 stands across fourteen fields surveyed that day.
+    pub stand_lines: Vec<Vec<(f64, f64)>>,
 }
 
 /// How far a drawn centreline may be from the planned route and still be the
@@ -868,6 +875,8 @@ pub struct TaxiRoutePlan {
 /// bar or a roadway marking is not a line to drive down, and one wrong type
 /// here snaps a route sideways onto a marking that merely runs nearby.
 const PAINT_CENTRELINE_TYPES: [&str; 2] = ["1", "51"];
+/// The stand lead-in line type (see `TaxiNet::stand_lines`).
+const LEADIN_TYPE: &str = "60";
 
 /// Points sampled along one bezier segment of a drawn line. The curves are
 /// junction fillets a few tens of metres long, so eight is smooth to well
@@ -903,6 +912,13 @@ fn bezier(p0: (f64, f64), p1: (f64, f64), p2: (f64, f64), p3: (f64, f64), t: f64
 /// beziers sampled. A feature can mix types (a taxiway line that becomes a
 /// hold bar), so this emits a run per unbroken stretch of centreline rather
 /// than one polyline per feature.
+/// How near the aircraft a painted line must pass to be its stand's lane.
+const LANE_END_M: f64 = 20.0;
+/// How far the line's direction may differ from the heading.
+const LANE_ALIGN_DEG: f64 = 35.0;
+/// The shortest painted lane worth pushing along.
+const LANE_MIN_M: f64 = 15.0;
+
 /// Even-odd point in a closed ring of (lat, lon).
 fn ring_contains(ring: &[(f64, f64)], lat: f64, lon: f64) -> bool {
     let mut inside = false;
@@ -1121,6 +1137,8 @@ pub fn find_taxi_net(path: &str, icao: &str) -> Result<Option<TaxiNet>> {
     // airport perimeter (130), and a boundary is not a line to taxi down.
     let mut in_feature = false;
     let mut feature: Vec<PaintNode> = Vec::new();
+    // The same 120 feature, flagged by LEAD-IN segments (type 60).
+    let mut leadin: Vec<PaintNode> = Vec::new();
     // The pavement polygon being read (a 110 block), and its current ring.
     let mut in_pavement = false;
     let mut ring: Vec<PaintNode> = Vec::new();
@@ -1140,6 +1158,7 @@ pub fn find_taxi_net(path: &str, icao: &str) -> Result<Option<TaxiNet>> {
         // Any row that opens a new block ends the feature being read.
         if !matches!(row, Some("111" | "112" | "113" | "114" | "115" | "116")) {
             flush_paint_feature(&mut feature, &mut net.paint);
+            flush_paint_feature(&mut leadin, &mut net.stand_lines);
             in_feature = in_airport && row == Some("120");
             ring.clear();
             in_pavement = in_airport && row == Some("110");
@@ -1205,21 +1224,33 @@ pub fn find_taxi_net(path: &str, icao: &str) -> Result<Option<TaxiNet>> {
                 } else {
                     None
                 };
-                let centre = f.any(|a| PAINT_CENTRELINE_TYPES.contains(&a));
+                let attrs: Vec<&str> = f.collect();
+                let centre = attrs.iter().any(|a| PAINT_CENTRELINE_TYPES.contains(a));
+                let lead = attrs.iter().any(|a| *a == LEADIN_TYPE);
                 feature.push(PaintNode {
                     p: (lat, lon),
                     ctrl,
                     centre,
+                });
+                leadin.push(PaintNode {
+                    p: (lat, lon),
+                    ctrl,
+                    centre: lead,
                 });
                 // 113/114 close a loop: the drawn line returns to its start.
                 if matches!(row, Some("113" | "114")) {
                     if let Some(&first) = feature.first() {
                         feature.push(first);
                     }
+                    if let Some(&first) = leadin.first() {
+                        leadin.push(first);
+                    }
                     flush_paint_feature(&mut feature, &mut net.paint);
+                    flush_paint_feature(&mut leadin, &mut net.stand_lines);
                     in_feature = false;
                 } else if matches!(row, Some("115" | "116")) {
                     flush_paint_feature(&mut feature, &mut net.paint);
+                    flush_paint_feature(&mut leadin, &mut net.stand_lines);
                     in_feature = false;
                 }
             }
@@ -1310,10 +1341,114 @@ pub fn find_taxi_net(path: &str, icao: &str) -> Result<Option<TaxiNet>> {
             _ => {}
         }
     }
+    net.stand_lines = stitch_lines(std::mem::take(&mut net.stand_lines), 1.0);
     Ok((!net.edges.is_empty()).then_some(net))
 }
 
+/// Join polylines whose ends meet (within `tol_m`) into continuous lines.
+/// A lead-in is often drawn as several short pieces (LIBP stand 1: a 2-point
+/// straight into the stand, then a 9-point curve, end to end), and a piece
+/// shorter than the direction probe says nothing about where it goes.
+pub fn stitch_lines(mut lines: Vec<Vec<(f64, f64)>>, tol_m: f64) -> Vec<Vec<(f64, f64)>> {
+    let near = |a: (f64, f64), b: (f64, f64)| {
+        let k = 111_320.0 * a.0.to_radians().cos();
+        (((a.1 - b.1) * k).powi(2) + ((a.0 - b.0) * 111_320.0).powi(2)).sqrt() <= tol_m
+    };
+    let mut out: Vec<Vec<(f64, f64)>> = Vec::new();
+    while let Some(mut cur) = lines.pop() {
+        loop {
+            let (head, tail) = (cur[0], cur[cur.len() - 1]);
+            let Some(i) = lines.iter().position(|l| {
+                let (a, b) = (l[0], l[l.len() - 1]);
+                near(tail, a) || near(tail, b) || near(head, a) || near(head, b)
+            }) else {
+                break;
+            };
+            let mut l = lines.swap_remove(i);
+            let (a, b) = (l[0], l[l.len() - 1]);
+            if near(tail, a) {
+                cur.extend(l.drain(1..));
+            } else if near(tail, b) {
+                l.reverse();
+                cur.extend(l.drain(1..));
+            } else if near(head, b) {
+                l.extend(cur.drain(1..));
+                cur = l;
+            } else {
+                l.reverse();
+                l.extend(cur.drain(1..));
+                cur = l;
+            }
+        }
+        out.push(cur);
+    }
+    out
+}
+
 impl TaxiNet {
+    /// The way a push from this spot should go: the stand's painted lead-in
+    /// read BACKWARDS, from its end at the aircraft out to the taxiway. A
+    /// lead-in (or, lacking one, a painted centreline) counts when one of its
+    /// ends is within [`LANE_END_M`] of the aircraft and runs INTO that end
+    /// along the aircraft's heading (a nose-in stand's line points at the
+    /// terminal, as the nose does). `None` where nothing is drawn: the push
+    /// then plans off the cleared route as before.
+    pub fn push_lane(&self, lat: f64, lon: f64, psi_deg: f64) -> Option<Vec<(f64, f64)>> {
+        let m_per_deg_lon = 111_320.0 * lat.to_radians().cos();
+        let xy = |p: (f64, f64)| ((p.1 - lon) * m_per_deg_lon, (p.0 - lat) * 111_320.0);
+        let diff = |a: f64, b: f64| ((a - b + 540.0).rem_euclid(360.0) - 180.0).abs();
+        let mut best: Option<(f64, Vec<(f64, f64)>)> = None;
+        for line in self.stand_lines.iter().chain(self.paint.iter()) {
+            let lead = self.stand_lines.contains(line);
+            for i in 0..line.len().saturating_sub(1) {
+                let (a, b) = (xy(line[i]), xy(line[i + 1]));
+                let (dx, dy) = (b.0 - a.0, b.1 - a.1);
+                let len2 = dx * dx + dy * dy;
+                if len2 < 0.25 {
+                    continue;
+                }
+                let t = (((-a.0) * dx + (-a.1) * dy) / len2).clamp(0.0, 1.0);
+                let (px, py) = (a.0 + t * dx, a.1 + t * dy);
+                let d = (px * px + py * py).sqrt();
+                if d > LANE_END_M {
+                    continue;
+                }
+                let brg = dx.atan2(dy).to_degrees().rem_euclid(360.0);
+                // Along the nose: the way out is back down the line; against
+                // it: forward down the line.
+                let back = if diff(brg, psi_deg) <= LANE_ALIGN_DEG {
+                    true
+                } else if diff(brg + 180.0, psi_deg) <= LANE_ALIGN_DEG {
+                    false
+                } else {
+                    continue;
+                };
+                let p = (lat + py / 111_320.0, lon + px / m_per_deg_lon);
+                let mut lane = vec![p];
+                if back {
+                    lane.extend(line[..=i].iter().rev().copied());
+                } else {
+                    lane.extend(line[i + 1..].iter().copied());
+                }
+                // A line drawn on past the stop point toward the terminal is
+                // not a way out: only a lane long enough to push along.
+                let length: f64 = lane
+                    .windows(2)
+                    .map(|w| haversine_nm(w[0].0, w[0].1, w[1].0, w[1].1) * 1852.0)
+                    .sum();
+                if length < LANE_MIN_M {
+                    continue;
+                }
+                let score = d + if lead { 0.0 } else { 5.0 };
+                if best.as_ref().is_none_or(|(s, _)| score < *s) {
+                    best = Some((score, lane));
+                }
+            }
+        }
+        best.map(|(_, lane)| lane)
+    }
+
+
     /// Is this point on the field's drawn pavement? `None` when the field
     /// draws none, so a caller never reads "no data" as "grass".
     pub fn on_pavement(&self, lat: f64, lon: f64) -> Option<bool> {
@@ -4787,6 +4922,68 @@ STAR:030,6,ALWYS3,RW28B,ARRTU,K2,P,C,E   , ,   ,TF, , , , , ,      ,    ,    ,  
         assert!(!net.pavement.is_empty(), "LIPK draws pavement");
         assert_eq!(net.on_pavement(44.19580628655603, 12.075011968589756), Some(true));
         assert_eq!(net.on_pavement(44.19488911712411, 12.074242855216026), Some(false));
+    }
+
+    /// How often a stand's lane is found, how long and how much it turns.
+    /// `cargo test -p atc -- --ignored live_push_lane_survey --nocapture`
+    #[test]
+    #[ignore]
+    fn live_push_lane_survey() {
+        let path =
+            "/Users/duanelicudi/X-Plane 12/Global Scenery/Global Airports/Earth nav data/apt.dat";
+        for icao in ["LIBP", "LIPK", "LEMG", "EGLL", "EGPH", "EGSS", "EDLP", "LFPB"] {
+            let Ok(Some(net)) = find_taxi_net(path, icao) else { continue };
+            let (mut found, mut lens, mut turns) = (0, Vec::new(), Vec::new());
+            for st in &net.stands {
+                if let Some(l) = net.push_lane(st.lat, st.lon, st.heading) {
+                    found += 1;
+                    let len: f64 = l.windows(2).map(|w| haversine_nm(w[0].0, w[0].1, w[1].0, w[1].1) * 1852.0).sum();
+                    let n = l.len();
+                    let end = bearing_deg(l[n - 2].0, l[n - 2].1, l[n - 1].0, l[n - 1].1);
+                    let nose = (end + 180.0).rem_euclid(360.0);
+                    lens.push(len as i64);
+                    turns.push((((nose - st.heading + 540.0).rem_euclid(360.0)) - 180.0) as i64);
+                }
+            }
+            lens.sort();
+            println!("{icao}: {found}/{} stands; lengths {:?}; turns {:?}", net.stands.len(),
+                     lens.iter().step_by((lens.len() / 8).max(1)).collect::<Vec<_>>(),
+                     turns.iter().take(12).collect::<Vec<_>>());
+        }
+    }
+
+    /// LIBP stand 1 (2026-09-26): its painted lead-in, read backwards, is the
+    /// way out; the tug's own pattern swung the 737 into the buildings.
+    #[test]
+    #[ignore] // needs the real X-Plane install; run with --ignored
+    fn live_libp_stand_has_a_push_lane() {
+        let path =
+            "/Users/duanelicudi/X-Plane 12/Global Scenery/Global Airports/Earth nav data/apt.dat";
+        let Ok(Some(net)) = find_taxi_net(path, "LIBP") else {
+            return;
+        };
+        println!("stand lines: {}", net.stand_lines.len());
+        let (la, lo): (f64, f64) = (42.431905167561986, 14.188689582813048);
+        let k0 = 111_320.0 * la.to_radians().cos();
+        for l in net.stand_lines.iter() {
+            for e in [0, l.len() - 1] {
+                let p = l[e];
+                let d = (((p.1 - lo) * k0).powi(2) + ((p.0 - la) * 111_320.0).powi(2)).sqrt();
+                if d < 40.0 {
+                    let q = if e == 0 { l[l.len().min(4) - 1] } else { l[l.len().saturating_sub(4)] };
+                    println!("end {e} of {} pts, {d:.1} m away, into brg {:.1}", l.len(), bearing_deg(q.0, q.1, p.0, p.1));
+                }
+            }
+        }
+        let lane = net.push_lane(42.431905167561986, 14.188689582813048, 171.8).expect("a lane");
+        let k = 111_320.0 * 42.43f64.to_radians().cos();
+        let mut along = 0.0;
+        for w in lane.windows(2) {
+            let (dx, dy) = ((w[1].1 - w[0].1) * k, (w[1].0 - w[0].0) * 111_320.0);
+            along += (dx * dx + dy * dy).sqrt();
+            println!("{:7.1} m  {:.6} {:.6}  brg {:5.1}", along, w[1].0, w[1].1, bearing_deg(w[0].0, w[0].1, w[1].0, w[1].1));
+        }
+        assert!(along > 20.0);
     }
 
     /// LIBP stand (2026-09-26): drawn, and nothing drawn 10 m behind it,
