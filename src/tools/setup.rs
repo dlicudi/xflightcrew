@@ -169,7 +169,7 @@ impl Tool for SetUpFlight {
             "setup",
             json!({ "event": "init", "acf": acf, "airport": origin, "ramp": stand_name, "json": body }),
         );
-        tokio::spawn(async move {
+        spawn_off_loop(async move {
             follow_up(base, voice, body, origin, stand_name).await;
         });
         Ok(format!(
@@ -189,25 +189,26 @@ async fn follow_up(base: String, voice: Option<Voice>, body: String, origin: Str
             v.alert(Priority::Advisory, line.to_string());
         }
     };
-    let seq0 = xp.get_float(INIT_SEQ).await.unwrap_or(-1.0);
-    if xp.set_data(INIT_JSON, body.as_bytes()).await.is_err() {
-        say("I couldn't reach the plugin to set up the flight. Is it up to date?");
-        return;
-    }
     // The plugin runs it on its next flight loop; the reload itself can take
     // a minute with scenery to load.
     let t0 = std::time::Instant::now();
-    let result = loop {
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-        if t0.elapsed().as_secs() > 120 {
-            break None;
+    let run = run_init(&xp, body.as_bytes(), InitTiming::RAMP, &|w| {
+        crate::blackbox::record("setup", json!({ "event": "init_wait", "seq": w.seq, "result": w.result,
+            "seq0": w.seq0, "read_errors": w.read_errors, "polls": w.polls }));
+    })
+    .await;
+    let result = match run.outcome {
+        InitOutcome::Done(code) => Some(code),
+        InitOutcome::Unreachable | InitOutcome::NoBaseline => {
+            crate::blackbox::record(
+                "setup",
+                json!({ "event": "result", "outcome": run.outcome.name(),
+                        "read_errors": run.read_errors }),
+            );
+            say("I couldn't reach the plugin to set up the flight. Is it up to date?");
+            return;
         }
-        let (seq, res) = tokio::join!(xp.get_float(INIT_SEQ), xp.get_float(INIT_RESULT));
-        if let (Ok(seq), Ok(res)) = (seq, res) {
-            if seq > seq0 && res >= 0.0 {
-                break Some(res as i64);
-            }
-        }
+        InitOutcome::TimedOut => None,
     };
     crate::blackbox::record("setup", json!({ "event": "result", "result": result }));
     match result {
@@ -600,7 +601,14 @@ impl Tool for SetUpApproach {
             land: self.land.clone(),
             field: info.position(),
         };
-        tokio::spawn(approach_follow_up(job));
+        // Its own thread and runtime, like every loop that must keep time:
+        // the command loop's runtime is current-thread and blocks on the
+        // microphone between passes, so a task spawned on it runs only in the
+        // slivers where the loop awaits. At LEMG (2026-09-26) the first setup
+        // never wrote the mailbox, and the second wrote it (the sim
+        // repositioned 6 s later) but never read the result: no arm, no line,
+        // not even the timeout, and the 737 dived with nobody flying.
+        spawn_off_loop(approach_follow_up(job));
         Ok(format!(
             "Setting up a {final_nm} mile final for runway {} at {}.",
             crate::circuit::spell_runway(&rwy),
@@ -622,9 +630,177 @@ struct ApproachJob {
     field: Option<(f64, f64)>,
 }
 
-/// How often the follow-up asks whether the flight exists: the gap between
-/// the sim placing the aircraft and the copilot's hands on it.
-const INIT_POLL_MS: u64 = 150;
+/// Run a future to completion on its own thread and runtime, the way
+/// `run_autoland` and every loop run. The command loop's runtime is
+/// current-thread and blocks synchronously on the microphone between passes,
+/// so a `tokio::spawn` from a tool starves (`speedhold`'s governor sat
+/// unpolled 23 s; the approach setup never read its result). Pinned by
+/// `no_tool_leaves_work_on_the_command_loops_runtime`.
+pub fn spawn_off_loop<F>(fut: F)
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    std::thread::spawn(move || {
+        let Ok(rt) = tokio::runtime::Builder::new_current_thread().enable_all().build() else {
+            return;
+        };
+        rt.block_on(fut);
+    });
+}
+
+/// The flight-initialisation mailbox as the follow-up sees it: numbers read,
+/// one JSON posted. The live one is the Web API; the tests fake a reload.
+#[async_trait]
+pub trait InitMailbox: Send + Sync {
+    async fn read(&self, name: &str) -> Result<f64>;
+    async fn post(&self, body: &[u8]) -> Result<()>;
+}
+
+#[async_trait]
+impl InitMailbox for crate::xplane::XPlaneClient {
+    async fn read(&self, name: &str) -> Result<f64> {
+        self.get_float(name).await
+    }
+    async fn post(&self, body: &[u8]) -> Result<()> {
+        self.set_data(INIT_JSON, body).await
+    }
+}
+
+/// How the mailbox wait keeps time.
+#[derive(Debug, Clone, Copy)]
+pub struct InitTiming {
+    /// Between polls: the most the arm can trail the flight's existence.
+    pub poll: std::time::Duration,
+    /// One read's cap. The client's own is 8 s, and a read that hangs through
+    /// the sim's reload must not hold the arm back: it is abandoned and the
+    /// next poll asks again.
+    pub read_timeout: std::time::Duration,
+    /// No answer by then is a timeout, said.
+    pub deadline: std::time::Duration,
+    /// How often the wait reports what it sees (blackbox `approach_wait`).
+    pub report_every: std::time::Duration,
+}
+
+impl InitTiming {
+    pub const LIVE: InitTiming = InitTiming {
+        poll: std::time::Duration::from_millis(150),
+        read_timeout: std::time::Duration::from_millis(600),
+        deadline: std::time::Duration::from_secs(120),
+        report_every: std::time::Duration::from_secs(2),
+    };
+    pub const RAMP: InitTiming = InitTiming {
+        poll: std::time::Duration::from_millis(500),
+        read_timeout: std::time::Duration::from_secs(2),
+        deadline: std::time::Duration::from_secs(120),
+        report_every: std::time::Duration::from_secs(2),
+    };
+}
+
+/// How a mailbox run ended.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum InitOutcome {
+    /// The plugin ran it: `XPLMInitResult` (0 = the flight exists).
+    Done(i64),
+    /// The write did not reach the plugin.
+    Unreachable,
+    /// The completion counter could not be read before the write, so no
+    /// answer could be told from the last flight's: nothing was written.
+    NoBaseline,
+    /// Written, and no answer by the deadline.
+    TimedOut,
+}
+
+impl InitOutcome {
+    pub fn name(&self) -> &'static str {
+        match self {
+            InitOutcome::Done(0) => "ok",
+            InitOutcome::Done(_) => "refused",
+            InitOutcome::Unreachable => "unreachable",
+            InitOutcome::NoBaseline => "no_baseline",
+            InitOutcome::TimedOut => "timeout",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct InitRun {
+    pub outcome: InitOutcome,
+    /// Reads that failed or were abandoned (the sim mid-reload).
+    pub read_errors: u32,
+    pub polls: u32,
+}
+
+/// What the wait sees, reported every `report_every`: the last good reads
+/// (`None` = that read failed) against the baseline.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct InitWait {
+    pub seq0: f64,
+    pub seq: Option<f64>,
+    pub result: Option<f64>,
+    pub read_errors: u32,
+    pub polls: u32,
+}
+
+/// Post the JSON and wait for the plugin's answer. A failed or hung read is
+/// no answer and never the end of the wait: the sim reloading the aircraft
+/// answers the Web API with errors for a while, and the result is the next
+/// good read. The baseline counter is read FIRST (retried): without it the
+/// last flight's pair (seq 0, result 0) reads as success before this one ran.
+pub async fn run_init(
+    mb: &dyn InitMailbox,
+    body: &[u8],
+    t: InitTiming,
+    report: &(dyn Fn(InitWait) + Sync),
+) -> InitRun {
+    let read = |name: &'static str| async move {
+        match tokio::time::timeout(t.read_timeout, mb.read(name)).await {
+            Ok(Ok(v)) => Some(v),
+            _ => None,
+        }
+    };
+    let mut run = InitRun { outcome: InitOutcome::TimedOut, read_errors: 0, polls: 0 };
+    let mut seq0 = None;
+    for _ in 0..10 {
+        match read(INIT_SEQ).await {
+            Some(v) => {
+                seq0 = Some(v);
+                break;
+            }
+            None => {
+                run.read_errors += 1;
+                tokio::time::sleep(t.poll).await;
+            }
+        }
+    }
+    let Some(seq0) = seq0 else {
+        run.outcome = InitOutcome::NoBaseline;
+        return run;
+    };
+    let posted = tokio::time::timeout(std::time::Duration::from_secs(5), mb.post(body)).await;
+    if !matches!(posted, Ok(Ok(()))) {
+        run.outcome = InitOutcome::Unreachable;
+        return run;
+    }
+    let t0 = tokio::time::Instant::now();
+    let mut reported = t0;
+    while t0.elapsed() < t.deadline {
+        tokio::time::sleep(t.poll).await;
+        run.polls += 1;
+        let (seq, res) = tokio::join!(read(INIT_SEQ), read(INIT_RESULT));
+        if let (Some(seq), Some(res)) = (seq, res) {
+            if seq > seq0 && res >= 0.0 {
+                run.outcome = InitOutcome::Done(res as i64);
+                return run;
+            }
+        }
+        run.read_errors += u32::from(seq.is_none()) + u32::from(res.is_none());
+        if reported.elapsed() >= t.report_every {
+            reported = tokio::time::Instant::now();
+            report(InitWait { seq0, seq, result: res, read_errors: run.read_errors, polls: run.polls });
+        }
+    }
+    run
+}
 
 async fn approach_follow_up(job: ApproachJob) {
     let xp = crate::xplane::XPlaneClient::new(job.base.clone());
@@ -633,58 +809,66 @@ async fn approach_follow_up(job: ApproachJob) {
             v.alert(Priority::Caution, line.to_string());
         }
     };
-    let seq0 = xp.get_float(INIT_SEQ).await.unwrap_or(-1.0);
-    if xp.set_data(INIT_JSON, job.body.as_bytes()).await.is_err() {
-        say("I couldn't reach the plugin to set up the approach. Is it up to date?");
-        return;
-    }
     let t0 = std::time::Instant::now();
-    let result = loop {
-        tokio::time::sleep(std::time::Duration::from_millis(INIT_POLL_MS)).await;
-        if t0.elapsed().as_secs() > 120 {
-            break None;
-        }
-        let (seq, res) = tokio::join!(xp.get_float(INIT_SEQ), xp.get_float(INIT_RESULT));
-        if let (Ok(seq), Ok(res)) = (seq, res) {
-            if seq > seq0 && res >= 0.0 {
-                break Some(res as i64);
-            }
-        }
+    let run = run_init(&xp, job.body.as_bytes(), InitTiming::LIVE, &|w| {
+        crate::blackbox::record(
+            "setup",
+            json!({ "event": "approach_wait", "seq": w.seq, "result": w.result, "seq0": w.seq0,
+                    "read_errors": w.read_errors, "polls": w.polls,
+                    "ms": t0.elapsed().as_millis() as u64 }),
+        );
+    })
+    .await;
+    let seen = std::time::Instant::now();
+    let result = match run.outcome {
+        InitOutcome::Done(code) => Some(code),
+        _ => None,
     };
-    let next = after_init(
-        result,
-        &job.icao,
-        &job.runway,
-        job.final_nm,
-        job.hand_fly,
-        job.land.is_some(),
-    );
-    // The arm first, the words after: the aircraft is already flying.
-    match &next {
-        AfterInit::Arm { runway, line } => {
-            if let Some((cfg, ias)) = job.land.clone() {
-                crate::autoland::ABORT.store(false, std::sync::atomic::Ordering::SeqCst);
-                crate::autoland::run_autoland(
-                    job.base.clone(),
-                    job.apt.clone(),
-                    cfg,
-                    ias,
-                    job.voice.clone(),
-                    None,
-                    Some(runway.clone()),
-                );
-                crate::flight::note_crew_takeover("setup_approach");
-            }
-            say(line);
+    let next = match run.outcome {
+        InitOutcome::Unreachable | InitOutcome::NoBaseline => AfterInit::Failed {
+            line: "I couldn't reach the plugin to set up the approach. Is it up to date?".into(),
+        },
+        _ => after_init(
+            result,
+            &job.icao,
+            &job.runway,
+            job.final_nm,
+            job.hand_fly,
+            job.land.is_some(),
+        ),
+    };
+    // The arm first, the record and the words after: the aircraft is
+    // already flying.
+    if let AfterInit::Arm { runway, .. } = &next {
+        if let Some((cfg, ias)) = job.land.clone() {
+            crate::autoland::ABORT.store(false, std::sync::atomic::Ordering::SeqCst);
+            crate::autoland::run_autoland(
+                job.base.clone(),
+                job.apt.clone(),
+                cfg,
+                ias,
+                job.voice.clone(),
+                None,
+                Some(runway.clone()),
+            );
+            crate::flight::note_crew_takeover("setup_approach");
         }
-        AfterInit::Monitor { line } | AfterInit::Failed { line } => say(line),
     }
+    // Always on file and always said: a setup that ends in silence is the
+    // one the pilot cannot act on. `arm_ms` is result-seen to armed.
     crate::blackbox::record(
         "setup",
-        json!({ "event": "approach_result", "result": result,
+        json!({ "event": "approach_result", "outcome": run.outcome.name(), "result": result,
                 "armed": matches!(next, AfterInit::Arm { .. }),
+                "arm_ms": seen.elapsed().as_millis() as u64,
+                "read_errors": run.read_errors, "polls": run.polls,
                 "ms": t0.elapsed().as_millis() as u64 }),
     );
+    match &next {
+        AfterInit::Arm { line, .. } | AfterInit::Monitor { line } | AfterInit::Failed { line } => {
+            say(line)
+        }
+    }
     if matches!(next, AfterInit::Failed { .. }) || !crate::mode::atc_enabled() {
         return;
     }
@@ -905,6 +1089,171 @@ mod tests {
             err,
             "L E M G has no runway one four. It has one three, three one, one two, three zero."
         );
+    }
+
+    /// The mailbox through a reload: reads fail (or hang) for a while after
+    /// the post, then the plugin's answer is there.
+    struct Reloading {
+        failing: std::sync::atomic::AtomicU32,
+        hanging: std::sync::atomic::AtomicU32,
+        /// Result reads after the post that still show "pending".
+        pending: std::sync::atomic::AtomicU32,
+        posted: std::sync::atomic::AtomicBool,
+        answer: i64,
+        post_fails: bool,
+    }
+
+    impl Reloading {
+        fn new(failing: u32, hanging: u32, pending: u32, answer: i64) -> Self {
+            Reloading {
+                failing: failing.into(),
+                hanging: hanging.into(),
+                pending: pending.into(),
+                posted: false.into(),
+                answer,
+                post_fails: false,
+            }
+        }
+    }
+
+    #[async_trait]
+    impl InitMailbox for Reloading {
+        async fn read(&self, name: &str) -> Result<f64> {
+            use std::sync::atomic::Ordering::SeqCst;
+            let posted = self.posted.load(SeqCst);
+            if posted && self.hanging.load(SeqCst) > 0 {
+                self.hanging.fetch_sub(1, SeqCst);
+                tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+            }
+            if posted && self.failing.load(SeqCst) > 0 {
+                self.failing.fetch_sub(1, SeqCst);
+                anyhow::bail!("503 mid-reload");
+            }
+            let done = posted && self.pending.load(SeqCst) == 0;
+            if posted && !done && name == INIT_RESULT {
+                self.pending.fetch_sub(1, SeqCst);
+            }
+            Ok(match (name, posted, done) {
+                (INIT_SEQ, _, true) => 1.0,
+                (INIT_SEQ, _, false) => 0.0,
+                (_, _, true) => self.answer as f64,
+                (_, true, false) => -1.0,
+                // The last flight's answer: success, seq 0.
+                _ => 0.0,
+            })
+        }
+        async fn post(&self, _body: &[u8]) -> Result<()> {
+            if self.post_fails {
+                anyhow::bail!("no plugin");
+            }
+            self.posted.store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    const FAST: InitTiming = InitTiming {
+        poll: std::time::Duration::from_millis(5),
+        read_timeout: std::time::Duration::from_millis(40),
+        deadline: std::time::Duration::from_secs(2),
+        report_every: std::time::Duration::from_millis(20),
+    };
+
+    fn quiet(_: InitWait) {}
+
+    #[tokio::test]
+    async fn the_result_is_read_through_a_reload_that_answers_errors() {
+        // A failed read is one more poll, never the end of the wait.
+        let mb = Reloading::new(12, 0, 3, 0);
+        let run = run_init(&mb, b"{}", FAST, &quiet).await;
+        assert_eq!(run.outcome, InitOutcome::Done(0));
+        assert!(run.read_errors >= 12, "{run:?}");
+    }
+
+    #[tokio::test]
+    async fn a_read_that_hangs_through_the_reload_does_not_hold_the_arm_back() {
+        let mb = Reloading::new(0, 4, 1, 0);
+        let t0 = std::time::Instant::now();
+        let run = run_init(&mb, b"{}", FAST, &quiet).await;
+        assert_eq!(run.outcome, InitOutcome::Done(0));
+        assert!(t0.elapsed() < std::time::Duration::from_secs(1), "{:?}", t0.elapsed());
+        // Live: a hung read plus a poll is under a second.
+        assert!(
+            (InitTiming::LIVE.read_timeout + InitTiming::LIVE.poll)
+                < std::time::Duration::from_secs(1)
+        );
+    }
+
+    #[tokio::test]
+    async fn the_last_flights_answer_is_never_this_ones_and_a_stuck_wait_reports() {
+        // Before the post the mailbox reads seq 0, result 0: success from
+        // the flight before. Never taken; the wait says what it sees.
+        let mb = Reloading::new(0, 0, u32::MAX, 0);
+        let seen = std::sync::Mutex::new(Vec::new());
+        let t = InitTiming { deadline: std::time::Duration::from_millis(150), ..FAST };
+        let run = run_init(&mb, b"{}", t, &|w| seen.lock().unwrap().push(w)).await;
+        assert_eq!(run.outcome, InitOutcome::TimedOut);
+        let seen = seen.into_inner().unwrap();
+        assert!(seen.len() >= 3, "{}", seen.len());
+        assert_eq!(seen[0].seq0, 0.0);
+        assert_eq!(seen[0].seq, Some(0.0));
+        assert_eq!(seen[0].result, Some(-1.0), "pending while the plugin has it");
+    }
+
+    #[tokio::test]
+    async fn a_refusal_and_an_unreachable_plugin_are_outcomes() {
+        let mb = Reloading::new(0, 0, 0, 6);
+        assert_eq!(run_init(&mb, b"{}", FAST, &quiet).await.outcome, InitOutcome::Done(6));
+        let mut dead = Reloading::new(0, 0, 0, 0);
+        dead.post_fails = true;
+        let run = run_init(&dead, b"{}", FAST, &quiet).await;
+        assert_eq!(run.outcome.name(), "unreachable");
+        assert_eq!(InitOutcome::TimedOut.name(), "timeout");
+        assert_eq!(InitOutcome::Done(0).name(), "ok");
+        assert_eq!(InitOutcome::Done(6).name(), "refused");
+    }
+
+    #[test]
+    fn a_follow_up_runs_while_the_command_loop_blocks() {
+        // The live failure reproduced: on a current-thread runtime that
+        // blocks (the command loop on the mic), a `tokio::spawn`ed task does
+        // not run; one on its own thread does.
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let starved = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let ran = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        rt.block_on(async {
+            let s = starved.clone();
+            tokio::spawn(async move { s.store(true, std::sync::atomic::Ordering::SeqCst) });
+            let r = ran.clone();
+            spawn_off_loop(async move { r.store(true, std::sync::atomic::Ordering::SeqCst) });
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            assert!(!starved.load(std::sync::atomic::Ordering::SeqCst));
+            assert!(ran.load(std::sync::atomic::Ordering::SeqCst), "the follow-up starved");
+        });
+    }
+
+    #[test]
+    fn no_tool_leaves_work_on_the_command_loops_runtime() {
+        // Tools run on the command loop's current-thread runtime, which
+        // blocks on the microphone: work that must outlive the call goes on
+        // `spawn_off_loop` (or its own thread), never `tokio::spawn`. Test
+        // modules may spawn (a test runtime is theirs); comments may name it.
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/tools");
+        let mut offenders = Vec::new();
+        for e in std::fs::read_dir(&dir).unwrap().flatten() {
+            let p = e.path();
+            if p.extension().is_none_or(|x| x != "rs") {
+                continue;
+            }
+            let text = std::fs::read_to_string(&p).unwrap();
+            let live = text.split("#[cfg(test)]").next().unwrap_or("");
+            for (i, line) in live.lines().enumerate() {
+                let code = line.split("//").next().unwrap_or("");
+                if code.contains("tokio::spawn(") {
+                    offenders.push(format!("{}:{}", p.display(), i + 1));
+                }
+            }
+        }
+        assert!(offenders.is_empty(), "tokio::spawn from a tool starves: {offenders:?}");
     }
 
     #[test]
