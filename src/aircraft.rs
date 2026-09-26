@@ -28,6 +28,13 @@ pub struct FlarePowerProfile {
     /// elevator on its stop (2026-09-26). `None` keeps the sink-keyed law.
     #[serde(default)]
     pub retard_below_ft: Option<f64>,
+    /// ...and not before the sink has come inside this rate (fpm, positive)
+    /// at least once in the flare. The LEMG 12 flare (2026-09-26) was still
+    /// sinking 300 at 20 ft, the height retard walked the lever 0.44 to 0.16,
+    /// and the speed it took off came back as sink at the wheels (407).
+    /// `None` retards by height alone.
+    #[serde(default)]
+    pub retard_inside_fpm: Option<f64>,
 }
 
 /// How the landing arrest's vertical-speed dial leads THIS autopilot's lag
@@ -107,39 +114,49 @@ pub struct FlareElevatorProfile {
 }
 
 /// The elevator-to-sink response of an airframe with the servos out, as its
-/// own flares recorded it: a standing pull holds a standing change of sink
-/// (`fpm_per_elevator`), arriving through two equal lags (`lag_s`) after a
-/// dead time (`dead_s`, the tick and the pitch response together). The 737
-/// fitted to its six LEMG 13 flares of 2026-09-26 is 2,600 fpm, 1.0 s and
-/// 1.8 s: a constant 0.23 of pull settled its sink at -350 (it does not keep
-/// arresting, as the old test plant's integrator did), and the sink turned
-/// 1.8 s after the column moved.
+/// own flares recorded it, and what the flare law does with it
+/// (`autoland::FlareModel`). A standing pull holds a standing change of sink
+/// (`fpm_per_elevator`) arriving through two lags (`lag_s`, `lag2_s`) after a
+/// dead time (`dead_s`); near the runway the aircraft pitches down by itself
+/// (the tail's ground effect), worth `ground_fpm` of sink at the wheels and
+/// growing linearly from `ground_ft`. Fitted to the 737's seven LEMG flares
+/// of 2026-09-26 (six on 13, one on 12; 35 fpm rms): 4,970 fpm, 0.84 and
+/// 3.1 s, 1.35 s of dead time, 405 fpm of ground effect from 43 ft. The
+/// first fit (2,600 fpm, two 1 s lags, 1.8 s, no ground term) landed every
+/// recorded gate soft on paper and the LEMG 12 flare at 407.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct FlareModelProfile {
     /// Standing change of sink per unit of elevator, fpm.
     pub fpm_per_elevator: f64,
-    /// Each of the two lags, seconds.
+    /// The first lag, seconds.
     pub lag_s: f64,
+    /// The second lag, seconds (absent: the first again).
+    #[serde(default)]
+    pub lag2_s: Option<f64>,
     /// The dead time, seconds.
     pub dead_s: f64,
-    /// The sink target is taken at the height the aircraft will have this
-    /// many seconds ahead (the response is that late).
-    #[serde(default = "default_model_lead_s")]
-    pub lead_s: f64,
-    /// How fast the law asks the model to arrive, seconds (smaller kicks the
-    /// column harder at the gate).
-    #[serde(default = "default_model_settle_s")]
-    pub settle_s: f64,
+    /// The sink the ground adds at the wheels, fpm (0: none modelled).
+    #[serde(default)]
+    pub ground_fpm: f64,
+    /// ...growing linearly from this height, ft.
+    #[serde(default = "default_model_ground_ft")]
+    pub ground_ft: f64,
+    /// The law asks the MODEL's sink this far ahead to be the flare's target
+    /// at the height the aircraft will have then, seconds (absent: the dead
+    /// time plus one).
+    #[serde(default)]
+    pub horizon_s: Option<f64>,
+    /// The sink the flare's target arrives at on the runway, fpm (positive;
+    /// absent: the arrest's own quarter of the path sink).
+    #[serde(default)]
+    pub touchdown_fpm: Option<f64>,
     /// Smoothing on the unexplained sink, seconds.
     #[serde(default = "default_model_observer_s")]
     pub observer_s: f64,
 }
 
-fn default_model_lead_s() -> f64 {
-    3.5
-}
-fn default_model_settle_s() -> f64 {
-    0.6
+fn default_model_ground_ft() -> f64 {
+    40.0
 }
 fn default_model_observer_s() -> f64 {
     0.3
@@ -149,9 +166,14 @@ impl FlareModelProfile {
     pub fn valid(self) -> Option<Self> {
         ((500.0..=10_000.0).contains(&self.fpm_per_elevator)
             && (0.1..=5.0).contains(&self.lag_s)
+            && self.lag2_s.is_none_or(|l| (0.1..=8.0).contains(&l))
             && (0.0..=4.0).contains(&self.dead_s)
-            && (0.0..=8.0).contains(&self.lead_s)
-            && (0.1..=5.0).contains(&self.settle_s)
+            && (0.0..=1500.0).contains(&self.ground_fpm)
+            && (5.0..=150.0).contains(&self.ground_ft)
+            && self.horizon_s.is_none_or(|h| (0.3..=8.0).contains(&h))
+            && self
+                .touchdown_fpm
+                .is_none_or(|t| (50.0..=400.0).contains(&t))
             && (0.05..=3.0).contains(&self.observer_s))
         .then_some(self)
     }
