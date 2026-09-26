@@ -652,7 +652,7 @@ pub fn arrival_ceiling_ft(
             continue;
         };
         let d = distance_to_leg_nm(from.lat, from.lon, legs, idx, k);
-        let c = max + d * ft_per_nm;
+        let c = max + path_nm(d) * ft_per_nm;
         ceiling = Some(ceiling.map_or(c, |x: f64| x.min(c)));
     }
     let floor = restriction_at(cons, &legs[idx]).and_then(|c| c.min_ft);
@@ -676,19 +676,71 @@ pub fn profile_ceiling_ft(legs: &[ProcLeg], idx: usize, ft_per_nm: f64) -> Optio
         }
         let Some(alt) = leg.alt1_ft else { continue };
         let d = distance_to_leg_nm(from.lat, from.lon, legs, idx, k);
-        let c = alt + d * ft_per_nm;
+        let c = alt + path_nm(d) * ft_per_nm;
         ceiling = Some(ceiling.map_or(c, |x: f64| x.min(c)));
     }
     ceiling
 }
 
-/// Descent gradient the ceiling is planned at, as a share of what the law
-/// flies: the rest is margin for the deceleration a speed limit asks for.
-const ARRIVAL_GRADIENT_SHARE: f64 = 0.85;
+/// The miles of a later fix's distance a ceiling may climb on: all of it
+/// but the descent's lead ([`TOD_LEAD_NM`]), which the path to that fix
+/// spends level at its altitude. The ceilings and the path are then ONE
+/// line: crossing a fix at its ceiling puts the aircraft exactly on the next
+/// leg's path. With the whole distance counted, every leg of the LEMG UNTO2A
+/// began a lead's worth of gradient above its own path (2026-09-26).
+fn path_nm(d: f64) -> f64 {
+    if d <= 0.0 {
+        0.0
+    } else {
+        (d - TOD_LEAD_NM).max(0.0)
+    }
+}
 
-/// Feet per nm the arrival ceiling is planned on at this groundspeed.
+/// Feet per nm the arrival ceiling is planned on at this groundspeed: the
+/// SAME planning rate the descent path is flown at
+/// ([`DESCENT_PLAN_FRACTION`]). It was 85 % against the path's 75 %, so a
+/// fix crossed at its ceiling was above the next leg's path and each leg
+/// started by catching up at the full rate, the margin a speed limit needs
+/// already spent (FOFUS 386 ft high, LEMG 2026-09-26).
 pub fn arrival_ft_per_nm(descent_fpm: f64, gs_kts: f64) -> f64 {
-    ARRIVAL_GRADIENT_SHARE * descent_fpm / (gs_kts.max(60.0) / 60.0)
+    DESCENT_PLAN_FRACTION * descent_fpm / (gs_kts.max(60.0) / 60.0)
+}
+
+/// The altitude leg `idx` is flown to once the ceilings ahead
+/// ([`arrival_ceiling_ft`], [`profile_ceiling_ft`]) are applied: `Some((alt,
+/// ceiling))` when a ceiling lowered the plan's altitude, `None` otherwise.
+/// `latch` holds the lowest ceiling seen on this leg: the ceiling is a
+/// gradient over the groundspeed, so it RISES as the aircraft slows, and an
+/// unlatched one lifted MG539's target from 14,900 to 15,500 ft in the last
+/// two miles and the 737 climbed at +260 fpm into its 230 kt slow-down
+/// (LEMG 2026-09-26). A descent's target never climbs back.
+pub fn ceilinged_leg_alt(
+    legs: &[ProcLeg],
+    cons: &[crate::nav::StarConstraint],
+    idx: usize,
+    gs_kts: f64,
+    descent_fpm: f64,
+    latch: &mut Option<(usize, f64)>,
+) -> Option<(f64, f64)> {
+    let grad = arrival_ft_per_nm(descent_fpm, gs_kts);
+    let ceiling = match (
+        arrival_ceiling_ft(legs, cons, idx, grad),
+        profile_ceiling_ft(legs, idx, grad),
+    ) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (a, b) => a.or(b),
+    };
+    let ceiling = match (ceiling, *latch) {
+        (Some(c), Some((i, l))) if i == idx => Some(c.min(l)),
+        (c, _) => c,
+    };
+    if let Some(c) = ceiling {
+        *latch = Some((idx, c));
+    }
+    match (legs.get(idx)?.alt1_ft, ceiling) {
+        (Some(a), Some(c)) if c < a - 50.0 => Some(((c / 100.0).floor() * 100.0, c)),
+        _ => None,
+    }
 }
 
 /// Knots a second the governor is planned to lose speed at in a descent.
@@ -1048,11 +1100,27 @@ pub fn descent_target_ft(
     gs_kts: f64,
     descent_fpm: f64,
 ) -> f64 {
+    descent_target(leg_alt, carry, alt_ft, dist_nm, gs_kts, descent_fpm).0
+}
+
+/// [`descent_target_ft`] and the target's own rate, fpm: the path's planned
+/// descent while the target is moving down it, zero when it is a level. The
+/// VS law feeds it forward ([`vs_law_fpm`]): a proportional law alone trails
+/// a ramp by rate over gain, 500 ft at the 737's 1,500 fpm path, and the
+/// path ends at the fix.
+pub fn descent_target(
+    leg_alt: f64,
+    carry: f64,
+    alt_ft: f64,
+    dist_nm: Option<f64>,
+    gs_kts: f64,
+    descent_fpm: f64,
+) -> (f64, f64) {
     let Some(dist_nm) = dist_nm else {
-        return leg_alt;
+        return (leg_alt, 0.0);
     };
     if descent_point_nm(leg_alt, alt_ft, gs_kts, descent_fpm).is_none() {
-        return leg_alt;
+        return (leg_alt, 0.0);
     }
     let held = if carry <= alt_ft + 100.0 {
         carry
@@ -1069,8 +1137,25 @@ pub fn descent_target_ft(
     // full rate; the path itself is the gentler one.
     let ft_per_nm = descent_fpm * DESCENT_PLAN_FRACTION / (gs_kts.max(60.0) / 60.0);
     let path = leg_alt + (dist_nm - TOD_LEAD_NM).max(0.0) * ft_per_nm;
-    path.min(held).max(leg_alt)
+    let want = path.min(held).max(leg_alt);
+    // Moving only while the PATH is what is commanded (not the level held
+    // before the top of descent, not the constraint after the lead).
+    let rate = if path < held && path > leg_alt {
+        -descent_fpm * DESCENT_PLAN_FRACTION
+    } else {
+        0.0
+    };
+    (want, rate)
 }
+
+/// The follower's vertical speed law: the target's own rate fed forward,
+/// plus three fpm a foot of error, inside the airframe's rates.
+pub fn vs_law_fpm(want_alt: f64, alt_ft: f64, target_fpm: f64, descent_fpm: f64, climb_cap: f64) -> f64 {
+    (target_fpm + (want_alt - alt_ft) * VS_GAIN_PER_FT).clamp(-descent_fpm, climb_cap)
+}
+
+/// Fpm of commanded vertical speed per foot off the target.
+const VS_GAIN_PER_FT: f64 = 3.0;
 
 /// The share of the airframe's descent rate a descent is PLANNED at: the
 /// rest is margin to catch up with, as a crew plans 3 miles per thousand
@@ -1108,6 +1193,9 @@ pub struct Vertical {
     pub floored: Option<f64>,
     /// True when the pilot's altitude is what set `want_alt`.
     pub pilot: bool,
+    /// `want_alt`'s own rate, fpm (negative down a descent path, zero for a
+    /// level), for the VS law's feed-forward.
+    pub target_fpm: f64,
 }
 
 /// Order of precedence, each one a rule learned the hard way: the plan's
@@ -1184,16 +1272,19 @@ pub fn vertical_tick(
     descent_fpm: f64,
 ) -> Vertical {
     let leg_alt = commanded_alt_ft(leg, carry);
-    let mut want_alt = descent_target_ft(leg_alt, prev_cmd, alt_ft, dist_nm, gs_kts, descent_fpm);
+    let (mut want_alt, mut target_fpm) =
+        descent_target(leg_alt, prev_cmd, alt_ft, dist_nm, gs_kts, descent_fpm);
     let from_pilot = pilot.is_some();
     if let Some(p) = pilot {
         want_alt = p;
+        target_fpm = 0.0;
     }
     let mut floored = None;
     if let Some(floor) = terrain_floor {
         if want_alt < floor {
             want_alt = floor;
             floored = Some(floor);
+            target_fpm = 0.0;
         }
     }
     Vertical {
@@ -1202,6 +1293,7 @@ pub fn vertical_tick(
         prev_cmd: want_alt,
         floored,
         pilot: from_pilot && floored.is_none(),
+        target_fpm,
     }
 }
 
@@ -1838,6 +1930,8 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, plan: Pla
 
     let mut said_star_speed: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut star_ceiling_logged: Option<usize> = None;
+    // The lowest ceiling seen on the leg flying (`ceilinged_leg_alt`).
+    let mut ceiling_latch: Option<(usize, f64)> = None;
     // The one descent a pilot-held altitude is reminded about: (the pilot's
     // altitude, the fix). The plan's later descents under the same held
     // altitude are silent; a new altitude from the pilot is a new hold.
@@ -2339,30 +2433,29 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, plan: Pla
         // The STAR's "at or below"s ahead, kept reachable: this fix's target
         // comes down to whatever still makes the tightest one further on.
         let star_leg;
-        let grad = arrival_ft_per_nm(descent_fpm(), gs_kts);
-        let ceiling = match (
-            arrival_ceiling_ft(&legs, &arrival_constraints, idx, grad),
-            profile_ceiling_ft(&legs, idx, grad),
+        let leg_for_vertical = match ceilinged_leg_alt(
+            &legs,
+            &arrival_constraints,
+            idx,
+            gs_kts,
+            descent_fpm(),
+            &mut ceiling_latch,
         ) {
-            (Some(a), Some(b)) => Some(a.min(b)),
-            (a, b) => a.or(b),
-        };
-        let leg_for_vertical = match (leg.alt1_ft, ceiling) {
-            (Some(a), Some(c)) if c < a - 50.0 => {
+            Some((alt, c)) => {
                 if star_ceiling_logged != Some(idx) {
                     star_ceiling_logged = Some(idx);
                     crate::blackbox::record(
                         "procedure",
                         serde_json::json!({"event": "star_ceiling", "idx": idx, "fix": leg.fix_ident,
-                                           "plan_ft": a, "ceiling_ft": c}),
+                                           "plan_ft": leg.alt1_ft, "ceiling_ft": c}),
                     );
                 }
                 let mut l = leg.clone();
-                l.alt1_ft = Some((c / 100.0).floor() * 100.0);
+                l.alt1_ft = Some(alt);
                 star_leg = l;
                 &star_leg
             }
-            _ => leg,
+            None => leg,
         };
         let v = vertical_tick(
             leg_for_vertical,
@@ -2490,7 +2583,12 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, plan: Pla
         let mut vs_cmd = match path {
             Some((path_ft, ff_fpm)) => (ff_fpm + (path_ft - alt_ft) * 2.0)
                 .clamp(-descent_fpm().max(ff_fpm.abs() * 1.4), 300.0),
-            None => ((want_alt - alt_ft) * 3.0).clamp(-descent_fpm(), climb_cap),
+            None => {
+                // The feed-forward only while the plan's path IS the target
+                // (a departure minimum or a MAP path is not it).
+                let ff = if (want_alt - v.want_alt).abs() < 1.0 { v.target_fpm } else { 0.0 };
+                vs_law_fpm(want_alt, alt_ft, ff, descent_fpm(), climb_cap)
+            }
         };
         if vs_cmd > 0.0 && vy_kts > 0.0 {
             vs_cmd = vs_cmd.min(crate::autotakeoff::climb_vs_fpm(ias, vy_kts, vs_cmd));
@@ -3242,13 +3340,16 @@ mod tests {
     fn a_restriction_two_fixes_on_brings_the_descent_forward() {
         let (mut legs, cons) = star_route();
         apply_arrival_constraints(&mut legs, &cons);
+        // Planned at the path's own 75 % (2026-09-26), and on the path's
+        // miles: the last one before TARTN is its lead, flown level.
         let grad = arrival_ft_per_nm(2_000.0, 300.0);
-        assert!((grad - 340.0).abs() < 1.0, "{grad}");
+        assert!((grad - 300.0).abs() < 1.0, "{grad}");
         let c = arrival_ceiling_ft(&legs, &cons, 2, grad).unwrap();
-        assert!((c - (7_000.0 + 15.0 * 340.0)).abs() < 30.0, "MIDDL {c}");
-        // Further out the ceiling is above the plan and changes nothing...
+        assert!((c - (7_000.0 + 14.0 * 300.0)).abs() < 30.0, "MIDDL {c}");
+        // Further out it is the same line: 39 path miles from HAVEN, under
+        // the plan's 20,000 at the planning rate (above it at the old 85 %)...
         let c = arrival_ceiling_ft(&legs, &cons, 1, grad).unwrap();
-        assert!(c > 20_000.0, "HAVEN {c}");
+        assert!((c - (7_000.0 + 39.0 * 300.0)).abs() < 30.0, "HAVEN {c}");
         // ...and a fix's own "at" stands over it.
         assert_eq!(arrival_ceiling_ft(&legs, &cons, 0, grad), Some(26_000.0));
         assert_eq!(arrival_ceiling_ft(&legs, &cons, 4, grad), None, "nothing ahead");
@@ -3313,6 +3414,154 @@ mod tests {
         let crossed = fly(true);
         assert!(crossed <= 7_100.0, "crossed TARTN at {crossed}");
         assert!(fly(false) > 8_000.0, "the test must bite without the ceiling");
+    }
+
+    /// LEMG's UNTO2A as the 737 flew it on 2026-09-26 (LIBP-LEMG, sortie
+    /// 1790429680): each fix with the plan's altitude after the STAR clamp
+    /// (the `star_ceiling` records' `plan_ft`), and the groundspeed and
+    /// airspeed recorded on the leg TO it (first, last).
+    #[allow(clippy::type_complexity)]
+    fn lemg_unto2a() -> (Vec<ProcLeg>, Vec<crate::nav::StarConstraint>, Vec<((f64, f64), (f64, f64))>) {
+        let fixes: [(&str, f64, f64, f64, (f64, f64), (f64, f64)); 17] = [
+            ("TOSGA", 37.625555556, -2.307222222, 37_000.0, (422.0, 435.0), (252.0, 257.0)),
+            ("ROLAS", 37.415555556, -2.854444444, 37_000.0, (435.0, 410.0), (257.0, 252.0)),
+            ("UNTOS", 37.250555556, -3.277694444, 29_000.0, (410.0, 383.0), (252.0, 254.0)),
+            ("NESDA", 36.821472222, -3.741722222, 28_720.0, (383.0, 363.0), (254.0, 247.0)),
+            ("IBACO", 36.710527778, -3.927638889, 26_007.0, (364.0, 353.0), (248.0, 252.0)),
+            ("OSENE", 36.710055556, -4.051972222, 24_551.0, (351.0, 342.0), (250.0, 250.0)),
+            ("PIZCU", 36.709444444, -4.176333333, 23_094.0, (342.0, 339.0), (250.0, 253.0)),
+            ("MG539", 36.839777778, -4.411083333, 19_752.0, (339.0, 295.0), (253.0, 228.0)),
+            ("OBLAC", 36.839055556, -4.577166667, 14_000.0, (294.0, 291.0), (227.0, 228.0)),
+            ("FOFUS", 36.932777778, -4.695500000, 10_000.0, (291.0, 282.0), (228.0, 228.0)),
+            ("MG529", 36.999527778, -4.696138889, 10_000.0, (282.0, 252.0), (228.0, 212.0)),
+            ("MG533", 37.066277778, -4.696777778, 10_000.0, (252.0, 247.0), (212.0, 209.0)),
+            ("MG537", 37.133027778, -4.697444444, 10_000.0, (247.0, 246.0), (209.0, 208.0)),
+            ("MG541", 37.199805556, -4.698083333, 10_000.0, (246.0, 247.0), (207.0, 207.0)),
+            ("MG437", 37.199111111, -4.802388889, 10_000.0, (247.0, 263.0), (207.0, 212.0)),
+            ("MG433", 37.132333333, -4.801666667, 10_000.0, (263.0, 253.0), (212.0, 212.0)),
+            ("LENHI", 37.065583333, -4.800916667, 8_800.0, (253.0, 254.0), (212.0, 218.0)),
+        ];
+        let legs = fixes
+            .iter()
+            .map(|(id, lat, lon, alt, _, _)| {
+                let mut l = leg(id, *lat, *lon);
+                l.alt1_ft = Some(*alt);
+                l
+            })
+            .collect();
+        let speeds = fixes.iter().map(|f| (f.4, f.5)).collect();
+        // The chart's windows as `plan_audit` `star_constraints` logged them.
+        let c = |fix: &str, min: Option<f64>, max: Option<f64>, kts: Option<f64>| crate::nav::StarConstraint {
+            fix: fix.into(),
+            min_ft: min,
+            max_ft: max,
+            max_kts: kts,
+        };
+        let cons = vec![
+            c("UNTOS", Some(14_000.0), Some(29_000.0), None),
+            c("NESDA", Some(13_500.0), None, None),
+            c("IBACO", Some(11_000.0), None, None),
+            c("OSENE", Some(10_000.0), None, None),
+            c("MG539", Some(8_500.0), None, Some(230.0)),
+            c("OBLAC", Some(7_000.0), Some(14_000.0), Some(220.0)),
+            c("FOFUS", Some(7_000.0), Some(10_000.0), Some(220.0)),
+            c("MG529", None, None, Some(210.0)),
+            c("MG533", None, None, Some(210.0)),
+            c("MG537", None, None, Some(210.0)),
+            c("MG541", None, None, Some(210.0)),
+            c("MG437", None, None, Some(210.0)),
+            c("MG433", None, None, Some(210.0)),
+            c("LENHI", Some(7_000.0), None, Some(210.0)),
+        ];
+        (legs, cons, speeds)
+    }
+
+    /// Fly the follower's real vertical (the ceilings, `vertical_tick`, the VS
+    /// law, the descent drag, the 100 fpm dial) down the recorded UNTO2A from
+    /// the ROLAS leg at FL370, through the 737's VS mode as the autoland
+    /// sorties model it: two 1.5 s lags behind 2 s of dead time, the loop
+    /// ticking every half second. Returns the altitude at each fix as the
+    /// leg sequences (1.2 nm out, FOFUS's recorded capture) and the highest
+    /// vertical speed flown.
+    fn fly_unto2a() -> (Vec<(String, f64)>, f64) {
+        let (legs, cons, speeds) = lemg_unto2a();
+        const RATE: f64 = 2_000.0;
+        const CAPTURE_NM: f64 = 1.2;
+        let dt = 0.5;
+        let (mut lat, mut lon) = (legs[0].fix.as_ref().unwrap().lat, legs[0].fix.as_ref().unwrap().lon);
+        let mut idx = 1usize;
+        let mut alt = 37_000.0;
+        let (mut carry, mut prev) = (alt, alt);
+        let mut latch = None;
+        let mut drag_out = false;
+        let (mut lag1, mut vs) = (0.0f64, 0.0f64);
+        let mut dial_queue: std::collections::VecDeque<f64> = std::collections::VecDeque::new();
+        let mut crossings = Vec::new();
+        let mut max_vs = f64::MIN;
+        let mut leg_len = crate::nav::haversine_nm(lat, lon, legs[1].fix.as_ref().unwrap().lat, legs[1].fix.as_ref().unwrap().lon);
+        for _ in 0..40_000 {
+            let f = legs[idx].fix.clone().unwrap();
+            let d = crate::nav::haversine_nm(lat, lon, f.lat, f.lon);
+            if d < CAPTURE_NM {
+                crossings.push((legs[idx].fix_ident.clone(), alt));
+                idx += 1;
+                if idx == legs.len() {
+                    break;
+                }
+                let n = legs[idx].fix.clone().unwrap();
+                leg_len = crate::nav::haversine_nm(lat, lon, n.lat, n.lon);
+                continue;
+            }
+            let frac = (1.0 - d / leg_len).clamp(0.0, 1.0);
+            let ((g0, g1), (i0, i1)) = speeds[idx];
+            let (gs, ias) = (g0 + (g1 - g0) * frac, i0 + (i1 - i0) * frac);
+            let mut l = legs[idx].clone();
+            if let Some((a, _)) = ceilinged_leg_alt(&legs, &cons, idx, gs, RATE, &mut latch) {
+                l.alt1_ft = Some(a);
+            }
+            let v = vertical_tick(&l, carry, prev, alt, Some(d), gs, None, None, RATE);
+            carry = v.carry;
+            prev = v.prev_cmd;
+            let mut cmd = vs_law_fpm(v.want_alt, alt, v.target_fpm, RATE, 1_500.0);
+            let target = arrival_speed_cap(&legs, &cons, idx, lat, lon, ias, gs).map_or(255.0, |c| c.0);
+            let (out, scale) = descent_drag(drag_out, ias, Some(target), cmd);
+            drag_out = out;
+            cmd *= scale;
+            dial_queue.push_back(vs_dial_fpm(cmd));
+            // 2 s of dead time at the half-second tick.
+            let dial = if dial_queue.len() > 4 { dial_queue.pop_front().unwrap() } else { 0.0 };
+            for _ in 0..10 {
+                let h = dt / 10.0;
+                lag1 += (dial - lag1) * h / 1.5;
+                vs += (lag1 - vs) * h / 1.5;
+                alt += vs * h / 60.0;
+            }
+            max_vs = max_vs.max(vs);
+            let brg = crate::nav::bearing_deg(lat, lon, f.lat, f.lon);
+            (lat, lon) = crate::nav::project_latlon(lat, lon, brg, gs * dt / 3600.0);
+        }
+        (crossings, max_vs)
+    }
+
+    /// FOFUS on UNTO2A is 7,000 to 10,000 ft and the 737 crossed it at 10,386
+    /// (2026-09-26): every fix's target was held a few miles into its leg
+    /// against the last one (never reached), the proportional VS law trailed
+    /// the path by 500 ft, and MG539's ceiling rose 600 ft as the aircraft
+    /// slowed and the descent climbed back. Replayed on the recorded legs,
+    /// every window is made, FOFUS inside its top, and nothing climbs.
+    #[test]
+    fn the_recorded_unto2a_crosses_fofus_inside_its_window() {
+        let (crossings, max_vs) = fly_unto2a();
+        let (_, cons, _) = lemg_unto2a();
+        let at = |fix: &str| crossings.iter().find(|(f, _)| f == fix).map(|c| c.1).unwrap();
+        let fofus = at("FOFUS");
+        assert!((7_000.0..=10_100.0).contains(&fofus), "FOFUS at {fofus:.0}: {crossings:?}");
+        for c in &cons {
+            let alt = at(&c.fix);
+            assert!(c.min_ft.is_none_or(|m| alt >= m - 100.0), "{} at {alt:.0}", c.fix);
+            assert!(c.max_ft.is_none_or(|m| alt <= m + 100.0), "{} at {alt:.0}", c.fix);
+        }
+        assert!(max_vs < 150.0, "the descent climbed at {max_vs:.0} fpm: {crossings:?}");
     }
 
     #[test]
