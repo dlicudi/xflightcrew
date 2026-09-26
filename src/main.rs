@@ -3641,11 +3641,19 @@ fn analyze_commands() -> Result<()> {
         .map(|d| d.filter_map(|e| e.ok().map(|e| e.path())).collect())
         .unwrap_or_default();
     paths.sort();
+    // `--since 2026-09-20`: only logs from that day on (the dated suffix).
+    let since = std::env::args()
+        .skip_while(|a| a != "--since")
+        .nth(1)
+        .unwrap_or_default();
     for p in paths {
         let is_log = p
             .file_name()
             .and_then(|n| n.to_str())
-            .is_some_and(|n| n.starts_with("xvoicelayer.log"));
+            .is_some_and(|n| {
+                n.starts_with("xvoicelayer.log")
+                    && (since.is_empty() || n.rsplit('.').next().is_some_and(|d| d >= since.as_str()))
+            });
         if !is_log {
             continue;
         }
@@ -3689,6 +3697,42 @@ fn analyze_commands() -> Result<()> {
     println!("commands analyzed: {total}");
     println!("  handled:            {fast:>5}  ({}%)", fast * 100 / total);
     println!("  missed:             {miss:>5}  ({}%)", miss * 100 / total);
+    // Replayed through TODAY's deterministic chain (the 172's registry and
+    // checklists): what is still missed is the work list. Questions need the
+    // live sim to answer, so they are listed apart.
+    if std::env::args().any(|a| a == "--now") {
+        let profile = aircraft::load("cessna_172sp").ok_or_else(|| anyhow::anyhow!("no 172 profile"))?;
+        let registry = Registry::for_aircraft(&profile);
+        let checklists = flow::install(&profile);
+        let (mut still, mut questions, mut fixed) = (Vec::new(), Vec::new(), 0u32);
+        for (t, n) in &tail {
+            // The live chain: STT's own repairs, then the grammar's.
+            let m = grammar::normalize(&phrase::normalize_numbers(&phrase::fix_mishears(t)));
+            let handled = router::conversational(&m, &registry).is_some()
+                || grammar::try_parse(&m, &registry, &profile).is_some()
+                || checklist::match_request(&m, &checklists).is_some()
+                || grammar::declined(&m, &registry).is_some();
+            if handled {
+                fixed += n;
+            } else if looks_like_question(&m) {
+                questions.push((t.clone(), *n));
+            } else {
+                still.push((t.clone(), *n));
+            }
+        }
+        still.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+        questions.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+        println!("\nreplayed through today's grammar: {fixed} of {miss} now handled");
+        println!("\nstill missed, commands ({}):", still.len());
+        for (t, n) in &still {
+            println!("  {n:>3}  {t}");
+        }
+        println!("\nquestions (answered from the live sim, not checked here) ({}):", questions.len());
+        for (t, n) in &questions {
+            println!("  {n:>3}  {t}");
+        }
+        return Ok(());
+    }
     println!("\nrule candidates, the most frequent missed phrasings:");
     let mut v: Vec<(String, u32)> = tail.into_iter().collect();
     v.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
@@ -5919,5 +5963,20 @@ mod gap_tests_2026_09_12 {
         assert!(!looks_like_question(
             grammar::normalize("Can you fly the flight plan?").trim_end_matches('?')
         ));
+    }
+}
+
+#[cfg(test)]
+mod scratch_probe {
+    #[test]
+    #[ignore]
+    fn probe_phrases() {
+        let profile = crate::aircraft::load("cessna_172sp").unwrap();
+        let registry = crate::tools::Registry::for_aircraft(&profile);
+        for t in std::env::var("PROBE").unwrap_or_default().split('|') {
+            let m = crate::grammar::normalize(&crate::phrase::normalize_numbers(&crate::phrase::fix_mishears(t)));
+            let r = crate::grammar::try_parse(&m, &registry, &profile);
+            println!("PROBE {t:?} -> {m:?} -> {:?}", r.map(|c| c.iter().map(|x| format!("{} {}", x.name, x.arguments)).collect::<Vec<_>>()));
+        }
     }
 }

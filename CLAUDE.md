@@ -65,7 +65,10 @@ and removed the next day with its RAG index code, config, panel switch and
 health probe. The work goes into the deterministic layers instead: `xvl
 analyze` lists the most frequent missed phrasings in the logs, and each one
 is a grammar rule, a matcher or a profile entry with the live transcript as
-its test. The one model-shaped future use is an instructor answering handbook
+its test. `xvl analyze --now --since 2026-09-20` replays every miss through
+TODAY's STT repairs and grammar (the 172's registry) and lists only what is
+still missed, questions apart; the waiver, flight-plan load and ATC branches
+live outside the grammar, so a few of its "misses" are handled live. The one model-shaped future use is an instructor answering handbook
 questions; if it returns, it returns as that persona, never as a fallback.
 
 **X-Plane access: REST for transport, plugin for capability.** Every stock

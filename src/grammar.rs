@@ -735,6 +735,26 @@ pub fn resume_plan_request(t: &str) -> bool {
         .or_else(|| t.strip_prefix("i said, "))
         .map(str::to_string)
         .unwrap_or(t);
+    // "Resume" with only these words after it is still the resume: whisper
+    // pads and garbles the tail ("resume flight now" five times, "resumes
+    // like that", "resume the fight plan", "resume flight 9"; 2026-09-2x).
+    // A CLOSED set, so "resume taxi" or "resume the checklist" never lands.
+    const RESUME_TAIL: &[&str] = &[
+        "the", "my", "flight", "fight", "plan", "now", "right", "like", "that", "9", "nine",
+    ];
+    let lead = t.strip_prefix("resumes ").or_else(|| t.strip_prefix("resume "));
+    if let Some(rest) = lead {
+        let words: Vec<&str> = rest
+            .split(|c: char| !c.is_ascii_alphanumeric())
+            .filter(|w| !w.is_empty())
+            .collect();
+        if !words.is_empty()
+            && words.iter().all(|w| RESUME_TAIL.contains(w))
+            && words.iter().any(|w| matches!(*w, "flight" | "fight" | "now" | "like" | "right"))
+        {
+            return true;
+        }
+    }
     matches!(
         t.as_str(),
         "resume the flight plan"
@@ -792,7 +812,7 @@ fn flight_plan_call(t: &str) -> Option<ToolCall> {
     // gun / path / bluff / class / time", "fly the flat band" (737 and S-76,
     // 2026-09-22/23, each followed by "fly the flight plan"). Nothing else in
     // a cockpit is flown "the flight" anything.
-    let garbled_plan = has(t, "fly")
+    let garbled_plan = (has(t, "fly") || has(t, "blow"))
         && (t.contains("the flight ") || t.contains("the flat "))
         && !t.contains("director")
         && !t.contains("level");
@@ -811,6 +831,9 @@ fn flight_plan_call(t: &str) -> Option<ToolCall> {
     // as the brief, then said again as "fly the flight plan").
     let fly_shaped = has(t, "fly")
         || has(t, "flying")
+        // "Blow the flight gun" (2026-09-2x): the garbled plan word with
+        // "fly" heard as "blow".
+        || (garbled_plan && has(t, "blow"))
         || has(t, "execute")
         || t.starts_with("flight to flight plan")
         || t.starts_with("play the flight plan")
@@ -867,6 +890,7 @@ pub fn waiver_request(t: &str) -> bool {
         "fly it anyway",
         // Whisper, live (LILB 2026-09-25).
         "play it anyway",
+        "flight anyway",
         "do it anyway",
         "go anyway",
         "go ahead anyway",
@@ -2838,6 +2862,13 @@ mod tests {
             "continue the flight plan",
             "Resume site plan.",
             "resume flight plans",
+            // Live misses, 2026-09-2x.
+            "resume flight now",
+            "resume flight",
+            "resumes like that",
+            "resumes right now",
+            "resume the fight plan",
+            "resume flight 9",
         ] {
             assert!(resume_plan_request(words), "{words}");
             assert_eq!(
@@ -2851,6 +2882,7 @@ mod tests {
             "the copilot will resume the flight plan",
             "do not resume the flight plan",
             "resume the checklist",
+            "resume taxi",
             "resume flight plan tomorrow",
         ] {
             assert!(!resume_plan_request(words), "{words}");

@@ -327,6 +327,21 @@ const PHRASE_MISHEARS: &[(&str, &str)] = &[
     ("props to cruz", "props to cruise"), // "Props to Cruz."
     ("pross", "props"),                   // "Max Pross?" (Twotter, 2026-07-09)
     ("full prompts", "full props"),       // "Full prompts?"
+    // The plan and the load (live, 2026-09-2x). Nothing in a cockpit is a
+    // "slide plan" or a "flag turn".
+    ("low slide plan", "load the flight plan"),
+    ("low drive plan", "load the flight plan"),
+    ("load slide plug", "load the flight plan"),
+    ("load flag turn", "load the flight plan"),
+    ("load the flag can", "load the flight plan"),
+    ("low aircraft", "load the aircraft"),
+    // The ground and the landing.
+    ("faxing to parking", "taxi to parking"),
+    ("put the aircraft down", "land the aircraft"),
+    ("put it on the ground", "land the aircraft"),
+    ("retract the flaps", "flaps up"),
+    ("retract flaps", "flaps up"),
+    ("blending lights", "landing lights"),
     // Controls and autopilot.
     ("mic controls", "my controls"),  // "Mic controls."
     ("nine controls", "my controls"), // "9 controls."
@@ -593,6 +608,14 @@ mod tests {
             // Climb / descend.
             ("They send to five thousand.", "descend to five thousand."),
             ("Client five thousand feet.", "climb five thousand feet."),
+            // The plan, the load, the ground (live misses, 2026-09-2x).
+            ("Low slide plan.", "load the flight plan."),
+            ("Load flag turn.", "load the flight plan."),
+            ("Low aircraft.", "load the aircraft."),
+            ("Faxing to parking.", "taxi to parking."),
+            ("Put the aircraft down.", "land the aircraft."),
+            ("Retract flaps.", "flaps up."),
+            ("Blending lights off.", "landing lights off."),
             // Props.
             ("Props to Cruz.", "props to cruise."),
             ("Full prompts?", "full props?"),
