@@ -1731,6 +1731,22 @@ pub fn compliance_tick(
     tuned: bool,
     now: Instant,
 ) -> Option<ComplianceCall> {
+    compliance_tick_facing(lat, lon, alt_ft, on_ground, gs_kts, tuned, now, None)
+}
+
+/// [`compliance_tick`] with the aircraft's true heading, so a runway it is
+/// named on is the end it is pointing down ([`on_active_runway_facing`]).
+#[allow(clippy::too_many_arguments)]
+pub fn compliance_tick_facing(
+    lat: f64,
+    lon: f64,
+    alt_ft: f64,
+    on_ground: bool,
+    gs_kts: f64,
+    tuned: bool,
+    now: Instant,
+    heading_true: Option<f64>,
+) -> Option<ComplianceCall> {
     if out_of_reach() {
         return None;
     }
@@ -1786,7 +1802,7 @@ pub fn compliance_tick(
             && !w.landing_berated
             && *state != tower::State::ClearedToLand
         {
-            if let Some(rwy) = on_active_runway(lat, lon) {
+            if let Some(rwy) = on_active_runway_facing(lat, lon, heading_true) {
                 w.landing_berated = true;
                 w.last_call = Some(now);
                 let rwy = atis::spoken_runway(&rwy);
@@ -1935,7 +1951,7 @@ pub fn compliance_tick(
                 tower::State::LinedUp | tower::State::TakeoffCleared | tower::State::ClearedToLand
             )
         {
-            if let Some(rwy) = on_active_runway(lat, lon) {
+            if let Some(rwy) = on_active_runway_facing(lat, lon, heading_true) {
                 // The tower's OWN taxi route may cross (or backtrack) a
                 // runway — apt.dat networks do it all the time, and the
                 // clearance speaks the crossing ("cross runway two seven").
@@ -1949,7 +1965,9 @@ pub fn compliance_tick(
                 if cleared_taxi && on_cleared_runway_crossing(lat, lon) {
                     if gs_kts < 3.0 {
                         w.last_call = Some(now);
-                        let rwy = atis::spoken_runway(&rwy);
+                        // Crossing, the heading is square to the strip and
+                        // names neither end: the nearer one it is.
+                        let rwy = atis::spoken_runway(&on_active_runway(lat, lon).unwrap_or(rwy));
                         return Some(if tuned {
                             ComplianceCall {
                                 line: format!("{callsign}, expedite crossing runway {rwy}."),
@@ -2940,6 +2958,26 @@ const RUNWAY_EDGE_SLACK_M: f64 = 10.0;
 pub fn on_active_runway(lat: f64, lon: f64) -> Option<String> {
     let runways = ACTIVE_RUNWAYS.lock().unwrap_or_else(|e| e.into_inner());
     runways.iter().find_map(|r| on_runway(r, lat, lon))
+}
+
+/// [`on_active_runway`], naming the END the aircraft is pointing down when
+/// its true heading is known, else the nearer end. The nearer end is the
+/// wrong name for an aircraft that has rolled past the middle: a 737 landed
+/// LEMG 12, stopped heading 117 in the far half, and was told "you landed on
+/// runway three zero" (2026-09-26).
+pub fn on_active_runway_facing(lat: f64, lon: f64, heading_true: Option<f64>) -> Option<String> {
+    let runways = ACTIVE_RUNWAYS.lock().unwrap_or_else(|e| e.into_inner());
+    runways.iter().find_map(|r| {
+        let nearer = on_runway(r, lat, lon)?;
+        Some(match heading_true.filter(|h| h.is_finite()) {
+            Some(h) => {
+                let off_a = crate::nav::angle_diff_deg(h, r.heading_a_deg()).abs();
+                let off_b = crate::nav::angle_diff_deg(h, r.heading_b_deg()).abs();
+                if off_a <= off_b { r.ident_a.clone() } else { r.ident_b.clone() }
+            }
+            None => nearer,
+        })
+    })
 }
 
 /// Is this position ON one strip? The shared segment test behind
@@ -6375,6 +6413,52 @@ mod tests {
         *ACTIVE_FIELD.lock().unwrap() = None;
         *CLEARANCE.lock().unwrap() = None;
         *LANDING_HANDOFF.lock().unwrap() = None;
+        *COMPLIANCE.lock().unwrap() = ComplianceState::NEW;
+    }
+
+    /// LEMG 12 (2026-09-26, a 737): landed 12, stopped in the far half of
+    /// the strip heading 117, and was told "you landed on runway three zero"
+    /// because the name was the NEARER end. The end is the one the aircraft
+    /// points down. Shown on the Jerez strip (02 runs 021 true).
+    #[test]
+    fn a_runway_is_named_by_the_end_the_aircraft_points_down() {
+        let _guard = SIDE_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        *ACTIVE_FIELD.lock().unwrap() = Some(("Jerez".into(), 36.7446, -6.0601));
+        *ACTIVE_RUNWAYS.lock().unwrap() = vec![nav::Runway {
+            width_m: 45.0,
+            surface: 0,
+            ident_a: "02".into(),
+            ident_b: "20".into(),
+            lat_a: 36.7349761,
+            lon_a: -6.0648168,
+            lat_b: 36.7542941,
+            lon_b: -6.0553835,
+        }];
+        // Three quarters of the way up 02, rolled out heading 021.
+        let (lat, lon) = (36.7494646, -6.0577402);
+        assert_eq!(on_active_runway(lat, lon).as_deref(), Some("20"), "the nearer end");
+        assert_eq!(on_active_runway_facing(lat, lon, Some(21.0)).as_deref(), Some("02"));
+        assert_eq!(on_active_runway_facing(lat, lon, Some(201.0)).as_deref(), Some("20"));
+        assert_eq!(on_active_runway_facing(lat, lon, None).as_deref(), Some("20"));
+        // And the uncleared-landing line says it.
+        *CLEARANCE.lock().unwrap() = Some(ClearanceSnap {
+            state: tower::State::Inbound,
+            callsign: "November one two three".into(),
+            runway_ident: "02".into(),
+            pending_readback: None,
+        });
+        *COMPLIANCE.lock().unwrap() = ComplianceState::NEW;
+        let t0 = Instant::now();
+        assert!(compliance_tick_facing(lat, lon, 400.0, false, 140.0, true, t0, Some(21.0)).is_none());
+        let call = compliance_tick_facing(
+            lat, lon, 12.0, true, 20.0, true, t0 + std::time::Duration::from_secs(60), Some(21.0),
+        )
+        .expect("an uncleared landing");
+        assert!(call.line.contains("runway zero two"), "{}", call.line);
+
+        *ACTIVE_FIELD.lock().unwrap() = None;
+        *ACTIVE_RUNWAYS.lock().unwrap() = Vec::new();
+        *CLEARANCE.lock().unwrap() = None;
         *COMPLIANCE.lock().unwrap() = ComplianceState::NEW;
     }
 

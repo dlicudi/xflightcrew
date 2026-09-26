@@ -591,6 +591,15 @@ async fn disconnect_autopilot(xp: &dyn crate::xplane::XPlane) -> Option<bool> {
 /// Rollout starts only after weight-on-wheels. The speed terms distinguish a
 /// landing from a low pass once on the surface; they must never substitute for
 /// the ground signal because a normal flare can satisfy both in the air.
+///
+/// ...but the wheels themselves are the best evidence there is. A 737 that
+/// touches down a couple of knots over its approach speed (LEMG 12,
+/// 2026-09-26: IAS 147 against 145, 146 kt over the ground) satisfied
+/// neither speed term, so the loop went on flying the FLARE on the runway
+/// for 2.8 s, then balked `overflew_the_runway` from the pavement and
+/// firewalled the throttle. `ground_ticks` consecutive guidance ticks with
+/// the wheels on and the radio under [`WHEELS_ON_RADIO_FT`] is a landing at
+/// any speed; a bounce breaks the count.
 fn should_start_rollout(
     already_rolling: bool,
     on_ground: bool,
@@ -598,8 +607,63 @@ fn should_start_rollout(
     gs_kts: f64,
     ias_kts: f64,
     approach_ias: f64,
+    ground_ticks: u32,
 ) -> bool {
-    already_rolling || (on_ground && radio_ft < 5.0 && (gs_kts < 45.0 || ias_kts < approach_ias))
+    already_rolling
+        || (on_ground && radio_ft < WHEELS_ON_RADIO_FT && ground_ticks >= WHEELS_ON_TICKS)
+        || (on_ground && radio_ft < 5.0 && (gs_kts < 45.0 || ias_kts < approach_ias))
+}
+
+/// Consecutive wheels-on ticks that make a landing whatever the speed.
+const WHEELS_ON_TICKS: u32 = 3;
+/// ...with the radio altimeter under this.
+const WHEELS_ON_RADIO_FT: f64 = 2.0;
+
+/// The count [`should_start_rollout`] reads: one more wheels-on tick under
+/// [`WHEELS_ON_RADIO_FT`], or back to zero (a bounce, a failed read).
+fn wheels_on_count(prev: u32, on_ground: bool, radio_ft: f64) -> u32 {
+    if on_ground && radio_ft.is_finite() && radio_ft < WHEELS_ON_RADIO_FT {
+        prev.saturating_add(1)
+    } else {
+        0
+    }
+}
+
+/// NO BALK FROM THE PAVEMENT. With the wheels on the runway a landing has
+/// happened: a go-around from there at 145 kt with the throttle closed, the
+/// spoilers out and the autobrake armed is the most dangerous thing the loop
+/// could ask for. LEMG 12 (2026-09-26): 2.8 s on the wheels in the flare,
+/// then `overflew_the_runway` at 0.33 ft radio, full power, "going around"
+/// to the tower, and a landing clearance voided for an aircraft that then
+/// stopped on the runway. On the ground any balk, and a flare turned into
+/// anything else, stays a flare down the runway's course, which the rollout
+/// latch takes over within ticks. Pure; the balk refused is returned.
+pub fn wheels_hold_the_landing(
+    g: Guidance,
+    on_ground: bool,
+    was_flaring: bool,
+    course_deg: f64,
+) -> (Guidance, Option<&'static str>) {
+    if !on_ground || !(g.balk.is_some() || (was_flaring && g.phase != ApproachPhase::Flare)) {
+        return (g, None);
+    }
+    let refused = g.balk.or(Some("phase_change"));
+    (
+        Guidance {
+            target_heading_deg: course_deg,
+            phase: ApproachPhase::Flare,
+            balk: None,
+            arresting: true,
+            ..g
+        },
+        refused,
+    )
+}
+
+/// The "going around" radio call goes out once per balk that was actually
+/// flown, and never with the wheels on the runway.
+fn go_around_call_due(missed: bool, said: bool, on_ground: bool) -> bool {
+    missed && !said && !on_ground
 }
 
 /// Cancel an active autoland; returns whether one was flying.
@@ -944,6 +1008,7 @@ pub fn run_autoland_scoped(
             // (P + trim, tested) holds the centreline through the plugin steer
             // channel while it brakes.
             let mut rolling_out = false;
+            let mut wheels_on: u32 = 0;
             let mut vacate_follows = false;
             let mut roll_law = crate::autotakeoff::RollSteer::default();
             // The landing readback last sent, so an owed one goes out once
@@ -1104,6 +1169,7 @@ pub fn run_autoland_scoped(
                 // weight-on-wheels. Without that gate a normal flare below five
                 // feet could latch rollout in the air, cut power, and arm the
                 // brakes before touchdown.
+                wheels_on = wheels_on_count(wheels_on, on_ground > 0.5, radio_ft);
                 if should_start_rollout(
                     rolling_out,
                     on_ground > 0.5,
@@ -1111,6 +1177,7 @@ pub fn run_autoland_scoped(
                     gs_kts,
                     ias,
                     approach_ias,
+                    wheels_on,
                 ) {
                     // Consumed once, at rollout entry: a stale flag from a
                     // mission that never landed must not turn a later
@@ -1254,7 +1321,15 @@ pub fn run_autoland_scoped(
                                            "remaining_m": rwy.length_m + along_nm.min(0.0) * M_PER_NM}),
                     );
                 }
-                let raw = committed;
+                let (raw, refused) =
+                    wheels_hold_the_landing(committed, on_ground > 0.5, flaring, rwy.course_deg);
+                if let Some(why) = refused {
+                    crate::blackbox::record(
+                        "autoland",
+                        serde_json::json!({"event": "balk_refused_on_ground", "why": why,
+                                           "radio": radio_ft, "ias": ias, "gs": gs_kts}),
+                    );
+                }
                 // A controller's order beats anything the approach thinks of
                 // itself. Consumed here rather than in the main loop because
                 // this is the thing that can ACT on it; the flag is drained
@@ -1545,7 +1620,7 @@ pub fn run_autoland_scoped(
                 // autoland balked, climbed away and repositioned over the field
                 // for four minutes, and nothing was ever said — the FSM sat in
                 // ClearedToLand throughout. Announced ONCE, on the arming tick.
-                if missed.is_some() && !said_going_around {
+                if go_around_call_due(missed.is_some(), said_going_around, on_ground > 0.5) {
                     said_going_around = true;
                     // The go-around VOIDS the landing clearance, so this
                     // approach owes the tower a fresh final report before it
@@ -5524,14 +5599,95 @@ mod tests {
     fn rollout_requires_weight_on_wheels() {
         // A normal flare can be below five feet and slightly below target;
         // neither airspeed nor radio altitude is proof of touchdown.
-        assert!(!should_start_rollout(false, false, 3.0, 70.0, 89.0, 90.0));
-        assert!(!should_start_rollout(false, false, 3.0, 40.0, 89.0, 90.0));
+        assert!(!should_start_rollout(false, false, 3.0, 70.0, 89.0, 90.0, 0));
+        assert!(!should_start_rollout(false, false, 3.0, 40.0, 89.0, 90.0, 0));
         // The same committed state starts rollout once the wheels are down,
         // including a tailwind landing whose groundspeed remains high.
-        assert!(should_start_rollout(false, true, 3.0, 70.0, 89.0, 90.0));
-        assert!(should_start_rollout(false, true, 3.0, 40.0, 95.0, 90.0));
+        assert!(should_start_rollout(false, true, 3.0, 70.0, 89.0, 90.0, 0));
+        assert!(should_start_rollout(false, true, 3.0, 40.0, 95.0, 90.0, 0));
         // Once latched, a noisy WOW sample cannot return control to approach.
-        assert!(should_start_rollout(true, false, 10.0, 70.0, 95.0, 90.0));
+        assert!(should_start_rollout(true, false, 10.0, 70.0, 95.0, 90.0, 0));
+    }
+
+    /// LEMG 12 (2026-09-26, 17:52Z, a 737, approach speed 145): the guidance
+    /// ticks from the last airborne one to the balk, as recorded (t from
+    /// 1790448340.0, the sim's on_ground, radio ft, IAS; 146 kt over the
+    /// ground throughout). The speed rule never latched the rollout, the
+    /// flare ran 2.8 s on the wheels, and at 3.3 s `overflew_the_runway`
+    /// balked from 0.33 ft into a full-power go-around and a "going around"
+    /// call to the tower.
+    #[test]
+    fn the_wheels_are_a_landing_and_nothing_balks_from_the_pavement() {
+        const TICKS: &[(f64, bool, f64, f64)] = &[
+            (0.0, false, 3.06, 147.42),
+            (0.3, true, 0.97, 147.34),
+            (0.5, true, -0.01, 147.28),
+            (0.7, true, 0.33, 147.21),
+            (1.0, true, 0.90, 147.08),
+            (1.2, true, 0.94, 146.99),
+            (1.4, true, 0.58, 146.89),
+            (1.7, true, 0.28, 146.73),
+            (1.9, true, 0.38, 146.60),
+            (2.2, true, 0.37, 146.45),
+            (2.4, true, 0.30, 146.29),
+            (2.6, true, 0.32, 146.12),
+            (2.8, true, 0.35, 145.95),
+            (3.1, true, 0.32, 145.65),
+            (3.3, true, 0.33, 145.46),
+        ];
+        let (gs, approach) = (146.0, 145.0);
+        // (1) The old rule: not one tick latched.
+        assert!(TICKS.iter().all(|&(_, g, r, ias)| !should_start_rollout(false, g, r, gs, ias, approach, 0)));
+        // The wheels: latched on the third tick on the ground, 0.4 s after
+        // first contact.
+        let mut n = 0;
+        let latched = TICKS.iter().find(|&&(_, g, r, ias)| {
+            n = wheels_on_count(n, g, r);
+            should_start_rollout(false, g, r, gs, ias, approach, n)
+        });
+        assert_eq!(latched.map(|t| t.0), Some(0.7), "the rollout latches at the wheels");
+        // A bounce breaks the count.
+        assert_eq!(wheels_on_count(2, false, 4.0), 0);
+        assert_eq!(wheels_on_count(2, true, 6.0), 0, "a wheel brushing at 6 ft is not down");
+
+        // (2) The balk tick as the guidance produced it.
+        let balked = Guidance {
+            target_heading_deg: 117.71,
+            target_vs_fpm: 2000.0,
+            target_ias_kts: 150.0,
+            dist_nm: 0.61,
+            glidepath_alt_ft: 292.3,
+            phase: ApproachPhase::Intercept,
+            balk: Some("overflew_the_runway"),
+            arresting: false,
+        };
+        let (held, refused) = wheels_hold_the_landing(balked, true, true, 117.3);
+        assert_eq!(refused, Some("overflew_the_runway"));
+        assert_eq!((held.phase, held.balk), (ApproachPhase::Flare, None));
+        assert!((held.target_heading_deg - 117.3).abs() < 1e-9, "down the runway's course");
+        // The go-around latch never arms off it; off the raw balk it did.
+        let mut latch = GoAroundLatch::new();
+        assert!(latch
+            .update(Some(ApproachPhase::Flare), held.phase, 0.33, 0.61, -0.61, FAP_NM, 0.0)
+            .is_none());
+        let mut latch = GoAroundLatch::new();
+        assert_eq!(
+            latch.update(Some(ApproachPhase::Flare), balked.phase, 0.33, 0.61, -0.61, FAP_NM, 0.0),
+            Some(MissedStage::Climb),
+            "the recorded go-around"
+        );
+        // Airborne, the balk stands (an overflight is still a go-around).
+        let (air, none) = wheels_hold_the_landing(balked, false, true, 117.3);
+        assert_eq!((air.phase, air.balk, none), (ApproachPhase::Intercept, Some("overflew_the_runway"), None));
+        // A flare that stays a flare on the ground is untouched.
+        let flare = Guidance { phase: ApproachPhase::Flare, balk: None, arresting: true, ..balked };
+        assert_eq!(wheels_hold_the_landing(flare, true, true, 117.3).1, None);
+
+        // (4) No "going around" call with the wheels on the runway.
+        assert!(!go_around_call_due(true, false, true));
+        assert!(go_around_call_due(true, false, false));
+        assert!(!go_around_call_due(true, true, false), "once");
+        assert!(!go_around_call_due(false, false, false));
     }
 
     /// The rollout brakes by wanted deceleration, not a fixed clamp. A flat

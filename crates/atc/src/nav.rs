@@ -2474,7 +2474,7 @@ pub fn headwind_for(
 }
 
 /// Smallest signed angle a−b, degrees, in −180..180.
-fn angle_diff_deg(a: f64, b: f64) -> f64 {
+pub(crate) fn angle_diff_deg(a: f64, b: f64) -> f64 {
     (a - b + 540.0).rem_euclid(360.0) - 180.0
 }
 
