@@ -306,6 +306,11 @@ pub fn try_parse(
     // off and land") — checked on the raw text BEFORE the compound gate would
     // split them. Full auto first: "start up and fly a circuit" contains
     // "circuit" and must not fall to the circuit rule.
+    // A new flight on a final: its hand-fly clause carries "and", and its
+    // runway words must never reach the mission grammar.
+    if let Some(c) = approach_setup_call(&t) {
+        return valid(&c, registry, profile).then_some(vec![c]);
+    }
     if let Some(c) = flight_plan_call(&t) {
         // A helicopter flies the plan on its own route follower: full auto
         // is withheld there. Stopping it is a hold.
@@ -810,6 +815,200 @@ pub fn set_up_flight_request(t: &str) -> bool {
             | "set up the flight from the plan"
             | "load the flight and the aircraft"
     )
+}
+
+/// "Put us on a 10 mile final to LEMG 13", "set us up on final for runway
+/// one three", "start us on approach to Malaga", "put us on a five mile
+/// final, my controls": a NEW FLIGHT on a runway final (`setup_approach`),
+/// started through the sim's own flight initialisation. The field, the
+/// runway and the distance are each optional (the tool defaults them); a
+/// hand-fly clause ("my controls", "and I'll fly it") keeps the copilot's
+/// hands off. CLOSED: a lead that puts US somewhere, then ON a final or an
+/// approach and nothing but a distance, a field and a runway; never an
+/// approach TYPE ("put us on the ILS" is the coupling's), never a pattern
+/// word. Checked before the compound gate ("and I'll fly it" carries "and").
+pub fn approach_setup_call(t: &str) -> Option<ToolCall> {
+    const LEADS: &[&str] = &[
+        "put us ", "put me ", "set us up ", "set me up ", "start us ", "start me ",
+        "place us ", "position us ", "reposition us ",
+    ];
+    const HAND_FLY: &[&str] = &[
+        "my controls", "my control", "i will fly", "ill fly", "let me fly", "i fly it",
+        "ill hand fly", "i will hand fly", "i have control", "ill take it from there",
+    ];
+    const NOT_THIS: &[&str] = &[
+        "ils", "localizer", "localiser", "glideslope", "glidepath", "rnav", "vor", "gps",
+        "visual", "circuit", "pattern", "downwind", "base", "missed", "go", "around",
+        "hold", "holding", "short",
+    ];
+    const MILES: &[&str] = &["mile", "miles", "nm", "mi", "nautical"];
+    const CONNECT: &[&str] = &["to", "for", "at", "into", "runway", "rwy", "the"];
+    let t = t.trim().trim_end_matches(['.', '!', '?']);
+    let lead = LEADS.iter().find(|l| t.starts_with(**l))?;
+    let mut rest = &t[lead.len()..];
+    let mut hand_fly = false;
+    for h in HAND_FLY {
+        if let Some(i) = find_phrase(rest, h) {
+            hand_fly = true;
+            rest = &rest[..i];
+        }
+    }
+    let mut words: Vec<&str> = rest
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|w| !w.is_empty())
+        .collect();
+    while words.last().is_some_and(|w| matches!(*w, "and" | "then" | "but")) {
+        words.pop();
+    }
+    if !matches!(words.first().copied(), Some("on" | "onto" | "for" | "in")) {
+        return None;
+    }
+    if words.iter().any(|w| NOT_THIS.contains(w)) {
+        return None;
+    }
+    let noun = words.iter().position(|w| matches!(*w, "final" | "approach"))?;
+    // The distance: the number said with a mile word, wherever it sits
+    // ("a 10 mile final", "final ten miles out").
+    let mut used = vec![false; words.len()];
+    let mut final_nm: Option<i64> = None;
+    if let Some(m) = words.iter().position(|w| MILES.contains(w)) {
+        let numeric =
+            |w: &str| w.parse::<i64>().is_ok() || word_value(w).is_some_and(|(_, mult)| !mult);
+        let mut k = m;
+        while k > 0 && m - k < 2 && numeric(words[k - 1]) {
+            k -= 1;
+        }
+        if k == m {
+            return None; // "a mile final": no number
+        }
+        final_nm = number(&words[k..m].join(" "));
+        for u in used.iter_mut().take(m + 1).skip(k) {
+            *u = true;
+        }
+        let mut after = m + 1;
+        if matches!(words.get(after), Some(&"miles") | Some(&"mile")) {
+            used[after] = true;
+            after += 1;
+        }
+        if words.get(after) == Some(&"out") {
+            used[after] = true;
+        }
+    }
+    // Before the noun: the preposition, an article, the distance. Nothing else.
+    for (i, w) in words.iter().enumerate().take(noun).skip(1) {
+        if !used[i] && !matches!(*w, "a" | "an" | "the" | "long") {
+            return None;
+        }
+    }
+    // After it: the field, then the runway, connectors between.
+    let mut field: Vec<&str> = Vec::new();
+    let mut rwy: Vec<&str> = Vec::new();
+    for (i, w) in words.iter().enumerate().skip(noun + 1) {
+        if used[i] || matches!(*w, "final" | "approach") || CONNECT.contains(w) {
+            continue;
+        }
+        let runway_word = w.chars().next().is_some_and(|c| c.is_ascii_digit())
+            || crate::phrase::digit_value(w).is_some()
+            || word_value(w).is_some_and(|(v, mult)| !mult && (10..=36).contains(&v))
+            || (!rwy.is_empty()
+                && matches!(*w, "left" | "right" | "center" | "centre" | "l" | "r" | "c"));
+        if runway_word {
+            rwy.push(w);
+        } else if rwy.is_empty() {
+            field.push(w);
+        } else {
+            return None; // nothing follows the runway
+        }
+    }
+    let mut args = serde_json::Map::new();
+    if let Some(n) = final_nm {
+        args.insert("final_nm".into(), json!(n));
+    }
+    if !rwy.is_empty() {
+        args.insert("runway".into(), json!(runway_designator(&rwy)?));
+    }
+    if !field.is_empty() {
+        let d = crate::flightplan::parse_destination(&field.join(" "))?;
+        args.insert("to".into(), json!(d.spoken()));
+        args.insert("to_codes".into(), json!(d.codes));
+    }
+    if hand_fly {
+        args.insert("hand_fly".into(), json!(true));
+    }
+    Some(call("setup_approach", Value::Object(args)))
+}
+
+/// Is this the ask for a new flight on a final ([`approach_setup_call`])?
+/// The main loop asks before its content routing and its release guard:
+/// "put us on a ten mile final" carries the radio word "final", and "put
+/// us on final, my controls" a release word, and neither is either.
+pub fn approach_setup_request(t: &str) -> bool {
+    approach_setup_call(&normalize(t)).is_some()
+}
+
+/// The first whole-phrase occurrence of `needle` in `hay`: "ill fly" is not
+/// inside "i will fly".
+fn find_phrase(hay: &str, needle: &str) -> Option<usize> {
+    let mut from = 0;
+    while let Some(i) = hay[from..].find(needle).map(|i| i + from) {
+        let before = hay[..i].chars().next_back();
+        let after = hay[i + needle.len()..].chars().next();
+        if !before.is_some_and(|c| c.is_ascii_alphanumeric())
+            && !after.is_some_and(|c| c.is_ascii_alphanumeric())
+        {
+            return Some(i);
+        }
+        from = i + needle.len();
+    }
+    None
+}
+
+/// A runway designator from its spoken or written words: "13", "one three",
+/// "thirteen", "31 left", "09r". `None` unless it is a runway (1 to 36, one
+/// suffix at most, nothing after the suffix). Two digits, as apt.dat has it.
+pub fn runway_designator(words: &[&str]) -> Option<String> {
+    let mut digits = String::new();
+    let mut suffix: Option<char> = None;
+    for w in words {
+        if suffix.is_some() {
+            return None;
+        }
+        let lead: String = w.chars().take_while(|c| c.is_ascii_digit()).collect();
+        let tail = &w[lead.len()..];
+        if !lead.is_empty() {
+            digits.push_str(&lead);
+            match tail {
+                "" => {}
+                "l" | "r" | "c" => suffix = tail.chars().next().map(|c| c.to_ascii_uppercase()),
+                _ => return None,
+            }
+        } else if let Some(d) = crate::phrase::digit_value(w) {
+            digits.push_str(&d.to_string());
+        } else if let Some((v, false)) = word_value(w) {
+            if !digits.is_empty() {
+                return None;
+            }
+            digits.push_str(&v.to_string());
+        } else {
+            suffix = Some(match *w {
+                "left" | "l" => 'L',
+                "right" | "r" => 'R',
+                "center" | "centre" | "c" => 'C',
+                _ => return None,
+            });
+        }
+    }
+    if digits.is_empty() || digits.len() > 2 {
+        return None;
+    }
+    let n: u32 = digits.parse().ok()?;
+    if !(1..=36).contains(&n) {
+        return None;
+    }
+    Some(match suffix {
+        Some(c) => format!("{n:02}{c}"),
+        None => format!("{n:02}"),
+    })
 }
 
 fn flight_plan_call(t: &str) -> Option<ToolCall> {
@@ -2872,6 +3071,86 @@ mod tests {
             let c = v.remove(0);
             (c.name, c.arguments)
         })
+    }
+
+    #[test]
+    fn a_new_flight_on_a_final_is_one_command() {
+        // The shapes the pilot uses (LEMG 2026-09-26, driven by hand that
+        // night): the field, runway and distance each optional.
+        let (name, a) = one("put us on approach to LEMG 13").unwrap();
+        assert_eq!(name, "setup_approach");
+        assert_eq!(a["runway"], "13");
+        assert_eq!(a["to_codes"], json!(["LEMG"]));
+        assert!(a.get("final_nm").is_none());
+        let (_, a) = one("Set us up on a 10 mile final to runway 13.").unwrap();
+        assert_eq!(a["final_nm"], 10);
+        assert_eq!(a["runway"], "13");
+        assert!(a.get("to").is_none());
+        let (_, a) = one("start us on final for one three").unwrap();
+        assert_eq!(a["runway"], "13");
+        let (_, a) = one("put us on a 5 mile final").unwrap();
+        assert_eq!(a["final_nm"], 5);
+        assert!(a.get("runway").is_none());
+        let (_, a) = one("put us on a five mile final").unwrap();
+        assert_eq!(a["final_nm"], 5);
+        let (_, a) =
+            one("set us up on a ten mile final to lima echo mike golf runway three one left")
+                .unwrap();
+        assert_eq!(a["final_nm"], 10);
+        assert_eq!(a["runway"], "31L");
+        assert_eq!(a["to_codes"], json!(["LEMG"]));
+        let (_, a) = one("put us on final twelve miles out for runway 13").unwrap();
+        assert_eq!(a["final_nm"], 12);
+        assert_eq!(a["runway"], "13");
+        // The pilot flies it: the copilot only monitors.
+        for w in [
+            "Put us on final, my controls.",
+            "put us on a 10 mile final and I'll fly it",
+            "set us up on final for runway 13, I will fly",
+        ] {
+            let (name, a) = one(w).unwrap();
+            assert_eq!(name, "setup_approach", "{w}");
+            assert_eq!(a["hand_fly"], true, "{w}");
+        }
+        assert!(one("put us on a 10 mile final").unwrap().1.get("hand_fly").is_none());
+    }
+
+    #[test]
+    fn a_final_that_is_not_a_new_flight_is_left_alone() {
+        for w in [
+            "put us on the ils",
+            "set us up for the ils approach",
+            "put us on downwind",
+            "put us on short final",
+            "set up the approach",
+            "final runway one three",
+            "turn final",
+            "put the gear down",
+            "put us on a mile final",
+            "put us on final runway 13 please now go",
+            "put us on final to runway 40",
+        ] {
+            assert!(
+                one(w).is_none_or(|(n, _)| n != "setup_approach"),
+                "{w} became a new flight"
+            );
+        }
+        assert!(approach_setup_request("Put us on a 10 mile final."));
+        assert!(!approach_setup_request("final runway one three"));
+    }
+
+    #[test]
+    fn a_runway_designator_is_spoken_or_written() {
+        assert_eq!(runway_designator(&["13"]).as_deref(), Some("13"));
+        assert_eq!(runway_designator(&["one", "three"]).as_deref(), Some("13"));
+        assert_eq!(runway_designator(&["thirteen"]).as_deref(), Some("13"));
+        assert_eq!(runway_designator(&["3"]).as_deref(), Some("03"));
+        assert_eq!(runway_designator(&["31", "left"]).as_deref(), Some("31L"));
+        assert_eq!(runway_designator(&["09r"]).as_deref(), Some("09R"));
+        assert_eq!(runway_designator(&["zero", "niner"]).as_deref(), Some("09"));
+        assert_eq!(runway_designator(&["40"]), None);
+        assert_eq!(runway_designator(&["1", "3", "5"]), None);
+        assert_eq!(runway_designator(&["31", "left", "2"]), None);
     }
 
     #[test]
