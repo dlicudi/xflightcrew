@@ -347,6 +347,9 @@ fn bus_write(slot: usize, name: &str, value: serde_json::Value) -> Result<()> {
     }
     let client = BUS_CLIENT.get_or_init(|| {
         reqwest::blocking::Client::builder()
+            // Always localhost: a system proxy lookup is never wanted, and reqwest's
+            // default one can stall the first build for seconds (2026-09-27).
+            .no_proxy()
             .timeout(std::time::Duration::from_millis(1500))
             .build()
             .expect("a blocking client")

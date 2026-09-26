@@ -385,6 +385,9 @@ impl XPlaneClient {
         // A per-request timeout so a stalled X-Plane call can never hang the
         // voice loop forever — it errors, and the loop recovers to listening.
         let http = reqwest::Client::builder()
+            // Always localhost: a system proxy lookup is never wanted, and reqwest's
+            // default one can stall the first build for seconds (2026-09-27).
+            .no_proxy()
             .timeout(std::time::Duration::from_secs(8))
             .build()
             .unwrap_or_else(|_| reqwest::Client::new());

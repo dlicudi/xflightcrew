@@ -7701,3 +7701,21 @@ live true heading each frame, so the arrow moves at the sim's rate while the
 app ticks at the monitor's. The plugin draws the arrow, the distance, the
 label and a cross-track bar on the Flight tab. Layer two, arrows on the
 pavement through XPLMInstance, is still owed. Offline only.
+
+## 2026-09-27: local Web API clients skip the system proxy
+
+Three `crates/sim` fake-server tests (`plugin_reload_re_resolves_a_stale_write_and_reads_back_the_new_id`,
+`cancellation_during_resolution_prevents_the_later_patch`,
+`pause_defers_handoff_until_live_measurements_resume`) failed now and then with
+`missing GET /api/v1/datarefs?`. The request was never wrong: the fake gives
+the client 10 s to connect, and the first `reqwest::Client` build in the
+process spent that time in reqwest's default system proxy lookup (macOS).
+Measured: 7 to 12 s for the first default build, under 1 ms with
+`.no_proxy()`; `scutil --proxy` itself answered in 10 ms, so the stall is the
+in-process lookup (possibly the sandbox; unconfirmed outside it). Every
+client that only ever talks to the local Web API now builds with
+`.no_proxy()`: `XPlaneClient::new` (`crates/sim/src/xplane.rs`),
+`plugin_status::run`, `livestate::run`, the audio bus writer
+(`tts::bus_write`) and the three panel pollers in `src/pollers.rs` (request
+buttons, voice picker, settings). SimBrief keeps the default client. The sim
+tests went from about 7 s (12 s when they failed) to 0.13 s.

@@ -22,6 +22,9 @@ use super::*;
 pub(crate) fn spawn_panel_request_poller(base_url: String, tx: std::sync::mpsc::Sender<String>) {
     std::thread::spawn(move || {
         let Ok(http) = reqwest::blocking::Client::builder()
+            // Always localhost: a system proxy lookup is never wanted, and reqwest's
+            // default one can stall the first build for seconds (2026-09-27).
+            .no_proxy()
             .timeout(std::time::Duration::from_secs(2))
             .build()
         else {
@@ -203,6 +206,9 @@ pub(crate) fn spawn_voice_picker(
             .join("\n");
         let roster_b64 = base64::engine::general_purpose::STANDARD.encode(roster.as_bytes());
         let Ok(http) = reqwest::blocking::Client::builder()
+            // Always localhost: a system proxy lookup is never wanted, and reqwest's
+            // default one can stall the first build for seconds (2026-09-27).
+            .no_proxy()
             .timeout(std::time::Duration::from_secs(2))
             .build()
         else {
@@ -406,6 +412,9 @@ pub(crate) fn spawn_settings_poller(base_url: String) {
     );
     std::thread::spawn(move || {
         let Ok(http) = reqwest::blocking::Client::builder()
+            // Always localhost: a system proxy lookup is never wanted, and reqwest's
+            // default one can stall the first build for seconds (2026-09-27).
+            .no_proxy()
             .timeout(std::time::Duration::from_secs(2))
             .build()
         else {

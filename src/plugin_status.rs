@@ -306,6 +306,9 @@ fn resolve_all(http: &reqwest::blocking::Client, rest: &str) -> Ids {
 /// an X-Plane restart (which reassigns dataref ids) without restarting the app.
 fn run(base: String, rx: Receiver<Update>) {
     let Ok(http) = reqwest::blocking::Client::builder()
+        // Always localhost: a system proxy lookup is never wanted, and reqwest's
+        // default one can stall the first build for seconds (2026-09-27).
+        .no_proxy()
         .timeout(Duration::from_secs(2))
         .build()
     else {

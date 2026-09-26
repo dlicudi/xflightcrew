@@ -80,6 +80,9 @@ impl LiveState {
 /// re-resolves them.
 fn run(base: String, names: Vec<String>, cache: Arc<Mutex<HashMap<String, f64>>>) {
     let Ok(http) = reqwest::blocking::Client::builder()
+        // Always localhost: a system proxy lookup is never wanted, and reqwest's
+        // default one can stall the first build for seconds (2026-09-27).
+        .no_proxy()
         .timeout(Duration::from_secs(5))
         .build()
     else {
