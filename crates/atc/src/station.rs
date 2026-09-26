@@ -2686,6 +2686,33 @@ pub fn arm_station_for_freq(com1_khz: i64, lat: f64, lon: f64, alt_msl_ft: f64, 
     }
 }
 
+/// A NEW FLIGHT at `icao` (the crew's "put us on a ten mile final", which
+/// starts a flight through the sim's own initialisation): the station for that
+/// field is rebuilt from nothing on the main loop's next pass, even when it is
+/// the one already up. The tower's worksheet for us belongs to the flight that
+/// ended: at LEMG (2026-09-26) the station that had watched the 737 sit on
+/// runway 30 went on as if the arrival 10 nm out on 13 were the same aircraft,
+/// and the landing earned "you landed without clearance". Overrides any swap
+/// already waiting (the new flight wins), starts the region cooldown so the
+/// nearest-field pick cannot move the station straight back, and drops the
+/// old flight's arrival pin and region handoff (install() keeps both on
+/// purpose, for a handoff in flight). Returns the tower's frequency, `None`
+/// when the field has no staffed tower in the region index (nothing armed).
+pub fn arm_new_flight(icao: &str, now: Instant) -> Option<i64> {
+    let (code, apt, khz) = {
+        let region = REGION.lock().unwrap_or_else(|e| e.into_inner());
+        let a = region.iter().find(|a| a.icao.eq_ignore_ascii_case(icao))?;
+        let khz = a.apt.freq(nav::FREQ_TOWER)?.khz;
+        (a.icao.clone(), a.apt.clone(), khz)
+    };
+    tracing::info!(%code, khz, "station rebuilt for a new flight");
+    *PENDING_STATION.lock().unwrap_or_else(|e| e.into_inner()) = Some((code, apt));
+    *LAST_REGION_SWITCH.lock().unwrap_or_else(|e| e.into_inner()) = Some(now);
+    *ARRIVAL_PIN.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    *REGION_HANDOFF.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    Some(khz)
+}
+
 /// The radio row's content: the ACTIVE station's name and services — but only
 /// while it's inside VHF range. A tower you can't physically raise isn't a
 /// radio row; parked in Extremadura the panel showed Gibraltar's comm plan as
@@ -7924,6 +7951,36 @@ mod tests {
         arm_station_for_freq(123500, lat, lon, 2700.0, now);
         let armed = PENDING_STATION.lock().unwrap().take().expect("swap armed for the strip");
         assert_eq!(armed.1.name, "Leoni Benabu");
+        *REGION.lock().unwrap() = Vec::new();
+        *ACTIVE_FIELD.lock().unwrap() = None;
+        *LAST_REGION_SWITCH.lock().unwrap() = None;
+    }
+
+    #[test]
+    fn a_new_flight_rebuilds_the_station_even_when_it_is_the_one_up() {
+        // LEMG 2026-09-26: the 737 was put on a 10 nm final for 13 from a
+        // seat on runway 30, and the station that had been watching it on the
+        // runway carried on as if nothing had happened. A new flight arms a
+        // fresh station for its field, over any swap already waiting, and the
+        // old flight's pin and handoff go with it.
+        let _guard = SIDE_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut malaga = region_apt("LEMG Malaga", 36.675, -4.499);
+        malaga.apt.freqs[0].khz = 118155;
+        let other = region_apt("LXGB Gibraltar", 36.15, -5.35);
+        *REGION.lock().unwrap() = vec![malaga, other];
+        *ACTIVE_FIELD.lock().unwrap() = Some(("LEMG Malaga".into(), 36.675, -4.499));
+        *PENDING_STATION.lock().unwrap() =
+            Some(("LXGB".into(), region_apt("LXGB Gibraltar", 36.15, -5.35).apt));
+        *ARRIVAL_PIN.lock().unwrap() = Some(131200);
+        let now = Instant::now();
+        assert_eq!(arm_new_flight("lemg", now), Some(118155));
+        let armed = PENDING_STATION.lock().unwrap().take().expect("a fresh station armed");
+        assert_eq!(armed.0, "LEMG");
+        assert!(ARRIVAL_PIN.lock().unwrap().is_none());
+        assert_eq!(*LAST_REGION_SWITCH.lock().unwrap(), Some(now));
+        // A field the index lacks arms nothing.
+        assert_eq!(arm_new_flight("ZZZZ", now), None);
+        assert!(PENDING_STATION.lock().unwrap().is_none());
         *REGION.lock().unwrap() = Vec::new();
         *ACTIVE_FIELD.lock().unwrap() = None;
         *LAST_REGION_SWITCH.lock().unwrap() = None;

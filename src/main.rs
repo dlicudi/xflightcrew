@@ -2237,6 +2237,9 @@ async fn run_session(
                     || procedure_flying
                     || full_auto_running)
                     && release_intent(&tl)
+                    // "Put us on final, my controls" is a new flight the
+                    // pilot will fly, not a hand-back of this one.
+                    && !grammar::approach_setup_request(&tl)
                 {
                     let names_mix = tl.contains("mixture") || tl.contains("mix");
                     let names_speed = tl.contains("throttle")
@@ -2367,7 +2370,11 @@ async fn run_session(
             // wreckage — a dead panel can't transmit (fail open, like the
             // receive gate).
             if let Some(st) = atc_station.as_mut() {
-                if try_route_content_atc(st, &tl, dual_ptt, &voice, &reporter, &xplane).await {
+                // "Put us on a ten mile final" carries the radio word
+                // "final": it is the crew's reposition, never a final report.
+                if !grammar::approach_setup_request(&tl)
+                    && try_route_content_atc(st, &tl, dual_ptt, &voice, &reporter, &xplane).await
+                {
                     continue;
                 }
                 // Named-station tuning ("tune the tower", "contact approach") —

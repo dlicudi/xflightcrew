@@ -889,6 +889,8 @@ pub(crate) fn looks_like_command(text: &str) -> bool {
         || t.contains("you fly")
         || t.contains("your aircraft")
         || t.contains("your airplane")
+        // "Put us on a five mile final": no keyword in it at all.
+        || crate::grammar::approach_setup_request(&t)
     {
         return true;
     }
@@ -1241,5 +1243,16 @@ mod unregistered_tool_tests {
             unregistered_tool_line(&fixed, "no_such_tool"),
             "That command isn't wired up yet."
         );
+    }
+}
+
+#[cfg(test)]
+mod approach_setup_gate_tests {
+    #[test]
+    fn a_new_flight_on_a_final_clears_the_domain_gate() {
+        // No keyword in it: "final" is not one, and neither is "put".
+        for w in ["Put us on a five mile final.", "start us on final for one three"] {
+            assert!(super::looks_like_command(w), "{w}");
+        }
     }
 }

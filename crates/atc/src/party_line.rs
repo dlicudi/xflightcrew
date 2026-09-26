@@ -381,6 +381,14 @@ pub fn landing_handoff_runway() -> Option<String> {
 }
 
 /// Consume the armed station swap. Main loop only — it owns the `Station`.
+/// A station swap is armed and the main loop has not built it yet. The crew
+/// waits on this before keying a call meant for the NEW station (a new
+/// flight's final report, `station::arm_new_flight`): routed a pass early it
+/// reaches the old tower and its worksheet.
+pub fn station_swap_pending() -> bool {
+    lock(&PENDING_STATION).is_some()
+}
+
 pub fn take_pending_station() -> Option<(String, nav::AirportInfo)> {
     lock(&PENDING_STATION).take()
 }
