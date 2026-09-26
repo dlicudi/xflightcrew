@@ -2099,7 +2099,7 @@ pub fn run_autoland_scoped(
                 } else if g.phase == ApproachPhase::Flare {
                     match cfg.flare_power {
                         Some(power) => match (thr_now, vvi) {
-                            (Some(throttle), Some(vs)) => flare_power.step(power, throttle, vs, dt_s),
+                            (Some(throttle), Some(vs)) => flare_power.step(power, throttle, vs, dt_s, radio_ft),
                             _ => None, // No measurement: no guessed power and no ramp advance.
                         },
                         None => Some(0.0),
@@ -3084,6 +3084,9 @@ pub fn aim_elevation_ft(header_ft: f64, probed_ft: Option<&[f64]>) -> (f64, Opti
     (probed, Some(probed))
 }
 
+/// The gentlest retard below the retard height, lever per second.
+const RETARD_MIN_PER_S: f64 = 0.03;
+
 /// Per-approach state: a go-around resets this, so a second flare starts from
 /// its own power. Never adds power or impersonates an airspeed governor in the
 /// flare. The existing overflight/go-around guard still bounds runway usage.
@@ -3104,6 +3107,7 @@ impl FlarePower {
         measured: f64,
         vvi: f64,
         dt: f64,
+        radio_ft: f64,
     ) -> Option<f64> {
         if !measured.is_finite()
             || !vvi.is_finite()
@@ -3128,12 +3132,24 @@ impl FlarePower {
         let current = measured
             .clamp(0.0, 1.0)
             .min(self.last_command.unwrap_or(1.0));
+        // A jet retards by HEIGHT: nothing above the retard height, and below
+        // it at the rate that reaches idle as the wheels arrive (time to
+        // touchdown from the height and the sink), never slower than a
+        // gentle floor nor faster than the profile's own rate x 4.
+        let rate = match cfg.retard_below_ft.filter(|h| h.is_finite() && *h > 0.0) {
+            Some(h) if radio_ft.is_finite() && radio_ft > h => 0.0,
+            Some(_) if radio_ft.is_finite() => {
+                let to_touch_s = radio_ft.max(0.0) / sink.max(100.0) * 60.0;
+                (current / to_touch_s.max(0.5)).clamp(RETARD_MIN_PER_S, cfg.reduction_per_second * 4.0)
+            }
+            _ => cfg.reduction_per_second,
+        };
         let next = if self.last_command.is_none()
             || sink.max(sink + worsening * cfg.lead_seconds) > cfg.hold_sink_fpm
         {
             current
         } else {
-            (current - cfg.reduction_per_second * dt.min(1.0)).max(0.0)
+            (current - rate * dt.min(1.0)).max(0.0)
         };
         self.last_command = Some(next);
         Some(next)
@@ -4797,7 +4813,7 @@ mod tests {
         let mut throttle = 0.30;
         let mut commands = Vec::new();
         for vs in samples {
-            throttle = power.step(cfg, throttle, vs, 0.67).unwrap();
+            throttle = power.step(cfg, throttle, vs, 0.67, 10.0).unwrap();
             commands.push(throttle);
         }
         assert_eq!(commands[0], 0.30, "no step to idle at flare entry");
@@ -4822,37 +4838,63 @@ mod tests {
     fn flare_power_foresees_sink_and_resets_for_a_new_approach() {
         let cfg = baron_flare_power();
         let mut power = FlarePower::default();
-        assert_eq!(power.step(cfg, 0.3, -50.0, 0.5), Some(0.3));
+        assert_eq!(power.step(cfg, 0.3, -50.0, 0.5, 10.0), Some(0.3));
         // Still less than 200 fpm down, but deteriorating at 200 fpm per second.
-        assert_eq!(power.step(cfg, 0.3, -150.0, 0.5), Some(0.3));
+        assert_eq!(power.step(cfg, 0.3, -150.0, 0.5, 10.0), Some(0.3));
         // A balloon needs power coming off, not a sink-triggered hold.
-        assert!(power.step(cfg, 0.3, 100.0, 0.5).unwrap() < 0.3);
+        assert!(power.step(cfg, 0.3, 100.0, 0.5, 10.0).unwrap() < 0.3);
         // A lagging throttle read must not restart/increase the command.
-        assert!(power.step(cfg, 0.4, -100.0, 0.5).unwrap() < 0.3);
+        assert!(power.step(cfg, 0.4, -100.0, 0.5, 10.0).unwrap() < 0.3);
         power.reset();
-        assert_eq!(power.step(cfg, 0.45, -300.0, 0.5), Some(0.45));
+        assert_eq!(power.step(cfg, 0.45, -300.0, 0.5, 10.0), Some(0.45));
     }
 
     #[test]
     fn flare_power_reaches_idle_smoothly_and_rejects_missing_measurements() {
         let cfg = baron_flare_power();
         let mut power = FlarePower::default();
-        let mut throttle = power.step(cfg, 0.3, -100.0, 0.5).unwrap();
+        let mut throttle = power.step(cfg, 0.3, -100.0, 0.5, 10.0).unwrap();
         for _ in 0..30 {
-            let next = power.step(cfg, throttle, -100.0, 0.5).unwrap();
+            let next = power.step(cfg, throttle, -100.0, 0.5, 10.0).unwrap();
             assert!((0.0..=throttle).contains(&next));
             assert!(throttle - next <= cfg.reduction_per_second * 0.5 + 1e-9);
             throttle = next;
         }
         assert_eq!(throttle, 0.0);
-        assert_eq!(power.step(cfg, f64::NAN, -100.0, 0.5), None);
-        assert_eq!(power.step(cfg, 0.3, f64::NAN, 0.5), None);
-        assert_eq!(power.step(cfg, 0.3, -100.0, 0.0), None);
+        assert_eq!(power.step(cfg, f64::NAN, -100.0, 0.5, 10.0), None);
+        assert_eq!(power.step(cfg, 0.3, f64::NAN, 0.5, 10.0), None);
+        assert_eq!(power.step(cfg, 0.3, -100.0, 0.0, 10.0), None);
         let invalid = crate::aircraft::FlarePowerProfile {
             reduction_per_second: -1.0,
             ..cfg
         };
-        assert_eq!(power.step(invalid, 0.3, -100.0, 0.5), None);
+        assert_eq!(power.step(invalid, 0.3, -100.0, 0.5, 10.0), None);
+    }
+
+    /// LEMG 13 (2026-09-26, 737): the arrest levelled at 20 ft, the sink-keyed
+    /// retard took the lever to idle IN the float, and the sink came back to
+    /// -859 fpm. A jet retards by height: nothing above it, and below it a
+    /// ramp that reaches idle as the wheels arrive.
+    #[test]
+    fn a_jet_retards_by_height_timed_to_the_touchdown() {
+        let cfg = crate::aircraft::FlarePowerProfile {
+            reduction_per_second: 0.08,
+            hold_sink_fpm: 400.0,
+            lead_seconds: 1.0,
+            retard_below_ft: Some(20.0),
+        };
+        let mut power = FlarePower::default();
+        // First tick keeps the approach power; at 36 ft in a float, still held.
+        assert_eq!(power.step(cfg, 0.35, -170.0, 0.2, 36.0), Some(0.35));
+        assert_eq!(power.step(cfg, 0.35, -170.0, 0.2, 30.0), Some(0.35));
+        // Below 20 ft at 170 fpm: about 7 s to the wheels, about 0.05 a second.
+        let next = power.step(cfg, 0.35, -170.0, 1.0, 20.0).unwrap();
+        assert!((0.29..0.31).contains(&next), "{next}");
+        // A normal sink closer in: a quicker retard, never past 4x the rate.
+        let mut quick = FlarePower::default();
+        quick.step(cfg, 0.3, -300.0, 0.2, 10.0);
+        let next = quick.step(cfg, 0.3, -300.0, 1.0, 10.0).unwrap();
+        assert!((0.0..0.2).contains(&next), "{next}");
     }
 
     #[test]

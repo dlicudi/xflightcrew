@@ -20,6 +20,14 @@ pub struct FlarePowerProfile {
     pub hold_sink_fpm: f64,
     /// Include the recent sink trend to avoid cutting into a renewed descent.
     pub lead_seconds: f64,
+    /// A JET's retard: no reduction above this radio height, and below it a
+    /// ramp timed to reach idle as the wheels arrive (`autoland::FlarePower`).
+    /// Keyed on the sink alone, the retard fired in the FLOAT the arrest had
+    /// made: the 737 levelled at 20 ft over LEMG 13, the power went to idle,
+    /// the speed washed off and it arrived at -859 fpm and 2.4 g with the
+    /// elevator on its stop (2026-09-26). `None` keeps the sink-keyed law.
+    #[serde(default)]
+    pub retard_below_ft: Option<f64>,
 }
 
 /// How the landing arrest's vertical-speed dial leads THIS autopilot's lag

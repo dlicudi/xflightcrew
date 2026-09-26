@@ -50,6 +50,15 @@ flare_power:
   reduction_per_second: 0.08
   hold_sink_fpm: 400.0
   lead_seconds: 1.0
+  # Retard by height, as the crew does: nothing above 20 ft, then timed to
+  # idle at the wheels. Keyed on the sink, it cut to idle in the float at
+  # LEMG 13 and the 737 arrived at -859 fpm, 2.4 g (2026-09-26).
+  retard_below_ft: 20.0
+# The flare's elevator: the default 0.35 of pull ran out with the nose at 1
+# degree at LEMG 13 (a 737 lands at 4 to 6, strikes its tail near 11).
+flare_elevator:
+  gain: 1.0
+  max: 0.45
 # How the landing arrest leads THIS autopilot. The 172's law (gain 2, dial
 # cap +300, no trend term) was fitted to a first-order 4.5 s lag; this
 # aircraft's VS mode, fitted to the EGCC 23L tick log (2026-09-19), is two
