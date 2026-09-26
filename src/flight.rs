@@ -1422,6 +1422,8 @@ pub struct Status {
     pub alt_ft: f64,
     pub ias_kts: f64,
     pub gs_kts: f64,
+    /// The highest the flight has been (the cruise, once it has had one).
+    pub peak_alt_ft: f64,
 }
 
 impl Flight {
@@ -1436,6 +1438,7 @@ impl Flight {
             alt_ft: s.alt_ft,
             ias_kts: s.ias_kts,
             gs_kts: s.gs_kts,
+            peak_alt_ft: self.memory.peak_alt_ft,
         })
     }
 }
@@ -2043,6 +2046,7 @@ mod tests {
             alt_ft: 700.0,
             ias_kts: 10.0,
             gs_kts: 10.0,
+            peak_alt_ft: 0.0,
         };
         let t = state_lines(&s, &Memory::default(), 47.0, ("taxi", "engines running", Some(true)));
         assert!(t.starts_with("Phase: TaxiOut, 40 s"), "{t}");
@@ -2072,6 +2076,7 @@ mod tests {
             alt_ft: 2028.9,
             ias_kts: 75.8,
             gs_kts: 74.6,
+            peak_alt_ft: 0.0,
         };
         let line = status_line(&s);
         assert!(line.starts_with("Climbing through"), "{line}");

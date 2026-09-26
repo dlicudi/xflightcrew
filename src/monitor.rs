@@ -212,6 +212,9 @@ pub struct Snapshot {
     /// follower's "7 miles ahead" again - four calls, two geometries, one
     /// descent that was being flown correctly the whole time.
     pub follower_flying: bool,
+    /// The flight's highest altitude so far (the flight model's memory):
+    /// a top of descent is the one that leaves it.
+    pub flight_peak_ft: Option<f64>,
     /// The altimeter knob (inHg) and the sim's local QNH (Pa), best-effort,
     /// for the altimeter cross-check. `None` = that read failed this tick.
     pub baro_inhg: Option<f64>,
@@ -533,6 +536,7 @@ impl Snapshot {
             tod_ring_nm,
             follower_tod: crate::procedure::planned_tod(),
             follower_flying: crate::procedure::ACTIVE.load(std::sync::atomic::Ordering::Relaxed),
+            flight_peak_ft: crate::flight::published().map(|f| f.peak_alt_ft).filter(|p| *p > 0.0),
             baro_inhg,
             qnh_pa,
             automation_flying,
@@ -1259,6 +1263,9 @@ const CLIMBING_FPM: f64 = 300.0;
 /// of the "when is TOD" question — the copilot volunteers it while there's
 /// still time to act, instead of answering after being asked. Fires once as
 /// the aircraft enters the 12-nm run-up to the planned TOD, level at altitude.
+/// Within this of the flight's peak the aircraft is still at its cruise.
+const CRUISE_BAND_FT: f64 = 1000.0;
+
 struct TodAhead;
 
 impl Check for TodAhead {
@@ -1279,6 +1286,14 @@ impl Check for TodAhead {
         // 2026-09-14: the ring said "past", the hands waited 3 more minutes).
         if let Some(p) = &s.follower_tod {
             if p.started || !(0.0..=12.0).contains(&p.to_tod_nm) {
+                return None;
+            }
+            // THE top of descent is the one that leaves the cruise. The
+            // follower publishes a point for every stepped leg, and each was
+            // called: seven "Descent coming up" down one arrival, from
+            // 34,400 to 8,800 feet (LIBP-LEMG, 2026-09-26). Below the
+            // cruise the steps are flown, not announced.
+            if s.flight_peak_ft.is_some_and(|peak| s.alt_ft < peak - CRUISE_BAND_FT) {
                 return None;
             }
             let to_tod = p.to_tod_nm;
@@ -4459,6 +4474,7 @@ mod tests {
             tod_ring_nm: None,
             follower_tod: None,
             follower_flying: false,
+            flight_peak_ft: None,
             baro_inhg: None,
             qnh_pa: None,
             automation_flying: false,
@@ -4794,6 +4810,12 @@ mod tests {
         let msg = TodAhead.eval(&s).expect("the follower's point, 8 nm ahead");
         assert!(msg.contains("8 miles ahead"), "{msg}");
         assert!(msg.contains("down to 3,100 feet"), "{msg}");
+        // At the cruise it is said; one step down, the next step is not
+        // (LIBP-LEMG 2026-09-26: seven calls down one arrival).
+        s.flight_peak_ft = Some(s.alt_ft + 200.0);
+        assert!(TodAhead.eval(&s).is_some(), "still at the cruise");
+        s.flight_peak_ft = Some(s.alt_ft + 5000.0);
+        assert!(TodAhead.eval(&s).is_none(), "a step of a descent already begun");
         // The ring says "coming up" (50 nm out); the follower is 20 nm away.
         let mut s = cruise_with_dest(50.0);
         s.follower_tod = Some(tod(20.0, false));

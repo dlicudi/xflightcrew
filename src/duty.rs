@@ -185,6 +185,7 @@ mod tests {
             alt_ft: 0.0,
             ias_kts: 0.0,
             gs_kts: 0.0,
+            peak_alt_ft: 0.0,
         }
     }
 
