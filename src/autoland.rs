@@ -3350,8 +3350,13 @@ impl FlarePitch {
         self.trim = (self.trim + err * g.trim_rate * dt).clamp(g.min, g.max);
         let want = (err * g.p - (vvi_trend / 100.0) * g.d + self.trim).clamp(g.min, g.max);
         if !ratchet {
-            // The roundout is still ordinary flying: the law is free both ways.
-            self.held = 0.0;
+            // The roundout is still ordinary flying: the law is free both
+            // ways. But the pull it ends on is where the flare STARTS: reset
+            // to nothing, the ratchet began from the flare's first ask, and
+            // the 737 went from 0.29 of elevator to 0.016 in one tick at the
+            // hand-over (38 ft), the nose dropped, and it met the runway at
+            // -773 fpm and bounced to 11 ft (LEMG circuit, 2026-09-26).
+            self.held = want.max(0.0);
             return want;
         }
         if vvi_fpm > 0.0 || vvi_fpm + vvi_trend * BALLOON_LEAD_S > 0.0 {
@@ -4912,6 +4917,23 @@ mod tests {
     /// retard took the lever to idle IN the float, and the sink came back to
     /// -859 fpm. A jet retards by height: nothing above it, and below it a
     /// ramp that reaches idle as the wheels arrive.
+    /// LEMG circuit (2026-09-26): the roundout's pull is where the flare
+    /// starts. The flare's first ask (a path target the aircraft is already
+    /// shallower than) must not take the column forward at the hand-over.
+    #[test]
+    fn the_flare_starts_from_the_roundouts_pull() {
+        let mut law = FlarePitch::default();
+        // Roundout: sinking 860 against 460 wanted, the pull builds.
+        let mut pull = 0.0;
+        for _ in 0..10 {
+            pull = law.step(-460.0, -860.0, 0.0, 0.2, false);
+        }
+        assert!(pull > 0.2, "{pull}");
+        // Flare: the target is the path (-759) and the sink already -690.
+        let first = law.step(-759.0, -690.0, 200.0, 0.2, true);
+        assert!(first >= pull - 1e-9, "the column held: {first} after {pull}");
+    }
+
     /// LEMG 13 (2026-09-26): the 737 floated from 36 to 19 ft on a flat
     /// -175. Exponential with 4 s, it is the path at the gate, -475 at 20 ft,
     /// -325 at 10, and the touchdown sink at the wheels; undeclared, flat.
