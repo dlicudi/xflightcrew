@@ -733,6 +733,39 @@ pub fn roll_target_heading(course_deg: f64, xtk_m: f64, xtk_rate_m_s: f64, gs_kt
     (course_deg - corr).rem_euclid(360.0)
 }
 
+/// The cross-track RATE the centreline law leads with, smoothed. Raw, it is
+/// a position differenced across a jittery tick: 0.8, 4.1, 5.4 and 7.4 m/s in
+/// neighbouring ticks of a 737 roll whose real drift was about 1 m/s (LEMG,
+/// 2026-09-26), and `XTK_LEAD_S` of lead turns each spike into degrees of
+/// target heading, so the rudder flicked side to side down the runway. A
+/// reading past [`XTK_RATE_MAX_M_S`] is noise, not a movement; the rest is
+/// averaged over [`XTK_RATE_TAU_S`].
+#[derive(Debug, Default, Clone, Copy)]
+pub struct XtkRate {
+    value: Option<f64>,
+}
+
+impl XtkRate {
+    pub fn update(&mut self, raw_m_s: f64, dt_s: f64) -> f64 {
+        if !raw_m_s.is_finite() || !dt_s.is_finite() || dt_s <= 0.0 {
+            return self.value.unwrap_or(0.0);
+        }
+        let raw = raw_m_s.clamp(-XTK_RATE_MAX_M_S, XTK_RATE_MAX_M_S);
+        let a = (dt_s / (XTK_RATE_TAU_S + dt_s)).clamp(0.0, 1.0);
+        let v = match self.value {
+            Some(v) => v + (raw - v) * a,
+            None => raw * a,
+        };
+        self.value = Some(v);
+        v
+    }
+}
+
+/// The fastest a cross-track reading may move and still be believed, m/s.
+pub const XTK_RATE_MAX_M_S: f64 = 5.0;
+/// The smoothing of the cross-track rate, seconds.
+pub const XTK_RATE_TAU_S: f64 = 1.0;
+
 /// Slew limit: move from `prev` toward `want` by at most `max_step`.
 pub fn slew(prev: f64, want: f64, max_step: f64) -> f64 {
     prev + (want - prev).clamp(-max_step, max_step)
@@ -1512,6 +1545,7 @@ async fn stop_on_centreline(xp: &XPlaneClient, rwy: &Runway, law: &mut RollSteer
     let mut last = std::time::Instant::now();
     let mut last_brake: Option<std::time::Instant> = None;
     let mut prev_xtk: Option<f64> = None;
+    let mut rate_filter = XtkRate::default();
     while t0.elapsed().as_secs_f64() < REJECT_STOP_MAX_S {
         let (lat, lon, psi, gs) = tokio::join!(
             xp.get_float(LAT),
@@ -1537,7 +1571,7 @@ async fn stop_on_centreline(xp: &XPlaneClient, rwy: &Runway, law: &mut RollSteer
         let dt = last.elapsed().as_secs_f64().clamp(0.05, 1.0);
         last = std::time::Instant::now();
         let xtk_m = cross_track_nm(lat, lon, rwy) * M_PER_NM;
-        let rate = prev_xtk.map_or(0.0, |p| (xtk_m - p) / dt);
+        let rate = rate_filter.update(prev_xtk.map_or(0.0, |p| (xtk_m - p) / dt), dt);
         prev_xtk = Some(xtk_m);
         let target = roll_target_heading(rwy.course_deg, xtk_m, rate, gs_kts);
         let err = ((target - psi + 540.0).rem_euclid(360.0)) - 180.0;
@@ -1814,6 +1848,7 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, p: Params) {
     // Previous cross-track, for the roll's own closure rate (see
     // [`roll_target_heading`]). Metres, right-positive.
     let mut prev_xtk_m: Option<f64> = None;
+    let mut rate_filter = XtkRate::default();
     // The heading error's last value, for the yaw rate an aligning pivot
     // is capped on (the roll reads no yaw rate of its own).
     let mut prev_align_err: Option<f64> = None;
@@ -2005,7 +2040,7 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, p: Params) {
             // Steer the centreline: PD plus the learned P-factor trim,
             // slew-limited (no tick slams the wheel).
             let xtk_m = cross_track_nm(lat, lon, &rwy) * M_PER_NM;
-            let xtk_rate = prev_xtk_m.map_or(0.0, |p| (xtk_m - p) / dt);
+            let xtk_rate = rate_filter.update(prev_xtk_m.map_or(0.0, |p| (xtk_m - p) / dt), dt);
             prev_xtk_m = Some(xtk_m);
             let target = roll_target_heading(rwy.course_deg, xtk_m, xtk_rate, gs_kts);
             let err = ((target - psi + 540.0).rem_euclid(360.0)) - 180.0;
@@ -2895,6 +2930,32 @@ mod tests {
     /// airspeed. The trim built up drifting left, the rudder came alive at
     /// 95 kt and the old trim swung the roll 9.5 m right by 124 kt. The roll
     /// now stays inside a few metres all the way to rotation.
+    /// LEMG (2026-09-26): a 1 m/s drift read through ±0.4 m of position
+    /// noise on a jittery tick. Raw, the rate swung the target heading by
+    /// degrees tick to tick; smoothed, it is steady.
+    #[test]
+    fn the_cross_track_rate_is_smoothed_before_it_is_led() {
+        let (mut raw_t, mut filt_t) = (Vec::new(), Vec::new());
+        let mut f = XtkRate::default();
+        let (mut x, mut prev) = (0.0_f64, None::<f64>);
+        for i in 0..80 {
+            let dt = if i % 3 == 0 { 0.15 } else { 0.25 };
+            x += 1.0 * dt;
+            let noise = if i % 2 == 0 { 0.4 } else { -0.4 };
+            let seen = x + noise;
+            let raw = prev.map_or(0.0, |p| (seen - p) / dt);
+            prev = Some(seen);
+            let smooth = f.update(raw, dt);
+            if i > 20 {
+                raw_t.push(roll_target_heading(40.0, seen, raw, 150.0));
+                filt_t.push(roll_target_heading(40.0, seen, smooth, 150.0));
+            }
+        }
+        let swing = |v: &[f64]| v.windows(2).map(|w| (w[1] - w[0]).abs()).fold(0.0, f64::max);
+        assert!(swing(&filt_t) < swing(&raw_t) * 0.25, "{:.2} vs {:.2}", swing(&filt_t), swing(&raw_t));
+        assert!(swing(&filt_t) < 0.3, "{:.2} degrees tick to tick", swing(&filt_t));
+    }
+
     #[test]
     fn a_trim_learned_slow_does_not_swing_the_roll_fast() {
         const COURSE: f64 = 40.0;

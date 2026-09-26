@@ -927,6 +927,7 @@ pub fn run_autoland_scoped(
             let mut prev_ias_t = std::time::Instant::now();
             // Cross-track history for the intercept damping term.
             let mut prev_xtk: Option<(f64, std::time::Instant)> = None;
+            let mut rollout_rate = crate::autotakeoff::XtkRate::default();
             let mut xtk_rate: f64 = 0.0;
             // Wind crab, low-passed — see [`CrabFilter`] for the hunt it ends.
             let mut crab_filter = CrabFilter::new();
@@ -1132,9 +1133,12 @@ pub fn run_autoland_scoped(
                         .map(|(_, t0)| t_roll.duration_since(t0).as_secs_f64())
                         .filter(|d| (0.05..=3.0).contains(d))
                         .unwrap_or(0.4);
-                    let xtk_rate = prev_xtk
-                        .filter(|_| roll_dt > 0.0)
-                        .map_or(0.0, |(x0, _)| (xtk_m - x0 * M_PER_NM) / roll_dt);
+                    let xtk_rate = rollout_rate.update(
+                        prev_xtk
+                            .filter(|_| roll_dt > 0.0)
+                            .map_or(0.0, |(x0, _)| (xtk_m - x0 * M_PER_NM) / roll_dt),
+                        roll_dt,
+                    );
                     prev_xtk = Some((xtk_nm, t_roll));
                     let target = crate::autotakeoff::roll_target_heading(
                         rwy.course_deg,
