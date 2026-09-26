@@ -380,6 +380,14 @@ pub struct AircraftProfile {
     /// flown on the type; the copilot's own path otherwise.
     #[serde(default)]
     pub ils_coupled: bool,
+    /// The autopilot's own approach button and its status, where the add-on
+    /// has its own (the Laminar 737's APP is `laminar/B738/autopilot/app_press`;
+    /// the stock command armed nothing and the coupling was abandoned after
+    /// six seconds, LEMG 13 2026-09-26). `None`: the stock command/dataref.
+    #[serde(default)]
+    pub approach_command: Option<String>,
+    #[serde(default)]
+    pub approach_status: Option<String>,
     /// The `park_brake_valve` value that means SET on this airframe, where the
     /// valve is modeled. The sense is PER-AIRCRAFT (C90B: 0 = set, verified live;
     /// SR22: 1 = set — the opposite, seen as an "inverted" handle). `None` = don't
@@ -4166,6 +4174,8 @@ fn cessna_172sp() -> AircraftProfile {
         parking_brake: true,
         cabin_crew: false,
         ils_coupled: false,
+        approach_command: None,
+        approach_status: None,
         bus_volts_nominal: None,
         flare_power: None,
         approach_thrust_min: None,
@@ -4474,6 +4484,8 @@ fn cirrus_sr22() -> AircraftProfile {
         parking_brake: true,
         cabin_crew: false,
         ils_coupled: false,
+        approach_command: None,
+        approach_status: None,
         bus_volts_nominal: None,
         flare_power: None,
         approach_thrust_min: None,

@@ -1910,14 +1910,22 @@ pub fn run_autoland_scoped(
                 // approach where the airframe allows it.
                 let on_final = g.phase == ApproachPhase::Final && pattern.is_none() && !ga;
                 let needles = if ils.is_some() {
-                    let (h, v, lv, gv, ap, gs) = tokio::join!(
+                    let appr_dref = crate::ils::approach_status_dref();
+                    let (h, v, lv, gv, ap, gs, stock_ap) = tokio::join!(
                         xp.get_float(crate::ils::HDEF),
                         xp.get_float(crate::ils::VDEF),
                         xp.get_float(crate::ils::LOC_VALID),
                         xp.get_float(crate::ils::GS_VALID),
-                        xp.get_float(crate::ils::APPR_STATUS),
+                        xp.get_float(&appr_dref),
                         xp.get_float(crate::ils::GS_STATUS),
+                        xp.get_float(crate::ils::APPR_STATUS),
                     );
+                    // Both readings, while an airframe's own status is being
+                    // learned (the 737's app_status, 2026-09-26).
+                    LAST_APPR_READS
+                        .lock()
+                        .map(|mut l| *l = (ap.as_ref().ok().copied(), stock_ap.ok()))
+                        .ok();
                     Some((
                         crate::ils::Needles {
                             hdef: h.ok(),
@@ -1957,7 +1965,7 @@ pub fn run_autoland_scoped(
                             tick_dt,
                         );
                         if out.press_appr {
-                            let _ = xp.run_command(crate::ils::CMD_APPROACH).await;
+                            let _ = xp.run_command(&crate::ils::approach_command()).await;
                         }
                         if out.decouple {
                             let _ = xp.run_command(CMD_HDG_MODE).await;
@@ -1967,7 +1975,9 @@ pub fn run_autoland_scoped(
                         if coupling != before {
                             crate::blackbox::record(
                                 "ils",
-                                serde_json::json!({"event": "coupling", "from": format!("{before:?}"),
+                                serde_json::json!({"event": "coupling",
+                                    "appr_reads": *LAST_APPR_READS.lock().unwrap_or_else(|e| e.into_inner()),
+                                    "from": format!("{before:?}"),
                                     "to": format!("{coupling:?}"), "hdef": n.hdef, "vdef": n.vdef,
                                     "radio": radio_ft, "dist": g.dist_nm}),
                             );
@@ -3240,6 +3250,10 @@ const FLARE_PITCH: &str = "xcopilot/pitch";
 const FLARE_PITCH_YIELD: &str = "xcopilot/pitch_yield";
 /// The roll channel the takeoff's climb-out flies, and its take-back latch:
 /// with the servos off for the arrest, the runway track is held here.
+/// The airframe's own approach status and the stock one, last read (while
+/// an add-on's encoding is being learned).
+static LAST_APPR_READS: std::sync::Mutex<(Option<f64>, Option<f64>)> = std::sync::Mutex::new((None, None));
+
 const FLARE_ROLL: &str = "xcopilot/roll";
 const FLARE_ROLL_YIELD: &str = "xcopilot/roll_yield";
 

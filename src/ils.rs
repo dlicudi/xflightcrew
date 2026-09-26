@@ -33,6 +33,20 @@ pub const APPR_STATUS: &str = "sim/cockpit2/autopilot/approach_status";
 pub const GS_STATUS: &str = "sim/cockpit2/autopilot/glideslope_status";
 pub const CMD_APPROACH: &str = "sim/autopilot/approach";
 
+/// The live airframe's approach button (its own where it has one).
+pub fn approach_command() -> String {
+    crate::aircraft::live_profile()
+        .and_then(|p| p.approach_command.clone())
+        .unwrap_or_else(|| CMD_APPROACH.to_string())
+}
+
+/// The live airframe's approach status dataref (its own where it has one).
+pub fn approach_status_dref() -> String {
+    crate::aircraft::live_profile()
+        .and_then(|p| p.approach_status.clone())
+        .unwrap_or_else(|| APPR_STATUS.to_string())
+}
+
 /// How far an ILS may be from the runway's field and still be its own.
 const FIND_MAX_NM: f64 = 40.0;
 
@@ -520,12 +534,13 @@ pub fn spawn_setup_watch(base: String, ils: crate::nav::Ils, mut watch: SetupWat
                     tokio::time::sleep(std::time::Duration::from_secs_f64(dt)).await;
                     continue;
                 }
+                let appr_dref = approach_status_dref();
                 let (hdef, vdef, locv, gsv, appr, nav, gs, servos, lat, lon, hdg, agl) = tokio::join!(
                     xp.get_float(HDEF),
                     xp.get_float(VDEF),
                     xp.get_float(LOC_VALID),
                     xp.get_float(GS_VALID),
-                    xp.get_float(APPR_STATUS),
+                    xp.get_float(&appr_dref),
                     xp.get_float(NAV_STATUS),
                     xp.get_float(GS_STATUS),
                     xp.get_float(SERVOS),
@@ -556,7 +571,7 @@ pub fn spawn_setup_watch(base: String, ils: crate::nav::Ils, mut watch: SetupWat
                 };
                 let out = watch.step(i, dt);
                 if out.press_appr {
-                    let _ = xp.run_command(CMD_APPROACH).await;
+                    let _ = xp.run_command(&approach_command()).await;
                     crate::blackbox::record("ils", json!({ "event": "appr_pressed", "rwy": ils.runway, "icao": ils.airport }));
                 }
                 if let Some(m) = out.set_dial {

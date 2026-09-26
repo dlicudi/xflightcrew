@@ -347,3 +347,7 @@ advisor:
 # On the heading knob the 737 wove 10 to 15 m either side of LEMG 13's
 # centreline all the way down (2026-09-26). First flown on this type then.
 ils_coupled: true
+# Its own APP button: the stock sim/autopilot/approach armed nothing and the
+# coupling gave up after six seconds (LEMG 13, 2026-09-26).
+approach_command: laminar/B738/autopilot/app_press
+approach_status: laminar/B738/autopilot/app_status
