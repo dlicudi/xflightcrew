@@ -902,6 +902,10 @@ struct StallSpeed {
     above_factor: Option<f64>,
 }
 
+/// With an automation flying, the caution band's top: the margin under its
+/// own target, not the hand-flown 1.2 Vs.
+const AUTO_CAUTION_FACTOR: f64 = 1.13;
+
 /// The stall speed at this flap setting: a straight line from the clean
 /// stall to the landing-configuration stall when the profile declares one,
 /// else the trainer's fixed reduction. Never above clean, never below Vso.
@@ -932,15 +936,33 @@ impl Check for StallSpeed {
         // band trips while there's still margin to recover. Only a *decaying*
         // trend counts (`.min(0.0)`), so this can lower the effective speed but
         // never raises it — it never masks a genuine low reading.
-        let projected = s.ias_kts + s.ias_trend_kts_per_s.min(0.0) * STALL_LOOKAHEAD_S;
-        let in_band = projected <= self.at_or_below_factor * vs
+        //
+        // With an AUTOMATION flying, the deceleration is its own, toward a
+        // target it chose: the trend is not a warning and the caution band
+        // is the margin under that target, not the 1.2 Vs a hand-flown
+        // approach wants. A 737's Vref is 1.23 Vso, so the hand band called
+        // "you're getting slow" through every normal slowdown to it, to a
+        // pilot who was not flying (LEMG circuit, 2026-09-26).
+        let auto = s.automation_flying;
+        let caution = self.severity == Severity::Caution;
+        let projected = if auto && caution {
+            s.ias_kts
+        } else {
+            s.ias_kts + s.ias_trend_kts_per_s.min(0.0) * STALL_LOOKAHEAD_S
+        };
+        let at_or_below = if auto && caution { AUTO_CAUTION_FACTOR } else { self.at_or_below_factor };
+        let in_band = projected <= at_or_below * vs
             && self.above_factor.is_none_or(|a| projected > a * vs);
         if !in_band {
             return None;
         }
-        Some(match self.severity {
-            Severity::Warning => "Airspeed! Lower the nose, add power.".to_string(),
-            _ => "Airspeed — you're getting slow.".to_string(),
+        // Who is flying decides the words: never "you" to a pilot who is
+        // not, never an order to the pilot's hands.
+        Some(match (self.severity, auto) {
+            (Severity::Warning, true) => "Airspeed low!".to_string(),
+            (Severity::Warning, false) => "Airspeed! Lower the nose, add power.".to_string(),
+            (_, true) => "Speed's getting low.".to_string(),
+            (_, false) => "Airspeed, you're getting slow.".to_string(),
         })
     }
     fn min_duration(&self) -> Duration {
