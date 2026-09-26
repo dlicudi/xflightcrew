@@ -988,7 +988,8 @@ pub fn run_autoland_scoped(
             // wings-level law that holds the track while it does; the
             // pilot has taken the roll for this approach.
             let mut arrest_hands = false;
-            let mut wings = crate::autotakeoff::WingsLevel::default();
+            let mut wings = arrest_wings();
+            let mut short_final: Option<ShortFinal> = None;
             let mut arrest_rate = crate::autotakeoff::XtkRate::default();
             let mut arrest_prev_xtk: Option<f64> = None;
             let mut roll_yielded = false;
@@ -1904,17 +1905,37 @@ pub fn run_autoland_scoped(
                 // heading), the power on the governor. A balk or leaving
                 // the band hands the servos back and re-engages the modes;
                 // the rollout latch finds them already off.
-                let crabbed_true = match g.phase {
-                    ApproachPhase::Final | ApproachPhase::Flare => {
+                // The last 0.3 nm of the final: the centreline closed in
+                // seconds, damped on the drift over the ground (see
+                // `short_final_cut_deg`), where the old 80 deg/nm let 1 degree
+                // of track build 9 m from 170 ft to the gate.
+                let off_course = |a: f64| ((a - rwy.course_deg + 540.0).rem_euclid(360.0)) - 180.0;
+                let track_off = hpath_r.as_ref().ok().copied().map(off_course);
+                let in_short_final = g.phase == ApproachPhase::Final
+                    && g.dist_nm <= SHORT_FINAL_NM
+                    && !g.arresting;
+                let crabbed_true = match (g.phase, in_short_final, track_off) {
+                    (ApproachPhase::Final, true, Some(to)) => {
+                        let pursuit_bug = g.target_heading_deg + crab + trim;
+                        let sf = short_final
+                            .get_or_insert_with(|| ShortFinal::new(off_course(pursuit_bug), to));
+                        (rwy.course_deg + sf.step(xtk_now * M_PER_NM, to, gs_kts, tick_dt))
+                            .rem_euclid(360.0)
+                    }
+                    (ApproachPhase::Final | ApproachPhase::Flare, ..) => {
+                        short_final = None;
                         (g.target_heading_deg + crab + trim).rem_euclid(360.0)
                     }
-                    ApproachPhase::Intercept => g.target_heading_deg,
+                    (ApproachPhase::Intercept, ..) => {
+                        short_final = None;
+                        g.target_heading_deg
+                    }
                 };
                 match arrest_hands_step(arrest_hands, g.arresting) {
                     ArrestHands::Take => {
                         let ok = xp.run_command(CMD_SERVOS_OFF).await.is_ok();
                         arrest_hands = true;
-                        wings = crate::autotakeoff::WingsLevel::default();
+                        wings = arrest_wings();
                         crate::blackbox::record(
                             "autoland",
                             serde_json::json!({"event": "arrest_hands", "taken": true, "ok": ok, "radio": radio_ft}),
@@ -1951,7 +1972,8 @@ pub fn run_autoland_scoped(
                 let track_now = hpath_r.as_ref().ok().copied();
                 let side_now = side_velocity_m_s(track_now, rwy.course_deg, gs_kts)
                     .unwrap_or(arrest_rate_now);
-                let bank_tgt = arrest_bank_target(xtk_m_now, side_now, radio_ft);
+                let phi_now = phi_r.as_ref().ok().copied().unwrap_or(0.0);
+                let bank_tgt = arrest_bank_target(xtk_m_now, side_now, phi_now, radio_ft);
                 let flare_ail = match (arrest_hands, phi_r.as_ref().ok().copied(), roll_yielded) {
                     (true, Some(phi), false) => Some(wings.step(phi, bank_tgt, tick_dt)),
                     _ => None,
@@ -1976,6 +1998,8 @@ pub fn run_autoland_scoped(
                     "flare_unexplained": model_out.map(|o| o.unexplained_fpm),
                     "lever": last_lever,
                     "phi": phi_r.as_ref().ok().copied(),
+                    "psi": psi_r.as_ref().ok().copied(), "bug_true": crabbed_true,
+                    "short_final": short_final.is_some(),
                     // The arrest's lateral: the track it closes on, the
                     // sideways velocity and the bank it asked for.
                     "trk": track_now, "side_m_s": side_now,
@@ -3842,16 +3866,111 @@ pub fn arrest_hands_step(taken: bool, arresting: bool) -> ArrestHands {
     }
 }
 
+/// Inside this distance to the threshold the final's heading is the
+/// short-final law's ([`short_final_cut_deg`]), not the pursuit's.
+pub const SHORT_FINAL_NM: f64 = 0.30;
+/// The short final closes the offset over this many seconds...
+const SHORT_FINAL_CLOSE_S: f64 = 6.0;
+/// ...judged this far ahead on the drift over the ground...
+const SHORT_FINAL_LEAD_S: f64 = 3.0;
+/// ...with a cut no bigger than this, degrees.
+const SHORT_FINAL_MAX_CUT_DEG: f64 = 3.0;
+
+/// The heading cut off the runway course on the last 0.3 nm, degrees (left
+/// negative), from the offset (`xtk_m`, right positive) and the drift over
+/// the ground (`side_m_s`, right positive, from the track).
+///
+/// It was 80 degrees per nm of offset and nothing else: 0.04 degrees a
+/// metre, an 18 s closure with no damping, where a degree of track error
+/// is 1.3 m/s at 140 kt. LEMG 13 (2026-09-26, 20:17Z): from 170 ft the 737
+/// tracked about a degree right of the runway (the track trim still held
+/// +0.45 degrees learnt against an earlier left drift, and the 15 s crab
+/// filter was still holding the wind of half a minute before, while the
+/// wind swung round), the law answered 8.9 m of offset with 0.4 degrees,
+/// and the arrest gate at 79 ft found it 9 to 12 m right. Here the offset
+/// closes in [`SHORT_FINAL_CLOSE_S`] and the drift is counted
+/// [`SHORT_FINAL_LEAD_S`] ahead, so a track error is answered the moment it
+/// shows, not once it has become metres. Pure.
+pub fn short_final_cut_deg(xtk_m: f64, side_m_s: f64, gs_kts: f64) -> f64 {
+    if !xtk_m.is_finite() || !side_m_s.is_finite() {
+        return 0.0;
+    }
+    let v = (if gs_kts.is_finite() { gs_kts } else { 0.0 } * 0.514_444).max(30.0);
+    let ahead = xtk_m + side_m_s * SHORT_FINAL_LEAD_S;
+    (-(ahead / (v * SHORT_FINAL_CLOSE_S)).atan().to_degrees())
+        .clamp(-SHORT_FINAL_MAX_CUT_DEG, SHORT_FINAL_MAX_CUT_DEG)
+}
+
+/// How quickly the short final learns what the track does against its bug,
+/// seconds.
+const SHORT_FINAL_BIAS_TAU_S: f64 = 2.0;
+
+/// The short final's bug, as an offset from the runway course (degrees):
+/// the [`short_final_cut_deg`] track it wants, less what the track has been
+/// doing against the bug it was given (the autopilot's own heading offset,
+/// a wind the 15 s crab filter has not caught up with, a stale track trim),
+/// learnt over [`SHORT_FINAL_BIAS_TAU_S`]. On the replayed LEMG 13 ticks a
+/// law without it still reached the gate 5 m right: the bug-to-track error
+/// was a steady degree, and a P law holds a steady offset against a steady
+/// error however it is damped. Seeded with the bug the pursuit was flying,
+/// so the hand-over is continuous.
+#[derive(Debug, Clone, Copy)]
+pub struct ShortFinal {
+    bias_deg: f64,
+    prev_bug_deg: f64,
+}
+
+impl ShortFinal {
+    /// `entry_bug_off_deg`: the bug (true) less the course on the tick the
+    /// short final begins; `track_off_deg`: the track less the course then.
+    pub fn new(entry_bug_off_deg: f64, track_off_deg: f64) -> Self {
+        Self {
+            bias_deg: (track_off_deg - entry_bug_off_deg).clamp(-5.0, 5.0),
+            prev_bug_deg: entry_bug_off_deg,
+        }
+    }
+
+    /// One tick: the bug offset from the course, degrees.
+    pub fn step(&mut self, xtk_m: f64, track_off_deg: f64, gs_kts: f64, dt_s: f64) -> f64 {
+        if !track_off_deg.is_finite() || !xtk_m.is_finite() {
+            return self.prev_bug_deg;
+        }
+        let dt = dt_s.clamp(0.05, 1.0);
+        let e = track_off_deg - self.prev_bug_deg;
+        let a = (dt / SHORT_FINAL_BIAS_TAU_S).min(1.0);
+        self.bias_deg = (self.bias_deg + (e - self.bias_deg) * a).clamp(-5.0, 5.0);
+        let v = (gs_kts.max(0.0) * 0.514_444).max(30.0);
+        let side = v * track_off_deg.to_radians().sin();
+        let bug = short_final_cut_deg(xtk_m, side, gs_kts) - self.bias_deg;
+        self.prev_bug_deg = bug;
+        bug
+    }
+}
+
 /// The closure the arrest asks for: the offset over this many seconds.
 const ARREST_CLOSE_S: f64 = 4.0;
 /// ...and never faster than this sideways, m/s.
 const ARREST_CLOSE_MAX_M_S: f64 = 2.5;
 /// How quickly a sideways-velocity error is taken out by the bank, seconds.
-const ARREST_VEL_TAU_S: f64 = 2.0;
+const ARREST_VEL_TAU_S: f64 = 1.5;
 /// The steepest bank over the runway, degrees, tapering toward the wheels.
 const ARREST_BANK_MAX_DEG: f64 = 5.0;
 const ARREST_BANK_WHEELS_DEG: f64 = 2.0;
 const G_M_S2: f64 = 9.81;
+/// The sideways deceleration the closure is sized to be stopped by, m/s^2:
+/// well inside the 0.5 a 3-degree bank gives, since the bank takes seconds
+/// to get there.
+const ARREST_STOP_M_S2: f64 = 0.2;
+/// How far ahead the current bank's push on the drift is counted, seconds:
+/// the 737's roll lag at the arrest's aileron (LEMG 13, 2026-09-26).
+const ARREST_BANK_LEAD_S: f64 = 1.0;
+/// Bank error for full aileron in the arrest (see `WingsLevel::stiff`).
+pub(crate) const ARREST_FULL_AIL_BANK_DEG: f64 = 6.0;
+
+/// The roll loop the arrest flies its bank target through.
+pub(crate) fn arrest_wings() -> crate::autotakeoff::WingsLevel {
+    crate::autotakeoff::WingsLevel::stiff(ARREST_FULL_AIL_BANK_DEG)
+}
 
 /// The bank the arrest flies with the servos out, from the centreline offset
 /// (`xtk_m`, right positive) and the SIDEWAYS VELOCITY over the runway
@@ -3870,12 +3989,30 @@ const G_M_S2: f64 = 9.81;
 /// a row (100 ft to the wheels: +5.6 to -11.9, +5.9 to -14.7, +13.0 to
 /// -5.6, +7.2 to -10.4). The track is what moves the aircraft over the
 /// paint, so the track is what this closes.
-pub fn arrest_bank_target(xtk_m: f64, side_m_s: f64, radio_ft: f64) -> f64 {
+///
+/// The closure goes to ZERO at the centreline and the bank's lag is led.
+/// LEMG 13 (2026-09-26, 20:17Z) went into the gate 11.9 m right: the old
+/// capped rate (the offset over 4 s, at most 2.5 m/s) built the drift to
+/// 2.65 m/s, the bank target reversed at 42 ft but the 737 rolls at about
+/// 2 deg/s on the aileron `WingsLevel` gives it, so the bank only crossed
+/// wings level 2 s later with the aircraft still 2.4 m right at 2.65 m/s;
+/// the shrinking cap then allowed 3 degrees to stop that, and it touched
+/// down 6.5 m left. So the wanted rate is also what a gentle deceleration
+/// ([`ARREST_STOP_M_S2`]) can take off in the offset left, and the drift
+/// the bank is judged against is the one the CURRENT bank will have made
+/// [`ARREST_BANK_LEAD_S`] from now.
+pub fn arrest_bank_target(xtk_m: f64, side_m_s: f64, phi_deg: f64, radio_ft: f64) -> f64 {
     if !xtk_m.is_finite() || !side_m_s.is_finite() {
         return 0.0;
     }
-    let want = (-xtk_m / ARREST_CLOSE_S).clamp(-ARREST_CLOSE_MAX_M_S, ARREST_CLOSE_MAX_M_S);
-    let bank = ((want - side_m_s) / (G_M_S2 * ARREST_VEL_TAU_S)).atan().to_degrees();
+    let phi = if phi_deg.is_finite() { phi_deg.clamp(-30.0, 30.0) } else { 0.0 };
+    let off = xtk_m.abs();
+    let rate = (off / ARREST_CLOSE_S)
+        .min((2.0 * ARREST_STOP_M_S2 * off).sqrt())
+        .min(ARREST_CLOSE_MAX_M_S);
+    let want = -xtk_m.signum() * rate;
+    let side_ahead = side_m_s + G_M_S2 * phi.to_radians().tan() * ARREST_BANK_LEAD_S;
+    let bank = ((want - side_ahead) / (G_M_S2 * ARREST_VEL_TAU_S)).atan().to_degrees();
     let cap = if radio_ft.is_finite() {
         (ARREST_BANK_WHEELS_DEG + radio_ft.max(0.0) / 10.0).min(ARREST_BANK_MAX_DEG)
     } else {
@@ -6212,7 +6349,7 @@ mod tests {
             let (gs_kts, t_end, dt) = (144.0, 8.5, 0.25);
             let v_air = gs_kts * 0.514_444;
             let (mut x, mut v, mut phi, mut p) = (x0, v0, phi0, 0.0_f64);
-            let mut wings = WingsLevel::default();
+            let mut wings = if track_law { arrest_wings() } else { WingsLevel::default() };
             let mut rate = XtkRate::default();
             let mut prev_x: Option<f64> = None;
             let mut queued = 0.0_f64;
@@ -6225,7 +6362,7 @@ mod tests {
                 let track_deg = (v / v_air).asin().to_degrees();
                 let bank_tgt = if track_law {
                     let side = side_velocity_m_s(Some(track_deg), 0.0, gs_kts).unwrap();
-                    arrest_bank_target(x, side, radio)
+                    arrest_bank_target(x, side, phi, radio)
                 } else {
                     let hdg = roll_target_heading(0.0, x, rate_now, gs_kts);
                     let err = ((hdg - track_deg + 540.0).rem_euclid(360.0)) - 180.0;
@@ -6257,16 +6394,162 @@ mod tests {
         assert!(wheels.abs() < 2.0 && worst < 5.0, "{wheels:.1} / {worst:.1}");
     }
 
+    /// LEMG 13, 2026-09-26 (20:17Z, a 737): the arrest gate at 79 ft, 11.89 m
+    /// right, drifting 0.13 m/s left, 2.08 degrees of left bank, 10.4 s to
+    /// the wheels. Recorded: the drift built to 2.65 m/s, the bank target
+    /// reversed at 42 ft but the bank crossed wings level only at 26 ft, it
+    /// crossed the centreline at 22 ft still at 2.5 m/s and touched down
+    /// 6.5 m left.
+    ///
+    /// The roll plant is FITTED to those ticks, not the faster one above:
+    /// 13 deg/s of roll rate per unit of aileron (0.15 to 0.18 of aileron took
+    /// the bank from -3.8 to -0.5 degrees in 1.7 s) through a 0.5 s lag, and
+    /// a slow return toward wings level (3.1 to 2.2 degrees in 2 s at zero
+    /// aileron), with the real `WingsLevel`, a 0.25 s tick and one tick of
+    /// delay. Asserted: the offset at the wheels and the worst overshoot.
+    #[test]
+    fn the_arrest_stops_its_drift_by_the_centreline() {
+        use crate::autotakeoff::WingsLevel;
+        fn old_law(x: f64, side: f64, radio: f64) -> f64 {
+            let want = (-x / 4.0).clamp(-2.5, 2.5);
+            let bank = ((want - side) / (9.81 * 2.0)).atan().to_degrees();
+            let cap = (2.0 + radio.max(0.0) / 10.0).min(5.0);
+            bank.clamp(-cap, cap)
+        }
+        let fly_k = |new: bool, x0: f64, v0: f64, phi0: f64, t_end: f64, k: f64| -> (f64, f64) {
+            let (gate_ft, dt) = (79.0, 0.25);
+            let (mut x, mut v, mut phi, mut p) = (x0, v0, phi0, 0.0_f64);
+            let mut wings = if new { arrest_wings() } else { WingsLevel::default() };
+            let mut queued = 0.0_f64;
+            let (mut t, mut worst) = (0.0, 0.0_f64);
+            while t < t_end {
+                let radio = gate_ft * (1.0 - t / t_end);
+                let tgt = if new {
+                    arrest_bank_target(x, v, phi, radio)
+                } else {
+                    old_law(x, v, radio)
+                };
+                let ail = wings.step(phi, tgt, dt);
+                let applied = std::mem::replace(&mut queued, ail);
+                for _ in 0..10 {
+                    let h = dt / 10.0;
+                    p += (k * applied - phi / 7.5 - p) / 0.5 * h;
+                    phi += p * h;
+                    v += 9.81 * phi.to_radians().tan() * h;
+                    x += v * h;
+                }
+                worst = worst.max(-x * x0.signum());
+                t += dt;
+            }
+            (x, worst)
+        };
+        let fly = |new: bool, x0: f64, v0: f64, phi0: f64, t_end: f64| fly_k(new, x0, v0, phi0, t_end, 13.0);
+        let (old_wheels, old_worst) = fly(false, 11.89, -0.13, -2.08, 10.4);
+        let (wheels, worst) = fly(true, 11.89, -0.13, -2.08, 10.4);
+        let (small, small_worst) = fly(true, 3.0, 0.0, 0.0, 10.4);
+        assert!(old_wheels < -4.0 && old_worst > 4.0, "the plant reproduces the overshoot: {old_wheels:.1} m");
+        assert!(wheels.abs() < 2.0, "lands {wheels:.1} m off");
+        assert!(worst < 2.0, "overshoots {worst:.1} m past the line");
+        assert!(small.abs() < 1.0 && small_worst < 1.0, "from 3 m: {small:.1} / {small_worst:.1}");
+        // Not tuned to one roll rate: the gate lands inside 2 m on a plant
+        // that rolls a third slower or half again faster.
+        for k in [9.0, 20.0] {
+            let (w, o) = fly_k(true, 11.89, -0.13, -2.08, 10.4, k);
+            assert!(w.abs() < 2.0 && o < 2.0, "at {k} deg/s per unit: {w:.1} / {o:.1}");
+        }
+        // Drifting AWAY at the gate still comes in, and a gate already
+        // crossing fast (17:43Z's 3.9 m at 2.3 m/s) lands nearer than it did.
+        let (w, o) = fly(true, 8.0, 1.0, 0.0, 10.4);
+        assert!(w.abs() < 1.0 && o < 1.0, "drifting away: {w:.1} / {o:.1}");
+        let (w_old, _) = fly(false, 3.9, -2.3, -1.4, 8.5);
+        let (w, _) = fly(true, 3.9, -2.3, -1.4, 8.5);
+        assert!(w.abs() < 2.0 && w.abs() < w_old.abs(), "crossing fast: {w:.1} against {w_old:.1}");
+    }
+
+    /// LEMG 13, 2026-09-26 (20:17Z, a 737), the last 7.5 s of the final: on
+    /// the centreline at 172 ft, 8.9 m right at 88 ft and 9 to 12 m right at
+    /// the 79 ft gate, with the bug within half a degree of the runway
+    /// (131.68 true) all the way. Replayed from the recorded inputs: the
+    /// crab plus track trim the loop added (0.59 falling to 0.27 degrees),
+    /// the recorded drift of the track off the heading (the wind), and an
+    /// autopilot that holds heading 0.6 degrees right of its bug through a
+    /// 3 s lag (the recorded heading ran 132.1 to 132.6 against a bug of
+    /// 131.6 to 132.3). Asserted: the offset at the gate.
+    #[test]
+    fn the_short_final_holds_the_centreline_to_the_gate() {
+        let course = 131.68_f64;
+        let gs = 144.0_f64;
+        let v_air = gs * 0.514_444;
+        let crab_trim = |t: f64| if t < 4.7 { 0.59 - (0.59 - 0.27) * t / 4.7 } else { 0.28 };
+        // The recorded track minus heading, at the state samples.
+        let drift_pts = [(0.0, 0.9), (0.9, 0.3), (2.2, 0.2), (3.6, 0.7), (5.0, 0.2), (6.3, -0.4), (7.6, -0.4)];
+        let drift = |t: f64| {
+            let mut d = drift_pts[0].1;
+            for w in drift_pts.windows(2) {
+                if t >= w[0].0 && t <= w[1].0 {
+                    d = w[0].1 + (w[1].1 - w[0].1) * (t - w[0].0) / (w[1].0 - w[0].0);
+                }
+            }
+            if t > drift_pts[drift_pts.len() - 1].0 {
+                d = drift_pts[drift_pts.len() - 1].1;
+            }
+            d
+        };
+        let fly_with = |new: bool, ap_bias: f64, ap_tau: f64, t_end: f64| -> (f64, f64) {
+            let dt = 0.33;
+            let (mut x, mut hdg, mut t, mut worst) = (0.0_f64, 131.8_f64, 0.0_f64, 0.0_f64);
+            let mut queued = 132.27_f64;
+            let mut sf = ShortFinal::new(132.27 - course, hdg + drift(0.0) - course);
+            while t < t_end {
+                let track = hdg + drift(t);
+                let bug = if new {
+                    course + sf.step(x, track - course, gs, dt)
+                } else {
+                    course + (-x / M_PER_NM * 80.0).clamp(-8.0, 8.0) + crab_trim(t)
+                };
+                let applied = std::mem::replace(&mut queued, bug);
+                for _ in 0..10 {
+                    let h = dt / 10.0;
+                    hdg += (applied + ap_bias - hdg) / ap_tau * h;
+                    x += v_air * (hdg + drift(t) - course).to_radians().sin() * h;
+                }
+                worst = worst.max(x.abs());
+                t += dt;
+            }
+            (x, worst)
+        };
+        let fly = |new: bool| fly_with(new, 0.6, 3.0, 7.5);
+        let (old_gate, _) = fly(false);
+        let (gate, worst) = fly(true);
+        assert!(old_gate > 6.0, "the replay reproduces the drift to the gate: {old_gate:.1} m");
+        assert!(gate.abs() < 2.0 && worst < 3.0, "the gate at {gate:.1} m, worst {worst:.1}");
+        // Not tuned to one autopilot: no bias, a larger one, a slower and a
+        // quicker heading mode.
+        for (b, tau) in [(0.0, 3.0), (1.2, 3.0), (0.6, 5.0), (0.6, 1.5)] {
+            let (g, w) = fly_with(true, b, tau, 7.5);
+            assert!(g.abs() < 2.5 && w < 3.5, "bias {b}, lag {tau} s: gate {g:.1}, worst {w:.1}");
+            // ...and a slow airframe's 20 s of short final settles, not rings.
+            let (g, w) = fly_with(true, b, tau, 20.0);
+            assert!(g.abs() < 1.5 && w < 4.0, "20 s, bias {b}, lag {tau} s: {g:.1} / {w:.1}");
+        }
+        // Small and bounded: a metre with no drift asks a tenth of a degree,
+        // and nothing asks more than the cap.
+        assert!(short_final_cut_deg(1.0, 0.0, 144.0).abs() < 0.2);
+        assert_eq!(short_final_cut_deg(200.0, 3.0, 144.0), -SHORT_FINAL_MAX_CUT_DEG);
+        assert_eq!(short_final_cut_deg(f64::NAN, 0.0, 144.0), 0.0);
+        assert!(short_final_cut_deg(0.0, 1.3, 144.0) < -0.5, "a drift is answered before it is metres");
+    }
+
     /// The bank is shallow near the wheels and nothing without a reading.
     #[test]
     fn the_arrest_bank_tapers_to_the_wheels() {
-        assert_eq!(arrest_bank_target(-30.0, 0.0, 80.0), ARREST_BANK_MAX_DEG);
-        assert_eq!(arrest_bank_target(-30.0, 0.0, 0.0), ARREST_BANK_WHEELS_DEG);
-        assert!(arrest_bank_target(30.0, 0.0, 80.0) < 0.0, "right of the line banks left");
-        assert_eq!(arrest_bank_target(f64::NAN, 0.0, 50.0), 0.0);
-        assert_eq!(arrest_bank_target(0.0, 0.0, 50.0), 0.0);
+        assert_eq!(arrest_bank_target(-30.0, 0.0, 0.0, 80.0), ARREST_BANK_MAX_DEG);
+        assert_eq!(arrest_bank_target(-30.0, 0.0, 0.0, 0.0), ARREST_BANK_WHEELS_DEG);
+        assert!(arrest_bank_target(30.0, 0.0, 0.0, 80.0) < 0.0, "right of the line banks left");
+        assert_eq!(arrest_bank_target(f64::NAN, 0.0, 0.0, 50.0), 0.0);
+        assert_eq!(arrest_bank_target(0.0, 0.0, 0.0, 50.0), 0.0);
         // Crossing left at 2.3 m/s over the centreline: bank right now.
-        assert!(arrest_bank_target(0.0, -2.3, 50.0) > 3.0);
+        assert!(arrest_bank_target(0.0, -2.3, 0.0, 50.0) > 3.0);
         assert!(side_velocity_m_s(None, 130.0, 140.0).is_none());
         let v = side_velocity_m_s(Some(129.0), 130.0, 140.0).unwrap();
         assert!((v + 1.26).abs() < 0.05, "1 degree left at 140 kt: {v}");
