@@ -986,6 +986,7 @@ pub fn run_autoland_scoped(
             // pilot has taken the roll for this approach.
             let mut arrest_hands = false;
             let mut wings = arrest_wings();
+            let mut short_final: Option<ShortFinal> = None;
             let mut arrest_rate = crate::autotakeoff::XtkRate::default();
             let mut arrest_prev_xtk: Option<f64> = None;
             let mut roll_yielded = false;
@@ -1901,11 +1902,31 @@ pub fn run_autoland_scoped(
                 // heading), the power on the governor. A balk or leaving
                 // the band hands the servos back and re-engages the modes;
                 // the rollout latch finds them already off.
-                let crabbed_true = match g.phase {
-                    ApproachPhase::Final | ApproachPhase::Flare => {
+                // The last 0.3 nm of the final: the centreline closed in
+                // seconds, damped on the drift over the ground (see
+                // `short_final_cut_deg`), where the old 80 deg/nm let 1 degree
+                // of track build 9 m from 170 ft to the gate.
+                let off_course = |a: f64| ((a - rwy.course_deg + 540.0).rem_euclid(360.0)) - 180.0;
+                let track_off = hpath_r.as_ref().ok().copied().map(off_course);
+                let in_short_final = g.phase == ApproachPhase::Final
+                    && g.dist_nm <= SHORT_FINAL_NM
+                    && !g.arresting;
+                let crabbed_true = match (g.phase, in_short_final, track_off) {
+                    (ApproachPhase::Final, true, Some(to)) => {
+                        let pursuit_bug = g.target_heading_deg + crab + trim;
+                        let sf = short_final
+                            .get_or_insert_with(|| ShortFinal::new(off_course(pursuit_bug), to));
+                        (rwy.course_deg + sf.step(xtk_now * M_PER_NM, to, gs_kts, tick_dt))
+                            .rem_euclid(360.0)
+                    }
+                    (ApproachPhase::Final | ApproachPhase::Flare, ..) => {
+                        short_final = None;
                         (g.target_heading_deg + crab + trim).rem_euclid(360.0)
                     }
-                    ApproachPhase::Intercept => g.target_heading_deg,
+                    (ApproachPhase::Intercept, ..) => {
+                        short_final = None;
+                        g.target_heading_deg
+                    }
                 };
                 match arrest_hands_step(arrest_hands, g.arresting) {
                     ArrestHands::Take => {
@@ -1973,6 +1994,8 @@ pub fn run_autoland_scoped(
                     "flare_ahead": model_out.map(|o| o.ahead_ft),
                     "flare_unexplained": model_out.map(|o| o.unexplained_fpm),
                     "phi": phi_r.as_ref().ok().copied(),
+                    "psi": psi_r.as_ref().ok().copied(), "bug_true": crabbed_true,
+                    "short_final": short_final.is_some(),
                     // The arrest's lateral: the track it closes on, the
                     // sideways velocity and the bank it asked for.
                     "trk": track_now, "side_m_s": side_now,
@@ -3825,6 +3848,87 @@ pub fn arrest_hands_step(taken: bool, arresting: bool) -> ArrestHands {
         (false, true) => ArrestHands::Take,
         (true, true) => ArrestHands::Keep,
         (true, false) => ArrestHands::Return,
+    }
+}
+
+/// Inside this distance to the threshold the final's heading is the
+/// short-final law's ([`short_final_cut_deg`]), not the pursuit's.
+pub const SHORT_FINAL_NM: f64 = 0.30;
+/// The short final closes the offset over this many seconds...
+const SHORT_FINAL_CLOSE_S: f64 = 6.0;
+/// ...judged this far ahead on the drift over the ground...
+const SHORT_FINAL_LEAD_S: f64 = 3.0;
+/// ...with a cut no bigger than this, degrees.
+const SHORT_FINAL_MAX_CUT_DEG: f64 = 3.0;
+
+/// The heading cut off the runway course on the last 0.3 nm, degrees (left
+/// negative), from the offset (`xtk_m`, right positive) and the drift over
+/// the ground (`side_m_s`, right positive, from the track).
+///
+/// It was 80 degrees per nm of offset and nothing else: 0.04 degrees a
+/// metre, an 18 s closure with no damping, where a degree of track error
+/// is 1.3 m/s at 140 kt. LEMG 13 (2026-09-26, 20:17Z): from 170 ft the 737
+/// tracked about a degree right of the runway (the track trim still held
+/// +0.45 degrees learnt against an earlier left drift, and the 15 s crab
+/// filter was still holding the wind of half a minute before, while the
+/// wind swung round), the law answered 8.9 m of offset with 0.4 degrees,
+/// and the arrest gate at 79 ft found it 9 to 12 m right. Here the offset
+/// closes in [`SHORT_FINAL_CLOSE_S`] and the drift is counted
+/// [`SHORT_FINAL_LEAD_S`] ahead, so a track error is answered the moment it
+/// shows, not once it has become metres. Pure.
+pub fn short_final_cut_deg(xtk_m: f64, side_m_s: f64, gs_kts: f64) -> f64 {
+    if !xtk_m.is_finite() || !side_m_s.is_finite() {
+        return 0.0;
+    }
+    let v = (if gs_kts.is_finite() { gs_kts } else { 0.0 } * 0.514_444).max(30.0);
+    let ahead = xtk_m + side_m_s * SHORT_FINAL_LEAD_S;
+    (-(ahead / (v * SHORT_FINAL_CLOSE_S)).atan().to_degrees())
+        .clamp(-SHORT_FINAL_MAX_CUT_DEG, SHORT_FINAL_MAX_CUT_DEG)
+}
+
+/// How quickly the short final learns what the track does against its bug,
+/// seconds.
+const SHORT_FINAL_BIAS_TAU_S: f64 = 2.0;
+
+/// The short final's bug, as an offset from the runway course (degrees):
+/// the [`short_final_cut_deg`] track it wants, less what the track has been
+/// doing against the bug it was given (the autopilot's own heading offset,
+/// a wind the 15 s crab filter has not caught up with, a stale track trim),
+/// learnt over [`SHORT_FINAL_BIAS_TAU_S`]. On the replayed LEMG 13 ticks a
+/// law without it still reached the gate 5 m right: the bug-to-track error
+/// was a steady degree, and a P law holds a steady offset against a steady
+/// error however it is damped. Seeded with the bug the pursuit was flying,
+/// so the hand-over is continuous.
+#[derive(Debug, Clone, Copy)]
+pub struct ShortFinal {
+    bias_deg: f64,
+    prev_bug_deg: f64,
+}
+
+impl ShortFinal {
+    /// `entry_bug_off_deg`: the bug (true) less the course on the tick the
+    /// short final begins; `track_off_deg`: the track less the course then.
+    pub fn new(entry_bug_off_deg: f64, track_off_deg: f64) -> Self {
+        Self {
+            bias_deg: (track_off_deg - entry_bug_off_deg).clamp(-5.0, 5.0),
+            prev_bug_deg: entry_bug_off_deg,
+        }
+    }
+
+    /// One tick: the bug offset from the course, degrees.
+    pub fn step(&mut self, xtk_m: f64, track_off_deg: f64, gs_kts: f64, dt_s: f64) -> f64 {
+        if !track_off_deg.is_finite() || !xtk_m.is_finite() {
+            return self.prev_bug_deg;
+        }
+        let dt = dt_s.clamp(0.05, 1.0);
+        let e = track_off_deg - self.prev_bug_deg;
+        let a = (dt / SHORT_FINAL_BIAS_TAU_S).min(1.0);
+        self.bias_deg = (self.bias_deg + (e - self.bias_deg) * a).clamp(-5.0, 5.0);
+        let v = (gs_kts.max(0.0) * 0.514_444).max(30.0);
+        let side = v * track_off_deg.to_radians().sin();
+        let bug = short_final_cut_deg(xtk_m, side, gs_kts) - self.bias_deg;
+        self.prev_bug_deg = bug;
+        bug
     }
 }
 
@@ -6343,6 +6447,80 @@ mod tests {
         let (w_old, _) = fly(false, 3.9, -2.3, -1.4, 8.5);
         let (w, _) = fly(true, 3.9, -2.3, -1.4, 8.5);
         assert!(w.abs() < 2.0 && w.abs() < w_old.abs(), "crossing fast: {w:.1} against {w_old:.1}");
+    }
+
+    /// LEMG 13, 2026-09-26 (20:17Z, a 737), the last 7.5 s of the final: on
+    /// the centreline at 172 ft, 8.9 m right at 88 ft and 9 to 12 m right at
+    /// the 79 ft gate, with the bug within half a degree of the runway
+    /// (131.68 true) all the way. Replayed from the recorded inputs: the
+    /// crab plus track trim the loop added (0.59 falling to 0.27 degrees),
+    /// the recorded drift of the track off the heading (the wind), and an
+    /// autopilot that holds heading 0.6 degrees right of its bug through a
+    /// 3 s lag (the recorded heading ran 132.1 to 132.6 against a bug of
+    /// 131.6 to 132.3). Asserted: the offset at the gate.
+    #[test]
+    fn the_short_final_holds_the_centreline_to_the_gate() {
+        let course = 131.68_f64;
+        let gs = 144.0_f64;
+        let v_air = gs * 0.514_444;
+        let crab_trim = |t: f64| if t < 4.7 { 0.59 - (0.59 - 0.27) * t / 4.7 } else { 0.28 };
+        // The recorded track minus heading, at the state samples.
+        let drift_pts = [(0.0, 0.9), (0.9, 0.3), (2.2, 0.2), (3.6, 0.7), (5.0, 0.2), (6.3, -0.4), (7.6, -0.4)];
+        let drift = |t: f64| {
+            let mut d = drift_pts[0].1;
+            for w in drift_pts.windows(2) {
+                if t >= w[0].0 && t <= w[1].0 {
+                    d = w[0].1 + (w[1].1 - w[0].1) * (t - w[0].0) / (w[1].0 - w[0].0);
+                }
+            }
+            if t > drift_pts[drift_pts.len() - 1].0 {
+                d = drift_pts[drift_pts.len() - 1].1;
+            }
+            d
+        };
+        let fly_with = |new: bool, ap_bias: f64, ap_tau: f64, t_end: f64| -> (f64, f64) {
+            let dt = 0.33;
+            let (mut x, mut hdg, mut t, mut worst) = (0.0_f64, 131.8_f64, 0.0_f64, 0.0_f64);
+            let mut queued = 132.27_f64;
+            let mut sf = ShortFinal::new(132.27 - course, hdg + drift(0.0) - course);
+            while t < t_end {
+                let track = hdg + drift(t);
+                let bug = if new {
+                    course + sf.step(x, track - course, gs, dt)
+                } else {
+                    course + (-x / M_PER_NM * 80.0).clamp(-8.0, 8.0) + crab_trim(t)
+                };
+                let applied = std::mem::replace(&mut queued, bug);
+                for _ in 0..10 {
+                    let h = dt / 10.0;
+                    hdg += (applied + ap_bias - hdg) / ap_tau * h;
+                    x += v_air * (hdg + drift(t) - course).to_radians().sin() * h;
+                }
+                worst = worst.max(x.abs());
+                t += dt;
+            }
+            (x, worst)
+        };
+        let fly = |new: bool| fly_with(new, 0.6, 3.0, 7.5);
+        let (old_gate, _) = fly(false);
+        let (gate, worst) = fly(true);
+        assert!(old_gate > 6.0, "the replay reproduces the drift to the gate: {old_gate:.1} m");
+        assert!(gate.abs() < 2.0 && worst < 3.0, "the gate at {gate:.1} m, worst {worst:.1}");
+        // Not tuned to one autopilot: no bias, a larger one, a slower and a
+        // quicker heading mode.
+        for (b, tau) in [(0.0, 3.0), (1.2, 3.0), (0.6, 5.0), (0.6, 1.5)] {
+            let (g, w) = fly_with(true, b, tau, 7.5);
+            assert!(g.abs() < 2.5 && w < 3.5, "bias {b}, lag {tau} s: gate {g:.1}, worst {w:.1}");
+            // ...and a slow airframe's 20 s of short final settles, not rings.
+            let (g, w) = fly_with(true, b, tau, 20.0);
+            assert!(g.abs() < 1.5 && w < 4.0, "20 s, bias {b}, lag {tau} s: {g:.1} / {w:.1}");
+        }
+        // Small and bounded: a metre with no drift asks a tenth of a degree,
+        // and nothing asks more than the cap.
+        assert!(short_final_cut_deg(1.0, 0.0, 144.0).abs() < 0.2);
+        assert_eq!(short_final_cut_deg(200.0, 3.0, 144.0), -SHORT_FINAL_MAX_CUT_DEG);
+        assert_eq!(short_final_cut_deg(f64::NAN, 0.0, 144.0), 0.0);
+        assert!(short_final_cut_deg(0.0, 1.3, 144.0) < -0.5, "a drift is answered before it is metres");
     }
 
     /// The bank is shallow near the wheels and nothing without a reading.
