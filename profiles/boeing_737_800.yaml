@@ -64,13 +64,34 @@ flare_elevator:
   gain: 0.6
   max: 0.45
   max_push: 0.0
-  # Exponential flare: the sink target falls with the height (4 s), so the
-  # arrest keeps descending and arrives in about five seconds from 35 ft.
-  # The flat -175 floated LEMG 13 from 36 to 19 ft (2026-09-26).
-  tau_s: 4.0
+  # Exponential flare: the sink target falls with the height, so the
+  # arrest keeps descending instead of floating. The flat -175 floated LEMG
+  # 13 from 36 to 19 ft (2026-09-26). 5 s, taken 3.5 s ahead by the model
+  # below: 4 s at the present height asked -335 at 10 ft and the pull
+  # settled there (-409 and -390 at the wheels).
+  tau_s: 5.0
   # A bounce eases the pull, never drops it: dropped to neutral, the nose
   # came down and the 737 met the runway again (LEMG circuit, 2026-09-26).
   balloon_ease_per_s: 0.15
+  # How the sink answers the column with the servos out, fitted to the six
+  # LEMG 13 flares of 2026-09-26 (the elevator written against the sink
+  # that followed, 36 fpm rms): a STANDING change of sink per unit of pull
+  # (0.23 held -350, 0.084 held -590; per flare 2,250 to 3,080), two 1 s
+  # lags, 1.8 s of dead time. Declared, the whole arrest from the roundout
+  # gate is flown on this model (autoland::FlareModel) instead of the
+  # tracker above; gain, trim and ratchet are then unused. Through the
+  # fitted plant from all six recorded gates, with the plant's gain from
+  # 2,250 to 3,080 and its delay 0.3 s either side: 361 fpm at worst,
+  # 302 to 326 as fitted, no balloon (lemg_737_flare_tests in autoland.rs).
+  # VERIFY: blackbox autoland ticks carry flare_target, flare_ahead and
+  # flare_unexplained from the arrest_hands event to the wheels.
+  model:
+    fpm_per_elevator: 2600.0
+    lag_s: 1.0
+    dead_s: 1.8
+    lead_s: 3.5
+    settle_s: 0.6
+    observer_s: 0.3
 # How the landing arrest leads THIS autopilot. The 172's law (gain 2, dial
 # cap +300, no trend term) was fitted to a first-order 4.5 s lag; this
 # aircraft's VS mode, fitted to the EGCC 23L tick log (2026-09-19), is two
