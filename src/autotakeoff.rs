@@ -2125,6 +2125,7 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, p: Params) {
                 // still owns the heading until liftoff.
                 let pitch = pitch_law.step(theta_deg, pitch_rate, dt);
                 let ail = wings.step(phi_deg, 0.0, dt);
+                crate::monitor::note_crew_yoke();
                 let (wp, wr) = tokio::join!(
                     xp.set_float(TAKEOFF_PITCH, pitch),
                     xp.set_float(TAKEOFF_ROLL, ail)
@@ -2233,6 +2234,7 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, p: Params) {
                 let hdg_err = ((rwy.course_deg - psi + 540.0).rem_euclid(360.0)) - 180.0;
                 let pitch = pitch_law.step(theta_deg, pitch_rate, dt);
                 let ail = wings.step(phi_deg, climb_bank_target(hdg_err), dt);
+                crate::monitor::note_crew_yoke();
                 let (wp, wr) = tokio::join!(
                     xp.set_float(TAKEOFF_PITCH, pitch),
                     xp.set_float(TAKEOFF_ROLL, ail)

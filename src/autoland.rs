@@ -2022,6 +2022,7 @@ pub fn run_autoland_scoped(
                     async {
                         match flare_elev {
                             Some(e) => {
+                                crate::monitor::note_crew_yoke();
                                 let _ = xp.set_float(FLARE_PITCH, e).await;
                                 xp.get_float(FLARE_PITCH_YIELD).await
                             }
@@ -2031,6 +2032,7 @@ pub fn run_autoland_scoped(
                     async {
                         match flare_ail {
                             Some(a) => {
+                                crate::monitor::note_crew_yoke();
                                 let _ = xp.set_float(FLARE_ROLL, a).await;
                                 xp.get_float(FLARE_ROLL_YIELD).await
                             }

@@ -2169,23 +2169,64 @@ async fn read_inputs(xp: &crate::xplane::XPlaneClient) -> Inputs {
 /// Past this deflection a yoke under an autopilot is a hand on it.
 const YOKE_HANDS: f64 = 0.15;
 
-/// Interventions the tick can see: a plugin yield latch rising (feet on the
-/// pedals, hands on the yoke, a toe brake during a steered drive), or the yoke
-/// deflected while the autopilot flies for an automation. Each is blackboxed
-/// `intervention` once per episode; "my controls" and the loops' own yield
-/// stand-downs record through `flight::note_pilot_takeover`.
-fn note_interventions(i: &Inputs, control: crate::flight::Control) {
-    static PREV: std::sync::Mutex<[bool; 4]> = std::sync::Mutex::new([false; 4]);
+/// How long a write to the crew's own yoke channels (`xcopilot/pitch`,
+/// `xcopilot/roll`) owns the yoke reading: the plugin applies a write for
+/// 1 s, the monitor reads the yoke some ticks later.
+const CREW_YOKE_FRESH_S: f64 = 1.5;
+
+fn process_secs() -> f64 {
+    static EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    EPOCH.get_or_init(std::time::Instant::now).elapsed().as_secs_f64()
+}
+
+/// Millis since the process epoch of the last crew yoke write, 0 = never.
+static CREW_YOKE_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// A loop wrote the elevator or aileron channel: for the next
+/// [`CREW_YOKE_FRESH_S`] the yoke ratio is OURS (the plugin overrides the
+/// joystick and writes the ratio itself), not a hand. Called by every writer
+/// of `xcopilot/pitch` / `xcopilot/roll` in the air (the takeoff's rotation
+/// and hand-flown climb, the autoland's arrest and flare).
+pub fn note_crew_yoke() {
+    let ms = (process_secs() * 1000.0) as u64 + 1;
+    CREW_YOKE_MS.store(ms, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn crew_yoke_fresh() -> bool {
+    let ms = CREW_YOKE_MS.load(std::sync::atomic::Ordering::Relaxed);
+    ms > 0 && process_secs() - (ms - 1) as f64 / 1000.0 <= CREW_YOKE_FRESH_S
+}
+
+/// Which interventions the tick sees, pure: `[steer_yield, pitch_yield,
+/// brake_yield, yoke_under_ap]`. The yoke is a hand only when WE are not the
+/// one moving it: under our own pitch/roll channel the ratio is the loop's
+/// output (1790441293: `yp` 0.21 to 0.32 in the 737's arrest and flare,
+/// -0.37 at the takeoff's AP engage, the channel's exact value, four
+/// "interventions" and a failed sortie), and a pilot's hand on the yoke
+/// while the channel is applied is the plugin's `pitch_yield` latch to see.
+fn interventions_now(i: &Inputs, control: crate::flight::Control, crew_yoke: bool) -> [bool; 4] {
     let automation = matches!(control, crate::flight::Control::Automation(_));
     let hands = automation
+        && !crew_yoke
         && i.ap_on.is_some_and(|v| v > 0.5)
         && [i.yoke_pitch, i.yoke_roll].iter().any(|v| v.is_some_and(|x| x.abs() > YOKE_HANDS));
-    let now = [
+    [
         i.steer_yield.is_some_and(|v| v > 0.5),
         i.pitch_yield.is_some_and(|v| v > 0.5),
         i.brake_yield.is_some_and(|v| v > 0.5),
         hands,
-    ];
+    ]
+}
+
+/// Interventions the tick can see: a plugin yield latch rising (feet on the
+/// pedals, hands on the yoke, a toe brake during a steered drive), or the yoke
+/// deflected while the autopilot flies for an automation and no loop of ours
+/// is writing it. Each is blackboxed `intervention` once per episode; "my
+/// controls" and the loops' own yield stand-downs record through
+/// `flight::note_pilot_takeover`.
+fn note_interventions(i: &Inputs, control: crate::flight::Control) {
+    static PREV: std::sync::Mutex<[bool; 4]> = std::sync::Mutex::new([false; 4]);
+    let now = interventions_now(i, control, crew_yoke_fresh());
     let names = ["steer_yield", "pitch_yield", "brake_yield", "yoke_under_ap"];
     let mut prev = PREV.lock().unwrap_or_else(|e| e.into_inner());
     for k in 0..4 {
@@ -4338,6 +4379,43 @@ fn feed_surface_wind() {
 
 #[cfg(test)]
 mod tests {
+    /// 1790441293 (737, LEMG 13): the `state` records' `in` at the four
+    /// `yoke_under_ap` interventions, every one the crew's own channel read
+    /// back (the takeoff's climb_manual pitch -0.371 at the AP engage, then
+    /// the arrest and flare's flare_elev 0.26 / 0.32 / 0.21). Under our own
+    /// fresh write they are no hand; with no write of ours the same yoke is.
+    #[test]
+    fn the_crews_own_flare_is_not_a_pilot_on_the_yoke() {
+        use crate::flight::Control;
+        let yoke = |yp: f64, yr: f64| super::Inputs {
+            yoke_pitch: Some(yp),
+            yoke_roll: Some(yr),
+            ap_on: Some(1.0),
+            steer_yield: Some(0.0),
+            pitch_yield: Some(0.0),
+            brake_yield: Some(0.0),
+            ..Default::default()
+        };
+        let recorded = [
+            (yoke(-0.37, -0.0), Control::Automation("takeoff")),
+            (yoke(0.26, -0.11), Control::Automation("autoland")),
+            (yoke(0.32, 0.05), Control::Automation("autoland")),
+            (yoke(0.21, 0.05), Control::Automation("autoland")),
+        ];
+        for (i, c) in &recorded {
+            assert_eq!(super::interventions_now(i, *c, true), [false; 4], "{i:?}");
+            assert!(super::interventions_now(i, *c, false)[3], "{i:?}");
+        }
+        // A real hand while our channel is on is the plugin's latch to see.
+        let mut grab = yoke(0.3, 0.0);
+        grab.pitch_yield = Some(1.0);
+        let now = super::interventions_now(&grab, Control::Automation("autoland"), true);
+        assert!(now[1] && !now[3]);
+        // The live stamp: a write just now owns the yoke reading.
+        super::note_crew_yoke();
+        assert!(super::crew_yoke_fresh());
+    }
+
     #[test]
     fn the_overspeed_warning_never_blames_a_descent_in_a_climb() {
         assert!(super::overspeed_line(-1500.0).contains("descent"));
