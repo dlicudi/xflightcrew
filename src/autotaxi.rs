@@ -119,10 +119,28 @@ pub(crate) const MAX_JOIN_M: f64 = 150.0;
 /// distance: room for the turning circle of a turn-around without ever
 /// letting a broken law wander further from the route than it started.
 const JOIN_GROW_M: f64 = 40.0;
+/// An engage further off than [`OFF_ROUTE_STOP_M`] or with the nose more than
+/// this far off the aim is a JOIN (the widened guard, the join pace).
+const JOIN_ALLOW_ERR_DEG: f64 = 45.0;
 /// Joined when inside this lateral AND aligned within [`JOIN_DONE_ERR_DEG`]:
-/// the tight established guard takes over from there.
-const JOIN_DONE_LAT_M: f64 = 15.0;
-const JOIN_DONE_ERR_DEG: f64 = 45.0;
+/// ON the line, which is what "joined" means to everything that reads it.
+///
+/// It was 15 m and 45 degrees, loose enough to latch in the middle of a
+/// capture that had not happened (Southampton, 2026-07-30), and the sortie
+/// scorer judges the taxi's lateral from the latch on, so every turn-round
+/// off a stand scored the tail of its own U-turn as "off the line": 14.5,
+/// 14.9 and 15.3 m (LEMG, LIBP, LIPR, 2026-09-26), the latch threshold
+/// itself, with the aircraft still swinging at 42 degrees of error.
+const JOIN_DONE_LAT_M: f64 = 3.0;
+const JOIN_DONE_ERR_DEG: f64 = 15.0;
+/// A capture that has stopped closing is joined where it SETTLED: within the
+/// old 15 m, aligned, and no nearer by [`JOIN_PROGRESS_M`] for
+/// [`JOIN_SETTLE_S`]. Without it a law holding a steady offset would stay
+/// "joining" for the whole taxi, the wide guard on, the trim frozen and the
+/// offset never judged.
+const JOIN_SETTLE_MAX_LAT_M: f64 = 15.0;
+const JOIN_PROGRESS_M: f64 = 0.5;
+const JOIN_SETTLE_S: f64 = 8.0;
 /// While joining with the nose still this far off the aim, hold the
 /// sharp-turn pace; better aligned joins ride at ordinary bend speed.
 const JOIN_ERR_SLOW_DEG: f64 = 60.0;
@@ -143,6 +161,27 @@ const STEER_FULL_DEG: f64 = 30.0;
 /// schedule to the pace's turn cap; at/above `SHARP_DEG`, to its sharp cap.
 const TURN_DEG: f64 = 30.0;
 const SHARP_DEG: f64 = 100.0;
+/// A corner's radius is the circle through the route this far either side
+/// of its vertex.
+const BEND_RADIUS_SPAN_M: f64 = 8.0;
+/// The deceleration the bend caps are anticipated at: the stop ramp's own.
+const BEND_DECEL_MS2: f64 = STOP_DECEL_MS2;
+/// How far before a corner's own window its approach is shaped: enough for
+/// 18 kt down to 6 at [`BEND_DECEL_MS2`].
+const BEND_ENVELOPE_M: f64 = 160.0;
+/// No corner cap below a walking pace: the governor needs a speed to hold.
+const CORNER_MIN_KTS: f64 = 3.0;
+
+/// The radius of the circle through three points (metres), or infinity when
+/// they lie on a line.
+fn circle_radius_m(a: (f64, f64), b: (f64, f64), c: (f64, f64)) -> f64 {
+    let (ab, bc, ca) = (taxi_guide::dist(a, b), taxi_guide::dist(b, c), taxi_guide::dist(c, a));
+    let cross = ((b.0 - a.0) * (c.1 - a.1) - (b.1 - a.1) * (c.0 - a.0)).abs();
+    if cross < 1e-6 {
+        return f64::INFINITY;
+    }
+    ab * bc * ca / (2.0 * cross)
+}
 /// The GA pace, tuned on the 172 and the default for any airframe whose
 /// profile declares nothing. See [`Pace`].
 const STRAIGHT_KTS: f64 = 10.0;
@@ -167,6 +206,9 @@ pub struct Pace {
     pub brake_steer: bool,
     /// Pure-pursuit aim time, seconds — see [`lookahead_m_with`].
     pub lookahead_s: f64,
+    /// The yaw rate a corner may ask, deg/s, when the profile declares one
+    /// (`taxi.max_yaw_dps`); see [`Route::bend_cap_kts`].
+    pub max_yaw_dps: Option<f64>,
 }
 
 impl Default for Pace {
@@ -180,6 +222,7 @@ impl Default for Pace {
             steer_slew_per_s: None,
             brake_steer: false,
             lookahead_s: 5.0,
+            max_yaw_dps: None,
         }
     }
 }
@@ -209,6 +252,7 @@ impl Pace {
             steer_slew_per_s: t.steer_slew_per_s.map(|v| v.clamp(0.5, 10.0)),
             brake_steer: t.brake_steer,
             lookahead_s: t.lookahead_s.map_or(5.0, |v| v.clamp(3.0, 12.0)),
+            max_yaw_dps: t.max_yaw_dps.map(|v| v.clamp(5.0, 60.0)),
         }
     }
 
@@ -228,7 +272,7 @@ impl Pace {
     ///
     /// The bend caps read the paint and nothing else: they answer "how sharp is
     /// what's coming", never "are we on it". Between them and `join_cap_kts`
-    /// there was a hole — the join cap stops at the `join_done` latch (15 m,
+    /// there was a hole: the join cap stops at the `join_done` latch (then 15 m,
     /// 45 deg), which is loose enough to fire in the middle of a capture that
     /// has not happened, and past it the schedule went straight back to the
     /// open-taxiway pace. Southampton, 2026-07-30: the SF50 latched joined at
@@ -322,8 +366,9 @@ pub struct Route {
     /// Cumulative along-route distance per vertex.
     cum: Vec<f64>,
     total: f64,
-    /// (along-route m, |bend| degrees) per real corner, for the slow-down.
-    bends: Vec<(f64, f64)>,
+    /// (along-route m, |bend| degrees, radius m) per real corner, for the
+    /// slow-down.
+    bends: Vec<(f64, f64, f64)>,
     /// Spoken holding point ("November five Whiskey"), may be empty.
     pub holding_point: String,
     /// Overrides the arrival line when set — a LINE-UP drive ends with
@@ -391,7 +436,7 @@ impl Route {
         if total < STOP_SHORT_M + 15.0 {
             return None;
         }
-        let mut bends: Vec<(f64, f64)> = Vec::new();
+        let mut bends: Vec<(f64, f64, f64)> = Vec::new();
         for i in 1..pts.len() - 1 {
             let b_in =
                 taxi_guide::bearing(taxi_guide::point_at(&pts, &cum, cum[i] - WINDOW_M), pts[i]);
@@ -399,7 +444,12 @@ impl Route {
                 taxi_guide::bearing(pts[i], taxi_guide::point_at(&pts, &cum, cum[i] + WINDOW_M));
             let delta = taxi_guide::angle_diff(b_out, b_in).abs();
             if delta >= TURN_DEG {
-                bends.push((cum[i], delta));
+                let radius = circle_radius_m(
+                    taxi_guide::point_at(&pts, &cum, cum[i] - BEND_RADIUS_SPAN_M),
+                    pts[i],
+                    taxi_guide::point_at(&pts, &cum, cum[i] + BEND_RADIUS_SPAN_M),
+                );
+                bends.push((cum[i], delta, radius));
             }
         }
         let runway_spans = runway_spans(&watch.seg, &cum);
@@ -541,17 +591,34 @@ impl Route {
     /// The bend-imposed speed cap near `progress`, if a corner is close
     /// enough to matter: inside a speed-scaled lead distance before the
     /// corner, and until 15 m past it (mid-turn is no place to accelerate).
+    ///
+    /// Before that window the cap is the corner's speed plus what
+    /// [`BEND_DECEL_MS2`] can take off in the distance left to the window,
+    /// so the governor arrives AT the corner's pace instead of being handed
+    /// it at the corner: on a 737 the cap arrived about 30 m out and it went
+    /// into LEMG's Alpha at 11.5 kt against 10 (2026-09-26). And where the
+    /// airframe declares the yaw rate it can turn at (`Pace::max_yaw_dps`),
+    /// no corner is taken faster than that rate times its radius: the same
+    /// corner was drawn at 9 m and asked 38 deg/s of an aircraft that turns
+    /// at 20, and it swung 5.8 m wide.
     pub fn bend_cap_kts(&self, progress: f64, gs_kts: f64) -> Option<f64> {
         let lead = (gs_kts * 0.514 * 6.0).clamp(25.0, 90.0);
         self.bends
             .iter()
-            .filter(|(at, _)| progress < at + 15.0 && at - progress < lead)
-            .map(|&(_, deg)| {
-                if deg >= SHARP_DEG {
+            .filter(|(at, ..)| progress < at + 15.0 && at - progress < lead + BEND_ENVELOPE_M)
+            .map(|&(at, deg, radius)| {
+                let class = if deg >= SHARP_DEG {
                     self.pace.sharp
                 } else {
                     self.pace.turn
-                }
+                };
+                let corner = self
+                    .pace
+                    .max_yaw_dps
+                    .map_or(class, |w| class.min(w.to_radians() * radius * MS_TO_KTS).max(CORNER_MIN_KTS));
+                let before = (at - progress - lead).max(0.0);
+                let v = corner / MS_TO_KTS;
+                MS_TO_KTS * (v * v + 2.0 * BEND_DECEL_MS2 * before).sqrt()
             })
             .fold(None, |acc: Option<f64>, cap| {
                 Some(acc.map_or(cap, |a| a.min(cap)))
@@ -904,16 +971,40 @@ pub fn stop_straighten(steer: f64, remaining_m: f64, gs_kts: f64) -> f64 {
 /// engage distance plus turning-circle room. The guard while joining is
 /// [`OFF_ROUTE_STOP_M`] plus this.
 pub fn join_allowance_m(lateral: f64, err_deg: f64) -> f64 {
-    if lateral > OFF_ROUTE_STOP_M || err_deg.abs() > JOIN_DONE_ERR_DEG {
+    if lateral > OFF_ROUTE_STOP_M || err_deg.abs() > JOIN_ALLOW_ERR_DEG {
         lateral.max(OFF_ROUTE_STOP_M) + JOIN_GROW_M
     } else {
         0.0
     }
 }
 
-/// True when a join has captured the route: close in and pointed along it.
+/// True when a join has captured the route: on the line and pointed along it.
 pub fn join_done(lateral: f64, err_deg: f64) -> bool {
     lateral < JOIN_DONE_LAT_M && err_deg.abs() < JOIN_DONE_ERR_DEG
+}
+
+/// The join's capture latch: [`join_done`], or a capture that has SETTLED
+/// (aligned, inside the old 15 m, and no longer closing). Pure; `t_s` is any
+/// monotonic clock.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct JoinCapture {
+    best: Option<(f64, f64)>,
+}
+
+impl JoinCapture {
+    pub fn step(&mut self, lateral: f64, err_deg: f64, t_s: f64) -> bool {
+        if join_done(lateral, err_deg) {
+            return true;
+        }
+        match self.best {
+            Some((b, _)) if lateral > b - JOIN_PROGRESS_M => {}
+            _ => self.best = Some((lateral, t_s)),
+        }
+        let since = self.best.map_or(t_s, |(_, t)| t);
+        lateral < JOIN_SETTLE_MAX_LAT_M
+            && err_deg.abs() < JOIN_DONE_ERR_DEG
+            && t_s - since >= JOIN_SETTLE_S
+    }
 }
 
 // ---- Line-up: from the hold-short position onto the runway centreline ----
@@ -1717,6 +1808,8 @@ async fn drive(xp: XPlaneClient, voice: Option<Voice>, route: Route, base_kts: f
     // against it and are JOINING — widened guard, bend-speed cap — until
     // captured, when it drops to 0 and the established guard takes over.
     let mut join_allow: Option<f64> = None;
+    let mut join_capture = JoinCapture::default();
+    let t_join = std::time::Instant::now();
     // Yaw rate for the steering lead, EMA-smoothed: raw tick-to-tick heading
     // differences of an HTTP read are noise the lead would amplify.
     let mut prev_psi: Option<(f64, std::time::Instant)> = None;
@@ -1945,7 +2038,7 @@ async fn drive(xp: XPlaneClient, voice: Option<Voice>, route: Route, base_kts: f
             }
             a
         });
-        if allow > 0.0 && join_done(lateral, err) {
+        if allow > 0.0 && join_capture.step(lateral, err, t_join.elapsed().as_secs_f64()) {
             tracing::info!(lateral, "auto taxi: joined the route");
             crate::blackbox::record("autotaxi", serde_json::json!({"event": "joined"}));
             join_allow = Some(0.0);
@@ -2404,6 +2497,57 @@ mod tests {
         assert_eq!(schedule_kts(10.0, &r, r.total - STOP_SHORT_M, 3.0), 0.0);
     }
 
+    /// LEMG's Alpha (2026-09-26, sortie 1790441293, a 737): an 80-degree
+    /// corner drawn at about a 9 m radius (the route asked 38 deg/s at
+    /// 11.5 kt), entered at 11.5 kt against the 10 kt turn cap that arrived
+    /// 30 m out; full lock gave 14 to 22 deg/s and it swung 5.8 m wide. With
+    /// the 737's yaw rate declared the corner is taken at the rate times the
+    /// radius, and the approach to it is shaped from well out.
+    #[test]
+    fn a_tight_corner_is_taken_at_the_yaw_rate_the_airframe_has() {
+        let mut path = vec![ll(0.0, 0.0), ll(200.0, 0.0)];
+        let (r, turn) = (9.0_f64, 80.0_f64.to_radians());
+        // Left turn: centre 9 m north of the arc's start.
+        for i in 1..=20 {
+            let a = turn * i as f64 / 20.0;
+            path.push(ll(200.0 + r * a.sin(), r - r * a.cos()));
+        }
+        let end = *path.last().unwrap();
+        path.push((end.0 + 100.0 / 111_320.0 * turn.sin(), end.1 + 100.0 / 90_000.0 * turn.cos()));
+        let watch = TaxiWatch {
+            seg: vec![(String::new(), false); path.len() - 1],
+            path,
+            via: String::new(),
+            holding_point: String::new(),
+            lead_on: Vec::new(),
+        };
+        let profile = |yaw: Option<f64>| crate::aircraft::TaxiProfile {
+            kts: Some(18.0),
+            turn_kts: Some(10.0),
+            sharp_kts: Some(6.0),
+            max_yaw_dps: yaw,
+            ..Default::default()
+        };
+        let mut old = Route::build(&watch).expect("route");
+        old.pace = Pace::from_profile(Some(&profile(None)));
+        let mut jet = Route::build(&watch).expect("route");
+        jet.pace = Pace::from_profile(Some(&profile(Some(15.0))));
+        // At the corner: the angle alone says the 10 kt turn pace; the yaw
+        // rate says 15 deg/s round 9 m, 4.6 kt.
+        assert_eq!(schedule_kts(18.0, &old, 205.0, 10.0), 10.0);
+        let at = schedule_kts(18.0, &jet, 205.0, 5.0);
+        assert!(at < 5.0 && at >= CORNER_MIN_KTS, "the corner's own pace: {at:.1} kt");
+        // And the approach is shaped: 60 m out (recorded 10.5 kt with a 10 kt
+        // target) it is coming down, and by 30 m out (where the old 10 kt cap
+        // first arrived) it is within a few metres of braking of the corner.
+        let out = schedule_kts(18.0, &jet, 140.0, 9.0);
+        assert!(out < 10.0, "60 m out: {out:.1} kt");
+        let window = schedule_kts(18.0, &jet, 172.0, 5.0);
+        assert!(window < 6.5, "30 m out: {window:.1} kt");
+        let far = schedule_kts(18.0, &jet, 0.0, 18.0);
+        assert!(far > 17.0, "a corner 200 m on barely touches the pace: {far:.1} kt");
+    }
+
     #[test]
     fn an_airframes_own_pace_drives_the_bend_caps() {
         // The 172 default is unchanged by the profile hook existing at all.
@@ -2420,7 +2564,10 @@ mod tests {
             ..Default::default()
         }));
         assert_eq!(jet.pace.straight, 18.0);
-        assert_eq!(schedule_kts(18.0, &jet, 50.0, 18.0), 18.0, "open taxiway");
+        assert_eq!(schedule_kts(18.0, &jet, 0.0, 18.0), 18.0, "open taxiway");
+        // 150 m out the jet is already coming down toward the bend's pace.
+        let shaped = schedule_kts(18.0, &jet, 50.0, 18.0);
+        assert!(shaped < 18.0 && shaped > 10.0, "{shaped}");
         assert_eq!(schedule_kts(18.0, &jet, 170.0, 18.0), 10.0, "into the bend");
         // The stop is still a stop, at any pace.
         assert_eq!(schedule_kts(18.0, &jet, jet.total - STOP_SHORT_M, 3.0), 0.0);
@@ -2826,6 +2973,104 @@ mod tests {
         );
     }
 
+    /// LEMG, 2026-09-26 (sortie 1790441293, a 737): the tug never came, the
+    /// push was skipped, and the drive turned the aircraft round off its
+    /// stand to join a route that started behind it (err -155). The old
+    /// latch fired at 14.5 m and -42 degrees, mid-swing, and the scorer
+    /// judged the taxi from there: "14.5 m off the line". Recorded `drive`
+    /// ticks (seconds from the engage, lat_m, err), from 17 s into the join.
+    #[test]
+    fn a_turn_round_join_is_judged_once_it_is_on_the_line() {
+        const TICKS: &[(f64, f64, f64)] = &[
+            (17.10, 13.04, -87.95),
+            (17.80, 13.70, -79.77),
+            (18.50, 14.28, -70.89),
+            (18.90, 14.54, -64.20),
+            (19.30, 14.66, -57.44),
+            (19.70, 14.67, -50.92),
+            (20.00, 14.54, -42.27),
+            (20.40, 14.22, -33.33),
+            (20.80, 13.74, -21.68),
+            (21.20, 13.13, -10.28),
+            (21.60, 12.10, -4.26),
+            (21.90, 11.32, -4.45),
+            (22.40, 10.68, -2.25),
+            (22.80, 9.82, 0.27),
+            (23.10, 9.12, 2.24),
+            (23.50, 8.46, 3.64),
+            (23.90, 7.55, 5.50),
+            (24.20, 6.88, 6.54),
+            (24.60, 6.29, 7.31),
+            (25.00, 5.56, 8.38),
+            (25.30, 4.94, 9.09),
+            (25.70, 4.41, 9.44),
+            (26.10, 3.74, 10.23),
+            (26.50, 3.25, 10.58),
+            (26.90, 2.81, 10.69),
+            (27.30, 2.36, 10.73),
+            (27.60, 1.99, 10.53),
+            (28.10, 1.52, 10.23),
+            (28.50, 1.12, 9.60),
+            (28.80, 0.82, 8.92),
+            (29.20, 0.50, 8.02),
+            (29.60, 0.20, 7.35),
+            (30.00, -0.08, 6.52),
+            (30.40, -0.32, 5.75),
+            (30.80, -0.50, 5.06),
+            (31.10, -0.70, 2.29),
+            (31.60, -0.83, 5.63),
+            (32.00, -0.91, 4.78),
+            (32.40, -0.94, 3.94),
+            (32.80, -0.93, 3.14),
+            (33.20, -0.91, 2.50),
+            (33.50, -0.88, -2.35),
+            (33.90, -0.88, -8.82),
+            (34.30, -0.98, -13.92),
+            (34.60, -1.24, -15.82),
+            (35.00, -1.71, -17.25),
+            (35.40, -2.45, -19.14),
+            (35.80, -2.88, -18.33),
+            (36.20, -2.19, -12.96),
+            (36.60, -1.67, -10.68),
+            (37.00, -1.45, -8.86),
+            (37.40, -0.59, -9.58),
+            (37.80, 0.51, -7.09),
+            (38.10, 1.32, -6.89),
+            (38.50, 1.95, -4.68),
+            (38.90, 2.29, -4.12),
+            (39.30, 1.69, -3.14),
+            (39.70, 0.82, -3.03),
+            (40.10, 0.52, -5.28),
+            (40.40, 0.14, -4.36),
+        ];
+        let score = |latch: &mut dyn FnMut(f64, f64, f64) -> bool| {
+            let mut sc = crate::scorecard::Scorer::new();
+            let ev = |e: &str, t: f64| serde_json::json!({"t": t, "kind": "autotaxi", "event": e});
+            sc.feed(&ev("join", 0.0));
+            let mut joined = false;
+            for &(t, lat, err) in TICKS {
+                if !joined && latch(lat.abs(), err, t) {
+                    joined = true;
+                    sc.feed(&ev("joined", t));
+                }
+                sc.feed(
+                    &serde_json::json!({"t": t, "kind": "autotaxi", "event": "drive",
+                    "gs": 6.0, "lat_m": lat, "err": err, "bl": 0.0, "br": 0.0, "yaw_dps": 0.0}),
+                );
+            }
+            let out = sc.feed(&ev("holding_point", 41.0));
+            out.iter()
+                .find(|(k, _)| k == "stage_result")
+                .map(|(_, v)| v["max_lat_m"].as_f64().unwrap())
+                .unwrap()
+        };
+        let old = score(&mut |lat, err, _| lat < 15.0 && err.abs() < 45.0);
+        assert!(old > 14.0, "the recorded latch scored {old} m");
+        let mut c = JoinCapture::default();
+        let new = score(&mut |lat, err, t| c.step(lat, err, t));
+        assert!(new < 3.0, "joined on the line, the taxi scores {new} m");
+    }
+
     #[test]
     fn join_state_machine_grants_and_captures() {
         // On route, aligned: no join, the tight guard from tick one.
@@ -2834,12 +3079,21 @@ mod tests {
         assert!(join_allowance_m(40.0, 0.0) > 40.0);
         assert!(join_allowance_m(2.0, 170.0) > OFF_ROUTE_STOP_M);
         // Captured only when close AND aligned.
-        assert!(join_done(5.0, 10.0));
+        assert!(join_done(2.0, 10.0));
+        assert!(!join_done(5.0, 10.0), "5 m off is not on the line");
         assert!(
-            !join_done(5.0, 90.0),
+            !join_done(2.0, 90.0),
             "close but still turning is not joined"
         );
         assert!(!join_done(20.0, 10.0), "aligned but wide is not joined");
+        // A capture that has stopped closing is joined where it settled.
+        let mut c = JoinCapture::default();
+        assert!(!c.step(6.0, 5.0, 0.0));
+        assert!(!c.step(5.9, 4.0, 5.0));
+        assert!(c.step(5.8, 3.0, 8.5), "settled at 6 m for 8 s is joined");
+        let mut c = JoinCapture::default();
+        assert!(!c.step(6.0, 50.0, 0.0));
+        assert!(!c.step(6.0, 50.0, 20.0), "settled but still turning is not");
         // Aligned rejoins ride at bend speed, not the sharp crawl.
         assert_eq!(Pace::default().join_cap_kts(20.0), TURN_KTS);
         assert_eq!(Pace::default().join_cap_kts(-170.0), SHARP_KTS);
@@ -3184,6 +3438,47 @@ mod tests {
             }
             LineUpPlan::Backtrack(p) => panic!("a 2,991 m strip needs no backtrack: {p:?}"),
         }
+    }
+
+    /// LEMG 13 (2026-09-26, sortie 1790441293, a 737): the line-up rode the
+    /// drawn lead-on and its projection jumped 6 m and 11 m forward in single
+    /// ticks while the heading error went -6 to -43 degrees; the scorer read
+    /// 6.0 m. `cargo test -- --ignored live_lemg_13_lead_on --nocapture`
+    #[test]
+    #[ignore] // needs the real X-Plane install
+    fn live_lemg_13_lead_on_runs_one_way() {
+        let apt = "/Users/duanelicudi/X-Plane 12/Global Scenery/Global Airports/Earth nav data/apt.dat";
+        let Ok(Some(net)) = atc::nav::find_taxi_net(apt, "LEMG") else {
+            return;
+        };
+        let (hlat, hlon) = (36.684854, -4.511439);
+        let rwy = crate::autoland::runway_by_id(apt, hlat, hlon, "13", 5.0, Some("LEMG"))
+            .unwrap()
+            .expect("LEMG 13");
+        let runways = atc::nav::find_runways(apt, "LEMG").unwrap();
+        let strip = runways.iter().find(|r| r.ident_a == "13" || r.ident_b == "13").expect("13/31");
+        let zone: Vec<String> = vec!["13".into(), "31".into()];
+        let plan = net
+            .plan_to_runway(36.673087, -4.491381, rwy.thr_lat, rwy.thr_lon, 60.0, &zone, Some(strip))
+            .expect("a route");
+        println!("holding point {} via {:?}, lead-on {} pts", plan.holding_point, plan.via, plan.lead_on.len());
+        let (path, stop) = line_up_path_from_lead_on(&rwy, hlat, hlon, &plan.lead_on).expect("the lead-on");
+        let geo = taxi_guide::Geo::new(path[0].0);
+        let pts: Vec<(f64, f64)> = path.iter().map(|&p| geo.to_m(path[0], p)).collect();
+        let mut prev_brg: Option<f64> = None;
+        let mut worst_turn = 0.0_f64;
+        for w in pts.windows(2) {
+            let d = taxi_guide::dist(w[0], w[1]);
+            let b = taxi_guide::bearing(w[0], w[1]);
+            let turn = prev_brg.map_or(0.0, |p| taxi_guide::angle_diff(b, p));
+            println!("  {:7.1} {:7.1}  len {:5.1}  brg {:6.1}  turn {:+6.1}", w[1].0, w[1].1, d, b, turn);
+            if d > 0.5 {
+                worst_turn = worst_turn.max(turn.abs());
+                prev_brg = Some(b);
+            }
+        }
+        println!("stop {stop:.0} m, sharpest vertex {worst_turn:.0} deg");
+        assert!(worst_turn < 90.0, "a lead-on never doubles back: {worst_turn:.0} degrees at one vertex");
     }
 
     #[test]

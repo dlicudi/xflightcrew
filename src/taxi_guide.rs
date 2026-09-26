@@ -700,6 +700,11 @@ pub(crate) fn project_signed_facing(
 /// there, so it cannot be the thing we are steering at here either.
 const FACING_REACH_M: f64 = crate::autotaxi::MAX_JOIN_M;
 
+/// How far past the route's end the offset is still taken square to the last
+/// leg. An overshoot of a stop is metres; further on, the end point is the
+/// honest distance.
+const PAST_END_SQUARE_M: f64 = 30.0;
+
 fn project_signed_with(
     path: &[(f64, f64)],
     lat: f64,
@@ -715,7 +720,8 @@ fn project_signed_with(
     let pts: Vec<(f64, f64)> = path.iter().map(|&q| geo.to_m(origin, q)).collect();
     let mut cum = 0.0;
     let mut best: Option<(f64, f64)> = None;
-    for w in pts.windows(2) {
+    let last = pts.len() - 2;
+    for (i, w) in pts.windows(2).enumerate() {
         let (a, b) = (w[0], w[1]);
         let (dx, dy) = (b.0 - a.0, b.1 - a.1);
         let len2 = dx * dx + dy * dy;
@@ -731,11 +737,26 @@ fn project_signed_with(
             (((p.0 - a.0) * dx + (p.1 - a.1) * dy) / len2).clamp(0.0, 1.0)
         };
         let c = (a.0 + t * dx, a.1 + t * dy);
-        let d = dist(p, c);
         // Coordinates are (east, north), so the cross product of the leg
         // direction with the offset is positive to the LEFT — negate it and
         // the sign reads the way a pilot describes it.
         let side = dy * (p.0 - c.0) - dx * (p.1 - c.1);
+        // Past the END of the route the offset is measured square to the
+        // last leg, not to its end point: the distance to the point is the
+        // overshoot along the paint, and it was being logged as lateral.
+        // LIBP (2026-09-26): a 737 rolling straight on through its holding
+        // stop, heading error 0.2 degrees, steer 0.01, "lat_m" 0.2 -> 3.85 m
+        // over two seconds at 2 kt, and the taxi scored "3.8 m off the line".
+        let past_end = if i == last && len2 >= 1.0 {
+            (((p.0 - a.0) * dx + (p.1 - a.1) * dy) / len2 - 1.0) * len2.sqrt()
+        } else {
+            0.0
+        };
+        let d = if past_end > 0.0 && past_end <= PAST_END_SQUARE_M {
+            side.abs() / len2.sqrt()
+        } else {
+            dist(p, c)
+        };
         let along = cum + t * len2.sqrt();
         if best.is_none_or(|(_, bd): (f64, f64)| d < bd.abs()) {
             best = Some((along, if side < 0.0 { -d } else { d }));
@@ -864,6 +885,38 @@ mod tests {
             let (_, d) = project(&east, p.0, p.1).unwrap();
             assert!((d - 5.0).abs() < 0.2, "project stays a distance: {d}");
         }
+    }
+
+    /// LIBP 04's holding point (sortie 1790426786, a 737): past the route's
+    /// end the aircraft rolled straight on at 2 to 3 kt, 0.19 m right of the
+    /// last leg, and the logged `lat_m` grew with the OVERSHOOT (the recorded
+    /// values below), scoring the taxi "3.8 m off the line". Measured square
+    /// to the last leg it is the 0.19 m it really was.
+    #[test]
+    fn rolling_past_the_end_of_the_route_is_not_lateral() {
+        const RECORDED_LAT: [f64; 15] = [
+            0.56, 0.75, 1.16, 1.51, 1.78, 1.91, 2.16, 2.30, 2.52, 2.78, 2.99, 3.18, 3.45, 3.58,
+            3.85,
+        ];
+        let east = [ll(0.0, 0.0), ll(100.0, 0.0)];
+        for lat in RECORDED_LAT {
+            let over = (lat * lat - 0.19 * 0.19).sqrt();
+            let p = ll(100.0 + over, -0.19);
+            // The old reading: the distance to the end point.
+            assert!((dist((over, -0.19), (0.0, 0.0)) - lat).abs() < 0.01);
+            let (along, off) = project_signed(&east, p.0, p.1).unwrap();
+            assert!(
+                (off - 0.19).abs() < 0.05,
+                "{over:.2} m past the end reads {off:.2} m off"
+            );
+            assert!(
+                (along - 100.0).abs() < 0.5,
+                "progress stays at the end: {along}"
+            );
+        }
+        // Far past the end the end point is the honest distance again.
+        let (_, off) = project_signed(&east, ll(160.0, -0.19).0, ll(160.0, -0.19).1).unwrap();
+        assert!(off > 50.0, "{off}");
     }
 
     /// East 200 m on W, left turn north onto S5W, cross runway 09L/27R,

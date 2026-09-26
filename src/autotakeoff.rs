@@ -2102,6 +2102,11 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, p: Params) {
                     "steer": steer, "trim": steer_law.trim(), "xtk_m": xtk_m,
                     "bl": bl, "br": br,
                     "xtk_rate": xtk_rate,
+                    // The heading and the target it was steered to: without
+                    // them the rudder's yaw per unit of steer cannot be read
+                    // off a roll (LIBP 04 held 3 degrees of error for six
+                    // seconds at 86 to 105 kt on 0.15 to 0.25 of steer).
+                    "psi": psi, "tgt": target,
                     "thr": thr_cmd, "remaining_m": remaining, "dt": dt, "trq_ftlb": torque_ftlb,
                 }),
             );

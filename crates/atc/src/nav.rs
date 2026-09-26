@@ -2354,19 +2354,52 @@ impl TaxiNet {
                 adjacent.insert(e.a);
             }
         }
-        taxiway_nodes
+        let dist_to = |id: &i64| {
+            self.nodes.get(id).map(|&p| {
+                let dx = (p.1 - lon) * m_per_deg_lon;
+                let dy = (p.0 - lat) * m_per_deg_lat;
+                dx.hypot(dy)
+            })
+        };
+        let entrance = taxiway_nodes
             .iter()
             .filter(|id| runway_nodes.contains(id) || adjacent.contains(id))
-            .filter_map(|id| {
-                self.nodes.get(id).map(|&p| {
-                    let dx = (p.1 - lon) * m_per_deg_lon;
-                    let dy = (p.0 - lat) * m_per_deg_lat;
-                    (*id, dx.hypot(dy))
-                })
-            })
+            .filter_map(|id| dist_to(id).map(|d| (*id, d)))
             .min_by(|x, y| x.1.total_cmp(&y.1))
             .filter(|(_, d)| *d < 3000.0)
-            .map(|(id, _)| id)
+            .map(|(id, _)| id)?;
+        // A node one hop OFF the strip is where the stub starts, not where it
+        // meets the runway: the route goes on to the runway node it joins, so
+        // the hold-short trim finds the runway and the lead-on it leaves
+        // behind reaches the centreline. Ending at the hop, the lead-on
+        // stopped where the stub began. LIBP 04 (2026-09-26): taxiway D's
+        // first node beside the threshold (68 m off the centreline, 92 m from
+        // the numbers) beat the node where D meets the runway (on the
+        // centreline, 101 m up it), the lead-on ran from the hold to 68 m
+        // off, the line-up refused it as `junction_off_the_runway`, and two
+        // 737s drove the synthetic 135-degree corner instead, 6.7 and 7.5 m
+        // past the centreline.
+        if runway_nodes.contains(&entrance) {
+            return Some(entrance);
+        }
+        let joins = self
+            .edges
+            .iter()
+            .filter(|e| !e.runway)
+            .filter_map(|e| {
+                if e.a == entrance {
+                    Some(e.b)
+                } else if e.b == entrance {
+                    Some(e.a)
+                } else {
+                    None
+                }
+            })
+            .filter(|n| runway_nodes.contains(n))
+            .filter_map(|n| dist_to(&n).map(|d| (n, d)))
+            .min_by(|x, y| x.1.total_cmp(&y.1))
+            .map(|(n, _)| n);
+        Some(joins.unwrap_or(entrance))
     }
 }
 
@@ -5242,6 +5275,93 @@ STAR:030,6,ALWYS3,RW28B,ARRTU,K2,P,C,E   , ,   ,TF, , , , , ,      ,    ,    ,  
              stub: {:.1} m off",
             ct(last)
         );
+    }
+
+    /// The LIBP 04 shape, drawn small: the stub's first node beside the
+    /// threshold (68 m off the centreline, 71 m from the numbers) is nearer
+    /// than the node where the stub meets the runway (on the centreline,
+    /// 100 m up it). The route must still run on to the runway node, so the
+    /// lead-on the zone trim leaves reaches the centreline.
+    #[test]
+    fn a_runway_entrance_one_hop_off_the_strip_leads_on_to_the_centreline() {
+        use std::io::Write as _;
+        let path = std::env::temp_dir().join("xc-taxi-hop-entrance.dat");
+        let mut f = std::fs::File::create(&path).unwrap();
+        writeln!(f, "1    50 0 0 LTHP Hop").unwrap();
+        writeln!(f, "100 45.00 1 0 0.10 1 3 0  09 36.0000000 -5.0100000 0 0 3 3 0 2 27 36.0000000 -4.9800000 0 0 3 3 0 2").unwrap();
+        writeln!(f, "1201 36.0000000 -5.0088900 both 18 rwy_d").unwrap();
+        writeln!(f, "1201 36.0000000 -4.9900000 both 19 rwy_far").unwrap();
+        writeln!(f, "1201 35.9993900 -5.0097600 both 8 d_stub").unwrap();
+        writeln!(f, "1201 35.9993900 -5.0080000 both 9 d_hold").unwrap();
+        writeln!(f, "1201 35.9985000 -5.0060000 both 30 stand").unwrap();
+        writeln!(f, "1202 18 19 twoway runway 09/27").unwrap();
+        writeln!(f, "1202 18 8 twoway taxiway D").unwrap();
+        writeln!(f, "1204 departure 09,27").unwrap();
+        writeln!(f, "1202 8 9 twoway taxiway D").unwrap();
+        writeln!(f, "1204 departure 09,27").unwrap();
+        writeln!(f, "1202 9 30 twoway taxiway E").unwrap();
+        drop(f);
+        let net = find_taxi_net(path.to_str().unwrap(), "LTHP").unwrap().expect("a network");
+        let runways = find_runways(path.to_str().unwrap(), "LTHP").unwrap();
+        let strip = runways.iter().find(|r| r.ident_a == "09").expect("09/27");
+        let (tlat, tlon) = (strip.lat_a, strip.lon_a);
+        let m = |a: (f64, f64), b: (f64, f64)| {
+            let dx = (a.1 - b.1) * 111_320.0 * 36.0_f64.to_radians().cos();
+            let dy = (a.0 - b.0) * 111_320.0;
+            (dx * dx + dy * dy).sqrt()
+        };
+        // The trap: the stub's hop is nearer the numbers than the junction.
+        assert!(m((35.99939, -5.00976), (tlat, tlon)) < m((36.0, -5.00889), (tlat, tlon)));
+        let zone: Vec<String> = vec!["09".into(), "27".into()];
+        let plan = net
+            .plan_to_runway(35.9985, -5.0060, tlat, tlon, 40.0, &zone, Some(strip))
+            .expect("a route");
+        let last = *plan.lead_on.last().expect("a lead-on");
+        // Off the centreline is the latitude difference here.
+        let off = (last.0 - 36.0).abs() * 111_320.0;
+        assert!(off < 5.0, "the lead-on ends {off:.0} m off the centreline");
+        assert!(m(*plan.path.last().unwrap(), (35.99939, -5.0080)) < 5.0, "the route holds at D");
+        assert_eq!(plan.holding_point, "D");
+    }
+
+    /// LIBP 04 (2026-09-26, two 737 sorties): the line-up refused the drawn
+    /// lead-on as `junction_off_the_runway` at 67.9 m and drove the
+    /// synthetic path, a 135-degree corner off taxiway D, 6.7 and 7.5 m past
+    /// the centreline. `cargo test -p atc -- --ignored live_libp_runway_04 --nocapture`
+    #[test]
+    #[ignore] // needs the real X-Plane install; run with --ignored
+    fn live_libp_runway_04_lead_on_ends_on_the_centreline() {
+        let path =
+            "/Users/duanelicudi/X-Plane 12/Global Scenery/Global Airports/Earth nav data/apt.dat";
+        let Ok(Some(net)) = find_taxi_net(path, "LIBP") else {
+            return;
+        };
+        let runways = find_runways(path, "LIBP").unwrap();
+        let strip = runways.iter().find(|r| r.ident_a == "04").expect("LIBP 04/22");
+        let (slat, slon) = (42.430744, 14.185867);
+        let (tlat, tlon) = (strip.lat_a, strip.lon_a);
+        let zone: Vec<String> = vec!["04".into(), "22".into()];
+        let course = strip.heading_a_deg();
+        let ct = |p: (f64, f64)| {
+            let d = haversine_nm(tlat, tlon, p.0, p.1) * 1852.0;
+            let b = bearing_deg(tlat, tlon, p.0, p.1);
+            d * angle_diff_deg(b, course).to_radians().sin()
+        };
+        for hold in [40.0, 60.0, 100.0] {
+            let plan = net
+                .plan_to_runway(slat, slon, tlat, tlon, hold, &zone, Some(strip))
+                .expect("a route");
+            let offs: Vec<String> = plan.lead_on.iter().map(|p| format!("{:.0}", ct(*p))).collect();
+            println!(
+                "hold {hold}: holding point {} via {:?}, route end {:.0} m off, lead-on {:?}",
+                plan.holding_point,
+                plan.via,
+                plan.path.last().map_or(f64::NAN, |p| ct(*p)),
+                offs
+            );
+            let last = *plan.lead_on.last().expect("a lead-on to drive");
+            assert!(ct(last).abs() < 20.0, "lead-on ends {:.1} m off 04", ct(last));
+        }
     }
 
     #[test]

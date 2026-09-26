@@ -1515,6 +1515,14 @@ pub struct TaxiProfile {
     /// A hypothesis until a blackboxed taxi measures it.
     #[serde(default)]
     pub beta_max: Option<f64>,
+    /// The yaw rate a taxi corner may ask of this airframe, degrees per
+    /// second: a corner of radius R is taken no faster than this times R.
+    /// `None` keeps the angle-only bend caps. The 737 turns at about 20 deg/s
+    /// at full lock under 7 kt (LEMG and LIBP, 2026-09-26), and entered an
+    /// 80-degree corner drawn at a 9 m radius at 11.5 kt, where the route asked
+    /// 38 deg/s: it swung 5.8 m wide.
+    #[serde(default)]
+    pub max_yaw_dps: Option<f64>,
 }
 
 /// A switch whose only control is a TOGGLE command, paired with the dataref
@@ -2696,6 +2704,11 @@ mod tests {
                 "autotaxi",
                 "CREEP_KTS",
                 "the speed below which the sim reads as stopped",
+            ),
+            (
+                "autotaxi",
+                "CORNER_MIN_KTS",
+                "floor under a declared max_yaw_dps corner cap: walking pace",
             ),
             (
                 "speedhold",
