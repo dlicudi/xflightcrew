@@ -93,6 +93,11 @@ pub struct FlareElevatorProfile {
     /// A balloon eases the held pull at most this fast, elevator per second.
     #[serde(default)]
     pub balloon_ease_per_s: Option<f64>,
+    /// An EXPONENTIAL flare's time constant, seconds (`autoland::flare_target_fpm`):
+    /// the sink target falls with the height instead of holding flat from
+    /// the gate. Only for an airframe whose flare is flown on the elevator.
+    #[serde(default)]
+    pub tau_s: Option<f64>,
 }
 
 fn default_max_push() -> f64 {

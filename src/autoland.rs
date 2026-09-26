@@ -3020,6 +3020,38 @@ pub fn arrest_targets_fpm(nominal_vs_fpm: f64) -> (f64, f64) {
     )
 }
 
+/// The flare's sink target at this height: an EXPONENTIAL flare, as
+/// autoland systems fly it. The touchdown sink (`flare_vs`) plus the height
+/// over [`FLARE_TAU_S`], never steeper than the approach path. The flare
+/// used to hold `flare_vs` flat from its gate: a 737 asked for -175 fpm from
+/// 35 ft takes twelve seconds to arrive, and floated LEMG 13 from 36 to 19 ft
+/// over five of them before the power came off and it dropped in at -859
+/// fpm (2026-09-26). Proportional to the height it keeps descending and
+/// arrives at `flare_vs` in about five. Pure.
+pub fn flare_target_fpm(radio_ft: f64, flare_vs: f64, nominal_vs: f64) -> f64 {
+    flare_target_with(radio_ft, flare_vs, nominal_vs, flare_tau_s())
+}
+
+/// [`flare_target_fpm`] with the time constant given: `None` is the flat
+/// flare every airframe but a declared one keeps. The 172's flare is flown
+/// through its VS mode's 4.5 s lag, and a target that moves with the height
+/// is faster than that lag can follow (the sortie test lands it at -298
+/// fpm); the 737's is flown on the elevator with the servos out. Pure.
+pub fn flare_target_with(radio_ft: f64, flare_vs: f64, nominal_vs: f64, tau_s: Option<f64>) -> f64 {
+    match tau_s.filter(|t| t.is_finite() && *t > 0.5) {
+        Some(tau) => (flare_vs - radio_ft.max(0.0) * 60.0 / tau).max(nominal_vs.min(flare_vs)),
+        None => flare_vs,
+    }
+}
+
+/// The live airframe's exponential flare time constant, if it declares one
+/// (`flare_elevator.tau_s`).
+fn flare_tau_s() -> Option<f64> {
+    crate::aircraft::live_profile()
+        .and_then(|p| p.flare_elevator)
+        .and_then(|f| f.tau_s)
+}
+
 /// The VS mode is a slow servo, and the landing arrest is the one place the
 /// dial's lag is measured in feet of runway. LXGB 27, 2026-09-14 (the 172's
 /// third firm arrival in three days, same shape each time): the roundout
@@ -3879,7 +3911,7 @@ pub fn hold_flare(
     let (_, flare_vs) = arrest_targets_fpm(nominal_vs);
     Guidance {
         phase: ApproachPhase::Flare,
-        target_vs_fpm: flare_vs,
+        target_vs_fpm: flare_target_fpm(radio_ft, flare_vs, nominal_vs),
         arresting: true,
         ..g
     }
@@ -3940,7 +3972,7 @@ pub fn commit_flare(
         target_vs_fpm: if radio_ft > band_ft {
             roundout_vs
         } else {
-            flare_vs
+            flare_target_fpm(radio_ft, flare_vs, nominal_vs)
         },
         balk: None,
         arresting: true,
@@ -4223,7 +4255,8 @@ pub fn guidance(
     // What the vertical path asks for, computed first so the speed-protection
     // branch below can be measured against it.
     let path_vs = match phase {
-        ApproachPhase::Flare => flare_vs, // arrest the descent near the ground
+        // Arrest the descent near the ground: exponentially (`flare_target_fpm`).
+        ApproachPhase::Flare => flare_target_fpm(radio_alt_ft, flare_vs, nominal_vs),
         // Below the floor without the surplus to climb: hold level while the
         // throttle bonus rebuilds it — NEVER track the glidepath down. The
         // glidepath altitude is distance-symmetric, so a rejoin on the wrong
@@ -4875,6 +4908,27 @@ mod tests {
     /// retard took the lever to idle IN the float, and the sink came back to
     /// -859 fpm. A jet retards by height: nothing above it, and below it a
     /// ramp that reaches idle as the wheels arrive.
+    /// LEMG 13 (2026-09-26): the 737 floated from 36 to 19 ft on a flat
+    /// -175. Exponential with 4 s, it is the path at the gate, -475 at 20 ft,
+    /// -325 at 10, and the touchdown sink at the wheels; undeclared, flat.
+    #[test]
+    fn the_737s_flare_is_exponential_and_the_rest_stay_flat() {
+        let (flare_vs, nominal) = (-175.0, -700.0);
+        let t = |h: f64| super::flare_target_with(h, flare_vs, nominal, Some(4.0));
+        assert_eq!(t(35.0), -700.0, "the path at the gate, never steeper");
+        assert!((t(20.0) + 475.0).abs() < 1.0, "{}", t(20.0));
+        assert!((t(10.0) + 325.0).abs() < 1.0, "{}", t(10.0));
+        assert!((t(0.0) + 175.0).abs() < 1.0, "{}", t(0.0));
+        assert_eq!(super::flare_target_with(20.0, flare_vs, nominal, None), flare_vs);
+        // Time from 35 ft: the float is gone (about 5.5 s, not 12).
+        let (mut h, mut secs) = (35.0_f64, 0.0);
+        while h > 0.5 {
+            h += t(h) / 60.0 * 0.1;
+            secs += 0.1;
+        }
+        assert!(secs < 7.0, "{secs:.1} s from 35 ft");
+    }
+
     #[test]
     fn a_jet_retards_by_height_timed_to_the_touchdown() {
         let cfg = crate::aircraft::FlarePowerProfile {
@@ -7530,6 +7584,7 @@ mod approach_power_floor_tests {
             max: 0.30,
             max_push: 0.05,
             balloon_ease_per_s: Some(0.15),
+            tau_s: None,
         };
         let g = super::FlareGains::from_profile(Some(p));
         let d = super::FlareGains::default();

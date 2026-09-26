@@ -59,6 +59,10 @@ flare_power:
 flare_elevator:
   gain: 1.0
   max: 0.45
+  # Exponential flare: the sink target falls with the height (4 s), so the
+  # arrest keeps descending and arrives in about five seconds from 35 ft.
+  # The flat -175 floated LEMG 13 from 36 to 19 ft (2026-09-26).
+  tau_s: 4.0
 # How the landing arrest leads THIS autopilot. The 172's law (gain 2, dial
 # cap +300, no trend term) was fitted to a first-order 4.5 s lag; this
 # aircraft's VS mode, fitted to the EGCC 23L tick log (2026-09-19), is two
