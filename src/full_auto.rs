@@ -65,9 +65,10 @@ static MISSION: std::sync::Mutex<&'static str> = std::sync::Mutex::new("");
 /// ILS 13, so the STAR flown and the runway landed on were decided twice.
 /// Written only through [`set_arrival_runway`]: the arm, the arrival's own
 /// safety overrule (tailwind, no approach we can fly), the tower's runway.
-/// The re-pick in flight (the METAR moves, the tower names a runway) is still
-/// owed; when it comes it writes here and nowhere else. Cleared with the
-/// mission (`stop_active`).
+/// After the arrival has set it up, a change of end goes through
+/// [`retarget_arrival_runway`] and nowhere else: autoland's tower switch
+/// (`autoland::clearance_switch`) today, the owed in-flight re-pick (#79)
+/// tomorrow. Cleared with the mission (`stop_active`).
 static ARRIVAL_RUNWAY: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
 
 /// The mission's arrival runway ([`ARRIVAL_RUNWAY`]); `None` with no mission,
@@ -84,6 +85,34 @@ pub fn set_arrival_runway(rwy: Option<String>, why: &str) {
         event("arrival_runway", json!({ "was": *cur, "now": rwy, "why": why }));
         *cur = rwy;
     }
+}
+
+/// THE write point for a change of arrival runway after the arm: the tower
+/// clearing us for another end inside autoland (`autoland::clearance_switch`,
+/// at its arm and on the approach), and the in-flight re-pick still owed
+/// (#79). It MOVES a runway the mission holds and never invents one: with no
+/// mission, a circuit, or a plan that named none, there is nothing to move,
+/// so a standalone autoland leaves the value `None` (a stale end must not
+/// outlive its mission; `stop_active` clears it). True when the mission's
+/// runway is now `rwy`. Blackboxed `arrival_runway` with `why` on a change.
+///
+/// LIBP-LEMG seam (issue #64): a tower switch re-armed autoland on the new
+/// end while this value stayed on the old one, so every reader after the
+/// switch read a runway nobody was flying.
+pub fn retarget_arrival_runway(rwy: &str, why: &str) -> bool {
+    let rwy = rwy.trim();
+    if rwy.is_empty() {
+        return false;
+    }
+    let mut cur = ARRIVAL_RUNWAY.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(was) = cur.clone() else {
+        return false;
+    };
+    if !was.eq_ignore_ascii_case(rwy) {
+        event("arrival_runway", json!({ "was": was, "now": rwy, "why": why }));
+        *cur = Some(rwy.to_string());
+    }
+    true
 }
 
 /// The human-readable current stage, empty when idle or not yet staged.
@@ -5807,14 +5836,87 @@ mod tests {
     /// The seam every reader of the arrival runway shares: set at the arm,
     /// overwritten only through `set_arrival_runway`, cleared with the
     /// mission.
+    /// The arrival-runway tests share one process-wide value.
+    static ARRIVAL_RUNWAY_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn the_arrival_runway_is_one_value() {
+        let _g = ARRIVAL_RUNWAY_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         super::set_arrival_runway(Some("12".into()), "arm");
         assert_eq!(super::arrival_runway().as_deref(), Some("12"));
         super::set_arrival_runway(Some("13".into()), "tower");
         assert_eq!(super::arrival_runway().as_deref(), Some("13"));
         super::stop_active();
         assert_eq!(super::arrival_runway(), None);
+    }
+
+    /// Issue #64: the tower clears us for the other end on the approach.
+    /// Autoland's watch finds the switch (`clearance_switch`), moves the
+    /// mission's ONE arrival runway, and the re-armed loop tunes NAV1 from
+    /// that value: the ILS 30's frequency and course, not the 12's. A
+    /// go-around reads no switch and moves nothing; with no mission there is
+    /// nothing to move; the mission's end clears it.
+    #[tokio::test]
+    async fn a_clearance_switch_moves_the_arrival_runway_and_the_ils() {
+        use crate::tower::State::{ClearedToLand, Inbound};
+        let _g = ARRIVAL_RUNWAY_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // No mission: a standalone autoland invents no arrival runway.
+        super::stop_active();
+        assert!(!super::retarget_arrival_runway("30", "clearance"));
+        assert_eq!(super::arrival_runway(), None);
+
+        // Armed for 12; autoland's arm flies the forced end: no change.
+        super::set_arrival_runway(Some("12".into()), "arm");
+        assert_eq!(crate::autoland::armed_runway_why(Some("12"), "12", false), "arm");
+        assert!(super::retarget_arrival_runway("12", "arm"));
+        assert_eq!(super::arrival_runway().as_deref(), Some("12"));
+
+        // A go-around: the ident published with Inbound is the runway in
+        // use, never a clearance. Nothing moves.
+        assert_eq!(
+            crate::autoland::clearance_switch("12", Some(Inbound), Some("30"), None, true),
+            None
+        );
+        assert_eq!(super::arrival_runway().as_deref(), Some("12"));
+
+        // "Cleared to land runway three zero" on the approach.
+        let to = crate::autoland::clearance_switch("12", Some(ClearedToLand), Some("30"), None, false)
+            .expect("an arrival clearance to the other end is a switch");
+        assert!(super::retarget_arrival_runway(&to, "clearance"));
+        assert_eq!(super::arrival_runway().as_deref(), Some("30"));
+        // The new loop's arm flies the end handed down: no second event.
+        assert_eq!(crate::autoland::armed_runway_why(Some("30"), "30", false), "arm");
+        // A switch found at the arm itself is the tower's too.
+        assert_eq!(crate::autoland::armed_runway_why(Some("12"), "30", true), "clearance");
+        assert_eq!(crate::autoland::armed_runway_why(None, "30", false), "self_pick");
+
+        // The re-armed loop's ILS tune reads the one value: NAV1 goes to
+        // the 30's localiser (LEMG-shaped fixture), course 300 magnetic.
+        let dir = std::env::temp_dir().join(format!("xvl_issue64_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let nav = dir.join("earth_nav.dat");
+        std::fs::write(
+            &nav,
+            "I\n1200 Version\n\n\
+             4  36.66000000  -4.47000000     52 10990  18  43318.000 IMLG LEMG LE 12 ILS-cat-I\n\
+             4  36.69000000  -4.51000000     52 11150  18 108298.000 IMGA LEMG LE 30 ILS-cat-I\n\
+             99\n",
+        )
+        .unwrap();
+        let xp = crate::xplane::FakeXPlane::with_reads(&[
+            (crate::ils::NAV1_FREQ, 10990.0),
+            (crate::ils::NAV1_OBS, 120.0),
+        ]);
+        let rwy = super::arrival_runway().unwrap();
+        let _ = crate::ils::tune_from(&xp, nav.to_str().unwrap(), "LEMG", &rwy, 36.60, -4.40).await;
+        assert_eq!(xp.last_write(crate::ils::NAV1_FREQ), Some(11150.0));
+        assert!((xp.last_write(crate::ils::NAV1_OBS).unwrap() - 300.0).abs() < 1.0);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // The mission's end clears it; a later switch has nothing to move.
+        super::stop_active();
+        assert_eq!(super::arrival_runway(), None);
+        assert!(!super::retarget_arrival_runway("12", "clearance"));
     }
 
     // The arrival is briefed at the gate. Gibraltar, as the data has it: no

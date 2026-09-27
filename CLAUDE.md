@@ -476,7 +476,8 @@ everything blackboxes to `logs/blackbox.jsonl` (kinds: `atc`, `autotaxi`, `autot
   METAR tailwind, `DESTINATION_BONUS_NM`) is the emergency path.
 - **The tower's clearance outranks the plan** (`runway_from_clearance`), watched THROUGH the
   approach since its answer comes after the arm: owed readbacks (`party_line::readback_owed`), a
-  re-arm on another end (`clearance_switch`, never `going_around`); a superseded loop leaves
+  re-arm on another end (`clearance_switch`, never `going_around`) moves the ONE arrival runway
+  (`full_auto::retarget_arrival_runway`, also the #79 re-pick's write point); a superseded loop leaves
   `ACTIVE` to its successor. Arrival wind is the destination METAR (`weather::surface_wind`,
   `arrival_wind`), not the datarefs aloft.
 - **A straight-in to THIS runway or none** (`nav::straight_in_legs`: the exact designator, no RF

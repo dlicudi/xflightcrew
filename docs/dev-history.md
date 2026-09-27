@@ -8265,3 +8265,34 @@ Not touched (why the final was 244 m off, still open):
   FAF, the autoland arm's distance ("Autoland to ... N miles" of 4 or more),
   `reversal` events when the join was from the far side, no
   `off_centreline_low`. Offline only.
+
+## 2026-09-27: a tower switch moves the one arrival runway (#64)
+
+The arrival-procedure brief (2026-09-26) made `full_auto::ARRIVAL_RUNWAY`
+the one value carrying the runway from the arm to the landing, but left the
+seam where autoland obeys the tower: `clearance_switch` (on the approach)
+and `runway_from_clearance` (at autoland's arm) re-armed or flew the
+cleared end while `arrival_runway()` stayed on the old one, so every reader
+after the switch (the inbound call, the flight-test card's `own_star` row)
+read a runway nobody was flying.
+
+Fix: `full_auto::retarget_arrival_runway(rwy, why)` is THE write point for a
+change after the arm. It moves a runway the mission holds and never invents
+one (no mission, a circuit, a plan with no runway: `None` stays `None`, so a
+standalone autoland leaves nothing stale), blackboxed `full_auto`
+`arrival_runway` {was, now, why}. Autoland calls it at the in-flight switch
+(why `clearance`, before the new loop arms, whose `ils::tune` then tunes the
+same end) and at every arm (`autoland::armed_runway_why`: `clearance` when
+the tower's end won at the arm, `self_pick` when the forced end was missing,
+`arm` with no change). The owed in-flight re-pick (#79) writes there too.
+The card's `own_star` row passes a landing on the tower's end when the
+`arrival_runway` record says `clearance`. `ils::tune_from` takes a named
+nav file so the retune is testable. Test
+`a_clearance_switch_moves_the_arrival_runway_and_the_ils`: 12 to 30 on a
+cleared-to-land, NAV1 to the 30's frequency and course; a go-around moves
+nothing; the mission's end clears it.
+
+Next flight with a runway switch, check: `full_auto` `arrival_runway` with
+why `clearance` and `now` the cleared end, then `autoland`
+`runway_from_clearance`, `ils` `tuned` rwy the new end, `taxi_in`
+`vacating` rwy the same. Offline only.

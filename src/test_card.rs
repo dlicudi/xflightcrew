@@ -790,14 +790,26 @@ fn c_own_star(log: &Log) -> Verdict {
         }
         judged_until = vac_t;
         let rwy = text(c.v, "runway").unwrap_or("");
+        // The tower outranks the crew's pick: a clearance to another end
+        // moves the ONE arrival runway (`full_auto arrival_runway`, why
+        // clearance, #64), and landing on it is the rule kept, said.
+        let cleared_to = log
+            .recs
+            .iter()
+            .filter(|r| r.t > c.t && r.t < vac_t && r.kind == "full_auto" && r.name == "arrival_runway")
+            .filter(|r| text(r.v, "why") == Some("clearance"))
+            .filter_map(|r| text(r.v, "now"))
+            .last();
+        let switched = cleared_to.is_some_and(|t| t == landed && t != rwy);
         let line = format!(
-            "{}: chose {} for {rwy} (planned {} for {}), landed {landed}",
+            "{}: chose {} for {rwy} (planned {} for {}), landed {landed}{}",
             hm(c.t),
             text(c.v, "star").unwrap_or("?"),
             text(c.v, "planned_star").unwrap_or("?"),
-            text(c.v, "planned_runway").unwrap_or("?")
+            text(c.v, "planned_runway").unwrap_or("?"),
+            if switched { ", the tower's end" } else { "" }
         );
-        if landed == rwy {
+        if landed == rwy || switched {
             oks.push(line);
         } else {
             fails.push(line);
@@ -2820,6 +2832,25 @@ mod tests {
     }
 
     const T: f64 = 1_790_430_000.0; // 2026-09-26 13:40Z, after every S0926 up to E
+
+    /// Issue #64: the tower's end outranks the crew's pick. A landing on it
+    /// passes when the one arrival runway moved by clearance; a landing on
+    /// another end with no clearance behind it still fails.
+    #[test]
+    fn own_star_passes_a_landing_on_the_towers_end() {
+        let base = |switch: bool| {
+            let mut v = vec![
+                json!({"kind":"plan_audit","event":"star_chosen","star":"UNTO2A","runway":"12","planned_star":"UNTO2A","planned_runway":"13","t":T}),
+                json!({"kind":"taxi_in","event":"vacating","rwy":"30","t":T+900.0}),
+            ];
+            if switch {
+                v.insert(1, json!({"kind":"full_auto","stage":"arrival_runway","detail":{"was":"12","now":"30","why":"clearance"},"t":T+600.0}));
+            }
+            v
+        };
+        assert!(matches!(judged("own_star", &base(true)), Verdict::Verified(l) if l.contains("the tower's end")));
+        assert!(matches!(judged("own_star", &base(false)), Verdict::Failed(_)));
+    }
 
     /// The LIBP-LEMG day in miniature: the numbers the card reported on the
     /// real log, so a change to a predicate that changes them fails here.
