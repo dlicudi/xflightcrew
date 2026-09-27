@@ -743,7 +743,8 @@ confirms it closes it (`fixes #N` in the commit). Known gaps are `owed` issues.
   complaint not yet a scorecard number is not yet testable.
 - **A verdict that is wrong hides the real failures** (2026-09-26): the crew's own flare and
   rotation read back through the yoke are not a hand (`monitor::note_crew_yoke`; the scorer
-  discounts the same window in old logs); a taxi is judged from its first tick ON the line after a
+  discounts the same window in old logs), nor is a brake latch our own command raised
+  (`monitor::CrewBrakeLatch`, `crew_brake_discounted`); a taxi is judged from its first tick ON the line after a
   join and never past its planned stop; a drive that stops short (`stagnant`, `off_route`, a
   give-up) fails; a landing is scored at its FIRST contact and a bounce is recorded (`bounce_ft`).
   `bench/sorties/` holds trimmed real sorties whose verdicts `cargo test` pins.
