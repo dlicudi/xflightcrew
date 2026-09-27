@@ -8525,3 +8525,41 @@ unkeyed), `the_ofp_callsign_is_the_atc_field_else_airline_and_number`,
 `the_plan_callsign_is_the_plan_on_the_shelf`. Next airline sortie, check the
 `callsign` record says `simbrief` and the tower's replies open with the
 airline callsign. Offline only.
+
+## 2026-09-27: we stop the tug on the lane, the swing only blocks a false stop (issue #62)
+
+The pilot's call after the SwingWatch fix above: we CONTROL the push with
+the commands (`pushback_stop` = stop and let go), so a tug is not left to
+finish its pattern past the lane. The swing still guards the false stop
+(the stall clock never runs while the nose is swung, a rate dip is not the
+end, a distance-only finish waits), but once the distance is made and the
+nose is coming to rest on the lane the push is stopped, swing or no swing
+(`PushVerdict::Aligned`, `stop_on_the_lane`).
+
+The stop is LED by the swing rate: `predicted_rest_err` = err + rate x
+`STOP_LATENCY_S`. A closing swing is stopped when that is within
+`ON_LANE_DEG` (2) of the lane or past it; a swing moving away, or not
+closing, is stopped at once inside `ALIGN_DEG`. The latency is one sample:
+LIPK sortie 1790408535 (2026-09-26) sent its stall-clock stop at err -11.8
+with the nose turning 3.4 deg/s, and the stop was obeyed: the `state`
+heading went 145.5, 148.3, 148.3 (2.8 degrees more, still within 1.3 s),
+0.8 s at the entry rate, a final err near -14.6. Replayed, the new judge
+stops that push 4.4 s earlier at err 3.0, resting about 0.4 off. LIBP
+1790429680 is stopped at +8.8 s on the recorded headings, err 2.9, where
+the rate dip no longer fools it; that tug ignored its live stop, so the
+wait after every stop now holds the heading against the one at the stop
+(`AfterStop`) and logs `stop_ignored` {travel_deg, hdg_at_stop, hdg,
+moved_s} past `STOP_IGNORED_DEG` (5); nothing is re-sent to a tug on the
+bar, the taxi takes the residual. The pavement edge still stops at once.
+Deliberate reading of "inside tolerance": a 20-degree band would stop a
+closing swing at its edge, 20 off; the aim is ON the lane.
+
+Tests: `a_swing_onto_the_lane_is_stopped_on_it` (LIPK ticks),
+`a_dip_in_the_swing_rate_never_stops_the_push` (LIBP: aligned at +8.8 s,
+the recorded headings after it read as `stop_ignored`, a never-reached lane
+stalls only once the nose stood still), `a_finished_push_still_stops_promptly`
+(LIEA straight push on its tick, a swing settling short ends when still, a
+swing away is stopped at once). Next push, check: `aligned` {err, rate,
+rest}, `stopped` {err, hdg, swinging}, the `state` heading after it (within
+a few degrees of `rest`), `stop_ignored` if not; `push` ticks now carry
+`rate`. Offline only.
