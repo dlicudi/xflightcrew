@@ -455,6 +455,7 @@ everything blackboxes to `logs/blackbox.jsonl` (kinds: `atc`, `autotaxi`, `autot
   follower rewriting the dial undoes the pilot in 500 ms); then the GROUND AHEAD, over both.
   **A descent never climbs back** to a navlog altitude above the level commanded
   (`DescentProfile`, `descent_no_climb`; LIEA-LEBL 2026-09-27); step climbs before the top do.
+  Mirror: a climb never descends below it until the cruise is FLOWN (`climb_no_descent`; LFBD).
 - **Terrain floor** (`terrain_floor_ahead_ft`: probes ahead + 1,000 ft), skipped on an approach,
   retired only after unanswered probes with the sim LIVE (`terrain_probe_fatal`). An AP target is
   judged against it: a climb into it RAISED and said, a descent below it refused with the number.
