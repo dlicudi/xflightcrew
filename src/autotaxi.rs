@@ -3328,7 +3328,7 @@ mod tests {
     #[ignore]
     fn live_lxgb_line_up_lead_on() {
         let apt =
-            "/Users/duanelicudi/X-Plane 12/Global Scenery/Global Airports/Earth nav data/apt.dat";
+            &crate::tools::autoland::xplane_path("Global Scenery/Global Airports/Earth nav data/apt.dat");
         let net = crate::nav::find_taxi_net(apt, "LXGB")
             .unwrap()
             .expect("LXGB network");
@@ -3407,7 +3407,7 @@ mod tests {
     #[ignore]
     fn live_lfpb_line_up_finds_runway_07() {
         let apt =
-            "/Users/duanelicudi/X-Plane 12/Global Scenery/Global Airports/Earth nav data/apt.dat";
+            &crate::tools::autoland::xplane_path("Global Scenery/Global Airports/Earth nav data/apt.dat");
         let Ok(Some(net)) = crate::nav::find_taxi_net(apt, "LFPB") else {
             return; // no install, no verdict
         };
@@ -3461,7 +3461,7 @@ mod tests {
     #[test]
     #[ignore] // needs the real X-Plane install
     fn live_lemg_13_lead_on_runs_one_way() {
-        let apt = "/Users/duanelicudi/X-Plane 12/Global Scenery/Global Airports/Earth nav data/apt.dat";
+        let apt = &crate::tools::autoland::xplane_path("Global Scenery/Global Airports/Earth nav data/apt.dat");
         let Ok(Some(net)) = atc::nav::find_taxi_net(apt, "LEMG") else {
             return;
         };

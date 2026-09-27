@@ -22,19 +22,20 @@ pub fn apt_dat_path() -> String {
     if let Ok(p) = std::env::var("XCOPILOT_APT_DAT") {
         return p;
     }
-    let home = std::env::var("HOME").unwrap_or_default();
-    format!("{home}/X-Plane 12/Global Scenery/Global Airports/Earth nav data/apt.dat")
+    xplane_path("Global Scenery/Global Airports/Earth nav data/apt.dat")
 }
 
 /// The X-Plane install the sim is running from — `XCOPILOT_XPLANE_ROOT`
 /// overrides the standard location. Where an unknown airframe's `.acf` is
 /// read from (`sim/aircraft/view/acf_relative_path` is relative to it).
 pub fn xplane_root() -> String {
-    if let Ok(p) = std::env::var("XCOPILOT_XPLANE_ROOT") {
-        return p;
-    }
-    let home = std::env::var("HOME").unwrap_or_default();
-    format!("{home}/X-Plane 12")
+    crate::config::xplane_root()
+}
+
+/// A path under the X-Plane install (`xplane_root`), e.g.
+/// `xplane_path("Custom Data/CIFP")`.
+pub fn xplane_path(rel: &str) -> String {
+    crate::config::xplane_path(rel)
 }
 
 pub struct Autoland {
