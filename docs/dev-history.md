@@ -7839,3 +7839,31 @@ side crew), `full_auto` `request_clearance` with `ifr: true`,
 `cleared_ceiling`.
 
 NOT flown.
+
+## 2026-09-27: flap retraction waits for the flaps and names the detent
+
+Sortie `1790494983-full_auto` (B738, Alghero): after takeoff the crew said
+"Flaps coming up a stage." twice, 0.5 s apart: `flap_step` to 0.25 at t 752.5
+(1,011 ft AGL, 191 kt), to 0.125 at t 753.0 (1,039 ft, 191 kt), then "Flaps
+up." to 0.0 at t 766.6 (1,710 ft, 210 kt). Same pattern on the day's earlier
+sorties. The retraction is held to the acceleration height
+(`climb_out.accel_agl_ft`); by then the IAS was past both detents'
+`retract_above_kts`, so `flap_retract_step` returned a step on two
+consecutive ticks, each commanding the next detent before the flaps had
+moved, each with the same vague line.
+
+- **Paced on the readback**: `autotakeoff::paced_flap_step` takes a step only
+  once `flap_handle_deploy_ratio` has arrived at the last commanded detent
+  (`takeoff_config::flaps_arrived`, the takeoff config's own `FLAP_DEPLOY` /
+  `FLAP_ARRIVED`, now shared). Read only while a step is due, not every tick
+  of the roll; a failed read is no step. The handoff's clean-up is
+  unchanged (it only acts on flaps still out, and speaks once).
+- **Named by its detent**: `flap_step_line` says "Flaps one.", "Flaps up.",
+  from the detent's `spoken` (`aircraft::flap_detent_spoken` over the live
+  profile); no name keeps "Flaps coming up a stage.". `flap_step` records
+  `detent` and `deployed`.
+- **The 737's schedule matches its comment**: detent 2 declared
+  `retract_above_kts: 180` and added a step to the 5, 1, up the profile
+  describes; removed. No other profile's schedule contradicts its comment.
+
+NOT flown.

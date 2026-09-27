@@ -289,6 +289,33 @@ pub fn flap_retract_step(schedule: &[(f64, f64)], current: f64, ias: f64) -> Opt
         .map(|(ratio, _)| *ratio)
 }
 
+/// [`flap_retract_step`], paced on the flaps themselves: the step is taken
+/// only once the flaps `deployed` have arrived at the `commanded` detent.
+/// `None` for a failed read (no measurement, no step). Pure.
+pub fn paced_flap_step(
+    schedule: &[(f64, f64)],
+    commanded: f64,
+    deployed: Option<f64>,
+    ias: f64,
+) -> Option<f64> {
+    flap_retract_step(schedule, commanded, ias)
+        .filter(|_| deployed.is_some_and(|d| crate::takeoff_config::flaps_arrived(d, commanded)))
+}
+
+/// The call for a retraction step to `to`, named by its detent the way a
+/// crew calls it: "Flaps one.", "Flaps up.". Without a name it is the old
+/// vague line. Two steps 0.5 s apart both said "Flaps coming up a stage."
+/// (Alghero, 2026-09-27). Pure.
+pub fn flap_step_line(to: f64, spoken: Option<&str>) -> String {
+    if to <= 1e-6 {
+        return "Flaps up.".into();
+    }
+    match spoken.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(name) => format!("Flaps {name}."),
+        None => "Flaps coming up a stage.".into(),
+    }
+}
+
 /// Raise the gear (when there is one) above this, climbing.
 const GEAR_UP_AGL_FT: f64 = 200.0;
 /// Above this the gear comes up whatever its warning says: drag and the
@@ -2258,25 +2285,34 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, p: Params) {
                     let _ = xp.set_float(FLAP_HANDLE, 0.0).await;
                     alert(&voice, Priority::Advisory, "Flaps up.");
                 }
-            } else if let Some(next) = flap_retract_step(&p.flap_schedule, flap_cmd, ias) {
-                flap_cmd = next;
-                flaps_retracted = next <= 1e-6;
-                let _ = xp.set_float(FLAP_HANDLE, next).await;
-                crate::blackbox::record(
-                    "autotakeoff",
-                    serde_json::json!({
-                        "event": "flap_step", "to": next, "ias": ias, "agl_ft": agl_ft,
-                    }),
-                );
-                alert(
-                    &voice,
-                    Priority::Advisory,
-                    if flaps_retracted {
-                        "Flaps up."
-                    } else {
-                        "Flaps coming up a stage."
-                    },
-                );
+            } else if flap_retract_step(&p.flap_schedule, flap_cmd, ias).is_some() {
+                // Each step waits for the flaps to ARRIVE at the last one:
+                // held to the acceleration height, a jet is past both
+                // detents' speeds at once, and the schedule commanded 5 to
+                // 2 and 2 to 1 on consecutive ticks, half a second apart
+                // (Alghero, 2026-09-27). Read only while a step is due, not
+                // every tick of the roll. A failed read is no measurement:
+                // no step on it.
+                let deployed = xp.get_float(crate::takeoff_config::FLAP_DEPLOY).await.ok();
+                if let Some(next) = paced_flap_step(&p.flap_schedule, flap_cmd, deployed, ias) {
+                    flap_cmd = next;
+                    flaps_retracted = next <= 1e-6;
+                    let _ = xp.set_float(FLAP_HANDLE, next).await;
+                    let detent = crate::aircraft::live_profile()
+                        .and_then(|lp| crate::aircraft::flap_detent_spoken(lp.flaps.as_ref(), next));
+                    crate::blackbox::record(
+                        "autotakeoff",
+                        serde_json::json!({
+                            "event": "flap_step", "to": next, "ias": ias, "agl_ft": agl_ft,
+                            "detent": detent, "deployed": deployed,
+                        }),
+                    );
+                    alert(
+                        &voice,
+                        Priority::Advisory,
+                        &flap_step_line(next, detent.as_deref()),
+                    );
+                }
             }
         }
         if !ap_engaged {
@@ -2772,6 +2808,53 @@ mod tests {
         assert_eq!(flap_retract_step(&sched, 0.375, 300.0), Some(0.25));
         // An airframe with no declared speeds keeps the one-shot clean-up.
         assert_eq!(flap_retract_step(&[], 0.375, 300.0), None);
+    }
+
+    /// Held to the acceleration height, a jet is past every detent's speed
+    /// at once: the schedule stepped 5 to 2 and 2 to 1 half a second apart
+    /// (Alghero, 2026-09-27). The next step waits for the flaps to arrive.
+    #[test]
+    fn a_flap_step_waits_for_the_flaps_to_arrive() {
+        let sched = [(0.0, 210.0), (0.125, 190.0), (0.25, 180.0)];
+        // First step: the flaps sit at the takeoff 5.
+        assert_eq!(paced_flap_step(&sched, 0.375, Some(0.375), 215.0), Some(0.25));
+        // Next tick: commanded 2, still travelling from 5. No second step.
+        assert_eq!(paced_flap_step(&sched, 0.25, Some(0.36), 215.0), None);
+        // A failed read is no measurement.
+        assert_eq!(paced_flap_step(&sched, 0.25, None, 215.0), None);
+        assert_eq!(paced_flap_step(&sched, 0.25, Some(f64::NAN), 215.0), None);
+        // Arrived (inside the tolerance): the next step.
+        assert_eq!(paced_flap_step(&sched, 0.25, Some(0.26), 215.0), Some(0.125));
+        // Arrived but too slow is still too slow.
+        assert_eq!(paced_flap_step(&sched, 0.125, Some(0.125), 200.0), None);
+    }
+
+    #[test]
+    fn a_flap_step_is_called_by_its_detent() {
+        assert_eq!(flap_step_line(0.125, Some("one")), "Flaps one.");
+        assert_eq!(flap_step_line(0.25, Some("ten degrees")), "Flaps ten degrees.");
+        assert_eq!(flap_step_line(0.0, Some("up")), "Flaps up.");
+        assert_eq!(flap_step_line(0.0, None), "Flaps up.");
+        // No name: the old line.
+        assert_eq!(flap_step_line(0.125, None), "Flaps coming up a stage.");
+        assert_eq!(flap_step_line(0.125, Some("  ")), "Flaps coming up a stage.");
+    }
+
+    /// The 737 walks 5, 1, up from its real profile, each named.
+    #[test]
+    fn the_737_walks_five_one_up() {
+        let flaps = crate::aircraft::load("boeing_737_800").unwrap().flaps;
+        let sched = crate::aircraft::flap_schedule(flaps.as_ref());
+        let (mut at, mut calls) = (0.375_f64, Vec::new());
+        while let Some(next) = paced_flap_step(&sched, at, Some(at), 250.0) {
+            at = next;
+            let name = crate::aircraft::flap_detent_spoken(flaps.as_ref(), next);
+            calls.push((next, flap_step_line(next, name.as_deref())));
+        }
+        assert_eq!(
+            calls,
+            vec![(0.125, "Flaps one.".to_string()), (0.0, "Flaps up.".to_string())]
+        );
     }
 
     #[test]
@@ -4168,17 +4251,20 @@ mod tests {
         let (mut agl, mut ias, mut vs1, mut vs) = (340.0_f64, 185.0_f64, 1600.0_f64, 1600.0_f64);
         let mut delay = std::collections::VecDeque::from(vec![1600.0_f64; 5]);
         let (mut flap, mut steps, mut at_accel) = (0.375_f64, Vec::new(), None);
+        let mut deployed = flap;
         let (mut reversals, mut last_cmd, mut last_dir) = (0usize, None::<f64>, 0.0_f64);
         let mut waited = None::<f64>;
         for tick in 0..400 {
             let t = tick as f64 * dt;
             let gate = climb_out.map_or(FLAP_RETRACT_AGL_FT, |c| c.accel_agl_ft);
             if flap > 1e-6 && agl > gate {
-                if let Some(next) = flap_retract_step(&schedule, flap, ias) {
+                if let Some(next) = paced_flap_step(&schedule, flap, Some(deployed), ias) {
                     flap = next;
                     steps.push((agl, ias, next));
                 }
             }
+            // The flaps follow the handle at about a detent in four seconds.
+            deployed += (flap - deployed).clamp(-0.03 * dt, 0.03 * dt);
             let cmd = climb_out_vs_fpm(ias, hold_kts, base_fpm, vne, agl, climb_out);
             if climb_out.is_some_and(|c| agl < c.accel_agl_ft) {
                 if let Some(prev) = last_cmd {
@@ -4232,10 +4318,11 @@ mod tests {
         // still under the flaps-up speed, so the schedule has steps to take.
         assert!(at_accel < 210.0, "{at_accel}");
         assert!(reversals <= 1, "the speed hold hunted: {reversals}");
-        // Flaps 5 stays to the height, then every detent at its own speed.
-        assert_eq!(steps.len(), 3, "{steps:?}");
+        // Flaps 5 stays to the height, then 1 and up, each at its own speed
+        // and after the flaps have run to the last.
+        assert_eq!(steps.len(), 2, "{steps:?}");
         assert!(steps.iter().all(|(agl, _, _)| *agl > 1000.0), "{steps:?}");
-        assert!(steps[2].1 >= 210.0 && steps[2].2 <= 1e-6, "{steps:?}");
+        assert!(steps[1].1 >= 210.0 && steps[1].2 <= 1e-6, "{steps:?}");
         // The handoff is clean, inside the wait, and nowhere near 250.
         assert!(h_ias < 235.0 && h_agl < 2500.0, "{h_agl} ft {h_ias} kt");
     }

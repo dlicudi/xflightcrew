@@ -20,7 +20,8 @@ use std::sync::Mutex;
 
 const FLAP_HANDLE: &str = crate::datarefs::FLAP_RATIO;
 /// Where the flaps ARE, following the handle at the airframe's own rate.
-const FLAP_DEPLOY: &str = "sim/cockpit2/controls/flap_handle_deploy_ratio";
+/// The climb-out's retraction reads it too: each step waits for the last.
+pub(crate) const FLAP_DEPLOY: &str = "sim/cockpit2/controls/flap_handle_deploy_ratio";
 const SPEEDBRAKE: &str = "sim/cockpit2/controls/speedbrake_ratio";
 /// 0 RTO, 1 off, 2..5 the landing levels.
 const AUTOBRAKE: &str = "sim/cockpit2/switches/auto_brake_level";
@@ -35,7 +36,15 @@ const REJECT_SPOILER_KTS: f64 = 40.0;
 /// about twenty seconds; a flap that has not arrived by now is said, and the
 /// roll goes (the takeoff's own flap law still holds the handle).
 const FLAP_WAIT_SECS: f64 = 40.0;
-const FLAP_ARRIVED: f64 = 0.03;
+/// How close the flaps must be to the handle to count as there.
+pub(crate) const FLAP_ARRIVED: f64 = 0.03;
+
+/// Whether flaps reading `deployed` have run to the `commanded` handle
+/// ratio. Pure; the one test behind the takeoff's wait and the climb-out's
+/// pacing of its retraction steps.
+pub fn flaps_arrived(deployed: f64, commanded: f64) -> bool {
+    deployed.is_finite() && (deployed - commanded).abs() <= FLAP_ARRIVED
+}
 
 /// A dial this far above the field is the pilot's own and is left alone.
 const DIAL_CLEAR_FT: f64 = 500.0;
@@ -298,7 +307,7 @@ async fn flaps_arrive(xp: &dyn XPlane, want: f64) -> bool {
         if xp
             .get_float(FLAP_DEPLOY)
             .await
-            .is_ok_and(|v| (v - want).abs() <= FLAP_ARRIVED)
+            .is_ok_and(|v| flaps_arrived(v, want))
         {
             return true;
         }

@@ -1363,6 +1363,16 @@ pub fn flap_schedule(f: Option<&FlapProfile>) -> Vec<(f64, f64)> {
     v
 }
 
+/// The spoken name of the detent at `ratio` ("one", "ten degrees"), for the
+/// call a crew makes as it selects it. `None` when no detent sits there.
+pub fn flap_detent_spoken(f: Option<&FlapProfile>, ratio: f64) -> Option<String> {
+    f?.detents
+        .iter()
+        .find(|d| (d.ratio - ratio).abs() < 1e-3)
+        .map(|d| d.spoken.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
 /// One flap handle position.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FlapDetent {
@@ -3456,12 +3466,17 @@ mod tests {
         assert_eq!(r.enroute_climb_fpm, Some(2000.0));
         assert_eq!(r.enroute_descent_fpm, Some(2000.0));
         assert_eq!(r.optimum_alt_ft, Some(38_000.0));
-        // The retraction schedule the climb-out walks: up at 210, 1 at 190,
-        // 2 at 180 — cleanest first.
+        // The retraction schedule the climb-out walks: 5, then 1 at 190,
+        // then up at 210, cleanest first. Detent 2 declared a speed too and
+        // added a step the profile's own comment did not have (Alghero,
+        // 2026-09-27).
         assert_eq!(
             flap_schedule(p.flaps.as_ref()),
-            vec![(0.0, 210.0), (0.125, 190.0), (0.25, 180.0)]
+            vec![(0.0, 210.0), (0.125, 190.0)]
         );
+        assert_eq!(flap_detent_spoken(p.flaps.as_ref(), 0.125).as_deref(), Some("one"));
+        assert_eq!(flap_detent_spoken(p.flaps.as_ref(), 0.0).as_deref(), Some("up"));
+        assert_eq!(flap_detent_spoken(p.flaps.as_ref(), 0.3), None);
     }
 
     /// The BIKF-EGPH brief, verbatim from the panel (2026-09-20): 3,126 kg in

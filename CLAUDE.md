@@ -358,7 +358,9 @@ everything blackboxes to `logs/blackbox.jsonl` (kinds: `atc`, `autotaxi`, `autot
 - **A jet's climb-out is declared** (`reference.acceleration_height_agl_ft`,
   `autotakeoff::ClimbOut`): below it the VS dial holds `initial_climb_kts` (`climb_out_vs_fpm` to
   `best_climb_fpm`) and the flaps stay; above it the schedule steps and the handoff waits for it
-  (`handoff_waits_for_schedule`). A circuit keeps the old climb-out.
+  (`handoff_waits_for_schedule`), each step only once the flaps ARRIVE at the last
+  (`paced_flap_step`) and called by its detent ("Flaps one.", `flap_step_line`). A circuit keeps
+  the old climb-out.
 - **A runway start is a lined-up aircraft and still calls** (`tower::Ctx::own_on_runway`).
 
 ### Circuit, procedure, full auto
