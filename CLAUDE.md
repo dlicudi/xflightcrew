@@ -246,7 +246,9 @@ Config: `XCOPILOT_ATC_AIRPORT` / `_VOICE` / `_RATE` / `_REGION`.
   arrival is committed, with wind hysteresis (parallels flip-flop invisibly); an arrival's STATED
   runway stands inside the margin (`note_stated_runway`). LinedUp and conditional line-up.
 - Release threads the arrival stream (`DEPART_GAP_NM`; strip clear = LUAW); wake timed from when
-  the HOLD went on.
+  the HOLD went on. **A reject is a radio call** (`Intent::RejectingTakeoff`, the crew's
+  `autotakeoff::REJECT_CALL`): the clearance and all it armed die; a held release lives only in
+  TaxiCleared/LinedUp and dies at a roll (`void_takeoff_hold_by_roll`; EGKK 2026-09-27).
 - **Taxi routes**: Dijkstra over apt.dat 1201/1202; crossings from strip GEOMETRY, never network
   flags; a crossing on the cleared route is never berated. A runway destination snaps to a node
   that can REACH the runway, per CALLER, ON THE DESTINATION STRIP's own pavement (LFPB 2026-09-22).

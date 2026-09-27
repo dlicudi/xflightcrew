@@ -8678,3 +8678,49 @@ never worse, all under 2 m (the plant under-reads the gusty days: LIBP 04 flew
 default law. Next 737 roll: `roll` ticks carry `law` ("rudder") and `r`;
 check err under 3 and xtk_m under 5 through rotation, trim toward 0.2 by
 60 kt in a crosswind, and no steer reversals. Offline only.
+
+## 2026-09-27: a rejected takeoff is a radio event (issue #115)
+
+**Sorties 1790524628, 1790525500, 1790525553 (EGKK, stock 737).** The first
+reject (lateral excursion, 26L) left the tower at TakeoffCleared. The resume
+(1790525500) found the stale clearance, read it back at +3.7 and rolled; its
+queued "ready for departure" went out at +14.1 during the roll, with traffic on
+the strip, and the tower answered "cancel takeoff clearance, hold position,
+traffic on the runway" and armed the release watch. The crew rejected again at
++27.1 (94 kt, 10.1 m off the centreline) and stopped. Nothing told the tower.
+The hold stayed armed (it voided only airborne), so 1.2 s into the next resume
+(1790525553) it replayed "traffic clear. Runway two six left, cleared for
+takeoff". The aircraft stood 1 km down the runway, too little to go, so full
+auto judged its taxi route stale and asked "request taxi, runway two six left";
+the tower's readback gate answered "read back: runway two six left, cleared
+for takeoff", nobody read back, and full auto gave up `no_taxi_clearance` at
++184.8.
+
+**The fix.** The crew reports the reject (`autotakeoff::reject`,
+`REJECT_CALL` "rejecting takeoff", only when `reject_call_due`: the tower has
+us TakeoffCleared or LinedUp). A new `tower::Intent::RejectingTakeoff`
+("stopping", ICAO's word, or reject/abort with takeoff; parsed before the
+takeoff words so it is never a request) is never gated by an owed readback
+(like a go-around), and on the ground from TakeoffCleared or LinedUp it leaves
+the flight LinedUp with nothing owed: "roger. Hold position, report ready."
+The station retires everything the clearance armed: the release watch, an
+unsynced released clearance, the line-up condition, the after-departure
+handoff. A held release now lives only while the tower is TaxiCleared or
+LinedUp, and the monitor voids it when our aircraft rolls past 40 kt on the
+ground (`station::void_takeoff_hold_by_roll`, blackbox `atc` `hold_void`), the
+tower's own eyes for a reject call it never heard. A taxi request while a
+takeoff or line-up readback is owed is not challenged: from TakeoffCleared the
+tower says "takeoff clearance cancelled, taxi to holding point ...". The resume
+itself needed no change: on the runway with room it asks for departure from
+LinedUp; mid-runway it asks for taxi and now gets it (the real EGKK network
+plans holding point Mike from the stop, 51.147885 N 0.192010 W).
+
+Tests `a_rejected_takeoff_cancels_the_clearance_and_the_held_release` (the
+sequence replayed through the keyed route), `a_taxi_request_cancels_a_takeoff_clearance`,
+`a_held_release_is_spent_by_the_roll`, `a_reject_cancels_the_takeoff_clearance`,
+`a_reject_call_parses_as_the_reject`, `a_reject_is_reported_to_the_tower_that_cleared_it`;
+corpus cases for the reject call. Next reject: blackbox `autotakeoff` `reject`
+carries `radio_call: true`, then an `atc` keyed record with intent
+`RejectingTakeoff` and state `TakeoffCleared>LinedUp`; no `hold_release` after
+it; a resume's `request_taxi` answered with a taxi. Offline only.
+

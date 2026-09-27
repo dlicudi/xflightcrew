@@ -868,6 +868,38 @@ impl Station {
                 "takeoff clearance withheld; release watch armed"
             );
         }
+        // A departure that STOPPED on the runway spent everything its
+        // clearance armed: the held release (EGKK 2026-09-27: armed while
+        // the 737 rolled, never released, it replayed "traffic clear,
+        // cleared for takeoff" 1.2 s into the resume), a release the main
+        // loop has not synced yet, the conditional line-up's condition and
+        // the after-departure handoff.
+        if service == Service::Tower
+            && intent == tower::Intent::RejectingTakeoff
+            && ctx.on_ground
+            && matches!(was, tower::State::TakeoffCleared | tower::State::LinedUp)
+        {
+            *PENDING_TAKEOFF_CLEARANCE
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()) = false;
+            *PENDING_LINE_UP.lock().unwrap_or_else(|e| e.into_inner()) = false;
+            *HANDOFF.lock().unwrap_or_else(|e| e.into_inner()) = None;
+            tracing::info!(runway = ?self.runway_in_use, "takeoff rejected; clearance cancelled");
+        }
+        // A held release lives only while the tower still owes one: the
+        // flight holding short or on the runway WITHOUT a clearance. Any
+        // other state (cleared, parked, inbound) or a reject retires it, so
+        // it can never replay a clearance nobody is waiting for.
+        if service == Service::Tower
+            && (intent == tower::Intent::RejectingTakeoff
+                || !matches!(
+                    self.twr.state,
+                    tower::State::TaxiCleared | tower::State::LinedUp
+                ))
+        {
+            *TAKEOFF_HOLD.lock().unwrap_or_else(|e| e.into_inner()) = None;
+            *LINE_UP_CONDITION.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        }
         reply
     }
 
@@ -1014,6 +1046,7 @@ impl Station {
             | tower::Intent::ReportBase
             | tower::Intent::ReportCrosswind
             | tower::Intent::GoAround
+            | tower::Intent::RejectingTakeoff
             | tower::Intent::RequestTakeoff
             | tower::Intent::RequestTaxi
             | tower::Intent::RequestTaxiIn
@@ -1230,6 +1263,7 @@ impl Station {
             | tower::Intent::ReportBase
             | tower::Intent::ReportCrosswind
             | tower::Intent::GoAround
+            | tower::Intent::RejectingTakeoff
             | tower::Intent::RequestTakeoff
             | tower::Intent::RequestTaxi
             | tower::Intent::RequestTaxiIn
@@ -4474,6 +4508,31 @@ fn hold_armed_at(existing: Option<&TakeoffHold>, runway_ident: &str, now: Instan
     existing
         .filter(|h| h.runway_ident == runway_ident)
         .map_or(now, |h| h.armed_at)
+}
+
+/// Groundspeed past which our aircraft on the ground is ROLLING for takeoff,
+/// never taxiing (taxi paces top out near 30 kt).
+pub const HOLD_ROLL_KTS: f64 = 40.0;
+
+/// Retire a held release once our aircraft rolls on the ground past
+/// [`HOLD_ROLL_KTS`]: the takeoff it was holding has happened (through the
+/// cancel, or before it was held). The reject call retires it too; this is
+/// the tower's own eyes for a reject it never heard. `true` when a hold was
+/// voided.
+pub fn void_takeoff_hold_by_roll(gs_kts: f64) -> bool {
+    if gs_kts < HOLD_ROLL_KTS {
+        return false;
+    }
+    let voided = TAKEOFF_HOLD
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .take()
+        .is_some();
+    if voided {
+        *LINE_UP_CONDITION.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        tracing::info!(gs_kts, "held takeoff release voided: the aircraft rolled");
+    }
+    voided
 }
 
 pub fn takeoff_hold_tick(
@@ -9857,8 +9916,14 @@ mod tests {
             "{owed}"
         );
         // A different call is challenged, and the challenge repeats the
-        // instruction — nothing moves.
-        let r = st.route_keyed("gibraltar tower, request taxi", Service::Tower, &ctx, wx);
+        // instruction; nothing moves. (A TAXI request is not challenged: it
+        // cancels the takeoff, see `a_taxi_request_cancels_a_takeoff_clearance`.)
+        let r = st.route_keyed(
+            "gibraltar tower, request start up",
+            Service::Tower,
+            &ctx,
+            wx,
+        );
         assert!(r.contains("read back"), "{r}");
         assert!(r.contains("cleared for takeoff"), "{r}");
         assert_eq!(
@@ -9910,6 +9975,201 @@ mod tests {
         *CLEARANCE.lock().unwrap_or_else(|e| e.into_inner()) = None;
         *HANDOFF.lock().unwrap_or_else(|e| e.into_inner()) = None;
         *TAKEOFF_HOLD.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    }
+
+    /// EGKK 2026-09-27 (sorties 1790525500 and 1790525553) replayed through
+    /// the keyed route. The resumed 737 was cleared for takeoff; its queued
+    /// "ready for departure" went out as it rolled, traffic stood on the
+    /// strip, and the tower answered "cancel takeoff clearance, hold
+    /// position" and armed the release watch. The crew rejected and stopped.
+    /// Then: the watch replayed "traffic clear, cleared for takeoff" 1.2 s
+    /// into the resume, and the resume's taxi request was answered "read
+    /// back: runway two six left, cleared for takeoff". Now the crew's reject
+    /// call cancels it all, and the taxi request gets its taxi.
+    #[test]
+    fn a_rejected_takeoff_cancels_the_clearance_and_the_held_release() {
+        let _guard = SIDE_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        *WAKE.lock().unwrap() = None;
+        *TAKEOFF_HOLD.lock().unwrap() = None;
+        *PENDING_TAKEOFF_CLEARANCE.lock().unwrap() = false;
+        let path = lxgb_apt_file();
+        let mut st = Station::load(path.to_str().unwrap(), "LXGB").expect("LXGB loads");
+        let wx = Wx {
+            wind_from_deg: 90.0,
+            wind_kts: 8.0,
+        };
+        let mut ctx = scripted_ctx(&mut st, wx);
+        ctx.on_ground = true;
+        let cs = "november one seven two sierra papa";
+
+        st.route_keyed(&format!("{cs}, request taxi"), Service::Tower, &ctx, wx);
+        let r = st.route_keyed(
+            &format!("{cs}, ready for departure"),
+            Service::Tower,
+            &ctx,
+            wx,
+        );
+        assert!(r.contains("cleared for takeoff"), "{r}");
+        let r = st.route_keyed(
+            &format!("cleared for takeoff runway zero niner, {cs}"),
+            Service::Tower,
+            &ctx,
+            wx,
+        );
+        assert_eq!(r, "", "read back");
+        // The queued re-report lands with traffic on the strip: cancelled,
+        // held, the release watch armed.
+        let mut busy = ctx.clone();
+        busy.runway_occupied = true;
+        let r = st.route_keyed(
+            &format!("{cs}, ready for departure"),
+            Service::Tower,
+            &busy,
+            wx,
+        );
+        assert!(r.contains("cancel takeoff clearance"), "{r}");
+        assert!(
+            TAKEOFF_HOLD.lock().unwrap().is_some(),
+            "release watch armed"
+        );
+        // A released clearance the main loop has not synced yet.
+        *PENDING_TAKEOFF_CLEARANCE.lock().unwrap() = true;
+
+        // The crew's reject call, as the drain keys it: never challenged for
+        // the readback it owes, answered, and everything it armed retired.
+        let r = st.route_keyed(
+            &format!("{cs}, rejecting takeoff"),
+            Service::Tower,
+            &ctx,
+            wx,
+        );
+        assert!(r.contains("roger") && r.contains("Hold position"), "{r}");
+        assert!(!r.contains("read back"), "{r}");
+        assert_eq!(
+            st.twr.state,
+            tower::State::LinedUp,
+            "on the runway, no clearance"
+        );
+        assert!(st.twr.pending().is_none(), "nothing owed");
+        assert!(
+            TAKEOFF_HOLD.lock().unwrap().is_none(),
+            "the held release is void"
+        );
+        assert!(
+            !*PENDING_TAKEOFF_CLEARANCE.lock().unwrap(),
+            "the unsynced release is void"
+        );
+        let (state, holds, owed) = {
+            let c = CLEARANCE.lock().unwrap();
+            let c = c.as_ref().unwrap();
+            (c.state, c.holds_runway, c.pending_readback.clone())
+        };
+        assert_eq!(state, tower::State::LinedUp);
+        assert!(holds, "the runway is still ours");
+        assert!(owed.is_none(), "the coach owes nothing");
+        // Nothing replays, however long the resume takes.
+        let t0 = Instant::now();
+        for s in [0, 15, 30, 120] {
+            assert!(
+                takeoff_hold_tick(&[], 11.0, true, t0 + std::time::Duration::from_secs(s))
+                    .is_none(),
+                "no replay at +{s} s"
+            );
+        }
+
+        // The resume, stopped mid-runway: its taxi request gets the taxi.
+        let r = st.route_keyed(
+            &format!("{cs}, request taxi, runway zero niner"),
+            Service::Tower,
+            &ctx,
+            wx,
+        );
+        assert!(r.contains("holding point"), "{r}");
+        assert!(!r.contains("read back"), "{r}");
+        assert_eq!(st.twr.state, tower::State::TaxiCleared);
+
+        // From the start of the runway instead, it asks for takeoff again.
+        let mut st = Station::load(path.to_str().unwrap(), "LXGB").unwrap();
+        st.route_keyed(&format!("{cs}, request taxi"), Service::Tower, &ctx, wx);
+        st.route_keyed(
+            &format!("{cs}, ready for departure"),
+            Service::Tower,
+            &ctx,
+            wx,
+        );
+        st.route_keyed(&format!("{cs}, stopping"), Service::Tower, &ctx, wx);
+        assert_eq!(st.twr.state, tower::State::LinedUp);
+        let r = st.route_keyed(
+            &format!("{cs}, ready for departure"),
+            Service::Tower,
+            &ctx,
+            wx,
+        );
+        assert!(r.contains("cleared for takeoff"), "a fresh clearance: {r}");
+
+        *CLEARANCE.lock().unwrap() = None;
+        *HANDOFF.lock().unwrap() = None;
+        *TAKEOFF_HOLD.lock().unwrap() = None;
+        *TAXI_ROUTE.lock().unwrap() = None;
+        *PENDING_TAKEOFF_CLEARANCE.lock().unwrap() = false;
+    }
+
+    /// The tower's own eyes, for a reject call it never heard: the hold armed
+    /// at +14 of sortie 1790525500 rode a roll to 94 kt and was still armed at
+    /// the resume. Rolling past 40 kt spends it; a taxi at 25 kt does not.
+    #[test]
+    fn a_held_release_is_spent_by_the_roll() {
+        let _guard = SIDE_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        *TAKEOFF_HOLD.lock().unwrap() = Some(TakeoffHold {
+            callsign: "Whiskey Alpha Tango one seven three".into(),
+            runway: "two six left".into(),
+            runway_ident: "26L".into(),
+            clear_since: None,
+            armed_at: Instant::now(),
+            logged_at: Instant::now(),
+            lined_up: true,
+            behind: false,
+        });
+        assert!(
+            !void_takeoff_hold_by_roll(25.0),
+            "a taxi pace spends nothing"
+        );
+        assert!(TAKEOFF_HOLD.lock().unwrap().is_some());
+        assert!(void_takeoff_hold_by_roll(94.0), "the roll spends it");
+        assert!(TAKEOFF_HOLD.lock().unwrap().is_none());
+        assert!(!void_takeoff_hold_by_roll(94.0), "once");
+        assert!(takeoff_hold_tick(&[], 200.0, true, Instant::now()).is_none());
+    }
+
+    /// A flight cleared for takeoff that asks to taxi is not taking the
+    /// takeoff: the tower cancels it out loud and gives the taxi, never "read
+    /// back: cleared for takeoff" (the EGKK resume's answer when the crew's
+    /// reject call never reached the tower).
+    #[test]
+    fn a_taxi_request_cancels_a_takeoff_clearance() {
+        let _guard = SIDE_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        *TAKEOFF_HOLD.lock().unwrap() = None;
+        let path = lxgb_apt_file();
+        let mut st = Station::load(path.to_str().unwrap(), "LXGB").expect("LXGB loads");
+        let wx = Wx {
+            wind_from_deg: 90.0,
+            wind_kts: 8.0,
+        };
+        let mut ctx = scripted_ctx(&mut st, wx);
+        ctx.on_ground = true;
+        st.route_keyed("request taxi", Service::Tower, &ctx, wx);
+        let r = st.route_keyed("ready for departure", Service::Tower, &ctx, wx);
+        assert!(r.contains("cleared for takeoff"), "{r}");
+        assert!(st.twr.pending().is_some(), "the takeoff readback is owed");
+        let r = st.route_keyed("gibraltar tower, request taxi", Service::Tower, &ctx, wx);
+        assert!(r.contains("takeoff clearance cancelled"), "{r}");
+        assert!(r.contains("holding point"), "{r}");
+        assert!(!r.contains("read back"), "{r}");
+        assert_eq!(st.twr.state, tower::State::TaxiCleared);
+        assert!(st.twr.pending().is_none());
+        *CLEARANCE.lock().unwrap() = None;
+        *HANDOFF.lock().unwrap() = None;
+        *TAXI_ROUTE.lock().unwrap() = None;
     }
 
     #[test]
