@@ -380,7 +380,7 @@ impl Snapshot {
             .get_float("sim/cockpit/gyros/dg_drift_vac_deg")
             .await
             .unwrap_or(0.0);
-        let gyro_drift_deg = (gyro_drift_raw + 180.0).rem_euclid(360.0) - 180.0;
+        let gyro_drift_deg = fold_drift_deg(gyro_drift_raw);
 
         // Fuel endurance = total fuel ÷ current burn. Both best-effort (a missing
         // read must not kill the snapshot); endurance is None when either is
@@ -2395,9 +2395,9 @@ pub async fn run(
     // independent of the advisory clock above — a safety alert must not wait
     // out a 45 s narration window.
     let mut near_miss_last: Option<Instant> = None;
-    // Gyro auto-sync cooldown (drift resets to ~0 on sync, so this only guards
-    // against a sim-side write failing silently and re-triggering every tick).
-    let mut gyro_sync_last: Option<Instant> = None;
+    // Gyro auto-sync: cooldown, the readback owed after a fire, and the latch
+    // for an airframe whose sync does nothing (reset on every swap below).
+    let mut gyro_sync = GyroSync::default();
     // The unasked cockpit duties (night lights, GPS welcome page) and their own
     // slower clock. The monitor ticks at 3 Hz and neither input justifies that:
     // the sun moves a quarter of a degree a minute, and a battery master thrown
@@ -2470,6 +2470,8 @@ pub async fn run(
             // fact that outlives its airframe aims the next aircraft's writes
             // at something it may not have.
             cockpit_auto = crate::cockpit_auto::CockpitAuto::default();
+            // "The sync does nothing here" is a fact about THAT airframe.
+            gyro_sync = GyroSync::default();
             flow_tracker = crate::flow::Tracker::default();
             landing_summary = crate::interaction::Landing::default();
             rapport = crate::rapport::Rapport::new();
@@ -3032,22 +3034,65 @@ pub async fn run(
                 // a true glass panel reads ~0 here, so it never fires there.
                 // Crew-gated: this is the copilot's HAND on the panel, not
                 // just its voice — in ATC-only nobody re-aligns your DG.
-                if crew_on
-                    && !snap.on_ground
-                    && snap.gyro_drift_deg.abs() >= GYRO_DRIFT_ADVISORY_DEG
-                    && gyro_sync_last.is_none_or(|t| now.duration_since(t).as_secs() >= 120)
-                {
-                    gyro_sync_last = Some(now);
+                //
+                // An ACCEPTED command is not a sync: the drift is read back a
+                // beat later and the line is said only if it fell. On the stock
+                // 737 the command did nothing and the copilot claimed a resync
+                // every 120 s with the drift climbing 11.8 to 15.6 (LEBL-LFBD
+                // 2026-09-27); a sync that does not take is silent and latches
+                // off for the airframe. Not gated on the systems survey's
+                // glass_hsi: the readback is the guard.
+                if gyro_sync.verify_due(now) {
+                    // A failed read is NO measurement (the snapshot's 0.0
+                    // default would read as a perfect sync).
+                    let after = xp
+                        .get_float("sim/cockpit/gyros/dg_drift_vac_deg")
+                        .await
+                        .ok()
+                        .map(fold_drift_deg);
+                    match gyro_sync.settle(after, now) {
+                        Some(GyroSyncOutcome::Took { before, after }) => {
+                            crate::blackbox::record(
+                                "gyro_sync",
+                                serde_json::json!({
+                                    "took": true,
+                                    "drift_deg": r1(before),
+                                    "after_deg": r1(after),
+                                }),
+                            );
+                            // `voice.alert` mirrors to the panel; an explicit
+                            // `s.action(&line)` here too double-wrote the line
+                            // to the chat (2026-07-24).
+                            voice.alert(Priority::Advisory, gyro_sync_line(before));
+                        }
+                        Some(GyroSyncOutcome::DidNotTake { before, after }) => {
+                            crate::blackbox::record(
+                                "gyro_sync",
+                                serde_json::json!({
+                                    "took": false,
+                                    "drift_deg": r1(before),
+                                    "after_deg": r1(after),
+                                    "latched": true,
+                                }),
+                            );
+                        }
+                        Some(GyroSyncOutcome::Unmeasured { before }) => {
+                            crate::blackbox::record(
+                                "gyro_sync",
+                                serde_json::json!({
+                                    "took": serde_json::Value::Null,
+                                    "drift_deg": r1(before),
+                                    "after_deg": serde_json::Value::Null,
+                                }),
+                            );
+                        }
+                        None => {}
+                    }
+                }
+                if crew_on && !snap.on_ground && gyro_sync.due(snap.gyro_drift_deg, now) {
+                    gyro_sync.last = Some(now);
                     if xp.run_command("sim/instruments/DG_sync_mag").await.is_ok() {
-                        let line = gyro_sync_line(snap.gyro_drift_deg);
-                        crate::blackbox::record(
-                            "gyro_sync",
-                            serde_json::json!({ "drift_deg": r1(snap.gyro_drift_deg) }),
-                        );
-                        // `voice.alert` mirrors to the panel; an explicit
-                        // `s.action(&line)` here too double-wrote the line to the
-                        // chat (2026-07-24).
-                        voice.alert(Priority::Advisory, line);
+                        gyro_sync.fired(snap.gyro_drift_deg, now);
                     }
                 }
                 // The ATIS loop: while COM1 sits on the ATIS frequency the
@@ -4079,11 +4124,100 @@ impl Check for AlternatorOffline {
 /// right-seat pilot doesn't nag about it, they reach over and fix it ("the
 /// copilot should adjust it and say so", 2026-07-09). The monitor loop performs
 /// the sync itself (the same DG_sync_mag command as the align_gyro tool) and
-/// announces it with this line. Pure so it unit-tests; rounds to 5° so the
-/// figure sounds like an estimate, not false precision.
+/// announces it with this line, once the drift READ BACK shows it took
+/// (`GyroSync`). Pure so it unit-tests; rounds to 5 degrees so the figure
+/// sounds like an estimate, not false precision.
 fn gyro_sync_line(drift_deg: f64) -> String {
     let approx = (drift_deg.abs() / 5.0).round() * 5.0;
-    format!("Heading indicator had drifted about {approx:.0} degrees — re-synced to the compass.")
+    format!("Heading indicator had drifted about {approx:.0} degrees, re-synced to the compass.")
+}
+
+/// Fold a DG drift into -180..180, the same as the `align_gyro` tool, so a
+/// small negative drift does not read as ~360.
+fn fold_drift_deg(raw: f64) -> f64 {
+    (raw + 180.0).rem_euclid(360.0) - 180.0
+}
+
+/// Time between auto-sync attempts.
+const GYRO_SYNC_COOLDOWN: Duration = Duration::from_secs(120);
+/// The sync is read back this long after the command (the sim applies a
+/// command on its next frame; a beat leaves room for a slow one).
+const GYRO_VERIFY_AFTER: Duration = Duration::from_secs(1);
+/// Past this with no successful read the readback gives up: unmeasured, silent,
+/// no latch (a failed read is no measurement either way).
+const GYRO_VERIFY_GIVE_UP: Duration = Duration::from_secs(3);
+
+/// Did the sync take? The drift must have at least halved: a real
+/// DG_sync_mag zeroes it, and an airframe whose heading is not a vacuum DG
+/// (the stock 737: IRS and glass) keeps drifting as if nothing was pressed.
+fn gyro_sync_took(before_deg: f64, after_deg: f64) -> bool {
+    after_deg.abs() <= before_deg.abs() / 2.0
+}
+
+/// What a readback found.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum GyroSyncOutcome {
+    /// The drift fell: say so.
+    Took { before: f64, after: f64 },
+    /// The command was accepted and did nothing: silent, and latched off.
+    DidNotTake { before: f64, after: f64 },
+    /// No read landed in time: silent, not latched.
+    Unmeasured { before: f64 },
+}
+
+/// The monitor's DG auto-sync, per airframe (the loop resets it on a swap):
+/// the cooldown, the readback owed after a fire, and the latch that stops an
+/// airframe whose sync does nothing from being "re-synced" every 120 s.
+#[derive(Debug, Default)]
+struct GyroSync {
+    /// When the command was last tried (the cooldown's clock).
+    last: Option<Instant>,
+    /// Drift at the fire and when, while its readback is owed.
+    pending: Option<(f64, Instant)>,
+    /// The sync was read back and did nothing on this airframe.
+    ineffective: bool,
+}
+
+impl GyroSync {
+    /// A drift worth syncing, off cooldown, no readback owed, not latched.
+    fn due(&self, drift_deg: f64, now: Instant) -> bool {
+        !self.ineffective
+            && self.pending.is_none()
+            && drift_deg.abs() >= GYRO_DRIFT_ADVISORY_DEG
+            && self
+                .last
+                .is_none_or(|t| now.duration_since(t) >= GYRO_SYNC_COOLDOWN)
+    }
+
+    /// The command was accepted: a readback is owed.
+    fn fired(&mut self, before_deg: f64, now: Instant) {
+        self.pending = Some((before_deg, now));
+    }
+
+    /// Time to read the drift back.
+    fn verify_due(&self, now: Instant) -> bool {
+        self.pending
+            .is_some_and(|(_, at)| now.duration_since(at) >= GYRO_VERIFY_AFTER)
+    }
+
+    /// Judge a readback (`None` = the read failed). A failed read inside the
+    /// give-up window keeps the readback owed and says nothing yet.
+    fn settle(&mut self, after: Option<f64>, now: Instant) -> Option<GyroSyncOutcome> {
+        let (before, at) = self.pending?;
+        let outcome = match after {
+            Some(after) if gyro_sync_took(before, after) => GyroSyncOutcome::Took { before, after },
+            Some(after) => {
+                self.ineffective = true;
+                GyroSyncOutcome::DidNotTake { before, after }
+            }
+            None if now.duration_since(at) >= GYRO_VERIFY_GIVE_UP => {
+                GyroSyncOutcome::Unmeasured { before }
+            }
+            None => return None,
+        };
+        self.pending = None;
+        Some(outcome)
+    }
 }
 
 /// Flaps extended above their speed limit (Vfe) — the per-detent limits from the
@@ -5583,6 +5717,85 @@ mod tests {
         s.engine_running = true;
         s.fuel_kg = None;
         assert!(c.eval(&s).is_none());
+    }
+
+    #[test]
+    fn gyro_sync_took_needs_the_drift_to_fall() {
+        // A real sync zeroes the drift.
+        assert!(gyro_sync_took(13.0, 0.2));
+        assert!(gyro_sync_took(-12.0, 1.0));
+        // The stock 737 (LEBL-LFBD 2026-09-27): accepted, nothing moved.
+        assert!(!gyro_sync_took(11.8, 11.8));
+        assert!(!gyro_sync_took(11.8, 11.9));
+        assert!(!gyro_sync_took(15.6, 15.6));
+        // A token dent is not a sync.
+        assert!(!gyro_sync_took(12.0, 9.0));
+    }
+
+    #[test]
+    fn gyro_sync_says_only_what_it_read_back() {
+        let t0 = Instant::now();
+        let mut g = GyroSync::default();
+        assert!(!g.due(5.0, t0), "under the advisory");
+        assert!(g.due(11.8, t0));
+        g.last = Some(t0);
+        g.fired(11.8, t0);
+        assert!(!g.due(11.8, t0), "readback owed");
+        assert!(!g.verify_due(t0 + Duration::from_millis(500)));
+        let t1 = t0 + GYRO_VERIFY_AFTER;
+        assert!(g.verify_due(t1));
+        // A failed read is no measurement: still owed, nothing said.
+        assert_eq!(g.settle(None, t1), None);
+        assert!(g.verify_due(t1));
+        // The 737's readback: the drift did not move. Silent, latched.
+        assert_eq!(
+            g.settle(Some(11.9), t1),
+            Some(GyroSyncOutcome::DidNotTake {
+                before: 11.8,
+                after: 11.9
+            })
+        );
+        assert!(!g.verify_due(t1));
+        // Fourteen calls in the sortie; now none, whatever the drift does.
+        for k in 1..=14u32 {
+            let t = t0 + GYRO_SYNC_COOLDOWN * k;
+            assert!(!g.due(11.8 + 0.3 * f64::from(k), t), "latched at {k}");
+        }
+        // A swap resets it (the loop builds a fresh one).
+        g = GyroSync::default();
+        assert!(g.due(15.6, t0));
+    }
+
+    #[test]
+    fn gyro_sync_that_took_is_said_and_can_come_again() {
+        let t0 = Instant::now();
+        let mut g = GyroSync::default();
+        g.last = Some(t0);
+        g.fired(-13.0, t0);
+        let t1 = t0 + GYRO_VERIFY_AFTER;
+        assert_eq!(
+            g.settle(Some(0.1), t1),
+            Some(GyroSyncOutcome::Took {
+                before: -13.0,
+                after: 0.1
+            })
+        );
+        assert!(!g.due(12.0, t1), "cooldown");
+        assert!(g.due(12.0, t0 + GYRO_SYNC_COOLDOWN));
+    }
+
+    #[test]
+    fn gyro_sync_unread_gives_up_without_latching() {
+        let t0 = Instant::now();
+        let mut g = GyroSync::default();
+        g.last = Some(t0);
+        g.fired(12.0, t0);
+        let late = t0 + GYRO_VERIFY_GIVE_UP;
+        assert_eq!(
+            g.settle(None, late),
+            Some(GyroSyncOutcome::Unmeasured { before: 12.0 })
+        );
+        assert!(g.due(12.0, t0 + GYRO_SYNC_COOLDOWN), "not latched");
     }
 
     #[test]

@@ -159,7 +159,9 @@ Read first, left alone in state, read back, named when not taken, one milestone 
 machine over conditions (powered AND dark), one-shot per spell, never re-asserted (a watch that
 re-fires fights the pilot). "Off" only for lights it lit; the claim drops when the pilot moves the
 switch. INTERIOR lights only (test-enforced); sun hysteresis; above the `quiet` gate. Every light
-write goes through `tools::lights::apply`.
+write goes through `tools::lights::apply`. The DG auto-sync is said only when the drift READ BACK
+fell (`monitor::GyroSync`); one that does not take is silent and latched off per airframe (the
+stock 737 "re-synced" 14 times, 2026-09-27).
 
 ## SimBrief
 
