@@ -962,6 +962,14 @@ pub struct FakeXPlane {
     late_presses: std::sync::Mutex<std::collections::HashSet<usize>>,
     presses: std::sync::Mutex<usize>,
     held: std::sync::Mutex<Vec<(String, f64, bool)>>,
+    /// Every array element write, in order, as (dataref, index, value). The
+    /// flat `writes` log drops the index, which is the whole question for a
+    /// switch that is one element of a per-tank array.
+    index_writes: std::sync::Mutex<Vec<(String, usize, f64)>>,
+    /// Arrays whose element writes LAND in the preset read (a switch the sim
+    /// takes), so a readback after the write sees it. Opt-in: by default a
+    /// preset array stays as set, which is a switch that did not take.
+    live_arrays: std::sync::Mutex<std::collections::HashSet<String>>,
 }
 
 impl FakeXPlane {
@@ -975,6 +983,42 @@ impl FakeXPlane {
             late_presses: std::sync::Mutex::new(std::collections::HashSet::new()),
             presses: std::sync::Mutex::new(0),
             held: std::sync::Mutex::new(Vec::new()),
+            index_writes: std::sync::Mutex::new(Vec::new()),
+            live_arrays: std::sync::Mutex::new(std::collections::HashSet::new()),
+        }
+    }
+
+    /// Make element writes to `name` land in its preset array read.
+    pub fn apply_array_writes(&self, name: &str) {
+        self.live_arrays.lock().unwrap().insert(name.to_string());
+    }
+
+    /// Every element written to `name`, in order, as (index, value).
+    pub fn index_writes(&self, name: &str) -> Vec<(usize, f64)> {
+        self.index_writes
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(n, _, _)| n == name)
+            .map(|(_, i, v)| (*i, *v))
+            .collect()
+    }
+
+    fn note_index_write(&self, name: &str, index: usize, value: f64) {
+        self.index_writes
+            .lock()
+            .unwrap()
+            .push((name.to_string(), index, value));
+        if self.live_arrays.lock().unwrap().contains(name) {
+            if let Some(slot) = self
+                .array_reads
+                .lock()
+                .unwrap()
+                .get_mut(name)
+                .and_then(|a| a.get_mut(index))
+            {
+                *slot = value;
+            }
         }
     }
 
@@ -1158,15 +1202,17 @@ impl XPlane for FakeXPlane {
             .map(|v| vec![*v])
             .unwrap_or_default())
     }
-    async fn set_int_array_elem(&self, name: &str, _index: usize, value: i64) -> Result<()> {
+    async fn set_int_array_elem(&self, name: &str, index: usize, value: i64) -> Result<()> {
         self.writes
             .lock()
             .unwrap()
             .push((name.to_string(), value as f64));
+        self.note_index_write(name, index, value as f64);
         Ok(())
     }
-    async fn set_float_array_elem(&self, name: &str, _index: usize, value: f64) -> Result<()> {
+    async fn set_float_array_elem(&self, name: &str, index: usize, value: f64) -> Result<()> {
         self.writes.lock().unwrap().push((name.to_string(), value));
+        self.note_index_write(name, index, value);
         Ok(())
     }
 }

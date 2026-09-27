@@ -42,6 +42,16 @@ carb_heat: false
 fuel_pump: false
 directional_gyro: false # IRS-aligned, no vacuum DG to sync
 
+# The CENTRE tank's pumps come off when it is empty (tools/fuel_pumps.rs).
+# The stock `fuel_tank_pump_on` is the switch itself: the overhead's pump
+# switches animate straight from elements 0..2 (cockpit_overhead.obj), and the
+# xlua writes it only at flight start (md80__init) and at the boarding step
+# that switches all three on (md80_auto_board_start), as does our power_up.
+# Tank 0 is the centre on this airframe (acf `_tank_name/0 Center`,
+# `_tank_xyz/0,0` 0; the wings 25.4 ft either side). Read from the files
+# 2026-09-27, not yet probed live.
+fuel_tank_pumps_off_when_empty: [0]
+
 # Electrical: battery, two engine generators, avionics, and an "all"/master that
 # brings the lot up ("all electrical systems on"). Actions fire the standard
 # X-Plane electrical commands (Laminar's own aircraft respond to them); readback

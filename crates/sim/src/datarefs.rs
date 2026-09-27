@@ -52,6 +52,13 @@ pub const TOTAL_WEIGHT_KG: &str = "sim/flightmodel/weight/m_total";
 /// Per-tank fuel mass (kg), one element per tank. For a 2-tank single it's
 /// `[left, right]`. Read as an array (not cached); used for the balance callout.
 pub const FUEL_PER_TANK_KG: &str = "sim/flightmodel/weight/m_fuel";
+/// Per-tank boost pump switch, one element per tank (0/1). The stock 737's
+/// and the MD-82's cockpit switch itself; the A330's is an OUTPUT of its own
+/// buttons. Written only by the crew's `fuel_pumps` tool.
+pub const FUEL_TANK_PUMP_ON: &str = "sim/cockpit2/fuel/fuel_tank_pump_on";
+/// Each tank's lateral position, m, one element per tank: zero is a
+/// centreline tank.
+pub const FUEL_TANK_LATERAL_M: &str = "sim/aircraft/overflow/acf_tank_X";
 /// Per-engine fuel flow, kg/sec, one element per engine. Summed × 3600 gives the
 /// live burn rate (kg/hr) for an endurance answer; ~0 with engines off.
 pub const FUEL_FLOW_KG_SEC: &str = "sim/cockpit2/engine/indicators/fuel_flow_kg_sec";

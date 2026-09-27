@@ -21,6 +21,7 @@ pub mod cycle;
 pub mod electrical;
 pub mod engine;
 pub mod flaps;
+pub mod fuel_pumps;
 pub mod full_auto;
 pub mod gear;
 pub mod ground;
@@ -545,6 +546,12 @@ impl Registry {
                 engines: profile.engines,
             }));
         }
+
+        // The centre tank pumps: registered on every airframe so "centre
+        // pumps off" on one without them is answered, not a silent miss.
+        tools.push(Box::new(fuel_pumps::SetCentrePumps {
+            declared: profile.fuel_tank_pumps_off_when_empty.clone(),
+        }));
 
         if profile.fuel_pump || profile.fuel_pump_commands.is_some() {
             tools.push(Box::new(engine::SetFuelPump {

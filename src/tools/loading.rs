@@ -35,7 +35,7 @@ const GROUNDSPEED_MS: &str = "sim/flightmodel/position/groundspeed";
 const MATCH_FRAC: f64 = 0.01;
 const MATCH_KG: f64 = 2.0;
 /// A tank this far off the centreline is a wing tank.
-const WING_TANK_M: f64 = 0.1;
+pub(crate) const WING_TANK_M: f64 = 0.1;
 
 fn matches(actual: f64, want: f64) -> bool {
     (actual - want).abs() <= MATCH_KG.max(want * MATCH_FRAC)

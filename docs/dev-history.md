@@ -7867,3 +7867,55 @@ moved, each with the same vague line.
   describes; removed. No other profile's schedule contradicts its comment.
 
 NOT flown.
+
+## 2026-09-27: centre tank pumps come off when the centre is dry
+
+The pilot found both CTR LOW PRESSURE lights lit on the stock 737 with the
+engines running. Probed live: `sim/flightmodel/weight/m_fuel` `[2916.8, 0.0,
+2918.1]` (tank 1, the centre, empty; `acf_tank_rat` `[0.187, 0.626, 0.187]`)
+and `sim/cockpit2/fuel/fuel_tank_pump_on` `[1, 1, 1]`. The pilot switched CTR
+off, element 1 read 0 and `laminar/B738/annunciator/low_fuel_press_c1`/`_c2`
+went out: the stock array IS the cockpit switch on this airframe. The xlua:
+`B738.Z.autostart.lua` step 4 switches the CTR pumps ON whatever the centre
+holds (before either engine turns), `B738.systems.lua:3248` writes 0 only at
+cold and dark, nothing rewrites it per frame. Our side never touched it, and
+the load sheet fills the wings first (`loading::distribute_fuel`), so every
+sector that fits in the wings flew its whole length with the pumps dry.
+(Laminar's own lights come on below 625/640 kg in the centre, so a light can
+be lit over fuel that still feeds; the rule below waits for empty.)
+
+- Profile: `fuel_tank_pumps_off_when_empty: [..]`, tank indices of the stock
+  array; silent = off. `aircraft::profile_references` adds the three names
+  the declaration relies on (pump switch, `m_fuel`, `acf_tank_X`), since the
+  field itself is only numbers. Declared: the 737 `[1]`; the MD-82 `[0]`
+  (overhead switches animate straight from the stock elements, the xlua writes
+  it only at flight start and the boarding step; tank 0 is "Center" at x 0;
+  read from the files, not probed live). Not declared: the A330 (its
+  `A333.systems.lua:2113` rewrites element 1 from its own two CTR buttons, the
+  stock array is an output there), the Sparky 747 (its xtlua runs its own
+  pump model and never touches the stock array).
+- A main tank is never touched: `fuel_pumps::is_centre_tank` honours a
+  declared tank only when `acf_tank_X` puts it on the centreline (0.1 m, the
+  load sheet's rule) with wing tanks beside it; a wrong declaration is logged
+  (blackbox `fuel_pumps` `rejected`) and ignored, never written. A single-tank
+  airframe's centreline tank is its main.
+- One decision, pure: `fuel_pumps::pumps_to_switch_off` (pump on AND tank
+  `<= EMPTY_TANK_KG` 5 kg AND an engine running; a failed read of any array
+  is no measurement). The monitor's `centre_tank_dry` check (sustained 5 s)
+  is the altimeter's shape: an automation flying switches them off through
+  `fix_write` (dispatched to `fuel_pumps::switch_pumps`, the one writer,
+  read back, a switch that did not take said), a pilot flying hears it once
+  per episode and nothing is written. Full auto needs no step of its own: the
+  monitor runs on the ground and `automation_flying` includes
+  `full_auto::ACTIVE`, so the fix lands within seconds of the start.
+- Spoken: "centre pumps off" / "center pumps on" / "turn off the centre
+  pumps" is `set_centre_pumps`, registered on every airframe so one without
+  them answers why. Off is refused with the kilos while the centre holds fuel
+  (its pumps are what feeds it); on is allowed whatever it holds.
+- One writer: the MD-82 `power_up` switched all three pumps on with raw
+  writes; it now goes through `fuel_pumps::switch_pumps` too. `set_fuel_pump`
+  writes the ENGINE pump array, the Twin Otter override fires commands.
+- Blackbox `fuel_pumps`: `switched` (source monitor | pilot | power_up; tank,
+  kg, before, after, took), `advised`, `rejected`. Offline only; the proof is
+  a 737 start at a stand on a wings-only load, a `switched` record from the
+  monitor for tank 1 within seconds of both engines running.

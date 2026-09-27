@@ -152,6 +152,10 @@ Read first, left alone in state, read back, named when not taken, one milestone 
   full-auto mission (an airborne resume too) and at the cabin-altitude callout; past the warning
   band a flying follower is handed 10,000 ft. A TOGGLE oxygen button fires only when it reads off,
   and the valve behind it is written too (a hypoxic climb, 2026-09-24).
+- **Centre tank pumps** (`src/tools/fuel_pumps.rs`, `fuel_tank_pumps_off_when_empty:`): an empty
+  centre with its pumps on and an engine running is switched off by the monitor's
+  `centre_tank_dry` with an automation flying, advised once with a pilot flying (the altimeter's
+  shape); a main tank never, by `acf_tank_X` (the 737's start pumped a dry centre, 2026-09-27).
 - **Seat belt signs** (`src/tools/signs.rs`): on before anything turns, off through ten thousand,
   on again through it and for the arrival; an add-on's own switch is declared (`seat_belt_signs:`).
 
@@ -285,7 +289,7 @@ everything blackboxes to `logs/blackbox.jsonl` (kinds: `atc`, `autotaxi`, `autot
 `pushback`, `checklist`, `taxi_guide`, `cockpit_auto`, `full_auto`, `circuit`, `procedure`,
 `cabin`, `instructor`, `loading`, `turbine_start`, `heli_start`, `hover`, `heli_circuit`,
 `heli_route`, `rapport`, `cabin_air`, `api_load`, `plan_audit`, `handover`, `start_item`,
-`sim_radio`).
+`sim_radio`, `fuel_pumps`).
 
 ### Holding, writers, reads
 - **A stage not moving the aircraft is holding it**: brakes for every wait, abort and give-up. **A

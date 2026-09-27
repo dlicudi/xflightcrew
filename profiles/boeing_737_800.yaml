@@ -161,6 +161,15 @@ carb_heat: false
 fuel_pump: false
 directional_gyro: false
 
+# The CTR tank's pumps come off when the centre is empty (tools/fuel_pumps.rs).
+# The stock `fuel_tank_pump_on` IS the cockpit switch here: probed live
+# 2026-09-27, the pilot switched CTR off and element 1 read 0 with both CTR
+# LOW PRESSURE lights out. B738.Z.autostart.lua step 4 switches it ON over an
+# empty centre and B738.systems.lua writes 0 only at cold and dark; nothing
+# rewrites it per frame. Tank 1 is the centre (acf `_tank_name/1 Center`,
+# `_tank_xyz/1,0` 0), the wings 23 ft either side.
+fuel_tank_pumps_off_when_empty: [1]
+
 # Electrical on the stock commands (only `battery_1_off` is replaced, and by
 # the aircraft's own handler). Readbacks are the stock switch datarefs. VERIFY.
 electrical:

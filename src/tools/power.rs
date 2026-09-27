@@ -27,7 +27,6 @@ const BLEED_NEEDLE: &str = "laminar/md82/bleedair/bleedair_needle";
 const XTIE_L: &str = "laminar/md82/electrical/cross_tie_APU_L";
 const XTIE_R: &str = "laminar/md82/electrical/cross_tie_APU_R";
 const START_PUMP: &str = "sim/cockpit2/engine/actuators/fuel_pump_on"; // [0] = aux start pump
-const TANK_PUMP: &str = "sim/cockpit2/fuel/fuel_tank_pump_on"; // [0]=ctr [1]=L [2]=R
 
 // ... and the controls that drive them.
 const CMD_BATTERY: &str = "sim/electrical/battery_1_on";
@@ -160,9 +159,10 @@ pub(crate) async fn run_prep(
     wait_until(xp, BLEED_NEEDLE, 30, |v| v > 2.0).await;
     pause().await;
 
-    // 5. Boost pumps on (centre, left, right tanks).
-    for i in 0..3 {
-        xp.set_int_array_elem(TANK_PUMP, i, 1).await.ok();
-    }
+    // 5. Boost pumps on (centre, left, right tanks), through the one writer
+    // of the tank pump array (the monitor switches an empty centre off there
+    // once the engines run).
+    let pumps = super::fuel_pumps::switch_pumps(xp, &[0, 1, 2], true).await;
+    super::fuel_pumps::record("switched", "power_up", &pumps);
     say(voice, status, "Fuel pumps on. Electrical systems up.");
 }

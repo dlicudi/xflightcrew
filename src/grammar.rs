@@ -2306,6 +2306,17 @@ fn parse_one(t: &str) -> Option<ToolCall> {
         ));
     }
 
+    // The centre tank pumps ("centre pumps off", "turn off the center
+    // pumps", "ctr pumps on"): before the fuel pump rule, which would take
+    // "centre fuel pumps" to the engine boost pumps.
+    if (has(t, "centre") || has(t, "center") || has(t, "ctr"))
+        && (has(t, "pump") || has(t, "pumps"))
+    {
+        if let Some(on) = onoff(t) {
+            return Some(call("set_centre_pumps", json!({ "on": on })));
+        }
+    }
+
     // <system> on/off
     if let Some(on) = onoff(t) {
         for (kw, key) in [
@@ -4174,6 +4185,25 @@ mod tests {
         // ...but the pump keeps its own tool, and a bare quantity mention parses
         // as nothing here (stays a question for the fuel report).
         assert_eq!(one("switch fuel pump on").unwrap().0, "set_fuel_pump");
+        // The centre tank pumps: the 737's CTR pumps left running dry over an
+        // empty centre (2026-09-27). Their own tool, never the boost pumps'.
+        for (said, on) in [
+            ("Centre pumps off.", false),
+            ("center pumps off", false),
+            ("turn off the centre pumps", false),
+            ("Turn the center fuel pumps off.", false),
+            ("switch the CTR pumps off", false),
+            ("centre pumps on", true),
+            ("Center pumps on.", true),
+        ] {
+            assert_eq!(
+                one_on("boeing_737_800", said),
+                Some(("set_centre_pumps".into(), json!({ "on": on }))),
+                "{said}"
+            );
+        }
+        // Registered everywhere, so the 172 answers why it cannot.
+        assert_eq!(one("centre pumps off").unwrap().0, "set_centre_pumps");
         assert!(one("how much fuel do we have").is_none());
         assert_eq!(
             one("strobes off").unwrap().1,
