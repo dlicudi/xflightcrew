@@ -152,6 +152,25 @@ static void WriteVoiceList(void*, void* in, int offset, int len) {
     g_voice_list.len = len;
 }
 
+// Text settings (the registry's free-text knobs: callsign, airline
+// telephony). App to plugin, `xcopilot/opt/text`: one row per knob,
+// "key|label|pinned_env|value|notice|help", '\n'-separated, republished every
+// few seconds (a reload zeroes it). Plugin to app, `xcopilot/opt/text_edit`:
+// "key=value" lines written on Enter or focus loss, consumed by the app with
+// a single NUL (the typed line's protocol); an edit made before the app
+// polled is appended, not dropped.
+static TextRef g_opt_text = {{0}, 0};
+static XPLMDataRef g_opt_text_dref = nullptr;
+static void WriteOptText(void* ref, void* in, int offset, int len) {
+    StoreText(static_cast<TextRef*>(ref), in, offset, len);
+}
+static TextRef g_opt_text_edit = {{0}, 0};
+static XPLMDataRef g_opt_text_edit_dref = nullptr;
+static void WriteOptTextEdit(void* ref, void* in, int offset, int len) {
+    StoreText(static_cast<TextRef*>(ref), in, offset, len);
+    if (g_opt_text_edit.buf[0] == '\0') g_opt_text_edit.len = 0;
+}
+
 // ---- status datarefs --------------------------------------------------------
 
 static int g_phase = 0;
@@ -190,6 +209,13 @@ static TextRef g_loadsheet = {{0}, 0};
 // model and duty engine), written by the app, read by the panel.
 static TextRef g_brief = {{0}, 0};
 static TextRef g_state = {{0}, 0};
+// The Settings tab's resolved callsign under its field: "spoken|source"
+// (source override, simbrief or tail), refreshed by the app.
+static TextRef g_callsign = {{0}, 0};
+static XPLMDataRef g_callsign_dref = nullptr;
+static void WriteCallsign(void* ref, void* in, int offset, int len) {
+    StoreText(static_cast<TextRef*>(ref), in, offset, len);
+}
 
 static XPLMDataRef g_phase_dref = nullptr;
 static XPLMDataRef g_heard_dref = nullptr;
@@ -1070,6 +1096,19 @@ void start() {
         "xcopilot/typed", xplmType_Data, 1,
         nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
         nullptr, nullptr, nullptr, nullptr, ReadText, WriteTyped, &g_typed, &g_typed);
+    g_opt_text_dref = XPLMRegisterDataAccessor(
+        "xcopilot/opt/text", xplmType_Data, 1,
+        nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
+        nullptr, nullptr, nullptr, nullptr, ReadText, WriteOptText, &g_opt_text, &g_opt_text);
+    g_opt_text_edit_dref = XPLMRegisterDataAccessor(
+        "xcopilot/opt/text_edit", xplmType_Data, 1,
+        nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
+        nullptr, nullptr, nullptr, nullptr, ReadText, WriteOptTextEdit,
+        &g_opt_text_edit, &g_opt_text_edit);
+    g_callsign_dref = XPLMRegisterDataAccessor(
+        "xcopilot/status/callsign", xplmType_Data, 1,
+        nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
+        nullptr, nullptr, nullptr, nullptr, ReadText, WriteCallsign, &g_callsign, &g_callsign);
     g_com1_dref = XPLMFindDataRef("sim/cockpit2/radios/actuators/com1_frequency_hz_833");
     g_psi_dref = XPLMFindDataRef("sim/flightmodel/position/psi");
     g_taxi_brake_dref = XPLMRegisterDataAccessor(
@@ -1199,6 +1238,9 @@ void stop_first() {
     if (g_steer_brake_l_dref) { XPLMUnregisterDataAccessor(g_steer_brake_l_dref); g_steer_brake_l_dref = nullptr; }
     if (g_steer_brake_r_dref) { XPLMUnregisterDataAccessor(g_steer_brake_r_dref); g_steer_brake_r_dref = nullptr; }
     if (g_typed_dref) { XPLMUnregisterDataAccessor(g_typed_dref); g_typed_dref = nullptr; }
+    if (g_opt_text_dref) { XPLMUnregisterDataAccessor(g_opt_text_dref); g_opt_text_dref = nullptr; }
+    if (g_opt_text_edit_dref) { XPLMUnregisterDataAccessor(g_opt_text_edit_dref); g_opt_text_edit_dref = nullptr; }
+    if (g_callsign_dref) { XPLMUnregisterDataAccessor(g_callsign_dref); g_callsign_dref = nullptr; }
     if (g_opt_ui_scale_dref) { XPLMUnregisterDataAccessor(g_opt_ui_scale_dref); g_opt_ui_scale_dref = nullptr; }
     if (g_loadsheet_dref) { XPLMUnregisterDataAccessor(g_loadsheet_dref); g_loadsheet_dref = nullptr; }
     if (g_brief_dref) { XPLMUnregisterDataAccessor(g_brief_dref); g_brief_dref = nullptr; }
@@ -1281,6 +1323,23 @@ void set_typed(const char* text) {
     std::memset(g_typed.buf, 0, sizeof g_typed.buf);
     std::strncpy(g_typed.buf, text, sizeof g_typed.buf - 1);
     g_typed.len = static_cast<int>(std::strlen(g_typed.buf));
+}
+const TextRef& opt_text() { return g_opt_text; }
+const TextRef& callsign_status() { return g_callsign; }
+bool send_text_edit(const char* key, const char* value) {
+    char line[sizeof g_opt_text_edit.buf];
+    int n = std::snprintf(line, sizeof line, "%s=%s", key, value);
+    if (n < 0 || n >= static_cast<int>(sizeof line)) return false;
+    // Append behind an edit the app has not consumed yet; one that does not
+    // fit is refused rather than truncated.
+    int at = g_opt_text_edit.len;
+    int need = at + (at > 0 ? 1 : 0) + n;
+    if (need >= static_cast<int>(sizeof g_opt_text_edit.buf)) return false;
+    if (at > 0) g_opt_text_edit.buf[at++] = '\n';
+    std::memcpy(g_opt_text_edit.buf + at, line, static_cast<size_t>(n));
+    g_opt_text_edit.len = at + n;
+    g_opt_text_edit.buf[g_opt_text_edit.len] = '\0';
+    return true;
 }
 int opt_voice() { return g_opt_voice; }
 void set_opt_voice(int v) { g_opt_voice = v; }

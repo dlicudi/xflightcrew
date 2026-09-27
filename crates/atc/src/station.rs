@@ -9767,6 +9767,68 @@ mod tests {
         *HANDOFF.lock().unwrap_or_else(|e| e.into_inner()) = None;
     }
 
+    /// A virtual airline the tables do not know is spoken by the pilot's own
+    /// telephony (the setting `airline_telephony`, "WAT=Walker", reaching the
+    /// crate through its provider): SimBrief's WAT2516 is "Walker two five one
+    /// six" to the tower, and "Walker 2516, request taxi" is ours keyed and
+    /// unkeyed (Walker Air was spelled "Whiskey Alpha Tango", 2026-09-27).
+    #[test]
+    fn a_pilots_telephony_is_spoken_and_addressed() {
+        let _guard = SIDE_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        crate::callsign::provide_telephony(|| "wat=Walker; junk".to_string());
+        let path = lxgb_apt_file();
+        let wx = Wx {
+            wind_from_deg: 250.0,
+            wind_kts: 12.0,
+        };
+        let mut st = Station::load(path.to_str().unwrap(), "LXGB").expect("LXGB loads");
+        let mut ctx = scripted_ctx(&mut st, wx);
+        let inputs = crate::callsign::Inputs {
+            override_id: None,
+            plan: Some(crate::callsign::PlanCallsign {
+                id: "WAT2516".into(),
+                plan_type: "B738".into(),
+                also_types: Vec::new(),
+            }),
+        };
+        let r = crate::callsign::resolve(&inputs, Some("G-EUPT"), Some("B738"), Some(79_000.0))
+            .expect("a callsign");
+        assert_eq!(r.source, crate::callsign::Source::Simbrief);
+        ctx.callsign = r.spoken;
+        assert_eq!(ctx.callsign, "Walker two five one six");
+
+        let r = st
+            .route_unkeyed("Walker 2516, request taxi", Service::Tower, &ctx, wx)
+            .expect("our callsign addresses the tower");
+        assert!(r.starts_with("Walker two five one six"), "{r}");
+        assert!(r.contains("holding point"), "{r}");
+        assert!(
+            st.route_unkeyed("Walker 2517, ready to taxi", Service::Tower, &ctx, wx)
+                .is_none(),
+            "another flight's number is not ours"
+        );
+
+        let mut st = Station::load(path.to_str().unwrap(), "LXGB").expect("LXGB loads");
+        let r = st.route_keyed(
+            "walker two five one six, request taxi",
+            Service::Tower,
+            &ctx,
+            wx,
+        );
+        assert!(r.starts_with("Walker two five one six"), "{r}");
+        assert!(r.contains("holding point"), "{r}");
+
+        *crate::party_line::CALLSIGN_TELEPHONY
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = None;
+        assert_eq!(
+            crate::callsign::spoken_id("WAT2516"),
+            "Whiskey Alpha Tango two five one six",
+            "without the setting, spelled as before"
+        );
+        *HANDOFF.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    }
+
     #[test]
     fn readback_discipline_runs_through_the_keyed_route() {
         let _guard = SIDE_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());

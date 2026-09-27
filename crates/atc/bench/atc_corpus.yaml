@@ -450,3 +450,10 @@
 - {text: "Gibraltar Tower, Speedbird 306, ready for departure", intent: request_takeoff, radio: true, callsign: "Speedbird three zero six"}
 - {text: "Speedbird 307, ready to taxi", intent: request_taxi, radio: false, callsign: "Speedbird three zero six"}
 - {text: "we're speedbird today, ready to taxi", intent: request_taxi, radio: false, callsign: "Speedbird three zero six"}
+# A virtual airline by the pilot's own telephony (setting airline_telephony
+# "WAT=Walker": SimBrief's WAT2516 is "Walker two five one six").
+- {text: "Walker 2516, ready to taxi", intent: request_taxi, radio: true, callsign: "Walker two five one six"}
+- {text: "walker two five one six, ready to taxi.", intent: request_taxi, radio: true, callsign: "Walker two five one six"}
+- {text: "Walker 25 16, ready to taxi", intent: request_taxi, radio: true, callsign: "Walker two five one six"}
+- {text: "Walker 2517, ready to taxi", intent: request_taxi, radio: false, callsign: "Walker two five one six"}
+- {text: "walker, ready to taxi", intent: request_taxi, radio: false, callsign: "Walker two five one six"}

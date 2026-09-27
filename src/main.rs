@@ -115,7 +115,8 @@ use plan::{
     PLAN_ASK_WINDOW,
 };
 use pollers::{
-    spawn_panel_request_poller, spawn_settings_poller, spawn_voice_picker, DR_OPT_SNAP, DR_OPT_TONE,
+    spawn_panel_request_poller, spawn_settings_poller, spawn_text_settings_poller,
+    spawn_voice_picker, DR_OPT_SNAP, DR_OPT_TONE,
 };
 #[cfg(test)]
 use router::has_number;
@@ -199,6 +200,9 @@ async fn main() -> Result<()> {
     // The station's callsign resolver asks the crew for the override and the
     // plan's callsign through this provider, read fresh each time.
     callsign::provide_inputs(circuit::callsign_inputs);
+    // ...and the pilot's own airline telephony ("WAT=Walker"), asked before
+    // its built-in tables, the same way.
+    callsign::provide_telephony(settings::airline_telephony);
 
     // Initial app mode: explicit env > the panel's saved pick > both. The
     // panel's Settings tab can change it live from here on (mode.rs).
@@ -492,6 +496,9 @@ async fn main() -> Result<()> {
     // The panel's Settings-tab toggles (app mode, cabin-crew staffing):
     // publish the current values, apply picks live, persist to prefs.
     spawn_settings_poller(config.xplane_base_url.clone());
+    // ...and its text fields (callsign, airline telephony), through the
+    // registry: env-pinned ones are shown read-only, edits persist.
+    spawn_text_settings_poller(config.xplane_base_url.clone());
 
     // In-sim status panel (the bundled plugin): mirror phase/heard/action into its
     // datarefs. Best-effort — a no-op if the plugin isn't loaded.

@@ -8563,3 +8563,64 @@ swing away is stopped at once). Next push, check: `aligned` {err, rate,
 rest}, `stopped` {err, hdg, swinging}, the `state` heading after it (within
 a few degrees of `rest`), `stop_ignored` if not; `push` ticks now carry
 `rate`. Offline only.
+
+## 2026-09-27: text settings, the callsign on the panel, the pilot's airline telephony
+
+The pilot flies a virtual airline, Walker Air (SimBrief callsign WAT2516,
+telephony "Walker"). WAT is in no built-in table, so the resolver spelled it
+"Whiskey Alpha Tango two five one six"; and the callsign override was
+env/prefs only, because the Settings registry had no text fields.
+
+- **A text kind in the registry** (`settings::Kind::Text { max_len }`,
+  `Value::Text`): one line, no control characters, a pasted em or en dash made
+  a hyphen; rendered "(none)" when blank; stored raw. Env > pref > default as
+  every knob (`settings::apply_saved`, the boot path's middle rung, now a
+  function); an env-pinned one is refused naming its variable. A text knob is
+  persisted as READ BACK (`set` stores `s.value()`), so prefs.json and the
+  panel show what is in force, not what was typed.
+- Two knobs: `callsign` (`XCOPILOT_CALLSIGN`; the hand-rolled boot path in
+  `settings::install` is gone, the resolver's provider still reads
+  `settings::live().callsign`; letters, digits, spaces, hyphens) and
+  `airline_telephony` (`XCOPILOT_AIRLINE_TELEPHONY`, `Config.airline_telephony`):
+  `WAT=Walker; XYZ=Zulu Air`, `;` or `,`, 3-letter codes in any case, bad
+  entries ignored, the last word on a code wins (`callsign::parse_telephony`,
+  `telephony_text`); something typed with nothing readable is refused, not a
+  silent wipe.
+- **The atc crate asks the pilot's table first**: `spoken_id_with` /
+  `spoken_ghost_with` take it (pure, tested), `spoken_id` / `spoken_ghost` ask
+  a second crew provider on the party line (`party_line::CALLSIGN_TELEPHONY`,
+  registered by `callsign::provide_telephony(settings::airline_telephony)`; the
+  `atc` binary registers one over the env var). Read when a callsign is spoken,
+  so an edit applies to the next transmission, ghosts included. "WAT2516" is
+  "Walker two five one six", the digits grouped as the built-ins group them; a
+  pilot's entry overrides a built-in ("BAW=Shuttle").
+- **Panel** (Settings tab, "Radio", shown in every mode): one field per text
+  knob from `xcopilot/opt/text` (app to plugin, rows
+  `key|label|pinned_env|value|notice|help`, on change and every 5 s:
+  `pollers::spawn_text_settings_poller`, `text_settings_payload`); an edit goes
+  back on Enter or focus loss, never per keystroke, as `key=value` lines on
+  `xcopilot/opt/text_edit` (consumed with a NUL, the typed line's protocol;
+  appended behind an unconsumed one), applied through `settings::set`
+  (`apply_text_edit`); a refusal comes back as a notice under the field. A
+  pinned knob is read-only, naming the variable. Under the callsign:
+  `xcopilot/status/callsign` "spoken|source", published by the monitor through
+  `callsign::live` every 5 s and at once after an edit
+  (`monitor::callsign_changed`); a failed read sends nothing.
+- **Terminal**: the Settings screen lists both; Right/Space on a text knob opens
+  its field in the bottom line (Enter saves through the registry, Esc cancels;
+  a pinned one says so).
+
+Tests: `a_telephony_setting_parses_defensively`,
+`the_pilots_telephony_comes_before_the_tables`,
+`a_pilots_telephony_is_spoken_and_addressed` (station, keyed and unkeyed,
+through the provider), corpus cases for "Walker 2516",
+`a_text_setting_is_env_then_pref_then_default`,
+`an_env_pinned_text_setting_refuses_the_edit`,
+`text_values_are_checked_before_they_apply`,
+`text_edits_split_at_the_first_equals`,
+`a_pinned_text_setting_is_published_read_only_and_refused`,
+`a_text_setting_opens_a_field_and_a_pinned_one_refuses`,
+`the_text_settings_datarefs_are_listed_and_registered`. Plugin built with
+`make -C plugin`, not installed. Next airline sortie: set `WAT=Walker` on the
+panel, check the `callsign` record says "Walker two five one six" and the
+tower answers "Walker 2516". Offline only.

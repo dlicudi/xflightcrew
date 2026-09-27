@@ -115,6 +115,8 @@ pub const PLUGIN_DATAREFS: &[&str] = &[
     "xcopilot/opt/mode",
     "xcopilot/opt/monitor_mute",
     "xcopilot/opt/negative_tone",
+    "xcopilot/opt/text",
+    "xcopilot/opt/text_edit",
     "xcopilot/opt/ui_scale",
     "xcopilot/opt/voice",
     "xcopilot/opt/voice_list",
@@ -135,6 +137,7 @@ pub const PLUGIN_DATAREFS: &[&str] = &[
     "xcopilot/status/auto",
     "xcopilot/status/brief",
     "xcopilot/status/callout",
+    "xcopilot/status/callsign",
     "xcopilot/status/coach",
     "xcopilot/status/heard",
     "xcopilot/status/loadsheet",
@@ -275,6 +278,26 @@ mod plugin_contract_tests {
 
     /// Every `"xcopilot/..."` literal in the workspace source is in
     /// [`PLUGIN_DATAREFS`], so a new dataref is probed the day it is added.
+    /// The panel's text settings ride three plugin datarefs: listed here (so
+    /// a stale plugin is said) and registered by the plugin's own source.
+    #[test]
+    fn the_text_settings_datarefs_are_listed_and_registered() {
+        let plugin =
+            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/plugin/src/drefs.cpp"))
+                .unwrap();
+        for name in [
+            "xcopilot/opt/text",
+            "xcopilot/opt/text_edit",
+            "xcopilot/status/callsign",
+        ] {
+            assert!(PLUGIN_DATAREFS.contains(&name), "{name}");
+            assert!(
+                plugin.contains(&format!("\"{name}\"")),
+                "{name} not registered"
+            );
+        }
+    }
+
     #[test]
     fn plugin_datarefs_list_every_literal_in_the_source() {
         fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {

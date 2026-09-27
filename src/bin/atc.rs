@@ -21,6 +21,7 @@
 //!   XCOPILOT_ATC_VOICE    macOS `say` voice for the station (default Daniel)
 //!   XCOPILOT_ATC_RATE     `say` words-per-minute (default 165, a read pace)
 //!   XCOPILOT_CALLSIGN     our callsign over the tail number ("BAW306")
+//!   XCOPILOT_AIRLINE_TELEPHONY  our airlines' radio names ("WAT=Walker")
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -149,6 +150,9 @@ fn main() -> Result<()> {
         .init();
 
     let config = Config::from_env()?;
+    // The pilot's airline telephony, asked before the built-in tables (the
+    // environment only: this process has no settings registry).
+    callsign::provide_telephony(|| env_or("XCOPILOT_AIRLINE_TELEPHONY", ""));
     let icao = env_or("XCOPILOT_ATC_AIRPORT", "LXGB").to_uppercase();
 
     tracing::info!(%icao, "scanning apt.dat for the airport (once, at startup)");

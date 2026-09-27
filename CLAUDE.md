@@ -229,7 +229,8 @@ Config: `XCOPILOT_ATC_AIRPORT` / `_VOICE` / `_RATE` / `_REGION`.
 - **A mishear may earn "say again", never a clearance.** Only mayday/pan-pan lands without a final.
 - **One callsign for tower and crew** (`atc::callsign::resolve`): `XCOPILOT_CALLSIGN` > the SimBrief
   plan's `atc/callsign` (only on the plan's type) > tail, heavy last; read through a crew provider,
-  never stored; a call naming it is addressed (blackbox `callsign`).
+  never stored; a call naming it is addressed (blackbox `callsign`). The pilot's own telephony
+  (`airline_telephony`, "WAT=Walker") is asked before the built-in tables, by a second provider.
 
 **Tower behaviours** (each one's sortie is in the history)
 - Readbacks enforced for runway-critical items (`XCOPILOT_ATC_READBACK=false` coaches only); the
@@ -709,7 +710,8 @@ every loop down.
   `fms::active_fix`. Native panel-graphics API (SDK 4.4.0; `plugin/src/imgui_xp.cpp`).
 - **The terminal is setup and diagnosis** (`src/ui.rs`, renders under `TestBackend`).
 - **Settings are a registry** (`src/settings.rs`, `Arc<Config>`, `settings::live()`): env > pref >
-  default; an env-pinned knob is REFUSED on screen, naming the variable.
+  default; an env-pinned knob is REFUSED on screen, naming the variable. Text knobs reach the panel
+  as rows on `xcopilot/opt/text`, edits come back on `xcopilot/opt/text_edit` (Enter or focus loss).
 - **Only settings persist** (`prefs.json`, env, geometry); a `mission.json` is parked. Never a state
   dump: persisted facts outlive their context.
 

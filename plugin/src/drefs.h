@@ -96,6 +96,13 @@ int opt_ui_scale();
 void set_opt_ui_scale(int v);
 // Hand a typed command to the app (xcopilot/typed; consumed by the app).
 void set_typed(const char* text);
+// Text settings: the app's rows ("key|label|pinned_env|value|notice|help",
+// '\n'-separated; see drefs.cpp) and the edit the panel sends back ("key=
+// value", appended behind an unconsumed one; false = it did not fit).
+const TextRef& opt_text();
+bool send_text_edit(const char* key, const char* value);
+// The resolved callsign for the Settings tab, "spoken|source" (empty = none yet).
+const TextRef& callsign_status();
 int opt_voice();
 void set_opt_voice(int v);
 int opt_cabin_voice();

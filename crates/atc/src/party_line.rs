@@ -81,6 +81,13 @@ pub(crate) static ARRIVAL_PIN: Mutex<Option<i64>> = Mutex::new(None);
 pub(crate) static CALLSIGN_INPUTS: Mutex<Option<fn() -> crate::callsign::Inputs>> =
     Mutex::new(None);
 
+/// The crew's provider of the pilot's own airline telephony
+/// (`callsign::provide_telephony`, registered once at boot): the raw setting
+/// ("WAT=Walker; XYZ=Zulu Air"), read at the moment a callsign is spoken so an
+/// edit applies to the next transmission. A function for the same reason as
+/// [`CALLSIGN_INPUTS`]: nothing here can go stale.
+pub(crate) static CALLSIGN_TELEPHONY: Mutex<Option<fn() -> String>> = Mutex::new(None);
+
 /// Set when the monitor speaks the released takeoff clearance; the main
 /// loop consumes it and syncs the tower FSM to what was said on frequency.
 pub(crate) static PENDING_TAKEOFF_CLEARANCE: Mutex<bool> = Mutex::new(false);

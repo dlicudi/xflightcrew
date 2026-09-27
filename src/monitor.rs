@@ -2547,6 +2547,8 @@ pub async fn run(
     let mut last_auto = String::new();
     let mut last_sheet = String::new();
     let mut auto_resend = 0u8;
+    // When the Settings tab's resolved callsign was last published.
+    let mut callsign_at: Option<Instant> = None;
 
     // Talk-down pacing: when the last callout went out, and whether we've
     // already handed over at the threshold (say it once, then shut up).
@@ -4152,6 +4154,18 @@ pub async fn run(
                     s.load_sheet(&sheet);
                     last_sheet = sheet;
                 }
+                // The Settings tab's resolved callsign under its field
+                // ("spoken|source"), through the one resolver: every 5 s
+                // (resent, since a plugin reload zeroes it) and at once after
+                // a callsign setting changed. A failed read sends nothing.
+                let due = CALLSIGN_STALE.swap(false, std::sync::atomic::Ordering::Relaxed)
+                    || callsign_at.map_or(true, |t| t.elapsed() >= Duration::from_secs(5));
+                if due {
+                    callsign_at = Some(Instant::now());
+                    if let Some(r) = crate::callsign::live(xp.view()).await {
+                        s.callsign(&format!("{}|{}", r.spoken, r.source.as_str()));
+                    }
+                }
                 if auto != last_auto || auto_resend == 0 {
                     s.auto_status(&auto);
                     last_auto = auto;
@@ -4850,6 +4864,15 @@ fn spoken_minutes(m: f64) -> String {
 /// and tower chose opposite ends of Exeter (2026-09-21). Above the `quiet`
 /// gate on purpose: an autoland in progress is exactly when the tower's wind
 /// matters.
+/// Set when a callsign setting changes, so the monitor republishes the
+/// resolved callsign on its next tick rather than within 5 s.
+static CALLSIGN_STALE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// A callsign setting changed (`settings`: `callsign`, `airline_telephony`).
+pub(crate) fn callsign_changed() {
+    CALLSIGN_STALE.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
 fn feed_surface_wind() {
     // Once a minute, and AT ONCE when the station changes: the wind held
     // until then is the last field's, filtered out as not this one's, and

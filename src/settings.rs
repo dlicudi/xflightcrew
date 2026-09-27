@@ -51,29 +51,33 @@ pub fn install(cfg: Config) -> Arc<Config> {
         if !matches!(s.persist, Persist::Map) || s.env_pinned() {
             continue;
         }
-        let Some(raw) = crate::prefs::setting(s.key) else {
-            continue;
-        };
-        match s.kind.parse(&raw) {
-            Some(v) => {
-                if !(s.apply)(&v) {
-                    tracing::warn!(key = s.key, value = %raw, "saved setting rejected; keeping the default");
-                }
-            }
-            None => {
-                tracing::warn!(key = s.key, value = %raw, "saved setting unreadable; keeping the default")
-            }
-        }
-    }
-    // The callsign override is free text, which the registry's screen cannot
-    // step, so it is not a registry knob: env > prefs.json `callsign` > none,
-    // the same precedence by hand.
-    if std::env::var("XCOPILOT_CALLSIGN").is_err() {
-        if let Some(cs) = crate::prefs::setting("callsign").filter(|c| !c.trim().is_empty()) {
-            update(|c| c.callsign = cs.trim().to_string());
-        }
+        apply_saved(s, crate::prefs::setting(s.key).as_deref());
     }
     live()
+}
+
+/// The middle rung of env > pref > default for one knob: apply a saved value
+/// unless the environment pins the knob. `true` = the saved value is now in
+/// force. An unreadable or rejected value keeps the default, said in the log.
+fn apply_saved(s: &Setting, saved: Option<&str>) -> bool {
+    if s.env_pinned() {
+        return false;
+    }
+    let Some(raw) = saved else {
+        return false;
+    };
+    match s.kind.parse(raw) {
+        Some(v) => {
+            if (s.apply)(&v) {
+                return true;
+            }
+            tracing::warn!(key = s.key, value = %raw, "saved setting rejected; keeping the default");
+        }
+        None => {
+            tracing::warn!(key = s.key, value = %raw, "saved setting unreadable; keeping the default")
+        }
+    }
+    false
 }
 
 /// Replace the live configuration with a modified copy. Copy-on-write, so a
@@ -86,12 +90,14 @@ pub fn update(f: impl FnOnce(&mut Config)) {
     *guard = Arc::new(next);
 }
 
-/// A setting's value, in the three shapes the registry supports.
+/// A setting's value, in the four shapes the registry supports.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Value {
     Bool(bool),
     Num(f64),
     Choice(String),
+    /// Free text: a callsign, a telephony table. Empty = none.
+    Text(String),
 }
 
 impl Value {
@@ -113,6 +119,12 @@ impl Value {
             _ => None,
         }
     }
+    pub fn as_text(&self) -> Option<&str> {
+        match self {
+            Value::Text(s) => Some(s.as_str()),
+            _ => None,
+        }
+    }
 }
 
 /// What a setting accepts, and how the screen renders and steps it.
@@ -127,6 +139,11 @@ pub enum Kind {
         unit: &'static str,
     },
     Choice(&'static [&'static str]),
+    /// One line of free text, at most `max_len` characters. The screen
+    /// cannot step it; the panel and the terminal edit it as a field.
+    Text {
+        max_len: usize,
+    },
 }
 
 impl Kind {
@@ -150,6 +167,23 @@ impl Kind {
                 .iter()
                 .find(|o| o.eq_ignore_ascii_case(raw))
                 .map(|o| Value::Choice((*o).to_string())),
+            Kind::Text { max_len } => {
+                // One line, no control characters, and no em or en dash (the
+                // panel font and the TTS choke on them): a pasted one becomes
+                // a hyphen rather than a refusal.
+                let text: String = raw
+                    .chars()
+                    .map(|c| {
+                        if matches!(c, '\u{2013}' | '\u{2014}') {
+                            '-'
+                        } else {
+                            c
+                        }
+                    })
+                    .collect();
+                (text.chars().count() <= *max_len && !text.chars().any(char::is_control))
+                    .then_some(Value::Text(text))
+            }
         }
     }
 
@@ -166,6 +200,8 @@ impl Kind {
                 }
             }
             (_, Value::Choice(s)) => s.clone(),
+            (Kind::Text { .. }, Value::Text(s)) if s.is_empty() => "(none)".to_string(),
+            (Kind::Text { .. }, Value::Text(s)) => s.clone(),
             // A mismatched pair can only come from a bad registry entry.
             (_, other) => format!("{other:?}"),
         }
@@ -176,6 +212,8 @@ impl Kind {
     fn store(&self, v: &Value) -> String {
         match (self, v) {
             (Kind::Num { decimals, .. }, Value::Num(n)) => format!("{n:.*}", *decimals),
+            // Raw, never the "(none)" the screen shows for an empty one.
+            (Kind::Text { .. }, Value::Text(s)) => s.clone(),
             _ => self.render(v),
         }
     }
@@ -282,13 +320,20 @@ pub fn set(key: &str, v: &Value) -> Result<(), String> {
         .find(|s| s.key == key)
         .ok_or_else(|| format!("no such setting: {key}"))?;
     if s.env_pinned() {
-        return Err(format!("pinned by {} — edit your .env", s.env));
+        return Err(format!("pinned by {}, edit your .env", s.env));
     }
     if !(s.apply)(v) {
         return Err(format!("{} did not accept that value", s.label));
     }
     if s.persist == Persist::Map {
-        crate::prefs::save_setting(s.key, &s.kind.store(v));
+        // Text is stored as it was READ BACK: a telephony table keeps only
+        // the entries that parsed, so prefs.json and the panel show what is
+        // in force, not what was typed.
+        let stored = match s.kind {
+            Kind::Text { .. } => s.kind.store(&s.value()),
+            _ => s.kind.store(v),
+        };
+        crate::prefs::save_setting(s.key, &stored);
     }
     tracing::info!(key = s.key, value = %s.kind.render(v), "setting changed");
     Ok(())
@@ -577,7 +622,65 @@ pub const ALL: &[Setting] = &[
             true
         },
     },
+    Setting {
+        key: "callsign",
+        env: "XCOPILOT_CALLSIGN",
+        label: "callsign",
+        help: "blank = the SimBrief plan's, then the tail; an id (BAW306, N172SP) or the words (Speedbird 306)",
+        kind: Kind::Text { max_len: 32 },
+        tier: Tier::Live,
+        persist: Persist::Map,
+        get: || Value::Text(live().callsign.clone()),
+        apply: |v| {
+            let Some(t) = v.as_text() else { return false };
+            let t = t.split_whitespace().collect::<Vec<_>>().join(" ");
+            // Letters, digits, spaces and hyphens ("G-ABCD"): anything else
+            // is not a callsign, and a '|' would break the panel's rows.
+            let ok = t
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == ' ' || c == '-');
+            if !ok || (!t.is_empty() && !t.chars().any(|c| c.is_ascii_alphanumeric())) {
+                return false;
+            }
+            update(|c| c.callsign = t);
+            crate::monitor::callsign_changed();
+            true
+        },
+    },
+    Setting {
+        key: "airline_telephony",
+        env: "XCOPILOT_AIRLINE_TELEPHONY",
+        label: "airline telephony",
+        help: "your airlines' radio names, asked before the built-in ones: WAT=Walker; XYZ=Zulu Air",
+        kind: Kind::Text { max_len: 400 },
+        tier: Tier::Live,
+        persist: Persist::Map,
+        get: || {
+            Value::Text(crate::callsign::telephony_text(
+                &crate::callsign::parse_telephony(&live().airline_telephony),
+            ))
+        },
+        apply: |v| {
+            let Some(t) = v.as_text() else { return false };
+            let entries = crate::callsign::parse_telephony(t);
+            // Something typed and nothing readable is a refusal, not a
+            // silent wipe of the table.
+            if entries.is_empty() && !t.trim().is_empty() {
+                return false;
+            }
+            let text = crate::callsign::telephony_text(&entries);
+            update(|c| c.airline_telephony = text);
+            crate::monitor::callsign_changed();
+            true
+        },
+    },
 ];
+
+/// The live airline telephony table, as the atc crate's provider hands it
+/// over (`callsign::provide_telephony`, registered in `main`).
+pub fn airline_telephony() -> String {
+    live().airline_telephony.clone()
+}
 
 /// Both channel volumes go to the audio layer together (it takes a pair), so a
 /// change to either re-sends both from the live configuration.
@@ -628,6 +731,7 @@ mod tests {
                 .iter()
                 .map(|o| Value::Choice((*o).to_string()))
                 .collect(),
+            Kind::Text { .. } => vec![Value::Text(String::new()), Value::Text("WAT=Walker".into())],
         }
     }
 
@@ -767,6 +871,109 @@ mod tests {
         assert!(err.contains("XCOPILOT_TAXI_GUIDE"), "{err}");
         unsafe { std::env::remove_var(s.env) };
         assert!(!s.env_pinned());
+    }
+
+    fn text_setting(key: &str) -> &'static Setting {
+        ALL.iter().find(|s| s.key == key).expect("declared")
+    }
+
+    /// A text knob is env > pref > default like every other: a saved value
+    /// fills in only while its variable is silent, and with nothing saved
+    /// the default (blank) stands.
+    #[test]
+    fn a_text_setting_is_env_then_pref_then_default() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let s = text_setting("callsign");
+        // Default: nothing in the environment, nothing saved.
+        unsafe { std::env::remove_var(s.env) };
+        update(|c| c.callsign = String::new());
+        assert!(!apply_saved(s, None));
+        assert_eq!(s.value(), Value::Text(String::new()));
+        assert_eq!(s.rendered(), "(none)");
+        // A saved value fills the default in.
+        assert!(apply_saved(s, Some("WAT2516")));
+        assert_eq!(live().callsign, "WAT2516");
+        // The environment (as `Config::from_env` read it) beats the saved one.
+        // SAFETY: the lock above serialises every env-mutating test.
+        unsafe { std::env::set_var(s.env, "BAW306") };
+        update(|c| c.callsign = "BAW306".into());
+        assert!(!apply_saved(s, Some("WAT2516")));
+        assert_eq!(live().callsign, "BAW306");
+        unsafe { std::env::remove_var(s.env) };
+
+        let t = text_setting("airline_telephony");
+        unsafe { std::env::remove_var(t.env) };
+        update(|c| c.airline_telephony = String::new());
+        // Saved junk keeps the default; a saved table is read back canonical.
+        assert!(!apply_saved(t, Some("nonsense")));
+        assert_eq!(live().airline_telephony, "");
+        assert!(apply_saved(t, Some("wat=Walker, junk")));
+        assert_eq!(t.value(), Value::Text("WAT=Walker".into()));
+        unsafe { std::env::set_var(t.env, "XYZ=Zulu") };
+        update(|c| c.airline_telephony = "XYZ=Zulu".into());
+        assert!(!apply_saved(t, Some("WAT=Walker")));
+        assert_eq!(t.value(), Value::Text("XYZ=Zulu".into()));
+        unsafe { std::env::remove_var(t.env) };
+        update(|c| {
+            c.callsign = String::new();
+            c.airline_telephony = String::new();
+        });
+    }
+
+    /// An env-pinned text knob refuses the edit naming its variable, and
+    /// the live value is untouched.
+    #[test]
+    fn an_env_pinned_text_setting_refuses_the_edit() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        for key in ["callsign", "airline_telephony"] {
+            let s = text_setting(key);
+            // SAFETY: the lock above serialises every env-mutating test.
+            unsafe { std::env::set_var(s.env, "") };
+            let before = s.value();
+            let err = set(key, &Value::Text("WAT2516".into())).expect_err("pinned");
+            assert!(err.contains(s.env), "{err}");
+            assert!(
+                !err.contains('\u{2014}') && !err.contains('\u{2013}'),
+                "{err}"
+            );
+            assert_eq!(s.value(), before);
+            unsafe { std::env::remove_var(s.env) };
+        }
+    }
+
+    /// What a text knob accepts: one line within its length, dashes made
+    /// plain; a callsign of letters, digits, spaces and hyphens; a telephony
+    /// table with at least one readable entry (or blank, to clear it).
+    #[test]
+    fn text_values_are_checked_before_they_apply() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let kind = Kind::Text { max_len: 8 };
+        assert_eq!(
+            kind.parse("  G\u{2014}ABCD "),
+            Some(Value::Text("G-ABCD".into()))
+        );
+        assert_eq!(kind.parse("123456789"), None);
+        assert_eq!(kind.parse("a\tb"), None);
+        assert_eq!(kind.store(&Value::Text(String::new())), "");
+
+        let cs = text_setting("callsign");
+        assert!((cs.apply)(&Value::Text("Walker  2516".into())));
+        assert_eq!(live().callsign, "Walker 2516");
+        assert!(!(cs.apply)(&Value::Text("WAT|2516".into())));
+        assert!(!(cs.apply)(&Value::Text("--".into())));
+        assert!(!(cs.apply)(&Value::Bool(true)));
+        assert!((cs.apply)(&Value::Text(String::new())));
+        assert_eq!(live().callsign, "");
+
+        let tel = text_setting("airline_telephony");
+        assert!(
+            !(tel.apply)(&Value::Text("Walker".into())),
+            "nothing readable"
+        );
+        assert!((tel.apply)(&Value::Text("wat=Walker;XYZ=Zulu Air".into())));
+        assert_eq!(live().airline_telephony, "WAT=Walker; XYZ=Zulu Air");
+        assert!((tel.apply)(&Value::Text(" ".into())), "blank clears");
+        assert_eq!(live().airline_telephony, "");
     }
 
     /// Applying a value of the wrong shape changes nothing.
