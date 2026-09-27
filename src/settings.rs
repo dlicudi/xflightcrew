@@ -65,6 +65,14 @@ pub fn install(cfg: Config) -> Arc<Config> {
             }
         }
     }
+    // The callsign override is free text, which the registry's screen cannot
+    // step, so it is not a registry knob: env > prefs.json `callsign` > none,
+    // the same precedence by hand.
+    if std::env::var("XCOPILOT_CALLSIGN").is_err() {
+        if let Some(cs) = crate::prefs::setting("callsign").filter(|c| !c.trim().is_empty()) {
+            update(|c| c.callsign = cs.trim().to_string());
+        }
+    }
     live()
 }
 

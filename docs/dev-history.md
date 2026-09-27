@@ -8479,3 +8479,49 @@ repairs, the domain gate and the SR22 grammar) and `sr22_rules_stay_narrow`.
 Next SR22 flight, check: `heard` "set transponder" followed by a
 `set_transponder_mode` tool line, "Set SP" reaching `hold_speed`, and any
 `electrical` `all_off_refused`. Offline only.
+
+## 2026-09-27: one callsign resolver: override, SimBrief OFP, tail number
+
+The callsign was only ever the tail number (`acf_tailnum`), resolved in
+three copies (`station::build_ctx`, `circuit::crew_callsign`, the `atc`
+binary), so an airline flight (a 737 on an OFP as BAW306) was worked by its
+registration and there was no way to name it by hand.
+
+Now ONE resolver, `atc::callsign` (`resolve`, `live`, `live_with`), in this
+order: `XCOPILOT_CALLSIGN` (env, else prefs.json `settings.callsign`; free
+text, so not a registry knob the Settings screen can step), then the loaded
+SimBrief plan's ATC callsign, then the tail; the wake suffix last
+(`tower::with_wake`, never twice). A raw id is spoken by shape
+(`is_airline_id`: three letters, one to four digits, up to two letters):
+through the telephony tables, moved out of station.rs into callsign.rs with
+`spoken_ghost` ("BAW306" is "Speedbird three zero six", an unknown airline
+spelled NATO), a registration as before; words ("Speedbird 306") stay words.
+
+- The OFP field was checked against the pilot's live OFP (LFBD-EGKK):
+  `atc.callsign` "WAT2516", beside `general.icao_airline` "WAT" and
+  `general.flight_number` "2516" (both also in simbrief_hub's parser).
+  `simbrief::plan_callsign` takes `atc/callsign`, else airline + number;
+  SimBrief's empty `{}` reads as absent. `FlightPlan.callsign`, `None` on a
+  local plan.
+- No stored callsign anywhere: the crew registers a provider
+  (`callsign::provide_inputs(circuit::callsign_inputs)`, the fn pointer on
+  the party line) that reads the setting and the plan shelf when asked, so a
+  replaced plan is a new callsign and a cleared one none. A plan's callsign
+  is ours only on an airframe of its type (`plan_fits`: `acf_ICAO`, or the
+  profile's `simbrief_types`), so a swap to another type is the tail again
+  with nothing to clear.
+- The tower hears it: an unkeyed call that names our override or plan
+  callsign is addressed (`callsign::addressed`, whisper's "Speed Bird 306"
+  folded), so "Speedbird 306, ready to taxi" reaches the tower where "brakes
+  set, ready to taxi" stays crew talk. Corpus cases carry a `callsign`.
+- Blackbox: `atc` `event: callsign` with `spoken` and `source`
+  (override|simbrief|tail) whenever the resolved callsign changes.
+
+Tests: `override_beats_plan_beats_tail`,
+`a_plan_for_another_type_is_the_tail_again`, `ids_are_spoken_like_a_controller`,
+`heavy_on_every_source`, `a_transmission_names_the_callsign_however_whisper_writes_it`,
+`an_airline_callsign_is_addressed_and_answered` (station routes, keyed and
+unkeyed), `the_ofp_callsign_is_the_atc_field_else_airline_and_number`,
+`the_plan_callsign_is_the_plan_on_the_shelf`. Next airline sortie, check the
+`callsign` record says `simbrief` and the tower's replies open with the
+airline callsign. Offline only.

@@ -121,6 +121,11 @@ pub struct FlightPlan {
     /// for (OFP `general/sid_ident`, `general/star_ident`, `origin/plan_rwy`,
     /// `destination/plan_rwy`). Empty on a local plan.
     pub procedures: PlanProcedures,
+    /// The OFP's ATC callsign ("BAW306"; `atc/callsign`, else
+    /// `general/icao_airline` + `general/flight_number`), the tower's and the
+    /// crew's name for us while this plan is loaded and fits the airframe
+    /// (`atc::callsign::resolve`). `None` on a local plan.
+    pub callsign: Option<String>,
 }
 
 /// See [`FlightPlan::procedures`].
@@ -335,6 +340,7 @@ pub async fn fetch(user_id: &str) -> Result<FlightPlan> {
             dest_rwy: ident_of(s("/destination/plan_rwy")),
         },
         source: PlanSource::SimBrief,
+        callsign: plan_callsign(&v),
         origin,
         destination,
         alternate: s("/alternate/icao_code"),
@@ -357,6 +363,26 @@ pub async fn fetch(user_id: &str) -> Result<FlightPlan> {
         block_fuel_kg: to_kg(n("/fuel/plan_ramp")),
         min_takeoff_fuel_kg: to_kg(n("/fuel/min_takeoff")),
         weights: parse_weights(&v, in_kg),
+    })
+}
+
+/// The OFP's ATC callsign: `atc/callsign` ("WAT2516" on the pilot's live
+/// LFBD-EGKK OFP, 2026-09-27, beside `general/icao_airline` "WAT" and
+/// `general/flight_number` "2516"), else airline + flight number. It is the
+/// field the pilot's "ATC callsign" box on SimBrief fills, which may differ
+/// from the flight number (BA545 flies as BAW5GU). SimBrief writes an empty
+/// field as `{}`, which reads as absent here.
+fn plan_callsign(v: &Value) -> Option<String> {
+    let s = |path: &str| {
+        v.pointer(path)
+            .and_then(Value::as_str)
+            .map(|s| s.trim().to_ascii_uppercase())
+            .filter(|s| !s.is_empty())
+    };
+    s("/atc/callsign").or_else(|| {
+        let airline = s("/general/icao_airline")?;
+        let number = s("/general/flight_number")?;
+        Some(format!("{airline}{number}"))
     })
 }
 
@@ -543,6 +569,42 @@ fn num_of(v: &Value) -> Option<f64> {
 
 #[cfg(test)]
 mod tests {
+    /// The OFP's ATC callsign, from the shape of the pilot's live OFP
+    /// (LFBD-EGKK, 2026-09-27: `atc.callsign` "WAT2516", `general`
+    /// "WAT" + "2516"); airline + flight number when the ATC box is empty,
+    /// which SimBrief writes as `{}`; none when neither is there.
+    #[test]
+    fn the_ofp_callsign_is_the_atc_field_else_airline_and_number() {
+        let full = serde_json::json!({
+            "atc": {"callsign": "BAW5GU", "flight_rules": "I"},
+            "general": {"icao_airline": "BAW", "flight_number": "545"},
+        });
+        assert_eq!(super::plan_callsign(&full).as_deref(), Some("BAW5GU"));
+        let live = serde_json::json!({
+            "atc": {"callsign": "WAT2516"},
+            "general": {"icao_airline": "WAT", "flight_number": "2516"},
+        });
+        assert_eq!(super::plan_callsign(&live).as_deref(), Some("WAT2516"));
+        for no_atc in [
+            serde_json::json!({"atc": {"callsign": {}}, "general": {"icao_airline": "BAW", "flight_number": "306"}}),
+            serde_json::json!({"atc": {"callsign": " "}, "general": {"icao_airline": "baw", "flight_number": "306"}}),
+            serde_json::json!({"general": {"icao_airline": "BAW", "flight_number": "306"}}),
+        ] {
+            assert_eq!(
+                super::plan_callsign(&no_atc).as_deref(),
+                Some("BAW306"),
+                "{no_atc}"
+            );
+        }
+        for none in [
+            serde_json::json!({}),
+            serde_json::json!({"general": {"icao_airline": {}, "flight_number": "306"}}),
+            serde_json::json!({"general": {"icao_airline": "BAW", "flight_number": ""}}),
+        ] {
+            assert_eq!(super::plan_callsign(&none), None, "{none}");
+        }
+    }
+
     #[test]
     fn a_route_simbrief_never_built_is_read_from_its_lat_lon_points() {
         let w = super::latlon_waypoints(

@@ -758,18 +758,44 @@ pub fn transmit_check_in(callsign: Option<String>, to: String, climb_to_ft: f64)
         });
 }
 
-/// The aircraft's callsign, spoken the way the tower says it ("November one
-/// seven two Sierra Papa"), so the copilot's calls sound like a real pilot's.
-/// `None` if the tail number can't be read.
+/// The aircraft's callsign, spoken the way the tower says it ("Speedbird
+/// three zero six", "November one seven two Sierra Papa"), so the copilot's
+/// calls sound like a real pilot's. The tower's own resolver
+/// (`atc::callsign`: override > SimBrief > tail, wake suffix last), so crew
+/// and controller can never call the aircraft two names. `None` if no source
+/// says anything.
 pub async fn crew_callsign(xp: &XPlaneClient) -> Option<String> {
-    // With the wake suffix: a heavy says "heavy" on every call it initiates,
-    // and the tower addresses it the same way (`station::build_ctx`).
-    let mtow_kg = xp.get_float(crate::datarefs::ACF_M_MAX_KG).await.ok();
-    xp.get_string(crate::datarefs::TAILNUM)
+    crate::callsign::live_with(&callsign_inputs(), xp.view())
         .await
-        .ok()
-        .map(|t| crate::tower::spoken_callsign_wake(&t, mtow_kg))
-        .filter(|s| !s.is_empty())
+        .map(|r| r.spoken)
+}
+
+/// What the crew knows of the callsign that the sim does not, read at the
+/// moment of asking (so a replaced plan is a new callsign and a cleared one
+/// none): the pilot's override (`XCOPILOT_CALLSIGN`) and a SimBrief plan's
+/// ATC callsign with its type, for `callsign::plan_fits` to hold against the
+/// airframe loaded. Registered with the station at boot
+/// (`callsign::provide_inputs`).
+pub fn callsign_inputs() -> crate::callsign::Inputs {
+    let over = crate::settings::live().callsign.trim().to_string();
+    crate::callsign::Inputs {
+        override_id: (!over.is_empty()).then_some(over),
+        plan: plan_callsign(crate::simbrief::loaded_plan().as_ref()),
+    }
+}
+
+/// A plan's callsign, only from a SimBrief plan (a local one names no flight).
+fn plan_callsign(
+    plan: Option<&crate::simbrief::FlightPlan>,
+) -> Option<crate::callsign::PlanCallsign> {
+    let p = plan.filter(|p| p.source == crate::simbrief::PlanSource::SimBrief)?;
+    Some(crate::callsign::PlanCallsign {
+        id: p.callsign.clone()?,
+        plan_type: p.aircraft.clone(),
+        also_types: crate::aircraft::live_profile()
+            .map(|a| a.simbrief_types.clone())
+            .unwrap_or_default(),
+    })
 }
 
 /// Format a radio call with the callsign in front, pilot-style: "November one
@@ -2841,6 +2867,88 @@ async fn try_published_arrival(
 
 #[cfg(test)]
 mod tests {
+
+    fn flight_plan(
+        source: crate::simbrief::PlanSource,
+        callsign: Option<&str>,
+    ) -> crate::simbrief::FlightPlan {
+        crate::simbrief::FlightPlan {
+            transition_altitude_ft: None,
+            transition_level_ft: None,
+            procedures: Default::default(),
+            callsign: callsign.map(str::to_string),
+            source,
+            origin: "EGLL".into(),
+            destination: "EGPH".into(),
+            alternate: String::new(),
+            aircraft: "B738".into(),
+            cruise_alt_ft: 35000.0,
+            distance_nm: 300.0,
+            ete_min: 60.0,
+            trip_fuel_kg: 3000.0,
+            reserve_kg: 1500.0,
+            route: "DCT".into(),
+            wind_comp_kts: 0.0,
+            wind_dir: 0.0,
+            wind_spd_kts: 0.0,
+            tod_to_dest_nm: 100.0,
+            waypoints: Vec::new(),
+            block_fuel_kg: 6000.0,
+            min_takeoff_fuel_kg: 5000.0,
+            weights: None,
+        }
+    }
+
+    /// The callsign lives with the plan: a local plan names no flight, a
+    /// SimBrief plan names its own, and the plan that replaces it names the
+    /// new one, with nothing stored in between.
+    #[test]
+    fn the_plan_callsign_is_the_plan_on_the_shelf() {
+        use crate::simbrief::PlanSource;
+        assert_eq!(super::plan_callsign(None), None);
+        let local = flight_plan(PlanSource::Local, Some("BAW306"));
+        assert_eq!(
+            super::plan_callsign(Some(&local)),
+            None,
+            "a local plan names no flight"
+        );
+        let bare = flight_plan(PlanSource::SimBrief, None);
+        assert_eq!(super::plan_callsign(Some(&bare)), None);
+
+        let speak = |fp: &crate::simbrief::FlightPlan| {
+            let inputs = crate::callsign::Inputs {
+                override_id: None,
+                plan: super::plan_callsign(Some(fp)),
+            };
+            crate::callsign::resolve(&inputs, Some("G-EUPT"), Some("B738"), Some(79_000.0))
+                .map(|r| (r.spoken, r.source))
+        };
+        let first = flight_plan(PlanSource::SimBrief, Some("BAW306"));
+        let p = super::plan_callsign(Some(&first)).expect("a SimBrief callsign");
+        assert_eq!((p.id.as_str(), p.plan_type.as_str()), ("BAW306", "B738"));
+        assert_eq!(
+            speak(&first),
+            Some((
+                "Speedbird three zero six".into(),
+                crate::callsign::Source::Simbrief
+            ))
+        );
+        let replaced = flight_plan(PlanSource::SimBrief, Some("EZY12AB"));
+        assert_eq!(
+            speak(&replaced),
+            Some((
+                "Easy one two Alpha Bravo".into(),
+                crate::callsign::Source::Simbrief
+            ))
+        );
+        assert_eq!(
+            speak(&local),
+            Some((
+                "Golf Echo Uniform Papa Tango".into(),
+                crate::callsign::Source::Tail
+            ))
+        );
+    }
 
     /// EGPF, 2026-09-21: pattern 1,796 ft, the FCU at 100. Level targets go
     /// on the dial to the hundred, a captured hold on that dial owns the leg,

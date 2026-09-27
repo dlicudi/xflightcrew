@@ -20,6 +20,7 @@
 //!   XCOPILOT_ATIS_FREQ    ATIS frequency, MHz ("131.2") or kHz ("131200")
 //!   XCOPILOT_ATC_VOICE    macOS `say` voice for the station (default Daniel)
 //!   XCOPILOT_ATC_RATE     `say` words-per-minute (default 165, a read pace)
+//!   XCOPILOT_CALLSIGN     our callsign over the tail number ("BAW306")
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -27,7 +28,8 @@ use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
 use xvoicelayer::{
-    atis, config::Config, datarefs, mic, nav, phrase, stt, tower, tts, xplane::XPlaneClient,
+    atis, callsign, config::Config, datarefs, mic, nav, phrase, stt, tower, tts,
+    xplane::XPlaneClient,
 };
 
 /// Read-only view of the simulator. ATC observes and speaks; it must never
@@ -282,12 +284,20 @@ fn main() -> Result<()> {
                         continue;
                     }
                 };
+                // The one resolver (override > SimBrief > tail, wake last).
+                // This process holds no plan, so only the override and the
+                // tail can speak here.
                 let mtow_kg = sim.get_float(datarefs::ACF_M_MAX_KG).ok();
-                let callsign = sim
-                    .get_string(datarefs::TAILNUM)
-                    .ok()
-                    .map(|t| tower::spoken_callsign_wake(&t, mtow_kg))
-                    .filter(|s| !s.is_empty())
+                let tail = sim.get_string(datarefs::TAILNUM).ok();
+                let inputs = callsign::Inputs {
+                    override_id: Some(config.callsign.clone()).filter(|c| !c.is_empty()),
+                    plan: None,
+                };
+                let callsign = callsign::resolve(&inputs, tail.as_deref(), None, mtow_kg)
+                    .map(|r| {
+                        callsign::note(&r);
+                        r.spoken
+                    })
                     .unwrap_or_else(|| "aircraft calling".to_string());
                 let ctx = tower::Ctx {
                     callsign,

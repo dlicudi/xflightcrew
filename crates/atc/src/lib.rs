@@ -15,6 +15,7 @@
 
 pub mod airspace;
 pub mod atis;
+pub mod callsign;
 pub mod nav;
 pub mod party_line;
 pub mod speaker;

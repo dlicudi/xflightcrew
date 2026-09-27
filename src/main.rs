@@ -86,7 +86,7 @@ mod weather;
 // The world side (ATC) and the simulator plumbing now live in their own
 // crates; these shims keep every existing `crate::station::...` /
 // `crate::xplane::...` path in the module tree resolving unchanged.
-pub(crate) use ::atc::{airspace, atis, nav, party_line, speaker, station, tower};
+pub(crate) use ::atc::{airspace, atis, callsign, nav, party_line, speaker, station, tower};
 pub(crate) use sim::{blackbox, datarefs, xplane};
 
 use std::time::{Duration, Instant};
@@ -196,6 +196,9 @@ async fn main() -> Result<()> {
     // snapshot, while the loops re-read `settings::live()` each tick so a
     // change made from the Settings screen applies without a restart.
     let config: Config = (*settings::install(config)).clone();
+    // The station's callsign resolver asks the crew for the override and the
+    // plan's callsign through this provider, read fresh each time.
+    callsign::provide_inputs(circuit::callsign_inputs);
 
     // Initial app mode: explicit env > the panel's saved pick > both. The
     // panel's Settings tab can change it live from here on (mode.rs).
@@ -4363,6 +4366,7 @@ mod tests {
             transition_altitude_ft: None,
             transition_level_ft: None,
             procedures: Default::default(),
+            callsign: None,
             source: crate::simbrief::PlanSource::SimBrief,
             origin: origin.into(),
             destination: dest.into(),
@@ -5810,6 +5814,7 @@ mod gap_tests_2026_09_12 {
             transition_altitude_ft: None,
             transition_level_ft: None,
             procedures: Default::default(),
+            callsign: None,
             source: simbrief::PlanSource::Local,
             origin: "LXGB".into(),
             destination: "LEMG".into(),

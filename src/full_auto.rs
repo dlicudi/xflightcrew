@@ -5192,6 +5192,7 @@ mod tests {
             transition_altitude_ft: None,
             transition_level_ft: None,
             procedures: Default::default(),
+            callsign: None,
             source: crate::simbrief::PlanSource::SimBrief,
             origin: "LXGB".into(),
             destination: "LEAX".into(),

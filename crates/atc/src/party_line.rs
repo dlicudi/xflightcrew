@@ -73,6 +73,14 @@ pub(crate) static PENDING_STATION: Mutex<Option<(String, nav::AirportInfo)>> = M
 /// inbound call, cleared when the arrival is over.
 pub(crate) static ARRIVAL_PIN: Mutex<Option<i64>> = Mutex::new(None);
 
+/// The crew's provider of what the sim cannot say about our callsign: the
+/// pilot's override and the loaded plan's ATC callsign
+/// (`callsign::provide_inputs`, registered once at boot). A function, never a
+/// value: it reads the setting and the plan shelf when asked, so a replaced
+/// or cleared plan is a new or no callsign with nothing here to go stale.
+pub(crate) static CALLSIGN_INPUTS: Mutex<Option<fn() -> crate::callsign::Inputs>> =
+    Mutex::new(None);
+
 /// Set when the monitor speaks the released takeoff clearance; the main
 /// loop consumes it and syncs the tower FSM to what was said on frequency.
 pub(crate) static PENDING_TAKEOFF_CLEARANCE: Mutex<bool> = Mutex::new(false);
