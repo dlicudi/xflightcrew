@@ -68,6 +68,10 @@ retractable_gear: true
 # worked by command and read back from the stock handle.
 gear_by_command: true
 cabin_crew: true
+# Full auto's arm-time load (#95): the stock tank and payload writes have
+# never been written and read back on this airframe, so the arm names it
+# and leaves the load to the pilot.
+load_sheet: unprobed
 pressurised: true
 engines: 4
 

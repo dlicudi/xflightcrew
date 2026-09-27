@@ -510,6 +510,13 @@ pub struct AircraftProfile {
     /// testing on anything.
     #[serde(default)]
     pub cabin_crew: bool,
+    /// Whether full auto may load this airframe from the plan at the arm
+    /// (`full_auto::arm_load`, issue #95). `stock` (the default) writes the
+    /// stock `weight/m_fuel` and `weight/m_fixed`, read back; `unprobed` and
+    /// `own_fuel_system` are named and left to the pilot, never forced. The
+    /// spoken "load the aircraft" is the pilot's and ignores it.
+    #[serde(default)]
+    pub load_sheet: LoadSheet,
     /// Fly an ILS COUPLED on this airframe's own approach mode (see
     /// `ils::Coupling`): armed on final, the bug and VS dial handed over as
     /// the localizer and glideslope capture. Off until a capture has been
@@ -1829,6 +1836,21 @@ pub struct TransponderModeKnob {
     /// the STOCK mode, which the add-on computes from all of them.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub also: Vec<CompanionKnob>,
+}
+
+/// Whether the stock load sheet writes (`weight/m_fuel`, `weight/m_fixed`)
+/// are known to take on an airframe (see [`AircraftProfile::load_sheet`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LoadSheet {
+    /// Stock tanks and payload: written and read back (the 737, probed live
+    /// on the EGPH ramp 2026-09-21; the 172).
+    #[default]
+    Stock,
+    /// Never written and read back on this airframe.
+    Unprobed,
+    /// The aircraft's scripts own the tanks: a stock write is undone.
+    OwnFuelSystem,
 }
 
 /// An add-on's own seat belt sign switch: a read-only position stepped by
@@ -4486,6 +4508,7 @@ fn cessna_172sp() -> AircraftProfile {
         ils: true,
         parking_brake: true,
         cabin_crew: false,
+        load_sheet: LoadSheet::Stock,
         ils_coupled: false,
         approach_command: None,
         approach_status: None,
@@ -4804,6 +4827,7 @@ fn cirrus_sr22() -> AircraftProfile {
         ils: true,
         parking_brake: true,
         cabin_crew: false,
+        load_sheet: LoadSheet::Stock,
         ils_coupled: false,
         approach_command: None,
         approach_status: None,

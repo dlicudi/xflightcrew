@@ -28,7 +28,7 @@ const TANK_RATIO: &str = "sim/aircraft/overflow/acf_tank_rat";
 const TANK_LATERAL_M: &str = "sim/aircraft/overflow/acf_tank_X";
 const EMPTY_WEIGHT_KG: &str = "sim/aircraft/weight/acf_m_empty";
 const MAX_WEIGHT_KG: &str = "sim/aircraft/weight/acf_m_max";
-const GROUNDSPEED_MS: &str = "sim/flightmodel/position/groundspeed";
+pub(crate) const GROUNDSPEED_MS: &str = "sim/flightmodel/position/groundspeed";
 
 /// A tank or a cabin within this of the plan is loaded: one percent, and
 /// never tighter than two kilos.
@@ -631,6 +631,39 @@ mod tests {
             "EGPH|EGTE|7200|0|0|0|kgs"
         );
         assert_eq!(loadsheet_payload(None), "");
+    }
+
+    /// #95: full auto's arm decides from the ramp as read, and the loader
+    /// then touches only the half the decision asked for.
+    #[tokio::test(start_paused = true)]
+    async fn the_arm_loads_the_fuel_and_leaves_a_payload_already_aboard() {
+        let xp = ramp([1_000.0, 0.0, 1_000.0], 14_310.0);
+        let fp = plan(7_200.0, Some(14_300.0));
+        let decision = crate::full_auto::arm_load(
+            &fp,
+            true,
+            Some(2_000.0),
+            Some(14_310.0),
+            crate::aircraft::LoadSheet::Stock,
+            "Boeing 737-800",
+        );
+        assert_eq!(decision, crate::full_auto::ArmLoad::Load(What::Fuel));
+        let crate::full_auto::ArmLoad::Load(what) = decision else { unreachable!() };
+        let line = load_from_plan(&xp, &fp, what).await.unwrap();
+        assert!(xp.wrote(crate::datarefs::FUEL_PER_TANK_KG), "{line}");
+        assert!(!xp.wrote(crate::datarefs::PAYLOAD_KG), "{line}");
+        // The fake never moves, so this is the add-on that undid the write.
+        assert_eq!(crate::full_auto::arm_load_outcome(&line), "not_taken", "{line}");
+    }
+
+    /// The A330's load is unprobed (#95) and the 737's is the stock one.
+    #[test]
+    fn the_unprobed_airframes_say_so_in_their_profiles() {
+        use crate::aircraft::{load, LoadSheet};
+        assert_eq!(load("airbus_a330_300").unwrap().load_sheet, LoadSheet::Unprobed);
+        assert_eq!(load("boeing_747_400").unwrap().load_sheet, LoadSheet::Unprobed);
+        assert_eq!(load("boeing_737_800").unwrap().load_sheet, LoadSheet::Stock);
+        assert_eq!(load("cessna_172sp").unwrap().load_sheet, LoadSheet::Stock);
     }
 
     /// A local plan has no load sheet: the fuel goes in, the payload is said

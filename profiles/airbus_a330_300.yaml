@@ -65,6 +65,10 @@ ils: true
 parking_brake: true
 retractable_gear: true
 cabin_crew: true       # up to 440 seats
+# Full auto's arm-time load (#95): the stock tank and payload writes have
+# never been written and read back on this airframe, so the arm names it
+# and leaves the load to the pilot.
+load_sheet: unprobed
 pressurised: true
 engines: 2
 

@@ -379,6 +379,8 @@ impl Registry {
                         .as_ref()
                         .and_then(|r| r.takeoff_distance_ft),
                     max_gross_lb: profile.reference.as_ref().and_then(|r| r.max_gross_lb),
+                    load_sheet: profile.load_sheet,
+                    airframe: profile.display_name.clone(),
                     takeoff_flap_ratio: profile.flaps.as_ref().and_then(|f| f.takeoff_ratio),
                     flap_schedule: crate::aircraft::flap_schedule(profile.flaps.as_ref()),
                     cruise_ias_kts: profile.reference.as_ref().and_then(|r| r.cruise_ias_kts),
