@@ -10,8 +10,12 @@
 //!
 //! - **Memory**: takeoffs, landings, go-arounds and the field, per flight and
 //!   per session. "That's our second go-around." "Back where we started."
+//!   The wheels are the FLIGHT MODEL's (`flight::Flight`): its touchdown,
+//!   bounce, touch and go and time aloft, never a second detector here that
+//!   could disagree with it (#85).
 //! - **The landing word**: the sink at the wheels, by the instructor's own
-//!   scorer (`instructor::touchdown_sink_fpm`), said once the roll is done
+//!   scorer (`instructor::touchdown_sink_fpm`, through the model's
+//!   `Touchdown`), said once the roll is done
 //!   and only when it is worth saying. Praise goes to the pilot, never to an
 //!   automation; a hard landing is said at every chattiness level.
 //! - **Offers**: the next flap as the speed comes inside its placard, the
@@ -34,10 +38,6 @@ pub const CALM_S: f64 = 8.0;
 /// An aside held longer than this gets "By the way" in front: it is no
 /// longer part of the moment it was about.
 pub const BY_THE_WAY_S: f64 = 20.0;
-/// Airborne this long above [`AIRBORNE_AGL_FT`] is a flight (a bounce, or a
-/// hover taxi, is not a takeoff).
-pub const AIRBORNE_S: f64 = 3.0;
-pub const AIRBORNE_AGL_FT: f64 = 30.0;
 /// The landing word waits for the roll to be done.
 pub const REMARK_KTS: f64 = 30.0;
 /// A touchdown this close to where the flight took off is the same field.
@@ -152,22 +152,15 @@ pub struct Landing {
     pub same_field: bool,
     /// Landings at this field this session, this one included.
     pub landings_here: u32,
-    /// Times the wheels left the runway again between the touchdown and the
-    /// remark (a skip off the oleos above a few feet).
+    /// Times the wheels left the runway again and came back between the
+    /// touchdown and the remark (the flight model's `Bounce`).
     pub bounces: u32,
 }
 
 #[derive(Default)]
 pub struct Rapport {
-    airborne: bool,
-    /// When the air sample run began (for the [`AIRBORNE_S`] debounce).
-    air_since: Option<f64>,
-    takeoff: Option<(f64, f64, f64)>,
-    /// Airborne `(t, vsi)` samples, the last few seconds.
-    samples: std::collections::VecDeque<(f64, f64)>,
+    /// The landing booked at the model's touchdown, waiting for the roll.
     pending: Option<Landing>,
-    /// Off the ground again since the touchdown (a bounce in progress).
-    bouncing: bool,
     /// Session memory: the field of the last landing, and how many there.
     field: Option<(f64, f64)>,
     landings_here: u32,
@@ -197,49 +190,48 @@ impl Rapport {
         Self::default()
     }
 
-    /// One monitor tick. Returns what to say now; everything deferrable that
-    /// arrives while the flight deck is busy is held as an aside.
-    pub fn tick(&mut self, v: &View, a: &Airframe, p: &Persona) -> Vec<Line> {
+    /// One monitor tick: `v` and the flight model `f` after this tick's
+    /// sample, with the `events` that tick produced (`v.t_s` on the model's
+    /// clock). Returns what to say now; everything deferrable that arrives
+    /// while the flight deck is busy is held as an aside.
+    pub fn tick(
+        &mut self,
+        v: &View,
+        f: &crate::flight::Flight,
+        events: &[crate::flight::Event],
+        a: &Airframe,
+        p: &Persona,
+    ) -> Vec<Line> {
+        use crate::flight::Event;
         let mut out = Vec::new();
         let mut asides: Vec<String> = Vec::new();
+        let airborne = f.phase().airborne();
 
-        // Air and ground, debounced: a bounce is not a takeoff.
-        if !v.on_ground && v.agl_ft > AIRBORNE_AGL_FT {
-            let since = *self.air_since.get_or_insert(v.t_s);
-            if !self.airborne && v.t_s - since >= AIRBORNE_S {
-                self.airborne = true;
-                self.takeoff = Some((since, v.lat, v.lon));
-                self.samples.clear();
-                // A touch and go: the landing word rides the climb-out.
-                if let Some(l) = self.pending.take() {
-                    asides.extend(landing_lines(&l, p, &mut self.named_once));
+        // The wheels, as the flight model saw them: one answer to when the
+        // aircraft landed, bounced or went flying again.
+        for e in events {
+            match e {
+                // A touch and go (or a new flight before the word was
+                // said): the landing word rides the climb-out.
+                Event::TouchAndGo | Event::Takeoff => {
+                    if let Some(l) = self.pending.take() {
+                        asides.extend(landing_lines(&l, p, &mut self.named_once));
+                    }
                 }
-            }
-        } else if v.on_ground {
-            self.air_since = None;
-        }
-
-        // A bounce: the wheels leave again above a few feet and come back
-        // down. Counted at the second contact, so a touch and go (which
-        // never comes back) is not one.
-        if let Some(l) = self.pending.as_mut() {
-            if !v.on_ground && v.agl_ft > 2.0 {
-                self.bouncing = true;
-            } else if v.on_ground && self.bouncing {
-                self.bouncing = false;
-                l.bounces += 1;
+                // Counted at the second contact, so a touch and go (which
+                // never comes back) is not one.
+                Event::Bounce => {
+                    if let Some(l) = self.pending.as_mut() {
+                        l.bounces += 1;
+                    }
+                }
+                Event::Touchdown(td) => self.touch_down(v, f.memory(), td, false),
+                Event::Impact(td) => self.touch_down(v, f.memory(), td, true),
+                _ => {}
             }
         }
 
-        if self.airborne {
-            self.samples.push_back((v.t_s, v.vsi_fpm));
-            while self
-                .samples
-                .front()
-                .is_some_and(|(t, _)| v.t_s - *t > crate::instructor::TOUCHDOWN_WINDOW_S + 1.0)
-            {
-                self.samples.pop_front();
-            }
+        if airborne {
             // A go-around: low and descending, then climbing away without
             // touching down. Pilot or automation, the count is the flight's.
             if !v.on_ground && v.agl_ft < 400.0 && v.vsi_fpm < -200.0 {
@@ -258,48 +250,6 @@ impl Rapport {
             }
         }
 
-        // The touchdown.
-        if self.airborne && v.on_ground {
-            self.airborne = false;
-            let recent: Vec<(f64, f64)> = self.samples.iter().copied().collect();
-            let sink = -crate::instructor::touchdown_sink_fpm(&recent, v.t_s, v.vsi_fpm);
-            let (t0, lat0, lon0) = self.takeoff.unwrap_or((v.t_s, v.lat, v.lon));
-            let here = (v.lat, v.lon);
-            let same_field = dist_m((lat0, lon0), here) < SAME_FIELD_M;
-            match self.field {
-                Some(f) if dist_m(f, here) < SAME_FIELD_M => self.landings_here += 1,
-                _ => {
-                    self.field = Some(here);
-                    self.landings_here = 1;
-                }
-            }
-            let l = Landing {
-                t_s: v.t_s,
-                sink_fpm: sink.max(0.0),
-                by_automation: v.automation_flying,
-                airborne_s: v.t_s - t0,
-                same_field,
-                landings_here: self.landings_here,
-                bounces: 0,
-            };
-            self.bouncing = false;
-            *lock(&LAST_LANDING_BY_AUTOMATION) = Some(l.by_automation);
-            crate::blackbox::record(
-                "rapport",
-                serde_json::json!({
-                    "event": "touchdown", "sink_fpm": l.sink_fpm.round(),
-                    "by_automation": l.by_automation, "airborne_s": l.airborne_s.round(),
-                    "same_field": l.same_field, "landings_here": l.landings_here,
-                    "go_arounds": self.go_arounds,
-                }),
-            );
-            self.go_arounds = 0;
-            self.approach_low = None;
-            self.reset_arrival();
-            self.brief_offered = false;
-            self.pending = (!v.crashed && !v.instructing).then_some(l);
-        }
-
         // The landing word, once the roll is done.
         if let Some(l) = self.pending {
             if v.crashed || v.instructing {
@@ -316,13 +266,13 @@ impl Rapport {
         }
 
         // Offers: pilot flying, airborne, not in a lesson, not in a hurry.
-        let may_offer = self.airborne
+        let may_offer = airborne
             && !v.automation_flying
             && !v.instructing
             && !a.rotorcraft
             && !v.crashed
             && p.chatter >= Chatter::Normal;
-        if self.airborne {
+        if airborne {
             self.track_placards(v, a);
         }
         if may_offer && !(v.busy || v.quiet) {
@@ -348,6 +298,60 @@ impl Rapport {
             }
         }
         out
+    }
+
+    /// Book the model's touchdown. The sink is the model's (the
+    /// instructor's scorer at its first contact); the time aloft runs from
+    /// its takeoff, touch and go or join (`Memory::aloft_t`); the same field
+    /// is where this flight took off (`Memory::origin`; a flight joined in
+    /// the air has none). An `impact` (climbing into the ground, or past
+    /// `flight::IMPACT_SINK_FPM`) is booked but never counted as a landing
+    /// at the field, and gets a word only when it came down hard: a strike
+    /// climbing into the ground is no "barely felt that".
+    fn touch_down(
+        &mut self,
+        v: &View,
+        m: &crate::flight::Memory,
+        td: &crate::flight::Touchdown,
+        impact: bool,
+    ) {
+        let sink = (-td.sink_fpm).max(0.0);
+        let here = td.lat.zip(td.lon).unwrap_or((v.lat, v.lon));
+        let same_field = m.origin.is_some_and(|o| dist_m(o, here) < SAME_FIELD_M);
+        if !impact {
+            match self.field {
+                Some(f) if dist_m(f, here) < SAME_FIELD_M => self.landings_here += 1,
+                _ => {
+                    self.field = Some(here);
+                    self.landings_here = 1;
+                }
+            }
+        }
+        let l = Landing {
+            t_s: td.t,
+            sink_fpm: sink,
+            by_automation: v.automation_flying,
+            airborne_s: td.t - m.aloft_t.unwrap_or(td.t),
+            same_field,
+            landings_here: self.landings_here,
+            bounces: 0,
+        };
+        *lock(&LAST_LANDING_BY_AUTOMATION) = Some(l.by_automation);
+        crate::blackbox::record(
+            "rapport",
+            serde_json::json!({
+                "event": "touchdown", "sink_fpm": l.sink_fpm.round(),
+                "by_automation": l.by_automation, "airborne_s": l.airborne_s.round(),
+                "same_field": l.same_field, "landings_here": l.landings_here,
+                "go_arounds": self.go_arounds, "impact": impact,
+            }),
+        );
+        self.go_arounds = 0;
+        self.approach_low = None;
+        self.reset_arrival();
+        self.brief_offered = false;
+        let worth_a_word = !impact || sink >= HARD_FPM;
+        self.pending = (!v.crashed && !v.instructing && worth_a_word).then_some(l);
     }
 
     fn reset_arrival(&mut self) {
@@ -773,6 +777,57 @@ pub fn arrival_brief(apt_dat: &str, cifp: &str, fixes: &str, xplane_root: &str) 
 mod tests {
     use super::*;
 
+    use crate::flight::{Flight, Sample};
+
+    /// The rapport as the monitor runs it: the flight model ticked first on
+    /// the same sample, its events handed over.
+    struct Rig {
+        r: Rapport,
+        f: Flight,
+    }
+
+    impl Rig {
+        fn new() -> Rig {
+            Rig {
+                r: Rapport::new(),
+                f: Flight::new(),
+            }
+        }
+        fn tick(&mut self, v: &View, a: &Airframe, p: &Persona) -> Vec<Line> {
+            self.tick_sample(&sample(v), v, a, p)
+        }
+        fn tick_sample(&mut self, s: &Sample, v: &View, a: &Airframe, p: &Persona) -> Vec<Line> {
+            let ev = self.f.tick(s);
+            self.r.tick(v, &self.f, &ev, a, p)
+        }
+    }
+
+    impl std::ops::Deref for Rig {
+        type Target = Rapport;
+        fn deref(&self) -> &Rapport {
+            &self.r
+        }
+    }
+
+    /// The flight model's sample for a synthetic view: engines running, the
+    /// field at sea level.
+    fn sample(v: &View) -> Sample {
+        Sample {
+            t: v.t_s,
+            on_ground: v.on_ground,
+            gs_kts: v.groundspeed_kts,
+            ias_kts: v.ias_kts,
+            vsi_fpm: v.vsi_fpm,
+            agl_ft: v.agl_ft,
+            alt_ft: v.agl_ft,
+            engine_running: true,
+            lat: Some(v.lat),
+            lon: Some(v.lon),
+            crashed: Some(v.crashed),
+            ..Sample::default()
+        }
+    }
+
     fn persona(chatter: Chatter) -> Persona {
         Persona {
             chatter,
@@ -809,11 +864,11 @@ mod tests {
     /// Fly a whole sortie through the tracker at 3 Hz: a takeoff, a climb,
     /// an arrival, a touchdown at `sink`, a roll to a stop. Returns every
     /// line said, in order, with the time it was said.
-    fn fly(r: &mut Rapport, p: &Persona, sink: f64, automation: bool) -> Vec<(f64, Line)> {
+    fn fly(r: &mut Rig, p: &Persona, sink: f64, automation: bool) -> Vec<(f64, Line)> {
         let a = c172();
         let mut said = Vec::new();
         let mut t = 0.0;
-        let mut step = |r: &mut Rapport, v: View, said: &mut Vec<(f64, Line)>| {
+        let mut step = |r: &mut Rig, v: View, said: &mut Vec<(f64, Line)>| {
             for l in r.tick(&v, &a, p) {
                 said.push((v.t_s, l));
             }
@@ -893,7 +948,7 @@ mod tests {
 
     #[test]
     fn a_nice_pilot_landing_gets_one_word_after_the_roll() {
-        let mut r = Rapport::new();
+        let mut r = Rig::new();
         let said = fly(&mut r, &persona(Chatter::Normal), 180.0, false);
         let words: Vec<&str> = said.iter().map(|(_, l)| l.text()).collect();
         let remark: Vec<&&str> = words
@@ -912,7 +967,7 @@ mod tests {
 
     #[test]
     fn an_automation_is_never_complimented_and_a_hard_landing_always_said() {
-        let mut r = Rapport::new();
+        let mut r = Rig::new();
         let said = fly(&mut r, &persona(Chatter::Normal), 180.0, true);
         assert!(
             said.iter()
@@ -924,7 +979,7 @@ mod tests {
             said.iter().all(|(_, l)| !l.text().contains("flaps")),
             "{said:?}"
         );
-        let mut r = Rapport::new();
+        let mut r = Rig::new();
         let said = fly(&mut r, &persona(Chatter::Quiet), 700.0, true);
         assert!(
             said.iter()
@@ -935,7 +990,7 @@ mod tests {
 
     #[test]
     fn quiet_volunteers_nothing_that_is_not_owed() {
-        let mut r = Rapport::new();
+        let mut r = Rig::new();
         let said = fly(&mut r, &persona(Chatter::Quiet), 180.0, false);
         assert!(said.is_empty(), "{said:?}");
     }
@@ -956,11 +1011,11 @@ mod tests {
         // until it has been calm for CALM_S.
         let a = c172();
         let p = persona(Chatter::Normal);
-        let mut r = Rapport::new();
+        let mut r = Rig::new();
         let mut t = 0.0;
         let mut said = Vec::new();
         let mut tick =
-            |r: &mut Rapport, agl: f64, vsi: f64, busy: bool, said: &mut Vec<(f64, String)>| {
+            |r: &mut Rig, agl: f64, vsi: f64, busy: bool, said: &mut Vec<(f64, String)>| {
                 t += 1.0;
                 let v = View {
                     t_s: t,
@@ -1002,10 +1057,22 @@ mod tests {
     fn a_bounce_is_not_a_takeoff() {
         let a = c172();
         let p = persona(Chatter::Normal);
-        let mut r = Rapport::new();
-        r.airborne = true;
-        r.takeoff = Some((0.0, 0.0, 0.0));
-        let mut t = 100.0;
+        let mut r = Rig::new();
+        // An arrival joined at 300 ft, down to the wheels.
+        let mut t = 80.0;
+        for i in 0..60 {
+            t += 0.33;
+            let v = View {
+                t_s: t,
+                agl_ft: 300.0 - i as f64 * 5.0,
+                vsi_fpm: -400.0,
+                groundspeed_kts: 60.0,
+                ias_kts: 60.0,
+                ..View::default()
+            };
+            r.tick(&v, &a, &p);
+        }
+        t += 0.33;
         let mut v = View {
             t_s: t,
             on_ground: true,
@@ -1025,7 +1092,7 @@ mod tests {
             };
             r.tick(&v, &a, &p);
         }
-        assert!(!r.airborne);
+        assert!(!r.f.phase().airborne(), "{:?}", r.f.phase());
         assert!(r.pending.is_some(), "the landing word survives a bounce");
         v = View {
             t_s: t + 0.33,
@@ -1039,6 +1106,69 @@ mod tests {
             Some(1),
             "counted at the second contact"
         );
+    }
+
+    /// Down to the wheels at `vsi` and roll to a stop, pilot flying; every
+    /// line said.
+    fn meet_the_ground(vsi: f64) -> (Rig, Vec<String>) {
+        let a = c172();
+        let p = persona(Chatter::Normal);
+        let mut r = Rig::new();
+        let mut said = Vec::new();
+        let mut t = 50.0;
+        for i in 0..30 {
+            t += 0.33;
+            let v = View {
+                t_s: t,
+                agl_ft: 200.0 - i as f64 * 6.0,
+                vsi_fpm: vsi,
+                groundspeed_kts: 70.0,
+                ias_kts: 70.0,
+                gear_down: true,
+                ..View::default()
+            };
+            said.extend(r.tick(&v, &a, &p).into_iter().map(|l| l.text().to_string()));
+        }
+        for i in 0..60 {
+            t += 0.33;
+            let gs = (68.0 - i as f64 * 2.0).max(0.0);
+            let v = View {
+                t_s: t,
+                on_ground: true,
+                vsi_fpm: if i == 0 { vsi } else { 0.0 },
+                groundspeed_kts: gs,
+                ias_kts: gs,
+                gear_down: true,
+                ..View::default()
+            };
+            said.extend(r.tick(&v, &a, &p).into_iter().map(|l| l.text().to_string()));
+        }
+        (r, said)
+    }
+
+    #[test]
+    fn the_ground_met_climbing_is_no_landing_to_praise() {
+        // The flight model reads a contact climbing at 500 fpm as an
+        // IMPACT: the rapport books it, counts no landing at the field and
+        // never calls it smooth (its own detector read it as a 0 fpm
+        // greaser).
+        let (r, said) = meet_the_ground(500.0);
+        assert_eq!(r.f.memory().impacts, 1);
+        assert!(said.is_empty(), "{said:?}");
+        assert_eq!(r.landings_here, 0);
+        // A strike past the impact sink is still said, as the hard landing
+        // it is.
+        let (r, said) = meet_the_ground(-1_600.0);
+        assert_eq!(r.f.memory().impacts, 1);
+        assert_eq!(
+            said,
+            vec!["That was a hard one, about 1600 feet a minute. Worth a look at the gear."]
+        );
+        // And an ordinary one is the model's touchdown, at the model's sink.
+        let (r, said) = meet_the_ground(-200.0);
+        let td = r.f.memory().last_touchdown.unwrap();
+        assert_eq!(td.sink_fpm, -200.0);
+        assert_eq!(said, vec!["Nice one, about 200 feet a minute."]);
     }
 
     #[test]
@@ -1164,14 +1294,14 @@ mod tests {
     fn the_arrival_brief_is_offered_once_a_flight() {
         let a = c172();
         let p = persona(Chatter::Normal);
-        let mut r = Rapport::new();
-        r.airborne = true;
+        let mut r = Rig::new();
         let mut offers = 0;
         for i in 0..200 {
             let v = View {
                 t_s: i as f64,
                 agl_ft: 8000.0,
                 ias_kts: 120.0,
+                groundspeed_kts: 120.0,
                 dest_dist_nm: Some(45.0 - i as f64 * 0.2),
                 ..View::default()
             };
@@ -1198,14 +1328,14 @@ mod tests {
         let a = Airframe::default();
         let p = persona(Chatter::Chatty);
         let mut out = Vec::new();
-        let mut r = Rapport::new();
+        let mut r = Rig::new();
         let mut t0 = 0.0;
         let mut booked: Option<Landing> = None;
         for line in LANDINGS.lines() {
             let v: serde_json::Value = serde_json::from_str(line).unwrap();
             if v["kind"] == "window" {
                 out.push(format!("window {}", v["name"].as_str().unwrap()));
-                r = Rapport::new();
+                r = Rig::new();
                 t0 = f64::NAN;
                 booked = None;
                 continue;
@@ -1231,7 +1361,8 @@ mod tests {
                 crashed: v["crashed"].as_bool().unwrap_or(false),
                 ..View::default()
             };
-            let said = replay_step(&mut r, &view, &a, &p);
+            let s = Sample::from_state_record(&v).unwrap();
+            let said = r.tick_sample(&s, &view, &a, &p);
             if let Some(l) = r.pending {
                 if booked.map(|b| b.t_s) != Some(l.t_s) {
                     out.push(format!(
@@ -1251,10 +1382,6 @@ mod tests {
             }
         }
         out
-    }
-
-    fn replay_step(r: &mut Rapport, v: &View, a: &Airframe, p: &Persona) -> Vec<Line> {
-        r.tick(v, a, p)
     }
 
     #[test]

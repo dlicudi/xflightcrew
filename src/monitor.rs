@@ -2732,7 +2732,6 @@ pub async fn run(
     // after the landing, the offers, the asides held for a quiet moment.
     let mut rapport = crate::rapport::Rapport::new();
     let mut rapport_airframe = crate::rapport::Airframe::from_profile(&live.get());
-    let rapport_epoch = Instant::now();
     // The checklist flow's phase-boundary detector: climb, cruise, descent,
     // before landing, after landing, each once per flight.
     let mut flow_tracker = crate::flow::Tracker::default();
@@ -4327,9 +4326,11 @@ pub async fn run(
             crate::tempo::set_workload(busy);
             // The rapport SEES every tick, a wreck included (it drops the
             // landing word for one), and speaks only what its tick returns.
+            // Its wheels are the flight model's (this tick's events, on the
+            // model's clock), never a second touchdown detector (#85).
             if crew_on {
                 let view = crate::rapport::View {
-                    t_s: now.duration_since(rapport_epoch).as_secs_f64(),
+                    t_s: wall_t,
                     on_ground: snap.on_ground,
                     groundspeed_kts: snap.groundspeed_kts,
                     agl_ft: snap.agl_ft,
@@ -4348,7 +4349,9 @@ pub async fn run(
                     quiet,
                 };
                 let persona = crate::persona::Persona::live();
-                for line in rapport.tick(&view, &rapport_airframe, &persona) {
+                for line in
+                    rapport.tick(&view, &flight, &flight_events, &rapport_airframe, &persona)
+                {
                     crate::blackbox::record(
                         "rapport",
                         serde_json::json!({ "event": "said", "line": line.text() }),
