@@ -389,6 +389,20 @@ pub fn parse_intent(transcript: &str) -> Intent {
     if t.contains("line up") || t.contains("lining up") || t.contains("line-up") {
         return Intent::Unknown;
     }
+    // "Cleared ..." is a READBACK of a clearance, never a request: a pilot
+    // asking says "request clearance", never "cleared". The route already
+    // silenced these, but the intent said RequestLanding / RequestTakeoff,
+    // and an unkeyed one could still reach the tower as that request (EGKK
+    // 26L, 2026-09-27: "..., cleared to land runway two six left" logged as
+    // a landing request in ClearedToLand). A go-around or a reject said in
+    // the same breath is still that report.
+    if word("cleared")
+        && !t.contains("going around")
+        && !t.contains("go around")
+        && !rejecting_takeoff(&t)
+    {
+        return Intent::Unknown;
+    }
     // "request vectors for taxi to parking" (real 2026-07-09 call) wants the
     // taxi, not the vectoring service — ground words beat the vector keyword.
     if t.contains("vector") && !t.contains("taxi") && !word("parking") {

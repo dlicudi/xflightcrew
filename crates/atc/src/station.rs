@@ -96,6 +96,10 @@ pub struct Station {
     requested_ident: Option<String>,
     /// The departure controller has said "radar contact" to this flight.
     dep_checked_in: bool,
+    /// The position the after-takeoff handoff sends the flight to
+    /// (Departure, or Approach at a field without one): its first readback
+    /// there is the check-in. `None` until a takeoff clearance arms it.
+    handed_to: Option<Service>,
     /// The ATIS information letter the pilot last reported having ("with
     /// information Alpha"). When it matches the current broadcast, clearances
     /// skip the QNH — the whole point of an ATIS.
@@ -234,6 +238,7 @@ impl Station {
             runway_request: None,
             requested_ident: None,
             dep_checked_in: false,
+            handed_to: None,
             pilot_info: None,
             assigned_squawk: None,
             planned_route: None,
@@ -637,19 +642,31 @@ impl Station {
             .any(|w| w == "cleared");
         if echoes_clearance || (intent == tower::Intent::Unknown && tower::is_readback(transcript))
         {
-            if service == Service::Departure && !self.dep_checked_in {
+            // The position the tower handed us to takes the check-in: a
+            // field without a departure frequency hands a departure to
+            // APPROACH, and until EGBB (2026-09-27) approach heard "passing
+            // three thousand one hundred climbing one five thousand" as a
+            // readback and said nothing, the tower still holding the flight
+            // cleared for takeoff.
+            let checks_in = service == Service::Departure || self.handed_to == Some(service);
+            if checks_in && !self.dep_checked_in {
                 self.dep_checked_in = true;
+                self.transfer_departure();
+                let position = match service {
+                    Service::Approach => "Approach",
+                    _ => "Departure",
+                };
                 // The climb the pilot announced is the climb they get: the
                 // zone clearance capped them at two thousand, and "radar
                 // contact" alone left "climbing five thousand" unanswered
                 // (LXGB, 2026-09-15).
                 return match climb_announced(transcript) {
                     Some(alt) => format!(
-                        "{}, {} Departure, radar contact, climb {alt}.",
+                        "{}, {} {position}, radar contact, climb {alt}.",
                         ctx.callsign, ctx.airport
                     ),
                     None => format!(
-                        "{}, {} Departure, radar contact.",
+                        "{}, {} {position}, radar contact.",
                         ctx.callsign, ctx.airport
                     ),
                 };
@@ -1196,6 +1213,11 @@ impl Station {
             (None, None) => return,
         };
         self.dep_checked_in = false;
+        self.handed_to = Some(if name == "Departure" {
+            Service::Departure
+        } else {
+            Service::Approach
+        });
         *HANDOFF.lock().unwrap_or_else(|e| e.into_inner()) = Some(Handoff {
             line: format!(
                 "{}, contact {} {} on {}.",
@@ -1209,6 +1231,23 @@ impl Station {
             khz,
         });
         tracing::info!(to = name, "departure handoff armed");
+    }
+
+    /// The departure has checked in with the position it was handed to: the
+    /// tower's book on it is closed. The takeoff clearance is spent (the
+    /// flight is airborne and someone else's), so the tower state goes back
+    /// to Parked, the state every arrival starts from, and the published
+    /// picture says so: nothing held, nothing owed.
+    fn transfer_departure(&mut self) {
+        if self.twr.state == tower::State::TakeoffCleared {
+            self.twr.state = tower::State::Parked;
+        }
+        self.twr.clear_clearance_readback();
+        if let Some(c) = CLEARANCE.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+            c.state = self.twr.state;
+            c.holds_runway = self.twr.holds_runway();
+            c.pending_readback = None;
+        }
     }
 
     /// The approach controller: vectors to final, or a redirect to the tower
@@ -2839,8 +2878,24 @@ pub fn region_tick(lat: f64, lon: f64, on_ground: bool, now: Instant) -> Option<
             d - SERVICE_BIAS_NM * region_services(apt) as f64
         }
     };
+    // An IFR flight in the air is worked by radar units, never handed to a
+    // tower that only owns its zone: EGBB-EGKK (2026-09-27) was told
+    // "contact Oxford Kidlington Tower" at FL150. It goes to a field's
+    // approach (or departure) position, and a tower-only field is passed
+    // over, save the active one and the pinned arrival (the flight is
+    // landing there; its tower is where the inbound call goes).
+    let ifr = IFR_FLIGHT.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let ifr_airborne = !on_ground && ifr.is_some();
+    let pin = arrival_pin_khz();
+    let eligible = |a: &RegionApt| {
+        !ifr_airborne
+            || a.apt.name == active_name
+            || radar_position(&a.apt).is_some()
+            || a.apt.freq(nav::FREQ_TOWER).is_some_and(|f| Some(f.khz) == pin)
+    };
     let (d_best, s_best, best) = region
         .iter()
+        .filter(|a| eligible(a))
         .map(|a| {
             let d = distance(a);
             (d, score(d, &a.apt), a)
@@ -2931,7 +2986,6 @@ pub fn region_tick(lat: f64, lon: f64, on_ground: bool, now: Instant) -> Option<
         // An IFR flight is handed unit to unit with its code: no service
         // ends and no squawk is ordered (LIEA-LEBL, 2026-09-27, an IFR 737
         // on 4501 was told "squawk seven thousand" at FL200).
-        let ifr = IFR_FLIGHT.lock().unwrap_or_else(|e| e.into_inner()).clone();
         // A discrete code in effect goes back to conspicuity with the service
         // that assigned it.
         let squawk_vfr = ifr.is_none()
@@ -2939,7 +2993,15 @@ pub fn region_tick(lat: f64, lon: f64, on_ground: bool, now: Instant) -> Option<
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .is_some();
-        let to = format!("{} Tower", spoken_airport(&best.apt.name));
+        // Enroute, the IFR flight goes to the field's radar position (see
+        // `eligible` above); the pinned arrival keeps its tower, where the
+        // crew's inbound call goes.
+        let pinned = best.apt.freq(nav::FREQ_TOWER).is_some_and(|f| Some(f.khz) == pin);
+        let (position, khz) = match radar_position(&best.apt) {
+            Some(r) if ifr_airborne && !pinned => r,
+            _ => ("Tower", khz),
+        };
+        let to = format!("{} {position}", spoken_airport(&best.apt.name));
         // The instruction as data for the crew that has to obey it: the
         // spoken line alone had no consumer, so the flight kept the discrete
         // code and the old frequency until its own arrival stage retuned.
@@ -2959,6 +3021,15 @@ pub fn region_tick(lat: f64, lon: f64, on_ground: bool, now: Instant) -> Option<
         Some((best.icao.clone(), best.apt.clone()));
     *LAST_REGION_SWITCH.lock().unwrap_or_else(|e| e.into_inner()) = Some(now);
     Some(sw)
+}
+
+/// A field's radar position for an IFR handoff: its approach, else its
+/// departure frequency, as spoken ("Approach") and in kHz. `None` = the field
+/// has only a tower.
+fn radar_position(apt: &nav::AirportInfo) -> Option<(&'static str, i64)> {
+    apt.freq(nav::FREQ_APPROACH)
+        .map(|f| ("Approach", f.khz))
+        .or_else(|| apt.freq(nav::FREQ_DEPARTURE).map(|f| ("Departure", f.khz)))
 }
 
 /// The enroute handoff as spoken. VFR: the radar service ends ("Radar
@@ -8476,6 +8547,7 @@ mod tests {
             runway_request: None,
             requested_ident: None,
             dep_checked_in: false,
+            handed_to: None,
             pilot_info: None,
             assigned_squawk: None,
             planned_route: None,
@@ -8945,6 +9017,78 @@ mod tests {
         );
     }
 
+    /// The real region at the EGBB-EGKK switch (sortie 1790534902, +1319 s,
+    /// FL150 IFR at 52.1 N 1.4 W): a VFR flight there is still handed to
+    /// Oxford's tower, the IFR flight never to a tower-only unit and to a
+    /// radar position when it is handed at all.
+    /// `cargo test -p atc -- --ignored real_install_region_ifr --nocapture`
+    #[test]
+    #[ignore] // needs the real X-Plane install; run with --ignored
+    fn real_install_region_ifr_handoff_goes_to_radar() {
+        let _guard = SIDE_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let apt = crate::nav::test_xplane_path("Global Scenery/Global Airports/Earth nav data/apt.dat");
+        if !std::path::Path::new(&apt).exists() {
+            return;
+        }
+        load_region(&apt);
+        let egbb = REGION
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|a| a.icao == "EGBB")
+            .map(|a| (a.apt.name.clone(), a.lat, a.lon))
+            .expect("EGBB indexed");
+        let arm = || {
+            *PENDING_STATION.lock().unwrap() = None;
+            *LAST_REGION_SWITCH.lock().unwrap() = None;
+            *ARRIVAL_PIN.lock().unwrap() = None;
+            *ACTIVE_FIELD.lock().unwrap() = Some(egbb.clone());
+            *CLEARANCE.lock().unwrap() = Some(ClearanceSnap {
+                state: tower::State::TakeoffCleared,
+                callsign: "Whiskey Alpha Tango four two three six".into(),
+                runway_ident: "33".into(),
+                pending_readback: None,
+                holds_runway: false,
+            });
+        };
+        let t0 = Instant::now();
+        // VFR: the old tower handoff stands.
+        *IFR_FLIGHT.lock().unwrap() = None;
+        arm();
+        let vfr = region_tick(52.1, -1.4, false, t0).map(|s| s.line);
+        let _ = crate::party_line::take_region_handoff();
+        eprintln!("VFR: {vfr:?}");
+        assert!(vfr.as_deref().is_some_and(|l| l.contains("Oxford Kidlington Tower")), "{vfr:?}");
+        // IFR on 4505, as flown.
+        arm();
+        publish_ifr_clearance(
+            tower::IfrClearance {
+                dest: "EGKK".into(),
+                sid: Some("ADME1M".into()),
+                runway: "33".into(),
+                initial_alt_ft: 5000,
+                squawk: 4505,
+            },
+            "Whiskey Alpha Tango four two three six",
+            None,
+        );
+        let ifr = region_tick(52.1, -1.4, false, t0).map(|s| s.line);
+        let h = crate::party_line::take_region_handoff();
+        eprintln!("IFR: {ifr:?} {h:?}");
+        // Oxford publishes approach 125.09 (and "Oxford Radar"): the flight
+        // goes there on radar, its code kept.
+        let h = h.expect("handed to a radar position");
+        assert_eq!((h.to.as_str(), h.khz, h.ifr_code), ("Oxford Kidlington Approach", 125_090, Some(4505)));
+        assert!(!ifr.unwrap_or_default().contains("Tower"));
+        *IFR_FLIGHT.lock().unwrap() = None;
+        *IFR_CLEARANCE.lock().unwrap() = None;
+        *CLEARANCE.lock().unwrap() = None;
+        *PENDING_STATION.lock().unwrap() = None;
+        *LAST_REGION_SWITCH.lock().unwrap() = None;
+        *ACTIVE_FIELD.lock().unwrap() = None;
+        REGION.lock().unwrap().clear();
+    }
+
     #[test]
     fn region_hands_off_to_the_decisively_nearer_tower() {
         let _guard = SIDE_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -9058,22 +9202,46 @@ mod tests {
             "November eight one six November November",
             None,
         );
+        // Malaga here publishes only a tower: an IFR flight in the air is
+        // never handed to one (EGBB-EGKK 2026-09-27, "contact Oxford
+        // Kidlington Tower" at FL150). The last controller keeps it.
+        assert!(region_tick(36.6, -4.6, false, t0).is_none(), "no tower-only handoff for IFR");
+        assert!(crate::party_line::take_region_handoff().is_none());
+        // With an approach position the field takes the flight on radar: a
+        // plain handoff to Malaga APPROACH, the code kept.
+        REGION.lock().unwrap()[1].apt.freqs.push(nav::AtcFreq {
+            kind: nav::FREQ_APPROACH,
+            khz: 123_950,
+            name: "Malaga Approach".into(),
+        });
         let sw = region_tick(36.6, -4.6, false, t0).expect("IFR handoff");
         assert!(!sw.crew);
         assert_eq!(
             sw.line,
-            "November eight one six November November, contact Malaga Tower on one one eight decimal one."
+            "November eight one six November November, contact Malaga Approach on one two three decimal niner five."
         );
         let h = crate::party_line::take_region_handoff().expect("published for the crew");
         assert_eq!(
             h,
             RegionHandoff {
-                to: "Malaga Tower".into(),
-                khz: 118_100,
+                to: "Malaga Approach".into(),
+                khz: 123_950,
                 squawk_vfr: false,
                 ifr_code: Some(4503),
             }
         );
+        // The pinned arrival keeps its tower (the inbound call goes there),
+        // tower-only or not.
+        *PENDING_STATION.lock().unwrap() = None;
+        *LAST_REGION_SWITCH.lock().unwrap() = None;
+        *ACTIVE_FIELD.lock().unwrap() = Some(("Gibraltar".into(), 36.15, -5.35));
+        REGION.lock().unwrap()[1].apt.freqs.pop();
+        *ARRIVAL_PIN.lock().unwrap() = Some(118_100);
+        let sw = region_tick(36.6, -4.6, false, t0).expect("pinned arrival handoff");
+        assert!(sw.line.contains("contact Malaga Tower on one one eight decimal one"), "{}", sw.line);
+        let h = crate::party_line::take_region_handoff().expect("published for the crew");
+        assert_eq!((h.to.as_str(), h.khz), ("Malaga Tower", 118_100));
+        *ARRIVAL_PIN.lock().unwrap() = None;
         // The IFR flight ends at the landing, not before: on the ground at
         // the clearance it stands, airborne it stands, the next ground
         // contact retires it.
@@ -9602,6 +9770,116 @@ mod tests {
             false, // runway unoccupied
             None,  // no wake clock
         )
+    }
+
+    /// EGBB 33, 2026-09-27 (sortie 1790534902): Birmingham has no departure
+    /// frequency, so the tower handed the climbing flight to APPROACH. The
+    /// crew read the handoff back on the tower (silence, correct), retuned,
+    /// and checked in: "passing three thousand one hundred climbing one five
+    /// thousand" was heard by approach as a plain readback and answered with
+    /// nothing, the tower still holding the flight cleared for takeoff. The
+    /// position a departure is handed to takes its check-in, and the tower's
+    /// book on the flight closes there.
+    #[test]
+    fn approach_takes_the_departure_check_in_when_it_is_the_handoff() {
+        let _guard = SIDE_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let path = lxgb_apt_file();
+        let wx = Wx {
+            wind_from_deg: 250.0,
+            wind_kts: 12.0,
+        };
+        let mut st = Station::load(path.to_str().unwrap(), "LXGB").expect("LXGB loads");
+        st.departure_khz = None;
+        let ctx = scripted_ctx(&mut st, wx);
+        // An arrival's readback to approach, no departure handed over: still
+        // silence, never "radar contact".
+        let r = st.route_keyed("descending two thousand", Service::Approach, &ctx, wx);
+        assert_eq!(r, "", "{r}");
+
+        st.twr.state = tower::State::TaxiCleared;
+        let r = st.route_keyed("ready for departure", Service::Tower, &ctx, wx);
+        assert!(r.contains("cleared for takeoff"), "{r}");
+        let _ = crate::party_line::take_departure_handoff();
+        let line = handoff_tick(900.0, false).expect("handoff due");
+        assert!(line.contains("Gibraltar Approach on one two two decimal eight"), "{line}");
+        let _ = crate::party_line::take_departure_handoff();
+
+        // The readback, on the TOWER before the retune: a frequency readback
+        // earns silence and moves nothing.
+        let r = st.route_keyed(
+            "whiskey alpha tango four two three six, gibraltar approach on one two two decimal eight",
+            Service::Tower,
+            &ctx,
+            wx,
+        );
+        assert_eq!(r, "", "{r}");
+        assert_eq!(st.twr.state, tower::State::TakeoffCleared);
+
+        // The check-in on approach, as the crew said it.
+        let checkin = "birmingham approach, whiskey alpha tango four two three six, passing three thousand one hundred climbing one five thousand";
+        assert_eq!(tower::parse_intent(checkin), tower::Intent::Unknown);
+        assert!(tower::is_readback(checkin));
+        let r = st.route_keyed(checkin, Service::Approach, &ctx, wx);
+        assert_eq!(
+            r,
+            "November one seven two Sierra Papa, Gibraltar Approach, radar contact, climb one five thousand."
+        );
+        assert_eq!(st.twr.state, tower::State::Parked, "the tower's book is closed");
+        let snap = crate::party_line::clearance_state();
+        assert_eq!(snap, Some(tower::State::Parked));
+        assert!(!st.twr.holds_runway());
+        // Later readbacks on approach stay quiet.
+        let r = st.route_keyed("maintaining one five thousand", Service::Approach, &ctx, wx);
+        assert_eq!(r, "", "{r}");
+        // The same flight coming back is an arrival from Parked.
+        let r = st.route_keyed("november one seven two, final", Service::Tower, &ctx, wx);
+        assert!(r.contains("cleared to land"), "{r}");
+        *CLEARANCE.lock().unwrap() = None;
+    }
+
+    /// EGKK 26L, 2026-09-27 (sortie 1790534902, +2735 s): the crew's landing
+    /// readback parsed as a landing REQUEST in ClearedToLand. The route kept
+    /// quiet only because the word "cleared" silenced it; the intent now says
+    /// what it is, a readback, and the unkeyed path (where no such guard
+    /// stood) can no longer walk the landing back to "join final".
+    #[test]
+    fn a_landing_readback_is_a_readback_not_a_landing_request() {
+        let _guard = SIDE_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let path = lxgb_apt_file();
+        let wx = Wx {
+            wind_from_deg: 250.0,
+            wind_kts: 12.0,
+        };
+        let readback = "whiskey alpha tango four two three six, cleared to land runway two seven";
+        assert_eq!(tower::parse_intent(readback), tower::Intent::Unknown);
+        assert!(tower::is_readback(readback));
+
+        // Keyed: the gate takes the echo, the frequency stays quiet, the
+        // clearance stands and nothing is owed.
+        let mut st = Station::load(path.to_str().unwrap(), "LXGB").expect("LXGB loads");
+        let ctx = scripted_ctx(&mut st, wx);
+        let r = st.route_keyed("november one seven two, final", Service::Tower, &ctx, wx);
+        assert!(r.contains("cleared to land"), "{r}");
+        assert!(st.twr.pending().is_some(), "the landing readback is owed");
+        let r = st.route_keyed(readback, Service::Tower, &ctx, wx);
+        assert_eq!(r, "", "{r}");
+        assert_eq!(st.twr.state, tower::State::ClearedToLand);
+        assert!(st.twr.pending().is_none(), "paid");
+        // Said again with nothing owed: still silence, still cleared.
+        let r = st.route_keyed(readback, Service::Tower, &ctx, wx);
+        assert_eq!(r, "", "{r}");
+        assert_eq!(st.twr.state, tower::State::ClearedToLand);
+
+        // Unkeyed, addressed by our callsign: not the tower's business as a
+        // request any more; it falls through and the landing stands.
+        let mut st = Station::load(path.to_str().unwrap(), "LXGB").expect("LXGB loads");
+        let mut ctx = scripted_ctx(&mut st, wx);
+        ctx.callsign = "Whiskey Alpha Tango four two three six".into();
+        st.route_keyed("whiskey alpha tango four two three six, final", Service::Tower, &ctx, wx);
+        assert_eq!(st.twr.state, tower::State::ClearedToLand);
+        assert_eq!(st.route_unkeyed(readback, Service::Tower, &ctx, wx), None);
+        assert_eq!(st.twr.state, tower::State::ClearedToLand, "never walked back to Inbound");
+        *CLEARANCE.lock().unwrap() = None;
     }
 
     /// Whole sorties driven through the pure routing layer — the dialogue

@@ -442,7 +442,9 @@ everything blackboxes to `logs/blackbox.jsonl` (kinds: `atc`, `autotaxi`, `autot
   `take_region_handoff()` (survives `Station::install`; 7000 via `SetTransponder`;
   `region_coach_line` with a pilot flying). **An IFR flight keeps its code** (party line
   `IFR_FLIGHT`, survives install, retired at the landing): no service terminated, no 7000
-  (`region_handoff_line`, `RegionHandoff.ifr_code`; LIEA-LEBL 2026-09-27).
+  (`region_handoff_line`, `RegionHandoff.ifr_code`; LIEA-LEBL 2026-09-27). Airborne it is handed
+  to a field's radar position, never a tower-only one (`radar_position`; the pinned arrival keeps
+  its tower; FL150 to "Oxford Kidlington Tower", EGBB-EGKK 2026-09-27).
 - **The inbound call** goes from the enroute leg once handed to the destination's OWN tower and
   close (`inbound_due`, `INBOUND_CALL_NM`, `INBOUND_MADE`) or on its challenge
   (`party_line::take_zone_challenge`); else at the station swap (`home_tower_khz`), before the
