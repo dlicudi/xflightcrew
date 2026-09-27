@@ -105,11 +105,7 @@ use answers::{
 use answers::{battery_low, progress_line, speed_assessment_words, speed_verdict, SpeedContext};
 use audio::{Listener, PttMic};
 use config::Config;
-#[cfg(test)]
-use detect::icao_to_profile;
-use detect::{
-    generic_profile, generic_profile_id, known_profile, spawn_aircraft_detector, LiveProfile,
-};
+use detect::{pick_profile, read_identity, spawn_aircraft_detector, LiveProfile};
 use livestate::LiveState;
 #[cfg(test)]
 use plan::ident_distance;
@@ -383,30 +379,24 @@ async fn main() -> Result<()> {
         return stt_eval::run(&config.whisper_model_path, &profile, &manifest);
     }
 
-    // Resolve the aircraft profile: auto-detect from X-Plane's acf_ICAO when
-    // configured as "auto", otherwise use the configured id. Falls back to the
-    // Cessna if detection fails (e.g. X-Plane not reachable yet). The probe
-    // client is used and dropped here — `run_session` makes its own (a reqwest
-    // client must be used on the runtime it runs on).
-    let mut startup_generic: Option<aircraft::AircraftProfile> = None;
+    // Resolve the aircraft profile: auto-detect from the loaded MODEL (its
+    // acf_ICAO and .acf path against every profile's `match:` block, never
+    // the ICAO alone) when configured as "auto", otherwise use the configured
+    // id. Falls back to the Cessna if detection fails (e.g. X-Plane not
+    // reachable yet). The probe client is used and dropped here:
+    // `run_session` makes its own (a reqwest client must be used on the
+    // runtime it runs on). The swap poller resolves through the same
+    // `detect::pick_profile` and says an uncurated airframe aloud.
+    let mut startup_profile: Option<aircraft::AircraftProfile> = None;
     let aircraft_id = if config.aircraft.eq_ignore_ascii_case("auto") {
         let probe = XPlaneClient::new(config.xplane_base_url.clone());
-        match probe.aircraft_icao().await {
-            Ok(icao) => match known_profile(&icao) {
-                Some(id) => {
-                    tracing::info!(icao = %icao, profile = %id, "auto-detected aircraft");
-                    id
-                }
-                None => {
-                    // An unknown type: its own placards, or the 172's numbers
-                    // with a warning in the log (the swap watch says it aloud).
-                    startup_generic = generic_profile(&probe, &icao).await;
-                    if startup_generic.is_none() {
-                        tracing::warn!(icao = %icao, "no profile and no readable .acf; defaulting to cessna_172sp numbers");
-                    }
-                    generic_profile_id(&icao)
-                }
-            },
+        match read_identity(&probe).await {
+            Ok(who) => {
+                let picked = pick_profile(&who);
+                tracing::info!(icao = %who.icao, path = %who.relative_path, profile = %picked.id, "auto-detected aircraft");
+                startup_profile = picked.profile;
+                picked.id
+            }
             Err(e) => {
                 tracing::warn!("aircraft auto-detect failed ({e:#}); defaulting to cessna_172sp");
                 "cessna_172sp".to_string()
@@ -415,7 +405,7 @@ async fn main() -> Result<()> {
     } else {
         config.aircraft.clone()
     };
-    let profile = match startup_generic {
+    let profile = match startup_profile {
         Some(p) => p,
         None => aircraft::load(&aircraft_id)
             .or_else(|| {
@@ -586,9 +576,10 @@ async fn main() -> Result<()> {
     // differs or changes (or if X-Plane wasn't up yet at launch).
     let live_profile = LiveProfile::new(profile.clone());
 
-    // Aircraft-change poller: re-read acf_ICAO periodically and swap the profile
-    // when it changes, so the copilot reconfigures itself (tools, limits, monitor)
-    // instead of staying on whatever was loaded at startup. Auto-detect only.
+    // Aircraft-change poller: re-read the loaded model (acf_ICAO and its .acf
+    // path) periodically and swap the profile when it changes, so the copilot
+    // reconfigures itself (tools, limits, monitor) instead of staying on
+    // whatever was loaded at startup. Auto-detect only.
     if config.aircraft.eq_ignore_ascii_case("auto") {
         spawn_aircraft_detector(
             live_profile.clone(),
@@ -4750,8 +4741,15 @@ mod tests {
     /// mapping that gets you the profile in the first place.
     #[test]
     fn the_baron_recites_the_twin_speeds() {
-        assert_eq!(super::icao_to_profile("BE58"), "beechcraft_baron_58");
-        assert_eq!(super::icao_to_profile("be58"), "beechcraft_baron_58");
+        let baron = "Aircraft/Laminar Research/Beechcraft Baron 58/Baron_58.acf";
+        assert_eq!(
+            super::detect::resolved_id("BE58", baron).as_deref(),
+            Some("beechcraft_baron_58")
+        );
+        assert_eq!(
+            super::detect::resolved_id("be58", baron).as_deref(),
+            Some("beechcraft_baron_58")
+        );
         let p = super::aircraft::load("beechcraft_baron_58").expect("baron profile");
         assert!(super::reference_limits(&p, "what's blue line")
             .unwrap()
@@ -4786,13 +4784,28 @@ mod tests {
     // The RV-10 flew on the 172's numbers for lack of a profile (2026-09-11).
     #[test]
     fn the_rv10_has_its_own_profile_and_unknown_types_are_not_the_172() {
-        assert_eq!(super::icao_to_profile("RV10"), "vans_rv10");
         assert_eq!(
-            super::known_profile("ZZZZ"),
-            None,
+            super::detect::resolved_id(
+                "RV10",
+                "Aircraft/Laminar Research/Van's Aircraft RV-10/RV-10.acf"
+            )
+            .as_deref(),
+            Some("vans_rv10")
+        );
+        let who = super::detect::AcfIdentity {
+            icao: "ZZZZ".into(),
+            relative_path: "Aircraft/Somebody/Zed/Zed Plane.acf".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            super::detect::resolve(&who, &super::aircraft::profile_matchers()),
+            super::detect::Resolution::UnknownType,
             "unknown is unknown, not a Cessna"
         );
-        assert_eq!(super::generic_profile_id("ZZZZ"), "generic_zzzz");
+        assert_eq!(
+            super::detect::generic_profile_id(&who),
+            "generic_zzzz_zed_plane"
+        );
         let p = super::aircraft::load("vans_rv10").expect("RV-10 profile loads");
         let r = p.reference.as_ref().expect("reference card");
         assert_eq!(
@@ -4818,7 +4831,14 @@ mod tests {
     #[test]
     fn citation_x_loads_with_the_poms_own_figures() {
         let p = super::aircraft::load("citation_x").expect("citation_x profile loads");
-        assert_eq!(super::icao_to_profile("C750"), "citation_x");
+        assert_eq!(
+            super::detect::resolved_id(
+                "C750",
+                "Aircraft/Laminar Research/Cessna Citation X/Cessna_CitationX.acf"
+            )
+            .as_deref(),
+            Some("citation_x")
+        );
         assert!(p.autopilot && p.throttle && p.retractable_gear);
         assert!(!p.engine, "a jet declares no piston engine group");
         // POM p.80: Vr 145, Vref 132, Vs1 clean 136, Vle 210. Vmo is altitude
@@ -4851,7 +4871,14 @@ mod tests {
     #[test]
     fn sf50_is_a_stock_systems_jet_with_a_two_press_start() {
         let p = super::aircraft::load("cirrus_vision_sf50").expect("sf50 profile loads");
-        assert_eq!(super::icao_to_profile("SF50"), "cirrus_vision_sf50");
+        assert_eq!(
+            super::detect::resolved_id(
+                "SF50",
+                "Aircraft/Laminar Research/Cirrus Vision SF50/CirrusSF50.acf"
+            )
+            .as_deref(),
+            Some("cirrus_vision_sf50")
+        );
         assert!(p.autopilot && p.throttle && p.retractable_gear);
         assert!(
             !p.engine && !p.magnetos && !p.carb_heat,

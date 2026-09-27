@@ -27,6 +27,15 @@
 id: dc3
 display_name: AWX DC-3
 
+# Which loaded aircraft this profile is for (detect::resolve): the ICAO
+# alone is a TYPE, and two models of one type (the stock 737 and the Zibo
+# both say B738) must never share a profile. Every key must hit. The acf
+# entry is a substring of acf_relative_path: if the aircraft's folder is
+# renamed, change it here (an unmatched model flies generic, said aloud).
+match:
+  icao: [DC3, DC30]
+  acf: ["AWXDC3/"]
+
 # Universal-dataref tools — safe across airframes, verified to respond live.
 # NB: this airframe has NO functional X-Plane autopilot — servos_on/servos_toggle/
 # fdir_on never latch (autopilot_mode stays 0) even powered and airborne, and

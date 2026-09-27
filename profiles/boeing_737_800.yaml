@@ -23,6 +23,15 @@
 id: boeing_737_800
 display_name: Boeing 737-800
 
+# Which loaded aircraft this profile is for (detect::resolve): the ICAO
+# alone is a TYPE, and two models of one type (the stock 737 and the Zibo
+# both say B738) must never share a profile. Every key must hit. The acf
+# entry is a substring of acf_relative_path: if the aircraft's folder is
+# renamed, change it here (an unmatched model flies generic, said aloud).
+match:
+  icao: [B738, B737, B739]
+  acf: ["Laminar Research/Boeing 737-800/"]
+
 # Capability flags.
 autopilot: true        # set_heading / set_altitude / set_vertical_speed
 throttle: true         # thrust levers — jet, so NO piston engine group

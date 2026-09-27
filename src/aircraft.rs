@@ -244,6 +244,13 @@ pub struct AircraftProfile {
     /// Piper M500, P46T). The plan audit's type check accepts them.
     #[serde(default)]
     pub simbrief_types: Vec<String>,
+    /// Which loaded aircraft this profile is FOR: its `acf_ICAO` and the
+    /// model (`acf_relative_path`, optionally author and description). The
+    /// stock Laminar 737 and the Zibo both say B738, and one ICAO cannot
+    /// pick between them (2026-09-27). `None` is a profile detection never
+    /// picks (a pinned `XCOPILOT_AIRCRAFT` still can).
+    #[serde(default, rename = "match")]
+    pub matcher: Option<ProfileMatch>,
     /// Flap system, if any. `None` means no `set_flaps` tool.
     #[serde(default)]
     pub flaps: Option<FlapProfile>,
@@ -1909,11 +1916,19 @@ pub enum ChecklistAction {
 
 /// Load a profile by id: prefer `profiles/<id>.yaml`, else the built-in.
 pub fn load(id: &str) -> Option<AircraftProfile> {
+    read_profile(id, true)
+}
+
+/// [`load`], with or without the "loaded from YAML" log line (the matcher
+/// sweep reads every profile and would print one per file).
+fn read_profile(id: &str, log: bool) -> Option<AircraftProfile> {
     let path = format!("profiles/{id}.yaml");
     match std::fs::read_to_string(&path) {
         Ok(text) => match serde_yaml::from_str::<AircraftProfile>(&text) {
             Ok(profile) => {
-                tracing::info!(path = %path, "loaded aircraft profile from YAML");
+                if log {
+                    tracing::info!(path = %path, "loaded aircraft profile from YAML");
+                }
                 Some(profile)
             }
             Err(e) => {
@@ -1923,6 +1938,79 @@ pub fn load(id: &str) -> Option<AircraftProfile> {
         },
         Err(_) => builtin(id), // no YAML file — use the built-in definition
     }
+}
+
+/// What a profile says it is FOR (the `match:` block). Every key given must
+/// hit; `icao` is required, and a profile with nothing else is a type-wide
+/// catch-all. Each list hits when ANY of its entries does, compared
+/// case-insensitively, the path with backslashes as slashes.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct ProfileMatch {
+    /// `sim/aircraft/view/acf_ICAO` values.
+    #[serde(default)]
+    pub icao: Vec<String>,
+    /// Substrings of `sim/aircraft/view/acf_relative_path` (the model's
+    /// folder and file, relative to the install).
+    #[serde(default)]
+    pub acf: Vec<String>,
+    /// Substrings of `sim/aircraft/view/acf_author`.
+    #[serde(default)]
+    pub author: Vec<String>,
+    /// Substrings of `sim/aircraft/view/acf_descrip`.
+    #[serde(default)]
+    pub description: Vec<String>,
+}
+
+impl ProfileMatch {
+    /// Does this profile claim the ICAO type at all?
+    pub fn claims_type(&self, icao: &str) -> bool {
+        let icao = icao.trim();
+        !icao.is_empty()
+            && self
+                .icao
+                .iter()
+                .any(|t| t.trim().eq_ignore_ascii_case(icao))
+    }
+}
+
+/// Every profile's `match:` block, as `(id, matcher)` sorted by id: the
+/// YAMLs in `profiles/` (read the way [`load`] reads them), and a built-in
+/// whose YAML is missing. A profile without a block is left out.
+pub fn profile_matchers() -> Vec<(String, ProfileMatch)> {
+    let mut ids: Vec<String> = std::fs::read_dir("profiles")
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|e| {
+            let path = e.path();
+            (path.extension().is_some_and(|x| x == "yaml"))
+                .then(|| path.file_stem()?.to_str().map(str::to_string))?
+        })
+        .collect();
+    for b in ["cessna_172sp", "cirrus_sr22"] {
+        if !ids.iter().any(|i| i == b) {
+            ids.push(b.to_string());
+        }
+    }
+    ids.sort();
+    ids.into_iter()
+        .filter_map(|id| {
+            let p = read_profile(&id, false)?;
+            Some((p.id, p.matcher?))
+        })
+        .collect()
+}
+
+/// The profile for a TYPE, not a model: a flight plan's ICAO (SimBrief
+/// `aircraft/icaocode`) names no model, so any profile whose `match.icao`
+/// holds it answers (the first by id). For type-level questions only (jet
+/// or helicopter, from a plan); the loaded aircraft is resolved by
+/// `detect::resolve`, never by this.
+pub fn profile_for_type(icao: &str) -> Option<AircraftProfile> {
+    profile_matchers()
+        .into_iter()
+        .find(|(_, m)| m.claims_type(icao))
+        .and_then(|(id, _)| read_profile(&id, true))
 }
 
 /// The universal thrust-lever dataref: what every airframe used until one
@@ -2500,6 +2588,8 @@ pub fn generic_from_acf(icao: &str, acf_text: &str) -> AircraftProfile {
     let kts = |k: &str| num(k).filter(|v| *v > 0.0 && *v < 9000.0);
     let mut p = cessna_172sp();
     p.id = format!("generic_{}", icao.to_lowercase());
+    // Built on the 172's bones, but never detected as one.
+    p.matcher = None;
     p.pressurised = None; // Unknown systems must use neutral cabin-altitude wording.
     let name = vals
         .get("acf/_name")
@@ -4280,6 +4370,11 @@ fn cessna_172sp() -> AircraftProfile {
         id: "cessna_172sp".into(),
         display_name: "Cessna 172SP Skyhawk".into(),
         simbrief_types: Vec::new(),
+        matcher: Some(ProfileMatch {
+            icao: vec!["C172".into()],
+            acf: vec!["Laminar Research/Cessna 172 SP/".into()],
+            ..Default::default()
+        }),
         engines: 1,
         magnetos_per_engine: false,
         flood_lights_dataref: None,
@@ -4600,6 +4695,11 @@ fn cirrus_sr22() -> AircraftProfile {
         id: "cirrus_sr22".into(),
         display_name: "Cirrus SR22".into(),
         simbrief_types: Vec::new(),
+        matcher: Some(ProfileMatch {
+            icao: vec!["SR22".into()],
+            acf: vec!["Laminar Research/Cirrus SR22/".into()],
+            ..Default::default()
+        }),
         engines: 1,
         magnetos_per_engine: false,
         flood_lights_dataref: None,

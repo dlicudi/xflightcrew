@@ -1,4 +1,5 @@
-//! The aircraft on the other side of the API: which profile an ICAO type gets,
+//! The aircraft on the other side of the API: which profile a loaded MODEL gets
+//! (its ICAO and .acf, resolved against every profile's `match:` block),
 //! the live profile handle the loops read, the swap-time stand-down, and the
 //! generic profile an unknown airframe is built from its own .acf. Split out
 //! of main.rs on 2026-09-16.
@@ -49,45 +50,257 @@ impl LiveProfile {
     }
 }
 
-/// Release every continuous manager before an aircraft profile changes.
-///
-
-/// Map an X-Plane ICAO type code to a profile id. Unknown types fall back to
-/// the Cessna so the app stays usable; add rows as profiles are added.
-/// The tests' view of the map: a known type's profile, else the 172.
-#[cfg(test)]
-pub(crate) fn icao_to_profile(icao: &str) -> String {
-    known_profile(icao).unwrap_or_else(|| "cessna_172sp".to_string())
+/// Who the loaded aircraft is: the strings detection resolves a profile from.
+/// The ICAO names a TYPE; the path (and author, description) name the MODEL.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct AcfIdentity {
+    /// `sim/aircraft/view/acf_ICAO`.
+    pub icao: String,
+    /// `sim/aircraft/view/acf_relative_path`, relative to the install.
+    pub relative_path: String,
+    /// `sim/aircraft/view/acf_author`.
+    pub author: String,
+    /// `sim/aircraft/view/acf_descrip`.
+    pub descrip: String,
 }
 
-/// The curated profile for an ICAO type, if one exists. `None` is an
-/// airframe nobody has written a profile for — and that is NOT the 172: the
-/// RV-10 flew on the 172's numbers for lack of this distinction (approach
-/// speed equal to its own clean stall, flap limit 11 kt under its placard,
-/// a healthy 12 volt battery called low; 2026-09-11). An unknown type gets a
-/// profile built from its own `.acf` placards instead (`generic_profile`).
-pub(crate) fn known_profile(icao: &str) -> Option<String> {
-    Some(
-        match icao.to_uppercase().as_str() {
-            "C172" => "cessna_172sp",
-            "SR22" => "cirrus_sr22",
-            "MD82" | "MD80" | "MD83" | "MD88" => "md82",
-            "C750" | "C75B" => "citation_x",
-            "SF50" => "cirrus_vision_sf50",
-            "DC3" | "DC30" => "dc3",
-            "BE9L" | "BE9T" | "C90" | "C90B" => "king_air_c90b",
-            "BE58" | "BE55" => "beechcraft_baron_58",
-            "EVOT" | "EVOP" => "lancair_evolution",
-            "DHC6" => "dhc6_twin_otter",
-            "RV10" => "vans_rv10",
-            "B738" | "B737" | "B739" => "boeing_737_800",
-            "A333" | "A332" | "A330" => "airbus_a330_300",
-            "B744" | "B748" | "B74F" => "boeing_747_400",
-            "S76" | "S76C" | "S76D" => "sikorsky_s76c",
-            _ => return None,
+/// Case-folded, trimmed, backslashes as slashes: how every matcher string and
+/// every identity string is compared.
+fn normalise(s: &str) -> String {
+    s.trim().replace('\\', "/").to_lowercase()
+}
+
+/// The detector's change key: the model, not the type. Two .acf files with
+/// one ICAO (the stock 737 and the Zibo) are two keys; a livery change is
+/// not a change (the livery path is never read).
+pub(crate) fn model_key(icao: &str, relative_path: &str) -> (String, String) {
+    (icao.trim().to_uppercase(), normalise(relative_path))
+}
+
+impl AcfIdentity {
+    pub(crate) fn key(&self) -> (String, String) {
+        model_key(&self.icao, &self.relative_path)
+    }
+}
+
+/// The identity, read in one join. Any failed read is no identity: the
+/// caller asks again (a missing author must not look like "no author").
+pub(crate) async fn read_identity(xp: &XPlaneClient) -> Result<AcfIdentity> {
+    let (icao, rel, author, descrip) = tokio::join!(
+        xp.aircraft_icao(),
+        xp.get_string(datarefs::ACF_RELATIVE_PATH),
+        xp.get_string(datarefs::ACF_AUTHOR),
+        xp.get_string(datarefs::ACF_DESCRIP),
+    );
+    Ok(AcfIdentity {
+        icao: icao?.trim().to_string(),
+        relative_path: rel?.trim().to_string(),
+        author: author?.trim().to_string(),
+        descrip: descrip?.trim().to_string(),
+    })
+}
+
+/// What detection made of an identity.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Resolution {
+    /// A profile claims this model. `keys` are the match keys that hit (all
+    /// it declared); `tied_with` names a second profile that matched as
+    /// specifically, a profile-authoring error.
+    Profile {
+        id: String,
+        keys: Vec<&'static str>,
+        tied_with: Option<String>,
+    },
+    /// A type we have a profile for, but not this model (the Zibo on the
+    /// stock 737's ICAO). Never the other model's profile.
+    UnknownModel,
+    /// A type no profile claims.
+    UnknownType,
+}
+
+/// The one decision from identity to profile, for the startup probe and the
+/// swap poller alike. Pure. Candidates are the profiles whose `match.icao`
+/// holds the ICAO; a candidate matches only when every key it declares hits;
+/// the most specific (most keys) wins, a tie goes to the first id and is
+/// warned. An ICAO hit with no model match is `UnknownModel`.
+pub(crate) fn resolve(
+    who: &AcfIdentity,
+    profiles: &[(String, aircraft::ProfileMatch)],
+) -> Resolution {
+    let path = normalise(&who.relative_path);
+    let author = normalise(&who.author);
+    let descrip = normalise(&who.descrip);
+    // A key hits when any of its (non-empty) entries is a substring; an
+    // empty list, or one of empty strings, is a key not declared.
+    let key = |entries: &[String], hay: &str| -> Option<bool> {
+        let entries: Vec<String> = entries
+            .iter()
+            .map(|e| normalise(e))
+            .filter(|e| !e.is_empty())
+            .collect();
+        (!entries.is_empty()).then(|| entries.iter().any(|e| hay.contains(e.as_str())))
+    };
+    let mut claimed = false;
+    let mut hits: Vec<(&str, Vec<&'static str>)> = Vec::new();
+    for (id, m) in profiles {
+        if !m.claims_type(&who.icao) {
+            continue;
         }
-        .to_string(),
-    )
+        claimed = true;
+        let mut keys = vec!["icao"];
+        let mut all = true;
+        for (name, entries, hay) in [
+            ("acf", &m.acf, path.as_str()),
+            ("author", &m.author, author.as_str()),
+            ("description", &m.description, descrip.as_str()),
+        ] {
+            match key(entries, hay) {
+                Some(true) => keys.push(name),
+                Some(false) => all = false,
+                None => {}
+            }
+        }
+        if all {
+            hits.push((id.as_str(), keys));
+        }
+    }
+    // Most keys first, then by id, so a tie is deterministic.
+    hits.sort_by(|a, b| b.1.len().cmp(&a.1.len()).then(a.0.cmp(b.0)));
+    let mut it = hits.into_iter();
+    match it.next() {
+        Some((id, keys)) => {
+            let tied_with = it
+                .next()
+                .filter(|(_, k)| k.len() == keys.len())
+                .map(|(o, _)| o.to_string());
+            if let Some(other) = &tied_with {
+                tracing::warn!(icao = %who.icao, path = %who.relative_path, chosen = id, other = %other, "two profiles match this aircraft equally; picked the first by id");
+            }
+            Resolution::Profile {
+                id: id.to_string(),
+                keys,
+                tied_with,
+            }
+        }
+        None if claimed => Resolution::UnknownModel,
+        None => Resolution::UnknownType,
+    }
+}
+
+/// The profile id an unmatched airframe flies under: the type AND the model's
+/// file, so two unknown models of one type are two ids (and the detector's
+/// "changed?" comparison is stable across ticks).
+pub(crate) fn generic_profile_id(who: &AcfIdentity) -> String {
+    let clean = |s: &str| -> String {
+        let mut out = String::new();
+        for c in s.to_lowercase().chars() {
+            let c = if c.is_ascii_alphanumeric() { c } else { '_' };
+            if !(c == '_' && out.ends_with('_')) {
+                out.push(c);
+            }
+        }
+        out.trim_matches('_').to_string()
+    };
+    let stem = std::path::Path::new(&normalise(&who.relative_path))
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .map(clean)
+        .filter(|s| !s.is_empty());
+    let icao = clean(&who.icao);
+    match stem {
+        Some(stem) => format!("generic_{icao}_{stem}"),
+        None => format!("generic_{icao}"),
+    }
+}
+
+/// "a B738", "an A333": the article as the letters are spoken.
+fn a_type(icao: &str) -> String {
+    let an = icao
+        .chars()
+        .next()
+        .is_some_and(|c| "AEFHILMNORSX".contains(c.to_ascii_uppercase()));
+    format!("{} {icao}", if an { "an" } else { "a" })
+}
+
+/// What the startup probe and the poller load for an identity, and the line
+/// the pilot hears when it is not a curated profile.
+pub(crate) struct Picked {
+    pub id: String,
+    pub profile: Option<aircraft::AircraftProfile>,
+    pub line: Option<String>,
+    pub resolution: Resolution,
+    pub who: AcfIdentity,
+}
+
+impl Picked {
+    /// Why this profile: the identity and the keys that picked it, for the
+    /// swap's `profile_probe` record.
+    pub(crate) fn blackbox(&self) -> serde_json::Value {
+        let (resolution, keys, tied_with) = match &self.resolution {
+            Resolution::Profile {
+                keys, tied_with, ..
+            } => ("profile", keys.clone(), tied_with.clone()),
+            Resolution::UnknownModel => ("unknown_model", Vec::new(), None),
+            Resolution::UnknownType => ("unknown_type", Vec::new(), None),
+        };
+        serde_json::json!({
+            "icao": self.who.icao,
+            "relative_path": self.who.relative_path,
+            "author": self.who.author,
+            "descrip": self.who.descrip,
+            "resolution": resolution,
+            "keys": keys,
+            "tied_with": tied_with,
+        })
+    }
+}
+
+/// Resolve an identity against every profile's `match:` block and load what
+/// it names. A curated profile loads by id. Anything else, including a model
+/// of a type we DO have a profile for, flies its own `.acf` placards and SAYS
+/// so; an unreadable file gets the 172's numbers, said too. A silent fallback
+/// is how the RV-10 was flown to a stall on a Cessna's approach speed
+/// (2026-09-11), and how a Zibo would have flown the stock 737's datarefs.
+pub(crate) fn pick_profile(who: &AcfIdentity) -> Picked {
+    let resolution = resolve(who, &aircraft::profile_matchers());
+    let icao = who.icao.trim().to_uppercase();
+    let (id, profile, line) = match &resolution {
+        Resolution::Profile { id, .. } => (id.clone(), aircraft::load(id), None),
+        other => {
+            let id = generic_profile_id(who);
+            let model = matches!(other, Resolution::UnknownModel);
+            match generic_profile(who, &id) {
+                Some(p) => {
+                    let line = if model {
+                        format!("This is {} but not one I have a profile for. I'm flying it on the placards from its own aircraft file. Treat every automation as untested.", a_type(&icao))
+                    } else {
+                        "No profile for this airframe. I'm flying it on the placards from its own aircraft file. Treat every automation as untested.".to_string()
+                    };
+                    (id, Some(p), Some(line))
+                }
+                None => {
+                    let p = aircraft::load("cessna_172sp").map(|mut p| {
+                        p.id = id.clone();
+                        p
+                    });
+                    let line = if model {
+                        format!("This is {} but not one I have a profile for, and I can't read its aircraft file. Falling back to Cessna 172 numbers, which are wrong for it. No automation until there's a profile.", a_type(&icao))
+                    } else {
+                        format!("No profile for {icao} and I can't read its aircraft file. Falling back to Cessna 172 numbers, which are wrong for it. No automation until there's a profile.")
+                    };
+                    (id, p, Some(line))
+                }
+            }
+        }
+    };
+    tracing::info!(icao = %who.icao, path = %who.relative_path, author = %who.author, profile = %id, resolution = ?resolution, "aircraft resolved");
+    Picked {
+        id,
+        profile,
+        line,
+        resolution,
+        who: who.clone(),
+    }
 }
 
 /// The names a profile relies on that the running sim does not have: two
@@ -107,53 +320,44 @@ pub(crate) async fn missing_profile_names(
     Ok(aircraft::missing_references(names, &datarefs, &commands))
 }
 
-/// The profile id an unknown type flies under, so the detector's "changed?"
-/// comparison is stable across ticks.
-pub(crate) fn generic_profile_id(icao: &str) -> String {
-    format!("generic_{}", icao.to_lowercase())
-}
-
 /// The loaded airframe's `.acf` text: the sim names the file
 /// (`acf_relative_path`, relative to the install). `None` when unreadable.
 pub(crate) async fn acf_text(xp: &XPlaneClient) -> Option<String> {
     let rel = xp
-        .get_string("sim/aircraft/view/acf_relative_path")
+        .get_string(datarefs::ACF_RELATIVE_PATH)
         .await
         .ok()
         .filter(|r| !r.is_empty())?;
     std::fs::read_to_string(format!("{}/{}", tools::autoland::xplane_root(), rel)).ok()
 }
 
-/// A profile for an unknown airframe from its own `.acf`: the sim names the
-/// file (`acf_relative_path`, relative to the install), the placards come
-/// out of it. `None` when the file can't be found or read — the caller then
-/// falls back to the 172's numbers and SAYS so.
-pub(crate) async fn generic_profile(
-    xp: &XPlaneClient,
-    icao: &str,
-) -> Option<aircraft::AircraftProfile> {
-    let rel = xp
-        .get_string("sim/aircraft/view/acf_relative_path")
-        .await
-        .ok()
-        .filter(|r| !r.is_empty())?;
+/// A profile for an unmatched airframe from its own `.acf`: the identity names
+/// the file (relative to the install), the placards come out of it. `None`
+/// when the file can't be found or read; the caller then falls back to the
+/// 172's numbers and SAYS so.
+pub(crate) fn generic_profile(who: &AcfIdentity, id: &str) -> Option<aircraft::AircraftProfile> {
+    let rel = who.relative_path.trim();
+    if rel.is_empty() {
+        tracing::warn!(icao = %who.icao, "no profile for this airframe and the sim names no .acf");
+        return None;
+    }
     let path = format!("{}/{}", tools::autoland::xplane_root(), rel);
     match std::fs::read_to_string(&path) {
         Ok(text) => {
-            let mut p = aircraft::generic_from_acf(icao, &text);
-            p.id = generic_profile_id(icao);
-            tracing::warn!(icao, path = %path, "no profile for this airframe; built one from its .acf placards");
+            let mut p = aircraft::generic_from_acf(&who.icao, &text);
+            p.id = id.to_string();
+            tracing::warn!(icao = %who.icao, path = %path, "no profile for this airframe; built one from its .acf placards");
             Some(p)
         }
         Err(e) => {
-            tracing::warn!(icao, path = %path, "no profile for this airframe and its .acf is unreadable: {e}");
+            tracing::warn!(icao = %who.icao, path = %path, "no profile for this airframe and its .acf is unreadable: {e}");
             None
         }
     }
 }
 
-/// The aircraft-change poller: re-reads `acf_ICAO`, swaps the live profile
-/// when it changes (tools, limits, monitor follow), stands every loop down
+/// The aircraft-change poller: re-reads `acf_ICAO` and the .acf path, swaps
+/// the live profile when the MODEL changes (tools, limits, monitor follow), stands every loop down
 /// first, and probes each new profile's names plus the plugin contract
 /// against the sim. Its own thread and runtime; auto-detect only.
 pub(crate) fn spawn_aircraft_detector(
@@ -177,8 +381,18 @@ pub(crate) fn spawn_aircraft_detector(
             // airframe is asked about once.
             let mut probed = String::new();
             let mut last_plugin_probe = std::time::Instant::now();
+            // The model last resolved (icao, normalised .acf path), the
+            // profile id it resolved to, and why, for the probe record.
+            // Keyed on the MODEL: the stock 737 and the Zibo share B738.
+            let mut last_key: Option<(String, String)> = None;
+            let mut id = String::new();
+            let mut identity = serde_json::Value::Null;
             loop {
-                if let Ok(icao) = xp.aircraft_icao().await {
+                let (icao, rel) = tokio::join!(
+                    xp.aircraft_icao(),
+                    xp.get_string(datarefs::ACF_RELATIVE_PATH)
+                );
+                if let (Ok(icao), Ok(rel)) = (icao, rel) {
                     let icao = icao.trim().to_string();
                     if !icao.is_empty() {
                         // Mirror type + callsign to the panel chip
@@ -200,47 +414,46 @@ pub(crate) fn spawn_aircraft_detector(
                             }
                             shown = chip;
                         }
-                        let known = known_profile(&icao);
-                        let id = known.clone().unwrap_or_else(|| generic_profile_id(&icao));
-                        if id != live.id() {
-                            // A known type loads its profile. An unknown one
-                            // gets its own placards, or the 172's numbers —
-                            // and either way the pilot HEARS which, because
-                            // a silent fallback is how the RV-10 was flown
-                            // to a stall on a Cessna's approach speed.
-                            let (loaded, line) = match known {
-                                Some(_) => (aircraft::load(&id), None),
-                                None => match generic_profile(&xp, &icao).await {
-                                    Some(p) => (Some(p), Some("No profile for this airframe. I'm flying it on the placards from its own aircraft file. Treat every automation as untested.".to_string())),
-                                    None => (
-                                        aircraft::load("cessna_172sp").map(|mut p| {
-                                            p.id = id.clone();
-                                            p
-                                        }),
-                                        Some(format!("No profile for {icao} and I can't read its aircraft file. Falling back to Cessna 172 numbers, which are wrong for it. No automation until there's a profile.")),
-                                    ),
-                                },
-                            };
-                            if let Some(p) = loaded {
-                                let name = p.display_name.clone();
-                                tracing::info!(icao = %icao, profile = %id, "aircraft changed; switching profile");
-                                // A manual/native push continues inside
-                                // X-Plane after its one-shot command. Stop
-                                // it before clearing its published state
-                                // and swapping actuator selectors.
-                                if pushback::ACTIVE.load(
-                                    std::sync::atomic::Ordering::SeqCst,
-                                ) {
-                                    let _ = xp
-                                        .run_command(tools::ground::CMD_PUSH_STOP)
-                                        .await;
+                        let key = model_key(&icao, &rel);
+                        // A new model is resolved once: the author and
+                        // description are read only then. A failed read
+                        // leaves the key unset, so the next tick asks again.
+                        if last_key.as_ref() != Some(&key) {
+                            if let Ok(who) = read_identity(&xp).await {
+                                let first = last_key.is_none();
+                                last_key = Some(who.key());
+                                let picked = pick_profile(&who);
+                                identity = picked.blackbox();
+                                id = picked.id.clone();
+                                if id != live.id() {
+                                    if let Some(p) = picked.profile {
+                                        let name = p.display_name.clone();
+                                        tracing::info!(icao = %icao, profile = %id, "aircraft changed; switching profile");
+                                        // A manual/native push continues inside
+                                        // X-Plane after its one-shot command. Stop
+                                        // it before clearing its published state
+                                        // and swapping actuator selectors.
+                                        if pushback::ACTIVE.load(
+                                            std::sync::atomic::Ordering::SeqCst,
+                                        ) {
+                                            let _ = xp
+                                                .run_command(tools::ground::CMD_PUSH_STOP)
+                                                .await;
+                                        }
+                                        live.swap(p);
+                                        // Mirror OR action, never both: voice.alert already
+                                        // posts the spoken line to the panel transcript, so a
+                                        // separate s.alert here double-wrote it (blue + green).
+                                        let line = picked.line.unwrap_or_else(|| format!("Now set up for the {name}."));
+                                        det_voice.alert(voice::Priority::Advisory, line);
+                                    }
+                                } else if first {
+                                    // The startup probe already loaded it; an
+                                    // uncurated airframe is still SAID, once.
+                                    if let Some(line) = picked.line {
+                                        det_voice.alert(voice::Priority::Advisory, line);
+                                    }
                                 }
-                                live.swap(p);
-                                // Mirror OR action, never both: voice.alert already
-                                // posts the spoken line to the panel transcript, so a
-                                // separate s.alert here double-wrote it (blue + green).
-                                let line = line.unwrap_or_else(|| format!("Now set up for the {name}."));
-                                det_voice.alert(voice::Priority::Advisory, line);
                             }
                         }
                         // A profile line is a hypothesis until asked of the
@@ -319,7 +532,7 @@ pub(crate) fn spawn_aircraft_detector(
                                     tracing::info!(profile = %id, total = profile_total, missing = ?missing, "profile probe");
                                     blackbox::record(
                                         "profile_probe",
-                                        serde_json::json!({ "profile": id, "total": profile_total, "missing": missing }),
+                                        serde_json::json!({ "profile": id, "total": profile_total, "missing": missing, "identity": identity }),
                                     );
                                     if let Some(line) = aircraft::probe_summary(&missing, profile_total) {
                                         det_voice.alert(voice::Priority::Caution, line);
@@ -349,4 +562,508 @@ pub(crate) fn spawn_aircraft_detector(
             }
         });
     });
+}
+
+/// The tests' view of the resolver: the curated profile an ICAO and .acf
+/// path resolve to (no author or description), `None` when generic.
+#[cfg(test)]
+pub(crate) fn resolved_id(icao: &str, relative_path: &str) -> Option<String> {
+    let who = AcfIdentity {
+        icao: icao.into(),
+        relative_path: relative_path.into(),
+        ..Default::default()
+    };
+    match resolve(&who, &aircraft::profile_matchers()) {
+        Resolution::Profile { id, .. } => Some(id),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const SPARKY_AUTHOR: &str = "Mohammad Gazzawi / Sergio Santagada / Javier Rollon / Jim Gregory / Michael M. / YesAviation / PresentMonkey / Wolfair / Notchmaster / Reddeviln / Totedemac/ Ghostfire / Mark Parker / Others (see github)";
+
+    fn who(icao: &str, path: &str, author: &str) -> AcfIdentity {
+        AcfIdentity {
+            icao: icao.into(),
+            relative_path: path.into(),
+            author: author.into(),
+            descrip: String::new(),
+        }
+    }
+
+    /// Every installed .acf (ICAO and author from its own `P acf/_ICAO` and
+    /// `P acf/_author` lines, 2026-09-27) and the profile it must fly.
+    /// `None` is generic, said aloud.
+    fn installed() -> Vec<(AcfIdentity, Option<&'static str>)> {
+        let lr = "Laminar Research - dmax3d.com";
+        let awx = "Johan van Wyk, Fred Stegmann, Manfred Jahn, Jan Visser and Team";
+        vec![
+            (
+                who(
+                    "C172",
+                    "Aircraft/Laminar Research/Cessna 172 SP/Cessna_172SP.acf",
+                    lr,
+                ),
+                Some("cessna_172sp"),
+            ),
+            (
+                who(
+                    "C172",
+                    "Aircraft/Laminar Research/Cessna 172 SP/Cessna_172SP_G1000.acf",
+                    lr,
+                ),
+                Some("cessna_172sp"),
+            ),
+            (
+                who(
+                    "C172",
+                    "Aircraft/Laminar Research/Cessna 172 SP/Cessna_172SP_seaplane.acf",
+                    lr,
+                ),
+                Some("cessna_172sp"),
+            ),
+            (
+                who(
+                    "SR22",
+                    "Aircraft/Laminar Research/Cirrus SR22/Cirrus SR22.acf",
+                    "Rodrigo Fernandez P., Alex Unruh, Austin Meyer",
+                ),
+                Some("cirrus_sr22"),
+            ),
+            (
+                who(
+                    "MD82",
+                    "Aircraft/Laminar Research/McDonnell Douglas MD-82/MD80.acf",
+                    "Sergio Santagada",
+                ),
+                Some("md82"),
+            ),
+            (
+                who(
+                    "C750",
+                    "Aircraft/Laminar Research/Cessna Citation X/Cessna_CitationX.acf",
+                    "Massimo Durando",
+                ),
+                Some("citation_x"),
+            ),
+            (
+                who(
+                    "SF50",
+                    "Aircraft/Laminar Research/Cirrus Vision SF50/CirrusSF50.acf",
+                    lr,
+                ),
+                Some("cirrus_vision_sf50"),
+            ),
+            (who("DC3", "Aircraft/AWXDC3/awxdc3.acf", awx), Some("dc3")),
+            (
+                who("DC3", "Aircraft/AWXDC3/awxdc3GNS.acf", awx),
+                Some("dc3"),
+            ),
+            (
+                who("DC3", "Aircraft/AWXDC3/awxdc3_Pas.acf", awx),
+                Some("dc3"),
+            ),
+            (
+                who("DC3", "Aircraft/AWXDC3/AWXDC3Float.acf", "Aeroworx"),
+                Some("dc3"),
+            ),
+            (
+                who(
+                    "BE9L",
+                    "Aircraft/Laminar Research/Beechcraft King Air C90B/C90B.acf",
+                    "Tom Kyler/Jim Gregory",
+                ),
+                Some("king_air_c90b"),
+            ),
+            (
+                who(
+                    "BE58",
+                    "Aircraft/Laminar Research/Beechcraft Baron 58/Baron_58.acf",
+                    "Tom Kyler/Jim Gregory",
+                ),
+                Some("beechcraft_baron_58"),
+            ),
+            (
+                who(
+                    "EVOT",
+                    "Aircraft/Laminar Research/Lancair Evolution/N844X.acf",
+                    "Austin Meyer, Rodrigo Fernandez, Alex Unruh",
+                ),
+                Some("lancair_evolution"),
+            ),
+            (
+                who(
+                    "DHC6",
+                    "Aircraft/DHC6-300 Twin Otter V2/DHC6.acf",
+                    "Rob Wilson",
+                ),
+                Some("dhc6_twin_otter"),
+            ),
+            (
+                who(
+                    "DHC6",
+                    "Aircraft/DHC6-300 Twin Otter V2/DHC6S.acf",
+                    "Rob Wilson",
+                ),
+                Some("dhc6_twin_otter"),
+            ),
+            (
+                who(
+                    "DHC6",
+                    "Aircraft/DHC6-300 Twin Otter V2/DHC6T.acf",
+                    "Rob Wilson",
+                ),
+                Some("dhc6_twin_otter"),
+            ),
+            (
+                who(
+                    "RV10",
+                    "Aircraft/Laminar Research/Van's Aircraft RV-10/RV-10.acf",
+                    "Rodrigo Fernandez",
+                ),
+                Some("vans_rv10"),
+            ),
+            (
+                who(
+                    "B738",
+                    "Aircraft/Laminar Research/Boeing 737-800/b738.acf",
+                    "Alex Unruh",
+                ),
+                Some("boeing_737_800"),
+            ),
+            (
+                who(
+                    "A333",
+                    "Aircraft/Laminar Research/Airbus A330-300/A330.acf",
+                    "Alex Unruh",
+                ),
+                Some("airbus_a330_300"),
+            ),
+            (
+                who(
+                    "A333",
+                    "Aircraft/Laminar Research/Airbus A330-300/A330_AI.acf",
+                    "Alex Unruh",
+                ),
+                Some("airbus_a330_300"),
+            ),
+            (
+                who("B744", "Aircraft/Sparky/747-400/747-400.acf", SPARKY_AUTHOR),
+                Some("boeing_747_400"),
+            ),
+            (
+                who(
+                    "B744",
+                    "Aircraft/Sparky/747-400/747-400_XP11.acf",
+                    SPARKY_AUTHOR,
+                ),
+                Some("boeing_747_400"),
+            ),
+            (
+                who(
+                    "S76",
+                    "Aircraft/Laminar Research/Sikorsky S-76/S-76C.acf",
+                    "Brett Sumpter",
+                ),
+                Some("sikorsky_s76c"),
+            ),
+            // Installed, no profile: the ToLiss A319 and the Laminar types
+            // nobody has written one for.
+            (
+                who(
+                    "A319",
+                    "Aircraft/ToLissA319_V1p12p1/a319.acf",
+                    "Gliding Kiwi",
+                ),
+                None,
+            ),
+            (
+                who(
+                    "A319",
+                    "Aircraft/ToLissA319_V1p12p1/a319_XP11_StdDef.acf",
+                    "Gliding Kiwi",
+                ),
+                None,
+            ),
+            (
+                who(
+                    "PA18",
+                    "Aircraft/Laminar Research/Piper PA-18 Super Cub/PA-18-150.acf",
+                    lr,
+                ),
+                None,
+            ),
+            (
+                who(
+                    "R22",
+                    "Aircraft/Laminar Research/Robinson R22 Beta II/Robinson R22 Beta II.acf",
+                    "Marcel Felde",
+                ),
+                None,
+            ),
+            // The Zibo says B738 too, and is NOT the stock 737.
+            (
+                who("B738", "Aircraft/Zibo/B737-800X/b738_4k.acf", "Zibo"),
+                None,
+            ),
+            // Windows reports backslashes.
+            (
+                who(
+                    "B738",
+                    "Aircraft\\Laminar Research\\Boeing 737-800\\b738.acf",
+                    "Alex Unruh",
+                ),
+                Some("boeing_737_800"),
+            ),
+            (
+                who(
+                    "b738",
+                    "AIRCRAFT/LAMINAR RESEARCH/BOEING 737-800/B738.ACF",
+                    "Alex Unruh",
+                ),
+                Some("boeing_737_800"),
+            ),
+        ]
+    }
+
+    #[test]
+    fn every_installed_model_resolves_to_its_own_profile_or_generic() {
+        let profiles = aircraft::profile_matchers();
+        for (w, want) in installed() {
+            let got = resolve(&w, &profiles);
+            match (want, &got) {
+                (Some(want), Resolution::Profile { id, tied_with, .. }) => {
+                    assert_eq!(id, want, "{w:?}");
+                    assert_eq!(tied_with, &None, "two shipped profiles tie on {w:?}");
+                }
+                (None, Resolution::UnknownModel | Resolution::UnknownType) => {}
+                _ => panic!("{w:?} resolved to {got:?}, wanted {want:?}"),
+            }
+        }
+    }
+
+    /// The Zibo on the stock 737's ICAO: an unknown MODEL of a known type,
+    /// flown generic and said so, never the stock profile.
+    #[test]
+    fn a_zibo_is_not_the_stock_737() {
+        let zibo = who("B738", "Aircraft/Zibo/B737-800X/b738_4k.acf", "Zibo");
+        assert_eq!(
+            resolve(&zibo, &aircraft::profile_matchers()),
+            Resolution::UnknownModel
+        );
+        let tolis = who(
+            "A319",
+            "Aircraft/ToLissA319_V1p12p1/a319.acf",
+            "Gliding Kiwi",
+        );
+        assert_eq!(
+            resolve(&tolis, &aircraft::profile_matchers()),
+            Resolution::UnknownType
+        );
+        // The file does not exist, so the 172's numbers: said, and under the
+        // model's own generic id, never boeing_737_800.
+        let picked = pick_profile(&zibo);
+        assert_eq!(picked.id, "generic_b738_b738_4k");
+        let line = picked
+            .line
+            .clone()
+            .expect("an uncurated airframe is said aloud");
+        assert!(
+            line.starts_with("This is a B738 but not one I have a profile for"),
+            "{line}"
+        );
+        let p = picked.profile.clone().expect("a flyable fallback");
+        assert_eq!(p.id, "generic_b738_b738_4k");
+        let rec = picked.blackbox();
+        assert_eq!(rec["resolution"], "unknown_model");
+        assert_eq!(rec["relative_path"], "Aircraft/Zibo/B737-800X/b738_4k.acf");
+    }
+
+    #[test]
+    fn the_probe_record_names_the_identity_and_the_keys() {
+        let sparky = who("B744", "Aircraft/Sparky/747-400/747-400.acf", SPARKY_AUTHOR);
+        let picked = pick_profile(&sparky);
+        assert_eq!(picked.id, "boeing_747_400");
+        assert!(picked.line.is_none());
+        let rec = picked.blackbox();
+        assert_eq!(rec["resolution"], "profile");
+        assert_eq!(rec["keys"], serde_json::json!(["icao", "acf", "author"]));
+        assert_eq!(rec["icao"], "B744");
+        assert_eq!(rec["author"], SPARKY_AUTHOR);
+        // Every declared key must hit: the Sparky folder with another
+        // author, or a renamed folder, is not the Sparky.
+        let other = who(
+            "B744",
+            "Aircraft/Sparky/747-400/747-400.acf",
+            "Laminar Research",
+        );
+        assert_eq!(
+            resolve(&other, &aircraft::profile_matchers()),
+            Resolution::UnknownModel
+        );
+        let moved = who("B744", "Aircraft/My 747/747-400.acf", SPARKY_AUTHOR);
+        assert_eq!(
+            resolve(&moved, &aircraft::profile_matchers()),
+            Resolution::UnknownModel
+        );
+    }
+
+    #[test]
+    fn every_shipped_profile_declares_its_model() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("profiles");
+        let mut n = 0;
+        for e in std::fs::read_dir(dir).unwrap().flatten() {
+            let path = e.path();
+            if path.extension().is_none_or(|x| x != "yaml") {
+                continue;
+            }
+            let text = std::fs::read_to_string(&path).unwrap();
+            let p: aircraft::AircraftProfile =
+                serde_yaml::from_str(&text).unwrap_or_else(|e| panic!("{}: {e:#}", path.display()));
+            let m = p
+                .matcher
+                .unwrap_or_else(|| panic!("{} has no match: block", p.id));
+            assert!(!m.icao.is_empty(), "{} match: needs icao", p.id);
+            let model = [&m.acf, &m.author, &m.description]
+                .iter()
+                .any(|l| l.iter().any(|e| !e.trim().is_empty()));
+            assert!(model, "{}: an ICAO alone is a type, not a model", p.id);
+            n += 1;
+        }
+        assert!(n >= 15, "only {n} profiles walked");
+        // The built-ins (the YAML-missing fallback) declare theirs too.
+        for id in ["cessna_172sp", "cirrus_sr22"] {
+            let m = aircraft::builtin(id)
+                .and_then(|p| p.matcher)
+                .expect("built-in match");
+            assert!(!m.acf.is_empty(), "{id}");
+        }
+    }
+
+    #[test]
+    fn specificity_wins_and_a_tie_is_picked_by_id() {
+        let m = |icao: &str, acf: &[&str], author: &[&str]| aircraft::ProfileMatch {
+            icao: vec![icao.into()],
+            acf: acf.iter().map(|s| s.to_string()).collect(),
+            author: author.iter().map(|s| s.to_string()).collect(),
+            description: Vec::new(),
+        };
+        let profiles = vec![
+            ("a_catch_all".to_string(), m("B738", &[], &[])),
+            ("b_folder".to_string(), m("B738", &["Zibo/"], &[])),
+            (
+                "c_folder_and_author".to_string(),
+                m("B738", &["zibo/"], &["zibo"]),
+            ),
+            ("d_folder_too".to_string(), m("B738", &["B737-800X"], &[])),
+        ];
+        let z = who("B738", "Aircraft/Zibo/B737-800X/b738_4k.acf", "Zibo team");
+        assert_eq!(
+            resolve(&z, &profiles),
+            Resolution::Profile {
+                id: "c_folder_and_author".into(),
+                keys: vec!["icao", "acf", "author"],
+                tied_with: None
+            }
+        );
+        let z2 = who("B738", "Aircraft/Zibo/B737-800X/b738_4k.acf", "someone");
+        assert_eq!(
+            resolve(&z2, &profiles),
+            Resolution::Profile {
+                id: "b_folder".into(),
+                keys: vec!["icao", "acf"],
+                tied_with: Some("d_folder_too".into())
+            }
+        );
+        // Only the catch-all is left for another model of the type.
+        let s = who(
+            "B738",
+            "Aircraft/Laminar Research/Boeing 737-800/b738.acf",
+            "",
+        );
+        assert_eq!(
+            resolve(&s, &profiles),
+            Resolution::Profile {
+                id: "a_catch_all".into(),
+                keys: vec!["icao"],
+                tied_with: None
+            }
+        );
+        // A description key.
+        let d = vec![(
+            "desc".to_string(),
+            aircraft::ProfileMatch {
+                icao: vec!["X1".into()],
+                description: vec!["Special".into()],
+                ..Default::default()
+            },
+        )];
+        let mut w = who("X1", "Aircraft/x/x.acf", "");
+        assert_eq!(resolve(&w, &d), Resolution::UnknownModel);
+        w.descrip = "A special build".into();
+        assert!(matches!(resolve(&w, &d), Resolution::Profile { .. }));
+    }
+
+    /// The poller re-resolves on the MODEL: same ICAO, another .acf, is a
+    /// change; the same file spelled another way is not.
+    #[test]
+    fn the_detector_key_is_the_model_not_the_type() {
+        let stock = model_key("B738", "Aircraft/Laminar Research/Boeing 737-800/b738.acf");
+        let zibo = model_key("B738", "Aircraft/Zibo/B737-800X/b738_4k.acf");
+        assert_ne!(stock, zibo);
+        assert_eq!(
+            stock,
+            model_key(
+                " b738 ",
+                "Aircraft\\Laminar Research\\Boeing 737-800\\B738.acf"
+            )
+        );
+        assert_eq!(
+            stock,
+            who(
+                "B738",
+                "Aircraft/Laminar Research/Boeing 737-800/b738.acf",
+                "any"
+            )
+            .key()
+        );
+        // Two unknown models of one type are two generic ids.
+        let a = generic_profile_id(&who("B738", "Aircraft/Zibo/B737-800X/b738_4k.acf", ""));
+        let b = generic_profile_id(&who("B738", "Aircraft/Other/737/b738_other.acf", ""));
+        assert_ne!(a, b);
+        assert_eq!(generic_profile_id(&who("A319", "", "")), "generic_a319");
+        assert_eq!(
+            generic_profile_id(&who(
+                "A319",
+                "Aircraft/ToLissA319_V1p12p1/a319_XP11_StdDef.acf",
+                ""
+            )),
+            "generic_a319_a319_xp11_stddef"
+        );
+    }
+
+    #[test]
+    fn a_plan_type_finds_a_profile_of_that_type() {
+        assert_eq!(
+            aircraft::profile_for_type("B738").map(|p| p.id).as_deref(),
+            Some("boeing_737_800")
+        );
+        assert_eq!(
+            aircraft::profile_for_type("b744").map(|p| p.id).as_deref(),
+            Some("boeing_747_400")
+        );
+        assert!(aircraft::profile_for_type("S76").is_some_and(|p| p.rotorcraft));
+        assert!(aircraft::profile_for_type("A319").is_none());
+        assert!(aircraft::profile_for_type("").is_none());
+    }
+
+    #[test]
+    fn the_article_follows_the_spoken_letter() {
+        assert_eq!(a_type("B738"), "a B738");
+        assert_eq!(a_type("A333"), "an A333");
+        assert_eq!(a_type("MD82"), "an MD82");
+    }
 }

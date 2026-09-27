@@ -4,11 +4,20 @@
 # their Vfe limits, and the light set are per-airframe and live here.
 #
 # To add an aircraft: copy this file to profiles/<id>.yaml, adjust, and select
-# it via XCOPILOT_AIRCRAFT=<id> (or add an acf_ICAO mapping in main.rs for
-# auto-detect).
+# it via XCOPILOT_AIRCRAFT=<id>, or give it a `match:` block (acf_ICAO and the
+# model's .acf path) for auto-detect.
 
 id: cessna_172sp
 display_name: Cessna 172SP Skyhawk
+
+# Which loaded aircraft this profile is for (detect::resolve): the ICAO
+# alone is a TYPE, and two models of one type (the stock 737 and the Zibo
+# both say B738) must never share a profile. Every key must hit. The acf
+# entry is a substring of acf_relative_path: if the aircraft's folder is
+# renamed, change it here (an unmatched model flies generic, said aloud).
+match:
+  icao: [C172]
+  acf: ["Laminar Research/Cessna 172 SP/"]
 
 # Capability flags — each gates a tool (or tool group).
 autopilot: true        # set_heading / set_altitude / set_vertical_speed
