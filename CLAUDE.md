@@ -243,8 +243,11 @@ Config: `XCOPILOT_ATC_AIRPORT` / `_VOICE` / `_RATE` / `_REGION`.
   ICAO or FAA phrasing; SID, altitude and code read back ENFORCED; the crew sees it only once
   accepted (`party_line::assigned_clearance`).
 - Runway in use: calm wind follows the arrival stream (`arrival_end`); FROZEN while a departure or
-  arrival is committed, with wind hysteresis (parallels flip-flop invisibly); an arrival's STATED
-  runway stands inside the margin (`note_stated_runway`). LinedUp and conditional line-up.
+  arrival is committed, an IFR clearance included (`ifr_runway`), with wind hysteresis (parallels
+  flip-flop invisibly); an arrival's STATED runway stands inside the margin (`note_stated_runway`).
+  **The wind picks a direction, the longest parallel the strip** (`best_runway_for_wind`); a
+  parallel under 760 m away is its main twin (`close_parallel_main`; EGKK 26R, 2026-09-27).
+  LinedUp and conditional line-up.
 - Release threads the arrival stream (`DEPART_GAP_NM`; strip clear = LUAW); wake timed from when
   the HOLD went on. **A reject is a radio call** (`Intent::RejectingTakeoff`, the crew's
   `autotakeoff::REJECT_CALL`): the clearance and all it armed die; a held release lives only in

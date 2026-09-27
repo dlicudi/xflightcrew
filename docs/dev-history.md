@@ -8724,3 +8724,33 @@ carries `radio_call: true`, then an `atc` keyed record with intent
 `RejectingTakeoff` and state `TakeoffCleared>LinedUp`; no `hold_release` after
 it; a resume's `request_taxi` answered with a taxi. Offline only.
 
+## 2026-09-27: one runway for the clearance, the taxi and the tower (issue #114)
+
+**Sortie 1790524628 (EGKK).** The IFR clearance at +154 named 26R with LAM6V;
+the taxi at +170 and the takeoff went to 26L. Wind 175 at 7.7: across both
+parallels, whose headings (from apt.dat's thresholds) are 257.629 and 257.624
+degrees true, so 26R faced it by 0.0007 kt more and won the pick. Then the
+crew's "request taxi, runway two six left" (its SimBrief runway) was a stated
+runway inside the swap margin and moved the pick to 26L under the clearance
+just read back. The overheard "runway two six right, cleared for takeoff" at
++99 was a replayed ghost nearer 26R's centreline, 198 m from 26L's.
+
+**The fix.** `nav::best_runway_for_wind`: the wind picks the DIRECTION, and of
+the ends within 5 degrees of it (`PARALLEL_DEG`) the longest strip is the
+runway (EGKK 26L 3,319 m, 26R 2,563 m, from the 100-row thresholds; EGLL's
+reversal now goes to 09L, 3,902 m against 3,660). `nav::close_parallel_main`:
+a parallel closer than 760 m (`CLOSE_PARALLEL_M`, the ICAO minimum for
+independent departures) is its longer twin; ghost narration and the calm-wind
+arrival stream (`arrival_end`) name that, and an uncommitted pick sitting on a
+close standby moves to the main runway (the hysteresis could never make that
+swap). An IFR clearance freezes the runway in use like a taxi clearance
+(`Station::ifr_runway`, retired airborne), so the taxi goes to the runway the
+SID was chosen for (`nav::sid_toward` off that runway, else runway heading).
+Against the real install: 26L's SID toward EGBB is LAM6M.
+
+Tests `the_wind_picks_a_direction_and_the_main_parallel_takes_it`,
+`the_ifr_clearance_and_the_taxi_name_one_runway_at_egkk` (EGKK's real rows),
+`a_close_parallel_is_its_main_runway`; `real_install_egkk_one_runway`
+(ignored, real apt.dat and CIFP). Next EGKK departure: blackbox `atc`
+`ifr_clearance` runway 26L with an M SID, the taxi reply naming 26L, and no
+party-line "two six right". Offline only.
