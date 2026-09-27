@@ -8025,3 +8025,23 @@ model.
   that matched, `tied_with`). Next session, check it on the first probe, and
   on any add-on that shares a stock ICAO the `unknown_model` resolution and
   the spoken line. Offline only.
+
+## 2026-09-27: the gyro auto-sync reads its drift back
+
+On the stock 737-800 (LEBL-LFBD full auto, sortie `1790504948-full_auto`) the
+monitor said "Heading indicator had drifted about N degrees, re-synced to the
+compass." 14 times, once every 120 s, while `dg_drift_vac_deg` climbed from
+11.8 to 15.6: `sim/instruments/DG_sync_mag` was ACCEPTED and did nothing (no
+vacuum DG, the heading is IRS and glass), and the line went out on the
+command's acceptance, never on a readback. The core rule again: a silently
+failed write must not answer "Roger". Now `monitor::GyroSync` owes a readback
+after the fire: at least 1 s later the drift is read directly (a failed read
+is no measurement; the snapshot's 0.0 default would have looked like a perfect
+sync) and judged by `gyro_sync_took` (the drift must at least halve). Took:
+the line, blackbox `gyro_sync` `took: true`. Did not take: silent, `took:
+false` with `drift_deg` and `after_deg`, and latched off for the airframe
+(the loop builds a fresh `GyroSync` on every swap). No read within 3 s:
+`took: null`, silent, not latched. Deliberately not gated on the systems
+survey's `glass_hsi`: an SR22 flagged glass genuinely drifted 166 degrees
+(2026-07-12); the readback is the guard. The spoken line lost its em dash.
+Offline only.
