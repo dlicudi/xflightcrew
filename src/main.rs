@@ -25,6 +25,7 @@ mod crew_pace;
 mod conversation;
 mod course_leg;
 mod debrief;
+mod sortie_runner;
 mod test_card;
 mod detect;
 mod dialogue;
@@ -360,6 +361,15 @@ async fn main() -> Result<()> {
         let text = std::fs::read_to_string(&path).map_err(|e| anyhow!("reading {path}: {e}"))?;
         print!("{}", debrief::report(text.lines()));
         return Ok(());
+    }
+
+    // `xvl sortie <spec.yaml> [--repeat N]`: the unattended runner, a second
+    // process beside a running xvl (src/sortie_runner.rs). Exit 1 on any fail.
+    if std::env::args().nth(1).as_deref() == Some("sortie") {
+        let rest: Vec<String> = std::env::args().skip(2).collect();
+        let all_passed =
+            sortie_runner::main_cmd(&rest, &config.xplane_base_url, &config.apt_data_path).await?;
+        std::process::exit(if all_passed { 0 } else { 1 });
     }
 
     // `cargo run -- analyze` mines the logs for fast-path coverage and the

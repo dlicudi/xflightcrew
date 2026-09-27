@@ -649,6 +649,42 @@ where
     });
 }
 
+/// How long a sortie waits for its loop to start, and how often it looks.
+#[derive(Debug, Clone, Copy)]
+pub struct SortieHold {
+    pub start_within: std::time::Duration,
+    pub poll: std::time::Duration,
+}
+
+impl SortieHold {
+    pub const LIVE: SortieHold = SortieHold {
+        start_within: std::time::Duration::from_secs(10),
+        poll: std::time::Duration::from_millis(250),
+    };
+}
+
+/// Keep a sortie open while `flag` (a loop's ACTIVE) is up: it ends when
+/// the loop lets go, or when the loop never started. The flag, not the
+/// thread, because a re-armed autoland hands ACTIVE to its successor and
+/// the landing it flies is still this sortie's.
+pub fn hold_sortie_while(
+    flag: &'static std::sync::atomic::AtomicBool,
+    sortie: crate::full_auto::SortieGuard,
+    t: SortieHold,
+) -> std::thread::JoinHandle<()> {
+    use std::sync::atomic::Ordering::SeqCst;
+    std::thread::spawn(move || {
+        let t0 = std::time::Instant::now();
+        while !flag.load(SeqCst) && t0.elapsed() < t.start_within {
+            std::thread::sleep(t.poll);
+        }
+        while flag.load(SeqCst) {
+            std::thread::sleep(t.poll);
+        }
+        drop(sortie);
+    })
+}
+
 /// The flight-initialisation mailbox as the follow-up sees it: numbers read,
 /// one JSON posted. The live one is the Web API; the tests fake a reload.
 #[async_trait]
@@ -842,6 +878,13 @@ async fn approach_follow_up(job: ApproachJob) {
     // already flying.
     if let AfterInit::Arm { runway, .. } = &next {
         if let Some((cfg, ias)) = job.land.clone() {
+            // The landing is a sortie: one file and one verdict for the
+            // sortie runner, begun before autoland's first tick.
+            let sortie = crate::full_auto::SortieGuard::begin(
+                "approach",
+                json!({ "airport": job.icao, "runway": job.runway, "final_nm": job.final_nm }),
+            );
+            hold_sortie_while(&crate::autoland::ACTIVE, sortie, SortieHold::LIVE);
             crate::autoland::ABORT.store(false, std::sync::atomic::Ordering::SeqCst);
             crate::autoland::run_autoland(
                 job.base.clone(),
@@ -922,6 +965,31 @@ async fn new_flight_radio(xp: &crate::xplane::XPlaneClient, job: &ApproachJob) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_approach_sortie_lasts_as_long_as_the_landing() {
+        use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
+        static FLYING: AtomicBool = AtomicBool::new(false);
+        let t = SortieHold {
+            start_within: std::time::Duration::from_millis(500),
+            poll: std::time::Duration::from_millis(5),
+        };
+        let guard = crate::full_auto::SortieGuard::begin("approach_test", json!({}));
+        let id = crate::blackbox::sortie().expect("begun");
+        let h = hold_sortie_while(&FLYING, guard, t);
+        // The loop comes up late (its own thread), then flies a while.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        FLYING.store(true, SeqCst);
+        std::thread::sleep(std::time::Duration::from_millis(600));
+        assert_eq!(crate::blackbox::sortie(), Some(id), "open while the loop flies");
+        FLYING.store(false, SeqCst);
+        h.join().unwrap();
+        assert!(crate::blackbox::sortie().is_none(), "closed when it lets go");
+        // A loop that never started does not hold a sortie open.
+        let guard = crate::full_auto::SortieGuard::begin("approach_test", json!({}));
+        hold_sortie_while(&FLYING, guard, t).join().unwrap();
+        assert!(crate::blackbox::sortie().is_none());
+    }
 
     #[test]
     fn an_acf_declares_its_type() {
