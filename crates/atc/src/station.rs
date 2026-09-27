@@ -23,8 +23,8 @@ use sim::xplane::SimView;
 // `party_line`'s accessors, never these statics.
 pub use crate::party_line::RegionHandoff;
 pub(crate) use crate::party_line::{
-    ARRIVAL_PIN, ASSIGNED_SQUAWK, CLEARANCE, DEPARTURE_HANDOFF, IFR_CLEARANCE, LANDING_HANDOFF,
-    LINE_UP_CONDITION,
+    ARRIVAL_PIN, ASSIGNED_SQUAWK, CLEARANCE, DEPARTURE_HANDOFF, IFR_CLEARANCE, IFR_FLIGHT,
+    IfrFlight, LANDING_HANDOFF, LINE_UP_CONDITION,
     PENDING_GO_AROUND, PENDING_LINE_UP, PENDING_STATION, PENDING_TAKEOFF_CLEARANCE, REGION_HANDOFF,
     SQUAWK_NUDGE, TAKEOFF_HOLD, TAXI_ROUTE, TAXI_TO_STAND, VECTORS, ZONE_CHALLENGE,
 };
@@ -404,6 +404,7 @@ impl Station {
         // The doc on the party line promises this one dies here.
         *ASSIGNED_SQUAWK.lock().unwrap_or_else(|e| e.into_inner()) = None;
         *IFR_CLEARANCE.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        *IFR_FLIGHT.lock().unwrap_or_else(|e| e.into_inner()) = None;
         *PENDING_STATION.lock().unwrap_or_else(|e| e.into_inner()) = None;
         *ARRIVAL_PIN.lock().unwrap_or_else(|e| e.into_inner()) = None;
         // NOT cleared by install(): the new station is installed on the main
@@ -1084,6 +1085,7 @@ impl Station {
             self.assigned_squawk.unwrap_or(7000)
         };
         *IFR_CLEARANCE.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        *IFR_FLIGHT.lock().unwrap_or_else(|e| e.into_inner()) = None;
         Some(tower::IfrOffer {
             clearance: tower::IfrClearance {
                 dest: icao,
@@ -1787,6 +1789,11 @@ fn publish_ifr_clearance(c: tower::IfrClearance, callsign: &str, bearings: Optio
             "dest_brg": bearings.map(|b| b.1.round()),
         }),
     );
+    *IFR_FLIGHT.lock().unwrap_or_else(|e| e.into_inner()) = Some(IfrFlight {
+        code: c.squawk,
+        callsign: callsign.to_string(),
+        airborne: false,
+    });
     *IFR_CLEARANCE.lock().unwrap_or_else(|e| e.into_inner()) = Some(c);
 }
 
@@ -2846,17 +2853,17 @@ pub fn region_tick(lat: f64, lon: f64, on_ground: bool, now: Instant) -> Option<
             crew: true,
         }
     } else {
+        // An IFR flight is handed unit to unit with its code: no service
+        // ends and no squawk is ordered (LIEA-LEBL, 2026-09-27, an IFR 737
+        // on 4501 was told "squawk seven thousand" at FL200).
+        let ifr = IFR_FLIGHT.lock().unwrap_or_else(|e| e.into_inner()).clone();
         // A discrete code in effect goes back to conspicuity with the service
         // that assigned it.
-        let squawk_vfr = SQUAWK_WATCH
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .is_some();
-        let squawk = if squawk_vfr {
-            " Squawk seven thousand."
-        } else {
-            ""
-        };
+        let squawk_vfr = ifr.is_none()
+            && SQUAWK_WATCH
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_some();
         let to = format!("{} Tower", spoken_airport(&best.apt.name));
         // The instruction as data for the crew that has to obey it: the
         // spoken line alone had no consumer, so the flight kept the discrete
@@ -2865,12 +2872,10 @@ pub fn region_tick(lat: f64, lon: f64, on_ground: bool, now: Instant) -> Option<
             to: to.clone(),
             khz,
             squawk_vfr,
+            ifr_code: ifr.as_ref().map(|f| f.code),
         });
         RegionSwitch {
-            line: format!(
-                "Radar services terminated.{squawk} Contact {to} on {}.",
-                atis::spoken_mhz(khz)
-            ),
+            line: region_handoff_line(ifr.as_ref().map(|f| f.callsign.as_str()), squawk_vfr, &to, khz),
             crew: false,
         }
     };
@@ -2879,6 +2884,31 @@ pub fn region_tick(lat: f64, lon: f64, on_ground: bool, now: Instant) -> Option<
         Some((best.icao.clone(), best.apt.clone()));
     *LAST_REGION_SWITCH.lock().unwrap_or_else(|e| e.into_inner()) = Some(now);
     Some(sw)
+}
+
+/// The enroute handoff as spoken. VFR: the radar service ends ("Radar
+/// services terminated", seven thousand when a code was assigned). IFR
+/// (`ifr_callsign`): a plain handoff to the next unit, the code kept, the
+/// same "contact X on Y" the station's other handoffs use in both dialects.
+pub(crate) fn region_handoff_line(
+    ifr_callsign: Option<&str>,
+    squawk_vfr: bool,
+    to: &str,
+    khz: i64,
+) -> String {
+    let mhz = atis::spoken_mhz(khz);
+    match ifr_callsign {
+        Some(cs) if !cs.is_empty() => format!("{cs}, contact {to} on {mhz}."),
+        Some(_) => format!("Contact {to} on {mhz}."),
+        None => {
+            let squawk = if squawk_vfr {
+                " Squawk seven thousand."
+            } else {
+                ""
+            };
+            format!("Radar services terminated.{squawk} Contact {to} on {mhz}.")
+        }
+    }
 }
 
 /// The active station's controller frequencies (kHz → speaking position),
@@ -3123,6 +3153,22 @@ pub fn note_aircraft(lat: f64, lon: f64, on_ground: bool) {
             *TAXI_ROUTE.lock().unwrap_or_else(|e| e.into_inner()) = None;
         }
     }
+    // An IFR flight ends at its landing: airborne since the clearance, the
+    // next ground contact retires it (never a region switch).
+    {
+        let mut ifr = IFR_FLIGHT.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(f) = ifr.as_mut() {
+            if !on_ground {
+                f.airborne = true;
+            } else if f.airborne {
+                sim::blackbox::record(
+                    "atc",
+                    serde_json::json!({ "event": "ifr_flight_ended", "code": f.code, "why": "landed" }),
+                );
+                *ifr = None;
+            }
+        }
+    }
     let far = on_ground
         && active_station_range_nm(lat, lon).is_some_and(|d| d > GROUND_REACH_NM);
     let was = OUT_OF_REACH.swap(far, Relaxed);
@@ -3137,6 +3183,7 @@ pub fn note_aircraft(lat: f64, lon: f64, on_ground: bool) {
         *CLEARANCE.lock().unwrap_or_else(|e| e.into_inner()) = None;
         *ASSIGNED_SQUAWK.lock().unwrap_or_else(|e| e.into_inner()) = None;
         *IFR_CLEARANCE.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        *IFR_FLIGHT.lock().unwrap_or_else(|e| e.into_inner()) = None;
         *TAKEOFF_HOLD.lock().unwrap_or_else(|e| e.into_inner()) = None;
         *LINE_UP_CONDITION.lock().unwrap_or_else(|e| e.into_inner()) = None;
         if SELF_TAXI.lock().unwrap_or_else(|e| e.into_inner()).is_none() {
@@ -8798,6 +8845,24 @@ mod tests {
         *SELF_TAXI.lock().unwrap() = None;
     }
 
+    /// The line the LIEA-LEBL 737 heard at FL200 (2026-09-27), and what an
+    /// IFR flight hears instead.
+    #[test]
+    fn the_region_handoff_line_by_flight_rules() {
+        assert_eq!(
+            region_handoff_line(None, true, "Barcelona Tower", 118_105),
+            "Radar services terminated. Squawk seven thousand. Contact Barcelona Tower on one one eight decimal one zero five."
+        );
+        assert_eq!(
+            region_handoff_line(Some("November eight one six November November"), false, "Barcelona Tower", 118_105),
+            "November eight one six November November, contact Barcelona Tower on one one eight decimal one zero five."
+        );
+        assert_eq!(
+            region_handoff_line(None, false, "Malaga Tower", 118_100),
+            "Radar services terminated. Contact Malaga Tower on one one eight decimal one."
+        );
+    }
+
     #[test]
     fn region_hands_off_to_the_decisively_nearer_tower() {
         let _guard = SIDE_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -8866,7 +8931,8 @@ mod tests {
             RegionHandoff {
                 to: "Malaga Tower".into(),
                 khz: 118_100,
-                squawk_vfr: false
+                squawk_vfr: false,
+                ifr_code: None,
             }
         );
         assert!(
@@ -8892,6 +8958,51 @@ mod tests {
         let h = crate::party_line::take_region_handoff().expect("published for the crew");
         assert!(h.squawk_vfr, "{h:?}");
         assert_eq!(h.khz, 118_100);
+        assert_eq!(h.ifr_code, None, "a VFR service ending");
+        // The same radar service, but the flight holds an accepted IFR
+        // clearance (LIEA-LEBL, 2026-09-27): handed on with its code, no
+        // service terminated, no seven thousand.
+        *PENDING_STATION.lock().unwrap() = None;
+        *LAST_REGION_SWITCH.lock().unwrap() = None;
+        *ACTIVE_FIELD.lock().unwrap() = Some(("Gibraltar".into(), 36.15, -5.35));
+        publish_ifr_clearance(
+            tower::IfrClearance {
+                dest: "LEMG".into(),
+                sid: None,
+                runway: "09".into(),
+                initial_alt_ft: 5000,
+                squawk: 4503,
+            },
+            "November eight one six November November",
+            None,
+        );
+        let sw = region_tick(36.6, -4.6, false, t0).expect("IFR handoff");
+        assert!(!sw.crew);
+        assert_eq!(
+            sw.line,
+            "November eight one six November November, contact Malaga Tower on one one eight decimal one."
+        );
+        let h = crate::party_line::take_region_handoff().expect("published for the crew");
+        assert_eq!(
+            h,
+            RegionHandoff {
+                to: "Malaga Tower".into(),
+                khz: 118_100,
+                squawk_vfr: false,
+                ifr_code: Some(4503),
+            }
+        );
+        // The IFR flight ends at the landing, not before: on the ground at
+        // the clearance it stands, airborne it stands, the next ground
+        // contact retires it.
+        note_aircraft(36.15, -5.35, true);
+        assert_eq!(crate::party_line::ifr_flight_code(), Some(4503));
+        note_aircraft(36.4, -5.0, false);
+        assert_eq!(crate::party_line::ifr_flight_code(), Some(4503));
+        note_aircraft(36.15, -5.35, true);
+        assert_eq!(crate::party_line::ifr_flight_code(), None, "landed");
+        OUT_OF_REACH.store(false, std::sync::atomic::Ordering::Relaxed);
+        *IFR_CLEARANCE.lock().unwrap() = None;
         *SQUAWK_WATCH.lock().unwrap() = None;
         *CLEARANCE.lock().unwrap() = None;
         // Ground relocation: parked AT Malaga with Gibraltar still active
@@ -10642,9 +10753,13 @@ mod tests {
             })
         );
         assert_eq!(crate::party_line::readback_owed(), None, "the debt is paid");
+        assert_eq!(crate::party_line::ifr_flight_code(), Some(code), "the flight is IFR");
         // Retired with the squawk: a new field, and the world going away.
         st.install();
         assert_eq!(crate::party_line::assigned_clearance(), None, "install retires it");
+        // The FLIGHT stays IFR across a region's install: the handoff that
+        // follows it must keep its code.
+        assert_eq!(crate::party_line::ifr_flight_code(), Some(code), "install keeps the IFR flight");
         *IFR_CLEARANCE.lock().unwrap() = Some(tower::IfrClearance {
             dest: "EGPH".into(),
             sid: None,
@@ -10654,6 +10769,7 @@ mod tests {
         });
         Station::uninstall();
         assert_eq!(crate::party_line::assigned_clearance(), None, "uninstall retires it");
+        assert_eq!(crate::party_line::ifr_flight_code(), None, "uninstall ends the IFR flight");
         *REGION.lock().unwrap() = Vec::new();
         *SQUAWK_WATCH.lock().unwrap() = None;
     }
