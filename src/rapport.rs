@@ -1186,6 +1186,102 @@ mod tests {
         clear_offer();
     }
 
+    /// Five recorded landings (bench/landings, slim `state` records): a
+    /// pilot's, two full-auto circuits (one with a go-around), a hard one on
+    /// a flight joined in the air, and a contact the vario read climbing.
+    const LANDINGS: &str = include_str!("../bench/landings/rapport_landings.jsonl");
+
+    /// Replay the recorded landings through the rapport, chatty, and write
+    /// down every touchdown it booked and every line it said. Each window
+    /// is a fresh session.
+    fn replay_landings() -> Vec<String> {
+        let a = Airframe::default();
+        let p = persona(Chatter::Chatty);
+        let mut out = Vec::new();
+        let mut r = Rapport::new();
+        let mut t0 = 0.0;
+        let mut booked: Option<Landing> = None;
+        for line in LANDINGS.lines() {
+            let v: serde_json::Value = serde_json::from_str(line).unwrap();
+            if v["kind"] == "window" {
+                out.push(format!("window {}", v["name"].as_str().unwrap()));
+                r = Rapport::new();
+                t0 = f64::NAN;
+                booked = None;
+                continue;
+            }
+            let f = |k: &str| v[k].as_f64().unwrap_or(0.0);
+            if t0.is_nan() {
+                t0 = f("t");
+            }
+            let view = View {
+                t_s: f("t"),
+                on_ground: v["ground"].as_bool().unwrap_or(false),
+                groundspeed_kts: f("gs"),
+                agl_ft: f("agl"),
+                vsi_fpm: f("vsi"),
+                ias_kts: f("ias"),
+                lat: f("lat"),
+                lon: f("lon"),
+                flap_ratio: f("flap"),
+                gear_down: true,
+                automation_flying: v["ctl"]
+                    .as_str()
+                    .is_some_and(|c| c.starts_with("Automation")),
+                crashed: v["crashed"].as_bool().unwrap_or(false),
+                ..View::default()
+            };
+            let said = replay_step(&mut r, &view, &a, &p);
+            if let Some(l) = r.pending {
+                if booked.map(|b| b.t_s) != Some(l.t_s) {
+                    out.push(format!(
+                        "touchdown +{:.0}s sink {:.0} auto {} airborne {:.0}s same_field {} here {}",
+                        l.t_s - t0,
+                        l.sink_fpm,
+                        l.by_automation,
+                        (l.airborne_s / 10.0).round() * 10.0,
+                        l.same_field,
+                        l.landings_here
+                    ));
+                }
+                booked = Some(l);
+            }
+            for s in said {
+                out.push(format!("said +{:.0}s {}", view.t_s - t0, s.text()));
+            }
+        }
+        out
+    }
+
+    fn replay_step(r: &mut Rapport, v: &View, a: &Airframe, p: &Persona) -> Vec<Line> {
+        r.tick(v, a, p)
+    }
+
+    #[test]
+    fn the_recorded_landings_say_what_they_said() {
+        let got = replay_landings();
+        let want = vec![
+            "window pilot_130",
+            "touchdown +3378s sink 126 auto false airborne 3360s same_field false here 1",
+            "said +3392s Nice one, about 130 feet a minute.",
+            "said +3392s 55 minutes in the air.",
+            "window circuit_43",
+            "touchdown +381s sink 278 auto true airborne 360s same_field true here 1",
+            "window joined_hard_769",
+            "touchdown +198s sink 769 auto true airborne 180s same_field false here 1",
+            "said +219s That was a hard one, about 770 feet a minute. Worth a look at the gear.",
+            "window circuit_ga_883",
+            "touchdown +908s sink 244 auto true airborne 880s same_field true here 1",
+            "said +926s Smooth one, about 240 feet a minute.",
+            "said +926s Back where we started.",
+            "window contact_plus48",
+            "touchdown +2392s sink 0 auto true airborne 2370s same_field false here 1",
+            "said +2416s Smooth one, about 0 feet a minute.",
+            "said +2416s Forty minutes in the air.",
+        ];
+        assert_eq!(got, want, "{got:#?}");
+    }
+
     #[test]
     fn no_line_carries_a_dash() {
         for d in [Dialect::British, Dialect::American] {
