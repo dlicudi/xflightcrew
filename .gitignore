@@ -52,3 +52,7 @@ indexes/
 
 # Source PDFs for the indexes (FAA handbooks, POMs) — large, re-downloadable.
 /manuals/
+
+# Local agent settings (absolute paths, per machine)
+.claude/settings.json
+.claude/settings.local.json
