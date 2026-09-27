@@ -737,6 +737,17 @@ pub fn take_crew_radio() -> Vec<CrewCall> {
     q.drain(..).collect()
 }
 
+/// A crew call is still queued for the main loop, not yet transmitted: the
+/// main loop drains the queue only between its blocking speech, so a
+/// readback can wait here behind the clearance it answers. Full auto starts
+/// the readback's acceptance clock once this is false.
+pub fn crew_radio_pending() -> bool {
+    !CREW_RADIO
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .is_empty()
+}
+
 /// Queue a radio call for the main loop to transmit. Public so the full-auto
 /// orchestrator can request taxi through the same channel.
 pub fn transmit(call: String) {

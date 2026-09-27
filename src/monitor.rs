@@ -3318,9 +3318,14 @@ pub async fn run(
                 // (Malaga runway 12, 2026-07-12). A genuine conflict against
                 // a cleared departure is the release/cancel machinery's
                 // problem, never this shout.
-                let runway_is_ours = matches!(
-                    crate::party_line::clearance_state(),
-                    Some(crate::tower::State::TakeoffCleared | crate::tower::State::LinedUp)
+                // So too the LANDING it cleared, until the vacated report, and
+                // a runway start or a moving cleared crossing: EGKK 26L
+                // (2026-09-27) heard "exit the runway immediately" from the
+                // touchdown to the vacate, eight times, cleared to land.
+                let runway_is_ours = crate::party_line::runway_occupancy_authorised(
+                    snap.lat,
+                    snap.lon,
+                    snap.groundspeed_kts,
                 );
                 if snap.on_ground && snap.groundspeed_kts < 30.0 && !runway_is_ours {
                     if let Some(rwy) = crate::station::on_active_runway(snap.lat, snap.lon) {

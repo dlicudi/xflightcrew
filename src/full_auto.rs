@@ -886,11 +886,27 @@ async fn get_ifr_clearance(
         crate::circuit::transmit(rb.trim_end_matches('.').to_string());
         event("clearance_readback", json!({ "ifr": true }));
     }
+    // The acceptance clock starts when the readback GOES OUT, not when it
+    // is queued: the tower's answer is published the moment it is routed,
+    // before it is spoken, so the readback is queued at once and waits in
+    // the crew queue behind the clearance itself (and anything ahead of it
+    // on the frequency). EGKK 2026-09-27: queued +17.4, the clearance
+    // spoken +33.2, the readback out +49.6 and accepted, 2 s after a 30 s
+    // clock from the queue gave up at +47.5.
     waiting("the readback to be accepted");
-    wait_until(30.0, 500, || async {
-        crate::party_line::assigned_clearance().is_some()
-    })
-    .await;
+    let mut wait = ReadbackWait::new(0.0);
+    let t0 = Instant::now();
+    loop {
+        if ABORT.load(SeqCst) {
+            break;
+        }
+        let pending = crate::circuit::crew_radio_pending();
+        let accepted = crate::party_line::assigned_clearance().is_some();
+        if wait.tick(t0.elapsed().as_secs_f64(), pending, accepted).is_some() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
     let Some(c) = crate::party_line::assigned_clearance() else {
         event("ifr_clearance_not_accepted", json!({ "dest": dest }));
         return false;
@@ -916,6 +932,46 @@ async fn get_ifr_clearance(
         );
     }
     true
+}
+
+/// The wait for an IFR readback to be accepted: [`READBACK_ACCEPT_S`] from
+/// the moment the readback left the crew queue (went out on the frequency),
+/// never from when it was queued; a readback that never leaves the queue is
+/// given up after [`READBACK_QUEUE_MAX_S`].
+struct ReadbackWait {
+    start_s: f64,
+    out_s: Option<f64>,
+}
+
+/// From the readback going out to the tower's acceptance (it is judged the
+/// moment it is routed, so this is slack for a busy frequency).
+const READBACK_ACCEPT_S: f64 = 30.0;
+/// The longest a readback may sit in the crew queue behind the clearance
+/// and the frequency's traffic before full auto stops waiting.
+const READBACK_QUEUE_MAX_S: f64 = 120.0;
+
+impl ReadbackWait {
+    fn new(start_s: f64) -> Self {
+        ReadbackWait {
+            start_s,
+            out_s: None,
+        }
+    }
+
+    /// One poll: `Some(true)` accepted, `Some(false)` given up, `None` wait on.
+    fn tick(&mut self, now_s: f64, queued: bool, accepted: bool) -> Option<bool> {
+        if accepted {
+            return Some(true);
+        }
+        if !queued && self.out_s.is_none() {
+            self.out_s = Some(now_s);
+        }
+        match self.out_s {
+            Some(out) if now_s - out >= READBACK_ACCEPT_S => Some(false),
+            None if now_s - self.start_s >= READBACK_QUEUE_MAX_S => Some(false),
+            _ => None,
+        }
+    }
 }
 
 async fn engine_running(xp: &XPlaneClient) -> bool {
@@ -5226,6 +5282,46 @@ mod tests {
         assert_eq!(super::ifr_readback_line(Some("Not above two thousand feet, squawk four five two one, N.")), None);
         assert_eq!(super::ifr_readback_line(Some("Cleared to land runway zero niner, N.")), None);
         assert_eq!(super::ifr_readback_line(None), None);
+    }
+
+    /// Issue #116, sortie 1790527340-full_auto (EGKK, 2026-09-27; seconds
+    /// after 1790527340): the readback was queued at +17.4, the tower's
+    /// clearance spoken at +33.2, the readback went out and was accepted at
+    /// +49.6 (atc `ifr_clearance` side tower), but a 30 s clock from the
+    /// queue gave up at +47.5 (`ifr_clearance_not_accepted`). The clock now
+    /// starts when the readback leaves the crew queue.
+    #[test]
+    fn the_ifr_readback_wait_runs_from_the_readback_going_out() {
+        use super::{ReadbackWait, READBACK_ACCEPT_S, READBACK_QUEUE_MAX_S};
+        let queued_at = 17.4;
+        let out_at = 49.6;
+        let accepted_at = 49.6;
+        // The recorded polls, 0.5 s apart, on the wait's own clock.
+        let run = |mut w: ReadbackWait, out_at: f64, accepted_at: f64| {
+            let mut t = queued_at;
+            loop {
+                let now = t - queued_at;
+                if let Some(v) = w.tick(now, t < out_at, t >= accepted_at) {
+                    return (v, t);
+                }
+                t += 0.5;
+                assert!(t < 1000.0, "never decided");
+            }
+        };
+        let (ok, at) = run(ReadbackWait::new(0.0), out_at, accepted_at);
+        assert!(ok, "gave up at +{at}");
+        assert!((at - accepted_at).abs() < 0.51, "accepted at +{at}");
+        // The old clock, 30 s from the queue, decided before the readback
+        // was even heard.
+        assert!(queued_at + READBACK_ACCEPT_S < out_at);
+        // Out but never accepted: given up 30 s after it went out.
+        let (ok, at) = run(ReadbackWait::new(0.0), out_at, f64::INFINITY);
+        assert!(!ok);
+        assert!((at - (out_at + READBACK_ACCEPT_S)).abs() < 0.51, "{at}");
+        // Never left the queue (the radio dead): the queue's own bound.
+        let (ok, at) = run(ReadbackWait::new(0.0), f64::INFINITY, f64::INFINITY);
+        assert!(!ok);
+        assert!((at - (queued_at + READBACK_QUEUE_MAX_S)).abs() < 0.51, "{at}");
     }
 
     #[test]
