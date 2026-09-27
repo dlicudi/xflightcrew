@@ -372,7 +372,9 @@ everything blackboxes to `logs/blackbox.jsonl` (kinds: `atc`, `autotaxi`, `autot
   takeoff band before brakes off. `brake_steer` airframes brake-steer the roll (`roll_brake_split`).
 - **The centreline cut is sized for a CLOSURE TIME** (`autotakeoff::roll_target_heading`, one rule
   for roll and rollout; `XTK_GAIN_REF_KTS`, `XTK_LEAD_S`): a fixed deg/m gain tightens with speed
-  until the loops weave. The rollout blackboxes `rollout` per tick with the REAL tick time.
+  until the loops weave. The rollout blackboxes `rollout` per tick with the REAL tick time. So a
+  steady drift is held off only by a standing offset: the scheduled roll feeds its own drift
+  forward (`DriftFilter`, the final's crab pattern; EGBB 2026-09-27).
 - **The handoff line is true** about who has the aircraft and the height (`handoff_to_caller`). **A
   pilot handoff is FLYABLE**: it waits for the clean-up (`handoff_waits_for_clean_up`), sets a
   capturable dial (`handoff_altitude_dial_ft`), and gives the governor the overspeed guard's speed
@@ -750,7 +752,8 @@ confirms it closes it (`fixes #N` in the commit). Known gaps are `owed` issues.
   rotation read back through the yoke are not a hand (`monitor::note_crew_yoke`; the scorer
   discounts the same window in old logs), nor is a brake latch our own command raised
   (`monitor::CrewBrakeLatch`, `crew_brake_discounted`); a taxi is judged from its first tick ON the line after a
-  join and never past its planned stop; a drive that stops short (`stagnant`, `off_route`, a
+  join and never past its planned stop, and inside a route VERTEX it turns through (the projection
+  jumped across it) is a cut, `TAXI_MAX_CUT_M`, not off the line; a drive that stops short (`stagnant`, `off_route`, a
   give-up) fails; a landing is scored at its FIRST contact and a bounce is recorded (`bounce_ft`).
   `bench/sorties/` holds trimmed real sorties whose verdicts `cargo test` pins.
 - A law that misbehaves in the air while its test passes: suspect the plant. A first-order lag
