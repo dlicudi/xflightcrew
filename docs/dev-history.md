@@ -8338,3 +8338,40 @@ Tests `the_stop_says_brakes_on_only_when_the_parking_brake_reads_set`,
 is not held). Next 737 landing to a stop: `autoland` `stopped_brakes`
 `held: true`, `park` 1.0, and the next `state` records `park` 1.0. Offline
 only.
+
+## 2026-09-27: a top of descent belongs to a cruise (issue #68)
+
+LSZS-LILO, SR22, 2026-09-24 (pilot flying, full auto's takeoff not in
+charge, no follower): `callout` `tod_passed` "We're past the descent point.
+About 300 feet a minute makes the profile." at t 1790265228.8, 51.3 ft AGL,
+5,638 ft, vsi +730, five seconds after liftoff from Samedan's 5,600 ft
+(the issue's "138 ft" is the `resume_refused` six seconds later, "we're 138
+feet above the ground"). Why: the plan's ring (`monitor::DESTINATION`,
+SimBrief's along-route `tod_to_dest_nm`) is compared with the STRAIGHT-line
+distance to the field; the valley route to Sondrio (898 ft, 14 waypoints)
+made the ring longer than the 23.6 nm straight line, so the aircraft was
+"past the descent point" on the runway. The recorded 300 fpm solves to a
+ring past 24.6 nm: (5,638 - 2,898) ft over (23.6 - 5) nm at 116 kt. The
+check then had no climb gate at all; 2026-09-25 added `CLIMBING_FPM`
+(silent above +300 fpm), which catches this tick but not a level moment in
+the climb-out, nor a level-off low.
+
+Fix (`src/monitor.rs`): `tod_in_cruise` gates `TodAhead` and `TodPassed` on
+the flight model's coarse phase being `Cruise` (a level cruise, or a
+descent still above 3,000 ft AGL, `coarse_phase`) and `agl_ft` at least
+`TOD_MIN_AGL_FT` (`flight::INITIAL_CLIMB_AGL_FT`, 1,000 ft): an initial
+climb is `Climb`, and a level held low becomes "levelled low" Cruise after
+30 s, which the height keeps silent. `HighOnProfile` takes `Cruise` or
+`Approach` and the same height. The existing gates (`follower_flying`,
+`follower_tod`, approach, `CLIMBING_FPM`) stand. Test
+`a_climb_out_under_a_ring_behind_the_departure_calls_no_top_of_descent`
+replays the sortie's state records (roll to 139 ft) through `Flight` with
+LILO's apt.dat position and a 25 nm ring: silent throughout, silent at
+139 ft level for an instant and for 40 s, and a 10,400 ft cruise 22 nm out
+still calls. `high_on_profile_is_a_descent_from_the_cruise` pins the phases.
+
+Not touched: the ring is still along-route against a straight line, so a
+winding route calls its TOD early in the cruise too. Next flight, check:
+no `callout` `tod_ahead`/`tod_passed`/`high_on_profile` whose preceding
+`state` has `fphase` other than Cruise/Descent or `agl` under 1,000.
+Offline only.

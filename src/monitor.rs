@@ -1291,6 +1291,23 @@ fn parse_phase(name: &str) -> Option<Phase> {
 /// ahead or behind it.
 const CLIMBING_FPM: f64 = 300.0;
 
+/// Below this height a top of descent is never called: the initial climb's
+/// own height (`flight::INITIAL_CLIMB_AGL_FT`). A level-off low after a
+/// departure is a pattern or a terrain level, not a cruise to leave.
+const TOD_MIN_AGL_FT: f64 = crate::flight::INITIAL_CLIMB_AGL_FT;
+
+/// The top-of-descent family (`tod_ahead`, `tod_passed`) speaks only in the
+/// CRUISE, by the flight model (`coarse_phase`: a level cruise, or a descent
+/// still above 3,000 ft AGL) and clear of the ground. LSZS-LILO (SR22,
+/// 2026-09-24): "we're past the descent point" at 51 ft AGL, five seconds
+/// after liftoff. The plan's ring (SimBrief's along-route TOD, a winding
+/// valley route) was longer than the 23.6 nm straight line from Samedan to
+/// Sondrio, so the ring was already behind the aircraft on the runway; the
+/// vertical-speed gate alone let any level moment in the climb-out speak.
+fn tod_in_cruise(s: &Snapshot) -> bool {
+    s.phase == Phase::Cruise && s.agl_ft >= TOD_MIN_AGL_FT
+}
+
 /// Descent advisor, part 1: top of descent coming up. The anticipatory version
 /// of the "when is TOD" question — the copilot volunteers it while there's
 /// still time to act, instead of answering after being asked. Fires once as
@@ -1312,6 +1329,10 @@ impl Check for TodAhead {
         // never announced a top of descent (09-24: "top of descent 11 miles
         // ahead" three times at 1,000 ft climbing out of a short hop).
         if s.on_ground || s.vsi_fpm.abs() > 500.0 || s.vsi_fpm > CLIMBING_FPM {
+            return None;
+        }
+        // A cruise, by the flight model, and clear of the ground.
+        if !tod_in_cruise(s) {
             return None;
         }
         // A follower flying: ITS point, to ITS altitude (LEJR-LXGB,
@@ -1395,6 +1416,11 @@ impl Check for TodPassed {
         if s.on_ground || s.vsi_fpm < -400.0 || s.vsi_fpm > CLIMBING_FPM {
             return None;
         }
+        // And only in the cruise, clear of the ground (`tod_in_cruise`): the
+        // same flight's ring was behind it from the runway.
+        if !tod_in_cruise(s) {
+            return None;
+        }
         // A follower flying is judged against ITS OWN point: a miss is the
         // follower a mile past it with the descent still uncommanded, never
         // the plan's ring passing while the hands are correctly waiting.
@@ -1448,6 +1474,12 @@ impl Check for HighOnProfile {
     fn eval(&self, s: &Snapshot) -> Option<String> {
         if s.on_ground || s.vsi_fpm > -400.0 {
             return None; // only mid-descent
+        }
+        // A descent from the cruise or on the arrival, clear of the ground:
+        // never the takeoff, the climb or the flare (`coarse_phase`).
+        let descending_phase = matches!(s.phase, Phase::Cruise | Phase::Approach);
+        if !descending_phase || s.agl_ft < TOD_MIN_AGL_FT {
+            return None;
         }
         // The follower's profile is its own (700 fpm to the next fix, not
         // 300 ft/nm to the field): judging it against the ring's slope would
@@ -5441,6 +5473,8 @@ mod tests {
         let mut s = snap(true, true);
         s.on_ground = false;
         s.alt_ft = 14_000.0;
+        s.agl_ft = 12_000.0;
+        s.phase = Phase::Cruise;
         s.vsi_fpm = 0.0;
         s.groundspeed_kts = 300.0;
         s.ias_kts = 240.0;
@@ -5609,6 +5643,136 @@ mod tests {
         // With no follower flying, nothing above has changed.
         let plain = cruise_with_dest(38.0);
         assert!(TodPassed.eval(&plain).is_some(), "the ring is still there");
+    }
+
+    /// LSZS-LILO, SR22, 2026-09-24 (issue #68): "We're past the descent
+    /// point. About 300 feet a minute makes the profile." at t 1790265228.8,
+    /// 51 ft AGL, five seconds after liftoff from Samedan (5,600 ft). The
+    /// plan's ring (SimBrief's along-route TOD down a winding valley route)
+    /// was longer than the 23.6 nm straight line to Sondrio (898 ft): the
+    /// recorded 300 fpm puts the ring past 24.6 nm, so the aircraft was
+    /// "past the descent point" on the runway. The recorded ticks replayed
+    /// through the flight model: the climb-out is silent, and so is a level
+    /// held low (139 ft, the resume refusal's height, long enough for the
+    /// model to call it a level); a real cruise still calls.
+    #[test]
+    fn a_climb_out_under_a_ring_behind_the_departure_calls_no_top_of_descent() {
+        use crate::flight::{Flight, Sample};
+        type Row = (f64, bool, f64, f64, f64, f64, f64, f64, f64);
+        const LILO: (f64, f64, f64) = (46.1546, 9.7952, 898.0);
+        const RING_NM: f64 = 25.0;
+        // (t, ground, gs, ias, vsi, agl, alt, lat, lon), the state records.
+        #[rustfmt::skip]
+        let recorded: &[Row] = &[
+            (1790265186.1, true, 12.8, 9.4, -8.1, 0.0, 5617.9, 46.52844, 9.87915),
+            (1790265191.4, true, 32.4, 26.8, -16.1, 0.0, 5616.7, 46.52895, 9.87953),
+            (1790265194.8, true, 44.2, 42.5, -26.1, 0.1, 5615.5, 46.52950, 9.87998),
+            (1790265198.3, true, 56.6, 55.6, -22.2, 0.0, 5614.4, 46.53018, 9.88062),
+            (1790265201.7, true, 68.1, 65.0, -37.5, 0.0, 5612.6, 46.53106, 9.88131),
+            (1790265204.9, true, 78.8, 70.6, -49.0, 0.1, 5610.4, 46.53214, 9.88192),
+            (1790265208.2, true, 83.6, 80.8, -68.4, -0.0, 5607.6, 46.53325, 9.88263),
+            (1790265211.5, true, 88.4, 82.2, -59.1, 0.1, 5604.3, 46.53436, 9.88368),
+            (1790265215.0, true, 95.2, 91.5, -43.8, 0.1, 5602.0, 46.53553, 9.88487),
+            (1790265218.4, true, 102.6, 99.1, -11.4, 0.1, 5600.3, 46.53694, 9.88614),
+            (1790265221.8, true, 110.3, 107.4, 7.6, 0.1, 5600.1, 46.53857, 9.88747),
+            (1790265223.3, false, 113.1, 107.4, 82.0, 2.6, 5600.7, 46.53936, 9.88808),
+            (1790265225.0, false, 114.6, 108.0, 372.7, 12.8, 5606.0, 46.54005, 9.88862),
+            (1790265226.9, false, 115.9, 111.1, 536.0, 29.2, 5620.2, 46.54087, 9.88931),
+            (1790265228.7, false, 116.4, 109.9, 730.4, 51.3, 5638.5, 46.54171, 9.89004),
+            (1790265230.6, false, 117.2, 110.6, 724.3, 74.0, 5661.4, 46.54257, 9.89080),
+            (1790265232.3, false, 118.1, 110.2, 689.3, 94.6, 5681.6, 46.54339, 9.89159),
+            (1790265233.7, false, 118.9, 106.4, 665.3, 114.5, 5700.6, 46.54421, 9.89237),
+            (1790265235.7, false, 119.6, 109.7, 990.4, 139.2, 5720.1, 46.54491, 9.89306),
+        ];
+        let mut flight = Flight::new();
+        let mut tick = |r: Row| {
+            let (t, ground, gs, ias, vsi, agl, alt, lat, lon) = r;
+            flight.tick(&Sample {
+                t,
+                on_ground: ground,
+                gs_kts: gs,
+                ias_kts: ias,
+                vsi_fpm: vsi,
+                agl_ft: agl,
+                alt_ft: alt,
+                engine_running: true,
+                lat: Some(lat),
+                lon: Some(lon),
+                ..Sample::default()
+            });
+            let mut s = snap(true, true);
+            s.on_ground = ground;
+            s.groundspeed_kts = gs;
+            s.ias_kts = ias;
+            s.vsi_fpm = vsi;
+            s.agl_ft = agl;
+            s.alt_ft = alt;
+            s.lat = lat;
+            s.lon = lon;
+            s.dest_dist_nm = Some(crate::nav::haversine_nm(lat, lon, LILO.0, LILO.1));
+            s.dest_elev_ft = Some(LILO.2);
+            s.tod_ring_nm = Some(RING_NM);
+            s.phase = coarse_phase(flight.phase(), agl);
+            s
+        };
+        for &r in recorded {
+            let s = tick(r);
+            assert_eq!(TodPassed.eval(&s), None, "t {}: {:?}", r.0, s.phase);
+            assert_eq!(TodAhead.eval(&s), None, "t {}", r.0);
+        }
+        // Level for an instant at 139 ft (the vertical-speed gate alone let
+        // this speak): the ring is behind us, the old rule's numbers hold
+        // (23.6 nm out, 116 kt, "about 300 feet a minute").
+        #[rustfmt::skip]
+        let row: Row = (1790265237.0, false, 119.6, 109.7, 0.0, 139.2, 5720.1, 46.54491, 9.89306);
+        let mut level = tick(row);
+        assert!((level.dest_dist_nm.unwrap() - 23.6).abs() < 0.3);
+        assert_eq!(level.phase, Phase::Climb, "the initial climb, by the model");
+        assert_eq!(TodPassed.eval(&level), None, "no top of descent in the climb-out");
+        // Held level at 139 ft for 40 s: the model calls it "levelled low"
+        // (a cruise), and the height still keeps the family silent.
+        for i in 1..=20 {
+            let t = row.0 + 2.0 * i as f64;
+            level = tick((t, false, 120.0, 110.0, 0.0, 139.2, 5720.1, 46.5450, 9.8931));
+        }
+        assert_eq!(level.phase, Phase::Cruise, "levelled low");
+        assert_eq!(TodPassed.eval(&level), None, "139 ft AGL is no cruise to leave");
+        // A real cruise: climb to 10,400 ft (4,800 ft over the valley),
+        // level for 40 s, 22 nm out under the 25 nm ring: now it speaks.
+        let mut t = 1790265300.0;
+        let mut alt: f64 = 5720.0;
+        while alt < 10_400.0 {
+            alt = (alt + 700.0 / 30.0).min(10_400.0);
+            t += 2.0;
+            tick((t, false, 120.0, 110.0, 700.0, alt - 5_581.0, alt, 46.50, 9.87));
+        }
+        let mut cruise = level;
+        for _ in 0..20 {
+            t += 2.0;
+            cruise = tick((t, false, 120.0, 110.0, 0.0, 4_819.0, 10_400.0, 46.50, 9.87));
+        }
+        assert_eq!(cruise.phase, Phase::Cruise);
+        assert!(cruise.dest_dist_nm.unwrap() < RING_NM - 1.0);
+        let msg = TodPassed.eval(&cruise).expect("past the ring in a real cruise");
+        assert!(msg.contains("feet a minute makes the profile"), "{msg}");
+    }
+
+    /// The descent advisor never judges a takeoff, a climb or a flare, and
+    /// never within the initial climb height of the ground.
+    #[test]
+    fn high_on_profile_is_a_descent_from_the_cruise() {
+        let mut s = cruise_with_dest(30.0);
+        s.vsi_fpm = -700.0;
+        s.alt_ft = 13_000.0;
+        assert!(HighOnProfile.eval(&s).is_some(), "mid-descent, high");
+        for p in [Phase::Ground, Phase::Takeoff, Phase::Climb, Phase::Landing] {
+            s.phase = p;
+            assert_eq!(HighOnProfile.eval(&s), None, "{p:?}");
+        }
+        s.phase = Phase::Approach;
+        assert!(HighOnProfile.eval(&s).is_some(), "a descent on the arrival");
+        s.agl_ft = 900.0;
+        assert_eq!(HighOnProfile.eval(&s), None, "too near the ground");
     }
 
     #[test]
