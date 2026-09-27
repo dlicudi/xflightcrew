@@ -1079,7 +1079,9 @@ pub fn heard_altitude_ft(transcript: &str) -> Option<i64> {
         // A written altitude ("5000").
         if w.len() >= 4 && w.len() <= 5 && w.chars().all(|c| c.is_ascii_digit()) {
             if let Ok(v) = w.parse::<i64>() {
-                if (1000..=60000).contains(&v) {
+                // Altitudes are whole hundreds; a written tail number
+                // ("12345") is not one.
+                if (1000..=60000).contains(&v) && v % 100 == 0 {
                     return Some(v);
                 }
             }

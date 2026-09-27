@@ -187,6 +187,24 @@ pub struct Route {
     /// (`plan_audit::choose_arrival`'s pick, else the plan's own), published
     /// as [`arrival_runway`] for the whole mission.
     pub arrival_rwy: Option<String>,
+    /// The planned SID's ident, when the plan has one (`general/sid_ident`):
+    /// the departure an IFR clearance's SID is measured against.
+    pub sid: Option<String>,
+    /// The mission flies IFR ([`plan_is_ifr`]): the tower is asked for the
+    /// IFR clearance to `dest_icao`, not the zone clearance.
+    pub ifr: bool,
+}
+
+/// Does this plan fly IFR? A SimBrief plan is an airline plan and always
+/// does; a local plan does when it cruises above the field's transition
+/// altitude (the plan's own figure, else the airframe's): a flight planned
+/// into the flight levels is not a zone departure. Pure.
+pub fn plan_is_ifr(
+    source: crate::simbrief::PlanSource,
+    cruise_ft: f64,
+    transition_ft: f64,
+) -> bool {
+    source == crate::simbrief::PlanSource::SimBrief || cruise_ft > transition_ft
 }
 
 /// The tested sub-tools the orchestrator invokes, built from the profile by the
@@ -547,18 +565,34 @@ pub(crate) async fn get_zone_clearance(
     ctx: &ToolCtx<'_>,
     voice: &Option<Voice>,
     callsign: &Option<String>,
+    ifr_dest: Option<&str>,
 ) {
     // No station in reach (an uncontrolled field): nobody to ask, and the
     // squawk wait would only burn a minute (every mission that leaves a
-    // field calls this, the helicopter route included).
+    // field calls this, the helicopter route included). An IFR flight asks
+    // for its route even with a code already held (a zone clearance earlier
+    // gave the code, not the route); one holding its clearance asks nothing.
     if !crate::mode::atc_enabled()
-        || crate::party_line::assigned_squawk().is_some()
+        || crate::party_line::assigned_clearance().is_some()
+        || (ifr_dest.is_none() && crate::party_line::assigned_squawk().is_some())
         || !crate::party_line::station_reaches()
     {
         return;
     }
     if let Some(khz) = crate::party_line::home_tower_khz() {
         let _ = xp.set_float(COM1_FREQ_KHZ, khz as f64).await;
+    }
+    if let Some(dest) = ifr_dest {
+        if get_ifr_clearance(xp, ctx, callsign, dest).await {
+            return;
+        }
+        // No IFR clearance came back (a destination the tower's index lacks,
+        // a garbled exchange): the zone clearance, as before, so the
+        // departure still has a code and a clearance to leave.
+        if crate::party_line::assigned_squawk().is_some() {
+            ensure_squawk(xp, ctx, voice).await;
+            return;
+        }
     }
     // The call itself is heard; a line announcing it first is a crew narrating
     // its own hands (LIPK 2026-09-26: said, queued behind the tower, and
@@ -590,6 +624,90 @@ pub(crate) async fn get_zone_clearance(
     }
 }
 
+/// The IFR clearance the tower owes a readback for is out: its coach line
+/// is the IFR readback ("Cleared to ... squawk ..."), not the zone
+/// clearance's ("Not above ...") nor a stale landing one ("Cleared to land
+/// runway ...", no code in it).
+fn ifr_readback_line(owed: Option<&str>) -> Option<&str> {
+    owed.filter(|r| r.starts_with("Cleared to ") && r.contains("squawk"))
+}
+
+/// The IFR call: the destination's ICAO spelled out the way it is said
+/// ("request IFR clearance to Echo Golf Papa Hotel"), which the tower
+/// parses back to the code.
+pub fn ifr_request_call(callsign: &Option<String>, dest_icao: &str) -> String {
+    let spelled: Vec<&str> = dest_icao
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .map(|c| crate::atis::nato(c.to_ascii_uppercase()))
+        .collect();
+    crate::circuit::radio_call(
+        callsign,
+        &format!("request IFR clearance to {}", spelled.join(" ")),
+    )
+}
+
+/// Ask the home tower for the IFR clearance to `dest`, read it back the
+/// way the tower phrases it, and dial its code once the readback is
+/// accepted. True when the clearance is held (`assigned_clearance`); false
+/// when none came back in time (the caller falls back to the zone call).
+async fn get_ifr_clearance(
+    xp: &XPlaneClient,
+    ctx: &ToolCtx<'_>,
+    callsign: &Option<String>,
+    dest: &str,
+) -> bool {
+    crate::circuit::transmit(ifr_request_call(callsign, dest));
+    event("request_clearance", json!({ "ifr": true, "dest": dest }));
+    // The same queue arithmetic as the zone call's wait: the call rides the
+    // speech queue behind anyone the tower is working.
+    waiting("the IFR clearance");
+    let issued = wait_until(60.0, 500, || async {
+        ifr_readback_line(crate::party_line::readback_owed().as_deref()).is_some()
+    })
+    .await;
+    if !issued {
+        event("ifr_clearance_missing", json!({ "dest": dest }));
+        return false;
+    }
+    // The readback is ENFORCED: the SID, the altitude and the code, in the
+    // tower's own words (the coach line), so it is right first time.
+    if let Some(rb) = ifr_readback_line(crate::party_line::readback_owed().as_deref()) {
+        crate::circuit::transmit(rb.trim_end_matches('.').to_string());
+        event("clearance_readback", json!({ "ifr": true }));
+    }
+    waiting("the readback to be accepted");
+    wait_until(30.0, 500, || async {
+        crate::party_line::assigned_clearance().is_some()
+    })
+    .await;
+    let Some(c) = crate::party_line::assigned_clearance() else {
+        event("ifr_clearance_not_accepted", json!({ "dest": dest }));
+        return false;
+    };
+    crate::blackbox::record(
+        "atc",
+        json!({
+            "event": "ifr_clearance", "side": "crew", "dest": c.dest, "sid": c.sid,
+            "runway": c.runway, "initial_alt_ft": c.initial_alt_ft, "squawk": c.squawk,
+        }),
+    );
+    // The clearance's code, dialled (at a tower-only field it is the code
+    // already held, which `ensure_squawk` never sees).
+    let actual = xp.get_float(crate::datarefs::TRANSPONDER_CODE).await.ok();
+    if let Some(code) = squawk_owed(Some(c.squawk), actual) {
+        let ok = crate::tools::radio::SetTransponder
+            .execute(&json!({ "code": code }), ctx)
+            .await
+            .is_ok();
+        event(
+            "squawk_set",
+            json!({ "code": code, "ok": ok, "was": actual }),
+        );
+    }
+    true
+}
+
 async fn engine_running(xp: &XPlaneClient) -> bool {
     xp.get_float_array(ENGN_RUNNING)
         .await
@@ -604,6 +722,19 @@ async fn engine_running(xp: &XPlaneClient) -> bool {
 /// How long a conditional line-up waits for the named arrival to pass before
 /// full auto gives the aircraft back at the hold line.
 const LINE_UP_BEHIND_SECS: f64 = 300.0;
+/// Within this of the IFR clearance's altitude the climb has levelled there.
+const CLEARED_LEVEL_BAND_FT: f64 = 300.0;
+/// Level at the IFR clearance's altitude this long with no departure
+/// handoff (a tower-only field hands nobody over): the crew climbs as filed
+/// rather than cruise the whole flight at the initial altitude.
+const CLEARED_LEVEL_RELEASE_SECS: f64 = 90.0;
+
+/// The hold at the clearance's altitude has run its course with nobody to
+/// clear us higher. Pure.
+pub fn cleared_hold_expired(level_secs: f64) -> bool {
+    level_secs >= CLEARED_LEVEL_RELEASE_SECS
+}
+
 /// How long the inbound call waits for the destination's station to take
 /// over the frequency before going out regardless.
 const INBOUND_SWAP_WAIT_SECS: f64 = 45.0;
@@ -669,11 +800,36 @@ async fn wait_enroute_working_the_radio(
     let mut landing_off = false;
     // The signs follow the flight through ten thousand, both ways.
     let mut signs = crate::tools::signs::Watch::default();
+    // Level at the IFR clearance's altitude since, with nobody yet to clear
+    // us higher.
+    let mut level_since: Option<Instant> = None;
     loop {
         if ABORT.load(SeqCst) {
             return false;
         }
         if let Ok(alt_ft) = xp.get_float(ALT_IND_FT).await {
+            let ceiling = crate::procedure::cleared_ceiling();
+            level_since = match ceiling {
+                Some(c) if (alt_ft - c).abs() <= CLEARED_LEVEL_BAND_FT => {
+                    level_since.or(Some(Instant::now()))
+                }
+                _ => None,
+            };
+            if let (Some(c), Some(t)) = (ceiling, level_since) {
+                if cleared_hold_expired(t.elapsed().as_secs_f64()) {
+                    crate::procedure::hold_at_cleared(None, "no_departure_handoff");
+                    level_since = None;
+                    event("cleared_ceiling_released", json!({ "ft": c, "why": "no_handoff" }));
+                    announce(
+                        voice,
+                        Priority::Advisory,
+                        &format!(
+                            "Level at {}, nobody to ask for higher. Climbing as filed.",
+                            crate::flightplan::spoken_feet(c)
+                        ),
+                    );
+                }
+            }
             if let Some(on) = signs.tick(alt_ft) {
                 if crate::tools::signs::set(xp, on).await == Some(true) {
                     announce(
@@ -772,6 +928,10 @@ pub(crate) async fn obey_departure_handoff(
     // frequency, and "passing one thousand" was said at 1,207 ft.
     let alt_ft = xp.get_float(ALT_IND_FT).await.unwrap_or(0.0);
     crate::circuit::transmit_check_in(callsign.clone(), to.clone(), climb_to_ft);
+    // The check-in announces the climb to the plan and departure clears it
+    // ("radar contact, climb ..."): the IFR clearance's altitude has done its
+    // job, the follower goes on to the plan's levels.
+    crate::procedure::hold_at_cleared(None, "departure_check_in");
     event(
         "departure_checkin",
         json!({ "to": to, "khz": khz, "alt_ft_queued": alt_ft.round() }),
@@ -1380,7 +1540,13 @@ async fn fly(xp: XPlaneClient, config: Config, voice: Option<Voice>, tools: SubT
         // simulated tower to answer (real/external ATC and copilot-only leave the
         // clearance to the pilot), and only if we don't already hold a squawk.
         if towered {
-            get_zone_clearance(&xp, &ctx, &voice, &callsign).await;
+            // An IFR plan asks for its route: the SID, the altitude and the
+            // code the rest of the departure flies.
+            let ifr_dest = match &tools.mission {
+                Mission::Flight(r) if r.ifr => Some(r.dest_icao.clone()),
+                _ => None,
+            };
+            get_zone_clearance(&xp, &ctx, &voice, &callsign, ifr_dest.as_deref()).await;
         }
         bail_if_abort!();
         // The taxi route is the tower's. Ask for it if we don't already hold
@@ -1620,22 +1786,39 @@ async fn fly(xp: XPlaneClient, config: Config, voice: Option<Voice>, tools: SubT
         // was given: a SID from that runway that joins the route, or direct
         // to the planned SID's exit (LIME 2026-09-25: the tower gave 10 for
         // a plan departing 28, and full auto handed back on the ramp).
+        // ...and an IFR clearance's SID is the departure flown when it
+        // serves the cleared runway: the crew's own pick is the fallback,
+        // and stays the whole behaviour with no clearance.
         let cleared = crate::party_line::clearance_runway();
-        if let Some(why) = departure_runway_mismatch(
-            match &tools.mission {
-                Mission::Flight(r) => r.departure_rwy.as_deref(),
-                _ => None,
-            },
-            cleared.as_deref(),
-        ) {
+        let ifr = crate::party_line::assigned_clearance();
+        let cleared_sid = cleared_sid_for(ifr.as_ref(), cleared.as_deref());
+        let (planned_rwy, planned_sid) = match &tools.mission {
+            Mission::Flight(r) => (r.departure_rwy.clone(), r.sid.clone()),
+            _ => (None, None),
+        };
+        let mismatch = departure_runway_mismatch(planned_rwy.as_deref(), cleared.as_deref());
+        let sid_differs = cleared_sid.as_deref().is_some_and(|c| {
+            planned_sid
+                .as_deref()
+                .is_none_or(|p| !p.eq_ignore_ascii_case(c))
+        });
+        let rwy = cleared.clone().or_else(|| ifr.as_ref().map(|c| c.runway.clone()));
+        if mismatch.is_some() || (sid_differs && matches!(tools.mission, Mission::Flight(_))) {
+            let why = mismatch.clone().unwrap_or_default();
             let vy = tools.takeoff.vy_kts;
-            let replanned = match (&mut tools.mission, cleared.as_deref()) {
-                (Mission::Flight(r), Some(c)) => choose_departure(&config, r, c, vy).await,
+            let only_cleared = mismatch.is_none();
+            let replanned = match (&mut tools.mission, rwy.as_deref()) {
+                (Mission::Flight(r), Some(c)) => {
+                    choose_departure(&config, r, c, vy, cleared_sid.clone(), only_cleared).await
+                }
                 _ => Err(String::new()),
             };
             match replanned {
-                Ok(line) => {
-                    event("departure_rechosen", json!({ "line": line }));
+                Ok(Rechosen { line, source }) => {
+                    event(
+                        "departure_rechosen",
+                        json!({ "line": line, "source": source, "cleared_sid": cleared_sid }),
+                    );
                     announce(&voice, Priority::Advisory, &line);
                     // The GPS shows the departure we will fly, not SimBrief's.
                     if let Mission::Flight(r) = &tools.mission {
@@ -1643,6 +1826,24 @@ async fn fly(xp: XPlaneClient, config: Config, voice: Option<Voice>, tools: SubT
                             let _ = xp.set_data("xcopilot/fms/route", r.fms_payload.as_bytes()).await;
                             let _ = xp.set_int("xcopilot/fms/load", 1).await;
                         }
+                    }
+                }
+                // The planned runway stands and only the tower's SID would
+                // not fit the route: said, and the plan's departure flown.
+                Err(no) if only_cleared => {
+                    event(
+                        "cleared_sid_not_flown",
+                        json!({ "sid": cleared_sid, "why": no }),
+                    );
+                    if let Some(sid) = &cleared_sid {
+                        announce(
+                            &voice,
+                            Priority::Advisory,
+                            &format!(
+                                "The tower cleared us via the {} departure, and it doesn't join our route. Flying the planned departure.",
+                                crate::tower::spoken_sid(sid)
+                            ),
+                        );
                     }
                 }
                 Err(no) => {
@@ -2116,7 +2317,16 @@ async fn fly_route(
             Priority::Advisory,
             &format!("Cleared to go. Flying your plan to {}.", route.dest_name),
         );
-        if let Ok(reply) = tools.takeoff.execute(&json!({}), ctx).await {
+        // An IFR clearance's altitude is the level the takeoff selects on
+        // the dial before the roll, and the climb-out's target.
+        let level_ft = crate::party_line::assigned_clearance()
+            .filter(|_| route.ifr)
+            .map(|c| c.initial_alt_ft as f64);
+        if let Ok(reply) = tools
+            .takeoff
+            .execute(&json!({ "level_ft": level_ft }), ctx)
+            .await
+        {
             announce(voice, Priority::Advisory, &reply);
         }
         if !crate::autotakeoff::ACTIVE.load(Relaxed) {
@@ -2209,6 +2419,13 @@ async fn fly_route(
     // --- Enroute: the procedure follower over the plan's own fixes. It climbs
     // to cruise on the first constraint and flies the plan's descent numbers
     // after TOD; quiet completion (EndAction::Enroute) hands back here.
+    // Under an IFR clearance the climb stops at its altitude until the
+    // departure controller's check-in clears higher (the ceiling is let go
+    // at the check-in, `obey_departure_handoff`).
+    let ceiling = crate::party_line::assigned_clearance()
+        .filter(|_| route.ifr && !matches!(tools.mission, Mission::Resume(_)))
+        .map(|c| c.initial_alt_ft as f64);
+    crate::procedure::hold_at_cleared(ceiling, "ifr_clearance");
     if !crate::procedure::start_scoped(
         config.xplane_base_url.clone(),
         voice.clone(),
@@ -2228,6 +2445,7 @@ async fn fly_route(
         },
         xp.cancellation(),
     ) {
+        crate::procedure::hold_at_cleared(None, "procedure_busy");
         give_up(
             xp,
             tools.taxi.park_brake_valve_set,
@@ -3448,8 +3666,11 @@ async fn choose_departure(
     route: &mut Route,
     cleared: &str,
     vy_kts: f64,
-) -> Result<String, String> {
+    cleared_sid: Option<String>,
+    only_cleared: bool,
+) -> Result<Rechosen, String> {
     use crate::nav::ProcKind;
+    let wanted = cleared_sid.clone();
     let idents: Vec<String> = route.legs.iter().map(|l| l.fix_ident.clone()).collect();
     let (cifp, apt_path, fix_path, nav_path) = (
         config.cifp_dir.clone(),
@@ -3473,7 +3694,12 @@ async fn choose_departure(
                 None
             }
         })?;
-        for choice in crate::nav::sids_for_route(&cifp, &origin, &cl, &idents) {
+        let choices = prefer_cleared_sid(
+            crate::nav::sids_for_route(&cifp, &origin, &cl, &idents),
+            wanted.as_deref(),
+            only_cleared,
+        );
+        for choice in choices {
             let mut legs =
                 crate::nav::load_proc_legs(&cifp, &origin, ProcKind::Sid, &choice.ident, Some(&choice.transition));
             crate::nav::resolve_proc_fixes(&fix_path, &nav_path, &apt, &origin, &mut legs, alat, alon);
@@ -3504,6 +3730,11 @@ async fn choose_departure(
                 Ok(note) => return Some(Ok((choice, sid, mins, note))),
                 Err(_) => continue,
             }
+        }
+        // The tower's SID was all we would fly and it does not work from
+        // here: say so, the plan stands.
+        if only_cleared {
+            return Some(Err(None));
         }
         // No SID from this runway to the route: direct to the planned SID's
         // exit. The planned SID is the one the route STARTS on (its first
@@ -3538,12 +3769,22 @@ async fn choose_departure(
             route.climb_minimums = mins;
             route.departure_rwy = Some(cleared.to_string());
             route.origin_rwy = Some(cleared.to_string());
-            Ok(format!(
-                "Runway {spoken} in use, so the {} departure to {}.{}",
-                choice.ident,
-                choice.join,
-                note.map(|n| format!(" {n}")).unwrap_or_default()
-            ))
+            route.sid = Some(choice.ident.clone());
+            let source = departure_source(Some(&choice.ident), cleared_sid.as_deref());
+            let note = note.map(|n| format!(" {n}")).unwrap_or_default();
+            let line = if source == "cleared" {
+                format!(
+                    "Cleared via the {} departure, runway {spoken}, to {}.{note}",
+                    crate::tower::spoken_sid(&choice.ident),
+                    choice.join,
+                )
+            } else {
+                format!(
+                    "Runway {spoken} in use, so the {} departure to {}.{note}",
+                    choice.ident, choice.join,
+                )
+            };
+            Ok(Rechosen { line, source })
         }
         Err(Some(exit)) => {
             let idx = route
@@ -3556,11 +3797,76 @@ async fn choose_departure(
             route.climb_minimums = Vec::new();
             route.departure_rwy = Some(cleared.to_string());
             route.origin_rwy = Some(cleared.to_string());
-            Ok(format!(
-                "Runway {spoken} in use and no departure from it joins our route, so direct to {exit}, watching the terrain."
-            ))
+            route.sid = None;
+            Ok(Rechosen {
+                line: format!(
+                    "Runway {spoken} in use and no departure from it joins our route, so direct to {exit}, watching the terrain."
+                ),
+                source: "chosen",
+            })
         }
+        Err(None) if only_cleared => Err("The cleared departure doesn't join our route.".to_string()),
         Err(None) => Err("No departure from that runway joins our route.".to_string()),
+    }
+}
+
+/// A departure the crew spliced into the route: the line to say and whose
+/// pick it was ("cleared": the tower's SID; "chosen": the crew's own).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Rechosen {
+    pub line: String,
+    pub source: &'static str,
+}
+
+/// The SIDs to try, the tower's first: the clearance's SID moved to the
+/// front when it is among them (it serves the runway and joins the route),
+/// the crew's own order after it. `only` keeps the tower's alone (the
+/// planned runway stands and only the SID changed: a crew never swaps a
+/// plan's SID for one of its own). No clearance: the order unchanged. Pure.
+pub fn prefer_cleared_sid(
+    mut choices: Vec<crate::nav::SidChoice>,
+    cleared: Option<&str>,
+    only: bool,
+) -> Vec<crate::nav::SidChoice> {
+    let Some(c) = cleared else {
+        return choices;
+    };
+    match choices.iter().position(|x| x.ident.eq_ignore_ascii_case(c)) {
+        Some(i) => {
+            let x = choices.remove(i);
+            if only {
+                return vec![x];
+            }
+            choices.insert(0, x);
+            choices
+        }
+        None if only => Vec::new(),
+        None => choices,
+    }
+}
+
+/// Whose departure is flown: "cleared" when it is the tower's SID, else
+/// "chosen". Pure.
+pub fn departure_source(flown: Option<&str>, cleared: Option<&str>) -> &'static str {
+    match (flown, cleared) {
+        (Some(f), Some(c)) if f.eq_ignore_ascii_case(c) => "cleared",
+        _ => "chosen",
+    }
+}
+
+/// The SID the IFR clearance hands the crew for the runway it was cleared
+/// on: the clearance's SID when its runway is the cleared one (with no
+/// runway clearance yet, its own runway). `None` with no clearance, no SID
+/// in it (runway heading), or a runway since changed. Pure.
+pub fn cleared_sid_for(
+    clearance: Option<&crate::party_line::IfrClearance>,
+    cleared_runway: Option<&str>,
+) -> Option<String> {
+    let c = clearance?;
+    let sid = c.sid.clone()?;
+    match cleared_runway {
+        Some(r) if !r.eq_ignore_ascii_case(&c.runway) => None,
+        _ => Some(sid),
     }
 }
 
@@ -4375,6 +4681,101 @@ async fn runway_check(
 
 #[cfg(test)]
 mod tests {
+    fn sid(ident: &str, join_index: usize) -> crate::nav::SidChoice {
+        crate::nav::SidChoice {
+            ident: ident.into(),
+            transition: "RW24".into(),
+            join: "GOSAM".into(),
+            join_index,
+            fixes: vec!["GOSAM".into()],
+        }
+    }
+
+    /// The IFR clearance as the station hands it down (`party_line::
+    /// assigned_clearance`): GOSAM 1A off runway 24.
+    fn gosam_1a() -> crate::party_line::IfrClearance {
+        crate::party_line::IfrClearance {
+            dest: "EGLL".into(),
+            sid: Some("GOSAM1A".into()),
+            runway: "24".into(),
+            initial_alt_ft: 5000,
+            squawk: 4521,
+        }
+    }
+
+    /// The crew flies the departure it was cleared on: with the station's
+    /// GOSAM 1A in hand the departure is GOSAM 1A and the event says
+    /// "cleared", ahead of the crew's own best pick (GOSAM 1B, which joins
+    /// further along). With no clearance the old pick stands, "chosen".
+    #[test]
+    fn a_cleared_sid_is_flown_and_the_old_pick_stands_without_one() {
+        use super::{cleared_sid_for, departure_source, prefer_cleared_sid};
+        // The crew's own order, best first (`nav::sids_for_route`).
+        let own = || vec![sid("GOSAM1B", 3), sid("GOSAM1A", 2)];
+        let c = gosam_1a();
+        let wanted = cleared_sid_for(Some(&c), Some("24"));
+        assert_eq!(wanted.as_deref(), Some("GOSAM1A"));
+        let order = prefer_cleared_sid(own(), wanted.as_deref(), false);
+        assert_eq!(order[0].ident, "GOSAM1A", "the tower's SID first");
+        assert_eq!(order.len(), 2, "the crew's pick stays as the fallback");
+        assert_eq!(departure_source(Some(&order[0].ident), wanted.as_deref()), "cleared");
+        // No clearance: the crew's order untouched, its pick "chosen".
+        let wanted = cleared_sid_for(None, Some("24"));
+        assert_eq!(wanted, None);
+        let order = prefer_cleared_sid(own(), wanted.as_deref(), false);
+        assert_eq!(order[0].ident, "GOSAM1B");
+        assert_eq!(departure_source(Some(&order[0].ident), wanted.as_deref()), "chosen");
+        // A clearance whose SID does not serve the runway now cleared (the
+        // tower swapped ends since): not the tower's SID any more.
+        assert_eq!(cleared_sid_for(Some(&c), Some("06")), None);
+        // No runway clearance yet: the clearance's own runway.
+        assert_eq!(cleared_sid_for(Some(&c), None).as_deref(), Some("GOSAM1A"));
+        // Runway heading (no SID in the clearance): nothing to fly but the plan.
+        let heading = crate::party_line::IfrClearance { sid: None, ..gosam_1a() };
+        assert_eq!(cleared_sid_for(Some(&heading), Some("24")), None);
+        // The planned runway stands and only the SID changed: the tower's
+        // alone, or nothing (the plan's departure is kept, never a third).
+        let only = prefer_cleared_sid(own(), Some("GOSAM1A"), true);
+        assert_eq!(only.iter().map(|c| c.ident.as_str()).collect::<Vec<_>>(), ["GOSAM1A"]);
+        assert!(prefer_cleared_sid(own(), Some("GOSAM1C"), true).is_empty());
+        assert_eq!(prefer_cleared_sid(own(), Some("GOSAM1C"), false)[0].ident, "GOSAM1B");
+    }
+
+    /// The crew's IFR call carries the destination's ICAO spelled out, and
+    /// the tower's parser reads it back as that code.
+    #[test]
+    fn the_ifr_call_carries_the_destination_the_tower_reads() {
+        let cs = Some("November one seven two Sierra Papa".to_string());
+        let call = super::ifr_request_call(&cs, "EGPH");
+        assert_eq!(
+            call,
+            "November one seven two Sierra Papa, request IFR clearance to Echo Golf Papa Hotel"
+        );
+        assert_eq!(
+            crate::tower::parse_intent(&call.to_ascii_lowercase()),
+            crate::tower::Intent::RequestIfrClearance {
+                dest: Some("EGPH".into())
+            }
+        );
+        // The IFR coach line, not the zone one nor a stale landing one.
+        let ifr = "Cleared to Edinburgh via the Gosa one Charlie departure, runway zero niner, climb five thousand feet, squawk four five two one, November.";
+        assert_eq!(super::ifr_readback_line(Some(ifr)), Some(ifr));
+        assert_eq!(super::ifr_readback_line(Some("Not above two thousand feet, squawk four five two one, N.")), None);
+        assert_eq!(super::ifr_readback_line(Some("Cleared to land runway zero niner, N.")), None);
+        assert_eq!(super::ifr_readback_line(None), None);
+    }
+
+    #[test]
+    fn a_plan_flies_ifr_from_simbrief_or_above_the_transition() {
+        use crate::simbrief::PlanSource;
+        assert!(super::plan_is_ifr(PlanSource::SimBrief, 4500.0, 6000.0));
+        assert!(super::plan_is_ifr(PlanSource::Local, 9500.0, 6000.0));
+        assert!(!super::plan_is_ifr(PlanSource::Local, 4500.0, 6000.0));
+        // A hold at the clearance's altitude lets go after a level spell.
+        assert!(!super::cleared_hold_expired(30.0));
+        assert!(super::cleared_hold_expired(90.0));
+    }
+
     /// LFPB 2026-09-22: the line-up refused at the holding point, full auto
     /// said "your aircraft", and the taxi governor went on holding the 737 on
     /// its wheel brakes for twenty-seven minutes with `park` at 0.0. A give-up
@@ -4550,13 +4951,25 @@ mod tests {
             origin_rwy: Some("28".into()),
             fms_payload: "LIME,45.6689,9.7003,0|ME609,45.7,9.8,5000|LIPE,44.5354,11.2887,0".into(),
             arrival_rwy: None,
+            sid: Some("LEGL1P".into()),
+            ifr: true,
         };
         let fallback_route = route.clone();
         // The Evolution's own climb (profile best_climb_fpm); the GA default
         // of 700 fpm cannot make LEGLO's FL120 from either runway.
         let evo = crate::aircraft::ReferenceProfile { best_climb_fpm: Some(5000.0), ..Default::default() };
         crate::procedure::publish_vs_limits(Some(&evo));
-        let line = super::choose_departure(&config, &mut route, "10", 105.0).await;
+        // The tower cleared LEGL1W off 10: that one is flown, "cleared".
+        let mut cleared_route = route.clone();
+        let d = super::choose_departure(&config, &mut cleared_route, "10", 105.0, Some("LEGL1W".into()), false)
+            .await
+            .expect("the cleared SID from 10");
+        println!("{d:?}");
+        assert_eq!(d.source, "cleared", "{d:?}");
+        assert_eq!(cleared_route.sid.as_deref(), Some("LEGL1W"));
+        let line = super::choose_departure(&config, &mut route, "10", 105.0, None, false)
+            .await
+            .map(|d| d.line);
         println!("{line:?}");
         let after: Vec<String> = route.legs.iter().map(|l| l.fix_ident.clone()).collect();
         println!("after: {after:?}");
@@ -4573,7 +4986,10 @@ mod tests {
         // exit (LEGL1P's LEGLO), never another SID's further join (SRN).
         crate::procedure::publish_vs_limits(None);
         let mut route = fallback_route;
-        let line = super::choose_departure(&config, &mut route, "10", 105.0).await.expect("fallback");
+        let line = super::choose_departure(&config, &mut route, "10", 105.0, None, false)
+            .await
+            .expect("fallback")
+            .line;
         println!("{line}");
         assert!(line.contains("direct to LEGLO"), "{line}");
         assert_eq!(route.legs.first().map(|l| l.fix_ident.as_str()), Some("LEGLO"));

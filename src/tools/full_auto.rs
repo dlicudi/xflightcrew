@@ -695,6 +695,9 @@ impl FullAuto {
                 legs,
                 fms_payload: payload,
                 local_runway: None,
+                sid: None,
+                // Airborne: no clearance to ask for.
+                ifr: false,
             }),
             ack,
         ))
@@ -1196,6 +1199,12 @@ impl FullAuto {
                 legs,
                 fms_payload,
                 local_runway,
+                sid: fp.procedures.sid.clone(),
+                ifr: crate::full_auto::plan_is_ifr(
+                    fp.source,
+                    fp.cruise_alt_ft,
+                    fp.transition_altitude_ft.unwrap_or(self.transition_altitude_ft),
+                ),
             }),
             ack,
         ))
