@@ -2878,8 +2878,24 @@ pub fn region_tick(lat: f64, lon: f64, on_ground: bool, now: Instant) -> Option<
             d - SERVICE_BIAS_NM * region_services(apt) as f64
         }
     };
+    // An IFR flight in the air is worked by radar units, never handed to a
+    // tower that only owns its zone: EGBB-EGKK (2026-09-27) was told
+    // "contact Oxford Kidlington Tower" at FL150. It goes to a field's
+    // approach (or departure) position, and a tower-only field is passed
+    // over, save the active one and the pinned arrival (the flight is
+    // landing there; its tower is where the inbound call goes).
+    let ifr = IFR_FLIGHT.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let ifr_airborne = !on_ground && ifr.is_some();
+    let pin = arrival_pin_khz();
+    let eligible = |a: &RegionApt| {
+        !ifr_airborne
+            || a.apt.name == active_name
+            || radar_position(&a.apt).is_some()
+            || a.apt.freq(nav::FREQ_TOWER).is_some_and(|f| Some(f.khz) == pin)
+    };
     let (d_best, s_best, best) = region
         .iter()
+        .filter(|a| eligible(a))
         .map(|a| {
             let d = distance(a);
             (d, score(d, &a.apt), a)
@@ -2970,7 +2986,6 @@ pub fn region_tick(lat: f64, lon: f64, on_ground: bool, now: Instant) -> Option<
         // An IFR flight is handed unit to unit with its code: no service
         // ends and no squawk is ordered (LIEA-LEBL, 2026-09-27, an IFR 737
         // on 4501 was told "squawk seven thousand" at FL200).
-        let ifr = IFR_FLIGHT.lock().unwrap_or_else(|e| e.into_inner()).clone();
         // A discrete code in effect goes back to conspicuity with the service
         // that assigned it.
         let squawk_vfr = ifr.is_none()
@@ -2978,7 +2993,15 @@ pub fn region_tick(lat: f64, lon: f64, on_ground: bool, now: Instant) -> Option<
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .is_some();
-        let to = format!("{} Tower", spoken_airport(&best.apt.name));
+        // Enroute, the IFR flight goes to the field's radar position (see
+        // `eligible` above); the pinned arrival keeps its tower, where the
+        // crew's inbound call goes.
+        let pinned = best.apt.freq(nav::FREQ_TOWER).is_some_and(|f| Some(f.khz) == pin);
+        let (position, khz) = match radar_position(&best.apt) {
+            Some(r) if ifr_airborne && !pinned => r,
+            _ => ("Tower", khz),
+        };
+        let to = format!("{} {position}", spoken_airport(&best.apt.name));
         // The instruction as data for the crew that has to obey it: the
         // spoken line alone had no consumer, so the flight kept the discrete
         // code and the old frequency until its own arrival stage retuned.
@@ -2998,6 +3021,15 @@ pub fn region_tick(lat: f64, lon: f64, on_ground: bool, now: Instant) -> Option<
         Some((best.icao.clone(), best.apt.clone()));
     *LAST_REGION_SWITCH.lock().unwrap_or_else(|e| e.into_inner()) = Some(now);
     Some(sw)
+}
+
+/// A field's radar position for an IFR handoff: its approach, else its
+/// departure frequency, as spoken ("Approach") and in kHz. `None` = the field
+/// has only a tower.
+fn radar_position(apt: &nav::AirportInfo) -> Option<(&'static str, i64)> {
+    apt.freq(nav::FREQ_APPROACH)
+        .map(|f| ("Approach", f.khz))
+        .or_else(|| apt.freq(nav::FREQ_DEPARTURE).map(|f| ("Departure", f.khz)))
 }
 
 /// The enroute handoff as spoken. VFR: the radar service ends ("Radar
@@ -8985,6 +9017,78 @@ mod tests {
         );
     }
 
+    /// The real region at the EGBB-EGKK switch (sortie 1790534902, +1319 s,
+    /// FL150 IFR at 52.1 N 1.4 W): a VFR flight there is still handed to
+    /// Oxford's tower, the IFR flight never to a tower-only unit and to a
+    /// radar position when it is handed at all.
+    /// `cargo test -p atc -- --ignored real_install_region_ifr --nocapture`
+    #[test]
+    #[ignore] // needs the real X-Plane install; run with --ignored
+    fn real_install_region_ifr_handoff_goes_to_radar() {
+        let _guard = SIDE_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let apt = crate::nav::test_xplane_path("Global Scenery/Global Airports/Earth nav data/apt.dat");
+        if !std::path::Path::new(&apt).exists() {
+            return;
+        }
+        load_region(&apt);
+        let egbb = REGION
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|a| a.icao == "EGBB")
+            .map(|a| (a.apt.name.clone(), a.lat, a.lon))
+            .expect("EGBB indexed");
+        let arm = || {
+            *PENDING_STATION.lock().unwrap() = None;
+            *LAST_REGION_SWITCH.lock().unwrap() = None;
+            *ARRIVAL_PIN.lock().unwrap() = None;
+            *ACTIVE_FIELD.lock().unwrap() = Some(egbb.clone());
+            *CLEARANCE.lock().unwrap() = Some(ClearanceSnap {
+                state: tower::State::TakeoffCleared,
+                callsign: "Whiskey Alpha Tango four two three six".into(),
+                runway_ident: "33".into(),
+                pending_readback: None,
+                holds_runway: false,
+            });
+        };
+        let t0 = Instant::now();
+        // VFR: the old tower handoff stands.
+        *IFR_FLIGHT.lock().unwrap() = None;
+        arm();
+        let vfr = region_tick(52.1, -1.4, false, t0).map(|s| s.line);
+        let _ = crate::party_line::take_region_handoff();
+        eprintln!("VFR: {vfr:?}");
+        assert!(vfr.as_deref().is_some_and(|l| l.contains("Oxford Kidlington Tower")), "{vfr:?}");
+        // IFR on 4505, as flown.
+        arm();
+        publish_ifr_clearance(
+            tower::IfrClearance {
+                dest: "EGKK".into(),
+                sid: Some("ADME1M".into()),
+                runway: "33".into(),
+                initial_alt_ft: 5000,
+                squawk: 4505,
+            },
+            "Whiskey Alpha Tango four two three six",
+            None,
+        );
+        let ifr = region_tick(52.1, -1.4, false, t0).map(|s| s.line);
+        let h = crate::party_line::take_region_handoff();
+        eprintln!("IFR: {ifr:?} {h:?}");
+        // Oxford publishes approach 125.09 (and "Oxford Radar"): the flight
+        // goes there on radar, its code kept.
+        let h = h.expect("handed to a radar position");
+        assert_eq!((h.to.as_str(), h.khz, h.ifr_code), ("Oxford Kidlington Approach", 125_090, Some(4505)));
+        assert!(!ifr.unwrap_or_default().contains("Tower"));
+        *IFR_FLIGHT.lock().unwrap() = None;
+        *IFR_CLEARANCE.lock().unwrap() = None;
+        *CLEARANCE.lock().unwrap() = None;
+        *PENDING_STATION.lock().unwrap() = None;
+        *LAST_REGION_SWITCH.lock().unwrap() = None;
+        *ACTIVE_FIELD.lock().unwrap() = None;
+        REGION.lock().unwrap().clear();
+    }
+
     #[test]
     fn region_hands_off_to_the_decisively_nearer_tower() {
         let _guard = SIDE_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -9098,22 +9202,46 @@ mod tests {
             "November eight one six November November",
             None,
         );
+        // Malaga here publishes only a tower: an IFR flight in the air is
+        // never handed to one (EGBB-EGKK 2026-09-27, "contact Oxford
+        // Kidlington Tower" at FL150). The last controller keeps it.
+        assert!(region_tick(36.6, -4.6, false, t0).is_none(), "no tower-only handoff for IFR");
+        assert!(crate::party_line::take_region_handoff().is_none());
+        // With an approach position the field takes the flight on radar: a
+        // plain handoff to Malaga APPROACH, the code kept.
+        REGION.lock().unwrap()[1].apt.freqs.push(nav::AtcFreq {
+            kind: nav::FREQ_APPROACH,
+            khz: 123_950,
+            name: "Malaga Approach".into(),
+        });
         let sw = region_tick(36.6, -4.6, false, t0).expect("IFR handoff");
         assert!(!sw.crew);
         assert_eq!(
             sw.line,
-            "November eight one six November November, contact Malaga Tower on one one eight decimal one."
+            "November eight one six November November, contact Malaga Approach on one two three decimal niner five."
         );
         let h = crate::party_line::take_region_handoff().expect("published for the crew");
         assert_eq!(
             h,
             RegionHandoff {
-                to: "Malaga Tower".into(),
-                khz: 118_100,
+                to: "Malaga Approach".into(),
+                khz: 123_950,
                 squawk_vfr: false,
                 ifr_code: Some(4503),
             }
         );
+        // The pinned arrival keeps its tower (the inbound call goes there),
+        // tower-only or not.
+        *PENDING_STATION.lock().unwrap() = None;
+        *LAST_REGION_SWITCH.lock().unwrap() = None;
+        *ACTIVE_FIELD.lock().unwrap() = Some(("Gibraltar".into(), 36.15, -5.35));
+        REGION.lock().unwrap()[1].apt.freqs.pop();
+        *ARRIVAL_PIN.lock().unwrap() = Some(118_100);
+        let sw = region_tick(36.6, -4.6, false, t0).expect("pinned arrival handoff");
+        assert!(sw.line.contains("contact Malaga Tower on one one eight decimal one"), "{}", sw.line);
+        let h = crate::party_line::take_region_handoff().expect("published for the crew");
+        assert_eq!((h.to.as_str(), h.khz), ("Malaga Tower", 118_100));
+        *ARRIVAL_PIN.lock().unwrap() = None;
         // The IFR flight ends at the landing, not before: on the ground at
         // the clearance it stands, airborne it stands, the next ground
         // contact retires it.

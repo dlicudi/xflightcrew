@@ -234,6 +234,10 @@
 # "radar contact, climb ...".
 - {text: "whiskey alpha tango four two three six, birmingham approach on one three one decimal zero zero five", intent: unknown, readback: true}
 - {text: "birmingham approach, whiskey alpha tango four two three six, passing three thousand one hundred climbing one five thousand", intent: unknown, readback: true}
+# The IFR region handoff read back at FL150 (EGBB-EGKK, 2026-09-27), then to
+# a tower; now to the field's radar position.
+- {text: "whiskey alpha tango four two three six, roger, oxford kidlington tower on one three three decimal four three", intent: unknown, readback: true}
+- {text: "whiskey alpha tango four two three six, roger, oxford kidlington approach on one two five decimal zero niner", intent: unknown, readback: true}
 - {text: "with you passing one thousand five hundred", intent: unknown, readback: true}
 - {text: "Headace, do copy.", intent: unknown, readback: true}
 - {text: "roger, holding point alpha", intent: unknown, readback: true}

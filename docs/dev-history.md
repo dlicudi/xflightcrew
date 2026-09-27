@@ -8921,3 +8921,35 @@ pays it and ClearedToLand stands, twice; unkeyed and addressed: falls through,
 never walked back to Inbound), corpus cases for both real transcripts. Next
 landing: the `atc` keyed record of the landing readback carries intent
 `Unknown`, outcome silence, state `ClearedToLand>ClearedToLand`. Offline only.
+
+## 2026-09-27: an IFR flight is handed to radar, never to a tower-only unit (issue #120)
+
+**Sortie 1790534902 (EGBB-EGKK, IFR on 4505, +1319 s).** At FL150 near 52.1 N
+1.4 W the region watch handed the flight from Birmingham to "Oxford Kidlington
+Tower on one three three decimal four three"; full auto read it back, retuned
+and kept its code (`region_handoff`). `region_tick` picks the service-weighted
+nearest staffed tower and always named the TOWER, whatever the flight rules or
+height: an instrument flight enroute above a small field's zone went to the
+controller of that zone.
+
+**The fix, the least one.** For an airborne flight holding `IFR_FLIGHT`, the
+region's candidates are the fields with a radar position (`radar_position`: the
+approach frequency, else the departure one), plus the active field and the
+pinned arrival; a tower-only field is passed over, so between radar fields the
+last controller keeps the flight. The handoff names that position:
+"<callsign>, contact Oxford Kidlington Approach on one two five decimal zero
+niner" (`RegionHandoff.to` and `khz` are the approach's). The pinned arrival
+keeps its TOWER, where `call_inbound` goes (it tunes the tower first anyway).
+VFR is unchanged. There is still no area or centre service in the region
+index, so a high IFR flight near a field with radar is worked by that field's
+approach (#96 stays owed for the rest of the IFR service picture).
+
+Tests `region_hands_off_to_the_decisively_nearer_tower` (IFR: no handoff to a
+tower-only Malaga, "contact Malaga Approach" once it has one, the pinned
+arrival still its tower), `real_install_region_ifr_handoff_goes_to_radar`
+(ignored; the real region at the sortie's position: VFR still Oxford
+Kidlington Tower, IFR Oxford Kidlington Approach 125.09 with 4505), corpus
+cases for both readbacks. Next IFR enroute switch: `atc_region` `crew: false`
+with a line naming Approach or Departure, `full_auto` `region_handoff` with
+`to` not ending in "Tower" (unless the arrival field), `ifr_code` and `code`
+the cleared code. Offline only.
