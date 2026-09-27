@@ -608,6 +608,34 @@ pub fn no_fit_line(why: &NoFit, can_line_up: bool) -> (String, bool) {
     }
 }
 
+/// [`why_no_fit`] told about the CLEARED runway: nowhere near any pavement,
+/// the refusal names the end the tower cleared and how far it is, never the
+/// strip that merely lay best along the nose. At ETND (2026-09-24) the SF50
+/// was cleared 26R, faced 016 at the hold, and heard "08L is 152 metres
+/// away": the reciprocal end of the runway it was cleared for, which reads
+/// as a crew that does not know its clearance. Every other gate stands as
+/// diagnosed (an aircraft aligned on another end is judged on that end).
+pub fn why_no_fit_cleared(
+    cands: &[Runway],
+    lat: f64,
+    lon: f64,
+    psi_true: f64,
+    needed_m: f64,
+    cleared: Option<&str>,
+) -> NoFit {
+    let why = why_no_fit(cands, lat, lon, psi_true, needed_m);
+    let NoFit::NoneNear { .. } = why else {
+        return why;
+    };
+    match cleared.and_then(|c| cands.iter().find(|r| r.id.eq_ignore_ascii_case(c))) {
+        Some(r) => NoFit::NoneNear {
+            id: r.id.clone(),
+            lateral_m: (cross_track_nm(lat, lon, r) * M_PER_NM).abs(),
+        },
+        None => why,
+    }
+}
+
 /// Diagnose a failed [`runway_fit`]: the best-aligned candidate, and the FIRST
 /// gate it fails — in the same order the fit applies them, so the answer is
 /// always the thing that actually stopped it.
@@ -775,21 +803,21 @@ pub fn slew(prev: f64, want: f64, max_step: f64) -> f64 {
 /// own box (the Twin Otter's KT73) has its KNOB turned; on its own task, since
 /// a stepped knob takes a few hundred milliseconds. The result is kept and a
 /// failure said: the A330 flew out in standby to two "recycle transponder"
-/// calls with nothing said on the flight deck (EGPH, 2026-09-20).
+/// calls with nothing said on the flight deck (EGPH, 2026-09-20). It is the
+/// ONE departure check (`radio::departure_check`): the tower's assigned code
+/// is dialled and read back too, so the spoken takeoff and the circuit leave
+/// with the squawk full auto would have set.
 fn squawk_altitude(base_url: String, v: Option<Voice>) {
     tokio::spawn(async move {
         let xp = XPlaneClient::new(base_url);
-        let ok = crate::tools::radio::set_mode(&xp, crate::tools::radio::XpdrMode::Altitude).await;
-        crate::blackbox::record(
-            "autotakeoff",
-            serde_json::json!({"event": "transponder_alt", "ok": ok}),
-        );
-        if !ok {
-            alert(
-                &v,
-                Priority::Caution,
-                "The transponder didn't take altitude mode. Check the knob.",
-            );
+        let check =
+            crate::tools::radio::departure_check(&xp, crate::party_line::assigned_squawk()).await;
+        let mut rec = check.json();
+        rec["event"] = serde_json::json!("transponder_alt");
+        rec["ok"] = serde_json::json!(check.ok());
+        crate::blackbox::record("autotakeoff", rec);
+        if let Some(line) = check.failure_line() {
+            alert(&v, Priority::Caution, &line);
         }
     });
 }
@@ -1710,7 +1738,14 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, p: Params) {
         // Say WHICH of the four things is wrong. They want four different
         // actions, and "not on the runway yet" was said to an aircraft
         // sitting on the runway with the tower telling it to vacate.
-        let why = why_no_fit(&cands, lat, lon, psi, p.needed_m);
+        let why = why_no_fit_cleared(
+            &cands,
+            lat,
+            lon,
+            psi,
+            p.needed_m,
+            p.cleared_runway.as_deref(),
+        );
         let can_line_up =
             crate::autotaxi::pick_line_up(&cands, lat, lon, p.cleared_runway.as_deref(), None)
                 .is_some();
@@ -2512,6 +2547,49 @@ mod tests {
     /// along a 2,549 m strip. The fit correctly refused — 141 m of runway
     /// ahead against a 500 m minimum — and then said "we're not on the
     /// runway yet" while the tower said "you are on runway two four".
+    /// ETND 2026-09-24, the recorded numbers: cleared 26R (the grass strip
+    /// beside 08/26), stopped at 52.585512 N 8.349835 E facing 016 true, and
+    /// the refusal named 08L, the reciprocal, "152 metres away". It names
+    /// the cleared end now, at the same distance; without a clearance the
+    /// best-aligned strip is still what it names.
+    #[test]
+    fn the_line_up_refusal_names_the_cleared_runway() {
+        let dir = std::env::temp_dir().join(format!("xvl_etnd_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let apt = dir.join("apt.dat");
+        std::fs::write(
+            &apt,
+            "1    126 0 0 ETND Diepholz AB\n\
+             100 50.00 3 0 0.00 0 0 0 08L 52.5862935 8.3393953 0 0 1 0 0 0 26R 52.5866670 8.3459906 0 0 1 0 0 0\n\
+             100 45.11 1 0 0.25 0 2 0  08 52.5850000 8.3318780 12 0 1 0 0 0 26 52.5859870 8.3501930 0 0 1 3 0 0\n",
+        )
+        .unwrap();
+        let (lat, lon, psi) = (52.585511622928735, 8.349835096044318, 16.0);
+        let cands = crate::autoland::nearby_runways(apt.to_str().unwrap(), lat, lon, 3.0).unwrap();
+        assert!(runway_fit(&cands, lat, lon, psi, 780.0).is_none());
+        let old = why_no_fit(&cands, lat, lon, psi, 780.0);
+        let NoFit::NoneNear { id, lateral_m } = &old else {
+            panic!("{old:?}");
+        };
+        assert_eq!(id, "08L", "the recorded refusal");
+        assert!((lateral_m - 152.0).abs() < 1.0, "{lateral_m}");
+
+        let why = why_no_fit_cleared(&cands, lat, lon, psi, 780.0, Some("26R"));
+        let NoFit::NoneNear { id, lateral_m } = &why else {
+            panic!("{why:?}");
+        };
+        assert_eq!(id, "26R");
+        assert!((lateral_m - 152.0).abs() < 1.0, "{lateral_m}");
+        let (line, _) = no_fit_line(&why, false);
+        assert!(line.starts_with("Runway two six right is 152 metres away"), "{line}");
+        assert!(!line.contains("zero eight"), "{line}");
+
+        // No clearance, or one the data does not know: as before.
+        assert_eq!(why_no_fit_cleared(&cands, lat, lon, psi, 780.0, None), old);
+        assert_eq!(why_no_fit_cleared(&cands, lat, lon, psi, 780.0, Some("33")), old);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn a_refused_takeoff_says_which_of_the_four_things_is_wrong() {
         // The 2,000 m north strip, and a position 1,900 m down it: aligned,

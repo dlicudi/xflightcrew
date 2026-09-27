@@ -315,6 +315,7 @@ fn main() -> Result<()> {
                     on_ground: false,
                     own_on_runway: false,
                     helicopter: false,
+                    runway_refusal: None,
                 };
                 let intent = if heard.confidence < config.stt_min_confidence {
                     tower::Intent::Unknown // garbled call → "say again", never a guessed clearance

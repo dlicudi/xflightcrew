@@ -2411,6 +2411,9 @@ pub async fn run(
     // Party-line cadence, and whether an advisory is waiting on its "clear of
     // traffic" closure.
     let mut chatter_last: Option<Instant> = None;
+    // The taxi clearance whose runway the crew last judged for a pilot
+    // taxiing (full auto judges its own): said once per clearance.
+    let mut cleared_runway_judged: Option<String> = None;
     // The last ATIS edition logged to the panel ("London Heathrow information
     // Alpha") — the loop speaks every repeat, the transcript records once.
     let mut atis_logged: Option<String> = None;
@@ -3181,6 +3184,91 @@ pub async fn run(
                         }
                     }
                 }
+                // The controller's squawk nudge is an INSTRUCTION to the
+                // crew: recycle, or dial the code, and say so on both
+                // channels (EGPH 2026-09-20: two "recycle transponder" calls,
+                // nobody answered). Crew hands only; on its own task, since a
+                // stepped knob takes a few hundred milliseconds.
+                if let Some(nudge) = crate::party_line::take_squawk_nudge() {
+                    if crate::mode::crew_actuates() {
+                        let base = config.xplane_base_url.clone();
+                        let v = voice.clone();
+                        tokio::spawn(async move {
+                            let xp = XPlaneClient::new(base);
+                            let (check, said, readback) =
+                                crate::tools::radio::answer_nudge(&xp, nudge.code, nudge.recycle)
+                                    .await;
+                            let mut rec = check.json();
+                            rec["route"] = serde_json::json!("squawk_answer");
+                            rec["recycle"] = serde_json::json!(nudge.recycle);
+                            rec["ok"] = serde_json::json!(check.ok());
+                            crate::blackbox::record("atc", rec);
+                            let prio = if check.ok() {
+                                Priority::Advisory
+                            } else {
+                                Priority::Caution
+                            };
+                            v.alert(prio, &said);
+                            if let Some(words) = readback {
+                                let cs = crate::circuit::crew_callsign(&xp).await;
+                                crate::circuit::transmit(crate::circuit::radio_call(&cs, &words));
+                            }
+                        });
+                    }
+                }
+                // A taxi clearance to a runway this airframe cannot use
+                // (ETND 2026-09-24: 446 m of grass for an SF50 needing 780):
+                // with a pilot taxiing, the copilot says both numbers and the
+                // request to make, once per clearance. Full auto judges and
+                // asks for itself (`full_auto::judge_cleared_runway`).
+                {
+                    let taxi_to = (crate::party_line::clearance_state()
+                        == Some(crate::tower::State::TaxiCleared))
+                    .then(crate::party_line::clearance_runway)
+                    .flatten();
+                    if taxi_to != cleared_runway_judged {
+                        cleared_runway_judged = taxi_to.clone();
+                        if let Some(rwy) =
+                            taxi_to.filter(|_| crew_on && snap.on_ground && !crate::full_auto::running())
+                        {
+                            let (roll, mtow) = crate::aircraft::profile_takeoff_roll(&live.get());
+                            let needed =
+                                crate::aircraft::takeoff_needed_now_m(&xp, roll, mtow, 500.0).await;
+                            if let crate::full_auto::ClearedFit::Short {
+                                cleared,
+                                length_m,
+                                needed_m,
+                                ask,
+                            } = crate::full_auto::cleared_runway_fit(
+                                &crate::party_line::field_runways(),
+                                &rwy,
+                                needed,
+                            ) {
+                                let line = match &ask {
+                                    Some(a) => format!(
+                                        "Runway {} is {:.0} metres, we need {:.0}. Ask the tower: {}.",
+                                        crate::circuit::spell_runway(&cleared),
+                                        length_m,
+                                        needed_m,
+                                        crate::full_auto::runway_request_call(&cleared, a)
+                                    ),
+                                    None => crate::full_auto::short_runway_line(
+                                        length_m, needed_m, &cleared, None,
+                                    ),
+                                };
+                                crate::blackbox::record(
+                                    "atc",
+                                    serde_json::json!({
+                                        "route": "cleared_runway_short", "runway": cleared,
+                                        "length_m": length_m.round(), "needed_m": needed_m.round(),
+                                        "ask": ask, "reply": &line,
+                                    }),
+                                );
+                                voice.alert(Priority::Caution, line);
+                            }
+                        }
+                    }
+                }
                 // Compliance watch: the tower holds the pilot to the
                 // clearances it actually issued (uncleared runway entry,
                 // takeoff, landing), and challenges zone traffic it has
@@ -3435,14 +3523,15 @@ pub async fn run(
                                 let fname = crate::station::active_field()
                                     .map(|(n, _, _, _)| n)
                                     .unwrap_or_default();
-                                // The strip the PLAYER occupies: a ghost
-                                // landing it gets "continue", not a narrated
-                                // clearance over the player's head.
-                                let blocked = if snap.on_ground {
-                                    crate::station::on_active_runway(snap.lat, snap.lon)
-                                } else {
-                                    None
-                                };
+                                // The strip the PLAYER holds (stands on, or
+                                // landed on and not yet reported vacated): a
+                                // ghost landing it gets "continue", not a
+                                // narrated clearance over the player's head.
+                                let blocked = crate::station::player_blocked_strip(
+                                    snap.on_ground,
+                                    snap.lat,
+                                    snap.lon,
+                                );
                                 if let Some(exchange) = crate::station::chatter_tick(
                                     &targets,
                                     &fname,

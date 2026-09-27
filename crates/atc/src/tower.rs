@@ -82,6 +82,14 @@ pub enum Intent {
     /// again" every time — twice in one arrival at Liege (2026-09-22), which
     /// reads as a controller who did not hear the one call they most want.
     RunwayVacated,
+    /// "request runway zero eight" / "unable two six, request zero eight for
+    /// length": the crew asks for a DIFFERENT runway than the one in use. The
+    /// runway itself is read from the words by [`requested_runway`] (the
+    /// intent stays `Copy` and a corpus label, like [`stated_runway`]); the
+    /// station resolves it against the field and hands the answer down in
+    /// [`Ctx::runway_refusal`]. ETND 2026-09-24: an SF50 was cleared onto
+    /// 446 m of grass and had no words to ask for the paved 1,240 m beside it.
+    RequestRunway,
     /// "request vectors" — the tower redirects to the approach frequency.
     RequestVectors,
     /// "good evening, Merida" / "hello tower" — an initial hail carrying no
@@ -170,6 +178,11 @@ pub struct Ctx {
     /// position, never sent to a runway holding point (the S-76 on its pad at
     /// ETHB got "taxi to holding point Foxtrot runway two five", 2026-09-23).
     pub helicopter: bool,
+    /// A runway request the station could NOT grant: (the runway asked for,
+    /// spoken; the reason, spoken). `None` on a grantable request (then
+    /// `runway` IS the requested runway and the route is planned to it) and
+    /// on every other call. An empty runway means the words named none.
+    pub runway_refusal: Option<(String, String)>,
 }
 
 /// Spoken position of traffic on final: "short final" inside 1.5 nm, else
@@ -350,6 +363,14 @@ pub fn parse_intent(transcript: &str) -> Intent {
         || word("confirm")
     {
         return Intent::Unknown;
+    }
+    // A request for a named runway ("request runway zero eight", "unable two
+    // six, request zero eight left for length"), before the takeoff, landing
+    // and taxi words below can claim "for takeoff" or "for departure". The
+    // designator must follow the request word itself: "request taxi, runway
+    // two seven" stays the taxi request with a stated runway.
+    if requested_runway(&t).is_some() {
+        return Intent::RequestRunway;
     }
     // "final" is a position report; checked before the landing request so
     // "final for landing" reads as the report (it earns the clearance). Not
@@ -536,6 +557,7 @@ pub fn intent_from_label(label: &str) -> Option<Intent> {
         "squawk_check" => Intent::SquawkCheck,
         "request_taxi_in" => Intent::RequestTaxiIn,
         "runway_vacated" => Intent::RunwayVacated,
+        "request_runway" => Intent::RequestRunway,
         "request_vectors" => Intent::RequestVectors,
         "greeting" => Intent::Greeting,
         "flight_following" => Intent::RequestFlightFollowing,
@@ -763,6 +785,23 @@ pub fn stated_runway(transcript: &str) -> Option<String> {
     runway_after_keyword(transcript)
 }
 
+/// The runway a REQUEST names, canonical: the designator right after
+/// "request"/"requesting" (optionally "request runway ..."). `None` when the
+/// request is for something else ("request taxi, runway two seven").
+pub fn requested_runway(transcript: &str) -> Option<String> {
+    let toks = lower_tokens(transcript);
+    toks.iter().enumerate().find_map(|(i, w)| {
+        if !matches!(w.as_str(), "request" | "requesting" | "requests") {
+            return None;
+        }
+        let rest = &toks[i + 1..];
+        match rest.first().map(String::as_str) {
+            Some("runway") => designator_at(&rest[1..]),
+            _ => designator_at(rest),
+        }
+    })
+}
+
 /// [`canon_runway`] for the station: does this strip ident match a canonical
 /// designator a transmission named?
 pub fn runway_matches(ident: &str, canon: &str) -> bool {
@@ -851,6 +890,12 @@ pub struct Tower {
     /// and the squawk. The crew reads it when it flies; a human pilot sees
     /// it in the coach. Dropped by the next request.
     clearance_readback: Option<String>,
+    /// The landed arrival has REPORTED the runway vacated. The state stays
+    /// `ClearedToLand` (the next bare "request taxi" is still the taxi in),
+    /// but the strip is the tower's again: a real controller frees it on
+    /// that report, not on the taxi request after it (Liege 2026-09-22).
+    /// Meaningless in any other state, and cleared by every transition.
+    vacated: bool,
 }
 
 impl Tower {
@@ -860,7 +905,24 @@ impl Tower {
             touch_and_go: false,
             pending: None,
             clearance_readback: None,
+            vacated: false,
         }
+    }
+
+    /// Our aircraft holds the runway in the tower's book: cleared onto it
+    /// (line-up, takeoff) or landed on it and not yet reported off. The
+    /// vacated report frees it; so does any transition out of the landing.
+    pub fn holds_runway(&self) -> bool {
+        match self.state {
+            State::LinedUp | State::TakeoffCleared => true,
+            State::ClearedToLand => !self.vacated,
+            _ => false,
+        }
+    }
+
+    /// The landed arrival reported the runway vacated (see [`Tower::holds_runway`]).
+    pub fn runway_vacated(&self) -> bool {
+        self.state == State::ClearedToLand && self.vacated
     }
 
     /// The crew has read the departure clearance back (or moved on).
@@ -914,6 +976,7 @@ impl Tower {
     /// readback dies with the clearance it echoed.
     pub fn apply_go_around(&mut self) {
         self.state = State::Inbound;
+        self.vacated = false;
         self.pending = None;
     }
 
@@ -1069,6 +1132,15 @@ impl Tower {
         if intent != Intent::Unknown {
             self.clearance_readback = None;
         }
+        let reply = self.answer(intent, ctx);
+        // The vacated report lives only as long as the landing it closed.
+        if self.state != State::ClearedToLand {
+            self.vacated = false;
+        }
+        reply
+    }
+
+    fn answer(&mut self, intent: Intent, ctx: &Ctx) -> String {
         match intent {
             Intent::RadioCheck => {
                 format!("{}, {} Tower, reading you five.", ctx.callsign, ctx.airport)
@@ -1106,11 +1178,53 @@ impl Tower {
                 self.state = State::Parked;
                 taxi_in_reply(ctx)
             }
-            // Acknowledged and nothing else. The state deliberately stands:
-            // a bare "request taxi" after a landing clearance is inferred as
-            // the taxi IN (below), and moving to Parked here would turn the
-            // next one into a departure clearance to the holding point.
-            Intent::RunwayVacated => format!("{}, roger, thank you.", ctx.callsign),
+            // A named runway asked for. Refused with the station's reason (a
+            // runway the field lacks, or one it does not hand out), or with
+            // "say again" when the words named none: a mishear never buys a
+            // runway. Granted on the ground as the taxi clearance TO it (the
+            // station planned the route there); in the air, as the join.
+            Intent::RequestRunway => match &ctx.runway_refusal {
+                Some((rwy, _)) if rwy.is_empty() => {
+                    format!("{}, say again the runway you are requesting.", ctx.callsign)
+                }
+                Some((rwy, why)) => format!("{}, unable runway {rwy}, {why}.", ctx.callsign),
+                None if ctx.on_ground => {
+                    self.state = State::TaxiCleared;
+                    format!(
+                        "{}, runway {} approved, taxi to holding point {} runway {}{}{}{}. \
+                         Report ready for departure.",
+                        ctx.callsign,
+                        ctx.runway,
+                        ctx.holding_point,
+                        ctx.runway,
+                        via_clause(ctx),
+                        crossing_clause(ctx),
+                        qnh_clause(ctx)
+                    )
+                }
+                None => {
+                    self.state = State::Inbound;
+                    format!(
+                        "{}, runway {} approved, join final runway {}{}. Report final.",
+                        ctx.callsign,
+                        ctx.runway,
+                        ctx.runway,
+                        qnh_clause(ctx)
+                    )
+                }
+            },
+            // Acknowledged, and the STRIP is freed, nothing else. The state
+            // deliberately stands: a bare "request taxi" after a landing
+            // clearance is inferred as the taxi IN (below), and moving to
+            // Parked here would turn the next one into a departure clearance
+            // to the holding point. Only a landed arrival frees a strip: the
+            // same words from the air are a garble, not a report.
+            Intent::RunwayVacated => {
+                if self.state == State::ClearedToLand && ctx.on_ground {
+                    self.vacated = true;
+                }
+                format!("{}, roger, thank you.", ctx.callsign)
+            }
             Intent::RequestTaxi if self.state == State::ClearedToLand => {
                 self.state = State::Parked;
                 taxi_in_reply(ctx)
@@ -1484,6 +1598,7 @@ mod tests {
             runway_occupied: false,
             own_on_runway: false,
             helicopter: false,
+            runway_refusal: None,
             wake_secs_left: None,
             taxi_via: Vec::new(),
             taxi_crossings: Vec::new(),
@@ -1785,6 +1900,7 @@ mod tests {
             SquawkCheck,
             RequestTaxiIn,
             RunwayVacated,
+            RequestRunway,
             RequestVectors,
             Greeting,
             RequestFlightFollowing,
@@ -1848,6 +1964,15 @@ mod tests {
                     // A position report off the runway is acknowledged and
                     // changes nothing — see the handler.
                     RunwayVacated => start,
+                    // A grantable request (ctx() carries no refusal): the
+                    // taxi to it, or the join from the air.
+                    RequestRunway => {
+                        if c.on_ground {
+                            TaxiCleared
+                        } else {
+                            Inbound
+                        }
+                    }
                     // ctx() has an approach frequency, so vectors redirect
                     // without touching the sequence.
                     RequestVectors => start,
@@ -2635,6 +2760,84 @@ mod tests {
         assert!(twr
             .handle(Intent::RequestTaxi, &c)
             .contains("taxi to stand one two"));
+    }
+
+    /// The same report frees the strip in the tower's book: on the ground,
+    /// after a landing, and only then. Without it the old behaviour stands
+    /// (the landing holds the runway until the taxi request parks it).
+    #[test]
+    fn the_vacated_report_frees_the_runway_in_the_book() {
+        let mut c = ctx();
+        c.on_ground = true;
+        let mut twr = Tower::new();
+        twr.state = State::ClearedToLand;
+        assert!(twr.holds_runway(), "landed, not reported off");
+        twr.handle(Intent::RunwayVacated, &c);
+        assert!(!twr.holds_runway() && twr.runway_vacated());
+        assert_eq!(twr.state, State::ClearedToLand);
+        // The next landing starts with the strip held again.
+        twr.handle(Intent::RequestTaxi, &c);
+        assert_eq!(twr.state, State::Parked);
+        twr.handle(Intent::ReportFinal, &c);
+        assert!(twr.holds_runway() && !twr.runway_vacated());
+
+        // From the air the words are a garble, not a report.
+        let mut air = ctx();
+        air.on_ground = false;
+        let mut twr = Tower::new();
+        twr.state = State::ClearedToLand;
+        twr.handle(Intent::RunwayVacated, &air);
+        assert!(twr.holds_runway());
+
+        // Without the report, the taxi request is what frees it (as before).
+        let mut twr = Tower::new();
+        twr.state = State::ClearedToLand;
+        twr.handle(Intent::RequestTaxi, &c);
+        assert!(!twr.holds_runway());
+    }
+
+    /// The runway request (ETND 2026-09-24): granted on the ground as the
+    /// taxi to the runway the station resolved, refused with its reason,
+    /// "say again" when the words named no runway. Never a takeoff or a
+    /// landing clearance.
+    #[test]
+    fn a_runway_request_is_granted_as_a_taxi_or_refused_with_the_reason() {
+        assert_eq!(requested_runway("request runway zero eight left").as_deref(), Some("8L"));
+        assert_eq!(
+            requested_runway("unable two six, request zero eight for length").as_deref(),
+            Some("8")
+        );
+        assert_eq!(requested_runway("request taxi, runway two seven"), None);
+        assert_eq!(requested_runway("november one two three, request taxi"), None);
+
+        let mut c = ctx();
+        c.on_ground = true;
+        c.runway = "zero eight".into();
+        c.holding_point = "Hotel two".into();
+        let mut twr = Tower::new();
+        let reply = twr.handle(Intent::RequestRunway, &c);
+        assert!(
+            reply.contains("runway zero eight approved, taxi to holding point Hotel two runway zero eight"),
+            "{reply:?}"
+        );
+        assert!(!reply.contains("cleared"), "{reply:?}");
+        assert_eq!(twr.state, State::TaxiCleared);
+
+        let mut no = c.clone();
+        no.runway_refusal = Some(("two six right".into(), "that runway is not available".into()));
+        let mut twr = Tower::new();
+        let reply = twr.handle(Intent::RequestRunway, &no);
+        assert!(
+            reply.contains("unable runway two six right, that runway is not available"),
+            "{reply:?}"
+        );
+        assert_eq!(twr.state, State::Parked, "a refusal moves nothing");
+
+        let mut garbled = c.clone();
+        garbled.runway_refusal = Some((String::new(), String::new()));
+        let mut twr = Tower::new();
+        assert!(twr.handle(Intent::RequestRunway, &garbled).contains("say again"));
+        assert_eq!(twr.state, State::Parked);
     }
 
     #[test]
