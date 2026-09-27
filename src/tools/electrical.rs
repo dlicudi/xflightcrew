@@ -196,6 +196,70 @@ const GUARD_WAIT_MS: u64 = 1_500;
 /// the readback.
 const GUARD_SETTLE_MS: u64 = 300;
 
+/// Where an ALL-OFF stands: every electrical system off at once is a
+/// shutdown, so it is gated like one (issue #66, the 2026-09-23 misread pass:
+/// a misheard "electrics off" in flight used to run). Singles are NOT gated:
+/// shedding one switch in flight (an alternator on overvoltage, the avionics
+/// for smoke) is a checklist action the pilot must be able to call.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AllOffGate {
+    /// Airborne, or the state could not be read: refused with this line.
+    Refuse(String),
+    /// On the ground with an engine turning: asked for a yes first.
+    Confirm,
+    /// On the ground, every engine stopped: a normal shutdown, no question.
+    Clear,
+}
+
+/// The on-ground flag every airborne gate reads (`set_mixture`, `stop_engines`).
+const ON_GROUND: &str = crate::datarefs::ON_GROUND_ANY;
+/// Per-engine running flag (the shutdown's own confirmation, `taxi_in`).
+const ENGN_RUNNING: &str = "sim/flightmodel/engine/ENGN_running";
+
+/// The request is every system off.
+pub fn is_all_off(args: &Value) -> bool {
+    args.get("system")
+        .and_then(Value::as_str)
+        .is_some_and(|s| s.eq_ignore_ascii_case("all"))
+        && args.get("on").and_then(Value::as_bool) == Some(false)
+}
+
+/// Judge an all-off from the sim. A failed read is no measurement, so it
+/// refuses: an unknown state errs toward keeping the power on.
+pub async fn all_off_gate(xp: &dyn crate::xplane::XPlane) -> AllOffGate {
+    let (ground, running) = tokio::join!(xp.get_float(ON_GROUND), xp.get_float_array(ENGN_RUNNING));
+    all_off_verdict(ground.ok(), running.ok().as_deref())
+}
+
+/// The pure half of [`all_off_gate`].
+fn all_off_verdict(on_ground: Option<f64>, running: Option<&[f64]>) -> AllOffGate {
+    match on_ground {
+        None => {
+            return AllOffGate::Refuse(
+                "I can't tell whether we're on the ground, so I'm leaving the electrics on."
+                    .to_string(),
+            )
+        }
+        Some(g) if g <= 0.5 => {
+            return AllOffGate::Refuse(
+                "Negative, I won't switch all the electrics off in flight.".to_string(),
+            )
+        }
+        Some(_) => {}
+    }
+    match running {
+        None => AllOffGate::Refuse(
+            "I can't tell whether the engines are running, so I'm leaving the electrics on."
+                .to_string(),
+        ),
+        Some(r) if r.iter().any(|&v| v > 0.5) => AllOffGate::Confirm,
+        Some(_) => AllOffGate::Clear,
+    }
+}
+
+/// What the confirm gate says for an all-off with an engine turning.
+pub const ALL_OFF_CONFIRM: &str = "all electrics off with the engines running";
+
 /// The 737's own test (`B738_guard_cover_logic`): a cover under 0.5 is shut.
 fn guard_is_open(pos: f64) -> bool {
     pos >= 0.5
@@ -249,8 +313,27 @@ impl Tool for SetElectrical {
         })
     }
 
+    fn confirm_prompt(&self, args: &Value) -> Option<String> {
+        // The main loop asks this only when `all_off_gate` says Confirm (an
+        // engine turning on the ground); cold on the ground it runs at once,
+        // and airborne `execute` refuses.
+        is_all_off(args).then(|| ALL_OFF_CONFIRM.to_string())
+    }
+
     async fn execute(&self, args: &Value, ctx: &ToolCtx<'_>) -> Result<String> {
         let args: Args = serde_json::from_value(args.clone())?;
+
+        if args.system.eq_ignore_ascii_case("all") && !args.on {
+            // The gate lives here too, so every caller (voice, a flow, a
+            // back-reference, an automation) meets it, not only the loop.
+            if let AllOffGate::Refuse(line) = all_off_gate(ctx.xplane).await {
+                crate::blackbox::record(
+                    "electrical",
+                    json!({ "event": "all_off_refused", "line": line }),
+                );
+                return Ok(line);
+            }
+        }
 
         if args.system.eq_ignore_ascii_case("all") {
             // Aggregate the per-system results instead of announcing success
@@ -336,6 +419,10 @@ mod tests {
         guard: std::sync::Mutex<f64>,
         switch: std::sync::Mutex<f64>,
         commands: std::sync::Mutex<Vec<String>>,
+        /// `onground_any`; `None` reads as a failed read.
+        on_ground: Option<f64>,
+        /// `ENGN_running`; `None` reads as a failed read.
+        running: Option<Vec<f64>>,
     }
 
     const GUARD_CMD: &str = "laminar/B738/guard_cover00";
@@ -349,6 +436,8 @@ mod tests {
                 guard: std::sync::Mutex::new(0.0),
                 switch: std::sync::Mutex::new(1.0),
                 commands: std::sync::Mutex::new(Vec::new()),
+                on_ground: Some(1.0),
+                running: Some(vec![0.0, 0.0]),
             }
         }
         fn battery(&self) -> f64 {
@@ -365,6 +454,7 @@ mod tests {
         async fn get_float(&self, name: &str) -> Result<f64> {
             match name {
                 BATTERY_ON => Ok(self.battery()),
+                ON_GROUND => self.on_ground.ok_or_else(|| anyhow::anyhow!("no read")),
                 _ => Err(anyhow::anyhow!("no read for {name}")),
             }
         }
@@ -393,6 +483,10 @@ mod tests {
         async fn get_float_array(&self, name: &str) -> Result<Vec<f64>> {
             match name {
                 GUARD_POS => Ok(vec![*self.guard.lock().unwrap(), 0.0]),
+                ENGN_RUNNING => self
+                    .running
+                    .clone()
+                    .ok_or_else(|| anyhow::anyhow!("no read")),
                 _ => Err(anyhow::anyhow!("no read for {name}")),
             }
         }
@@ -493,5 +587,97 @@ mod tests {
             "All electrical systems off, except: The battery didn't move; its guard stayed shut."
         );
         assert!(!xp.commands.lock().unwrap().iter().any(|c| c == GUARD_CMD));
+    }
+
+    fn all_off() -> Value {
+        json!({"system": "all", "on": false})
+    }
+
+    /// Issue #66: a misheard "electrics off" in flight used to run. Airborne
+    /// it is refused with a reason and nothing is pressed.
+    #[tokio::test(start_paused = true)]
+    async fn all_off_in_flight_is_refused_and_said() {
+        let cfg = crate::config::Config::default();
+        let mut xp = B738Battery::at_the_stand();
+        xp.on_ground = Some(0.0);
+        xp.running = Some(vec![1.0, 1.0]);
+        let tool = SetElectrical::new(vec![b738_battery()]);
+        let line = tool.execute(&all_off(), &ctx(&xp, &cfg)).await.unwrap();
+        assert_eq!(
+            line,
+            "Negative, I won't switch all the electrics off in flight."
+        );
+        assert!(xp.commands.lock().unwrap().is_empty(), "nothing pressed");
+        assert_eq!(xp.battery(), 1.0);
+        // The loop's gate agrees: no question is asked before the refusal.
+        assert!(matches!(all_off_gate(&xp).await, AllOffGate::Refuse(_)));
+    }
+
+    /// A failed read is no measurement: refused, never switched blind.
+    #[tokio::test(start_paused = true)]
+    async fn all_off_with_an_unreadable_state_is_refused() {
+        let cfg = crate::config::Config::default();
+        let mut xp = B738Battery::at_the_stand();
+        xp.on_ground = None;
+        let tool = SetElectrical::new(vec![b738_battery()]);
+        let line = tool.execute(&all_off(), &ctx(&xp, &cfg)).await.unwrap();
+        assert!(line.contains("leaving the electrics on"), "{line}");
+        assert!(xp.commands.lock().unwrap().is_empty());
+
+        let mut xp = B738Battery::at_the_stand();
+        xp.running = None;
+        let line = tool.execute(&all_off(), &ctx(&xp, &cfg)).await.unwrap();
+        assert!(line.contains("engines are running"), "{line}");
+        assert!(xp.commands.lock().unwrap().is_empty());
+    }
+
+    /// On the ground with an engine turning the loop asks first; cold it
+    /// does not, and runs.
+    #[tokio::test(start_paused = true)]
+    async fn engines_running_asks_and_cold_proceeds() {
+        let cfg = crate::config::Config::default();
+        let tool = SetElectrical::new(vec![b738_battery()]);
+        assert_eq!(
+            tool.confirm_prompt(&all_off()).as_deref(),
+            Some(ALL_OFF_CONFIRM)
+        );
+        let mut xp = B738Battery::at_the_stand();
+        xp.running = Some(vec![0.0, 1.0]);
+        assert_eq!(
+            all_off_gate(&xp).await,
+            AllOffGate::Confirm,
+            "the second engine"
+        );
+        // Once confirmed it runs.
+        let line = tool.execute(&all_off(), &ctx(&xp, &cfg)).await.unwrap();
+        assert_eq!(line, "Roger, all electrical systems off.");
+
+        let xp = B738Battery::at_the_stand();
+        assert_eq!(all_off_gate(&xp).await, AllOffGate::Clear);
+        let line = tool.execute(&all_off(), &ctx(&xp, &cfg)).await.unwrap();
+        assert_eq!(line, "Roger, all electrical systems off.");
+        assert_eq!(xp.battery(), 0.0);
+    }
+
+    /// Singles and all-ON are never gated: shedding one switch in flight is a
+    /// checklist action, and a power-up asks nothing.
+    #[tokio::test(start_paused = true)]
+    async fn singles_and_all_on_are_not_gated() {
+        let cfg = crate::config::Config::default();
+        let tool = SetElectrical::new(vec![b738_battery()]);
+        assert!(tool
+            .confirm_prompt(&json!({"system": "battery", "on": false}))
+            .is_none());
+        assert!(tool
+            .confirm_prompt(&json!({"system": "all", "on": true}))
+            .is_none());
+        let mut xp = B738Battery::at_the_stand();
+        xp.on_ground = Some(0.0);
+        *xp.guard.lock().unwrap() = 1.0;
+        let line = tool
+            .execute(&json!({"system": "battery", "on": false}), &ctx(&xp, &cfg))
+            .await
+            .unwrap();
+        assert_eq!(line, "Roger, battery off.");
     }
 }
