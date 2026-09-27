@@ -471,6 +471,139 @@ pub(crate) fn spawn_settings_poller(base_url: String) {
     });
 }
 
+/// The panel's text settings, app to plugin: one row per registry knob of
+/// [`settings::Kind::Text`], `key|label|pinned_env|value|notice|help`, rows
+/// '\n'-separated. `pinned_env` names the variable that pins the knob (the
+/// field is then read-only), empty when the panel may edit it; `notice` is
+/// the refusal of the last edit, empty after one that took.
+pub(crate) const DR_OPT_TEXT: &str = "xcopilot/opt/text";
+
+/// The panel's text edits, plugin to app: `key=value` lines, written on Enter
+/// or focus loss and consumed by writing a NUL back (the typed line's
+/// protocol). A value may hold '=' ("WAT=Walker"): the key ends at the first.
+pub(crate) const DR_OPT_TEXT_EDIT: &str = "xcopilot/opt/text_edit";
+
+/// The `key=value` lines of one consumed edit, in order; a line without a
+/// key is ignored.
+pub(crate) fn parse_text_edits(raw: &str) -> Vec<(String, String)> {
+    raw.lines()
+        .filter_map(|l| {
+            let (k, v) = l.split_once('=')?;
+            let k = k.trim();
+            (!k.is_empty()).then(|| (k.to_string(), v.trim().to_string()))
+        })
+        .collect()
+}
+
+/// Apply one panel edit through the registry (validate, apply live, persist;
+/// an env-pinned knob is refused naming its variable). `Err` is said on the
+/// panel under the field.
+pub(crate) fn apply_text_edit(key: &str, raw: &str) -> Result<(), String> {
+    let s = settings::ALL
+        .iter()
+        .find(|s| s.key == key && matches!(s.kind, settings::Kind::Text { .. }))
+        .ok_or_else(|| format!("no text setting {key}"))?;
+    let v = s
+        .kind
+        .parse(raw)
+        .ok_or_else(|| format!("{} is too long or not one line", s.label))?;
+    settings::set(key, &v)
+}
+
+/// The [`DR_OPT_TEXT`] payload: every text knob with its live value.
+pub(crate) fn text_settings_payload(notices: &std::collections::HashMap<String, String>) -> String {
+    let clean = |t: &str| t.replace(['|', '\n'], " ");
+    settings::ALL
+        .iter()
+        .filter(|s| matches!(s.kind, settings::Kind::Text { .. }))
+        .map(|s| {
+            let value = s.value().as_text().map(str::to_string).unwrap_or_default();
+            format!(
+                "{}|{}|{}|{}|{}|{}",
+                s.key,
+                clean(s.label),
+                if s.env_pinned() { s.env } else { "" },
+                clean(&value),
+                clean(notices.get(s.key).map(String::as_str).unwrap_or("")),
+                clean(s.help),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Sync the panel's text fields with the registry: publish every text knob
+/// ([`DR_OPT_TEXT`], on change and every 5 s, since a plugin reload zeroes
+/// the buffer) and apply the edits the panel sends ([`DR_OPT_TEXT_EDIT`],
+/// polled each second: a setting, not a control, so no faster). A plugin
+/// built before the text fields resolves neither and costs one lookup per
+/// retry.
+pub(crate) fn spawn_text_settings_poller(base_url: String) {
+    std::thread::spawn(move || {
+        use base64::Engine;
+        let Ok(http) = reqwest::blocking::Client::builder()
+            // Always localhost: a system proxy lookup is never wanted, and reqwest's
+            // default one can stall the first build for seconds (2026-09-27).
+            .no_proxy()
+            .timeout(std::time::Duration::from_secs(2))
+            .build()
+        else {
+            return;
+        };
+        let rest = format!("{}/api/v1", base_url.trim_end_matches('/'));
+        let mut ids: Option<(i64, i64)> = None; // (text, edit)
+        let mut notices: std::collections::HashMap<String, String> = Default::default();
+        let mut last_sent = String::new();
+        let mut sent_at = std::time::Instant::now();
+        loop {
+            std::thread::sleep(std::time::Duration::from_secs(1));
+            if ids.is_none() {
+                ids = crate::plugin_status::resolve_id(&http, &rest, DR_OPT_TEXT).zip(
+                    crate::plugin_status::resolve_id(&http, &rest, DR_OPT_TEXT_EDIT),
+                );
+                if ids.is_none() {
+                    // Plugin not loaded, sim down, or an older build: retry lazily.
+                    std::thread::sleep(std::time::Duration::from_secs(5));
+                    continue;
+                }
+                last_sent.clear();
+            }
+            let Some((text_id, edit_id)) = ids else {
+                continue;
+            };
+            if let Some(raw) = take_typed(&http, &rest, edit_id) {
+                for (key, value) in parse_text_edits(&raw) {
+                    match apply_text_edit(&key, &value) {
+                        Ok(()) => {
+                            notices.remove(&key);
+                        }
+                        Err(e) => {
+                            tracing::info!(key = %key, error = %e, "panel text setting refused");
+                            notices.insert(key, e);
+                        }
+                    }
+                }
+            }
+            let payload = text_settings_payload(&notices);
+            if payload != last_sent || sent_at.elapsed() >= std::time::Duration::from_secs(5) {
+                let b64 = base64::engine::general_purpose::STANDARD.encode(payload.as_bytes());
+                let ok = http
+                    .patch(format!("{rest}/datarefs/{text_id}/value"))
+                    .json(&serde_json::json!({ "data": b64 }))
+                    .send()
+                    .map(|r| r.status().is_success())
+                    .unwrap_or(false);
+                if !ok {
+                    ids = None; // stale ids (sim restarted): re-resolve
+                    continue;
+                }
+                last_sent = payload;
+                sent_at = std::time::Instant::now();
+            }
+        }
+    });
+}
+
 /// Panel settings-popup switches, polled the same way. Missing (no plugin) =
 /// the feature's default (both on).
 pub(crate) const DR_OPT_SNAP: &str = "xcopilot/opt/camera_snap";
@@ -482,6 +615,65 @@ pub(crate) const DR_OPT_AUDIO_BUS: &str = "xcopilot/opt/audio_bus";
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A panel edit is `key=value` lines; the value keeps its own '='.
+    #[test]
+    fn text_edits_split_at_the_first_equals() {
+        assert_eq!(
+            parse_text_edits(
+                "airline_telephony=WAT=Walker; XYZ=Zulu\ncallsign= WAT2516 \n=x\njunk"
+            ),
+            vec![
+                (
+                    "airline_telephony".to_string(),
+                    "WAT=Walker; XYZ=Zulu".to_string()
+                ),
+                ("callsign".to_string(), "WAT2516".to_string()),
+            ]
+        );
+        assert_eq!(
+            parse_text_edits("callsign="),
+            vec![("callsign".to_string(), String::new())]
+        );
+    }
+
+    /// The panel's rows name every text knob, and a pinned one carries its
+    /// variable so the field is read-only; an edit to it is refused naming
+    /// the variable, and nothing is written.
+    #[test]
+    fn a_pinned_text_setting_is_published_read_only_and_refused() {
+        let _guard = settings::TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        // SAFETY: the lock above serialises every env-mutating test.
+        unsafe { std::env::set_var("XCOPILOT_AIRLINE_TELEPHONY", "WAT=Walker") };
+        settings::update(|c| c.airline_telephony = "WAT=Walker".into());
+        let mut notices = std::collections::HashMap::new();
+        let err = apply_text_edit("airline_telephony", "XYZ=Zulu").expect_err("pinned");
+        assert!(err.contains("XCOPILOT_AIRLINE_TELEPHONY"), "{err}");
+        notices.insert("airline_telephony".to_string(), err);
+        let payload = text_settings_payload(&notices);
+        let row = payload
+            .lines()
+            .find(|l| l.starts_with("airline_telephony|"))
+            .expect("published");
+        let f: Vec<&str> = row.split('|').collect();
+        assert_eq!(f.len(), 6, "{row}");
+        assert_eq!(f[2], "XCOPILOT_AIRLINE_TELEPHONY");
+        assert_eq!(f[3], "WAT=Walker");
+        assert!(
+            f[4].contains("pinned by XCOPILOT_AIRLINE_TELEPHONY"),
+            "{row}"
+        );
+        assert!(
+            payload.lines().any(|l| l.starts_with("callsign|")),
+            "{payload}"
+        );
+        assert_eq!(settings::live().airline_telephony, "WAT=Walker");
+        unsafe { std::env::remove_var("XCOPILOT_AIRLINE_TELEPHONY") };
+        settings::update(|c| c.airline_telephony = String::new());
+        assert!(apply_text_edit("mode", "atc").is_err(), "not a text knob");
+    }
 
     #[test]
     fn a_cabin_pick_is_never_the_copilots_voice() {

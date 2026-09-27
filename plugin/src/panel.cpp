@@ -10,6 +10,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
+#include <map>
 #include <memory>
 #include <string>
 #include <vector>
@@ -385,6 +386,126 @@ private:
     // A scale change asks the next frame (font pushed, metrics real) to
     // re-fit the window to its tab strip.
     bool mFitPending = false;
+    // The Settings tab's text fields, by registry key: the edit buffer, the
+    // app's value it was last filled from, and whether this edit already
+    // went out on Enter (so the focus loss that follows does not send it
+    // twice).
+    struct TextField {
+        char buf[512] = {0};
+        std::string shown;
+        bool sent_on_enter = false;
+        bool active = false;
+    };
+    std::map<std::string, TextField> mTextFields;
+
+    // Split one row of the app's text settings on '|' (see drefs.cpp).
+    static std::vector<std::string> SplitBar(const std::string& row) {
+        std::vector<std::string> out;
+        size_t start = 0;
+        for (;;) {
+            size_t bar = row.find('|', start);
+            out.push_back(row.substr(start, bar == std::string::npos ? std::string::npos : bar - start));
+            if (bar == std::string::npos) break;
+            start = bar + 1;
+        }
+        return out;
+    }
+
+    // The registry's text knobs (callsign, airline telephony), one field
+    // each, from the rows the app publishes. Applied on Enter or when the
+    // field loses focus, never per keystroke; the app validates, applies
+    // live, persists, and republishes the value in force (a refusal comes
+    // back as a notice under the field). A knob pinned by an environment
+    // variable is shown read-only, naming it. Hidden until the app
+    // publishes (no app, or an app built before the text fields).
+    void buildTextSettings() {
+        const TextRef& text = drefs::opt_text();
+        if (text.len <= 0) return;
+        const std::string all(text.buf, static_cast<size_t>(text.len));
+        ImGui::Spacing();
+        ImGui::TextUnformatted("Radio");
+        size_t pos = 0;
+        while (pos <= all.size()) {
+            size_t nl = all.find('\n', pos);
+            const std::string row = all.substr(pos, nl == std::string::npos ? std::string::npos : nl - pos);
+            pos = (nl == std::string::npos) ? all.size() + 1 : nl + 1;
+            const std::vector<std::string> f = SplitBar(row);
+            if (f.size() < 6 || f[0].empty()) continue;
+            const std::string& key = f[0];
+            const std::string& label = f[1];
+            const std::string& pinned = f[2];
+            const std::string& value = f[3];
+            const std::string& notice = f[4];
+            const std::string& help = f[5];
+            TextField& tf = mTextFields[key];
+            const std::string id = "##text_" + key;
+            ImGui::PushID(key.c_str());
+            ImGui::TextUnformatted(label.c_str());
+            ImGui::SetNextItemWidth(-FLT_MIN);
+            if (!pinned.empty()) {
+                // Read-only: the environment wins at every boot, so an edit
+                // here would be a lie.
+                char ro[512];
+                std::snprintf(ro, sizeof ro, "%s", value.c_str());
+                ImGui::BeginDisabled();
+                ImGui::InputText(id.c_str(), ro, sizeof ro, ImGuiInputTextFlags_ReadOnly);
+                ImGui::EndDisabled();
+                ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(COL_DIM),
+                                   "Set by %s in your .env; edit it there.", pinned.c_str());
+                tf.shown = value;
+            } else {
+                // Follow the app's value whenever the pilot is not typing
+                // (the field's activity as of last frame).
+                if (!tf.active && tf.shown != value) {
+                    std::snprintf(tf.buf, sizeof tf.buf, "%s", value.c_str());
+                    tf.shown = value;
+                }
+                const bool enter = ImGui::InputTextWithHint(
+                    id.c_str(), help.c_str(), tf.buf, sizeof tf.buf,
+                    ImGuiInputTextFlags_EnterReturnsTrue);
+                tf.active = ImGui::IsItemActive();
+                const bool left = ImGui::IsItemDeactivatedAfterEdit();
+                bool send = false;
+                if (enter) {
+                    send = true;
+                    tf.sent_on_enter = true;
+                } else if (left) {
+                    send = !tf.sent_on_enter;
+                }
+                if (ImGui::IsItemDeactivated()) tf.sent_on_enter = false;
+                if (send && value != tf.buf) {
+                    if (!drefs::send_text_edit(key.c_str(), tf.buf)) {
+                        std::snprintf(tf.buf, sizeof tf.buf, "%s", value.c_str());
+                    }
+                }
+                if (ImGui::IsItemHovered() && !help.empty()) {
+                    ImGui::SetTooltip("%s", help.c_str());
+                }
+            }
+            if (!notice.empty()) {
+                ImGui::PushTextWrapPos(0.0f);
+                ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(COL_AMBER), "%s", notice.c_str());
+                ImGui::PopTextWrapPos();
+            }
+            // Under the callsign: what the tower and the crew will say, and
+            // where it came from.
+            if (key == "callsign") {
+                const TextRef& cs = drefs::callsign_status();
+                const std::string status(cs.buf, static_cast<size_t>(cs.len > 0 ? cs.len : 0));
+                const std::vector<std::string> sf = SplitBar(status);
+                if (sf.size() >= 2 && !sf[0].empty()) {
+                    ImGui::PushTextWrapPos(0.0f);
+                    ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(COL_CYAN),
+                                       "Spoken: %s (%s)", sf[0].c_str(), sf[1].c_str());
+                    ImGui::PopTextWrapPos();
+                } else {
+                    ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(COL_DIM),
+                                       "Spoken: not resolved yet");
+                }
+            }
+            ImGui::PopID();
+        }
+    }
 
     // The minimum the tab strip needs at the current font: every label at
     // its padding, or the bar scrolls behind arrows. Measured, not guessed,
@@ -1476,6 +1597,9 @@ protected:
             }
         }
         }
+        // The radio callsign serves the tower in every mode, so it stands
+        // outside the copilot block.
+        buildTextSettings();
         ImGui::Spacing();
         ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(COL_DIM),
                            "Changes apply live; no restart needed.");

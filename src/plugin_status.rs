@@ -33,6 +33,7 @@ const DR_LOADSHEET: &str = "xcopilot/status/loadsheet";
 const DR_BRIEF: &str = "xcopilot/status/brief";
 const DR_STATE: &str = "xcopilot/status/state";
 const DR_TAXI: &str = "xcopilot/status/taxi";
+const DR_CALLSIGN: &str = "xcopilot/status/callsign";
 
 /// Keep text within the plugin's fixed display buffer (512 bytes, NUL-terminated)
 /// — long enough for a full engine/weather summary readback.
@@ -80,6 +81,9 @@ enum Update {
     /// The Flight tab's taxi turn card (`taxi_guide::TurnCard::payload`).
     /// Empty hides it.
     Taxi(String),
+    /// The Settings tab's resolved callsign, "spoken|source"
+    /// (`atc::callsign::resolve`; source override, simbrief or tail).
+    Callsign(String),
 }
 
 /// Severity of a panel alert — drives the chip colour/label in the plugin.
@@ -190,6 +194,10 @@ impl StatusSink {
     pub fn taxi(&self, payload: &str) {
         let _ = self.0.send(Update::Taxi(clip(payload)));
     }
+    /// The Settings tab's resolved callsign, "spoken|source".
+    pub fn callsign(&self, payload: &str) {
+        let _ = self.0.send(Update::Callsign(clip(payload)));
+    }
 }
 
 /// Scrub em/en dashes (the panel font can't render them) and trim to the plugin
@@ -230,6 +238,7 @@ enum Slot {
     Brief,
     State,
     Taxi,
+    Callsign,
 }
 
 /// The resolved numeric ids of the plugin's status datarefs. All `None` until a
@@ -251,6 +260,7 @@ struct Ids {
     brief: Option<i64>,
     state: Option<i64>,
     taxi: Option<i64>,
+    callsign: Option<i64>,
 }
 
 impl Ids {
@@ -271,6 +281,7 @@ impl Ids {
             Slot::Brief => self.brief,
             Slot::State => self.state,
             Slot::Taxi => self.taxi,
+            Slot::Callsign => self.callsign,
         }
     }
     /// True once at least one dataref resolved (i.e. the plugin is present).
@@ -298,6 +309,7 @@ fn resolve_all(http: &reqwest::blocking::Client, rest: &str) -> Ids {
         brief: resolve_id(http, rest, DR_BRIEF),
         state: resolve_id(http, rest, DR_STATE),
         taxi: resolve_id(http, rest, DR_TAXI),
+        callsign: resolve_id(http, rest, DR_CALLSIGN),
     }
 }
 
@@ -407,6 +419,7 @@ fn run(base: String, rx: Receiver<Update>) {
                 Update::Brief(text) => (Slot::Brief, json!(STANDARD.encode(text.as_bytes()))),
                 Update::State(text) => (Slot::State, json!(STANDARD.encode(text.as_bytes()))),
                 Update::Taxi(text) => (Slot::Taxi, json!(STANDARD.encode(text.as_bytes()))),
+                Update::Callsign(text) => (Slot::Callsign, json!(STANDARD.encode(text.as_bytes()))),
             };
             healthy = patch(&http, &rest, &ids, slot, value);
         }

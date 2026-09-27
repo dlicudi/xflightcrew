@@ -245,6 +245,9 @@ struct App {
     /// Text mode: Enter enters it, Esc leaves. In command mode `q` quits; in text
     /// mode every key types (so `q` is a normal letter, e.g. "qnh 2992").
     editing: bool,
+    /// A text setting being edited on the Settings screen (callsign, airline
+    /// telephony): the buffer, saved on Enter, dropped on Esc.
+    setting_edit: Option<String>,
 }
 
 const MAX_LOG: usize = 500;
@@ -279,6 +282,7 @@ pub fn run_dashboard(
         notice: None,
         input: String::new(),
         editing: false,
+        setting_edit: None,
     };
 
     // Redraw only when something visibly changed, not on a fixed timer — a full
@@ -339,7 +343,23 @@ pub fn run_dashboard(
                     if ctrl && k.code == KeyCode::Char('c') {
                         break Ok(()); // Ctrl-C always quits
                     }
-                    if app.editing {
+                    if let Some(buf) = app.setting_edit.as_mut() {
+                        // A text setting's field: keys type, Enter saves it
+                        // through the registry, Esc drops the edit.
+                        match k.code {
+                            KeyCode::Esc => {
+                                app.setting_edit = None;
+                                app.notice = None;
+                            }
+                            KeyCode::Enter => save_text_setting(&mut app),
+                            KeyCode::Backspace => {
+                                buf.pop();
+                            }
+                            KeyCode::Char(c) if !ctrl => buf.push(c),
+                            _ => {}
+                        }
+                        dirty = true;
+                    } else if app.editing {
                         // Text mode: keys type; Enter runs the command (staying in
                         // text mode for the next one); Esc leaves text mode.
                         match k.code {
@@ -448,16 +468,49 @@ fn tab_key(app: &mut App, key: KeyCode) -> bool {
 /// Step the selected setting and apply it. A refusal (an env-pinned knob, a
 /// value the setting won't take) is shown rather than swallowed: silently
 /// ignoring a keypress is how a settings screen teaches you to distrust it.
+/// A text knob cannot be stepped: the key opens its field instead (a pinned
+/// one says so).
 fn adjust(app: &mut App, up: bool) -> bool {
     let Some(s) = settings::ALL.get(app.cursor) else {
         return false;
     };
+    if matches!(s.kind, settings::Kind::Text { .. }) {
+        if s.env_pinned() {
+            app.notice = Some((format!("pinned by {}, edit your .env", s.env), false));
+        } else {
+            let current = s.value().as_text().unwrap_or_default().to_string();
+            app.setting_edit = Some(current);
+            app.notice = None;
+        }
+        return true;
+    }
     let next = s.kind.step(&s.value(), up);
     app.notice = Some(match settings::set(s.key, &next) {
         Ok(()) => (format!("{} → {}", s.label, s.kind.render(&next)), true),
         Err(e) => (e, false),
     });
     true
+}
+
+/// Save the text setting being edited through the registry (validate, apply
+/// live, persist), saying what happened. A refusal keeps the field open.
+fn save_text_setting(app: &mut App) {
+    let (Some(buf), Some(s)) = (app.setting_edit.as_ref(), settings::ALL.get(app.cursor)) else {
+        app.setting_edit = None;
+        return;
+    };
+    let result = s
+        .kind
+        .parse(buf)
+        .ok_or_else(|| format!("{} is too long or not one line", s.label))
+        .and_then(|v| settings::set(s.key, &v));
+    match result {
+        Ok(()) => {
+            app.notice = Some((format!("{} = {}", s.label, s.rendered()), true));
+            app.setting_edit = None;
+        }
+        Err(e) => app.notice = Some((e, false)),
+    }
 }
 
 fn draw(f: &mut Frame, app: &App) {
@@ -478,7 +531,23 @@ fn draw(f: &mut Frame, app: &App) {
     }
 
     // --- bottom line: command-mode hint, or the text input when editing ---
-    let input_line = if app.editing {
+    let input_line = if let Some(buf) = &app.setting_edit {
+        let label = settings::ALL.get(app.cursor).map_or("", |s| s.label);
+        Line::from(vec![
+            Span::styled(
+                format!(" {label}: "),
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(buf.as_str()),
+            Span::styled("▏", Style::default().fg(Color::Cyan)),
+            Span::styled(
+                "   Enter save · Esc cancel",
+                Style::default().fg(Color::DarkGray),
+            ),
+        ])
+    } else if app.editing {
         Line::from(vec![
             Span::styled(
                 " › ",
@@ -841,7 +910,7 @@ fn draw_settings(f: &mut Frame, app: &App, area: Rect) {
         Paragraph::new(lines).block(
             Block::default()
                 .borders(Borders::ALL)
-                .title(" ←/→ change · ↑/↓ select "),
+                .title(" ←/→ change (text: edit) · ↑/↓ select "),
         ),
         detail,
     );
@@ -975,6 +1044,7 @@ mod tests {
             notice: None,
             input: String::new(),
             editing: false,
+            setting_edit: None,
         }
     }
 
@@ -1089,6 +1159,48 @@ mod tests {
         let out = render(&app, 100, 24);
         assert!(out.contains("pinned by XCOPILOT_ATC_CHATTER"), "{out}");
         unsafe { std::env::remove_var("XCOPILOT_ATC_CHATTER") };
+    }
+
+    /// A text knob is edited in place: the key opens its field with the
+    /// live value, Esc drops it untouched; a pinned one says so and opens
+    /// nothing.
+    #[test]
+    fn a_text_setting_opens_a_field_and_a_pinned_one_refuses() {
+        let _guard = settings::TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let i = settings::ALL
+            .iter()
+            .position(|s| s.key == "callsign")
+            .expect("declared");
+        let mut app = app_with(Vec::new());
+        app.tab = Tab::Settings;
+        app.cursor = i;
+        // SAFETY: the lock above serialises every env-mutating test.
+        unsafe { std::env::remove_var("XCOPILOT_CALLSIGN") };
+        settings::update(|c| c.callsign = "WAT2516".into());
+        assert!(tab_key(&mut app, KeyCode::Right));
+        assert_eq!(app.setting_edit.as_deref(), Some("WAT2516"));
+        let out = render(&app, 100, 24);
+        assert!(out.contains("callsign: WAT2516"), "{out}");
+        assert!(out.contains("Enter save"), "{out}");
+        app.setting_edit = None;
+
+        unsafe { std::env::set_var("XCOPILOT_CALLSIGN", "BAW306") };
+        assert!(tab_key(&mut app, KeyCode::Right));
+        assert!(app.setting_edit.is_none());
+        let out = render(&app, 100, 24);
+        assert!(out.contains("pinned by XCOPILOT_CALLSIGN"), "{out}");
+        // A refused save (pinned) keeps the field and says why.
+        app.setting_edit = Some("WAT2516".into());
+        save_text_setting(&mut app);
+        assert!(app.setting_edit.is_some());
+        assert!(app
+            .notice
+            .as_ref()
+            .is_some_and(|(n, ok)| !ok && n.contains("XCOPILOT_CALLSIGN")));
+        unsafe { std::env::remove_var("XCOPILOT_CALLSIGN") };
+        settings::update(|c| c.callsign = String::new());
     }
 
     #[test]

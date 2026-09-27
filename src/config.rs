@@ -174,9 +174,14 @@ pub struct Config {
     /// The callsign the tower and the crew use, over the SimBrief plan's and
     /// the tail number: a raw id ("BAW306", "N172SP", "G-ABCD") is spoken
     /// for you, or give the words ("Speedbird 306"). Empty = the plan's, else
-    /// the tail's. `XCOPILOT_CALLSIGN`, else prefs.json's `settings` map key
-    /// `callsign` (hand-edited: the Settings screen has no text fields).
+    /// the tail's. `XCOPILOT_CALLSIGN`, else the Settings registry's
+    /// `callsign` (the panel's Settings tab, the terminal, prefs.json).
     pub callsign: String,
+    /// The pilot's own airline telephony, asked before the built-in tables:
+    /// `WAT=Walker; XYZ=Zulu Air` (`atc::callsign::parse_telephony`). Empty =
+    /// the tables only. `XCOPILOT_AIRLINE_TELEPHONY`, else the registry's
+    /// `airline_telephony`.
+    pub airline_telephony: String,
     /// Mute X-Plane's own radio voice (built-in ATC + its ATIS) at startup
     /// while our ATC is on — both spoke on the same frequencies at once
     /// (two ATIS voices, 2026-07-10). Also silences nav-aid morse idents.
@@ -346,6 +351,7 @@ impl Config {
             pilot_name: env_or("XCOPILOT_PILOT_NAME", "").trim().to_string(),
             copilot_name: env_or("XCOPILOT_COPILOT_NAME", "").trim().to_string(),
             callsign: env_or("XCOPILOT_CALLSIGN", "").trim().to_string(),
+            airline_telephony: env_or("XCOPILOT_AIRLINE_TELEPHONY", "").trim().to_string(),
             mute_xp_radio: env_or("XCOPILOT_MUTE_XP_RADIO", "true") != "false",
             atc_readback: env_or("XCOPILOT_ATC_READBACK", "true") != "false",
             taxi_guide: env_or("XCOPILOT_TAXI_GUIDE", "true") != "false",
