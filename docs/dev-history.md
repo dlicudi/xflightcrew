@@ -8440,3 +8440,42 @@ Next push, check: `swing_wait` then `tug_finished` or the release, never
 `stopped` while the `state` heading is still moving; the LIPK-style
 3.5 deg/s stall stop is gone, so the tug finishes its pattern past the
 lane there (the taxi owns the residual). Offline only.
+
+## 2026-09-27: all electrics off is gated; the SR22's LSZS-LILO dead ends are rules
+
+Issue #66 (the 2026-09-23 misread pass): `set_electrical` all-off had no
+gate, so a misheard "electrics off" in flight would have run.
+`electrical::all_off_gate` reads `onground_any` and `ENGN_running` in one
+join: airborne it refuses ("Negative, I won't switch all the electrics off
+in flight."), a failed read refuses (no measurement, so the power stays
+on), an engine turning on the ground asks "Confirm, all electrics off with
+the engines running?" through `confirm_prompt`, and cold on the ground it
+runs at once (the main loop skips the question, as it does for a parked
+`stop_engines`). The refusal lives in `execute` too, so a flow, a
+back-reference or `taxi_in::shut_down_at_stand` meets it; blackbox
+`electrical` `all_off_refused`. Single switches and all-on are not gated:
+shedding one switch in flight (an alternator on overvoltage, the avionics
+for smoke) is a checklist action the pilot must be able to call.
+
+Issue #69, the SR22 LSZS-LILO flight (2026-09-24), verbatim from `heard`:
+
+- "Set transponder." (t 1790265258.8, climbing out, a deterministic miss;
+  the box stayed in standby): a `set` naming no code and no mode is
+  `set_transponder_mode` altitude, as the takeoff sets it. "Set transponder
+  code." with no code is still a miss.
+- "Set SP to 85 knots." (t 1790266795.0): never reached the grammar. The
+  domain gate knows no "SP" and dropped it without a sound; the pilot's
+  re-say came back "And speed 885 knots." and the governor held 189 kt.
+  `phrase::fix_mishears` now repairs "set sp" to "set speed" (only after
+  "set"), which also covers "Set SP to 160 knots." and "Set SP two hundred
+  and sixty." from 2026-09-20.
+- "Can you manage throttle for landing?" (t 1790266907.4, on the final, a
+  miss): `hold_speed` preset approach. The lever words take the governor
+  only after "manage" or "handle", and the preset only with landing,
+  approach or final ("keep the power up" is not a request).
+
+Tests `sr22_lszs_lilo_misses_are_rules` (the transcripts through the STT
+repairs, the domain gate and the SR22 grammar) and `sr22_rules_stay_narrow`.
+Next SR22 flight, check: `heard` "set transponder" followed by a
+`set_transponder_mode` tool line, "Set SP" reaching `hold_speed`, and any
+`electrical` `all_off_refused`. Offline only.

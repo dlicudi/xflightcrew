@@ -268,6 +268,11 @@ const PHRASE_MISHEARS: &[(&str, &str)] = &[
     ("probe light", "strobe light"), // "Probe lights on." (pitot probes
     ("probe lights", "strobe lights"), //  exist; probe LIGHTS don't)
     ("show lights on", "strobe lights on"),
+    // "Speed" clipped to "SP" after "set": "Set SP to 85 knots." (SR22,
+    // LSZS-LILO 2026-09-24), "Set SP to 160 knots.", "Set SP two hundred
+    // and sixty." (2026-09-20), each dropped at the domain gate without a
+    // sound. Only after "set": a bare "SP" is not repaired.
+    ("set sp", "set speed"),
     // Vertical speed.
     ("vertigo speed", "vertical speed"), // "Vertigo speed 0."
     ("medical speed", "vertical speed"), // "Medical speed 0."

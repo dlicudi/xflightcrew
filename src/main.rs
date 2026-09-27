@@ -3278,7 +3278,14 @@ async fn run_session(
                 };
                 let parked_shutdown = call.name == "stop_engines"
                     && tools::jet_start::stopped_on_ground(&xplane).await;
-                let intent = if config.confirm_critical && !parked_shutdown {
+                // An all-off asks only with an engine turning on the ground:
+                // cold it is the normal shutdown, airborne the tool refuses
+                // (issue #66).
+                let electrics_clear = call.name == "set_electrical"
+                    && tools::electrical::is_all_off(&call.arguments)
+                    && tools::electrical::all_off_gate(&xplane).await
+                        != tools::electrical::AllOffGate::Confirm;
+                let intent = if config.confirm_critical && !parked_shutdown && !electrics_clear {
                     tool.confirm_prompt(&call.arguments)
                 } else {
                     None
