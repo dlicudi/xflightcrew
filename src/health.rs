@@ -156,6 +156,7 @@ pub const PLUGIN_DATAREFS: &[&str] = &[
     "xcopilot/terrain/query",
     "xcopilot/terrain/valid",
     "xcopilot/typed",
+    "xcopilot/typed_age",
 ];
 
 /// The last plugin probe's verdict: `None` until one has run, else the names

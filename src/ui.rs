@@ -372,7 +372,9 @@ pub fn run_dashboard(
                                 let cmd = app.input.trim().to_string();
                                 app.input.clear();
                                 if !cmd.is_empty() {
-                                    let _ = cmd_tx.send(cmd); // loop gone = quitting anyway
+                                    // Stamped like the panel's lines; loop
+                                    // gone = quitting anyway.
+                                    let _ = crate::pollers::queue_command(&cmd_tx, cmd);
                                 }
                                 dirty = true;
                             }

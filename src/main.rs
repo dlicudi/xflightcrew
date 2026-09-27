@@ -3876,6 +3876,13 @@ fn next_input(
     let idle_deadline = std::time::Instant::now() + Duration::from_secs(2);
     loop {
         if let Ok(t) = typed.try_recv() {
+            // How long it sat on the channel (#90): the plugin's `taken`
+            // record says how long it sat on the panel before that.
+            let queued_ms = pollers::took_command().map(|d| d.as_millis() as u64);
+            crate::blackbox::record(
+                "typed",
+                serde_json::json!({ "event": "consumed", "text": t, "queued_ms": queued_ms }),
+            );
             let t = t.trim().to_string();
             if !t.is_empty() {
                 return Some(Input::Typed(t));
@@ -3917,7 +3924,9 @@ fn say(voice: &Voice, reporter: &Reporter, kind: ui::LogKind, line: &str) {
     tracing::info!(spoke = %line, "spoke");
     reporter.status(ui::Phase::Speaking);
     reporter.log(kind, line);
-    voice.say(Priority::Readback, line);
+    // Blocks until spoken, unless the pilot has a line waiting (typed, a
+    // panel button): the loop goes to take it and the line plays on (#90).
+    voice.say_until(Priority::Readback, line, pollers::command_waiting);
     reporter.status(ui::Phase::Listening);
     if matches!(kind, ui::LogKind::Readback) {
         if let Ok(mut last) = LAST_READBACK.lock() {
