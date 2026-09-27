@@ -62,6 +62,7 @@ pub(crate) fn publish_airframe(p: &AircraftProfile) {
     crate::aircraft::publish_approach_thrust_min(p.approach_thrust_min);
     crate::aircraft::publish_arrest_lead(p.arrest_lead);
     crate::aircraft::publish_flare_elevator(p.flare_elevator);
+    crate::aircraft::publish_roll_rudder(p.roll_rudder);
     crate::aircraft::publish_landing_distance(
         p.reference.as_ref().and_then(|r| r.landing_distance_ft),
     );

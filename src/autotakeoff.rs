@@ -82,6 +82,8 @@ const PHI: &str = "sim/flightmodel/position/true_phi";
 /// The sim's own pitch rate, deg/s — what the rotation law damps on. Measured,
 /// so it needs neither differencing nor a filter; see [`RotatePitch::step`].
 const PITCH_RATE: &str = "sim/flightmodel/position/Q";
+/// Yaw rate, deg/s, nose right positive: the roll law's damping.
+const YAW_RATE: &str = "sim/flightmodel/position/R";
 
 const M_TO_FT: f64 = 3.280_84;
 const MS_TO_KTS: f64 = 1.943_844;
@@ -142,6 +144,20 @@ const STEER_TRIM_MAX: f64 = 0.3;
 const STEER_TRIM_ERR_CLAMP_DEG: f64 = 6.0;
 /// Above this the rudder is aerodynamic and the trim scales with 1/v².
 const TRIM_SCALE_FROM_KTS: f64 = 40.0;
+/// The roll law SCHEDULED on a declared rudder
+/// ([`crate::aircraft::RollRudderProfile`]): the gain per degree is this
+/// closure rate divided by the yaw rate a unit of steer holds at the speed,
+/// so the heading closes at the same pace at 40 kt and at Vr (never more per
+/// degree than [`ROLL_FULL_DEG`] allows). Damped by [`STEER_LEAD_S`] of the
+/// sim's MEASURED yaw rate. Chosen over the EGKK-fitted plant with its rudder
+/// at half, as declared and at two and a half times: 1.3 rang at 3.5 times.
+const RUDDER_CLOSE_PER_S: f64 = 1.0;
+/// The trim's corner, per second of the same gain: it takes a steady
+/// crosswind in about five seconds (EGKK 26L: 0.2 of steer from 50 kt).
+/// 0.45 and up wound up on a recovery from an offset with a weak rudder.
+const RUDDER_TRIM_PER_S: f64 = 0.3;
+/// ...and its cap: about 0.23 held an 8 kt crosswind at 60 kt.
+const RUDDER_TRIM_MAX: f64 = 0.4;
 /// Speed-authority floor. Sortie two's 0.3 floor starved the STANDING
 /// P-factor rudder — but that job belongs to the trim integrator now,
 /// which adds OUTSIDE this taper. So the P term can shrink properly with
@@ -919,6 +935,9 @@ pub struct RollSteer {
     /// No propeller, no P-factor to lead: a jet takes no power lead
     /// (`for_airframe`). The default is the propeller law.
     jet: bool,
+    /// The airframe's measured rudder, when its profile declares one: the
+    /// law is then scheduled on it (see [`RollSteer::step_with_yaw`]).
+    rudder: Option<crate::aircraft::RollRudderProfile>,
 }
 
 /// The rudder led in WITH the power: proportional to the throttle
@@ -943,17 +962,68 @@ impl RollSteer {
         });
         Self {
             jet,
+            rudder: crate::aircraft::roll_rudder(),
             ..Self::default()
         }
+    }
+
+    /// The law scheduled on a measured rudder (tests and replays).
+    pub fn with_rudder(jet: bool, rudder: crate::aircraft::RollRudderProfile) -> Self {
+        Self {
+            jet,
+            rudder: rudder.valid(),
+            ..Self::default()
+        }
+    }
+
+    /// Whether this law is scheduled on a declared rudder.
+    pub fn scheduled(&self) -> bool {
+        self.rudder.is_some()
     }
 
     /// One control tick: heading error (deg, right positive), the time
     /// since the last tick, groundspeed, and the throttle being
     /// commanded (for the power feed-forward). Returns the deflection.
     pub fn step(&mut self, err_deg: f64, dt_s: f64, gs_kts: f64, thr: f64) -> f64 {
+        self.step_with_yaw(err_deg, dt_s, gs_kts, thr, None)
+    }
+
+    /// [`RollSteer::step`] with the sim's yaw rate (deg/s, nose right
+    /// positive, `sim/flightmodel/position/R`) for the damping. The default
+    /// law ignores it and keeps its differenced error, as flown.
+    ///
+    /// With a declared rudder the law is SCHEDULED on it. EGKK 26L
+    /// (2026-09-27, twice): an 8 kt crosswind from the left needed about 0.23
+    /// of right rudder from 40 kt on, and the default law gave it 0.03 of
+    /// steer per degree of error over 50 kt (its authority floor, set for the
+    /// 172's lively rudder) plus a trim learning 0.01 per degree-second that
+    /// the 1/v² scaling bled away nearly as fast as it learned. The nose sat
+    /// 5 degrees left for ten seconds and both rolls were rejected 10 m left
+    /// of the centreline at 82 and 87 kt. Here every gain is a yaw rate
+    /// divided by the yaw rate a unit of steer holds at this speed, so the
+    /// heading closes at [`RUDDER_CLOSE_PER_S`] whatever the speed; the
+    /// same lead is taken on the MEASURED yaw rate, not a differenced heading
+    /// (the error's own difference carries every step of the target); the
+    /// trim learns at [`RUDDER_TRIM_PER_S`] of the same gain and shrinks as 1/v
+    /// with the speed, which is how a crosswind's steer falls (its moment
+    /// grows as v, the rudder's as v²). Never more per degree than the
+    /// default law's full authority, so the slow roll is the one it was.
+    pub fn step_with_yaw(
+        &mut self,
+        err_deg: f64,
+        dt_s: f64,
+        gs_kts: f64,
+        thr: f64,
+        yaw_dps: Option<f64>,
+    ) -> f64 {
         let dt = dt_s.clamp(0.05, 1.0);
         let rate = self.prev_err.map_or(0.0, |p| (err_deg - p) / dt);
         self.prev_err = Some(err_deg);
+        if let Some(rudder) = self.rudder {
+            // A failed read is no measurement: the error's own rate stands in.
+            let yaw = yaw_dps.filter(|v| v.is_finite()).unwrap_or(-rate);
+            return self.step_scheduled(rudder, err_deg, dt, gs_kts, thr, yaw);
+        }
         let auth = 1.0 - (1.0 - STEER_AUTH_FLOOR) * ((gs_kts - 15.0) / 35.0).clamp(0.0, 1.0);
         let pd = ((err_deg + STEER_LEAD_S * rate) / ROLL_FULL_DEG).clamp(-1.0, 1.0) * auth;
         // Prop wash makes the tail HYPER-effective under power at low
@@ -988,6 +1058,45 @@ impl RollSteer {
         // worse: the scaling alone is the fix.)
         if let Some(pg) = self.prev_gs.filter(|pg| *pg > TRIM_SCALE_FROM_KTS && gs_kts > *pg) {
             self.trim *= (pg / gs_kts).powi(2);
+        }
+        self.prev_gs = Some(gs_kts);
+        self.out = slew(self.out, want, STEER_SLEW_PER_S * dt);
+        self.out
+    }
+
+    fn step_scheduled(
+        &mut self,
+        rudder: crate::aircraft::RollRudderProfile,
+        err_deg: f64,
+        dt: f64,
+        gs_kts: f64,
+        thr: f64,
+        yaw_dps: f64,
+    ) -> f64 {
+        let authority = rudder.yaw_dps_at(gs_kts).max(1e-3);
+        // Where the rudder is still dead the gain would be enormous: never
+        // more per degree than the default law's full authority.
+        let kp = (RUDDER_CLOSE_PER_S / authority).min(1.0 / ROLL_FULL_DEG);
+        let pd = (kp * (err_deg - STEER_LEAD_S * yaw_dps)).clamp(-1.0, 1.0);
+        let cap = LOW_SPEED_STEER_CAP
+            + (MAX_ROLL_STEER - LOW_SPEED_STEER_CAP)
+                * (gs_kts / LOW_SPEED_FULL_KTS).clamp(0.0, 1.0);
+        let lead = if self.jet {
+            0.0
+        } else {
+            power_lead(thr, gs_kts)
+        };
+        let want = (pd + self.trim + lead).clamp(-cap, cap);
+        if gs_kts > TRIM_MIN_GS_KTS {
+            let e = err_deg.clamp(-STEER_TRIM_ERR_CLAMP_DEG, STEER_TRIM_ERR_CLAMP_DEG);
+            self.trim = (self.trim + RUDDER_TRIM_PER_S * kp * e * dt)
+                .clamp(-RUDDER_TRIM_MAX, RUDDER_TRIM_MAX);
+        }
+        if let Some(pg) = self
+            .prev_gs
+            .filter(|pg| *pg > TRIM_SCALE_FROM_KTS && gs_kts > *pg)
+        {
+            self.trim *= pg / gs_kts;
         }
         self.prev_gs = Some(gs_kts);
         self.out = slew(self.out, want, STEER_SLEW_PER_S * dt);
@@ -1616,11 +1725,12 @@ async fn stop_on_centreline(xp: &XPlaneClient, rwy: &Runway, law: &mut RollSteer
     let mut prev_xtk: Option<f64> = None;
     let mut rate_filter = XtkRate::default();
     while t0.elapsed().as_secs_f64() < REJECT_STOP_MAX_S {
-        let (lat, lon, psi, gs) = tokio::join!(
+        let (lat, lon, psi, gs, yaw_r) = tokio::join!(
             xp.get_float(LAT),
             xp.get_float(LON),
             xp.get_float(PSI_TRUE),
-            xp.get_float(GS_MS)
+            xp.get_float(GS_MS),
+            xp.get_float(YAW_RATE)
         );
         let Some([lat, lon, psi, gs]) = crate::control::measurements("autotakeoff", [lat, lon, psi, gs])
         else {
@@ -1644,12 +1754,13 @@ async fn stop_on_centreline(xp: &XPlaneClient, rwy: &Runway, law: &mut RollSteer
         prev_xtk = Some(xtk_m);
         let target = roll_target_heading(rwy.course_deg, xtk_m, rate, gs_kts);
         let err = ((target - psi + 540.0).rem_euclid(360.0)) - 180.0;
-        let steer = law.step(err, dt, gs_kts, 0.0);
+        let yaw_dps = yaw_r.ok().filter(|v| v.is_finite());
+        let steer = law.step_with_yaw(err, dt, gs_kts, 0.0, yaw_dps);
         let _ = xp.set_float(TAXI_STEER, steer).await;
         crate::blackbox::record(
             "autotakeoff",
             serde_json::json!({"event": "reject_rollout", "gs": gs_kts, "xtk_m": xtk_m,
-                               "err": err, "steer": steer}),
+                               "err": err, "steer": steer, "r": yaw_dps}),
         );
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
     }
@@ -1991,6 +2102,7 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, p: Params) {
             pitch_yield,
             roll_yield,
             torque_nm,
+            yaw_r,
         ) = tokio::join!(
             xp.get_float(LAT),
             xp.get_float(LON),
@@ -2007,6 +2119,7 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, p: Params) {
             xp.get_float(PITCH_YIELD),
             xp.get_float(ROLL_YIELD),
             xp.get_float_array(ENGN_TRQ),
+            xp.get_float(YAW_RATE),
         );
         let torque_ftlb = torque_nm
             .ok()
@@ -2133,7 +2246,9 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, p: Params) {
                     return;
                 }
             }
-            let steer = steer_law.step(err, dt, gs_kts, thr_cmd);
+            // A failed read is no measurement: logged null, the law falls back.
+            let yaw_dps = yaw_r.ok().filter(|v| v.is_finite());
+            let steer = steer_law.step_with_yaw(err, dt, gs_kts, thr_cmd, yaw_dps);
             // The brake half, on an airframe that has no other low-speed
             // steering; zero once rotated (the channel expires anyway).
             let yaw_dps = prev_align_err.map_or(0.0, |p| -(err - p) / dt.max(0.05));
@@ -2183,6 +2298,9 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, p: Params) {
                     // off a roll (LIBP 04 held 3 degrees of error for six
                     // seconds at 86 to 105 kt on 0.15 to 0.25 of steer).
                     "psi": psi, "tgt": target,
+                    // The sim's yaw rate the scheduled law damps on, and
+                    // whether it flew (the 737's `roll_rudder:`).
+                    "r": yaw_dps, "law": if steer_law.scheduled() { "rudder" } else { "default" },
                     "thr": thr_cmd, "remaining_m": remaining, "dt": dt, "trq_ftlb": torque_ftlb,
                 }),
             );
@@ -3175,6 +3293,328 @@ mod tests {
         // The law before the scaling: 7.8 m, 6.0 m above 90 kt.
         assert!(worst < 5.0, "the roll wandered {worst:.1} m");
         assert!(worst_fast < 2.0, "above 90 kt it swung {worst_fast:.1} m");
+    }
+
+    /// The 737's rudder as the profile declares it (`roll_rudder:`).
+    fn rudder_737() -> crate::aircraft::RollRudderProfile {
+        let text = std::fs::read_to_string("profiles/boeing_737_800.yaml").unwrap();
+        let p: crate::aircraft::AircraftProfile = serde_yaml::from_str(&text).unwrap();
+        p.roll_rudder
+            .and_then(|r| r.valid())
+            .expect("the 737 declares its rudder")
+    }
+
+    /// One tick of a flown roll, as the blackbox's `roll` event carries it.
+    struct RollTick {
+        gs: f64,
+        err: f64,
+        xtk: f64,
+        steer: f64,
+        trim: f64,
+    }
+
+    /// A 737 takeoff roll through the plant fitted to both EGKK 26L rolls of
+    /// 2026-09-27 (30 to 86 kt, three-second predictions of the heading
+    /// 0.07 degrees rms): a unit of steer holds 6.45 deg/s of yaw at 60 kt,
+    /// growing with v², reached through a 0.47 s lag after 0.3 s of dead
+    /// time (second order from steer to heading), plus the nosewheel at a
+    /// walk; the crosswind from the left yaws it into the wind by
+    /// 2.48 deg/s per 60 kt less 0.99 at the recorded 7.4 kt, in proportion.
+    /// The loop ticks at the recorded 0.27 s with the real target law and
+    /// cross-track filter. `kscale` makes the real rudder weaker or stronger
+    /// than the one declared.
+    fn fly_737_roll(
+        mut law: RollSteer,
+        xw_kt: f64,
+        kscale: f64,
+        xtk0: f64,
+        psi_off: f64,
+        accel_kts_s: f64,
+        gs0: f64,
+        vr_kts: f64,
+    ) -> Vec<RollTick> {
+        const COURSE: f64 = 257.6;
+        const TICK: f64 = 0.27;
+        const DEAD_S: f64 = 0.3;
+        const LAG_S: f64 = 0.47;
+        const H: f64 = 0.01;
+        let (mut psi, mut yaw, mut xtk, mut gs) = (COURSE + psi_off, 0.0_f64, xtk0, gs0);
+        let mut queue: std::collections::VecDeque<(f64, f64)> = Default::default();
+        let mut applied = 0.0_f64;
+        let mut prev_xtk: Option<f64> = None;
+        let mut rate_filter = XtkRate::default();
+        let mut t = 0.0_f64;
+        let mut ticks = Vec::new();
+        while gs < vr_kts {
+            let raw = prev_xtk.map_or(0.0, |p| (xtk - p) / TICK);
+            prev_xtk = Some(xtk);
+            let rate = rate_filter.update(raw, TICK);
+            let target = roll_target_heading(COURSE, xtk, rate, gs);
+            let err = ((target - psi + 540.0).rem_euclid(360.0)) - 180.0;
+            let steer = law.step_with_yaw(err, TICK, gs, 1.0, Some(yaw));
+            queue.push_back((t + DEAD_S, steer));
+            ticks.push(RollTick {
+                gs,
+                err,
+                xtk,
+                steer,
+                trim: law.trim(),
+            });
+            let next = t + TICK;
+            while t < next - 1e-9 {
+                while queue.front().is_some_and(|(at, _)| *at <= t) {
+                    applied = queue.pop_front().map_or(applied, |(_, s)| s);
+                }
+                let nose = 0.23 * gs * (1.0 - gs / 40.0).max(0.0);
+                let rudder = kscale * 6.45 * (gs / 60.0).powi(2) + nose;
+                let weathervane = xw_kt / 7.4 * (2.48 * gs / 60.0 - 0.99).max(0.0);
+                yaw += (rudder * applied - weathervane - yaw) * H / LAG_S;
+                psi += yaw * H;
+                xtk += gs / MS_TO_KTS * (psi - COURSE).to_radians().sin() * H;
+                gs += accel_kts_s * H;
+                t += H;
+            }
+        }
+        ticks
+    }
+
+    fn worst_xtk(ticks: &[RollTick], upto_kts: f64) -> f64 {
+        ticks
+            .iter()
+            .filter(|k| k.gs >= 30.0 && k.gs <= upto_kts)
+            .map(|k| k.xtk.abs())
+            .fold(0.0, f64::max)
+    }
+
+    /// Tick-to-tick steer jumps past 0.08: the weave's signature.
+    fn steer_swings(ticks: &[RollTick]) -> usize {
+        ticks
+            .windows(2)
+            .filter(|w| w[0].gs >= 30.0 && (w[1].steer - w[0].steer).abs() > 0.08)
+            .count()
+    }
+
+    fn default_737_law() -> RollSteer {
+        RollSteer {
+            jet: true,
+            ..RollSteer::default()
+        }
+    }
+
+    /// EGKK 26L, 2026-09-27, both rolls rejected `lateral_excursion`: an
+    /// 8 kt crosswind from the left, the nose 5 degrees left of the target
+    /// for ten seconds on 0.28 of steer, 10.3 m left at 87 kt. The default
+    /// law must still do that through the fitted plant, or this test is not
+    /// about EGKK any more; the law scheduled on the 737's declared rudder
+    /// holds the centreline through rotation, its trim taking the crosswind
+    /// within seconds of 40 kt.
+    #[test]
+    fn a_steady_crosswind_is_held_on_the_centreline() {
+        // First roll: 7.5 kt of crosswind, on the centreline at the start.
+        let old = fly_737_roll(default_737_law(), 7.5, 1.0, 0.08, 0.19, 6.2, 0.0, 145.0);
+        let old_err = old
+            .iter()
+            .filter(|k| k.gs <= 87.0)
+            .map(|k| k.err.abs())
+            .fold(0.0, f64::max);
+        assert!(
+            old_err > 5.0,
+            "the default law held only {old_err:.1} degrees off"
+        );
+        assert!(
+            worst_xtk(&old, 87.0) > 10.0,
+            "the default law reached only {:.1} m by 87 kt",
+            worst_xtk(&old, 87.0)
+        );
+        let new = fly_737_roll(
+            RollSteer::with_rudder(true, rudder_737()),
+            7.5,
+            1.0,
+            0.08,
+            0.19,
+            6.2,
+            0.0,
+            145.0,
+        );
+        assert!(
+            worst_xtk(&new, 145.0) < 5.0,
+            "held within 5 m through rotation: {:.1} m",
+            worst_xtk(&new, 145.0)
+        );
+        let new_err = new.iter().map(|k| k.err.abs()).fold(0.0, f64::max);
+        assert!(
+            new_err < 3.0,
+            "the nose stays within 3 degrees: {new_err:.1}"
+        );
+        let trim_60 = new.iter().find(|k| k.gs >= 60.0).map_or(0.0, |k| k.trim);
+        assert!(
+            trim_60 > 0.1,
+            "the crosswind's steady rudder is in the trim by 60 kt: {trim_60:.2}"
+        );
+        assert_eq!(
+            steer_swings(&new),
+            0,
+            "and the rudder does not weave for it"
+        );
+
+        // Second roll: 6.4 kt, starting 3.1 m left with the nose 1.5 right.
+        let old = fly_737_roll(default_737_law(), 6.4, 1.0, -3.1, 1.49, 6.1, 0.0, 145.0);
+        let new = fly_737_roll(
+            RollSteer::with_rudder(true, rudder_737()),
+            6.4,
+            1.0,
+            -3.1,
+            1.49,
+            6.1,
+            0.0,
+            145.0,
+        );
+        assert!(worst_xtk(&old, 87.0) > 8.0, "{:.1}", worst_xtk(&old, 87.0));
+        assert!(
+            worst_xtk(&new, 145.0) < 5.0,
+            "the second roll within 5 m too: {:.1}",
+            worst_xtk(&new, 145.0)
+        );
+    }
+
+    /// No wind (the LIBP case the trim scaling was for): the scheduled law
+    /// recovers an offset without weaving and overshoots no more than the
+    /// default law, with the real rudder as declared, half of it or two and a
+    /// half times it; and a crosswind with a rudder not as declared is still
+    /// held in half the default law's excursion or less.
+    #[test]
+    fn the_scheduled_roll_law_does_not_weave() {
+        // The far side of the centreline from where it started.
+        let overshoot = |ticks: &[RollTick], xtk0: f64| {
+            ticks
+                .iter()
+                .map(|k| -k.xtk * xtk0.signum())
+                .fold(0.0, f64::max)
+        };
+        for kscale in [0.5, 1.0, 2.5] {
+            for (gs0, xtk0, psi_off) in [(0.0, 3.0, 1.0), (40.0, 3.0, 2.0), (80.0, -2.0, -1.5)] {
+                let old = fly_737_roll(
+                    default_737_law(),
+                    0.0,
+                    kscale,
+                    xtk0,
+                    psi_off,
+                    6.2,
+                    gs0,
+                    150.0,
+                );
+                let new = fly_737_roll(
+                    RollSteer::with_rudder(true, rudder_737()),
+                    0.0,
+                    kscale,
+                    xtk0,
+                    psi_off,
+                    6.2,
+                    gs0,
+                    150.0,
+                );
+                let (o, n) = (overshoot(&old, xtk0), overshoot(&new, xtk0));
+                assert!(
+                    n < 2.5 && n <= o + 1.0,
+                    "x{kscale} from {gs0} kt: {n:.1} m through the centreline, default {o:.1}"
+                );
+                assert!(
+                    steer_swings(&new) <= 1,
+                    "x{kscale} from {gs0} kt: the rudder swung {} times",
+                    steer_swings(&new)
+                );
+                assert!(
+                    new.last().is_some_and(|k| k.xtk.abs() < 2.5),
+                    "x{kscale} from {gs0} kt: rotates near the centreline"
+                );
+            }
+            let old = fly_737_roll(default_737_law(), 7.4, kscale, 0.08, 0.2, 6.2, 0.0, 145.0);
+            let new = fly_737_roll(
+                RollSteer::with_rudder(true, rudder_737()),
+                7.4,
+                kscale,
+                0.08,
+                0.2,
+                6.2,
+                0.0,
+                145.0,
+            );
+            assert!(
+                worst_xtk(&new, 145.0) < worst_xtk(&old, 145.0) * 0.5,
+                "x{kscale} in the crosswind: {:.1} against {:.1}",
+                worst_xtk(&new, 145.0),
+                worst_xtk(&old, 145.0)
+            );
+            assert_eq!(
+                steer_swings(&new),
+                0,
+                "x{kscale} in the crosswind: the rudder weaves"
+            );
+        }
+    }
+
+    /// Every recorded 737 roll in the sorties (2026-09-26 and 27), replayed
+    /// through the same plant with its own mean crosswind (the `state`
+    /// wind across the runway), acceleration and start: the scheduled law
+    /// is never worse than the default law it replaces, and every one stays
+    /// within 5 m. The plant under-reads the gustier days (LIBP, LEMG flew
+    /// 7 to 10 m against the plant's 2 to 6 under the default law), so this
+    /// ranks the laws; it does not reproduce those rolls metre for metre.
+    #[test]
+    fn recorded_737_rolls_replay_no_worse() {
+        // (sortie, crosswind from the left kt, accel kt/s, xtk0 m, psi0 deg, vr kt)
+        const ROLLS: [(&str, f64, f64, f64, f64, f64); 10] = [
+            ("1790426786 LIBP 04", 3.6, 6.2, 0.5, 0.0, 125.0),
+            ("1790429680 LIBP 04", 3.9, 6.3, 0.6, 0.0, 150.0),
+            ("1790441293 LEMG 13", 1.1, 6.6, 0.0, 0.0, 150.0),
+            ("1790457940 LIBP 22", -0.7, 6.0, 0.0, -0.02, 150.0),
+            ("1790466443 LIEA 02", 0.1, 6.0, 0.0, -0.40, 150.0),
+            ("1790494983 LIEA 20", -0.1, 5.9, -0.1, -0.87, 150.0),
+            ("1790504948 LEBL 24R", 0.1, 6.1, 0.0, 0.55, 150.0),
+            ("1790510400 LFBD 29", 1.4, 5.9, 0.1, 0.09, 150.0),
+            ("1790524628 EGKK 26L", 7.5, 6.2, 0.1, 0.19, 145.0),
+            ("1790525414 EGKK 26L", 6.4, 6.1, -3.1, 1.49, 145.0),
+        ];
+        for (id, xw, accel, xtk0, psi0, vr) in ROLLS {
+            let old = fly_737_roll(default_737_law(), xw, 1.0, xtk0, psi0, accel, 0.0, vr);
+            let new = fly_737_roll(
+                RollSteer::with_rudder(true, rudder_737()),
+                xw,
+                1.0,
+                xtk0,
+                psi0,
+                accel,
+                0.0,
+                vr,
+            );
+            let (o, n) = (worst_xtk(&old, vr), worst_xtk(&new, vr));
+            assert!(
+                n <= o + 0.3,
+                "{id}: {n:.1} m against the default law's {o:.1}"
+            );
+            assert!(n < 5.0, "{id}: {n:.1} m");
+            assert_eq!(steer_swings(&new), 0, "{id}: the rudder weaves");
+        }
+    }
+
+    /// Without a declared rudder nothing changes: the yaw rate is ignored
+    /// and every other airframe flies the law it flew.
+    #[test]
+    fn an_undeclared_rudder_keeps_the_default_law() {
+        let mut plain = default_737_law();
+        let mut with_yaw = default_737_law();
+        for (err, gs) in [(2.0, 30.0), (3.0, 45.0), (1.0, 70.0), (-2.0, 100.0)] {
+            let a = plain.step(err, 0.27, gs, 1.0);
+            let b = with_yaw.step_with_yaw(err, 0.27, gs, 1.0, Some(5.0));
+            assert_eq!(a, b);
+        }
+        assert!(!RollSteer::default().scheduled());
+        // A nonsense declaration is no declaration.
+        let silly = crate::aircraft::RollRudderProfile {
+            yaw_dps: 0.0,
+            at_kts: 80.0,
+        };
+        assert!(!RollSteer::with_rudder(true, silly).scheduled());
     }
 
     #[test]
