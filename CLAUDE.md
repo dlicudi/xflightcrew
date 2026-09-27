@@ -257,6 +257,9 @@ Config: `XCOPILOT_ATC_AIRPORT` / `_VOICE` / `_RATE` / `_REGION`.
   the HOLD went on. **A reject is a radio call** (`Intent::RejectingTakeoff`, the crew's
   `autotakeoff::REJECT_CALL`): the clearance and all it armed die; a held release lives only in
   TaxiCleared/LinedUp and dies at a roll (`void_takeoff_hold_by_roll`; EGKK 2026-09-27).
+- **The tower's book is the runway's**: a landing holds its strip until the vacated report, a
+  runway start is lined up, a cleared crossing that keeps moving is legal
+  (`station::runway_occupancy_authorised`, the incursion watch's one question; EGKK 2026-09-27).
 - **Taxi routes**: Dijkstra over apt.dat 1201/1202; crossings from strip GEOMETRY, never network
   flags; a crossing on the cleared route is never berated. A runway destination snaps to a node
   that can REACH the runway, per CALLER, ON THE DESTINATION STRIP's own pavement (LFPB 2026-09-22).
@@ -390,7 +393,8 @@ everything blackboxes to `logs/blackbox.jsonl` (kinds: `atc`, `autotaxi`, `autot
   (`handoff_waits_for_schedule`), each step only once the flaps ARRIVE at the last
   (`paced_flap_step`) and called by its detent ("Flaps one.", `flap_step_line`). A circuit keeps
   the old climb-out.
-- **A runway start is a lined-up aircraft and still calls** (`tower::Ctx::own_on_runway`).
+- **A runway start is a lined-up aircraft and still calls** (`tower::Ctx::own_on_runway`), never
+  an incursion (`ComplianceState.runway_start`: a strip first seen stopped).
 
 ### Circuit, procedure, full auto
 (`src/circuit.rs`, `src/procedure.rs`, `src/full_auto.rs`)
@@ -446,6 +450,7 @@ everything blackboxes to `logs/blackbox.jsonl` (kinds: `atc`, `autotaxi`, `autot
   not be checked.
 - **The crew works the radio as it flies**: a conditional line-up waits on
   `party_line::line_up_condition_clear()`; `take_departure_handoff()` (readback, retune, check-in);
+  an IFR readback is judged from when it goes OUT (`ReadbackWait`, `circuit::crew_radio_pending`);
   `take_region_handoff()` (survives `Station::install`; 7000 via `SetTransponder`;
   `region_coach_line` with a pilot flying). **An IFR flight keeps its code** (party line
   `IFR_FLIGHT`, survives install, retired at the landing): no service terminated, no 7000

@@ -9144,3 +9144,42 @@ driving the loader on the 737 ramp fake), `the_unprobed_airframes_say_so_in_thei
 Next ramp arm: `full_auto` `plan_fetch` then `arm_load` before `preflight`,
 a `loading` `load_aircraft` record between them when the outcome is loaded,
 and `preflight` `fuel_kg` at the block. Offline only.
+
+## 2026-09-28: the tower holds its own runway clearances; the IFR readback clock (issues #124, #117, #108, #116)
+
+Sorties `1790534902-full_auto` (EGBB-EGKK) and `1790527340-full_auto` (EGKK-EGBB), 2026-09-27.
+
+#124: cleared to land 26L and down at +2974 s, the 737 taxied the strip at 8 to 12 kt to exit ER and
+reported vacated at +3149. The monitor's runway-incursion watch (blackbox `runway_incursion`, not the
+compliance watch) said "exit the runway immediately" or "expedite" 7 times from +2993.9 (traffic 0.1
+to 3.8 nm, 26L then 08R past midfield), and once more at +3191.1 on the arrival's cleared crossing
+of 08L at 12.7 kt. It counted only `TakeoffCleared` or `LinedUp` as the tower putting us there.
+`station::runway_occupancy_authorised` (party line accessor, the monitor's `runway_is_ours`) adds a
+landing clearance on THIS strip until the vacated report (`ClearanceSnap.holds_runway`), a runway
+start, and a cleared route crossing while moving (3 kt or more).
+
+#117: lined up on 26L at 0.0 kt, the IFR request made contact (tower `Parked`) and the compliance
+watch said "you are on runway two six left without clearance. Exit the runway immediately." at
++17.3. `ComplianceState.runway_start` latches a strip first seen with the aircraft stopped
+(`RUNWAY_START_MAX_KTS` 1 kt: a taxi arrives moving, a landing airborne), held while it stays on
+that strip; the occupancy call and the incursion watch stand down for it.
+
+#108: the LEMG "you landed on runway three zero" at t 1790448368.5 (20:46:08) came from a build
+older than 3b6ff11 (20:58:36, name the end the true heading points down). The recorded numbers
+(36.682790, -4.488170, 117.9 true on apt.dat's 12/30) now pin "one two".
+
+#116: the tower publishes the owed readback when a call is ROUTED, before it is spoken, so full auto
+queued its IFR readback at +17.4. The clearance was spoken at +33.2 and the readback went out and was
+accepted at +49.6, 2 s after a 30 s clock from the queue logged `ifr_clearance_not_accepted`
+(+47.5). `full_auto::ReadbackWait` gives 30 s from the moment `circuit::crew_radio_pending()` goes
+false, bounded at 120 s in the queue.
+
+Tests: `a_runway_start_is_lined_up_not_an_incursion`, `a_cleared_landing_holds_its_runway_until_vacated`,
+`the_lemg_landing_is_named_one_two_from_its_recorded_numbers`,
+`the_ifr_readback_wait_runs_from_the_readback_going_out`. Seen, not fixed: the runway start at
+1790527340 asked for taxi and was sent to hold Mike instead of calling ready; 26R's final corridor
+catches 26L traffic (no close-parallel rule in the incursion watch).
+
+Next sortie: no `runway_incursion` between `taxi_in` `vacating` and `RunwayVacated`; no `atc`
+`compliance` record at a runway start; `clearance_readback` then `atc` `ifr_clearance` side crew with
+no `ifr_clearance_not_accepted`. Offline only.
