@@ -440,7 +440,8 @@ everything blackboxes to `logs/blackbox.jsonl` (kinds: `atc`, `autotaxi`, `autot
   `procedure::planned_tod` is announced. **While a follower flies, the plan's ring is silence**
   (`Snapshot::follower_flying` gates `tod_ahead`, `tod_passed`, `high_on_profile`). A PILOT-held
   level gets one reminder naming who holds it (`PlannedTod.held_ft`, `procedure::held_tod`). None on
-  an approach or in a climb (`CLIMBING_FPM`).
+  an approach or in a climb (`CLIMBING_FPM`), and the family speaks only in the model's cruise
+  above 1,000 ft AGL (`monitor::tod_in_cruise`; a ring behind the departure, LSZS-LILO 2026-09-24).
 - **A level the plan handed down is not argued with**: no step-climb advice with a TOD published; a
   wandering cruise is still cruise (`CRUISE_WANDER_FPM`); a JOIN projects along the nose
   (`project_signed_facing`); the taxi law's idle-and-brake waits unless a surge (`SURGE_KTS_S`).
