@@ -845,6 +845,60 @@ pub struct VacatePlan {
     pub exit_name: String,
 }
 
+/// A stand route that begins ON the runway: the drive off it, forward, then
+/// the route to the stand from where that drive ends.
+///
+/// Planned from the runway itself, a stand route snaps to the nearest node
+/// whatever the heading, and that node is as likely behind as ahead: EDLP 24
+/// (SF50, 2026-09-24) the vacate timed out 714 m short of exit C, the stand
+/// route was planned from 51.61388 N 8.61568 E heading 236, and it started
+/// back up the runway (the drive joined 179 degrees off) with a clearance
+/// that said "cross runway zero six" for the strip we were already on. The
+/// vacate knows the way off ([`TaxiNet::plan_vacate`]: exits ahead only,
+/// toward the apron); the stand route starts where it ends.
+///
+/// `rest` is the stand route from the vacate's end, its crossings already
+/// marked: the vacate's own runway legs are the landing clearance's, never
+/// a crossing. The vacate's exit leads the `via`.
+pub fn after_vacate(vacate: VacatePlan, rest: TaxiRoutePlan) -> TaxiRoutePlan {
+    let mut path = vacate.path;
+    let mut seg = vacate.seg;
+    let mut tail_path = rest.path.into_iter();
+    // The stand route starts where the vacate ends (its first point is the
+    // position it was planned from): the duplicate goes, and the stand
+    // route's first leg then runs from the vacate's end. Apart, a connecting
+    // leg joins them.
+    match (path.last(), tail_path.as_slice().first()) {
+        (Some(&end), Some(first)) => {
+            let m_per_deg_lon = 111_320.0 * end.0.to_radians().cos();
+            let gap = ((first.1 - end.1) * m_per_deg_lon).hypot((first.0 - end.0) * 111_320.0);
+            if gap < 1.0 {
+                tail_path.next();
+            } else {
+                seg.push((String::new(), false));
+            }
+        }
+        // No vacate to lead with: the stand route whole.
+        (None, _) => seg.clear(),
+        (Some(_), None) => {}
+    }
+    path.extend(tail_path);
+    seg.extend(rest.seg);
+    let mut via = Vec::with_capacity(rest.via.len() + 1);
+    if !vacate.exit_name.is_empty() && rest.via.first() != Some(&vacate.exit_name) {
+        via.push(vacate.exit_name);
+    }
+    via.extend(rest.via);
+    TaxiRoutePlan {
+        via,
+        crossings: rest.crossings,
+        holding_point: rest.holding_point,
+        path,
+        seg,
+        lead_on: Vec::new(),
+    }
+}
+
 /// A planned taxi route, ready to phrase: ordered taxiway names, runways
 /// crossed, the holding-point name, and the node polyline for the
 /// off-route compliance watch. Names are RAW apt.dat strings — the station
@@ -5183,6 +5237,41 @@ STAR:030,6,ALWYS3,RW28B,ARRTU,K2,P,C,E   , ,   ,TF, , , , , ,      ,    ,    ,  
         // The names still change where the network said.
         assert_eq!(rode_seg.first().unwrap().0, "A");
         assert_eq!(rode_seg.last().unwrap().0, "HN1");
+    }
+
+    /// The vacate leads, the stand route follows from its end: one point where
+    /// they meet, legs aligned, the exit named first once, crossings the
+    /// stand route's own (EDLP 24, 2026-09-24).
+    #[test]
+    fn a_stand_route_from_the_runway_starts_with_the_vacate() {
+        let vacate = VacatePlan {
+            path: vec![ll(0.0, 0.0), ll(100.0, 0.0), ll(100.0, -60.0)],
+            seg: vec![("06/24".into(), true), ("C".into(), false)],
+            exit_name: "C".into(),
+        };
+        let rest = TaxiRoutePlan {
+            via: vec!["C".into(), "D".into()],
+            crossings: vec![],
+            holding_point: "7C".into(),
+            path: vec![ll(100.0, -60.0), ll(100.0, -120.0), ll(200.0, -120.0)],
+            seg: vec![("C".into(), false), ("D".into(), false)],
+            lead_on: vec![],
+        };
+        let p = after_vacate(vacate.clone(), rest.clone());
+        assert_eq!(p.path.len(), 5, "the meeting point once: {:?}", p.path);
+        assert_eq!(p.seg.len() + 1, p.path.len());
+        assert_eq!(p.path[0], ll(0.0, 0.0), "starts at the aircraft");
+        assert_eq!(p.via, vec!["C".to_string(), "D".to_string()]);
+        assert!(p.seg[0].1, "the rollout leg is the runway's");
+        assert_eq!(p.holding_point, "7C");
+        // A stand route that starts elsewhere is joined by a plain leg.
+        let mut apart = rest;
+        apart.path[0] = ll(100.0, -70.0);
+        apart.via = vec!["D".into()];
+        let q = after_vacate(vacate, apart);
+        assert_eq!(q.path.len(), 6);
+        assert_eq!(q.seg.len() + 1, q.path.len());
+        assert_eq!(q.via, vec!["C".to_string(), "D".to_string()]);
     }
 
     /// The whole point, in one test: a network drawn beside its paint, and a
