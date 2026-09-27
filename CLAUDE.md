@@ -530,7 +530,10 @@ everything blackboxes to `logs/blackbox.jsonl` (kinds: `atc`, `autotaxi`, `autot
 - **A low flare with room to stop is COMMITTED** (`autoland::commit_flare`, `committed_flare`): no
   `overflew_the_runway` go-around while the pavement covers the landing distance (a go-around from
   an idle flare cannot climb); a balloon under `BALLOON_COMMIT_FT` likewise (`balloon_power`,
-  `BALLOON_LEAD_S`).
+  `BALLOON_LEAD_S`). The need is the book LESS the air already flown from 50 ft
+  (`flare_pavement_need_m`; LFBD 11 missed by 12 m). **A low balk is called on the radio only once it
+  CLIMBS** (`go_around_call_due`, `BalkWatch`); one the wheels take keeps the clearance
+  (`balk_landed`).
 - A debrief touchdown is the steepest recent sink (`instructor::touchdown_sink_fpm`).
 
 ### Taxi in

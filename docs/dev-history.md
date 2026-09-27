@@ -8045,3 +8045,60 @@ false` with `drift_deg` and `after_deg`, and latched off for the airframe
 survey's `glass_hsi`: an SR22 flagged glass genuinely drifted 166 degrees
 (2026-07-12); the readback is the guard. The spoken line lost its em dash.
 Offline only.
+
+## 2026-09-27: a flare is credited the air it has flown; a balk that lands never calls "going around"
+
+Sortie 1790504948-full_auto, the stock 737-800 into LFBD 11 (2,418 m), the
+second approach, cleared to land. The flare opened at 38 ft at about 148 kt
+and floated. At 7.9 ft radio, 796 m past the threshold (0.43 nm) and sinking
+184 fpm, `guidance()` balked `overflew_the_runway`: the float allowance
+(`overflight_allowance_nm` with the POM's 5,360 ft = 1,634 m) ran out at
+784 m. `commit_flare` did not save it: 1,622 m ahead against 1,634 m
+needed, short by 12 m. The copilot said "Going around. Full power, climbing
+straight ahead.", the throttle went to 1.0 for about a second, "going
+around" went out on the radio on the balk tick, and the tower answered
+"roger, go around ... report downwind" and dropped ClearedToLand to
+Inbound. The wheels touched 1.3 s later with the engines still spooling,
+the AP came out, the rollout took it and it stopped with about 700 m to
+spare (touchdown about 1,578 m from the end, 880 m of roll). The crew had
+called a go-around and then landed uncleared.
+
+**The committed flare's need** (`autoland::flare_pavement_need_m`): a
+recited landing distance runs from 50 ft over the threshold
+(`LANDING_SCREEN_FT`), and a flare at 8 ft has already flown the part of it
+between the two, so the whole figure counted it twice. The need is now the
+book figure less the air a 3 degree path covers from 50 ft down to this
+height (`SCREEN_AIR_M` = 50 ft x 0.3048 / tan 3 degrees = 291 m, credited
+in proportion: 245 m at 7.9 ft, none at or above 50 ft, so a balloon asks
+the whole figure). The book's own air segment is longer than that geometry
+(it includes the float), so what is asked is the ground roll plus a float,
+never less. Floored at half the book figure: the 172's book is 1,335 ft
+with 575 ft of roll (43%), and the geometric credit alone would ask 116 m to
+stop in 175; a jet never reaches the floor (737: 1,343 against 817). With
+no declared figure the need stays the Baron's 900 m whole: that is a
+measured rollout plus margin, with no air in it to credit. At LFBD the need
+at 7.9 ft is 1,389 m and 1,622 m commits. The SF50 test's "no room" case
+moved from 400 m to 300 m at 20 ft (it now asks 350 m). The float's own
+judgement above the band (`overflight_allowance_nm`) is unchanged: it
+already subtracts the run to the band, and the low end is what the commit
+owns.
+
+**No radio call for a balk that lands** (`go_around_call_due`,
+`BalkWatch`): the latch and the intercom's "Going around" still act on the
+balk tick (the power is coming and the pilot must know why), but the tower
+call, and the `owe_final_report` it carries, wait until the go-around is
+real. At or above `GO_AROUND_CALL_AGL_FT` (200 ft, twice what a 737 loses
+spooling from idle at the path's sink) it goes at once; below, once the
+radio is `GO_AROUND_RISE_FT` (10 ft) above its lowest since the balk with
+the VSI (one tick old) positive, or the radio's rise alone when the VSI
+could not be read. A balk whose wheels touched calls only if it then climbs
+through 200 ft (a touch that really left); one the rollout takes never
+calls, keeps the clearance, blackboxes `balk_landed` (`why`, `balk_radio`,
+`radio`, `gs`, `remaining_m`, `called`) and, if the intercom said "going
+around", corrects it: "Correction, we're down. Landing, not going around."
+The `going_around` event's `radio` and `why` are now the BALK's (the
+debrief's "GO-AROUND at N ft radio: why"), with `called_radio`, `low_ft`
+and `touched` added; the debrief prints `balk_landed`. The first LFBD
+approach's `off_centreline_low` at 96 ft still calls as soon as it climbs.
+Tests: `a_flare_is_credited_the_air_it_has_already_flown`,
+`a_low_balk_is_called_on_the_radio_only_once_it_climbs`. Offline only.

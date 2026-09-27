@@ -660,10 +660,73 @@ pub fn wheels_hold_the_landing(
     )
 }
 
+/// A balked landing called at or above this radio height is a go-around the
+/// moment it is called: from here no spool-up ends on the runway (a 737's
+/// idle-to-go-around spool, 6 to 8 s at the path's 800 fpm, loses about 100
+/// ft), so the tower hears it at once. Below it the call waits for a climb.
+const GO_AROUND_CALL_AGL_FT: f64 = 200.0;
+/// The climb that makes a low balk real: the radio this far above its
+/// lowest since the balk, with the VSI (one tick old) positive.
+const GO_AROUND_RISE_FT: f64 = 10.0;
+
+/// A balk being flown, watched until it is a go-around or a landing: the
+/// balk's own gate and height, the lowest radio since, and whether the
+/// wheels have touched.
+#[derive(Debug, Clone, Copy)]
+struct BalkWatch {
+    why: Option<&'static str>,
+    balk_radio_ft: f64,
+    low_ft: f64,
+    touched: bool,
+}
+
+impl BalkWatch {
+    fn new(why: Option<&'static str>, radio_ft: f64) -> Self {
+        Self {
+            why,
+            balk_radio_ft: radio_ft,
+            low_ft: radio_ft,
+            touched: false,
+        }
+    }
+
+    fn note(&mut self, radio_ft: f64, on_ground: bool) {
+        if radio_ft.is_finite() {
+            self.low_ft = self.low_ft.min(radio_ft);
+        }
+        self.touched |= on_ground;
+    }
+}
+
 /// The "going around" radio call goes out once per balk that was actually
-/// flown, and never with the wheels on the runway.
-fn go_around_call_due(missed: bool, said: bool, on_ground: bool) -> bool {
-    missed && !said && !on_ground
+/// FLOWN as a go-around, and never with the wheels on the runway. A balk
+/// called low may still land: LFBD 11 (2026-09-27) the 737 balked
+/// `overflew_the_runway` at 7.9 ft radio, the call went out on that tick,
+/// the tower answered "roger, go around" and dropped the landing clearance,
+/// and the wheels touched 1.3 s later with the engines still spooling; the
+/// crew had called a go-around and then landed uncleared. So a low balk is
+/// called once it CLIMBS (`GO_AROUND_RISE_FT` above its lowest radio, the
+/// VSI positive when it could be read), and a balk whose wheels touched
+/// only once it is clear of [`GO_AROUND_CALL_AGL_FT`] (a touch that then
+/// really left); one that rolls out never calls. A balk at or above that
+/// height calls at once; the first LFBD approach's `off_centreline_low` at
+/// 96 ft calls as soon as it climbs. Pure.
+fn go_around_call_due(
+    missed: bool,
+    said: bool,
+    on_ground: bool,
+    watch: Option<&BalkWatch>,
+    radio_ft: f64,
+    vvi_fpm: Option<f64>,
+) -> bool {
+    if !missed || said || on_ground {
+        return false;
+    }
+    let Some(w) = watch else { return true };
+    if radio_ft >= GO_AROUND_CALL_AGL_FT {
+        return true;
+    }
+    !w.touched && radio_ft - w.low_ft >= GO_AROUND_RISE_FT && vvi_fpm.is_none_or(|v| v > 0.0)
 }
 
 /// Cancel an active autoland; returns whether one was flying.
@@ -960,6 +1023,11 @@ pub fn run_autoland_scoped(
             // needed (an HTTP read, so not on every tick).
             let mut said_going_around = false;
             let mut going_around_callsign: Option<Option<String>> = None;
+            // The balk being flown until it climbs (then the call) or the
+            // wheels take it (then no call: see [`go_around_call_due`]), and
+            // whether the intercom said "going around" for it.
+            let mut balk_watch: Option<BalkWatch> = None;
+            let mut spoke_going_around = false;
             // When the current missed approach started, for the runaway guard.
             let mut missed_since: Option<std::time::Instant> = None;
             let mut gear_down = false;
@@ -1193,6 +1261,29 @@ pub fn run_autoland_scoped(
                         // Wheels on this runway: the fact the vacate needs.
                         *LANDED_RUNWAY.lock().unwrap_or_else(|e| e.into_inner()) =
                             Some(rwy.id.clone());
+                        // A balk the wheels took is a LANDING (LFBD 11,
+                        // 2026-09-27): the call waited for a climb that
+                        // never came, so the tower still holds our landing
+                        // clearance; the intercom's "going around" is
+                        // corrected.
+                        if go_around.active() {
+                            let along_m = along_track_nm(lat, lon, &rwy) * M_PER_NM;
+                            crate::blackbox::record(
+                                "autoland",
+                                serde_json::json!({"event": "balk_landed",
+                                    "why": balk_watch.and_then(|w| w.why),
+                                    "balk_radio": balk_watch.map(|w| w.balk_radio_ft),
+                                    "radio": radio_ft, "gs": gs_kts,
+                                    "remaining_m": (rwy.length_m + along_m).max(0.0),
+                                    "called": said_going_around}),
+                            );
+                            if spoke_going_around {
+                                announce(
+                                    "Correction, we're down. Landing, not going around.".into(),
+                                    Priority::Caution,
+                                );
+                            }
+                        }
                     }
                     let xtk_nm = cross_track_nm(lat, lon, &rwy);
                     let xtk_m = xtk_nm * M_PER_NM;
@@ -1623,8 +1714,26 @@ pub fn run_autoland_scoped(
                 // and it works the traffic underneath us. Luton 2026-07-28: the
                 // autoland balked, climbed away and repositioned over the field
                 // for four minutes, and nothing was ever said — the FSM sat in
-                // ClearedToLand throughout. Announced ONCE, on the arming tick.
-                if go_around_call_due(missed.is_some(), said_going_around, on_ground > 0.5) {
+                // ClearedToLand throughout. Announced ONCE, once the go-around
+                // is real: a balk low in the flare can still land (LFBD 11,
+                // 2026-09-27), and then it is a landing, cleared, and nothing
+                // goes out (see [`go_around_call_due`], `balk_landed`).
+                if missed.is_none() {
+                    balk_watch = None;
+                } else if balk_watch.is_none() {
+                    balk_watch = Some(BalkWatch::new(raw.balk, radio_ft));
+                }
+                if let Some(w) = balk_watch.as_mut() {
+                    w.note(radio_ft, on_ground > 0.5);
+                }
+                if go_around_call_due(
+                    missed.is_some(),
+                    said_going_around,
+                    on_ground > 0.5,
+                    balk_watch.as_ref(),
+                    radio_ft,
+                    prev_vvi.map(|(v, _)| v),
+                ) {
                     said_going_around = true;
                     // The go-around VOIDS the landing clearance, so this
                     // approach owes the tower a fresh final report before it
@@ -1635,10 +1744,16 @@ pub fn run_autoland_scoped(
                     }
                     let cs = going_around_callsign.clone().flatten();
                     crate::circuit::transmit(crate::circuit::radio_call(&cs, "going around"));
+                    // `radio` and `why` are the BALK's (the debrief's
+                    // "GO-AROUND at N ft radio: why"); `called_radio` is
+                    // where the climb made it real.
+                    let w = balk_watch.unwrap_or(BalkWatch::new(raw.balk, radio_ft));
                     crate::blackbox::record(
                         "autoland",
-                        serde_json::json!({"event": "going_around", "radio": radio_ft,
-                                           "why": raw.balk, "xtk_m": xtk_now * M_PER_NM,
+                        serde_json::json!({"event": "going_around", "radio": w.balk_radio_ft,
+                                           "why": w.why, "called_radio": radio_ft,
+                                           "low_ft": w.low_ft, "touched": w.touched,
+                                           "xtk_m": xtk_now * M_PER_NM,
                                            "dist": raw.dist_nm, "trim": track_trim.value()}),
                     );
                 }
@@ -1672,6 +1787,7 @@ pub fn run_autoland_scoped(
                 // Cleared to try again: the next balked landing is a new call.
                 if missed.is_none() {
                     said_going_around = false;
+                    spoke_going_around = false;
                     missed_since = None;
                 } else if missed_since.is_none() {
                     missed_since = Some(std::time::Instant::now());
@@ -2495,6 +2611,10 @@ pub fn run_autoland_scoped(
                             if matches!(prev, Some(ApproachPhase::Final | ApproachPhase::Flare)) =>
                         {
                             if ga {
+                                // Said at once: the power is coming and the
+                                // pilot must know why. Corrected if the
+                                // wheels take it (`balk_landed`).
+                                spoke_going_around = true;
                                 "Going around. Full power, climbing straight ahead."
                             } else {
                                 "Overflew the runway. Going around, climbing to re-intercept."
@@ -4540,6 +4660,52 @@ pub fn hold_flare(
 /// fpm. A pilot holds a balloon, adds a little power and lets it settle.
 pub const BALLOON_COMMIT_FT: f64 = 100.0;
 
+/// The height a recited landing distance is measured from: the book figure
+/// (POM, AFM) runs from 50 ft over the threshold, on a stabilised 3 degree
+/// approach, to a stop.
+const LANDING_SCREEN_FT: f64 = 50.0;
+/// The part of that figure a 3 degree path covers from the screen height to
+/// the ground: 50 ft x 0.3048 / tan 3 degrees, about 291 m. The book's
+/// definition, so the 3 degree constant, not this approach's path.
+const SCREEN_AIR_M: f64 = LANDING_SCREEN_FT * M_PER_FT / GLIDEPATH_TAN;
+
+/// The pavement a flare at `radio_ft` still needs to land and stop, metres.
+///
+/// A recited landing distance starts at 50 ft over the threshold; an
+/// aircraft flaring at 8 ft has already flown the part of it between the
+/// two, and asking the pavement for the whole figure counts that part twice.
+/// LFBD 11, 2026-09-27 (the stock 737, POM 5,360 ft = 1,634 m, 2,418 m of
+/// runway): the flare floated to 7.9 ft radio at 145 kt over the ground,
+/// 796 m past the threshold with 1,622 m ahead and sinking 184 fpm, and the
+/// overflight balk stood because 1,622 < 1,634, by 12 m. "Going around",
+/// full power for a second, the wheels touched 1.3 s later and it stopped
+/// with about 700 m to spare. The air flown is taken on the book's 3 degree
+/// path from 50 ft down to this height, in proportion (a flare at 7.9 ft is
+/// credited 245 m of the 291, a balloon at or above 50 ft nothing): the
+/// book's own air segment is longer than that geometry, since it includes
+/// the flare's float, so what is left asked for is the ground roll plus a
+/// float, never less.
+///
+/// Floored at half the declared figure: a light single's ground roll is a
+/// small part of its over-50-ft figure (the 172's book: 1,335 ft total,
+/// 575 ft of roll, 43%), and the geometric 291 m would leave it asking for
+/// 116 m to stop in 175. Half covers it; a jet's need never reaches the
+/// floor (the 737's 1,634 less 291 is 1,343, against 817).
+///
+/// With NO declared figure the need stays [`FLOAT_MIN_REMAINING_M`] whole:
+/// that 900 m is the Baron's measured ~550 m ROLLOUT plus a margin, a
+/// ground figure already, with no air segment in it to credit. Pure.
+pub fn flare_pavement_need_m(radio_ft: f64, landing_m: Option<f64>) -> f64 {
+    match landing_m.filter(|v| v.is_finite() && *v > 0.0) {
+        Some(book_m) => {
+            let flown_ft = (LANDING_SCREEN_FT - radio_ft.max(0.0)).clamp(0.0, LANDING_SCREEN_FT);
+            let air_flown_m = SCREEN_AIR_M * flown_ft / LANDING_SCREEN_FT;
+            (book_m - air_flown_m).max(0.5 * book_m)
+        }
+        None => FLOAT_MIN_REMAINING_M,
+    }
+}
+
 /// COMMITTED, ONCE FLARING LOW. A flare below the roundout band is at idle,
 /// slow and nose up, and the go-around the overflight balk hands it cannot
 /// climb: the vertical law climbs only with speed in hand, a flare has none,
@@ -4552,7 +4718,9 @@ pub const BALLOON_COMMIT_FT: f64 = 100.0;
 /// (the 900 m floor is for the float's judgement above, not for a landing
 /// already in its last seconds). A BALLOON is committed the same way up to
 /// [`BALLOON_COMMIT_FT`] (EDLP 24, the crash). No room to stop is still a
-/// go-around; every other balk stands. Pure.
+/// go-around; every other balk stands. The room is
+/// [`flare_pavement_need_m`]: the recited distance less the air segment
+/// already flown (LFBD 11). Pure.
 pub fn commit_flare(
     g: Guidance,
     was_flaring: bool,
@@ -4569,10 +4737,7 @@ pub fn commit_flare(
         Some("balloon") if was_flaring => BALLOON_COMMIT_FT,
         _ => return g,
     };
-    let need_m = landing_m
-        .filter(|v| v.is_finite() && *v > 0.0)
-        .unwrap_or(FLOAT_MIN_REMAINING_M);
-    if radio_ft > ceiling_ft || remaining_m < need_m {
+    if radio_ft > ceiling_ft || remaining_m < flare_pavement_need_m(radio_ft, landing_m) {
         return g;
     }
     let nominal_vs = -(gs_kts / 60.0) * gp_ft_per_nm();
@@ -5228,8 +5393,9 @@ mod tests {
         // Above the band: the float's own geometry judges it.
         let (_, band) = arrest_gates_ft(25.0, 77.0);
         assert_eq!(commit_flare(g, true, band + 5.0, 77.0, 25.0, 900.0, sf50_m, 265.0).balk, g.balk);
-        // No room to stop: still a go-around.
-        assert_eq!(commit_flare(g, true, 20.0, 77.0, 25.0, 400.0, sf50_m, 265.0).balk, g.balk);
+        // No room to stop: still a go-around. At 20 ft the SF50 has flown
+        // 175 m of its book's 525, so it asks 350 m (400 m now commits).
+        assert_eq!(commit_flare(g, true, 20.0, 77.0, 25.0, 300.0, sf50_m, 265.0).balk, g.balk);
         // No declared distance: the 900 m floor.
         assert_eq!(commit_flare(g, true, 20.0, 77.0, 25.0, 850.0, None, 265.0).balk, g.balk);
         // A balloon (EDLP 24: 52 ft, 2,180 m of runway, 1,900 ahead) is
@@ -5259,6 +5425,49 @@ mod tests {
             ..g
         };
         assert_eq!(commit_flare(off, true, 20.0, 77.0, 25.0, 900.0, sf50_m, 265.0).balk, off.balk);
+    }
+
+    /// LFBD 11, 2026-09-27, the stock 737 (POM 5,360 ft): the flare floated
+    /// to 7.9 ft radio at 145 kt over the ground, 796 m past the threshold
+    /// with 1,622 m of the 2,418 ahead, and the overflight balk stood by
+    /// 12 m against the whole book figure. It landed anyway, 1.3 s later,
+    /// and stopped with about 700 m to spare.
+    #[test]
+    fn a_flare_is_credited_the_air_it_has_already_flown() {
+        let b738_m = Some(5360.0 * 0.3048);
+        let g = Guidance {
+            target_heading_deg: 293.0,
+            target_vs_fpm: 1500.0,
+            target_ias_kts: 150.0,
+            dist_nm: 0.43,
+            glidepath_alt_ft: 0.0,
+            phase: ApproachPhase::Intercept,
+            balk: Some("overflew_the_runway"),
+            arresting: false,
+        };
+        let c = commit_flare(g, true, 7.9, 145.0, 25.0, 1622.0, b738_m, 110.0);
+        assert_eq!((c.phase, c.balk), (ApproachPhase::Flare, None), "the recorded landing");
+        assert_eq!(c.target_heading_deg, 110.0, "the runway's heading");
+        // The need at 7.9 ft: 1,634 less 42.1 ft of 3 degree path (245 m).
+        let need = flare_pavement_need_m(7.9, b738_m);
+        assert!((need - 1389.0).abs() < 2.0, "{need}");
+        // The whole 291 m only at the ground, none at or above 50 ft.
+        assert!((SCREEN_AIR_M - 290.8).abs() < 0.5, "{SCREEN_AIR_M}");
+        let at_wheels = flare_pavement_need_m(0.0, b738_m);
+        assert!((at_wheels - (5360.0 * 0.3048 - SCREEN_AIR_M)).abs() < 1e-9);
+        assert_eq!(flare_pavement_need_m(50.0, b738_m), 5360.0 * 0.3048);
+        assert_eq!(flare_pavement_need_m(80.0, b738_m), 5360.0 * 0.3048);
+        // Genuinely too little runway still balks: 1,300 m at 7.9 ft.
+        assert_eq!(
+            commit_flare(g, true, 7.9, 145.0, 25.0, 1300.0, b738_m, 110.0).balk,
+            Some("overflew_the_runway")
+        );
+        // A light single keeps half its book: the 172's 407 m asks 203 at
+        // the ground, never the geometric 116.
+        let c172_m = 1335.0 * 0.3048;
+        assert_eq!(flare_pavement_need_m(0.0, Some(c172_m)), 0.5 * c172_m);
+        // No declared figure: the Baron's 900 m, a rollout already, whole.
+        assert_eq!(flare_pavement_need_m(5.0, None), FLOAT_MIN_REMAINING_M);
     }
 
     #[test]
@@ -5875,10 +6084,57 @@ mod tests {
         assert_eq!(wheels_hold_the_landing(flare, true, true, 117.3).1, None);
 
         // (4) No "going around" call with the wheels on the runway.
-        assert!(!go_around_call_due(true, false, true));
-        assert!(go_around_call_due(true, false, false));
-        assert!(!go_around_call_due(true, true, false), "once");
-        assert!(!go_around_call_due(false, false, false));
+        assert!(!go_around_call_due(true, false, true, None, 0.3, None));
+        assert!(go_around_call_due(true, false, false, None, 300.0, None));
+        assert!(!go_around_call_due(true, true, false, None, 300.0, None), "once");
+        assert!(!go_around_call_due(false, false, false, None, 300.0, None));
+    }
+
+    /// LFBD 11, 2026-09-27: the 737 balked `overflew_the_runway` at 7.9 ft
+    /// radio sinking 184 fpm, "going around" went out on that tick and the
+    /// tower dropped the landing clearance, and the wheels touched 1.3 s
+    /// later. The call now waits for the climb; a balk the wheels take never
+    /// calls. The first approach's `off_centreline_low` at 96 ft still calls
+    /// as soon as it climbs.
+    #[test]
+    fn a_low_balk_is_called_on_the_radio_only_once_it_climbs() {
+        let due = |w: &BalkWatch, on_ground, radio, vvi| {
+            go_around_call_due(true, false, on_ground, Some(w), radio, vvi)
+        };
+        // The recorded balk: 7.9 ft, sinking, spooling.
+        let mut w = BalkWatch::new(Some("overflew_the_runway"), 7.9);
+        assert!(!due(&w, false, 7.9, Some(-184.0)), "not on the balk tick");
+        w.note(4.0, false);
+        assert!(!due(&w, false, 4.0, Some(-150.0)));
+        // The wheels take it: never called, whatever follows under 200 ft.
+        w.note(0.4, true);
+        assert!(!due(&w, true, 0.4, Some(-60.0)), "on the runway");
+        w.note(15.0, false);
+        assert!(!due(&w, false, 15.0, Some(300.0)), "a bounce is not a go-around");
+        // A touch that really leaves is called once clear of 200 ft.
+        w.note(GO_AROUND_CALL_AGL_FT, false);
+        assert!(due(&w, false, GO_AROUND_CALL_AGL_FT, Some(900.0)));
+
+        // The same balk flown away without touching: called on the climb.
+        let mut w = BalkWatch::new(Some("overflew_the_runway"), 7.9);
+        w.note(3.0, false);
+        assert!(!due(&w, false, 3.0 + GO_AROUND_RISE_FT - 1.0, Some(200.0)), "not yet risen");
+        w.note(3.0 + GO_AROUND_RISE_FT, false);
+        assert!(due(&w, false, 3.0 + GO_AROUND_RISE_FT, Some(400.0)));
+        assert!(!due(&w, false, 3.0 + GO_AROUND_RISE_FT, Some(-50.0)), "the VSI says sinking");
+        assert!(due(&w, false, 3.0 + GO_AROUND_RISE_FT, None), "no VSI: the radio's rise stands");
+        assert!(!go_around_call_due(true, true, false, Some(&w), 40.0, Some(400.0)), "once");
+
+        // The first LFBD approach: off_centreline_low at 96 ft, settling to
+        // 88 before the power bites, called as soon as it climbs.
+        let mut w = BalkWatch::new(Some("off_centreline_low"), 96.0);
+        w.note(88.0, false);
+        assert!(!due(&w, false, 88.0, Some(-300.0)));
+        w.note(99.0, false);
+        assert!(due(&w, false, 99.0, Some(500.0)));
+        // A balk above the call height is called on its own tick.
+        let w = BalkWatch::new(Some("unstabilised_at_gate"), 1000.0);
+        assert!(due(&w, false, 1000.0, Some(-700.0)));
     }
 
     /// The rollout brakes by wanted deceleration, not a fixed clamp. A flat
