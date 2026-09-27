@@ -3265,6 +3265,11 @@ mod tests {
                 "DRAG_MIN_DESCENT_FPM",
                 "a gate on the COMMANDED rate, which is already the airframe's descent_fpm",
             ),
+            (
+                "procedure",
+                "DRAG_KEEP_BELOW_FPM",
+                "a gate on the COMMANDED rate: only a commanded climb stows a brake already out",
+            ),
         ];
 
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
