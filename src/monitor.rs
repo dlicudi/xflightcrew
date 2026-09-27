@@ -223,6 +223,10 @@ pub struct Snapshot {
     /// circuit or autoland): the altimeter is then the crew's knob to set,
     /// not the pilot's to be advised about.
     pub automation_flying: bool,
+    /// The tanks (fuel, pump switch, lateral position), read only on an
+    /// airframe that declares `fuel_tank_pumps_off_when_empty`. `None` = not
+    /// declared or a read failed this tick: no measurement, no callout.
+    pub fuel_tanks: Option<crate::tools::fuel_pumps::Tanks>,
     pub phase: Phase,
 }
 
@@ -540,6 +544,7 @@ impl Snapshot {
             baro_inhg,
             qnh_pa,
             automation_flying,
+            fuel_tanks: None, // filled in by the poll loop (per airframe)
             phase: Phase::Ground,
         };
         // The coarse phase is the flight model's, set by the monitor tick
@@ -1735,6 +1740,63 @@ impl Check for AltimeterSetting {
     }
 }
 
+/// A centre tank empty with its pumps still on and an engine running
+/// (`tools::fuel_pumps::pumps_to_switch_off`, the one decision). The stock
+/// 737's scripted start switches the CTR pumps on over an empty centre, and
+/// the load sheet fills the wings first, so a short sector flew with both
+/// CTR LOW PRESSURE lights lit for the whole flight (2026-09-27). The
+/// altimeter's shape: with an automation flying the crew switches them off
+/// (`fix_write`, through `fuel_pumps::switch_pumps`, read back); with the
+/// pilot flying it is the pilot's fuel panel, said once per episode.
+pub(crate) const CENTRE_TANK_DRY: &str = "centre_tank_dry";
+
+struct CentreTankDry {
+    declared: Vec<usize>,
+}
+
+impl CentreTankDry {
+    fn tanks(&self, s: &Snapshot) -> Vec<usize> {
+        crate::tools::fuel_pumps::pumps_to_switch_off(
+            &self.declared,
+            s.fuel_tanks.as_ref(),
+            s.engine_running,
+        )
+    }
+}
+
+impl Check for CentreTankDry {
+    fn id(&self) -> &'static str {
+        CENTRE_TANK_DRY
+    }
+    fn severity(&self) -> Severity {
+        Severity::Advisory
+    }
+    fn eval(&self, s: &Snapshot) -> Option<String> {
+        if self.tanks(s).is_empty() {
+            return None;
+        }
+        Some(if s.automation_flying {
+            "Centre tank's empty, centre pumps off.".to_string()
+        } else {
+            "Centre tank's empty, centre pumps are still on.".to_string()
+        })
+    }
+    /// A few seconds, so a pump the pilot is reaching for, or an engine just
+    /// lit, is not a callout.
+    fn min_duration(&self) -> Duration {
+        Duration::from_secs(CENTRE_DRY_SUSTAIN_S)
+    }
+    fn fix_write(&self, s: &Snapshot) -> Option<(&'static str, f64)> {
+        if !s.automation_flying || self.tanks(s).is_empty() {
+            return None;
+        }
+        Some((crate::tools::fuel_pumps::TANK_PUMP_ON, 0.0))
+    }
+}
+
+/// Seconds an empty centre with its pumps on must hold before it is said.
+const CENTRE_DRY_SUSTAIN_S: u64 = 5;
+
 /// Cruising further below the optimum altitude than a step is worth saying.
 ///
 /// The altitude a jet flies best at rises as fuel burns off — roughly a level
@@ -1832,6 +1894,42 @@ impl Check for StepClimb {
     }
 }
 
+/// The tank picture for the centre-pump check: fuel and pumps every tick
+/// (batched), the lateral positions once per airframe. All or nothing; a
+/// declared tank the geometry says is a main tank is logged, never used.
+async fn read_fuel_tanks(
+    xp: &XPlaneClient,
+    declared: &[usize],
+    lateral: &mut Option<Vec<f64>>,
+) -> Option<crate::tools::fuel_pumps::Tanks> {
+    use crate::tools::fuel_pumps as fp;
+    if lateral.is_none() {
+        let x = xp
+            .get_float_array(fp::TANK_LATERAL_M)
+            .await
+            .ok()
+            .filter(|v| !v.is_empty())?;
+        let bad = fp::rejected(declared, &x);
+        if !bad.is_empty() {
+            tracing::warn!(?bad, "fuel pumps: declared tanks are not centre tanks; ignored");
+            crate::blackbox::record(
+                "fuel_pumps",
+                serde_json::json!({"event": "rejected", "tanks": bad, "lateral_m": &x}),
+            );
+        }
+        *lateral = Some(x);
+    }
+    let (kg, pumps) = tokio::join!(
+        xp.get_float_array(fp::TANK_FUEL_KG),
+        xp.get_float_array(fp::TANK_PUMP_ON),
+    );
+    Some(fp::Tanks {
+        kg: kg.ok().filter(|v| !v.is_empty())?,
+        pumps: pumps.ok().filter(|v| !v.is_empty())?,
+        lateral_m: lateral.clone()?,
+    })
+}
+
 fn build_checks(profile: &AircraftProfile) -> Vec<Box<dyn Check>> {
     let mut checks: Vec<Box<dyn Check>> = vec![
         // Universal: every airframe can roll with the brake set.
@@ -1849,6 +1947,12 @@ fn build_checks(profile: &AircraftProfile) -> Vec<Box<dyn Check>> {
             transition_altitude_ft: profile.transition_altitude_ft,
         }),
     ];
+    // Centre tank pumps: only where the profile declares which tanks.
+    if !profile.fuel_tank_pumps_off_when_empty.is_empty() {
+        checks.push(Box::new(CentreTankDry {
+            declared: profile.fuel_tank_pumps_off_when_empty.clone(),
+        }));
+    }
     // Step climb: only on an airframe whose profile declares an optimum
     // altitude, which is jets. A piston goes as high as it can and stays.
     if let Some(r) = profile.reference.clone() {
@@ -2316,6 +2420,10 @@ pub async fn run(
     let mut gen = live.generation();
     let mut checks = build_checks(&live.get());
     let mut drefs = advisor_drefs(&live.get());
+    // The tanks the centre-pump check reads, and their lateral positions
+    // (static per airframe, read once per swap).
+    let mut pump_tanks = live.get().fuel_tank_pumps_off_when_empty.clone();
+    let mut tank_lateral: Option<Vec<f64>> = None;
     let mut avionics_readback = avionics_readback_dref(&live.get());
     // The cockpit duties the copilot performs unasked, per airframe: interior
     // lights flagged `auto_at_night`, and a GPS welcome page to acknowledge.
@@ -2462,6 +2570,8 @@ pub async fn run(
             gen = live.generation();
             checks = build_checks(&live.get());
             drefs = advisor_drefs(&live.get());
+            pump_tanks = live.get().fuel_tank_pumps_off_when_empty.clone();
+            tank_lateral = None;
             avionics_readback = avionics_readback_dref(&live.get());
             (night_lights, gps_ack) = cockpit_duties(&live.get());
             // A new airframe is a new cockpit: whatever we set on the last one
@@ -2525,6 +2635,9 @@ pub async fn run(
             continue;
         }
         if let Some(mut snap) = Snapshot::read(&xp, &drefs).await {
+            if !pump_tanks.is_empty() {
+                snap.fuel_tanks = read_fuel_tanks(&xp, &pump_tanks, &mut tank_lateral).await;
+            }
             let now = Instant::now();
             // The flight model FIRST, every tick whatever is quiet: the
             // consumers below read its phase, memory and this tick's events
@@ -3942,6 +4055,28 @@ pub async fn run(
                             );
                             speed_spoke |= speed && spoke;
                             cabin_spoke |= cabin && spoke;
+                            // The pilot's fuel panel: said, never written.
+                            if spoke
+                                && check.id() == CENTRE_TANK_DRY
+                                && check.fix_write(&snap).is_none()
+                            {
+                                if let Some(t) = snap.fuel_tanks.as_ref() {
+                                    for i in crate::tools::fuel_pumps::pumps_to_switch_off(
+                                        &pump_tanks,
+                                        Some(t),
+                                        snap.engine_running,
+                                    ) {
+                                        crate::blackbox::record(
+                                            "fuel_pumps",
+                                            serde_json::json!({
+                                                "event": "advised", "source": "monitor",
+                                                "tank": i, "kg": t.kg.get(i),
+                                                "before": t.pumps.get(i),
+                                            }),
+                                        );
+                                    }
+                                }
+                            }
                             // On the rising edge, the copilot ACTS on SOP rows that
                             // carry a fix (strobes, landing lights) instead of only
                             // advising — crew business, so it's already behind the
@@ -4001,6 +4136,25 @@ pub async fn run(
                                             if !sync.took() {
                                                 voice.alert(Priority::Warning, sync.line());
                                             }
+                                        }
+                                    } else if dref == crate::tools::fuel_pumps::TANK_PUMP_ON {
+                                        // An indexed switch per tank, through
+                                        // its one writer, read back: the tanks
+                                        // are the decision's own.
+                                        let tanks = crate::tools::fuel_pumps::pumps_to_switch_off(
+                                            &pump_tanks,
+                                            snap.fuel_tanks.as_ref(),
+                                            snap.engine_running,
+                                        );
+                                        let done = crate::tools::fuel_pumps::switch_pumps(
+                                            &xp,
+                                            &tanks,
+                                            value > 0.5,
+                                        )
+                                        .await;
+                                        crate::tools::fuel_pumps::record("switched", "monitor", &done);
+                                        if let Some(line) = crate::tools::fuel_pumps::failed_line(&done) {
+                                            voice.alert(Priority::Caution, line);
                                         }
                                     } else {
                                         let _ = xp.set_float(dref, value).await;
@@ -4600,6 +4754,7 @@ mod tests {
             baro_inhg: None,
             qnh_pa: None,
             automation_flying: false,
+            fuel_tanks: None,
             phase: Phase::Ground,
         }
     }
@@ -4614,6 +4769,93 @@ mod tests {
         s.qnh_pa = Some(101_946.0);
         s.automation_flying = automation_flying;
         s
+    }
+
+    /// The stock 737 at the stand as probed live on 2026-09-27: engines
+    /// running, centre (tank 1) empty, every pump switch on.
+    fn b738_dry_centre(automation_flying: bool) -> Snapshot {
+        let mut s = snap(true, true);
+        s.on_ground = true;
+        s.automation_flying = automation_flying;
+        s.fuel_tanks = Some(crate::tools::fuel_pumps::Tanks {
+            kg: vec![2916.8, 0.0, 2918.1],
+            pumps: vec![1.0, 1.0, 1.0],
+            lateral_m: vec![-7.01, 0.0, 7.01],
+        });
+        s
+    }
+
+    #[test]
+    fn an_automation_flying_switches_the_dry_centre_pumps_off() {
+        let c = CentreTankDry { declared: vec![1] };
+        let s = b738_dry_centre(true);
+        assert_eq!(c.eval(&s).as_deref(), Some("Centre tank's empty, centre pumps off."));
+        assert_eq!(
+            c.fix_write(&s),
+            Some((crate::tools::fuel_pumps::TANK_PUMP_ON, 0.0))
+        );
+        assert!(c.min_duration() >= Duration::from_secs(3));
+    }
+
+    #[test]
+    fn a_pilot_flying_is_advised_and_nothing_is_written() {
+        let c = CentreTankDry { declared: vec![1] };
+        let s = b738_dry_centre(false);
+        assert_eq!(
+            c.eval(&s).as_deref(),
+            Some("Centre tank's empty, centre pumps are still on.")
+        );
+        assert!(c.fix_write(&s).is_none());
+    }
+
+    #[test]
+    fn the_centre_check_is_silent_on_a_failed_read_or_with_fuel_aboard() {
+        let c = CentreTankDry { declared: vec![1] };
+        let mut s = b738_dry_centre(true);
+        s.fuel_tanks = None;
+        assert!(c.eval(&s).is_none() && c.fix_write(&s).is_none());
+        let mut s = b738_dry_centre(true);
+        s.fuel_tanks.as_mut().unwrap().kg[1] = 4_000.0;
+        assert!(c.eval(&s).is_none() && c.fix_write(&s).is_none());
+        let mut s = b738_dry_centre(true);
+        s.engine_running = false;
+        assert!(c.eval(&s).is_none());
+    }
+
+    #[test]
+    fn only_a_profile_that_declares_tanks_gets_the_centre_check() {
+        let b738 = crate::aircraft::load("boeing_737_800").expect("737 profile");
+        assert_eq!(b738.fuel_tank_pumps_off_when_empty, vec![1]);
+        assert!(build_checks(&b738).iter().any(|c| c.id() == CENTRE_TANK_DRY));
+        let c172 = crate::aircraft::load("cessna_172sp").expect("172 profile");
+        assert!(!build_checks(&c172).iter().any(|c| c.id() == CENTRE_TANK_DRY));
+        // The swap probe covers the names the declaration relies on.
+        let names = crate::aircraft::profile_references(&b738);
+        for n in [
+            crate::tools::fuel_pumps::TANK_PUMP_ON,
+            crate::tools::fuel_pumps::TANK_FUEL_KG,
+            crate::tools::fuel_pumps::TANK_LATERAL_M,
+        ] {
+            assert!(names.iter().any(|x| x == n), "{n} not probed");
+        }
+    }
+
+    /// The monitor's fix end to end on the recorded numbers: the decision
+    /// names tank 1, the one writer switches element 1 to 0 and reads it back.
+    #[tokio::test]
+    async fn the_fix_switches_element_one_off_and_reads_it_back() {
+        use crate::tools::fuel_pumps as fp;
+        let s = b738_dry_centre(true);
+        let tanks = fp::pumps_to_switch_off(&[1], s.fuel_tanks.as_ref(), s.engine_running);
+        let xp = sim::xplane::FakeXPlane::new();
+        xp.set_read_array(fp::TANK_FUEL_KG, &[2916.8, 0.0, 2918.1]);
+        xp.set_read_array(fp::TANK_PUMP_ON, &[1.0, 1.0, 1.0]);
+        xp.apply_array_writes(fp::TANK_PUMP_ON);
+        let done = fp::switch_pumps(&xp, &tanks, false).await;
+        assert_eq!(xp.index_writes(fp::TANK_PUMP_ON), vec![(1, 0.0)]);
+        assert_eq!(done.len(), 1);
+        assert_eq!((done[0].tank, done[0].kg, done[0].before, done[0].after), (1, Some(0.0), Some(1.0), Some(0.0)));
+        assert!(fp::all_took(&done) && fp::failed_line(&done).is_none());
     }
 
     /// The 737 mid-Atlantic on EIDW-BIKF (2026-09-20): FL340, 62.9 tonnes,

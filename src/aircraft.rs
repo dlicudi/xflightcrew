@@ -540,6 +540,16 @@ pub struct AircraftProfile {
     /// false.
     #[serde(default)]
     pub fuel_pump_commands: Option<PumpCommands>,
+    /// Tank indices of the stock `sim/cockpit2/fuel/fuel_tank_pump_on` whose
+    /// pumps come OFF when that tank is empty with an engine running (see
+    /// [`crate::tools::fuel_pumps`]): the 737's CTR pumps were left running
+    /// dry for a whole flight after the scripted start switched them on over
+    /// an empty centre (2026-09-27). Only a CENTRELINE tank with wing tanks
+    /// beside it is ever honoured (`acf_tank_X`); a main tank is never a
+    /// switch to tidy. Declare only where the add-on's scripts leave the
+    /// stock array as the cockpit switch. Empty (silent) = off.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fuel_tank_pumps_off_when_empty: Vec<usize>,
     /// Magneto/ignition selector (`set_magnetos`) — for the run-up mag check.
     #[serde(default)]
     pub magnetos: bool,
@@ -2650,6 +2660,19 @@ pub fn profile_references(p: &AircraftProfile) -> Vec<String> {
     if let Ok(v) = serde_yaml::to_value(p) {
         walk(&v, "", &mut out);
     }
+    // Fields that carry no name of their own, only indices into stock
+    // arrays the tool reads and writes: the names they rely on.
+    if !p.fuel_tank_pumps_off_when_empty.is_empty() {
+        for name in [
+            crate::datarefs::FUEL_TANK_PUMP_ON,
+            crate::datarefs::FUEL_PER_TANK_KG,
+            crate::datarefs::FUEL_TANK_LATERAL_M,
+        ] {
+            if !out.iter().any(|o| o == name) {
+                out.push(name.to_string());
+            }
+        }
+    }
     out
 }
 
@@ -4360,6 +4383,7 @@ fn cessna_172sp() -> AircraftProfile {
         flood_lights: true,
         fuel_pump: true,
         fuel_pump_commands: None,
+        fuel_tank_pumps_off_when_empty: Vec::new(),
         reverse_thrust: false,
         magnetos: true,
         carb_heat: true,
@@ -4719,6 +4743,7 @@ fn cirrus_sr22() -> AircraftProfile {
         // (not laminar/sr22/switch/boost_pump, which an earlier scaffold guessed).
         fuel_pump: true,
         fuel_pump_commands: None,
+        fuel_tank_pumps_off_when_empty: Vec::new(),
         reverse_thrust: false,
         // OFF / LEFT / RIGHT — no "both" (low-wing twin tanks, fed one at a
         // time). Selector commands verified against the rustdecks deck. The
