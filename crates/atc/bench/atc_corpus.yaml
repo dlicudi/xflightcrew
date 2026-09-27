@@ -237,12 +237,14 @@
 - {text: "with you passing one thousand five hundred", intent: unknown, readback: true}
 - {text: "Headace, do copy.", intent: unknown, readback: true}
 - {text: "roger, holding point alpha", intent: unknown, readback: true}
-# Clearance echoes parse as their intents but route_keyed silences any
-# transmission containing "cleared" (see the sortie test) — a pilot asking
-# says "request clearance", never "cleared".
-- {text: "cleared to land runway two seven, november one seven two", intent: request_landing, readback: true}
-- {text: "cleared for takeoff runway two seven", intent: request_takeoff, readback: true}
-- {text: "cleared touch and go, one seven two sierra papa", intent: request_touch_and_go, readback: true}
+# Clearance echoes are readbacks, never requests: a pilot asking says
+# "request clearance", never "cleared" (EGKK 26L, 2026-09-27: the crew's
+# landing readback was logged as RequestLanding in ClearedToLand).
+- {text: "cleared to land runway two seven, november one seven two", intent: unknown, readback: true}
+- {text: "cleared for takeoff runway two seven", intent: unknown, readback: true}
+- {text: "cleared touch and go, one seven two sierra papa", intent: unknown, readback: true}
+- {text: "whiskey alpha tango four two three six, cleared to land runway two six left", intent: unknown, readback: true}
+- {text: "whiskey alpha tango four two three six, cleared for takeoff runway three three", intent: unknown, readback: true}
 
 # --- Questions: crew talk, never transmissions --------------------------------
 - {text: "What runway shall I take off from?", intent: unknown}
@@ -389,8 +391,8 @@
 - {text: "behind the landing traffic, lining up runway two seven behind", intent: unknown, radio: false, readback: true}
 - {text: "holding position, november one seven two sierra papa", intent: unknown, radio: false, readback: true}
 - {text: "holding position", intent: unknown, radio: false, readback: true}
-- {text: "cleared for takeoff runway zero niner, november one seven two sierra papa", intent: request_takeoff, readback: true}
-- {text: "cleared to land runway zero niner, november one seven two sierra papa", intent: request_landing, readback: true}
+- {text: "cleared for takeoff runway zero niner, november one seven two sierra papa", intent: unknown, readback: true}
+- {text: "cleared to land runway zero niner, november one seven two sierra papa", intent: unknown, readback: true}
 # Confirm-questions are NOT readbacks — the gate answers them by repeating
 # the instruction, and the question guard keeps them off the state machine.
 - {text: "confirm cleared for takeoff?", intent: unknown, radio: false, readback: false}
@@ -434,7 +436,7 @@
 # and the takeoff clearance echo with whisper's "map" stuck on the front.
 - {text: "copy flying heading 270 degrees.", intent: unknown, radio: false, readback: true}
 - {text: "number 272 sierra papa, squawk, change to 4503.", intent: unknown, radio: false, readback: true}
-- {text: "map cleared for takeoff, runway 27, november 172, sierra papa.", intent: request_takeoff, readback: true}
+- {text: "map cleared for takeoff, runway 27, november 172, sierra papa.", intent: unknown, readback: true}
 
 # --- 2026-07-20/22 sorties: airport-name mangles and callsign mangles --------
 # Whisper butchered "Gibraltar Tower" three ways in one day; the intent

@@ -9709,6 +9709,51 @@ mod tests {
         *CLEARANCE.lock().unwrap() = None;
     }
 
+    /// EGKK 26L, 2026-09-27 (sortie 1790534902, +2735 s): the crew's landing
+    /// readback parsed as a landing REQUEST in ClearedToLand. The route kept
+    /// quiet only because the word "cleared" silenced it; the intent now says
+    /// what it is, a readback, and the unkeyed path (where no such guard
+    /// stood) can no longer walk the landing back to "join final".
+    #[test]
+    fn a_landing_readback_is_a_readback_not_a_landing_request() {
+        let _guard = SIDE_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let path = lxgb_apt_file();
+        let wx = Wx {
+            wind_from_deg: 250.0,
+            wind_kts: 12.0,
+        };
+        let readback = "whiskey alpha tango four two three six, cleared to land runway two seven";
+        assert_eq!(tower::parse_intent(readback), tower::Intent::Unknown);
+        assert!(tower::is_readback(readback));
+
+        // Keyed: the gate takes the echo, the frequency stays quiet, the
+        // clearance stands and nothing is owed.
+        let mut st = Station::load(path.to_str().unwrap(), "LXGB").expect("LXGB loads");
+        let ctx = scripted_ctx(&mut st, wx);
+        let r = st.route_keyed("november one seven two, final", Service::Tower, &ctx, wx);
+        assert!(r.contains("cleared to land"), "{r}");
+        assert!(st.twr.pending().is_some(), "the landing readback is owed");
+        let r = st.route_keyed(readback, Service::Tower, &ctx, wx);
+        assert_eq!(r, "", "{r}");
+        assert_eq!(st.twr.state, tower::State::ClearedToLand);
+        assert!(st.twr.pending().is_none(), "paid");
+        // Said again with nothing owed: still silence, still cleared.
+        let r = st.route_keyed(readback, Service::Tower, &ctx, wx);
+        assert_eq!(r, "", "{r}");
+        assert_eq!(st.twr.state, tower::State::ClearedToLand);
+
+        // Unkeyed, addressed by our callsign: not the tower's business as a
+        // request any more; it falls through and the landing stands.
+        let mut st = Station::load(path.to_str().unwrap(), "LXGB").expect("LXGB loads");
+        let mut ctx = scripted_ctx(&mut st, wx);
+        ctx.callsign = "Whiskey Alpha Tango four two three six".into();
+        st.route_keyed("whiskey alpha tango four two three six, final", Service::Tower, &ctx, wx);
+        assert_eq!(st.twr.state, tower::State::ClearedToLand);
+        assert_eq!(st.route_unkeyed(readback, Service::Tower, &ctx, wx), None);
+        assert_eq!(st.twr.state, tower::State::ClearedToLand, "never walked back to Inbound");
+        *CLEARANCE.lock().unwrap() = None;
+    }
+
     /// Whole sorties driven through the pure routing layer — the dialogue
     /// sequences that live between the tower FSM (unit-tested above it) and
     /// the mic (untestable): out-of-order calls, questions on a keyed radio,

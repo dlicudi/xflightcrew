@@ -8895,3 +8895,29 @@ transcripts through the keyed route), corpus cases for both. Next departure
 from a field without a departure frequency: an `atc` keyed record on service
 `approach` with outcome `reply`, reply "radar contact, climb ...", state
 `TakeoffCleared>Parked`. Offline only.
+
+## 2026-09-27: a clearance read back is a readback, not a request (issue #119)
+
+**Sortie 1790534902 (EGKK 26L, +2735 s).** The crew's "whiskey alpha tango
+four two three six, cleared to land runway two six left" in ClearedToLand
+logged intent `RequestLanding { touch_and_go: false }`, outcome silence; the
+takeoff readback at EGBB ("..., cleared for takeoff runway three three") logged
+`RequestTakeoff` the same way. On the keyed route the word "cleared" silenced
+them (`echoes_clearance` in `route_keyed`) and the gate had already paid the
+readback, so nothing went wrong on the air. The UNKEYED route has no such
+guard: an addressed "cleared to land ..." reached `Tower::handle` as a landing
+request.
+
+**The fix.** `tower::parse_intent`: a call with the word "cleared" is a
+readback (`Intent::Unknown`, `is_readback` true), after the emergency, radio
+check, say-again and line-up rules; a go-around or a reject in the same breath
+is still that report. The corpus cases that pinned these echoes as their
+request intents (with a note that the route silenced them) now pin them as
+readbacks. Unkeyed, a clearance readback falls through like every other
+readback.
+
+Tests `a_landing_readback_is_a_readback_not_a_landing_request` (keyed: the gate
+pays it and ClearedToLand stands, twice; unkeyed and addressed: falls through,
+never walked back to Inbound), corpus cases for both real transcripts. Next
+landing: the `atc` keyed record of the landing readback carries intent
+`Unknown`, outcome silence, state `ClearedToLand>ClearedToLand`. Offline only.
