@@ -193,6 +193,40 @@ fn default_max_push() -> f64 {
     0.10
 }
 
+/// How hard this airframe's rudder yaws it on the takeoff roll
+/// (`autotakeoff::RollSteer`): the yaw rate, deg/s, that a whole unit of the
+/// steer channel holds at `at_kts`, growing with the square of the speed.
+/// Declared, the roll law's gains are scheduled on it and its trim takes a
+/// crosswind in seconds; `None` is the default law. The default's gain per
+/// degree at 50 to 80 kt was a quarter of what the 737 needs to hold an 8 kt
+/// crosswind, and its trim bled away with the speed faster than it learned:
+/// held 5 degrees off, 10 m left, rejected twice (EGKK 26L, 2026-09-27).
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct RollRudderProfile {
+    /// Yaw rate, deg/s, per unit of steer at `at_kts`.
+    pub yaw_dps: f64,
+    /// The groundspeed that figure was measured at, knots.
+    pub at_kts: f64,
+}
+
+impl RollRudderProfile {
+    /// Used only when both numbers are sane ones.
+    pub fn valid(self) -> Option<Self> {
+        ((0.5..=100.0).contains(&self.yaw_dps) && (20.0..=200.0).contains(&self.at_kts))
+            .then_some(self)
+    }
+
+    /// The yaw rate a unit of steer holds at this groundspeed, deg/s.
+    pub fn yaw_dps_at(&self, gs_kts: f64) -> f64 {
+        let v = if gs_kts.is_finite() {
+            gs_kts.max(0.0)
+        } else {
+            0.0
+        };
+        self.yaw_dps * (v / self.at_kts).powi(2)
+    }
+}
+
 impl FlareElevatorProfile {
     /// Used only when every number is a sane one.
     pub fn valid(self) -> Option<Self> {
@@ -296,6 +330,9 @@ pub struct AircraftProfile {
     /// The flare's elevator law, when the default does not fit.
     #[serde(default)]
     pub flare_elevator: Option<FlareElevatorProfile>,
+    /// The rudder's authority on the takeoff roll, when measured.
+    #[serde(default)]
+    pub roll_rudder: Option<RollRudderProfile>,
     /// Bleed air and crew oxygen, where the airframe has them.
     #[serde(default)]
     pub cabin_air: Option<CabinAirProfile>,
@@ -2506,6 +2543,20 @@ pub fn flare_elevator() -> Option<FlareElevatorProfile> {
     *FLARE_ELEVATOR.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// The live airframe's rudder authority on the roll (see
+/// [`RollRudderProfile`]); `None` is the default roll law.
+static ROLL_RUDDER: std::sync::Mutex<Option<RollRudderProfile>> = std::sync::Mutex::new(None);
+
+/// Publish it. Called on EVERY profile swap; absent is the default law,
+/// never the previous airframe's.
+pub fn publish_roll_rudder(p: Option<RollRudderProfile>) {
+    *ROLL_RUDDER.lock().unwrap_or_else(|e| e.into_inner()) = p.and_then(RollRudderProfile::valid);
+}
+
+pub fn roll_rudder() -> Option<RollRudderProfile> {
+    *ROLL_RUDDER.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 /// The live airframe's landing distance in metres, if its profile recites
 /// one. The autoland's float rule asks it how much pavement a landing from
 /// here still needs; `None` is the old GA figure.
@@ -4429,6 +4480,7 @@ fn cessna_172sp() -> AircraftProfile {
         approach_thrust_min: None,
         arrest_lead: None,
         flare_elevator: None,
+        roll_rudder: None,
         cabin_air: None,
         pressurised: Some(false),
         park_brake_valve_set: None,
@@ -4746,6 +4798,7 @@ fn cirrus_sr22() -> AircraftProfile {
         approach_thrust_min: None,
         arrest_lead: None,
         flare_elevator: None,
+        roll_rudder: None,
         cabin_air: None,
         pressurised: Some(false),
         park_brake_valve_set: None,

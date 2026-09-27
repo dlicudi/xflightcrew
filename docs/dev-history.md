@@ -8624,3 +8624,57 @@ through the provider), corpus cases for "Walker 2516",
 `make -C plugin`, not installed. Next airline sortie: set `WAT=Walker` on the
 panel, check the `callsign` record says "Walker two five one six" and the
 tower answers "Walker 2516". Offline only.
+
+## 2026-09-27: the 737's roll law is scheduled on its own rudder (issue #59)
+
+EGKK 26L, sorties 1790524628 and 1790525414, both rejected
+`lateral_excursion` (10.3 m left at 87 kt, 9.6 m at 82). Wind 170 to 215 at
+8 kt, about 7.5 kt of crosswind from the left. From 30 kt the nose drifted
+left at 0.6 to 0.9 deg/s (257.8 to 254.3) while the cut raised the target to
+259.7; the error sat near 5 degrees for ten seconds on 0.10 to 0.28 of steer.
+
+**Measured.** The recorded steer replayed through a fitted second-order
+plant (three-second heading predictions, both rolls, 0.07 degrees rms): a
+unit of steer holds 6.45 deg/s of yaw at 60 kt, growing as v² (the nosewheel
+term fitted to nothing above 20 kt), through a 0.47 s lag after 0.3 s of dead
+time; the crosswind yaws it left by 2.48 deg/s per 60 kt less 0.99. Holding
+the line needs 0.23 of steer at 40 to 60 kt, 0.22 at 80, 0.14 at Vr. The
+calm-day 737 rolls (LIBP 22, LIEA, LEBL, LFBD) never asked for more than 0.10,
+which is why nobody saw it.
+
+**What limited it.** Not the cap (0.85; the steer never passed 0.31) and not
+the cut. The P gain: the authority taper floors at 0.35 from 50 kt, 0.03 of
+steer per degree, a heading closure of 0.19 per second at 60 kt against this
+rudder (five seconds), because the floor was set for the 172's lively tail.
+And the trim: it learns 0.01 per degree-second, clamped at 6 degrees, and the
+LIBP fix scales it by (v0/v)² every tick of acceleration, a bleed of about 25%
+a second at 50 kt: at 5 degrees of error it gained 0.05 a second and lost
+0.04. By 85 kt it held 0.17.
+
+**The fix.** A profile `roll_rudder:` (`aircraft::RollRudderProfile`,
+`yaw_dps` per unit steer at `at_kts`, published per swap); the 737 declares
+11.5 at 80 kt. Declared, `RollSteer::step_with_yaw` schedules on it: gain per
+degree = `RUDDER_CLOSE_PER_S` (1.0) / the yaw rate a unit holds at this
+speed, never more than the default's full 1/12; the 0.4 s lead taken on the
+sim's MEASURED yaw rate (`sim/flightmodel/position/R`, now read in the roll's
+join and the reject rollout; a failed read falls back to the differenced
+error); the trim learns at `RUDDER_TRIM_PER_S` (0.3) of the same gain, cap 0.4,
+and shrinks as 1/v with speed (a crosswind's moment grows as v, the rudder's
+as v², so its steer falls as 1/v; 1/v² threw the crosswind away). Undeclared
+airframes fly the old law byte for byte. The closure and trim corner were
+chosen over the plant with the rudder at 0.5, 1 and 2.5 times the declared:
+1.3 rang at 3.5 times, a trim corner of 0.45 wound up recovering an offset
+with a weak rudder.
+
+Through the fitted plant: the old law reproduces the reject (5.6 degrees,
+10.3 m by 87 kt); the new one holds 3.4 m and 2.6 degrees through Vr, trim
+0.12 by 60 kt. The other eight 737 rolls replayed with their own crosswind:
+never worse, all under 2 m (the plant under-reads the gusty days: LIBP 04 flew
+9.9 m where the plant gives the old law 5.9). Tests
+`a_steady_crosswind_is_held_on_the_centreline`,
+`the_scheduled_roll_law_does_not_weave`,
+`recorded_737_rolls_replay_no_worse`,
+`an_undeclared_rudder_keeps_the_default_law`. The landing rollout keeps the
+default law. Next 737 roll: `roll` ticks carry `law` ("rudder") and `r`;
+check err under 3 and xtk_m under 5 through rotation, trim toward 0.2 by
+60 kt in a crosswind, and no steer reversals. Offline only.

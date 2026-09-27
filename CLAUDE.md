@@ -361,7 +361,7 @@ everything blackboxes to `logs/blackbox.jsonl` (kinds: `atc`, `autotaxi`, `autot
 ### Takeoff
 - **Auto takeoff** (`src/autotakeoff.rs`): refuses without a clearance when a tower runs; ALT on the
   transponder at the roll; `RollSteer` (P, lead damping, slow clamped integrator, a cap that grows
-  with speed); stagnation reject on GROUNDSPEED (the ASI is dead when slow); rotation on
+  with speed; SCHEDULED on a declared `roll_rudder:`, lead on the sim's `R`, EGKK 2026-09-27); stagnation reject on GROUNDSPEED (the ASI is dead when slow); rotation on
   `xcopilot/pitch`; the AP takes the ESTABLISHED climb at 300 ft, the VS dial written AFTER engage
   (engage syncs it away); pitch damping on the sim's `Q`, never attitude differenced; trim into the
   takeoff band before brakes off. `brake_steer` airframes brake-steer the roll (`roll_brake_split`).
