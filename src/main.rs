@@ -23,6 +23,7 @@ mod config;
 mod control;
 mod crew_pace;
 mod conversation;
+mod course_leg;
 mod debrief;
 mod test_card;
 mod detect;

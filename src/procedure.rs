@@ -12,7 +12,8 @@
 //! 2. Each tick the loop steers the great-circle track to the current leg's fix
 //!    (wind-crabbed, exactly like the circuit's downwind), descends/climbs to
 //!    the leg's altitude constraint, and sequences to the next leg on capture.
-//!    To-altitude legs (CA/VA/FA — a missed approach's "climb to 3000", a SID's
+//!    A CF leg is flown ON its course, and an approach IF behind the aircraft
+//!    is joined by a pattern ([`crate::course_leg`]). To-altitude legs (CA/VA/FA — a missed approach's "climb to 3000", a SID's
 //!    initial climb) hold the leg course until the altitude is made.
 //! 3. On an APPROACH it hands the FAF-inbound segment to [`crate::autoland`]
 //!    (the proven glideslope + flare + rollout); on a DEPARTURE it levels at the
@@ -2140,6 +2141,10 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, plan: Pla
         );
     }
     let mut idx = 0usize;
+    // The join onto an approach's final from its IF, and how the last tick
+    // steered (`crate::course_leg`, #106).
+    let mut final_join = crate::course_leg::FinalJoin::default();
+    let mut steer_was = crate::course_leg::Steer::Direct;
     let mut closure: Option<(usize, crate::circuit::Closure)> = None;
     let mut stalls = 0u32;
     let mut progress_s = 0.0;
@@ -2452,7 +2457,7 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, plan: Pla
         // the AP holds the GROUND track (the circuit's downwind lesson). A
         // to-altitude leg holds its own magnetic course.
         let psi_v = Some(psi);
-        let crab = match (psi_v, hpath_r.ok().filter(|v| v.is_finite())) {
+        let crab = match (psi_v, hpath_r.as_ref().ok().copied().filter(|v| v.is_finite())) {
             (Some(psi), Some(hp)) => {
                 (((psi - hp + 540.0).rem_euclid(360.0)) - 180.0).clamp(-25.0, 25.0)
             }
@@ -2472,13 +2477,100 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, plan: Pla
             gs_kts,
             leg_turn_deg(lat, lon, leg, legs.get(idx + 1)).unwrap_or(0.0),
         );
-        let target_mag = if let Some(brg_true) = bearing_to_fix(lat, lon, leg) {
+        // A CF leg is flown ON its course, and an approach's IF behind us is
+        // joined by a pattern, never homed on: EGKK 26L from WILLO turned
+        // 150 degrees at CF26L and was handed to autoland 1,965 m off the
+        // course tracking 044 (2026-09-27, `crate::course_leg`). Both give a
+        // TRACK; the crab is added here as for every other leg.
+        use crate::course_leg::{CourseLine, Join, Steer};
+        let track_true = hpath_r.as_ref().ok().copied().filter(|v| v.is_finite()).unwrap_or(psi);
+        let mut steer = Steer::Direct;
+        let mut steer_track: Option<f64> = None;
+        // The course line this tick is judged against, for the log.
+        let mut steer_line: Option<CourseLine> = None;
+        let join = if matches!(end, EndAction::Approach { .. }) {
+            final_join.step(&legs, idx, lat, lon, track_true, gs_kts, mag_var, alt_ft, descent_fpm())
+        } else {
+            None
+        };
+        if matches!(join, Some(Join::Skip { .. }) | Some(Join::Pattern { .. })) {
+            steer_line = legs.get(idx + 1).and_then(|l| CourseLine::of_leg(l, mag_var));
+        }
+        let line_pos = |line: &Option<CourseLine>| {
+            line.as_ref().map(|l| (l.along_nm(lat, lon), l.xtk_nm(lat, lon)))
+        };
+        match join {
+            Some(Join::Skip { why }) => {
+                let (along, xtk) = line_pos(&steer_line).unzip();
+                crate::blackbox::record(
+                    "procedure",
+                    serde_json::json!({"event": "final_join", "how": why, "idx": idx, "fix": leg.fix_ident,
+                        "along_nm": along, "xtk_nm": xtk, "track": track_true}),
+                );
+                alert(&voice, Priority::Advisory, "Intercepting the final approach course.");
+                idx += 1;
+                heading_hold.reset();
+                closure = None;
+                continue;
+            }
+            Some(Join::Pattern { track_true: t, leg: pattern_leg, started, side }) => {
+                if started {
+                    let (along, xtk) = line_pos(&steer_line).unzip();
+                    crate::blackbox::record(
+                        "procedure",
+                        serde_json::json!({"event": "final_join", "how": "pattern", "idx": idx, "fix": leg.fix_ident,
+                            "side": side, "along_nm": along, "xtk_nm": xtk, "track": track_true}),
+                    );
+                    alert(
+                        &voice,
+                        Priority::Advisory,
+                        "We're on the far side of the final. A pattern to join it.",
+                    );
+                }
+                steer = Steer::Pattern(pattern_leg);
+                steer_track = Some(t);
+            }
+            _ => {}
+        }
+        if steer_track.is_none() {
+            let line = CourseLine::of_leg(leg, mag_var);
+            if let Some((t, s)) = line.as_ref().and_then(|l| {
+                crate::course_leg::course_track(l, lat, lon, track_true, gs_kts, steer_was == Steer::Track)
+            }) {
+                steer_track = Some(t);
+                steer = s;
+            }
+            if line.is_some() {
+                steer_line = line;
+            }
+        }
+        let steer_pos = line_pos(&steer_line);
+        if steer != steer_was {
+            crate::blackbox::record(
+                "procedure",
+                serde_json::json!({"event": "steer", "idx": idx, "fix": leg.fix_ident, "steer": steer.word(),
+                    "along_nm": steer_pos.map(|p| p.0), "xtk_nm": steer_pos.map(|p| p.1), "track": track_true}),
+            );
+        }
+        steer_was = steer;
+        let target_mag = if let Some(t) = steer_track {
+            Some(true_to_mag(t + crab, mag_var))
+        } else if let Some(brg_true) = bearing_to_fix(lat, lon, leg) {
             Some(true_to_mag(brg_true + crab, mag_var))
         } else {
             // course is already magnetic; add crab to hold it as a track.
             leg.course_mag.map(|c| (c + crab).rem_euclid(360.0))
         };
-        if let Some(d) = dist_nm.filter(|_| !leg_done(leg, dist_nm, alt_ft, capture_nm, lat, lon)) {
+        // A course leg flown on its course is done abeam its fix, as a
+        // fly-by is: the intercept may still be closing the line.
+        let done = leg_done(leg, dist_nm, alt_ft, capture_nm, lat, lon)
+            || (matches!(steer, Steer::Intercept | Steer::Track)
+                && steer_line
+                    .as_ref()
+                    .is_some_and(|l| crate::course_leg::course_passed(l, lat, lon, capture_nm)));
+        // The closure watchdog judges a leg flown AT its fix; a pattern flies
+        // away from the IF on purpose.
+        if let Some(d) = dist_nm.filter(|_| !done && !final_join.flying_pattern()) {
             if closure.as_ref().is_none_or(|(i, _)| *i != idx) {
                 // A new leg is judged on its own: stalls on an earlier leg
                 // that was later flown are not this one's (LIPK 2026-09-25:
@@ -2530,7 +2622,9 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, plan: Pla
         }
         if let Some(t) = target_mag {
             let now_s = started.elapsed().as_secs_f64();
-            if let Some(h) = heading_hold.decide(idx, t, true_to_mag(psi, mag_var), phi, now_s) {
+            // Keyed by the phase too: a new intercept, course or pattern leg
+            // is set at once, corrections inside one wait (`HeadingHold`).
+            if let Some(h) = heading_hold.decide(steer.key(idx), t, true_to_mag(psi, mag_var), phi, now_s) {
                 if xp.set_float(HDG_BUG, h).await.is_ok() {
                     bug_mag = h;
                     crate::blackbox::record(
@@ -2928,6 +3022,9 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, plan: Pla
                 "event": "leg", "idx": idx, "type": leg.leg_type, "fix": leg.fix_ident,
                 "dist_nm": dist_nm, "alt_ft": alt_ft, "alt_true": true_alt_ft, "want_alt": want_alt,
                 "agl_ft": agl_ft, "crab": crab, "psi": psi_v, "bug": bug_mag, "tgt": target_mag,
+                // How the lateral is flown and where on the course it is
+                // (`course_leg`): the FAF's line during a final's join.
+                "steer": steer.word(), "along_nm": steer_pos.map(|p| p.0), "xtk_nm": steer_pos.map(|p| p.1),
                 // The capture radius in force, so a fix that will not close
                 // can be told from one the aircraft simply has not reached.
                 "cap_nm": capture_nm,
@@ -2945,7 +3042,7 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, plan: Pla
             Some(hi),
         ) = (&end, handoff)
         {
-            if idx >= hi && leg_done(leg, dist_nm, alt_ft, capture_nm, lat, lon) {
+            if idx >= hi && done {
                 crate::blackbox::record(
                     "procedure",
                     serde_json::json!({"event": "handoff_autoland", "idx": idx, "agl_ft": agl_ft}),
@@ -3040,7 +3137,7 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, plan: Pla
             }
         }
 
-        if leg_done(leg, dist_nm, alt_ft, capture_nm, lat, lon) {
+        if done {
             idx += 1;
             if idx < legs.len() {
                 let next = &legs[idx];
