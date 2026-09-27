@@ -96,6 +96,10 @@ pub struct Station {
     requested_ident: Option<String>,
     /// The departure controller has said "radar contact" to this flight.
     dep_checked_in: bool,
+    /// The position the after-takeoff handoff sends the flight to
+    /// (Departure, or Approach at a field without one): its first readback
+    /// there is the check-in. `None` until a takeoff clearance arms it.
+    handed_to: Option<Service>,
     /// The ATIS information letter the pilot last reported having ("with
     /// information Alpha"). When it matches the current broadcast, clearances
     /// skip the QNH — the whole point of an ATIS.
@@ -234,6 +238,7 @@ impl Station {
             runway_request: None,
             requested_ident: None,
             dep_checked_in: false,
+            handed_to: None,
             pilot_info: None,
             assigned_squawk: None,
             planned_route: None,
@@ -637,19 +642,31 @@ impl Station {
             .any(|w| w == "cleared");
         if echoes_clearance || (intent == tower::Intent::Unknown && tower::is_readback(transcript))
         {
-            if service == Service::Departure && !self.dep_checked_in {
+            // The position the tower handed us to takes the check-in: a
+            // field without a departure frequency hands a departure to
+            // APPROACH, and until EGBB (2026-09-27) approach heard "passing
+            // three thousand one hundred climbing one five thousand" as a
+            // readback and said nothing, the tower still holding the flight
+            // cleared for takeoff.
+            let checks_in = service == Service::Departure || self.handed_to == Some(service);
+            if checks_in && !self.dep_checked_in {
                 self.dep_checked_in = true;
+                self.transfer_departure();
+                let position = match service {
+                    Service::Approach => "Approach",
+                    _ => "Departure",
+                };
                 // The climb the pilot announced is the climb they get: the
                 // zone clearance capped them at two thousand, and "radar
                 // contact" alone left "climbing five thousand" unanswered
                 // (LXGB, 2026-09-15).
                 return match climb_announced(transcript) {
                     Some(alt) => format!(
-                        "{}, {} Departure, radar contact, climb {alt}.",
+                        "{}, {} {position}, radar contact, climb {alt}.",
                         ctx.callsign, ctx.airport
                     ),
                     None => format!(
-                        "{}, {} Departure, radar contact.",
+                        "{}, {} {position}, radar contact.",
                         ctx.callsign, ctx.airport
                     ),
                 };
@@ -1196,6 +1213,11 @@ impl Station {
             (None, None) => return,
         };
         self.dep_checked_in = false;
+        self.handed_to = Some(if name == "Departure" {
+            Service::Departure
+        } else {
+            Service::Approach
+        });
         *HANDOFF.lock().unwrap_or_else(|e| e.into_inner()) = Some(Handoff {
             line: format!(
                 "{}, contact {} {} on {}.",
@@ -1209,6 +1231,23 @@ impl Station {
             khz,
         });
         tracing::info!(to = name, "departure handoff armed");
+    }
+
+    /// The departure has checked in with the position it was handed to: the
+    /// tower's book on it is closed. The takeoff clearance is spent (the
+    /// flight is airborne and someone else's), so the tower state goes back
+    /// to Parked, the state every arrival starts from, and the published
+    /// picture says so: nothing held, nothing owed.
+    fn transfer_departure(&mut self) {
+        if self.twr.state == tower::State::TakeoffCleared {
+            self.twr.state = tower::State::Parked;
+        }
+        self.twr.clear_clearance_readback();
+        if let Some(c) = CLEARANCE.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+            c.state = self.twr.state;
+            c.holds_runway = self.twr.holds_runway();
+            c.pending_readback = None;
+        }
     }
 
     /// The approach controller: vectors to final, or a redirect to the tower
@@ -8476,6 +8515,7 @@ mod tests {
             runway_request: None,
             requested_ident: None,
             dep_checked_in: false,
+            handed_to: None,
             pilot_info: None,
             assigned_squawk: None,
             planned_route: None,
@@ -9602,6 +9642,71 @@ mod tests {
             false, // runway unoccupied
             None,  // no wake clock
         )
+    }
+
+    /// EGBB 33, 2026-09-27 (sortie 1790534902): Birmingham has no departure
+    /// frequency, so the tower handed the climbing flight to APPROACH. The
+    /// crew read the handoff back on the tower (silence, correct), retuned,
+    /// and checked in: "passing three thousand one hundred climbing one five
+    /// thousand" was heard by approach as a plain readback and answered with
+    /// nothing, the tower still holding the flight cleared for takeoff. The
+    /// position a departure is handed to takes its check-in, and the tower's
+    /// book on the flight closes there.
+    #[test]
+    fn approach_takes_the_departure_check_in_when_it_is_the_handoff() {
+        let _guard = SIDE_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let path = lxgb_apt_file();
+        let wx = Wx {
+            wind_from_deg: 250.0,
+            wind_kts: 12.0,
+        };
+        let mut st = Station::load(path.to_str().unwrap(), "LXGB").expect("LXGB loads");
+        st.departure_khz = None;
+        let ctx = scripted_ctx(&mut st, wx);
+        // An arrival's readback to approach, no departure handed over: still
+        // silence, never "radar contact".
+        let r = st.route_keyed("descending two thousand", Service::Approach, &ctx, wx);
+        assert_eq!(r, "", "{r}");
+
+        st.twr.state = tower::State::TaxiCleared;
+        let r = st.route_keyed("ready for departure", Service::Tower, &ctx, wx);
+        assert!(r.contains("cleared for takeoff"), "{r}");
+        let _ = crate::party_line::take_departure_handoff();
+        let line = handoff_tick(900.0, false).expect("handoff due");
+        assert!(line.contains("Gibraltar Approach on one two two decimal eight"), "{line}");
+        let _ = crate::party_line::take_departure_handoff();
+
+        // The readback, on the TOWER before the retune: a frequency readback
+        // earns silence and moves nothing.
+        let r = st.route_keyed(
+            "whiskey alpha tango four two three six, gibraltar approach on one two two decimal eight",
+            Service::Tower,
+            &ctx,
+            wx,
+        );
+        assert_eq!(r, "", "{r}");
+        assert_eq!(st.twr.state, tower::State::TakeoffCleared);
+
+        // The check-in on approach, as the crew said it.
+        let checkin = "birmingham approach, whiskey alpha tango four two three six, passing three thousand one hundred climbing one five thousand";
+        assert_eq!(tower::parse_intent(checkin), tower::Intent::Unknown);
+        assert!(tower::is_readback(checkin));
+        let r = st.route_keyed(checkin, Service::Approach, &ctx, wx);
+        assert_eq!(
+            r,
+            "November one seven two Sierra Papa, Gibraltar Approach, radar contact, climb one five thousand."
+        );
+        assert_eq!(st.twr.state, tower::State::Parked, "the tower's book is closed");
+        let snap = crate::party_line::clearance_state();
+        assert_eq!(snap, Some(tower::State::Parked));
+        assert!(!st.twr.holds_runway());
+        // Later readbacks on approach stay quiet.
+        let r = st.route_keyed("maintaining one five thousand", Service::Approach, &ctx, wx);
+        assert_eq!(r, "", "{r}");
+        // The same flight coming back is an arrival from Parked.
+        let r = st.route_keyed("november one seven two, final", Service::Tower, &ctx, wx);
+        assert!(r.contains("cleared to land"), "{r}");
+        *CLEARANCE.lock().unwrap() = None;
     }
 
     /// Whole sorties driven through the pure routing layer — the dialogue

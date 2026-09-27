@@ -8864,3 +8864,34 @@ Test `the_closest_field_is_not_volunteered_on_a_normal_flight`. Next flight:
 blackbox `atc_region` carries `said`; airborne `crew: true` records say
 `said: false` under normal chatter with no failure, and no "Closest field"
 in `said`. Offline only.
+
+## 2026-09-27: approach takes the departure check-in when it is the handoff (issue #118)
+
+**Sortie 1790534902 (EGBB 33, IFR to EGKK).** Birmingham publishes no
+departure frequency, so `arm_departure_handoff` sent the climbing flight to
+APPROACH ("contact Birmingham Approach on one three one decimal zero zero
+five", `atc_handoff` at 1,071 ft). The crew's readback at +906 ("..., birmingham
+approach on one three one decimal zero zero five") went out on the TOWER, as it
+should before the retune (`obey_departure_handoff` reads back, waits, then
+tunes): `frequency_readback` made it a readback and the tower kept quiet,
+correct, logged intent Unknown. The check-in at +934 ("birmingham approach,
+..., passing three thousand one hundred climbing one five thousand") reached
+approach as another readback: the "radar contact, climb ..." answer in
+`route_keyed` fired only for `Service::Departure`, so approach said nothing,
+and the tower's book stayed TakeoffCleared through the whole enroute leg.
+
+**The fix.** `Station::handed_to` records the position the after-takeoff
+handoff armed (Departure, or Approach at a field without one); its first
+readback is the check-in and gets "<callsign>, <field> Approach, radar
+contact, climb <announced>." (`climb_announced`, same as departure). An
+arrival's readback to approach with no departure handed over is still
+silence. The answered check-in closes the tower's book
+(`Station::transfer_departure`): TakeoffCleared goes back to Parked (the state
+an arrival starts from; a final report still earns the clearance), the
+published `CLEARANCE` says Parked with nothing held and nothing owed.
+
+Tests `approach_takes_the_departure_check_in_when_it_is_the_handoff` (both real
+transcripts through the keyed route), corpus cases for both. Next departure
+from a field without a departure frequency: an `atc` keyed record on service
+`approach` with outcome `reply`, reply "radar contact, climb ...", state
+`TakeoffCleared>Parked`. Offline only.

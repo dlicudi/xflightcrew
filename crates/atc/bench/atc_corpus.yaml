@@ -228,6 +228,12 @@
 # form that keeps the code.
 - {text: "november eight one six november november, squawking seven thousand, barcelona tower on one one eight decimal one zero five", intent: unknown, readback: true}
 - {text: "november eight one six november november, roger, barcelona tower on one one eight decimal one zero five", intent: unknown, readback: true}
+# EGBB 33, 2026-09-27 (sortie 1790534902): the departure handed to APPROACH
+# (no departure frequency). The readback on the tower earns silence; the
+# check-in on approach is a readback shape the handed-to position answers
+# "radar contact, climb ...".
+- {text: "whiskey alpha tango four two three six, birmingham approach on one three one decimal zero zero five", intent: unknown, readback: true}
+- {text: "birmingham approach, whiskey alpha tango four two three six, passing three thousand one hundred climbing one five thousand", intent: unknown, readback: true}
 - {text: "with you passing one thousand five hundred", intent: unknown, readback: true}
 - {text: "Headace, do copy.", intent: unknown, readback: true}
 - {text: "roger, holding point alpha", intent: unknown, readback: true}
