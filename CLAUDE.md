@@ -346,8 +346,11 @@ everything blackboxes to `logs/blackbox.jsonl` (kinds: `atc`, `autotaxi`, `autot
   (EBLG 2026-09-22).
 - **Routes ride the paint** (`ride_paint`): 1201/1202 for topology, names, crossings; drawn `120`
   centrelines for geometry, sliding sideways only; runway legs and the vacate's start never move;
-  thin data degrades, never refuses. Stands get a `plan_to_stand` lead-in. **An arrival's route is
+  thin data degrades, never refuses; a chord of a drawn curve rides the curve between two samples on
+  it (`fill_paint_gaps`; LEMG 13 2026-09-26). Stands get a `plan_to_stand` lead-in. **An arrival's route is
   never a departure's clearance**: check the party line's `taxi_to_stand`, not proximity.
+- **A hold is reached ON the line** (`autotaxi::arrived_on_line`, 5 m; else `stopped_off_line`, a
+  taxi failure; full auto's hand-taxied check `at_the_hold`; LSZS 03 2026-09-24).
 - **Line up** rides the DRAWN lead-on (`TaxiRoutePlan.lead_on`), synthetic geometry only as a
   fallback (invented entries end in the grass); crosschecked against `party_line::clearance_runway`;
   refused with too little runway left.
@@ -472,6 +475,9 @@ everything blackboxes to `logs/blackbox.jsonl` (kinds: `atc`, `autotaxi`, `autot
   level gets one reminder naming who holds it (`PlannedTod.held_ft`, `procedure::held_tod`). None on
   an approach or in a climb (`CLIMBING_FPM`), and the family speaks only in the model's cruise
   above 1,000 ft AGL (`monitor::tod_in_cruise`; a ring behind the departure, LSZS-LILO 2026-09-24).
+  The plan's ring is along-route and compared with the route still to fly
+  (`monitor::route_remaining_nm`, `ring_dist_nm`); a mile is "a mile" and the time comes from the
+  distance (`tod_ahead_words`).
 - **A level the plan handed down is not argued with**: no step-climb advice while a follower flies,
   with under 30 min of cruise left, or more than three levels under optimum (a level PLANNED low,
   `STEP_CLIMB_MIN_CRUISE_MIN`; EGBB-EGKK 2026-09-27); a wandering cruise is still cruise
@@ -480,6 +486,10 @@ everything blackboxes to `logs/blackbox.jsonl` (kinds: `atc`, `autotaxi`, `autot
 - **A descent that outruns the governor gets drag, then a shallower rate**
   (`procedure::descent_drag`: speedbrake where `arm_spoilers` is declared; stowed on every exit).
   Never with the gear down or flap past the first detent (`drag_barred`, `why`; EGKK 2026-09-27).
+  A brake out stays out through a level-off until the speed is in, holds each state
+  `DRAG_MIN_HOLD_S`, and is said at most every two minutes (`DragVoice`); a STAR speed limit once
+  begun holds (`arrival_speed_cap` `begun`); a capture of the dial is not a dropped VS mode
+  (`vs_mode_capturing`; EGKK-EGBB 2026-09-27).
 
 ### The follower's vertical and the altimeter
 - **Three owners in order** (`procedure::vertical_tick`, pure): the PLAN's constraint, paced to its
@@ -579,7 +589,9 @@ everything blackboxes to `logs/blackbox.jsonl` (kinds: `atc`, `autotaxi`, `autot
 (`src/taxi_in.rs`) VACATE first (completing the landing clearance, decided at the JUNCTION), then
 "runway vacated", THEN the request. **A vacate turns toward the parking and never onto another
 runway** (`nearest_stand`). `vacate_runway` falls back to `autoland::landed_runway`;
-`vacate_budget_secs`; stands entered on their line (`nav::stand_lead_in`). **A mission ends shut
+`vacate_budget_secs`; stands entered on their line (`nav::stand_lead_in`). **A stand route asked
+from the runway starts with the vacate, forward** (`station::stand_route_on`, `nav::after_vacate`;
+EDLP 24 2026-09-24). **A mission ends shut
 down** (`taxi_in::shut_down_at_stand`: engines confirmed from `ENGN_running`, electrics off); a
 spoken "taxi to parking" leaves the engines to the pilot.
 

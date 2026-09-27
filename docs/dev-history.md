@@ -9222,3 +9222,61 @@ Needs `make -C plugin install` and a reload.
 Next sortie: push ticks `swinging` true once the nose moves 2 degrees in 4 s, `pavement_edge` only
 with `here: false` mid-swing; `abort_brakes` `pilot_stop: true` `held: true` before "Stopping the
 push"; typed `age_s` under 0.5 s and `queued_ms` under 200 ms. Offline only.
+
+## 2026-09-28: the top of descent said as it is, measured along the route; the descent speedbrake holds (issues #127, #109, #126)
+
+EGKK-EGBB (737, sortie 1790541304-full_auto, 2026-09-27) +1604: "Top of descent in about a minute, 1
+miles ahead" at 300 kt, where a mile is 12 s; the minutes were rounded and floored at one.
+`monitor::tod_ahead_words` works the time out from the distance at the groundspeed ("in under a
+minute" under 45 s) and `spoken_miles` says "a mile"; `plan::tod_phrase` uses it under an hour.
+
+LSZS-LILO (SR22, 2026-09-24): the plan's TOD ring is SimBrief's navlog distance after TOD, along the
+route, and was compared with the straight line to the field: 63.0 nm of valley legs to a field 23.1
+nm away, so a 25 nm ring was "coming up" at the first valley fix with 57 nm to go and "past" with 31
+to go. `monitor::Destination` carries the plan's points and `route_remaining_nm` measures straight to
+the end of the nearest leg, then the rest; `ring_dist_nm` is what `tod_ahead`, `tod_passed`,
+`high_on_profile` and the step climb compare with the ring.
+
+On the same EGBB arrival the speedbrake was said thirteen times: seven in 46 s from +2387 were
+OSKOT's 210 coming and going against 250 (`arrival_speed_cap` decided each tick from the speed still
+to lose; an aircraft slowing at the planned 0.5 kt/s rode the boundary), now held once begun; around
+the approach's 210.25 two of three stows were the descent gate at a level-off still 6 and 13 kt fast
+(+2739, +3004). `descent_drag` keeps a brake already out through a level-off until the speed is
+within 3 kt or a climb past 300 fpm is commanded (`DRAG_KEEP_BELOW_FPM`), holds each state at least
+15 s (`DRAG_MIN_HOLD_S`), and `DragVoice` says an extension only 120 s after the last call and a stow
+only when its extension was said; replayed, six said changes became five with three said. The +2295
+and +3001 `write_unconfirmed vertical_velocity -1900 / 0` were the autopilot capturing the dial 202
+and 246 ft above it while the path target was 134 and 148 ft below; `vs_mode_capturing` leaves a mode
+dropped inside 0.2 min of the commanded rate of the dial.
+
+Next sortie: `tod_ahead` text never "1 miles"; `procedure` `speedbrake` changes at least 15 s apart,
+`said:false` on quick re-extensions; no 210/250 alternation in `speed_limit`; no `write_unconfirmed
+vertical_velocity ... actual 0` near a capture. Offline only.
+
+## 2026-09-28: a lead-on rides its curve, a hold is reached on the line, a stand route leaves the runway forward (issues #60, #71)
+
+LEMG 13 (2026-09-26, sortie 1790441293): the network's leg from taxiway A to the runway junction is a
+chord of the drawn lead-on curve, which bulges up to 6.5 m out of it (about 8 m by the snap test's
+measure), past `PAINT_SNAP_M` in the middle, so those samples stayed on the chord while their
+neighbours sat on the curve: -62, +49, +43, -63 degrees at consecutive vertices, and the line-up's
+remaining distance jumped 8 and 12 m in single ticks. `ride_paint` remembers which line each sample
+snapped to and where; `nav::fill_paint_gaps` replaces a run of unmoved samples between two on the
+same line with the line itself (no runway leg in the run, within `PAINT_FILL_DETOUR` 1.5 of the
+straight gap, within twice the snap distance). Sharpest vertex now 11 degrees
+(`live_lemg_13_lead_on_runs_one_way`, asserting under 15 from the route's own end).
+
+LSZS 03 (SR22, 2026-09-24): the second line-up drive joined 27.4 m off, never captured, and declared
+the holding point at 0.4 m to go and 27.44 m off the line; full auto then found the runway 34 degrees
+off. An arrival is only on its line (`autotaxi::arrived_on_line`, 5 m), else `stopped_off_line`,
+spoken with the number and a taxi failure on the scorecard. Full auto's hand-taxied hold check is
+60 m along the route and on its line (`at_the_hold`), not a straight 60 m from its end.
+
+EDLP 24 (SF50, 2026-09-24): after the vacate timed out the stand route was planned from the runway at
+the nearest node whatever the heading: "via Bravo, Alpha, Delta, cross runway zero six", starting
+backwards (59 degrees against 236), joined 179 degrees off. On a runway the tower now plans the drive
+off it forward first (`plan_vacate`), then the stand, route and crossings from the vacate's end,
+joined by `nav::after_vacate`: "via C, D", no crossings, leaving on 236. Still owed: a backtrack
+along the strip we occupy is phrased as a crossing.
+
+Next sortie: `atc` `stand_route_from_runway`, a small `join` `err_deg`, no `holding_point` with
+`|lat_m|` over 5, `drive.remaining_m` steps of 3 m or less on a lead-on. Offline only.
