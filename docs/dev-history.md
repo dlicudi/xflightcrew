@@ -8158,3 +8158,60 @@ Fixes (`procedure::vertical_tick`, `DescentProfile`):
   `want_alt` never falling before the top of descent, no `terrain_floor`
   in the climb unless the ground is really above the plan, `descent_no_climb`
   only after the cruise was flown. Offline only.
+
+## 2026-09-27: a MAP on the runway fix hands autoland the approach at the FAF
+
+LFBD-EGKK, stock 737-800, full auto, runway 26L (sortie
+`1790510400-full_auto`, issue #105). After the STAR (WILLO, 7,000 ft) full
+auto armed "the ILS approach runway two six left" through
+`approach_plan_for` (`straight_in_legs` of the CIFP final: IF CF26L, CF
+FF26L flagged FAF "E  F", CF RW26L flagged MAP "G  M"; no transition, so the
+join to CF26L was direct from WILLO, bug 021 to 042, a near-reversal onto
+the 256 final). Autoland was handed the aircraft at RW26L:
+
+- `handoff_index` took `legs.last().is_map` as the LSZS case (a MAP short
+  of the runway, flown to and handed over there) and returned idx 2. The
+  CIFP codes the MAP on the threshold of nearly every ILS final (EGLL 27R,
+  LEJR 20, LIPE 12 carry the same "G  M"), so since 2026-09-24 every such
+  approach was handed over at the runway, not the FAF. LIPE's 2026-09-25
+  fix (`map_short_of_runway`) went into the hand-over's wording and the
+  flap schedule, never into `handoff_index`; LIPR 30's "handed to autoland
+  120 ft high at 0.8 nm" (2026-09-26) is the same fault.
+- At t 1790515472 CF26L was captured 2.9 nm out (its turn onto FF26L
+  about 150 degrees, capture 2.7 nm) and FF26L in the same tick (1.9 nm
+  away, its own turn onto RW26L as large): "Next, FF26L." and "Next,
+  RW26L." together, the aircraft 4.3 nm from the threshold, 2.8 km south of
+  the centreline, track 042. The follower flies every fix leg DIRECT TO the
+  fix (`bearing_to_fix` plus crab), a CF's course included: the turn crossed
+  the centreline inside FF26L and overshot to 2.2 km north (t 1790515536),
+  and the leg to RW26L homed on the threshold at track 240 against the
+  runway's 258, 1.2 km off at 2.2 nm, 550 m at 1.1 nm.
+- "At the fix. Landing us." at t 1790515620 at 310 ft radio 1 nm out,
+  "Autoland to EGKK runway 26L, 1 miles", localizer and glideslope 2.5 dots,
+  `going_around` `off_centreline_low` at 97 ft, xtk 244.5 m, 0.15 nm. The
+  reversal pattern flew the second approach and landed.
+
+Fix (`procedure::handoff_index`): the MAP rule asks `map_short_of_runway`,
+so a MAP on the runway fix falls through to the FAF. On the sortie's tick
+FF26L is done at once and autoland takes the aircraft 4.3 nm out on the
+wrong side of the course, where `reversal::needed` flies its pattern onto
+the final (the pattern the second approach landed from) instead of a 1 nm
+final 550 m off. `faf_off_course` and `approach_flyable_from` now judge
+FF26L, the FAF, as their comments always said. Test
+`a_runway_map_hands_autoland_the_approach_at_the_faf`: the real EGKK I26L
+rows, the FAF chosen, and the sortie's tick (51.141136, -0.052538, 261 kt)
+completing FF26L more than 4 nm from the threshold.
+
+Not touched (why the final was 244 m off, still open):
+
+- The follower flies a CF leg as a direct-to, never on its course; a final
+  flown by the follower past a FAF (the LSZS MAP legs) or any course leg
+  entered off its line homes on the fix at an angle.
+- An approach joined at its IF from the far side is a reversal the fly-by
+  cannot fly (capture capped at the turn radius, two fixes sequenced in
+  one tick); the published transition (WILLO, D113V, MAY, the FD to 8.5 DME
+  from MAY) is not loaded, and autoland's pattern is the only reversal we have.
+- Next EGKK-style arrival, check: `procedure` `handoff_autoland` idx at the
+  FAF, the autoland arm's distance ("Autoland to ... N miles" of 4 or more),
+  `reversal` events when the join was from the far side, no
+  `off_centreline_low`. Offline only.

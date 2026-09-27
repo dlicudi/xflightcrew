@@ -1445,7 +1445,8 @@ pub fn vertical_tick(
     }
 }
 
-/// The leg to hand off to autoland on an approach: the FAF if the data flags one,
+/// The leg to hand off to autoland on an approach: the MAP of an approach
+/// that ends short of the runway, else the FAF if the data flags one,
 /// else the last fix leg before the runway threshold, else the last leg. `None`
 /// only when there are no legs. Handing off AT the FAF lets autoland own the
 /// glideslope from platform to touchdown, exactly where it's proven.
@@ -1456,8 +1457,11 @@ pub fn handoff_index(legs: &[ProcLeg]) -> Option<usize> {
     // An approach to a MAP short of the runway is flown TO the MAP: its final
     // is the published valley track, and the runway's extended centreline
     // from the FAF lies across the slopes beside it (LSZS 03: two miles off,
-    // toward Piz Corvatsch).
-    if legs.last().is_some_and(|l| l.is_map) {
+    // toward Piz Corvatsch). A MAP coded ON the runway fix is not one: the
+    // ILS finals in the CIFP carry the MAP flag on the threshold ("G  M"),
+    // and handing off there gave autoland EGKK 26L at 1 nm, 244 m off the
+    // centreline, and a go-around at 97 ft (2026-09-27).
+    if legs.last().is_some_and(map_short_of_runway) {
         return Some(legs.len() - 1);
     }
     if let Some(i) = legs.iter().position(|l| l.is_faf) {
@@ -4510,6 +4514,69 @@ mod tests {
         ];
         assert_eq!(handoff_index(&legs), Some(1));
         assert_eq!(handoff_index(&[]), None);
+    }
+
+    /// EGKK ILS 26L (sortie 1790510400-full_auto, stock 737, 2026-09-27):
+    /// the real CIFP final codes its MAP on RW26L ("G  M"), and the MAP rule
+    /// for LSZS handed off THERE: "At the fix. Landing us." at 1 nm and 310 ft
+    /// radio, 550 m off the centreline, localizer and glideslope 2.5 dots, a
+    /// go-around at 97 ft 244 m off. The handoff is the FAF, FF26L; on the
+    /// sortie's tick that sequenced it (the aircraft 4.3 nm out, turning onto
+    /// the final from the south) autoland takes it there, not a mile out.
+    #[test]
+    fn a_runway_map_hands_autoland_the_approach_at_the_faf() {
+        let rows = "APPCH:010,I,I26L, ,CF26L,EG,P,C,E  I, ,   ,IF, ,IWW,EG,P,I,      ,0766,0082,    ,    ,J,02000,02000,     , ,   ,    ,   , , , , , ,0,D,S;\n\
+                    APPCH:020,I,I26L, ,FF26L,EG,P,C,E  F, ,   ,CF, ,IWW,EG,P,I,      ,0766,0072,2560,0010,H,02000,02000,     , ,   ,-300,   ,EGKK,EG,P,A, ,0,D,S;\n\
+                    APPCH:030,I,I26L, ,RW26L,EG,P,G,G  M, ,   ,CF, ,IWW,EG,P,I,      ,0766,0017,2560,0055, ,00248,     ,     , ,   ,-300,   , , , , , ,0,D,S;\n\
+                    APPCH:040,I,I26L, , , , , ,  M , ,   ,CA, , , , , ,      ,    ,    ,2560,    ,+,02000,     ,     , ,   ,    ,   , , , , , ,0,D,S;\n\
+                    APPCH:050,I,I26L, , , , , , E  , ,   ,VM, , , , , ,      ,    ,    ,1770,    , ,03000,     ,     , ,   ,    ,   , , , , , ,0,D,S;\n";
+        let raw = crate::nav::parse_proc_legs(
+            rows.lines().map(str::trim),
+            crate::nav::ProcKind::Appch,
+            "I26L",
+            None,
+        );
+        let mut legs = crate::nav::straight_in_legs(raw, "26L").expect("straight in");
+        let at = |ident: &str, lat: f64, lon: f64| Fix {
+            ident: ident.into(),
+            lat,
+            lon,
+        };
+        legs[0].fix = Some(at("CF26L", 51.173697222, -0.003744444));
+        legs[1].fix = Some(at("FF26L", 51.170172222, -0.029625));
+        legs[2].fix = Some(at("RW26L", 51.150672, -0.171944));
+        assert_eq!(
+            legs.iter()
+                .map(|l| (l.fix_ident.as_str(), l.is_faf, l.is_map))
+                .collect::<Vec<_>>(),
+            [
+                ("CF26L", false, false),
+                ("FF26L", true, false),
+                ("RW26L", false, true)
+            ]
+        );
+        assert_eq!(
+            handoff_index(&legs),
+            Some(1),
+            "the FAF, never the runway's MAP"
+        );
+
+        // t 1790515473.3: FF26L sequenced, groundspeed 261 kt, track 042.
+        let (lat, lon) = (51.141135858, -0.052537624);
+        let d = crate::nav::haversine_nm(lat, lon, 51.170172222, -0.029625);
+        let cap = capture_radius_nm(
+            260.6,
+            leg_turn_deg(lat, lon, &legs[1], legs.get(2)).unwrap(),
+        );
+        assert!(
+            leg_done(&legs[1], Some(d), 2914.0, cap, lat, lon),
+            "d {d:.2} cap {cap:.2}"
+        );
+        let thr = crate::nav::haversine_nm(lat, lon, 51.150672, -0.171944);
+        assert!(
+            thr > 4.0,
+            "handed over {thr:.1} nm out, not the 1 nm of the sortie"
+        );
     }
 
     fn wp(ident: &str, lat: f64, lon: f64, alt: f64) -> crate::simbrief::Waypoint {
