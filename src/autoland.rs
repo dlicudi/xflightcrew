@@ -856,6 +856,7 @@ pub fn run_autoland_scoped(
             // against a "cleared to land runway one two" (2026-09-12) — every
             // planned arrival must hand its runway down (see `EndAction`).
             let cleared = crate::party_line::clearance_runway();
+            let mut from_clearance = false;
             let picked = match forced_rwy.as_ref() {
                 Some(planned_rwy) => match runway_by_id(
                     &apt_dat,
@@ -911,6 +912,7 @@ pub fn run_autoland_scoped(
                                         ),
                                         Priority::Caution,
                                     );
+                                    from_clearance = true;
                                     Ok(Some(r))
                                 }
                                 _ => Ok(Some(planned)),
@@ -936,6 +938,13 @@ pub fn run_autoland_scoped(
                 icao = %rwy.icao, id = %rwy.id, dist_nm = rwy.dist_nm,
                 len_m = rwy.length_m, course = rwy.course_deg, elev = rwy.elev_ft,
                 "runway selected"
+            );
+            // The runway flown IS the mission's arrival runway, from here to
+            // the vacate: a tower switch at the arm moves it, and a re-arm
+            // on the approach arrives here with it already moved (#64).
+            crate::full_auto::retarget_arrival_runway(
+                &rwy.id,
+                armed_runway_why(forced_rwy.as_ref().map(|p| p.id.as_str()), &rwy.id, from_clearance),
             );
             announce(
                 format!("Autoland to {} runway {}, {:.0} miles. Flying the approach.", rwy.icao, rwy.id, rwy.dist_nm),
@@ -1205,6 +1214,11 @@ pub fn run_autoland_scoped(
                                     ),
                                     Priority::Caution,
                                 );
+                                // The mission's ONE arrival runway moves
+                                // with us, before the new loop arms: its
+                                // ILS tune, the crew's calls, the vacate
+                                // and the card read the cleared end (#64).
+                                crate::full_auto::retarget_arrival_runway(&r.id, "clearance");
                                 // A new loop owns the aircraft from its first
                                 // tick; this one exits on the generation bump
                                 // and leaves ACTIVE to it.
@@ -2724,6 +2738,21 @@ pub fn clearance_switch(
         return None;
     }
     Some(c.to_string())
+}
+
+/// Why the runway autoland arms on is (or is not) a change of the mission's
+/// arrival runway, for `full_auto::retarget_arrival_runway`: the tower's
+/// clearance moved it at the arm ("clearance"), the forced end was flown as
+/// handed down ("arm", no change), or nothing forced it or the forced end
+/// was missing and the track picked ("self_pick"). Pure.
+pub fn armed_runway_why(forced: Option<&str>, flying: &str, from_clearance: bool) -> &'static str {
+    if from_clearance {
+        "clearance"
+    } else if forced.is_some_and(|f| f.trim().eq_ignore_ascii_case(flying.trim())) {
+        "arm"
+    } else {
+        "self_pick"
+    }
 }
 
 /// Is an owed readback the LANDING one? The tower phrases what it waits for

@@ -62,6 +62,19 @@ pub async fn tune(
     lon: f64,
 ) -> Option<crate::nav::Ils> {
     let nav_path = crate::settings::live().nav_data_path.clone();
+    tune_from(xp, &nav_path, icao, rwy, lat, lon).await
+}
+
+/// [`tune`] against a named `earth_nav.dat` (tests hand it a fixture).
+pub async fn tune_from(
+    xp: &dyn crate::xplane::XPlane,
+    nav_path: &str,
+    icao: &str,
+    rwy: &str,
+    lat: f64,
+    lon: f64,
+) -> Option<crate::nav::Ils> {
+    let nav_path = nav_path.to_string();
     let (want_rwy, want_icao) = (rwy.to_string(), icao.to_string());
     let ils = tokio::task::spawn_blocking(move || {
         crate::nav::find_ils(&nav_path, &want_rwy, lat, lon, FIND_MAX_NM).ok().flatten()
