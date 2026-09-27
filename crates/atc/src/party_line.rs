@@ -147,6 +147,13 @@ pub(crate) static LANDING_HANDOFF: Mutex<Option<String>> = Mutex::new(None);
 /// cleared on `Station::uninstall`.
 pub(crate) static ASSIGNED_SQUAWK: Mutex<Option<i64>> = Mutex::new(None);
 
+/// The IFR clearance the tower issued AND heard read back correctly: the
+/// destination, the SID, the runway, the initial altitude and the code.
+/// Set only by the accepted readback (a clearance nobody read back is not
+/// one the crew may fly), retired with the squawk: by `Station::install`
+/// (a new field), `Station::uninstall` and the out-of-reach stand-down.
+pub(crate) static IFR_CLEARANCE: Mutex<Option<tower::IfrClearance>> = Mutex::new(None);
+
 fn lock<T>(m: &'static Mutex<T>) -> MutexGuard<'static, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
@@ -319,6 +326,16 @@ pub fn plan_vacate(
 pub fn assigned_squawk() -> Option<i64> {
     *lock(&ASSIGNED_SQUAWK)
 }
+
+/// The IFR clearance this flight holds, read back and accepted: fly the
+/// SID it names (when it serves the cleared runway) and climb to its
+/// altitude. `None` before the readback, after a swap, and at a field the
+/// flight left.
+pub fn assigned_clearance() -> Option<IfrClearance> {
+    lock(&IFR_CLEARANCE).clone()
+}
+
+pub use crate::tower::IfrClearance;
 
 /// The controller's last squawk nudge, consumed: the crew recycles or
 /// re-dials once per call it heard.

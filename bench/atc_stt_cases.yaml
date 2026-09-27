@@ -16,6 +16,11 @@
 - {say: "Gibraltar tower, ready for departure runway two seven", intent: request_takeoff}
 - {say: "request takeoff", intent: request_takeoff}
 - {say: "request departure clearance", intent: request_clearance}
+# IFR clearance (added 2026-09-27; synthesized and unmeasured so far)
+- {say: "Gibraltar tower, November one seven two Sierra Papa, request IFR clearance to Edinburgh", intent: request_ifr_clearance}
+- {say: "request IFR clearance to Echo Golf Papa Hotel", intent: request_ifr_clearance}
+- {say: "IFR to Malaga, ready to copy", intent: request_ifr_clearance}
+- {say: "request clearance as filed", intent: request_ifr_clearance}
 
 # Emergencies and the pattern (intents added 2026-07-09)
 - {say: "mayday, mayday, mayday", intent: mayday}

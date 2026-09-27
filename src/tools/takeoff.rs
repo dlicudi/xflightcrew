@@ -65,6 +65,12 @@ struct Args {
     /// true = abort/reject the takeoff.
     #[serde(default)]
     off: bool,
+    /// The level the caller will fly to, set on the altitude dial before the
+    /// roll (full auto's IFR clearance altitude). Not in the schema: the
+    /// grammar never sets it, a pilot's "take off for me" leaves the dial as
+    /// before.
+    #[serde(default)]
+    level_ft: Option<f64>,
 }
 
 #[async_trait]
@@ -228,7 +234,7 @@ impl Tool for AutoTakeoff {
                 // A330 on a light sector was refused a 2,549 m runway by
                 // eleven metres, from every position on it (2026-09-20).
                 needed_m,
-                level_ft: None,
+                level_ft: a.level_ft.filter(|v| v.is_finite() && *v > 0.0),
                 handoff_agl_ft: autotakeoff::DEFAULT_HANDOFF_AGL_FT,
             },
             ctx.xplane.cancellation(),

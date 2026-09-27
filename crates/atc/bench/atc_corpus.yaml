@@ -62,6 +62,38 @@
 - {text: "request departure clearance", intent: request_clearance, radio: true}
 - {text: "Do we have clearance?", intent: request_clearance, radio: false}
 
+# --- IFR clearance (a route, a SID, an altitude, a code) ---------------------
+# Added 2026-09-27 with the IFR clearance: hand-written in the shapes the
+# brief names plus whisper's likely spellings. `dest` is what the parser must
+# carry (an ICAO upper case, a spelled one joined, else the name words). A
+# bare "request clearance" with no IFR word and no place stays the ZONE
+# clearance above; "clearance to leave/taxi/land/start" names no place.
+- {text: "request IFR clearance to EGPH", intent: request_ifr_clearance, dest: "EGPH", radio: true}
+- {text: "requesting ifr clearance to lemg", intent: request_ifr_clearance, dest: "LEMG", radio: true}
+- {text: "Gibraltar Tower, November 172SP, request IFR clearance to Edinburgh", intent: request_ifr_clearance, dest: "edinburgh", radio: true}
+- {text: "request clearance to Edinburgh", intent: request_ifr_clearance, dest: "edinburgh", radio: true}
+- {text: "request clearance to Edinburgh airport.", intent: request_ifr_clearance, dest: "edinburgh", radio: true}
+- {text: "IFR to Edinburgh, ready to copy", intent: request_ifr_clearance, dest: "edinburgh", radio: true}
+- {text: "November one seven two Sierra Papa, IFR to Malaga, ready to copy.", intent: request_ifr_clearance, dest: "malaga", radio: true}
+- {text: "request IFR clearance to Echo Golf Papa Hotel", intent: request_ifr_clearance, dest: "EGPH", radio: true}
+- {text: "request I F R clearance to Edinburgh", intent: request_ifr_clearance, dest: "edinburgh", radio: true}
+- {text: "ready to copy", intent: request_ifr_clearance, radio: true}
+- {text: "Gibraltar Tower, ready to copy.", intent: request_ifr_clearance, radio: true}
+- {text: "request clearance as filed", intent: request_ifr_clearance, radio: true}
+- {text: "request IFR clearance", intent: request_ifr_clearance, radio: true}
+- {text: "request IFR clearance as filed to Palma", intent: request_ifr_clearance, dest: "palma", radio: true}
+# Near misses: no place, or not a request at all.
+- {text: "request clearance to leave the zone", intent: request_clearance, radio: true}
+- {text: "request clearance to taxi to holding point alpha", intent: request_taxi, radio: true}
+- {text: "request clearance to land", intent: request_landing, radio: true}
+- {text: "request clearance to take off", intent: request_takeoff, radio: true}
+- {text: "request clearance to the holding point", intent: request_clearance, radio: true}
+- {text: "we're IFR today", intent: unknown, radio: false}
+- {text: "what's our IFR clearance?", intent: unknown, radio: false}
+# The readback: an echo, never a new request.
+- {text: "Cleared to Edinburgh via the Gosa one Charlie departure, runway two four, climb five thousand feet, squawk four five two one, November one seven two Sierra Papa.", intent: unknown, readback: true}
+- {text: "cleared to edinburgh, climb 5,000 feet, squawk 4521", intent: unknown, readback: true}
+
 # --- Start-up requests (NOT the zone clearance) -------------------------------
 # Real 2026-07-12 call: a parked, engines-off Malaga gate said the first line
 # and got "cleared to leave the zone" plus a squawk. The word "clearance" must

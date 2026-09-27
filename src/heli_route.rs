@@ -793,7 +793,7 @@ async fn call_departure(xp: &XPlaneClient, voice: &Option<Voice>, config: &crate
         status: None,
         reminders: None,
     };
-    crate::full_auto::get_zone_clearance(xp, &ctx, voice, &callsign).await;
+    crate::full_auto::get_zone_clearance(xp, &ctx, voice, &callsign, None).await;
     crate::blackbox::record(
         "heli_route",
         serde_json::json!({

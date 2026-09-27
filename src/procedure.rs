@@ -973,6 +973,47 @@ pub fn pilot_altitude() -> Option<f64> {
     *PILOT_ALT.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// The altitude an IFR clearance holds the climb to until the departure
+/// controller clears higher (`hold_at_cleared`): a CEILING on the plan's
+/// climb, never a target of its own, set by the crew before the follower
+/// starts and released at the departure check-in. A pilot's own altitude
+/// outranks it; the ground ahead and an unmet SID minimum outrank both.
+static CLEARED_CEILING: std::sync::Mutex<Option<f64>> = std::sync::Mutex::new(None);
+
+/// Hold the climb at the clearance's altitude (`Some`) or let it go on to
+/// the plan (`None`). Blackboxed either way.
+pub fn hold_at_cleared(ft: Option<f64>, why: &str) {
+    let mut c = CLEARED_CEILING.lock().unwrap_or_else(|e| e.into_inner());
+    if *c == ft {
+        return;
+    }
+    *c = ft;
+    crate::blackbox::record(
+        "procedure",
+        serde_json::json!({"event": "cleared_ceiling", "ft": ft, "why": why}),
+    );
+}
+
+/// The clearance's ceiling on the climb, while one holds.
+pub fn cleared_ceiling() -> Option<f64> {
+    *CLEARED_CEILING.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// The follower's altitude under a cleared ceiling: capped at it unless the
+/// PILOT has taken the vertical, and never below the terrain floor the
+/// vertical law already applied. Pure.
+pub fn cap_at_clearance(
+    want_ft: f64,
+    ceiling_ft: Option<f64>,
+    pilot_held: bool,
+    floor_ft: Option<f64>,
+) -> f64 {
+    match ceiling_ft {
+        Some(c) if !pilot_held && want_ft > c => c.max(floor_ft.unwrap_or(f64::MIN)),
+        _ => want_ft,
+    }
+}
+
 fn clear_pilot_altitude() {
     *PILOT_ALT.lock().unwrap_or_else(|e| e.into_inner()) = None;
     *PILOT_SPEED.lock().unwrap_or_else(|e| e.into_inner()) = None;
@@ -1677,6 +1718,7 @@ pub fn start_scoped(
             clear_pilot_altitude();
             publish_terrain_floor(None);
             crate::tools::speedhold::release();
+            hold_at_cleared(None, "follower_ended");
         });
         let Ok(rt) = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -1730,6 +1772,7 @@ fn stand_down(voice: &Option<Voice>, line: &str, reason: &str) {
     });
     ACTIVE.store(false, Ordering::SeqCst);
     clear_pilot_altitude();
+    hold_at_cleared(None, "stand_down");
     publish_terrain_floor(None);
     // Drop any cruise-power hold so nothing keeps working the throttle after we
     // hand back (no-op if it was never armed).
@@ -2473,6 +2516,9 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, plan: Pla
         // (`map_path`); every other leg the constraint law above.
         let path = map_path(leg, dist_nm, gs_kts);
         let want_alt = path.map_or(v.want_alt, |(a, _)| a);
+        // An IFR clearance's altitude caps the climb until departure clears
+        // higher; a SID minimum above it (below) still wins.
+        let want_alt = cap_at_clearance(want_alt, cleared_ceiling(), v.pilot, v.floored);
         // An unmet departure minimum ahead is a level to climb TO, not only
         // a reason to climb faster: a plan predicting 3,000 ft at RIM against
         // the chart's 4,000 levelled at 3,000 and the minimum watch then
@@ -2873,6 +2919,22 @@ pub fn terrain_probe_fatal(misses: &mut u32, frozen: bool) -> bool {
 
 #[cfg(test)]
 mod tests {
+    /// An IFR clearance's altitude caps the climb, below the plan's cruise,
+    /// until released; a pilot's own altitude outranks it and the ground
+    /// ahead outranks both.
+    #[test]
+    fn the_cleared_altitude_caps_the_climb() {
+        assert_eq!(cap_at_clearance(35_000.0, Some(5_000.0), false, None), 5_000.0);
+        assert_eq!(cap_at_clearance(4_000.0, Some(5_000.0), false, None), 4_000.0, "below it: the plan");
+        assert_eq!(cap_at_clearance(35_000.0, None, false, None), 35_000.0, "released");
+        assert_eq!(cap_at_clearance(9_000.0, Some(5_000.0), true, None), 9_000.0, "the pilot's");
+        assert_eq!(
+            cap_at_clearance(35_000.0, Some(5_000.0), false, Some(7_200.0)),
+            7_200.0,
+            "the terrain floor wins"
+        );
+    }
+
     fn fix_leg(ident: &str, lat: f64, lon: f64) -> ProcLeg {
         ProcLeg {
             seq: 0,

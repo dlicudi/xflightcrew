@@ -7768,3 +7768,74 @@ From `docs/tasks/2026-09-27-atc-loose-ends.md`. Offline only.
   asks for the longest assignable runway that fits, flown the cleared way; a
   pilot taxiing hears the numbers and the words to say (`atc`
   `cleared_runway_short`). `party_line::field_runways` is the new accessor.
+
+## 2026-09-27: the tower issues IFR clearances and the crew flies them
+
+The gap: every "request clearance" got the VFR zone clearance ("cleared to
+leave the zone, not above two thousand feet, squawk ..."), readback only
+suggested, while full auto flew SimBrief plans, picked its own SID
+(`choose_departure`) and set its own initial altitude. Nobody ever said
+"cleared to Edinburgh via the ... departure, climb five thousand feet".
+
+- **The intent** `tower::Intent::RequestIfrClearance { dest }` (`ifr_request`,
+  after the question guard, before the runway request): "request IFR
+  clearance to EGPH", "request clearance to Edinburgh", "IFR to Malaga, ready
+  to copy", "ready to copy", "as filed", a spelled code ("Echo Golf Papa
+  Hotel" is EGPH). "Clearance to leave/taxi/land/start/the holding point"
+  names no place and a bare "request clearance" stays the zone clearance.
+  `Intent` is Clone, no longer Copy (the dest is a String); the loose-ends
+  entry above says "kept Copy", which the merge ended.
+- **The clearance** (station `ifr_offer`, tower `ifr_clearance_line`): the
+  destination resolved against the region index (`resolve_destination`: code,
+  three letters also with K, else name words; two fields by one name get no
+  guess), unknown is "say again destination", none named "say destination".
+  Initial altitude `tower::ifr_initial_altitude_ft`: the higher of 5,000 ft and
+  field + 3,000, rounded up. The code: the discrete one at a radar field.
+  ICAO / CAP 413: "cleared to Edinburgh via the Gosa one Charlie departure,
+  runway zero niner, climb five thousand feet, squawk four five two one, QNH
+  ...". FAA: "cleared to Edinburgh airport via the ... departure, then as
+  filed, climb and maintain five thousand, departure frequency ..., squawk
+  ...". No SID: "after departure fly runway heading", never an invented name.
+- **The SID leaves toward the destination** (`nav::sid_exits`,
+  `nav::sid_toward`): `Station::set_procedures` positions every SID's exit fix
+  (last fix of its runway transition plus common route, one scan of each nav
+  file) on a background thread; the SID whose exit bearing from the field is
+  nearest the great-circle bearing to the destination is given. No positioned
+  exits yet: the first SID in the file for the runway (`sid_for_runway`).
+- **The readback is ENFORCED** (`Awaited::IfrClearance`,
+  `check_ifr_readback`): SID (by name or designator, "one Charlie"),
+  altitude and code must come back, a runway named must be ours. Wrong items
+  get "negative, ..." for as long as it takes; missing ones "read back ..."
+  and spend a challenge; a mishear is challenged twice, then let through with
+  NOTHING published. With `XCOPILOT_ATC_READBACK=false` any readback that says
+  the clearance stands.
+- **The seam**: `party_line::assigned_clearance()` (crate-private
+  `IFR_CLEARANCE`), set only on the accepted readback, retired with the squawk
+  by `install`, `uninstall` and the out-of-reach stand-down.
+- **Full auto flies it**: a SimBrief plan, or a local one above the
+  transition (`plan_is_ifr`), asks for it with the ICAO spelled
+  (`get_ifr_clearance`), reads back the tower's own coach line, dials the code
+  once accepted, and falls back to the zone clearance when none comes.
+  `choose_departure` tries the cleared SID first (`prefer_cleared_sid`,
+  `cleared_sid_for`); `departure_rechosen` names its source, cleared or chosen;
+  a plan whose runway stands flies the tower's SID or keeps its own
+  (`cleared_sid_not_flown`), never a third. The takeoff dials the cleared
+  altitude and the follower's climb is capped there
+  (`procedure::hold_at_cleared`, `cap_at_clearance`; a pilot's altitude, the
+  terrain floor and a SID minimum still outrank it) until the departure
+  check-in, or 90 s level with nobody to hand us over.
+
+Known weaknesses: the destination must be in the region index (staffed towers
+only; an untowered destination or `XCOPILOT_ATC_REGION=off` falls back to the
+zone clearance); a tower-only field clears with the code already held (7000
+unless assigned); the cap is released when the check-in is TRANSMITTED, not
+when departure answers; a second IFR request while a readback is owed gets
+"read back: ...", not a new clearance.
+
+Blackbox: `atc` `ifr_clearance` (side tower with `sid_exit_brg`, `dest_brg`;
+side crew), `full_auto` `request_clearance` with `ifr: true`,
+`ifr_clearance_missing`, `ifr_clearance_not_accepted`, `departure_rechosen`
+`source`, `cleared_sid_not_flown`, `cleared_ceiling_released`, `procedure`
+`cleared_ceiling`.
+
+NOT flown.

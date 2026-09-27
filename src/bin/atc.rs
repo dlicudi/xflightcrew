@@ -315,6 +315,9 @@ fn main() -> Result<()> {
                     on_ground: false,
                     own_on_runway: false,
                     helicopter: false,
+                    // No airport index here: an IFR request is asked to say
+                    // its destination again, never cleared.
+                    ifr: None,
                     runway_refusal: None,
                 };
                 let intent = if heard.confidence < config.stt_min_confidence {
