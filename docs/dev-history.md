@@ -8265,3 +8265,40 @@ Not touched (why the final was 244 m off, still open):
   FAF, the autoland arm's distance ("Autoland to ... N miles" of 4 or more),
   `reversal` events when the join was from the far side, no
   `off_centreline_low`. Offline only.
+
+## 2026-09-27: the compliance watch runs through an autoland
+
+Issue #63. The monitor's world block sits under `quiet` (a recovery,
+`autoland::ACTIVE`, the panel's mute, a wreck), and the compliance watch
+(`station::compliance_tick_facing`) was inside it, so it was never ticked
+from the autoland arm to the rollout handoff. Its air/ground edge
+(`prev_on_ground`) stayed the last airborne sample before the arm, and the
+first tick after the handoff read as the touchdown. 2026-09-26 (N816NN, no
+landing clearance, the tower still at `Parked`): touchdown at t 1790448341.9
+(flight `touchdown`, 146 kt), autoland handed over stopped at 1790448368.3,
+"you landed on runway three zero without clearance" at 1790448368.5, 26.6 s
+after the wheels and 27.9 s after radio 0. 2026-09-27 (LFBD, sortie
+`1790504948-full_auto`): the same shape, 20.8 s (touchdown 1790509565.7,
+handoff 1790509586.3, call 1790509586.5); that one's clearance had been
+spent by the crew's own "going around" call from a balk the wheels took,
+which `balk_landed` already fixes.
+
+Fix (`src/monitor.rs`): `world_gates` splits the gate. `quiet` (chatter,
+incursion, ATIS, squawk, the landing-clearance coach) is unchanged. The
+compliance watch has its own block before it: it TICKS on every live tick
+but a wreck (`compliance_ticks`), so its edges never go stale, and SPEAKS
+unless a recovery, the panel's mute or a wreck silences the world
+(`compliance_speaks`, the cabin's gate); a muted call is consumed, never said
+late. The COM1 read and `tuned_speaker` are hoisted out of the quiet block to
+serve both. No duplicate voice: the crew's own landing readback
+(`autoland` `landing_readback`) moves the tower to `ClearedToLand` and the
+watch stays silent; an owed readback is still `ClearedToLand`; the
+landing-clearance coach stays under `quiet`. Blackbox: `atc` `route:
+compliance` gains `autoland` and `said`. Tests:
+`an_uncleared_landing_is_called_at_touchdown_whoever_flies` (atc: every tick
+calls on the touchdown tick; the old skipped window calls 26 s late; cleared
+to land, silent through the rollout),
+`the_compliance_watch_runs_through_an_autoland`,
+`the_compliance_tick_is_not_under_the_quiet_gate`. Next autoland without a
+landing clearance, check: the `atc` `compliance` record's `t` within a tick
+of the flight `touchdown`, with `autoland: true, said: true`. Offline only.

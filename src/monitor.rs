@@ -2354,6 +2354,35 @@ fn r1(v: f64) -> f64 {
     (v * 10.0).round() / 10.0
 }
 
+/// Who in the world block may act this tick. `quiet` mutes the world's
+/// narration while the flight deck is busy (a recovery, an autoland, the
+/// panel's mute, a wreck). The cabin and the compliance watch are not
+/// narration: they are state machines that must SEE the flight, the autoland
+/// included (the cabin missed its own landing, Liege 2026-09-22; the
+/// compliance watch called an uncleared landing 26.6 s late, 2026-09-26,
+/// issue #63). They speak unless a recovery, the panel's mute or a wreck
+/// silences them; the compliance watch TICKS on every live tick but a wreck,
+/// so its air/ground edges never go stale.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct WorldGates {
+    quiet: bool,
+    cabin_quiet: bool,
+    compliance_ticks: bool,
+    compliance_speaks: bool,
+    autoland: bool,
+}
+
+fn world_gates(recovering: bool, autoland: bool, panel_mute: bool, crashed: bool) -> WorldGates {
+    let silenced = recovering || panel_mute || crashed;
+    WorldGates {
+        quiet: silenced || autoland,
+        cabin_quiet: silenced,
+        compliance_ticks: !crashed,
+        compliance_speaks: !silenced,
+        autoland,
+    }
+}
+
 /// Whether the radio has power, from the airframe's avionics readback and the
 /// value read off it. Fails OPEN twice over: no readback dataref (the airframe
 /// models no avionics master) and a failed read both mean powered.
@@ -2950,10 +2979,13 @@ pub async fn run(
             // under the same gates as the visual-approach talk-down. A crashed
             // airframe silences the whole world block: no controller works a
             // wreck, and the frozen flight model reads as garbage anyway.
-            let quiet = crate::tools::recover::ACTIVE.load(std::sync::atomic::Ordering::Relaxed)
-                || crate::autoland::ACTIVE.load(std::sync::atomic::Ordering::Relaxed)
-                || PANEL_MUTE.load(std::sync::atomic::Ordering::Relaxed)
-                || voice.crashed();
+            let gates = world_gates(
+                crate::tools::recover::ACTIVE.load(std::sync::atomic::Ordering::Relaxed),
+                crate::autoland::ACTIVE.load(std::sync::atomic::Ordering::Relaxed),
+                PANEL_MUTE.load(std::sync::atomic::Ordering::Relaxed),
+                voice.crashed(),
+            );
+            let quiet = gates.quiet;
             // The CABIN is not part of that. `quiet` mutes the world's
             // narration while the flight deck is busy, and an autoland is
             // exactly when it is - but the cabin is a state machine that has
@@ -2963,10 +2995,7 @@ pub async fn run(
             // approach (Liege 2026-09-22, "cabin is secure for departure"
             // during the taxi in). A recovery, the panel's mute and a wreck
             // still silence it; a normal landing does not.
-            let cabin_quiet = crate::tools::recover::ACTIVE
-                .load(std::sync::atomic::Ordering::Relaxed)
-                || PANEL_MUTE.load(std::sync::atomic::Ordering::Relaxed)
-                || voice.crashed();
+            let cabin_quiet = gates.cabin_quiet;
             feed_surface_wind();
             // The oxygen valve follows the oxygen master (crew hands only).
             if crate::mode::crew_actuates() {
@@ -3026,14 +3055,76 @@ pub async fn run(
                     voice.alert_cabin(Priority::Advisory, line);
                 }
             }
-            if !quiet {
-                // One COM1 read serves the incursion shout, the ATIS loop and
-                // the traffic advisories below.
-                let com1: Option<i64> = xp
-                    .get_float(crate::datarefs::COM1_FREQ_KHZ)
+            // One COM1 read serves the compliance watch, the incursion
+            // shout, the ATIS loop and the traffic advisories below, read
+            // whenever the compliance watch ticks (a wreck reads nothing).
+            let com1: Option<i64> = if gates.compliance_ticks {
+                xp.get_float(crate::datarefs::COM1_FREQ_KHZ)
                     .await
                     .ok()
-                    .map(|v| v.round() as i64);
+                    .map(|v| v.round() as i64)
+            } else {
+                None
+            };
+            // Which CONTROLLER the radio actually hears, resolved once per
+            // tick: every controller call below speaks in THIS voice (or
+            // falls to the crew when None). A berate hardcoded to the
+            // Tower while the pilot sat on the approach frequency put two
+            // controllers on one radio (2026-07-12).
+            let tuned_speaker = com1.and_then(crate::station::tuned_controller);
+            // Compliance watch: the tower holds the pilot to the clearances
+            // it actually issued (uncleared runway entry, takeoff, landing),
+            // and challenges zone traffic it has never talked to. Tuned to
+            // the station the controller speaks; otherwise the copilot flags
+            // it as crew: a controller can't berate a radio that isn't
+            // listening.
+            //
+            // NOT under `quiet`: that gate includes `autoland::ACTIVE`, and
+            // the landing clearance is exactly what this watch guards. Gated
+            // with the chatter it was never ticked from the autoland arm to
+            // the rollout handoff, so its air/ground edge went stale and an
+            // uncleared landing was called on the first tick after the
+            // handoff, 26.6 s after the touchdown, at a stopped aircraft
+            // (2026-09-26, issue #63). It TICKS on every live tick but a
+            // wreck, so its edges are always current, and SPEAKS unless a
+            // recovery, the panel's mute or a wreck silences the world (the
+            // cabin's gate). A muted call is consumed, never said late.
+            if gates.compliance_ticks {
+                if let Some(call) = crate::station::compliance_tick_facing(
+                    snap.lat,
+                    snap.lon,
+                    snap.alt_ft,
+                    crate::hover::tower_on_ground(snap.on_ground, snap.agl_ft),
+                    snap.groundspeed_kts,
+                    tuned_speaker.is_some(),
+                    now,
+                    Some(snap.heading_deg).filter(|h| *h != 0.0),
+                ) {
+                    crate::blackbox::record(
+                        "atc",
+                        serde_json::json!({
+                            "route": "compliance", "crew": call.crew, "reply": &call.line,
+                            "autoland": gates.autoland, "said": gates.compliance_speaks,
+                        }),
+                    );
+                    if !gates.compliance_speaks {
+                        // A recovery, the panel's mute: consumed, unsaid.
+                    } else if call.crew {
+                        voice.alert(Priority::Caution, call.line);
+                    } else {
+                        // The controller you're actually TUNED to delivers
+                        // it (approach relays a deviation and the phone
+                        // number exactly like the real thing), never the
+                        // tower's voice on someone else's frequency.
+                        let who = tuned_speaker.unwrap_or(crate::voice::StationSpeaker::Tower);
+                        if let Some(s) = status.as_ref() {
+                            s.action(&format!("{}: {}", who.tag(), call.line));
+                        }
+                        voice.alert_station(Priority::Warning, who, call.line);
+                    }
+                }
+            }
+            if !quiet {
                 // Tell the speech arbiter what COM1 hears (controllers AND
                 // the ATIS loop): it cuts a live station transmission the
                 // instant we tune off its frequency, and lets a stepped-on
@@ -3045,12 +3136,6 @@ pub async fn run(
                 // every transmission studio-clean at 60 nm.
                 voice
                     .set_station_range(crate::station::active_station_range_nm(snap.lat, snap.lon));
-                // Which CONTROLLER the radio actually hears, resolved once per
-                // tick: every controller call below speaks in THIS voice (or
-                // falls to the crew when None). A berate hardcoded to the
-                // Tower while the pilot sat on the approach frequency put two
-                // controllers on one radio (2026-07-12).
-                let tuned_speaker = com1.and_then(crate::station::tuned_controller);
                 // Radio audio needs a powered receiver: with the avionics
                 // master OFF the pilot can't hear ATC/ATIS/traffic. Confident
                 // reads only — a read failure or an airframe with no avionics
@@ -3424,44 +3509,6 @@ pub async fn run(
                                 );
                                 voice.alert(Priority::Caution, line);
                             }
-                        }
-                    }
-                }
-                // Compliance watch: the tower holds the pilot to the
-                // clearances it actually issued (uncleared runway entry,
-                // takeoff, landing), and challenges zone traffic it has
-                // never talked to. Tuned to the station the controller
-                // speaks; otherwise the copilot flags it as crew — a
-                // controller can't berate a radio that isn't listening.
-                {
-                    if let Some(call) = crate::station::compliance_tick_facing(
-                        snap.lat,
-                        snap.lon,
-                        snap.alt_ft,
-                        crate::hover::tower_on_ground(snap.on_ground, snap.agl_ft),
-                        snap.groundspeed_kts,
-                        tuned_speaker.is_some(),
-                        now,
-                        Some(snap.heading_deg).filter(|h| *h != 0.0),
-                    ) {
-                        crate::blackbox::record(
-                            "atc",
-                            serde_json::json!({
-                                "route": "compliance", "crew": call.crew, "reply": &call.line,
-                            }),
-                        );
-                        if call.crew {
-                            voice.alert(Priority::Caution, call.line);
-                        } else {
-                            // The controller you're actually TUNED to delivers
-                            // it (approach relays a deviation and the phone
-                            // number exactly like the real thing) — never the
-                            // tower's voice on someone else's frequency.
-                            let who = tuned_speaker.unwrap_or(crate::voice::StationSpeaker::Tower);
-                            if let Some(s) = status.as_ref() {
-                                s.action(&format!("{}: {}", who.tag(), call.line));
-                            }
-                            voice.alert_station(Priority::Warning, who, call.line);
                         }
                     }
                 }
@@ -4800,6 +4847,51 @@ fn feed_surface_wind() {
 
 #[cfg(test)]
 mod tests {
+    /// Issue #63 (2026-09-26): `quiet` includes `autoland::ACTIVE`, and the
+    /// compliance watch rode it, so an uncleared landing under an autoland
+    /// was called 26.6 s after the touchdown, at the handoff. The watch now
+    /// ticks and speaks through an autoland; the chatter stays quiet; a
+    /// recovery and the panel's mute still silence it; a wreck stops it.
+    #[test]
+    fn the_compliance_watch_runs_through_an_autoland() {
+        let g = super::world_gates(false, true, false, false);
+        assert!(g.quiet, "chatter stays quiet under an autoland");
+        assert!(g.compliance_ticks && g.compliance_speaks, "{g:?}");
+        assert!(!g.cabin_quiet);
+        // Hand-flown: the same watch, the same voice.
+        let h = super::world_gates(false, false, false, false);
+        assert!(!h.quiet && h.compliance_ticks && h.compliance_speaks);
+        // A recovery or the panel's mute: ticked (edges current), unsaid.
+        for g in [
+            super::world_gates(true, false, false, false),
+            super::world_gates(false, false, true, false),
+        ] {
+            assert!(g.quiet && g.cabin_quiet && g.compliance_ticks && !g.compliance_speaks);
+        }
+        // A wreck: nothing ticks, nothing speaks.
+        let w = super::world_gates(false, false, false, true);
+        assert!(w.quiet && !w.compliance_ticks && !w.compliance_speaks);
+    }
+
+    /// The watch's call site sits outside the `if !quiet` world block: a
+    /// refactor that moves it back in brings issue #63 back.
+    #[test]
+    fn the_compliance_tick_is_not_under_the_quiet_gate() {
+        let src = include_str!("monitor.rs");
+        let tick = src
+            .find("crate::station::compliance_tick_facing(")
+            .expect("call site");
+        let gate = src[..tick]
+            .rfind("if gates.compliance_ticks {")
+            .expect("its own gate");
+        assert!(
+            !src[gate..tick].contains("if !quiet"),
+            "the compliance watch is back under `quiet`"
+        );
+        let quiet_block = src.find("            if !quiet {\n").expect("world block");
+        assert!(tick < quiet_block, "compliance tick inside the quiet block");
+    }
+
     /// 1790441293 (737, LEMG 13): the `state` records' `in` at the four
     /// `yoke_under_ap` interventions, every one the crew's own channel read
     /// back (the takeoff's climb_manual pitch -0.371 at the AP engage, then
