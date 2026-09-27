@@ -1384,6 +1384,39 @@ pub fn descent_drag(
     (want_out, scale)
 }
 
+/// Why the speedbrake may not be out in this configuration, if it may not:
+/// `"gear"` with the gear handle down, `"flaps"` with the flap handle past the
+/// airframe's first detent (`flap_limits`, retracted first; any flap at all
+/// when none is declared). A crew rule, not a speed rule: the drag is for a
+/// clean descent, and the approach slows on flap and gear.
+///
+/// EGKK 26L, 2026-09-27 (sortie 1790510400-full_auto, stock 737): the
+/// follower put the speedbrake out at 218 kt against a 210 target and
+/// 2,000 fpm down, then configured for the final with it still out: gear
+/// down and flaps 10, 25, 30, 40 before the speed let it in, and out again
+/// for five seconds at flaps 40. The SPEEDBRAKE EXTENDED caution kept
+/// tripping the master caution through the approach. `descent_drag`'s
+/// shallower rate is what the descent keeps.
+pub fn drag_barred(
+    flap_handle: f64,
+    gear_handle_down: bool,
+    flap_limits: &[(f64, Option<f64>)],
+) -> Option<&'static str> {
+    if gear_handle_down {
+        return Some("gear");
+    }
+    let first_detent = flap_limits
+        .iter()
+        .map(|(r, _)| *r)
+        .filter(|r| r.is_finite() && *r > 0.01)
+        .min_by(f64::total_cmp)
+        .unwrap_or(0.0);
+    if flap_handle > first_detent + 0.01 {
+        return Some("flaps");
+    }
+    None
+}
+
 pub fn vertical_tick(
     leg: &ProcLeg,
     carry: f64,
@@ -2802,7 +2835,23 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, plan: Pla
             let (want_out, scale) =
                 descent_drag(ours, ias, crate::tools::speedhold::flight_target(), vs_cmd);
             vs_cmd *= scale;
-            if want_out != ours && crate::takeoff_config::has_speedbrake() {
+            let has_speedbrake = crate::takeoff_config::has_speedbrake();
+            // Never with flap or gear (`drag_barred`), read only while the
+            // drag is out or wanted. A failed read is no measurement: a brake
+            // of ours stays as the speed rule says, one not out stays in.
+            let barred = if has_speedbrake && (ours || want_out) {
+                let (flap_r, gear_r) =
+                    tokio::join!(xp.get_float(FLAP_RATIO), xp.get_float(GEAR_HANDLE));
+                match (flap_r, gear_r) {
+                    (Ok(f), Ok(g)) => drag_barred(f, g > 0.5, &crate::aircraft::flap_limits()),
+                    _ if ours => None,
+                    _ => Some("unread"),
+                }
+            } else {
+                None
+            };
+            let want_out = want_out && barred.is_none();
+            if want_out != ours && has_speedbrake {
                 // Read first: a lever already out is the pilot's, and an
                 // ARMED one (negative) is stowed-and-armed, ours to use.
                 let at = xp.get_float(SPEEDBRAKE).await.ok();
@@ -2818,7 +2867,8 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, plan: Pla
                             "procedure",
                             serde_json::json!({"event": "speedbrake", "out": want_out,
                                 "ias": ias, "target": crate::tools::speedhold::flight_target(),
-                                "vs_cmd": vs_cmd}),
+                                "vs_cmd": vs_cmd,
+                                "why": if want_out { "speed" } else { barred.unwrap_or("speed") }}),
                         );
                         alert(
                             &voice,
@@ -3245,6 +3295,45 @@ mod tests {
         assert_eq!(descent_drag(true, 278.0, Some(250.0), 0.0), (false, 1.0));
         assert_eq!(descent_drag(false, 278.0, Some(250.0), 800.0), (false, 1.0));
         assert_eq!(descent_drag(false, 278.0, None, -2000.0), (false, 1.0));
+    }
+
+    /// EGKK 26L, 2026-09-27 (sortie 1790510400-full_auto, stock 737): out at
+    /// 218 kt against 210.25 and 2,000 fpm down, kept out through gear down
+    /// and flaps 10 to 40. The speed rule still asks for it; the
+    /// configuration says no, and the shallower rate is what is left.
+    #[test]
+    fn the_speedbrake_is_never_out_with_landing_flap_or_gear() {
+        // The 737's detents, as the profile declares them.
+        let b738: Vec<(f64, Option<f64>)> = [0.0, 0.125, 0.25, 0.375, 0.5, 0.625, 0.75, 0.875, 1.0]
+            .iter()
+            .map(|r| (*r, None))
+            .collect();
+        // The speed rule, alone, wanted it out at the sortie's numbers...
+        assert_eq!(
+            descent_drag(false, 218.36, Some(210.25), -2000.0),
+            (true, 1.0)
+        );
+        // ...clean it may be, and flaps 1 is still the clean descent...
+        assert_eq!(drag_barred(0.0, false, &b738), None);
+        assert_eq!(drag_barred(0.125, false, &b738), None);
+        // ...flaps 10 (the sortie's 0.5), 5, 40 and the gear say in.
+        assert_eq!(drag_barred(0.5, false, &b738), Some("flaps"));
+        assert_eq!(drag_barred(0.375, false, &b738), Some("flaps"));
+        assert_eq!(drag_barred(1.0, false, &b738), Some("flaps"));
+        assert_eq!(drag_barred(0.0, true, &b738), Some("gear"));
+        assert_eq!(drag_barred(1.0, true, &b738), Some("gear"));
+        // No detents declared: any flap at all.
+        assert_eq!(drag_barred(0.1, false, &[]), Some("flaps"));
+        assert_eq!(drag_barred(0.0, false, &[]), None);
+        // The 5 s re-deployment at full flap: 153.6 kt against 145 and
+        // 968 fpm down is out by speed, in by configuration.
+        assert_eq!(descent_drag(false, 153.56, Some(145.0), -967.7).0, true);
+        assert_eq!(drag_barred(1.0, true, &b738), Some("gear"));
+        // A runaway still shallows the descent with the brake barred.
+        assert_eq!(
+            descent_drag(false, 235.0, Some(210.0), -2000.0),
+            (true, 0.5)
+        );
     }
 
     use super::*;

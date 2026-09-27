@@ -446,6 +446,7 @@ everything blackboxes to `logs/blackbox.jsonl` (kinds: `atc`, `autotaxi`, `autot
   (`project_signed_facing`); the taxi law's idle-and-brake waits unless a surge (`SURGE_KTS_S`).
 - **A descent that outruns the governor gets drag, then a shallower rate**
   (`procedure::descent_drag`: speedbrake where `arm_spoilers` is declared; stowed on every exit).
+  Never with the gear down or flap past the first detent (`drag_barred`, `why`; EGKK 2026-09-27).
 
 ### The follower's vertical and the altimeter
 - **Three owners in order** (`procedure::vertical_tick`, pure): the PLAN's constraint, paced to its
