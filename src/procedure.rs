@@ -1243,6 +1243,9 @@ pub struct Vertical {
     /// A plan altitude above the level already commanded in the descent,
     /// held rather than climbed to: `(plan_ft, held_ft)`.
     pub descent_held: Option<(f64, f64)>,
+    /// A plan altitude below the level already commanded in the CLIMB,
+    /// held rather than descended to: `(plan_ft, held_ft)`.
+    pub climb_held: Option<(f64, f64)>,
 }
 
 /// Where the flight is on the plan's profile, for [`vertical_tick`]: once it
@@ -1254,17 +1257,28 @@ pub struct Vertical {
 /// CHELY at 29,000 and CLIMBED to 28,999 before descending again for VERSO.
 /// SimBrief's navlog altitudes down a descent are where it predicts the
 /// aircraft to be, and a crew that has started down never climbs back.
+///
+/// And the mirror: until the cruise is REACHED, a plan altitude below the
+/// level already commanded is not a descent. LFBD-EGKK, 2026-09-27 (sortie
+/// 1790510400-full_auto): climbing through 7,638 ft for FL340, the CNA6R's
+/// "course 296, at or above 660 ft" leg dialled 660, the terrain floor raised
+/// it to 705 ("holding 800 feet") and, the cruise having been COMMANDED from
+/// the first leg, the old rule called that a descent from 34,000 and held
+/// BD923's 34,000 at 705: 14 minutes at 1,200 ft until the pilot dialled it.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct DescentProfile {
     /// The plan's cruise: its highest leg altitude. `None` switches the rule
     /// off (an approach's own procedure, a plan without altitudes).
     pub cruise_ft: Option<f64>,
-    /// The highest altitude the PLAN has commanded this flight (never the
-    /// pilot's or the terrain floor's), carried tick to tick.
+    /// The highest altitude FLOWN this flight, carried tick to tick. Flown,
+    /// not commanded: FL340 is commanded from the runway's first leg.
     pub peak_ft: f64,
     /// The leg is past the plan's last leg at its cruise altitude: whatever
     /// follows is the descent, which covers a follower armed mid-descent.
     pub past_top: bool,
+    /// The arrival's ceilings lowered this leg (`ceilinged_leg_alt`): the
+    /// plan's own descent begun before the cruise was reached, not a dip.
+    pub arrival_ceiling: bool,
 }
 
 impl DescentProfile {
@@ -1275,21 +1289,25 @@ impl DescentProfile {
     }
 
     /// Whether a flight that last commanded `prev_cmd` has begun its descent
-    /// on the plan's profile: it has commanded the cruise and is now below
+    /// on the plan's profile: it has flown the cruise and now commands below
     /// it, or it is past the plan's top and below the cruise. A step climb
     /// BEFORE the top of descent is neither: the cruise is not reached yet.
     pub fn descending(&self, prev_cmd: f64) -> bool {
         let Some(cruise) = self.cruise_ft else {
             return false;
         };
-        let top = if self.past_top {
-            cruise
-        } else if self.peak_ft >= cruise - STEP_FT {
-            self.peak_ft
-        } else {
-            return false;
-        };
-        prev_cmd < top - STEP_FT
+        (self.past_top || self.cruise_reached(cruise)) && prev_cmd < cruise - STEP_FT
+    }
+
+    /// Whether the flight is still climbing to the plan's cruise: never
+    /// flown it, not past the plan's top, no arrival ceiling in force.
+    pub fn climbing(&self) -> bool {
+        self.cruise_ft
+            .is_some_and(|c| !self.past_top && !self.arrival_ceiling && !self.cruise_reached(c))
+    }
+
+    fn cruise_reached(&self, cruise: f64) -> bool {
+        self.peak_ft >= cruise - STEP_FT
     }
 }
 
@@ -1388,11 +1406,19 @@ pub fn vertical_tick(
         descent_held = Some((leg_alt, prev_cmd));
         leg_alt = prev_cmd;
     }
+    // In the climb a plan altitude below the level already commanded (a
+    // CA leg's "at or above", a navlog prediction) is held at that level:
+    // a crew climbing to its cruise never descends for a minimum it passed.
+    let mut climb_held = None;
+    if pilot.is_none() && profile.climbing() && leg_alt < prev_cmd - 50.0 {
+        climb_held = Some((leg_alt, prev_cmd));
+        leg_alt = prev_cmd;
+    }
     let (mut want_alt, mut target_fpm) =
         descent_target(leg_alt, prev_cmd, alt_ft, dist_nm, gs_kts, descent_fpm);
-    // Only the PLAN's own targets count toward its peak: a pilot's level or
-    // a terrain floor above the cruise is not the cruise.
-    let peak_ft = profile.peak_ft.max(want_alt);
+    // The cruise is reached by FLYING it: commanded from the first leg, it
+    // made a climb through 7,600 ft look like a descent (LFBD 2026-09-27).
+    let peak_ft = profile.peak_ft.max(alt_ft);
     let from_pilot = pilot.is_some();
     if let Some(p) = pilot {
         want_alt = p;
@@ -1415,6 +1441,7 @@ pub fn vertical_tick(
         target_fpm,
         peak_ft,
         descent_held,
+        climb_held,
     }
 }
 
@@ -2067,6 +2094,7 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, plan: Pla
     let plan_top = descent_cruise_ft.and_then(|c| plan_top_index(&legs, c));
     let mut plan_peak_ft = prev_cmd_alt;
     let mut descent_held_logged: Option<usize> = None;
+    let mut climb_held_logged: Option<usize> = None;
     if !arrival_constraints.is_empty() {
         crate::blackbox::record(
             "procedure",
@@ -2564,7 +2592,7 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, plan: Pla
         // The STAR's "at or below"s ahead, kept reachable: this fix's target
         // comes down to whatever still makes the tightest one further on.
         let star_leg;
-        let leg_for_vertical = match ceilinged_leg_alt(
+        let (leg_for_vertical, arrival_ceiling) = match ceilinged_leg_alt(
             &legs,
             &arrival_constraints,
             idx,
@@ -2584,9 +2612,9 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, plan: Pla
                 let mut l = leg.clone();
                 l.alt1_ft = Some(alt);
                 star_leg = l;
-                &star_leg
+                (&star_leg, true)
             }
-            None => leg,
+            None => (leg, false),
         };
         let v = vertical_tick(
             leg_for_vertical,
@@ -2602,9 +2630,20 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, plan: Pla
                 cruise_ft: descent_cruise_ft,
                 peak_ft: plan_peak_ft,
                 past_top: plan_top.is_some_and(|t| idx > t),
+                arrival_ceiling,
             },
         );
         plan_peak_ft = v.peak_ft;
+        if let Some((plan_ft, held_ft)) = v.climb_held {
+            if climb_held_logged != Some(idx) {
+                climb_held_logged = Some(idx);
+                crate::blackbox::record(
+                    "procedure",
+                    serde_json::json!({"event": "climb_no_descent", "idx": idx, "fix": leg.fix_ident,
+                                       "plan_ft": plan_ft, "held_ft": held_ft, "alt_ft": alt_ft}),
+                );
+            }
+        }
         if let Some((plan_ft, held_ft)) = v.descent_held {
             if descent_held_logged != Some(idx) {
                 descent_held_logged = Some(idx);
@@ -3934,6 +3973,7 @@ mod tests {
                     cruise_ft: with_profile.then_some(cruise),
                     peak_ft: peak,
                     past_top: top.is_some_and(|t| idx > t),
+                    arrival_ceiling: false,
                 };
                 let v = vertical_tick(l, carry, prev, alt, Some(d), GS, None, None, RATE, profile);
                 carry = v.carry;
@@ -3972,7 +4012,7 @@ mod tests {
     fn in_descent(pilot: Option<f64>, floor: Option<f64>) -> Vertical {
         let mut chely = leg("CHELY", 41.0, 3.0);
         chely.alt1_ft = Some(29_000.0);
-        let profile = DescentProfile { cruise_ft: Some(31_000.0), peak_ft: 31_000.0, past_top: true };
+        let profile = DescentProfile { cruise_ft: Some(31_000.0), peak_ft: 31_000.0, past_top: true, ..Default::default() };
         vertical_tick(&chely, 28_000.0, 28_000.0, 28_000.0, Some(8.0), 420.0, pilot, floor, 2_000.0, profile)
     }
 
@@ -4008,11 +4048,95 @@ mod tests {
             cruise_ft: Some(31_000.0),
             peak_ft: 29_000.0,
             past_top: top.is_some_and(|t| 1 > t),
+            arrival_ceiling: false,
         };
         let v = vertical_tick(&step, 29_000.0, 29_000.0, 29_000.0, Some(60.0), 420.0, None, None, 2_000.0, profile);
         assert_eq!(v.want_alt, 31_000.0);
         assert_eq!(v.descent_held, None);
-        assert_eq!(v.peak_ft, 31_000.0);
+        assert_eq!(v.peak_ft, 29_000.0, "the peak is what was flown");
+    }
+
+    /// LFBD-EGKK, 2026-09-27 (sortie 1790510400-full_auto): the CNA6R from
+    /// runway 29 as the follower flew it. DER29 and BD923 carry the plan's
+    /// FL340, the CA leg between them its chart's "at or above 660".
+    fn lfbd_cna6r() -> (ProcLeg, ProcLeg, ProcLeg) {
+        let mut der = leg("DER29", 44.83, -0.72);
+        der.leg_type = "DF".to_string();
+        der.alt1_ft = Some(34_000.0);
+        let ca = to_alt('+', 660.0);
+        let mut bd923 = leg("BD923", 44.93, -0.80);
+        bd923.leg_type = "DF".to_string();
+        bd923.alt1_ft = Some(34_000.0);
+        (der, ca, bd923)
+    }
+
+    /// THE bug of LFBD 2026-09-27: climbing through 7,638 ft on the CA leg
+    /// with FL340 commanded since the runway, the terrain floor at 705 ft
+    /// (the probe's ground plus 1,000). The CA's 660 dialled the aircraft
+    /// down, the floor made it 705, and BD923's FL340 was then held at 705
+    /// as a "descent that never climbs back". Both legs keep climbing now.
+    #[test]
+    fn a_climb_never_descends_to_a_minimum_it_has_passed() {
+        let (der, ca, bd923) = lfbd_cna6r();
+        let legs = vec![der.clone(), ca.clone(), bd923.clone()];
+        let cruise = 34_000.0;
+        let top = plan_top_index(&legs, cruise);
+        let profile = |idx: usize, peak: f64| DescentProfile {
+            cruise_ft: Some(cruise),
+            peak_ft: peak,
+            past_top: top.is_some_and(|t| idx > t),
+            arrival_ceiling: false,
+        };
+        let floor = Some(705.0);
+        let v0 = vertical_tick(&der, 34_000.0, 34_000.0, 7_618.0, Some(0.76), 265.0, None, floor, 2_000.0, profile(0, 7_618.0));
+        assert_eq!(v0.want_alt, 34_000.0);
+        let v1 = vertical_tick(&ca, v0.carry, v0.prev_cmd, 7_638.0, None, 265.0, None, floor, 2_000.0, profile(1, v0.peak_ft));
+        assert_eq!(v1.want_alt, 34_000.0, "the CA's 660 is a minimum passed long ago");
+        assert_eq!(v1.floored, None, "the floor is only ever a minimum");
+        assert_eq!(v1.climb_held, Some((660.0, 34_000.0)), "plan_ft and held_ft for the blackbox");
+        let v2 = vertical_tick(&bd923, v1.carry, v1.prev_cmd, 7_658.0, Some(7.4), 265.0, None, floor, 2_000.0, profile(2, v1.peak_ft));
+        assert_eq!(v2.want_alt, 34_000.0, "BD923 climbs on to the cruise");
+        assert!(v2.want_alt >= v1.prev_cmd);
+        assert_eq!(v2.descent_held, None);
+        assert_eq!(v2.climb_held, None);
+    }
+
+    /// The same tick without the profile: the test must bite. The CA's 660
+    /// goes through and the floor is what stops the dive.
+    #[test]
+    fn the_lfbd_climb_bit_without_the_profile() {
+        let (_, ca, _) = lfbd_cna6r();
+        let v = vertical_tick(&ca, 34_000.0, 34_000.0, 7_638.0, None, 265.0, None, Some(705.0), 2_000.0, DescentProfile::none());
+        assert_eq!(v.want_alt, 705.0, "without the profile the CA dials the aircraft down");
+    }
+
+    /// FL340 commanded but only 7,700 ft flown is not the cruise: not in the
+    /// descent, still climbing. Flown to within a step of it, it is.
+    #[test]
+    fn a_cruise_commanded_but_not_flown_is_not_descending() {
+        let climb = DescentProfile { cruise_ft: Some(34_000.0), peak_ft: 7_700.0, past_top: false, arrival_ceiling: false };
+        assert!(!climb.descending(705.0));
+        assert!(!climb.descending(34_000.0));
+        assert!(climb.climbing());
+        let cruised = DescentProfile { peak_ft: 33_950.0, ..climb };
+        assert!(cruised.descending(31_000.0));
+        assert!(!cruised.climbing());
+        // Past the plan's top it is the descent whatever was flown.
+        let past = DescentProfile { past_top: true, ..climb };
+        assert!(past.descending(7_700.0));
+        assert!(!past.climbing());
+    }
+
+    /// An arrival ceiling before the cruise was reached (a short flight, a
+    /// slow climb) is the plan's descent, not a dip: it is flown.
+    #[test]
+    fn an_arrival_ceiling_in_the_climb_is_flown() {
+        let mut fix = leg("REVTU", 51.0, 0.0);
+        fix.alt1_ft = Some(26_600.0);
+        let profile = DescentProfile { cruise_ft: Some(34_000.0), peak_ft: 30_000.0, past_top: false, arrival_ceiling: true };
+        let v = vertical_tick(&fix, 34_000.0, 34_000.0, 30_000.0, Some(5.0), 420.0, None, None, 2_000.0, profile);
+        assert_eq!(v.climb_held, None);
+        assert!(v.want_alt < 30_000.0, "the ceiling is paced down to: {}", v.want_alt);
     }
 
     /// A follower armed mid-descent (a resume) has never commanded the
@@ -4021,7 +4145,7 @@ mod tests {
     fn a_follower_armed_in_the_descent_holds_too() {
         let mut chely = leg("CHELY", 41.0, 3.0);
         chely.alt1_ft = Some(29_000.0);
-        let profile = DescentProfile { cruise_ft: Some(31_000.0), peak_ft: 28_000.0, past_top: true };
+        let profile = DescentProfile { cruise_ft: Some(31_000.0), peak_ft: 28_000.0, past_top: true, ..Default::default() };
         let v = vertical_tick(&chely, 28_000.0, 28_000.0, 28_000.0, Some(8.0), 420.0, None, None, 2_000.0, profile);
         assert_eq!(v.want_alt, 28_000.0);
         // Not past the top and never at the cruise: a climb.

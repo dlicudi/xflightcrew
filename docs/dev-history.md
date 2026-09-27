@@ -8102,3 +8102,59 @@ and `touched` added; the debrief prints `balk_landed`. The first LFBD
 approach's `off_centreline_low` at 96 ft still calls as soon as it climbs.
 Tests: `a_flare_is_credited_the_air_it_has_already_flown`,
 `a_low_balk_is_called_on_the_radio_only_once_it_climbs`. Offline only.
+
+## 2026-09-27: a climb never descends to a minimum it has passed; the cruise is reached by flying it
+
+LFBD-EGKK, stock 737-800, full auto, cruise FL340 (sortie
+`1790510400-full_auto`, issue #103). The follower flew the CNA6R from runway
+29 as charted (`charted_departure_legs`): DF DER29 and DF BD923 carrying the
+plan's 34,000 (neither is in the plan, so both take the join's altitude),
+and between them the chart's CA "course 296, at or above 660 ft" (CIFP
+`SID:020,5,CNA6R,RW29,...,CA,...,2960,...,+,00660`), which keeps its own
+altitude. Climbing through 7,638 ft at t 1790511150.8 the follower
+sequenced to the CA (idx 1, done at once, the aircraft being far above it)
+and to BD923 (idx 2):
+
+- idx 1: `commanded_alt_ft` gave the CA's 660, below the aircraft. The
+  terrain floor (probe plus 1,000 ft, 705) was above it, so `terrain_floor`
+  fired with floor 705 and "Terrain ahead, holding 800 feet." went out; the
+  floor was only ever a minimum, the plan target was the fault.
+- idx 2: BD923's 34,000 went through `DescentProfile::descending` with
+  `prev_cmd` 705. `peak_ft` was the highest altitude the plan had COMMANDED,
+  and FL340 had been commanded since DER29's first tick, so the profile
+  counted the cruise as reached and 705 as a descent from it:
+  `descent_no_climb` held BD923 (705), ROVFU (1,011), CNA (1,190), MANAK
+  (1,336). The 737 went down to about 1,200 ft and flew there for 14
+  minutes until the pilot said "set altitude 34000" (t 1790511982).
+
+Fixes (`procedure::vertical_tick`, `DescentProfile`):
+
+- `peak_ft` is now the highest altitude FLOWN (the tick's `alt_ft`), and
+  `descending` needs the cruise flown to within `STEP_FT` or the leg past
+  `plan_top_index`. FL340 commanded but 7,700 flown is not the cruise.
+- The mirror rule, `DescentProfile::climbing` (a cruise, not past the top,
+  never flown, no arrival ceiling): a plan altitude below the level already
+  commanded is held at that level (`Vertical.climb_held`), the carry too. A
+  CA leg's "at or above" and a navlog prediction below the aircraft are
+  minimums passed, never a descent. The pilot's altitude and the terrain
+  floor still apply after it.
+- `DescentProfile.arrival_ceiling`, set when `ceilinged_leg_alt` lowered the
+  leg: a STAR window or a later plan altitude kept reachable is the plan's
+  own descent, so a short flight that never reaches its cruise still makes
+  its "at or below". It does not make the flight `descending`.
+- Blackbox `procedure` `climb_no_descent` once per leg: idx, fix, plan_ft,
+  held_ft, alt_ft.
+- Tests: `a_climb_never_descends_to_a_minimum_it_has_passed` (the sortie's
+  DER29, CA 660 and BD923 at 7,618 to 7,658 ft with the floor at 705: 34,000
+  throughout, no floor, no `descent_held`),
+  `the_lfbd_climb_bit_without_the_profile` (the old CA tick gives 705),
+  `a_cruise_commanded_but_not_flown_is_not_descending`,
+  `an_arrival_ceiling_in_the_climb_is_flown`; the LIEA-LEBL descent tests
+  still pass (their step-climb test now pins the flown peak).
+- Not touched: why idx 0 (DER29, a DF) was flown for three minutes to 7,600
+  ft before sequencing.
+- Next IFR full-auto sortie with a charted SID, check: `procedure`
+  `climb_no_descent` on the CA leg with held_ft the cruise, the leg ticks'
+  `want_alt` never falling before the top of descent, no `terrain_floor`
+  in the climb unless the ground is really above the plan, `descent_no_climb`
+  only after the cruise was flown. Offline only.
