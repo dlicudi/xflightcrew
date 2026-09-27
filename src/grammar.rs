@@ -1914,6 +1914,21 @@ fn parse_one(t: &str) -> Option<ToolCall> {
             None => call("hold_speed", json!({})), // hold what we're doing now
         });
     }
+    // "Can you manage throttle for landing?" (SR22 on final, LSZS-LILO
+    // 2026-09-24, a dead end): the lever named instead of the speed. Only
+    // the asking verbs "manage"/"handle" take the throttle this way ("keep
+    // the power up" is not a request for the governor), and only with the
+    // landing named: that is the approach speed, which the governor idles
+    // at the touchdown. A bare "manage the throttle" holds what we have.
+    if (has(t, "manage") || has(t, "handle"))
+        && (has(t, "throttle") || has(t, "throttles") || has(t, "power"))
+        && !t.contains("percent")
+    {
+        if has(t, "landing") || has(t, "approach") || has(t, "final") {
+            return Some(call("hold_speed", json!({ "preset": "approach" })));
+        }
+        return Some(call("hold_speed", json!({})));
+    }
 
     // AP airspeed select: "set speed 250", "speed 280", "airspeed 250". Excludes
     // vertical/ground speed (handled elsewhere) and percent (that's throttle).
@@ -2665,6 +2680,13 @@ fn parse_one(t: &str) -> Option<ToolCall> {
         }
         if let Some(n) = num {
             return Some(call("set_transponder", json!({ "code": n })));
+        }
+        // "Set transponder." (SR22 climbing out of LSZS, 2026-09-24: a dead
+        // end, and the box stayed in standby): no code and no mode is the
+        // box brought to work, which is ALT, as the takeoff sets it. "Set
+        // transponder code" with no code is left to ask again.
+        if has(t, "set") && !has(t, "code") {
+            return Some(call("set_transponder_mode", json!({ "mode": "altitude" })));
         }
     }
 
@@ -4883,5 +4905,74 @@ mod tests {
         ] {
             assert!(!super::waiver_request(no), "{no}");
         }
+    }
+
+    /// The live chain on the SR22: whisper's text through the STT repairs
+    /// (`stt.rs`), the domain gate, then the grammar.
+    fn sr22_live(heard: &str) -> Option<(String, Value)> {
+        let t = crate::phrase::collapse_hyphens(heard);
+        let t = crate::phrase::fix_mishears(&t);
+        let t = crate::phrase::normalize_numbers(&t);
+        assert!(
+            crate::router::looks_like_command(&t),
+            "{heard:?} ({t:?}) must pass the domain gate"
+        );
+        one_on("cirrus_sr22", &t)
+    }
+
+    /// Issue #69, the SR22's dead ends from LSZS-LILO (2026-09-24), each
+    /// transcript verbatim from the blackbox `heard` records.
+    #[test]
+    fn sr22_lszs_lilo_misses_are_rules() {
+        // t 1790265258.8, climbing out: the box stayed in standby.
+        assert_eq!(
+            sr22_live("Set transponder."),
+            Some(("set_transponder_mode".into(), json!({"mode": "altitude"})))
+        );
+        // t 1790266795.0: dropped silently at the domain gate ("SP" is
+        // no keyword); the pilot re-said it and got "885 knots".
+        assert_eq!(
+            sr22_live("Set SP to 85 knots."),
+            Some(("hold_speed".into(), json!({"knots": 85})))
+        );
+        // The same clip from 2026-09-20.
+        assert_eq!(
+            sr22_live("Set SP to 160 knots."),
+            Some(("hold_speed".into(), json!({"knots": 160})))
+        );
+        // t 1790266907.4, on the final: a deterministic miss.
+        assert_eq!(
+            sr22_live("Can you manage throttle for landing?"),
+            Some(("hold_speed".into(), json!({"preset": "approach"})))
+        );
+    }
+
+    /// The new shapes do not over-match: "SP" is repaired only after "set",
+    /// a transponder with "code" and no number still asks, and the lever
+    /// words take the governor only with an asking verb.
+    #[test]
+    fn sr22_rules_stay_narrow() {
+        assert_eq!(crate::phrase::fix_mishears("SP 85"), "SP 85");
+        assert_eq!(crate::phrase::fix_mishears("set spoilers"), "set spoilers");
+        assert_eq!(
+            crate::phrase::fix_mishears("set sp to 85"),
+            "set speed to 85"
+        );
+        assert!(one_on("cirrus_sr22", "set transponder code").is_none());
+        assert_eq!(
+            one_on("cirrus_sr22", "set transponder 7000"),
+            Some(("set_transponder".into(), json!({"code": 7000})))
+        );
+        assert_eq!(
+            one_on("cirrus_sr22", "set transponder standby"),
+            Some(("set_transponder_mode".into(), json!({"mode": "standby"})))
+        );
+        assert!(one_on("cirrus_sr22", "keep the power up").is_none_or(|(n, _)| n != "hold_speed"));
+        assert_eq!(
+            one_on("cirrus_sr22", "my throttle"),
+            Some(("hold_speed".into(), json!({"off": true}))),
+            "the release still wins"
+        );
+        assert!(one_on("cirrus_sr22", "throttle 50 percent").is_none_or(|(n, _)| n != "hold_speed"));
     }
 }
