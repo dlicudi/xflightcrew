@@ -851,6 +851,12 @@ pub struct Tower {
     /// and the squawk. The crew reads it when it flies; a human pilot sees
     /// it in the coach. Dropped by the next request.
     clearance_readback: Option<String>,
+    /// The landed arrival has REPORTED the runway vacated. The state stays
+    /// `ClearedToLand` (the next bare "request taxi" is still the taxi in),
+    /// but the strip is the tower's again: a real controller frees it on
+    /// that report, not on the taxi request after it (Liege 2026-09-22).
+    /// Meaningless in any other state, and cleared by every transition.
+    vacated: bool,
 }
 
 impl Tower {
@@ -860,7 +866,24 @@ impl Tower {
             touch_and_go: false,
             pending: None,
             clearance_readback: None,
+            vacated: false,
         }
+    }
+
+    /// Our aircraft holds the runway in the tower's book: cleared onto it
+    /// (line-up, takeoff) or landed on it and not yet reported off. The
+    /// vacated report frees it; so does any transition out of the landing.
+    pub fn holds_runway(&self) -> bool {
+        match self.state {
+            State::LinedUp | State::TakeoffCleared => true,
+            State::ClearedToLand => !self.vacated,
+            _ => false,
+        }
+    }
+
+    /// The landed arrival reported the runway vacated (see [`Tower::holds_runway`]).
+    pub fn runway_vacated(&self) -> bool {
+        self.state == State::ClearedToLand && self.vacated
     }
 
     /// The crew has read the departure clearance back (or moved on).
@@ -914,6 +937,7 @@ impl Tower {
     /// readback dies with the clearance it echoed.
     pub fn apply_go_around(&mut self) {
         self.state = State::Inbound;
+        self.vacated = false;
         self.pending = None;
     }
 
@@ -1069,6 +1093,15 @@ impl Tower {
         if intent != Intent::Unknown {
             self.clearance_readback = None;
         }
+        let reply = self.answer(intent, ctx);
+        // The vacated report lives only as long as the landing it closed.
+        if self.state != State::ClearedToLand {
+            self.vacated = false;
+        }
+        reply
+    }
+
+    fn answer(&mut self, intent: Intent, ctx: &Ctx) -> String {
         match intent {
             Intent::RadioCheck => {
                 format!("{}, {} Tower, reading you five.", ctx.callsign, ctx.airport)
@@ -1106,11 +1139,18 @@ impl Tower {
                 self.state = State::Parked;
                 taxi_in_reply(ctx)
             }
-            // Acknowledged and nothing else. The state deliberately stands:
-            // a bare "request taxi" after a landing clearance is inferred as
-            // the taxi IN (below), and moving to Parked here would turn the
-            // next one into a departure clearance to the holding point.
-            Intent::RunwayVacated => format!("{}, roger, thank you.", ctx.callsign),
+            // Acknowledged, and the STRIP is freed, nothing else. The state
+            // deliberately stands: a bare "request taxi" after a landing
+            // clearance is inferred as the taxi IN (below), and moving to
+            // Parked here would turn the next one into a departure clearance
+            // to the holding point. Only a landed arrival frees a strip: the
+            // same words from the air are a garble, not a report.
+            Intent::RunwayVacated => {
+                if self.state == State::ClearedToLand && ctx.on_ground {
+                    self.vacated = true;
+                }
+                format!("{}, roger, thank you.", ctx.callsign)
+            }
             Intent::RequestTaxi if self.state == State::ClearedToLand => {
                 self.state = State::Parked;
                 taxi_in_reply(ctx)
@@ -2635,6 +2675,40 @@ mod tests {
         assert!(twr
             .handle(Intent::RequestTaxi, &c)
             .contains("taxi to stand one two"));
+    }
+
+    /// The same report frees the strip in the tower's book: on the ground,
+    /// after a landing, and only then. Without it the old behaviour stands
+    /// (the landing holds the runway until the taxi request parks it).
+    #[test]
+    fn the_vacated_report_frees_the_runway_in_the_book() {
+        let mut c = ctx();
+        c.on_ground = true;
+        let mut twr = Tower::new();
+        twr.state = State::ClearedToLand;
+        assert!(twr.holds_runway(), "landed, not reported off");
+        twr.handle(Intent::RunwayVacated, &c);
+        assert!(!twr.holds_runway() && twr.runway_vacated());
+        assert_eq!(twr.state, State::ClearedToLand);
+        // The next landing starts with the strip held again.
+        twr.handle(Intent::RequestTaxi, &c);
+        assert_eq!(twr.state, State::Parked);
+        twr.handle(Intent::ReportFinal, &c);
+        assert!(twr.holds_runway() && !twr.runway_vacated());
+
+        // From the air the words are a garble, not a report.
+        let mut air = ctx();
+        air.on_ground = false;
+        let mut twr = Tower::new();
+        twr.state = State::ClearedToLand;
+        twr.handle(Intent::RunwayVacated, &air);
+        assert!(twr.holds_runway());
+
+        // Without the report, the taxi request is what frees it (as before).
+        let mut twr = Tower::new();
+        twr.state = State::ClearedToLand;
+        twr.handle(Intent::RequestTaxi, &c);
+        assert!(!twr.holds_runway());
     }
 
     #[test]

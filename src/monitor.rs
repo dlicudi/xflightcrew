@@ -3435,14 +3435,15 @@ pub async fn run(
                                 let fname = crate::station::active_field()
                                     .map(|(n, _, _, _)| n)
                                     .unwrap_or_default();
-                                // The strip the PLAYER occupies: a ghost
-                                // landing it gets "continue", not a narrated
-                                // clearance over the player's head.
-                                let blocked = if snap.on_ground {
-                                    crate::station::on_active_runway(snap.lat, snap.lon)
-                                } else {
-                                    None
-                                };
+                                // The strip the PLAYER holds (stands on, or
+                                // landed on and not yet reported vacated): a
+                                // ghost landing it gets "continue", not a
+                                // narrated clearance over the player's head.
+                                let blocked = crate::station::player_blocked_strip(
+                                    snap.on_ground,
+                                    snap.lat,
+                                    snap.lon,
+                                );
                                 if let Some(exchange) = crate::station::chatter_tick(
                                     &targets,
                                     &fname,
