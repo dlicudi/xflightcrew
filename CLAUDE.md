@@ -422,7 +422,9 @@ everything blackboxes to `logs/blackbox.jsonl` (kinds: `atc`, `autotaxi`, `autot
 - **The crew works the radio as it flies**: a conditional line-up waits on
   `party_line::line_up_condition_clear()`; `take_departure_handoff()` (readback, retune, check-in);
   `take_region_handoff()` (survives `Station::install`; 7000 via `SetTransponder`;
-  `region_coach_line` with a pilot flying).
+  `region_coach_line` with a pilot flying). **An IFR flight keeps its code** (party line
+  `IFR_FLIGHT`, survives install, retired at the landing): no service terminated, no 7000
+  (`region_handoff_line`, `RegionHandoff.ifr_code`; LIEA-LEBL 2026-09-27).
 - **The inbound call** goes from the enroute leg once handed to the destination's OWN tower and
   close (`inbound_due`, `INBOUND_CALL_NM`, `INBOUND_MADE`) or on its challenge
   (`party_line::take_zone_challenge`); else at the station swap (`home_tower_khz`), before the
@@ -446,6 +448,8 @@ everything blackboxes to `logs/blackbox.jsonl` (kinds: `atc`, `autotaxi`, `autot
   about to become (a descent began 56 nm early, 2026-09-13); then the PILOT's altitude, HANDED over
   (`procedure::take_altitude` from `fly_to`, `level_off`), sticky, never written to the dial (a
   follower rewriting the dial undoes the pilot in 500 ms); then the GROUND AHEAD, over both.
+  **A descent never climbs back** to a navlog altitude above the level commanded
+  (`DescentProfile`, `descent_no_climb`; LIEA-LEBL 2026-09-27); step climbs before the top do.
 - **Terrain floor** (`terrain_floor_ahead_ft`: probes ahead + 1,000 ft), skipped on an approach,
   retired only after unanswered probes with the sim LIVE (`terrain_probe_fatal`). An AP target is
   judged against it: a climb into it RAISED and said, a descent below it refused with the number.
