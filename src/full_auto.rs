@@ -1151,8 +1151,12 @@ pub fn region_readback(callsign: &Option<String>, h: &crate::party_line::RegionH
 /// NEW tower as a garbled call), give the discrete code back, retune COM1.
 /// The spoken line had no crew consumer until 2026-09-14: the flight kept the
 /// departure code and the old frequency until its own arrival stage.
+///
+/// An IFR flight is handed on with its code (`h.ifr_code`, no squawk
+/// ordered): nothing is dialled, and the event records the code it kept.
+/// LIEA-LEBL, 2026-09-27: an IFR 737 on 4501 set 7000 at FL200.
 pub(crate) async fn obey_region_handoff(
-    xp: &XPlaneClient,
+    xp: &dyn crate::xplane::XPlane,
     ctx: &ToolCtx<'_>,
     voice: &Option<Voice>,
     callsign: &Option<String>,
@@ -1174,11 +1178,20 @@ pub(crate) async fn obey_region_handoff(
         None
     };
     let tuned = xp.set_float(COM1_FREQ_KHZ, h.khz as f64).await.is_ok();
+    // The code the transponder shows after the handoff: 7000 for a VFR
+    // service ending, the IFR code unchanged otherwise. A failed read is
+    // recorded as null, never a guess.
+    let code = xp
+        .get_float(crate::datarefs::TRANSPONDER_CODE)
+        .await
+        .ok()
+        .map(|v| v.round() as i64);
     event(
         "region_handoff",
         json!({
             "to": h.to, "khz": h.khz, "squawk_vfr": h.squawk_vfr,
             "squawk_set": squawk_ok, "tuned": tuned, "readback": readback,
+            "ifr_code": h.ifr_code, "code": code,
         }),
     );
     if squawk_ok == Some(true) {
@@ -5907,6 +5920,7 @@ mod region_handoff_tests {
             to: "Malaga Tower".into(),
             khz: 118_100,
             squawk_vfr: true,
+            ifr_code: None,
         };
         assert_eq!(
             region_readback(&cs, &h),
@@ -5921,6 +5935,39 @@ mod region_handoff_tests {
         assert_eq!(line, "roger, Malaga Tower on one one eight decimal one");
         assert!(!line.contains("thousand"));
         assert!(crate::tower::is_readback(&line));
+    }
+
+    fn handoff(squawk_vfr: bool, ifr_code: Option<i64>) -> RegionHandoff {
+        RegionHandoff {
+            to: "Barcelona Tower".into(),
+            khz: 118_105,
+            squawk_vfr,
+            ifr_code,
+        }
+    }
+
+    /// LIEA-LEBL, 2026-09-27: the IFR 737 on 4501 was handed to Barcelona
+    /// Tower. With the code kept, nothing is dialled and COM1 is retuned.
+    #[tokio::test]
+    async fn an_ifr_handoff_keeps_the_code() {
+        use crate::xplane::FakeXPlane;
+        let xp = FakeXPlane::with_reads(&[(crate::datarefs::TRANSPONDER_CODE, 4501.0)]);
+        let cfg = crate::config::Config::default();
+        let ctx = crate::tools::ToolCtx { xplane: &xp, config: &cfg, voice: None, status: None, reminders: None };
+        super::obey_region_handoff(&xp, &ctx, &None, &None, handoff(false, Some(4501)), false).await;
+        assert!(xp.writes_to(crate::datarefs::TRANSPONDER_CODE).is_empty(), "no squawk dialled");
+        assert_eq!(xp.writes_to(super::COM1_FREQ_KHZ), vec![118_105.0]);
+    }
+
+    /// A VFR service ending still gives the code back: 7000 is dialled.
+    #[tokio::test]
+    async fn a_vfr_handoff_still_sets_seven_thousand() {
+        use crate::xplane::FakeXPlane;
+        let xp = FakeXPlane::with_reads(&[(crate::datarefs::TRANSPONDER_CODE, 4501.0)]);
+        let cfg = crate::config::Config::default();
+        let ctx = crate::tools::ToolCtx { xplane: &xp, config: &cfg, voice: None, status: None, reminders: None };
+        super::obey_region_handoff(&xp, &ctx, &None, &None, handoff(true, None), false).await;
+        assert_eq!(xp.writes_to(crate::datarefs::TRANSPONDER_CODE), vec![7000.0]);
     }
 }
 

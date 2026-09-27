@@ -7919,3 +7919,65 @@ be lit over fuel that still feeds; the rule below waits for empty.)
   kg, before, after, took), `advised`, `rejected`. Offline only; the proof is
   a 737 start at a stand on a wings-only load, a `switched` record from the
   monitor for tank 1 within seconds of both engines running.
+
+## 2026-09-27: a descent never climbs back, and an IFR flight keeps its code
+
+LIEA-LEBL, B738, full auto, unattended (sortie `1790494983-full_auto`).
+
+**A climb in the descent.** The plan's profile (the `plan_audit` record at
+t 1790494983.0): KIFMI 31000, ELVOP 28000, MUREN 28000, CHELY 29000, VERSO
+25000, OSTUR 16000. The follower called its top of descent at 08:22:00 ("12
+miles ahead, down to 28,000"), began down from 31,000 at 08:23:46, levelled
+at MUREN's 28,000 (08:25:51), then armed CHELY at 08:26:43 and CLIMBED to
+28,999 by 08:28:37 before VERSO (star_ceiling 23,655) took it down again.
+SimBrief's navlog altitudes down a descent are predictions, not a step climb.
+
+- `procedure::vertical_tick` takes a `DescentProfile`: the plan's cruise (its
+  highest leg altitude; `None` on an approach), the highest altitude the PLAN
+  has commanded (never the pilot's or the floor's), and whether the leg is
+  past `plan_top_index` (the last leg at cruise, which covers a follower
+  armed mid-descent). Descending = commanded the cruise and now 100 ft under
+  it, or past the top and under the cruise. Then a plan altitude above the
+  last commanded altitude is held at it (`Vertical.descent_held`), the carry
+  too, until a lower one takes over. The pilot's handed altitude still wins
+  and the terrain floor still raises it (both applied after); a step climb
+  before the top of descent never reaches the cruise first, so it climbs.
+- Blackbox `procedure` `descent_no_climb` once per leg: idx, fix, plan_ft,
+  held_ft, alt_ft.
+- Tests replay the recorded profile through the pure vertical (the old law
+  climbs to 29,000 at CHELY, the new one holds 28,000 and VERSO descends),
+  plus a pilot climb, a floor above the held level, a pre-TOD 29,000 to
+  31,000 step and a mid-descent arm.
+
+**Seven thousand on an IFR flight.** The flight accepted an IFR clearance at
+the ramp (4501, `ifr_clearance` side tower and crew, `squawk_set` 4501). At
+08:36:52, about FL200, the one region switch (LIEA to LEBL) said "Radar
+services terminated. Squawk seven thousand. Contact Barcelona Tower on one
+one eight decimal one zero five." and full auto set 7000 (`region_handoff`
+`squawk_vfr=true`, `squawk_set=true`). The squawk decision read only the
+radar watch. `IFR_CLEARANCE` is the departure field's worksheet and dies at
+the next install, so it could not carry the flight rules either.
+
+- Party line `IFR_FLIGHT` (code, callsign, airborne): set with the accepted
+  readback (`publish_ifr_clearance`), NOT cleared by `Station::install`,
+  retired at the landing (`note_aircraft`: airborne since, then on the
+  ground; blackbox `atc` `ifr_flight_ended`), by a ground stand-down out of
+  reach, by a new clearance offer and by `uninstall`. Accessor
+  `party_line::ifr_flight_code`. There is no "cancel IFR" intent yet, so a
+  cancellation retires nothing.
+- `region_tick` with it: `squawk_vfr=false`, `RegionHandoff.ifr_code` the
+  code, and the line `region_handoff_line`: "<callsign>, contact Barcelona
+  Tower on ..." (no service terminated, no squawk). VFR is byte-identical.
+- Crew: `obey_region_handoff` already dialled only for `squawk_vfr`; it now
+  records `ifr_code` and the transponder's `code` after the handoff (takes
+  `&dyn XPlane`, so a fake sim tests it). The monitor's coach says "We've
+  been handed over" for IFR, not "Radar's done with us".
+- Left as it was: the handoff still goes to the destination's TOWER. The
+  crew's arrival checks in with the tower (`call_inbound`); a handoff to
+  Approach would sit the flight on a frequency nobody calls until then.
+- Next IFR full-auto sortie, check: `procedure` `descent_no_climb` (if the
+  navlog bumps up in the descent) and the leg ticks' `want_alt` never rising
+  after the top of descent; `full_auto` `region_handoff` with
+  `squawk_vfr=false`, `ifr_code` and `code` both the cleared code, `squawk_set`
+  null; the `atc_region` line without "seven thousand"; `atc`
+  `ifr_flight_ended` after the touchdown. Offline only.

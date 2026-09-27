@@ -131,6 +131,32 @@ pub struct RegionHandoff {
     /// "Squawk seven thousand" was ordered: a radar service assigned a
     /// discrete code that is now void.
     pub squawk_vfr: bool,
+    /// The IFR flight's discrete code, KEPT across the handoff (no squawk
+    /// instruction): an IFR flight is handed unit to unit with its code.
+    /// `None` for a VFR service ending.
+    pub ifr_code: Option<i64>,
+}
+
+/// This flight holds an accepted IFR clearance: its code and callsign, from
+/// the readback the tower accepted. Unlike [`IFR_CLEARANCE`] (the departure
+/// field's worksheet, retired with that field) it is the FLIGHT's, so it
+/// survives `Station::install`: the region handoff that follows the flight
+/// must know it is IFR. LIEA-LEBL, 2026-09-27: an IFR-cleared 737 on 4501
+/// was told "radar services terminated, squawk seven thousand" at FL200 and
+/// set it. Retired at the landing (`station::note_aircraft`), by a ground
+/// stand-down out of reach, by a new clearance offer and by `uninstall`,
+/// never at a region switch.
+pub(crate) static IFR_FLIGHT: Mutex<Option<IfrFlight>> = Mutex::new(None);
+
+/// See [`IFR_FLIGHT`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct IfrFlight {
+    /// The discrete code the clearance assigned.
+    pub code: i64,
+    /// Our callsign as the tower heard it, for the handoff line.
+    pub callsign: String,
+    /// Airborne since the clearance: the next ground contact is the landing.
+    pub airborne: bool,
 }
 
 /// The runway the APPROACH controller cleared you toward and handed to the
@@ -336,6 +362,13 @@ pub fn assigned_clearance() -> Option<IfrClearance> {
 }
 
 pub use crate::tower::IfrClearance;
+
+/// The flight is IFR (an accepted IFR clearance, not yet landed): its
+/// discrete code. Survives the region handoffs the clearance does not
+/// ([`IFR_FLIGHT`]).
+pub fn ifr_flight_code() -> Option<i64> {
+    lock(&IFR_FLIGHT).as_ref().map(|f| f.code)
+}
 
 /// The controller's last squawk nudge, consumed: the crew recycles or
 /// re-dials once per call it heard.

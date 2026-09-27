@@ -4553,7 +4553,13 @@ pub fn region_coach_line(
     if owed.is_empty() {
         return None;
     }
-    Some(format!("Radar's done with us: {}.", owed.join(", and ")))
+    // An IFR flight is handed on, not let go: no service ended.
+    let lead = if h.ifr_code.is_some() {
+        "We've been handed over"
+    } else {
+        "Radar's done with us"
+    };
+    Some(format!("{lead}: {}.", owed.join(", and ")))
 }
 
 #[cfg(test)]
@@ -4566,7 +4572,23 @@ mod region_coach_tests {
             to: "Malaga Tower".into(),
             khz: 118_100,
             squawk_vfr,
+            ifr_code: None,
         }
+    }
+
+    /// An IFR flight keeps its code: the coach never mentions a squawk and
+    /// never says the service ended.
+    #[test]
+    fn an_ifr_handoff_is_coached_as_a_handover() {
+        let ifr = RegionHandoff {
+            ifr_code: Some(4501),
+            ..h(false)
+        };
+        assert_eq!(region_coach_line(&ifr, Some(118_100), None), None);
+        assert_eq!(
+            region_coach_line(&ifr, Some(130_400), None).as_deref(),
+            Some("We've been handed over: Malaga Tower on one one eight decimal one.")
+        );
     }
 
     #[test]
