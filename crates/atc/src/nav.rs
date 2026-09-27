@@ -3452,6 +3452,112 @@ pub fn stars_for_route(cifp_dir: &str, icao: &str, runway: &str, route: &[String
     stars_for_route_in(text.lines(), runway, route)
 }
 
+/// Where one SID off one runway leaves the terminal area: the last fix of
+/// its runway transition plus common route, positioned.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SidExit {
+    pub ident: String,
+    /// The runway transition ("RW24", "RW26B").
+    pub transition: String,
+    pub fix_ident: String,
+    pub lat: f64,
+    pub lon: f64,
+}
+
+/// Every SID's exit off every runway at a field, from the CIFP lines, the
+/// fixes positioned through [`resolve_proc_fixes`] (ONE scan of each nav
+/// file for the whole field: seconds on the real files, so the owner runs
+/// it off the reply path and caches it). A SID whose legs resolve no fix
+/// has no exit and is left out.
+pub fn sid_exits_in<'a>(
+    lines: impl Iterator<Item = &'a str> + Clone,
+    fix_path: &str,
+    nav_path: &str,
+    airport: &AirportInfo,
+    icao: &str,
+) -> Vec<SidExit> {
+    let mut idents: Vec<(String, String)> = Vec::new();
+    for line in lines.clone() {
+        let Some(body) = line.strip_prefix("SID:") else { continue };
+        let f: Vec<&str> = body.split(',').collect();
+        let (id, tr) = (cifp_field(&f, 2), cifp_field(&f, 3));
+        if !id.is_empty() && tr.starts_with("RW") && !idents.iter().any(|(i, t)| i == id && t == tr) {
+            idents.push((id.to_string(), tr.to_string()));
+        }
+    }
+    // All the legs in one vector, so the nav files are scanned once.
+    let mut legs: Vec<ProcLeg> = Vec::new();
+    let mut spans: Vec<(usize, usize)> = Vec::new();
+    for (id, tr) in &idents {
+        let start = legs.len();
+        legs.extend(parse_proc_legs(lines.clone(), ProcKind::Sid, id, Some(tr)));
+        spans.push((start, legs.len()));
+    }
+    let (alat, alon) = airport.position().unwrap_or((0.0, 0.0));
+    resolve_proc_fixes(fix_path, nav_path, airport, icao, &mut legs, alat, alon);
+    idents
+        .into_iter()
+        .zip(spans)
+        .filter_map(|((ident, transition), (a, b))| {
+            let last = legs[a..b]
+                .iter()
+                .rev()
+                .find(|l| l.fix.is_some() && !l.fix_ident.starts_with("RW"))?;
+            let fix = last.fix.as_ref()?;
+            Some(SidExit {
+                ident,
+                transition,
+                fix_ident: last.fix_ident.clone(),
+                lat: fix.lat,
+                lon: fix.lon,
+            })
+        })
+        .collect()
+}
+
+/// [`sid_exits_in`] from the field's CIFP file. Empty with no file.
+pub fn sid_exits(
+    cifp_dir: &str,
+    fix_path: &str,
+    nav_path: &str,
+    airport: &AirportInfo,
+    icao: &str,
+) -> Vec<SidExit> {
+    let path = std::path::Path::new(cifp_dir).join(format!("{icao}.dat"));
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    sid_exits_in(text.lines(), fix_path, nav_path, airport, icao)
+}
+
+/// The SID off `runway` that leaves toward the destination: the one whose
+/// exit fix lies closest in bearing (from the field) to the great-circle
+/// bearing from the field to the destination. `(ident, exit bearing,
+/// destination bearing)`, degrees true; `None` when no exit serves the
+/// runway. Pure.
+pub fn sid_toward(
+    exits: &[SidExit],
+    runway: &str,
+    field: (f64, f64),
+    dest: (f64, f64),
+) -> Option<(String, f64, f64)> {
+    let want = bearing_deg(field.0, field.1, dest.0, dest.1);
+    let off = |b: f64| {
+        let d = (b - want).rem_euclid(360.0);
+        d.min(360.0 - d)
+    };
+    exits
+        .iter()
+        .filter(|e| {
+            e.transition.strip_prefix("RW").is_some_and(|r| {
+                r.eq_ignore_ascii_case(runway) || runway_matches(r.trim_end_matches('B'), runway)
+            })
+        })
+        .map(|e| (e, bearing_deg(field.0, field.1, e.lat, e.lon)))
+        .min_by(|a, b| off(a.1).total_cmp(&off(b.1)))
+        .map(|(e, b)| (e.ident.clone(), b, want))
+}
+
 pub fn sid_for_runway(cifp_dir: &str, icao: &str, runway: &str) -> Option<String> {
     let path = std::path::Path::new(cifp_dir).join(format!("{icao}.dat"));
     let text = std::fs::read_to_string(path).ok()?;

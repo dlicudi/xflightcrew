@@ -114,6 +114,14 @@ pub struct Station {
     /// clearance names (set by the owner, like the dialect). `None` = no
     /// procedure data: IFR clearances say "fly runway heading".
     procedures: Option<(String, String)>,
+    /// Every SID's exit fix, positioned, loaded off the reply path by
+    /// [`Station::set_procedures`] (`None` until it lands, or with no nav
+    /// files): the IFR clearance picks the SID that leaves toward the
+    /// destination (`nav::sid_toward`), else the first in the file.
+    sid_exits: std::sync::Arc<Mutex<Option<Vec<nav::SidExit>>>>,
+    /// The (exit, destination) bearings behind the last IFR clearance's SID,
+    /// for its blackbox record when the readback is accepted.
+    ifr_bearings: Option<(f64, f64)>,
 }
 
 /// Radio phraseology dialect. ICAO/CAP 413 style ("descend to altitude two
@@ -220,6 +228,8 @@ impl Station {
             enforce_readback: true,
             dialect: Dialect::Icao,
             procedures: None,
+            sid_exits: Default::default(),
+            ifr_bearings: None,
         })
     }
 
@@ -236,8 +246,36 @@ impl Station {
 
     /// Where the field's SIDs are: the CIFP directory and the field's ICAO
     /// (the station never sees its own identifier otherwise).
-    pub fn set_procedures(&mut self, cifp_dir: &str, icao: &str) {
+    /// The SIDs' exit fixes are positioned on a background thread (one scan
+    /// of `earth_fix.dat` and `earth_nav.dat`), so the SID toward the
+    /// destination is a lookup by the time anyone asks.
+    pub fn set_procedures(&mut self, cifp_dir: &str, fix_path: &str, nav_path: &str, icao: &str) {
         self.procedures = Some((cifp_dir.to_string(), icao.to_uppercase()));
+        let (cifp, fix, nav_p, icao) = (
+            cifp_dir.to_string(),
+            fix_path.to_string(),
+            nav_path.to_string(),
+            icao.to_uppercase(),
+        );
+        let apt = self.apt.clone();
+        let cache = std::sync::Arc::clone(&self.sid_exits);
+        *cache.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        std::thread::Builder::new()
+            .name("sid-exits".into())
+            .spawn(move || {
+                let exits = nav::sid_exits(&cifp, &fix, &nav_p, &apt, &icao);
+                tracing::info!(%icao, sids = exits.len(), "SID exits positioned for IFR clearances");
+                *cache.lock().unwrap_or_else(|e| e.into_inner()) = Some(exits);
+            })
+            .ok();
+    }
+
+    /// [`Station::set_procedures`] done in this thread, for tests.
+    #[cfg(test)]
+    fn set_procedures_now(&mut self, cifp_dir: &str, fix_path: &str, nav_path: &str, icao: &str) {
+        self.procedures = Some((cifp_dir.to_string(), icao.to_uppercase()));
+        let exits = nav::sid_exits(cifp_dir, fix_path, nav_path, &self.apt, &icao.to_uppercase());
+        *self.sid_exits.lock().unwrap_or_else(|e| e.into_inner()) = Some(exits);
     }
 
     /// The active field's spoken name ("Gibraltar") — the per-airport voice
@@ -545,7 +583,7 @@ impl Station {
                         c.pending_readback = None;
                     }
                     if let Some(ifr) = self.twr.take_accepted_ifr() {
-                        publish_ifr_clearance(ifr, &ctx.callsign);
+                        publish_ifr_clearance(ifr, &ctx.callsign, self.ifr_bearings);
                     }
                     return String::new();
                 }
@@ -555,7 +593,7 @@ impl Station {
                 if ifr_read {
                     self.twr.accept_ifr_unenforced();
                     if let Some(ifr) = self.twr.take_accepted_ifr() {
-                        publish_ifr_clearance(ifr, &ctx.callsign);
+                        publish_ifr_clearance(ifr, &ctx.callsign, self.ifr_bearings);
                     }
                 }
                 // Enforcement off (XCOPILOT_ATC_READBACK=false): no
@@ -1011,13 +1049,28 @@ impl Station {
     /// supersedes the published one until it is read back. `None` = the
     /// destination is unknown to the index.
     fn ifr_offer(&mut self, dest: &str, ctx: &tower::Ctx) -> Option<tower::IfrOffer> {
-        let (icao, name) = resolve_destination(dest)?;
+        let (icao, name, dest_pos) = resolve_destination(dest)?;
         let runway = self.runway_in_use.clone().unwrap_or_default();
-        let sid = self
-            .procedures
-            .as_ref()
-            .filter(|_| !runway.is_empty())
-            .and_then(|(dir, apt)| nav::sid_for_runway(dir, apt, &runway));
+        // The SID that leaves toward the destination; with no positioned
+        // exits (still loading, no nav data) the first in the file.
+        let toward = match (self.apt.position(), runway.is_empty()) {
+            (Some(field), false) => self
+                .sid_exits
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .as_deref()
+                .and_then(|x| nav::sid_toward(x, &runway, field, dest_pos)),
+            _ => None,
+        };
+        self.ifr_bearings = toward.as_ref().map(|t| (t.1, t.2));
+        let sid = match toward {
+            Some((ident, _, _)) => Some(ident),
+            None => self
+                .procedures
+                .as_ref()
+                .filter(|_| !runway.is_empty())
+                .and_then(|(dir, apt)| nav::sid_for_runway(dir, apt, &runway)),
+        };
         let radar = self.approach_khz.is_some() || self.departure_khz.is_some();
         let squawk = if radar {
             let scope = if self.departure_khz.is_some() {
@@ -1721,7 +1774,7 @@ pub fn is_radio_call(t: &str, airport_lc: &str) -> bool {
 
 /// Publish an IFR clearance whose readback the tower accepted, for the
 /// crew (`party_line::assigned_clearance`), and blackbox it item by item.
-fn publish_ifr_clearance(c: tower::IfrClearance, callsign: &str) {
+fn publish_ifr_clearance(c: tower::IfrClearance, callsign: &str, bearings: Option<(f64, f64)>) {
     tracing::info!(dest = %c.dest, sid = ?c.sid, runway = %c.runway, alt = c.initial_alt_ft,
                    squawk = c.squawk, "IFR clearance read back and accepted");
     sim::blackbox::record(
@@ -1730,6 +1783,8 @@ fn publish_ifr_clearance(c: tower::IfrClearance, callsign: &str) {
             "event": "ifr_clearance", "side": "tower", "callsign": callsign,
             "dest": c.dest, "sid": c.sid, "runway": c.runway,
             "initial_alt_ft": c.initial_alt_ft, "squawk": c.squawk,
+            "sid_exit_brg": bearings.map(|b| b.0.round()),
+            "dest_brg": bearings.map(|b| b.1.round()),
         }),
     );
     *IFR_CLEARANCE.lock().unwrap_or_else(|e| e.into_inner()) = Some(c);
@@ -1741,7 +1796,7 @@ fn publish_ifr_clearance(c: tower::IfrClearance, callsign: &str) {
 /// name: the one whose radio name IS the words, else none (a guess would
 /// clear the flight somewhere it never filed). `(icao, apt.dat name)`;
 /// `None` = unknown to the index (or the index not loaded).
-pub(crate) fn resolve_destination(dest: &str) -> Option<(String, String)> {
+pub(crate) fn resolve_destination(dest: &str) -> Option<(String, String, (f64, f64))> {
     let region = REGION.lock().unwrap_or_else(|e| e.into_inner());
     let dest = dest.trim();
     let single = !dest.contains(' ')
@@ -1755,7 +1810,7 @@ pub(crate) fn resolve_destination(dest: &str) -> Option<(String, String)> {
         }
         for code in &codes {
             if let Some(a) = region.iter().find(|a| a.icao.eq_ignore_ascii_case(code)) {
-                return Some((a.icao.clone(), a.apt.name.clone()));
+                return Some((a.icao.clone(), a.apt.name.clone(), (a.lat, a.lon)));
             }
         }
     }
@@ -1791,7 +1846,7 @@ pub(crate) fn resolve_destination(dest: &str) -> Option<(String, String)> {
             }
         }
     }?;
-    Some((pick.icao.clone(), pick.apt.name.clone()))
+    Some((pick.icao.clone(), pick.apt.name.clone(), (pick.lat, pick.lon)))
 }
 
 /// A requested runway resolved against the field: `Ok(ident)` for a strip
@@ -8298,6 +8353,8 @@ mod tests {
             enforce_readback: true,
             dialect: Dialect::Icao,
             procedures: None,
+            sid_exits: Default::default(),
+            ifr_bearings: None,
         }
     }
 
@@ -10525,7 +10582,7 @@ mod tests {
         };
         let path = lxgb_apt_file();
         let mut st = Station::load(path.to_str().unwrap(), "LXGB").expect("LXGB loads");
-        st.set_procedures(lxgb_cifp_dir().to_str().unwrap(), "LXGB");
+        st.set_procedures_now(lxgb_cifp_dir().to_str().unwrap(), "", "", "LXGB");
         let ctx = st.make_ctx(
             wx,
             "QNH one zero one seven".into(),
@@ -10634,6 +10691,115 @@ mod tests {
         let r = st.route_keyed("cleared to edinburgh, climb and maintain six thousand, squawk 4521", Service::Tower, &ctx, wx);
         assert_eq!(r, "");
         assert!(crate::party_line::assigned_clearance().is_some());
+        Station::uninstall();
+        *REGION.lock().unwrap() = Vec::new();
+        *SQUAWK_WATCH.lock().unwrap() = None;
+    }
+
+    /// Two SIDs off Gibraltar's 09 with opposite exits: NORTH1A to NRTHX
+    /// (up the peninsula) and SOUTH1A to STHXX (across the strait). Each
+    /// destination is cleared via the one that leaves toward it, whichever
+    /// the file lists first, and the bearings behind the pick are kept for
+    /// the blackbox.
+    #[test]
+    fn the_ifr_sid_is_the_one_that_leaves_toward_the_destination() {
+        let _guard = SIDE_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        Station::uninstall();
+        *SQUAWK_WATCH.lock().unwrap() = None;
+        let dir = std::env::temp_dir().join(format!("xc-station-sids-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let leg = |sid: &str, seq: u32, fix: &str| {
+            format!(
+                "SID:{seq:03},5,{sid},RW09,{fix},LX,E,A,E   , ,   ,TF, ,   ,  , , ,      ,    ,    ,    ,    , ,     ,     ,     , ,   ,    ,   ;\n"
+            )
+        };
+        // The southbound SID first in the file: the old rule's pick.
+        let cifp = [
+            leg("SOUTH1A", 10, "SMIDX"),
+            leg("SOUTH1A", 20, "STHXX"),
+            leg("NORTH1A", 10, "NMIDX"),
+            leg("NORTH1A", 20, "NRTHX"),
+        ]
+        .concat();
+        std::fs::write(dir.join("LXGB.dat"), cifp).unwrap();
+        let fixes = dir.join("earth_fix.dat");
+        std::fs::write(
+            &fixes,
+            "I\n1200 Version\n\n 36.300 -5.300 NMIDX ENRT LX 2\n 37.500 -5.200 NRTHX ENRT LX 2\n \
+             35.900 -5.400 SMIDX ENRT LX 2\n 34.800 -5.500 STHXX ENRT LX 2\n99\n",
+        )
+        .unwrap();
+        let mut madrid = region_apt("Madrid Barajas", 40.47, -3.56);
+        madrid.icao = "LEMD".into();
+        let mut marrakech = region_apt("Marrakech Menara", 31.61, -8.04);
+        marrakech.icao = "GMMX".into();
+        *REGION.lock().unwrap() = vec![madrid, marrakech];
+        let wx = Wx {
+            wind_from_deg: 90.0,
+            wind_kts: 10.0,
+        };
+        let path = lxgb_apt_file();
+        let mut st = Station::load(path.to_str().unwrap(), "LXGB").expect("LXGB loads");
+        st.set_procedures_now(
+            dir.to_str().unwrap(),
+            fixes.to_str().unwrap(),
+            "",
+            "LXGB",
+        );
+        let ctx = st.make_ctx(
+            wx,
+            "QNH one zero one seven".into(),
+            "November one seven two Sierra Papa".into(),
+            true,
+            false,
+            None,
+            false,
+            None,
+        );
+        let r = st.route_keyed("request ifr clearance to lemd", Service::Tower, &ctx, wx);
+        assert!(r.contains("via the North one Alpha departure, runway zero niner"), "{r}");
+        let (exit, dest) = st.ifr_bearings.expect("bearings kept");
+        assert!(exit < 10.0 || exit > 350.0, "north exit: {exit}");
+        assert!((dest - 22.0).abs() < 10.0, "Madrid bearing: {dest}");
+        // Another flight (a fresh station: this one is owed a readback).
+        let mut st = Station::load(path.to_str().unwrap(), "LXGB").expect("LXGB loads");
+        st.set_procedures_now(
+            dir.to_str().unwrap(),
+            fixes.to_str().unwrap(),
+            "",
+            "LXGB",
+        );
+        let ctx = st.make_ctx(
+            wx,
+            "QNH one zero one seven".into(),
+            "November one seven two Sierra Papa".into(),
+            true,
+            false,
+            None,
+            false,
+            None,
+        );
+        let r = st.route_keyed("request ifr clearance to gmmx", Service::Tower, &ctx, wx);
+        assert!(r.contains("via the South one Alpha departure"), "{r}");
+        let (exit, dest) = st.ifr_bearings.expect("bearings kept");
+        assert!((exit - 190.0).abs() < 15.0, "south exit: {exit}");
+        assert!((dest - 212.0).abs() < 10.0, "Marrakech bearing: {dest}");
+        // No positioned fixes: the first in the file, as before.
+        let mut st = Station::load(path.to_str().unwrap(), "LXGB").expect("LXGB loads");
+        st.set_procedures_now(dir.to_str().unwrap(), "", "", "LXGB");
+        let ctx = st.make_ctx(
+            wx,
+            "QNH one zero one seven".into(),
+            "November one seven two Sierra Papa".into(),
+            true,
+            false,
+            None,
+            false,
+            None,
+        );
+        let r = st.route_keyed("request ifr clearance to lemd", Service::Tower, &ctx, wx);
+        assert!(r.contains("via the South one Alpha departure"), "{r}");
+        assert_eq!(st.ifr_bearings, None);
         Station::uninstall();
         *REGION.lock().unwrap() = Vec::new();
         *SQUAWK_WATCH.lock().unwrap() = None;

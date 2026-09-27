@@ -1142,7 +1142,7 @@ async fn run_session(
                     st.set_enforce_readback(config.atc_readback);
                     st.set_dialect(station::dialect_for(&icao));
                     // Its SIDs, for the IFR clearance.
-                    st.set_procedures(&config.cifp_dir, &icao);
+                    st.set_procedures(&config.cifp_dir, &config.fix_data_path, &config.nav_data_path, &icao);
                     st.install();
                     // The new field's taxi network, in the background.
                     station::spawn_taxi_net_load(config.apt_data_path.clone(), icao.clone());
@@ -4051,7 +4051,12 @@ fn install_home_station(config: &Config, voice: &voice::Voice) -> Option<station
     // the UK, FAA grammar at a K/P/C field.
     st.set_dialect(station::dialect_for(&home_icao));
     // The field's SIDs (CIFP), for the IFR clearance's departure.
-    st.set_procedures(&config.cifp_dir, &home_icao);
+    st.set_procedures(
+        &config.cifp_dir,
+        &config.fix_data_path,
+        &config.nav_data_path,
+        &home_icao,
+    );
     // Publish the live station's side state (ATIS broadcast, enroute switch
     // identity) for the monitor's ticks.
     st.install();
