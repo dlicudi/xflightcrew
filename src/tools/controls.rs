@@ -176,6 +176,52 @@ pub(crate) async fn drive_park_brake(
     Ok(set == on)
 }
 
+/// What [`set_park_brake_confirmed`] found: whether the brake reads set, how
+/// many drives it took, the last error, and the ratio read at the end (`None`
+/// when that read failed: no measurement).
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct ParkBrakeSet {
+    pub held: bool,
+    pub tries: u32,
+    pub err: Option<String>,
+    pub park: Option<f64>,
+}
+
+/// Set the parking brake through [`drive_park_brake`] up to `tries` times and
+/// report what the READ-BACK says, for every automation that ends a hold with
+/// a spoken "brakes on". The line is chosen from `held`, never from the
+/// attempt: at EGSS (2026-09-22) autoland said "Brakes on, your aircraft." on
+/// the 737 with `parking_brake_ratio` at 0.03, because its stop wrote the
+/// plugin's one-second taxi-brake squeeze and nothing held the aircraft once
+/// that expired. At LIPK (2026-09-26) one attempt read back unset with its
+/// error swallowed; the same command sent again set at once, hence the tries.
+pub(crate) async fn set_park_brake_confirmed(
+    xp: &dyn crate::xplane::XPlane,
+    valve_set: Option<f64>,
+    tries: u32,
+) -> ParkBrakeSet {
+    let mut held = false;
+    let mut err: Option<String> = None;
+    let mut n = 0;
+    while n < tries.max(1) && !held {
+        n += 1;
+        match drive_park_brake(xp, true, valve_set).await {
+            Ok(h) => held = h,
+            Err(e) => err = Some(format!("{e:#}")),
+        }
+        if !held && n < tries.max(1) {
+            tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+        }
+    }
+    let park = xp.get_float(PARK_BRAKE).await.ok();
+    ParkBrakeSet {
+        held,
+        tries: n,
+        err,
+        park,
+    }
+}
+
 #[derive(Deserialize)]
 struct Args {
     /// true = set the parking brake, false = release it.
@@ -783,6 +829,37 @@ mod tests {
         let fake = FakeXPlane::new();
         ensure_park_brake_valve(&fake, false, None).await;
         assert!(!fake.ran(CMD_VALVE_OPEN) && !fake.ran(CMD_VALVE_CLOSE));
+    }
+
+    /// EGSS 2026-09-22 (issue #65): autoland said "Brakes on" on the 737 with
+    /// `parking_brake_ratio` at 0.03. A brake that stays at 0.03 through every
+    /// drive is reported NOT held, with the ratio it read; one the command
+    /// sets is held on the first try, valve first.
+    #[tokio::test]
+    async fn a_parking_brake_is_reported_from_its_read_back() {
+        const SET: &str = "sim/flight_controls/park_brake_set";
+        let stuck = FakeXPlane::with_reads(&[(PARK_BRAKE, 0.03)]);
+        let r = set_park_brake_confirmed(&stuck, None, 3).await;
+        assert!(!r.held, "0.03 is not a parking brake");
+        assert_eq!(r.tries, 3);
+        assert_eq!(r.park, Some(0.03));
+        assert_eq!(stuck.ran_count(SET), 3, "tried three times");
+
+        let takes = FakeXPlane::with_reads(&[(PARK_BRAKE, 0.03)]);
+        takes.step_on_command(SET, PARK_BRAKE, 0.97);
+        let r = set_park_brake_confirmed(&takes, Some(1.0), 3).await;
+        assert!(r.held);
+        assert_eq!(r.tries, 1);
+        assert!(
+            takes.command_index(CMD_VALVE_OPEN) < takes.command_index(SET),
+            "valve-aware: the valve before the handle"
+        );
+
+        // A ratio that cannot be read is no measurement.
+        let blind = FakeXPlane::new();
+        let r = set_park_brake_confirmed(&blind, None, 1).await;
+        assert!(!r.held);
+        assert_eq!(r.park, None);
     }
 
     /// Releasing for a roll moves the VALVE, not just the ratio.
