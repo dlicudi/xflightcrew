@@ -8803,3 +8803,64 @@ Tests `the_wind_picks_a_direction_and_the_main_parallel_takes_it`,
 (ignored, real apt.dat and CIFP). Next EGKK departure: blackbox `atc`
 `ifr_clearance` runway 26L with an M SID, the taxi reply naming 26L, and no
 party-line "two six right". Offline only.
+
+## 2026-09-27: no step climb on a short hop (issue #121)
+
+**Sortie 1790534902 (737, EGBB-EGKK, 100 nm, planned 15,000 ft).** At +1405 s,
+level at 14,997 ft with the follower flying, 68 nm from Gatwick at 303 kt, the
+monitor said "We're 23,300 feet below optimum at this weight. Flight level one
+seven zero would burn less if you can get it." The top of descent was called
+at +1923 s.
+
+Neither number was a bug on its own. The optimum was the profile's line at
+63,976 kg (38,000 + 1.0 t x 290 = 38,300), and the level was one 2,000 ft step
+by design ("asking for two at once is how you get neither"). The pair was
+wrong: a step climb follows an optimum that drifts up as fuel burns, a few
+thousand feet over a long sector (EIDW-BIKF, 4,600); a cruise eleven levels
+under optimum was PLANNED low, and one step does not address it. The gate that
+should have held, "silent while the follower has a top of descent published",
+did not: `procedure::planned_tod` is `None` on a leg whose constraint is not
+below us, and at +1405 the leg was the cruise (the same hole the descent
+advisors fell through on EGLF-LFPB, closed there by `follower_flying`).
+
+**The fix.** `StepClimb::wanted` is silent while a follower flies at all
+(`Snapshot::follower_flying`, not only with a point published), and when the
+cruise left to the top of descent is under 30 minutes (`step_cruise_left_min`:
+to the plan's ring, else 3 nm per 1,000 ft above the field;
+`STEP_CLIMB_MIN_CRUISE_MIN`). `aircraft::step_climb_ft` offers a step only
+for a gap of one to three levels (`STEP_CLIMB_MAX_GAP_FT`), so the gap said
+and the level asked for always belong together.
+
+Test `no_step_climb_on_a_short_hop_or_over_the_plans_level` (the sortie's
+weight, level, distance and speed; each gate alone); the EIDW-BIKF test still
+offers FL360 at 4,600 ft under. Next jet cruise: no `callout` `step_climb`
+under full auto; hand-flown, only with half an hour of cruise left. Offline
+only.
+
+## 2026-09-27: the closest field is not volunteered (issue #122)
+
+**Sortie 1790534902 (737, EGBB-EGKK).** After the region handoff to Oxford
+Kidlington at +1319 s (read back, tuned, IFR code kept), the copilot said
+"Closest field is X, tower is on ..." four times: +1684 RAF Benson, +1864
+London Heathrow, +2045 Farnborough, +2226 London Gatwick, with the follower
+flying and nothing wrong. None was an answer: the one question of the leg,
+"when do we land?" at +1677, was answered at +1678 by the ETA.
+
+The line is `station::region_tick`'s crew note for an airborne switch with no
+controller contact, meant for the first fix after a mid-flight boot.
+`Station::install` clears the clearance and the squawk watch, so after an
+airborne handoff every later switch looks uncontacted and lands there too.
+The monitor spoke every crew note unconditionally.
+
+**The fix.** The note is VOLUNTEERED, so it follows the persona's rule
+(`monitor::region_note_said`): on the ground (the relocation note) always;
+airborne only with the flight model abnormal (a failure, an emergency: the
+closest field is then the question) or a chatty copilot. Unsaid, it goes to
+the panel transcript and the station still swaps. Both crew notes lost their
+em dash ("Closest field is X, tower is on ..."). Whether the switches after a
+handoff should be controller handoffs is left as it is.
+
+Test `the_closest_field_is_not_volunteered_on_a_normal_flight`. Next flight:
+blackbox `atc_region` carries `said`; airborne `crew: true` records say
+`said: false` under normal chatter with no failure, and no "Closest field"
+in `said`. Offline only.

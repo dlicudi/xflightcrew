@@ -2415,13 +2415,28 @@ pub fn optimum_altitude_ft(r: &ReferenceProfile, weight_kg: f64) -> Option<f64> 
 /// there anything a pilot could act on.
 const STEP_CLIMB_FT: f64 = 2000.0;
 
+/// The widest gap a step climb answers: three levels. A step climb is how a
+/// jet follows an optimum that drifts UP as fuel burns (EIDW-BIKF: 4,600 ft
+/// by mid-Atlantic); a cruise many levels under optimum was PLANNED low, for
+/// a reason the copilot cannot see (a short sector, the ceiling, the wind),
+/// and one step does not address it. EGBB-EGKK (2026-09-27, 100 nm at
+/// 15,000 ft) said "23,300 feet below optimum ... flight level one seven
+/// zero would burn less": the gap was true (the profile's line at 64 t) and
+/// the level was one step by design, and together they said nothing a pilot
+/// could use.
+const STEP_CLIMB_MAX_GAP_FT: f64 = 3.0 * STEP_CLIMB_FT;
+
 /// The next same-direction level up, if cruising `cruise_ft` is at least a
-/// full step below `optimum_ft`. `None` when we are at or near optimum, or
-/// above it — a jet above optimum is a different problem and not this one's
-/// to solve. The step is always exactly one level: a climb is a request to
-/// ATC, and asking for two at once is how you get neither.
+/// full step below `optimum_ft` and no more than [`STEP_CLIMB_MAX_GAP_FT`]
+/// below it. `None` when we are at or near optimum, above it (a jet above
+/// optimum is a different problem and not this one's to solve), or so far
+/// below it that the level was planned, not drifted into. The step is
+/// always exactly one level: a climb is a request to ATC, and asking for
+/// two at once is how you get neither.
 pub fn step_climb_ft(cruise_ft: f64, optimum_ft: f64) -> Option<f64> {
-    (optimum_ft - cruise_ft >= STEP_CLIMB_FT).then(|| cruise_ft + STEP_CLIMB_FT)
+    (STEP_CLIMB_FT..=STEP_CLIMB_MAX_GAP_FT)
+        .contains(&(optimum_ft - cruise_ft))
+        .then(|| cruise_ft + STEP_CLIMB_FT)
 }
 
 /// The floor for the LANDING configuration: 1.2 x Vso when the profile
