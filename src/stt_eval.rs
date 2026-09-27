@@ -112,7 +112,17 @@ pub fn run(model_path: &str, profile: &AircraftProfile, manifest: &str) -> Resul
                     .ok_or_else(|| anyhow!("{}: unknown intent label {label:?}", case.say))?;
                 int_total += 1;
                 let got = crate::tower::parse_intent(&heard);
-                if got == want {
+                // The IFR label names the call, not its destination (the
+                // corpus carries the destination; here it is the shape).
+                let same = got == want
+                    || matches!(
+                        (&got, &want),
+                        (
+                            crate::tower::Intent::RequestIfrClearance { .. },
+                            crate::tower::Intent::RequestIfrClearance { .. }
+                        )
+                    );
+                if same {
                     int_ok += 1;
                     format!("atc:{label} OK")
                 } else {

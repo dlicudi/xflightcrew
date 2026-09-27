@@ -30,11 +30,23 @@ pub enum State {
 }
 
 /// What the pilot asked for, keyword-matched from the transcript.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Intent {
     RadioCheck,
     RequestTaxi,
     RequestClearance,
+    /// "request IFR clearance to EGPH" / "IFR to Edinburgh, ready to copy" /
+    /// "request clearance as filed": the instrument departure clearance, a
+    /// route, a SID, an altitude and a code. Distinct from the zone
+    /// clearance on purpose: a bare "request clearance" with no IFR word and
+    /// no destination stays [`Intent::RequestClearance`], exactly as before.
+    /// `dest` is the destination as heard: an ICAO code (upper case, a
+    /// spelled one already joined: "EGPH") or the name words in lower case
+    /// ("edinburgh"). The station resolves it against its airport index;
+    /// `None` = the call named none, and the tower asks for it.
+    RequestIfrClearance {
+        dest: Option<String>,
+    },
     /// "request start-up" / "request clearance to start engines" — asking to
     /// turn the engines, NOT asking for the departure clearance. Distinct on
     /// purpose: a parked, engines-off aircraft asking to start must hear
@@ -170,6 +182,86 @@ pub struct Ctx {
     /// position, never sent to a runway holding point (the S-76 on its pad at
     /// ETHB got "taxi to holding point Foxtrot runway two five", 2026-09-23).
     pub helicopter: bool,
+    /// The IFR clearance the station has made up for THIS call, when the
+    /// call is an IFR request whose destination the station's index knows.
+    /// `None` on every other call, and on an IFR request to a destination it
+    /// cannot find: the tower then asks for it and clears nothing.
+    pub ifr: Option<IfrOffer>,
+}
+
+/// The IFR departure clearance as issued and, once read back correctly, as
+/// published to the crew (`party_line::assigned_clearance`). Every field is
+/// something the tower actually said.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IfrClearance {
+    /// The destination's ICAO code.
+    pub dest: String,
+    /// The SID's CIFP ident ("GOSA1C"), `None` when the field has no SID
+    /// from the runway in use: the clearance is then "after departure fly
+    /// runway heading", never an invented name.
+    pub sid: Option<String>,
+    /// The runway END in use, as apt.dat names it ("06", "27R").
+    pub runway: String,
+    /// The initial altitude, feet ([`ifr_initial_altitude_ft`]).
+    pub initial_alt_ft: i64,
+    /// The transponder code, the one the station issues this flight.
+    pub squawk: i64,
+}
+
+/// What the station hands the tower to phrase an IFR clearance: the
+/// clearance itself plus the spoken bits only the station knows.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IfrOffer {
+    pub clearance: IfrClearance,
+    /// The destination as a controller says it ("Edinburgh").
+    pub dest_spoken: String,
+    /// FAA phraseology ("climb and maintain", "then as filed", the
+    /// departure frequency) instead of ICAO / CAP 413.
+    pub faa: bool,
+    /// The departure (else approach) frequency, spoken, for the FAA
+    /// clearance's "departure frequency" item; `None` at a tower-only field.
+    pub departure_freq: Option<String>,
+}
+
+/// The IFR initial altitude: the higher of 5,000 ft and the field elevation
+/// plus 3,000, rounded UP to the thousand. One function, so the tower and
+/// anything that checks it agree (EGPH at 136 ft gets 5,000; LOWI at 1,906
+/// gets 5,000; LSZS at 5,600 gets 9,000).
+pub fn ifr_initial_altitude_ft(field_elev_ft: f64) -> i64 {
+    let above = ((field_elev_ft.max(0.0) + 3000.0) / 1000.0).ceil() * 1000.0;
+    above.max(5000.0) as i64
+}
+
+/// A SID's CIFP ident as a controller says it: "GOSA1C" is "Gosa one
+/// Charlie", "LEGL1P" is "Legl one Papa". The letters before the number are
+/// said as the word they abbreviate; the number and the letter after it are
+/// spoken the radio way. An ident with no number is said as it is.
+pub fn spoken_sid(ident: &str) -> String {
+    let Some(at) = ident.find(|c: char| c.is_ascii_digit()) else {
+        return title_case(ident);
+    };
+    let (name, rest) = ident.split_at(at);
+    let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+    let tail: String = rest.chars().skip(digits.len()).collect();
+    let mut out = vec![title_case(name)];
+    let d = crate::atis::spoken_digits(&digits);
+    if !d.is_empty() {
+        out.push(d);
+    }
+    for c in tail.chars().filter(|c| c.is_ascii_alphabetic()) {
+        out.push(crate::atis::nato(c.to_ascii_uppercase()).to_string());
+    }
+    out.retain(|w| !w.is_empty());
+    out.join(" ")
+}
+
+fn title_case(w: &str) -> String {
+    let lower = w.to_lowercase();
+    let mut c = lower.chars();
+    match c.next() {
+        Some(f) => f.to_uppercase().chain(c).collect(),
+        None => String::new(),
+    }
 }
 
 /// Spoken position of traffic on final: "short final" inside 1.5 nm, else
@@ -351,6 +443,13 @@ pub fn parse_intent(transcript: &str) -> Intent {
     {
         return Intent::Unknown;
     }
+    // The IFR clearance, right after the question guard and before every
+    // runway word: a destination's name must never read as a runway call
+    // ("clearance to Lands End" is not a landing request), and "ready to
+    // copy" is the IFR pilot's whole request.
+    if let Some(dest) = ifr_request(&t) {
+        return Intent::RequestIfrClearance { dest };
+    }
     // "final" is a position report; checked before the landing request so
     // "final for landing" reads as the report (it earns the clearance). Not
     // when it's a cockpit question ("what's our final approach speed").
@@ -511,6 +610,152 @@ pub fn parse_intent(transcript: &str) -> Intent {
     Intent::Unknown
 }
 
+/// Words that, straight after "clearance to", say what the clearance is FOR
+/// rather than where it goes: "clearance to leave the zone" is the zone
+/// clearance, "clearance to start" the start-up, "clearance to cross" a
+/// runway crossing. None of them is a destination.
+const NOT_A_DESTINATION: &[&str] = &[
+    "leave", "enter", "cross", "transit", "depart", "start", "taxi", "push", "pushback", "land",
+    "zone", "join", "climb", "descend", "proceed", "fly", "go", "be", "copy", "the", "a", "hold",
+    "line", "backtrack", "switch", "shut", "change", "contact", "take", "operate", "takeoff",
+    "departure", "vacate", "park", "parking", "runway", "taxiway", "stand", "gate", "ramp",
+    "apron", "holding", "startup", "engines", "engine", "shutdown", "power", "run", "use",
+];
+
+/// Where a destination's words stop: the rest of the call.
+const DEST_STOPS: &[&str] = &[
+    "ready", "copy", "request", "requesting", "as", "filed", "with", "information", "via",
+    "please", "over", "and", "runway", "ifr", "clearance", "flight", "plan", "for", "to",
+    "squawk", "november", "callsign", "departure", "on", "at",
+];
+
+/// Filler words dropped from a destination ("to the Edinburgh airport").
+const DEST_FILLER: &[&str] = &["the", "airport", "airfield", "international", "intl", "field"];
+
+/// The spelling alphabet as whisper writes it: one letter per word.
+fn phonetic_letter(w: &str) -> Option<char> {
+    Some(match w {
+        "alpha" | "alfa" => 'A',
+        "bravo" => 'B',
+        "charlie" => 'C',
+        "delta" => 'D',
+        "echo" => 'E',
+        "foxtrot" => 'F',
+        "golf" => 'G',
+        "hotel" => 'H',
+        "india" => 'I',
+        "juliet" | "juliett" => 'J',
+        "kilo" => 'K',
+        "lima" => 'L',
+        "mike" => 'M',
+        "november" => 'N',
+        "oscar" => 'O',
+        "papa" => 'P',
+        "quebec" => 'Q',
+        "romeo" => 'R',
+        "sierra" => 'S',
+        "tango" => 'T',
+        "uniform" => 'U',
+        "victor" => 'V',
+        "whiskey" | "whisky" => 'W',
+        "xray" => 'X',
+        "yankee" => 'Y',
+        "zulu" => 'Z',
+        _ => return None,
+    })
+}
+
+/// The destination words after a "to", as heard: a spelled ICAO joined
+/// ("echo golf papa hotel" is "EGPH"), a written one upper-cased ("egph" is
+/// "EGPH"; a three-letter one stays three letters and the station tries the
+/// K too), else the name words lower-case ("edinburgh"). `None` when the
+/// words say what the clearance is for instead ("to leave the zone").
+fn destination_after(words: &[&str]) -> Option<String> {
+    let first = *words.first()?;
+    if NOT_A_DESTINATION.contains(&first) && first != "the" {
+        return None;
+    }
+    // "to the zone" / "to the holding point" is not a place either.
+    if first == "the"
+        && words
+            .get(1)
+            .is_some_and(|w| NOT_A_DESTINATION.contains(w) || *w == "holding" || *w == "zone")
+    {
+        return None;
+    }
+    // Four spelled letters (phonetic words or single letters) are a code.
+    let spelled: Vec<char> = words
+        .iter()
+        .take(4)
+        .map_while(|w| {
+            phonetic_letter(w).or_else(|| {
+                (w.len() == 1 && w.chars().all(|c| c.is_ascii_alphabetic()))
+                    .then(|| w.chars().next().unwrap().to_ascii_uppercase())
+            })
+        })
+        .collect();
+    if spelled.len() == 4 {
+        return Some(spelled.into_iter().collect());
+    }
+    let name: Vec<&str> = words
+        .iter()
+        .copied()
+        .take_while(|w| !DEST_STOPS.contains(w))
+        .filter(|w| !DEST_FILLER.contains(w))
+        .take(4)
+        .collect();
+    if name.is_empty() || name.iter().any(|w| w.chars().any(|c| c.is_ascii_digit())) {
+        return None;
+    }
+    // One short token is carried as a code ("egph" is "EGPH"); the station
+    // tries it as a code first and as a name ("nice", "bern") second.
+    if name.len() == 1 && (3..=4).contains(&name[0].len()) {
+        return Some(name[0].to_ascii_uppercase());
+    }
+    Some(name.join(" "))
+}
+
+/// Is this an IFR clearance request, and to where? `Some(None)` = the IFR
+/// shape with no destination named ("ready to copy", "request clearance as
+/// filed"); `Some(Some(dest))` = one named; `None` = not the IFR call (a bare
+/// "request clearance" is the ZONE clearance and stays so).
+fn ifr_request(t: &str) -> Option<Option<String>> {
+    let toks: Vec<&str> = t
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|s| !s.is_empty())
+        .collect();
+    let has = |w: &str| toks.contains(&w);
+    let ifr = has("ifr") || t.contains("i f r");
+    let clearance = has("clearance");
+    let copy = t.contains("ready to copy");
+    let filed = t.contains("as filed");
+    // The destination: the words after the first "to" that follows the
+    // clearance or IFR word (the one in "ready to copy" names nothing).
+    let anchor = toks
+        .iter()
+        .position(|w| *w == "clearance" || *w == "ifr")
+        .or_else(|| copy.then_some(0));
+    let dest = anchor.and_then(|a| {
+        // Only the FIRST "to": "clearance to taxi to holding point Alpha"
+        // is a taxi request, and its second "to" names no destination.
+        let i = toks.iter().skip(a).position(|w| *w == "to")? + a;
+        destination_after(&toks[i + 1..])
+    });
+    if ifr && (clearance || copy || dest.is_some() || has("request") || has("requesting")) {
+        return Some(dest);
+    }
+    if copy || (filed && clearance) {
+        return Some(dest);
+    }
+    // "request clearance to Edinburgh": a clearance to a PLACE is the IFR
+    // one; "clearance to leave the zone" names no place and stays the zone
+    // clearance.
+    if clearance && dest.is_some() {
+        return Some(dest);
+    }
+    None
+}
+
 /// Parse a corpus label ("request_taxi") into the intent it names — the shared
 /// vocabulary of the battle-test manifests (`bench/atc_corpus.yaml`, the ATC
 /// cases in the stt-eval manifest). `None` for a label no intent carries.
@@ -519,6 +764,8 @@ pub fn intent_from_label(label: &str) -> Option<Intent> {
         "radio_check" => Intent::RadioCheck,
         "request_taxi" => Intent::RequestTaxi,
         "request_clearance" => Intent::RequestClearance,
+        // The destination is the case's own field (`dest` in the corpus).
+        "request_ifr_clearance" => Intent::RequestIfrClearance { dest: None },
         "request_startup" => Intent::RequestStartup,
         "request_shutdown" => Intent::RequestShutdown,
         "request_takeoff" => Intent::RequestTakeoff,
@@ -648,6 +895,25 @@ pub enum Awaited {
         runway: String,
         touch_and_go: bool,
     },
+    /// The IFR clearance: the SID (when one was given), the altitude and the
+    /// squawk must all come back, and a runway named must be ours. The
+    /// spoken bits ride along so the coach and the correction say them the
+    /// way the clearance did.
+    IfrClearance {
+        clearance: IfrClearance,
+        dest_spoken: String,
+        runway_spoken: String,
+        faa: bool,
+    },
+}
+
+/// One item of the IFR clearance, for the readback's verdict.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IfrItem {
+    Departure,
+    Altitude,
+    Squawk,
+    Runway,
 }
 
 /// A clearance awaiting its readback: what must be echoed, the instruction
@@ -672,7 +938,197 @@ pub enum ReadbackCheck {
     WrongRunway {
         heard: String,
     },
+    /// An IFR clearance read back with items WRONG (a different altitude,
+    /// code or runway) or MISSING (not said at all). Both earn the
+    /// correction; neither earns the clearance.
+    IfrItems {
+        wrong: Vec<IfrItem>,
+        missing: Vec<IfrItem>,
+    },
     NotAReadback,
+}
+
+/// A number said digit by digit or written ("four five two one", "4521",
+/// "niner"), read from `toks[i..]`: the digits and how many tokens they
+/// took. At most `max` digits.
+fn digits_at(toks: &[String], i: usize, max: usize) -> (String, usize) {
+    let digit = |tok: &str| -> Option<&'static str> {
+        Some(match tok {
+            // Not "to" or "for": "climb to five thousand" is five.
+            "zero" => "0",
+            "one" => "1",
+            "two" => "2",
+            "three" | "tree" => "3",
+            "four" | "fower" => "4",
+            "five" | "fife" => "5",
+            "six" => "6",
+            "seven" => "7",
+            "eight" => "8",
+            "nine" | "niner" => "9",
+            _ => return None,
+        })
+    };
+    let mut out = String::new();
+    let mut j = i;
+    while j < toks.len() && out.len() < max {
+        let t = toks[j].as_str();
+        if let Some(d) = digit(t) {
+            out.push_str(d);
+        } else if !t.is_empty() && t.chars().all(|c| c.is_ascii_digit()) {
+            if out.len() + t.len() > max {
+                break;
+            }
+            out.push_str(t);
+        } else {
+            break;
+        }
+        j += 1;
+    }
+    (out, j - i)
+}
+
+/// Tokens with the thousands separators whisper writes ("5,000") closed up,
+/// so a written altitude is one token.
+fn number_tokens(t: &str) -> Vec<String> {
+    let chars: Vec<char> = t.chars().collect();
+    let mut closed = String::with_capacity(t.len());
+    for (k, &c) in chars.iter().enumerate() {
+        let between_digits = k > 0
+            && chars[k - 1].is_ascii_digit()
+            && chars.get(k + 1).is_some_and(|n| n.is_ascii_digit());
+        if c == ',' && between_digits {
+            continue;
+        }
+        closed.push(c);
+    }
+    lower_tokens(&closed)
+}
+
+/// The squawk a readback says: the four digits after "squawk" (or
+/// "transponder", "code"). `None` when no code was said.
+pub fn heard_squawk(transcript: &str) -> Option<i64> {
+    let toks = number_tokens(&transcript.to_lowercase());
+    for (i, w) in toks.iter().enumerate() {
+        if matches!(w.as_str(), "squawk" | "squawking" | "transponder" | "code") {
+            let (d, _) = digits_at(&toks, i + 1, 4);
+            if d.len() == 4 {
+                return d.parse().ok();
+            }
+        }
+    }
+    None
+}
+
+/// The altitude a readback says, feet: "five thousand", "one zero thousand
+/// five hundred", "5000", "5,000 feet". The squawk's four digits are never
+/// read as one (they follow "squawk"). `None` when no altitude was said.
+pub fn heard_altitude_ft(transcript: &str) -> Option<i64> {
+    let toks = number_tokens(&transcript.to_lowercase());
+    let tens = |w: &str| -> Option<i64> {
+        Some(match w {
+            "ten" => 10,
+            "eleven" => 11,
+            "twelve" => 12,
+            "thirteen" => 13,
+            "fourteen" => 14,
+            "fifteen" => 15,
+            "sixteen" => 16,
+            "seventeen" => 17,
+            "eighteen" => 18,
+            "nineteen" => 19,
+            _ => return None,
+        })
+    };
+    // Where the squawk's digits sit, so they are skipped.
+    let mut skip = vec![false; toks.len()];
+    for (i, w) in toks.iter().enumerate() {
+        if matches!(w.as_str(), "squawk" | "squawking" | "transponder" | "code") {
+            let (_, n) = digits_at(&toks, i + 1, 4);
+            for s in skip.iter_mut().skip(i + 1).take(n) {
+                *s = true;
+            }
+        }
+    }
+    for (i, w) in toks.iter().enumerate() {
+        if skip[i] {
+            continue;
+        }
+        if w == "thousand" {
+            // The thousands: the digits just before (spoken or written), or
+            // a teen word ("twelve thousand").
+            let mut start = i;
+            while start > 0 && !skip[start - 1] && digits_at(&toks, start - 1, 1).1 == 1 {
+                start -= 1;
+                if i - start >= 2 {
+                    break;
+                }
+            }
+            let th: Option<i64> = if start < i {
+                digits_at(&toks, start, 2).0.parse().ok()
+            } else {
+                i.checked_sub(1).and_then(|k| tens(&toks[k]))
+            };
+            let Some(th) = th else { continue };
+            let mut ft = th * 1000;
+            let (h, n) = digits_at(&toks, i + 1, 1);
+            if n == 1 && toks.get(i + 2).is_some_and(|w| w == "hundred") {
+                ft += h.parse::<i64>().unwrap_or(0) * 100;
+            }
+            return Some(ft);
+        }
+        // A written altitude ("5000").
+        if w.len() >= 4 && w.len() <= 5 && w.chars().all(|c| c.is_ascii_digit()) {
+            if let Ok(v) = w.parse::<i64>() {
+                if (1000..=60000).contains(&v) {
+                    return Some(v);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Does a readback name this SID? Lenient on the name (whisper spells a fix
+/// name any way it likes): the name's word, or its number-and-letter
+/// designator ("one Charlie", "1C") is enough.
+fn heard_sid(transcript: &str, ident: &str) -> bool {
+    let toks = number_tokens(&transcript.to_lowercase());
+    let Some(at) = ident.find(|c: char| c.is_ascii_digit()) else {
+        let want = ident.to_lowercase();
+        return toks.iter().any(|w| *w == want);
+    };
+    let (name, rest) = ident.split_at(at);
+    let name = name.to_lowercase();
+    let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+    let letter = rest
+        .chars()
+        .skip(digits.len())
+        .find(|c| c.is_ascii_alphabetic())
+        .map(|c| c.to_ascii_lowercase());
+    // The name: the whole abbreviation, or a word it begins ("gosam" for
+    // "GOSA"), four letters at least so a short one cannot match noise.
+    if name.len() >= 3
+        && toks
+            .iter()
+            .any(|w| *w == name || (w.len() >= 4 && name.len() >= 4 && w.starts_with(&name)))
+    {
+        return true;
+    }
+    // The designator: "one charlie" / "1 charlie" / "1c".
+    let Some(letter) = letter else { return false };
+    let nato = crate::atis::nato(letter.to_ascii_uppercase()).to_lowercase();
+    let joined = format!("{digits}{letter}");
+    toks.iter().enumerate().any(|(i, w)| {
+        if *w == joined {
+            return true;
+        }
+        let (d, n) = digits_at(&toks, i, digits.len());
+        n > 0
+            && d == digits
+            && toks
+                .get(i + n)
+                .is_some_and(|l| *l == nato || (l.len() == 1 && l.starts_with(letter)))
+    })
 }
 
 /// Parse a runway designator at the START of a token slice: spelled digits
@@ -795,6 +1251,9 @@ pub fn check_readback(transcript: &str, awaited: &Awaited) -> ReadbackCheck {
     {
         return ReadbackCheck::NotAReadback;
     }
+    if let Awaited::IfrClearance { clearance, .. } = awaited {
+        return check_ifr_readback(&t, clearance);
+    }
     let verb_ok = match awaited {
         Awaited::HoldPosition => word("hold") || word("holding"),
         Awaited::LineUp { behind, .. } => {
@@ -815,6 +1274,7 @@ pub fn check_readback(transcript: &str, awaited: &Awaited) -> ReadbackCheck {
                 word("land") || word("landing") || word("cleared")
             }
         }
+        Awaited::IfrClearance { .. } => unreachable!("judged above"),
     };
     if !verb_ok {
         return ReadbackCheck::NotAReadback;
@@ -825,7 +1285,7 @@ pub fn check_readback(transcript: &str, awaited: &Awaited) -> ReadbackCheck {
         Awaited::LineUp { runway, .. }
         | Awaited::Takeoff { runway }
         | Awaited::Landing { runway, .. } => canon_runway(runway),
-        Awaited::HoldPosition => None,
+        Awaited::HoldPosition | Awaited::IfrClearance { .. } => None,
     };
     if let (Some(e), Some(h)) = (expect, runway_after_keyword(&t)) {
         if e != h {
@@ -833,6 +1293,164 @@ pub fn check_readback(transcript: &str, awaited: &Awaited) -> ReadbackCheck {
         }
     }
     ReadbackCheck::Correct
+}
+
+/// The IFR readback, item by item: the SID (if one was given), the
+/// altitude, the squawk, and a runway if one is named. Nothing of the
+/// clearance heard at all is no readback (a mishear, a new call): it earns
+/// the challenge, never the clearance.
+fn check_ifr_readback(t: &str, c: &IfrClearance) -> ReadbackCheck {
+    let alt = heard_altitude_ft(t);
+    let code = heard_squawk(t);
+    let sid_heard = c.sid.as_deref().map(|s| heard_sid(t, s));
+    let rwy = runway_after_keyword(t);
+    if alt.is_none() && code.is_none() && sid_heard != Some(true) {
+        return ReadbackCheck::NotAReadback;
+    }
+    let mut wrong = Vec::new();
+    let mut missing = Vec::new();
+    if sid_heard == Some(false) {
+        missing.push(IfrItem::Departure);
+    }
+    if let (Some(h), Some(e)) = (rwy, canon_runway(&c.runway)) {
+        if h != e {
+            wrong.push(IfrItem::Runway);
+        }
+    }
+    match alt {
+        Some(a) if a != c.initial_alt_ft => wrong.push(IfrItem::Altitude),
+        Some(_) => {}
+        None => missing.push(IfrItem::Altitude),
+    }
+    match code {
+        Some(k) if k != c.squawk => wrong.push(IfrItem::Squawk),
+        Some(_) => {}
+        None => missing.push(IfrItem::Squawk),
+    }
+    if wrong.is_empty() && missing.is_empty() {
+        ReadbackCheck::Correct
+    } else {
+        ReadbackCheck::IfrItems { wrong, missing }
+    }
+}
+
+/// The IFR clearance, phrased in the field's dialect: the sentence the
+/// tower says (with the callsign) and the instruction a challenge repeats
+/// (without it). ICAO / CAP 413: "cleared to Edinburgh via the Gosa one
+/// Charlie departure, runway two four, climb five thousand feet, squawk four
+/// five two one, QNH ...". FAA: "cleared to Chicago airport via the ...
+/// departure, then as filed, climb and maintain five thousand, departure
+/// frequency ..., squawk ...". No SID: "after departure fly runway heading".
+pub fn ifr_clearance_line(ctx: &Ctx, offer: &IfrOffer) -> (String, String) {
+    let c = &offer.clearance;
+    let alt = crate::atis::spoken_alt(c.initial_alt_ft as f64);
+    let code = crate::atis::spoken_digits(&format!("{:04}", c.squawk));
+    let body = if offer.faa {
+        let route = match &c.sid {
+            Some(sid) => format!("via the {} departure, then as filed", spoken_sid(sid)),
+            None => "as filed, after departure fly runway heading".to_string(),
+        };
+        let freq = offer
+            .departure_freq
+            .as_ref()
+            .map(|f| format!(", departure frequency {f}"))
+            .unwrap_or_default();
+        format!(
+            "cleared to {} airport {route}, climb and maintain {alt}{freq}, squawk {code}.",
+            offer.dest_spoken
+        )
+    } else {
+        let route = match &c.sid {
+            Some(sid) => format!(" via the {} departure, runway {}", spoken_sid(sid), ctx.runway),
+            None => format!(", runway {}, after departure fly runway heading", ctx.runway),
+        };
+        format!(
+            "cleared to {}{route}, climb {alt} feet, squawk {code}{}.",
+            offer.dest_spoken,
+            qnh_clause(ctx)
+        )
+    };
+    (format!("{}, {body}", ctx.callsign), body)
+}
+
+/// The IFR readback a pilot owes, phrased: the coach's line and the crew's
+/// transmission. Items only (the QNH and the frequency are not enforced).
+fn ifr_readback_line(
+    c: &IfrClearance,
+    dest_spoken: &str,
+    runway_spoken: &str,
+    faa: bool,
+    callsign: &str,
+) -> String {
+    let alt = crate::atis::spoken_alt(c.initial_alt_ft as f64);
+    let code = crate::atis::spoken_digits(&format!("{:04}", c.squawk));
+    if faa {
+        let route = match &c.sid {
+            Some(sid) => format!("via the {} departure, then as filed", spoken_sid(sid)),
+            None => "as filed, runway heading".to_string(),
+        };
+        format!("Cleared to {dest_spoken} {route}, climb and maintain {alt}, squawk {code}, {callsign}.")
+    } else {
+        let route = match &c.sid {
+            Some(sid) => format!(" via the {} departure, runway {runway_spoken}", spoken_sid(sid)),
+            None => format!(", runway {runway_spoken}, runway heading"),
+        };
+        format!("Cleared to {dest_spoken}{route}, climb {alt} feet, squawk {code}, {callsign}.")
+    }
+}
+
+/// The correction for an IFR readback with wrong or missing items: the
+/// wrong ones said again after "negative", the missing ones asked for.
+fn ifr_correction(
+    callsign: &str,
+    awaited: &Awaited,
+    wrong: &[IfrItem],
+    missing: &[IfrItem],
+) -> String {
+    let Awaited::IfrClearance {
+        clearance: c,
+        runway_spoken,
+        faa,
+        ..
+    } = awaited
+    else {
+        return format!("{callsign}, say again.");
+    };
+    let phrase = |item: &IfrItem| -> String {
+        match item {
+            IfrItem::Departure => format!(
+                "the {} departure",
+                c.sid.as_deref().map(spoken_sid).unwrap_or_default()
+            ),
+            IfrItem::Altitude => {
+                let alt = crate::atis::spoken_alt(c.initial_alt_ft as f64);
+                if *faa {
+                    format!("climb and maintain {alt}")
+                } else {
+                    format!("climb {alt} feet")
+                }
+            }
+            IfrItem::Squawk => format!(
+                "squawk {}",
+                crate::atis::spoken_digits(&format!("{:04}", c.squawk))
+            ),
+            IfrItem::Runway => format!("runway {runway_spoken}"),
+        }
+    };
+    let mut out = callsign.to_string();
+    if !wrong.is_empty() {
+        let w: Vec<String> = wrong.iter().map(phrase).collect();
+        out.push_str(&format!(", negative, {}.", w.join(", ")));
+    }
+    if !missing.is_empty() {
+        let m: Vec<String> = missing.iter().map(phrase).collect();
+        if wrong.is_empty() {
+            out.push_str(&format!(", read back {}.", m.join(", ")));
+        } else {
+            out.push_str(&format!(" Read back {}.", m.join(", ")));
+        }
+    }
+    out
 }
 
 /// A conditional line-up needs the arrival far enough out that the pilot can
@@ -851,6 +1469,10 @@ pub struct Tower {
     /// and the squawk. The crew reads it when it flies; a human pilot sees
     /// it in the coach. Dropped by the next request.
     clearance_readback: Option<String>,
+    /// An IFR clearance whose readback has just been accepted, for the
+    /// station to publish (`take_accepted_ifr`). Only a correct readback
+    /// (or, with enforcement off, any readback) puts it here.
+    accepted_ifr: Option<IfrClearance>,
 }
 
 impl Tower {
@@ -860,7 +1482,36 @@ impl Tower {
             touch_and_go: false,
             pending: None,
             clearance_readback: None,
+            accepted_ifr: None,
         }
+    }
+
+    /// The IFR clearance the pilot has just read back correctly, once.
+    pub fn take_accepted_ifr(&mut self) -> Option<IfrClearance> {
+        self.accepted_ifr.take()
+    }
+
+    /// Readback enforcement is OFF (`XCOPILOT_ATC_READBACK=false`) and the
+    /// pilot has read the IFR clearance back, right or wrong: the clearance
+    /// was issued, the tower coaches and does not challenge, so it stands.
+    /// Nothing happens when no IFR readback is owed.
+    pub fn accept_ifr_unenforced(&mut self) {
+        if let Some(PendingReadback {
+            awaited: Awaited::IfrClearance { clearance, .. },
+            ..
+        }) = &self.pending
+        {
+            self.accepted_ifr = Some(clearance.clone());
+            self.pending = None;
+        }
+    }
+
+    /// An IFR clearance's readback is owed.
+    pub fn ifr_readback_owed(&self) -> bool {
+        matches!(
+            self.pending.as_ref().map(|p| &p.awaited),
+            Some(Awaited::IfrClearance { .. })
+        )
     }
 
     /// The crew has read the departure clearance back (or moved on).
@@ -960,6 +1611,12 @@ impl Tower {
             } => {
                 format!("Cleared touch and go runway {runway}, {callsign}.")
             }
+            Awaited::IfrClearance {
+                clearance,
+                dest_spoken,
+                runway_spoken,
+                faa,
+            } => ifr_readback_line(clearance, dest_spoken, runway_spoken, *faa, callsign),
         })
     }
 
@@ -988,8 +1645,27 @@ impl Tower {
         }
         match check_readback(transcript, &pending.awaited) {
             ReadbackCheck::Correct => {
+                if let Awaited::IfrClearance { clearance, .. } = &pending.awaited {
+                    self.accepted_ifr = Some(clearance.clone());
+                }
                 self.pending = None;
                 Some(String::new())
+            }
+            ReadbackCheck::IfrItems { wrong, missing } => {
+                let line = ifr_correction(&ctx.callsign, &pending.awaited, &wrong, &missing);
+                // A wrong item is corrected as long as it takes, like a
+                // wrong runway. Only MISSING items spend a challenge: two,
+                // then the tower lets the call through, and the clearance
+                // stays unpublished (a mishear never earns it).
+                if wrong.is_empty() {
+                    let p = self.pending.as_mut().unwrap();
+                    if p.nudges >= 2 {
+                        self.pending = None;
+                        return None;
+                    }
+                    p.nudges += 1;
+                }
+                Some(line)
             }
             ReadbackCheck::WrongRunway { .. } => {
                 let instruction = pending.instruction.clone();
@@ -1073,6 +1749,25 @@ impl Tower {
             Intent::RadioCheck => {
                 format!("{}, {} Tower, reading you five.", ctx.callsign, ctx.airport)
             }
+            Intent::RequestIfrClearance { dest } => match &ctx.ifr {
+                Some(offer) => {
+                    let (line, instruction) = ifr_clearance_line(ctx, offer);
+                    self.arm(
+                        Awaited::IfrClearance {
+                            clearance: offer.clearance.clone(),
+                            dest_spoken: offer.dest_spoken.clone(),
+                            runway_spoken: ctx.runway.clone(),
+                            faa: offer.faa,
+                        },
+                        &instruction,
+                    );
+                    line
+                }
+                // No destination named: the tower asks for it and clears
+                // nothing. One it cannot find: "say again", never a guess.
+                None if dest.is_none() => format!("{}, say destination.", ctx.callsign),
+                None => format!("{}, say again destination.", ctx.callsign),
+            },
             Intent::RequestClearance => {
                 self.clearance_readback = Some(format!(
                     "Not above two thousand feet{}, squawk {}, {}.",
@@ -1488,7 +2183,243 @@ mod tests {
             taxi_via: Vec::new(),
             taxi_crossings: Vec::new(),
             on_ground: false,
+            ifr: None,
         }
+    }
+
+    /// ctx() on the ground at an ICAO field, offered an IFR clearance to
+    /// Edinburgh from runway 09 (with or without a SID).
+    fn ifr_ctx(sid: Option<&str>, faa: bool) -> Ctx {
+        Ctx {
+            on_ground: true,
+            squawk: "four five two one".into(),
+            ifr: Some(IfrOffer {
+                clearance: IfrClearance {
+                    dest: "EGPH".into(),
+                    sid: sid.map(str::to_string),
+                    runway: "09".into(),
+                    initial_alt_ft: 5000,
+                    squawk: 4521,
+                },
+                dest_spoken: "Edinburgh".into(),
+                faa,
+                departure_freq: Some("one two zero decimal four".into()),
+            }),
+            ..ctx()
+        }
+    }
+
+    fn ifr_request() -> Intent {
+        Intent::RequestIfrClearance {
+            dest: Some("EGPH".into()),
+        }
+    }
+
+    #[test]
+    fn the_ifr_initial_altitude_is_five_thousand_or_field_plus_three_rounded_up() {
+        assert_eq!(ifr_initial_altitude_ft(136.0), 5000);
+        assert_eq!(ifr_initial_altitude_ft(-11.0), 5000);
+        assert_eq!(ifr_initial_altitude_ft(1906.0), 5000);
+        assert_eq!(ifr_initial_altitude_ft(2001.0), 6000);
+        assert_eq!(ifr_initial_altitude_ft(5582.0), 9000);
+        assert_eq!(ifr_initial_altitude_ft(7000.0), 10000);
+    }
+
+    #[test]
+    fn a_sid_ident_is_spoken_the_radio_way() {
+        assert_eq!(spoken_sid("GOSA1C"), "Gosa one Charlie");
+        assert_eq!(spoken_sid("LEGL1P"), "Legl one Papa");
+        assert_eq!(spoken_sid("BIG2F"), "Big two Foxtrot");
+        assert_eq!(spoken_sid("RADAR"), "Radar");
+    }
+
+    #[test]
+    fn the_ifr_clearance_is_phrased_in_the_fields_dialect() {
+        // ICAO / CAP 413 with a SID.
+        let mut twr = Tower::new();
+        let r = twr.handle(ifr_request(), &ifr_ctx(Some("GOSA1C"), false));
+        assert_eq!(
+            r,
+            "November one seven two Sierra Papa, cleared to Edinburgh via the Gosa one \
+             Charlie departure, runway zero niner, climb five thousand feet, squawk four \
+             five two one, QNH one zero one seven."
+        );
+        assert!(twr.ifr_readback_owed(), "the readback is enforced");
+        assert_eq!(
+            twr.suggested_readback("November one seven two Sierra Papa").as_deref(),
+            Some(
+                "Cleared to Edinburgh via the Gosa one Charlie departure, runway zero niner, \
+                 climb five thousand feet, squawk four five two one, November one seven two \
+                 Sierra Papa."
+            )
+        );
+        assert_eq!(twr.state, State::Parked, "a route clearance moves no runway state");
+        // ICAO with no SID from this runway: runway heading, no invented name.
+        let mut twr = Tower::new();
+        let r = twr.handle(ifr_request(), &ifr_ctx(None, false));
+        assert!(r.contains("cleared to Edinburgh, runway zero niner, after departure fly runway heading, climb five thousand feet, squawk four five two one"), "{r}");
+        assert!(!r.contains("departure,") && !r.contains(" via "), "{r}");
+        // FAA with a SID: "then as filed", "climb and maintain", the frequency.
+        let mut twr = Tower::new();
+        let r = twr.handle(ifr_request(), &ifr_ctx(Some("BIG2F"), true));
+        assert_eq!(
+            r,
+            "November one seven two Sierra Papa, cleared to Edinburgh airport via the Big \
+             two Foxtrot departure, then as filed, climb and maintain five thousand, departure \
+             frequency one two zero decimal four, squawk four five two one."
+        );
+        // FAA with no SID.
+        let mut twr = Tower::new();
+        let r = twr.handle(ifr_request(), &ifr_ctx(None, true));
+        assert!(
+            r.contains("cleared to Edinburgh airport as filed, after departure fly runway heading, climb and maintain five thousand"),
+            "{r}"
+        );
+        // A destination the station could not find, or none: asked, never cleared.
+        let mut twr = Tower::new();
+        let r = twr.handle(ifr_request(), &Ctx { on_ground: true, ..ctx() });
+        assert_eq!(r, "November one seven two Sierra Papa, say again destination.");
+        assert!(!twr.ifr_readback_owed());
+        let r = twr.handle(Intent::RequestIfrClearance { dest: None }, &ctx());
+        assert_eq!(r, "November one seven two Sierra Papa, say destination.");
+        assert!(twr.pending().is_none());
+    }
+
+    #[test]
+    fn the_ifr_readback_is_enforced_item_by_item() {
+        let cs = "November one seven two Sierra Papa";
+        let c = ifr_ctx(Some("GOSA1C"), false);
+        let issue = || {
+            let mut twr = Tower::new();
+            twr.handle(ifr_request(), &c);
+            twr
+        };
+        // Correct: silence, and the clearance is there to publish.
+        let mut twr = issue();
+        let rb = twr.suggested_readback(cs).unwrap();
+        let heard = parse_intent(&rb.to_lowercase());
+        assert_eq!(twr.gate(&rb.to_lowercase(), heard, &c), Some(String::new()));
+        assert_eq!(
+            twr.take_accepted_ifr(),
+            Some(IfrClearance {
+                dest: "EGPH".into(),
+                sid: Some("GOSA1C".into()),
+                runway: "09".into(),
+                initial_alt_ft: 5000,
+                squawk: 4521,
+            })
+        );
+        assert!(twr.pending().is_none());
+        // Whisper's spellings count: a written altitude and code, the
+        // designator without the name.
+        let mut twr = issue();
+        let t = "cleared to edinburgh, 1c departure, climb 5,000 feet, squawk 4521";
+        assert_eq!(twr.gate(t, parse_intent(t), &c), Some(String::new()));
+        assert!(twr.take_accepted_ifr().is_some());
+        // Wrong altitude: "negative" and the right one; still owed, no
+        // clearance, and wrong items spend no challenge.
+        let mut twr = issue();
+        let t = "cleared to edinburgh via the gosa one charlie departure, climb six thousand feet, squawk four five two one";
+        for _ in 0..4 {
+            let r = twr.gate(t, parse_intent(t), &c).expect("corrected");
+            assert_eq!(r, format!("{cs}, negative, climb five thousand feet."));
+        }
+        assert!(twr.take_accepted_ifr().is_none());
+        assert!(twr.ifr_readback_owed());
+        // Missing squawk: asked for, still owed.
+        let mut twr = issue();
+        let t = "cleared to edinburgh via the gosa one charlie departure, climb five thousand feet";
+        let r = twr.gate(t, parse_intent(t), &c).expect("asked");
+        assert_eq!(r, format!("{cs}, read back squawk four five two one."));
+        assert!(twr.take_accepted_ifr().is_none());
+        assert!(twr.ifr_readback_owed());
+        // ...then read back right: accepted.
+        let t = "squawk four five two one, climb five thousand, gosa one charlie";
+        assert_eq!(twr.gate(t, parse_intent(t), &c), Some(String::new()));
+        assert!(twr.take_accepted_ifr().is_some());
+        // Wrong squawk AND a missing SID: both named.
+        let mut twr = issue();
+        let t = "cleared to edinburgh, climb five thousand feet, squawk four five two two";
+        let r = twr.gate(t, parse_intent(t), &c).unwrap();
+        assert_eq!(
+            r,
+            format!("{cs}, negative, squawk four five two one. Read back the Gosa one Charlie departure.")
+        );
+        // A wrong runway in the echo is caught too.
+        let mut twr = issue();
+        let t = "cleared to edinburgh via gosa one charlie runway two seven, climb five thousand, squawk 4521";
+        let r = twr.gate(t, parse_intent(t), &c).unwrap();
+        assert!(r.contains("negative, runway zero niner"), "{r}");
+        // A mishear is never the readback: challenged, twice, then let go
+        // with NOTHING published. It never earns the clearance.
+        let mut twr = issue();
+        for t in ["gibraltar tower, say again", "blah blah weather"] {
+            let r = twr.gate(t, parse_intent(t), &c).expect("challenged");
+            assert!(r.starts_with(&format!("{cs}, read back: cleared to Edinburgh")), "{r}");
+        }
+        let t = "mumble";
+        assert_eq!(twr.gate(t, parse_intent(t), &c), None, "let through after two");
+        assert!(twr.take_accepted_ifr().is_none(), "a mishear earned a clearance");
+        assert!(!twr.ifr_readback_owed());
+        // Without a SID only the altitude and the squawk are owed.
+        let c = ifr_ctx(None, false);
+        let mut twr = Tower::new();
+        twr.handle(ifr_request(), &c);
+        let t = "cleared to edinburgh, runway heading, climb five thousand feet, squawk four five two one";
+        assert_eq!(twr.gate(t, parse_intent(t), &c), Some(String::new()));
+        assert_eq!(twr.take_accepted_ifr().unwrap().sid, None);
+        // Enforcement off: any readback of the clearance stands.
+        let c = ifr_ctx(Some("GOSA1C"), true);
+        let mut twr = Tower::new();
+        twr.handle(ifr_request(), &c);
+        twr.accept_ifr_unenforced();
+        assert!(twr.take_accepted_ifr().is_some());
+    }
+
+    #[test]
+    fn readback_numbers_parse_the_way_whisper_writes_them() {
+        assert_eq!(heard_altitude_ft("climb five thousand feet"), Some(5000));
+        assert_eq!(heard_altitude_ft("climb to five thousand"), Some(5000));
+        assert_eq!(heard_altitude_ft("climb and maintain one zero thousand"), Some(10000));
+        assert_eq!(heard_altitude_ft("climb 5,000 feet"), Some(5000));
+        assert_eq!(heard_altitude_ft("climb 6000"), Some(6000));
+        assert_eq!(heard_altitude_ft("twelve thousand"), Some(12000));
+        assert_eq!(heard_altitude_ft("four thousand five hundred"), Some(4500));
+        assert_eq!(heard_altitude_ft("squawk four five two one"), None, "a code is no altitude");
+        assert_eq!(heard_altitude_ft("squawk 4521"), None);
+        assert_eq!(heard_squawk("squawk four five two one"), Some(4521));
+        assert_eq!(heard_squawk("squawk 4521"), Some(4521));
+        assert_eq!(heard_squawk("squawk niner seven one zero"), Some(9710));
+        assert_eq!(heard_squawk("squawk four five"), None);
+        assert!(heard_sid("via the gosam one charlie", "GOSA1C"));
+        assert!(heard_sid("gosa 1c departure", "GOSA1C"));
+        assert!(heard_sid("the one c departure", "GOSA1C"));
+        assert!(!heard_sid("the one delta departure", "GOSA1C"));
+        assert!(!heard_sid("climb five thousand", "GOSA1C"));
+    }
+
+    #[test]
+    fn ifr_requests_parse_and_the_zone_clearance_stands() {
+        let ifr = |d: Option<&str>| Intent::RequestIfrClearance {
+            dest: d.map(str::to_string),
+        };
+        assert_eq!(parse_intent("request ifr clearance to egph"), ifr(Some("EGPH")));
+        assert_eq!(parse_intent("request clearance to edinburgh"), ifr(Some("edinburgh")));
+        assert_eq!(parse_intent("ifr to edinburgh, ready to copy"), ifr(Some("edinburgh")));
+        assert_eq!(parse_intent("request clearance as filed"), ifr(None));
+        assert_eq!(parse_intent("ready to copy"), ifr(None));
+        assert_eq!(
+            parse_intent("request ifr clearance to kilo oscar romeo delta"),
+            ifr(Some("KORD"))
+        );
+        assert_eq!(parse_intent("request ifr clearance to ord"), ifr(Some("ORD")));
+        // Nothing existing changes its answer.
+        assert_eq!(parse_intent("request clearance"), Intent::RequestClearance);
+        assert_eq!(parse_intent("request departure clearance"), Intent::RequestClearance);
+        assert_eq!(parse_intent("request clearance to leave the zone"), Intent::RequestClearance);
+        assert_eq!(parse_intent("request clearance to start engines"), Intent::RequestStartup);
+        assert_eq!(parse_intent("request clearance to parking"), Intent::RequestTaxiIn);
+        assert_eq!(parse_intent("request clearance for taxi"), Intent::RequestTaxi);
     }
 
     /// ctx() with one arrival on final at `nm`.
@@ -1768,6 +2699,10 @@ mod tests {
             RadioCheck,
             RequestTaxi,
             RequestClearance,
+            RequestIfrClearance {
+                dest: Some("EGPH".into()),
+            },
+            RequestIfrClearance { dest: None },
             RequestStartup,
             RequestShutdown,
             RequestTakeoff,
@@ -1793,10 +2728,10 @@ mod tests {
         ];
         let c = ctx();
         for &start in &states {
-            for &intent in &intents {
+            for intent in intents.iter().cloned() {
                 let mut twr = Tower::new();
                 twr.state = start;
-                let reply = twr.handle(intent, &c);
+                let reply = twr.handle(intent.clone(), &c);
                 let end = twr.state;
                 let cell = format!("{start:?} + {intent:?}");
 
@@ -1842,6 +2777,9 @@ mod tests {
                 let want = match intent {
                     RadioCheck | WindCheck | SquawkCheck | Unknown | RequestClearance
                     | RequestStartup | RequestShutdown => start,
+                    // The IFR clearance clears a route, not a runway: the
+                    // sequence stands (and with no offer it is "say again").
+                    RequestIfrClearance { .. } => start,
                     // A hail, flight following, and radio housekeeping are
                     // answered without touching the sequence.
                     Greeting | RequestFlightFollowing | RequestFrequencyChange => start,
