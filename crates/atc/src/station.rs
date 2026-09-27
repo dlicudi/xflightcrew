@@ -8906,8 +8906,7 @@ mod tests {
     fn real_install_self_taxi_lilb() {
         let _guard = SIDE_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let apt = std::env::var("XPLANE_APT_DATA").unwrap_or_else(|_| {
-            "/Users/duanelicudi/X-Plane 12/Global Scenery/Global Airports/Earth nav data/apt.dat"
-                .into()
+            crate::nav::test_xplane_path("Global Scenery/Global Airports/Earth nav data/apt.dat")
         });
         // Where the 172 sat on 2026-09-25.
         let (lat, lon) = (45.771_275, 9.164_289);
@@ -10750,8 +10749,7 @@ mod tests {
     fn atc_world_sweep_every_towered_field_stands_up() {
         let _guard = SIDE_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let path = std::env::var("XCOPILOT_APT_DAT").unwrap_or_else(|_| {
-            "/Users/duanelicudi/X-Plane 12/Global Scenery/Global Airports/Earth nav data/apt.dat"
-                .to_string()
+            crate::nav::test_xplane_path("Global Scenery/Global Airports/Earth nav data/apt.dat")
         });
         let wx = Wx {
             wind_from_deg: 250.0,

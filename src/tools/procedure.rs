@@ -325,10 +325,10 @@ mod divert_probe {
     #[test]
     #[ignore]
     fn real_install_eddm_divert() {
-        let apt = "/Users/duanelicudi/X-Plane 12/Global Scenery/Global Airports/Earth nav data/apt.dat";
-        let cifp = "/Users/duanelicudi/X-Plane 12/Custom Data/CIFP";
-        let fix = "/Users/duanelicudi/X-Plane 12/Custom Data/earth_fix.dat";
-        let nav = "/Users/duanelicudi/X-Plane 12/Custom Data/earth_nav.dat";
+        let apt = &crate::tools::autoland::xplane_path("Global Scenery/Global Airports/Earth nav data/apt.dat");
+        let cifp = &crate::tools::autoland::xplane_path("Custom Data/CIFP");
+        let fix = &crate::tools::autoland::xplane_path("Custom Data/earth_fix.dat");
+        let nav = &crate::tools::autoland::xplane_path("Custom Data/earth_nav.dat");
         for (label, lat, lon, trk, rwy) in [
             ("now", 47.77, 11.79, 0.0, None),
             ("20 nm S of EDDM", 48.02, 11.80, 0.0, None),

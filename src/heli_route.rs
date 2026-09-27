@@ -2238,7 +2238,7 @@ mod tests {
     #[ignore]
     fn real_install_ethc_helipads() {
         let pads = helipads(
-            "/Users/duanelicudi/X-Plane 12/Global Scenery/Global Airports/Earth nav data/apt.dat",
+            &crate::tools::autoland::xplane_path("Global Scenery/Global Airports/Earth nav data/apt.dat"),
             "ETHC",
         );
         assert!(pads.len() >= 18, "{}", pads.len());

@@ -292,48 +292,48 @@ impl Config {
             // what X-Plane itself flies on; the stock file goes stale the moment
             // a cycle is installed. Env override wins over both.
             nav_data_path: {
-                let custom = "/Users/duanelicudi/X-Plane 12/Custom Data/earth_nav.dat";
-                let fallback = if std::path::Path::new(custom).exists() {
+                let custom = xplane_path("Custom Data/earth_nav.dat");
+                let fallback = if std::path::Path::new(&custom).exists() {
                     custom
                 } else {
-                    "/Users/duanelicudi/X-Plane 12/Resources/default data/earth_nav.dat"
+                    xplane_path("Resources/default data/earth_nav.dat")
                 };
-                env_or("XPLANE_NAV_DATA", fallback)
+                env_or("XPLANE_NAV_DATA", &fallback)
             },
             fix_data_path: {
-                let custom = "/Users/duanelicudi/X-Plane 12/Custom Data/earth_fix.dat";
-                let fallback = if std::path::Path::new(custom).exists() {
+                let custom = xplane_path("Custom Data/earth_fix.dat");
+                let fallback = if std::path::Path::new(&custom).exists() {
                     custom
                 } else {
-                    "/Users/duanelicudi/X-Plane 12/Resources/default data/earth_fix.dat"
+                    xplane_path("Resources/default data/earth_fix.dat")
                 };
-                env_or("XPLANE_FIX_DATA", fallback)
+                env_or("XPLANE_FIX_DATA", &fallback)
             },
             airspace_path: {
-                let custom = "/Users/duanelicudi/X-Plane 12/Custom Data/airspaces/airspace.txt";
-                let fallback = if std::path::Path::new(custom).exists() {
+                let custom = xplane_path("Custom Data/airspaces/airspace.txt");
+                let fallback = if std::path::Path::new(&custom).exists() {
                     custom
                 } else {
-                    "/Users/duanelicudi/X-Plane 12/Resources/default data/airspaces/airspace.txt"
+                    xplane_path("Resources/default data/airspaces/airspace.txt")
                 };
-                env_or("XPLANE_AIRSPACE", fallback)
+                env_or("XPLANE_AIRSPACE", &fallback)
             },
             // Real approach procedures (ARINC 424 legs, one file per airport).
             // Same Custom-Data-first rule as the nav data: a Navigraph cycle
             // outranks the stock one. Feeds the approach controller's ILS
             // platform altitudes; missing dir just means geometric fallbacks.
             cifp_dir: {
-                let custom = "/Users/duanelicudi/X-Plane 12/Custom Data/CIFP";
-                let fallback = if std::path::Path::new(custom).exists() {
+                let custom = xplane_path("Custom Data/CIFP");
+                let fallback = if std::path::Path::new(&custom).exists() {
                     custom
                 } else {
-                    "/Users/duanelicudi/X-Plane 12/Resources/default data/CIFP"
+                    xplane_path("Resources/default data/CIFP")
                 };
-                env_or("XPLANE_CIFP_DIR", fallback)
+                env_or("XPLANE_CIFP_DIR", &fallback)
             },
             apt_data_path: env_or(
                 "XPLANE_APT_DATA",
-                "/Users/duanelicudi/X-Plane 12/Global Scenery/Global Airports/Earth nav data/apt.dat",
+                &xplane_path("Global Scenery/Global Airports/Earth nav data/apt.dat"),
             ),
             aircraft: env_or("XCOPILOT_AIRCRAFT", "auto"),
             confirm_critical: env_or("XCOPILOT_CONFIRM", "true") != "false",
@@ -497,6 +497,22 @@ impl Config {
         settle(&mut self.atc_departure_piper_voice);
         self
     }
+}
+
+/// The X-Plane install the sim is running from: `XCOPILOT_XPLANE_ROOT`
+/// overrides the standard location, `$HOME/X-Plane 12`.
+pub fn xplane_root() -> String {
+    if let Ok(p) = std::env::var("XCOPILOT_XPLANE_ROOT") {
+        return p;
+    }
+    let home = std::env::var("HOME").unwrap_or_default();
+    format!("{home}/X-Plane 12")
+}
+
+/// A path under the X-Plane install (`xplane_root`), e.g.
+/// `xplane_path("Custom Data/CIFP")`.
+pub fn xplane_path(rel: &str) -> String {
+    format!("{}/{rel}", xplane_root())
 }
 
 fn env_or(key: &str, default: &str) -> String {

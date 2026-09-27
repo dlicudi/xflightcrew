@@ -6194,10 +6194,10 @@ mod arrival_watch_tests {
     #[test]
     #[ignore]
     fn real_install_lowi_arrival() {
-        let apt = "/Users/duanelicudi/X-Plane 12/Global Scenery/Global Airports/Earth nav data/apt.dat";
-        let cifp = "/Users/duanelicudi/X-Plane 12/Custom Data/CIFP";
-        let fix = "/Users/duanelicudi/X-Plane 12/Custom Data/earth_fix.dat";
-        let nav = "/Users/duanelicudi/X-Plane 12/Custom Data/earth_nav.dat";
+        let apt = &crate::tools::autoland::xplane_path("Global Scenery/Global Airports/Earth nav data/apt.dat");
+        let cifp = &crate::tools::autoland::xplane_path("Custom Data/CIFP");
+        let fix = &crate::tools::autoland::xplane_path("Custom Data/earth_fix.dat");
+        let nav = &crate::tools::autoland::xplane_path("Custom Data/earth_nav.dat");
         println!("MOGT3H 26 minimums: {:?}", crate::nav::sid_minimums(cifp, "LOWI", "MOGT3H", "26"));
         for wind in [Some((360.0, 17.0)), None] {
             let a = super::build_arrival(

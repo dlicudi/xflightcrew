@@ -4,11 +4,11 @@ Read the repo's CLAUDE.md fully before touching anything. Its rules are
 standing rules; its named functions are where the work goes. Grep
 docs/dev-history.md before reworking any subsystem it names.
 
-- Evidence lives in the live repo, not the worktree: sortie files are
-  `/Users/duanelicudi/GitHub/xvoicelayer/logs/sorties/<id>.jsonl` (one file
-  per mission, every record tagged `sortie`), the whole log is
-  `/Users/duanelicudi/GitHub/xvoicelayer/logs/blackbox.jsonl` (40 MB; grep it,
-  never cat it). `xvl debrief [file]` prints a flight's numbers.
+- Evidence lives in the main checkout, not the worktree: sortie files are
+  `logs/sorties/<id>.jsonl` (one file per mission, every record tagged
+  `sortie`), the whole log is `logs/blackbox.jsonl` (40 MB; grep it, never
+  cat it), both relative to the main checkout. `xvl debrief [file]` prints a
+  flight's numbers.
 - Run tests with `XCOPILOT_BLACKBOX=off cargo test --workspace` (a test that
   walks a real path otherwise records into the live log). The suite takes
   seconds once built; the build takes minutes the first time.

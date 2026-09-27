@@ -3654,8 +3654,8 @@ mod tests {
     #[ignore]
     fn real_install_lxgb_side_pick() {
         let apt =
-            "/Users/duanelicudi/X-Plane 12/Global Scenery/Global Airports/Earth nav data/apt.dat";
-        let air = "/Users/duanelicudi/X-Plane 12/Custom Data/airspaces/airspace.txt";
+            &crate::tools::autoland::xplane_path("Global Scenery/Global Airports/Earth nav data/apt.dat");
+        let air = &crate::tools::autoland::xplane_path("Custom Data/airspaces/airspace.txt");
         let cands = nearby_runways(apt, 36.1515, -5.3412, 2.0).expect("apt.dat");
         let rwy = cands
             .iter()

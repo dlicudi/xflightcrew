@@ -4136,8 +4136,7 @@ mod tests {
     #[test]
     #[ignore]
     fn real_install_castoring_noses_brake_steer() {
-        let root = std::env::var("XCOPILOT_XPLANE_ROOT")
-            .unwrap_or_else(|_| "/Users/duanelicudi/X-Plane 12".to_string());
+        let root = crate::config::xplane_root();
         for (id, dir, acf) in [
             ("lancair_evolution", "Laminar Research/Lancair Evolution", "N844X.acf"),
             ("vans_rv10", "Laminar Research/Van's Aircraft RV-10", "RV-10.acf"),

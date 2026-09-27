@@ -982,8 +982,8 @@ double-registers every dataref). Everything else DID move on 2026-07-30: the
 GitHub repo (`dlicudi/xvoicelayer`, old URL redirects, so stale clones keep
 working) and the local directory (`~/GitHub/xvoicelayer`). The directory move
 was the fiddly one, because three things key on the absolute path and none of
-them announce it when they break: `~/.claude/projects/-Users-duanelicudi-GitHub-*`
-(25 memories and 55 session transcripts, silently orphaned by a plain `mv` of
+them announce it when they break: the agent's per-project memory directory
+(keyed on the path; 25 memories and 55 session transcripts, silently orphaned by a plain `mv` of
 the repo alone), the absolute paths in `.claude/settings*.json`, and the
 cross-reference at `~/GitHub/rustdecks/CLAUDE.md:34`. The Rust crate
 identifier DID change, to `xvoicelayer` — see the tracing-filter warning in the

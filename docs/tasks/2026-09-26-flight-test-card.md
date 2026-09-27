@@ -5,7 +5,7 @@ Read docs/tasks/COMMON.md first.
 More than twenty changes shipped between 2026-09-21 and 2026-09-26 that no
 sortie has verified. They are recorded in two places: CLAUDE.md's
 "unflown" / "Still owed" lines, and the pilot's session notes in
-`/Users/duanelicudi/.claude/projects/-Users-duanelicudi-GitHub-xvoicelayer/memory/`
+the agent's memory directory
 (read `MEMORY.md` there for the index; every file whose title says
 "unflown" is one item, and each names the blackbox events to check). The
 flight model itself is "in shadow" (`src/flight.rs`, `src/duty.rs`) waiting
@@ -27,7 +27,7 @@ circuit, a helicopter route, a ramp-only session (start, pushback, cabin
 voice picker, hand-over words), a hand-flown session (rapport, tempo,
 say again, instructor). Put the items that can be verified from logs of
 flights ALREADY flown today first: check the sortie files under
-`/Users/duanelicudi/GitHub/xvoicelayer/logs/sorties/` and the main blackbox
+`logs/sorties/` and the main blackbox
 for each item's event, and if the evidence is there, fill in the status
 column now (verified, failed with the numbers, or not exercised). Be
 precise about the event and field names: read the source that emits each
