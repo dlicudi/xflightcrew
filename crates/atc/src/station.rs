@@ -2906,7 +2906,7 @@ pub fn region_tick(lat: f64, lon: f64, on_ground: bool, now: Instant) -> Option<
     let sw = if on_ground {
         RegionSwitch {
             line: format!(
-                "We're at {} — tower here is on {}.",
+                "We're at {}, tower here is on {}.",
                 spoken_airport(&best.apt.name),
                 atis::spoken_mhz(khz)
             ),
@@ -2914,9 +2914,14 @@ pub fn region_tick(lat: f64, lon: f64, on_ground: bool, now: Instant) -> Option<
         }
     } else if !had_contact {
         // First fix of the session: the copilot orients, no radar theatre.
+        // Also every switch AFTER an airborne handoff: `Station::install`
+        // clears the clearance and the squawk watch, so the new station has
+        // "never worked" us (EGBB-EGKK 2026-09-27: four of these after the
+        // Oxford handoff). The crew speaks the note only when it is worth
+        // volunteering (`monitor::region_note_said`).
         RegionSwitch {
             line: format!(
-                "Closest field is {} — tower is on {}.",
+                "Closest field is {}, tower is on {}.",
                 spoken_airport(&best.apt.name),
                 atis::spoken_mhz(khz)
             ),

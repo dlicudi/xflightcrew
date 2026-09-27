@@ -1897,6 +1897,19 @@ impl StepClimb {
     }
 }
 
+/// Whether the crew's region note ("Closest field is Benson, tower is on
+/// ...") is spoken. It is VOLUNTEERED: nobody asked, and the station swaps
+/// behind it either way. On the ground it is the relocation note (you loaded
+/// the flight at a new field) and always said. Airborne it is worth a word
+/// when something is wrong, since the closest field is then the question,
+/// and otherwise only to a chatty copilot (`persona` gates what is
+/// volunteered, never what is owed). EGBB-EGKK (2026-09-27) heard it four
+/// times in nine minutes, Benson, Heathrow, Farnborough, Gatwick, over a
+/// normal descent with the follower flying. Pure.
+fn region_note_said(on_ground: bool, abnormal: bool, chatter: crate::persona::Chatter) -> bool {
+    on_ground || abnormal || chatter == crate::persona::Chatter::Chatty
+}
+
 /// Minutes of cruise left before the top of descent under which a step climb
 /// is not worth asking for. A 2,000 ft step costs a couple of minutes at climb
 /// power and saves a percent or two of the cruise burn after it: over half an
@@ -3944,18 +3957,28 @@ pub async fn run(
                     .then(|| crate::station::region_tick(snap.lat, snap.lon, snap.on_ground, now))
                     .flatten()
                 {
+                    let abnormal = crate::flight::published()
+                        .is_some_and(|f| f.abnormal != crate::flight::Abnormal::Normal);
+                    let said = !sw.crew
+                        || region_note_said(snap.on_ground, abnormal, crate::persona::chatter());
                     crate::blackbox::record(
                         "atc_region",
                         serde_json::json!({
                             "lat": r1(snap.lat), "lon": r1(snap.lon),
-                            "crew": sw.crew, "msg": &sw.line
+                            "crew": sw.crew, "said": said, "msg": &sw.line
                         }),
                     );
-                    if sw.crew {
+                    if sw.crew && said {
                         // `voice.alert` mirrors to the panel; an explicit
                         // `s.action(&sw.line)` here too double-wrote the line
                         // to the chat (the Jerez relocation note, 2026-07-24).
                         voice.alert(Priority::Advisory, sw.line);
+                    } else if sw.crew {
+                        // Unsaid, still on the panel for a glance: mirror OR
+                        // speak, never both.
+                        if let Some(s) = status.as_ref() {
+                            s.action(&sw.line);
+                        }
                     } else {
                         if let Some(s) = status.as_ref() {
                             s.action(&format!("DEP: {}", sw.line));
@@ -5510,6 +5533,23 @@ mod tests {
         // The same drift with two hours of cruise ahead is still worth a word.
         short.dest_dist_nm = Some(1_000.0);
         assert!(c.eval(&short).is_some_and(|l| l.contains("three six zero")));
+    }
+
+    /// EGBB-EGKK (sortie 1790534902, 2026-09-27): +1684 Benson, +1864
+    /// Heathrow, +2045 Farnborough, +2226 Gatwick, each "Closest field is X,
+    /// tower is on ...", none an answer (the one question, "when do we
+    /// land?" at +1677, was answered at +1678 by the ETA).
+    #[test]
+    fn the_closest_field_is_not_volunteered_on_a_normal_flight() {
+        use crate::persona::Chatter;
+        for c in [Chatter::Quiet, Chatter::Normal] {
+            assert!(!region_note_said(false, false, c), "{c:?}: normal flight, airborne");
+        }
+        assert!(region_note_said(false, false, Chatter::Chatty), "a chatty copilot volunteers");
+        for c in [Chatter::Quiet, Chatter::Normal, Chatter::Chatty] {
+            assert!(region_note_said(false, true, c), "{c:?}: with a failure it is the question");
+            assert!(region_note_said(true, false, c), "{c:?}: the ground relocation note");
+        }
     }
 
     /// The climb is only worth taking if the wind up there allows it, so the

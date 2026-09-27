@@ -8839,3 +8839,31 @@ weight, level, distance and speed; each gate alone); the EIDW-BIKF test still
 offers FL360 at 4,600 ft under. Next jet cruise: no `callout` `step_climb`
 under full auto; hand-flown, only with half an hour of cruise left. Offline
 only.
+
+## 2026-09-27: the closest field is not volunteered (issue #122)
+
+**Sortie 1790534902 (737, EGBB-EGKK).** After the region handoff to Oxford
+Kidlington at +1319 s (read back, tuned, IFR code kept), the copilot said
+"Closest field is X, tower is on ..." four times: +1684 RAF Benson, +1864
+London Heathrow, +2045 Farnborough, +2226 London Gatwick, with the follower
+flying and nothing wrong. None was an answer: the one question of the leg,
+"when do we land?" at +1677, was answered at +1678 by the ETA.
+
+The line is `station::region_tick`'s crew note for an airborne switch with no
+controller contact, meant for the first fix after a mid-flight boot.
+`Station::install` clears the clearance and the squawk watch, so after an
+airborne handoff every later switch looks uncontacted and lands there too.
+The monitor spoke every crew note unconditionally.
+
+**The fix.** The note is VOLUNTEERED, so it follows the persona's rule
+(`monitor::region_note_said`): on the ground (the relocation note) always;
+airborne only with the flight model abnormal (a failure, an emergency: the
+closest field is then the question) or a chatty copilot. Unsaid, it goes to
+the panel transcript and the station still swaps. Both crew notes lost their
+em dash ("Closest field is X, tower is on ..."). Whether the switches after a
+handoff should be controller handoffs is left as it is.
+
+Test `the_closest_field_is_not_volunteered_on_a_normal_flight`. Next flight:
+blackbox `atc_region` carries `said`; airborne `crew: true` records say
+`said: false` under normal chatter with no failure, and no "Closest field"
+in `said`. Offline only.
