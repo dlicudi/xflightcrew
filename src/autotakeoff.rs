@@ -1812,10 +1812,34 @@ async fn reject(xp: &XPlaneClient, voice: &Option<Voice>, line: &str, reason: &s
     let _ = xp.set_float(TAXI_STEER, 0.0).await;
     crate::takeoff_config::on_reject(xp).await;
     alert(voice, Priority::Warning, line);
+    // The tower is told. A reject is a radio event: the clearance it ends is
+    // the TOWER's, and left standing it outlived the stop (EGKK 2026-09-27:
+    // the resume heard a stale "cleared for takeoff" and was asked to read
+    // it back instead of getting its taxi). Only under a tower's clearance
+    // onto this runway; an uncontrolled field has nobody to tell.
+    let call = reject_call_due(crate::party_line::clearance_state());
+    if call {
+        let callsign = crate::circuit::crew_callsign(xp).await;
+        crate::circuit::transmit(crate::circuit::radio_call(&callsign, REJECT_CALL));
+    }
     crate::blackbox::record(
         "autotakeoff",
-        serde_json::json!({"event": "reject", "reason": reason}),
+        serde_json::json!({"event": "reject", "reason": reason, "radio_call": call}),
     );
+}
+
+/// The crew's reject report on the tower frequency. ICAO's word is
+/// "stopping"; the crew says what it is doing, which no mishear turns into a
+/// request (`tower::parse_intent` reads both as `RejectingTakeoff`).
+pub const REJECT_CALL: &str = "rejecting takeoff";
+
+/// Whether a reject is reported: only when the tower has us on its runway
+/// (cleared for takeoff, or lined up without a clearance).
+pub fn reject_call_due(state: Option<crate::tower::State>) -> bool {
+    matches!(
+        state,
+        Some(crate::tower::State::TakeoffCleared | crate::tower::State::LinedUp)
+    )
 }
 
 /// A mode command is only a request; handoff needs live mode and dial readbacks.
@@ -2702,6 +2726,33 @@ pub fn spoken_height_ft(agl_ft: f64) -> String {
 
 #[cfg(test)]
 mod tests {
+
+    /// EGKK 2026-09-27: the reject left the tower's takeoff clearance live.
+    /// The crew now reports it, in words the tower reads as the reject and
+    /// never as a request, and only when the tower has us on its runway.
+    #[test]
+    fn a_reject_is_reported_to_the_tower_that_cleared_it() {
+        use crate::tower::{parse_intent, Intent, State};
+        let call = crate::circuit::radio_call(
+            &Some("Whiskey Alpha Tango one seven three".into()),
+            super::REJECT_CALL,
+        );
+        assert_eq!(
+            parse_intent(&call.to_ascii_lowercase()),
+            Intent::RejectingTakeoff,
+            "{call}"
+        );
+        assert!(super::reject_call_due(Some(State::TakeoffCleared)));
+        assert!(super::reject_call_due(Some(State::LinedUp)));
+        for quiet in [
+            None,
+            Some(State::Parked),
+            Some(State::TaxiCleared),
+            Some(State::Inbound),
+        ] {
+            assert!(!super::reject_call_due(quiet), "{quiet:?}");
+        }
+    }
 
     /// The Edinburgh refusal, from the measured geometry (2026-09-20): on
     /// runway 24, aligned to 0.9 degrees, dead on the centreline, 2,408 m

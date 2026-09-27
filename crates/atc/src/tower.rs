@@ -74,6 +74,13 @@ pub enum Intent {
     /// "going around" / "missed approach" — a balked landing rejoining the
     /// pattern. The landing clearance is void; the tower re-sequences.
     GoAround,
+    /// "stopping" / "rejecting takeoff" / "aborting takeoff": a departure
+    /// stopping on the runway. A REPORT that ends the takeoff clearance, the
+    /// way a go-around ends the landing one. EGKK 2026-09-27: a rejected
+    /// 737 stopped on 26L and the tower kept it cleared for takeoff; the
+    /// resume heard a stale hold release replay "cleared for takeoff" and its
+    /// taxi request was answered "read back: cleared for takeoff".
+    RejectingTakeoff,
     /// "mayday" / "pan pan" / "declaring an emergency" — priority handling.
     /// The ONE intent that earns a landing clearance without a final report:
     /// an emergency outranks the sequence, never the other way round.
@@ -507,6 +514,13 @@ pub fn parse_intent(transcript: &str) -> Intent {
     {
         return Intent::GoAround;
     }
+    // A departure stopping on the runway, before the takeoff words below can
+    // read "rejecting takeoff" as a takeoff REQUEST. "Stopping" is the ICAO
+    // word for it (Doc 4444, CAP 413); "rejecting/aborting takeoff" is how
+    // crews also say it.
+    if rejecting_takeoff(&t) {
+        return Intent::RejectingTakeoff;
+    }
     // Pattern position reports, before the landing request so "downwind for
     // landing" reads as the report. "base" alone is too common a word — it
     // needs pattern context ("turning base", "base leg", "on base", "left/
@@ -777,6 +791,31 @@ fn ifr_request(t: &str) -> Option<Option<String>> {
     None
 }
 
+/// "stopping", "rejecting takeoff", "aborting the takeoff" (lower case in):
+/// a departure calling its own stop. The takeoff word must sit with the
+/// reject word so "abort" alone (a cockpit word) never reaches it; "stopping"
+/// alone is the standard call.
+fn rejecting_takeoff(t: &str) -> bool {
+    let words: Vec<&str> = t
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|w| !w.is_empty())
+        .collect();
+    let has = |w: &str| words.contains(&w);
+    let takeoff = t.contains("takeoff") || t.contains("take off") || t.contains("take-off");
+    has("stopping")
+        || (takeoff
+            && [
+                "reject",
+                "rejecting",
+                "rejected",
+                "abort",
+                "aborting",
+                "aborted",
+            ]
+            .iter()
+            .any(|w| has(w)))
+}
+
 /// Parse a corpus label ("request_taxi") into the intent it names — the shared
 /// vocabulary of the battle-test manifests (`bench/atc_corpus.yaml`, the ATC
 /// cases in the stt-eval manifest). `None` for a label no intent carries.
@@ -799,6 +838,7 @@ pub fn intent_from_label(label: &str) -> Option<Intent> {
         "report_base" => Intent::ReportBase,
         "report_crosswind" => Intent::ReportCrosswind,
         "go_around" => Intent::GoAround,
+        "rejecting_takeoff" => Intent::RejectingTakeoff,
         "mayday" => Intent::Mayday,
         "wind_check" => Intent::WindCheck,
         "squawk_check" => Intent::SquawkCheck,
@@ -1704,7 +1744,25 @@ impl Tower {
         }
         // Safety outranks discipline: an emergency or a go-around is never
         // answered with "read back".
-        if matches!(intent, Intent::Mayday | Intent::GoAround) {
+        // A reject is the same: the clearance it would read back just died.
+        if matches!(
+            intent,
+            Intent::Mayday | Intent::GoAround | Intent::RejectingTakeoff
+        ) {
+            self.pending = None;
+            return None;
+        }
+        // A taxi request is not taking the takeoff or the line-up it would
+        // echo: the tower answers the request (and cancels what it
+        // supersedes), never "read back: cleared for takeoff" to a flight
+        // asking to taxi. EGKK 2026-09-27: that answer, unread, ran full
+        // auto's taxi wait out to `no_taxi_clearance`.
+        if matches!(
+            pending.awaited,
+            Awaited::Takeoff { .. } | Awaited::LineUp { .. }
+        ) && matches!(intent, Intent::RequestTaxi | Intent::RequestTaxiIn)
+            && check_readback(transcript, &pending.awaited) == ReadbackCheck::NotAReadback
+        {
             self.pending = None;
             return None;
         }
@@ -1927,9 +1985,17 @@ impl Tower {
                 taxi_in_reply(ctx)
             }
             Intent::RequestTaxi => {
+                // A flight cleared for takeoff that asks to taxi is not
+                // taking it: the clearance is cancelled out loud, never left
+                // standing behind the new route.
+                let cancel = if self.state == State::TakeoffCleared {
+                    "takeoff clearance cancelled, "
+                } else {
+                    ""
+                };
                 self.state = State::TaxiCleared;
                 format!(
-                    "{}, taxi to holding point {} runway {}{}{}{}. \
+                    "{}, {cancel}taxi to holding point {} runway {}{}{}{}. \
                      Report ready for departure.",
                     ctx.callsign,
                     ctx.holding_point,
@@ -2161,6 +2227,22 @@ impl Tower {
                     ctx.callsign
                 )
             }
+            // A departure stopping on the runway: the takeoff clearance is
+            // void and the aircraft is on the pavement with none, which is
+            // LinedUp in this book (the runway stays ours, nobody else is
+            // cleared onto it). Nothing to read back: "hold position" here is
+            // the tower acknowledging a crew with its hands full. From
+            // anywhere else on the ground the words change nothing; in the
+            // air they are a garble.
+            Intent::RejectingTakeoff
+                if ctx.on_ground
+                    && matches!(self.state, State::TakeoffCleared | State::LinedUp) =>
+            {
+                self.state = State::LinedUp;
+                format!("{}, roger. Hold position, report ready.", ctx.callsign)
+            }
+            Intent::RejectingTakeoff if ctx.on_ground => format!("{}, roger.", ctx.callsign),
+            Intent::RejectingTakeoff => format!("{}, say again.", ctx.callsign),
             // Priority handling — the ONE clearance spoken without a final
             // report. An emergency outranks the sequence. On the GROUND there
             // is nothing to clear: send the trucks, hold the traffic.
@@ -2843,6 +2925,7 @@ mod tests {
             ReportBase,
             ReportCrosswind,
             GoAround,
+            RejectingTakeoff,
             Mayday,
             WindCheck,
             SquawkCheck,
@@ -2906,6 +2989,10 @@ mod tests {
                 let want = match intent {
                     RadioCheck | WindCheck | SquawkCheck | Unknown | RequestClearance
                     | RequestStartup | RequestShutdown => start,
+                    // A reject is a ground report: ctx() is airborne, so it
+                    // is a garble there and moves nothing (the ground half
+                    // has its own test).
+                    RejectingTakeoff => start,
                     // The IFR clearance clears a route, not a runway: the
                     // sequence stands (and with no offer it is "say again").
                     RequestIfrClearance { .. } => start,
@@ -2993,6 +3080,96 @@ mod tests {
                 assert_eq!(twr.state, start, "{start:?}: hold moves nobody");
             }
         }
+    }
+
+    /// The reject is its own call, never a takeoff request: "rejecting
+    /// takeoff" carries the word "takeoff", and parsed as `RequestTakeoff` it
+    /// would ask for the clearance it is giving up. The cockpit's own "abort"
+    /// or "stop" is not it (unkeyed, those never reach the tower anyway).
+    #[test]
+    fn a_reject_call_parses_as_the_reject() {
+        for call in [
+            "whiskey alpha tango one seven three, rejecting takeoff",
+            "Whiskey Alpha Tango one seven three, stopping.",
+            "gatwick tower, easy two five five, stopping",
+            "aborting takeoff, november one seven two sierra papa",
+            "rejecting take off",
+            "we rejected the take-off",
+        ] {
+            assert_eq!(parse_intent(call), Intent::RejectingTakeoff, "{call}");
+        }
+        for call in [
+            "ready for departure",
+            "cleared for takeoff runway two six left",
+            "abort",
+            "stop",
+            "full stop landing",
+            "why are we stopping",
+        ] {
+            assert_ne!(parse_intent(call), Intent::RejectingTakeoff, "{call}");
+        }
+        assert_eq!(
+            intent_from_label("rejecting_takeoff"),
+            Some(Intent::RejectingTakeoff)
+        );
+    }
+
+    /// On the ground a reject ends the takeoff clearance: from TakeoffCleared
+    /// or LinedUp the flight is on the runway with none (LinedUp), nothing is
+    /// owed, and the answer is an acknowledgement, not an instruction to read
+    /// back. The owed takeoff readback never gates it (safety outranks
+    /// discipline, as for a go-around). Elsewhere on the ground it moves
+    /// nothing; in the air it is a garble.
+    #[test]
+    fn a_reject_cancels_the_takeoff_clearance() {
+        let mut ground = ctx();
+        ground.on_ground = true;
+        for start in [State::TakeoffCleared, State::LinedUp] {
+            let mut twr = Tower::new();
+            twr.state = start;
+            twr.arm_takeoff_readback(
+                "zero niner".into(),
+                "runway zero niner, cleared for takeoff.".into(),
+            );
+            assert_eq!(
+                twr.gate(
+                    "november one seven two sierra papa, rejecting takeoff",
+                    Intent::RejectingTakeoff,
+                    &ground
+                ),
+                None,
+                "{start:?}: never challenged"
+            );
+            let r = twr.handle(Intent::RejectingTakeoff, &ground);
+            assert!(r.starts_with(&ground.callsign), "{r}");
+            assert!(r.contains("roger") && r.contains("Hold position"), "{r}");
+            assert!(!r.contains("cleared"), "{r}");
+            assert_eq!(twr.state, State::LinedUp, "{start:?}");
+            assert!(twr.pending().is_none(), "{start:?}: nothing owed");
+            assert!(twr.holds_runway(), "{start:?}: still on the runway");
+            // The resume's next call is answered on its own terms.
+            let mut t2 = Tower::new();
+            t2.state = twr.state;
+            assert!(t2
+                .handle(Intent::RequestTaxi, &ground)
+                .contains("holding point"));
+            assert!(twr
+                .handle(Intent::RequestTakeoff, &ground)
+                .contains("cleared for takeoff"));
+        }
+        for start in [State::Parked, State::TaxiCleared] {
+            let mut twr = Tower::new();
+            twr.state = start;
+            let r = twr.handle(Intent::RejectingTakeoff, &ground);
+            assert!(r.contains("roger"), "{r}");
+            assert_eq!(twr.state, start);
+        }
+        let mut twr = Tower::new();
+        twr.state = State::TakeoffCleared;
+        assert!(twr
+            .handle(Intent::RejectingTakeoff, &ctx())
+            .contains("say again"));
+        assert_eq!(twr.state, State::TakeoffCleared, "airborne: a garble");
     }
 
     #[test]

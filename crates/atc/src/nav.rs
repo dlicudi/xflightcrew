@@ -2429,7 +2429,89 @@ pub fn best_runway_for_wind(
             }
         }
     }
-    best
+    // The wind picks a DIRECTION; between parallels it cannot pick the
+    // strip. Their headings agree to a hundredth of a degree, so the
+    // headwind decided EGKK's 26L against 26R on noise and the IFR clearance
+    // named 26R, the standby, while ground and tower worked 26L (sortie
+    // 1790524628, 2026-09-27). Of the ends facing that way, the LONGEST
+    // strip is the field's main runway (apt.dat's thresholds: 26L 3,319 m,
+    // 26R 2,563 m).
+    let (best_id, best_hdg, _) = best.clone()?;
+    let main = assignable_runways(runways)
+        .flat_map(|r| {
+            [
+                (&r.ident_a, r.heading_a_deg(), r.length_m()),
+                (&r.ident_b, r.heading_b_deg(), r.length_m()),
+            ]
+        })
+        .filter(|(_, hdg, _)| angle_diff_deg(*hdg, best_hdg).abs() <= PARALLEL_DEG)
+        .fold(None::<(&String, f64, f64)>, |acc, e| match acc {
+            Some(a) if a.2 >= e.2 => Some(a),
+            _ => Some(e),
+        });
+    match main {
+        Some((id, hdg, _)) if *id != best_id => {
+            let headwind = wind_kts * angle_diff_deg(wind_from_deg, hdg).to_radians().cos();
+            Some((id.clone(), hdg, headwind))
+        }
+        _ => best,
+    }
+}
+
+/// Two runway ends within this many degrees face the same way: parallels
+/// (EGKK's 26L and 26R differ by a hundredth of a degree).
+pub const PARALLEL_DEG: f64 = 5.0;
+
+/// Parallels closer than this cannot be worked as two runways at once
+/// (ICAO Annex 14 / Doc 4444: independent parallel departures need 760 m
+/// between the centrelines), so one of the pair is the runway and the other
+/// its standby.
+pub const CLOSE_PARALLEL_M: f64 = 760.0;
+
+/// The runway a CLOSE parallel end stands in for: the same-direction end of
+/// the longest strip within [`CLOSE_PARALLEL_M`] of this one's centreline,
+/// else the end itself. EGKK's 26R (the standby, 198 m north of 26L) is
+/// 26L; EGLL's 27R (1,400 m from 27L) is itself. A ghost whose replayed
+/// position sits nearer the standby's centreline flew the main runway, and
+/// an overheard "cleared for takeoff runway two six right" named a runway
+/// the tower was not using (sortie 1790524628, +99 s).
+pub fn close_parallel_main(runways: &[Runway], ident: &str) -> String {
+    let Some((own, own_hdg)) = runways.iter().find_map(|r| {
+        if r.ident_a == ident {
+            Some((r, r.heading_a_deg()))
+        } else if r.ident_b == ident {
+            Some((r, r.heading_b_deg()))
+        } else {
+            None
+        }
+    }) else {
+        return ident.to_string();
+    };
+    let own_len = own.length_m();
+    let mid = |r: &Runway| ((r.lat_a + r.lat_b) / 2.0, (r.lon_a + r.lon_b) / 2.0);
+    let mut out = (ident.to_string(), own_len);
+    for r in assignable_runways(runways) {
+        if std::ptr::eq(r, own) {
+            continue;
+        }
+        let (end, hdg) = if angle_diff_deg(r.heading_a_deg(), own_hdg).abs() <= PARALLEL_DEG {
+            (&r.ident_a, r.heading_a_deg())
+        } else if angle_diff_deg(r.heading_b_deg(), own_hdg).abs() <= PARALLEL_DEG {
+            (&r.ident_b, r.heading_b_deg())
+        } else {
+            continue;
+        };
+        // Lateral separation: the other strip's midpoint off our centreline.
+        let (mlat, mlon) = mid(r);
+        let (olat, olon) = mid(own);
+        let d_nm = haversine_nm(olat, olon, mlat, mlon);
+        let brg = bearing_deg(olat, olon, mlat, mlon);
+        let lateral_m = (d_nm * 1852.0 * angle_diff_deg(brg, hdg).to_radians().sin()).abs();
+        if lateral_m < CLOSE_PARALLEL_M && r.length_m() > out.1 {
+            out = (end.clone(), r.length_m());
+        }
+    }
+    out.0
 }
 
 /// The runways a wind pick may choose from: the field's MAIN runways. A hard
@@ -4294,6 +4376,49 @@ STAR:030,6,ALWYS3,RW28B,ARRTU,K2,P,C,E   , ,   ,TF, , , , , ,      ,    ,    ,  
         assert!(map_final_legs(rw).is_none());
     }
 
+    /// EGKK's two strips from the real apt.dat rows. Their headings differ
+    /// by 0.005 degrees (257.629 and 257.624 true), so at 175/7.7 (sortie
+    /// 1790524628, 2026-09-27) 26R faced the wind by 0.0007 kt more and won:
+    /// the IFR clearance named the standby. The wind picks the direction;
+    /// the longest strip facing it is the runway, in any wind.
+    #[test]
+    fn the_wind_picks_a_direction_and_the_main_parallel_takes_it() {
+        let rw = vec![
+            Runway {
+                ident_a: "08R".into(),
+                ident_b: "26L".into(),
+                lat_a: 51.1450993,
+                lon_a: -0.2123748,
+                lat_b: 51.1514994,
+                lon_b: -0.1659296,
+                width_m: 46.0,
+                surface: 26,
+            },
+            Runway {
+                ident_a: "08L".into(),
+                ident_b: "26R".into(),
+                lat_a: 51.1468901,
+                lon_a: -0.2126029,
+                lat_b: 51.1518321,
+                lon_b: -0.1767408,
+                width_m: 46.0,
+                surface: 23,
+            },
+        ];
+        assert!(rw[0].length_m() > 3300.0 && rw[1].length_m() < 2600.0);
+        let (id, hdg, hw) = best_runway_for_wind(&rw, 174.7, 7.7).unwrap();
+        assert_eq!(id, "26L");
+        assert!((hdg - 257.63).abs() < 0.01, "{hdg}");
+        assert!(
+            (hw - 0.948).abs() < 0.001,
+            "the headwind is 26L's own: {hw}"
+        );
+        for from in (0..360).step_by(5) {
+            let id = best_runway_for_wind(&rw, from as f64, 12.0).unwrap().0;
+            assert!(id == "26L" || id == "08R", "wind {from}: {id}");
+        }
+    }
+
     #[test]
     fn the_wind_pick_hands_out_the_main_runway_not_the_grass_strip() {
         // ETND's own two rows (2026-09-24): 08L/26R grass, 446 m; 08/26
@@ -5028,6 +5153,78 @@ STAR:030,6,ALWYS3,RW28B,ARRTU,K2,P,C,E   , ,   ,TF, , , , , ,      ,    ,    ,  
     /// aircraft — where the route runs is the only part of that we own.
     /// LIPR gate 210 to Alpha for 30 (2026-09-26): the route ended on a
     /// repeated point and the stop swerved right toward "due north".
+    /// The real install's EGKK, the numbers of sortie 1790524628: the wind
+    /// pick is 26L, 26R stands for 26L, the CIFP's SID toward Birmingham off
+    /// 26L is a Mike departure, and the taxi from where the rejected 737
+    /// stopped (1790525500, 51.147885 N 0.192010 W, facing 261) reaches 26L's
+    /// holding point. `cargo test -p atc -- --ignored real_install_egkk --nocapture`
+    #[test]
+    #[ignore] // needs the real X-Plane install; run with --ignored
+    fn real_install_egkk_one_runway() {
+        let apt =
+            "/Users/duanelicudi/X-Plane 12/Global Scenery/Global Airports/Earth nav data/apt.dat";
+        let (Ok(Some(egkk)), Ok(Some(egbb))) =
+            (find_airport(apt, "EGKK"), find_airport(apt, "EGBB"))
+        else {
+            return;
+        };
+        let (id, _, _) = best_runway_for_wind(&egkk.runways, 174.7, 7.7).unwrap();
+        assert_eq!(id, "26L");
+        assert_eq!(close_parallel_main(&egkk.runways, "26R"), "26L");
+        let first = |a: &str, b: &str| {
+            if std::path::Path::new(a).exists() {
+                a.to_string()
+            } else {
+                b.to_string()
+            }
+        };
+        let cifp = first(
+            "/Users/duanelicudi/X-Plane 12/Custom Data/CIFP",
+            "/Users/duanelicudi/X-Plane 12/Resources/default data/CIFP",
+        );
+        let fix = first(
+            "/Users/duanelicudi/X-Plane 12/Custom Data/earth_fix.dat",
+            "/Users/duanelicudi/X-Plane 12/Resources/default data/earth_fix.dat",
+        );
+        let navd = first(
+            "/Users/duanelicudi/X-Plane 12/Custom Data/earth_nav.dat",
+            "/Users/duanelicudi/X-Plane 12/Resources/default data/earth_nav.dat",
+        );
+        let exits = sid_exits(&cifp, &fix, &navd, &egkk, "EGKK");
+        let sid = sid_toward(
+            &exits,
+            "26L",
+            egkk.position().unwrap(),
+            egbb.position().unwrap(),
+        );
+        println!("EGKK 26L toward EGBB: {sid:?}");
+        let sid = sid.expect("a SID off 26L").0;
+        assert!(sid.ends_with('M') || sid.ends_with('X'), "a 26L SID: {sid}");
+        let net = find_taxi_net(apt, "EGKK")
+            .unwrap()
+            .expect("EGKK taxi network");
+        let r = egkk.runways.iter().find(|r| r.ident_b == "26L").unwrap();
+        let zone = [r.ident_a.clone(), r.ident_b.clone()];
+        let plan = net.plan_to_runway(
+            51.147885,
+            -0.192010,
+            r.lat_b,
+            r.lon_b,
+            100.0,
+            &zone,
+            Some(r),
+        );
+        println!(
+            "from the reject stop: {:?}",
+            plan.as_ref()
+                .map(|p| (&p.holding_point, &p.via, p.path.len()))
+        );
+        assert!(
+            plan.is_some_and(|p| p.path.len() >= 2),
+            "a taxi back from the runway"
+        );
+    }
+
     #[test]
     #[ignore] // needs the real X-Plane install; run with --ignored
     fn live_lipr_route_has_no_zero_length_legs() {

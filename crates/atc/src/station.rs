@@ -127,6 +127,13 @@ pub struct Station {
     /// The (exit, destination) bearings behind the last IFR clearance's SID,
     /// for its blackbox record when the readback is accepted.
     ifr_bearings: Option<(f64, f64)>,
+    /// The runway the last IFR clearance named, while its departure is still
+    /// to fly: the runway in use is FROZEN on it, exactly as a taxi
+    /// clearance freezes it. EGKK 2026-09-27: the clearance named 26R, the
+    /// crew's "request taxi, runway two six left" then moved the pick, and
+    /// ground and tower worked 26L under a SID for 26R. Retired airborne
+    /// and by an arrival's calls.
+    ifr_runway: Option<String>,
 }
 
 /// Radio phraseology dialect. ICAO/CAP 413 style ("descend to altitude two
@@ -235,6 +242,7 @@ impl Station {
             procedures: None,
             sid_exits: Default::default(),
             ifr_bearings: None,
+            ifr_runway: None,
         })
     }
 
@@ -868,6 +876,38 @@ impl Station {
                 "takeoff clearance withheld; release watch armed"
             );
         }
+        // A departure that STOPPED on the runway spent everything its
+        // clearance armed: the held release (EGKK 2026-09-27: armed while
+        // the 737 rolled, never released, it replayed "traffic clear,
+        // cleared for takeoff" 1.2 s into the resume), a release the main
+        // loop has not synced yet, the conditional line-up's condition and
+        // the after-departure handoff.
+        if service == Service::Tower
+            && intent == tower::Intent::RejectingTakeoff
+            && ctx.on_ground
+            && matches!(was, tower::State::TakeoffCleared | tower::State::LinedUp)
+        {
+            *PENDING_TAKEOFF_CLEARANCE
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()) = false;
+            *PENDING_LINE_UP.lock().unwrap_or_else(|e| e.into_inner()) = false;
+            *HANDOFF.lock().unwrap_or_else(|e| e.into_inner()) = None;
+            tracing::info!(runway = ?self.runway_in_use, "takeoff rejected; clearance cancelled");
+        }
+        // A held release lives only while the tower still owes one: the
+        // flight holding short or on the runway WITHOUT a clearance. Any
+        // other state (cleared, parked, inbound) or a reject retires it, so
+        // it can never replay a clearance nobody is waiting for.
+        if service == Service::Tower
+            && (intent == tower::Intent::RejectingTakeoff
+                || !matches!(
+                    self.twr.state,
+                    tower::State::TaxiCleared | tower::State::LinedUp
+                ))
+        {
+            *TAKEOFF_HOLD.lock().unwrap_or_else(|e| e.into_inner()) = None;
+            *LINE_UP_CONDITION.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        }
         reply
     }
 
@@ -1014,6 +1054,7 @@ impl Station {
             | tower::Intent::ReportBase
             | tower::Intent::ReportCrosswind
             | tower::Intent::GoAround
+            | tower::Intent::RejectingTakeoff
             | tower::Intent::RequestTakeoff
             | tower::Intent::RequestTaxi
             | tower::Intent::RequestTaxiIn
@@ -1075,6 +1116,7 @@ impl Station {
             _ => None,
         };
         self.ifr_bearings = toward.as_ref().map(|t| (t.1, t.2));
+        self.ifr_runway = Some(runway.clone()).filter(|r| !r.is_empty());
         let sid = match toward {
             Some((ident, _, _)) => Some(ident),
             None => self
@@ -1230,6 +1272,7 @@ impl Station {
             | tower::Intent::ReportBase
             | tower::Intent::ReportCrosswind
             | tower::Intent::GoAround
+            | tower::Intent::RejectingTakeoff
             | tower::Intent::RequestTakeoff
             | tower::Intent::RequestTaxi
             | tower::Intent::RequestTaxiIn
@@ -1475,7 +1518,10 @@ impl Station {
                 | tower::State::LinedUp
                 | tower::State::TakeoffCleared
                 | tower::State::Inbound
-        ) || (self.twr.state == tower::State::ClearedToLand && !self.twr.runway_vacated());
+        ) || (self.twr.state == tower::State::ClearedToLand && !self.twr.runway_vacated())
+            // ...and so does an IFR clearance: it named the runway and the
+            // SID off it, and the taxi that follows goes to THAT runway.
+            || (self.ifr_runway.is_some() && self.ifr_runway == self.runway_in_use);
         if committed && self.runway_in_use.is_some() {
             return self.runway_in_use.clone().unwrap_or_default();
         }
@@ -1533,6 +1579,17 @@ impl Station {
                 }
             }
         }
+        // An uncommitted pick sitting on a CLOSE parallel's standby moves to
+        // the main runway: the hysteresis above can never make that swap
+        // (their headwinds agree to rounding), so a 26R picked on noise
+        // before the fix, or by a calm-wind stream, would stand for good.
+        if let Some(cur) = self.runway_in_use.as_deref() {
+            let main = nav::close_parallel_main(&self.apt.runways, cur);
+            if main != cur {
+                tracing::info!(from = %cur, to = %main, "runway in use moved to the main runway");
+                self.runway_in_use = Some(main);
+            }
+        }
         self.runway_in_use.clone().unwrap_or_default()
     }
 
@@ -1559,6 +1616,11 @@ impl Station {
             .map(|r| r.spoken)
             .unwrap_or_else(|| "aircraft calling".to_string());
         let on_ground = xp.get_float(datarefs::ON_GROUND_ANY).await.unwrap_or(0.0) > 0.5;
+        // An IFR clearance's runway is held for its departure only: airborne
+        // it has been flown (or abandoned), and the pick is free again.
+        if !on_ground {
+            self.ifr_runway = None;
+        }
         // The wind a tower reads out and picks its runway by is the wind ON
         // THE FIELD. The sim's wind datarefs are the air the aircraft is in:
         // for a caller on the ground the same thing, for an arrival at
@@ -3554,7 +3616,9 @@ pub fn arrival_end(targets: &[TcasTarget], runways: &[nav::Runway], field_elev_f
             }
         }
     }
-    best.map(|(_, e)| e)
+    // A close parallel's corridor is the main runway's too: the stream
+    // lands on the runway the field works (`nav::close_parallel_main`).
+    best.map(|(_, e)| nav::close_parallel_main(runways, &e))
 }
 
 /// Live traffic on final for THIS strip: airborne, low over the field,
@@ -3737,6 +3801,14 @@ fn departure_runway_ident(lat: f64, lon: f64, prev_lat: f64, prev_lon: f64) -> O
     } else {
         r.ident_b.clone()
     })
+}
+
+/// The runway a ghost's end is narrated as: a CLOSE parallel's is the main
+/// runway's (`nav::close_parallel_main`), since replayed positions wander
+/// between centrelines 200 m apart and the field works one of them.
+fn main_runway_of(ident: &str) -> String {
+    let runways = ACTIVE_RUNWAYS.lock().unwrap_or_else(|e| e.into_inner());
+    nav::close_parallel_main(&runways, ident)
 }
 
 /// The active field's runway end nearest a position — the runway a landing
@@ -4199,7 +4271,7 @@ pub fn chatter_tick(
             && descending
         {
             let cs = spoken_ghost(&t.callsign);
-            let aim = nearest_runway_ident(t.lat, t.lon);
+            let aim = nearest_runway_ident(t.lat, t.lon).map(|id| main_runway_of(&id));
             // The player is on (or cleared onto) this ghost's strip: no
             // narrated landing clearance over their head — "continue" is
             // what a real tower says, and it stays true when the replay
@@ -4285,7 +4357,8 @@ pub fn chatter_tick(
             // reciprocal (every 09R departure read "two seven left" on the
             // 2026-07-10 tape).
             let ident = departure_runway_ident(t.lat, t.lon, m.prev_lat, m.prev_lon)
-                .or_else(|| nearest_runway_ident(t.lat, t.lon));
+                .or_else(|| nearest_runway_ident(t.lat, t.lon))
+                .map(|id| main_runway_of(&id));
             // The player holds this strip: the tower gave nobody else a
             // takeoff on it, so the replay's departure goes un-narrated.
             let held = match (&ident, blocked_ident) {
@@ -4474,6 +4547,31 @@ fn hold_armed_at(existing: Option<&TakeoffHold>, runway_ident: &str, now: Instan
     existing
         .filter(|h| h.runway_ident == runway_ident)
         .map_or(now, |h| h.armed_at)
+}
+
+/// Groundspeed past which our aircraft on the ground is ROLLING for takeoff,
+/// never taxiing (taxi paces top out near 30 kt).
+pub const HOLD_ROLL_KTS: f64 = 40.0;
+
+/// Retire a held release once our aircraft rolls on the ground past
+/// [`HOLD_ROLL_KTS`]: the takeoff it was holding has happened (through the
+/// cancel, or before it was held). The reject call retires it too; this is
+/// the tower's own eyes for a reject it never heard. `true` when a hold was
+/// voided.
+pub fn void_takeoff_hold_by_roll(gs_kts: f64) -> bool {
+    if gs_kts < HOLD_ROLL_KTS {
+        return false;
+    }
+    let voided = TAKEOFF_HOLD
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .take()
+        .is_some();
+    if voided {
+        *LINE_UP_CONDITION.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        tracing::info!(gs_kts, "held takeoff release voided: the aircraft rolled");
+    }
+    voided
 }
 
 pub fn takeoff_hold_tick(
@@ -8381,6 +8479,7 @@ mod tests {
             procedures: None,
             sid_exits: Default::default(),
             ifr_bearings: None,
+            ifr_runway: None,
         }
     }
 
@@ -9377,8 +9476,10 @@ mod tests {
         for (from, kts) in [(250.0, 12.0), (270.0, 20.0), (271.0, 9.0)] {
             assert_eq!(st.pick_runway(from, kts), "27L", "wind {from}/{kts}");
         }
-        // ...but a genuine reversal still turns the field around, as it must.
-        assert_eq!(st.pick_runway(90.0, 20.0), "09R");
+        // ...but a genuine reversal still turns the field around, as it must,
+        // onto the main (longest) strip facing the new way: 09L/27R is
+        // 3,902 m against 09R/27L's 3,660 m (`nav::best_runway_for_wind`).
+        assert_eq!(st.pick_runway(90.0, 20.0), "09L");
     }
 
     #[test]
@@ -9857,8 +9958,14 @@ mod tests {
             "{owed}"
         );
         // A different call is challenged, and the challenge repeats the
-        // instruction — nothing moves.
-        let r = st.route_keyed("gibraltar tower, request taxi", Service::Tower, &ctx, wx);
+        // instruction; nothing moves. (A TAXI request is not challenged: it
+        // cancels the takeoff, see `a_taxi_request_cancels_a_takeoff_clearance`.)
+        let r = st.route_keyed(
+            "gibraltar tower, request start up",
+            Service::Tower,
+            &ctx,
+            wx,
+        );
         assert!(r.contains("read back"), "{r}");
         assert!(r.contains("cleared for takeoff"), "{r}");
         assert_eq!(
@@ -9910,6 +10017,201 @@ mod tests {
         *CLEARANCE.lock().unwrap_or_else(|e| e.into_inner()) = None;
         *HANDOFF.lock().unwrap_or_else(|e| e.into_inner()) = None;
         *TAKEOFF_HOLD.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    }
+
+    /// EGKK 2026-09-27 (sorties 1790525500 and 1790525553) replayed through
+    /// the keyed route. The resumed 737 was cleared for takeoff; its queued
+    /// "ready for departure" went out as it rolled, traffic stood on the
+    /// strip, and the tower answered "cancel takeoff clearance, hold
+    /// position" and armed the release watch. The crew rejected and stopped.
+    /// Then: the watch replayed "traffic clear, cleared for takeoff" 1.2 s
+    /// into the resume, and the resume's taxi request was answered "read
+    /// back: runway two six left, cleared for takeoff". Now the crew's reject
+    /// call cancels it all, and the taxi request gets its taxi.
+    #[test]
+    fn a_rejected_takeoff_cancels_the_clearance_and_the_held_release() {
+        let _guard = SIDE_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        *WAKE.lock().unwrap() = None;
+        *TAKEOFF_HOLD.lock().unwrap() = None;
+        *PENDING_TAKEOFF_CLEARANCE.lock().unwrap() = false;
+        let path = lxgb_apt_file();
+        let mut st = Station::load(path.to_str().unwrap(), "LXGB").expect("LXGB loads");
+        let wx = Wx {
+            wind_from_deg: 90.0,
+            wind_kts: 8.0,
+        };
+        let mut ctx = scripted_ctx(&mut st, wx);
+        ctx.on_ground = true;
+        let cs = "november one seven two sierra papa";
+
+        st.route_keyed(&format!("{cs}, request taxi"), Service::Tower, &ctx, wx);
+        let r = st.route_keyed(
+            &format!("{cs}, ready for departure"),
+            Service::Tower,
+            &ctx,
+            wx,
+        );
+        assert!(r.contains("cleared for takeoff"), "{r}");
+        let r = st.route_keyed(
+            &format!("cleared for takeoff runway zero niner, {cs}"),
+            Service::Tower,
+            &ctx,
+            wx,
+        );
+        assert_eq!(r, "", "read back");
+        // The queued re-report lands with traffic on the strip: cancelled,
+        // held, the release watch armed.
+        let mut busy = ctx.clone();
+        busy.runway_occupied = true;
+        let r = st.route_keyed(
+            &format!("{cs}, ready for departure"),
+            Service::Tower,
+            &busy,
+            wx,
+        );
+        assert!(r.contains("cancel takeoff clearance"), "{r}");
+        assert!(
+            TAKEOFF_HOLD.lock().unwrap().is_some(),
+            "release watch armed"
+        );
+        // A released clearance the main loop has not synced yet.
+        *PENDING_TAKEOFF_CLEARANCE.lock().unwrap() = true;
+
+        // The crew's reject call, as the drain keys it: never challenged for
+        // the readback it owes, answered, and everything it armed retired.
+        let r = st.route_keyed(
+            &format!("{cs}, rejecting takeoff"),
+            Service::Tower,
+            &ctx,
+            wx,
+        );
+        assert!(r.contains("roger") && r.contains("Hold position"), "{r}");
+        assert!(!r.contains("read back"), "{r}");
+        assert_eq!(
+            st.twr.state,
+            tower::State::LinedUp,
+            "on the runway, no clearance"
+        );
+        assert!(st.twr.pending().is_none(), "nothing owed");
+        assert!(
+            TAKEOFF_HOLD.lock().unwrap().is_none(),
+            "the held release is void"
+        );
+        assert!(
+            !*PENDING_TAKEOFF_CLEARANCE.lock().unwrap(),
+            "the unsynced release is void"
+        );
+        let (state, holds, owed) = {
+            let c = CLEARANCE.lock().unwrap();
+            let c = c.as_ref().unwrap();
+            (c.state, c.holds_runway, c.pending_readback.clone())
+        };
+        assert_eq!(state, tower::State::LinedUp);
+        assert!(holds, "the runway is still ours");
+        assert!(owed.is_none(), "the coach owes nothing");
+        // Nothing replays, however long the resume takes.
+        let t0 = Instant::now();
+        for s in [0, 15, 30, 120] {
+            assert!(
+                takeoff_hold_tick(&[], 11.0, true, t0 + std::time::Duration::from_secs(s))
+                    .is_none(),
+                "no replay at +{s} s"
+            );
+        }
+
+        // The resume, stopped mid-runway: its taxi request gets the taxi.
+        let r = st.route_keyed(
+            &format!("{cs}, request taxi, runway zero niner"),
+            Service::Tower,
+            &ctx,
+            wx,
+        );
+        assert!(r.contains("holding point"), "{r}");
+        assert!(!r.contains("read back"), "{r}");
+        assert_eq!(st.twr.state, tower::State::TaxiCleared);
+
+        // From the start of the runway instead, it asks for takeoff again.
+        let mut st = Station::load(path.to_str().unwrap(), "LXGB").unwrap();
+        st.route_keyed(&format!("{cs}, request taxi"), Service::Tower, &ctx, wx);
+        st.route_keyed(
+            &format!("{cs}, ready for departure"),
+            Service::Tower,
+            &ctx,
+            wx,
+        );
+        st.route_keyed(&format!("{cs}, stopping"), Service::Tower, &ctx, wx);
+        assert_eq!(st.twr.state, tower::State::LinedUp);
+        let r = st.route_keyed(
+            &format!("{cs}, ready for departure"),
+            Service::Tower,
+            &ctx,
+            wx,
+        );
+        assert!(r.contains("cleared for takeoff"), "a fresh clearance: {r}");
+
+        *CLEARANCE.lock().unwrap() = None;
+        *HANDOFF.lock().unwrap() = None;
+        *TAKEOFF_HOLD.lock().unwrap() = None;
+        *TAXI_ROUTE.lock().unwrap() = None;
+        *PENDING_TAKEOFF_CLEARANCE.lock().unwrap() = false;
+    }
+
+    /// The tower's own eyes, for a reject call it never heard: the hold armed
+    /// at +14 of sortie 1790525500 rode a roll to 94 kt and was still armed at
+    /// the resume. Rolling past 40 kt spends it; a taxi at 25 kt does not.
+    #[test]
+    fn a_held_release_is_spent_by_the_roll() {
+        let _guard = SIDE_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        *TAKEOFF_HOLD.lock().unwrap() = Some(TakeoffHold {
+            callsign: "Whiskey Alpha Tango one seven three".into(),
+            runway: "two six left".into(),
+            runway_ident: "26L".into(),
+            clear_since: None,
+            armed_at: Instant::now(),
+            logged_at: Instant::now(),
+            lined_up: true,
+            behind: false,
+        });
+        assert!(
+            !void_takeoff_hold_by_roll(25.0),
+            "a taxi pace spends nothing"
+        );
+        assert!(TAKEOFF_HOLD.lock().unwrap().is_some());
+        assert!(void_takeoff_hold_by_roll(94.0), "the roll spends it");
+        assert!(TAKEOFF_HOLD.lock().unwrap().is_none());
+        assert!(!void_takeoff_hold_by_roll(94.0), "once");
+        assert!(takeoff_hold_tick(&[], 200.0, true, Instant::now()).is_none());
+    }
+
+    /// A flight cleared for takeoff that asks to taxi is not taking the
+    /// takeoff: the tower cancels it out loud and gives the taxi, never "read
+    /// back: cleared for takeoff" (the EGKK resume's answer when the crew's
+    /// reject call never reached the tower).
+    #[test]
+    fn a_taxi_request_cancels_a_takeoff_clearance() {
+        let _guard = SIDE_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        *TAKEOFF_HOLD.lock().unwrap() = None;
+        let path = lxgb_apt_file();
+        let mut st = Station::load(path.to_str().unwrap(), "LXGB").expect("LXGB loads");
+        let wx = Wx {
+            wind_from_deg: 90.0,
+            wind_kts: 8.0,
+        };
+        let mut ctx = scripted_ctx(&mut st, wx);
+        ctx.on_ground = true;
+        st.route_keyed("request taxi", Service::Tower, &ctx, wx);
+        let r = st.route_keyed("ready for departure", Service::Tower, &ctx, wx);
+        assert!(r.contains("cleared for takeoff"), "{r}");
+        assert!(st.twr.pending().is_some(), "the takeoff readback is owed");
+        let r = st.route_keyed("gibraltar tower, request taxi", Service::Tower, &ctx, wx);
+        assert!(r.contains("takeoff clearance cancelled"), "{r}");
+        assert!(r.contains("holding point"), "{r}");
+        assert!(!r.contains("read back"), "{r}");
+        assert_eq!(st.twr.state, tower::State::TaxiCleared);
+        assert!(st.twr.pending().is_none());
+        *CLEARANCE.lock().unwrap() = None;
+        *HANDOFF.lock().unwrap() = None;
+        *TAXI_ROUTE.lock().unwrap() = None;
     }
 
     #[test]
@@ -10762,6 +11064,175 @@ mod tests {
             path
         })
         .clone()
+    }
+
+    /// EGKK as the real install's apt.dat has it (2026-09-27): the header,
+    /// both 100-rows verbatim (08R/26L 3,319 m with approach and centreline
+    /// lights; 08L/26R 2,563 m, the standby) and the tower.
+    fn egkk_apt_file() -> std::path::PathBuf {
+        use std::io::Write;
+        use std::sync::OnceLock;
+        static PATH: OnceLock<std::path::PathBuf> = OnceLock::new();
+        PATH.get_or_init(|| {
+            let path = std::env::temp_dir()
+                .join(format!("xc-station-egkk-{}.dat", std::process::id()));
+            let mut f = std::fs::File::create(&path).unwrap();
+            writeln!(f, "1    203 0 0 EGKK London Gatwick").unwrap();
+            writeln!(f, "100 46.00 26 1527 0.25 1 3 0 08R 51.1450993 -0.2123748 395 0 7 4 1 3 26L 51.1514994 -0.1659296 425 30 7 4 1 3").unwrap();
+            writeln!(f, "100 46.00 23 853 0.25 0 1 0 08L 51.1468901 -0.2126029 321 0 7 0 0 3 26R 51.1518321 -0.1767408 415 0 7 0 0 3").unwrap();
+            writeln!(f, "1052 121955 Gatwick Delivery").unwrap();
+            writeln!(f, "1054 124230 Gatwick Tower").unwrap();
+            writeln!(f, "1055 126825 Gatwick Director").unwrap();
+            writeln!(f, "1   1027 0 0 0MU1 Sunderland").unwrap();
+            f.flush().unwrap();
+            path
+        })
+        .clone()
+    }
+
+    /// EGKK 2026-09-27 (sortie 1790524628): the IFR clearance at +154 named
+    /// 26R with LAM6V, and the taxi at +170 and the takeoff went to 26L. The
+    /// wind was 175 at 7.7: across both parallels, whose headwinds differ by
+    /// rounding, so the pick was noise. Then the crew's "request taxi, runway
+    /// two six left" moved the runway in use under the clearance just read
+    /// back. Now: one answer. The main runway (26L) is picked, a stale 26R
+    /// moves to it, the SID is 26L's, and the clearance freezes the runway
+    /// the taxi goes to.
+    #[test]
+    fn the_ifr_clearance_and_the_taxi_name_one_runway_at_egkk() {
+        let _guard = SIDE_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        Station::uninstall();
+        *SQUAWK_WATCH.lock().unwrap() = None;
+        let dir = std::env::temp_dir().join(format!("xc-station-egkk-sids-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // Two SIDs to Lambourne as the CIFP has them: M off 26L, V off 26R.
+        let leg = |sid: &str, rwy: &str| {
+            format!(
+                "SID:010,5,{sid},{rwy},LAMXX,EG,E,A,E   , ,   ,TF, ,   ,  , , ,      ,    ,    ,    ,    , ,     ,     ,     , ,   ,    ,   ;\n"
+            )
+        };
+        std::fs::write(
+            dir.join("EGKK.dat"),
+            [leg("LAM6V", "RW26R"), leg("LAM6M", "RW26L")].concat(),
+        )
+        .unwrap();
+        let fixes = dir.join("earth_fix.dat");
+        std::fs::write(
+            &fixes,
+            "I\n1200 Version\n\n 51.646 0.152 LAMXX ENRT EG 2\n99\n",
+        )
+        .unwrap();
+        let mut egbb = region_apt("Birmingham", 52.4539, -1.748);
+        egbb.icao = "EGBB".into();
+        *REGION.lock().unwrap() = vec![egbb];
+        let wx = Wx {
+            wind_from_deg: 174.7,
+            wind_kts: 7.7,
+        };
+        let path = egkk_apt_file();
+        let mut st = Station::load(path.to_str().unwrap(), "EGKK").expect("EGKK loads");
+        st.set_procedures_now(dir.to_str().unwrap(), fixes.to_str().unwrap(), "", "EGKK");
+        let cs = "Whiskey Alpha Tango one seven three";
+        let ctx_now = |st: &mut Station| {
+            st.make_ctx(
+                wx,
+                "QNH one zero one three".into(),
+                cs.into(),
+                true,
+                false,
+                None,
+                false,
+                None,
+            )
+        };
+
+        // The pick: the main runway of the pair, whichever parallel the
+        // wind favours by a hundredth of a knot.
+        assert_eq!(st.pick_runway(174.7, 7.7), "26L");
+        assert_eq!(
+            st.pick_runway(354.7, 7.7),
+            "26L",
+            "hysteresis: no reversal in 7.7 kt of crosswind"
+        );
+        // A pick left on the standby (by the old rule, or a calm stream)
+        // moves to the main runway while nothing is committed.
+        st.runway_in_use = Some("26R".into());
+        assert_eq!(st.pick_runway(174.7, 7.7), "26L");
+
+        // The clearance names 26L and 26L's SID.
+        let ctx = ctx_now(&mut st);
+        let r = st.route_keyed("request ifr clearance to egbb", Service::Tower, &ctx, wx);
+        assert!(r.contains("runway two six left"), "{r}");
+        assert!(r.contains("Mike departure"), "LAM6M off 26L: {r}");
+        assert!(!r.contains("Victor"), "{r}");
+        let r = st.route_keyed(
+            &format!("cleared to birmingham via the lam six mike departure, runway two six left, climb five thousand feet, squawk {}, {cs}", atis::spoken_digits(&format!("{:04}", st.assigned_squawk.unwrap()))),
+            Service::Tower,
+            &ctx,
+            wx,
+        );
+        assert_eq!(r, "", "read back");
+
+        // The crew states another runway with its taxi request: the
+        // clearance holds the runway the SID was chosen for.
+        let taxi = "whiskey alpha tango one seven three, request taxi, runway two six right";
+        st.note_stated_runway(taxi, tower::parse_intent(taxi));
+        let ctx = ctx_now(&mut st);
+        assert_eq!(ctx.runway, "two six left", "the clearance's runway stands");
+        let r = st.route_keyed(taxi, Service::Tower, &ctx, wx);
+        assert!(r.contains("runway two six left"), "{r}");
+
+        // Airborne, the freeze is spent.
+        st.ifr_runway = None;
+        *REGION.lock().unwrap() = Vec::new();
+        *IFR_CLEARANCE.lock().unwrap() = None;
+        *IFR_FLIGHT.lock().unwrap() = None;
+        *CLEARANCE.lock().unwrap() = None;
+        *TAXI_ROUTE.lock().unwrap() = None;
+        *SQUAWK_WATCH.lock().unwrap() = None;
+        Station::uninstall();
+    }
+
+    /// The overheard traffic at +99 of the same sortie was "cleared for
+    /// takeoff runway two six right": a replayed ghost 200 m off 26L's
+    /// centreline is on 26L. A close parallel names its main runway; a wide
+    /// one (Heathrow's 1,400 m) is itself.
+    #[test]
+    fn a_close_parallel_is_its_main_runway() {
+        let st = Station::load(egkk_apt_file().to_str().unwrap(), "EGKK").expect("EGKK loads");
+        let rw = &st.apt.runways;
+        assert_eq!(nav::close_parallel_main(rw, "26R"), "26L");
+        assert_eq!(nav::close_parallel_main(rw, "08L"), "08R");
+        assert_eq!(nav::close_parallel_main(rw, "26L"), "26L");
+        assert_eq!(
+            nav::close_parallel_main(rw, "33"),
+            "33",
+            "unknown end: itself"
+        );
+        let egll = vec![
+            nav::Runway {
+                width_m: 50.0,
+                surface: 0,
+                ident_a: "09L".into(),
+                ident_b: "27R".into(),
+                lat_a: 51.4774781,
+                lon_a: -0.4894423,
+                lat_b: 51.4776753,
+                lon_b: -0.4332600,
+            },
+            nav::Runway {
+                width_m: 50.0,
+                surface: 0,
+                ident_a: "09R".into(),
+                ident_b: "27L".into(),
+                lat_a: 51.4647701,
+                lon_a: -0.4867489,
+                lat_b: 51.4649460,
+                lon_b: -0.4340638,
+            },
+        ];
+        assert_eq!(nav::close_parallel_main(&egll, "27L"), "27L");
+        assert_eq!(nav::close_parallel_main(&egll, "09R"), "09R");
     }
 
     /// A CIFP directory with one SID from Gibraltar's runway 09.

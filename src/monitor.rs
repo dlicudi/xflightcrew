@@ -3741,6 +3741,21 @@ pub async fn run(
                         matches!(tuned_speaker, Some(crate::voice::StationSpeaker::Tower));
                     let cleared_to_land = crate::party_line::clearance_state()
                         == Some(crate::tower::State::ClearedToLand);
+                    // A held release is spent once we ROLL on the runway: the
+                    // tower saw the takeoff it was holding. Left armed it
+                    // outlived a reject and replayed "traffic clear, cleared
+                    // for takeoff" into the next mission (EGKK 2026-09-27).
+                    if snap.on_ground
+                        && crate::station::void_takeoff_hold_by_roll(snap.groundspeed_kts)
+                    {
+                        crate::blackbox::record(
+                            "atc",
+                            serde_json::json!({
+                                "event": "hold_void", "why": "rolled",
+                                "gs_kts": snap.groundspeed_kts,
+                            }),
+                        );
+                    }
                     let hold_armed = crate::party_line::takeoff_hold_armed();
                     // Party-line flavor stands down while the taxi guide is
                     // working AND the aircraft is rolling: its cues are

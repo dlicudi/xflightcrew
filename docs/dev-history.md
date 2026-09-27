@@ -8730,3 +8730,79 @@ Next reject: no `callout` `rolling_park_brake` while `reject_rollout` ticks
 run; state `in.crew_brake` true with `park` up; no `intervention`
 `brake_yield` within 2 s of `reject`; the `sortie_result` `interventions` 0.
 Offline only.
+
+## 2026-09-27: a rejected takeoff is a radio event (issue #115)
+
+**Sorties 1790524628, 1790525500, 1790525553 (EGKK, stock 737).** The first
+reject (lateral excursion, 26L) left the tower at TakeoffCleared. The resume
+(1790525500) found the stale clearance, read it back at +3.7 and rolled; its
+queued "ready for departure" went out at +14.1 during the roll, with traffic on
+the strip, and the tower answered "cancel takeoff clearance, hold position,
+traffic on the runway" and armed the release watch. The crew rejected again at
++27.1 (94 kt, 10.1 m off the centreline) and stopped. Nothing told the tower.
+The hold stayed armed (it voided only airborne), so 1.2 s into the next resume
+(1790525553) it replayed "traffic clear. Runway two six left, cleared for
+takeoff". The aircraft stood 1 km down the runway, too little to go, so full
+auto judged its taxi route stale and asked "request taxi, runway two six left";
+the tower's readback gate answered "read back: runway two six left, cleared
+for takeoff", nobody read back, and full auto gave up `no_taxi_clearance` at
++184.8.
+
+**The fix.** The crew reports the reject (`autotakeoff::reject`,
+`REJECT_CALL` "rejecting takeoff", only when `reject_call_due`: the tower has
+us TakeoffCleared or LinedUp). A new `tower::Intent::RejectingTakeoff`
+("stopping", ICAO's word, or reject/abort with takeoff; parsed before the
+takeoff words so it is never a request) is never gated by an owed readback
+(like a go-around), and on the ground from TakeoffCleared or LinedUp it leaves
+the flight LinedUp with nothing owed: "roger. Hold position, report ready."
+The station retires everything the clearance armed: the release watch, an
+unsynced released clearance, the line-up condition, the after-departure
+handoff. A held release now lives only while the tower is TaxiCleared or
+LinedUp, and the monitor voids it when our aircraft rolls past 40 kt on the
+ground (`station::void_takeoff_hold_by_roll`, blackbox `atc` `hold_void`), the
+tower's own eyes for a reject call it never heard. A taxi request while a
+takeoff or line-up readback is owed is not challenged: from TakeoffCleared the
+tower says "takeoff clearance cancelled, taxi to holding point ...". The resume
+itself needed no change: on the runway with room it asks for departure from
+LinedUp; mid-runway it asks for taxi and now gets it (the real EGKK network
+plans holding point Mike from the stop, 51.147885 N 0.192010 W).
+
+Tests `a_rejected_takeoff_cancels_the_clearance_and_the_held_release` (the
+sequence replayed through the keyed route), `a_taxi_request_cancels_a_takeoff_clearance`,
+`a_held_release_is_spent_by_the_roll`, `a_reject_cancels_the_takeoff_clearance`,
+`a_reject_call_parses_as_the_reject`, `a_reject_is_reported_to_the_tower_that_cleared_it`;
+corpus cases for the reject call. Next reject: blackbox `autotakeoff` `reject`
+carries `radio_call: true`, then an `atc` keyed record with intent
+`RejectingTakeoff` and state `TakeoffCleared>LinedUp`; no `hold_release` after
+it; a resume's `request_taxi` answered with a taxi. Offline only.
+
+## 2026-09-27: one runway for the clearance, the taxi and the tower (issue #114)
+
+**Sortie 1790524628 (EGKK).** The IFR clearance at +154 named 26R with LAM6V;
+the taxi at +170 and the takeoff went to 26L. Wind 175 at 7.7: across both
+parallels, whose headings (from apt.dat's thresholds) are 257.629 and 257.624
+degrees true, so 26R faced it by 0.0007 kt more and won the pick. Then the
+crew's "request taxi, runway two six left" (its SimBrief runway) was a stated
+runway inside the swap margin and moved the pick to 26L under the clearance
+just read back. The overheard "runway two six right, cleared for takeoff" at
++99 was a replayed ghost nearer 26R's centreline, 198 m from 26L's.
+
+**The fix.** `nav::best_runway_for_wind`: the wind picks the DIRECTION, and of
+the ends within 5 degrees of it (`PARALLEL_DEG`) the longest strip is the
+runway (EGKK 26L 3,319 m, 26R 2,563 m, from the 100-row thresholds; EGLL's
+reversal now goes to 09L, 3,902 m against 3,660). `nav::close_parallel_main`:
+a parallel closer than 760 m (`CLOSE_PARALLEL_M`, the ICAO minimum for
+independent departures) is its longer twin; ghost narration and the calm-wind
+arrival stream (`arrival_end`) name that, and an uncommitted pick sitting on a
+close standby moves to the main runway (the hysteresis could never make that
+swap). An IFR clearance freezes the runway in use like a taxi clearance
+(`Station::ifr_runway`, retired airborne), so the taxi goes to the runway the
+SID was chosen for (`nav::sid_toward` off that runway, else runway heading).
+Against the real install: 26L's SID toward EGBB is LAM6M.
+
+Tests `the_wind_picks_a_direction_and_the_main_parallel_takes_it`,
+`the_ifr_clearance_and_the_taxi_name_one_runway_at_egkk` (EGKK's real rows),
+`a_close_parallel_is_its_main_runway`; `real_install_egkk_one_runway`
+(ignored, real apt.dat and CIFP). Next EGKK departure: blackbox `atc`
+`ifr_clearance` runway 26L with an M SID, the taxi reply naming 26L, and no
+party-line "two six right". Offline only.

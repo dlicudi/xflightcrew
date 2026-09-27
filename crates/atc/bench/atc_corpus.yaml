@@ -302,6 +302,15 @@
 - {text: "going around", intent: go_around, radio: true}
 - {text: "november 172SP going around", intent: go_around, radio: true}
 - {text: "missed approach, november 172SP", intent: go_around, radio: true}
+# The reject report (EGKK 2026-09-27): the crew keys it from the runway, so the
+# callsign-only forms need no unkeyed routing; "takeoff" in it must never read
+# as a takeoff REQUEST. The cockpit's own "abort takeoff" stays the copilot's.
+- {text: "whiskey alpha tango one seven three, rejecting takeoff", intent: rejecting_takeoff, radio: false}
+- {text: "Whiskey Alpha Tango 173, rejecting take off.", intent: rejecting_takeoff, radio: false}
+- {text: "Easy two five five, stopping.", intent: rejecting_takeoff, radio: false}
+- {text: "gatwick tower, easy two five five, stopping", intent: rejecting_takeoff, radio: true}
+- {text: "abort takeoff", intent: rejecting_takeoff, radio: false}
+- {text: "why are we stopping", intent: unknown, radio: false}
 # "base" without pattern context stays unparsed — too common a word.
 - {text: "base", intent: unknown, radio: false}
 
