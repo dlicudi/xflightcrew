@@ -1269,6 +1269,7 @@ pub struct DescentProfile {
 
 impl DescentProfile {
     /// The rule off.
+    #[cfg(test)]
     pub fn none() -> Self {
         Self::default()
     }
