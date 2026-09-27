@@ -111,6 +111,21 @@
 # ...and the combined wording the station itself suggests is still the REQUEST.
 - {text: "runway vacated, request taxi to parking", intent: request_taxi_in, radio: true}
 
+# --- A named runway asked for ----------------------------------------------------
+# ETND 2026-09-24: the SF50 was cleared onto 446 m of grass with no words to
+# ask for the paved runway beside it. The request names the runway right after
+# the request word; "request taxi, runway ..." stays the taxi request.
+- {text: "request runway zero eight left", intent: request_runway, radio: true}
+- {text: "diepholz tower, november one two three, request runway zero eight", intent: request_runway, radio: true}
+- {text: "unable two six, request zero eight left for length", intent: request_runway, radio: true}
+- {text: "unable runway two six right, request runway two six for length", intent: request_runway, radio: true}
+- {text: "requesting runway two four for departure", intent: request_runway, radio: true}
+- {text: "request runway 08L", intent: request_runway, radio: true}
+- {text: "request runway 0 8 left for takeoff", intent: request_runway, radio: true}
+- {text: "request taxi, runway two seven", intent: request_taxi, radio: true}
+- {text: "request runway change", intent: unknown, radio: true}
+- {text: "which runway can we request", intent: unknown, radio: true}
+
 # --- Final reports ------------------------------------------------------------
 - {text: "november one seven two, final", intent: report_final, radio: true}
 - {text: "turning final", intent: report_final, radio: true}

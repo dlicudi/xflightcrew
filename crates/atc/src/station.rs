@@ -82,6 +82,12 @@ pub struct Station {
     /// The runway the arrival now calling named for itself, consumed by the
     /// pick that answers the call (`note_stated_runway`).
     stated_runway: Option<String>,
+    /// The runway a "request runway ..." call named, canonical ("8L"), for
+    /// the ctx that answers it (`note_stated_runway`, `apply_runway_request`).
+    runway_request: Option<String>,
+    /// That request resolved to a strip end the tower can hand out ("08L"),
+    /// committed as the runway in use when the tower grants it.
+    requested_ident: Option<String>,
     /// The departure controller has said "radar contact" to this flight.
     dep_checked_in: bool,
     /// The ATIS information letter the pilot last reported having ("with
@@ -200,6 +206,8 @@ impl Station {
             twr: tower::Tower::new(),
             runway_in_use: None,
             stated_runway: None,
+            runway_request: None,
+            requested_ident: None,
             dep_checked_in: false,
             pilot_info: None,
             assigned_squawk: None,
@@ -641,6 +649,16 @@ impl Station {
             ctx
         };
         let reply = self.respond_inner(transcript, service, intent, ctx, wx);
+        // A granted runway request makes that runway the one in use; the
+        // taxi (or the join) it bought freezes the pick on it from here.
+        if service == Service::Tower && intent == tower::Intent::RequestRunway {
+            if let Some(ident) = self.requested_ident.take() {
+                if ctx.runway_refusal.is_none() {
+                    tracing::info!(runway = %ident, "runway request granted");
+                    self.runway_in_use = Some(ident);
+                }
+            }
+        }
         // Publish the clearance picture for the monitor's compliance watch:
         // two-way contact has happened, and this is what the pilot is (and
         // isn't) cleared to do. Same reply-path-owns-its-static pattern as
@@ -655,7 +673,7 @@ impl Station {
         // A fresh taxi clearance publishes its route for the off-route
         // compliance watch (and clears any stale one when route-less).
         if service == Service::Tower
-            && intent == tower::Intent::RequestTaxi
+            && matches!(intent, tower::Intent::RequestTaxi | tower::Intent::RequestRunway)
             && self.twr.state == tower::State::TaxiCleared
         {
             *TAXI_ROUTE.lock().unwrap_or_else(|e| e.into_inner()) = self
@@ -899,6 +917,7 @@ impl Station {
             | tower::Intent::RequestTaxi
             | tower::Intent::RequestTaxiIn
             | tower::Intent::RunwayVacated
+            | tower::Intent::RequestRunway
             | tower::Intent::RequestStartup
             | tower::Intent::RequestShutdown
             | tower::Intent::RequestClearance => format!(
@@ -1054,6 +1073,7 @@ impl Station {
             | tower::Intent::RequestTaxi
             | tower::Intent::RequestTaxiIn
             | tower::Intent::RunwayVacated
+            | tower::Intent::RequestRunway
             | tower::Intent::RequestStartup
             | tower::Intent::RequestShutdown
             | tower::Intent::RequestClearance => format!(
@@ -1205,6 +1225,49 @@ impl Station {
             | tower::Intent::RequestLanding { .. } => tower::stated_runway(transcript),
             _ => None,
         };
+        self.runway_request = match intent {
+            tower::Intent::RequestRunway => tower::requested_runway(transcript),
+            _ => None,
+        };
+        self.requested_ident = None;
+    }
+
+    /// Answer a "request runway ..." call's context: the runway it named,
+    /// resolved against this field (`resolve_runway_request`). Granted, the
+    /// ctx names THAT runway and, on the ground, the taxi route is re-planned
+    /// to it from `pos` (as `RequestTaxi` plans one to the runway in use);
+    /// refused, the ctx carries the reason. Pure but for the route planner.
+    fn apply_runway_request(&mut self, ctx: &mut tower::Ctx, pos: Option<(f64, f64)>) {
+        match resolve_runway_request(&self.apt.runways, self.runway_request.as_deref()) {
+            Err(refusal) => {
+                self.requested_ident = None;
+                ctx.runway_refusal = Some(refusal);
+            }
+            Ok(ident) => {
+                ctx.runway = atis::spoken_runway(&ident);
+                ctx.runway_refusal = None;
+                if ctx.on_ground {
+                    self.planned_route = pos.and_then(|(lat, lon)| {
+                        plan_taxi_route_to(&self.apt.runways, &ident, lat, lon)
+                    });
+                    let route = self.planned_route.as_ref();
+                    ctx.holding_point = route
+                        .map(|r| spoken_taxiway(&r.holding_point))
+                        .filter(|h| !h.is_empty())
+                        .unwrap_or_else(|| "Alpha".to_string());
+                    ctx.taxi_via = route.map(|r| spoken_via(&r.via)).unwrap_or_default();
+                    ctx.taxi_crossings = route
+                        .map(|r| {
+                            r.crossings
+                                .iter()
+                                .map(|n| atis::spoken_runway(first_designator(n)))
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                }
+                self.requested_ident = Some(ident);
+            }
+        }
     }
 
     /// The runway in use. Re-picked from the wind only when there IS wind
@@ -1388,11 +1451,13 @@ impl Station {
                 && self.twr.state == tower::State::ClearedToLand);
         self.planned_route = None;
         let mut own_on_runway = false;
+        let mut pos = None;
         if on_ground {
             if let (Ok(lat), Ok(lon)) = (
                 xp.get_float(datarefs::LATITUDE).await,
                 xp.get_float(datarefs::LONGITUDE).await,
             ) {
+                pos = Some((lat, lon));
                 own_on_runway = strip(&self.apt.runways, &ident)
                     .is_some_and(|r| on_runway(r, lat, lon).is_some());
                 self.planned_route = if arrival {
@@ -1413,6 +1478,9 @@ impl Station {
             wake_secs_left,
         );
         ctx.own_on_runway = own_on_runway;
+        if intent == tower::Intent::RequestRunway {
+            self.apply_runway_request(&mut ctx, pos);
+        }
         ctx.helicopter = xp
             .get_float("sim/aircraft2/metadata/is_helicopter")
             .await
@@ -1486,6 +1554,7 @@ impl Station {
             // The sim read is `build_ctx`'s; scripted contexts are off it.
             own_on_runway: false,
             helicopter: false,
+            runway_refusal: None,
         }
     }
 }
@@ -1547,6 +1616,46 @@ pub fn is_radio_call(t: &str, airport_lc: &str) -> bool {
         || word("vacating")
         || t.contains("clear of the runway")
         || t.contains("clear of runway")
+}
+
+/// A requested runway resolved against the field: `Ok(ident)` for a strip
+/// end the tower hands out (`nav::assignable_runways`), else the spoken
+/// (runway, reason) the refusal says. No runway in the words is refused
+/// with an empty runway, which the tower answers with "say again": a
+/// mishear never buys a runway.
+fn resolve_runway_request(
+    runways: &[nav::Runway],
+    heard: Option<&str>,
+) -> Result<String, (String, String)> {
+    let Some(canon) = heard else {
+        return Err((String::new(), String::new()));
+    };
+    let spoken_canon = || {
+        let digits: String = canon.chars().take_while(|c| c.is_ascii_digit()).collect();
+        let padded = if digits.len() == 1 {
+            format!("0{canon}")
+        } else {
+            canon.to_string()
+        };
+        atis::spoken_runway(&padded)
+    };
+    let Some(ident) = runways
+        .iter()
+        .flat_map(|r| [&r.ident_a, &r.ident_b])
+        .find(|id| tower::runway_matches(id, canon))
+        .cloned()
+    else {
+        return Err((spoken_canon(), "no such runway here".to_string()));
+    };
+    let assignable = nav::assignable_runways(runways)
+        .any(|r| r.ident_a == ident || r.ident_b == ident);
+    if !assignable {
+        return Err((
+            atis::spoken_runway(&ident),
+            "that runway is not available".to_string(),
+        ));
+    }
+    Ok(ident)
 }
 
 /// This flight's discrete squawk, deterministic from the callsign so tests
@@ -6875,6 +6984,85 @@ mod tests {
         *ACTIVE_RUNWAYS.lock().unwrap() = Vec::new();
     }
 
+    /// ETND's two strips as apt.dat has them: 08L/26R, 446 m of grass, and
+    /// 08/26, 1,240 m of asphalt beside it.
+    fn etnd_runways() -> Vec<nav::Runway> {
+        vec![
+            nav::Runway {
+                ident_a: "08L".into(),
+                ident_b: "26R".into(),
+                lat_a: 52.5862935,
+                lon_a: 8.3393953,
+                lat_b: 52.5866670,
+                lon_b: 8.3459906,
+                width_m: 50.0,
+                surface: 3,
+            },
+            nav::Runway {
+                ident_a: "08".into(),
+                ident_b: "26".into(),
+                lat_a: 52.5850000,
+                lon_a: 8.3318780,
+                lat_b: 52.5859870,
+                lon_b: 8.3501930,
+                width_m: 45.11,
+                surface: 1,
+            },
+        ]
+    }
+
+    /// "Request runway ..." in the tower matrix (ETND 2026-09-24): an
+    /// assignable runway is granted as the taxi to it and becomes the runway
+    /// in use (published on the party line for the crew); the grass strip
+    /// the field does not hand out, a runway the field lacks and words with
+    /// no runway in them are refused and move nothing.
+    #[test]
+    fn a_runway_request_is_granted_or_refused_by_the_field() {
+        let _guard = SIDE_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        *CLEARANCE.lock().unwrap() = None;
+        let wx = calm();
+        let mut st = lxgb();
+        st.apt.name = "Diepholz".into();
+        st.apt.runways = etnd_runways();
+        let ask = |st: &mut Station, words: &str| {
+            let intent = tower::parse_intent(words);
+            assert_eq!(intent, tower::Intent::RequestRunway, "{words}");
+            st.note_stated_runway(words, intent);
+            let mut ctx = scripted_ctx(st, wx);
+            ctx.on_ground = true;
+            st.apply_runway_request(&mut ctx, None);
+            st.route_keyed(words, Service::Tower, &ctx, wx)
+        };
+
+        // The grass strip is refused: a tower does not hand it out.
+        let r = ask(&mut st, "request runway two six right");
+        assert!(r.contains("unable runway two six right, that runway is not available"), "{r}");
+        assert_eq!(st.twr.state, tower::State::Parked);
+        // A runway the field lacks.
+        let r = ask(&mut st, "request runway three three");
+        assert!(r.contains("unable runway three three, no such runway here"), "{r}");
+        let r = ask(&mut st, "request runway zero niner");
+        assert!(r.contains("unable runway zero niner"), "{r}");
+        assert_eq!(st.twr.state, tower::State::Parked);
+
+        // The paved runway, asked for by length: granted, and it is the
+        // runway in use from here, on the party line too.
+        let r = ask(&mut st, "unable two six right, request runway zero eight for length");
+        assert!(
+            r.contains("runway zero eight approved, taxi to holding point"),
+            "{r}"
+        );
+        assert!(r.contains("runway zero eight"), "{r}");
+        assert_eq!(st.twr.state, tower::State::TaxiCleared);
+        assert_eq!(st.runway_in_use.as_deref(), Some("08"));
+        assert_eq!(crate::party_line::clearance_runway().as_deref(), Some("08"));
+        // The pick holds it through the taxi, whatever the calm air says.
+        assert_eq!(st.pick_runway(260.0, 3.0), "08");
+
+        *CLEARANCE.lock().unwrap() = None;
+        *TAXI_ROUTE.lock().unwrap() = None;
+    }
+
     /// Liege 2026-09-22 (history "Still owed"): the tower learned its runway
     /// was free from our taxi request, not from the "runway vacated" report
     /// before it. Landed and off the pavement, before the report a ghost's
@@ -7916,6 +8104,8 @@ mod tests {
             twr: tower::Tower::new(),
             runway_in_use: None,
             stated_runway: None,
+            runway_request: None,
+            requested_ident: None,
             dep_checked_in: false,
             pilot_info: None,
             assigned_squawk: None,
@@ -9882,6 +10072,7 @@ mod tests {
             runway_occupied: false,
             own_on_runway: false,
             helicopter: false,
+            runway_refusal: None,
             wake_secs_left: None,
             taxi_via: Vec::new(),
             taxi_crossings: Vec::new(),
@@ -10261,6 +10452,7 @@ mod tests {
                 runway_occupied: false,
                 own_on_runway: false,
                 helicopter: false,
+                runway_refusal: None,
                 wake_secs_left: None,
                 taxi_via: Vec::new(),
                 taxi_crossings: Vec::new(),
@@ -10522,6 +10714,7 @@ mod tests {
             runway_occupied: false,
             own_on_runway: false,
             helicopter: false,
+            runway_refusal: None,
             wake_secs_left: None,
             taxi_via: Vec::new(),
             taxi_crossings: Vec::new(),
