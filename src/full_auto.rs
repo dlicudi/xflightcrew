@@ -534,6 +534,167 @@ async fn ensure_squawk(xp: &XPlaneClient, ctx: &ToolCtx<'_>, voice: &Option<Voic
     }
 }
 
+/// What the crew makes of the runway the tower cleared it to taxi to,
+/// judged by the ONE rule (`aircraft::takeoff_needed_m`, here at the weight
+/// on the wheels) before a wheel turns.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ClearedFit {
+    Fits,
+    /// The field data lacks the runway: the line-up judges it, as before.
+    Unknown,
+    /// Too short. `ask` is the end to request instead: the LONGEST runway
+    /// the tower hands out (`nav::assignable_runways`) that fits, flown the
+    /// way the tower's own pick faces; `None` when nothing here fits.
+    Short {
+        cleared: String,
+        length_m: f64,
+        needed_m: f64,
+        ask: Option<String>,
+    },
+}
+
+/// Judge `cleared` on this field. Pure. ETND 2026-09-24: an SF50 was taxied
+/// to 446 m of grass (runway 26R) with 1,240 m of asphalt beside it, and
+/// nothing measured the runway until the line-up gave up at the hold.
+pub fn cleared_runway_fit(
+    runways: &[crate::nav::Runway],
+    cleared: &str,
+    needed_m: f64,
+) -> ClearedFit {
+    let ends = |r: &crate::nav::Runway| {
+        [
+            (r.ident_a.clone(), r.heading_a_deg()),
+            (r.ident_b.clone(), r.heading_b_deg()),
+        ]
+    };
+    let Some((strip, cleared_hdg)) = runways.iter().find_map(|r| {
+        ends(r)
+            .into_iter()
+            .find(|(id, _)| id.eq_ignore_ascii_case(cleared))
+            .map(|(_, h)| (r, h))
+    }) else {
+        return ClearedFit::Unknown;
+    };
+    let length_m = strip.length_m();
+    if length_m >= needed_m {
+        return ClearedFit::Fits;
+    }
+    let off = |a: f64, b: f64| {
+        let d = (a - b).rem_euclid(360.0);
+        d.min(360.0 - d)
+    };
+    let ask = crate::nav::assignable_runways(runways)
+        .filter(|r| r.length_m() >= needed_m)
+        .max_by(|a, b| a.length_m().total_cmp(&b.length_m()))
+        .and_then(|r| {
+            ends(r)
+                .into_iter()
+                .min_by(|a, b| off(a.1, cleared_hdg).total_cmp(&off(b.1, cleared_hdg)))
+                .map(|(id, _)| id)
+        });
+    ClearedFit::Short {
+        cleared: strip_end_named(cleared, runways),
+        length_m,
+        needed_m,
+        ask,
+    }
+}
+
+/// The field's own spelling of an end ("26R" for "26r").
+fn strip_end_named(id: &str, runways: &[crate::nav::Runway]) -> String {
+    runways
+        .iter()
+        .flat_map(|r| [&r.ident_a, &r.ident_b])
+        .find(|e| e.eq_ignore_ascii_case(id))
+        .cloned()
+        .unwrap_or_else(|| id.to_string())
+}
+
+/// The flight deck's line for a short cleared runway, both numbers first.
+pub fn short_runway_line(length_m: f64, needed_m: f64, cleared: &str, ask: Option<&str>) -> String {
+    let base = format!(
+        "Runway {} is {:.0} metres, we need {:.0}.",
+        crate::circuit::spell_runway(cleared),
+        length_m,
+        needed_m
+    );
+    match ask {
+        Some(a) => format!("{base} Asking for {}.", crate::circuit::spell_runway(a)),
+        None => format!("{base} Nothing here is long enough."),
+    }
+}
+
+/// The radio call that asks for the longer runway, in the words the tower's
+/// runway request parses ("unable runway two six right, request runway zero
+/// eight for length").
+pub fn runway_request_call(cleared: &str, ask: &str) -> String {
+    format!(
+        "unable runway {}, request runway {} for length",
+        crate::circuit::spell_runway(cleared),
+        crate::circuit::spell_runway(ask)
+    )
+}
+
+/// At the taxi clearance: the cleared runway judged against this airframe
+/// (blackbox `cleared_runway_fit`); a short one refused aloud with both
+/// numbers and the longest one that fits asked for, waited for and taken
+/// (`runway_granted`). `Err` is the give-up line.
+async fn judge_cleared_runway(
+    xp: &XPlaneClient,
+    tools: &SubTools,
+    voice: &Option<Voice>,
+    callsign: &Option<String>,
+) -> Result<(), String> {
+    let Some(cleared) = crate::party_line::clearance_runway() else {
+        return Ok(());
+    };
+    let needed_m = crate::aircraft::takeoff_needed_now_m(
+        xp,
+        tools.line_up.takeoff_roll_m,
+        tools.line_up.mtow_kg,
+        500.0,
+    )
+    .await;
+    let fit = cleared_runway_fit(&crate::party_line::field_runways(), &cleared, needed_m);
+    event(
+        "cleared_runway_fit",
+        json!({ "runway": cleared, "needed_m": needed_m.round(), "fit": format!("{fit:?}") }),
+    );
+    let ClearedFit::Short {
+        cleared,
+        length_m,
+        needed_m,
+        ask,
+    } = fit
+    else {
+        return Ok(());
+    };
+    let line = short_runway_line(length_m, needed_m, &cleared, ask.as_deref());
+    let Some(ask) = ask else {
+        return Err(format!("{line} Your aircraft."));
+    };
+    announce(voice, Priority::Advisory, &line);
+    crate::circuit::transmit(crate::circuit::radio_call(
+        callsign,
+        &runway_request_call(&cleared, &ask),
+    ));
+    waiting("the longer runway");
+    let granted = wait_until(90.0, 1000, || async {
+        crate::party_line::clearance_runway().is_some_and(|r| r.eq_ignore_ascii_case(&ask))
+            && taxi_route_is_ours(xp).await
+    })
+    .await;
+    event("runway_granted", json!({ "asked": ask, "granted": granted }));
+    if granted {
+        Ok(())
+    } else {
+        Err(format!(
+            "{line} The tower didn't give us runway {}. Your aircraft.",
+            crate::circuit::spell_runway(&ask)
+        ))
+    }
+}
+
 /// The ONE transponder check before a "ready for departure" call
 /// (`radio::departure_check`): the assigned code dialled and read back, ALT
 /// through the airframe's selector. Said when it changed the code, and when
@@ -1510,6 +1671,19 @@ async fn fly(xp: XPlaneClient, config: Config, voice: Option<Voice>, tools: SubT
                     &voice,
                     "No taxi clearance came back. Tune the tower and request taxi, then say full auto again.",
                     "no_taxi_clearance",
+                )
+                .await;
+                return;
+            }
+            // The runway it bought is judged before a wheel turns, and a
+            // short one is refused and a longer one asked for.
+            if let Err(line) = judge_cleared_runway(&xp, &tools, &voice, &callsign).await {
+                give_up(
+                    &xp,
+                    tools.taxi.park_brake_valve_set,
+                    &voice,
+                    &line,
+                    "cleared_runway_short",
                 )
                 .await;
                 return;
@@ -4406,6 +4580,86 @@ async fn runway_check(
             needed_m,
             crate::party_line::clearance_runway().as_deref(),
         ))),
+    }
+}
+
+#[cfg(test)]
+mod cleared_runway_tests {
+    use super::*;
+
+    /// ETND's two strips as apt.dat has them: 08L/26R, 446 m of grass, and
+    /// 08/26, 1,240 m of asphalt beside it.
+    fn etnd() -> Vec<crate::nav::Runway> {
+        vec![
+            crate::nav::Runway {
+                ident_a: "08L".into(),
+                ident_b: "26R".into(),
+                lat_a: 52.5862935,
+                lon_a: 8.3393953,
+                lat_b: 52.5866670,
+                lon_b: 8.3459906,
+                width_m: 50.0,
+                surface: 3,
+            },
+            crate::nav::Runway {
+                ident_a: "08".into(),
+                ident_b: "26".into(),
+                lat_a: 52.5850000,
+                lon_a: 8.3318780,
+                lat_b: 52.5859870,
+                lon_b: 8.3501930,
+                width_m: 45.11,
+                surface: 1,
+            },
+        ]
+    }
+
+    /// ETND 2026-09-24, the SF50 at the weight it flew: cleared 26R, 446 m,
+    /// against 780 m needed. Refused with both numbers, the paved 26 asked
+    /// for in the words the tower parses; a runway that fits is taxied as
+    /// today; nothing that fits is said and asks for nothing.
+    #[test]
+    fn a_short_cleared_runway_is_refused_and_the_longer_one_requested() {
+        let rw = etnd();
+        let fit = cleared_runway_fit(&rw, "26R", 780.0);
+        let ClearedFit::Short {
+            cleared,
+            length_m,
+            needed_m,
+            ask,
+        } = fit.clone()
+        else {
+            panic!("{fit:?}");
+        };
+        assert_eq!(cleared, "26R");
+        assert!((length_m - 446.0).abs() < 5.0, "{length_m}");
+        assert_eq!(needed_m, 780.0);
+        assert_eq!(ask.as_deref(), Some("26"), "the long runway, flown the cleared way");
+        let line = short_runway_line(length_m, needed_m, &cleared, ask.as_deref());
+        assert!(
+            line.starts_with("Runway two six right is 44") && line.contains("we need 780."),
+            "{line}"
+        );
+        assert!(line.ends_with("Asking for two six."), "{line}");
+        let call = runway_request_call(&cleared, "26");
+        assert_eq!(call, "unable runway two six right, request runway two six for length");
+        assert_eq!(
+            crate::tower::parse_intent(&call),
+            crate::tower::Intent::RequestRunway
+        );
+        assert_eq!(crate::tower::requested_runway(&call).as_deref(), Some("26"));
+
+        // The 1,240 m runway fits the same aircraft: taxied as today.
+        assert_eq!(cleared_runway_fit(&rw, "26", 780.0), ClearedFit::Fits);
+        assert_eq!(cleared_runway_fit(&rw, "08", 780.0), ClearedFit::Fits);
+        // A runway the data lacks is the line-up's to judge.
+        assert_eq!(cleared_runway_fit(&rw, "33", 780.0), ClearedFit::Unknown);
+        // Nothing long enough: refused, nothing asked for.
+        match cleared_runway_fit(&rw, "26", 2_000.0) {
+            ClearedFit::Short { ask: None, .. } => {}
+            other => panic!("{other:?}"),
+        }
+        assert!(short_runway_line(1240.0, 2000.0, "26", None).ends_with("Nothing here is long enough."));
     }
 }
 

@@ -3091,6 +3091,14 @@ pub fn active_station_range_nm(lat: f64, lon: f64) -> Option<f64> {
 /// the runway-incursion watch.
 static ACTIVE_RUNWAYS: Mutex<Vec<nav::Runway>> = Mutex::new(Vec::new());
 
+/// The active field's runways, for the party line (`field_runways`).
+pub(crate) fn active_runways() -> Vec<nav::Runway> {
+    ACTIVE_RUNWAYS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+}
+
 /// Lateral capture around a runway centerline when the 100-row carried no
 /// width: 40 m covers everything up to a wide-body runway (60 m ÷ 2 + slack)
 /// without capturing a parallel taxiway.

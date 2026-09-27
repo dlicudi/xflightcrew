@@ -277,6 +277,13 @@ pub fn on_runway(lat: f64, lon: f64) -> Option<bool> {
     crate::station::on_active_runway_known(lat, lon)
 }
 
+/// The active station's runways as apt.dat has them (empty with no station):
+/// the crew judges the runway it was cleared for against its own airframe
+/// before it taxis, and picks the one to ask for when it does not fit.
+pub fn field_runways() -> Vec<nav::Runway> {
+    crate::station::active_runways()
+}
+
 /// Whether the active field publishes any parking positions at all.
 pub fn stands_known() -> bool {
     crate::station::taxi_net().is_some_and(|n| !n.stands.is_empty())
