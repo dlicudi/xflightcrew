@@ -4398,8 +4398,13 @@ async fn runway_check(
     let cands = crate::autoland::nearby_runways(&apt, lat, lon, 3.0).unwrap_or_default();
     match crate::autotakeoff::runway_fit(&cands, lat, lon, psi, needed_m) {
         Some(_) => Ok(()),
-        None => Err(Some(crate::autotakeoff::why_no_fit(
-            &cands, lat, lon, psi, needed_m,
+        None => Err(Some(crate::autotakeoff::why_no_fit_cleared(
+            &cands,
+            lat,
+            lon,
+            psi,
+            needed_m,
+            crate::party_line::clearance_runway().as_deref(),
         ))),
     }
 }
