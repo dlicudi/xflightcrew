@@ -238,6 +238,14 @@ pub fn clearance_state() -> Option<tower::State> {
     lock(&CLEARANCE).as_ref().map(|c| c.state)
 }
 
+/// The tower's book puts us on the strip we stand on (cleared onto it,
+/// landed on it and not yet vacated, a runway start, a moving cleared
+/// crossing): the runway-incursion watch stays silent. See
+/// [`crate::station::runway_occupancy_authorised`].
+pub fn runway_occupancy_authorised(lat: f64, lon: f64, gs_kts: f64) -> bool {
+    crate::station::runway_occupancy_authorised(lat, lon, gs_kts)
+}
+
 /// The runway END of the standing clearance ("09R"), if one is known —
 /// the auto-takeoff line-up crosscheck reads it against the strip the
 /// aircraft is actually pointing down.

@@ -2155,6 +2155,14 @@ struct ComplianceState {
     /// Last off-route taxi challenge — its own cooldown; wandering is a
     /// nudge, not a violation.
     off_route_last: Option<Instant>,
+    /// The strip (its `ident_a`) the aircraft stood on at the last ground
+    /// tick, `None` off every runway, airborne or before the first tick.
+    prev_strip: Option<String>,
+    /// A RUNWAY START: the strip the aircraft first appeared on, stopped,
+    /// without being seen to taxi onto it (the sim put it there). It is a
+    /// lined-up aircraft awaiting its clearance, never an incursion, for as
+    /// long as it stays on that strip (EGKK 26L, 2026-09-27).
+    runway_start: Option<String>,
 }
 
 impl ComplianceState {
@@ -2167,6 +2175,8 @@ impl ComplianceState {
         landing_berated: false,
         zone_last: None,
         off_route_last: None,
+        prev_strip: None,
+        runway_start: None,
     };
 }
 
@@ -2177,6 +2187,9 @@ const VIOLATION_COOLDOWN_SECS: f64 = 60.0;
 /// Rollout/vacating time after a landing clearance before "on the runway
 /// without clearance" can fire.
 const VACATE_GRACE_SECS: f64 = 120.0;
+/// Below this a first sight of the aircraft on a strip is a standing start
+/// (the sim's runway start reads 0.0 kt), never a taxi onto it.
+const RUNWAY_START_MAX_KTS: f64 = 1.0;
 /// The pseudo control zone around the active towered field: apt.dat has no
 /// airspace geometry, so a cylinder stands in for the CTR.
 const ZONE_RADIUS_NM: f64 = 5.0;
@@ -2246,6 +2259,19 @@ pub fn compliance_tick_facing(
     } else if w.airborne_since.is_none() {
         w.airborne_since = Some(now);
     }
+    // A runway start: first seen on this strip, and stopped. A taxi onto a
+    // runway arrives moving, a landing arrives airborne; only the sim's own
+    // placement (boot, a reposition, the first tick of a fresh station)
+    // shows a stopped aircraft on a strip it was not on a tick ago.
+    let here = if on_ground { strip_under(lat, lon) } else { None };
+    if here.is_none() || w.runway_start != here {
+        w.runway_start = None;
+    }
+    if here.is_some() && here != w.prev_strip && gs_kts < RUNWAY_START_MAX_KTS {
+        w.runway_start = here.clone();
+    }
+    w.prev_strip = here;
+    let runway_start = w.runway_start.is_some();
     if clr
         .as_ref()
         .is_some_and(|(s, _)| *s == tower::State::ClearedToLand)
@@ -2414,6 +2440,7 @@ pub fn compliance_tick_facing(
             && gs_kts < 30.0
             && !vacating
             && !quiet
+            && !runway_start
             && !matches!(
                 state,
                 // LinedUp is the tower's OWN instruction to be on the runway.
@@ -3570,6 +3597,64 @@ pub fn on_active_runway_known(lat: f64, lon: f64) -> Option<bool> {
         return None;
     }
     Some(runways.iter().any(|r| on_runway(r, lat, lon).is_some()))
+}
+
+/// The strip under this position, keyed by its `ident_a` (both ends of one
+/// pavement are one strip), `None` off every active runway.
+fn strip_under(lat: f64, lon: f64) -> Option<String> {
+    let runways = ACTIVE_RUNWAYS.lock().unwrap_or_else(|e| e.into_inner());
+    runways
+        .iter()
+        .find(|r| on_runway(r, lat, lon).is_some())
+        .map(|r| r.ident_a.clone())
+}
+
+/// Does the tower's own book put us on the runway we stand on? The runway
+/// incursion watch ("traffic on final, exit the runway") asks this before it
+/// shouts: a standing takeoff clearance or line-up; a landing clearance on
+/// THIS strip not yet reported vacated (the rollout and the vacate, EGKK 26L
+/// 2026-09-27: "exit the runway immediately" from 20 s after touchdown to
+/// the vacate, eight times); a runway start; a crossing on the cleared route
+/// that keeps moving. Anything else on a strip with traffic on final is the
+/// incursion it is.
+pub(crate) fn runway_occupancy_authorised(lat: f64, lon: f64, gs_kts: f64) -> bool {
+    let Some(here) = strip_under(lat, lon) else {
+        return false;
+    };
+    let clr = CLEARANCE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .map(|c| (c.state, c.runway_ident.clone(), c.holds_runway));
+    if let Some((state, ident, holds)) = &clr {
+        if matches!(state, tower::State::LinedUp | tower::State::TakeoffCleared) {
+            return true;
+        }
+        if *state == tower::State::ClearedToLand && *holds {
+            let cleared = {
+                let runways = ACTIVE_RUNWAYS.lock().unwrap_or_else(|e| e.into_inner());
+                strip(&runways, ident).map(|r| r.ident_a.clone())
+            };
+            if ident.is_empty() || cleared.as_deref() == Some(here.as_str()) {
+                return true;
+            }
+        }
+    }
+    let started_here = COMPLIANCE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .runway_start
+        .as_deref()
+        == Some(here.as_str());
+    if started_here {
+        return true;
+    }
+    let arrival_taxi = *TAXI_TO_STAND.lock().unwrap_or_else(|e| e.into_inner());
+    let cleared_taxi = clr
+        .as_ref()
+        .is_some_and(|(s, _, _)| *s == tower::State::TaxiCleared)
+        || arrival_taxi;
+    cleared_taxi && gs_kts >= 3.0 && on_cleared_runway_crossing(lat, lon)
 }
 
 /// Is this position ON one strip? The shared segment test behind
@@ -6447,10 +6532,11 @@ mod tests {
         });
         // On the ground at the parking first (settles the air/ground edge —
         // and a stand is nobody's runway), then taxi onto the runway
-        // uncleared: ordered off.
+        // uncleared: ordered off. It arrives MOVING: a stopped first sight
+        // on a strip is a runway start, which is no incursion.
         let t2 = t0 + sec(400);
         assert!(compliance_tick(36.16, -5.35, 15.0, true, 0.0, true, t2 - sec(10)).is_none());
-        let call = compliance_tick(36.15155, -5.342, 20.0, true, 0.0, true, t2).expect("occupancy");
+        let call = compliance_tick(36.15155, -5.342, 20.0, true, 5.0, true, t2).expect("occupancy");
         assert!(!call.crew);
         // Past midfield the position names the 27 end (same rule as the
         // occupancy geometry test).
@@ -6668,9 +6754,11 @@ mod tests {
         // The bare flag WITHOUT a route is not a clearance: a stale flag that
         // survived a station swap (or a route-less reply) must not switch the
         // incursion watch off. Same position, route gone: the berate stands.
+        // (Rolling, as a landed aircraft is: a stopped first sight on a strip
+        // is a runway start.)
         *TAXI_ROUTE.lock().unwrap() = None;
         *COMPLIANCE.lock().unwrap() = ComplianceState::NEW;
-        let call = compliance_tick(36.15155, -5.342, 20.0, true, 0.0, true, t0 + sec(300))
+        let call = compliance_tick(36.15155, -5.342, 20.0, true, 5.0, true, t0 + sec(300))
             .expect("occupancy berate with the flag but no published route");
         assert!(call.line.contains("without clearance"), "{}", call.line);
 
@@ -6678,7 +6766,7 @@ mod tests {
         // an incursion — proving the exemption, not the geometry, silenced it.
         *TAXI_TO_STAND.lock().unwrap() = false;
         *COMPLIANCE.lock().unwrap() = ComplianceState::NEW;
-        let call = compliance_tick(36.15155, -5.342, 20.0, true, 0.0, true, t0 + sec(400))
+        let call = compliance_tick(36.15155, -5.342, 20.0, true, 5.0, true, t0 + sec(400))
             .expect("occupancy berate without the taxi-in flag");
         assert!(call.line.contains("without clearance"), "{}", call.line);
 
@@ -7112,6 +7200,226 @@ mod tests {
         )
         .expect("an uncleared landing");
         assert!(call.line.contains("runway zero two"), "{}", call.line);
+
+        *ACTIVE_FIELD.lock().unwrap() = None;
+        *ACTIVE_RUNWAYS.lock().unwrap() = Vec::new();
+        *CLEARANCE.lock().unwrap() = None;
+        *COMPLIANCE.lock().unwrap() = ComplianceState::NEW;
+    }
+
+    /// Issue #108, the recorded case itself: LEMG 12/30 from apt.dat, the
+    /// 737 (N816NN, 2026-09-26) stopped at 36.682790, -4.488170 heading
+    /// 117.9 true, 227 m from the 30 threshold, and at t 1790448368.5 was
+    /// told "you landed on runway three zero". That build predated 3b6ff11
+    /// (committed 20:58:36 local, the call 20:46:08), which named the
+    /// NEARER end; the monitor passes `psi` (true), the frame
+    /// `heading_a_deg` is in. With the fix the same numbers say "one two".
+    #[test]
+    fn the_lemg_landing_is_named_one_two_from_its_recorded_numbers() {
+        let _guard = SIDE_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        *ACTIVE_FIELD.lock().unwrap() = Some(("Malaga".into(), 36.6749, -4.4991));
+        *ACTIVE_RUNWAYS.lock().unwrap() = vec![
+            nav::Runway {
+                width_m: 45.11,
+                surface: 1,
+                ident_a: "12".into(),
+                ident_b: "30".into(),
+                lat_a: 36.6910753,
+                lon_a: -4.5078270,
+                lat_b: 36.6795648,
+                lon_b: -4.4805125,
+            },
+            nav::Runway {
+                width_m: 45.11,
+                surface: 1,
+                ident_a: "13".into(),
+                ident_b: "31".into(),
+                lat_a: 36.6845573,
+                lon_a: -4.5126253,
+                lat_b: 36.6654027,
+                lon_b: -4.4858140,
+            },
+        ];
+        let (lat, lon, hdg) = (36.682790230055794, -4.488169765732041, 117.9);
+        assert_eq!(on_active_runway(lat, lon).as_deref(), Some("30"), "the old name");
+        assert_eq!(on_active_runway_facing(lat, lon, Some(hdg)).as_deref(), Some("12"));
+        // The tower was at Parked (no landing clearance): a flight, then the
+        // wheels, heading down 12.
+        *CLEARANCE.lock().unwrap() = Some(ClearanceSnap {
+            state: tower::State::Parked,
+            callsign: "November eight one six November November".into(),
+            runway_ident: "12".into(),
+            pending_readback: None,
+            holds_runway: false,
+        });
+        *TAXI_TO_STAND.lock().unwrap() = false;
+        *TAXI_ROUTE.lock().unwrap() = None;
+        *COMPLIANCE.lock().unwrap() = ComplianceState::NEW;
+        let t0 = Instant::now();
+        let sec = std::time::Duration::from_secs;
+        assert!(compliance_tick_facing(36.70, -4.53, 900.0, false, 146.0, true, t0, Some(hdg)).is_none());
+        let call = compliance_tick_facing(lat, lon, 38.2, true, 0.0, true, t0 + sec(60), Some(hdg))
+            .expect("an uncleared landing");
+        assert!(call.line.contains("landed on runway one two"), "{}", call.line);
+        assert!(!call.line.contains("three zero"), "{}", call.line);
+
+        *ACTIVE_FIELD.lock().unwrap() = None;
+        *ACTIVE_RUNWAYS.lock().unwrap() = Vec::new();
+        *CLEARANCE.lock().unwrap() = None;
+        *COMPLIANCE.lock().unwrap() = ComplianceState::NEW;
+    }
+
+    /// EGKK's two strips from apt.dat: 08R/26L and the close parallel
+    /// 08L/26R.
+    fn egkk_runways() -> Vec<nav::Runway> {
+        vec![
+            nav::Runway {
+                width_m: 46.0,
+                surface: 1,
+                ident_a: "08R".into(),
+                ident_b: "26L".into(),
+                lat_a: 51.1450993,
+                lon_a: -0.2123748,
+                lat_b: 51.1514994,
+                lon_b: -0.1659296,
+            },
+            nav::Runway {
+                width_m: 46.0,
+                surface: 1,
+                ident_a: "08L".into(),
+                ident_b: "26R".into(),
+                lat_a: 51.1468901,
+                lon_a: -0.2126029,
+                lat_b: 51.1518321,
+                lon_b: -0.1767408,
+            },
+        ]
+    }
+
+    /// Issue #117, sortie 1790527340-full_auto (EGKK-EGBB, 2026-09-27): the
+    /// 737 began lined up on 26L at 51.1476808, -0.1935461 (0.0 kt, heading
+    /// 256.3), a runway start. The IFR request made contact (tower Parked)
+    /// and the compliance watch said "you are on runway two six left without
+    /// clearance. Exit the runway immediately." at +17.3 s. A stopped first
+    /// sight on a strip is the sim's placement, a lined-up aircraft awaiting
+    /// its clearance: silent at the recorded ticks, and the incursion watch
+    /// holds it authorised too. One that TAXIES onto a strip (first seen
+    /// moving) is still ordered off, and the start is spent once it leaves.
+    #[test]
+    fn a_runway_start_is_lined_up_not_an_incursion() {
+        let _guard = SIDE_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        *ACTIVE_FIELD.lock().unwrap() = Some(("Gatwick".into(), 51.1481, -0.1903));
+        *ACTIVE_RUNWAYS.lock().unwrap() = egkk_runways();
+        *CLEARANCE.lock().unwrap() = None;
+        *TAXI_TO_STAND.lock().unwrap() = false;
+        *TAXI_ROUTE.lock().unwrap() = None;
+        *COMPLIANCE.lock().unwrap() = ComplianceState::NEW;
+        let t0 = Instant::now();
+        let at = |s: f64| t0 + std::time::Duration::from_secs_f64(s);
+        let (lat, lon, hdg) = (51.14768083914999, -0.19354614043732044, 256.3);
+        let tick = |s: f64| compliance_tick_facing(lat, lon, 203.0, true, 0.0, true, at(s), Some(hdg));
+        // No contact yet: the recorded ticks from +1.5 s.
+        for s in [1.5, 4.0, 6.4, 9.0, 11.6, 14.5] {
+            assert!(tick(s).is_none(), "{s}");
+        }
+        // The IFR request's answer publishes the snapshot at +17.2 s.
+        *CLEARANCE.lock().unwrap() = Some(ClearanceSnap {
+            state: tower::State::Parked,
+            callsign: "Whiskey Alpha Tango one seven three".into(),
+            runway_ident: "26R".into(),
+            pending_readback: None,
+            holds_runway: false,
+        });
+        for s in [17.3, 17.8, 20.2, 33.1, 47.9, 62.7, 90.0, 200.0] {
+            assert!(tick(s).is_none(), "the runway start berated at +{s}");
+        }
+        assert!(runway_occupancy_authorised(lat, lon, 0.0), "the incursion watch");
+
+        // Off the strip, then back on it: not a start any more.
+        assert!(compliance_tick_facing(51.1440, -0.1935, 203.0, true, 10.0, true, at(210.0), Some(0.0)).is_none());
+        assert!(!runway_occupancy_authorised(lat, lon, 0.0));
+        let call = compliance_tick_facing(lat, lon, 203.0, true, 5.0, true, at(220.0), Some(hdg))
+            .expect("taxied onto the runway uncleared");
+        assert!(call.line.contains("runway two six left without clearance"), "{}", call.line);
+
+        // A fresh watch whose first sight is a taxi onto the strip: ordered off.
+        *COMPLIANCE.lock().unwrap() = ComplianceState::NEW;
+        let call = compliance_tick_facing(lat, lon, 203.0, true, 8.0, true, at(400.0), Some(hdg))
+            .expect("moving onto the strip is no runway start");
+        assert!(call.line.contains("Exit the runway"), "{}", call.line);
+
+        *ACTIVE_FIELD.lock().unwrap() = None;
+        *ACTIVE_RUNWAYS.lock().unwrap() = Vec::new();
+        *CLEARANCE.lock().unwrap() = None;
+        *COMPLIANCE.lock().unwrap() = ComplianceState::NEW;
+    }
+
+    /// Issue #124, sortie 1790534902-full_auto (EGBB-EGKK, 2026-09-27):
+    /// cleared to land 26L, down at +2974 s, then taxiing down the strip at
+    /// 8 to 12 kt to exit ER and "runway vacated" only at +3149. The monitor's
+    /// incursion watch said "exit the runway immediately" / "expedite" eight
+    /// times from +2994 (26L, then 08R past midfield) because only a takeoff
+    /// clearance or line-up counted as the tower putting us there. A landing
+    /// holds its strip until the vacated report; the arrival's cleared
+    /// crossing of 08L (+3191, 12.7 kt) is legal while it moves.
+    #[test]
+    fn a_cleared_landing_holds_its_runway_until_vacated() {
+        let _guard = SIDE_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        *ACTIVE_FIELD.lock().unwrap() = Some(("Gatwick".into(), 51.1481, -0.1903));
+        *ACTIVE_RUNWAYS.lock().unwrap() = egkk_runways();
+        *TAXI_TO_STAND.lock().unwrap() = false;
+        *TAXI_ROUTE.lock().unwrap() = None;
+        *COMPLIANCE.lock().unwrap() = ComplianceState::NEW;
+        let landed = |holds: bool, ident: &str| {
+            *CLEARANCE.lock().unwrap() = Some(ClearanceSnap {
+                state: tower::State::ClearedToLand,
+                callsign: "Whiskey Alpha Tango four two three six".into(),
+                runway_ident: ident.into(),
+                pending_readback: None,
+                holds_runway: holds,
+            });
+        };
+        // The recorded vacate: +3000.5 (26L half), +3050.6 (08R half).
+        let vacate = [
+            (51.14847323089843, -0.1879083802267358, 8.4),
+            (51.14796049673604, -0.1916164076685698, 9.1),
+        ];
+        landed(true, "26L");
+        for &(lat, lon, gs) in &vacate {
+            assert!(on_active_runway(lat, lon).is_some(), "on the strip");
+            assert!(runway_occupancy_authorised(lat, lon, gs), "{lat},{lon}");
+        }
+        // Reported vacated (or a landing clearance for the other strip):
+        // the strip is not ours, the watch speaks again.
+        landed(false, "26L");
+        assert!(!runway_occupancy_authorised(vacate[0].0, vacate[0].1, 8.4));
+        landed(true, "26R");
+        assert!(!runway_occupancy_authorised(vacate[0].0, vacate[0].1, 8.4));
+        // Taxi-in cleared (Parked) across 08L on its route: legal moving,
+        // not stopped on it.
+        *CLEARANCE.lock().unwrap() = Some(ClearanceSnap {
+            state: tower::State::Parked,
+            callsign: "Whiskey Alpha Tango four two three six".into(),
+            runway_ident: "26L".into(),
+            pending_readback: None,
+            holds_runway: false,
+        });
+        let (clat, clon) = (51.14836698215888, -0.20092418920350943);
+        assert!(on_active_runway(clat, clon).is_some(), "on 08L");
+        *TAXI_TO_STAND.lock().unwrap() = true;
+        *TAXI_ROUTE.lock().unwrap() = Some(TaxiWatch {
+            path: vec![(51.1478, -0.1990), (51.1484, -0.2009), (51.1492, -0.2020)],
+            via: "Echo Romeo, Echo".into(),
+            seg: vec![("ER".into(), false), ("E".into(), false)],
+            holding_point: "Stand 230R".into(),
+            lead_on: vec![],
+        });
+        assert!(runway_occupancy_authorised(clat, clon, 12.7));
+        assert!(!runway_occupancy_authorised(clat, clon, 0.0), "stopped on a crossing");
+        // A plain Parked aircraft on the strip with no route: an incursion.
+        *TAXI_TO_STAND.lock().unwrap() = false;
+        *TAXI_ROUTE.lock().unwrap() = None;
+        assert!(!runway_occupancy_authorised(vacate[0].0, vacate[0].1, 8.4));
 
         *ACTIVE_FIELD.lock().unwrap() = None;
         *ACTIVE_RUNWAYS.lock().unwrap() = Vec::new();
