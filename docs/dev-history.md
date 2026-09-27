@@ -8406,3 +8406,37 @@ Next flight with a runway switch, check: `full_auto` `arrival_runway` with
 why `clearance` and `now` the cleared end, then `autoland`
 `runway_from_clearance`, `ils` `tuned` rwy the new end, `taxi_in`
 `vacating` rwy the same. Offline only.
+
+## 2026-09-27: a dip in the tug's swing rate is not the end of the swing (issue #62)
+
+LIBP, sortie 1790429680, 13:38:44Z 2026-09-26: a Nose 90 left, plan 55.3 m
+to 217.4. The tug swung the nose at 1.2 deg/s through the plan's distance,
+and at 60.9 m, err 12.6, `done` saw the push finished and the swing over,
+and the loop said "stop". The swing test was `SWING_DEG` (2 degrees) over
+`SWING_WINDOW_S` (2 s), a 1 deg/s threshold standing in for "the swing is
+over", and its window was trimmed to samples NEWER than two seconds, so at
+the 0.55 s tick it spanned 1.7 s: 14.6 to 12.6 read as under two degrees.
+The tug took no notice: over the next 31 s (`state` records) it swung the
+nose on to 262, dipping to 0.7 deg/s on the way but never turning less than
+3.2 degrees in any four seconds, stood still, and let go 4 s later. The
+only other mid-swing stop in the log is the stall clock's: LIPK 1790408535
+said `tug_finished` with the nose turning 3.5 deg/s (back_m had stopped
+growing, the heading had not).
+
+Fix (`pushback::SwingWatch`, `PushJudge`): one pure judgement over the push
+ticks. A swing starts on `SWING_DEG` over a span of AT LEAST
+`SWING_WINDOW_S` (measured, never assumed from the trim) and ends only when
+the nose has turned under `SWING_STILL_DEG` (1 degree) over
+`SWING_SETTLE_S` (4 s). While the bar is on and it says swinging, neither
+`done`, the straight/lane finish nor the stall clock may end the push (a
+nose being swung is the tug moving us), so "stop" goes out at the tug's own
+stop: the bar off, or 12 s of true stillness. The pavement edge still stops
+at once (safety, logs `swinging`); every `push` tick now carries `swinging`. Tests replay the recorded LIBP ticks
+(the old rule stops mid-swing; the new one ends at the release at +34 s,
+or with the bar left on at the stall 12 s after the nose stood still), and
+the LIEA straight push still stops on its recorded tick.
+
+Next push, check: `swing_wait` then `tug_finished` or the release, never
+`stopped` while the `state` heading is still moving; the LIPK-style
+3.5 deg/s stall stop is gone, so the tug finishes its pattern past the
+lane there (the taxi owns the residual). Offline only.

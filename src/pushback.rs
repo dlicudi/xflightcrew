@@ -169,6 +169,20 @@ const TUG_CLEAR_MAX_SECS: f64 = 120.0;
 /// stood the whole mission down (08:15Z, 2026-09-15).
 const SWING_DEG: f64 = 2.0;
 const SWING_WINDOW_S: f64 = 2.0;
+/// A swing, once seen, is over only when the nose has turned less than
+/// `SWING_STILL_DEG` over `SWING_SETTLE_S`: STILL, not merely slower. The
+/// rate test alone stood in for "the swing is over" and ended a live one.
+/// At 13:38:44Z 2026-09-26 (LIBP, sortie 1790429680, a Nose 90 left) the
+/// tug was swinging the nose at 1.2 deg/s; its window, trimmed to samples
+/// NEWER than two seconds, spanned three 0.55 s ticks, so it asked for two
+/// degrees in 1.7 s, read 14.6 to 12.6 as under it, and `done` sent "stop"
+/// at 60.9 m with the nose at 204. The tug took no notice: over the next
+/// 31 s it swung us on to 262, dipping to 0.7 deg/s on the way (never less
+/// than 3.2 degrees in any four seconds), and stood still 4 s before it
+/// let go. A tug at the end of its pattern turns under a tenth of a degree
+/// in four seconds.
+const SWING_SETTLE_S: f64 = 4.0;
+const SWING_STILL_DEG: f64 = 1.0;
 // There is deliberately no re-hook deadline. A released tug is never asked
 // back: `reissued_after_release` fired four times across the whole blackbox
 // and `rehooked` never once answered it, so the wait was a pure four-for-four
@@ -350,12 +364,155 @@ pub fn done(back_m: f64, err_deg: f64, plan: &Plan) -> bool {
     back_m >= plan.back_m + CHASE_M || (back_m >= plan.back_m && err_deg.abs() <= ALIGN_DEG)
 }
 
-/// Is the tug still turning the nose? `err_then` is the heading error
-/// `SWING_WINDOW_S` ago. While a bar is on and this is true, the manoeuvre
-/// is in progress and [`done`] waits for the swing to end (the tug runs its
-/// whole pattern whatever it is told; see `SWING_DEG`).
-pub fn swing_in_progress(attached: bool, err_then: f64, err_now: f64) -> bool {
-    attached && (err_now - err_then).abs() >= SWING_DEG
+/// Is the tug still turning the nose? Pure over (time, heading error, bar),
+/// so the recorded pushes replay through it. A swing STARTS when the error
+/// moves `SWING_DEG` over a span of at least `SWING_WINDOW_S` (the span is
+/// measured, never assumed from the trim: the live window spanned 1.7 s);
+/// it ENDS only when the nose has turned under `SWING_STILL_DEG` over
+/// `SWING_SETTLE_S`, so a dip in the rate mid-swing is noise, not the end.
+/// While the bar is on and this says swinging, the manoeuvre is in progress
+/// and neither [`done`] nor the stall clock may end it (the tug runs its
+/// whole pattern whatever it is told; see `SWING_DEG`, `SWING_SETTLE_S`).
+#[derive(Debug, Clone, Default)]
+pub struct SwingWatch {
+    hist: std::collections::VecDeque<(f64, f64)>,
+    swinging: bool,
+}
+
+impl SwingWatch {
+    /// How far the error has moved since the newest sample at least `span`
+    /// old; `None` until the history reaches back that far.
+    fn turned_over(&self, t: f64, err: f64, span: f64) -> Option<f64> {
+        self.hist
+            .iter()
+            .rev()
+            .find(|(ts, _)| t - ts >= span)
+            .map(|(_, e)| angle_diff_deg(err, *e).abs())
+    }
+
+    pub fn step(&mut self, t: f64, err: f64, attached: bool) -> bool {
+        self.hist.push_back((t, err));
+        // Keep one sample at or beyond the longest span.
+        while self.hist.len() > 2 && t - self.hist[1].0 >= SWING_SETTLE_S {
+            self.hist.pop_front();
+        }
+        if self
+            .turned_over(t, err, SWING_WINDOW_S)
+            .is_some_and(|d| d >= SWING_DEG)
+        {
+            self.swinging = true;
+        } else if self
+            .turned_over(t, err, SWING_SETTLE_S)
+            .is_some_and(|d| d < SWING_STILL_DEG)
+        {
+            self.swinging = false;
+        }
+        self.in_progress(attached)
+    }
+
+    /// The last judgement, with the bar as read now: a swing with the bar
+    /// OFF is not the tug's doing.
+    pub fn in_progress(&self, attached: bool) -> bool {
+        attached && self.swinging
+    }
+}
+
+/// What this tick of the push says. [`PushJudge`] is the whole ending rule.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PushVerdict {
+    Pushing,
+    /// Finished by the numbers but the tug is mid-swing: waiting for it
+    /// (returned on the first such tick only, for the log).
+    SwingWait,
+    /// Finished: stop and let go.
+    Complete,
+    /// Motionless, nose included, for `STALL_SECS` after moving: the tug
+    /// has run its pattern and stopped.
+    Stalled,
+}
+
+/// The push's ending rule, pure over seconds since the brakes came off, so
+/// the recorded ticks replay through exactly what the loop runs. One swing
+/// judgement ([`SwingWatch`]) gates both the finish and the stall clock: a
+/// nose being swung is the tug moving us.
+#[derive(Debug, Clone)]
+pub struct PushJudge {
+    swing: SwingWatch,
+    swinging: bool,
+    moved_at: f64,
+    moved_m: f64,
+    swing_waited: bool,
+}
+
+impl PushJudge {
+    pub fn new(t: f64) -> Self {
+        Self {
+            swing: SwingWatch::default(),
+            swinging: false,
+            moved_at: t,
+            moved_m: 0.0,
+            swing_waited: false,
+        }
+    }
+
+    /// Stalled for a beat AND regressing forward off the high-water mark:
+    /// idle creep, not a swing's sideways plateau (see [`should_hold_creep`]).
+    pub fn sliding(&self, t: f64, back_m: f64) -> bool {
+        t - self.moved_at >= HOLD_STALL_SECS && back_m < self.moved_m - HOLD_REGRESS_M
+    }
+
+    /// The tug swinging us, as of the last step.
+    pub fn swinging(&self) -> bool {
+        self.swinging
+    }
+
+    /// `straight`: the pattern asked was straight back (or the plan is a
+    /// painted lane), which ends at the planned distance.
+    pub fn step(
+        &mut self,
+        t: f64,
+        back_m: f64,
+        err: f64,
+        attached: bool,
+        towed: bool,
+        plan: &Plan,
+        straight: bool,
+    ) -> PushVerdict {
+        let swinging = self.swing.step(t, err, attached);
+        self.swinging = swinging;
+        let stalled = if back_m > self.moved_m + MOVED_M {
+            self.moved_m = back_m;
+            self.moved_at = t;
+            false
+        } else if swinging {
+            self.moved_at = t;
+            false
+        } else {
+            towed && t - self.moved_at >= STALL_SECS
+        };
+        // A straight push never aligns the nose (by design: the taxi turns
+        // it), so it ends at the planned distance, not 25 m past it.
+        if (straight || plan.lane) && back_m >= plan.back_m && !swinging {
+            return PushVerdict::Complete;
+        }
+        if done(back_m, err, plan) {
+            if !swinging {
+                return PushVerdict::Complete;
+            }
+            // Far enough by the numbers, but the tug is mid-swing: it will
+            // finish the pattern whatever we say, so the push ends at ITS
+            // stop (the bar off, or the stall below), never here.
+            if !self.swing_waited {
+                self.swing_waited = true;
+                return PushVerdict::SwingWait;
+            }
+        }
+        if stalled {
+            PushVerdict::Stalled
+        } else {
+            PushVerdict::Pushing
+        }
+    }
 }
 
 /// Would asking for ANOTHER pattern actually improve things?
@@ -887,11 +1044,11 @@ async fn run_inner(
     // sense is learned from.
     let mut turn_since: Option<(Instant, f64)> = (cmd != Steer::Straight).then_some((began, err0));
     let mut back_m = 0.0;
-    // Last time we actually moved, and how far we'd got then: the tug runs its
-    // chosen manoeuvre and STOPS, so "stopped after moving" is completion, not
-    // a hang, and the loop must not sit out MAX_SECS waiting for more.
-    let mut moved_at = Instant::now();
-    let mut moved_m = 0.0;
+    // The ending rule: last time we actually moved (a swing counts), how far
+    // we'd got then, and the swing watch. The tug runs its chosen manoeuvre
+    // and STOPS, so "stopped after moving" is completion, not a hang, and the
+    // loop must not sit out MAX_SECS waiting for more.
+    let mut judge = PushJudge::new(0.0);
     // Whether we've ever actually been under tow, and whether the "push" has
     // been repeated to a tug that hooked on but never moved.
     let mut towed = false;
@@ -904,9 +1061,6 @@ async fn run_inner(
     // declared released `MOVED_M` metres in, and the re-issue would re-aim
     // the tug mid-manoeuvre.
     let mut saw_attached = false;
-    // Heading-error history for the swing watch: (when, err).
-    let mut err_hist: std::collections::VecDeque<(Instant, f64)> = Default::default();
-    let mut swing_waited = false;
     loop {
         if stopping(abort) {
             send(ctx, "stop").await;
@@ -963,8 +1117,7 @@ async fn run_inner(
         // expiring proportional brake channel instead: it holds the aircraft
         // this tick and frees itself in a second, so a tug that begins its
         // manoeuvre is never fighting a latched brake.
-        let sliding = moved_at.elapsed().as_secs_f64() >= HOLD_STALL_SECS
-            && back_m < moved_m - HOLD_REGRESS_M;
+        let sliding = judge.sliding(began.elapsed().as_secs_f64(), back_m);
         if should_hold_creep(towed, towing, attached, back_m, sliding) {
             let _ = xp.set_float(TAXI_BRAKE, HOLD_BRAKE).await;
         }
@@ -1051,6 +1204,17 @@ async fn run_inner(
             send(ctx, cmd.action()).await;
         }
         let err = angle_diff_deg(plan.target_hdg, psi);
+        // The ending rule, one judgement for the finish and the stall
+        // clock: a swing in progress ends neither (see `SwingWatch`).
+        let verdict = judge.step(
+            began.elapsed().as_secs_f64(),
+            back_m,
+            err,
+            attached,
+            towed,
+            plan,
+            cmd == Steer::Straight,
+        );
         event(json!({
             "event": "push",
             "back_m": r1(back_m),
@@ -1059,17 +1223,8 @@ async fn run_inner(
             "sense": sense,
             "att": attached,
             "tow": towing,
+            "swinging": judge.swinging(),
         }));
-        // The swing watch: the error this window ago against now.
-        let now = Instant::now();
-        err_hist.push_back((now, err));
-        while err_hist
-            .front()
-            .is_some_and(|(t, _)| now.duration_since(*t).as_secs_f64() > SWING_WINDOW_S)
-        {
-            err_hist.pop_front();
-        }
-        let err_then = err_hist.front().map(|(_, e)| *e).unwrap_or(err);
         // The tug's pattern is the sim's geometry: stop it before it takes
         // us off the pavement, whatever the plan still owed. The residual is
         // the taxi's, and a taxi can turn on pavement; on grass it could not
@@ -1080,31 +1235,19 @@ async fn run_inner(
             let here = crate::party_line::on_pavement(lat, lon);
             let behind = crate::party_line::on_pavement(blat, blon);
             if at_pavement_edge(started_on_pavement, here, behind) {
-                event(json!({ "event": "pavement_edge", "back_m": r1(back_m), "err": r1(err),
-                              "here": here, "swinging": swing_in_progress(attached, err_then, err) }));
+                event(
+                    json!({ "event": "pavement_edge", "back_m": r1(back_m), "err": r1(err),
+                              "here": here, "swinging": judge.swinging() }),
+                );
                 break;
             }
         }
-        // A straight push never aligns the nose (by design: the taxi turns
-        // it), so it ends at the planned distance, not 25 m past it.
-        if (cmd == Steer::Straight || plan.lane)
-            && back_m >= plan.back_m
-            && !swing_in_progress(attached, err_then, err)
-        {
-            break;
-        }
-        if done(back_m, err, plan) {
-            if swing_in_progress(attached, err_then, err) {
-                // Far enough by the numbers, but the tug is mid-swing: it
-                // will finish the pattern whatever we say, so the push ends
-                // at ITS stop (the stall path below), never here.
-                if !swing_waited {
-                    swing_waited = true;
-                    event(json!({ "event": "swing_wait", "back_m": r1(back_m), "err": r1(err) }));
-                }
-            } else {
-                break;
+        match verdict {
+            PushVerdict::Complete => break,
+            PushVerdict::SwingWait => {
+                event(json!({ "event": "swing_wait", "back_m": r1(back_m), "err": r1(err) }));
             }
+            PushVerdict::Pushing | PushVerdict::Stalled => {}
         }
         // The sense clock only runs while the aircraft is actually MOVING.
         // Standing still, a turn proves nothing: at Luton the ask went out at
@@ -1160,10 +1303,7 @@ async fn run_inner(
         // aircraft motionless, and the copilot then reported the whole stage
         // as "no tug came". Short of the plan, ask for one more push; the
         // count is bounded so a tug that can't finish can't loop us forever.
-        if back_m > moved_m + MOVED_M {
-            moved_m = back_m;
-            moved_at = Instant::now();
-        } else if towed && moved_at.elapsed().as_secs_f64() >= STALL_SECS {
+        if verdict == PushVerdict::Stalled {
             // The tug has run its pattern and stopped. It used to be asked
             // for another; a command to a tug ON THE BAR drops it off the bar
             // (five for five, 2026-09-12) and it comes back ninety seconds
@@ -1678,11 +1818,195 @@ mod tests {
             "past the chase margin by the numbers"
         );
         // Two seconds ago the error was 146.5: the tug is turning us.
-        assert!(swing_in_progress(true, 146.5, 139.6));
+        let mut w = SwingWatch::default();
+        w.step(0.0, 146.5, true);
+        assert!(w.step(2.0, 139.6, true));
         // The same swing with the bar OFF is not the tug's doing.
-        assert!(!swing_in_progress(false, 146.5, 139.6));
-        // Error holding still: the swing has ended, the distance test stands.
-        assert!(!swing_in_progress(true, 139.9, 139.6));
+        assert!(!w.in_progress(false));
+        // Error holding still: no swing, the distance test stands.
+        let mut w = SwingWatch::default();
+        w.step(0.0, 139.9, true);
+        assert!(!w.step(2.0, 139.6, true));
+        let mut j = PushJudge::new(0.0);
+        assert_eq!(
+            j.step(0.0, 65.3, 139.6, true, true, &p, false),
+            PushVerdict::Complete
+        );
+    }
+
+    /// LIBP, sortie 1790429680, 13:38:44Z 2026-09-26: a Nose 90 left, plan
+    /// 55.3 m to 217.4. Every `push` tick (t from the live "stopped", back_m,
+    /// err, the bar on throughout), as blackboxed.
+    #[rustfmt::skip]
+    const LIBP_PUSH: &[(f64, f64, f64)] = &[
+        (-48.4, -0.0, 45.5), (-47.8, -0.0, 45.5), (-47.3, -0.0, 45.5), (-46.8, 0.1, 45.5),
+        (-46.2, 0.4, 45.5), (-45.7, 0.9, 45.5), (-45.1, 1.6, 45.5), (-44.6, 2.5, 45.5),
+        (-44.0, 3.4, 45.5), (-43.5, 4.5, 45.5), (-42.9, 5.8, 45.5), (-42.4, 7.0, 45.5),
+        (-41.8, 8.2, 45.5), (-41.3, 9.4, 45.5), (-40.8, 10.6, 45.5), (-40.2, 11.8, 45.6),
+        (-39.7, 13.1, 45.6), (-39.1, 14.4, 45.6), (-38.6, 15.6, 45.6), (-38.1, 16.8, 45.6),
+        (-37.5, 18.0, 45.6), (-37.0, 19.3, 45.6), (-36.4, 20.4, 45.6), (-35.9, 21.7, 45.6),
+        (-35.3, 22.9, 45.6), (-34.8, 24.2, 45.6), (-34.2, 25.4, 45.6), (-33.7, 26.3, 45.5),
+        (-33.2, 26.9, 45.5), (-32.6, 27.4, 45.4), (-32.1, 27.9, 45.4), (-31.5, 28.6, 45.3),
+        (-31.0, 29.2, 45.2), (-30.4, 29.9, 45.1), (-29.9, 30.6, 44.9), (-29.3, 31.4, 44.8),
+        (-28.8, 32.1, 44.7), (-28.3, 32.9, 44.5), (-27.7, 33.7, 44.3), (-27.2, 34.6, 44.1),
+        (-26.6, 35.4, 43.8), (-26.1, 36.2, 43.6), (-25.5, 37.1, 43.3), (-25.0, 37.9, 43.0),
+        (-24.4, 38.8, 42.6), (-23.9, 39.7, 42.2), (-23.4, 40.5, 41.8), (-22.8, 41.3, 41.4),
+        (-22.3, 41.9, 41.0), (-21.7, 42.6, 40.5), (-21.2, 43.2, 40.0), (-20.7, 43.8, 39.6),
+        (-20.1, 44.4, 39.0), (-19.6, 45.0, 38.6), (-19.0, 45.5, 38.1), (-18.5, 46.0, 37.5),
+        (-18.0, 46.5, 37.0), (-17.4, 47.0, 36.3), (-16.9, 47.5, 35.7), (-16.3, 47.9, 35.1),
+        (-15.8, 48.4, 34.5), (-15.2, 48.7, 33.9), (-14.7, 49.1, 33.3), (-14.1, 49.6, 32.7),
+        (-13.6, 50.0, 32.0), (-13.1, 50.4, 31.3), (-12.5, 50.8, 30.6), (-12.0, 51.3, 29.8),
+        (-11.4, 51.7, 29.1), (-10.9, 52.2, 28.3), (-10.3, 52.7, 27.4), (-9.8, 53.2, 26.6),
+        (-9.2, 53.7, 25.6), (-8.7, 54.4, 24.3), (-8.1, 55.1, 22.8), (-7.6, 55.7, 21.9),
+        (-7.1, 56.0, 21.4), (-6.5, 56.4, 20.8), (-6.0, 56.8, 20.0), (-5.4, 57.2, 19.4),
+        (-4.9, 57.6, 18.7), (-4.4, 57.9, 17.9), (-3.8, 58.4, 17.2), (-3.3, 58.7, 16.6),
+        (-2.7, 59.1, 15.9), (-2.2, 59.5, 15.2), (-1.7, 59.8, 14.6), (-1.1, 60.2, 13.9),
+        (-0.6, 60.5, 13.2), (0.0, 60.9, 12.6),
+    ];
+    /// The same push after the stop: true heading from the `state` records
+    /// (t from the stop). The tug ignored "stop" and swung on to 262.
+    #[rustfmt::skip]
+    const LIBP_AFTER_STOP: &[(f64, f64)] = &[
+        (1.0, 205.9), (2.2, 208.6), (3.4, 209.4), (4.8, 210.4), (6.0, 211.8),
+        (7.2, 213.0), (8.6, 214.5), (9.9, 216.4), (11.3, 218.8), (12.6, 221.8),
+        (14.0, 225.1), (15.3, 229.2), (16.5, 231.6), (17.8, 235.2), (19.2, 238.6),
+        (20.5, 241.8), (21.8, 244.7), (23.1, 247.6), (24.4, 250.1), (25.7, 253.3),
+        (26.9, 255.8), (28.2, 258.1), (29.5, 259.9), (30.9, 262.1), (32.2, 262.2),
+        (33.5, 262.2), (34.6, 262.2), (35.9, 262.2), (37.2, 262.0),
+    ];
+    /// The bar off after the stop (`autotaxi` `tug_released`).
+    const LIBP_RELEASED_S: f64 = 34.0;
+
+    /// Issue #62. The recorded LIBP ticks through the old rule and the new:
+    /// the old window (samples newer than two seconds, two degrees) read the
+    /// 1.2 deg/s swing as over and said "stop" with the nose still 58
+    /// degrees of swing short of where the tug took it (live at err 12.6,
+    /// t 0.0; the log's rounding trips it a few ticks earlier). The new
+    /// judge rides the swing through its dips to the tug's own stop: the bar
+    /// off at +34 s, and with the bar left on, the stall clock once the nose
+    /// stood still, never mid-swing.
+    #[test]
+    fn a_dip_in_the_swing_rate_never_stops_the_push() {
+        let plan = Plan {
+            back_m: 55.3,
+            target_hdg: 217.4,
+            node: (LAT0, LON0),
+            lane: false,
+        };
+        // The continuation at the loop's 0.55 s tick, holding the last
+        // recorded back_m (the aircraft crept at 0.1-0.2 kt: no progress).
+        let mut ticks: Vec<(f64, f64, f64)> = LIBP_PUSH.to_vec();
+        let mut t = 0.55;
+        while t <= 50.0 {
+            let h = LIBP_AFTER_STOP
+                .iter()
+                .rev()
+                .find(|(ts, _)| *ts <= t)
+                .map_or(204.8, |(_, h)| *h);
+            ticks.push((t, 60.9, angle_diff_deg(plan.target_hdg, h)));
+            t += 0.55;
+        }
+
+        // The old rule, as it ran.
+        let old_stop = {
+            let mut hist: std::collections::VecDeque<(f64, f64)> = Default::default();
+            ticks.iter().find_map(|&(t, back, err)| {
+                hist.push_back((t, err));
+                while hist.front().is_some_and(|(ts, _)| t - ts > SWING_WINDOW_S) {
+                    hist.pop_front();
+                }
+                let then = hist.front().map_or(err, |(_, e)| *e);
+                let swinging = (err - then).abs() >= SWING_DEG;
+                (done(back, err, &plan) && !swinging).then_some((t, err))
+            })
+        };
+        let (t_old, err_old) = old_stop.expect("the old rule stopped the push");
+        assert!(t_old <= 0.0 && err_old > 12.0, "{t_old} {err_old}");
+
+        // The new rule over the same ticks, the bar on until the release.
+        let run = |released: f64| {
+            let mut j = PushJudge::new(LIBP_PUSH[0].0);
+            let mut towed = false;
+            for &(t, back, err) in &ticks {
+                let attached = t < released;
+                towed |= back > MOVED_M;
+                if towed && !attached {
+                    return ("released", t, j.swinging());
+                }
+                match j.step(t, back, err, attached, towed, &plan, false) {
+                    PushVerdict::Complete => return ("complete", t, j.swinging()),
+                    PushVerdict::Stalled => return ("stalled", t, j.swinging()),
+                    _ => {}
+                }
+            }
+            ("pushing", f64::NAN, false)
+        };
+        let (how, at, _) = run(LIBP_RELEASED_S);
+        assert_eq!(how, "released", "ended at the tug's own release, at {at}");
+        assert!((at - LIBP_RELEASED_S).abs() < 0.6, "{at}");
+        // The bar never comes off: the stall clock ends it once the nose has
+        // stood still (262.1 at +30.9; the state records are 1.3 s apart,
+        // so allow a sample), never while it is swinging.
+        let (how, at, swinging) = run(f64::INFINITY);
+        assert_eq!(how, "stalled", "{at}");
+        assert!(!swinging);
+        assert!(
+            at > 30.9 + STALL_SECS && at < 30.9 + 1.3 + SWING_SETTLE_S + STALL_SECS,
+            "{at}"
+        );
+    }
+
+    /// A push that is really over still ends at once. The LIEA straight push
+    /// (sortie 1790494983, 2026-09-27, plan 34.3 m, the nose steady at 0.4)
+    /// stops on the tick it passed the plan, as it did live; a turned push
+    /// that comes to rest aligned ends within `SWING_SETTLE_S` of the nose
+    /// standing still, not at the 12 s stall.
+    #[test]
+    fn a_finished_push_still_stops_promptly() {
+        let plan = Plan {
+            back_m: 34.3,
+            target_hdg: 114.6,
+            node: (LAT0, LON0),
+            lane: false,
+        };
+        #[rustfmt::skip]
+        let ticks = [
+            (-6.5, 22.1, 0.4), (-6.0, 23.1, 0.4), (-5.5, 24.2, 0.4), (-4.9, 25.1, 0.4),
+            (-4.4, 26.3, 0.4), (-3.8, 27.3, 0.4), (-3.3, 28.4, 0.4), (-2.7, 29.5, 0.4),
+            (-2.2, 30.5, 0.4), (-1.6, 31.6, 0.4), (-1.1, 32.7, 0.4), (-0.5, 33.7, 0.4),
+            (0.0, 34.8, 0.4),
+        ];
+        let mut j = PushJudge::new(-40.0);
+        let end = ticks
+            .iter()
+            .find(|&&(t, back, err)| {
+                j.step(t, back, err, true, true, &plan, true) == PushVerdict::Complete
+            })
+            .map(|(t, _, _)| *t);
+        assert_eq!(end, Some(0.0));
+
+        // A Nose 90 swinging 3 deg/s onto the lane, still from t = 10.
+        let plan = Plan {
+            back_m: 40.0,
+            target_hdg: 0.0,
+            node: (LAT0, LON0),
+            lane: false,
+        };
+        let mut j = PushJudge::new(0.0);
+        let mut t: f64 = 0.0;
+        let end = loop {
+            let err = (35.0 - 3.0 * t).max(5.0);
+            let v = j.step(t, 45.0, err, true, true, &plan, false);
+            if t < 10.0 {
+                assert_ne!(v, PushVerdict::Complete, "mid-swing at {t}");
+            }
+            if v == PushVerdict::Complete {
+                break t;
+            }
+            t += 0.5;
+            assert!(t < 30.0);
+        };
+        assert!((10.0..=10.0 + SWING_SETTLE_S + 0.5).contains(&end), "{end}");
     }
 
     /// The Gatwick stand that convicted the per-tick steering (2026-07-27).
@@ -1748,38 +2072,8 @@ mod tests {
     /// the same ticks see the tug let go.
     #[test]
     fn the_tug_wait_runs_from_the_end_of_the_swing() {
-        let hdg = [
-            (1.0, 205.9),
-            (2.2, 208.6),
-            (3.4, 209.4),
-            (4.8, 210.4),
-            (6.0, 211.8),
-            (7.2, 213.0),
-            (8.6, 214.5),
-            (9.9, 216.4),
-            (11.3, 218.8),
-            (12.6, 221.8),
-            (14.0, 225.1),
-            (15.3, 229.2),
-            (16.5, 231.6),
-            (17.8, 235.2),
-            (19.2, 238.6),
-            (20.5, 241.8),
-            (21.8, 244.7),
-            (23.1, 247.6),
-            (24.4, 250.1),
-            (25.7, 253.3),
-            (26.9, 255.8),
-            (28.2, 258.1),
-            (29.5, 259.9),
-            (30.9, 262.1),
-            (32.2, 262.2),
-            (33.5, 262.2),
-            (34.6, 262.2),
-            (35.9, 262.2),
-            (37.2, 262.0),
-        ];
-        const RELEASED_S: f64 = 34.0;
+        let hdg = LIBP_AFTER_STOP;
+        const RELEASED_S: f64 = LIBP_RELEASED_S;
         let replay = |with_heading: bool| {
             let mut w = TugClearWatch::new(0.0);
             // The live wait polls every 0.5 s; the heading is the nearest
