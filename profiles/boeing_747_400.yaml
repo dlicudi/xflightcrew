@@ -32,6 +32,17 @@
 id: boeing_747_400
 display_name: Boeing 747-400
 
+# Which loaded aircraft this profile is for (detect::resolve): the ICAO
+# alone is a TYPE, and two models of one type (the stock 737 and the Zibo
+# both say B738) must never share a profile. Every key must hit. The acf
+# entry is a substring of acf_relative_path: if the aircraft's folder is
+# renamed, change it here (an unmatched model flies generic, said aloud).
+# The author entry is a substring of the model's own `P acf/_author` line.
+match:
+  icao: [B744, B748, B74F]
+  acf: ["Sparky/747-400/"]
+  author: ["see github"]
+
 autopilot: false
 throttle: true
 # The thrust levers are a FADEC's input: `B747.42.xt.EEC` holds

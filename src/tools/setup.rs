@@ -148,9 +148,10 @@ impl Tool for SetUpFlight {
         let Ok(Some(net)) = crate::nav::find_taxi_net(&ctx.config.apt_data_path, &fp.origin) else {
             return Ok(format!("{} has no parking positions I can read.", fp.origin));
         };
-        // Jet or not, from the profile the type maps to; an unknown type
+        // Jet or not, from a profile of the plan's TYPE (a plan names no
+        // model, and any model of the type answers this); an unknown type
         // takes any suitable stand.
-        let known = crate::detect::known_profile(&fp.aircraft).and_then(|id| crate::aircraft::load(&id));
+        let known = crate::aircraft::profile_for_type(&fp.aircraft);
         let jet = known.as_ref().is_some_and(|p| {
             p.reference
                 .as_ref()

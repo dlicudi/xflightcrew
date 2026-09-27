@@ -11,6 +11,15 @@
 id: md82
 display_name: McDonnell Douglas MD-82
 
+# Which loaded aircraft this profile is for (detect::resolve): the ICAO
+# alone is a TYPE, and two models of one type (the stock 737 and the Zibo
+# both say B738) must never share a profile. Every key must hit. The acf
+# entry is a substring of acf_relative_path: if the aircraft's folder is
+# renamed, change it here (an unmatched model flies generic, said aloud).
+match:
+  icao: [MD82, MD80, MD83, MD88]
+  acf: ["Laminar Research/McDonnell Douglas MD-82/"]
+
 # Capability flags.
 autopilot: true        # set_heading / set_altitude / set_vertical_speed
 throttle: true         # set_throttle (thrust levers) — jet, so NO piston engine group

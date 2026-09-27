@@ -486,6 +486,9 @@ pub fn suitability(s: &Suitability, cruise_alt_ft: f64, af: &Airframe) -> Vec<Fi
     let caution = |kind, line: String| Finding { severity: Severity::Caution, kind, line };
     let mut out = Vec::new();
     // The type: every number in a plan for another aircraft is its numbers.
+    // A plan names a TYPE, never a model, so this stays on the ICAO: a Zibo
+    // flying a plan filed as B738 is the plan's type (detect::resolve is the
+    // model question, and it is not asked here).
     if let Some(acf) = s.acf_type.as_deref().map(str::trim).filter(|a| !a.is_empty()) {
         let plan = s.plan_type.trim();
         let ours = plan.eq_ignore_ascii_case(acf)

@@ -124,6 +124,14 @@ pub const AUDIO_SELECTION_COM1: &str = "sim/cockpit2/radios/actuators/audio_sele
 /// Tail number string ("N172SP") — the spoken callsign.
 #[allow(dead_code)] // consumed by the atc binary's tree, not the copilot's (yet)
 pub const TAILNUM: &str = "sim/aircraft/view/acf_tailnum";
+/// The loaded model's .acf, relative to the install
+/// ("Aircraft/Laminar Research/Boeing 737-800/b738.acf"): with the ICAO, the
+/// key aircraft detection resolves a profile from.
+pub const ACF_RELATIVE_PATH: &str = "sim/aircraft/view/acf_relative_path";
+/// The .acf's `acf/_author` string, a second route to the model.
+pub const ACF_AUTHOR: &str = "sim/aircraft/view/acf_author";
+/// The .acf's `acf/_descrip` string.
+pub const ACF_DESCRIP: &str = "sim/aircraft/view/acf_descrip";
 /// Maximum gross mass, kg. The wake turbulence category is read off it.
 pub const ACF_M_MAX_KG: &str = "sim/aircraft/weight/acf_m_max";
 
