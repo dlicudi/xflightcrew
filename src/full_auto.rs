@@ -2206,10 +2206,13 @@ async fn fly(xp: XPlaneClient, config: Config, voice: Option<Voice>, tools: SubT
         // instead (the pilot may have taxied us there by hand) — otherwise
         // stand down honestly.
         if !crate::autotaxi::LAST_ARRIVED.load(SeqCst) {
-            let hold_end =
-                crate::party_line::with_taxi_route(|r| r.and_then(|w| w.path.last().copied()));
-            let near_hold = match hold_end {
-                Some((hl, hn)) => {
+            // Near the hold means near it ALONG the route and ON its line
+            // (`autotaxi::at_the_hold`): a straight 60 m from the route's end
+            // also takes an aircraft stopped 27 m off the line beside it, as
+            // the LSZS 03 line-up drive did (2026-09-24).
+            let cleared = crate::party_line::with_taxi_route(|r| r.and_then(crate::autotaxi::Route::build));
+            let near_hold = match cleared {
+                Some(route) => {
                     let (Ok(lat), Ok(lon)) = (xp.get_float(LAT).await, xp.get_float(LON).await)
                     else {
                         give_up(
@@ -2222,9 +2225,12 @@ async fn fly(xp: XPlaneClient, config: Config, voice: Option<Voice>, tools: SubT
                         .await;
                         return;
                     };
-                    let dist_m = crate::nav::haversine_nm(lat, lon, hl, hn) * 1852.0;
-                    event("taxi_end_check", json!({ "dist_m": dist_m }));
-                    dist_m <= 60.0
+                    let fix = crate::autotaxi::route_end_fix(&route, lat, lon);
+                    event(
+                        "taxi_end_check",
+                        json!({ "to_go_m": fix.map(|f| f.0), "lateral_m": fix.map(|f| f.1) }),
+                    );
+                    fix.is_some_and(|(to_go, lateral)| crate::autotaxi::at_the_hold(to_go, lateral))
                 }
                 None => false,
             };

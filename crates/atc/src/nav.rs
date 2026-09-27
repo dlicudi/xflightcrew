@@ -845,6 +845,60 @@ pub struct VacatePlan {
     pub exit_name: String,
 }
 
+/// A stand route that begins ON the runway: the drive off it, forward, then
+/// the route to the stand from where that drive ends.
+///
+/// Planned from the runway itself, a stand route snaps to the nearest node
+/// whatever the heading, and that node is as likely behind as ahead: EDLP 24
+/// (SF50, 2026-09-24) the vacate timed out 714 m short of exit C, the stand
+/// route was planned from 51.61388 N 8.61568 E heading 236, and it started
+/// back up the runway (the drive joined 179 degrees off) with a clearance
+/// that said "cross runway zero six" for the strip we were already on. The
+/// vacate knows the way off ([`TaxiNet::plan_vacate`]: exits ahead only,
+/// toward the apron); the stand route starts where it ends.
+///
+/// `rest` is the stand route from the vacate's end, its crossings already
+/// marked: the vacate's own runway legs are the landing clearance's, never
+/// a crossing. The vacate's exit leads the `via`.
+pub fn after_vacate(vacate: VacatePlan, rest: TaxiRoutePlan) -> TaxiRoutePlan {
+    let mut path = vacate.path;
+    let mut seg = vacate.seg;
+    let mut tail_path = rest.path.into_iter();
+    // The stand route starts where the vacate ends (its first point is the
+    // position it was planned from): the duplicate goes, and the stand
+    // route's first leg then runs from the vacate's end. Apart, a connecting
+    // leg joins them.
+    match (path.last(), tail_path.as_slice().first()) {
+        (Some(&end), Some(first)) => {
+            let m_per_deg_lon = 111_320.0 * end.0.to_radians().cos();
+            let gap = ((first.1 - end.1) * m_per_deg_lon).hypot((first.0 - end.0) * 111_320.0);
+            if gap < 1.0 {
+                tail_path.next();
+            } else {
+                seg.push((String::new(), false));
+            }
+        }
+        // No vacate to lead with: the stand route whole.
+        (None, _) => seg.clear(),
+        (Some(_), None) => {}
+    }
+    path.extend(tail_path);
+    seg.extend(rest.seg);
+    let mut via = Vec::with_capacity(rest.via.len() + 1);
+    if !vacate.exit_name.is_empty() && rest.via.first() != Some(&vacate.exit_name) {
+        via.push(vacate.exit_name);
+    }
+    via.extend(rest.via);
+    TaxiRoutePlan {
+        via,
+        crossings: rest.crossings,
+        holding_point: rest.holding_point,
+        path,
+        seg,
+        lead_on: Vec::new(),
+    }
+}
+
 /// A planned taxi route, ready to phrase: ordered taxiway names, runways
 /// crossed, the holding-point name, and the node polyline for the
 /// off-route compliance watch. Names are RAW apt.dat strings — the station
@@ -973,8 +1027,9 @@ fn flush_paint_feature(nodes: &mut Vec<PaintNode>, out: &mut Vec<Vec<(f64, f64)>
 pub type RoutePolyline = (Vec<(f64, f64)>, Vec<(String, bool)>);
 
 /// The drawn centreline nearest `p` that could be a continuation of a leg
-/// running on bearing `brg`: its index in `paint` and the foot of the
-/// perpendicular. `prefer` is the line the previous sample snapped to, which
+/// running on bearing `brg`: its index in `paint`, the foot of the
+/// perpendicular, and how far along the line (m from its first point) the
+/// foot sits. `prefer` is the line the previous sample snapped to, which
 /// wins whenever it is still a candidate — without that, two lines drawn a
 /// metre apart (a taxiway and the stand lead-in leaving it) swap the route
 /// between them sample by sample and saw-tooth a straight leg.
@@ -984,15 +1039,18 @@ fn nearest_paint(
     brg: f64,
     prefer: Option<usize>,
     m_per_deg_lon: f64,
-) -> Option<(usize, (f64, f64))> {
-    let mut best: Option<(f64, usize, (f64, f64))> = None;
-    let mut best_prefer: Option<(f64, usize, (f64, f64))> = None;
+) -> Option<(usize, (f64, f64), f64)> {
+    let mut best: Option<(f64, usize, (f64, f64), f64)> = None;
+    let mut best_prefer: Option<(f64, usize, (f64, f64), f64)> = None;
     for (idx, line) in paint.iter().enumerate() {
+        let mut along = 0.0;
         for w in line.windows(2) {
             let (ax, ay) = ((w[0].1 - p.1) * m_per_deg_lon, (w[0].0 - p.0) * 111_320.0);
             let (bx, by) = ((w[1].1 - p.1) * m_per_deg_lon, (w[1].0 - p.0) * 111_320.0);
             let (dx, dy) = (bx - ax, by - ay);
             let len2 = dx * dx + dy * dy;
+            let seg_start = along;
+            along += len2.sqrt();
             if len2 < 1e-6 {
                 continue;
             }
@@ -1008,15 +1066,75 @@ fn nearest_paint(
                 continue;
             }
             let foot = (p.0 + fy / 111_320.0, p.1 + fx / m_per_deg_lon);
-            if best.is_none_or(|(bd, _, _)| d < bd) {
-                best = Some((d, idx, foot));
+            let at = seg_start + t * len2.sqrt();
+            if best.is_none_or(|(bd, ..)| d < bd) {
+                best = Some((d, idx, foot, at));
             }
-            if prefer == Some(idx) && best_prefer.is_none_or(|(bd, _, _)| d < bd) {
-                best_prefer = Some((d, idx, foot));
+            if prefer == Some(idx) && best_prefer.is_none_or(|(bd, ..)| d < bd) {
+                best_prefer = Some((d, idx, foot, at));
             }
         }
     }
-    best_prefer.or(best).map(|(_, idx, foot)| (idx, foot))
+    best_prefer.or(best).map(|(_, idx, foot, at)| (idx, foot, at))
+}
+
+/// How much longer than the straight gap a drawn line may run between two
+/// samples snapped onto it and still be the way the route goes there. A
+/// quarter circle is 1.11 times its chord; a line that wanders further is
+/// going somewhere else.
+const PAINT_FILL_DETOUR: f64 = 1.5;
+
+/// The piece of drawn line `line` between the feet at `from_m` and `to_m`
+/// metres along it, EXCLUSIVE of both ends, in the route's direction (the
+/// line may be drawn either way), resampled so no gap exceeds
+/// [`PAINT_SAMPLE_M`]. Returns the points and the piece's length.
+fn paint_between(
+    line: &[(f64, f64)],
+    from_m: f64,
+    to_m: f64,
+    m_per_deg_lon: f64,
+) -> (Vec<(f64, f64)>, f64) {
+    let dist = |a: (f64, f64), b: (f64, f64)| {
+        let (dx, dy) = ((a.1 - b.1) * m_per_deg_lon, (a.0 - b.0) * 111_320.0);
+        (dx * dx + dy * dy).sqrt()
+    };
+    // The line's vertices with how far along it each sits.
+    let mut at = Vec::with_capacity(line.len());
+    let mut acc = 0.0;
+    for (i, &p) in line.iter().enumerate() {
+        if i > 0 {
+            acc += dist(line[i - 1], p);
+        }
+        at.push(acc);
+    }
+    let point_at = |m: f64| -> (f64, f64) {
+        let k = at.partition_point(|&a| a <= m).clamp(1, line.len() - 1);
+        let (a, b) = (line[k - 1], line[k]);
+        let span = at[k] - at[k - 1];
+        let t = if span > 1e-9 { ((m - at[k - 1]) / span).clamp(0.0, 1.0) } else { 0.0 };
+        (a.0 + (b.0 - a.0) * t, a.1 + (b.1 - a.1) * t)
+    };
+    let (lo, hi) = (from_m.min(to_m), from_m.max(to_m));
+    // Stations along the piece: every vertex strictly inside, plus fill-ins
+    // so a long straight stays sampled like any other leg.
+    let mut stations: Vec<f64> = Vec::new();
+    let mut prev = lo;
+    for &a in at.iter().filter(|&&a| a > lo + 0.25 && a < hi - 0.25) {
+        let n = ((a - prev) / PAINT_SAMPLE_M).ceil() as usize;
+        for k in 1..n {
+            stations.push(prev + (a - prev) * k as f64 / n as f64);
+        }
+        stations.push(a);
+        prev = a;
+    }
+    let n = ((hi - prev) / PAINT_SAMPLE_M).ceil() as usize;
+    for k in 1..n {
+        stations.push(prev + (hi - prev) * k as f64 / n as f64);
+    }
+    if to_m < from_m {
+        stations.reverse();
+    }
+    (stations.into_iter().map(point_at).collect(), hi - lo)
 }
 
 /// Move a planned route onto the paint it is an approximation of, returning
@@ -1055,6 +1173,8 @@ pub fn ride_paint(
     };
     let mut out_path: Vec<(f64, f64)> = Vec::with_capacity(path.len() * 4);
     let mut out_seg: Vec<(String, bool)> = Vec::with_capacity(path.len() * 4);
+    // Which line each output point sits on, and where along it.
+    let mut out_snap: Vec<Option<(usize, f64)>> = Vec::with_capacity(path.len() * 4);
     let mut prefer: Option<usize> = None;
     for i in 0..path.len() - 1 {
         let (a, b) = (path[i], path[i + 1]);
@@ -1069,6 +1189,7 @@ pub fn ride_paint(
         if s.1 {
             out_path.push(a);
             out_seg.push(s);
+            out_snap.push(None);
             prefer = None;
             continue;
         }
@@ -1077,8 +1198,9 @@ pub fn ride_paint(
         for k in 0..n {
             let t = k as f64 / n as f64;
             let raw = (a.0 + (b.0 - a.0) * t, a.1 + (b.1 - a.1) * t);
-            let snapped = match nearest_paint(paint, raw, brg, prefer, m_per_deg_lon) {
-                Some((idx, q)) => {
+            let hit = nearest_paint(paint, raw, brg, prefer, m_per_deg_lon);
+            let snapped = match hit {
+                Some((idx, q, _)) => {
                     prefer = Some(idx);
                     q
                 }
@@ -1099,25 +1221,115 @@ pub fn ride_paint(
                 });
             out_path.push(if keeps_going { snapped } else { raw });
             out_seg.push(s.clone());
+            out_snap.push(hit.filter(|_| keeps_going).map(|(idx, _, at)| (idx, at)));
         }
     }
     // The end point rides the last leg's bearing, so a route that finishes at
     // a holding point finishes ON the line, which is where it will stop.
     let last = path[path.len() - 1];
     let prev = path[path.len() - 2];
-    let end = if seg.last().is_some_and(|s| s.1) {
-        last
+    let (end, end_snap) = if seg.last().is_some_and(|s| s.1) {
+        (last, None)
     } else {
         let brg = bearing_deg(prev.0, prev.1, last.0, last.1);
-        nearest_paint(paint, last, brg, prefer, m_per_deg_lon).map_or(last, |(_, q)| q)
+        nearest_paint(paint, last, brg, prefer, m_per_deg_lon)
+            .map_or((last, None), |(idx, q, at)| (q, Some((idx, at))))
     };
     // The end snapped onto the last sample is the same point twice: merge.
     if out_path.len() >= 2 && out_path.last().is_some_and(|&p| dist_m(p, end) < 0.5) {
         out_path.pop();
         out_seg.pop();
+        out_snap.pop();
     }
     out_path.push(end);
+    out_snap.push(end_snap);
+    fill_paint_gaps(paint, &mut out_path, &mut out_seg, &out_snap, m_per_deg_lon);
     (out_path, out_seg)
+}
+
+/// Close the gaps in a ridden route where the drawn line bulged out of reach.
+///
+/// A network leg is a CHORD of the drawn curve it approximates, and a curve
+/// that sweeps round a junction runs further than [`PAINT_SNAP_M`] from its
+/// own chord in the middle: the samples there cannot be moved and stay on
+/// the chord while their neighbours sit on the line. The route then zigzags
+/// between the two, a vertex of 40 to 60 degrees every five metres. LEMG 13's
+/// lead-on did it (2026-09-26, sortie 1790441293): 6 m off the drawn curve in
+/// the middle, the line-up's projection jumped 6 and 11 m forward in single
+/// ticks and the heading error swung to -43 degrees.
+///
+/// So a run of unmoved samples between two samples on the SAME line is
+/// replaced by that line between their feet, when it is the way the route
+/// goes there: no runway leg inside (a runway is never ridden), not more than
+/// [`PAINT_FILL_DETOUR`] times the straight gap, and never more than twice
+/// the snap distance from the samples it replaces (a line that leaves and
+/// comes back is a different line).
+fn fill_paint_gaps(
+    paint: &[Vec<(f64, f64)>],
+    path: &mut Vec<(f64, f64)>,
+    seg: &mut Vec<(String, bool)>,
+    snap: &[Option<(usize, f64)>],
+    m_per_deg_lon: f64,
+) {
+    let dist = |a: (f64, f64), b: (f64, f64)| {
+        let (dx, dy) = ((a.1 - b.1) * m_per_deg_lon, (a.0 - b.0) * 111_320.0);
+        (dx * dx + dy * dy).sqrt()
+    };
+    if path.len() != snap.len() || seg.len() + 1 != path.len() {
+        return;
+    }
+    let mut out_path: Vec<(f64, f64)> = Vec::with_capacity(path.len());
+    let mut out_seg: Vec<(String, bool)> = Vec::with_capacity(seg.len());
+    let mut i = 0;
+    while i < path.len() {
+        out_path.push(path[i]);
+        let next = (i + 1..path.len()).find(|&j| snap[j].is_some());
+        let fill = match (snap[i], next) {
+            (Some((li, from_m)), Some(j)) if j > i + 1 => match snap[j] {
+                Some((lj, to_m)) if lj == li && (to_m - from_m).abs() > 0.5 => {
+                    let (piece, len) = paint_between(&paint[li], from_m, to_m, m_per_deg_lon);
+                    let straight = dist(path[i], path[j]);
+                    let runway = seg[i..j].iter().any(|s| s.1);
+                    let near = path[i + 1..j].iter().all(|&p| {
+                        piece
+                            .iter()
+                            .chain([&path[i], &path[j]])
+                            .any(|&q| dist(p, q) <= 2.0 * PAINT_SNAP_M)
+                    });
+                    (!runway && near && len <= PAINT_FILL_DETOUR * straight + 5.0)
+                        .then_some((j, piece))
+                }
+                _ => None,
+            },
+            _ => None,
+        };
+        match fill {
+            Some((j, piece)) => {
+                // Each new leg keeps the name of the replaced sample nearest
+                // it, so a name change at a network node inside the gap
+                // lands where the node was.
+                let name_near = |q: (f64, f64)| {
+                    (i..j)
+                        .min_by(|&a, &b| dist(path[a], q).total_cmp(&dist(path[b], q)))
+                        .map_or_else(|| seg[i].clone(), |k| seg[k].clone())
+                };
+                out_seg.push(seg[i].clone());
+                for &q in &piece {
+                    out_path.push(q);
+                    out_seg.push(name_near(q));
+                }
+                i = j;
+            }
+            None => {
+                if let Some(s) = seg.get(i) {
+                    out_seg.push(s.clone());
+                }
+                i += 1;
+            }
+        }
+    }
+    *path = out_path;
+    *seg = out_seg;
 }
 
 /// Parse `icao`'s taxi network from apt.dat — same streaming block scan as
@@ -4950,6 +5162,116 @@ STAR:030,6,ALWYS3,RW28B,ARRTU,K2,P,C,E   , ,   ,TF, , , , , ,      ,    ,    ,  
             LAT0 + north_m / 111_320.0,
             LON0 + east_m / (111_320.0 * LAT0.to_radians().cos()),
         )
+    }
+
+    /// A network leg that CHORDS a drawn curve rides the curve, not a zigzag
+    /// between the two.
+    ///
+    /// LEMG 13's lead-on (2026-09-26, sortie 1790441293): the network went
+    /// from the taxiway straight to the runway junction while the paint swept
+    /// round a curve up to 6.5 m out of the chord; the middle samples were
+    /// past the snap distance and stayed on the chord, their neighbours sat
+    /// on the curve, and the ridden lead-on turned -62, +49, +43 and -63
+    /// degrees at consecutive vertices. The line-up's projection jumped 6 and
+    /// 11 m in single ticks and its heading error reached -43 degrees. Here
+    /// the curve is a 50 degree arc of 100 m radius, whose chord sits 9.4 m
+    /// inside it at the middle.
+    #[test]
+    fn a_leg_that_chords_a_drawn_curve_rides_the_curve() {
+        // South 60 m, a 50 degree left arc (radius 100, centre 100 m east of
+        // its start), then 60 m straight on 130 degrees.
+        let mut drawn: Vec<(f64, f64)> = vec![(0.0, 0.0), (0.0, -60.0)];
+        for k in 1..=10 {
+            let a = (50.0_f64 * k as f64 / 10.0).to_radians();
+            drawn.push((100.0 - 100.0 * a.cos(), -60.0 - 100.0 * a.sin()));
+        }
+        let c = *drawn.last().unwrap();
+        let out = 130.0_f64.to_radians();
+        let d = (c.0 + 60.0 * out.sin(), c.1 + 60.0 * out.cos());
+        drawn.push(d);
+        let paint = vec![drawn.iter().map(|&(e, n)| ll(e, n)).collect::<Vec<_>>()];
+        // The network: straight to the start of the arc (1.5 m off the
+        // paint, as authored), a chord to its end, and on down the straight.
+        let path = vec![ll(1.5, 0.0), ll(1.5, -60.0), ll(c.0, c.1), ll(d.0, d.1)];
+        let seg = vec![
+            ("A".to_string(), false),
+            ("HN1".to_string(), false),
+            ("HN1".to_string(), false),
+        ];
+        let (rode, rode_seg) = ride_paint(&paint, &path, &seg);
+        assert_eq!(rode_seg.len(), rode.len() - 1, "seg stays aligned with path");
+        let xy = |p: (f64, f64)| {
+            (
+                (p.1 - LON0) * 111_320.0 * LAT0.to_radians().cos(),
+                (p.0 - LAT0) * 111_320.0,
+            )
+        };
+        let pts: Vec<(f64, f64)> = rode.iter().map(|&p| xy(p)).collect();
+        // Every point ON the drawn line.
+        let on_paint = |p: (f64, f64)| {
+            drawn.windows(2).any(|w| {
+                let (ax, ay, bx, by) = (w[0].0, w[0].1, w[1].0, w[1].1);
+                let (dx, dy) = (bx - ax, by - ay);
+                let t = (((p.0 - ax) * dx + (p.1 - ay) * dy) / (dx * dx + dy * dy)).clamp(0.0, 1.0);
+                ((ax + t * dx - p.0).powi(2) + (ay + t * dy - p.1).powi(2)).sqrt() < 1.0
+            })
+        };
+        for p in &pts {
+            assert!(on_paint(*p), "a point off the drawn line: {p:?}");
+        }
+        // And it runs one way: no vertex turns more than the arc's own
+        // sampling does.
+        let mut prev: Option<f64> = None;
+        for w in pts.windows(2) {
+            let (dx, dy) = (w[1].0 - w[0].0, w[1].1 - w[0].1);
+            if dx.hypot(dy) < 0.5 {
+                continue;
+            }
+            let brg = dx.atan2(dy).to_degrees().rem_euclid(360.0);
+            if let Some(p) = prev {
+                let turn = angle_diff_deg(brg, p);
+                assert!(turn.abs() < 12.0, "a {turn:.0} degree vertex at {w:?}");
+            }
+            prev = Some(brg);
+        }
+        // The names still change where the network said.
+        assert_eq!(rode_seg.first().unwrap().0, "A");
+        assert_eq!(rode_seg.last().unwrap().0, "HN1");
+    }
+
+    /// The vacate leads, the stand route follows from its end: one point where
+    /// they meet, legs aligned, the exit named first once, crossings the
+    /// stand route's own (EDLP 24, 2026-09-24).
+    #[test]
+    fn a_stand_route_from_the_runway_starts_with_the_vacate() {
+        let vacate = VacatePlan {
+            path: vec![ll(0.0, 0.0), ll(100.0, 0.0), ll(100.0, -60.0)],
+            seg: vec![("06/24".into(), true), ("C".into(), false)],
+            exit_name: "C".into(),
+        };
+        let rest = TaxiRoutePlan {
+            via: vec!["C".into(), "D".into()],
+            crossings: vec![],
+            holding_point: "7C".into(),
+            path: vec![ll(100.0, -60.0), ll(100.0, -120.0), ll(200.0, -120.0)],
+            seg: vec![("C".into(), false), ("D".into(), false)],
+            lead_on: vec![],
+        };
+        let p = after_vacate(vacate.clone(), rest.clone());
+        assert_eq!(p.path.len(), 5, "the meeting point once: {:?}", p.path);
+        assert_eq!(p.seg.len() + 1, p.path.len());
+        assert_eq!(p.path[0], ll(0.0, 0.0), "starts at the aircraft");
+        assert_eq!(p.via, vec!["C".to_string(), "D".to_string()]);
+        assert!(p.seg[0].1, "the rollout leg is the runway's");
+        assert_eq!(p.holding_point, "7C");
+        // A stand route that starts elsewhere is joined by a plain leg.
+        let mut apart = rest;
+        apart.path[0] = ll(100.0, -70.0);
+        apart.via = vec!["D".into()];
+        let q = after_vacate(vacate, apart);
+        assert_eq!(q.path.len(), 6);
+        assert_eq!(q.seg.len() + 1, q.path.len());
+        assert_eq!(q.via, vec!["C".to_string(), "D".to_string()]);
     }
 
     /// The whole point, in one test: a network drawn beside its paint, and a

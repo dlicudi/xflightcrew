@@ -1721,7 +1721,10 @@ impl Station {
                 own_on_runway = strip(&self.apt.runways, &ident)
                     .is_some_and(|r| on_runway(r, lat, lon).is_some());
                 self.planned_route = if arrival {
-                    plan_taxi_route_to_stand(&self.apt.runways, lat, lon)
+                    // The heading says which way is forward off a runway we
+                    // may still be on; a failed read plans as before.
+                    let psi = xp.get_float(TRUE_PSI).await.ok();
+                    plan_taxi_route_to_stand(&self.apt.runways, lat, lon, psi)
                 } else {
                     plan_taxi_route_to(&self.apt.runways, &ident, lat, lon)
                 };
@@ -5087,13 +5090,61 @@ fn plan_taxi_route_to_stand(
     runways: &[nav::Runway],
     lat: f64,
     lon: f64,
+    psi_true: Option<f64>,
 ) -> Option<nav::TaxiRoutePlan> {
     let net = TAXI_NET.lock().unwrap_or_else(|e| e.into_inner()).clone()?;
-    let stand = net.nearest_stand(lat, lon)?.clone();
+    stand_route_on(&net, runways, lat, lon, psi_true)
+}
+
+/// True heading, for which way is forward off a runway.
+const TRUE_PSI: &str = "sim/flightmodel/position/psi";
+
+/// [`plan_taxi_route_to_stand`] on a given network, so the real apt.dat can
+/// test it. ON a runway with a heading, the route starts with the drive off
+/// it, FORWARD ([`nav::TaxiNet::plan_vacate`]), and the stand is the one
+/// nearest where that drive ends: planned from the strip itself it snapped
+/// to the nearest node whatever the heading and backtracked (EDLP 24,
+/// 2026-09-24, see [`nav::after_vacate`]). Off a runway, no heading, or no
+/// way off ahead: the plain route from here, as before.
+fn stand_route_on(
+    net: &nav::TaxiNet,
+    runways: &[nav::Runway],
+    lat: f64,
+    lon: f64,
+    psi_true: Option<f64>,
+) -> Option<nav::TaxiRoutePlan> {
+    let on = runways.iter().find(|r| on_runway(r, lat, lon).is_some());
+    let vacate = match (on, psi_true.filter(|p| p.is_finite())) {
+        (Some(r), Some(psi)) => {
+            let zone = vec![r.ident_a.clone(), r.ident_b.clone()];
+            net.plan_vacate(lat, lon, psi, &zone, nav::VACATE_CLEAR_M)
+                .filter(|v| v.path.len() >= 2)
+                .map(|v| (v, format!("{}/{}", r.ident_a, r.ident_b)))
+        }
+        _ => None,
+    };
+    let (slat, slon) = vacate
+        .as_ref()
+        .and_then(|(v, _)| v.path.last().copied())
+        .unwrap_or((lat, lon));
+    let stand = net.nearest_stand(slat, slon)?.clone();
     // To the STAND, not to the taxiway node nearest it — see `plan_to_stand`.
-    let mut plan = net.plan_to_stand(lat, lon, &stand)?;
+    let mut plan = net.plan_to_stand(slat, slon, &stand)?;
     plan.holding_point = stand.name.clone();
+    // Crossings on the stand route only: the vacate's own runway is the
+    // landing clearance's pavement, not a crossing.
     mark_runway_crossings(&mut plan, runways);
+    if let Some((v, strip)) = vacate {
+        sim::blackbox::record(
+            "atc",
+            serde_json::json!({
+                "event": "stand_route_from_runway", "runway": strip,
+                "exit": v.exit_name, "vacate_pts": v.path.len(),
+                "stand": stand.name,
+            }),
+        );
+        plan = nav::after_vacate(v, plan);
+    }
     Some(plan)
 }
 
@@ -12645,6 +12696,71 @@ mod tests {
         assert_eq!(
             spoken_pressure(102000.0, Dialect::Faa),
             "altimeter three zero one two"
+        );
+    }
+
+    /// EDLP 24 (SF50, 2026-09-24): the vacate timed out 714 m short of exit
+    /// C and the stand route was planned from the runway, 51.613882 N
+    /// 8.615681 E heading 236 (state record at t 1790239644.0). It started
+    /// back up the strip (the drive joined 179 degrees off) and the
+    /// clearance said "cross runway zero six" for the runway we were on.
+    /// Planned from the vacate it runs forward and crosses nothing of ours.
+    /// `cargo test -p atc -- --ignored live_edlp_stand_route --nocapture`
+    #[test]
+    #[ignore] // needs the real X-Plane install; run with --ignored
+    fn live_edlp_stand_route_from_the_runway_runs_forward() {
+        let apt = crate::nav::test_xplane_path("Global Scenery/Global Airports/Earth nav data/apt.dat");
+        let Ok(Some(net)) = nav::find_taxi_net(&apt, "EDLP") else {
+            return; // no install, no verdict
+        };
+        let runways = nav::find_runways(&apt, "EDLP").unwrap();
+        let (lat, lon) = (51.613882, 8.615681);
+        let strip = runways
+            .iter()
+            .find(|r| on_runway(r, lat, lon).is_some())
+            .expect("the stop is on a runway");
+        // The rollout direction: the end heading within 30 degrees of 236.
+        let psi = [strip.heading_a_deg(), strip.heading_b_deg()]
+            .into_iter()
+            .find(|h| nav::angle_diff_deg(*h, 236.0).abs() < 30.0)
+            .expect("the landing end");
+        let full = format!("{}/{}", strip.ident_a, strip.ident_b);
+        // Which way the route first goes: the bearing to its point 40 m on.
+        let first_brg = |p: &nav::TaxiRoutePlan| {
+            let mut run = 0.0;
+            for w in p.path.windows(2) {
+                run += nav::haversine_nm(w[0].0, w[0].1, w[1].0, w[1].1) * 1852.0;
+                if run >= 40.0 {
+                    return nav::bearing_deg(lat, lon, w[1].0, w[1].1);
+                }
+            }
+            f64::NAN
+        };
+        // Without the heading: the old plan, from the nearest node.
+        let old = stand_route_on(&net, &runways, lat, lon, None).expect("a route");
+        println!(
+            "old: via {:?} crossings {:?}, first leg {:.0} deg",
+            old.via,
+            old.crossings,
+            first_brg(&old)
+        );
+        let new = stand_route_on(&net, &runways, lat, lon, Some(psi)).expect("a route");
+        println!(
+            "new: via {:?} crossings {:?}, first leg {:.0} deg, heading {psi:.0}",
+            new.via,
+            new.crossings,
+            first_brg(&new)
+        );
+        assert_eq!(new.seg.len() + 1, new.path.len(), "seg stays aligned");
+        assert!(
+            nav::angle_diff_deg(first_brg(&new), psi).abs() < 45.0,
+            "the stand route leaves the runway forward: {:.0} against {psi:.0}",
+            first_brg(&new)
+        );
+        assert!(
+            !new.crossings.contains(&full),
+            "the strip we are on is not a crossing: {:?}",
+            new.crossings
         );
     }
 }
