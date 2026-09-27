@@ -601,6 +601,29 @@ fn c_descent_drag(log: &Log) -> Verdict {
     if outs == 0 {
         return Verdict::NotExercised;
     }
+    // Never out with the final's gear or landing flap (EGKK 2026-09-27): a
+    // MAP final configured while the brake was out. The stow lands in the
+    // same tick as the configuring write, so it is allowed two seconds.
+    let mut out = false;
+    let mut marks: Vec<&Rec> = evs.clone();
+    marks.extend(log.of("procedure", "map_config"));
+    marks.sort_by(|a, b| a.t.total_cmp(&b.t));
+    for r in marks {
+        if r.name == "speedbrake" {
+            out = flag(r.v, "out") == Some(true);
+        } else if out
+            && (flag(r.v, "gear") == Some(true) || num(r.v, "flap").unwrap_or(0.0) > 0.13)
+            && !evs
+                .iter()
+                .any(|s| flag(s.v, "out") == Some(false) && s.t >= r.t && s.t <= r.t + 2.0)
+        {
+            return Verdict::Failed(format!(
+                "speedbrake out at {} while configuring (flap {:.2})",
+                hm(r.t),
+                num(r.v, "flap").unwrap_or(0.0)
+            ));
+        }
+    }
     let last = evs.last().unwrap();
     if flag(last.v, "out") == Some(true) {
         return Verdict::Failed(format!(

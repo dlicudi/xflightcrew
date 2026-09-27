@@ -8158,3 +8158,53 @@ Fixes (`procedure::vertical_tick`, `DescentProfile`):
   `want_alt` never falling before the top of descent, no `terrain_floor`
   in the climb unless the ground is really above the plan, `descent_no_climb`
   only after the cruise was flown. Offline only.
+
+## 2026-09-27: the speedbrake is never out with landing flap or gear
+
+EGKK 26L, stock 737, sortie `1790510400-full_auto` (issue #104). The
+follower's descent drag (`procedure::descent_drag`) put the speedbrake out
+at t 1790515336 (218.4 kt against a 210.25 target, vs_cmd -2,000, flaps up)
+and the speed kept it out while the follower configured for the final to a
+MAP on the runway: `map_config` gear down with flaps 5 at t 1790515473, then
+flaps 10, 25, 30 and 40 by t 1790515517. It came in only at t 1790515530,
+by speed (146.8 against 145), and went out again from t 1790515587 to
+1790515592 at flaps 40 with the gear down (153.6 against 145, 968 fpm
+down). The 737's SPEEDBRAKE EXTENDED caution kept tripping the master
+caution through the approach and the pilot asked why. The speed rule had
+no notion of configuration: a crew never flies speedbrake with landing flap
+or gear.
+
+Fixes (`src/procedure.rs`):
+
+- `drag_barred(flap_handle, gear_handle_down, flap_limits)`, pure: `"gear"`
+  with the gear handle down, `"flaps"` with the flap handle past the
+  airframe's first detent (`aircraft::flap_limits`, the 737's flaps 1 at
+  0.125; any flap at all when no detent is declared). Flaps 1 is still the
+  clean descent.
+- The follower's tick reads `flap_ratio` and `gear_handle_down` (one
+  `tokio::join!`, only while the drag is out or wanted) and a barred
+  configuration forces the drag in: stowed if it is ours, never deployed.
+  `descent_drag`'s shallower rate still applies, so the speed is taken out
+  of the descent instead. A failed read deploys nothing and leaves a brake
+  of ours to the speed rule. `DRAG_OURS` and the one writer are unchanged:
+  a lever the pilot pulled stays the pilot's.
+- Blackbox `procedure` `speedbrake` now carries `why`: `speed` for the old
+  rule, `flaps` or `gear` for a configuration stow.
+- Every exit already stows: `fly` returns on the autoland handoff, the MAP
+  handover and every stand-down, and the spawn wrapper puts away a brake of
+  ours (`follower_ended`) whoever ended it. The sortie's handoff at
+  t 1790515620 found the brake already in.
+- The test card's `descent_drag` row fails a `map_config` with gear or
+  flap past 0.13 while the brake is out and no stow follows within 2 s;
+  over this sortie it now reads "speedbrake out at 13:24 while configuring
+  (flap 0.38)".
+- Test: `the_speedbrake_is_never_out_with_landing_flap_or_gear` (the
+  sortie's 218.36 against 210.25 at -2,000 wants it by speed; clean and
+  flaps 1 may, flaps 5, 10, 40 and the gear bar it; no detents means any
+  flap; the 153.6 against 145 re-deployment is barred; a runaway still
+  shallows to half).
+- Next 737 full-auto arrival, check: `procedure` `speedbrake` `out:true`
+  never after a `map_config` with gear or flap past 0.125 until an
+  `out:false`; a stow with `why` `flaps` or `gear` when the final is
+  configured with the brake out; no SPEEDBRAKE EXTENDED master caution on
+  the approach. Offline only.
