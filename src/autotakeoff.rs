@@ -1742,6 +1742,10 @@ async fn stop_on_centreline(xp: &XPlaneClient, rwy: &Runway, law: &mut RollSteer
             break;
         }
         if last_brake.is_none_or(|t| t.elapsed().as_secs_f64() >= 0.8) {
+            // Noted BEFORE the command too: the plugin latches its brake
+            // yield at the command's begin, before the Web API answers, and a
+            // monitor tick in between would read our brake as a hand.
+            crate::tools::note_brake_cmd();
             if xp.run_command_for(BRAKES_MAX, crate::tools::BRAKE_HOLD_SECS).await.is_ok() {
                 crate::tools::note_brake_cmd();
             }
@@ -1765,6 +1769,7 @@ async fn stop_on_centreline(xp: &XPlaneClient, rwy: &Runway, law: &mut RollSteer
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
     }
     let _ = xp.set_float(TAXI_STEER, 0.0).await;
+    crate::tools::note_brake_cmd();
     if xp.run_command_for(BRAKES_MAX, crate::tools::BRAKE_HOLD_SECS).await.is_ok() {
         crate::tools::note_brake_cmd();
     }
@@ -1795,6 +1800,8 @@ async fn reject(xp: &XPlaneClient, voice: &Option<Voice>, line: &str, reason: &s
     let xp = &xp.unscoped();
     RUN.record(sim::run::Outcome::Failed(reason.into()));
     let _ = xp.set_float(&throttle_dref(), 0.0).await;
+    // Noted before as well as after: see `stop_on_centreline`.
+    crate::tools::note_brake_cmd();
     if xp
         .run_command_for(crate::tools::BRAKES_REGULAR, crate::tools::BRAKE_HOLD_SECS)
         .await

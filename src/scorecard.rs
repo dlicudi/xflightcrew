@@ -33,6 +33,12 @@ const TAXI_PAST_END_M: f64 = 0.0;
 /// A `yoke_under_ap` within this of the crew's own yoke-channel write is the
 /// loop's output read back, never a hand (the monitor's own window).
 const CREW_YOKE_FRESH_S: f64 = 1.5;
+/// A `brake_yield` within this of the crew's own brake command is the
+/// plugin latching on OUR command, never a hand: the held command's 1 s
+/// plus the 1 s decay tail of `tools::brake_cmd_quiet`, the monitor's own
+/// window. EGKK (1790524628, 1790525414, 1790525500): 0.4 to 0.9 s after
+/// each reject.
+const CREW_BRAKE_FRESH_S: f64 = 2.0;
 /// Taxi: fastest the brake command may move (ratio per second) outside a stop.
 pub const TAXI_MAX_BRAKE_RATE: f64 = 1.5;
 /// A takeoff starts aligned or it is a line-up failure.
@@ -166,6 +172,8 @@ pub struct Scorer {
     interventions: usize,
     /// `yoke_under_ap` records that were the crew's own channel write.
     crew_yoke_discounted: usize,
+    /// `brake_yield` records that were the crew's own brake command.
+    crew_brake_discounted: usize,
     /// The pilot's commands to the crew during the sortie (`tool` records).
     commands: usize,
     results: Vec<(String, bool)>,
@@ -177,6 +185,11 @@ pub struct Scorer {
     sortie: Option<String>,
     /// Last time a loop of ours wrote the elevator/aileron channel.
     crew_yoke_t: Option<f64>,
+    /// Last time a loop of ours fired the sim's brake commands: a reject
+    /// (`brakes_regular`, then `brakes_max` renewed through its rollout),
+    /// the taxi's arrest when its hold vanished, or a state record whose
+    /// `in.crew_brake` says a crew brake was in flight.
+    crew_brake_t: Option<f64>,
     /// The takeoff has rotated: its roll ticks now write the elevator.
     rotated: bool,
     /// Recent autoland (t, vvi) for the first contact's sink.
@@ -231,6 +244,15 @@ impl Scorer {
             self.close_landing(&mut out);
         }
         let (kind, event) = (s(r, "kind"), s(r, "event"));
+        let crew_brake = matches!(
+            (kind, event),
+            ("autotakeoff", "reject" | "reject_rollout" | "reject_stopped")
+                | ("autotaxi", "hold_gone")
+        ) || (kind == "state"
+            && r.pointer("/in/crew_brake").and_then(Value::as_bool) == Some(true));
+        if crew_brake {
+            self.crew_brake_t = Some(t);
+        }
         match (kind, event) {
             // The backtrack's turn is the line-up's second leg.
             ("autotaxi", "line_up_path" | "backtrack_turn") => self.line_up_next = true,
@@ -312,12 +334,24 @@ impl Scorer {
             {
                 self.crew_yoke_discounted += 1
             }
+            // The plugin's brake latch rising on our own brake command (a
+            // reject's stop, EGKK 1790524628): the live monitor no longer
+            // records these (`monitor::CrewBrakeLatch`); older sorties are
+            // re-judged here.
+            ("intervention", _)
+                if s(r, "what") == "brake_yield"
+                    && self.crew_brake_t.is_some_and(|c| t - c <= CREW_BRAKE_FRESH_S) =>
+            {
+                self.crew_brake_discounted += 1
+            }
             ("intervention", _) => self.interventions += 1,
             ("tool", _) => self.commands += 1,
             ("sortie", "begin") => {
                 self.results.clear();
                 self.interventions = 0;
                 self.crew_yoke_discounted = 0;
+                self.crew_brake_discounted = 0;
+                self.crew_brake_t = None;
                 self.commands = 0;
             }
             ("sortie", "end") => {
@@ -336,6 +370,7 @@ impl Scorer {
                     "failed": failed,
                     "interventions": self.interventions,
                     "crew_yoke_discounted": self.crew_yoke_discounted,
+                    "crew_brake_discounted": self.crew_brake_discounted,
                     "commands": self.commands,
                     "unattended": unattended,
                     "pass": failed.is_empty() && unattended && s(r, "outcome") != "gave_up",
@@ -702,10 +737,16 @@ pub fn line(v: &Value) -> String {
             .map(|a| a.iter().filter_map(Value::as_str).collect())
             .unwrap_or_default();
         let n = |k: &str| v.get(k).and_then(Value::as_u64).unwrap_or(0);
-        let discounted = match n("crew_yoke_discounted") {
-            0 => String::new(),
-            d => format!(" ({d} crew yoke not counted)"),
-        };
+        let discounted: String = [
+            ("crew_yoke_discounted", "crew yoke"),
+            ("crew_brake_discounted", "crew brake"),
+        ]
+        .iter()
+        .filter_map(|(k, what)| match n(k) {
+            0 => None,
+            d => Some(format!(" ({d} {what} not counted)")),
+        })
+        .collect();
         return format!(
             "SORTIE {}: {} stages, {}, {} interventions{}, {} commands, {}, outcome {}",
             if v.get("pass").and_then(Value::as_bool) == Some(true) { "PASS" } else { "FAIL" },
@@ -853,6 +894,51 @@ mod tests {
         assert_eq!(sortie["interventions"], 0, "the flare's own pull is not a hand");
         assert_eq!(sortie["crew_yoke_discounted"], 4);
         // The recorded (live, older) verdicts are never trusted twice.
+        assert!(recs.iter().all(|r| s(r, "kind") != "stage_result"));
+    }
+
+    /// The 737's first EGKK 26L sortie (1790524628, 2026-09-27), trimmed to
+    /// 678 of its 2,576 records (every tenth taxi tick and every one over
+    /// 2.5 m off, every third roll tick, every reject and state record
+    /// whole; api_load, taxi_guide, speedhold, duty, atc and the live
+    /// verdicts dropped). The reject at 87 kt latched the plugin's
+    /// `brake_yield` 0.5 s later on the crew's own brake command, logged as
+    /// an intervention: the takeoff still fails, the sortie has no hand in it.
+    const EGKK_737_REJECT: &str =
+        include_str!("../bench/sorties/1790524628-full_auto.trimmed.jsonl");
+
+    #[test]
+    fn the_recorded_egkk_reject_scores_as_pinned() {
+        let recs = records(EGKK_737_REJECT);
+        let card = score_all(recs.iter());
+        let text = block(&card);
+        print!("{text}");
+        assert_eq!(
+            text,
+            "  Mission 1790524628-full_auto:\n\
+             \x20   taxi      FAIL: 4.2 m off the line\n\
+             \x20   line_up   pass\n\
+             \x20   alignment pass\n\
+             \x20   takeoff   FAIL: ended by reject, 9.4 m off the centreline\n\
+             \x20   SORTIE FAIL: 4 stages, failed taxi, takeoff, \
+             0 interventions (1 crew brake not counted), 0 commands, unattended, outcome gave_up\n"
+        );
+        let sortie = card.last().unwrap();
+        assert_eq!(sortie["interventions"], 0, "the reject's own brake is not a hand");
+        assert_eq!(sortie["crew_brake_discounted"], 1);
+        assert_eq!(sortie["unattended"], true);
+        assert_eq!(sortie["pass"], false, "a reject is still a failed sortie");
+        // The same latch with no crew brake near it is still a hand.
+        let no_reject: Vec<Value> = recs
+            .iter()
+            .filter(|r| {
+                !(s(r, "kind") == "autotakeoff"
+                    && matches!(s(r, "event"), "reject" | "reject_rollout" | "reject_stopped"))
+            })
+            .cloned()
+            .collect();
+        let sortie = score_all(no_reject.iter()).last().cloned().unwrap();
+        assert_eq!(sortie["interventions"], 1, "{sortie}");
         assert!(recs.iter().all(|r| s(r, "kind") != "stage_result"));
     }
 

@@ -8678,3 +8678,55 @@ never worse, all under 2 m (the plant under-reads the gusty days: LIBP 04 flew
 default law. Next 737 roll: `roll` ticks carry `law` ("rudder") and `r`;
 check err under 3 and xtk_m under 5 through rotation, trim toward 0.2 by
 60 kt in a crosswind, and no steer reversals. Offline only.
+
+## 2026-09-27: a reject's own brake is neither a parking brake nor a hand (issues #112, #113)
+
+All three EGKK 26L rejects on the stock 737 (sorties 1790524628, 1790525414,
+1790525500) said "Parking brake is set and we're rolling, release it." about
+4.7 to 5.0 s into the stop, and each sortie scored `unattended: false` for one
+`intervention` {what: brake_yield} 0.4 to 0.9 s after the reject. Nobody
+touched anything.
+
+**Why the parking brake read set at 87 kt.** It never was. X-Plane shows a
+HELD brake command on `parking_brake_ratio` (measured 2026-07-14:
+`brakes_regular` ramps it to about 0.36 and it decays about 0.8 s after
+expiry). `brakes_max` takes it to 1.0. The reject flies its maximum-effort
+stop on `brakes_max`, renewed every 0.8 s by `stop_on_centreline`, so `park`
+read 0.7 at 87 kt (+2.6 s), 1.0 at 69 kt (+4.7 s), then 1.0 at the stop, 0.4
+two seconds later and 0.0 by four, with no tool and no pilot. That is the
+intended stopping brake, not a hold path firing early, and the valve was
+open (`release_park_brake_for_roll`): a latched brake would have stayed at
+1.0. So nothing in the reject changed; the caution was reading our brake.
+`Snapshot.crew_brake` (`tools::brake_cmd_quiet` false: a crew brake held, or
+inside its 1 s expiry plus 1 s decay tail) gates `RollingOnParkBrake`, which
+is for the brake a pilot forgot.
+
+**Why the brake yield latched.** The plugin's before-handler on the sim's
+brake commands latches `xcopilot/brake_yield` on ANY command begin while the
+steer channel holds the toe brakes for steering alone, and a Web API command
+looks exactly like the pilot's key. The reject fires `brakes_regular`, then
+`brakes_max`, while the roll law still steers the rollout. The monitor now
+owns the latch per episode (`monitor::CrewBrakeLatch`): one that ROSE while a
+crew brake was in flight is the crew's until it drops (the steer channel
+going stale); one that rose with our brakes quiet is a hand. The reject notes
+its brake clock BEFORE each command as well as after, since the latch rises at
+the command's begin, before the Web API answers. The state record's `in`
+carries `crew_brake`. A pilot pressing the key during our own stop stays
+invisible: the latch is one bit and already up.
+
+The scorer re-judges old logs the way it does the crew's yoke: a
+`brake_yield` within `CREW_BRAKE_FRESH_S` (2 s) of `reject`,
+`reject_rollout`, `reject_stopped`, the taxi's `hold_gone` arrest, or a state
+record with `in.crew_brake` is counted as `crew_brake_discounted`, not an
+intervention. `bench/sorties/1790524628-full_auto.trimmed.jsonl` (678 of 2,576
+records) pins it: taxi FAIL 4.2 m, line_up pass, alignment pass, takeoff FAIL
+(ended by reject, 9.4 m), 0 interventions (1 crew brake not counted),
+unattended. The other two rejects re-score the same way. Tests
+`a_rejects_own_brake_is_not_a_rolling_parking_brake`,
+`the_crews_own_reject_brake_is_not_a_pilot_on_the_brakes`,
+`the_recorded_egkk_reject_scores_as_pinned`.
+
+Next reject: no `callout` `rolling_park_brake` while `reject_rollout` ticks
+run; state `in.crew_brake` true with `park` up; no `intervention`
+`brake_yield` within 2 s of `reject`; the `sortie_result` `interventions` 0.
+Offline only.

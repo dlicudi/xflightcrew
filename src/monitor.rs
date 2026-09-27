@@ -157,6 +157,12 @@ pub struct Snapshot {
     /// check. The C90 doesn't animate its handle from this, so the panel can look
     /// released while the sim-level brake drags (seen live: 48 kt -> stopped).
     pub park_brake: f64,
+    /// A crew loop's own brake command is in flight (`tools::brake_cmd_quiet`
+    /// false). X-Plane shows a HELD brake command on `parking_brake_ratio`:
+    /// `brakes_regular` ramps it to about 0.36, `brakes_max` to 1.0, and it
+    /// decays within a second or two of the command's expiry. So while this
+    /// is true the ratio is our brake, not a parking brake anyone set.
+    pub crew_brake: bool,
     /// Cabin altitude, feet (`.../pressurization/indicators/cabin_altitude_ft`). On
     /// an unpressurized airframe this tracks the actual altitude, which is exactly
     /// what the hypoxia check wants; on a pressurized one it's the real cabin.
@@ -522,6 +528,7 @@ impl Snapshot {
             low_vacuum,
             battery_amps,
             park_brake,
+            crew_brake: !crate::tools::brake_cmd_quiet(),
             cabin_altitude_ft,
             fuel_selector,
             alt_ft,
@@ -1644,9 +1651,16 @@ impl Check for RollingOnParkBrake {
     fn eval(&self, s: &Snapshot) -> Option<String> {
         // Not when the copilot set it: the taxi-in arrests a rolling handoff
         // on the parking brake and says so itself (see `taxi_in::arrest_holding`).
+        // Nor while a crew brake command is in flight: a rejected takeoff's
+        // `brakes_max` reads 0.7 to 1.0 on this ratio at 60 to 90 kt and
+        // decays to zero once it expires (1790524628: 1.0 at the stop, 0.4
+        // two seconds later, 0.0 by four); the caution said "release it"
+        // mid-reject at EGKK three times (2026-09-27). This check is for the
+        // brake a PILOT forgot, which reads set with our brakes quiet.
         (s.on_ground
             && s.groundspeed_kts > 5.0
             && s.park_brake > 0.5
+            && !s.crew_brake
             && !crate::taxi_in::arrest_holding())
         .then(|| "Parking brake is set and we're rolling — release it.".to_string())
     }
@@ -2247,6 +2261,10 @@ struct Inputs {
     steer_yield: Option<f64>,
     pitch_yield: Option<f64>,
     brake_yield: Option<f64>,
+    /// A crew loop's own brake command is in flight (held, or inside its
+    /// expiry and decay tail, `tools::brake_cmd_quiet`): the brake the
+    /// plugin sees and the parking-brake ratio are OURS this tick.
+    crew_brake: bool,
 }
 
 impl Inputs {
@@ -2261,6 +2279,7 @@ impl Inputs {
             "sim_speed": self.sim_speed, "trq": self.trq.map(r1),
             "yield": [self.steer_yield.map(|v| v > 0.5), self.pitch_yield.map(|v| v > 0.5),
                       self.brake_yield.map(|v| v > 0.5)],
+            "crew_brake": self.crew_brake,
         })
     }
 }
@@ -2304,6 +2323,7 @@ async fn read_inputs(xp: &crate::xplane::XPlaneClient) -> Inputs {
         steer_yield: ok(steer_yield),
         pitch_yield: ok(pitch_yield),
         brake_yield: ok(brake_yield),
+        crew_brake: !crate::tools::brake_cmd_quiet(),
     }
 }
 
@@ -2345,7 +2365,14 @@ fn crew_yoke_fresh() -> bool {
 /// -0.37 at the takeoff's AP engage, the channel's exact value, four
 /// "interventions" and a failed sortie), and a pilot's hand on the yoke
 /// while the channel is applied is the plugin's `pitch_yield` latch to see.
-fn interventions_now(i: &Inputs, control: crate::flight::Control, crew_yoke: bool) -> [bool; 4] {
+/// Likewise the brake latch is not a hand when it is the crew's
+/// (`crew_brake_latch`, from [`CrewBrakeLatch`]).
+fn interventions_now(
+    i: &Inputs,
+    control: crate::flight::Control,
+    crew_yoke: bool,
+    crew_brake_latch: bool,
+) -> [bool; 4] {
     let automation = matches!(control, crate::flight::Control::Automation(_));
     let hands = automation
         && !crew_yoke
@@ -2354,9 +2381,42 @@ fn interventions_now(i: &Inputs, control: crate::flight::Control, crew_yoke: boo
     [
         i.steer_yield.is_some_and(|v| v > 0.5),
         i.pitch_yield.is_some_and(|v| v > 0.5),
-        i.brake_yield.is_some_and(|v| v > 0.5),
+        i.brake_yield.is_some_and(|v| v > 0.5) && !crew_brake_latch,
         hands,
     ]
+}
+
+/// Whose `xcopilot/brake_yield` latch this is. The plugin latches it on ANY
+/// begin of the sim's brake commands while the steer channel holds the toe
+/// brakes for steering alone, and it cannot tell the pilot's key from our
+/// own Web API command: a rejected takeoff fires `brakes_regular` and then
+/// `brakes_max` while the roll law is still steering, and the latch rose
+/// 0.4 to 0.9 s after every reject at EGKK (1790524628, 1790525414,
+/// 1790525500, 2026-09-27), an "intervention" that made each sortie
+/// attended. A latch that ROSE while a crew brake command was in flight
+/// (`tools::brake_cmd_quiet` false) is the crew's for its whole episode (it
+/// stays up until the steer channel goes stale); one that rose with our
+/// brakes quiet is a hand. A pilot pressing the key during our own stop is
+/// invisible either way: the latch is one bit, and it is already up.
+#[derive(Debug, Default, Clone, Copy)]
+struct CrewBrakeLatch {
+    prev: bool,
+    crews: bool,
+}
+
+impl CrewBrakeLatch {
+    /// The latch's raw reading and whether a crew brake is in flight; true
+    /// while the latch is up and it is the crew's.
+    fn step(&mut self, latched: bool, crew_brake: bool) -> bool {
+        if latched && !self.prev {
+            self.crews = crew_brake;
+        }
+        if !latched {
+            self.crews = false;
+        }
+        self.prev = latched;
+        latched && self.crews
+    }
 }
 
 /// Interventions the tick can see: a plugin yield latch rising (feet on the
@@ -2367,7 +2427,13 @@ fn interventions_now(i: &Inputs, control: crate::flight::Control, crew_yoke: boo
 /// `flight::note_pilot_takeover`.
 fn note_interventions(i: &Inputs, control: crate::flight::Control) {
     static PREV: std::sync::Mutex<[bool; 4]> = std::sync::Mutex::new([false; 4]);
-    let now = interventions_now(i, control, crew_yoke_fresh());
+    static BRAKE_LATCH: std::sync::Mutex<CrewBrakeLatch> =
+        std::sync::Mutex::new(CrewBrakeLatch { prev: false, crews: false });
+    let crews = BRAKE_LATCH
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .step(i.brake_yield.is_some_and(|v| v > 0.5), i.crew_brake);
+    let now = interventions_now(i, control, crew_yoke_fresh(), crews);
     let names = ["steer_yield", "pitch_yield", "brake_yield", "yoke_under_ap"];
     let mut prev = PREV.lock().unwrap_or_else(|e| e.into_inner());
     for k in 0..4 {
@@ -4971,13 +5037,13 @@ mod tests {
             (yoke(0.21, 0.05), Control::Automation("autoland")),
         ];
         for (i, c) in &recorded {
-            assert_eq!(super::interventions_now(i, *c, true), [false; 4], "{i:?}");
-            assert!(super::interventions_now(i, *c, false)[3], "{i:?}");
+            assert_eq!(super::interventions_now(i, *c, true, false), [false; 4], "{i:?}");
+            assert!(super::interventions_now(i, *c, false, false)[3], "{i:?}");
         }
         // A real hand while our channel is on is the plugin's latch to see.
         let mut grab = yoke(0.3, 0.0);
         grab.pitch_yield = Some(1.0);
-        let now = super::interventions_now(&grab, Control::Automation("autoland"), true);
+        let now = super::interventions_now(&grab, Control::Automation("autoland"), true, false);
         assert!(now[1] && !now[3]);
         // The live stamp: a write just now owns the yoke reading.
         super::note_crew_yoke();
@@ -5126,6 +5192,7 @@ mod tests {
             low_vacuum: false,
             battery_amps: 0.0,
             park_brake: 0.0,
+            crew_brake: false,
             cabin_altitude_ft: 0.0,
             fuel_selector: None,
             alt_ft: 0.0,
@@ -6225,6 +6292,61 @@ mod tests {
         );
         crate::taxi_in::ARREST_HOLD.store(false, std::sync::atomic::Ordering::Relaxed);
         assert!(c.eval(&s).is_some());
+    }
+
+    /// EGKK 26L (1790524628, 2026-09-27): the reject's `brakes_max` read
+    /// `park` 0.7 at 87 kt and 1.0 at 69 kt, and the caution told the crew
+    /// to release the brake that was stopping the aircraft. Our own brake
+    /// command is not a forgotten parking brake; the same reading with our
+    /// brakes quiet still is.
+    #[test]
+    fn a_rejects_own_brake_is_not_a_rolling_parking_brake() {
+        let c = RollingOnParkBrake;
+        let mut s = snap(true, true);
+        for (gs, park) in [(87.7, 0.7), (69.0, 1.0), (48.4, 1.0)] {
+            s.groundspeed_kts = gs;
+            s.park_brake = park;
+            s.crew_brake = true;
+            assert!(c.eval(&s).is_none(), "the reject's brake at {gs} kt, park {park}");
+            s.crew_brake = false;
+            assert!(c.eval(&s).is_some(), "a pilot's brake at {gs} kt, park {park}");
+        }
+    }
+
+    /// EGKK (1790524628): the reject's brake command latched the plugin's
+    /// `brake_yield` 0.5 s later, and the latch stayed up through the stop.
+    /// A latch that rose on our command is ours for its whole episode; one
+    /// that rose with our brakes quiet is a hand.
+    #[test]
+    fn the_crews_own_reject_brake_is_not_a_pilot_on_the_brakes() {
+        use crate::flight::Control;
+        let tick = |latched: bool| super::Inputs {
+            steer_yield: Some(0.0),
+            pitch_yield: Some(0.0),
+            brake_yield: Some(if latched { 1.0 } else { 0.0 }),
+            ..Default::default()
+        };
+        let ctl = Control::Automation("takeoff");
+        let mut latch = super::CrewBrakeLatch::default();
+        // (latched, crew brake in flight, a hand): the roll, the reject's
+        // command, the latch rising with it, the stop, our brake quiet with
+        // the latch still up, the steer channel stale (the latch drops),
+        // then a pilot's key with our brakes quiet, still up when ours fire.
+        let ticks = [
+            (false, false, false),
+            (false, true, false),
+            (true, true, false),
+            (true, true, false),
+            (true, false, false),
+            (false, false, false),
+            (true, false, true),
+            (true, true, true),
+        ];
+        for (k, (latched, crew, hand)) in ticks.iter().enumerate() {
+            let crews = latch.step(*latched, *crew);
+            let now = super::interventions_now(&tick(*latched), ctl, false, crews);
+            assert_eq!(now[2], *hand, "tick {k}");
+        }
     }
 
     #[test]
