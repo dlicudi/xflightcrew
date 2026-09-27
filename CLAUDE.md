@@ -311,7 +311,7 @@ everything blackboxes to `logs/blackbox.jsonl` (kinds: `atc`, `autotaxi`, `autot
 `pushback`, `checklist`, `taxi_guide`, `cockpit_auto`, `full_auto`, `circuit`, `procedure`,
 `cabin`, `instructor`, `loading`, `turbine_start`, `heli_start`, `hover`, `heli_circuit`,
 `heli_route`, `rapport`, `cabin_air`, `api_load`, `plan_audit`, `handover`, `start_item`,
-`sim_radio`, `fuel_pumps`, `electrical`).
+`sim_radio`, `fuel_pumps`, `electrical`, `typed`).
 
 ### Holding, writers, reads
 - **A stage not moving the aircraft is holding it**: brakes for every wait, abort and give-up. **A
@@ -356,9 +356,12 @@ everything blackboxes to `logs/blackbox.jsonl` (kinds: `atc`, `autotaxi`, `autot
   - **We stop the tug when we are there** (`PushJudge`): distance made and the nose on the lane
     is `Aligned`, stopped mid-swing, led by the rate (`stop_on_the_lane`, `STOP_LATENCY_S`). The
     swing (`SwingWatch`) only blocks a FALSE stop: no stall verdict and no distance-only finish
-    while the nose is swung, a rate dip is not the end. A tug that swings on after the stop is
+    while the nose is swung, a rate dip is not the end. A swing is 2 degrees in 2 s OR in 4 s (a
+    slow build is a swing); the pavement look-behind is a straight push's test, mid-swing only
+    leaving the pavement stops it (EGBB 2026-09-27). A tug that swings on after the stop is
     logged (`stop_ignored`), never told again. A tug on the bar owns the aircraft: the taxi holds
-    on `pushback_attached` (`tug_hold`, `TUG_WAIT_SECS`).
+    on `pushback_attached` (`tug_hold`, `TUG_WAIT_SECS`). The pilot's stop is answered from the
+    park brake's read-back by the push loop (`abort_brakes`, `stop_line`).
   - **Any command to a tug ON THE BAR drops it off**: no re-issue, no nudge, no second pattern; a
     short push is judged (`push_delivered`), the rest is the taxi's. The bar coming off ENDS the
     push (released tugs never come back).
@@ -730,7 +733,9 @@ every loop down.
   point, aim bearing and cross-track, drawn as a GPS-style arrow by the plugin (rotated against live
   heading per frame); kind X off route points nowhere.
 - Buttons inject pilot English (`REQUEST_PHRASES`, grammar-test-pinned); CANCEL ALWAYS aborts
-  something. The typed line is `xcopilot/typed`. Route tab: `xcopilot/status/loadsheet`,
+  something. The typed line is `xcopilot/typed`; every pilot line is stamped on the channel
+  (`pollers::queue_command`) and the loop's readback wait gives way to one (`Voice::say_until`;
+  blackbox `typed`, `age_s` from `xcopilot/typed_age`, `queued_ms`). Route tab: `xcopilot/status/loadsheet`,
   `fms::active_fix`. Native panel-graphics API (SDK 4.4.0; `plugin/src/imgui_xp.cpp`).
 - **The terminal is setup and diagnosis** (`src/ui.rs`, renders under `TestBackend`).
 - **Settings are a registry** (`src/settings.rs`, `Arc<Config>`, `settings::live()`): env > pref >

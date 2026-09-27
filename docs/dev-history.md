@@ -9196,3 +9196,29 @@ and types "my controls". Rows go to `logs/sorties/run-<stamp>.md`, exit 1 on any
 approach setup is now a sortie (`approach`, held while `autoland::ACTIVE`,
 `setup::hold_sortie_while`), so every case is one file and one verdict. First spec:
 `bench/sorties/lemg-737.yaml`. Offline only; the 5 s ack and sim speed 2x are unmeasured live.
+
+## 2026-09-28: a slow swing is a swing, a stop is answered from the brake, the typed line is timed (issues #125, #110, #90)
+
+#125: EGBB 737 push (sortie 1790534902): the Nose 90 built from 0.1 to 0.8 deg/s over 13 s, under
+`SwingWatch`'s 1 deg/s start, so `swinging` read false at 41.2 of 49.6 m. `pavement_edge` then stopped
+the push on the look-behind with the aircraft on the pavement (`here` true) and the nose 82 degrees
+off. The tug ignored it and swung on to 235.4 (`stop_ignored` 85.4). A swing now also starts at 2
+degrees in 4 s (0.5 deg/s); mid-swing only `here == false` stops the push; `TugClearWatch` uses the
+same slow rate. The "park brake at 3.9 kt" was the `state` gs lagging 1.3 s: speedhold read 0.68 kt
+when `secure` set it. Seen, not changed: the autotaxi's "Holding point ... brakes set" line is spoken
+on arrival at a stand. Pinned by `a_swing_that_builds_slowly_is_seen_and_the_edge_behind_waits_for_it`.
+
+#110: the steered push's stop line now comes from the push loop after `set_park_brake_confirmed`
+(`pushback::abort_brakes`, `stop_line`, blackbox `pushback` `abort_brakes`); `main.rs` no longer
+claims the brakes. A pilot's stop during the tug-let-go wait now sets the parking brake instead of
+leaving the aircraft unbraked. Test `the_pilots_stop_is_answered_from_the_brake_read_back`.
+
+#90: LEMG's typed "recover the aircraft" was taken by the poller at 18:42:30.856 and consumed 35 ms
+later, so the pilot's ~15 s was before the take and unplaceable. Added plugin `xcopilot/typed_age`
+(in `health::PLUGIN_DATAREFS`) and blackbox `typed` `taken` (`age_s`) / `consumed` (`queued_ms`). The
+loop's readback wait now gives way to a queued line (`Voice::say_until`, `pollers::command_waiting`).
+Needs `make -C plugin install` and a reload.
+
+Next sortie: push ticks `swinging` true once the nose moves 2 degrees in 4 s, `pavement_edge` only
+with `here: false` mid-swing; `abort_brakes` `pilot_stop: true` `held: true` before "Stopping the
+push"; typed `age_s` under 0.5 s and `queued_ms` under 200 ms. Offline only.
