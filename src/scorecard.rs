@@ -13,6 +13,37 @@ use serde_json::{json, Value};
 
 /// Taxi: most off the centreline.
 pub const TAXI_MAX_LAT_M: f64 = 3.0;
+/// Taxi: most INSIDE a corner of the route, while turning through it. The
+/// route is a polyline and its corners are vertices no wheel can follow: an
+/// aircraft flying a turn of radius R through a vertex of deflection D is
+/// R (1 - cos D/2) inside it at the bisector however well it is flown, and
+/// the projection onto the polyline measures exactly that. EGBB 33
+/// (1790534902, 2026-09-27): the 737 held 0.1 to 0.5 m down every straight
+/// and scored "3.2 m off the line" at a 56 degree vertex flown at 21 m
+/// (geometry alone: 2.5 m) and "4.2 m" on the line-up's 92 degree vertex at
+/// 13 m (3.9 m), each peak at the tick the projection jumped 3 to 7 m
+/// along the route across the vertex's inside. 14 of the taxi and line-up
+/// failures in the 22 sorties on file (3.1 to 4.3 m) were this shape. The
+/// allowance needs that jump: inside a drawn CURVE (no jump) the law's own
+/// bend cap holds the cut to 1.5 m, so a deeper one there is judged as the
+/// line (LIME's 8.5 m inside a gentle bend, 2026-09-25). 5 m covers the
+/// 737's 90 degree vertex at its full-lock radius; a swing OUTSIDE a corner
+/// (LEMG Alpha's 5.8 m wide) is judged against [`TAXI_MAX_LAT_M`].
+pub const TAXI_MAX_CUT_M: f64 = 5.0;
+/// The route's own turn rate (the drive's `turn_dps`) at or above which a
+/// corner is open, and the yaw rate a tick must carry the same way to be
+/// turning through it.
+const CORNER_TURN_DPS: f64 = 2.0;
+const CORNER_YAW_DPS: f64 = 2.0;
+/// A corner is closed this long after the route last asked for the turn.
+const CORNER_TAIL_S: f64 = 10.0;
+/// A tick's `remaining_m` falling by more than the ground covered plus this
+/// much (and this many seconds of groundspeed, for the ticks' own timing
+/// jitter: straights at 18 kt read up to 1.3 m over) is the projection
+/// crossing a vertex. EGBB's four vertices read 1.9 to 6.5 m over.
+const CORNER_JUMP_M: f64 = 1.0;
+const CORNER_JUMP_S: f64 = 0.15;
+const KTS_TO_MS: f64 = 0.514_444;
 /// Taxi: after a JOIN (the drive engaged off its route and turned onto it)
 /// the line is judged from the first tick inside [`TAXI_MAX_LAT_M`]; getting
 /// there may take this long from the `joined` record. The join's own record
@@ -91,6 +122,13 @@ struct Taxi {
     ticks: usize,
     max_gs: f64,
     max_lat: f64,
+    /// Most inside a route VERTEX while turning through it
+    /// ([`TAXI_MAX_CUT_M`]).
+    max_cut: f64,
+    /// The corner being turned through.
+    corner: Option<Corner>,
+    /// The last tick's time and `remaining_m`, for the projection's jump.
+    prev_rem: Option<(f64, f64)>,
     brake_rate: f64,
     brake_reversals: usize,
     yaw_swings: usize,
@@ -106,6 +144,34 @@ struct Taxi {
     capture_secs: Option<f64>,
     past_end_ticks: usize,
     sortie: Option<String>,
+}
+
+/// A corner of the route the drive is turning through.
+#[derive(Debug, Clone, Copy)]
+struct Corner {
+    /// +1 a right turn, -1 a left.
+    side: f64,
+    /// The last time the route asked for it (`turn_dps`).
+    asked_t: f64,
+    /// Most inside it so far, judged when it closes.
+    inside: f64,
+    /// The projection jumped across its inside: a vertex, not a curve.
+    vertex: bool,
+}
+
+impl Taxi {
+    /// Judge the corner being closed: inside a vertex it is a cut, inside a
+    /// drawn curve it is off the line like any other tick (the law's own
+    /// bend cap keeps a curve's cut to 1.5 m, so one past the limit is real).
+    fn flush_corner(&mut self) {
+        if let Some(c) = self.corner.take() {
+            if c.vertex {
+                self.max_cut = self.max_cut.max(c.inside);
+            } else {
+                self.max_lat = self.max_lat.max(c.inside);
+            }
+        }
+    }
 }
 
 /// Where a taxi drive stands against its line.
@@ -405,6 +471,47 @@ impl Scorer {
             f(r, "yaw_dps").unwrap_or(0.0),
         );
         x.max_gs = x.max_gs.max(gs);
+        // A corner opens where the route asks for a turn and stays open while
+        // the aircraft is still turning that way (the projection has passed
+        // the vertex by the time the offset peaks, and the route's turn reads
+        // zero there).
+        let turn = f(r, "turn_dps").unwrap_or(0.0);
+        let rem = f(r, "remaining_m");
+        // The projection leaping along the route faster than the aircraft
+        // moves is its foot crossing from one leg of a vertex to the next:
+        // 2 |lat| tan(D/2) at once, 3 to 7 m at EGBB and EGKK.
+        let jumped = match (x.prev_rem, rem) {
+            (Some((t1, r1)), Some(r2)) => {
+                let v = gs * KTS_TO_MS;
+                (r1 - r2) - v * (t - t1).max(0.0) > CORNER_JUMP_M + CORNER_JUMP_S * v
+            }
+            _ => false,
+        };
+        x.prev_rem = rem.map(|m| (t, m));
+        if turn.abs() >= CORNER_TURN_DPS {
+            match x.corner.as_mut() {
+                Some(c) if c.side == turn.signum() => c.asked_t = t,
+                _ => {
+                    x.flush_corner();
+                    x.corner = Some(Corner {
+                        side: turn.signum(),
+                        asked_t: t,
+                        inside: 0.0,
+                        vertex: false,
+                    });
+                }
+            }
+        }
+        if x
+            .corner
+            .is_some_and(|c| yaw * c.side < CORNER_YAW_DPS || t - c.asked_t > CORNER_TAIL_S)
+        {
+            x.flush_corner();
+        }
+        if let Some(c) = x.corner.as_mut() {
+            c.vertex |= jumped;
+        }
+        let cutting = x.corner.is_some_and(|c| lat * c.side > 0.0);
         let past_end = f(r, "remaining_m").is_some_and(|m| m < TAXI_PAST_END_M);
         if past_end {
             x.past_end_ticks += 1;
@@ -416,7 +523,10 @@ impl Scorer {
                 }
             }
             if x.capture == Capture::Tracking {
-                x.max_lat = x.max_lat.max(lat.abs());
+                match x.corner.as_mut() {
+                    Some(c) if cutting => c.inside = c.inside.max(lat.abs()),
+                    _ => x.max_lat = x.max_lat.max(lat.abs()),
+                }
             } else {
                 x.closest_uncaptured =
                     Some(x.closest_uncaptured.map_or(lat.abs(), |c: f64| c.min(lat.abs())));
@@ -455,6 +565,7 @@ impl Scorer {
         if x.ticks < 5 {
             return;
         }
+        x.flush_corner();
         x.ended_by = by.to_string();
         let mut fails = Vec::new();
         if stopped {
@@ -477,6 +588,9 @@ impl Scorer {
         if x.max_lat > TAXI_MAX_LAT_M {
             fails.push(format!("{:.1} m off the line", x.max_lat));
         }
+        if x.max_cut > TAXI_MAX_CUT_M {
+            fails.push(format!("{:.1} m inside a corner", x.max_cut));
+        }
         if x.brake_rate > TAXI_MAX_BRAKE_RATE {
             fails.push(format!("brake moved {:.1}/s", x.brake_rate));
         }
@@ -484,6 +598,7 @@ impl Scorer {
         let sortie = x.sortie.clone();
         self.push(stage, sortie, fails, json!({
             "secs": r1(x.t_last - x.t0), "max_gs": r1(x.max_gs), "max_lat_m": r1(x.max_lat),
+            "max_cut_m": r1(x.max_cut),
             "brake_rate": r2(x.brake_rate), "brake_reversals": x.brake_reversals,
             "yaw_swings": x.yaw_swings, "end_err_deg": r1(x.last_err),
             "end_lat_m": r1(x.last_lat), "ended_by": x.ended_by,
@@ -916,13 +1031,18 @@ mod tests {
         assert_eq!(
             text,
             "  Mission 1790524628-full_auto:\n\
-             \x20   taxi      FAIL: 4.2 m off the line\n\
+             \x20   taxi      pass\n\
              \x20   line_up   pass\n\
              \x20   alignment pass\n\
              \x20   takeoff   FAIL: ended by reject, 9.4 m off the centreline\n\
-             \x20   SORTIE FAIL: 4 stages, failed taxi, takeoff, \
+             \x20   SORTIE FAIL: 4 stages, failed takeoff, \
              0 interventions (1 crew brake not counted), 0 commands, unattended, outcome gave_up\n"
         );
+        // The taxi's "4.2 m off the line" was the inside of a vertex (the
+        // projection jumped 7 m along the route across it): a cut, in limit.
+        let taxi = card.iter().find(|v| s(v, "stage") == "taxi").cloned().unwrap();
+        assert_eq!(taxi["max_cut_m"], 4.2, "{taxi}");
+        assert!(taxi["max_lat_m"].as_f64().unwrap() <= TAXI_MAX_LAT_M, "{taxi}");
         let sortie = card.last().unwrap();
         assert_eq!(sortie["interventions"], 0, "the reject's own brake is not a hand");
         assert_eq!(sortie["crew_brake_discounted"], 1);
@@ -940,6 +1060,97 @@ mod tests {
         let sortie = score_all(no_reject.iter()).last().cloned().unwrap();
         assert_eq!(sortie["interventions"], 1, "{sortie}");
         assert!(recs.iter().all(|r| s(r, "kind") != "stage_result"));
+    }
+
+    /// The 737's EGBB 33 sortie (1790534902, 2026-09-27), trimmed to 1,021
+    /// of its 8,246 records (every tenth taxi tick and every one over 2 m
+    /// off, turning or in a route turn; every autotakeoff record; every
+    /// tenth state and all of the minute around the touchdown with its
+    /// autoland ticks; speech, ATC, procedure, api_load and the live
+    /// verdicts dropped). Live it scored taxi 3.2 m and line-up 4.2 m off
+    /// the line: both the inside of a vertex, every straight held to 0.5 m.
+    /// The takeoff is a real failure: the heading held within 0.3 degrees
+    /// of its target while a 0.65 degree drift carried the wheels 5.7 m
+    /// right by liftoff (`autotakeoff::DriftFilter`).
+    const EGBB_737: &str = include_str!("../bench/sorties/1790534902-full_auto.trimmed.jsonl");
+
+    #[test]
+    fn the_recorded_egbb_sortie_scores_as_pinned() {
+        let recs = records(EGBB_737);
+        let card = score_all(recs.iter());
+        let text = block(&card);
+        print!("{text}");
+        assert_eq!(
+            text,
+            "  Mission 1790534902-full_auto:\n\
+             \x20   taxi      pass\n\
+             \x20   line_up   pass\n\
+             \x20   alignment pass\n\
+             \x20   takeoff   FAIL: 5.7 m off the centreline\n\
+             \x20   landing   pass\n\
+             \x20   SORTIE FAIL: 5 stages, failed takeoff, \
+             0 interventions, 0 commands, unattended, outcome ended\n"
+        );
+        let stage = |n: &str| card.iter().find(|v| s(v, "stage") == n).cloned().unwrap();
+        let (taxi, line_up) = (stage("taxi"), stage("line_up"));
+        println!("{taxi}\n{line_up}");
+        assert_eq!(taxi["max_cut_m"], 3.2, "the 56 degree vertex onto Sierra");
+        assert_eq!(line_up["max_cut_m"], 4.2, "the line-up's 92 degree vertex");
+        // The rest: 0.5 m down the straights; the taxi's 2.0 m is the bend
+        // onto Echo at 9.6 kt, whose projection moved too little to prove a
+        // vertex, so it is judged as the line.
+        assert_eq!(taxi["max_lat_m"], 2.0);
+        assert_eq!(line_up["max_lat_m"], 0.8);
+        assert_eq!(stage("takeoff")["liftoff_xtk_m"], 5.7);
+        assert!(recs.iter().all(|r| s(r, "kind") != "stage_result"));
+    }
+
+    /// A route corner is a vertex no wheel can follow: inside it while
+    /// turning through it is a cut, judged at [`TAXI_MAX_CUT_M`], and only
+    /// where the projection proved a vertex by jumping across it. A drawn
+    /// curve cut as deep, a swing outside the corner, or a cut past the
+    /// limit all still fail.
+    #[test]
+    fn a_cut_inside_a_vertex_is_not_off_the_line() {
+        // A left corner at 6.5 kt: the route asks the turn, the aircraft
+        // yaws left and runs up to `peak` inside (left, negative); `jump`
+        // metres of projection leap at the vertex.
+        let corner = |peak: f64, jump: f64, side: f64| {
+            let mut recs = Vec::new();
+            let mut rem = 500.0;
+            for i in 0..40 {
+                let t = i as f64 * 0.2;
+                let turning = (10..30).contains(&i);
+                let lat = if turning {
+                    let k = if i < 20 { (i - 10) as f64 / 10.0 } else { (30 - i) as f64 / 10.0 };
+                    side * peak * k
+                } else {
+                    0.2
+                };
+                rem -= 0.67;
+                if i == 20 {
+                    rem -= jump;
+                }
+                let mut d = drive(t, 6.5, lat, 0.0, 0.0, if turning { -9.0 } else { 0.0 }, 0.0);
+                d["turn_dps"] = json!(if (8..20).contains(&i) { -10.0 } else { 0.0 });
+                d["remaining_m"] = json!(rem);
+                recs.push(d);
+            }
+            recs.push(json!({"t": 9.0, "kind": "autotaxi", "event": "holding_point"}));
+            score_all(recs.iter()).remove(0)
+        };
+        let cut = corner(3.2, 3.9, -1.0);
+        assert_eq!(cut["pass"], true, "{cut}");
+        assert_eq!(cut["max_cut_m"], 3.2);
+        assert_eq!(cut["max_lat_m"], 0.2);
+        let curve = corner(3.2, 0.0, -1.0);
+        assert_eq!(curve["pass"], false, "no vertex, a drawn curve: {curve}");
+        assert_eq!(curve["why"][0], "3.2 m off the line");
+        let wide = corner(3.2, 3.9, 1.0);
+        assert_eq!(wide["pass"], false, "outside the turn: {wide}");
+        let deep = corner(6.0, 5.0, -1.0);
+        assert_eq!(deep["pass"], false, "{deep}");
+        assert_eq!(deep["why"][0], "6.0 m inside a corner");
     }
 
     #[test]
