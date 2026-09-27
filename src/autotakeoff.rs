@@ -832,6 +832,81 @@ impl XtkRate {
     }
 }
 
+/// The aircraft's own DRIFT on the roll: its track across the runway less
+/// its heading, the angle a heading held dead on course still carries it
+/// sideways by. The cut in [`roll_target_heading`] is proportional, and its
+/// gain falls as 1/v to hold the closure time, so a steady drift is held off
+/// only by a standing offset that grows with speed: drift / gain, 1.6 m at
+/// 40 kt and 6 m at 150 for two thirds of a degree.
+///
+/// EGBB 33 (1790534902, 2026-09-27): about 3 kt of crosswind from the left,
+/// the scheduled rudder law holding the heading within 0.3 degrees of its
+/// target the whole roll, and the aircraft drifting right at 0.35 to 0.45
+/// m/s from 95 kt: track less heading a steady 0.6 to 0.7 degrees, 0.9
+/// once rotated. The cut had reached 0.5 degrees at 4 m; the wheels left
+/// the runway 5.7 m right of the centreline.
+///
+/// Fed forward, like the final's wind crab (`autoland::CrabFilter`): the
+/// heading target less this puts the TRACK where the cut asks. Read from
+/// the cross-track rate the cut already uses (`asin(rate / v)` is the track
+/// across the runway) less the heading off the runway smoothed by the SAME
+/// [`XTK_RATE_TAU_S`], so a nose swing reaches both sides together and is
+/// not read as drift, then low-passed over [`DRIFT_TAU_S`] and bounded.
+/// Nothing below [`DRIFT_FROM_KTS`], where a centimetre of position jitter
+/// is a degree of track.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct DriftFilter {
+    /// Heading less course, smoothed like the cross-track rate.
+    heading: Option<f64>,
+    est: Option<f64>,
+}
+
+/// The drift is read from this groundspeed (the cut's own reference pace).
+pub const DRIFT_FROM_KTS: f64 = 40.0;
+/// Its smoothing, seconds: three times the rate's, so the rate's spikes
+/// (1.3 m of position in one EGBB tick at 50 kt) come through at a tenth.
+pub const DRIFT_TAU_S: f64 = 4.0;
+/// A raw reading past this is a swerve, not a drift.
+const DRIFT_RAW_MAX_DEG: f64 = 3.0;
+/// The most drift the target may carry.
+pub const DRIFT_MAX_DEG: f64 = 2.0;
+
+impl DriftFilter {
+    /// One tick: heading less runway course (degrees, right positive), the
+    /// smoothed cross-track rate ([`XtkRate`], m/s right positive),
+    /// groundspeed and the tick. Returns the drift to take off the target,
+    /// degrees (track right of heading positive).
+    pub fn update(&mut self, psi_off_deg: f64, rate_m_s: f64, gs_kts: f64, dt_s: f64) -> f64 {
+        if !psi_off_deg.is_finite() || !rate_m_s.is_finite() || !gs_kts.is_finite() {
+            return self.value();
+        }
+        if !dt_s.is_finite() || dt_s <= 0.0 {
+            return self.value();
+        }
+        let a = (dt_s / (XTK_RATE_TAU_S + dt_s)).clamp(0.0, 1.0);
+        let heading = match self.heading {
+            Some(h) => h + (psi_off_deg - h) * a,
+            None => psi_off_deg,
+        };
+        self.heading = Some(heading);
+        if gs_kts < DRIFT_FROM_KTS {
+            return self.value();
+        }
+        let v = gs_kts * 0.514_444;
+        let track = (rate_m_s / v).clamp(-1.0, 1.0).asin().to_degrees();
+        let raw = (track - heading).clamp(-DRIFT_RAW_MAX_DEG, DRIFT_RAW_MAX_DEG);
+        let b = (dt_s / (DRIFT_TAU_S + dt_s)).clamp(0.0, 1.0);
+        let e = self.est.unwrap_or(0.0);
+        self.est = Some((e + (raw - e) * b).clamp(-DRIFT_MAX_DEG, DRIFT_MAX_DEG));
+        self.value()
+    }
+
+    /// The current estimate; zero before it has read anything.
+    pub fn value(&self) -> f64 {
+        self.est.unwrap_or(0.0)
+    }
+}
+
 /// The fastest a cross-track reading may move and still be believed, m/s.
 pub const XTK_RATE_MAX_M_S: f64 = 5.0;
 /// The smoothing of the cross-track rate, seconds.
@@ -2067,6 +2142,9 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, p: Params) {
     // [`roll_target_heading`]). Metres, right-positive.
     let mut prev_xtk_m: Option<f64> = None;
     let mut rate_filter = XtkRate::default();
+    // The drift the cut is fed, on the scheduled law only (see
+    // [`DriftFilter`]); every other airframe flies the target it flew.
+    let mut drift_filter = DriftFilter::default();
     // The heading error's last value, for the yaw rate an aligning pivot
     // is capped on (the roll reads no yaw rate of its own).
     let mut prev_align_err: Option<f64> = None;
@@ -2262,7 +2340,14 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, p: Params) {
             let xtk_m = cross_track_nm(lat, lon, &rwy) * M_PER_NM;
             let xtk_rate = rate_filter.update(prev_xtk_m.map_or(0.0, |p| (xtk_m - p) / dt), dt);
             prev_xtk_m = Some(xtk_m);
-            let target = roll_target_heading(rwy.course_deg, xtk_m, xtk_rate, gs_kts);
+            let psi_off = ((psi - rwy.course_deg + 540.0).rem_euclid(360.0)) - 180.0;
+            let drift = if steer_law.scheduled() {
+                drift_filter.update(psi_off, xtk_rate, gs_kts, dt)
+            } else {
+                0.0
+            };
+            let cut = roll_target_heading(rwy.course_deg, xtk_m, xtk_rate, gs_kts);
+            let target = (cut - drift).rem_euclid(360.0);
             let err = ((target - psi + 540.0).rem_euclid(360.0)) - 180.0;
             last_err = err;
             if !rotated {
@@ -2328,7 +2413,7 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, p: Params) {
                     // them the rudder's yaw per unit of steer cannot be read
                     // off a roll (LIBP 04 held 3 degrees of error for six
                     // seconds at 86 to 105 kt on 0.15 to 0.25 of steer).
-                    "psi": psi, "tgt": target,
+                    "psi": psi, "tgt": target, "drift": drift,
                     // The sim's yaw rate the scheduled law damps on, and
                     // whether it flew (the 737's `roll_rudder:`).
                     "r": yaw_dps, "law": if steer_law.scheduled() { "rudder" } else { "default" },
@@ -3382,6 +3467,34 @@ mod tests {
     /// cross-track filter. `kscale` makes the real rudder weaker or stronger
     /// than the one declared.
     fn fly_737_roll(
+        law: RollSteer,
+        xw_kt: f64,
+        kscale: f64,
+        xtk0: f64,
+        psi_off: f64,
+        accel_kts_s: f64,
+        gs0: f64,
+        vr_kts: f64,
+    ) -> Vec<RollTick> {
+        fly_737_roll_drifting(
+            law,
+            xw_kt,
+            kscale,
+            xtk0,
+            psi_off,
+            accel_kts_s,
+            gs0,
+            vr_kts,
+            0.0,
+            false,
+        )
+    }
+
+    /// [`fly_737_roll`] with the tyres letting the track run `slip_deg`
+    /// right of the heading (EGBB 33: 0.6 to 0.7 degrees), and the loop's
+    /// [`DriftFilter`] fed into the target when `feed`.
+    #[allow(clippy::too_many_arguments)]
+    fn fly_737_roll_drifting(
         mut law: RollSteer,
         xw_kt: f64,
         kscale: f64,
@@ -3390,6 +3503,8 @@ mod tests {
         accel_kts_s: f64,
         gs0: f64,
         vr_kts: f64,
+        slip_deg: f64,
+        feed: bool,
     ) -> Vec<RollTick> {
         const COURSE: f64 = 257.6;
         const TICK: f64 = 0.27;
@@ -3401,13 +3516,19 @@ mod tests {
         let mut applied = 0.0_f64;
         let mut prev_xtk: Option<f64> = None;
         let mut rate_filter = XtkRate::default();
+        let mut drift_filter = DriftFilter::default();
         let mut t = 0.0_f64;
         let mut ticks = Vec::new();
         while gs < vr_kts {
             let raw = prev_xtk.map_or(0.0, |p| (xtk - p) / TICK);
             prev_xtk = Some(xtk);
             let rate = rate_filter.update(raw, TICK);
-            let target = roll_target_heading(COURSE, xtk, rate, gs);
+            let drift = if feed {
+                drift_filter.update(psi - COURSE, rate, gs, TICK)
+            } else {
+                0.0
+            };
+            let target = roll_target_heading(COURSE, xtk, rate, gs) - drift;
             let err = ((target - psi + 540.0).rem_euclid(360.0)) - 180.0;
             let steer = law.step_with_yaw(err, TICK, gs, 1.0, Some(yaw));
             queue.push_back((t + DEAD_S, steer));
@@ -3428,7 +3549,7 @@ mod tests {
                 let weathervane = xw_kt / 7.4 * (2.48 * gs / 60.0 - 0.99).max(0.0);
                 yaw += (rudder * applied - weathervane - yaw) * H / LAG_S;
                 psi += yaw * H;
-                xtk += gs / MS_TO_KTS * (psi - COURSE).to_radians().sin() * H;
+                xtk += gs / MS_TO_KTS * (psi - COURSE + slip_deg).to_radians().sin() * H;
                 gs += accel_kts_s * H;
                 t += H;
             }
@@ -3653,6 +3774,133 @@ mod tests {
             assert!(n < 5.0, "{id}: {n:.1} m");
             assert_eq!(steer_swings(&new), 0, "{id}: the rudder weaves");
         }
+    }
+
+    /// EGBB 33 (1790534902, 2026-09-27): about 3 kt of crosswind from the
+    /// left, the heading held within 0.3 degrees of its target, and the
+    /// track 0.6 to 0.7 degrees right of the heading from 95 kt. Through the
+    /// fitted plant with that drift, the cut alone lifts off metres right
+    /// (the recorded roll: 5.7 m at 161 kt); fed the drift it holds the
+    /// line, with no weave bought for it.
+    #[test]
+    fn a_steady_drift_is_fed_forward_not_held_off() {
+        let fly = |feed: bool| {
+            fly_737_roll_drifting(
+                RollSteer::with_rudder(true, rudder_737()),
+                3.1,
+                1.0,
+                0.13,
+                0.0,
+                5.85,
+                0.0,
+                161.0,
+                0.65,
+                feed,
+            )
+        };
+        let (old, new) = (fly(false), fly(true));
+        // At Vr (145 kt IAS, 147 over the ground): the recorded roll was
+        // 3.7 m right there, before rotation raised the drift to 0.9.
+        let at_vr = |t: &[RollTick]| t.iter().find(|k| k.gs >= 147.0).map_or(0.0, |k| k.xtk);
+        println!(
+            "cut alone: {:.1} m at Vr, {:.1} at liftoff; fed: worst {:.1} m",
+            at_vr(&old),
+            old.last().map_or(0.0, |k| k.xtk),
+            worst_xtk(&new, 161.0)
+        );
+        assert!(
+            at_vr(&old) > 3.0,
+            "the cut alone must still lose the line, or this is not EGBB: {:.1} m",
+            at_vr(&old)
+        );
+        assert!(
+            worst_xtk(&new, 161.0) < 1.5,
+            "fed the drift, within 1.5 m to liftoff: {:.1} m (cut alone {:.1} at Vr)",
+            worst_xtk(&new, 161.0),
+            at_vr(&old)
+        );
+        assert!(new.iter().map(|k| k.err.abs()).fold(0.0, f64::max) < 3.0);
+        assert_eq!(steer_swings(&new), 0, "and the rudder does not weave for it");
+    }
+
+    /// With no drift to read, the feed changes nothing that matters: the
+    /// offset recoveries, the crosswinds and every recorded 737 roll fly
+    /// within a few tenths of the law without it, and never weave.
+    #[test]
+    fn the_drift_feed_is_inert_without_a_drift() {
+        let lift = |t: &[RollTick]| t.last().map_or(0.0, |k| k.xtk);
+        for kscale in [0.5, 1.0, 2.5] {
+            for (xw, gs0, xtk0, psi_off) in [
+                (0.0, 0.0, 3.0, 1.0),
+                (0.0, 40.0, 3.0, 2.0),
+                (0.0, 80.0, -2.0, -1.5),
+                (7.4, 0.0, 0.08, 0.2),
+            ] {
+                let run = |feed: bool| {
+                    fly_737_roll_drifting(
+                        RollSteer::with_rudder(true, rudder_737()),
+                        xw,
+                        kscale,
+                        xtk0,
+                        psi_off,
+                        6.2,
+                        gs0,
+                        150.0,
+                        0.0,
+                        feed,
+                    )
+                };
+                let (a, b) = (run(false), run(true));
+                let (wa, wb) = (worst_xtk(&a, 150.0), worst_xtk(&b, 150.0));
+                assert!(
+                    wb <= wa + 0.3,
+                    "x{kscale} {xw} kt from {gs0} kt: {wb:.1} m against {wa:.1}"
+                );
+                assert!(
+                    steer_swings(&b) <= steer_swings(&a).max(1),
+                    "x{kscale} {xw} kt from {gs0} kt: the rudder swung {} times",
+                    steer_swings(&b)
+                );
+                let (la, lb) = (lift(&a).abs(), lift(&b).abs());
+                assert!(
+                    lb < 2.5 || lb <= la + 0.3,
+                    "x{kscale} {xw} kt from {gs0} kt: rotates {lb:.1} m off against {la:.1}"
+                );
+            }
+        }
+    }
+
+    /// The filter over the recorded EGBB roll ticks (bench/sorties): the
+    /// course is the logged target plus the cut it was built from. It reads
+    /// the drift the roll carried (0.6 to 0.7 degrees from 95 kt) by
+    /// rotation, and the position spikes in the ticks (1.3 m in one tick at
+    /// 50 kt) never throw it past a degree.
+    #[test]
+    fn the_drift_is_read_off_the_recorded_egbb_roll() {
+        const EGBB: &str = include_str!("../bench/sorties/1790534902-full_auto.trimmed.jsonl");
+        let ticks: Vec<serde_json::Value> = EGBB
+            .lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .filter(|r| r["kind"] == "autotakeoff" && r["event"] == "roll")
+            .collect();
+        assert!(ticks.len() > 100, "{} roll ticks", ticks.len());
+        let mut filter = DriftFilter::default();
+        let (mut worst, mut at_vr) = (0.0_f64, None);
+        for r in &ticks {
+            let g = |k: &str| r[k].as_f64().unwrap_or(0.0);
+            let (gs, xtk, rate) = (g("gs"), g("xtk_m"), g("xtk_rate"));
+            let course = g("tgt") - roll_target_heading(0.0, xtk, rate, gs);
+            let psi_off = ((g("psi") - course + 540.0).rem_euclid(360.0)) - 180.0;
+            let d = filter.update(psi_off, rate, gs, g("dt"));
+            worst = worst.max(d.abs());
+            if at_vr.is_none() && g("ias") >= 145.0 {
+                at_vr = Some(d);
+            }
+        }
+        let at_vr = at_vr.expect("the roll reached Vr");
+        println!("drift at Vr {at_vr:.2}, worst {worst:.2} degrees");
+        assert!((0.45..=0.9).contains(&at_vr), "drift at Vr {at_vr:.2} degrees");
+        assert!(worst < 1.0, "never past a degree: {worst:.2}");
     }
 
     /// Without a declared rudder nothing changes: the yaw rate is ignored

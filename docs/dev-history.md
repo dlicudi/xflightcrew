@@ -9020,3 +9020,71 @@ intercept, track; `leg` ticks' `steer`, `along_nm`, `xtk_nm` with `xtk_nm`
 under 0.16 (300 m) at least 2 nm before FF26L; `handoff_autoland` at the
 FAF; autoland with no `reversal` event; `ils` `coupling` LocCaptured well
 before 4 nm; no `leg_stalled` during the pattern. Offline only.
+
+## 2026-09-27: a vertex is not a line, and the roll feeds its own drift (issue #123)
+
+**Sortie 1790534902 (EGBB 33, stock 737).** Live verdicts: taxi FAIL 3.2 m
+off the line, line-up FAIL 4.2 m, takeoff FAIL 5.7 m off the centreline at
+liftoff, alignment pass at 0.1 m. Diagnosed per stage from the ticks.
+
+**Taxi and line-up: the scorer, not the law.** Every straight held 0.1 to
+0.5 m. The four peaks (-3.18 at +352, +2.49 at +416, +2.73 at +428, +4.15 at
++496 on the line-up) were each INSIDE a turn the route asked for (`turn_dps`
+-12 to +15), with the yaw the same way, at the tick the projection jumped
+3.9, 2.7, 3.4 and 7.0 m along the route in 0.2 s against 0.5 to 0.8 m
+flown: the foot crossing from one leg of a vertex to the next. The route is
+a polyline and its corners are vertices. A turn of radius R through a
+vertex of deflection D is R (1 - cos D/2) inside it at the bisector however it is flown: the headings
+(state records) and yaw rates give 56 degrees at 21 m (2.5 m), 41 at 29 m
+(1.8), 46 at 25 m (2.0) and 92 at 13 m (3.9), against 3.2, 2.5, 2.7 and
+4.2 measured. Steer never saturated (0.3 to 0.48 in the taxi, 0.72 to 0.83
+on the line-up). The law was flying the corner; the scorer was measuring
+from a point no wheel can follow.
+
+`scorecard`: a corner opens where the route asks for a turn
+(`CORNER_TURN_DPS`) and stays open while the aircraft yaws that way; the
+offset inside it is a CUT, judged at `TAXI_MAX_CUT_M` (5 m, the 737's 90
+degree vertex at its full-lock radius) and reported as `max_cut_m`, but
+only once the corner shows the projection's jump (`CORNER_JUMP_M` plus
+`CORNER_JUMP_S` of groundspeed over the distance flown; the straights at 18
+kt read up to 1.3 m over). Inside a drawn curve (no jump) the law's bend cap
+holds the cut to 1.5 m, so a deeper one there is still off the line; a swing
+OUTSIDE a corner is still judged at 3 m. Re-scored, the 22 sorties on file
+flip 14 taxi and line-up stages to pass, all 3.1 to 4.3 m vertex cuts; LEMG's
+5.8 m wide swing and 6.0 m jagged lead-on (#60), and the rest (3.1, 3.3,
+3.4, 3.6, 6.7, 7.5 m), still fail. The EGKK pin's taxi (1790524628, 4.2 m, a
+7 m jump) is now a pass with `max_cut_m` 4.2.
+
+**Takeoff: the law.** The scheduled rudder law (#59) held the heading within
+0.3 degrees of its target the whole roll; the target was wrong. From 95 kt
+the aircraft moved right at 0.35 to 0.45 m/s with the nose 0.36 degrees LEFT
+of the runway: track less heading a steady 0.6 to 0.7 degrees (0.9 once
+rotated), about 3 kt of crosswind from the left on the tyres. The cut is
+proportional with a gain falling as 1/v (the closure-time rule), so a steady
+drift is held off only by a standing offset of drift / gain: 6 m at 150 kt.
+At 4 m the cut was 0.5 degrees; xtk ran 0.3 to 3.7 m by Vr and 5.7 at
+liftoff with no correction the heading loop could see.
+
+`autotakeoff::DriftFilter`: the drift read as `asin(xtk_rate / v)` less the
+heading off the runway smoothed by the rate's own `XTK_RATE_TAU_S` (so a
+nose swing reaches both sides together), from `DRIFT_FROM_KTS` (40), low
+passed over `DRIFT_TAU_S` (4 s), bounded at 3 degrees raw and
+`DRIFT_MAX_DEG` (2) out, and taken off the heading target, the final's crab
+pattern. Scheduled (`roll_rudder:`) airframes only; every other airframe
+and both rollouts fly the target they flew. Over the recorded roll ticks
+the filter reads 0.57 degrees at Vr, never past 0.68. Through the fitted
+737 plant with that 0.65 degree drift: the cut alone 3.2 m at Vr, fed the
+drift 0.7 m worst, no steer swings; with no drift the feed is within 0.3 m
+of the law without it across the offset recoveries, a 7.4 kt crosswind and
+the rudder at half, one and two and a half times as declared. The 5 m roll
+limit stands (#59's PASS line).
+
+Tests `a_cut_inside_a_vertex_is_not_off_the_line`,
+`the_recorded_egbb_sortie_scores_as_pinned` (bench/sorties/1790534902, 1,021
+of 8,246 records), `the_recorded_egkk_reject_scores_as_pinned` (re-pinned),
+`a_steady_drift_is_fed_forward_not_held_off`,
+`the_drift_feed_is_inert_without_a_drift`,
+`the_drift_is_read_off_the_recorded_egbb_roll`. Next 737 roll: `roll` ticks
+carry `drift`; check it settles to the crosswind's side by 100 kt, xtk_m
+under 2 through liftoff, err under 3 and no steer reversals; next taxi:
+`stage_result` `max_cut_m` beside `max_lat_m`. Offline only.
