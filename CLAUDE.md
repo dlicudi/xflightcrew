@@ -506,6 +506,9 @@ everything blackboxes to `logs/blackbox.jsonl` (kinds: `atc`, `autotaxi`, `autot
   (`power_hold_target`); gear and flaps wait for their limits (`gear_may_extend`,
   `flap_within_limits`); no taxi-in after `has_crashed`. Below the floor a final must be
   interceptable (`stabilised_xtk`) or it balks with height in hand.
+- **A CF leg is flown on its course** (`course_leg::course_track`: a 30 degree intercept rolled out
+  at the fly-by lead), never homed on; **an IF behind us is joined by autoland's pattern** against
+  the FAF's course until the intercept fits 2 nm out (`FinalJoin`; EGKK 26L 2026-09-27).
 - **The VS watchdog excuses a slow autopilot, never a dead one** (`vs_not_held`).
 - **A mountain field is a flyable approach or a hand-over** (`mountain_field`, `earth_msa.dat`): a
   MAP short of the runway is flown on its path (`map_path`) and HANDED OVER with the talk-down armed

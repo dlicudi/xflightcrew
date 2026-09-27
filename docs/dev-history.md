@@ -8953,3 +8953,70 @@ cases for both readbacks. Next IFR enroute switch: `atc_region` `crew: false`
 with a line naming Approach or Departure, `full_auto` `region_handoff` with
 `to` not ending in "Tower" (unless the arrival field), `ifr_code` and `code`
 the cleared code. Offline only.
+
+## 2026-09-27: a CF leg is flown on its course, a far-side IF is joined by a pattern (issue #106)
+
+EGKK 26L, stock 737, sortie `1790534902-full_auto` (and `1790510400`, #105).
+The approach armed at t 1790537411.8 just past WILLO (50.98614, -0.17858),
+tracking 264 at 7,066 ft, 218 kt: 9.6 nm left of the 26L final and 7.8 nm
+DOWNWIND of FF26L, the FAF (the IF, CF26L, is 1.0 nm before it; the
+published transition WILLO, D113V, MAY, FD to 8.5 DME is not loaded). The
+follower flew every fix leg DIRECT to its fix (`bearing_to_fix` plus crab):
+bug 026 to CF26L, 041 once the turn was done, captured 2.3 nm out, then
+"Next, FF26L." with a 024 bug and the handoff the same tick: autoland had
+the aircraft 4.57 nm out, xtk -1,965 m, track 044, 600 ft high. Its
+reversal ran 7 nm of downwind at 1,800 ft, turned in at 6.8 nm, ended
+(`reversal_done`) 3.7 km off at 5.5 nm, and the localizer captured at
+1.0 nm (`ils` `coupling` LocCaptured, 1.9 dots). It landed, 265 fpm, but the
+final was a 30 degree dive at the centreline from 3,273 m.
+
+Root cause: a CF leg's published course (`ProcLeg.course_mag`) was never
+read by the lateral; and an IF whose turn onto the final is over 90 degrees
+(an RNAV IF allows 90 at most, so the aircraft is on its far side) was homed
+on like any other fix, its fly-by capped at one turn radius and the FAF
+sequenced inside it.
+
+Fix, [src/course_leg.rs](../src/course_leg.rs), pure, composed into
+`procedure::fly`:
+
+- `course_track`: a CF leg is a course INTERCEPT then the course. 30 degrees
+  toward the line (`INTERCEPT_DEG`, `circuit::MAX_FINAL_CUT_DEG`'s number),
+  the roll-out begun at the fly-by lead `R(1 - cos 30)` for the enroute
+  radius (`enroute_turn_radius_nm`), then the course with a correction aimed
+  2 nm ahead (longer than the 1.75 nm the heading hold's 30 s covers, so a
+  correction never overshoots); hysteresis to twice the lead. Only when the
+  line can be joined 0.8 nm before the fix (`intercept_room_nm`: the turn
+  onto the cut, the cut, the roll-out); else the fix is flown direct, as
+  before. The course is the CIFP's magnetic made true with the variation
+  HERE. A course leg flown on its course is done abeam its fix inside the
+  capture (`course_passed`), as a fly-by is.
+- `FinalJoin`: an approach IF followed by a CF. Turn at the IF 90 or less:
+  flown direct as published. Else, when the FAF's course can be intercepted
+  with `FAF_ESTABLISHED_NM` (2 nm, ICAO's minimum) to spare, the IF is
+  SKIPPED for the intercept (vectors to final); otherwise autoland's own
+  pattern (`reversal::step`, outbound, base, inbound; `pick_side`,
+  `too_high_to_turn`) is flown against the FAF's course line, the base two
+  sizing radii beyond the established point, until the intercept fits. An
+  inbound pattern leg that runs inside 2 nm of the FAF is skipped anyway
+  (`out_of_room`). The closure watchdog stands off during a pattern.
+- The heading hold is keyed by leg AND phase (`Steer::key`): a new intercept,
+  course or pattern leg is set at once, corrections inside one wait for 5
+  degrees, level wings and 30 s (#93). No new law: the pattern is the one
+  autoland flies, the intercept the circuit's cut.
+
+Tests (the real EGKK I26L rows, a heading-mode plant rolling at 20 to 25
+degrees): `a_far_side_join_at_egkk_flies_a_pattern_and_reaches_the_faf_established`
+from the sortie's arm position at 180 and 220 kt: pattern outbound, base,
+intercept, track; established (300 m, 10 degrees) 4.5 to 5.7 nm before the
+FAF, 10 to 50 m off and 1 to 4 degrees at the handoff, 9 to 10 bug writes;
+`a_near_side_join_flies_the_if_then_tracks_the_faf_course`;
+`a_cf_leg_is_a_course_intercept_not_a_direct_to` (the sortie's 024 bug from
+1.2 nm left becomes course + 30).
+
+Next EGKK-style arrival (or any CF approach), check: `procedure`
+`final_join` (`how` pattern, then intercept; `side`, `along_nm`,
+`xtk_nm`), `steer` events in the order pattern_outbound, pattern_base,
+intercept, track; `leg` ticks' `steer`, `along_nm`, `xtk_nm` with `xtk_nm`
+under 0.16 (300 m) at least 2 nm before FF26L; `handoff_autoland` at the
+FAF; autoland with no `reversal` event; `ils` `coupling` LocCaptured well
+before 4 nm; no `leg_stalled` during the pattern. Offline only.
