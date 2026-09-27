@@ -64,6 +64,7 @@ mod radiofx;
 mod rapport;
 mod readback;
 mod reversal;
+mod route_finder;
 mod router;
 mod settings;
 mod simbrief;

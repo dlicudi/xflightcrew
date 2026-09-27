@@ -1,8 +1,9 @@
 //! Local flight planning from a spoken destination: "plan a flight to Malaga",
 //! "divert to Gibraltar", "take us to lima echo mike golf".
 //!
-//! Stage one of the local planner: a DIRECT route from the field we are at (or
-//! nearest to, when airborne) to the named destination, with a cruise altitude
+//! The local planner: a route from the field we are at (or nearest to, when
+//! airborne) to the named destination (airways for an IFR plan, else direct,
+//! dog-legged round no-go airspace: `route_finder`), with a cruise altitude
 //! picked by rule, a fuel figure from the profile's cruise burn, and a runway
 //! sanity check at the far end. The result is the same [`FlightPlan`] shape
 //! SimBrief produces, so everything downstream (the GPS load, top of descent,
@@ -579,6 +580,14 @@ pub struct LocalRoute {
     pub terrain: Vec<((f64, f64), f64)>,
 }
 
+/// The arm's own points, stripped before a plan is expanded again (an armed
+/// local plan goes back to the shelf with them, and a second arm rebuilds).
+const ARM_POINTS: &[&str] = &["XVLCR", "XVLIF", "XVLFA"];
+/// A planned enroute point this close to the landing threshold is dropped:
+/// the alignment fix is 16 nm out, and a point inside it turns the arrival
+/// back on itself.
+const ARRIVAL_CLEAR_NM: f64 = 20.0;
+
 pub fn local_route(
     fp: &FlightPlan,
     origin: &nav::AirportInfo,
@@ -602,6 +611,30 @@ pub fn local_route(
     {
         return Err("The local flight needs usable climb, cruise and arrival figures.".into());
     }
+    // The plan's own enroute points (airways, dog-legs), kept in order; the
+    // arm's synthetic ones from an earlier arm are rebuilt below.
+    let n_wp = fp.waypoints.len();
+    let mut mids: Vec<Waypoint> = fp
+        .waypoints
+        .iter()
+        .enumerate()
+        .filter(|(i, w)| {
+            *i != 0
+                && *i + 1 != n_wp
+                && !ARM_POINTS.contains(&w.ident.as_str())
+                && w.lat.is_finite()
+                && w.lon.is_finite()
+        })
+        .map(|(_, w)| w.clone())
+        .collect();
+    mids.retain(|w| {
+        dest.runways.iter().all(|r| {
+            nav::haversine_nm(w.lat, w.lon, r.lat_a, r.lon_a) >= ARRIVAL_CLEAR_NM
+                && nav::haversine_nm(w.lat, w.lon, r.lat_b, r.lon_b) >= ARRIVAL_CLEAR_NM
+        })
+    });
+    // The arrival comes from the last enroute point (the origin when direct).
+    let from = mids.last().map_or((o.lat, o.lon), |w| (w.lat, w.lon));
     let mut ends = Vec::new();
     for r in &dest.runways {
         let length = nav::haversine_nm(r.lat_a, r.lon_a, r.lat_b, r.lon_b) * 1852.0 * M_TO_FT;
@@ -615,7 +648,7 @@ pub fn local_route(
             let target = wind
                 .filter(|(_, k)| *k >= 4.0)
                 .map(|(d, _)| d)
-                .unwrap_or_else(|| nav::bearing_deg(o.lat, o.lon, lat, lon));
+                .unwrap_or_else(|| nav::bearing_deg(from.0, from.1, lat, lon));
             let score = ((heading - target + 540.0).rem_euclid(360.0) - 180.0).abs();
             ends.push((score, id.clone(), lat, lon, heading));
         }
@@ -627,7 +660,10 @@ pub fn local_route(
         .ok_or("The destination has no runway long enough for this local flight.")?;
     let outer = nav::project_latlon(lat, lon, heading + 180.0, 16.0);
     let final_fix = nav::project_latlon(lat, lon, heading + 180.0, 8.0);
-    let dist = nav::haversine_nm(o.lat, o.lon, outer.0, outer.1);
+    let mut path: Vec<(f64, f64)> = vec![(o.lat, o.lon)];
+    path.extend(mids.iter().map(|w| (w.lat, w.lon)));
+    path.push(outer);
+    let dist = crate::route_finder::path_nm(&path);
     let outer_alt = cruise.min(dest.elev_ft + 4900.0);
     // Reserve descent at 250 ft/nm, gentler than the follower's nominal path,
     // and five miles for the turn onto final.
@@ -639,52 +675,67 @@ pub fn local_route(
     if dist < climb_nm + descent_nm {
         return Err("This local route has too little room for the climb, descent and final turn. Choose a farther destination or a lower cruise altitude.".into());
     }
-    let top = nav::project_latlon(
-        o.lat,
-        o.lon,
-        nav::bearing_deg(o.lat, o.lon, outer.0, outer.1),
-        dist - descent_nm,
-    );
+    // The top of descent sits `descent_nm` before the alignment fix ALONG
+    // the route; enroute points after it are placed on the descent line.
+    let tod_s = dist - descent_nm;
+    let top = crate::route_finder::point_along(&path, tod_s);
     let wp = |id: &str, p: (f64, f64), alt| Waypoint {
         ident: id.into(),
         lat: p.0,
         lon: p.1,
         alt,
     };
-    let waypoints = vec![
-        o.clone(),
-        wp("XVLCR", top, cruise),
-        wp("XVLIF", outer, outer_alt),
-        wp("XVLFA", final_fix, cruise.min(dest.elev_ft + 2500.0)),
-        wp(&fp.destination, (lat, lon), dest.elev_ft),
-    ];
+    let mut waypoints = vec![o.clone()];
+    let mut s = 0.0;
+    let mut prev = (o.lat, o.lon);
+    let mut top_placed = false;
+    for m in &mids {
+        s += nav::haversine_nm(prev.0, prev.1, m.lat, m.lon);
+        prev = (m.lat, m.lon);
+        if s > tod_s && !top_placed {
+            waypoints.push(wp("XVLCR", top, cruise));
+            top_placed = true;
+        }
+        let alt = if s <= tod_s {
+            cruise
+        } else {
+            cruise + (outer_alt - cruise) * ((s - tod_s) / descent_nm).min(1.0)
+        };
+        waypoints.push(wp(&m.ident, (m.lat, m.lon), alt));
+    }
+    if !top_placed {
+        waypoints.push(wp("XVLCR", top, cruise));
+    }
+    let top_index = waypoints.len() - 1;
+    waypoints.push(wp("XVLIF", outer, outer_alt));
+    waypoints.push(wp("XVLFA", final_fix, cruise.min(dest.elev_ft + 2500.0)));
+    waypoints.push(wp(&fp.destination, (lat, lon), dest.elev_ft));
+    let final_leg = waypoints.len() - 2;
     let mut terrain = Vec::new();
     let mut distance_nm = 0.0;
     for (leg, pair) in waypoints.windows(2).enumerate() {
         let a = &pair[0];
         let b = &pair[1];
         let d = nav::haversine_nm(a.lat, a.lon, b.lat, b.lon);
-        distance_nm += d;
         // Final eight miles belong to the proven autoland path; verify that
         // corridor too, with a 3-degree path and a 50-foot threshold crossing.
         let n = (d * 1852.0 / 150.0).ceil().max(1.0) as usize;
         for i in 0..=n {
             let f = i as f64 / n as f64;
-            let p = nav::project_latlon(
-                a.lat,
-                a.lon,
-                nav::bearing_deg(a.lat, a.lon, b.lat, b.lon),
-                d * f,
-            );
-            let floor = if leg == 0 {
-                // Conservative reachable climb; the takeoff supplies the
-                // first 500 feet, before the follower owns any lateral turn.
+            let p = (a.lat + (b.lat - a.lat) * f, a.lon + (b.lon - a.lon) * f);
+            let floor = if leg < top_index {
+                // Conservative reachable climb along the route; the takeoff
+                // supplies the first 500 feet, before the follower owns any
+                // lateral turn.
                 (origin.elev_ft
                     + 500.0
-                    + (d * f - 3.0).max(0.0) / (cruise_kts + 30.0) * 60.0 * climb_fpm * 0.7)
+                    + (distance_nm + d * f - 3.0).max(0.0) / (cruise_kts + 30.0)
+                        * 60.0
+                        * climb_fpm
+                        * 0.7)
                     .min(cruise)
                     - 500.0
-            } else if leg == 3 {
+            } else if leg == final_leg {
                 dest.elev_ft + 50.0 + d * (1.0 - f) * 300.0
             } else {
                 // Lowest of a continuous descent and its end constraint.
@@ -692,6 +743,7 @@ pub fn local_route(
             };
             terrain.push((p, floor));
         }
+        distance_nm += d;
     }
     Ok(LocalRoute {
         runway,
@@ -727,6 +779,9 @@ pub struct Planned {
     /// own unit like every other fuel figure.
     pub aboard_kg: Option<f64>,
     pub aircraft: String,
+    /// Which way the line goes: airways, round no-go airspace, or direct
+    /// (`route_finder`). The default is direct with nothing crossed.
+    pub lateral: crate::route_finder::Lateral,
 }
 
 /// Thousands separators for an already-converted fuel figure.
@@ -735,9 +790,33 @@ fn commas_f(n: f64) -> String {
 }
 
 impl Planned {
+    /// The distance flown: the lateral route's, else the direct line.
+    pub fn route_nm(&self) -> f64 {
+        if self.lateral.mids.is_empty() {
+            self.dist_nm
+        } else {
+            self.lateral.distance_nm
+        }
+    }
+
     /// The plan in SimBrief's shape, so every downstream consumer is shared.
+    /// The lateral route's points ride between the two fields, so the plan on
+    /// the shelf, in the GPS and at the arm is one route.
     pub fn to_flight_plan(&self) -> FlightPlan {
         let f = self.fuel.as_ref();
+        let mut waypoints = vec![Waypoint {
+            ident: self.origin.icao.clone(),
+            lat: self.origin.lat,
+            lon: self.origin.lon,
+            alt: 0.0,
+        }];
+        waypoints.extend(self.lateral.mids.iter().cloned());
+        waypoints.push(Waypoint {
+            ident: self.dest.icao.clone(),
+            lat: self.dest.lat,
+            lon: self.dest.lon,
+            alt: 0.0,
+        });
         FlightPlan {
             transition_altitude_ft: None,
             transition_level_ft: None,
@@ -750,46 +829,67 @@ impl Planned {
             alternate: String::new(),
             aircraft: self.aircraft.clone(),
             cruise_alt_ft: self.cruise_alt_ft,
-            distance_nm: self.dist_nm,
+            distance_nm: self.route_nm(),
             ete_min: f.map(|f| f.ete_min).unwrap_or(0.0),
             trip_fuel_kg: f.map(|f| f.trip_kg).unwrap_or(0.0),
             reserve_kg: f.map(|f| f.reserve_kg).unwrap_or(0.0),
             block_fuel_kg: f.map(|f| f.block_kg).unwrap_or(0.0),
             min_takeoff_fuel_kg: f.map(|f| f.trip_kg + f.reserve_kg).unwrap_or(0.0),
             weights: None,
-            route: "direct".to_string(),
+            route: if self.lateral.mids.is_empty() {
+                "direct".to_string()
+            } else {
+                self.lateral.route.clone()
+            },
             wind_comp_kts: 0.0,
             wind_dir: 0.0,
             wind_spd_kts: 0.0,
             tod_to_dest_nm: 0.0,
-            waypoints: vec![
-                Waypoint {
-                    ident: self.origin.icao.clone(),
-                    lat: self.origin.lat,
-                    lon: self.origin.lon,
-                    alt: 0.0,
-                },
-                Waypoint {
-                    ident: self.dest.icao.clone(),
-                    lat: self.dest.lat,
-                    lon: self.dest.lon,
-                    alt: 0.0,
-                },
-            ],
+            waypoints,
         }
+    }
+
+    /// The brief's first sentence: where, which way, how far. A no-go volume
+    /// the route still enters is said here with the bound that kept it in,
+    /// never left for the pilot to find.
+    pub fn route_line(&self) -> String {
+        use crate::route_finder::Via;
+        let (name, code) = (&self.dest.name, spell_code(&self.dest.icao));
+        let mut s = match (&self.lateral.via, self.lateral.mids.first()) {
+            (Via::Airways { entry, airways }, Some(_)) => {
+                let spoken: Vec<String> = airways.iter().map(|a| spell_code(a)).collect();
+                format!(
+                    "To {name}, {code}, {:.0} miles by airway {}, joining at {entry}.",
+                    self.route_nm(),
+                    spoken_list(&spoken, 3)
+                )
+            }
+            (Via::AroundAirspace { avoided }, Some(first)) => format!(
+                "To {name}, {code}, {:.0} miles, dog-legged round {}; first heading {:03.0}.",
+                self.route_nm(),
+                spoken_list(avoided, 2),
+                nav::bearing_deg(self.origin.lat, self.origin.lon, first.lat, first.lon)
+            ),
+            _ => format!(
+                "Direct to {name}, {code}, {:.0} miles on a heading of {:03.0}.",
+                self.dist_nm, self.bearing_deg
+            ),
+        };
+        if !self.lateral.crossed.is_empty() {
+            s.push_str(&format!(
+                " The route still enters {}; I found no way round within {:.0} miles.",
+                spoken_list(&self.lateral.crossed, 2),
+                self.dist_nm * crate::route_finder::DOGLEG_MAX_DETOUR
+            ));
+        }
+        s
     }
 
     /// The spoken brief: where, how far, how high, how long, fuel against the
     /// tanks, the ground on the way, the runway at the far end. Ends by
     /// telling the pilot the next word unless the plan is already loading.
     pub fn brief(&self, loading: bool) -> String {
-        let mut s = format!(
-            "Direct to {}, {}, {:.0} miles on a heading of {:03.0}.",
-            self.dest.name,
-            spell_code(&self.dest.icao),
-            self.dist_nm,
-            self.bearing_deg
-        );
+        let mut s = self.route_line();
         if self.dest_matches > 1 {
             s.push_str(&format!(
                 " There are {} fields by that name; I took the biggest.",
@@ -866,6 +966,22 @@ pub fn spell_code(code: &str) -> String {
         .map(|c| c.to_ascii_uppercase().to_string())
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+/// "A", "A and B", "A, B and C"; past `max` items, the first `max` and how
+/// many more ("A, B and 2 more").
+fn spoken_list(items: &[String], max: usize) -> String {
+    let n = items.len();
+    if n == 0 {
+        return String::new();
+    }
+    if n > max {
+        return format!("{} and {} more", items[..max].join(", "), n - max);
+    }
+    match n {
+        1 => items[0].clone(),
+        _ => format!("{} and {}", items[..n - 1].join(", "), items[n - 1]),
+    }
 }
 
 pub fn spoken_feet(ft: f64) -> String {
@@ -1272,6 +1388,7 @@ mod tests {
             cruise_kts: Some(124.0),
             aboard_kg: Some(40.0 * 2.72),
             aircraft: "Cessna 172SP".into(),
+            lateral: Default::default(),
         }
     }
 
@@ -1332,6 +1449,201 @@ mod tests {
         assert!(runway_refusal(&strip, None).is_none(), "no figure, no gate");
         assert_eq!(runway_needed_ft(None, Some(1630.0)), Some(1630.0));
         assert_eq!(runway_needed_ft(Some(1335.0), Some(1630.0)), Some(1335.0));
+    }
+
+    fn field(name: &str, elev: f64, rwy: (&str, &str, f64, f64, f64, f64)) -> nav::AirportInfo {
+        nav::AirportInfo {
+            name: name.into(),
+            elev_ft: elev,
+            freqs: vec![],
+            runways: vec![nav::Runway {
+                ident_a: rwy.0.into(),
+                ident_b: rwy.1.into(),
+                lat_a: rwy.2,
+                lon_a: rwy.3,
+                lat_b: rwy.4,
+                lon_b: rwy.5,
+                width_m: 45.0,
+                surface: 1,
+            }],
+        }
+    }
+
+    /// #73: "plan a flight to X" then "fly the flight plan" end to end at the
+    /// plan level. A local plan dog-legged north of the line (the planner's
+    /// own enroute point) goes through the arm's expansion, the follower's
+    /// legs, the preflight and the whole-plan audit, and a second arm of the
+    /// expanded plan (the shelf after the first) rebuilds the same route.
+    #[test]
+    fn a_local_plan_flies_through_the_arm_the_preflight_and_the_audit() {
+        let base = planned();
+        let turn = Waypoint {
+            ident: "XVLD1".into(),
+            lat: 36.55,
+            lon: -5.00,
+            alt: 0.0,
+        };
+        // A point inside the final's 20 nm is the planner's, never flown.
+        let late = Waypoint {
+            ident: "XVLD2".into(),
+            lat: 36.64,
+            lon: -4.62,
+            alt: 0.0,
+        };
+        let pts = [
+            (base.origin.lat, base.origin.lon),
+            (turn.lat, turn.lon),
+            (late.lat, late.lon),
+            (base.dest.lat, base.dest.lon),
+        ];
+        let p = Planned {
+            lateral: crate::route_finder::Lateral {
+                via: crate::route_finder::Via::AroundAirspace {
+                    avoided: vec!["restricted area R 77".into()],
+                },
+                mids: vec![turn.clone(), late],
+                route: "XVLD1 XVLD2".into(),
+                distance_nm: crate::route_finder::path_nm(&pts),
+                crossed: vec![],
+                at_fields: vec![],
+            },
+            ..base
+        };
+        let brief = p.brief(false);
+        assert!(
+            brief.starts_with("To Malaga Costa del Sol, L E M G, ")
+                && brief.contains("dog-legged round restricted area R 77; first heading"),
+            "{brief}"
+        );
+        let fp = p.to_flight_plan();
+        assert_eq!(fp.waypoints.len(), 4);
+        assert_eq!(fp.route, "XVLD1 XVLD2");
+        assert!(fp.distance_nm > nav::haversine_nm(pts[0].0, pts[0].1, pts[3].0, pts[3].1));
+        assert_eq!(fp.distance_nm, p.lateral.distance_nm);
+        let enroute = crate::procedure::enroute_legs(&fp.waypoints, &fp.origin, &fp.destination, fp.cruise_alt_ft);
+        assert_eq!(enroute.len(), 2, "the shelf plan already has fixes to fly");
+
+        let lxgb = field("Gibraltar", 15.0, ("09", "27", 36.1513, -5.3587, 36.1506, -5.3336));
+        let lemg = field("Malaga", 52.0, ("13", "31", 36.6860, -4.5130, 36.6640, -4.4830));
+        let route = local_route(&fp, &lxgb, &lemg, 110.0, 700.0, 1335.0, None).unwrap();
+        let ids: Vec<&str> = route.waypoints.iter().map(|w| w.ident.as_str()).collect();
+        assert_eq!(ids, ["LXGB", "XVLD1", "XVLCR", "XVLIF", "XVLFA", "LEMG"]);
+        let mut armed = fp.clone();
+        armed.waypoints = route.waypoints.clone();
+        armed.distance_nm = route.distance_nm;
+        let again = local_route(&armed, &lxgb, &lemg, 110.0, 700.0, 1335.0, None).unwrap();
+        let ids2: Vec<&str> = again.waypoints.iter().map(|w| w.ident.as_str()).collect();
+        assert_eq!(ids2, ids, "a second arm rebuilds, never stacks");
+        assert!((again.distance_nm - route.distance_nm).abs() < 0.01);
+        assert!(local_terrain_clear(&route, &vec![0.0; route.terrain.len()]));
+
+        let legs = crate::procedure::enroute_legs(&route.waypoints, &fp.origin, &fp.destination, fp.cruise_alt_ft);
+        assert_eq!(legs.len(), 4);
+        assert!(legs.iter().all(|l| l.fix.is_some()));
+        assert_eq!(legs[0].fix_ident, "XVLD1");
+        assert_eq!(legs[0].alt1_ft, Some(fp.cruise_alt_ft));
+
+        let facts = crate::full_auto::PreflightFacts {
+            fuel_kg: Some(fp.block_fuel_kg + 5.0),
+            payload_kg: None,
+            total_kg: None,
+            max_gross_lb: None,
+            takeoff_roll_m: None,
+            landing_distance_ft: Some(1335.0),
+            takeoff_distance_ft: Some(1630.0),
+            origin_longest_ft: p.origin.longest_runway_ft,
+            dest_longest_ft: p.dest.longest_runway_ft,
+            service_ceiling_ft: Some(14_000.0),
+        };
+        crate::full_auto::preflight(&fp, &facts).expect("the preflight passes");
+
+        let audit = crate::plan_audit::audit(&crate::plan_audit::Inputs {
+            origin: (lxgb.runways[0].lat_a, lxgb.runways[0].lon_a),
+            origin_elev_ft: 15.0,
+            dest: (lemg.runways[0].lat_a, lemg.runways[0].lon_a),
+            legs: &legs,
+            cruise_alt_ft: fp.cruise_alt_ft,
+            stars: &[],
+            mora: None,
+            departure_ground: None,
+            airframe: crate::plan_audit::Airframe {
+                ceiling_ft: Some(14_000.0),
+                pressurised: Some(false),
+                climb_fpm: 700.0,
+                best_climb_fpm: 730.0,
+                descent_fpm: 500.0,
+                climb_ias_kts: 74.0,
+                cruise_ias_kts: 110.0,
+                speed_floor_kts: Some(58.0),
+            },
+            suitability: None,
+        });
+        assert!(audit.stop().is_none(), "{:?}", audit.findings);
+    }
+
+    /// An enroute point past the top of descent is flown on the descent
+    /// line, and the top of descent is measured along the route, not the
+    /// chord.
+    #[test]
+    fn an_enroute_point_past_the_top_of_descent_sits_on_the_descent() {
+        let mut fp = planned().to_flight_plan();
+        fp.cruise_alt_ft = 9000.0;
+        fp.waypoints[0].lat = 0.0;
+        fp.waypoints[0].lon = 0.0;
+        fp.waypoints[1].lat = 2.0;
+        fp.waypoints[1].lon = 0.0;
+        fp.waypoints.insert(1, Waypoint { ident: "MIDFX".into(), lat: 1.6, lon: 0.0, alt: 0.0 });
+        let flat = field("Flat", 0.0, ("36", "18", 2.0, 0.0, 2.03, 0.0));
+        let route = local_route(&fp, &flat, &flat, 150.0, 1000.0, 2000.0, None).unwrap();
+        let ids: Vec<&str> = route.waypoints.iter().map(|w| w.ident.as_str()).collect();
+        assert_eq!(ids, ["LXGB", "XVLCR", "MIDFX", "XVLIF", "XVLFA", "LEMG"]);
+        let mid = &route.waypoints[2];
+        assert!(mid.alt < 9000.0 && mid.alt > 4900.0, "{}", mid.alt);
+        let legs = crate::procedure::enroute_legs(&route.waypoints, &fp.origin, &fp.destination, 9000.0);
+        assert_eq!(legs[1].alt1_ft, Some(mid.alt));
+    }
+
+    #[test]
+    fn the_route_line_says_the_airways_and_what_it_could_not_avoid() {
+        use crate::route_finder::{Lateral, Via};
+        let wp = |id: &str, lat, lon| Waypoint { ident: id.into(), lat, lon, alt: 0.0 };
+        let airways = Planned {
+            lateral: Lateral {
+                via: Via::Airways {
+                    entry: "RBO".into(),
+                    airways: vec!["N870".into()],
+                },
+                mids: vec![wp("RBO", 40.9, -3.4), wp("KARES", 41.2, 1.2)],
+                route: "RBO N870 KARES".into(),
+                distance_nm: 271.4,
+                ..Default::default()
+            },
+            ..planned()
+        };
+        let line = airways.route_line();
+        assert_eq!(
+            line,
+            "To Malaga Costa del Sol, L E M G, 271 miles by airway N 8 7 0, joining at RBO."
+        );
+        let fp = airways.to_flight_plan();
+        assert_eq!(fp.route, "RBO N870 KARES");
+        assert_eq!(fp.distance_nm, 271.4);
+        // Direct with a volume the bound would not go round: said, with the
+        // bound in miles (62 nm direct x 1.3).
+        let walled = Planned {
+            lateral: Lateral {
+                crossed: vec!["restricted area R 77".into()],
+                ..Default::default()
+            },
+            ..planned()
+        };
+        let line = walled.route_line();
+        assert!(line.starts_with("Direct to Malaga Costa del Sol"), "{line}");
+        assert!(
+            line.ends_with("The route still enters restricted area R 77; I found no way round within 81 miles."),
+            "{line}"
+        );
+        assert_eq!(walled.to_flight_plan().route, "direct");
     }
 
     #[test]

@@ -568,6 +568,54 @@ pub(crate) async fn plan_flight(
         winds: crate::weather::winds_aloft(xp).await,
     });
     let cruise_kts = r.and_then(|r| r.cruise_kts);
+    // Which way the line goes (#74, #75): airways for an IFR (pressurised,
+    // whole-thousand) plan, else direct dog-legged round no-go airspace. The
+    // vertical profile is the airframe's own climb and descent, or the whole
+    // band when it has none (never a guessed rate).
+    let per_nm = |fpm: f64, kts: Option<f64>| {
+        kts.filter(|k| *k > 0.0 && fpm > 0.0).map(|k| fpm / (k / 60.0))
+    };
+    let vprofile = crate::route_finder::Profile {
+        origin_elev_ft: from.elev_ft,
+        dest_elev_ft: to.elev_ft,
+        cruise_ft: cruise_alt_ft,
+        climb_ft_per_nm: per_nm(crate::procedure::climb_fpm(), r.and_then(|r| r.vy_kts)),
+        descent_ft_per_nm: per_nm(crate::procedure::descent_fpm(), cruise_kts),
+    };
+    let lateral = {
+        let (awy, fix, navp, air) = (
+            crate::route_finder::data_file_beside(&config.fix_data_path, "earth_awy.dat"),
+            config.fix_data_path.clone(),
+            config.nav_data_path.clone(),
+            config.airspace_path.clone(),
+        );
+        let (o, d) = ((from.lat, from.lon), (to.lat, to.lon));
+        tokio::task::spawn_blocking(move || {
+            let files = crate::route_finder::LateralFiles {
+                awy: &awy,
+                fix: &fix,
+                nav: &navp,
+                airspace: &air,
+            };
+            crate::route_finder::plan_lateral(&files, o, d, pressurised, &vprofile)
+        })
+        .await
+        .unwrap_or_else(|_| crate::route_finder::Lateral::direct(o, d))
+    };
+    // The ground under the route actually flown, when it is not the line.
+    let max_terrain_ft = if lateral.mids.is_empty() {
+        max_terrain_ft
+    } else {
+        let mut pts = vec![(from.lat, from.lon)];
+        pts.extend(lateral.mids.iter().map(|w| (w.lat, w.lon)));
+        pts.push((to.lat, to.lon));
+        let along = crate::route_finder::path_samples(&pts, 24);
+        match (max_terrain_ft, terrain::max_elevation_ft(xp, &along).await) {
+            (Some(a), Some(b)) => Some(a.max(b)),
+            (a, b) => a.or(b),
+        }
+    };
+    let route_nm = if lateral.mids.is_empty() { dist_nm } else { lateral.distance_nm };
     let burn = profile
         .fuel
         .as_ref()
@@ -581,10 +629,11 @@ pub(crate) async fn plan_flight(
         bearing_deg: bearing,
         cruise_alt_ft,
         max_terrain_ft,
-        fuel: flightplan::fuel_plan(dist_nm, cruise_kts, burn),
+        fuel: flightplan::fuel_plan(route_nm, cruise_kts, burn),
         cruise_kts,
         aboard_kg: fuel_kg.ok(),
         aircraft: profile.display_name.clone(),
+        lateral,
     };
     blackbox::record(
         "flightplan",
@@ -599,6 +648,17 @@ pub(crate) async fn plan_flight(
             "block_kg": planned.fuel.as_ref().map(|f| f.block_kg),
             "aboard_kg": planned.aboard_kg,
             "load": req.load,
+            "via": planned.lateral.via.label(),
+            "route": planned.lateral.route,
+            "route_nm": (route_nm * 10.0).round() / 10.0,
+            "fixes": planned.lateral.mids.len(),
+            "avoided": match &planned.lateral.via {
+                crate::route_finder::Via::AroundAirspace { avoided } => avoided.clone(),
+                _ => Vec::new(),
+            },
+            "crossed": planned.lateral.crossed,
+            "at_fields": planned.lateral.at_fields,
+            "ifr": pressurised,
         }),
     );
     let fp = planned.to_flight_plan();
