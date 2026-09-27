@@ -223,6 +223,12 @@ Config: `XCOPILOT_ATC_AIRPORT` / `_VOICE` / `_RATE` / `_REGION`.
 - Readbacks enforced for runway-critical items (`XCOPILOT_ATC_READBACK=false` coaches only); the
   zone clearance's readback is suggested, never enforced. A departure check-in is answered with the
   climb it announced (`climb_announced`).
+- **IFR clearance** (`Intent::RequestIfrClearance`: "IFR clearance to X", "clearance to <place>",
+  "ready to copy"; a bare "request clearance" stays the zone one): destination from the region
+  index or "say again destination"; SID off the runway in use whose exit points at the
+  destination (`nav::sid_toward`, else runway heading, never invented); 5,000 ft or field + 3,000;
+  ICAO or FAA phrasing; SID, altitude and code read back ENFORCED; the crew sees it only once
+  accepted (`party_line::assigned_clearance`).
 - Runway in use: calm wind follows the arrival stream (`arrival_end`); FROZEN while a departure or
   arrival is committed, with wind hysteresis (parallels flip-flop invisibly); an arrival's STATED
   runway stands inside the margin (`note_stated_runway`). LinedUp and conditional line-up.
@@ -392,7 +398,9 @@ everything blackboxes to `logs/blackbox.jsonl` (kinds: `atc`, `autotaxi`, `autot
   SID joining furthest along (`nav::sids_for_route`, `full_auto::choose_departure`); a METAR
   favouring another end gets its STAR entering earliest (`nav::stars_for_route`,
   `plan_audit::choose_arrival`, `star_chosen`). Either reloads the GPS
-  (`full_auto::payload_with_legs`).
+  (`full_auto::payload_with_legs`). A cleared SID that serves the runway is flown first
+  (`prefer_cleared_sid`, `departure_rechosen` source cleared|chosen), and the climb is capped at the
+  cleared altitude until the departure check-in (`procedure::hold_at_cleared`).
 - **Charts are flown**: SID minimums (`nav::sid_minimums` from `sid_ident` / `plan_rwy`, as
   `climb_minimums`) are judged at the arm (`departure_gradients`), climbed at best rate and watched
   (`watch_minimum`, a miss handed over). STAR windows (`nav::star_constraints`, `star_ident`,
