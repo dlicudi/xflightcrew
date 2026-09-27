@@ -753,6 +753,13 @@ const ARRIVAL_SPEED_LEAD_NM: f64 = 2.0;
 /// (a limit holds from its fix on) and every one ahead whose slow-down has
 /// begun, at [`ARRIVAL_DECEL_KTS_S`] from `ias_kts` plus the lead. `(knots,
 /// fix)`; `None` when nothing applies yet.
+///
+/// A limit whose slow-down has BEGUN holds (`begun`, the legs' indices,
+/// carried tick to tick): the start is judged from the speed still to lose,
+/// so an aircraft slowing at the planned rate rides the boundary and the
+/// limit came and went with it. EGKK-EGBB (2026-09-27, #126): OSKOT's 210
+/// against 250, 8.9 nm out at 257 kt, flipped the governor's target five
+/// times in 27 s, and each flip moved the speedbrake, said aloud.
 pub fn arrival_speed_cap(
     legs: &[ProcLeg],
     cons: &[crate::nav::StarConstraint],
@@ -761,17 +768,21 @@ pub fn arrival_speed_cap(
     lon: f64,
     ias_kts: f64,
     gs_kts: f64,
+    begun: &mut std::collections::HashSet<usize>,
 ) -> Option<(f64, String)> {
     let mut cap: Option<(f64, String)> = None;
     for (k, leg) in legs.iter().enumerate() {
         let Some(kts) = restriction_at(cons, leg).and_then(|c| c.max_kts) else {
             continue;
         };
-        let applies = k < idx || {
+        let applies = k < idx || begun.contains(&k) || {
             let d = distance_to_leg_nm(lat, lon, legs, idx, k);
             let slow_nm = (ias_kts - kts).max(0.0) / ARRIVAL_DECEL_KTS_S * gs_kts.max(60.0) / 3600.0;
             d <= slow_nm + ARRIVAL_SPEED_LEAD_NM
         };
+        if applies {
+            begun.insert(k);
+        }
         if applies && cap.as_ref().is_none_or(|(c, _)| kts < *c) {
             cap = Some((kts, leg.fix_ident.clone()));
         }
@@ -1346,6 +1357,17 @@ const DRAG_OUT_KTS: f64 = 8.0;
 const DRAG_IN_KTS: f64 = 3.0;
 /// A commanded descent gentler than this is not one the brakes are for.
 const DRAG_MIN_DESCENT_FPM: f64 = 500.0;
+/// A brake already out stays out through a level-off or a shallowing path
+/// (the speed is still owed); only a commanded CLIMB past this puts it in.
+/// The descent gate alone put it in 5 s after it went out at 216 kt when the
+/// VS law eased to +131 fpm on a level-off (EGKK-EGBB +2739, 2026-09-27).
+const DRAG_KEEP_BELOW_FPM: f64 = 300.0;
+/// Seconds the brake keeps a state before the speed rule may change it
+/// (the configuration bar and a lost target still act at once).
+const DRAG_MIN_HOLD_S: f64 = 15.0;
+/// Seconds between spoken speedbrake calls: a change sooner than this is
+/// flown and blackboxed, not said.
+const DRAG_SPEAK_GAP_S: f64 = 120.0;
 
 /// What a descent that is running away with the speed gets: whether the
 /// speedbrake should be out, and the fraction of the commanded rate to fly.
@@ -1356,9 +1378,19 @@ const DRAG_MIN_DESCENT_FPM: f64 = 500.0;
 /// governor with no drag device can only watch a descent accelerate. A crew
 /// pulls the speedbrake, and if that is not enough it shallows the descent:
 /// the speed is owed to the approach that starts at the bottom, the height
-/// can be lost later. Pure; `out` is the brake's state going in.
+/// can be lost later. Pure; `out` is the brake's state going in, `held_s`
+/// how long it has had it (`f64::INFINITY` when it never changed).
+///
+/// EGKK-EGBB, 2026-09-27 (sortie 1790541304-full_auto, #126): out and in
+/// around the approach's 210.25 at +2621/+2691, +2735/+2739 and +2962/+3004,
+/// every change spoken. Two of the three "in"s were the descent gate, not
+/// the speed: the VS law easing through -500 fpm at a level-off with the
+/// aircraft still 6 and 13 kt fast. Out, the brake now stays out through a
+/// level-off until the speed is in or a climb is commanded, and neither
+/// state is left inside [`DRAG_MIN_HOLD_S`].
 pub fn descent_drag(
     out: bool,
+    held_s: f64,
     ias_kts: f64,
     target_kts: Option<f64>,
     vs_cmd_fpm: f64,
@@ -1366,15 +1398,16 @@ pub fn descent_drag(
     let Some(target) = target_kts else {
         return (false, 1.0);
     };
-    if vs_cmd_fpm > -DRAG_MIN_DESCENT_FPM {
-        return (false, 1.0);
-    }
     let over = ias_kts - target;
+    let settled = held_s >= DRAG_MIN_HOLD_S;
     let want_out = if out {
-        over > DRAG_IN_KTS
+        vs_cmd_fpm < DRAG_KEEP_BELOW_FPM && (over > DRAG_IN_KTS || !settled)
     } else {
-        over > DRAG_OUT_KTS
+        vs_cmd_fpm <= -DRAG_MIN_DESCENT_FPM && over > DRAG_OUT_KTS && settled
     };
+    if vs_cmd_fpm > -DRAG_MIN_DESCENT_FPM {
+        return (want_out, 1.0);
+    }
     let scale = if over > 20.0 {
         0.5
     } else if over > 12.0 {
@@ -1383,6 +1416,56 @@ pub fn descent_drag(
         1.0
     };
     (want_out, scale)
+}
+
+/// Minutes of the commanded rate inside which a VS mode that drops heading
+/// for the dial is the autopilot's own altitude capture.
+const CAPTURE_LEAD_MIN: f64 = 0.2;
+
+/// Whether a VS mode found OFF is the autopilot capturing, to be left alone:
+/// near the follower's target, or inside the capture band of the DIAL (the
+/// level this movement ends at) while heading for it. EGKK-EGBB (2026-09-27,
+/// sortie 1790541304-full_auto +2295 and +3001): the 737 began capturing
+/// HON's 9,000 202 ft above it at 1,960 fpm down and FI33's 1,800 246 ft
+/// above it at 1,500; the path target was 134 and 148 ft below, so the old
+/// 100 ft test called it a dropped mode, re-engaged VS, and the dial write
+/// read back 0 (`write_unconfirmed vertical_velocity want -1900 actual 0`),
+/// one tick lost and the capture undone. Pure.
+pub fn vs_mode_capturing(alt_ft: f64, want_alt: f64, dial_ft: f64, vs_cmd_fpm: f64) -> bool {
+    if (want_alt - alt_ft).abs() <= 100.0 {
+        return true;
+    }
+    let band = (vs_cmd_fpm.abs() * CAPTURE_LEAD_MIN).max(100.0);
+    (dial_ft - alt_ft).abs() <= band && (dial_ft - alt_ft) * vs_cmd_fpm >= 0.0
+}
+
+/// Which speedbrake changes are SAID: an extension when nothing about the
+/// brake was said for [`DRAG_SPEAK_GAP_S`], and the stow of an extension
+/// that was said (never an orphan "Speedbrake in."). Every change is still
+/// flown and blackboxed. EGKK-EGBB (2026-09-27, #126) said "Speedbrake." /
+/// "Speedbrake in." thirteen times on one arrival, seven of them in 46 s.
+/// Pure: `t` is seconds on any clock.
+#[derive(Debug, Default, Clone)]
+pub struct DragVoice {
+    last_said: Option<f64>,
+    out_said: bool,
+}
+
+impl DragVoice {
+    /// Whether the change to `out` at `t` is spoken.
+    pub fn say(&mut self, out: bool, t: f64) -> bool {
+        let due = if out {
+            let due = self.last_said.is_none_or(|l| t - l >= DRAG_SPEAK_GAP_S);
+            self.out_said = due;
+            due
+        } else {
+            std::mem::take(&mut self.out_said)
+        };
+        if due {
+            self.last_said = Some(t);
+        }
+        due
+    }
 }
 
 /// Why the speedbrake may not be out in this configuration, if it may not:
@@ -2117,6 +2200,14 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, plan: Pla
     }
 
     let mut said_star_speed: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // The STAR speed limits whose slow-down has begun: held from then on
+    // (`arrival_speed_cap`).
+    let mut star_speed_begun: std::collections::HashSet<usize> = std::collections::HashSet::new();
+    // The speedbrake's last change and which changes are said (`descent_drag`,
+    // `DragVoice`).
+    let mut drag_changed: Option<std::time::Instant> = None;
+    let mut drag_voice = DragVoice::default();
+    let drag_clock = std::time::Instant::now();
     let mut star_ceiling_logged: Option<usize> = None;
     // The lowest ceiling seen on the leg flying (`ceilinged_leg_alt`).
     let mut ceiling_latch: Option<(usize, f64)> = None;
@@ -2339,7 +2430,7 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, plan: Pla
             // The pilot's speed outranks the plan's, as their altitude does.
             let planned = pilot_speed().unwrap_or(planned);
             // The STAR's speed limits: slowed in time for each, held after.
-            let star_cap = arrival_speed_cap(&legs, &arrival_constraints, idx, lat, lon, ias, gs * MS_TO_KTS);
+            let star_cap = arrival_speed_cap(&legs, &arrival_constraints, idx, lat, lon, ias, gs * MS_TO_KTS, &mut star_speed_begun);
             let planned = match &star_cap {
                 Some((kts, fix)) if *kts < planned => {
                     if said_star_speed.insert(fix.clone()) {
@@ -2930,8 +3021,9 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, plan: Pla
         // where the airframe has one, a shallower rate either way.
         {
             let ours = DRAG_OURS.load(Ordering::SeqCst);
+            let held_s = drag_changed.map_or(f64::INFINITY, |c: std::time::Instant| c.elapsed().as_secs_f64());
             let (want_out, scale) =
-                descent_drag(ours, ias, crate::tools::speedhold::flight_target(), vs_cmd);
+                descent_drag(ours, held_s, ias, crate::tools::speedhold::flight_target(), vs_cmd);
             vs_cmd *= scale;
             let has_speedbrake = crate::takeoff_config::has_speedbrake();
             // Never with flap or gear (`drag_barred`), read only while the
@@ -2961,22 +3053,27 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, plan: Pla
                 if let Some(v) = write {
                     if xp.set_float(SPEEDBRAKE, v).await.is_ok() {
                         DRAG_OURS.store(want_out, Ordering::SeqCst);
+                        drag_changed = Some(std::time::Instant::now());
+                        let said = drag_voice.say(want_out, drag_clock.elapsed().as_secs_f64());
                         crate::blackbox::record(
                             "procedure",
                             serde_json::json!({"event": "speedbrake", "out": want_out,
                                 "ias": ias, "target": crate::tools::speedhold::flight_target(),
-                                "vs_cmd": vs_cmd,
+                                "vs_cmd": vs_cmd, "held_s": held_s.is_finite().then_some(held_s),
+                                "said": said,
                                 "why": if want_out { "speed" } else { barred.unwrap_or("speed") }}),
                         );
-                        alert(
-                            &voice,
-                            Priority::Advisory,
-                            if want_out {
-                                "Speedbrake."
-                            } else {
-                                "Speedbrake in."
-                            },
-                        );
+                        if said {
+                            alert(
+                                &voice,
+                                Priority::Advisory,
+                                if want_out {
+                                    "Speedbrake."
+                                } else {
+                                    "Speedbrake in."
+                                },
+                            );
+                        }
                     }
                 }
             }
@@ -2985,7 +3082,7 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, plan: Pla
             // VS mode gone NEAR the target means the preselect CAPTURED —
             // its hold is the clean level-off, leave it flying. Far from the
             // target it's a dropped mode: re-engage and rewrite the dial.
-            if (want_alt - alt_ft).abs() > 100.0 {
+            if !vs_mode_capturing(alt_ft, want_alt, dial, vs_cmd) {
                 last_vs_cmd = None; // engage can sync the dial even if the response is lost
                 if xp.run_command(CMD_VS_MODE).await.is_err() {
                     continue;
@@ -3373,29 +3470,33 @@ mod tests {
     fn a_descent_that_outruns_the_governor_gets_drag_then_a_shallower_rate() {
         // Through ten thousand, 8 over: not yet. 9 over: brakes.
         assert_eq!(
-            descent_drag(false, 258.0, Some(250.0), -2000.0),
+            descent_drag(false, f64::INFINITY, 258.0, Some(250.0), -2000.0),
             (false, 1.0)
         );
         assert_eq!(
-            descent_drag(false, 259.0, Some(250.0), -2000.0),
+            descent_drag(false, f64::INFINITY, 259.0, Some(250.0), -2000.0),
             (true, 1.0)
         );
         // Out, they stay out until the speed is nearly back...
-        assert_eq!(descent_drag(true, 254.0, Some(250.0), -2000.0), (true, 1.0));
+        assert_eq!(descent_drag(true, f64::INFINITY, 254.0, Some(250.0), -2000.0), (true, 1.0));
         assert_eq!(
-            descent_drag(true, 252.0, Some(250.0), -2000.0),
+            descent_drag(true, f64::INFINITY, 252.0, Some(250.0), -2000.0),
             (false, 1.0)
         );
         // ...and a runaway shallows the descent as well.
         assert_eq!(
-            descent_drag(true, 267.0, Some(250.0), -2000.0),
+            descent_drag(true, f64::INFINITY, 267.0, Some(250.0), -2000.0),
             (true, 0.75)
         );
-        assert_eq!(descent_drag(true, 278.0, Some(250.0), -2000.0), (true, 0.5));
-        // Level, climbing, or with no governor target: nothing.
-        assert_eq!(descent_drag(true, 278.0, Some(250.0), 0.0), (false, 1.0));
-        assert_eq!(descent_drag(false, 278.0, Some(250.0), 800.0), (false, 1.0));
-        assert_eq!(descent_drag(false, 278.0, None, -2000.0), (false, 1.0));
+        assert_eq!(descent_drag(true, f64::INFINITY, 278.0, Some(250.0), -2000.0), (true, 0.5));
+        // Never put out level or climbing; one already out stays out
+        // through a level-off (the speed is still owed) and comes in for a
+        // commanded climb (#126). No governor target: nothing.
+        assert_eq!(descent_drag(false, f64::INFINITY, 278.0, Some(250.0), 0.0), (false, 1.0));
+        assert_eq!(descent_drag(true, f64::INFINITY, 278.0, Some(250.0), 0.0), (true, 1.0));
+        assert_eq!(descent_drag(true, f64::INFINITY, 278.0, Some(250.0), 800.0), (false, 1.0));
+        assert_eq!(descent_drag(false, f64::INFINITY, 278.0, Some(250.0), 800.0), (false, 1.0));
+        assert_eq!(descent_drag(false, f64::INFINITY, 278.0, None, -2000.0), (false, 1.0));
     }
 
     /// EGKK 26L, 2026-09-27 (sortie 1790510400-full_auto, stock 737): out at
@@ -3411,7 +3512,7 @@ mod tests {
             .collect();
         // The speed rule, alone, wanted it out at the sortie's numbers...
         assert_eq!(
-            descent_drag(false, 218.36, Some(210.25), -2000.0),
+            descent_drag(false, f64::INFINITY, 218.36, Some(210.25), -2000.0),
             (true, 1.0)
         );
         // ...clean it may be, and flaps 1 is still the clean descent...
@@ -3428,13 +3529,192 @@ mod tests {
         assert_eq!(drag_barred(0.0, false, &[]), None);
         // The 5 s re-deployment at full flap: 153.6 kt against 145 and
         // 968 fpm down is out by speed, in by configuration.
-        assert_eq!(descent_drag(false, 153.56, Some(145.0), -967.7).0, true);
+        assert_eq!(descent_drag(false, f64::INFINITY, 153.56, Some(145.0), -967.7).0, true);
         assert_eq!(drag_barred(1.0, true, &b738), Some("gear"));
         // A runaway still shallows the descent with the brake barred.
         assert_eq!(
-            descent_drag(false, 235.0, Some(210.0), -2000.0),
+            descent_drag(false, f64::INFINITY, 235.0, Some(210.0), -2000.0),
             (true, 0.5)
         );
+    }
+
+    /// EGKK-EGBB, 2026-09-27 (sortie 1790541304-full_auto, #126), the
+    /// approach at 210.25 kt: (seconds after +2600, the state records' IAS,
+    /// the VS law's command rebuilt from the leg records' altitude and
+    /// target). The old rule put the brake out and in three times, once in
+    /// under 2 s at a level-off 8 kt fast, and said every change.
+    #[rustfmt::skip]
+    const EGBB_APPROACH: &[(f64, f64, f64)] = &[
+            (5.9, 210.4, 10.0), (7.5, 210.1, 10.0), (9.3, 209.6, -2000.0), (11.0, 209.2, -2000.0),
+            (12.7, 209.4, -2000.0), (14.4, 210.3, -2000.0), (16.1, 211.7, -2000.0), (17.9, 213.6, -2000.0),
+            (19.3, 215.6, -2000.0), (20.9, 217.0, -2000.0), (22.4, 218.6, -2000.0), (24.1, 219.7, -2000.0),
+            (25.8, 220.3, -2000.0), (27.5, 220.9, -2000.0), (29.2, 221.6, -2000.0), (30.9, 222.4, -2000.0),
+            (32.6, 222.9, -2000.0), (34.4, 223.2, -2000.0), (36.1, 223.3, -2000.0), (37.9, 223.5, -2000.0),
+            (39.6, 223.9, -2000.0), (41.3, 223.8, -2000.0), (43.0, 223.5, -2000.0), (44.8, 223.2, -2000.0),
+            (46.4, 223.0, -1966.0), (48.1, 222.5, -1910.0), (49.8, 221.9, -1919.0), (51.5, 222.0, -2000.0),
+            (53.2, 222.4, -2000.0), (54.9, 222.6, -2000.0), (56.5, 222.5, -2000.0), (58.1, 222.2, -2000.0),
+            (59.8, 222.1, -2000.0), (61.5, 222.3, -2000.0), (63.0, 222.3, -1983.0), (64.7, 222.3, -1956.0),
+            (66.4, 222.5, -1732.0), (68.1, 222.5, -1855.0), (69.3, 222.4, -1743.0), (71.0, 222.3, -1760.0),
+            (72.7, 222.1, -1742.0), (74.4, 222.0, -1724.0), (76.1, 222.0, -2000.0), (77.8, 221.9, -1542.0),
+            (79.6, 221.9, -1380.0), (81.3, 222.4, -1348.0), (83.0, 222.4, -1093.0), (84.6, 221.9, -847.0),
+            (86.3, 220.8, -674.0), (88.0, 218.8, -584.0), (89.7, 216.4, -534.0), (91.4, 214.3, -735.0),
+            (93.2, 212.1, -872.0), (94.6, 210.3, -946.0), (96.2, 209.0, -1080.0), (97.9, 207.8, -1814.0),
+            (99.6, 207.8, -1969.0), (101.2, 209.1, -2000.0), (102.9, 211.3, -2000.0), (104.6, 213.1, -1895.0),
+            (106.3, 214.6, -1466.0), (107.9, 215.6, -1208.0), (109.5, 215.9, -930.0), (111.2, 216.1, -536.0),
+            (112.8, 215.7, -582.0), (114.5, 214.8, -323.0), (116.2, 213.1, -279.0), (117.9, 211.3, -354.0),
+            (119.6, 209.2, -392.0), (121.0, 207.8, -524.0), (122.6, 207.4, -816.0), (124.3, 207.0, -1059.0),
+            (125.9, 206.9, -1221.0), (127.3, 207.7, -1362.0), (129.0, 209.1, -1805.0), (130.7, 212.0, -1446.0),
+            (132.5, 215.1, -1040.0), (134.1, 217.2, -982.0), (135.5, 218.3, -663.0), (137.2, 218.5, -305.0),
+            (138.8, 217.7, -38.0), (140.5, 216.7, 164.0), (142.2, 215.7, 209.0), (144.2, 214.5, 213.0),
+            (145.9, 213.4, 187.0), (147.3, 211.9, 145.0), (148.8, 210.6, 120.0), (150.5, 208.9, 80.0),
+            (152.1, 206.9, 69.0), (153.8, 205.8, 67.0), (155.5, 205.8, 74.0), (157.2, 206.7, 76.0),
+            (159.0, 208.2, 78.0), (339.6, 213.3, 28.0), (341.3, 212.7, -1131.0), (342.8, 211.9, -1326.0),
+            (344.3, 211.1, -1384.0), (346.0, 210.3, -1397.0), (347.5, 209.7, -1550.0), (349.2, 209.0, -1776.0),
+            (350.7, 208.9, -2000.0), (352.4, 209.2, -2000.0), (354.1, 210.2, -2000.0), (355.8, 212.4, -2000.0),
+            (357.5, 214.1, -2000.0), (359.2, 215.5, -2000.0), (361.0, 216.9, -2000.0), (362.7, 218.2, -2000.0),
+            (364.4, 219.7, -2000.0), (366.1, 220.8, -2000.0), (367.8, 222.1, -2000.0), (369.4, 222.9, -2000.0),
+            (371.2, 223.4, -1811.0), (372.8, 223.3, -1770.0), (374.5, 223.6, -1839.0), (376.2, 223.4, -1855.0),
+            (377.9, 222.9, -1822.0), (379.6, 222.7, -1740.0), (381.0, 222.2, -1961.0), (382.7, 222.3, -2000.0),
+            (384.4, 222.8, -1988.0), (386.1, 223.2, -1722.0), (387.8, 223.1, -1990.0), (389.4, 223.5, -2000.0),
+            (391.1, 224.0, -1852.0), (392.9, 223.9, -1864.0), (394.6, 223.6, -1773.0), (396.3, 223.6, -1889.0),
+            (397.9, 223.0, -2000.0), (399.6, 222.5, -1897.0), (401.3, 222.0, -1898.0), (403.0, 222.0, -1943.0),
+            (404.7, 223.1, -1109.0), (406.5, 222.4, -271.0), (408.2, 221.6, -184.0), (409.6, 221.5, -184.0),
+    ];
+
+    /// The recorded approach through the old rule and the new: every change
+    /// `(t, out)`, and which are said.
+    fn replay_drag(new: bool) -> (Vec<(f64, bool)>, Vec<(f64, bool)>) {
+        const TARGET: f64 = 210.25;
+        let (mut out, mut since) = (false, f64::NEG_INFINITY);
+        let mut voice = DragVoice::default();
+        let (mut changes, mut said) = (Vec::new(), Vec::new());
+        for &(t, ias, vs) in EGBB_APPROACH {
+            let want = if new {
+                descent_drag(out, t - since, ias, Some(TARGET), vs).0
+            } else {
+                // The rule as flown: the descent gate, then 8 out / 3 in.
+                vs <= -DRAG_MIN_DESCENT_FPM
+                    && if out { ias - TARGET > DRAG_IN_KTS } else { ias - TARGET > DRAG_OUT_KTS }
+            };
+            if want != out {
+                out = want;
+                since = t;
+                changes.push((t, out));
+                if !new || voice.say(out, t) {
+                    said.push((t, out));
+                }
+            }
+        }
+        (changes, said)
+    }
+
+    /// #126: out and in around the approach speed, every change spoken.
+    #[test]
+    fn the_speedbrake_holds_through_a_level_off_and_is_said_once() {
+        let (old, old_said) = replay_drag(false);
+        // As flown: three extensions, one stowed within 2 s by the gate at
+        // a level-off still 8 kt fast, and all six said.
+        assert_eq!(old.iter().filter(|c| c.1).count(), 3, "{old:?}");
+        assert!(old.windows(2).any(|w| w[0].1 && !w[1].1 && w[1].0 - w[0].0 < 5.0), "{old:?}");
+        assert_eq!(old_said.len(), 6);
+        let (new, said) = replay_drag(true);
+        // Every state is held at least the minimum.
+        for w in new.windows(2) {
+            assert!(w[1].0 - w[0].0 >= DRAG_MIN_HOLD_S, "{new:?}");
+        }
+        // Never stowed while still fast and not climbing: the level-offs at
+        // +2739 and +3004 keep it out.
+        for &(t, out) in &new {
+            if !out {
+                let &(_, ias, vs) = EGBB_APPROACH.iter().find(|r| r.0 == t).unwrap();
+                assert!(ias - 210.25 <= DRAG_IN_KTS || vs >= DRAG_KEEP_BELOW_FPM, "in at {t}: {ias} {vs}");
+            }
+        }
+        assert_eq!(new.last().map(|c| c.1), Some(true), "still out 12 kt fast at the handoff");
+        // Said: an extension and its stow, then silence for the quick
+        // re-extension, then the last extension 4 minutes on.
+        assert!(said.len() <= 3, "{said:?}");
+        assert!(said.len() < new.len(), "{said:?} of {new:?}");
+        for w in said.windows(2) {
+            assert!(!w[1].1 || w[1].0 - w[0].0 >= DRAG_SPEAK_GAP_S, "{said:?}");
+        }
+    }
+
+    /// +2295 and +3001 on EGKK-EGBB: the VS mode dropped as the autopilot
+    /// captured the dial, and the follower re-engaged VS over it.
+    #[test]
+    fn a_capture_of_the_dial_is_not_a_dropped_vs_mode() {
+        // HON: 9,202 ft, path 9,068, dial 9,000, -1,900 commanded.
+        assert!(vs_mode_capturing(9_202.0, 9_068.0, 9_000.0, -1_900.0));
+        // FI33: 2,046 ft, path 1,895, dial 1,800.
+        assert!(vs_mode_capturing(2_046.0, 1_895.0, 1_800.0, -1_900.0));
+        // Far from the dial, or moving away from it: a dropped mode.
+        assert!(!vs_mode_capturing(9_900.0, 9_700.0, 9_000.0, -1_900.0));
+        assert!(!vs_mode_capturing(9_202.0, 9_400.0, 9_000.0, 1_500.0));
+        // Near the target, as before.
+        assert!(vs_mode_capturing(5_050.0, 5_000.0, 3_000.0, -1_000.0));
+    }
+
+    #[test]
+    fn a_stowed_speedbrake_is_said_only_when_its_extension_was() {
+        let mut v = DragVoice::default();
+        assert!(v.say(true, 0.0));
+        assert!(v.say(false, 60.0));
+        assert!(!v.say(true, 100.0), "40 s after the last call");
+        assert!(!v.say(false, 130.0), "its extension was not said");
+        assert!(v.say(true, 300.0));
+    }
+
+    /// #126: OSKOT's 210 on EGKK-EGBB (2026-09-27, +2370 to +2440), the
+    /// leg records' distance with the state records' IAS and groundspeed
+    /// (every other tick). Judged afresh each tick, the limit came and went
+    /// as the aircraft slowed at the planned rate; begun, it holds.
+    #[test]
+    fn a_star_speed_limit_once_begun_holds() {
+        #[rustfmt::skip]
+        let recorded: &[(f64, f64, f64)] = &[
+            (10.19, 248.8, 261.0), (10.10, 248.8, 261.0), (10.03, 248.1, 260.0), (9.94, 247.6, 259.0),
+            (9.86, 247.4, 259.0), (9.78, 247.8, 260.0), (9.70, 248.5, 261.0), (9.62, 249.5, 262.0),
+            (9.53, 250.6, 263.0), (9.45, 251.8, 265.0), (9.37, 252.7, 266.0), (9.29, 253.8, 267.0),
+            (9.21, 254.7, 268.0), (9.12, 255.6, 268.0), (9.04, 256.2, 269.0), (8.96, 256.5, 269.0),
+            (8.86, 256.6, 269.0), (8.77, 256.6, 269.0), (8.68, 256.2, 268.0), (8.60, 255.7, 267.0),
+            (8.52, 255.2, 267.0), (8.43, 254.7, 265.0), (8.34, 253.7, 264.0), (8.26, 252.9, 263.0),
+            (8.18, 252.2, 262.0), (8.10, 251.8, 262.0), (8.01, 251.5, 261.0), (7.92, 251.4, 261.0),
+            (7.84, 251.4, 261.0), (7.76, 251.0, 261.0), (7.68, 250.5, 261.0), (7.59, 249.9, 260.0),
+            (7.51, 249.4, 259.0), (7.43, 248.8, 258.0), (7.34, 248.0, 257.0), (7.25, 247.0, 256.0),
+            (7.17, 246.3, 255.0), (7.09, 245.8, 255.0), (7.01, 245.6, 255.0), (6.92, 245.9, 255.0),
+            (6.84, 246.4, 256.0), (6.76, 247.1, 256.0), (6.68, 247.0, 256.0), (6.60, 246.3, 255.0),
+            (6.51, 245.4, 254.0), (6.43, 244.5, 253.0), (6.35, 243.8, 252.0), (6.26, 242.9, 251.0),
+            (6.19, 242.2, 250.0), (6.11, 241.5, 249.0), (6.03, 240.8, 248.0), (5.94, 240.0, 247.0),
+            (5.86, 238.9, 246.0), (5.78, 238.1, 245.0), (5.70, 237.4, 245.0), (5.62, 237.0, 244.0),
+            (5.54, 237.3, 245.0), (5.47, 237.8, 246.0), (5.39, 238.1, 246.0), (5.31, 237.9, 246.0),
+            (5.23, 237.9, 246.0),
+        ];
+        let legs = vec![leg("HON", 1.0, 0.0), leg("OSKOT", 0.0, 0.0)];
+        let cons = vec![crate::nav::StarConstraint {
+            fix: "OSKOT".into(),
+            min_ft: None,
+            max_ft: None,
+            max_kts: Some(210.0),
+        }];
+        let caps = |fresh: bool| {
+            let mut begun = std::collections::HashSet::new();
+            recorded
+                .iter()
+                .map(|&(d, ias, gs)| {
+                    if fresh {
+                        begun.clear();
+                    }
+                    arrival_speed_cap(&legs, &cons, 1, -d / 60.0, 0.0, ias, gs, &mut begun).map(|c| c.0)
+                })
+                .collect::<Vec<_>>()
+        };
+        let flips = |v: &[Option<f64>]| v.windows(2).filter(|w| w[0] != w[1]).count();
+        let old = caps(true);
+        assert!(flips(&old) >= 3, "the limit came and went: {old:?}");
+        let new = caps(false);
+        assert_eq!(flips(&new), 1, "{new:?}");
+        assert_eq!(new.last(), Some(&Some(210.0)));
     }
 
     use super::*;
@@ -3888,7 +4168,8 @@ mod tests {
         let mut alt = 37_000.0;
         let (mut carry, mut prev) = (alt, alt);
         let mut latch = None;
-        let mut drag_out = false;
+        let (mut drag_out, mut drag_held) = (false, f64::INFINITY);
+        let mut begun = std::collections::HashSet::new();
         let (mut lag1, mut vs) = (0.0f64, 0.0f64);
         let mut dial_queue: std::collections::VecDeque<f64> = std::collections::VecDeque::new();
         let mut crossings = Vec::new();
@@ -3918,8 +4199,9 @@ mod tests {
             carry = v.carry;
             prev = v.prev_cmd;
             let mut cmd = vs_law_fpm(v.want_alt, alt, v.target_fpm, RATE, 1_500.0);
-            let target = arrival_speed_cap(&legs, &cons, idx, lat, lon, ias, gs).map_or(255.0, |c| c.0);
-            let (out, scale) = descent_drag(drag_out, ias, Some(target), cmd);
+            let target = arrival_speed_cap(&legs, &cons, idx, lat, lon, ias, gs, &mut begun).map_or(255.0, |c| c.0);
+            let (out, scale) = descent_drag(drag_out, drag_held, ias, Some(target), cmd);
+            drag_held = if out == drag_out { drag_held + dt } else { 0.0 };
             drag_out = out;
             cmd *= scale;
             dial_queue.push_back(vs_dial_fpm(cmd));
@@ -3963,13 +4245,13 @@ mod tests {
     fn a_stars_speed_limits_start_in_time_and_hold_after() {
         let (legs, cons) = star_route();
         // 20 nm short of HAVEN at 290 kt: nothing yet.
-        assert_eq!(arrival_speed_cap(&legs, &cons, 1, 10.0 / 60.0, 0.0, 290.0, 400.0), None);
+        assert_eq!(arrival_speed_cap(&legs, &cons, 1, 10.0 / 60.0, 0.0, 290.0, 400.0, &mut Default::default()), None);
         // 40 kt to lose at 0.5 kt/s is 80 s, 8.9 nm at 400 kt, plus 2.
-        let near = arrival_speed_cap(&legs, &cons, 1, 20.0 / 60.0, 0.0, 290.0, 400.0);
+        let near = arrival_speed_cap(&legs, &cons, 1, 20.0 / 60.0, 0.0, 290.0, 400.0, &mut Default::default());
         assert_eq!(near, Some((250.0, "HAVEN".to_string())));
         // Past HAVEN the 250 holds; nearing TARTN its 230 takes over.
-        assert_eq!(arrival_speed_cap(&legs, &cons, 2, 31.0 / 60.0, 0.0, 250.0, 300.0).unwrap().0, 250.0);
-        assert_eq!(arrival_speed_cap(&legs, &cons, 3, 66.0 / 60.0, 0.0, 250.0, 300.0).unwrap().0, 230.0);
+        assert_eq!(arrival_speed_cap(&legs, &cons, 2, 31.0 / 60.0, 0.0, 250.0, 300.0, &mut Default::default()).unwrap().0, 250.0);
+        assert_eq!(arrival_speed_cap(&legs, &cons, 3, 66.0 / 60.0, 0.0, 250.0, 300.0, &mut Default::default()).unwrap().0, 230.0);
     }
 
     fn leg(fix_ident: &str, lat: f64, lon: f64) -> ProcLeg {
