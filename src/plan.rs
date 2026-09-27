@@ -850,6 +850,13 @@ pub(crate) fn wrong_plan_complaint(tl: &str) -> bool {
     wrong && plan
 }
 
+/// One plan and another are the same FLIGHT: origin, destination and the
+/// airway string, never the timestamp (a plan re-served unchanged is still
+/// the same plan). The "wrong plan" check and full auto's arm share it.
+pub(crate) fn same_route(a: &simbrief::FlightPlan, b: &simbrief::FlightPlan) -> bool {
+    a.origin == b.origin && a.destination == b.destination && a.route == b.route
+}
+
 /// What a forced re-fetch after "wrong plan" found. Compares route identity
 /// (origin, destination, airway string), never the timestamp: a SimBrief
 /// plan re-served unchanged is still the same plan.
@@ -869,9 +876,7 @@ pub(crate) fn plan_change_line(
             after.origin, after.destination
         );
     }
-    let same = before.is_some_and(|b| {
-        b.origin == after.origin && b.destination == after.destination && b.route == after.route
-    });
+    let same = before.is_some_and(|b| same_route(b, after));
     if same {
         format!(
             "SimBrief still has {} to {}. Generate the new plan there, then say load the flight \

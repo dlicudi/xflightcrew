@@ -148,6 +148,10 @@ pub struct FullAuto {
     pub landing_distance_ft: Option<f64>,
     pub takeoff_distance_ft: Option<f64>,
     pub max_gross_lb: Option<f64>,
+    /// Whether the arm may load this airframe from the plan (#95), and the
+    /// airframe's name for the line that says it will not.
+    pub load_sheet: crate::aircraft::LoadSheet,
+    pub airframe: String,
     /// Flap-handle ratio set for takeoff and retracted climbing out (profile's
     /// `flaps.takeoff_ratio`); `None` leaves the flaps alone.
     pub takeoff_flap_ratio: Option<f64>,
@@ -703,12 +707,39 @@ impl FullAuto {
         ))
     }
 
-    /// Fetch the SimBrief OFP and distil it to a flyable [`Mission::Flight`] —
-    /// or an honest spoken refusal (no plan, no waypoints, or a plan that
-    /// departs somewhere we aren't).
+    /// The Flight mission's arm, with what it did on the way said first: a
+    /// changed or stale plan and the load (#95) ride ahead of the ack, and
+    /// ahead of a refusal, which then names the number the load left.
     async fn build_flight_mission(
         &self,
         ctx: &ToolCtx<'_>,
+    ) -> std::result::Result<(Mission, String), String> {
+        let mut notes: Vec<String> = Vec::new();
+        let built = self.flight_mission(ctx, &mut notes).await;
+        let said = |line: String| {
+            notes
+                .iter()
+                .cloned()
+                .chain(std::iter::once(line))
+                .filter(|l| !l.is_empty())
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+        match built {
+            Ok((mission, ack)) => Ok((mission, said(ack))),
+            Err(why) => Err(said(why)),
+        }
+    }
+
+    /// Fetch the SimBrief OFP and distil it to a flyable [`Mission::Flight`] —
+    /// or an honest spoken refusal (no plan, no waypoints, or a plan that
+    /// departs somewhere we aren't). On the ground and stopped, the plan is
+    /// fetched fresh, the aircraft loaded from it, THEN preflighted: the plan
+    /// the FMS gets is the plan loaded and the plan preflighted (#95).
+    async fn flight_mission(
+        &self,
+        ctx: &ToolCtx<'_>,
+        notes: &mut Vec<String>,
     ) -> std::result::Result<(Mission, String), String> {
         // Airborne, the mission cannot arm — and the refusal must say what
         // DOES fly up here. The origin check below used to answer first,
@@ -727,20 +758,50 @@ impl FullAuto {
                     .to_string(),
             );
         }
-        let mut fp = if let Some(local) = crate::simbrief::local_plan() {
-            local
+        // The plan, fetched fresh (`PlanFetch::Asked`'s rule): a local plan is
+        // the pilot's own and stays; a SimBrief plan is fetched every arm,
+        // because the pilot regenerates it on the website and says the same
+        // words; the shelf flies when the site does not answer, said so.
+        let before = crate::simbrief::loaded_plan();
+        let mut fetch_error: Option<String> = None;
+        let (mut fp, fetch) = if let Some(local) = crate::simbrief::local_plan() {
+            (local, crate::full_auto::ArmFetch::Local)
         } else {
             if ctx.config.simbrief_id.trim().is_empty() {
                 return Err("No flight plan. Say plan a flight to, and a destination, or configure SimBrief.".into());
             }
-            crate::simbrief::fetch(&ctx.config.simbrief_id)
-                .await
-                .map_err(|e| {
+            match crate::simbrief::fetch(&ctx.config.simbrief_id).await {
+                Ok(fp) => {
+                    let judged =
+                        crate::full_auto::ArmFetch::judge(false, true, before.as_ref(), &fp);
+                    // The Route tab's load sheet shows the plan being loaded.
+                    crate::simbrief::publish_plan(&fp);
+                    (fp, judged)
+                }
+                Err(e) => {
                     tracing::warn!("simbrief fetch failed: {e:#}");
-                    "Couldn't fetch your SimBrief plan. Generate one first, or check the ID."
-                        .to_string()
-                })?
+                    fetch_error = Some(format!("{e:#}"));
+                    match before.clone() {
+                        Some(shelf) => (shelf, crate::full_auto::ArmFetch::Fallback),
+                        None => {
+                            return Err("Couldn't fetch your SimBrief plan. Generate one first, \
+                                        or check the ID."
+                                .to_string())
+                        }
+                    }
+                }
+            }
         };
+        crate::full_auto::event(
+            "plan_fetch",
+            json!({
+                "outcome": format!("{fetch:?}").to_lowercase(),
+                "origin": fp.origin, "destination": fp.destination, "route": fp.route,
+                "before": before.as_ref().map(|b| format!("{} {} {}", b.origin, b.route, b.destination)),
+                "error": fetch_error,
+            }),
+        );
+        notes.extend(fetch.line(&fp));
 
         // The plan must depart from where we're parked — flying LEJR's route
         // out of some other field would thread the wrong corridor entirely.
@@ -951,6 +1012,58 @@ impl FullAuto {
             .map(|a| a.name.trim().to_string())
             .filter(|n| !n.is_empty())
             .unwrap_or_else(|| fp.destination.clone());
+
+        // The load sheet, before the preflight judges it (#95): on the
+        // ground and stopped, the halves the aircraft does not already carry
+        // are loaded from THIS plan through the load tool's own path (wings
+        // first, payload into m_fixed, read back). Its refusals are said and
+        // the preflight below then refuses with its number, as ever.
+        let (og, gs, fuel0, payload0) = tokio::join!(
+            ctx.xplane.get_float(crate::datarefs::ON_GROUND_ANY),
+            ctx.xplane.get_float(super::loading::GROUNDSPEED_MS),
+            ctx.xplane.get_float(crate::datarefs::FUEL_TOTAL_KG),
+            ctx.xplane.get_float(crate::datarefs::PAYLOAD_KG),
+        );
+        let stopped = og.is_ok_and(|v| v > 0.5) && gs.is_ok_and(|v| v.abs() < 0.5);
+        let decision = crate::full_auto::arm_load(
+            &fp,
+            stopped,
+            fuel0.as_ref().ok().copied(),
+            payload0.as_ref().ok().copied(),
+            self.load_sheet,
+            &self.airframe,
+        );
+        let (outcome, load_line) = match &decision {
+            crate::full_auto::ArmLoad::Load(what) => {
+                match super::loading::load_from_plan(ctx.xplane, &fp, *what).await {
+                    Ok(line) => (crate::full_auto::arm_load_outcome(&line), Some(line)),
+                    Err(e) => {
+                        tracing::warn!("arm load failed: {e:#}");
+                        ("failed", Some("The load didn't go through.".to_string()))
+                    }
+                }
+            }
+            crate::full_auto::ArmLoad::Declined(line) => (decision.outcome(), Some(line.clone())),
+            _ => (decision.outcome(), None),
+        };
+        crate::full_auto::event(
+            "arm_load",
+            json!({
+                "outcome": outcome,
+                "what": match &decision {
+                    crate::full_auto::ArmLoad::Load(w) => Some(format!("{w:?}")),
+                    _ => None,
+                },
+                "fuel_before_kg": fuel0.ok(), "block_kg": fp.block_fuel_kg,
+                "min_takeoff_kg": fp.min_takeoff_fuel_kg,
+                "payload_before_kg": payload0.ok(),
+                "plan_payload_kg": fp.weights.as_ref().map(|w| w.payload_kg),
+                "stopped": stopped,
+                "load_sheet": format!("{:?}", self.load_sheet),
+                "line": load_line,
+            }),
+        );
+        notes.extend(load_line);
 
         // The preflight: tanks, load and all-up weight as the sim has them
         // now, against the plan and the book. A refusal here costs nothing;

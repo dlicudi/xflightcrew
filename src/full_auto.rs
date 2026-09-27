@@ -4480,6 +4480,147 @@ async fn ensure_takeoff_cleared(
     true
 }
 
+/// How the arm came by its plan (#95): what is said and blackboxed
+/// (`full_auto` `plan_fetch`) before the load and the preflight.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArmFetch {
+    /// A local plan: the pilot's own, never swapped for SimBrief.
+    Local,
+    /// SimBrief answered with the plan already on the shelf (or the first).
+    Fetched,
+    /// SimBrief answered with a different plan than the shelf's.
+    Changed,
+    /// SimBrief did not answer: the shelf's plan is flown.
+    Fallback,
+}
+
+impl ArmFetch {
+    /// What `before` (the shelf) and `after` (what the arm flies) say about
+    /// the fetch. Route identity is `plan::same_route`'s, as the "wrong
+    /// plan" check's. Pure.
+    pub fn judge(
+        local: bool,
+        fetched: bool,
+        before: Option<&crate::simbrief::FlightPlan>,
+        after: &crate::simbrief::FlightPlan,
+    ) -> Self {
+        if local {
+            ArmFetch::Local
+        } else if !fetched {
+            ArmFetch::Fallback
+        } else if before.is_some_and(|b| !crate::plan::same_route(b, after)) {
+            ArmFetch::Changed
+        } else {
+            ArmFetch::Fetched
+        }
+    }
+
+    /// The one short line the arm says for it, if any. Pure.
+    pub fn line(self, fp: &crate::simbrief::FlightPlan) -> Option<String> {
+        match self {
+            ArmFetch::Local | ArmFetch::Fetched => None,
+            ArmFetch::Changed => Some(format!(
+                "New plan from SimBrief, {} to {}.",
+                fp.origin, fp.destination
+            )),
+            ArmFetch::Fallback => Some(format!(
+                "Couldn't reach SimBrief, flying the plan I already had, {} to {}.",
+                fp.origin, fp.destination
+            )),
+        }
+    }
+}
+
+/// Fuel within this of the plan's block is aboard already: two percent,
+/// never tighter than a few kilos. An absolute 100 kg would swallow a 172's
+/// whole 109 kg block.
+const ARM_FUEL_FRAC: f64 = 0.02;
+const ARM_FUEL_KG: f64 = 5.0;
+/// Payload within this of the load sheet is aboard already: two percent,
+/// never tighter than one bag.
+const ARM_PAYLOAD_FRAC: f64 = 0.02;
+const ARM_PAYLOAD_KG: f64 = 20.0;
+
+/// What the arm does with the plan's load sheet before the preflight.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ArmLoad {
+    /// Load these halves with `tools::loading::load_from_plan`.
+    Load(crate::tools::loading::What),
+    /// Everything the plan carries is aboard already: nothing is written.
+    Matches,
+    /// Not on the ground and stopped: the arm never loads a rolling aircraft.
+    NotStopped,
+    /// The airframe's load is unprobed or its own: the line names it and
+    /// the load is the pilot's.
+    Declined(String),
+}
+
+impl ArmLoad {
+    /// The blackbox outcome before the loader has spoken.
+    pub fn outcome(&self) -> &'static str {
+        match self {
+            ArmLoad::Load(_) => "load",
+            ArmLoad::Matches => "skipped_matches",
+            ArmLoad::NotStopped => "skipped_not_stopped",
+            ArmLoad::Declined(_) => "refused_airframe",
+        }
+    }
+}
+
+/// The arm's load decision (#95), from the tanks and payload as read NOW.
+/// A half the plan does not carry (no block, no load sheet) is never asked
+/// for; a half whose read failed is asked for, so the loader reads again
+/// and refuses on a failed read itself. Pure.
+pub fn arm_load(
+    fp: &crate::simbrief::FlightPlan,
+    stopped_on_ground: bool,
+    fuel_kg: Option<f64>,
+    payload_kg: Option<f64>,
+    sheet: crate::aircraft::LoadSheet,
+    airframe: &str,
+) -> ArmLoad {
+    use crate::tools::loading::What;
+    if !stopped_on_ground {
+        return ArmLoad::NotStopped;
+    }
+    let within = |have: Option<f64>, want: f64, frac: f64, floor: f64| {
+        have.is_some_and(|h| (h - want).abs() <= floor.max(want * frac))
+    };
+    let fuel = fp.block_fuel_kg > 0.0
+        && !within(fuel_kg, fp.block_fuel_kg, ARM_FUEL_FRAC, ARM_FUEL_KG);
+    let payload = fp.weights.as_ref().is_some_and(|w| {
+        w.payload_kg > 0.0 && !within(payload_kg, w.payload_kg, ARM_PAYLOAD_FRAC, ARM_PAYLOAD_KG)
+    });
+    if !fuel && !payload {
+        return ArmLoad::Matches;
+    }
+    match sheet {
+        crate::aircraft::LoadSheet::Stock => ArmLoad::Load(match (fuel, payload) {
+            (true, true) => What::Both,
+            (true, false) => What::Fuel,
+            _ => What::Payload,
+        }),
+        crate::aircraft::LoadSheet::Unprobed => ArmLoad::Declined(format!(
+            "Loading the {airframe} from the plan is unprobed, so the fuel and payload are yours to set."
+        )),
+        crate::aircraft::LoadSheet::OwnFuelSystem => ArmLoad::Declined(format!(
+            "The {airframe} manages its own fuel, so the fuel and payload are yours to set."
+        )),
+    }
+}
+
+/// What the load tool's line says it did, for the blackbox: every line
+/// the loader returns starts with its verdict. Pure.
+pub fn arm_load_outcome(line: &str) -> &'static str {
+    if line.starts_with("Loaded for") {
+        "loaded"
+    } else if line.starts_with("Loading for") {
+        "not_taken"
+    } else {
+        "refused"
+    }
+}
+
 /// What the arm-time preflight compares the plan against: the tanks and the
 /// load as the sim has them NOW, the airframe's book figures, and the longest
 /// runway at each end. `None`/0 = unknown, and an unknown is never a refusal.
@@ -5184,6 +5325,109 @@ mod tests {
             assert!(!confirmed_ground(Ok(invalid), Ok(1.0)));
             assert!(!confirmed_ground(Ok(0.0), Ok(invalid)));
         }
+    }
+
+    /// #95: the arm loads only what the aircraft does not already carry, on
+    /// the ground and stopped, and names an airframe it will not load.
+    #[test]
+    fn the_arm_loads_only_the_halves_that_are_not_aboard() {
+        use super::{arm_load, ArmLoad};
+        use crate::aircraft::LoadSheet;
+        use crate::tools::loading::What;
+        let fp = plan(true);
+        let arm = |fuel: Option<f64>, payload: Option<f64>| {
+            arm_load(&fp, true, fuel, payload, LoadSheet::Stock, "Cessna 172SP")
+        };
+        // The LXGB plan: 109 kg block, 268.5 kg payload.
+        assert_eq!(arm(Some(109.0), Some(270.0)), ArmLoad::Matches);
+        assert_eq!(arm(Some(105.0), Some(250.0)), ArmLoad::Matches, "inside 5 kg and one bag");
+        assert_eq!(arm(Some(40.0), Some(270.0)), ArmLoad::Load(What::Fuel));
+        assert_eq!(arm(Some(160.0), Some(270.0)), ArmLoad::Load(What::Fuel), "over the block too");
+        assert_eq!(arm(Some(109.0), Some(80.0)), ArmLoad::Load(What::Payload));
+        assert_eq!(arm(Some(40.0), Some(80.0)), ArmLoad::Load(What::Both));
+        // A failed read is no measurement: the loader reads again itself.
+        assert_eq!(arm(None, Some(270.0)), ArmLoad::Load(What::Fuel));
+        // An absolute 100 kg would call a dry 172 "at the block".
+        assert_eq!(arm(Some(20.0), Some(270.0)), ArmLoad::Load(What::Fuel));
+        // A 737's 7,200 kg block: two percent is 144 kg of taxi and rounding.
+        let mut big = plan(true);
+        big.block_fuel_kg = 7_200.0;
+        let fuel = |kg: f64| arm_load(&big, true, Some(kg), Some(268.5), LoadSheet::Stock, "737");
+        assert_eq!(fuel(7_100.0), ArmLoad::Matches);
+        assert_eq!(fuel(6_900.0), ArmLoad::Load(What::Fuel));
+    }
+
+    #[test]
+    fn the_arm_never_loads_a_rolling_aircraft_or_forces_an_unprobed_one() {
+        use super::{arm_load, ArmLoad};
+        use crate::aircraft::LoadSheet;
+        let fp = plan(true);
+        assert_eq!(
+            arm_load(&fp, false, Some(20.0), Some(0.0), LoadSheet::Stock, "Cessna 172SP"),
+            ArmLoad::NotStopped
+        );
+        let ArmLoad::Declined(line) =
+            arm_load(&fp, true, Some(20.0), Some(0.0), LoadSheet::Unprobed, "Airbus A330-300")
+        else {
+            panic!("an unprobed airframe is never loaded");
+        };
+        assert_eq!(
+            line,
+            "Loading the Airbus A330-300 from the plan is unprobed, so the fuel and payload are yours to set."
+        );
+        let ArmLoad::Declined(line) =
+            arm_load(&fp, true, Some(20.0), None, LoadSheet::OwnFuelSystem, "Boeing 747-400")
+        else {
+            panic!("an add-on's own fuel is never loaded");
+        };
+        assert!(line.starts_with("The Boeing 747-400 manages its own fuel"), "{line}");
+        // Already aboard is nothing to say, whoever owns the tanks.
+        assert_eq!(
+            arm_load(&fp, true, Some(109.0), Some(268.5), LoadSheet::Unprobed, "Airbus A330-300"),
+            ArmLoad::Matches
+        );
+        // A local plan carries no sheet: the payload is never asked for.
+        assert_eq!(
+            arm_load(&plan(false), true, Some(109.0), Some(0.0), LoadSheet::Stock, "172"),
+            ArmLoad::Matches
+        );
+        assert_eq!(super::arm_load_outcome("Loaded for LXGB to LEAX. Fuel 240 pounds."), "loaded");
+        assert_eq!(
+            super::arm_load_outcome("Loading for LXGB to LEAX. The fuel did not take: ..."),
+            "not_taken"
+        );
+        assert_eq!(super::arm_load_outcome("Negative. The plan wants ..."), "refused");
+        for line in [
+            super::ArmFetch::Changed.line(&fp),
+            super::ArmFetch::Fallback.line(&fp),
+        ] {
+            let line = line.expect("said");
+            assert!(!line.contains('\u{2014}') && !line.contains('\u{2013}'), "{line}");
+        }
+    }
+
+    /// #95: the arm fetches fresh and says only a change or a stale plan.
+    #[test]
+    fn the_arm_says_a_new_plan_and_a_stale_one_and_nothing_else() {
+        use super::ArmFetch;
+        let old = plan(true);
+        let mut new = plan(true);
+        new.destination = "LEMG".into();
+        assert_eq!(ArmFetch::judge(false, true, Some(&old), &new), ArmFetch::Changed);
+        assert_eq!(ArmFetch::judge(false, true, Some(&old), &old), ArmFetch::Fetched);
+        assert_eq!(ArmFetch::judge(false, true, None, &new), ArmFetch::Fetched);
+        assert_eq!(ArmFetch::judge(false, false, Some(&old), &old), ArmFetch::Fallback);
+        assert_eq!(ArmFetch::judge(true, false, Some(&old), &old), ArmFetch::Local);
+        assert_eq!(
+            ArmFetch::Changed.line(&new).as_deref(),
+            Some("New plan from SimBrief, LXGB to LEMG.")
+        );
+        assert_eq!(
+            ArmFetch::Fallback.line(&old).as_deref(),
+            Some("Couldn't reach SimBrief, flying the plan I already had, LXGB to LEAX.")
+        );
+        assert_eq!(ArmFetch::Fetched.line(&old), None);
+        assert_eq!(ArmFetch::Local.line(&old), None);
     }
 
     /// A 172 plan LXGB-LEAX as SimBrief sent it (2026-09-15), in kilos.

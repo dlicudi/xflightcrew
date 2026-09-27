@@ -192,7 +192,11 @@ stock 737 "re-synced" 14 times, 2026-09-27).
   `preflight`): both runways (`takeoff_needed_m`), `weight/m_total` vs the plan's MTOW (else max
   gross), tanks vs the MINIMUM takeoff fuel, `weight/m_fixed` vs the load sheet (`PlanWeights`). A
   refusal names the number; an unknown is skipped, never guessed. Why: these used to be found at
-  the enroute caution and at the hold.
+  the enroute caution and at the hold. **Before it, on the ground and stopped, the arm fetches the
+  plan fresh and loads it** (#95): `ArmFetch` says a changed plan or a stale shelf (blackbox
+  `plan_fetch`); `arm_load` loads through `load_from_plan` only the half not already aboard (2 %),
+  never an airframe declaring `load_sheet: unprobed` / `own_fuel_system` (named; blackbox
+  `arm_load`). The FMS gets the plan loaded and preflighted; an airborne resume does neither.
 - **A MARGIN is the pilot's to waive, the airframe never** (`full_auto::Gate`): "say fly it anyway"
   only for the runway's 1.4 factor (`OriginRunway`; `BookRoll` and 500 m still hold) and the plan's
   weight limit (`PlanWeight`; max gross holds), by `grammar::waiver_request` within 120 s, for THAT
@@ -204,8 +208,9 @@ stock 737 "re-synced" 14 times, 2026-09-27).
   authorises nothing.
 - **The load sheet** (`src/tools/loading.rs`, `load_aircraft`): ground and stopped only; BLOCK fuel
   wings first (`distribute_fuel`, from `acf_tank_rat`, `acf_tank_X`), payload into `m_fixed`,
-  refused with both numbers past the tanks or `acf_m_max`, read back. The loop asks
-  `grammar::load_aircraft_request` first (same shape as the FMS load); "refuel" is the fuel truck.
+  refused with both numbers past the tanks or `acf_m_max`, read back; full auto's arm reuses it. The
+  loop asks `grammar::load_aircraft_request` first (same shape as the FMS load); "refuel" is the
+  fuel truck.
 
 Still owed: issues labelled `owed` + `area:full-auto` (local plan enroute point #73, dog-legs #74,
 airways #75).

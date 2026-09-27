@@ -9088,3 +9088,59 @@ of 8,246 records), `the_recorded_egkk_reject_scores_as_pinned` (re-pinned),
 carry `drift`; check it settles to the crosswind's side by 100 kt, xtk_m
 under 2 through liftoff, err under 3 and no steer reversals; next taxi:
 `stage_result` `max_cut_m` beside `max_lat_m`. Offline only.
+
+## 2026-09-27: full auto loads the aircraft at the arm (issue #95)
+
+Owed since the load sheet (2026-09-21, eighth pass): "fly the flight plan"
+refused a plan whose fuel or payload did not match ("Say load the aircraft and
+I'll fuel it from the plan, then say it again") instead of loading it, and a
+failed SimBrief fetch at the arm refused outright although a plan sat on the
+shelf.
+
+**The arm now does three things in order, on the ground and stopped**
+(`tools::full_auto::flight_mission`):
+
+1. **The plan, fresh** (`PlanFetch::Asked`'s rule): a local plan stays, a
+   SimBrief plan is fetched every arm and published. `full_auto::ArmFetch`
+   judges it against the shelf with `plan::same_route` (origin, destination,
+   airway string; now shared with `plan_change_line`): a changed plan is said
+   ("New plan from SimBrief, X to Y."), a failed fetch flies the shelf and
+   says so ("Couldn't reach SimBrief, flying the plan I already had, X to
+   Y."), no plan at all is the old refusal. `plan_change_line`'s own words end
+   in "say load it", which the arm is already doing, so the arm has its two.
+   Blackbox `full_auto` `plan_fetch`: `outcome` local|fetched|changed|fallback,
+   `before`, `error`.
+2. **The load** (`full_auto::arm_load`, pure): the halves the aircraft does
+   not already carry are loaded from THIS plan through the load tool's own
+   `load_from_plan` (wings first, payload into `m_fixed`, read back, its
+   refusals spoken). Fuel within 2 % or 5 kg of the block and payload within
+   2 % or 20 kg of the sheet are aboard already and left alone (an absolute
+   100 kg would call a dry 172 at its 109 kg block full). A failed read asks
+   for the half, so the loader reads again and refuses on its own. A local
+   plan has no sheet, so the payload is never asked for. An airframe whose
+   stock tank and payload writes have never been written and read back
+   declares `load_sheet: unprobed` (`aircraft::LoadSheet`; the A330 and the
+   747), or `own_fuel_system` for an add-on that owns its tanks: the arm names
+   it ("Loading the Airbus A330-300 from the plan is unprobed, so the fuel and
+   payload are yours to set.") and never writes. The spoken "load the
+   aircraft" is the pilot's and ignores the declaration. Blackbox `full_auto`
+   `arm_load`: `outcome` loaded|not_taken|refused|failed|skipped_matches|
+   skipped_not_stopped|refused_airframe, `what`, `fuel_before_kg`, `block_kg`,
+   `payload_before_kg`, `plan_payload_kg`, `stopped`, `load_sheet`, `line`;
+   the loader's own `loading` `load_aircraft` record as before.
+3. **The preflight exactly as before**, reading the tanks after the load: it
+   stays the gate, and a load the loader refused (past the tanks, past
+   `acf_m_max`) meets its refusal with the number.
+
+What the arm did rides ahead of the ack, and ahead of a refusal
+(`build_flight_mission` joins the notes to either). The FMS gets the same plan
+that was loaded and preflighted. The airborne resume never fetches or loads.
+
+Tests `the_arm_loads_only_the_halves_that_are_not_aboard`,
+`the_arm_never_loads_a_rolling_aircraft_or_forces_an_unprobed_one`,
+`the_arm_says_a_new_plan_and_a_stale_one_and_nothing_else`,
+`the_arm_loads_the_fuel_and_leaves_a_payload_already_aboard` (the decision
+driving the loader on the 737 ramp fake), `the_unprobed_airframes_say_so_in_their_profiles`.
+Next ramp arm: `full_auto` `plan_fetch` then `arm_load` before `preflight`,
+a `loading` `load_aircraft` record between them when the outcome is loaded,
+and `preflight` `fuel_kg` at the block. Offline only.
