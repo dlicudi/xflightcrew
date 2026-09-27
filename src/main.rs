@@ -1391,7 +1391,21 @@ async fn run_session(
                         acts.push("autopilot disengaged".to_string());
                     }
                     for (dr, label, old, is_int) in &snap.reverts {
-                        let restored = if *is_int {
+                        // The parking brake goes back through its valve-aware
+                        // seam and is "restored" only when it READS back so: a
+                        // raw ratio write left the valve behind and claimed
+                        // success on the write alone (#65).
+                        let restored = if dr == tools::PARK_BRAKE {
+                            matches!(
+                                tools::controls::drive_park_brake(
+                                    &xplane,
+                                    *old > 0.5,
+                                    profile.park_brake_valve_set,
+                                )
+                                .await,
+                                Ok(true)
+                            )
+                        } else if *is_int {
                             xplane.set_int(dr, old.round() as i64).await.is_ok()
                         } else {
                             xplane.set_float(dr, *old).await.is_ok()
@@ -1761,18 +1775,26 @@ async fn run_session(
                     tracing::info!("native pushback stop, pre-gate");
                     conversation.clear();
                     let _ = xplane.run_command(tools::ground::CMD_PUSH_STOP).await;
-                    let _ = tools::controls::drive_park_brake(
-                        &xplane,
-                        true,
-                        profile.park_brake_valve_set,
-                    )
-                    .await;
+                    let held = matches!(
+                        tools::controls::drive_park_brake(
+                            &xplane,
+                            true,
+                            profile.park_brake_valve_set,
+                        )
+                        .await,
+                        Ok(true)
+                    );
                     pushback::ACTIVE.store(false, std::sync::atomic::Ordering::SeqCst);
+                    // The line from the read-back, never the attempt (#65).
                     say(
                         &voice,
                         &reporter,
                         ui::LogKind::Readback,
-                        "Stopping the push. Brakes on, your aircraft.",
+                        if held {
+                            "Stopping the push. Brakes on, your aircraft."
+                        } else {
+                            "Stopping the push. The parking brake did not set, hold the brakes. Your aircraft."
+                        },
                     );
                     // A governor also driving means the flag was stale, not a
                     // push — fall through so "stop" reaches the brakes it was

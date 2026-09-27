@@ -487,19 +487,9 @@ async fn hand_back_brakes_if(
     // went on squeezing a 172 on its wheel brakes for fifteen minutes (the
     // pilot has no toe-brake axis to release them). The same command, sent
     // by hand afterwards, set at once.
-    let mut held = false;
-    let mut err: Option<String> = None;
-    let mut tries = 0;
-    while tries < 3 && !held {
-        tries += 1;
-        match crate::tools::controls::drive_park_brake(xp, true, valve_set).await {
-            Ok(h) => held = h,
-            Err(e) => err = Some(format!("{e:#}")),
-        }
-        if !held {
-            tokio::time::sleep(std::time::Duration::from_millis(400)).await;
-        }
-    }
+    let crate::tools::controls::ParkBrakeSet {
+        held, tries, err, ..
+    } = crate::tools::controls::set_park_brake_confirmed(xp, valve_set, 3).await;
     if !held {
         tracing::warn!(?err, "full auto: the parking brake did not set at the hand-back");
     }

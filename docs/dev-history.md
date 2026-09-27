@@ -8302,3 +8302,39 @@ to land, silent through the rollout),
 `the_compliance_tick_is_not_under_the_quiet_gate`. Next autoland without a
 landing clearance, check: the `atc` `compliance` record's `t` within a tick
 of the flight `touchdown`, with `autoland: true, said: true`. Offline only.
+
+## 2026-09-27: "Brakes on" at the stop is the parking brake's read-back
+
+Issue #65, owed since EGSS 22 (2026-09-22, stock 737): autoland stopped on
+the runway (gs 0.2 kt at t 1790031655), said "Down and stopped. Brakes on,
+your aircraft.", and `state` read `park` 0.0 for the next 55 s (0.03 by hand,
+the autobrake's residue) until the pilot's spoken "set the parking brake"
+put it at 1.0 (t 1790031712). The rollout's closing write was
+`xcopilot/taxi_brake` 0.5, the plugin's one-second heartbeat channel: the
+loop broke on the next line, nothing renewed it, and nothing ever touched
+the parking brake. The line was a constant.
+
+Fixed, offline:
+
+- `controls::set_park_brake_confirmed` (up to N drives of
+  `drive_park_brake`, valve-aware, then the ratio read back into
+  `ParkBrakeSet { held, tries, err, park }`); `full_auto::hand_back_brakes_if`
+  now uses it instead of its own copy of the three-try loop.
+- Autoland's stop hands the hold to it (valve from `live_profile`) and speaks
+  `autoland::stopped_line(held)`: "Brakes on" only when it reads set, else
+  "The parking brake did not set, hold the brakes." Blackbox `autoland`
+  `stopped_brakes` {held, tries, park, err, valve_set}.
+- The same bug elsewhere: taxi-in's rolling arrest ("Brakes on, holding for
+  the taxi clearance", `arrest_rolling` now carries held/tries/park) and the
+  native push stop ("Stopping the push. Brakes on") discarded the result;
+  both now speak from it. "Belay that" after `set_parking_brake` restored
+  the ratio with a raw write (valve left behind, "restored" on the write
+  alone); it now drives the seam and says restored only on the read-back.
+- Left: the steered push's "Stopping the push. Brakes on" is said before the
+  push loop sets the brake (the loop owns it, `pushback.rs`).
+
+Tests `the_stop_says_brakes_on_only_when_the_parking_brake_reads_set`,
+`a_parking_brake_is_reported_from_its_read_back` (0.03 through three drives
+is not held). Next 737 landing to a stop: `autoland` `stopped_brakes`
+`held: true`, `park` 1.0, and the next `state` records `park` 1.0. Offline
+only.

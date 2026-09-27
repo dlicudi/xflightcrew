@@ -463,6 +463,18 @@ const TAXI_STEER: &str = "xcopilot/taxi_steer";
 const TAXI_BRAKE: &str = "xcopilot/taxi_brake";
 /// The gentler brake hold once stopped.
 const ROLLOUT_BRAKE_HOLD: f64 = 0.5;
+
+/// The line at a full stop, from the PARKING brake's read-back: "Brakes on"
+/// only when it reads set. A brake that did not take is named, because the
+/// rollout's squeeze expires within a second of the hand-off and the aircraft
+/// is then the pilot's to hold (EGSS 2026-09-22: said on, read 0.03).
+pub(crate) fn stopped_line(parking_brake_held: bool) -> &'static str {
+    if parking_brake_held {
+        "Down and stopped. Brakes on, your aircraft."
+    } else {
+        "Down and stopped. The parking brake did not set, hold the brakes. Your aircraft."
+    }
+}
 /// Throttle a give-up hands back with: enough to hold level flight with gear
 /// down and landing flap out, which is the state a balked landing leaves the
 /// aircraft in. Half throttle was not (110 → 80 kt, EGHI 2026-08-02).
@@ -1360,10 +1372,25 @@ pub fn run_autoland_scoped(
                         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
                         continue;
                     }
-                    // Stopped: hold the brakes, free the nosewheel, hand off.
+                    // Stopped: squeeze the brakes, free the nosewheel, then
+                    // hand the hold to the PARKING brake through the
+                    // valve-aware seam, and say what the read-back says. The
+                    // squeeze is the plugin's one-second heartbeat: on its own
+                    // it let go the moment this loop ended, and at EGSS the
+                    // 737 sat on the runway after "Brakes on" with
+                    // `parking_brake_ratio` at 0.03 (2026-09-22).
                     let _ = xp.set_float(TAXI_BRAKE, ROLLOUT_BRAKE_HOLD).await;
                     let _ = xp.set_float(TAXI_STEER, 0.0).await;
-                    announce("Down and stopped. Brakes on, your aircraft.".into(), Priority::Warning);
+                    let valve = crate::aircraft::live_profile().and_then(|p| p.park_brake_valve_set);
+                    let set = crate::tools::controls::set_park_brake_confirmed(&xp, valve, 3).await;
+                    crate::blackbox::record(
+                        "autoland",
+                        serde_json::json!({
+                            "event": "stopped_brakes", "held": set.held, "tries": set.tries,
+                            "park": set.park, "err": set.err, "valve_set": valve,
+                        }),
+                    );
+                    announce(stopped_line(set.held).into(), Priority::Warning);
                     break;
                 }
                 // Cross-track closure rate (nm/min, positive = drifting right),
@@ -5140,6 +5167,35 @@ pub fn guidance(
 
 #[cfg(test)]
 mod tests {
+
+    /// EGSS 22, 2026-09-22 (issue #65): "Down and stopped. Brakes on, your
+    /// aircraft." with the 737's `parking_brake_ratio` at 0.03, the rollout's
+    /// squeeze expired. The stop's line is chosen from the parking brake's
+    /// read-back: the brake reading 0.03 through every drive names that it did
+    /// not set, and only a brake that reads set is "Brakes on".
+    #[tokio::test]
+    async fn the_stop_says_brakes_on_only_when_the_parking_brake_reads_set() {
+        use crate::xplane::FakeXPlane;
+        const PARK: &str = "sim/cockpit2/controls/parking_brake_ratio";
+        const SET: &str = "sim/flight_controls/park_brake_set";
+        let egss = FakeXPlane::with_reads(&[(PARK, 0.03)]);
+        let r = crate::tools::controls::set_park_brake_confirmed(&egss, None, 3).await;
+        let line = super::stopped_line(r.held);
+        assert!(!line.contains("Brakes on"), "{line}");
+        assert!(line.contains("did not set"), "{line}");
+
+        let set = FakeXPlane::with_reads(&[(PARK, 0.03)]);
+        set.step_on_command(SET, PARK, 0.97);
+        let r = crate::tools::controls::set_park_brake_confirmed(&set, None, 3).await;
+        assert_eq!(
+            super::stopped_line(r.held),
+            "Down and stopped. Brakes on, your aircraft."
+        );
+        assert!(
+            !set.wrote(PARK),
+            "the command set it; no raw ratio write needed"
+        );
+    }
 
     /// The flare flies the ELEVATOR, and it has to arrest a real sink in the
     /// three seconds it has. Flown against a plant with no autopilot in it —

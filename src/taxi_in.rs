@@ -335,17 +335,26 @@ async fn fly(
             .map(|v| v * 1.943_84);
         if gs_kts.as_ref().map_or(true, |gs| *gs > 3.0) {
             ARREST_HOLD.store(true, std::sync::atomic::Ordering::Relaxed);
-            let _ = crate::tools::controls::drive_park_brake(&xp, true, park_brake_valve_set).await;
+            let set =
+                crate::tools::controls::set_park_brake_confirmed(&xp, park_brake_valve_set, 3)
+                    .await;
             // Say so: a brake the pilot did not set, on a roll they may still
-            // think is theirs, is announced, not discovered.
+            // think is theirs, is announced, not discovered. And say what the
+            // read-back says: "Brakes on" over a brake that did not take was
+            // the EGSS rollout's untrue line (2026-09-22, issue #65).
             announce(
                 &voice,
                 Priority::Caution,
-                "Brakes on, holding for the taxi clearance.",
+                if set.held {
+                    "Brakes on, holding for the taxi clearance."
+                } else {
+                    "The parking brake did not set. Hold the brakes, we may still be rolling."
+                },
             );
             crate::blackbox::record(
                 "taxi_in",
-                json!({ "event": "arrest_rolling", "gs": gs_kts.unwrap_or(-1.0) }),
+                json!({ "event": "arrest_rolling", "gs": gs_kts.unwrap_or(-1.0),
+                        "held": set.held, "tries": set.tries, "park": set.park }),
             );
         }
     }
