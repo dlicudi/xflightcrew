@@ -58,8 +58,56 @@ pub struct Destination {
     /// Field elevation, feet (the plan's destination waypoint altitude when
     /// plausible, else 0 — a sea-level assumption only makes TOD *earlier*).
     pub elev_ft: f64,
-    /// Planned top-of-descent distance from the destination, nm.
+    /// Planned top-of-descent distance from the destination, nm. SimBrief's
+    /// is ALONG THE ROUTE (the navlog's legs after TOD), so it is compared
+    /// with [`route_remaining_nm`] over `route`, never the straight line.
     pub tod_ring_nm: f64,
+    /// The plan's points, origin to destination, `(lat, lon)`: the legs the
+    /// ring is measured along. Empty = no route known (straight line then).
+    pub route: Vec<(f64, f64)>,
+}
+
+/// Miles still to fly to the end of `route` from here: straight to the end
+/// of the leg we are nearest (by the distance to each leg, clamped to it),
+/// then the rest of the plan's legs. `None` with fewer than two points.
+///
+/// The plan's TOD ring is along-route: LSZS-LILO (SR22, 2026-09-24, #109)
+/// flies 63 nm of valley legs to a field 23 nm away in a straight line, so a
+/// 25 nm ring compared with the straight line was "past" from the runway and
+/// "coming up" at every point of the route's northern loop. Pure.
+pub fn route_remaining_nm(route: &[(f64, f64)], lat: f64, lon: f64) -> Option<f64> {
+    if route.len() < 2 {
+        return None;
+    }
+    // Local flat miles about the aircraft: good enough to pick the leg.
+    let k = lat.to_radians().cos();
+    let xy = |(a, b): (f64, f64)| ((b - lon) * 60.0 * k, (a - lat) * 60.0);
+    let mut best: Option<(f64, usize)> = None;
+    for i in 0..route.len() - 1 {
+        let (ax, ay) = xy(route[i]);
+        let (bx, by) = xy(route[i + 1]);
+        let (dx, dy) = (bx - ax, by - ay);
+        let len2 = dx * dx + dy * dy;
+        let t = if len2 > 1e-12 {
+            ((-ax * dx - ay * dy) / len2).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        let (px, py) = (ax + t * dx, ay + t * dy);
+        let d = (px * px + py * py).sqrt();
+        // At a vertex both legs are equally near: the later one is the leg
+        // being flown once the fix is passed, and costs the same either way.
+        if best.is_none_or(|(b, _)| d <= b + 1e-9) {
+            best = Some((d, i));
+        }
+    }
+    let (_, i) = best?;
+    let next = route[i + 1];
+    let mut sum = crate::nav::haversine_nm(lat, lon, next.0, next.1);
+    for w in route[i + 1..].windows(2) {
+        sum += crate::nav::haversine_nm(w[0].0, w[0].1, w[1].0, w[1].1);
+    }
+    Some(sum)
 }
 
 pub static DESTINATION: std::sync::Mutex<Option<Destination>> = std::sync::Mutex::new(None);
@@ -202,6 +250,10 @@ pub struct Snapshot {
     pub dest_dist_nm: Option<f64>,
     pub dest_elev_ft: Option<f64>,
     pub tod_ring_nm: Option<f64>,
+    /// Miles still to fly along the plan's legs ([`route_remaining_nm`]):
+    /// what the along-route ring is compared with. `None` = no route, and
+    /// [`ring_dist_nm`] falls back to `dest_dist_nm`.
+    pub dest_route_nm: Option<f64>,
     /// The procedure follower's OWN top of descent while one flies
     /// ([`crate::procedure::planned_tod`]). Outranks the ring above for the
     /// descent advisors: the point the hands will use is the only one worth
@@ -325,13 +377,14 @@ impl Snapshot {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone();
-        let (dest_dist_nm, dest_elev_ft, tod_ring_nm) = match dest {
+        let (dest_dist_nm, dest_elev_ft, tod_ring_nm, dest_route_nm) = match dest {
             Some(d) => (
                 Some(crate::nav::haversine_nm(lat, lon, d.lat, d.lon)),
                 Some(d.elev_ft),
                 Some(d.tod_ring_nm),
+                route_remaining_nm(&d.route, lat, lon),
             ),
-            None => (None, None, None),
+            None => (None, None, None, None),
         };
         // Best-effort (a missing read must not kill the snapshot): the
         // seatbelt sign, for the cabin crew's watch.
@@ -545,6 +598,7 @@ impl Snapshot {
             dest_dist_nm,
             dest_elev_ft,
             tod_ring_nm,
+            dest_route_nm,
             follower_tod: crate::procedure::planned_tod(),
             follower_flying: crate::procedure::ACTIVE.load(std::sync::atomic::Ordering::Relaxed),
             flight_peak_ft: crate::flight::published().map(|f| f.peak_alt_ft).filter(|p| *p > 0.0),
@@ -1315,6 +1369,14 @@ fn tod_in_cruise(s: &Snapshot) -> bool {
     s.phase == Phase::Cruise && s.agl_ft >= TOD_MIN_AGL_FT
 }
 
+/// The distance the plan's ring is compared with: miles still to fly along
+/// the plan's legs, since the ring is along-route (#109); the straight line
+/// only when no route is known. Everything measured against `tod_ring_nm`
+/// reads this, never `dest_dist_nm` directly.
+fn ring_dist_nm(s: &Snapshot) -> Option<f64> {
+    s.dest_route_nm.or(s.dest_dist_nm)
+}
+
 /// Descent advisor, part 1: top of descent coming up. The anticipatory version
 /// of the "when is TOD" question — the copilot volunteers it while there's
 /// still time to act, instead of answering after being asked. Fires once as
@@ -1358,30 +1420,25 @@ impl Check for TodAhead {
             }
             let to_tod = p.to_tod_nm;
             let alt = crate::auto_status::commas((p.target_ft / 100.0).round() as i64 * 100);
-            let mins = (s.groundspeed_kts > 60.0).then(|| to_tod / s.groundspeed_kts * 60.0);
             // The pilot's altitude holds the follower: the plan's descent,
             // said once as the plan's, with who holds the level.
             if let Some(h) = p.held_ft {
                 let held = crate::auto_status::commas((h / 100.0).round() as i64 * 100);
                 return Some(format!(
-                    "The plan starts down to {alt} feet for {}, {to_tod:.0} miles ahead. You've got {held} held, give me an altitude when you want to go down.",
-                    p.fix
+                    "The plan starts down to {alt} feet for {}, {} ahead. You've got {held} held, give me an altitude when you want to go down.",
+                    p.fix,
+                    spoken_miles(to_tod)
                 ));
             }
-            return Some(match mins {
-                Some(m) => format!(
-                    "Descent coming up. Top of descent in about {}, {to_tod:.0} miles ahead, down to {alt} feet.",
-                    spoken_minutes(m)
-                ),
-                None => format!(
-                    "Descent coming up. Top of descent {to_tod:.0} miles ahead, down to {alt} feet."
-                ),
-            });
+            return Some(format!(
+                "Descent coming up. Top of descent {}, down to {alt} feet.",
+                tod_ahead_words(to_tod, s.groundspeed_kts)
+            ));
         }
         if s.follower_flying {
             return None; // the follower's point or nothing — see `follower_flying`
         }
-        let (dist, elev, ring) = (s.dest_dist_nm?, s.dest_elev_ft?, s.tod_ring_nm?);
+        let (dist, elev, ring) = (ring_dist_nm(s)?, s.dest_elev_ft?, s.tod_ring_nm?);
         if s.alt_ft < elev + 6000.0 {
             return None; // already low; TOD math is meaningless
         }
@@ -1389,14 +1446,10 @@ impl Check for TodAhead {
         if !(0.0..=12.0).contains(&to_tod) {
             return None;
         }
-        let mins = (s.groundspeed_kts > 60.0).then(|| to_tod / s.groundspeed_kts * 60.0);
-        Some(match mins {
-            Some(m) => format!(
-                "Descent coming up. Top of descent in about {}, {to_tod:.0} miles ahead.",
-                spoken_minutes(m)
-            ),
-            None => format!("Descent coming up. Top of descent {to_tod:.0} miles ahead."),
-        })
+        Some(format!(
+            "Descent coming up. Top of descent {}.",
+            tod_ahead_words(to_tod, s.groundspeed_kts)
+        ))
     }
     fn min_duration(&self) -> Duration {
         Duration::from_secs(3)
@@ -1448,7 +1501,7 @@ impl Check for TodPassed {
         if s.follower_flying {
             return None; // the follower's point or nothing — see `follower_flying`
         }
-        let (dist, elev, ring) = (s.dest_dist_nm?, s.dest_elev_ft?, s.tod_ring_nm?);
+        let (dist, elev, ring) = (ring_dist_nm(s)?, s.dest_elev_ft?, s.tod_ring_nm?);
         if s.alt_ft < elev + 4000.0 || dist >= ring - 1.0 || s.groundspeed_kts < 60.0 {
             return None;
         }
@@ -1494,7 +1547,7 @@ impl Check for HighOnProfile {
         if s.follower_tod.is_some() || s.follower_flying {
             return None;
         }
-        let (dist, elev, ring) = (s.dest_dist_nm?, s.dest_elev_ft?, s.tod_ring_nm?);
+        let (dist, elev, ring) = (ring_dist_nm(s)?, s.dest_elev_ft?, s.tod_ring_nm?);
         if dist > ring + 5.0 || dist < 4.0 {
             return None; // not on the arrival yet / inside the final where GPWS owns it
         }
@@ -1921,7 +1974,7 @@ const STEP_CLIMB_MIN_CRUISE_MIN: f64 = 30.0;
 /// without a destination or a groundspeed (then nothing is gated on it).
 /// Pure.
 fn step_cruise_left_min(s: &Snapshot) -> Option<f64> {
-    let dist = s.dest_dist_nm?;
+    let dist = ring_dist_nm(s)?;
     if s.groundspeed_kts <= 60.0 {
         return None;
     }
@@ -4985,13 +5038,45 @@ mod region_coach_tests {
     }
 }
 
-/// "a minute", "2 minutes": a rounded duration the way it is said ("about 1
-/// minutes" was spoken at every short step-down, 2026-09-21).
-fn spoken_minutes(m: f64) -> String {
-    match m.round() as i64 {
-        n if n <= 1 => "a minute".to_string(),
-        n => format!("{n} minutes"),
+/// A distance the way it is said: "under a mile", "a mile", "12 miles".
+/// "1 miles ahead" was spoken (EGKK-EGBB, 2026-09-27, #127).
+pub(crate) fn spoken_miles(nm: f64) -> String {
+    match nm.round() as i64 {
+        n if n < 1 => "under a mile".to_string(),
+        1 => "a mile".to_string(),
+        n => format!("{n} miles"),
     }
+}
+
+/// Under this many seconds a time to a point is "under a minute", never
+/// rounded up to "about a minute".
+const UNDER_A_MINUTE_S: f64 = 45.0;
+
+/// "in under a minute, a mile ahead", "in about 3 minutes, 24 miles ahead":
+/// a top of descent's time and distance as ONE phrase, the time derived
+/// from the distance at this groundspeed so the two always agree; the
+/// distance alone ("12 miles ahead") without a usable groundspeed.
+///
+/// EGKK-EGBB, 2026-09-27 (sortie 1790541304-full_auto +1604): "Top of
+/// descent in about a minute, 1 miles ahead" at 300 kt, where a mile is
+/// 12 seconds: the minutes were rounded to the nearest and floored at one,
+/// so anything under 90 seconds was "about a minute" (#127). ("about 1
+/// minutes" was the same rounding's older bug, 2026-09-21.)
+pub(crate) fn tod_ahead_words(nm: f64, gs_kts: f64) -> String {
+    let miles = spoken_miles(nm);
+    if gs_kts <= 60.0 {
+        return format!("{miles} ahead");
+    }
+    let secs = nm.max(0.0) / gs_kts * 3600.0;
+    let time = if secs < UNDER_A_MINUTE_S {
+        "in under a minute".to_string()
+    } else {
+        match (secs / 60.0).round().max(1.0) as i64 {
+            1 => "in about a minute".to_string(),
+            n => format!("in about {n} minutes"),
+        }
+    };
+    format!("{time}, {miles} ahead")
 }
 
 /// Hand the active field's SURFACE wind (the sim's real-weather METAR) down
@@ -5278,6 +5363,7 @@ mod tests {
             dest_dist_nm: None,
             dest_elev_ft: None,
             tod_ring_nm: None,
+            dest_route_nm: None,
             follower_tod: None,
             follower_flying: false,
             flight_peak_ft: None,
@@ -5976,6 +6062,152 @@ mod tests {
         assert!(cruise.dest_dist_nm.unwrap() < RING_NM - 1.0);
         let msg = TodPassed.eval(&cruise).expect("past the ring in a real cruise");
         assert!(msg.contains("feet a minute makes the profile"), "{msg}");
+    }
+
+    /// The LSZS-LILO plan's points (SimBrief, 2026-09-24; the same route
+    /// `heli_route` `start` logged on 1790279339.9): 63.0 nm of valley legs
+    /// to a field 23.1 nm away in a straight line.
+    const LSZS_LILO: &[(f64, f64)] = &[
+        (46.5344, 9.8841),
+        (46.6, 9.0 + 59.0 / 60.0),
+        (46.7, 10.1),
+        (46.65, 10.0 + 11.0 / 60.0),
+        (46.0 + 34.0 / 60.0, 10.0 + 10.0 / 60.0),
+        (46.0 + 26.0 / 60.0, 10.05),
+        (46.0 + 25.0 / 60.0, 10.05),
+        (46.4, 10.0 + 2.0 / 60.0),
+        (46.35, 10.05),
+        (46.0 + 17.0 / 60.0, 10.1),
+        (46.0 + 13.0 / 60.0, 10.15),
+        (46.0 + 10.0 / 60.0, 10.1),
+        (46.0 + 10.0 / 60.0, 9.95),
+        (46.1546, 9.7952),
+    ];
+
+    /// The route's remaining miles: the whole 63 nm from the origin, the
+    /// straight line only on the last straight legs, and never growing as
+    /// the aircraft flies the legs.
+    #[test]
+    fn the_remaining_route_is_measured_along_the_legs() {
+        let r = LSZS_LILO;
+        let dest = r[r.len() - 1];
+        let at_origin = route_remaining_nm(r, r[0].0, r[0].1).unwrap();
+        assert!((at_origin - 63.0).abs() < 0.3, "{at_origin}");
+        let straight = crate::nav::haversine_nm(r[0].0, r[0].1, dest.0, dest.1);
+        assert!((straight - 23.1).abs() < 0.3, "{straight}");
+        // Flown leg by leg, ten points a leg: never more to go than before.
+        let mut last = f64::INFINITY;
+        for w in r.windows(2) {
+            for k in 0..10 {
+                let f = k as f64 / 10.0;
+                let (lat, lon) = (w[0].0 + f * (w[1].0 - w[0].0), w[0].1 + f * (w[1].1 - w[0].1));
+                let rem = route_remaining_nm(r, lat, lon).unwrap();
+                assert!(rem <= last + 0.05, "{lat},{lon}: {rem} after {last}");
+                last = rem;
+            }
+        }
+        // The last leg is the straight line.
+        let (lat, lon) = r[r.len() - 2];
+        let rem = route_remaining_nm(r, lat, lon).unwrap();
+        assert!((rem - crate::nav::haversine_nm(lat, lon, dest.0, dest.1)).abs() < 0.01);
+        // No route, no measurement: the straight line stands in.
+        assert_eq!(route_remaining_nm(&r[..1], 46.5, 9.9), None);
+        assert_eq!(route_remaining_nm(&[], 46.5, 9.9), None);
+    }
+
+    /// #109: the plan's ring (SimBrief's along-route TOD) against the
+    /// straight line to the field called LSZS-LILO's top of descent at
+    /// every point of the route's northern loop, and "past" long before it.
+    /// Measured along the legs, it speaks only where the ring really is.
+    #[test]
+    fn the_along_route_ring_is_compared_with_the_route_still_to_fly() {
+        const RING_NM: f64 = 25.0;
+        let r = LSZS_LILO;
+        let dest = r[r.len() - 1];
+        let cruise_at = |i: usize, route: bool| {
+            let mut s = snap(true, true);
+            s.on_ground = false;
+            s.phase = Phase::Cruise;
+            s.alt_ft = 10_400.0;
+            s.agl_ft = 4_800.0;
+            s.vsi_fpm = 0.0;
+            s.groundspeed_kts = 150.0;
+            s.ias_kts = 140.0;
+            (s.lat, s.lon) = r[i];
+            s.dest_dist_nm = Some(crate::nav::haversine_nm(r[i].0, r[i].1, dest.0, dest.1));
+            s.dest_elev_ft = Some(898.0);
+            s.tod_ring_nm = Some(RING_NM);
+            s.dest_route_nm = if route { route_remaining_nm(r, r[i].0, r[i].1) } else { None };
+            s
+        };
+        // The old comparison, the straight line: "coming up" 2.9 nm out at
+        // the first valley fix, 57 nm of route before the real point...
+        let old = cruise_at(1, false);
+        assert!(TodAhead.eval(&old).is_some(), "the straight line calls it");
+        // ...and "past the descent point" 31 nm of route out, at fix 5.
+        let old = cruise_at(5, false);
+        assert!(TodPassed.eval(&old).is_some(), "the straight line calls it past");
+        // Along the legs: nothing on the northern loop...
+        for i in 1..=4 {
+            let s = cruise_at(i, true);
+            assert_eq!(TodAhead.eval(&s), None, "fix {i}");
+            assert_eq!(TodPassed.eval(&s), None, "fix {i}");
+        }
+        // ...the run-up where the ring is (30.7 nm of route at fix 5)...
+        let s = cruise_at(5, true);
+        assert_eq!(TodPassed.eval(&s), None, "not past it yet");
+        let msg = TodAhead.eval(&s).expect("the ring 5.7 nm ahead along the route");
+        assert!(msg.contains("6 miles ahead"), "{msg}");
+        // ...and past it once the route to fly is inside the ring (fix 9).
+        let s = cruise_at(9, true);
+        assert!(TodPassed.eval(&s).is_some(), "20.9 nm of route under a 25 nm ring");
+    }
+
+    /// #127: EGKK-EGBB (sortie 1790541304-full_auto +1604) said "Top of
+    /// descent in about a minute, 1 miles ahead" at 300 kt. A mile is said
+    /// "a mile", and the time is the distance at this groundspeed.
+    #[test]
+    fn the_top_of_descent_says_a_mile_and_a_time_that_agrees() {
+        let mut s = cruise_with_dest(38.0);
+        s.groundspeed_kts = 300.0;
+        s.follower_tod = Some(crate::procedure::PlannedTod {
+            fix: "BUZAD".into(),
+            dist_nm: 20.0,
+            to_tod_nm: 1.0,
+            target_ft: 18_000.0,
+            started: false,
+            held_ft: None,
+        });
+        let msg = TodAhead.eval(&s).expect("the follower's point, a mile ahead");
+        assert_eq!(
+            msg,
+            "Descent coming up. Top of descent in under a minute, a mile ahead, down to 18,000 feet."
+        );
+        assert_eq!(tod_ahead_words(0.3, 300.0), "in under a minute, under a mile ahead");
+        assert_eq!(tod_ahead_words(4.0, 300.0), "in about a minute, 4 miles ahead");
+        assert_eq!(tod_ahead_words(12.0, 480.0), "in about 2 minutes, 12 miles ahead");
+        assert_eq!(tod_ahead_words(1.0, 0.0), "a mile ahead");
+        assert_eq!(spoken_miles(8.4), "8 miles");
+        // The two halves never disagree by more than the rounding: over the
+        // whole run-up band at every groundspeed a descent is flown at.
+        for gs in (120..=520).step_by(20) {
+            for tenth in 0..=120 {
+                let nm = tenth as f64 / 10.0;
+                let words = tod_ahead_words(nm, gs as f64);
+                assert!(!words.contains(", 1 miles") && !words.contains('\u{2014}'), "{words}");
+                let secs = nm / gs as f64 * 3600.0;
+                if words.starts_with("in under a minute") {
+                    assert!(secs < 45.0, "{words} at {gs} kt is {secs:.0} s");
+                } else {
+                    let n: f64 = if words.starts_with("in about a minute") {
+                        1.0
+                    } else {
+                        words["in about ".len()..].split(' ').next().unwrap().parse().unwrap()
+                    };
+                    assert!((secs - n * 60.0).abs() <= 30.0, "{words} at {gs} kt is {secs:.0} s");
+                }
+            }
+        }
     }
 
     /// The descent advisor never judges a takeoff, a climb or a flare, and

@@ -274,16 +274,20 @@ pub(crate) async fn tod_phrase(dist_nm: f64, xp: &XPlaneClient) -> String {
         .await
         .unwrap_or(0.0)
         * MS_TO_KTS;
+    let miles = crate::monitor::spoken_miles(dist_nm);
     if gs_kts < 30.0 {
-        return format!("Top of descent about {dist_nm:.0} miles ahead.");
+        return format!("Top of descent about {miles} ahead.");
     }
     let mins = (dist_nm / gs_kts * 60.0).round() as i64;
-    let time = if mins >= 60 {
-        format!("{} hours {} minutes", mins / 60, mins % 60)
-    } else {
-        format!("{mins} minutes")
-    };
-    format!("About {time} to top of descent, {dist_nm:.0} miles ahead.")
+    if mins < 60 {
+        // The monitor's one phrase: time from distance, "a mile" (#127).
+        return format!(
+            "Top of descent {}.",
+            crate::monitor::tod_ahead_words(dist_nm, gs_kts)
+        );
+    }
+    let time = format!("{} hours {} minutes", mins / 60, mins % 60);
+    format!("About {time} to top of descent, {miles} ahead.")
 }
 
 /// Estimated time to the destination ("time before we land", "when do we get in"):
@@ -466,6 +470,8 @@ pub(crate) async fn ensure_plan(
                 lon: w.lon,
                 elev_ft,
                 tod_ring_nm: ring,
+                // The ring is along-route: the legs it is measured along (#109).
+                route: fp.waypoints.iter().map(|w| (w.lat, w.lon)).collect(),
             });
         }
     }
