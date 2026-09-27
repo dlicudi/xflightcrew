@@ -151,7 +151,7 @@ const STALL_SECS: f64 = 12.0;
 const MAX_SECS: f64 = 300.0;
 /// How long to wait for the tug to unhook and clear before taxiing, counted
 /// from the last moment the tug MOVED the aircraft, not from our "stop": a
-/// tug mid-swing finishes its pattern whatever it is told. At 13:39Z
+/// tug mid-swing can ignore the stop and finish its pattern. At 13:39Z
 /// 2026-09-26 the push loop stopped at 60.9 m with the nose at 204, the tug
 /// swung it on to 262 over the next 31 s, stood still, and let go 3 s
 /// later; a wait counted from the stop had timed out 4 s before that and
@@ -183,6 +183,20 @@ const SWING_WINDOW_S: f64 = 2.0;
 /// in four seconds.
 const SWING_SETTLE_S: f64 = 4.0;
 const SWING_STILL_DEG: f64 = 1.0;
+/// From the push tick that reads the heading to the tug's nose standing
+/// still, once "stop" is sent mid-swing: the stop is LED by the swing rate
+/// times this. Measured on the one obeyed mid-swing stop in the log: LIPK
+/// (sortie 1790408535, 2026-09-26) sent it at err -11.8 with the nose
+/// turning 3.4 deg/s; the `state` heading moved 2.8 degrees more and was
+/// still 1.3 s later (0.8 s at the entry rate). The LIBP tug ignored its stop
+/// outright, so this is one sample, not a law.
+const STOP_LATENCY_S: f64 = 0.8;
+/// A swing closing on the lane is stopped when the heading it will come to
+/// rest on (see `STOP_LATENCY_S`) is this close to the lane, or past it.
+const ON_LANE_DEG: f64 = 2.0;
+/// The heading still moving this far after "stop" went out: the tug ignored
+/// it (LIBP 2026-09-26: 58 degrees). The obeyed LIPK stop moved 2.8.
+const STOP_IGNORED_DEG: f64 = 5.0;
 // There is deliberately no re-hook deadline. A released tug is never asked
 // back: `reissued_after_release` fired four times across the whole blackbox
 // and `rehooked` never once answered it, so the wait was a pure four-for-four
@@ -370,13 +384,15 @@ pub fn done(back_m: f64, err_deg: f64, plan: &Plan) -> bool {
 /// measured, never assumed from the trim: the live window spanned 1.7 s);
 /// it ENDS only when the nose has turned under `SWING_STILL_DEG` over
 /// `SWING_SETTLE_S`, so a dip in the rate mid-swing is noise, not the end.
-/// While the bar is on and this says swinging, the manoeuvre is in progress
-/// and neither [`done`] nor the stall clock may end it (the tug runs its
-/// whole pattern whatever it is told; see `SWING_DEG`, `SWING_SETTLE_S`).
+/// While the bar is on and this says swinging, the stall clock may not end
+/// the push (a nose being swung is the tug moving us) and a rate dip is not
+/// the end; the push is stopped mid-swing only ON the lane
+/// ([`stop_on_the_lane`]).
 #[derive(Debug, Clone, Default)]
 pub struct SwingWatch {
     hist: std::collections::VecDeque<(f64, f64)>,
     swinging: bool,
+    rate: f64,
 }
 
 impl SwingWatch {
@@ -391,6 +407,14 @@ impl SwingWatch {
     }
 
     pub fn step(&mut self, t: f64, err: f64, attached: bool) -> bool {
+        // The error's rate over the measured window (signed, deg/s), before
+        // this sample joins the history.
+        self.rate = self
+            .hist
+            .iter()
+            .rev()
+            .find(|(ts, _)| t - ts >= SWING_WINDOW_S)
+            .map_or(0.0, |(ts, e)| angle_diff_deg(err, *e) / (t - ts));
         self.hist.push_back((t, err));
         // Keep one sample at or beyond the longest span.
         while self.hist.len() > 2 && t - self.hist[1].0 >= SWING_SETTLE_S {
@@ -415,6 +439,81 @@ impl SwingWatch {
     pub fn in_progress(&self, attached: bool) -> bool {
         attached && self.swinging
     }
+
+    /// The heading error's rate over the last `SWING_WINDOW_S`, deg/s,
+    /// signed (0 until the history spans it).
+    pub fn rate(&self) -> f64 {
+        self.rate
+    }
+}
+
+/// Where the nose comes to rest if "stop" goes out on this tick: the swing
+/// carries on for `STOP_LATENCY_S`.
+pub fn predicted_rest_err(err: f64, rate: f64) -> f64 {
+    err + rate * STOP_LATENCY_S
+}
+
+/// Is this the tick to stop a tug mid-swing, the distance already made? We
+/// CONTROL the push (`pushback_stop` = stop and let go): a nose swinging
+/// onto the lane is stopped so it comes to rest ON it, led by the rate
+/// ([`predicted_rest_err`]); a nose swinging away from the lane, or not
+/// closing, is stopped at once while it is still inside `ALIGN_DEG`. Short
+/// of the band the tug is left to bring it round.
+pub fn stop_on_the_lane(err: f64, rate: f64) -> bool {
+    let rest = predicted_rest_err(err, rate);
+    if err * rate < 0.0 {
+        // Closing: at the lane, or it would be past it by the stop.
+        rest.abs() <= ON_LANE_DEG || rest.signum() != err.signum()
+    } else {
+        err.abs() <= ALIGN_DEG
+    }
+}
+
+/// The heading after "stop" went out: a tug that ignores it keeps swinging
+/// us (LIBP 2026-09-26: 204 to 262 over 31 s). Watched, never answered: a
+/// command to a tug on the bar drops it off, so the travel is only logged
+/// (`stop_ignored`) and the taxi takes the residual.
+#[derive(Debug, Clone)]
+pub struct AfterStop {
+    at: Option<f64>,
+    travel: f64,
+    moved_s: f64,
+}
+
+impl AfterStop {
+    /// `hdg`: the heading on the tick "stop" was sent.
+    pub fn new(hdg: Option<f64>) -> Self {
+        Self {
+            at: hdg,
+            travel: 0.0,
+            moved_s: 0.0,
+        }
+    }
+
+    /// `t` seconds since the stop; a failed read is no measurement.
+    pub fn step(&mut self, t: f64, hdg: Option<f64>) {
+        if let (Some(a), Some(h)) = (self.at, hdg) {
+            let d = angle_diff_deg(h, a);
+            if d.abs() > self.travel.abs() {
+                self.travel = d;
+                self.moved_s = t;
+            }
+        }
+    }
+
+    /// Signed degrees the nose moved past the stop's heading, at most.
+    pub fn travel_deg(&self) -> f64 {
+        self.travel
+    }
+
+    /// Seconds after the stop the nose was last moving further.
+    pub fn moved_s(&self) -> f64 {
+        self.moved_s
+    }
+
+    pub fn ignored(&self) -> bool {
+        self.travel.abs() > STOP_IGNORED_DEG
+    }
 }
 
 /// What this tick of the push says. [`PushJudge`] is the whole ending rule.
@@ -426,15 +525,21 @@ pub enum PushVerdict {
     SwingWait,
     /// Finished: stop and let go.
     Complete,
+    /// Finished mid-swing, the nose coming to rest on the lane: stop and
+    /// let go now, swing or no swing ([`stop_on_the_lane`]).
+    Aligned,
     /// Motionless, nose included, for `STALL_SECS` after moving: the tug
     /// has run its pattern and stopped.
     Stalled,
 }
 
 /// The push's ending rule, pure over seconds since the brakes came off, so
-/// the recorded ticks replay through exactly what the loop runs. One swing
-/// judgement ([`SwingWatch`]) gates both the finish and the stall clock: a
-/// nose being swung is the tug moving us.
+/// the recorded ticks replay through exactly what the loop runs. We control
+/// the push: once the distance is made and the nose is (or is coming to
+/// rest) on the lane, it is stopped, swing or no swing. The swing
+/// ([`SwingWatch`]) only guards the FALSE stop: the stall clock never runs
+/// while the nose is being swung, and a distance-only finish (the chase
+/// margin, a straight or lane push) waits for the swing to end.
 #[derive(Debug, Clone)]
 pub struct PushJudge {
     swing: SwingWatch,
@@ -466,6 +571,11 @@ impl PushJudge {
         self.swinging
     }
 
+    /// The heading error's rate as of the last step, deg/s.
+    pub fn swing_rate(&self) -> f64 {
+        self.swing.rate()
+    }
+
     /// `straight`: the pattern asked was straight back (or the plan is a
     /// painted lane), which ends at the planned distance.
     pub fn step(
@@ -490,18 +600,22 @@ impl PushJudge {
         } else {
             towed && t - self.moved_at >= STALL_SECS
         };
+        let reached = back_m >= plan.back_m;
         // A straight push never aligns the nose (by design: the taxi turns
         // it), so it ends at the planned distance, not 25 m past it.
-        if (straight || plan.lane) && back_m >= plan.back_m && !swinging {
-            return PushVerdict::Complete;
-        }
-        if done(back_m, err, plan) {
-            if !swinging {
+        let by_distance = (straight || plan.lane) && reached;
+        if !swinging {
+            if by_distance || done(back_m, err, plan) {
                 return PushVerdict::Complete;
             }
-            // Far enough by the numbers, but the tug is mid-swing: it will
-            // finish the pattern whatever we say, so the push ends at ITS
-            // stop (the bar off, or the stall below), never here.
+        } else if reached && stop_on_the_lane(err, self.swing.rate()) {
+            // Delivered: far enough, and the nose comes to rest on the lane
+            // if we stop it now. The tug is not left to swing us past it.
+            return PushVerdict::Aligned;
+        } else if by_distance || done(back_m, err, plan) {
+            // Finished by distance alone while the tug swings us: stopping
+            // now would leave the nose wherever the swing had got to (LXGB
+            // 2026-09-15: 140 degrees off). Wait for the lane or the stop.
             if !self.swing_waited {
                 self.swing_waited = true;
                 return PushVerdict::SwingWait;
@@ -1061,6 +1175,10 @@ async fn run_inner(
     // declared released `MOVED_M` metres in, and the re-issue would re-aim
     // the tug mid-manoeuvre.
     let mut saw_attached = false;
+    // The heading and error on the last tick read, for the stop's record and
+    // the watch after it (`AfterStop`).
+    let mut last_psi: Option<f64> = None;
+    let mut last_err: Option<f64> = None;
     loop {
         if stopping(abort) {
             send(ctx, "stop").await;
@@ -1204,8 +1322,11 @@ async fn run_inner(
             send(ctx, cmd.action()).await;
         }
         let err = angle_diff_deg(plan.target_hdg, psi);
+        last_psi = Some(psi);
+        last_err = Some(err);
         // The ending rule, one judgement for the finish and the stall
-        // clock: a swing in progress ends neither (see `SwingWatch`).
+        // clock: stopped on the lane mid-swing, never stalled mid-swing
+        // (see `PushJudge`).
         let verdict = judge.step(
             began.elapsed().as_secs_f64(),
             back_m,
@@ -1224,6 +1345,7 @@ async fn run_inner(
             "att": attached,
             "tow": towing,
             "swinging": judge.swinging(),
+            "rate": r1(judge.swing_rate()),
         }));
         // The tug's pattern is the sim's geometry: stop it before it takes
         // us off the pavement, whatever the plan still owed. The residual is
@@ -1244,6 +1366,14 @@ async fn run_inner(
         }
         match verdict {
             PushVerdict::Complete => break,
+            PushVerdict::Aligned => {
+                let rate = judge.swing_rate();
+                event(
+                    json!({ "event": "aligned", "back_m": r1(back_m), "err": r1(err),
+                              "rate": r1(rate), "rest": r1(predicted_rest_err(err, rate)) }),
+                );
+                break;
+            }
             PushVerdict::SwingWait => {
                 event(json!({ "event": "swing_wait", "back_m": r1(back_m), "err": r1(err) }));
             }
@@ -1323,7 +1453,10 @@ async fn run_inner(
     }
 
     send(ctx, "stop").await;
-    event(json!({ "event": "stopped", "back_m": r1(back_m) }));
+    event(
+        json!({ "event": "stopped", "back_m": r1(back_m), "err": last_err.map(r1),
+                  "hdg": last_psi.map(r1), "swinging": judge.swinging() }),
+    );
     // Wait for the tug to unhook and drive clear before any power goes on —
     // taxiing into your own tug is a way to end a flight on the stand. Watch
     // the BAR: gating this on tow_in_progress alone made it a no-op, because
@@ -1336,7 +1469,7 @@ async fn run_inner(
     // the bar, and every one was released 5 to 10 s after the taxi drive let
     // the handle off (LIPK 2026-09-26 among them). The toe channel is an
     // expiring heartbeat, so it is written every poll.
-    let cleared = wait_for_tug(xp, abort).await;
+    let cleared = wait_for_tug(xp, abort, last_psi).await;
     // Off the toe brakes we put on: the channel's override expires but the
     // ratios keep their last value on an airframe with no toe-brake axis,
     // and the taxi governor then read our 0.4 as the PILOT braking and
@@ -1387,10 +1520,13 @@ async fn send(ctx: &ToolCtx<'_>, action: &str) {
 
 /// The tug wait itself: the toe brakes written every poll (an expiring
 /// heartbeat), the bar, the dead tow flag and the heading read, and the
-/// deadline [`TugClearWatch`]'s. `true` when the bar came off.
-async fn wait_for_tug(xp: &XPlaneClient, abort: &AtomicBool) -> bool {
+/// deadline [`TugClearWatch`]'s. `true` when the bar came off. The heading
+/// is also held against the one at the stop (`hdg_at_stop`): a tug that
+/// swings on regardless is logged `stop_ignored`, never told again.
+async fn wait_for_tug(xp: &XPlaneClient, abort: &AtomicBool, hdg_at_stop: Option<f64>) -> bool {
     let t0 = Instant::now();
     let mut watch = TugClearWatch::new(0.0);
+    let mut after = AfterStop::new(hdg_at_stop);
     let mut logged_at = -TUG_LOG_SECS;
     loop {
         if stopping(abort) {
@@ -1405,12 +1541,24 @@ async fn wait_for_tug(xp: &XPlaneClient, abort: &AtomicBool) -> bool {
         let t = t0.elapsed().as_secs_f64();
         let (att, tow, psi) = (att.ok(), tow.ok(), psi.ok());
         let verdict = watch.step(t, att, tow, psi);
+        after.step(t, psi);
         if t - logged_at >= TUG_LOG_SECS || verdict != TugWait::Waiting {
             logged_at = t;
             let rec = json!({ "event": "tug_wait", "s": r1(t), "att": att, "tow": tow,
                               "hdg": psi.map(r1), "swinging": watch.swinging(),
                               "verdict": format!("{verdict:?}") });
             event(rec);
+        }
+        if verdict != TugWait::Waiting && after.ignored() {
+            tracing::warn!(
+                travel = after.travel_deg(),
+                "pushback: the tug swung on after the stop"
+            );
+            event(
+                json!({ "event": "stop_ignored", "travel_deg": r1(after.travel_deg()),
+                          "hdg_at_stop": hdg_at_stop.map(r1), "hdg": psi.map(r1),
+                          "moved_s": r1(after.moved_s()) }),
+            );
         }
         match verdict {
             TugWait::Clear => return true,
@@ -1877,14 +2025,43 @@ mod tests {
     /// The bar off after the stop (`autotaxi` `tug_released`).
     const LIBP_RELEASED_S: f64 = 34.0;
 
-    /// Issue #62. The recorded LIBP ticks through the old rule and the new:
-    /// the old window (samples newer than two seconds, two degrees) read the
-    /// 1.2 deg/s swing as over and said "stop" with the nose still 58
-    /// degrees of swing short of where the tug took it (live at err 12.6,
-    /// t 0.0; the log's rounding trips it a few ticks earlier). The new
-    /// judge rides the swing through its dips to the tug's own stop: the bar
-    /// off at +34 s, and with the bar left on, the stall clock once the nose
-    /// stood still, never mid-swing.
+    /// Replay a push's ticks through the judge, the bar on until `released`:
+    /// how it ended, when, the error then and the judge's rate.
+    fn replay(
+        ticks: &[(f64, f64, f64)],
+        plan: &Plan,
+        released: f64,
+    ) -> (&'static str, f64, f64, f64, bool) {
+        let mut j = PushJudge::new(ticks[0].0);
+        let mut towed = false;
+        for &(t, back, err) in ticks {
+            let attached = t < released;
+            towed |= back > MOVED_M;
+            if towed && !attached {
+                return ("released", t, err, j.swing_rate(), j.swinging());
+            }
+            let how = match j.step(t, back, err, attached, towed, plan, false) {
+                PushVerdict::Complete => "complete",
+                PushVerdict::Aligned => "aligned",
+                PushVerdict::Stalled => "stalled",
+                _ => continue,
+            };
+            return (how, t, err, j.swing_rate(), j.swinging());
+        }
+        ("pushing", f64::NAN, f64::NAN, 0.0, false)
+    }
+
+    /// Issue #62. The recorded LIBP ticks through the old rule and the new.
+    /// The old window (samples newer than two seconds, two degrees) read the
+    /// 1.2 deg/s swing as over and said "stop" at err 12.6 (live t 0.0; the
+    /// log's rounding trips it a few ticks earlier), a rate dip read as the
+    /// end. The new judge rides the dip: the nose is still closing on the
+    /// lane and would come to rest 11.7 off it, so the tug is left to bring
+    /// it round and stopped ON the lane (err 2.9, +8.8 s, resting ~1.9 off);
+    /// the headings that followed (the tug ignored the live stop and swung
+    /// on to 262) are then read as `stop_ignored`, never answered. With a
+    /// lane the swing never reaches, the stall clock never fires mid-swing:
+    /// only once the nose has stood still.
     #[test]
     fn a_dip_in_the_swing_rate_never_stops_the_push() {
         let plan = Plan {
@@ -1895,17 +2072,26 @@ mod tests {
         };
         // The continuation at the loop's 0.55 s tick, holding the last
         // recorded back_m (the aircraft crept at 0.1-0.2 kt: no progress).
-        let mut ticks: Vec<(f64, f64, f64)> = LIBP_PUSH.to_vec();
-        let mut t = 0.55;
-        while t <= 50.0 {
-            let h = LIBP_AFTER_STOP
+        let heading_at = |t: f64| {
+            LIBP_AFTER_STOP
                 .iter()
                 .rev()
                 .find(|(ts, _)| *ts <= t)
-                .map_or(204.8, |(_, h)| *h);
-            ticks.push((t, 60.9, angle_diff_deg(plan.target_hdg, h)));
-            t += 0.55;
-        }
+                .map_or(204.8, |(_, h)| *h)
+        };
+        let ticks_for = |target: f64| {
+            let mut ticks: Vec<(f64, f64, f64)> = LIBP_PUSH
+                .iter()
+                .map(|&(t, b, e)| (t, b, angle_diff_deg(target, plan.target_hdg - e)))
+                .collect();
+            let mut t = 0.55;
+            while t <= 50.0 {
+                ticks.push((t, 60.9, angle_diff_deg(target, heading_at(t))));
+                t += 0.55;
+            }
+            ticks
+        };
+        let ticks = ticks_for(plan.target_hdg);
 
         // The old rule, as it ran.
         let old_stop = {
@@ -1923,31 +2109,38 @@ mod tests {
         let (t_old, err_old) = old_stop.expect("the old rule stopped the push");
         assert!(t_old <= 0.0 && err_old > 12.0, "{t_old} {err_old}");
 
-        // The new rule over the same ticks, the bar on until the release.
-        let run = |released: f64| {
-            let mut j = PushJudge::new(LIBP_PUSH[0].0);
-            let mut towed = false;
-            for &(t, back, err) in &ticks {
-                let attached = t < released;
-                towed |= back > MOVED_M;
-                if towed && !attached {
-                    return ("released", t, j.swinging());
-                }
-                match j.step(t, back, err, attached, towed, &plan, false) {
-                    PushVerdict::Complete => return ("complete", t, j.swinging()),
-                    PushVerdict::Stalled => return ("stalled", t, j.swinging()),
-                    _ => {}
-                }
-            }
-            ("pushing", f64::NAN, false)
-        };
-        let (how, at, _) = run(LIBP_RELEASED_S);
-        assert_eq!(how, "released", "ended at the tug's own release, at {at}");
-        assert!((at - LIBP_RELEASED_S).abs() < 0.6, "{at}");
-        // The bar never comes off: the stall clock ends it once the nose has
+        // The new rule: stopped on the lane, mid-swing, long before the
+        // tug's own release at +34 s.
+        let (how, at, err, rate, swinging) = replay(&ticks, &plan, LIBP_RELEASED_S);
+        assert_eq!(how, "aligned", "at {at}");
+        assert!(swinging);
+        assert!((8.0..10.5).contains(&at), "{at}");
+        assert!(err.abs() < 4.0, "{err}");
+        let rest = predicted_rest_err(err, rate);
+        assert!(rest.abs() <= ON_LANE_DEG, "{rest}");
+
+        // What the tug did after a stop it ignored: the heading at the stop,
+        // then every `state` heading after it.
+        let mut after = AfterStop::new(Some(heading_at(at)));
+        for &(ts, h) in LIBP_AFTER_STOP.iter().filter(|(ts, _)| *ts > at) {
+            after.step(ts - at, Some(h));
+        }
+        assert!(after.ignored());
+        assert!(after.travel_deg() > 40.0, "{}", after.travel_deg());
+        // A failed read is no measurement.
+        let mut blind = AfterStop::new(Some(heading_at(at)));
+        blind.step(1.0, None);
+        assert!(!blind.ignored());
+
+        // A lane the swing never reaches (target 300): nothing stops the
+        // push while the nose swings, the stall clock only once it has
         // stood still (262.1 at +30.9; the state records are 1.3 s apart,
-        // so allow a sample), never while it is swinging.
-        let (how, at, swinging) = run(f64::INFINITY);
+        // so allow a sample).
+        let far = Plan {
+            target_hdg: 300.0,
+            ..plan.clone()
+        };
+        let (how, at, _, _, swinging) = replay(&ticks_for(300.0), &far, f64::INFINITY);
         assert_eq!(how, "stalled", "{at}");
         assert!(!swinging);
         assert!(
@@ -1956,11 +2149,72 @@ mod tests {
         );
     }
 
+    /// LIPK, sortie 1790408535, 2026-09-26: a Nose 90 left, plan 83.5 m to
+    /// 135.6. Every `push` tick from the swing's start (t from the live
+    /// "stopped"), as blackboxed.
+    #[rustfmt::skip]
+    const LIPK_PUSH: &[(f64, f64, f64)] = &[
+        (-39.7, 93.9, 109.1), (-39.2, 95.0, 109.1), (-38.6, 96.1, 109.1), (-38.1, 97.1, 109.1),
+        (-37.5, 98.2, 109.1), (-37.0, 99.2, 109.1), (-36.4, 100.4, 109.0), (-35.9, 101.3, 108.1),
+        (-35.4, 101.8, 107.2), (-34.8, 102.2, 106.7), (-34.3, 102.6, 106.3), (-33.7, 103.2, 105.9),
+        (-33.2, 103.9, 105.5), (-32.6, 104.5, 105.0), (-32.1, 105.1, 104.5), (-31.5, 105.7, 103.9),
+        (-31.0, 106.3, 103.3), (-30.4, 106.8, 102.7), (-29.9, 107.4, 102.0), (-29.4, 108.0, 100.9),
+        (-28.8, 108.6, 99.9), (-28.3, 109.2, 98.7), (-27.7, 109.8, 97.3), (-27.2, 110.4, 95.6),
+        (-26.7, 111.1, 93.9), (-26.1, 111.7, 91.9), (-25.6, 112.3, 89.8), (-25.0, 112.7, 88.0),
+        (-24.5, 113.2, 86.2), (-24.0, 113.5, 84.5), (-23.4, 113.9, 82.9), (-22.9, 114.2, 81.4),
+        (-22.3, 114.6, 79.6), (-21.8, 114.9, 77.8), (-21.2, 115.2, 76.1), (-20.7, 115.5, 74.3),
+        (-20.1, 115.9, 72.5), (-19.6, 116.1, 70.6), (-19.0, 116.4, 68.7), (-18.5, 116.7, 66.9),
+        (-18.0, 116.9, 64.9), (-17.4, 117.2, 63.0), (-16.9, 117.4, 61.0), (-16.3, 117.6, 59.0),
+        (-15.8, 117.8, 56.7), (-15.2, 118.0, 53.5), (-14.7, 118.2, 50.3), (-14.2, 118.4, 47.0),
+        (-13.6, 118.5, 43.6), (-13.1, 118.7, 40.2), (-12.5, 118.8, 36.7), (-12.0, 118.9, 33.2),
+        (-11.4, 118.9, 29.9), (-10.9, 119.0, 27.0), (-10.4, 119.0, 24.6), (-9.8, 119.1, 22.2),
+        (-9.3, 119.1, 19.9), (-8.7, 119.1, 17.6), (-8.2, 119.1, 15.5), (-7.6, 119.1, 13.5),
+        (-7.1, 119.1, 11.7), (-6.6, 119.1, 10.0), (-6.0, 119.1, 8.2), (-5.5, 119.1, 6.6),
+        (-4.9, 119.0, 4.8), (-4.4, 119.0, 3.0), (-3.8, 119.0, 1.1), (-3.3, 119.0, -0.7),
+        (-2.7, 118.9, -2.5), (-2.2, 118.9, -4.3), (-1.7, 118.8, -6.2), (-1.1, 118.8, -8.1),
+        (-0.6, 118.8, -9.9), (0.0, 118.7, -11.8),
+    ];
+
+    /// The LIPK tug swung the nose THROUGH the lane at 3.4 deg/s and the
+    /// stall clock said "stop" 11.8 degrees past it; that stop was obeyed:
+    /// the `state` heading moved 145.5, 148.3, 148.3 (2.8 degrees, still
+    /// within 1.3 s), which is `STOP_LATENCY_S` and a final err near -14.6.
+    /// The new judge stops it 4.4 s earlier, at err 3.0, led by the rate, so
+    /// it comes to rest within `ON_LANE_DEG` of the lane; the obeyed stop's
+    /// travel is not `stop_ignored`.
+    #[test]
+    fn a_swing_onto_the_lane_is_stopped_on_it() {
+        let plan = Plan {
+            back_m: 83.5,
+            target_hdg: 135.6,
+            node: (LAT0, LON0),
+            lane: false,
+        };
+        let (how, at, err, rate, _) = replay(LIPK_PUSH, &plan, f64::INFINITY);
+        assert_eq!(how, "aligned", "at {at}");
+        assert!((at + 4.4).abs() < 0.05, "{at}");
+        assert!((err - 3.0).abs() < 0.05, "{err}");
+        assert!((-3.6..-2.8).contains(&rate), "{rate}");
+        let rest = predicted_rest_err(err, rate);
+        assert!(rest.abs() <= ON_LANE_DEG, "{rest}");
+        // The live stop's own numbers, through the same prediction: -11.8 at
+        // -3.4 deg/s rests at -14.5, what the state headings showed.
+        assert!((predicted_rest_err(-11.8, -3.4) + 14.5).abs() < 0.1);
+
+        // The obeyed stop, read after it: 2.8 degrees, not ignored.
+        let mut after = AfterStop::new(Some(145.5));
+        for (ts, h) in [(1.3, 148.3), (2.5, 148.3), (3.7, 148.7), (4.9, 148.2)] {
+            after.step(ts, Some(h));
+        }
+        assert!(!after.ignored(), "{}", after.travel_deg());
+    }
+
     /// A push that is really over still ends at once. The LIEA straight push
     /// (sortie 1790494983, 2026-09-27, plan 34.3 m, the nose steady at 0.4)
     /// stops on the tick it passed the plan, as it did live; a turned push
-    /// that comes to rest aligned ends within `SWING_SETTLE_S` of the nose
-    /// standing still, not at the 12 s stall.
+    /// that comes to rest short of the lane (but inside `ALIGN_DEG`) ends
+    /// within `SWING_SETTLE_S` of the nose standing still, not at the 12 s
+    /// stall; one swinging AWAY from the lane is stopped at once.
     #[test]
     fn a_finished_push_still_stops_promptly() {
         let plan = Plan {
@@ -1985,7 +2239,8 @@ mod tests {
             .map(|(t, _, _)| *t);
         assert_eq!(end, Some(0.0));
 
-        // A Nose 90 swinging 3 deg/s onto the lane, still from t = 10.
+        // A Nose 90 swinging 3 deg/s toward the lane, still at 5 off from
+        // t = 10: never "on the lane", so it ends once the nose is still.
         let plan = Plan {
             back_m: 40.0,
             target_hdg: 0.0,
@@ -1999,6 +2254,7 @@ mod tests {
             let v = j.step(t, 45.0, err, true, true, &plan, false);
             if t < 10.0 {
                 assert_ne!(v, PushVerdict::Complete, "mid-swing at {t}");
+                assert_ne!(v, PushVerdict::Aligned, "short of the lane at {t}");
             }
             if v == PushVerdict::Complete {
                 break t;
@@ -2007,6 +2263,21 @@ mod tests {
             assert!(t < 30.0);
         };
         assert!((10.0..=10.0 + SWING_SETTLE_S + 0.5).contains(&end), "{end}");
+
+        // Swinging AWAY from the lane, inside the band: stopped at once.
+        // The swing is under way before the distance is made (t = 3.5).
+        let mut j = PushJudge::new(0.0);
+        let mut t: f64 = 0.0;
+        let end = loop {
+            let v = j.step(t, 30.0 + 3.0 * t, 5.0 + 2.0 * t, true, true, &plan, false);
+            assert_ne!(v, PushVerdict::Complete, "at {t}");
+            if v == PushVerdict::Aligned {
+                break t;
+            }
+            t += 0.5;
+            assert!(t < 10.0);
+        };
+        assert_eq!(end, 3.5);
     }
 
     /// The Gatwick stand that convicted the per-tick steering (2026-07-27).

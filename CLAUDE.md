@@ -339,8 +339,12 @@ everything blackboxes to `logs/blackbox.jsonl` (kinds: `atc`, `autotaxi`, `autot
   refused with too little runway left.
 - **Pushback** (`src/pushback.rs`): the tug commands are WHOLE manoeuvres (a "Nose 90" is in the
   plan's arithmetic), sent ONCE at the summon, never steered; `pushback_stop` = stop and let go.
-  - A tug mid-swing finishes its pattern (`PushJudge`: `done` and the stall clock wait for the
-    nose to be STILL, `SwingWatch`; a rate dip is not the end); a tug on the bar owns the aircraft: the taxi holds on `pushback_attached` (`tug_hold`, `TUG_WAIT_SECS`).
+  - **We stop the tug when we are there** (`PushJudge`): distance made and the nose on the lane
+    is `Aligned`, stopped mid-swing, led by the rate (`stop_on_the_lane`, `STOP_LATENCY_S`). The
+    swing (`SwingWatch`) only blocks a FALSE stop: no stall verdict and no distance-only finish
+    while the nose is swung, a rate dip is not the end. A tug that swings on after the stop is
+    logged (`stop_ignored`), never told again. A tug on the bar owns the aircraft: the taxi holds
+    on `pushback_attached` (`tug_hold`, `TUG_WAIT_SECS`).
   - **Any command to a tug ON THE BAR drops it off**: no re-issue, no nudge, no second pattern; a
     short push is judged (`push_delivered`), the rest is the taxi's. The bar coming off ENDS the
     push (released tugs never come back).
