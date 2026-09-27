@@ -378,6 +378,12 @@ fn summarise(flight: &[&Value]) -> String {
                 }
                 Some(l)
             }
+            ("autoland", "balk_landed") => Some(format!(
+                "balked at {:.0} ft radio ({}) and landed anyway, {:.0} m ahead: no go-around call",
+                f(e, "balk_radio").unwrap_or(0.0),
+                s(e, "why").replace('_', " "),
+                f(e, "remaining_m").unwrap_or(0.0)
+            )),
             ("autoland", "final_report") => Some(format!(
                 "final report: runway {}, {:.1} nm",
                 s(e, "rwy"),
