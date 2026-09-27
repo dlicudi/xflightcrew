@@ -773,6 +773,10 @@ confirms it closes it (`fixes #N` in the commit). Known gaps are `owed` issues.
   jumped across it) is a cut, `TAXI_MAX_CUT_M`, not off the line; a drive that stops short (`stagnant`, `off_route`, a
   give-up) fails; a landing is scored at its FIRST contact and a bounce is recorded (`bounce_ft`).
   `bench/sorties/` holds trimmed real sorties whose verdicts `cargo test` pins.
+- **A night of landings is one command** (`xvl sortie bench/sorties/<spec>.yaml --repeat N`,
+  `src/sortie_runner.rs`): set up, type the mission, the `sortie_result` is the row
+  (`logs/sorties/run-<stamp>.md`); an approach setup is its own sortie (`setup::hold_sortie_while`).
+  It refuses over a flying loop or replay; Ctrl-C, a crash or the deadline types "my controls".
 - A law that misbehaves in the air while its test passes: suspect the plant. A first-order lag
   cannot ring; fly second-order plants through the real transport delay.
 

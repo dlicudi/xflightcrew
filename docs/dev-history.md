@@ -9183,3 +9183,16 @@ catches 26L traffic (no close-parallel rule in the incursion watch).
 Next sortie: no `runway_incursion` between `taxi_in` `vacating` and `RunwayVacated`; no `atc`
 `compliance` record at a runway start; `clearance_readback` then `atc` `ifr_clearance` side crew with
 no `ifr_clearance_not_accepted`. Offline only.
+
+## 2026-09-28: the sortie runner (issue #89)
+
+`xvl sortie <spec.yaml> [--repeat N]` (`src/sortie_runner.rs`) flies a list of cases unattended beside
+a live xvl. An approach is the setup tool's own typed words (`approach_line`, grammar-pinned), so the
+app arms autoland on the result; a runway or ramp start goes through the init mailbox (`run_init`),
+then 5 s still and `settle_s`. The mission is typed into `xcopilot/typed`; `CaseMachine` over the
+blackbox tail wants a `tool` record or crew line in 5 s (once more; a setup never twice), a sortie
+begin in 180 s, and takes the `sortie_result` as the verdict; a crash or the deadline fails the case
+and types "my controls". Rows go to `logs/sorties/run-<stamp>.md`, exit 1 on any fail. A stand-alone
+approach setup is now a sortie (`approach`, held while `autoland::ACTIVE`,
+`setup::hold_sortie_while`), so every case is one file and one verdict. First spec:
+`bench/sorties/lemg-737.yaml`. Offline only; the 5 s ack and sim speed 2x are unmeasured live.
