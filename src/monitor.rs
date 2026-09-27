@@ -157,6 +157,12 @@ pub struct Snapshot {
     /// check. The C90 doesn't animate its handle from this, so the panel can look
     /// released while the sim-level brake drags (seen live: 48 kt -> stopped).
     pub park_brake: f64,
+    /// A crew loop's own brake command is in flight (`tools::brake_cmd_quiet`
+    /// false). X-Plane shows a HELD brake command on `parking_brake_ratio`:
+    /// `brakes_regular` ramps it to about 0.36, `brakes_max` to 1.0, and it
+    /// decays within a second or two of the command's expiry. So while this
+    /// is true the ratio is our brake, not a parking brake anyone set.
+    pub crew_brake: bool,
     /// Cabin altitude, feet (`.../pressurization/indicators/cabin_altitude_ft`). On
     /// an unpressurized airframe this tracks the actual altitude, which is exactly
     /// what the hypoxia check wants; on a pressurized one it's the real cabin.
@@ -522,6 +528,7 @@ impl Snapshot {
             low_vacuum,
             battery_amps,
             park_brake,
+            crew_brake: !crate::tools::brake_cmd_quiet(),
             cabin_altitude_ft,
             fuel_selector,
             alt_ft,
@@ -1644,9 +1651,16 @@ impl Check for RollingOnParkBrake {
     fn eval(&self, s: &Snapshot) -> Option<String> {
         // Not when the copilot set it: the taxi-in arrests a rolling handoff
         // on the parking brake and says so itself (see `taxi_in::arrest_holding`).
+        // Nor while a crew brake command is in flight: a rejected takeoff's
+        // `brakes_max` reads 0.7 to 1.0 on this ratio at 60 to 90 kt and
+        // decays to zero once it expires (1790524628: 1.0 at the stop, 0.4
+        // two seconds later, 0.0 by four); the caution said "release it"
+        // mid-reject at EGKK three times (2026-09-27). This check is for the
+        // brake a PILOT forgot, which reads set with our brakes quiet.
         (s.on_ground
             && s.groundspeed_kts > 5.0
             && s.park_brake > 0.5
+            && !s.crew_brake
             && !crate::taxi_in::arrest_holding())
         .then(|| "Parking brake is set and we're rolling — release it.".to_string())
     }
@@ -5126,6 +5140,7 @@ mod tests {
             low_vacuum: false,
             battery_amps: 0.0,
             park_brake: 0.0,
+            crew_brake: false,
             cabin_altitude_ft: 0.0,
             fuel_selector: None,
             alt_ft: 0.0,
@@ -6225,6 +6240,25 @@ mod tests {
         );
         crate::taxi_in::ARREST_HOLD.store(false, std::sync::atomic::Ordering::Relaxed);
         assert!(c.eval(&s).is_some());
+    }
+
+    /// EGKK 26L (1790524628, 2026-09-27): the reject's `brakes_max` read
+    /// `park` 0.7 at 87 kt and 1.0 at 69 kt, and the caution told the crew
+    /// to release the brake that was stopping the aircraft. Our own brake
+    /// command is not a forgotten parking brake; the same reading with our
+    /// brakes quiet still is.
+    #[test]
+    fn a_rejects_own_brake_is_not_a_rolling_parking_brake() {
+        let c = RollingOnParkBrake;
+        let mut s = snap(true, true);
+        for (gs, park) in [(87.7, 0.7), (69.0, 1.0), (48.4, 1.0)] {
+            s.groundspeed_kts = gs;
+            s.park_brake = park;
+            s.crew_brake = true;
+            assert!(c.eval(&s).is_none(), "the reject's brake at {gs} kt, park {park}");
+            s.crew_brake = false;
+            assert!(c.eval(&s).is_some(), "a pilot's brake at {gs} kt, park {park}");
+        }
     }
 
     #[test]
