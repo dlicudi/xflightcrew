@@ -492,7 +492,7 @@ everything blackboxes to `logs/blackbox.jsonl` (kinds: `atc`, `autotaxi`, `autot
   MAP short of the runway is flown on its path (`map_path`) and HANDED OVER with the talk-down armed
   (`map_handover_path`, `nav::visual_segment`). The steep autoland (`gp_ft_per_nm`,
   `take_missed_legs`) is off behind `MAP_AUTOLAND` (LSZS 2026-09-24). **A MAP on the runway fix is a
-  landing** (`map_short_of_runway`).
+  landing** (`map_short_of_runway`), handed over at the FAF (`handoff_index`; EGKK 26L 2026-09-27).
 - **The ILS is tuned, watched and, per airframe, flown** (`src/ils.rs`): `ils::tune` at every arm
   (read back, `ils` `tuned`); `XCheck` calls a needle held off on final; `Coupling` only with the
   profile's `ils_coupled`, never writing what a capture owns.
