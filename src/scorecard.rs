@@ -275,6 +275,8 @@ const TAXI_FAILURES: &[&str] = &[
     "overspeed_stop",
     "tug_never_released",
     "stopped_from_outside",
+    // The route's end reached off its line (`autotaxi::arrived_on_line`).
+    "stopped_off_line",
 ];
 
 /// The takeoff events that mean the roll was STOPPED, not finished.

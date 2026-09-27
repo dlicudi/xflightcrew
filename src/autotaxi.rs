@@ -111,6 +111,44 @@ const STOP_HEADING_HOLD_M: f64 = 8.0;
 /// so 25 m off means something is wrong (bad fix, blocked nosewheel, a
 /// route the geometry can't follow).
 pub(crate) const OFF_ROUTE_STOP_M: f64 = 25.0;
+/// How far off the route's line a stop at its end may sit and still be an
+/// ARRIVAL. The law holds a couple of metres; the scorer calls 3 m off the
+/// line and 5 m inside a corner a miss (`scorecard` `TAXI_MAX_CUT_M`), so
+/// past this the aircraft is beside the holding point, not at it.
+pub(crate) const ARRIVED_ON_LINE_M: f64 = 5.0;
+
+/// Whether a stop at the route's end, `lateral_m` off its line (either
+/// side), is an arrival.
+pub(crate) fn arrived_on_line(lateral_m: f64) -> bool {
+    lateral_m.abs() <= ARRIVED_ON_LINE_M
+}
+
+/// How far short of the route's end, along it, an aircraft taxied there by
+/// hand still counts as at the holding point.
+pub(crate) const HAND_TAXIED_END_M: f64 = 60.0;
+
+/// Whether a position `to_go_m` short of the route's end (along it) and
+/// `lateral_m` off its line is at the holding point, for a drive that did
+/// not arrive by itself: near along the route AND on its line.
+pub fn at_the_hold(to_go_m: f64, lateral_m: f64) -> bool {
+    to_go_m <= HAND_TAXIED_END_M && arrived_on_line(lateral_m)
+}
+
+/// What the crew says stopping at the route's end off its line.
+fn off_line_stop_line(lateral_m: f64) -> String {
+    format!(
+        "We're {:.0} metres off the line at the end of the route, not at the holding point. Holding here. Your steering.",
+        lateral_m.abs()
+    )
+}
+
+/// Where a position sits against a route's END: metres still to run along
+/// it and metres off its line. The arrival judgement for a caller that was
+/// not driving (full auto's check after a pilot-taxied hold).
+pub fn route_end_fix(route: &Route, lat: f64, lon: f64) -> Option<(f64, f64)> {
+    let (progress, offset) = route.fix_signed(lat, lon)?;
+    Some((route.remaining(progress), offset.abs()))
+}
 /// Farther off than this at engage is a refusal: the projection onto the
 /// route stops meaning anything, and a blind cross-country drive to it
 /// isn't a join, it's a new route the tower never gave us.
@@ -2066,7 +2104,27 @@ async fn drive(xp: XPlaneClient, voice: Option<Voice>, route: Route, base_kts: f
             ACTIVE.store(false, Ordering::Relaxed);
             break;
         }
-        // Arrived: stopped at the hold-short line. The governor stays,
+        // Stopped at the end of the route but NOT on it: that is no arrival.
+        // A projection runs along the route however far off it the aircraft
+        // is, so the end can be "reached" from the grass beside it: LSZS 03
+        // (SR22, 2026-09-24) the second line-up joined 27 m off, never
+        // captured, and declared the holding point 27.4 m off the line; full
+        // auto then found the runway 34 degrees off. Hold it where it is and
+        // hand the steering back, with the number.
+        if remaining <= 1.0 && gs_kts < 1.5 && !arrived_on_line(lateral) {
+            tracing::warn!(lateral, "auto taxi: route end reached off the line");
+            crate::blackbox::record(
+                "autotaxi",
+                serde_json::json!({"event": "stopped_off_line", "lateral_m": lateral,
+                                   "joining": join_allow.is_none_or(|a| a > 0.0)}),
+            );
+            speedhold::set_taxi_target(0.0);
+            let _ = xp.set_float(TAXI_STEER, 0.0).await;
+            alert(&voice, Priority::Caution, &off_line_stop_line(lateral));
+            ACTIVE.store(false, Ordering::Relaxed);
+            break;
+        }
+        // Arrived: stopped at the hold-short line, ON it. The governor stays,
         // holding position on the brakes, exactly as a spoken "stop" —
         // "go" past this point is the pilot's call (a crossing clearance).
         if remaining <= 1.0 && gs_kts < 1.5 {
@@ -2394,6 +2452,37 @@ mod tests {
             holding_point: "N1".into(),
             lead_on: Vec::new(),
         }
+    }
+
+    /// LSZS 03 (SR22, 2026-09-24): the second line-up drive joined 27.4 m
+    /// off its route, never captured, and ran the projection to the end:
+    /// its last ticks read 0.4 m to go and -27.44 m off the line, and it
+    /// declared the holding point. Full auto found the runway 34 degrees off
+    /// and gave up. An arrival is ON the line; and full auto's own check
+    /// for a hold reached by hand (a straight 60 m from the route's end,
+    /// which a stop 27 m beside it passed) is along the route and on it.
+    #[test]
+    fn the_hold_is_reached_on_the_line_not_beside_it() {
+        assert!(!arrived_on_line(-27.44), "the recorded stop is no arrival");
+        assert!(!arrived_on_line(27.44));
+        // LEMG 13's hold (2026-09-26) ended 0.05 m off: an arrival.
+        assert!(arrived_on_line(0.05));
+        let r = Route::build(&watch()).expect("route");
+        // 27 m beside the hold, level with it: 27 m from the end in a
+        // straight line, which the old check took for the hold.
+        let (lat, lon) = ll(173.0, 297.0);
+        let (to_go, lateral) = route_end_fix(&r, lat, lon).expect("a fix");
+        assert!((lateral - 27.0).abs() < 1.0, "{lateral}");
+        assert!(!at_the_hold(to_go, lateral), "{to_go} to go, {lateral} off");
+        // Taxied by hand to 40 m short, on the paint: at the hold.
+        let (lat, lon) = ll(200.5, 260.0);
+        let (to_go, lateral) = route_end_fix(&r, lat, lon).expect("a fix");
+        assert!(at_the_hold(to_go, lateral), "{to_go} to go, {lateral} off");
+        // On the paint but 200 m short: not there yet.
+        let (lat, lon) = ll(200.0, 100.0);
+        let (to_go, lateral) = route_end_fix(&r, lat, lon).expect("a fix");
+        assert!(!at_the_hold(to_go, lateral), "{to_go} to go");
+        assert!(off_line_stop_line(-27.44).contains("27 metres off the line"));
     }
 
     #[test]
@@ -3476,6 +3565,8 @@ mod tests {
             .plan_to_runway(36.673087, -4.491381, rwy.thr_lat, rwy.thr_lon, 60.0, &zone, Some(strip))
             .expect("a route");
         println!("holding point {} via {:?}, lead-on {} pts", plan.holding_point, plan.via, plan.lead_on.len());
+        // The line-up starts where the taxi stopped: the route's own end.
+        let &(hlat, hlon) = plan.path.last().expect("a route end");
         let (path, stop) = line_up_path_from_lead_on(&rwy, hlat, hlon, &plan.lead_on).expect("the lead-on");
         let geo = taxi_guide::Geo::new(path[0].0);
         let pts: Vec<(f64, f64)> = path.iter().map(|&p| geo.to_m(path[0], p)).collect();
@@ -3492,7 +3583,11 @@ mod tests {
             }
         }
         println!("stop {stop:.0} m, sharpest vertex {worst_turn:.0} deg");
-        assert!(worst_turn < 90.0, "a lead-on never doubles back: {worst_turn:.0} degrees at one vertex");
+        // Before the paint gaps were filled (`nav::fill_paint_gaps`) the
+        // lead-on turned -62, +49, +43 and -63 degrees at consecutive
+        // vertices where the network's chord cut the drawn curve; the curve
+        // itself never turns more than about 11 degrees at one vertex.
+        assert!(worst_turn < 15.0, "a lead-on runs one way: {worst_turn:.0} degrees at one vertex");
     }
 
     #[test]
