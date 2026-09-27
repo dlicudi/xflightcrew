@@ -343,6 +343,28 @@ pub fn load_near(path: &str, lat: f64, lon: f64, half_deg: f64) -> Vec<Airspace>
         .collect()
 }
 
+/// The no-go volumes whose polygon's bounding box overlaps the box
+/// `lat_lo..=lat_hi`, `lon_lo..=lon_hi`: everything a route inside the box
+/// could meet. One streaming pass, like [`load_near`]; off the reply path.
+pub fn load_box(path: &str, lat_lo: f64, lat_hi: f64, lon_lo: f64, lon_hi: f64) -> Vec<Airspace> {
+    let Ok(file) = std::fs::File::open(path) else {
+        return Vec::new();
+    };
+    parse_no_go(BufReader::new(file).lines().map_while(Result::ok))
+        .into_iter()
+        .filter(|a| {
+            let (mut la0, mut la1, mut lo0, mut lo1) = (f64::MAX, f64::MIN, f64::MAX, f64::MIN);
+            for (la, lo) in &a.poly {
+                la0 = la0.min(*la);
+                la1 = la1.max(*la);
+                lo0 = lo0.min(*lo);
+                lo1 = lo1.max(*lo);
+            }
+            la0 <= lat_hi && la1 >= lat_lo && lo0 <= lon_hi && lo1 >= lon_lo
+        })
+        .collect()
+}
+
 /// The first volume any of `pts` enters at `alt_ft`; `None` = the path is
 /// clear of every no-go volume in `spaces`.
 pub fn first_conflict<'a>(

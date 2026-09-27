@@ -185,7 +185,7 @@ pub fn spoken_weight(v: f64, unit: &str) -> String {
 }
 
 /// A route waypoint for the FMS: an ident plus position and planned altitude.
-#[derive(Clone)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Waypoint {
     pub ident: String,
     pub lat: f64,
