@@ -207,8 +207,8 @@ stock 737 "re-synced" 14 times, 2026-09-27).
   refused with both numbers past the tanks or `acf_m_max`, read back. The loop asks
   `grammar::load_aircraft_request` first (same shape as the FMS load); "refuel" is the fuel truck.
 
-Still owed: an enroute point so full auto can fly a local plan (`enroute_legs` yields nothing from
-two airports), airspace dog-legs, airways.
+Still owed: issues labelled `owed` + `area:full-auto` (local plan enroute point #73, dog-legs #74,
+airways #75).
 
 ## ATC: the world, not the crew
 
@@ -542,9 +542,8 @@ down** (`taxi_in::shut_down_at_stand`: engines confirmed from `ENGN_running`, el
 spoken "taxi to parking" leaves the engines to the pilot.
 
 ### Still owed
-- The retard (`FlarePower`) is keyed on the sink the arrest removes (`hold_sink_fpm`). A go-around
-  that pitches for SPEED when slow and low. The hand-flown rotation loses the first knots.
-- SID/STAR re-pick in flight; AP capture on the authored route; `ils_coupled` proven per type.
+Issues labelled `owed` + `area:approach-landing` / `area:takeoff` / `area:full-auto` (retard #76,
+slow go-around #77, rotation #78, SID/STAR re-pick #79, authored-route capture #80, `ils_coupled` #81).
 
 ## Helicopters: the hover loop
 
@@ -596,8 +595,8 @@ physical drive.
 - Words: "hover at N", "set it down", "hold position", "take off", "fly a circuit"; the AP's mode
   tools are refused while the loop flies (`hover::blocks`).
 
-Still owed: the final's GROUNDSPEED cap in a headwind; transit fields' challenges; fast climb, gate
-lowering and the approach are unflown.
+Still owed: issues labelled `area:helicopter` (`owed`: headwind cap #82, transit challenges #83;
+`unflown`: approach and gate #47, fast climb #48).
 
 ## The flight model: one state, read by everyone (in SHADOW)
 
@@ -618,7 +617,7 @@ the `legal` table), `Control`, `Abnormal`, `Memory`, `Situation` (the pilot's ta
   spoken decline. The upset RECOVERY is only for an actual upset or distress words. "I'll taxi" /
   "let me fly" is the release guard (`note_crew_takeover`; blackbox `handover`).
 
-Still owed: rapport's own touchdown bookkeeping.
+Still owed: issues labelled `owed` (rapport's touchdown bookkeeping #85).
 
 ## Checklist flows: the list at its phase, three flavours
 
@@ -656,7 +655,7 @@ every loop down.
 - **"Teach me a full flight"** (`Syllabus`, `STEPS`, `flow::phase_boundary`, `syllabus_active`),
   behind `SyllabusIo` (`FlowIo` live), so the whole flight is a plain `cargo test`.
 - `xvl debrief` prints lessons and `instructor::grade_flight` over any flight's `state` records.
-- Still owed: a "show me" demonstration, handbook questions, taxi centreline as a lesson axis.
+- Still owed: issues labelled `owed` + `area:instructor` (#86, #87, #88).
 
 **Cabin crew** (`src/cabin.rs`): the second intercom persona.
 - **A state machine, not a commentator**, with its own mute (`cabin_quiet`), NOT the monitor's
@@ -711,6 +710,9 @@ its entry); near-static flags (`is_in_replay`, `paused`) are `SLOW_DATAREFS`; a 
 
 `cargo test --workspace` (root `cargo test` is the crew package only). **Run tests with
 `XCOPILOT_BLACKBOX=off`**, or they record into the live log.
+
+**A fix merged offline gets an `unflown` issue** listing the blackbox fields to check; the sortie that
+confirms it closes it (`fixes #N` in the commit). Known gaps are `owed` issues.
 
 - `crates/atc/src/tower.rs` matrix; `crates/atc/bench/atc_corpus.yaml` (real whisper, **add every
   new wart**); `route_keyed`/`route_unkeyed` in `crates/atc/src/station.rs`; STT eval
