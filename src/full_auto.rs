@@ -534,6 +534,36 @@ async fn ensure_squawk(xp: &XPlaneClient, ctx: &ToolCtx<'_>, voice: &Option<Voic
     }
 }
 
+/// The ONE transponder check before a "ready for departure" call
+/// (`radio::departure_check`): the assigned code dialled and read back, ALT
+/// through the airframe's selector. Said when it changed the code, and when
+/// it did not take; blackboxed `transponder_check` either way. Shared by the
+/// taxied departure, the runway start and the helicopter's pad departure.
+pub(crate) async fn transponder_before_departure(
+    xp: &XPlaneClient,
+    voice: &Option<Voice>,
+    at: &str,
+) -> crate::tools::radio::XpdrCheck {
+    let check =
+        crate::tools::radio::departure_check(xp, crate::party_line::assigned_squawk()).await;
+    let mut rec = check.json();
+    rec["at"] = json!(at);
+    event("transponder_check", rec);
+    if let Some(line) = check.failure_line() {
+        announce(voice, Priority::Caution, &line);
+    } else if let (true, Some(code)) = (check.code_dialled, check.code) {
+        announce(
+            voice,
+            Priority::Advisory,
+            &format!(
+                "Squawk {}, set.",
+                crate::atis::spoken_digits(&format!("{code:04}"))
+            ),
+        );
+    }
+    check
+}
+
 /// Clearance first, the real order: the zone clearance from the home tower,
 /// its squawk dialled and the clearance read back. Only with a simulated
 /// tower to answer (real/external ATC and copilot-only leave the clearance
@@ -1750,8 +1780,8 @@ async fn fly(xp: XPlaneClient, config: Config, voice: Option<Voice>, tools: SubT
         }
         event("at_hold", json!({}));
         // A squawk that came back after the clearance wait gave up is set
-        // here, before we talk to the tower again.
-        ensure_squawk(&xp, &ctx, &voice).await;
+        // here, before we talk to the tower again, and the box goes to ALT.
+        transponder_before_departure(&xp, &voice, "hold").await;
 
         // ATC: get the departure clearance BEFORE lining up — the tower gates
         // both the line-up and the takeoff on it. No station running means
@@ -1996,6 +2026,7 @@ async fn fly(xp: XPlaneClient, config: Config, voice: Option<Voice>, tools: SubT
             if let Some(khz) = crate::party_line::home_tower_khz() {
                 let _ = xp.set_float(COM1_FREQ_KHZ, khz as f64).await;
             }
+            transponder_before_departure(&xp, &voice, "runway_start").await;
             request_departure(&callsign).await;
             bail_if_abort!();
             let mut read_back = false;

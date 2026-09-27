@@ -804,6 +804,7 @@ async fn call_departure(xp: &XPlaneClient, voice: &Option<Voice>, config: &crate
     let _ = xp
         .set_float(crate::datarefs::COM1_FREQ_KHZ, khz as f64)
         .await;
+    crate::full_auto::transponder_before_departure(xp, voice, "heli_pad").await;
     crate::circuit::transmit(crate::circuit::radio_call(&callsign, "ready for departure"));
     DETAIL.set("waiting for the departure clearance");
     crate::blackbox::record(

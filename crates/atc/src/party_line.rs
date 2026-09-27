@@ -29,6 +29,21 @@ use crate::tower;
 /// The standing clearance: FSM state, callsign, runway, the readback owed.
 pub(crate) static CLEARANCE: Mutex<Option<ClearanceSnap>> = Mutex::new(None);
 
+/// A radar controller's squawk nudge, armed by the squawk watch as it speaks
+/// it: the crew acts on the instruction it heard ("recycle transponder",
+/// "confirm squawk ..."), which it never did (EGPH 2026-09-20: two recycles,
+/// nobody answered).
+pub(crate) static SQUAWK_NUDGE: Mutex<Option<SquawkNudge>> = Mutex::new(None);
+
+/// What the controller asked of the transponder: the code it wants, and
+/// whether it asked to RECYCLE (the code shows, the box does not reply) or
+/// to confirm the code (the digits are wrong).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SquawkNudge {
+    pub code: i64,
+    pub recycle: bool,
+}
+
 /// The taxi route the pilot is CLEARED on — feeds the compliance watch
 /// (world) and the progressive taxi guide (crew).
 pub(crate) static TAXI_ROUTE: Mutex<Option<TaxiWatch>> = Mutex::new(None);
@@ -296,6 +311,12 @@ pub fn plan_vacate(
 /// it into the transponder after the clearance.
 pub fn assigned_squawk() -> Option<i64> {
     *lock(&ASSIGNED_SQUAWK)
+}
+
+/// The controller's last squawk nudge, consumed: the crew recycles or
+/// re-dials once per call it heard.
+pub fn take_squawk_nudge() -> Option<SquawkNudge> {
+    lock(&SQUAWK_NUDGE).take()
 }
 
 /// A takeoff clearance is currently being withheld for traffic.

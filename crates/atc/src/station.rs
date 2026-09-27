@@ -25,7 +25,7 @@ pub use crate::party_line::RegionHandoff;
 pub(crate) use crate::party_line::{
     ARRIVAL_PIN, ASSIGNED_SQUAWK, CLEARANCE, DEPARTURE_HANDOFF, LANDING_HANDOFF, LINE_UP_CONDITION,
     PENDING_GO_AROUND, PENDING_LINE_UP, PENDING_STATION, PENDING_TAKEOFF_CLEARANCE, REGION_HANDOFF,
-    TAKEOFF_HOLD, TAXI_ROUTE, TAXI_TO_STAND, VECTORS, ZONE_CHALLENGE,
+    SQUAWK_NUDGE, TAKEOFF_HOLD, TAXI_ROUTE, TAXI_TO_STAND, VECTORS, ZONE_CHALLENGE,
 };
 
 /// Which of the station's frequencies COM1 is tuned to.
@@ -252,6 +252,7 @@ impl Station {
         // A new station means the old radar service (and its code) is void,
         // and the new tower has never talked to you — or to its ghosts.
         *SQUAWK_WATCH.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        *SQUAWK_NUDGE.lock().unwrap_or_else(|e| e.into_inner()) = None;
         *ASSIGNED_SQUAWK.lock().unwrap_or_else(|e| e.into_inner()) = None;
         *CLEARANCE.lock().unwrap_or_else(|e| e.into_inner()) = None;
         // Zone-watch grace on a fresh station: a region handoff says
@@ -323,6 +324,7 @@ impl Station {
         *ACTIVE_RUNWAYS.lock().unwrap_or_else(|e| e.into_inner()) = Vec::new();
         *ATIS.lock().unwrap_or_else(|e| e.into_inner()) = None;
         *SQUAWK_WATCH.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        *SQUAWK_NUDGE.lock().unwrap_or_else(|e| e.into_inner()) = None;
         *COMPLIANCE.lock().unwrap_or_else(|e| e.into_inner()) = ComplianceState::NEW;
         *HANDOFF.lock().unwrap_or_else(|e| e.into_inner()) = None;
         *GHOSTS.lock().unwrap_or_else(|e| e.into_inner()) = None;
@@ -1628,7 +1630,12 @@ pub fn squawk_tick(
     // with the transponder in standby got "confirm squawk 4503" (Gatwick,
     // 2026-07-13) — a nag that reads as "your digits are wrong" when the
     // digits are the one thing that's right.
-    let line = if actual == Some(w.code) {
+    let recycle = actual == Some(w.code);
+    *SQUAWK_NUDGE.lock().unwrap_or_else(|e| e.into_inner()) = Some(crate::party_line::SquawkNudge {
+        code: w.code,
+        recycle,
+    });
+    let line = if recycle {
         format!(
             "{}, negative radar contact, recycle transponder.",
             w.callsign
@@ -5728,6 +5735,7 @@ mod tests {
         // callsign (armed by Departure, already nudged) was this test's watch
         // about one run in four, by test order.
         *SQUAWK_WATCH.lock().unwrap() = None;
+        *SQUAWK_NUDGE.lock().unwrap() = None;
         let mut st = lxgb();
         let spoken = st.assign_squawk(
             "November one seven two Sierra Papa",
@@ -5752,6 +5760,12 @@ mod tests {
         let (line, who) = squawk_tick(Some(7000), true, late).expect("nudge");
         assert!(line.contains("confirm squawk"), "{line}");
         assert!(matches!(who, StationSpeaker::Approach));
+        // The crew hears it as data: the code to dial, no recycle.
+        assert_eq!(
+            crate::party_line::take_squawk_nudge(),
+            Some(crate::party_line::SquawkNudge { code, recycle: false })
+        );
+        assert_eq!(crate::party_line::take_squawk_nudge(), None, "drained once");
         // Immediately again: quiet (nudge cooldown).
         assert!(squawk_tick(Some(7000), true, late).is_none());
         // Right code but transponder on standby: not replying, no contact —
@@ -5764,6 +5778,11 @@ mod tests {
             "{line}"
         );
         assert!(!line.contains("confirm squawk"), "{line}");
+        assert_eq!(
+            crate::party_line::take_squawk_nudge(),
+            Some(crate::party_line::SquawkNudge { code, recycle: true }),
+            "the crew is told to recycle"
+        );
         // Code set and replying: "radar contact", exactly once.
         let (line, _) = squawk_tick(Some(code), true, later + std::time::Duration::from_secs(50))
             .expect("radar contact");

@@ -775,21 +775,21 @@ pub fn slew(prev: f64, want: f64, max_step: f64) -> f64 {
 /// own box (the Twin Otter's KT73) has its KNOB turned; on its own task, since
 /// a stepped knob takes a few hundred milliseconds. The result is kept and a
 /// failure said: the A330 flew out in standby to two "recycle transponder"
-/// calls with nothing said on the flight deck (EGPH, 2026-09-20).
+/// calls with nothing said on the flight deck (EGPH, 2026-09-20). It is the
+/// ONE departure check (`radio::departure_check`): the tower's assigned code
+/// is dialled and read back too, so the spoken takeoff and the circuit leave
+/// with the squawk full auto would have set.
 fn squawk_altitude(base_url: String, v: Option<Voice>) {
     tokio::spawn(async move {
         let xp = XPlaneClient::new(base_url);
-        let ok = crate::tools::radio::set_mode(&xp, crate::tools::radio::XpdrMode::Altitude).await;
-        crate::blackbox::record(
-            "autotakeoff",
-            serde_json::json!({"event": "transponder_alt", "ok": ok}),
-        );
-        if !ok {
-            alert(
-                &v,
-                Priority::Caution,
-                "The transponder didn't take altitude mode. Check the knob.",
-            );
+        let check =
+            crate::tools::radio::departure_check(&xp, crate::party_line::assigned_squawk()).await;
+        let mut rec = check.json();
+        rec["event"] = serde_json::json!("transponder_alt");
+        rec["ok"] = serde_json::json!(check.ok());
+        crate::blackbox::record("autotakeoff", rec);
+        if let Some(line) = check.failure_line() {
+            alert(&v, Priority::Caution, &line);
         }
     });
 }

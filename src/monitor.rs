@@ -3181,6 +3181,38 @@ pub async fn run(
                         }
                     }
                 }
+                // The controller's squawk nudge is an INSTRUCTION to the
+                // crew: recycle, or dial the code, and say so on both
+                // channels (EGPH 2026-09-20: two "recycle transponder" calls,
+                // nobody answered). Crew hands only; on its own task, since a
+                // stepped knob takes a few hundred milliseconds.
+                if let Some(nudge) = crate::party_line::take_squawk_nudge() {
+                    if crate::mode::crew_actuates() {
+                        let base = config.xplane_base_url.clone();
+                        let v = voice.clone();
+                        tokio::spawn(async move {
+                            let xp = XPlaneClient::new(base);
+                            let (check, said, readback) =
+                                crate::tools::radio::answer_nudge(&xp, nudge.code, nudge.recycle)
+                                    .await;
+                            let mut rec = check.json();
+                            rec["route"] = serde_json::json!("squawk_answer");
+                            rec["recycle"] = serde_json::json!(nudge.recycle);
+                            rec["ok"] = serde_json::json!(check.ok());
+                            crate::blackbox::record("atc", rec);
+                            let prio = if check.ok() {
+                                Priority::Advisory
+                            } else {
+                                Priority::Caution
+                            };
+                            v.alert(prio, &said);
+                            if let Some(words) = readback {
+                                let cs = crate::circuit::crew_callsign(&xp).await;
+                                crate::circuit::transmit(crate::circuit::radio_call(&cs, &words));
+                            }
+                        });
+                    }
+                }
                 // Compliance watch: the tower holds the pilot to the
                 // clearances it actually issued (uncleared runway entry,
                 // takeoff, landing), and challenges zone traffic it has
