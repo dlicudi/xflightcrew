@@ -992,7 +992,15 @@ pub async fn run(
     STEERED.store(true, SeqCst);
     ABORT.store(false, SeqCst);
     SKIP.store(false, SeqCst);
-    let out = run_inner(xp, ctx, voice, plan, abort, valve_set).await;
+    let mut out = run_inner(xp, ctx, voice, plan, abort, valve_set).await;
+    // The pilot's stop that landed after the loop's last look (it returned
+    // on its own a tick later): still answered, brakes first, from their
+    // read-back, never left to a line said before anything was set (#110).
+    if out.is_ok() && ABORT.load(SeqCst) {
+        send(ctx, "stop").await;
+        abort_brakes(ctx.xplane, voice, valve_set, "ended").await;
+        out = Err("abort".into());
+    }
     // Stop-and-let-go on EVERY exit, unconditionally. A pushback command is a
     // whole manoeuvre the tug runs on its own, and a re-issued continuation
     // outlives any return path that forgets this line: the MAX_ISSUES exit
@@ -1156,8 +1164,14 @@ async fn run_inner(
             event(json!({ "event": "skipped", "stage": "waiting" }));
             return Err("skipped".into());
         }
+        let aborted = stopping(abort);
+        if aborted {
+            // Set for the wait already; driven again for the read-back the
+            // pilot's "stop" is answered from.
+            abort_brakes(ctx.xplane, voice, valve_set, "waiting").await;
+        }
         event(json!({ "event": "no_tug", "waited_s": TUG_WAIT_SECS }));
-        return Err(if stopping(abort) { "abort" } else { "no_tug" }.into());
+        return Err(if aborted { "abort" } else { "no_tug" }.into());
     }
 
     // NOTHING is sent to a tug on the bar. The summon carried the pattern,
@@ -1213,8 +1227,9 @@ async fn run_inner(
             send(ctx, "stop").await;
             // Brakes on. The bar may be off and the engines are running, so an
             // abort that only stops the TUG leaves the aircraft rolling —
-            // the same hole the re-hook wait had.
-            let _ = crate::tools::controls::drive_park_brake(ctx.xplane, true, valve_set).await;
+            // the same hole the re-hook wait had. Answered from the brake's
+            // read-back, never before it (#110).
+            abort_brakes(ctx.xplane, voice, valve_set, "pushing").await;
             event(json!({ "event": "abort", "back_m": r1(back_m) }));
             return Err("abort".into());
         }
@@ -1507,6 +1522,14 @@ async fn run_inner(
     // held the throttle at idle for 25 s (LIBP 737, 2026-09-26). A fresh
     // zero makes the plugin write the ratios back to zero.
     let _ = xp.set_float(TAXI_BRAKE, 0.0).await;
+    if stopping(abort) {
+        // Stopped while waiting for the tug to let go: the pilot's word, so
+        // the parking brake, on the bar or not, and the line from what the
+        // brake reads.
+        abort_brakes(ctx.xplane, voice, valve_set, "tug_wait").await;
+        event(json!({ "event": "abort", "back_m": r1(back_m), "stage": "tug_wait" }));
+        return Err("abort".into());
+    }
     if cleared {
         // Brakes SET now, and set they STAY until the taxi drive arms and its
         // governor releases them itself. The gap between the tug letting go
@@ -1537,6 +1560,53 @@ async fn run_inner(
         *TUG_WARNED.lock().unwrap_or_else(|e| e.into_inner()) = Some(Instant::now());
     }
     Ok(back_m)
+}
+
+/// The answer to the pilot's "stop" during a push, chosen from the parking
+/// brake's READ-BACK: full auto's steered push used to hear "Brakes on, your
+/// aircraft." from the command loop the moment the word landed, before the
+/// push loop had set anything (#110, from #65). Shared with the native push's
+/// stop in `main.rs`, so the two can never say different things.
+pub fn stop_line(held: bool) -> &'static str {
+    if held {
+        "Stopping the push. Brakes on, your aircraft."
+    } else {
+        "Stopping the push. The parking brake did not set, hold the brakes. Your aircraft."
+    }
+}
+
+/// A push that ends on a stop: the parking brake through the confirmed seam
+/// (tried three times, read back). The line is the pilot's answer only when
+/// the pilot's stop word ([`ABORT`]) ended it, taken once; a full auto abort
+/// from elsewhere is spoken for by full auto. Blackbox `abort_brakes`.
+async fn abort_brakes(
+    xp: &dyn crate::xplane::XPlane,
+    voice: &Option<Voice>,
+    valve_set: Option<f64>,
+    stage: &str,
+) -> bool {
+    let (held, line) = answer_stop(xp, valve_set, stage, ABORT.swap(false, SeqCst)).await;
+    if let (Some(line), Some(v)) = (line, voice) {
+        v.alert(Priority::Readback, line.to_string());
+    }
+    held
+}
+
+/// [`abort_brakes`] without the voice: whether the brake reads set, and the
+/// line owed to the pilot (`None` when the stop was not theirs, `pilot`).
+async fn answer_stop(
+    xp: &dyn crate::xplane::XPlane,
+    valve_set: Option<f64>,
+    stage: &str,
+    pilot: bool,
+) -> (bool, Option<&'static str>) {
+    let r = crate::tools::controls::set_park_brake_confirmed(xp, valve_set, 3).await;
+    event(
+        json!({ "event": "abort_brakes", "stage": stage, "held": r.held,
+                  "tries": r.tries, "park": r.park.map(|p| (p * 100.0).round() / 100.0),
+                  "err": r.err, "pilot_stop": pilot }),
+    );
+    (r.held, pilot.then(|| stop_line(r.held)))
 }
 
 /// Every tug instruction goes through the SAME `pushback` tool the pilot's
@@ -2546,5 +2616,48 @@ mod tests {
             t += 0.5;
         };
         assert_eq!((v, t), (TugWait::TimedOut, TUG_CLEAR_MAX_SECS));
+    }
+
+    /// Issue #110: the steered push's stop was answered "Brakes on, your
+    /// aircraft." by the command loop before the push loop had set anything.
+    /// The answer now comes from the brake's read-back: a brake the command
+    /// sets is "Brakes on"; one that stays at 0.03 through three drives (the
+    /// EGSS 737's read-back, #65) says it did not set; a stop that was not
+    /// the pilot's (full auto's own abort) sets the brake and says nothing.
+    #[tokio::test]
+    async fn the_pilots_stop_is_answered_from_the_brake_read_back() {
+        use crate::tools::PARK_BRAKE;
+        use crate::xplane::FakeXPlane;
+        const SET: &str = "sim/flight_controls/park_brake_set";
+        let takes = FakeXPlane::with_reads(&[(PARK_BRAKE, 0.0)]);
+        takes.step_on_command(SET, PARK_BRAKE, 1.0);
+        let (held, line) = answer_stop(&takes, None, "pushing", true).await;
+        assert!(held);
+        assert_eq!(line, Some("Stopping the push. Brakes on, your aircraft."));
+
+        let stuck = FakeXPlane::with_reads(&[(PARK_BRAKE, 0.03)]);
+        let (held, line) = answer_stop(&stuck, None, "pushing", true).await;
+        assert!(!held);
+        let line = line.expect("the pilot is answered");
+        assert!(
+            line.contains("did not set") && !line.contains("Brakes on"),
+            "{line}"
+        );
+
+        let takes = FakeXPlane::with_reads(&[(PARK_BRAKE, 0.0)]);
+        takes.step_on_command(SET, PARK_BRAKE, 1.0);
+        let (held, line) = answer_stop(&takes, None, "pushing", false).await;
+        assert!(held, "the brake is set whoever stopped the push");
+        assert_eq!(line, None);
+
+        // The command loop no longer claims the brake for a steered push:
+        // its stop lines are the native push's, chosen from its own
+        // read-back through the same `stop_line`.
+        let main = include_str!("main.rs");
+        assert!(
+            !main.contains(r#""Stopping the push."#),
+            "a literal stop line in main.rs"
+        );
+        assert!(main.contains("pushback::stop_line(held)"));
     }
 }

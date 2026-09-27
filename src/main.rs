@@ -1768,12 +1768,10 @@ async fn run_session(
                     // which is what aborting only the push would have full
                     // auto do next. Only a steered push can be full auto's.
                     full_auto::abort();
-                    say(
-                        &voice,
-                        &reporter,
-                        ui::LogKind::Readback,
-                        "Stopping the push. Brakes on, your aircraft.",
-                    );
+                    // Nothing said HERE: the push loop answers once it has
+                    // set the parking brake, from the read-back
+                    // (`pushback::stop_line`). This line used to claim the
+                    // brakes before the loop had even seen the word (#110).
                     continue;
                 } else {
                     // A NATIVE push (the spoken tool's one-shot command): no
@@ -1801,11 +1799,7 @@ async fn run_session(
                         &voice,
                         &reporter,
                         ui::LogKind::Readback,
-                        if held {
-                            "Stopping the push. Brakes on, your aircraft."
-                        } else {
-                            "Stopping the push. The parking brake did not set, hold the brakes. Your aircraft."
-                        },
+                        pushback::stop_line(held),
                     );
                     // A governor also driving means the flag was stale, not a
                     // push — fall through so "stop" reaches the brakes it was
