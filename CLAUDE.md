@@ -455,9 +455,11 @@ everything blackboxes to `logs/blackbox.jsonl` (kinds: `atc`, `autotaxi`, `autot
   level gets one reminder naming who holds it (`PlannedTod.held_ft`, `procedure::held_tod`). None on
   an approach or in a climb (`CLIMBING_FPM`), and the family speaks only in the model's cruise
   above 1,000 ft AGL (`monitor::tod_in_cruise`; a ring behind the departure, LSZS-LILO 2026-09-24).
-- **A level the plan handed down is not argued with**: no step-climb advice with a TOD published; a
-  wandering cruise is still cruise (`CRUISE_WANDER_FPM`); a JOIN projects along the nose
-  (`project_signed_facing`); the taxi law's idle-and-brake waits unless a surge (`SURGE_KTS_S`).
+- **A level the plan handed down is not argued with**: no step-climb advice while a follower flies,
+  with under 30 min of cruise left, or more than three levels under optimum (a level PLANNED low,
+  `STEP_CLIMB_MIN_CRUISE_MIN`; EGBB-EGKK 2026-09-27); a wandering cruise is still cruise
+  (`CRUISE_WANDER_FPM`); a JOIN projects along the nose (`project_signed_facing`); the taxi law's
+  idle-and-brake waits unless a surge (`SURGE_KTS_S`).
 - **A descent that outruns the governor gets drag, then a shallower rate**
   (`procedure::descent_drag`: speedbrake where `arm_spoilers` is declared; stowed on every exit).
   Never with the gear down or flap past the first detent (`drag_barred`, `why`; EGKK 2026-09-27).

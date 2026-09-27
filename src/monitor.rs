@@ -1874,15 +1874,48 @@ impl StepClimb {
         // thousand feet below optimum, flight level two five zero would burn
         // less" - twice - at FL230, which the plan had just brought us down
         // to from FL250, with the descent advisory already given.
-        if s.follower_tod.is_some() {
+        //
+        // And the plan's level is the plan's on EVERY leg, not only one
+        // with a descent published: `follower_tod` is `None` on a leg whose
+        // constraint is not below us, so EGBB-EGKK (2026-09-27) heard the
+        // advice at +1405 s with the follower holding the planned 15,000 ft
+        // and its descent 9 minutes off.
+        if s.follower_tod.is_some() || s.follower_flying {
             return None;
         }
         if s.phase != Phase::Cruise || s.on_ground || s.vsi_fpm.abs() > CRUISE_WANDER_FPM {
             return None;
         }
+        // A climb pays back only over the cruise left to fly at the new
+        // level; minutes before the top of descent it is fuel spent going
+        // up to come straight down.
+        if step_cruise_left_min(s).is_some_and(|m| m < STEP_CLIMB_MIN_CRUISE_MIN) {
+            return None;
+        }
         let optimum = crate::aircraft::optimum_altitude_ft(&self.reference, s.all_up_kg?)?;
         crate::aircraft::step_climb_ft(s.alt_ft, optimum).map(|step| (step, optimum))
     }
+}
+
+/// Minutes of cruise left before the top of descent under which a step climb
+/// is not worth asking for. A 2,000 ft step costs a couple of minutes at climb
+/// power and saves a percent or two of the cruise burn after it: over half an
+/// hour that is money, over the ten minutes EGBB-EGKK had left it is not.
+const STEP_CLIMB_MIN_CRUISE_MIN: f64 = 30.0;
+
+/// Minutes to the top of descent at this groundspeed: to the plan's ring when
+/// one is published, else to 3 nm per 1,000 ft above the field. `None`
+/// without a destination or a groundspeed (then nothing is gated on it).
+/// Pure.
+fn step_cruise_left_min(s: &Snapshot) -> Option<f64> {
+    let dist = s.dest_dist_nm?;
+    if s.groundspeed_kts <= 60.0 {
+        return None;
+    }
+    let ring = s.tod_ring_nm.unwrap_or_else(|| {
+        (s.alt_ft - s.dest_elev_ft.unwrap_or(0.0)).max(0.0) / 1000.0 * 3.0
+    });
+    Some((dist - ring).max(0.0) / s.groundspeed_kts * 60.0)
 }
 
 /// A level cruise under an autopilot wanders, and every crossing of this gate
@@ -5434,6 +5467,49 @@ mod tests {
             None,
             "the copilot asks, it does not climb"
         );
+    }
+
+    /// EGBB-EGKK (sortie 1790534902, 2026-09-27, +1405 s): a 737 at 63,976 kg
+    /// holding the plan's 15,000 ft, 68 nm from Gatwick at 303 kt with the
+    /// follower flying, heard "23,300 feet below optimum ... flight level one
+    /// seven zero would burn less". Three gates, each alone enough.
+    #[test]
+    fn no_step_climb_on_a_short_hop_or_over_the_plans_level() {
+        let c = StepClimb {
+            reference: jet_reference(),
+        };
+        let egbb_egkk = || {
+            let mut s = mid_atlantic_737(63_976.0, 14_997.0);
+            s.groundspeed_kts = 303.0;
+            s.dest_dist_nm = Some(68.0);
+            s.dest_elev_ft = Some(202.0);
+            s
+        };
+        // The optimum the line quoted is the profile's own at that weight.
+        let optimum = crate::aircraft::optimum_altitude_ft(&jet_reference(), 63_976.0).unwrap();
+        assert_eq!(((optimum - 14_997.0) / 100.0).round() * 100.0, 23_300.0);
+        // 1: a gap of eleven levels is a level PLANNED low, not a drift one
+        // step answers: the gap and the level asked for no longer disagree
+        // because the pair is never said.
+        assert_eq!(crate::aircraft::step_climb_ft(14_997.0, optimum), None);
+        assert_eq!(c.eval(&egbb_egkk()), None, "planned low, not drifted");
+        // 2: a follower flying the plan's level is never argued with, even on
+        // a leg with no top of descent published and a gap one step answers.
+        let mut following = mid_atlantic_737(62_935.0, 34_000.0);
+        following.follower_flying = true;
+        assert_eq!(following.follower_tod, None);
+        assert_eq!(c.eval(&following), None, "the plan's level is the plan's");
+        // 3: ten minutes of cruise left does not pay for a climb, whoever flies.
+        let mut short = mid_atlantic_737(62_935.0, 34_000.0);
+        short.groundspeed_kts = 450.0;
+        short.dest_dist_nm = Some(180.0);
+        short.dest_elev_ft = Some(202.0);
+        short.tod_ring_nm = Some(105.0);
+        assert!(step_cruise_left_min(&short).unwrap() < STEP_CLIMB_MIN_CRUISE_MIN);
+        assert_eq!(c.eval(&short), None, "10 minutes to the top of descent");
+        // The same drift with two hours of cruise ahead is still worth a word.
+        short.dest_dist_nm = Some(1_000.0);
+        assert!(c.eval(&short).is_some_and(|l| l.contains("three six zero")));
     }
 
     /// The climb is only worth taking if the wind up there allows it, so the
