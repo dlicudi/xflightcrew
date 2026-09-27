@@ -26,7 +26,7 @@ pub(crate) use crate::party_line::{
     ARRIVAL_PIN, ASSIGNED_SQUAWK, CLEARANCE, DEPARTURE_HANDOFF, IFR_CLEARANCE, LANDING_HANDOFF,
     LINE_UP_CONDITION,
     PENDING_GO_AROUND, PENDING_LINE_UP, PENDING_STATION, PENDING_TAKEOFF_CLEARANCE, REGION_HANDOFF,
-    TAKEOFF_HOLD, TAXI_ROUTE, TAXI_TO_STAND, VECTORS, ZONE_CHALLENGE,
+    SQUAWK_NUDGE, TAKEOFF_HOLD, TAXI_ROUTE, TAXI_TO_STAND, VECTORS, ZONE_CHALLENGE,
 };
 
 /// Which of the station's frequencies COM1 is tuned to.
@@ -83,6 +83,12 @@ pub struct Station {
     /// The runway the arrival now calling named for itself, consumed by the
     /// pick that answers the call (`note_stated_runway`).
     stated_runway: Option<String>,
+    /// The runway a "request runway ..." call named, canonical ("8L"), for
+    /// the ctx that answers it (`note_stated_runway`, `apply_runway_request`).
+    runway_request: Option<String>,
+    /// That request resolved to a strip end the tower can hand out ("08L"),
+    /// committed as the runway in use when the tower grants it.
+    requested_ident: Option<String>,
     /// The departure controller has said "radar contact" to this flight.
     dep_checked_in: bool,
     /// The ATIS information letter the pilot last reported having ("with
@@ -205,6 +211,8 @@ impl Station {
             twr: tower::Tower::new(),
             runway_in_use: None,
             stated_runway: None,
+            runway_request: None,
+            requested_ident: None,
             dep_checked_in: false,
             pilot_info: None,
             assigned_squawk: None,
@@ -264,6 +272,7 @@ impl Station {
         // A new station means the old radar service (and its code) is void,
         // and the new tower has never talked to you — or to its ghosts.
         *SQUAWK_WATCH.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        *SQUAWK_NUDGE.lock().unwrap_or_else(|e| e.into_inner()) = None;
         *ASSIGNED_SQUAWK.lock().unwrap_or_else(|e| e.into_inner()) = None;
         *IFR_CLEARANCE.lock().unwrap_or_else(|e| e.into_inner()) = None;
         *CLEARANCE.lock().unwrap_or_else(|e| e.into_inner()) = None;
@@ -336,6 +345,7 @@ impl Station {
         *ACTIVE_RUNWAYS.lock().unwrap_or_else(|e| e.into_inner()) = Vec::new();
         *ATIS.lock().unwrap_or_else(|e| e.into_inner()) = None;
         *SQUAWK_WATCH.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        *SQUAWK_NUDGE.lock().unwrap_or_else(|e| e.into_inner()) = None;
         *COMPLIANCE.lock().unwrap_or_else(|e| e.into_inner()) = ComplianceState::NEW;
         *HANDOFF.lock().unwrap_or_else(|e| e.into_inner()) = None;
         *GHOSTS.lock().unwrap_or_else(|e| e.into_inner()) = None;
@@ -690,6 +700,16 @@ impl Station {
             _ => ctx,
         };
         let reply = self.respond_inner(transcript, service, intent.clone(), ctx, wx);
+        // A granted runway request makes that runway the one in use; the
+        // taxi (or the join) it bought freezes the pick on it from here.
+        if service == Service::Tower && intent == tower::Intent::RequestRunway {
+            if let Some(ident) = self.requested_ident.take() {
+                if ctx.runway_refusal.is_none() {
+                    tracing::info!(runway = %ident, "runway request granted");
+                    self.runway_in_use = Some(ident);
+                }
+            }
+        }
         // Publish the clearance picture for the monitor's compliance watch:
         // two-way contact has happened, and this is what the pilot is (and
         // isn't) cleared to do. Same reply-path-owns-its-static pattern as
@@ -699,11 +719,12 @@ impl Station {
             callsign: ctx.callsign.clone(),
             runway_ident: self.runway_in_use.clone().unwrap_or_default(),
             pending_readback: self.twr.suggested_readback(&ctx.callsign),
+            holds_runway: self.twr.holds_runway(),
         });
         // A fresh taxi clearance publishes its route for the off-route
         // compliance watch (and clears any stale one when route-less).
         if service == Service::Tower
-            && intent == tower::Intent::RequestTaxi
+            && matches!(intent, tower::Intent::RequestTaxi | tower::Intent::RequestRunway)
             && self.twr.state == tower::State::TaxiCleared
         {
             *TAXI_ROUTE.lock().unwrap_or_else(|e| e.into_inner()) = self
@@ -947,6 +968,7 @@ impl Station {
             | tower::Intent::RequestTaxi
             | tower::Intent::RequestTaxiIn
             | tower::Intent::RunwayVacated
+            | tower::Intent::RequestRunway
             | tower::Intent::RequestStartup
             | tower::Intent::RequestShutdown
             | tower::Intent::RequestIfrClearance { .. }
@@ -1146,6 +1168,7 @@ impl Station {
             | tower::Intent::RequestTaxi
             | tower::Intent::RequestTaxiIn
             | tower::Intent::RunwayVacated
+            | tower::Intent::RequestRunway
             | tower::Intent::RequestStartup
             | tower::Intent::RequestShutdown
             | tower::Intent::RequestIfrClearance { .. }
@@ -1298,6 +1321,49 @@ impl Station {
             | tower::Intent::RequestLanding { .. } => tower::stated_runway(transcript),
             _ => None,
         };
+        self.runway_request = match intent {
+            tower::Intent::RequestRunway => tower::requested_runway(transcript),
+            _ => None,
+        };
+        self.requested_ident = None;
+    }
+
+    /// Answer a "request runway ..." call's context: the runway it named,
+    /// resolved against this field (`resolve_runway_request`). Granted, the
+    /// ctx names THAT runway and, on the ground, the taxi route is re-planned
+    /// to it from `pos` (as `RequestTaxi` plans one to the runway in use);
+    /// refused, the ctx carries the reason. Pure but for the route planner.
+    fn apply_runway_request(&mut self, ctx: &mut tower::Ctx, pos: Option<(f64, f64)>) {
+        match resolve_runway_request(&self.apt.runways, self.runway_request.as_deref()) {
+            Err(refusal) => {
+                self.requested_ident = None;
+                ctx.runway_refusal = Some(refusal);
+            }
+            Ok(ident) => {
+                ctx.runway = atis::spoken_runway(&ident);
+                ctx.runway_refusal = None;
+                if ctx.on_ground {
+                    self.planned_route = pos.and_then(|(lat, lon)| {
+                        plan_taxi_route_to(&self.apt.runways, &ident, lat, lon)
+                    });
+                    let route = self.planned_route.as_ref();
+                    ctx.holding_point = route
+                        .map(|r| spoken_taxiway(&r.holding_point))
+                        .filter(|h| !h.is_empty())
+                        .unwrap_or_else(|| "Alpha".to_string());
+                    ctx.taxi_via = route.map(|r| spoken_via(&r.via)).unwrap_or_default();
+                    ctx.taxi_crossings = route
+                        .map(|r| {
+                            r.crossings
+                                .iter()
+                                .map(|n| atis::spoken_runway(first_designator(n)))
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                }
+                self.requested_ident = Some(ident);
+            }
+        }
     }
 
     /// The runway in use. Re-picked from the wind only when there IS wind
@@ -1335,14 +1401,15 @@ impl Station {
         // a wind dead across the strip the pick flipped in that moment, the
         // party line published the other end, and the crew's approach was
         // re-aimed at it from 60 ft (EGTE 08 to 26, 2026-09-21).
+        // A landed arrival that has REPORTED the runway vacated no longer
+        // owns it: the pick is free to follow the wind and the stream again.
         let committed = matches!(
             self.twr.state,
             tower::State::TaxiCleared
                 | tower::State::LinedUp
                 | tower::State::TakeoffCleared
                 | tower::State::Inbound
-                | tower::State::ClearedToLand
-        );
+        ) || (self.twr.state == tower::State::ClearedToLand && !self.twr.runway_vacated());
         if committed && self.runway_in_use.is_some() {
             return self.runway_in_use.clone().unwrap_or_default();
         }
@@ -1480,11 +1547,13 @@ impl Station {
                 && self.twr.state == tower::State::ClearedToLand);
         self.planned_route = None;
         let mut own_on_runway = false;
+        let mut pos = None;
         if on_ground {
             if let (Ok(lat), Ok(lon)) = (
                 xp.get_float(datarefs::LATITUDE).await,
                 xp.get_float(datarefs::LONGITUDE).await,
             ) {
+                pos = Some((lat, lon));
                 own_on_runway = strip(&self.apt.runways, &ident)
                     .is_some_and(|r| on_runway(r, lat, lon).is_some());
                 self.planned_route = if arrival {
@@ -1505,6 +1574,9 @@ impl Station {
             wake_secs_left,
         );
         ctx.own_on_runway = own_on_runway;
+        if intent == tower::Intent::RequestRunway {
+            self.apply_runway_request(&mut ctx, pos);
+        }
         ctx.helicopter = xp
             .get_float("sim/aircraft2/metadata/is_helicopter")
             .await
@@ -1579,6 +1651,7 @@ impl Station {
             own_on_runway: false,
             helicopter: false,
             ifr: None,
+            runway_refusal: None,
         }
     }
 }
@@ -1721,6 +1794,46 @@ pub(crate) fn resolve_destination(dest: &str) -> Option<(String, String)> {
     Some((pick.icao.clone(), pick.apt.name.clone()))
 }
 
+/// A requested runway resolved against the field: `Ok(ident)` for a strip
+/// end the tower hands out (`nav::assignable_runways`), else the spoken
+/// (runway, reason) the refusal says. No runway in the words is refused
+/// with an empty runway, which the tower answers with "say again": a
+/// mishear never buys a runway.
+fn resolve_runway_request(
+    runways: &[nav::Runway],
+    heard: Option<&str>,
+) -> Result<String, (String, String)> {
+    let Some(canon) = heard else {
+        return Err((String::new(), String::new()));
+    };
+    let spoken_canon = || {
+        let digits: String = canon.chars().take_while(|c| c.is_ascii_digit()).collect();
+        let padded = if digits.len() == 1 {
+            format!("0{canon}")
+        } else {
+            canon.to_string()
+        };
+        atis::spoken_runway(&padded)
+    };
+    let Some(ident) = runways
+        .iter()
+        .flat_map(|r| [&r.ident_a, &r.ident_b])
+        .find(|id| tower::runway_matches(id, canon))
+        .cloned()
+    else {
+        return Err((spoken_canon(), "no such runway here".to_string()));
+    };
+    let assignable = nav::assignable_runways(runways)
+        .any(|r| r.ident_a == ident || r.ident_b == ident);
+    if !assignable {
+        return Err((
+            atis::spoken_runway(&ident),
+            "that runway is not available".to_string(),
+        ));
+    }
+    Ok(ident)
+}
+
 /// This flight's discrete squawk, deterministic from the callsign so tests
 /// and a restarted session reproduce it. Codes live in the 45xx block with
 /// octal last digits — every code valid, and the block is clear of all
@@ -1802,7 +1915,12 @@ pub fn squawk_tick(
     // with the transponder in standby got "confirm squawk 4503" (Gatwick,
     // 2026-07-13) — a nag that reads as "your digits are wrong" when the
     // digits are the one thing that's right.
-    let line = if actual == Some(w.code) {
+    let recycle = actual == Some(w.code);
+    *SQUAWK_NUDGE.lock().unwrap_or_else(|e| e.into_inner()) = Some(crate::party_line::SquawkNudge {
+        code: w.code,
+        recycle,
+    });
+    let line = if recycle {
         format!(
             "{}, negative radar contact, recycle transponder.",
             w.callsign
@@ -1832,6 +1950,10 @@ pub struct ClearanceSnap {
     /// The exact readback the pilot owes right now, phrased — the coach's
     /// first suggestion. `None` = no readback outstanding.
     pub pending_readback: Option<String>,
+    /// The tower's book says OUR aircraft holds `runway_ident`: cleared onto
+    /// it, or landed on it and not yet reported off ([`tower::Tower::holds_runway`]).
+    /// The "runway vacated" report clears it, before the taxi request.
+    pub holds_runway: bool,
 }
 
 /// A compliance or zone call: what to say, and whether the COPILOT says it
@@ -3146,6 +3268,14 @@ pub fn active_station_range_nm(lat: f64, lon: f64) -> Option<f64> {
 /// the runway-incursion watch.
 static ACTIVE_RUNWAYS: Mutex<Vec<nav::Runway>> = Mutex::new(Vec::new());
 
+/// The active field's runways, for the party line (`field_runways`).
+pub(crate) fn active_runways() -> Vec<nav::Runway> {
+    ACTIVE_RUNWAYS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+}
+
 /// Lateral capture around a runway centerline when the 100-row carried no
 /// width: 40 m covers everything up to a wide-body runway (60 m ÷ 2 + slack)
 /// without capturing a parallel taxiway.
@@ -4031,6 +4161,26 @@ pub struct PartyExchange {
     pub ghost_seed: usize,
 }
 
+/// The strip the PLAYER holds for the party line: the one it stands on, or,
+/// on the ground, the one the tower's book still gives it (cleared onto it,
+/// or landed and not yet reported off). A ghost landing or departing that
+/// strip is not narrated a clearance over our head. The "runway vacated"
+/// report frees it, as it frees a real tower's runway, before the taxi
+/// request that used to be the only thing that did (Liege 2026-09-22).
+pub fn player_blocked_strip(on_ground: bool, lat: f64, lon: f64) -> Option<String> {
+    if !on_ground {
+        return None;
+    }
+    on_active_runway(lat, lon).or_else(|| {
+        CLEARANCE
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .filter(|c| c.holds_runway && !c.runway_ident.is_empty())
+            .map(|c| c.runway_ident.clone())
+    })
+}
+
 /// One pass of the party line: narrate at most ONE exchange for the ghost
 /// traffic — an arrival's final call answered with the landing clearance
 /// while the ghost is still descending (spoken BEFORE reality lands it), a
@@ -4170,6 +4320,26 @@ pub fn chatter_tick(
             // 2026-07-10 tape).
             let ident = departure_runway_ident(t.lat, t.lon, m.prev_lat, m.prev_lon)
                 .or_else(|| nearest_runway_ident(t.lat, t.lon));
+            // The player holds this strip: the tower gave nobody else a
+            // takeoff on it, so the replay's departure goes un-narrated.
+            let held = match (&ident, blocked_ident) {
+                (Some(a), Some(b)) => {
+                    let runways = ACTIVE_RUNWAYS.lock().unwrap_or_else(|e| e.into_inner());
+                    matches!(
+                        (strip(&runways, a), strip(&runways, b)),
+                        (Some(x), Some(y)) if std::ptr::eq(x, y)
+                    )
+                }
+                _ => false,
+            };
+            if held {
+                m.last_seen = now;
+                m.prev_ele_ft = t.ele_ft;
+                m.prev_ground = t.on_ground;
+                m.prev_lat = t.lat;
+                m.prev_lon = t.lon;
+                continue;
+            }
             let clearance = match ident {
                 Some(id) => format!(
                     "{cs}, runway {}, cleared for takeoff.",
@@ -5859,6 +6029,7 @@ mod tests {
         // callsign (armed by Departure, already nudged) was this test's watch
         // about one run in four, by test order.
         *SQUAWK_WATCH.lock().unwrap() = None;
+        *SQUAWK_NUDGE.lock().unwrap() = None;
         let mut st = lxgb();
         let spoken = st.assign_squawk(
             "November one seven two Sierra Papa",
@@ -5883,6 +6054,12 @@ mod tests {
         let (line, who) = squawk_tick(Some(7000), true, late).expect("nudge");
         assert!(line.contains("confirm squawk"), "{line}");
         assert!(matches!(who, StationSpeaker::Approach));
+        // The crew hears it as data: the code to dial, no recycle.
+        assert_eq!(
+            crate::party_line::take_squawk_nudge(),
+            Some(crate::party_line::SquawkNudge { code, recycle: false })
+        );
+        assert_eq!(crate::party_line::take_squawk_nudge(), None, "drained once");
         // Immediately again: quiet (nudge cooldown).
         assert!(squawk_tick(Some(7000), true, late).is_none());
         // Right code but transponder on standby: not replying, no contact —
@@ -5895,6 +6072,11 @@ mod tests {
             "{line}"
         );
         assert!(!line.contains("confirm squawk"), "{line}");
+        assert_eq!(
+            crate::party_line::take_squawk_nudge(),
+            Some(crate::party_line::SquawkNudge { code, recycle: true }),
+            "the crew is told to recycle"
+        );
         // Code set and replying: "radar contact", exactly once.
         let (line, _) = squawk_tick(Some(code), true, later + std::time::Duration::from_secs(50))
             .expect("radar contact");
@@ -6121,6 +6303,7 @@ mod tests {
             callsign: "November one seven two Sierra Papa".into(),
             runway_ident: "09".into(),
             pending_readback: None,
+            holds_runway: false,
         });
         // On the ground at the parking first (settles the air/ground edge —
         // and a stand is nobody's runway), then taxi onto the runway
@@ -6205,6 +6388,7 @@ mod tests {
             callsign: "November one seven two Sierra Papa".into(),
             runway_ident: "27".into(),
             pending_readback: None,
+            holds_runway: false,
         });
         let t0 = Instant::now();
         let sec = std::time::Duration::from_secs;
@@ -6342,6 +6526,7 @@ mod tests {
             callsign: "November one seven two Sierra Papa".into(),
             runway_ident: "09".into(),
             pending_readback: None,
+            holds_runway: false,
         });
         *COMPLIANCE.lock().unwrap() = ComplianceState::NEW;
         // The cleared route: south to north straight across the runway at
@@ -6492,6 +6677,7 @@ mod tests {
             callsign: "November one seven two Sierra Papa".into(),
             runway_ident: "09".into(),
             pending_readback: None,
+            holds_runway: false,
         });
         // A tiny network: taxiway A east along 36.0000, then H1 north to the
         // holding point. The cleared route rides all of it.
@@ -6592,6 +6778,7 @@ mod tests {
             callsign: "November five five zero Charlie Romeo".into(),
             runway_ident: "27".into(),
             pending_readback: None,
+            holds_runway: false,
         });
         let t0 = Instant::now();
         let sec = std::time::Duration::from_secs;
@@ -6660,6 +6847,7 @@ mod tests {
             callsign: "November one two three".into(),
             runway_ident: "02".into(),
             pending_readback: None,
+            holds_runway: false,
         });
         *COMPLIANCE.lock().unwrap() = ComplianceState::NEW;
         let t0 = Instant::now();
@@ -6711,6 +6899,7 @@ mod tests {
             callsign: "November five five zero Charlie Romeo".into(),
             runway_ident: "20".into(),
             pending_readback: None,
+            holds_runway: false,
         });
         *COMPLIANCE.lock().unwrap() = ComplianceState::NEW;
         let t0 = Instant::now();
@@ -6980,6 +7169,162 @@ mod tests {
         *ACTIVE_RUNWAYS.lock().unwrap() = Vec::new();
     }
 
+    /// ETND's two strips as apt.dat has them: 08L/26R, 446 m of grass, and
+    /// 08/26, 1,240 m of asphalt beside it.
+    fn etnd_runways() -> Vec<nav::Runway> {
+        vec![
+            nav::Runway {
+                ident_a: "08L".into(),
+                ident_b: "26R".into(),
+                lat_a: 52.5862935,
+                lon_a: 8.3393953,
+                lat_b: 52.5866670,
+                lon_b: 8.3459906,
+                width_m: 50.0,
+                surface: 3,
+            },
+            nav::Runway {
+                ident_a: "08".into(),
+                ident_b: "26".into(),
+                lat_a: 52.5850000,
+                lon_a: 8.3318780,
+                lat_b: 52.5859870,
+                lon_b: 8.3501930,
+                width_m: 45.11,
+                surface: 1,
+            },
+        ]
+    }
+
+    /// "Request runway ..." in the tower matrix (ETND 2026-09-24): an
+    /// assignable runway is granted as the taxi to it and becomes the runway
+    /// in use (published on the party line for the crew); the grass strip
+    /// the field does not hand out, a runway the field lacks and words with
+    /// no runway in them are refused and move nothing.
+    #[test]
+    fn a_runway_request_is_granted_or_refused_by_the_field() {
+        let _guard = SIDE_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        *CLEARANCE.lock().unwrap() = None;
+        let wx = calm();
+        let mut st = lxgb();
+        st.apt.name = "Diepholz".into();
+        st.apt.runways = etnd_runways();
+        let ask = |st: &mut Station, words: &str| {
+            let intent = tower::parse_intent(words);
+            assert_eq!(intent, tower::Intent::RequestRunway, "{words}");
+            st.note_stated_runway(words, intent);
+            let mut ctx = scripted_ctx(st, wx);
+            ctx.on_ground = true;
+            st.apply_runway_request(&mut ctx, None);
+            st.route_keyed(words, Service::Tower, &ctx, wx)
+        };
+
+        // The grass strip is refused: a tower does not hand it out.
+        let r = ask(&mut st, "request runway two six right");
+        assert!(r.contains("unable runway two six right, that runway is not available"), "{r}");
+        assert_eq!(st.twr.state, tower::State::Parked);
+        // A runway the field lacks.
+        let r = ask(&mut st, "request runway three three");
+        assert!(r.contains("unable runway three three, no such runway here"), "{r}");
+        let r = ask(&mut st, "request runway zero niner");
+        assert!(r.contains("unable runway zero niner"), "{r}");
+        assert_eq!(st.twr.state, tower::State::Parked);
+
+        // The paved runway, asked for by length: granted, and it is the
+        // runway in use from here, on the party line too.
+        let r = ask(&mut st, "unable two six right, request runway zero eight for length");
+        assert!(
+            r.contains("runway zero eight approved, taxi to holding point"),
+            "{r}"
+        );
+        assert!(r.contains("runway zero eight"), "{r}");
+        assert_eq!(st.twr.state, tower::State::TaxiCleared);
+        assert_eq!(st.runway_in_use.as_deref(), Some("08"));
+        assert_eq!(crate::party_line::clearance_runway().as_deref(), Some("08"));
+        // The pick holds it through the taxi, whatever the calm air says.
+        assert_eq!(st.pick_runway(260.0, 3.0), "08");
+
+        *CLEARANCE.lock().unwrap() = None;
+        *TAXI_ROUTE.lock().unwrap() = None;
+    }
+
+    /// Liege 2026-09-22 (history "Still owed"): the tower learned its runway
+    /// was free from our taxi request, not from the "runway vacated" report
+    /// before it. Landed and off the pavement, before the report a ghost's
+    /// departure off our strip goes un-narrated (nobody else is given a
+    /// takeoff on a runway the book still gives us); after it the next
+    /// departure is released, the pick is free again, and the bare
+    /// "request taxi" is still the taxi IN.
+    #[test]
+    fn the_vacated_report_frees_the_strip_before_the_taxi_request() {
+        let _guard = SIDE_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        *GHOSTS.lock().unwrap() = None;
+        let path = lxgb_apt_file();
+        let wx = Wx {
+            wind_from_deg: 250.0,
+            wind_kts: 12.0,
+        };
+        let mut st = Station::load(path.to_str().unwrap(), "LXGB").expect("LXGB loads");
+        *ACTIVE_RUNWAYS.lock().unwrap() = st.apt.runways.clone();
+        let mut ctx = scripted_ctx(&mut st, wx);
+        ctx.on_ground = true;
+        // Landed on 27, rolled off onto the apron south of the strip.
+        let r = st.route_keyed("final runway two seven", Service::Tower, &ctx, wx);
+        assert!(r.contains("cleared to land"), "{r}");
+        st.twr.gate("cleared to land runway two seven", tower::Intent::Unknown, &ctx);
+        assert_eq!(st.twr.state, tower::State::ClearedToLand);
+        let (off_lat, off_lon) = (36.1440, -5.3500);
+        assert!(on_active_runway(off_lat, off_lon).is_none(), "the apron is off the strip");
+        let held = player_blocked_strip(true, off_lat, off_lon);
+        assert!(held.is_some(), "landed and not reported off: the book holds the strip");
+        assert!(player_blocked_strip(false, off_lat, off_lon).is_none(), "airborne holds nothing");
+
+        let (flat, flon, felev) = (36.1512, -5.3554, 11.0);
+        let t0 = Instant::now();
+        let sec = std::time::Duration::from_secs;
+        let ghost = |cs: &str, ele: f64, ground: bool| TcasTarget {
+            callsign: cs.into(),
+            lat: 36.1514,
+            lon: -5.345,
+            ele_ft: ele,
+            on_ground: ground,
+            vs_fpm: 0.0,
+        };
+        let tick = |t: TcasTarget, held: Option<&str>, at: Instant| {
+            chatter_tick(&[t], "Gibraltar", flat, flon, felev, held, at)
+        };
+        assert!(tick(ghost("VLG88AB", 11.0, true), held.as_deref(), t0).is_none());
+        assert!(
+            tick(ghost("VLG88AB", 100.0, false), held.as_deref(), t0 + sec(5)).is_none(),
+            "no takeoff narrated off a strip the book still gives us"
+        );
+
+        // The report: acknowledged, the state stands, the strip is free.
+        let r = st.route_keyed("runway vacated", Service::Tower, &ctx, wx);
+        assert!(r.contains("roger, thank you"), "{r}");
+        assert_eq!(st.twr.state, tower::State::ClearedToLand);
+        assert!(st.twr.runway_vacated());
+        let snap_holds = CLEARANCE.lock().unwrap().as_ref().map(|c| c.holds_runway);
+        assert_eq!(snap_holds, Some(false), "published for the watches");
+        let held = player_blocked_strip(true, off_lat, off_lon);
+        assert!(held.is_none(), "{held:?}");
+        assert!(tick(ghost("RYR12", 11.0, true), held.as_deref(), t0 + sec(10)).is_none());
+        let ex = tick(ghost("RYR12", 100.0, false), held.as_deref(), t0 + sec(15))
+            .expect("the next departure is released");
+        assert!(ex.lines[0].text.contains("cleared for takeoff"), "{}", ex.lines[0].text);
+        // The pick no longer freezes on a landing that is over.
+        assert_eq!(st.pick_runway(90.0, 20.0), "09", "the wind turns a freed field round");
+
+        // Still the taxi IN, never a departure clearance.
+        let r = st.route_keyed("request taxi", Service::Tower, &ctx, wx);
+        assert!(!r.contains("holding point"), "{r}");
+        assert_eq!(st.twr.state, tower::State::Parked);
+
+        *GHOSTS.lock().unwrap() = None;
+        *ACTIVE_RUNWAYS.lock().unwrap() = Vec::new();
+        *CLEARANCE.lock().unwrap() = None;
+    }
+
     #[test]
     fn go_around_ordered_when_a_ghost_takes_the_runway() {
         let _guard = SIDE_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -7000,6 +7345,7 @@ mod tests {
             callsign: "November one seven two Sierra Papa".into(),
             runway_ident: "09".into(),
             pending_readback: None,
+            holds_runway: false,
         });
         let ghost_on_runway = TcasTarget {
             callsign: "IBE3421".into(),
@@ -7136,6 +7482,7 @@ mod tests {
             callsign: cs.into(),
             runway_ident: "27".into(),
             pending_readback: Some(format!("Cleared to land runway two seven, {cs}.")),
+            holds_runway: false,
         });
         let mut st = lxgb();
         st.twr.state = tower::State::ClearedToLand;
@@ -7193,6 +7540,7 @@ mod tests {
             callsign: "November one seven two Sierra Papa".into(),
             runway_ident: "09".into(),
             pending_readback: None,
+            holds_runway: false,
         });
         // Our strip: 09/27. The watches only care about THIS pavement.
         *ACTIVE_RUNWAYS.lock().unwrap() = vec![nav::Runway {
@@ -7338,6 +7686,7 @@ mod tests {
             callsign: "November two four four Kilo Romeo".into(),
             runway_ident: "26L".into(),
             pending_readback: None,
+            holds_runway: false,
         });
         *PENDING_TAKEOFF_CLEARANCE.lock().unwrap() = false;
         *PENDING_LINE_UP.lock().unwrap() = false;
@@ -7477,6 +7826,7 @@ mod tests {
             callsign: "November two four four Kilo Romeo".into(),
             runway_ident: "27L".into(),
             pending_readback: None,
+            holds_runway: false,
         });
         *PENDING_TAKEOFF_CLEARANCE.lock().unwrap() = false;
         *PENDING_LINE_UP.lock().unwrap() = false;
@@ -7684,6 +8034,7 @@ mod tests {
                 callsign: cs.into(),
                 runway_ident: "09".into(),
                 pending_readback: None,
+                holds_runway: false,
             });
         };
         set(tower::State::Parked);
@@ -7812,6 +8163,7 @@ mod tests {
             callsign: cs.into(),
             runway_ident: String::new(),
             pending_readback: None,
+            holds_runway: false,
         });
         let s = suggest_call(cs, true, Some(0.5), Some(131200)).unwrap();
         assert!(s.first.is_none(), "{:?}", s.first);
@@ -7937,6 +8289,8 @@ mod tests {
             twr: tower::Tower::new(),
             runway_in_use: None,
             stated_runway: None,
+            runway_request: None,
+            requested_ident: None,
             dep_checked_in: false,
             pilot_info: None,
             assigned_squawk: None,
@@ -8311,6 +8665,7 @@ mod tests {
             callsign: "N172SP".into(),
             runway_ident: "09".into(),
             pending_readback: None,
+            holds_runway: false,
         };
         *ACTIVE_FIELD.lock().unwrap() = Some(("Gibraltar".into(), 36.15, -5.35));
         *CLEARANCE.lock().unwrap() = Some(cleared());
@@ -8435,6 +8790,7 @@ mod tests {
             callsign: "November one seven two Sierra Papa".into(),
             runway_ident: "09".into(),
             pending_readback: None,
+            holds_runway: false,
         });
         let _ = crate::party_line::take_region_handoff();
         let sw = region_tick(36.6, -4.6, false, t0).expect("handoff");
@@ -9510,6 +9866,7 @@ mod tests {
             callsign: "November one seven two Sierra Papa".into(),
             runway_ident: "09".into(),
             pending_readback: None,
+            holds_runway: false,
         });
         *COMPLIANCE.lock().unwrap() = ComplianceState::NEW;
         // The cleared route: a straight east-west line 1 km north of the
@@ -9557,6 +9914,7 @@ mod tests {
             callsign: cs.into(),
             runway_ident: "09".into(),
             pending_readback: Some(format!("Cleared for takeoff runway zero niner, {cs}.")),
+            holds_runway: false,
         });
         let s = suggest_call(cs, true, None, None).expect("a suggestion");
         assert_eq!(
@@ -9571,6 +9929,7 @@ mod tests {
             callsign: cs.into(),
             runway_ident: "09".into(),
             pending_readback: None,
+            holds_runway: false,
         });
         let s = suggest_call(cs, true, None, None).expect("a suggestion");
         assert!(!s.urgent);
@@ -9723,6 +10082,7 @@ mod tests {
             callsign: "November one two three alpha bravo".into(),
             runway_ident: "27".into(),
             pending_readback: None,
+            holds_runway: false,
         });
         *LANDING_HANDOFF.lock().unwrap() = Some("27".into());
         *PENDING_TAKEOFF_CLEARANCE.lock().unwrap() = true;
@@ -9906,6 +10266,7 @@ mod tests {
             own_on_runway: false,
             helicopter: false,
             ifr: None,
+            runway_refusal: None,
             wake_secs_left: None,
             taxi_via: Vec::new(),
             taxi_crossings: Vec::new(),
@@ -10457,6 +10818,7 @@ mod tests {
                 own_on_runway: false,
                 helicopter: false,
                 ifr: None,
+                runway_refusal: None,
                 wake_secs_left: None,
                 taxi_via: Vec::new(),
                 taxi_crossings: Vec::new(),
@@ -10719,6 +11081,7 @@ mod tests {
             own_on_runway: false,
             helicopter: false,
             ifr: None,
+            runway_refusal: None,
             wake_secs_left: None,
             taxi_via: Vec::new(),
             taxi_crossings: Vec::new(),

@@ -7719,3 +7719,52 @@ client that only ever talks to the local Web API now builds with
 (`tts::bus_write`) and the three panel pollers in `src/pollers.rs` (request
 buttons, voice picker, settings). SimBrief keeps the default client. The sim
 tests went from about 7 s (12 s when they failed) to 0.13 s.
+
+## 2026-09-27: four ATC loose ends (vacated report, transponder, line-up refusal, runway request)
+
+From `docs/tasks/2026-09-27-atc-loose-ends.md`. Offline only.
+
+- **The region handoff readback into the void** (2026-09-15) was already
+  fixed by `void_outcome` (2026-09-21): every sortie since logs it
+  `handoff_readback` (four in `logs/sorties`), and the whole blackbox has no
+  `outcome: void` left.
+- **"Runway vacated" frees the strip.** The tower FSM keeps a `vacated` flag
+  on the landing (`Tower::holds_runway`, `runway_vacated`; the state still
+  stands at `ClearedToLand`, so a bare "request taxi" is still the taxi in;
+  set only on the ground, dies with the landing). The clearance snapshot
+  publishes `holds_runway`; the runway pick stops freezing on a landing that
+  has been reported off; the party line's blocked strip
+  (`station::player_blocked_strip`) is the strip we stand on or the one the
+  book still gives us on the ground, so a ghost's landing gets "continue
+  approach" and a ghost's departure off our strip goes un-narrated until the
+  report. There is no second controlled aircraft in the FSM: the ghosts are
+  the "second aircraft".
+- **One transponder check** (`radio::departure_check`): the assigned code
+  dialled where the box does not show it and read back, ALT through
+  `set_mode`. Full auto at the hold and before a runway start's call
+  (`transponder_check`), the helicopter's pad departure, and the takeoff's
+  roll and liftoff (`transponder_alt` with `code_ok`/`mode_ok`), so the spoken
+  takeoff and the circuit leave with the squawk too. Why the tower said
+  "recycle" twice at EGPH: the radar watch nudges up to its cap of two when
+  the code shows and the box does not reply (stock mode below ON), airborne
+  only; not a height rule. The watch now publishes its nudge
+  (`party_line::take_squawk_nudge`) and the crew recycles (standby, code, ALT)
+  or re-dials, says so and reads "squawking ..." back (blackbox `atc`
+  `squawk_answer`); the watch's next tick is "radar contact".
+- **The line-up refusal names the cleared runway**
+  (`autotakeoff::why_no_fit_cleared`): ETND's recorded stop (52.585512 N
+  8.349835 E, 016) said "08L is 152 metres away" under a 26R clearance; it
+  now says 26R, same 152 m. Other gates stand as diagnosed.
+- **A short cleared runway is refused and a longer one requested.** The
+  tower has `Intent::RequestRunway` ("request runway zero eight", "unable two
+  six, request zero eight for length"; the runway read by
+  `tower::requested_runway`, the intent kept `Copy`), resolved by
+  `resolve_runway_request` against `nav::assignable_runways`, granted as the
+  taxi to it (route re-planned, runway in use committed), refused with the
+  reason, "say again" with no runway in the words. Full auto judges the
+  cleared runway at the taxi clearance (`judge_cleared_runway`,
+  `cleared_runway_fit`, the ONE rule at the weight on the wheels; blackbox
+  `cleared_runway_fit`, `runway_granted`): short, it says both numbers and
+  asks for the longest assignable runway that fits, flown the cleared way; a
+  pilot taxiing hears the numbers and the words to say (`atc`
+  `cleared_runway_short`). `party_line::field_runways` is the new accessor.

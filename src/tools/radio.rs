@@ -400,6 +400,128 @@ pub async fn set_mode(xp: &dyn crate::xplane::XPlane, mode: XpdrMode) -> bool {
         .is_ok_and(|v| stock_transmits(v.round() as i64))
 }
 
+/// What the one transponder check found and did: the code the tower
+/// assigned (if any), whether we dialled it, whether the box READS it back,
+/// and whether the mode is ALT by the airframe's own verdict.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct XpdrCheck {
+    pub code: Option<i64>,
+    pub code_dialled: bool,
+    pub code_ok: bool,
+    pub mode_ok: bool,
+}
+
+impl XpdrCheck {
+    pub fn ok(&self) -> bool {
+        self.code_ok && self.mode_ok
+    }
+
+    /// What the crew says when the check did not take, else `None`.
+    pub fn failure_line(&self) -> Option<String> {
+        match (self.code_ok, self.mode_ok) {
+            (true, true) => None,
+            (false, true) => Some(format!(
+                "The transponder isn't showing squawk {}. Check the code.",
+                self.code.map(|c| format!("{c:04}")).unwrap_or_default()
+            )),
+            (true, false) => {
+                Some("The transponder didn't take altitude mode. Check the knob.".to_string())
+            }
+            (false, false) => Some(
+                "The transponder didn't take the code or altitude mode. Check the box."
+                    .to_string(),
+            ),
+        }
+    }
+
+    pub fn json(&self) -> Value {
+        json!({
+            "code": self.code, "code_dialled": self.code_dialled,
+            "code_ok": self.code_ok, "mode_ok": self.mode_ok,
+        })
+    }
+}
+
+/// Dial `code` into the transponder and confirm it from what the box reads.
+pub async fn set_code(xp: &dyn crate::xplane::XPlane, code: i64) -> bool {
+    if xp.set_int(XPDR_CODE, code).await.is_err() {
+        return false;
+    }
+    xp.get_float(XPDR_CODE)
+        .await
+        .is_ok_and(|v| v.round() as i64 == code)
+}
+
+/// The ONE transponder check before a departure call and at the roll: the
+/// assigned code dialled where the box does not already show it and READ
+/// BACK, then ALT through the airframe's own selector ([`set_mode`], never a
+/// raw write). Two "negative radar contact, recycle transponder" calls went
+/// unanswered on the EGPH sortie (2026-09-20): the spoken takeoff set the
+/// mode at liftoff only and never looked at the code, the circuit likewise,
+/// and only full auto dialled the squawk. With nothing assigned the code is
+/// the pilot's and is left alone.
+pub async fn departure_check(xp: &dyn crate::xplane::XPlane, assigned: Option<i64>) -> XpdrCheck {
+    let (code_dialled, code_ok) = match assigned {
+        None => (false, true),
+        Some(code) => match xp.get_float(XPDR_CODE).await {
+            Ok(v) if v.round() as i64 == code => (false, true),
+            // A failed read is no measurement: dial it, and believe the
+            // readback only.
+            _ => (true, set_code(xp, code).await),
+        },
+    };
+    let mode_ok = set_mode(xp, XpdrMode::Altitude).await;
+    XpdrCheck {
+        code: assigned,
+        code_dialled,
+        code_ok,
+        mode_ok,
+    }
+}
+
+/// "Recycle transponder": standby, the code dialled again, back to ALT, each
+/// through the one writer and the result read back.
+pub async fn recycle(xp: &dyn crate::xplane::XPlane, code: i64) -> XpdrCheck {
+    let _ = set_mode(xp, XpdrMode::Standby).await;
+    let code_ok = set_code(xp, code).await;
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    let mode_ok = set_mode(xp, XpdrMode::Altitude).await;
+    XpdrCheck {
+        code: Some(code),
+        code_dialled: true,
+        code_ok,
+        mode_ok,
+    }
+}
+
+/// The crew's answer to a controller's squawk nudge: "recycle transponder"
+/// is recycled, "confirm squawk X" re-dialled (and the box to ALT), both
+/// through the one check. Returns what was done, the flight deck's line and,
+/// when the box took it, the radio readback ("squawking four five zero
+/// three", a readback the station hears in silence; the watch's next tick
+/// says "radar contact" from what the box now shows).
+pub async fn answer_nudge(
+    xp: &dyn crate::xplane::XPlane,
+    code: i64,
+    recycle_asked: bool,
+) -> (XpdrCheck, String, Option<String>) {
+    let check = if recycle_asked {
+        recycle(xp, code).await
+    } else {
+        departure_check(xp, Some(code)).await
+    };
+    let digits = crate::atis::spoken_digits(&format!("{code:04}"));
+    if let Some(line) = check.failure_line() {
+        return (check, line, None);
+    }
+    let said = if recycle_asked {
+        format!("Recycled the transponder, squawk {digits}.")
+    } else {
+        format!("Squawk {digits}, set.")
+    };
+    (check, said, Some(format!("squawking {digits}")))
+}
+
 /// Whether a stock `transponder_mode` is a box that replies: 2 ON, 3 ALT, 5
 /// ground mode S, 6 TA, 7 TA/RA. 0 off, 1 standby and 4 test are not.
 pub fn stock_transmits(mode: i64) -> bool {
@@ -544,6 +666,68 @@ mod tests {
         assert!(!set_mode(&stuck, XpdrMode::Altitude).await);
 
         publish_mode_knob(None);
+    }
+
+    /// EGPH 2026-09-20: two "negative radar contact, recycle transponder"
+    /// went unanswered, and only full auto ever looked at the code. The one
+    /// check dials an assigned code the box does not show and believes only
+    /// the readback; a code already showing is left alone; nothing assigned
+    /// leaves the pilot's code alone; the mode goes to ALT every time.
+    #[tokio::test]
+    async fn the_departure_check_sets_the_code_and_altitude_and_reads_them_back() {
+        let _g = KNOB_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        publish_mode_knob(None);
+
+        // Already squawking the assigned code, box in standby: ALT only.
+        let set = FakeXPlane::with_reads(&[(XPDR_CODE, 4503.0), (XPDR_MODE, 3.0)]);
+        let c = departure_check(&set, Some(4503)).await;
+        assert!(c.ok() && !c.code_dialled, "{c:?}");
+        assert!(!set.wrote(XPDR_CODE), "a code that shows is never rewritten");
+        assert_eq!(set.last_write(XPDR_MODE), Some(3.0));
+        assert_eq!(c.failure_line(), None);
+
+        // Still on 7000 and the box never takes the new code: dialled, and
+        // the failure is said with the code.
+        let stuck = FakeXPlane::with_reads(&[(XPDR_CODE, 7000.0), (XPDR_MODE, 3.0)]);
+        let c = departure_check(&stuck, Some(4503)).await;
+        assert!(c.code_dialled && !c.code_ok && c.mode_ok, "{c:?}");
+        assert_eq!(stuck.last_write(XPDR_CODE), Some(4503.0));
+        let line = c.failure_line().expect("said");
+        assert!(line.contains("4503"), "{line}");
+
+        // Nothing assigned: the pilot's code stands, the mode still goes up.
+        let vfr = FakeXPlane::with_reads(&[(XPDR_CODE, 7000.0), (XPDR_MODE, 1.0)]);
+        let c = departure_check(&vfr, None).await;
+        assert!(!vfr.wrote(XPDR_CODE));
+        assert!(c.code_ok && !c.mode_ok, "a box that stays in standby is reported: {c:?}");
+        assert!(c.failure_line().unwrap().contains("altitude mode"));
+    }
+
+    /// "Recycle transponder" is recycled: standby, the code again, ALT, read
+    /// back, and the words for both channels. The radio line is a READBACK
+    /// the station hears in silence (never a "say again"); the watch then
+    /// sees the code replying and says "radar contact".
+    #[tokio::test]
+    async fn the_crew_recycles_when_the_controller_asks() {
+        let _g = KNOB_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        publish_mode_knob(None);
+        let fake = FakeXPlane::with_reads(&[(XPDR_CODE, 4503.0), (XPDR_MODE, 3.0)]);
+        let (c, said, radio) = answer_nudge(&fake, 4503, true).await;
+        assert!(c.ok(), "{c:?}");
+        assert_eq!(fake.writes_to(XPDR_MODE), vec![1.0, 3.0], "standby, then altitude");
+        assert_eq!(fake.writes_to(XPDR_CODE), vec![4503.0], "the code dialled again");
+        assert!(said.starts_with("Recycled the transponder"), "{said}");
+        let radio = radio.expect("read back on the radio");
+        assert_eq!(radio, "squawking four five zero three");
+        assert!(crate::tower::is_readback(&radio));
+
+        // "Confirm squawk" re-dials; a box that does not take it is said on
+        // the flight deck and never read back as set.
+        let stuck = FakeXPlane::with_reads(&[(XPDR_CODE, 7000.0), (XPDR_MODE, 3.0)]);
+        let (c, said, radio) = answer_nudge(&stuck, 4503, false).await;
+        assert!(!c.code_ok);
+        assert!(said.contains("isn't showing squawk 4503"), "{said}");
+        assert!(radio.is_none());
     }
 
     /// The A330's knob dataref is read-only (probed live, 2026-09-21): the

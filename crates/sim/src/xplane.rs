@@ -1024,6 +1024,17 @@ impl FakeXPlane {
             .map(|(_, v)| *v)
     }
 
+    /// Every value written to `name`, in order.
+    pub fn writes_to(&self, name: &str) -> Vec<f64> {
+        self.writes
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(n, _)| n == name)
+            .map(|(_, v)| *v)
+            .collect()
+    }
+
     /// Preset an array-valued read (bus volts, per-engine indicators).
     pub fn set_read_array(&self, name: &str, values: &[f64]) {
         self.array_reads
