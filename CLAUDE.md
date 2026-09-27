@@ -227,6 +227,9 @@ Config: `XCOPILOT_ATC_AIRPORT` / `_VOICE` / `_RATE` / `_REGION`.
 - `Station::install()` publishes side state, never `from_airport` (sweeps and tests stay free of
   side effects); `uninstall()` retires it all.
 - **A mishear may earn "say again", never a clearance.** Only mayday/pan-pan lands without a final.
+- **One callsign for tower and crew** (`atc::callsign::resolve`): `XCOPILOT_CALLSIGN` > the SimBrief
+  plan's `atc/callsign` (only on the plan's type) > tail, heavy last; read through a crew provider,
+  never stored; a call naming it is addressed (blackbox `callsign`).
 
 **Tower behaviours** (each one's sortie is in the history)
 - Readbacks enforced for runway-critical items (`XCOPILOT_ATC_READBACK=false` coaches only); the

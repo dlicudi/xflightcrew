@@ -2250,13 +2250,24 @@ pub const HEAVY_MTOW_KG: f64 = 136_000.0;
 /// and the tower's wake clock knew nothing about it (2026-09-20). Unknown or
 /// unreadable mass = no suffix, never a guess.
 pub fn spoken_callsign_wake(tail: &str, mtow_kg: Option<f64>) -> String {
-    let base = spoken_callsign(tail);
-    if base.is_empty() {
-        return base;
+    with_wake(&spoken_callsign(tail), mtow_kg)
+}
+
+/// A spoken callsign, from any source (`callsign::resolve`), with its wake
+/// suffix. One already saying "heavy" (a pilot's own override) keeps one.
+pub fn with_wake(spoken: &str, mtow_kg: Option<f64>) -> String {
+    let base = spoken.trim();
+    if base.is_empty()
+        || base
+            .rsplit(' ')
+            .next()
+            .is_some_and(|w| w.eq_ignore_ascii_case("heavy"))
+    {
+        return base.to_string();
     }
     match mtow_kg {
         Some(m) if m.is_finite() && m >= HEAVY_MTOW_KG => format!("{base} heavy"),
-        _ => base,
+        _ => base.to_string(),
     }
 }
 

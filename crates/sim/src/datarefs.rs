@@ -132,6 +132,9 @@ pub const ACF_RELATIVE_PATH: &str = "sim/aircraft/view/acf_relative_path";
 pub const ACF_AUTHOR: &str = "sim/aircraft/view/acf_author";
 /// The .acf's `acf/_descrip` string.
 pub const ACF_DESCRIP: &str = "sim/aircraft/view/acf_descrip";
+/// The loaded aircraft's ICAO type ("B738"): a SimBrief plan's callsign is
+/// ours only on an airframe of the plan's type.
+pub const ACF_ICAO: &str = "sim/aircraft/view/acf_ICAO";
 /// Maximum gross mass, kg. The wake turbulence category is read off it.
 pub const ACF_M_MAX_KG: &str = "sim/aircraft/weight/acf_m_max";
 

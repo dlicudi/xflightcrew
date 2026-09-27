@@ -29,6 +29,11 @@ pub(crate) use crate::party_line::{
     SQUAWK_NUDGE, TAKEOFF_HOLD, TAXI_ROUTE, TAXI_TO_STAND, VECTORS, ZONE_CHALLENGE,
 };
 
+// The airline telephony and the ghost speaker live with the callsign
+// resolver, one table for our flight id and everyone else's.
+pub use crate::callsign::spoken_ghost;
+use crate::callsign::{TELEPHONY, TELEPHONY_IATA};
+
 /// Which of the station's frequencies COM1 is tuned to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Service {
@@ -437,8 +442,12 @@ impl Station {
     ) -> Option<(String, StationSpeaker)> {
         // Cheap word gates before any dataref read — the common case is a
         // cockpit command, and it must cost nothing. route_unkeyed re-applies
-        // the same gates; only the trace differs per exit.
-        if !is_radio_call(transcript, &spoken_airport(&self.apt.name).to_lowercase()) {
+        // the same gates; only the trace differs per exit. A call that names
+        // our own airline callsign is addressed ("Speedbird three zero six,
+        // ready to taxi").
+        if !is_radio_call(transcript, &spoken_airport(&self.apt.name).to_lowercase())
+            && !crate::callsign::addressed_to_own(transcript)
+        {
             return None;
         }
         let intent = tower::parse_intent(transcript);
@@ -489,7 +498,9 @@ impl Station {
         ctx: &tower::Ctx,
         wx: Wx,
     ) -> Option<String> {
-        if !is_radio_call(transcript, &spoken_airport(&self.apt.name).to_lowercase()) {
+        if !is_radio_call(transcript, &spoken_airport(&self.apt.name).to_lowercase())
+            && !crate::callsign::addressed(transcript, &ctx.callsign)
+        {
             return None;
         }
         self.note_information(transcript);
@@ -1540,15 +1551,12 @@ impl Station {
             Ok(pa) => spoken_pressure(pa, self.dialect),
             Err(_) => String::new(),
         };
-        // The wake category rides the sim's own MTOW, so the tower says
-        // "heavy" to an A330 without the crew's profile in its dep tree.
-        let mtow_kg = xp.get_float(datarefs::ACF_M_MAX_KG).await.ok();
-        let callsign = xp
-            .get_string(datarefs::TAILNUM)
+        // One resolver with the crew (override > SimBrief > tail). The wake
+        // category rides the sim's own MTOW, so the tower says "heavy" to an
+        // A330 without the crew's profile in its dep tree.
+        let callsign = crate::callsign::live(xp)
             .await
-            .ok()
-            .map(|t| tower::spoken_callsign_wake(&t, mtow_kg))
-            .filter(|s| !s.is_empty())
+            .map(|r| r.spoken)
             .unwrap_or_else(|| "aircraft calling".to_string());
         let on_ground = xp.get_float(datarefs::ON_GROUND_ANY).await.unwrap_or(0.0) > 0.5;
         // The wind a tower reads out and picks its runway by is the wind ON
@@ -3697,150 +3705,6 @@ pub async fn read_tcas_targets(xp: SimView<'_>) -> Vec<TcasTarget> {
             vs_fpm: vs,
         })
         .collect()
-}
-
-/// Airline telephony for the party line — the common carriers over Iberia;
-/// anything else is spoken NATO-style like a tail number.
-const TELEPHONY: &[(&str, &str)] = &[
-    ("IBE", "Iberia"),
-    ("BAW", "Speedbird"),
-    ("RYR", "Ryanair"),
-    ("EZY", "Easy"),
-    ("VLG", "Vueling"),
-    ("AEA", "Air Europa"),
-    ("ANE", "Air Nostrum"),
-    ("SWT", "Swift"),
-    ("DLH", "Lufthansa"),
-    ("AFR", "Air France"),
-    ("KLM", "KLM"),
-    ("TAP", "Air Portugal"),
-    ("EIN", "Shamrock"),
-    ("WZZ", "Wizz Air"),
-    ("SWR", "Swiss"),
-    ("UAE", "Emirates"),
-    ("QTR", "Qatari"),
-    ("AAL", "American"),
-    ("UAL", "United"),
-    ("DAL", "Delta"),
-    ("VIR", "Virgin"),
-    ("EXS", "Channex"),
-    ("EWG", "Eurowings"),
-    ("MEA", "Cedar Jet"),
-    ("BEL", "Bee-line"),
-    ("AUA", "Austrian"),
-    ("SAS", "Scandinavian"),
-    ("THY", "Turkish"),
-    ("FIN", "Finnair"),
-    ("ICE", "Iceair"),
-    ("ACA", "Air Canada"),
-    ("CPA", "Cathay"),
-    ("SIA", "Singapore"),
-    ("ANA", "All Nippon"),
-    ("ETD", "Etihad"),
-    ("ELY", "El Al"),
-    ("QFA", "Qantas"),
-    ("ANZ", "New Zealand"),
-    ("JBU", "JetBlue"),
-    ("CFG", "Condor"),
-    ("TRA", "Transavia"),
-    ("NAX", "Nor Shuttle"),
-    ("TOM", "Tomjet"),
-    ("LOG", "Logan"),
-    ("AEE", "Aegean"),
-    ("LOT", "LOT"),
-    ("AIC", "Air India"),
-    ("PIA", "Pakistan"),
-    ("WJA", "WestJet"),
-    ("PGT", "Sunturk"),
-];
-
-/// IATA two-letter prefixes — LiveTraffic's flight ids arrive this way
-/// ("BA306", measured live 2026-07-10), so both spellings get telephony.
-const TELEPHONY_IATA: &[(&str, &str)] = &[
-    ("BA", "Speedbird"),
-    ("IB", "Iberia"),
-    ("FR", "Ryanair"),
-    ("U2", "Easy"),
-    ("VY", "Vueling"),
-    ("UX", "Air Europa"),
-    ("LH", "Lufthansa"),
-    ("AF", "Air France"),
-    ("KL", "KLM"),
-    ("TP", "Air Portugal"),
-    ("EI", "Shamrock"),
-    ("W6", "Wizz Air"),
-    ("LX", "Swiss"),
-    ("EK", "Emirates"),
-    ("QR", "Qatari"),
-    ("AA", "American"),
-    ("UA", "United"),
-    ("DL", "Delta"),
-    ("TG", "Thai"),
-    ("VS", "Virgin"),
-    ("LS", "Channex"),
-    ("EW", "Eurowings"),
-    ("ME", "Cedar Jet"),
-    ("SN", "Bee-line"),
-    ("OS", "Austrian"),
-    ("SK", "Scandinavian"),
-    ("TK", "Turkish"),
-    ("AY", "Finnair"),
-    ("FI", "Iceair"),
-    ("AC", "Air Canada"),
-    ("CX", "Cathay"),
-    ("SQ", "Singapore"),
-    ("NH", "All Nippon"),
-    ("EY", "Etihad"),
-    ("LY", "El Al"),
-    ("QF", "Qantas"),
-    ("NZ", "New Zealand"),
-    ("B6", "JetBlue"),
-    ("DE", "Condor"),
-    ("HV", "Transavia"),
-    ("DY", "Nor Shuttle"),
-    ("BY", "Tomjet"),
-    ("LM", "Logan"),
-    ("A3", "Aegean"),
-    ("LO", "LOT"),
-    ("AI", "Air India"),
-    ("PK", "Pakistan"),
-    ("WS", "WestJet"),
-    ("PC", "Sunturk"),
-];
-
-/// A ghost's flight id spoken like a controller would: airline telephony +
-/// digits for "IBE3421" / "BA306", full NATO for a tail number.
-pub fn spoken_ghost(id: &str) -> String {
-    let id = id.trim();
-    let spoken_rest = |rest: &str| {
-        (!rest.is_empty() && rest.chars().all(|c| c.is_ascii_alphanumeric()))
-            .then(|| tower::spoken_callsign(rest))
-    };
-    // ICAO 3-letter prefix first ("IBE3421"), then IATA 2-letter where the
-    // third character is a digit ("BA306" — but never "BAC" of a tail).
-    // Byte-boundary-safe slicing on purpose: the flight id comes off raw
-    // TCAS bytes through from_utf8_lossy, and a garbage feed's replacement
-    // characters land mid-slice — `get` answers None where `split_at` would
-    // panic the monitor thread.
-    if id.len() > 3 {
-        if let (Some(prefix), Some(rest)) = (id.get(..3), id.get(3..)) {
-            if let Some((_, telephony)) = TELEPHONY.iter().find(|(p, _)| *p == prefix) {
-                if let Some(rest) = spoken_rest(rest) {
-                    return format!("{telephony} {rest}");
-                }
-            }
-        }
-    }
-    if id.len() > 2 && id.as_bytes()[2].is_ascii_digit() {
-        if let (Some(prefix), Some(rest)) = (id.get(..2), id.get(2..)) {
-            if let Some((_, telephony)) = TELEPHONY_IATA.iter().find(|(p, _)| *p == prefix) {
-                if let Some(rest) = spoken_rest(rest) {
-                    return format!("{telephony} {rest}");
-                }
-            }
-        }
-    }
-    tower::spoken_callsign(id)
 }
 
 /// The runway end a DEPARTING ghost rolled from: nearest strip, end chosen
@@ -9450,6 +9314,11 @@ mod tests {
             /// (`request_ifr_clearance` only; absent = none named).
             #[serde(default)]
             dest: Option<String>,
+            /// Our spoken callsign for the case: `radio` is then judged as
+            /// the station's unkeyed gate judges it, the radio words OR the
+            /// callsign named (`callsign::addressed`).
+            #[serde(default)]
+            callsign: Option<String>,
         }
         let path = concat!(env!("CARGO_MANIFEST_DIR"), "/bench/atc_corpus.yaml");
         let cases: Vec<Case> =
@@ -9470,7 +9339,11 @@ mod tests {
                 fails.push(format!("{:?}: parsed {got:?}, wanted {want:?}", c.text));
             }
             if let Some(radio) = c.radio {
-                if is_radio_call(&t, "gibraltar") != radio {
+                let ours = c
+                    .callsign
+                    .as_deref()
+                    .is_some_and(|cs| crate::callsign::addressed(&t, cs));
+                if (is_radio_call(&t, "gibraltar") || ours) != radio {
                     fails.push(format!("{:?}: is_radio_call should be {radio}", c.text));
                 }
             }
@@ -9717,6 +9590,65 @@ mod tests {
 
         // Any leftover handoff from this sortie must not leak into the next
         // test holding the lock.
+        *HANDOFF.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    }
+
+    /// An airline flight is worked by its airline callsign: the tower
+    /// answers "Speedbird three zero six", and a call that opens with it is
+    /// addressed even without a station name or a "request" (a 737 on an
+    /// OFP as BAW306 was called by its registration, 2026-09-27).
+    #[test]
+    fn an_airline_callsign_is_addressed_and_answered() {
+        let _guard = SIDE_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let path = lxgb_apt_file();
+        let wx = Wx {
+            wind_from_deg: 250.0,
+            wind_kts: 12.0,
+        };
+        let mut st = Station::load(path.to_str().unwrap(), "LXGB").expect("LXGB loads");
+        let mut ctx = scripted_ctx(&mut st, wx);
+        ctx.callsign = crate::callsign::resolve(
+            &crate::callsign::Inputs {
+                override_id: None,
+                plan: Some(crate::callsign::PlanCallsign {
+                    id: "BAW306".into(),
+                    plan_type: "B738".into(),
+                    also_types: Vec::new(),
+                }),
+            },
+            Some("G-EUPT"),
+            Some("B738"),
+            Some(79_000.0),
+        )
+        .expect("a callsign")
+        .spoken;
+        assert_eq!(ctx.callsign, "Speedbird three zero six");
+
+        // "Ready to taxi" alone is crew talk; with our callsign in front it
+        // is a call to the tower.
+        assert!(!is_radio_call("brakes set, ready to taxi", "gibraltar"));
+        assert!(
+            st.route_unkeyed("brakes set, ready to taxi", Service::Tower, &ctx, wx)
+                .is_none(),
+            "crew talk stays crew talk"
+        );
+        let r = st
+            .route_unkeyed("Speedbird 306, ready to taxi", Service::Tower, &ctx, wx)
+            .expect("our callsign addresses the tower");
+        assert!(r.starts_with("Speedbird three zero six"), "{r}");
+        assert!(r.contains("holding point"), "{r}");
+        assert_eq!(st.twr.state, tower::State::TaxiCleared);
+
+        // Keyed, the whisper spelling of the same callsign.
+        let mut st = Station::load(path.to_str().unwrap(), "LXGB").expect("LXGB loads");
+        let r = st.route_keyed(
+            "speed bird three zero six, request taxi",
+            Service::Tower,
+            &ctx,
+            wx,
+        );
+        assert!(r.starts_with("Speedbird three zero six"), "{r}");
+        assert!(r.contains("holding point"), "{r}");
         *HANDOFF.lock().unwrap_or_else(|e| e.into_inner()) = None;
     }
 
