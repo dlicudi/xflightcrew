@@ -3499,13 +3499,10 @@ is just more tools. Don't over-build the framework before that loop works.
 **`GPL-3.0-or-later`** (2026-07-30, `LICENSE` at the root, declared once in
 `[workspace.package]` and inherited by every crate). Two things are now settled
 and not open questions: this is **open source, never commercial**, and it is
-**X-Plane only**, no MSFS port, whatever the incumbents' platform reach. Only
-the product NAME stays parked.
+**X-Plane only**, no MSFS port. Only the product NAME stays parked.
 
 Copyleft over the dual `MIT OR Apache-2.0` the Rust convention would suggest,
-because the threat here is specific and demonstrated: the flight-sim ecosystem
-is payware-dominated, and Skylink Simulations sells this exact product shape
-(deterministic ATC + voice copilot + cabin crew) for $49. Under a permissive
+because the flight-sim ecosystem is payware-dominated: under a permissive
 license the tower FSM, the taxi planner, the wake-separation logic and the
 ground-drive laws could be lifted straight into closed payware. The usual
 argument FOR permissive is commercial adoption, which is a LIBRARY concern ,
@@ -3513,8 +3510,8 @@ this is an end-user application, so it costs us nothing to refuse. It is also
 the reversible direction: a sole author can always relicense GPL code as
 permissive later, but MIT grants already handed out can never be clawed back.
 Two bonuses: `3.0` specifically because several deps are Apache-2.0 (compatible
-with GPLv3, NOT GPLv2), and matching Welly's ATC now makes his IFR/live-ATIS
-code legally liftable, where the old rule was patterns-yes-code-no.
+with GPLv3, NOT GPLv2), and GPL-3.0 keeps the project compatible with other GPL
+flight-sim projects.
 
 The linking question people assume blocks this doesn't: `plugin/SDK/license.txt`
 is plain MIT/BSD, not a proprietary SDK license, as are Dear ImGui (MIT) and
