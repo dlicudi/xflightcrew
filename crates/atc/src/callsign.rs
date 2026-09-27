@@ -15,6 +15,12 @@
 //! plan. A plan's callsign applies only to an airframe of the plan's type
 //! ([`plan_fits`]): a swap to another type is the tail again, with no state to
 //! clear.
+//!
+//! The pilot's own telephony (`XCOPILOT_AIRLINE_TELEPHONY`, "WAT=Walker") is
+//! consulted BEFORE the built-in tables, so a virtual airline is spoken by its
+//! name and not spelled ("Walker two five one six", not "Whiskey Alpha Tango",
+//! 2026-09-27). It reaches this crate the same way: a provider the crew
+//! registers ([`provide_telephony`]), read when a callsign is spoken.
 
 use std::sync::Mutex;
 
@@ -140,6 +146,11 @@ pub fn is_airline_id(id: &str) -> bool {
 /// already spoken ("Speedbird 306") stay words, their digits read out. Split
 /// ids ("BAW 306", "G ABCD") are ids.
 pub fn spoken_id(raw: &str) -> String {
+    spoken_id_with(raw, &user_telephony())
+}
+
+/// [`spoken_id`] with the pilot's telephony table given, not asked for.
+pub fn spoken_id_with(raw: &str, user: &[(String, String)]) -> String {
     let tokens: Vec<&str> = raw.split_whitespace().collect();
     let is_word = |t: &&str| t.len() >= 4 && t.chars().all(|c| c.is_ascii_alphabetic());
     if tokens.len() > 1 && tokens.iter().any(is_word) {
@@ -157,7 +168,7 @@ pub fn spoken_id(raw: &str) -> String {
     }
     let id = tokens.concat().to_ascii_uppercase();
     if is_airline_id(&id) {
-        spoken_ghost(&id)
+        spoken_ghost_with(&id, user)
     } else {
         crate::tower::spoken_callsign(&id)
     }
@@ -228,6 +239,66 @@ pub fn addressed_to_own(transcript: &str) -> bool {
         .map(|o| spoken_id(o))
         .chain(i.plan.iter().map(|p| spoken_id(&p.id)))
         .any(|s| addressed(transcript, &s))
+}
+
+/// Register the crew's provider of the pilot's telephony setting (the raw
+/// text, [`parse_telephony`] reads it). Called once at boot.
+pub fn provide_telephony(f: fn() -> String) {
+    *crate::party_line::CALLSIGN_TELEPHONY
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = Some(f);
+}
+
+/// The pilot's telephony entries right now; none without a provider.
+pub fn user_telephony() -> Vec<(String, String)> {
+    let f = *crate::party_line::CALLSIGN_TELEPHONY
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    f.map(|f| parse_telephony(&f())).unwrap_or_default()
+}
+
+/// The longest telephony a pilot may give ("Air Nostrum" is 11).
+const TELEPHONY_MAX_CHARS: usize = 32;
+
+/// Read the pilot's telephony setting: `CODE=Telephony` entries separated by
+/// `;` or `,` ("WAT=Walker; xyz=Zulu Air"). The code is a 3-letter ICAO
+/// airline designator, any case; the telephony is letters, spaces, hyphens
+/// and apostrophes. A bad entry is ignored, never the whole setting; a code
+/// given twice keeps its LAST telephony (an appended fix wins).
+pub fn parse_telephony(raw: &str) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = Vec::new();
+    for entry in raw.split([';', ',', '\n']) {
+        let Some((code, name)) = entry.split_once('=') else {
+            continue;
+        };
+        let code = code.trim().to_ascii_uppercase();
+        if code.len() != 3 || !code.bytes().all(|b| b.is_ascii_uppercase()) {
+            continue;
+        }
+        let name = name.split_whitespace().collect::<Vec<_>>().join(" ");
+        let ok = !name.is_empty()
+            && name.chars().count() <= TELEPHONY_MAX_CHARS
+            && name.chars().any(|c| c.is_ascii_alphabetic())
+            && name
+                .chars()
+                .all(|c| c.is_ascii_alphabetic() || c == ' ' || c == '-' || c == '\'');
+        if !ok {
+            continue;
+        }
+        out.retain(|(c, _)| *c != code);
+        out.push((code, name));
+    }
+    out
+}
+
+/// The canonical text of a telephony setting: the entries that parse, in
+/// order, as `CODE=Telephony; ...` (what the panel and prefs.json show back).
+pub fn telephony_text(entries: &[(String, String)]) -> String {
+    entries
+        .iter()
+        .map(|(c, n)| format!("{c}={n}"))
+        .collect::<Vec<_>>()
+        .join("; ")
 }
 
 /// Register the crew's provider of [`Inputs`]. Called once at boot; the
@@ -402,6 +473,13 @@ pub(crate) const TELEPHONY_IATA: &[(&str, &str)] = &[
 /// A ghost's flight id spoken like a controller would: airline telephony +
 /// digits for "IBE3421" / "BA306", full NATO for a tail number.
 pub fn spoken_ghost(id: &str) -> String {
+    spoken_ghost_with(id, &user_telephony())
+}
+
+/// [`spoken_ghost`] with the pilot's telephony table given: its entries are
+/// asked first ("WAT2516" with `WAT=Walker` is "Walker two five one six"), so
+/// a pilot's entry also overrides a built-in one.
+pub fn spoken_ghost_with(id: &str, user: &[(String, String)]) -> String {
     let id = id.trim();
     let spoken_rest = |rest: &str| {
         (!rest.is_empty() && rest.chars().all(|c| c.is_ascii_alphanumeric()))
@@ -415,7 +493,17 @@ pub fn spoken_ghost(id: &str) -> String {
     // panic the monitor thread.
     if id.len() > 3 {
         if let (Some(prefix), Some(rest)) = (id.get(..3), id.get(3..)) {
-            if let Some((_, telephony)) = TELEPHONY.iter().find(|(p, _)| *p == prefix) {
+            let mine = user
+                .iter()
+                .find(|(p, _)| p.eq_ignore_ascii_case(prefix))
+                .map(|(_, t)| t.as_str());
+            let built_in = || {
+                TELEPHONY
+                    .iter()
+                    .find(|(p, _)| *p == prefix)
+                    .map(|(_, t)| *t)
+            };
+            if let Some(telephony) = mine.or_else(built_in) {
                 if let Some(rest) = spoken_rest(rest) {
                     return format!("{telephony} {rest}");
                 }
@@ -509,7 +597,12 @@ mod tests {
         assert_eq!(spoken_id("BAW 306"), "Speedbird three zero six");
         assert_eq!(spoken_id("BAW5GU"), "Speedbird five Golf Uniform");
         assert_eq!(spoken_id("XYZ123"), "X-ray Yankee Zulu one two three");
-        assert_eq!(spoken_id("WAT2516"), "Whiskey Alpha Tango two five one six");
+        // Unknown to the tables and to the pilot's (the pure form: the
+        // provider is process-wide and another test may hold one).
+        assert_eq!(
+            spoken_id_with("WAT2516", &[]),
+            "Whiskey Alpha Tango two five one six"
+        );
         assert_eq!(spoken_id("N172SP"), "November one seven two Sierra Papa");
         assert_eq!(spoken_id("G-ABCD"), "Golf Alpha Bravo Charlie Delta");
         assert_eq!(spoken_id("N172SP"), crate::tower::spoken_callsign("N172SP"));
@@ -584,5 +677,86 @@ mod tests {
             "Lufthansa four zero niner"
         ));
         assert!(!addressed("anything", ""));
+    }
+
+    fn table(raw: &str) -> Vec<(String, String)> {
+        parse_telephony(raw)
+    }
+
+    /// The pilot's telephony setting: good entries kept, bad ones ignored,
+    /// either separator, any case, the last word on a code wins.
+    #[test]
+    fn a_telephony_setting_parses_defensively() {
+        assert_eq!(
+            table("WAT=Walker"),
+            vec![("WAT".to_string(), "Walker".to_string())]
+        );
+        assert_eq!(
+            table(" wat = walker ; xyz=Zulu  Air, abc=Bee-line"),
+            vec![
+                ("WAT".to_string(), "walker".to_string()),
+                ("XYZ".to_string(), "Zulu Air".to_string()),
+                ("ABC".to_string(), "Bee-line".to_string()),
+            ]
+        );
+        // Bad entries: no '=', a 2- or 4-letter code, digits in the code,
+        // an empty or numeric telephony, punctuation, empty slots.
+        assert_eq!(
+            table("WAT; WA=Walker; WATT=Walker; W4T=Walker; WAT=; WAT=123; WAT=Walk@r;;,"),
+            Vec::<(String, String)>::new()
+        );
+        // Mixed: the good survive the bad around them.
+        assert_eq!(
+            table("junk, WAT=Walker;BAD, XYZ=Zulu"),
+            vec![
+                ("WAT".to_string(), "Walker".to_string()),
+                ("XYZ".to_string(), "Zulu".to_string()),
+            ]
+        );
+        assert_eq!(
+            table("WAT=Walker; wat=Walker Air"),
+            vec![("WAT".to_string(), "Walker Air".to_string())]
+        );
+        assert!(table("").is_empty());
+        assert_eq!(
+            telephony_text(&table("wat=Walker,XYZ=Zulu Air")),
+            "WAT=Walker; XYZ=Zulu Air"
+        );
+    }
+
+    /// A virtual airline is spoken by its telephony with the digits grouped
+    /// as the built-ins group them, and a pilot's entry beats a built-in.
+    #[test]
+    fn the_pilots_telephony_comes_before_the_tables() {
+        let walker = table("WAT=Walker");
+        assert_eq!(
+            spoken_id_with("WAT2516", &walker),
+            "Walker two five one six"
+        );
+        assert_eq!(
+            spoken_id_with("wat 2516", &walker),
+            "Walker two five one six"
+        );
+        assert_eq!(
+            spoken_ghost_with("WAT2516", &walker),
+            "Walker two five one six"
+        );
+        // Same grouping as a built-in's digits.
+        assert_eq!(
+            spoken_id_with("WAT306", &walker).strip_prefix("Walker "),
+            spoken_id_with("BAW306", &[]).strip_prefix("Speedbird ")
+        );
+        let over = table("BAW=Shuttle");
+        assert_eq!(spoken_id_with("BAW306", &over), "Shuttle three zero six");
+        // Other airlines keep the tables.
+        assert_eq!(
+            spoken_id_with("RYR12QT", &walker),
+            "Ryanair one two Quebec Tango"
+        );
+        // A registration never meets the table.
+        assert_eq!(
+            spoken_id_with("N172SP", &table("N17=Nope")),
+            "November one seven two Sierra Papa"
+        );
     }
 }
