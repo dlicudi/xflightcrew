@@ -183,6 +183,15 @@ const SWING_WINDOW_S: f64 = 2.0;
 /// in four seconds.
 const SWING_SETTLE_S: f64 = 4.0;
 const SWING_STILL_DEG: f64 = 1.0;
+/// A swing that BUILDS slowly is still a swing: `SWING_DEG` over the
+/// longer `SWING_SETTLE_S` starts one too (0.5 deg/s). The two-second test
+/// alone asks for 1 deg/s, and a tug easing into its turn stays under that
+/// for seconds while the nose is already going: at EGBB (sortie
+/// 1790534902, 2026-09-27, a Nose 90 on the 737) the rate climbed 0.1 to
+/// 0.8 deg/s over 13 s and the watch still read `swinging` false at 41.2 m,
+/// when `pavement_edge` stopped the push with the nose 82 degrees off; the
+/// tug swung on to 235 regardless (`stop_ignored`, 85 degrees). Two degrees
+/// in four seconds is past the ending test's one, so the hysteresis stays.
 /// From the push tick that reads the heading to the tug's nose standing
 /// still, once "stop" is sent mid-swing: the stop is LED by the swing rate
 /// times this. Measured on the one obeyed mid-swing stop in the log: LIPK
@@ -381,7 +390,8 @@ pub fn done(back_m: f64, err_deg: f64, plan: &Plan) -> bool {
 /// Is the tug still turning the nose? Pure over (time, heading error, bar),
 /// so the recorded pushes replay through it. A swing STARTS when the error
 /// moves `SWING_DEG` over a span of at least `SWING_WINDOW_S` (the span is
-/// measured, never assumed from the trim: the live window spanned 1.7 s);
+/// measured, never assumed from the trim: the live window spanned 1.7 s) or
+/// of `SWING_SETTLE_S` (a swing that builds slowly, see `SWING_SETTLE_S`);
 /// it ENDS only when the nose has turned under `SWING_STILL_DEG` over
 /// `SWING_SETTLE_S`, so a dip in the rate mid-swing is noise, not the end.
 /// While the bar is on and this says swinging, the stall clock may not end
@@ -423,6 +433,9 @@ impl SwingWatch {
         if self
             .turned_over(t, err, SWING_WINDOW_S)
             .is_some_and(|d| d >= SWING_DEG)
+            || self
+                .turned_over(t, err, SWING_SETTLE_S)
+                .is_some_and(|d| d >= SWING_DEG)
         {
             self.swinging = true;
         } else if self
@@ -745,8 +758,9 @@ pub enum TugWait {
 
 /// The wait for the tug to unhook, pure over (time, reads) so the recorded
 /// push replays through it. The deadline runs from the last moment the nose
-/// was still being swung (`SWING_DEG` over `SWING_WINDOW_S`, the push loop's
-/// own swing test), capped at `TUG_CLEAR_MAX_SECS` from the start. A failed
+/// was still being swung (the push loop's slow swing rate, `SWING_DEG` per
+/// `SWING_SETTLE_S`: EGBB's tug turned us at 0.7 deg/s after its stop),
+/// capped at `TUG_CLEAR_MAX_SECS` from the start. A failed
 /// read of the bar is no measurement, never "clear": the old wait read a
 /// failure as 0.0, off the bar. `tow_in_progress` is dead on this sim (see
 /// [`TOW_IN_PROGRESS`]) and only blocks when it actually reads on.
@@ -770,7 +784,7 @@ impl TugClearWatch {
     pub fn swinging(&self) -> bool {
         match (self.hdg_hist.front(), self.hdg_hist.back()) {
             (Some(&(t0, h0)), Some(&(t1, h1))) if t1 - t0 >= 0.5 * SWING_WINDOW_S => {
-                angle_diff_deg(h1, h0).abs() / (t1 - t0) >= SWING_DEG / SWING_WINDOW_S
+                angle_diff_deg(h1, h0).abs() / (t1 - t0) >= SWING_DEG / SWING_SETTLE_S
             }
             _ => false,
         }
@@ -849,8 +863,23 @@ pub const PAVEMENT_LOOK_M: f64 = 10.0;
 
 /// Is the push at the pavement's edge? Only for a push that STARTED on drawn
 /// pavement (a grass parking row is left alone), and never on no data.
-pub fn at_pavement_edge(started_on: Option<bool>, here: Option<bool>, behind: Option<bool>) -> bool {
-    started_on == Some(true) && (here == Some(false) || behind == Some(false))
+///
+/// The look-behind is a STRAIGHT push's geometry: it is where the tail goes
+/// only while the tug pushes us straight back. Once the tug swings us
+/// (`swinging`, [`SwingWatch`]) the reference point runs round an arc that
+/// turns away from that line, so only being OFF the pavement stops a swing,
+/// never a point 10 m down the line it is leaving. At EGBB (sortie
+/// 1790534902, 2026-09-27) the edge was read behind at 41.2 of 49.6 m with
+/// the aircraft on the pavement and the nose 82 degrees off, a second into
+/// the Nose 90's swing; "stop" went to a tug mid-swing, which ignored it and
+/// finished the turn to 235 against 238.7 on the pavement.
+pub fn at_pavement_edge(
+    started_on: Option<bool>,
+    here: Option<bool>,
+    behind: Option<bool>,
+    swinging: bool,
+) -> bool {
+    started_on == Some(true) && (here == Some(false) || (!swinging && behind == Some(false)))
 }
 
 /// Should this tick squeeze the brake channel against forward creep? Only
@@ -1356,10 +1385,12 @@ async fn run_inner(
                 nav::project_latlon(lat, lon, psi + 180.0, PAVEMENT_LOOK_M / M_PER_NM);
             let here = crate::party_line::on_pavement(lat, lon);
             let behind = crate::party_line::on_pavement(blat, blon);
-            if at_pavement_edge(started_on_pavement, here, behind) {
+            if at_pavement_edge(started_on_pavement, here, behind, judge.swinging()) {
                 event(
                     json!({ "event": "pavement_edge", "back_m": r1(back_m), "err": r1(err),
-                              "here": here, "swinging": judge.swinging() }),
+                              "here": here, "behind": behind,
+                              "swinging": judge.swinging(),
+                              "rate": r1(judge.swing_rate()) }),
                 );
                 break;
             }
@@ -1596,11 +1627,32 @@ mod tests {
     #[test]
     fn the_push_stops_at_the_pavement_edge_only_from_pavement() {
         use super::at_pavement_edge;
-        assert!(at_pavement_edge(Some(true), Some(true), Some(false)), "edge behind");
-        assert!(at_pavement_edge(Some(true), Some(false), Some(false)), "already over");
-        assert!(!at_pavement_edge(Some(true), Some(true), Some(true)));
-        assert!(!at_pavement_edge(Some(false), Some(false), Some(false)), "a grass stand");
-        assert!(!at_pavement_edge(None, None, None), "no data is no verdict");
+        assert!(
+            at_pavement_edge(Some(true), Some(true), Some(false), false),
+            "edge behind"
+        );
+        assert!(
+            at_pavement_edge(Some(true), Some(false), Some(false), false),
+            "already over"
+        );
+        assert!(!at_pavement_edge(Some(true), Some(true), Some(true), false));
+        assert!(
+            !at_pavement_edge(Some(false), Some(false), Some(false), false),
+            "a grass stand"
+        );
+        assert!(
+            !at_pavement_edge(None, None, None, false),
+            "no data is no verdict"
+        );
+        // Mid-swing only the aircraft itself leaving the pavement counts.
+        assert!(
+            !at_pavement_edge(Some(true), Some(true), Some(false), true),
+            "a swing"
+        );
+        assert!(
+            at_pavement_edge(Some(true), Some(false), Some(true), true),
+            "over, swinging"
+        );
     }
 
     /// LIBP stand 1's painted lane, as read from the install: back north
@@ -2278,6 +2330,108 @@ mod tests {
             assert!(t < 10.0);
         };
         assert_eq!(end, 3.5);
+    }
+
+    /// EGBB, sortie 1790534902, 2026-09-27: the 737's Nose 90, plan 49.6 m
+    /// to 238.7. Every `push` tick (t from the live "stopped", back_m, err,
+    /// the bar on throughout), as blackboxed.
+    #[rustfmt::skip]
+    const EGBB_PUSH: &[(f64, f64, f64)] = &[
+        (-30.6, 0.0, -87.4), (-30.0, 0.0, -87.4), (-29.5, 0.0, -87.4), (-28.9, 0.0, -87.4),
+        (-28.3, 0.1, -87.4), (-27.7, 0.4, -87.4), (-27.1, 0.8, -87.4), (-26.6, 1.4, -87.4),
+        (-26.0, 2.1, -87.4), (-25.4, 2.9, -87.4), (-24.8, 4.0, -87.4), (-24.2, 5.0, -87.4),
+        (-23.7, 6.1, -87.4), (-23.1, 7.3, -87.4), (-22.5, 8.5, -87.3), (-21.9, 9.6, -87.3),
+        (-21.3, 10.8, -87.3), (-20.8, 11.9, -87.3), (-20.2, 13.0, -87.3), (-19.6, 14.2, -87.3),
+        (-19.0, 15.3, -87.3), (-18.4, 16.5, -87.3), (-17.9, 17.7, -87.3), (-17.3, 18.9, -87.3),
+        (-16.7, 20.1, -87.3), (-16.1, 21.1, -87.3), (-15.6, 22.3, -87.3), (-15.0, 23.5, -87.3),
+        (-14.4, 24.5, -87.3), (-13.8, 25.5, -87.3), (-13.3, 26.4, -87.2), (-12.7, 26.9, -87.2),
+        (-12.2, 27.3, -87.1), (-11.6, 27.8, -87.0), (-11.0, 28.4, -87.0), (-10.4, 29.0, -86.9),
+        (-9.8, 29.5, -86.8), (-9.3, 30.1, -86.7), (-8.7, 30.7, -86.5), (-8.1, 31.4, -86.4),
+        (-7.5, 32.1, -86.2), (-7.0, 32.7, -86.0), (-6.4, 33.4, -85.8), (-5.8, 34.2, -85.6),
+        (-5.2, 34.9, -85.4), (-4.7, 35.6, -85.1), (-4.1, 36.3, -84.8), (-3.5, 37.0, -84.5),
+        (-3.0, 37.7, -84.2), (-2.4, 38.5, -83.8), (-1.8, 39.2, -83.4), (-1.2, 39.9, -83.0),
+        (-0.7, 40.5, -82.6), (-0.1, 41.2, -82.1),
+    ];
+    /// The same push after the stop: the `tug_wait` headings (s from the
+    /// stop). The tug ignored "stop" and swung on to 235.4, the bar off at
+    /// +59.2 (`stop_ignored`, 85.4 degrees).
+    #[rustfmt::skip]
+    const EGBB_AFTER_STOP: &[(f64, f64)] = &[
+        (0.0, 320.8), (2.2, 316.5), (4.4, 313.5), (6.6, 311.0), (8.8, 308.9),
+        (11.0, 307.3), (13.2, 305.7), (15.4, 303.8), (17.6, 301.7), (19.7, 299.1),
+        (21.9, 296.2), (24.1, 292.9), (26.3, 289.0), (28.5, 284.8), (30.7, 280.4),
+        (32.9, 275.1), (35.1, 271.1), (37.3, 267.1), (39.5, 263.1), (41.7, 258.9),
+        (43.9, 254.7), (46.0, 250.8), (48.2, 247.0), (50.4, 243.2), (52.6, 239.9),
+        (54.8, 236.7), (57.0, 235.6), (59.2, 235.4),
+    ];
+
+    /// Issue #125. The EGBB swing built from 0.1 to 0.8 deg/s over 13 s and
+    /// the two-second test (1 deg/s) never saw it: `swinging` false at
+    /// 41.2 m, so the edge 10 m behind stopped the push with the nose 82
+    /// degrees off, a second into the swing. A swing that builds slowly is
+    /// seen by 38.5 m (two degrees in four seconds), and mid-swing the
+    /// look-behind no longer stops it: the push rides on to the lane or the
+    /// aircraft actually leaving the pavement. After the stop the tug wait
+    /// reads the same slow swing as moving (it read 0.7 to 0.95 deg/s as
+    /// still for 9 s).
+    #[test]
+    fn a_swing_that_builds_slowly_is_seen_and_the_edge_behind_waits_for_it() {
+        let plan = Plan {
+            back_m: 49.6,
+            target_hdg: 238.7,
+            node: (LAT0, LON0),
+            lane: false,
+        };
+        // The old start rule, as it ran: two degrees over two seconds only.
+        let old_swinging = |upto: usize| {
+            let (t, _, err) = EGBB_PUSH[upto];
+            EGBB_PUSH[..upto]
+                .iter()
+                .rev()
+                .find(|(ts, _, _)| t - ts >= SWING_WINDOW_S)
+                .is_some_and(|(_, _, e)| angle_diff_deg(err, *e).abs() >= SWING_DEG)
+        };
+        let last = EGBB_PUSH.len() - 1;
+        assert!(!old_swinging(last), "the recorded failure");
+        assert!(at_pavement_edge(Some(true), Some(true), Some(false), false));
+
+        let mut j = PushJudge::new(EGBB_PUSH[0].0);
+        let mut first_swing: Option<(f64, f64)> = None;
+        for &(t, back, err) in EGBB_PUSH {
+            let v = j.step(t, back, err, true, back > MOVED_M, &plan, false);
+            assert_eq!(
+                v,
+                PushVerdict::Pushing,
+                "at {t}: short of the plan and the lane"
+            );
+            if j.swinging() && first_swing.is_none() {
+                first_swing = Some((t, back));
+            }
+        }
+        let (t_swing, back_swing) = first_swing.expect("the swing is seen");
+        assert!((-2.5..=-2.3).contains(&t_swing), "{t_swing}");
+        assert!((back_swing - 38.5).abs() < 0.05, "{back_swing}");
+        assert!(j.swinging(), "still swinging at the edge's tick");
+        assert!((j.swing_rate() - 0.8).abs() < 0.1, "{}", j.swing_rate());
+        // The edge behind, with the aircraft on the pavement: no stop.
+        assert!(!at_pavement_edge(
+            Some(true),
+            Some(true),
+            Some(false),
+            j.swinging()
+        ));
+
+        // The tug wait over the headings after the stop: moving throughout
+        // the swing, still from 57 s, the bar off at 59.2 is Clear.
+        let mut w = TugClearWatch::new(0.0);
+        for &(t, h) in EGBB_AFTER_STOP {
+            let att = if t >= 59.2 { 0.0 } else { 1.0 };
+            let v = w.step(t, Some(att), Some(0.0), Some(h));
+            if (2.2..=54.8).contains(&t) {
+                assert!(w.swinging(), "at {t}");
+            }
+            assert_eq!(v == TugWait::Clear, t >= 59.2, "at {t}");
+        }
     }
 
     /// The Gatwick stand that convicted the per-tick steering (2026-07-27).
