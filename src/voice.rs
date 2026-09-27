@@ -245,6 +245,28 @@ struct Latch {
     cv: Condvar,
 }
 
+/// How often a [`Voice::say_until`] wait looks at its `stop`.
+const SAY_UNTIL_POLL: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// Block until the latch says spoken, or `stop` says to stop waiting; `true`
+/// when spoken.
+fn wait_spoken_or(latch: &Latch, stop: impl Fn() -> bool) -> bool {
+    let mut spoken = latch.spoken.lock().unwrap_or_else(|e| e.into_inner());
+    loop {
+        if *spoken {
+            return true;
+        }
+        if stop() {
+            return false;
+        }
+        spoken = latch
+            .cv
+            .wait_timeout(spoken, SAY_UNTIL_POLL)
+            .unwrap_or_else(|e| e.into_inner())
+            .0;
+    }
+}
+
 /// The Piper model for this position. Seed 0 (the configured home field)
 /// uses the curated per-position voices; any other seed draws a stable
 /// per-airport crew from `atc_voice_pool`, offset per position so the
@@ -1616,6 +1638,22 @@ impl Voice {
         }
     }
 
+    /// [`Voice::say`] that stops WAITING (never speaking) once `stop` says so:
+    /// the command loop's readback, which blocked the loop until spoken, so a
+    /// typed line or a panel button sat on the channel behind every queued
+    /// intercom line (#90). The line plays in full either way; the mic's echo
+    /// guard is the speaking flag, not this wait.
+    pub fn say_until(&self, priority: Priority, text: impl Into<String>, stop: impl Fn() -> bool) {
+        let latch = Arc::new(Latch {
+            spoken: Mutex::new(false),
+            cv: Condvar::new(),
+        });
+        let text = text.into();
+        crate::auto_status::note_said(&text);
+        self.enqueue(priority, text, Some(latch.clone()), false, None);
+        wait_spoken_or(&latch, stop);
+    }
+
     /// Queue a CREW utterance and block until spoken: the checklist flow's
     /// pacing (one item plays before the next is decided, off the command
     /// loop). Crew-gated and panel-mirrored like `alert`, blocking like `say`.
@@ -2368,6 +2406,36 @@ fn resolve_negative(configured: &str) -> Option<std::path::PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Issue #90: the readback wait gives way to a pilot's waiting line
+    /// within a poll, and still returns at once when the line is spoken.
+    #[test]
+    fn a_readback_wait_gives_way_to_a_waiting_line() {
+        let latch = Latch {
+            spoken: Mutex::new(false),
+            cv: Condvar::new(),
+        };
+        let t0 = Instant::now();
+        let line_waiting_at = std::time::Duration::from_millis(150);
+        assert!(!wait_spoken_or(&latch, || t0.elapsed() >= line_waiting_at));
+        // Never spoken, so only the stop ends it (a loaded test runner can
+        // add a few polls; the old wait never returned at all).
+        let waited = t0.elapsed();
+        assert!(waited < std::time::Duration::from_secs(2), "{waited:?}");
+
+        let latch = Arc::new(Latch {
+            spoken: Mutex::new(false),
+            cv: Condvar::new(),
+        });
+        let l2 = latch.clone();
+        let speaker = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(30));
+            *l2.spoken.lock().unwrap() = true;
+            l2.cv.notify_all();
+        });
+        assert!(wait_spoken_or(&latch, || false));
+        speaker.join().unwrap();
+    }
 
     fn utt(priority: Priority, seq: u64) -> Utterance {
         Utterance {

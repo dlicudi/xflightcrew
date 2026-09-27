@@ -183,6 +183,15 @@ const SWING_WINDOW_S: f64 = 2.0;
 /// in four seconds.
 const SWING_SETTLE_S: f64 = 4.0;
 const SWING_STILL_DEG: f64 = 1.0;
+/// A swing that BUILDS slowly is still a swing: `SWING_DEG` over the
+/// longer `SWING_SETTLE_S` starts one too (0.5 deg/s). The two-second test
+/// alone asks for 1 deg/s, and a tug easing into its turn stays under that
+/// for seconds while the nose is already going: at EGBB (sortie
+/// 1790534902, 2026-09-27, a Nose 90 on the 737) the rate climbed 0.1 to
+/// 0.8 deg/s over 13 s and the watch still read `swinging` false at 41.2 m,
+/// when `pavement_edge` stopped the push with the nose 82 degrees off; the
+/// tug swung on to 235 regardless (`stop_ignored`, 85 degrees). Two degrees
+/// in four seconds is past the ending test's one, so the hysteresis stays.
 /// From the push tick that reads the heading to the tug's nose standing
 /// still, once "stop" is sent mid-swing: the stop is LED by the swing rate
 /// times this. Measured on the one obeyed mid-swing stop in the log: LIPK
@@ -381,7 +390,8 @@ pub fn done(back_m: f64, err_deg: f64, plan: &Plan) -> bool {
 /// Is the tug still turning the nose? Pure over (time, heading error, bar),
 /// so the recorded pushes replay through it. A swing STARTS when the error
 /// moves `SWING_DEG` over a span of at least `SWING_WINDOW_S` (the span is
-/// measured, never assumed from the trim: the live window spanned 1.7 s);
+/// measured, never assumed from the trim: the live window spanned 1.7 s) or
+/// of `SWING_SETTLE_S` (a swing that builds slowly, see `SWING_SETTLE_S`);
 /// it ENDS only when the nose has turned under `SWING_STILL_DEG` over
 /// `SWING_SETTLE_S`, so a dip in the rate mid-swing is noise, not the end.
 /// While the bar is on and this says swinging, the stall clock may not end
@@ -423,6 +433,9 @@ impl SwingWatch {
         if self
             .turned_over(t, err, SWING_WINDOW_S)
             .is_some_and(|d| d >= SWING_DEG)
+            || self
+                .turned_over(t, err, SWING_SETTLE_S)
+                .is_some_and(|d| d >= SWING_DEG)
         {
             self.swinging = true;
         } else if self
@@ -745,8 +758,9 @@ pub enum TugWait {
 
 /// The wait for the tug to unhook, pure over (time, reads) so the recorded
 /// push replays through it. The deadline runs from the last moment the nose
-/// was still being swung (`SWING_DEG` over `SWING_WINDOW_S`, the push loop's
-/// own swing test), capped at `TUG_CLEAR_MAX_SECS` from the start. A failed
+/// was still being swung (the push loop's slow swing rate, `SWING_DEG` per
+/// `SWING_SETTLE_S`: EGBB's tug turned us at 0.7 deg/s after its stop),
+/// capped at `TUG_CLEAR_MAX_SECS` from the start. A failed
 /// read of the bar is no measurement, never "clear": the old wait read a
 /// failure as 0.0, off the bar. `tow_in_progress` is dead on this sim (see
 /// [`TOW_IN_PROGRESS`]) and only blocks when it actually reads on.
@@ -770,7 +784,7 @@ impl TugClearWatch {
     pub fn swinging(&self) -> bool {
         match (self.hdg_hist.front(), self.hdg_hist.back()) {
             (Some(&(t0, h0)), Some(&(t1, h1))) if t1 - t0 >= 0.5 * SWING_WINDOW_S => {
-                angle_diff_deg(h1, h0).abs() / (t1 - t0) >= SWING_DEG / SWING_WINDOW_S
+                angle_diff_deg(h1, h0).abs() / (t1 - t0) >= SWING_DEG / SWING_SETTLE_S
             }
             _ => false,
         }
@@ -849,8 +863,23 @@ pub const PAVEMENT_LOOK_M: f64 = 10.0;
 
 /// Is the push at the pavement's edge? Only for a push that STARTED on drawn
 /// pavement (a grass parking row is left alone), and never on no data.
-pub fn at_pavement_edge(started_on: Option<bool>, here: Option<bool>, behind: Option<bool>) -> bool {
-    started_on == Some(true) && (here == Some(false) || behind == Some(false))
+///
+/// The look-behind is a STRAIGHT push's geometry: it is where the tail goes
+/// only while the tug pushes us straight back. Once the tug swings us
+/// (`swinging`, [`SwingWatch`]) the reference point runs round an arc that
+/// turns away from that line, so only being OFF the pavement stops a swing,
+/// never a point 10 m down the line it is leaving. At EGBB (sortie
+/// 1790534902, 2026-09-27) the edge was read behind at 41.2 of 49.6 m with
+/// the aircraft on the pavement and the nose 82 degrees off, a second into
+/// the Nose 90's swing; "stop" went to a tug mid-swing, which ignored it and
+/// finished the turn to 235 against 238.7 on the pavement.
+pub fn at_pavement_edge(
+    started_on: Option<bool>,
+    here: Option<bool>,
+    behind: Option<bool>,
+    swinging: bool,
+) -> bool {
+    started_on == Some(true) && (here == Some(false) || (!swinging && behind == Some(false)))
 }
 
 /// Should this tick squeeze the brake channel against forward creep? Only
@@ -963,7 +992,15 @@ pub async fn run(
     STEERED.store(true, SeqCst);
     ABORT.store(false, SeqCst);
     SKIP.store(false, SeqCst);
-    let out = run_inner(xp, ctx, voice, plan, abort, valve_set).await;
+    let mut out = run_inner(xp, ctx, voice, plan, abort, valve_set).await;
+    // The pilot's stop that landed after the loop's last look (it returned
+    // on its own a tick later): still answered, brakes first, from their
+    // read-back, never left to a line said before anything was set (#110).
+    if out.is_ok() && ABORT.load(SeqCst) {
+        send(ctx, "stop").await;
+        abort_brakes(ctx.xplane, voice, valve_set, "ended").await;
+        out = Err("abort".into());
+    }
     // Stop-and-let-go on EVERY exit, unconditionally. A pushback command is a
     // whole manoeuvre the tug runs on its own, and a re-issued continuation
     // outlives any return path that forgets this line: the MAX_ISSUES exit
@@ -1127,8 +1164,14 @@ async fn run_inner(
             event(json!({ "event": "skipped", "stage": "waiting" }));
             return Err("skipped".into());
         }
+        let aborted = stopping(abort);
+        if aborted {
+            // Set for the wait already; driven again for the read-back the
+            // pilot's "stop" is answered from.
+            abort_brakes(ctx.xplane, voice, valve_set, "waiting").await;
+        }
         event(json!({ "event": "no_tug", "waited_s": TUG_WAIT_SECS }));
-        return Err(if stopping(abort) { "abort" } else { "no_tug" }.into());
+        return Err(if aborted { "abort" } else { "no_tug" }.into());
     }
 
     // NOTHING is sent to a tug on the bar. The summon carried the pattern,
@@ -1184,8 +1227,9 @@ async fn run_inner(
             send(ctx, "stop").await;
             // Brakes on. The bar may be off and the engines are running, so an
             // abort that only stops the TUG leaves the aircraft rolling —
-            // the same hole the re-hook wait had.
-            let _ = crate::tools::controls::drive_park_brake(ctx.xplane, true, valve_set).await;
+            // the same hole the re-hook wait had. Answered from the brake's
+            // read-back, never before it (#110).
+            abort_brakes(ctx.xplane, voice, valve_set, "pushing").await;
             event(json!({ "event": "abort", "back_m": r1(back_m) }));
             return Err("abort".into());
         }
@@ -1356,10 +1400,12 @@ async fn run_inner(
                 nav::project_latlon(lat, lon, psi + 180.0, PAVEMENT_LOOK_M / M_PER_NM);
             let here = crate::party_line::on_pavement(lat, lon);
             let behind = crate::party_line::on_pavement(blat, blon);
-            if at_pavement_edge(started_on_pavement, here, behind) {
+            if at_pavement_edge(started_on_pavement, here, behind, judge.swinging()) {
                 event(
                     json!({ "event": "pavement_edge", "back_m": r1(back_m), "err": r1(err),
-                              "here": here, "swinging": judge.swinging() }),
+                              "here": here, "behind": behind,
+                              "swinging": judge.swinging(),
+                              "rate": r1(judge.swing_rate()) }),
                 );
                 break;
             }
@@ -1476,6 +1522,14 @@ async fn run_inner(
     // held the throttle at idle for 25 s (LIBP 737, 2026-09-26). A fresh
     // zero makes the plugin write the ratios back to zero.
     let _ = xp.set_float(TAXI_BRAKE, 0.0).await;
+    if stopping(abort) {
+        // Stopped while waiting for the tug to let go: the pilot's word, so
+        // the parking brake, on the bar or not, and the line from what the
+        // brake reads.
+        abort_brakes(ctx.xplane, voice, valve_set, "tug_wait").await;
+        event(json!({ "event": "abort", "back_m": r1(back_m), "stage": "tug_wait" }));
+        return Err("abort".into());
+    }
     if cleared {
         // Brakes SET now, and set they STAY until the taxi drive arms and its
         // governor releases them itself. The gap between the tug letting go
@@ -1506,6 +1560,53 @@ async fn run_inner(
         *TUG_WARNED.lock().unwrap_or_else(|e| e.into_inner()) = Some(Instant::now());
     }
     Ok(back_m)
+}
+
+/// The answer to the pilot's "stop" during a push, chosen from the parking
+/// brake's READ-BACK: full auto's steered push used to hear "Brakes on, your
+/// aircraft." from the command loop the moment the word landed, before the
+/// push loop had set anything (#110, from #65). Shared with the native push's
+/// stop in `main.rs`, so the two can never say different things.
+pub fn stop_line(held: bool) -> &'static str {
+    if held {
+        "Stopping the push. Brakes on, your aircraft."
+    } else {
+        "Stopping the push. The parking brake did not set, hold the brakes. Your aircraft."
+    }
+}
+
+/// A push that ends on a stop: the parking brake through the confirmed seam
+/// (tried three times, read back). The line is the pilot's answer only when
+/// the pilot's stop word ([`ABORT`]) ended it, taken once; a full auto abort
+/// from elsewhere is spoken for by full auto. Blackbox `abort_brakes`.
+async fn abort_brakes(
+    xp: &dyn crate::xplane::XPlane,
+    voice: &Option<Voice>,
+    valve_set: Option<f64>,
+    stage: &str,
+) -> bool {
+    let (held, line) = answer_stop(xp, valve_set, stage, ABORT.swap(false, SeqCst)).await;
+    if let (Some(line), Some(v)) = (line, voice) {
+        v.alert(Priority::Readback, line.to_string());
+    }
+    held
+}
+
+/// [`abort_brakes`] without the voice: whether the brake reads set, and the
+/// line owed to the pilot (`None` when the stop was not theirs, `pilot`).
+async fn answer_stop(
+    xp: &dyn crate::xplane::XPlane,
+    valve_set: Option<f64>,
+    stage: &str,
+    pilot: bool,
+) -> (bool, Option<&'static str>) {
+    let r = crate::tools::controls::set_park_brake_confirmed(xp, valve_set, 3).await;
+    event(
+        json!({ "event": "abort_brakes", "stage": stage, "held": r.held,
+                  "tries": r.tries, "park": r.park.map(|p| (p * 100.0).round() / 100.0),
+                  "err": r.err, "pilot_stop": pilot }),
+    );
+    (r.held, pilot.then(|| stop_line(r.held)))
 }
 
 /// Every tug instruction goes through the SAME `pushback` tool the pilot's
@@ -1596,11 +1697,32 @@ mod tests {
     #[test]
     fn the_push_stops_at_the_pavement_edge_only_from_pavement() {
         use super::at_pavement_edge;
-        assert!(at_pavement_edge(Some(true), Some(true), Some(false)), "edge behind");
-        assert!(at_pavement_edge(Some(true), Some(false), Some(false)), "already over");
-        assert!(!at_pavement_edge(Some(true), Some(true), Some(true)));
-        assert!(!at_pavement_edge(Some(false), Some(false), Some(false)), "a grass stand");
-        assert!(!at_pavement_edge(None, None, None), "no data is no verdict");
+        assert!(
+            at_pavement_edge(Some(true), Some(true), Some(false), false),
+            "edge behind"
+        );
+        assert!(
+            at_pavement_edge(Some(true), Some(false), Some(false), false),
+            "already over"
+        );
+        assert!(!at_pavement_edge(Some(true), Some(true), Some(true), false));
+        assert!(
+            !at_pavement_edge(Some(false), Some(false), Some(false), false),
+            "a grass stand"
+        );
+        assert!(
+            !at_pavement_edge(None, None, None, false),
+            "no data is no verdict"
+        );
+        // Mid-swing only the aircraft itself leaving the pavement counts.
+        assert!(
+            !at_pavement_edge(Some(true), Some(true), Some(false), true),
+            "a swing"
+        );
+        assert!(
+            at_pavement_edge(Some(true), Some(false), Some(true), true),
+            "over, swinging"
+        );
     }
 
     /// LIBP stand 1's painted lane, as read from the install: back north
@@ -2280,6 +2402,108 @@ mod tests {
         assert_eq!(end, 3.5);
     }
 
+    /// EGBB, sortie 1790534902, 2026-09-27: the 737's Nose 90, plan 49.6 m
+    /// to 238.7. Every `push` tick (t from the live "stopped", back_m, err,
+    /// the bar on throughout), as blackboxed.
+    #[rustfmt::skip]
+    const EGBB_PUSH: &[(f64, f64, f64)] = &[
+        (-30.6, 0.0, -87.4), (-30.0, 0.0, -87.4), (-29.5, 0.0, -87.4), (-28.9, 0.0, -87.4),
+        (-28.3, 0.1, -87.4), (-27.7, 0.4, -87.4), (-27.1, 0.8, -87.4), (-26.6, 1.4, -87.4),
+        (-26.0, 2.1, -87.4), (-25.4, 2.9, -87.4), (-24.8, 4.0, -87.4), (-24.2, 5.0, -87.4),
+        (-23.7, 6.1, -87.4), (-23.1, 7.3, -87.4), (-22.5, 8.5, -87.3), (-21.9, 9.6, -87.3),
+        (-21.3, 10.8, -87.3), (-20.8, 11.9, -87.3), (-20.2, 13.0, -87.3), (-19.6, 14.2, -87.3),
+        (-19.0, 15.3, -87.3), (-18.4, 16.5, -87.3), (-17.9, 17.7, -87.3), (-17.3, 18.9, -87.3),
+        (-16.7, 20.1, -87.3), (-16.1, 21.1, -87.3), (-15.6, 22.3, -87.3), (-15.0, 23.5, -87.3),
+        (-14.4, 24.5, -87.3), (-13.8, 25.5, -87.3), (-13.3, 26.4, -87.2), (-12.7, 26.9, -87.2),
+        (-12.2, 27.3, -87.1), (-11.6, 27.8, -87.0), (-11.0, 28.4, -87.0), (-10.4, 29.0, -86.9),
+        (-9.8, 29.5, -86.8), (-9.3, 30.1, -86.7), (-8.7, 30.7, -86.5), (-8.1, 31.4, -86.4),
+        (-7.5, 32.1, -86.2), (-7.0, 32.7, -86.0), (-6.4, 33.4, -85.8), (-5.8, 34.2, -85.6),
+        (-5.2, 34.9, -85.4), (-4.7, 35.6, -85.1), (-4.1, 36.3, -84.8), (-3.5, 37.0, -84.5),
+        (-3.0, 37.7, -84.2), (-2.4, 38.5, -83.8), (-1.8, 39.2, -83.4), (-1.2, 39.9, -83.0),
+        (-0.7, 40.5, -82.6), (-0.1, 41.2, -82.1),
+    ];
+    /// The same push after the stop: the `tug_wait` headings (s from the
+    /// stop). The tug ignored "stop" and swung on to 235.4, the bar off at
+    /// +59.2 (`stop_ignored`, 85.4 degrees).
+    #[rustfmt::skip]
+    const EGBB_AFTER_STOP: &[(f64, f64)] = &[
+        (0.0, 320.8), (2.2, 316.5), (4.4, 313.5), (6.6, 311.0), (8.8, 308.9),
+        (11.0, 307.3), (13.2, 305.7), (15.4, 303.8), (17.6, 301.7), (19.7, 299.1),
+        (21.9, 296.2), (24.1, 292.9), (26.3, 289.0), (28.5, 284.8), (30.7, 280.4),
+        (32.9, 275.1), (35.1, 271.1), (37.3, 267.1), (39.5, 263.1), (41.7, 258.9),
+        (43.9, 254.7), (46.0, 250.8), (48.2, 247.0), (50.4, 243.2), (52.6, 239.9),
+        (54.8, 236.7), (57.0, 235.6), (59.2, 235.4),
+    ];
+
+    /// Issue #125. The EGBB swing built from 0.1 to 0.8 deg/s over 13 s and
+    /// the two-second test (1 deg/s) never saw it: `swinging` false at
+    /// 41.2 m, so the edge 10 m behind stopped the push with the nose 82
+    /// degrees off, a second into the swing. A swing that builds slowly is
+    /// seen by 38.5 m (two degrees in four seconds), and mid-swing the
+    /// look-behind no longer stops it: the push rides on to the lane or the
+    /// aircraft actually leaving the pavement. After the stop the tug wait
+    /// reads the same slow swing as moving (it read 0.7 to 0.95 deg/s as
+    /// still for 9 s).
+    #[test]
+    fn a_swing_that_builds_slowly_is_seen_and_the_edge_behind_waits_for_it() {
+        let plan = Plan {
+            back_m: 49.6,
+            target_hdg: 238.7,
+            node: (LAT0, LON0),
+            lane: false,
+        };
+        // The old start rule, as it ran: two degrees over two seconds only.
+        let old_swinging = |upto: usize| {
+            let (t, _, err) = EGBB_PUSH[upto];
+            EGBB_PUSH[..upto]
+                .iter()
+                .rev()
+                .find(|(ts, _, _)| t - ts >= SWING_WINDOW_S)
+                .is_some_and(|(_, _, e)| angle_diff_deg(err, *e).abs() >= SWING_DEG)
+        };
+        let last = EGBB_PUSH.len() - 1;
+        assert!(!old_swinging(last), "the recorded failure");
+        assert!(at_pavement_edge(Some(true), Some(true), Some(false), false));
+
+        let mut j = PushJudge::new(EGBB_PUSH[0].0);
+        let mut first_swing: Option<(f64, f64)> = None;
+        for &(t, back, err) in EGBB_PUSH {
+            let v = j.step(t, back, err, true, back > MOVED_M, &plan, false);
+            assert_eq!(
+                v,
+                PushVerdict::Pushing,
+                "at {t}: short of the plan and the lane"
+            );
+            if j.swinging() && first_swing.is_none() {
+                first_swing = Some((t, back));
+            }
+        }
+        let (t_swing, back_swing) = first_swing.expect("the swing is seen");
+        assert!((-2.5..=-2.3).contains(&t_swing), "{t_swing}");
+        assert!((back_swing - 38.5).abs() < 0.05, "{back_swing}");
+        assert!(j.swinging(), "still swinging at the edge's tick");
+        assert!((j.swing_rate() - 0.8).abs() < 0.1, "{}", j.swing_rate());
+        // The edge behind, with the aircraft on the pavement: no stop.
+        assert!(!at_pavement_edge(
+            Some(true),
+            Some(true),
+            Some(false),
+            j.swinging()
+        ));
+
+        // The tug wait over the headings after the stop: moving throughout
+        // the swing, still from 57 s, the bar off at 59.2 is Clear.
+        let mut w = TugClearWatch::new(0.0);
+        for &(t, h) in EGBB_AFTER_STOP {
+            let att = if t >= 59.2 { 0.0 } else { 1.0 };
+            let v = w.step(t, Some(att), Some(0.0), Some(h));
+            if (2.2..=54.8).contains(&t) {
+                assert!(w.swinging(), "at {t}");
+            }
+            assert_eq!(v == TugWait::Clear, t >= 59.2, "at {t}");
+        }
+    }
+
     /// The Gatwick stand that convicted the per-tick steering (2026-07-27).
     /// The nose had to come 115 degrees LEFT to face down the lane, and the
     /// pattern picked from that error is the one command the tug gets — a
@@ -2392,5 +2616,48 @@ mod tests {
             t += 0.5;
         };
         assert_eq!((v, t), (TugWait::TimedOut, TUG_CLEAR_MAX_SECS));
+    }
+
+    /// Issue #110: the steered push's stop was answered "Brakes on, your
+    /// aircraft." by the command loop before the push loop had set anything.
+    /// The answer now comes from the brake's read-back: a brake the command
+    /// sets is "Brakes on"; one that stays at 0.03 through three drives (the
+    /// EGSS 737's read-back, #65) says it did not set; a stop that was not
+    /// the pilot's (full auto's own abort) sets the brake and says nothing.
+    #[tokio::test]
+    async fn the_pilots_stop_is_answered_from_the_brake_read_back() {
+        use crate::tools::PARK_BRAKE;
+        use crate::xplane::FakeXPlane;
+        const SET: &str = "sim/flight_controls/park_brake_set";
+        let takes = FakeXPlane::with_reads(&[(PARK_BRAKE, 0.0)]);
+        takes.step_on_command(SET, PARK_BRAKE, 1.0);
+        let (held, line) = answer_stop(&takes, None, "pushing", true).await;
+        assert!(held);
+        assert_eq!(line, Some("Stopping the push. Brakes on, your aircraft."));
+
+        let stuck = FakeXPlane::with_reads(&[(PARK_BRAKE, 0.03)]);
+        let (held, line) = answer_stop(&stuck, None, "pushing", true).await;
+        assert!(!held);
+        let line = line.expect("the pilot is answered");
+        assert!(
+            line.contains("did not set") && !line.contains("Brakes on"),
+            "{line}"
+        );
+
+        let takes = FakeXPlane::with_reads(&[(PARK_BRAKE, 0.0)]);
+        takes.step_on_command(SET, PARK_BRAKE, 1.0);
+        let (held, line) = answer_stop(&takes, None, "pushing", false).await;
+        assert!(held, "the brake is set whoever stopped the push");
+        assert_eq!(line, None);
+
+        // The command loop no longer claims the brake for a steered push:
+        // its stop lines are the native push's, chosen from its own
+        // read-back through the same `stop_line`.
+        let main = include_str!("main.rs");
+        assert!(
+            !main.contains(r#""Stopping the push."#),
+            "a literal stop line in main.rs"
+        );
+        assert!(main.contains("pushback::stop_line(held)"));
     }
 }

@@ -33,6 +33,7 @@ pub(crate) fn spawn_panel_request_poller(base_url: String, tx: std::sync::mpsc::
         let rest = format!("{}/api/v1", base_url.trim_end_matches('/'));
         let mut id: Option<i64> = None;
         let mut typed_id: Option<i64> = None;
+        let mut typed_age_id: Option<i64> = None;
         loop {
             std::thread::sleep(std::time::Duration::from_millis(300));
             if id.is_none() {
@@ -43,11 +44,18 @@ pub(crate) fn spawn_panel_request_poller(base_url: String, tx: std::sync::mpsc::
                     continue;
                 }
                 typed_id = crate::plugin_status::resolve_id(&http, &rest, "xcopilot/typed");
+                // An older plugin has no age: the line is still taken.
+                typed_age_id = crate::plugin_status::resolve_id(&http, &rest, "xcopilot/typed_age");
             }
             if let Some(tid) = typed_id {
-                if let Some(text) = take_typed(&http, &rest, tid) {
-                    tracing::info!(typed = %text, "panel typed command");
-                    if tx.send(text).is_err() {
+                if let Some((text, age_s)) = take_typed_aged(&http, &rest, tid, typed_age_id) {
+                    tracing::info!(typed = %text, age_s, "panel typed command");
+                    crate::blackbox::record(
+                        "typed",
+                        serde_json::json!({ "event": "taken", "text": text,
+                                            "age_s": age_s.map(|a| (a * 100.0).round() / 100.0) }),
+                    );
+                    if !queue_command(&tx, text) {
                         return; // session gone
                     }
                 }
@@ -85,17 +93,82 @@ pub(crate) fn spawn_panel_request_poller(base_url: String, tx: std::sync::mpsc::
                     .send();
             }
             let Some(cmd) = cmd else { continue };
-            if tx.send(cmd.to_string()).is_err() {
+            if !queue_command(&tx, cmd.to_string()) {
                 return; // session gone
             }
         }
     });
 }
 
+/// When each line on the command channel was queued, oldest first (#90). The
+/// command loop takes one line per pass, and a pass that SAYS something used
+/// to block until the line was spoken, however long the intercom queue made
+/// that; a typed line or a panel button waited behind it. `say` in main.rs
+/// stops waiting (the line still plays) while [`command_waiting`], and the
+/// loop records how long each line sat ([`took_command`], blackbox `typed`).
+static QUEUED: std::sync::Mutex<std::collections::VecDeque<std::time::Instant>> =
+    std::sync::Mutex::new(std::collections::VecDeque::new());
+
+fn queued() -> std::sync::MutexGuard<'static, std::collections::VecDeque<std::time::Instant>> {
+    QUEUED.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Put a pilot's line (typed, a panel button, the terminal) on the command
+/// channel, stamped. `false` when the loop is gone.
+pub(crate) fn queue_command(tx: &std::sync::mpsc::Sender<String>, text: String) -> bool {
+    queued().push_back(std::time::Instant::now());
+    if tx.send(text).is_err() {
+        queued().pop_back();
+        return false;
+    }
+    true
+}
+
+/// Is a pilot's line waiting for the command loop?
+pub(crate) fn command_waiting() -> bool {
+    !queued().is_empty()
+}
+
+/// The loop took the oldest line: how long it sat on the channel.
+pub(crate) fn took_command() -> Option<std::time::Duration> {
+    queued().pop_front().map(|at| at.elapsed())
+}
+
+/// [`take_typed`] for the pilot's typed line, with the plugin's own age of it
+/// (`xcopilot/typed_age`, seconds since the panel set it), read only when a
+/// line is there and before it is consumed. `None` from an older plugin or a
+/// failed read: no measurement.
+pub(crate) fn take_typed_aged(
+    http: &reqwest::blocking::Client,
+    rest: &str,
+    id: i64,
+    age_id: Option<i64>,
+) -> Option<(String, Option<f64>)> {
+    let text = read_typed(http, rest, id)?;
+    let age_s = age_id.and_then(|a| {
+        http.get(format!("{rest}/datarefs/{a}/value"))
+            .send()
+            .ok()
+            .filter(|r| r.status().is_success())
+            .and_then(|r| r.json::<serde_json::Value>().ok())
+            .and_then(|b| b.get("data").and_then(|d| d.as_f64()))
+            .filter(|v| v.is_finite() && *v >= 0.0)
+    });
+    consume_typed(http, rest, id);
+    Some((text, age_s))
+}
+
 /// One poll of the panel's typed line: the text if there is one (consumed),
 /// else `None`. Consume FIRST, like the request code, so a slow channel can't
 /// inject the same line twice.
 pub(crate) fn take_typed(http: &reqwest::blocking::Client, rest: &str, id: i64) -> Option<String> {
+    let text = read_typed(http, rest, id)?;
+    consume_typed(http, rest, id);
+    Some(text)
+}
+
+/// The typed line's text, `None` when empty or unreadable.
+fn read_typed(http: &reqwest::blocking::Client, rest: &str, id: i64) -> Option<String> {
     use base64::Engine;
     let url = format!("{rest}/datarefs/{id}/value");
     let raw = http
@@ -111,12 +184,18 @@ pub(crate) fn take_typed(http: &reqwest::blocking::Client, rest: &str, id: i64) 
     if text.is_empty() {
         return None;
     }
+    Some(text)
+}
+
+/// Consume the typed line: a single NUL, which the plugin reads as empty.
+fn consume_typed(http: &reqwest::blocking::Client, rest: &str, id: i64) {
+    use base64::Engine;
+    let url = format!("{rest}/datarefs/{id}/value");
     let nul = base64::engine::general_purpose::STANDARD.encode([0u8]);
     let _ = http
         .patch(&url)
         .json(&serde_json::json!({ "data": nul }))
         .send();
-    Some(text)
 }
 
 /// The panel's copilot-voice picker (see plugin/src/xcopilot.cpp): the app
@@ -615,6 +694,37 @@ pub(crate) const DR_OPT_AUDIO_BUS: &str = "xcopilot/opt/audio_bus";
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Issue #90: a typed line waited behind the command loop's blocking
+    /// readback. Every line on the channel is stamped, so the loop's `say`
+    /// can see one waiting and stop waiting for its own line, and each line
+    /// is taken with how long it sat, oldest first. The readback in main.rs
+    /// waits through this, not through the unconditional `Voice::say`.
+    #[test]
+    fn a_line_on_the_channel_is_seen_waiting_and_timed() {
+        let (tx, rx) = std::sync::mpsc::channel::<String>();
+        assert!(!command_waiting());
+        assert!(queue_command(&tx, "recover the aircraft".into()));
+        assert!(queue_command(&tx, "land the aircraft".into()));
+        assert!(command_waiting());
+        assert_eq!(rx.try_recv().as_deref(), Ok("recover the aircraft"));
+        assert!(took_command().is_some_and(|d| d < std::time::Duration::from_secs(1)));
+        assert!(command_waiting(), "the second is still there");
+        assert_eq!(rx.try_recv().as_deref(), Ok("land the aircraft"));
+        assert!(took_command().is_some());
+        assert!(!command_waiting());
+        assert_eq!(took_command(), None);
+        // A loop that is gone leaves nothing stamped behind.
+        drop(rx);
+        assert!(!queue_command(&tx, "stop".into()));
+        assert!(!command_waiting());
+
+        let main = include_str!("main.rs");
+        assert!(
+            main.contains("voice.say_until(Priority::Readback, line, pollers::command_waiting)")
+        );
+        assert!(!main.contains("voice.say(Priority::Readback, line)"));
+    }
 
     /// A panel edit is `key=value` lines; the value keeps its own '='.
     #[test]

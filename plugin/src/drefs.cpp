@@ -4,6 +4,7 @@
 
 #include "drefs.h"
 
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -65,9 +66,23 @@ static void WriteRequest(void*, int v) { g_request = v; }
 // line typed before the app polled replaces the first.
 static TextRef g_typed = {{0}, 0};
 static XPLMDataRef g_typed_dref = nullptr;
+// When the typed line was last set, so the app can place how long a line sat
+// before it was taken (issue #90: "about 15 s" at LEMG, 2026-09-26, that the
+// app's own log could not place). xcopilot/typed_age reads the seconds since
+// (a steady wall-clock timer, running through a sim pause), -1 with no line.
+static std::chrono::steady_clock::time_point g_typed_at{};
+static XPLMDataRef g_typed_age_dref = nullptr;
+static void StampTyped() {
+    if (g_typed.len > 0) g_typed_at = std::chrono::steady_clock::now();
+}
+static float ReadTypedAge(void*) {
+    if (g_typed.len <= 0 || g_typed.buf[0] == '\0') return -1.0f;
+    return std::chrono::duration<float>(std::chrono::steady_clock::now() - g_typed_at).count();
+}
 static void WriteTyped(void* ref, void* in, int offset, int len) {
     StoreText(static_cast<TextRef*>(ref), in, offset, len);
     if (g_typed.buf[0] == '\0') g_typed.len = 0;
+    StampTyped();
 }
 
 // ---- panel options (plugin → app) --------------------------------------------
@@ -1096,6 +1111,10 @@ void start() {
         "xcopilot/typed", xplmType_Data, 1,
         nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
         nullptr, nullptr, nullptr, nullptr, ReadText, WriteTyped, &g_typed, &g_typed);
+    g_typed_age_dref = XPLMRegisterDataAccessor(
+        "xcopilot/typed_age", xplmType_Float, 0,
+        nullptr, nullptr, ReadTypedAge, nullptr, nullptr, nullptr,
+        nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
     g_opt_text_dref = XPLMRegisterDataAccessor(
         "xcopilot/opt/text", xplmType_Data, 1,
         nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
@@ -1238,6 +1257,7 @@ void stop_first() {
     if (g_steer_brake_l_dref) { XPLMUnregisterDataAccessor(g_steer_brake_l_dref); g_steer_brake_l_dref = nullptr; }
     if (g_steer_brake_r_dref) { XPLMUnregisterDataAccessor(g_steer_brake_r_dref); g_steer_brake_r_dref = nullptr; }
     if (g_typed_dref) { XPLMUnregisterDataAccessor(g_typed_dref); g_typed_dref = nullptr; }
+    if (g_typed_age_dref) { XPLMUnregisterDataAccessor(g_typed_age_dref); g_typed_age_dref = nullptr; }
     if (g_opt_text_dref) { XPLMUnregisterDataAccessor(g_opt_text_dref); g_opt_text_dref = nullptr; }
     if (g_opt_text_edit_dref) { XPLMUnregisterDataAccessor(g_opt_text_edit_dref); g_opt_text_edit_dref = nullptr; }
     if (g_callsign_dref) { XPLMUnregisterDataAccessor(g_callsign_dref); g_callsign_dref = nullptr; }
@@ -1323,6 +1343,7 @@ void set_typed(const char* text) {
     std::memset(g_typed.buf, 0, sizeof g_typed.buf);
     std::strncpy(g_typed.buf, text, sizeof g_typed.buf - 1);
     g_typed.len = static_cast<int>(std::strlen(g_typed.buf));
+    StampTyped();
 }
 const TextRef& opt_text() { return g_opt_text; }
 const TextRef& callsign_status() { return g_callsign; }

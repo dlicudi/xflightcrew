@@ -1778,12 +1778,10 @@ async fn run_session(
                     // which is what aborting only the push would have full
                     // auto do next. Only a steered push can be full auto's.
                     full_auto::abort();
-                    say(
-                        &voice,
-                        &reporter,
-                        ui::LogKind::Readback,
-                        "Stopping the push. Brakes on, your aircraft.",
-                    );
+                    // Nothing said HERE: the push loop answers once it has
+                    // set the parking brake, from the read-back
+                    // (`pushback::stop_line`). This line used to claim the
+                    // brakes before the loop had even seen the word (#110).
                     continue;
                 } else {
                     // A NATIVE push (the spoken tool's one-shot command): no
@@ -1811,11 +1809,7 @@ async fn run_session(
                         &voice,
                         &reporter,
                         ui::LogKind::Readback,
-                        if held {
-                            "Stopping the push. Brakes on, your aircraft."
-                        } else {
-                            "Stopping the push. The parking brake did not set, hold the brakes. Your aircraft."
-                        },
+                        pushback::stop_line(held),
                     );
                     // A governor also driving means the flag was stale, not a
                     // push — fall through so "stop" reaches the brakes it was
@@ -3892,6 +3886,13 @@ fn next_input(
     let idle_deadline = std::time::Instant::now() + Duration::from_secs(2);
     loop {
         if let Ok(t) = typed.try_recv() {
+            // How long it sat on the channel (#90): the plugin's `taken`
+            // record says how long it sat on the panel before that.
+            let queued_ms = pollers::took_command().map(|d| d.as_millis() as u64);
+            crate::blackbox::record(
+                "typed",
+                serde_json::json!({ "event": "consumed", "text": t, "queued_ms": queued_ms }),
+            );
             let t = t.trim().to_string();
             if !t.is_empty() {
                 return Some(Input::Typed(t));
@@ -3933,7 +3934,9 @@ fn say(voice: &Voice, reporter: &Reporter, kind: ui::LogKind, line: &str) {
     tracing::info!(spoke = %line, "spoke");
     reporter.status(ui::Phase::Speaking);
     reporter.log(kind, line);
-    voice.say(Priority::Readback, line);
+    // Blocks until spoken, unless the pilot has a line waiting (typed, a
+    // panel button): the loop goes to take it and the line plays on (#90).
+    voice.say_until(Priority::Readback, line, pollers::command_waiting);
     reporter.status(ui::Phase::Listening);
     if matches!(kind, ui::LogKind::Readback) {
         if let Ok(mut last) = LAST_READBACK.lock() {
