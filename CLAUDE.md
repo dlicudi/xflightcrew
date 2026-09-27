@@ -78,9 +78,12 @@ must not answer "Roger"), (3) **safety gates** ("gear up" on the ground refuses 
 
 ## Aircraft profiles drive the tool surface
 
-Profiles (`src/aircraft.rs`, `profiles/<id>.yaml`, detected from `acf_ICAO`,
-`XCOPILOT_AIRCRAFT=auto`) declare systems and limits; the registry is built FROM them (172SP: no gear
-tool, per-notch Vfe). Datarefs and commands stay in the Rust tools; YAML is per-airframe config.
+Profiles (`src/aircraft.rs`, `profiles/<id>.yaml`, `XCOPILOT_AIRCRAFT=auto`) are detected from the
+profile's `match:` block (`acf_ICAO` AND the `.acf` path, `detect::resolve`, one resolver for boot
+and swap), never the ICAO alone: the stock 737 and the Zibo both say B738. An unmatched model of a
+known type is generic, said aloud. Plan-type questions use `aircraft::profile_for_type`. They
+declare systems and limits; the registry is built FROM them (172SP: no gear tool, per-notch Vfe).
+Datarefs and commands stay in the Rust tools; YAML is per-airframe config.
 
 **Numbers are the airframe's**
 - **All automation numbers are per-airframe**, the old GA figure when silent: taxi pace (carried BY the
@@ -94,7 +97,7 @@ tool, per-notch Vfe). Datarefs and commands stay in the Rust tools; YAML is per-
   singles stay byte-identical (element 0, starter 1). `vyse_kts`, `vmca_kts` stay `None` on
   singles: say nothing rather than invent.
 - **An unknown type is never silently the 172** (an RV-10 flew the 172's numbers into a stall).
-  `known_profile` maps ICAO; else `aircraft::generic_from_acf` reads speeds, flaps, gear and weights
+  A `match:` hit loads the profile; else `aircraft::generic_from_acf` reads speeds, flaps, gear and weights
   from the `.acf` (`acf_relative_path` under `xplane_root()`) and the pilot hears "no profile for
   this airframe"; only an unreadable file gets the 172, said aloud. Approach = max(1.3 Vso,
   1.2 Vs). `bus_volts_nominal` scales the start gate.

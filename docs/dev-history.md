@@ -7981,3 +7981,47 @@ the next install, so it could not carry the flight rules either.
   `squawk_vfr=false`, `ifr_code` and `code` both the cleared code, `squawk_set`
   null; the `atc_region` line without "seven thousand"; `atc`
   `ifr_flight_ended` after the touchdown. Offline only.
+
+## 2026-09-27: a profile per aircraft model, never per ICAO type
+
+Detection mapped `sim/aircraft/view/acf_ICAO` to a profile through a Rust
+table (`detect::known_profile`). The stock Laminar 737 and the Zibo 737 both
+say B738, so the Zibo would have flown `boeing_737_800`: the stock datarefs,
+the stock xlua assumptions, the stock `scripted_auto_start`. The same shape as
+the RV-10 on the 172's numbers (2026-09-11), one level down: a type is not a
+model.
+
+- Every `profiles/*.yaml` declares a `match:` block: `icao` (required) and
+  substrings of `acf_relative_path` (`acf`), optionally `author` and
+  `description` (substrings of `acf_author` / `acf_descrip`). Case-insensitive,
+  backslashes as slashes. Every key given must hit. The table is gone; the
+  blocks are read by `aircraft::profile_matchers` through the same reader as
+  `aircraft::load` (built-in 172 and SR22 carry theirs for a missing YAML).
+- One pure resolver, `detect::resolve(&AcfIdentity, matchers)`: candidates
+  are the profiles claiming the ICAO; the most keys matched wins; a tie is a
+  profile-authoring error, warned and picked by id (a test pins no tie on any
+  installed .acf). An ICAO hit with no model match is `UnknownModel`: the
+  model's own `.acf` placards under `generic_<icao>_<acf stem>`, and the pilot
+  hears "This is a B738 but not one I have a profile for. I'm flying it on the
+  placards from its own aircraft file. Treat every automation as untested."
+  `detect::pick_profile` wraps it for BOTH the startup probe and the swap
+  poller (they were two copies of the decision). The poller also says an
+  uncurated airframe at boot, which the old startup path only logged.
+- The poller's change key is (icao, normalised .acf path) (`model_key`), so a
+  stock-to-Zibo swap re-resolves; author and description are read only on a
+  change; the livery path is never read.
+- Type-level callers stay type-level: the stand pick from a SimBrief plan
+  (`tools/setup.rs`) asks `aircraft::profile_for_type`; `plan_audit`'s
+  "another type" refusal stays on the ICAO. A plan names no model.
+- Matchers: the Laminar folders for the stock aircraft, `AWXDC3/` (the dc3
+  profile is written for the AWX DC-3), `DHC6-300 Twin Otter V2/`, and
+  `Sparky/747-400/` plus author `see github` from the Sparky's own
+  `acf/_author` line. A renamed folder makes the model generic, said aloud;
+  the YAML comment says what to change. `DHC6F.acf` (the float Twin Otter)
+  has no `acf/_ICAO` line at all, so the detector sees an empty ICAO and never
+  resolved it before or after.
+- Blackbox: `profile_probe` gains `identity` (icao, relative_path, author,
+  descrip, resolution `profile` / `unknown_model` / `unknown_type`, the keys
+  that matched, `tied_with`). Next session, check it on the first probe, and
+  on any add-on that shares a stock ICAO the `unknown_model` resolution and
+  the spoken line. Offline only.
