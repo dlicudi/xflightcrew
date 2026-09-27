@@ -6462,6 +6462,121 @@ mod tests {
         *COMPLIANCE.lock().unwrap() = ComplianceState::NEW;
     }
 
+    /// Issue #63, 2026-09-26: an autoland with no landing clearance touched
+    /// down at t 1790448341.9 and the tower's phone number came at
+    /// 1790448368.5, 0.2 s after the autoland handed over at a standstill:
+    /// the monitor skipped the watch while `autoland::ACTIVE`, so the
+    /// air/ground edge it needs was the last one before the arm. Ticked
+    /// through the approach, the call lands ON the touchdown tick, the same
+    /// as hand-flown; with a landing clearance it stays silent through the
+    /// touchdown and the rollout. The skipped-tick replay pins the old
+    /// delay so the regression is visible.
+    #[test]
+    fn an_uncleared_landing_is_called_at_touchdown_whoever_flies() {
+        let _guard = SIDE_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        *ACTIVE_FIELD.lock().unwrap() = Some(("Gibraltar".into(), 36.1512, -5.3554));
+        *ACTIVE_PANEL.lock().unwrap() = Some((
+            "Gibraltar".into(),
+            11.0,
+            vec![("tower".to_string(), 131200_i64)],
+        ));
+        *ACTIVE_RUNWAYS.lock().unwrap() = vec![nav::Runway {
+            width_m: 0.0,
+            surface: 0,
+            ident_a: "09".into(),
+            ident_b: "27".into(),
+            lat_a: 36.1512,
+            lon_a: -5.3554,
+            lat_b: 36.1517,
+            lon_b: -5.3366,
+        }];
+        *TAXI_TO_STAND.lock().unwrap() = false;
+        *TAXI_ROUTE.lock().unwrap() = None;
+        let t0 = Instant::now();
+        let at = |s: f64| t0 + std::time::Duration::from_secs_f64(s);
+        // The recorded shape at 0.4 s ticks: airborne on the final, the
+        // touchdown at 60 s at 146 kt, stopped 26 s later, and the autoland
+        // handoff 26.4 s after the touchdown (1790448341.9 to 1790448368.3).
+        let touchdown = 60.0;
+        let handoff = touchdown + 26.4;
+        let tick = |s: f64| {
+            let on_ground = s >= touchdown;
+            let gs = if on_ground {
+                (146.0 - (s - touchdown) * 5.6).max(0.0)
+            } else {
+                146.0
+            };
+            let (lat, lon, alt) = if on_ground {
+                (36.15145, -5.3450, 12.0)
+            } else {
+                (
+                    36.1510,
+                    -5.3554 - (touchdown - s) * 0.0012,
+                    12.0 + (touchdown - s) * 8.0,
+                )
+            };
+            compliance_tick(lat, lon, alt, on_ground, gs, true, at(s))
+        };
+        let reset = |state: tower::State| {
+            *COMPLIANCE.lock().unwrap() = ComplianceState::NEW;
+            *CLEARANCE.lock().unwrap() = Some(ClearanceSnap {
+                state,
+                callsign: "November eight one six November November".into(),
+                runway_ident: "09".into(),
+                pending_readback: None,
+                holds_runway: false,
+            });
+        };
+        let steps: Vec<f64> = (0..=250).map(|i| i as f64 * 0.4).collect();
+
+        // Ticked every tick (hand-flown, and now under an autoland): the
+        // phone number on the touchdown tick, once.
+        reset(tower::State::Inbound);
+        let calls: Vec<(f64, String)> = steps
+            .iter()
+            .filter_map(|&s| tick(s).map(|c| (s, c.line)))
+            .collect();
+        assert!(!calls.is_empty(), "no call at all");
+        assert!(
+            (calls[0].0 - touchdown).abs() < 0.41,
+            "called at {} against touchdown {touchdown}",
+            calls[0].0
+        );
+        assert!(calls[0].1.contains("without clearance"), "{}", calls[0].1);
+        assert!(
+            calls[0].1.contains("number for you to copy"),
+            "{}",
+            calls[0].1
+        );
+        assert_eq!(
+            calls.iter().filter(|(_, l)| l.contains("number")).count(),
+            1,
+            "{calls:?}"
+        );
+
+        // The old gate: skipped from the arm (20 s before the touchdown) to
+        // the handoff. The call came on the first tick after it.
+        reset(tower::State::Inbound);
+        let late = steps
+            .iter()
+            .filter(|&&s| !(touchdown - 20.0..handoff).contains(&s))
+            .find_map(|&s| tick(s).map(|_| s))
+            .expect("the skipped watch still called it, late");
+        assert!(late - touchdown > 26.0, "late by {}", late - touchdown);
+
+        // Cleared to land: silent through the touchdown and the rollout.
+        reset(tower::State::ClearedToLand);
+        for &s in &steps {
+            assert!(tick(s).is_none(), "cleared landing berated at {s}");
+        }
+
+        *ACTIVE_FIELD.lock().unwrap() = None;
+        *ACTIVE_PANEL.lock().unwrap() = None;
+        *ACTIVE_RUNWAYS.lock().unwrap() = Vec::new();
+        *CLEARANCE.lock().unwrap() = None;
+        *COMPLIANCE.lock().unwrap() = ComplianceState::NEW;
+    }
+
     #[test]
     fn arrival_taxi_in_is_not_a_runway_incursion() {
         // The live fault (2026-07-27): after landing and getting a taxi-in
