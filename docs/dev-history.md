@@ -9280,3 +9280,35 @@ along the strip we occupy is phrased as a crossing.
 
 Next sortie: `atc` `stand_route_from_runway`, a small `join` `err_deg`, no `holding_point` with
 `|lat_m|` over 5, `drive.remaining_m` steps of 3 m or less on a lead-on. Offline only.
+
+## 2026-09-28: local planner: airways, airspace dog-legs, a route the arm keeps (issues #73, #74, #75)
+
+"Plan a flight to X" made a two-airport DIRECT plan. The arm had given it cruise, alignment and final
+fixes since 2026-09-16, but `local_route` read only the origin, so nothing between the fields could
+survive, and the shelf, GPS load and "check the flight plan" had no enroute point.
+`src/route_finder.rs` now decides the lateral route at plan time.
+
+An IFR (pressurised) plan searches `earth_awy.dat` with Dijkstra: ends placed from earth_fix/earth_nav
+(enroute over terminal namesakes), only segments whose base..top band holds the level, one-way
+segments honoured, entry within 60 nm, exit 25 to 60 nm out, direct joins weighted x2. It is taken
+only within 1.20x direct and with half the direct distance on airways, else direct. EGKK-EGPH FL210
+OTSID N16 BIG T420 TNT M868 TIPIL N57 POL N601 TLA, 322 nm against 310; FL350 direct (UK airways stop
+at FL255); LEMD-LEBL RBO N870 KARES; KSFO-KLAS FL350 OAK J84 BABIT J92 BTY J86 FUZZY, 418 against 359.
+
+A direct plan is dog-legged round P/R/Q volumes from the sim's `Custom Data/airspaces/airspace.txt`
+(OpenAir), each checked at the altitude the flight will be at there (the airframe's climb and descent
+per nm, else the whole field-to-cruise band). It goes round the convex hull 2 nm clear, within 1.30x
+direct, turn points XVLD1..9. A volume the bound refuses is flown and named with the bound. A volume
+over either field is only blackboxed (`at_fields`): LFPN sits inside eight, LXGB inside R-164.
+
+`local_route` keeps the plan's points (its own XVL points stripped, so a second arm rebuilds rather
+than stacks), drops points inside 20 nm of a destination runway end, places the top of descent along
+the route, puts later points on the descent line, and floors terrain by the climb along the route.
+Not done: class A/C/D are not avoided (a clearance or a vertical question, not lateral); the cruise
+level is still picked from terrain under the direct line (the route's terrain is re-probed and
+reported); the last leg to the 16 nm alignment fix is not airspace-checked; an airborne resume still
+refuses a local plan; no SID/STAR on local plans.
+
+Next sortie: blackbox `flightplan` `planned` (`via`, `route`, `route_nm`, `fixes`, `avoided`,
+`crossed`, `at_fields`, `ifr`); at the arm `plan_fetch` outcome `local`, `preflight`, `plan_audit`
+with the airway or XVLD fixes before XVLCR, XVLIF, XVLFA; the follower sequences them. Offline only.

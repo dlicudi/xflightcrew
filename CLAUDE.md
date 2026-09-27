@@ -183,8 +183,12 @@ stock 737 "re-synced" 14 times, 2026-09-27).
 - **The plan is the WHOLE navlog** (`simbrief::fms_route_payload`): the 512-byte `TextRef` is
   thinned from the MIDDLE, origin and destination always kept. A cap on the front of a list
   amputates its end (EGLL-EGPH 2026-09-17).
-- **Local planner** (`src/flightplan.rs`; "plan a flight to X", "divert [to X]"): a DIRECT plan in
-  the same `FlightPlan` (`PlanSource::Local`). Origin the nearest land-runway field; destination by
+- **Local planner** (`src/flightplan.rs`, `src/route_finder.rs`; "plan a flight to X", "divert [to
+  X]"): the same `FlightPlan` (`PlanSource::Local`), its lateral route decided at plan time: an IFR
+  plan over airways (`earth_awy.dat`, the level inside each segment's band, within 1.20x direct, half
+  on airways), else direct, dog-legged round P/R/Q volumes the flight would be inside (hull 2 nm
+  clear, within 1.30x; one it cannot go round is NAMED, one over a field only blackboxed). The
+  arm's `local_route` keeps those points and adds its own cruise, alignment and final fixes. Origin the nearest land-runway field; destination by
   ICAO (3 letters also with K) or name words. Cruise by `cruise_altitude_ft` (distance, terrain,
   ceiling, oxygen, semicircular, VFR +500 unpressurised). Fuel from `cruise_burn_kg_hr` or unsaid.
   A short destination runway is REFUSED. Only an explicit refresh replaces it.
@@ -212,8 +216,7 @@ stock 737 "re-synced" 14 times, 2026-09-27).
   loop asks `grammar::load_aircraft_request` first (same shape as the FMS load); "refuel" is the
   fuel truck.
 
-Still owed: issues labelled `owed` + `area:full-auto` (local plan enroute point #73, dog-legs #74,
-airways #75).
+Still owed: issues labelled `owed` + `area:full-auto`.
 
 ## ATC: the world, not the crew
 
