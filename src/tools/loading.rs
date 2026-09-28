@@ -505,6 +505,7 @@ mod tests {
             transition_level_ft: None,
             procedures: Default::default(),
             callsign: None,
+            schedule: Default::default(),
         }
     }
 

@@ -1139,6 +1139,7 @@ mod tests {
             transition_level_ft: None,
             procedures: Default::default(),
             callsign: None,
+            schedule: Default::default(),
             source: crate::simbrief::PlanSource::SimBrief,
             origin: "LIME".into(),
             destination: "LIPE".into(),

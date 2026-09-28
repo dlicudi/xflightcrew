@@ -3555,6 +3555,7 @@ mod tests {
             transition_level_ft: None,
             procedures: Default::default(),
             callsign: callsign.map(str::to_string),
+            schedule: Default::default(),
             source,
             origin: "EGLL".into(),
             destination: "EGPH".into(),

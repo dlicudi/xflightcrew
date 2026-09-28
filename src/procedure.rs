@@ -466,6 +466,12 @@ pub struct Plan {
     /// the follower if that landing goes around (never a self-flown pattern
     /// in a valley).
     pub missed_legs: Vec<ProcLeg>,
+    /// The OFP's cruise schedule (#101): on an enroute flight a CRUISE leg is
+    /// flown at the speed its cost index planned ([`scheduled_cruise_kts`],
+    /// [`cruise_pick`]) and a planned step is said as it begins
+    /// ([`step_climb_at`]; the levels themselves are already in `legs`,
+    /// [`apply_step_climbs`]). Empty: the profile's `cruise_ias_kts`.
+    pub cruise_schedule: crate::simbrief::CruiseSchedule,
 }
 
 /// The published missed approach of the approach being landed, stashed at the
@@ -1777,6 +1783,7 @@ pub fn approach_plan_for(
         arrival_constraints: Vec::new(),
         visual_deg,
         missed_legs,
+        cruise_schedule: Default::default(),
     })
 }
 
@@ -1888,6 +1895,202 @@ pub fn power_hold_target(end: &EndAction, cruise_ias_kts: Option<f64>) -> Option
         }
         EndAction::Level => None,
     }
+}
+
+/// Calibrated airspeed, kt, of `mach` at a pressure altitude (ISA,
+/// troposphere and the isothermal layer above 36,089 ft). The governor holds
+/// INDICATED speed, so a planned Mach is held as the airspeed it is at the
+/// level flown: M0.628 at FL180 is 300 kt, M0.78 at FL360 is 260. Pure.
+pub fn cas_for_mach(mach: f64, pressure_alt_ft: f64) -> f64 {
+    const A0_KTS: f64 = 661.4786;
+    let h = pressure_alt_ft.clamp(-2_000.0, 65_000.0);
+    let delta = if h <= 36_089.0 {
+        (1.0 - 6.875_59e-6 * h).powf(5.255_88)
+    } else {
+        0.223_36 * (-4.806_34e-5 * (h - 36_089.0)).exp()
+    };
+    let qc_over_p = (1.0 + 0.2 * mach * mach).powf(3.5) - 1.0;
+    let qc_over_p0 = qc_over_p * delta;
+    A0_KTS * (5.0 * ((qc_over_p0 + 1.0).powf(2.0 / 7.0) - 1.0)).sqrt()
+}
+
+/// A leg's planned cruise speed from the OFP: the airspeed and Mach the cost
+/// index gave its fix, and what the governor should hold at `alt_ft`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ScheduledSpeed {
+    pub fix: String,
+    pub plan_ias_kts: Option<f64>,
+    pub mach: Option<f64>,
+    /// The lower of the planned airspeed and the planned Mach at the level
+    /// flown: an airline's IAS/Mach schedule, so a level other than the
+    /// plan's (a pilot's, a controller's) still stays on the Mach.
+    pub target_kts: f64,
+}
+
+/// The fix a schedule entry must be within to be this leg's, nm: an ident is
+/// not unique across the world, a position is.
+const SCHEDULE_MATCH_NM: f64 = 2.0;
+
+/// The OFP cruise speed for the leg flown, if the navlog planned it as a
+/// CRUISE leg (its fix's `stage` is CRZ). Climb and descent legs are `None`:
+/// the airframe's speed, the 250 below ten thousand and the STAR limits
+/// keep them as before. Pure.
+pub fn scheduled_cruise_kts(
+    schedule: &crate::simbrief::CruiseSchedule,
+    leg: &ProcLeg,
+    alt_ft: f64,
+) -> Option<ScheduledSpeed> {
+    let e = schedule.fixes.iter().find(|e| {
+        e.stage == crate::simbrief::Stage::Cruise
+            && e.ident.eq_ignore_ascii_case(&leg.fix_ident)
+            && leg
+                .fix
+                .as_ref()
+                .is_some_and(|f| crate::nav::haversine_nm(f.lat, f.lon, e.lat, e.lon) <= SCHEDULE_MATCH_NM)
+    })?;
+    let by_mach = e
+        .mach
+        .filter(|_| alt_ft.is_finite())
+        .map(|m| cas_for_mach(m, alt_ft));
+    let target = match (e.ias_kts, by_mach) {
+        (Some(a), Some(b)) => a.min(b),
+        (a, b) => a.or(b)?,
+    };
+    Some(ScheduledSpeed {
+        fix: e.ident.clone(),
+        plan_ias_kts: e.ias_kts,
+        mach: e.mach,
+        target_kts: target.round(),
+    })
+}
+
+/// Which cruise speed the governor holds on this leg, and why.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CruisePick {
+    pub kts: f64,
+    /// "ofp" or "profile".
+    pub source: &'static str,
+    /// Why the OFP's speed was not taken: "below_floor", "above_ceiling".
+    pub rejected: Option<&'static str>,
+}
+
+/// The OFP's speed where the leg has one and it is inside the airframe's
+/// floor and ceiling; the profile's `cruise_ias_kts` otherwise. A plan made
+/// for another type, or a number outside what this airframe may fly, is
+/// never flown: the airframe's own figure is (a wrong number handed down
+/// from a plan is still wrong). A target over the ceiling would also be
+/// clamped by the governor every tick and re-armed every tick. Pure.
+pub fn cruise_pick(
+    profile_kts: f64,
+    scheduled: Option<&ScheduledSpeed>,
+    floor_kts: Option<f64>,
+    ceiling_kts: Option<f64>,
+) -> CruisePick {
+    let profile = |rejected| CruisePick { kts: profile_kts, source: "profile", rejected };
+    let Some(s) = scheduled else {
+        return profile(None);
+    };
+    if floor_kts.is_some_and(|f| s.target_kts < f) {
+        return profile(Some("below_floor"));
+    }
+    if ceiling_kts.is_some_and(|c| s.target_kts > c) {
+        return profile(Some("above_ceiling"));
+    }
+    CruisePick { kts: s.target_kts, source: "ofp", rejected: None }
+}
+
+/// A planned step placed on the legs: from the leg after `idx` (the leg
+/// flown FROM the step fix) the plan's level is `alt_ft`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PlacedStep {
+    pub fix: String,
+    pub idx: usize,
+    pub alt_ft: f64,
+}
+
+/// The plan's step climbs, flown where the OFP planned them. `enroute_legs`
+/// commands the plan's HIGHEST level from the first leg (one continuous climb
+/// to cruise), which for a stepped plan is the LAST step: FL340 then FL360
+/// at ERNAN was flown as FL360 from the runway. With the OFP's
+/// `stepclimb_string` read, every climb and cruise leg (before the first
+/// DESCENT-stage fix) commands the level in force: the initial level up to
+/// and including the first step fix, the step's level after it, and so on.
+/// The descent keeps the navlog's own numbers. Returns the steps placed. A
+/// plan with one level, no stages, an implausible initial level or a step
+/// fix not on the route (before the descent) is left exactly as built. Pure.
+pub fn apply_step_climbs(
+    legs: &mut [ProcLeg],
+    schedule: &crate::simbrief::CruiseSchedule,
+) -> Vec<PlacedStep> {
+    let Some((first, rest)) = schedule.steps.split_first() else {
+        return Vec::new();
+    };
+    if rest.is_empty() || !(1_000.0..=60_000.0).contains(&first.alt_ft) {
+        return Vec::new();
+    }
+    let stage_of = |leg: &ProcLeg| {
+        schedule
+            .fixes
+            .iter()
+            .find(|e| {
+                e.ident.eq_ignore_ascii_case(&leg.fix_ident)
+                    && leg.fix.as_ref().is_some_and(|f| {
+                        crate::nav::haversine_nm(f.lat, f.lon, e.lat, e.lon) <= SCHEDULE_MATCH_NM
+                    })
+            })
+            .map(|e| e.stage)
+    };
+    let Some(top) = legs
+        .iter()
+        .position(|l| stage_of(l) == Some(crate::simbrief::Stage::Descent))
+        .or_else(|| legs.iter().any(|l| stage_of(l).is_some()).then_some(legs.len()))
+    else {
+        return Vec::new();
+    };
+    let mut placed = Vec::new();
+    let mut from = 0usize;
+    for s in rest {
+        let Some(j) = legs[..top]
+            .iter()
+            .enumerate()
+            .skip(from)
+            .find(|(_, l)| l.fix_ident.eq_ignore_ascii_case(&s.fix))
+            .map(|(j, _)| j)
+        else {
+            // A step the route does not carry: the plan cannot be flown as
+            // stepped, so none of it is (the navlog's levels stand).
+            return Vec::new();
+        };
+        placed.push(PlacedStep { fix: s.fix.clone(), idx: j, alt_ft: s.alt_ft });
+        from = j + 1;
+    }
+    for (i, leg) in legs[..top].iter_mut().enumerate() {
+        let level = placed
+            .iter()
+            .rev()
+            .find(|p| p.idx < i)
+            .map_or(first.alt_ft, |p| p.alt_ft);
+        leg.alt1_ft = Some(level);
+    }
+    placed
+}
+
+/// The step climb that begins on leg `idx`: the leg before it ends at a
+/// planned step fix and this leg's level is a step above that leg's. Pure.
+pub fn step_climb_at(
+    legs: &[ProcLeg],
+    idx: usize,
+    schedule: &crate::simbrief::CruiseSchedule,
+) -> Option<(String, f64, f64)> {
+    let prev = legs.get(idx.checked_sub(1)?)?;
+    let (from, to) = (prev.alt1_ft?, legs.get(idx)?.alt1_ft?);
+    (to > from + STEP_FT
+        && schedule
+            .steps
+            .iter()
+            .skip(1)
+            .any(|s| s.fix.eq_ignore_ascii_case(&prev.fix_ident)))
+    .then(|| (prev.fix_ident.clone(), from, to))
 }
 
 /// Build the ENROUTE legs of a SimBrief plan: direct-to legs over the named
@@ -2154,6 +2357,7 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, plan: Pla
         mut arrival_constraints,
         visual_deg,
         missed_legs,
+        cruise_schedule,
     } = plan;
     // Never judge the aircraft against a minimum above the level it is
     // flying to (`minimums_within_cruise`); the arm says so, and this
@@ -2271,6 +2475,10 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, plan: Pla
     }
 
     let mut said_star_speed: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // The OFP schedule's last logged pick (leg, source, why rejected), and
+    // the planned steps already said.
+    let mut schedule_logged: Option<(usize, &'static str, Option<&'static str>)> = None;
+    let mut said_steps: std::collections::HashSet<String> = std::collections::HashSet::new();
     // The STAR speed limits whose slow-down has begun: held from then on
     // (`arrival_speed_cap`).
     let mut star_speed_begun: std::collections::HashSet<usize> = std::collections::HashSet::new();
@@ -2532,6 +2740,36 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, plan: Pla
             }
         }
         if let Some(planned) = power_hold_target(&end, cruise_ias_kts) {
+            // The OFP's cruise schedule on a cruise leg of an enroute flight:
+            // the speed its cost index planned, held as IAS or Mach,
+            // whichever is lower at the level flown (#101).
+            let planned = if matches!(end, EndAction::Enroute) {
+                let sched = scheduled_cruise_kts(&cruise_schedule, &legs[idx], alt_ft);
+                let pick = cruise_pick(
+                    planned,
+                    sched.as_ref(),
+                    crate::aircraft::speed_floor_kts(),
+                    crate::aircraft::speed_ceiling_kts(),
+                );
+                let key = (idx, pick.source, pick.rejected);
+                if sched.is_some() && schedule_logged != Some(key) {
+                    schedule_logged = Some(key);
+                    crate::blackbox::record(
+                        "procedure",
+                        serde_json::json!({
+                            "event": "cruise_schedule", "idx": idx, "fix": legs[idx].fix_ident,
+                            "source": pick.source, "target": pick.kts, "rejected": pick.rejected,
+                            "plan_ias": sched.as_ref().and_then(|s| s.plan_ias_kts),
+                            "mach": sched.as_ref().and_then(|s| s.mach),
+                            "ofp_target": sched.as_ref().map(|s| s.target_kts),
+                            "profile_kts": planned, "alt_ft": alt_ft, "ias": ias,
+                        }),
+                    );
+                }
+                pick.kts
+            } else {
+                planned
+            };
             // A departure minimum ahead is climbed at Vy, the steepest the
             // airframe goes up: at cruise speed the SF50 made 375 ft a mile
             // where MOGT3H asks 600 (LOWI, 2026-09-24).
@@ -3032,6 +3270,23 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, plan: Pla
             },
         );
         plan_peak_ft = v.peak_ft;
+        // A planned step climb begins on this leg: said once, as a crew
+        // says it, and only when it is the plan's level being flown (not a
+        // pilot's, not the terrain floor's).
+        if let Some((fix, from_ft, to_ft)) = step_climb_at(&legs, idx, &cruise_schedule) {
+            if !v.pilot && v.floored.is_none() && said_steps.insert(fix.clone()) {
+                crate::blackbox::record(
+                    "procedure",
+                    serde_json::json!({"event": "step_climb", "idx": idx, "fix": fix,
+                                       "from_ft": from_ft, "to_ft": to_ft, "alt_ft": alt_ft}),
+                );
+                alert(
+                    &voice,
+                    Priority::Advisory,
+                    &format!("Step climb, {}.", atc::atis::spoken_flight_level(to_ft)),
+                );
+            }
+        }
         if let Some((plan_ft, held_ft)) = v.climb_held {
             if climb_held_logged != Some(idx) {
                 climb_held_logged = Some(idx);
@@ -5421,6 +5676,7 @@ mod tests {
             arrival_constraints: Vec::new(),
             visual_deg: None,
             missed_legs: Vec::new(),
+            cruise_schedule: Default::default(),
         };
         // Tight circuit: 0.3 nm from the FAF at 700 ft — NOT flyable (autoland).
         let (near_lat, near_lon) = crate::nav::project_latlon(36.0, -5.0, 0.0, 0.3);
@@ -5445,5 +5701,160 @@ mod tests {
         assert!(!terrain_probe_fatal(&mut m, true));
         assert_eq!(m, 1);
         assert!(terrain_probe_fatal(&mut m, false));
+    }
+
+    /// The trimmed OFP (EGKK-EGBB, B738, CI 77, FL180; the pilot's plan,
+    /// 2026-09-28), its navlog as the fetcher builds the waypoints.
+    fn egkk_egbb() -> (Vec<crate::simbrief::Waypoint>, crate::simbrief::CruiseSchedule) {
+        let v: serde_json::Value =
+            serde_json::from_str(include_str!("../bench/ofp/egkk-egbb-738.trimmed.json")).unwrap();
+        let n = |f: &serde_json::Value, k: &str| f[k].as_str().unwrap().parse::<f64>().unwrap();
+        let mut wps: Vec<_> = v["navlog"]["fix"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|f| f["ident"] != "TOC" && f["ident"] != "TOD")
+            .map(|f| wp(f["ident"].as_str().unwrap(), n(f, "pos_lat"), n(f, "pos_long"), n(f, "altitude_feet")))
+            .collect();
+        wps.insert(0, wp("EGKK", 51.148, -0.19, 0.0));
+        (wps, crate::simbrief::parse_schedule(&v))
+    }
+
+    #[test]
+    fn a_planned_mach_is_held_as_the_airspeed_it_is_at_the_level() {
+        // The OFP's HEMEL: M0.628 at FL180 planned at 300 KIAS.
+        let fl180 = cas_for_mach(0.628, 18_000.0);
+        assert!((fl180 - 300.0).abs() < 2.0, "{fl180}");
+        // The 737 profile's own reasoning (dev-history 2026-09-19): M0.78
+        // at FL360 is about 255 to 260.
+        let fl360 = cas_for_mach(0.78, 36_000.0);
+        assert!((255.0..=262.0).contains(&fl360), "{fl360}");
+        // Above the tropopause too, and at sea level Mach is TAS.
+        assert!(cas_for_mach(0.78, 39_000.0) < fl360);
+        assert!((cas_for_mach(0.3, 0.0) - 198.4).abs() < 1.0);
+    }
+
+    /// #101: the 737's profile flies 255 at every level, chosen to stay under
+    /// Mmo at FL360. The OFP planned 300 KIAS / M0.63 for the FL180 cruise of
+    /// EGKK-EGBB: the cruise legs are flown at it, the climb and descent
+    /// legs are the profile's, and a level other than the plan's stays on
+    /// the Mach (the lower of the two).
+    #[test]
+    fn the_ofp_cruise_speed_is_flown_on_its_cruise_legs() {
+        let (wps, sched) = egkk_egbb();
+        assert_eq!((sched.cost_index, sched.profile.as_deref()), (Some(77.0), Some("CI 77")));
+        let legs = enroute_legs(&wps, "EGKK", "EGBB", 18_000.0);
+        let at = |id: &str| legs.iter().find(|l| l.fix_ident == id).unwrap();
+        let hemel = scheduled_cruise_kts(&sched, at("HEMEL"), 18_000.0).expect("a cruise leg");
+        assert_eq!((hemel.plan_ias_kts, hemel.target_kts), (Some(300.0), 300.0));
+        assert_eq!(scheduled_cruise_kts(&sched, at("D156O"), 18_000.0).unwrap().target_kts, 299.0);
+        // Climb and descent legs: no schedule, the profile's speed.
+        for id in ["DET31", "ACORN", "PUFAX", "HON", "OSKOT"] {
+            assert_eq!(scheduled_cruise_kts(&sched, at(id), 12_000.0), None, "{id}");
+        }
+        // Held at FL280 (a controller's level): the Mach, not the 300.
+        let high = scheduled_cruise_kts(&sched, at("HEMEL"), 28_000.0).unwrap().target_kts;
+        assert!((240.0..=250.0).contains(&high), "{high}");
+        // The 737 (floor about 167, ceiling Vne 340 less 15): the OFP's 300,
+        // where the old law held the profile's 255.
+        let pick = cruise_pick(255.0, Some(&hemel), Some(167.0), Some(325.0));
+        assert_eq!(pick, CruisePick { kts: 300.0, source: "ofp", rejected: None });
+        assert_eq!(cruise_pick(255.0, None, Some(167.0), Some(325.0)).kts, 255.0);
+        // A 737 plan in a 172 is never flown at 300: the airframe's number.
+        let pick = cruise_pick(108.0, Some(&hemel), Some(58.0), Some(148.0));
+        assert_eq!(pick, CruisePick { kts: 108.0, source: "profile", rejected: Some("above_ceiling") });
+        let slow = ScheduledSpeed { target_kts: 90.0, ..hemel.clone() };
+        assert_eq!(cruise_pick(255.0, Some(&slow), Some(167.0), None).rejected, Some("below_floor"));
+        // A leg whose ident matches but whose fix is elsewhere is not it.
+        let mut far = at("HEMEL").clone();
+        far.fix.as_mut().unwrap().lat += 1.0;
+        assert_eq!(scheduled_cruise_kts(&sched, &far, 18_000.0), None);
+        // One level, no step: the legs are left as built.
+        let mut same = legs.clone();
+        assert!(apply_step_climbs(&mut same, &sched).is_empty());
+        let alts = |l: &[ProcLeg]| l.iter().map(|l| l.alt1_ft).collect::<Vec<_>>();
+        assert_eq!(alts(&same), alts(&legs));
+    }
+
+    /// An EIDW-BIKF shaped plan (the sector the step-climb advisory's FL360
+    /// test flies): FL340 initial, "ERNAN/0360" a step. The navlog shows
+    /// 36,000 from the fix after ERNAN, so `enroute_legs` commanded FL360
+    /// from the first leg and the step was flown as the initial cruise.
+    #[test]
+    fn a_planned_step_climb_is_flown_at_its_fix() {
+        use crate::simbrief::{CruiseSchedule, NavlogSpeed, Stage, StepClimb};
+        let route = [
+            ("EIDW", 53.42, -6.27, 0.0, None),
+            ("DUB", 53.50, -6.50, 12_000.0, Some(Stage::Climb)),
+            ("LIFFY", 53.60, -7.00, 30_000.0, Some(Stage::Climb)),
+            ("BAMLI", 54.00, -8.00, 34_000.0, Some(Stage::Cruise)),
+            ("ERNAN", 55.00, -10.00, 34_000.0, Some(Stage::Cruise)),
+            ("5715N", 57.00, -15.00, 36_000.0, Some(Stage::Cruise)),
+            ("6120N", 61.00, -20.00, 36_000.0, Some(Stage::Cruise)),
+            ("KEF", 63.90, -22.60, 11_000.0, Some(Stage::Descent)),
+            ("BIKF", 63.98, -22.60, 0.0, None),
+        ];
+        let wps: Vec<_> = route.iter().map(|(i, la, lo, a, _)| wp(i, *la, *lo, *a)).collect();
+        let sched = CruiseSchedule {
+            cost_index: Some(30.0),
+            profile: Some("CI 30".into()),
+            fixes: route
+                .iter()
+                .filter_map(|(i, la, lo, a, st)| {
+                    st.map(|stage| NavlogSpeed {
+                        ident: i.to_string(),
+                        lat: *la,
+                        lon: *lo,
+                        stage,
+                        alt_ft: *a,
+                        ias_kts: Some(270.0),
+                        mach: Some(0.78),
+                    })
+                })
+                .collect(),
+            steps: crate::simbrief::parse_step_climbs("EIDW/0340 ERNAN/0360"),
+        };
+        assert_eq!(sched.steps[1], StepClimb { fix: "ERNAN".into(), alt_ft: 36_000.0 });
+        let built = enroute_legs(&wps, "EIDW", "BIKF", 34_000.0);
+        let alts = |l: &[ProcLeg]| l.iter().map(|l| l.alt1_ft.unwrap()).collect::<Vec<_>>();
+        // As built: FL360 from the runway.
+        assert_eq!(alts(&built), vec![36_000.0, 36_000.0, 36_000.0, 36_000.0, 36_000.0, 36_000.0, 11_000.0]);
+        let mut legs = built.clone();
+        let placed = apply_step_climbs(&mut legs, &sched);
+        assert_eq!(placed, vec![PlacedStep { fix: "ERNAN".into(), idx: 3, alt_ft: 36_000.0 }]);
+        // FL340 to and over ERNAN, FL360 from the leg after it, the descent
+        // untouched.
+        assert_eq!(alts(&legs), vec![34_000.0, 34_000.0, 34_000.0, 34_000.0, 36_000.0, 36_000.0, 11_000.0]);
+        // Said as it begins, on the leg flown from ERNAN, and nowhere else.
+        assert_eq!(step_climb_at(&legs, 4, &sched), Some(("ERNAN".into(), 34_000.0, 36_000.0)));
+        assert!((0..legs.len()).filter(|i| *i != 4).all(|i| step_climb_at(&legs, i, &sched).is_none()));
+        // The follower's vertical: level at FL340 on the leg to ERNAN (no
+        // early climb), climbing to FL360 on the leg after it; the cruise is
+        // the plan's highest level, so this is a climb before the top.
+        let cruise = legs.iter().filter_map(|l| l.alt1_ft).fold(f64::MIN, f64::max);
+        let top = plan_top_index(&legs, cruise);
+        let profile = |idx: usize| DescentProfile {
+            cruise_ft: Some(cruise),
+            peak_ft: 34_000.0,
+            past_top: top.is_some_and(|t| idx > t),
+            arrival_ceiling: false,
+        };
+        let v = vertical_tick(&legs[3], 34_000.0, 34_000.0, 34_000.0, Some(80.0), 460.0, None, None, 2_000.0, profile(3));
+        assert_eq!(v.want_alt, 34_000.0);
+        let v = vertical_tick(&legs[4], 34_000.0, 34_000.0, 34_000.0, Some(200.0), 460.0, None, None, 2_000.0, profile(4));
+        assert_eq!(v.want_alt, 36_000.0);
+        // A step fix the route does not carry: nothing is changed.
+        let mut other = built.clone();
+        let lost = CruiseSchedule {
+            steps: crate::simbrief::parse_step_climbs("EIDW/0340 NOSUCH/0360"),
+            ..sched.clone()
+        };
+        assert!(apply_step_climbs(&mut other, &lost).is_empty());
+        assert_eq!(alts(&other), alts(&built));
+        // A plan without stages (an old OFP) is not stepped either.
+        let mut bare = built.clone();
+        let nostage = CruiseSchedule { fixes: Vec::new(), ..sched };
+        assert!(apply_step_climbs(&mut bare, &nostage).is_empty());
+        assert_eq!(alts(&bare), alts(&built));
     }
 }
