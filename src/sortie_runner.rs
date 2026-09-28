@@ -28,6 +28,7 @@ const SIM_SPEED: &str = "sim/time/sim_speed";
 const ACF_PATH: &str = "sim/aircraft/view/acf_relative_path";
 const ACF_ICAO: &str = "sim/aircraft/view/acf_ICAO";
 const GROUNDSPEED: &str = "sim/flightmodel/position/groundspeed";
+const PAUSE_ON: &str = "sim/operation/pause_on";
 
 /// A case with no deadline of its own ends failed after this long.
 pub const DEFAULT_DEADLINE_MIN: f64 = 20.0;
@@ -303,6 +304,49 @@ pub struct Verdict {
     pub reason: String,
     /// The runner must take the loops off the aircraft ("my controls").
     pub abort: bool,
+    /// The case ended on the wreck flag (with [`Verdict::abort`]).
+    pub crashed: bool,
+    /// The sim is still wrecked after a setup: the rest of the run would
+    /// fail in seconds each, so the run stops here.
+    pub stop_run: bool,
+    /// The case ended with the aircraft airborne and its loops left flying
+    /// ([`HandBack::LeaveFlying`]): the next case's setup replaces them.
+    pub left_flying: bool,
+}
+
+/// The line that stops a run on a wreck that outlived its setup.
+pub const STILL_CRASHED: &str = "the sim is still crashed; reset it";
+/// After the case's line, the wreck flag of the LAST case has this long to
+/// clear before it counts as this case's: an approach setup's reload takes up
+/// to two minutes (`InitTiming`), a ramp or runway start has already reloaded.
+/// LEMG 2026-09-28: after 1790584266 crashed, three cases each failed in 2 s
+/// as "the aircraft crashed", on the wreck the flag still reported.
+pub const CRASH_CLEAR_S: f64 = 150.0;
+
+/// What the runner does with the aircraft when a case ends.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum HandBack {
+    /// Nothing was armed, or the case ended by itself.
+    Nothing,
+    /// "my controls": on the ground, or a wreck.
+    MyControls,
+    /// Airborne (or the wheels unreadable): the loops keep flying it. "my
+    /// controls" there hands a flying aircraft to nobody (the deadline once
+    /// did at 1,600 ft on a 5 nm final); the next case's setup replaces the
+    /// flight, and a run that ends pauses the sim ([`secure_at_end`]).
+    LeaveFlying,
+}
+
+/// The hand-back for an ended case. `on_ground` is `None` when the read
+/// failed: no measurement, so the aircraft is treated as flying.
+pub fn hand_back(v: &Verdict, on_ground: Option<bool>) -> HandBack {
+    if !v.abort {
+        HandBack::Nothing
+    } else if v.crashed || on_ground == Some(true) {
+        HandBack::MyControls
+    } else {
+        HandBack::LeaveFlying
+    }
 }
 
 pub struct CaseMachine {
@@ -313,6 +357,11 @@ pub struct CaseMachine {
     last_crew_line: Option<String>,
     give_up: Option<String>,
     tool: Option<String>,
+    /// The wreck flag has read clear since the case began: only then is a
+    /// wreck this case's.
+    crash_clear: bool,
+    /// How long the last case's wreck may take to clear ([`CRASH_CLEAR_S`]).
+    pub crash_clear_s: f64,
 }
 
 fn st<'a>(r: &'a Value, k: &str) -> &'a str {
@@ -345,6 +394,8 @@ impl CaseMachine {
             last_crew_line: None,
             give_up: None,
             tool: None,
+            crash_clear: false,
+            crash_clear_s: CRASH_CLEAR_S,
         }
     }
 
@@ -436,6 +487,9 @@ impl CaseMachine {
         let stages = std::mem::take(&mut self.stages);
         let mut why: Vec<String> = Vec::new();
         if !pass {
+            if r.get("crashed").and_then(Value::as_bool) == Some(true) {
+                why.push("the aircraft crashed".into());
+            }
             for s in stages
                 .iter()
                 .filter(|s| s.get("pass") != Some(&Value::Bool(true)))
@@ -479,6 +533,8 @@ impl CaseMachine {
             outcome,
             reason: why.join("; "),
             abort: false,
+            crashed: r.get("crashed").and_then(Value::as_bool) == Some(true),
+            ..Verdict::default()
         }
     }
 
@@ -498,8 +554,24 @@ impl CaseMachine {
             }
             v
         };
-        if crashed == Some(true) {
-            return tag(self.fail("the aircraft crashed".into(), true));
+        match crashed {
+            Some(false) => self.crash_clear = true,
+            Some(true) if self.crash_clear => {
+                let mut v = tag(self.fail("the aircraft crashed".into(), true));
+                if let Step::Finished(x) = &mut v {
+                    x.crashed = true;
+                }
+                return v;
+            }
+            // The last case's wreck, until the setup's reload clears it.
+            Some(true) if now - self.started > self.crash_clear_s => {
+                let mut v = tag(self.fail(STILL_CRASHED.into(), false));
+                if let Step::Finished(x) = &mut v {
+                    x.stop_run = true;
+                }
+                return v;
+            }
+            _ => {}
         }
         if now - self.started > self.deadline_s {
             let why = format!("deadline {:.0} min passed", self.deadline_s / 60.0);
@@ -646,6 +718,9 @@ pub fn table(spec_path: &str, started: &str, rows: &[Row]) -> String {
             cell(&v.reason),
         ));
     }
+    if rows.last().is_some_and(|r| r.verdict.stop_run) {
+        eprintln!("run stopped: {STILL_CRASHED}");
+    }
     let passed = rows.iter().filter(|r| r.verdict.pass).count();
     out.push_str(&format!("\n{passed} of {} passed.\n", rows.len()));
     out
@@ -717,10 +792,14 @@ pub trait RunnerSim: Send + Sync {
     async fn read_string(&self, name: &str) -> Result<String>;
     async fn write_float(&self, name: &str, v: f64) -> Result<()>;
     async fn write_bytes(&self, name: &str, bytes: &[u8]) -> Result<()>;
+    async fn command(&self, name: &str) -> Result<()>;
 }
 
 #[async_trait]
 impl RunnerSim for crate::xplane::XPlaneClient {
+    async fn command(&self, name: &str) -> Result<()> {
+        self.run_command(name).await
+    }
     async fn read(&self, name: &str) -> Result<f64> {
         self.get_float(name).await
     }
@@ -761,6 +840,8 @@ pub struct Pace {
     pub settle_scale: f64,
     /// Longest wait for the loops of the last case to let go.
     pub idle_max_s: f64,
+    /// Longest wait for the last case's wreck to clear ([`CRASH_CLEAR_S`]).
+    pub crash_clear_s: f64,
 }
 
 impl Pace {
@@ -771,6 +852,7 @@ impl Pace {
         still_max_s: 240.0,
         settle_scale: 1.0,
         idle_max_s: 60.0,
+        crash_clear_s: CRASH_CLEAR_S,
     };
 }
 
@@ -832,21 +914,27 @@ pub async fn preflight(sim: &dyn RunnerSim) -> Result<()> {
     Ok(())
 }
 
-/// Between cases: the last case's loops let go, else "my controls".
-async fn wait_idle(sim: &dyn RunnerSim, pace: &Pace) -> Result<()> {
+/// Between cases: the last case's loops let go, else "my controls". Loops the
+/// last case LEFT flying (airborne at its end) are taken back at once, right
+/// before this case's setup replaces the flight: the aircraft is nobody's
+/// only for the seconds between the two lines.
+async fn wait_idle(sim: &dyn RunnerSim, pace: &Pace, take_back_now: bool) -> Result<()> {
     let t0 = now_s();
-    let mut told = false;
+    let mut told: Option<f64> = None;
     loop {
         match sim.read_string(STATUS_AUTO).await {
             Ok(s) if !loop_flying(&s) => return Ok(()),
             _ => {}
         }
-        if now_s() - t0 > pace.idle_max_s {
-            if told {
+        match told {
+            None if take_back_now || now_s() - t0 > pace.idle_max_s => {
+                type_line(sim, ABORT_LINE, pace).await?;
+                told = Some(now_s());
+            }
+            Some(t) if now_s() - t > pace.idle_max_s => {
                 return Err(anyhow!("a loop is still flying after my controls"));
             }
-            type_line(sim, ABORT_LINE, pace).await?;
-            told = true;
+            _ => {}
         }
         tokio::time::sleep(pace.poll).await;
     }
@@ -959,13 +1047,14 @@ pub async fn run_case(
     case: &Case,
     apt_dat: &str,
     pace: &Pace,
+    take_back_now: bool,
 ) -> Verdict {
     let failed = |reason: String| Verdict {
         reason,
         outcome: "runner".into(),
         ..Verdict::default()
     };
-    if let Err(e) = wait_idle(sim, pace).await {
+    if let Err(e) = wait_idle(sim, pace, take_back_now).await {
         return failed(e.to_string());
     }
     if let Err(e) = set_up_start(sim, case, apt_dat, pace).await {
@@ -980,6 +1069,7 @@ pub async fn run_case(
         Setup::Approach { .. } => CaseMachine::once(now_s(), case.deadline_s()),
         _ => CaseMachine::new(now_s(), case.deadline_s()),
     };
+    m.crash_clear_s = pace.crash_clear_s;
     let speed = case.sim_speed.filter(|s| *s != 1);
     let verdict = loop {
         tokio::time::sleep(pace.poll).await;
@@ -1017,10 +1107,39 @@ pub async fn run_case(
     if speed.is_some() {
         let _ = sim.write_float(SIM_SPEED, 1.0).await;
     }
-    if verdict.abort {
-        let _ = type_line(sim, ABORT_LINE, pace).await;
+    let mut verdict = verdict;
+    let on_ground = match verdict.abort {
+        true => sim
+            .read(crate::datarefs::ON_GROUND_ANY)
+            .await
+            .ok()
+            .map(|g| g > 0.5),
+        false => None,
+    };
+    match hand_back(&verdict, on_ground) {
+        HandBack::MyControls => {
+            let _ = type_line(sim, ABORT_LINE, pace).await;
+        }
+        HandBack::LeaveFlying => verdict.left_flying = true,
+        HandBack::Nothing => {}
     }
     verdict
+}
+
+/// The run is over: an aircraft still in the air (its loops left flying at a
+/// deadline, or a setup that failed after the take-back) is paused, never
+/// handed to nobody. The pilot comes back to a frozen sim with whatever was
+/// flying it still armed. An unreadable wheels flag pauses too.
+pub async fn secure_at_end(sim: &dyn RunnerSim) -> bool {
+    let on_ground = sim
+        .read(crate::datarefs::ON_GROUND_ANY)
+        .await
+        .ok()
+        .map(|g| g > 0.5);
+    if on_ground == Some(true) {
+        return false;
+    }
+    sim.command(PAUSE_ON).await.is_ok()
 }
 
 /// Every case, `repeat` times, in order; a row per case as it ends.
@@ -1033,11 +1152,13 @@ pub async fn run_all(
     pace: &Pace,
     on_row: &mut (dyn FnMut(&Row) + Send),
 ) -> Vec<Row> {
-    let mut rows = Vec::new();
-    for case in &spec.cases {
+    let mut rows: Vec<Row> = Vec::new();
+    'run: for case in &spec.cases {
         for rep in 1..=repeat.max(1) {
             let t0 = now_s();
-            let verdict = run_case(sim, tail, case, apt_dat, pace).await;
+            let left_flying = rows.last().is_some_and(|r| r.verdict.left_flying);
+            let verdict = run_case(sim, tail, case, apt_dat, pace, left_flying).await;
+            let stop = verdict.stop_run;
             let row = Row {
                 case: case.name.clone(),
                 rep,
@@ -1046,7 +1167,13 @@ pub async fn run_all(
             };
             on_row(&row);
             rows.push(row);
+            if stop {
+                break 'run;
+            }
         }
+    }
+    if secure_at_end(sim).await {
+        eprintln!("the run ended with the aircraft in the air: X-Plane is paused");
     }
     rows
 }
@@ -1119,7 +1246,13 @@ pub async fn main_cmd(args: &[String], base_url: &str, apt_dat: &str) -> Result<
     tokio::select! {
         _ = run => {}
         _ = tokio::signal::ctrl_c() => {
-            eprintln!("interrupted: my controls");
+            // In the air the sim is paused first: the pilot at the keyboard
+            // takes the aircraft back with it frozen, not diving.
+            let paused = secure_at_end(&xp).await;
+            eprintln!(
+                "interrupted: my controls{}",
+                if paused { ", X-Plane paused" } else { "" }
+            );
             let _ = xp.set_float(SIM_SPEED, 1.0).await;
             let _ = type_line(&xp, ABORT_LINE, &Pace::LIVE).await;
             let rows = rows.lock().unwrap_or_else(|e| e.into_inner()).clone();
@@ -1452,10 +1585,16 @@ mod tests {
         ));
         // A failed read is no measurement, never a crash.
         assert_eq!(m.tick(10.0, None), Step::Wait);
+        assert_eq!(m.tick(10.5, Some(false)), Step::Wait);
         let v = finished(m.tick(11.0, Some(true)));
         assert_eq!(v.reason, "the aircraft crashed");
         assert_eq!(v.sortie.as_deref(), Some("s"));
-        assert!(v.abort);
+        assert!(v.abort && v.crashed && !v.stop_run);
+        assert_eq!(
+            hand_back(&v, Some(false)),
+            HandBack::MyControls,
+            "a wreck is nobody's flight"
+        );
         let mut m = CaseMachine::new(0.0, 600.0);
         m.feed(&rec(1.0, "tool", json!({"name": "full_auto"})));
         m.feed(&rec(
@@ -1466,7 +1605,61 @@ mod tests {
         assert_eq!(m.tick(600.0, Some(false)), Step::Wait);
         let v = finished(m.tick(601.0, Some(false)));
         assert_eq!(v.reason, "deadline 10 min passed");
-        assert!(v.abort && !v.pass);
+        assert!(v.abort && !v.pass && !v.crashed);
+    }
+
+    /// LEMG 2026-09-28: 1790584266-approach crashed, and the next three cases
+    /// each failed in 2 s as "the aircraft crashed", no sortie: the wreck
+    /// flag stays up until the sim resets, and the new case's setup is that
+    /// reset.
+    #[test]
+    fn the_last_cases_wreck_is_waited_out_then_stops_the_run() {
+        // The setup's reload clears it: the case flies on, and a wreck
+        // after that is this case's.
+        let mut m = CaseMachine::once(0.0, 600.0);
+        assert_eq!(m.tick(1.0, Some(true)), Step::Wait, "the last case's wreck");
+        m.feed(&rec(1.5, "tool", json!({"name": "setup_approach"})));
+        assert_eq!(m.tick(60.0, Some(true)), Step::Wait, "still reloading");
+        assert_eq!(
+            m.tick(70.0, Some(false)),
+            Step::Wait,
+            "the reload cleared it"
+        );
+        m.feed(&rec(
+            71.0,
+            "sortie",
+            json!({"event": "begin", "sortie": "s"}),
+        ));
+        let v = finished(m.tick(200.0, Some(true)));
+        assert_eq!(v.reason, "the aircraft crashed");
+        assert!(v.crashed && !v.stop_run);
+
+        // It never clears: one line, and the run stops.
+        let mut m = CaseMachine::once(0.0, 600.0);
+        m.feed(&rec(1.5, "tool", json!({"name": "setup_approach"})));
+        assert_eq!(m.tick(CRASH_CLEAR_S, Some(true)), Step::Wait);
+        let v = finished(m.tick(CRASH_CLEAR_S + 0.5, Some(true)));
+        assert_eq!(v.reason, STILL_CRASHED);
+        assert!(v.stop_run && !v.crashed && !v.abort, "{v:?}");
+        assert_eq!(hand_back(&v, None), HandBack::Nothing);
+    }
+
+    #[test]
+    fn a_case_ended_in_the_air_is_never_handed_to_nobody() {
+        let deadline = Verdict {
+            abort: true,
+            reason: "deadline 10 min passed".into(),
+            ..Verdict::default()
+        };
+        // 1,600 ft on a 5 nm final: the loops keep it.
+        assert_eq!(hand_back(&deadline, Some(false)), HandBack::LeaveFlying);
+        // Unreadable wheels are no measurement: treated as flying.
+        assert_eq!(hand_back(&deadline, None), HandBack::LeaveFlying);
+        assert_eq!(hand_back(&deadline, Some(true)), HandBack::MyControls);
+        assert_eq!(
+            hand_back(&Verdict::default(), Some(false)),
+            HandBack::Nothing
+        );
     }
 
     #[test]
@@ -1561,15 +1754,41 @@ mod tests {
         log: std::path::PathBuf,
         flying: std::sync::atomic::AtomicBool,
         inits: std::sync::Mutex<Vec<String>>,
+        /// The wreck flag, as the sim reports it.
+        crashed: std::sync::atomic::AtomicBool,
+        /// The wheels are off the ground.
+        airborne: std::sync::atomic::AtomicBool,
+        /// A typed mission begins and then never ends (the deadline's case).
+        endless: std::sync::atomic::AtomicBool,
+        commands: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl FakeSim {
+        fn new(log: std::path::PathBuf) -> Self {
+            Self {
+                typed: Default::default(),
+                speeds: Default::default(),
+                log,
+                flying: false.into(),
+                inits: Default::default(),
+                crashed: false.into(),
+                airborne: false.into(),
+                endless: false.into(),
+                commands: Default::default(),
+            }
+        }
     }
 
     #[async_trait]
     impl RunnerSim for FakeSim {
         async fn read(&self, name: &str) -> Result<f64> {
+            use std::sync::atomic::Ordering::SeqCst;
             let posted = self.inits.lock().unwrap().len() as f64;
+            let flag = |b: bool| if b { 1.0 } else { 0.0 };
             Ok(match name {
                 "xcopilot/sim/init_seq" => posted,
-                crate::datarefs::ON_GROUND_ANY => 1.0,
+                crate::datarefs::ON_GROUND_ANY => flag(!self.airborne.load(SeqCst)),
+                crate::datarefs::HAS_CRASHED => flag(self.crashed.load(SeqCst)),
                 _ => 0.0,
             })
         }
@@ -1588,7 +1807,12 @@ mod tests {
             self.speeds.lock().unwrap().push(v);
             Ok(())
         }
+        async fn command(&self, name: &str) -> Result<()> {
+            self.commands.lock().unwrap().push(name.to_string());
+            Ok(())
+        }
         async fn write_bytes(&self, name: &str, bytes: &[u8]) -> Result<()> {
+            use std::sync::atomic::Ordering::SeqCst;
             let line = String::from_utf8_lossy(bytes).to_string();
             if name == "xcopilot/sim/init_flight" {
                 self.inits.lock().unwrap().push(line);
@@ -1601,7 +1825,18 @@ mod tests {
                 .append(true)
                 .open(&self.log)
                 .unwrap();
-            if line != ABORT_LINE {
+            if line == ABORT_LINE {
+                self.flying.store(false, SeqCst);
+            } else if self.endless.load(SeqCst) {
+                let s = format!("{}-endless", self.typed.lock().unwrap().len());
+                self.flying.store(true, SeqCst);
+                for r in [
+                    json!({"t": 1.0, "kind": "tool", "name": "setup_approach"}),
+                    json!({"t": 2.0, "kind": "sortie", "event": "begin", "sortie": s}),
+                ] {
+                    writeln!(f, "{r}").unwrap();
+                }
+            } else {
                 let s = "77-mission";
                 let tool = if line.starts_with("put us on") {
                     "setup_approach"
@@ -1629,13 +1864,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let log = dir.join("blackbox.jsonl");
         std::fs::write(&log, "").unwrap();
-        let sim = FakeSim {
-            typed: Default::default(),
-            speeds: Default::default(),
-            log: log.clone(),
-            flying: false.into(),
-            inits: Default::default(),
-        };
+        let sim = FakeSim::new(log.clone());
         let spec = parse_spec(
             "cases: [{name: five, setup: {approach: {field: LEMG, runway: 13, final_nm: 5}}, sim_speed: 2},\n\
                      {name: circuit, setup: {runway_start: {field: LEMG, runway: 13, engines_running: true}},\n\
@@ -1649,6 +1878,7 @@ mod tests {
             still_max_s: 1.0,
             settle_scale: 0.0,
             idle_max_s: 1.0,
+            crash_clear_s: 0.2,
         };
         let mut tail = BlackboxTail::at_end(&log);
         let mut seen = Vec::new();
@@ -1687,6 +1917,124 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("AUTOLAND|final"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn quick_pace() -> Pace {
+        Pace {
+            poll: std::time::Duration::from_millis(5),
+            init: InitTiming::LIVE,
+            still_s: 0.0,
+            still_max_s: 1.0,
+            settle_scale: 0.0,
+            idle_max_s: 1.0,
+            crash_clear_s: 0.2,
+        }
+    }
+
+    fn scratch_log(tag: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!("xvl-runner-{tag}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("blackbox.jsonl");
+        std::fs::write(&log, "").unwrap();
+        (dir, log)
+    }
+
+    /// LEMG 2026-09-28: three cases burned in 2 s each on the last case's
+    /// wreck. Now the wreck that outlives a setup stops the run, once.
+    #[tokio::test]
+    async fn a_wreck_that_outlives_the_setup_stops_the_run_once() {
+        let (dir, log) = scratch_log("wreck");
+        let sim = FakeSim::new(log.clone());
+        sim.crashed.store(true, std::sync::atomic::Ordering::SeqCst);
+        sim.endless.store(true, std::sync::atomic::Ordering::SeqCst);
+        let spec = parse_spec(
+            "cases: [{name: five, setup: {approach: {field: LEMG, runway: 13, final_nm: 5}}}]",
+        )
+        .unwrap();
+        let mut tail = BlackboxTail::at_end(&log);
+        let rows = run_all(
+            &sim,
+            &mut tail,
+            &spec,
+            3,
+            "",
+            &quick_pace(),
+            &mut |_: &Row| {},
+        )
+        .await;
+        assert_eq!(rows.len(), 1, "the run stops at the first case");
+        assert_eq!(rows[0].verdict.reason, STILL_CRASHED);
+        assert!(rows[0].verdict.stop_run);
+        assert_eq!(
+            *sim.typed.lock().unwrap(),
+            vec!["put us on a 5 mile final to LEMG runway 13"],
+            "no \"my controls\" over a wreck that was never this case's"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The deadline typed "my controls" at 1,600 ft on a 5 nm final: the
+    /// aircraft was handed to nobody. Now the loops keep it until the next
+    /// case's setup replaces the flight, and a run that ends pauses the sim.
+    #[tokio::test]
+    async fn a_deadline_in_the_air_leaves_the_loops_flying_to_the_next_setup() {
+        let (dir, log) = scratch_log("deadline");
+        let sim = FakeSim::new(log.clone());
+        sim.airborne
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        sim.endless.store(true, std::sync::atomic::Ordering::SeqCst);
+        // 0.005 min: 0.3 s.
+        let spec = parse_spec(
+            "cases: [{name: five, setup: {approach: {field: LEMG, runway: 13, final_nm: 5}}, deadline_min: 0.005}]",
+        )
+        .unwrap();
+        let mut tail = BlackboxTail::at_end(&log);
+        let rows = run_all(
+            &sim,
+            &mut tail,
+            &spec,
+            2,
+            "",
+            &quick_pace(),
+            &mut |_: &Row| {},
+        )
+        .await;
+        assert_eq!(rows.len(), 2);
+        for r in &rows {
+            assert!(r.verdict.reason.starts_with("deadline"), "{:?}", r.verdict);
+            assert!(r.verdict.left_flying && !r.verdict.pass);
+        }
+        let setup = "put us on a 5 mile final to LEMG runway 13";
+        assert_eq!(
+            *sim.typed.lock().unwrap(),
+            vec![setup, ABORT_LINE, setup],
+            "taken back only to be replaced by the next setup, never after the last"
+        );
+        assert_eq!(
+            *sim.commands.lock().unwrap(),
+            vec![PAUSE_ON],
+            "the run ends with the aircraft in the air: paused, still flown"
+        );
+        assert!(sim.flying.load(std::sync::atomic::Ordering::SeqCst));
+
+        // On the ground the deadline takes the aircraft back, and nothing is paused.
+        let sim = FakeSim::new(log.clone());
+        sim.endless.store(true, std::sync::atomic::Ordering::SeqCst);
+        let mut tail = BlackboxTail::at_end(&log);
+        let rows = run_all(
+            &sim,
+            &mut tail,
+            &spec,
+            1,
+            "",
+            &quick_pace(),
+            &mut |_: &Row| {},
+        )
+        .await;
+        assert!(!rows[0].verdict.left_flying);
+        assert_eq!(*sim.typed.lock().unwrap(), vec![setup, ABORT_LINE]);
+        assert!(sim.commands.lock().unwrap().is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
