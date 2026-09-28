@@ -143,6 +143,11 @@ Datarefs and commands stay in the Rust tools; YAML is per-airframe config.
   airframe. `src/flight_state.rs` is the one page: `publish_airframe` sets every selector,
   `stand_down` stops every loop that can hold the aircraft (swap, instructor entry, connection
   lost); a source scan pins it to every `static ACTIVE`. New ones go there, never in a caller.
+- **Anti-ice** (`src/tools/anti_ice.rs` `set_anti_ice`, profile `anti_ice:`, else the `.acf`'s
+  loads, `systems::IceKit`): read first, read back, an undeclared wing left alone and said; the
+  monitor's `icing` switches probes, windows, engines and props in visible moisture at +10 C or
+  colder and the wing on accretion with an automation flying, advises a pilot once, and switches off
+  only its own claims after 5 min clear.
 - **A cart and a contactor are two things**: ground power moves the cart request only when presence
   differs from want (a blind toggle dismisses the cart) AND `gpu_on`, and reports BUS volts.
 
@@ -572,7 +577,8 @@ everything blackboxes to `logs/blackbox.jsonl` (kinds: `atc`, `autotaxi`, `autot
   indicated feet; only the floor is true feet (`floor_indicated`).
 - **So the altimeter is kept right**: ONE rule (`instruments::correct_setting_inhg`: QNH below the
   transition, standard above) behind the tool, full auto, the follower's arm
-  (`Plan.transition_altitude_ft`) and the monitor's `AltimeterSetting` check: an automation flying
+  (`Plan.transition_altitude_ft`), both sides (the first officer's too), a declared `altimeter:
+  std_command` going to 29.92 first when it saves ten presses (`std_fast_path_pays`), and the monitor's `AltimeterSetting` check: an automation flying
   RESETS it (`Check::fix_write`), a pilot is advised once. `set_altimeter` steps in rounds EARNED by
   progress (`keep_stepping`); `AltimeterSync::line` says "did not take" (EGSS 2026-09-22). The
   transition is the FLIGHT's (`instruments::FlightTransition`, `origin/trans_alt` /
@@ -605,6 +611,9 @@ everything blackboxes to `logs/blackbox.jsonl` (kinds: `atc`, `autotaxi`, `autot
   `flare_xtk_limit_m`): below the floor it must be interceptable AND its pursuit must leave the
   offset inside the landing limit at the threshold (`lands_on_the_pavement`), or it balks with height
   in hand, ordered even on the first tick (LEMG 13 45 m, 36.7 m right at the wheels, 2026-09-28).
+- **The autopilot's own modes are tools, not yet the follower's** (`tools::autoflight` `ap_mode`:
+  autothrust, level change, GPSS; `systems::ap_modes`: proved > `autoflight:` > type): toggles read
+  before firing, refused where the map says No; the follower adopts `engage` later (probes owed).
 - **The arrival is re-picked in flight** (`RepickWatch`): the destination tower's runway at once, the
   METAR's wind runway on two readings in a row beyond 25 nm (never in calm, never against the tower),
   at most `MAX_ARRIVAL_REPICKS`; the new STAR is spliced from its entry (`plan_audit::star_splice`,

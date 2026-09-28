@@ -9710,3 +9710,19 @@ departure's runway). Real-data test: LIPE BAME2S (30) becomes BAME5M (12) from B
 round WI009 in the real-data test); HF/HA holds are flown as a racetrack (`HoldFlight`, direct entry,
 each 180 as two 90s so the heading mode never takes the short way), HM flown through. Still owed on
 #101: the OFP cruise schedule. Offline only.
+
+## 2026-09-28: both altimeters and the truth; anti-ice; the autopilot's own modes (issues #94, #100, #92)
+
+#94: `set_altimeter` sets the first officer's side too; the 737 declares its STD button
+(`altimeter: std_command`) and a far set goes to 29.92 first when it saves ten presses: EGSS's 0 to
+30.40 is 2 STD presses + 48, not 3,040 (the 737's xlua copies the stock dial into its baro memory at
+flight start, so it loads at 0). "Set the altimeter" now goes through the proving setter. A new
+`altimeter_disagrees` Caution speaks only the residual the knob and air temperature do not explain
+(`altimeter_truth` from `position/elevation`); `altimeter_truth_now` is the follower's seam. STD pair
+unpressed live (VERIFY).
+#100: `set_anti_ice` (pitot, window, engine, prop, wing) from a profile `anti_ice:` block (C90B from
+its xlua switches, VERIFY) or the `.acf`'s electrical loads with the stock `sim/ice` commands; the
+monitor's `icing` practice switches or advises. DC-3 relies on its `.acf` loads (uninspected).
+#92: `ap_mode` (autothrust, level change, GPSS) with readback and a capability map (proved >
+`autoflight:` > survey type); not wired into the follower or autoland. No airframe declares
+`autoflight:` yet: autothrust on the A330 and 737, FLCH and GPSS need live probes. Offline only.
