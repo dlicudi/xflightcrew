@@ -419,10 +419,9 @@ async fn light(tools: &SubTools, ctx: &ToolCtx<'_>, key: &str, on: bool) -> bool
         .is_ok()
 }
 
-/// Give up cleanly.
-/// The fastest a give-up may set the PARKING brake. The taxi governor only
-/// runs at taxi speeds, so this is belt and braces against a future caller:
-/// a park brake is a chock, not a stopping device.
+/// The fastest a give-up brakes the aircraft to a stop and sets the PARKING
+/// brake: taxi speeds. Above it (a rollout, a takeoff roll) the loop that
+/// owns the speed does the stopping, and a park brake is a chock anyway.
 const HAND_BACK_BRAKE_MAX_KTS: f64 = 25.0;
 
 /// A mission's sortie in the blackbox: begun at the mission's start, ended
@@ -442,6 +441,7 @@ impl Drop for SortieGuard {
     }
 }
 
+/// Give up cleanly.
 async fn give_up(
     xp: &XPlaneClient,
     valve_set: Option<f64>,
@@ -449,6 +449,10 @@ async fn give_up(
     line: &str,
     reason: &str,
 ) {
+    // A wait the pilot's "my controls" cut short is a cancel, never the
+    // stage's own failure: at LEMG (2026-09-28, sortie 1790586620) the taxi
+    // wait saw the abort and said "The taxi didn't finish" as `taxi_stalled`.
+    let (line, reason) = give_up_words(line, reason, ABORT.load(SeqCst));
     RUN.fail(reason);
     stop_active();
     // "Your aircraft" means every lever: the mixture manager stands down with
@@ -458,13 +462,42 @@ async fn give_up(
     crate::blackbox::end_sortie("gave_up", json!({ "reason": reason, "line": line }));
     // Held before it is said: the line claims the pilot has the aircraft, so
     // whatever is going to hold it should already be holding it.
-    hand_back_brakes(xp, valve_set).await;
+    let held = hand_back_brakes(xp, valve_set).await;
     clear_stage();
-    announce(voice, Priority::Caution, line);
+    announce(voice, Priority::Caution, &hand_back_line(line, held));
 }
 
-/// ...and on the ground it means the PARKING BRAKE holds the aircraft, not a
-/// control loop of ours.
+/// The give-up's line and reason, relabelled as the pilot's cancel when the
+/// abort flag is what ended the wait. Pure.
+fn give_up_words<'a>(line: &'a str, reason: &'a str, aborted: bool) -> (&'a str, &'a str) {
+    if aborted && reason != "abort" {
+        ("Cancelled. Your aircraft.", "abort")
+    } else {
+        (line, reason)
+    }
+}
+
+/// The give-up's line with what the hand-back did to the brakes: said only
+/// when it was a ground hand-back (`None` leaves the line alone). Pure.
+fn hand_back_line(line: &str, held: Option<bool>) -> String {
+    match held {
+        Some(true) => format!("{line} Parking brake set."),
+        Some(false) => format!("{line} The parking brake didn't set, hold the brakes."),
+        None => line.to_string(),
+    }
+}
+
+/// Stopped, for the hand-back: under this the parking brake goes on.
+const HAND_BACK_STOPPED_KTS: f64 = 1.0;
+/// The longest the hand-back brakes toward a stop before the parking brake
+/// goes on anyway (the governor's taxi speeds stop in a few seconds).
+const HAND_BACK_STOP_S: f64 = 15.0;
+/// One wheel-brake pulse per this long while stopping, inside the held
+/// command's own expiry so the squeeze is continuous.
+const HAND_BACK_TICK_MS: u64 = 400;
+
+/// ...and on the ground it means the aircraft is STOPPED and the PARKING
+/// BRAKE holds it, not a control loop of ours and not nothing.
 ///
 /// A taxi that reaches its holding point stops there with the governor still
 /// running, target zero, squeezing the wheel brakes. That is deliberate, so
@@ -475,49 +508,88 @@ async fn give_up(
 /// minutes: 3,736 more ticks of Web API load the sim did not get, `park` still
 /// 0.0 in every state record, and a proportional brake squeeze the pilot
 /// cannot find or release (the governor's own exit path says exactly that).
-/// CLAUDE.md has had the rule since the first orchestrator - brakes set for
-/// every wait, and every abort or give-up path sets them too - and this was
-/// the path that did not.
 ///
-/// Only while the TAXI governor is the thing holding us, so a give-up at
-/// rolling speed or in the air can never slam a parking brake on: the flavour
-/// check is `taxi_hold_active`, and the governor's own next tick then sees the
-/// brake, closes the throttle, stands down and releases its own squeeze.
-async fn hand_back_brakes(xp: &XPlaneClient, valve_set: Option<f64>) {
+/// It used to act only while the TAXI governor was holding us, and that is
+/// the gate LEMG went through (2026-09-28, sortie 1790586620): the pilot's
+/// "my controls" stopped the governor, the give-up came 0.6 s later with
+/// nothing of ours holding the 737, and it was left rolling at 4.9 kt, then
+/// 5.8 kt and rising, `parking_brake_ratio` 0.0, with "your aircraft" said
+/// over it. Now any end of the mission on the ground below
+/// [`HAND_BACK_BRAKE_MAX_KTS`] brakes to a stop on the wheel brakes (the
+/// pilot's own held brake key, which expires by itself) and then sets the
+/// parking brake, read back. Airborne, faster, a tug on the bar, or a speed
+/// we could not read: nothing, and the reason is blackboxed.
+async fn hand_back_brakes(xp: &XPlaneClient, valve_set: Option<f64>) -> Option<bool> {
     // Unscoped: the give-up has already cancelled this mission's client.
     let free = xp.unscoped();
-    hand_back_brakes_if(&free, crate::tools::speedhold::taxi_hold_active(), valve_set).await;
+    hand_back_hold(&free, valve_set).await
 }
 
-/// [`hand_back_brakes`] with the governor's flavour handed in, so the gates are
-/// a plain `cargo test` against the fake sim instead of a process-wide static.
-async fn hand_back_brakes_if(
-    xp: &dyn crate::xplane::XPlane,
-    taxi_holding: bool,
-    valve_set: Option<f64>,
-) {
-    if !taxi_holding {
-        return;
-    }
-    let (ground, gs) = tokio::join!(
+/// [`hand_back_brakes`] against any sim, so the gates and the stop are a
+/// plain `cargo test`. `Some(held)` when it was a ground hand-back.
+async fn hand_back_hold(xp: &dyn crate::xplane::XPlane, valve_set: Option<f64>) -> Option<bool> {
+    let skipped = |why: &str, kts: Option<f64>| {
+        crate::blackbox::record(
+            "full_auto",
+            json!({ "stage": "hand_back_skipped", "detail": { "why": why, "gs_kts": kts } }),
+        );
+        None
+    };
+    let (ground, gs, tug) = tokio::join!(
         xp.get_float(crate::datarefs::ON_GROUND_ANY),
         xp.get_float(crate::autotaxi::GS_MS),
+        xp.get_float(crate::autotaxi::TUG_ATTACHED),
     );
     if !matches!(ground, Ok(g) if g > 0.5) {
-        return;
+        return skipped("not_on_ground", None);
     }
     // A failed read is no measurement, and a parking brake is not a brake to
     // set at a speed we could not confirm.
-    if !matches!(gs, Ok(v) if v.is_finite() && v.abs() * MS_TO_KTS < HAND_BACK_BRAKE_MAX_KTS) {
-        return;
+    let Some(from_kts) = gs
+        .ok()
+        .filter(|v| v.is_finite())
+        .map(|v| v.abs() * MS_TO_KTS)
+    else {
+        return skipped("no_groundspeed", None);
+    };
+    if from_kts >= HAND_BACK_BRAKE_MAX_KTS {
+        return skipped("too_fast", Some(from_kts));
     }
+    // A tug on the bar owns the aircraft: brakes against it are a fight.
+    if tug.is_ok_and(|t| t > 0.5) {
+        return skipped("tug_attached", Some(from_kts));
+    }
+    // Stop on the wheel brakes first: a parking brake is a chock.
+    let t0 = tokio::time::Instant::now();
+    let mut kts = from_kts;
+    let mut pulses = 0u32;
+    while kts >= HAND_BACK_STOPPED_KTS && t0.elapsed().as_secs_f64() < HAND_BACK_STOP_S {
+        if xp
+            .run_command_for(crate::tools::BRAKES_REGULAR, crate::tools::BRAKE_HOLD_SECS)
+            .await
+            .is_ok()
+        {
+            crate::tools::note_brake_cmd();
+            pulses += 1;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(HAND_BACK_TICK_MS)).await;
+        match xp.get_float(crate::autotaxi::GS_MS).await {
+            Ok(v) if v.is_finite() => kts = v.abs() * MS_TO_KTS,
+            // Unread: the parking brake below is still owed, not skipped.
+            _ => break,
+        }
+    }
+    let stopped = kts < HAND_BACK_STOPPED_KTS;
     // Tried three times, and the failure KEPT: at LIPK (2026-09-26) one
     // attempt read back unset with its error swallowed, and the governor
     // went on squeezing a 172 on its wheel brakes for fifteen minutes (the
     // pilot has no toe-brake axis to release them). The same command, sent
     // by hand afterwards, set at once.
     let crate::tools::controls::ParkBrakeSet {
-        held, tries, err, ..
+        held,
+        tries,
+        err,
+        park,
     } = crate::tools::controls::set_park_brake_confirmed(xp, valve_set, 3).await;
     if !held {
         tracing::warn!(?err, "full auto: the parking brake did not set at the hand-back");
@@ -527,8 +599,12 @@ async fn hand_back_brakes_if(
     crate::blackbox::record(
         "full_auto",
         json!({ "stage": "hand_back_brakes",
-                "detail": { "held": held, "tries": tries, "err": err } }),
+                "detail": { "held": held, "tries": tries, "err": err, "park": park,
+                            "from_kts": (from_kts * 10.0).round() / 10.0,
+                            "stopped": stopped, "brake_pulses": pulses,
+                            "secs": (t0.elapsed().as_secs_f64() * 10.0).round() / 10.0 } }),
     );
+    Some(held)
 }
 
 /// The squawk still to dial: the tower's assigned code when the transponder
@@ -5686,32 +5762,130 @@ mod tests {
         assert!(super::cleared_hold_expired(90.0));
     }
 
+    /// A 737 on the taxiway after a give-up: idle thrust creeps it faster
+    /// (LEMG 2026-09-28: 4.9 kt at the give-up, 5.8 kt 13 s later, 0.035
+    /// m/s/s), and each held regular-brake pulse slows it at 1.5 m/s/s for
+    /// the 0.4 s tick. Records the groundspeed when the parking brake is SET.
+    struct TaxiingJet {
+        sim: crate::xplane::FakeXPlane,
+        gs_ms: std::sync::Mutex<f64>,
+        braking: std::sync::atomic::AtomicBool,
+        gs_at_park: std::sync::Mutex<Option<f64>>,
+    }
+
+    impl TaxiingJet {
+        const SET: &'static str = "sim/flight_controls/park_brake_set";
+        const PARK: &'static str = "sim/cockpit2/controls/parking_brake_ratio";
+
+        fn rolling_at_kts(kts: f64) -> Self {
+            let sim = crate::xplane::FakeXPlane::with_reads(&[
+                (crate::datarefs::ON_GROUND_ANY, 1.0),
+                (crate::autotaxi::TUG_ATTACHED, 0.0),
+                (Self::PARK, 0.0),
+            ]);
+            sim.step_on_command(Self::SET, Self::PARK, 1.0);
+            TaxiingJet {
+                sim,
+                gs_ms: std::sync::Mutex::new(kts / super::MS_TO_KTS),
+                braking: std::sync::atomic::AtomicBool::new(false),
+                gs_at_park: std::sync::Mutex::new(None),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::xplane::XPlane for TaxiingJet {
+        async fn get_float(&self, name: &str) -> anyhow::Result<f64> {
+            if name != crate::autotaxi::GS_MS {
+                return self.sim.get_float(name).await;
+            }
+            let mut gs = self.gs_ms.lock().unwrap();
+            if self.braking.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                *gs = (*gs - 1.5 * 0.4).max(0.0);
+            } else if *gs > 0.0 {
+                *gs += 0.035 * 0.4;
+            }
+            Ok(*gs)
+        }
+        async fn set_float(&self, name: &str, value: f64) -> anyhow::Result<()> {
+            self.sim.set_float(name, value).await
+        }
+        async fn set_int(&self, name: &str, value: i64) -> anyhow::Result<()> {
+            self.sim.set_int(name, value).await
+        }
+        async fn run_command(&self, name: &str) -> anyhow::Result<()> {
+            if name == Self::SET {
+                *self.gs_at_park.lock().unwrap() = Some(*self.gs_ms.lock().unwrap());
+            }
+            self.sim.run_command(name).await
+        }
+        async fn run_command_for(&self, name: &str, secs: f64) -> anyhow::Result<()> {
+            if name == crate::tools::BRAKES_REGULAR {
+                self.braking.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+            self.sim.run_command_for(name, secs).await
+        }
+        async fn get_float_array(&self, name: &str) -> anyhow::Result<Vec<f64>> {
+            self.sim.get_float_array(name).await
+        }
+        async fn set_int_array_elem(&self, name: &str, i: usize, v: i64) -> anyhow::Result<()> {
+            self.sim.set_int_array_elem(name, i, v).await
+        }
+        async fn set_float_array_elem(&self, name: &str, i: usize, v: f64) -> anyhow::Result<()> {
+            self.sim.set_float_array_elem(name, i, v).await
+        }
+    }
+
+    /// LEMG 2026-09-28 (sortie 1790586620, #135): the pilot's "my controls"
+    /// stopped the taxi governor, and the give-up 0.6 s later found nothing
+    /// of ours holding the 737: the old gate (`taxi_hold_active`) skipped the
+    /// hand-back, "The taxi didn't finish. Your aircraft." was said over an
+    /// aircraft at 4.9 kt, 5.8 kt and rising 13 s on, `parking_brake_ratio`
+    /// 0.0. A ground mission's end STOPS it on the wheel brakes, then sets
+    /// the parking brake, read back.
+    #[tokio::test(start_paused = true)]
+    async fn a_give_up_rolling_on_the_taxiway_stops_and_parks_the_aircraft() {
+        let jet = TaxiingJet::rolling_at_kts(4.9);
+        let held = super::hand_back_hold(&jet, Some(1.0)).await;
+        assert_eq!(held, Some(true), "the parking brake reads set");
+        assert!(
+            jet.sim.ran(crate::tools::BRAKES_REGULAR),
+            "stopped on the wheel brakes first"
+        );
+        let at_park = jet.gs_at_park.lock().unwrap().expect("park brake set");
+        assert!(
+            at_park * super::MS_TO_KTS < super::HAND_BACK_STOPPED_KTS,
+            "the parking brake went on at {:.1} kt, not stopped",
+            at_park * super::MS_TO_KTS
+        );
+        assert_eq!(jet.sim.last_write(TaxiingJet::PARK), None, "never a raw ratio write");
+        assert!(
+            jet.sim.ran("sim/flight_controls/park_brake_valve_open"),
+            "valve-aware, the Baron's latching valve"
+        );
+    }
+
     /// LFPB 2026-09-22: the line-up refused at the holding point, full auto
     /// said "your aircraft", and the taxi governor went on holding the 737 on
-    /// its wheel brakes for twenty-seven minutes with `park` at 0.0. A give-up
-    /// on the ground hands the hold to the PARKING brake so the loop can stop.
-    #[tokio::test]
+    /// its wheel brakes for twenty-seven minutes with `park` at 0.0. Stopped,
+    /// the parking brake goes straight on; the gates still hold elsewhere.
+    #[tokio::test(start_paused = true)]
     async fn a_ground_give_up_hands_the_hold_to_the_parking_brake() {
-        use super::hand_back_brakes_if;
+        use super::hand_back_hold;
         use crate::xplane::FakeXPlane;
-        const SET: &str = "sim/flight_controls/park_brake_set";
-        const PARK: &str = "sim/cockpit2/controls/parking_brake_ratio";
+        const SET: &str = TaxiingJet::SET;
+        const PARK: &str = TaxiingJet::PARK;
 
-        // Stopped at the hold with the governor holding us: the brake goes on,
-        // and the valve goes with it (the Baron's latching valve is why the
-        // raw ratio write is never the seam).
+        // Stopped at the hold, governor or not: the brake goes on, no pulse.
         let xp = FakeXPlane::with_reads(&[
             (crate::datarefs::ON_GROUND_ANY, 1.0),
             (crate::autotaxi::GS_MS, 0.0),
             (PARK, 0.0),
         ]);
         xp.step_on_command(SET, PARK, 1.0);
-        hand_back_brakes_if(&xp, true, Some(1.0)).await;
+        assert_eq!(hand_back_hold(&xp, Some(1.0)).await, Some(true));
         assert!(xp.ran(SET), "the parking brake is set");
-        assert!(
-            xp.ran("sim/flight_controls/park_brake_valve_open"),
-            "valve-aware, never a raw ratio write"
-        );
+        assert!(!xp.ran(crate::tools::BRAKES_REGULAR), "already stopped");
 
         // Airborne: nothing. A give-up in the air hands back a flying
         // aircraft, and a parking brake is not part of that.
@@ -5720,33 +5894,60 @@ mod tests {
             (crate::autotaxi::GS_MS, 90.0),
             (PARK, 0.0),
         ]);
-        hand_back_brakes_if(&air, true, Some(1.0)).await;
+        assert_eq!(hand_back_hold(&air, Some(1.0)).await, None);
         assert!(!air.ran(SET), "no park brake in the air");
+        assert!(!air.ran(crate::tools::BRAKES_REGULAR), "no brakes in the air");
 
-        // Rolling: a parking brake is a chock, not a stopping device.
+        // Rolling fast: the loop that owns the speed stops it, not a give-up.
         let fast = FakeXPlane::with_reads(&[
             (crate::datarefs::ON_GROUND_ANY, 1.0),
             (crate::autotaxi::GS_MS, 40.0),
             (PARK, 0.0),
         ]);
-        hand_back_brakes_if(&fast, true, Some(1.0)).await;
+        assert_eq!(hand_back_hold(&fast, Some(1.0)).await, None);
         assert!(!fast.ran(SET), "not at 78 knots");
 
-        // Nothing of ours holding the aircraft: leave the brakes alone. The
-        // pilot may be sitting on the pedals, and a give-up is not a licence
-        // to move a control nobody asked us to move.
-        let idle = FakeXPlane::with_reads(&[
+        // A tug on the bar owns the aircraft.
+        let tug = FakeXPlane::with_reads(&[
+            (crate::datarefs::ON_GROUND_ANY, 1.0),
+            (crate::autotaxi::GS_MS, 0.5),
+            (crate::autotaxi::TUG_ATTACHED, 1.0),
+            (PARK, 0.0),
+        ]);
+        assert_eq!(hand_back_hold(&tug, Some(1.0)).await, None);
+        assert!(!tug.ran(SET) && !tug.ran(crate::tools::BRAKES_REGULAR));
+
+        // A failed groundspeed read is NO measurement, never an assumed zero.
+        let blind = FakeXPlane::with_reads(&[(crate::datarefs::ON_GROUND_ANY, 1.0), (PARK, 0.0)]);
+        assert_eq!(hand_back_hold(&blind, Some(1.0)).await, None);
+        assert!(!blind.ran(SET), "a speed we could not read is not a stop");
+
+        // A brake that never reads set is said, never claimed.
+        let stuck = FakeXPlane::with_reads(&[
             (crate::datarefs::ON_GROUND_ANY, 1.0),
             (crate::autotaxi::GS_MS, 0.0),
             (PARK, 0.0),
         ]);
-        hand_back_brakes_if(&idle, false, Some(1.0)).await;
-        assert!(!idle.ran(SET), "no governor, no change");
+        assert_eq!(hand_back_hold(&stuck, Some(1.0)).await, Some(false));
+    }
 
-        // A failed groundspeed read is NO measurement, never an assumed zero.
-        let blind = FakeXPlane::with_reads(&[(crate::datarefs::ON_GROUND_ANY, 1.0), (PARK, 0.0)]);
-        hand_back_brakes_if(&blind, true, Some(1.0)).await;
-        assert!(!blind.ran(SET), "a speed we could not read is not a stop");
+    /// #135: the pilot's cancel ends the taxi wait, and the give-up says so
+    /// instead of blaming the taxi; the line then says what holds the aircraft.
+    #[test]
+    fn a_cancelled_wait_is_a_cancel_and_the_line_names_the_brake() {
+        use super::{give_up_words, hand_back_line};
+        let taxi = "The taxi didn't finish. Your aircraft.";
+        assert_eq!(
+            give_up_words(taxi, "taxi_stalled", true),
+            ("Cancelled. Your aircraft.", "abort")
+        );
+        assert_eq!(give_up_words(taxi, "taxi_stalled", false), (taxi, "taxi_stalled"));
+        assert_eq!(
+            hand_back_line("Cancelled. Your aircraft.", Some(true)),
+            "Cancelled. Your aircraft. Parking brake set."
+        );
+        assert!(hand_back_line(taxi, Some(false)).ends_with("hold the brakes."));
+        assert_eq!(hand_back_line(taxi, None), taxi);
     }
 
     #[test]

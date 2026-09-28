@@ -34,6 +34,14 @@ const PAUSE_ON: &str = "sim/operation/pause_on";
 pub const DEFAULT_DEADLINE_MIN: f64 = 20.0;
 /// The app answers a typed command (a `tool` record or a crew line) within this.
 pub const ACK_S: f64 = 5.0;
+/// A line the app's poller has TAKEN (blackbox `typed` `taken`) is on the
+/// command channel, not lost: it is waited for this long to be read, never
+/// typed again. LEMG (2026-09-28, sortie 1790586620): "fly a circuit" was
+/// taken at +0.0, retyped at +5.8 as unanswered, failed at +11 as "the app
+/// did not take the command", and then both copies were read at +11.7 (the
+/// command loop was held behind a tower reply): the mission flew
+/// unobserved, and the second copy was answered "I'm already running".
+pub const QUEUED_S: f64 = 60.0;
 /// From the command's answer to the mission's `sortie` begin: an approach
 /// setup waits on the sim's reload (up to two minutes) before it arms.
 pub const SORTIE_GRACE_S: f64 = 180.0;
@@ -269,6 +277,10 @@ pub enum Phase {
         sent_t: f64,
         attempts: u32,
     },
+    /// Taken by the app's poller, waiting on its command loop: never resent.
+    Queued {
+        since: f64,
+    },
     /// Taken, waiting for the mission's sortie to begin.
     AwaitSortie {
         since: f64,
@@ -362,6 +374,9 @@ pub struct CaseMachine {
     crash_clear: bool,
     /// How long the last case's wreck may take to clear ([`CRASH_CLEAR_S`]).
     pub crash_clear_s: f64,
+    /// The typed line, so the app's `typed` records are matched to it;
+    /// `None` takes any typed line as this one.
+    pub line: Option<String>,
 }
 
 fn st<'a>(r: &'a Value, k: &str) -> &'a str {
@@ -396,6 +411,7 @@ impl CaseMachine {
             tool: None,
             crash_clear: false,
             crash_clear_s: CRASH_CLEAR_S,
+            line: None,
         }
     }
 
@@ -410,6 +426,13 @@ impl CaseMachine {
             abort,
             ..Verdict::default()
         })
+    }
+
+    /// A `typed` record for this case's line (any line when unknown).
+    fn is_my_line(&self, r: &Value) -> bool {
+        self.line
+            .as_deref()
+            .is_none_or(|l| st(r, "text").trim().eq_ignore_ascii_case(l.trim()))
     }
 
     fn with_said(&self, what: &str) -> String {
@@ -428,11 +451,38 @@ impl CaseMachine {
         }
         match self.phase.clone() {
             Phase::Done => Step::Wait,
-            Phase::AwaitAck { .. } => {
+            Phase::AwaitAck { attempts, .. } => {
+                if kind == "typed" && event == "taken" && self.is_my_line(r) {
+                    self.phase = Phase::Queued { since: t };
+                    return Step::Wait;
+                }
+                // Read at once: the answer's clock starts at the reading.
+                if kind == "typed" && event == "consumed" && self.is_my_line(r) {
+                    self.phase = Phase::AwaitAck {
+                        sent_t: t,
+                        attempts: attempts.max(2),
+                    };
+                    return Step::Wait;
+                }
                 if kind == "tool" || (kind == "said" && st(r, "who") == "crew") {
                     if kind == "tool" {
                         self.tool = Some(st(r, "name").to_string());
                     }
+                    self.phase = Phase::AwaitSortie { since: t };
+                }
+                Step::Wait
+            }
+            // On the channel: the loop reading it is the next word. A crew
+            // line meanwhile is chatter, not an answer to an unread line.
+            Phase::Queued { .. } => {
+                if kind == "typed" && event == "consumed" && self.is_my_line(r) {
+                    // Read: answered within ACK_S of now, and never retyped.
+                    self.phase = Phase::AwaitAck {
+                        sent_t: t,
+                        attempts: 2,
+                    };
+                } else if kind == "tool" {
+                    self.tool = Some(st(r, "name").to_string());
                     self.phase = Phase::AwaitSortie { since: t };
                 }
                 Step::Wait
@@ -591,6 +641,12 @@ impl CaseMachine {
                 };
                 Step::Resend
             }
+            // Taken and never read: the app may still act on it, so the
+            // aircraft is taken back (`abort`), and it is never typed again.
+            Phase::Queued { since } if now - since > QUEUED_S => self.fail(
+                format!("the app took the command but its loop never read it in {QUEUED_S:.0} s"),
+                true,
+            ),
             Phase::AwaitSortie { since } if now - since > SORTIE_GRACE_S => {
                 let what = format!(
                     "no mission began{}",
@@ -1070,6 +1126,7 @@ pub async fn run_case(
         _ => CaseMachine::new(now_s(), case.deadline_s()),
     };
     m.crash_clear_s = pace.crash_clear_s;
+    m.line = Some(line.clone());
     let speed = case.sim_speed.filter(|s| *s != 1);
     let verdict = loop {
         tokio::time::sleep(pace.poll).await;
@@ -1535,6 +1592,69 @@ mod tests {
         assert!(matches!(m.phase, Phase::AwaitSortie { .. }));
         // A setup line is never typed twice.
         let mut m = CaseMachine::once(0.0, 600.0);
+        let v = finished(m.tick(5.5, Some(false)));
+        assert!(v.reason.contains("did not take"), "{v:?}");
+    }
+
+    /// LEMG 2026-09-28 (sortie 1790586620, #135): "fly a circuit" was taken
+    /// by the app's poller at 1790586608.6, retyped at 614.4, failed as "the
+    /// app did not take the command", and both copies were read at 620.2 and
+    /// 620.3 behind a tower reply: the mission flew unobserved and the second
+    /// copy got "I'm already running the full sequence". A TAKEN line is
+    /// waited for, never retyped, and the case follows the mission it began.
+    #[test]
+    fn a_line_the_app_has_taken_is_waited_for_never_typed_again() {
+        let t0 = 1790586608.3;
+        let mut m = CaseMachine::new(t0, 1200.0);
+        m.line = Some("fly a circuit".into());
+        m.feed(&rec(
+            1790586608.6,
+            "typed",
+            json!({"event": "taken", "text": "fly a circuit", "age_s": 0.25}),
+        ));
+        assert!(matches!(m.phase, Phase::Queued { .. }));
+        // The old clocks: a resend at +5 s, a failure at +10 s. Neither now.
+        assert_eq!(m.tick(t0 + 5.5, Some(false)), Step::Wait);
+        assert_eq!(m.tick(t0 + 11.0, Some(false)), Step::Wait);
+        // A crew line while it waits is chatter (the After landing list).
+        m.feed(&rec(1790586615.0, "said", json!({"who": "crew", "text": "After landing."})));
+        assert!(matches!(m.phase, Phase::Queued { .. }));
+        m.feed(&rec(
+            1790586620.2,
+            "typed",
+            json!({"event": "consumed", "text": "fly a circuit", "queued_ms": 11663}),
+        ));
+        m.feed(&rec(1790586620.2, "tool", json!({"name": "full_auto"})));
+        assert!(matches!(m.phase, Phase::AwaitSortie { .. }));
+        assert_eq!(
+            m.feed(&rec(
+                1790586620.3,
+                "sortie",
+                json!({"event": "begin", "sortie": "1790586620-full_auto"}),
+            )),
+            Step::Began
+        );
+
+        // Taken and never read: failed, and the aircraft taken back, since
+        // the app still holds the line and may act on it later.
+        let mut m = CaseMachine::new(0.0, 1200.0);
+        m.line = Some("fly a circuit".into());
+        m.feed(&rec(0.3, "typed", json!({"event": "taken", "text": "fly a circuit"})));
+        assert_eq!(m.tick(59.0, Some(false)), Step::Wait);
+        let v = finished(m.tick(61.0, Some(false)));
+        assert!(v.reason.contains("never read it"), "{v:?}");
+        assert!(v.abort);
+
+        // Another line taken (the pilot's own) is not this case's.
+        let mut m = CaseMachine::new(0.0, 1200.0);
+        m.line = Some("fly a circuit".into());
+        m.feed(&rec(0.3, "typed", json!({"event": "taken", "text": "my controls"})));
+        assert_eq!(m.tick(5.5, Some(false)), Step::Resend);
+
+        // Read at once and never answered: no second copy either.
+        let mut m = CaseMachine::new(0.0, 1200.0);
+        m.feed(&rec(0.3, "typed", json!({"event": "taken", "text": "full auto"})));
+        m.feed(&rec(0.4, "typed", json!({"event": "consumed", "text": "full auto"})));
         let v = finished(m.tick(5.5, Some(false)));
         assert!(v.reason.contains("did not take"), "{v:?}");
     }

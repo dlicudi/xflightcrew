@@ -1240,6 +1240,12 @@ async fn run_session(
         // with no station, the calls are discarded — external ATC owns the
         // radio then, the same rule a keyed transmission follows below.
         {
+            // A pilot's line in hand (or waiting on the channel) is never held
+            // behind the crew's radio work: the waits below give way to it, the
+            // lines still play in order. LEMG (2026-09-28, sortie 1790586620):
+            // "my controls" was taken at +0.0 and routed at +26.1 s, after the
+            // crew's "request taxi" and the tower's whole taxi clearance.
+            let pilot_waiting = || pilot_line_pending(input.is_some());
             let calls = circuit::take_crew_radio();
             // A discarded transmission is never silent. The queue is drained
             // unconditionally, so a failed gate loses the call for good — and
@@ -1266,7 +1272,10 @@ async fn run_session(
                                 climb_to_ft,
                             } => {
                                 let quiet = std::time::Instant::now();
-                                while voice.radio_on_air() && quiet.elapsed().as_secs_f64() < 20.0 {
+                                while voice.radio_on_air()
+                                    && quiet.elapsed().as_secs_f64() < 20.0
+                                    && !pilot_waiting()
+                                {
                                     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
                                 }
                                 let alt_ft =
@@ -1292,18 +1301,24 @@ async fn run_session(
                         let routed = st
                             .handle_transmission(&call.to_ascii_lowercase(), xplane.view())
                             .await;
-                        say(
+                        say_or(
                             &voice,
                             &reporter,
                             ui::LogKind::Readback,
                             &format!("{call}."),
+                            &pilot_waiting,
                         );
                         if let Some((reply, who)) = routed {
                             if !reply.is_empty() {
                                 tracing::info!(target: "xvoicelayer::radio", station = %who.tag(), reply = %reply, "rx");
                                 reporter
                                     .log(ui::LogKind::Readback, format!("{}: {reply}", who.tag()));
-                                voice.say_station(Priority::Readback, who, &reply);
+                                voice.say_station_until(
+                                    Priority::Readback,
+                                    who,
+                                    &reply,
+                                    &pilot_waiting,
+                                );
                             }
                         }
                     }
@@ -1314,8 +1329,15 @@ async fn run_session(
         // Station work consumed — an idle tick carries no utterance to route.
         let (mut command, from_text) = match input {
             None => continue,
-            Some(Input::Typed(text)) => {
+            Some(Input::Typed(text, taken_at)) => {
                 tracing::info!(typed = %text, "typed command");
+                // From the channel to routing: the station work above ran
+                // between them, and "consumed" alone hid 26 s of it (#135).
+                blackbox::record(
+                    "typed",
+                    serde_json::json!({ "event": "routed", "text": &text,
+                                        "held_ms": taken_at.elapsed().as_millis() as u64 }),
+                );
                 reporter.log(ui::LogKind::Heard, format!("⌨  \"{text}\""));
                 (text, true)
             }
@@ -3867,7 +3889,8 @@ fn listen_once(
 /// it) or typed in the TUI.
 enum Input {
     Spoken(stt::Transcription, bool),
-    Typed(String),
+    /// The line, and when the loop took it off the channel.
+    Typed(String, Instant),
 }
 
 /// Block until the next input arrives from either source. With a `typed`
@@ -3899,7 +3922,7 @@ fn next_input(
             );
             let t = t.trim().to_string();
             if !t.is_empty() {
-                return Some(Input::Typed(t));
+                return Some(Input::Typed(t, Instant::now()));
             }
         }
         if let Some((t, tx)) = listen_once(
@@ -3932,6 +3955,24 @@ fn next_input(
 static LAST_READBACK: std::sync::Mutex<Option<(String, Instant)>> = std::sync::Mutex::new(None);
 
 fn say(voice: &Voice, reporter: &Reporter, kind: ui::LogKind, line: &str) {
+    say_or(voice, reporter, kind, line, pollers::command_waiting);
+}
+
+/// Is a pilot's line owed the command loop's attention: one already taken off
+/// the channel and not yet routed (`in_hand`), or one still waiting on it.
+/// The command loop's waits on its OWN speech give way to either (#90, #135).
+fn pilot_line_pending(in_hand: bool) -> bool {
+    in_hand || pollers::command_waiting()
+}
+
+/// [`say`] with the wait's give-way condition handed in.
+fn say_or(
+    voice: &Voice,
+    reporter: &Reporter,
+    kind: ui::LogKind,
+    line: &str,
+    stop: impl Fn() -> bool,
+) {
     // The first reply of a turn waits a human beat after the pilot stopped
     // talking (never when busy, never for typed input): `tempo`.
     tempo::reaction_pause();
@@ -3940,7 +3981,7 @@ fn say(voice: &Voice, reporter: &Reporter, kind: ui::LogKind, line: &str) {
     reporter.log(kind, line);
     // Blocks until spoken, unless the pilot has a line waiting (typed, a
     // panel button): the loop goes to take it and the line plays on (#90).
-    voice.say_until(Priority::Readback, line, pollers::command_waiting);
+    voice.say_until(Priority::Readback, line, stop);
     reporter.status(ui::Phase::Listening);
     if matches!(kind, ui::LogKind::Readback) {
         if let Ok(mut last) = LAST_READBACK.lock() {
@@ -4385,6 +4426,15 @@ mod tests {
         progress_line, radio_panel_line, undoable_drefs, wrong_plan_complaint, ConfidenceAction,
         PlanFetch, Ptt,
     };
+
+    /// #135: a line the loop has taken off the channel and not yet routed is
+    /// owed the loop as much as one still waiting on it. The crew-radio drain
+    /// saw only the channel, and "my controls" (taken, so the channel was
+    /// empty) waited 26.1 s behind the tower's taxi clearance at LEMG.
+    #[test]
+    fn a_line_in_hand_is_owed_the_loop_like_a_waiting_one() {
+        assert!(super::pilot_line_pending(true));
+    }
 
     fn plan(origin: &str, dest: &str, route: &str, n: usize) -> crate::simbrief::FlightPlan {
         crate::simbrief::FlightPlan {
