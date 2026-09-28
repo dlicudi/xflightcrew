@@ -605,6 +605,13 @@ everything blackboxes to `logs/blackbox.jsonl` (kinds: `atc`, `autotaxi`, `autot
   `flare_xtk_limit_m`): below the floor it must be interceptable AND its pursuit must leave the
   offset inside the landing limit at the threshold (`lands_on_the_pavement`), or it balks with height
   in hand, ordered even on the first tick (LEMG 13 45 m, 36.7 m right at the wheels, 2026-09-28).
+- **The arrival is re-picked in flight** (`RepickWatch`): the destination tower's runway at once, the
+  METAR's wind runway on two readings in a row beyond 25 nm (never in calm, never against the tower),
+  at most `MAX_ARRIVAL_REPICKS`; the new STAR is spliced from its entry (`plan_audit::star_splice`,
+  `procedure::offer_splice`), windows clamped, GPS reloaded (`arrival_repick`).
+- **An RF leg is flown round its arc** (`course_leg::arc_track`, `ProcLeg::arc()`, ends at the end
+  radial) and **a hold as a racetrack** (`HoldFlight`: direct entry, each 180 split into two 90s,
+  chart time else 1 / 1.5 min; HF one circuit, HA to its altitude or 6 circuits; HM flown through).
 - **A CF leg is flown on its course** (`course_leg::course_track`: a 30 degree intercept rolled out
   at the fly-by lead), never homed on; **an IF behind us is joined by autoland's pattern** against
   the FAF's course until the intercept fits 2 nm out (`FinalJoin`; EGKK 26L 2026-09-27).
@@ -692,7 +699,7 @@ spoken "taxi to parking" leaves the engines to the pilot.
 
 ### Still owed
 Issues labelled `owed` + `area:approach-landing` / `area:takeoff` / `area:full-auto` (retard #76,
-slow go-around #77, SID/STAR re-pick #79, authored-route capture #80, `ils_coupled` #81).
+slow go-around #77, authored-route capture #80, `ils_coupled` #81).
 
 ## Helicopters: the hover loop
 

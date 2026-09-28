@@ -9696,3 +9696,17 @@ to lever 0.9, VERIFY against N1) and a read-only BEFORE TAKEOFF audit; the 737 l
 item tested `<0.05` and passed an armed lever (-0.5), now `-0.05|0.05`. Open: the circuit's 300 ft AP
 handover from a ~3,400 fpm pitch climb to VS 1500, the circuit's 500 ft flap dump at 190 kt, the MCP
 speed after V2 (filed). Offline only.
+
+## 2026-09-28: the arrival re-picked in flight; RF arcs and holds (issues #79, #101)
+
+#79: `RepickWatch` during the enroute wait takes the destination tower's runway at once and the
+METAR's wind runway on two readings in a row beyond 25 nm (never in calm, never while the tower names
+ours), at most two re-picks; the runway moves through `retarget_arrival_runway`, the new runway's STAR
+is spliced into the flying follower from its entry (`star_splice`, `offer_splice`/`apply_splice`, else
+`splice_stale`), windows clamped, GPS reloaded. No in-flight SID re-pick (the tower freezes a committed
+departure's runway). Real-data test: LIPE BAME2S (30) becomes BAME5M (12) from BAMEK.
+#101 (part): CIFP RF legs carry centre and radius (`nav::LegPath`) and are flown round the arc
+(`arc_track`, tangent corrected by at most 30 degrees, ends at the end radial; LOWI RTT3X's RF to WI008
+round WI009 in the real-data test); HF/HA holds are flown as a racetrack (`HoldFlight`, direct entry,
+each 180 as two 90s so the heading mode never takes the short way), HM flown through. Still owed on
+#101: the OFP cruise schedule. Offline only.
