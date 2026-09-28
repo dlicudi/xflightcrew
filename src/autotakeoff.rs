@@ -77,6 +77,9 @@ const TAKEOFF_ROLL: &str = "xcopilot/roll";
 const ROLL_YIELD: &str = "xcopilot/roll_yield";
 /// Engine torque, N m per engine.
 const ENGN_TRQ: &str = "sim/flightmodel/engine/ENGN_TRQ";
+/// N1 per engine, percent: recorded at the thrust reduction, the evidence
+/// for the declared climb lever.
+const ENGN_N1: &str = "sim/flightmodel/engine/ENGN_N1_";
 const THETA: &str = "sim/flightmodel/position/true_theta";
 const PHI: &str = "sim/flightmodel/position/true_phi";
 /// The sim's own pitch rate, deg/s — what the rotation law damps on. Measured,
@@ -939,7 +942,7 @@ pub fn slew(prev: f64, want: f64, max_step: f64) -> f64 {
 /// ONE departure check (`radio::departure_check`): the tower's assigned code
 /// is dialled and read back too, so the spoken takeoff and the circuit leave
 /// with the squawk full auto would have set.
-fn squawk_altitude(base_url: String, v: Option<Voice>) {
+fn squawk_altitude(base_url: String, v: Option<Voice>, audit: bool) {
     tokio::spawn(async move {
         let xp = XPlaneClient::new(base_url);
         let check =
@@ -950,6 +953,11 @@ fn squawk_altitude(base_url: String, v: Option<Voice>) {
         crate::blackbox::record("autotakeoff", rec);
         if let Some(line) = check.failure_line() {
             alert(&v, Priority::Caution, &line);
+        }
+        // The roll's first call: brakes off and the transponder done, the
+        // list audits the rest (`takeoff_config::before_takeoff_audit`).
+        if audit {
+            crate::takeoff_config::before_takeoff_audit(v);
         }
     });
 }
@@ -1244,7 +1252,78 @@ pub struct RotatePitch {
     ceiling: Option<f64>,
     /// This airframe's nose-down limit — see [`PITCH_MIN`].
     pitch_min: f64,
+    /// The speed hold by pitch after liftoff, on an airframe that declares
+    /// one (see [`ClimbHold`]); `None` holds the rotation attitude, as ever.
+    hold: Option<ClimbHold>,
+    /// The last airspeed read and its low-passed trend, knots per second.
+    prev_ias: Option<f64>,
+    accel_kts_s: f64,
 }
+
+/// The hand-flown initial climb's speed hold: from liftoff to the autopilot's
+/// engage the rotation's attitude target is walked by the airspeed TREND, so
+/// the aircraft climbs at `hold_kts` instead of accelerating away at a fixed
+/// 8 degrees. The rotation attitude is its floor (a slow aircraft flies the old
+/// law) and `pitch_max_deg` its ceiling, reached only as the tail clears the
+/// runway ([`tail_clear_ceiling_deg`]).
+///
+/// LEMG 13, the 737, 2026-09-28 (five full-auto circuits, every one the same):
+/// rotate 145, liftoff 162, then 185 kt by the 300 ft engage at 11 degrees,
+/// the law pushing -0.37 to hold 8. EGPH 2026-09-21 the same, 157 to 185. A
+/// crew rotates to about 15 degrees and holds V2 + 15 by pitch.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ClimbHold {
+    pub hold_kts: f64,
+    pub pitch_max_deg: f64,
+}
+
+impl ClimbHold {
+    /// From the airframe's declaration and its initial climb speed (V2 + 20
+    /// on the jets): hold [`CLIMB_HOLD_UNDER_KTS`] under it, the middle of the
+    /// V2 to V2 + 20 band a crew flies. `None` without a sane ceiling above
+    /// the rotation attitude.
+    pub fn new(initial_climb_kts: f64, pitch_max_deg: Option<f64>) -> Option<Self> {
+        let pitch_max_deg = pitch_max_deg.filter(|d| d.is_finite() && *d > ROTATE_PITCH_DEG)?;
+        (initial_climb_kts.is_finite() && initial_climb_kts > CLIMB_HOLD_UNDER_KTS).then(|| {
+            ClimbHold {
+                hold_kts: initial_climb_kts - CLIMB_HOLD_UNDER_KTS,
+                pitch_max_deg,
+            }
+        })
+    }
+}
+
+/// The hold sits this far under the initial climb speed (V2 + 20): V2 + 15.
+pub const CLIMB_HOLD_UNDER_KTS: f64 = 5.0;
+/// The tail's arm behind the main wheels, feet, for the clearance a height
+/// buys: a long one on purpose (the A330-300's is about 100, the 737-800's
+/// about 60), so every airframe's ceiling grows no faster than its tail
+/// clears. The sim's `y_agl` reads 0.1 ft on the 737's wheels (LEMG
+/// 2026-09-28), so the height IS the wheels'.
+pub const TAIL_ARM_FT: f64 = 100.0;
+
+/// The attitude the tail allows at `agl_ft` wheel height: the rotation's own
+/// ceiling on the runway, plus the angle the height buys over the tail's arm
+/// (5.7 degrees at 10 ft, 11.3 at 20, 19.3 at 35). A crew keeps rotating
+/// through liftoff; the tail strike is an attitude ON the runway. Pure.
+pub fn tail_clear_ceiling_deg(on_runway_deg: f64, agl_ft: f64) -> f64 {
+    on_runway_deg + (agl_ft.max(0.0) / TAIL_ARM_FT).atan().to_degrees()
+}
+/// The airspeed trend's low-pass, seconds. A two-sample difference over a
+/// 0.2 s tick turns a tenth of a knot of read noise into half a knot a second.
+const CLIMB_ACCEL_TAU_S: f64 = 1.0;
+/// The acceleration the hold asks for: the speed error closed over this
+/// time constant, capped both ways.
+const CLIMB_SPEED_TAU_S: f64 = 3.0;
+const CLIMB_ACCEL_MAX_KTS_S: f64 = 1.5;
+/// How fast the attitude target walks per knot-per-second of acceleration
+/// it should not have, degrees per second. At takeoff thrust a degree of
+/// flight path is about a third of a knot a second, so this closes the
+/// attitude on the speed in about three seconds.
+const CLIMB_DEG_S_PER_KT_S: f64 = 1.5;
+/// The target walks down no faster than this, degrees per second (up is the
+/// rotation's own rate).
+const CLIMB_PITCH_DOWN_DEG_S: f64 = 1.5;
 
 impl RotatePitch {
     /// `tail_strike_deg` is the airframe's tail-clearance attitude, from the
@@ -1270,7 +1349,22 @@ impl RotatePitch {
             // Never POSITIVE — a "minimum" above zero would be a standing
             // pull the law could not release — and never past full travel.
             pitch_min: pitch_min.clamp(-1.0, 0.0),
+            hold: None,
+            prev_ias: None,
+            accel_kts_s: 0.0,
         }
+    }
+
+    /// Hold the initial climb speed by pitch after liftoff (see
+    /// [`ClimbHold`]). `None` is the fixed rotation attitude.
+    pub fn with_climb_hold(mut self, hold: Option<ClimbHold>) -> Self {
+        self.hold = hold;
+        self
+    }
+
+    /// The low-passed airspeed trend, knots per second, for the blackbox.
+    pub fn accel_kts_s(&self) -> f64 {
+        self.accel_kts_s
     }
 
     /// The attitude being commanded right now — the ramp, for the blackbox.
@@ -1297,6 +1391,19 @@ impl RotatePitch {
     /// differ by cos(bank), and this climb holds the wings inside
     /// `CLIMB_BANK_MAX_DEG`, so the error is under 1%.
     pub fn step(&mut self, theta_deg: f64, rate_deg_s: Option<f64>, dt_s: f64) -> f64 {
+        self.step_climb(theta_deg, rate_deg_s, dt_s, None)
+    }
+
+    /// [`RotatePitch::step`] with the airspeed and height, for the climb
+    /// hold: `air` is `(ias_kts, agl_ft)`. Without a declared hold, or with
+    /// `air` `None`, exactly the fixed-attitude law.
+    pub fn step_climb(
+        &mut self,
+        theta_deg: f64,
+        rate_deg_s: Option<f64>,
+        dt_s: f64,
+        air: Option<(f64, f64)>,
+    ) -> f64 {
         let dt = dt_s.clamp(0.05, 1.0);
         let rate = rate_deg_s
             .unwrap_or_else(|| self.prev_theta.map_or(0.0, |p| (theta_deg - p) / dt))
@@ -1307,15 +1414,49 @@ impl RotatePitch {
         let cap = self
             .ceiling
             .map_or(ROTATE_PITCH_DEG, |c| ROTATE_PITCH_DEG.min(c));
-        let target = match self.target {
+        let prev_target = self.target;
+        let ramped = match prev_target {
             None => theta_deg.min(cap),
+            Some(t) if t < cap => (t + ROTATE_RATE_DEG_S * dt).min(cap),
+            // Past the ramp: the hold's target stands (the ramp never pulls
+            // it back to the rotation attitude).
+            Some(t) if self.hold.is_some() => t,
             Some(t) => (t + ROTATE_RATE_DEG_S * dt).min(cap),
         };
+        // The airspeed trend, whenever the caller has the airspeed.
+        if let Some((ias, _)) = air.filter(|(v, _)| v.is_finite()) {
+            let raw = self.prev_ias.map_or(0.0, |p| ((ias - p) / dt).clamp(-10.0, 10.0));
+            if self.prev_ias.is_some() {
+                self.accel_kts_s += (raw - self.accel_kts_s) * dt / (CLIMB_ACCEL_TAU_S + dt);
+            }
+            self.prev_ias = Some(ias);
+        }
+        let held = match (self.hold, air) {
+            (Some(h), Some((ias, agl_ft))) if ramped >= cap - 1e-9 && ias.is_finite() => {
+                // The climb attitude, as far as the tail has cleared.
+                let tail = self
+                    .ceiling
+                    .map_or(f64::INFINITY, |c| tail_clear_ceiling_deg(c, agl_ft));
+                let top = h.pitch_max_deg.min(tail).max(cap);
+                let want_accel = ((h.hold_kts - ias) / CLIMB_SPEED_TAU_S)
+                    .clamp(-CLIMB_ACCEL_MAX_KTS_S, CLIMB_ACCEL_MAX_KTS_S);
+                let walk = (CLIMB_DEG_S_PER_KT_S * (self.accel_kts_s - want_accel) * dt)
+                    .clamp(-CLIMB_PITCH_DOWN_DEG_S * dt, ROTATE_RATE_DEG_S * dt);
+                Some((ramped + walk).clamp(cap, top))
+            }
+            _ => None,
+        };
+        let target = held.unwrap_or(ramped);
         self.target = Some(target);
         // Damp the rate ERROR: while the ramp is still climbing, the nose is
         // SUPPOSED to be moving at ROTATE_RATE_DEG_S, and subtracting that
-        // motion as if it were an overshoot is what stalls a rotation.
-        let want_rate = if target < cap { ROTATE_RATE_DEG_S } else { 0.0 };
+        // motion as if it were an overshoot is what stalls a rotation. The
+        // hold's walk is a commanded rate too.
+        let want_rate = match (held, prev_target) {
+            (Some(t), Some(p)) => (t - p) / dt,
+            _ if target < cap => ROTATE_RATE_DEG_S,
+            _ => 0.0,
+        };
         let err = target - theta_deg - PITCH_LEAD_S * (rate - want_rate);
         // PROPORTIONAL + integral, not integral alone.
         //
@@ -1440,6 +1581,34 @@ pub fn tick_throttle_want(
     } else {
         throttle_cmd(elapsed_s, err_deg, gs_kts)
     }
+}
+
+/// The thrust lever after the declared thrust reduction: above its height,
+/// airborne, no more than the climb lever, and whether the reduction BINDS
+/// (the lever it leaves is under the takeoff's own want). Takeoff thrust held
+/// to the handoff and past it was the follower's to take back (EGPH
+/// 2026-09-21); a crew sets climb thrust at the reduction height. Pure.
+pub fn thrust_reduced(
+    want: f64,
+    airborne: bool,
+    agl_ft: f64,
+    reduction: Option<crate::takeoff_config::ThrustReduction>,
+) -> (f64, bool) {
+    match reduction {
+        Some(r) if airborne && agl_ft >= r.agl_ft && want > r.lever => (r.lever, true),
+        _ => (want, false),
+    }
+}
+
+/// A reduction comes back at this rate, lever per second: the way a crew
+/// pulls to climb thrust, not a step the pitch has to answer at once.
+pub const THRUST_REDUCE_PER_S: f64 = 0.1;
+
+/// The lever while the reduction binds: `slewed` (the takeoff's own slew,
+/// whose releases are instant) no further below `last` than
+/// [`THRUST_REDUCE_PER_S`] a second. Every other release stays instant. Pure.
+pub fn reduction_slew(slewed: f64, last: f64, dt_s: f64) -> f64 {
+    slewed.max((last - THRUST_REDUCE_PER_S * dt_s.max(0.0)).min(last))
 }
 
 /// The commanded climb rate: the profile's best rate, backed off while the
@@ -2087,7 +2256,7 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, p: Params) {
     // standby and the tower called "negative radar contact" with the pilot
     // climbing out (EDLP 24, 2026-09-24). Liftoff asks again (a no-op when
     // it took).
-    squawk_altitude(p.base_url.clone(), voice.clone());
+    squawk_altitude(p.base_url.clone(), voice.clone(), true);
     alert(
         &voice,
         Priority::Advisory,
@@ -2138,10 +2307,28 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, p: Params) {
     let mut gear_raised = !p.retract_gear;
     let mut positive_called = false;
     let mut thr_challenged = false;
+    // The initial climb's speed hold by pitch, on an airframe that declares
+    // its climb attitude (`climb_pitch_max_deg`); the fixed rotation
+    // attitude elsewhere.
+    let climb_hold = ClimbHold::new(
+        p.initial_climb_kts,
+        crate::aircraft::live_profile().and_then(|lp| lp.climb_pitch_max_deg),
+    );
+    if let Some(h) = climb_hold {
+        crate::blackbox::record(
+            "autotakeoff",
+            serde_json::json!({"event": "climb_hold", "hold_kts": h.hold_kts,
+                               "pitch_max_deg": h.pitch_max_deg}),
+        );
+    }
     let mut pitch_law = RotatePitch::with_authority(
         p.tail_strike_deg,
         p.pitch_authority_down.map_or(PITCH_MIN, |a| -a.abs()),
-    );
+    )
+    .with_climb_hold(climb_hold);
+    // Thrust reduction at the declared height (`takeoff_config:`).
+    let reduction = crate::takeoff_config::thrust_reduction();
+    let mut reduced = false;
     let mut wings = WingsLevel::default();
     let mut last_vs_cmd: Option<f64> = None;
     let mut last_thr_cmd = 0.3_f64;
@@ -2307,7 +2494,23 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, p: Params) {
             ias,
             power_limit.as_ref(),
         );
+        let (thr_want, reducing) = thrust_reduced(thr_want, airborne, agl_ft, reduction);
         let thr_cmd = throttle_slew(last_thr_cmd, thr_want, dt);
+        let thr_cmd = if reducing {
+            reduction_slew(thr_cmd, last_thr_cmd, dt)
+        } else {
+            thr_cmd
+        };
+        if reducing && !reduced {
+            reduced = true;
+            alert(&voice, Priority::Advisory, "Climb thrust.");
+            let n1 = xp.get_float_array(ENGN_N1).await.ok();
+            crate::blackbox::record(
+                "autotakeoff",
+                serde_json::json!({"event": "thrust_reduction", "agl": agl_ft, "ias": ias,
+                                   "from": last_thr_cmd, "to": thr_want, "n1": n1}),
+            );
+        }
         // FAIL OPEN, deliberately: a failed throttle read impersonates our own
         // command, so an API blink can never register as a pilot pull mid-roll.
         // The cost is one tick of blindness to a real hand; the alternative is
@@ -2452,7 +2655,7 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, p: Params) {
             if rotated {
                 // Wings held level through the pull — the rudder steering
                 // still owns the heading until liftoff.
-                let pitch = pitch_law.step(theta_deg, pitch_rate, dt);
+                let pitch = pitch_law.step_climb(theta_deg, pitch_rate, dt, Some((ias, agl_ft)));
                 let ail = wings.step(phi_deg, 0.0, dt);
                 crate::monitor::note_crew_yoke();
                 let (wp, wr) = tokio::join!(
@@ -2488,7 +2691,7 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, p: Params) {
                 // the result is KEPT: it was discarded, and the A330 flew out
                 // in standby to two "recycle transponder" calls with nothing
                 // said on the flight deck (EGPH, 2026-09-20).
-                squawk_altitude(p.base_url.clone(), voice.clone());
+                squawk_altitude(p.base_url.clone(), voice.clone(), false);
                 crate::blackbox::record(
                     "autotakeoff",
                     serde_json::json!({"event": "liftoff", "ias": ias}),
@@ -2570,7 +2773,7 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, p: Params) {
                 // gently toward runway heading, since the rudder steering
                 // ended at liftoff.
                 let hdg_err = ((rwy.course_deg - psi + 540.0).rem_euclid(360.0)) - 180.0;
-                let pitch = pitch_law.step(theta_deg, pitch_rate, dt);
+                let pitch = pitch_law.step_climb(theta_deg, pitch_rate, dt, Some((ias, agl_ft)));
                 let ail = wings.step(phi_deg, climb_bank_target(hdg_err), dt);
                 crate::monitor::note_crew_yoke();
                 let (wp, wr) = tokio::join!(
@@ -2600,6 +2803,9 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, p: Params) {
                         // path, and nothing logged what it damped on.
                         "theta": theta_deg, "pitch": pitch, "q": pitch_rate, "dt": dt,
                         "pitch_tgt": pitch_law.target_deg(),
+                        // The airspeed trend the climb hold walks the target
+                        // on, knots per second (`ClimbHold`).
+                        "accel": pitch_law.accel_kts_s(),
                         "phi": phi_deg, "ail": ail, "hdg_err": hdg_err,
                     }),
                 );
@@ -4577,6 +4783,166 @@ mod tests {
             at_ship < 2.5,
             "the tuned point must be comfortable: {at_ship:.1} deg"
         );
+    }
+
+    /// The 737's rotation and hand-flown climb, rotate to the 300 ft engage,
+    /// against the pitch plant above (through the loop's transport delay) and
+    /// a flight path with the aircraft's own excess thrust, both fitted to
+    /// LEMG 13 (sortie 1790596335-full_auto, 2026-09-28): the law pushing
+    /// -0.37 to hold 11 degrees is a standing nose-up moment of about 130
+    /// (6.25 x 11 + 167 x 0.37); 2,280 fpm at 184 kt is a 7 degree path at
+    /// 11 degrees of pitch, so about 4 degrees of alpha there; 1.2 kt/s on
+    /// that path is a thrust-to-weight excess of 0.185. Returns what the
+    /// blackbox reports per `climb_manual` tick: the airspeed at 300 ft, the
+    /// highest airspeed and attitude from liftoff to 300 ft, the highest
+    /// tail margin (the attitude less the 11 degree strike plus the angle the
+    /// height buys over the -800's 60 ft arm; positive is a strike), and the
+    /// share of ticks the elevator
+    /// sat on a stop.
+    fn fly_initial_climb(
+        hold: Option<ClimbHold>,
+        zeta: f64,
+        lag_s: f64,
+    ) -> (f64, f64, f64, f64, f64) {
+        const TW: f64 = 0.185;
+        const KTS_S_PER_G: f64 = 9.81 / 0.514_444;
+        let mut plant = PitchPlant::new(zeta, 130.0);
+        let mut law = RotatePitch::with_authority(Some(11.0), -0.5).with_climb_hold(hold);
+        let (mut ias, mut gamma, mut h_ft) = (145.5_f64, 0.0_f64, 0.0_f64);
+        let mut airborne = false;
+        let mut pending: Vec<(f64, f64)> = Vec::new();
+        let mut applied = 0.0;
+        let (mut t, dt) = (0.0_f64, 0.2_f64);
+        let (mut max_ias, mut max_theta, mut max_theta_low) = (0.0_f64, 0.0_f64, f64::MIN);
+        let (mut ticks, mut saturated) = (0.0, 0.0);
+        let mut at_300 = None;
+        // A tenth of a knot of read noise, deterministic.
+        let mut seed = 7_u32;
+        let mut noise = move || {
+            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            (f64::from(seed >> 8) / f64::from(1_u32 << 23) - 1.0) * 0.1
+        };
+        while t < 60.0 && at_300.is_none() {
+            let cmd = law.step_climb(plant.theta, Some(plant.q), dt, Some((ias + noise(), h_ft)));
+            pending.push((t + lag_s, cmd));
+            let (mut now, end) = (t, t + dt);
+            while now < end - 1e-9 {
+                let next = pending
+                    .iter()
+                    .map(|&(at, _)| at)
+                    .filter(|&at| at > now && at < end)
+                    .fold(end, f64::min);
+                let span = next - now;
+                plant.advance(applied, span);
+                // On the wheels the attitude cannot go below the runway.
+                if !airborne && plant.theta < 0.0 {
+                    plant.theta = 0.0;
+                    plant.q = plant.q.max(0.0);
+                }
+                let alpha = 4.0 * (184.0 / ias).powi(2);
+                if !airborne && ias >= 160.0 && plant.theta >= alpha {
+                    airborne = true;
+                }
+                if airborne {
+                    gamma += ((plant.theta - alpha) - gamma) / 1.5 * span;
+                    ias += (TW - gamma.to_radians().sin()) * KTS_S_PER_G * span;
+                    h_ft += ias * 1.6878 * gamma.to_radians().sin() * span;
+                } else {
+                    // The recorded ground run: 145 to 162 in 4.4 s.
+                    ias += 3.9 * span;
+                }
+                now = next;
+                while let Some(i) = pending.iter().position(|&(at, _)| at <= now) {
+                    applied = pending.remove(i).1;
+                }
+            }
+            t = end;
+            if airborne && h_ft > 8.0 {
+                max_ias = max_ias.max(ias);
+                max_theta = max_theta.max(plant.theta);
+                let strike = 11.0 + (h_ft / 60.0).atan().to_degrees();
+                max_theta_low = max_theta_low.max(plant.theta - strike);
+                ticks += 1.0;
+                if cmd <= -0.5 + 1e-9 || cmd >= PITCH_MAX - 1e-9 {
+                    saturated += 1.0;
+                }
+                if h_ft >= AP_ENGAGE_AGL_FT {
+                    at_300 = Some(ias);
+                }
+            }
+        }
+        (
+            at_300.expect("reaches the engage height"),
+            max_ias,
+            max_theta,
+            max_theta_low,
+            saturated / ticks,
+        )
+    }
+
+    /// #78: the hand-flown segment holds V2 to V2 + 20, not the rotation
+    /// attitude. The fixed 8 degrees reproduces LEMG 13 (162 at liftoff, 185
+    /// at 300 ft on all five circuits); the hold keeps the 737 inside its
+    /// band with the tail clear, across the plant uncertainty.
+    #[test]
+    fn the_initial_climb_holds_v2_plus_fifteen_by_pitch() {
+        let b738 = crate::aircraft::load("boeing_737_800").expect("737 profile loads");
+        let initial = b738
+            .reference
+            .as_ref()
+            .and_then(|r| r.initial_climb_kts)
+            .unwrap();
+        let hold = ClimbHold::new(initial, b738.climb_pitch_max_deg);
+        let h = hold.expect("the 737 declares its climb attitude");
+        assert_eq!(h.hold_kts, 165.0, "V2 150 + 15");
+        let (v2, top) = (initial - 20.0, initial);
+
+        // The recorded flight, reproduced: the plant is the aircraft.
+        let (at_300, ..) = fly_initial_climb(None, 0.45, 0.2);
+        assert!(at_300 > 178.0, "the old law runs away as the 737 did: {at_300:.1}");
+
+        for zeta in [0.35, 0.45, 0.55] {
+            for lag in [0.1, 0.2, 0.3] {
+                let (at_300, max_ias, max_theta, low, sat) = fly_initial_climb(hold, zeta, lag);
+                let tag = format!("zeta {zeta}, lag {lag}");
+                assert!(
+                    (v2..=top).contains(&max_ias),
+                    "peak {max_ias:.1} outside V2 {v2} to V2 + 20 ({tag})"
+                );
+                assert!(
+                    (h.hold_kts - 5.0..=h.hold_kts + 5.0).contains(&at_300),
+                    "at the engage {at_300:.1} vs hold {} ({tag})",
+                    h.hold_kts
+                );
+                assert!(
+                    max_theta <= h.pitch_max_deg + 1.0,
+                    "theta {max_theta:.1} ({tag})"
+                );
+                assert!(low < 0.0, "tail strike: {low:.1} deg past it ({tag})");
+                assert!(sat < 0.05, "camps on a stop: {:.0}% ({tag})", sat * 100.0);
+            }
+        }
+    }
+
+    /// Silent profiles keep the fixed attitude: no ceiling, no hold, and the
+    /// law's target never passes the rotation attitude whatever the speed.
+    #[test]
+    fn an_airframe_without_a_climb_attitude_keeps_the_rotation_attitude() {
+        assert_eq!(ClimbHold::new(74.0, None), None);
+        assert_eq!(
+            ClimbHold::new(74.0, Some(ROTATE_PITCH_DEG)),
+            None,
+            "no room above the rotation attitude"
+        );
+        let c172 = crate::aircraft::builtin("cessna_172sp").unwrap();
+        assert_eq!(c172.climb_pitch_max_deg, None);
+        let mut law = RotatePitch::with_authority(None, PITCH_MIN);
+        let mut ias = 60.0;
+        for _ in 0..100 {
+            ias += 1.0;
+            law.step_climb(8.0, Some(0.0), 0.2, Some((ias, 200.0)));
+        }
+        assert_eq!(law.target_deg(), ROTATE_PITCH_DEG);
     }
 
     /// LFLL-EGLL, 2026-09-17. The 737 lifted at V2+20 and climbed out at

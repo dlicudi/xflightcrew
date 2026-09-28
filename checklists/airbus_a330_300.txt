@@ -85,6 +85,8 @@ sw_item:ALTIMETERS|SET:sim/cockpit2/gauges/actuators/barometer_setting_in_hg_pil
 sw_item:FLAPS|CONF 2:sim/cockpit2/controls/flap_ratio:0.4|0.6
 sw_item:SPEED BRAKE|ARMED:sim/cockpit2/controls/speedbrake_ratio:<-0.25
 sw_item:AUTOBRAKE|MAX:sim/cockpit2/switches/auto_brake_level:<0.5
+sw_item:FLIGHT DIRECTORS|ON:sim/cockpit2/autopilot/flight_director_mode:1
+sw_item:SPEED|V2:sim/cockpit2/autopilot/airspeed_dial_kts_mach:148|160
 sw_item:TRANSPONDER|AUTO:laminar/A333/transponder/auto_on_knob_pos:-0.5|0.5
 sw_item:LANDING LIGHTS|ON:sim/cockpit2/switches/landing_lights_switch[0]:1
 sw_item:TAXI LIGHT|TAKEOFF:sim/cockpit2/switches/landing_lights_switch[1]:>0.75

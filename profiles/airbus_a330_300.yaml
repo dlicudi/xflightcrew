@@ -298,6 +298,17 @@ takeoff_config:
   arm_spoilers: true
   autobrake_rto: true
   landing_autobrake_level: 4
+  # Flight directors on and V2 on the FCU speed before the roll (stock
+  # flight_director_mode / airspeed_dial_kts_mach, both read, never written,
+  # by the A333 scripts; issue #91). V2 is the card's (V1 143 / VR 148 /
+  # V2 153). VERIFY: blackbox `autotakeoff` `takeoff_config` names
+  # "flight directors on" and "V2 153 set", or "Check ..." if they did not
+  # take. NOT declared here: the autothrust arm (A333.autopilot.lua sets
+  # autothrottle_enabled from the lever detents' FADEC mode every frame, so a
+  # write is its output) and the thrust reduction (the lever positions of
+  # its CL and FLX detents are the script's, unprobed).
+  flight_directors: true
+  v2_kts: 153.0
 # Clean stall from the acf at a mid weight. 1.2 x this (210) is the floor any
 # handed-down target is raised to; the derived approach speed is max(1.3 Vso,
 # 1.2 Vs) so a clean floor never lands the aircraft fast on its own.
@@ -308,6 +319,12 @@ vlo_kts: 250.0
 # Tail clearance at rotation is about 12.5 degrees on the -300; the rotation
 # is bounded 2 degrees below. VERIFY.
 tail_strike_deg: 12.5
+# The highest attitude the hand-flown initial climb may hold once the tail
+# clears (autotakeoff::tail_clear_ceiling_deg), holding V2 + 15 by pitch to the 300 ft engage
+# (autotakeoff::ClimbHold, issue #78). About 15 degrees is the all-engine
+# SRS attitude at a mid weight; 17.5 leaves the light end room. VERIFY:
+# blackbox `autotakeoff` `climb_manual` `ias` 150-173 and `theta` under this.
+climb_pitch_max_deg: 17.5
 
 # The landing laws the 737 learned on the same stock autopilot (LFLL and
 # EGCC, 2026-09-17/19), absent here until the profile review: without them

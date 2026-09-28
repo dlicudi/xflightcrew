@@ -85,6 +85,9 @@ sw_remark:BEFORE TAKEOFF
 sw_item:FLAPS|5:sim/cockpit2/controls/flap_ratio:0.3|0.45
 sw_item:STABILIZER TRIM|IN THE GREEN BAND:sim/cockpit2/controls/elevator_trim:-0.15|0.15
 sw_item:SPEED BRAKE|DOWN DETENT:sim/cockpit2/controls/speedbrake_ratio:<0.05
+sw_item:FLIGHT DIRECTORS|ON:sim/cockpit2/autopilot/flight_director_mode:1
+sw_item:AUTOTHROTTLE|ARMED:sim/cockpit2/autopilot/autothrottle_enabled:0
+sw_item:MCP SPEED|V2:sim/cockpit2/autopilot/airspeed_dial_kts_mach:145|160
 sw_item:PARKING BRAKE|RELEASED:sim/cockpit2/controls/parking_brake_ratio:<0.1
 sw_item:TRANSPONDER|ALT:sim/cockpit2/radios/actuators/transponder_mode:>1
 sw_item:STROBE LIGHTS|ON:sim/cockpit2/switches/strobe_lights_on:1
