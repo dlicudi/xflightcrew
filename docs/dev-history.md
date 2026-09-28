@@ -10176,3 +10176,16 @@ same picture for a takeoff request. Tests `a_lemg_12_arrival_is_not_traffic_for_
 `a_held_runway_start_is_released_once_its_traffic_has_gone`,
 `a_held_runway_start_arms_the_release_and_takes_the_hold_readback`,
 `a_held_crew_reads_back_the_hold_before_asking_again`. Offline only.
+
+## 2026-09-28: the glideslope cross-check said above for below (issue #175)
+
+EGKK-EGBB 15, 737, sortie 1790624015-full_auto: "Glideslope 1.4 dots up, we're below the ILS path"
+at +2683.8 with the aircraft 221 ft ABOVE the beam (earth_nav.dat's 15 GS antenna, 348 ft, 3.00
+degrees; autoland 279 ft over its own path), and "1.5 dots down, we're above" at 142 ft radio on
+autoland's path, 67 ft UNDER the beam. Every recorded glideslope call (47 across the sorties,
+LEMG, EGKK, EGBB, LIPR) puts a positive `nav1_vdef_dots_pilot` above the beam and a negative one
+below it; DataRefs.txt only says "CDI vertical deflection in dots". `XCheck` had it inverted, as
+had "set up the ILS"'s "above the glideslope" warning (it fired on a negative needle). Now one
+reading, `ils::above_glideslope`, words "N dots high, we're above" / "low, below", and no
+glideslope call under 200 ft radio (`XCHECK_GS_FLOOR_AGL_FT`; the localizer is still watched).
+Test `a_positive_glideslope_needle_is_above_the_beam`. Offline only.

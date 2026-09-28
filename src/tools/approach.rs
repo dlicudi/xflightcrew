@@ -360,7 +360,9 @@ impl Tool for PrepareIls {
         if (arm_wanted || matches!(plan_arm, ArmPlan::AlreadyArmed)) && flies_gs == Some(false) {
             line.push_str(" This autopilot flies the localiser only, the glideslope is yours.");
         }
-        if gs_valid.is_ok_and(|v| v > 0.5) && vdef.as_ref().is_ok_and(|v| *v < -1.0) && !on_ground {
+        // #175: a positive needle is above the beam (this said so of a negative one).
+        let high = vdef.as_ref().is_ok_and(|v| ils::above_glideslope(*v) && v.abs() > 1.0);
+        if gs_valid.is_ok_and(|v| v > 0.5) && high && !on_ground {
             line.push_str(" We're above the glideslope, it won't capture from above.");
         }
         if let (Some(m), true) = (
