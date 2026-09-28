@@ -42,7 +42,6 @@ const HPATH: &str = "sim/flightmodel/position/hpath";
 /// reads it to know which way the AP is turning (see `bug_toward`).
 const PHI: &str = "sim/flightmodel/position/phi";
 const AGL_M: &str = "sim/flightmodel/position/y_agl";
-const ELEV_M: &str = "sim/flightmodel/position/elevation";
 const MAG_VAR: &str = "sim/flightmodel/position/magnetic_variation";
 // AP surface (mirror of autotakeoff.rs — the recipe PROVEN to climb and
 // steer; `sim/autopilot/altitude_hold` is deliberately absent: it holds the
@@ -2231,11 +2230,9 @@ async fn fly_authored_route(
             continue;
         }
         let thr_dref = throttle_dref();
-        let (lat_r, lon_r, elev_r, psi_r, hp_r, phi_r, hdg_st, vs_st, ias_r, thr_r) = tokio::join!(
-            xp.get_float(LAT),
-            xp.get_float(LON),
-            xp.get_float(ELEV_M),
-            xp.get_float(PSI_TRUE),
+        // Position, elevation and heading as ONE frame saw them (#157).
+        let (pos, hp_r, phi_r, hdg_st, vs_st, ias_r, thr_r) = tokio::join!(
+            sim::position::read(&xp),
             xp.get_float(HPATH),
             xp.get_float(PHI),
             xp.get_float(HDG_STATUS),
@@ -2243,6 +2240,9 @@ async fn fly_authored_route(
             xp.get_float(IAS),
             xp.get_float(&thr_dref),
         );
+        let (lat_r, lon_r) = sim::position::lat_lon(&pos);
+        let elev_r = sim::position::field(&pos, |p| p.elev_m);
+        let psi_r = sim::position::field(&pos, |p| p.psi_true_deg);
         // Read only where the capture is declared: nothing else uses them.
         let (dial_r, alt_hold_r) = if ap_capture {
             let (d, h) = tokio::join!(xp.get_float(ALT_DIAL), xp.get_float(ALT_HOLD_STATUS));
@@ -2983,16 +2983,17 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, p: Params
             continue;
         }
 
-        let (lat, lon, agl_m, elev_m, psi_r, hpath_r, hdg_st, vs_st) = tokio::join!(
-            xp.get_float(LAT),
-            xp.get_float(LON),
-            xp.get_float(AGL_M),
-            xp.get_float(ELEV_M),
-            xp.get_float(PSI_TRUE),
+        // Position, height and heading as ONE frame saw them (#157).
+        let (pos, hpath_r, hdg_st, vs_st) = tokio::join!(
+            sim::position::read(&xp),
             xp.get_float(HPATH),
             xp.get_float(HDG_STATUS),
             xp.get_float(VS_STATUS),
         );
+        let (lat, lon) = sim::position::lat_lon(&pos);
+        let agl_m = sim::position::field(&pos, |p| p.agl_m);
+        let elev_m = sim::position::field(&pos, |p| p.elev_m);
+        let psi_r = sim::position::field(&pos, |p| p.psi_true_deg);
         let thr_dref = throttle_dref();
         let (ias_r, thr_r, dial_r, alt_hold_r, phi_r) = tokio::join!(
             xp.get_float(IAS),

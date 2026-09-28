@@ -122,6 +122,7 @@ pub const PLUGIN_DATAREFS: &[&str] = &[
     "xcopilot/opt/voice_list",
     "xcopilot/pitch",
     "xcopilot/pitch_yield",
+    "xcopilot/position",
     "xcopilot/ptt_active",
     "xcopilot/radio_ptt_active",
     "xcopilot/request",

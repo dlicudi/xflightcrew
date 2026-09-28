@@ -234,6 +234,9 @@ pub struct Snapshot {
     /// Position (`sim/flightmodel/position/latitude`/`longitude`).
     pub lat: f64,
     pub lon: f64,
+    /// Which read the position came from (`None` = it failed): the plugin's
+    /// one frame, or an older plugin's separate reads (#157).
+    pub pos_source: Option<sim::position::Source>,
     /// Ground track, degrees true (`sim/flightmodel/position/hpath`). `None` =
     /// the read failed; consumers treat it as "track unknown", never 0.
     pub track_deg: Option<f64>,
@@ -361,14 +364,13 @@ impl Snapshot {
             advisor_values.push(xp.get_float(dref).await.ok());
         }
         // Position + the descent picture vs the planned destination (if any).
-        let lat = xp
-            .get_float("sim/flightmodel/position/latitude")
-            .await
-            .unwrap_or(0.0);
-        let lon = xp
-            .get_float("sim/flightmodel/position/longitude")
-            .await
-            .unwrap_or(0.0);
+        // One frame's latitude and longitude (#157): read separately they
+        // paired two frames, metres apart at speed, and this is the position
+        // the taxi guide projects and the `state` record the scorer judges.
+        let (lat, lon, pos_source) = match sim::position::read_lat_lon(xp).await {
+            Ok((lat, lon, src)) => (lat, lon, Some(src)),
+            Err(_) => (0.0, 0.0, None),
+        };
         let track_deg = xp.get_float("sim/flightmodel/position/hpath").await.ok();
         let heading_deg = xp
             .get_float("sim/flightmodel/position/psi")
@@ -602,6 +604,7 @@ impl Snapshot {
             advisor_values,
             lat,
             lon,
+            pos_source,
             track_deg,
             heading_deg,
             bank_deg,
@@ -4558,6 +4561,7 @@ pub async fn run(
                 "state",
                 serde_json::json!({
                     "lat": lat, "lon": lon, "hdg": r1(snap.heading_deg), "alt": r1(alt),
+                    "pos": snap.pos_source.map(|s| s.as_str()),
                     "bank": r1(snap.bank_deg), "track": snap.track_deg.map(r1),
                     "ias": r1(snap.ias_kts), "gs": r1(snap.groundspeed_kts),
                     "vsi": r1(snap.vsi_fpm), "agl": r1(snap.agl_ft),
@@ -5683,6 +5687,7 @@ mod tests {
             advisor_values: vec![],
             lat: 0.0,
             lon: 0.0,
+            pos_source: None,
             track_deg: None,
             fps: None,
             dest_dist_nm: None,

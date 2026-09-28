@@ -1401,12 +1401,20 @@ pub fn run_autoland_scoped(
                 }
                 // One read burst — nine sequential HTTP awaits is the slow-tick
                 // disease that gave the takeoff its slew weave (sortie four).
-                let (lat_r, lon_r, elev_r, agl_r, gs_r, var_r, ias_r, psi_r, hpath_r, ground_r, phi_r) = tokio::join!(
-                    xp.get_float(LAT), xp.get_float(LON), xp.get_float(ELEV_M),
-                    xp.get_float(AGL_M), xp.get_float(GS_MS), xp.get_float(MAG_VAR),
-                    xp.get_float(IAS), xp.get_float(PSI_TRUE), xp.get_float(HPATH_TRUE),
+                // Position, height, groundspeed and heading as ONE frame saw
+                // them (#157): read separately, latitude and longitude paired
+                // two frames, metres of cross-track for a tick at speed.
+                let (pos, var_r, ias_r, hpath_r, ground_r, phi_r) = tokio::join!(
+                    sim::position::read(&xp), xp.get_float(MAG_VAR),
+                    xp.get_float(IAS), xp.get_float(HPATH_TRUE),
                     xp.get_float(ON_GROUND), xp.get_float(PHI_TRUE),
                 );
+                let (lat_r, lon_r) = sim::position::lat_lon(&pos);
+                let elev_r = sim::position::field(&pos, |p| p.elev_m);
+                let agl_r = sim::position::field(&pos, |p| p.agl_m);
+                let gs_r = sim::position::field(&pos, |p| p.gs_ms);
+                let psi_r = sim::position::field(&pos, |p| p.psi_true_deg);
+                let pos_source = sim::position::source_word(&pos);
                 let (Ok(lat), Ok(lon), Ok(elev_m), Ok(agl_m), Ok(gs_ms), Ok(var), Ok(ias), Ok(on_ground)) =
                     (lat_r, lon_r, elev_r, agl_r, gs_r, var_r, ias_r, ground_r)
                 else { tokio::time::sleep(std::time::Duration::from_millis(300)).await; continue };
@@ -1614,6 +1622,7 @@ pub fn run_autoland_scoped(
                             "event": "rollout", "gs": gs_kts, "xtk_m": xtk_m,
                             "xtk_rate": xtk_rate, "err": err, "steer": steer,
                             "trim": roll_law.trim(), "psi": psi, "dt": roll_dt,
+                            "pos": pos_source,
                         }),
                     );
                     let thr_dref = throttle_dref();
@@ -2564,6 +2573,9 @@ pub fn run_autoland_scoped(
                     "ground": on_ground > 0.5,
                     "phase": format!("{:?}", g.phase), "ga": ga, "crab": crab, "crab_raw": crab_raw,
                     "trim": trim, "xtk_m": xtk_now * M_PER_NM,
+                    // "plugin": one frame's position; "split": an older
+                    // plugin's separate reads (#157).
+                    "pos": pos_source,
                     "flare_elev": flare_elev, "flare_ail": flare_ail, "hands": arrest_hands,
                     // The autopilot not yet confirmed and read off: the
                     // elevator above is the level hold's (`ApEngage`).

@@ -176,12 +176,10 @@ enum VacateEnd {
 }
 
 /// The aircraft's position, or `None` on a failed read (no measurement).
+/// One frame's latitude and longitude (#157), else the two stock reads.
 async fn position(xp: &XPlaneClient) -> Option<(f64, f64)> {
-    let (lat, lon) = tokio::join!(
-        xp.get_float(crate::datarefs::LATITUDE),
-        xp.get_float(crate::datarefs::LONGITUDE),
-    );
-    Some((lat.ok()?, lon.ok()?))
+    let (lat, lon, _) = sim::position::read_lat_lon(xp).await.ok()?;
+    Some((lat, lon))
 }
 
 /// Whether a vacate route planned from the rollout still starts where the

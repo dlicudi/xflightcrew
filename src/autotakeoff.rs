@@ -41,8 +41,10 @@ use crate::xplane::XPlaneClient;
 const LAT: &str = "sim/flightmodel/position/latitude";
 const LON: &str = "sim/flightmodel/position/longitude";
 const PSI_TRUE: &str = "sim/flightmodel/position/psi";
+#[cfg(test)]
 const GS_MS: &str = "sim/flightmodel/position/groundspeed";
 const IAS: &str = "sim/flightmodel/position/indicated_airspeed";
+#[cfg(test)]
 const AGL_M: &str = "sim/flightmodel/position/y_agl";
 const MAG_VAR: &str = "sim/flightmodel/position/magnetic_variation";
 const ON_GROUND: &str = "sim/flightmodel/failures/onground_any";
@@ -87,9 +89,6 @@ const PHI: &str = "sim/flightmodel/position/true_phi";
 const PITCH_RATE: &str = "sim/flightmodel/position/Q";
 /// Yaw rate, deg/s, nose right positive: the roll law's damping.
 const YAW_RATE: &str = "sim/flightmodel/position/R";
-/// The flight model's vertical speed, fpm: the climb the pitch is flying
-/// when the autopilot takes it (`ClimbVs`).
-const VS_FPM: &str = "sim/flightmodel/position/vh_ind_fpm";
 
 const M_TO_FT: f64 = 3.280_84;
 const MS_TO_KTS: f64 = 1.943_844;
@@ -1005,7 +1004,10 @@ pub struct CutTick {
 ///   on LEMG's diagonal runway that is up to 2.9 m of cross-track for one
 ///   tick above 120 kt (0.7 at EGKK's east-west one), and each spike is
 ///   metres of target and a flick of rudder. A single-tick spike never
-///   passes a median; a real movement is late by one tick.
+///   passes a median; a real movement is late by one tick. The source is
+///   fixed since (#157: the plugin's `xcopilot/position`, one frame in one
+///   request); the median stays as the defence for an older plugin's split
+///   reads and any other single-tick glitch.
 /// - From [`XTK_GAIN_REF_KTS`] the cut grows to [`ROLL_CUT_FAST_MULT`] times
 ///   the closure-time cut: the heading loop under it now holds the line, and
 ///   a 7 s lateral closure let a yaw gust at 100 kt carry the aircraft 4 m.
@@ -2461,13 +2463,11 @@ async fn stop_on_centreline(xp: &XPlaneClient, rwy: &Runway, law: &mut RollSteer
     let mut prev_xtk: Option<f64> = None;
     let mut rate_filter = XtkRate::default();
     while t0.elapsed().as_secs_f64() < REJECT_STOP_MAX_S {
-        let (lat, lon, psi, gs, yaw_r) = tokio::join!(
-            xp.get_float(LAT),
-            xp.get_float(LON),
-            xp.get_float(PSI_TRUE),
-            xp.get_float(GS_MS),
-            xp.get_float(YAW_RATE)
-        );
+        // One frame's position (#157), as the roll reads it.
+        let (pos, yaw_r) = tokio::join!(sim::position::read(xp), xp.get_float(YAW_RATE));
+        let (lat, lon) = sim::position::lat_lon(&pos);
+        let psi = sim::position::field(&pos, |p| p.psi_true_deg);
+        let gs = sim::position::field(&pos, |p| p.gs_ms);
         let Some([lat, lon, psi, gs]) = crate::control::measurements("autotakeoff", [lat, lon, psi, gs])
         else {
             tokio::time::sleep(std::time::Duration::from_millis(200)).await;
@@ -2500,7 +2500,8 @@ async fn stop_on_centreline(xp: &XPlaneClient, rwy: &Runway, law: &mut RollSteer
         crate::blackbox::record(
             "autotakeoff",
             serde_json::json!({"event": "reject_rollout", "gs": gs_kts, "xtk_m": xtk_m,
-                               "err": err, "steer": steer, "r": yaw_dps}),
+                               "err": err, "steer": steer, "r": yaw_dps,
+                               "pos": sim::position::source_word(&pos)}),
         );
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
     }
@@ -2902,12 +2903,8 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, p: Params) {
         // the sleep rate.
         let thr_dref = throttle_dref();
         let (
-            lat,
-            lon,
-            psi,
-            gs_ms,
+            pos,
             ias,
-            agl_m,
             on_ground,
             steer_yield,
             thr_read,
@@ -2918,14 +2915,14 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, p: Params) {
             roll_yield,
             torque_nm,
             yaw_r,
-            vs_read,
         ) = tokio::join!(
-            xp.get_float(LAT),
-            xp.get_float(LON),
-            xp.get_float(PSI_TRUE),
-            xp.get_float(GS_MS),
+            // Position, heading, groundspeed, height and vertical speed as
+            // ONE frame saw them (#157): read separately, latitude and
+            // longitude paired two frames, up to 2.9 m of cross-track for a
+            // tick on LEMG 13. An older plugin falls back to the separate
+            // reads, and the tick says which (`pos`).
+            sim::position::read(&xp),
             xp.get_float(IAS),
-            xp.get_float(AGL_M),
             xp.get_float(ON_GROUND),
             xp.get_float(STEER_YIELD),
             xp.get_float(&thr_dref),
@@ -2936,8 +2933,15 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, p: Params) {
             xp.get_float(ROLL_YIELD),
             xp.get_float_array(ENGN_TRQ),
             xp.get_float(YAW_RATE),
-            xp.get_float(VS_FPM),
         );
+        let (lat, lon) = sim::position::lat_lon(&pos);
+        let psi = sim::position::field(&pos, |p| p.psi_true_deg);
+        let gs_ms = sim::position::field(&pos, |p| p.gs_ms);
+        let agl_m = sim::position::field(&pos, |p| p.agl_m);
+        // The flight model's vertical speed (`vh_ind_fpm`): the climb the
+        // pitch is flying when the autopilot takes it (`ClimbVs`).
+        let vs_read = sim::position::field(&pos, |p| p.vs_fpm);
+        let pos_source = sim::position::source_word(&pos);
         // A failed read is no measurement: the engage then writes the law.
         let vs_flown = vs_read.ok().filter(|v| v.is_finite());
         let torque_ftlb = torque_nm
@@ -3138,6 +3142,10 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, p: Params) {
                     // three reads on the scheduled law), its proportional
                     // cut and the cross-track trim's (see [`RollCut`]).
                     "xtk_used": cut.xtk_m, "cut": cut.cut_deg, "cut_i": cut.cut_i_deg,
+                    // Which read the position came from: "plugin" is one
+                    // frame (xcopilot/position), "split" the separate stock
+                    // reads of an older plugin (#157).
+                    "pos": pos_source,
                     // The sim's yaw rate the scheduled law damps on (null on a
                     // failed read), and whether it flew (the 737's
                     // `roll_rudder:`). Until 2026-09-28 `r` carried the
@@ -7192,5 +7200,202 @@ mod tests {
         }
         assert!(p > 0.05, "prop leads right: {p}");
         assert!(j.abs() < 1e-9, "jet leads nothing: {j}");
+    }
+
+    /// A sim whose frames run on while the Web API answers: every request is
+    /// served `frames_per_request` frames after the one before it, as the
+    /// API serves each request from whichever flight-loop frame it lands in.
+    /// The aircraft flies `truth` (time s, along m, cross-track m right of
+    /// `course`) from `thr`. `plugin` is a plugin that publishes
+    /// `xcopilot/position`, copied in the frame its request lands in.
+    struct FrameSim {
+        thr: (f64, f64),
+        course: f64,
+        truth: Vec<(f64, f64, f64)>,
+        t0: std::sync::Mutex<f64>,
+        frame: std::sync::atomic::AtomicU64,
+        frames_per_request: u64,
+        plugin: bool,
+    }
+
+    const SIM_FPS: f64 = 30.0;
+
+    impl FrameSim {
+        /// The aircraft at time `t`: (lat, lon), groundspeed m/s.
+        fn at(&self, t: f64) -> ((f64, f64), f64) {
+            let k = self
+                .truth
+                .windows(2)
+                .position(|w| t < w[1].0)
+                .unwrap_or(self.truth.len() - 2);
+            let (a, b) = (self.truth[k], self.truth[k + 1]);
+            let f = ((t - a.0) / (b.0 - a.0)).clamp(0.0, 1.5);
+            let along = a.1 + f * (b.1 - a.1);
+            let xtk = a.2 + f * (b.2 - a.2);
+            let gs = (b.1 - a.1) / (b.0 - a.0);
+            let on_line = project_latlon(self.thr.0, self.thr.1, self.course, along / M_PER_NM);
+            let right = (self.course + 90.0).rem_euclid(360.0);
+            (project_latlon(on_line.0, on_line.1, right, xtk / M_PER_NM), gs)
+        }
+        /// The time the next request is served at.
+        fn next_t(&self) -> f64 {
+            let f = self
+                .frame
+                .fetch_add(self.frames_per_request, std::sync::atomic::Ordering::SeqCst);
+            *self.t0.lock().unwrap() + f as f64 / SIM_FPS
+        }
+        /// Start a tick's reads at `t`.
+        fn tick_at(&self, t: f64) {
+            *self.t0.lock().unwrap() = t;
+            self.frame.store(0, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::xplane::XPlane for FrameSim {
+        async fn get_float(&self, name: &str) -> anyhow::Result<f64> {
+            let ((lat, lon), gs) = self.at(self.next_t());
+            Ok(match name {
+                LAT => lat,
+                LON => lon,
+                PSI_TRUE => self.course,
+                GS_MS => gs,
+                _ => 0.0,
+            })
+        }
+        async fn get_bytes(&self, name: &str) -> anyhow::Result<Vec<u8>> {
+            anyhow::ensure!(
+                self.plugin && name == sim::position::POSITION,
+                "dataref not found: {name}"
+            );
+            let t = self.next_t();
+            let ((lat, lon), gs) = self.at(t);
+            Ok(sim::position::encode(&sim::position::Position {
+                lat,
+                lon,
+                elev_m: 0.0,
+                psi_true_deg: self.course,
+                gs_ms: gs,
+                vs_fpm: 0.0,
+                agl_m: 0.0,
+                frame: Some((t * SIM_FPS).round() as u64),
+                sim_time_s: Some(t),
+                source: sim::position::Source::Plugin,
+            }))
+        }
+        async fn set_float(&self, _: &str, _: f64) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn set_int(&self, _: &str, _: i64) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn run_command(&self, _: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn run_command_for(&self, _: &str, _: f64) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn get_float_array(&self, _: &str) -> anyhow::Result<Vec<f64>> {
+            Ok(vec![])
+        }
+        async fn set_int_array_elem(&self, _: &str, _: usize, _: i64) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn set_float_array_elem(&self, _: &str, _: usize, _: f64) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// #157: latitude and longitude read as two requests pair two frames. The
+    /// LEMG 13 roll of 1790591256 (every `roll` tick, its groundspeed and
+    /// cross-track as the truth, on 13's diagonal) is flown through a sim
+    /// that serves each request two frames after the last (30 fps), and each
+    /// tick is read the way the roll reads it. Split, the cross-track the law
+    /// is handed is off the aircraft's own by up to 3.0 m above 120 kt (the
+    /// 2.9 m flown), a different error every tick; from the plugin's
+    /// one-frame snapshot it is the aircraft's own, every tick. On EGKK 08R's
+    /// east-west strip the same lag is under half of it.
+    #[tokio::test]
+    async fn one_frames_position_never_pairs_two_frames() {
+        async fn worst(
+            ticks: &[serde_json::Value],
+            course: f64,
+            plugin: bool,
+        ) -> (f64, sim::position::Source) {
+            // Along-track from the logged groundspeed, the logged
+            // cross-track as the aircraft's.
+            let mut truth = Vec::new();
+            let (mut along, mut last_t) = (0.0, None::<f64>);
+            for r in ticks {
+                let t = r["t"].as_f64().unwrap();
+                let gs_ms = r["gs"].as_f64().unwrap() / MS_TO_KTS;
+                if let Some(t0) = last_t {
+                    along += gs_ms * (t - t0);
+                }
+                last_t = Some(t);
+                truth.push((t, along, r["xtk_m"].as_f64().unwrap()));
+            }
+            let sim = FrameSim {
+                thr: (36.6893, -4.5147),
+                course,
+                truth: truth.clone(),
+                t0: std::sync::Mutex::new(0.0),
+                frame: std::sync::atomic::AtomicU64::new(0),
+                frames_per_request: 2,
+                plugin,
+            };
+            let rwy = Runway {
+                icao: "TEST".into(),
+                id: "13".into(),
+                thr_lat: sim.thr.0,
+                thr_lon: sim.thr.1,
+                course_deg: course,
+                length_m: 3200.0,
+                surface: 1,
+                dist_nm: 0.0,
+                elev_ft: 0.0,
+            };
+            let (mut worst, mut source) = (0.0_f64, sim::position::Source::Split);
+            for (r, (t, _, _)) in ticks.iter().zip(&truth) {
+                if r["gs"].as_f64().unwrap() < 120.0 {
+                    continue;
+                }
+                sim.tick_at(*t);
+                let pos = sim::position::read(&sim).await.unwrap();
+                source = pos.source;
+                let read_m = cross_track_nm(pos.lat, pos.lon, &rwy) * M_PER_NM;
+                // The aircraft's own cross-track in the frame the reading
+                // began in.
+                let ((lat, lon), _) = sim.at(*t);
+                let own_m = cross_track_nm(lat, lon, &rwy) * M_PER_NM;
+                worst = worst.max((read_m - own_m).abs());
+            }
+            (worst, source)
+        }
+        let rolls = rolls_0928();
+        let (_, lemg) = rolls
+            .iter()
+            .find(|(id, _)| id.starts_with("1790591256"))
+            .expect("the LEMG 13 roll");
+        // LEMG 13 true course by the rolls' heading on the line.
+        let (split, src) = worst(lemg, 132.2, false).await;
+        assert_eq!(src, sim::position::Source::Split);
+        assert!(
+            split > 1.5,
+            "split reads should pair two frames on the diagonal: {split:.2} m"
+        );
+        let (snap, src) = worst(lemg, 132.2, true).await;
+        assert_eq!(src, sim::position::Source::Plugin);
+        assert!(
+            snap < 0.005,
+            "one frame's position is the aircraft's: {snap:.4} m"
+        );
+        // The same lag on EGKK 08R's course: under half the diagonal's
+        // (1.2 m against 3.0 here).
+        let (east_west, _) = worst(lemg, 77.6, false).await;
+        assert!(
+            east_west < 0.5 * split,
+            "{east_west:.2} m east-west vs {split:.2} diagonal"
+        );
     }
 }
