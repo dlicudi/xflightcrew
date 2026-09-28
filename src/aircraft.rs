@@ -3452,6 +3452,16 @@ mod tests {
                 "DRAG_KEEP_BELOW_FPM",
                 "a gate on the COMMANDED rate: only a commanded climb stows a brake already out",
             ),
+            (
+                "circuit",
+                "GO_AROUND_PLACARD_MARGIN_KTS",
+                "MARGIN: under the airframe's own flap placard, cleaning up a go-around",
+            ),
+            (
+                "circuit",
+                "GO_AROUND_RETRACT_MARGIN_KTS",
+                "MARGIN: over the airframe's own flap retraction speed",
+            ),
         ];
 
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");

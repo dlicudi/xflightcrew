@@ -354,7 +354,7 @@ pub fn publish_gear_warning(w: Option<crate::aircraft::GearWarning>) {
     *GEAR_WARNING.lock().unwrap_or_else(|e| e.into_inner()) = w;
 }
 
-fn gear_warning() -> Option<crate::aircraft::GearWarning> {
+pub(crate) fn gear_warning() -> Option<crate::aircraft::GearWarning> {
     *GEAR_WARNING.lock().unwrap_or_else(|e| e.into_inner())
 }
 

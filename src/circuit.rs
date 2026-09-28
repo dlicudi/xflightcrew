@@ -567,6 +567,99 @@ pub fn final_leg_kts(approach_ias: f64, config_floor: Option<f64>) -> f64 {
     crate::aircraft::floored_target(approach_ias, config_floor)
 }
 
+/// The flap a go-around selects at once: the go-around's half (autoland's
+/// own), never more than is already out.
+pub const GO_AROUND_FLAP_RATIO: f64 = 0.5;
+/// While cleaning up, the speed stays this far under the placard of the flap
+/// that is out.
+const GO_AROUND_PLACARD_MARGIN_KTS: f64 = 10.0;
+/// ...and reaches this far past the next retraction speed, so the step is
+/// taken rather than hovered at.
+const GO_AROUND_RETRACT_MARGIN_KTS: f64 = 5.0;
+
+/// Whether the circuit flies a tower's go-around order on this leg: the
+/// approach legs, the only ones a landing clearance stands on. The order
+/// outranks everything there; elsewhere there is nothing to go around from,
+/// and it is logged, not flown. Pure.
+pub fn flies_go_around_order(leg: Leg) -> bool {
+    matches!(leg, Leg::Base | Leg::Final)
+}
+
+/// The flap the go-around selects at the order: the deepest of the
+/// airframe's detents (`limits`, as [`crate::aircraft::flap_limits`]) at or
+/// under the go-around's half, never more than `current` (a base at flaps 5
+/// keeps 5). A real detent: the MD-82 has none at half travel, and its 15
+/// (0.375) is the go-around flap there. No detents: the ratio itself. Pure.
+pub fn go_around_flap(current: Option<f64>, limits: &[(f64, Option<f64>)]) -> f64 {
+    let want = current.unwrap_or(0.0).clamp(0.0, GO_AROUND_FLAP_RATIO);
+    if limits.is_empty() {
+        return want;
+    }
+    limits
+        .iter()
+        .map(|(ratio, _)| *ratio)
+        .filter(|ratio| *ratio <= want + 1e-6)
+        .fold(0.0, f64::max)
+}
+
+/// The next flap step while a go-around cleans up: the airframe's retraction
+/// schedule, one detent at a time and paced on the flaps arriving
+/// ([`autotakeoff::paced_flap_step`]); with no schedule, up in one step once
+/// the speed is at `clean_ok_kts`. `None` when clean or not yet. Pure.
+pub fn go_around_flap_step(
+    schedule: &[(f64, f64)],
+    commanded: f64,
+    deployed: Option<f64>,
+    ias: f64,
+    clean_ok_kts: f64,
+) -> Option<f64> {
+    if commanded <= 1e-6 {
+        return None;
+    }
+    if schedule.is_empty() {
+        return (ias >= clean_ok_kts).then_some(0.0);
+    }
+    autotakeoff::paced_flap_step(schedule, commanded, deployed, ias)
+}
+
+/// The speed a go-around cleaning up flies with `flap` out: the pattern
+/// speed, raised past the next retraction speed so the step comes, held
+/// under the placard of what is out, never under `floor_kts` (the floor for
+/// that configuration). Clean, it is the pattern speed. Flying the pattern
+/// speed at once would put the 737's go-around flaps 10 (Vfe 210) at 210.
+/// Pure.
+pub fn go_around_speed_kts(
+    pattern_kts: f64,
+    flap: f64,
+    schedule: &[(f64, f64)],
+    limits: &[(f64, Option<f64>)],
+    floor_kts: Option<f64>,
+) -> f64 {
+    if flap <= 1e-6 {
+        return pattern_kts;
+    }
+    let next_retract = schedule
+        .iter()
+        .filter(|(ratio, _)| *ratio < flap - 1e-6)
+        .max_by(|a, b| a.0.total_cmp(&b.0))
+        .map(|(_, kts)| *kts);
+    let placard = limits
+        .iter()
+        .filter(|(ratio, _)| *ratio <= flap + 1e-6)
+        .filter_map(|(_, vfe)| *vfe)
+        .fold(f64::INFINITY, f64::min);
+    let cap = placard - GO_AROUND_PLACARD_MARGIN_KTS;
+    let target = match next_retract {
+        // The two margins squeeze: the A330's CONF 1 retracts at 210 under
+        // a 215 placard. Fly the middle of the gap.
+        Some(r) if r + GO_AROUND_RETRACT_MARGIN_KTS > cap && placard > r => (r + placard) / 2.0,
+        _ => pattern_kts
+            .max(next_retract.map_or(0.0, |r| r + GO_AROUND_RETRACT_MARGIN_KTS))
+            .min(cap),
+    };
+    target.max(floor_kts.unwrap_or(0.0))
+}
+
 /// How far ahead the climb limiter judges the airspeed, seconds. Long enough
 /// to lead the airframe's own response, short enough not to invent a speed:
 /// the same order as the altitude capture's lead.
@@ -2082,6 +2175,8 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, p: Params
     // Read before the move: `p.takeoff` goes into the takeoff loop below, and
     // the base leg needs to know whether this airframe HAS gear to lower.
     let retractable_gear = p.takeoff.retract_gear;
+    // ...and the retraction schedule, for a go-around the tower orders.
+    let flap_schedule = p.takeoff.flap_schedule.clone();
     // Where the airframe declares it, the pattern altitude goes on the
     // altitude dial before the roll and the autopilot's own capture holds it
     // (see `ap_holds_level`). Otherwise the takeoff only lifts a dial the
@@ -2294,6 +2389,17 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, p: Params
     // Set when the base turn onto final may BEGIN. The handover waits for the
     // geometry to become flyable, not merely for the leg to change.
     let mut turning_final = false;
+    // The tower's go-around orders, watched from the pattern on: a landing
+    // clearance only stands on the approach legs, and there the order
+    // outranks everything (see `flies_go_around_order`).
+    let mut orders = crate::party_line::GoAroundOrders::arm();
+    // An order seen while handing over, flown on the next tick.
+    let mut order_owed = false;
+    // A go-around cleaning up: the flap it has commanded, until clean.
+    let mut cleaning_up: Option<f64> = None;
+    // The gear the go-around still owes raising.
+    let mut gear_up_owed = false;
+    let mut go_arounds: u32 = 0;
 
     loop {
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
@@ -2339,6 +2445,60 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, p: Params
         let a_m = -along_track_nm(lat, lon, &rwy) * M_PER_NM;
         let x_m = cross_track_nm(lat, lon, &rwy) * M_PER_NM;
 
+        // --- The tower's go-around order, before anything else: a landing
+        // clearance voided while the circuit flies its own final is flown
+        // HERE, not left to autoland (which arms at 2 nm and only watches
+        // from then on). LEMG 31 (sortie 1790584715-full_auto, 2026-09-28):
+        // the order came at 736 ft, 5.7 km out, and the circuit flew on,
+        // handed over at 2 nm and landed "without clearance".
+        if std::mem::take(&mut order_owed) | orders.take() {
+            let ias_now = ias_r.as_ref().ok().copied();
+            if flies_go_around_order(leg) {
+                go_arounds += 1;
+                let limits = crate::aircraft::flap_limits();
+                let flap = go_around_flap(last_flap, &limits);
+                let (thr_ok, flap_ok) = tokio::join!(xp.set_float(&thr_dref, 1.0), async {
+                    if limits.is_empty() || last_flap.is_none_or(|f| f <= flap + 1e-6) {
+                        None
+                    } else {
+                        Some(xp.set_float(FLAP_RATIO, flap).await.is_ok())
+                    }
+                },);
+                crate::blackbox::record(
+                    "circuit",
+                    serde_json::json!({
+                        "event": "ordered_go_around", "leg": format!("{leg:?}"),
+                        "agl_ft": agl_ft, "a_m": a_m, "x_m": x_m, "ias": ias_now,
+                        "flap_was": last_flap, "flap": flap, "flap_ok": flap_ok,
+                        "thr_ok": thr_ok.is_ok(), "n": go_arounds,
+                    }),
+                );
+                if !limits.is_empty() {
+                    last_flap = Some(flap);
+                }
+                cleaning_up = (!limits.is_empty() && flap > 1e-6).then_some(flap);
+                gear_up_owed = retractable_gear && gear_lowered;
+                leg = Leg::Upwind;
+                turning_final = false;
+                descent_target = None;
+                last_vs_cmd = None;
+                alert(
+                    &voice,
+                    Priority::Warning,
+                    "Going around. Tower's instruction.",
+                );
+                // The tower voided the clearance; it is owed the call, and the
+                // downwind report it asked for comes round with the pattern.
+                transmit(radio_call(&callsign, "going around"));
+            } else {
+                crate::blackbox::record(
+                    "circuit",
+                    serde_json::json!({"event": "go_around_order_ignored",
+                                       "leg": format!("{leg:?}"), "agl_ft": agl_ft}),
+                );
+            }
+        }
+
         // --- Hand over only once our own turn onto final has rolled out. ---
         // `turning_final` means the turn may BEGIN; the aircraft is still up
         // to 1.3 radii abeam at that instant, pointing across the centreline.
@@ -2374,6 +2534,12 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, p: Params
             {
                 ACTIVE.store(false, Ordering::SeqCst);
                 return;
+            }
+            // The arrival lookup takes a while off the reactor: an order
+            // given meanwhile is still this leg's, never autoland's to miss.
+            if orders.take() {
+                order_owed = true;
+                continue;
             }
             crate::blackbox::record(
                 "circuit",
@@ -2678,6 +2844,9 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, p: Params
             // (`flap_within_limits`, autoland's own law). Airframes with no
             // flap profile are left alone.
             if matches!(leg, Leg::Base | Leg::Final) {
+                // A go-around's clean-up not finished by base: base owns the
+                // flaps from here.
+                cleaning_up = None;
                 let limits = crate::aircraft::flap_limits();
                 if !limits.is_empty() {
                     let wanted = if matches!(leg, Leg::Final) {
@@ -2696,16 +2865,86 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, p: Params
                     }
                 }
             }
+            // A go-around cleans up on the airframe's retraction schedule,
+            // one detent at a time, paced on the flaps arriving.
+            if let Some(cmd) = cleaning_up {
+                let clean_ok = crate::aircraft::config_floor_kts(0.0).unwrap_or(pattern_kts * 0.9);
+                let due = if flap_schedule.is_empty() {
+                    go_around_flap_step(&flap_schedule, cmd, None, ias, clean_ok)
+                } else {
+                    autotakeoff::flap_retract_step(&flap_schedule, cmd, ias)
+                };
+                if due.is_some() {
+                    // Read only while a step is due; a failed read is no
+                    // measurement, and no step is taken on it.
+                    let deployed = xp.get_float(crate::takeoff_config::FLAP_DEPLOY).await.ok();
+                    if let Some(next) =
+                        go_around_flap_step(&flap_schedule, cmd, deployed, ias, clean_ok)
+                    {
+                        let ok = xp.set_float(FLAP_RATIO, next).await.is_ok();
+                        last_flap = Some(next);
+                        cleaning_up = (next > 1e-6).then_some(next);
+                        let detent = crate::aircraft::live_profile().and_then(|lp| {
+                            crate::aircraft::flap_detent_spoken(lp.flaps.as_ref(), next)
+                        });
+                        crate::blackbox::record(
+                            "circuit",
+                            serde_json::json!({"event": "go_around_flap_step", "to": next,
+                                               "ias": ias, "agl_ft": agl_ft, "deployed": deployed,
+                                               "ok": ok}),
+                        );
+                        alert(
+                            &voice,
+                            Priority::Advisory,
+                            &autotakeoff::flap_step_line(next, detent.as_deref()),
+                        );
+                    }
+                }
+            }
+            // The go-around's gear, once climbing and clear of its own
+            // warning (the takeoff's rule). The downwind lowers it again.
+            if gear_up_owed
+                && vs_est > 0.0
+                && autotakeoff::gear_up_due(
+                    agl_ft,
+                    ias,
+                    last_flap.unwrap_or(0.0),
+                    autotakeoff::gear_warning(),
+                    crate::aircraft::gear_limit_kts(),
+                )
+            {
+                gear_up_owed = false;
+                let ok = xp.set_float(GEAR_HANDLE, 0.0).await.is_ok();
+                if ok {
+                    gear_lowered = false;
+                }
+                crate::blackbox::record(
+                    "circuit",
+                    serde_json::json!({"event": "go_around_gear_up", "ias": ias,
+                                       "agl_ft": agl_ft, "ok": ok}),
+                );
+                alert(&voice, Priority::Advisory, "Gear up.");
+            }
             // Base flies the approach-setup speed, final the approach speed
             // floored by the flaps actually out; the rest of the pattern
-            // flies Vy (which is also what the geometry was sized on).
+            // flies Vy (which is also what the geometry was sized on), and a
+            // go-around cleaning up flies inside the placard of what is out.
             let want_kts = match leg {
                 Leg::Final => final_leg_kts(
                     p_approach_ias,
                     crate::aircraft::config_floor_kts(last_flap.unwrap_or(0.0)),
                 ),
                 Leg::Base => approach_kts,
-                _ => pattern_kts,
+                _ => match cleaning_up {
+                    Some(flap) => go_around_speed_kts(
+                        pattern_kts,
+                        flap,
+                        &flap_schedule,
+                        &crate::aircraft::flap_limits(),
+                        crate::aircraft::config_floor_kts(flap),
+                    ),
+                    None => pattern_kts,
+                },
             };
             let delta = crate::tools::speedhold::throttle_adjust(want_kts - ias, ias_trend);
             if delta != 0.0 {
@@ -4288,7 +4527,7 @@ mod tests {
 
 #[cfg(test)]
 mod final_leg_kts_tests {
-    use super::final_leg_kts;
+    use super::*;
 
     /// The 737's Vref 145 stands with flaps 40 out (floor 137) and is raised
     /// to 156 while the flaps are still at 5; a 172 (floor 58 under a 65 kt
@@ -4299,5 +4538,136 @@ mod final_leg_kts_tests {
         assert_eq!(final_leg_kts(145.0, Some(156.0)), 156.0);
         assert_eq!(final_leg_kts(65.0, Some(58.0)), 65.0);
         assert_eq!(final_leg_kts(65.0, None), 65.0);
+    }
+
+    fn limits_of(f: Option<&crate::aircraft::FlapProfile>) -> Vec<(f64, Option<f64>)> {
+        f.map(|f| f.detents.iter().map(|d| (d.ratio, d.vfe_kts)).collect())
+            .unwrap_or_default()
+    }
+
+    /// LEMG 31 (sortie 1790584715-full_auto, 2026-09-28): the tower's order
+    /// came on the circuit's Final at 736 ft AGL, 5,654 m out, 136.6 kt,
+    /// flaps commanded full since 1790585512.0. The circuit flew on and
+    /// landed. The order is the circuit's to fly on the approach legs.
+    #[test]
+    fn the_circuit_flies_a_go_around_order_on_its_approach_legs() {
+        assert!(flies_go_around_order(Leg::Final), "the recorded leg");
+        assert!(flies_go_around_order(Leg::Base));
+        for leg in [Leg::Upwind, Leg::Crosswind, Leg::Downwind] {
+            assert!(!flies_go_around_order(leg), "{leg:?}: no clearance to void");
+        }
+        // The go-around's half from full flap; a base at flaps 5 keeps 5.
+        assert_eq!(go_around_flap(Some(1.0), &[]), GO_AROUND_FLAP_RATIO);
+        assert_eq!(go_around_flap(Some(0.375), &[]), 0.375);
+        assert_eq!(go_around_flap(None, &[]), 0.0);
+        // A real detent: the MD-82's 15, where it has none at half travel.
+        let md82 = crate::aircraft::load("md82").expect("the MD-82 profile");
+        assert_eq!(
+            go_around_flap(Some(1.0), &limits_of(md82.flaps.as_ref())),
+            0.375
+        );
+    }
+
+    /// The recorded go-around, cleaned up on the 737's own profile: flaps 10
+    /// at the order, flown at 200 kt (Vfe 210 less the margin, past flaps
+    /// one's 190), flaps one only once 10 has ARRIVED, then 215 kt (past the
+    /// clean-up's 210) and up, then the pattern speed. The recorded 136.6 kt
+    /// at the order takes no step.
+    #[test]
+    fn the_lemg_go_around_cleans_up_on_the_737s_schedule() {
+        let p = crate::aircraft::load("boeing_737_800").expect("the 737 profile");
+        let sched = crate::aircraft::flap_schedule(p.flaps.as_ref());
+        let limits = limits_of(p.flaps.as_ref());
+        let pattern = 210.0;
+        let flap = go_around_flap(Some(1.0), &limits);
+        assert_eq!(flap, 0.5);
+        assert_eq!(
+            go_around_flap_step(&sched, flap, Some(0.5), 136.6, 0.0),
+            None
+        );
+        assert_eq!(
+            go_around_speed_kts(pattern, flap, &sched, &limits, None),
+            200.0
+        );
+        // Still travelling from 40: no step on the speed alone.
+        assert_eq!(
+            go_around_flap_step(&sched, flap, Some(0.8), 200.0, 0.0),
+            None
+        );
+        assert_eq!(
+            go_around_flap_step(&sched, flap, None, 200.0, 0.0),
+            None,
+            "no read, no step"
+        );
+        assert_eq!(
+            go_around_flap_step(&sched, flap, Some(0.5), 200.0, 0.0),
+            Some(0.125)
+        );
+        assert_eq!(
+            go_around_speed_kts(pattern, 0.125, &sched, &limits, None),
+            215.0
+        );
+        assert_eq!(
+            go_around_flap_step(&sched, 0.125, Some(0.125), 205.0, 0.0),
+            None
+        );
+        assert_eq!(
+            go_around_flap_step(&sched, 0.125, Some(0.125), 215.0, 0.0),
+            Some(0.0)
+        );
+        assert_eq!(
+            go_around_speed_kts(pattern, 0.0, &sched, &limits, None),
+            pattern
+        );
+        assert_eq!(
+            go_around_flap_step(&sched, 0.0, Some(0.0), 250.0, 0.0),
+            None
+        );
+        // A floor for the configuration is never flown under.
+        assert_eq!(
+            go_around_speed_kts(pattern, 0.5, &sched, &limits, Some(205.0)),
+            205.0
+        );
+    }
+
+    /// No airframe's go-around hovers with its flaps out: at every stage of
+    /// the clean-up the speed it flies is inside the placard of what is out
+    /// AND takes the next step, from the go-around's half to clean.
+    #[test]
+    fn every_profile_cleans_up_a_go_around_inside_its_placards() {
+        let mut checked = 0;
+        for entry in std::fs::read_dir("profiles").expect("profiles dir") {
+            let path = entry.unwrap().path();
+            if path.extension().and_then(|e| e.to_str()) != Some("yaml") {
+                continue;
+            }
+            let id = path.file_stem().unwrap().to_str().unwrap().to_string();
+            let Some(p) = crate::aircraft::load(&id) else {
+                continue;
+            };
+            let limits = limits_of(p.flaps.as_ref());
+            let sched = crate::aircraft::flap_schedule(p.flaps.as_ref());
+            if limits.is_empty() || sched.is_empty() {
+                continue;
+            }
+            // The worst case: a pattern speed that asks for nothing.
+            let mut flap = go_around_flap(Some(1.0), &limits);
+            let mut steps = 0;
+            while flap > 1e-6 {
+                let kts = go_around_speed_kts(0.0, flap, &sched, &limits, None);
+                let placard = crate::autoland::flap_within_limits(flap, kts, &limits);
+                assert!(
+                    placard + 1e-6 >= flap,
+                    "{id}: {kts} kt is over flap {flap}'s placard"
+                );
+                let next = go_around_flap_step(&sched, flap, Some(flap), kts, 0.0);
+                assert!(next.is_some(), "{id}: hovers at flap {flap}, {kts} kt");
+                flap = next.unwrap();
+                steps += 1;
+                assert!(steps <= 10, "{id}: never cleans up");
+            }
+            checked += 1;
+        }
+        assert!(checked >= 3, "only {checked} profiles with a schedule");
     }
 }
