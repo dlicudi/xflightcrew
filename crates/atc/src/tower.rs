@@ -3452,6 +3452,15 @@ mod tests {
             Intent::ReportFinal
         );
         assert_eq!(parse_intent("localizer established"), Intent::ReportFinal);
+        // The crew's question on an uncleared final (autoland's
+        // `UnclearedWatch`, #155) is a final report, judged afresh against
+        // the strip, never a landing request that answers "join final".
+        assert_eq!(
+            parse_intent(
+                "whiskey alpha tango six two six, final runway one five, request landing clearance"
+            ),
+            Intent::ReportFinal
+        );
         // But a cockpit question about it stays crew talk.
         assert_eq!(
             parse_intent("how do I know when we're established"),

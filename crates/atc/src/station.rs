@@ -2695,6 +2695,13 @@ struct ComplianceState {
     /// lined-up aircraft awaiting its clearance, never an incursion, for as
     /// long as it stays on that strip (EGKK 26L, 2026-09-27).
     runway_start: Option<String>,
+    /// The strip (its `ident_a`) the aircraft LANDED on, cleared or not,
+    /// for as long as it stays on it: the rollout and the vacate are the only
+    /// way off, never an incursion (EGKK-EGBB 15, sortie
+    /// 1790601822-full_auto, 2026-09-28: landed uncleared, then "exit the
+    /// runway" four times and "you are on runway one five without clearance"
+    /// during the vacate the tower had just ordered with "taxi to parking").
+    landed_strip: Option<String>,
 }
 
 impl ComplianceState {
@@ -2709,6 +2716,7 @@ impl ComplianceState {
         off_route_last: None,
         prev_strip: None,
         runway_start: None,
+        landed_strip: None,
     };
 }
 
@@ -2802,6 +2810,15 @@ pub fn compliance_tick_facing(
     if here.is_some() && here != w.prev_strip && gs_kts < RUNWAY_START_MAX_KTS {
         w.runway_start = here.clone();
     }
+    // A landing's strip is ours until we leave it (see `landed_strip`).
+    if !on_ground {
+        w.landed_strip = None;
+    } else if prev_ground == Some(false) && airborne_secs >= MIN_FLIGHT_SECS {
+        w.landed_strip = here.clone();
+    } else if w.landed_strip.is_some() && here != w.landed_strip {
+        w.landed_strip = None;
+    }
+    let landed_here = here.is_some() && w.landed_strip == here;
     w.prev_strip = here;
     let runway_start = w.runway_start.is_some();
     if clr
@@ -2973,6 +2990,7 @@ pub fn compliance_tick_facing(
             && !vacating
             && !quiet
             && !runway_start
+            && !landed_here
             && !matches!(
                 state,
                 // LinedUp is the tower's OWN instruction to be on the runway.
@@ -4340,9 +4358,11 @@ fn strip_under(lat: f64, lon: f64) -> Option<String> {
 /// shouts: a standing takeoff clearance or line-up; a landing clearance on
 /// THIS strip not yet reported vacated (the rollout and the vacate, EGKK 26L
 /// 2026-09-27: "exit the runway immediately" from 20 s after touchdown to
-/// the vacate, eight times); a runway start; a crossing on the cleared route
-/// that keeps moving. Anything else on a strip with traffic on final is the
-/// incursion it is.
+/// the vacate, eight times); a runway start; the strip we LANDED on, cleared
+/// or not, until we leave it (EGKK-EGBB 15, 2026-09-28: four "exit the
+/// runway" during the vacate of an uncleared landing); a crossing on the
+/// cleared route that keeps moving. Anything else on a strip with traffic on
+/// final is the incursion it is.
 pub(crate) fn runway_occupancy_authorised(lat: f64, lon: f64, gs_kts: f64) -> bool {
     let Some(here) = strip_under(lat, lon) else {
         return false;
@@ -4366,13 +4386,16 @@ pub(crate) fn runway_occupancy_authorised(lat: f64, lon: f64, gs_kts: f64) -> bo
             }
         }
     }
-    let started_here = COMPLIANCE
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .runway_start
-        .as_deref()
-        == Some(here.as_str());
-    if started_here {
+    let (started_here, landed_here) = {
+        let w = COMPLIANCE.lock().unwrap_or_else(|e| e.into_inner());
+        (
+            w.runway_start.as_deref() == Some(here.as_str()),
+            w.landed_strip.as_deref() == Some(here.as_str()),
+        )
+    };
+    // A runway start, or the strip we landed on and have not yet left
+    // (cleared or not: an aircraft vacating is not an incursion).
+    if started_here || landed_here {
         return true;
     }
     let arrival_taxi = *TAXI_TO_STAND.lock().unwrap_or_else(|e| e.into_inner());
@@ -8854,6 +8877,90 @@ mod tests {
         *TAXI_TO_STAND.lock().unwrap() = false;
         *TAXI_ROUTE.lock().unwrap() = None;
         assert!(!runway_occupancy_authorised(vacate[0].0, vacate[0].1, 8.4));
+
+        *ACTIVE_FIELD.lock().unwrap() = None;
+        *ACTIVE_RUNWAYS.lock().unwrap() = Vec::new();
+        *CLEARANCE.lock().unwrap() = None;
+        *COMPLIANCE.lock().unwrap() = ComplianceState::NEW;
+    }
+
+    /// EGBB 15/33 as apt.dat has it (46 m wide).
+    fn egbb_runways() -> Vec<nav::Runway> {
+        vec![nav::Runway {
+            width_m: 46.02,
+            surface: 1,
+            ident_a: "15".into(),
+            ident_b: "33".into(),
+            lat_a: 52.4656497,
+            lon_a: -1.7611282,
+            lat_b: 52.4428974,
+            lon_b: -1.7358498,
+        }]
+    }
+
+    /// Issue #155, sortie 1790601822-full_auto (EGKK-EGBB, 2026-09-28): an
+    /// autoland with no landing clearance touched down on 15 at +3472.2 and
+    /// the tower said "you landed on runway one five without clearance. Taxi
+    /// to parking". The incursion watch then said "exit the runway" at
+    /// +3491.5, +3507.8, +3529.4 and +3544.8 naming runway 33 (the nearer end,
+    /// past midfield) and the compliance watch "you are on runway one five
+    /// without clearance" at +3532.6, all through the vacate the tower had
+    /// just ordered. The strip we landed on is ours until we leave it; off it
+    /// and back on, it is an incursion again. The end named is the one we
+    /// point down.
+    #[test]
+    fn an_uncleared_landing_still_vacates_its_own_runway() {
+        let _guard = SIDE_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        *ACTIVE_FIELD.lock().unwrap() = Some(("Birmingham".into(), 52.4539, -1.7480));
+        *ACTIVE_RUNWAYS.lock().unwrap() = egbb_runways();
+        *TAXI_TO_STAND.lock().unwrap() = false;
+        *TAXI_ROUTE.lock().unwrap() = None;
+        *COMPLIANCE.lock().unwrap() = ComplianceState::NEW;
+        // The book at the touchdown: Inbound (held, never released).
+        *CLEARANCE.lock().unwrap() = Some(ClearanceSnap {
+            state: tower::State::Inbound,
+            callsign: "Whiskey Alpha Tango six two six".into(),
+            runway_ident: "15".into(),
+            pending_readback: None,
+            holds_runway: false,
+        });
+        let t0 = Instant::now();
+        let at = |s: f64| t0 + std::time::Duration::from_secs_f64(s - 3400.0);
+        // The recorded final, airborne since well before.
+        for s in [3400.0, 3440.0, 3470.9] {
+            assert!(compliance_tick_facing(52.4596, -1.7544, 330.0, false, 136.0, true, at(s), Some(144.5))
+                .is_none());
+        }
+        // The touchdown tick: the uncleared landing is called, on 15.
+        let call = compliance_tick_facing(52.45892702734815, -1.753640601511448, 312.8, true, 133.1, true,
+            at(3472.3), Some(145.3))
+            .expect("the uncleared landing");
+        assert!(call.line.contains("landed on runway one five without clearance"), "{}", call.line);
+        // The recorded rollout and vacate down the strip (state records).
+        let rollout = [
+            (3491.7, 52.45386543479656, -1.748043000849525, 12.1, 145.9),
+            (3508.0, 52.45329194494851, -1.7474048138516027, 11.0, 145.4),
+            (3520.8, 52.45279749067367, -1.7468509083893378, 8.5, 145.3),
+            (3527.8, 52.45259466624598, -1.7466236640010893, 7.0, 145.4),
+            (3534.4, 52.452416156695165, -1.74651448352706, 5.5, 177.6),
+            (3541.5, 52.45225506252149, -1.746556227323538, 3.8, 194.1),
+        ];
+        for &(s, lat, lon, gs, hdg) in &rollout {
+            assert!(on_active_runway(lat, lon).is_some(), "+{s} on the strip");
+            assert!(runway_occupancy_authorised(lat, lon, gs), "+{s}: the incursion watch");
+            let c = compliance_tick_facing(lat, lon, 325.0, true, gs, true, at(s), Some(hdg));
+            assert!(c.is_none(), "+{s}: {}", c.map(|c| c.line).unwrap_or_default());
+        }
+        // Named by the end we point down, never the nearer 33.
+        let (_, lat, lon, _, hdg) = rollout[0];
+        assert_eq!(on_active_runway(lat, lon).as_deref(), Some("33"));
+        assert_eq!(on_active_runway_facing(lat, lon, Some(hdg)).as_deref(), Some("15"));
+        // Off the strip (the recorded taxi-in at +3595.4, 1.3 kt), then back
+        // on: an incursion like any other.
+        let (olat, olon) = (52.45043554899071, -1.7476458779956332);
+        assert!(on_active_runway(olat, olon).is_none(), "off the strip");
+        assert!(compliance_tick_facing(olat, olon, 325.0, true, 1.3, true, at(3595.4), Some(193.2)).is_none());
+        assert!(!runway_occupancy_authorised(rollout[1].1, rollout[1].2, 8.0));
 
         *ACTIVE_FIELD.lock().unwrap() = None;
         *ACTIVE_RUNWAYS.lock().unwrap() = Vec::new();
