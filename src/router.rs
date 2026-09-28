@@ -891,6 +891,7 @@ pub(crate) fn looks_like_command(text: &str) -> bool {
         || t.contains("your airplane")
         // "Put us on a five mile final": no keyword in it at all.
         || crate::grammar::approach_setup_request(&t)
+        || crate::grammar::enroute_setup_request(&t)
     {
         return true;
     }

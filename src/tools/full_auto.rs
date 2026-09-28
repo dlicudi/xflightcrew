@@ -168,6 +168,44 @@ pub(crate) fn resume_join(
     ResumeJoin::Refused(why)
 }
 
+/// The airborne resume's state gates, each naming itself: live, in the
+/// air, a thousand feet above the ground, wings level, at the airframe's
+/// floor. `None`: the aircraft may be resumed. Pure.
+pub(crate) fn resume_gate(
+    frozen: bool,
+    on_ground: bool,
+    agl_ft: f64,
+    bank: f64,
+    ias: f64,
+    speed_floor: f64,
+) -> Option<String> {
+    const NOT_TAKEN: &str = "I haven't taken control.";
+    if frozen {
+        Some(format!("We're paused or in replay. Go back to live and ask again; {NOT_TAKEN}"))
+    } else if on_ground {
+        Some(
+            "We're on the ground. Resume is for the air; say fly the flight plan for the \
+             whole mission."
+                .to_string(),
+        )
+    } else if agl_ft < 1000.0 {
+        Some(format!(
+            "Resume needs a thousand feet; we're {agl_ft:.0} feet above the ground. {NOT_TAKEN}"
+        ))
+    } else if bank.abs() > 20.0 {
+        Some(format!(
+            "Wings level first; we're in {:.0} degrees of bank. Then ask again. {NOT_TAKEN}",
+            bank.abs()
+        ))
+    } else if ias < speed_floor {
+        Some(format!(
+            "We're slow at {ias:.0} knots; resume needs {speed_floor:.0}. {NOT_TAKEN}"
+        ))
+    } else {
+        None
+    }
+}
+
 /// What an airborne resume arms: the route follower, or autoland on the
 /// plan's arrival runway.
 pub(crate) enum ResumeArm {
@@ -383,12 +421,19 @@ impl Tool for FullAuto {
             .get_float(crate::datarefs::ON_GROUND_ANY)
             .await
             .is_ok_and(|g| g > 0.5);
-        let (mission, ack) = if a.resume && on_ground {
+        // "Fly the flight plan" in the air is the checked RESUME of the plan
+        // on the shelf: it used to be refused ("we're already flying, say
+        // navigate"), so a pilot handing over mid-route, and the sortie
+        // runner's enroute setup, had to know the other word (#67). An
+        // unread wheels flag falls to the resume too, whose own gates read
+        // the aircraft again and refuse with the number.
+        let resume = a.resume || (a.flight && !on_ground);
+        let (mission, ack) = if resume && on_ground {
             match self.build_flight_mission(ctx).await {
                 Ok(v) => v,
                 Err(why) => return Ok(why),
             }
-        } else if a.resume {
+        } else if resume {
             match self.build_resume_mission(ctx).await {
                 Ok(ResumeArm::Route(m, ack)) => (m, ack),
                 Ok(ResumeArm::Arrival { dest, rwy, ack }) => {
@@ -433,7 +478,7 @@ impl Tool for FullAuto {
         };
 
         // "Take us to X": X must be where the plan goes, or nothing arms.
-        if let (Some(to), Mission::Flight(r)) = (&a.to, &mission) {
+        if let (Some(to), Mission::Flight(r) | Mission::Resume(r)) = (&a.to, &mission) {
             if !names_destination(to, &a.to_codes, &r.dest_icao, &r.dest_name) {
                 return Ok(format!(
                     "The plan goes to {} ({}), not {to}. Load a plan for {to} first.",
@@ -626,20 +671,7 @@ impl FullAuto {
         let speed_floor =
             crate::aircraft::floored_target(self.approach_ias, crate::aircraft::speed_floor_kts());
         let agl_ft = agl * 3.28084;
-        let gate = if frozen {
-            Some("We're paused or in replay. Go back to live and ask again; I haven't taken control.".to_string())
-        } else if ground > 0.5 {
-            Some("We're on the ground. Resume is for the air; say fly the flight plan for the whole mission.".to_string())
-        } else if agl_ft < 1000.0 {
-            Some(format!("Resume needs a thousand feet; we're {agl_ft:.0} feet above the ground. I haven't taken control."))
-        } else if bank.abs() > 20.0 {
-            Some(format!("Wings level first; we're in {:.0} degrees of bank. Then ask again. I haven't taken control.", bank.abs()))
-        } else if ias < speed_floor {
-            Some(format!("We're slow at {ias:.0} knots; resume needs {speed_floor:.0}. I haven't taken control."))
-        } else {
-            None
-        };
-        if let Some(why) = gate {
+        if let Some(why) = resume_gate(frozen, ground > 0.5, agl_ft, bank, ias, speed_floor) {
             return Err(why);
         }
         let running = engines.as_ref().ok().map(|v| {

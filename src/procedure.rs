@@ -7007,6 +7007,7 @@ mod tests {
                 })
                 .collect(),
             steps: crate::simbrief::parse_step_climbs("EIDW/0340 ERNAN/0360"),
+            tod: None,
         };
         assert_eq!(sched.steps[1], StepClimb { fix: "ERNAN".into(), alt_ft: 36_000.0 });
         let built = enroute_legs(&wps, "EIDW", "BIKF", 34_000.0);

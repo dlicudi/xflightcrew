@@ -308,7 +308,7 @@ pub fn try_parse(
     // "circuit" and must not fall to the circuit rule.
     // A new flight on a final: its hand-fly clause carries "and", and its
     // runway words must never reach the mission grammar.
-    if let Some(c) = approach_setup_call(&t) {
+    if let Some(c) = approach_setup_call(&t).or_else(|| enroute_setup_call(&t)) {
         return valid(&c, registry, profile).then_some(vec![c]);
     }
     if let Some(c) = flight_plan_call(&t) {
@@ -945,6 +945,77 @@ pub fn approach_setup_call(t: &str) -> Option<ToolCall> {
         args.insert("hand_fly".into(), json!(true));
     }
     Some(call("setup_approach", Value::Object(args)))
+}
+
+/// "Put us enroute 30 miles before top of descent", "put us enroute 40
+/// miles before the destination", "put us enroute at WELIN", "put us en
+/// route at the top of descent": a NEW FLIGHT in the air on the loaded plan
+/// (`setup_enroute`), for the sortie runner's arrival cases. CLOSED: a lead
+/// that puts US somewhere, the word enroute, then exactly a fix (one ident
+/// after "at" or "over") or a distance and what it is before.
+pub fn enroute_setup_call(t: &str) -> Option<ToolCall> {
+    const LEADS: &[&str] = &[
+        "put us ", "put me ", "set us up ", "set me up ", "start us ", "start me ",
+        "place us ", "position us ", "reposition us ",
+    ];
+    const MILES: &[&str] = &["mile", "miles", "nm", "mi", "nautical"];
+    let t = t.trim().trim_end_matches(['.', '!', '?']);
+    let lead = LEADS.iter().find(|l| t.starts_with(**l))?;
+    let rest = &t[lead.len()..];
+    let rest = rest.strip_prefix("enroute ").or_else(|| rest.strip_prefix("en route "))?;
+    let words: Vec<&str> = rest
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|w| !w.is_empty())
+        .collect();
+    let tod = |w: &[&str]| {
+        matches!(w, ["top", "of", "descent"] | ["the", "top", "of", "descent"] | ["tod"])
+    };
+    match words.as_slice() {
+        ["at", rest @ ..] if tod(rest) => {
+            return Some(call("setup_enroute", json!({ "at": "before_tod", "nm": 0 })));
+        }
+        ["at" | "over", id]
+            if (2..=7).contains(&id.len())
+                && id.chars().any(|c| c.is_ascii_alphabetic())
+                && !matches!(*id, "the" | "top" | "cruise") =>
+        {
+            let fix = id.to_ascii_uppercase();
+            return Some(call("setup_enroute", json!({ "at": "fix", "fix": fix })));
+        }
+        _ => {}
+    }
+    let m = words.iter().position(|w| MILES.contains(w))?;
+    let numeric =
+        |w: &str| w.parse::<i64>().is_ok() || word_value(w).is_some_and(|(_, mult)| !mult);
+    if m == 0 || m > 3 || !words[..m].iter().all(|w| numeric(w)) {
+        return None;
+    }
+    let nm = number(&words[..m].join(" "))?;
+    let mut tail = &words[m + 1..];
+    if tail.first() == Some(&"miles") {
+        tail = &tail[1..];
+    }
+    let (first, what) = tail.split_first()?;
+    if !matches!(*first, "before" | "from" | "out" | "short" | "to") {
+        return None;
+    }
+    let what = match what {
+        ["of", w @ ..] | ["from", w @ ..] => w,
+        w => w,
+    };
+    let at = if tod(what) {
+        "before_tod"
+    } else if matches!(what, ["destination"] | ["the", "destination"]) {
+        "before_destination"
+    } else {
+        return None;
+    };
+    Some(call("setup_enroute", json!({ "at": at, "nm": nm })))
+}
+
+/// Is this the ask for a new flight in the air ([`enroute_setup_call`])?
+pub fn enroute_setup_request(t: &str) -> bool {
+    enroute_setup_call(&normalize(t)).is_some()
 }
 
 /// Is this the ask for a new flight on a final ([`approach_setup_call`])?

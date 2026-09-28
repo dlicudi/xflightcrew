@@ -30,6 +30,24 @@ cases:
     deadline_min: 300
     after: park
 
+  # The EGKK-EGBB plan's arrival without its departure and cruise: a new
+  # flight IN THE AIR 30 nm (along the route) before the plan's top of
+  # descent, FL180 at the OFP's speed on the BUZAD-WELIN leg, the autopilot
+  # holding it (setup_enroute), then "fly the flight plan" is full auto's
+  # airborne resume. Issues #156 (STAR windows over the cruise), #161 (the
+  # join), #109 (TOD), #126/#104 (descent drag), #67 (the resume). Needs
+  # XCOPILOT_SIMBRIEF_ID with the EGKK-EGBB 737 plan generated. A case may
+  # add sim_speed steps as the gate to gate one does; the runner's guard
+  # alone decides when the sim may have them (never below 5,000 ft AGL, off
+  # the servos or with a landing loop flying). Left at 1x here: the top of
+  # descent is under test.
+  - name: EGKK-EGBB arrival from 30 nm before the top of descent
+    setup:
+      aircraft: "Aircraft/Laminar Research/Boeing 737-800/b738.acf"
+      enroute: { at: before_tod_nm, value: 30 }
+    command: fly the flight plan
+    deadline_min: 45
+
   # A rejected takeoff at 60 kt inside full auto's circuit: the pilot's
   # "reject the takeoff" is auto_takeoff off, the loop flies it to a stop
   # on the centreline and the crew calls "rejecting takeoff" on the radio.

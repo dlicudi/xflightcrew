@@ -889,7 +889,22 @@ pub enum Setup {
         field: String,
         stand: Option<String>,
     },
+    /// A new flight IN THE AIR on the SimBrief plan at the point under test
+    /// (`setup_enroute`, typed as the app's own words and waited for), the
+    /// case's command ("fly the flight plan") then the airborne resume.
+    /// `field` and `runway` are the plan's origin and its runway, where
+    /// another aircraft is loaded first (engines running) before the setup.
+    Enroute {
+        field: String,
+        runway: String,
+        point: EnroutePoint,
+    },
 }
+
+pub use crate::tools::setup_enroute::EnroutePoint;
+
+/// `enroute: {at: ...}`: the points a case may start at.
+pub const ENROUTE_AT: &[&str] = &["fix", "before_tod_nm", "before_destination_nm"];
 
 /// The YAML shape: a map with exactly one of the three keys (serde_yaml
 /// reads a plain enum only from `!tags`).
@@ -904,6 +919,54 @@ struct SetupMap {
     runway_start: Option<RunwayStartSpec>,
     #[serde(default)]
     ramp: Option<RampSpec>,
+    #[serde(default)]
+    enroute: Option<EnrouteSpec>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EnrouteSpec {
+    at: String,
+    value: serde_yaml::Value,
+}
+
+impl EnrouteSpec {
+    /// The point, or why the spec's words are not one.
+    fn point(&self) -> std::result::Result<EnroutePoint, String> {
+        let miles = |max: f64| match &self.value {
+            serde_yaml::Value::Number(n) => n
+                .as_f64()
+                .filter(|v| *v >= 0.0 && *v <= max && v.fract() == 0.0)
+                .ok_or_else(|| {
+                    format!("enroute {} is a whole number of miles, 0 to {max:.0}", self.at)
+                }),
+            _ => Err(format!("enroute {} needs a number of miles", self.at)),
+        };
+        let max = crate::tools::setup_enroute::MAX_POINT_NM;
+        match self.at.trim() {
+            "fix" => match &self.value {
+                serde_yaml::Value::String(f)
+                    if (2..=7).contains(&f.trim().len())
+                        && f.trim().chars().all(|c| c.is_ascii_alphanumeric())
+                        && f.trim().chars().any(|c| c.is_ascii_alphabetic()) =>
+                {
+                    Ok(EnroutePoint::Fix(f.trim().to_ascii_uppercase()))
+                }
+                _ => Err(
+                    "enroute fix names one fix of the plan (2 to 7 letters and digits)".into()
+                ),
+            },
+            "before_tod_nm" => Ok(EnroutePoint::BeforeTod(miles(max)?)),
+            "before_destination_nm" => {
+                let n = miles(max)?;
+                if n < 1.0 {
+                    return Err("enroute before_destination_nm is at least 1".into());
+                }
+                Ok(EnroutePoint::BeforeDestination(n))
+            }
+            other => Err(format!("enroute at {other:?} is not one of {}", ENROUTE_AT.join(", "))),
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -940,22 +1003,27 @@ struct RampSpec {
 impl TryFrom<SetupMap> for Setup {
     type Error = String;
     fn try_from(m: SetupMap) -> std::result::Result<Self, String> {
-        match (m.approach, m.runway_start, m.ramp) {
-            (Some(a), None, None) => Ok(Setup::Approach {
+        match (m.approach, m.runway_start, m.ramp, m.enroute) {
+            (None, None, None, Some(e)) => Ok(Setup::Enroute {
+                field: FIELD_PLAN_ORIGIN.into(),
+                runway: RUNWAY_FROM_PLAN.into(),
+                point: e.point()?,
+            }),
+            (Some(a), None, None, None) => Ok(Setup::Approach {
                 field: a.field,
                 runway: a.runway,
                 final_nm: a.final_nm,
             }),
-            (None, Some(r), None) => Ok(Setup::RunwayStart {
+            (None, Some(r), None, None) => Ok(Setup::RunwayStart {
                 field: r.field,
                 runway: r.runway,
                 engines_running: r.engines_running,
             }),
-            (None, None, Some(r)) => Ok(Setup::Ramp {
+            (None, None, Some(r), None) => Ok(Setup::Ramp {
                 field: r.field,
                 stand: r.stand,
             }),
-            _ => Err("setup is exactly one of approach, runway_start, ramp".into()),
+            _ => Err("setup is exactly one of approach, runway_start, ramp, enroute".into()),
         }
     }
 }
@@ -1019,7 +1087,7 @@ impl Case {
             Setup::Approach { runway, .. } | Setup::RunwayStart { runway, .. } => {
                 runway == RUNWAY_FROM_WIND
             }
-            Setup::Ramp { .. } => false,
+            Setup::Ramp { .. } | Setup::Enroute { .. } => false,
         }
     }
 
@@ -1065,9 +1133,9 @@ impl Case {
 
     fn field_mut(&mut self) -> (&mut String, Option<&mut String>) {
         match &mut self.setup {
-            Setup::Approach { field, runway, .. } | Setup::RunwayStart { field, runway, .. } => {
-                (field, Some(runway))
-            }
+            Setup::Approach { field, runway, .. }
+            | Setup::RunwayStart { field, runway, .. }
+            | Setup::Enroute { field, runway, .. } => (field, Some(runway)),
             Setup::Ramp { field, .. } => (field, None),
         }
     }
@@ -1076,7 +1144,8 @@ impl Case {
         match &self.setup {
             Setup::Approach { field, .. }
             | Setup::RunwayStart { field, .. }
-            | Setup::Ramp { field, .. } => field,
+            | Setup::Ramp { field, .. }
+            | Setup::Enroute { field, .. } => field,
         }
     }
 
@@ -1096,6 +1165,10 @@ pub struct PlanFacts {
     pub dest_rwy: Option<String>,
     /// The ICAO type.
     pub aircraft: String,
+    /// The route's fixes, origin to destination, and whether the navlog
+    /// has a top of descent (an enroute case's point is checked on them).
+    pub fixes: Vec<String>,
+    pub has_tod: bool,
 }
 
 impl PlanFacts {
@@ -1106,6 +1179,8 @@ impl PlanFacts {
             origin_rwy: p.procedures.origin_rwy.clone(),
             dest_rwy: p.procedures.dest_rwy.clone(),
             aircraft: p.aircraft.trim().to_ascii_uppercase(),
+            fixes: p.waypoints.iter().map(|w| w.ident.to_ascii_uppercase()).collect(),
+            has_tod: p.schedule.tod.is_some(),
         }
     }
 }
@@ -1135,12 +1210,35 @@ pub fn resolve_case(
     if field.is_empty() {
         return Err(bad("the flight plan has no such field".into()));
     }
+    let enroute = matches!(case.setup, Setup::Enroute { .. });
     if let Some(r) = runway {
-        if r.as_str() == RUNWAY_FROM_PLAN {
+        if r.as_str() == RUNWAY_FROM_PLAN && enroute {
+            // Only a swap needs it (the aircraft loaded on the origin's
+            // runway first): an absent one is said at that swap.
+            *r = rwy.map(|x| x.trim().to_ascii_uppercase()).unwrap_or_default();
+        } else if r.as_str() == RUNWAY_FROM_PLAN {
             *r = rwy
                 .map(|x| x.trim().to_ascii_uppercase())
                 .filter(|x| !x.is_empty())
                 .ok_or_else(|| bad("the flight plan names no runway there".into()))?;
+        }
+    }
+    if let Setup::Enroute { point, .. } = &c.setup {
+        match point {
+            EnroutePoint::Fix(f) => {
+                let i = plan.fixes.iter().position(|x| x.eq_ignore_ascii_case(f));
+                match i {
+                    None => return Err(bad(format!("enroute fix {f} is not on the flight plan"))),
+                    Some(i) if i == 0 || i + 1 >= plan.fixes.len() => {
+                        return Err(bad(format!("enroute fix {f} is an end of the flight plan")))
+                    }
+                    _ => {}
+                }
+            }
+            EnroutePoint::BeforeTod(_) if !plan.has_tod => {
+                return Err(bad("the flight plan has no top of descent on its navlog".into()))
+            }
+            _ => {}
         }
     }
     if c.aircraft.as_deref() == Some(AIRCRAFT_FROM_PLAN) {
@@ -1255,7 +1353,7 @@ pub fn parse_spec_with(text: &str, acf_exists: &dyn Fn(&str) -> bool) -> Result<
             Setup::Approach { runway, .. } | Setup::RunwayStart { runway, .. } => {
                 runway == RUNWAY_FROM_PLAN
             }
-            Setup::Ramp { .. } => false,
+            Setup::Ramp { .. } | Setup::Enroute { .. } => false,
         };
         if plan_rwy && !plan_field {
             return bad("runway plan needs field plan_origin or plan_destination");
@@ -2303,6 +2401,8 @@ pub struct Pace {
     pub swap_max_s: f64,
     /// Every fast condition holds this long first ([`FAST_RESUME_S`]).
     pub fast_resume_s: f64,
+    /// Longest wait for an enroute setup's `enroute_result` ([`ENROUTE_MAX_S`]).
+    pub enroute_max_s: f64,
 }
 
 impl Pace {
@@ -2318,8 +2418,14 @@ impl Pace {
         crash_clear_s: CRASH_CLEAR_S,
         swap_max_s: SWAP_MAX_S,
         fast_resume_s: FAST_RESUME_S,
+        enroute_max_s: ENROUTE_MAX_S,
     };
 }
+
+/// From the typed enroute setup to its `enroute_result`: the reload (up to
+/// two minutes, `InitTiming::LIVE`), the autopilot's engage (at most a
+/// minute), the settle and the station (a minute and fifteen seconds).
+pub const ENROUTE_MAX_S: f64 = 300.0;
 
 /// From a setup that loads another aircraft to the app's `profile_probe`
 /// of it: the reload (up to two minutes, `InitTiming`), then the
@@ -2691,7 +2797,16 @@ async fn set_up_start(
         Setup::Approach { field, runway, .. } if swap => {
             runway_start_json(&acf, field, runway, true)
         }
+        Setup::Enroute { field, runway, .. } if swap => {
+            if runway.is_empty() {
+                return Err(anyhow!(
+                    "the flight plan names no runway at {field} to load the {acf} on"
+                ));
+            }
+            runway_start_json(&acf, field, runway, true)
+        }
         Setup::Approach { .. } => return Ok(()),
+        Setup::Enroute { point, .. } => return enroute_setup(sim, tail, point, pace).await,
     };
     tail.skip_to_end();
     let run =
@@ -2701,7 +2816,8 @@ async fn set_up_start(
         InitOutcome::Done(code) => {
             let (field, rwy) = match &case.setup {
                 Setup::RunwayStart { field, runway, .. }
-                | Setup::Approach { field, runway, .. } => (field.as_str(), runway.as_str()),
+                | Setup::Approach { field, runway, .. }
+                | Setup::Enroute { field, runway, .. } => (field.as_str(), runway.as_str()),
                 Setup::Ramp { field, .. } => (field.as_str(), ""),
             };
             return Err(anyhow!(
@@ -2740,6 +2856,10 @@ async fn set_up_start(
             false
         };
         if still && swapped {
+            if let Setup::Enroute { point, .. } = &case.setup {
+                // The aircraft is loaded: now the new flight in the air.
+                return enroute_setup(sim, tail, point, pace).await;
+            }
             let settle = case.settle_s.unwrap_or(DEFAULT_SETTLE_S) * pace.settle_scale;
             tokio::time::sleep(std::time::Duration::from_secs_f64(settle)).await;
             return Ok(());
@@ -2754,6 +2874,61 @@ async fn set_up_start(
         if !still && waited > pace.still_max_s {
             return Err(anyhow!("the aircraft never sat still after the setup"));
         }
+    }
+}
+
+/// What the app's enroute setup came to, from its blackbox records: `None`
+/// while it is still working; `Some(Ok)` once the new flight is up with the
+/// autopilot's servos confirmed; `Some(Err(why))` for a refusal (the tool's
+/// own words, `enroute_refused`) or a result without the autopilot. Pure.
+pub fn enroute_outcome(r: &Value) -> Option<std::result::Result<(), String>> {
+    if st(r, "kind") != "setup" {
+        return None;
+    }
+    match st(r, "event") {
+        "enroute_refused" => Some(Err(format!("the app refused: {}", st(r, "why")))),
+        "enroute_result" if st(r, "outcome") == "ok" && r["engaged"] == json!(true) => {
+            Some(Ok(()))
+        }
+        "enroute_result" => Some(Err(match st(r, "why") {
+            "" => format!(
+                "the enroute setup ended {} without the autopilot engaged",
+                st(r, "outcome")
+            ),
+            why => why.to_string(),
+        })),
+        _ => None,
+    }
+}
+
+/// Type the enroute setup's words and wait for the app to have put the new
+/// flight in the air with the autopilot holding it ([`enroute_outcome`]);
+/// then the case's command is typed as on any other start.
+async fn enroute_setup(
+    sim: &dyn RunnerSim,
+    tail: &mut BlackboxTail,
+    point: &EnroutePoint,
+    pace: &Pace,
+) -> Result<()> {
+    tail.skip_to_end();
+    let line = crate::tools::setup_enroute::enroute_line(point);
+    type_line(sim, &line, pace).await?;
+    let t0 = now_s();
+    loop {
+        for r in tail.poll() {
+            match enroute_outcome(&r) {
+                Some(Ok(())) => return Ok(()),
+                Some(Err(why)) => return Err(anyhow!("{why}")),
+                None => {}
+            }
+        }
+        if now_s() - t0 > pace.enroute_max_s {
+            return Err(anyhow!(
+                "no enroute_result in {:.0} s after {line:?}: is xvl running?",
+                pace.enroute_max_s
+            ));
+        }
+        tokio::time::sleep(pace.poll).await;
     }
 }
 
@@ -3209,6 +3384,19 @@ async fn with_the_plan(spec: Spec) -> Result<Spec> {
         .iter()
         .map(|c| resolve_case(c, &facts, &find))
         .collect::<Result<Vec<_>>>()?;
+    // An enroute point must be a placement the plan can give (its height,
+    // its speed), checked with the plan's type's profile as the app will.
+    let speeds = crate::tools::setup_enroute::Speeds {
+        profile_kts: crate::aircraft::profile_for_type(&plan.aircraft)
+            .and_then(|p| p.reference.and_then(|r| r.cruise_ias_kts)),
+        ..Default::default()
+    };
+    for c in &cases {
+        if let Setup::Enroute { point, .. } = &c.setup {
+            crate::tools::setup_enroute::place(&plan, point, &speeds)
+                .map_err(|e| anyhow!("case {:?}: {e}", c.name))?;
+        }
+    }
     Ok(Spec {
         cases,
         after: spec.after,
@@ -3633,6 +3821,7 @@ mod tests {
             origin_rwy: Some("33".into()),
             dest_rwy: Some("26l".into()),
             aircraft: "B738".into(),
+            ..PlanFacts::default()
         };
         let find = |icao: &str| {
             (icao == "B738")
@@ -4589,6 +4778,8 @@ mod tests {
         enroute: std::sync::atomic::AtomicBool,
         /// The first fast write wrecks the aircraft.
         crash_when_fast: std::sync::atomic::AtomicBool,
+        /// The app refuses a typed enroute setup (its `enroute_refused`).
+        enroute_refuses: std::sync::atomic::AtomicBool,
     }
 
     /// The fake's taxi-in pace, 14 kt in metres per second.
@@ -4623,6 +4814,7 @@ mod tests {
                 speed: std::sync::Mutex::new(1.0),
                 enroute: false.into(),
                 crash_when_fast: false.into(),
+                enroute_refuses: false.into(),
             }
         }
     }
@@ -4717,6 +4909,29 @@ mod tests {
             if line.starts_with("put us on") {
                 self.setup_posted();
             }
+            if line.starts_with("put us enroute") {
+                // The app's enroute setup: its tool, the new flight in the
+                // air with the servos confirmed (or its refusal).
+                self.setup_posted();
+                self.typed.lock().unwrap().push(line.clone());
+                use std::io::Write;
+                let mut f = std::fs::OpenOptions::new()
+                    .append(true)
+                    .open(&self.log)
+                    .unwrap();
+                let end = if self.enroute_refuses.load(SeqCst) {
+                    json!({"t": 2.0, "kind": "setup", "event": "enroute_refused",
+                           "why": "The plan is for a A320, and this is a B738."})
+                } else {
+                    self.airborne.store(true, SeqCst);
+                    json!({"t": 2.0, "kind": "setup", "event": "enroute_result", "outcome": "ok",
+                           "engaged": true, "next_fix": "WELIN"})
+                };
+                for r in [json!({"t": 1.0, "kind": "tool", "name": "setup_enroute"}), end] {
+                    writeln!(f, "{r}").unwrap();
+                }
+                return Ok(());
+            }
             assert_eq!(name, TYPED);
             self.typed.lock().unwrap().push(line.clone());
             use std::io::Write;
@@ -4791,6 +5006,7 @@ mod tests {
             crash_clear_s: 0.2,
             swap_max_s: 1.0,
             fast_resume_s: 0.0,
+            enroute_max_s: 1.0,
         };
         let mut tail = BlackboxTail::at_end(&log);
         let mut seen = Vec::new();
@@ -4875,6 +5091,208 @@ mod tests {
             .await
             .unwrap_err();
         assert!(e.to_string().contains("the app never took"), "{e}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `setup: {enroute: {at, value}}`: a point on the plan, the plan's
+    /// origin and runway kept for a swap; a point that is none is refused
+    /// naming the case, and an enroute case types its command.
+    #[test]
+    fn an_enroute_case_parses_and_refuses_what_is_no_point() {
+        let spec = |setup: &str, rest: &str| {
+            format!("cases: [{{name: e, setup: {{enroute: {setup}}}{rest}}}]")
+        };
+        let cmd = ", command: fly the flight plan";
+        let one = |setup: &str| parse_spec_with(&spec(setup, cmd), &|_| true);
+        let c = one("{at: before_tod_nm, value: 30}").unwrap().cases.remove(0);
+        assert_eq!(
+            c.setup,
+            Setup::Enroute {
+                field: FIELD_PLAN_ORIGIN.into(),
+                runway: RUNWAY_FROM_PLAN.into(),
+                point: EnroutePoint::BeforeTod(30.0),
+            }
+        );
+        assert!(c.uses_plan() && !c.wants_wind());
+        assert_eq!(c.first_line(), "fly the flight plan");
+        let fix = one("{at: fix, value: welin}").unwrap().cases.remove(0);
+        let at = |c: &Case| match &c.setup {
+            Setup::Enroute { point, .. } => point.clone(),
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(at(&fix), EnroutePoint::Fix("WELIN".into()));
+        let dest = one("{at: before_destination_nm, value: 40}").unwrap().cases.remove(0);
+        assert_eq!(at(&dest), EnroutePoint::BeforeDestination(40.0));
+        // Fast forward is a want the guard decides, as on any case.
+        let fast_case = spec("{at: before_tod_nm, value: 30}", &format!("{cmd}, sim_speed: 4"));
+        let fast = parse_spec_with(&fast_case, &|_| true).unwrap();
+        assert_eq!(fast.cases[0].sim_speed, Some(4));
+        for (bad, why) in [
+            (
+                "{at: top_of_climb, value: 3}",
+                "is not one of fix, before_tod_nm, before_destination_nm",
+            ),
+            ("{at: before_tod_nm, value: -5}", "whole number of miles"),
+            ("{at: before_tod_nm, value: 2.5}", "whole number of miles"),
+            ("{at: before_tod_nm, value: WELIN}", "needs a number of miles"),
+            ("{at: before_destination_nm, value: 0}", "at least 1"),
+            ("{at: fix, value: 30}", "names one fix"),
+            ("{at: fix, value: \"WEL IN\"}", "names one fix"),
+            ("{at: fix}", "missing field"),
+        ] {
+            let e = one(bad).unwrap_err().to_string();
+            assert!(e.contains(why), "{bad}: {e}");
+        }
+        let e = parse_spec_with(&spec("{at: fix, value: WELIN}", ""), &|_| true).unwrap_err();
+        assert!(e.to_string().contains("needs a command"), "{e}");
+        let e = parse_spec_with(
+            "cases: [{name: e, setup: {enroute: {at: fix, value: WELIN}, ramp: {field: EGKK}},\
+             command: x}]",
+            &|_| true,
+        )
+        .unwrap_err();
+        assert!(e.to_string().contains("exactly one of"), "{e}");
+    }
+
+    /// The point is checked on the fetched plan: a fix it does not hold, an
+    /// end of it, a top of descent its navlog lacks, and the placement
+    /// itself (the pilot's EGKK-EGBB OFP) are refused before the run.
+    #[test]
+    fn an_enroute_point_is_checked_on_the_plan() {
+        let v: Value =
+            serde_json::from_str(include_str!("../bench/ofp/egkk-egbb-738.trimmed.json")).unwrap();
+        let fp = crate::simbrief::plan_from_ofp(&v).unwrap();
+        let facts = PlanFacts::of(&fp);
+        assert!(facts.has_tod && facts.fixes.contains(&"WELIN".to_string()));
+        let find = |_: &str| None;
+        let case = |point: EnroutePoint| Case {
+            name: "e".into(),
+            setup: Setup::Enroute {
+                field: FIELD_PLAN_ORIGIN.into(),
+                runway: RUNWAY_FROM_PLAN.into(),
+                point,
+            },
+            aircraft: None,
+            command: Some("fly the flight plan".into()),
+            steps: Vec::new(),
+            deadline_min: None,
+            sim_speed: None,
+            settle_s: None,
+            expect_give_up: None,
+            after: None,
+        };
+        let ok = resolve_case(&case(EnroutePoint::BeforeTod(30.0)), &facts, &find).unwrap();
+        assert_eq!(
+            ok.setup,
+            Setup::Enroute {
+                field: "EGKK".into(),
+                runway: "26L".into(),
+                point: EnroutePoint::BeforeTod(30.0)
+            }
+        );
+        let e = |p: EnroutePoint, f: &PlanFacts| {
+            resolve_case(&case(p), f, &find).unwrap_err().to_string()
+        };
+        assert!(e(EnroutePoint::Fix("NOSUCH".into()), &facts).contains("not on the flight plan"));
+        assert!(e(EnroutePoint::Fix("EGBB".into()), &facts).contains("an end of the flight plan"));
+        let no_tod = PlanFacts { has_tod: false, ..facts.clone() };
+        assert!(e(EnroutePoint::BeforeTod(30.0), &no_tod).contains("no top of descent"));
+        // A plan without an origin runway still sets up on the loaded type.
+        let no_rwy = PlanFacts { origin_rwy: None, ..facts.clone() };
+        let r = resolve_case(&case(EnroutePoint::Fix("HEMEL".into())), &no_rwy, &find).unwrap();
+        assert!(matches!(r.setup, Setup::Enroute { ref runway, .. } if runway.is_empty()));
+        // The placement the app will make, with the 737's cruise.
+        let speeds = crate::tools::setup_enroute::Speeds {
+            profile_kts: Some(255.0),
+            ..Default::default()
+        };
+        let place = |p: EnroutePoint| crate::tools::setup_enroute::place(&fp, &p, &speeds);
+        assert!(place(EnroutePoint::BeforeTod(30.0)).is_ok());
+        let low = place(EnroutePoint::BeforeDestination(2.0)).unwrap_err();
+        assert!(low.contains("under the 3000"), "{low}");
+    }
+
+    #[test]
+    fn the_enroute_outcome_is_read_from_the_apps_records() {
+        let r = |v: Value| enroute_outcome(&v);
+        assert_eq!(r(json!({"kind": "setup", "event": "enroute_init"})), None);
+        assert_eq!(r(json!({"kind": "tool", "name": "setup_enroute"})), None);
+        assert_eq!(
+            r(json!({"kind": "setup", "event": "enroute_result", "outcome": "ok",
+                     "engaged": true})),
+            Some(Ok(()))
+        );
+        let no_ap = r(json!({"kind": "setup", "event": "enroute_result", "outcome": "ok",
+                             "engaged": false}));
+        assert!(no_ap.unwrap().unwrap_err().contains("without the autopilot"));
+        let refused = r(json!({"kind": "setup", "event": "enroute_result", "outcome": "refused",
+                               "engaged": false, "why": "X-Plane refused it, code 1."}));
+        assert_eq!(refused, Some(Err("X-Plane refused it, code 1.".into())));
+        let said =
+            r(json!({"kind": "setup", "event": "enroute_refused", "why": "No flight plan."}));
+        assert_eq!(said, Some(Err("the app refused: No flight plan.".into())));
+    }
+
+    /// An enroute case: the app's own setup words, the new flight in the
+    /// air waited for, then the case's command and its sortie's verdict. A
+    /// refusal is the case's failure, in the app's words, nothing typed
+    /// after it. The typed words route to the setup tool on the 737.
+    #[tokio::test]
+    async fn an_enroute_case_is_set_up_in_the_air_then_resumed() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let (dir, log) = scratch_log("enroute");
+        let sim = FakeSim::new(log.clone());
+        let mut spec = parse_spec_with(
+            "cases: [{name: arrival, setup: {enroute: {at: before_tod_nm, value: 30}},\n\
+                      command: fly the flight plan}]",
+            &|_| true,
+        )
+        .unwrap();
+        spec.cases[0].setup = Setup::Enroute {
+            field: "EGKK".into(),
+            runway: "26L".into(),
+            point: EnroutePoint::BeforeTod(30.0),
+        };
+        let mut tail = BlackboxTail::at_end(&log);
+        let rows = run_all(&sim, &mut tail, &spec, 1, "", &quick_pace(), &mut |_: &Row| {}).await;
+        assert!(rows[0].verdict.pass, "{:?}", rows[0].verdict);
+        assert_eq!(
+            *sim.typed.lock().unwrap(),
+            vec!["put us enroute 30 miles before top of descent", "fly the flight plan"]
+        );
+        assert!(sim.inits.lock().unwrap().is_empty(), "the app's setup, not a runner post");
+        let b738 = bench_profile(None);
+        assert_eq!(
+            routed("put us enroute 30 miles before top of descent", &b738).as_deref(),
+            Some("setup_enroute")
+        );
+        assert_eq!(routed("fly the flight plan", &b738).as_deref(), Some("full_auto"));
+        // Refused: the case fails with the app's words, no command typed.
+        sim.typed.lock().unwrap().clear();
+        sim.airborne.store(false, SeqCst);
+        sim.enroute_refuses.store(true, SeqCst);
+        let rows = run_all(&sim, &mut tail, &spec, 1, "", &quick_pace(), &mut |_: &Row| {}).await;
+        assert!(!rows[0].verdict.pass);
+        let why = &rows[0].verdict.reason;
+        assert!(why.contains("the app refused: The plan is for a A320"), "{why}");
+        assert_eq!(sim.typed.lock().unwrap().len(), 1);
+        // Another aircraft: loaded on the plan's origin runway first.
+        sim.enroute_refuses.store(false, SeqCst);
+        sim.probe_on_swap.store(true, SeqCst);
+        let mut swap = spec.cases[0].clone();
+        swap.aircraft = Some("Aircraft/Laminar Research/Cirrus SR22/Cirrus SR22.acf".into());
+        set_up_start(&sim, &mut tail, &swap, "", &quick_pace()).await.unwrap();
+        let inits = sim.inits.lock().unwrap().clone();
+        let v: Value = serde_json::from_str(inits.last().unwrap()).unwrap();
+        assert_eq!(v["runway_start"]["airport_id"], "EGKK");
+        assert_eq!(v["runway_start"]["runway"], "26L");
+        swap.setup = Setup::Enroute {
+            field: "EGKK".into(),
+            runway: String::new(),
+            point: EnroutePoint::BeforeTod(30.0),
+        };
+        let e = set_up_start(&sim, &mut tail, &swap, "", &quick_pace()).await.unwrap_err();
+        assert!(e.to_string().contains("names no runway at EGKK"), "{e}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -4997,6 +5415,7 @@ mod tests {
             crash_clear_s: 0.2,
             swap_max_s: 1.0,
             fast_resume_s: 0.0,
+            enroute_max_s: 1.0,
         }
     }
 
