@@ -2942,6 +2942,13 @@ pub async fn run(
             // brief's picture of the aircraft); narration comes back only
             // while a lesson flies. Advisory, so the radio is never talked
             // over for a heading nudge.
+            // The aircraft against the cleared taxi route (the guide's turn
+            // card), for the lesson's centreline and the state record (#88).
+            let taxi_line = (snap.on_ground
+                && crate::party_line::clearance_state() == Some(crate::tower::State::TaxiCleared))
+            .then(|| taxi_guide.as_ref().and_then(|g| g.turn_card(snap.lat, snap.lon)))
+            .flatten()
+            .map(|c| crate::instructor::TaxiLine::from_card(&c));
             if crew_on {
                 let sample = crate::instructor::Sample {
                     t_s: crate::instructor::clock_s(),
@@ -2955,6 +2962,7 @@ pub async fn run(
                     track_deg: snap.track_deg,
                     gs_kts: snap.groundspeed_kts,
                     engine_running: snap.engine_running,
+                    taxi: taxi_line,
                 };
                 let mut io = crate::instructor::FlowIo {
                     config: &config,
@@ -4236,6 +4244,7 @@ pub async fn run(
                     "phase": format!("{:?}", snap.phase),
                     "fphase": format!("{:?}", flight.phase()), "crashed": crashed,
                     "ctl": format!("{:?}", flight.control()),
+                    "taxi": taxi_line.map(|l| l.json()),
                     "in": inputs.json(),
                 }),
             );
