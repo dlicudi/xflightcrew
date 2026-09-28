@@ -333,6 +333,7 @@ fn main() -> Result<()> {
                     // its destination again, never cleared.
                     ifr: None,
                     runway_refusal: None,
+                    transition_level_ft: apt.transition_level_ft,
                 };
                 let intent = if heard.confidence < config.stt_min_confidence {
                     tower::Intent::Unknown // garbled call → "say again", never a guessed clearance
