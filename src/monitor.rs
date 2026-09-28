@@ -1783,35 +1783,73 @@ const BARO_KNOB: &str = "sim/cockpit2/gauges/actuators/barometer_setting_in_hg_p
 /// once per episode and never re-asserted (the cockpit_auto rule). Real
 /// weather walks the QNH a hundredth at a time; the tolerance and the sustain
 /// keep that from becoming chatter.
+///
+/// Two instances: the drift check (`crossing: false`, 20 s) and the
+/// transition itself (`crossing: true`, [`ALTIMETER_CROSSING_SUSTAIN_MS`]):
+/// crossed in the direction flown, the setting is owed AT the transition
+/// (`instruments::transition_crossed`, #156), and the drift check leaves
+/// that case to it so one knob is never said twice.
 struct AltimeterSetting {
     transition_altitude_ft: f64,
+    crossing: bool,
 }
+
+/// The transition crossing's sustain: a single-sample altimeter glitch is
+/// not a crossing; two seconds at 2,000 fpm is under 70 ft past it.
+const ALTIMETER_CROSSING_SUSTAIN_MS: u64 = 2_000;
 
 impl AltimeterSetting {
     fn wanted(&self, s: &Snapshot) -> Option<(f64, f64)> {
-        if !s.engine_running {
-            return None;
-        }
-        let (baro, pa) = (s.baro_inhg?, s.qnh_pa?);
-        if pa <= 0.0 {
-            return None;
-        }
         let ta = crate::tools::instruments::transition_in_force_ft(self.transition_altitude_ft);
-        let want = crate::tools::instruments::correct_setting_inhg(s.alt_ft, ta, pa);
-        let tol = crate::tools::instruments::ALTIMETER_TOLERANCE_INHG;
-        // Near the transition either setting is right: hovering at FL180 on a
-        // FL180 transition reset the knob QNH, standard, QNH inside two
-        // minutes (EDLP-LOWI, 2026-09-24). Inside the band, a knob on either
-        // one is left alone; the change is made clear of it.
-        if in_transition_band(s.alt_ft, ta) {
-            let qnh = (pa / crate::tools::instruments::PA_PER_INHG).clamp(28.0, 31.5);
-            let std = crate::tools::instruments::STANDARD_INHG;
-            if (baro - qnh).abs() < tol || (baro - std).abs() < tol {
-                return None;
-            }
-        }
-        ((baro - want).abs() >= tol).then_some((baro, want))
+        altimeter_wanted(s, ta, self.crossing)
     }
+}
+
+/// (knob, wanted) when the altimeter should be reset against transition
+/// `ta` (the one in force), for the drift check or the crossing one. Pure.
+fn altimeter_wanted(s: &Snapshot, ta: f64, crossing: bool) -> Option<(f64, f64)> {
+    use crate::tools::instruments as ins;
+    if !s.engine_running {
+        return None;
+    }
+    let (baro, pa) = (s.baro_inhg?, s.qnh_pa?);
+    if pa <= 0.0 {
+        return None;
+    }
+    let crossed = ins::transition_crossed(s.alt_ft, s.vsi_fpm, ta, baro, pa);
+    if crossing {
+        return crossed.map(|want| (baro, want));
+    }
+    if crossed.is_some() {
+        return None;
+    }
+    let want = ins::correct_setting_inhg(s.alt_ft, ta, pa);
+    let tol = ins::ALTIMETER_TOLERANCE_INHG;
+    let qnh = (pa / ins::PA_PER_INHG).clamp(28.0, 31.5);
+    let std = ins::STANDARD_INHG;
+    // Near the transition either setting is right: hovering at FL180 on a
+    // FL180 transition reset the knob QNH, standard, QNH inside two
+    // minutes (EDLP-LOWI, 2026-09-24). Inside the band, a knob on either
+    // one is left alone; the change is made clear of it.
+    if in_transition_band(s.alt_ft, ta)
+        && ((baro - qnh).abs() < tol || (baro - std).abs() < tol)
+    {
+        return None;
+    }
+    // Just through it the right way, the knob's own jump can put the
+    // altimeter back across (standard set at 6,000 on a 30.50 QNH reads
+    // 5,440): the setting the direction flown owes is left alone within
+    // the knob's jump of the transition.
+    let jump_ft = (qnh - std).abs() * ins::FT_PER_INHG + 100.0;
+    let near = (s.alt_ft - ta).abs() < jump_ft.max(TRANSITION_BAND_FT);
+    let climbing = s.vsi_fpm >= ins::TRANSITION_CROSSING_FPM;
+    let descending = s.vsi_fpm <= -ins::TRANSITION_CROSSING_FPM;
+    if near
+        && ((climbing && (baro - std).abs() < tol) || (descending && (baro - qnh).abs() < tol))
+    {
+        return None;
+    }
+    ((baro - want).abs() >= tol).then_some((baro, want))
 }
 
 /// Feet either side of the transition where either setting stands: more than
@@ -1825,7 +1863,11 @@ fn in_transition_band(alt_ft: f64, transition_ft: f64) -> bool {
 
 impl Check for AltimeterSetting {
     fn id(&self) -> &'static str {
-        "altimeter_setting"
+        if self.crossing {
+            "altimeter_transition"
+        } else {
+            "altimeter_setting"
+        }
     }
     fn severity(&self) -> Severity {
         Severity::Advisory
@@ -1836,9 +1878,7 @@ impl Check for AltimeterSetting {
         Some(if s.automation_flying {
             format!("Altimeter reset, {}.", spoken(want))
         } else {
-            let what = if s.alt_ft
-                >= crate::tools::instruments::transition_in_force_ft(self.transition_altitude_ft)
-            {
+            let what = if (want - crate::tools::instruments::STANDARD_INHG).abs() < 0.005 {
                 "standard"
             } else {
                 "QNH"
@@ -1851,9 +1891,14 @@ impl Check for AltimeterSetting {
         })
     }
     /// The pilot turning the knob passes through wrong values on the way to
-    /// the right one; a weather edition moves the QNH under a set knob.
+    /// the right one; a weather edition moves the QNH under a set knob. The
+    /// transition itself is owed at once.
     fn min_duration(&self) -> Duration {
-        Duration::from_secs(20)
+        if self.crossing {
+            Duration::from_millis(ALTIMETER_CROSSING_SUSTAIN_MS)
+        } else {
+            Duration::from_secs(20)
+        }
     }
     fn fix_write(&self, s: &Snapshot) -> Option<(&'static str, f64)> {
         if !s.automation_flying {
@@ -2229,6 +2274,12 @@ fn build_checks(profile: &AircraftProfile) -> Vec<Box<dyn Check>> {
         // flies the indicated altitude off it.
         Box::new(AltimeterSetting {
             transition_altitude_ft: profile.transition_altitude_ft,
+            crossing: false,
+        }),
+        // ...and AT the transition, crossed in the direction flown (#156).
+        Box::new(AltimeterSetting {
+            transition_altitude_ft: profile.transition_altitude_ft,
+            crossing: true,
         }),
         // Universal: the altimeter itself against the true height (#94).
         Box::new(AltimeterTruthCheck {
@@ -5664,6 +5715,129 @@ mod tests {
 
     /// The LINTO altimeter of 2026-09-14: 30.15 set, QNH 30.10, an
     /// automation flying indicated altitude 46 ft wrong.
+    /// EGKK-EGBB, 2026-09-28 (sortie 1790601822-full_auto, #156), the state
+    /// records' (t, altitude, vsi): the climb off the 6,000 ft level at LAM
+    /// through EGKK's 6,000 ft transition altitude on QNH 30.13...
+    #[rustfmt::skip]
+    const EGKK_CLIMB: &[(f64, f64, f64)] = &[
+        (1646.2, 6072.0, 20.0), (1647.8, 6073.0, 75.0), (1649.4, 6076.0, 109.0), (1650.8, 6079.0, 110.0),
+        (1652.2, 6081.0, 94.0), (1653.2, 6084.0, 279.0), (1654.6, 6091.0, 598.0), (1656.1, 6112.0, 1211.0),
+        (1657.8, 6149.0, 1798.0), (1659.3, 6210.0, 2235.0), (1660.9, 6279.0, 2414.0), (1662.4, 6350.0, 2458.0),
+        (1664.0, 6421.0, 2448.0), (1665.5, 6491.0, 2425.0), (1666.6, 6555.0, 2413.0), (1668.0, 6609.0, 2414.0),
+        (1669.3, 6672.0, 2395.0), (1670.8, 6730.0, 2375.0), (1672.2, 6796.0, 2363.0), (1673.6, 6859.0, 2353.0),
+        (1674.9, 6918.0, 2377.0), (1676.1, 6974.0, 2428.0), (1677.5, 7028.0, 2440.0), (1679.0, 7092.0, 2387.0),
+        (1680.3, 7152.0, 2317.0), (1681.7, 7207.0, 2272.0), (1683.1, 7261.0, 2234.0), (1684.6, 7314.0, 2195.0),
+        (1686.2, 7371.0, 2150.0), (1687.6, 7435.0, 2112.0), (1689.0, 7488.0, 2096.0), (1690.4, 7544.0, 2094.0),
+        (1691.6, 7595.0, 2089.0), (1692.9, 7636.0, 2092.0), (1694.0, 7685.0, 2114.0), (1695.4, 7730.0, 2140.0),
+        (1696.9, 7783.0, 2177.0), (1698.2, 7837.0, 2196.0), (1699.6, 7886.0, 2207.0), (1701.0, 7940.0, 2206.0),
+        (1702.4, 7993.0, 2204.0), (1703.7, 8049.0, 2206.0), (1705.0, 8100.0, 2191.0), (1706.5, 8155.0, 2141.0),
+        (1707.7, 8210.0, 2064.0), (1709.1, 8251.0, 2021.0), (1710.4, 8297.0, 1987.0),
+    ];
+    /// ...and the descent on standard through EGBB's FL75 transition level
+    /// to GROVE's FL070 and on down the join (QNH 30.15).
+    #[rustfmt::skip]
+    const EGBB_DESCENT: &[(f64, f64, f64)] = &[
+        (2827.2, 7764.0, -800.0), (2828.9, 7752.0, -134.0), (2830.6, 7755.0, 323.0), (2832.2, 7769.0, 534.0),
+        (2833.6, 7781.0, 398.0), (2835.0, 7784.0, -151.0), (2836.8, 7774.0, -824.0), (2838.7, 7734.0, -1699.0),
+        (2840.5, 7673.0, -2177.0), (2842.3, 7606.0, -2246.0), (2844.0, 7543.0, -2120.0), (2845.7, 7489.0, -1950.0),
+        (2847.4, 7434.0, -1800.0), (2849.3, 7384.0, -1702.0), (2851.1, 7331.0, -1688.0), (2852.8, 7282.0, -1852.0),
+        (2854.5, 7226.0, -2051.0), (2856.4, 7167.0, -1992.0), (2858.0, 7110.0, -1685.0), (2859.6, 7070.0, -1287.0),
+        (2861.6, 7042.0, -875.0), (2863.3, 7022.0, -464.0), (2865.3, 7013.0, -102.0), (2867.2, 7008.0, -366.0),
+        (2869.1, 6984.0, -1140.0), (2871.0, 6937.0, -1787.0), (2872.8, 6875.0, -2110.0), (2874.7, 6813.0, -2111.0),
+        (2876.6, 6748.0, -1915.0), (2878.3, 6697.0, -1581.0), (2880.2, 6656.0, -1276.0), (2882.2, 6619.0, -1037.0),
+        (2884.1, 6589.0, -911.0), (2886.1, 6561.0, -826.0), (2888.1, 6535.0, -777.0), (2890.1, 6511.0, -718.0),
+        (2892.3, 6488.0, -638.0), (2894.2, 6467.0, -544.0), (2896.3, 6451.0, -466.0), (2898.0, 6436.0, -403.0),
+        (2899.9, 6425.0, -446.0), (2902.0, 6410.0, -425.0), (2904.2, 6396.0, -482.0), (2906.4, 6367.0, -1039.0),
+        (2908.5, 6317.0, -1696.0), (2910.5, 6254.0, -2057.0), (2912.7, 6180.0, -2112.0),
+    ];
+
+    /// The first time `wanted` has held for `sustain_s` over the recorded
+    /// ticks, and the setting it wanted: the monitor's sustain, replayed.
+    fn replay_altimeter(
+        ticks: &[(f64, f64, f64)],
+        baro: f64,
+        qnh_inhg: f64,
+        sustain_s: f64,
+        wanted: impl Fn(&Snapshot) -> Option<(f64, f64)>,
+    ) -> Option<(f64, f64)> {
+        let mut s = linto_altimeter(true);
+        s.baro_inhg = Some(baro);
+        s.qnh_pa = Some(qnh_inhg * crate::tools::instruments::PA_PER_INHG);
+        let mut since: Option<f64> = None;
+        for &(t, alt, vsi) in ticks {
+            s.alt_ft = alt;
+            s.vsi_fpm = vsi;
+            match wanted(&s) {
+                Some((_, want)) => {
+                    let t0 = *since.get_or_insert(t);
+                    if t - t0 >= sustain_s {
+                        return Some((t, want));
+                    }
+                }
+                None => since = None,
+            }
+        }
+        None
+    }
+
+    /// #156: standard went in 38 s after the climb passed EGKK's 6,000 ft
+    /// transition altitude (at 8,300 ft), QNH more than a minute under
+    /// EGBB's FL75 transition level on standard (at 6,180 ft). Replayed: the
+    /// old drift rule alone is late on both; the crossing check sets each AT
+    /// its transition, and the drift check stays silent through both.
+    #[test]
+    fn the_altimeter_is_set_at_the_transition_not_after_it() {
+        let sustain = ALTIMETER_CROSSING_SUSTAIN_MS as f64 / 1000.0;
+        // The rule as flown: the band, then 20 s.
+        let old = |ta: f64| {
+            move |s: &Snapshot| {
+                let (baro, pa) = (s.baro_inhg?, s.qnh_pa?);
+                let want = crate::tools::instruments::correct_setting_inhg(s.alt_ft, ta, pa);
+                let qnh = pa / crate::tools::instruments::PA_PER_INHG;
+                if in_transition_band(s.alt_ft, ta)
+                    && ((baro - qnh).abs() < 0.03 || (baro - 29.92).abs() < 0.03)
+                {
+                    return None;
+                }
+                ((baro - want).abs() >= 0.03).then_some((baro, want))
+            }
+        };
+        let (t_old, _) = replay_altimeter(EGKK_CLIMB, 30.13, 30.13, 20.0, old(6_000.0)).unwrap();
+        assert!(t_old > 1_685.0, "as flown: late, {t_old}");
+        let (t, want) =
+            replay_altimeter(EGKK_CLIMB, 30.13, 30.13, sustain, |s| altimeter_wanted(s, 6_000.0, true))
+                .expect("standard owed climbing through 6,000");
+        assert_eq!(want, crate::tools::instruments::STANDARD_INHG);
+        assert!(t <= 1_657.8, "standard at {t}, the climb began at 1653");
+        assert_eq!(
+            replay_altimeter(EGKK_CLIMB, 30.13, 30.13, 20.0, |s| altimeter_wanted(s, 6_000.0, false)),
+            None,
+            "the drift check leaves the crossing to its own check"
+        );
+        // The descent: FL75 on standard.
+        let (t_old, _) = replay_altimeter(EGBB_DESCENT, 29.92, 30.15, 20.0, old(7_500.0)).unwrap();
+        assert!(t_old > 2_890.0, "as flown: late, {t_old}");
+        let (t, want) =
+            replay_altimeter(EGBB_DESCENT, 29.92, 30.15, sustain, |s| altimeter_wanted(s, 7_500.0, true))
+                .expect("QNH owed descending through FL75");
+        assert!((want - 30.15).abs() < 0.005, "{want}");
+        assert!(t <= 2_849.3, "QNH at {t}, FL75 passed at 2845.7");
+        // Set, the knob's own jump never undoes it: QNH read 220 ft higher
+        // just under FL75, standard 200 ft lower just over 6,000.
+        let mut s = linto_altimeter(true);
+        s.qnh_pa = Some(30.15 * crate::tools::instruments::PA_PER_INHG);
+        (s.baro_inhg, s.alt_ft, s.vsi_fpm) = (Some(30.15), 7_710.0, -1_800.0);
+        assert_eq!(altimeter_wanted(&s, 7_500.0, true), None);
+        assert_eq!(altimeter_wanted(&s, 7_500.0, false), None);
+        s.qnh_pa = Some(30.50 * crate::tools::instruments::PA_PER_INHG);
+        (s.baro_inhg, s.alt_ft, s.vsi_fpm) = (Some(29.92), 5_440.0, 2_000.0);
+        assert_eq!(altimeter_wanted(&s, 6_000.0, true), None);
+        assert_eq!(altimeter_wanted(&s, 6_000.0, false), None, "a high QNH's jump");
+        // Level at the transition is no crossing: either setting stands.
+        (s.baro_inhg, s.alt_ft, s.vsi_fpm) = (Some(30.50), 6_080.0, 40.0);
+        assert_eq!(altimeter_wanted(&s, 6_000.0, true), None);
+    }
+
     fn linto_altimeter(automation_flying: bool) -> Snapshot {
         let mut s = snap(true, true);
         s.on_ground = false;
@@ -6053,6 +6227,7 @@ mod tests {
     fn altimeter_check_advises_the_pilot_and_resets_for_an_automation() {
         let c = AltimeterSetting {
             transition_altitude_ft: 18_000.0,
+            crossing: false,
         };
         let pilot = linto_altimeter(false);
         let said = c.eval(&pilot).expect("mis-set altimeter is a callout");
@@ -6082,6 +6257,7 @@ mod tests {
     fn altimeter_check_is_quiet_when_set_or_cold() {
         let c = AltimeterSetting {
             transition_altitude_ft: 18_000.0,
+            crossing: false,
         };
         let mut s = linto_altimeter(false);
         s.baro_inhg = Some(30.11); // a hundredth off: within tolerance
@@ -6098,6 +6274,7 @@ mod tests {
     fn altimeter_check_wants_standard_above_the_transition_altitude() {
         let c = AltimeterSetting {
             transition_altitude_ft: 6_000.0,
+            crossing: false,
         };
         let mut s = linto_altimeter(false);
         s.baro_inhg = Some(30.10); // QNH set, but we are in the flight levels
@@ -6117,6 +6294,7 @@ mod tests {
     fn altimeter_check_leaves_either_setting_alone_near_the_transition() {
         let c = AltimeterSetting {
             transition_altitude_ft: 18_000.0,
+            crossing: false,
         };
         let mut s = linto_altimeter(false);
         let qnh = s.qnh_pa.unwrap() / crate::tools::instruments::PA_PER_INHG;
