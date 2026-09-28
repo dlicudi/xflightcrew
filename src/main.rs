@@ -2057,7 +2057,13 @@ async fn run_session(
                     .to_string()
             };
             say(&voice, &reporter, ui::LogKind::Readback, &line);
-            continue;
+            // "Show me": the demonstration's own request words route on to
+            // the tool door, where the open demonstration lets exactly that
+            // tool through (`mode::tool_may_actuate`).
+            match instructor::take_demo_command() {
+                Some(words) => command = words.to_string(),
+                None => continue,
+            }
         }
         // Read-only conversation runs before the spoken domain gate: "and now"
         // and clarification replies have no command keyword. Its response type
@@ -3256,8 +3262,10 @@ async fn run_session(
             // its Instruct flavour (flow::start decides that itself); an
             // autopilot-shaped call during a lesson becomes the lesson's
             // target; everything else is refused with the action named, so
-            // the pilot does it. One door, before any confirm prompt.
-            if !mode::crew_actuates() {
+            // the pilot does it. One door, before any confirm prompt. The
+            // instructor's own demonstration ("show me") is the one tool
+            // let through, once.
+            if !mode::tool_may_actuate(&call.name, &call.arguments) {
                 if let Some(i) = checklists.iter().position(|c| c.id == call.name) {
                     if !flow::start(i, flow::Flavour::Instruct, (*config).clone(), voice.clone()) {
                         say(

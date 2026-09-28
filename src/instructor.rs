@@ -1650,6 +1650,9 @@ enum Stage {
     },
     /// The full flight from the ramp, step by step.
     Syllabus(Box<Syllabus>),
+    /// "Show me": the crew's automation flies the task, the instructor
+    /// narrates, then hands back to the brief.
+    Demonstrating(Box<Demo>),
 }
 
 struct Lesson {
@@ -1659,6 +1662,9 @@ struct Lesson {
     last_grade: Option<Grade>,
     /// The latest sample the monitor handed over, for the brief's numbers.
     latest: Option<Sample>,
+    /// The words a "show me" hands the main loop to route through the tool
+    /// door (the task's own request phrase), taken once.
+    pending_command: Option<&'static str>,
 }
 
 static LESSON: Mutex<Lesson> = Mutex::new(Lesson {
@@ -1677,6 +1683,7 @@ static LESSON: Mutex<Lesson> = Mutex::new(Lesson {
     },
     last_grade: None,
     latest: None,
+    pending_command: None,
 });
 
 fn lesson() -> std::sync::MutexGuard<'static, Lesson> {
@@ -1712,6 +1719,10 @@ pub enum Request {
     Menu,
     /// "Teach me a full flight" / "a lesson from cold and dark".
     FullFlight,
+    /// "Show me" (the briefed or flying task) / "show me a takeoff".
+    ShowMe(Option<Task>),
+    /// "My controls" while the instructor demonstrates.
+    TakeBack,
 }
 
 fn words(text: &str) -> Vec<String> {
@@ -1794,6 +1805,26 @@ pub fn request(text: &str) -> Option<Request> {
     {
         return Some(Request::End);
     }
+    // The demonstration's words. A take-back answers only a demonstration
+    // in progress (elsewhere "my controls" is the crew's release path); a
+    // "show me" only a lesson standing, or, naming a task, instructor mode
+    // ("show me the weather" in any mode is not ours).
+    let stage_kind = lesson_stage_kind();
+    if stage_kind == StageKind::Demonstrating && take_back_words(&joined) {
+        return Some(Request::TakeBack);
+    }
+    if show_me_words(&joined, &w) {
+        let stands = stage_kind != StageKind::Idle;
+        match demo_task_named(&joined) {
+            Some(task) if stands || crate::mode::instructing() => {
+                return Some(Request::ShowMe(Some(task)));
+            }
+            None if stands && w.iter().all(|x| SHOW_ME_BARE.contains(&x.as_str())) => {
+                return Some(Request::ShowMe(None));
+            }
+            _ => {}
+        }
+    }
     if has("how am i doing")
         || has("how was that")
         || has("how did i do")
@@ -1864,6 +1895,556 @@ pub fn request(text: &str) -> Option<Request> {
     None
 }
 
+// ------------------------------------------------------- the demonstration
+
+/// A demonstration whose automation has not started this long after "show
+/// me" did not start (the tool refused, and said why): the lesson resumes.
+pub const DEMO_START_S: f64 = 30.0;
+/// The automation's loop has been off this long: the demonstration is over.
+pub const DEMO_SETTLE_S: f64 = 2.0;
+/// The final and flare cues of a demonstrated landing (feet AGL).
+pub const DEMO_SHORT_FINAL_AGL_FT: f64 = 500.0;
+pub const DEMO_FLARE_AGL_FT: f64 = 30.0;
+
+/// The words a bare "show me" may carry and still be one (a lesson
+/// standing): anything else is some other question.
+const SHOW_ME_BARE: &[&str] = &[
+    "show",
+    "me",
+    "how",
+    "demonstrate",
+    "demonstration",
+    "a",
+    "the",
+    "it",
+    "that",
+    "this",
+    "please",
+    "can",
+    "could",
+    "would",
+    "you",
+    "do",
+    "one",
+    "first",
+    "give",
+    "again",
+    "instructor",
+    "let",
+    "see",
+    "watch",
+    "its",
+    "done",
+    "to",
+    "fly",
+    "i",
+    "want",
+    "like",
+    "lets",
+    "have",
+];
+
+fn show_me_words(joined: &str, w: &[String]) -> bool {
+    joined.contains("show me")
+        || w.iter().any(|x| x == "demonstrate" || x == "demonstration")
+        || joined.contains("let me see you")
+        || joined.contains("let me watch you")
+}
+
+fn take_back_words(joined: &str) -> bool {
+    [
+        "my controls",
+        "my control",
+        "i have control",
+        "i have the controls",
+        "i have the aircraft",
+        "my aircraft",
+        "stop the demonstration",
+        "stop the demo",
+        "end the demonstration",
+        "let me fly",
+        "ill take it",
+        "i will take it",
+    ]
+    .iter()
+    .any(|p| joined.contains(p))
+}
+
+/// A task named in a "show me": the two ground tasks by their own words,
+/// then the lesson names.
+fn demo_task_named(t: &str) -> Option<Task> {
+    if t.contains("takeoff") || t.contains("take off") {
+        return Some(Task::Takeoff);
+    }
+    if t.contains("taxi") {
+        return Some(Task::Taxi);
+    }
+    task_named(t)
+}
+
+impl Task {
+    /// The crew automation that demonstrates the task: its tool and the
+    /// panel's request phrase for it ([`crate::auto_status::REQUEST_PHRASES`],
+    /// grammar-pinned), so a demonstration walks the same door a button
+    /// does. `None`: nothing of the crew's flies it (air work is hands).
+    pub fn demonstration(self) -> Option<(&'static str, &'static str)> {
+        let (tool, code) = match self {
+            Task::Taxi => ("auto_taxi", 7),
+            Task::Takeoff => ("auto_takeoff", 9),
+            Task::Pattern => ("full_auto", 10),
+            Task::Landing => ("autoland", 2),
+            _ => return None,
+        };
+        crate::auto_status::REQUEST_PHRASES
+            .iter()
+            .find(|(c, _)| *c == code)
+            .map(|(_, phrase)| (tool, *phrase))
+    }
+
+    /// Where the demonstration can start: the lesson's own entry, and the
+    /// pattern from the ground (the crew's circuit is full auto, which
+    /// never arms airborne).
+    fn demo_entry_ok(self, s: &Sample) -> Result<(), &'static str> {
+        match self {
+            Task::Pattern if !s.on_ground => {
+                Err("I fly that one from the ground. Ask me to show you a landing instead")
+            }
+            _ => self.entry_ok(s),
+        }
+    }
+}
+
+/// The lesson's stage, by kind (for the word classifier).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum StageKind {
+    Idle,
+    Briefed,
+    Flying,
+    Syllabus,
+    Demonstrating,
+}
+
+fn lesson_stage_kind() -> StageKind {
+    match lesson().stage {
+        Stage::Idle => StageKind::Idle,
+        Stage::Briefed { .. } => StageKind::Briefed,
+        Stage::Flying { .. } => StageKind::Flying,
+        Stage::Syllabus(_) => StageKind::Syllabus,
+        Stage::Demonstrating(_) => StageKind::Demonstrating,
+    }
+}
+
+/// One demonstration: the automation flies, the instructor narrates, and
+/// the task's own scorer grades it as the INSTRUCTOR's (blackboxed
+/// `demo_end` with `by: instructor`, never the student's `last_grade`).
+#[derive(Debug)]
+struct Demo {
+    task: Task,
+    tool: &'static str,
+    targets: Targets,
+    started_t: f64,
+    last_t: Option<f64>,
+    /// The automation's loop has been seen running.
+    seen: bool,
+    /// Seconds the loop has been off since it was seen.
+    quiet_s: f64,
+    /// Airborne at some point of the demonstration (the touchdown cue).
+    airborne_seen: bool,
+    said: Vec<&'static str>,
+    scorer: Scorer,
+}
+
+/// How a demonstration ended by itself.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum DemoEnd {
+    /// The automation finished the task.
+    Complete,
+    /// The automation never started (its tool refused, and said why).
+    NotStarted,
+}
+
+impl DemoEnd {
+    fn key(self) -> &'static str {
+        match self {
+            DemoEnd::Complete => "complete",
+            DemoEnd::NotStarted => "not_started",
+        }
+    }
+}
+
+impl Demo {
+    fn new(
+        task: Task,
+        tool: &'static str,
+        entry: &Sample,
+        refs: &Refs,
+        level: Level,
+        now_s: f64,
+    ) -> Demo {
+        let targets = task.assign(entry, refs, level);
+        Demo {
+            task,
+            tool,
+            targets,
+            started_t: now_s,
+            last_t: None,
+            seen: false,
+            quiet_s: 0.0,
+            airborne_seen: !entry.on_ground,
+            said: Vec::new(),
+            scorer: Scorer::new(task, level, targets).with_landing_speed(refs.approach_kts),
+        }
+    }
+
+    /// One tick: `running` is the automation's loop flag. Returns the
+    /// narration to speak and, once, how the demonstration ended.
+    fn tick(&mut self, s: &Sample, running: bool) -> (Vec<String>, Option<DemoEnd>) {
+        let dt = self
+            .last_t
+            .map(|t| (s.t_s - t).clamp(0.0, 5.0))
+            .unwrap_or(0.0);
+        self.last_t = Some(s.t_s);
+        let mut lines = Vec::new();
+        if running {
+            self.seen = true;
+            self.quiet_s = 0.0;
+        } else if self.seen {
+            self.quiet_s += dt;
+        }
+        if !self.seen {
+            if s.t_s - self.started_t >= DEMO_START_S {
+                return (lines, Some(DemoEnd::NotStarted));
+            }
+            return (lines, None);
+        }
+        // The instructor's own scorer: its excursion lines are for a
+        // student, so they stay in the grade, never on the intercom.
+        let _ = self.scorer.tick(s);
+        if !s.on_ground {
+            self.airborne_seen = true;
+        }
+        if running {
+            if let Some(line) = self.cue(s) {
+                lines.push(line);
+            }
+        }
+        if self.quiet_s >= DEMO_SETTLE_S {
+            return (lines, Some(DemoEnd::Complete));
+        }
+        (lines, None)
+    }
+
+    /// The next teaching point the aircraft has reached, each said once.
+    fn cue(&mut self, s: &Sample) -> Option<String> {
+        let t = self.targets;
+        let gs = s.gs_kts.abs();
+        let air = !s.on_ground;
+        let touchdown = s.on_ground && self.airborne_seen;
+        let flare = air && self.airborne_seen && s.agl_ft < DEMO_FLARE_AGL_FT && s.vsi_fpm < 0.0;
+        let knots_or = |k: Option<f64>, what: &str| match k {
+            Some(k) => knots(k),
+            None => what.to_string(),
+        };
+        let said = |k: &str| self.said.iter().any(|x| *x == k);
+        let cues: Vec<(&'static str, bool, String)> = match self.task {
+            Task::Taxi => vec![
+                (
+                    "taxi_start",
+                    true,
+                    format!(
+                        "A little power to get moving, then back to idle. A steady {} on the straights, the nosewheel on the yellow line.",
+                        knots_or(t.pace_kts, "walking pace")
+                    ),
+                ),
+                (
+                    "taxi_brakes",
+                    gs > TAXI_MOVING_KTS,
+                    "Moving. Brakes checked, first thing.".into(),
+                ),
+                (
+                    "taxi_turn",
+                    s.taxi.and_then(|l| l.turn).is_some(),
+                    "Turn coming. Slow first, then steer as the nosewheel reaches the line, not before."
+                        .into(),
+                ),
+                (
+                    "taxi_hold",
+                    s.taxi.is_some_and(|l| l.remaining_m < 60.0) && gs > TAXI_MOVING_KTS,
+                    "Hold short line ahead. Power off early and let it roll to the line.".into(),
+                ),
+            ],
+            Task::Takeoff => vec![
+                (
+                    "takeoff_start",
+                    true,
+                    match t.vr_kts {
+                        Some(vr) => format!(
+                            "On the centreline, heels on the floor, full power smoothly. Rotation at {}.",
+                            knots(vr)
+                        ),
+                        None => "On the centreline, heels on the floor, full power smoothly."
+                            .into(),
+                    },
+                ),
+                (
+                    "takeoff_roll",
+                    s.on_ground && gs > ROLL_KTS,
+                    "Power set, gauges in the green, airspeed alive. Rudder holds the centreline."
+                        .into(),
+                ),
+                (
+                    "takeoff_rotate",
+                    s.on_ground && t.vr_kts.is_some_and(|vr| s.ias_kts >= vr - 3.0),
+                    "Rotate. Gentle back pressure, and let it fly off.".into(),
+                ),
+                (
+                    "takeoff_climb",
+                    air && s.agl_ft >= CLIMB_JUDGE_AGL_FT,
+                    format!(
+                        "Positive rate. Pitch for {}, runway heading, and trim.",
+                        knots_or(t.ias_kts, "the climb speed")
+                    ),
+                ),
+            ],
+            Task::Pattern => vec![
+                (
+                    "pattern_start",
+                    true,
+                    "The whole pattern: takeoff, pattern altitude, then power and pitch on every leg."
+                        .into(),
+                ),
+                (
+                    "pattern_lift",
+                    air,
+                    "Airborne. Climbing out on the runway heading.".into(),
+                ),
+                (
+                    "pattern_alt",
+                    air && t.alt_ft.is_some_and(|a| s.alt_ft >= a - 150.0),
+                    format!(
+                        "Pattern altitude{}. Power back, {} on the downwind.",
+                        t.alt_ft.map(|a| format!(", {}", feet(a))).unwrap_or_default(),
+                        knots_or(t.ias_kts, "pattern speed")
+                    ),
+                ),
+                (
+                    "pattern_descent",
+                    air && said("pattern_alt") && s.vsi_fpm < -300.0,
+                    "Power back abeam the numbers, and down we come. Base when the runway is over my shoulder."
+                        .into(),
+                ),
+                (
+                    "short_final",
+                    air && said("pattern_descent") && s.agl_ft < DEMO_SHORT_FINAL_AGL_FT,
+                    "Final. The aim point stays still in the windscreen, the speed on its number."
+                        .into(),
+                ),
+                (
+                    "flare",
+                    flare,
+                    "Power off. Hold it off, hold it off.".into(),
+                ),
+                (
+                    "touchdown",
+                    touchdown,
+                    "Touchdown, main wheels first. Straight down the centreline.".into(),
+                ),
+            ],
+            Task::Landing => vec![
+                (
+                    "landing_start",
+                    true,
+                    format!(
+                        "A stabilised approach: the aim point fixed, {}, small corrections early.",
+                        knots_or(t.ias_kts, "the approach speed")
+                    ),
+                ),
+                (
+                    "short_final",
+                    air && s.agl_ft < DEMO_SHORT_FINAL_AGL_FT,
+                    "Short final. Still on the speed, still on the aim point.".into(),
+                ),
+                (
+                    "flare",
+                    flare,
+                    "Power off. Hold it off, hold it off.".into(),
+                ),
+                (
+                    "touchdown",
+                    touchdown,
+                    "Touchdown, main wheels first. Straight down the centreline, brakes gently."
+                        .into(),
+                ),
+            ],
+            _ => Vec::new(),
+        };
+        let (key, _, line) = cues.into_iter().find(|(k, due, _)| *due && !said(k))?;
+        self.said.push(key);
+        Some(line)
+    }
+}
+
+/// Is the demonstrated task's automation flying?
+#[cfg(not(test))]
+fn demo_loop_running(task: Task) -> bool {
+    use std::sync::atomic::Ordering::Relaxed;
+    match task {
+        Task::Taxi => crate::autotaxi::ACTIVE.load(Relaxed),
+        Task::Takeoff => crate::autotakeoff::running() || crate::autotakeoff::ACTIVE.load(Relaxed),
+        Task::Pattern => {
+            crate::full_auto::running()
+                || crate::full_auto::ACTIVE.load(Relaxed)
+                || crate::circuit::ACTIVE.load(Relaxed)
+        }
+        Task::Landing => crate::autoland::ACTIVE.load(Relaxed),
+        _ => false,
+    }
+}
+
+/// The tests' loop flag: the real ones belong to the loops' own tests.
+#[cfg(test)]
+static TEST_DEMO_RUNNING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+#[cfg(test)]
+static TEST_DEMO_STOPPED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(test)]
+fn demo_loop_running(_: Task) -> bool {
+    TEST_DEMO_RUNNING.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// The pilot takes the aircraft back mid-demonstration: the loop stands
+/// down the way the crew's release path stands it down ("my controls"): a
+/// takeoff hands over with the power set, a taxi lets go of the speed, a
+/// circuit or a landing gives back a flyable aircraft.
+#[cfg(not(test))]
+fn stop_demo_loop(task: Task) {
+    use std::sync::atomic::Ordering::SeqCst;
+    match task {
+        Task::Taxi => {
+            crate::autotaxi::ACTIVE.store(false, SeqCst);
+            crate::tools::speedhold::ACTIVE.store(false, SeqCst);
+        }
+        Task::Takeoff => crate::autotakeoff::cancel(),
+        Task::Pattern => {
+            crate::full_auto::abort();
+            crate::circuit::abort();
+        }
+        Task::Landing => {
+            crate::autoland::abort();
+        }
+        _ => {}
+    }
+    crate::flight::note_pilot_takeover("my controls");
+}
+
+#[cfg(test)]
+fn stop_demo_loop(_: Task) {
+    TEST_DEMO_STOPPED.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// The words a "show me" hands the main loop, once: route them on to the
+/// tool door, where [`crate::mode::tool_may_actuate`] lets exactly this
+/// demonstration's tool through.
+pub fn take_demo_command() -> Option<&'static str> {
+    lesson().pending_command.take()
+}
+
+/// The hand-back line: the controls, and how the lesson goes on.
+fn hand_back_line(task: Task, s: Option<&Sample>, lead: &str) -> String {
+    let next = match s.map(|s| task.entry_ok(s)) {
+        Some(Ok(())) => "Say begin when you're ready, and fly it the same way.",
+        _ => "Set up for it again and say begin.",
+    };
+    format!("{lead}Your controls. {next}")
+}
+
+/// Close a demonstration: the permit shuts, the instructor's grade is
+/// blackboxed as the instructor's, and the lesson stands briefed on the
+/// same task (`resume`) or ends.
+fn end_demo(l: &mut Lesson, demo: Box<Demo>, reason: &str, resume: bool) {
+    crate::mode::close_demonstration();
+    l.pending_command = None;
+    let grade = demo.seen.then(|| demo.scorer.grade().json());
+    crate::blackbox::record(
+        "instructor",
+        json!({
+            "event": "demo_end", "task": demo.task.key(), "tool": demo.tool,
+            "reason": reason, "by": "instructor", "flown": demo.seen,
+            "cues": demo.said, "grade": grade,
+        }),
+    );
+    l.stage = if resume {
+        Stage::Briefed { task: demo.task }
+    } else {
+        Stage::Idle
+    };
+}
+
+/// "Show me": hand the aircraft to the crew's automation for the task.
+fn show_me(l: &mut Lesson, task: Option<Task>, now_s: f64) -> String {
+    let task = match (&l.stage, task) {
+        (Stage::Demonstrating(d), _) => {
+            return format!("I'm showing you {} now. Watch.", d.task.name());
+        }
+        (Stage::Syllabus(_), _) => {
+            return "Not in the full flight. Say end the lesson first, then show me, and a task."
+                .into();
+        }
+        (_, Some(t)) => t,
+        (Stage::Briefed { task }, None) => *task,
+        (Stage::Flying { scorer }, None) => scorer.task(),
+        (Stage::Idle, None) => return "Show you what? Say show me, and a task.".into(),
+    };
+    let Some((tool, phrase)) = task.demonstration() else {
+        return format!(
+            "I can't demonstrate {}: nothing of the crew's flies it, it's all hands. I can show you a taxi, a takeoff, the pattern or a landing.",
+            task.name()
+        );
+    };
+    if !crate::mode::instructing() {
+        return "Demonstrations run in instructor mode. Flip the mode in Settings and ask again."
+            .into();
+    }
+    let Some(s) = l.latest else {
+        return "I can't see the aircraft yet. Give me a moment and ask again.".into();
+    };
+    if let Err(why) = task.demo_entry_ok(&s) {
+        return format!("To show you {}, {why}.", task.name());
+    }
+    let from = match &l.stage {
+        Stage::Idle => "idle",
+        Stage::Briefed { .. } => "briefed",
+        _ => "flying",
+    };
+    // A student's attempt in progress is closed as the student's, on the
+    // numbers so far: the demonstration is never graded to them.
+    if let Stage::Flying { scorer } = &l.stage {
+        let grade = scorer.grade();
+        crate::blackbox::record(
+            "instructor",
+            json!({ "event": "end", "reason": "demonstration", "grade": grade.json() }),
+        );
+        l.last_grade = Some(grade);
+    }
+    let demo = Demo::new(task, tool, &s, &l.refs, l.level, now_s);
+    crate::blackbox::record(
+        "instructor",
+        json!({
+            "event": "demo_start", "task": task.key(), "tool": tool, "phrase": phrase,
+            "from": from, "by": "instructor", "t_s": now_s,
+            "alt": demo.targets.alt_ft, "ias": demo.targets.ias_kts,
+            "vr": demo.targets.vr_kts, "pace": demo.targets.pace_kts,
+        }),
+    );
+    l.stage = Stage::Demonstrating(Box::new(demo));
+    l.pending_command = Some(phrase);
+    crate::mode::open_demonstration(tool);
+    format!(
+        "My controls. I'll show you {}. Watch, and say my controls to take it back.",
+        task.name()
+    )
+}
+
 fn menu() -> String {
     format!(
         "I can teach {}, or a full flight from cold and dark. Say teach me, and the one you want.",
@@ -1877,10 +2458,25 @@ fn menu() -> String {
 
 /// Answer a lesson request. `now_s` is the monitor's clock (seconds), the
 /// same one [`tick`] is fed with. Returns the line to speak.
+/// A lesson word that needs the aircraft back first.
+const DEMO_BUSY: &str = "I'm demonstrating. Say my controls first.";
+
 pub fn handle(req: Request, now_s: f64) -> String {
     let mut l = lesson();
     match req {
         Request::Menu => menu(),
+        Request::ShowMe(task) => show_me(&mut l, task, now_s),
+        Request::TakeBack => {
+            let stage = std::mem::replace(&mut l.stage, Stage::Idle);
+            let Stage::Demonstrating(demo) = stage else {
+                l.stage = stage;
+                return "You have it.".into();
+            };
+            let task = demo.task;
+            stop_demo_loop(task);
+            end_demo(&mut l, demo, "pilot", true);
+            hand_back_line(task, l.latest.as_ref(), "")
+        }
         Request::SetLevel(level) => {
             l.level = level;
             crate::blackbox::record(
@@ -1898,6 +2494,7 @@ pub fn handle(req: Request, now_s: f64) -> String {
                     );
                 }
                 Stage::Syllabus(_) => return "We're already on the full flight.".into(),
+                Stage::Demonstrating(_) => return DEMO_BUSY.into(),
                 _ => {}
             }
             let Some(s) = l.latest else {
@@ -1929,6 +2526,7 @@ pub fn handle(req: Request, now_s: f64) -> String {
                 Stage::Syllabus(_) => {
                     return "We're on the full flight. Say end the lesson to leave it.".into();
                 }
+                Stage::Demonstrating(_) => return DEMO_BUSY.into(),
                 _ => {}
             }
             let Some(s) = l.latest else {
@@ -2010,6 +2608,7 @@ pub fn handle(req: Request, now_s: f64) -> String {
         Request::Interim => match &l.stage {
             Stage::Flying { scorer } => scorer.grade().spoken(),
             Stage::Syllabus(sy) => sy.interim(),
+            Stage::Demonstrating(_) => "I'm flying this one. Watch, and you'll fly it next.".into(),
             _ => match &l.last_grade {
                 Some(g) => g.spoken(),
                 None => "No lesson running. Say teach me, and a task.".into(),
@@ -2024,6 +2623,7 @@ pub fn handle(req: Request, now_s: f64) -> String {
             }
             Stage::Flying { scorer } => scorer.task().brief(&scorer.targets(), l.level),
             Stage::Syllabus(sy) => sy.standards(),
+            Stage::Demonstrating(d) => d.task.brief(&d.targets, l.level),
             Stage::Idle => "No lesson running. Say teach me, and a task.".into(),
         },
         Request::End => {
@@ -2059,6 +2659,11 @@ pub fn handle(req: Request, now_s: f64) -> String {
                         json!({ "event": "syllabus_end", "reason": "pilot" }),
                     );
                     format!("Lesson over. {}", sy.summary())
+                }
+                Stage::Demonstrating(demo) => {
+                    stop_demo_loop(demo.task);
+                    end_demo(&mut l, demo, "lesson_ended", false);
+                    "Lesson over. Your controls.".into()
                 }
             }
         }
@@ -2129,6 +2734,34 @@ pub fn tick(s: Sample) -> Vec<String> {
 pub fn tick_with(s: Sample, io: &mut dyn SyllabusIo) -> Vec<String> {
     let mut l = lesson();
     l.latest = Some(s);
+    if let Stage::Demonstrating(demo) = &mut l.stage {
+        let running = demo_loop_running(demo.task);
+        let (mut lines, end) = demo.tick(&s, running);
+        for line in &lines {
+            crate::blackbox::record(
+                "instructor",
+                json!({ "event": "demo_narration", "task": demo.task.key(), "line": line, "t_s": s.t_s, "by": "instructor" }),
+            );
+        }
+        if let Some(end) = end {
+            let Stage::Demonstrating(demo) = std::mem::replace(&mut l.stage, Stage::Idle) else {
+                unreachable!("matched above");
+            };
+            let task = demo.task;
+            // A loop the pilot cancelled at the tool door ended in their
+            // hands, not as a finished demonstration.
+            let by_pilot = crate::mode::demonstration_stopped();
+            let reason = if by_pilot { "pilot" } else { end.key() };
+            end_demo(&mut l, demo, reason, true);
+            let lead = match end {
+                _ if by_pilot => "",
+                DemoEnd::Complete => "That's the demonstration. ",
+                DemoEnd::NotStarted => "The demonstration didn't start. ",
+            };
+            lines.push(hand_back_line(task, Some(&s), lead));
+        }
+        return lines;
+    }
     if let Stage::Syllabus(sy) = &mut l.stage {
         let (lines, done) = sy.tick(&s, io);
         if done {
@@ -2180,6 +2813,17 @@ pub fn abandon(reason: &str) -> bool {
     if matches!(l.stage, Stage::Idle) {
         return false;
     }
+    // A demonstration's permit dies with the lesson; the loop it armed is
+    // the caller's (a swap stands every loop down; out of instructor mode
+    // the crew owns what flies).
+    if let Stage::Demonstrating(d) = &l.stage {
+        crate::blackbox::record(
+            "instructor",
+            json!({ "event": "demo_end", "task": d.task.key(), "tool": d.tool, "reason": reason, "by": "instructor", "flown": d.seen }),
+        );
+        crate::mode::close_demonstration();
+        l.pending_command = None;
+    }
     l.stage = Stage::Idle;
     crate::blackbox::record("instructor", json!({ "event": "end", "reason": reason }));
     true
@@ -2210,6 +2854,10 @@ pub fn status() -> Option<String> {
             scorer.elapsed_s()
         )),
         Stage::Syllabus(sy) => Some(format!("lesson: full flight, {}", sy.step_name())),
+        Stage::Demonstrating(d) => Some(format!(
+            "lesson: demonstrating {}",
+            d.task.key().replace('_', " ")
+        )),
     }
 }
 
@@ -4129,5 +4777,319 @@ mod tests {
         let c = Task::SteepTurns.assign(&entry, &refs172(), Level::Commercial);
         assert_eq!(c.bank_deg, Some(50.0));
         assert_eq!(c.ias_kts, Some(95.0), "at or below Va, rounded down to 5");
+    }
+
+    // ---------------------------------------------------- the demonstration
+
+    /// A clean slate for a demonstration test: instructor mode, no lesson,
+    /// the loop flags down. The caller holds `mode::TEST_LOCK`.
+    fn demo_reset() {
+        use std::sync::atomic::Ordering::SeqCst;
+        crate::mode::set(crate::mode::Mode::Instructor);
+        crate::mode::close_demonstration();
+        TEST_DEMO_RUNNING.store(false, SeqCst);
+        TEST_DEMO_STOPPED.store(false, SeqCst);
+        let mut l = lesson();
+        l.stage = Stage::Idle;
+        l.refs = refs172();
+        l.level = Level::Private;
+        l.latest = None;
+        l.last_grade = None;
+        l.pending_command = None;
+    }
+
+    fn demo_done() {
+        use std::sync::atomic::Ordering::SeqCst;
+        TEST_DEMO_RUNNING.store(false, SeqCst);
+        lesson().stage = Stage::Idle;
+        crate::mode::set(crate::mode::Mode::Both);
+    }
+
+    #[test]
+    fn show_me_is_a_closed_vocabulary() {
+        let _g = crate::mode::TEST_LOCK.lock().unwrap();
+        demo_reset();
+        crate::mode::set(crate::mode::Mode::Both);
+        assert_eq!(request("show me the weather"), None);
+        assert_eq!(
+            request("show me a takeoff"),
+            None,
+            "a task named outside instructor mode is not a lesson word"
+        );
+        crate::mode::set(crate::mode::Mode::Instructor);
+        assert_eq!(
+            request("show me a takeoff"),
+            Some(Request::ShowMe(Some(Task::Takeoff)))
+        );
+        assert_eq!(
+            request("can you demonstrate the landing"),
+            Some(Request::ShowMe(Some(Task::Landing)))
+        );
+        assert_eq!(
+            request("show me how to taxi"),
+            Some(Request::ShowMe(Some(Task::Taxi)))
+        );
+        assert_eq!(
+            request("show me the traffic pattern"),
+            Some(Request::ShowMe(Some(Task::Pattern)))
+        );
+        assert_eq!(request("show me"), None, "no lesson standing, no task");
+        assert_eq!(request("show me the weather"), None);
+        assert_eq!(request("my controls"), None, "no demonstration running");
+        lesson().stage = Stage::Briefed {
+            task: Task::Landing,
+        };
+        assert_eq!(request("show me"), Some(Request::ShowMe(None)));
+        assert_eq!(
+            request("could you demonstrate it first please"),
+            Some(Request::ShowMe(None))
+        );
+        assert_eq!(
+            request("show me how it's done"),
+            Some(Request::ShowMe(None))
+        );
+        assert_eq!(
+            request("show me the fuel"),
+            None,
+            "a bare show-me carries nothing else"
+        );
+        assert_eq!(request("my controls"), None, "briefed is not demonstrating");
+        demo_done();
+    }
+
+    /// Every demonstration walks the panel button's own words through the
+    /// tool door: the spoken gate passes them and the grammar picks the
+    /// very tool the permit opens.
+    #[test]
+    fn every_demonstration_is_the_panel_request_for_its_tool() {
+        let profile = crate::aircraft::load("cessna_172sp").expect("cessna profile");
+        let reg = crate::tools::Registry::for_aircraft(&profile);
+        let mut shown = 0;
+        for task in Task::ALL {
+            let Some((tool, phrase)) = task.demonstration() else {
+                continue;
+            };
+            shown += 1;
+            assert!(crate::router::looks_like_command(phrase), "{phrase}");
+            let calls = crate::grammar::try_parse(phrase, &reg, &profile)
+                .unwrap_or_else(|| panic!("{phrase} does not parse"));
+            assert_eq!(calls.len(), 1, "{phrase}");
+            assert_eq!(calls[0].name, tool, "{phrase}");
+        }
+        assert_eq!(shown, 4, "taxi, takeoff, pattern, landing");
+        assert_eq!(Task::SteepTurns.demonstration(), None, "air work is hands");
+    }
+
+    #[test]
+    fn a_takeoff_demonstration_flies_narrates_and_hands_back_to_the_brief() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let _g = crate::mode::TEST_LOCK.lock().unwrap();
+        demo_reset();
+        tick(gnd(0.0, 0.0, 90.0, true));
+        assert!(handle(Request::Start(Task::Takeoff), 0.5).starts_with("Normal takeoff"));
+        assert_eq!(request("show me"), Some(Request::ShowMe(None)));
+        let line = handle(Request::ShowMe(None), 1.0);
+        assert!(
+            line.starts_with("My controls. I'll show you a normal takeoff."),
+            "{line}"
+        );
+        // The main loop routes the button's words, once.
+        assert_eq!(take_demo_command(), Some("take off for me"));
+        assert_eq!(take_demo_command(), None);
+        // The hands gate: that tool once, nothing else, the duties still off.
+        assert!(!crate::mode::tool_may_actuate("set_flaps", &json!({})));
+        assert!(crate::mode::tool_may_actuate("auto_takeoff", &json!({})));
+        assert!(!crate::mode::tool_may_actuate("auto_takeoff", &json!({})));
+        assert!(!crate::mode::crew_actuates());
+        assert_eq!(status().as_deref(), Some("lesson: demonstrating takeoff"));
+        assert_eq!(
+            request("begin"),
+            None,
+            "nothing briefed while demonstrating"
+        );
+        assert_eq!(
+            handle(Request::Interim, 1.5),
+            "I'm flying this one. Watch, and you'll fly it next."
+        );
+        // The automation flies: the roll, the rotation at 55, the climb.
+        TEST_DEMO_RUNNING.store(true, SeqCst);
+        let mut said = Vec::new();
+        let mut t = 2.0;
+        let mut gs = 0.0;
+        while gs < 58.0 {
+            gs += 3.0;
+            let mut s = gnd(t, gs, 90.0, true);
+            s.ias_kts = gs;
+            said.extend(tick(s));
+            t += 1.0;
+        }
+        let mut agl = 0.0;
+        while agl < 400.0 {
+            agl += 40.0;
+            let mut s = air(t, 100.0 + agl, 90.0, 70.0);
+            s.agl_ft = agl;
+            s.vsi_fpm = 700.0;
+            said.extend(tick(s));
+            t += 1.0;
+        }
+        assert_eq!(said.len(), 4, "one line per teaching point: {said:?}");
+        assert!(said[0].ends_with("Rotation at 55 knots."), "{said:?}");
+        assert!(said[1].starts_with("Power set"), "{said:?}");
+        assert!(said[2].starts_with("Rotate."), "{said:?}");
+        assert_eq!(
+            said[3],
+            "Positive rate. Pitch for 74 knots, runway heading, and trim."
+        );
+        // The loop hands over: two quiet seconds end the demonstration.
+        TEST_DEMO_RUNNING.store(false, SeqCst);
+        let mut end = Vec::new();
+        for _ in 0..4 {
+            let mut s = air(t, 520.0, 90.0, 74.0);
+            s.agl_ft = 420.0;
+            end.extend(tick(s));
+            t += 1.0;
+        }
+        assert_eq!(
+            end,
+            vec![
+                "That's the demonstration. Your controls. Set up for it again and say begin."
+                    .to_string()
+            ]
+        );
+        // The lesson stands briefed on the same task, the permit shut, and
+        // nothing of the demonstration graded to the student.
+        assert!(matches!(
+            lesson().stage,
+            Stage::Briefed {
+                task: Task::Takeoff
+            }
+        ));
+        assert!(lesson().last_grade.is_none());
+        assert_eq!(crate::mode::demonstration_tool(), None);
+        assert!(!crate::mode::tool_may_actuate(
+            "auto_takeoff",
+            &json!({ "off": true })
+        ));
+        demo_done();
+    }
+
+    #[test]
+    fn the_pilot_takes_a_demonstration_back_and_one_that_never_starts_resumes() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let _g = crate::mode::TEST_LOCK.lock().unwrap();
+        demo_reset();
+        tick(air(0.0, 2500.0, 270.0, 90.0));
+        // Straight from idle, naming the task.
+        let line = handle(Request::ShowMe(Some(Task::Landing)), 1.0);
+        assert!(line.contains("a normal approach and landing"), "{line}");
+        assert_eq!(take_demo_command(), Some("land the aircraft"));
+        TEST_DEMO_RUNNING.store(true, SeqCst);
+        let said = tick(air(2.0, 2400.0, 270.0, 65.0));
+        assert_eq!(
+            said,
+            vec![
+                "A stabilised approach: the aim point fixed, 65 knots, small corrections early."
+                    .to_string()
+            ]
+        );
+        assert_eq!(request("my controls"), Some(Request::TakeBack));
+        assert_eq!(request("I have control"), Some(Request::TakeBack));
+        assert_eq!(
+            handle(Request::TakeBack, 3.0),
+            "Your controls. Say begin when you're ready, and fly it the same way."
+        );
+        assert!(TEST_DEMO_STOPPED.load(SeqCst), "the loop was stood down");
+        assert_eq!(crate::mode::demonstration_tool(), None);
+        assert!(matches!(
+            lesson().stage,
+            Stage::Briefed {
+                task: Task::Landing
+            }
+        ));
+        // A demonstration whose tool refused: the loop never runs.
+        TEST_DEMO_RUNNING.store(false, SeqCst);
+        handle(Request::ShowMe(None), 10.0);
+        let mut said = Vec::new();
+        let mut t = 11.0;
+        while t < 10.0 + DEMO_START_S + 2.0 {
+            said.extend(tick(air(t, 2400.0, 270.0, 90.0)));
+            t += 1.0;
+        }
+        assert_eq!(
+            said,
+            vec!["The demonstration didn't start. Your controls. Say begin when you're ready, and fly it the same way."
+                .to_string()]
+        );
+        // The pilot's cancel at the tool door ends it in their hands.
+        handle(Request::ShowMe(None), 50.0);
+        TEST_DEMO_RUNNING.store(true, SeqCst);
+        tick(air(51.0, 2400.0, 270.0, 65.0));
+        assert!(crate::mode::tool_may_actuate(
+            "autoland",
+            &json!({ "cancel": true })
+        ));
+        TEST_DEMO_RUNNING.store(false, SeqCst);
+        let mut said = Vec::new();
+        for i in 0..4 {
+            said.extend(tick(air(52.0 + i as f64, 2400.0, 270.0, 65.0)));
+        }
+        assert_eq!(
+            said,
+            vec![
+                "Your controls. Say begin when you're ready, and fly it the same way.".to_string()
+            ]
+        );
+        // "End the lesson" mid-demonstration stands the loop down too.
+        handle(Request::ShowMe(None), 60.0);
+        TEST_DEMO_STOPPED.store(false, SeqCst);
+        assert_eq!(handle(Request::End, 61.0), "Lesson over. Your controls.");
+        assert!(TEST_DEMO_STOPPED.load(SeqCst));
+        assert!(!active());
+        assert_eq!(crate::mode::demonstration_tool(), None);
+        demo_done();
+    }
+
+    #[test]
+    fn only_the_crews_tasks_are_demonstrated_and_a_students_attempt_stays_theirs() {
+        let _g = crate::mode::TEST_LOCK.lock().unwrap();
+        demo_reset();
+        tick(air(0.0, 3500.0, 90.0, 100.0));
+        let no = handle(Request::ShowMe(Some(Task::SteepTurns)), 0.5);
+        assert!(no.starts_with("I can't demonstrate steep turns"), "{no}");
+        assert_eq!(take_demo_command(), None, "nothing routed");
+        assert_eq!(crate::mode::demonstration_tool(), None, "nothing opened");
+        let air_pattern = handle(Request::ShowMe(Some(Task::Pattern)), 0.6);
+        assert!(
+            air_pattern
+                .starts_with("To show you the traffic pattern, I fly that one from the ground"),
+            "{air_pattern}"
+        );
+        // A student flying the landing asks to see it: their attempt is
+        // closed as theirs, and the demonstration opens.
+        handle(Request::Start(Task::Landing), 1.0);
+        handle(Request::Begin, 1.0);
+        for i in 2..6 {
+            tick(air(i as f64, 3400.0, 90.0, 66.0));
+        }
+        assert!(lesson().last_grade.is_none());
+        assert!(handle(Request::ShowMe(None), 6.0).starts_with("My controls."));
+        assert!(
+            lesson().last_grade.is_some(),
+            "the attempt so far is the student's"
+        );
+        assert_eq!(crate::mode::demonstration_tool(), Some("autoland"));
+        assert_eq!(handle(Request::Start(Task::Climb), 6.5), DEMO_BUSY);
+        // The mode changing under it retires the permit with the lesson.
+        assert!(abandon("mode_change"));
+        assert_eq!(crate::mode::demonstration_tool(), None);
+        assert_eq!(take_demo_command(), None);
+        // Outside instructor mode nothing is demonstrated.
+        crate::mode::set(crate::mode::Mode::Both);
+        let off = handle(Request::ShowMe(Some(Task::Takeoff)), 7.0);
+        assert!(
+            off.starts_with("Demonstrations run in instructor mode"),
+            "{off}"
+        );
+        demo_done();
     }
 }
