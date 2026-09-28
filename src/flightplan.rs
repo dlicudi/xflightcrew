@@ -1467,6 +1467,7 @@ mod tests {
                 width_m: 45.0,
                 surface: 1,
             }],
+            transition_level_ft: None,
         }
     }
 
