@@ -3732,6 +3732,127 @@ pub fn arm_new_flight(icao: &str, now: Instant) -> Option<i64> {
     Some(khz)
 }
 
+/// A new flight airborne is worked by the nearest towered field within this
+/// (a setup's final is at most 30 nm out).
+const NEW_FLIGHT_AIR_NM: f64 = 30.0;
+
+/// The towered field a new flight at this position belongs to. On the
+/// ground: the field whose pavement is under the wheels (the region's own
+/// ground rule, nearest runway footprint within [`AT_FIELD_NM`]). Airborne:
+/// the nearest within [`NEW_FLIGHT_AIR_NM`]. `None`: no staffed tower here
+/// (an uncontrolled field, or nowhere). Pure over the index.
+fn field_under_in(region: &[RegionApt], lat: f64, lon: f64, on_ground: bool) -> Option<&RegionApt> {
+    let reach = if on_ground { AT_FIELD_NM } else { NEW_FLIGHT_AIR_NM };
+    let dist = |a: &RegionApt| {
+        let direct = crate::nav::haversine_nm(lat, lon, a.lat, a.lon);
+        if on_ground {
+            a.apt.ground_distance_nm(lat, lon).unwrap_or(direct)
+        } else {
+            direct
+        }
+    };
+    region
+        .iter()
+        .filter(|a| a.apt.freq(nav::FREQ_TOWER).is_some())
+        .map(|a| (dist(a), a))
+        .filter(|(d, _)| *d <= reach)
+        .min_by(|x, y| x.0.total_cmp(&y.0))
+        .map(|(_, a)| a)
+}
+
+/// The towered field under the aircraft, as (ICAO, name); see
+/// [`field_under_in`].
+pub fn field_under(lat: f64, lon: f64, on_ground: bool) -> Option<(String, String)> {
+    let region = REGION.lock().unwrap_or_else(|e| e.into_inner());
+    field_under_in(&region, lat, lon, on_ground).map(|a| (a.icao.clone(), a.apt.name.clone()))
+}
+
+/// A NEW FLIGHT wherever the sim put us: the station for the field under
+/// the aircraft's NEW position is rebuilt ([`arm_new_flight`]), never the
+/// field the station happened to be working. EGKK, 2026-09-28: the runner
+/// moved the 737 from LEMG to Gatwick stand 71, the new-flight watch re-armed
+/// the ACTIVE field (Malaga) and its cooldown held the region's relocation
+/// off for 180 s, so full auto departed Gatwick as an uncontrolled field and
+/// looked its stand up at LEMG (#151). Returns the field and its tower;
+/// `None` when no staffed tower is under the position (nothing armed: the
+/// old station, retired and out of reach, stays silent).
+pub fn arm_new_flight_at(lat: f64, lon: f64, on_ground: bool, now: Instant) -> Option<(String, i64)> {
+    let (icao, _) = field_under(lat, lon, on_ground)?;
+    let khz = arm_new_flight(&icao, now)?;
+    Some((icao, khz))
+}
+
+/// Whether the installed station is the departure field's, judged at a
+/// mission's arm.
+#[derive(Debug, Clone, PartialEq)]
+pub enum DepartureStation {
+    /// The station up is the field's (or no towered field is under us: an
+    /// uncontrolled departure).
+    Ready,
+    /// The field's station is armed and the main loop has not installed it.
+    Waiting { want: String },
+    /// The station up is another field's (or the last flight's worksheet)
+    /// and nothing is armed for this one.
+    Arm { want: String },
+}
+
+/// Judge the station against the field under the aircraft. `active`: the
+/// installed station's field; `under`: the towered field under the wheels;
+/// `pending`: a swap armed and not yet installed; `new_flight_pending`: the
+/// station up still holds the last flight's worksheet. Pure.
+pub fn judge_departure_station(
+    active: Option<&str>,
+    under: Option<&str>,
+    pending: Option<&str>,
+    new_flight_pending: bool,
+) -> DepartureStation {
+    let Some(want) = under else {
+        return DepartureStation::Ready;
+    };
+    let same = |x: Option<&str>| x.is_some_and(|x| x.eq_ignore_ascii_case(want));
+    if same(pending) {
+        return DepartureStation::Waiting { want: want.to_string() };
+    }
+    if same(active) && !new_flight_pending && pending.is_none() {
+        return DepartureStation::Ready;
+    }
+    DepartureStation::Arm { want: want.to_string() }
+}
+
+/// The field of the swap armed and not yet installed.
+fn pending_station_icao() -> Option<String> {
+    PENDING_STATION
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .map(|(icao, _)| icao.clone())
+}
+
+/// The departure station at the aircraft's position, on the ground: judged
+/// by [`judge_departure_station`], and the field's station armed when `arm`
+/// and the verdict asks for it. Returns the verdict and the installed
+/// station's field.
+pub fn departure_station(
+    lat: f64,
+    lon: f64,
+    arm: bool,
+    now: Instant,
+) -> (DepartureStation, Option<String>) {
+    let under = field_under(lat, lon, true).map(|(icao, _)| icao);
+    let active = active_icao().map(|(icao, _, _)| icao);
+    let pending = pending_station_icao();
+    let verdict = judge_departure_station(
+        active.as_deref(),
+        under.as_deref(),
+        pending.as_deref(),
+        new_flight_pending(),
+    );
+    if let (DepartureStation::Arm { want }, true) = (&verdict, arm) {
+        let _ = arm_new_flight(want, now);
+    }
+    (verdict, active)
+}
+
 /// The radio row's content: the ACTIVE station's name and services — but only
 /// while it's inside VHF range. A tower you can't physically raise isn't a
 /// radio row; parked in Extremadura the panel showed Gibraltar's comm plan as
@@ -10667,6 +10788,92 @@ mod tests {
         *REGION.lock().unwrap() = Vec::new();
         *ACTIVE_FIELD.lock().unwrap() = None;
         *LAST_REGION_SWITCH.lock().unwrap() = None;
+    }
+
+    /// EGKK, 2026-09-28 (#151): after a day at LEMG the runner put the 737 on
+    /// Gatwick stand 71 (51.15540 N 0.16537 W). The new-flight watch re-armed
+    /// the ACTIVE field (LEMG, tower 118155) and its cooldown held the
+    /// region's relocation off for 180 s: full auto departed Gatwick as an
+    /// uncontrolled field and looked stand 71 up at LEMG, 1,639 km away. A
+    /// new flight's station is the field under its NEW position.
+    fn lemg_and_egkk() -> Vec<RegionApt> {
+        let mut malaga = region_apt("LEMG Malaga", 36.675, -4.499);
+        malaga.apt.freqs[0].khz = 118155;
+        let mut gatwick = region_apt("EGKK London Gatwick", 51.1481, -0.1903);
+        gatwick.apt.freqs[0].khz = 124230;
+        gatwick.apt.runways = vec![nav::Runway {
+            ident_a: "08R".into(),
+            ident_b: "26L".into(),
+            lat_a: 51.14495,
+            lon_a: -0.21262,
+            lat_b: 51.15132,
+            lon_b: -0.16813,
+            width_m: 45.0,
+            surface: 1,
+        }];
+        vec![malaga, gatwick]
+    }
+
+    #[test]
+    fn a_new_flight_takes_the_station_of_the_field_it_was_put_at() {
+        let _guard = SIDE_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let region = lemg_and_egkk();
+        // Stand 71: Gatwick's, whatever station was up.
+        let stand_71 = (51.155_395_5, -0.165_369_4);
+        let at = field_under_in(&region, stand_71.0, stand_71.1, true).expect("Gatwick");
+        assert_eq!(at.icao, "EGKK");
+        // Malaga's ramp is Malaga's.
+        assert_eq!(field_under_in(&region, 36.6716, -4.4890, true).unwrap().icao, "LEMG");
+        // A field with no tower in the index (on the ground 20 nm from both):
+        // nobody's, nothing armed.
+        assert!(field_under_in(&region, 51.4, -0.6, true).is_none());
+        // Airborne on a 10 nm final to Gatwick: Gatwick.
+        assert_eq!(field_under_in(&region, 51.12, -0.45, false).unwrap().icao, "EGKK");
+
+        // Live: the station up is Malaga's, a relocation was switched 20 s ago
+        // (the cooldown that held the region back), and the new flight at
+        // stand 71 arms Gatwick all the same.
+        *REGION.lock().unwrap() = region;
+        *ACTIVE_FIELD.lock().unwrap() = Some(("LEMG Malaga".into(), 36.675, -4.499));
+        *PENDING_STATION.lock().unwrap() = None;
+        let now = Instant::now();
+        *LAST_REGION_SWITCH.lock().unwrap() = Some(now);
+        assert_eq!(
+            arm_new_flight_at(stand_71.0, stand_71.1, true, now),
+            Some(("EGKK".to_string(), 124230))
+        );
+        let armed = PENDING_STATION.lock().unwrap().take().expect("Gatwick armed");
+        assert_eq!(armed.1.name, "EGKK London Gatwick");
+        // Nowhere towered: nothing armed.
+        assert_eq!(arm_new_flight_at(51.4, -0.6, true, now), None);
+        assert!(PENDING_STATION.lock().unwrap().is_none());
+        *REGION.lock().unwrap() = Vec::new();
+        *ACTIVE_FIELD.lock().unwrap() = None;
+        *LAST_REGION_SWITCH.lock().unwrap() = None;
+    }
+
+    /// Full auto's arm waits for the departure field's station: the one up
+    /// must be the field under the wheels, and not the last flight's
+    /// worksheet (#151).
+    #[test]
+    fn the_departure_station_is_the_field_under_the_wheels() {
+        use DepartureStation::*;
+        let want = || "EGKK".to_string();
+        // The EGKK case at the arm: Malaga up, nothing armed.
+        assert_eq!(judge_departure_station(Some("LEMG"), Some("EGKK"), None, true), Arm { want: want() });
+        assert_eq!(judge_departure_station(Some("LEMG"), Some("EGKK"), None, false), Arm { want: want() });
+        // Armed, not yet installed.
+        assert_eq!(judge_departure_station(Some("LEMG"), Some("EGKK"), Some("EGKK"), true), Waiting { want: want() });
+        // Another field armed (a stale swap): this one is armed over it.
+        assert_eq!(judge_departure_station(Some("LEMG"), Some("EGKK"), Some("LEMG"), true), Arm { want: want() });
+        // Installed.
+        assert_eq!(judge_departure_station(Some("EGKK"), Some("EGKK"), None, false), Ready);
+        // The right field, still holding the last flight's worksheet.
+        assert_eq!(judge_departure_station(Some("EGKK"), Some("EGKK"), None, true), Arm { want: want() });
+        // No station at all yet.
+        assert_eq!(judge_departure_station(None, Some("EGKK"), None, false), Arm { want: want() });
+        // No towered field under us: an uncontrolled departure is ready as is.
+        assert_eq!(judge_departure_station(Some("LEMG"), None, None, true), Ready);
     }
 
     /// LEMG, 2026-09-28 (sortie 1790584266-approach): the previous case was
