@@ -31,12 +31,21 @@
 #                  laws tick in wall time, so treat 2x as an experiment.
 #       settle_s: seconds after a ramp or runway start is still before the
 #                 command (default 10, for the profile detection).
+#       after: park (default) or stop, what follows the verdict on the
+#              ground. park waits for the taxi-in to finish by itself before
+#              the next setup (up to 10 min); stop types "my controls" at
+#              once (the crew brakes to a stop and parks). Use park only
+#              where the case tests the vacate, the taxi in or the stand.
+#              A spec-level `after:` is every case's default.
 #
 # A runway YAML would read as a number may be quoted or not: 13 and "13"
 # are the same runway. `runway: wind` is the into-wind end, picked at the
 # case's setup by the tower's own rule (best_runway_for_wind) from the
 # field's METAR, else the sim's wind with the aircraft on the field; the row
 # names the runway and the wind.
+
+# Landings and circuits: none of them tests the taxi in.
+after: stop
 
 cases:
   - name: LEMG into the wind, 10 nm final
@@ -50,8 +59,9 @@ cases:
     deadline_min: 8
 
   # "Fly a circuit" is full auto's circuit: on the runway it skips the
-  # start and the taxi, works the tower, and flies the pattern to a landing
-  # and the taxi in, all one sortie.
+  # start and the taxi, works the tower, and flies the pattern to a landing.
+  # Its sortie ends at the taxi_in stage; the taxi in follows unscored, and
+  # `after: stop` ends it there.
   - name: LEMG runway start into the wind, circuit
     setup:
       runway_start: { field: LEMG, runway: wind, engines_running: true }

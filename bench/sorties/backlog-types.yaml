@@ -7,6 +7,10 @@
 # the finals carry no deadline of their own, so each gets the default scaled
 # to its airframe's approach speed.
 
+# The taxi in is waited out only where the case tests it (the SR22 from the
+# ramp) and for the S-76, whose taxi in is a hover taxi.
+after: stop
+
 cases:
   # SR22 from a stand: taxi, the line-up pivot on the brake (#46, #60),
   # the circuit, the landing and taxi-in.
@@ -16,6 +20,7 @@ cases:
       ramp: { field: LEMG }
     command: fly a circuit
     deadline_min: 35
+    after: park
 
   - name: SR22 LEMG into the wind, 10 nm final
     setup:
@@ -77,6 +82,7 @@ cases:
       - { say: plan a flight to LXGB, when: start, tool: plan_flight }
       - { say: fly the flight plan, when: { after_s: 15 }, tool: hover }
     deadline_min: 60
+    after: park
 
   - name: S-76 LEMG runway start into the wind, circuit
     setup:
@@ -84,3 +90,4 @@ cases:
       runway_start: { field: LEMG, runway: wind, engines_running: true }
     command: fly a circuit
     deadline_min: 20
+    after: park

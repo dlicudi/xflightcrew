@@ -53,6 +53,102 @@ fn arrest_release() {
     ARREST_HOLD.store(false, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// A taxi-in is running: from [`start`] to the end of its thread, vacate,
+/// request and drive alike (the request's wait drives nothing, so the auto
+/// taxi's flag alone does not say it).
+pub(crate) static ACTIVE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+/// The running taxi-in's generation: a newer [`start`] supersedes it.
+static GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Set by [`abort`]: the taxi-in ends where it is.
+static CANCEL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// With [`CANCEL`]: whether the end stops and parks the aircraft (the
+/// pilot's "my controls") or only lets go (a stand-down for a swap or a new
+/// flight, whose setup owns the aircraft).
+static CANCEL_HOLD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether a taxi-in is running.
+pub fn running() -> bool {
+    ACTIVE.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// End the running taxi-in where it is: its drive halted, its governor off,
+/// nothing requested or driven after. `hold`: the aircraft is then braked to
+/// a stop and parked (`full_auto::hand_back_hold`), the pilot's release. It
+/// used to be only the auto taxi's flag: LEMG (2026-09-28, t 1790591992.8)
+/// "my controls" in the vacate stopped the drive, and the taxi-in reported
+/// vacated, called for taxi and drove to the stand 7 s later.
+pub fn abort(hold: bool) {
+    use std::sync::atomic::Ordering::SeqCst;
+    if !ACTIVE.load(SeqCst) {
+        return;
+    }
+    CANCEL_HOLD.store(hold, SeqCst);
+    CANCEL.store(true, SeqCst);
+    crate::autotaxi::halt();
+    crate::tools::speedhold::ACTIVE.store(false, SeqCst);
+}
+
+/// A new taxi-in is running from now: its generation.
+fn begin() -> u64 {
+    use std::sync::atomic::Ordering::SeqCst;
+    let gen = GEN.fetch_add(1, SeqCst) + 1;
+    CANCEL.store(false, SeqCst);
+    ACTIVE.store(true, SeqCst);
+    gen
+}
+
+/// This taxi-in (`gen`) is to end: aborted, or superseded by a newer one.
+fn cancelled(gen: u64) -> bool {
+    use std::sync::atomic::Ordering::SeqCst;
+    CANCEL.load(SeqCst) || GEN.load(SeqCst) != gen
+}
+
+/// Clears [`ACTIVE`] when its taxi-in ends, however it ends, unless a newer
+/// one has started.
+struct Running(u64);
+
+impl Drop for Running {
+    fn drop(&mut self) {
+        use std::sync::atomic::Ordering::SeqCst;
+        if GEN.load(SeqCst) == self.0 {
+            ACTIVE.store(false, SeqCst);
+        }
+    }
+}
+
+/// The taxi-in was told to end at `at`: blackboxed, and on the pilot's
+/// release the aircraft stopped and parked, the parking brake said. Always
+/// true, so a checkpoint reads `if cancelled(gen) && end_cancelled(..).await`.
+async fn end_cancelled(
+    xp: &XPlaneClient,
+    voice: &Option<Voice>,
+    park_brake_valve_set: Option<f64>,
+    at: &str,
+) -> bool {
+    use std::sync::atomic::Ordering::SeqCst;
+    let hold = CANCEL_HOLD.load(SeqCst) && CANCEL.load(SeqCst);
+    let held = match hold {
+        true => crate::full_auto::hand_back_hold(xp, park_brake_valve_set).await,
+        false => None,
+    };
+    crate::blackbox::record(
+        "taxi_in",
+        json!({ "event": "cancelled", "at": at, "hold": hold, "held": held }),
+    );
+    match held {
+        Some(true) => announce(voice, Priority::Advisory, "Parking brake set."),
+        Some(false) => announce(
+            voice,
+            Priority::Caution,
+            "The parking brake did not set. Hold the brakes.",
+        ),
+        None => {}
+    }
+    arrest_release();
+    true
+}
+
 /// Spawn the arrival taxi on its own thread + runtime + client.
 /// `vacate_from` is the runway END we have just landed on, when we have: the
 /// drive off it runs before anything is requested. `None` means we are already
@@ -70,7 +166,11 @@ pub fn start(
     vacate_from: Option<String>,
     shut_down: bool,
 ) {
+    // Running from here, not from the thread's first poll: a "my controls"
+    // typed the moment the landing's verdict is in must find it.
+    let gen = begin();
     std::thread::spawn(move || {
+        let _running = Running(gen);
         let Ok(rt) = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -86,6 +186,7 @@ pub fn start(
             pace,
             vacate_from,
             shut_down,
+            gen,
         ));
     });
 }
@@ -400,6 +501,7 @@ async fn fly(
     pace: crate::autotaxi::Pace,
     vacate_from: Option<String>,
     shut_down: bool,
+    gen: u64,
 ) {
     // --- Phase one: get off the runway. No clearance, no request, no wait. ---
     if let Some(rwy) = vacate_from {
@@ -417,6 +519,10 @@ async fn fly(
             stand_down_relocated(&voice, "vacate", said);
             return;
         }
+    }
+    let valve = park_brake_valve_set;
+    if cancelled(gen) && end_cancelled(&xp, &voice, valve, "vacate").await {
+        return;
     }
     // Autoland may have handed off ROLLING (taxi pace, brakes released) on the
     // promise that the vacate drive takes over. Any vacate failure path breaks
@@ -488,6 +594,9 @@ async fn fly(
         let mut got = false;
         let mut last = position(&xp).await.map(|p| (p, std::time::Instant::now()));
         for _ in 0..120 {
+            if cancelled(gen) && end_cancelled(&xp, &voice, valve, "request").await {
+                return;
+            }
             if stand_route_ready() {
                 got = true;
                 break;
@@ -545,6 +654,9 @@ async fn fly(
     // sits stagnant at the numbers (2026-07-26). The same "brakes off" full auto
     // does before a departure taxi, and valve-aware for the reason above: the
     // ratio-only write left the valve armed to re-trap the first squeeze.
+    if cancelled(gen) && end_cancelled(&xp, &voice, valve, "cleared").await {
+        return;
+    }
     crate::tools::controls::release_park_brake_for_roll(&xp, park_brake_valve_set).await;
     arrest_release();
 
@@ -608,6 +720,9 @@ async fn fly(
         // Give the loop its tick to see the flag and let go of the channels.
         tokio::time::sleep(std::time::Duration::from_millis(600)).await;
     }
+    if cancelled(gen) && end_cancelled(&xp, &voice, valve, "before_drive").await {
+        return;
+    }
     crate::autotaxi::LAST_ARRIVED.store(false, std::sync::atomic::Ordering::Relaxed);
     match auto_taxi.execute(&json!({}), &ctx).await {
         Ok(line) => announce(&voice, Priority::Advisory, &line),
@@ -629,6 +744,9 @@ async fn fly(
             return;
         }
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+    if cancelled(gen) && end_cancelled(&xp, &voice, valve, "driving").await {
+        return;
     }
     if crate::autotaxi::LAST_ARRIVED.load(Relaxed)
         && secure(&xp, &voice, park_brake_valve_set, shut_down).await
@@ -921,5 +1039,46 @@ mod relocation_tests {
         );
         assert!(!vacated_report_due(false, Some(false)));
         assert!(!vacated_report_due(false, None));
+    }
+}
+
+#[cfg(test)]
+mod abort_tests {
+    use super::*;
+    use std::sync::atomic::Ordering::SeqCst;
+
+    /// LEMG (2026-09-28, t 1790591992.8): "my controls" in the vacate stopped
+    /// the drive and the taxi-in drove to the stand 7 s later. The release
+    /// now ends the taxi-in itself, between its drives too, and holds.
+    #[test]
+    fn my_controls_ends_the_taxi_in_between_its_drives() {
+        let _g = crate::mode::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        ACTIVE.store(false, SeqCst);
+        CANCEL.store(false, SeqCst);
+        // Nothing running: nothing to end.
+        abort(true);
+        assert!(!CANCEL.load(SeqCst));
+        // Running (the request's wait: no auto taxi), the pilot's release.
+        let gen = begin();
+        assert!(running() && !cancelled(gen));
+        crate::autotaxi::ACTIVE.store(true, SeqCst);
+        abort(true);
+        assert!(cancelled(gen), "the taxi-in ends");
+        assert!(CANCEL_HOLD.load(SeqCst), "and stops and parks the aircraft");
+        assert!(!crate::autotaxi::driving(), "its drive halted");
+        assert!(!crate::tools::speedhold::ACTIVE.load(SeqCst), "its governor off");
+        // A stand-down (swap, new flight) lets go without the hold.
+        let gen = begin();
+        abort(false);
+        assert!(cancelled(gen) && !CANCEL_HOLD.load(SeqCst));
+        // A newer taxi-in supersedes an older one, and the older one's end
+        // leaves the newer running.
+        let old = begin();
+        let newer = begin();
+        assert!(cancelled(old) && !cancelled(newer));
+        drop(Running(old));
+        assert!(running());
+        drop(Running(newer));
+        assert!(!running());
     }
 }

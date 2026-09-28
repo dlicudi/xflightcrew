@@ -2329,6 +2329,9 @@ async fn run_session(
                 let circuit_flying = circuit::ACTIVE.load(Relaxed);
                 let procedure_flying = procedure::ACTIVE.load(Relaxed);
                 let full_auto_running = full_auto::ACTIVE.load(Relaxed);
+                // A taxi-in between its drives (the request's wait) holds
+                // the aircraft with no auto taxi running.
+                let taxi_in_running = crate::taxi_in::running();
                 let hover_holding = hover::ACTIVE.load(Relaxed);
                 // A helicopter's route or circuit: in cruise the hover loop
                 // is not running, and the route's speed law owns the
@@ -2341,6 +2344,7 @@ async fn run_session(
                     || mix_held
                     || reverse_in
                     || taxi_driving
+                    || taxi_in_running
                     || takeoff_flying
                     || circuit_flying
                     || procedure_flying
@@ -2430,8 +2434,17 @@ async fn run_session(
                         autotakeoff::cancel();
                         released.push("your takeoff, power is set");
                     }
+                    // The taxi-in ends where it is, braked to a stop and
+                    // parked: a stopped drive alone was driven again to the
+                    // stand 7 s later (LEMG, 2026-09-28).
+                    let taxi_in_ended = taxi_in_running && (names_speed || generic);
+                    if taxi_in_ended {
+                        crate::taxi_in::abort(true);
+                        released.push("taxi in off, your aircraft");
+                    }
                     if !circuit_flying
                         && !full_auto_running
+                        && !taxi_in_ended
                         && taxi_driving
                         && (names_speed || names_steer || generic)
                     {
@@ -2442,7 +2455,7 @@ async fn run_session(
                             tools::speedhold::ACTIVE.store(false, Relaxed);
                             released.push("auto taxi off, your aircraft");
                         }
-                    } else if speed_held && (names_speed || generic) {
+                    } else if speed_held && !taxi_in_ended && (names_speed || generic) {
                         tools::speedhold::ACTIVE.store(false, Relaxed);
                         released.push("speed hold off, your throttle");
                     }

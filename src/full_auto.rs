@@ -556,7 +556,10 @@ async fn hand_back_brakes(xp: &XPlaneClient, valve_set: Option<f64>) -> Option<b
 
 /// [`hand_back_brakes`] against any sim, so the gates and the stop are a
 /// plain `cargo test`. `Some(held)` when it was a ground hand-back.
-async fn hand_back_hold(xp: &dyn crate::xplane::XPlane, valve_set: Option<f64>) -> Option<bool> {
+pub(crate) async fn hand_back_hold(
+    xp: &dyn crate::xplane::XPlane,
+    valve_set: Option<f64>,
+) -> Option<bool> {
     let skipped = |why: &str, kts: Option<f64>| {
         crate::blackbox::record(
             "full_auto",
@@ -2400,11 +2403,13 @@ async fn fly(xp: XPlaneClient, config: Config, voice: Option<Voice>, tools: SubT
         // push itself is narrated by the monitor's pushback watch, so the
         // only crew line here is the ask.
         {
-            let (lat_r, lon_r, psi_r) = tokio::join!(
+            let (lat_r, lon_r, psi_r, mtow_r) = tokio::join!(
                 xp.get_float(LAT),
                 xp.get_float(LON),
                 xp.get_float(crate::autotaxi::PSI_TRUE),
+                xp.get_float(crate::datarefs::ACF_M_MAX_KG),
             );
+            let mtow_kg = mtow_r.ok();
             let path = crate::party_line::with_taxi_route(|r| r.map(|w| w.path.clone()))
                 .unwrap_or_default();
             if let (Ok(lat), Ok(lon), Ok(psi)) = (lat_r, lon_r, psi_r) {
@@ -2447,7 +2452,26 @@ async fn fly(xp: XPlaneClient, config: Config, voice: Option<Voice>, tools: SubT
                         }),
                     );
                 }
-                if let Some(plan) = plan.filter(|_| at_stand) {
+                let tug = crate::pushback::tug_for_weight(mtow_kg);
+                if plan.is_some() && at_stand && !tug {
+                    // A light aircraft turns itself off the stand: the tug
+                    // is minutes of waiting, or never comes (LEMG GA, #170).
+                    announce(
+                        &voice,
+                        Priority::Advisory,
+                        "Way out's behind us. No tug for us, I'll turn us round under our \
+                         own steam. Watch the wingtips.",
+                    );
+                    event(
+                        "pushback_skipped",
+                        json!({
+                            "why": "light_aircraft",
+                            "mtow_kg": mtow_kg,
+                            "stand": stand.as_ref().map(|s| s.name.clone()),
+                        }),
+                    );
+                }
+                if let Some(plan) = plan.filter(|_| at_stand && tug) {
                     announce(
                         &voice,
                         Priority::Advisory,
