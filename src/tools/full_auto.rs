@@ -1058,12 +1058,45 @@ impl FullAuto {
                 crate::weather::surface_wind(&super::autoland::xplane_root(), &fp.destination),
             )?;
             let xp = crate::xplane::XPlaneClient::new(ctx.config.xplane_base_url.clone());
+            // The probe answers only inside the loaded scenery (about 100 nm
+            // round the aircraft): a chunk beyond it is judged on the grid
+            // MORA's highest ground, which errs high. LEMG-LEBL, 413 nm, was
+            // refused outright on 2026-09-28.
+            let root = super::autoland::xplane_root();
+            let mora = tokio::task::spawn_blocking(move || {
+                crate::nav::MoraGrid::load(&format!(
+                    "{root}/Resources/default data/earth_mora.dat"
+                ))
+            })
+            .await
+            .ok()
+            .flatten();
             let mut heights = Vec::new();
+            let mut from_grid = 0usize;
             for chunk in route.terrain.chunks(crate::terrain::MAX_POINTS) {
                 let pts: Vec<_> = chunk.iter().map(|(p, _)| *p).collect();
-                heights.extend(crate::terrain::sample_ft(&xp, &pts).await
-                    .ok_or("I can't verify terrain along the local route. The updated plugin and loaded scenery are required.")?);
+                match crate::terrain::sample_ft(&xp, &pts).await {
+                    Some(h) => heights.extend(h),
+                    None => {
+                        let grid = mora.as_ref().ok_or(
+                            "I can't verify terrain along the local route: no probe beyond \
+                             the loaded scenery and no MORA grid.",
+                        )?;
+                        for &(lat, lon) in &pts {
+                            let m = grid.at(lat, lon).ok_or(
+                                "I can't verify terrain along the local route: a leg is \
+                                 outside the MORA grid.",
+                            )?;
+                            heights.push(crate::nav::mora_ground_ft(m));
+                        }
+                        from_grid += pts.len();
+                    }
+                }
             }
+            crate::blackbox::record(
+                "full_auto",
+                json!({"event": "local_terrain", "points": heights.len(), "from_grid": from_grid}),
+            );
             if !crate::flightplan::local_terrain_clear(&route, &heights) {
                 return Err("Terrain blocks the local climb or arrival corridor. Choose another destination or route.".into());
             }
