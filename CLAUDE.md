@@ -291,7 +291,7 @@ Config: `XCOPILOT_ATC_AIRPORT` / `_VOICE` / `_RATE` / `_REGION`.
   the HOLD went on. **Circuit traffic stays with the tower** (`tower::wants_circuits`,
   `Station.circuits`): "for circuits" on the taxi or ready call withholds the departure handoff
   (`departure_handoff_withheld`) and the radar watch; full auto's circuit says it (`taxi_call`,
-  `ready_call`; LEMG 31 2026-09-28); its zone request is cleared FOR THE CIRCUIT, never out of the
+  `ready_call`, the ramp's `zone_clearance_call`; LEMG 31 2026-09-28); its zone request is cleared FOR THE CIRCUIT, never out of the
   zone (`Ctx.circuit`, `tower::circuit_clearance_lines`: runway, circuit height `circuit_height_ft`,
   pressure, code, "report ready"; FAA "closed traffic approved"). **A reject is a radio call** (`Intent::RejectingTakeoff`, the crew's
   `autotakeoff::REJECT_CALL`): the clearance and all it armed die; a held release lives only in
@@ -351,7 +351,8 @@ Config: `XCOPILOT_ATC_AIRPORT` / `_VOICE` / `_RATE` / `_REGION`.
 - **The command loop never holds a pilot's line behind its own speech**: `say`, the crew-radio
   drain and the tower's reply give way to a line in hand or waiting (`pilot_line_pending`,
   `Voice::say_station_until`); blackbox `typed` `routed` `held_ms` (LEMG 2026-09-28: "my controls"
-  routed 26.1 s late).
+  routed 26.1 s late). **Nor an armed station swap**, which only the loop installs (`loop_owed`; a
+  stepped-on readback held a new flight's station 22 to 38 s, its final call unmade, #167).
 - **Any PTT mutes everything while held**; release rejoins LIVE, no replay. Recovery is procedural
   and knows what was cut (`voice::SpeechMemory`, `router::recall_line`): silenced lines are OWED;
   "what were you saying?" says them, "say again" the newest of owed, readback and volunteered line.

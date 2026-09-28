@@ -720,13 +720,16 @@ mod tests {
         assert!(!command_waiting());
 
         let main = include_str!("main.rs");
-        assert!(main.contains("say_or(voice, reporter, kind, line, pollers::command_waiting)"));
+        // #167: and to an armed station swap (`loop_owed`), which only the
+        // loop installs.
+        assert!(main.contains("say_or(voice, reporter, kind, line, || loop_owed(false))"));
+        assert!(main.contains("pilot_line_pending(in_hand), party_line::station_swap_pending()"));
         assert!(main.contains("voice.say_until(Priority::Readback, line, stop)"));
         assert!(!main.contains("voice.say(Priority::Readback, line)"));
         // #135: the crew-radio drain gives way to a line already in hand too,
         // the tower's reply included (it waited out a whole taxi clearance
         // with "my controls" taken and unrouted, LEMG 2026-09-28).
-        assert!(main.contains("let pilot_waiting = || pilot_line_pending(input.is_some());"));
+        assert!(main.contains("let pilot_waiting = || loop_owed(input.is_some());"));
         assert!(main.contains("voice.say_station_until("));
     }
 

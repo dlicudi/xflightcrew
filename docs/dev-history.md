@@ -9987,3 +9987,29 @@ not take latches fast off); 1x before every setup, at the case end, on a crash, 
 Ctrl-C. Blackbox `sortie_runner` `sim_speed` (`wanted`, `set`, `read_back`, `actual`, `reason`); the run
 row gains `Wall s` and `Fast` ("N s at xA" from `sim_speed_actual`). backlog-737's gate to gate: 4x at
 Cruise, 1x at Descent. Offline only.
+
+## 2026-09-28: an approach setup's station came up after the final call gave up (issue #167)
+
+LEMG, sorties 1790611629 (SF50, 12) and 1790619465 (SR22, 13): `setup approach_radio station_up:false
+call:null`, both landings uncleared and challenged "inside controlled airspace without clearance". Not a
+reach latch (no `atc route:reach` in either window): the swap sat in `PENDING_STATION`, which only the
+command loop installs, while the loop waited on its own readback "Setting up a 10 mile final": a tower
+call stepped on it (16:07:08.7Z, armed 16:07:09.4, installed 16:07:31.1 when the stale remainder was
+dropped; 18:17:45 to 18:18:22.9; 18:39:14.6 to 18:39:43.4), past `STATION_UP_S` (15 s). Setups where no
+radio call stepped on the readback installed in 0.2 to 1.8 s. The loop's speech waits (`say`, the
+crew-radio drain) now give way to an armed swap as to a pilot's line (`main::loop_owed`). Offline only.
+
+## 2026-09-28: a circuit from the ramp asks its clearance for circuits (issue #148 follow-up)
+
+LEMG, sorties 1790605551 and 1790618416: a circuit from the ramp asked a plain "request clearance"
+(`get_zone_clearance`) and was "cleared to leave the Malaga zone"; only the runway start's
+`strip_clearance_call` said "for circuits". The ramp's call is now `zone_clearance_call` ("request
+clearance, for circuits" on a circuit mission, blackbox `full_auto request_clearance circuits`), and the
+tower clears the circuit without a stated runway too. Offline only.
+
+## 2026-09-28: the 737's coupled ILS off until proven (issue #81)
+
+Blackbox `ils coupling` 2026-09-26 to 09-28: 46 arms on the 737, 43 Armed then Abandoned (42 with
+`appr_reads [0,0]`: `app_press` never read back in `app_status`), 2 reached Coupled and were then
+abandoned, 1 stopped at LocCaptured. `ils_coupled: false` on `boeing_737_800`; autoland flies the
+heading knob as every other type. #81 stays open.

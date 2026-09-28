@@ -1252,7 +1252,7 @@ async fn run_session(
             // lines still play in order. LEMG (2026-09-28, sortie 1790586620):
             // "my controls" was taken at +0.0 and routed at +26.1 s, after the
             // crew's "request taxi" and the tower's whole taxi clearance.
-            let pilot_waiting = || pilot_line_pending(input.is_some());
+            let pilot_waiting = || loop_owed(input.is_some());
             let calls = circuit::take_crew_radio();
             // A discarded transmission is never silent. The queue is drained
             // unconditionally, so a failed gate loses the call for good — and
@@ -4010,7 +4010,7 @@ fn next_input(
 static LAST_READBACK: std::sync::Mutex<Option<(String, Instant)>> = std::sync::Mutex::new(None);
 
 fn say(voice: &Voice, reporter: &Reporter, kind: ui::LogKind, line: &str) {
-    say_or(voice, reporter, kind, line, pollers::command_waiting);
+    say_or(voice, reporter, kind, line, || loop_owed(false));
 }
 
 /// The live facts a queued crew call is judged against (#143), read together.
@@ -4033,6 +4033,21 @@ async fn crew_radio_facts(xp: &XPlaneClient) -> circuit::RadioFacts {
 /// The command loop's waits on its OWN speech give way to either (#90, #135).
 fn pilot_line_pending(in_hand: bool) -> bool {
     in_hand || pollers::command_waiting()
+}
+
+/// Is the command loop owed back from a wait on its own speech: a pilot's
+/// line ([`pilot_line_pending`]) or an armed station swap, which only this
+/// loop installs. LEMG (2026-09-28, sorties 1790611629 and 1790619465, #167):
+/// a tower call stepped on the setup's readback, the loop waited 22 and 38 s
+/// for its remainder, and the new flight's station, armed 0.4 s after the
+/// readback's stall, came up after the final call had given up.
+fn loop_owed(in_hand: bool) -> bool {
+    loop_owed_by(pilot_line_pending(in_hand), party_line::station_swap_pending())
+}
+
+/// [`loop_owed`] over its two facts. Pure.
+fn loop_owed_by(pilot_line: bool, swap_armed: bool) -> bool {
+    pilot_line || swap_armed
 }
 
 /// [`say`] with the wait's give-way condition handed in.
@@ -4504,6 +4519,36 @@ mod tests {
     #[test]
     fn a_line_in_hand_is_owed_the_loop_like_a_waiting_one() {
         assert!(super::pilot_line_pending(true));
+    }
+
+    /// #167: the records of sortie 1790611629 (LEMG, 2026-09-28). The loop
+    /// spoke the setup's readback at +0.5 s, the tower stepped on it at
+    /// +7.8 s, the swap was armed at +8.4 s and installed at +30.2 s, when the
+    /// stale remainder was dropped. No pilot line was waiting, so only the
+    /// armed swap can release the wait.
+    #[test]
+    fn an_armed_station_swap_releases_the_loops_speech_wait() {
+        use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
+        // Before the swap: the readback is waited out.
+        assert!(!super::loop_owed_by(false, false));
+        // Armed: the loop goes to install it.
+        assert!(super::loop_owed_by(false, true));
+        assert!(super::loop_owed_by(true, false));
+        // Through the real wait: a readback never spoken (stepped on, its
+        // remainder queued behind the radio) gives way the moment the swap
+        // is armed, not when the line is dropped stale 20 s later.
+        let armed = std::sync::Arc::new(AtomicBool::new(false));
+        let a = armed.clone();
+        let t = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            a.store(true, SeqCst);
+        });
+        let t0 = std::time::Instant::now();
+        let spoken =
+            crate::voice::wait_unspoken_until(|| super::loop_owed_by(false, armed.load(SeqCst)));
+        t.join().unwrap();
+        assert!(!spoken);
+        assert!(t0.elapsed() < std::time::Duration::from_secs(2), "{:?}", t0.elapsed());
     }
 
     fn plan(origin: &str, dest: &str, route: &str, n: usize) -> crate::simbrief::FlightPlan {

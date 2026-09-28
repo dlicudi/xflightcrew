@@ -15493,6 +15493,22 @@ mod tests {
             assert!(!st.circuits);
             assert!(r.contains("cleared to leave the Gibraltar zone"), "{r}");
         }
+        // From the ramp no runway is named (full auto's zone_clearance_call,
+        // LEMG sorties 1790605551 and 1790618416): still the circuit.
+        *SQUAWK_WATCH.lock().unwrap() = None;
+        *CLEARANCE.lock().unwrap() = None;
+        let mut st = Station::load(path.to_str().unwrap(), "LXGB").expect("LXGB loads");
+        let ctx = scripted_ctx(&mut st, wx);
+        let r = st.route_keyed(
+            "november one seven two sierra papa, request clearance, for circuits",
+            Service::Tower,
+            &ctx,
+            wx,
+        );
+        assert!(st.circuits, "circuits noted from the ramp's zone request");
+        assert!(!r.contains("leave the"), "{r}");
+        assert!(r.contains("circuit height"), "{r}");
+        assert!(r.ends_with("report ready for departure."), "{r}");
         *SQUAWK_WATCH.lock().unwrap() = None;
         *CLEARANCE.lock().unwrap() = None;
         *HANDOFF.lock().unwrap() = None;
