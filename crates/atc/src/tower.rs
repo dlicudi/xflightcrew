@@ -223,6 +223,69 @@ pub struct Ctx {
     /// an assigned level at or above it is spoken as a flight level
     /// ([`crate::atis::spoken_level`]). `None` = unknown, everything in feet.
     pub transition_level_ft: Option<f64>,
+    /// The flight has said it stays in the pattern (the station's
+    /// `circuits`, noted from THIS call's words before the reply): a zone
+    /// clearance request is then answered with the circuit clearance, never
+    /// "cleared to leave the zone". `None` on every other flight.
+    pub circuit: Option<CircuitOffer>,
+}
+
+/// What the station hands the tower to phrase a CIRCUIT clearance: the
+/// pattern altitude and the dialect. LEMG 13 (sorties 1790590663 and
+/// 1790591256, 2026-09-28): "request clearance, runway one three, for
+/// circuits" got "cleared to leave the Malaga zone, not above two thousand
+/// feet", and a circuit never leaves the zone.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CircuitOffer {
+    /// Circuit height (ICAO) / pattern altitude (FAA) on the QNH, feet:
+    /// [`circuit_height_ft`] of the field.
+    pub height_ft: f64,
+    /// FAA phraseology ("closed traffic", "pattern altitude") instead of
+    /// ICAO / CAP 413 ("circuit height").
+    pub faa: bool,
+}
+
+/// The circuit height on the QNH: 1,000 ft above the field, to the nearest
+/// hundred (LEMG at 52 ft is one thousand one hundred; 598 ft is one
+/// thousand six hundred).
+pub fn circuit_height_ft(field_elev_ft: f64) -> f64 {
+    ((field_elev_ft.max(0.0) + 1000.0) / 100.0).round() * 100.0
+}
+
+/// The circuit clearance and its suggested readback, in the field's dialect:
+/// the runway, the height, the pressure and the code, then "report ready".
+/// ICAO / CAP 413: "runway one three, circuit height one thousand one
+/// hundred feet, QNH ..., squawk ..., report ready for departure". FAA:
+/// "runway one three, closed traffic approved, pattern altitude one thousand
+/// one hundred, altimeter ..., squawk ..., report ready for departure".
+pub fn circuit_clearance_lines(ctx: &Ctx, offer: &CircuitOffer) -> (String, String) {
+    let alt = crate::atis::spoken_alt(offer.height_ft);
+    let qnh = qnh_clause(ctx);
+    if offer.faa {
+        (
+            format!(
+                "{}, runway {}, closed traffic approved, pattern altitude {alt}{qnh}, \
+                 squawk {}, report ready for departure.",
+                ctx.callsign, ctx.runway, ctx.squawk
+            ),
+            format!(
+                "Closed traffic runway {}, pattern altitude {alt}{qnh}, squawk {}, {}.",
+                ctx.runway, ctx.squawk, ctx.callsign
+            ),
+        )
+    } else {
+        (
+            format!(
+                "{}, runway {}, circuit height {alt} feet{qnh}, squawk {}, \
+                 report ready for departure.",
+                ctx.callsign, ctx.runway, ctx.squawk
+            ),
+            format!(
+                "Runway {}, circuit height {alt} feet{qnh}, squawk {}, {}.",
+                ctx.runway, ctx.squawk, ctx.callsign
+            ),
+        )
+    }
 }
 
 /// The IFR departure clearance as issued and, once read back correctly, as
@@ -2042,6 +2105,13 @@ impl Tower {
                 None if dest.is_none() => format!("{}, say destination.", ctx.callsign),
                 None => format!("{}, say again destination.", ctx.callsign),
             },
+            // A circuit stays in the zone: its clearance is the pattern's.
+            Intent::RequestClearance if ctx.circuit.is_some() => {
+                let offer = ctx.circuit.as_ref().expect("guarded");
+                let (line, readback) = circuit_clearance_lines(ctx, offer);
+                self.clearance_readback = Some(readback);
+                line
+            }
             Intent::RequestClearance => {
                 self.clearance_readback = Some(format!(
                     "Not above two thousand feet{}, squawk {}, {}.",
@@ -2582,7 +2652,92 @@ mod tests {
             taxi_crossings: Vec::new(),
             on_ground: false,
             ifr: None,
+            circuit: None,
         }
+    }
+
+    /// ctx() on the ground as circuit traffic, code 4501, in the ICAO or the
+    /// FAA dialect (the FAA pressure is an altimeter setting).
+    fn circuit_ctx(faa: bool) -> Ctx {
+        Ctx {
+            on_ground: true,
+            squawk: "four five zero one".into(),
+            qnh: if faa {
+                "altimeter three zero zero one".into()
+            } else {
+                "QNH one zero one niner".into()
+            },
+            circuit: Some(CircuitOffer {
+                height_ft: circuit_height_ft(52.0),
+                faa,
+            }),
+            ..ctx()
+        }
+    }
+
+    /// LEMG 13 (sorties 1790590663 and 1790591256, 2026-09-28): "request
+    /// clearance, runway one three, for circuits" was "cleared to leave the
+    /// Malaga zone, not above two thousand feet". A circuit gets the
+    /// circuit's clearance in its dialect, and the readback the tower
+    /// suggests (the crew reads it verbatim) is a readback, not a request.
+    #[test]
+    fn a_circuit_is_cleared_for_the_circuit_not_out_of_the_zone() {
+        assert_eq!(circuit_height_ft(52.0), 1100.0, "LEMG");
+        assert_eq!(circuit_height_ft(598.0), 1600.0);
+        assert_eq!(circuit_height_ft(-10.0), 1000.0, "below sea level floors");
+        let request = "november eight one six november november, \
+                       request clearance, runway one three, for circuits";
+        assert_eq!(parse_intent(request), Intent::RequestClearance);
+        assert!(wants_circuits(request));
+        for (faa, line, rb) in [
+            (
+                false,
+                "November one seven two Sierra Papa, runway zero niner, circuit height one \
+                 thousand one hundred feet, QNH one zero one niner, squawk four five zero one, \
+                 report ready for departure.",
+                "Runway zero niner, circuit height one thousand one hundred feet, QNH one \
+                 zero one niner, squawk four five zero one, November one seven two Sierra Papa.",
+            ),
+            (
+                true,
+                "November one seven two Sierra Papa, runway zero niner, closed traffic \
+                 approved, pattern altitude one thousand one hundred, altimeter three zero \
+                 zero one, squawk four five zero one, report ready for departure.",
+                "Closed traffic runway zero niner, pattern altitude one thousand one hundred, \
+                 altimeter three zero zero one, squawk four five zero one, November one seven \
+                 two Sierra Papa.",
+            ),
+        ] {
+            let c = circuit_ctx(faa);
+            let mut twr = Tower::new();
+            let reply = twr.handle(Intent::RequestClearance, &c);
+            assert_eq!(reply, line);
+            assert_eq!(twr.state, State::Parked, "a clearance moves no sequence");
+            let owed = twr
+                .suggested_readback(&c.callsign)
+                .expect("readback suggested");
+            assert_eq!(owed, rb);
+            // What the crew transmits (the owed line, stop trimmed) is heard
+            // as a readback: silence, and the debt is paid.
+            let sent = owed.trim_end_matches('.');
+            assert_eq!(parse_intent(sent), Intent::Unknown, "{sent}");
+            assert!(is_readback(sent), "{sent}");
+            // The next call ("ready for departure, for circuits") gets its
+            // takeoff answer, never the zone.
+            let r = twr.handle(parse_intent("ready for departure, for circuits"), &c);
+            assert!(!r.contains("leave the"), "{r}");
+        }
+        // Without circuits the zone clearance is as it was.
+        let mut twr = Tower::new();
+        let c = Ctx {
+            circuit: None,
+            ..circuit_ctx(false)
+        };
+        let r = twr.handle(Intent::RequestClearance, &c);
+        assert!(
+            r.contains("cleared to leave the Gibraltar zone, not above two thousand"),
+            "{r}"
+        );
     }
 
     /// ctx() on the ground at an ICAO field, offered an IFR clearance to
@@ -3270,108 +3425,125 @@ mod tests {
             RequestFrequencyChange,
             Unknown,
         ];
-        let c = ctx();
-        for &start in &states {
-            for intent in intents.iter().cloned() {
-                let mut twr = Tower::new();
-                twr.state = start;
-                let reply = twr.handle(intent.clone(), &c);
-                let end = twr.state;
-                let cell = format!("{start:?} + {intent:?}");
+        // The plain flight, and circuit traffic in both dialects (#148),
+        // airborne like ctx() so the table below holds for all three.
+        let airborne = |faa| Ctx {
+            on_ground: false,
+            ..circuit_ctx(faa)
+        };
+        for c in [ctx(), airborne(false), airborne(true)] {
+            for &start in &states {
+                for intent in intents.iter().cloned() {
+                    let mut twr = Tower::new();
+                    twr.state = start;
+                    let reply = twr.handle(intent.clone(), &c);
+                    let end = twr.state;
+                    let cell = format!("{start:?} + {intent:?} (circuit {:?})", c.circuit);
 
-                // A controller always answers, and always by callsign.
-                assert!(!reply.is_empty(), "{cell}: silent");
-                assert!(
-                    reply.contains(&c.callsign),
-                    "{cell}: no callsign in {reply:?}"
-                );
+                    // Circuit traffic is never sent out of the zone, and its
+                    // clearance names the runway and the code.
+                    if c.circuit.is_some() {
+                        assert!(!reply.contains("leave the"), "{cell}: {reply}");
+                        if intent == RequestClearance {
+                            assert!(reply.contains(&c.runway), "{cell}: {reply}");
+                            assert!(reply.contains(&c.squawk), "{cell}: {reply}");
+                        }
+                    }
 
-                // A takeoff clearance is only ever spoken to an aircraft that
-                // asked for one FROM the holding-point states — never handed
-                // out by any other cell of the grid.
-                if reply.contains("cleared for takeoff") {
-                    assert_eq!(intent, RequestTakeoff, "{cell}: unasked takeoff clearance");
+                    // A controller always answers, and always by callsign.
+                    assert!(!reply.is_empty(), "{cell}: silent");
                     assert!(
-                        matches!(start, TaxiCleared | LinedUp | TakeoffCleared),
-                        "{cell}: takeoff clearance from the wrong state"
+                        reply.contains(&c.callsign),
+                        "{cell}: no callsign in {reply:?}"
                     );
-                    assert!(
-                        reply.contains(&c.runway),
-                        "{cell}: clearance without runway"
-                    );
-                    assert!(reply.contains(&c.wind), "{cell}: clearance without wind");
+
+                    // A takeoff clearance is only ever spoken to an aircraft that
+                    // asked for one FROM the holding-point states — never handed
+                    // out by any other cell of the grid.
+                    if reply.contains("cleared for takeoff") {
+                        assert_eq!(intent, RequestTakeoff, "{cell}: unasked takeoff clearance");
+                        assert!(
+                            matches!(start, TaxiCleared | LinedUp | TakeoffCleared),
+                            "{cell}: takeoff clearance from the wrong state"
+                        );
+                        assert!(
+                            reply.contains(&c.runway),
+                            "{cell}: clearance without runway"
+                        );
+                        assert!(reply.contains(&c.wind), "{cell}: clearance without wind");
+                    }
+                    // A landing clearance only ever answers a final report — or a
+                    // MAYDAY, the one deliberate exception: an emergency outranks
+                    // the sequence (priority handling is the point of the call).
+                    if reply.contains("cleared to land") || reply.contains("cleared touch and go") {
+                        assert!(
+                            matches!(intent, ReportFinal | Mayday),
+                            "{cell}: unasked landing clearance"
+                        );
+                        assert!(
+                            reply.contains(&c.runway),
+                            "{cell}: clearance without runway"
+                        );
+                        assert!(reply.contains(&c.wind), "{cell}: clearance without wind");
+                    }
+
+                    // The full transition table — any change here must be a
+                    // deliberate edit to this test, not a surprise.
+                    let want = match intent {
+                        RadioCheck | WindCheck | SquawkCheck | Unknown | RequestClearance
+                        | RequestStartup | RequestShutdown => start,
+                        // A reject is a ground report: ctx() is airborne, so it
+                        // is a garble there and moves nothing (the ground half
+                        // has its own test).
+                        RejectingTakeoff => start,
+                        // A backtrack is a ground request (ctx() is airborne: a
+                        // garble) and a cancellation is the station's book.
+                        RequestBacktrack | CancelIfr => start,
+                        // The IFR clearance clears a route, not a runway: the
+                        // sequence stands (and with no offer it is "say again").
+                        RequestIfrClearance { .. } => start,
+                        // A hail, flight following, and radio housekeeping are
+                        // answered without touching the sequence.
+                        Greeting | RequestFlightFollowing | RequestFrequencyChange => start,
+                        // A position report off the runway is acknowledged and
+                        // changes nothing — see the handler.
+                        RunwayVacated => start,
+                        // A grantable request (ctx() carries no refusal): the
+                        // taxi to it, or the join from the air.
+                        RequestRunway => {
+                            if c.on_ground {
+                                TaxiCleared
+                            } else {
+                                Inbound
+                            }
+                        }
+                        // ctx() has an approach frequency, so vectors redirect
+                        // without touching the sequence.
+                        RequestVectors => start,
+                        RequestTaxiIn => Parked,
+                        RequestTaxi => {
+                            if start == ClearedToLand {
+                                Parked
+                            } else {
+                                TaxiCleared
+                            }
+                        }
+                        RequestTakeoff => {
+                            if matches!(start, TaxiCleared | LinedUp | TakeoffCleared) {
+                                TakeoffCleared
+                            } else {
+                                TaxiCleared
+                            }
+                        }
+                        RequestLanding { .. } => Inbound,
+                        ReportFinal => ClearedToLand,
+                        // Pattern legs and a go-around all land in "in the
+                        // pattern, awaiting final"; a mayday is cleared at once.
+                        ReportDownwind | ReportBase | ReportCrosswind | GoAround => Inbound,
+                        Mayday => ClearedToLand,
+                    };
+                    assert_eq!(end, want, "{cell}: wrong transition");
                 }
-                // A landing clearance only ever answers a final report — or a
-                // MAYDAY, the one deliberate exception: an emergency outranks
-                // the sequence (priority handling is the point of the call).
-                if reply.contains("cleared to land") || reply.contains("cleared touch and go") {
-                    assert!(
-                        matches!(intent, ReportFinal | Mayday),
-                        "{cell}: unasked landing clearance"
-                    );
-                    assert!(
-                        reply.contains(&c.runway),
-                        "{cell}: clearance without runway"
-                    );
-                    assert!(reply.contains(&c.wind), "{cell}: clearance without wind");
-                }
-
-                // The full transition table — any change here must be a
-                // deliberate edit to this test, not a surprise.
-                let want = match intent {
-                    RadioCheck | WindCheck | SquawkCheck | Unknown | RequestClearance
-                    | RequestStartup | RequestShutdown => start,
-                    // A reject is a ground report: ctx() is airborne, so it
-                    // is a garble there and moves nothing (the ground half
-                    // has its own test).
-                    RejectingTakeoff => start,
-                    // A backtrack is a ground request (ctx() is airborne: a
-                    // garble) and a cancellation is the station's book.
-                    RequestBacktrack | CancelIfr => start,
-                    // The IFR clearance clears a route, not a runway: the
-                    // sequence stands (and with no offer it is "say again").
-                    RequestIfrClearance { .. } => start,
-                    // A hail, flight following, and radio housekeeping are
-                    // answered without touching the sequence.
-                    Greeting | RequestFlightFollowing | RequestFrequencyChange => start,
-                    // A position report off the runway is acknowledged and
-                    // changes nothing — see the handler.
-                    RunwayVacated => start,
-                    // A grantable request (ctx() carries no refusal): the
-                    // taxi to it, or the join from the air.
-                    RequestRunway => {
-                        if c.on_ground {
-                            TaxiCleared
-                        } else {
-                            Inbound
-                        }
-                    }
-                    // ctx() has an approach frequency, so vectors redirect
-                    // without touching the sequence.
-                    RequestVectors => start,
-                    RequestTaxiIn => Parked,
-                    RequestTaxi => {
-                        if start == ClearedToLand {
-                            Parked
-                        } else {
-                            TaxiCleared
-                        }
-                    }
-                    RequestTakeoff => {
-                        if matches!(start, TaxiCleared | LinedUp | TakeoffCleared) {
-                            TakeoffCleared
-                        } else {
-                            TaxiCleared
-                        }
-                    }
-                    RequestLanding { .. } => Inbound,
-                    ReportFinal => ClearedToLand,
-                    // Pattern legs and a go-around all land in "in the
-                    // pattern, awaiting final"; a mayday is cleared at once.
-                    ReportDownwind | ReportBase | ReportCrosswind | GoAround => Inbound,
-                    Mayday => ClearedToLand,
-                };
-                assert_eq!(end, want, "{cell}: wrong transition");
             }
         }
 
