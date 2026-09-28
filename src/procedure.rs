@@ -2133,6 +2133,29 @@ pub struct CruisePick {
     pub source: &'static str,
     /// Why the OFP's speed was not taken: "below_floor", "above_ceiling".
     pub rejected: Option<&'static str>,
+    /// The OFP's speed when it was taken down to [`cruise_cap_kts`].
+    pub capped_from: Option<f64>,
+}
+
+/// Knots under the monitor's overspeed caution a cruise is scheduled at:
+/// the governor's own wander (296 to 303 kt around a 299 target at FL180)
+/// and a descent's first seconds must not reach the caution band.
+pub const CRUISE_CAUTION_MARGIN_KTS: f64 = 10.0;
+
+/// The highest cruise the follower schedules: the overspeed caution's
+/// floor ([`crate::monitor::OVERSPEED_CAUTION_FACTOR`] of Vne) less
+/// [`CRUISE_CAUTION_MARGIN_KTS`]. `vne_kts` is the airframe's; `None`
+/// without one.
+///
+/// EGKK-EGBB, 2026-09-28 (sortie 1790601822-full_auto, #156): the OFP's
+/// 299 and 300 KIAS at FL180 against the 737's 340 kt Vne (caution from
+/// 306): the governor held 294.8 to 302.7, and the nose-down at the top of
+/// descent (+2115.3, 305 kt with the trend) said "Airspeed, you're getting
+/// fast." A crew flies the plan's speed, never into the caution. Pure.
+pub fn cruise_cap_kts(vne_kts: Option<f64>) -> Option<f64> {
+    vne_kts
+        .filter(|v| *v > 0.0)
+        .map(|v| (v * crate::monitor::OVERSPEED_CAUTION_FACTOR - CRUISE_CAUTION_MARGIN_KTS).floor())
 }
 
 /// The OFP's speed where the leg has one and it is inside the airframe's
@@ -2146,8 +2169,14 @@ pub fn cruise_pick(
     scheduled: Option<&ScheduledSpeed>,
     floor_kts: Option<f64>,
     ceiling_kts: Option<f64>,
+    cap_kts: Option<f64>,
 ) -> CruisePick {
-    let profile = |rejected| CruisePick { kts: profile_kts, source: "profile", rejected };
+    let profile = |rejected| CruisePick {
+        kts: profile_kts,
+        source: "profile",
+        rejected,
+        capped_from: None,
+    };
     let Some(s) = scheduled else {
         return profile(None);
     };
@@ -2157,7 +2186,22 @@ pub fn cruise_pick(
     if ceiling_kts.is_some_and(|c| s.target_kts > c) {
         return profile(Some("above_ceiling"));
     }
-    CruisePick { kts: s.target_kts, source: "ofp", rejected: None }
+    // Under the overspeed caution ([`cruise_cap_kts`]): the plan's speed,
+    // as near it as the caution allows (never under the floor).
+    match cap_kts.filter(|c| s.target_kts > *c && floor_kts.is_none_or(|f| *c >= f)) {
+        Some(c) => CruisePick {
+            kts: c,
+            source: "ofp",
+            rejected: None,
+            capped_from: Some(s.target_kts),
+        },
+        None => CruisePick {
+            kts: s.target_kts,
+            source: "ofp",
+            rejected: None,
+            capped_from: None,
+        },
+    }
 }
 
 /// A planned step placed on the legs: from the leg after `idx` (the leg
@@ -2923,11 +2967,14 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, plan: Pla
             // whichever is lower at the level flown (#101).
             let planned = if matches!(end, EndAction::Enroute) {
                 let sched = scheduled_cruise_kts(&cruise_schedule, &legs[idx], alt_ft);
+                let ceiling = crate::aircraft::speed_ceiling_kts();
                 let pick = cruise_pick(
                     planned,
                     sched.as_ref(),
                     crate::aircraft::speed_floor_kts(),
-                    crate::aircraft::speed_ceiling_kts(),
+                    ceiling,
+                    // Vne from the published ceiling (Vne less its margin).
+                    cruise_cap_kts(ceiling.map(|c| c + crate::aircraft::SPEED_CEILING_MARGIN_KTS)),
                 );
                 let key = (idx, pick.source, pick.rejected);
                 if sched.is_some() && schedule_logged != Some(key) {
@@ -2937,6 +2984,7 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, plan: Pla
                         serde_json::json!({
                             "event": "cruise_schedule", "idx": idx, "fix": legs[idx].fix_ident,
                             "source": pick.source, "target": pick.kts, "rejected": pick.rejected,
+                            "capped_from": pick.capped_from,
                             "plan_ias": sched.as_ref().and_then(|s| s.plan_ias_kts),
                             "mach": sched.as_ref().and_then(|s| s.mach),
                             "ofp_target": sched.as_ref().map(|s| s.target_kts),
@@ -6001,14 +6049,34 @@ mod tests {
         assert!((240.0..=250.0).contains(&high), "{high}");
         // The 737 (floor about 167, ceiling Vne 340 less 15): the OFP's 300,
         // where the old law held the profile's 255.
-        let pick = cruise_pick(255.0, Some(&hemel), Some(167.0), Some(325.0));
-        assert_eq!(pick, CruisePick { kts: 300.0, source: "ofp", rejected: None });
-        assert_eq!(cruise_pick(255.0, None, Some(167.0), Some(325.0)).kts, 255.0);
+        let pick = cruise_pick(255.0, Some(&hemel), Some(167.0), Some(325.0), None);
+        assert_eq!(pick, CruisePick { kts: 300.0, source: "ofp", rejected: None, capped_from: None });
+        assert_eq!(cruise_pick(255.0, None, Some(167.0), Some(325.0), None).kts, 255.0);
         // A 737 plan in a 172 is never flown at 300: the airframe's number.
-        let pick = cruise_pick(108.0, Some(&hemel), Some(58.0), Some(148.0));
-        assert_eq!(pick, CruisePick { kts: 108.0, source: "profile", rejected: Some("above_ceiling") });
+        let pick = cruise_pick(108.0, Some(&hemel), Some(58.0), Some(148.0), None);
+        assert_eq!(
+            pick,
+            CruisePick { kts: 108.0, source: "profile", rejected: Some("above_ceiling"), capped_from: None }
+        );
         let slow = ScheduledSpeed { target_kts: 90.0, ..hemel.clone() };
-        assert_eq!(cruise_pick(255.0, Some(&slow), Some(167.0), None).rejected, Some("below_floor"));
+        assert_eq!(cruise_pick(255.0, Some(&slow), Some(167.0), None, None).rejected, Some("below_floor"));
+        // #156: under the overspeed caution (0.9 x 340 = 306) by the margin:
+        // 296, the plan's 300 kept as `capped_from`. The FL180 cruise as
+        // flown held 294.2 to 304.2 around its 299 (+2010 to +2100): the same
+        // wander over the cap stays out of the caution band.
+        let cap = cruise_cap_kts(Some(340.0));
+        assert_eq!(cap, Some(296.0));
+        let pick = cruise_pick(255.0, Some(&hemel), Some(167.0), Some(325.0), cap);
+        assert_eq!(pick, CruisePick { kts: 296.0, source: "ofp", rejected: None, capped_from: Some(300.0) });
+        assert!(296.0 + (304.2 - 299.2) < 306.0);
+        // Under the cap, or a cap under the floor: the plan's own number.
+        let under = ScheduledSpeed { target_kts: 280.0, ..hemel.clone() };
+        assert_eq!(
+            cruise_pick(255.0, Some(&under), Some(167.0), Some(325.0), cap),
+            CruisePick { kts: 280.0, source: "ofp", rejected: None, capped_from: None }
+        );
+        assert_eq!(cruise_pick(255.0, Some(&hemel), Some(167.0), None, Some(150.0)).kts, 300.0);
+        assert_eq!(cruise_cap_kts(None), None);
         // A leg whose ident matches but whose fix is elsewhere is not it.
         let mut far = at("HEMEL").clone();
         far.fix.as_mut().unwrap().lat += 1.0;

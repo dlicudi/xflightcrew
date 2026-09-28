@@ -974,6 +974,9 @@ const STALL_LOOKAHEAD_S: f64 = 4.0;
 /// callout — so a descent accelerating toward redline is called with lead time,
 /// not at Vne. Only a rising trend counts (see `Overspeed::eval`).
 const OVERSPEED_LOOKAHEAD_S: f64 = 4.0;
+/// The overspeed caution's floor, a fraction of Vne; the follower schedules
+/// its cruise under it (`procedure::cruise_cap_kts`).
+pub(crate) const OVERSPEED_CAUTION_FACTOR: f64 = 0.90;
 
 struct StallSpeed {
     id: &'static str,
@@ -2471,7 +2474,7 @@ fn build_checks(profile: &AircraftProfile) -> Vec<Box<dyn Check>> {
             id: "overspeed_caution",
             severity: Severity::Caution,
             vne_kts: vne,
-            at_or_above_factor: 0.90,
+            at_or_above_factor: OVERSPEED_CAUTION_FACTOR,
             below_factor: Some(1.0),
         }));
         checks.push(Box::new(Overspeed {
