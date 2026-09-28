@@ -274,8 +274,10 @@ Config: `XCOPILOT_ATC_AIRPORT` / `_VOICE` / `_RATE` / `_REGION`.
   (`Ctx.transition_level_ft`) a level is a flight level in clearance, readback and correction
   (`tower::climb_item`); `heard_altitude_ft` hears either form; the crew's check-in says flight
   levels above the flight's transition altitude (`departure_check_in_above`).
-- Runway in use: calm wind follows the live stream, arrivals first (`arrival_end`) else the last ghost
-  liftoff's end (`departure_end`, `DEPARTURE_STREAM_SECS`); **one strip, one direction**: an
+- Runway in use: calm wind follows the live stream, arrivals first (the lander on final, `arrival_end`,
+  else the last ghost TOUCHDOWN's end, `arrival_stream_end`, `ARRIVAL_STREAM_SECS`), else the last ghost
+  liftoff's end (`departure_end`, `DEPARTURE_STREAM_SECS`), read through one `field_streams` (opposed
+  streams: the older is dropped; LEMG 30 cleared head-on to the 12 landings between landers, #164); **one strip, one direction**: an
   uncommitted calm pick against the stream turns round to it (`ends_oppose`, `runway_follows_stream`),
   a stated runway into the departures is refused, and **the party line clears nobody against our
   runway** (`own_strip_claim`, `conflicts_with_claim`, in the air too; `party_line_withheld`; LEMG 31

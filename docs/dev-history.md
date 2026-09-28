@@ -9935,3 +9935,13 @@ with no velocity on its first ground sample. Now: occupancy is the paved half-wi
 (`ghost_stale`), and an order for traffic that will not leave re-sequences (`resequence_runway`: 12 in
 300/4; another runway for a standing occupant; else hold). Root cause left open: a stated calm runway
 cleared against a live arrival stream nobody remembered (arrival-stream memory owed, #164). Offline only.
+
+## 2026-09-28: the tower remembers the arrival stream (issue #164)
+
+LEMG (sortie 1790610218-approach): the replay landed 12 (RYR431 t 1790610003, RYR590 1790610134); at
+1790610223 the SR22's "final runway three zero" in 300/4 was cleared for 30, because `arrival_end` is a
+snapshot of traffic ON FINAL and nothing was on final at that instant; ordered round twice (#162). The
+wake watch now remembers every ghost touchdown on a runway's pavement for `ARRIVAL_STREAM_SECS` (600 s,
+`arrival_stream_end`, blackbox `atc arrival_stream`); `field_streams` is the one reader for the runway
+pick, the stated-runway refusal, `runway_follows_stream`, the runway-start rule and `resequence_runway`;
+opposed arrival and departure memories keep only the newer. Offline only.
