@@ -1564,6 +1564,28 @@ where
     }
 }
 
+/// Wait for the auto drive (taxi, line-up, backtrack) to end. False when
+/// it gained no ground along its route for `autotaxi::DRIVE_NO_PROGRESS_S`,
+/// ran past `autotaxi::DRIVE_CEILING_S`, or the mission was aborted. Never
+/// a flat clock: at LEMG (2026-09-28) the SR22's 4.7 km taxis were given up
+/// at 600 s still rolling at 4 to 9 kt with 2 km to go.
+async fn wait_for_drive() -> bool {
+    let t0 = Instant::now();
+    let ended = wait_until(crate::autotaxi::DRIVE_CEILING_S, 1000, || async {
+        !crate::autotaxi::driving() || crate::autotaxi::drive_stalled()
+    })
+    .await;
+    let still = crate::autotaxi::driving();
+    if still && !ABORT.load(SeqCst) {
+        event(
+            "drive_no_progress",
+            json!({ "waited_s": t0.elapsed().as_secs_f64(),
+                    "stalled": crate::autotaxi::drive_stalled() }),
+        );
+    }
+    ended && !still
+}
+
 /// Both instruments must affirm the ground gate; an API failure is no clearance.
 fn confirmed_ground(agl_m: anyhow::Result<f64>, on_ground: anyhow::Result<f64>) -> bool {
     matches!((agl_m, on_ground), (Ok(agl), Ok(ground))
@@ -2633,7 +2655,7 @@ async fn fly(xp: XPlaneClient, config: Config, voice: Option<Voice>, tools: SubT
         // flag reads that gap as "finished".
         waiting("the taxi to arrive");
         if crate::autotaxi::driving()
-            && !wait_until(600.0, 1000, || async { !crate::autotaxi::driving() }).await
+            && !wait_for_drive().await
         {
             give_up(
                 &xp,
@@ -2803,7 +2825,7 @@ async fn fly(xp: XPlaneClient, config: Config, voice: Option<Voice>, tools: SubT
             // a failure one second after leg two engaged (2026-07-28).
             waiting("the taxi to arrive");
             if crate::autotaxi::driving()
-                && !wait_until(600.0, 1000, || async { !crate::autotaxi::driving() }).await
+                && !wait_for_drive().await
             {
                 give_up(
                     &xp,
@@ -5343,7 +5365,7 @@ async fn backtrack_from_runway_start(
     }
     waiting("the backtrack");
     if crate::autotaxi::driving()
-        && !wait_until(600.0, 1000, || async { !crate::autotaxi::driving() }).await
+        && !wait_for_drive().await
     {
         return Err((
             "The backtrack didn't finish. Your aircraft.".to_string(),
