@@ -674,7 +674,9 @@ the `legal` table), `Control`, `Abnormal`, `Memory`, `Situation` (the pilot's ta
   spoken decline. The upset RECOVERY is only for an actual upset or distress words. "I'll taxi" /
   "let me fly" is the release guard (`note_crew_takeover`; blackbox `handover`).
 
-Still owed: issues labelled `owed` (rapport's touchdown bookkeeping #85).
+Rapport's touchdown, bounce and time aloft are the model's events (`Rapport::tick` takes `&Flight` and
+the tick's events; `Memory::aloft_t`); an `Impact` is never praised. Go-arounds are still rapport's
+own count (the two disagreed on 2 of 4 recorded).
 
 ## Checklist flows: the list at its phase, three flavours
 
@@ -707,12 +709,14 @@ every loop down.
 **Instructor** (`src/instructor.rs`): one ACS task at a time (`Task::Taxi`, `Task::Takeoff` too).
 - The brief ASSIGNS the numbers from the book and the aircraft, so the scorer never guesses;
   "begin" re-assigns from NOW. An excursion is narrated once, with its correction.
-- ACS tolerances per level (`Task::standards`). An AP-shaped command in a lesson is a RETARGET
+- ACS tolerances per level (`Task::standards`); the taxi's centreline (`line_m`, `Axis::Centreline`)
+  is judged by the scorecard's own `LineJudge` (vertex cuts are cuts) from the guide's turn card
+  (`TaxiLine`), and `state` carries `taxi` for `grade_flight`. An AP-shaped command in a lesson is a RETARGET
   (`take_target`), never a write. Taxi pace is judged against `taxi.kts`, never too slow.
 - **"Teach me a full flight"** (`Syllabus`, `STEPS`, `flow::phase_boundary`, `syllabus_active`),
   behind `SyllabusIo` (`FlowIo` live), so the whole flight is a plain `cargo test`.
 - `xvl debrief` prints lessons and `instructor::grade_flight` over any flight's `state` records.
-- Still owed: issues labelled `owed` + `area:instructor` (#86, #87, #88).
+- Still owed: issues labelled `owed` + `area:instructor` (#86, #87).
 
 **Cabin crew** (`src/cabin.rs`): the second intercom persona.
 - **A state machine, not a commentator**, with its own mute (`cabin_quiet`), NOT the monitor's
@@ -733,7 +737,7 @@ every loop down.
 - **Persona** (`src/persona.rs`): `XCOPILOT_CREW_CHATTER` gates only what is VOLUNTEERED, never an
   answer or safety call; the idiom follows the VOICE's accent (`XCOPILOT_CREW_DIALECT`); small talk
   is a CLOSED set; `XCOPILOT_PILOT_NAME` on the first praise. Acks vary (`readback::vary_ack`).
-- **Rapport** (`src/rapport.rs`): sees every tick, autoland included; the landing word is the
+- **Rapport** (`src/rapport.rs`): its wheels are the flight model's; sees every tick, autoland included; the landing word is the
   instructor's scorer (`landing_summary` still blackboxed); praise goes to the pilot, never an
   automation; a bounce counts at the SECOND contact. Offers are sentences, never actions
   (`rapport::arrival_brief`); busy deferrables become ASIDES.

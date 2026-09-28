@@ -9312,3 +9312,29 @@ refuses a local plan; no SID/STAR on local plans.
 Next sortie: blackbox `flightplan` `planned` (`via`, `route`, `route_nm`, `fixes`, `avoided`,
 `crossed`, `at_fields`, `ifr`); at the arm `plan_fetch` outcome `local`, `preflight`, `plan_audit`
 with the airway or XVLD fixes before XVLCR, XVLIF, XVLFA; the follower sequences them. Offline only.
+
+## 2026-09-28: rapport's wheels are the flight model's; the taxi lesson judges the centreline (issues #85, #88)
+
+#85: rapport kept its own air/ground debounce (3 s above 30 ft), its own sink window and its own
+bounce latch beside flight.rs. Across 17 recorded landings its sink matched the model's every time
+but one (t=1790530411, a +48 fpm vario at contact). `Rapport::tick` now takes the model and the
+tick's events: a landing is booked at `Event::Touchdown` with the model's sink, bounces at
+`Event::Bounce`, a pending word goes out as an aside at `TouchAndGo`/`Takeoff`, airborne time comes
+from the new `Memory::aloft_t` (takeoff, touch and go or join) and the same field from
+`Memory::origin`. An `Impact` is booked (`rapport` `touchdown` `impact`) but never a landing at the
+field, and gets a word only past 600 fpm (the old detector called a contact climbing into the ground a
+greaser). Five recorded landings (`bench/landings/rapport_landings.jsonl`, pinned by
+`the_recorded_landings_say_what_they_said`) replay to the same bookings and lines before and after.
+Go-arounds stay rapport's own count: the model's needs the Approach phase and the two disagreed on 2
+of the 4 recorded. Pinned as today's behaviour, not fixed: the +48 fpm contact says "about 0 feet a
+minute"; `words_for(55)` says "55 minutes in the air".
+
+#88: `Task::Taxi` standards carry `line_m` (private 3 m, the scorecard's `TAXI_MAX_LAT_M`; commercial
+2 m, both our figures, the ACS names none) and a `Centreline` axis, judged by `scorecard::LineJudge`
+(the scorecard's corner and vertex logic moved out unchanged; the pinned sortie scores are
+unchanged), narrated once per excursion with its correction. The lesson reads the taxi guide's turn
+card (`instructor::TaxiLine`); `state` records carry `taxi` [xtk, remaining, turn, off] so
+`grade_flight` grades every taxi on a cleared route. Needs a published route and `taxi_guide` on.
+
+Next flight: `rapport` `touchdown` on the tick of `flight` `touchdown` with the model's sink; a taxi
+lesson's grade has a `centreline` axis; `xvl debrief` prints a taxi line. Offline only.
