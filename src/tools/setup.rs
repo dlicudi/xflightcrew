@@ -36,10 +36,10 @@ const TYPED: &str = "xcopilot/typed";
 //   runner put the 737 on 13's threshold while the last case's zone
 //   clearance (31, squawk 4501) was still held, and full auto taxied to 31.
 
-/// The app is starting a new flight (a setup tool committed to it): set
-/// before the follow-up is spawned, cleared once it has armed or failed.
-static NEW_FLIGHT_LOADING: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+/// New flights being started or taken on (a setup tool committed to one, or
+/// the watch resolving one someone else started): counted up before the
+/// follow-up is spawned, down once it has armed or failed.
+static NEW_FLIGHT_LOADING: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 /// Mailbox runs this process has in flight ([`run_init`]).
 static OWN_INITS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 /// The highest init sequence number this process has accounted for (its own
@@ -53,20 +53,21 @@ struct Loading;
 
 impl Loading {
     fn begin() -> Loading {
-        NEW_FLIGHT_LOADING.store(true, std::sync::atomic::Ordering::SeqCst);
+        NEW_FLIGHT_LOADING.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         Loading
     }
 }
 
 impl Drop for Loading {
     fn drop(&mut self) {
-        NEW_FLIGHT_LOADING.store(false, std::sync::atomic::Ordering::SeqCst);
+        NEW_FLIGHT_LOADING.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
     }
 }
 
-/// A new flight is loading through this app's mailbox.
+/// A new flight is loading through this app's mailbox, or one someone else
+/// started is still being taken on (its station resolved).
 pub fn new_flight_loading() -> bool {
-    NEW_FLIGHT_LOADING.load(std::sync::atomic::Ordering::SeqCst)
+    NEW_FLIGHT_LOADING.load(std::sync::atomic::Ordering::SeqCst) > 0
         || OWN_INITS.load(std::sync::atomic::Ordering::SeqCst) > 0
 }
 
@@ -101,10 +102,10 @@ pub fn judge_init_seq(known: i64, seq: i64, result: i64) -> (InitSeen, i64) {
 
 /// Watch the flight-initialisation mailbox for runs this app did not post
 /// (the sortie runner's starts): each new flight stands every loop down and
-/// retires the last flight's clearances, the station for the field rebuilt,
-/// as the app's own approach setup does (blackbox `setup`
-/// `foreign_new_flight`). A slow poll: the runner waits for the aircraft to
-/// sit still and settles fifteen seconds before its command.
+/// retires the last flight's clearances, and the station for the field
+/// under the aircraft's NEW position is rebuilt, as the app's own setups do
+/// (blackbox `setup` `foreign_new_flight`). A slow poll: the runner waits for
+/// the aircraft to sit still and settles fifteen seconds before its command.
 pub fn spawn_new_flight_watch(base: String) {
     spawn_off_loop(async move {
         use std::sync::atomic::Ordering::SeqCst;
@@ -123,28 +124,202 @@ pub fn spawn_new_flight_watch(base: String) {
                 judge_init_seq(KNOWN_INIT_SEQ.load(SeqCst), seq as i64, res as i64);
             KNOWN_INIT_SEQ.fetch_max(known, SeqCst);
             if seen == (InitSeen::Foreign { new_flight: true }) && !new_flight_loading() {
-                foreign_new_flight(seq as i64);
+                foreign_new_flight(&xp, seq as i64).await;
             }
         }
     });
 }
 
-/// Someone else started a new flight: nothing keeps flying the old one, and
-/// the world forgets it.
-fn foreign_new_flight(seq: i64) {
+/// Someone else started a new flight: nothing keeps flying the old one, the
+/// world forgets it, and the station is the field the aircraft is now at.
+/// The arm waits while this runs (`new_flight_loading`).
+async fn foreign_new_flight(xp: &crate::xplane::XPlaneClient, seq: i64) {
+    let _loading = Loading::begin();
     crate::flight_state::stand_down();
-    let field = crate::station::active_icao().map(|(icao, _, _)| icao);
-    let tower = match (&field, crate::mode::atc_enabled()) {
-        (Some(icao), true) => {
-            crate::party_line::retire_for_new_flight();
-            crate::station::arm_new_flight(icao, std::time::Instant::now())
-        }
-        _ => None,
+    let atc = crate::mode::atc_enabled();
+    if atc {
+        crate::party_line::retire_for_new_flight();
+    }
+    let t0 = std::time::Instant::now();
+    let fix = if atc { settled_position(xp, SettleTiming::LIVE).await } else { None };
+    let station = match fix {
+        Some(fix) => new_flight_station(fix, STATION_UP_S).await,
+        None => NewFlightStation::default(),
     };
     crate::blackbox::record(
         "setup",
-        json!({ "event": "foreign_new_flight", "seq": seq, "field": field, "tower": tower }),
+        json!({ "event": "foreign_new_flight", "seq": seq, "field": station.field,
+                "tower": station.tower, "station_up": station.up,
+                "was": station.was,
+                "lat": fix.map(|f| f.lat), "lon": fix.map(|f| f.lon),
+                "on_ground": fix.map(|f| f.on_ground),
+                "settled": fix.is_some(), "ms": t0.elapsed().as_millis() as u64 }),
     );
+}
+
+// ---- The new flight's position, and its station ----------------------------
+//
+// A new flight is at a new field, and the station must be that field's. The
+// sim's own report of where the new flight is lies for a while: through the
+// load it gives the first runway's midpoint (EGKK 2026-09-28: 51.14830 N
+// 0.18915 W, "on the ground" at 157 ft AGL, 16 s, before stand 71 at
+// 51.15540 N 0.16537 W and 0 ft; LEMG #134: runway 12's midpoint at -84 ft
+// AGL). The station is chosen only from a position that has settled.
+
+/// One read of where the aircraft is.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PosSample {
+    /// Seconds, any epoch.
+    pub t: f64,
+    pub lat: f64,
+    pub lon: f64,
+    pub agl_ft: f64,
+    pub on_ground: bool,
+    /// Metres per second.
+    pub gs_mps: f64,
+}
+
+/// A position the station can be chosen from.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Fix {
+    pub lat: f64,
+    pub lon: f64,
+    pub on_ground: bool,
+}
+
+/// On the ground the wheels are within this of the terrain.
+const SETTLE_GROUND_AGL_FT: f64 = 20.0;
+/// Airborne, the aircraft is at least this far above it.
+const SETTLE_AIR_AGL_FT: f64 = 10.0;
+/// Slack on the dead-reckoned move between two reads, metres.
+const SETTLE_SLACK_M: f64 = 15.0;
+/// Plausible reads, each consistent with the last, for this long.
+const SETTLE_SPAN_S: f64 = 2.0;
+const SETTLE_MIN_SAMPLES: usize = 3;
+
+/// Has the new flight's position settled? Each read must be plausible (on
+/// the ground at the terrain, airborne above it) and follow from the last
+/// by its groundspeed; a run of them over [`SETTLE_SPAN_S`] is the fix. A
+/// read that fails either starts the run again. Pure.
+#[derive(Debug, Default)]
+pub struct SettleJudge {
+    run: Vec<PosSample>,
+}
+
+impl SettleJudge {
+    pub fn feed(&mut self, s: PosSample) -> Option<Fix> {
+        let plausible = if s.on_ground {
+            s.agl_ft.abs() <= SETTLE_GROUND_AGL_FT
+        } else {
+            s.agl_ft >= SETTLE_AIR_AGL_FT
+        };
+        let follows = self.run.last().is_none_or(|p| {
+            let moved = crate::nav::haversine_nm(p.lat, p.lon, s.lat, s.lon) * 1852.0;
+            let dt = (s.t - p.t).max(0.0);
+            p.on_ground == s.on_ground && moved <= s.gs_mps.abs().max(p.gs_mps.abs()) * dt + SETTLE_SLACK_M
+        });
+        if !plausible {
+            self.run.clear();
+            return None;
+        }
+        if !follows {
+            self.run.clear();
+        }
+        self.run.push(s);
+        let first = self.run.first()?;
+        (self.run.len() >= SETTLE_MIN_SAMPLES && s.t - first.t >= SETTLE_SPAN_S).then_some(Fix {
+            lat: s.lat,
+            lon: s.lon,
+            on_ground: s.on_ground,
+        })
+    }
+}
+
+/// How the settle wait keeps time.
+#[derive(Debug, Clone, Copy)]
+pub struct SettleTiming {
+    pub poll: std::time::Duration,
+    pub deadline: std::time::Duration,
+}
+
+impl SettleTiming {
+    pub const LIVE: SettleTiming = SettleTiming {
+        poll: std::time::Duration::from_millis(500),
+        deadline: std::time::Duration::from_secs(60),
+    };
+}
+
+/// Read the position until it settles ([`SettleJudge`]); `None` by the
+/// deadline. A failed read is no sample.
+pub async fn settled_position(xp: &crate::xplane::XPlaneClient, t: SettleTiming) -> Option<Fix> {
+    let t0 = std::time::Instant::now();
+    let mut judge = SettleJudge::default();
+    while t0.elapsed() < t.deadline {
+        let (lat, lon, agl, g, gs) = tokio::join!(
+            xp.get_float(crate::datarefs::LATITUDE),
+            xp.get_float(crate::datarefs::LONGITUDE),
+            xp.get_float(crate::datarefs::AGL_METERS),
+            xp.get_float(crate::datarefs::ON_GROUND_ANY),
+            xp.get_float("sim/flightmodel/position/groundspeed"),
+        );
+        if let (Ok(lat), Ok(lon), Ok(agl), Ok(g), Ok(gs)) = (lat, lon, agl, g, gs) {
+            let s = PosSample {
+                t: t0.elapsed().as_secs_f64(),
+                lat,
+                lon,
+                agl_ft: agl * 3.28084,
+                on_ground: g > 0.5,
+                gs_mps: gs,
+            };
+            if let Some(fix) = judge.feed(s) {
+                return Some(fix);
+            }
+        }
+        tokio::time::sleep(t.poll).await;
+    }
+    None
+}
+
+/// How long a new flight waits for its station to be installed.
+const STATION_UP_S: u64 = 15;
+
+/// What a new flight's station came to.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct NewFlightStation {
+    /// The towered field under the new position (`None`: none, nothing armed).
+    pub field: Option<String>,
+    pub tower: Option<i64>,
+    /// The main loop installed it within the wait.
+    pub up: bool,
+    /// The station that was up before.
+    pub was: Option<String>,
+}
+
+/// The station for the field under the new flight's settled position: armed
+/// ([`crate::station::arm_new_flight_at`]) and waited on until the main loop
+/// has installed it, at most `wait_s`.
+pub async fn new_flight_station(fix: Fix, wait_s: u64) -> NewFlightStation {
+    let was = crate::station::active_icao().map(|(icao, _, _)| icao);
+    let Some((field, khz)) =
+        crate::station::arm_new_flight_at(fix.lat, fix.lon, fix.on_ground, std::time::Instant::now())
+    else {
+        return NewFlightStation { was, ..NewFlightStation::default() };
+    };
+    let up = await_station_up(khz, wait_s).await;
+    NewFlightStation { field: Some(field), tower: Some(khz), up, was }
+}
+
+/// Wait for the armed swap to be installed with this tower, at most `wait_s`.
+async fn await_station_up(khz: i64, wait_s: u64) -> bool {
+    let t0 = std::time::Instant::now();
+    let up = || {
+        !crate::party_line::station_swap_pending()
+            && crate::party_line::home_tower_khz() == Some(khz)
+    };
+    while t0.elapsed().as_secs() < wait_s && !up() {
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+    up()
 }
 
 /// The ICAO type an `.acf` declares (`P acf/_ICAO B738`). Pure.
@@ -342,9 +517,13 @@ async fn follow_up(base: String, voice: Option<Voice>, body: String, origin: Str
     };
     crate::blackbox::record("setup", json!({ "event": "result", "result": result }));
     match result {
-        // A checklist of the flight that ended ends with it.
+        // A checklist of the flight that ended ends with it, and so do its
+        // clearances.
         Some(0) => {
             crate::flow::stand_down(crate::flow::StandDown::NewFlight("setup"));
+            if crate::mode::atc_enabled() {
+                crate::party_line::retire_for_new_flight();
+            }
         }
         Some(code) => {
             let why = match code {
@@ -362,16 +541,41 @@ async fn follow_up(base: String, voice: Option<Voice>, body: String, origin: Str
             return;
         }
     }
-    // Settled: on the ground and still for five seconds, then the profile
-    // detection has its moment before the plan and the load.
+    // Settled: on the ground AT the terrain and still for five seconds (the
+    // load's transient sits "on the ground" 157 ft up a runway's midpoint,
+    // EGKK 2026-09-28), then the profile detection has its moment before the
+    // plan and the load.
     let mut still = 0;
     while t0.elapsed().as_secs() < 240 && still < 10 {
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-        let (g, gs) = tokio::join!(
+        let (g, gs, agl) = tokio::join!(
             xp.get_float(crate::datarefs::ON_GROUND_ANY),
             xp.get_float("sim/flightmodel/position/groundspeed"),
+            xp.get_float(crate::datarefs::AGL_METERS),
         );
-        still = if g.is_ok_and(|g| g > 0.5) && gs.is_ok_and(|v| v.abs() < 0.5) { still + 1 } else { 0 };
+        still = if g.is_ok_and(|g| g > 0.5)
+            && gs.is_ok_and(|v| v.abs() < 0.5)
+            && agl.is_ok_and(|m| (m * 3.28084).abs() <= SETTLE_GROUND_AGL_FT)
+        {
+            still + 1
+        } else {
+            0
+        };
+    }
+    // The station is the field we are now at, up before the flag drops and
+    // anything arms (#151).
+    if crate::mode::atc_enabled() {
+        let fix = settled_position(&xp, SettleTiming::LIVE).await;
+        let station = match fix {
+            Some(fix) => new_flight_station(fix, STATION_UP_S).await,
+            None => NewFlightStation::default(),
+        };
+        crate::blackbox::record(
+            "setup",
+            json!({ "event": "ramp_station", "airport": origin, "field": station.field,
+                    "tower": station.tower, "station_up": station.up, "was": station.was,
+                    "settled": fix.is_some() }),
+        );
     }
     tokio::time::sleep(std::time::Duration::from_secs(8)).await;
     say(&format!("We're at {origin}, {stand}. Loading the plan and the load sheet."));
@@ -1043,8 +1247,14 @@ async fn approach_follow_up(job: ApproachJob, loading: Loading) {
     // arms: autoland reads the party line on its first pass, and at LEMG
     // (sortie 1790584266-approach, 2026-09-28) it read the last case's
     // "cleared to land 12" 1.3 s into a new 10 nm final for 13.
+    // The station is rebuilt for the field the flight was put at, armed here
+    // with the retirement so the main loop installs it while autoland arms.
+    let mut tower = None;
     if new_flight_began(&run.outcome) {
         crate::party_line::retire_for_new_flight();
+        if !matches!(next, AfterInit::Failed { .. }) && crate::mode::atc_enabled() {
+            tower = crate::station::arm_new_flight(&job.icao, std::time::Instant::now());
+        }
         // A checklist of the flight that ended ends with it.
         crate::flow::stand_down(crate::flow::StandDown::NewFlight("setup"));
     }
@@ -1092,15 +1302,15 @@ async fn approach_follow_up(job: ApproachJob, loading: Loading) {
     if matches!(next, AfterInit::Failed { .. }) || !crate::mode::atc_enabled() {
         return;
     }
-    new_flight_radio(&xp, &job).await;
+    new_flight_radio(&xp, &job, tower).await;
 }
 
 /// The tower hears a NEW arrival: its station for this field is rebuilt from
 /// nothing, COM1 goes to it, the field's own wind is published, and once the
 /// new station is up the final report goes out (the landing is cleared; at
 /// LEMG it earned "you landed without clearance").
-async fn new_flight_radio(xp: &crate::xplane::XPlaneClient, job: &ApproachJob) {
-    let Some(khz) = crate::station::arm_new_flight(&job.icao, std::time::Instant::now()) else {
+async fn new_flight_radio(xp: &crate::xplane::XPlaneClient, job: &ApproachJob, tower: Option<i64>) {
+    let Some(khz) = tower else {
         crate::blackbox::record(
             "setup",
             json!({ "event": "approach_radio", "icao": job.icao, "tower": null }),
@@ -1114,14 +1324,7 @@ async fn new_flight_radio(xp: &crate::xplane::XPlaneClient, job: &ApproachJob) {
     }
     // The call belongs to the NEW station: routed a pass early it reaches
     // the old one and its worksheet.
-    let t0 = std::time::Instant::now();
-    while t0.elapsed().as_secs() < 15
-        && (crate::party_line::station_swap_pending()
-            || crate::party_line::home_tower_khz() != Some(khz))
-    {
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-    }
-    let up = crate::party_line::home_tower_khz() == Some(khz);
+    let up = await_station_up(khz, STATION_UP_S).await;
     let callsign = crate::circuit::crew_callsign(xp).await;
     let words = format!(
         "{} mile final runway {}",
@@ -1536,6 +1739,86 @@ mod tests {
         let arm = this.find("crate::autoland::run_autoland(").unwrap();
         let drop_at = this.find("drop(loading);").unwrap();
         assert!(arm < drop_at, "the flag drops after the arm");
+    }
+
+    fn at(t: f64, lat: f64, lon: f64, agl_ft: f64, on_ground: bool, gs_mps: f64) -> PosSample {
+        PosSample { t, lat, lon, agl_ft, on_ground, gs_mps }
+    }
+
+    /// EGKK, 2026-09-28 (#151): the recorded load. The sim said "on the
+    /// ground" at runway 08R/26L's midpoint 157 ft up for 16 s, then stand 71
+    /// at the terrain. The station is chosen only from stand 71.
+    #[test]
+    fn a_new_flight_is_placed_only_once_its_position_settles() {
+        let mut j = SettleJudge::default();
+        // The load's transient: plausible nowhere, however still.
+        for k in 0..40 {
+            let t = 1509.3 + 0.4 * f64::from(k);
+            assert_eq!(j.feed(at(t, 51.14829935, -0.1891522, 157.1, true, 0.0)), None, "t {t}");
+        }
+        // Stand 71: settles once 2 s of it agree.
+        let stand = [
+            (1531.6, 51.15539550997997, -0.16536942320749573, -0.0, 0.0),
+            (1531.9, 51.15539550997997, -0.16536942320749573, -0.0, 0.0),
+            (1532.3, 51.15539550997997, -0.16536942320749573, -0.0, 0.0),
+            (1532.7, 51.15539550997997, -0.16536942320749573, -0.0, 0.0),
+            (1533.0, 51.15539550997997, -0.16536942320749573, -0.0, 0.0),
+        ];
+        for (t, lat, lon, agl, gs) in stand {
+            assert_eq!(j.feed(at(t, lat, lon, agl, true, gs)), None, "t {t}");
+        }
+        let fix = j
+            .feed(at(1534.4, 51.155395652708314, -0.16536949061987397, 0.0, true, 0.1))
+            .expect("settled on the stand");
+        assert!((fix.lat - 51.1554).abs() < 1e-3 && (fix.lon + 0.1654).abs() < 1e-3, "{fix:?}");
+        assert!(fix.on_ground);
+
+        // LEMG #134: a final's transient at -84 ft AGL is no position; the
+        // final itself, flying 70 m/s, settles.
+        let mut j = SettleJudge::default();
+        for k in 0..5 {
+            let t = f64::from(k) * 0.5;
+            assert_eq!(j.feed(at(t, 36.68532005, -4.49416975, -84.0, false, 0.0)), None);
+        }
+        let mut fix = None;
+        for k in 0..6 {
+            let t = 10.0 + f64::from(k) * 0.5;
+            // 35 m a read along the final, about 0.000315 degrees of latitude.
+            let lat = 36.60 + 0.000315 * f64::from(k);
+            fix = fix.or(j.feed(at(t, lat, -4.55, 2_900.0, false, 70.0)));
+        }
+        assert!(fix.is_some_and(|f| !f.on_ground));
+
+        // A jump is a new place, never a movement: the run starts again.
+        let mut j = SettleJudge::default();
+        assert_eq!(j.feed(at(0.0, 36.6716, -4.4890, 0.1, true, 0.0)), None);
+        assert_eq!(j.feed(at(1.0, 36.6716, -4.4890, 0.1, true, 0.0)), None);
+        assert_eq!(j.feed(at(1.5, 51.1554, -0.1654, 0.0, true, 0.0)), None);
+        assert_eq!(j.feed(at(2.5, 51.1554, -0.1654, 0.0, true, 0.0)), None, "1 s of the new place");
+        assert!(j.feed(at(3.5, 51.1554, -0.1654, 0.0, true, 0.0)).is_some());
+    }
+
+    /// Every new flight resolves its station from where it now is: the watch
+    /// never re-arms the field the station happened to be working, and the
+    /// ramp setup rebuilds it before its flag drops (#151).
+    #[test]
+    fn a_new_flight_takes_its_station_from_its_new_position() {
+        let src = include_str!("setup.rs");
+        let body = |name: &str| {
+            let a = src.find(name).unwrap();
+            let b = a + src[a..].find("\n}\n").unwrap();
+            &src[a..b]
+        };
+        let foreign = body("async fn foreign_new_flight(");
+        assert!(!foreign.contains(&["active", "_icao()"].concat()), "never the active field");
+        assert!(foreign.contains("settled_position(") && foreign.contains("new_flight_station("));
+        assert!(foreign.contains("Loading::begin()"), "the arm waits while it resolves");
+        let ramp = body("async fn follow_up(");
+        let station = ramp.find("new_flight_station(").expect("the ramp setup resolves it");
+        let typed = ramp.find("load the flight plan").unwrap();
+        assert!(station < typed, "up before anything is asked of the new flight");
+        let resolve = body("pub async fn new_flight_station(");
+        assert!(resolve.contains("arm_new_flight_at(fix.lat, fix.lon"));
     }
 
     #[test]

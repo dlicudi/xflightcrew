@@ -1640,6 +1640,90 @@ async fn condition_to_run(xp: &XPlaneClient) {
     }
 }
 
+/// How long the arm waits for the departure field's station to be installed.
+const DEPARTURE_STATION_WAIT: Duration = Duration::from_secs(20);
+
+/// How the arm's wait for the departure station ended.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum DepartureWait {
+    /// The station up is the field's (or there is no towered field here).
+    Ready { armed: bool },
+    /// Not by the deadline: the field wanted and the station still up.
+    Refused { want: String, active: Option<String> },
+}
+
+/// Wait until the installed station is the field under the aircraft. `look`
+/// judges once (`true` = it may arm the field's station, asked at most once:
+/// the main loop installs it); the wait ends Ready, or Refused at `wait`.
+pub(crate) async fn wait_departure_station<F>(mut look: F, wait: Duration, poll: Duration) -> DepartureWait
+where
+    F: FnMut(bool) -> (crate::station::DepartureStation, Option<String>),
+{
+    use crate::station::DepartureStation as D;
+    let t0 = tokio::time::Instant::now();
+    let mut armed = false;
+    loop {
+        let (verdict, active) = look(!armed);
+        let want = match verdict {
+            D::Ready => return DepartureWait::Ready { armed },
+            D::Arm { want } => {
+                armed = true;
+                want
+            }
+            D::Waiting { want } => want,
+        };
+        if t0.elapsed() >= wait {
+            return DepartureWait::Refused { want, active };
+        }
+        tokio::time::sleep(poll).await;
+    }
+}
+
+/// The words for a departure whose field's station never came up. Pure.
+pub(crate) fn departure_station_refusal(want: &str, active: Option<&str>) -> String {
+    match active {
+        Some(a) => format!(
+            "The tower for {want} isn't up; the station is still {a}. Ask again in a moment. Your aircraft."
+        ),
+        None => format!("The tower for {want} isn't up. Ask again in a moment. Your aircraft."),
+    }
+}
+
+/// The arm's departure-station check on the aircraft's position (blackbox
+/// `full_auto` `departure_station`). An unread position is no judgement:
+/// the mission goes on as before.
+async fn departure_station(xp: &XPlaneClient) -> Result<(), String> {
+    let (lat, lon) = tokio::join!(xp.get_float(LAT), xp.get_float(LON));
+    let (Ok(lat), Ok(lon)) = (lat, lon) else {
+        return Ok(());
+    };
+    let under = crate::station::field_under(lat, lon, true).map(|(icao, _)| icao);
+    let t0 = Instant::now();
+    let out = wait_departure_station(
+        |arm| crate::station::departure_station(lat, lon, arm, Instant::now()),
+        DEPARTURE_STATION_WAIT,
+        Duration::from_millis(250),
+    )
+    .await;
+    let waited_ms = t0.elapsed().as_millis() as u64;
+    match out {
+        DepartureWait::Ready { armed } => {
+            event(
+                "departure_station",
+                json!({ "field": under, "armed": armed, "ready": true, "waited_ms": waited_ms }),
+            );
+            Ok(())
+        }
+        DepartureWait::Refused { want, active } => {
+            event(
+                "departure_station",
+                json!({ "field": want, "active": active, "ready": false, "waited_ms": waited_ms }),
+            );
+            Err(departure_station_refusal(&want, active.as_deref()))
+        }
+    }
+}
+
 async fn taxi_route_is_ours(xp: &XPlaneClient) -> bool {
     if crate::party_line::taxi_to_stand() {
         return false;
@@ -1752,6 +1836,17 @@ async fn fly(xp: XPlaneClient, config: Config, voice: Option<Voice>, tools: SubT
         .await;
         return;
     }
+    // The station must be the field we are AT before anything asks it for a
+    // thing: a new flight 1,600 km from the last kept Malaga's station, and
+    // Gatwick was departed as an uncontrolled field with its stand looked up
+    // at LEMG (EGKK 2026-09-28, #151).
+    if crate::mode::atc_enabled() {
+        if let Err(line) = departure_station(&xp).await {
+            give_up(&xp, tools.taxi.park_brake_valve_set, &voice, &line, "departure_station").await;
+            return;
+        }
+    }
+    bail_if_abort!();
     // The callsign the tower knows us by, so our calls sound like a real pilot.
     let callsign = crate::circuit::crew_callsign(&xp).await;
 
@@ -6112,6 +6207,67 @@ mod cleared_runway_tests {
 
 #[cfg(test)]
 mod tests {
+    /// EGKK, 2026-09-28 (#151): the arm found Malaga's station up at Gatwick
+    /// stand 71. It arms the field's station once, waits for the main loop
+    /// to install it, and refuses in words when it never comes.
+    #[tokio::test(start_paused = true)]
+    async fn the_arm_waits_for_the_departure_fields_station() {
+        use super::{wait_departure_station, DepartureWait};
+        use crate::station::DepartureStation as D;
+        let want = || "EGKK".to_string();
+        let poll = std::time::Duration::from_millis(250);
+        let wait = std::time::Duration::from_secs(20);
+        // Malaga up, Gatwick armed on the first look, installed on the fourth.
+        let mut looks = 0;
+        let mut arms = 0;
+        let out = wait_departure_station(
+            |arm| {
+                looks += 1;
+                arms += usize::from(arm);
+                let v = match looks {
+                    1 => D::Arm { want: want() },
+                    2..=3 => D::Waiting { want: want() },
+                    _ => D::Ready,
+                };
+                (v, Some("LEMG".to_string()))
+            },
+            wait,
+            poll,
+        )
+        .await;
+        assert_eq!(out, DepartureWait::Ready { armed: true });
+        assert_eq!(looks, 4);
+        assert_eq!(arms, 1, "armed once; the main loop installs it");
+        // Up already: no wait, nothing armed.
+        let out = wait_departure_station(|_| (D::Ready, Some("EGKK".into())), wait, poll).await;
+        assert_eq!(out, DepartureWait::Ready { armed: false });
+        // Never installed (a station that would not build): refused at the
+        // deadline, naming both fields, asked to arm only once.
+        let mut arms = 0;
+        let t0 = tokio::time::Instant::now();
+        let out = wait_departure_station(
+            |arm| {
+                arms += usize::from(arm);
+                (D::Arm { want: want() }, Some("LEMG".into()))
+            },
+            wait,
+            poll,
+        )
+        .await;
+        assert_eq!(out, DepartureWait::Refused { want: want(), active: Some("LEMG".into()) });
+        assert_eq!(arms, 1);
+        assert!(t0.elapsed() >= wait && t0.elapsed() < wait + poll * 2, "{:?}", t0.elapsed());
+        let line = super::departure_station_refusal("EGKK", Some("LEMG"));
+        assert!(line.contains("EGKK") && line.contains("LEMG"), "{line}");
+        assert!(!line.contains('\u{2014}') && !line.contains('\u{2013}'));
+        // The check comes before the mission asks the tower for anything.
+        let src = include_str!("full_auto.rs");
+        let check = src.find("if let Err(line) = departure_station(&xp).await").unwrap();
+        let towered = src.find("let towered = crate::mode::atc_enabled()").unwrap();
+        let callsign = src.find("let callsign = crate::circuit::crew_callsign(&xp).await;\n\n    // On a Flight").unwrap();
+        assert!(check < callsign && check < towered);
+    }
+
     fn sid(ident: &str, join_index: usize) -> crate::nav::SidChoice {
         crate::nav::SidChoice {
             ident: ident.into(),
