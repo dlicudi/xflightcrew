@@ -367,6 +367,10 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
+    // Both processes hold their traffic through a flight load (the plugin's
+    // `xcopilot/sim/loading`; failing open without it).
+    xplane::enable_load_gate(&config.xplane_base_url);
+
     // `xvl sortie <spec.yaml> [--repeat N]`: the unattended runner, a second
     // process beside a running xvl (src/sortie_runner.rs). Exit 1 on any fail.
     if std::env::args().nth(1).as_deref() == Some("sortie") {

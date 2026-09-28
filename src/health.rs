@@ -131,6 +131,7 @@ pub const PLUGIN_DATAREFS: &[&str] = &[
     "xcopilot/sim/init_flight",
     "xcopilot/sim/init_result",
     "xcopilot/sim/init_seq",
+    "xcopilot/sim/loading",
     "xcopilot/status/action",
     "xcopilot/status/aircraft",
     "xcopilot/status/alert",
