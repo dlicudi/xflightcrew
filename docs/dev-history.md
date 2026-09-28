@@ -9603,3 +9603,19 @@ aircraft at rest before any setup (marker idle, on the ground, under 1 kt, held 
 stands 2.5 s between vacate and drive), up to 600 s, then types "my controls" (`hand_back_hold`
 parks) and waits for the stop; in the air it keeps #132's take-back. The run table's "Before" column
 records it. Offline only.
+
+## 2026-09-28: the flare in rough air (issue #146)
+
+LEMG 13 on the #139 build: 1790589309 422 fpm, 89541 315, 89773 335 against 225-285 for the other
+thirteen. Not ApEngage: those three finals strayed 72/83/105 fpm rms from the commanded sink, every
+other one 10-23 (three calm ones on the same build landed 274/240/247), wind 1.4-9 kt swinging. In
+89309 the recorded air through today's calm plant (4,000 fpm per unit, 1.55 s; ten calm fits
+3,700-4,450, 1.35-1.8 s) is a -130 fpm downdraft at 30-20 ft then +100 of lift; the model's 0.3 s
+observer chased both: 0.39 at 25 ft, eased to 0.08 by 16 ft while still sinking 415 to 246, floated
+at -69 at 15 ft on the ease's dead time, rebuilt to -402 under full pull. The ease came before the
+float, so a float-only rule replays at 435. A hold from the flare gate lands the recorded air at 272
+and 292, but in still air through the 09-26 17:25 plant (6,429) it ballooned four of eight gates to
+506. So `FinalAir` measures the final (400 ft to the gate, rough past 40 fpm rms) and rough air holds
+the column (only a climb eases it); smooth air keeps the prediction plus a float hold (inside 150 fpm,
+never forward). Ticks `rough_air`, `flare_ask`; `arrest_hands` `air_rms`, `rough`. Open: the
+roundout's 0.45 kick on a deep gusty gate; 89541 never pulled the sink inside 285. Offline only.
