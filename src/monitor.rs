@@ -2980,6 +2980,14 @@ pub async fn run(
             // region_tick is the exception (its index cache survives).
             let crew_on = crate::mode::copilot_enabled();
 
+            // The sim moved the aircraft (a new flight loaded, a reposition):
+            // a list of the flight that was ends with it.
+            if flight_events
+                .iter()
+                .any(|e| matches!(e, crate::flight::Event::Reposition { .. }))
+            {
+                crate::flow::stand_down(crate::flow::StandDown::NewFlight("reposition"));
+            }
             // The checklist at its phase: crossing a boundary runs the
             // matching list as the flying copilot's cross-check when an
             // automation has the aircraft, or proposes it to the pilot
@@ -3627,7 +3635,7 @@ pub async fn run(
                             .await
                             .is_ok_and(|v| v >= 2.0);
                         if let Some((line, _assigner)) =
-                            crate::station::squawk_tick(code, replying, now)
+                            crate::station::squawk_tick(code, replying, speaker, now)
                         {
                             if let Some(s) = status.as_ref() {
                                 s.action(&format!("{}: {line}", speaker.tag()));
