@@ -3627,7 +3627,7 @@ pub async fn run(
                             .await
                             .is_ok_and(|v| v >= 2.0);
                         if let Some((line, _assigner)) =
-                            crate::station::squawk_tick(code, replying, now)
+                            crate::station::squawk_tick(code, replying, speaker, now)
                         {
                             if let Some(s) = status.as_ref() {
                                 s.action(&format!("{}: {line}", speaker.tag()));

@@ -663,6 +663,9 @@ impl Station {
             if checks_in && !self.dep_checked_in {
                 self.dep_checked_in = true;
                 self.transfer_departure();
+                // This reply IS the radar contact: the watch has nothing
+                // left to say.
+                radar_contact_at_check_in();
                 let position = match service {
                     Service::Approach => "Approach",
                     _ => "Departure",
@@ -1254,6 +1257,7 @@ impl Station {
                 callsign: callsign.to_string(),
                 speaker,
                 observed: false,
+                check_in_owed: false,
                 first_seen: None,
                 last_nudge: None,
                 nudges: 0,
@@ -1320,6 +1324,14 @@ impl Station {
             (None, None) => return,
         };
         self.dep_checked_in = false;
+        // "Radar contact" is now the check-in's answer on the new frequency.
+        if let Some(w) = SQUAWK_WATCH
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_mut()
+        {
+            w.check_in_owed = true;
+        }
         self.handed_to = Some(if name == "Departure" {
             Service::Departure
         } else {
@@ -2178,6 +2190,9 @@ pub struct SquawkWatch {
     speaker: StationSpeaker,
     /// "Radar contact" has been spoken; the watch is satisfied.
     observed: bool,
+    /// A departure handoff is armed and the flight has not checked in: the
+    /// check-in's reply says "radar contact", so the watch holds it.
+    check_in_owed: bool,
     /// First tick after assignment — starts the grace period.
     first_seen: Option<Instant>,
     last_nudge: Option<Instant>,
@@ -2203,18 +2218,47 @@ pub fn squawk_watch_active() -> bool {
         .is_some_and(|w| !w.observed)
 }
 
-/// One tick of the radar watch: the actual transponder code and whether the
-/// mode is replying (ON/ALT). Returns what to speak and who says it.
+/// Can this position say "radar contact"? Only a radar unit: a tower works
+/// by eye, and never relays another unit's contact.
+fn radar_unit(s: StationSpeaker) -> bool {
+    matches!(s, StationSpeaker::Approach | StationSpeaker::Departure)
+}
+
+/// The departure check-in's reply said "radar contact": the watch is
+/// satisfied, and says nothing more.
+fn radar_contact_at_check_in() {
+    if let Some(w) = SQUAWK_WATCH
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_mut()
+    {
+        w.observed = true;
+        w.check_in_owed = false;
+    }
+}
+
+/// One tick of the radar watch: the actual transponder code, whether the
+/// mode is replying (ON/ALT), and who COM1 is tuned to. Returns what to
+/// speak and who says it.
+///
+/// "Radar contact" is the RADAR unit's, on its own frequency: tuned to the
+/// tower the watch holds it (a tower does not relay it), and with a
+/// departure handoff armed it is the check-in's reply, never the watch's.
+/// LEMG 31 (sortie 1790584715, 2026-09-28): a departure heard "radar
+/// contact" in the tower's voice 4.3 s after rotation (t 1790585265.4,
+/// route squawk_watch), and again from Departure at the check-in. The
+/// nudges ("confirm squawk") are still relayed: they are an instruction.
 pub fn squawk_tick(
     actual: Option<i64>,
     mode_on: bool,
+    tuned: StationSpeaker,
     now: Instant,
 ) -> Option<(String, StationSpeaker)> {
     let mut guard = SQUAWK_WATCH.lock().unwrap_or_else(|e| e.into_inner());
     let w = guard.as_mut()?;
     let first = *w.first_seen.get_or_insert(now);
     if actual == Some(w.code) && mode_on {
-        if w.observed {
+        if w.observed || !radar_unit(tuned) || w.check_in_owed {
             return None;
         }
         w.observed = true;
@@ -6592,10 +6636,11 @@ mod tests {
 
         let t0 = Instant::now();
         // Still on the old code, inside the grace period: silence.
-        assert!(squawk_tick(Some(7000), true, t0).is_none());
+        assert!(squawk_tick(Some(7000), true, StationSpeaker::Approach, t0).is_none());
         // Grace expired, still wrong: the nudge, once, from the assigner.
         let late = t0 + std::time::Duration::from_secs(25);
-        let (line, who) = squawk_tick(Some(7000), true, late).expect("nudge");
+        let (line, who) =
+            squawk_tick(Some(7000), true, StationSpeaker::Approach, late).expect("nudge");
         assert!(line.contains("confirm squawk"), "{line}");
         assert!(matches!(who, StationSpeaker::Approach));
         // The crew hears it as data: the code to dial, no recycle.
@@ -6605,12 +6650,13 @@ mod tests {
         );
         assert_eq!(crate::party_line::take_squawk_nudge(), None, "drained once");
         // Immediately again: quiet (nudge cooldown).
-        assert!(squawk_tick(Some(7000), true, late).is_none());
+        assert!(squawk_tick(Some(7000), true, StationSpeaker::Approach, late).is_none());
         // Right code but transponder on standby: not replying, no contact —
         // and the nudge names the REAL problem, never "confirm squawk" (the
         // digits are the one thing that's right; Gatwick 2026-07-13).
         let later = late + std::time::Duration::from_secs(50);
-        let (line, _) = squawk_tick(Some(code), false, later).expect("standby nudge");
+        let (line, _) =
+            squawk_tick(Some(code), false, StationSpeaker::Approach, later).expect("standby nudge");
         assert!(
             line.contains("negative radar contact, recycle transponder"),
             "{line}"
@@ -6622,12 +6668,21 @@ mod tests {
             "the crew is told to recycle"
         );
         // Code set and replying: "radar contact", exactly once.
-        let (line, _) = squawk_tick(Some(code), true, later + std::time::Duration::from_secs(50))
-            .expect("radar contact");
+        let (line, _) = squawk_tick(
+            Some(code),
+            true,
+            StationSpeaker::Approach,
+            later + std::time::Duration::from_secs(50),
+        )
+        .expect("radar contact");
         assert!(line.contains("radar contact"), "{line}");
-        assert!(
-            squawk_tick(Some(code), true, later + std::time::Duration::from_secs(60)).is_none()
-        );
+        assert!(squawk_tick(
+            Some(code),
+            true,
+            StationSpeaker::Approach,
+            later + std::time::Duration::from_secs(60)
+        )
+        .is_none());
         assert!(
             !squawk_watch_active(),
             "satisfied watch stops the dataref reads"
@@ -9874,6 +9929,7 @@ mod tests {
             callsign: "November one seven two Sierra Papa".into(),
             speaker: StationSpeaker::Departure,
             observed: true,
+            check_in_owed: false,
             first_seen: None,
             last_nudge: None,
             nudges: 0,
@@ -11928,6 +11984,76 @@ mod tests {
     /// clearance had armed. A flight that says it is a circuit stays with
     /// the tower: no handoff, no radar watch. The next departure that does
     /// not say so is handed off as before.
+    #[test]
+    fn radar_contact_is_the_radar_units_never_the_towers() {
+        // LEMG 31 (sortie 1790584715, 2026-09-28, t 1790585265.4, route
+        // squawk_watch): the zone clearance's Departure watch said "radar
+        // contact" in the TOWER's voice 4.3 s after rotation, and Departure
+        // said it again at the check-in.
+        let _guard = SIDE_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let path = lxgb_apt_file();
+        let wx = Wx {
+            wind_from_deg: 250.0,
+            wind_kts: 12.0,
+        };
+        let mut st = Station::load(path.to_str().unwrap(), "LXGB").expect("LXGB loads");
+        let ctx = scripted_ctx(&mut st, wx);
+        *HANDOFF.lock().unwrap() = None;
+        *SQUAWK_WATCH.lock().unwrap() = None;
+        *SQUAWK_NUDGE.lock().unwrap() = None;
+        let _ = crate::party_line::take_departure_handoff();
+
+        let r = st.route_keyed("request clearance", Service::Tower, &ctx, wx);
+        assert!(r.contains("squawk"), "{r}");
+        let code = st.assigned_squawk.expect("code issued");
+        let t0 = Instant::now();
+        // Airborne on the tower, the code squawking: the tower says nothing,
+        // and the watch still waits for the radar unit.
+        assert!(squawk_tick(Some(code), true, StationSpeaker::Tower, t0).is_none());
+        assert!(squawk_watch_active(), "held, not spent");
+        // A wrong code is still relayed: the nudge is an instruction.
+        let late = t0 + std::time::Duration::from_secs(25);
+        let (line, who) =
+            squawk_tick(Some(7000), true, StationSpeaker::Tower, late).expect("relayed nudge");
+        assert!(line.contains("confirm squawk"), "{line}");
+        assert!(matches!(who, StationSpeaker::Departure), "the assigner's");
+        let _ = crate::party_line::take_squawk_nudge();
+
+        // The takeoff clearance arms the handoff: "radar contact" is now the
+        // check-in's, even tuned to Departure before the call goes out.
+        let r = st.route_keyed("request taxi", Service::Tower, &ctx, wx);
+        assert!(r.contains("taxi"), "{r}");
+        let r = st.route_keyed("ready for departure", Service::Tower, &ctx, wx);
+        assert!(r.contains("cleared for takeoff"), "{r}");
+        let later = late + std::time::Duration::from_secs(60);
+        assert!(squawk_tick(Some(code), true, StationSpeaker::Tower, later).is_none());
+        assert!(squawk_tick(Some(code), true, StationSpeaker::Departure, later).is_none());
+        let r = st.route_keyed(
+            "passing one thousand five hundred climbing",
+            Service::Departure,
+            &ctx,
+            wx,
+        );
+        assert!(r.contains("Departure, radar contact"), "{r}");
+        // Said once: the watch is satisfied by the check-in.
+        assert!(!squawk_watch_active(), "the check-in satisfied the watch");
+        assert!(squawk_tick(Some(code), true, StationSpeaker::Departure, later).is_none());
+
+        // A code issued by the radar unit on its own frequency (flight
+        // following, no handoff): the watch says it there.
+        *SQUAWK_WATCH.lock().unwrap() = None;
+        st.assigned_squawk = None;
+        st.assign_squawk("November one two three", StationSpeaker::Departure);
+        let code = st.assigned_squawk.expect("code issued");
+        let (line, who) = squawk_tick(Some(code), true, StationSpeaker::Departure, t0)
+            .expect("radar contact on Departure");
+        assert!(line.contains("radar contact"), "{line}");
+        assert!(matches!(who, StationSpeaker::Departure));
+        *SQUAWK_WATCH.lock().unwrap() = None;
+        *HANDOFF.lock().unwrap() = None;
+        let _ = crate::party_line::take_departure_handoff();
+    }
+
     #[test]
     fn circuit_traffic_stays_with_the_tower() {
         let _guard = SIDE_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
