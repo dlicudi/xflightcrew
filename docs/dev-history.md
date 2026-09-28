@@ -9495,3 +9495,22 @@ after the tower's go-around order at 1790585525.5 autoland flew on and landed, a
 Next sortie: `typed` `routed` `held_ms` under 1 s while the crew talks; after a ground "my controls"
 `give_up` abort, `hand_back_brakes` held stopped park; circuit calls "for circuits",
 `departure_handoff_withheld`, no `atc_handoff`. Offline only.
+
+## 2026-09-28: a runway start asks for its own strip; a new flight is new whoever starts it (issues #134, #128)
+
+Sortie 1790584476: "Short 12 at 1,375.8 of 2,019.4" was read at runway 12's midpoint (36.68532005,
+-4.49416975, AGL -84): X-Plane reports the first runway's midpoint while it loads a flight, and a
+queued approach setup (typed 446.0, consumed 464.7, run 475.9) reloaded the sim 0.1 s after the
+runner typed "fly a circuit". Full auto armed after that setup's `stand_down`, lived on as a zombie,
+asked the next case's zone clearance (31, squawk 4501) and a taxi; the next "fly a circuit" got "I'm
+already running the full sequence". Sortie 1790584715 was placed correctly on 13 (fit 13), but the
+runner's mailbox start never ran `retire_for_new_flight`, the held 31 clearance survived, and
+`under_clearance(31)` taxied 396 s to 31. And a zone request carried no runway: at 342.6/2.9 with
+arrivals on 12 the pick would never be 13. Fixes: `note_caller_on_strip` (a caller on the stated
+strip on the ground gets it ahead of the calm stream when `stated_runway_stands`);
+`full_auto::zone_clearance_from_the_strip` ("request clearance, runway 13[, for circuits]", asked
+again when the held one names another runway); `setup::spawn_new_flight_watch` / `judge_init_seq`
+(a mailbox run the app did not post stands down every loop and retires the clearances, blackbox
+`setup` `foreign_new_flight`); `new_flight_loading` refuses to arm full auto mid-load. Next runner
+night: `foreign_new_flight` once per runner start, `runway_start` Lined 13, `strip_clearance`
+cleared 13, no `request_taxi`. Offline only.

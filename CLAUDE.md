@@ -421,7 +421,9 @@ everything blackboxes to `logs/blackbox.jsonl` (kinds: `atc`, `autotaxi`, `autot
   the old climb-out.
 - **A runway start is a lined-up aircraft and still calls** (`tower::Ctx::own_on_runway`), never
   an incursion (`ComplianceState.runway_start`: a strip first seen stopped); its clearance comes
-  first from the strip; too little ahead is a BACKTRACK, never a taxi (`full_auto::RunwayStart`,
+  first from the strip and names it (`full_auto::zone_clearance_from_the_strip`; asked again when the
+  held one names another runway); the tower gives a caller standing on the stated strip that runway
+  ahead of the calm-wind stream when the wind does not argue (`note_caller_on_strip`); too little ahead is a BACKTRACK, never a taxi (`full_auto::RunwayStart`,
   `backtrack_from_runway_start`, `Intent::RequestBacktrack`; EGKK 26L 2026-09-27); a clearance for
   another runway is taxied to (`under_clearance`). `why_no_fit` diagnoses the aligned end we are
   ON (parallels tie on heading).
@@ -545,7 +547,10 @@ everything blackboxes to `logs/blackbox.jsonl` (kinds: `atc`, `autotaxi`, `autot
   METAR tailwind, `DESTINATION_BONUS_NM`) is the emergency path.
 - **A new flight takes its clearances with it** (`party_line::retire_for_new_flight`, called by
   `setup_approach` before the arm; the old station publishes nothing until the new one is installed,
-  `NEW_FLIGHT_PENDING`, and its radar watch; a refused stated runway is blackboxed `stated_runway_refused`; LEMG 2026-09-28).
+  `NEW_FLIGHT_PENDING`, and its radar watch; whoever starts it: a mailbox run the app did not post
+  (the runner's starts) stands every loop down and retires them too (`setup::spawn_new_flight_watch`,
+  `judge_init_seq`, blackbox `setup` `foreign_new_flight`); nothing arms while the app's own new
+  flight loads (`setup::new_flight_loading`: a load reports the first runway's midpoint); a refused stated runway is blackboxed `stated_runway_refused`; LEMG 2026-09-28).
 - **The tower's clearance outranks the plan** (`runway_from_clearance`), watched THROUGH the
   approach since its answer comes after the arm: owed readbacks (`party_line::readback_owed`), a
   re-arm on another end (`clearance_switch`, never `going_around`) moves the ONE arrival runway
