@@ -59,6 +59,8 @@ const VS_DIAL: &str = "sim/cockpit/autopilot/vertical_velocity";
 const GEAR_HANDLE: &str = "sim/cockpit2/controls/gear_handle_down";
 const FLAP_RATIO: &str = "sim/cockpit2/controls/flap_ratio";
 const VS_STATUS: &str = "sim/cockpit2/autopilot/vvi_status";
+/// 0 off, 1 armed, 2 holding (the capture included).
+const ALT_HOLD_STATUS: &str = "sim/cockpit2/autopilot/altitude_hold_status";
 const ALT_DIAL: &str = "sim/cockpit2/autopilot/altitude_dial_ft";
 const HDG_BUG: &str = "sim/cockpit2/autopilot/heading_dial_deg_mag_pilot";
 const HDG_STATUS: &str = "sim/cockpit2/autopilot/heading_status";
@@ -594,11 +596,15 @@ pub fn vs_dial_fpm(vs: f64) -> f64 {
     (vs / 100.0).round() * 100.0
 }
 
-/// The first departure minimum still ahead of the aircraft and not yet met:
-/// (leg index of its fix, minimum ft). Legs before `idx` are behind us.
 /// A departure minimum is met this close under it, feet.
 pub const MINIMUM_MET_TOL_FT: f64 = 100.0;
 
+/// The first departure minimum still ahead of the aircraft and not yet met:
+/// (leg index of its fix, minimum ft). Legs before `idx` are behind us.
+/// Stateless, so it flips on the tolerance's last foot: the loop uses
+/// [`DepartureMinimums`], which remembers; this is the old rule the #153
+/// replay is judged against.
+#[cfg(test)]
 pub fn unmet_minimum(
     minimums: &[crate::nav::ClimbMinimum],
     legs: &[ProcLeg],
@@ -617,6 +623,161 @@ pub fn unmet_minimum(
             .filter(|m| alt_ft < m.min_ft - MINIMUM_MET_TOL_FT)
             .map(|m| (i, m.min_ft))
     })
+}
+
+/// The departure minimums with MEMORY: a minimum once reached stays met, and
+/// every minimum at a fix still ahead is a FLOOR on the target, met or not,
+/// until its fix is behind.
+///
+/// EGKK LAM5P (2026-09-28, sortie 1790601822-full_auto, #153): D156J's
+/// "at or above 6,000" was a level to climb TO only while unmet, and met
+/// within [`MINIMUM_MET_TOL_FT`], so at 5,900 ft the target fell back to the
+/// plan's navlog 5,000 (ACORN, D156O) and the speed from Vy's 210 to the
+/// cruise's 250; the autopilot dived for the 5,000 dial, the minimum came
+/// unmet under 5,900 and the climb and the 210 came back. Nineteen flips in
+/// 207 s between 5,742 and 5,959 ft, at -1,822 to +1,145 fpm,
+/// the yoke visibly jerking. A floor does not flip: met or not, the level
+/// is held until the fix is passed, and "met" (Vy released) happens once.
+#[derive(Debug, Default, Clone)]
+pub struct DepartureMinimums {
+    met: std::collections::HashSet<String>,
+}
+
+impl DepartureMinimums {
+    /// The first minimum ahead not yet met, after marking met every one
+    /// ahead whose level has been reached (`alt_ft` within the tolerance).
+    /// Keyed by fix, so a splice of the arrival never forgets one.
+    pub fn unmet(
+        &mut self,
+        minimums: &[crate::nav::ClimbMinimum],
+        legs: &[ProcLeg],
+        idx: usize,
+        alt_ft: f64,
+    ) -> Option<(usize, f64)> {
+        for leg in legs.iter().skip(idx) {
+            if let Some(m) = minimums.iter().find(|m| m.fix.eq_ignore_ascii_case(&leg.fix_ident)) {
+                if alt_ft >= m.min_ft - MINIMUM_MET_TOL_FT {
+                    self.met.insert(m.fix.to_ascii_uppercase());
+                }
+            }
+        }
+        legs.iter().enumerate().skip(idx).find_map(|(i, leg)| {
+            minimums
+                .iter()
+                .find(|m| m.fix.eq_ignore_ascii_case(&leg.fix_ident))
+                .filter(|m| !self.met.contains(&m.fix.to_ascii_uppercase()))
+                .map(|m| (i, m.min_ft))
+        })
+    }
+
+    /// The highest minimum at a fix still ahead (leg index, feet), met or
+    /// not: the level the target may not go under until that fix is flown.
+    pub fn floor(
+        minimums: &[crate::nav::ClimbMinimum],
+        legs: &[ProcLeg],
+        idx: usize,
+    ) -> Option<(usize, f64)> {
+        legs.iter()
+            .enumerate()
+            .skip(idx)
+            .filter_map(|(i, leg)| {
+                minimums
+                    .iter()
+                    .find(|m| m.fix.eq_ignore_ascii_case(&leg.fix_ident))
+                    .map(|m| (i, m.min_ft))
+            })
+            .max_by(|a, b| a.1.total_cmp(&b.1))
+    }
+}
+
+/// The follower's altitude once its departure owners have spoken, in their
+/// order: the plan's (`plan_ft`, the vertical law with the pilot and the
+/// ground already applied), raised to a departure minimum still ahead
+/// (`minimum_ft`, [`DepartureMinimums::floor`]; never on a published path),
+/// then capped at an IFR clearance's altitude until departure clears higher
+/// (`cap_at_clearance`: a pilot's own altitude and the terrain floor still
+/// outrank the cap). A minimum above the clearance is climbed to only once
+/// the check-in has released the cap: the dial and the target are one number
+/// and a controller's altitude is never climbed through on a chart's
+/// account. Pure.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct DepartureTarget {
+    /// The altitude to command.
+    pub want_ft: f64,
+    /// A departure minimum raised the plan's target.
+    pub raised_by_minimum: bool,
+    /// The clearance holds the target under a minimum still ahead.
+    pub minimum_capped: bool,
+    /// The clearance lowered the target (plan or minimum).
+    pub cap_limited: bool,
+}
+
+pub fn departure_target_ft(
+    plan_ft: f64,
+    minimum_ft: Option<f64>,
+    ceiling_ft: Option<f64>,
+    pilot_held: bool,
+    terrain_floor_ft: Option<f64>,
+) -> DepartureTarget {
+    let raised = minimum_ft.filter(|m| *m > plan_ft);
+    let uncapped = raised.unwrap_or(plan_ft);
+    let want_ft = cap_at_clearance(uncapped, ceiling_ft, pilot_held, terrain_floor_ft);
+    DepartureTarget {
+        want_ft,
+        raised_by_minimum: raised.is_some(),
+        minimum_capped: raised.is_some() && want_ft < uncapped - 0.5,
+        cap_limited: want_ft < uncapped - 0.5,
+    }
+}
+
+/// What the follower does with the VS wheel this tick, read from the modes
+/// first: [`VsAction::Write`] only while VS mode reads ON. A VS dial written
+/// under ALT HOLD reads back 0 (`write_unconfirmed vertical_velocity want
+/// 400 actual 0`, EGKK 2026-09-28 with `ap_state` 16386), and the failed
+/// write threw the rest of the tick away.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VsAction {
+    /// VS mode is on: set the wheel.
+    Write,
+    /// The autopilot's own capture or hold has the level we want: leave it.
+    Leave,
+    /// A movement the holding mode will not make: engage VS, then (mode
+    /// read again) set the wheel.
+    Engage,
+}
+
+/// Feet from the dial inside which an ALT HOLD (or capture) on OUR dial is
+/// left to finish the level-off: the 737 began capturing 6,000 at 5,817 ft
+/// and 962 fpm, 183 ft out (EGKK 2026-09-28).
+pub const ALT_HOLD_LEAVE_FT: f64 = 300.0;
+
+/// Pure: `vs_on` the VS mode's status, `alt_hold_on` the altitude hold
+/// ENGAGED (`altitude_hold_status` 2, the capture included), `rate_fpm` the
+/// rate being flown.
+pub fn vs_action(
+    vs_on: bool,
+    alt_hold_on: bool,
+    alt_ft: f64,
+    want_ft: f64,
+    dial_ft: f64,
+    vs_cmd_fpm: f64,
+    rate_fpm: f64,
+) -> VsAction {
+    if vs_on {
+        return VsAction::Write;
+    }
+    let lead = if rate_fpm.abs() > vs_cmd_fpm.abs() { rate_fpm } else { vs_cmd_fpm };
+    if vs_mode_capturing(alt_ft, want_ft, dial_ft, lead) {
+        return VsAction::Leave;
+    }
+    // A hold on OUR dial, at it or still closing on it: the capture's own.
+    // A hold parked short of the dial (not closing) is not a level-off.
+    let off = dial_ft - alt_ft;
+    let closing = off * rate_fpm > 0.0 && off.abs() <= ALT_HOLD_LEAVE_FT;
+    if alt_hold_on && (dial_ft - want_ft).abs() <= 100.0 && (off.abs() <= 100.0 || closing) {
+        return VsAction::Leave;
+    }
+    VsAction::Engage
 }
 
 /// Along-route distance, nm, from the aircraft to leg `target`'s fix: to the
@@ -2543,6 +2704,14 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, plan: Pla
     let mut rate_samples = 0u32;
     let mut said_unable: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut said_warned_unable = 0usize;
+    // The departure minimums met so far and the floors ahead
+    // (`DepartureMinimums`), the minimums said as held under the clearance,
+    // and the clearance's altitude while it was holding the target down.
+    let mut minimums_state = DepartureMinimums::default();
+    let mut said_min_capped: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut cap_holding: Option<f64> = None;
+    // The VS wheel's last action logged (`vs_action`), so a change is one record.
+    let mut vs_action_logged: Option<VsAction> = None;
     while idx < legs.len() {
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         if xp.cancelled() || ABORT.load(Ordering::SeqCst) {
@@ -2656,7 +2825,14 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, plan: Pla
         // climb (2026-09-20). Re-armed only when the cap actually changes;
         // `arm_flight` is idempotent and a running hold just takes the new
         // number, so this costs nothing per tick.
-        let unmet = unmet_minimum(&climb_minimums, &legs, idx, alt_ft);
+        let unmet = minimums_state.unmet(&climb_minimums, &legs, idx, alt_ft);
+        // An unmet minimum above an IFR clearance's altitude is held under
+        // the clearance until departure clears higher: not a climb to judge
+        // (a watch that sees no climb would hand the aircraft back).
+        let under_clearance = match (unmet, cleared_ceiling()) {
+            (Some((_, m)), Some(c)) => pilot_altitude().is_none() && m > c + MINIMUM_MET_TOL_FT,
+            _ => false,
+        };
         // The climb rate, from the altimeter itself (smoothed): what the
         // minimum watch predicts with.
         if let Some((a0, t0)) = prev_alt_sample {
@@ -2674,7 +2850,7 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, plan: Pla
         }
         prev_alt_sample = Some((alt_ft, now));
         // No judgement until the rate is a measurement (several seconds).
-        let unmet_judged = unmet.filter(|_| rate_samples >= MIN_RATE_SAMPLES);
+        let unmet_judged = unmet.filter(|_| rate_samples >= MIN_RATE_SAMPLES && !under_clearance);
         if let Some((at, min_ft)) = unmet_judged {
             let fix = legs[at].fix_ident.clone();
             let dist = distance_to_leg_nm(lat, lon, &legs, idx, at);
@@ -3311,20 +3487,62 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, plan: Pla
         // (`map_path`); every other leg the constraint law above.
         let path = map_path(leg, dist_nm, gs_kts);
         let want_alt = path.map_or(v.want_alt, |(a, _)| a);
-        // An IFR clearance's altitude caps the climb until departure clears
-        // higher; a SID minimum above it (below) still wins.
-        let want_alt = cap_at_clearance(want_alt, cleared_ceiling(), v.pilot, v.floored);
-        // An unmet departure minimum ahead is a level to climb TO, not only
-        // a reason to climb faster: a plan predicting 3,000 ft at RIM against
-        // the chart's 4,000 levelled at 3,000 and the minimum watch then
-        // called "not climbing" and handed the aircraft back. Minimums above
-        // the cruise were dropped at the start (`minimums_within_cruise`).
-        let want_alt = match unmet_minimum(&climb_minimums, &legs, idx, alt_ft) {
-            Some((_, min_ft)) if path.is_none() && min_ft > want_alt => min_ft,
-            _ => want_alt,
-        };
+        // A departure minimum ahead is a FLOOR on the target until its fix
+        // is flown, not only a reason to climb faster: a plan predicting
+        // 3,000 ft at RIM against the chart's 4,000 levelled at 3,000 and the
+        // minimum watch then called "not climbing" and handed the aircraft
+        // back; a minimum dropped the moment it was met hunted round it
+        // (EGKK D156J, #153). Minimums above the cruise were dropped at the
+        // start (`minimums_within_cruise`). Then an IFR clearance's altitude
+        // caps the climb, the minimum's included, until departure clears
+        // higher (`departure_target_ft`).
+        let ceiling_now = cleared_ceiling();
+        let minimum = DepartureMinimums::floor(&climb_minimums, &legs, idx).filter(|_| path.is_none());
+        let dep = departure_target_ft(want_alt, minimum.map(|m| m.1), ceiling_now, v.pilot, v.floored);
+        let want_alt = dep.want_ft;
+        if dep.minimum_capped {
+            if let (Some((at, min_ft)), Some(c)) = (minimum, ceiling_now) {
+                let fix = legs[at].fix_ident.clone();
+                if said_min_capped.insert(fix.to_ascii_uppercase()) {
+                    crate::blackbox::record(
+                        "procedure",
+                        serde_json::json!({"event": "minimum_capped", "fix": fix, "min_ft": min_ft,
+                                           "ceiling_ft": c, "alt_ft": alt_ft}),
+                    );
+                    alert(
+                        &voice,
+                        Priority::Advisory,
+                        &format!(
+                            "{fix} needs {}, we're cleared to {}. Holding it until departure clears us higher.",
+                            crate::flightplan::spoken_feet(min_ft),
+                            crate::flightplan::spoken_feet(c),
+                        ),
+                    );
+                }
+            }
+        }
+        // The clearance let go of a target it was holding down: the climb
+        // on is said, once, as the dial moves.
+        if let Some(c) = cap_holding {
+            if ceiling_now.is_none() && want_alt > c + STEP_FT {
+                crate::blackbox::record(
+                    "procedure",
+                    serde_json::json!({"event": "cleared_climb", "from_ft": c, "to_ft": want_alt, "alt_ft": alt_ft}),
+                );
+                alert(
+                    &voice,
+                    Priority::Advisory,
+                    &format!("Cleared higher. Climbing to {}.", crate::flightplan::spoken_feet(want_alt)),
+                );
+            }
+        }
+        cap_holding = if dep.cap_limited { ceiling_now } else { None };
         carry_alt = v.carry;
-        prev_cmd_alt = v.prev_cmd;
+        // A minimum's level is COMMANDED: the climb's hold on a plan
+        // altitude below the level commanded (`climb_no_descent`) keeps it
+        // after its fix, instead of the plan's navlog 5,000 pulling the
+        // aircraft back down from 6,000.
+        prev_cmd_alt = if dep.raised_by_minimum { v.prev_cmd.max(want_alt) } else { v.prev_cmd };
         // The follower's own top of descent, for the advisor and the spoken
         // answer: the same point the law above paces against. `carry` is the
         // leg's constraint (carried across unconstrained fixes).
@@ -3417,7 +3635,7 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, plan: Pla
             }
         });
         prev_ias = Some((ias, now_ias));
-        let climb_cap = if unmet_minimum(&climb_minimums, &legs, idx, alt_ft).is_some() {
+        let climb_cap = if minimums_state.unmet(&climb_minimums, &legs, idx, alt_ft).is_some() {
             best_climb_fpm()
         } else {
             climb_fpm()
@@ -3509,23 +3727,47 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, plan: Pla
                 }
             }
         }
-        if vs_st <= 0.5 {
-            // VS mode gone NEAR the target means the preselect CAPTURED —
-            // its hold is the clean level-off, leave it flying. Far from the
-            // target it's a dropped mode: re-engage and rewrite the dial.
-            if !vs_mode_capturing(alt_ft, want_alt, dial, vs_cmd) {
-                last_vs_cmd = None; // engage can sync the dial even if the response is lost
-                if xp.run_command(CMD_VS_MODE).await.is_err() {
-                    continue;
-                }
+        // The modes are read before the VS wheel is touched (`vs_action`):
+        // VS mode gone NEAR the target, or an ALT hold closing on OUR dial,
+        // is the autopilot's own level-off, left flying and its wheel left
+        // alone (a VS dial written under ALT HOLD reads back 0 and threw the
+        // tick away, EGKK 2026-09-28). Far from the target it's a dropped
+        // mode: re-engage, read the mode again, and only then the wheel.
+        let mut action = if vs_st > 0.5 {
+            VsAction::Write
+        } else {
+            // A failed read of the hold is no measurement: not holding.
+            let alt_hold_on = xp.get_float(ALT_HOLD_STATUS).await.is_ok_and(|v| v > 1.5);
+            vs_action(false, alt_hold_on, alt_ft, want_alt, dial, vs_cmd, climb_rate_fpm)
+        };
+        if action == VsAction::Engage {
+            last_vs_cmd = None; // engage can sync the dial even if the response is lost
+            if xp.run_command(CMD_VS_MODE).await.is_err() {
+                continue;
             }
+            if xp.get_float(VS_STATUS).await.is_ok_and(|v| v > 0.5) {
+                action = VsAction::Write;
+            }
+        }
+        if vs_action_logged != Some(action) {
+            vs_action_logged = Some(action);
+            crate::blackbox::record(
+                "procedure",
+                serde_json::json!({"event": "vs_mode", "action": format!("{action:?}").to_lowercase(),
+                                   "alt_ft": alt_ft, "want_alt": want_alt, "dial": dial, "vs_cmd": vs_cmd}),
+            );
         }
         // The VS wheel in the 100 fpm clicks an autopilot has, moved only
         // when the click changes: the law's fine value every tick was the
         // same twitching the heading bug did (2026-09-26).
         let vs_cmd = vs_dial_fpm(vs_cmd);
-        if !set_confirmed("procedure", &xp, VS_DIAL, vs_cmd, &mut last_vs_cmd, 50.0).await {
-            continue;
+        if action == VsAction::Write {
+            if !set_confirmed("procedure", &xp, VS_DIAL, vs_cmd, &mut last_vs_cmd, 50.0).await {
+                continue;
+            }
+        } else {
+            // Unwritten: the next VS engage writes it afresh.
+            last_vs_cmd = None;
         }
         let owner = if v.floored.is_some() {
             AltOwner::Terrain
@@ -5856,5 +6098,398 @@ mod tests {
         let nostage = CruiseSchedule { fixes: Vec::new(), ..sched };
         assert!(apply_step_climbs(&mut bare, &nostage).is_empty());
         assert_eq!(alts(&bare), alts(&built));
+    }
+}
+
+/// #153: the follower's departure owners on the EGKK LAM5P climb
+/// (2026-09-28, sortie 1790601822-full_auto): D156J's 6,000 minimum, the
+/// plan's navlog 5,000 at ACORN and D156O, the IFR clearance's 5,000.
+#[cfg(test)]
+mod departure_minimum_tests {
+    use super::*;
+    use crate::nav::ClimbMinimum;
+
+    const HUNT: &str = include_str!("../bench/follower/egkk_lam5p_minimum_hunt.jsonl");
+
+    fn records() -> Vec<serde_json::Value> {
+        HUNT.lines().filter_map(|l| serde_json::from_str(l).ok()).collect()
+    }
+
+    fn mins() -> Vec<ClimbMinimum> {
+        vec![
+            ClimbMinimum { fix: "ACORN".into(), min_ft: 5000.0 },
+            ClimbMinimum { fix: "D156J".into(), min_ft: 6000.0 },
+        ]
+    }
+
+    /// The LAM5P as flown, on a meridian: (ident, nm from the arm, plan ft).
+    const ROUTE: [(&str, f64, Option<f64>); 7] = [
+        ("D075D", 0.9, Some(1210.0)),
+        ("D258T", 7.5, Some(2500.0)),
+        ("ACORN", 13.5, Some(5000.0)),
+        ("D156O", 20.5, None),
+        ("D156J", 29.0, None),
+        ("LAM", 39.0, Some(8000.0)),
+        ("HEMEL", 60.0, Some(22000.0)),
+    ];
+
+    fn legs() -> Vec<ProcLeg> {
+        ROUTE
+            .iter()
+            .map(|(id, nm, alt)| ProcLeg {
+                seq: 0,
+                transition: String::new(),
+                leg_type: "TF".into(),
+                fix_ident: (*id).into(),
+                fix_region: String::new(),
+                fix: Some(crate::nav::Fix { ident: (*id).into(), lat: 51.0 + nm / 60.0, lon: 0.0 }),
+                course_mag: None,
+                dist_nm: None,
+                turn: None,
+                alt_desc: ' ',
+                alt1_ft: *alt,
+                alt2_ft: None,
+                is_faf: false,
+                is_map: false,
+                vpa_deg: None,
+                navaid_ident: String::new(),
+                navaid_region: String::new(),
+                navaid: None,
+                path: Default::default(),
+            })
+            .collect()
+    }
+
+    fn changes(v: &[f64]) -> usize {
+        v.windows(2).filter(|w| (w[0] - w[1]).abs() > 0.5).count()
+    }
+
+    /// The recorded ticks, replayed through the old stateless test and the
+    /// new memory: the old one flips the target and the speed on the
+    /// altimeter's last feet at 5,900, exactly as the sortie logged them;
+    /// the new one meets D156J once and holds 6,000.
+    #[test]
+    fn the_recorded_climb_met_d156j_once_and_held_its_floor() {
+        let recs = records();
+        let ticks: Vec<&serde_json::Value> = recs.iter().filter(|r| r["kind"] == "leg").collect();
+        assert!(ticks.len() > 500, "{}", ticks.len());
+        // What the sortie logged: the governor's target flipping 210/250.
+        let logged: Vec<f64> = recs
+            .iter()
+            .filter(|r| r["kind"] == "speed_limit")
+            .map(|r| r["target"].as_f64().unwrap())
+            .collect();
+        assert!(changes(&logged) >= 18, "{logged:?}");
+        let recorded_want: Vec<f64> = ticks.iter().map(|r| r["want_alt"].as_f64().unwrap()).collect();
+        assert!(changes(&recorded_want) >= 18, "the target hunted 5,000/6,000: {}", changes(&recorded_want));
+
+        let (mins, legs) = (mins(), legs());
+        let idx_of = |r: &serde_json::Value| {
+            let fix = r["fix"].as_str().unwrap();
+            legs.iter().position(|l| l.fix_ident == fix).unwrap()
+        };
+        let released = recs
+            .iter()
+            .find(|r| r["kind"] == "cleared_ceiling" && r["ft"].is_null())
+            .map(|r| r["t"].as_f64().unwrap())
+            .unwrap();
+        let mut memory = DepartureMinimums::default();
+        let (mut old_speed, mut new_speed, mut new_want) = (Vec::new(), Vec::new(), Vec::new());
+        for r in &ticks {
+            let (idx, alt) = (idx_of(r), r["alt_ft"].as_f64().unwrap());
+            let t = r["t"].as_f64().unwrap();
+            old_speed.push(if unmet_minimum(&mins, &legs, idx, alt).is_some() { 210.0 } else { 250.0 });
+            new_speed.push(if memory.unmet(&mins, &legs, idx, alt).is_some() { 210.0 } else { 250.0 });
+            // The plan's own level: the logged target where no minimum
+            // raised it (the navlog's 3,682 held and 5,000).
+            let logged = r["want_alt"].as_f64().unwrap();
+            let plan = if (logged - 6000.0).abs() < 1.0 { 5000.0 } else { logged };
+            let ceiling = (t < released).then_some(5000.0);
+            let floor = DepartureMinimums::floor(&mins, &legs, idx).map(|m| m.1);
+            new_want.push(departure_target_ft(plan, floor, ceiling, false, None).want_ft);
+        }
+        assert!(changes(&old_speed) >= 18, "the old rule reproduces the log: {}", changes(&old_speed));
+        assert_eq!(changes(&new_speed), 1, "Vy released once, at 5,900");
+        // After the check-in: one number, 6,000, all the way to D156J (past
+        // it the climb's hold on the level commanded keeps it, see the
+        // plant test below).
+        let after: Vec<f64> = ticks
+            .iter()
+            .zip(&new_want)
+            .filter(|(r, _)| r["t"].as_f64().unwrap() >= released && r["fix"] != "LAM")
+            .map(|(_, w)| *w)
+            .collect();
+        assert!(after.iter().all(|w| (*w - 6000.0).abs() < 0.5), "{after:?}");
+    }
+
+    /// The owners in order: a minimum raises the plan, the clearance caps
+    /// both until it is released, the pilot and the ground outrank the cap.
+    #[test]
+    fn the_clearance_caps_a_minimum_until_departure_clears_higher() {
+        let t = departure_target_ft(5000.0, Some(6000.0), Some(5000.0), false, None);
+        assert_eq!(t.want_ft, 5000.0);
+        assert!(t.raised_by_minimum && t.minimum_capped && t.cap_limited);
+        let t = departure_target_ft(5000.0, Some(6000.0), None, false, None);
+        assert_eq!(t.want_ft, 6000.0, "released: the minimum");
+        assert!(t.raised_by_minimum && !t.minimum_capped && !t.cap_limited);
+        let t = departure_target_ft(22000.0, Some(6000.0), Some(5000.0), false, None);
+        assert_eq!(t.want_ft, 5000.0);
+        assert!(!t.raised_by_minimum && t.cap_limited);
+        assert_eq!(departure_target_ft(9000.0, Some(6000.0), Some(5000.0), true, None).want_ft, 9000.0, "the pilot's");
+        assert_eq!(departure_target_ft(5000.0, Some(6000.0), Some(5000.0), false, Some(5600.0)).want_ft, 5600.0, "the ground's");
+        assert_eq!(departure_target_ft(7000.0, Some(6000.0), None, false, None).want_ft, 7000.0, "under the plan: nothing");
+    }
+
+    /// A minimum met stays met, keyed by fix (a splice renumbers legs); the
+    /// floor holds met minimums until their fix is behind.
+    #[test]
+    fn a_minimum_met_stays_met_and_floors_the_target_until_its_fix() {
+        let (mins, legs) = (mins(), legs());
+        let mut m = DepartureMinimums::default();
+        assert_eq!(m.unmet(&mins, &legs, 1, 4000.0), Some((2, 5000.0)));
+        assert_eq!(m.unmet(&mins, &legs, 1, 4900.0), Some((4, 6000.0)), "ACORN met at 4,900");
+        assert_eq!(m.unmet(&mins, &legs, 2, 5900.0), None, "D156J met at 5,900");
+        assert_eq!(m.unmet(&mins, &legs, 3, 5750.0), None, "and stays met");
+        // Renumbered by a splice ahead: still met.
+        let mut spliced = legs.clone();
+        spliced.insert(0, legs[0].clone());
+        assert_eq!(m.unmet(&mins, &spliced, 4, 5750.0), None);
+        assert_eq!(DepartureMinimums::floor(&mins, &legs, 0), Some((4, 6000.0)), "the highest ahead");
+        assert_eq!(DepartureMinimums::floor(&mins, &legs, 4), Some((4, 6000.0)), "met, not flown");
+        assert_eq!(DepartureMinimums::floor(&mins, &legs, 5), None, "behind us");
+    }
+
+    /// The VS wheel only in VS mode; a hold closing on our dial is left.
+    #[test]
+    fn the_vs_wheel_is_written_only_in_vs_mode() {
+        assert_eq!(vs_action(true, false, 5800.0, 6000.0, 6000.0, 600.0, 900.0), VsAction::Write);
+        // The recorded capture: ALT HOLD 183 ft under the 6,000 dial at 962 fpm.
+        assert_eq!(vs_action(false, true, 5817.0, 6000.0, 6000.0, 549.0, 962.0), VsAction::Leave);
+        assert_eq!(vs_action(false, true, 5990.0, 6000.0, 6000.0, 30.0, 0.0), VsAction::Leave);
+        // Holding short of the dial and not closing: not a level-off.
+        assert_eq!(vs_action(false, true, 5750.0, 6000.0, 6000.0, 750.0, 0.0), VsAction::Engage);
+        // A new level far off the held one: VS.
+        assert_eq!(vs_action(false, true, 6000.0, 8000.0, 8000.0, 1800.0, 0.0), VsAction::Engage);
+        assert_eq!(vs_action(false, false, 5000.0, 8000.0, 8000.0, 1800.0, 0.0), VsAction::Engage);
+    }
+
+    /// The 737's vertical modes: VS through a 2 s transport delay and two
+    /// 1.5 s lags (#150's fit); an ALT capture that takes the dial inside
+    /// 0.19 min of the rate (the recorded 183 ft at 962 fpm) and holds it
+    /// through the same delay; the VS wheel reads 0 outside VS mode; a VS
+    /// engage syncs the wheel to the rate flown.
+    struct Ap {
+        alt: f64,
+        vs: f64,
+        lag1: f64,
+        pipe: std::collections::VecDeque<f64>,
+        vs_mode: bool,
+        vs_dial: f64,
+        alt_dial: f64,
+        hold_ft: f64,
+    }
+
+    impl Ap {
+        const DT: f64 = 0.1;
+        fn new(alt: f64, vs: f64) -> Self {
+            Ap {
+                alt,
+                vs,
+                lag1: vs,
+                pipe: std::iter::repeat_n(vs, 20).collect(),
+                vs_mode: true,
+                vs_dial: vs,
+                alt_dial: 5000.0,
+                hold_ft: 0.0,
+            }
+        }
+        fn step(&mut self) {
+            let cmd = if self.vs_mode {
+                self.vs_dial
+            } else {
+                ((self.hold_ft - self.alt) * 3.0).clamp(-1500.0, 1500.0)
+            };
+            self.pipe.push_back(cmd);
+            let late = self.pipe.pop_front().unwrap();
+            self.lag1 += (late - self.lag1) * Self::DT / 1.5;
+            self.vs += (self.lag1 - self.vs) * Self::DT / 1.5;
+            self.alt += self.vs * Self::DT / 60.0;
+            let off = self.alt_dial - self.alt;
+            if self.vs_mode && off * self.vs >= 0.0 && off.abs() <= (self.vs.abs() * 0.19).max(20.0) {
+                self.vs_mode = false;
+                self.hold_ft = self.alt_dial;
+            }
+        }
+        fn engage_vs(&mut self) {
+            self.vs_mode = true;
+            self.vs_dial = (self.vs / 100.0).round() * 100.0;
+        }
+        /// Write then read back, as `set_confirmed`.
+        fn write_vs(&mut self, v: f64) -> bool {
+            if self.vs_mode {
+                self.vs_dial = v;
+            }
+            let read = if self.vs_mode { self.vs_dial } else { 0.0 };
+            (read - v).abs() <= 1.0
+        }
+    }
+
+    #[derive(Default, Debug)]
+    struct Flown {
+        speed: Vec<f64>,
+        /// (alt, vs) every tick after 5,900 ft was first reached, to D156J.
+        level: Vec<(f64, f64)>,
+        alt_at_d156j: Option<f64>,
+        vs_writes_in_alt: u32,
+        unconfirmed: u32,
+        final_alt: f64,
+    }
+
+    /// The follower's vertical over the plant, old chain or new, from the
+    /// arm at 3,712 ft climbing 1,500 under the clearance's 5,000 (released
+    /// 4 s later by the check-in, as recorded) to 180 s past LAM.
+    fn fly(new: bool) -> Flown {
+        let (mins, legs) = (mins(), legs());
+        let mut ap = Ap::new(3712.0, 1500.0);
+        let (gs, best, climb) = (230.0, 2500.0, 1800.0);
+        let (mut idx, mut pos) = (0usize, 0.0_f64);
+        let (mut carry, mut prev_cmd, mut peak) = (3712.0, 3712.0, 3712.0);
+        let mut memory = DepartureMinimums::default();
+        let (mut last_dial, mut last_vs): (Option<f64>, Option<f64>) = (None, None);
+        let mut out = Flown::default();
+        let mut reached = false;
+        let mut past_lam_s = 0.0;
+        for tick in 0..3000 {
+            for _ in 0..5 {
+                ap.step();
+            }
+            pos += gs * 0.5 / 3600.0;
+            let alt = ap.alt;
+            let fix_nm = |i: usize| ROUTE[i].1;
+            while idx + 1 < legs.len() && fix_nm(idx) - pos <= CAPTURE_NM {
+                if legs[idx].fix_ident == "D156J" {
+                    out.alt_at_d156j = Some(alt);
+                }
+                idx += 1;
+            }
+            if idx >= 6 {
+                past_lam_s += 0.5;
+                if past_lam_s > 180.0 {
+                    break;
+                }
+            }
+            let dist = fix_nm(idx) - pos;
+            let ceiling = (tick < 8).then_some(5000.0);
+            let unmet = if new {
+                memory.unmet(&mins, &legs, idx, alt)
+            } else {
+                unmet_minimum(&mins, &legs, idx, alt)
+            };
+            out.speed.push(if unmet.is_some() { 210.0 } else { 250.0 });
+            let profile = DescentProfile { cruise_ft: Some(22000.0), peak_ft: peak, past_top: false, arrival_ceiling: false };
+            let v = vertical_tick(&legs[idx], carry, prev_cmd, alt, Some(dist), gs, None, None, 2000.0, profile);
+            peak = v.peak_ft;
+            let want = if new {
+                let floor = DepartureMinimums::floor(&mins, &legs, idx).map(|m| m.1);
+                let dep = departure_target_ft(v.want_alt, floor, ceiling, false, None);
+                prev_cmd = if dep.raised_by_minimum { v.prev_cmd.max(dep.want_ft) } else { v.prev_cmd };
+                dep.want_ft
+            } else {
+                let w = cap_at_clearance(v.want_alt, ceiling, false, None);
+                prev_cmd = v.prev_cmd;
+                match unmet {
+                    Some((_, m)) if m > w => m,
+                    _ => w,
+                }
+            };
+            carry = v.carry;
+            let dial = dial_target_ft(want, alt, v.carry, None, None);
+            if last_dial.is_none_or(|d| (d - dial).abs() > 50.0) {
+                ap.alt_dial = dial;
+                last_dial = Some(dial);
+            }
+            let cap = if unmet.is_some() { best } else { climb };
+            let ff = if (want - v.want_alt).abs() < 1.0 { v.target_fpm } else { 0.0 };
+            let vs_cmd = vs_law_fpm(want, alt, ff, 2000.0, cap);
+            let write = if new {
+                let mut a = if ap.vs_mode {
+                    VsAction::Write
+                } else {
+                    vs_action(false, true, alt, want, dial, vs_cmd, ap.vs)
+                };
+                if a == VsAction::Engage {
+                    last_vs = None;
+                    ap.engage_vs();
+                    if ap.vs_mode {
+                        a = VsAction::Write;
+                    }
+                }
+                a == VsAction::Write
+            } else {
+                if !ap.vs_mode && !vs_mode_capturing(alt, want, dial, vs_cmd) {
+                    last_vs = None;
+                    ap.engage_vs();
+                }
+                true
+            };
+            let vs_cmd = vs_dial_fpm(vs_cmd);
+            if write {
+                if last_vs.is_none_or(|l| (l - vs_cmd).abs() > 50.0) {
+                    if !ap.vs_mode {
+                        out.vs_writes_in_alt += 1;
+                    }
+                    if ap.write_vs(vs_cmd) {
+                        last_vs = Some(vs_cmd);
+                    } else {
+                        last_vs = None;
+                        out.unconfirmed += 1;
+                    }
+                }
+            } else {
+                last_vs = None;
+            }
+            reached |= alt >= 5900.0;
+            if reached && idx <= 4 {
+                out.level.push((alt, ap.vs));
+            }
+        }
+        out.final_alt = ap.alt;
+        out
+    }
+
+    /// Replayed through the plant: the old chain hunts round 5,900 with the
+    /// speed flipping and VS written under ALT HOLD; the new one climbs to
+    /// 6,000 once, holds it on the autopilot's own capture, leaves Vy once,
+    /// and climbs on for LAM's 8,000.
+    #[test]
+    fn the_follower_levels_at_the_minimum_once_on_the_737s_modes() {
+        let old = fly(false);
+        let old_min_vs = old.level.iter().map(|p| p.1).fold(f64::MAX, f64::min);
+        eprintln!(
+            "old: {} speed flips, min vs {old_min_vs:.0}, {} VS writes in ALT, {} unconfirmed",
+            changes(&old.speed),
+            old.vs_writes_in_alt,
+            old.unconfirmed
+        );
+        assert!(changes(&old.speed) >= 4, "the old chain hunts: {} speed flips", changes(&old.speed));
+        assert!(old_min_vs < -800.0, "and dives for the 5,000 dial: {old_min_vs:.0} fpm");
+
+        let new = fly(true);
+        let min_vs = new.level.iter().map(|p| p.1).fold(f64::MAX, f64::min);
+        let min_alt = new.level.iter().map(|p| p.0).fold(f64::MAX, f64::min);
+        let max_alt = new.level.iter().map(|p| p.0).fold(f64::MIN, f64::max);
+        eprintln!(
+            "new: {} speed flips, vs {min_vs:.0}.., alt {min_alt:.0}..{max_alt:.0}, D156J {:?}, final {:.0}",
+            changes(&new.speed),
+            new.alt_at_d156j,
+            new.final_alt
+        );
+        assert_eq!(changes(&new.speed), 1, "Vy to 250 once");
+        assert!(min_vs > -300.0, "no dive: {min_vs:.0} fpm");
+        assert!(min_alt > 5850.0 && max_alt < 6150.0, "level at 6,000: {min_alt:.0}..{max_alt:.0}");
+        assert!(new.alt_at_d156j.is_some_and(|a| a >= 5900.0), "{:?}", new.alt_at_d156j);
+        assert_eq!(new.vs_writes_in_alt, 0);
+        assert_eq!(new.unconfirmed, 0);
+        assert!(new.final_alt > 7800.0, "on for LAM: {:.0}", new.final_alt);
     }
 }

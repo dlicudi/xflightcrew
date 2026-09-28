@@ -1,0 +1,881 @@
+{"event": "cleared_ceiling", "ft": 5000.0, "t": 1790603006.0, "why": "ifr_clearance", "kind": "cleared_ceiling"}
+{"kind": "state", "t": 1790603006.4, "alt": 3622.9, "ias": 194.1, "vsi": 2730.7, "ap_state": 50}
+{"alt_ft": 3712.4521, "event": "speed_limit", "planned": 210.0, "t": 1790603007.0, "target": 210.0, "kind": "speed_limit"}
+{"alt_ft": 3712.4521, "event": "climb_no_descent", "fix": "D075D", "held_ft": 3681.842, "idx": 0, "plan_ft": 1210.0, "t": 1790603007.3, "kind": "climb_no_descent"}
+{"kind": "leg", "t": 1790603007.3, "idx": 0, "fix": "D075D", "alt_ft": 3712.5, "want_alt": 5000.0, "dist_nm": 0.839}
+{"kind": "state", "t": 1790603007.8, "alt": 3706.5, "ias": 195.5, "vsi": 2767.1, "ap_state": 50}
+{"kind": "leg", "t": 1790603007.9, "idx": 0, "fix": "D075D", "alt_ft": 3754.9, "want_alt": 5000.0, "dist_nm": 0.792}
+{"kind": "leg", "t": 1790603008.5, "idx": 1, "fix": "D258T", "alt_ft": 3786.0, "want_alt": 5000.0, "dist_nm": 8.175}
+{"kind": "leg", "t": 1790603009.1, "idx": 1, "fix": "D258T", "alt_ft": 3817.0, "want_alt": 5000.0, "dist_nm": 8.139}
+{"kind": "state", "t": 1790603009.4, "alt": 3775.6, "ias": 197.0, "vsi": 2809.4, "ap_state": 50}
+{"kind": "leg", "t": 1790603009.7, "idx": 1, "fix": "D258T", "alt_ft": 3848.6, "want_alt": 5000.0, "dist_nm": 8.102}
+{"event": "cleared_ceiling", "ft": null, "t": 1790603010.3, "why": "departure_check_in", "kind": "cleared_ceiling"}
+{"kind": "leg", "t": 1790603010.3, "idx": 1, "fix": "D258T", "alt_ft": 3876.1, "want_alt": 5000.0, "dist_nm": 8.065}
+{"kind": "leg", "t": 1790603010.9, "idx": 1, "fix": "D258T", "alt_ft": 3905.4, "want_alt": 5000.0, "dist_nm": 8.029}
+{"kind": "state", "t": 1790603011.0, "alt": 3857.7, "ias": 200.0, "vsi": 2639.1, "ap_state": 50}
+{"kind": "leg", "t": 1790603011.5, "idx": 1, "fix": "D258T", "alt_ft": 3930.3, "want_alt": 5000.0, "dist_nm": 7.993}
+{"kind": "leg", "t": 1790603012.1, "idx": 1, "fix": "D258T", "alt_ft": 3953.5, "want_alt": 5000.0, "dist_nm": 7.958}
+{"kind": "state", "t": 1790603012.4, "alt": 3927.3, "ias": 203.3, "vsi": 2308.0, "ap_state": 50}
+{"kind": "leg", "t": 1790603012.7, "idx": 1, "fix": "D258T", "alt_ft": 3978.5, "want_alt": 5000.0, "dist_nm": 7.919}
+{"kind": "leg", "t": 1790603013.2, "idx": 1, "fix": "D258T", "alt_ft": 4003.7, "want_alt": 5000.0, "dist_nm": 7.879}
+{"kind": "leg", "t": 1790603013.8, "idx": 1, "fix": "D258T", "alt_ft": 4027.1, "want_alt": 5000.0, "dist_nm": 7.843}
+{"kind": "state", "t": 1790603014.0, "alt": 3989.0, "ias": 206.2, "vsi": 2225.7, "ap_state": 50}
+{"kind": "leg", "t": 1790603014.3, "idx": 1, "fix": "D258T", "alt_ft": 4051.5, "want_alt": 5000.0, "dist_nm": 7.806}
+{"kind": "leg", "t": 1790603014.9, "idx": 1, "fix": "D258T", "alt_ft": 4078.1, "want_alt": 5000.0, "dist_nm": 7.767}
+{"kind": "state", "t": 1790603015.4, "alt": 4058.5, "ias": 208.7, "vsi": 2436.6, "ap_state": 50}
+{"kind": "leg", "t": 1790603015.5, "idx": 1, "fix": "D258T", "alt_ft": 4106.0, "want_alt": 5000.0, "dist_nm": 7.728}
+{"kind": "leg", "t": 1790603016.1, "idx": 1, "fix": "D258T", "alt_ft": 4133.9, "want_alt": 5000.0, "dist_nm": 7.69}
+{"kind": "leg", "t": 1790603016.6, "idx": 1, "fix": "D258T", "alt_ft": 4162.2, "want_alt": 5000.0, "dist_nm": 7.653}
+{"kind": "state", "t": 1790603016.6, "alt": 4128.8, "ias": 210.5, "vsi": 2746.9, "ap_state": 50}
+{"kind": "leg", "t": 1790603017.4, "idx": 1, "fix": "D258T", "alt_ft": 4192.5, "want_alt": 5000.0, "dist_nm": 7.614}
+{"kind": "leg", "t": 1790603017.9, "idx": 1, "fix": "D258T", "alt_ft": 4230.9, "want_alt": 5000.0, "dist_nm": 7.566}
+{"kind": "state", "t": 1790603018.1, "alt": 4187.1, "ias": 211.5, "vsi": 2926.6, "ap_state": 50}
+{"kind": "leg", "t": 1790603018.5, "idx": 1, "fix": "D258T", "alt_ft": 4264.7, "want_alt": 5000.0, "dist_nm": 7.524}
+{"kind": "leg", "t": 1790603019.1, "idx": 1, "fix": "D258T", "alt_ft": 4297.6, "want_alt": 5000.0, "dist_nm": 7.483}
+{"kind": "state", "t": 1790603019.6, "alt": 4271.0, "ias": 212.7, "vsi": 2985.9, "ap_state": 50}
+{"kind": "leg", "t": 1790603019.7, "idx": 1, "fix": "D258T", "alt_ft": 4329.9, "want_alt": 5000.0, "dist_nm": 7.441}
+{"kind": "leg", "t": 1790603020.3, "idx": 1, "fix": "D258T", "alt_ft": 4359.1, "want_alt": 5000.0, "dist_nm": 7.403}
+{"kind": "leg", "t": 1790603020.9, "idx": 1, "fix": "D258T", "alt_ft": 4390.5, "want_alt": 5000.0, "dist_nm": 7.359}
+{"kind": "state", "t": 1790603021.0, "alt": 4351.7, "ias": 212.9, "vsi": 2814.6, "ap_state": 50}
+{"kind": "leg", "t": 1790603021.5, "idx": 1, "fix": "D258T", "alt_ft": 4418.3, "want_alt": 5000.0, "dist_nm": 7.319}
+{"kind": "leg", "t": 1790603022.0, "idx": 1, "fix": "D258T", "alt_ft": 4445.9, "want_alt": 5000.0, "dist_nm": 7.276}
+{"kind": "leg", "t": 1790603022.6, "idx": 1, "fix": "D258T", "alt_ft": 4468.6, "want_alt": 5000.0, "dist_nm": 7.239}
+{"kind": "state", "t": 1790603022.7, "alt": 4425.7, "ias": 213.0, "vsi": 2488.9, "ap_state": 50}
+{"kind": "leg", "t": 1790603023.2, "idx": 1, "fix": "D258T", "alt_ft": 4491.7, "want_alt": 5000.0, "dist_nm": 7.198}
+{"kind": "leg", "t": 1790603023.7, "idx": 1, "fix": "D258T", "alt_ft": 4512.6, "want_alt": 5000.0, "dist_nm": 7.159}
+{"kind": "state", "t": 1790603024.2, "alt": 4494.4, "ias": 212.9, "vsi": 2064.9, "ap_state": 50}
+{"kind": "leg", "t": 1790603024.3, "idx": 1, "fix": "D258T", "alt_ft": 4531.8, "want_alt": 5000.0, "dist_nm": 7.12}
+{"kind": "leg", "t": 1790603024.9, "idx": 1, "fix": "D258T", "alt_ft": 4550.9, "want_alt": 5000.0, "dist_nm": 7.078}
+{"kind": "leg", "t": 1790603025.5, "idx": 1, "fix": "D258T", "alt_ft": 4569.6, "want_alt": 5000.0, "dist_nm": 7.034}
+{"kind": "state", "t": 1790603025.6, "alt": 4546.0, "ias": 213.0, "vsi": 1716.6, "ap_state": 50}
+{"kind": "leg", "t": 1790603026.1, "idx": 1, "fix": "D258T", "alt_ft": 4585.0, "want_alt": 5000.0, "dist_nm": 6.995}
+{"kind": "leg", "t": 1790603026.6, "idx": 1, "fix": "D258T", "alt_ft": 4601.2, "want_alt": 5000.0, "dist_nm": 6.951}
+{"kind": "leg", "t": 1790603027.2, "idx": 1, "fix": "D258T", "alt_ft": 4614.8, "want_alt": 5000.0, "dist_nm": 6.912}
+{"kind": "state", "t": 1790603027.2, "alt": 4588.1, "ias": 213.5, "vsi": 1444.8, "ap_state": 50}
+{"kind": "leg", "t": 1790603027.9, "idx": 1, "fix": "D258T", "alt_ft": 4627.8, "want_alt": 5000.0, "dist_nm": 6.872}
+{"kind": "leg", "t": 1790603028.4, "idx": 1, "fix": "D258T", "alt_ft": 4644.0, "want_alt": 5000.0, "dist_nm": 6.82}
+{"kind": "state", "t": 1790603028.8, "alt": 4628.7, "ias": 213.6, "vsi": 1212.1, "ap_state": 50}
+{"kind": "leg", "t": 1790603029.0, "idx": 1, "fix": "D258T", "alt_ft": 4655.9, "want_alt": 5000.0, "dist_nm": 6.779}
+{"kind": "leg", "t": 1790603029.6, "idx": 1, "fix": "D258T", "alt_ft": 4667.3, "want_alt": 5000.0, "dist_nm": 6.741}
+{"kind": "leg", "t": 1790603030.1, "idx": 1, "fix": "D258T", "alt_ft": 4678.4, "want_alt": 5000.0, "dist_nm": 6.697}
+{"kind": "state", "t": 1790603030.4, "alt": 4661.6, "ias": 213.3, "vsi": 1069.6, "ap_state": 50}
+{"kind": "leg", "t": 1790603030.7, "idx": 1, "fix": "D258T", "alt_ft": 4688.8, "want_alt": 5000.0, "dist_nm": 6.657}
+{"kind": "leg", "t": 1790603031.3, "idx": 1, "fix": "D258T", "alt_ft": 4699.9, "want_alt": 5000.0, "dist_nm": 6.613}
+{"kind": "leg", "t": 1790603031.9, "idx": 1, "fix": "D258T", "alt_ft": 4710.4, "want_alt": 5000.0, "dist_nm": 6.571}
+{"kind": "state", "t": 1790603031.9, "alt": 4691.6, "ias": 213.1, "vsi": 972.8, "ap_state": 50}
+{"kind": "leg", "t": 1790603032.5, "idx": 1, "fix": "D258T", "alt_ft": 4719.6, "want_alt": 5000.0, "dist_nm": 6.532}
+{"kind": "leg", "t": 1790603033.0, "idx": 1, "fix": "D258T", "alt_ft": 4728.7, "want_alt": 5000.0, "dist_nm": 6.493}
+{"kind": "state", "t": 1790603033.4, "alt": 4718.0, "ias": 212.6, "vsi": 902.8, "ap_state": 50}
+{"kind": "leg", "t": 1790603033.6, "idx": 1, "fix": "D258T", "alt_ft": 4738.0, "want_alt": 5000.0, "dist_nm": 6.452}
+{"kind": "leg", "t": 1790603034.1, "idx": 1, "fix": "D258T", "alt_ft": 4747.0, "want_alt": 5000.0, "dist_nm": 6.411}
+{"kind": "state", "t": 1790603034.6, "alt": 4742.0, "ias": 212.1, "vsi": 840.2, "ap_state": 50}
+{"kind": "leg", "t": 1790603034.7, "idx": 1, "fix": "D258T", "alt_ft": 4755.7, "want_alt": 5000.0, "dist_nm": 6.371}
+{"kind": "leg", "t": 1790603035.3, "idx": 1, "fix": "D258T", "alt_ft": 4764.3, "want_alt": 5000.0, "dist_nm": 6.329}
+{"kind": "leg", "t": 1790603035.8, "idx": 1, "fix": "D258T", "alt_ft": 4772.3, "want_alt": 5000.0, "dist_nm": 6.289}
+{"kind": "state", "t": 1790603036.0, "alt": 4761.5, "ias": 211.5, "vsi": 781.8, "ap_state": 50}
+{"kind": "leg", "t": 1790603036.4, "idx": 1, "fix": "D258T", "alt_ft": 4779.8, "want_alt": 5000.0, "dist_nm": 6.251}
+{"kind": "leg", "t": 1790603036.9, "idx": 1, "fix": "D258T", "alt_ft": 4787.3, "want_alt": 5000.0, "dist_nm": 6.212}
+{"kind": "leg", "t": 1790603037.5, "idx": 1, "fix": "D258T", "alt_ft": 4794.8, "want_alt": 5000.0, "dist_nm": 6.17}
+{"kind": "state", "t": 1790603037.5, "alt": 4781.7, "ias": 210.7, "vsi": 722.5, "ap_state": 50}
+{"kind": "leg", "t": 1790603038.3, "idx": 1, "fix": "D258T", "alt_ft": 4801.7, "want_alt": 5000.0, "dist_nm": 6.131}
+{"kind": "leg", "t": 1790603038.9, "idx": 1, "fix": "D258T", "alt_ft": 4810.8, "want_alt": 5000.0, "dist_nm": 6.077}
+{"kind": "state", "t": 1790603039.0, "alt": 4800.7, "ias": 210.2, "vsi": 657.4, "ap_state": 50}
+{"kind": "leg", "t": 1790603039.4, "idx": 1, "fix": "D258T", "alt_ft": 4817.8, "want_alt": 5000.0, "dist_nm": 6.032}
+{"kind": "leg", "t": 1790603040.0, "idx": 1, "fix": "D258T", "alt_ft": 4823.7, "want_alt": 5000.0, "dist_nm": 5.993}
+{"kind": "state", "t": 1790603040.5, "alt": 4818.7, "ias": 209.7, "vsi": 578.6, "ap_state": 50}
+{"kind": "leg", "t": 1790603040.6, "idx": 1, "fix": "D258T", "alt_ft": 4829.0, "want_alt": 5000.0, "dist_nm": 5.951}
+{"kind": "leg", "t": 1790603041.2, "idx": 1, "fix": "D258T", "alt_ft": 4834.4, "want_alt": 5000.0, "dist_nm": 5.91}
+{"kind": "leg", "t": 1790603041.7, "idx": 1, "fix": "D258T", "alt_ft": 4838.5, "want_alt": 5000.0, "dist_nm": 5.872}
+{"kind": "state", "t": 1790603042.1, "alt": 4833.7, "ias": 209.2, "vsi": 445.3, "ap_state": 50}
+{"kind": "leg", "t": 1790603042.2, "idx": 1, "fix": "D258T", "alt_ft": 4841.7, "want_alt": 5000.0, "dist_nm": 5.836}
+{"kind": "leg", "t": 1790603042.8, "idx": 1, "fix": "D258T", "alt_ft": 4845.0, "want_alt": 5000.0, "dist_nm": 5.793}
+{"kind": "state", "t": 1790603043.2, "alt": 4843.9, "ias": 208.8, "vsi": 282.0, "ap_state": 50}
+{"kind": "leg", "t": 1790603043.4, "idx": 1, "fix": "D258T", "alt_ft": 4847.7, "want_alt": 5000.0, "dist_nm": 5.753}
+{"kind": "leg", "t": 1790603044.0, "idx": 1, "fix": "D258T", "alt_ft": 4850.4, "want_alt": 5000.0, "dist_nm": 5.714}
+{"kind": "leg", "t": 1790603044.5, "idx": 1, "fix": "D258T", "alt_ft": 4852.9, "want_alt": 5000.0, "dist_nm": 5.668}
+{"kind": "state", "t": 1790603044.8, "alt": 4849.0, "ias": 208.5, "vsi": 236.1, "ap_state": 50}
+{"kind": "leg", "t": 1790603045.1, "idx": 1, "fix": "D258T", "alt_ft": 4855.4, "want_alt": 5000.0, "dist_nm": 5.626}
+{"kind": "leg", "t": 1790603045.6, "idx": 1, "fix": "D258T", "alt_ft": 4857.7, "want_alt": 5000.0, "dist_nm": 5.59}
+{"kind": "leg", "t": 1790603046.2, "idx": 1, "fix": "D258T", "alt_ft": 4860.1, "want_alt": 5000.0, "dist_nm": 5.549}
+{"kind": "leg", "t": 1790603046.7, "idx": 1, "fix": "D258T", "alt_ft": 4862.8, "want_alt": 5000.0, "dist_nm": 5.51}
+{"kind": "state", "t": 1790603046.8, "alt": 4858.0, "ias": 208.5, "vsi": 238.5, "ap_state": 50}
+{"kind": "leg", "t": 1790603047.3, "idx": 1, "fix": "D258T", "alt_ft": 4865.6, "want_alt": 5000.0, "dist_nm": 5.467}
+{"kind": "leg", "t": 1790603047.8, "idx": 1, "fix": "D258T", "alt_ft": 4868.5, "want_alt": 5000.0, "dist_nm": 5.429}
+{"kind": "state", "t": 1790603048.4, "alt": 4865.6, "ias": 208.6, "vsi": 279.4, "ap_state": 50}
+{"kind": "leg", "t": 1790603048.5, "idx": 1, "fix": "D258T", "alt_ft": 4871.5, "want_alt": 5000.0, "dist_nm": 5.391}
+{"kind": "leg", "t": 1790603049.1, "idx": 1, "fix": "D258T", "alt_ft": 4875.8, "want_alt": 5000.0, "dist_nm": 5.342}
+{"kind": "leg", "t": 1790603049.6, "idx": 1, "fix": "D258T", "alt_ft": 4879.6, "want_alt": 5000.0, "dist_nm": 5.297}
+{"kind": "state", "t": 1790603049.9, "alt": 4874.7, "ias": 208.9, "vsi": 330.6, "ap_state": 50}
+{"kind": "leg", "t": 1790603050.2, "idx": 1, "fix": "D258T", "alt_ft": 4883.3, "want_alt": 5000.0, "dist_nm": 5.26}
+{"kind": "leg", "t": 1790603050.7, "idx": 1, "fix": "D258T", "alt_ft": 4886.9, "want_alt": 5000.0, "dist_nm": 5.215}
+{"kind": "state", "t": 1790603051.3, "alt": 4884.1, "ias": 209.2, "vsi": 343.2, "ap_state": 50}
+{"kind": "leg", "t": 1790603051.3, "idx": 1, "fix": "D258T", "alt_ft": 4890.5, "want_alt": 5000.0, "dist_nm": 5.174}
+{"kind": "leg", "t": 1790603051.9, "idx": 1, "fix": "D258T", "alt_ft": 4894.1, "want_alt": 5000.0, "dist_nm": 5.132}
+{"kind": "leg", "t": 1790603052.4, "idx": 1, "fix": "D258T", "alt_ft": 4897.3, "want_alt": 5000.0, "dist_nm": 5.094}
+{"kind": "state", "t": 1790603052.6, "alt": 4893.7, "ias": 209.5, "vsi": 325.0, "ap_state": 50}
+{"kind": "leg", "t": 1790603053.0, "idx": 1, "fix": "D258T", "alt_ft": 4900.6, "want_alt": 6000.0, "dist_nm": 5.054}
+{"kind": "leg", "t": 1790603053.6, "idx": 1, "fix": "D258T", "alt_ft": 4904.5, "want_alt": 6000.0, "dist_nm": 5.008}
+{"kind": "state", "t": 1790603054.1, "alt": 4901.4, "ias": 209.7, "vsi": 302.3, "ap_state": 50}
+{"kind": "leg", "t": 1790603054.2, "idx": 1, "fix": "D258T", "alt_ft": 4907.6, "want_alt": 6000.0, "dist_nm": 4.962}
+{"kind": "leg", "t": 1790603054.8, "idx": 1, "fix": "D258T", "alt_ft": 4911.1, "want_alt": 6000.0, "dist_nm": 4.923}
+{"kind": "leg", "t": 1790603055.4, "idx": 1, "fix": "D258T", "alt_ft": 4915.3, "want_alt": 6000.0, "dist_nm": 4.875}
+{"kind": "state", "t": 1790603055.5, "alt": 4910.2, "ias": 209.6, "vsi": 317.5, "ap_state": 50}
+{"kind": "leg", "t": 1790603056.0, "idx": 1, "fix": "D258T", "alt_ft": 4920.9, "want_alt": 6000.0, "dist_nm": 4.831}
+{"kind": "leg", "t": 1790603056.6, "idx": 1, "fix": "D258T", "alt_ft": 4928.7, "want_alt": 6000.0, "dist_nm": 4.788}
+{"kind": "state", "t": 1790603056.9, "alt": 4921.7, "ias": 208.6, "vsi": 589.8, "ap_state": 50}
+{"kind": "leg", "t": 1790603057.2, "idx": 1, "fix": "D258T", "alt_ft": 4939.1, "want_alt": 6000.0, "dist_nm": 4.745}
+{"kind": "leg", "t": 1790603057.8, "idx": 1, "fix": "D258T", "alt_ft": 4951.6, "want_alt": 6000.0, "dist_nm": 4.706}
+{"kind": "state", "t": 1790603058.2, "alt": 4943.6, "ias": 207.4, "vsi": 1168.4, "ap_state": 50}
+{"kind": "leg", "t": 1790603058.3, "idx": 1, "fix": "D258T", "alt_ft": 4967.4, "want_alt": 6000.0, "dist_nm": 4.665}
+{"kind": "leg", "t": 1790603059.0, "idx": 1, "fix": "D258T", "alt_ft": 4985.2, "want_alt": 6000.0, "dist_nm": 4.626}
+{"kind": "leg", "t": 1790603059.6, "idx": 1, "fix": "D258T", "alt_ft": 5010.5, "want_alt": 6000.0, "dist_nm": 4.576}
+{"kind": "state", "t": 1790603059.6, "alt": 4979.1, "ias": 206.2, "vsi": 1754.9, "ap_state": 50}
+{"kind": "leg", "t": 1790603060.2, "idx": 1, "fix": "D258T", "alt_ft": 5032.6, "want_alt": 6000.0, "dist_nm": 4.538}
+{"kind": "leg", "t": 1790603060.8, "idx": 1, "fix": "D258T", "alt_ft": 5055.8, "want_alt": 6000.0, "dist_nm": 4.494}
+{"kind": "state", "t": 1790603061.0, "alt": 5030.2, "ias": 205.0, "vsi": 2177.3, "ap_state": 50}
+{"kind": "leg", "t": 1790603061.4, "idx": 1, "fix": "D258T", "alt_ft": 5081.2, "want_alt": 6000.0, "dist_nm": 4.457}
+{"kind": "leg", "t": 1790603062.0, "idx": 1, "fix": "D258T", "alt_ft": 5106.7, "want_alt": 6000.0, "dist_nm": 4.417}
+{"kind": "leg", "t": 1790603062.5, "idx": 1, "fix": "D258T", "alt_ft": 5133.2, "want_alt": 6000.0, "dist_nm": 4.379}
+{"kind": "state", "t": 1790603062.5, "alt": 5088.2, "ias": 204.1, "vsi": 2359.4, "ap_state": 50}
+{"kind": "leg", "t": 1790603063.1, "idx": 1, "fix": "D258T", "alt_ft": 5157.6, "want_alt": 6000.0, "dist_nm": 4.336}
+{"kind": "leg", "t": 1790603063.7, "idx": 1, "fix": "D258T", "alt_ft": 5180.9, "want_alt": 6000.0, "dist_nm": 4.298}
+{"kind": "state", "t": 1790603064.0, "alt": 5154.5, "ias": 203.6, "vsi": 2352.9, "ap_state": 50}
+{"kind": "leg", "t": 1790603064.3, "idx": 1, "fix": "D258T", "alt_ft": 5205.4, "want_alt": 6000.0, "dist_nm": 4.257}
+{"kind": "leg", "t": 1790603064.9, "idx": 1, "fix": "D258T", "alt_ft": 5227.5, "want_alt": 6000.0, "dist_nm": 4.215}
+{"kind": "leg", "t": 1790603065.4, "idx": 1, "fix": "D258T", "alt_ft": 5251.7, "want_alt": 6000.0, "dist_nm": 4.176}
+{"kind": "state", "t": 1790603065.6, "alt": 5215.4, "ias": 203.3, "vsi": 2201.8, "ap_state": 50}
+{"kind": "leg", "t": 1790603066.0, "idx": 1, "fix": "D258T", "alt_ft": 5272.8, "want_alt": 6000.0, "dist_nm": 4.14}
+{"kind": "leg", "t": 1790603066.5, "idx": 1, "fix": "D258T", "alt_ft": 5293.1, "want_alt": 6000.0, "dist_nm": 4.098}
+{"kind": "state", "t": 1790603066.9, "alt": 5277.5, "ias": 204.1, "vsi": 2016.9, "ap_state": 50}
+{"kind": "leg", "t": 1790603067.0, "idx": 1, "fix": "D258T", "alt_ft": 5313.0, "want_alt": 6000.0, "dist_nm": 4.059}
+{"kind": "leg", "t": 1790603067.6, "idx": 1, "fix": "D258T", "alt_ft": 5332.7, "want_alt": 6000.0, "dist_nm": 4.02}
+{"kind": "leg", "t": 1790603068.1, "idx": 1, "fix": "D258T", "alt_ft": 5352.6, "want_alt": 6000.0, "dist_nm": 3.98}
+{"kind": "state", "t": 1790603068.4, "alt": 5326.7, "ias": 205.3, "vsi": 1914.0, "ap_state": 50}
+{"kind": "leg", "t": 1790603068.7, "idx": 1, "fix": "D258T", "alt_ft": 5372.4, "want_alt": 6000.0, "dist_nm": 3.939}
+{"kind": "leg", "t": 1790603069.4, "idx": 1, "fix": "D258T", "alt_ft": 5390.7, "want_alt": 6000.0, "dist_nm": 3.902}
+{"kind": "state", "t": 1790603069.8, "alt": 5378.9, "ias": 207.2, "vsi": 1872.6, "ap_state": 50}
+{"kind": "leg", "t": 1790603070.0, "idx": 1, "fix": "D258T", "alt_ft": 5415.7, "want_alt": 6000.0, "dist_nm": 3.849}
+{"kind": "leg", "t": 1790603070.6, "idx": 1, "fix": "D258T", "alt_ft": 5435.4, "want_alt": 6000.0, "dist_nm": 3.807}
+{"kind": "leg", "t": 1790603071.2, "idx": 1, "fix": "D258T", "alt_ft": 5454.8, "want_alt": 6000.0, "dist_nm": 3.767}
+{"kind": "state", "t": 1790603071.4, "alt": 5428.5, "ias": 208.7, "vsi": 1869.8, "ap_state": 50}
+{"kind": "leg", "t": 1790603071.7, "idx": 1, "fix": "D258T", "alt_ft": 5476.0, "want_alt": 6000.0, "dist_nm": 3.722}
+{"kind": "leg", "t": 1790603072.3, "idx": 1, "fix": "D258T", "alt_ft": 5496.1, "want_alt": 6000.0, "dist_nm": 3.68}
+{"kind": "state", "t": 1790603072.8, "alt": 5480.5, "ias": 210.2, "vsi": 1876.2, "ap_state": 50}
+{"kind": "leg", "t": 1790603072.9, "idx": 1, "fix": "D258T", "alt_ft": 5517.0, "want_alt": 6000.0, "dist_nm": 3.635}
+{"kind": "leg", "t": 1790603073.5, "idx": 1, "fix": "D258T", "alt_ft": 5536.9, "want_alt": 6000.0, "dist_nm": 3.592}
+{"kind": "leg", "t": 1790603074.1, "idx": 1, "fix": "D258T", "alt_ft": 5554.9, "want_alt": 6000.0, "dist_nm": 3.553}
+{"kind": "state", "t": 1790603074.4, "alt": 5533.9, "ias": 211.3, "vsi": 1856.9, "ap_state": 50}
+{"kind": "leg", "t": 1790603074.6, "idx": 1, "fix": "D258T", "alt_ft": 5575.6, "want_alt": 6000.0, "dist_nm": 3.508}
+{"kind": "leg", "t": 1790603075.2, "idx": 1, "fix": "D258T", "alt_ft": 5594.0, "want_alt": 6000.0, "dist_nm": 3.467}
+{"kind": "leg", "t": 1790603075.7, "idx": 1, "fix": "D258T", "alt_ft": 5612.9, "want_alt": 6000.0, "dist_nm": 3.423}
+{"kind": "state", "t": 1790603076.1, "alt": 5585.7, "ias": 212.6, "vsi": 1775.0, "ap_state": 50}
+{"kind": "leg", "t": 1790603076.3, "idx": 1, "fix": "D258T", "alt_ft": 5630.8, "want_alt": 6000.0, "dist_nm": 3.38}
+{"kind": "leg", "t": 1790603076.9, "idx": 1, "fix": "D258T", "alt_ft": 5649.0, "want_alt": 6000.0, "dist_nm": 3.336}
+{"kind": "leg", "t": 1790603077.5, "idx": 1, "fix": "D258T", "alt_ft": 5665.1, "want_alt": 6000.0, "dist_nm": 3.292}
+{"kind": "state", "t": 1790603077.7, "alt": 5641.0, "ias": 213.7, "vsi": 1604.0, "ap_state": 50}
+{"kind": "leg", "t": 1790603078.0, "idx": 1, "fix": "D258T", "alt_ft": 5681.2, "want_alt": 6000.0, "dist_nm": 3.247}
+{"kind": "leg", "t": 1790603078.6, "idx": 1, "fix": "D258T", "alt_ft": 5695.7, "want_alt": 6000.0, "dist_nm": 3.205}
+{"kind": "leg", "t": 1790603079.2, "idx": 1, "fix": "D258T", "alt_ft": 5711.1, "want_alt": 6000.0, "dist_nm": 3.157}
+{"kind": "state", "t": 1790603079.2, "alt": 5683.4, "ias": 214.6, "vsi": 1416.0, "ap_state": 50}
+{"kind": "leg", "t": 1790603080.0, "idx": 1, "fix": "D258T", "alt_ft": 5723.6, "want_alt": 6000.0, "dist_nm": 3.116}
+{"kind": "leg", "t": 1790603080.5, "idx": 1, "fix": "D258T", "alt_ft": 5740.3, "want_alt": 6000.0, "dist_nm": 3.056}
+{"kind": "state", "t": 1790603080.8, "alt": 5724.0, "ias": 214.7, "vsi": 1183.8, "ap_state": 50}
+{"kind": "leg", "t": 1790603081.1, "idx": 1, "fix": "D258T", "alt_ft": 5750.8, "want_alt": 6000.0, "dist_nm": 3.015}
+{"kind": "leg", "t": 1790603081.6, "idx": 1, "fix": "D258T", "alt_ft": 5761.3, "want_alt": 6000.0, "dist_nm": 2.971}
+{"kind": "state", "t": 1790603082.2, "alt": 5755.5, "ias": 214.1, "vsi": 974.5, "ap_state": 50}
+{"kind": "leg", "t": 1790603082.2, "idx": 1, "fix": "D258T", "alt_ft": 5771.1, "want_alt": 6000.0, "dist_nm": 2.927}
+{"kind": "leg", "t": 1790603082.7, "idx": 1, "fix": "D258T", "alt_ft": 5779.9, "want_alt": 6000.0, "dist_nm": 2.884}
+{"kind": "leg", "t": 1790603083.3, "idx": 1, "fix": "D258T", "alt_ft": 5788.1, "want_alt": 6000.0, "dist_nm": 2.842}
+{"kind": "state", "t": 1790603083.6, "alt": 5778.9, "ias": 214.1, "vsi": 819.6, "ap_state": 50}
+{"kind": "leg", "t": 1790603083.9, "idx": 1, "fix": "D258T", "alt_ft": 5796.5, "want_alt": 6000.0, "dist_nm": 2.795}
+{"kind": "leg", "t": 1790603084.5, "idx": 1, "fix": "D258T", "alt_ft": 5804.1, "want_alt": 6000.0, "dist_nm": 2.749}
+{"kind": "leg", "t": 1790603085.0, "idx": 1, "fix": "D258T", "alt_ft": 5810.6, "want_alt": 6000.0, "dist_nm": 2.708}
+{"kind": "state", "t": 1790603085.1, "alt": 5798.1, "ias": 214.0, "vsi": 694.8, "ap_state": 50}
+{"kind": "leg", "t": 1790603085.6, "idx": 1, "fix": "D258T", "alt_ft": 5816.8, "want_alt": 6000.0, "dist_nm": 2.666}
+{"kind": "leg", "t": 1790603086.2, "idx": 1, "fix": "D258T", "alt_ft": 5823.2, "want_alt": 6000.0, "dist_nm": 2.62}
+{"kind": "leg", "t": 1790603086.7, "idx": 1, "fix": "D258T", "alt_ft": 5828.7, "want_alt": 6000.0, "dist_nm": 2.578}
+{"kind": "state", "t": 1790603086.8, "alt": 5818.3, "ias": 214.1, "vsi": 575.4, "ap_state": 50}
+{"kind": "leg", "t": 1790603087.3, "idx": 1, "fix": "D258T", "alt_ft": 5834.4, "want_alt": 6000.0, "dist_nm": 2.534}
+{"kind": "leg", "t": 1790603087.8, "idx": 1, "fix": "D258T", "alt_ft": 5839.7, "want_alt": 6000.0, "dist_nm": 2.49}
+{"kind": "leg", "t": 1790603088.4, "idx": 1, "fix": "D258T", "alt_ft": 5844.6, "want_alt": 6000.0, "dist_nm": 2.448}
+{"kind": "state", "t": 1790603088.5, "alt": 5835.7, "ias": 213.5, "vsi": 495.0, "ap_state": 50}
+{"kind": "leg", "t": 1790603089.0, "idx": 1, "fix": "D258T", "alt_ft": 5849.4, "want_alt": 6000.0, "dist_nm": 2.404}
+{"kind": "leg", "t": 1790603089.6, "idx": 1, "fix": "D258T", "alt_ft": 5854.2, "want_alt": 6000.0, "dist_nm": 2.357}
+{"kind": "state", "t": 1790603090.1, "alt": 5849.4, "ias": 212.4, "vsi": 426.6, "ap_state": 50}
+{"kind": "leg", "t": 1790603090.3, "idx": 1, "fix": "D258T", "alt_ft": 5858.4, "want_alt": 6000.0, "dist_nm": 2.314}
+{"kind": "leg", "t": 1790603090.8, "idx": 1, "fix": "D258T", "alt_ft": 5863.4, "want_alt": 6000.0, "dist_nm": 2.26}
+{"kind": "leg", "t": 1790603091.4, "idx": 1, "fix": "D258T", "alt_ft": 5866.8, "want_alt": 6000.0, "dist_nm": 2.221}
+{"kind": "state", "t": 1790603091.6, "alt": 5861.7, "ias": 210.7, "vsi": 367.9, "ap_state": 50}
+{"kind": "leg", "t": 1790603092.0, "idx": 1, "fix": "D258T", "alt_ft": 5870.7, "want_alt": 6000.0, "dist_nm": 2.175}
+{"kind": "leg", "t": 1790603092.5, "idx": 1, "fix": "D258T", "alt_ft": 5874.3, "want_alt": 6000.0, "dist_nm": 2.13}
+{"kind": "state", "t": 1790603092.9, "alt": 5871.4, "ias": 209.7, "vsi": 323.2, "ap_state": 50}
+{"kind": "leg", "t": 1790603093.1, "idx": 1, "fix": "D258T", "alt_ft": 5877.7, "want_alt": 6000.0, "dist_nm": 2.086}
+{"kind": "leg", "t": 1790603093.7, "idx": 1, "fix": "D258T", "alt_ft": 5880.8, "want_alt": 6000.0, "dist_nm": 2.044}
+{"kind": "leg", "t": 1790603094.2, "idx": 1, "fix": "D258T", "alt_ft": 5884.1, "want_alt": 6000.0, "dist_nm": 2.0}
+{"kind": "state", "t": 1790603094.5, "alt": 5879.5, "ias": 209.6, "vsi": 296.8, "ap_state": 50}
+{"kind": "leg", "t": 1790603094.8, "idx": 1, "fix": "D258T", "alt_ft": 5886.9, "want_alt": 6000.0, "dist_nm": 1.959}
+{"kind": "leg", "t": 1790603095.3, "idx": 1, "fix": "D258T", "alt_ft": 5889.8, "want_alt": 6000.0, "dist_nm": 1.916}
+{"kind": "state", "t": 1790603095.9, "alt": 5887.4, "ias": 209.2, "vsi": 269.0, "ap_state": 50}
+{"kind": "leg", "t": 1790603095.9, "idx": 1, "fix": "D258T", "alt_ft": 5892.4, "want_alt": 6000.0, "dist_nm": 1.875}
+{"kind": "leg", "t": 1790603096.5, "idx": 1, "fix": "D258T", "alt_ft": 5895.1, "want_alt": 6000.0, "dist_nm": 1.832}
+{"kind": "leg", "t": 1790603097.0, "idx": 1, "fix": "D258T", "alt_ft": 5897.8, "want_alt": 6000.0, "dist_nm": 1.789}
+{"kind": "state", "t": 1790603097.4, "alt": 5895.0, "ias": 209.0, "vsi": 249.6, "ap_state": 50}
+{"alt_ft": 5900.322, "event": "speed_limit", "planned": 255.0, "t": 1790603097.6, "target": 250.0, "kind": "speed_limit"}
+{"kind": "leg", "t": 1790603097.7, "idx": 1, "fix": "D258T", "alt_ft": 5900.3, "want_alt": 3681.8, "dist_nm": 1.748}
+{"kind": "leg", "t": 1790603098.2, "idx": 1, "fix": "D258T", "alt_ft": 5903.3, "want_alt": 3681.8, "dist_nm": 1.701}
+{"kind": "leg", "t": 1790603098.8, "idx": 1, "fix": "D258T", "alt_ft": 5905.7, "want_alt": 3681.8, "dist_nm": 1.655}
+{"kind": "state", "t": 1790603099.0, "alt": 5901.9, "ias": 208.2, "vsi": 239.1, "ap_state": 50}
+{"kind": "leg", "t": 1790603099.4, "idx": 1, "fix": "D258T", "alt_ft": 5907.5, "want_alt": 3681.8, "dist_nm": 1.614}
+{"kind": "leg", "t": 1790603099.9, "idx": 1, "fix": "D258T", "alt_ft": 5908.8, "want_alt": 3681.8, "dist_nm": 1.57}
+{"kind": "state", "t": 1790603100.6, "alt": 5908.0, "ias": 207.9, "vsi": 143.1, "ap_state": 50}
+{"kind": "leg", "t": 1790603100.7, "idx": 1, "fix": "D258T", "alt_ft": 5908.5, "want_alt": 3681.8, "dist_nm": 1.527}
+{"kind": "leg", "t": 1790603101.2, "idx": 1, "fix": "D258T", "alt_ft": 5905.2, "want_alt": 3681.8, "dist_nm": 1.474}
+{"dist_nm": 21.540873920095965, "event": "minimum_short", "fix": "D156J", "min_ft": 6000.0, "predicted_ft": 5899.5576, "t": 1790603101.8, "kind": "minimum_short"}
+{"alt_ft": 5899.5576, "event": "speed_limit", "planned": 210.0, "t": 1790603101.8, "target": 210.0, "kind": "speed_limit"}
+{"kind": "leg", "t": 1790603101.9, "idx": 1, "fix": "D258T", "alt_ft": 5899.6, "want_alt": 6000.0, "dist_nm": 1.43}
+{"kind": "state", "t": 1790603102.1, "alt": 5906.1, "ias": 209.8, "vsi": -328.0, "ap_state": 50}
+{"kind": "leg", "t": 1790603102.4, "idx": 1, "fix": "D258T", "alt_ft": 5890.3, "want_alt": 6000.0, "dist_nm": 1.384}
+{"kind": "leg", "t": 1790603103.0, "idx": 1, "fix": "D258T", "alt_ft": 5879.0, "want_alt": 6000.0, "dist_nm": 1.341}
+{"kind": "leg", "t": 1790603103.6, "idx": 1, "fix": "D258T", "alt_ft": 5865.6, "want_alt": 6000.0, "dist_nm": 1.303}
+{"kind": "state", "t": 1790603103.7, "alt": 5887.7, "ias": 214.0, "vsi": -996.0, "ap_state": 50}
+{"kind": "leg", "t": 1790603104.1, "idx": 1, "fix": "D258T", "alt_ft": 5852.3, "want_alt": 6000.0, "dist_nm": 1.259}
+{"kind": "leg", "t": 1790603104.7, "idx": 1, "fix": "D258T", "alt_ft": 5836.6, "want_alt": 6000.0, "dist_nm": 1.216}
+{"kind": "leg", "t": 1790603105.3, "idx": 1, "fix": "D258T", "alt_ft": 5819.4, "want_alt": 6000.0, "dist_nm": 1.166}
+{"kind": "state", "t": 1790603105.3, "alt": 5849.0, "ias": 219.5, "vsi": -1487.0, "ap_state": 50}
+{"kind": "leg", "t": 1790603105.9, "idx": 1, "fix": "D258T", "alt_ft": 5805.2, "want_alt": 6000.0, "dist_nm": 1.124}
+{"kind": "leg", "t": 1790603106.4, "idx": 1, "fix": "D258T", "alt_ft": 5792.0, "want_alt": 6000.0, "dist_nm": 1.071}
+{"kind": "state", "t": 1790603106.9, "alt": 5805.9, "ias": 223.8, "vsi": -1270.5, "ap_state": 50}
+{"kind": "leg", "t": 1790603107.0, "idx": 1, "fix": "D258T", "alt_ft": 5783.2, "want_alt": 6000.0, "dist_nm": 1.027}
+{"kind": "leg", "t": 1790603107.6, "idx": 1, "fix": "D258T", "alt_ft": 5776.4, "want_alt": 6000.0, "dist_nm": 0.976}
+{"kind": "leg", "t": 1790603108.2, "idx": 1, "fix": "D258T", "alt_ft": 5773.9, "want_alt": 6000.0, "dist_nm": 0.937}
+{"kind": "state", "t": 1790603108.6, "alt": 5778.3, "ias": 225.3, "vsi": -523.1, "ap_state": 50}
+{"kind": "leg", "t": 1790603108.7, "idx": 1, "fix": "D258T", "alt_ft": 5773.8, "want_alt": 6000.0, "dist_nm": 0.895}
+{"kind": "leg", "t": 1790603109.3, "idx": 1, "fix": "D258T", "alt_ft": 5776.1, "want_alt": 6000.0, "dist_nm": 0.851}
+{"kind": "state", "t": 1790603109.8, "alt": 5775.1, "ias": 224.4, "vsi": 259.5, "ap_state": 50}
+{"kind": "leg", "t": 1790603109.8, "idx": 1, "fix": "D258T", "alt_ft": 5780.7, "want_alt": 6000.0, "dist_nm": 0.805}
+{"kind": "leg", "t": 1790603110.4, "idx": 1, "fix": "D258T", "alt_ft": 5786.9, "want_alt": 6000.0, "dist_nm": 0.762}
+{"kind": "leg", "t": 1790603111.2, "idx": 2, "fix": "ACORN", "alt_ft": 5795.2, "want_alt": 6000.0, "dist_nm": 5.268}
+{"kind": "state", "t": 1790603111.3, "alt": 5786.4, "ias": 222.7, "vsi": 647.1, "ap_state": 50}
+{"kind": "leg", "t": 1790603111.8, "idx": 2, "fix": "ACORN", "alt_ft": 5807.7, "want_alt": 6000.0, "dist_nm": 5.21}
+{"kind": "leg", "t": 1790603112.4, "idx": 2, "fix": "ACORN", "alt_ft": 5816.7, "want_alt": 6000.0, "dist_nm": 5.169}
+{"kind": "leg", "t": 1790603112.9, "idx": 2, "fix": "ACORN", "alt_ft": 5825.9, "want_alt": 6000.0, "dist_nm": 5.128}
+{"kind": "state", "t": 1790603112.9, "alt": 5809.9, "ias": 220.3, "vsi": 858.8, "ap_state": 50}
+{"kind": "leg", "t": 1790603113.5, "idx": 2, "fix": "ACORN", "alt_ft": 5834.5, "want_alt": 6000.0, "dist_nm": 5.087}
+{"kind": "leg", "t": 1790603114.1, "idx": 2, "fix": "ACORN", "alt_ft": 5842.7, "want_alt": 6000.0, "dist_nm": 5.045}
+{"kind": "leg", "t": 1790603114.6, "idx": 2, "fix": "ACORN", "alt_ft": 5849.3, "want_alt": 6000.0, "dist_nm": 5.006}
+{"kind": "state", "t": 1790603114.7, "alt": 5834.7, "ias": 217.6, "vsi": 778.7, "ap_state": 50}
+{"kind": "leg", "t": 1790603115.2, "idx": 2, "fix": "ACORN", "alt_ft": 5854.2, "want_alt": 6000.0, "dist_nm": 4.971}
+{"kind": "leg", "t": 1790603115.8, "idx": 2, "fix": "ACORN", "alt_ft": 5858.6, "want_alt": 6000.0, "dist_nm": 4.936}
+{"kind": "state", "t": 1790603116.2, "alt": 5855.1, "ias": 214.4, "vsi": 501.5, "ap_state": 50}
+{"kind": "leg", "t": 1790603116.3, "idx": 2, "fix": "ACORN", "alt_ft": 5862.4, "want_alt": 6000.0, "dist_nm": 4.9}
+{"kind": "leg", "t": 1790603116.9, "idx": 2, "fix": "ACORN", "alt_ft": 5865.5, "want_alt": 6000.0, "dist_nm": 4.865}
+{"kind": "leg", "t": 1790603117.5, "idx": 2, "fix": "ACORN", "alt_ft": 5868.1, "want_alt": 6000.0, "dist_nm": 4.826}
+{"kind": "state", "t": 1790603117.5, "alt": 5864.5, "ias": 212.6, "vsi": 319.7, "ap_state": 50}
+{"kind": "leg", "t": 1790603118.1, "idx": 2, "fix": "ACORN", "alt_ft": 5870.3, "want_alt": 6000.0, "dist_nm": 4.788}
+{"kind": "leg", "t": 1790603118.6, "idx": 2, "fix": "ACORN", "alt_ft": 5872.1, "want_alt": 6000.0, "dist_nm": 4.752}
+{"kind": "leg", "t": 1790603119.2, "idx": 2, "fix": "ACORN", "alt_ft": 5873.8, "want_alt": 6000.0, "dist_nm": 4.715}
+{"kind": "state", "t": 1790603119.2, "alt": 5870.1, "ias": 210.8, "vsi": 213.2, "ap_state": 50}
+{"kind": "leg", "t": 1790603119.8, "idx": 2, "fix": "ACORN", "alt_ft": 5875.3, "want_alt": 6000.0, "dist_nm": 4.68}
+{"kind": "leg", "t": 1790603120.4, "idx": 2, "fix": "ACORN", "alt_ft": 5876.7, "want_alt": 6000.0, "dist_nm": 4.641}
+{"kind": "leg", "t": 1790603120.9, "idx": 2, "fix": "ACORN", "alt_ft": 5877.9, "want_alt": 6000.0, "dist_nm": 4.605}
+{"kind": "state", "t": 1790603120.9, "alt": 5875.2, "ias": 208.8, "vsi": 152.6, "ap_state": 50}
+{"kind": "leg", "t": 1790603121.7, "idx": 2, "fix": "ACORN", "alt_ft": 5879.1, "want_alt": 6000.0, "dist_nm": 4.568}
+{"kind": "leg", "t": 1790603122.3, "idx": 2, "fix": "ACORN", "alt_ft": 5880.6, "want_alt": 6000.0, "dist_nm": 4.521}
+{"kind": "state", "t": 1790603122.7, "alt": 5879.1, "ias": 207.1, "vsi": 120.1, "ap_state": 50}
+{"kind": "leg", "t": 1790603122.9, "idx": 2, "fix": "ACORN", "alt_ft": 5882.0, "want_alt": 6000.0, "dist_nm": 4.48}
+{"kind": "leg", "t": 1790603123.4, "idx": 2, "fix": "ACORN", "alt_ft": 5883.5, "want_alt": 6000.0, "dist_nm": 4.443}
+{"kind": "leg", "t": 1790603124.0, "idx": 2, "fix": "ACORN", "alt_ft": 5885.0, "want_alt": 6000.0, "dist_nm": 4.408}
+{"kind": "state", "t": 1790603124.5, "alt": 5882.9, "ias": 206.3, "vsi": 152.0, "ap_state": 50}
+{"kind": "leg", "t": 1790603124.6, "idx": 2, "fix": "ACORN", "alt_ft": 5886.8, "want_alt": 6000.0, "dist_nm": 4.369}
+{"kind": "leg", "t": 1790603125.1, "idx": 2, "fix": "ACORN", "alt_ft": 5888.7, "want_alt": 6000.0, "dist_nm": 4.332}
+{"kind": "leg", "t": 1790603125.7, "idx": 2, "fix": "ACORN", "alt_ft": 5890.9, "want_alt": 6000.0, "dist_nm": 4.295}
+{"kind": "state", "t": 1790603126.1, "alt": 5888.1, "ias": 206.3, "vsi": 210.1, "ap_state": 50}
+{"kind": "leg", "t": 1790603126.3, "idx": 2, "fix": "ACORN", "alt_ft": 5893.1, "want_alt": 6000.0, "dist_nm": 4.259}
+{"kind": "leg", "t": 1790603126.9, "idx": 2, "fix": "ACORN", "alt_ft": 5895.5, "want_alt": 6000.0, "dist_nm": 4.222}
+{"kind": "leg", "t": 1790603127.4, "idx": 2, "fix": "ACORN", "alt_ft": 5898.0, "want_alt": 6000.0, "dist_nm": 4.188}
+{"kind": "state", "t": 1790603128.0, "alt": 5895.0, "ias": 207.1, "vsi": 251.5, "ap_state": 50}
+{"alt_ft": 5900.5034, "event": "speed_limit", "planned": 255.0, "t": 1790603128.0, "target": 250.0, "kind": "speed_limit"}
+{"kind": "leg", "t": 1790603128.1, "idx": 2, "fix": "ACORN", "alt_ft": 5900.5, "want_alt": 5000.0, "dist_nm": 4.148}
+{"kind": "leg", "t": 1790603128.6, "idx": 2, "fix": "ACORN", "alt_ft": 5903.2, "want_alt": 5000.0, "dist_nm": 4.107}
+{"kind": "leg", "t": 1790603129.2, "idx": 2, "fix": "ACORN", "alt_ft": 5905.8, "want_alt": 5000.0, "dist_nm": 4.069}
+{"kind": "state", "t": 1790603129.7, "alt": 5902.6, "ias": 208.3, "vsi": 266.9, "ap_state": 50}
+{"kind": "leg", "t": 1790603129.7, "idx": 2, "fix": "ACORN", "alt_ft": 5908.1, "want_alt": 5000.0, "dist_nm": 4.035}
+{"kind": "leg", "t": 1790603130.3, "idx": 2, "fix": "ACORN", "alt_ft": 5910.3, "want_alt": 5000.0, "dist_nm": 3.996}
+{"kind": "leg", "t": 1790603130.9, "idx": 2, "fix": "ACORN", "alt_ft": 5911.8, "want_alt": 5000.0, "dist_nm": 3.962}
+{"kind": "state", "t": 1790603131.4, "alt": 5909.9, "ias": 209.6, "vsi": 210.0, "ap_state": 50}
+{"kind": "leg", "t": 1790603131.5, "idx": 2, "fix": "ACORN", "alt_ft": 5912.2, "want_alt": 5000.0, "dist_nm": 3.916}
+{"kind": "leg", "t": 1790603132.2, "idx": 2, "fix": "ACORN", "alt_ft": 5911.2, "want_alt": 5000.0, "dist_nm": 3.879}
+{"kind": "leg", "t": 1790603132.7, "idx": 2, "fix": "ACORN", "alt_ft": 5907.1, "want_alt": 5000.0, "dist_nm": 3.825}
+{"kind": "state", "t": 1790603133.0, "alt": 5911.4, "ias": 212.7, "vsi": -155.1, "ap_state": 50}
+{"kind": "leg", "t": 1790603133.3, "idx": 2, "fix": "ACORN", "alt_ft": 5901.3, "want_alt": 5000.0, "dist_nm": 3.783}
+{"alt_ft": 5893.7188, "event": "speed_limit", "planned": 210.0, "t": 1790603133.9, "target": 210.0, "kind": "speed_limit"}
+{"kind": "leg", "t": 1790603134.0, "idx": 2, "fix": "ACORN", "alt_ft": 5893.7, "want_alt": 6000.0, "dist_nm": 3.743}
+{"kind": "leg", "t": 1790603134.5, "idx": 2, "fix": "ACORN", "alt_ft": 5884.0, "want_alt": 6000.0, "dist_nm": 3.702}
+{"kind": "state", "t": 1790603134.8, "alt": 5898.1, "ias": 218.1, "vsi": -772.0, "ap_state": 50}
+{"kind": "leg", "t": 1790603135.1, "idx": 2, "fix": "ACORN", "alt_ft": 5872.8, "want_alt": 6000.0, "dist_nm": 3.661}
+{"kind": "leg", "t": 1790603135.7, "idx": 2, "fix": "ACORN", "alt_ft": 5860.2, "want_alt": 6000.0, "dist_nm": 3.624}
+{"kind": "leg", "t": 1790603136.3, "idx": 2, "fix": "ACORN", "alt_ft": 5847.3, "want_alt": 6000.0, "dist_nm": 3.58}
+{"kind": "state", "t": 1790603136.6, "alt": 5867.5, "ias": 225.5, "vsi": -1299.2, "ap_state": 50}
+{"kind": "leg", "t": 1790603136.9, "idx": 2, "fix": "ACORN", "alt_ft": 5832.9, "want_alt": 6000.0, "dist_nm": 3.54}
+{"kind": "leg", "t": 1790603137.4, "idx": 2, "fix": "ACORN", "alt_ft": 5820.1, "want_alt": 6000.0, "dist_nm": 3.491}
+{"kind": "leg", "t": 1790603138.0, "idx": 2, "fix": "ACORN", "alt_ft": 5810.0, "want_alt": 6000.0, "dist_nm": 3.454}
+{"kind": "state", "t": 1790603138.3, "alt": 5826.7, "ias": 233.1, "vsi": -1311.9, "ap_state": 50}
+{"kind": "leg", "t": 1790603138.6, "idx": 2, "fix": "ACORN", "alt_ft": 5800.8, "want_alt": 6000.0, "dist_nm": 3.402}
+{"kind": "leg", "t": 1790603139.1, "idx": 2, "fix": "ACORN", "alt_ft": 5795.6, "want_alt": 6000.0, "dist_nm": 3.359}
+{"kind": "leg", "t": 1790603139.7, "idx": 2, "fix": "ACORN", "alt_ft": 5793.9, "want_alt": 6000.0, "dist_nm": 3.314}
+{"kind": "state", "t": 1790603140.1, "alt": 5797.8, "ias": 238.4, "vsi": -523.5, "ap_state": 50}
+{"kind": "leg", "t": 1790603140.3, "idx": 2, "fix": "ACORN", "alt_ft": 5794.9, "want_alt": 6000.0, "dist_nm": 3.271}
+{"kind": "leg", "t": 1790603140.8, "idx": 2, "fix": "ACORN", "alt_ft": 5798.6, "want_alt": 6000.0, "dist_nm": 3.228}
+{"kind": "leg", "t": 1790603141.4, "idx": 2, "fix": "ACORN", "alt_ft": 5804.6, "want_alt": 6000.0, "dist_nm": 3.185}
+{"kind": "state", "t": 1790603141.8, "alt": 5797.2, "ias": 241.4, "vsi": 425.5, "ap_state": 50}
+{"kind": "leg", "t": 1790603142.0, "idx": 2, "fix": "ACORN", "alt_ft": 5812.0, "want_alt": 6000.0, "dist_nm": 3.143}
+{"kind": "leg", "t": 1790603142.8, "idx": 2, "fix": "ACORN", "alt_ft": 5821.9, "want_alt": 6000.0, "dist_nm": 3.097}
+{"kind": "state", "t": 1790603143.3, "alt": 5817.7, "ias": 241.8, "vsi": 962.0, "ap_state": 16386}
+{"kind": "leg", "t": 1790603143.4, "idx": 2, "fix": "ACORN", "alt_ft": 5838.1, "want_alt": 6000.0, "dist_nm": 3.029}
+{"kind": "leg", "t": 1790603144.0, "idx": 2, "fix": "ACORN", "alt_ft": 5850.6, "want_alt": 6000.0, "dist_nm": 2.98}
+{"actual": 0.0, "dataref": "sim/cockpit/autopilot/vertical_velocity", "event": "write_unconfirmed", "t": 1790603144.5, "want": 400.0, "kind": "write_unconfirmed"}
+{"kind": "state", "t": 1790603144.9, "alt": 5848.8, "ias": 240.2, "vsi": 1139.8, "ap_state": 16386}
+{"kind": "leg", "t": 1790603145.2, "idx": 2, "fix": "ACORN", "alt_ft": 5875.3, "want_alt": 6000.0, "dist_nm": 2.884}
+{"kind": "leg", "t": 1790603145.8, "idx": 2, "fix": "ACORN", "alt_ft": 5888.5, "want_alt": 6000.0, "dist_nm": 2.834}
+{"alt_ft": 5900.0693, "event": "speed_limit", "planned": 255.0, "t": 1790603146.3, "target": 250.0, "kind": "speed_limit"}
+{"kind": "leg", "t": 1790603146.4, "idx": 2, "fix": "ACORN", "alt_ft": 5900.1, "want_alt": 5000.0, "dist_nm": 2.787}
+{"kind": "state", "t": 1790603146.6, "alt": 5882.5, "ias": 237.6, "vsi": 1131.3, "ap_state": 50}
+{"kind": "leg", "t": 1790603147.0, "idx": 2, "fix": "ACORN", "alt_ft": 5912.0, "want_alt": 5000.0, "dist_nm": 2.738}
+{"kind": "leg", "t": 1790603147.5, "idx": 2, "fix": "ACORN", "alt_ft": 5921.5, "want_alt": 5000.0, "dist_nm": 2.696}
+{"kind": "leg", "t": 1790603148.0, "idx": 2, "fix": "ACORN", "alt_ft": 5930.3, "want_alt": 5000.0, "dist_nm": 2.654}
+{"kind": "state", "t": 1790603148.2, "alt": 5914.7, "ias": 234.4, "vsi": 1007.9, "ap_state": 50}
+{"kind": "leg", "t": 1790603148.6, "idx": 2, "fix": "ACORN", "alt_ft": 5937.9, "want_alt": 5000.0, "dist_nm": 2.612}
+{"kind": "leg", "t": 1790603149.1, "idx": 2, "fix": "ACORN", "alt_ft": 5944.0, "want_alt": 5000.0, "dist_nm": 2.576}
+{"kind": "state", "t": 1790603149.7, "alt": 5940.7, "ias": 231.8, "vsi": 658.6, "ap_state": 50}
+{"kind": "leg", "t": 1790603149.7, "idx": 2, "fix": "ACORN", "alt_ft": 5948.4, "want_alt": 5000.0, "dist_nm": 2.529}
+{"kind": "leg", "t": 1790603150.3, "idx": 2, "fix": "ACORN", "alt_ft": 5950.3, "want_alt": 5000.0, "dist_nm": 2.489}
+{"kind": "leg", "t": 1790603150.8, "idx": 2, "fix": "ACORN", "alt_ft": 5949.7, "want_alt": 5000.0, "dist_nm": 2.449}
+{"kind": "leg", "t": 1790603151.4, "idx": 2, "fix": "ACORN", "alt_ft": 5946.1, "want_alt": 5000.0, "dist_nm": 2.406}
+{"kind": "state", "t": 1790603151.5, "alt": 5950.3, "ias": 230.9, "vsi": 104.8, "ap_state": 50}
+{"kind": "leg", "t": 1790603151.9, "idx": 2, "fix": "ACORN", "alt_ft": 5939.8, "want_alt": 5000.0, "dist_nm": 2.365}
+{"kind": "leg", "t": 1790603152.5, "idx": 2, "fix": "ACORN", "alt_ft": 5930.2, "want_alt": 5000.0, "dist_nm": 2.322}
+{"kind": "state", "t": 1790603153.2, "alt": 5937.7, "ias": 232.5, "vsi": -883.9, "ap_state": 50}
+{"kind": "leg", "t": 1790603153.3, "idx": 2, "fix": "ACORN", "alt_ft": 5917.8, "want_alt": 5000.0, "dist_nm": 2.277}
+{"kind": "leg", "t": 1790603153.8, "idx": 2, "fix": "ACORN", "alt_ft": 5900.5, "want_alt": 5000.0, "dist_nm": 2.224}
+{"alt_ft": 5886.1387, "event": "speed_limit", "planned": 210.0, "t": 1790603154.3, "target": 210.0, "kind": "speed_limit"}
+{"kind": "leg", "t": 1790603154.4, "idx": 2, "fix": "ACORN", "alt_ft": 5886.1, "want_alt": 6000.0, "dist_nm": 2.184}
+{"kind": "state", "t": 1790603154.7, "alt": 5898.8, "ias": 236.5, "vsi": -1551.7, "ap_state": 50}
+{"kind": "leg", "t": 1790603155.0, "idx": 2, "fix": "ACORN", "alt_ft": 5865.6, "want_alt": 6000.0, "dist_nm": 2.13}
+{"kind": "leg", "t": 1790603155.6, "idx": 2, "fix": "ACORN", "alt_ft": 5846.3, "want_alt": 6000.0, "dist_nm": 2.082}
+{"kind": "leg", "t": 1790603156.1, "idx": 2, "fix": "ACORN", "alt_ft": 5829.6, "want_alt": 6000.0, "dist_nm": 2.036}
+{"kind": "state", "t": 1790603156.5, "alt": 5856.2, "ias": 241.2, "vsi": -1766.4, "ap_state": 50}
+{"kind": "leg", "t": 1790603156.8, "idx": 2, "fix": "ACORN", "alt_ft": 5813.2, "want_alt": 6000.0, "dist_nm": 1.991}
+{"kind": "leg", "t": 1790603157.3, "idx": 2, "fix": "ACORN", "alt_ft": 5797.7, "want_alt": 6000.0, "dist_nm": 1.949}
+{"kind": "leg", "t": 1790603157.9, "idx": 2, "fix": "ACORN", "alt_ft": 5783.9, "want_alt": 6000.0, "dist_nm": 1.897}
+{"kind": "state", "t": 1790603158.0, "alt": 5805.7, "ias": 246.7, "vsi": -1568.6, "ap_state": 50}
+{"kind": "leg", "t": 1790603158.5, "idx": 2, "fix": "ACORN", "alt_ft": 5773.5, "want_alt": 6000.0, "dist_nm": 1.852}
+{"kind": "leg", "t": 1790603159.0, "idx": 2, "fix": "ACORN", "alt_ft": 5765.6, "want_alt": 6000.0, "dist_nm": 1.8}
+{"kind": "state", "t": 1790603159.2, "alt": 5771.9, "ias": 249.7, "vsi": -852.3, "ap_state": 50}
+{"kind": "leg", "t": 1790603159.6, "idx": 2, "fix": "ACORN", "alt_ft": 5761.8, "want_alt": 6000.0, "dist_nm": 1.751}
+{"kind": "leg", "t": 1790603160.1, "idx": 2, "fix": "ACORN", "alt_ft": 5761.3, "want_alt": 6000.0, "dist_nm": 1.707}
+{"kind": "leg", "t": 1790603160.7, "idx": 2, "fix": "ACORN", "alt_ft": 5763.5, "want_alt": 6000.0, "dist_nm": 1.658}
+{"kind": "state", "t": 1790603161.0, "alt": 5761.2, "ias": 250.0, "vsi": -88.6, "ap_state": 50}
+{"kind": "leg", "t": 1790603161.3, "idx": 2, "fix": "ACORN", "alt_ft": 5767.6, "want_alt": 6000.0, "dist_nm": 1.614}
+{"alt_ft": 5773.495, "event": "cruise_schedule", "fix": "D156O", "ias": 248.28981, "idx": 3, "mach": 0.625, "ofp_target": 299.0, "plan_ias": 299.0, "profile_kts": 255.0, "rejected": null, "source": "ofp", "t": 1790603161.8, "target": 299.0, "kind": "cruise_schedule"}
+{"kind": "leg", "t": 1790603161.9, "idx": 3, "fix": "D156O", "alt_ft": 5773.5, "want_alt": 6000.0, "dist_nm": 11.448}
+{"kind": "leg", "t": 1790603162.4, "idx": 3, "fix": "D156O", "alt_ft": 5781.2, "want_alt": 6000.0, "dist_nm": 11.418}
+{"kind": "state", "t": 1790603162.8, "alt": 5770.3, "ias": 248.9, "vsi": 604.4, "ap_state": 50}
+{"kind": "leg", "t": 1790603163.0, "idx": 3, "fix": "D156O", "alt_ft": 5788.5, "want_alt": 6000.0, "dist_nm": 11.393}
+{"kind": "leg", "t": 1790603163.8, "idx": 3, "fix": "D156O", "alt_ft": 5797.7, "want_alt": 6000.0, "dist_nm": 11.364}
+{"kind": "leg", "t": 1790603164.3, "idx": 3, "fix": "D156O", "alt_ft": 5810.0, "want_alt": 6000.0, "dist_nm": 11.327}
+{"kind": "state", "t": 1790603164.4, "alt": 5795.1, "ias": 246.4, "vsi": 935.9, "ap_state": 50}
+{"kind": "leg", "t": 1790603164.9, "idx": 3, "fix": "D156O", "alt_ft": 5819.2, "want_alt": 6000.0, "dist_nm": 11.3}
+{"kind": "leg", "t": 1790603165.4, "idx": 3, "fix": "D156O", "alt_ft": 5829.9, "want_alt": 6000.0, "dist_nm": 11.267}
+{"kind": "state", "t": 1790603166.0, "alt": 5820.7, "ias": 243.9, "vsi": 958.3, "ap_state": 50}
+{"kind": "leg", "t": 1790603166.0, "idx": 3, "fix": "D156O", "alt_ft": 5839.6, "want_alt": 6000.0, "dist_nm": 11.236}
+{"kind": "leg", "t": 1790603166.6, "idx": 3, "fix": "D156O", "alt_ft": 5847.7, "want_alt": 6000.0, "dist_nm": 11.207}
+{"kind": "leg", "t": 1790603167.2, "idx": 3, "fix": "D156O", "alt_ft": 5855.8, "want_alt": 6000.0, "dist_nm": 11.175}
+{"kind": "state", "t": 1790603167.5, "alt": 5846.9, "ias": 240.6, "vsi": 810.4, "ap_state": 50}
+{"kind": "leg", "t": 1790603167.7, "idx": 3, "fix": "D156O", "alt_ft": 5864.0, "want_alt": 6000.0, "dist_nm": 11.139}
+{"kind": "leg", "t": 1790603168.3, "idx": 3, "fix": "D156O", "alt_ft": 5870.3, "want_alt": 6000.0, "dist_nm": 11.11}
+{"kind": "leg", "t": 1790603168.8, "idx": 3, "fix": "D156O", "alt_ft": 5876.4, "want_alt": 6000.0, "dist_nm": 11.077}
+{"kind": "state", "t": 1790603169.1, "alt": 5867.0, "ias": 237.9, "vsi": 647.3, "ap_state": 50}
+{"kind": "leg", "t": 1790603169.4, "idx": 3, "fix": "D156O", "alt_ft": 5881.6, "want_alt": 6000.0, "dist_nm": 11.046}
+{"kind": "leg", "t": 1790603170.0, "idx": 3, "fix": "D156O", "alt_ft": 5886.4, "want_alt": 6000.0, "dist_nm": 11.014}
+{"kind": "leg", "t": 1790603170.5, "idx": 3, "fix": "D156O", "alt_ft": 5890.7, "want_alt": 6000.0, "dist_nm": 10.983}
+{"kind": "state", "t": 1790603170.8, "alt": 5883.9, "ias": 235.3, "vsi": 493.4, "ap_state": 50}
+{"kind": "leg", "t": 1790603171.1, "idx": 3, "fix": "D156O", "alt_ft": 5894.7, "want_alt": 6000.0, "dist_nm": 10.952}
+{"kind": "leg", "t": 1790603171.6, "idx": 3, "fix": "D156O", "alt_ft": 5898.4, "want_alt": 6000.0, "dist_nm": 10.919}
+{"alt_ft": 5901.742, "event": "speed_limit", "planned": 299.0, "t": 1790603172.2, "target": 250.0, "kind": "speed_limit"}
+{"kind": "leg", "t": 1790603172.3, "idx": 3, "fix": "D156O", "alt_ft": 5901.7, "want_alt": 5000.0, "dist_nm": 10.89}
+{"kind": "state", "t": 1790603172.5, "alt": 5896.5, "ias": 232.8, "vsi": 390.4, "ap_state": 50}
+{"kind": "leg", "t": 1790603172.8, "idx": 3, "fix": "D156O", "alt_ft": 5905.2, "want_alt": 5000.0, "dist_nm": 10.852}
+{"kind": "leg", "t": 1790603173.4, "idx": 3, "fix": "D156O", "alt_ft": 5908.2, "want_alt": 5000.0, "dist_nm": 10.823}
+{"kind": "leg", "t": 1790603174.1, "idx": 3, "fix": "D156O", "alt_ft": 5911.1, "want_alt": 5000.0, "dist_nm": 10.785}
+{"kind": "state", "t": 1790603174.1, "alt": 5906.4, "ias": 230.5, "vsi": 320.6, "ap_state": 50}
+{"kind": "leg", "t": 1790603174.7, "idx": 3, "fix": "D156O", "alt_ft": 5914.0, "want_alt": 5000.0, "dist_nm": 10.741}
+{"kind": "leg", "t": 1790603175.3, "idx": 3, "fix": "D156O", "alt_ft": 5915.1, "want_alt": 5000.0, "dist_nm": 10.704}
+{"kind": "leg", "t": 1790603175.8, "idx": 3, "fix": "D156O", "alt_ft": 5914.8, "want_alt": 5000.0, "dist_nm": 10.669}
+{"kind": "state", "t": 1790603175.9, "alt": 5914.1, "ias": 229.0, "vsi": 174.3, "ap_state": 50}
+{"kind": "leg", "t": 1790603176.4, "idx": 3, "fix": "D156O", "alt_ft": 5912.4, "want_alt": 5000.0, "dist_nm": 10.632}
+{"kind": "leg", "t": 1790603177.0, "idx": 3, "fix": "D156O", "alt_ft": 5908.2, "want_alt": 5000.0, "dist_nm": 10.598}
+{"kind": "leg", "t": 1790603177.5, "idx": 3, "fix": "D156O", "alt_ft": 5901.1, "want_alt": 5000.0, "dist_nm": 10.558}
+{"kind": "state", "t": 1790603177.5, "alt": 5912.6, "ias": 228.9, "vsi": -311.5, "ap_state": 50}
+{"alt_ft": 5893.324, "event": "speed_limit", "planned": 210.0, "t": 1790603178.1, "target": 210.0, "kind": "speed_limit"}
+{"kind": "leg", "t": 1790603178.2, "idx": 3, "fix": "D156O", "alt_ft": 5893.3, "want_alt": 6000.0, "dist_nm": 10.523}
+{"kind": "leg", "t": 1790603178.8, "idx": 3, "fix": "D156O", "alt_ft": 5879.4, "want_alt": 6000.0, "dist_nm": 10.478}
+{"kind": "state", "t": 1790603179.2, "alt": 5893.3, "ias": 230.5, "vsi": -996.8, "ap_state": 50}
+{"kind": "leg", "t": 1790603179.4, "idx": 3, "fix": "D156O", "alt_ft": 5865.2, "want_alt": 6000.0, "dist_nm": 10.439}
+{"kind": "leg", "t": 1790603179.9, "idx": 3, "fix": "D156O", "alt_ft": 5851.6, "want_alt": 6000.0, "dist_nm": 10.399}
+{"kind": "leg", "t": 1790603180.5, "idx": 3, "fix": "D156O", "alt_ft": 5837.0, "want_alt": 6000.0, "dist_nm": 10.36}
+{"kind": "state", "t": 1790603180.7, "alt": 5857.4, "ias": 234.3, "vsi": -1481.2, "ap_state": 50}
+{"kind": "leg", "t": 1790603181.1, "idx": 3, "fix": "D156O", "alt_ft": 5821.5, "want_alt": 6000.0, "dist_nm": 10.318}
+{"kind": "leg", "t": 1790603181.7, "idx": 3, "fix": "D156O", "alt_ft": 5807.8, "want_alt": 6000.0, "dist_nm": 10.279}
+{"kind": "leg", "t": 1790603182.3, "idx": 3, "fix": "D156O", "alt_ft": 5794.5, "want_alt": 6000.0, "dist_nm": 10.23}
+{"kind": "state", "t": 1790603182.3, "alt": 5818.7, "ias": 237.8, "vsi": -1458.0, "ap_state": 50}
+{"kind": "leg", "t": 1790603182.8, "idx": 3, "fix": "D156O", "alt_ft": 5785.4, "want_alt": 6000.0, "dist_nm": 10.19}
+{"kind": "leg", "t": 1790603183.4, "idx": 3, "fix": "D156O", "alt_ft": 5779.0, "want_alt": 6000.0, "dist_nm": 10.145}
+{"kind": "state", "t": 1790603183.8, "alt": 5784.0, "ias": 239.6, "vsi": -765.5, "ap_state": 50}
+{"kind": "leg", "t": 1790603184.0, "idx": 3, "fix": "D156O", "alt_ft": 5775.7, "want_alt": 6000.0, "dist_nm": 10.096}
+{"kind": "leg", "t": 1790603184.7, "idx": 3, "fix": "D156O", "alt_ft": 5776.6, "want_alt": 6000.0, "dist_nm": 10.048}
+{"kind": "leg", "t": 1790603185.3, "idx": 3, "fix": "D156O", "alt_ft": 5782.6, "want_alt": 6000.0, "dist_nm": 9.986}
+{"kind": "state", "t": 1790603185.4, "alt": 5775.8, "ias": 239.3, "vsi": 97.9, "ap_state": 50}
+{"kind": "leg", "t": 1790603185.9, "idx": 3, "fix": "D156O", "alt_ft": 5789.4, "want_alt": 6000.0, "dist_nm": 9.943}
+{"kind": "leg", "t": 1790603186.4, "idx": 3, "fix": "D156O", "alt_ft": 5798.6, "want_alt": 6000.0, "dist_nm": 9.896}
+{"kind": "state", "t": 1790603186.6, "alt": 5791.1, "ias": 237.7, "vsi": 808.6, "ap_state": 50}
+{"kind": "leg", "t": 1790603186.9, "idx": 3, "fix": "D156O", "alt_ft": 5808.5, "want_alt": 6000.0, "dist_nm": 9.852}
+{"kind": "leg", "t": 1790603187.6, "idx": 3, "fix": "D156O", "alt_ft": 5820.0, "want_alt": 6000.0, "dist_nm": 9.805}
+{"kind": "state", "t": 1790603188.0, "alt": 5811.3, "ias": 235.8, "vsi": 1053.3, "ap_state": 50}
+{"kind": "leg", "t": 1790603188.2, "idx": 3, "fix": "D156O", "alt_ft": 5832.9, "want_alt": 6000.0, "dist_nm": 9.755}
+{"kind": "leg", "t": 1790603188.8, "idx": 3, "fix": "D156O", "alt_ft": 5846.0, "want_alt": 6000.0, "dist_nm": 9.708}
+{"kind": "leg", "t": 1790603189.3, "idx": 3, "fix": "D156O", "alt_ft": 5858.5, "want_alt": 6000.0, "dist_nm": 9.657}
+{"kind": "state", "t": 1790603189.5, "alt": 5840.1, "ias": 232.8, "vsi": 1133.6, "ap_state": 16386}
+{"kind": "leg", "t": 1790603189.9, "idx": 3, "fix": "D156O", "alt_ft": 5870.9, "want_alt": 6000.0, "dist_nm": 9.608}
+{"kind": "leg", "t": 1790603190.5, "idx": 3, "fix": "D156O", "alt_ft": 5883.6, "want_alt": 6000.0, "dist_nm": 9.558}
+{"kind": "state", "t": 1790603191.0, "alt": 5873.4, "ias": 229.0, "vsi": 1090.0, "ap_state": 16386}
+{"kind": "leg", "t": 1790603191.1, "idx": 3, "fix": "D156O", "alt_ft": 5895.3, "want_alt": 6000.0, "dist_nm": 9.512}
+{"alt_ft": 5907.266, "event": "speed_limit", "planned": 299.0, "t": 1790603191.6, "target": 250.0, "kind": "speed_limit"}
+{"kind": "leg", "t": 1790603191.7, "idx": 3, "fix": "D156O", "alt_ft": 5907.3, "want_alt": 5000.0, "dist_nm": 9.464}
+{"kind": "leg", "t": 1790603192.3, "idx": 3, "fix": "D156O", "alt_ft": 5918.5, "want_alt": 5000.0, "dist_nm": 9.421}
+{"kind": "state", "t": 1790603192.7, "alt": 5905.6, "ias": 226.4, "vsi": 1054.8, "ap_state": 50}
+{"kind": "leg", "t": 1790603192.8, "idx": 3, "fix": "D156O", "alt_ft": 5927.8, "want_alt": 5000.0, "dist_nm": 9.379}
+{"kind": "leg", "t": 1790603193.4, "idx": 3, "fix": "D156O", "alt_ft": 5937.0, "want_alt": 5000.0, "dist_nm": 9.338}
+{"kind": "leg", "t": 1790603193.9, "idx": 3, "fix": "D156O", "alt_ft": 5944.9, "want_alt": 5000.0, "dist_nm": 9.301}
+{"kind": "state", "t": 1790603194.4, "alt": 5934.7, "ias": 224.0, "vsi": 951.0, "ap_state": 50}
+{"kind": "leg", "t": 1790603194.5, "idx": 3, "fix": "D156O", "alt_ft": 5952.1, "want_alt": 5000.0, "dist_nm": 9.26}
+{"kind": "leg", "t": 1790603195.2, "idx": 3, "fix": "D156O", "alt_ft": 5957.9, "want_alt": 5000.0, "dist_nm": 9.217}
+{"kind": "leg", "t": 1790603195.7, "idx": 3, "fix": "D156O", "alt_ft": 5961.3, "want_alt": 5000.0, "dist_nm": 9.162}
+{"kind": "state", "t": 1790603196.1, "alt": 5956.8, "ias": 221.8, "vsi": 497.3, "ap_state": 50}
+{"kind": "leg", "t": 1790603196.3, "idx": 3, "fix": "D156O", "alt_ft": 5960.8, "want_alt": 5000.0, "dist_nm": 9.119}
+{"kind": "leg", "t": 1790603196.8, "idx": 3, "fix": "D156O", "alt_ft": 5957.1, "want_alt": 5000.0, "dist_nm": 9.079}
+{"kind": "leg", "t": 1790603197.4, "idx": 3, "fix": "D156O", "alt_ft": 5950.3, "want_alt": 5000.0, "dist_nm": 9.035}
+{"kind": "state", "t": 1790603197.7, "alt": 5958.7, "ias": 222.3, "vsi": -391.9, "ap_state": 50}
+{"kind": "leg", "t": 1790603198.0, "idx": 3, "fix": "D156O", "alt_ft": 5941.2, "want_alt": 5000.0, "dist_nm": 8.993}
+{"kind": "leg", "t": 1790603198.6, "idx": 3, "fix": "D156O", "alt_ft": 5930.2, "want_alt": 5000.0, "dist_nm": 8.959}
+{"kind": "leg", "t": 1790603199.1, "idx": 3, "fix": "D156O", "alt_ft": 5917.8, "want_alt": 5000.0, "dist_nm": 8.912}
+{"kind": "state", "t": 1790603199.3, "alt": 5937.0, "ias": 224.8, "vsi": -1124.2, "ap_state": 50}
+{"kind": "leg", "t": 1790603199.7, "idx": 3, "fix": "D156O", "alt_ft": 5904.0, "want_alt": 5000.0, "dist_nm": 8.872}
+{"alt_ft": 5889.2446, "event": "speed_limit", "planned": 210.0, "t": 1790603200.3, "target": 210.0, "kind": "speed_limit"}
+{"kind": "leg", "t": 1790603200.4, "idx": 3, "fix": "D156O", "alt_ft": 5889.2, "want_alt": 6000.0, "dist_nm": 8.83}
+{"kind": "leg", "t": 1790603201.0, "idx": 3, "fix": "D156O", "alt_ft": 5871.5, "want_alt": 6000.0, "dist_nm": 8.782}
+{"kind": "state", "t": 1790603201.0, "alt": 5900.8, "ias": 229.2, "vsi": -1556.8, "ap_state": 50}
+{"kind": "leg", "t": 1790603201.5, "idx": 3, "fix": "D156O", "alt_ft": 5854.6, "want_alt": 6000.0, "dist_nm": 8.736}
+{"kind": "leg", "t": 1790603202.1, "idx": 3, "fix": "D156O", "alt_ft": 5838.6, "want_alt": 6000.0, "dist_nm": 8.691}
+{"kind": "leg", "t": 1790603202.7, "idx": 3, "fix": "D156O", "alt_ft": 5823.5, "want_alt": 6000.0, "dist_nm": 8.646}
+{"kind": "state", "t": 1790603202.8, "alt": 5849.7, "ias": 236.1, "vsi": -1653.8, "ap_state": 50}
+{"kind": "leg", "t": 1790603203.3, "idx": 3, "fix": "D156O", "alt_ft": 5810.8, "want_alt": 6000.0, "dist_nm": 8.604}
+{"kind": "leg", "t": 1790603203.9, "idx": 3, "fix": "D156O", "alt_ft": 5798.4, "want_alt": 6000.0, "dist_nm": 8.555}
+{"kind": "state", "t": 1790603204.4, "alt": 5809.2, "ias": 241.6, "vsi": -1295.0, "ap_state": 50}
+{"kind": "leg", "t": 1790603204.4, "idx": 3, "fix": "D156O", "alt_ft": 5790.0, "want_alt": 6000.0, "dist_nm": 8.513}
+{"kind": "leg", "t": 1790603205.0, "idx": 3, "fix": "D156O", "alt_ft": 5784.5, "want_alt": 6000.0, "dist_nm": 8.47}
+{"kind": "leg", "t": 1790603205.8, "idx": 3, "fix": "D156O", "alt_ft": 5781.7, "want_alt": 6000.0, "dist_nm": 8.426}
+{"kind": "state", "t": 1790603206.3, "alt": 5784.7, "ias": 245.3, "vsi": -494.4, "ap_state": 50}
+{"kind": "leg", "t": 1790603206.3, "idx": 3, "fix": "D156O", "alt_ft": 5782.5, "want_alt": 6000.0, "dist_nm": 8.367}
+{"kind": "leg", "t": 1790603206.9, "idx": 3, "fix": "D156O", "alt_ft": 5785.9, "want_alt": 6000.0, "dist_nm": 8.327}
+{"kind": "leg", "t": 1790603207.4, "idx": 3, "fix": "D156O", "alt_ft": 5791.6, "want_alt": 6000.0, "dist_nm": 8.283}
+{"kind": "state", "t": 1790603207.9, "alt": 5786.3, "ias": 247.4, "vsi": 507.9, "ap_state": 50}
+{"kind": "leg", "t": 1790603207.9, "idx": 3, "fix": "D156O", "alt_ft": 5798.8, "want_alt": 6000.0, "dist_nm": 8.241}
+{"kind": "leg", "t": 1790603208.5, "idx": 3, "fix": "D156O", "alt_ft": 5808.0, "want_alt": 6000.0, "dist_nm": 8.196}
+{"kind": "leg", "t": 1790603209.1, "idx": 3, "fix": "D156O", "alt_ft": 5817.9, "want_alt": 6000.0, "dist_nm": 8.152}
+{"kind": "state", "t": 1790603209.5, "alt": 5806.4, "ias": 247.1, "vsi": 977.8, "ap_state": 50}
+{"kind": "leg", "t": 1790603209.7, "idx": 3, "fix": "D156O", "alt_ft": 5831.1, "want_alt": 6000.0, "dist_nm": 8.098}
+{"kind": "leg", "t": 1790603210.3, "idx": 3, "fix": "D156O", "alt_ft": 5843.5, "want_alt": 6000.0, "dist_nm": 8.048}
+{"kind": "leg", "t": 1790603210.9, "idx": 3, "fix": "D156O", "alt_ft": 5855.8, "want_alt": 6000.0, "dist_nm": 7.999}
+{"kind": "state", "t": 1790603211.1, "alt": 5840.4, "ias": 244.9, "vsi": 1145.6, "ap_state": 16386}
+{"kind": "leg", "t": 1790603211.4, "idx": 3, "fix": "D156O", "alt_ft": 5868.1, "want_alt": 6000.0, "dist_nm": 7.948}
+{"kind": "leg", "t": 1790603212.1, "idx": 3, "fix": "D156O", "alt_ft": 5881.1, "want_alt": 6000.0, "dist_nm": 7.895}
+{"kind": "state", "t": 1790603212.6, "alt": 5871.6, "ias": 241.6, "vsi": 1108.0, "ap_state": 16386}
+{"kind": "leg", "t": 1790603212.6, "idx": 3, "fix": "D156O", "alt_ft": 5892.8, "want_alt": 6000.0, "dist_nm": 7.846}
+{"alt_ft": 5904.912, "event": "speed_limit", "planned": 299.0, "t": 1790603213.2, "target": 250.0, "kind": "speed_limit"}
+{"kind": "leg", "t": 1790603213.3, "idx": 3, "fix": "D156O", "alt_ft": 5904.9, "want_alt": 5000.0, "dist_nm": 7.794}
+{"kind": "leg", "t": 1790603213.8, "idx": 3, "fix": "D156O", "alt_ft": 5916.8, "want_alt": 5000.0, "dist_nm": 7.741}
+{"kind": "state", "t": 1790603214.1, "alt": 5904.6, "ias": 238.6, "vsi": 1038.6, "ap_state": 50}
+{"kind": "leg", "t": 1790603214.3, "idx": 3, "fix": "D156O", "alt_ft": 5926.3, "want_alt": 5000.0, "dist_nm": 7.697}
+{"kind": "leg", "t": 1790603214.9, "idx": 3, "fix": "D156O", "alt_ft": 5935.7, "want_alt": 5000.0, "dist_nm": 7.648}
+{"kind": "leg", "t": 1790603215.4, "idx": 3, "fix": "D156O", "alt_ft": 5943.4, "want_alt": 5000.0, "dist_nm": 7.602}
+{"kind": "state", "t": 1790603215.6, "alt": 5932.5, "ias": 235.5, "vsi": 861.5, "ap_state": 50}
+{"kind": "leg", "t": 1790603216.2, "idx": 3, "fix": "D156O", "alt_ft": 5949.1, "want_alt": 5000.0, "dist_nm": 7.555}
+{"kind": "leg", "t": 1790603216.7, "idx": 3, "fix": "D156O", "alt_ft": 5952.8, "want_alt": 5000.0, "dist_nm": 7.496}
+{"kind": "state", "t": 1790603217.0, "alt": 5950.0, "ias": 233.6, "vsi": 416.7, "ap_state": 50}
+{"kind": "leg", "t": 1790603217.2, "idx": 3, "fix": "D156O", "alt_ft": 5952.2, "want_alt": 5000.0, "dist_nm": 7.446}
+{"kind": "leg", "t": 1790603217.8, "idx": 3, "fix": "D156O", "alt_ft": 5948.1, "want_alt": 5000.0, "dist_nm": 7.398}
+{"kind": "leg", "t": 1790603218.3, "idx": 3, "fix": "D156O", "alt_ft": 5941.4, "want_alt": 5000.0, "dist_nm": 7.354}
+{"kind": "state", "t": 1790603218.4, "alt": 5951.2, "ias": 233.7, "vsi": -304.9, "ap_state": 50}
+{"kind": "leg", "t": 1790603218.9, "idx": 3, "fix": "D156O", "alt_ft": 5931.1, "want_alt": 5000.0, "dist_nm": 7.306}
+{"kind": "leg", "t": 1790603219.5, "idx": 3, "fix": "D156O", "alt_ft": 5918.0, "want_alt": 5000.0, "dist_nm": 7.259}
+{"kind": "leg", "t": 1790603220.0, "idx": 3, "fix": "D156O", "alt_ft": 5903.3, "want_alt": 5000.0, "dist_nm": 7.208}
+{"kind": "state", "t": 1790603220.1, "alt": 5931.1, "ias": 236.8, "vsi": -1080.6, "ap_state": 50}
+{"alt_ft": 5886.668, "event": "speed_limit", "planned": 210.0, "t": 1790603220.6, "target": 210.0, "kind": "speed_limit"}
+{"actual": 5000.0, "dataref": "sim/cockpit2/autopilot/altitude_dial_ft", "event": "write_unconfirmed", "t": 1790603220.6, "want": 6000.0, "kind": "write_unconfirmed"}
+{"kind": "leg", "t": 1790603221.3, "idx": 3, "fix": "D156O", "alt_ft": 5867.4, "want_alt": 6000.0, "dist_nm": 7.106}
+{"kind": "state", "t": 1790603221.8, "alt": 5886.7, "ias": 242.0, "vsi": -1613.9, "ap_state": 50}
+{"kind": "leg", "t": 1790603221.8, "idx": 3, "fix": "D156O", "alt_ft": 5847.3, "want_alt": 6000.0, "dist_nm": 7.053}
+{"kind": "leg", "t": 1790603222.4, "idx": 3, "fix": "D156O", "alt_ft": 5826.9, "want_alt": 6000.0, "dist_nm": 6.998}
+{"kind": "leg", "t": 1790603223.0, "idx": 3, "fix": "D156O", "alt_ft": 5806.7, "want_alt": 6000.0, "dist_nm": 6.944}
+{"kind": "state", "t": 1790603223.4, "alt": 5829.8, "ias": 247.0, "vsi": -1782.1, "ap_state": 50}
+{"kind": "leg", "t": 1790603223.5, "idx": 3, "fix": "D156O", "alt_ft": 5787.9, "want_alt": 6000.0, "dist_nm": 6.891}
+{"kind": "leg", "t": 1790603224.2, "idx": 3, "fix": "D156O", "alt_ft": 5771.6, "want_alt": 6000.0, "dist_nm": 6.839}
+{"kind": "leg", "t": 1790603224.7, "idx": 3, "fix": "D156O", "alt_ft": 5757.7, "want_alt": 6000.0, "dist_nm": 6.785}
+{"kind": "state", "t": 1790603224.9, "alt": 5777.9, "ias": 249.8, "vsi": -1485.8, "ap_state": 50}
+{"kind": "leg", "t": 1790603225.3, "idx": 3, "fix": "D156O", "alt_ft": 5748.2, "want_alt": 6000.0, "dist_nm": 6.736}
+{"kind": "leg", "t": 1790603225.8, "idx": 3, "fix": "D156O", "alt_ft": 5742.3, "want_alt": 6000.0, "dist_nm": 6.686}
+{"kind": "leg", "t": 1790603226.5, "idx": 3, "fix": "D156O", "alt_ft": 5740.3, "want_alt": 6000.0, "dist_nm": 6.634}
+{"kind": "state", "t": 1790603226.7, "alt": 5745.2, "ias": 249.7, "vsi": -596.0, "ap_state": 50}
+{"kind": "leg", "t": 1790603227.1, "idx": 3, "fix": "D156O", "alt_ft": 5742.3, "want_alt": 6000.0, "dist_nm": 6.578}
+{"kind": "state", "t": 1790603227.6, "alt": 5742.8, "ias": 248.0, "vsi": 365.1, "ap_state": 50}
+{"kind": "leg", "t": 1790603227.6, "idx": 3, "fix": "D156O", "alt_ft": 5747.1, "want_alt": 6000.0, "dist_nm": 6.529}
+{"kind": "leg", "t": 1790603228.3, "idx": 3, "fix": "D156O", "alt_ft": 5754.9, "want_alt": 6000.0, "dist_nm": 6.478}
+{"kind": "leg", "t": 1790603228.9, "idx": 3, "fix": "D156O", "alt_ft": 5764.8, "want_alt": 6000.0, "dist_nm": 6.428}
+{"kind": "state", "t": 1790603229.0, "alt": 5752.4, "ias": 246.9, "vsi": 750.9, "ap_state": 50}
+{"kind": "leg", "t": 1790603229.4, "idx": 3, "fix": "D156O", "alt_ft": 5774.6, "want_alt": 6000.0, "dist_nm": 6.385}
+{"kind": "leg", "t": 1790603230.0, "idx": 3, "fix": "D156O", "alt_ft": 5785.7, "want_alt": 6000.0, "dist_nm": 6.339}
+{"kind": "leg", "t": 1790603230.6, "idx": 3, "fix": "D156O", "alt_ft": 5796.9, "want_alt": 6000.0, "dist_nm": 6.289}
+{"kind": "state", "t": 1790603230.7, "alt": 5777.2, "ias": 244.5, "vsi": 1093.4, "ap_state": 50}
+{"kind": "leg", "t": 1790603231.1, "idx": 3, "fix": "D156O", "alt_ft": 5810.8, "want_alt": 6000.0, "dist_nm": 6.241}
+{"kind": "leg", "t": 1790603231.7, "idx": 3, "fix": "D156O", "alt_ft": 5822.7, "want_alt": 6000.0, "dist_nm": 6.193}
+{"kind": "leg", "t": 1790603232.3, "idx": 3, "fix": "D156O", "alt_ft": 5835.2, "want_alt": 6000.0, "dist_nm": 6.141}
+{"kind": "state", "t": 1790603232.3, "alt": 5814.1, "ias": 241.6, "vsi": 1145.3, "ap_state": 50}
+{"kind": "leg", "t": 1790603232.8, "idx": 3, "fix": "D156O", "alt_ft": 5845.9, "want_alt": 6000.0, "dist_nm": 6.094}
+{"kind": "leg", "t": 1790603233.4, "idx": 3, "fix": "D156O", "alt_ft": 5854.7, "want_alt": 6000.0, "dist_nm": 6.053}
+{"kind": "state", "t": 1790603233.8, "alt": 5845.4, "ias": 239.3, "vsi": 990.2, "ap_state": 50}
+{"kind": "leg", "t": 1790603234.0, "idx": 3, "fix": "D156O", "alt_ft": 5864.3, "want_alt": 6000.0, "dist_nm": 6.004}
+{"kind": "leg", "t": 1790603234.5, "idx": 3, "fix": "D156O", "alt_ft": 5871.9, "want_alt": 6000.0, "dist_nm": 5.961}
+{"kind": "leg", "t": 1790603235.1, "idx": 3, "fix": "D156O", "alt_ft": 5879.9, "want_alt": 6000.0, "dist_nm": 5.91}
+{"kind": "state", "t": 1790603235.3, "alt": 5868.8, "ias": 236.8, "vsi": 793.7, "ap_state": 50}
+{"kind": "leg", "t": 1790603235.7, "idx": 3, "fix": "D156O", "alt_ft": 5886.5, "want_alt": 6000.0, "dist_nm": 5.864}
+{"kind": "leg", "t": 1790603236.3, "idx": 3, "fix": "D156O", "alt_ft": 5892.5, "want_alt": 6000.0, "dist_nm": 5.817}
+{"kind": "state", "t": 1790603237.0, "alt": 5888.2, "ias": 234.3, "vsi": 579.7, "ap_state": 50}
+{"kind": "leg", "t": 1790603237.0, "idx": 3, "fix": "D156O", "alt_ft": 5897.6, "want_alt": 6000.0, "dist_nm": 5.773}
+{"alt_ft": 5903.6807, "event": "speed_limit", "planned": 299.0, "t": 1790603237.5, "target": 250.0, "kind": "speed_limit"}
+{"kind": "leg", "t": 1790603237.6, "idx": 3, "fix": "D156O", "alt_ft": 5903.7, "want_alt": 5000.0, "dist_nm": 5.714}
+{"kind": "leg", "t": 1790603238.1, "idx": 3, "fix": "D156O", "alt_ft": 5908.4, "want_alt": 5000.0, "dist_nm": 5.663}
+{"kind": "state", "t": 1790603238.4, "alt": 5903.8, "ias": 231.7, "vsi": 426.3, "ap_state": 50}
+{"kind": "leg", "t": 1790603238.7, "idx": 3, "fix": "D156O", "alt_ft": 5912.6, "want_alt": 5000.0, "dist_nm": 5.613}
+{"kind": "leg", "t": 1790603239.3, "idx": 3, "fix": "D156O", "alt_ft": 5915.9, "want_alt": 5000.0, "dist_nm": 5.571}
+{"kind": "leg", "t": 1790603239.8, "idx": 3, "fix": "D156O", "alt_ft": 5918.2, "want_alt": 5000.0, "dist_nm": 5.52}
+{"kind": "state", "t": 1790603240.1, "alt": 5914.2, "ias": 229.7, "vsi": 318.9, "ap_state": 50}
+{"kind": "leg", "t": 1790603240.4, "idx": 3, "fix": "D156O", "alt_ft": 5918.9, "want_alt": 5000.0, "dist_nm": 5.474}
+{"kind": "leg", "t": 1790603240.9, "idx": 3, "fix": "D156O", "alt_ft": 5917.3, "want_alt": 5000.0, "dist_nm": 5.427}
+{"kind": "leg", "t": 1790603241.5, "idx": 3, "fix": "D156O", "alt_ft": 5912.8, "want_alt": 5000.0, "dist_nm": 5.38}
+{"kind": "state", "t": 1790603241.6, "alt": 5918.7, "ias": 228.8, "vsi": -84.3, "ap_state": 50}
+{"kind": "leg", "t": 1790603242.0, "idx": 3, "fix": "D156O", "alt_ft": 5905.1, "want_alt": 5000.0, "dist_nm": 5.333}
+{"alt_ft": 5894.59, "event": "speed_limit", "planned": 210.0, "t": 1790603242.6, "target": 210.0, "kind": "speed_limit"}
+{"kind": "leg", "t": 1790603242.7, "idx": 3, "fix": "D156O", "alt_ft": 5894.6, "want_alt": 6000.0, "dist_nm": 5.286}
+{"kind": "state", "t": 1790603243.1, "alt": 5903.9, "ias": 229.8, "vsi": -866.8, "ap_state": 50}
+{"kind": "leg", "t": 1790603243.3, "idx": 3, "fix": "D156O", "alt_ft": 5881.3, "want_alt": 6000.0, "dist_nm": 5.239}
+{"kind": "leg", "t": 1790603243.8, "idx": 3, "fix": "D156O", "alt_ft": 5865.7, "want_alt": 6000.0, "dist_nm": 5.191}
+{"kind": "leg", "t": 1790603244.5, "idx": 3, "fix": "D156O", "alt_ft": 5849.7, "want_alt": 6000.0, "dist_nm": 5.146}
+{"kind": "state", "t": 1790603244.9, "alt": 5868.7, "ias": 233.3, "vsi": -1508.7, "ap_state": 50}
+{"kind": "leg", "t": 1790603245.0, "idx": 3, "fix": "D156O", "alt_ft": 5833.7, "want_alt": 6000.0, "dist_nm": 5.103}
+{"kind": "leg", "t": 1790603245.5, "idx": 3, "fix": "D156O", "alt_ft": 5818.5, "want_alt": 6000.0, "dist_nm": 5.061}
+{"kind": "leg", "t": 1790603246.1, "idx": 3, "fix": "D156O", "alt_ft": 5803.2, "want_alt": 6000.0, "dist_nm": 5.016}
+{"kind": "state", "t": 1790603246.5, "alt": 5821.6, "ias": 237.5, "vsi": -1639.7, "ap_state": 50}
+{"kind": "leg", "t": 1790603246.7, "idx": 3, "fix": "D156O", "alt_ft": 5790.7, "want_alt": 6000.0, "dist_nm": 4.97}
+{"kind": "leg", "t": 1790603247.5, "idx": 3, "fix": "D156O", "alt_ft": 5779.0, "want_alt": 6000.0, "dist_nm": 4.928}
+{"kind": "state", "t": 1790603247.9, "alt": 5782.9, "ias": 239.9, "vsi": -1103.2, "ap_state": 50}
+{"kind": "leg", "t": 1790603248.1, "idx": 3, "fix": "D156O", "alt_ft": 5768.6, "want_alt": 6000.0, "dist_nm": 4.872}
+{"kind": "leg", "t": 1790603248.6, "idx": 3, "fix": "D156O", "alt_ft": 5764.8, "want_alt": 6000.0, "dist_nm": 4.825}
+{"kind": "leg", "t": 1790603249.2, "idx": 3, "fix": "D156O", "alt_ft": 5763.7, "want_alt": 6000.0, "dist_nm": 4.782}
+{"kind": "state", "t": 1790603249.6, "alt": 5765.8, "ias": 240.3, "vsi": -379.7, "ap_state": 50}
+{"kind": "leg", "t": 1790603249.8, "idx": 3, "fix": "D156O", "alt_ft": 5765.4, "want_alt": 6000.0, "dist_nm": 4.737}
+{"kind": "leg", "t": 1790603250.3, "idx": 3, "fix": "D156O", "alt_ft": 5769.2, "want_alt": 6000.0, "dist_nm": 4.696}
+{"kind": "leg", "t": 1790603250.9, "idx": 3, "fix": "D156O", "alt_ft": 5774.6, "want_alt": 6000.0, "dist_nm": 4.655}
+{"kind": "state", "t": 1790603251.0, "alt": 5768.1, "ias": 238.6, "vsi": 458.9, "ap_state": 50}
+{"kind": "leg", "t": 1790603251.4, "idx": 3, "fix": "D156O", "alt_ft": 5781.3, "want_alt": 6000.0, "dist_nm": 4.616}
+{"kind": "leg", "t": 1790603252.0, "idx": 3, "fix": "D156O", "alt_ft": 5789.6, "want_alt": 6000.0, "dist_nm": 4.571}
+{"kind": "state", "t": 1790603252.4, "alt": 5782.4, "ias": 236.6, "vsi": 810.6, "ap_state": 50}
+{"kind": "leg", "t": 1790603252.6, "idx": 3, "fix": "D156O", "alt_ft": 5799.4, "want_alt": 6000.0, "dist_nm": 4.53}
+{"kind": "leg", "t": 1790603253.2, "idx": 3, "fix": "D156O", "alt_ft": 5808.8, "want_alt": 6000.0, "dist_nm": 4.483}
+{"kind": "leg", "t": 1790603253.8, "idx": 3, "fix": "D156O", "alt_ft": 5818.5, "want_alt": 6000.0, "dist_nm": 4.441}
+{"kind": "state", "t": 1790603254.0, "alt": 5804.2, "ias": 234.5, "vsi": 979.8, "ap_state": 50}
+{"kind": "leg", "t": 1790603254.3, "idx": 3, "fix": "D156O", "alt_ft": 5828.8, "want_alt": 6000.0, "dist_nm": 4.394}
+{"kind": "leg", "t": 1790603254.9, "idx": 3, "fix": "D156O", "alt_ft": 5837.9, "want_alt": 6000.0, "dist_nm": 4.353}
+{"kind": "leg", "t": 1790603255.5, "idx": 3, "fix": "D156O", "alt_ft": 5846.9, "want_alt": 6000.0, "dist_nm": 4.31}
+{"kind": "state", "t": 1790603255.7, "alt": 5831.4, "ias": 231.8, "vsi": 964.0, "ap_state": 50}
+{"kind": "leg", "t": 1790603256.1, "idx": 3, "fix": "D156O", "alt_ft": 5855.2, "want_alt": 6000.0, "dist_nm": 4.268}
+{"kind": "leg", "t": 1790603256.7, "idx": 3, "fix": "D156O", "alt_ft": 5863.1, "want_alt": 6000.0, "dist_nm": 4.226}
+{"kind": "leg", "t": 1790603257.2, "idx": 3, "fix": "D156O", "alt_ft": 5870.5, "want_alt": 6000.0, "dist_nm": 4.182}
+{"kind": "state", "t": 1790603257.4, "alt": 5857.9, "ias": 228.9, "vsi": 810.9, "ap_state": 50}
+{"kind": "leg", "t": 1790603258.0, "idx": 3, "fix": "D156O", "alt_ft": 5877.1, "want_alt": 6000.0, "dist_nm": 4.141}
+{"kind": "leg", "t": 1790603258.6, "idx": 3, "fix": "D156O", "alt_ft": 5885.0, "want_alt": 6000.0, "dist_nm": 4.087}
+{"kind": "state", "t": 1790603259.1, "alt": 5878.2, "ias": 226.6, "vsi": 658.8, "ap_state": 50}
+{"kind": "leg", "t": 1790603259.1, "idx": 3, "fix": "D156O", "alt_ft": 5890.8, "want_alt": 6000.0, "dist_nm": 4.044}
+{"kind": "leg", "t": 1790603259.7, "idx": 3, "fix": "D156O", "alt_ft": 5896.3, "want_alt": 6000.0, "dist_nm": 4.0}
+{"alt_ft": 5900.672, "event": "speed_limit", "planned": 299.0, "t": 1790603260.2, "target": 250.0, "kind": "speed_limit"}
+{"kind": "leg", "t": 1790603260.3, "idx": 3, "fix": "D156O", "alt_ft": 5900.7, "want_alt": 5000.0, "dist_nm": 3.962}
+{"kind": "state", "t": 1790603260.5, "alt": 5895.1, "ias": 224.4, "vsi": 515.5, "ap_state": 50}
+{"kind": "leg", "t": 1790603260.8, "idx": 3, "fix": "D156O", "alt_ft": 5905.3, "want_alt": 5000.0, "dist_nm": 3.918}
+{"kind": "leg", "t": 1790603261.4, "idx": 3, "fix": "D156O", "alt_ft": 5909.5, "want_alt": 5000.0, "dist_nm": 3.874}
+{"kind": "state", "t": 1790603261.7, "alt": 5905.9, "ias": 222.5, "vsi": 424.1, "ap_state": 50}
+{"kind": "leg", "t": 1790603262.0, "idx": 3, "fix": "D156O", "alt_ft": 5913.4, "want_alt": 5000.0, "dist_nm": 3.829}
+{"kind": "leg", "t": 1790603262.5, "idx": 3, "fix": "D156O", "alt_ft": 5916.1, "want_alt": 5000.0, "dist_nm": 3.785}
+{"kind": "leg", "t": 1790603263.1, "idx": 3, "fix": "D156O", "alt_ft": 5917.4, "want_alt": 5000.0, "dist_nm": 3.74}
+{"kind": "state", "t": 1790603263.2, "alt": 5914.7, "ias": 221.4, "vsi": 272.0, "ap_state": 50}
+{"kind": "leg", "t": 1790603263.6, "idx": 3, "fix": "D156O", "alt_ft": 5916.8, "want_alt": 5000.0, "dist_nm": 3.7}
+{"kind": "leg", "t": 1790603264.2, "idx": 3, "fix": "D156O", "alt_ft": 5914.5, "want_alt": 5000.0, "dist_nm": 3.663}
+{"kind": "state", "t": 1790603264.5, "alt": 5916.6, "ias": 221.0, "vsi": -187.8, "ap_state": 50}
+{"kind": "leg", "t": 1790603264.7, "idx": 3, "fix": "D156O", "alt_ft": 5910.0, "want_alt": 5000.0, "dist_nm": 3.624}
+{"kind": "leg", "t": 1790603265.3, "idx": 3, "fix": "D156O", "alt_ft": 5903.4, "want_alt": 5000.0, "dist_nm": 3.586}
+{"kind": "state", "t": 1790603265.8, "alt": 5906.9, "ias": 222.0, "vsi": -723.1, "ap_state": 50}
+{"alt_ft": 5894.6562, "event": "speed_limit", "planned": 210.0, "t": 1790603265.8, "target": 210.0, "kind": "speed_limit"}
+{"kind": "leg", "t": 1790603265.9, "idx": 3, "fix": "D156O", "alt_ft": 5894.7, "want_alt": 6000.0, "dist_nm": 3.547}
+{"kind": "leg", "t": 1790603266.5, "idx": 3, "fix": "D156O", "alt_ft": 5881.4, "want_alt": 6000.0, "dist_nm": 3.5}
+{"kind": "leg", "t": 1790603267.0, "idx": 3, "fix": "D156O", "alt_ft": 5865.6, "want_alt": 6000.0, "dist_nm": 3.452}
+{"kind": "state", "t": 1790603267.2, "alt": 5886.1, "ias": 224.0, "vsi": -1230.6, "ap_state": 50}
+{"kind": "leg", "t": 1790603267.6, "idx": 3, "fix": "D156O", "alt_ft": 5849.7, "want_alt": 6000.0, "dist_nm": 3.408}
+{"kind": "leg", "t": 1790603268.3, "idx": 3, "fix": "D156O", "alt_ft": 5835.0, "want_alt": 6000.0, "dist_nm": 3.368}
+{"kind": "state", "t": 1790603268.6, "alt": 5844.4, "ias": 228.4, "vsi": -1631.6, "ap_state": 50}
+{"kind": "leg", "t": 1790603268.8, "idx": 3, "fix": "D156O", "alt_ft": 5816.8, "want_alt": 6000.0, "dist_nm": 3.318}
+{"kind": "leg", "t": 1790603269.4, "idx": 3, "fix": "D156O", "alt_ft": 5803.1, "want_alt": 6000.0, "dist_nm": 3.278}
+{"kind": "state", "t": 1790603270.0, "alt": 5810.8, "ias": 231.7, "vsi": -1528.9, "ap_state": 50}
+{"kind": "leg", "t": 1790603270.0, "idx": 3, "fix": "D156O", "alt_ft": 5787.6, "want_alt": 6000.0, "dist_nm": 3.226}
+{"kind": "leg", "t": 1790603270.6, "idx": 3, "fix": "D156O", "alt_ft": 5776.6, "want_alt": 6000.0, "dist_nm": 3.178}
+{"kind": "leg", "t": 1790603271.1, "idx": 3, "fix": "D156O", "alt_ft": 5769.0, "want_alt": 6000.0, "dist_nm": 3.129}
+{"kind": "state", "t": 1790603271.5, "alt": 5778.1, "ias": 234.4, "vsi": -925.7, "ap_state": 50}
+{"kind": "leg", "t": 1790603271.7, "idx": 3, "fix": "D156O", "alt_ft": 5765.4, "want_alt": 6000.0, "dist_nm": 3.083}
+{"kind": "leg", "t": 1790603272.3, "idx": 3, "fix": "D156O", "alt_ft": 5765.3, "want_alt": 6000.0, "dist_nm": 3.042}
+{"kind": "leg", "t": 1790603272.8, "idx": 3, "fix": "D156O", "alt_ft": 5768.1, "want_alt": 6000.0, "dist_nm": 2.992}
+{"kind": "state", "t": 1790603272.9, "alt": 5764.9, "ias": 235.3, "vsi": -31.9, "ap_state": 50}
+{"kind": "leg", "t": 1790603273.3, "idx": 3, "fix": "D156O", "alt_ft": 5773.6, "want_alt": 6000.0, "dist_nm": 2.947}
+{"kind": "leg", "t": 1790603273.9, "idx": 3, "fix": "D156O", "alt_ft": 5781.5, "want_alt": 6000.0, "dist_nm": 2.9}
+{"kind": "leg", "t": 1790603274.5, "idx": 3, "fix": "D156O", "alt_ft": 5790.3, "want_alt": 6000.0, "dist_nm": 2.857}
+{"kind": "state", "t": 1790603274.5, "alt": 5775.4, "ias": 234.0, "vsi": 676.7, "ap_state": 50}
+{"kind": "leg", "t": 1790603275.1, "idx": 3, "fix": "D156O", "alt_ft": 5802.0, "want_alt": 6000.0, "dist_nm": 2.806}
+{"kind": "leg", "t": 1790603275.6, "idx": 3, "fix": "D156O", "alt_ft": 5813.1, "want_alt": 6000.0, "dist_nm": 2.762}
+{"kind": "state", "t": 1790603276.0, "alt": 5800.4, "ias": 231.2, "vsi": 1047.3, "ap_state": 50}
+{"kind": "leg", "t": 1790603276.2, "idx": 3, "fix": "D156O", "alt_ft": 5825.0, "want_alt": 6000.0, "dist_nm": 2.715}
+{"kind": "leg", "t": 1790603276.8, "idx": 3, "fix": "D156O", "alt_ft": 5837.8, "want_alt": 6000.0, "dist_nm": 2.669}
+{"kind": "leg", "t": 1790603277.4, "idx": 3, "fix": "D156O", "alt_ft": 5848.8, "want_alt": 6000.0, "dist_nm": 2.618}
+{"kind": "state", "t": 1790603277.5, "alt": 5831.6, "ias": 227.9, "vsi": 1083.7, "ap_state": 16386}
+{"kind": "leg", "t": 1790603278.0, "idx": 3, "fix": "D156O", "alt_ft": 5859.0, "want_alt": 6000.0, "dist_nm": 2.574}
+{"kind": "state", "t": 1790603278.7, "alt": 5860.7, "ias": 225.8, "vsi": 934.2, "ap_state": 50}
+{"kind": "leg", "t": 1790603278.8, "idx": 3, "fix": "D156O", "alt_ft": 5868.9, "want_alt": 6000.0, "dist_nm": 2.528}
+{"kind": "leg", "t": 1790603279.3, "idx": 3, "fix": "D156O", "alt_ft": 5881.7, "want_alt": 6000.0, "dist_nm": 2.464}
+{"actual": 0.0, "dataref": "sim/cockpit/autopilot/vertical_velocity", "event": "write_unconfirmed", "t": 1790603279.9, "want": 300.0, "kind": "write_unconfirmed"}
+{"kind": "state", "t": 1790603280.1, "alt": 5881.4, "ias": 223.8, "vsi": 819.3, "ap_state": 16386}
+{"kind": "leg", "t": 1790603280.5, "idx": 3, "fix": "D156O", "alt_ft": 5898.5, "want_alt": 6000.0, "dist_nm": 2.374}
+{"alt_ft": 5907.033, "event": "speed_limit", "planned": 299.0, "t": 1790603281.0, "target": 250.0, "kind": "speed_limit"}
+{"kind": "leg", "t": 1790603281.1, "idx": 3, "fix": "D156O", "alt_ft": 5907.0, "want_alt": 5000.0, "dist_nm": 2.324}
+{"kind": "leg", "t": 1790603281.7, "idx": 3, "fix": "D156O", "alt_ft": 5916.3, "want_alt": 5000.0, "dist_nm": 2.277}
+{"kind": "state", "t": 1790603281.7, "alt": 5901.8, "ias": 221.7, "vsi": 769.7, "ap_state": 50}
+{"kind": "leg", "t": 1790603282.2, "idx": 3, "fix": "D156O", "alt_ft": 5923.7, "want_alt": 5000.0, "dist_nm": 2.237}
+{"kind": "leg", "t": 1790603282.7, "idx": 3, "fix": "D156O", "alt_ft": 5931.0, "want_alt": 5000.0, "dist_nm": 2.194}
+{"kind": "state", "t": 1790603282.7, "alt": 5923.3, "ias": 218.6, "vsi": 735.6, "ap_state": 50}
+{"kind": "leg", "t": 1790603283.2, "idx": 3, "fix": "D156O", "alt_ft": 5937.6, "want_alt": 5000.0, "dist_nm": 2.151}
+{"kind": "leg", "t": 1790603283.8, "idx": 3, "fix": "D156O", "alt_ft": 5943.0, "want_alt": 5000.0, "dist_nm": 2.107}
+{"kind": "state", "t": 1790603284.0, "alt": 5936.9, "ias": 217.1, "vsi": 600.8, "ap_state": 50}
+{"kind": "leg", "t": 1790603284.3, "idx": 3, "fix": "D156O", "alt_ft": 5946.2, "want_alt": 5000.0, "dist_nm": 2.066}
+{"kind": "leg", "t": 1790603284.9, "idx": 3, "fix": "D156O", "alt_ft": 5947.2, "want_alt": 5000.0, "dist_nm": 2.023}
+{"kind": "leg", "t": 1790603285.5, "idx": 3, "fix": "D156O", "alt_ft": 5945.4, "want_alt": 5000.0, "dist_nm": 1.983}
+{"kind": "state", "t": 1790603285.5, "alt": 5946.9, "ias": 216.5, "vsi": 128.6, "ap_state": 50}
+{"kind": "leg", "t": 1790603286.0, "idx": 3, "fix": "D156O", "alt_ft": 5940.6, "want_alt": 5000.0, "dist_nm": 1.937}
+{"kind": "leg", "t": 1790603286.6, "idx": 3, "fix": "D156O", "alt_ft": 5932.6, "want_alt": 5000.0, "dist_nm": 1.894}
+{"kind": "state", "t": 1790603287.0, "alt": 5940.6, "ias": 218.1, "vsi": -619.9, "ap_state": 50}
+{"kind": "leg", "t": 1790603287.1, "idx": 3, "fix": "D156O", "alt_ft": 5923.3, "want_alt": 5000.0, "dist_nm": 1.85}
+{"kind": "leg", "t": 1790603287.7, "idx": 3, "fix": "D156O", "alt_ft": 5909.2, "want_alt": 5000.0, "dist_nm": 1.809}
+{"alt_ft": 5894.772, "event": "speed_limit", "planned": 210.0, "t": 1790603288.2, "target": 210.0, "kind": "speed_limit"}
+{"kind": "leg", "t": 1790603288.3, "idx": 3, "fix": "D156O", "alt_ft": 5894.8, "want_alt": 6000.0, "dist_nm": 1.767}
+{"kind": "state", "t": 1790603288.4, "alt": 5914.0, "ias": 222.2, "vsi": -1324.5, "ap_state": 50}
+{"kind": "leg", "t": 1790603289.0, "idx": 3, "fix": "D156O", "alt_ft": 5877.0, "want_alt": 6000.0, "dist_nm": 1.721}
+{"kind": "leg", "t": 1790603289.5, "idx": 3, "fix": "D156O", "alt_ft": 5854.3, "want_alt": 6000.0, "dist_nm": 1.665}
+{"kind": "state", "t": 1790603289.8, "alt": 5875.5, "ias": 227.6, "vsi": -1740.9, "ap_state": 50}
+{"kind": "leg", "t": 1790603290.1, "idx": 3, "fix": "D156O", "alt_ft": 5836.5, "want_alt": 6000.0, "dist_nm": 1.623}
+{"kind": "leg", "t": 1790603290.7, "idx": 3, "fix": "D156O", "alt_ft": 5817.2, "want_alt": 6000.0, "dist_nm": 1.575}
+{"kind": "state", "t": 1790603291.2, "alt": 5828.7, "ias": 233.2, "vsi": -1822.6, "ap_state": 50}
+{"kind": "leg", "t": 1790603291.2, "idx": 3, "fix": "D156O", "alt_ft": 5801.1, "want_alt": 6000.0, "dist_nm": 1.531}
+{"kind": "leg", "t": 1790603291.8, "idx": 3, "fix": "D156O", "alt_ft": 5784.7, "want_alt": 6000.0, "dist_nm": 1.481}
+{"kind": "leg", "t": 1790603292.4, "idx": 3, "fix": "D156O", "alt_ft": 5772.5, "want_alt": 6000.0, "dist_nm": 1.433}
+{"kind": "state", "t": 1790603292.8, "alt": 5787.6, "ias": 238.1, "vsi": -1417.7, "ap_state": 50}
+{"kind": "leg", "t": 1790603292.9, "idx": 3, "fix": "D156O", "alt_ft": 5763.2, "want_alt": 6000.0, "dist_nm": 1.382}
+{"kind": "leg", "t": 1790603293.5, "idx": 3, "fix": "D156O", "alt_ft": 5758.7, "want_alt": 6000.0, "dist_nm": 1.334}
+{"kind": "state", "t": 1790603294.0, "alt": 5760.1, "ias": 241.3, "vsi": -419.7, "ap_state": 50}
+{"kind": "leg", "t": 1790603294.1, "idx": 3, "fix": "D156O", "alt_ft": 5758.1, "want_alt": 6000.0, "dist_nm": 1.284}
+{"kind": "leg", "t": 1790603294.6, "idx": 3, "fix": "D156O", "alt_ft": 5761.1, "want_alt": 6000.0, "dist_nm": 1.237}
+{"kind": "leg", "t": 1790603295.2, "idx": 3, "fix": "D156O", "alt_ft": 5766.5, "want_alt": 6000.0, "dist_nm": 1.188}
+{"kind": "state", "t": 1790603295.5, "alt": 5760.3, "ias": 241.9, "vsi": 375.7, "ap_state": 50}
+{"alt_ft": 5775.9883, "event": "cruise_schedule", "fix": "D156J", "ias": 241.19818, "idx": 4, "mach": 0.626, "ofp_target": 299.0, "plan_ias": 299.0, "profile_kts": 255.0, "rejected": null, "source": "ofp", "t": 1790603295.7, "target": 299.0, "kind": "cruise_schedule"}
+{"kind": "leg", "t": 1790603295.8, "idx": 4, "fix": "D156J", "alt_ft": 5776.0, "want_alt": 6000.0, "dist_nm": 5.859}
+{"kind": "leg", "t": 1790603296.4, "idx": 4, "fix": "D156J", "alt_ft": 5785.3, "want_alt": 6000.0, "dist_nm": 5.825}
+{"kind": "state", "t": 1790603296.7, "alt": 5778.6, "ias": 241.0, "vsi": 943.4, "ap_state": 50}
+{"kind": "leg", "t": 1790603296.9, "idx": 4, "fix": "D156J", "alt_ft": 5795.5, "want_alt": 6000.0, "dist_nm": 5.792}
+{"kind": "leg", "t": 1790603297.5, "idx": 4, "fix": "D156J", "alt_ft": 5805.7, "want_alt": 6000.0, "dist_nm": 5.761}
+{"kind": "state", "t": 1790603297.9, "alt": 5799.8, "ias": 239.2, "vsi": 1125.0, "ap_state": 50}
+{"kind": "leg", "t": 1790603298.0, "idx": 4, "fix": "D156J", "alt_ft": 5816.1, "want_alt": 6000.0, "dist_nm": 5.73}
+{"kind": "leg", "t": 1790603298.6, "idx": 4, "fix": "D156J", "alt_ft": 5826.2, "want_alt": 6000.0, "dist_nm": 5.698}
+{"kind": "state", "t": 1790603299.1, "alt": 5823.2, "ias": 237.0, "vsi": 1115.0, "ap_state": 50}
+{"kind": "leg", "t": 1790603299.3, "idx": 4, "fix": "D156J", "alt_ft": 5836.5, "want_alt": 6000.0, "dist_nm": 5.666}
+{"kind": "leg", "t": 1790603299.9, "idx": 4, "fix": "D156J", "alt_ft": 5848.1, "want_alt": 6000.0, "dist_nm": 5.629}
+{"kind": "state", "t": 1790603300.4, "alt": 5844.2, "ias": 234.6, "vsi": 978.9, "ap_state": 50}
+{"kind": "leg", "t": 1790603300.4, "idx": 4, "fix": "D156J", "alt_ft": 5856.3, "want_alt": 6000.0, "dist_nm": 5.594}
+{"kind": "leg", "t": 1790603301.0, "idx": 4, "fix": "D156J", "alt_ft": 5864.3, "want_alt": 6000.0, "dist_nm": 5.561}
+{"kind": "leg", "t": 1790603301.5, "idx": 4, "fix": "D156J", "alt_ft": 5871.1, "want_alt": 6000.0, "dist_nm": 5.529}
+{"kind": "state", "t": 1790603301.6, "alt": 5862.8, "ias": 232.3, "vsi": 805.3, "ap_state": 50}
+{"kind": "leg", "t": 1790603302.1, "idx": 4, "fix": "D156J", "alt_ft": 5877.4, "want_alt": 6000.0, "dist_nm": 5.497}
+{"kind": "leg", "t": 1790603302.7, "idx": 4, "fix": "D156J", "alt_ft": 5882.9, "want_alt": 6000.0, "dist_nm": 5.465}
+{"kind": "state", "t": 1790603302.9, "alt": 5877.5, "ias": 230.4, "vsi": 637.5, "ap_state": 50}
+{"kind": "leg", "t": 1790603303.2, "idx": 4, "fix": "D156J", "alt_ft": 5887.8, "want_alt": 6000.0, "dist_nm": 5.431}
+{"kind": "leg", "t": 1790603303.8, "idx": 4, "fix": "D156J", "alt_ft": 5892.9, "want_alt": 6000.0, "dist_nm": 5.396}
+{"kind": "state", "t": 1790603304.2, "alt": 5889.9, "ias": 228.4, "vsi": 507.9, "ap_state": 50}
+{"kind": "leg", "t": 1790603304.3, "idx": 4, "fix": "D156J", "alt_ft": 5896.9, "want_alt": 6000.0, "dist_nm": 5.365}
+{"alt_ft": 5901.1533, "event": "speed_limit", "planned": 299.0, "t": 1790603304.9, "target": 250.0, "kind": "speed_limit"}
+{"kind": "leg", "t": 1790603304.9, "idx": 4, "fix": "D156J", "alt_ft": 5901.2, "want_alt": 6000.0, "dist_nm": 5.331}
+{"kind": "leg", "t": 1790603305.4, "idx": 4, "fix": "D156J", "alt_ft": 5905.5, "want_alt": 6000.0, "dist_nm": 5.296}
+{"kind": "state", "t": 1790603305.5, "alt": 5899.8, "ias": 226.6, "vsi": 453.2, "ap_state": 50}
+{"kind": "leg", "t": 1790603305.9, "idx": 4, "fix": "D156J", "alt_ft": 5910.0, "want_alt": 6000.0, "dist_nm": 5.258}
+{"kind": "leg", "t": 1790603306.5, "idx": 4, "fix": "D156J", "alt_ft": 5914.8, "want_alt": 6000.0, "dist_nm": 5.217}
+{"kind": "state", "t": 1790603307.1, "alt": 5911.0, "ias": 224.5, "vsi": 443.1, "ap_state": 50}
+{"kind": "leg", "t": 1790603307.1, "idx": 4, "fix": "D156J", "alt_ft": 5919.6, "want_alt": 6000.0, "dist_nm": 5.178}
+{"kind": "leg", "t": 1790603307.7, "idx": 4, "fix": "D156J", "alt_ft": 5925.0, "want_alt": 6000.0, "dist_nm": 5.136}
+{"kind": "leg", "t": 1790603308.2, "idx": 4, "fix": "D156J", "alt_ft": 5930.0, "want_alt": 6000.0, "dist_nm": 5.097}
+{"kind": "state", "t": 1790603308.6, "alt": 5924.6, "ias": 222.3, "vsi": 486.6, "ap_state": 16386}
+{"kind": "leg", "t": 1790603308.8, "idx": 4, "fix": "D156J", "alt_ft": 5935.4, "want_alt": 6000.0, "dist_nm": 5.056}
+{"kind": "leg", "t": 1790603309.6, "idx": 4, "fix": "D156J", "alt_ft": 5940.8, "want_alt": 6000.0, "dist_nm": 5.02}
+{"kind": "leg", "t": 1790603310.1, "idx": 4, "fix": "D156J", "alt_ft": 5947.7, "want_alt": 6000.0, "dist_nm": 4.966}
+{"kind": "state", "t": 1790603310.3, "alt": 5938.0, "ias": 221.3, "vsi": 517.2, "ap_state": 16386}
+{"kind": "leg", "t": 1790603310.8, "idx": 4, "fix": "D156J", "alt_ft": 5953.2, "want_alt": 6000.0, "dist_nm": 4.928}
+{"kind": "leg", "t": 1790603311.3, "idx": 4, "fix": "D156J", "alt_ft": 5959.9, "want_alt": 6000.0, "dist_nm": 4.886}
+{"kind": "leg", "t": 1790603311.9, "idx": 4, "fix": "D156J", "alt_ft": 5965.9, "want_alt": 6000.0, "dist_nm": 4.849}
+{"kind": "state", "t": 1790603312.1, "alt": 5954.7, "ias": 221.4, "vsi": 618.3, "ap_state": 16386}
+{"kind": "leg", "t": 1790603312.4, "idx": 4, "fix": "D156J", "alt_ft": 5973.2, "want_alt": 6000.0, "dist_nm": 4.807}
+{"kind": "leg", "t": 1790603313.0, "idx": 4, "fix": "D156J", "alt_ft": 5980.6, "want_alt": 6000.0, "dist_nm": 4.767}
+{"kind": "state", "t": 1790603313.4, "alt": 5974.4, "ias": 223.5, "vsi": 744.9, "ap_state": 16386}
+{"kind": "leg", "t": 1790603313.6, "idx": 4, "fix": "D156J", "alt_ft": 5988.2, "want_alt": 6000.0, "dist_nm": 4.727}
+{"kind": "leg", "t": 1790603314.1, "idx": 4, "fix": "D156J", "alt_ft": 5996.2, "want_alt": 6000.0, "dist_nm": 4.686}
+{"kind": "leg", "t": 1790603314.6, "idx": 4, "fix": "D156J", "alt_ft": 6004.5, "want_alt": 6000.0, "dist_nm": 4.644}
+{"kind": "state", "t": 1790603314.8, "alt": 5994.2, "ias": 226.7, "vsi": 828.3, "ap_state": 16386}
+{"kind": "leg", "t": 1790603315.2, "idx": 4, "fix": "D156J", "alt_ft": 6013.4, "want_alt": 6000.0, "dist_nm": 4.601}
+{"kind": "leg", "t": 1790603315.8, "idx": 4, "fix": "D156J", "alt_ft": 6021.6, "want_alt": 6000.0, "dist_nm": 4.56}
+{"kind": "state", "t": 1790603316.2, "alt": 6015.2, "ias": 231.1, "vsi": 875.7, "ap_state": 16386}
+{"kind": "leg", "t": 1790603316.4, "idx": 4, "fix": "D156J", "alt_ft": 6031.5, "want_alt": 6000.0, "dist_nm": 4.51}
+{"kind": "leg", "t": 1790603316.9, "idx": 4, "fix": "D156J", "alt_ft": 6039.8, "want_alt": 6000.0, "dist_nm": 4.467}
+{"kind": "leg", "t": 1790603317.5, "idx": 4, "fix": "D156J", "alt_ft": 6048.2, "want_alt": 6000.0, "dist_nm": 4.422}
+{"kind": "state", "t": 1790603317.5, "alt": 6036.7, "ias": 235.8, "vsi": 848.0, "ap_state": 16386}
+{"kind": "leg", "t": 1790603318.1, "idx": 4, "fix": "D156J", "alt_ft": 6055.7, "want_alt": 6000.0, "dist_nm": 4.377}
+{"kind": "leg", "t": 1790603318.6, "idx": 4, "fix": "D156J", "alt_ft": 6063.2, "want_alt": 6000.0, "dist_nm": 4.33}
+{"kind": "state", "t": 1790603318.9, "alt": 6054.9, "ias": 240.5, "vsi": 756.7, "ap_state": 16386}
+{"kind": "leg", "t": 1790603319.2, "idx": 4, "fix": "D156J", "alt_ft": 6069.9, "want_alt": 6000.0, "dist_nm": 4.283}
+{"kind": "leg", "t": 1790603319.9, "idx": 4, "fix": "D156J", "alt_ft": 6075.8, "want_alt": 6000.0, "dist_nm": 4.238}
+{"kind": "state", "t": 1790603320.3, "alt": 6072.1, "ias": 245.9, "vsi": 621.4, "ap_state": 16386}
+{"kind": "leg", "t": 1790603320.4, "idx": 4, "fix": "D156J", "alt_ft": 6083.1, "want_alt": 6000.0, "dist_nm": 4.178}
+{"kind": "leg", "t": 1790603321.0, "idx": 4, "fix": "D156J", "alt_ft": 6088.0, "want_alt": 6000.0, "dist_nm": 4.133}
+{"kind": "leg", "t": 1790603321.6, "idx": 4, "fix": "D156J", "alt_ft": 6093.0, "want_alt": 6000.0, "dist_nm": 4.079}
+{"kind": "state", "t": 1790603321.7, "alt": 6086.3, "ias": 250.7, "vsi": 495.6, "ap_state": 16386}
+{"kind": "leg", "t": 1790603322.1, "idx": 4, "fix": "D156J", "alt_ft": 6096.8, "want_alt": 6000.0, "dist_nm": 4.033}
+{"kind": "leg", "t": 1790603322.7, "idx": 4, "fix": "D156J", "alt_ft": 6100.0, "want_alt": 6000.0, "dist_nm": 3.986}
+{"kind": "state", "t": 1790603323.1, "alt": 6096.9, "ias": 253.6, "vsi": 358.3, "ap_state": 50}
+{"kind": "leg", "t": 1790603323.3, "idx": 4, "fix": "D156J", "alt_ft": 6102.5, "want_alt": 6000.0, "dist_nm": 3.938}
+{"kind": "leg", "t": 1790603323.8, "idx": 4, "fix": "D156J", "alt_ft": 6104.2, "want_alt": 6000.0, "dist_nm": 3.897}
+{"kind": "leg", "t": 1790603324.3, "idx": 4, "fix": "D156J", "alt_ft": 6105.6, "want_alt": 6000.0, "dist_nm": 3.849}
+{"kind": "state", "t": 1790603324.5, "alt": 6103.5, "ias": 255.9, "vsi": 196.7, "ap_state": 50}
+{"kind": "leg", "t": 1790603324.9, "idx": 4, "fix": "D156J", "alt_ft": 6106.8, "want_alt": 6000.0, "dist_nm": 3.803}
+{"kind": "leg", "t": 1790603325.4, "idx": 4, "fix": "D156J", "alt_ft": 6107.7, "want_alt": 6000.0, "dist_nm": 3.757}
+{"kind": "state", "t": 1790603325.9, "alt": 6107.0, "ias": 257.0, "vsi": 103.6, "ap_state": 50}
+{"kind": "leg", "t": 1790603326.0, "idx": 4, "fix": "D156J", "alt_ft": 6108.6, "want_alt": 6000.0, "dist_nm": 3.71}
+{"kind": "leg", "t": 1790603326.5, "idx": 4, "fix": "D156J", "alt_ft": 6109.4, "want_alt": 6000.0, "dist_nm": 3.661}
+{"kind": "state", "t": 1790603327.1, "alt": 6109.2, "ias": 257.1, "vsi": 74.8, "ap_state": 50}
+{"kind": "leg", "t": 1790603327.1, "idx": 4, "fix": "D156J", "alt_ft": 6110.0, "want_alt": 6000.0, "dist_nm": 3.612}
+{"kind": "leg", "t": 1790603327.7, "idx": 4, "fix": "D156J", "alt_ft": 6110.3, "want_alt": 6000.0, "dist_nm": 3.565}
+{"kind": "leg", "t": 1790603328.2, "idx": 4, "fix": "D156J", "alt_ft": 6110.4, "want_alt": 6000.0, "dist_nm": 3.515}
+{"kind": "state", "t": 1790603328.4, "alt": 6110.3, "ias": 256.0, "vsi": 36.2, "ap_state": 50}
+{"kind": "leg", "t": 1790603328.8, "idx": 4, "fix": "D156J", "alt_ft": 6110.3, "want_alt": 6000.0, "dist_nm": 3.471}
+{"kind": "leg", "t": 1790603329.3, "idx": 4, "fix": "D156J", "alt_ft": 6109.8, "want_alt": 6000.0, "dist_nm": 3.421}
+{"kind": "state", "t": 1790603329.6, "alt": 6110.2, "ias": 255.1, "vsi": -28.7, "ap_state": 50}
+{"kind": "leg", "t": 1790603330.0, "idx": 4, "fix": "D156J", "alt_ft": 6109.0, "want_alt": 6000.0, "dist_nm": 3.374}
+{"kind": "leg", "t": 1790603330.6, "idx": 4, "fix": "D156J", "alt_ft": 6107.5, "want_alt": 6000.0, "dist_nm": 3.314}
+{"kind": "state", "t": 1790603330.9, "alt": 6108.6, "ias": 253.7, "vsi": -106.1, "ap_state": 50}
+{"kind": "leg", "t": 1790603331.1, "idx": 4, "fix": "D156J", "alt_ft": 6106.0, "want_alt": 6000.0, "dist_nm": 3.266}
+{"kind": "leg", "t": 1790603331.7, "idx": 4, "fix": "D156J", "alt_ft": 6104.3, "want_alt": 6000.0, "dist_nm": 3.22}
+{"kind": "state", "t": 1790603332.2, "alt": 6105.4, "ias": 252.3, "vsi": -166.2, "ap_state": 50}
+{"kind": "leg", "t": 1790603332.3, "idx": 4, "fix": "D156J", "alt_ft": 6102.5, "want_alt": 6000.0, "dist_nm": 3.176}
+{"kind": "leg", "t": 1790603332.8, "idx": 4, "fix": "D156J", "alt_ft": 6100.7, "want_alt": 6000.0, "dist_nm": 3.131}
+{"kind": "state", "t": 1790603333.3, "alt": 6101.2, "ias": 251.1, "vsi": -184.6, "ap_state": 50}
+{"kind": "leg", "t": 1790603333.3, "idx": 4, "fix": "D156J", "alt_ft": 6099.0, "want_alt": 6000.0, "dist_nm": 3.087}
+{"kind": "leg", "t": 1790603333.9, "idx": 4, "fix": "D156J", "alt_ft": 6097.4, "want_alt": 6000.0, "dist_nm": 3.042}
+{"kind": "leg", "t": 1790603334.4, "idx": 4, "fix": "D156J", "alt_ft": 6096.1, "want_alt": 6000.0, "dist_nm": 2.998}
+{"kind": "state", "t": 1790603334.5, "alt": 6097.9, "ias": 250.3, "vsi": -166.7, "ap_state": 50}
+{"kind": "leg", "t": 1790603335.0, "idx": 4, "fix": "D156J", "alt_ft": 6095.0, "want_alt": 6000.0, "dist_nm": 2.955}
+{"kind": "leg", "t": 1790603335.5, "idx": 4, "fix": "D156J", "alt_ft": 6094.2, "want_alt": 6000.0, "dist_nm": 2.907}
+{"kind": "state", "t": 1790603335.9, "alt": 6094.9, "ias": 250.0, "vsi": -95.4, "ap_state": 50}
+{"kind": "leg", "t": 1790603336.1, "idx": 4, "fix": "D156J", "alt_ft": 6093.9, "want_alt": 6000.0, "dist_nm": 2.861}
+{"kind": "leg", "t": 1790603336.6, "idx": 4, "fix": "D156J", "alt_ft": 6093.8, "want_alt": 6000.0, "dist_nm": 2.814}
+{"kind": "leg", "t": 1790603337.2, "idx": 4, "fix": "D156J", "alt_ft": 6093.9, "want_alt": 6000.0, "dist_nm": 2.769}
+{"kind": "state", "t": 1790603337.3, "alt": 6093.8, "ias": 249.0, "vsi": 2.1, "ap_state": 50}
+{"kind": "leg", "t": 1790603337.7, "idx": 4, "fix": "D156J", "alt_ft": 6094.2, "want_alt": 6000.0, "dist_nm": 2.725}
+{"kind": "leg", "t": 1790603338.3, "idx": 4, "fix": "D156J", "alt_ft": 6094.6, "want_alt": 6000.0, "dist_nm": 2.681}
+{"kind": "state", "t": 1790603338.7, "alt": 6094.3, "ias": 248.5, "vsi": 37.9, "ap_state": 50}
+{"kind": "leg", "t": 1790603338.8, "idx": 4, "fix": "D156J", "alt_ft": 6095.0, "want_alt": 6000.0, "dist_nm": 2.635}
+{"kind": "leg", "t": 1790603339.3, "idx": 4, "fix": "D156J", "alt_ft": 6095.4, "want_alt": 6000.0, "dist_nm": 2.595}
+{"kind": "state", "t": 1790603339.8, "alt": 6095.3, "ias": 248.3, "vsi": 48.7, "ap_state": 50}
+{"kind": "leg", "t": 1790603339.9, "idx": 4, "fix": "D156J", "alt_ft": 6095.9, "want_alt": 6000.0, "dist_nm": 2.547}
+{"kind": "leg", "t": 1790603340.6, "idx": 4, "fix": "D156J", "alt_ft": 6096.4, "want_alt": 6000.0, "dist_nm": 2.502}
+{"kind": "state", "t": 1790603341.1, "alt": 6096.3, "ias": 248.4, "vsi": 54.4, "ap_state": 50}
+{"kind": "leg", "t": 1790603341.2, "idx": 4, "fix": "D156J", "alt_ft": 6096.9, "want_alt": 6000.0, "dist_nm": 2.44}
+{"kind": "leg", "t": 1790603341.8, "idx": 4, "fix": "D156J", "alt_ft": 6097.1, "want_alt": 6000.0, "dist_nm": 2.394}
+{"kind": "leg", "t": 1790603342.3, "idx": 4, "fix": "D156J", "alt_ft": 6097.0, "want_alt": 6000.0, "dist_nm": 2.347}
+{"kind": "state", "t": 1790603342.4, "alt": 6097.1, "ias": 247.8, "vsi": 7.2, "ap_state": 50}
+{"kind": "leg", "t": 1790603342.8, "idx": 4, "fix": "D156J", "alt_ft": 6096.9, "want_alt": 6000.0, "dist_nm": 2.304}
+{"kind": "leg", "t": 1790603343.4, "idx": 4, "fix": "D156J", "alt_ft": 6096.6, "want_alt": 6000.0, "dist_nm": 2.259}
+{"kind": "state", "t": 1790603343.7, "alt": 6096.9, "ias": 247.6, "vsi": -28.3, "ap_state": 50}
+{"kind": "leg", "t": 1790603343.9, "idx": 4, "fix": "D156J", "alt_ft": 6096.1, "want_alt": 6000.0, "dist_nm": 2.214}
+{"kind": "leg", "t": 1790603344.5, "idx": 4, "fix": "D156J", "alt_ft": 6095.4, "want_alt": 6000.0, "dist_nm": 2.17}
+{"kind": "leg", "t": 1790603345.0, "idx": 4, "fix": "D156J", "alt_ft": 6094.6, "want_alt": 6000.0, "dist_nm": 2.125}
+{"kind": "state", "t": 1790603345.1, "alt": 6095.8, "ias": 247.6, "vsi": -72.1, "ap_state": 50}
+{"kind": "leg", "t": 1790603345.6, "idx": 4, "fix": "D156J", "alt_ft": 6093.7, "want_alt": 6000.0, "dist_nm": 2.081}
+{"kind": "leg", "t": 1790603346.1, "idx": 4, "fix": "D156J", "alt_ft": 6092.8, "want_alt": 6000.0, "dist_nm": 2.035}
+{"kind": "state", "t": 1790603346.5, "alt": 6093.7, "ias": 248.4, "vsi": -91.8, "ap_state": 50}
+{"kind": "leg", "t": 1790603346.7, "idx": 4, "fix": "D156J", "alt_ft": 6091.9, "want_alt": 6000.0, "dist_nm": 1.989}
+{"kind": "leg", "t": 1790603347.3, "idx": 4, "fix": "D156J", "alt_ft": 6090.9, "want_alt": 6000.0, "dist_nm": 1.943}
+{"kind": "leg", "t": 1790603347.8, "idx": 4, "fix": "D156J", "alt_ft": 6090.1, "want_alt": 6000.0, "dist_nm": 1.898}
+{"kind": "state", "t": 1790603347.9, "alt": 6091.4, "ias": 249.3, "vsi": -94.6, "ap_state": 50}
+{"kind": "leg", "t": 1790603348.3, "idx": 4, "fix": "D156J", "alt_ft": 6089.5, "want_alt": 6000.0, "dist_nm": 1.855}
+{"kind": "leg", "t": 1790603348.9, "idx": 4, "fix": "D156J", "alt_ft": 6089.0, "want_alt": 6000.0, "dist_nm": 1.811}
+{"kind": "state", "t": 1790603349.3, "alt": 6089.4, "ias": 250.3, "vsi": -63.8, "ap_state": 50}
+{"kind": "leg", "t": 1790603349.4, "idx": 4, "fix": "D156J", "alt_ft": 6088.6, "want_alt": 6000.0, "dist_nm": 1.765}
+{"kind": "leg", "t": 1790603350.0, "idx": 4, "fix": "D156J", "alt_ft": 6088.3, "want_alt": 6000.0, "dist_nm": 1.72}
+{"kind": "state", "t": 1790603350.6, "alt": 6088.4, "ias": 251.2, "vsi": -26.3, "ap_state": 50}
+{"kind": "leg", "t": 1790603350.7, "idx": 4, "fix": "D156J", "alt_ft": 6088.1, "want_alt": 6000.0, "dist_nm": 1.672}
+{"kind": "leg", "t": 1790603351.2, "idx": 4, "fix": "D156J", "alt_ft": 6087.9, "want_alt": 6000.0, "dist_nm": 1.614}
+{"kind": "leg", "t": 1790603351.7, "idx": 4, "fix": "D156J", "alt_ft": 6087.7, "want_alt": 6000.0, "dist_nm": 1.57}
+{"kind": "state", "t": 1790603352.0, "alt": 6087.9, "ias": 251.4, "vsi": -17.6, "ap_state": 50}
+{"kind": "leg", "t": 1790603352.3, "idx": 4, "fix": "D156J", "alt_ft": 6087.3, "want_alt": 6000.0, "dist_nm": 1.525}
+{"kind": "leg", "t": 1790603352.8, "idx": 4, "fix": "D156J", "alt_ft": 6086.8, "want_alt": 6000.0, "dist_nm": 1.485}
+{"kind": "leg", "t": 1790603353.4, "idx": 4, "fix": "D156J", "alt_ft": 6086.2, "want_alt": 6000.0, "dist_nm": 1.434}
+{"kind": "state", "t": 1790603353.4, "alt": 6087.1, "ias": 251.6, "vsi": -50.4, "ap_state": 50}
+{"kind": "leg", "t": 1790603353.9, "idx": 4, "fix": "D156J", "alt_ft": 6085.4, "want_alt": 6000.0, "dist_nm": 1.386}
+{"kind": "leg", "t": 1790603354.5, "idx": 4, "fix": "D156J", "alt_ft": 6084.6, "want_alt": 6000.0, "dist_nm": 1.341}
+{"kind": "state", "t": 1790603354.8, "alt": 6085.5, "ias": 251.9, "vsi": -78.2, "ap_state": 50}
+{"kind": "leg", "t": 1790603355.0, "idx": 4, "fix": "D156J", "alt_ft": 6083.7, "want_alt": 6000.0, "dist_nm": 1.296}
+{"kind": "leg", "t": 1790603355.6, "idx": 4, "fix": "D156J", "alt_ft": 6082.8, "want_alt": 6000.0, "dist_nm": 1.255}
+{"kind": "leg", "t": 1790603356.1, "idx": 4, "fix": "D156J", "alt_ft": 6081.6, "want_alt": 6000.0, "dist_nm": 1.205}
+{"kind": "state", "t": 1790603356.2, "alt": 6083.2, "ias": 252.3, "vsi": -99.5, "ap_state": 50}
+{"kind": "leg", "t": 1790603356.7, "idx": 4, "fix": "D156J", "alt_ft": 6080.2, "want_alt": 6000.0, "dist_nm": 1.155}
+{"kind": "leg", "t": 1790603357.2, "idx": 4, "fix": "D156J", "alt_ft": 6079.1, "want_alt": 6000.0, "dist_nm": 1.108}
+{"kind": "state", "t": 1790603357.3, "alt": 6080.3, "ias": 252.2, "vsi": -126.1, "ap_state": 50}
+{"kind": "leg", "t": 1790603357.8, "idx": 4, "fix": "D156J", "alt_ft": 6078.1, "want_alt": 6000.0, "dist_nm": 1.064}
+{"kind": "leg", "t": 1790603358.4, "idx": 4, "fix": "D156J", "alt_ft": 6077.0, "want_alt": 6000.0, "dist_nm": 1.016}
+{"kind": "state", "t": 1790603358.5, "alt": 6078.1, "ias": 252.2, "vsi": -99.7, "ap_state": 50}
+{"kind": "leg", "t": 1790603358.9, "idx": 4, "fix": "D156J", "alt_ft": 6075.9, "want_alt": 6000.0, "dist_nm": 0.97}
+{"kind": "leg", "t": 1790603359.5, "idx": 4, "fix": "D156J", "alt_ft": 6074.8, "want_alt": 6000.0, "dist_nm": 0.926}
+{"kind": "state", "t": 1790603360.0, "alt": 6075.7, "ias": 251.9, "vsi": -115.5, "ap_state": 50}
+{"kind": "leg", "t": 1790603360.0, "idx": 4, "fix": "D156J", "alt_ft": 6073.7, "want_alt": 6000.0, "dist_nm": 0.88}
+{"kind": "leg", "t": 1790603360.8, "idx": 4, "fix": "D156J", "alt_ft": 6072.7, "want_alt": 6000.0, "dist_nm": 0.836}
+{"kind": "leg", "t": 1790603361.4, "idx": 4, "fix": "D156J", "alt_ft": 6071.3, "want_alt": 6000.0, "dist_nm": 0.777}
+{"kind": "state", "t": 1790603361.8, "alt": 6072.9, "ias": 250.9, "vsi": -111.0, "ap_state": 50}
+{"alt_ft": 6070.3193, "event": "cruise_schedule", "fix": "LAM", "ias": 250.34592, "idx": 5, "mach": 0.626, "ofp_target": 299.0, "plan_ias": 299.0, "profile_kts": 255.0, "rejected": null, "source": "ofp", "t": 1790603361.9, "target": 299.0, "kind": "cruise_schedule"}
+{"kind": "leg", "t": 1790603362.0, "idx": 5, "fix": "LAM", "alt_ft": 6070.3, "want_alt": 6000.0, "dist_nm": 10.712}
+{"kind": "leg", "t": 1790603362.5, "idx": 5, "fix": "LAM", "alt_ft": 6069.3, "want_alt": 6000.0, "dist_nm": 10.662}
