@@ -9808,3 +9808,16 @@ clearance waits for the check-in and is said; this reverses the old "minimum out
 terrain still does); the minimum's level counts as commanded for `climb_no_descent`; `vs_action` reads
 the modes first. Replayed: 18+ flips became 1. Open: the 250-below-10,000 limit has no hysteresis either.
 Offline only.
+
+## 2026-09-28: the climb attitude is a ceiling (#78 follow-up); the 250 cap holds (#154)
+
+#78, EGKK 08R (sortie 1790601822), the first ClimbHold flight: speed held (162.6 to 170.3 kt to the
+engage) but theta reached 22.4 under an 18 degree ceiling. The target was capped at 18 from 77 ft and
+the rotation tracked its ramp within 0.6 degrees: the attitude loop overshot (the nose reached 18 rising
+2.6 deg/s; four degrees over, the law pushed 0.15 on a 737 that needs 0.14 just to stop pitching).
+Refitted plant (column sets a pitch rate: k 12.9 deg/s per unit past -0.139, tau 0.1 s, delay 0.4 s;
+0.23 deg RMS); the LEMG `PitchPlant` missed the same column by 6 deg RMS and was retired from the hold
+sweep. `RotatePitch::ceiling_guard` lets the nose close on the ceiling no faster than the gap over 2.5 s
+and the target stops 0.5 under it: replay 21.96 to 17.83, under 18 across the plant sweep.
+#154: `speedhold::AirspaceLimit` latches the 250 below 10,000 cap (lifted only at 10,300); a level at
+10,000 +-50 ft flipped the old rule ~325 times, the latch never. Offline only.

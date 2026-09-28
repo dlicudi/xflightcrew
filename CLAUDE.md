@@ -453,7 +453,9 @@ everything blackboxes to `logs/blackbox.jsonl` (kinds: `atc`, `autotaxi`, `autot
 - **The initial climb holds V2 + 15 by pitch** (`autotakeoff::ClimbHold`, profile
   `climb_pitch_max_deg`): liftoff to the 300 ft engage, the attitude target walks on the airspeed
   trend, floored at the rotation attitude and capped by what the tail has cleared; silent profiles
-  keep 8 degrees (LEMG 13 2026-09-28: 162 to 185 kt at 8 degrees).
+  keep 8 degrees (LEMG 13 2026-09-28: 162 to 185 kt at 8 degrees). The climb attitude is a CEILING the nose never
+  passes (`RotatePitch::ceiling_guard`, `CEILING_APPROACH_S`, target `CEILING_MARGIN_DEG` under it;
+  `climb_manual` `pitch_lim`; EGKK 08R: 22.4 under 18, the loop's overshoot).
 - **The autopilot takes the climb being flown** (`autotakeoff::ClimbVs`, `vh_ind_fpm`): the 300 ft
   engage writes the climb the pitch was flying and every later command, the circuit's included
   (`circuit::ClimbCarry`), moves at `CLIMB_VS_SLEW_FPM_S`; a circuit takes its flaps from the
@@ -529,7 +531,8 @@ everything blackboxes to `logs/blackbox.jsonl` (kinds: `atc`, `autotaxi`, `autot
   (`DepartureMinimums`; EGKK D156J hunted 5,000/6,000 and 210/250 at 5,900, #153); the owners are
   plan, minimum, then the clearance's cap (`departure_target_ft`): a minimum above the clearance waits
   for the check-in, said (`minimum_capped`, `cleared_climb`); the VS wheel is written only in VS mode
-  (`vs_action`: an ALT HOLD closing on our dial is left). STAR windows (`nav::star_constraints`, `star_ident`,
+  (`vs_action`: an ALT HOLD closing on our dial is left). **The 250 below 10,000 cap, once begun,
+  holds** (`speedhold::AirspaceLimit`: lifted only at 10,300, both edges legal; `airspace_capped`). STAR windows (`nav::star_constraints`, `star_ident`,
   `destination/plan_rwy`) clamp the plan (`apply_arrival_constraints`); each target is capped so a
   later "at or below" stays reachable (`arrival_ceiling_ft`, `star_ceiling`; plan altitudes too,
   `profile_ceiling_ft`); speed limits are slowed for in time (`arrival_speed_cap`, `star_speed`).
