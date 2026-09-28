@@ -9739,3 +9739,23 @@ level in force, all or nothing. Blackbox `full_auto cruise_schedule`, `procedure
 `step_climb`. Fixture `bench/ofp/egkk-egbb-738.trimmed.json`. #80 was built earlier as `efecb12`
 (`circuit::authored_vertical`: the authored route's levels on the AP's dial where
 `ap_altitude_capture` is declared). Offline only.
+
+## 2026-09-28: the retard, the slow go-around, the held knob (issues #76, #77, #93); the hover's power budget (#84)
+
+#76: the flare retard started when the arrest brought the sink inside 185 fpm (15.8 ft in 1790589309,
+mid-float) and stopped when the sink it caused came back past 400. `FlarePower::step` now keys on
+height (`retard_below_ft`), time to the wheels (`retard_at_s`), speed (`retard_fast_kts`,
+`retard_slow_kts`) and a rate cap, never the sink. Replayed over today's 16 LEMG 13 approaches: mean
+268 to 238 fpm, worst 300 to 277. #77 (EDLP 24 SF50, 2026-09-24): a balk at 52 ft and 81 kt on idle
+asked 0 fpm and half flap (stall 74.5) and hit at -1,568 fpm; `go_around_vs_fpm` judges the speed 2 s
+ahead (climb within 7 kt of approach speed, level above the configuration's floor, below it a descent
+no steeper than the ground 10 s away) and `go_around_flap_due` keeps landing flap until the half flap
+flies; on the fitted plant it never stalls (lowest 75.7 kt, 30 ft). #93: `circuit::BugHold` and
+`autoland::bug_knob` set the knob once per leg/phase and correct past a deadband; recorded finals
+move it 21 times against 76.
+#84 (EDVW 1,298 ft heavy, 2026-09-23): lifted at 0.644 after a 16.5 s ramp from flat pitch, crept to
+9.5 ft in 16 s; no droop set-down on record. 30 recorded lift-offs track W/sigma (LSZS 5,605 ft 0.711 vs
+0.604 low down, the standard-day 1.18). The hover now budgets its lever by loading (pressure
+altitude, OAT, weight), measures the loading at lift-off, pre-lifts to just under the prediction,
+refuses a hover it cannot give on the wheels with its numbers, and gives up a lift that droops. On
+the plant: EDVW 16.6 s to lift and 33.3 s to 11 ft become 7.8 s and 15.9 s. Offline only.

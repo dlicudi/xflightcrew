@@ -683,6 +683,15 @@ everything blackboxes to `logs/blackbox.jsonl` (kinds: `atc`, `autotaxi`, `autot
   smooth air the prediction flies it and a near-level float never takes it forward. A gust and a
   strong elevator look alike for the seconds that matter (LEMG 13 2026-09-28: 422 fpm in gusts; a
   still-air hold through the 09-26 17:25 plant ballooned to 506).
+- **The flare retard is keyed on height, time to the wheels and speed, never on the sink the
+  arrest is removing** (`FlarePower`, `retard_below_ft`, `retard_at_s`, `retard_fast_kts`,
+  `retard_slow_kts`, `retard_max_per_s`; `power` `retard`; LEMG 13 2026-09-28).
+- **A slow, low go-around pitches for speed** (`go_around_vs_fpm`: level over the configuration's
+  floor, below it a descent no steeper than the ground 10 s away; `go_around_flap_due`): 0 fpm held
+  into a stall (EDLP 24 SF50, 2026-09-24).
+- **The heading knob is set, not rewritten** (`circuit::BugHold`, `autoland::bug_knob`,
+  `heading_set`): once per leg or phase, steering of 5 degrees or more at once, corrections past a
+  deadband; the short final and the flare still steer every tick.
 - **In the flare the column only comes BACK** (`FlarePitch::step` `ratchet`, `FLARE_PITCH_MAX`):
   forward column a few feet up is a nosewheel landing. A BALLOON eases toward neutral, never a push
   (`hold_flare`; above the band `balloon`). Gains per airframe (`flare_elevator:`,
@@ -710,8 +719,7 @@ down** (`taxi_in::shut_down_at_stand`: engines confirmed from `ENGN_running`, el
 spoken "taxi to parking" leaves the engines to the pilot.
 
 ### Still owed
-Issues labelled `owed` + `area:approach-landing` / `area:takeoff` / `area:full-auto` (retard #76,
-slow go-around #77, `ils_coupled` #81).
+Issues labelled `owed` + `area:approach-landing` / `area:takeoff` / `area:full-auto` (`ils_coupled` #81).
 
 ## Helicopters: the hover loop
 
@@ -730,7 +738,10 @@ physical drive.
   `DEPART_MAX_MPS`.
 - **Pedals are a yaw-RATE command with a heading hold**: above `PEDALS_ON_MPS` `HeadingHold` asks a
   RATE via `taxi_steer`, never damping on `R` (it rang until `PEDAL_FAULT_DPS` stood it down).
-- **The collective follows the power curve** (`level_collective`); a takeover starts at the curve.
+- **The collective follows the power curve at the hover's LOADING** (`level_collective_at`,
+  `PowerBudget`, `LoadingEstimate`: W/sigma corrected by the lever the rotor lifts at, `liftoff`;
+  `prelift`; a hover the lever cannot give is refused on the wheels or held in the cushion, with its
+  numbers; a lift that droops on the wheels is given up; EDVW 2026-09-23, #84). The collective follows the power curve (`level_collective`); a takeover starts at the curve.
   The trim is bounded to the curve: an unbounded integrator crashed one (ETHC 2026-09-23). The rotor
   guard caps it (`droop_ceiling`); a long droop low down is a set-down.
 - **In the air the AP is never simply turned off** (`hand_back`: cruise modes when fast, the hover
@@ -767,7 +778,7 @@ physical drive.
 - Words: "hover at N", "set it down", "hold position", "take off", "fly a circuit"; the AP's mode
   tools are refused while the loop flies (`hover::blocks`).
 
-Still owed: issues labelled `area:helicopter` (`owed`: hover taxi power #84;
+Still owed: issues labelled `area:helicopter` (`owed`: none;
 `unflown`: approach and gate #47, fast climb #48).
 
 ## The flight model: one state, read by everyone (in SHADOW)
