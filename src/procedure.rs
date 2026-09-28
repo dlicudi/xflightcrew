@@ -2708,6 +2708,8 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, plan: Pla
     // (`DepartureMinimums`), the minimums said as held under the clearance,
     // and the clearance's altitude while it was holding the target down.
     let mut minimums_state = DepartureMinimums::default();
+    // The 250 below 10,000 cap, once begun held through a level near the line.
+    let mut airspace = crate::tools::speedhold::AirspaceLimit::default();
     let mut said_min_capped: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut cap_holding: Option<f64> = None;
     // The VS wheel's last action logged (`vs_action`), so a change is one record.
@@ -3029,16 +3031,16 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, plan: Pla
             } else {
                 crate::aircraft::speed_floor_kts()
             };
-            let want = crate::aircraft::floored_target(
-                crate::tools::speedhold::airspace_limited(alt_ft, planned),
-                floor,
-            );
+            // With memory (`AirspaceLimit`): a level at or near 10,000 ft
+            // must not flip the cap on the altimeter's wander (#154).
+            let want = crate::aircraft::floored_target(airspace.limit(alt_ft, planned), floor);
             if crate::tools::speedhold::flight_target().is_some_and(|t| (t - want).abs() > 0.5) {
                 crate::blackbox::record(
                     "procedure",
                     serde_json::json!({
                         "event": "speed_limit", "alt_ft": alt_ft,
                         "planned": planned, "target": want,
+                        "airspace_capped": airspace.capped(),
                     }),
                 );
                 crate::tools::speedhold::arm_flight_with_floor(base_url.clone(), voice.clone(), want, floor);

@@ -193,6 +193,52 @@ pub fn airspace_limited(alt_ft: f64, wanted: f64) -> f64 {
     }
 }
 
+/// How far above [`SPEED_LIMIT_ALT_FT`] a capped aircraft must climb before
+/// the cap lifts. Once the cap has begun it holds through a level at or
+/// near 10,000 ft (an altimeter wandering 50 ft either side of the line);
+/// once lifted it comes back only below the line itself. Both edges are on
+/// the legal side: the cap is never lifted below 10,000 nor missing below it.
+pub const SPEED_LIMIT_LIFT_BAND_FT: f64 = 300.0;
+
+/// [`airspace_limited`] with memory, for a loop that applies the rule every
+/// tick. The stateless test flips at the line: a plan level at exactly
+/// 10,000 ft, or a level-off a few feet under it, would hunt the speed target
+/// 250/300 on every wander of the altimeter, the same shape as D156J's 6,000
+/// ft minimum (EGKK LAM5P, 2026-09-28, #153; #154). One rule for the loop:
+/// capped once below the line, lifted only past the band above it.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct AirspaceLimit {
+    /// `None` until the first finite altitude.
+    capped: Option<bool>,
+}
+
+impl AirspaceLimit {
+    /// Advance the latch on `alt_ft` (indicated) and return `wanted`, capped
+    /// while the latch holds. A failed read (non-finite) is no measurement:
+    /// the latch keeps what it knew, and with nothing known the stateless
+    /// rule's answer (no invented cap) stands.
+    pub fn limit(&mut self, alt_ft: f64, wanted: f64) -> f64 {
+        if alt_ft.is_finite() {
+            let capped = match self.capped {
+                None => alt_ft < SPEED_LIMIT_ALT_FT,
+                Some(true) => alt_ft < SPEED_LIMIT_ALT_FT + SPEED_LIMIT_LIFT_BAND_FT,
+                Some(false) => alt_ft < SPEED_LIMIT_ALT_FT,
+            };
+            self.capped = Some(capped);
+        }
+        if self.capped == Some(true) {
+            wanted.min(BELOW_10K_LIMIT_KTS)
+        } else {
+            wanted
+        }
+    }
+
+    /// Whether the cap currently holds (`None` before any measurement).
+    pub fn capped(&self) -> Option<bool> {
+        self.capped
+    }
+}
+
 /// Arm (or retarget) the FLIGHT speed-hold governor from code — the autoflight
 /// cruise-power hold. Same Flight-mode arm the `hold_speed` tool does: sets the
 /// target and, if the governor isn't already running, starts it on its own
@@ -1437,6 +1483,96 @@ mod tests {
         assert_eq!(airspace_limited(1_000.0, 110.0), 110.0);
         // A failed altitude read is no measurement: do not invent a cap.
         assert_eq!(airspace_limited(f64::NAN, 255.0), 255.0);
+    }
+
+    /// An altimeter 50 ft either side of `level`, the wander of a level
+    /// held by an autopilot: deterministic, both extremes reached.
+    fn wander(level: f64, n: usize) -> impl Iterator<Item = f64> {
+        (0..n).map(move |i| level + 50.0 * ((i as f64) * 1.7).sin())
+    }
+
+    fn changes(v: &[f64]) -> usize {
+        v.windows(2).filter(|w| (w[0] - w[1]).abs() > 0.5).count()
+    }
+
+    /// A climb that levels AT 10,000 ft (a plan level on the line) with the
+    /// altimeter wandering +-50 ft: the stateless rule flips the target
+    /// 250/300 on every wander; the latch holds the cap, and a level just
+    /// past the lift band changes it once, never back. #154, the shape of
+    /// D156J's minimum (#153).
+    #[test]
+    fn a_level_at_ten_thousand_never_flips_the_cap() {
+        let climb: Vec<f64> = (0..200)
+            .map(|i| 8_000.0 + 10.0 * i as f64)
+            .chain(wander(10_000.0, 600))
+            .collect();
+        let old: Vec<f64> = climb.iter().map(|a| airspace_limited(*a, 300.0)).collect();
+        assert!(changes(&old) > 50, "the stateless rule hunts: {}", changes(&old));
+        let mut latch = AirspaceLimit::default();
+        let new: Vec<f64> = climb.iter().map(|a| latch.limit(*a, 300.0)).collect();
+        assert_eq!(changes(&new), 0, "capped from the climb, held at the level");
+        assert!(new.iter().all(|k| *k == 250.0));
+
+        // Levelled on the lift band's edge: one change, never back.
+        let mut latch = AirspaceLimit::default();
+        let over: Vec<f64> = (0..230)
+            .map(|i| 8_000.0 + 10.0 * i as f64)
+            .chain(wander(10_300.0, 600))
+            .map(|a| latch.limit(a, 300.0))
+            .collect();
+        assert_eq!(changes(&over), 1, "lifted once at the band");
+        assert_eq!(*over.last().unwrap(), 300.0);
+    }
+
+    /// A descent from the cruise through 10,000 ft with the same +-50 ft
+    /// noise, levelling on the line, and one carried on down: the cap comes
+    /// on once, at the first reading under 10,000 (never above, never
+    /// late), and never alternates. Then back up through it: lifted once.
+    #[test]
+    fn a_descent_through_ten_thousand_caps_once() {
+        let noise = |i: usize| 50.0 * ((i as f64) * 1.7).sin();
+        let mut latch = AirspaceLimit::default();
+        let alts: Vec<f64> = (0..200)
+            .map(|i| 12_000.0 - 10.0 * i as f64)
+            .chain(wander(10_000.0, 600))
+            .collect();
+        let got: Vec<f64> = alts.iter().map(|a| latch.limit(*a, 300.0)).collect();
+        assert_eq!(changes(&got), 1, "capped once at the first reading under the line");
+        let first = got.iter().position(|k| *k == 250.0).unwrap();
+        assert!(alts[first] < SPEED_LIMIT_ALT_FT);
+        assert!(alts[..first].iter().all(|a| *a >= SPEED_LIMIT_ALT_FT));
+
+        let mut latch = AirspaceLimit::default();
+        let alts: Vec<f64> = (0..700)
+            .map(|i| 12_000.0 - 10.0 * i as f64 + noise(i))
+            .collect();
+        let got: Vec<f64> = alts.iter().map(|a| latch.limit(*a, 300.0)).collect();
+        assert_eq!(changes(&got), 1);
+        let first = got.iter().position(|k| *k == 250.0).unwrap();
+        assert!(alts[..first].iter().all(|a| *a >= SPEED_LIMIT_ALT_FT));
+
+        let alts: Vec<f64> = (0..700)
+            .map(|i| 5_000.0 + 10.0 * i as f64 + noise(i))
+            .collect();
+        let got: Vec<f64> = alts.iter().map(|a| latch.limit(*a, 300.0)).collect();
+        assert_eq!(changes(&got), 1);
+        let lifted = got.iter().position(|k| *k == 300.0).unwrap();
+        assert!(alts[lifted] >= SPEED_LIMIT_ALT_FT + SPEED_LIMIT_LIFT_BAND_FT);
+    }
+
+    /// The latch's edges: seeded by the first reading on the stateless rule,
+    /// a failed read keeps what it knew, inert below 250 kt.
+    #[test]
+    fn the_airspace_latch_seeds_and_survives_a_failed_read() {
+        let mut l = AirspaceLimit::default();
+        assert_eq!(l.limit(f64::NAN, 300.0), 300.0, "nothing known: no invented cap");
+        assert_eq!(l.capped(), None);
+        assert_eq!(l.limit(10_100.0, 300.0), 300.0, "seeded above the line: free");
+        assert_eq!(l.limit(f64::NAN, 300.0), 300.0, "a lost read keeps it");
+        assert_eq!(l.limit(9_990.0, 300.0), 250.0);
+        assert_eq!(l.limit(f64::NAN, 300.0), 250.0, "and keeps the cap too");
+        assert_eq!(l.limit(10_200.0, 300.0), 250.0, "inside the band: still capped");
+        assert_eq!(l.limit(9_000.0, 110.0), 110.0, "inert on a piston");
     }
     use super::*;
 
