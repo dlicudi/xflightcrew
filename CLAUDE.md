@@ -534,6 +534,9 @@ everything blackboxes to `logs/blackbox.jsonl` (kinds: `atc`, `autotaxi`, `autot
 - **Every planned arrival hands its runway down** (`EndAction::Approach { rwy_id }` to
   `run_autoland`); the self-pick (`autoland::self_pick`, `landing_score`, `self_pick_min_length_m`,
   METAR tailwind, `DESTINATION_BONUS_NM`) is the emergency path.
+- **A new flight takes its clearances with it** (`party_line::retire_for_new_flight`, called by
+  `setup_approach` before the arm; the old station publishes nothing until the new one is installed,
+  `NEW_FLIGHT_PENDING`; a refused stated runway is blackboxed `stated_runway_refused`; LEMG 2026-09-28).
 - **The tower's clearance outranks the plan** (`runway_from_clearance`), watched THROUGH the
   approach since its answer comes after the arm: owed readbacks (`party_line::readback_owed`), a
   re-arm on another end (`clearance_switch`, never `going_around`) moves the ONE arrival runway
@@ -571,7 +574,10 @@ everything blackboxes to `logs/blackbox.jsonl` (kinds: `atc`, `autotaxi`, `autot
   inbound past the threshold is OVER (`reversal::overflown`); `pattern_ias`. **The stabilised gate
   is about TIME** (`unstabilised_at_gate`, `reversal::predicted_residual_m`), not position.
 - The receding guard measures from the furthest legitimate point (`recede_ref_nm`); flaps never cycle
-  on a placard (`flap_held_within_limits`); a give-up hands the SPEED to the governor
+  on a placard (`flap_held_within_limits`); **an approach never takes away the flap the wing flies
+  on** (`flap_kept_flying`, `last_flap` read at the arm) and **a climb is flown on thrust**
+  (`climb_power_floor`); a pattern's inbound leg the glidepath reaches is the approach
+  (`reversal::path_joined`); a give-up hands the SPEED to the governor
   (`hand_back_speed_kts`).
 - **Autoland core**: the pursuit aim keeps full lead (`pursuit_aim_nm`); a roundout band
   (`ROUNDOUT_MULT`, `ROUNDOUT_VS_FPM`) before the flare (level-hold over the runway is the bug); a
@@ -800,7 +806,7 @@ confirms it closes it (`fixes #N` in the commit). Known gaps are `owed` issues.
 - `xvl debrief` (`src/debrief.rs`) after every flight, before diagnosing by hand.
 - **A sortie is one file with a verdict** (`full_auto::SortieGuard`, `sortie`,
   `logs/sorties/<id>.jsonl`; `src/scorecard.rs` `stage_result`, `sortie_result`: PASS with no failed
-  stage, no give-up and UNATTENDED: no `intervention` and no `tool` record, the pilot's command to
+  stage, no give-up, no crash inside it, at least one stage scored, and UNATTENDED: no `intervention` and no `tool` record, the pilot's command to
   the crew), grouped by mission in `xvl debrief`. `state` logs `in` and `ctl`; speech is `said`. A
   complaint not yet a scorecard number is not yet testable.
 - **A verdict that is wrong hides the real failures** (2026-09-26): the crew's own flare and
@@ -814,7 +820,11 @@ confirms it closes it (`fixes #N` in the commit). Known gaps are `owed` issues.
 - **A night of landings is one command** (`xvl sortie bench/sorties/<spec>.yaml --repeat N`,
   `src/sortie_runner.rs`): set up, type the mission, the `sortie_result` is the row
   (`logs/sorties/run-<stamp>.md`); an approach setup is its own sortie (`setup::hold_sortie_while`).
-  It refuses over a flying loop or replay; Ctrl-C, a crash or the deadline types "my controls".
+  It refuses over a flying loop or replay; a crash counts only once the wreck flag has read clear
+  since the case's line (`CRASH_CLEAR_S`), and a wreck that outlives the setup stops the run.
+  **An airborne aircraft is never handed to nobody** (`hand_back`): on the ground a crash or deadline
+  types "my controls"; in the air the loops keep it until the next setup, and a run that ends in the
+  air pauses X-Plane (`secure_at_end`); Ctrl-C pauses first.
 - A law that misbehaves in the air while its test passes: suspect the plant. A first-order lag
   cannot ring; fly second-order plants through the real transport delay.
 

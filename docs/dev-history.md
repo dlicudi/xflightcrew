@@ -9426,3 +9426,40 @@ crosswind no more than the swap margin worse than the best end's, or inside the 
 still only uncommitted and with no arrival stream on another end. Test
 `the_lemg_final_for_one_three_keeps_its_runway_in_a_calm`. Next sortie: a "final runway X" call with
 a light tailwind is cleared for X with no "negative". Offline only.
+
+## 2026-09-28: the first night of sortie-runner landings at LEMG (issues #130, #131, #132)
+
+Runner `bench/sorties/lemg-737.yaml --repeat 5` on build 5f07f76: 10 nm finals #1 to #3 PASS (sink
+281, 279, 362 fpm; rollout 3.1 to 3.6 m), 5 nm #4 PASS (278 fpm). Then:
+
+#130, a crash: every sim-started 10 nm final gave autoland flaps 0.25 at idle, and the flap
+schedule's first tick raised them (`last_flap` started `None`) at a 58/146 kt airspeed read (clean
+stall 139 kt) with the lever at 0.10 while +2,000 fpm sat on the dial. 1790583434 bottomed at 200 ft
+AGL; 1790583663 reached 25 ft radio. 1790584266 armed on 12 from the previous case's clearance 1.3 s
+after the reposition (`approach_follow_up` armed before `arm_new_flight`), turned across rising ground
+3.6 km beside 12's centreline and hit at -3,353 fpm, autoland Intercept and climbing throughout (the
+"into the flare" was flight.rs's label). Fixes: `station::retire_for_new_flight` via
+`party_line::retire_for_new_flight` before the arm, `NEW_FLIGHT_PENDING` until the new station
+installs; autoland reads `last_flap` at the arm and `flap_kept_flying` raises a setting only at the
+cleaner setting's `retract_above_kts` or speed floor; `climb_power_floor` flies a commanded climb in
+Intercept at no less than the approach thrust floor. Still open: the AP engaging 7 to 10 s late after
+a sim setup (the VS watchdog's re-press recovers it).
+
+#131: the 10-minute reversal to 12 was set off by the dive (a zoom to 512 ft above the path at 7.6 nm
+put the approach point behind); its inbound leg held the 2,921 ft platform through the glidepath at
+8.9 nm and overflew 12 at 2,900 ft (only a Final inside 5.5 nm within 500 ft ends it).
+`reversal::path_joined` ends the leg on the glidepath (`reversal_done` `why: path_joined`). The
+tower's "negative, runway one two" into 060/6 was the traffic-picture stream (Ryanair on 12), not the
+wind; a refusal is now blackboxed `atc stated_runway_refused`.
+
+#132, the runner: after the crash `has_crashed` stayed up and the three 5 nm cases each failed in 2 s;
+the scorer wrote the crashed sortie `pass: true, stages: 0` (the impact was logged 0.1 s after the
+runner's "my controls" ended it); an earlier deadline typed "my controls" at 1,600 ft on a 5 nm
+final. The scorer now fails a sortie with a crash inside it or no stage scored (`crashed` on
+`sortie_result`); the runner counts a crash only once the flag has read clear since the case began,
+stops the run on a wreck older than `CRASH_CLEAR_S` (150 s), and leaves an airborne aircraft to its
+loops at a deadline (`hand_back`): the next setup replaces the flight right after "my controls", a
+run that ends in the air pauses the sim (`secure_at_end`, also Ctrl-C).
+
+Also seen, filed: the circuit handed to Departure on the crosswind leg; the runway-start case set up
+on 12 with 1,376 m left and then asked for taxi. Offline only for the fixes.
