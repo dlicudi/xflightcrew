@@ -1400,6 +1400,108 @@ async fn write_bug(xp: &dyn crate::xplane::XPlane, bug_mag: f64) {
     }
 }
 
+/// How a loop's heading bug is SET, the way a pilot sets it (issue #93):
+/// once per leg or phase (`key`), a turn led through at once (a move of
+/// [`BUG_STEER_DEG`] or more is steering: the lead through a turn, a new
+/// intercept), and otherwise a correction only when it has grown past the
+/// loop's `deadband_deg` and not more often than every `every_s`. The laws
+/// keep computing their fine bug every tick; the KNOB moves only when this
+/// says so. `procedure::HeadingHold` is the follower's version (a whole
+/// degree per leg, 5 degrees, 30 s); these loops fly patterns and finals, so
+/// each passes its own deadband. LIPR 2026-09-26: "a human pilot would never
+/// use the heading bug like that"; LEMG 2026-09-28: the circuit's downwind
+/// knob stepped 10 to 24 times in two minutes on a one-degree crab, and
+/// autoland's final 40 to 80 times in 100 s in tenths. Pure.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct BugHold {
+    key: Option<u32>,
+    set: Option<f64>,
+    last_write_s: f64,
+}
+
+/// A bug move this big is steering, not a correction: written at once.
+pub const BUG_STEER_DEG: f64 = 5.0;
+
+/// A loop's correction deadband: the smallest correction worth a hand on
+/// the knob, and how often.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct BugDeadband {
+    pub deg: f64,
+    pub every_s: f64,
+}
+
+/// The circuit's legs: a two-degree correction at most every ten seconds.
+pub const CIRCUIT_LEG_DEADBAND: BugDeadband = BugDeadband { deg: 2.0, every_s: 10.0 };
+/// The circuit's final, closing the centreline for the handover: a degree
+/// at most every three seconds.
+pub const CIRCUIT_FINAL_DEADBAND: BugDeadband = BugDeadband { deg: 1.0, every_s: 3.0 };
+
+impl BugHold {
+    /// The bug to set now (magnetic), or `None` to leave the knob alone.
+    pub fn decide(&mut self, key: u32, want_mag: f64, now_s: f64, db: BugDeadband) -> Option<f64> {
+        if !want_mag.is_finite() {
+            return None;
+        }
+        let want = want_mag.rem_euclid(360.0);
+        let write = match (self.key == Some(key), self.set) {
+            (true, Some(set)) => {
+                let off = (((want - set) + 540.0).rem_euclid(360.0) - 180.0).abs();
+                off >= BUG_STEER_DEG
+                    || (off >= db.deg && now_s - self.last_write_s >= db.every_s)
+            }
+            _ => true,
+        };
+        if !write {
+            return None;
+        }
+        self.key = Some(key);
+        self.set = Some(want);
+        self.last_write_s = now_s;
+        Some(want)
+    }
+
+    /// What the knob was last set to (the laws' `current_bug`), if anything.
+    pub fn set(&self) -> Option<f64> {
+        self.set
+    }
+
+    /// The knob read back after a write (a knob that only stepped part of
+    /// the way, or a failed write: `None` forgets it so the next tick sets
+    /// it afresh).
+    pub fn took(&mut self, read_mag: Option<f64>) {
+        match read_mag.filter(|v| v.is_finite()) {
+            Some(v) => self.set = Some(v.rem_euclid(360.0)),
+            None => {
+                self.key = None;
+                self.set = None;
+            }
+        }
+    }
+
+    /// Forget everything: the next decision writes.
+    pub fn reset(&mut self) {
+        *self = Self::default();
+    }
+}
+
+/// The laws' bug through the [`BugHold`]: the knob is set only when the hold
+/// says so, and the laws carry on from what the knob holds.
+async fn hold_bug(
+    xp: &dyn crate::xplane::XPlane,
+    hold: &mut BugHold,
+    key: u32,
+    bug_mag: &mut f64,
+    now_s: f64,
+    db: BugDeadband,
+) {
+    if let Some(b) = hold.decide(key, *bug_mag, now_s, db) {
+        write_bug(xp, b).await;
+    }
+    if let Some(s) = hold.set() {
+        *bug_mag = s;
+    }
+}
+
 /// The last whole degree written, as f64 bits (`u64::MAX`: none).
 static LAST_BUG: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
 
@@ -2010,6 +2112,7 @@ async fn fly_authored_route(
     let mut prev_ias: Option<(f64, std::time::Instant)> = None;
     let mut ias_trend = 0.0_f64;
     let t_start = std::time::Instant::now();
+    let mut bug_hold = BugHold::default();
     // Picked from the first good position read, not assumed to be 0.
     let mut wpt_idx: Option<usize> = None;
     let mut closure: Option<Closure> = None;
@@ -2089,7 +2192,17 @@ async fn fly_authored_route(
             ),
             None => slew_bug(bug_mag, want_mag, BUG_SLEW_PER_TICK),
         };
-        write_bug(&xp, bug_mag).await;
+        // Set, not rewritten: per waypoint, a correction past the deadband
+        // (`BugHold`, issue #93).
+        hold_bug(
+            &xp,
+            &mut bug_hold,
+            idx as u32,
+            &mut bug_mag,
+            t_start.elapsed().as_secs_f64(),
+            CIRCUIT_LEG_DEADBAND,
+        )
+        .await;
         if !hdg_on {
             let _ = xp.run_command(CMD_SERVOS_ON).await;
             let _ = xp.run_command(CMD_HDG_MODE).await;
@@ -2195,7 +2308,9 @@ async fn fly_authored_route(
             );
             if let Some(psi) = psi_r {
                 bug_mag = true_to_mag(psi, mag_var);
+                bug_hold.reset();
                 write_bug(&xp, bug_mag).await;
+                bug_hold.decide(idx as u32, bug_mag, t_start.elapsed().as_secs_f64(), CIRCUIT_LEG_DEADBAND);
             }
         }
     }
@@ -2640,6 +2755,9 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, p: Params
         BUG_SLEW_PER_TICK,
     );
     write_bug(&xp, bug_mag).await;
+    // The pattern's knob from here on (`BugHold`, issue #93).
+    let mut bug_hold = BugHold::default();
+    let loop_t0 = std::time::Instant::now();
     // Forward terrain guard cadence + throttle; a fired guard raises the
     // vertical target floor for a while instead of pressing dead buttons.
     let mut tick: u32 = 0;
@@ -2923,7 +3041,21 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, p: Params
             ),
             _ => slew_bug(bug_mag, target_mag, BUG_SLEW_PER_TICK),
         };
-        write_bug(&xp, bug_mag).await;
+        // Set, not rewritten: per leg, a correction past the leg's deadband,
+        // the final's finer (`BugHold`, issue #93).
+        hold_bug(
+            &xp,
+            &mut bug_hold,
+            leg as u32,
+            &mut bug_mag,
+            loop_t0.elapsed().as_secs_f64(),
+            if leg == Leg::Final {
+                CIRCUIT_FINAL_DEADBAND
+            } else {
+                CIRCUIT_LEG_DEADBAND
+            },
+        )
+        .await;
         // The lateral mode must actually be ON for the bug to mean anything —
         // re-engage like the takeoff's VS guard, never press blind.
         if !hdg_on {
@@ -5227,6 +5359,19 @@ mod issue_147_circuit_tests {
     /// landing limit. Neither: the circuit as it flew (3,250 m capture, 300 m
     /// and 12 degrees).
     fn fly_circuit(on_bank: bool, on_line: bool, wind_from: f64, wind_mps: f64) -> (Handoff, Jet) {
+        let (h, jet, _) = fly_circuit_knob(on_bank, on_line, wind_from, wind_mps, false);
+        (h, jet)
+    }
+
+    /// ...with the knob set as today's loop sets it (`BugHold`) when `held`;
+    /// the third answer is how many times the knob moved (a whole degree).
+    fn fly_circuit_knob(
+        on_bank: bool,
+        on_line: bool,
+        wind_from: f64,
+        wind_mps: f64,
+        held: bool,
+    ) -> (Handoff, Jet, u32) {
         let rwy = lemg("13");
         let mut geom = Geometry::for_radii(2500.0, 2500.0);
         assert_eq!(
@@ -5240,7 +5385,9 @@ mod issue_147_circuit_tests {
         let mut leg = Leg::Base;
         let mut leg_t = 0.0;
         let mut watch = BankWatch::default();
-        let mut bug = 311.8;
+        let mut bug: f64 = 311.8;
+        let mut hold = BugHold::default();
+        let (mut moves, mut knob) = (0u32, bug.round());
         let limit = on_line.then(|| landing_xtk_limit_m(Some(LEMG_WIDTH_M)));
         let dt = 0.6;
         let mut t = 0.0;
@@ -5261,6 +5408,7 @@ mod issue_147_circuit_tests {
                         capture_m: geom.final_capture_m,
                     },
                     jet,
+                    moves,
                 );
             }
             let crab = ((jet.psi - trk + 540.0).rem_euclid(360.0)) - 180.0;
@@ -5278,7 +5426,22 @@ mod issue_147_circuit_tests {
                 }
             }
             bug = bug_toward(bug, leg_hdg + crab, jet.psi, jet.phi, BUG_SLEW_PER_TICK);
-            jet.step(bug, dt);
+            if held {
+                let db = if leg == Leg::Final {
+                    CIRCUIT_FINAL_DEADBAND
+                } else {
+                    CIRCUIT_LEG_DEADBAND
+                };
+                hold.decide(leg as u32, bug, t, db);
+                bug = hold.set().unwrap_or(bug);
+            }
+            // The knob is a whole degree (`write_bug`).
+            let whole = bug.round().rem_euclid(360.0);
+            if whole != knob {
+                moves += 1;
+                knob = whole;
+            }
+            jet.step(whole, dt);
             if pattern_advance(leg, a_m, x_m, &geom, rwy.length_m, true) {
                 if let Some(n) = next_leg(leg) {
                     leg = n;
@@ -5391,6 +5554,65 @@ mod issue_147_circuit_tests {
         assert!(f.worst_short_bank_deg < 5.0, "{f:?}");
     }
 
+
+    /// Issue #93: the knob set as a pilot sets it, per leg with a deadband,
+    /// hands over on the line exactly as the every-tick knob did, in every
+    /// wind, with the knob moved far fewer times (base and final from the
+    /// recorded base-leg start: 12 to 17 moves against 31 to 43).
+    #[test]
+    fn the_held_knob_hands_over_on_the_line_and_moves_less() {
+        let limit = landing_xtk_limit_m(Some(LEMG_WIDTH_M));
+        for (from, mps) in [(0.0, 0.0), (106.0, 6.0), (106.0, 9.0), (200.0, 8.0), (40.0, 7.0)] {
+            let (free, _, free_moves) = fly_circuit_knob(true, true, from, mps, false);
+            let (h, mut jet, moves) = fly_circuit_knob(true, true, from, mps, true);
+            assert!(
+                h.x_m.abs() <= 3.0 * limit && h.residual_m <= limit && h.trk_err.abs() <= 5.0,
+                "wind {from}/{mps}: {h:?}"
+            );
+            let f = fly_final(
+                &mut jet,
+                &mut FinalLoop::new(Some(LEMG_WIDTH_M), 3.0),
+                &lemg("13"),
+                0.35,
+            );
+            assert!(f.balk.is_none(), "wind {from}/{mps}: {f:?}");
+            assert!(
+                moves * 2 <= free_moves,
+                "wind {from}/{mps}: {moves} moves against {free_moves} ({free:?})"
+            );
+        }
+    }
+
+    /// The hold itself: a new leg sets at once, a turn's lead is steering
+    /// and goes at once, a small correction waits for its deadband and its
+    /// interval, a failed write forgets.
+    #[test]
+    fn the_bug_is_set_once_per_leg_and_corrected_rarely() {
+        let db = CIRCUIT_LEG_DEADBAND;
+        let mut h = BugHold::default();
+        assert_eq!(h.decide(2, 310.4, 0.0, db), Some(310.4));
+        // Crab dither: nothing.
+        for (i, w) in [311.2, 309.6, 311.9, 309.1].iter().enumerate() {
+            assert_eq!(h.decide(2, *w, 1.0 + i as f64, db), None, "{w}");
+        }
+        // Two degrees off, but too soon.
+        assert_eq!(h.decide(2, 312.6, 5.0, db), None);
+        // ...and after the interval, once.
+        assert_eq!(h.decide(2, 312.6, 11.0, db), Some(312.6));
+        assert_eq!(h.decide(2, 312.9, 12.0, db), None);
+        // A turn's lead: five degrees or more is steering, at once.
+        assert_eq!(h.decide(2, 318.0, 12.5, db), Some(318.0));
+        // Across north, the short way round counts.
+        let mut n = BugHold::default();
+        n.decide(1, 359.5, 0.0, db);
+        assert_eq!(n.decide(1, 0.5, 1.0, db), None);
+        // A new leg: at once.
+        assert_eq!(h.decide(3, 220.0, 12.6, db), Some(220.0));
+        // A failed write forgets: the next tick sets it.
+        h.took(None);
+        assert_eq!(h.decide(3, 220.0, 12.7, db), Some(220.0));
+        assert_eq!(h.decide(3, f64::NAN, 13.0, db), None);
+    }
     /// Not tuned to one wind: calm, the recorded one, a stronger one from the
     /// other side of the final.
     #[test]
