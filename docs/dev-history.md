@@ -9413,3 +9413,16 @@ Tests `the_egkk_runway_start_backtracks_on_26l`, `a_runway_start_departs_from_th
 `a_climb_above_the_transition_altitude_checks_in_with_a_flight_level`; `real_install_transition_levels`
 (ignored). Next runway start: blackbox `full_auto` `runway_start`, `request_backtrack`, `atc`
 `RequestBacktrack` Parked>LinedUp, `backtracked`, no `request_taxi`. Offline only.
+
+## 2026-09-28: an arrival's stated runway stands in a calm (issue #129)
+
+Found by the first sortie-runner case, 1790580676-approach: 737 on a 10 nm final for LEMG 13, wind
+350/3. "Ten mile final runway one three" earned "negative, runway three one ... cleared to land" (t
+1790580681.3) and autoland turned for 31 from 10 nm. 13's -2.3 kt trailed 31's +2.3 kt by 4.7 kt,
+over the 3 kt swap margin, in a wind the same pick calls calm (< 5 kt). `station::stated_runway_stands`:
+a stated runway stands in calm (`CALM_WIND_KTS`, 5 kt, now shared by the pick, the stated runway and
+the ATIS), else with a tailwind within `STATED_RUNWAY_TAILWIND_KTS` (5 kt, the PANS-ATM figure) on a
+crosswind no more than the swap margin worse than the best end's, or inside the old 3 kt margin;
+still only uncommitted and with no arrival stream on another end. Test
+`the_lemg_final_for_one_three_keeps_its_runway_in_a_calm`. Next sortie: a "final runway X" call with
+a light tailwind is cleared for X with no "negative". Offline only.

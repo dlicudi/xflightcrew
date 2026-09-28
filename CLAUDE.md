@@ -260,7 +260,7 @@ Config: `XCOPILOT_ATC_AIRPORT` / `_VOICE` / `_RATE` / `_REGION`.
   levels above the flight's transition altitude (`departure_check_in_above`).
 - Runway in use: calm wind follows the arrival stream (`arrival_end`); FROZEN while a departure or
   arrival is committed, an IFR clearance included (`ifr_runway`), with wind hysteresis (parallels
-  flip-flop invisibly); an arrival's STATED runway stands inside the margin (`note_stated_runway`).
+  flip-flop invisibly); an arrival's STATED runway stands when the wind does not argue: in calm, or within a 5 kt tailwind on no worse a crosswind (`stated_runway_stands`, `note_stated_runway`; LEMG 13, 2026-09-28).
   **The wind picks a direction, the longest parallel the strip** (`best_runway_for_wind`); a
   parallel under 760 m away is its main twin (`close_parallel_main`; EGKK 26R, 2026-09-27).
   LinedUp and conditional line-up.
