@@ -3653,6 +3653,31 @@ mod tests {
                 "a gate on the COMMANDED rate: only a commanded climb stows a brake already out",
             ),
             (
+                "procedure",
+                "DRAG_SLOW_KTS",
+                "MARGIN: under the speed owed, which is the airframe's (or its plan's)",
+            ),
+            (
+                "procedure",
+                "IDLE_DESCENT_ON_FPM",
+                "a gate on the rate the vertical law WANTS, which is the airframe's descent_fpm",
+            ),
+            (
+                "procedure",
+                "IDLE_DESCENT_OFF_FPM",
+                "a gate on the rate the vertical law WANTS, which is the airframe's descent_fpm",
+            ),
+            (
+                "procedure",
+                "SPEED_PROTECT_FROM_KTS",
+                "MARGIN: over the speed owed, which is the airframe's (or its plan's)",
+            ),
+            (
+                "procedure",
+                "SPEED_PROTECT_SPAN_KTS",
+                "MARGIN: over the speed owed; the descent it scales is the airframe's descent_fpm",
+            ),
+            (
                 "circuit",
                 "GO_AROUND_PLACARD_MARGIN_KTS",
                 "MARGIN: under the airframe's own flap placard, cleaning up a go-around",
