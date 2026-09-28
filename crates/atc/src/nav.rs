@@ -366,6 +366,28 @@ pub struct AirportInfo {
     /// Communication frequencies, in file order (empty for untowered fields).
     #[allow(dead_code)] // atc-binary tree only (yet)
     pub freqs: Vec<AtcFreq>,
+    /// The field's transition LEVEL in feet (apt.dat `1302 transition_level`,
+    /// "7000" at EGKK, "18000" at KJFK; a written "FL070" or a bare "070"
+    /// is hundreds). At or above it a controller says a flight level; below
+    /// it an altitude in feet with the QNH. `None` = the file says nothing,
+    /// and every altitude stays in feet as before.
+    pub transition_level_ft: Option<f64>,
+}
+
+/// A `1302 transition_level` value in feet: "7000" as written, "FL070" and a
+/// bare "070" (under 1,000) as flight levels. `None` for anything else ("By
+/// ATC" is in the file) and for zero.
+pub fn parse_transition_level(v: &str) -> Option<f64> {
+    let v = v.trim();
+    let (fl, digits) = match v.get(..2) {
+        Some(p) if p.eq_ignore_ascii_case("FL") => (true, &v[2..]),
+        _ => (false, v),
+    };
+    let n: f64 = digits.parse().ok()?;
+    if n <= 0.0 {
+        return None;
+    }
+    Some(if fl || n < 1000.0 { n * 100.0 } else { n })
 }
 
 impl AirportInfo {
@@ -452,6 +474,7 @@ pub fn find_airport(path: &str, icao: &str) -> Result<Option<AirportInfo>> {
     let mut name = String::new();
     let mut in_airport = false;
     let mut elev_ft = 0.0_f64;
+    let mut transition_level_ft = None;
     // Reused byte buffer + a cheap prefix test before any splitting: the file is
     // ~400 MB and 13M lines, and a String-per-line scan is unusable in a debug
     // build. Only `1 `/`16 `/`17 ` (headers), `100 ` (runways), and the comm
@@ -489,6 +512,11 @@ pub fn find_airport(path: &str, icao: &str) -> Result<Option<AirportInfo>> {
                     runways.push(r);
                 }
             }
+            Some("1302") if in_airport => {
+                if f.next() == Some("transition_level") {
+                    transition_level_ft = f.next().and_then(parse_transition_level);
+                }
+            }
             Some(code) if in_airport => {
                 if let Some(fr) = parse_comm_row(code, f) {
                     freqs.push(fr);
@@ -508,6 +536,7 @@ pub fn find_airport(path: &str, icao: &str) -> Result<Option<AirportInfo>> {
         elev_ft,
         runways,
         freqs,
+        transition_level_ft,
     }))
 }
 
@@ -587,6 +616,7 @@ pub fn scan_airports(path: &str, mut f: impl FnMut(&str, AirportInfo)) -> Result
                             elev_ft: elev.unwrap_or(0.0),
                             runways: Vec::new(),
                             freqs: Vec::new(),
+                            transition_level_ft: None,
                         },
                     ));
                 }
@@ -595,6 +625,13 @@ pub fn scan_airports(path: &str, mut f: impl FnMut(&str, AirportInfo)) -> Result
                 if let Some((_, apt)) = cur.as_mut() {
                     if let Some(r) = parse_runway_row(fields) {
                         apt.runways.push(r);
+                    }
+                }
+            }
+            Some("1302") => {
+                if let Some((_, apt)) = cur.as_mut() {
+                    if fields.next() == Some("transition_level") {
+                        apt.transition_level_ft = fields.next().and_then(parse_transition_level);
                     }
                 }
             }
@@ -5491,6 +5528,23 @@ STAR:030,6,ALWYS3,RW28B,ARRTU,K2,P,C,E   , ,   ,TF, , , , , ,      ,    ,    ,  
     /// 26L is a Mike departure, and the taxi from where the rejected 737
     /// stopped (1790525500, 51.147885 N 0.192010 W, facing 261) reaches 26L's
     /// holding point. `cargo test -p atc -- --ignored real_install_egkk --nocapture`
+    /// The transition levels the tower speaks flight levels from (issue
+    /// #97), read from the real apt.dat: EGKK 7,000, EGBB 7,500, LEBL 8,000,
+    /// KJFK 18,000. `cargo test -p atc -- --ignored real_install_transition_levels`
+    #[test]
+    #[ignore] // needs the real X-Plane install; run with --ignored
+    fn real_install_transition_levels() {
+        let apt =
+            &crate::nav::test_xplane_path("Global Scenery/Global Airports/Earth nav data/apt.dat");
+        if !std::path::Path::new(apt).exists() {
+            return;
+        }
+        for (icao, want) in [("EGKK", 7000.0), ("EGBB", 7500.0), ("LEBL", 8000.0), ("KJFK", 18000.0)] {
+            let a = find_airport(apt, icao).unwrap().expect(icao);
+            assert_eq!(a.transition_level_ft, Some(want), "{icao}");
+        }
+    }
+
     #[test]
     #[ignore] // needs the real X-Plane install; run with --ignored
     fn real_install_egkk_one_runway() {

@@ -1298,6 +1298,7 @@ mod tests {
         fp.waypoints[1].lat = 1.2;
         fp.waypoints[1].lon = 0.0;
         let airport = nav::AirportInfo {
+            transition_level_ft: None,
             name: "Flat field".into(),
             elev_ft: 0.0,
             freqs: vec![],

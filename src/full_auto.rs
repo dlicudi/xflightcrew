@@ -1280,25 +1280,45 @@ pub(crate) async fn obey_region_handoff(
 /// it as a check-in (a readback with "passing"/"climbing") and answers "radar
 /// contact". With no planned altitude the climb clause is left off rather
 /// than invented.
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn departure_check_in(
     callsign: &Option<String>,
     to: &str,
     alt_ft: f64,
     climb_to_ft: f64,
 ) -> String {
+    departure_check_in_above(callsign, to, alt_ft, climb_to_ft, f64::INFINITY)
+}
+
+/// [`departure_check_in`] with the flight's transition altitude: a level
+/// above it (passed or climbed to) is a flight level ("passing flight level
+/// seven zero climbing flight level one five zero"), one at or below it
+/// feet, the way the climb is flown on the altimeter (issue #97; the
+/// setting rule is `instruments::correct_setting_inhg`'s).
+pub fn departure_check_in_above(
+    callsign: &Option<String>,
+    to: &str,
+    alt_ft: f64,
+    climb_to_ft: f64,
+    transition_ft: f64,
+) -> String {
     let who = callsign
         .as_ref()
         .map(|c| format!("{c}, "))
         .unwrap_or_default();
+    let said = |ft: f64| {
+        if ft > transition_ft {
+            crate::atis::spoken_flight_level(ft)
+        } else {
+            crate::atis::spoken_alt(ft)
+        }
+    };
     let climb = if climb_to_ft > alt_ft + 200.0 {
-        format!(" climbing {}", crate::atis::spoken_alt(climb_to_ft))
+        format!(" climbing {}", said(climb_to_ft))
     } else {
         String::new()
     };
-    format!(
-        "{to}, {who}passing {}{climb}",
-        crate::atis::spoken_alt(alt_ft)
-    )
+    format!("{to}, {who}passing {}{climb}", said(alt_ft))
 }
 
 async fn wait_until<F, Fut>(secs: f64, step_ms: u64, mut cond: F) -> bool
@@ -1806,25 +1826,68 @@ async fn fly(xp: XPlaneClient, config: Config, voice: Option<Voice>, tools: SubT
     bail_if_abort!();
 
     // --- Stage 3: onto the runway ---------------------------------------------
-    // Already lined up (the pilot put us on)? Skip straight to the circuit.
-    if !lined_up(&xp, &tools, &config).await {
-        // A tower that can hear us, or an uncontrolled departure: no
-        // simulated ATC, or no station in reach of this field (LILB,
-        // 2026-09-25: Gibraltar, 1,000 nm away, cleared the 172 and gave it a
-        // taxi to its own runway 09, and full auto waited three minutes for
-        // a route that could be ours).
-        let towered = crate::mode::atc_enabled() && crate::party_line::station_reaches();
+    // A tower that can hear us, or an uncontrolled departure: no
+    // simulated ATC, or no station in reach of this field (LILB,
+    // 2026-09-25: Gibraltar, 1,000 nm away, cleared the 172 and gave it a
+    // taxi to its own runway 09, and full auto waited three minutes for
+    // a route that could be ours).
+    let towered = crate::mode::atc_enabled() && crate::party_line::station_reaches();
+    // An IFR plan asks for its route: the SID, the altitude and the
+    // code the rest of the departure flies.
+    let ifr_dest = match &tools.mission {
+        Mission::Flight(r) if r.ifr => Some(r.dest_icao.clone()),
+        _ => None,
+    };
+    // Already on a runway (the pilot or the sim put us there)? Lined up with
+    // the roll ahead: call ready from here. Too little ahead: backtrack. A
+    // runway start used to ask for a taxi when the length ahead fell short,
+    // and was cleared off the runway to its far hold (EGKK 26L, #128).
+    let mut start = runway_start(&xp, &tools).await;
+    let mut clearance_asked = false;
+    if start != RunwayStart::None && towered {
+        // The clearance first, from the strip too (IFR route or zone): it
+        // names the runway the departure is flown from.
+        get_zone_clearance(&xp, &ctx, &voice, &callsign, ifr_dest.as_deref()).await;
+        clearance_asked = true;
+        bail_if_abort!();
+        let cleared = crate::party_line::clearance_runway();
+        let on = start.runway().map(str::to_string);
+        start = start.under_clearance(cleared.as_deref());
+        if start == RunwayStart::None {
+            event(
+                "runway_start_other_runway",
+                json!({ "on": on, "cleared": cleared }),
+            );
+            if let Some(c) = &cleared {
+                announce(
+                    &voice,
+                    Priority::Advisory,
+                    &format!(
+                        "We're cleared off runway {}, not this one. Asking for the taxi.",
+                        crate::atis::spoken_runway(c)
+                    ),
+                );
+            }
+        }
+    }
+    if let RunwayStart::Short { runway } = &start {
+        if let Err((line, why)) =
+            backtrack_from_runway_start(&xp, &ctx, &voice, &tools, &callsign, runway, towered).await
+        {
+            give_up(&xp, tools.taxi.park_brake_valve_set, &voice, &line, why).await;
+            return;
+        }
+        bail_if_abort!();
+        start = RunwayStart::Lined {
+            runway: runway.clone(),
+        };
+    }
+    if start == RunwayStart::None {
         event("departure_field", json!({ "towered": towered }));
         // Clearance first — the real order is clearance, THEN taxi. Only with a
         // simulated tower to answer (real/external ATC and copilot-only leave the
         // clearance to the pilot), and only if we don't already hold a squawk.
-        if towered {
-            // An IFR plan asks for its route: the SID, the altitude and the
-            // code the rest of the departure flies.
-            let ifr_dest = match &tools.mission {
-                Mission::Flight(r) if r.ifr => Some(r.dest_icao.clone()),
-                _ => None,
-            };
+        if towered && !clearance_asked {
             get_zone_clearance(&xp, &ctx, &voice, &callsign, ifr_dest.as_deref()).await;
         }
         bail_if_abort!();
@@ -2485,6 +2548,12 @@ async fn fly(xp: XPlaneClient, config: Config, voice: Option<Voice>, tools: SubT
         // 2026-09-21). The tower now takes a "ready" from the strip as a
         // lined-up aircraft (`Ctx::own_on_runway`), so the same call and the
         // same wait as the taxied departure apply.
+        // A SID with minimums: the takeoff's own climb-out at best rate, as
+        // from a taxied line-up.
+        crate::autotakeoff::DEPARTURE_MINIMUMS.store(
+            matches!(&tools.mission, Mission::Flight(r) if !r.climb_minimums.is_empty()),
+            SeqCst,
+        );
         let strobe = light(&tools, &ctx, "strobe", true).await;
         let landing = light(&tools, &ctx, "landing", true).await;
         event(
@@ -4450,6 +4519,115 @@ async fn request_departure(callsign: &Option<String>) {
     .await;
 }
 
+/// How long one backtrack request waits for the tower's line-up before it
+/// is asked again (a hold for traffic on final can run minutes).
+const BACKTRACK_WAIT_SECS: f64 = 60.0;
+/// Asks before full auto gives the aircraft back on the runway.
+const BACKTRACK_ASKS: usize = 5;
+
+/// A runway start with too little runway ahead (issue #128): ask the tower
+/// to backtrack, read its line-up back, and drive the line-up tool's own
+/// backtrack to the threshold and round onto the centreline. No tower (no
+/// simulated ATC, none in reach) leaves it to the crew's judgment, as the
+/// line-up tool does. `Err((line, why))` is the give-up.
+async fn backtrack_from_runway_start(
+    xp: &XPlaneClient,
+    ctx: &ToolCtx<'_>,
+    voice: &Option<Voice>,
+    tools: &SubTools,
+    callsign: &Option<String>,
+    runway: &str,
+    towered: bool,
+) -> Result<(), (String, &'static str)> {
+    use crate::tower::State::{LinedUp, TakeoffCleared};
+    if towered {
+        if let Some(khz) = crate::party_line::home_tower_khz() {
+            let _ = xp.set_float(COM1_FREQ_KHZ, khz as f64).await;
+        }
+        let call = format!(
+            "request backtrack runway {}",
+            crate::circuit::spell_runway(runway)
+        );
+        let mut approved = false;
+        for attempt in 0..BACKTRACK_ASKS {
+            crate::circuit::transmit(crate::circuit::radio_call(callsign, &call));
+            event(
+                "request_backtrack",
+                json!({ "runway": runway, "attempt": attempt }),
+            );
+            waiting("the backtrack approval");
+            approved = wait_until(BACKTRACK_WAIT_SECS, 1000, || async {
+                matches!(
+                    crate::party_line::clearance_state(),
+                    Some(LinedUp) | Some(TakeoffCleared)
+                )
+            })
+            .await;
+            if approved || ABORT.load(SeqCst) {
+                break;
+            }
+            // Held for traffic: "hold position" is read back like any
+            // instruction, then asked again once it has had its minute.
+            if let Some(rb) = crate::party_line::readback_owed() {
+                crate::circuit::transmit(rb.trim_end_matches('.').to_string());
+            }
+        }
+        if ABORT.load(SeqCst) {
+            return Ok(());
+        }
+        if !approved {
+            return Err((
+                "The tower never let us backtrack, and there isn't the runway ahead to go from here. \
+                 Your aircraft."
+                    .to_string(),
+                "no_backtrack_approval",
+            ));
+        }
+        if let Some(rb) = crate::party_line::readback_owed() {
+            crate::circuit::transmit(rb.trim_end_matches('.').to_string());
+            event("backtrack_readback", json!({}));
+        }
+    }
+    if let Ok(reply) = tools
+        .line_up
+        .execute(&json!({ "backtrack": true }), ctx)
+        .await
+    {
+        announce(voice, Priority::Advisory, &reply);
+    }
+    waiting("the backtrack");
+    if crate::autotaxi::driving()
+        && !wait_until(600.0, 1000, || async { !crate::autotaxi::driving() }).await
+    {
+        return Err((
+            "The backtrack didn't finish. Your aircraft.".to_string(),
+            "backtrack_stalled",
+        ));
+    }
+    if ABORT.load(SeqCst) {
+        return Ok(());
+    }
+    match runway_check(xp, tools).await {
+        Ok(()) => {
+            event("backtracked", json!({ "runway": runway }));
+            Ok(())
+        }
+        Err(why) => {
+            event("backtrack_no_fit", json!({ "why": format!("{why:?}") }));
+            Err((
+                match &why {
+                    Some(w) => format!(
+                        "{} Your aircraft.",
+                        crate::autotakeoff::no_fit_line(w, false).0
+                    ),
+                    None => "The backtrack didn't put us on the runway. Your aircraft.".to_string(),
+                },
+                "backtrack_no_fit",
+            ))
+        }
+    }
+}
+
 /// Wait until the tower actually clears the takeoff, through a traffic hold if
 /// that's what it takes (a final can be minutes out). Re-report "ready for
 /// departure" periodically while merely waiting, but stay SILENT while
@@ -5078,10 +5256,82 @@ pub fn preflight_gated(
     Ok(waived_lines.join(" "))
 }
 
-/// Whether we're already sitting on a runway ready to depart — then taxi and
-/// line-up are skipped. Uses the takeoff loop's own fit against apt.dat.
-async fn lined_up(xp: &XPlaneClient, tools: &SubTools, _config: &Config) -> bool {
-    runway_check(xp, tools).await.is_ok()
+/// Where the arm finds the aircraft before any taxi (issue #128).
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum RunwayStart {
+    /// Not on a runway it can depart from: the taxied departure.
+    None,
+    /// Lined up on `runway` with the roll ahead of it: call ready.
+    Lined { runway: String },
+    /// Stopped on `runway`, aligned, with too little of it ahead: backtrack
+    /// to the threshold. A taxi request from here was answered with a route
+    /// OFF the runway to its far holding point (EGKK 26L, sortie
+    /// 1790527340: 1,340 m ahead, 1,897 needed, "taxi to holding point
+    /// Mike").
+    Short { runway: String },
+}
+
+/// Stopped means stopped: a runway start is where the sim put the aircraft,
+/// never a roll in progress (the tower's own latch uses 1 kt,
+/// `RUNWAY_START_MAX_KTS`; the crew allows a creep).
+const RUNWAY_START_BACKTRACK_MAX_KTS: f64 = 3.0;
+
+/// Classify the arm's position from the takeoff fit. Pure.
+pub(crate) fn classify_runway_start(
+    fit: Result<String, Option<crate::autotakeoff::NoFit>>,
+    gs_kts: f64,
+) -> RunwayStart {
+    match fit {
+        Ok(runway) => RunwayStart::Lined { runway },
+        Err(Some(crate::autotakeoff::NoFit::TooLittleLeft { id, .. }))
+            if gs_kts < RUNWAY_START_BACKTRACK_MAX_KTS =>
+        {
+            RunwayStart::Short { runway: id }
+        }
+        _ => RunwayStart::None,
+    }
+}
+
+impl RunwayStart {
+    /// The strip we stand on, when we stand on one.
+    pub(crate) fn runway(&self) -> Option<&str> {
+        match self {
+            RunwayStart::None => None,
+            RunwayStart::Lined { runway } | RunwayStart::Short { runway } => Some(runway),
+        }
+    }
+
+    /// A clearance for ANOTHER runway (the IFR clearance's SID was chosen
+    /// with the tower's runway in use, which the station freezes for it) is
+    /// flown from that runway: the taxied departure goes there. Asking for
+    /// the strip we sit on would unpick a clearance already read back, and
+    /// the tower treats only the strip in use as a lined-up aircraft
+    /// (`Ctx::own_on_runway`). Pure.
+    pub(crate) fn under_clearance(self, cleared: Option<&str>) -> RunwayStart {
+        match (self.runway(), cleared) {
+            (Some(on), Some(c)) if !crate::autotakeoff::runway_matches(on, c) => RunwayStart::None,
+            _ => self,
+        }
+    }
+}
+
+/// The takeoff fit at the arm, as a [`RunwayStart`].
+async fn runway_start(xp: &XPlaneClient, tools: &SubTools) -> RunwayStart {
+    let fit = runway_check_id(xp, tools).await;
+    let gs_kts = xp
+        .get_float(crate::autotaxi::GS_MS)
+        .await
+        .map(|v| v * MS_TO_KTS)
+        .unwrap_or(f64::INFINITY);
+    let start = classify_runway_start(fit.clone(), gs_kts);
+    if start != RunwayStart::None {
+        event(
+            "runway_start",
+            json!({ "start": format!("{start:?}"), "gs_kts": gs_kts,
+                    "fit": format!("{fit:?}") }),
+        );
+    }
+    start
 }
 
 /// The takeoff loop's own fit, asked with the takeoff's own pavement rule
@@ -5091,6 +5341,14 @@ async fn runway_check(
     xp: &XPlaneClient,
     tools: &SubTools,
 ) -> Result<(), Option<crate::autotakeoff::NoFit>> {
+    runway_check_id(xp, tools).await.map(|_| ())
+}
+
+/// [`runway_check`] naming the runway end that fits.
+async fn runway_check_id(
+    xp: &XPlaneClient,
+    tools: &SubTools,
+) -> Result<String, Option<crate::autotakeoff::NoFit>> {
     // Airborne is not "lined up"; and a fit needs a valid position.
     if xp.get_float(ON_GROUND).await.unwrap_or(1.0) < 0.5 {
         return Err(None);
@@ -5112,7 +5370,7 @@ async fn runway_check(
     let apt = crate::tools::autoland::apt_dat_path();
     let cands = crate::autoland::nearby_runways(&apt, lat, lon, 3.0).unwrap_or_default();
     match crate::autotakeoff::runway_fit(&cands, lat, lon, psi, needed_m) {
-        Some(_) => Ok(()),
+        Some((r, _)) => Ok(r.id),
         None => Err(Some(crate::autotakeoff::why_no_fit_cleared(
             &cands,
             lat,
@@ -5121,6 +5379,93 @@ async fn runway_check(
             needed_m,
             crate::party_line::clearance_runway().as_deref(),
         ))),
+    }
+}
+
+#[cfg(test)]
+mod runway_start_tests {
+    use super::*;
+
+    /// EGKK's two strips, the rows as apt.dat has them.
+    fn egkk() -> Vec<crate::autoland::Runway> {
+        use std::io::Write;
+        let apt = std::env::temp_dir().join("xvl-runway-start-egkk-apt.dat");
+        let mut f = std::fs::File::create(&apt).unwrap();
+        writeln!(f, "1    203 0 0 EGKK London Gatwick").unwrap();
+        writeln!(f, "100 46.00 26 1527 0.25 1 3 0 08R 51.1450993 -0.2123748 395 0 7 4 1 3 26L 51.1514994 -0.1659296 425 30 7 4 1 3").unwrap();
+        writeln!(f, "100 46.00 23 853 0.25 0 1 0 08L 51.1468901 -0.2126029 321 0 7 0 0 3 26R 51.1518321 -0.1767408 415 0 7 0 0 3").unwrap();
+        f.flush().unwrap();
+        crate::autoland::nearby_runways(apt.to_str().unwrap(), 51.1477, -0.1935, 3.0).unwrap()
+    }
+
+    /// Sortie 1790527340 (EGKK, 2026-09-27): stopped on 26L's centreline
+    /// at 51.14768 N 0.19355 W, 256.3 true, 1,897 m needed. The fit fails on
+    /// LENGTH on 26L (not "none near" off 26R, 200 m away and aligned to
+    /// 0.005 degrees more), so the arm backtracks instead of asking for the
+    /// taxi that took it off the runway to holding point Mike.
+    #[test]
+    fn the_egkk_runway_start_backtracks_on_26l() {
+        let cands = egkk();
+        let (lat, lon, psi, need) = (51.14768083914999, -0.19354614043732044, 256.3, 1897.0);
+        assert!(crate::autotakeoff::runway_fit(&cands, lat, lon, psi, need).is_none());
+        // The coin toss the old diagnosis made: 26R is the better-aligned.
+        let best_aligned = cands
+            .iter()
+            .min_by(|a, b| {
+                crate::autoland::heading_diff(psi, a.course_deg)
+                    .total_cmp(&crate::autoland::heading_diff(psi, b.course_deg))
+            })
+            .unwrap();
+        assert_eq!(best_aligned.id, "26R");
+        let why = crate::autotakeoff::why_no_fit_cleared(&cands, lat, lon, psi, need, None);
+        let crate::autotakeoff::NoFit::TooLittleLeft { id, remaining_m, .. } = &why else {
+            panic!("{why:?}");
+        };
+        assert_eq!(id, "26L");
+        assert!((1250.0..1450.0).contains(remaining_m), "{remaining_m}");
+        let start = classify_runway_start(Err(Some(why.clone())), 0.0);
+        assert_eq!(start, RunwayStart::Short { runway: "26L".into() });
+        // A roll in progress is not a runway start.
+        assert_eq!(classify_runway_start(Err(Some(why)), 40.0), RunwayStart::None);
+        // Enough ahead: lined up, whatever the speed.
+        assert_eq!(
+            classify_runway_start(Ok("26L".into()), 0.0),
+            RunwayStart::Lined { runway: "26L".into() }
+        );
+        // Off any runway: the taxied departure.
+        assert_eq!(classify_runway_start(Err(None), 0.0), RunwayStart::None);
+        let none_near = crate::autotakeoff::NoFit::NoneNear {
+            id: "26L".into(),
+            lateral_m: 300.0,
+        };
+        assert_eq!(classify_runway_start(Err(Some(none_near)), 0.0), RunwayStart::None);
+    }
+
+    /// The clearance names the runway: the one we sit on stands, a zero-
+    /// padded or case-different name included; another one is taxied to.
+    #[test]
+    fn a_runway_start_departs_from_the_cleared_runway() {
+        let short = RunwayStart::Short { runway: "26L".into() };
+        assert_eq!(short.clone().under_clearance(Some("26L")), short);
+        assert_eq!(short.clone().under_clearance(None), short);
+        assert_eq!(short.clone().under_clearance(Some("26R")), RunwayStart::None);
+        let lined = RunwayStart::Lined { runway: "09".into() };
+        assert_eq!(lined.clone().under_clearance(Some("9")), lined);
+        assert_eq!(lined.under_clearance(Some("27")), RunwayStart::None);
+        assert_eq!(RunwayStart::None.under_clearance(Some("27")), RunwayStart::None);
+    }
+
+    /// The arm reads the start once, before any taxi request, and a short
+    /// start asks for the backtrack by name; read from the source because
+    /// the orchestration is async over the live sim.
+    #[test]
+    fn the_arm_asks_for_a_backtrack_before_a_taxi() {
+        let src = include_str!("full_auto.rs");
+        let start = src.find("let mut start = runway_start(").expect("the arm classifies");
+        let backtrack = src.find("backtrack_from_runway_start(&xp").expect("a short start backtracks");
+        let taxi = src.find("event(\"request_taxi\"").expect("the taxi request");
+        assert!(start < backtrack && backtrack < taxi, "classify, backtrack, then the taxi");
+        assert!(src.contains("\"request backtrack runway {}\""));
     }
 }
 
@@ -6110,7 +6455,7 @@ mod tests {
         assert_eq!(super::arrival_wind(None, None), (None, "none"));
     }
 
-    use super::departure_check_in;
+    use super::{departure_check_in, departure_check_in_above};
 
     /// The runway chosen at the arm is the runway the arrival sets up for
     /// (LIBP-LEMG 2026-09-26: UNTO2A chosen for 12, the ILS 13 flown after a
@@ -6325,6 +6670,27 @@ mod tests {
     // The first call to Departure has to read as a CHECK-IN to the station
     // (a readback carrying "passing"/"climbing", never a request), or the
     // departure controller answers "say again" instead of "radar contact".
+    #[test]
+    fn a_climb_above_the_transition_altitude_checks_in_with_a_flight_level() {
+        let cs = Some("Speedbird three zero six".to_string());
+        let call = departure_check_in_above(&cs, "London Departure", 3000.0, 15000.0, 6000.0);
+        assert_eq!(
+            call,
+            "London Departure, Speedbird three zero six, passing three thousand climbing flight level one five zero"
+        );
+        let call = departure_check_in_above(&cs, "London Departure", 7020.0, 15000.0, 6000.0);
+        assert!(call.contains("passing flight level seven zero climbing flight level one five zero"), "{call}");
+        // At or below the transition altitude it stays feet.
+        let call = departure_check_in_above(&cs, "London Departure", 2000.0, 6000.0, 6000.0);
+        assert!(call.ends_with("passing two thousand climbing six thousand"), "{call}");
+        // The departure controller clears the climb the check-in announced,
+        // in its own words.
+        assert_eq!(
+            crate::station::climb_announced(&call.replace("six thousand", "flight level one two zero")),
+            Some("flight level one two zero".into())
+        );
+    }
+
     #[test]
     fn the_departure_check_in_is_shaped_to_earn_radar_contact() {
         let cs = Some("November four five X-ray Sierra".to_string());

@@ -116,6 +116,33 @@ pub fn spoken_alt(ft: f64) -> String {
     }
 }
 
+/// A flight level in controller words, from feet on the standard setting:
+/// 12,000 is "flight level one two zero", 7,000 "flight level seven zero"
+/// (the digits of the level, no leading zero, the way CAP 413 and the FAA
+/// both say it).
+pub fn spoken_flight_level(ft: f64) -> String {
+    let fl = ((ft / 100.0).round() as i64).max(1);
+    format!("flight level {}", spoken_digits(&fl.to_string()))
+}
+
+/// Is an assigned level said as a flight level? At or above the field's
+/// transition LEVEL (apt.dat's `1302 transition_level`); below it, and
+/// wherever the level is unknown, it is an altitude in feet with the QNH.
+pub fn is_flight_level(ft: f64, transition_level_ft: Option<f64>) -> bool {
+    transition_level_ft.is_some_and(|tl| tl > 0.0 && ft >= tl)
+}
+
+/// A level the way it is assigned or reported: "flight level one two zero"
+/// at or above the transition level, else "five thousand" (the caller adds
+/// "feet" where its dialect says it).
+pub fn spoken_level(ft: f64, transition_level_ft: Option<f64>) -> String {
+    if is_flight_level(ft, transition_level_ft) {
+        spoken_flight_level(ft)
+    } else {
+        spoken_alt(ft)
+    }
+}
+
 pub fn spoken_mhz(khz: i64) -> String {
     let mhz = khz / 1000;
     let frac = (khz % 1000).abs();

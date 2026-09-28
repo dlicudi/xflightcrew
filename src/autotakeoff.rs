@@ -683,8 +683,22 @@ pub fn why_no_fit_cleared(
 /// gate it fails — in the same order the fit applies them, so the answer is
 /// always the thing that actually stopped it.
 pub fn why_no_fit(cands: &[Runway], lat: f64, lon: f64, psi_true: f64, needed_m: f64) -> NoFit {
-    let best = cands.iter().min_by(|a, b| {
-        heading_diff(psi_true, a.course_deg).total_cmp(&heading_diff(psi_true, b.course_deg))
+    // Of the ends we are aligned with, the one we are ON (least lateral):
+    // parallels share a heading to thousandths of a degree, so the best-
+    // aligned pick was a coin toss between them. EGKK 2026-09-27 (sortie
+    // 1790527340): on 26L's centreline at 256.3 true, 26R (257.624) beat
+    // 26L (257.629) by 0.005 degrees, 200 m away, and the diagnosis was
+    // "none near" instead of "too little left". With nothing aligned, the
+    // best-aligned end, as before.
+    let lateral = |r: &Runway| (cross_track_nm(lat, lon, r) * M_PER_NM).abs();
+    let aligned = cands
+        .iter()
+        .filter(|r| heading_diff(psi_true, r.course_deg) <= ALIGN_MAX_DEG)
+        .min_by(|a, b| lateral(a).total_cmp(&lateral(b)));
+    let best = aligned.or_else(|| {
+        cands.iter().min_by(|a, b| {
+            heading_diff(psi_true, a.course_deg).total_cmp(&heading_diff(psi_true, b.course_deg))
+        })
     });
     let Some(r) =
         best.filter(|r| (cross_track_nm(lat, lon, r) * M_PER_NM).abs() < 2.0 * LATERAL_MAX_M)

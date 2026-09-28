@@ -1271,7 +1271,10 @@ async fn run_session(
                                 }
                                 let alt_ft =
                                     xplane.get_float(datarefs::ALTITUDE_FT).await.unwrap_or(0.0);
-                                full_auto::departure_check_in(&callsign, &to, alt_ft, climb_to_ft)
+                                // Above the flight's transition altitude the
+                                // levels are flight levels (issue #97).
+                                let ta = crate::tools::instruments::transition_in_force_ft(18_000.0);
+                                full_auto::departure_check_in_above(&callsign, &to, alt_ft, climb_to_ft, ta)
                             }
                         };
                         // The copilot transmits (its own voice), then the tower.
