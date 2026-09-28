@@ -1,0 +1,87 @@
+# One airframe after another, each on its own unflown fixes:
+#   xvl sortie bench/sorties/backlog-types.yaml
+# Every case loads its aircraft (setup.aircraft) and waits for the app to
+# swap to it before the first line. The shape is lemg-737.yaml's header.
+# Parse-tested (every line pinned to the tool it must reach), not yet flown.
+
+cases:
+  # SR22 from a stand: taxi, the line-up pivot on the brake (#46, #60),
+  # the circuit, the landing and taxi-in.
+  - name: SR22 LEMG circuit from the ramp
+    setup:
+      aircraft: "Aircraft/Laminar Research/Cirrus SR22/Cirrus SR22.acf"
+      ramp: { field: LEMG }
+    command: fly a circuit
+    deadline_min: 35
+
+  - name: SR22 LEMG 13, 10 nm final
+    setup:
+      aircraft: "Aircraft/Laminar Research/Cirrus SR22/Cirrus SR22.acf"
+      approach: { field: LEMG, runway: "13", final_nm: 10 }
+    deadline_min: 12
+
+  # SF50: the gear warning envelope and cabin air on the circuit (#44,
+  # #41); the flare gains and the committed flare on the final (#44).
+  - name: SF50 LEMG 13 runway start, circuit
+    setup:
+      aircraft: "Aircraft/Laminar Research/Cirrus Vision SF50/CirrusSF50.acf"
+      runway_start: { field: LEMG, runway: "13", engines_running: true }
+    command: fly a circuit
+    deadline_min: 20
+
+  - name: SF50 LEMG 13, 10 nm final
+    setup:
+      aircraft: "Aircraft/Laminar Research/Cirrus Vision SF50/CirrusSF50.acf"
+      approach: { field: LEMG, runway: "13", final_nm: 10 }
+    deadline_min: 10
+
+  # A330: transponder knobs, spoilers, runway start, altitude capture
+  # (#43); the circuit's base at speed (#72).
+  - name: A330 LEMG 13 runway start, circuit
+    setup:
+      aircraft: "Aircraft/Laminar Research/Airbus A330-300/A330.acf"
+      runway_start: { field: LEMG, runway: "13", engines_running: true }
+    command: fly a circuit
+    deadline_min: 25
+
+  - name: A330 LEMG 13, 10 nm final
+    setup:
+      aircraft: "Aircraft/Laminar Research/Airbus A330-300/A330.acf"
+      approach: { field: LEMG, runway: "13", final_nm: 10 }
+    deadline_min: 10
+
+  # Citation X cold and dark at a gate: the start from a cold APU (#52),
+  # then the whole circuit.
+  - name: Citation X LEMG circuit from a cold gate
+    setup:
+      aircraft: "Aircraft/Laminar Research/Cessna Citation X/Cessna_CitationX.acf"
+      ramp: { field: LEMG }
+    command: fly a circuit
+    deadline_min: 35
+
+  - name: Citation X LEMG 13, 10 nm final
+    setup:
+      aircraft: "Aircraft/Laminar Research/Cessna Citation X/Cessna_CitationX.acf"
+      approach: { field: LEMG, runway: "13", final_nm: 10 }
+    deadline_min: 10
+
+  # S-76C from a helicopter stand at Malaga to Gibraltar on a local plan:
+  # the cold start, the climb checked at the arm, the approach at speed to
+  # a gate (#47), terrain gates and the runway spot at a field without a
+  # pad (#48), the radio (#49), the hand-back that never turns the AP off
+  # (#50).
+  - name: S-76 LEMG to LXGB on a local plan
+    setup:
+      aircraft: "Aircraft/Laminar Research/Sikorsky S-76/S-76C.acf"
+      ramp: { field: LEMG }
+    steps:
+      - { say: plan a flight to LXGB, when: start, tool: plan_flight }
+      - { say: fly the flight plan, when: { after_s: 15 }, tool: hover }
+    deadline_min: 60
+
+  - name: S-76 LEMG 13 runway start, circuit
+    setup:
+      aircraft: "Aircraft/Laminar Research/Sikorsky S-76/S-76C.acf"
+      runway_start: { field: LEMG, runway: "13", engines_running: true }
+    command: fly a circuit
+    deadline_min: 20
