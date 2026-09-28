@@ -15,6 +15,7 @@
 //! gear. Each item is read first and left alone when it is already in state,
 //! read back after the write, and named when it did not take.
 
+use crate::aircraft::TakeoffConfigProfile;
 use crate::xplane::XPlane;
 use std::sync::Mutex;
 
@@ -22,11 +23,21 @@ const FLAP_HANDLE: &str = crate::datarefs::FLAP_RATIO;
 /// Where the flaps ARE, following the handle at the airframe's own rate.
 /// The climb-out's retraction reads it too: each step waits for the last.
 pub(crate) const FLAP_DEPLOY: &str = "sim/cockpit2/controls/flap_handle_deploy_ratio";
-const SPEEDBRAKE: &str = "sim/cockpit2/controls/speedbrake_ratio";
+const SPEEDBRAKE: &str = TakeoffConfigProfile::SPEEDBRAKE;
 /// 0 RTO, 1 off, 2..5 the landing levels.
-const AUTOBRAKE: &str = "sim/cockpit2/switches/auto_brake_level";
+const AUTOBRAKE: &str = TakeoffConfigProfile::AUTOBRAKE;
 const ALT_DIAL: &str = "sim/cockpit2/autopilot/altitude_dial_ft";
 const GROUNDSPEED_MS: &str = "sim/flightmodel/position/groundspeed";
+/// The stock autoflight names: one list, the profile probe's
+/// ([`TakeoffConfigProfile::references`]).
+const FD_MODE: &str = TakeoffConfigProfile::FD_MODE;
+const CMD_FD_ON: &str = TakeoffConfigProfile::CMD_FD_ON;
+const AT_MODE: &str = TakeoffConfigProfile::AT_MODE;
+const CMD_AT_ARM: &str = TakeoffConfigProfile::CMD_AT_ARM;
+const CMD_AT_OFF: &str = TakeoffConfigProfile::CMD_AT_OFF;
+const SPEED_WINDOW: &str = TakeoffConfigProfile::SPEED_WINDOW;
+/// A speed window this close to V2 already shows it.
+const V2_TOLERANCE_KTS: f64 = 1.0;
 
 const SPEEDBRAKE_ARMED: f64 = -0.5;
 const AUTOBRAKE_RTO: i64 = 0;
@@ -67,6 +78,27 @@ pub fn has_speedbrake() -> bool {
 
 fn airframe() -> Option<crate::aircraft::TakeoffConfigProfile> {
     AIRFRAME.lock().unwrap_or_else(|e| e.into_inner()).clone()
+}
+
+/// Thrust reduction, declared: pull the levers back to climb thrust above
+/// this height.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ThrustReduction {
+    pub agl_ft: f64,
+    pub lever: f64,
+}
+
+/// The live airframe's thrust reduction, when it declares both numbers (and
+/// sane ones: a lever inside (0, 1), a height above the runway).
+pub fn thrust_reduction() -> Option<ThrustReduction> {
+    let af = airframe()?;
+    let agl_ft = af
+        .thrust_reduction_agl_ft
+        .filter(|h| h.is_finite() && *h > 0.0)?;
+    let lever = af
+        .climb_thrust_ratio
+        .filter(|r| r.is_finite() && *r > 0.0 && *r < 1.0)?;
+    Some(ThrustReduction { agl_ft, lever })
 }
 
 /// What was set, and what would not go.
@@ -158,6 +190,18 @@ pub async fn set_for_takeoff(
 
     if af.autobrake_rto {
         set_autobrake(xp, AUTOBRAKE_RTO, "autobrake max", &mut out).await;
+    }
+
+    // The autoflight a crew sets before the roll (EGPH 2026-09-21: the MCP
+    // speed window at 125, no flight directors, no autothrottle arm).
+    if af.flight_directors {
+        flight_directors_on(xp, &mut out).await;
+    }
+    if af.autothrottle_armed {
+        autothrottle_armed(xp, &mut out).await;
+    }
+    if let Some(v2) = af.v2_kts.filter(|v| v.is_finite() && *v > 0.0) {
+        speed_window_v2(xp, v2, &mut out).await;
     }
 
     let elev_ft = xp
@@ -280,6 +324,79 @@ pub async fn set_for_landing(xp: &dyn XPlane) -> Outcome {
     out
 }
 
+/// Flight directors on: read, `fdir_on` only when off, read back.
+async fn flight_directors_on(xp: &dyn XPlane, out: &mut Outcome) {
+    match xp.get_float(FD_MODE).await {
+        Ok(at) if at < 0.5 => {
+            let ok = xp.run_command(CMD_FD_ON).await.is_ok()
+                && xp.get_float(FD_MODE).await.is_ok_and(|v| v >= 0.5);
+            if ok {
+                out.set.push("flight directors on".into());
+            } else {
+                out.not_taken.push("the flight directors".into());
+            }
+        }
+        Ok(_) => {}
+        Err(_) => out.not_taken.push("the flight directors".into()),
+    }
+}
+
+/// What the autothrottle arm owes: `None` in state (armed, no mode),
+/// `Some(command)` to fire. An ENGAGED mode is taken out to armed, since the
+/// takeoff owns the thrust levers (one writer per dataref); hard off is
+/// armed. Pure.
+pub fn autothrottle_step(mode: f64) -> Option<&'static str> {
+    if !mode.is_finite() {
+        return None;
+    }
+    match mode.round() as i64 {
+        0 => None,
+        m if m < 0 => Some(CMD_AT_ARM),
+        _ => Some(CMD_AT_OFF),
+    }
+}
+
+async fn autothrottle_armed(xp: &dyn XPlane, out: &mut Outcome) {
+    match xp.get_float(AT_MODE).await {
+        Ok(at) => {
+            if let Some(cmd) = autothrottle_step(at) {
+                let ok = xp.run_command(cmd).await.is_ok()
+                    && xp
+                        .get_float(AT_MODE)
+                        .await
+                        .is_ok_and(|v| v.is_finite() && v.round() as i64 == 0);
+                if ok {
+                    out.set.push("autothrottle armed".into());
+                } else {
+                    out.not_taken.push("the autothrottle arm".into());
+                }
+            }
+        }
+        Err(_) => out.not_taken.push("the autothrottle arm".into()),
+    }
+}
+
+/// V2 in the MCP speed window: read, written only when it shows something
+/// else, read back against V2.
+async fn speed_window_v2(xp: &dyn XPlane, v2: f64, out: &mut Outcome) {
+    match xp.get_float(SPEED_WINDOW).await {
+        Ok(at) if (at - v2).abs() > V2_TOLERANCE_KTS => {
+            let ok = xp.set_float(SPEED_WINDOW, v2).await.is_ok()
+                && xp
+                    .get_float(SPEED_WINDOW)
+                    .await
+                    .is_ok_and(|v| (v - v2).abs() <= V2_TOLERANCE_KTS);
+            if ok {
+                out.set.push(format!("V2 {v2:.0} set"));
+            } else {
+                out.not_taken.push("the speed window".into());
+            }
+        }
+        Ok(_) => {}
+        Err(_) => out.not_taken.push("the speed window".into()),
+    }
+}
+
 async fn set_autobrake(xp: &dyn XPlane, level: i64, label: &str, out: &mut Outcome) {
     match xp.get_float(AUTOBRAKE).await {
         Ok(at) if at.round() as i64 != level => {
@@ -316,6 +433,34 @@ async fn flaps_arrive(xp: &dyn XPlane, want: f64) -> bool {
         }
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     }
+}
+
+/// The BEFORE TAKEOFF list, audited as a Monitor flow once the roll has
+/// begun: the brakes are off and the transponder at ALT by then, the takeoff's
+/// last two items, so the airframe's own list (XChecklist) cross-checks what
+/// the takeoff set, read-only, ONE line at its end (`flow::summary_line`).
+/// EGPH 2026-09-21: the phase tracker's flight begins at the roll, so no list
+/// ever audited the takeoff configuration and an armed speedbrake reached
+/// 7,000 ft. Nothing without a crew voice, or a file without the section.
+/// Blackbox `autotakeoff` `before_takeoff_audit`.
+pub fn before_takeoff_audit(voice: Option<crate::voice::Voice>) {
+    let Some(voice) = voice else {
+        return;
+    };
+    let section = crate::flow::find_section("before takeoff");
+    let started = section.is_some_and(|idx| {
+        crate::flow::start(
+            idx,
+            crate::flow::Flavour::Monitor,
+            (*crate::settings::live()).clone(),
+            voice,
+        )
+    });
+    crate::blackbox::record(
+        "autotakeoff",
+        serde_json::json!({"event": "before_takeoff_audit",
+                           "section": section.is_some(), "started": started}),
+    );
 }
 
 /// The one line for what was done: a milestone, not the switches. `None` when
@@ -381,15 +526,20 @@ mod tests {
             (ALT_DIAL, 100.0),
             (crate::datarefs::ELEVATION_M, 6.0),
             ("sim/cockpit2/controls/elevator_trim", 0.0),
+            (FD_MODE, 0.0),
+            (SPEED_WINDOW, 100.0),
         ]);
         let o = set_for_takeoff(&xp, Some(0.5), Some(1795.8), true).await;
         assert_eq!(xp.last_write(FLAP_HANDLE), Some(0.5));
         assert_eq!(xp.last_write(SPEEDBRAKE), Some(SPEEDBRAKE_ARMED));
         assert_eq!(xp.last_write(AUTOBRAKE), Some(0.0), "RTO");
         assert_eq!(xp.last_write(ALT_DIAL), Some(1800.0));
+        assert!(xp.ran(CMD_FD_ON), "flight directors");
+        assert_eq!(xp.last_write(SPEED_WINDOW), Some(153.0), "V2");
+        assert!(!xp.ran(CMD_AT_ARM), "the A330's autothrust is its levers'");
         // The fake never moves, so every readback disagrees: each item is
         // NAMED, never assumed.
-        assert_eq!(o.not_taken.len(), 4, "{o:?}");
+        assert_eq!(o.not_taken.len(), 6, "{o:?}");
         assert!(line("Takeoff config", &o)
             .unwrap()
             .starts_with("Check the flaps"));
@@ -483,6 +633,8 @@ mod tests {
             (ALT_DIAL, 1800.0),
             (crate::datarefs::ELEVATION_M, 6.0),
             ("sim/cockpit2/controls/elevator_trim", 0.0),
+            (FD_MODE, 1.0),
+            (SPEED_WINDOW, 153.0),
         ]);
         let o = set_for_takeoff(&xp, Some(0.5), Some(1795.8), true).await;
         assert_eq!(o, Outcome::default());
@@ -510,6 +662,163 @@ mod tests {
         assert_eq!(o.not_taken, vec!["the flaps, still travelling".to_string()]);
         // A 172: no spoilers, no autobrake, never touched.
         assert!(!xp.wrote(SPEEDBRAKE) && !xp.wrote(AUTOBRAKE));
+    }
+
+    /// EGPH 2026-09-21, the 737 lined up: the MCP speed window at 125, no
+    /// flight directors, the autothrottle hard off. The takeoff config sets
+    /// all three before the brakes come off, each read back against intent.
+    #[tokio::test(start_paused = true)]
+    async fn the_737_sets_its_autoflight_before_the_roll() {
+        let _g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        publish(Some(b738()));
+        let xp = FakeXPlane::with_reads(&[
+            (FLAP_HANDLE, 0.375),
+            (FLAP_DEPLOY, 0.375),
+            (SPEEDBRAKE, 0.0),
+            (AUTOBRAKE, 0.0),
+            (ALT_DIAL, 25000.0),
+            (crate::datarefs::ELEVATION_M, 41.0),
+            ("sim/cockpit2/controls/elevator_trim", 0.0),
+            (FD_MODE, 0.0),
+            (AT_MODE, -1.0),
+            (SPEED_WINDOW, 125.0),
+        ]);
+        xp.step_on_command(CMD_FD_ON, FD_MODE, 1.0);
+        xp.step_on_command(CMD_AT_ARM, AT_MODE, 1.0);
+        let o = set_for_takeoff(&xp, Some(0.375), None, false).await;
+        assert!(xp.ran(CMD_FD_ON) && xp.ran(CMD_AT_ARM), "{o:?}");
+        assert!(!xp.ran(CMD_AT_OFF));
+        assert_eq!(xp.last_write(SPEED_WINDOW), Some(150.0), "V2 on the card");
+        assert!(o.set.contains(&"flight directors on".to_string()), "{o:?}");
+        assert!(o.set.contains(&"autothrottle armed".to_string()), "{o:?}");
+        // The fake's window never moves: a write that did not take is named.
+        assert_eq!(o.not_taken, vec!["the speed window".to_string()]);
+        publish(None);
+    }
+
+    /// Already set: nothing fired, nothing written, nothing said. A silent
+    /// profile touches none of it.
+    #[tokio::test(start_paused = true)]
+    async fn set_autoflight_is_left_alone() {
+        let _g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let reads = [
+            (FLAP_HANDLE, 0.375),
+            (FLAP_DEPLOY, 0.375),
+            (SPEEDBRAKE, 0.0),
+            (AUTOBRAKE, 0.0),
+            (ALT_DIAL, 25000.0),
+            (crate::datarefs::ELEVATION_M, 41.0),
+            ("sim/cockpit2/controls/elevator_trim", 0.0),
+            (FD_MODE, 1.0),
+            (AT_MODE, 0.0),
+            (SPEED_WINDOW, 150.4),
+        ];
+        publish(Some(b738()));
+        let xp = FakeXPlane::with_reads(&reads);
+        let o = set_for_takeoff(&xp, Some(0.375), None, false).await;
+        assert_eq!(o, Outcome::default());
+        assert!(!xp.ran(CMD_FD_ON) && !xp.ran(CMD_AT_ARM) && !xp.wrote(SPEED_WINDOW));
+        publish(None);
+        let xp = FakeXPlane::with_reads(&reads);
+        xp.set_read(FD_MODE, 0.0);
+        xp.set_read(AT_MODE, -1.0);
+        set_for_takeoff(&xp, Some(0.375), None, false).await;
+        assert!(!xp.ran(CMD_FD_ON) && !xp.ran(CMD_AT_ARM) && !xp.wrote(SPEED_WINDOW));
+    }
+
+    /// The autothrottle's one question: armed and not engaged. Hard off is
+    /// armed; an engaged mode is taken out, because the takeoff owns the
+    /// levers (one writer per dataref); a failed read fires nothing.
+    #[test]
+    fn the_autothrottle_is_armed_never_engaged() {
+        assert_eq!(autothrottle_step(0.0), None);
+        assert_eq!(autothrottle_step(-1.0), Some(CMD_AT_ARM));
+        assert_eq!(autothrottle_step(1.0), Some(CMD_AT_OFF));
+        assert_eq!(autothrottle_step(2.0), Some(CMD_AT_OFF));
+        assert_eq!(autothrottle_step(f64::NAN), None);
+    }
+
+    /// The declarations carry no names; the probe gets the stock ones behind
+    /// them, and the per-airframe choices are the ones the profiles make.
+    #[test]
+    fn declared_autoflight_is_probed_and_per_airframe() {
+        let b = b738();
+        let refs = b.references();
+        for n in [
+            FD_MODE,
+            CMD_FD_ON,
+            AT_MODE,
+            CMD_AT_ARM,
+            CMD_AT_OFF,
+            SPEED_WINDOW,
+        ] {
+            assert!(refs.contains(&n), "{n}");
+        }
+        let full = crate::aircraft::load("boeing_737_800").unwrap();
+        let probed = crate::aircraft::profile_references(&full);
+        assert!(probed.iter().any(|p| p == SPEED_WINDOW), "{probed:?}");
+        let a = a330();
+        assert!(a.flight_directors && a.v2_kts == Some(153.0));
+        assert!(
+            !a.autothrottle_armed,
+            "the A330's script arms it from the levers"
+        );
+        assert!(a.thrust_reduction_agl_ft.is_none());
+        assert!(!a.references().contains(&AT_MODE));
+        let _g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        publish(Some(b));
+        assert_eq!(
+            thrust_reduction(),
+            Some(ThrustReduction {
+                agl_ft: 1000.0,
+                lever: 0.9
+            })
+        );
+        publish(Some(a));
+        assert_eq!(thrust_reduction(), None);
+        publish(None);
+        assert_eq!(thrust_reduction(), None);
+    }
+
+    /// The Monitor's audit: the 737's own BEFORE TAKEOFF list, read-only,
+    /// finds EGPH's state (lever armed, no FD, A/T hard off, 125 in the
+    /// window) as four discrepancies, and a configured aircraft as none.
+    #[test]
+    fn the_before_takeoff_list_audits_the_autoflight() {
+        use crate::checklist::Item;
+        let profile = crate::aircraft::load("boeing_737_800").unwrap();
+        let lists = crate::checklist::load(&profile).expect("the 737 checklist parses");
+        let idx = crate::flow::find_titled(&lists, "before takeoff").expect("section");
+        let judge = |state: &[(&str, f64)]| -> Vec<String> {
+            lists[idx]
+                .items
+                .iter()
+                .filter_map(|item| {
+                    let (dref, cond) = match item {
+                        Item::Act { cond, dataref, .. } | Item::Verify { cond, dataref, .. } => {
+                            (dataref.as_str(), cond)
+                        }
+                        _ => return None,
+                    };
+                    let v = state.iter().find(|(d, _)| *d == dref)?.1;
+                    (!cond.eval(v)).then(|| dref.to_string())
+                })
+                .collect()
+        };
+        let egph = [
+            (SPEEDBRAKE, -0.5),
+            (FD_MODE, 0.0),
+            (AT_MODE, -1.0),
+            (SPEED_WINDOW, 125.0),
+        ];
+        assert_eq!(judge(&egph).len(), 4, "{:?}", judge(&egph));
+        let set = [
+            (SPEEDBRAKE, 0.0),
+            (FD_MODE, 1.0),
+            (AT_MODE, 0.0),
+            (SPEED_WINDOW, 150.0),
+        ];
+        assert!(judge(&set).is_empty(), "{:?}", judge(&set));
     }
 
     /// A speedbrake the descent is using is not pulled in to arm it.

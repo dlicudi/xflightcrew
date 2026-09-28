@@ -254,6 +254,22 @@ takeoff_config:
   takeoff_speedbrake_down: true
   autobrake_rto: true
   landing_autobrake_level: 3
+  # The autoflight a crew sets before the roll (EGPH 2026-09-21: the MCP
+  # speed window at 125, no flight directors, no A/T arm; issue #91). All
+  # stock, and the B738 glareshield script only READS them: FD
+  # flight_director_mode (fdir_on), A/T autothrottle_enabled 0 = the PFD's
+  # "ARM" (autothrottle_arm from hard off; an engaged mode is taken out with
+  # autothrottle_off, since the takeoff owns the levers), the MCP window
+  # airspeed_dial_kts_mach. V2 is the card's (V1 140 / VR 145 / V2 150).
+  flight_directors: true
+  autothrottle_armed: true
+  v2_kts: 150.0
+  # Thrust reduction at 1,000 ft to climb thrust. No FADEC notches on this
+  # acf (_fadec_parameter -1), so the lever is roughly linear in thrust and
+  # 0.9 is a hypothesis for CLB. VERIFY: blackbox `autotakeoff`
+  # `thrust_reduction` carries `n1` (CLB is about 95 % at sea level).
+  thrust_reduction_agl_ft: 1000.0
+  climb_thrust_ratio: 0.9
 vs_clean_kts: 139.0
 # Gear operating limit (VLO 235 to extend in the real aircraft; the acf's
 # Vle 270 is the extended limit). The tool refuses cycling above this.
@@ -269,6 +285,13 @@ tail_strike_deg: 11.0
 # -0.38 (BIKF-EGPH, 2026-09-20). Half travel is enough to hold the tail-strike
 # ceiling above without being able to shove the nose at the runway.
 pitch_authority_down: 0.5
+# The highest attitude the hand-flown initial climb may hold once the tail
+# clears (autotakeoff::tail_clear_ceiling_deg), holding V2 + 15 by pitch to the 300 ft engage
+# (autotakeoff::ClimbHold, issue #78). At 8 degrees the aircraft went 162 to
+# 185 kt by 300 ft on all five LEMG 13 circuits (2026-09-28); the excess
+# thrust recorded there wants about 16 to hold 165. VERIFY: blackbox
+# `autotakeoff` `climb_manual` `ias` 150-173 and `theta` under this.
+climb_pitch_max_deg: 18.0
 
 # Taxi pacing: an MD-82 figure. At idle thrust a 737 rolls past 10 knots on
 # flat pavement, so 10 is a brake setting; airline practice is 15-20 straight,

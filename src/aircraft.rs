@@ -362,6 +362,15 @@ pub struct AircraftProfile {
     /// on a jet — see `autotakeoff::PITCH_MIN`.
     #[serde(default)]
     pub pitch_authority_down: Option<f64>,
+    /// The highest pitch attitude the hand-flown initial climb may hold,
+    /// degrees, once clear of the runway (see `autotakeoff::ClimbHold`). With
+    /// it the rotation holds the initial climb speed by PITCH from liftoff to
+    /// the autopilot's engage, the way a crew flies V2 + 15; without it the
+    /// law holds its fixed rotation attitude, as every GA single always has.
+    /// EGPH 2026-09-21 and LEMG 2026-09-28: at 8 degrees a 737 at takeoff
+    /// thrust went 162 to 185 kt between liftoff and 300 ft.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub climb_pitch_max_deg: Option<f64>,
     /// Path to an XChecklist file to interpret (relative to the working dir).
     /// `None` means no checklists for this airframe. The file is read-only input;
     /// the copilot interprets it (see [`crate::checklist`]).
@@ -2032,6 +2041,69 @@ pub struct TakeoffConfigProfile {
     /// script lights LO at 3 and MED at 4. `None` leaves it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub landing_autobrake_level: Option<i64>,
+    /// Flight directors ON before the roll (stock `flight_director_mode`,
+    /// raised by `sim/autopilot/fdir_on`, read back).
+    #[serde(default)]
+    pub flight_directors: bool,
+    /// Autothrottle ARMED and not engaged before the roll (stock
+    /// `autothrottle_enabled` 0: armed by `autothrottle_arm` from hard off,
+    /// an engaged mode taken out by `autothrottle_off`, because the takeoff
+    /// owns the thrust levers). An airframe whose script arms it from the
+    /// lever detents (the A330) leaves this false.
+    #[serde(default)]
+    pub autothrottle_armed: bool,
+    /// V2, KIAS, set in the MCP speed window before the roll (stock
+    /// `airspeed_dial_kts_mach`, read back). The reference card's figure.
+    /// `None` leaves the window.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub v2_kts: Option<f64>,
+    /// Thrust reduction: above this height AGL the takeoff pulls the levers
+    /// back to `climb_thrust_ratio`. Both or neither; `None` keeps takeoff
+    /// thrust until whoever takes the aircraft next sets it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thrust_reduction_agl_ft: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub climb_thrust_ratio: Option<f64>,
+}
+
+impl TakeoffConfigProfile {
+    pub const SPEEDBRAKE: &'static str = "sim/cockpit2/controls/speedbrake_ratio";
+    /// 0 RTO, 1 off, 2..5 the landing levels.
+    pub const AUTOBRAKE: &'static str = "sim/cockpit2/switches/auto_brake_level";
+    /// 0 off, 1 on, 2 on with the servos.
+    pub const FD_MODE: &'static str = "sim/cockpit2/autopilot/flight_director_mode";
+    pub const CMD_FD_ON: &'static str = "sim/autopilot/fdir_on";
+    /// -1 hard off, 0 ARMED (servos declutched; the PFD's "ARM"), 1 speed,
+    /// 2 N1, 3 retard.
+    pub const AT_MODE: &'static str = "sim/cockpit2/autopilot/autothrottle_enabled";
+    pub const CMD_AT_ARM: &'static str = "sim/autopilot/autothrottle_arm";
+    /// "All modes off, remain armed."
+    pub const CMD_AT_OFF: &'static str = "sim/autopilot/autothrottle_off";
+    /// The MCP speed window (the 737's glareshield script reads this one).
+    pub const SPEED_WINDOW: &'static str = "sim/cockpit2/autopilot/airspeed_dial_kts_mach";
+
+    /// The stock names the declarations rely on, for the profile probe
+    /// ([`profile_references`]): the profile says THAT the airframe has an
+    /// item, the names live here and in `takeoff_config`, which uses these.
+    pub fn references(&self) -> Vec<&'static str> {
+        let mut out = Vec::new();
+        if self.arm_spoilers || self.takeoff_speedbrake_down {
+            out.push(Self::SPEEDBRAKE);
+        }
+        if self.autobrake_rto || self.landing_autobrake_level.is_some() {
+            out.push(Self::AUTOBRAKE);
+        }
+        if self.flight_directors {
+            out.extend([Self::FD_MODE, Self::CMD_FD_ON]);
+        }
+        if self.autothrottle_armed {
+            out.extend([Self::AT_MODE, Self::CMD_AT_ARM, Self::CMD_AT_OFF]);
+        }
+        if self.v2_kts.is_some() {
+            out.push(Self::SPEED_WINDOW);
+        }
+        out
+    }
 }
 
 /// One more knob a transponder needs set (see [`TransponderModeKnob::also`]):
@@ -3030,6 +3102,15 @@ pub fn profile_references(p: &AircraftProfile) -> Vec<String> {
     if let Ok(v) = serde_yaml::to_value(p) {
         walk(&v, "", &mut out);
     }
+    // The takeoff configuration's declarations carry no names either: the
+    // stock ones behind each ([`TakeoffConfigProfile::references`]).
+    if let Some(tc) = &p.takeoff_config {
+        for name in tc.references() {
+            if !out.iter().any(|o| o == name) {
+                out.push(name.to_string());
+            }
+        }
+    }
     // Fields that carry no name of their own, only indices into stock
     // arrays the tool reads and writes: the names they rely on.
     if !p.fuel_tank_pumps_off_when_empty.is_empty() {
@@ -3178,6 +3259,8 @@ mod tests {
             ("autotakeoff", "ROLL_BRAKE_FULL_KTS", "brake-steer fade band, groundspeed; only brake_steer airframes"),
             ("autotakeoff", "ROLL_BRAKE_OFF_KTS", "brake-steer fade band, groundspeed; only brake_steer airframes"),
             ("autotakeoff", "ROLL_ALIGN_KTS", "walking-pace pivot at a crooked roll start; only brake_steer airframes"),
+            ("autotakeoff", "CLIMB_ACCEL_MAX_KTS_S", "the climb hold's asked-for trend: a speed ERROR closed, and only on airframes declaring climb_pitch_max_deg"),
+            ("autotakeoff", "CLIMB_PITCH_DOWN_DEG_S", "the climb hold's target walk down, a law rate below the rotation's own 2.5 deg/s; declared airframes only"),
             ("speedhold", "IDLE_FAST_KTS", "margin over the pilot's own target, not an airframe speed"),
             // --- Properties of the SIM or the SENSORS, not the airframe ---
             (
@@ -4830,6 +4913,7 @@ fn cessna_172sp() -> AircraftProfile {
         // A light single runs out of elevator before it runs out of tail
         // clearance, and only ever needs the rotation held BACK.
         pitch_authority_down: None,
+        climb_pitch_max_deg: None,
         // Reference figures from the X-Plane C172 Pilot's Operating Manual.
         reference: Some(ReferenceProfile {
             kind: Some("single-engine aircraft".into()),
@@ -5209,6 +5293,7 @@ fn cirrus_sr22() -> AircraftProfile {
         // A light single runs out of elevator before it runs out of tail
         // clearance, and only ever needs the rotation held BACK.
         pitch_authority_down: None,
+        climb_pitch_max_deg: None,
         // Reference figures from the X-Plane Cirrus SR22 Pilot's Operating Manual
         // (the modeled aircraft is the turbo TSIO-550-K, ceiling 25,000 ft).
         reference: Some(ReferenceProfile {
