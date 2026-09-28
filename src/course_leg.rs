@@ -120,6 +120,10 @@ pub enum Steer {
     Intercept,
     Track,
     Pattern(reversal::Leg),
+    /// An RF leg flown round its arc (#101).
+    Arc,
+    /// A holding pattern's phase (#101).
+    Hold(HoldPhase),
 }
 
 impl Steer {
@@ -131,6 +135,8 @@ impl Steer {
             Steer::Pattern(reversal::Leg::Outbound) => "pattern_outbound",
             Steer::Pattern(reversal::Leg::Base) => "pattern_base",
             Steer::Pattern(reversal::Leg::Inbound) => "pattern_inbound",
+            Steer::Arc => "arc",
+            Steer::Hold(p) => p.word(),
         }
     }
 
@@ -143,8 +149,14 @@ impl Steer {
             Steer::Pattern(reversal::Leg::Outbound) => 3,
             Steer::Pattern(reversal::Leg::Base) => 4,
             Steer::Pattern(reversal::Leg::Inbound) => 5,
+            Steer::Arc => 6,
+            Steer::Hold(HoldPhase::ToFix) => 7,
+            Steer::Hold(HoldPhase::TurnOut) => 8,
+            Steer::Hold(HoldPhase::Outbound) => 9,
+            Steer::Hold(HoldPhase::TurnIn) => 10,
+            Steer::Hold(HoldPhase::Inbound) => 11,
         };
-        idx * 8 + k
+        idx * 16 + k
     }
 }
 
@@ -631,5 +643,384 @@ mod tests {
         let (lat, lon) = at(0.5, -1.0);
         assert!(course_passed(&line, lat, lon, 0.8));
         assert!(!course_passed(&line, lat, lon, 0.3));
+    }
+}
+
+/// On an RF arc, the correction back onto it aims this far ahead, nm.
+const ARC_AIM_NM: f64 = 1.0;
+/// An arc whose end radial lies this far or more round the turn is behind
+/// us (no coded RF turns through more than this).
+const ARC_PASSED_DEG: f64 = 330.0;
+
+/// Degrees of the arc still to fly, measured round the turn from the
+/// aircraft's radial to the end fix's radial.
+pub fn arc_remaining_deg(arc: &crate::nav::Arc, lat: f64, lon: f64) -> f64 {
+    let here = crate::nav::bearing_deg(arc.center_lat, arc.center_lon, lat, lon);
+    let end = crate::nav::bearing_deg(arc.center_lat, arc.center_lon, arc.end_lat, arc.end_lon);
+    if arc.right {
+        (end - here).rem_euclid(360.0)
+    } else {
+        (here - end).rem_euclid(360.0)
+    }
+}
+
+/// The TRACK (true) that flies an RF arc (#101): the tangent at the
+/// aircraft's radial, cut toward the arc by the radial error over
+/// [`ARC_AIM_NM`], at most the standard intercept. Flown direct to its end
+/// fix, an RF is a chord across the airspace the arc was drawn round.
+pub fn arc_track(arc: &crate::nav::Arc, lat: f64, lon: f64) -> f64 {
+    let radial = crate::nav::bearing_deg(arc.center_lat, arc.center_lon, lat, lon);
+    let dir = if arc.right { 1.0 } else { -1.0 };
+    let tangent = radial + dir * 90.0;
+    let err = crate::nav::haversine_nm(arc.center_lat, arc.center_lon, lat, lon) - arc.radius_nm;
+    let cut = (err.abs() / ARC_AIM_NM).atan().to_degrees().min(INTERCEPT_DEG);
+    // Outside the arc the correction turns toward the centre: the turn's
+    // own direction.
+    (tangent + dir * err.signum() * cut).rem_euclid(360.0)
+}
+
+/// Has the arc been flown? Its end radial reached, or within the capture
+/// distance of it round the arc.
+pub fn arc_done(arc: &crate::nav::Arc, lat: f64, lon: f64, capture_nm: f64) -> bool {
+    let rem = arc_remaining_deg(arc, lat, lon);
+    rem >= ARC_PASSED_DEG || rem.to_radians() * arc.radius_nm <= capture_nm
+}
+
+/// A holding pattern's phase: to the fix, the turn outbound, the timed
+/// outbound leg, the turn back, the inbound course to the fix.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HoldPhase {
+    ToFix,
+    TurnOut,
+    Outbound,
+    TurnIn,
+    Inbound,
+}
+
+impl HoldPhase {
+    pub fn word(self) -> &'static str {
+        match self {
+            HoldPhase::ToFix => "hold_to_fix",
+            HoldPhase::TurnOut => "hold_turn_out",
+            HoldPhase::Outbound => "hold_outbound",
+            HoldPhase::TurnIn => "hold_turn_in",
+            HoldPhase::Inbound => "hold_inbound",
+        }
+    }
+}
+
+/// A hold's 180 degree turns are flown in two halves (90 degrees, then the
+/// rest), so the heading mode never meets a 180 it may take the short way.
+const HOLD_HALF_TURN_DONE_DEG: f64 = 20.0;
+/// The outbound leg is timed from this close to the outbound track.
+const HOLD_OUTBOUND_BAND_DEG: f64 = 10.0;
+/// A hold to an altitude that has not made it after this many circuits is
+/// left, and said.
+pub const HOLD_MAX_CIRCUITS: u32 = 6;
+/// A hold's altitude is made within this, feet (the follower's own margin).
+const HOLD_ALT_MARGIN_FT: f64 = 100.0;
+
+/// How a hold ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HoldEnd {
+    /// HF: the one circuit flown; HA: the altitude made at the fix.
+    Flown,
+    /// HA past [`HOLD_MAX_CIRCUITS`].
+    GaveUp,
+}
+
+/// One holding leg flown as a racetrack (#101): HF once round, HA until its
+/// altitude is made at the fix. Direct entry (to the fix, then outbound);
+/// the outbound leg is the chart's time (else 1 minute at or below 14,000
+/// ft, 1.5 above) or distance. Pure; the caller supplies the clock.
+#[derive(Debug, Clone)]
+pub struct HoldFlight {
+    pub phase: HoldPhase,
+    pub circuits: u32,
+    /// The inbound course, true.
+    inbound_true: f64,
+    right: bool,
+    fix: (f64, f64),
+    leg_min: Option<f64>,
+    leg_nm: Option<f64>,
+    /// Inside a turn: its first 90 degrees are done.
+    half: bool,
+    outbound_from: Option<(f64, f64, f64)>,
+}
+
+/// One hold tick's answer.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct HoldStep {
+    pub track_true: f64,
+    pub steer: Steer,
+    pub end: Option<HoldEnd>,
+    /// The phase changed this tick (for the log).
+    pub moved: bool,
+}
+
+impl HoldFlight {
+    /// A hold for `leg` when it is HF or HA with a fix and an inbound
+    /// course. HM (hold until told) is `None`: the follower flies its fix
+    /// and goes on, as before, since nobody here can release it.
+    pub fn for_leg(leg: &ProcLeg, mag_var: f64) -> Option<Self> {
+        if !matches!(leg.leg_type.as_str(), "HF" | "HA") {
+            return None;
+        }
+        let f = leg.fix.as_ref()?;
+        let course = leg.course_mag?;
+        Some(HoldFlight {
+            phase: HoldPhase::ToFix,
+            circuits: 0,
+            inbound_true: (course - mag_var).rem_euclid(360.0),
+            right: leg.turn != Some('L'),
+            fix: (f.lat, f.lon),
+            leg_min: leg.path.hold_leg_min.filter(|m| *m > 0.0),
+            leg_nm: leg.dist_nm.filter(|d| *d > 0.0),
+            half: false,
+            outbound_from: None,
+        })
+    }
+
+    /// At the fix: is the hold over? HF after one circuit; HA once its
+    /// altitude is made, or past the cap.
+    fn exit_due(&self, leg: &ProcLeg, alt_ft: f64) -> Option<HoldEnd> {
+        if leg.leg_type == "HF" {
+            return (self.circuits >= 1).then_some(HoldEnd::Flown);
+        }
+        let made = match (leg.alt1_ft, leg.alt_desc) {
+            (None, _) => true,
+            (Some(t), '+') => alt_ft >= t - HOLD_ALT_MARGIN_FT,
+            (Some(t), '-') => alt_ft <= t + HOLD_ALT_MARGIN_FT,
+            (Some(t), _) => (alt_ft - t).abs() <= HOLD_ALT_MARGIN_FT,
+        };
+        if made {
+            Some(HoldEnd::Flown)
+        } else if self.circuits >= HOLD_MAX_CIRCUITS {
+            Some(HoldEnd::GaveUp)
+        } else {
+            None
+        }
+    }
+
+    /// Steer the hold one tick. `capture_nm` is the fix's capture distance,
+    /// `now_s` any monotonic clock.
+    #[allow(clippy::too_many_arguments)]
+    pub fn step(
+        &mut self,
+        leg: &ProcLeg,
+        lat: f64,
+        lon: f64,
+        track_true: f64,
+        gs_kts: f64,
+        alt_ft: f64,
+        capture_nm: f64,
+        now_s: f64,
+    ) -> HoldStep {
+        let dir = if self.right { 1.0 } else { -1.0 };
+        let outbound = (self.inbound_true + 180.0).rem_euclid(360.0);
+        let abeam_out = self.inbound_true + dir * 90.0;
+        let abeam_in = outbound + dir * 90.0;
+        let line = CourseLine::through(self.fix.0, self.fix.1, self.inbound_true);
+        let at_fix = crate::nav::haversine_nm(lat, lon, self.fix.0, self.fix.1) <= capture_nm;
+        let was = self.phase;
+        let mut end = None;
+        match self.phase {
+            HoldPhase::ToFix if at_fix => {
+                // A hold to an altitude already made is flown through.
+                if leg.leg_type == "HA" {
+                    end = self.exit_due(leg, alt_ft).filter(|e| *e == HoldEnd::Flown);
+                }
+                if end.is_none() {
+                    self.phase = HoldPhase::TurnOut;
+                    self.half = false;
+                }
+            }
+            HoldPhase::TurnOut => {
+                if !self.half && heading_diff(abeam_out, track_true).abs() <= HOLD_HALF_TURN_DONE_DEG {
+                    self.half = true;
+                }
+                if self.half && heading_diff(outbound, track_true).abs() <= HOLD_OUTBOUND_BAND_DEG {
+                    self.phase = HoldPhase::Outbound;
+                    self.outbound_from = Some((lat, lon, now_s));
+                }
+            }
+            HoldPhase::Outbound => {
+                let (la, lo, t0) = self.outbound_from.unwrap_or((lat, lon, now_s));
+                let done = match self.leg_nm {
+                    Some(nm) => crate::nav::haversine_nm(la, lo, lat, lon) >= nm,
+                    None => {
+                        let min = self.leg_min.unwrap_or(if alt_ft > 14_000.0 { 1.5 } else { 1.0 });
+                        now_s - t0 >= min * 60.0
+                    }
+                };
+                if done {
+                    self.phase = HoldPhase::TurnIn;
+                    self.half = false;
+                }
+            }
+            HoldPhase::TurnIn => {
+                if heading_diff(abeam_in, track_true).abs() <= HOLD_HALF_TURN_DONE_DEG {
+                    self.phase = HoldPhase::Inbound;
+                }
+            }
+            HoldPhase::Inbound => {
+                if at_fix || course_passed(&line, lat, lon, capture_nm) {
+                    self.circuits += 1;
+                    end = self.exit_due(leg, alt_ft);
+                    if end.is_none() {
+                        self.phase = HoldPhase::TurnOut;
+                        self.half = false;
+                    }
+                }
+            }
+            _ => {}
+        }
+        let track = match self.phase {
+            HoldPhase::ToFix => crate::nav::bearing_deg(lat, lon, self.fix.0, self.fix.1),
+            HoldPhase::TurnOut if !self.half => abeam_out,
+            HoldPhase::TurnOut | HoldPhase::Outbound => outbound,
+            HoldPhase::TurnIn => abeam_in,
+            HoldPhase::Inbound => course_track(&line, lat, lon, track_true, gs_kts, true)
+                .map(|(t, _)| t)
+                .unwrap_or_else(|| crate::nav::bearing_deg(lat, lon, self.fix.0, self.fix.1)),
+        };
+        HoldStep {
+            track_true: track.rem_euclid(360.0),
+            steer: Steer::Hold(self.phase),
+            end,
+            moved: self.phase != was,
+        }
+    }
+}
+
+#[cfg(test)]
+mod arc_hold_tests {
+    use super::*;
+    use crate::nav::{project_latlon, Arc, Fix, ProcLeg};
+
+    fn arc() -> Arc {
+        // Centre 47N 11E, 3 nm, clockwise, ending due east of it.
+        let (end_lat, end_lon) = project_latlon(47.0, 11.0, 90.0, 3.0);
+        Arc { center_lat: 47.0, center_lon: 11.0, radius_nm: 3.0, right: true, end_lat, end_lon }
+    }
+
+    /// #101: on the arc the track is its tangent; outside it cuts in,
+    /// inside it cuts out, never past the intercept; the end radial ends it.
+    #[test]
+    fn an_rf_leg_is_flown_round_its_arc_not_across_its_chord() {
+        let a = arc();
+        let (lat, lon) = project_latlon(47.0, 11.0, 0.0, 3.0);
+        assert!(heading_diff(arc_track(&a, lat, lon), 90.0).abs() < 1.0, "north of the centre, clockwise: east");
+        assert!((arc_remaining_deg(&a, lat, lon) - 90.0).abs() < 1.0);
+        assert!(!arc_done(&a, lat, lon, 0.5));
+        let (lat, lon) = project_latlon(47.0, 11.0, 0.0, 3.5);
+        assert!(heading_diff(arc_track(&a, lat, lon), 90.0) > 10.0, "outside: toward the centre");
+        let (lat, lon) = project_latlon(47.0, 11.0, 0.0, 2.5);
+        let cut = heading_diff(arc_track(&a, lat, lon), 90.0);
+        assert!(cut < -10.0 && cut >= -INTERCEPT_DEG - 0.01, "inside: outward, {cut}");
+        let (lat, lon) = project_latlon(47.0, 11.0, 85.0, 3.0);
+        assert!(arc_done(&a, lat, lon, 0.5), "within the capture of the end");
+        let (lat, lon) = project_latlon(47.0, 11.0, 100.0, 3.0);
+        assert!(arc_done(&a, lat, lon, 0.5), "past the end radial");
+        // Anticlockwise mirrors it.
+        let l = Arc { right: false, ..a };
+        let (lat, lon) = project_latlon(47.0, 11.0, 180.0, 3.0);
+        assert!(heading_diff(arc_track(&l, lat, lon), 90.0).abs() < 1.0, "south, anticlockwise: east");
+    }
+
+    #[test]
+    fn a_parsed_rf_leg_is_an_arc_only_with_its_centre_turn_and_fix() {
+        let mut leg = ProcLeg { leg_type: "RF".into(), turn: Some('R'), ..Default::default() };
+        assert!(leg.arc().is_none());
+        leg.fix = Some(Fix { ident: "END".into(), lat: 47.0, lon: 11.05 });
+        assert!(leg.arc().is_none(), "no centre");
+        leg.path.arc_center = Some(Fix { ident: "CTR".into(), lat: 47.0, lon: 11.0 });
+        let a = leg.arc().expect("arc");
+        assert!((a.radius_nm - crate::nav::haversine_nm(47.0, 11.0, 47.0, 11.05)).abs() < 0.01, "from geometry");
+        leg.path.arc_radius_nm = Some(2.0);
+        assert_eq!(leg.arc().unwrap().radius_nm, 2.0, "the chart's radius first");
+        leg.leg_type = "TF".into();
+        assert!(leg.arc().is_none());
+    }
+
+    fn hold(kind: &str) -> ProcLeg {
+        let mut l = ProcLeg {
+            leg_type: kind.into(),
+            fix_ident: "HLD".into(),
+            fix: Some(Fix { ident: "HLD".into(), lat: 47.0, lon: 11.0 }),
+            course_mag: Some(360.0),
+            turn: Some('R'),
+            ..Default::default()
+        };
+        l.path.hold_leg_min = Some(1.0);
+        l
+    }
+
+    /// A kinematic aircraft turning at 3 deg/s toward the commanded track,
+    /// from 5 nm south of the fix. Returns the end, the circuits, the
+    /// distance from the fix at the end and the phases in order.
+    fn fly(leg: &ProcLeg, climb_fpm: f64) -> (HoldEnd, u32, f64, Vec<HoldPhase>) {
+        let mut h = HoldFlight::for_leg(leg, 0.0).expect("a hold");
+        let (mut lat, mut lon) = project_latlon(47.0, 11.0, 180.0, 5.0);
+        let (mut trk, mut alt, gs) = (0.0_f64, 5000.0, 180.0);
+        let mut phases = vec![h.phase];
+        for i in 0..20_000 {
+            let s = h.step(leg, lat, lon, trk, gs, alt, 0.5, i as f64);
+            if s.moved {
+                phases.push(h.phase);
+            }
+            if let Some(e) = s.end {
+                return (e, h.circuits, crate::nav::haversine_nm(lat, lon, 47.0, 11.0), phases);
+            }
+            trk = (trk + heading_diff(s.track_true, trk).clamp(-3.0, 3.0)).rem_euclid(360.0);
+            (lat, lon) = project_latlon(lat, lon, trk, gs / 3600.0);
+            alt += climb_fpm / 60.0;
+        }
+        panic!("the hold never ended: {:?} after {} circuits", h.phase, h.circuits);
+    }
+
+    #[test]
+    fn a_hold_is_flown_as_a_racetrack_and_left_at_its_fix() {
+        let (e, n, d, phases) = fly(&hold("HF"), 0.0);
+        assert_eq!((e, n), (HoldEnd::Flown, 1));
+        assert!(d < 1.0, "left at the fix, {d} nm");
+        use HoldPhase::*;
+        assert_eq!(phases, vec![ToFix, TurnOut, Outbound, TurnIn, Inbound]);
+        // HA: 500 fpm from 5,000 to 8,000 is six minutes, a circuit or two
+        // of about four; left at the fix once made.
+        let mut ha = hold("HA");
+        ha.alt1_ft = Some(8000.0);
+        ha.alt_desc = '+';
+        let (e, n, d, _) = fly(&ha, 500.0);
+        assert_eq!(e, HoldEnd::Flown);
+        assert!((1..=3).contains(&n), "{n} circuits");
+        assert!(d < 1.0);
+        // One that never makes it gives up at the cap.
+        let (e, n, _, _) = fly(&ha, 0.0);
+        assert_eq!((e, n), (HoldEnd::GaveUp, HOLD_MAX_CIRCUITS));
+        // HM is not flown: the follower goes on at its fix.
+        assert!(HoldFlight::for_leg(&hold("HM"), 0.0).is_none());
+    }
+
+    /// LOWI's RTT3X from 26: the RF to WI008 round WI009 at 1.4 nm, parsed
+    /// and resolved into an arc the follower flies. Needs the X-Plane install.
+    /// `cargo test -- --ignored real_install_lowi_rf_arc --nocapture`
+    #[test]
+    #[ignore]
+    fn real_install_lowi_rf_arc() {
+        let config = crate::config::Config::from_env().expect("config");
+        let apt = crate::nav::find_airport(&config.apt_data_path, "LOWI").unwrap().unwrap();
+        let (alat, alon) = apt.position().unwrap();
+        let mut legs =
+            crate::nav::load_proc_legs(&config.cifp_dir, "LOWI", crate::nav::ProcKind::Sid, "RTT3X", Some("RW26"));
+        crate::nav::resolve_proc_fixes(&config.fix_data_path, &config.nav_data_path, &apt, "LOWI", &mut legs, alat, alon);
+        let rf = legs.iter().find(|l| l.leg_type == "RF").expect("an RF leg");
+        println!("{} centre {:?} r {:?} turn {:?}", rf.fix_ident, rf.path.arc_center, rf.path.arc_radius_nm, rf.turn);
+        assert_eq!((rf.fix_ident.as_str(), rf.path.arc_center_ident.as_str()), ("WI008", "WI009"));
+        let a = rf.arc().expect("a flyable arc");
+        assert!((a.radius_nm - 1.4).abs() < 0.15, "{}", a.radius_nm);
+        assert!(!a.right, "a left turn");
+        let geo = crate::nav::haversine_nm(a.center_lat, a.center_lon, a.end_lat, a.end_lon);
+        assert!((geo - a.radius_nm).abs() < 0.2, "the end fix is on the arc: {geo}");
     }
 }

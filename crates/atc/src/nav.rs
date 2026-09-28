@@ -2897,7 +2897,7 @@ pub struct Fix {
 /// One leg of a terminal procedure, parsed from a CIFP record. `fix` is `None`
 /// until [`resolve_proc_fixes`] fills it (and stays `None` for to-altitude legs
 /// that have no fix at all).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct ProcLeg {
     pub seq: u32,
     /// Transition/runway this leg belongs to (field 3): "RW30", a transition
@@ -2935,6 +2935,83 @@ pub struct ProcLeg {
     pub navaid_region: String,
     /// That navaid resolved, once [`resolve_proc_fixes`] has run.
     pub navaid: Option<Fix>,
+    /// The leg's shape beyond its fix: an RF arc's centre and radius, a
+    /// holding leg's length.
+    pub path: LegPath,
+}
+
+/// What an RF or holding leg carries besides its fix (issue #101).
+#[derive(Debug, Clone, Default)]
+pub struct LegPath {
+    /// RF: the arc's centre fix (fields 30 and 31) and radius, nm (field 17,
+    /// thousandths: LOWI's "001400" is 1.4 nm).
+    pub arc_center_ident: String,
+    pub arc_center_region: String,
+    /// The centre resolved, once [`resolve_proc_fixes`] has run.
+    pub arc_center: Option<Fix>,
+    pub arc_radius_nm: Option<f64>,
+    /// HM / HA / HF: the inbound leg's time, minutes (field 21, "T010" = 1.0
+    /// min); a leg coded by distance keeps it in `dist_nm`.
+    pub hold_leg_min: Option<f64>,
+}
+
+/// An RF leg the follower can fly: its fix, its centre and its radius known.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Arc {
+    pub center_lat: f64,
+    pub center_lon: f64,
+    pub radius_nm: f64,
+    /// 'R' clockwise, 'L' anticlockwise, seen from above.
+    pub right: bool,
+    pub end_lat: f64,
+    pub end_lon: f64,
+}
+
+impl ProcLeg {
+    /// This leg as a flyable RF arc: `None` for any other leg, or an RF whose
+    /// centre, radius, turn or end fix is unknown (flown as before).
+    pub fn arc(&self) -> Option<Arc> {
+        if self.leg_type != "RF" {
+            return None;
+        }
+        let c = self.path.arc_center.as_ref()?;
+        let f = self.fix.as_ref()?;
+        let right = match self.turn? {
+            'R' => true,
+            'L' => false,
+            _ => return None,
+        };
+        // The radius from the chart, else from the geometry (the end fix is
+        // on the arc by construction).
+        let radius_nm = self
+            .path
+            .arc_radius_nm
+            .filter(|r| *r > 0.05)
+            .unwrap_or_else(|| haversine_nm(c.lat, c.lon, f.lat, f.lon));
+        (radius_nm > 0.05).then_some(Arc {
+            center_lat: c.lat,
+            center_lon: c.lon,
+            radius_nm,
+            right,
+            end_lat: f.lat,
+            end_lon: f.lon,
+        })
+    }
+
+    /// A holding leg (HM manual, HA to an altitude, HF one circuit).
+    pub fn is_hold(&self) -> bool {
+        matches!(self.leg_type.as_str(), "HM" | "HA" | "HF")
+    }
+}
+
+/// A CIFP distance/time cell: "T010" is 1.0 minute (a hold's leg time),
+/// anything else tenths of a mile. Returns (nm, minutes).
+fn arinc_dist_or_time(s: &str) -> (Option<f64>, Option<f64>) {
+    let s = s.trim();
+    match s.strip_prefix('T') {
+        Some(t) => (None, arinc_tenths(t)),
+        None => (arinc_tenths(s), None),
+    }
 }
 
 impl ProcLeg {
@@ -3001,15 +3078,29 @@ pub fn parse_proc_legs<'a>(
             .nth(1)
             .and_then(|s| s.trim().parse().ok())
             .unwrap_or(0);
+        let leg_type = cifp_field(&f, 11).to_string();
+        let (dist_nm, leg_min) = arinc_dist_or_time(cifp_field(&f, 21));
+        let rf = leg_type == "RF";
         out.push(ProcLeg {
             seq,
             transition: tr,
-            leg_type: cifp_field(&f, 11).to_string(),
+            path: LegPath {
+                arc_center_ident: if rf { cifp_field(&f, 30).to_string() } else { String::new() },
+                arc_center_region: if rf { cifp_field(&f, 31).to_string() } else { String::new() },
+                arc_center: None,
+                arc_radius_nm: if rf {
+                    cifp_field(&f, 17).parse::<f64>().ok().map(|r| r / 1000.0).filter(|r| *r > 0.0)
+                } else {
+                    None
+                },
+                hold_leg_min: leg_min,
+            },
+            leg_type,
             fix_ident: cifp_field(&f, 4).to_string(),
             fix_region: cifp_field(&f, 5).to_string(),
             fix: None,
             course_mag: arinc_tenths(cifp_field(&f, 20)),
-            dist_nm: arinc_tenths(cifp_field(&f, 21)),
+            dist_nm,
             // The turn direction is field 9; 12 is only its "valid" flag
             // (LOWI R26-Z's RF leg: "L" in 9, blank in 12).
             turn: cifp_field(&f, 9)
@@ -3962,6 +4053,11 @@ pub fn resolve_proc_fixes(
                 .filter(|l| l.navaid.is_none() && !l.navaid_ident.is_empty())
                 .map(|l| (l.navaid_ident.clone(), l.navaid_region.clone())),
         )
+        .chain(
+            legs.iter()
+                .filter(|l| l.path.arc_center.is_none() && !l.path.arc_center_ident.is_empty())
+                .map(|l| (l.path.arc_center_ident.clone(), l.path.arc_center_region.clone())),
+        )
         .collect();
     if wanted.is_empty() {
         return;
@@ -4032,6 +4128,19 @@ pub fn resolve_proc_fixes(
         if let Some(&(lat, lon, _)) = found.get(&(leg.navaid_ident.clone(), leg.navaid_region.clone())) {
             leg.navaid = Some(Fix {
                 ident: leg.navaid_ident.clone(),
+                lat,
+                lon,
+            });
+        }
+    }
+    for leg in legs.iter_mut() {
+        if leg.path.arc_center.is_some() || leg.path.arc_center_ident.is_empty() {
+            continue;
+        }
+        let key = (leg.path.arc_center_ident.clone(), leg.path.arc_center_region.clone());
+        if let Some(&(lat, lon, _)) = found.get(&key) {
+            leg.path.arc_center = Some(Fix {
+                ident: key.0,
                 lat,
                 lon,
             });
@@ -4146,6 +4255,7 @@ pub fn reconstruct_approach(
             navaid_ident: String::new(),
             navaid_region: String::new(),
             navaid: None,
+            path: Default::default(),
         });
     }
     // The threshold itself, so the follower has a fix to fly to after the FAF
@@ -4173,6 +4283,7 @@ pub fn reconstruct_approach(
         navaid_ident: String::new(),
         navaid_region: String::new(),
         navaid: None,
+        path: Default::default(),
     });
     legs
 }
@@ -4495,6 +4606,7 @@ SID:070,5,LEGL1W,RW10,LEGLO,LI,E,A,EE  ,R,010,TF, , , , , ,      ,    ,    ,    
             navaid_ident: String::new(),
             navaid_region: String::new(),
             navaid: None,
+            path: Default::default(),
         };
         let circling = vec![leg("IF", "WI813"), leg("TF", "WI814"), leg("TF", "WI006"), leg("TF", "RTT")];
         assert!(straight_in_legs(circling, "08").is_none());
@@ -4613,6 +4725,7 @@ STAR:030,6,ALWYS3,RW28B,ARRTU,K2,P,C,E   , ,   ,TF, , , , , ,      ,    ,    ,  
             navaid_ident: String::new(),
             navaid_region: String::new(),
             navaid: None,
+            path: Default::default(),
         };
         let raw = vec![
             leg("ZS701", 46.3265, 9.575944, false, Some(12400.0)),

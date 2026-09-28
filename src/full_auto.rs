@@ -6831,6 +6831,7 @@ mod tests {
             navaid_ident: String::new(),
             navaid_region: String::new(),
             navaid: None,
+            path: Default::default(),
         };
         let legs = vec![
             leg("WI505", 47.252, 11.269),

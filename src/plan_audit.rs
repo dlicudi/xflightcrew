@@ -1209,6 +1209,7 @@ mod tests {
             navaid_ident: String::new(),
             navaid_region: String::new(),
             navaid: None,
+            path: Default::default(),
         }
     }
 

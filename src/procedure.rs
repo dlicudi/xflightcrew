@@ -1968,6 +1968,7 @@ pub fn enroute_legs(
             navaid_ident: String::new(),
             navaid_region: String::new(),
             navaid: None,
+            path: Default::default(),
         })
         .collect()
 }
@@ -2305,6 +2306,9 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, plan: Pla
     // The join onto an approach's final from its IF, and how the last tick
     // steered (`crate::course_leg`, #106).
     let mut final_join = crate::course_leg::FinalJoin::default();
+    // The hold being flown, by leg index, and the last hold leg seen (#101).
+    let mut hold: Option<(usize, crate::course_leg::HoldFlight)> = None;
+    let mut hold_seen: Option<usize> = None;
     let mut steer_was = crate::course_leg::Steer::Direct;
     let mut closure: Option<(usize, crate::circuit::Closure)> = None;
     let mut stalls = 0u32;
@@ -2728,6 +2732,66 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, plan: Pla
             }
             _ => {}
         }
+        // An RF leg round its arc, a hold as a racetrack (#101).
+        let arc = if steer_track.is_none() { leg.arc() } else { None };
+        let mut holding = false;
+        let mut hold_end: Option<crate::course_leg::HoldEnd> = None;
+        if let Some(a) = arc.as_ref() {
+            steer_track = Some(crate::course_leg::arc_track(a, lat, lon));
+            steer = Steer::Arc;
+        } else if steer_track.is_none() && leg.is_hold() {
+            if hold_seen != Some(idx) {
+                hold_seen = Some(idx);
+                hold = crate::course_leg::HoldFlight::for_leg(leg, mag_var).map(|h| (idx, h));
+                crate::blackbox::record(
+                    "procedure",
+                    serde_json::json!({"event": if hold.is_some() { "hold_armed" } else { "hold_not_flown" },
+                        "idx": idx, "fix": leg.fix_ident, "leg": leg.leg_type, "course": leg.course_mag,
+                        "turn": leg.turn.map(String::from), "leg_min": leg.path.hold_leg_min,
+                        "leg_nm": leg.dist_nm, "alt": leg.alt1_ft}),
+                );
+            }
+            if let Some((_, h)) = hold.as_mut().filter(|(i, _)| *i == idx) {
+                let s = h.step(leg, lat, lon, track_true, gs_kts, alt_ft, CAPTURE_NM, progress_s);
+                if s.moved {
+                    crate::blackbox::record(
+                        "procedure",
+                        serde_json::json!({"event": "hold", "idx": idx, "fix": leg.fix_ident,
+                            "phase": h.phase.word(), "circuits": h.circuits, "alt_ft": alt_ft}),
+                    );
+                    if h.phase == crate::course_leg::HoldPhase::TurnOut && h.circuits == 0 {
+                        alert(
+                            &voice,
+                            Priority::Advisory,
+                            &format!("Entering the hold at {}.", crate::tools::procedure::spell_ident(&leg.fix_ident)),
+                        );
+                    }
+                }
+                if let Some(e) = s.end {
+                    crate::blackbox::record(
+                        "procedure",
+                        serde_json::json!({"event": "hold_end", "idx": idx, "fix": leg.fix_ident,
+                            "how": if e == crate::course_leg::HoldEnd::Flown { "flown" } else { "gave_up" },
+                            "circuits": h.circuits, "alt_ft": alt_ft, "alt": leg.alt1_ft}),
+                    );
+                    if e == crate::course_leg::HoldEnd::GaveUp {
+                        alert(
+                            &voice,
+                            Priority::Advisory,
+                            &format!(
+                                "We did not make {} feet in the hold at {}. Leaving it.",
+                                leg.alt1_ft.map(|a| a.round() as i64).unwrap_or(0),
+                                crate::tools::procedure::spell_ident(&leg.fix_ident)
+                            ),
+                        );
+                    }
+                }
+                holding = true;
+                hold_end = s.end;
+                steer_track = Some(s.track_true);
+                steer = s.steer;
+            }
+        }
         if steer_track.is_none() {
             let line = CourseLine::of_leg(leg, mag_var);
             if let Some((t, s)) = line.as_ref().and_then(|l| {
@@ -2759,14 +2823,21 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, plan: Pla
         };
         // A course leg flown on its course is done abeam its fix, as a
         // fly-by is: the intercept may still be closing the line.
-        let done = leg_done(leg, dist_nm, alt_ft, capture_nm, lat, lon)
-            || (matches!(steer, Steer::Intercept | Steer::Track)
-                && steer_line
-                    .as_ref()
-                    .is_some_and(|l| crate::course_leg::course_passed(l, lat, lon, capture_nm)));
+        // An arc is done at its end radial; a hold when it says so.
+        let done = if let Some(a) = arc.as_ref() {
+            crate::course_leg::arc_done(a, lat, lon, CAPTURE_NM)
+        } else if holding {
+            hold_end.is_some()
+        } else {
+            leg_done(leg, dist_nm, alt_ft, capture_nm, lat, lon)
+                || (matches!(steer, Steer::Intercept | Steer::Track)
+                    && steer_line
+                        .as_ref()
+                        .is_some_and(|l| crate::course_leg::course_passed(l, lat, lon, capture_nm)))
+        };
         // The closure watchdog judges a leg flown AT its fix; a pattern flies
-        // away from the IF on purpose.
-        if let Some(d) = dist_nm.filter(|_| !done && !final_join.flying_pattern()) {
+        // away from the IF on purpose, and so does a hold's outbound leg.
+        if let Some(d) = dist_nm.filter(|_| !done && !final_join.flying_pattern() && !holding) {
             if closure.as_ref().is_none_or(|(i, _)| *i != idx) {
                 // A new leg is judged on its own: stalls on an earlier leg
                 // that was later flown are not this one's (LIPK 2026-09-25:
@@ -3450,6 +3521,7 @@ mod tests {
             navaid_ident: String::new(),
             navaid_region: String::new(),
             navaid: None,
+            path: Default::default(),
         }
     }
 
@@ -3531,6 +3603,7 @@ mod tests {
             navaid_ident: String::new(),
             navaid_region: String::new(),
             navaid: None,
+            path: Default::default(),
         };
         assert!(!super::map_short_of_runway(&leg), "LIPE I12: MAP on RW12");
         leg.fix_ident = "MA03".into();
@@ -4415,6 +4488,7 @@ mod tests {
             navaid_ident: String::new(),
             navaid_region: String::new(),
             navaid: None,
+            path: Default::default(),
         }
     }
 
@@ -4801,6 +4875,7 @@ mod tests {
             navaid_ident: String::new(),
             navaid_region: String::new(),
             navaid: None,
+            path: Default::default(),
         }
     }
 

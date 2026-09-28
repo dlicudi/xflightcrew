@@ -294,7 +294,7 @@ fn build_plan(
 
 /// Spell a procedure ident so TTS reads it as characters, not a word ("BLN4L"
 /// → "B L N four L"). Keeps digits spoken and letters spelled.
-fn spell_ident(ident: &str) -> String {
+pub(crate) fn spell_ident(ident: &str) -> String {
     ident
         .chars()
         .map(|c| c.to_string())
