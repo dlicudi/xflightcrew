@@ -4945,6 +4945,31 @@ mod tests {
         assert_eq!(law.target_deg(), ROTATE_PITCH_DEG);
     }
 
+    /// #91: thrust comes back to the declared climb lever at the reduction
+    /// height, airborne only, at a crew's pace; every other release (the
+    /// swinging-nose hold, the overspeed guard) stays instant, and a silent
+    /// airframe keeps takeoff thrust as it always did.
+    #[test]
+    fn thrust_reduction_at_the_declared_height() {
+        let r = Some(crate::takeoff_config::ThrustReduction { agl_ft: 1000.0, lever: 0.9 });
+        assert_eq!(thrust_reduced(1.0, true, 999.0, r), (1.0, false));
+        assert_eq!(thrust_reduced(1.0, false, 1200.0, r), (1.0, false), "on the ground never");
+        assert_eq!(thrust_reduced(1.0, true, 1000.0, r), (0.9, true));
+        assert_eq!(thrust_reduced(0.7, true, 1500.0, r), (0.7, false), "the guard's lower lever stands");
+        assert_eq!(thrust_reduced(1.0, true, 1500.0, None), (1.0, false));
+        // Paced: from takeoff thrust to 0.9 over a second, never past it.
+        let mut lever = 1.0;
+        let mut steps = 0;
+        while lever > 0.9 + 1e-9 {
+            lever = reduction_slew(throttle_slew(lever, 0.9, 0.2), lever, 0.2);
+            steps += 1;
+            assert!(lever >= 0.9 - 1e-9);
+        }
+        assert_eq!(steps, 5, "0.1 of lever a second at 0.2 s ticks");
+        // The takeoff's own releases are untouched by it.
+        assert_eq!(throttle_slew(1.0, 0.5, 0.2), 0.5);
+    }
+
     /// LFLL-EGLL, 2026-09-17. The 737 lifted at V2+20 and climbed out at
     /// 174 kt. Handed the profile's enroute `vy_kts` of 210 as its climb
     /// reference, the law read that as thirty-six knots slow, took 2,150 fpm
