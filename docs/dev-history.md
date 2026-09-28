@@ -10057,6 +10057,35 @@ abandoned at 360 s, then the turn-round under its own power joined the route in 
 since July by stand: tugs serve light GA (EGHI GA 1/2 hooked in 81 to 101 s), but LEMG's GA
 tie-downs hooked at 261 to 289 s (Baron, 102 and 93) or never (Baron 103, SR22 100 twice), and jets
 hook at 42 to 251 s (737 EGKK 10: 251 s), so a 60 s bound on the wait would drop real pushes. Now a
-light aircraft (`acf_m_max` at or under 5,700 kg, `pushback::tug_for_weight`) calls no tug and turns
-itself off the stand (`full_auto` `pushback_skipped` `why: light_aircraft`, `mtow_kg`); a failed read
-keeps the tug. Test `a_light_aircraft_turns_itself_off_the_stand`. Offline only.
+light aircraft (`acf_m_max` at or under 5,700 kg, `pushback::tug_for_weight`) calls no tug and
+turns itself off the stand (`full_auto` `pushback_skipped` `why: light_aircraft`, `mtow_kg`); a
+failed read keeps the tug. Test `a_light_aircraft_turns_itself_off_the_stand`. Offline only.
+
+## 2026-09-28: "my controls" in a taxi-in was driven on to the stand (issue #168)
+
+LEMG (t 1790591992.8): "my controls" during the vacate stopped the auto taxi, and the taxi-in then
+reported `vacated`, set the parking brake at 10.8 kt (`arrest_rolling`), called for taxi and drove
+to the stand 7 s later. The release reached only the auto taxi's flag, and the request's wait
+drives nothing at all. Now `taxi_in::ACTIVE` runs from `start` to the thread's end (a generation
+guards a newer one), `taxi_in::abort(hold)` halts the drive and the governor, and every checkpoint
+(after the vacate, the request's wait, the clearance, before and after the stand drive) ends it;
+the pilot's release (`main`, `taxi_in_running`) holds: `full_auto::hand_back_hold` brakes to a stop
+and parks, blackbox `taxi_in` `cancelled` (`at`, `hold`, `held`). `flight_state::stand_down` lets
+go without the hold. Test `my_controls_ends_the_taxi_in_between_its_drives`. Offline only.
+
+## 2026-09-28: the sortie runner waits for a taxi in only where the case tests it (issue #168)
+
+A full-auto landing's verdict comes at its `taxi_in` stage, and the runner then waited for the
+vacate and the drive to the stand before the next setup: `waited` 128, 149, 113 and 131 s in the
+run files (runs 101708Z, 112036Z, 121938Z), 306 and 151 s in the backlog run after them
+(sortie_result to the next setup). Approach cases stop on the runway and waited 10 to 34 s. A spec
+now says `after: stop` (per case, or a spec-level default; `park` when silent): on the ground at
+the verdict the next settle types "my controls" at once (`SettleWatch::stop_now`, again once past
+`STOP_RETYPE_S` with a loop still driving), then the quiet hold; the run's last case is stopped at
+the end. Airborne and unreadable wheels keep today's rule. The row says "my controls at the last
+verdict, at rest after N s". Expected: about 15 s instead of 113 to 306 s per full-auto landing
+case (about 150 s saved each; nothing on approaches, which already stop). lemg-737, backlog-737 and
+backlog-types default to stop; the 737 gate to gate (#141), the SR22 from the ramp and both S-76
+cases (hover taxi) park. Tests `after_is_the_cases_else_the_specs_else_park`,
+`a_stop_after_the_verdict_takes_the_aircraft_back_on_the_ground`,
+`after_stop_types_my_controls_at_the_verdict`. Offline only.

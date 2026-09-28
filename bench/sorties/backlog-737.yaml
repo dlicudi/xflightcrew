@@ -3,6 +3,9 @@
 # The shape is lemg-737.yaml's header. Parse-tested (every line pinned to
 # the tool it must reach), not yet flown.
 
+# Only the gate to gate case tests the taxi in (#141): it parks.
+after: stop
+
 cases:
   # Gate to gate on the pilot's SimBrief plan: the ramp at the plan's
   # origin (the setup tool's stand for a jet), the load sheet, then the
@@ -25,6 +28,7 @@ cases:
       - { sim_speed: 4, when: { phase: Cruise } }
       - { sim_speed: 1, when: { phase: Descent } }
     deadline_min: 300
+    after: park
 
   # A rejected takeoff at 60 kt inside full auto's circuit: the pilot's
   # "reject the takeoff" is auto_takeoff off, the loop flies it to a stop

@@ -792,7 +792,10 @@ EDLP 24 2026-09-24). **A jump in position is a relocation, never a movement**
 finds the aircraft moved under it stands down; "runway vacated" needs the pavement to agree
 (`vacated_report_due`). **A mission ends shut
 down** (`taxi_in::shut_down_at_stand`: engines confirmed from `ENGN_running`, electrics off); a
-spoken "taxi to parking" leaves the engines to the pilot.
+spoken "taxi to parking" leaves the engines to the pilot. **"My controls" ends the taxi-in
+itself** (`taxi_in::abort`, `running`, between its drives too), braked to a stop and parked
+(`hand_back_hold`, blackbox `taxi_in` `cancelled`); a stand-down only lets go. A stopped drive alone
+was driven again to the stand 7 s later (LEMG 2026-09-28).
 
 ### Still owed
 Issues labelled `owed` + `area:approach-landing` / `area:takeoff` / `area:full-auto` (`ils_coupled` #81).
@@ -1026,7 +1029,10 @@ confirms it closes it (`fixes #N` in the commit). Known gaps are `owed` issues.
   retyped (`Phase::Queued`, `QUEUED_S`). **No setup under a moving aircraft** (`SettleWatch`,
   `settle_before_setup`): before each setup the last aircraft is at rest (marker idle, on the ground
   under `STOPPED_KTS`, held `QUIET_S`), waited up to `STOP_MAX_S`, then "my controls" (`hand_back_hold`
-  parks); in the air it is taken back at once; the row's "Before" says which.
+  parks); in the air it is taken back at once; the row's "Before" says which. **A taxi in not
+  under test is not waited for** (`after: stop`, per case or spec, default `park`;
+  `SettleWatch::stop_now`): on the ground "my controls" at the verdict, retyped once past
+  `STOP_RETYPE_S` (a full-auto landing's taxi-in held the next setup 113 to 306 s, #168).
   A case scripts `steps` (`say` at `start`, `after_s`, `ias_above`, `agl_above`, `phase`, `event`),
   loads `setup.aircraft` (waits for its `profile_probe`), reads `plan_origin` / `runway: plan` from
   SimBrief, and may `expect_give_up`; `runway: wind` is the tower's into-wind end at the setup (`resolve_wind`, METAR else
