@@ -1073,21 +1073,32 @@ impl FullAuto {
             .flatten();
             let mut heights = Vec::new();
             let mut from_grid = 0usize;
-            for chunk in route.terrain.chunks(crate::terrain::MAX_POINTS) {
+            let mut grid_cautions = 0usize;
+            for (ci, chunk) in route.terrain.chunks(crate::terrain::MAX_POINTS).enumerate() {
                 let pts: Vec<_> = chunk.iter().map(|(p, _)| *p).collect();
                 match crate::terrain::sample_ft(&xp, &pts).await {
                     Some(h) => heights.extend(h),
                     None => {
+                        let base = ci * crate::terrain::MAX_POINTS;
                         let grid = mora.as_ref().ok_or(
                             "I can't verify terrain along the local route: no probe beyond \
                              the loaded scenery and no MORA grid.",
                         )?;
-                        for &(lat, lon) in &pts {
+                        // The grid is a caution, never a refusal (the plan
+                        // audit's rule): a one-degree cell's highest peak
+                        // stands over the whole cell, so it is logged and the
+                        // follower's own terrain floor watches it in flight.
+                        for (k, &(lat, lon)) in pts.iter().enumerate() {
                             let m = grid.at(lat, lon).ok_or(
                                 "I can't verify terrain along the local route: a leg is \
                                  outside the MORA grid.",
                             )?;
-                            heights.push(crate::nav::mora_ground_ft(m));
+                            let floor = route.terrain[base + k].1;
+                            let ground = crate::nav::mora_ground_ft(m);
+                            if ground > floor {
+                                grid_cautions += 1;
+                            }
+                            heights.push(ground.min(floor));
                         }
                         from_grid += pts.len();
                     }
@@ -1095,7 +1106,8 @@ impl FullAuto {
             }
             crate::blackbox::record(
                 "full_auto",
-                json!({"event": "local_terrain", "points": heights.len(), "from_grid": from_grid}),
+                json!({"event": "local_terrain", "points": heights.len(), "from_grid": from_grid,
+                       "grid_cautions": grid_cautions}),
             );
             if !crate::flightplan::local_terrain_clear(&route, &heights) {
                 return Err("Terrain blocks the local climb or arrival corridor. Choose another destination or route.".into());
