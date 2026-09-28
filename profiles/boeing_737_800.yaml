@@ -115,7 +115,11 @@ flare_elevator:
   # 12 flare was the weak slow end (4,021, 1.77). Declared, the whole
   # arrest from the roundout gate is flown on this model (autoland::
   # FlareModel, a prediction to the horizon) instead of the tracker above;
-  # gain, trim and ratchet are then unused. The law's gain is 3,500 on
+  # gain and trim are then unused. The flare holds the column the model's
+  # own way: a near-level float never takes it forward, and in rough air
+  # (autoland::FinalAir, the final's sink straying over 40 fpm rms) nothing
+  # but a climb does (LEMG 13, 2026-09-28: 422 fpm in gusts after the
+  # prediction eased 0.39 to 0.08 into a float). The law's gain is 3,500 on
   # purpose, under every flare's own: it pulls for the weakest.
   # Replayed from all seven recorded gates through each flare's own plant
   # (49 landings): 181 to 310 fpm, no balloon; LEMG 12's own gate and plant

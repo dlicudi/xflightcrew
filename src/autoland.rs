@@ -1271,6 +1271,8 @@ pub fn run_autoland_scoped(
             let mut arrest_prev_xtk: Option<f64> = None;
             let mut roll_yielded = false;
             let mut last_arresting = false;
+            // The final's air (`FinalAir`), for how the flare holds the column.
+            let mut final_air = FinalAir::default();
             // Airspeed history for the throttle governor's derivative term — the
             // anti-stall reflex needs the TREND (kts/sec), not just the error.
             let mut prev_ias: Option<f64> = None;
@@ -2261,6 +2263,16 @@ pub fn run_autoland_scoped(
                 // measurements in hand: anywhere else the dial is right and
                 // proven. The channel is a 1 s expiring heartbeat, so simply
                 // ceasing to write it hands the pitch back by itself.
+                // The final's air, for the flare (`FinalAir`): measured on the
+                // way down to the gate with the autopilot flying, begun again
+                // above it (a go-around's climb, a new pattern).
+                if radio_ft > FINAL_AIR_FROM_FT {
+                    final_air = FinalAir::default();
+                } else if let (ApproachPhase::Final, false, false, Some(v)) =
+                    (g.phase, g.arresting, es.hold, vvi)
+                {
+                    final_air.note(v, g.target_vs_fpm);
+                }
                 let mut model_out: Option<FlareModelOut> = None;
                 let flare_elev = match (g.arresting, vvi, pitch_yielded) {
                     // Once the pilot has taken the pitch it stays taken for
@@ -2269,7 +2281,14 @@ pub fn run_autoland_scoped(
                     // a control with a person on the other end.
                     (true, Some(v), false) => match flare_model.as_mut() {
                         Some(m) => {
-                            let o = m.step(radio_ft, gs_kts, v, tick_dt);
+                            let o = m.step(
+                                radio_ft,
+                                gs_kts,
+                                v,
+                                tick_dt,
+                                g.phase == ApproachPhase::Flare,
+                                final_air.rough(),
+                            );
                             model_out = Some(o);
                             Some(o.elev)
                         }
@@ -2357,7 +2376,11 @@ pub fn run_autoland_scoped(
                         wings = arrest_wings();
                         crate::blackbox::record(
                             "autoland",
-                            serde_json::json!({"event": "arrest_hands", "taken": true, "ok": ok, "radio": radio_ft}),
+                            serde_json::json!({
+                                "event": "arrest_hands", "taken": true, "ok": ok, "radio": radio_ft,
+                                // The final's air the flare will be flown for.
+                                "air_rms": final_air.rms_fpm(), "rough": final_air.rough(),
+                            }),
                         );
                     }
                     ArrestHands::Return => {
@@ -2418,6 +2441,10 @@ pub fn run_autoland_scoped(
                     "flare_target": model_out.map(|o| o.target_fpm),
                     "flare_ahead": model_out.map(|o| o.ahead_ft),
                     "flare_unexplained": model_out.map(|o| o.unexplained_fpm),
+                    // The prediction's own ask before the flare's ratchet:
+                    // `flare_elev` over it is the pull held.
+                    "flare_ask": model_out.map(|o| o.ask),
+                    "rough_air": g.arresting.then(|| final_air.rough()),
                     "lever": last_lever,
                     "phi": phi_r.as_ref().ok().copied(),
                     "psi": psi_r.as_ref().ok().copied(), "bug_true": crabbed_true,
@@ -4165,12 +4192,41 @@ impl FlarePitch {
 /// dead time is met with LEAD, the future written into the ask, never with
 /// gain. Never a push past the airframe's `max_push`, never a pull past its
 /// `max`.
+///
+/// IN ROUGH AIR THE COLUMN ONLY COMES BACK in the flare (the Flare phase;
+/// the roundout above it stays free both ways): the prediction's ask is the
+/// least pull written, never less than the pull already held. Free all the
+/// way down, the model chased the air mass: LEMG 13, 2026-09-28 (sortie
+/// 1790589309, the final's sink straying 72 fpm rms from the one asked for
+/// against 10 to 23 on the ten calm finals before it), a downdraft of about
+/// 130 fpm over 30 to 20 ft had it pull 0.39 at 25 ft, the air came back,
+/// the unexplained sink swung up with it, and the prediction eased the
+/// column 0.39 to 0.08 by 16 ft while still sinking 415 to 246; the ease
+/// arrived a dead time later in a -69 fpm FLOAT at 15 ft, the sink rebuilt
+/// faster than full pull could come back, and the wheels met the runway at
+/// -422 fpm. The gust and a strong elevator look the same for the seconds
+/// that matter, and in SMOOTH air the free prediction is what lands a strong
+/// one: through the 17:25 flare of 2026-09-26 (6,429 fpm per unit) in still
+/// air, the column held from the flare gate ballooned four of the eight
+/// recorded gates and dropped the worst in at 506, where the prediction
+/// landed all eight under 305. So smooth air
+/// keeps the prediction and holds only a near-level float
+/// ([`FLARE_HOLD_MIN_SINK_FPM`]); rough air ([`FinalAir`]) holds from the
+/// flare gate. Either way a float is not a balloon: only a measured CLIMB
+/// lets the held pull go, eased at the airframe's `balloon_ease_per_s`
+/// toward the ask, never a push, and more pull comes whenever the prediction
+/// of the sink at the horizon asks for it.
 #[derive(Debug, Clone)]
 pub struct FlareModel {
     cfg: crate::aircraft::FlareModelProfile,
     max: f64,
     min: f64,
     tau_s: f64,
+    /// In a climb the held pull eases toward the ask at most this fast
+    /// (elevator per second); `None` lets go at once.
+    balloon_ease_per_s: Option<f64>,
+    /// The pull the flare holds (the ratchet), `None` above the flare.
+    held: Option<f64>,
     /// Model time, seconds, and every elevator written with its time, for
     /// the dead time.
     t: f64,
@@ -4197,6 +4253,8 @@ pub struct FlareModelOut {
     pub ahead_ft: f64,
     /// The sink the model does not explain, fpm.
     pub unexplained_fpm: f64,
+    /// The elevator the prediction asked for, before the flare's ratchet.
+    pub ask: f64,
 }
 
 /// The model's own integration step, seconds.
@@ -4219,6 +4277,8 @@ impl FlareModel {
             } else {
                 5.0
             },
+            balloon_ease_per_s: None,
+            held: None,
             t: 0.0,
             written: std::collections::VecDeque::new(),
             b1: 0.0,
@@ -4229,18 +4289,28 @@ impl FlareModel {
         }
     }
 
+    /// A climb in the flare eases the held pull at most this fast (elevator
+    /// per second; the profile's `balloon_ease_per_s`).
+    pub fn with_balloon_ease(mut self, per_s: Option<f64>) -> Self {
+        self.balloon_ease_per_s = per_s.filter(|r| r.is_finite() && *r > 0.0);
+        self
+    }
+
     /// From the airframe's `flare_elevator:`; `None` unless it declares a
     /// model (every other airframe keeps [`FlarePitch`]).
     pub fn from_profile(p: Option<crate::aircraft::FlareElevatorProfile>) -> Option<Self> {
         let p = p.and_then(|p| p.valid())?;
         let gains = FlareGains::from_profile(Some(p));
-        p.model
-            .map(|m| Self::new(m, gains.max, gains.min, p.tau_s.unwrap_or(5.0)))
+        p.model.map(|m| {
+            Self::new(m, gains.max, gains.min, p.tau_s.unwrap_or(5.0))
+                .with_balloon_ease(gains.balloon_ease_per_s)
+        })
     }
 
-    /// A new approach: nothing written, nothing owed.
+    /// A new approach: nothing written, nothing owed, nothing held.
     pub fn reset(&mut self) {
-        *self = Self::new(self.cfg, self.max, self.min, self.tau_s);
+        *self = Self::new(self.cfg, self.max, self.min, self.tau_s)
+            .with_balloon_ease(self.balloon_ease_per_s);
     }
 
     fn lag2(&self) -> f64 {
@@ -4331,8 +4401,19 @@ impl FlareModel {
         flare_target_with(radio_ft, touchdown, nominal, Some(self.tau_s))
     }
 
-    /// One tick: the elevator for this measured sink.
-    pub fn step(&mut self, radio_ft: f64, gs_kts: f64, vvi_fpm: f64, dt_s: f64) -> FlareModelOut {
+    /// One tick: the elevator for this measured sink. `flare` is the flare
+    /// proper (as against the roundout above it, which stays free both
+    /// ways); `rough` is the final's air ([`FinalAir::rough`]). See
+    /// [`FlareModel`] for what each holds.
+    pub fn step(
+        &mut self,
+        radio_ft: f64,
+        gs_kts: f64,
+        vvi_fpm: f64,
+        dt_s: f64,
+        flare: bool,
+        rough: bool,
+    ) -> FlareModelOut {
         let dt = dt_s.clamp(0.02, 3.0);
         self.advance(dt, radio_ft);
         self.coasting_s = 0.0;
@@ -4347,18 +4428,95 @@ impl FlareModel {
         let (v1, _) = self.predict(1.0, radio_ft, vvi_fpm, unexplained);
         let target = self.target_fpm(ahead, gs_kts);
         let per_unit = v1 - v0;
-        let elev = if per_unit > 1e-6 {
+        let ask = if per_unit > 1e-6 {
             ((target - v0) / per_unit).clamp(self.min, self.max)
         } else {
             0.0
         };
+        let elev = if flare {
+            // The roundout's last ask is where the flare starts.
+            let held = self.held.unwrap_or(ask);
+            let next = if vvi_fpm > 0.0 {
+                // A BALLOON, measured: the pull has beaten the ground and the
+                // aircraft climbs. Eased toward the ask, never a push.
+                let eased = ask.max(0.0);
+                match self.balloon_ease_per_s {
+                    Some(rate) => eased.max(held - rate * dt),
+                    None => eased,
+                }
+            } else if rough || vvi_fpm > -FLARE_HOLD_MIN_SINK_FPM {
+                // Rough air, or a near-level float: the pull stays, and more
+                // comes only when the prediction asks for it.
+                ask.max(held)
+            } else {
+                // Smooth air and a real sink: the prediction flies it.
+                ask
+            };
+            self.held = Some(next);
+            next
+        } else {
+            self.held = None;
+            ask
+        };
+        // The model's pipe carries what was WRITTEN, the held pull included.
         self.el = elev;
         FlareModelOut {
             elev,
             target_fpm: target,
             ahead_ft: ahead,
             unexplained_fpm: unexplained,
+            ask,
         }
+    }
+}
+
+/// The final's air, as the autopilot felt it: how far the sink strays from
+/// the one asked for (fpm rms about its own mean, so a steady tracking
+/// offset is not turbulence), from [`FINAL_AIR_FROM_FT`] down to the arrest
+/// gate, only while the autopilot is confirmed. The ten calm LEMG 13 finals
+/// of 2026-09-28 strayed 10 to 23 fpm; the three gusty ones after them 72,
+/// 83 and 105, and the 2026-09-26 finals in 8 to 12 kt of swinging wind 29
+/// to 110. Too few samples (a close-in reposition, failed reads) is no
+/// measurement, and no measurement is smooth air: the flare the calm
+/// landings flew.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct FinalAir {
+    n: u32,
+    sum: f64,
+    sum_sq: f64,
+}
+
+/// The final's air is measured from this radio height down, ft.
+pub const FINAL_AIR_FROM_FT: f64 = 400.0;
+/// ...needs this many samples (about five seconds of ticks)...
+const FINAL_AIR_MIN_SAMPLES: u32 = 15;
+/// ...and is rough past this, fpm rms.
+pub const ROUGH_AIR_FPM: f64 = 40.0;
+
+impl FinalAir {
+    /// One tick's sink against the one asked for; a read that failed is no
+    /// sample.
+    pub fn note(&mut self, vvi_fpm: f64, asked_fpm: f64) {
+        let e = vvi_fpm - asked_fpm;
+        if e.is_finite() {
+            self.n += 1;
+            self.sum += e;
+            self.sum_sq += e * e;
+        }
+    }
+
+    /// The stray, fpm rms about its mean; `None` with too few samples.
+    pub fn rms_fpm(&self) -> Option<f64> {
+        if self.n < FINAL_AIR_MIN_SAMPLES {
+            return None;
+        }
+        let n = f64::from(self.n);
+        let mean = self.sum / n;
+        Some((self.sum_sq / n - mean * mean).max(0.0).sqrt())
+    }
+
+    pub fn rough(&self) -> bool {
+        self.rms_fpm().is_some_and(|r| r > ROUGH_AIR_FPM)
     }
 }
 
@@ -9597,6 +9755,10 @@ mod lemg_737_flare_tests {
         queue: VecDeque<(f64, f64)>,
         elev: f64,
         vvi: f64,
+        /// The air: sink (fpm) and speed change (kt/s) the fit does not
+        /// explain, taken from a recording ([`air_of`]); zero is still air.
+        air_fpm: f64,
+        air_kts_s: f64,
     }
 
     impl Plant {
@@ -9613,6 +9775,8 @@ mod lemg_737_flare_tests {
                 queue: VecDeque::new(),
                 elev: 0.0,
                 vvi: g.vvi_fpm,
+                air_fpm: 0.0,
+                air_kts_s: 0.0,
             }
         }
         fn write(&mut self, elev: f64) {
@@ -9629,14 +9793,16 @@ mod lemg_737_flare_tests {
             self.x2 += (self.x1 - self.x2) * dt / LAG2_S;
             self.ias = match ias {
                 Some(v) => v,
-                None => {
-                    self.ias
-                        + (-1.08 + 2.99 * lever - 2.05 * self.elev - 0.40 * self.vvi / 1000.0) * dt
-                }
+                None => self.ias + (speed_model(lever, self.elev, self.vvi) + self.air_kts_s) * dt,
             };
-            self.vvi = self.trimmed + self.x2 + FPM_PER_KT * (self.ias - self.ias0);
+            self.vvi = self.trimmed + self.x2 + FPM_PER_KT * (self.ias - self.ias0) + self.air_fpm;
             self.t += dt;
         }
+    }
+
+    /// The fitted speed model, kt/s.
+    fn speed_model(lever: f64, elev: f64, vvi: f64) -> f64 {
+        -1.08 + 2.99 * lever - 2.05 * elev - 0.40 * vvi / 1000.0
     }
 
     /// The fitted plant IS the recorded aircraft: LEMG 12's own elevator,
@@ -9819,6 +9985,9 @@ mod lemg_737_flare_tests {
     enum Law {
         First(FirstModel),
         Model(FlareModel),
+        /// The model flare as flown in rough air (the column held from the
+        /// flare gate).
+        Rough(FlareModel),
     }
 
     struct Landing {
@@ -9881,7 +10050,8 @@ mod lemg_737_flare_tests {
                 let (flare_ft, _) = super::arrest_gates_ft(25.0, gs);
                 let e = match &mut law {
                     Law::First(m) => m.step(h, gs, v, tick),
-                    Law::Model(m) => m.step(h, gs, v, tick).elev,
+                    Law::Model(m) => m.step(h, gs, v, tick, h <= flare_ft, false).elev,
+                    Law::Rough(m) => m.step(h, gs, v, tick, h <= flare_ft, true).elev,
                 };
                 out.max_elev = out.max_elev.max(e);
                 out.min_elev = out.min_elev.min(e);
@@ -10047,16 +10217,429 @@ mod lemg_737_flare_tests {
     #[test]
     fn a_missed_read_coasts_the_model() {
         let mut m = model();
-        let first = m.step(81.5, 139.0, -774.0, 0.22);
+        let first = m.step(81.5, 139.0, -774.0, 0.22, false, false);
         assert!(
             first.elev > 0.1,
             "the gate kicks the column: {}",
             first.elev
         );
         m.coast(0.22, 78.0);
-        let again = m.step(76.0, 139.0, -760.0, 0.22);
+        let again = m.step(76.0, 139.0, -760.0, 0.22, false, false);
         assert!(again.elev >= 0.0 && again.elev <= 0.45);
         assert!(again.unexplained_fpm.is_finite() && again.ahead_ft < 76.0);
+    }
+
+    // ---- LEMG 13, 2026-09-28: the flare in rough air (issue #146) ----
+
+    /// Three recorded LEMG 13 finals (the autoland ticks from 400 ft to the
+    /// wheels, and the flight model's touchdown): 1790589309 (422 fpm) and
+    /// 1790589773 (335) in gusts, 1790588609 (236) in calm air.
+    const LEMG_13_FLARES: &str = include_str!("../bench/landings/lemg13_gusty_flares.jsonl");
+
+    #[derive(Clone, Copy, Debug)]
+    struct Tick {
+        t: f64,
+        radio: f64,
+        vvi: f64,
+        trend: f64,
+        asked: f64,
+        ias: f64,
+        elev: f64,
+        lever: f64,
+        arresting: bool,
+        flare: bool,
+        final_leg: bool,
+        ap_hold: bool,
+    }
+
+    struct Recording {
+        ticks: Vec<Tick>,
+        touchdown_fpm: f64,
+    }
+
+    fn recording(sortie: &str) -> Recording {
+        let mut ticks = Vec::new();
+        let mut touchdown_fpm = f64::NAN;
+        for line in LEMG_13_FLARES.lines() {
+            let v: serde_json::Value = serde_json::from_str(line).expect("a bench line");
+            if !v["sortie"].as_str().is_some_and(|s| s.starts_with(sortie)) {
+                continue;
+            }
+            if v["kind"] == "flight" {
+                touchdown_fpm = -v["sink"].as_f64().unwrap();
+                continue;
+            }
+            let f = |k: &str| v[k].as_f64().unwrap_or(0.0);
+            ticks.push(Tick {
+                t: f("t"),
+                radio: f("radio"),
+                vvi: f("vvi"),
+                trend: f("vvi_trend"),
+                asked: f("cmd_vs"),
+                ias: f("ias"),
+                elev: f("flare_elev"),
+                lever: f("lever"),
+                arresting: v["arresting"] == true,
+                flare: v["phase"] == "Flare",
+                final_leg: v["phase"] == "Final",
+                ap_hold: v["ap_hold"] == true,
+            });
+        }
+        assert!(!ticks.is_empty() && touchdown_fpm.is_finite(), "{sortie}");
+        Recording {
+            ticks,
+            touchdown_fpm,
+        }
+    }
+
+    impl Recording {
+        /// The final's air as the loop measures it on the way to the gate.
+        fn air(&self) -> super::FinalAir {
+            let mut air = super::FinalAir::default();
+            for k in &self.ticks {
+                if k.final_leg && !k.arresting && !k.ap_hold && k.radio <= super::FINAL_AIR_FROM_FT
+                {
+                    air.note(k.vvi, k.asked);
+                }
+            }
+            air
+        }
+        fn arrest(&self) -> Vec<Tick> {
+            self.ticks.iter().copied().filter(|k| k.arresting).collect()
+        }
+    }
+
+    /// Today's calm flares through their own fits: 3,700 to 4,450 fpm per
+    /// unit, 1.35 to 1.8 s of dead time (ten landings, 9 to 23 fpm rms).
+    /// The gusty ones fit nothing sensible (6,450 to 9,150 fpm, 49 to 96
+    /// rms): the air is not in the plant.
+    const CALM_FIT: Fit = Fit {
+        fpm_per_elevator: 4000.0,
+        dead_s: 1.55,
+    };
+
+    fn gate_of(a: &[Tick]) -> Gate {
+        Gate {
+            radio_ft: a[0].radio,
+            vvi_fpm: a[0].vvi,
+            trend_fpm_s: a[0].trend,
+            ias_kts: a[0].ias,
+            throttle: a[0].lever,
+            // What the air does is taken from the recording; the trim is
+            // folded into it.
+            trimmed_sink_fpm: a[0].vvi,
+            flown_fpm: f64::NAN,
+        }
+    }
+
+    /// The air of a recording through a fit: the recorded elevator, speed
+    /// and lever flown open loop, and per tick the sink (fpm, at the tick)
+    /// and speed change (kt/s, over the interval after it) the fit does not
+    /// explain.
+    fn air_of(a: &[Tick], fit: Fit) -> (Vec<f64>, Vec<f64>) {
+        let mut p = Plant::at(gate_of(a), fit);
+        let dt = 0.01;
+        let (mut air, mut speed) = (vec![0.0], Vec::new());
+        for w in a.windows(2) {
+            let (t0, t1) = (w[0].t - a[0].t, w[1].t - a[0].t);
+            p.write(w[0].elev);
+            let (mut acc, mut n) = (0.0f64, 0.0f64);
+            while p.t + 1e-9 < t1 {
+                acc += speed_model(w[0].lever, p.elev, w[0].vvi);
+                n += 1.0;
+                let f = (p.t - t0) / (t1 - t0);
+                p.step(
+                    w[0].lever,
+                    w[0].radio,
+                    Some(w[0].ias + (w[1].ias - w[0].ias) * f),
+                    dt,
+                );
+            }
+            speed.push((w[1].ias - w[0].ias) / (t1 - t0) - acc / n.max(1.0));
+            air.push(w[1].vvi - (p.trimmed + p.x2 + FPM_PER_KT * (w[1].ias - p.ias0)));
+        }
+        (air, speed)
+    }
+
+    struct Flown {
+        sink_fpm: f64,
+        /// Most the column came forward of its flare peak while not
+        /// climbing.
+        eased: f64,
+        climbed: bool,
+        float_m: f64,
+    }
+
+    /// Fly a recorded gate through a fit and the recorded air, the law
+    /// ticking at the recorded tick times (0.22 s past them), the flare from
+    /// the loop's own gate, the profile's retard below it and the approach
+    /// lever held in a climb, the elevator arriving a dead time after it is
+    /// written through two lags.
+    fn fly_through_air(a: &[Tick], fit: Fit, rough: bool, with_air: bool) -> Flown {
+        let (air, speed) = if with_air {
+            air_of(a, fit)
+        } else {
+            (vec![0.0], Vec::new())
+        };
+        let times: Vec<f64> = a.iter().map(|k| k.t - a[0].t).collect();
+        let power_cfg = profile_737().flare_power.expect("the 737 retards");
+        let mut power = FlarePower::default();
+        let mut law = model();
+        let mut p = Plant::at(gate_of(a), fit);
+        let (mut h, approach_lever) = (a[0].radio, a[0].lever);
+        let mut lever = approach_lever;
+        let (dt, mut i, mut next) = (0.01, 0usize, 0.0);
+        let mut prev_t: Option<f64> = None;
+        let (mut peak, mut flaring) = (0.0f64, false);
+        let mut out = Flown {
+            sink_fpm: 0.0,
+            eased: 0.0,
+            climbed: false,
+            float_m: 0.0,
+        };
+        while h > 0.0 && p.t < 40.0 {
+            if p.t + 1e-9 >= next {
+                let tick = times.get(i + 1).map_or(0.22, |t1| t1 - times[i]);
+                let law_dt = prev_t.map_or(0.22, |t0| p.t - t0);
+                prev_t = Some(p.t);
+                let v = p.vvi;
+                let gs = p.ias - 4.0;
+                let (flare_ft, _) = super::arrest_gates_ft(25.0, gs);
+                let flare = h <= flare_ft;
+                let e = law.step(h, gs, v, law_dt, flare, rough).elev;
+                p.write(e);
+                if flare {
+                    if !flaring {
+                        peak = e;
+                    }
+                    flaring = true;
+                    peak = peak.max(e);
+                    if v <= 0.0 {
+                        out.eased = out.eased.max(peak - e);
+                    }
+                    lever = if v > 0.0 {
+                        approach_lever
+                    } else {
+                        power.step(power_cfg, lever, v, law_dt, h).unwrap_or(lever)
+                    };
+                }
+                p.air_kts_s = if with_air {
+                    speed.get(i).copied().unwrap_or(0.0)
+                } else {
+                    0.0
+                };
+                i += 1;
+                next += tick;
+            }
+            if with_air {
+                let j = i - 1;
+                p.air_fpm = match (air.get(j), air.get(j + 1), times.get(j + 1)) {
+                    (Some(a0), Some(a1), Some(t1)) => {
+                        let f = ((p.t - times[j]) / (t1 - times[j])).clamp(0.0, 1.0);
+                        a0 + (a1 - a0) * f
+                    }
+                    _ => *air.last().unwrap(),
+                };
+            }
+            p.step(lever, h, None, dt);
+            h += p.vvi / 60.0 * dt;
+            if flaring {
+                out.float_m += (p.ias - 4.0) * 0.514_444 * dt;
+                out.climbed |= p.vvi > 0.0;
+            }
+        }
+        out.sink_fpm = -p.vvi;
+        out
+    }
+
+    /// The loop's measure of the final's air tells the three apart: the
+    /// gusty finals strayed 72 and 105 fpm rms from the sink asked for, the
+    /// calm one 19.
+    #[test]
+    fn the_final_says_whether_the_air_is_rough() {
+        for (sortie, rough) in [
+            ("1790589309", true),
+            ("1790589773", true),
+            ("1790588609", false),
+        ] {
+            let air = recording(sortie).air();
+            let rms = air.rms_fpm().expect("a whole final measured");
+            assert_eq!(air.rough(), rough, "{sortie}: {rms:.0} fpm rms");
+        }
+        assert!(recording("1790588609").air().rms_fpm().unwrap() < 25.0);
+        assert!(recording("1790589309").air().rms_fpm().unwrap() > 60.0);
+        // Too little of a final is no measurement, and no measurement is
+        // smooth air.
+        let mut short = super::FinalAir::default();
+        for _ in 0..5 {
+            short.note(-700.0, -800.0);
+            short.note(-900.0, -800.0);
+        }
+        assert!(short.rms_fpm().is_none() && !short.rough());
+        short.note(f64::NAN, -800.0);
+        assert!(short.rms_fpm().is_none(), "a failed read is no sample");
+    }
+
+    /// The harness is the law that flew: today's law, fed the recorded
+    /// sinks, writes the elevator that was written (the float hold changes
+    /// nothing there, the model was already pulling), and the fit flown
+    /// open loop through the recorded air gives back the recorded sink.
+    #[test]
+    fn the_recorded_flares_replay_through_todays_law() {
+        for sortie in ["1790589309", "1790589773", "1790588609"] {
+            let a = recording(sortie).arrest();
+            let mut m = model();
+            let mut worst: f64 = 0.0;
+            for (n, k) in a.iter().enumerate() {
+                let dt = if n == 0 { 0.22 } else { k.t - a[n - 1].t };
+                let e = m.step(k.radio, k.ias - 4.0, k.vvi, dt, k.flare, false).elev;
+                worst = worst.max((e - k.elev).abs());
+            }
+            assert!(worst < 0.07, "{sortie}: elevator {worst:.3} off the record");
+        }
+    }
+
+    /// LEMG 13, 1790589309 (issue #146): through today's calm fit and the
+    /// air the recording carries, the flare as flown (smooth, the prediction
+    /// free) eases the column a fifth of its travel from 25 ft while still
+    /// sinking, floats, and arrives near the 422 the aircraft did. Flown for
+    /// the rough air the final measured, the column holds from the flare
+    /// gate and the same air lands under 300 without a climb.
+    #[test]
+    fn a_gusty_flare_holds_the_column_through_the_float() {
+        let r = recording("1790589309");
+        assert_eq!(r.touchdown_fpm, 422.0);
+        assert!(r.air().rough());
+        let a = r.arrest();
+        let flown = fly_through_air(&a, CALM_FIT, false, true);
+        assert!(
+            (flown.sink_fpm - r.touchdown_fpm).abs() < 40.0,
+            "the replay lands where the aircraft did: {:.0}",
+            flown.sink_fpm
+        );
+        assert!(flown.eased > 0.2, "and eases as it did: {:.2}", flown.eased);
+        let held = fly_through_air(&a, CALM_FIT, true, true);
+        assert!(held.sink_fpm < 300.0, "{:.0}", held.sink_fpm);
+        assert!(
+            held.sink_fpm > 150.0,
+            "a landing, not a float: {:.0}",
+            held.sink_fpm
+        );
+        assert!(held.eased < 1e-9, "never forward: {:.3}", held.eased);
+        assert!(!held.climbed, "no balloon");
+        assert!(held.float_m < 1200.0, "floated {:.0} m", held.float_m);
+        // 1790589773 (335 fpm, the same gusts): 380 as flown here, under
+        // 320 held.
+        let a = recording("1790589773").arrest();
+        let flown = fly_through_air(&a, CALM_FIT, false, true);
+        let held = fly_through_air(&a, CALM_FIT, true, true);
+        assert!(flown.sink_fpm > 350.0, "{:.0}", flown.sink_fpm);
+        assert!(
+            held.sink_fpm < 320.0 && !held.climbed,
+            "{:.0}",
+            held.sink_fpm
+        );
+        // Not one plant's luck: through elevators from today's weakest to
+        // past the 2026-09-26 middle, and dead times 1.35 to 1.8 s, both
+        // gusty flares held land under 340 and never climb.
+        for sortie in ["1790589309", "1790589773"] {
+            let a = recording(sortie).arrest();
+            for k in [3700.0, 4400.0, 5100.0] {
+                for d in [1.35, 1.55, 1.8] {
+                    let fit = Fit {
+                        fpm_per_elevator: k,
+                        dead_s: d,
+                    };
+                    let held = fly_through_air(&a, fit, true, true);
+                    assert!(
+                        held.sink_fpm < 340.0 && !held.climbed,
+                        "{sortie} {k} {d}: {:.0}",
+                        held.sink_fpm
+                    );
+                }
+            }
+        }
+    }
+
+    /// The calm final keeps the prediction: 1790588609 through its air is
+    /// smooth, and flown smooth lands where it did (236).
+    #[test]
+    fn a_calm_flare_is_flown_as_before() {
+        let r = recording("1790588609");
+        assert!(!r.air().rough());
+        let a = r.arrest();
+        let flown = fly_through_air(&a, CALM_FIT, false, true);
+        assert!(
+            (flown.sink_fpm - r.touchdown_fpm).abs() < 30.0,
+            "{:.0} against {:.0}",
+            flown.sink_fpm,
+            r.touchdown_fpm
+        );
+        assert!(flown.sink_fpm > 200.0 && flown.sink_fpm < 290.0);
+    }
+
+    /// Why smooth air keeps the prediction: the 17:25 flare of 2026-09-26
+    /// answered 6,429 fpm per unit, and in still air the column held from
+    /// the flare gate balloons it and drops it in, where the prediction
+    /// eases and lands. The gust and a strong elevator look alike for the
+    /// seconds that matter; only the air tells them apart.
+    #[test]
+    fn a_strong_elevator_in_still_air_keeps_the_prediction() {
+        let strong = PLANTS[3];
+        let mut worst_held: f64 = 0.0;
+        let mut climbed = false;
+        for g in GATES.iter() {
+            let free = fly(*g, strong, Law::Model(model()));
+            assert!(
+                free.sink_fpm < 340.0 && !free.climbed,
+                "{:.0}",
+                free.sink_fpm
+            );
+            let held = fly(*g, strong, Law::Rough(model()));
+            worst_held = worst_held.max(held.sink_fpm);
+            climbed |= held.climbed;
+        }
+        assert!(
+            climbed && worst_held > 400.0,
+            "held in still air it balloons: {worst_held:.0}"
+        );
+    }
+
+    /// A near-level float never takes the column forward, smooth air or
+    /// rough; a climb eases it at the airframe's rate, never a push; the
+    /// roundout above the flare stays free.
+    #[test]
+    fn a_float_keeps_its_pull_and_only_a_climb_eases_it() {
+        let mut m = model();
+        // Into the flare sinking hard: the prediction pulls.
+        let mut pulled: f64 = 0.0;
+        for n in 0..6 {
+            let h = 30.0 - n as f64 * 1.5;
+            pulled = m.step(h, 140.0, -420.0, 0.22, true, false).elev;
+        }
+        assert!(pulled > 0.1, "{pulled}");
+        // Floating at -70 with that pull in the pipe: the prediction wants
+        // it forward, the column stays.
+        let mut e = pulled;
+        for _ in 0..8 {
+            let o = m.step(16.0, 140.0, -70.0, 0.22, true, false);
+            assert!(o.elev >= e - 1e-9, "forward in a float: {e} -> {}", o.elev);
+            assert!(o.ask <= o.elev + 1e-9);
+            e = o.elev;
+        }
+        // Climbing: eased at the profile's 0.15 a second, never below zero.
+        let o = m.step(16.5, 140.0, 60.0, 0.22, true, false);
+        assert!(
+            o.elev < e && o.elev >= e - 0.15 * 0.22 - 1e-9,
+            "{e} -> {}",
+            o.elev
+        );
+        assert!(o.elev >= 0.0);
+        // Above the flare the model is free both ways again.
+        let mut free = model();
+        let hi = free.step(60.0, 140.0, -900.0, 0.22, false, true).elev;
+        let lo = free.step(58.0, 140.0, -300.0, 0.22, false, true).elev;
+        assert!(lo < hi, "the roundout eases: {hi} -> {lo}");
     }
 }
 
