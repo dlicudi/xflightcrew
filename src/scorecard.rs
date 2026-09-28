@@ -321,6 +321,10 @@ pub struct Scorer {
     /// The pilot's commands to the crew during the sortie (`tool` records).
     commands: usize,
     results: Vec<(String, bool)>,
+    /// The aircraft struck the ground or wrecked inside the sortie (a
+    /// `flight` `impact` or `Crashed`, a `state` `crashed`, a `rapport`
+    /// touchdown with `impact`): the sortie fails whatever its stages say.
+    crashed: bool,
     /// A `join` (or `joined`) arrived before the drive's first tick: the
     /// drive logs both before its first `drive` record when the engage is
     /// already inside the join-done gate.
@@ -492,8 +496,18 @@ impl Scorer {
             }
             ("intervention", _) => self.interventions += 1,
             ("tool", _) => self.commands += 1,
+            ("flight", _)
+                if s(r, "ev") == "impact"
+                    || (s(r, "ev") == "abnormal" && s(r, "to") == "Crashed") =>
+            {
+                self.crashed = true
+            }
+            ("rapport", _) if r.get("impact").and_then(Value::as_bool) == Some(true) => {
+                self.crashed = true
+            }
             ("sortie", "begin") => {
                 self.results.clear();
+                self.crashed = false;
                 self.interventions = 0;
                 self.crew_yoke_discounted = 0;
                 self.crew_brake_discounted = 0;
@@ -510,6 +524,15 @@ impl Scorer {
                 // mission (1790366657) flew part of it, and the flag said
                 // unattended because only yield latches were counted.
                 let unattended = self.interventions == 0 && self.commands == 0;
+                // A sortie that scored nothing proved nothing: 1790584266
+                // flew a 737 into the ground 8.8 nm short of LEMG 12, the
+                // runner's "my controls" ended the sortie 0.1 s before the
+                // impact record, and it was written `pass: true, stages: 0`.
+                let pass = failed.is_empty()
+                    && unattended
+                    && s(r, "outcome") != "gave_up"
+                    && !self.crashed
+                    && !self.results.is_empty();
                 let mut v = json!({
                     "outcome": s(r, "outcome"),
                     "stages": self.results.len(),
@@ -519,7 +542,8 @@ impl Scorer {
                     "crew_brake_discounted": self.crew_brake_discounted,
                     "commands": self.commands,
                     "unattended": unattended,
-                    "pass": failed.is_empty() && unattended && s(r, "outcome") != "gave_up",
+                    "crashed": self.crashed,
+                    "pass": pass,
                 });
                 if let (Some(o), Some(id)) = (v.as_object_mut(), self.sortie.clone()) {
                     o.insert("sortie".into(), id.into());
@@ -726,6 +750,9 @@ impl Scorer {
     fn state_tick(&mut self, r: &Value, t: f64, out: &mut Vec<(String, Value)>) {
         let ground = r.get("ground").and_then(Value::as_bool).unwrap_or(true);
         let crashed = r.get("crashed").and_then(Value::as_bool).unwrap_or(false);
+        if crashed {
+            self.crashed = true;
+        }
         if !ground {
             self.airborne_since.get_or_insert(t);
             self.air.push((
@@ -904,7 +931,7 @@ pub fn line(v: &Value) -> String {
         })
         .collect();
         return format!(
-            "SORTIE {}: {} stages, {}, {} interventions{}, {} commands, {}, outcome {}",
+            "SORTIE {}: {} stages, {}, {} interventions{}, {} commands, {}, outcome {}{}",
             if v.get("pass").and_then(Value::as_bool) == Some(true) { "PASS" } else { "FAIL" },
             n("stages"),
             if failed.is_empty() {
@@ -921,6 +948,7 @@ pub fn line(v: &Value) -> String {
                 "attended"
             },
             s(v, "outcome"),
+            if v.get("crashed").and_then(Value::as_bool) == Some(true) { ", crashed" } else { "" },
         );
     }
     format!(
@@ -1405,5 +1433,68 @@ mod tests {
         let sortie = out.last().unwrap();
         assert_eq!(sortie["interventions"], 1, "{sortie}");
         assert_eq!(sortie["crew_yoke_discounted"], 1);
+    }
+
+    /// LEMG 1790584266-approach (2026-09-28), as recorded: the 737 flew into
+    /// the ground 8.8 nm short of runway 12 at 3,353 fpm, the runner's "my
+    /// controls" ended the sortie at 290.1 and the impact was logged at
+    /// 290.2, outside it. The sortie scored nothing and was written
+    /// `pass: true, stages: 0`.
+    #[test]
+    fn a_sortie_that_scored_nothing_or_crashed_is_no_pass() {
+        let id = "1790584266-approach";
+        let recs = vec![
+            json!({"t": 1790584266.3, "kind": "sortie", "event": "begin", "sortie": id}),
+            json!({"t": 1790584288.9, "kind": "state", "ground": false, "crashed": false,
+                   "agl": 46.9, "vsi": -3353.2, "hdg": 107.7, "track": 108.8, "sortie": id}),
+            json!({"t": 1790584290.1, "kind": "sortie", "event": "end", "outcome": "ended",
+                   "sortie": id}),
+            json!({"t": 1790584290.2, "kind": "flight", "ev": "impact", "gs": 13.0,
+                   "sink": -3353.0}),
+        ];
+        let card = score_all(recs.iter());
+        let sortie = card.iter().find(|v| s(v, "kind") == "sortie_result").unwrap();
+        assert_eq!(sortie["stages"], 0);
+        assert_eq!(sortie["pass"], false, "nothing scored, nothing proved: {sortie}");
+        assert_eq!(
+            line(sortie),
+            "SORTIE FAIL: 0 stages, none failed, 0 interventions, 0 commands, unattended, outcome ended"
+        );
+
+        let taxi_sortie = |before: Option<Value>, during: Option<Value>| {
+            let mut recs: Vec<Value> = before.into_iter().collect();
+            recs.push(json!({"t": 0.0, "kind": "sortie", "event": "begin", "sortie": "9-full_auto"}));
+            for i in 0..10 {
+                let mut d = drive(1.0 + i as f64 * 0.2, 6.0, 0.5, 0.0, 0.0, 0.0, 0.0);
+                d["sortie"] = json!("9-full_auto");
+                recs.push(d);
+            }
+            recs.push(json!({"t": 3.1, "kind": "autotaxi", "event": "holding_point",
+                             "sortie": "9-full_auto"}));
+            recs.extend(during);
+            recs.push(json!({"t": 30.0, "kind": "sortie", "event": "end", "outcome": "ended",
+                             "sortie": "9-full_auto"}));
+            score_all(recs.iter())
+                .into_iter()
+                .find(|v| s(v, "kind") == "sortie_result")
+                .unwrap()
+        };
+        assert_eq!(taxi_sortie(None, None)["pass"], true, "the clean one passes");
+        // A crash inside the sortie fails it whatever its stages said.
+        for crash in [
+            json!({"t": 20.0, "kind": "flight", "ev": "impact", "sink": -3353.0}),
+            json!({"t": 20.0, "kind": "flight", "ev": "abnormal", "from": "Normal", "to": "Crashed"}),
+            json!({"t": 20.0, "kind": "rapport", "event": "touchdown", "impact": true}),
+            json!({"t": 20.0, "kind": "state", "ground": true, "crashed": true}),
+        ] {
+            let sortie = taxi_sortie(None, Some(crash.clone()));
+            assert_eq!(sortie["pass"], false, "{crash}: {sortie}");
+            assert_eq!(sortie["crashed"], true);
+            assert!(line(&sortie).ends_with("outcome ended, crashed"), "{}", line(&sortie));
+        }
+        // The last case's wreck, before this sortie began, is not this one's.
+        let before = json!({"t": -5.0, "kind": "flight", "ev": "impact", "sink": -3353.0});
+        let sortie = taxi_sortie(Some(before), None);
+        assert_eq!(sortie["pass"], true, "{sortie}");
     }
 }
