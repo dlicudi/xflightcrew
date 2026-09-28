@@ -9374,3 +9374,42 @@ heading every tick, so it holds no heading while a roll persists.
 
 Next flight: `full_auto` `resume_arrival` then `autoland` on the named runway; every `resume_refused`
 why carries a number; no A330 `airspeed_caution` in CONF 1 to 3 above 1.2 x 147/139/131. Offline only.
+
+## 2026-09-28: a runway start backtracks, flight levels, IFR anywhere and cancel IFR (issues #128, #97, #96)
+
+Sortie 1790527340 (EGKK, 737): booted stopped on 26L's centreline, 51.14768 N 0.19355 W, 256.3 true,
+1,340 m from the end with 1,897 m needed. The arm's lined-up check failed on length, so full auto
+asked for the taxi and was cleared to holding point Mike at +63.2, off the runway it was on. Worse,
+`autotakeoff::why_no_fit` diagnosed against the best-ALIGNED end: 26R (257.624) beat 26L (257.629) by
+0.005 degrees from 200 m away, so the verdict was "none near", not "too little left".
+`why_no_fit` now diagnoses the aligned end we are ON (least lateral). `full_auto::runway_start`
+classifies the arm (`RunwayStart` Lined / Short / None, stopped under 3 kt for Short); a runway start
+gets its clearance from the strip first; a clearance naming another strip sends it to the taxied
+departure (`RunwayStart::under_clearance`: the SID and the frozen runway were chosen together, #114);
+a Short start calls "request backtrack runway ..." (`backtrack_from_runway_start`,
+`Intent::RequestBacktrack`: "backtrack approved runway ..., line up and wait", held for final or
+runway traffic), drives the line-up tool's backtrack, re-checks the fit, then calls ready as before.
+Unflown risk: the backtrack from mid-runway starts with a 180 on the runway
+(`autotaxi::backtrack_pocket_path`), never flown with a 737 on a 45 m strip. Not done: the
+incursion watch's close-parallel corridor (`nav::close_parallel_main` is the hook).
+
+Flight levels (#97): apt.dat's `1302 transition_level` (EGKK 7000, EGBB 7500, LEBL 8000, KJFK 18000)
+rides `tower::Ctx`; at or above it the IFR clearance, its readback and correction and approach's
+descent say flight levels (`tower::climb_item`, `atis::spoken_flight_level`); `heard_altitude_ft`
+hears "flight level one two zero" / "FL120"; the crew's check-in says flight levels above the
+flight's transition altitude (`departure_check_in_above`); the grammar reads "climb flight level one
+two zero" as 12,000 ft, not a 120 fpm climb (`grammar::flight_level_as_feet`).
+
+IFR (#96): destinations resolve by ICAO against every land field (`station::FIELD_DIR`) after the
+region index; `Intent::CancelIfr` retires the clearance, `IFR_FLIGHT` and the frozen runway
+(`Station::cancel_ifr`). Handing the IFR arrival to the destination's Approach is NOT done: the
+crew's inbound call tunes `home_tower_khz` and nothing follows `assigned_vector` yet, so the crew's
+arrival must talk to approach first.
+
+Tests `the_egkk_runway_start_backtracks_on_26l`, `a_runway_start_departs_from_the_cleared_runway`,
+`the_arm_asks_for_a_backtrack_before_a_taxi`, `a_backtrack_is_a_line_up_from_the_runway`,
+`a_level_at_or_above_the_transition_level_is_a_flight_level`, `a_flight_level_is_heard_in_every_spelling`,
+`an_ifr_clearance_reaches_any_field_and_cancel_ifr_ends_it`, `a_flight_level_is_an_altitude_target`,
+`a_climb_above_the_transition_altitude_checks_in_with_a_flight_level`; `real_install_transition_levels`
+(ignored). Next runway start: blackbox `full_auto` `runway_start`, `request_backtrack`, `atc`
+`RequestBacktrack` Parked>LinedUp, `backtracked`, no `request_taxi`. Offline only.

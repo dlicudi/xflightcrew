@@ -249,10 +249,15 @@ Config: `XCOPILOT_ATC_AIRPORT` / `_VOICE` / `_RATE` / `_REGION`.
   climb it announced (`climb_announced`).
 - **IFR clearance** (`Intent::RequestIfrClearance`: "IFR clearance to X", "clearance to <place>",
   "ready to copy"; a bare "request clearance" stays the zone one): destination from the region
-  index or "say again destination"; SID off the runway in use whose exit points at the
+  index, else any land field by its ICAO (`FIELD_DIR`), else "say again destination"; SID off the runway in use whose exit points at the
   destination (`nav::sid_toward`, else runway heading, never invented); 5,000 ft or field + 3,000;
   ICAO or FAA phrasing; SID, altitude and code read back ENFORCED; the crew sees it only once
-  accepted (`party_line::assigned_clearance`).
+  accepted (`party_line::assigned_clearance`). **Cancel IFR** (`Intent::CancelIfr`,
+  `Station::cancel_ifr`) retires the clearance, `IFR_FLIGHT` and the frozen runway.
+- **Levels are the field's**: at or above apt.dat's `1302 transition_level`
+  (`Ctx.transition_level_ft`) a level is a flight level in clearance, readback and correction
+  (`tower::climb_item`); `heard_altitude_ft` hears either form; the crew's check-in says flight
+  levels above the flight's transition altitude (`departure_check_in_above`).
 - Runway in use: calm wind follows the arrival stream (`arrival_end`); FROZEN while a departure or
   arrival is committed, an IFR clearance included (`ifr_runway`), with wind hysteresis (parallels
   flip-flop invisibly); an arrival's STATED runway stands inside the margin (`note_stated_runway`).
@@ -406,7 +411,11 @@ everything blackboxes to `logs/blackbox.jsonl` (kinds: `atc`, `autotaxi`, `autot
   (`paced_flap_step`) and called by its detent ("Flaps one.", `flap_step_line`). A circuit keeps
   the old climb-out.
 - **A runway start is a lined-up aircraft and still calls** (`tower::Ctx::own_on_runway`), never
-  an incursion (`ComplianceState.runway_start`: a strip first seen stopped).
+  an incursion (`ComplianceState.runway_start`: a strip first seen stopped); its clearance comes
+  first from the strip; too little ahead is a BACKTRACK, never a taxi (`full_auto::RunwayStart`,
+  `backtrack_from_runway_start`, `Intent::RequestBacktrack`; EGKK 26L 2026-09-27); a clearance for
+  another runway is taxied to (`under_clearance`). `why_no_fit` diagnoses the aligned end we are
+  ON (parallels tie on heading).
 
 ### Circuit, procedure, full auto
 (`src/circuit.rs`, `src/procedure.rs`, `src/full_auto.rs`)
