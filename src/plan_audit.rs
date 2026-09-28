@@ -390,6 +390,18 @@ pub fn audit(i: &Inputs) -> Audit {
                 continue;
             }
         }
+        // A window over the plan's cruise is flown at the cruise
+        // (`procedure::apply_arrival_constraints`), and said as that, not as
+        // a low crossing (HEMEL's FL220 in an FL180 plan, EGKK-EGBB
+        // 2026-09-28, #156).
+        if let Some(min) = c.min_ft.filter(|m| i.cruise_alt_ft > 0.0 && *m > i.cruise_alt_ft + STAR_SLACK_FT) {
+            out.findings.push(Finding {
+                severity: Severity::Caution,
+                kind: "star_above_cruise",
+                line: crate::procedure::above_cruise_line(&c.fix, min, i.cruise_alt_ft),
+            });
+            continue;
+        }
         if let Some(max) = c.max_ft.filter(|m| x.alt_ft > m + STAR_SLACK_FT) {
             out.findings.push(Finding {
                 severity: Severity::Caution,
@@ -1312,6 +1324,23 @@ mod tests {
         let stars = [StarConstraint { fix: "FIX5".into(), min_ft: None, max_ft: Some(7_000.0), max_kts: None }];
         let a = audit(&inputs(&legs, &stars));
         assert!(a.findings.iter().all(|f| f.kind != "star_high"), "{:?}", a.findings);
+    }
+
+    /// #156: HEME1B's "HEMEL at FL220" in EGKK-EGBB's FL180 plan: the plan
+    /// flies it at the cruise, and the audit says it as that, once, not as
+    /// a crossing 4,000 feet low.
+    #[test]
+    fn a_star_window_over_the_cruise_is_said_as_flown_at_the_cruise() {
+        let legs = route(&[18_000.0, 18_000.0, 12_000.0, 9_000.0], 25.0);
+        let c = |fix: &str, min, max| StarConstraint { fix: fix.into(), min_ft: min, max_ft: max, max_kts: None };
+        let stars = [c("FIX1", Some(22_000.0), Some(22_000.0)), c("FIX3", Some(9_000.0), Some(9_000.0))];
+        let mut i = inputs(&legs, &stars);
+        i.cruise_alt_ft = 18_000.0;
+        let a = audit(&i);
+        let f = a.findings.iter().find(|f| f.kind == "star_above_cruise").unwrap_or_else(|| panic!("{:?}", a.findings));
+        assert_eq!(f.line, "FIX1's 22,000 feet is above our cruise. We'll cross it at 18,000 feet.");
+        assert!(a.findings.iter().all(|f| f.kind != "star_low"), "{:?}", a.findings);
+        assert!(a.stop().is_none());
     }
 
     #[test]

@@ -910,6 +910,94 @@ pub fn windows_above_cruise(
     out
 }
 
+/// A window missed by more than this is said (the card's slack, #32).
+const STAR_MISS_SLACK_FT: f64 = 300.0;
+
+/// A STAR altitude window the airframe cannot make from here, at its best.
+#[derive(Debug, Clone, PartialEq)]
+pub struct WindowMiss {
+    pub fix: String,
+    /// Under an "at or above" (true) or over an "at or below".
+    pub low: bool,
+    /// The window's edge judged (a minimum over the cruise is the cruise).
+    pub limit_ft: f64,
+    pub predicted_ft: f64,
+    pub by_ft: f64,
+    pub dist_nm: f64,
+}
+
+impl WindowMiss {
+    /// What a crew says: once, with the number.
+    pub fn line(&self) -> String {
+        format!(
+            "We'll cross {} about {} feet {} its {}.",
+            self.fix,
+            crate::auto_status::commas(((self.by_ft / 50.0).round() * 50.0) as i64),
+            if self.low { "under" } else { "above" },
+            crate::flightplan::spoken_feet(self.limit_ft),
+        )
+    }
+}
+
+/// The next STAR altitude window ahead (leg `idx` on), judged from here at
+/// the airframe's best: climbing at `climb_fpm` to an "at or above" (never
+/// above `cruise_ft`: a window over the cruise is flown at the cruise,
+/// [`windows_above_cruise`]), descending at `descent_fpm` (the speedbrake's
+/// rate) to an "at or below". `Some` when even that misses it by more than
+/// [`STAR_MISS_SLACK_FT`]. #32's owed rule: a restriction that cannot be
+/// made is said, not silently missed (EGKK-EGBB 2026-09-28: HEMEL crossed
+/// at 14,638 against FL220, unsaid). Pure.
+#[allow(clippy::too_many_arguments)]
+pub fn star_window_miss(
+    legs: &[ProcLeg],
+    cons: &[crate::nav::StarConstraint],
+    idx: usize,
+    lat: f64,
+    lon: f64,
+    alt_ft: f64,
+    gs_kts: f64,
+    climb_fpm: f64,
+    descent_fpm: f64,
+    cruise_ft: Option<f64>,
+) -> Option<WindowMiss> {
+    let (k, c) = legs.iter().enumerate().skip(idx).find_map(|(k, l)| {
+        restriction_at(cons, l)
+            .filter(|c| c.min_ft.is_some() || c.max_ft.is_some())
+            .map(|c| (k, c))
+    })?;
+    let dist_nm = distance_to_leg_nm(lat, lon, legs, idx, k);
+    let minutes = dist_nm / gs_kts.max(60.0) * 60.0;
+    let fix = legs[k].fix_ident.clone();
+    if let Some(min) = c.min_ft.map(|m| cruise_ft.map_or(m, |cr| m.min(cr))) {
+        if alt_ft < min {
+            let predicted_ft = alt_ft + climb_fpm.max(0.0) * minutes;
+            let by_ft = min - predicted_ft;
+            if by_ft > STAR_MISS_SLACK_FT {
+                return Some(WindowMiss { fix, low: true, limit_ft: min, predicted_ft, by_ft, dist_nm });
+            }
+        }
+    }
+    if let Some(max) = c.max_ft {
+        if alt_ft > max {
+            let predicted_ft = alt_ft - descent_fpm.max(0.0) * minutes;
+            let by_ft = predicted_ft - max;
+            if by_ft > STAR_MISS_SLACK_FT {
+                return Some(WindowMiss { fix, low: false, limit_ft: max, predicted_ft, by_ft, dist_nm });
+            }
+        }
+    }
+    None
+}
+
+/// What a crew says about a window over its cruise, once.
+pub fn above_cruise_line(fix: &str, min_ft: f64, cruise_ft: f64) -> String {
+    format!(
+        "{fix}'s {} is above our cruise. We'll cross it at {}.",
+        crate::flightplan::spoken_feet(min_ft),
+        crate::flightplan::spoken_feet(cruise_ft),
+    )
+}
+
 /// The highest altitude leg `idx`'s fix may be crossed at so that every
 /// arrival "at or below" further on is still reachable at `ft_per_nm`
 /// (the descent law's rate over the groundspeed), never under that fix's
@@ -2866,6 +2954,25 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, plan: Pla
                 serde_json::json!({"fix": c.fix, "min_ft": c.min_ft, "max_ft": c.max_ft, "max_kts": c.max_kts})).collect::<Vec<_>>()}),
         );
     }
+    // The STAR's windows the plan does not make, said once each: over the
+    // cruise at the arm (and a splice), and any the airframe cannot reach
+    // from where it is as it flies (#32, #156).
+    let mut said_windows: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut said_unable_windows: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let star_cruise_ft = (cruise_ft > 0.0).then_some(cruise_ft);
+    let say_above_cruise = |legs: &[ProcLeg], cons: &[crate::nav::StarConstraint], said: &mut std::collections::HashSet<String>| {
+        let Some(cruise) = star_cruise_ft else { return };
+        for (fix, min_ft, cruise_ft) in windows_above_cruise(legs, cons, cruise) {
+            if said.insert(fix.to_ascii_uppercase()) {
+                crate::blackbox::record(
+                    "procedure",
+                    serde_json::json!({"event": "star_window_above_cruise", "fix": fix, "min_ft": min_ft, "cruise_ft": cruise_ft}),
+                );
+                alert(&voice, Priority::Advisory, &above_cruise_line(&fix, min_ft, cruise_ft));
+            }
+        }
+    };
+    say_above_cruise(&legs, &arrival_constraints, &mut said_windows);
     let mut idx = 0usize;
     // The join onto an approach's final from its IF, and how the last tick
     // steered (`crate::course_leg`, #106).
@@ -2934,6 +3041,7 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, plan: Pla
                     );
                     legs = new;
                     arrival_constraints = s.constraints;
+                    say_above_cruise(&legs, &arrival_constraints, &mut said_windows);
                     handoff = handoff_index(&legs);
                     plan_top = descent_cruise_ft.and_then(|c| plan_top_index(&legs, c));
                     star_speed_begun.clear();
@@ -3658,6 +3766,33 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, plan: Pla
             },
         );
         plan_peak_ft = v.peak_ft;
+        // The next STAR window, judged at the airframe's best from here: one
+        // that cannot be made is said once (#32). Not while the pilot holds
+        // the altitude (their level, their restrictions).
+        if !arrival_constraints.is_empty() && pilot_altitude().is_none() {
+            if let Some(miss) = star_window_miss(
+                &legs,
+                &arrival_constraints,
+                idx,
+                lat,
+                lon,
+                alt_ft,
+                gs_kts,
+                climb_fpm(),
+                descent_fpm(),
+                star_cruise_ft,
+            ) {
+                if said_unable_windows.insert(miss.fix.to_ascii_uppercase()) {
+                    crate::blackbox::record(
+                        "procedure",
+                        serde_json::json!({"event": "star_window_unable", "fix": miss.fix, "low": miss.low,
+                            "limit_ft": miss.limit_ft, "predicted_ft": miss.predicted_ft, "by_ft": miss.by_ft,
+                            "dist_nm": miss.dist_nm, "alt_ft": alt_ft}),
+                    );
+                    alert(&voice, Priority::Advisory, &miss.line());
+                }
+            }
+        }
         // A planned step climb begins on this leg: said once, as a crew
         // says it, and only when it is the plan's level being flown (not a
         // pilot's, not the terrain floor's).
@@ -5433,6 +5568,54 @@ mod tests {
             assert!(c.max_ft.is_none_or(|m| alt <= m + 300.0), "{} at {alt:.0}", c.fix);
         }
         assert!(max_vs < 250.0, "the descent climbed at {max_vs:.0} fpm: {crossings:?}");
+    }
+
+    /// #156 / #32: HEMEL's "at FL220" in the FL180 plan is flown at the
+    /// cruise, said once at the arm; from the HEMEL leg as recorded (+1661.6:
+    /// 6,350 ft, 23.4 nm, 273 kt, held at 6,000 until LAM by the clearance)
+    /// even the 2,000 fpm climb cannot make 18,000, and that is said once
+    /// with the number, where the flight crossed it at 14,638 unsaid.
+    #[test]
+    fn a_star_window_that_cannot_be_made_is_said() {
+        let (mut legs, cons) = egbb_heme1b();
+        apply_arrival_constraints(&mut legs, &cons);
+        assert_eq!(legs[1].fix_ident, "HEMEL");
+        assert_eq!(legs[1].alt1_ft, Some(18_000.0), "never climbed to FL220");
+        assert!(legs.iter().all(|l| l.alt1_ft.unwrap() <= 18_000.0));
+        let cruise = legs.iter().filter_map(|l| l.alt1_ft).fold(0.0, f64::max);
+        assert_eq!(windows_above_cruise(&legs, &cons, cruise), vec![("HEMEL".to_string(), 22_000.0, 18_000.0)]);
+        assert_eq!(
+            above_cruise_line("HEMEL", 22_000.0, 18_000.0),
+            "HEMEL's 22,000 feet is above our cruise. We'll cross it at 18,000 feet."
+        );
+        // A plan that starts on the STAR has no cruise before it: as before.
+        let (legs2, cons2) = star_route();
+        let mut l2 = legs2.clone();
+        apply_arrival_constraints(&mut l2, &cons2);
+        assert_eq!(l2[0].alt1_ft, Some(26_000.0));
+        // On the LAM leg, 29 nm out: the climb still makes it.
+        let hemel = legs[1].fix.clone().unwrap();
+        let (lat, lon) = crate::nav::project_latlon(hemel.lat, hemel.lon, 110.0, 23.4);
+        let lam = legs[0].fix.clone().unwrap();
+        assert_eq!(
+            star_window_miss(&legs, &cons, 0, lam.lat + 0.09, lam.lon, 6_079.0, 280.0, 2_000.0, 2_000.0, Some(cruise)),
+            None
+        );
+        // On the HEMEL leg as recorded: 1,300 ft low even at the best.
+        let miss = star_window_miss(&legs, &cons, 1, lat, lon, 6_350.0, 273.0, 2_000.0, 2_000.0, Some(cruise))
+            .expect("unmakeable");
+        assert!(miss.low && miss.limit_ft == 18_000.0, "{miss:?}");
+        assert!((1_000.0..1_700.0).contains(&miss.by_ft), "{miss:?}");
+        assert_eq!(miss.line(), format!("We'll cross HEMEL about {} feet under its 18,000 feet.",
+            crate::auto_status::commas(((miss.by_ft / 50.0).round() * 50.0) as i64)));
+        // An "at or below" the best descent cannot reach: said high.
+        let honl = legs[5].fix.clone().unwrap();
+        let (lat, lon) = crate::nav::project_latlon(honl.lat, honl.lon, 90.0, 3.0);
+        let high = star_window_miss(&legs, &cons, 5, lat, lon, 12_000.0, 250.0, 2_000.0, 2_000.0, Some(cruise))
+            .expect("too high for HON");
+        assert!(!high.low && high.limit_ft == 9_000.0 && high.by_ft > 1_000.0, "{high:?}");
+        // Within the slack, or with room: nothing.
+        assert_eq!(star_window_miss(&legs, &cons, 5, lat, lon, 10_200.0, 250.0, 2_000.0, 2_000.0, Some(cruise)), None);
     }
 
     #[test]
