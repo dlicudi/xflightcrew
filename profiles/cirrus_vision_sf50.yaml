@@ -431,12 +431,42 @@ cabin_air:
 # Chosen from the trace, NOT fitted: a plant fitted to the tick log did not
 # reproduce it (thrust pitch and spool lag are not in it). VERIFY: blackbox
 # `flare_elev`, `vvi` and the `power` events on the next SF50 landing.
+#
+# LEMG 12 (2026-09-28, sortie 1790611629): the tracker above pulled 0.19 at
+# 44 ft into a +263 fpm balloon, pushed -0.05 through it, and the sink it
+# rebuilt met the runway at -814 (the servos handed back at 50.5 ft did the
+# rest). A dead time is met with a prediction, not a tracker, so the arrest
+# is flown on a MODEL of this elevator as the 737's is (autoland::
+# FlareModel). Fitted with the servos out to the three clean SF50 arrests
+# on record, the column written against the sink that followed (ETND 26
+# 2026-09-23, EDLP 24's balked balloon 2026-09-24, LEMG 12's roundout to
+# its balloon): 8,000 fpm of standing sink change per unit of pull (the
+# 737's 4,970: "twice as hard") through two 1.2 s lags after 0.9 s of dead
+# time, 66 fpm rms over all three. Flare by flare: ETND 7,000 / 1.2 / 1.2 /
+# 1.0 s (28 rms), EDLP 9,000 / 1.5 / 1.2 / 0.8 (19), LEMG 10,000 / 1.5 /
+# 0.9 / 0.7 (8). No ground term fitted (no clean arrest to the wheels).
+# Flown on every one of those plants with the speed the SF50's flares bled
+# (1.7 kt/s, less 1.3 per 1,000 fpm of climb) and 67 kt Vso: to 150 fpm at
+# the wheels (the quarter-path default's 114 floats a slow wing longer),
+# and the prediction flies it in rough air too (`rough_hold: false`): the
+# 737's rough-air hold, pull only ever back, turned this elevator's pulls
+# into floats that stalled onto the runway in gusts (57 of 160 gusty
+# landings past 400 fpm, the worst 1,098, against none past 236).
+# VERIFY: blackbox `flare_ask`, `flare_unexplained`, `flare_elev` against
+# `vvi` from `arrest_hands`, and no `roundout_held` that ends in a hand-back.
 flare_elevator:
   gain: 0.5
   trim_gain: 3.0
   max: 0.30
   max_push: 0.05
   balloon_ease_per_s: 0.15
+  model:
+    fpm_per_elevator: 8000.0
+    lag_s: 1.2
+    lag2_s: 1.2
+    dead_s: 0.9
+    touchdown_fpm: 150.0
+    rough_hold: false
 flare_power:
   reduction_per_second: 0.06
 
