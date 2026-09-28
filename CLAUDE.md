@@ -805,7 +805,13 @@ every loop down.
 - **"Teach me a full flight"** (`Syllabus`, `STEPS`, `flow::phase_boundary`, `syllabus_active`),
   behind `SyllabusIo` (`FlowIo` live), so the whole flight is a plain `cargo test`.
 - `xvl debrief` prints lessons and `instructor::grade_flight` over any flight's `state` records.
-- Still owed: issues labelled `owed` + `area:instructor` (#86, #87).
+- **"Show me" is the one exception to folded arms** (`instructor::show_me`, `Demo`): the task's crew
+  automation (taxi, takeoff, the pattern from the ground, a landing) is armed with the panel button's
+  words through the tool door, opened ONCE plus its off switch (`mode::tool_may_actuate`,
+  `DEMONSTRATION_ARM_S`); the instructor narrates each point once, grades it as its OWN (`demo_end`
+  `by: instructor`), and hands back "Your controls." to the task briefed. Air work is hands.
+- Still owed: #87 handbook questions (see docs/tasks/2026-09-28-instructor-handbook-questions.md:
+  authored answers, then lexical retrieval, no model).
 
 **Cabin crew** (`src/cabin.rs`): the second intercom persona.
 - **A state machine, not a commentator**, with its own mute (`cabin_quiet`), NOT the monitor's

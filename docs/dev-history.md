@@ -9659,3 +9659,13 @@ at any distance, and the final call ignored occupancy. Now: "continue approach, 
 clearance" plus a landing hold released by the monitor (one monitor.rs call site), and the go-around
 ordered only inside 60 s when the occupant (judged from its track by `strip_exit`) will not be off 10
 s before we cross. Ghosts are replays; the tower releases none of them. Offline only.
+
+## 2026-09-28: the instructor shows how (issue #86; #87 decided)
+
+A demonstration is the crew's existing automation, never a new law, armed through the same door and
+words as the panel button ("taxi for me", "take off for me", "do a circuit", "land the aircraft");
+instructor mode's hands-off guarantee narrows to exactly that one call once (`mode::tool_may_actuate`)
+plus its off switch. The demonstration's grade is the instructor's (`demo_end` `by: instructor`); a
+student's attempt in progress is closed as theirs. #87: authored answers plus lexical (BM25) retrieval
+over the existing handbook chunks, no model (the 2026-07-08 fps measurement; a teaching voice must not
+invent); see docs/tasks/2026-09-28-instructor-handbook-questions.md. Offline only.
