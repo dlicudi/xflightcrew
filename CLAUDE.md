@@ -595,7 +595,11 @@ everything blackboxes to `logs/blackbox.jsonl` (kinds: `atc`, `autotaxi`, `autot
   `setup_approach` before the arm; the old station publishes nothing until the new one is installed,
   `NEW_FLIGHT_PENDING`, and its radar watch; whoever starts it: a mailbox run the app did not post
   (the runner's starts) stands every loop down and retires them too (`setup::spawn_new_flight_watch`,
-  `judge_init_seq`, blackbox `setup` `foreign_new_flight`); nothing arms while the app's own new
+  `judge_init_seq`, blackbox `setup` `foreign_new_flight`); **its station is the field under the NEW
+  position** (`station::arm_new_flight_at`, `field_under`) chosen from a SETTLED position
+  (`setup::SettleJudge`: the load reports a runway's midpoint on the ground 157 ft up), installed
+  before the flag drops; full auto's mission waits for it (`judge_departure_station`, 20 s, else
+  `give_up` `departure_station`; EGKK 2026-09-28); nothing arms while the app's own new
   flight loads (`setup::new_flight_loading`: a load reports the first runway's midpoint); a refused stated runway is blackboxed `stated_runway_refused`; LEMG 2026-09-28).
 - **The tower's clearance outranks the plan** (`runway_from_clearance`), watched THROUGH the
   approach since its answer comes after the arm: owed readbacks (`party_line::readback_owed`), a

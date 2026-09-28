@@ -9759,3 +9759,14 @@ move it 21 times against 76.
 altitude, OAT, weight), measures the loading at lift-off, pre-lifts to just under the prediction,
 refuses a hover it cannot give on the wheels with its numbers, and gives up a lift that droops. On
 the plant: EDVW 16.6 s to lift and 33.3 s to 11 ft become 7.8 s and 15.9 s. Offline only.
+
+## 2026-09-28: a new flight kept the old field's station (issue #151)
+
+After a day at LEMG the runner put the 737 on Gatwick stand 71. `foreign_new_flight` re-armed the
+ACTIVE field (LEMG) at 13:18:53.5, and that re-arm's 180 s region cooldown held the ground relocation
+off until 13:21:55. Full auto's departure (+133 s) saw no station in reach: `departure_field
+towered:false`, self_taxi 08R via Juliett, `pushback_skipped` 1,639,240 m from "stand 71" at LEMG.
+The load reported 51.14830 N 0.18915 W on the ground at 157 ft AGL for 16 s before the stand. A new
+flight's station is now the towered field under its settled position (the watch, the ramp setup, the
+approach setup's named field); full auto's mission waits up to 20 s for the departure field's station
+or gives up naming both. Offline only.
