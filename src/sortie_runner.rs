@@ -99,6 +99,12 @@ pub const FIELD_PLAN_DESTINATION: &str = "PLAN_DESTINATION";
 /// `runway: plan`: the plan's runway at that end (`origin/plan_rwy`,
 /// `destination/plan_rwy`).
 pub const RUNWAY_FROM_PLAN: &str = "PLAN";
+/// `runway: wind`: the into-wind end of the field's runways, picked at the
+/// case's setup by the tower's own rule (`nav::best_runway_for_wind`) from
+/// the field's surface wind at that moment. LEMG (2026-09-28, #158): the
+/// backlog's cases named 13 with the wind at 280/5, the tower sent the
+/// arrivals to 30, and a slow SR22 spent its whole deadline reversing.
+pub const RUNWAY_FROM_WIND: &str = "WIND";
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -496,9 +502,55 @@ fn ident<'de, D: serde::Deserializer<'de>>(d: D) -> std::result::Result<String, 
     }
 }
 
+/// The approach speed the default deadline is sized for: the 737's
+/// (`profiles/boeing_737_800.yaml`), the airframe the default was set on.
+pub const REF_APPROACH_KTS: f64 = 145.0;
+/// A slow airframe's default deadline grows by at most this factor.
+pub const DEADLINE_SCALE_MAX: f64 = 2.5;
+
+/// The deadline of a case with none of its own: [`DEFAULT_DEADLINE_MIN`]
+/// scaled by how much slower the airframe flies its approach than the
+/// [`REF_APPROACH_KTS`] it was set for (every leg of a pattern and a final
+/// is distance over speed), never shorter than the default. Unknown speed:
+/// the default. The SR22 at LEMG (2026-09-28, #158) was still on final at
+/// its deadline.
+pub fn default_deadline_min(approach_kts: Option<f64>) -> f64 {
+    let scale = approach_kts
+        .filter(|k| k.is_finite() && *k > 0.0)
+        .map_or(1.0, |k| (REF_APPROACH_KTS / k).clamp(1.0, DEADLINE_SCALE_MAX));
+    DEFAULT_DEADLINE_MIN * scale
+}
+
 impl Case {
     pub fn deadline_s(&self) -> f64 {
-        self.deadline_min.unwrap_or(DEFAULT_DEADLINE_MIN) * 60.0
+        self.deadline_s_for(None)
+    }
+
+    /// The case's deadline for an airframe that approaches at this speed:
+    /// its own `deadline_min`, else [`default_deadline_min`].
+    pub fn deadline_s_for(&self, approach_kts: Option<f64>) -> f64 {
+        self.deadline_min
+            .unwrap_or_else(|| default_deadline_min(approach_kts))
+            * 60.0
+    }
+
+    /// The case's runway is the wind's, picked at its setup.
+    pub fn wants_wind(&self) -> bool {
+        match &self.setup {
+            Setup::Approach { runway, .. } | Setup::RunwayStart { runway, .. } => {
+                runway == RUNWAY_FROM_WIND
+            }
+            Setup::Ramp { .. } => false,
+        }
+    }
+
+    /// The case with its runway named.
+    pub fn with_runway(&self, ident: &str) -> Case {
+        let mut c = self.clone();
+        if let (_, Some(r)) = c.field_mut() {
+            *r = ident.to_string();
+        }
+        c
     }
 
     /// The line typed to start the case: the approach setup's own words, or
@@ -749,6 +801,139 @@ pub fn runway_start_json(
     .to_string()
 }
 
+// ---- The runway the wind picks ---------------------------------------------------
+
+/// The aircraft on the ground within this of a field's runway ends is ON
+/// the field: the sim's wind at the aircraft is the field's surface wind.
+pub const FIELD_WIND_NM: f64 = 3.0;
+
+/// A `runway: wind` resolved: the end, the wind it was picked into, and
+/// where that wind came from. Its words ride the case's row.
+#[derive(Debug, Clone, PartialEq)]
+pub struct WindPick {
+    pub runway: String,
+    pub from_deg: f64,
+    pub kts: f64,
+    pub headwind_kts: f64,
+    /// "METAR" or "sim".
+    pub source: &'static str,
+}
+
+impl WindPick {
+    pub fn words(&self) -> String {
+        format!(
+            "runway {} into {:03.0}/{:.0} {}, headwind {:.1} kt",
+            self.runway, self.from_deg, self.kts, self.source, self.headwind_kts
+        )
+    }
+}
+
+/// The into-wind end by the tower's own rule (`nav::best_runway_for_wind`:
+/// the most headwind among the field's assignable runways, the longest of
+/// parallels). Pure.
+pub fn pick_into_wind(
+    runways: &[crate::nav::Runway],
+    wind_from_deg: f64,
+    wind_kts: f64,
+    source: &'static str,
+) -> Option<WindPick> {
+    crate::nav::best_runway_for_wind(runways, wind_from_deg, wind_kts).map(|(id, _, hw)| {
+        WindPick {
+            runway: id,
+            from_deg: wind_from_deg,
+            kts: wind_kts,
+            headwind_kts: (hw * 10.0).round() / 10.0,
+            source,
+        }
+    })
+}
+
+/// The field's surface wind now: the newest METAR the app reads
+/// (`weather::surface_wind`), else the sim's wind at the aircraft when it
+/// sits on the field. Aloft or elsewhere the aircraft's wind is not the
+/// field's (the tower's own rule, `monitor::feed_surface_wind`): no answer.
+async fn field_wind(
+    sim: &dyn RunnerSim,
+    field: &str,
+    runways: &[crate::nav::Runway],
+) -> Result<(f64, f64, &'static str)> {
+    if let Some((from, kts)) = sim.metar_wind(field).await {
+        return Ok((from, kts, "METAR"));
+    }
+    let on_ground = sim
+        .read(crate::datarefs::ON_GROUND_ANY)
+        .await
+        .ok()
+        .is_some_and(|g| g > 0.5);
+    let (lat, lon) = (
+        sim.read(crate::datarefs::LATITUDE).await.ok(),
+        sim.read(crate::datarefs::LONGITUDE).await.ok(),
+    );
+    let on_field = match (lat, lon) {
+        (Some(a), Some(b)) => runways.iter().any(|r| {
+            crate::nav::haversine_nm(a, b, r.lat_a, r.lon_a) <= FIELD_WIND_NM
+                || crate::nav::haversine_nm(a, b, r.lat_b, r.lon_b) <= FIELD_WIND_NM
+        }),
+        _ => false,
+    };
+    if on_ground && on_field {
+        let dir = sim.read(crate::datarefs::WIND_DIR_DEG_TRUE).await;
+        let spd = sim.read(crate::datarefs::WIND_SPEED_MSC).await;
+        if let (Ok(d), Ok(v)) = (dir, spd) {
+            return Ok((d.rem_euclid(360.0), v * MPS_TO_KTS, "sim"));
+        }
+    }
+    Err(anyhow!(
+        "no surface wind for {field}: no METAR on file and the aircraft is not on the field"
+    ))
+}
+
+/// A `runway: wind` case made the into-wind end now; any other case as it
+/// is. The pick is the row's to report.
+async fn resolve_wind(
+    sim: &dyn RunnerSim,
+    case: &Case,
+    apt_dat: &str,
+) -> Result<(Case, Option<WindPick>)> {
+    if !case.wants_wind() {
+        return Ok((case.clone(), None));
+    }
+    let field = case.field().to_string();
+    let (path, icao) = (apt_dat.to_string(), field.clone());
+    let runways = tokio::task::spawn_blocking(move || crate::nav::find_runways(&path, &icao))
+        .await
+        .map_err(|e| anyhow!("{e}"))??;
+    if runways.is_empty() {
+        return Err(anyhow!("{field} has no runways in apt.dat"));
+    }
+    let (from, kts, source) = field_wind(sim, &field, &runways).await?;
+    let pick = pick_into_wind(&runways, from, kts, source)
+        .ok_or_else(|| anyhow!("no runway at {field} to face the wind"))?;
+    Ok((case.with_runway(&pick.runway), Some(pick)))
+}
+
+/// The approach speed of an installed `.acf`, from the profile the app's
+/// detector would fly it on (`detect::pick_profile`: a curated profile, else
+/// its own placards). `None` when the file is unreadable.
+fn approach_kts_of_acf(acf_rel: &str) -> Option<f64> {
+    let text = std::fs::read_to_string(crate::config::xplane_path(acf_rel)).ok()?;
+    let key = |k: &str| {
+        text.lines()
+            .find_map(|l| l.strip_prefix(k).map(|v| v.trim().to_string()))
+            .unwrap_or_default()
+    };
+    let who = crate::detect::AcfIdentity {
+        icao: crate::tools::setup::acf_icao(&text).unwrap_or_default(),
+        relative_path: acf_rel.to_string(),
+        author: key("P acf/_author "),
+        descrip: key("P acf/_descrip "),
+    };
+    crate::detect::pick_profile(&who)
+        .profile?
+        .reference?
+        .approach_kts
+}
+
 // ---- The case state machine ----------------------------------------------------
 
 /// Where a case is, between the typed command and the verdict.
@@ -815,6 +1000,9 @@ pub struct Verdict {
     /// What the row says beside the verdict: the sorties a script ended on
     /// the way, the scripted commands forgiven.
     pub note: String,
+    /// How the case was set up where the spec left it to the runner: the
+    /// runway the wind picked, the deadline scaled to the airframe.
+    pub setup: String,
 }
 
 /// The line that stops a run on a wreck that outlived its setup.
@@ -1365,8 +1553,12 @@ pub fn row_line(r: &Row) -> String {
         .and_then(|s| s.words())
         .map(|w| format!(" ({w})"))
         .unwrap_or_default();
+    let setup = match v.setup.is_empty() {
+        true => String::new(),
+        false => format!(" ({})", v.setup),
+    };
     format!(
-        "{} {} #{}: {} in {:.0} s{before}, sortie {}, {}{}{}",
+        "{} {} #{}{setup}: {} in {:.0} s{before}, sortie {}, {}{}{}",
         if v.pass { "PASS" } else { "FAIL" },
         r.case,
         r.rep,
@@ -1410,9 +1602,13 @@ pub fn table(spec_path: &str, started: &str, rows: &[Row]) -> String {
             .settle
             .and_then(|s| s.words())
             .unwrap_or_else(|| "-".into());
+        let case = match v.setup.is_empty() {
+            true => r.case.clone(),
+            false => format!("{} ({})", r.case, v.setup),
+        };
         out.push_str(&format!(
             "| {} | {} | {} | {} | {} | {} | {:.0} | {} | {} |\n",
-            cell(&r.case),
+            cell(&case),
             r.rep,
             v.sortie.as_deref().unwrap_or("-"),
             if v.pass { "PASS" } else { "FAIL" },
@@ -1505,6 +1701,16 @@ pub trait RunnerSim: Send + Sync {
     async fn write_float(&self, name: &str, v: f64) -> Result<()>;
     async fn write_bytes(&self, name: &str, bytes: &[u8]) -> Result<()>;
     async fn command(&self, name: &str) -> Result<()>;
+    /// The field's surface wind from the newest METAR on file (direction
+    /// true, knots), the app's own `weather::surface_wind`.
+    async fn metar_wind(&self, icao: &str) -> Option<(f64, f64)> {
+        crate::weather::surface_wind(&crate::config::xplane_root(), icao)
+    }
+    /// The approach speed of an installed aircraft (`.acf` path relative to
+    /// the X-Plane root), knots.
+    async fn approach_kts(&self, acf_rel: &str) -> Option<f64> {
+        approach_kts_of_acf(acf_rel)
+    }
 }
 
 #[async_trait]
@@ -2011,6 +2217,38 @@ pub async fn run_case(
         settle: Some(settle),
         ..failed(reason)
     };
+    let (resolved, pick) = match resolve_wind(sim, case, apt_dat).await {
+        Ok(r) => r,
+        Err(e) => return failed(format!("setup: {e}")),
+    };
+    let case = &resolved;
+    // The deadline for the airframe that will fly it: the case's own, else
+    // the default scaled to its approach speed.
+    let acf = match &case.aircraft {
+        Some(a) => Some(a.clone()),
+        None => sim
+            .read_string(ACF_PATH)
+            .await
+            .ok()
+            .filter(|p| !p.trim().is_empty()),
+    };
+    let vapp = match (&case.deadline_min, &acf) {
+        (None, Some(a)) => sim.approach_kts(a).await,
+        _ => None,
+    };
+    let deadline_s = case.deadline_s_for(vapp);
+    let mut setup_words: Vec<String> = pick.iter().map(WindPick::words).collect();
+    if let Some(k) = vapp.filter(|_| deadline_s > DEFAULT_DEADLINE_MIN * 60.0) {
+        setup_words.push(format!("deadline {:.0} min at {k:.0} kt", deadline_s / 60.0));
+    }
+    let setup_note = setup_words.join(", ");
+    if !setup_note.is_empty() {
+        eprintln!("{}: {setup_note}", case.name);
+    }
+    let failed = |reason: String| Verdict {
+        setup: setup_note.clone(),
+        ..failed(reason)
+    };
     if let Err(e) = set_up_start(sim, tail, case, apt_dat, pace).await {
         return failed(format!("setup: {e}"));
     }
@@ -2021,8 +2259,8 @@ pub async fn run_case(
     }
     let approach = matches!(case.setup, Setup::Approach { .. });
     let mut m = match approach {
-        true => CaseMachine::once(now_s(), case.deadline_s()),
-        false => CaseMachine::new(now_s(), case.deadline_s()),
+        true => CaseMachine::once(now_s(), deadline_s),
+        false => CaseMachine::new(now_s(), deadline_s),
     };
     m.crash_clear_s = pace.crash_clear_s;
     m.line = Some(line.clone());
@@ -2105,6 +2343,7 @@ pub async fn run_case(
     }
     let mut verdict = verdict;
     verdict.settle = Some(settle);
+    verdict.setup = setup_note;
     // A script that never finished proved less than it meant to.
     if let Some(s) = script.next_step() {
         verdict.pass = false;
@@ -2238,7 +2477,11 @@ pub async fn main_cmd(args: &[String], base_url: &str, apt_dat: &str) -> Result<
     };
     let sink = rows.clone();
     let mut on_row = move |r: &Row| {
-        println!("{}", row_line(r));
+        // Each row as it ends, flushed: the run is watched through a pipe.
+        use std::io::Write;
+        let mut out = std::io::stdout().lock();
+        let _ = writeln!(out, "{}", row_line(r));
+        let _ = out.flush();
         sink.lock()
             .unwrap_or_else(|e| e.into_inner())
             .push(r.clone());
@@ -3050,7 +3293,7 @@ mod tests {
             spec.cases[0].setup,
             Setup::Approach {
                 field: "LEMG".into(),
-                runway: "13".into(),
+                runway: RUNWAY_FROM_WIND.into(),
                 final_nm: 10
             }
         );
@@ -3058,7 +3301,7 @@ mod tests {
             spec.cases[1].setup,
             Setup::Approach {
                 field: "LEMG".into(),
-                runway: "13".into(),
+                runway: RUNWAY_FROM_WIND.into(),
                 final_nm: 5
             }
         );
@@ -3069,6 +3312,7 @@ mod tests {
                 ..
             }
         ));
+        assert!(spec.cases.iter().all(Case::wants_wind), "#158: the wind's runway");
         assert_eq!(spec.cases[2].command.as_deref(), Some("fly a circuit"));
         assert_eq!(spec.cases[1].deadline_s(), 8.0 * 60.0);
         assert_eq!(spec.cases[0].deadline_s(), 10.0 * 60.0);
@@ -3617,6 +3861,12 @@ mod tests {
         /// A mailbox post loading another aircraft is answered by the app's
         /// detector (`profile_probe` of it).
         probe_on_swap: std::sync::atomic::AtomicBool,
+        /// The METAR on file for any field (direction true, knots).
+        metar: std::sync::Mutex<Option<(f64, f64)>>,
+        /// The aircraft's position and the wind at it (m/s).
+        at: std::sync::Mutex<(f64, f64, f64, f64)>,
+        /// Every aircraft's approach speed.
+        vapp: std::sync::Mutex<Option<f64>>,
     }
 
     /// The fake's taxi-in pace, 14 kt in metres per second.
@@ -3645,6 +3895,9 @@ mod tests {
                 rolling_reads: 0.into(),
                 setups_while_rolling: 0.into(),
                 probe_on_swap: false.into(),
+                metar: Default::default(),
+                at: Default::default(),
+                vapp: Default::default(),
             }
         }
     }
@@ -3659,6 +3912,10 @@ mod tests {
                 "xcopilot/sim/init_seq" => posted,
                 crate::datarefs::ON_GROUND_ANY => flag(!self.airborne.load(SeqCst)),
                 crate::datarefs::HAS_CRASHED => flag(self.crashed.load(SeqCst)),
+                crate::datarefs::LATITUDE => self.at.lock().unwrap().0,
+                crate::datarefs::LONGITUDE => self.at.lock().unwrap().1,
+                crate::datarefs::WIND_DIR_DEG_TRUE => self.at.lock().unwrap().2,
+                crate::datarefs::WIND_SPEED_MSC => self.at.lock().unwrap().3,
                 GROUNDSPEED => {
                     let left = self.rolling_reads.load(SeqCst);
                     if left > 0 && left != u32::MAX {
@@ -3691,6 +3948,12 @@ mod tests {
         async fn command(&self, name: &str) -> Result<()> {
             self.commands.lock().unwrap().push(name.to_string());
             Ok(())
+        }
+        async fn metar_wind(&self, _icao: &str) -> Option<(f64, f64)> {
+            *self.metar.lock().unwrap()
+        }
+        async fn approach_kts(&self, _acf: &str) -> Option<f64> {
+            *self.vapp.lock().unwrap()
         }
         async fn write_bytes(&self, name: &str, bytes: &[u8]) -> Result<()> {
             use std::sync::atomic::Ordering::SeqCst;
@@ -3869,6 +4132,112 @@ mod tests {
             .await
             .unwrap_err();
         assert!(e.to_string().contains("the app never took"), "{e}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// LEMG's two runways, verbatim from the Global Airports apt.dat.
+    fn lemg_apt(dir: &std::path::Path) -> String {
+        let p = dir.join("apt.dat");
+        std::fs::write(
+            &p,
+            "1    52 0 0 LEMG Malaga\n\
+             100 45.11 1 1 0.00 1 3 0  12 36.6910753 -4.5078270 0 190 3 1 1 1 30 36.6795648 -4.4805125 0 489 3 0 0 1\n\
+             100 45.11 27 27 0.00 1 3 0  13 36.6845573 -4.5126253 0 75 3 1 0 2 31 36.6654027 -4.4858140 0 75 3 1 0 3\n\
+             1   1027 0 0 0MU1 Sunderland\n",
+        )
+        .unwrap();
+        p.to_string_lossy().to_string()
+    }
+
+    /// #158: the backlog named LEMG 13 with the wind at 280/5; the tower
+    /// sent arrivals to 30. `runway: wind` is picked at the setup by the
+    /// tower's own rule, from the METAR, else the sim's wind on the field,
+    /// and the row says which.
+    #[tokio::test]
+    async fn runway_wind_is_the_towers_into_wind_end_at_the_setup() {
+        let (dir, log) = scratch_log("wind-pick");
+        let apt = lemg_apt(&dir);
+        let sim = FakeSim::new(log.clone());
+        let spec = parse_spec(
+            "cases: [{name: final, setup: {approach: {field: LEMG, runway: wind, final_nm: 5}}},\n\
+                     {name: start, setup: {runway_start: {field: LEMG, runway: wind, engines_running: true}},\n\
+                      command: fly a circuit}]",
+        )
+        .unwrap();
+        assert!(spec.cases.iter().all(Case::wants_wind));
+        // The tower's rule on the recorded wind: 30, not 13.
+        let runways = crate::nav::find_runways(&apt, "LEMG").unwrap();
+        let p = pick_into_wind(&runways, 280.0, 5.0, "METAR").unwrap();
+        assert_eq!(p.runway, "30", "{p:?}");
+        assert_eq!(p.words(), "runway 30 into 280/5 METAR, headwind 4.8 kt");
+        assert_eq!(pick_into_wind(&runways, 130.0, 8.0, "sim").unwrap().runway, "13");
+        *sim.metar.lock().unwrap() = Some((280.0, 5.0));
+        let mut tail = BlackboxTail::at_end(&log);
+        let mut seen = Vec::new();
+        let rows = run_all(&sim, &mut tail, &spec, 1, &apt, &quick_pace(), &mut |r: &Row| {
+            seen.push(row_line(r))
+        })
+        .await;
+        assert!(rows.iter().all(|r| r.verdict.pass), "{seen:?}");
+        assert_eq!(
+            sim.typed.lock().unwrap()[0],
+            "put us on a 5 mile final to LEMG runway 30"
+        );
+        let inits = sim.inits.lock().unwrap().clone();
+        let v: Value = serde_json::from_str(&inits[0]).unwrap();
+        assert_eq!(v["runway_start"]["runway"], "30");
+        assert!(
+            seen[0].starts_with("PASS final #1 (runway 30 into 280/5 METAR, headwind 4.8 kt): "),
+            "{seen:?}"
+        );
+        // No METAR: the sim's wind at the aircraft on the field (LEMG 13's
+        // threshold, 130 at 8 kt) picks 13.
+        *sim.metar.lock().unwrap() = None;
+        *sim.at.lock().unwrap() = (36.6845, -4.5126, 130.0, 8.0 / MPS_TO_KTS);
+        let one = Spec { cases: vec![spec.cases[1].clone()] };
+        let rows = run_all(&sim, &mut tail, &one, 1, &apt, &quick_pace(), &mut |_| {}).await;
+        assert!(rows[0].verdict.pass, "{:?}", rows[0].verdict);
+        assert!(rows[0].verdict.setup.starts_with("runway 13 into 130/8 sim"), "{:?}", rows[0].verdict);
+        // Away from the field the aircraft's wind is not the field's: the
+        // case fails its setup, naming why, and nothing is flown.
+        *sim.at.lock().unwrap() = (51.15, -0.18, 130.0, 4.0);
+        let typed = sim.typed.lock().unwrap().len();
+        let rows = run_all(&sim, &mut tail, &one, 1, &apt, &quick_pace(), &mut |_| {}).await;
+        assert!(!rows[0].verdict.pass);
+        assert!(rows[0].verdict.reason.contains("no surface wind for LEMG"), "{:?}", rows[0].verdict);
+        assert_eq!(sim.typed.lock().unwrap().len(), typed, "nothing typed");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #158: a case with no deadline of its own gets the default scaled by
+    /// the airframe's approach speed; one that names its deadline keeps it.
+    #[tokio::test]
+    async fn the_default_deadline_scales_with_the_approach_speed() {
+        assert_eq!(default_deadline_min(None), DEFAULT_DEADLINE_MIN);
+        assert_eq!(default_deadline_min(Some(145.0)), DEFAULT_DEADLINE_MIN);
+        // A faster airframe never gets less than the default.
+        assert_eq!(default_deadline_min(Some(154.0)), DEFAULT_DEADLINE_MIN);
+        // The SF50's 87 kt: 145/87 of it.
+        assert!((default_deadline_min(Some(87.0)) - 20.0 * 145.0 / 87.0).abs() < 1e-9);
+        // A 50 kt ultralight is capped.
+        assert_eq!(default_deadline_min(Some(50.0)), DEFAULT_DEADLINE_MIN * DEADLINE_SCALE_MAX);
+        let spec = parse_spec(
+            "cases: [{name: a, setup: {approach: {field: LEMG, runway: 13}}},\n\
+                     {name: b, setup: {approach: {field: LEMG, runway: 13}}, deadline_min: 7}]",
+        )
+        .unwrap();
+        assert_eq!(spec.cases[0].deadline_s_for(Some(87.0)), 20.0 * 145.0 / 87.0 * 60.0);
+        assert_eq!(spec.cases[1].deadline_s_for(Some(87.0)), 7.0 * 60.0);
+        // The driver sizes the case's deadline from the airframe: an endless
+        // mission on an 87 kt aircraft is judged at the scaled deadline, and
+        // the row says so.
+        let (dir, log) = scratch_log("vapp-deadline");
+        let sim = FakeSim::new(log.clone());
+        *sim.vapp.lock().unwrap() = Some(87.0);
+        let mut tail = BlackboxTail::at_end(&log);
+        let one = Spec { cases: vec![spec.cases[0].clone()] };
+        let rows = run_all(&sim, &mut tail, &one, 1, "", &quick_pace(), &mut |_| {}).await;
+        assert_eq!(rows[0].verdict.setup, "deadline 33 min at 87 kt", "{:?}", rows[0].verdict);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
