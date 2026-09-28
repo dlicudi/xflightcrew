@@ -738,19 +738,17 @@ pub fn choose_arrival(
     if planned.as_deref().and_then(crate::nav::runway_number) == crate::nav::runway_number(&runway) {
         return None;
     }
-    let idents: Vec<String> = legs.iter().map(|l| l.fix_ident.clone()).collect();
-    let mut choices = crate::nav::stars_for_route(cifp_dir, &fp.destination, &runway, &idents);
-    if let Some(star) = &fp.procedures.star {
-        if let Some(k) = choices.iter().position(|c| c.ident.eq_ignore_ascii_case(star)) {
-            let same = choices.remove(k);
-            choices.insert(0, same);
-        }
-    }
-    let (alat, alon) = apt.position()?;
-    let chosen = choices.into_iter().find_map(|mut c| {
-        crate::nav::resolve_proc_fixes(fix_path, nav_path, &apt, &fp.destination, &mut c.legs, alat, alon);
-        c.legs.iter().all(|l| l.fix.is_some()).then_some(c)
-    });
+    let chosen = star_splice(
+        cifp_dir,
+        fix_path,
+        nav_path,
+        &apt,
+        &fp.destination,
+        &runway,
+        fp.procedures.star.as_deref(),
+        legs,
+        0,
+    );
     let spoken = crate::circuit::spell_runway(&runway);
     let Some(c) = chosen else {
         crate::blackbox::record(
@@ -764,34 +762,8 @@ pub fn choose_arrival(
             fp.destination
         ));
     };
-    let entry_alt = legs[c.entry_index].alt1_ft;
-    let last_alt = legs.last().and_then(|l| l.alt1_ft);
-    let mut star_legs = c.legs;
-    let pos: Vec<(f64, f64)> = star_legs.iter().filter_map(|l| l.fix.as_ref().map(|f| (f.lat, f.lon))).collect();
-    let along: Vec<f64> = pos
-        .iter()
-        .scan((0.0, None::<(f64, f64)>), |(d, prev), p| {
-            if let Some(q) = *prev {
-                *d += crate::nav::haversine_nm(q.0, q.1, p.0, p.1);
-            }
-            *prev = Some(*p);
-            Some(*d)
-        })
-        .collect();
-    let total = along.last().copied().unwrap_or(0.0).max(0.1);
-    for (i, l) in star_legs.iter_mut().enumerate() {
-        l.alt1_ft = match (entry_alt, last_alt) {
-            (Some(a), Some(b)) => Some(a + (b - a) * along[i] / total),
-            (a, b) => a.or(b),
-        };
-        l.alt_desc = ' ';
-        l.alt2_ft = None;
-        l.transition = String::new();
-        l.leg_type = "TF".to_string();
-        l.seq = (c.entry_index + i) as u32;
-    }
     legs.truncate(c.entry_index);
-    legs.extend(star_legs);
+    legs.extend(c.legs);
     crate::blackbox::record(
         "plan_audit",
         serde_json::json!({ "event": "star_chosen", "star": c.ident, "entry": c.entry, "runway": runway,
@@ -804,6 +776,103 @@ pub fn choose_arrival(
         "The wind at {} favours runway {spoken}, so the {} arrival from {}.",
         fp.destination, c.ident, c.entry
     ))
+}
+
+/// A STAR to one runway, spliced into the legs the crew flies: `legs[..entry_index]`
+/// stay, `legs` here replace the rest.
+#[derive(Debug, Clone)]
+pub struct StarSplice {
+    pub ident: String,
+    /// The STAR's first fix on the route, and its index in the legs given.
+    pub entry: String,
+    pub entry_index: usize,
+    /// The STAR from the entry on, positioned, as plain TF legs whose
+    /// altitudes descend in a straight line (by distance) from the entry's
+    /// altitude to the old route's last; the STAR's own windows clamp them
+    /// after (`arrival_restrictions`, `nav::star_constraints`).
+    pub legs: Vec<crate::nav::ProcLeg>,
+}
+
+/// The STAR serving `runway` that meets `legs` at or after `from` (the leg
+/// flying, in flight; 0 at the arm), `prefer` first when it serves the
+/// runway too (the STAR already flown only changes its runway part), else
+/// the one entering earliest (`nav::stars_for_route`), its fixes all
+/// positioned. `None`: no STAR from this route serves the runway. The arm's
+/// pick (`choose_arrival`) and the in-flight re-pick (#79,
+/// `full_auto::repick_arrival`) are this one rule.
+#[allow(clippy::too_many_arguments)]
+pub fn star_splice(
+    cifp_dir: &str,
+    fix_path: &str,
+    nav_path: &str,
+    apt: &crate::nav::AirportInfo,
+    dest: &str,
+    runway: &str,
+    prefer: Option<&str>,
+    legs: &[crate::nav::ProcLeg],
+    from: usize,
+) -> Option<StarSplice> {
+    if from >= legs.len() {
+        return None;
+    }
+    let idents: Vec<String> = legs[from..].iter().map(|l| l.fix_ident.clone()).collect();
+    let mut choices = crate::nav::stars_for_route(cifp_dir, dest, runway, &idents);
+    if let Some(star) = prefer {
+        if let Some(k) = choices.iter().position(|c| c.ident.eq_ignore_ascii_case(star)) {
+            let same = choices.remove(k);
+            choices.insert(0, same);
+        }
+    }
+    let (alat, alon) = apt.position()?;
+    let c = choices.into_iter().find_map(|mut c| {
+        crate::nav::resolve_proc_fixes(fix_path, nav_path, apt, dest, &mut c.legs, alat, alon);
+        c.legs.iter().all(|l| l.fix.is_some()).then_some(c)
+    })?;
+    let entry_index = from + c.entry_index;
+    let star_legs = realtitude_star(c.legs, legs[entry_index].alt1_ft, legs.last().and_then(|l| l.alt1_ft), entry_index);
+    Some(StarSplice {
+        ident: c.ident,
+        entry: c.entry,
+        entry_index,
+        legs: star_legs,
+    })
+}
+
+/// A STAR's legs as the follower flies them: TF legs from the entry, the
+/// altitude a straight line by distance from `entry_alt` to `last_alt`, the
+/// chart's own windows left to `apply_arrival_constraints`. Pure.
+pub fn realtitude_star(
+    mut star_legs: Vec<crate::nav::ProcLeg>,
+    entry_alt: Option<f64>,
+    last_alt: Option<f64>,
+    seq_from: usize,
+) -> Vec<crate::nav::ProcLeg> {
+    let pos: Vec<Option<(f64, f64)>> = star_legs.iter().map(|l| l.fix.as_ref().map(|f| (f.lat, f.lon))).collect();
+    let mut along = Vec::with_capacity(pos.len());
+    let mut d = 0.0;
+    let mut prev: Option<(f64, f64)> = None;
+    for p in &pos {
+        if let (Some(q), Some(p)) = (prev, p) {
+            d += crate::nav::haversine_nm(q.0, q.1, p.0, p.1);
+        }
+        if p.is_some() {
+            prev = *p;
+        }
+        along.push(d);
+    }
+    let total = along.last().copied().unwrap_or(0.0).max(0.1);
+    for (i, l) in star_legs.iter_mut().enumerate() {
+        l.alt1_ft = match (entry_alt, last_alt) {
+            (Some(a), Some(b)) => Some(a + (b - a) * along[i] / total),
+            (a, b) => a.or(b),
+        };
+        l.alt_desc = ' ';
+        l.alt2_ft = None;
+        l.transition = String::new();
+        l.leg_type = "TF".to_string();
+        l.seq = (seq_from + i) as u32;
+    }
+    star_legs
 }
 
 /// The fix nearest `d` nm along, for naming a place.
@@ -1140,6 +1209,7 @@ mod tests {
             navaid_ident: String::new(),
             navaid_region: String::new(),
             navaid: None,
+            path: Default::default(),
         }
     }
 

@@ -175,6 +175,74 @@ pub struct PlannedTod {
     pub held_ft: Option<f64>,
 }
 
+/// The follower's legs as flown and the index of the leg flying, republished
+/// when either changes: what an in-flight re-pick (#79) splices into.
+static ROUTE_AHEAD: std::sync::Mutex<Option<(usize, Vec<ProcLeg>)>> = std::sync::Mutex::new(None);
+
+/// The legs the follower flies and the leg flying; `None` between procedures.
+pub fn route_ahead() -> Option<(usize, Vec<ProcLeg>)> {
+    if !ACTIVE.load(Ordering::Relaxed) {
+        return None;
+    }
+    ROUTE_AHEAD.lock().unwrap_or_else(|e| e.into_inner()).clone()
+}
+
+fn publish_route_ahead(v: Option<(usize, Vec<ProcLeg>)>) {
+    *ROUTE_AHEAD.lock().unwrap_or_else(|e| e.into_inner()) = v;
+}
+
+/// A new tail for the flying route: the arrival re-picked in flight (#79,
+/// `full_auto::repick_arrival`). `legs` replace the route from `from` on,
+/// where the route must still hold `entry` (the STAR's first fix, the one
+/// the splice was computed against); `constraints` are the new STAR's
+/// windows, replacing the old ones whole.
+#[derive(Debug, Clone)]
+pub struct Splice {
+    pub from: usize,
+    pub entry: String,
+    pub legs: Vec<ProcLeg>,
+    pub constraints: Vec<crate::nav::StarConstraint>,
+    pub why: String,
+}
+
+static SPLICE: std::sync::Mutex<Option<Splice>> = std::sync::Mutex::new(None);
+
+/// Offer the flying follower a new tail; it takes it on its next tick, or
+/// refuses it (`splice_stale`) when the leg flying is already past the entry.
+/// False with no follower flying.
+pub fn offer_splice(s: Splice) -> bool {
+    if !ACTIVE.load(Ordering::SeqCst) {
+        return false;
+    }
+    *SPLICE.lock().unwrap_or_else(|e| e.into_inner()) = Some(s);
+    true
+}
+
+fn take_splice() -> Option<Splice> {
+    SPLICE.lock().unwrap_or_else(|e| e.into_inner()).take()
+}
+
+/// The route with the splice applied, flying leg `idx`: the legs before
+/// `from` kept and the new ones after, so `idx` still names the same leg.
+/// Refused when the route no longer holds the entry at `from` (another
+/// splice came first) or the leg flying is past it (a turn onto the old
+/// STAR's next fix is already in hand: the arrival sets up from there). Pure.
+pub fn apply_splice(legs: &[ProcLeg], idx: usize, s: &Splice) -> Result<Vec<ProcLeg>, &'static str> {
+    let at = legs.get(s.from).ok_or("route_changed")?;
+    if !at.fix_ident.eq_ignore_ascii_case(&s.entry) {
+        return Err("route_changed");
+    }
+    if idx > s.from {
+        return Err("past_entry");
+    }
+    if s.legs.is_empty() || !s.legs[0].fix_ident.eq_ignore_ascii_case(&s.entry) {
+        return Err("no_entry");
+    }
+    let mut out = legs[..s.from].to_vec();
+    out.extend(s.legs.iter().cloned());
+    Ok(out)
+}
+
 static TOD: std::sync::Mutex<Option<PlannedTod>> = std::sync::Mutex::new(None);
 
 /// The follower's planned top of descent for the leg being flown; `None`
@@ -1900,6 +1968,7 @@ pub fn enroute_legs(
             navaid_ident: String::new(),
             navaid_region: String::new(),
             navaid: None,
+            path: Default::default(),
         })
         .collect()
 }
@@ -1944,6 +2013,8 @@ pub fn start_scoped(
             publish_fix_dist(None);
             clear_pilot_altitude();
             publish_terrain_floor(None);
+            publish_route_ahead(None);
+            take_splice();
             crate::tools::speedhold::release();
             hold_at_cleared(None, "follower_ended");
         });
@@ -2074,13 +2145,13 @@ impl HeadingHold {
 async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, plan: Plan) {
     let Plan {
         name,
-        legs,
+        mut legs,
         end,
         vy_kts,
         cruise_ias_kts,
         transition_altitude_ft,
         climb_minimums,
-        arrival_constraints,
+        mut arrival_constraints,
         visual_deg,
         missed_legs,
     } = plan;
@@ -2099,7 +2170,7 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, plan: Pla
             serde_json::json!({"event": "minimum_above_cruise", "fix": m.fix, "min_ft": m.min_ft, "cruise_ft": cruise_ft}),
         );
     }
-    let handoff = handoff_index(&legs);
+    let mut handoff = handoff_index(&legs);
     let _detail = crate::auto_status::DetailGuard::hold(&DETAIL);
     // Process-wide facts must never outlive the flight that set them.
     clear_pilot_altitude();
@@ -2220,7 +2291,7 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, plan: Pla
     // own procedure owns the heights.
     let descent_cruise_ft = (cruise_ft > 0.0 && !matches!(end, EndAction::Approach { .. }))
         .then_some(cruise_ft);
-    let plan_top = descent_cruise_ft.and_then(|c| plan_top_index(&legs, c));
+    let mut plan_top = descent_cruise_ft.and_then(|c| plan_top_index(&legs, c));
     let mut plan_peak_ft = prev_cmd_alt;
     let mut descent_held_logged: Option<usize> = None;
     let mut climb_held_logged: Option<usize> = None;
@@ -2235,6 +2306,9 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, plan: Pla
     // The join onto an approach's final from its IF, and how the last tick
     // steered (`crate::course_leg`, #106).
     let mut final_join = crate::course_leg::FinalJoin::default();
+    // The hold being flown, by leg index, and the last hold leg seen (#101).
+    let mut hold: Option<(usize, crate::course_leg::HoldFlight)> = None;
+    let mut hold_seen: Option<usize> = None;
     let mut steer_was = crate::course_leg::Steer::Direct;
     let mut closure: Option<(usize, crate::circuit::Closure)> = None;
     let mut stalls = 0u32;
@@ -2242,6 +2316,8 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, plan: Pla
     let mut tick_clock = std::time::Instant::now();
     // The FMS is sequenced once per leg, when the follower first steers at it.
     let mut fms_leg: Option<usize> = None;
+    // The leg index last published with the route (`route_ahead`).
+    let mut route_published: Option<usize> = None;
     // Terrain look-ahead: probed on its own slow cadence (the ground does not
     // move), disabled for the flight the first time the plugin has no answer so
     // an old build degrades to the previous behaviour instead of stalling the
@@ -2269,6 +2345,39 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, plan: Pla
         if crate::xplane::sim_frozen(&xp).await {
             tick_clock = std::time::Instant::now();
             continue;
+        }
+        // An arrival re-picked in flight (#79): the new STAR's legs from its
+        // entry, and its windows, taken whole between two ticks.
+        if let Some(s) = take_splice() {
+            match apply_splice(&legs, idx, &s) {
+                Ok(new) => {
+                    crate::blackbox::record(
+                        "procedure",
+                        serde_json::json!({"event": "star_spliced", "idx": idx, "from": s.from, "entry": s.entry,
+                            "why": s.why, "fixes": new[s.from..].iter().map(|l| l.fix_ident.clone()).collect::<Vec<_>>(),
+                            "alts": new[s.from..].iter().map(|l| l.alt1_ft.map(f64::round)).collect::<Vec<_>>(),
+                            "constraints": s.constraints.len()}),
+                    );
+                    legs = new;
+                    arrival_constraints = s.constraints;
+                    handoff = handoff_index(&legs);
+                    plan_top = descent_cruise_ft.and_then(|c| plan_top_index(&legs, c));
+                    star_speed_begun.clear();
+                    said_star_speed.clear();
+                    star_ceiling_logged = None;
+                    ceiling_latch = None;
+                    fms_leg = None;
+                    route_published = None;
+                }
+                Err(why) => crate::blackbox::record(
+                    "procedure",
+                    serde_json::json!({"event": "splice_stale", "idx": idx, "from": s.from, "entry": s.entry, "why": why}),
+                ),
+            }
+        }
+        if route_published != Some(idx) {
+            route_published = Some(idx);
+            publish_route_ahead(Some((idx, legs.clone())));
         }
 
         let (
@@ -2623,6 +2732,66 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, plan: Pla
             }
             _ => {}
         }
+        // An RF leg round its arc, a hold as a racetrack (#101).
+        let arc = if steer_track.is_none() { leg.arc() } else { None };
+        let mut holding = false;
+        let mut hold_end: Option<crate::course_leg::HoldEnd> = None;
+        if let Some(a) = arc.as_ref() {
+            steer_track = Some(crate::course_leg::arc_track(a, lat, lon));
+            steer = Steer::Arc;
+        } else if steer_track.is_none() && leg.is_hold() {
+            if hold_seen != Some(idx) {
+                hold_seen = Some(idx);
+                hold = crate::course_leg::HoldFlight::for_leg(leg, mag_var).map(|h| (idx, h));
+                crate::blackbox::record(
+                    "procedure",
+                    serde_json::json!({"event": if hold.is_some() { "hold_armed" } else { "hold_not_flown" },
+                        "idx": idx, "fix": leg.fix_ident, "leg": leg.leg_type, "course": leg.course_mag,
+                        "turn": leg.turn.map(String::from), "leg_min": leg.path.hold_leg_min,
+                        "leg_nm": leg.dist_nm, "alt": leg.alt1_ft}),
+                );
+            }
+            if let Some((_, h)) = hold.as_mut().filter(|(i, _)| *i == idx) {
+                let s = h.step(leg, lat, lon, track_true, gs_kts, alt_ft, CAPTURE_NM, progress_s);
+                if s.moved {
+                    crate::blackbox::record(
+                        "procedure",
+                        serde_json::json!({"event": "hold", "idx": idx, "fix": leg.fix_ident,
+                            "phase": h.phase.word(), "circuits": h.circuits, "alt_ft": alt_ft}),
+                    );
+                    if h.phase == crate::course_leg::HoldPhase::TurnOut && h.circuits == 0 {
+                        alert(
+                            &voice,
+                            Priority::Advisory,
+                            &format!("Entering the hold at {}.", crate::tools::procedure::spell_ident(&leg.fix_ident)),
+                        );
+                    }
+                }
+                if let Some(e) = s.end {
+                    crate::blackbox::record(
+                        "procedure",
+                        serde_json::json!({"event": "hold_end", "idx": idx, "fix": leg.fix_ident,
+                            "how": if e == crate::course_leg::HoldEnd::Flown { "flown" } else { "gave_up" },
+                            "circuits": h.circuits, "alt_ft": alt_ft, "alt": leg.alt1_ft}),
+                    );
+                    if e == crate::course_leg::HoldEnd::GaveUp {
+                        alert(
+                            &voice,
+                            Priority::Advisory,
+                            &format!(
+                                "We did not make {} feet in the hold at {}. Leaving it.",
+                                leg.alt1_ft.map(|a| a.round() as i64).unwrap_or(0),
+                                crate::tools::procedure::spell_ident(&leg.fix_ident)
+                            ),
+                        );
+                    }
+                }
+                holding = true;
+                hold_end = s.end;
+                steer_track = Some(s.track_true);
+                steer = s.steer;
+            }
+        }
         if steer_track.is_none() {
             let line = CourseLine::of_leg(leg, mag_var);
             if let Some((t, s)) = line.as_ref().and_then(|l| {
@@ -2654,14 +2823,21 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, plan: Pla
         };
         // A course leg flown on its course is done abeam its fix, as a
         // fly-by is: the intercept may still be closing the line.
-        let done = leg_done(leg, dist_nm, alt_ft, capture_nm, lat, lon)
-            || (matches!(steer, Steer::Intercept | Steer::Track)
-                && steer_line
-                    .as_ref()
-                    .is_some_and(|l| crate::course_leg::course_passed(l, lat, lon, capture_nm)));
+        // An arc is done at its end radial; a hold when it says so.
+        let done = if let Some(a) = arc.as_ref() {
+            crate::course_leg::arc_done(a, lat, lon, CAPTURE_NM)
+        } else if holding {
+            hold_end.is_some()
+        } else {
+            leg_done(leg, dist_nm, alt_ft, capture_nm, lat, lon)
+                || (matches!(steer, Steer::Intercept | Steer::Track)
+                    && steer_line
+                        .as_ref()
+                        .is_some_and(|l| crate::course_leg::course_passed(l, lat, lon, capture_nm)))
+        };
         // The closure watchdog judges a leg flown AT its fix; a pattern flies
-        // away from the IF on purpose.
-        if let Some(d) = dist_nm.filter(|_| !done && !final_join.flying_pattern()) {
+        // away from the IF on purpose, and so does a hold's outbound leg.
+        if let Some(d) = dist_nm.filter(|_| !done && !final_join.flying_pattern() && !holding) {
             if closure.as_ref().is_none_or(|(i, _)| *i != idx) {
                 // A new leg is judged on its own: stalls on an earlier leg
                 // that was later flown are not this one's (LIPK 2026-09-25:
@@ -3345,7 +3521,40 @@ mod tests {
             navaid_ident: String::new(),
             navaid_region: String::new(),
             navaid: None,
+            path: Default::default(),
         }
+    }
+
+    /// #79: an in-flight re-pick replaces the route from the STAR's entry on,
+    /// the leg flying keeps its index, and a splice the aircraft has flown
+    /// past (or computed against another route) is refused, never applied.
+    #[test]
+    fn a_splice_replaces_the_route_from_its_entry_while_the_entry_is_ahead() {
+        let legs: Vec<ProcLeg> = ["A", "B", "BAMEK", "OLD1", "OLD2"]
+            .iter()
+            .enumerate()
+            .map(|(i, f)| fix_leg(f, 45.0 + i as f64 * 0.1, 10.0))
+            .collect();
+        let s = Splice {
+            from: 2,
+            entry: "BAMEK".into(),
+            legs: ["BAMEK", "NEW1", "NEW2", "NEW3"].iter().map(|f| fix_leg(f, 44.8, 11.0)).collect(),
+            constraints: Vec::new(),
+            why: "wind".into(),
+        };
+        for idx in [0, 1, 2] {
+            let out = apply_splice(&legs, idx, &s).unwrap();
+            let ids: Vec<&str> = out.iter().map(|l| l.fix_ident.as_str()).collect();
+            assert_eq!(ids, ["A", "B", "BAMEK", "NEW1", "NEW2", "NEW3"]);
+            assert_eq!(out[idx].fix_ident, legs[idx].fix_ident, "the leg flying keeps its index");
+        }
+        assert_eq!(apply_splice(&legs, 3, &s).unwrap_err(), "past_entry");
+        let moved = Splice { from: 1, ..s.clone() };
+        assert_eq!(apply_splice(&legs, 0, &moved).unwrap_err(), "route_changed");
+        let off_end = Splice { from: 9, ..s.clone() };
+        assert_eq!(apply_splice(&legs, 0, &off_end).unwrap_err(), "route_changed");
+        let headless = Splice { legs: vec![fix_leg("NEW1", 44.8, 11.0)], ..s };
+        assert_eq!(apply_splice(&legs, 0, &headless).unwrap_err(), "no_entry");
     }
 
     /// LSZS 03 hand-over at the MAP (1.98 nm, 6,598 ft, threshold 5,602):
@@ -3394,6 +3603,7 @@ mod tests {
             navaid_ident: String::new(),
             navaid_region: String::new(),
             navaid: None,
+            path: Default::default(),
         };
         assert!(!super::map_short_of_runway(&leg), "LIPE I12: MAP on RW12");
         leg.fix_ident = "MA03".into();
@@ -4278,6 +4488,7 @@ mod tests {
             navaid_ident: String::new(),
             navaid_region: String::new(),
             navaid: None,
+            path: Default::default(),
         }
     }
 
@@ -4664,6 +4875,7 @@ mod tests {
             navaid_ident: String::new(),
             navaid_region: String::new(),
             navaid: None,
+            path: Default::default(),
         }
     }
 
