@@ -10229,3 +10229,23 @@ list has it) and taxi on (the list does not check it). Tests
 `the_after_landing_list_waits_for_the_vacate`,
 `the_descent_list_runs_near_the_top_of_a_sawtooth_descent`,
 `the_vacate_lights_agree_with_the_after_landing_list` (records in `bench/flight/`). Offline only.
+
+## 2026-09-28: a cleared SID's "at 5,000" held 6,000 under an FL180 clearance (issue #173)
+
+EGKK 08R to EGBB, 737 (sortie 1790624015-full_auto): the cleared LAM5P replaced the filed LAM6M
+(`departure_rechosen` source cleared), and `choose_departure` spliced the chart's legs in with the
+chart's own altitudes: CIFP codes ACORN and D156O "at 5,000" (blank descriptor), D156J and LAM
+6,000. The follower flew those as the plan's level (`climb_no_descent` plan_ft 5,000 at ACORN and
+D156O), LAM's 6,000 minimum floored it, and after the check-in released the clearance it held
+6,000 from D258T to LAM (+1141 to +1425; the flight model called it Cruise); the filed plan had
+16,000 at ACORN and 18,000 by D156O. The climb began at LAM, HEMEL at 14,587, FL180 never reached.
+A spliced SID now takes the PLAN's levels (`rederive_sid_altitudes`, the rule
+`charted_departure_legs` already had for the filed SID): a fix the plan has keeps its altitude, any
+other the plan's altitude at the join; "at" and "at or above" stay what they were, the minimums
+`DepartureMinimums` floors; only an "at or below" (or a `B` window's top) caps a leg and every leg
+before it (`apply_sid_ceilings`, in both splices). Second fault: at +1408.6, level at 6,000, the
+STAR window watch predicted HEMEL at 17,668 ("about 350 feet under") on the book's 2,000 fpm; it
+is judged now on the follower's commanded climb (`window_climb_fpm`, blackbox `climb_fpm`), and
+not while a clearance holds the target. Bench `bench/follower/egkk_lam5p_held_6000.jsonl`; tests
+`a_rechosen_sid_is_flown_at_the_plans_levels`, `a_sids_at_or_below_stays_a_ceiling`,
+`a_star_window_is_judged_on_the_climb_flown`. Offline only.

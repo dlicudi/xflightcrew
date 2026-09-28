@@ -939,8 +939,9 @@ impl WindowMiss {
     }
 }
 
-/// The next STAR altitude window ahead (leg `idx` on), judged from here at
-/// the airframe's best: climbing at `climb_fpm` to an "at or above" (never
+/// The next STAR altitude window ahead (leg `idx` on), judged from here:
+/// climbing at `climb_fpm`, the climb being flown ([`window_climb_fpm`]),
+/// to an "at or above" (never
 /// above `cruise_ft`: a window over the cruise is flown at the cruise,
 /// [`windows_above_cruise`]), descending at `descent_fpm` (the speedbrake's
 /// rate) to an "at or below". `Some` when even that misses it by more than
@@ -987,6 +988,17 @@ pub fn star_window_miss(
         }
     }
     None
+}
+
+/// The climb a STAR "at or above" is judged on: the rate the follower is
+/// commanding this tick (`vs_cmd`, after its speed protection), never the
+/// airframe's book rate; `None` while an IFR clearance holds the target
+/// down (`cap_limited`: the controller's level, judged once released).
+/// EGKK-EGBB (sortie 1790624015-full_auto, 2026-09-28, #173): held level
+/// at 6,000, the book's 2,000 fpm said "HEMEL about 350 feet under its
+/// 18,000"; it was crossed at 14,587. Pure.
+pub fn window_climb_fpm(vs_cmd: f64, cap_limited: bool) -> Option<f64> {
+    (!cap_limited).then_some(vs_cmd.max(0.0))
 }
 
 /// What a crew says about a window over its cruise, once.
@@ -3769,33 +3781,6 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, plan: Pla
             },
         );
         plan_peak_ft = v.peak_ft;
-        // The next STAR window, judged at the airframe's best from here: one
-        // that cannot be made is said once (#32). Not while the pilot holds
-        // the altitude (their level, their restrictions).
-        if !arrival_constraints.is_empty() && pilot_altitude().is_none() {
-            if let Some(miss) = star_window_miss(
-                &legs,
-                &arrival_constraints,
-                idx,
-                lat,
-                lon,
-                alt_ft,
-                gs_kts,
-                climb_fpm(),
-                descent_fpm(),
-                star_cruise_ft,
-            ) {
-                if said_unable_windows.insert(miss.fix.to_ascii_uppercase()) {
-                    crate::blackbox::record(
-                        "procedure",
-                        serde_json::json!({"event": "star_window_unable", "fix": miss.fix, "low": miss.low,
-                            "limit_ft": miss.limit_ft, "predicted_ft": miss.predicted_ft, "by_ft": miss.by_ft,
-                            "dist_nm": miss.dist_nm, "alt_ft": alt_ft}),
-                    );
-                    alert(&voice, Priority::Advisory, &miss.line());
-                }
-            }
-        }
         // A planned step climb begins on this leg: said once, as a crew
         // says it, and only when it is the plan's level being flown (not a
         // pilot's, not the terrain floor's).
@@ -4030,6 +4015,39 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, plan: Pla
             idle_descent.step(vs_want);
         } else {
             idle_descent.step(0.0);
+        }
+        // The next STAR window, judged from here: an "at or below" at the
+        // airframe's best descent, an "at or above" on the climb this loop is
+        // FLYING (`window_climb_fpm`). One that cannot be made is said once
+        // (#32). Not while the pilot or a clearance holds the altitude
+        // (their level, their restrictions).
+        let window_climb = window_climb_fpm(vs_cmd, dep.cap_limited);
+        if let (false, true, Some(climb)) =
+            (arrival_constraints.is_empty(), pilot_altitude().is_none(), window_climb)
+        {
+            if let Some(miss) = star_window_miss(
+                &legs,
+                &arrival_constraints,
+                idx,
+                lat,
+                lon,
+                alt_ft,
+                gs_kts,
+                climb,
+                descent_fpm(),
+                star_cruise_ft,
+            ) {
+                if said_unable_windows.insert(miss.fix.to_ascii_uppercase()) {
+                    crate::blackbox::record(
+                        "procedure",
+                        serde_json::json!({"event": "star_window_unable", "fix": miss.fix,
+                            "low": miss.low, "limit_ft": miss.limit_ft,
+                            "predicted_ft": miss.predicted_ft, "by_ft": miss.by_ft,
+                            "dist_nm": miss.dist_nm, "alt_ft": alt_ft, "climb_fpm": climb}),
+                    );
+                    alert(&voice, Priority::Advisory, &miss.line());
+                }
+            }
         }
         {
             let ours = DRAG_OURS.load(Ordering::SeqCst);
@@ -5812,6 +5830,54 @@ mod tests {
         assert!(!high.low && high.limit_ft == 9_000.0 && high.by_ft > 1_000.0, "{high:?}");
         // Within the slack, or with room: nothing.
         assert_eq!(star_window_miss(&legs, &cons, 5, lat, lon, 10_200.0, 250.0, 2_000.0, 2_000.0, Some(cruise)), None);
+    }
+
+    /// #173 (sortie 1790624015-full_auto, +1408.6): held level at 6,000 on
+    /// the LAM leg, 27.4 nm from HEMEL, the book's 2,000 fpm predicted
+    /// 17,668 and "about 350 feet under"; the follower's own climb was
+    /// nothing, and it crossed at 14,587. Judged on the climb flown, the
+    /// line is the level being held; a clearance's hold is not judged.
+    #[test]
+    fn a_star_window_is_judged_on_the_climb_flown() {
+        let recs: Vec<serde_json::Value> =
+            include_str!("../bench/follower/egkk_lam5p_held_6000.jsonl")
+                .lines()
+                .filter_map(|l| serde_json::from_str(l).ok())
+                .collect();
+        let said = recs.iter().find(|r| r["kind"] == "star_window_unable").unwrap();
+        let f = |k: &str| said[k].as_f64().unwrap();
+        let (alt, dist, t) = (f("alt_ft"), f("dist_nm"), f("t"));
+        // The groundspeed the prediction was made on, from its own numbers.
+        let gs = dist / ((f("predicted_ft") - alt) / 2_000.0) * 60.0;
+        assert!((250.0..320.0).contains(&gs), "{gs}");
+        let tick = recs
+            .iter()
+            .filter(|r| r["kind"] == "leg")
+            .min_by(|a, b| {
+                let d = |r: &serde_json::Value| (r["t"].as_f64().unwrap() - t).abs();
+                d(a).total_cmp(&d(b))
+            })
+            .unwrap();
+        assert_eq!(tick["want_alt"].as_f64(), Some(6_000.0), "held at 6,000");
+        let vs_cmd = tick["vs_cmd"].as_f64().unwrap();
+        assert!(vs_cmd.abs() < 100.0, "{vs_cmd}");
+
+        let (mut legs, cons) = egbb_heme1b();
+        apply_arrival_constraints(&mut legs, &cons);
+        let hemel = legs[1].fix.clone().unwrap();
+        let (lat, lon) = crate::nav::project_latlon(hemel.lat, hemel.lon, 110.0, dist);
+        let cruise = Some(18_000.0);
+        let book = star_window_miss(&legs, &cons, 1, lat, lon, alt, gs, 2_000.0, 2_000.0, cruise)
+            .expect("the log's line");
+        assert!((book.by_ft - f("by_ft")).abs() < 50.0, "{book:?}");
+        let climb = window_climb_fpm(vs_cmd, false).unwrap();
+        let flown = star_window_miss(&legs, &cons, 1, lat, lon, alt, gs, climb, 2_000.0, cruise)
+            .expect("held level, it is missed by the whole climb");
+        assert!((flown.predicted_ft - alt).abs() < 100.0, "{flown:?}");
+        assert_eq!(flown.line(), "We'll cross HEMEL about 12,000 feet under its 18,000 feet.");
+        assert_eq!(window_climb_fpm(-300.0, false), Some(0.0));
+        assert_eq!(window_climb_fpm(1_800.0, false), Some(1_800.0));
+        assert_eq!(window_climb_fpm(1_800.0, true), None, "the clearance's level");
     }
 
     #[test]
