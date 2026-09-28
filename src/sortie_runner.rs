@@ -77,8 +77,9 @@ pub struct Case {
     /// setup's own words), each when its trigger fires.
     pub steps: Vec<ScriptStep>,
     pub deadline_min: Option<f64>,
-    /// X-Plane's time multiplier for the flying (`sim/time/sim_speed`), set
-    /// once the mission's sortie begins and put back to 1 at the case's end.
+    /// X-Plane's time multiplier the spec wants from the mission's sortie on
+    /// (`sim/time/sim_speed`), flown only where [`SpeedGuard`] allows and
+    /// put back to 1 at the case's end. Speed steps change it later.
     pub sim_speed: Option<u32>,
     /// Seconds after a ramp or runway start is still before the command.
     pub settle_s: Option<f64>,
@@ -200,21 +201,47 @@ pub const PHASES: &[&str] = &[
     "TaxiIn",
 ];
 
-/// One scripted line.
+/// One scripted step: a typed line (`say`), or the time multiplier the
+/// spec wants from here on (`sim_speed`), never both. A speed step types
+/// nothing: the runner's [`SpeedGuard`] applies it only while the flight is
+/// one that tolerates it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ScriptStep {
-    /// The typed line, as a pilot says it.
+    /// The typed line, as a pilot says it; empty on a speed step.
     pub say: String,
     pub when: Trigger,
     /// The tool the line must route to (a test pins it against the grammar;
     /// `plan_flight` is the local planner's branch in the command loop).
     pub tool: Option<String>,
+    /// The wanted `sim/time/sim_speed`, 1 to [`MAX_SIM_SPEED`].
+    pub sim_speed: Option<u32>,
 }
+
+impl ScriptStep {
+    /// A typed line (not a speed step).
+    pub fn is_say(&self) -> bool {
+        self.sim_speed.is_none()
+    }
+
+    /// The step in words, for a row.
+    pub fn words(&self) -> String {
+        match self.sim_speed {
+            Some(n) => format!("sim_speed {n}"),
+            None => format!("{:?}", self.say),
+        }
+    }
+}
+
+/// The highest `sim_speed` a spec may ask for (X-Plane's own top).
+pub const MAX_SIM_SPEED: u32 = 16;
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct StepRaw {
-    say: String,
+    #[serde(default)]
+    say: Option<String>,
+    #[serde(default)]
+    sim_speed: Option<i64>,
     #[serde(default)]
     when: Option<serde_yaml::Value>,
     #[serde(default)]
@@ -224,18 +251,44 @@ struct StepRaw {
 impl TryFrom<StepRaw> for ScriptStep {
     type Error = String;
     fn try_from(s: StepRaw) -> std::result::Result<Self, String> {
-        let say = s.say.trim().to_string();
-        if say.is_empty() {
-            return Err("a step needs a say".into());
-        }
-        let when = match s.when {
-            None => return Err(format!("step {say:?} needs a when")),
-            Some(v) => trigger(&v).map_err(|e| format!("step {say:?}: {e}"))?,
+        let say = s.say.as_deref().unwrap_or("").trim().to_string();
+        let sim_speed = match (s.say.is_some(), s.sim_speed) {
+            (true, Some(_)) => return Err(format!("step {say:?}: say or sim_speed, not both")),
+            (false, None) => return Err("a step needs a say (or a sim_speed)".into()),
+            (true, None) if say.is_empty() => return Err("a step needs a say".into()),
+            (true, None) => None,
+            (false, Some(n)) => {
+                if !(1..=i64::from(MAX_SIM_SPEED)).contains(&n) {
+                    return Err(format!(
+                        "step sim_speed {n}: sim_speed is 1 to {MAX_SIM_SPEED}"
+                    ));
+                }
+                if s.tool.is_some() {
+                    return Err(format!(
+                        "step sim_speed {n}: a speed step routes to no tool"
+                    ));
+                }
+                Some(n as u32)
+            }
         };
+        let name = match sim_speed {
+            Some(n) => format!("sim_speed {n}"),
+            None => format!("{say:?}"),
+        };
+        let when = match s.when {
+            None => return Err(format!("step {name} needs a when")),
+            Some(v) => trigger(&v).map_err(|e| format!("step {name}: {e}"))?,
+        };
+        if sim_speed.is_some() && when == Trigger::Start {
+            return Err(format!(
+                "step {name}: a speed step is never the start (the case's sim_speed is)"
+            ));
+        }
         Ok(ScriptStep {
             say,
             when,
             tool: s.tool,
+            sim_speed,
         })
     }
 }
@@ -335,16 +388,20 @@ impl Script {
         self.steps.get(self.next)
     }
 
+    /// The steps not yet taken, the next first.
+    pub fn remaining(&self) -> &[ScriptStep] {
+        &self.steps[self.next.min(self.steps.len())..]
+    }
+
+    /// Typed lines not yet typed (speed steps type nothing).
+    pub fn pending_says(&self) -> usize {
+        self.remaining().iter().filter(|s| s.is_say()).count()
+    }
+
     /// One blackbox record, in the order the app wrote it.
     pub fn feed(&mut self, r: &Value) {
-        match (st(r, "kind"), st(r, "event")) {
-            ("state", _) if !st(r, "fphase").is_empty() => {
-                self.phase = Some(st(r, "fphase").to_string())
-            }
-            ("flight", _) if st(r, "ev") == "phase" && !st(r, "to").is_empty() => {
-                self.phase = Some(st(r, "to").to_string())
-            }
-            _ => {}
+        if let Some(p) = phase_of(r) {
+            self.phase = Some(p.to_string());
         }
         if !self.armed() {
             return;
@@ -391,6 +448,399 @@ impl Script {
         self.since = Some(now);
         self.event_seen = false;
     }
+}
+
+/// The flight model's phase a record carries: the `state` record's
+/// `fphase`, or a `flight` `phase` event's `to`.
+fn phase_of(r: &Value) -> Option<&str> {
+    match st(r, "kind") {
+        "state" if !st(r, "fphase").is_empty() => Some(st(r, "fphase")),
+        "flight" if st(r, "ev") == "phase" && !st(r, "to").is_empty() => Some(st(r, "to")),
+        _ => None,
+    }
+}
+
+// ---- Fast forward: a time multiplier only where the flight tolerates it ------------
+
+/// The flight model's phases a fast sim may fly (the autopilot's enroute
+/// legs, where the follower only moves the bug and the dials now and then).
+pub const FAST_PHASES: &[&str] = &["Climb", "Cruise", "Descent"];
+/// Below this height above the ground the sim runs at 1x.
+pub const FAST_FLOOR_AGL_FT: f64 = 5_000.0;
+/// Every condition holds this long before a fast speed is (re)applied: a
+/// height or a phase flickering at its edge never flip-flops the sim.
+pub const FAST_RESUME_S: f64 = 10.0;
+/// What the sim achieved after its frame-rate limiting (read-only).
+const SIM_SPEED_ACTUAL: &str = "sim/time/sim_speed_actual";
+
+/// Status lines (`xcopilot/status/auto`, lower-cased, the headline's
+/// `NAME|stage` included) of the loops that fly close to the ground or to
+/// the aircraft on wall-clock ticks: at 4x their gains and delays are four
+/// times what they were tuned for.
+const SLOW_LOOPS: &[&str] = &[
+    "autoland",
+    "recovering",
+    "recovery",
+    "talk-down",
+    "auto circuit",
+    "heli circuit",
+    "route",
+    "auto takeoff",
+    "auto taxi",
+    "pushback",
+    "air taxi",
+    "hover ",
+    "setting down",
+];
+
+/// The first loop on the panel's status that must fly at 1x, as its line
+/// says it; `None` when none is. The hover's own flying line ("flying 40
+/// kt, 500 ft") is one; the follower's ("flying a procedure") is not.
+pub fn slow_loop(status: &str) -> Option<String> {
+    let body = status.get(1..).unwrap_or("");
+    body.lines().map(str::trim).find_map(|l| {
+        let low = l.to_ascii_lowercase();
+        let hover_fly = low
+            .strip_prefix("flying ")
+            .is_some_and(|r| r.starts_with(|c: char| c.is_ascii_digit()));
+        (hover_fly || SLOW_LOOPS.iter().any(|p| low.starts_with(p))).then(|| l.to_string())
+    })
+}
+
+/// One poll's measurements for the guard; `None` is a failed read, which
+/// is no measurement and never lets the sim run fast.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct FastReads {
+    pub crashed: Option<bool>,
+    pub on_ground: Option<bool>,
+    pub agl_ft: Option<f64>,
+    pub servos_on: Option<bool>,
+    /// `xcopilot/status/auto`.
+    pub status: Option<String>,
+}
+
+/// What the driver does with the sim's time multiplier this poll.
+#[derive(Debug, Clone, PartialEq)]
+pub enum SpeedAct {
+    Keep,
+    /// Write this multiplier and read it back.
+    Write {
+        to: u32,
+        reason: String,
+    },
+    /// A fast speed is wanted and withheld: why (once per reason).
+    Held {
+        reason: String,
+    },
+}
+
+/// The runner's hard guard over `sim/time/sim_speed`, which a spec cannot
+/// override. The control laws tick on WALL time over REST at a few Hz: at
+/// 4x the plant moves four times as far per tick, so taxi steering, the
+/// roll, the flare, pushback and the hover would ring or crash, and every
+/// "held N s" watchdog is a quarter as long in sim time. A fast speed is
+/// flown only while ALL hold: a sortie flying, no wreck, airborne, the
+/// flight model in [`FAST_PHASES`], above [`FAST_FLOOR_AGL_FT`], the
+/// autopilot's servos on, no [`slow_loop`] on the panel, and in this sortie
+/// no give-up, intervention or pilot's command (those latch it off until the
+/// next sortie). The moment one fails it is 1x with the reason; the spec's
+/// speed returns only after all have held [`FAST_RESUME_S`]. Pure: the
+/// driver feeds it records and reads and writes what it says.
+#[derive(Debug, Clone)]
+pub struct SpeedGuard {
+    /// The spec's speed (the case's `sim_speed`, then its speed steps).
+    wanted: u32,
+    /// The sim's multiplier as last read back; `None`: unknown, restored.
+    set: Option<u32>,
+    phase: Option<String>,
+    sortie: Option<String>,
+    /// Why fast is off for the rest of this sortie.
+    latched: Option<String>,
+    ok_since: Option<f64>,
+    held: Option<String>,
+    last_t: Option<f64>,
+    /// Wall seconds flown fast.
+    pub fast_s: f64,
+    /// Wall seconds of those with `sim_speed_actual` read, and the sim
+    /// seconds they flew.
+    measured_s: f64,
+    sim_s: f64,
+    /// [`FAST_RESUME_S`] live.
+    resume_s: f64,
+}
+
+impl SpeedGuard {
+    /// The case's own `sim_speed` is the first wanted speed; the sim is at
+    /// 1x (the runner restores it before every setup).
+    pub fn new(wanted: Option<u32>, resume_s: f64) -> Self {
+        Self {
+            resume_s,
+            wanted: wanted.unwrap_or(1).max(1),
+            set: Some(1),
+            phase: None,
+            sortie: None,
+            latched: None,
+            ok_since: None,
+            held: None,
+            last_t: None,
+            fast_s: 0.0,
+            measured_s: 0.0,
+            sim_s: 0.0,
+        }
+    }
+
+    /// A speed step fired.
+    pub fn want(&mut self, n: u32) {
+        self.wanted = n.max(1);
+        self.held = None;
+    }
+
+    pub fn wanted(&self) -> u32 {
+        self.wanted
+    }
+
+    /// The sim's multiplier as last read back (`None`: unknown).
+    pub fn set(&self) -> Option<u32> {
+        self.set
+    }
+
+    /// The sim is (or may be) running fast: a restore is owed.
+    pub fn owes_restore(&self) -> bool {
+        self.set != Some(1)
+    }
+
+    /// The guard needs the sim's reads this poll.
+    pub fn needs_reads(&self) -> bool {
+        self.wanted > 1 || self.owes_restore()
+    }
+
+    /// The mean multiplier the sim achieved while fast (`None`: never read).
+    pub fn achieved(&self) -> Option<f64> {
+        (self.measured_s > 0.0).then(|| self.sim_s / self.measured_s)
+    }
+
+    /// One blackbox record, in the order the app wrote it.
+    pub fn feed(&mut self, r: &Value) {
+        if let Some(p) = phase_of(r) {
+            self.phase = Some(p.to_string());
+        }
+        let (kind, event) = (st(r, "kind"), st(r, "event"));
+        match (kind, event) {
+            ("sortie", "begin") => {
+                self.sortie = Some(st(r, "sortie").to_string());
+                self.latched = None;
+                return;
+            }
+            ("sortie_result", _) if self.sortie.as_deref() == Some(st(r, "sortie")) => {
+                self.sortie = None;
+                return;
+            }
+            _ => {}
+        }
+        if self.sortie.is_none() || self.latched.is_some() {
+            return;
+        }
+        self.latched = match (kind, event) {
+            ("intervention", _) => Some(format!("an intervention ({})", st(r, "what"))),
+            ("tool", _) => Some(format!("a pilot's command ({})", st(r, "name"))),
+            ("full_auto" | "heli_route", "give_up") => {
+                Some(format!("a give-up ({})", st(r, "reason")))
+            }
+            ("full_auto", _) if st(r, "stage") == "give_up" => Some("a give-up".into()),
+            ("flight", _)
+                if st(r, "ev") == "impact"
+                    || (st(r, "ev") == "abnormal" && st(r, "to") == "Crashed") =>
+            {
+                Some("an impact".into())
+            }
+            _ => None,
+        };
+    }
+
+    /// Why the sim may not run fast now; `None`: every condition holds.
+    pub fn blocker(&self, x: &FastReads) -> Option<String> {
+        if let Some(l) = &self.latched {
+            return Some(format!("{l} in this sortie"));
+        }
+        if self.sortie.is_none() {
+            return Some("no sortie flying".into());
+        }
+        match x.crashed {
+            Some(false) => {}
+            Some(true) => return Some("crashed".into()),
+            None => return Some("the wreck flag unreadable".into()),
+        }
+        match x.on_ground {
+            Some(false) => {}
+            Some(true) => return Some("on the ground".into()),
+            None => return Some("the wheels unreadable".into()),
+        }
+        match self.phase.as_deref() {
+            Some(p) if FAST_PHASES.contains(&p) => {}
+            Some(p) => return Some(format!("phase {p}")),
+            None => return Some("no flight phase yet".into()),
+        }
+        match x.agl_ft {
+            Some(h) if h >= FAST_FLOOR_AGL_FT => {}
+            Some(h) => return Some(format!("{h:.0} ft AGL, under {FAST_FLOOR_AGL_FT:.0}")),
+            None => return Some("the height unreadable".into()),
+        }
+        match x.servos_on {
+            Some(true) => {}
+            Some(false) => return Some("the autopilot servos off".into()),
+            None => return Some("the servos unreadable".into()),
+        }
+        match &x.status {
+            Some(s) => slow_loop(s).map(|l| format!("{l} flying")),
+            None => Some("the loop status unreadable".into()),
+        }
+    }
+
+    /// One poll: what to do with the sim's multiplier.
+    pub fn tick(&mut self, now: f64, x: &FastReads) -> SpeedAct {
+        let fast_now = self.set.is_some_and(|s| s > 1);
+        if self.wanted <= 1 {
+            self.ok_since = None;
+            return match self.owes_restore() {
+                true => SpeedAct::Write {
+                    to: 1,
+                    reason: "the spec wants 1x".into(),
+                },
+                false => SpeedAct::Keep,
+            };
+        }
+        if let Some(why) = self.blocker(x) {
+            self.ok_since = None;
+            if self.owes_restore() {
+                self.held = Some(why.clone());
+                return SpeedAct::Write { to: 1, reason: why };
+            }
+            if self.held.as_deref() != Some(why.as_str()) {
+                self.held = Some(why.clone());
+                return SpeedAct::Held { reason: why };
+            }
+            return SpeedAct::Keep;
+        }
+        self.held = None;
+        let since = *self.ok_since.get_or_insert(now);
+        if self.set == Some(self.wanted) {
+            return SpeedAct::Keep;
+        }
+        // Already fast (another fast speed asked): at once; from 1x, after
+        // the conditions have held.
+        if fast_now || now - since >= self.resume_s {
+            return SpeedAct::Write {
+                to: self.wanted,
+                reason: "every condition holds".into(),
+            };
+        }
+        SpeedAct::Keep
+    }
+
+    /// The multiplier `to` was written and read back as `read`. A fast
+    /// write that did not take latches fast off for the sortie (never
+    /// written again each poll); an unread one is unknown, so restored.
+    pub fn written(&mut self, to: u32, read: Option<f64>) {
+        let got = read
+            .filter(|v| v.is_finite())
+            .map(|v| v.round().max(0.0) as u32);
+        self.set = got;
+        if to > 1 && got != Some(to) {
+            self.latched = Some(format!(
+                "sim_speed {to} read back {}",
+                read.map_or("nothing".to_string(), |v| format!("{v}"))
+            ));
+        }
+    }
+
+    /// The clock, every poll: wall seconds flown fast, and the sim seconds
+    /// `sim_speed_actual` says they were.
+    pub fn accrue(&mut self, now: f64, actual: Option<f64>) {
+        if let (Some(t), Some(s)) = (self.last_t, self.set) {
+            let dt = (now - t).max(0.0);
+            if s > 1 {
+                self.fast_s += dt;
+                if let Some(a) = actual.filter(|a| a.is_finite() && *a > 0.0) {
+                    self.measured_s += dt;
+                    self.sim_s += dt * a;
+                }
+            }
+        }
+        self.last_t = Some(now);
+    }
+}
+
+/// Write the multiplier, read it back and what the sim achieved, tell the
+/// guard, and blackbox it (`sortie_runner` `sim_speed`).
+async fn apply_sim_speed(
+    sim: &dyn RunnerSim,
+    guard: &mut SpeedGuard,
+    to: u32,
+    reason: &str,
+    case: &str,
+) {
+    let wrote = sim.write_float(SIM_SPEED, f64::from(to)).await;
+    let (read, actual) = tokio::join!(sim.read(SIM_SPEED), sim.read(SIM_SPEED_ACTUAL));
+    let read = read.ok();
+    guard.written(to, read);
+    record_sim_speed(
+        guard.wanted(),
+        Some(to),
+        read,
+        actual.ok(),
+        reason,
+        case,
+        wrote.err().map(|e| e.to_string()),
+    );
+    eprintln!(
+        "{case}: sim_speed {to} ({reason}), read back {}",
+        read.map_or("nothing".to_string(), |v| format!("{v}"))
+    );
+}
+
+fn record_sim_speed(
+    wanted: u32,
+    set: Option<u32>,
+    read: Option<f64>,
+    actual: Option<f64>,
+    reason: &str,
+    case: &str,
+    error: Option<String>,
+) {
+    crate::blackbox::record(
+        "sortie_runner",
+        json!({
+            "event": "sim_speed",
+            "case": case,
+            "wanted": wanted,
+            "set": set,
+            "read_back": read,
+            "actual": actual,
+            "reason": reason,
+            "error": error,
+        }),
+    );
+}
+
+/// The sim at 1x, read first: before a setup, at a run's end, on Ctrl-C.
+/// An unreadable multiplier is written anyway. Returns whether it reads 1.
+async fn ensure_real_time(sim: &dyn RunnerSim, reason: &str) -> bool {
+    if sim.read(SIM_SPEED).await.ok() == Some(1.0) {
+        return true;
+    }
+    let wrote = sim.write_float(SIM_SPEED, 1.0).await;
+    let (read, actual) = tokio::join!(sim.read(SIM_SPEED), sim.read(SIM_SPEED_ACTUAL));
+    let read = read.ok();
+    record_sim_speed(
+        1,
+        Some(1),
+        read,
+        actual.ok(),
+        reason,
+        "",
+        wrote.err().map(|e| e.to_string()),
+    );
+    read == Some(1.0)
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -718,8 +1168,10 @@ pub fn parse_spec_with(text: &str, acf_exists: &dyn Fn(&str) -> bool) -> Result<
         if c.deadline_min.is_some_and(|d| !(d > 0.0)) {
             return bad("deadline_min must be above zero");
         }
-        if c.sim_speed.is_some_and(|s| !(1..=16).contains(&s)) {
-            return bad("sim_speed is 1 to 16");
+        if c.sim_speed
+            .is_some_and(|s| !(1..=MAX_SIM_SPEED).contains(&s))
+        {
+            return bad(&format!("sim_speed is 1 to {MAX_SIM_SPEED}"));
         }
         if c.command.as_deref().is_some_and(|s| s.trim().is_empty()) {
             return bad("the command is empty");
@@ -1003,6 +1455,20 @@ pub struct Verdict {
     /// How the case was set up where the spec left it to the runner: the
     /// runway the wind picked, the deadline scaled to the airframe.
     pub setup: String,
+    /// Wall seconds the sim flew faster than real time ([`SpeedGuard`]).
+    pub fast_s: f64,
+    /// The mean multiplier it achieved meanwhile (`sim_speed_actual`).
+    pub fast_x: Option<f64>,
+}
+
+impl Verdict {
+    /// The row's words for the fast-forward; `None` when it never ran fast.
+    pub fn fast_words(&self) -> Option<String> {
+        (self.fast_s >= 0.5).then(|| match self.fast_x {
+            Some(x) => format!("{:.0} s at x{x:.1}", self.fast_s),
+            None => format!("{:.0} s", self.fast_s),
+        })
+    }
 }
 
 /// The line that stops a run on a wreck that outlived its setup.
@@ -1563,6 +2029,10 @@ pub fn row_line(r: &Row) -> String {
         true => String::new(),
         false => format!(" ({})", v.setup),
     };
+    let before = match v.fast_words() {
+        Some(f) => format!(" (fast {f}){before}"),
+        None => before,
+    };
     format!(
         "{} {} #{}{setup}: {} in {:.0} s{before}, sortie {}, {}{}{}",
         if v.pass { "PASS" } else { "FAIL" },
@@ -1598,8 +2068,8 @@ fn cell(s: &str) -> String {
 pub fn table(spec_path: &str, started: &str, rows: &[Row]) -> String {
     let mut out = format!(
         "# Sortie run {started}\n\nSpec: `{spec_path}`\n\n\
-         | Case | # | Sortie | Verdict | Stages | Interventions | Secs | Before | Reason |\n\
-         |---|---|---|---|---|---|---|---|---|\n"
+         | Case | # | Sortie | Verdict | Stages | Interventions | Wall s | Fast | Before | Reason |\n\
+         |---|---|---|---|---|---|---|---|---|---|\n"
     );
     for r in rows {
         let v = &r.verdict;
@@ -1613,7 +2083,7 @@ pub fn table(spec_path: &str, started: &str, rows: &[Row]) -> String {
             false => format!("{} ({})", r.case, v.setup),
         };
         out.push_str(&format!(
-            "| {} | {} | {} | {} | {} | {} | {:.0} | {} | {} |\n",
+            "| {} | {} | {} | {} | {} | {} | {:.0} | {} | {} | {} |\n",
             cell(&case),
             r.rep,
             v.sortie.as_deref().unwrap_or("-"),
@@ -1621,6 +2091,7 @@ pub fn table(spec_path: &str, started: &str, rows: &[Row]) -> String {
             cell(&stages.join("; ")),
             v.interventions,
             r.secs,
+            v.fast_words().unwrap_or_else(|| "-".into()),
             cell(&before),
             cell(&match (v.reason.is_empty(), v.note.is_empty()) {
                 (_, true) => v.reason.clone(),
@@ -1774,6 +2245,8 @@ pub struct Pace {
     pub crash_clear_s: f64,
     /// Longest wait for the app to swap to a case's aircraft ([`SWAP_MAX_S`]).
     pub swap_max_s: f64,
+    /// Every fast condition holds this long first ([`FAST_RESUME_S`]).
+    pub fast_resume_s: f64,
 }
 
 impl Pace {
@@ -1788,6 +2261,7 @@ impl Pace {
         stop_max_s: STOP_MAX_S,
         crash_clear_s: CRASH_CLEAR_S,
         swap_max_s: SWAP_MAX_S,
+        fast_resume_s: FAST_RESUME_S,
     };
 }
 
@@ -2215,6 +2689,8 @@ pub async fn run_case(
         outcome: "runner".into(),
         ..Verdict::default()
     };
+    // No setup (and no take-back of the last aircraft) at a fast sim.
+    ensure_real_time(sim, "before the setup").await;
     let settle = match settle_before_setup(sim, pace, take_back_now).await {
         Ok(s) => s,
         Err(e) => return failed(e.to_string()),
@@ -2272,8 +2748,10 @@ pub async fn run_case(
     m.line = Some(line.clone());
     m.expect_give_up = case.expect_give_up.clone();
     let mut script = Script::new(case.later_steps());
-    m.pending_steps = script.pending();
-    let speed = case.sim_speed.filter(|s| *s != 1);
+    m.pending_steps = script.pending_says();
+    // The case's sim_speed and its speed steps are what the spec WANTS; the
+    // guard decides when the sim may have it.
+    let mut guard = SpeedGuard::new(case.sim_speed, pace.fast_resume_s);
     let verdict = 'case: loop {
         tokio::time::sleep(pace.poll).await;
         let mut done = None;
@@ -2285,17 +2763,10 @@ pub async fn run_case(
                 script.arm(now_s());
             }
             script.feed(&r);
-            match step {
-                Step::Finished(v) => {
-                    done = Some(v);
-                    break;
-                }
-                Step::Began => {
-                    if let Some(s) = speed {
-                        let _ = sim.write_float(SIM_SPEED, s as f64).await;
-                    }
-                }
-                _ => {}
+            guard.feed(&r);
+            if let Step::Finished(v) = step {
+                done = Some(v);
+                break;
             }
         }
         if let Some(v) = done {
@@ -2316,19 +2787,28 @@ pub async fn run_case(
                 false => None,
             };
             if script.due(now_s(), ias, agl) {
-                let say = script
-                    .next_step()
-                    .map(|s| s.say.clone())
-                    .unwrap_or_default();
-                if let Err(e) = type_line(sim, &say, pace).await {
-                    // Whatever was armed may still be flying: taken back.
-                    let mut v = failed(format!("step {say:?}: {e}"));
-                    v.abort = true;
-                    break 'case v;
+                match script.next_step().cloned() {
+                    Some(ScriptStep {
+                        sim_speed: Some(n), ..
+                    }) => {
+                        // Nothing typed: the guard takes the new want.
+                        guard.want(n);
+                        script.sent(now_s());
+                    }
+                    Some(s) => {
+                        let say = s.say;
+                        if let Err(e) = type_line(sim, &say, pace).await {
+                            // Whatever was armed may still be flying: taken back.
+                            let mut v = failed(format!("step {say:?}: {e}"));
+                            v.abort = true;
+                            break 'case v;
+                        }
+                        let t = now_s();
+                        script.sent(t);
+                        m.note_step_sent(t, &say);
+                    }
+                    None => {}
                 }
-                let t = now_s();
-                script.sent(t);
-                m.note_step_sent(t, &say);
             }
         }
         let crashed = sim
@@ -2336,6 +2816,41 @@ pub async fn run_case(
             .await
             .ok()
             .map(|v| v > 0.5);
+        if guard.needs_reads() {
+            let (ground, agl, servos, status) = tokio::join!(
+                sim.read(crate::datarefs::ON_GROUND_ANY),
+                sim.read(crate::datarefs::AGL_METERS),
+                sim.read(crate::datarefs::SERVOS_ON),
+                sim.read_string(STATUS_AUTO),
+            );
+            let reads = FastReads {
+                crashed,
+                on_ground: ground.ok().map(|g| g > 0.5),
+                agl_ft: agl.ok().map(|m| m * M_TO_FT),
+                servos_on: servos.ok().map(|s| s > 0.5),
+                status: status.ok(),
+            };
+            match guard.tick(now_s(), &reads) {
+                SpeedAct::Write { to, reason } => {
+                    apply_sim_speed(sim, &mut guard, to, &reason, &case.name).await
+                }
+                SpeedAct::Held { reason } => record_sim_speed(
+                    guard.wanted(),
+                    guard.set(),
+                    None,
+                    None,
+                    &format!("held: {reason}"),
+                    &case.name,
+                    None,
+                ),
+                SpeedAct::Keep => {}
+            }
+            let actual = match guard.set().is_some_and(|s| s > 1) {
+                true => sim.read(SIM_SPEED_ACTUAL).await.ok(),
+                false => None,
+            };
+            guard.accrue(now_s(), actual);
+        }
         match m.tick(now_s(), crashed) {
             Step::Finished(v) => break v,
             Step::Resend => {
@@ -2344,16 +2859,27 @@ pub async fn run_case(
             _ => {}
         }
     };
-    if speed.is_some() {
-        let _ = sim.write_float(SIM_SPEED, 1.0).await;
+    // Back to 1x before anything else happens to the aircraft.
+    if guard.owes_restore() {
+        let why = if verdict.crashed {
+            "the case ended: crashed"
+        } else if verdict.abort {
+            "the case ended: taken back"
+        } else {
+            "the case ended"
+        };
+        apply_sim_speed(sim, &mut guard, 1, why, &case.name).await;
     }
     let mut verdict = verdict;
     verdict.settle = Some(settle);
     verdict.setup = setup_note;
-    // A script that never finished proved less than it meant to.
-    if let Some(s) = script.next_step() {
+    verdict.fast_s = guard.fast_s;
+    verdict.fast_x = guard.achieved();
+    // A script that never finished proved less than it meant to. A speed
+    // step that never came is no finding: the case ends at 1x regardless.
+    if let Some(s) = script.remaining().iter().find(|s| s.is_say()) {
         verdict.pass = false;
-        let why = format!("the script's step {:?} never came ({:?})", s.say, s.when);
+        let why = format!("the script's step {} never came ({:?})", s.words(), s.when);
         verdict.reason = match verdict.reason.is_empty() {
             true => why,
             false => format!("{}; {why}", verdict.reason),
@@ -2422,6 +2948,9 @@ pub async fn run_all(
                 break 'run;
             }
         }
+    }
+    if !ensure_real_time(sim, "the run ended").await {
+        eprintln!("sim_speed did not read back 1 at the run's end: check it");
     }
     if secure_at_end(sim).await {
         eprintln!("the run ended with the aircraft in the air: X-Plane is paused");
@@ -2505,13 +3034,14 @@ pub async fn main_cmd(args: &[String], base_url: &str, apt_dat: &str) -> Result<
         _ = run => {}
         _ = tokio::signal::ctrl_c() => {
             // In the air the sim is paused first: the pilot at the keyboard
-            // takes the aircraft back with it frozen, not diving.
+            // takes the aircraft back with it frozen, not diving, and at 1x.
             let paused = secure_at_end(&xp).await;
+            let real_time = ensure_real_time(&xp, "interrupted").await;
             eprintln!(
-                "interrupted: my controls{}",
-                if paused { ", X-Plane paused" } else { "" }
+                "interrupted: my controls{}{}",
+                if paused { ", X-Plane paused" } else { "" },
+                if real_time { "" } else { "; sim_speed did not read back 1, check it" }
             );
-            let _ = xp.set_float(SIM_SPEED, 1.0).await;
             let _ = type_line(&xp, ABORT_LINE, &Pace::LIVE).await;
             let rows = rows.lock().unwrap_or_else(|e| e.into_inner()).clone();
             write_table(&rows);
@@ -2661,7 +3191,7 @@ mod tests {
                     assert!(routed(cmd, &prof).is_some(), "{}", at(cmd));
                     checked += 1;
                 }
-                for s in &c.steps {
+                for s in c.steps.iter().filter(|s| s.is_say()) {
                     let want = s
                         .tool
                         .as_deref()
@@ -2885,6 +3415,7 @@ mod tests {
             say: say.into(),
             when,
             tool: None,
+            sim_speed: None,
         }
     }
 
@@ -3761,9 +4292,16 @@ mod tests {
                     secs: 42.3,
                     end: SettleEnd::AtRest,
                 }),
+                fast_s: 600.2,
+                fast_x: Some(3.94),
                 ..Verdict::default()
             },
         };
+        assert!(
+            row_line(&fail).contains("in 900 s (fast 600 s at x3.9) (waited 42 s"),
+            "{}",
+            row_line(&fail)
+        );
         assert_eq!(
             row_line(&pass),
             "PASS LEMG 13, 5 nm final #2: landing pass (sink 222/400 fpm, drift 1.2/5 deg, rollout 0.8/5 m) \
@@ -3780,7 +4318,7 @@ mod tests {
         assert_eq!(
             lines[7],
             "| LEMG circuit | 1 | 1790600300-full_auto | FAIL | taxi FAIL (lat 5.8/3 m, cut 1/5 m); \
-             alignment pass (err 0.4/3 deg, xtk 0.3/2 m); takeoff pass (xtk 1.1/5 m) | 1 | 900 | \
+             alignment pass (err 0.4/3 deg, xtk 0.3/2 m); takeoff pass (xtk 1.1/5 m) | 1 | 900 | 600 s at x3.9 | \
              waited 42 s for the last aircraft to stop | taxi: 5.8 m off the line / x |"
         );
         assert!(
@@ -3886,6 +4424,13 @@ mod tests {
         at: std::sync::Mutex<(f64, f64, f64, f64)>,
         /// Every aircraft's approach speed.
         vapp: std::sync::Mutex<Option<f64>>,
+        /// `sim/time/sim_speed` (and what it achieves).
+        speed: std::sync::Mutex<f64>,
+        /// The follower's cruise: 3,000 m up, the servos in, the panel on
+        /// full auto's cruise, and an endless mission's model in Cruise.
+        enroute: std::sync::atomic::AtomicBool,
+        /// The first fast write wrecks the aircraft.
+        crash_when_fast: std::sync::atomic::AtomicBool,
     }
 
     /// The fake's taxi-in pace, 14 kt in metres per second.
@@ -3917,6 +4462,9 @@ mod tests {
                 metar: Default::default(),
                 at: Default::default(),
                 vapp: Default::default(),
+                speed: std::sync::Mutex::new(1.0),
+                enroute: false.into(),
+                crash_when_fast: false.into(),
             }
         }
     }
@@ -3935,6 +4483,9 @@ mod tests {
                 crate::datarefs::LONGITUDE => self.at.lock().unwrap().1,
                 crate::datarefs::WIND_DIR_DEG_TRUE => self.at.lock().unwrap().2,
                 crate::datarefs::WIND_SPEED_MSC => self.at.lock().unwrap().3,
+                SIM_SPEED | SIM_SPEED_ACTUAL => *self.speed.lock().unwrap(),
+                crate::datarefs::AGL_METERS if self.enroute.load(SeqCst) => 3_000.0,
+                crate::datarefs::SERVOS_ON => flag(self.enroute.load(SeqCst)),
                 GROUNDSPEED => {
                     let left = self.rolling_reads.load(SeqCst);
                     if left > 0 && left != u32::MAX {
@@ -3951,6 +4502,12 @@ mod tests {
         }
         async fn read_string(&self, name: &str) -> Result<String> {
             Ok(match name {
+                STATUS_AUTO
+                    if self.enroute.load(std::sync::atomic::Ordering::SeqCst)
+                        && self.flying.load(std::sync::atomic::Ordering::SeqCst) =>
+                {
+                    "1FULL AUTO|cruise\nflying a procedure: to PIMOS, 42.0 nm".into()
+                }
                 STATUS_AUTO if self.flying.load(std::sync::atomic::Ordering::SeqCst) => {
                     "1AUTOLAND|final".into()
                 }
@@ -3960,8 +4517,13 @@ mod tests {
             })
         }
         async fn write_float(&self, name: &str, v: f64) -> Result<()> {
+            use std::sync::atomic::Ordering::SeqCst;
             assert_eq!(name, SIM_SPEED);
             self.speeds.lock().unwrap().push(v);
+            *self.speed.lock().unwrap() = v;
+            if v > 1.0 && self.crash_when_fast.load(SeqCst) {
+                self.crashed.store(true, SeqCst);
+            }
             Ok(())
         }
         async fn command(&self, name: &str) -> Result<()> {
@@ -4018,6 +4580,10 @@ mod tests {
                 ] {
                     writeln!(f, "{r}").unwrap();
                 }
+                if self.enroute.load(SeqCst) {
+                    let r = json!({"t": 3.0, "kind": "state", "fphase": "Cruise", "sortie": s});
+                    writeln!(f, "{r}").unwrap();
+                }
             } else {
                 let s = "77-mission";
                 let tool = if line.starts_with("put us on") {
@@ -4066,6 +4632,7 @@ mod tests {
             stop_max_s: 0.5,
             crash_clear_s: 0.2,
             swap_max_s: 1.0,
+            fast_resume_s: 0.0,
         };
         let mut tail = BlackboxTail::at_end(&log);
         let mut seen = Vec::new();
@@ -4092,10 +4659,9 @@ mod tests {
         let v: Value = serde_json::from_str(&inits[0]).unwrap();
         assert_eq!(v["runway_start"]["runway"], "13");
         assert_eq!(v["engine_status"]["all_engines"]["running"], true);
-        assert_eq!(
-            *sim.speeds.lock().unwrap(),
-            vec![2.0, 1.0, 2.0, 1.0],
-            "2x while flying, 1x after"
+        assert!(
+            sim.speeds.lock().unwrap().is_empty(),
+            "the case's 2x is never flown on the ground (the guard)"
         );
         // A flying loop refuses the run.
         sim.flying.store(true, std::sync::atomic::Ordering::SeqCst);
@@ -4272,6 +4838,7 @@ mod tests {
             stop_max_s: 0.5,
             crash_clear_s: 0.2,
             swap_max_s: 1.0,
+            fast_resume_s: 0.0,
         }
     }
 
@@ -4628,6 +5195,423 @@ mod tests {
         );
         // The run's last taxi-in is left to finish: no setup follows it.
         assert_eq!(sim.rolling_reads.load(SeqCst), u32::MAX);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- Fast forward ------------------------------------------------------------
+
+    #[test]
+    fn a_speed_step_parses_and_a_bad_one_is_refused() {
+        let s = parse_spec_with(
+            "cases: [{name: a, setup: {ramp: {field: LEMG}}, sim_speed: 2, steps: [\n\
+               {say: fly the flight plan, when: start, tool: full_auto},\n\
+               {sim_speed: 4, when: {phase: cruise}},\n\
+               {sim_speed: 1, when: {event: {kind: procedure, event: tod}}}]}]",
+            &|_| true,
+        )
+        .unwrap();
+        let c = &s.cases[0];
+        assert_eq!(c.sim_speed, Some(2));
+        let later = c.later_steps();
+        assert_eq!(later.len(), 2);
+        assert_eq!(later[0].sim_speed, Some(4));
+        assert_eq!(later[0].when, Trigger::Phase("Cruise".into()));
+        assert!(!later[0].is_say() && later[0].say.is_empty());
+        assert_eq!(later[1].sim_speed, Some(1));
+        let mut script = Script::new(later);
+        assert_eq!((script.pending(), script.pending_says()), (2, 0));
+        script.arm(0.0);
+        script.sent(1.0);
+        assert_eq!(script.remaining().len(), 1);
+        let bad = [
+            ("sim_speed: 0", "sim_speed is 1 to 16"),
+            ("sim_speed: 17", "sim_speed is 1 to 16"),
+            (
+                "steps: [{sim_speed: 0, when: {after_s: 1}}]",
+                "sim_speed is 1 to 16",
+            ),
+            (
+                "steps: [{sim_speed: 32, when: {after_s: 1}}]",
+                "sim_speed is 1 to 16",
+            ),
+            (
+                "steps: [{sim_speed: -4, when: {after_s: 1}}]",
+                "sim_speed is 1 to 16",
+            ),
+            (
+                "steps: [{say: x, sim_speed: 4, when: {after_s: 1}}]",
+                "not both",
+            ),
+            (
+                "steps: [{sim_speed: 4, when: {after_s: 1}, tool: full_auto}]",
+                "routes to no tool",
+            ),
+            ("steps: [{sim_speed: 4, when: start}]", "never the start"),
+            ("steps: [{sim_speed: 4}]", "needs a when"),
+            ("steps: [{when: {after_s: 1}}]", "needs a say"),
+        ];
+        for (tail, want) in bad {
+            let text = format!(
+                "cases: [{{name: a, setup: {{runway_start: {{field: LEMG, runway: 13}}}}, command: fly a circuit, {tail}}}]"
+            );
+            let e = parse_spec_with(&text, &|_| true)
+                .expect_err(tail)
+                .to_string();
+            assert!(e.contains(want), "{tail}: {e}");
+        }
+    }
+
+    #[test]
+    fn a_slow_loop_on_the_panel_is_named_the_follower_is_not() {
+        assert_eq!(
+            slow_loop("0MONITORING|You have control; check autopilot"),
+            None
+        );
+        assert_eq!(
+            slow_loop("1FULL AUTO|cruise\nflying a procedure: to PIMOS\ncontrol: copilot flying"),
+            None
+        );
+        for (s, want) in [
+            (
+                "1AUTOLAND LEMG 13 12.4nm FINAL",
+                "AUTOLAND LEMG 13 12.4nm FINAL",
+            ),
+            ("1FULL AUTO|approach\nautoland LEMG 13", "autoland LEMG 13"),
+            (
+                "1AUTO CIRCUIT|downwind runway 13",
+                "AUTO CIRCUIT|downwind runway 13",
+            ),
+            (
+                "1FULL AUTO|taxi\nauto taxi: 340 m to go",
+                "auto taxi: 340 m to go",
+            ),
+            ("1RECOVERING: STALL|", "RECOVERING: STALL|"),
+            ("1ROUTE|cruise", "ROUTE|cruise"),
+            ("1ROUTE|cruise\nflying 40 kt, 500 ft", "ROUTE|cruise"),
+            ("1FLYING 40 KT, 500 FT|", "FLYING 40 KT, 500 FT|"),
+            ("1PUSHBACK|", "PUSHBACK|"),
+            ("1TALK-DOWN LSZS 21|", "TALK-DOWN LSZS 21|"),
+        ] {
+            assert_eq!(slow_loop(s).as_deref(), Some(want), "{s}");
+        }
+    }
+
+    /// Every reading of the follower's cruise that lets the sim run fast.
+    fn cruising() -> FastReads {
+        FastReads {
+            crashed: Some(false),
+            on_ground: Some(false),
+            agl_ft: Some(20_000.0),
+            servos_on: Some(true),
+            status: Some("1FULL AUTO|cruise\nflying a procedure: to PIMOS".into()),
+        }
+    }
+
+    /// A guard flying 4x in cruise, its sortie begun at t 0 and fast from t 20.
+    fn fast_guard() -> SpeedGuard {
+        let mut g = SpeedGuard::new(Some(4), FAST_RESUME_S);
+        g.feed(&json!({"kind": "sortie", "event": "begin", "sortie": "9-full_auto"}));
+        g.feed(&json!({"kind": "state", "fphase": "Cruise", "sortie": "9-full_auto"}));
+        assert_eq!(g.tick(0.0, &cruising()), SpeedAct::Keep, "held first");
+        assert_eq!(g.tick(9.0, &cruising()), SpeedAct::Keep);
+        assert!(matches!(
+            g.tick(10.0, &cruising()),
+            SpeedAct::Write { to: 4, .. }
+        ));
+        g.written(4, Some(4.0));
+        assert_eq!(g.tick(11.0, &cruising()), SpeedAct::Keep);
+        g
+    }
+
+    /// The runner's guard: 1x the moment any condition fails, the reason
+    /// said; fast again only after they have all held; the latches last the
+    /// sortie.
+    #[test]
+    fn the_guard_drops_to_1x_on_each_condition() {
+        let one = |g: &mut SpeedGuard, x: FastReads, want: &str| match g.tick(30.0, &x) {
+            SpeedAct::Write { to: 1, reason } => {
+                assert!(reason.contains(want), "{reason} vs {want}");
+                g.written(1, Some(1.0));
+            }
+            other => panic!("{want}: {other:?}"),
+        };
+        let cases: Vec<(FastReads, &str)> = vec![
+            (
+                FastReads {
+                    crashed: Some(true),
+                    ..cruising()
+                },
+                "crashed",
+            ),
+            (
+                FastReads {
+                    crashed: None,
+                    ..cruising()
+                },
+                "wreck flag unreadable",
+            ),
+            (
+                FastReads {
+                    on_ground: Some(true),
+                    ..cruising()
+                },
+                "on the ground",
+            ),
+            (
+                FastReads {
+                    on_ground: None,
+                    ..cruising()
+                },
+                "wheels unreadable",
+            ),
+            (
+                FastReads {
+                    agl_ft: Some(4_900.0),
+                    ..cruising()
+                },
+                "4900 ft AGL",
+            ),
+            (
+                FastReads {
+                    agl_ft: None,
+                    ..cruising()
+                },
+                "height unreadable",
+            ),
+            (
+                FastReads {
+                    servos_on: Some(false),
+                    ..cruising()
+                },
+                "servos off",
+            ),
+            (
+                FastReads {
+                    servos_on: None,
+                    ..cruising()
+                },
+                "servos unreadable",
+            ),
+            (
+                FastReads {
+                    status: Some("1FULL AUTO|approach\nautoland LEMG 13".into()),
+                    ..cruising()
+                },
+                "autoland LEMG 13 flying",
+            ),
+            (
+                FastReads {
+                    status: None,
+                    ..cruising()
+                },
+                "status unreadable",
+            ),
+        ];
+        for (x, want) in cases {
+            let mut g = fast_guard();
+            one(&mut g, x.clone(), want);
+            // Held (said once), then back only after the conditions held.
+            assert_eq!(g.tick(31.0, &x), SpeedAct::Keep);
+            assert_eq!(g.tick(40.0, &cruising()), SpeedAct::Keep);
+            assert!(matches!(
+                g.tick(50.0, &cruising()),
+                SpeedAct::Write { to: 4, .. }
+            ));
+        }
+        // The phase: an approach or the ground.
+        for p in ["Approach", "InitialClimb", "Landing", "GoAround"] {
+            let mut g = fast_guard();
+            g.feed(&json!({"kind": "flight", "ev": "phase", "from": "Descent", "to": p}));
+            one(&mut g, cruising(), &format!("phase {p}"));
+        }
+        // Latched for the sortie: a give-up, a hand, a pilot's command, an
+        // impact; a new sortie clears it.
+        for (r, want) in [
+            (
+                json!({"kind": "full_auto", "event": "give_up", "reason": "ap_not_engaged"}),
+                "give-up (ap_not_engaged)",
+            ),
+            (
+                json!({"kind": "intervention", "what": "yoke_under_ap"}),
+                "intervention (yoke_under_ap)",
+            ),
+            (
+                json!({"kind": "tool", "name": "set_heading"}),
+                "pilot's command (set_heading)",
+            ),
+            (json!({"kind": "flight", "ev": "impact"}), "impact"),
+        ] {
+            let mut g = fast_guard();
+            g.feed(&r);
+            one(&mut g, cruising(), want);
+            assert_eq!(
+                g.tick(100.0, &cruising()),
+                SpeedAct::Keep,
+                "{want}: latched"
+            );
+            assert_eq!(
+                g.tick(200.0, &cruising()),
+                SpeedAct::Keep,
+                "{want}: latched"
+            );
+            g.feed(&json!({"kind": "sortie", "event": "begin", "sortie": "10-full_auto"}));
+            assert_eq!(g.tick(201.0, &cruising()), SpeedAct::Keep);
+            assert!(matches!(
+                g.tick(211.0, &cruising()),
+                SpeedAct::Write { to: 4, .. }
+            ));
+        }
+        // The sortie's end, and the spec's own 1x.
+        let mut g = fast_guard();
+        g.feed(&json!({"kind": "sortie_result", "sortie": "9-full_auto", "pass": true}));
+        one(&mut g, cruising(), "no sortie flying");
+        let mut g = fast_guard();
+        g.want(1);
+        one(&mut g, cruising(), "the spec wants 1x");
+        assert!(!g.needs_reads(), "nothing wanted, nothing owed: no reads");
+        // Withheld before it ever ran: said once per reason, never written.
+        let mut g = SpeedGuard::new(Some(4), FAST_RESUME_S);
+        let ground = FastReads {
+            on_ground: Some(true),
+            ..cruising()
+        };
+        assert_eq!(
+            g.tick(0.0, &ground),
+            SpeedAct::Held {
+                reason: "no sortie flying".into()
+            }
+        );
+        assert_eq!(g.tick(1.0, &ground), SpeedAct::Keep);
+        // A fast write that does not read back is latched off and restored.
+        let mut g = SpeedGuard::new(Some(4), 0.0);
+        g.feed(&json!({"kind": "sortie", "event": "begin", "sortie": "s"}));
+        g.feed(&json!({"kind": "state", "fphase": "Climb"}));
+        assert!(matches!(
+            g.tick(0.0, &cruising()),
+            SpeedAct::Write { to: 4, .. }
+        ));
+        g.written(4, Some(1.0));
+        assert!(!g.owes_restore());
+        assert!(matches!(
+            g.tick(1.0, &cruising()),
+            SpeedAct::Held { reason } if reason.contains("sim_speed 4 read back 1")
+        ));
+        let mut g = SpeedGuard::new(Some(4), 0.0);
+        g.feed(&json!({"kind": "sortie", "event": "begin", "sortie": "s"}));
+        g.feed(&json!({"kind": "state", "fphase": "Descent"}));
+        assert!(matches!(
+            g.tick(0.0, &cruising()),
+            SpeedAct::Write { to: 4, .. }
+        ));
+        g.written(4, None);
+        assert!(g.owes_restore(), "an unread multiplier is restored");
+        assert!(matches!(
+            g.tick(1.0, &cruising()),
+            SpeedAct::Write { to: 1, .. }
+        ));
+        // The clock: wall seconds fast, and what the sim achieved.
+        let mut g = fast_guard();
+        g.accrue(11.0, Some(3.8));
+        g.accrue(21.0, Some(3.8));
+        g.accrue(31.0, None);
+        assert!((g.fast_s - 20.0).abs() < 1e-9);
+        assert!((g.achieved().unwrap() - 3.8).abs() < 1e-9);
+    }
+
+    /// Against a fake sim: a speed step at the cruise runs the sim fast
+    /// through the guard, and every way out puts it back to 1x: a sim left
+    /// fast before the setup, the case's end, a crash.
+    #[tokio::test]
+    async fn the_cruise_flies_fast_and_every_end_comes_back_to_1x() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let (dir, log) = scratch_log("fast");
+        let sim = FakeSim::new(log.clone());
+        sim.airborne.store(true, SeqCst);
+        sim.endless.store(true, SeqCst);
+        sim.enroute.store(true, SeqCst);
+        // A sim left fast by something else: 1x before the setup.
+        *sim.speed.lock().unwrap() = 8.0;
+        // 0.01 min: 0.6 s, then the deadline.
+        let spec = parse_spec(
+            "cases: [{name: cruise, setup: {approach: {field: LEMG, runway: 13, final_nm: 5}},\n\
+                      deadline_min: 0.01, steps: [{sim_speed: 4, when: {phase: Cruise}}]}]",
+        )
+        .unwrap();
+        let mut tail = BlackboxTail::at_end(&log);
+        let rows = run_all(
+            &sim,
+            &mut tail,
+            &spec,
+            1,
+            "",
+            &quick_pace(),
+            &mut |_: &Row| {},
+        )
+        .await;
+        assert_eq!(
+            *sim.speeds.lock().unwrap(),
+            vec![1.0, 4.0, 1.0],
+            "1x before the setup, 4x in the cruise, 1x at the case's end"
+        );
+        let v = &rows[0].verdict;
+        assert!(v.reason.starts_with("deadline"), "{v:?}");
+        assert!(v.fast_s > 0.0, "{v:?}");
+        assert_eq!(v.fast_x, Some(4.0));
+        assert!(
+            row_line(&rows[0]).contains("(fast "),
+            "{}",
+            row_line(&rows[0])
+        );
+
+        // A crash while fast: 1x at once, and the case ends crashed.
+        let sim = FakeSim::new(log.clone());
+        sim.airborne.store(true, SeqCst);
+        sim.endless.store(true, SeqCst);
+        sim.enroute.store(true, SeqCst);
+        sim.crash_when_fast.store(true, SeqCst);
+        let spec = parse_spec(
+            "cases: [{name: cruise, setup: {approach: {field: LEMG, runway: 13, final_nm: 5}},\n\
+                      deadline_min: 0.05, sim_speed: 4}]",
+        )
+        .unwrap();
+        let mut tail = BlackboxTail::at_end(&log);
+        let rows = run_all(
+            &sim,
+            &mut tail,
+            &spec,
+            1,
+            "",
+            &quick_pace(),
+            &mut |_: &Row| {},
+        )
+        .await;
+        assert!(rows[0].verdict.crashed, "{:?}", rows[0].verdict);
+        assert_eq!(*sim.speeds.lock().unwrap(), vec![4.0, 1.0]);
+        assert_eq!(*sim.speed.lock().unwrap(), 1.0);
+
+        // Below the floor (or on any failed condition) the case's speed is
+        // never written at all.
+        let sim = FakeSim::new(log.clone());
+        sim.airborne.store(true, SeqCst);
+        sim.endless.store(true, SeqCst);
+        let spec = parse_spec(
+            "cases: [{name: cruise, setup: {approach: {field: LEMG, runway: 13, final_nm: 5}},\n\
+                      deadline_min: 0.005, sim_speed: 4}]",
+        )
+        .unwrap();
+        let mut tail = BlackboxTail::at_end(&log);
+        let rows = run_all(
+            &sim,
+            &mut tail,
+            &spec,
+            1,
+            "",
+            &quick_pace(),
+            &mut |_: &Row| {},
+        )
+        .await;
+        assert_eq!(rows[0].verdict.fast_s, 0.0);
+        assert!(sim.speeds.lock().unwrap().is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

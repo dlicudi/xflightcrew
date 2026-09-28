@@ -1023,6 +1023,12 @@ confirms it closes it (`fixes #N` in the commit). Known gaps are `owed` issues.
   SimBrief, and may `expect_give_up`; `runway: wind` is the tower's into-wind end at the setup (`resolve_wind`, METAR else
   the sim's wind on the field); an unset deadline scales with the approach speed; **a reposition or
   swap is a new flight to the scorer** (`Scorer::new_flight`); specs `bench/sorties/backlog-737.yaml`, `backlog-types.yaml`.
+  **Fast forward only where the laws tolerate it** (`SpeedGuard`; our ticks are wall time, so 4x is
+  4x the gain and delay): a step or the case's `sim_speed: N` is what the spec WANTS; the runner flies
+  it only airborne, in Climb/Cruise/Descent, over `FAST_FLOOR_AGL_FT`, servos on, no `slow_loop` on
+  the panel, no give-up, hand or `tool` in the sortie, else 1x at once with the reason (blackbox
+  `sortie_runner` `sim_speed`, read back); 1x before every setup, at the case end, crash, run end and
+  Ctrl-C; the row's `Fast` says "N s at xA" (#168).
 - A law that misbehaves in the air while its test passes: suspect the plant. A first-order lag
   cannot ring; fly second-order plants through the real transport delay.
 

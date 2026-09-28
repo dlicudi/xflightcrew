@@ -9957,3 +9957,19 @@ the lever 0.16 to 0.27 (the tail engine pushes the nose down); taken again at 48
 roundout climb never pushes, and the SF50 flies a `FlareModel` fitted to its three clean arrests (8,000
 fpm per unit, 1.2/1.2 s, 0.9 s dead, 66 fpm rms) with `rough_hold: false` (the 737's hold put 57 of 160
 gusty plant landings past 400). The recorded balloon, recovered: 258 fpm calm, 308 in gusts. Offline only.
+
+## 2026-09-28: the sortie runner fast-forwards the cruise, behind a guard (issue #168)
+
+A gate-to-gate case took its whole flight in wall time. The case-level `sim_speed` already existed but
+ran the WHOLE sortie fast, taxi, roll and flare included: our laws tick on wall time over REST at a few
+Hz, so at 4x the plant moves four times as far per tick (gain and transport delay x4) and every "held N
+s" watchdog is a quarter as long. Now a step can say `sim_speed: N` on any trigger but `start`, and the
+runner's `SpeedGuard` (not overridable by the spec) flies it only while all hold: a sortie flying, no
+wreck, airborne, the flight model in Climb/Cruise/Descent, AGL >= 5,000 ft (`FAST_FLOOR_AGL_FT`),
+`servos_on`, no `slow_loop` on the panel status, and in the sortie no give-up, intervention, `tool`
+record or impact (latched to the next sortie). Any failure writes 1 at once with its reason; fast
+returns after `FAST_RESUME_S` (10 s) of all holding. Every write is read back (a fast write that does
+not take latches fast off); 1x before every setup, at the case end, on a crash, at the run end and on
+Ctrl-C. Blackbox `sortie_runner` `sim_speed` (`wanted`, `set`, `read_back`, `actual`, `reason`); the run
+row gains `Wall s` and `Fast` ("N s at xA" from `sim_speed_actual`). backlog-737's gate to gate: 4x at
+Cruise, 1x at Descent. Offline only.

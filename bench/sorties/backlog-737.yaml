@@ -19,6 +19,11 @@ cases:
       - say: fly the flight plan
         when: { event: { kind: loading, event: load_aircraft } }
         tool: full_auto
+      # The cruise at 4x (the runner's guard holds 1x below 5,000 ft AGL,
+      # off the autopilot, or with any landing loop flying), 1x from the
+      # top of descent.
+      - { sim_speed: 4, when: { phase: Cruise } }
+      - { sim_speed: 1, when: { phase: Descent } }
     deadline_min: 300
 
   # A rejected takeoff at 60 kt inside full auto's circuit: the pilot's
