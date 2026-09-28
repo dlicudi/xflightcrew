@@ -10013,3 +10013,39 @@ Blackbox `ils coupling` 2026-09-26 to 09-28: 46 arms on the 737, 43 Armed then A
 `appr_reads [0,0]`: `app_press` never read back in `app_status`), 2 reached Coupled and were then
 abandoned, 1 stopped at LocCaptured. `ils_coupled: false` on `boeing_737_800`; autoland flies the
 heading knob as every other type. #81 stays open.
+
+## 2026-09-28: the duty engine's last disagreement, a standalone autoland's stop (issue #34)
+
+11 of 216 `duty` records since 1790586000 disagreed, all `taxi_to_stand` "down, heading in" at
+TaxiIn under mission "autoland" (latest t 1790611965.0): the flight model enters TaxiIn at taxi
+speed while autoland is still stopping on the runway (`stopped_brakes` 0.2 s later), then control
+goes to the pilot and the mission ends 1.5 to 3.2 s on. A standalone autoland's mission IS the
+landing; nobody owes a stand. `duty::next` now says Vacate at TaxiIn under mission "autoland" (the
+rollout's duty carries on, autoland agrees), and TaxiToStand stays full auto's. Replayed through
+`DutyTrail`: nothing in the logs since 1790586000 disagrees now. Offline only.
+
+## 2026-09-28: the hand-back's parking brake written over by our own brake command (issue #35)
+
+LEMG, SR22 (sortie 1790605551, t 1790606569.6): `hand_back_brakes` from 4.2 kt, three
+`brakes_regular` pulses, stopped, then three `park_brake_set` tries inside 1.6 s of the last pulse,
+`held: false`, `park` 0.294, "the parking brake didn't set". Not the valve sense (1.0 = set, as the
+SR22's autoland stops read back). The held command rides `parking_brake_ratio` at the regular effort
+while active and the sim decays it ~0.8 s after its 1 s expiry (measured 2026-07-14,
+`tools::brake_cmd_quiet`), so a set inside that window is written over; 0.294 is that decay. The 737
+(t 1790601686.9) and the later SR22 (t 1790619440.1) held only on try two, the one past the tail.
+`hand_back_hold` now waits `HAND_BACK_BRAKE_TAIL_S` (hold + 1.0 s) after its last pulse, or from its
+start when another loop's brake command is still live, before setting. Test
+`the_hand_back_parks_after_the_brake_command_lets_go_of_the_ratio` (a sim whose command rides the
+ratio; the old code reads back false). Offline only.
+
+## 2026-09-28: a stopped aircraft's line-up distance jumped 14.9 m (issue #60)
+
+LEMG 31 (sorties 1790584715 t 1790585130.1, 1790585651 t 1790586080.1): the taxi rolled 7.4 m
+through its holding stop (`past_end_ticks` 36), and `line_up_path_from_lead_on` built aircraft, hold
+node (now BEHIND), then forward along the stub back through the aircraft. At rest the engage tick's
+joining projection (`project_signed_facing`) took the forward pass, 14.8 m along (236.0 of 255.8 to
+go), and the next tick's plain projection the leg back, 0 m (250.8 to go, lat 0.000). Both line-up
+builders now drive only the lead-on points still ahead (`lead_on_ahead`: past the aircraft's
+projection onto the stub, and over 5 m from it). The 3.54 m step at 1790586103.4 was at 5 kt, lat 3.2
+m and err 12 to 15 degrees: a vertex cut while rolling, not a stopped aircraft. Test
+`a_line_up_from_past_the_hold_never_runs_back_to_it`. Offline only.

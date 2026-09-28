@@ -129,6 +129,13 @@ pub fn next(s: &Status, landed: bool, now_s: f64) -> (Duty, &'static str) {
         GoAround => (Duty::GoAround, "going around"),
         Hover => (Duty::LandAtPad, "slow in the air"),
         Rollout => (Duty::Vacate, "on the landing roll"),
+        // A standalone autoland's mission IS the landing: it stops on the
+        // runway (or hands the vacate to the taxi) and ends. Slowed to taxi
+        // speed under it is still the vacate, never a stand nobody asked
+        // for (11 of 208 records disagreed on this, 2026-09-28).
+        TaxiIn if s.situation.mission == Some("autoland") => {
+            (Duty::Vacate, "the landing's own stop, on the runway")
+        }
         TaxiIn => (Duty::TaxiToStand, "down, heading in"),
     }
 }
@@ -320,6 +327,42 @@ mod tests {
         // Autoland on its own rollout is doing the vacate.
         assert_eq!(agrees(Duty::Vacate, Control::Automation("autoland")), Some(true));
         assert_eq!(agrees(Duty::TaxiToStand, Control::Automation("autoland")), Some(false));
+    }
+
+    /// The eleven 2026-09-28 disagreements (latest t 1790611965.0): a
+    /// standalone autoland (mission "autoland", no plan) slowed into TaxiIn
+    /// while still stopping on the runway, then handed to the pilot 1.5 to
+    /// 3.2 s later and the mission ended. The duty stays the vacate the
+    /// rollout began, and the hand-over ends in Monitor: nothing disagrees.
+    #[test]
+    fn a_standalone_autoland_stop_is_the_vacate_not_the_stand() {
+        let mut s = status(Phase::Rollout, true, None);
+        s.situation.plan = None;
+        s.situation.mission = Some("autoland");
+        s.control = Control::Automation("autoland");
+        let mut trail = DutyTrail::default();
+        let mut out = Vec::new();
+        let mut tick = |s: &Status, t: f64| {
+            let (d, why) = next(s, true, t);
+            out.extend(trail.step(d, why, &format!("{:?}", s.phase), s.control, t));
+        };
+        for i in 0..20 {
+            tick(&s, i as f64 * 0.4);
+        }
+        s.phase = Phase::TaxiIn;
+        assert_eq!(next(&s, true, 8.0).0, Duty::Vacate);
+        for t in [8.0, 8.4, 9.2, 11.2] {
+            tick(&s, t);
+        }
+        s.control = Control::Pilot;
+        s.situation.mission = None;
+        tick(&s, 11.5);
+        tick(&s, 20.0);
+        assert!(out.iter().all(|r| r.agrees != Some(false)), "{out:?}");
+        let duties: Vec<Duty> = out.iter().map(|r| r.duty).collect();
+        assert_eq!(duties, vec![Duty::Vacate, Duty::Monitor]);
+        // Under full auto the same phase is still the taxi to the stand.
+        assert_eq!(next(&status(Phase::TaxiIn, true, None), true, 0.0).0, Duty::TaxiToStand);
     }
 
     /// The 2026-09-26 transition ticks, from the `state` records' `ctl`:

@@ -1310,8 +1310,7 @@ pub fn line_up_path_from_lead_on(
     lon: f64,
     lead_on: &[(f64, f64)],
 ) -> Option<(Vec<(f64, f64)>, f64)> {
-    use crate::autoland::{along_track_nm, cross_track_nm, haversine_nm, project_latlon};
-    let dist_m = |a: (f64, f64), b: (f64, f64)| haversine_nm(a.0, a.1, b.0, b.1) * M_PER_NM;
+    use crate::autoland::{along_track_nm, cross_track_nm, project_latlon};
     let (&first, &last) = (lead_on.first()?, lead_on.last()?);
     // OURS, not another stub's: compare ALONG-TRACK positions, not straight-
     // line distance — the stub runs perpendicular to the runway, so a legit
@@ -1360,12 +1359,7 @@ pub fn line_up_path_from_lead_on(
     // pursuit can actually follow (it chorded the raw corner, probed
     // 2026-07-24).
     let mut path = vec![(lat, lon)];
-    path.extend(
-        lead_on
-            .iter()
-            .copied()
-            .filter(|p| dist_m((lat, lon), *p) > 5.0),
-    );
+    path.extend(lead_on_ahead(lead_on, lat, lon));
     let stop = project_latlon(rwy.thr_lat, rwy.thr_lon, rwy.course_deg, stop_m / M_PER_NM);
     let corner = path.pop()?; // the junction (or the aircraft itself — refused below)
     if path.is_empty() {
@@ -1374,6 +1368,32 @@ pub fn line_up_path_from_lead_on(
     path.extend(fillet_corner(*path.last()?, corner, stop, 18.0));
     path.push(stop);
     (path.len() >= 3).then_some((path, stop_m))
+}
+
+/// The lead-on's points still AHEAD of the aircraft and more than 5 m from
+/// it (one we are on top of is not a point to drive to), for the line-up
+/// and the backtrack. A taxi that rolls through its holding stop (LEMG 31,
+/// 2026-09-28: `past_end_ticks` 36, stopped 7.4 m past the hold node) left
+/// the node BEHIND the aircraft, and the path ran back to it and forward
+/// again through the aircraft: at rest the joining projection read 14.8 m
+/// along (the forward pass) and the plain one 0 m (the leg back), and
+/// `remaining_m` jumped 14.9 m between two ticks with nothing moving.
+fn lead_on_ahead(lead_on: &[(f64, f64)], lat: f64, lon: f64) -> Vec<(f64, f64)> {
+    let dist_m = |a: (f64, f64), b: (f64, f64)| {
+        crate::autoland::haversine_nm(a.0, a.1, b.0, b.1) * M_PER_NM
+    };
+    let passed_m = crate::taxi_guide::project_signed(lead_on, lat, lon).map_or(0.0, |(a, _)| a);
+    let mut along = 0.0;
+    let mut prev = lead_on.first().copied();
+    lead_on
+        .iter()
+        .copied()
+        .filter(|&p| {
+            along += prev.map_or(0.0, |q| dist_m(q, p));
+            prev = Some(p);
+            along > passed_m - 1.0 && dist_m((lat, lon), p) > 5.0
+        })
+        .collect()
 }
 
 /// A sampled quadratic-Bezier fillet replacing the sharp vertex at `corner`:
@@ -1484,8 +1504,7 @@ pub fn backtrack_pocket_path_from_lead_on(
     lon: f64,
     lead_on: &[(f64, f64)],
 ) -> Option<Vec<(f64, f64)>> {
-    use crate::autoland::{along_track_nm, cross_track_nm, haversine_nm, project_latlon};
-    let dist_m = |a: (f64, f64), b: (f64, f64)| haversine_nm(a.0, a.1, b.0, b.1) * M_PER_NM;
+    use crate::autoland::{along_track_nm, cross_track_nm, project_latlon};
     let (&first, &last) = (lead_on.first()?, lead_on.last()?);
     // OURS, and ending on THIS centreline — the same two tests the plain
     // lead-on line-up applies, for the same reason: a foreign stub is
@@ -1527,12 +1546,7 @@ pub fn backtrack_pocket_path_from_lead_on(
     // draws a right angle, the paint curves), then down the strip to the
     // pocket.
     let mut path = vec![(lat, lon)];
-    path.extend(
-        lead_on
-            .iter()
-            .copied()
-            .filter(|p| dist_m((lat, lon), *p) > 5.0),
-    );
+    path.extend(lead_on_ahead(lead_on, lat, lon));
     let corner = path.pop()?;
     if path.is_empty() {
         return None;
@@ -3838,6 +3852,52 @@ mod tests {
         // vertices where the network's chord cut the drawn curve; the curve
         // itself never turns more than about 11 degrees at one vertex.
         assert!(worst_turn < 15.0, "a lead-on runs one way: {worst_turn:.0} degrees at one vertex");
+    }
+
+    /// #60, LEMG 31 (sorties 1790584715 and 1790585651, 2026-09-28): the taxi
+    /// rolled 7.4 m through its holding stop, and the line-up path ran from
+    /// the aircraft BACK to the hold node and forward again. At rest the
+    /// engage tick's joining projection read 14.8 m along (236.0 of 255.8 to
+    /// go) and the next tick's plain one 0 m (250.8): `remaining_m` jumped
+    /// 14.9 m with the aircraft stopped. Points behind the aircraft are
+    /// dropped, so both projections of a stopped aircraft agree.
+    #[test]
+    fn a_line_up_from_past_the_hold_never_runs_back_to_it() {
+        use crate::autoland::{project_latlon, Runway};
+        let rwy = Runway {
+            icao: "TEST".into(),
+            id: "36".into(),
+            thr_lat: 0.0,
+            thr_lon: 0.0,
+            course_deg: 0.0,
+            length_m: 2000.0,
+            surface: 1,
+            dist_nm: 0.02,
+            elev_ft: 0.0,
+        };
+        let at = |a_m: f64, x_m: f64| {
+            let (la, lo) = project_latlon(0.0, 0.0, 0.0, a_m / 1852.0);
+            project_latlon(la, lo, 90.0, x_m / 1852.0)
+        };
+        // The stub runs west from the hold node (40 m east) to the centreline.
+        let hold = at(100.0, 40.0);
+        let lead_on = vec![hold, at(100.0, 25.0), at(100.0, 10.0), at(100.0, 0.0)];
+        // Stopped 7.4 m past the node, nose west down the stub.
+        let (lat, lon) = at(100.0, 32.6);
+        let (path, _) =
+            line_up_path_from_lead_on(&rwy, lat, lon, &lead_on).expect("drives the lead-on");
+        assert!(!path.contains(&hold), "the node behind the aircraft is not driven back to");
+        let plain = crate::taxi_guide::project_signed(&path, lat, lon).unwrap();
+        let facing = crate::taxi_guide::project_signed_facing(&path, lat, lon, 270.0).unwrap();
+        assert!(
+            (plain.0 - facing.0).abs() < 0.5,
+            "one answer for a stopped aircraft: plain {plain:?}, facing {facing:?}"
+        );
+        assert!(plain.0 < 0.5, "we are at the start: {plain:?}");
+        // A hold still AHEAD keeps its node, as before.
+        let (blat, blon) = at(100.0, 48.0);
+        let (before, _) = line_up_path_from_lead_on(&rwy, blat, blon, &lead_on).unwrap();
+        assert_eq!(before[1], hold);
     }
 
     #[test]
