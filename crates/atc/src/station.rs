@@ -88,6 +88,10 @@ pub struct Station {
     /// The runway the arrival now calling named for itself, consumed by the
     /// pick that answers the call (`note_stated_runway`).
     stated_runway: Option<String>,
+    /// The caller stating [`Station::stated_runway`] stands ON that strip,
+    /// on the ground: a runway start asking for the runway it is lined up on
+    /// (`note_caller_on_strip`), consumed by the same pick.
+    stated_on_strip: bool,
     /// The runway a "request runway ..." call named, canonical ("8L"), for
     /// the ctx that answers it (`note_stated_runway`, `apply_runway_request`).
     runway_request: Option<String>,
@@ -242,6 +246,7 @@ impl Station {
             twr: tower::Tower::new(),
             runway_in_use: None,
             stated_runway: None,
+            stated_on_strip: false,
             runway_request: None,
             requested_ident: None,
             dep_checked_in: false,
@@ -1582,14 +1587,53 @@ impl Station {
             | tower::Intent::ReportDownwind
             | tower::Intent::ReportBase
             | tower::Intent::RequestTaxi
-            | tower::Intent::RequestLanding { .. } => tower::stated_runway(transcript),
+            | tower::Intent::RequestLanding { .. }
+            // A departure's clearance request may name its runway, like the
+            // taxi request; a runway start names the strip it is lined up on
+            // ("request clearance, runway one three", `note_caller_on_strip`).
+            | tower::Intent::RequestClearance => tower::stated_runway(transcript),
             _ => None,
         };
+        self.stated_on_strip = false;
         self.runway_request = match intent {
             tower::Intent::RequestRunway => tower::requested_runway(transcript),
             _ => None,
         };
         self.requested_ident = None;
+    }
+
+    /// The caller of the stated runway stands ON that strip, on the ground:
+    /// a runway start (the sim put it there, lined up). Its runway stands
+    /// against the calm-wind arrival stream as long as the wind does not
+    /// argue (`pick_runway_with`). Pure but for the flag.
+    fn note_caller_on_strip(&mut self, on_ground: bool, lat: f64, lon: f64) {
+        self.stated_on_strip = on_ground
+            && self.stated_ident().is_some_and(|ident| {
+                strip(&self.apt.runways, &ident).is_some_and(|r| on_runway(r, lat, lon).is_some())
+            });
+    }
+
+    /// The strip end the held stated runway names at this field.
+    fn stated_ident(&self) -> Option<String> {
+        let stated = self.stated_runway.as_deref()?;
+        self.apt
+            .runways
+            .iter()
+            .flat_map(|r| [r.ident_a.clone(), r.ident_b.clone()])
+            .find(|id| tower::runway_matches(id, stated))
+    }
+
+    /// A flight the tower is sequencing owns the runway in use (see
+    /// `pick_runway_with`).
+    fn runway_committed(&self) -> bool {
+        matches!(
+            self.twr.state,
+            tower::State::TaxiCleared
+                | tower::State::LinedUp
+                | tower::State::TakeoffCleared
+                | tower::State::Inbound
+        ) || (self.twr.state == tower::State::ClearedToLand && !self.twr.runway_vacated())
+            || (self.ifr_runway.is_some() && self.ifr_runway == self.runway_in_use)
     }
 
     /// Answer a "request runway ..." call's context: the runway it named,
@@ -1648,6 +1692,23 @@ impl Station {
         wind_kts: f64,
         arrival_end: Option<&str>,
     ) -> String {
+        // A RUNWAY START IS GIVEN THE RUNWAY IT IS LINED UP ON when the wind
+        // does not argue: an arrival stream on another end sequences around
+        // a departure already on its runway, it does not send it off to taxi.
+        // LEMG (sortie 1790584715-full_auto, 2026-09-28): the 737 set up on
+        // 13's threshold in 342 at 3 kt was cleared off 31 and taxied 400 s
+        // round the field to line up there.
+        if std::mem::take(&mut self.stated_on_strip) && !self.runway_committed() {
+            if let Some(ident) = self.stated_ident() {
+                let hw = nav::headwind_for(&self.apt.runways, &ident, wind_from, wind_kts);
+                let best = nav::best_runway_for_wind(&self.apt.runways, wind_from, wind_kts);
+                if stated_runway_stands(&self.apt.runways, &ident, hw, best, wind_from, wind_kts) {
+                    self.stated_runway = None;
+                    self.runway_in_use = Some(ident.clone());
+                    return ident;
+                }
+            }
+        }
         if wind_kts < CALM_WIND_KTS && self.runway_in_use.is_none() {
             if let Some(end) = arrival_end {
                 if strip(&self.apt.runways, end).is_some() {
@@ -1667,16 +1728,10 @@ impl Station {
         // re-aimed at it from 60 ft (EGTE 08 to 26, 2026-09-21).
         // A landed arrival that has REPORTED the runway vacated no longer
         // owns it: the pick is free to follow the wind and the stream again.
-        let committed = matches!(
-            self.twr.state,
-            tower::State::TaxiCleared
-                | tower::State::LinedUp
-                | tower::State::TakeoffCleared
-                | tower::State::Inbound
-        ) || (self.twr.state == tower::State::ClearedToLand && !self.twr.runway_vacated())
-            // ...and so does an IFR clearance: it named the runway and the
-            // SID off it, and the taxi that follows goes to THAT runway.
-            || (self.ifr_runway.is_some() && self.ifr_runway == self.runway_in_use);
+        // ...and so does an IFR clearance: it named the runway and the SID
+        // off it, and the taxi that follows goes to THAT runway
+        // (`runway_committed`).
+        let committed = self.runway_committed();
         if committed && self.runway_in_use.is_some() {
             return self.runway_in_use.clone().unwrap_or_default();
         }
@@ -1819,6 +1874,14 @@ impl Station {
         // (2026-07-10).
         let targets = read_tcas_targets(xp).await;
         let arrival_end = arrival_end(&targets, &self.apt.runways, self.apt.elev_ft);
+        if on_ground && self.stated_runway.is_some() {
+            if let (Ok(lat), Ok(lon)) = (
+                xp.get_float(datarefs::LATITUDE).await,
+                xp.get_float(datarefs::LONGITUDE).await,
+            ) {
+                self.note_caller_on_strip(on_ground, lat, lon);
+            }
+        }
         let ident =
             self.pick_runway_with(wx.wind_from_deg, wx.wind_kts, arrival_end.as_deref());
         let (final_traffic, runway_occupied) = match strip(&self.apt.runways, &ident) {
@@ -9172,6 +9235,7 @@ mod tests {
             twr: tower::Tower::new(),
             runway_in_use: None,
             stated_runway: None,
+            stated_on_strip: false,
             runway_request: None,
             requested_ident: None,
             dep_checked_in: false,
@@ -10409,6 +10473,100 @@ mod tests {
         ];
         st.note_stated_runway("final runway zero nine", tower::Intent::ReportFinal);
         assert_eq!(st.pick_runway(0.0, 12.0), "36");
+        *CLEARANCE.lock().unwrap() = None;
+    }
+
+    /// Issue #134, the recorded case: LEMG (sortie 1790584715-full_auto,
+    /// 2026-09-28), the runner's runway start put the 737 on 13's threshold
+    /// (36.684289 N 4.512250 W, 131.4 true, fit "13"), wind 342.6 at 2.9 kt,
+    /// arrivals landing 12 on the party line. The clearance named 31 and full
+    /// auto taxied 400 s round the field to line up there. A runway start
+    /// asks for the strip it is on and is given it while the wind does not
+    /// argue: the calm-wind stream on another end does not move it.
+    #[test]
+    fn a_runway_start_is_given_the_runway_it_is_lined_up_on() {
+        let _guard = SIDE_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        *CLEARANCE.lock().unwrap() = None;
+        let runways = vec![
+            nav::Runway {
+                width_m: 45.11,
+                surface: 1,
+                ident_a: "12".into(),
+                ident_b: "30".into(),
+                lat_a: 36.6910753,
+                lon_a: -4.5078270,
+                lat_b: 36.6795648,
+                lon_b: -4.4805125,
+            },
+            nav::Runway {
+                width_m: 45.11,
+                surface: 1,
+                ident_a: "13".into(),
+                ident_b: "31".into(),
+                lat_a: 36.6845573,
+                lon_a: -4.5126253,
+                lat_b: 36.6654027,
+                lon_b: -4.4858140,
+            },
+        ];
+        let (lat, lon) = (36.684288506540085, -4.51224958630406);
+        let words = "november eight one six november november, request clearance, runway one three";
+        let intent = tower::parse_intent(words);
+        assert_eq!(intent, tower::Intent::RequestClearance);
+        let station = || {
+            let mut st = lxgb();
+            st.apt.name = "Malaga".into();
+            st.apt.runways = runways.clone();
+            st
+        };
+
+        // Lined up on 13, the stream on 12: 13.
+        let mut st = station();
+        st.note_stated_runway(words, intent.clone());
+        st.note_caller_on_strip(true, lat, lon);
+        assert_eq!(st.pick_runway_with(342.6, 2.9, Some("12")), "13");
+        assert_eq!(st.runway_in_use.as_deref(), Some("13"));
+        // ...and it holds for the takeoff call that follows (no stated
+        // runway, nothing committed, calm).
+        assert_eq!(st.pick_runway_with(342.6, 2.9, Some("12")), "13");
+        // The same words from an aircraft NOT on the strip: the stream's end,
+        // as before.
+        let mut st = station();
+        st.note_stated_runway(words, intent.clone());
+        st.note_caller_on_strip(true, 36.6950, -4.4900);
+        assert_eq!(st.pick_runway_with(342.6, 2.9, Some("12")), "12");
+        // Airborne is never a runway start.
+        let mut st = station();
+        st.note_stated_runway(words, intent.clone());
+        st.note_caller_on_strip(false, lat, lon);
+        assert_eq!(st.pick_runway_with(342.6, 2.9, Some("12")), "12");
+        // A wind that really argues still wins: 310 at 12 is 12 kt of tailwind
+        // on 13.
+        let mut st = station();
+        st.note_stated_runway(words, intent.clone());
+        st.note_caller_on_strip(true, lat, lon);
+        assert_ne!(st.pick_runway_with(310.0, 12.0, None), "13");
+        // A flight the tower is sequencing keeps its runway.
+        let mut st = station();
+        st.runway_in_use = Some("31".into());
+        st.twr.state = tower::State::TaxiCleared;
+        st.note_stated_runway(words, intent.clone());
+        st.note_caller_on_strip(true, lat, lon);
+        assert_eq!(st.pick_runway_with(342.6, 2.9, Some("12")), "31");
+
+        // The clearance the crew reads names 13.
+        let mut st = station();
+        st.note_stated_runway(words, intent);
+        st.note_caller_on_strip(true, lat, lon);
+        assert_eq!(st.pick_runway_with(342.6, 2.9, Some("12")), "13");
+        let wx = Wx {
+            wind_from_deg: 342.6,
+            wind_kts: 2.9,
+        };
+        let ctx = scripted_ctx(&mut st, wx);
+        let r = st.route_keyed(words, Service::Tower, &ctx, wx);
+        assert!(r.contains("cleared to leave"), "{r}");
+        assert_eq!(crate::party_line::clearance_runway().as_deref(), Some("13"));
         *CLEARANCE.lock().unwrap() = None;
     }
 
