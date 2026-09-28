@@ -351,7 +351,8 @@ Config: `XCOPILOT_ATC_AIRPORT` / `_VOICE` / `_RATE` / `_REGION`.
 - **The command loop never holds a pilot's line behind its own speech**: `say`, the crew-radio
   drain and the tower's reply give way to a line in hand or waiting (`pilot_line_pending`,
   `Voice::say_station_until`); blackbox `typed` `routed` `held_ms` (LEMG 2026-09-28: "my controls"
-  routed 26.1 s late).
+  routed 26.1 s late). **Nor an armed station swap**, which only the loop installs (`loop_owed`; a
+  stepped-on readback held a new flight's station 22 to 38 s, its final call unmade, #167).
 - **Any PTT mutes everything while held**; release rejoins LIVE, no replay. Recovery is procedural
   and knows what was cut (`voice::SpeechMemory`, `router::recall_line`): silenced lines are OWED;
   "what were you saying?" says them, "say again" the newest of owed, readback and volunteered line.

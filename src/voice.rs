@@ -267,6 +267,17 @@ fn wait_spoken_or(latch: &Latch, stop: impl Fn() -> bool) -> bool {
     }
 }
 
+/// A [`Voice::say_until`] wait on a line that is never spoken (stepped on,
+/// its remainder queued behind the radio): returns once `stop` says so.
+#[cfg(test)]
+pub(crate) fn wait_unspoken_until(stop: impl Fn() -> bool) -> bool {
+    let latch = Latch {
+        spoken: Mutex::new(false),
+        cv: Condvar::new(),
+    };
+    wait_spoken_or(&latch, stop)
+}
+
 /// The Piper model for this position. Seed 0 (the configured home field)
 /// uses the curated per-position voices; any other seed draws a stable
 /// per-airport crew from `atc_voice_pool`, offset per position so the

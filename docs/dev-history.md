@@ -9957,3 +9957,14 @@ the lever 0.16 to 0.27 (the tail engine pushes the nose down); taken again at 48
 roundout climb never pushes, and the SF50 flies a `FlareModel` fitted to its three clean arrests (8,000
 fpm per unit, 1.2/1.2 s, 0.9 s dead, 66 fpm rms) with `rough_hold: false` (the 737's hold put 57 of 160
 gusty plant landings past 400). The recorded balloon, recovered: 258 fpm calm, 308 in gusts. Offline only.
+
+## 2026-09-28: an approach setup's station came up after the final call gave up (issue #167)
+
+LEMG, sorties 1790611629 (SF50, 12) and 1790619465 (SR22, 13): `setup approach_radio station_up:false
+call:null`, both landings uncleared and challenged "inside controlled airspace without clearance". Not a
+reach latch (no `atc route:reach` in either window): the swap sat in `PENDING_STATION`, which only the
+command loop installs, while the loop waited on its own readback "Setting up a 10 mile final": a tower
+call stepped on it (16:07:08.7Z, armed 16:07:09.4, installed 16:07:31.1 when the stale remainder was
+dropped; 18:17:45 to 18:18:22.9; 18:39:14.6 to 18:39:43.4), past `STATION_UP_S` (15 s). Setups where no
+radio call stepped on the readback installed in 0.2 to 1.8 s. The loop's speech waits (`say`, the
+crew-radio drain) now give way to an armed swap as to a pilot's line (`main::loop_owed`). Offline only.
