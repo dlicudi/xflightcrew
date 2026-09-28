@@ -481,12 +481,17 @@ everything blackboxes to `logs/blackbox.jsonl` (kinds: `atc`, `autotaxi`, `autot
 - **The handoff line is true** about who has the aircraft and the height (`handoff_to_caller`). **A
   pilot handoff is FLYABLE**: it waits for the clean-up (`handoff_waits_for_clean_up`), sets a
   capturable dial (`handoff_altitude_dial_ft`), and gives the governor the overspeed guard's speed
-  (`handoff_speed_kts`). Flap schedules fit their placards (test-enforced over every profile).
+  (`handoff_speed_kts`). Flap schedules fit their placards (test-enforced over every profile), and
+  so does a circuit's clean-up: ONE speed per leg (`circuit::leg_want_kts`) feeds the throttle AND
+  the climb limiter's full rate, faded to the KEPT flap's floor (`leg_climb_floor_kts`; the A330 ran
+  CONF 1 to 224 kt chasing two speeds, #169).
 - **A jet's climb-out is declared** (`reference.acceleration_height_agl_ft`,
   `autotakeoff::ClimbOut`): below it the VS dial holds `initial_climb_kts` (`climb_out_vs_fpm` to
   `best_climb_fpm`) and the flaps stay; above it the schedule steps and the handoff waits for it
   (`handoff_waits_for_schedule`), each step only once the flaps ARRIVE at the last
-  (`paced_flap_step`) and called by its detent ("Flaps one.", `flap_step_line`). A circuit keeps
+  (`paced_flap_step`; a reading that left the old detent and stopped counts, `FlapPace`, withheld
+  steps blackboxed `flap_step_withheld`) and called by its detent ("Flaps one.",
+  `flap_step_line`). A circuit keeps
   the old climb-out.
 - **The initial climb holds V2 + 15 by pitch** (`autotakeoff::ClimbHold`, profile
   `climb_pitch_max_deg`): liftoff to the 300 ft engage, the attitude target walks on the airspeed
@@ -893,7 +898,9 @@ as held, never written (one writer per dataref).
 
 **Who starts one**: `flow::Tracker`, one-shot per flight, every boundary SUSTAINED (a single-tick
 boundary audits the automation's own actions half done; `CLIMB_AGL_FT`, `CLIMB_SECS`). Under an
-automation Monitor starts at once; with a pilot flying the copilot PROPOSES (`PROPOSAL_TTL`) and
+automation Monitor starts at once (BEFORE LANDING only once gear and landing flap are set,
+`Sample.landing_config`: a circuit's downwind descent is not the landing config, #169); with a
+pilot flying the copilot PROPOSES (`PROPOSAL_TTL`) and
 never acts by itself; the after-landing list runs at once as Crew. The profile's `checklist_flow:`
 maps titles. Panel: `flow::status()`.
 

@@ -3264,6 +3264,12 @@ pub async fn run(
                 let sample = crate::flow::Sample {
                     agl_ft: snap.agl_ft,
                     vsi_fpm: snap.vsi_fpm,
+                    automation: crate::flow::automation_flying(),
+                    landing_config: crate::flow::landing_config(
+                        snap.gear_down,
+                        snap.flap_ratio,
+                        !crate::aircraft::flap_limits().is_empty(),
+                    ),
                 };
                 if let Some(section) = flow_tracker.tick(&sample, &flight, &flight_events, now) {
                     crate::flow::phase_boundary(section, &config, &voice);
