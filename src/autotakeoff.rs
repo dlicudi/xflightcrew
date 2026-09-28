@@ -36,7 +36,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use crate::autoland::{along_track_nm, cross_track_nm, heading_diff, true_to_mag, Runway};
 use crate::tools::autopilot::ApConfig;
 use crate::voice::{Priority, Voice};
-use crate::xplane::XPlaneClient;
+use crate::xplane::{XPlane, XPlaneClient};
 
 const LAT: &str = "sim/flightmodel/position/latitude";
 const LON: &str = "sim/flightmodel/position/longitude";
@@ -2542,110 +2542,211 @@ fn alert(voice: &Option<Voice>, priority: Priority, line: &str) {
     }
 }
 
-/// Throttle idle, one expiring brake pulse, steering released, and say why.
 /// Maximum braking, held: a rejected takeoff is a maximum-effort stop.
-const BRAKES_MAX: &str = "sim/flight_controls/brakes_max";
-/// Below this a rejected roll is slow enough to hand over.
-const REJECT_HANDOVER_KTS: f64 = 20.0;
-/// The longest the stop is flown before handing over regardless.
+pub(crate) const BRAKES_MAX: &str = "sim/flight_controls/brakes_max";
+/// Under this a rejected roll has STOPPED and the parking brake goes on; the
+/// hand-back's own stopped line (`full_auto::hand_back_hold`).
+const REJECT_STOPPED_KTS: f64 = 1.0;
+/// Below this the stop lets go of the steering: a walk on the centreline.
+const REJECT_STEER_MIN_KTS: f64 = 3.0;
+/// The longest the stop is flown, in live seconds (a pause slides it).
 const REJECT_STOP_MAX_S: f64 = 90.0;
+/// Maximum braking is renewed this often, inside the held command's second.
+const REJECT_BRAKE_EVERY_S: f64 = 0.8;
+/// The autothrottle is looked at this often through the stop.
+const REJECT_AT_EVERY_S: f64 = 1.0;
+/// The stop's tick.
+const REJECT_TICK_MS: u64 = 200;
 
-/// A reject at speed is FLOWN to a stop: idle, maximum braking renewed every
-/// second, and the centreline held with the roll's own law until the
-/// aircraft is under [`REJECT_HANDOVER_KTS`]. The reject used to brake for
-/// one second, zero the steering and say "your aircraft" at 127 kt; nobody
-/// was on the pedals and the 737 left the side of LIBP 04 (2026-09-26).
-async fn stop_on_centreline(xp: &XPlaneClient, rwy: &Runway, law: &mut RollSteer) {
-    let t0 = std::time::Instant::now();
-    let mut last = std::time::Instant::now();
-    let mut last_brake: Option<std::time::Instant> = None;
+/// What the stop did, for the blackbox and the hand-back line.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct RejectStop {
+    /// Under [`REJECT_STOPPED_KTS`] before [`REJECT_STOP_MAX_S`].
+    pub stopped: bool,
+    /// Groundspeed at the first and last reads, and the most seen, knots.
+    pub from_kts: Option<f64>,
+    pub end_kts: Option<f64>,
+    pub max_kts: Option<f64>,
+    /// Live seconds flown.
+    pub secs: f64,
+    pub brake_pulses: u32,
+    /// An ENGAGED autothrottle found and taken out: whether it read back out.
+    pub at_off: Option<bool>,
+}
+
+/// A reject is FLOWN to a full stop: the throttles idle every tick (the
+/// levers are ours, an engaged autothrottle is taken out and read back),
+/// maximum braking renewed inside its own expiry, and the centreline held
+/// with the roll's own law, until the aircraft is under
+/// [`REJECT_STOPPED_KTS`]. The reject used to brake for one second and say
+/// "your aircraft" at 127 kt (LIBP 04, 2026-09-26); then it stopped to 20 kt
+/// on the EGKK rejects; and the pilot's own "reject the takeoff" never flew
+/// the stop at all: LEMG 13 (sortie 1790627884-full_auto, 2026-09-28) said
+/// "Throttle is idle, brakes on. Your aircraft." at 63 kt, the engines
+/// spooling down from takeoff thrust pushed it to 73 kt with one second of
+/// brakes, and it rolled 70 to 52 kt for two minutes with nobody braking.
+pub(crate) async fn stop_on_centreline(
+    xp: &dyn XPlane,
+    rwy: &Runway,
+    law: &mut RollSteer,
+) -> RejectStop {
+    let mut out = RejectStop::default();
+    let thr = throttle_dref();
+    let mut live_s = 0.0_f64;
+    let mut last = tokio::time::Instant::now();
+    let mut last_brake: Option<f64> = None;
+    let mut last_at: Option<f64> = None;
     let mut prev_xtk: Option<f64> = None;
     let mut rate_filter = XtkRate::default();
-    while t0.elapsed().as_secs_f64() < REJECT_STOP_MAX_S {
+    while live_s < REJECT_STOP_MAX_S {
+        let now = tokio::time::Instant::now();
+        let dt = (now - last).as_secs_f64().clamp(0.0, 1.0);
+        last = now;
+        // Pause or replay: nothing is written and the clock slides.
+        if crate::xplane::sim_frozen(xp).await {
+            tokio::time::sleep(std::time::Duration::from_millis(REJECT_TICK_MS)).await;
+            continue;
+        }
+        live_s += dt;
+        // The levers are the reject's: idle, every tick.
+        let _ = xp.set_float(&thr, 0.0).await;
+        if last_at.is_none_or(|t| live_s - t >= REJECT_AT_EVERY_S) {
+            last_at = Some(live_s);
+            if let Some(ok) = crate::takeoff_config::autothrottle_off(xp).await {
+                out.at_off = Some(ok);
+            }
+        }
         // One frame's position (#157), as the roll reads it.
         let (pos, yaw_r) = tokio::join!(sim::position::read(xp), xp.get_float(YAW_RATE));
         let (lat, lon) = sim::position::lat_lon(&pos);
         let psi = sim::position::field(&pos, |p| p.psi_true_deg);
         let gs = sim::position::field(&pos, |p| p.gs_ms);
-        let Some([lat, lon, psi, gs]) = crate::control::measurements("autotakeoff", [lat, lon, psi, gs])
-        else {
-            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-            continue;
-        };
-        let gs_kts = gs * MS_TO_KTS;
-        if gs_kts < REJECT_HANDOVER_KTS {
-            break;
+        // A failed read is no measurement: the brakes stay on, nothing else.
+        let meas = crate::control::measurements("autotakeoff", [lat, lon, psi, gs]);
+        let gs_kts = meas.map(|[_, _, _, g]| g.abs() * MS_TO_KTS);
+        if let Some(k) = gs_kts {
+            out.from_kts.get_or_insert(k);
+            out.end_kts = Some(k);
+            out.max_kts = Some(out.max_kts.map_or(k, |m: f64| m.max(k)));
+            if k < REJECT_STOPPED_KTS {
+                out.stopped = true;
+                break;
+            }
         }
-        if last_brake.is_none_or(|t| t.elapsed().as_secs_f64() >= 0.8) {
+        if last_brake.is_none_or(|t| live_s - t >= REJECT_BRAKE_EVERY_S) {
             // Noted BEFORE the command too: the plugin latches its brake
             // yield at the command's begin, before the Web API answers, and a
             // monitor tick in between would read our brake as a hand.
             crate::tools::note_brake_cmd();
             if xp.run_command_for(BRAKES_MAX, crate::tools::BRAKE_HOLD_SECS).await.is_ok() {
                 crate::tools::note_brake_cmd();
+                out.brake_pulses += 1;
             }
-            last_brake = Some(std::time::Instant::now());
+            last_brake = Some(live_s);
         }
-        let dt = last.elapsed().as_secs_f64().clamp(0.05, 1.0);
-        last = std::time::Instant::now();
-        let xtk_m = cross_track_nm(lat, lon, rwy) * M_PER_NM;
-        let rate = rate_filter.update(prev_xtk.map_or(0.0, |p| (xtk_m - p) / dt), dt);
-        prev_xtk = Some(xtk_m);
-        let target = roll_target_heading(rwy.course_deg, xtk_m, rate, gs_kts);
-        let err = ((target - psi + 540.0).rem_euclid(360.0)) - 180.0;
-        let yaw_dps = yaw_r.ok().filter(|v| v.is_finite());
-        let steer = law.step_with_yaw(err, dt, gs_kts, 0.0, yaw_dps);
-        let _ = xp.set_float(TAXI_STEER, steer).await;
-        crate::blackbox::record(
-            "autotakeoff",
-            serde_json::json!({"event": "reject_rollout", "gs": gs_kts, "xtk_m": xtk_m,
-                               "err": err, "steer": steer, "r": yaw_dps,
-                               "pos": sim::position::source_word(&pos)}),
-        );
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        if let (Some([lat, lon, psi, _]), Some(gs_kts)) = (meas, gs_kts) {
+            let dt = dt.max(0.05);
+            let xtk_m = cross_track_nm(lat, lon, rwy) * M_PER_NM;
+            let rate = rate_filter.update(prev_xtk.map_or(0.0, |p| (xtk_m - p) / dt), dt);
+            prev_xtk = Some(xtk_m);
+            let target = roll_target_heading(rwy.course_deg, xtk_m, rate, gs_kts);
+            let err = ((target - psi + 540.0).rem_euclid(360.0)) - 180.0;
+            let yaw_dps = yaw_r.ok().filter(|v| v.is_finite());
+            let steer = if gs_kts >= REJECT_STEER_MIN_KTS {
+                law.step_with_yaw(err, dt, gs_kts, 0.0, yaw_dps)
+            } else {
+                0.0
+            };
+            let _ = xp.set_float(TAXI_STEER, steer).await;
+            crate::blackbox::record(
+                "autotakeoff",
+                serde_json::json!({"event": "reject_rollout", "gs": gs_kts, "xtk_m": xtk_m,
+                                   "err": err, "steer": steer, "r": yaw_dps,
+                                   "pos": sim::position::source_word(&pos)}),
+            );
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(REJECT_TICK_MS)).await;
     }
     let _ = xp.set_float(TAXI_STEER, 0.0).await;
-    crate::tools::note_brake_cmd();
-    if xp.run_command_for(BRAKES_MAX, crate::tools::BRAKE_HOLD_SECS).await.is_ok() {
-        crate::tools::note_brake_cmd();
+    out.secs = live_s;
+    out
+}
+
+/// The line the reject ends on, from what the stop and the hand-back READ
+/// BACK: "your aircraft" only over an aircraft that is stopped and held, or
+/// said with what is not. Pure.
+pub fn reject_end_line(stop: &RejectStop, held: Option<bool>) -> String {
+    match (held, stop.stopped) {
+        (Some(true), _) => "Stopped. Parking brake set. Your aircraft.".into(),
+        (Some(false), true) => {
+            "Stopped. The parking brake didn't set, hold the brakes. Your aircraft.".into()
+        }
+        (Some(false), false) => "The parking brake didn't set, hold the brakes. Your aircraft."
+            .into(),
+        (None, true) => "Stopped. Your aircraft.".into(),
+        (None, false) => "I couldn't stop us. Your aircraft, brakes.".into(),
     }
 }
 
-/// A reject while ROLLING: the reject, then the stop flown on the
-/// centreline, then the hand-over, said once stopped.
+/// A reject from ANY speed on the ground: the reject, the stop flown to a
+/// full stop on the centreline, the parking brake set and read back
+/// (`full_auto::hand_back_hold`, after the held brake lets go of the ratio),
+/// and only then the hand-back. The run's outcome is the reject's
+/// (`Failed(reason)`), so a caller ends as `takeoff_not_completed`.
 async fn reject_rolling(
     xp: &XPlaneClient,
     voice: &Option<Voice>,
-    why: &str,
+    line: &str,
     reason: &str,
     rwy: &Runway,
     law: &mut RollSteer,
+    valve_set: Option<f64>,
 ) {
     // Unscoped: a reject is how the run ENDS, and a cancelled scope must
-    // never refuse the brakes that stop it.
+    // never refuse the throttles and brakes that stop it.
     let xp = &xp.unscoped();
-    reject(xp, voice, &format!("{why} Rejecting takeoff."), reason).await;
-    stop_on_centreline(xp, rwy, law).await;
-    alert(voice, Priority::Warning, "Stopped. Your aircraft.");
-    crate::blackbox::record("autotakeoff", serde_json::json!({"event": "reject_stopped", "reason": reason}));
+    reject(xp, voice, line, reason).await;
+    let stop = stop_on_centreline(xp, rwy, law).await;
+    let held = crate::full_auto::hand_back_hold(xp, valve_set).await;
+    let end = reject_end_line(&stop, held);
+    alert(voice, Priority::Warning, &end);
+    crate::blackbox::record(
+        "autotakeoff",
+        serde_json::json!({"event": "reject_stopped", "reason": reason,
+                           "stopped": stop.stopped, "from_kts": stop.from_kts,
+                           "max_kts": stop.max_kts, "end_kts": stop.end_kts,
+                           "secs": (stop.secs * 10.0).round() / 10.0,
+                           "brake_pulses": stop.brake_pulses, "at_off": stop.at_off,
+                           "park_held": held}),
+    );
 }
 
-async fn reject(xp: &XPlaneClient, voice: &Option<Voice>, line: &str, reason: &str) {
-    // The throttle and brakes of a reject are never refused by the scope
-    // the abort itself just cancelled.
-    let xp = &xp.unscoped();
-    RUN.record(sim::run::Outcome::Failed(reason.into()));
+/// The reject's hands in its first second: throttles idle, an engaged
+/// autothrottle out (read back, `Some` when there was one), maximum braking.
+pub(crate) async fn reject_hands(xp: &dyn XPlane) -> Option<bool> {
     let _ = xp.set_float(&throttle_dref(), 0.0).await;
+    let at_off = crate::takeoff_config::autothrottle_off(xp).await;
     // Noted before as well as after: see `stop_on_centreline`.
     crate::tools::note_brake_cmd();
     if xp
-        .run_command_for(crate::tools::BRAKES_REGULAR, crate::tools::BRAKE_HOLD_SECS)
+        .run_command_for(BRAKES_MAX, crate::tools::BRAKE_HOLD_SECS)
         .await
         .is_ok()
     {
         crate::tools::note_brake_cmd();
     }
-    let _ = xp.set_float(TAXI_STEER, 0.0).await;
+    at_off
+}
+
+/// The reject's first second: the run's outcome, throttles idle, the
+/// autothrottle out, maximum braking, the lever up on a down-detent
+/// airframe, the line, and the tower told.
+async fn reject(xp: &XPlaneClient, voice: &Option<Voice>, line: &str, reason: &str) {
+    // The throttle and brakes of a reject are never refused by the scope
+    // the abort itself just cancelled.
+    let xp = &xp.unscoped();
+    RUN.record(sim::run::Outcome::Failed(reason.into()));
+    let at_off = reject_hands(xp).await;
     crate::takeoff_config::on_reject(xp).await;
     alert(voice, Priority::Warning, line);
     // The tower is told. A reject is a radio event: the clearance it ends is
@@ -2660,7 +2761,8 @@ async fn reject(xp: &XPlaneClient, voice: &Option<Voice>, line: &str, reason: &s
     }
     crate::blackbox::record(
         "autotakeoff",
-        serde_json::json!({"event": "reject", "reason": reason, "radio_call": call}),
+        serde_json::json!({"event": "reject", "reason": reason, "radio_call": call,
+                           "at_off": at_off}),
     );
 }
 
@@ -3040,11 +3142,17 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, p: Params) {
                     serde_json::json!({"event": "handoff_airborne_abort"}),
                 );
             } else {
-                reject(
+                // The pilot's "reject the takeoff" flies the same stop as
+                // the loop's own rejects, to a standstill and the parking
+                // brake, before "your aircraft" (LEMG 13, 2026-09-28).
+                reject_rolling(
                     &xp,
                     &voice,
-                    "Rejecting takeoff. Throttle is idle, brakes on. Your aircraft.",
+                    "Rejecting takeoff.",
                     "pilot_abort",
+                    &rwy,
+                    &mut steer_law,
+                    p.park_brake_valve_set,
                 )
                 .await;
             }
@@ -3210,11 +3318,14 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, p: Params) {
         if !airborne {
             // Not accelerating: something is holding the aircraft.
             if elapsed > STAGNANT_SECS && gs_kts < STAGNANT_GS_KTS {
-                reject(
+                reject_rolling(
                     &xp,
                     &voice,
-                    "We're not accelerating. Rejecting takeoff. Your aircraft.",
+                    "We're not accelerating. Rejecting takeoff.",
                     "stagnant",
+                    &rwy,
+                    &mut steer_law,
+                    p.park_brake_valve_set,
                 )
                 .await;
                 return;
@@ -3222,7 +3333,16 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, p: Params) {
             let along_m = along_track_nm(lat, lon, &rwy) * M_PER_NM;
             let remaining = rwy.length_m - (-along_m).max(0.0);
             if !rotated && must_reject(remaining, ias, p.vr_kts) {
-                reject_rolling(&xp, &voice, "Runway is running out.", "runway_end", &rwy, &mut steer_law).await;
+                reject_rolling(
+                    &xp,
+                    &voice,
+                    "Runway is running out. Rejecting takeoff.",
+                    "runway_end",
+                    &rwy,
+                    &mut steer_law,
+                    p.park_brake_valve_set,
+                )
+                .await;
                 return;
             }
             // Steer the centreline: PD plus the learned P-factor trim,
@@ -3242,7 +3362,16 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, p: Params) {
                         serde_json::json!({"event": "excursion", "why": why,
                             "xtk_m": xtk_m, "off_course": off_course, "gs": gs_kts}),
                     );
-                    reject_rolling(&xp, &voice, "We're leaving the centreline.", "lateral_excursion", &rwy, &mut steer_law).await;
+                    reject_rolling(
+                        &xp,
+                        &voice,
+                        "We're leaving the centreline. Rejecting takeoff.",
+                        "lateral_excursion",
+                        &rwy,
+                        &mut steer_law,
+                        p.park_brake_valve_set,
+                    )
+                    .await;
                     return;
                 }
             }
@@ -3265,11 +3394,14 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, p: Params) {
                 );
             }
             if xp.set_float(TAXI_STEER, steer).await.is_err() {
-                reject(
+                reject_rolling(
                     &xp,
                     &voice,
-                    "I've lost the steering. Rejecting takeoff. Your aircraft.",
+                    "I've lost the steering. Rejecting takeoff.",
                     "steer_lost",
+                    &rwy,
+                    &mut steer_law,
+                    p.park_brake_valve_set,
                 )
                 .await;
                 return;
@@ -3340,11 +3472,14 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, p: Params) {
                     xp.set_float(TAKEOFF_ROLL, ail)
                 );
                 if wp.is_err() || wr.is_err() {
-                    reject(
+                    reject_rolling(
                         &xp,
                         &voice,
-                        "I've lost the elevator. Rejecting takeoff. Your aircraft.",
+                        "I've lost the elevator. Rejecting takeoff.",
                         "pitch_lost",
+                        &rwy,
+                        &mut steer_law,
+                        p.park_brake_valve_set,
                     )
                     .await;
                     return;
@@ -7691,5 +7826,267 @@ mod tests {
             east_west < 0.5 * split,
             "{east_west:.2} m east-west vs {split:.2} diagonal"
         );
+    }
+}
+
+/// The pilot's reject at LEMG 13 (2026-09-28, sortie 1790627884-full_auto,
+/// stock 737), replayed through a plant: the stop is flown, the throttles
+/// held at idle, the parking brake set once stopped, and only then "your
+/// aircraft".
+#[cfg(test)]
+mod reject_stop_tests {
+    use super::*;
+    use crate::xplane::FakeXPlane;
+    use std::sync::Mutex;
+    use tokio::time::Instant;
+
+    const AT_MODE: &str = crate::aircraft::TakeoffConfigProfile::AT_MODE;
+    const CMD_AT_OFF: &str = crate::aircraft::TakeoffConfigProfile::CMD_AT_OFF;
+    const GS: &str = "sim/flightmodel/position/groundspeed";
+    const PARK: &str = "sim/cockpit2/controls/parking_brake_ratio";
+    const SET: &str = "sim/flight_controls/park_brake_set";
+
+    /// Takeoff thrust's acceleration at 60 to 70 kt (the roll records:
+    /// 60.4 to 66.7 kt in 1.2 s) and its decay once the levers close (a
+    /// CFM56 spooling down from TOGA, fitted so one second of regular
+    /// brakes peaks where the sortie did, 73 kt).
+    const THRUST_KTS_S: f64 = 5.0;
+    const SPOOL_TAU_S: f64 = 1.5;
+    /// Coasting at idle, nobody braking: 73.3 kt at +76.8 to 52.7 at +116.
+    const COAST_KTS_S: f64 = 0.5;
+    /// Maximum braking, from the EGKK rejects (1790524628, 1790525414,
+    /// 1790525500): about 0.3 s before the brakes bite, a second to build,
+    /// then 8 to 15 kt/s tick to tick, 10.5 on the average.
+    const MAX_BRAKE_KTS_S: f64 = 10.5;
+    const REGULAR_BRAKE_KTS_S: f64 = 3.5;
+    const BRAKE_DEAD_S: f64 = 0.3;
+    const BRAKE_BUILD_S: f64 = 1.0;
+
+    #[derive(Default)]
+    struct State {
+        last: Option<Instant>,
+        gs_kts: f64,
+        idle_at: Option<Instant>,
+        /// The held brake command: effort, since (continuous), until.
+        brake: Option<(f64, Instant, Instant)>,
+        max_kts: f64,
+        gs_at_park: Option<f64>,
+        thrust_back: bool,
+    }
+
+    /// The 737 as the reject found it: rolling at `kts` on takeoff thrust,
+    /// the autothrottle `at_mode`.
+    struct RejectPlant {
+        sim: FakeXPlane,
+        st: Mutex<State>,
+    }
+
+    impl RejectPlant {
+        fn rolling_at_kts(kts: f64, at_mode: f64) -> Self {
+            let sim = FakeXPlane::with_reads(&[
+                (crate::datarefs::ON_GROUND_ANY, 1.0),
+                (crate::autotaxi::TUG_ATTACHED, 0.0),
+                (PARK, 0.0),
+                (AT_MODE, at_mode),
+                (sim::datarefs::LATITUDE, 0.0),
+                (sim::datarefs::LONGITUDE, 0.0),
+                (sim::datarefs::ELEVATION_M, 15.0),
+                ("sim/flightmodel/position/psi", 0.0),
+                ("sim/flightmodel/position/vh_ind_fpm", 0.0),
+                (sim::datarefs::AGL_METERS, 0.0),
+                (YAW_RATE, 0.0),
+            ]);
+            sim.step_on_command(SET, PARK, 1.0);
+            sim.set_on_command(CMD_AT_OFF, AT_MODE, 0.0);
+            let st = State { gs_kts: kts, max_kts: kts, ..Default::default() };
+            RejectPlant { sim, st: Mutex::new(st) }
+        }
+
+        /// Integrate to now in 10 ms steps.
+        fn advance(&self) {
+            let now = Instant::now();
+            let at_engaged = self.sim.read_value(AT_MODE).is_some_and(|m| m > 0.5);
+            let parked = self.sim.read_value(PARK).is_some_and(|p| p > 0.5);
+            let mut s = self.st.lock().unwrap();
+            let Some(mut t) = s.last else {
+                s.last = Some(now);
+                return;
+            };
+            let step = std::time::Duration::from_millis(10);
+            while t + step <= now {
+                t += step;
+                let thrust = match s.idle_at {
+                    _ if at_engaged => THRUST_KTS_S,
+                    None => THRUST_KTS_S,
+                    Some(i) => {
+                        THRUST_KTS_S * (-(t - i).as_secs_f64() / SPOOL_TAU_S).exp()
+                    }
+                };
+                let brake = match s.brake {
+                    _ if parked => MAX_BRAKE_KTS_S,
+                    Some((effort, since, until)) if t <= until => {
+                        let on = (t - since).as_secs_f64() - BRAKE_DEAD_S;
+                        effort * (on / BRAKE_BUILD_S).clamp(0.0, 1.0)
+                    }
+                    _ => 0.0,
+                };
+                let coast = if s.gs_kts > 0.0 { COAST_KTS_S } else { 0.0 };
+                s.gs_kts = (s.gs_kts + (thrust - brake - coast) * 0.01).max(0.0);
+                s.max_kts = s.max_kts.max(s.gs_kts);
+            }
+            s.last = Some(t);
+        }
+
+        fn gs_kts(&self) -> f64 {
+            self.advance();
+            self.st.lock().unwrap().gs_kts
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::xplane::XPlane for RejectPlant {
+        async fn get_float(&self, name: &str) -> anyhow::Result<f64> {
+            if name == GS {
+                return Ok(self.gs_kts() / MS_TO_KTS);
+            }
+            self.advance();
+            self.sim.get_float(name).await
+        }
+        async fn set_float(&self, name: &str, value: f64) -> anyhow::Result<()> {
+            self.advance();
+            if name.contains("throttle") {
+                let mut s = self.st.lock().unwrap();
+                if value > 0.05 {
+                    s.thrust_back = s.idle_at.is_some();
+                    s.idle_at = None;
+                } else if s.idle_at.is_none() {
+                    s.idle_at = Some(Instant::now());
+                }
+            }
+            self.sim.set_float(name, value).await
+        }
+        async fn set_int(&self, name: &str, value: i64) -> anyhow::Result<()> {
+            self.sim.set_int(name, value).await
+        }
+        async fn run_command(&self, name: &str) -> anyhow::Result<()> {
+            self.advance();
+            if name == SET {
+                let gs = self.st.lock().unwrap().gs_kts;
+                self.st.lock().unwrap().gs_at_park.get_or_insert(gs);
+            }
+            self.sim.run_command(name).await
+        }
+        async fn run_command_for(&self, name: &str, secs: f64) -> anyhow::Result<()> {
+            self.advance();
+            let effort = match name {
+                BRAKES_MAX => MAX_BRAKE_KTS_S,
+                crate::tools::BRAKES_REGULAR => REGULAR_BRAKE_KTS_S,
+                _ => 0.0,
+            };
+            if effort > 0.0 {
+                let now = Instant::now();
+                let until = now + std::time::Duration::from_secs_f64(secs);
+                let mut s = self.st.lock().unwrap();
+                let since = match s.brake {
+                    Some((_, since, prev_until)) if now <= prev_until => since,
+                    _ => now,
+                };
+                s.brake = Some((effort, since, until));
+            }
+            self.sim.run_command_for(name, secs).await
+        }
+        async fn get_float_array(&self, name: &str) -> anyhow::Result<Vec<f64>> {
+            self.sim.get_float_array(name).await
+        }
+        async fn set_int_array_elem(&self, name: &str, i: usize, v: i64) -> anyhow::Result<()> {
+            self.sim.set_int_array_elem(name, i, v).await
+        }
+        async fn set_float_array_elem(&self, name: &str, i: usize, v: f64) -> anyhow::Result<()> {
+            self.sim.set_float_array_elem(name, i, v).await
+        }
+    }
+
+    fn rwy_north() -> Runway {
+        Runway {
+            icao: "LEMG".into(),
+            id: "13".into(),
+            thr_lat: -0.001,
+            thr_lon: 0.0,
+            course_deg: 0.0,
+            length_m: 3200.0,
+            surface: 1,
+            dist_nm: 0.0,
+            elev_ft: 52.0,
+        }
+    }
+
+    /// The plant is the sortie: the old reject (idle and one second of the
+    /// regular brakes, then nobody) pushed the 737 from 69 to about 73 kt
+    /// on the spool-down and left it above 50 kt forty seconds on.
+    #[tokio::test(start_paused = true)]
+    async fn the_plant_reproduces_the_lemg_reject() {
+        let jet = RejectPlant::rolling_at_kts(69.2, 0.0);
+        jet.set_float(&throttle_dref(), 0.0).await.unwrap();
+        jet.run_command_for(crate::tools::BRAKES_REGULAR, 1.0).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_secs(6)).await;
+        jet.gs_kts();
+        let peak = jet.st.lock().unwrap().max_kts;
+        assert!((72.0..75.0).contains(&peak), "peak {peak:.1} kt, the sortie's 73.3");
+        tokio::time::sleep(std::time::Duration::from_secs(34)).await;
+        let gs = jet.gs_kts();
+        assert!(gs > 50.0, "{gs:.1} kt forty seconds on, the sortie's 52.7");
+    }
+
+    /// The fix: the reject owns the levers (idle every tick, an ENGAGED
+    /// autothrottle taken out and read back), brakes at maximum inside the
+    /// held command's expiry to a FULL stop on the centreline, and sets the
+    /// parking brake only once stopped (#112's caution never sees its own
+    /// brake rolling), read back, before "your aircraft".
+    #[tokio::test(start_paused = true)]
+    async fn a_rejected_takeoff_is_flown_to_a_stop_and_parked() {
+        let jet = RejectPlant::rolling_at_kts(69.2, 1.0);
+        let at_off = reject_hands(&jet).await;
+        assert_eq!(at_off, Some(true), "the engaged autothrottle is out, read back");
+        let mut law = RollSteer::for_airframe();
+        let stop = stop_on_centreline(&jet, &rwy_north(), &mut law).await;
+        let held = crate::full_auto::hand_back_hold(&jet, Some(1.0)).await;
+        let s = jet.st.lock().unwrap();
+        assert!(stop.stopped, "{stop:?}");
+        assert!(!s.thrust_back, "the levers never came back up");
+        assert!(
+            jet.sim.writes_to(&throttle_dref()).iter().all(|v| *v == 0.0),
+            "idle held: {:?}",
+            jet.sim.writes_to(&throttle_dref())
+        );
+        assert!(s.max_kts < 71.0, "peak {:.1} kt, never the sortie's 73.3", s.max_kts);
+        assert!(stop.secs < 12.0, "stopped in {:.1} s", stop.secs);
+        assert!(stop.brake_pulses >= 8, "maximum braking renewed: {stop:?}");
+        assert_eq!(held, Some(true), "the parking brake reads set");
+        let at_park = s.gs_at_park.expect("the parking brake was set");
+        assert!(at_park < 1.0, "parked at {at_park:.1} kt, not rolling");
+        assert!(s.gs_kts < 0.1, "held at {:.2} kt", s.gs_kts);
+        assert_eq!(
+            reject_end_line(&stop, held),
+            "Stopped. Parking brake set. Your aircraft."
+        );
+    }
+
+    /// Nothing claimed that did not read back.
+    #[test]
+    fn the_reject_says_only_what_holds_the_aircraft() {
+        let stopped = RejectStop { stopped: true, ..Default::default() };
+        let rolling = RejectStop::default();
+        assert!(reject_end_line(&stopped, Some(false)).contains("didn't set"));
+        assert!(!reject_end_line(&rolling, Some(false)).starts_with("Stopped"));
+        assert!(reject_end_line(&rolling, None).contains("couldn't stop"));
+    }
+
+    /// An engaged autothrottle moves the levers; armed and hard off do not.
+    #[test]
+    fn only_an_engaged_autothrottle_is_taken_out() {
+        use crate::takeoff_config::autothrottle_engaged;
+        assert!(!autothrottle_engaged(-1.0) && !autothrottle_engaged(0.0));
+        assert!(autothrottle_engaged(1.0) && autothrottle_engaged(2.0));
+        assert!(!autothrottle_engaged(f64::NAN));
     }
 }

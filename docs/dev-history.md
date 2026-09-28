@@ -10263,3 +10263,55 @@ groundspeed unreadable, off the ground, the speed to one decimal). A failed sett
 only that case. Test `a_stopped_aircraft_at_the_bound_settles` (the recorded groundspeeds).
 Still open: an airliner coasting from a reject at idle takes minutes, past the 60 s bound.
 Offline only.
+
+## 2026-09-28: a reject is flown to a stop and parked, and a readback goes out once (#112, #172)
+
+Runner 737 LEMG 13, sortie 1790627884-full_auto (build 81acff5), times from +0. The pilot's "reject
+the takeoff" at +71.2 (60 kt IAS, 69 kt GS) ran the loop's REJECT branch, which was the bare
+`reject`: throttle 0, ONE second of `brakes_regular`, "Rejecting takeoff. Throttle is idle, brakes
+on. Your aircraft." and return. Only the runway-end and excursion rejects flew
+`stop_on_centreline`, and that stopped at 20 kt. The throttle read 0.0 in every `state` record and
+the autothrottle was armed, not engaged (`ap_state` 132 carries no A/T bit): the rise from 67.9 to
+73.3 kt by +76.8 was the CFM56 spooling down from takeoff thrust with nothing braking. The circuit
+then stood down (`takeoff_not_completed`), full auto's circuit branch found no autoland
+(`no_autoland`) and the sortie ENDED instead of giving up, and the hand-back skipped a fast
+aircraft (`HAND_BACK_BRAKE_MAX_KTS`, "the loop that owns the speed does the stopping"), which no
+loop owned: 70 to 52 kt for two minutes at 0.5 kt/s until a park brake from outside.
+
+Now every ground reject (pilot, stagnant, steering or elevator lost, runway end, excursion) is
+`reject_rolling`: `reject_hands` (idle, an ENGAGED autothrottle out and read back,
+`takeoff_config::autothrottle_off`, blackbox `reject_autothrottle_off`; maximum braking at once),
+`stop_on_centreline` to a FULL stop (`REJECT_STOPPED_KTS` 1 kt: idle written every tick, the A/T
+looked at every second, `brakes_max` every 0.8 s, the roll law steering above 3 kt), then
+`full_auto::hand_back_hold` for the parking brake once the held brake has let go of the ratio,
+and only then `reject_end_line` ("Stopped. Parking brake set. Your aircraft.", or what did not
+read back); blackbox `reject_stopped` with `from_kts`, `max_kts`, `secs`, `brake_pulses`,
+`park_held`. The run's outcome stays `Failed(reason)` while the thread stops the aircraft, so the
+circuit and full auto wait for it; the circuit records why it stood down (`circuit::stood_down`)
+and full auto's circuit mission gives up `takeoff_not_completed` (`circuit_takeoff_failed`), the
+flight path with a "rejected" line. `hand_back_hold` no longer skips a fast aircraft: it brakes to
+a stop, `brakes_max` above 25 kt, over `hand_back_stop_s` (0.6 s per knot, 15 s floor), unless a
+pilot is on the toe brakes (`pilot_on_the_brakes`, skipped `pilot_braking`). The plant
+(`reject_stop_tests`): takeoff thrust 5 kt/s decaying with a 1.5 s spool, coasting 0.5 kt/s, and
+the EGKK rejects' maximum braking (1790524628, 1790525414, 1790525500: 0.3 s before it bites, a
+second to build, 10.5 kt/s); it reproduces the sortie (the old reject peaks at 73.3 kt, 55.8 kt
+forty seconds on) and the new stop peaks at 70.9 kt, stops in 7.8 s and parks at 0 kt.
+
+Same sortie, the radio. The circuit clearance's readback was queued at +13.7 (`clearance_readback`)
+and, still queued at +34.0, again by the held wait's `OwedReadback` (which knew only its own
+sends); the first went out at +36.1 (intent Unknown, silence: heard), the copy at +63.2 in the
+roll, earning "read back: ... cleared for takeoff". A readback is now recorded as it is queued and
+as it goes out (`circuit::transmit_readback`, `last_readback`, `note_readback_out` from the main
+loop's routing), `OwedReadback::due` judges that record (never while the same words are queued,
+again only 30 s after they went OUT), and a copy of the tower's words goes out only while the tower
+still waits for them (`owed_copy_stale`, `crew_radio_stale` why `not_owed`). The roll began at
++52.8 on the tower's TakeoffCleared state, before the spoken "cleared for takeoff" at +53.5, and
+the readback went out at +71.2: `ensure_takeoff_cleared` now waits, bounded at 45 s, for its
+takeoff or line-up readback to go out and the frequency to go quiet (`readback_before_moving`,
+blackbox `full_auto` `readback_out`). Tests `a_rejected_takeoff_is_flown_to_a_stop_and_parked`,
+`the_plant_reproduces_the_lemg_reject`, `a_fast_hand_back_on_the_ground_is_braked_to_a_stop`,
+`a_circuit_whose_takeoff_was_rejected_gives_up`,
+`a_held_crew_reads_back_the_hold_before_asking_again`,
+`a_readback_copy_goes_out_only_while_the_tower_waits_for_it`,
+`the_roll_waits_for_the_takeoff_readback`.
+Offline only.

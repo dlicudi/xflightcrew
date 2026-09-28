@@ -356,6 +356,32 @@ pub fn autothrottle_step(mode: f64) -> Option<&'static str> {
     }
 }
 
+/// An autothrottle mode ENGAGED (`autothrottle_enabled` above zero): it
+/// moves the levers. Armed (0) and hard off (-1) do not. Pure.
+pub fn autothrottle_engaged(mode: f64) -> bool {
+    mode.is_finite() && mode.round() as i64 > 0
+}
+
+/// A reject owns the levers: an ENGAGED autothrottle is taken out and read
+/// back. `None` when none was engaged or it could not be read (nothing to
+/// take out, nothing claimed); `Some(out)` when it was, with the read-back.
+pub async fn autothrottle_off(xp: &dyn XPlane) -> Option<bool> {
+    let mode = xp.get_float(AT_MODE).await.ok()?;
+    if !autothrottle_engaged(mode) {
+        return None;
+    }
+    let _ = xp.run_command(CMD_AT_OFF).await;
+    let out = xp
+        .get_float(AT_MODE)
+        .await
+        .is_ok_and(|v| v.is_finite() && !autothrottle_engaged(v));
+    crate::blackbox::record(
+        "autotakeoff",
+        serde_json::json!({"event": "reject_autothrottle_off", "was": mode, "out": out}),
+    );
+    Some(out)
+}
+
 async fn autothrottle_armed(xp: &dyn XPlane, out: &mut Outcome) {
     match xp.get_float(AT_MODE).await {
         Ok(at) => {

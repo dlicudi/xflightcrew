@@ -1105,6 +1105,66 @@ pub struct Queued {
     pub call: CrewCall,
     pub holds: Holds,
     pub at: std::time::Instant,
+    /// Whether the call is a readback, and whose words it copies.
+    pub readback: Readback,
+}
+
+/// A queued call as a readback. An `OwedCopy` is the tower's own suggested
+/// words (`party_line::readback_owed`), read back only while the tower still
+/// waits for THEM: LEMG 13 (2026-09-28, sortie 1790627884-full_auto) queued
+/// the circuit clearance's readback at +13.7 and again at +34.0 (the first
+/// had not gone out), and the second went out at +63.2 in the takeoff roll,
+/// earning "read back: ... cleared for takeoff". `Own` is the crew's own
+/// words ("cleared for takeoff runway one three"), judged by the tower.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Readback {
+    No,
+    Own,
+    OwedCopy,
+}
+
+/// The crew's latest readback: its words, when queued and when it went out
+/// (routed to the frequency, or discarded with the radio). One slot: a crew
+/// reads back one instruction at a time.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ReadbackRec {
+    pub words: String,
+    pub queued_at: std::time::Instant,
+    pub out_at: Option<std::time::Instant>,
+}
+
+static LAST_READBACK: Mutex<Option<ReadbackRec>> = Mutex::new(None);
+
+/// A call's words for comparing readbacks: lower case, no closing stop.
+pub fn readback_words(call: &str) -> String {
+    call.trim().trim_end_matches('.').trim().to_ascii_lowercase()
+}
+
+/// An owed-words copy that is no longer what the tower waits for: it was
+/// heard (nothing owed) or the tower now waits for another readback. Pure.
+pub fn owed_copy_stale(call: &str, owed: Option<&str>) -> bool {
+    !owed.is_some_and(|o| readback_words(o) == readback_words(call))
+}
+
+/// The latest readback's record, if any.
+pub fn last_readback() -> Option<ReadbackRec> {
+    LAST_READBACK.lock().unwrap_or_else(|e| e.into_inner()).clone()
+}
+
+/// The readback of `call` has gone out (or was discarded with the radio):
+/// the main loop's word, as it routes it.
+pub fn note_readback_out(call: &str) {
+    let words = readback_words(call);
+    let mut rec = LAST_READBACK.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(r) = rec.as_mut().filter(|r| r.words == words && r.out_at.is_none()) {
+        r.out_at = Some(std::time::Instant::now());
+    }
+}
+
+/// Whether the readback of `call` has gone out.
+pub fn readback_out(call: &str) -> bool {
+    let words = readback_words(call);
+    last_readback().is_some_and(|r| r.words == words && r.out_at.is_some())
 }
 
 /// The facts a queued call is judged against as it is about to go out, read
@@ -1258,6 +1318,10 @@ pub fn crew_radio_pending() -> bool {
 /// identical "5 mile final" reports in the same tenth of a second
 /// (2026-09-28).
 fn enqueue(call: CrewCall) {
+    enqueue_as(call, Readback::No);
+}
+
+fn enqueue_as(call: CrewCall, readback: Readback) {
     let mut q = CREW_RADIO.lock().unwrap_or_else(|e| e.into_inner());
     if q.back().is_some_and(|b| b.call == call) {
         drop(q);
@@ -1272,6 +1336,7 @@ fn enqueue(call: CrewCall) {
         call,
         holds,
         at: std::time::Instant::now(),
+        readback,
     });
 }
 
@@ -1279,6 +1344,20 @@ fn enqueue(call: CrewCall) {
 /// orchestrator can request taxi through the same channel.
 pub fn transmit(call: String) {
     enqueue(CrewCall::Text(call));
+}
+
+/// Queue a READBACK: recorded, so the crew never queues the same words again
+/// before they have gone out ([`last_readback`]) and the roll can wait for
+/// them ([`readback_out`]). `owed_copy` marks the tower's own suggested
+/// words, which die once the tower no longer waits for them.
+pub fn transmit_readback(call: String, owed_copy: bool) {
+    *LAST_READBACK.lock().unwrap_or_else(|e| e.into_inner()) = Some(ReadbackRec {
+        words: readback_words(&call),
+        queued_at: std::time::Instant::now(),
+        out_at: None,
+    });
+    let kind = if owed_copy { Readback::OwedCopy } else { Readback::Own };
+    enqueue_as(CrewCall::Text(call), kind);
 }
 
 /// Queue the departure check-in, rendered with the live altitude when spoken.
@@ -2855,6 +2934,7 @@ pub fn start(base_url: String, voice: Option<Voice>, p: Params) {
         return;
     }
     ABORT.store(false, Ordering::SeqCst);
+    *STOOD_DOWN.lock().unwrap_or_else(|e| e.into_inner()) = None;
     std::thread::spawn(move || {
         let Ok(rt) = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -2878,9 +2958,26 @@ fn alert(voice: &Option<Voice>, priority: Priority, line: &str) {
     }
 }
 
+/// Why the running (or last) circuit stood down, `None` while it has not:
+/// full auto's circuit mission ends as the takeoff's give-up when the
+/// takeoff never completed, instead of a silent "ended" (LEMG 13,
+/// 2026-09-28, sortie 1790627884-full_auto: a rejected takeoff ended the
+/// mission as `no_autoland`).
+static STOOD_DOWN: std::sync::Mutex<Option<&'static str>> = std::sync::Mutex::new(None);
+
+/// The reason the last circuit stood down, if it did.
+pub fn stood_down() -> Option<&'static str> {
+    *STOOD_DOWN.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// The circuit's takeoff never completed: a reject, a pilot taking the
+/// roll, or a takeoff that handed back on the ground.
+pub const TAKEOFF_NOT_COMPLETED: &str = "takeoff_not_completed";
+
 /// Bail out cleanly: clear our flag and let whatever sub-loop is flying stand
 /// down. Never leaves the aircraft with nobody watching the loop.
-fn stand_down(voice: &Option<Voice>, line: &str, reason: &str) {
+fn stand_down(voice: &Option<Voice>, line: &str, reason: &'static str) {
+    *STOOD_DOWN.lock().unwrap_or_else(|e| e.into_inner()) = Some(reason);
     ACTIVE.store(false, Ordering::SeqCst);
     crate::blackbox::record(
         "circuit",
@@ -3108,12 +3205,16 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, p: Params
             break;
         }
     }
-    if autotakeoff::outcome() != Some(sim::run::Outcome::Completed) {
-        stand_down(
-            &voice,
-            "The takeoff handed control back. Your aircraft.",
-            "takeoff_not_completed",
-        );
+    let outcome = autotakeoff::outcome();
+    if outcome != Some(sim::run::Outcome::Completed) {
+        // A reject has already stopped, parked and said "your aircraft".
+        let line = match outcome {
+            Some(sim::run::Outcome::Failed(_)) => {
+                "The takeoff was rejected, so the circuit is off."
+            }
+            _ => "The takeoff handed control back. Your aircraft.",
+        };
+        stand_down(&voice, line, TAKEOFF_NOT_COMPLETED);
         return;
     }
     let agl_ft = xp.get_float(AGL_M).await.unwrap_or(0.0) * M_TO_FT;
@@ -7228,5 +7329,28 @@ mod issue_169_tests {
         assert_eq!(detent_above(0.25, &limits), Some(0.5));
         assert_eq!(detent_above(0.5, &limits), Some(1.0));
         assert_eq!(detent_above(1.0, &limits), None);
+    }
+}
+
+/// #172, LEMG 13 (2026-09-28, sortie 1790627884-full_auto): the circuit
+/// clearance's readback, queued at +13.7 and again at +34.0, went out at
+/// +36.1 (the tower's silence: heard) and again at +63.2 in the takeoff roll.
+#[cfg(test)]
+mod readback_tests {
+    use super::*;
+
+    #[test]
+    fn a_readback_copy_goes_out_only_while_the_tower_waits_for_it() {
+        let copy = "Runway one three, circuit height one thousand feet, QNH one zero one \
+                    seven, squawk four five zero one, November eight one six November November";
+        let owed = format!("{copy}.");
+        // +36.1: the tower still waits for these words.
+        assert!(!owed_copy_stale(copy, Some(&owed)));
+        // +63.2: heard, and the tower now waits for the takeoff's readback.
+        assert!(owed_copy_stale(copy, None));
+        let takeoff = "Cleared for takeoff runway one three, November eight one six November \
+                       November.";
+        assert!(owed_copy_stale(copy, Some(takeoff)));
+        assert_eq!(readback_words(&owed), readback_words(copy));
     }
 }
