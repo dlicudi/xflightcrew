@@ -9924,3 +9924,14 @@ BugHold level and turn base. A takeoff now clears an inherited autopilot on the 
 reads the servos; the circuit's `PatternGuard` gives up past 1,500 ft over the pattern, a leg past 2.5x
 its length, or servos out (the recording is given back at 3,302 ft, 46 s after the handoff); a sortie
 ending airborne fails. Offline only.
+
+## 2026-09-28: an occupant is the pavement's; stale ghosts; re-sequence after an order (issue #162)
+
+LEMG 30 SR22 (sortie 1790610218-approach): ordered round at 1.08 nm (VY3149) and 0.95 nm (VL1834), both
+"stays", no position on file. VL1834 was not on the strip at the final report and no go_around_deferred
+was logged, so it arrived within ~27 s of the order while the live stream landed 12: a head-on lander
+with no velocity on its first ground sample. Now: occupancy is the paved half-width + 5 m
+(`on_runway_pavement`), tracks include airborne samples (`Oncoming`), a ghost standing 300 s is stale
+(`ghost_stale`), and an order for traffic that will not leave re-sequences (`resequence_runway`: 12 in
+300/4; another runway for a standing occupant; else hold). Root cause left open: a stated calm runway
+cleared against a live arrival stream nobody remembered (arrival-stream memory owed, #164). Offline only.

@@ -313,7 +313,11 @@ Config: `XCOPILOT_ATC_AIRPORT` / `_VOICE` / `_RATE` / `_REGION`.
   comes only inside 60 s of the threshold, when an occupant judged from its track (`strip_exit`) will
   not be off 10 s before we cross (blackbox `landing_withheld`, `landing_released`,
   `go_around_deferred`, `go_around_judged`; LEMG 13 2026-09-28: ordered around at 3.8 nm for a
-  departure airborne 81 s later).
+  departure airborne 81 s later); **an occupant is the PAVEMENT's** (`on_runway_pavement`), judged
+  from a track that includes its airborne samples (a lander rolling at us is `Oncoming`), a ghost
+  standing 5 min is stale data (`ghost_stale`); **an order for traffic that will not leave
+  re-sequences** (`resequence_runway`: the reciprocal with oncoming traffic, else another runway never
+  against a live stream, "expect runway X", blackbox `resequenced`), else the tower holds (LEMG 30, #162).
 - **Taxi routes**: Dijkstra over apt.dat 1201/1202; crossings from strip GEOMETRY, never network
   flags; a crossing on the cleared route is never berated. A runway destination snaps to a node
   that can REACH the runway, per CALLER, ON THE DESTINATION STRIP's own pavement (LFPB 2026-09-22).
