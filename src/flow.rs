@@ -236,6 +236,17 @@ pub fn find_titled(lists: &[Checklist], request: &str) -> Result<usize, Vec<Stri
 pub struct Sample {
     pub agl_ft: f64,
     pub vsi_fpm: f64,
+    /// An automation has the aircraft (the list would run as Monitor).
+    pub automation: bool,
+    /// Gear down and flaps at the landing detent ([`landing_config`]).
+    pub landing_config: bool,
+}
+
+/// The landing configuration the BEFORE LANDING list audits: the gear down
+/// (a fixed gear reads down) and the flap handle at the landing detent, or
+/// an airframe with no flap profile. Pure.
+pub fn landing_config(gear_down: bool, flap_ratio: f64, has_flaps: bool) -> bool {
+    gear_down && (!has_flaps || flap_ratio >= crate::autoland::LANDING_FLAP_RATIO)
 }
 
 /// Climb list once the climb is established, not at liftoff, and AFTER the
@@ -371,7 +382,14 @@ impl Tracker {
             s.agl_ft < BEFORE_LANDING_AGL_FT && s.vsi_fpm < -100.0 && peak >= 1000.0,
             BEFORE_LANDING_SECS,
         );
-        if low && !self.fired("before landing") {
+        // Under an automation the list audits the landing configuration, so
+        // it waits for it: a circuit's downwind descent is low and sinking
+        // long before autoland configures, and the A330's Monitor list ran
+        // at +527 s against the config set at +667 s, five items "not as
+        // listed" (LEMG 13, sortie 1790621184-full_auto, #169). A pilot
+        // flying is proposed the list on the old trigger.
+        let configured = !s.automation || s.landing_config;
+        if low && configured && !self.fired("before landing") {
             return self.fire("before landing");
         }
         None
@@ -380,7 +398,7 @@ impl Tracker {
 
 /// Is an automation flying the aircraft (so the copilot is the pilot flying
 /// and the list is its own cross-check)?
-fn automation_flying() -> bool {
+pub fn automation_flying() -> bool {
     use std::sync::atomic::Ordering::Relaxed;
     crate::full_auto::ACTIVE.load(Relaxed)
         || crate::procedure::ACTIVE.load(Relaxed)
@@ -1637,6 +1655,9 @@ mod tests {
         secs: f64,
         agl: f64,
         fired: Vec<(f64, &'static str)>,
+        /// An automation flying, and whether it has configured to land.
+        automation: bool,
+        configured: bool,
     }
 
     impl Rig {
@@ -1648,6 +1669,8 @@ mod tests {
                 secs: 0.0,
                 agl: 0.0,
                 fired: Vec::new(),
+                automation: false,
+                configured: false,
             }
         }
         /// `n` seconds on the ground at `gs`, or airborne at `vsi` (the
@@ -1673,7 +1696,12 @@ mod tests {
                 };
                 let ev = self.f.tick(&fs);
                 let now = self.t0 + Duration::from_secs_f64(self.secs);
-                let s = Sample { agl_ft: self.agl, vsi_fpm: vsi };
+                let s = Sample {
+                    agl_ft: self.agl,
+                    vsi_fpm: vsi,
+                    automation: self.automation,
+                    landing_config: self.configured,
+                };
                 if let Some(sec) = self.t.tick(&s, &self.f, &ev, now) {
                     self.fired.push((self.agl, sec));
                 }
@@ -1739,6 +1767,36 @@ mod tests {
         // Base and final: before landing only.
         r.fly(100, false, -500.0, 80.0);
         assert_eq!(r.names(), vec!["climb", "before landing"]);
+    }
+
+    /// #169: under an automation the BEFORE LANDING list audits the landing
+    /// configuration, so a circuit's downwind descent does not run it; it
+    /// runs once gear and landing flap are set. A pilot flying keeps the
+    /// old trigger (a proposal, which the pilot answers when configured).
+    #[test]
+    fn an_automations_before_landing_list_waits_for_the_landing_config() {
+        let mut r = Rig::new();
+        r.automation = true;
+        r.fly(5, true, 0.0, 0.0).fly(8, true, 0.0, 50.0);
+        r.fly(130, false, 700.0, 75.0);
+        assert_eq!(r.names(), vec!["climb"]);
+        // Downwind and base, descending, clean: no list.
+        r.fly(60, false, -500.0, 80.0);
+        assert_eq!(r.names(), vec!["climb"], "{:?}", r.fired);
+        // Autoland's landing configuration: the list, at once.
+        r.configured = true;
+        r.fly(1, false, -500.0, 80.0);
+        assert_eq!(r.names(), vec!["climb", "before landing"]);
+
+        let mut p = Rig::new();
+        p.fly(5, true, 0.0, 0.0).fly(8, true, 0.0, 50.0);
+        p.fly(130, false, 700.0, 75.0).fly(60, false, -500.0, 80.0);
+        assert_eq!(p.names(), vec!["climb", "before landing"]);
+
+        assert!(landing_config(true, 1.0, true));
+        assert!(!landing_config(true, 0.75, true), "CONF 3 is not the landing flap");
+        assert!(!landing_config(false, 1.0, true), "gear up");
+        assert!(landing_config(true, 0.0, false), "no flaps to set");
     }
 
     /// An impact is no landing, and a wreck runs no list (the S-76 at LILB,

@@ -326,6 +326,97 @@ pub fn paced_flap_step(
         .filter(|_| deployed.is_some_and(|d| crate::takeoff_config::flaps_arrived(d, commanded)))
 }
 
+/// A deploy reading this still, over [`FLAP_SETTLE_S`] of reads, has stopped.
+pub const FLAP_SETTLE_BAND: f64 = 0.01;
+/// How long a deploy reading must hold still to count as settled, seconds.
+pub const FLAP_SETTLE_S: f64 = 4.0;
+/// A gap between reads longer than this starts the settle clock again.
+const FLAP_SETTLE_GAP_S: f64 = 2.0;
+/// A withheld step is blackboxed at most this often, seconds.
+const FLAP_WITHHELD_LOG_S: f64 = 10.0;
+
+/// The flaps' own pace for a retraction walk (#169). The flaps have arrived
+/// at the commanded detent when the deploy reading is within
+/// [`crate::takeoff_config::flaps_arrived`] of it, OR when it has moved off
+/// the detent the last step left and stopped ([`FLAP_SETTLE_BAND`] over
+/// [`FLAP_SETTLE_S`] of reads). The stock A330 (LEMG 13, sortie
+/// 1790621184-full_auto, 2026-09-28) selected CONF 1 at +360 s and never
+/// stepped again, the speed past the 210 retract speed for most of a
+/// minute: its deploy ratio never came within 0.03 of the handle. A
+/// reading that never left the old detent is not settled (a jammed flap is
+/// not an arrival). A failed read is no measurement.
+#[derive(Debug, Clone, Default)]
+pub struct FlapPace {
+    from: Option<f64>,
+    reads: Vec<(f64, f64)>,
+    withheld_at: Option<f64>,
+}
+
+impl FlapPace {
+    /// A step was taken from `from`: the settle clock starts again.
+    pub fn stepped(&mut self, from: f64) {
+        *self = Self {
+            from: Some(from),
+            ..Self::default()
+        };
+    }
+
+    /// Whether the flaps count as arrived at `commanded`, fed the reading
+    /// taken at `t_s` (seconds on any monotonic clock).
+    pub fn arrived(&mut self, t_s: f64, commanded: f64, deployed: Option<f64>) -> bool {
+        let Some(d) = deployed.filter(|d| d.is_finite()) else {
+            return false;
+        };
+        if crate::takeoff_config::flaps_arrived(d, commanded) {
+            return true;
+        }
+        if self
+            .reads
+            .last()
+            .is_some_and(|(t, _)| t_s < *t || t_s - t > FLAP_SETTLE_GAP_S)
+        {
+            self.reads.clear();
+        }
+        self.reads.push((t_s, d));
+        while self.reads.len() >= 2 && t_s - self.reads[1].0 >= FLAP_SETTLE_S {
+            self.reads.remove(0);
+        }
+        let span = t_s - self.reads[0].0;
+        let (lo, hi) = self
+            .reads
+            .iter()
+            .fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), (_, r)| {
+                (lo.min(*r), hi.max(*r))
+            });
+        let moved = self
+            .from
+            .is_some_and(|f| !crate::takeoff_config::flaps_arrived(d, f));
+        moved && span >= FLAP_SETTLE_S && hi - lo < FLAP_SETTLE_BAND
+    }
+
+    /// The deploy reading as [`paced_flap_step`] should judge it: the
+    /// commanded detent itself once [`Self::arrived`], else the reading.
+    pub fn judged(&mut self, t_s: f64, commanded: f64, deployed: Option<f64>) -> Option<f64> {
+        if self.arrived(t_s, commanded, deployed) {
+            Some(commanded)
+        } else {
+            deployed
+        }
+    }
+
+    /// Whether a step the speed allows but the pace withheld is due a
+    /// blackbox line: the first, then every [`FLAP_WITHHELD_LOG_S`].
+    pub fn withheld_log_due(&mut self, t_s: f64) -> bool {
+        let due = self
+            .withheld_at
+            .is_none_or(|t| t_s < t || t_s - t >= FLAP_WITHHELD_LOG_S);
+        if due {
+            self.withheld_at = Some(t_s);
+        }
+        due
+    }
+}
+
 /// The call for a retraction step to `to`, named by its detent the way a
 /// crew calls it: "Flaps one.", "Flaps up.". Without a name it is the old
 /// vague line. Two steps 0.5 s apart both said "Flaps coming up a stage."
@@ -2851,6 +2942,8 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, p: Params) {
     let mut flaps_retracted = p.takeoff_flap_ratio.unwrap_or(0.0) <= 0.01;
     // The setting the law believes is selected, for the schedule to walk down.
     let mut flap_cmd = p.takeoff_flap_ratio.unwrap_or(0.0);
+    // The flaps' own pace for the clean-up walk (#169).
+    let mut flap_pace = FlapPace::default();
 
     let mut airborne = false;
     let mut rotated = false;
@@ -3325,7 +3418,20 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, p: Params) {
                 // every tick of the roll. A failed read is no measurement:
                 // no step on it.
                 let deployed = xp.get_float(crate::takeoff_config::FLAP_DEPLOY).await.ok();
-                if let Some(next) = paced_flap_step(&p.flap_schedule, flap_cmd, deployed, ias) {
+                let t_s = roll_start.elapsed().as_secs_f64();
+                let judged = flap_pace.judged(t_s, flap_cmd, deployed);
+                let step = paced_flap_step(&p.flap_schedule, flap_cmd, judged, ias);
+                if step.is_none() && flap_pace.withheld_log_due(t_s) {
+                    crate::blackbox::record(
+                        "autotakeoff",
+                        serde_json::json!({
+                            "event": "flap_step_withheld", "at": flap_cmd, "ias": ias,
+                            "agl_ft": agl_ft, "deployed": deployed,
+                        }),
+                    );
+                }
+                if let Some(next) = step {
+                    flap_pace.stepped(flap_cmd);
                     flap_cmd = next;
                     flaps_retracted = next <= 1e-6;
                     let _ = xp.set_float(FLAP_HANDLE, next).await;
@@ -4063,6 +4169,59 @@ mod tests {
         assert_eq!(paced_flap_step(&sched, 0.25, Some(0.26), 215.0), Some(0.125));
         // Arrived but too slow is still too slow.
         assert_eq!(paced_flap_step(&sched, 0.125, Some(0.125), 200.0), None);
+    }
+
+    /// #169: the stock A330's deploy ratio never came within 0.03 of CONF 1's
+    /// handle, and the walk never stepped again. A reading that left the old
+    /// detent and stopped counts as arrived; one still moving, one that never
+    /// left the old detent (a jammed flap), or a failed read does not.
+    #[test]
+    fn a_stalled_deploy_reading_still_steps() {
+        // The A330's schedule: CONF 1 (0.25) cleans up above 210.
+        let sched = [(0.0, 210.0), (0.25, 180.0)];
+        let mut pace = FlapPace::default();
+        pace.stepped(0.5);
+        let step = |pace: &mut FlapPace, t: f64, d: Option<f64>| {
+            let judged = pace.judged(t, 0.25, d);
+            paced_flap_step(&sched, 0.25, judged, 212.0)
+        };
+        // Travelling from CONF 2: no step.
+        assert_eq!(step(&mut pace, 0.0, Some(0.45)), None);
+        assert_eq!(step(&mut pace, 1.0, Some(0.40)), None);
+        // Stopped short at 0.33, 0.005 of wander: not yet four seconds.
+        for i in 0..8 {
+            let t = 2.0 + i as f64 * 0.5;
+            let d = 0.33 + if i % 2 == 0 { 0.0 } else { 0.004 };
+            assert_eq!(step(&mut pace, t, Some(d)), None, "t {t}");
+        }
+        // Four seconds still: the step.
+        assert_eq!(step(&mut pace, 6.0, Some(0.332)), Some(0.0));
+        // A failed read is no measurement.
+        assert_eq!(step(&mut pace, 6.5, None), None);
+        // A gap in the reads starts the clock again.
+        assert_eq!(step(&mut pace, 20.0, Some(0.332)), None);
+
+        // Jammed at the detent the step left: never an arrival.
+        let mut jam = FlapPace::default();
+        jam.stepped(0.5);
+        for i in 0..40 {
+            assert_eq!(step(&mut jam, i as f64 * 0.5, Some(0.5)), None);
+        }
+        // Still creeping (0.02 in 4 s): not settled.
+        let mut creep = FlapPace::default();
+        creep.stepped(0.5);
+        for i in 0..20 {
+            let t = i as f64 * 0.5;
+            assert_eq!(step(&mut creep, t, Some(0.40 - t * 0.005)), None, "t {t}");
+        }
+        // Arrived inside the tolerance needs no settling at all.
+        let mut near = FlapPace::default();
+        assert_eq!(step(&mut near, 0.0, Some(0.26)), Some(0.0));
+        // The withheld line: the first, then every ten seconds.
+        let mut log = FlapPace::default();
+        assert!(log.withheld_log_due(0.0));
+        assert!(!log.withheld_log_due(5.0));
+        assert!(log.withheld_log_due(10.0));
     }
 
     #[test]

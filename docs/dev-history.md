@@ -10049,3 +10049,24 @@ builders now drive only the lead-on points still ahead (`lead_on_ahead`: past th
 projection onto the stub, and over 5 m from it). The 3.54 m step at 1790586103.4 was at 5 kt, lat 3.2
 m and err 12 to 15 degrees: a vertex cut while rolling, not a stopped aircraft. Test
 `a_line_up_from_past_the_hold_never_runs_back_to_it`. Offline only.
+
+## 2026-09-28: the A330 circuit flew 224 kt on CONF 1, placard 215 (issue #169)
+
+LEMG 13 runway-start circuit (sortie 1790621184-full_auto): three faults. (1) The throttle held the
+clean-up's 212.5 (CONF 1, `go_around_speed_kts`) while the climb limiter granted full rate only at
+220 (`climb_full_rate_kts` of the pattern speed 227.5, Vy 220): at 210 it faded the climb 479 to 140
+fpm (+376 to +381 s) with the lever still easing off TOGA, the climb given up went into speed, 224 kt
+on the crosswind, "Flap overspeed" at +396 s. One speed per leg now (`leg_want_kts`, logged
+`want_kts`) feeds both. (2) The clean floor (1.15 Vs clean, 201.25) sat over CONF 2's 196 placard,
+so the upwind from the 178 kt handover commanded 0 fpm for ten seconds; a kept flap's floor is the
+stall IN that configuration (`leg_climb_floor_kts`, `climb_floor_in_config`; blue line stays;
+logged `climb_floor`). (3) `climb_flap_step` 0.5 to 0.25 at +360 s, then never again though the
+speed passed 210 repeatedly: the deploy ratio never came within 0.03 of the handle (the stock A330's
+CONF 1 is slats only; unconfirmed, the reading was not logged). `autotakeoff::FlapPace`: a reading
+that left the old detent and held within 0.01 for 4 s counts as arrived, in both walks; a withheld
+step is blackboxed `flap_step_withheld` with `deployed`. Also: the Monitor BEFORE LANDING list ran
+at +527 s on the downwind descent, before autoland's landing config (+667 s), and flagged five items;
+under an automation it now waits for gear down and landing flap (`flow::Sample.landing_config`). The
+737 hands over clean and is unchanged. Tests in `circuit::issue_169_tests`,
+`a_stalled_deploy_reading_still_steps`,
+`an_automations_before_landing_list_waits_for_the_landing_config`. Offline only.

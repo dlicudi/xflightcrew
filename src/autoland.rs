@@ -3908,7 +3908,7 @@ const TERRAIN_FLOOR_AGL_FT: f64 = 500.0;
 /// Fast by more than this on final and the speed law may still idle a jet.
 const APPROACH_FAST_KTS: f64 = 10.0;
 /// The flap ratio that is the landing configuration (the schedule's full).
-const LANDING_FLAP_RATIO: f64 = 0.999;
+pub(crate) const LANDING_FLAP_RATIO: f64 = 0.999;
 /// The lever's idle stop in the speed law.
 const IDLE_THROTTLE: f64 = 0.1;
 
