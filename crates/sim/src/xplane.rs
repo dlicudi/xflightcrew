@@ -97,7 +97,7 @@ const SLOW_DATAREF_TTL: std::time::Duration = std::time::Duration::from_millis(5
 /// name that is not there (a request of frame time each), so a miss is
 /// remembered for [`ABSENT_RECHECK`] and asked again after, which also
 /// finds the dataref once a newer plugin is reloaded.
-const OPTIONAL_DATAREFS: &[&str] = &["xcopilot/position"];
+const OPTIONAL_DATAREFS: &[&str] = &["xcopilot/position", SIM_LOADING];
 /// How long a missing [`OPTIONAL_DATAREFS`] name is taken as missing.
 const ABSENT_RECHECK: std::time::Duration = std::time::Duration::from_secs(10);
 
@@ -289,6 +289,190 @@ fn is_not_found(err: &anyhow::Error) -> bool {
     })
 }
 
+// ---- The load quiet window -------------------------------------------------
+//
+// X-Plane 12.4.4-b2 hung twice on 2026-09-28, 1 to 2 s after an
+// `XPLMInitFlight` the plugin ran that unloaded the SR22 (XLua 1.1.0r1). The
+// cause is unproven; what is ours is that the Web API kept serving our
+// traffic through the load. The plugin publishes `xcopilot/sim/loading` (1
+// from the mailbox write until 3 s of sim frames after the call returns) and
+// every request here waits while it reads 1, except the few the load itself
+// needs ([`LOAD_ESSENTIAL`]). Fail OPEN: a plugin without the dataref or a
+// hold past [`LOAD_HOLD_MAX`] lets the request go; a failed read changes
+// nothing (mid-load the API may not answer).
+
+/// The plugin's quiet-window flag.
+pub const SIM_LOADING: &str = "xcopilot/sim/loading";
+/// The flight-initialisation mailbox.
+pub const INIT_FLIGHT: &str = "xcopilot/sim/init_flight";
+/// Requests the load itself needs: the flag, the mailbox and its answer.
+const LOAD_ESSENTIAL: &[&str] = &[
+    SIM_LOADING,
+    INIT_FLIGHT,
+    "xcopilot/sim/init_seq",
+    "xcopilot/sim/init_result",
+];
+/// With no load, how often the flag is asked (only while requests flow).
+const LOAD_QUIET_CHECK: std::time::Duration = std::time::Duration::from_secs(1);
+/// Inside a load, how often it is asked again.
+const LOAD_HOLD_POLL: std::time::Duration = std::time::Duration::from_millis(500);
+/// The longest a request is held, fail open past it.
+const LOAD_HOLD_MAX: std::time::Duration = std::time::Duration::from_secs(30);
+/// A reading older than this says nothing to the blocking pollers.
+const LOAD_READING_STALE: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// One read of the flag.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoadReading {
+    Loading,
+    Quiet,
+    /// The plugin has no such dataref (an older build): fail open.
+    Absent,
+    /// The read failed: fail open.
+    Unread,
+}
+
+/// What a request does next.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoadStep {
+    Go,
+    /// Ask the flag first.
+    Check,
+    Wait,
+}
+
+/// The quiet window's state for one sim. Pure: the client drives it.
+#[derive(Debug, Default, Clone)]
+pub struct LoadGate {
+    loading: bool,
+    /// When the current hold began.
+    since: Option<std::time::Instant>,
+    /// When the flag was last read (or a post was made).
+    checked: Option<std::time::Instant>,
+    /// When the plugin was last found without the flag.
+    absent_at: Option<std::time::Instant>,
+}
+
+impl LoadGate {
+    pub fn step(&self, now: std::time::Instant) -> LoadStep {
+        let age = |t: Option<std::time::Instant>| t.map(|t| now.saturating_duration_since(t));
+        if !self.loading && age(self.absent_at).is_some_and(|a| a < ABSENT_RECHECK) {
+            return LoadStep::Go;
+        }
+        let every = if self.loading { LOAD_HOLD_POLL } else { LOAD_QUIET_CHECK };
+        if age(self.checked).is_none_or(|a| a >= every) {
+            return LoadStep::Check;
+        }
+        if self.loading && age(self.since).is_some_and(|a| a < LOAD_HOLD_MAX) {
+            LoadStep::Wait
+        } else {
+            LoadStep::Go
+        }
+    }
+
+    pub fn note(&mut self, reading: LoadReading, now: std::time::Instant) {
+        self.checked = Some(now);
+        match reading {
+            LoadReading::Loading => {
+                if !self.loading {
+                    self.since = Some(now);
+                }
+                self.loading = true;
+                self.absent_at = None;
+            }
+            LoadReading::Quiet => {
+                self.loading = false;
+                self.since = None;
+                self.absent_at = None;
+            }
+            // Mid-load the API may not answer: the hold stands, bounded by
+            // its cap. Outside one nothing changes.
+            LoadReading::Unread => {}
+            LoadReading::Absent => {
+                self.loading = false;
+                self.since = None;
+                self.absent_at = Some(now);
+            }
+        }
+    }
+
+    /// This process wrote the mailbox: hold at once, the plugin set its flag
+    /// in the same write. The next check comes a poll later; a plugin without
+    /// the flag answers `Absent` then and lets everything go.
+    pub fn posted(&mut self, now: std::time::Instant) {
+        if !self.loading {
+            self.since = Some(now);
+        }
+        self.loading = true;
+        self.checked = Some(now);
+        self.absent_at = None;
+    }
+
+    /// Holding now, on a fresh reading and inside the cap.
+    pub fn holding(&self, now: std::time::Instant) -> bool {
+        let fresh = |t: Option<std::time::Instant>, max| {
+            t.is_some_and(|t| now.saturating_duration_since(t) < max)
+        };
+        self.loading
+            && fresh(self.checked, LOAD_READING_STALE)
+            && fresh(self.since, LOAD_HOLD_MAX)
+    }
+}
+
+/// The gates, per base URL, only for bases the app enabled
+/// ([`enable_load_gate`]); a client on any other base (every test server)
+/// never asks the flag.
+static LOAD_GATES: std::sync::Mutex<Option<HashMap<String, LoadGate>>> =
+    std::sync::Mutex::new(None);
+/// One flag read at a time, process-wide.
+static LOAD_CHECKING: Mutex<()> = Mutex::const_new(());
+
+fn gate_key(base: &str) -> String {
+    base.trim_end_matches('/').to_string()
+}
+
+fn with_gate<T>(base: &str, f: impl FnOnce(&mut LoadGate) -> T) -> Option<T> {
+    let mut guard = LOAD_GATES.lock().unwrap_or_else(|e| e.into_inner());
+    guard.as_mut()?.get_mut(&gate_key(base)).map(f)
+}
+
+/// Hold this process's requests to the sim at `base` through a flight load.
+/// Called once at startup by the app and the sortie runner.
+pub fn enable_load_gate(base: &str) {
+    let mut guard = LOAD_GATES.lock().unwrap_or_else(|e| e.into_inner());
+    guard.get_or_insert_with(HashMap::new).entry(gate_key(base)).or_default();
+}
+
+/// A flight is loading on some enabled sim, by the last fresh reading: for
+/// the blocking pollers and the WebSocket, which do not go through the
+/// client. Stale or unknown is false (fail open).
+pub fn sim_loading() -> bool {
+    let now = std::time::Instant::now();
+    let guard = LOAD_GATES.lock().unwrap_or_else(|e| e.into_inner());
+    guard.as_ref().is_some_and(|m| m.values().any(|g| g.holding(now)))
+}
+
+/// Wait (bounded) while [`sim_loading`]: for the blocking threads. True when
+/// it waited.
+pub fn wait_out_load_blocking() -> bool {
+    let t0 = std::time::Instant::now();
+    let mut waited = false;
+    while sim_loading() && t0.elapsed() < LOAD_HOLD_MAX {
+        waited = true;
+        std::thread::sleep(std::time::Duration::from_millis(250));
+    }
+    waited
+}
+
+fn load_reading_of(result: &Result<f64>) -> LoadReading {
+    match result {
+        Ok(v) if *v > 0.5 => LoadReading::Loading,
+        Ok(_) => LoadReading::Quiet,
+        Err(e) if format!("{e:#}").contains("dataref not found") => LoadReading::Absent,
+        Err(_) => LoadReading::Unread,
+    }
+}
+
 /// The dataref/command surface a tool uses to talk to the simulator. Abstracting
 /// it behind a trait lets the trust-critical tool logic (autopilot capture, safety
 /// gates) be unit-tested against a fake, with no running X-Plane. The live impl is
@@ -457,6 +641,72 @@ impl XPlaneClient {
         Ok(())
     }
 
+    /// Wait out a flight load before a request for `name` (`None`: an index
+    /// dump or a read by id). See [`LoadGate`].
+    async fn hold_for_load(&self, name: Option<&str>) {
+        if name.is_some_and(|n| LOAD_ESSENTIAL.contains(&n)) {
+            return;
+        }
+        let mut held: Option<std::time::Instant> = None;
+        loop {
+            let now = std::time::Instant::now();
+            let Some(step) = with_gate(&self.base, |g| g.step(now)) else {
+                return; // no gate for this sim
+            };
+            match step {
+                LoadStep::Go => break,
+                LoadStep::Wait => {
+                    held.get_or_insert(now);
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                }
+                LoadStep::Check => {
+                    let Ok(_one) = LOAD_CHECKING.try_lock() else {
+                        // Someone is asking: wait for the answer inside a
+                        // hold, go on outside one.
+                        if with_gate(&self.base, |g| g.loading) != Some(true) {
+                            break;
+                        }
+                        held.get_or_insert(now);
+                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                        continue;
+                    };
+                    note_named(SIM_LOADING);
+                    let read = tokio::time::timeout(
+                        std::time::Duration::from_secs(1),
+                        self.fetch_value(SIM_LOADING, "decoding the load flag", ttl_for("")),
+                    )
+                    .await
+                    .unwrap_or_else(|_| Err(anyhow!("timed out")))
+                    .and_then(|v| v.as_f64().ok_or_else(|| anyhow!("not a number: {v}")));
+                    let reading = load_reading_of(&read);
+                    let was = with_gate(&self.base, |g| {
+                        let was = g.loading;
+                        g.note(reading, std::time::Instant::now());
+                        (was, g.loading)
+                    });
+                    match was {
+                        Some((false, true)) => {
+                            tracing::info!(target: "sim::load", "flight loading: requests held")
+                        }
+                        Some((true, false)) => {
+                            tracing::info!(target: "sim::load", "flight loaded: requests resume")
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+        if let Some(t) = held {
+            note_named("(held for load)");
+            tracing::debug!(
+                target: "sim::load",
+                what = name.unwrap_or("(index)"),
+                ms = t.elapsed().as_millis() as u64,
+                "request held through a flight load"
+            );
+        }
+    }
+
     /// Resolve a dataref's numeric id, caching the result.
     async fn dataref_id(&self, name: &str) -> Result<i64> {
         if let Some(id) = ID_CACHE
@@ -546,6 +796,18 @@ impl XPlaneClient {
                 }
             }
         }
+        self.hold_for_load(Some(name)).await;
+        self.fetch_value(name, decoding, ttl).await
+    }
+
+    /// The request half of [`XPlaneClient::get_value`], past the cache and
+    /// the load gate (whose own flag read comes straight here).
+    async fn fetch_value(
+        &self,
+        name: &str,
+        decoding: &'static str,
+        ttl: std::time::Duration,
+    ) -> Result<serde_json::Value> {
         let mut refreshed = false;
         loop {
             let id = self.dataref_id(name).await?;
@@ -601,6 +863,7 @@ impl XPlaneClient {
     /// set (`sim/operation/failures/rel_*`, ~800 entries) without hardcoding names,
     /// so the copilot can never be blind to a failure whose dataref it forgot.
     pub async fn list_datarefs_by_prefix(&self, prefix: &str) -> Result<Vec<(String, i64)>> {
+        self.hold_for_load(None).await;
         let url = format!("{}/api/v1/datarefs", self.base);
         let index: DatarefIndex = with_retry(|| async {
             self.http
@@ -627,6 +890,7 @@ impl XPlaneClient {
     /// reads hundreds at once). Returns the raw JSON so the caller decodes the
     /// scalar-or-array shape.
     pub async fn get_value_by_id(&self, id: i64) -> Result<serde_json::Value> {
+        self.hold_for_load(None).await;
         let url = format!("{}/api/v1/datarefs/{}/value", self.base, id);
         let resp: ValueResponse = with_retry(|| async {
             self.http
@@ -664,6 +928,7 @@ impl XPlaneClient {
     /// Write a raw JSON value to a dataref's `value` endpoint.
     async fn set_value(&self, name: &str, value: serde_json::Value) -> Result<()> {
         self.allow_write()?;
+        self.hold_for_load(Some(name)).await;
         // A write makes any cached value a lie, and the readback that follows
         // it is the whole trust model — drop the entry so that read is real.
         if let Some(m) = VALUE_CACHE.lock().await.get_mut(&self.base) {
@@ -687,7 +952,13 @@ impl XPlaneClient {
             })
             .await;
             match result {
-                Ok(()) => return Ok(()),
+                Ok(()) => {
+                    if name == INIT_FLIGHT {
+                        // The plugin raised its flag in this very write.
+                        with_gate(&self.base, |g| g.posted(std::time::Instant::now()));
+                    }
+                    return Ok(());
+                }
                 Err(e) if !refreshed && is_not_found(&e) => {
                     if let Some(m) = ID_CACHE.lock().await.get_mut(&self.base) {
                         m.remove(name); // stale handle — re-resolve
@@ -708,6 +979,7 @@ impl XPlaneClient {
     /// retried and not re-resolved: the next tick is the retry.
     pub async fn set_float_index(&self, name: &str, index: usize, value: f64) -> Result<()> {
         self.allow_write()?;
+        self.hold_for_load(Some(name)).await;
         if let Some(m) = VALUE_CACHE.lock().await.get_mut(&self.base) {
             m.remove(name);
         }
@@ -801,6 +1073,7 @@ impl XPlaneClient {
     /// fuel selector and its autopilot went unverified for a whole flight,
     /// 2026-09-11). Seeds the id cache on the way past.
     pub async fn dataref_index(&self) -> Result<Vec<(String, bool)>> {
+        self.hold_for_load(None).await;
         let url = format!("{}/api/v1/datarefs", self.base);
         let index: DatarefIndex = with_retry(|| async {
             self.http
@@ -826,8 +1099,43 @@ impl XPlaneClient {
             .collect())
     }
 
+    /// Does the running sim have this dataref? One small lookup by name,
+    /// for the probe's names its cached index lacks (seeds the id cache).
+    pub async fn dataref_exists(&self, name: &str) -> Result<bool> {
+        self.hold_for_load(Some(name)).await;
+        let url = format!("{}/api/v1/datarefs", self.base);
+        let index: Result<DatarefIndex> = with_retry(|| async {
+            self.http
+                .get(&url)
+                .query(&[("filter[name]", name)])
+                .send()
+                .await
+                .with_context(|| format!("GET {url}"))?
+                .error_for_status()?
+                .json()
+                .await
+                .context("decoding dataref index")
+        })
+        .await;
+        let index = match index {
+            Err(e) if is_not_found(&e) => return Ok(false),
+            other => other?,
+        };
+        let Some(id) = index.data.into_iter().find(|d| d.name == name).map(|d| d.id) else {
+            return Ok(false);
+        };
+        ID_CACHE
+            .lock()
+            .await
+            .entry(self.base.clone())
+            .or_default()
+            .insert(name.to_string(), id);
+        Ok(true)
+    }
+
     /// Every command the running sim has: one request, for the probe.
     pub async fn command_index(&self) -> Result<Vec<String>> {
+        self.hold_for_load(None).await;
         let url = format!("{}/api/v2/commands", self.base);
         let index: CommandIndex = with_retry(|| async {
             self.http
@@ -858,6 +1166,7 @@ impl XPlaneClient {
     /// starter). `0.0` is a momentary press.
     pub async fn run_command_for(&self, name: &str, duration: f64) -> Result<()> {
         self.allow_write()?;
+        self.hold_for_load(Some(name)).await;
         let id = self.command_id(name).await?;
         self.allow_write()?;
         let url = format!("{}/api/v2/command/{}/activate", self.base, id);
@@ -1584,5 +1893,159 @@ mod failure_sequences {
         VALUE_CACHE.lock().await.remove(&base); // next sample after cache expiry
         assert!(!sim_frozen(&xp).await);
         server.join().unwrap();
+    }
+
+    /// An older plugin has no `xcopilot/sim/loading`: the gate asks once,
+    /// finds it absent and lets the read go, then asks nothing more for a
+    /// while (the server answers exactly these three requests).
+    #[tokio::test]
+    async fn the_quiet_window_fails_open_without_the_plugin_flag() {
+        let (base, server) = server(vec![
+            reply("GET /api/v1/datarefs?", 200, r#"{"data":[]}"#),
+            reply(
+                "GET /api/v1/datarefs?",
+                200,
+                r#"{"data":[{"id":1,"name":"test/dial"}]}"#,
+            ),
+            reply("GET /api/v1/datarefs/1/value", 200, r#"{"data":7}"#),
+        ]);
+        enable_load_gate(&base);
+        let xp = XPlaneClient::new(base.clone());
+        assert_eq!(xp.get_float("test/dial").await.unwrap(), 7.0);
+        server.join().unwrap();
+        // The next reads within the absent window ask the flag nothing (a
+        // cached value here; the server is gone).
+        let now = std::time::Instant::now();
+        assert_eq!(with_gate(&base, |g| g.step(now)), Some(LoadStep::Go));
+    }
+
+    /// With the flag up, a read waits for it to drop; the mailbox's own
+    /// answer is read straight through.
+    #[tokio::test]
+    async fn a_read_waits_out_the_load_and_the_mailbox_does_not() {
+        let (base, server) = server(vec![
+            reply(
+                "GET /api/v1/datarefs?",
+                200,
+                r#"{"data":[{"id":9,"name":"xcopilot/sim/loading"}]}"#,
+            ),
+            reply("GET /api/v1/datarefs/9/value", 200, r#"{"data":1}"#),
+            reply(
+                "GET /api/v1/datarefs?",
+                200,
+                r#"{"data":[{"id":3,"name":"xcopilot/sim/init_seq"}]}"#,
+            ),
+            reply("GET /api/v1/datarefs/3/value", 200, r#"{"data":4}"#),
+            reply("GET /api/v1/datarefs/9/value", 200, r#"{"data":0}"#),
+            reply(
+                "GET /api/v1/datarefs?",
+                200,
+                r#"{"data":[{"id":1,"name":"test/dial"}]}"#,
+            ),
+            reply("GET /api/v1/datarefs/1/value", 200, r#"{"data":7}"#),
+        ]);
+        enable_load_gate(&base);
+        let xp = XPlaneClient::new(base.clone());
+        // First check: loading.
+        with_gate(&base, |g| {
+            g.note(LoadReading::Loading, std::time::Instant::now());
+            g.checked = None;
+        });
+        let t0 = std::time::Instant::now();
+        let dial = {
+            let xp = XPlaneClient::new(base.clone());
+            tokio::spawn(async move { xp.get_float("test/dial").await.unwrap() })
+        };
+        // Let the dial's first check land, then read the mailbox through it.
+        while with_gate(&base, |g| g.checked.is_none()).unwrap() {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert_eq!(xp.get_float("xcopilot/sim/init_seq").await.unwrap(), 4.0);
+        assert!(!dial.is_finished(), "held while the flag reads 1");
+        assert_eq!(dial.await.unwrap(), 7.0);
+        assert!(t0.elapsed() >= LOAD_HOLD_POLL, "{:?}", t0.elapsed());
+        server.join().unwrap();
+    }
+}
+
+#[cfg(test)]
+mod load_gate_tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn a_gate_with_no_reading_checks_then_goes_when_quiet() {
+        let t = Instant::now();
+        let mut g = LoadGate::default();
+        assert_eq!(g.step(t), LoadStep::Check);
+        g.note(LoadReading::Quiet, t);
+        assert_eq!(g.step(t + Duration::from_millis(200)), LoadStep::Go);
+        assert_eq!(g.step(t + LOAD_QUIET_CHECK), LoadStep::Check);
+        assert!(!g.holding(t));
+    }
+
+    #[test]
+    fn a_load_holds_until_the_flag_drops_or_the_cap() {
+        let t = Instant::now();
+        let mut g = LoadGate::default();
+        g.note(LoadReading::Loading, t);
+        assert_eq!(g.step(t + Duration::from_millis(100)), LoadStep::Wait);
+        assert_eq!(g.step(t + LOAD_HOLD_POLL), LoadStep::Check);
+        assert!(g.holding(t + Duration::from_millis(100)));
+        // A failed read mid-load changes nothing: still held.
+        g.note(LoadReading::Unread, t + LOAD_HOLD_POLL);
+        assert_eq!(g.step(t + LOAD_HOLD_POLL + Duration::from_millis(1)), LoadStep::Wait);
+        // Past the cap it goes, still asking on the poll.
+        let late = t + LOAD_HOLD_MAX + Duration::from_millis(1);
+        g.note(LoadReading::Loading, late);
+        assert_eq!(g.step(late + Duration::from_millis(1)), LoadStep::Go);
+        assert!(!g.holding(late));
+        g.note(LoadReading::Quiet, late);
+        assert_eq!(g.step(late + Duration::from_millis(1)), LoadStep::Go);
+    }
+
+    #[test]
+    fn an_absent_flag_fails_open_and_is_asked_again_later() {
+        let t = Instant::now();
+        let mut g = LoadGate::default();
+        g.note(LoadReading::Absent, t);
+        assert_eq!(g.step(t + Duration::from_secs(5)), LoadStep::Go);
+        assert_eq!(g.step(t + ABSENT_RECHECK), LoadStep::Check);
+        assert!(!g.holding(t));
+    }
+
+    #[test]
+    fn our_own_post_holds_at_once_and_an_old_plugin_releases_it() {
+        let t = Instant::now();
+        let mut g = LoadGate::default();
+        g.note(LoadReading::Absent, t);
+        g.posted(t + Duration::from_secs(1));
+        assert_eq!(g.step(t + Duration::from_millis(1100)), LoadStep::Wait);
+        assert!(g.holding(t + Duration::from_millis(1100)));
+        assert_eq!(g.step(t + Duration::from_millis(1600)), LoadStep::Check);
+        g.note(LoadReading::Absent, t + Duration::from_millis(1600));
+        assert_eq!(g.step(t + Duration::from_millis(1700)), LoadStep::Go);
+    }
+
+    #[test]
+    fn a_stale_reading_says_nothing_to_the_blocking_pollers() {
+        let t = Instant::now();
+        let mut g = LoadGate::default();
+        g.note(LoadReading::Loading, t);
+        assert!(g.holding(t + Duration::from_secs(1)));
+        assert!(!g.holding(t + LOAD_READING_STALE));
+    }
+
+    #[test]
+    fn the_load_reading_of_a_read() {
+        assert_eq!(load_reading_of(&Ok(1.0)), LoadReading::Loading);
+        assert_eq!(load_reading_of(&Ok(0.0)), LoadReading::Quiet);
+        assert_eq!(
+            load_reading_of(&Err(anyhow!("dataref not found: xcopilot/sim/loading"))),
+            LoadReading::Absent
+        );
+        assert_eq!(load_reading_of(&Err(anyhow!("GET timed out"))), LoadReading::Unread);
+        assert!(LOAD_ESSENTIAL.contains(&SIM_LOADING));
+        assert!(LOAD_ESSENTIAL.contains(&INIT_FLIGHT));
     }
 }

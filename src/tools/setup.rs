@@ -1056,8 +1056,11 @@ pub struct InitTiming {
 }
 
 impl InitTiming {
+    // The mailbox reads ride through the load quiet window (the only reads
+    // that do), so they ask no faster than this: two reads a poll were 13 a
+    // second into a loading sim (2026-09-28).
     pub const LIVE: InitTiming = InitTiming {
-        poll: std::time::Duration::from_millis(150),
+        poll: std::time::Duration::from_millis(350),
         read_timeout: std::time::Duration::from_millis(600),
         deadline: std::time::Duration::from_secs(120),
         report_every: std::time::Duration::from_secs(2),

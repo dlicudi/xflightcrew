@@ -89,6 +89,8 @@ fn run(base: String, names: Vec<String>, cache: Arc<Mutex<HashMap<String, f64>>>
         return;
     };
     loop {
+        // A (re)connect resolves every id by name: never into a loading sim.
+        crate::xplane::wait_out_load_blocking();
         connect_and_pump(&http, &base, &names, &cache);
         // Socket dropped or never connected — drop stale values so readers fall
         // back (REST snapshot) or fail safe (PTT reads released), then retry.

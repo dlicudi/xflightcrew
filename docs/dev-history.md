@@ -10315,3 +10315,32 @@ blackbox `full_auto` `readback_out`). Tests `a_rejected_takeoff_is_flown_to_a_st
 `a_readback_copy_goes_out_only_while_the_tower_waits_for_it`,
 `the_roll_waits_for_the_takeoff_readback`.
 Offline only.
+
+## 2026-09-28: X-Plane hung after a flight init; our traffic is held through the load (issue #179)
+
+X-Plane 12.4.4-b2 hung twice tonight, 1 to 2 s after an `XPLMInitFlight` the plugin ran
+(`flightinit.cpp` `InitLoop`) that unloaded the SR22 (XLua 1.1.0r1). Cause unproven; ours is that
+the Web API serves requests during InitFlight and everything kept asking: the loops, the blocking
+pollers, the panel status writer, the runner, the new-flight watch, the WebSocket reconnect, and
+the profile probe's two full index dumps fired at the swap. Now:
+- Log.txt brackets the load: `init_flight seq N: calling XPLMInitFlight (<start>, <acf>)`, the
+  result with the call's seconds, `first flight loop after the call`, `load quiet window closed`.
+- `xcopilot/sim/loading` (read-only, `health::PLUGIN_DATAREFS`): 1 from the mailbox write until
+  3 s of sim frames after the call returns (frames capped at 0.1 s, a 15 s wall cap for a paused
+  sim). `sim::xplane::LoadGate`, per enabled base (`enable_load_gate`, main before the runner
+  branch): every client request waits while it reads 1, except the flag and the mailbox
+  (`LOAD_ESSENTIAL`); a mailbox write holds at once (`posted`); an absent flag fails open (asked
+  again after 10 s), a failed read changes nothing, a hold past 30 s goes. The blocking threads
+  read `sim_loading()` (a reading under 5 s old): pollers skip, the status writer keeps the newest
+  per slot, the audio bus plays locally, the WebSocket waits to reconnect. `InitTiming::LIVE` polls
+  at 350 ms (was 150).
+- The probe waits 10 s after a new model and for the window (`probe_settled`), and keeps the
+  indexes for the session (`ProbeIndex`, `missing_with_cache`): unknown names are looked up by
+  name (`dataref_exists`), the whole dataref index only past 25 of them, the command index at most
+  every 5 min.
+- `fms.cpp`: the load and goto accessors only store and flag; `FmsLoop` does the navaid searches,
+  `XPLMLoadFMSFlightPlan` and `XPLMSetDestination*`, and waits out the window.
+Tests `the_quiet_window_fails_open_without_the_plugin_flag`,
+`a_read_waits_out_the_load_and_the_mailbox_does_not`, `load_gate_tests`,
+`the_probe_fetches_the_indexes_once_per_session`, `the_probe_waits_for_the_swap_to_settle`.
+Offline only; the plugin needs installing and reloading with nothing flying.

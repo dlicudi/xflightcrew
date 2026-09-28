@@ -303,21 +303,119 @@ pub(crate) fn pick_profile(who: &AcfIdentity) -> Picked {
     }
 }
 
-/// The names a profile relies on that the running sim does not have: two
-/// index fetches (every dataref, every command), one membership test each.
+/// The names a profile relies on that the running sim does not have, from
+/// the session's cached indexes ([`ProbeIndex`]).
 pub(crate) async fn missing_profile_names(
     xp: &XPlaneClient,
     names: &[String],
 ) -> Result<Vec<String>> {
-    let datarefs: std::collections::HashSet<String> = xp
-        .dataref_index()
-        .await?
-        .into_iter()
-        .map(|(n, _)| n)
-        .collect();
-    let commands: std::collections::HashSet<String> =
-        xp.command_index().await?.into_iter().collect();
-    Ok(aircraft::missing_references(names, &datarefs, &commands))
+    // Taken out for the call and put back after: one probe at a time (the
+    // detector's own thread), and a failed one leaves the cache as it was.
+    let mut index = PROBE_INDEX.lock().unwrap_or_else(|e| e.into_inner()).take();
+    let result = missing_with_cache(xp, &mut index, names, std::time::Instant::now()).await;
+    *PROBE_INDEX.lock().unwrap_or_else(|e| e.into_inner()) = index;
+    result
+}
+
+// ---- The probe's indexes, once per session ---------------------------------
+//
+// The probe used to fetch the WHOLE dataref index and the WHOLE command index
+// (thousands of entries each) on every airframe swap, right as the new flight
+// loaded: frame time the sim pays while X-Plane 12.4.4-b2 hung twice after a
+// flight init (2026-09-28). Stock names survive a swap, so the indexes are
+// fetched once per session and kept; a name the cache lacks is asked by name
+// (one small lookup), and only a name that is no dataref asks the command
+// index again, at most every [`COMMAND_INDEX_REFRESH`]. A name kept from an
+// airframe that has gone (its own plugin's datarefs) may read present: a
+// false "all there" for that one name, never a false missing.
+
+/// Above this many unknown names, the dataref index is fetched whole again.
+const PER_NAME_MAX: usize = 25;
+/// The command index is fetched again no sooner than this.
+const COMMAND_INDEX_REFRESH: std::time::Duration = std::time::Duration::from_secs(300);
+/// A probe waits this long after a new model is first seen, and for the
+/// load's quiet window to close.
+pub(crate) const PROBE_SETTLE: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// What the sim has, as the probe last learnt it.
+#[derive(Debug, Default)]
+pub(crate) struct ProbeIndex {
+    datarefs: std::collections::HashSet<String>,
+    commands: std::collections::HashSet<String>,
+    commands_at: Option<std::time::Instant>,
+}
+
+static PROBE_INDEX: std::sync::Mutex<Option<ProbeIndex>> = std::sync::Mutex::new(None);
+
+/// The sim's answers the probe asks for.
+#[async_trait::async_trait]
+pub(crate) trait IndexSource: Send + Sync {
+    async fn dataref_names(&self) -> Result<Vec<String>>;
+    async fn command_names(&self) -> Result<Vec<String>>;
+    async fn dataref_exists(&self, name: &str) -> Result<bool>;
+}
+
+#[async_trait::async_trait]
+impl IndexSource for XPlaneClient {
+    async fn dataref_names(&self) -> Result<Vec<String>> {
+        Ok(self.dataref_index().await?.into_iter().map(|(n, _)| n).collect())
+    }
+    async fn command_names(&self) -> Result<Vec<String>> {
+        self.command_index().await
+    }
+    async fn dataref_exists(&self, name: &str) -> Result<bool> {
+        XPlaneClient::dataref_exists(self, name).await
+    }
+}
+
+/// The missing names, asking the sim only what `cache` cannot answer. The
+/// first call fetches both indexes; later ones ask by name. Fills `cache`.
+pub(crate) async fn missing_with_cache(
+    src: &dyn IndexSource,
+    cache: &mut Option<ProbeIndex>,
+    names: &[String],
+    now: std::time::Instant,
+) -> Result<Vec<String>> {
+    let Some(idx) = cache.as_mut() else {
+        let datarefs = src.dataref_names().await?.into_iter().collect();
+        let commands = src.command_names().await?.into_iter().collect();
+        let idx =
+            cache.insert(ProbeIndex { datarefs, commands, commands_at: Some(now) });
+        return Ok(aircraft::missing_references(names, &idx.datarefs, &idx.commands));
+    };
+    let unknown = aircraft::missing_references(names, &idx.datarefs, &idx.commands);
+    if unknown.is_empty() {
+        return Ok(unknown);
+    }
+    if unknown.len() > PER_NAME_MAX {
+        idx.datarefs = src.dataref_names().await?.into_iter().collect();
+    } else {
+        for n in &unknown {
+            if src.dataref_exists(n).await? {
+                idx.datarefs.insert(n.clone());
+            }
+        }
+    }
+    let still = aircraft::missing_references(names, &idx.datarefs, &idx.commands);
+    let stale = idx
+        .commands_at
+        .is_none_or(|t| now.saturating_duration_since(t) >= COMMAND_INDEX_REFRESH);
+    if !still.is_empty() && stale {
+        idx.commands = src.command_names().await?.into_iter().collect();
+        idx.commands_at = Some(now);
+    }
+    Ok(aircraft::missing_references(names, &idx.datarefs, &idx.commands))
+}
+
+/// May the probe run: the model has been the same for [`PROBE_SETTLE`] and
+/// no flight is loading. Pure.
+pub(crate) fn probe_settled(
+    model_seen_at: Option<std::time::Instant>,
+    now: std::time::Instant,
+    loading: bool,
+) -> bool {
+    !loading
+        && model_seen_at.is_none_or(|t| now.saturating_duration_since(t) >= PROBE_SETTLE)
 }
 
 /// The loaded airframe's `.acf` text: the sim names the file
@@ -387,6 +485,9 @@ pub(crate) fn spawn_aircraft_detector(
             let mut last_key: Option<(String, String)> = None;
             let mut id = String::new();
             let mut identity = serde_json::Value::Null;
+            // When the model last resolved: the probe waits for the swap's
+            // load to settle before its index requests.
+            let mut model_seen_at: Option<std::time::Instant> = None;
             loop {
                 let (icao, rel) = tokio::join!(
                     xp.aircraft_icao(),
@@ -422,6 +523,7 @@ pub(crate) fn spawn_aircraft_detector(
                             if let Ok(who) = read_identity(&xp).await {
                                 let first = last_key.is_none();
                                 last_key = Some(who.key());
+                                model_seen_at = Some(std::time::Instant::now());
                                 let picked = pick_profile(&who);
                                 identity = picked.blackbox();
                                 id = picked.id.clone();
@@ -471,7 +573,12 @@ pub(crate) fn spawn_aircraft_detector(
                         {
                             probed.clear();
                         }
-                        if id == live.id() && probed != id {
+                        let settled = probe_settled(
+                            model_seen_at,
+                            std::time::Instant::now(),
+                            crate::xplane::sim_loading(),
+                        );
+                        if id == live.id() && probed != id && settled {
                             last_plugin_probe = std::time::Instant::now();
                             // The gear-warning envelope is the airframe's own
                             // (its .acf), when the profile does not declare
@@ -576,6 +683,95 @@ pub(crate) fn resolved_id(icao: &str, relative_path: &str) -> Option<String> {
     match resolve(&who, &aircraft::profile_matchers()) {
         Resolution::Profile { id, .. } => Some(id),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod probe_cache_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+    use std::time::{Duration, Instant};
+
+    #[derive(Default)]
+    struct Sim {
+        datarefs: Vec<&'static str>,
+        commands: Vec<&'static str>,
+        dref_dumps: AtomicUsize,
+        cmd_dumps: AtomicUsize,
+        lookups: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl IndexSource for Sim {
+        async fn dataref_names(&self) -> Result<Vec<String>> {
+            self.dref_dumps.fetch_add(1, SeqCst);
+            Ok(self.datarefs.iter().map(|s| s.to_string()).collect())
+        }
+        async fn command_names(&self) -> Result<Vec<String>> {
+            self.cmd_dumps.fetch_add(1, SeqCst);
+            Ok(self.commands.iter().map(|s| s.to_string()).collect())
+        }
+        async fn dataref_exists(&self, name: &str) -> Result<bool> {
+            self.lookups.fetch_add(1, SeqCst);
+            Ok(self.datarefs.contains(&name))
+        }
+    }
+
+    fn names(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// The whole indexes are fetched once per session: a swap to an
+    /// airframe whose names are all known asks the sim nothing, a new
+    /// dataref is one lookup by name, and a missing name asks the command
+    /// index again only once per refresh window (an older plugin's missing
+    /// flag is re-probed every minute).
+    #[tokio::test]
+    async fn the_probe_fetches_the_indexes_once_per_session() {
+        let sim = Sim {
+            datarefs: vec!["sim/a", "sim/b", "xvl/own"],
+            commands: vec!["sim/cmd"],
+            ..Default::default()
+        };
+        let t = Instant::now();
+        let mut cache = None;
+        let first = names(&["sim/a", "sim/cmd"]);
+        assert!(missing_with_cache(&sim, &mut cache, &first, t).await.unwrap().is_empty());
+        assert_eq!((sim.dref_dumps.load(SeqCst), sim.cmd_dumps.load(SeqCst)), (1, 1));
+
+        // The next airframe: known names cost nothing.
+        let known = names(&["sim/b", "sim/cmd"]);
+        assert!(missing_with_cache(&sim, &mut cache, &known, t).await.unwrap().is_empty());
+        assert_eq!((sim.dref_dumps.load(SeqCst), sim.cmd_dumps.load(SeqCst)), (1, 1));
+        assert_eq!(sim.lookups.load(SeqCst), 0);
+
+        // A name the cache lacks: one lookup (the index said it was there
+        // all along, so it is found without a dump).
+        let own = names(&["xvl/own"]);
+        let mut fresh = Some(ProbeIndex { commands_at: Some(t), ..Default::default() });
+        assert!(missing_with_cache(&sim, &mut fresh, &own, t).await.unwrap().is_empty());
+        assert_eq!(sim.lookups.load(SeqCst), 1);
+        assert_eq!(sim.dref_dumps.load(SeqCst), 1);
+
+        // A name nobody has: said missing; the command index is asked again
+        // only once the refresh window has passed.
+        let gone = names(&["xcopilot/sim/loading"]);
+        let later = t + Duration::from_secs(60);
+        assert_eq!(missing_with_cache(&sim, &mut cache, &gone, later).await.unwrap(), gone);
+        assert_eq!(sim.cmd_dumps.load(SeqCst), 1, "inside the window");
+        let much_later = t + COMMAND_INDEX_REFRESH;
+        assert_eq!(missing_with_cache(&sim, &mut cache, &gone, much_later).await.unwrap(), gone);
+        assert_eq!(sim.cmd_dumps.load(SeqCst), 2);
+        assert_eq!(sim.dref_dumps.load(SeqCst), 1, "never the whole dataref index again");
+    }
+
+    #[test]
+    fn the_probe_waits_for_the_swap_to_settle() {
+        let t = Instant::now();
+        assert!(probe_settled(None, t, false));
+        assert!(!probe_settled(Some(t), t + Duration::from_secs(3), false));
+        assert!(probe_settled(Some(t), t + PROBE_SETTLE, false));
+        assert!(!probe_settled(Some(t), t + PROBE_SETTLE, true), "a load is loading");
     }
 }
 

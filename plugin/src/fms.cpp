@@ -13,9 +13,11 @@
 #include <cstring>
 
 #include "XPLMDataAccess.h"
+#include "XPLMProcessing.h"
 #include "XPLMUtilities.h"
 
 #include "drefs.h"
+#include "flightinit.h"
 
 static TextRef g_fms_route = {{0}, 0};
 static int g_fms_load = 0;
@@ -231,8 +233,17 @@ static int find_fms_entry(const char* ident, double lat, double lon) {
     return best;
 }
 
-static void WriteFmsGoto(void*, void* in, int offset, int len) {
-    StoreText(&g_fms_goto, in, offset, len);
+// ---- Deferred to the flight loop --------------------------------------------
+// The Web API runs a write's accessor inside its own request dispatch, so the
+// accessors only store and flag: the navaid searches, the plan load and the
+// destination changes run in FmsLoop, as flightinit.cpp runs XPLMInitFlight
+// (2026-09-28: X-Plane hung twice after an init with our traffic still
+// arriving; nothing heavy stays in a set handler). A load waits out the
+// flight-init quiet window.
+static bool g_load_pending = false;
+static bool g_goto_pending = false;
+
+static void sequence_goto() {
     char buf[sizeof g_fms_goto.buf];
     std::strncpy(buf, g_fms_goto.buf, sizeof buf);
     buf[sizeof buf - 1] = '\0';
@@ -258,12 +269,30 @@ static void WriteFmsGoto(void*, void* in, int offset, int len) {
     XPLMDebugString(msg);
 }
 
+static void WriteFmsGoto(void*, void* in, int offset, int len) {
+    StoreText(&g_fms_goto, in, offset, len);
+    g_goto_pending = true;
+}
+
 static int ReadFmsLoad(void*) { return g_fms_load; }
 static void WriteFmsLoad(void*, int v) {
     if (v != 0) {
-        load_fms_route();
+        g_load_pending = true;
     }
     g_fms_load = 0; // edge-triggered; reset so a re-load needs a fresh write
+}
+
+static float FmsLoop(float, float, int, void*) {
+    if (flightinit::loading()) return 0.25f;
+    if (g_load_pending) {
+        g_load_pending = false;
+        load_fms_route();
+    }
+    if (g_goto_pending) {
+        g_goto_pending = false;
+        sequence_goto();
+    }
+    return 0.1f;
 }
 
 namespace fms {
@@ -281,15 +310,17 @@ void register_datarefs() {
         "xcopilot/fms/goto", xplmType_Data, 1,
         nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
         nullptr, nullptr, nullptr, nullptr, ReadText, WriteFmsGoto, &g_fms_goto, &g_fms_goto);
+    XPLMRegisterFlightLoopCallback(FmsLoop, 0.1f, nullptr);
 }
 
 void unregister_datarefs() {
+    XPLMUnregisterFlightLoopCallback(FmsLoop, nullptr);
     if (g_fms_goto_dref) { XPLMUnregisterDataAccessor(g_fms_goto_dref); g_fms_goto_dref = nullptr; }
     if (g_fms_load_dref) { XPLMUnregisterDataAccessor(g_fms_load_dref); g_fms_load_dref = nullptr; }
     if (g_fms_route_dref) { XPLMUnregisterDataAccessor(g_fms_route_dref); g_fms_route_dref = nullptr; }
 }
 
-void load_route() { load_fms_route(); }
+void load_route() { g_load_pending = true; }
 
 void read_airac_cycle() { read_airac_cycle_impl(); }
 

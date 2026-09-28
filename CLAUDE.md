@@ -118,7 +118,8 @@ Datarefs and commands stay in the Rust tools; YAML is per-airframe config.
 **A profile line is a hypothesis until probed**
 - Every airframe, `aircraft::profile_references` walks every name in the profile, `probe_dataref` /
   `probe_command` ask the sim, `probe_summary` speaks the missing, blackbox `profile_probe`. A new
-  field is probed the day it is added.
+  field is probed the day it is added. The probe runs 10 s after a swap, never into a load, from
+  indexes fetched once per session (`detect::missing_with_cache`: unknown names asked by name).
 - **Rust constants too**: read names come from `datarefs::*`; `cargo test -- --ignored
   real_install_names` checks every `"sim/..."` literal against DataRefs.txt/Commands.txt (two
   made-up names fed fallbacks that impersonated a measurement for months).
@@ -191,7 +192,8 @@ stock 737 "re-synced" 14 times, 2026-09-27).
 - **FMS injection is plugin-only**: the app writes `xcopilot/fms/route` (`IDENT,lat,lon,alt|...`)
   then `xcopilot/fms/load` (edge); the plugin resolves idents (`XPLMFindNavAid`), composes an XP11
   plan in memory and loads it whole (`XPLMLoadFMSFlightPlan`), because only a load fills
-  ORIGIN/DEST. It feeds the monitor's `DESTINATION` and the fuel check.
+  ORIGIN/DEST; in its flight loop (`FmsLoop`), never the set handler, as the goto too. It feeds
+  the monitor's `DESTINATION` and the fuel check.
 - **The follower sequences the FMS** (it flies the bug, never GPS mode): each leg goes as
   `IDENT,lat,lon` to `xcopilot/fms/goto`; the plugin makes the matching entry the destination.
 - **The plan is the WHOLE navlog** (`simbrief::fms_route_payload`): the 512-byte `TextRef` is
@@ -1036,6 +1038,13 @@ The API runs in X-Plane's flight loop: every request is frame time. `crates/sim/
 reports every 30 s (blackbox `api_load`, per-dataref histogram). A 60 ms read cache (a write drops
 its entry); near-static flags (`is_in_replay`, `paused`) are `SLOW_DATAREFS`; a COMMAND clears it.
 `cached=0` is an honest answer.
+- **Nothing asks a loading sim** (#179; 12.4.4-b2 hung twice 1 to 2 s after an init): the plugin's
+  `xcopilot/sim/loading` is 1 from the mailbox write to 3 s of sim frames after `XPLMInitFlight`,
+  bracketed in Log.txt. `xplane::LoadGate` (`enable_load_gate`) holds every request but the
+  mailbox's (`LOAD_ESSENTIAL`); blocking threads read `sim_loading()`. Fails open without the flag
+  and past 30 s. The profile probe waits for the settle and keeps its indexes per session
+  (`detect::ProbeIndex`). Plugin work never runs in a Web API set handler: store, flag, act in a
+  flight loop (`flightinit.cpp`, `fms.cpp` `FmsLoop`).
 
 ## Battle-test surface
 

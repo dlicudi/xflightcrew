@@ -338,6 +338,11 @@ fn bus_write(slot: usize, name: &str, value: serde_json::Value) -> Result<()> {
     if tokio::runtime::Handle::try_current().is_ok() {
         bail!("audio bus write from an async thread");
     }
+    if slot == 0 && crate::xplane::sim_loading() {
+        // No new play into a loading sim (the line plays locally instead);
+        // a cut still goes.
+        bail!("a flight is loading");
+    }
     let base = BUS_BASE_URL
         .lock()
         .unwrap_or_else(|e| e.into_inner())

@@ -36,6 +36,10 @@ pub(crate) fn spawn_panel_request_poller(base_url: String, tx: std::sync::mpsc::
         let mut typed_age_id: Option<i64> = None;
         loop {
             std::thread::sleep(std::time::Duration::from_millis(300));
+            // A flight is loading: the panel waits (xplane::sim_loading).
+            if crate::xplane::sim_loading() {
+                continue;
+            }
             if id.is_none() {
                 id = crate::plugin_status::resolve_id(&http, &rest, "xcopilot/request");
                 if id.is_none() {
@@ -318,6 +322,10 @@ pub(crate) fn spawn_voice_picker(
         };
         loop {
             std::thread::sleep(std::time::Duration::from_millis(500));
+            // A flight is loading: the panel waits (xplane::sim_loading).
+            if crate::xplane::sim_loading() {
+                continue;
+            }
             if ids.is_none() {
                 ids = crate::plugin_status::resolve_id(&http, &rest, DR_OPT_VOICE_LIST)
                     .zip(crate::plugin_status::resolve_id(&http, &rest, DR_OPT_VOICE));
@@ -509,6 +517,10 @@ pub(crate) fn spawn_settings_poller(base_url: String) {
         };
         loop {
             std::thread::sleep(std::time::Duration::from_millis(500));
+            // A flight is loading: the panel waits (xplane::sim_loading).
+            if crate::xplane::sim_loading() {
+                continue;
+            }
             for s in settings.iter_mut() {
                 let applied = (s.current)();
                 if s.id.is_none() {
@@ -636,6 +648,10 @@ pub(crate) fn spawn_text_settings_poller(base_url: String) {
         let mut sent_at = std::time::Instant::now();
         loop {
             std::thread::sleep(std::time::Duration::from_secs(1));
+            // A flight is loading: the panel waits (xplane::sim_loading).
+            if crate::xplane::sim_loading() {
+                continue;
+            }
             if ids.is_none() {
                 ids = crate::plugin_status::resolve_id(&http, &rest, DR_OPT_TEXT).zip(
                     crate::plugin_status::resolve_id(&http, &rest, DR_OPT_TEXT_EDIT),

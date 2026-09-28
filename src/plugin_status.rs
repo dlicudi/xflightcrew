@@ -221,7 +221,7 @@ fn clip_to(s: &str, max: usize) -> String {
 
 /// Which status dataref an update targets — so the id can be re-looked-up after
 /// a re-resolve (X-Plane reassigns ids on restart).
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum Slot {
     Phase,
     Heard,
@@ -377,6 +377,8 @@ fn run(base: String, rx: Receiver<Update>) {
     // repopulate the panel chip.
     let mut last_aircraft: Option<String> = None;
     let mut last_beat = Instant::now();
+    // Updates that arrived while a flight loaded, newest per slot.
+    let mut held: Vec<(Slot, serde_json::Value)> = Vec::new();
     loop {
         let update = match rx.recv_timeout(HEARTBEAT) {
             Ok(u) => Some(u),
@@ -385,7 +387,7 @@ fn run(base: String, rx: Receiver<Update>) {
         };
         // Link down (or never up)? Re-resolve ids on a throttled retry — X-Plane
         // hands out new ids across restarts, so the stale ones must be dropped.
-        if !healthy && last_resolve.elapsed() >= RESOLVE_RETRY {
+        if !healthy && last_resolve.elapsed() >= RESOLVE_RETRY && !crate::xplane::sim_loading() {
             ids = resolve_all(&http, &rest);
             last_resolve = Instant::now();
         }
@@ -421,7 +423,21 @@ fn run(base: String, rx: Receiver<Update>) {
                 Update::Taxi(text) => (Slot::Taxi, json!(STANDARD.encode(text.as_bytes()))),
                 Update::Callsign(text) => (Slot::Callsign, json!(STANDARD.encode(text.as_bytes()))),
             };
-            healthy = patch(&http, &rest, &ids, slot, value);
+            if crate::xplane::sim_loading() {
+                // A flight is loading: keep the newest per slot for after.
+                match held.iter_mut().find(|(s, _)| *s == slot) {
+                    Some(h) => h.1 = value,
+                    None => held.push((slot, value)),
+                }
+            } else {
+                healthy = patch(&http, &rest, &ids, slot, value);
+            }
+        }
+        if crate::xplane::sim_loading() {
+            continue; // no heartbeat into a load either
+        }
+        for (slot, value) in held.drain(..) {
+            healthy = patch(&http, &rest, &ids, slot, value) && healthy;
         }
         // Heartbeat on wall clock, regardless of how busy the stream is.
         if last_beat.elapsed() >= HEARTBEAT {
