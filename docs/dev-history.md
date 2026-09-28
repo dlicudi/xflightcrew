@@ -9567,3 +9567,29 @@ in bench/sorties.
 write(2) per token and the sortie runner is a second process appending the same file. Now one
 `write_all` of the whole line under a file lock (`blackbox::append_line`), and the runner's tail is
 byte-based. Offline only.
+
+## 2026-09-28: the autopilot confirmed, the go-around order flown, a relocation is not a movement (issues #139, #136, #141)
+
+#139: after `setup_approach` autoland pressed `servos_on` once at the arm (+0.85 s), while the new
+flight was still starting (IAS 0 to 12 kt, frozen until 1.3 to 1.7 s), and never read it back; the
+flight start dropped it. 1790587073, 1790583434 and 1790583663 flew with `ap_state` 132 until the VS
+watchdog's re-press (+9.5 s; engaged +10.9, +10.7) or a re-arm's press (+7.2): -900 to -3,450 fpm,
+2,318 to 1,697 ft MSL, minimums 405, 200 and 145 ft AGL. `ApEngage` presses every tick until confirmed
+on live reads, holds level on `xcopilot/pitch` while the servos read off (`engage_hold_gains`, from the
+737's fitted flare plant plus the fitted flight start: -900 fpm and 0.54 mistrim), gates the watchdog
+on the confirmation and hands over after 10 s. On the plant: confirmed +2.7 s, 21 ft lost.
+
+#136, LEMG 31 circuit 1790584715: the tower's go-around order (t 1790585525.5, a ghost it had released
+on 13 on our strip, #140) came with the circuit flying its own final (736 ft, 136.6 kt, flaps full);
+nothing in circuit.rs read it, the main loop's FSM sync took the only flag, and autoland drained it at
+its 2 nm arm and landed "without clearance". None of the 15 orders ever logged reached
+`ordered_go_around`. `party_line::GoAroundOrders` gives each loop its own watch; the circuit flies the
+order (go-around flap, "going around", the pattern again, clean-up on the schedule). Not yet: the LXGB
+authored route and the procedure follower.
+
+#141: the LEMG 31 taxi-in was right (vacate via E5 from the stop, 1.1 m off 13/31); 0.3 s after the
+landing's `sortie_result` the runner's next setup reloaded the aircraft onto 12/30's midpoint, 1,293 m
+away, and the running vacate "joined" 1,033 m off (bypassing `MAX_JOIN_M`), the request went out from
+12/30, and the tower planned correctly from there. `relocation_jump_m` (100 m + 60 m/s x dt) stands the
+drive and the taxi-in down; the vacate re-checks its start; "runway vacated" needs `on_runway` false.
+Owed (#145): the runner must not set up over a running taxi-in. Offline only.

@@ -583,6 +583,11 @@ everything blackboxes to `logs/blackbox.jsonl` (kinds: `atc`, `autotaxi`, `autot
 - **A CF leg is flown on its course** (`course_leg::course_track`: a 30 degree intercept rolled out
   at the fly-by lead), never homed on; **an IF behind us is joined by autoland's pattern** against
   the FAF's course until the intercept fits 2 nm out (`FinalJoin`; EGKK 26L 2026-09-27).
+- **The autopilot is engaged and CONFIRMED, never assumed** (`ApEngage`): pressed every tick until
+  `servos_on` reads on for two live ticks, each try blackboxed `ap_engage` then `ap_engaged`; until
+  then the loop holds level on `xcopilot/pitch` (`engage_hold_gains`, `ap_hold`), and 10 s of live
+  flight without it is said and handed over (`ap_not_engaged`). A new flight's start drops a press
+  made before it (LEMG 13 2026-09-28, 405 ft AGL).
 - **The VS watchdog excuses a slow autopilot, never a dead one** (`vs_not_held`).
 - **A mountain field is a flyable approach or a hand-over** (`mountain_field`, `earth_msa.dat`): a
   MAP short of the runway is flown on its path (`map_path`) and HANDED OVER with the talk-down armed
@@ -616,7 +621,11 @@ everything blackboxes to `logs/blackbox.jsonl` (kinds: `atc`, `autotaxi`, `autot
   `threshold_elev`), not the apt.dat header.
 - **The crab is LOW-PASSED** (`CrabFilter`, `CRAB_TAU_S`; `crab`, `crab_raw`) and cancels wind only;
   a bias is `TrackTrim`'s. Each balk names its gate (`Guidance.balk`; ticks carry `trim`, `xtk_m`).
-  **A tower's go-around order outranks everything** (`GoAroundLatch::order`).
+  **A tower's go-around order outranks everything, and reaches whoever flies the final**: each loop
+  watches it (`party_line::GoAroundOrders`, never the main loop's `take_pending_go_around`); autoland
+  latches it (`GoAroundLatch::order`), the circuit flies it from Base or Final
+  (`flies_go_around_order`, clean-up on `go_around_flap_step` / `go_around_speed_kts`; LEMG 31
+  2026-09-28).
 - **The landing arrest leads the AP's lag** (`vs_dial_fpm`, `Guidance.arresting`): gain, cap and
   horizon are the airframe's (`ArrestLeadProfile`); gates and targets are seconds of sink
   (`arrest_gates_ft`, `arrest_targets_fpm`). Ticks log `cmd_vs`, `vs_dial`, `vvi`, `vvi_trend`.
@@ -643,7 +652,10 @@ everything blackboxes to `logs/blackbox.jsonl` (kinds: `atc`, `autotaxi`, `autot
 runway** (`nearest_stand`). `vacate_runway` falls back to `autoland::landed_runway`;
 `vacate_budget_secs`; stands entered on their line (`nav::stand_lead_in`). **A stand route asked
 from the runway starts with the vacate, forward** (`station::stand_route_on`, `nav::after_vacate`;
-EDLP 24 2026-09-24). **A mission ends shut
+EDLP 24 2026-09-24). **A jump in position is a relocation, never a movement**
+(`autotaxi::relocation_jump_m`, `RELOCATED`; `vacate_still_here`): a drive, vacate or request that
+finds the aircraft moved under it stands down; "runway vacated" needs the pavement to agree
+(`vacated_report_due`). **A mission ends shut
 down** (`taxi_in::shut_down_at_stand`: engines confirmed from `ENGN_running`, electrics off); a
 spoken "taxi to parking" leaves the engines to the pilot.
 
