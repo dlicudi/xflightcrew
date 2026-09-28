@@ -1213,6 +1213,9 @@ pub fn run_autoland_scoped(
             *TRACKING_ERROR.lock().unwrap_or_else(|e| e.into_inner()) = None;
             let mut last_phase: Option<ApproachPhase> = None;
             let mut flare_power = FlarePower::default();
+            // The heading knob, set as a pilot sets it (`bug_knob`, issue #93).
+            let mut bug_hold = crate::circuit::BugHold::default();
+            let knob_t0 = std::time::Instant::now();
             // The lever the approach was flown on, for a balloon to hold.
             let mut approach_thr: Option<f64> = None;
             let mut go_around = GoAroundLatch::new();
@@ -2602,12 +2605,35 @@ pub fn run_autoland_scoped(
                         own_vertical: true,
                     },
                 };
-                let (_, hdg_st, vs_st, _, yield_r, roll_yield_r) = tokio::join!(
+                // The knob: once per phase or pattern leg and corrected past a
+                // deadband (`bug_knob`); the short final and the flare steer
+                // it every tick, as before.
+                let knob = bug_knob(
+                    g.phase,
+                    in_short_final || g.arresting,
+                    pattern.map(|(_, l, _)| l),
+                    missed,
+                );
+                let knob_set = match (cpl.own_lateral, knob) {
+                    (false, _) => {
+                        bug_hold.reset();
+                        None
+                    }
+                    (true, Some((key, db))) => {
+                        bug_hold.decide(key, mag_hdg, knob_t0.elapsed().as_secs_f64(), db)
+                    }
+                    (true, None) => {
+                        bug_hold.reset();
+                        Some(mag_hdg)
+                    }
+                };
+                let (knob_read, hdg_st, vs_st, _, yield_r, roll_yield_r) = tokio::join!(
                     async {
-                        if cpl.own_lateral {
-                            crate::tools::autopilot::drive_heading_bug_step(&xp, mag_hdg, 30.0).await
-                        } else {
-                            0.0
+                        match knob_set {
+                            Some(h) => {
+                                Some(crate::tools::autopilot::drive_heading_bug_step(&xp, h, 30.0).await)
+                            }
+                            None => None,
                         }
                     },
                     xp.get_float(HDG_STATUS),
@@ -2640,6 +2666,15 @@ pub fn run_autoland_scoped(
                         }
                     },
                 );
+                if let (Some((key, _)), Some(h)) = (knob, knob_set) {
+                    bug_hold.took(knob_read);
+                    crate::blackbox::record(
+                        "autoland",
+                        serde_json::json!({"event": "heading_set", "key": key, "hdg": h,
+                            "read": knob_read, "phase": format!("{:?}", g.phase),
+                            "radio": radio_ft}),
+                    );
+                }
                 // The pilot pulled or pushed: the plugin has already dropped
                 // the override this frame. Stop commanding and let the dial
                 // fly what is left — the VS path is still running underneath.
@@ -5397,6 +5432,36 @@ pub fn go_around_flap_due(ias_kts: f64, floor_kts: Option<f64>) -> bool {
     match floor_kts {
         Some(f) if f.is_finite() => ias_kts >= f,
         _ => true,
+    }
+}
+
+/// Autoland's intercepts, patterns and missed approach: a two-degree
+/// correction at most every five seconds.
+pub const AUTOLAND_INTERCEPT_DEADBAND: crate::circuit::BugDeadband =
+    crate::circuit::BugDeadband { deg: 2.0, every_s: 5.0 };
+/// The final outside [`SHORT_FINAL_NM`]: half a degree at most every two
+/// seconds (a degree every three left the fitted 737 9.8 m off at the
+/// roundout gate from a 30 m LEMG 13 handover, against 3.9 every tick).
+pub const AUTOLAND_FINAL_DEADBAND: crate::circuit::BugDeadband =
+    crate::circuit::BugDeadband { deg: 0.5, every_s: 2.0 };
+
+/// How autoland's heading knob is set this tick (issue #93): the key and
+/// deadband for [`crate::circuit::BugHold`], or `None` to steer it every
+/// tick as before (the short final and the flare, where the last 0.3 nm
+/// closes the centreline in seconds). A pattern's legs and each missed
+/// approach stage are their own keys, so a new leg is set at once. Pure.
+pub fn bug_knob(
+    phase: ApproachPhase,
+    short_final: bool,
+    pattern_leg: Option<crate::reversal::Leg>,
+    missed: Option<MissedStage>,
+) -> Option<(u32, crate::circuit::BugDeadband)> {
+    match (phase, short_final, pattern_leg, missed) {
+        (ApproachPhase::Flare, ..) | (_, true, ..) => None,
+        (_, _, Some(leg), _) => Some((10 + leg as u32, AUTOLAND_INTERCEPT_DEADBAND)),
+        (_, _, None, Some(stage)) => Some((20 + stage as u32, AUTOLAND_INTERCEPT_DEADBAND)),
+        (ApproachPhase::Final, ..) => Some((2, AUTOLAND_FINAL_DEADBAND)),
+        (ApproachPhase::Intercept, ..) => Some((1, AUTOLAND_INTERCEPT_DEADBAND)),
     }
 }
 
@@ -11029,6 +11094,85 @@ mod lemg_737_flare_tests {
         out
     }
 
+    /// Every autoland tick's bug (true) from four LEMG 13 approaches of
+    /// 2026-09-28, the arm to the wheels (two 5 nm finals, one with an
+    /// intercept, and a full-auto circuit's final).
+    const LEMG_13_FINAL_KNOBS: &str = include_str!("../bench/landings/lemg13_final_knobs.jsonl");
+
+    /// Issue #93: those approaches' bugs replayed through the knob autoland
+    /// now sets (`bug_knob`): the knob moved (0.2 degrees or more, the least
+    /// `drive_heading_bug_step` writes) at most half as often outside the
+    /// short final and the flare (which still steer every tick), and always
+    /// within a turn's steering of the law's own bug: 21 moves against 76.
+    #[test]
+    fn the_recorded_finals_move_the_knob_less() {
+        let moved = |a: Option<f64>, b: f64| {
+            a.is_none_or(|a| (((b - a) + 540.0).rem_euclid(360.0) - 180.0).abs() >= 0.2)
+        };
+        let mut by_sortie: Vec<(String, Vec<serde_json::Value>)> = Vec::new();
+        for line in LEMG_13_FINAL_KNOBS.lines() {
+            let v: serde_json::Value = serde_json::from_str(line).expect("a bench line");
+            let s = v["sortie"].as_str().unwrap().to_string();
+            match by_sortie.last_mut() {
+                Some((id, ticks)) if *id == s => ticks.push(v),
+                _ => by_sortie.push((s, vec![v])),
+            }
+        }
+        assert_eq!(by_sortie.len(), 4);
+        let (mut free_all, mut held_all) = (0u32, 0u32);
+        for (s, ticks) in &by_sortie {
+            let mut hold = crate::circuit::BugHold::default();
+            let (mut free, mut held) = (0u32, 0u32);
+            let (mut free_at, mut held_at) = (None::<f64>, None::<f64>);
+            let t0 = ticks[0]["t"].as_f64().unwrap();
+            for k in ticks {
+                let b = k["bug_true"].as_f64().unwrap();
+                let phase = match k["phase"].as_str() {
+                    Some("Flare") => super::ApproachPhase::Flare,
+                    Some("Final") => super::ApproachPhase::Final,
+                    _ => super::ApproachPhase::Intercept,
+                };
+                let short = k["short_final"] == true || k["arresting"] == true;
+                let leg = match k["leg"].as_str() {
+                    Some("outbound") => Some(crate::reversal::Leg::Outbound),
+                    Some("base") => Some(crate::reversal::Leg::Base),
+                    Some("inbound") => Some(crate::reversal::Leg::Inbound),
+                    _ => None,
+                };
+                let knob = match super::bug_knob(phase, short, leg, None) {
+                    Some((key, db)) => {
+                        hold.decide(key, b, k["t"].as_f64().unwrap() - t0, db);
+                        let h = hold.set().unwrap_or(b);
+                        let off = (((h - b) + 540.0).rem_euclid(360.0) - 180.0).abs();
+                        assert!(
+                            off < crate::circuit::BUG_STEER_DEG,
+                            "{s}: the knob {h:.1} against the law's {b:.1}"
+                        );
+                        h
+                    }
+                    None => {
+                        hold.reset();
+                        free_at = None;
+                        held_at = None;
+                        continue;
+                    }
+                };
+                if moved(free_at, b) {
+                    free += 1;
+                    free_at = Some(b);
+                }
+                if moved(held_at, knob) {
+                    held += 1;
+                    held_at = Some(knob);
+                }
+            }
+            assert!(held * 2 <= free, "{s}: {held} moves against {free}");
+            free_all += free;
+            held_all += held;
+        }
+        assert!(held_all * 3 <= free_all, "{held_all} moves against {free_all}");
+    }
+
     /// The loop's measure of the final's air tells the three apart: the
     /// gusty finals strayed 72 and 105 fpm rms from the sink asked for, the
     /// calm one 19.
@@ -11654,6 +11798,15 @@ pub(crate) mod lemg_replay {
         pub short_final: Option<ShortFinal>,
         pub width_m: Option<f64>,
         pub trim_cap_deg: f64,
+        /// The knob as the loop sets it (`bug_knob`), when held; the knob
+        /// the aircraft flies, how many times it moved (0.2 degrees, the
+        /// least `drive_heading_bug_step` writes) and the loop's clock.
+        pub knob: Option<crate::circuit::BugHold>,
+        pub knob_at: Option<f64>,
+        /// A deadband over the loop's own (`bug_knob`), for comparisons.
+        pub knob_db: Option<crate::circuit::BugDeadband>,
+        pub moves: u32,
+        pub t: f64,
     }
 
     impl FinalLoop {
@@ -11664,7 +11817,18 @@ pub(crate) mod lemg_replay {
                 short_final: None,
                 width_m,
                 trim_cap_deg,
+                knob: None,
+                knob_at: None,
+                knob_db: None,
+                moves: 0,
+                t: 0.0,
             }
+        }
+
+        /// ...with the knob set as today's loop sets it.
+        pub fn held(mut self) -> Self {
+            self.knob = Some(crate::circuit::BugHold::default());
+            self
         }
 
         /// One tick: the bug (true) and the guidance behind it.
@@ -11714,7 +11878,26 @@ pub(crate) mod lemg_replay {
                     g.target_heading_deg + crab + trim
                 }
             };
-            (bug.rem_euclid(360.0), g)
+            self.t += dt;
+            let short = in_short || g.arresting;
+            let mut bug = bug.rem_euclid(360.0);
+            if let Some(k) = self.knob.as_mut() {
+                match bug_knob(g.phase, short, None, None) {
+                    Some((key, db)) => {
+                        k.decide(key, bug, self.t, self.knob_db.unwrap_or(db));
+                        bug = k.set().unwrap_or(bug);
+                    }
+                    None => k.reset(),
+                }
+            }
+            if self
+                .knob_at
+                .is_none_or(|a| (((bug - a) + 540.0).rem_euclid(360.0) - 180.0).abs() >= 0.2)
+            {
+                self.moves += 1;
+                self.knob_at = Some(bug);
+            }
+            (bug, g)
         }
     }
 
@@ -12059,6 +12242,71 @@ mod issue_147_tests {
             "{x:.1} m at 0.5 nm"
         );
         assert!(trim < 0.5, "{trim:.2}");
+    }
+
+    /// Issue #93: autoland's final with the knob set as a pilot sets it (half
+    /// a degree at most every two seconds outside the short final) holds the
+    /// line the every-tick knob held, from the LEMG 31 handover and offsets
+    /// either side of 13 in four winds: no balk, the roundout gate within
+    /// 2 m of it, the worst offset below 500 ft within 3 m of it or inside
+    /// the landing limit (the plant has no gusts, so the knob's moves are
+    /// counted on the recordings: `the_recorded_finals_move_the_knob_less`).
+    #[test]
+    fn the_final_on_a_held_knob_keeps_the_line() {
+        let limit = landing_xtk_limit_m(Some(LEMG_WIDTH_M));
+        // (runway, along m, xtk m, heading true, IAS, wind from, m/s)
+        let starts = [
+            ("31", 3392.9, 103.1, 299.4, 149.0, 106.0, 3.0),
+            ("13", 3700.0, 30.0, 126.0, 146.0, 106.0, 6.0),
+            ("13", 3700.0, -40.0, 136.0, 146.0, 200.0, 8.0),
+            ("13", 5500.0, 0.0, 131.7, 150.0, 40.0, 7.0),
+        ];
+        for (id, along, xtk, psi, ias, wf, wm) in starts {
+            let rwy = lemg(id);
+            let fly = |held: bool| {
+                let (lat, lon) = at(&rwy, along, xtk);
+                let mut jet = Jet::new(lat, lon, psi, ias);
+                jet.wind_to_deg = (wf + 180.0_f64).rem_euclid(360.0);
+                jet.wind_mps = wm;
+                let lp = FinalLoop::new(Some(LEMG_WIDTH_M), TRACK_TRIM_ERR_CAP_DEG);
+                let mut lp = if held { lp.held() } else { lp };
+                let f = fly_final(&mut jet, &mut lp, &rwy, 0.35);
+                (f, lp.moves)
+            };
+            let (free, free_moves) = fly(false);
+            let (f, moves) = fly(true);
+            assert!(f.balk.is_none() && free.balk.is_none(), "{id} {along} {xtk}: {f:?}");
+            assert!(
+                f.gate_xtk_m.abs() <= free.gate_xtk_m.abs() + 2.0
+                    && f.worst_low_xtk_m <= (free.worst_low_xtk_m + 3.0).max(limit),
+                "{id} {along} {xtk}: {f:?} against {free:?}"
+            );
+            assert!(moves <= free_moves, "{id}: {moves} against {free_moves}");
+        }
+    }
+
+    /// The knob's keys: the short final and the flare steer every tick; a
+    /// pattern leg, a missed approach stage, the final and an intercept are
+    /// each set once and corrected past their deadband.
+    #[test]
+    fn the_knob_keys() {
+        use crate::reversal::Leg;
+        assert_eq!(bug_knob(ApproachPhase::Flare, false, None, None), None);
+        assert_eq!(bug_knob(ApproachPhase::Final, true, None, None), None);
+        assert_eq!(
+            bug_knob(ApproachPhase::Final, false, None, None),
+            Some((2, AUTOLAND_FINAL_DEADBAND))
+        );
+        let out = bug_knob(ApproachPhase::Intercept, false, Some(Leg::Outbound), None);
+        let base = bug_knob(ApproachPhase::Intercept, false, Some(Leg::Base), None);
+        assert!(out.is_some() && base.is_some() && out != base);
+        let climb = bug_knob(ApproachPhase::Intercept, false, None, Some(MissedStage::Climb));
+        let repo = bug_knob(ApproachPhase::Intercept, false, None, Some(MissedStage::Reposition));
+        assert!(climb.is_some() && repo.is_some() && climb != repo);
+        assert_eq!(
+            bug_knob(ApproachPhase::Intercept, false, None, None),
+            Some((1, AUTOLAND_INTERCEPT_DEADBAND))
+        );
     }
 
     /// The limits follow the pavement, and a runway of unknown width keeps

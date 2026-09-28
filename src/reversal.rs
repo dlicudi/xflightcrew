@@ -440,8 +440,17 @@ mod tests {
 
     /// Fly the pattern, then the final's pursuit, to the threshold; returns
     /// the worst cross-track inside 3 nm and the legs seen.
-    fn fly_pattern(mut p: Plant, rwy: &Runway, side: f64) -> (f64, Vec<Leg>) {
+    fn fly_pattern(p: Plant, rwy: &Runway, side: f64) -> (f64, Vec<Leg>) {
+        let (worst, legs, _) = fly_pattern_knob(p, rwy, side, false);
+        (worst, legs)
+    }
+
+    /// ...with the knob set as autoland sets it (`autoland::bug_knob`) when
+    /// `held`; the third answer is how often the knob moved (0.2 degrees).
+    fn fly_pattern_knob(mut p: Plant, rwy: &Runway, side: f64, held: bool) -> (f64, Vec<Leg>, u32) {
         let join = 5.75;
+        let mut hold = crate::circuit::BugHold::default();
+        let (mut t, mut moves, mut knob_at) = (0.0, 0u32, None::<f64>);
         let mut rev = Some(Reversal {
             side,
             leg: Leg::Outbound,
@@ -492,8 +501,28 @@ mod tests {
                 worst_inside_3 = worst_inside_3.max(xtk.abs() * M_PER_NM);
             }
             if rev.is_none() && along <= 0.05 {
-                return (worst_inside_3, legs);
+                return (worst_inside_3, legs, moves);
             }
+            let mut bug = bug;
+            if held {
+                let (phase, leg) = match rev {
+                    Some(r) => (crate::autoland::ApproachPhase::Intercept, Some(r.leg)),
+                    None => (crate::autoland::ApproachPhase::Final, None),
+                };
+                let short = rev.is_none() && along <= crate::autoland::SHORT_FINAL_NM;
+                match crate::autoland::bug_knob(phase, short, leg, None) {
+                    Some((key, db)) => {
+                        hold.decide(key, bug, t, db);
+                        bug = hold.set().unwrap_or(bug);
+                    }
+                    None => hold.reset(),
+                }
+            }
+            if knob_at.is_none_or(|a| heading_diff(bug, a).abs() >= 0.2) {
+                moves += 1;
+                knob_at = Some(bug);
+            }
+            t += 0.5;
             p.fly(bug, 0.5);
         }
         panic!("never reached the threshold: legs {legs:?}");
@@ -540,6 +569,48 @@ mod tests {
             let (worst, legs) = fly_pattern(p, &rwy, side);
             assert_eq!(legs.last(), Some(&Leg::Inbound));
             assert!(worst < 60.0, "{gs} kt: {worst:.0} m off inside 3 nm");
+        }
+    }
+
+
+    /// Issue #93: the patterns flown on the knob autoland now sets (each leg
+    /// once, corrections past two degrees at most every five seconds, the
+    /// final past half a degree every two) fly the same legs onto the same
+    /// line, with the knob moved far less (EGTE 08: 30 to 39 moves against
+    /// 188 to 272; worst inside 3 nm 5 to 7 m against 3 to 15).
+    #[test]
+    fn a_pattern_on_a_held_knob_flies_the_same_legs() {
+        let rwy = egte_08();
+        let (lat, lon) = project_latlon(rwy.thr_lat, rwy.thr_lon, 80.0, 6.5);
+        let wrong_final = Plant {
+            lat,
+            lon,
+            hdg: 259.0,
+            bank: 0.0,
+            gs_kts: 165.0,
+            max_bank: 24.0,
+        };
+        let side = pick_side(cross_track_nm(lat, lon, &rwy), None, None);
+        let (lat, lon) = project_latlon(rwy.thr_lat, rwy.thr_lon, rwy.course_deg, 1.5);
+        let go_around = |gs: f64, bank: f64| Plant {
+            lat,
+            lon,
+            hdg: rwy.course_deg,
+            bank: 0.0,
+            gs_kts: gs,
+            max_bank: bank,
+        };
+        let copy = |p: &Plant| Plant { ..*p };
+        for (p, side) in [
+            (wrong_final, side),
+            (go_around(160.0, 24.0), -1.0),
+            (go_around(75.0, 15.5), -1.0),
+        ] {
+            let (free_worst, free_legs, free_moves) = fly_pattern_knob(copy(&p), &rwy, side, false);
+            let (worst, legs, moves) = fly_pattern_knob(p, &rwy, side, true);
+            assert_eq!(legs, free_legs);
+            assert!(worst < 60.0, "{worst:.0} m inside 3 nm (every tick {free_worst:.0})");
+            assert!(moves * 2 <= free_moves, "{moves} moves against {free_moves}");
         }
     }
 
