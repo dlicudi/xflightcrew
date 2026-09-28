@@ -9338,3 +9338,39 @@ card (`instructor::TaxiLine`); `state` records carry `taxi` [xtk, remaining, tur
 
 Next flight: `rapport` `touchdown` on the tick of `flight` `touchdown` with the model's sink; a taxi
 lesson's grade has a `centreline` axis; `xvl debrief` prints a taxi line. Offline only.
+
+## 2026-09-28: a slatted wing's stall is its own; a resume near a field flies the arrival (issues #72, #67, #70)
+
+#72: EGPF's A330 circuit (2026-09-21) called "getting slow" at 183.5 kt in CONF 1 and at 175 to 177 kt
+in CONF 2. The flap-adjusted stall was a straight line from 175 clean to 125 full: 162.5 at CONF 1 and
+150 at CONF 2, so caution started at 195 and 180 kt. Its .acf flies slats 70/87/100 % of 8 degrees
+with flaps 8/14/22 of 32; from the file's own schedule (`aircraft::detent_stall_from_acf`) the notches
+stall at 147/139/131. `FlapDetent.vs_kts` declares them (A330 profile, VERIFY),
+`aircraft::stall_speed_in_config` runs through them, and a profile that declares nothing keeps the
+line; `generic_from_acf` fills them for an unprofiled slatted wing. The monitor's stall check,
+`config_floor_kts` (1.2 x the stall in the configuration via `publish_stall_curve`: CONF 2 floors at
+167, not 180) and `speed_verdict` (which judged a full-flap final against the clean 210 floor) follow
+the table. Still open: the 145.6 kt full-flap call (Vso 125 is a heavy figure; the stall is not scaled
+with weight). The 737, MD-82 and Citation X .acf files carry slats too; their profiles are unchanged
+(the .acf model on the 737's flap angles gives about 122 kt at flaps 30, not trusted).
+
+The 225 kt "base overshoot" was a 270 degree wrong-way turn: the bug went 90 degrees left and the A330
+banked 26 degrees right; crosswind and final did the same. See #70.
+
+#67: at LIPE-LIPK the resume came 6.5 nm from Forli at 2,800 ft, past the last enroute fix, and was
+refused "climb to 7,500 feet first". `tools::full_auto::resume_join` joins a leg abeam in the
+corridor, else the origin's first fix within 15 nm, else, past the route within 25 nm of the
+destination (`ARRIVAL_REJOIN_NM`), arms autoland on the plan's runway (blackbox `full_auto`
+`resume_arrival`); a plan with no runway is refused with the distance. The LSZS 8 nm refusal is the
+departure join (pinned). Every refusal names its number. The 1,000 ft and speed gates and the 3 nm
+corridor are unchanged.
+
+#70: not our arithmetic. ESFOK (2026-09-25 20:31:33Z): the bug went 25 degrees right from wings
+level, HDG engaged, and the 172 rolled left about 1.5 s later. LIPR RW30 did the reverse, and the A330
+at EGPF turned the wrong way on every 60 to 90 degree left step; FI30's +25 lead went the right way.
+Unexplained without a per-frame probe of the sim's heading mode (a 25 degree bug step, roll and
+`heading_dial` readback per frame). Ours and still open: the on-the-nose bug is re-set to the current
+heading every tick, so it holds no heading while a roll persists.
+
+Next flight: `full_auto` `resume_arrival` then `autoland` on the named runway; every `resume_refused`
+why carries a number; no A330 `airspeed_caution` in CONF 1 to 3 above 1.2 x 147/139/131. Offline only.

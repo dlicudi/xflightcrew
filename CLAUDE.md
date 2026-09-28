@@ -101,6 +101,9 @@ Datarefs and commands stay in the Rust tools; YAML is per-airframe config.
   from the `.acf` (`acf_relative_path` under `xplane_root()`) and the pilot hears "no profile for
   this airframe"; only an unreadable file gets the 172, said aloud. Approach = max(1.3 Vso,
   1.2 Vs). `bus_volts_nominal` scales the start gate.
+- **A slatted wing's stall is per notch** (`FlapDetent.vs_kts`, `aircraft::stall_speed_in_config`,
+  from the .acf's slat schedule by `detent_stall_from_acf`): the monitor, `config_floor_kts` and
+  `speed_verdict` read the same table; with nothing declared it is the straight line (EGPF A330).
 - **No automation target below the speed floor** (`aircraft::speed_floor_kts`, 1.2 x clean Vs,
   per swap): `speedhold::arm_flight` and `run_autoland` raise it and say so (`target_floored`,
   `approach_ias_floored`); a wrong number from a profile, plan or pilot is still wrong. The ceiling
@@ -425,7 +428,9 @@ everything blackboxes to `logs/blackbox.jsonl` (kinds: `atc`, `autotaxi`, `autot
   (`LXGB_ROCK_CLEAR_M`).
 - Full auto: engine start per class (`StartKind`); power-up INLINE (racing bring-ups shut a
   cross-tie); waits on `driving()`, not `ACTIVE`; refuses to arm airborne, naming the tools that
-  fly; ends with `taxi_in_after_landing`. Cruise is a SPEED (`reference.cruise_ias_kts`).
+  fly; ends with `taxi_in_after_landing`. **A resume past the route near the destination is the
+  arrival** (`resume_join`, `ARRIVAL_REJOIN_NM`, autoland on the plan's runway); every refusal names
+  its number. Cruise is a SPEED (`reference.cruise_ias_kts`).
 - **The arrival is briefed at the arm** (`full_auto::brief_arrival`); a destination the data lacks
   is refused there, not on the approach.
 - **The next fix is `procedure::active_leg()` first**: the GPS sits on the plan's first entry.
