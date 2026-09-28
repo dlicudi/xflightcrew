@@ -9852,3 +9852,12 @@ HEMEL window) against the filed FL180: the check-in and departure's climb are ca
 cruise. (5) A ghost cleared for takeoff on 08R 1.6 s after us: the wake clock sat on the other strip's
 end, a ghost liftoff was narrated 17 s late, TakeoffCleared claimed only a direction; fixed (one
 departure on the runway at a time). (6) "1 miles" in traffic advisories. Offline only.
+
+## 2026-09-28: the runner's wind runway and the scorer's new flight (issue #158)
+
+The swap from the SR22 still on final to LEMG 30 (1,270 ft, 549 fpm down, past its deadline) to the SF50
+on 13's threshold scored "landing FAIL, touched down at 549 fpm": the scorer's airborne track outlived
+the jump. `Scorer::new_flight` now runs on every `flight` `reposition` and `flight_meta`. The specs named
+13 with the wind at 280/5 while the tower sent arrivals to 30: `runway: wind` picks the tower's end at
+each setup (`nav::best_runway_for_wind`), a default deadline scales with the airframe's approach speed,
+rows are flushed (pipe through `grep --line-buffered`). Offline only.
