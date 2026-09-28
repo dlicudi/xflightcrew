@@ -362,6 +362,29 @@ pub fn driving() -> bool {
 /// must not be driven over.
 pub static LAST_ARRIVED: AtomicBool = AtomicBool::new(false);
 
+/// Whether the LAST drive stood down because the aircraft was MOVED under
+/// it ([`relocation_jump_m`]): a reposition, a sim reload, a replay scrub.
+/// Set by the loop, cleared by every [`start`]. The taxi-in reads it: the
+/// drive it was running belongs to a place the aircraft no longer is.
+pub static RELOCATED: AtomicBool = AtomicBool::new(false);
+
+/// No aircraft on its wheels covers ground faster than this; the slack
+/// absorbs a stale read and the tick's own jitter.
+pub(crate) const RELOCATE_MAX_MPS: f64 = 60.0;
+pub(crate) const RELOCATE_SLACK_M: f64 = 100.0;
+
+/// A position JUMP between two reads `dt_s` apart: `Some(metres)` when the
+/// aircraft moved further than it could have on its wheels, else `None`.
+/// A jump is never a movement (the projection rule's sibling): LEMG 31
+/// (2026-09-28, sorties 1790584715 and 1790585651) the sortie runner's next
+/// setup reloaded the aircraft 1,293 m from its rollout 0.3 s after the
+/// landing verdict, the vacate "joined" 1,033 m off its route, and the
+/// taxi-in went on to ask for and drive a stand route from the new place.
+pub fn relocation_jump_m(from: (f64, f64), to: (f64, f64), dt_s: f64) -> Option<f64> {
+    let d = crate::autoland::haversine_nm(from.0, from.1, to.0, to.1) * M_PER_NM;
+    (d > RELOCATE_SLACK_M + RELOCATE_MAX_MPS * dt_s.max(0.0)).then_some(d)
+}
+
 /// Stop a drive from OUTSIDE its loop, claiming nothing.
 ///
 /// The arrival latch is cleared with the flags, and that is the whole point:
@@ -1654,6 +1677,7 @@ pub fn start(base_url: String, voice: Option<Voice>, route: Route, base_kts: f64
     }
     let gen = DRIVE_GEN.fetch_add(1, Ordering::SeqCst) + 1;
     LAST_ARRIVED.store(false, Ordering::Relaxed);
+    RELOCATED.store(false, Ordering::Relaxed);
     std::thread::spawn(move || {
         let Ok(rt) = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -1867,6 +1891,8 @@ async fn drive(xp: XPlaneClient, voice: Option<Voice>, route: Route, base_kts: f
     let mut stalled_since: Option<std::time::Instant> = None;
     // Over the taxi pace since (see [`taxi_overspeed`]).
     let mut overspeed_since: Option<std::time::Instant> = None;
+    // The last good fix, for the relocation guard ([`relocation_jump_m`]).
+    let mut last_fix: Option<((f64, f64), std::time::Instant)> = None;
     loop {
         if !ACTIVE.load(Ordering::Relaxed) || DRIVE_GEN.load(Ordering::SeqCst) != gen {
             crate::blackbox::record(
@@ -2004,6 +2030,33 @@ async fn drive(xp: XPlaneClient, voice: Option<Voice>, route: Route, base_kts: f
             continue;
         };
         let gs_kts = gs_ms * MS_TO_KTS;
+        // Moved under us: whatever this route was, it is for a place the
+        // aircraft no longer is. Stand down BEFORE the join or the off-route
+        // guard reads the jump as a drive gone wrong (LEMG 31, 2026-09-28).
+        let now = std::time::Instant::now();
+        if let Some((from, t0)) = last_fix {
+            if let Some(jump_m) =
+                relocation_jump_m(from, (lat, lon), now.duration_since(t0).as_secs_f64())
+            {
+                tracing::warn!(jump_m, "auto taxi: the aircraft was moved, standing down");
+                crate::blackbox::record(
+                    "autotaxi",
+                    serde_json::json!({"event": "relocated", "jump_m": jump_m,
+                                       "dt_s": now.duration_since(t0).as_secs_f64()}),
+                );
+                speedhold::set_taxi_target(0.0);
+                let _ = xp.set_float(TAXI_STEER, 0.0).await;
+                RELOCATED.store(true, Ordering::Relaxed);
+                alert(
+                    &voice,
+                    Priority::Caution,
+                    "We've been moved. Taxi stopped. Your aircraft.",
+                );
+                ACTIVE.store(false, Ordering::Relaxed);
+                break;
+            }
+        }
+        last_fix = Some(((lat, lon), now));
         // Signed here, magnitude everywhere below: the gates ask how far off
         // the route we are, and the record wants to know which side. While
         // still JOINING, project along the nose: the nearest paint can be a
@@ -2395,6 +2448,34 @@ async fn drive(xp: XPlaneClient, voice: Option<Voice>, route: Route, base_kts: f
 
 #[cfg(test)]
 mod tests {
+    /// LEMG 31 (2026-09-28, issue #141): the rollout at 16.1 kt (state t
+    /// 1790585617.7), then 0.5 s later on 12/30's centreline at 0.1 kt after
+    /// the sortie runner's reload. The drive then read the 1,293 m as a join
+    /// 1,033 m off its line and a stand drive 492 m off route.
+    #[test]
+    fn a_jump_in_position_is_a_relocation_never_a_movement() {
+        let rollout = (36.67410120039185, -4.49797079757389);
+        let reloaded = (36.68532005, -4.49417);
+        let jump = super::relocation_jump_m(rollout, reloaded, 0.5).expect("a relocation");
+        assert!((1250.0..1350.0).contains(&jump), "{jump:.0} m");
+        // The second reload, rwy 13's threshold 6 s later, is one too.
+        assert!(
+            super::relocation_jump_m(reloaded, (36.68428873856669, -4.512249603370898), 6.0)
+                .is_some()
+        );
+        // Real driving never is: the rollout's own 1.5 s at 37 kt (state
+        // t 1790585614.3 -> .8), a 25 kt taxi over a 3 s read gap, standing still.
+        assert!(super::relocation_jump_m(
+            (36.67374691174619, -4.497480866034466),
+            (36.67397931820287, -4.497803976111265),
+            1.5
+        )
+        .is_none());
+        let three_s_at_25_kts = (36.6741 + 38.6 / 111_320.0, -4.4980);
+        assert!(super::relocation_jump_m((36.6741, -4.4980), three_s_at_25_kts, 3.0).is_none());
+        assert!(super::relocation_jump_m(rollout, rollout, 0.0).is_none());
+    }
+
     #[test]
     fn a_stuck_taxi_says_what_the_log_can_show() {
         assert!(super::stagnant_line(true, true).contains("grass"));

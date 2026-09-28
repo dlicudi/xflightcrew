@@ -14151,4 +14151,102 @@ mod tests {
             new.crossings
         );
     }
+
+    /// LEMG 31 (737, 2026-09-28, issue #141): the rollout stopped at
+    /// 36.674101 N 4.497971 W heading 311 true (state at t 1790585617.7;
+    /// sortie 1790585651 stopped at 36.674500 N 4.498537 W, t 1790586584.6),
+    /// 1.1 m off the 13/31 centreline and 1,262 m off 12/30. The strip under
+    /// the aircraft is 13/31, the vacate starts AT the aircraft and runs
+    /// forward, and the stand route from there leaves 13/31 forward without
+    /// calling it a crossing. The "12/30" of the recorded
+    /// `stand_route_from_runway` was the RIGHT answer for where the aircraft
+    /// then was: the sortie runner had reloaded it onto 12/30's centreline
+    /// (36.685320 N 4.494170 W, 0.0 m off 12/30, 1,158 m off 13/31) 0.3 s
+    /// after the landing's verdict, so it is pinned here too.
+    /// `cargo test -p atc -- --ignored live_lemg_31 --nocapture`
+    #[test]
+    #[ignore] // needs the real X-Plane install; run with --ignored
+    fn live_lemg_31_rollout_vacates_forward_off_the_strip_under_it() {
+        let apt =
+            crate::nav::test_xplane_path("Global Scenery/Global Airports/Earth nav data/apt.dat");
+        let Ok(Some(net)) = nav::find_taxi_net(&apt, "LEMG") else {
+            return; // no install, no verdict
+        };
+        let runways = nav::find_runways(&apt, "LEMG").unwrap();
+        let strip_under = |lat: f64, lon: f64| -> Vec<String> {
+            runways
+                .iter()
+                .filter(|r| on_runway(r, lat, lon).is_some())
+                .map(|r| format!("{}/{}", r.ident_a, r.ident_b))
+                .collect()
+        };
+        // The reload spot: 12/30 and nothing else.
+        assert_eq!(
+            strip_under(36.68532005, -4.49417),
+            vec!["12/30".to_string()]
+        );
+        let psi = 311.7; // 31's true course; the rollout read 310.9 to 311.4
+        for (lat, lon) in [
+            (36.67410120039185, -4.49797079757389),
+            (36.674499892604075, -4.498536580519237),
+        ] {
+            assert_eq!(
+                strip_under(lat, lon),
+                vec!["13/31".to_string()],
+                "the rollout is on 13/31"
+            );
+            let zone = vec!["31".to_string(), "13".to_string()];
+            let v = net
+                .plan_vacate(lat, lon, psi, &zone, nav::VACATE_CLEAR_M)
+                .expect("a way off 31 ahead");
+            let start_m = nav::haversine_nm(lat, lon, v.path[0].0, v.path[0].1) * 1852.0;
+            println!(
+                "vacate via {:?}: {} pts, starts {start_m:.1} m from the aircraft",
+                v.exit_name,
+                v.path.len()
+            );
+            assert!(
+                start_m < 5.0,
+                "the vacate starts at the aircraft: {start_m:.1} m"
+            );
+            // Forward: the first point 40 m on is ahead of abeam.
+            let mut run = 0.0;
+            let mut ahead = None;
+            for w in v.path.windows(2) {
+                run += nav::haversine_nm(w[0].0, w[0].1, w[1].0, w[1].1) * 1852.0;
+                if run >= 40.0 {
+                    ahead = Some(nav::bearing_deg(lat, lon, w[1].0, w[1].1));
+                    break;
+                }
+            }
+            let brg = ahead.expect("a vacate longer than 40 m");
+            assert!(
+                nav::angle_diff_deg(brg, psi).abs() < 90.0,
+                "the vacate runs forward: {brg:.0} against {psi:.0}"
+            );
+            // Ends OFF 13/31 (and off every strip).
+            let end = *v.path.last().unwrap();
+            assert!(
+                strip_under(end.0, end.1).is_empty(),
+                "the vacate ends off the strips: {end:?}"
+            );
+            // The stand route asked from here starts with that vacate, off
+            // 13/31, forward, and never calls 13/31 a crossing.
+            let plan = stand_route_on(&net, &runways, lat, lon, Some(psi)).expect("a stand route");
+            let first_m = nav::haversine_nm(lat, lon, plan.path[0].0, plan.path[0].1) * 1852.0;
+            println!(
+                "stand {:?} via {:?} crossings {:?}, starts {first_m:.1} m off",
+                plan.holding_point, plan.via, plan.crossings
+            );
+            assert!(
+                first_m < 5.0,
+                "the stand route starts at the aircraft: {first_m:.1} m"
+            );
+            assert!(
+                !plan.crossings.contains(&"13/31".to_string()),
+                "the strip we are on is not a crossing: {:?}",
+                plan.crossings
+            );
+        }
+    }
 }

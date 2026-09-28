@@ -90,6 +90,23 @@ pub fn start(
     });
 }
 
+/// The aircraft was moved under the taxi-in: stop here, ask nothing, drive
+/// nothing. Said only when the drive's own guard has not already said it.
+fn stand_down_relocated(voice: &Option<Voice>, at: &str, said: bool) {
+    crate::blackbox::record(
+        "taxi_in",
+        json!({ "event": "relocated", "at": at, "said": said }),
+    );
+    if !said {
+        announce(
+            voice,
+            Priority::Caution,
+            "We've been moved. Taxi-in cancelled. Your aircraft.",
+        );
+    }
+    arrest_release();
+}
+
 fn announce(voice: &Option<Voice>, priority: Priority, line: &str) {
     if let Some(v) = voice {
         v.alert(priority, line.to_string());
@@ -145,13 +162,49 @@ fn vacate_budget_secs(route_m: f64, kts: f64) -> f64 {
     (1.5 * route_m.max(0.0) / mps).max(VACATE_MAX_SECS)
 }
 
+/// How phase one ended, for the only question phase two asks of it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VacateEnd {
+    /// Driven, refused, timed out or handed back: the taxi-in goes on from
+    /// wherever the aircraft is, as it always did.
+    Carry,
+    /// The aircraft was MOVED under the vacate (a reposition, a sim reload):
+    /// nothing planned from the rollout means anything any more, and a
+    /// taxi-in request from the new place is a flight nobody flew. `said`:
+    /// the drive's own guard already told the pilot.
+    Relocated { said: bool },
+}
+
+/// The aircraft's position, or `None` on a failed read (no measurement).
+async fn position(xp: &XPlaneClient) -> Option<(f64, f64)> {
+    let (lat, lon) = tokio::join!(
+        xp.get_float(crate::datarefs::LATITUDE),
+        xp.get_float(crate::datarefs::LONGITUDE),
+    );
+    Some((lat.ok()?, lon.ok()?))
+}
+
+/// Whether a vacate route planned from the rollout still starts where the
+/// aircraft is: `from` is where it was planned, `now` a fresh read `dt_s`
+/// later, `lateral_m` the fresh read's distance off the route. Either a jump
+/// ([`crate::autotaxi::relocation_jump_m`]) or a route further off than any
+/// join ([`crate::autotaxi::MAX_JOIN_M`], the auto taxi tool's own refusal,
+/// which the vacate's direct start used to skip) is a vacate that must not
+/// start. LEMG 31 (2026-09-28): planned at the rollout's stop, engaged 0.3 s
+/// later 1,033 m off its line after the sortie runner reloaded the aircraft.
+fn vacate_still_here(from: (f64, f64), now: (f64, f64), dt_s: f64, lateral_m: f64) -> bool {
+    crate::autotaxi::relocation_jump_m(from, now, dt_s).is_none()
+        && lateral_m <= crate::autotaxi::MAX_JOIN_M
+}
+
 /// Phase one: drive clear of `rwy`, then report it.
 ///
 /// Best effort throughout, and every failure falls through to the taxi-in
-/// exactly as it behaved before this existed — no network at the field, a
+/// exactly as it behaved before this existed: no network at the field, a
 /// runway with no authored exits, a drive that refuses. The one thing this
 /// must never do is BLOCK the taxi-in, because the taxi-in is the other way
-/// off the runway.
+/// off the runway. The one exception is an aircraft MOVED under it
+/// ([`VacateEnd::Relocated`]): there is no runway of ours to get off.
 async fn vacate(
     xp: &XPlaneClient,
     config: &Config,
@@ -160,8 +213,9 @@ async fn vacate(
     prop: Option<crate::aircraft::PropProfile>,
     pace: crate::autotaxi::Pace,
     rwy: &str,
-) {
+) -> VacateEnd {
     use std::sync::atomic::Ordering::Relaxed;
+    let planned_at = std::time::Instant::now();
     let (lat_r, lon_r, psi_r) = tokio::join!(
         xp.get_float(crate::datarefs::LATITUDE),
         xp.get_float(crate::datarefs::LONGITUDE),
@@ -169,13 +223,13 @@ async fn vacate(
     );
     let (Ok(lat), Ok(lon), Ok(psi)) = (lat_r, lon_r, psi_r) else {
         crate::blackbox::record("taxi_in", json!({ "event": "vacate_no_position" }));
-        return;
+        return VacateEnd::Carry;
     };
     let Some(plan) = crate::party_line::plan_vacate(lat, lon, psi, rwy) else {
         // No network, or no exit ahead. The taxi-in still runs; it just starts
         // from the runway as it always did.
         crate::blackbox::record("taxi_in", json!({ "event": "vacate_no_plan", "rwy": rwy }));
-        return;
+        return VacateEnd::Carry;
     };
     let watch = crate::station::TaxiWatch {
         path: plan.path.clone(),
@@ -191,7 +245,7 @@ async fn vacate(
             "taxi_in",
             json!({ "event": "vacate_too_short", "pts": plan.path.len() }),
         );
-        return;
+        return VacateEnd::Carry;
     };
     route.pace = pace;
     route.done_line = Some(if plan.exit_name.is_empty() {
@@ -235,12 +289,33 @@ async fn vacate(
     .await;
     if armed.is_err() || !crate::tools::speedhold::taxi_hold_active() {
         crate::blackbox::record("taxi_in", json!({ "event": "vacate_no_governor" }));
-        return;
+        return VacateEnd::Carry;
     }
     // Props out of feather before the drive rolls (the same wall auto taxi
     // and the line-up hit): a turboprop with feathered blades makes no thrust.
     crate::tools::prop::advance_for_ground_roll(xp, &prop).await;
     let budget = vacate_budget_secs(route.total_m(), drive_kts);
+    // Is the route still where we are? Read again at the last moment: the
+    // plan is from the rollout's stop, and the governor's arm and the brake
+    // release took time the aircraft may have spent somewhere else.
+    if let Some(now) = position(xp).await {
+        let lateral = route
+            .fix(now.0, now.1)
+            .map_or(f64::INFINITY, |(_, l)| l.abs());
+        let dt_s = planned_at.elapsed().as_secs_f64();
+        if !vacate_still_here((lat, lon), now, dt_s, lateral) {
+            let jump_m = crate::autoland::haversine_nm(lat, lon, now.0, now.1) * 1852.0;
+            crate::blackbox::record(
+                "taxi_in",
+                json!({ "event": "vacate_relocated", "jump_m": jump_m,
+                        "lateral_m": lateral, "dt_s": dt_s }),
+            );
+            // Nothing drives, so nothing may be driving: the governor just
+            // armed at a rolling target holds at zero instead.
+            crate::tools::speedhold::set_taxi_target(0.0);
+            return VacateEnd::Relocated { said: false };
+        }
+    }
     crate::autotaxi::start(
         config.xplane_base_url.clone(),
         voice.clone(),
@@ -267,8 +342,27 @@ async fn vacate(
         }
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     }
-    let arrived = crate::autotaxi::LAST_ARRIVED.load(Relaxed);
-    crate::blackbox::record("taxi_in", json!({ "event": "vacated", "arrived": arrived }));
+    if crate::autotaxi::RELOCATED.load(Relaxed) {
+        crate::blackbox::record(
+            "taxi_in",
+            json!({ "event": "vacated", "arrived": false, "relocated": true }),
+        );
+        return VacateEnd::Relocated { said: true };
+    }
+    // Arrived is the drive's word; OFF the strip is the pavement's. A route
+    // end inside the strip's lateral span (thin data, a short exit) is still
+    // the runway, and "runway vacated" from it is a false report.
+    let drove_there = crate::autotaxi::LAST_ARRIVED.load(Relaxed);
+    let on_runway = match position(xp).await {
+        Some((la, lo)) => crate::party_line::on_runway(la, lo),
+        None => None,
+    };
+    let arrived = vacated_report_due(drove_there, on_runway);
+    crate::blackbox::record(
+        "taxi_in",
+        json!({ "event": "vacated", "arrived": arrived, "drove_there": drove_there,
+                "on_runway": on_runway }),
+    );
     // Report it — but only a drive that ARRIVED has anything to report. The
     // timeout, a refused join and a pilot handback all reach this line too,
     // possibly still mid-runway, and "runway vacated" transmitted from the
@@ -289,6 +383,14 @@ async fn vacate(
             json!({ "event": "lights_vacated", "did": did, "dark": dark }),
         );
     }
+    VacateEnd::Carry
+}
+
+/// Whether "runway vacated" may go out: the drive ARRIVED and the pavement
+/// does not say we are still on a strip. No runway data (`None`) is no
+/// evidence either way and leaves the drive's word standing.
+fn vacated_report_due(arrived: bool, on_runway: Option<bool>) -> bool {
+    arrived && on_runway != Some(true)
 }
 
 async fn fly(
@@ -303,7 +405,7 @@ async fn fly(
 ) {
     // --- Phase one: get off the runway. No clearance, no request, no wait. ---
     if let Some(rwy) = vacate_from {
-        vacate(
+        let end = vacate(
             &xp,
             &config,
             &voice,
@@ -313,6 +415,10 @@ async fn fly(
             &rwy,
         )
         .await;
+        if let VacateEnd::Relocated { said } = end {
+            stand_down_relocated(&voice, "vacate", said);
+            return;
+        }
     }
     // Autoland may have handed off ROLLING (taxi pace, brakes released) on the
     // promise that the vacate drive takes over. Any vacate failure path breaks
@@ -378,14 +484,35 @@ async fn fly(
         crate::circuit::transmit(crate::circuit::radio_call(&callsign, "taxi to parking"));
         crate::blackbox::record("taxi_in", json!({ "event": "request", "khz": khz }));
         // Wait for the tower to plan and publish the stand route (~60 s, to
-        // outlast a busy frequency working other traffic).
+        // outlast a busy frequency working other traffic). Watching where we
+        // are meanwhile: a route the tower plans for an aircraft that was
+        // moved while it waited is not ours to drive.
         let mut got = false;
+        let mut last = position(&xp).await.map(|p| (p, std::time::Instant::now()));
         for _ in 0..120 {
             if stand_route_ready() {
                 got = true;
                 break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            if let Some(now) = position(&xp).await {
+                let t = std::time::Instant::now();
+                if let Some((from, t0)) = last {
+                    if let Some(jump_m) = crate::autotaxi::relocation_jump_m(
+                        from,
+                        now,
+                        t.duration_since(t0).as_secs_f64(),
+                    ) {
+                        crate::blackbox::record(
+                            "taxi_in",
+                            json!({ "event": "request_relocated", "jump_m": jump_m }),
+                        );
+                        stand_down_relocated(&voice, "request", false);
+                        return;
+                    }
+                }
+                last = Some((now, t));
+            }
         }
         if !got {
             // Say WHICH of the two failed. The tower sets `taxi_to_stand` on
@@ -759,5 +886,42 @@ mod shutdown_tests {
             );
         }
         assert!(checked > 3, "only {checked} full-auto airframes found");
+    }
+}
+
+#[cfg(test)]
+mod relocation_tests {
+    use super::{vacate_still_here, vacated_report_due};
+
+    /// LEMG 31 (2026-09-28, issue #141): the rollout's stop, where the vacate
+    /// was planned (state t 1790585617.7), and where the aircraft was 0.4 s
+    /// later (t 1790585618.2) after the sortie runner reloaded it; the drive
+    /// engaged 1,032.6 m off the vacate's line.
+    const ROLLOUT: (f64, f64) = (36.67410120039185, -4.49797079757389);
+    const RELOADED: (f64, f64) = (36.68532005, -4.49417);
+
+    #[test]
+    fn a_vacate_never_starts_from_where_the_aircraft_was_moved_to() {
+        assert!(!vacate_still_here(ROLLOUT, RELOADED, 0.4, 1032.6));
+        // A route far off with no jump seen is still no join (the tool's own
+        // 150 m refusal, which the vacate's direct start skipped).
+        assert!(!vacate_still_here(ROLLOUT, ROLLOUT, 0.4, 151.0));
+        // Still rolling at the recorded 16 kt for the 0.4 s: here.
+        assert!(vacate_still_here(ROLLOUT, (36.674127, -4.498005), 0.4, 1.0));
+    }
+
+    #[test]
+    fn runway_vacated_is_said_only_off_the_strip() {
+        assert!(vacated_report_due(true, Some(false)));
+        assert!(
+            vacated_report_due(true, None),
+            "no runway data is no evidence"
+        );
+        assert!(
+            !vacated_report_due(true, Some(true)),
+            "an arrival still on a strip"
+        );
+        assert!(!vacated_report_due(false, Some(false)));
+        assert!(!vacated_report_due(false, None));
     }
 }
