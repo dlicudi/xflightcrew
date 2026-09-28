@@ -431,8 +431,6 @@ flare_elevator:
   balloon_ease_per_s: 0.15
 flare_power:
   reduction_per_second: 0.06
-  hold_sink_fpm: 300.0
-  lead_seconds: 1.0
 
 reference:
   kind: single-engine jet

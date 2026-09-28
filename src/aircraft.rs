@@ -15,36 +15,40 @@ use serde::{Deserialize, Serialize};
 /// Simulator tuning, not a POH power setting. Throttle ratios per second.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct FlarePowerProfile {
+    /// The fastest the retard walks the lever, per second, where
+    /// `retard_max_per_s` is not declared.
     pub reduction_per_second: f64,
-    /// Pause the reduction when measured descent exceeds this positive rate.
-    pub hold_sink_fpm: f64,
-    /// Include the recent sink trend to avoid cutting into a renewed descent.
-    pub lead_seconds: f64,
-    /// A JET's retard: no reduction above this radio height, and below it a
-    /// ramp timed to reach idle as the wheels arrive (`autoland::FlarePower`).
-    /// Keyed on the sink alone, the retard fired in the FLOAT the arrest had
-    /// made: the 737 levelled at 20 ft over LEMG 13, the power went to idle,
-    /// the speed washed off and it arrived at -859 fpm and 2.4 g with the
-    /// elevator on its stop (2026-09-26). `None` keeps the sink-keyed law.
+    /// The retard HEIGHT (radio ft): nothing comes off above it, and below
+    /// it the lever walks to idle timed to the wheels (`autoland::
+    /// FlarePower`). `None` retards from the flare gate. A Boeing retards
+    /// at 20 to 30 ft and lands at idle; keyed on the sink, the law fired in
+    /// the float the arrest had made (LEMG 13, 2026-09-26: idle at 20 ft
+    /// level, -859 fpm and 2.4 g at the wheels) or held until the float was
+    /// already spent (LEMG 13, 2026-09-28: inside 185 at 15.8 ft, then held
+    /// again for the sink it had rebuilt).
     #[serde(default)]
     pub retard_below_ft: Option<f64>,
-    /// ...and not before the sink has come inside this rate (fpm, positive)
-    /// at least once in the flare. The LEMG 12 flare (2026-09-26) was still
-    /// sinking 300 at 20 ft, the height retard walked the lever 0.44 to 0.16,
-    /// and the speed it took off came back as sink at the wheels (407).
-    /// `None` retards by height alone.
-    #[serde(default)]
-    pub retard_inside_fpm: Option<f64>,
-    /// ...but by this height the retard starts whatever the sink (ft): at
-    /// LEMG 13 (2026-09-26, the first prediction flare) the sink never came
-    /// inside 185 and the 737 touched down at 138 kt with 0.30 of lever.
-    #[serde(default)]
-    pub retard_by_ft: Option<f64>,
-    /// The fastest the height retard walks the lever, per second (absent:
-    /// four times `reduction_per_second`). Slower, the thrust leaving does
-    /// not rebuild the sink in the last second.
+    /// The fastest the retard walks the lever, per second (absent:
+    /// `reduction_per_second`). Slower, the thrust leaving does not rebuild
+    /// the sink in the last second.
     #[serde(default)]
     pub retard_max_per_s: Option<f64>,
+    /// The SPEED key: the retard waits while the airspeed is more than this
+    /// under the approach speed (kt; absent: `autoland::RETARD_SLOW_KTS`).
+    /// The thrust is what holds a slow flare's speed, and a knot the retard
+    /// takes comes back as sink at the wheels (the 737's plant: 63 fpm a
+    /// knot).
+    #[serde(default)]
+    pub retard_slow_kts: Option<f64>,
+    /// The TIME key: below the retard height the lever starts off only once
+    /// the time to the wheels (radio over sink) is inside this (s), and
+    /// then walks to idle timed to them. `None`: at the retard height.
+    #[serde(default)]
+    pub retard_at_s: Option<f64>,
+    /// ...or once the airspeed is more than this over the approach speed
+    /// (kt): a fast flare floats, and the float is the speed.
+    #[serde(default)]
+    pub retard_fast_kts: Option<f64>,
 }
 
 /// How the landing arrest's vertical-speed dial leads THIS autopilot's lag
@@ -3533,6 +3537,16 @@ mod tests {
                 "autoland",
                 "APPROACH_FAST_KTS",
                 "MARGIN: over the approach speed",
+            ),
+            (
+                "autoland",
+                "RETARD_SLOW_KTS",
+                "MARGIN: default only; the profile's retard_slow_kts",
+            ),
+            (
+                "autoland",
+                "RETARD_SINK_FLOOR_FPM",
+                "floor only: time to the wheels is never infinite",
             ),
             (
                 "autoland",

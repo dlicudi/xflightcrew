@@ -336,8 +336,12 @@ climb_pitch_max_deg: 17.5
 approach_thrust_min: 0.3
 flare_power:
   reduction_per_second: 0.08
-  hold_sink_fpm: 400.0
-  lead_seconds: 1.0
+  # The Airbus "RETARD" call is at 20 ft; timed to the wheels from 2 s out
+  # (issue #76, the 737's keys). VERIFY: blackbox `power` `retard` on the
+  # next A330 landing.
+  retard_below_ft: 20.0
+  retard_at_s: 2.0
+  retard_fast_kts: 2.0
 arrest_lead:
   gain: 1.5
   max_climb_fpm: 100.0
