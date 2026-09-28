@@ -2024,15 +2024,9 @@ async fn fly(xp: XPlaneClient, config: Config, voice: Option<Voice>, tools: SubT
             // The planned departure's runway, asked for (the tower honours it
             // unless the wind really favours another end): a SID exists for
             // one runway, and in calm air the pick could have been the other.
-            let ask = match &tools.mission {
-                Mission::Flight(r) => r.departure_rwy.as_deref().map(|rwy| {
-                    format!("request taxi, runway {}", crate::circuit::spell_runway(rwy))
-                }),
-                _ => None,
-            };
             crate::circuit::transmit(crate::circuit::radio_call(
                 &callsign,
-                ask.as_deref().unwrap_or("request taxi"),
+                &taxi_call(&tools.mission),
             ));
             event("request_taxi", json!({}));
             // The call queues behind our own intercom lines AND anyone the
@@ -2697,12 +2691,14 @@ async fn fly(xp: XPlaneClient, config: Config, voice: Option<Voice>, tools: SubT
                 return;
             }
             event("circuit_armed", json!({}));
+            drop_departure_handoff("circuit_armed");
             // The circuit owns the FLYING from here, but not the last stage:
             // it hands the final to autoland, which stops on the runway and
             // lets go. Somebody has to vacate. See `taxi_in_after_landing` —
             // ninety seconds holding Southampton's 02 with an arrival at half
             // a mile is what "our job is done" used to mean here.
             taxi_in_after_landing(&xp, &config, &voice, &tools, true).await;
+            drop_departure_handoff("circuit_ended");
             stop_active();
         }
         Mission::Flight(route) | Mission::Resume(route) => {
@@ -4575,6 +4571,51 @@ fn approach_fallback_ends(
     ends.into_iter().map(|(id, _)| id).collect()
 }
 
+/// A circuit never obeys a departure handoff: the pattern comes back to the
+/// tower's runway. One that reached the party line anyway (a station that
+/// did not hear "for circuits") is drained and blackboxed, never left for
+/// the next mission's climb to retune on.
+fn drop_departure_handoff(at: &str) {
+    if let Some((to, khz)) = crate::party_line::take_departure_handoff() {
+        event(
+            "departure_handoff_ignored",
+            json!({ "at": at, "to": to, "khz": khz }),
+        );
+    }
+}
+
+/// Is this mission a circuit? The tower keeps pattern traffic, so the crew
+/// says so on every departure request (`tower::wants_circuits`).
+fn flying_circuits() -> bool {
+    MISSION.lock().map(|m| *m == "circuit").unwrap_or(false)
+}
+
+/// The departure-readiness call: "for circuits" on a circuit, so the tower
+/// keeps the flight instead of handing it to Departure on the crosswind leg
+/// (LEMG 31, sortie 1790584715, 2026-09-28).
+fn ready_call(circuits: bool) -> &'static str {
+    if circuits {
+        "ready for departure, for circuits"
+    } else {
+        "ready for departure"
+    }
+}
+
+/// The taxi request: a planned departure asks for its runway (a SID exists
+/// for one runway, and in calm air the pick could have been the other); a
+/// circuit says it is one, since the tower keeps pattern traffic.
+fn taxi_call(mission: &Mission) -> String {
+    match mission {
+        Mission::Flight(r) => r
+            .departure_rwy
+            .as_deref()
+            .map(|rwy| format!("request taxi, runway {}", crate::circuit::spell_runway(rwy)))
+            .unwrap_or_else(|| "request taxi".to_string()),
+        Mission::Circuit { .. } => "request taxi for circuits".to_string(),
+        Mission::Resume(_) => "request taxi".to_string(),
+    }
+}
+
 /// Call the tower for departure and wait for it to move us to a departure
 /// clearance (line-up-and-wait or cleared for takeoff). The call itself is
 /// voiced + transcribed by the crew-radio drain, along with the tower's reply.
@@ -4583,7 +4624,10 @@ async fn request_departure(callsign: &Option<String>) {
     // The call itself is heard; a line announcing it first is a crew narrating
     // its own hands (LIPK 2026-09-26: said, queued behind the tower, and
     // dropped stale, or heard after the call it announced).
-    crate::circuit::transmit(crate::circuit::radio_call(callsign, "ready for departure"));
+    crate::circuit::transmit(crate::circuit::radio_call(
+        callsign,
+        ready_call(flying_circuits()),
+    ));
     event("request_departure", json!({}));
     waiting("departure clearance");
     wait_until(20.0, 1000, || async {
@@ -4763,7 +4807,10 @@ async fn ensure_takeoff_cleared(
                 announced_hold = true;
             }
         } else if last_call.elapsed() >= NUDGE_EVERY {
-            crate::circuit::transmit(crate::circuit::radio_call(callsign, "ready for departure"));
+            crate::circuit::transmit(crate::circuit::radio_call(
+                callsign,
+                ready_call(flying_circuits()),
+            ));
             last_call = Instant::now();
         }
         tokio::time::sleep(Duration::from_millis(1000)).await;
@@ -5647,6 +5694,27 @@ mod tests {
             initial_alt_ft: 5000,
             squawk: 4521,
         }
+    }
+
+    #[test]
+    fn a_circuit_tells_the_tower_it_is_one() {
+        use super::{ready_call, taxi_call, Mission};
+        use crate::tower::{parse_intent, wants_circuits, Intent};
+        // LEMG 31 (sortie 1790584715-full_auto, 2026-09-28): the circuit
+        // asked "request taxi" and "ready for departure", and the tower sent
+        // it to Malaga Departure on the crosswind leg.
+        let cs = Some("November eight one six November November".to_string());
+        let circuit = Mission::Circuit { right: true };
+        let taxi = crate::circuit::radio_call(&cs, &taxi_call(&circuit));
+        assert_eq!(parse_intent(&taxi), Intent::RequestTaxi, "{taxi}");
+        assert!(wants_circuits(&taxi), "{taxi}");
+        let ready = crate::circuit::radio_call(&cs, ready_call(true));
+        assert_eq!(parse_intent(&ready), Intent::RequestTakeoff, "{ready}");
+        assert!(wants_circuits(&ready), "{ready}");
+        // A departure never says it.
+        let ready = crate::circuit::radio_call(&cs, ready_call(false));
+        assert_eq!(parse_intent(&ready), Intent::RequestTakeoff);
+        assert!(!wants_circuits(&ready), "{ready}");
     }
 
     /// The crew flies the departure it was cleared on: with the station's

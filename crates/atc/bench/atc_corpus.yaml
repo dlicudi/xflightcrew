@@ -499,3 +499,12 @@
 - {text: "London control, speedbird three zero six, cancel IFR", intent: cancel_ifr, radio: true}
 - {text: "speedbird 306, cancelling i f r, continuing VFR", intent: cancel_ifr, radio: true}
 - {text: "cancel ifr clearance", intent: cancel_ifr, radio: true}
+
+# --- 2026-09-28: circuit traffic says so (issue #133) ------------------------
+# LEMG 31, sortie 1790584715: the circuit asked a plain "request taxi" and was
+# handed to Malaga Departure on the crosswind leg. "For circuits" rides the
+# same request and never changes what is asked for.
+- {text: "November eight one six November November, request taxi for circuits", intent: request_taxi, radio: true}
+- {text: "November eight one six November November, ready for departure, for circuits", intent: request_takeoff, radio: true}
+- {text: "request taxi for closed traffic", intent: request_taxi, radio: true}
+- {text: "ready for departure, remain in the pattern", intent: request_takeoff, radio: true}
