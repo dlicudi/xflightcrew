@@ -1266,6 +1266,12 @@ pub struct RotatePitch {
     /// The last airspeed read and its low-passed trend, knots per second.
     prev_ias: Option<f64>,
     accel_kts_s: f64,
+    /// The column the climb hold's ceiling guard allows, while it holds one
+    /// ([`RotatePitch::ceiling_guard`]); `None` when the nose is inside its
+    /// approach to `pitch_max_deg`.
+    ceiling_limit: Option<f64>,
+    /// Tests only: the law as it flew EGKK 08R, without the guard.
+    unguarded: bool,
 }
 
 /// The hand-flown initial climb's speed hold: from liftoff to the autopilot's
@@ -1360,7 +1366,23 @@ impl RotatePitch {
             hold: None,
             prev_ias: None,
             accel_kts_s: 0.0,
+            ceiling_limit: None,
+            unguarded: false,
         }
+    }
+
+    /// The law without its ceiling guard: what flew EGKK 08R (#78), for the
+    /// replay that pins the guard.
+    #[cfg(test)]
+    fn without_ceiling_guard(mut self) -> Self {
+        self.unguarded = true;
+        self
+    }
+
+    /// The column limit the ceiling guard holds right now, for the blackbox
+    /// (`climb_manual` `pitch_lim`); `None` while it holds none.
+    pub fn ceiling_limit(&self) -> Option<f64> {
+        self.ceiling_limit
     }
 
     /// Hold the initial climb speed by pitch after liftoff (see
@@ -1445,7 +1467,15 @@ impl RotatePitch {
                 let tail = self
                     .ceiling
                     .map_or(f64::INFINITY, |c| tail_clear_ceiling_deg(c, agl_ft));
-                let top = h.pitch_max_deg.min(tail).max(cap);
+                // The target stops CEILING_MARGIN_DEG under the ceiling, so
+                // a settled attitude is under it too (#78); the guard keeps
+                // the nose from passing the ceiling on the way there.
+                let margin = if self.unguarded {
+                    0.0
+                } else {
+                    CEILING_MARGIN_DEG
+                };
+                let top = (h.pitch_max_deg - margin).min(tail).max(cap);
                 let want_accel = ((h.hold_kts - ias) / CLIMB_SPEED_TAU_S)
                     .clamp(-CLIMB_ACCEL_MAX_KTS_S, CLIMB_ACCEL_MAX_KTS_S);
                 let walk = (CLIMB_DEG_S_PER_KT_S * (self.accel_kts_s - want_accel) * dt)
@@ -1479,10 +1509,81 @@ impl RotatePitch {
         // wanted from it — hold the standing pull the trim state demands, so
         // that on target and steady the elevator does not fall away.
         self.trim = (self.trim + err * PITCH_TRIM_PER_DEG_S * dt).clamp(self.pitch_min, PITCH_MAX);
-        self.out = (err * PITCH_P_PER_DEG + self.trim).clamp(self.pitch_min, PITCH_MAX);
+        let out = (err * PITCH_P_PER_DEG + self.trim).clamp(self.pitch_min, PITCH_MAX);
+        self.out = match self.hold {
+            Some(h) if !self.unguarded => {
+                self.ceiling_guard(h.pitch_max_deg, theta_deg, rate, dt, out, err)
+            }
+            _ => out,
+        };
         self.out
     }
+
+    /// The climb attitude is a CEILING, not a target the law may sail
+    /// through: the nose may approach `pitch_max_deg` no faster than
+    /// [`CEILING_APPROACH_S`] closes the gap, and while it comes faster the
+    /// column is walked forward by the excess rate (an integral, so it finds
+    /// whatever push this airframe's nose-up moment needs without knowing
+    /// it) plus a proportional part for the first tick. The walk lets go only
+    /// once the attitude law asks for less than the limit; while it holds,
+    /// the attitude law's integrator is held to the limit (it cannot wind
+    /// pull the guard then has to undo).
+    ///
+    /// EGKK 08R, the 737, 2026-09-28 (the first ClimbHold flight): the target
+    /// stopped at 18 degrees and the nose flew to 22.4. The law arrived with
+    /// the nose rising 2.8 degrees a second and had 0.03 of column per degree
+    /// to stop it with; four degrees over it was pushing 0.15 where the 737
+    /// needs 0.14 of push just to hold its attitude (the fit in
+    /// `the_egkk_climb_stays_under_its_ceiling`).
+    fn ceiling_guard(
+        &mut self,
+        pitch_max_deg: f64,
+        theta_deg: f64,
+        rate: f64,
+        dt: f64,
+        out: f64,
+        err: f64,
+    ) -> f64 {
+        let excess = rate - (pitch_max_deg - theta_deg) / CEILING_APPROACH_S;
+        let walked = match self.ceiling_limit {
+            Some(lim) => Some(lim - CEILING_WALK_GAIN * excess * dt),
+            None if excess > 0.0 => Some(self.out.min(out) - CEILING_WALK_GAIN * excess * dt),
+            None => None,
+        };
+        // Released once the attitude law itself asks for no more than the
+        // limit and the nose is inside its approach.
+        self.ceiling_limit = walked
+            .filter(|lim| excess > 0.0 || *lim < out)
+            .map(|lim| lim.clamp(self.pitch_min, PITCH_MAX));
+        let Some(lim) = self.ceiling_limit else {
+            return out;
+        };
+        let u = out
+            .min(lim - CEILING_RATE_GAIN * excess.max(0.0))
+            .clamp(self.pitch_min, PITCH_MAX);
+        self.trim = self.trim.min(u - err * PITCH_P_PER_DEG).max(self.pitch_min);
+        u
+    }
 }
+
+/// The time constant the nose may close on the climb ceiling with, seconds:
+/// the rate allowed is the gap over this. Fitted with the two gains below
+/// against the EGKK 08R recording across its plant uncertainty
+/// (`the_egkk_climb_stays_under_its_ceiling`): 2.0 grazes the ceiling on
+/// the slow plants, 3.0 holds the nose a further half degree down for
+/// nothing.
+const CEILING_APPROACH_S: f64 = 2.5;
+/// The climb hold's target stops this far under `climb_pitch_max_deg`: a P+I
+/// law settles ON its target, grazing a ceiling the target sits on.
+const CEILING_MARGIN_DEG: f64 = 0.5;
+/// The guard's integral gain: column walked forward per second per degree a
+/// second of rate over the approach. A gain on the attitude law, not an
+/// airframe number: it finds the airframe's push itself, and holds the
+/// ceiling from 8 to 32 degrees a second per unit of column (the fit is 12.9).
+const CEILING_WALK_GAIN: f64 = 0.15;
+/// The guard's proportional gain: column pushed at once per degree a second
+/// over the approach.
+const CEILING_RATE_GAIN: f64 = 0.04;
 
 /// The bank the climb-out flies: toward runway heading, capped shallow —
 /// this is track-keeping on departure, not a turn.
@@ -3006,6 +3107,9 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, p: Params) {
                         // The airspeed trend the climb hold walks the target
                         // on, knots per second (`ClimbHold`).
                         "accel": pitch_law.accel_kts_s(),
+                        // The column the ceiling guard holds, null while it
+                        // holds none (#78, EGKK 08R flew 22.4 under 18).
+                        "pitch_lim": pitch_law.ceiling_limit(),
                         "phi": phi_deg, "ail": ail, "hdg_err": hdg_err,
                         // The climb the engage will take (#150).
                         "vs": vs_flown,
@@ -5018,6 +5122,82 @@ mod tests {
         m0: f64,
     }
 
+    /// A pitch plant the takeoff harnesses can fly: the LEMG-fitted
+    /// [`PitchPlant`] or the EGKK-fitted [`RatePlant`].
+    trait PitchModel {
+        fn advance(&mut self, elevator: f64, dur_s: f64);
+        fn theta(&self) -> f64;
+        fn q(&self) -> f64;
+        /// On the wheels: the attitude stops at the runway.
+        fn hold_on_runway(&mut self);
+    }
+
+    impl PitchModel for PitchPlant {
+        fn advance(&mut self, elevator: f64, dur_s: f64) {
+            PitchPlant::advance(self, elevator, dur_s);
+        }
+        fn theta(&self) -> f64 {
+            self.theta
+        }
+        fn q(&self) -> f64 {
+            self.q
+        }
+        fn hold_on_runway(&mut self) {
+            self.theta = 0.0;
+            self.q = self.q.max(0.0);
+        }
+    }
+
+    /// The 737's pitch as EGKK 08R flew it (sortie 1790601822-full_auto,
+    /// 2026-09-28, #78): the column sets a pitch RATE, `k` degrees a second
+    /// per unit of column past `u0`, the column that holds the attitude,
+    /// through a lag `tau` (the harness adds the loop's transport delay).
+    /// Second order in the attitude. Fitted to the 27 airborne ticks from
+    /// liftoff to the 300 ft engage, driven by the column the law logged:
+    /// `k` 12.9, `u0` -0.139, `tau` 0.1 s, delay 0.4 s, 0.23 degree RMS on
+    /// the attitude. The -0.139 is the finding: the 737 pitched up at 3
+    /// degrees a second on a column of 0.10 and needed a PUSH of 0.14 to stop,
+    /// the nose-up trim and the thrust line the rotation rode on (it rotated
+    /// at 2.9 degrees a second on a column of about zero).
+    struct RatePlant {
+        theta: f64,
+        q: f64,
+        k: f64,
+        u0: f64,
+        tau: f64,
+    }
+
+    impl RatePlant {
+        /// As fitted.
+        const K: f64 = 12.9;
+        const U0: f64 = -0.139;
+        const TAU_S: f64 = 0.1;
+        const DELAY_S: f64 = 0.4;
+    }
+
+    impl PitchModel for RatePlant {
+        fn advance(&mut self, elevator: f64, dur_s: f64) {
+            let h = 0.005_f64;
+            let mut left = dur_s;
+            while left > 1e-9 {
+                let step = h.min(left);
+                self.q += (self.k * (elevator - self.u0) - self.q) / self.tau * step;
+                self.theta += self.q * step;
+                left -= step;
+            }
+        }
+        fn theta(&self) -> f64 {
+            self.theta
+        }
+        fn q(&self) -> f64 {
+            self.q
+        }
+        fn hold_on_runway(&mut self) {
+            self.theta = 0.0;
+            self.q = self.q.max(0.0);
+        }
+    }
+
     impl PitchPlant {
         fn new(zeta: f64, m0: f64) -> Self {
             PitchPlant {
@@ -5156,9 +5336,10 @@ mod tests {
     }
 
     /// The 737's rotation and hand-flown climb, rotate to the 300 ft engage,
-    /// against the pitch plant above (through the loop's transport delay) and
-    /// a flight path with the aircraft's own excess thrust, both fitted to
-    /// LEMG 13 (sortie 1790596335-full_auto, 2026-09-28): the law pushing
+    /// against `plant` (through the loop's transport delay) and a flight path
+    /// with the aircraft's own excess thrust. The path and the [`PitchPlant`]
+    /// were fitted to LEMG 13 (sortie 1790596335-full_auto, 2026-09-28; the
+    /// hold is judged on the [`RatePlant`] refitted to EGKK 08R): the law pushing
     /// -0.37 to hold 11 degrees is a standing nose-up moment of about 130
     /// (6.25 x 11 + 167 x 0.37); 2,280 fpm at 184 kt is a 7 degree path at
     /// 11 degrees of pitch, so about 4 degrees of alpha there; 1.2 kt/s on
@@ -5171,12 +5352,11 @@ mod tests {
     /// sat on a stop.
     fn fly_initial_climb(
         hold: Option<ClimbHold>,
-        zeta: f64,
+        mut plant: impl PitchModel,
         lag_s: f64,
     ) -> (f64, f64, f64, f64, f64) {
         const TW: f64 = 0.185;
         const KTS_S_PER_G: f64 = 9.81 / 0.514_444;
-        let mut plant = PitchPlant::new(zeta, 130.0);
         let mut law = RotatePitch::with_authority(Some(11.0), -0.5).with_climb_hold(hold);
         let (mut ias, mut gamma, mut h_ft) = (145.5_f64, 0.0_f64, 0.0_f64);
         let mut airborne = false;
@@ -5193,7 +5373,12 @@ mod tests {
             (f64::from(seed >> 8) / f64::from(1_u32 << 23) - 1.0) * 0.1
         };
         while t < 60.0 && at_300.is_none() {
-            let cmd = law.step_climb(plant.theta, Some(plant.q), dt, Some((ias + noise(), h_ft)));
+            let cmd = law.step_climb(
+                plant.theta(),
+                Some(plant.q()),
+                dt,
+                Some((ias + noise(), h_ft)),
+            );
             pending.push((t + lag_s, cmd));
             let (mut now, end) = (t, t + dt);
             while now < end - 1e-9 {
@@ -5205,16 +5390,15 @@ mod tests {
                 let span = next - now;
                 plant.advance(applied, span);
                 // On the wheels the attitude cannot go below the runway.
-                if !airborne && plant.theta < 0.0 {
-                    plant.theta = 0.0;
-                    plant.q = plant.q.max(0.0);
+                if !airborne && plant.theta() < 0.0 {
+                    plant.hold_on_runway();
                 }
                 let alpha = 4.0 * (184.0 / ias).powi(2);
-                if !airborne && ias >= 160.0 && plant.theta >= alpha {
+                if !airborne && ias >= 160.0 && plant.theta() >= alpha {
                     airborne = true;
                 }
                 if airborne {
-                    gamma += ((plant.theta - alpha) - gamma) / 1.5 * span;
+                    gamma += ((plant.theta() - alpha) - gamma) / 1.5 * span;
                     ias += (TW - gamma.to_radians().sin()) * KTS_S_PER_G * span;
                     h_ft += ias * 1.6878 * gamma.to_radians().sin() * span;
                 } else {
@@ -5229,9 +5413,9 @@ mod tests {
             t = end;
             if airborne && h_ft > 8.0 {
                 max_ias = max_ias.max(ias);
-                max_theta = max_theta.max(plant.theta);
+                max_theta = max_theta.max(plant.theta());
                 let strike = 11.0 + (h_ft / 60.0).atan().to_degrees();
-                max_theta_low = max_theta_low.max(plant.theta - strike);
+                max_theta_low = max_theta_low.max(plant.theta() - strike);
                 ticks += 1.0;
                 if cmd <= -0.5 + 1e-9 || cmd >= PITCH_MAX - 1e-9 {
                     saturated += 1.0;
@@ -5268,13 +5452,43 @@ mod tests {
         let (v2, top) = (initial - 20.0, initial);
 
         // The recorded flight, reproduced: the plant is the aircraft.
-        let (at_300, ..) = fly_initial_climb(None, 0.45, 0.2);
+        let (at_300, ..) = fly_initial_climb(None, PitchPlant::new(0.45, 130.0), 0.2);
         assert!(at_300 > 178.0, "the old law runs away as the 737 did: {at_300:.1}");
+        let fitted = RatePlant {
+            theta: 0.0,
+            q: 0.0,
+            k: RatePlant::K,
+            u0: RatePlant::U0,
+            tau: RatePlant::TAU_S,
+        };
+        let (at_300, ..) = fly_initial_climb(None, fitted, RatePlant::DELAY_S);
+        assert!(at_300 > 178.0, "and on the EGKK plant: {at_300:.1}");
 
-        for zeta in [0.35, 0.45, 0.55] {
-            for lag in [0.1, 0.2, 0.3] {
-                let (at_300, max_ias, max_theta, low, sat) = fly_initial_climb(hold, zeta, lag);
-                let tag = format!("zeta {zeta}, lag {lag}");
+        // The hold is flown on the plant refitted to its first real flight
+        // (EGKK 08R, #78), across its authority, holding push and lag. The
+        // LEMG plant above was fitted to a standing push alone: driven by
+        // the column EGKK logged it flies 25 to 28 degrees against the
+        // recorded 22.4 (6 degrees RMS), a pitch six times too quick for the
+        // 737 it stands for, so it no longer judges the climb.
+        let mut plants = Vec::new();
+        for k in [10.0, RatePlant::K, 16.0] {
+            for u0 in [-0.10, RatePlant::U0, -0.20] {
+                for tau in [RatePlant::TAU_S, 0.25] {
+                    plants.push((k, u0, tau));
+                }
+            }
+        }
+        for &(k, u0, tau) in &plants {
+            for lag in [0.2, RatePlant::DELAY_S, 0.5] {
+                let plant = RatePlant {
+                    theta: 0.0,
+                    q: 0.0,
+                    k,
+                    u0,
+                    tau,
+                };
+                let (at_300, max_ias, max_theta, low, sat) = fly_initial_climb(hold, plant, lag);
+                let tag = format!("k {k}, u0 {u0}, tau {tau}, lag {lag}");
                 assert!(
                     (v2..=top).contains(&max_ias),
                     "peak {max_ias:.1} outside V2 {v2} to V2 + 20 ({tag})"
@@ -5285,11 +5499,286 @@ mod tests {
                     h.hold_kts
                 );
                 assert!(
-                    max_theta <= h.pitch_max_deg + 1.0,
-                    "theta {max_theta:.1} ({tag})"
+                    max_theta <= h.pitch_max_deg,
+                    "theta {max_theta:.2} over the ceiling ({tag})"
                 );
                 assert!(low < 0.0, "tail strike: {low:.1} deg past it ({tag})");
                 assert!(sat < 0.05, "camps on a stop: {:.0}% ({tag})", sat * 100.0);
+            }
+        }
+    }
+
+    /// EGKK 08R, the first ClimbHold flight (#78), as the blackbox drew it:
+    /// every `roll` tick from the rotation and every `climb_manual` tick to
+    /// the 300 ft engage.
+    struct EgkkTick {
+        climb: bool,
+        t: f64,
+        theta: f64,
+        q: f64,
+        dt: f64,
+        ias: f64,
+        /// `climb_manual` only: the height and the column the law wrote.
+        agl: f64,
+        pitch: f64,
+        /// The target as logged (a `roll` record logs the PREVIOUS tick's).
+        pitch_tgt: f64,
+    }
+
+    fn egkk_ticks() -> (ClimbHold, Vec<EgkkTick>) {
+        let recs: Vec<serde_json::Value> =
+            include_str!("../bench/takeoffs/egkk08r_climb_hold.jsonl")
+                .lines()
+                .filter_map(|l| serde_json::from_str(l).ok())
+                .collect();
+        let f = |r: &serde_json::Value, k: &str| r[k].as_f64().unwrap_or(f64::NAN);
+        let h = recs
+            .iter()
+            .find(|r| r["event"] == "climb_hold")
+            .expect("climb_hold");
+        let hold = ClimbHold {
+            hold_kts: f(h, "hold_kts"),
+            pitch_max_deg: f(h, "pitch_max_deg"),
+        };
+        let rotate_t = recs
+            .iter()
+            .find(|r| r["event"] == "rotate")
+            .map(|r| f(r, "t"))
+            .unwrap();
+        let ticks = recs
+            .iter()
+            .filter(|r| {
+                (r["event"] == "roll" && f(r, "t") >= rotate_t) || r["event"] == "climb_manual"
+            })
+            .map(|r| EgkkTick {
+                climb: r["event"] == "climb_manual",
+                t: f(r, "t"),
+                theta: f(r, "theta"),
+                q: f(r, "q"),
+                dt: f(r, "dt"),
+                ias: f(r, "ias"),
+                agl: f(r, "agl"),
+                pitch: f(r, "pitch"),
+                pitch_tgt: f(r, "pitch_tgt"),
+            })
+            .collect();
+        (hold, ticks)
+    }
+
+    /// The law the 737 flew (tail strike 11, push authority 0.5), with the
+    /// EGKK hold.
+    fn egkk_law(hold: ClimbHold, guarded: bool) -> RotatePitch {
+        let law = RotatePitch::with_authority(Some(11.0), -0.5).with_climb_hold(Some(hold));
+        if guarded {
+            law
+        } else {
+            law.without_ceiling_guard()
+        }
+    }
+
+    /// Steps the law over the recorded rotation (the roll ticks, open loop:
+    /// they carry the attitude the aircraft had) and returns the column each
+    /// wrote, (t, column). A roll record carries no height, so the one the
+    /// law read is given back by the tail ceiling the NEXT record's target
+    /// was held under; the last, by the first climb tick's.
+    fn egkk_rotation(law: &mut RotatePitch, ticks: &[EgkkTick]) -> Vec<(f64, f64)> {
+        let first_climb = ticks.iter().position(|k| k.climb).unwrap();
+        (0..first_climb)
+            .map(|i| {
+                let k = &ticks[i];
+                let agl = if ticks[i + 1].climb {
+                    ticks[i + 1].agl
+                } else {
+                    let over = (ticks[i + 1].pitch_tgt - (11.0 - TAIL_STRIKE_MARGIN_DEG)).max(0.0);
+                    TAIL_ARM_FT * over.to_radians().tan()
+                };
+                (
+                    k.t,
+                    law.step_climb(k.theta, Some(k.q), k.dt, Some((k.ias, agl))),
+                )
+            })
+            .collect()
+    }
+
+    /// Flies the law from EGKK's liftoff against a [`RatePlant`] (`k`, `u0`,
+    /// `tau`) through `delay_s`: the rotation replayed as recorded, then
+    /// closed loop over the recorded airspeed and height to the 300 ft
+    /// engage, then `extra_s` more on the air as last read. Returns the
+    /// highest attitude and (t, theta) per tick.
+    fn fly_egkk(
+        guarded: bool,
+        plant: (f64, f64, f64),
+        delay_s: f64,
+        extra_s: f64,
+    ) -> (f64, Vec<(f64, f64)>) {
+        let (hold, ticks) = egkk_ticks();
+        let mut law = egkk_law(hold, guarded);
+        let mut pending: Vec<(f64, f64)> = egkk_rotation(&mut law, &ticks)
+            .into_iter()
+            .map(|(t, u)| (t + delay_s, u))
+            .collect();
+        let air: Vec<&EgkkTick> = ticks.iter().filter(|k| k.climb).collect();
+        let (k, u0, tau) = plant;
+        let mut p = RatePlant {
+            theta: air[0].theta,
+            q: air[0].q,
+            k,
+            u0,
+            tau,
+        };
+        let mut t = air[0].t;
+        let mut applied = pending
+            .iter()
+            .filter(|(at, _)| *at <= t)
+            .last()
+            .map_or(0.0, |x| x.1);
+        pending.retain(|(at, _)| *at > t);
+        let end = air.last().unwrap().t + extra_s;
+        let (mut max_theta, mut log) = (p.theta, Vec::new());
+        let mut i = 0;
+        while t < end {
+            let r = air[i.min(air.len() - 1)];
+            let dt = if i < air.len() { r.dt } else { 0.22 };
+            let cmd = law.step_climb(p.theta, Some(p.q), dt, Some((r.ias, r.agl)));
+            log.push((t, p.theta));
+            pending.push((t + delay_s, cmd));
+            let stop = t + dt;
+            while t < stop - 1e-9 {
+                let next = pending
+                    .iter()
+                    .map(|&(at, _)| at)
+                    .filter(|&at| at > t && at < stop)
+                    .fold(stop, f64::min);
+                p.advance(applied, next - t);
+                t = next;
+                while let Some(j) = pending.iter().position(|&(at, _)| at <= t + 1e-9) {
+                    applied = pending.remove(j).1;
+                }
+                max_theta = max_theta.max(p.theta);
+            }
+            i += 1;
+        }
+        (max_theta, log)
+    }
+
+    /// #78, EGKK 08R (sortie 1790601822-full_auto, 2026-09-28): the hold held
+    /// its speed (162.6 to 170.3 kt to the engage) and the nose flew to 22.4
+    /// degrees under an 18 degree ceiling. The TARGET never passed 18 (it
+    /// stopped there at 77 ft); the rotation tracked its ramp within 0.6
+    /// degrees. The attitude loop overshot: the nose arrived at 18 rising
+    /// 2.6 degrees a second, and four degrees past it the law was pushing
+    /// 0.18 on a 737 that needs 0.14 of push just to stop rotating.
+    #[test]
+    fn the_egkk_climb_stays_under_its_ceiling() {
+        let (hold, ticks) = egkk_ticks();
+        assert_eq!((hold.hold_kts, hold.pitch_max_deg), (165.0, 18.0));
+        let recorded_max = ticks.iter().map(|k| k.theta).fold(f64::MIN, f64::max);
+        assert!((recorded_max - 22.38).abs() < 0.01, "{recorded_max}");
+
+        // The replay: the law without the guard, stepped over the recorded
+        // ticks, wrote the column the blackbox logged, every climb tick.
+        let mut law = egkk_law(hold, false);
+        let mut column = egkk_rotation(&mut law, &ticks);
+        for k in ticks.iter().filter(|k| k.climb) {
+            let u = law.step_climb(k.theta, Some(k.q), k.dt, Some((k.ias, k.agl)));
+            assert!(
+                (u - k.pitch).abs() < 0.002,
+                "t {}: replayed {u:.3} vs logged {:.3}",
+                k.t,
+                k.pitch
+            );
+            assert!(
+                (law.target_deg() - k.pitch_tgt).abs() < 0.01,
+                "target at t {}",
+                k.t
+            );
+            assert!(
+                law.target_deg() <= hold.pitch_max_deg,
+                "the target never passed the ceiling"
+            );
+            column.push((k.t, k.pitch));
+        }
+
+        // The plant IS the aircraft: driven by that column through the
+        // fitted delay from the liftoff tick, it flies the recorded attitude.
+        let air: Vec<&EgkkTick> = ticks.iter().filter(|k| k.climb).collect();
+        let mut p = RatePlant {
+            theta: air[0].theta,
+            q: air[0].q,
+            k: RatePlant::K,
+            u0: RatePlant::U0,
+            tau: RatePlant::TAU_S,
+        };
+        let applied_at = |t: f64| {
+            column
+                .iter()
+                .filter(|(at, _)| at + RatePlant::DELAY_S <= t + 1e-9)
+                .last()
+                .map_or(0.0, |x| x.1)
+        };
+        let (mut sq, mut worst, mut peak) = (0.0, 0.0_f64, 0.0_f64);
+        for w in air.windows(2) {
+            let mut t = w[0].t;
+            while t < w[1].t - 1e-9 {
+                let step = 0.005_f64.min(w[1].t - t);
+                p.advance(applied_at(t), step);
+                t += step;
+            }
+            let e = p.theta - w[1].theta;
+            sq += e * e;
+            worst = worst.max(e.abs());
+            peak = peak.max(p.theta);
+        }
+        let rms = (sq / (air.len() - 1) as f64).sqrt();
+        assert!(rms < 0.3, "fit RMS {rms:.2}");
+        assert!(worst < 0.6, "fit worst {worst:.2}");
+        assert!(
+            (peak - recorded_max).abs() < 0.5,
+            "fitted peak {peak:.2} vs {recorded_max}"
+        );
+
+        // Closed loop on the fitted plant: the old law reproduces the
+        // overshoot, the guarded law keeps the nose under the ceiling.
+        let fitted = (RatePlant::K, RatePlant::U0, RatePlant::TAU_S);
+        let (old, _) = fly_egkk(false, fitted, RatePlant::DELAY_S, 0.0);
+        assert!(
+            old > 21.0,
+            "the old law flies past the ceiling as the 737 did: {old:.2}"
+        );
+        let (new, log) = fly_egkk(true, fitted, RatePlant::DELAY_S, 10.0);
+        assert!(new <= hold.pitch_max_deg, "guarded: {new:.2}");
+        // Still a climb attitude, not a flattened one, by the engage.
+        let engage_t = air.last().unwrap().t;
+        let by_engage = log
+            .iter()
+            .filter(|(t, _)| *t <= engage_t)
+            .map(|x| x.1)
+            .fold(f64::MIN, f64::max);
+        assert!(by_engage > 15.0, "climbs to its attitude: {by_engage:.2}");
+        // And across the plant uncertainty: authority, the holding push, the
+        // lag and the transport delay.
+        for k in [10.0, 12.9, 16.0] {
+            for u0 in [-0.10, -0.14, -0.20] {
+                for tau in [0.1, 0.25, 0.4] {
+                    for delay in [0.2, 0.35, 0.5] {
+                        let (max, log) = fly_egkk(true, (k, u0, tau), delay, 10.0);
+                        let tag = format!("k {k}, u0 {u0}, tau {tau}, delay {delay}");
+                        assert!(
+                            max <= hold.pitch_max_deg,
+                            "{max:.2} over the ceiling ({tag})"
+                        );
+                        // No ring: the last four seconds move less than a degree.
+                        let end = log.last().unwrap().0;
+                        let tail: Vec<f64> = log
+                            .iter()
+                            .filter(|(t, _)| *t > end - 4.0)
+                            .map(|x| x.1)
+                            .collect();
+                        let spread = tail.iter().cloned().fold(f64::MIN, f64::max)
+                            - tail.iter().cloned().fold(f64::MAX, f64::min);
+                        assert!(spread < 1.0, "rings: {spread:.2} ({tag})");
+                    }
+                }
             }
         }
     }
