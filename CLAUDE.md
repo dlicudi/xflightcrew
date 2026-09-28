@@ -412,6 +412,9 @@ everything blackboxes to `logs/blackbox.jsonl` (kinds: `atc`, `autotaxi`, `autot
   JOIN (refused past `MAX_JOIN_M`); errors can only slow the pace; a governor evaporating on the
   ground ARRESTS ("your aircraft"). Castoring nosewheels brake-steer through the PLUGIN channels
   only: REST `*_brake_ratio` writes are re-driven by hardware every frame.
+- **A castoring nosewheel brake-steers the rollout too** (`autoland::RolloutBrakeSteer`: the stop
+  moved to the inside wheel at every speed; `roll_brake_split` fades out above 40 kt; SR22 LEMG 13
+  rolled 12.1 m off on a rudder worth under 2 deg/s, #166).
 - **A drive is judged by the ground it makes, never a flat clock** (`autotaxi::ProgressWatch`,
   `drive_stalled`, `full_auto::wait_for_drive`): 20 m in 120 s, or the route at half its pace plus
   2 min (`route_deadline_s`); pause, tug and a spoken stop hold it (blackbox `drive_no_progress`; an
@@ -761,7 +764,9 @@ everything blackboxes to `logs/blackbox.jsonl` (kinds: `atc`, `autotaxi`, `autot
   with room to stop, else a `balloon` balk; only a go-around gives them back; a roundout climb never
   pushes (LEMG 12 SF50 2026-09-28: handed back at 50.5 ft, the AP dived, -814 fpm). The SF50 flies a
   declared model (`flare_elevator.model`: 8,000 fpm per unit, 1.2/1.2 s, 0.9 s dead) with `rough_hold:
-  false` (the 737's rough-air hold floated its strong elevator onto the runway).
+  false` (the 737's rough-air hold floated its strong elevator onto the runway). The SR22 flies one too (`flare_elevator.model` 6,000 fpm, 1.0 s, 0.8 s dead) and holds its
+  thrust until a second from the wheels (`flare_power` `retard_at_s`): at idle with full flap it
+  bleeds 2.7 kt/s at 115 fpm per knot (LEMG 13 2026-09-28, 575 fpm, #166).
 - **A model flare holds its column in rough air** (`FlareModel::step` `rough`, `FinalAir`,
   `ROUGH_AIR_FPM`): past 40 fpm rms of stray on the final, only a measured climb eases the pull; in
   smooth air the prediction flies it and a near-level float never takes it forward. A gust and a

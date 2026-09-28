@@ -10134,3 +10134,16 @@ nothing when a pattern began that tick (its "Repositioning" line says it), else 
 approach" or "Off the final". Tests `the_a330_final_keeps_its_flap_and_flies_under_the_placard`,
 `the_glidepath_law_can_always_hold_the_path_it_is_on`,
 `a_pattern_begun_short_of_the_field_says_why_and_never_overflew`. Offline only.
+
+## 2026-09-28: the SR22 lands on a model of its elevator and steers its rollout on its brakes (issue #166)
+
+LEMG 13 (sortie 1790619465-approach): the 172's tracker arrested 476 fpm to +10 by 45 ft, pushed
+0.10, rebuilt to -471, then -52; the flare's 0.35 at 22 ft met the idle cut a dead time later (-528
+at 12.5 ft), ballooned to +298, let go in one tick, balloon thrust on and off again, -585 at 1.4 ft.
+Fitted to the 38 ticks with the servos out (39 fpm rms): 10,000 fpm per unit, 1.45/1.45 s, 0.9 s
+dead; idle with full flap bleeds 2.7 kt/s, 115 fpm per knot. Profile: model 6,000/1.0/0.8 and
+`flare_power` held to 1 s from the wheels; four plants from five gates all under 300 (273), 200
+gusty under 400 (353); the lever cut at the gate goes past 300, the tracker to 1,267. Rollout:
+brakes 0.24/0.24, rudder alone (under 2 deg/s per unit), 3 to 9 degrees right for ten seconds, 1.6
+to 12.1 m; `RolloutBrakeSteer` holds the replay inside 2.6 m for 15 to 60 deg/s per unit of brake
+difference. Offline only.
