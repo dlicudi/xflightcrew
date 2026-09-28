@@ -291,6 +291,15 @@ Config: `XCOPILOT_ATC_AIRPORT` / `_VOICE` / `_RATE` / `_REGION`.
 - **The tower's book is the runway's**: a landing holds its strip until the vacated report, a
   runway start is lined up, a cleared crossing that keeps moving is legal
   (`station::runway_occupancy_authorised`, the incursion watch's one question; EGKK 2026-09-27).
+- **The runway watch ticks whoever flies the final** (`go_around_tick` / `landing_hold_tick` run
+  ahead of the monitor's `quiet` block, which closes under `autoland::ACTIVE`); **the crew never lands
+  uncleared**: autoland's `UnclearedWatch` asks at 1,000 ft and goes around at 300 ft while the book is
+  Inbound (`landing_clearance_asked`, `uncleared_go_around`; EGBB 15 2026-09-28). The strip we LANDED
+  on, cleared or not, is ours while rolling off it (`landed_strip`); the incursion shout names the end
+  we point down. **One departure on the runway at a time** (LinedUp/TakeoffCleared claim the whole
+  strip, no ghost departure within `WAKE_SECS` of our liftoff, a ghost change not seen live is never
+  narrated, `PARTY_LINE_FRESH_S`; the wake clock on the departure's own end). The taxi request names
+  the cleared runway; departure clears no higher than the FILED cruise (`capped_departure_climb`).
 - **A landing is never cleared onto an occupied runway, and the go-around is judged on time**: a
   final onto a ghost on our strip is "continue approach ..., expect late landing clearance"
   (`LANDING_HOLD`), cleared by the monitor once the strip is clear or its occupants move off in time

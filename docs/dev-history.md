@@ -9837,3 +9837,18 @@ the new law, keeps all eight rolls within 3 m worst and 2 m at liftoff (EGKK 1.3
 log the sim's yaw rate as `r` (it was the brake split's error) and `xtk_used`, `cut`, `cut_i`. Open:
 the scorer still reads the raw spiky xtk; a consistent position read from the plugin would remove the
 spikes at the source (filed). Offline only.
+
+## 2026-09-28: the tower after a withheld landing, and the departures around us (issues #155, #149)
+
+EGKK-EGBB (sortie 1790601822, t0 = 1790601822). (1) The landing hold armed at +3314.5 was never released
+or judged: `go_around_tick` and `landing_hold_tick` sat inside the monitor's `if !quiet` block, and
+`quiet` includes `autoland::ACTIVE`, so an autoland final never got a release or a go-around order at
+all; the 737 landed uncleared. They now run ahead of it, and autoland's `UnclearedWatch` asks at
+1,000 ft and goes around at 300 ft while uncleared. (2) Four "exit the runway" (naming 33) during our
+own vacate on 15: an uncleared landing's strip was not ours; `landed_strip` now covers it while
+rolling off, and the shout names the end we point down. (3) "request taxi, runway two six left" after
+an 08R clearance: the taxi call now names the cleared runway. (4) Departure cleared FL220 (HEME1B's
+HEMEL window) against the filed FL180: the check-in and departure's climb are capped at the filed
+cruise. (5) A ghost cleared for takeoff on 08R 1.6 s after us: the wake clock sat on the other strip's
+end, a ghost liftoff was narrated 17 s late, TakeoffCleared claimed only a direction; fixed (one
+departure on the runway at a time). (6) "1 miles" in traffic advisories. Offline only.
