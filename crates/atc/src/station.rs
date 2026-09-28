@@ -2719,6 +2719,11 @@ struct ComplianceState {
     /// runway" four times and "you are on runway one five without clearance"
     /// during the vacate the tower had just ordered with "taxi to parking").
     landed_strip: Option<String>,
+    /// Our last LIFTOFF: the strip (its `ident_a`) we rolled on and when.
+    /// The party line clears no departure off that strip behind us inside
+    /// [`WAKE_SECS`] (EGKK 08R, 2026-09-28: "Easy eight six five three,
+    /// cleared for takeoff" 1.6 s after our liftoff).
+    liftoff: Option<(String, Instant)>,
 }
 
 impl ComplianceState {
@@ -2734,6 +2739,7 @@ impl ComplianceState {
         prev_strip: None,
         runway_start: None,
         landed_strip: None,
+        liftoff: None,
     };
 }
 
@@ -2752,6 +2758,10 @@ const RUNWAY_START_MAX_KTS: f64 = 1.0;
 const ZONE_RADIUS_NM: f64 = 5.0;
 const ZONE_HEIGHT_FT: f64 = 3000.0;
 const ZONE_COOLDOWN_SECS: f64 = 120.0;
+/// Rolling out or vacating the strip it landed on, an aircraft at this pace or
+/// more is on its way off (the recorded EGBB 15 vacate: 3.8 to 12 kt).
+/// Stopped on it, it is squatting, cleared landing or not.
+const LANDED_VACATING_KTS: f64 = 3.0;
 /// Continuous air time before ground contact can be called a LANDING —
 /// shorter is a skip on the takeoff roll or a bounce, not an arrival.
 const MIN_FLIGHT_SECS: f64 = 30.0;
@@ -2827,6 +2837,12 @@ pub fn compliance_tick_facing(
     if here.is_some() && here != w.prev_strip && gs_kts < RUNWAY_START_MAX_KTS {
         w.runway_start = here.clone();
     }
+    // Our liftoff, off the strip we rolled on (see `liftoff`).
+    if prev_ground == Some(true) && !on_ground {
+        if let Some(strip) = w.prev_strip.clone() {
+            w.liftoff = Some((strip, now));
+        }
+    }
     // A landing's strip is ours until we leave it (see `landed_strip`).
     if !on_ground {
         w.landed_strip = None;
@@ -2835,7 +2851,8 @@ pub fn compliance_tick_facing(
     } else if w.landed_strip.is_some() && here != w.landed_strip {
         w.landed_strip = None;
     }
-    let landed_here = here.is_some() && w.landed_strip == here;
+    let landed_here =
+        here.is_some() && w.landed_strip == here && gs_kts >= LANDED_VACATING_KTS;
     w.prev_strip = here;
     let runway_start = w.runway_start.is_some();
     if clr
@@ -4407,10 +4424,10 @@ pub(crate) fn runway_occupancy_authorised(lat: f64, lon: f64, gs_kts: f64) -> bo
         let w = COMPLIANCE.lock().unwrap_or_else(|e| e.into_inner());
         (
             w.runway_start.as_deref() == Some(here.as_str()),
-            w.landed_strip.as_deref() == Some(here.as_str()),
+            w.landed_strip.as_deref() == Some(here.as_str()) && gs_kts >= LANDED_VACATING_KTS,
         )
     };
-    // A runway start, or the strip we landed on and have not yet left
+    // A runway start, or the strip we landed on and are still rolling off
     // (cleared or not: an aircraft vacating is not an incursion).
     if started_here || landed_here {
         return true;
@@ -5212,13 +5229,61 @@ fn own_strip_claim() -> Option<(String, bool)> {
     let c = clr.as_ref().filter(|c| !c.runway_ident.is_empty())?;
     match c.state {
         tower::State::ClearedToLand if c.holds_runway => Some((c.runway_ident.clone(), true)),
-        tower::State::TaxiCleared
-        | tower::State::LinedUp
-        | tower::State::TakeoffCleared
-        | tower::State::Inbound => Some((c.runway_ident.clone(), false)),
+        // Lined up or cleared for takeoff, the runway is ours alone: one
+        // departure on it at a time, either direction (EGKK 08R, sortie
+        // 1790601822-full_auto, 2026-09-28: "Easy eight six eight zero,
+        // runway zero eight right, cleared for takeoff" 1.6 s after our own
+        // takeoff clearance, while we lined up).
+        tower::State::LinedUp | tower::State::TakeoffCleared => {
+            Some((c.runway_ident.clone(), true))
+        }
+        tower::State::TaxiCleared | tower::State::Inbound => {
+            Some((c.runway_ident.clone(), false))
+        }
         _ => None,
     }
 }
+
+/// Our own departure is still spacing the strip `ghost_end` is on: we lifted
+/// off it less than [`WAKE_SECS`] ago, so the tower has cleared nobody off it
+/// behind us (the wake and departure spacing a real tower gives the next
+/// departure). Read from the compliance watch's memory of our liftoff.
+fn own_departure_spacing(ghost_end: &str, now: Instant) -> bool {
+    let Some((ours, at)) = COMPLIANCE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .liftoff
+        .clone()
+    else {
+        return false;
+    };
+    if now.saturating_duration_since(at).as_secs() >= WAKE_SECS {
+        return false;
+    }
+    let runways = ACTIVE_RUNWAYS.lock().unwrap_or_else(|e| e.into_inner());
+    same_strip_or_twin(&runways, ghost_end, &ours)
+}
+
+/// Two runway ends on one strip, or on a strip and its close-parallel main
+/// twin (`nav::close_parallel_main`): the replay puts a real 08R departure on
+/// EGKK's 08L pavement 190 m away, and a wake clock kept on "26R" never
+/// matched the held 08R (sortie 1790601822-full_auto, 2026-09-28).
+fn same_strip_or_twin(runways: &[nav::Runway], a: &str, b: &str) -> bool {
+    let a = nav::close_parallel_main(runways, a);
+    let b = nav::close_parallel_main(runways, b);
+    matches!(
+        (strip(runways, &a), strip(runways, &b)),
+        (Some(x), Some(y)) if std::ptr::eq(x, y)
+    )
+}
+
+/// How recently the party line must have seen a ghost for a change in it to
+/// be narrated as happening now. The chatter is not ticked while a release is
+/// held or for 45 s after an exchange, and a liftoff remembered across that
+/// gap was narrated 17 s late as a fresh clearance ("Easy eight six eight
+/// zero, cleared for takeoff" at 13:40:48 for U28680 airborne at 13:40:31,
+/// EGKK 2026-09-28).
+const PARTY_LINE_FRESH_S: f64 = 5.0;
 
 /// Whether a ghost's movement on `ghost_end` conflicts with our claim: the
 /// same strip, and either the whole strip is ours or the ghost uses the
@@ -5276,6 +5341,8 @@ pub fn chatter_tick(
             announced_continue: false,
         });
         let descending = t.ele_ft < m.prev_ele_ft - 1.0;
+        // A change seen across a gap in the watch is history, not news.
+        let fresh = now.saturating_duration_since(m.last_seen).as_secs_f64() <= PARTY_LINE_FRESH_S;
         let was_ground = m.prev_ground;
         let agl = t.ele_ft - field_elev_ft;
         if exchange.is_none()
@@ -5385,6 +5452,12 @@ pub fn chatter_tick(
                 ghost_seed: crate::speaker::station_voice_seed(&t.callsign),
             });
         }
+        if exchange.is_none() && was_ground && !t.on_ground && !m.announced_takeoff && dist < 3.0
+            && !fresh
+        {
+            // Lifted off while nobody was watching: spent, never narrated late.
+            m.announced_takeoff = true;
+        }
         if exchange.is_none() && was_ground && !t.on_ground && !m.announced_takeoff && dist < 3.0 {
             m.announced_takeoff = true;
             let cs = spoken_ghost(&t.callsign);
@@ -5416,7 +5489,7 @@ pub fn chatter_tick(
             let claimed = match (&ident, &claim) {
                 (Some(a), Some(c)) => conflicts_with_claim(a, c),
                 _ => false,
-            };
+            } || ident.as_deref().is_some_and(|a| own_departure_spacing(a, now));
             if claimed {
                 sim::blackbox::record(
                     "atc",
@@ -6395,7 +6468,14 @@ pub fn wake_note_targets(targets: &[TcasTarget], now: Instant) {
             }
         }
         if was_ground && !t.on_ground && is_airline(&t.callsign) {
-            if let Some(ident) = nearest_runway_ident(t.lat, t.lon) {
+            // The END it departed, by the roll, on the main strip of a close
+            // parallel pair: the nearest threshold of the nearest runway was
+            // EGKK's 26R (the 08L pavement) for an 08R departure, and the
+            // held 08R release ignored the clock (2026-09-28, #155).
+            if let Some(ident) = departure_runway_ident(t.lat, t.lon, prev.lat, prev.lon)
+                .or_else(|| nearest_runway_ident(t.lat, t.lon))
+                .map(|id| main_runway_of(&id))
+            {
                 tracing::info!(ghost = %t.callsign, runway = %ident, "wake clock started");
                 *WAKE.lock().unwrap_or_else(|e| e.into_inner()) = Some(Wake {
                     since: now,
@@ -6417,11 +6497,7 @@ pub fn wake_remaining(runway_ident: &str, now: Instant) -> Option<u64> {
         return None;
     }
     let runways = ACTIVE_RUNWAYS.lock().unwrap_or_else(|e| e.into_inner());
-    let same = matches!(
-        (strip(&runways, &w.runway_ident), strip(&runways, runway_ident)),
-        (Some(a), Some(b)) if std::ptr::eq(a, b)
-    );
-    same.then_some(WAKE_SECS - elapsed)
+    same_strip_or_twin(&runways, &w.runway_ident, runway_ident).then_some(WAKE_SECS - elapsed)
 }
 
 // --- Taxi routes -------------------------------------------------------------
@@ -7372,10 +7448,13 @@ pub fn traffic_worth_recalling(called: &TrafficFactor, now: &TrafficFactor) -> b
 
 /// The advisory's words for a factor.
 pub fn advisory_line(f: &TrafficFactor) -> String {
-    let range = if f.nm < 1.0 {
-        "under a mile".to_string()
-    } else {
-        format!("{:.0} miles", f.nm)
+    // A mile is "a mile": 1.0 to 1.5 nm rounds to one, and "1 miles" was
+    // said twice on one approach (EGBB 15, sortie 1790601822-full_auto,
+    // +3194.7 and +3240.1, 2026-09-28, #155).
+    let range = match f.nm {
+        nm if nm < 1.0 => "under a mile".to_string(),
+        nm if nm < 1.5 => "a mile".to_string(),
+        nm => format!("{nm:.0} miles"),
     };
     format!(
         "traffic, {} o'clock, {range}, {}.",
@@ -8076,9 +8155,11 @@ mod tests {
             "{}",
             call.line
         );
-        // The landing berate is once — but still squatting on the runway a
-        // minute later earns the occupancy order (no clearance to be there).
-        let call = compliance_tick(36.15155, -5.342, 12.0, true, 10.0, true, t4 + sec(70))
+        // The landing berate is once, but still squatting (stopped) on the
+        // runway a minute later earns the occupancy order (no clearance to be
+        // there). Rolling off it is the vacate (#155).
+        assert!(compliance_tick(36.15155, -5.342, 12.0, true, 10.0, true, t4 + sec(70)).is_none());
+        let call = compliance_tick(36.15155, -5.342, 12.0, true, 0.0, true, t4 + sec(71))
             .expect("occupancy after uncleared landing");
         assert!(call.line.contains("Exit the runway"), "{}", call.line);
 
@@ -9003,6 +9084,8 @@ mod tests {
             let c = compliance_tick_facing(lat, lon, 325.0, true, gs, true, at(s), Some(hdg));
             assert!(c.is_none(), "+{s}: {}", c.map(|c| c.line).unwrap_or_default());
         }
+        // Stopped on it, the strip is not ours: squatting is an incursion.
+        assert!(!runway_occupancy_authorised(rollout[1].1, rollout[1].2, 0.0));
         // Named by the end we point down, never the nearer 33.
         let (_, lat, lon, _, hdg) = rollout[0];
         assert_eq!(on_active_runway(lat, lon).as_deref(), Some("33"));
@@ -9018,6 +9101,109 @@ mod tests {
         *ACTIVE_RUNWAYS.lock().unwrap() = Vec::new();
         *CLEARANCE.lock().unwrap() = None;
         *COMPLIANCE.lock().unwrap() = ComplianceState::NEW;
+    }
+
+    /// Issue #155, sortie 1790601822-full_auto (EGKK 08R, 2026-09-28), from
+    /// the xvl log: U28680 lifted off at 13:40:31 ("departure stream ...
+    /// 08R", "wake clock started ... 26R"), our held release said "traffic
+    /// clear ... cleared for takeoff" at 13:40:47 (the clock was on the 08L
+    /// pavement's 26R, never the held 08R), and the party line, not ticked
+    /// while the release was held, narrated "Easy eight six eight zero,
+    /// runway zero eight right, cleared for takeoff" at 13:40:48, 17 s after
+    /// that liftoff and 1.6 s after our clearance. Then U28653 lifted off
+    /// 13:42:27, seconds after us, and was "cleared for takeoff" too. Now:
+    /// the wake clock sits on the departure's own end (main strip of a close
+    /// pair), a liftoff the party line did not see live is never narrated,
+    /// the runway is ours alone while lined up or cleared for takeoff, and
+    /// nobody departs our strip within the wake time of our own liftoff.
+    #[test]
+    fn one_departure_on_the_runway_at_a_time() {
+        let _guard = SIDE_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        *ACTIVE_FIELD.lock().unwrap() = Some(("Gatwick".into(), 51.1481, -0.1903));
+        *ACTIVE_PANEL.lock().unwrap() = None;
+        *ACTIVE_RUNWAYS.lock().unwrap() = egkk_runways();
+        *GHOSTS.lock().unwrap() = None;
+        *WAKE.lock().unwrap() = None;
+        *WAKE_PREV.lock().unwrap() = None;
+        *COMPLIANCE.lock().unwrap() = ComplianceState::NEW;
+        *TAXI_TO_STAND.lock().unwrap() = false;
+        *TAXI_ROUTE.lock().unwrap() = None;
+        let t0 = Instant::now();
+        let at = |s: f64| t0 + std::time::Duration::from_secs_f64(s);
+        // A point along a strip, 08 end to 26 end.
+        let along = |r: usize, f: f64| {
+            let rw = &egkk_runways()[r];
+            (rw.lat_a + f * (rw.lat_b - rw.lat_a), rw.lon_a + f * (rw.lon_b - rw.lon_a))
+        };
+        let ghost = |cs: &str, (lat, lon): (f64, f64), ground: bool| TcasTarget {
+            callsign: cs.into(),
+            lat,
+            lon,
+            ele_ft: if ground { 203.0 } else { 260.0 },
+            on_ground: ground,
+            vs_fpm: if ground { 0.0 } else { 1500.0 },
+        };
+        let chatter = |targets: &[TcasTarget], s: f64| {
+            chatter_tick(targets, "Gatwick", 51.1481, -0.1903, 203.0, None, at(s))
+        };
+        let book = |state: tower::State| {
+            *CLEARANCE.lock().unwrap() = Some(ClearanceSnap {
+                state,
+                callsign: "Whiskey Alpha Tango six two six".into(),
+                runway_ident: "08R".into(),
+                pending_readback: None,
+                holds_runway: false,
+            });
+        };
+
+        // The wake clock: U28680 rolling east on the 08L pavement lifts off.
+        book(tower::State::TaxiCleared);
+        wake_note_targets(&[ghost("U28680", along(1, 0.55), true)], at(0.0));
+        wake_note_targets(&[ghost("U28680", along(1, 0.57), false)], at(1.0));
+        assert!(wake_remaining("08R", at(17.0)).is_some(), "the held 08R waits out the wake");
+
+        // The party line saw it on the ground, then not again for 17 s: its
+        // liftoff is history, never narrated as a clearance.
+        assert!(chatter(&[ghost("U28680", along(1, 0.55), true)], 0.0).is_none());
+        assert!(
+            chatter(&[ghost("U28680", along(1, 0.57), false)], 17.0).is_none(),
+            "a liftoff 17 s old narrated"
+        );
+
+        // Cleared for takeoff (and lined up): nobody else departs our strip.
+        book(tower::State::TakeoffCleared);
+        assert!(chatter(&[ghost("U28653", along(0, 0.40), true)], 30.0).is_none());
+        assert!(
+            chatter(&[ghost("U28653", along(0, 0.42), false)], 31.0).is_none(),
+            "cleared for takeoff behind our takeoff clearance"
+        );
+        book(tower::State::LinedUp);
+        assert!(chatter(&[ghost("EZY1", along(0, 0.40), true)], 32.0).is_none());
+        assert!(chatter(&[ghost("EZY1", along(0, 0.42), false)], 33.0).is_none());
+
+        // Our own liftoff off 08R, then the book moves on (the check-in):
+        // a departure off the same strip inside the wake time is withheld.
+        book(tower::State::Parked);
+        let (glat, glon) = along(0, 0.5);
+        assert!(compliance_tick(glat, glon, 203.0, true, 140.0, true, at(100.0)).is_none());
+        let _ = compliance_tick(glat + 0.001, glon + 0.004, 260.0, false, 150.0, true, at(101.0));
+        assert!(chatter(&[ghost("U2865", along(0, 0.40), true)], 101.5).is_none());
+        assert!(
+            chatter(&[ghost("U2865", along(0, 0.42), false)], 102.6).is_none(),
+            "cleared for takeoff 1.6 s after our liftoff"
+        );
+        // Past the wake time, a departure is narrated again.
+        assert!(chatter(&[ghost("U2866", along(0, 0.40), true)], 230.0).is_none());
+        let ex = chatter(&[ghost("U2866", along(0, 0.42), false)], 231.0).expect("narrated");
+        assert!(ex.lines[0].text.contains("cleared for takeoff"), "{}", ex.lines[0].text);
+
+        *ACTIVE_FIELD.lock().unwrap() = None;
+        *ACTIVE_RUNWAYS.lock().unwrap() = Vec::new();
+        *CLEARANCE.lock().unwrap() = None;
+        *COMPLIANCE.lock().unwrap() = ComplianceState::NEW;
+        *GHOSTS.lock().unwrap() = None;
+        *WAKE.lock().unwrap() = None;
+        *WAKE_PREV.lock().unwrap() = None;
     }
 
     /// The Jerez sortie, 2026-07-11: holding at E1 (40 m off the 45 m
@@ -12638,6 +12824,25 @@ mod tests {
         // onto the main (longest) strip facing the new way: 09L/27R is
         // 3,902 m against 09R/27L's 3,660 m (`nav::best_runway_for_wind`).
         assert_eq!(st.pick_runway(90.0, 20.0), "09L");
+    }
+
+    /// Issue #155, sortie 1790601822-full_auto (EGBB 15, 2026-09-28):
+    /// "traffic, 5 o'clock, 1 miles, 900 feet above" (+3194.7) and "4
+    /// o'clock, 1 miles, 300 feet above" (+3240.1). One mile is "a mile".
+    #[test]
+    fn a_traffic_advisory_says_a_mile() {
+        let f = |nm: f64, clock: i32, ft: f64| TrafficFactor { nm, clock, ft };
+        assert_eq!(
+            advisory_line(&f(1.2, 5, 900.0)),
+            "traffic, 5 o'clock, a mile, 900 feet above."
+        );
+        assert!(advisory_line(&f(1.49, 4, 300.0)).contains(", a mile, "));
+        assert!(advisory_line(&f(0.4, 12, 0.0)).contains("under a mile"));
+        assert!(advisory_line(&f(1.5, 12, 0.0)).contains(", 2 miles, "));
+        assert!(advisory_line(&f(6.0, 12, 0.0)).contains(", 6 miles, "));
+        for nm in [0.2, 0.99, 1.0, 1.3, 1.49, 1.5, 2.4, 5.9] {
+            assert!(!advisory_line(&f(nm, 3, 0.0)).contains(" 1 miles"), "{nm}");
+        }
     }
 
     #[test]
