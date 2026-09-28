@@ -908,8 +908,9 @@ pub(crate) async fn get_zone_clearance(
     // The call itself is heard; a line announcing it first is a crew narrating
     // its own hands (LIPK 2026-09-26: said, queued behind the tower, and
     // dropped stale, or heard after the call it announced).
-    crate::circuit::transmit(crate::circuit::radio_call(callsign, "request clearance"));
-    event("request_clearance", json!({}));
+    let circuits = flying_circuits();
+    crate::circuit::transmit(crate::circuit::radio_call(callsign, zone_clearance_call(circuits)));
+    event("request_clearance", json!({ "circuits": circuits }));
     // The tower answers with a discrete squawk; wait for it, then dial it
     // into the transponder and read it back — the crew's clearance copy.
     // The clock starts when the call is QUEUED, and the call rides the
@@ -932,6 +933,19 @@ pub(crate) async fn get_zone_clearance(
     if let Some(rb) = crate::party_line::readback_owed() {
         crate::circuit::transmit(rb.trim_end_matches('.').to_string());
         event("clearance_readback", json!({}));
+    }
+}
+
+/// The zone clearance call from the ramp: "for circuits" on a circuit, so
+/// the tower clears the circuit (`tower::circuit_clearance_lines`), never out
+/// of the zone. LEMG (sorties 1790605551 and 1790618416, 2026-09-28): a
+/// circuit from the ramp asked a plain "request clearance" and was "cleared
+/// to leave the Malaga zone". Pure.
+pub(crate) fn zone_clearance_call(circuits: bool) -> &'static str {
+    if circuits {
+        "request clearance, for circuits"
+    } else {
+        "request clearance"
     }
 }
 
@@ -6483,6 +6497,23 @@ mod tests {
         let ready = crate::circuit::radio_call(&cs, ready_call(false));
         assert_eq!(parse_intent(&ready), Intent::RequestTakeoff);
         assert!(!wants_circuits(&ready), "{ready}");
+    }
+
+    #[test]
+    fn a_circuit_from_the_ramp_asks_its_clearance_for_circuits() {
+        use super::zone_clearance_call;
+        use crate::tower::{parse_intent, wants_circuits, Intent};
+        // LEMG (sorties 1790605551 and 1790618416, 2026-09-28): the ramp's
+        // "request clearance" on a circuit earned "cleared to leave the
+        // Malaga zone".
+        let cs = Some("November two five one Charlie Victor".to_string());
+        let call = crate::circuit::radio_call(&cs, zone_clearance_call(true));
+        assert_eq!(parse_intent(&call), Intent::RequestClearance, "{call}");
+        assert!(wants_circuits(&call), "{call}");
+        // A departure never says it.
+        let call = crate::circuit::radio_call(&cs, zone_clearance_call(false));
+        assert_eq!(parse_intent(&call), Intent::RequestClearance, "{call}");
+        assert!(!wants_circuits(&call), "{call}");
     }
 
     fn egkk_egbb_route() -> super::Route {

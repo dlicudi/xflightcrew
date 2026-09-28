@@ -9968,3 +9968,11 @@ call stepped on it (16:07:08.7Z, armed 16:07:09.4, installed 16:07:31.1 when the
 dropped; 18:17:45 to 18:18:22.9; 18:39:14.6 to 18:39:43.4), past `STATION_UP_S` (15 s). Setups where no
 radio call stepped on the readback installed in 0.2 to 1.8 s. The loop's speech waits (`say`, the
 crew-radio drain) now give way to an armed swap as to a pilot's line (`main::loop_owed`). Offline only.
+
+## 2026-09-28: a circuit from the ramp asks its clearance for circuits (issue #148 follow-up)
+
+LEMG, sorties 1790605551 and 1790618416: a circuit from the ramp asked a plain "request clearance"
+(`get_zone_clearance`) and was "cleared to leave the Malaga zone"; only the runway start's
+`strip_clearance_call` said "for circuits". The ramp's call is now `zone_clearance_call` ("request
+clearance, for circuits" on a circuit mission, blackbox `full_auto request_clearance circuits`), and the
+tower clears the circuit without a stated runway too. Offline only.
