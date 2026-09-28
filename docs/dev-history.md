@@ -10070,3 +10070,27 @@ under an automation it now waits for gear down and landing flap (`flow::Sample.l
 737 hands over clean and is unchanged. Tests in `circuit::issue_169_tests`,
 `a_stalled_deploy_reading_still_steps`,
 `an_automations_before_landing_list_waits_for_the_landing_config`. Offline only.
+
+## 2026-09-28: the A330 10 nm final flown at 200 to 241 kt, three patterns, no landing (issue #171)
+
+LEMG 13 runner setup (sortie 1790622093-approach): the sim put the A330 on a 10 nm final at 206 kt,
+CONF 1, 870 ft under the path. (1) Speed: the schedule's clean speed is 1.45 x approach, 223 kt on
+the 154; the distance schedule wanted clean beyond 6 nm, so `flap_kept_flying` took CONF 1 at 211 kt
+(t 36.9, the clean retract speed 210), and the clean floor (1.2 x 175 = 210) then held the target
+at 210 and over, the lever at 1.0 at 199 kt (t 661); after the pattern the inbound leg (t 542)
+chased 223 with CONF 2 out, full power to 241 kt, the placard took both flaps. The flap readings
+followed the handle (0.25, 0.5, 0.0): not #169's stuck reading. Now an approach never asks for less
+flap than is out (`approach_flap_wanted`; only a placard or the go-around's half takes one), and its
+target stays 10 kt under the placard of the flap out, the floor winning a conflict
+(`approach_target_kts`, `flap_placard_kts`). (2) The pattern at 5.2 nm (t 680.4, missed false):
+the path law's flat -1,200 cap is the 3 degree sink at 226 kt; at 239 kt it could not hold the path,
+the error passed 500 ft (491.7 at t 679.0), the guidance aimed at the join point for 2,250 ft (8 nm,
+behind), and `reversal::needed` read that as a pattern (5.2 is outside `late_go_around`'s FAP). The
+cap is now the path's own sink plus 300 fpm when steeper (`path_descent_cap_fpm`); the `reversal`
+record carries `why` (`missed_approach`, `final_pointing_away`, `join_point_behind`, `fap_behind`),
+`above_path_ft`, `aim_nm`, `along`, `ias`, `gs`. (3) "Overflew the runway" was the line for ANY
+Final to Intercept without a go-around; now only with the runway behind (`dropped_final_line`),
+nothing when a pattern began that tick (its "Repositioning" line says it), else "High on the
+approach" or "Off the final". Tests `the_a330_final_keeps_its_flap_and_flies_under_the_placard`,
+`the_glidepath_law_can_always_hold_the_path_it_is_on`,
+`a_pattern_begun_short_of_the_field_says_why_and_never_overflew`. Offline only.

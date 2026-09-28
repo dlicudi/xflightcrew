@@ -1888,6 +1888,9 @@ pub fn run_autoland_scoped(
                     .or(psi_r.as_ref().ok())
                     .copied()
                     .unwrap_or(rwy.course_deg);
+                // Set on the tick a pattern begins: its own line says what
+                // happens, so the phase change says nothing more.
+                let mut reversal_began = false;
                 if reversal.is_none() {
                     let aim_along_nm = if alt - raw.glidepath_alt_ft > 500.0 {
                         join_point_nm(alt, rwy.elev_ft)
@@ -2047,13 +2050,22 @@ pub fn run_autoland_scoped(
                         if missed == Some(MissedStage::Reposition) {
                             go_around.hold_reposition();
                         }
+                        reversal_began = true;
+                        let above_path_ft = alt - raw.glidepath_alt_ft;
                         crate::blackbox::record(
                             "autoland",
                             serde_json::json!({"event": "reversal", "side": side,
                                 "platform_ft": platform_ft, "left_ft": left_ft, "right_ft": right_ft,
                                 "xtk_m": xtk_now * M_PER_NM, "dist": raw.dist_nm,
                                 "track": track_true, "missed": missed.is_some(),
-                                "final_called": raw.phase == ApproachPhase::Final}),
+                                "final_called": raw.phase == ApproachPhase::Final,
+                                "why": crate::reversal::why(
+                                    missed.is_some(),
+                                    raw.phase == ApproachPhase::Final,
+                                    above_path_ft,
+                                ),
+                                "above_path_ft": above_path_ft, "aim_nm": aim_along_nm,
+                                "along": along_nm, "ias": ias, "gs": gs_kts}),
                         );
                         announce(
                             format!(
@@ -2974,7 +2986,12 @@ pub fn run_autoland_scoped(
                     // own on final and a ceiling-only rule low in a
                     // reposition (`approach_power_floor`).
                     let floor = crate::aircraft::config_floor_kts(last_flap.unwrap_or(0.0));
-                    let target = crate::aircraft::floored_target(g.target_ias_kts, floor);
+                    let target = approach_target_kts(
+                        g.target_ias_kts,
+                        last_flap.unwrap_or(0.0),
+                        &crate::aircraft::flap_limits(),
+                        floor,
+                    );
                     let adj = crate::tools::speedhold::throttle_adjust(target - ias, trend_kts_s);
                     // In the roundout the lever only ever comes back. The
                     // speed law read the roundout's own deceleration as
@@ -3089,7 +3106,8 @@ pub fn run_autoland_scoped(
                 } else if ga || outbound {
                     0.5
                 } else {
-                    flap_schedule(g.dist_nm, alt - g.glidepath_alt_ft)
+                    let sched = flap_schedule(g.dist_nm, alt - g.glidepath_alt_ft);
+                    approach_flap_wanted(sched, last_flap)
                 };
                 let limits = crate::aircraft::flap_limits();
                 let flap = flap_kept_flying(
@@ -3226,7 +3244,12 @@ pub fn run_autoland_scoped(
                                 spoke_going_around = true;
                                 "Going around. Full power, climbing straight ahead."
                             } else {
-                                "Overflew the runway. Going around, climbing to re-intercept."
+                                dropped_final_line(
+                                    along_nm,
+                                    reversal_began,
+                                    alt - g.glidepath_alt_ft,
+                                )
+                                .unwrap_or("")
                             }
                         }
                         ApproachPhase::Intercept => "Intercepting the final approach.",
@@ -3234,7 +3257,9 @@ pub fn run_autoland_scoped(
                         ApproachPhase::Flare if cfg.flare_power.is_some() => "Over the threshold, flaring, easing the power back.",
                         ApproachPhase::Flare => "Over the threshold, flaring, power to idle.",
                     };
-                    announce(line.into(), Priority::Caution);
+                    if !line.is_empty() {
+                        announce(line.into(), Priority::Caution);
+                    }
                 }
 
                 // (Touchdown + rollout-to-stop is handled at the top of the loop,
@@ -3819,6 +3844,86 @@ pub fn pattern_ias(approach_ias: f64, flap_limits: &[(f64, Option<f64>)]) -> f64
     mid.min(half_vfe - 15.0).max(approach_ias)
 }
 
+/// What the copilot says when a final drops back to an intercept without a
+/// go-around, or `None` when another line already says it. "Overflew the
+/// runway" only with the runway BEHIND (`along_nm` negative): it was said at
+/// 5.2 nm on the tick a pattern began, over the pattern's own "Repositioning"
+/// line (LEMG 13, sortie 1790622093-approach, #171). Pure.
+pub fn dropped_final_line(
+    along_nm: f64,
+    reversal_began: bool,
+    above_path_ft: f64,
+) -> Option<&'static str> {
+    if along_nm < 0.0 {
+        Some("Overflew the runway. Going around, climbing to re-intercept.")
+    } else if reversal_began {
+        None
+    } else if above_path_ft > 0.0 {
+        Some("High on the approach. Re-intercepting the glidepath.")
+    } else {
+        Some("Off the final. Re-intercepting.")
+    }
+}
+
+/// Room past the path's own sink the glidepath law may command to get back
+/// down to it, fpm.
+const PATH_CATCH_UP_FPM: f64 = 300.0;
+
+/// The steepest descent the glidepath law commands, fpm (negative): the old
+/// flat 1,200, or the path's own sink at this groundspeed plus
+/// [`PATH_CATCH_UP_FPM`] when that is steeper. A flat 1,200 is the 3 degree
+/// path at 226 kt over the ground: faster, the law could not even HOLD the
+/// path, the error grew, and past 500 ft high the guidance aimed at a join
+/// point behind the aircraft, which the reversal read as a pattern (the A330
+/// at 239 kt, 491 ft high at 5.3 nm on a -1,200 dial, then a downwind from
+/// 5.2 nm; LEMG 13, sortie 1790622093-approach, #171). Pure.
+pub fn path_descent_cap_fpm(nominal_vs_fpm: f64) -> f64 {
+    (nominal_vs_fpm - PATH_CATCH_UP_FPM).min(-1200.0)
+}
+
+/// The placard of the flap that is out: the lowest Vfe of every detent at or
+/// inside `flap_ratio`. `None` clean, or with no Vfe declared. Pure.
+pub fn flap_placard_kts(flap_ratio: f64, flap_limits: &[(f64, Option<f64>)]) -> Option<f64> {
+    flap_limits
+        .iter()
+        .filter(|(ratio, _)| *ratio > 1e-6 && *ratio <= flap_ratio + 1e-6)
+        .filter_map(|(_, vfe)| *vfe)
+        .reduce(f64::min)
+}
+
+/// The approach's speed target sits this far under the placard of the flap out.
+const PLACARD_TARGET_MARGIN_KTS: f64 = 10.0;
+
+/// The speed the approach's governor holds: the schedule, never closer to the
+/// placard of the flap actually out than [`PLACARD_TARGET_MARGIN_KTS`], and
+/// never under that configuration's floor (the floor wins a conflict). The
+/// schedule's clean speed is 1.45 x the approach speed, 223 kt on the A330's
+/// 154: with CONF 1 out (Vfe 215) the governor added power to reach it, the
+/// placard took the flap, the clean floor (1.2 x 175 = 210) then held the
+/// lever up, and a 10 nm final ran at 200 to 241 kt (LEMG 13, sortie
+/// 1790622093-approach, 2026-09-28, #171). Pure.
+pub fn approach_target_kts(
+    scheduled_kts: f64,
+    flap_ratio: f64,
+    flap_limits: &[(f64, Option<f64>)],
+    floor_kts: Option<f64>,
+) -> f64 {
+    let ceiling = flap_placard_kts(flap_ratio, flap_limits)
+        .map_or(f64::INFINITY, |v| v - PLACARD_TARGET_MARGIN_KTS);
+    crate::aircraft::floored_target(scheduled_kts.min(ceiling), floor_kts)
+}
+
+/// The flap an approach asks for: the distance schedule, never LESS than is
+/// already out. A flap out is drag and a lower floor, both what an approach
+/// needs; only a placard (`flap_held_within_limits`) or the go-around's half
+/// takes one away. The schedule wanted the A330 clean beyond 6 nm, CONF 1
+/// came up at 211 kt 7.9 nm out (the clean retract speed, 210), and the clean
+/// floor then kept the final at 210 and over (#171). `current` is the last
+/// flap written or read. Pure.
+pub fn approach_flap_wanted(scheduled: f64, current: Option<f64>) -> f64 {
+    scheduled.max(current.unwrap_or(0.0))
+}
+
 /// The speed a give-up leaves the governor holding: the pattern speed, inside
 /// the placard of whatever flap is actually out, never under the approach
 /// speed. With the flaps up it is the clean approach speed.
@@ -3830,11 +3935,7 @@ pub fn hand_back_speed_kts(
     if flap_ratio < 0.05 {
         return clean_approach_ias(approach_ias);
     }
-    let placard = flap_limits
-        .iter()
-        .filter(|(ratio, _)| *ratio <= flap_ratio + 1e-6)
-        .filter_map(|(_, vfe)| *vfe)
-        .fold(f64::INFINITY, f64::min);
+    let placard = flap_placard_kts(flap_ratio, flap_limits).unwrap_or(f64::INFINITY);
     pattern_ias(approach_ias, flap_limits)
         .min(placard - 15.0)
         .max(approach_ias)
@@ -6358,10 +6459,11 @@ pub fn guidance_on(
     // half minutes, porpoising 1,859 to 2,050 ft while wandering between 1.1
     // and 4.1 nm from the field. Fading the permitted descent to zero AT the
     // floor lands the aircraft on it instead of through it.
+    let descent_cap_fpm = path_descent_cap_fpm(nominal_vs);
     let descent_limit_fpm = if phase == ApproachPhase::Intercept {
-        -((radio_alt_ft - REPOSITION_MIN_AGL_FT) * 2.0).clamp(0.0, 1200.0)
+        -((radio_alt_ft - REPOSITION_MIN_AGL_FT) * 2.0).clamp(0.0, -descent_cap_fpm)
     } else {
-        -1200.0
+        descent_cap_fpm
     };
 
     // The roundout band's own gates, named once: the vertical law below owns
@@ -6422,9 +6524,10 @@ pub fn guidance_on(
         // against the 190 ft the LXGB 09 final carried — it arrived at
         // the numbers still 190 ft high (2026-07-22). 1.2 converges a
         // 200 ft error inside the last mile; the clamp still forbids a
-        // dive.
+        // dive, and it is never shallower than the path itself plus a
+        // catch-up (`path_descent_cap_fpm`).
         _ => (nominal_vs - alt_err * glidepath_gain_fpm_per_ft(gs_kts))
-            .clamp(-1200.0, 0.0)
+            .clamp(descent_cap_fpm, 0.0)
             .max(descent_limit_fpm),
     };
 
@@ -8468,6 +8571,133 @@ mod tests {
         // Extending is never held back, and an unread flap changes nothing.
         assert_eq!(flap_kept_flying(0.5, Some(0.25), 180.0, &limits, false, retract), 0.5);
         assert_eq!(flap_kept_flying(0.0, None, 58.2, &limits, false, retract), 0.0);
+    }
+
+    /// The A330's placards and per-notch floors, straight from its profile.
+    fn a330_flaps() -> (Vec<(f64, Option<f64>)>, impl Fn(f64) -> Option<f64>) {
+        let p = crate::aircraft::load("airbus_a330_300").unwrap();
+        let f = p.flaps.clone().unwrap();
+        let limits: Vec<_> = f.detents.iter().map(|d| (d.ratio, d.vfe_kts)).collect();
+        let clean = p.vs_clean_kts;
+        let floors: Vec<_> = f
+            .detents
+            .iter()
+            .map(|d| (d.ratio, if d.ratio == 0.0 { clean } else { d.vs_kts }))
+            .collect();
+        let floor = move |r: f64| {
+            floors
+                .iter()
+                .find(|(x, _)| (x - r).abs() < 1e-3)
+                .and_then(|(_, vs)| vs.map(|v| (1.2 * v).round()))
+        };
+        (limits, floor)
+    }
+
+    /// LEMG 13, sortie 1790622093-approach (2026-09-28, #171): an A330 set up
+    /// on a 10 nm final at 206 kt with CONF 1 out. At 7.9 nm (211 kt) the
+    /// distance schedule's "clean" took CONF 1 away at the clean retract
+    /// speed, the clean floor (210) then held the lever up, and after the
+    /// pattern the inbound leg chased the clean 223 kt with CONF 2 out: the
+    /// placard took both flaps and the final ran at 200 to 241 kt.
+    #[test]
+    fn the_a330_final_keeps_its_flap_and_flies_under_the_placard() {
+        let (limits, floor) = a330_flaps();
+        assert_eq!(flap_placard_kts(0.0, &limits), None);
+        assert_eq!(flap_placard_kts(0.25, &limits), Some(215.0));
+        assert_eq!(flap_placard_kts(0.5, &limits), Some(196.0));
+        assert_eq!(floor(0.0), Some(210.0), "the clean floor, 1.2 x 175");
+        assert_eq!(floor(0.25), Some(176.0));
+
+        // t 36.9: 7.88 nm, 47 ft under the path, 211.3 kt, CONF 1 out.
+        let sched = flap_schedule(7.877, 2557.3 - 2604.4);
+        assert_eq!(sched, 0.0, "the distance schedule wants clean");
+        // The old ask: CONF 1 came up at the clean retract speed (210).
+        let old = flap_held_within_limits(sched, 211.3, &limits, Some(0.25));
+        let retract = |_: f64| Some(210.0);
+        assert_eq!(flap_kept_flying(old, Some(0.25), 211.3, &limits, false, retract), 0.0);
+        // The approach never asks for less than is out.
+        let wanted = approach_flap_wanted(sched, Some(0.25));
+        assert_eq!(wanted, 0.25);
+        let held = flap_held_within_limits(wanted, 211.3, &limits, Some(0.25));
+        assert_eq!(flap_kept_flying(held, Some(0.25), 211.3, &limits, false, retract), 0.25);
+        // Inside 6 nm it still asks for more, and a placard still takes it.
+        assert_eq!(approach_flap_wanted(flap_schedule(5.4, 400.0), Some(0.25)), 0.5);
+        assert_eq!(flap_held_within_limits(0.25, 236.4, &limits, Some(0.25)), 0.0);
+        // Nothing read is nothing kept.
+        assert_eq!(approach_flap_wanted(0.0, None), 0.0);
+
+        // The speed: t 2.1, 9.9 nm, CONF 1. The schedule's clean speed is
+        // 1.45 x 154 = 223, over CONF 1's 215 placard.
+        let at_arm = scheduled_ias(9.916, 154.0);
+        assert!(at_arm > 215.0, "{at_arm}");
+        assert_eq!(approach_target_kts(at_arm, 0.25, &limits, floor(0.25)), 205.0);
+        // t 553.1, the pattern's inbound leg at 12.6 nm with CONF 2 out:
+        // the governor went to full power for 223 and reached 241.
+        let inbound = scheduled_ias(12.635, 154.0);
+        assert!((inbound - 223.3).abs() < 0.1, "{inbound}");
+        assert_eq!(approach_target_kts(inbound, 0.5, &limits, floor(0.5)), 186.0);
+        // The schedule under the placard stands, and so does the floor.
+        assert_eq!(approach_target_kts(154.0, 0.25, &limits, floor(0.25)), 176.0);
+        assert_eq!(approach_target_kts(154.0, 0.0, &limits, floor(0.0)), 210.0);
+        assert_eq!(approach_target_kts(180.0, 1.0, &limits, None), 170.0);
+    }
+
+    /// Same sortie, t 679.0: Final at 5.28 nm, 239.4 kt over the ground,
+    /// 491.7 ft above the path, on a -1,200 dial. The 3 degree path at that
+    /// groundspeed is 1,269 fpm: the flat cap could not even hold it, and a
+    /// second later the aircraft was 505 ft high and the guidance aimed at a
+    /// join point behind it.
+    #[test]
+    fn the_glidepath_law_can_always_hold_the_path_it_is_on() {
+        let nominal = -(239.4 / 60.0) * GLIDEPATH_FT_PER_NM;
+        assert!(nominal < -1200.0, "{nominal}");
+        let cap = path_descent_cap_fpm(nominal);
+        assert!(cap <= nominal - 299.0, "{cap}");
+        let law = (nominal - 491.7 * glidepath_gain_fpm_per_ft(239.4)).clamp(cap, 0.0);
+        assert!(law < nominal, "it catches up: {law}");
+        // A slower final keeps the old limit.
+        assert_eq!(path_descent_cap_fpm(-(150.0 / 60.0) * GLIDEPATH_FT_PER_NM), -1200.0);
+        assert_eq!(path_descent_cap_fpm(-(70.0 / 60.0) * GLIDEPATH_FT_PER_NM), -1200.0);
+    }
+
+    /// Same sortie, t 680.4: the second `reversal` (missed false, final not
+    /// called) at 5.2 nm on the centreline, tracking the runway, 505 ft
+    /// above the path. Over 500 ft the guidance aims at the join point for
+    /// its altitude, 8 nm out, behind it: `reversal::needed` read that as a
+    /// pattern. The copilot then said "Overflew the runway" at 5.2 nm.
+    #[test]
+    fn a_pattern_begun_short_of_the_field_says_why_and_never_overflew() {
+        let rwy = Runway {
+            icao: "LEMG".into(),
+            id: "13".into(),
+            thr_lat: 36.6860,
+            thr_lon: -4.5100,
+            course_deg: 131.5,
+            length_m: 2750.0,
+            surface: 1,
+            dist_nm: 0.0,
+            elev_ft: 48.0,
+        };
+        let (lat, lon) = crate::nav::project_latlon(
+            rwy.thr_lat,
+            rwy.thr_lon,
+            (rwy.course_deg + 180.0) % 360.0,
+            5.2,
+        );
+        let aim = join_point_nm(2250.0, rwy.elev_ft);
+        assert!(aim > 5.2, "the join point is behind: {aim}");
+        assert!(crate::reversal::needed(&rwy, lat, lon, 132.2, aim, false));
+        assert_eq!(crate::reversal::why(false, false, 505.0), "join_point_behind");
+        assert_eq!(crate::reversal::why(true, false, -40.0), "missed_approach");
+        assert_eq!(crate::reversal::why(false, true, 100.0), "final_pointing_away");
+        assert_eq!(crate::reversal::why(false, false, 100.0), "fap_behind");
+        // The phase change on that tick: the pattern's own line says it.
+        assert_eq!(dropped_final_line(5.07, true, 516.0), None);
+        let high = dropped_final_line(5.07, false, 516.0).unwrap();
+        assert!(!high.contains("Overflew"), "{high}");
+        // Only with the runway behind.
+        assert!(dropped_final_line(-0.3, false, 800.0).unwrap().starts_with("Overflew"));
+        assert!(dropped_final_line(-0.3, true, 800.0).unwrap().starts_with("Overflew"));
     }
 
     /// Same sortie: +100 to +2,000 fpm on the dial under the reposition

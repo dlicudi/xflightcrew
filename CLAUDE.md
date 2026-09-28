@@ -720,11 +720,17 @@ everything blackboxes to `logs/blackbox.jsonl` (kinds: `atc`, `autotaxi`, `autot
   `magnetic x 360 + true` (`nav::loc_courses`).
 - **A reposition is a PATTERN, never a point** (`src/reversal.rs`, `reversal::needed`): the downwind
   extends while the height cannot be lost (`reversal::too_high_to_turn`, `pattern_descent_fpm`); an
-  inbound past the threshold is OVER (`reversal::overflown`); `pattern_ias`. **The stabilised gate
+  inbound past the threshold is OVER (`reversal::overflown`); `pattern_ias`; each is blackboxed with
+  its `why` (`reversal::why`), and "Overflew the runway" is said only with the runway behind
+  (`dropped_final_line`; it was said at 5.2 nm, #171). **The stabilised gate
   is about TIME** (`unstabilised_at_gate`, `reversal::predicted_residual_m`), not position.
 - The receding guard measures from the furthest legitimate point (`recede_ref_nm`); flaps never cycle
   on a placard (`flap_held_within_limits`); **an approach never takes away the flap the wing flies
-  on** (`flap_kept_flying`, `last_flap` read at the arm) and **a climb is flown on thrust**
+  on** (`flap_kept_flying`, `last_flap` read at the arm), nor asks for less than is out
+  (`approach_flap_wanted`), and its speed target stays under the placard of the flap out
+  (`approach_target_kts`; the A330's clean 223 took CONF 1 and ran a final at 241 kt, #171); the path
+  law's descent cap is the path's own sink plus a catch-up (`path_descent_cap_fpm`; a flat 1,200 is
+  the path at 226 kt) and **a climb is flown on thrust**
   (`climb_power_floor`); a pattern's inbound leg the glidepath reaches is the approach
   (`reversal::path_joined`); a give-up hands the SPEED to the governor
   (`hand_back_speed_kts`).

@@ -149,6 +149,24 @@ pub fn overflown(rev: &Reversal, along_nm: f64) -> bool {
     rev.leg == Leg::Inbound && along_nm < 0.0
 }
 
+/// Why a pattern began, for its blackbox record: the missed approach's
+/// reposition stage, a final called with the nose pointing away, or the
+/// guidance's aim (the join point when over 500 ft above the path, else the
+/// FAP) lying behind the aircraft. The record carried no reason, and the A330
+/// began one at 5.2 nm on the centreline (LEMG 13, #171): 505 ft high, the
+/// join point 6.9 nm out behind it. Pure.
+pub fn why(missed: bool, final_called: bool, above_path_ft: f64) -> &'static str {
+    if missed {
+        "missed_approach"
+    } else if final_called {
+        "final_pointing_away"
+    } else if above_path_ft > 500.0 {
+        "join_point_behind"
+    } else {
+        "fap_behind"
+    }
+}
+
 /// Turn radius the pattern is sized for, nm.
 pub fn sizing_radius_nm(gs_kts: f64) -> f64 {
     let v = gs_kts.max(50.0) * 0.514_444;
