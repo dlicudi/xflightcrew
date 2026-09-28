@@ -430,6 +430,17 @@ fn crossing_clause(ctx: &Ctx) -> String {
 /// ATIS information (the station blanks `ctx.qnh`), so the clearance skips
 /// the numbers the broadcast already gave them. `pub(crate)`: the approach
 /// controller's vector phrases attach the same clause.
+/// The answer to a crew's "going around" after the tower sent it round for
+/// an occupant that will not leave on its own clock and offered another
+/// runway (`station::resequence_runway`, issue #162): the runway given up
+/// and the one to expect. `from` and `to` are spoken.
+pub fn go_around_resequenced_line(callsign: &str, from: &str, to: &str) -> String {
+    format!(
+        "{callsign}, roger, go around. Climb to circuit altitude, runway heading. \
+         Runway {from} is blocked, expect runway {to}, report downwind."
+    )
+}
+
 pub fn qnh_clause(ctx: &Ctx) -> String {
     if ctx.qnh.is_empty() {
         String::new()
@@ -2643,6 +2654,16 @@ impl Tower {
             // leg. All land in Inbound — "in the pattern, awaiting final".
             // Live traffic on final makes the downwind join number two, off
             // the same TCAS picture the advisories narrate.
+            // Traffic standing on the runway: the downwind is number two
+            // behind it, and the final report's clearance is withheld until
+            // the strip clears (issue #162: the hold, not a second order).
+            Intent::ReportDownwind if ctx.runway_occupied && !ctx.on_ground => {
+                self.state = State::Inbound;
+                format!(
+                    "{}, number two, traffic on the runway, report final.",
+                    ctx.callsign
+                )
+            }
             Intent::ReportDownwind => {
                 self.state = State::Inbound;
                 match ctx.final_traffic_nm {
