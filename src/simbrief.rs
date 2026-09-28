@@ -126,6 +126,143 @@ pub struct FlightPlan {
     /// crew's name for us while this plan is loaded and fits the airframe
     /// (`atc::callsign::resolve`). `None` on a local plan.
     pub callsign: Option<String>,
+    /// The OFP's speed schedule and planned step climbs (navlog `stage`,
+    /// `ind_airspeed`, `mach_thousandths`; `general/costindex`,
+    /// `general/stepclimb_string`). Empty on a local plan: the follower then
+    /// flies the profile's `reference.cruise_ias_kts` as before.
+    pub schedule: CruiseSchedule,
+}
+
+/// Where a navlog fix sits on the plan's profile (the OFP's `stage`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Stage {
+    Climb,
+    Cruise,
+    Descent,
+}
+
+/// One navlog fix's planned speeds: indicated airspeed and Mach at that fix,
+/// at its planned altitude, as the cost index made them.
+#[derive(Clone, Debug, PartialEq)]
+pub struct NavlogSpeed {
+    pub ident: String,
+    pub lat: f64,
+    pub lon: f64,
+    pub stage: Stage,
+    pub alt_ft: f64,
+    pub ias_kts: Option<f64>,
+    pub mach: Option<f64>,
+}
+
+/// A planned level from `general/stepclimb_string` ("EGKK/0180",
+/// "EIDW/0340 ERNAN/0360"): from `fix` on, fly `alt_ft`. The first entry is
+/// the origin and the initial cruise level; every later one is a step.
+#[derive(Clone, Debug, PartialEq)]
+pub struct StepClimb {
+    pub fix: String,
+    pub alt_ft: f64,
+}
+
+/// The OFP's cruise schedule: the per-fix speeds its cost index planned and
+/// the levels it planned to step through. Before this the follower flew the
+/// airframe's one `cruise_ias_kts` at every level (the 737's 255, chosen to
+/// stay under Mmo at FL360, is 45 kt under the OFP's 300 at FL180) and
+/// climbed straight to the plan's HIGHEST level from the runway, so a
+/// planned step was flown as the initial cruise (#101).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct CruiseSchedule {
+    /// `general/costindex`, for the record (the speeds already carry it).
+    pub cost_index: Option<f64>,
+    /// `general/cruise_profile` ("CI 77", "LRC", "M78").
+    pub profile: Option<String>,
+    /// Every navlog fix with a stage, TOC and TOD excluded.
+    pub fixes: Vec<NavlogSpeed>,
+    /// The planned levels, the initial one first. One entry = no step.
+    pub steps: Vec<StepClimb>,
+}
+
+/// The navlog fixes' stages and planned speeds. A fix without a stage is
+/// left out (an old or foreign OFP): no schedule, the airframe's speed.
+fn parse_schedule_fixes(v: &Value) -> Vec<NavlogSpeed> {
+    let Some(fixes) = v.pointer("/navlog/fix").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    fixes
+        .iter()
+        .filter_map(|f| {
+            let ident = f.get("ident").and_then(Value::as_str).unwrap_or("");
+            if ident.is_empty() || ident == "TOC" || ident == "TOD" {
+                return None;
+            }
+            let stage = match f.get("stage").and_then(Value::as_str)?.trim() {
+                "CLB" => Stage::Climb,
+                "CRZ" => Stage::Cruise,
+                "DSC" | "DES" => Stage::Descent,
+                _ => return None,
+            };
+            let lat = f.get("pos_lat").and_then(num_of)?;
+            let lon = f.get("pos_long").and_then(num_of)?;
+            let ias_kts = f
+                .get("ind_airspeed")
+                .and_then(num_of)
+                .filter(|k| (40.0..=450.0).contains(k));
+            let mach = f
+                .get("mach_thousandths")
+                .and_then(num_of)
+                .or_else(|| f.get("mach").and_then(num_of))
+                .filter(|m| (0.05..=0.99).contains(m));
+            Some(NavlogSpeed {
+                ident: ident.to_string(),
+                lat,
+                lon,
+                stage,
+                alt_ft: f.get("altitude_feet").and_then(num_of).unwrap_or(0.0),
+                ias_kts,
+                mach,
+            })
+        })
+        .collect()
+}
+
+/// `general/stepclimb_string`: "IDENT/LLLL" tokens, the level in hundreds of
+/// feet ("EGKK/0180" = FL180). A token that does not read is dropped; a
+/// level out of any airliner's range too.
+pub fn parse_step_climbs(s: &str) -> Vec<StepClimb> {
+    s.split_whitespace()
+        .filter_map(|tok| {
+            let mut parts = tok.split('/');
+            let fix = parts.next()?.trim().to_ascii_uppercase();
+            let lvl = parts.next()?.trim();
+            if fix.is_empty() || !fix.chars().all(|c| c.is_ascii_alphanumeric()) {
+                return None;
+            }
+            let digits: String = lvl.chars().take_while(|c| c.is_ascii_digit()).collect();
+            if digits.len() < 3 {
+                return None;
+            }
+            let alt_ft = digits.parse::<f64>().ok()? * 100.0;
+            (1_000.0..=60_000.0).contains(&alt_ft).then_some(StepClimb { fix, alt_ft })
+        })
+        .collect()
+}
+
+/// The whole schedule from an OFP.
+pub fn parse_schedule(v: &Value) -> CruiseSchedule {
+    let text = |p: &str| {
+        v.pointer(p)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty() && *s != "{}")
+            .map(str::to_string)
+    };
+    CruiseSchedule {
+        cost_index: v.pointer("/general/costindex").and_then(num_of),
+        profile: text("/general/cruise_profile"),
+        fixes: parse_schedule_fixes(v),
+        steps: text("/general/stepclimb_string")
+            .map(|s| parse_step_climbs(&s))
+            .unwrap_or_default(),
+    }
 }
 
 /// See [`FlightPlan::procedures`].
@@ -363,6 +500,7 @@ pub async fn fetch(user_id: &str) -> Result<FlightPlan> {
         block_fuel_kg: to_kg(n("/fuel/plan_ramp")),
         min_takeoff_fuel_kg: to_kg(n("/fuel/min_takeoff")),
         weights: parse_weights(&v, in_kg),
+        schedule: parse_schedule(&v),
     })
 }
 
@@ -620,6 +758,55 @@ mod tests {
     }
 
     use super::*;
+
+    /// The pilot's real OFP, trimmed (EGKK-EGBB, B738, 2026-09-28): the
+    /// cruise schedule is its CI, the CRZ fixes (TOD left out) with their
+    /// airspeed and Mach, and a step string of just the initial level.
+    #[test]
+    fn the_ofp_cruise_schedule_is_read_from_the_navlog() {
+        let v: Value =
+            serde_json::from_str(include_str!("../bench/ofp/egkk-egbb-738.trimmed.json")).unwrap();
+        let s = parse_schedule(&v);
+        assert_eq!(s.cost_index, Some(77.0));
+        assert_eq!(s.profile.as_deref(), Some("CI 77"));
+        assert_eq!(s.steps, vec![StepClimb { fix: "EGKK".into(), alt_ft: 18_000.0 }]);
+        let cruise: Vec<&str> = s
+            .fixes
+            .iter()
+            .filter(|f| f.stage == Stage::Cruise)
+            .map(|f| f.ident.as_str())
+            .collect();
+        assert_eq!(cruise, ["D156O", "D156J", "LAM", "HEMEL", "BUZAD", "WELIN"]);
+        let hemel = s.fixes.iter().find(|f| f.ident == "HEMEL").unwrap();
+        assert_eq!((hemel.ias_kts, hemel.mach, hemel.alt_ft), (Some(300.0), Some(0.628), 18_000.0));
+        assert!(!s.fixes.iter().any(|f| f.ident == "TOC" || f.ident == "TOD"));
+        assert_eq!(s.fixes.iter().find(|f| f.ident == "HON").unwrap().stage, Stage::Descent);
+        assert_eq!(s.fixes.iter().find(|f| f.ident == "ACORN").unwrap().stage, Stage::Climb);
+        // The waypoints the follower flies are the same fixes.
+        assert_eq!(parse_waypoints(&v).len(), s.fixes.len());
+        // An OFP without the fields: an empty schedule, never a guess.
+        assert_eq!(parse_schedule(&serde_json::json!({})), CruiseSchedule::default());
+    }
+
+    #[test]
+    fn a_step_climb_string_reads_fix_and_level() {
+        assert_eq!(
+            parse_step_climbs("EIDW/0340 ERNAN/0360  5715N/0380"),
+            vec![
+                StepClimb { fix: "EIDW".into(), alt_ft: 34_000.0 },
+                StepClimb { fix: "ERNAN".into(), alt_ft: 36_000.0 },
+                StepClimb { fix: "5715N".into(), alt_ft: 38_000.0 },
+            ]
+        );
+        // Anything that does not read is dropped, not guessed.
+        assert_eq!(
+            parse_step_climbs("EGKK/0180 BAD 12/ /0350 X/99 HON/0090"),
+            vec![
+                StepClimb { fix: "EGKK".into(), alt_ft: 18_000.0 },
+                StepClimb { fix: "HON".into(), alt_ft: 9_000.0 },
+            ]
+        );
+    }
 
     /// The load sheet as the fetcher sends it (LXGB-LEAX in the 172,
     /// 2026-09-15: three aboard, 67 lb of cargo, planned at max takeoff

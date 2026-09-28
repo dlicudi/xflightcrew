@@ -823,6 +823,7 @@ impl Planned {
             procedures: Default::default(),
             // A local plan names no flight: the override or the tail speak.
             callsign: None,
+            schedule: Default::default(),
             source: PlanSource::Local,
             origin: self.origin.icao.clone(),
             destination: self.dest.icao.clone(),

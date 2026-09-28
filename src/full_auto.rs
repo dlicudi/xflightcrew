@@ -225,6 +225,11 @@ pub struct Route {
     /// The mission flies IFR ([`plan_is_ifr`]): the tower is asked for the
     /// IFR clearance to `dest_icao`, not the zone clearance.
     pub ifr: bool,
+    /// The OFP's cruise schedule (`simbrief::CruiseSchedule`): the follower
+    /// flies each cruise leg at its planned speed and says each planned step
+    /// (`procedure::scheduled_cruise_kts`, `step_climb_at`). The levels are
+    /// already in `legs` (`procedure::apply_step_climbs` at the arm).
+    pub cruise_schedule: crate::simbrief::CruiseSchedule,
 }
 
 /// Does this plan fly IFR? A SimBrief plan is an airline plan and always
@@ -3020,6 +3025,7 @@ async fn fly_route(
             arrival_constraints: route.arrival_constraints.clone(),
             visual_deg: None,
             missed_legs: Vec::new(),
+            cruise_schedule: route.cruise_schedule.clone(),
         },
         xp.cancellation(),
     ) {
@@ -6585,6 +6591,7 @@ mod tests {
             transition_level_ft: None,
             procedures: Default::default(),
             callsign: None,
+            schedule: Default::default(),
             source: crate::simbrief::PlanSource::SimBrief,
             origin: "LXGB".into(),
             destination: "LEAX".into(),
@@ -6669,6 +6676,7 @@ mod tests {
             arrival_star: None,
             sid: Some("LEGL1P".into()),
             ifr: true,
+            cruise_schedule: Default::default(),
         };
         let fallback_route = route.clone();
         // The Evolution's own climb (profile best_climb_fpm); the GA default

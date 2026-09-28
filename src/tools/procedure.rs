@@ -257,6 +257,7 @@ fn build_plan(
                 arrival_constraints: Vec::new(),
                 visual_deg: None,
                 missed_legs: Vec::new(),
+                cruise_schedule: Default::default(),
             },
             ack,
         ));

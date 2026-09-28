@@ -676,6 +676,8 @@ impl FullAuto {
             &fp.destination,
             fp.cruise_alt_ft,
         );
+        // The OFP's planned steps, flown where it planned them (#101).
+        record_step_climbs(&mut legs, &fp.schedule);
         // Below the sector altitude of either field, a rejoin heading is
         // never advice on its own: "steer 343 for WI506" from 3,000 ft west
         // of Innsbruck pointed across the ridges, and the next thing the log
@@ -852,6 +854,7 @@ impl FullAuto {
                 sid: None,
                 // Airborne: no clearance to ask for.
                 ifr: false,
+                cruise_schedule: fp.schedule.clone(),
             }),
             ack,
         ))
@@ -1055,6 +1058,8 @@ impl FullAuto {
             &fp.destination,
             fp.cruise_alt_ft,
         );
+        // The OFP's planned steps, flown where it planned them (#101).
+        record_step_climbs(&mut legs, &fp.schedule);
         // The arrival is the crew's: the STAR to the runway the wind will
         // give us, when SimBrief planned the other end.
         let star_line = crate::plan_audit::choose_arrival(
@@ -1469,10 +1474,41 @@ impl FullAuto {
                     fp.cruise_alt_ft,
                     fp.transition_altitude_ft.unwrap_or(self.transition_altitude_ft),
                 ),
+                cruise_schedule: fp.schedule.clone(),
             }),
             ack,
         ))
     }
+}
+
+/// The OFP's planned step climbs put on the legs
+/// (`procedure::apply_step_climbs`) and blackboxed with the schedule the
+/// follower will fly (`full_auto` `cruise_schedule`): cost index, cruise
+/// profile, cruise-stage fixes, the steps placed and any not on the route.
+fn record_step_climbs(legs: &mut [crate::nav::ProcLeg], schedule: &crate::simbrief::CruiseSchedule) {
+    let placed = crate::procedure::apply_step_climbs(legs, schedule);
+    if schedule.fixes.is_empty() && schedule.steps.is_empty() {
+        return;
+    }
+    let unplaced: Vec<&str> = schedule
+        .steps
+        .iter()
+        .skip(1)
+        .filter(|s| !placed.iter().any(|p| p.fix == s.fix))
+        .map(|s| s.fix.as_str())
+        .collect();
+    crate::blackbox::record(
+        "full_auto",
+        serde_json::json!({
+            "event": "cruise_schedule",
+            "cost_index": schedule.cost_index,
+            "profile": schedule.profile,
+            "cruise_fixes": schedule.fixes.iter().filter(|f| f.stage == crate::simbrief::Stage::Cruise).count(),
+            "initial_ft": schedule.steps.first().map(|s| s.alt_ft),
+            "steps": placed.iter().map(|p| serde_json::json!({"fix": p.fix, "idx": p.idx, "alt_ft": p.alt_ft})).collect::<Vec<_>>(),
+            "unplaced": unplaced,
+        }),
+    );
 }
 
 /// The arming ack as SPOKEN: the flight, the pilot's own waivers, the
