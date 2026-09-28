@@ -9648,3 +9648,14 @@ now fills `Ctx.circuit` (`circuit_height_ft` = field + 1,000 to the hundred, dia
 answers "runway one three, circuit height one thousand one hundred feet, QNH ..., squawk ..., report
 ready for departure" (FAA: "closed traffic approved, pattern altitude ..."); the suggested readback is
 a readback. Not linked: the crew's circuit.rs sizes its own pattern height. Offline only.
+
+## 2026-09-28: no landing clearance onto an occupied runway; the go-around judged on time (issue #149)
+
+LEMG 13 runner circuit (sortie 1790594471-full_auto): "final runway one three" at 7.3 km / 174 kt
+(about 80 s out) got "cleared to land" (t 1790595127.3), then "go around, traffic on the runway" 0.8
+s later. The traffic was TO4611 standing on 13, airborne at 1209.2, 81 s after the order: the runway
+would have been clear. The old `go_around_tick` fired on any ground ghost on our runway below 800 ft
+at any distance, and the final call ignored occupancy. Now: "continue approach, expect late landing
+clearance" plus a landing hold released by the monitor (one monitor.rs call site), and the go-around
+ordered only inside 60 s when the occupant (judged from its track by `strip_exit`) will not be off 10
+s before we cross. Ghosts are replays; the tower releases none of them. Offline only.

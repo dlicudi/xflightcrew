@@ -284,6 +284,14 @@ Config: `XCOPILOT_ATC_AIRPORT` / `_VOICE` / `_RATE` / `_REGION`.
 - **The tower's book is the runway's**: a landing holds its strip until the vacated report, a
   runway start is lined up, a cleared crossing that keeps moving is legal
   (`station::runway_occupancy_authorised`, the incursion watch's one question; EGKK 2026-09-27).
+- **A landing is never cleared onto an occupied runway, and the go-around is judged on time**: a
+  final onto a ghost on our strip is "continue approach ..., expect late landing clearance"
+  (`LANDING_HOLD`), cleared by the monitor once the strip is clear or its occupants move off in time
+  (`landing_hold_tick`, `landing_release_due`, `sync_landing_release`); the order (`go_around_due`)
+  comes only inside 60 s of the threshold, when an occupant judged from its track (`strip_exit`) will
+  not be off 10 s before we cross (blackbox `landing_withheld`, `landing_released`,
+  `go_around_deferred`, `go_around_judged`; LEMG 13 2026-09-28: ordered around at 3.8 nm for a
+  departure airborne 81 s later).
 - **Taxi routes**: Dijkstra over apt.dat 1201/1202; crossings from strip GEOMETRY, never network
   flags; a crossing on the cleared route is never berated. A runway destination snaps to a node
   that can REACH the runway, per CALLER, ON THE DESTINATION STRIP's own pavement (LFPB 2026-09-22).
