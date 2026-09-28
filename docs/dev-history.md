@@ -9794,3 +9794,17 @@ joins, else furthest join, fewest fixes), the filed route reaching the station t
 provider; the crew asks for a SID other than the cleared one (`Intent::RequestSid`,
 `Station::amend_sid`) and hands back on the ramp if refused. Blackbox `atc ifr_clearance` `sid_basis`,
 `sid_join`. Offline only.
+
+## 2026-09-28: a departure minimum is a floor, met once; the clearance caps it; no VS write under ALT HOLD (issue #153)
+
+EGKK LAM5P (737, sortie 1790601822-full_auto): D156J's 6,000 was "met" within 100 ft at 5,900, so the
+target fell to the navlog 5,000 and the speed from Vy's 210 to 250; the AP dived, the minimum came unmet
+again: 19 speed flips and 20 target flips in 207 s between 5,742 and 5,959 ft, -1,822 to +1,145 fpm (the
+pilot saw a jerky yoke). The dial's `write_unconfirmed 6000/5000` was our own flip (the cap had been
+released at the check-in); `vertical_velocity 400/300` read back 0 under ALT HOLD (`ap_state` 16386),
+183 ft under the dial at 962 fpm. `DepartureMinimums` latches a minimum met by fix and floors the target
+until the fix; `departure_target_ft` orders plan, minimum, then the clearance's cap (a minimum above the
+clearance waits for the check-in and is said; this reverses the old "minimum outranks the clearance";
+terrain still does); the minimum's level counts as commanded for `climb_no_descent`; `vs_action` reads
+the modes first. Replayed: 18+ flips became 1. Open: the 250-below-10,000 limit has no hysteresis either.
+Offline only.

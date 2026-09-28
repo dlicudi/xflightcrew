@@ -525,7 +525,11 @@ everything blackboxes to `logs/blackbox.jsonl` (kinds: `atc`, `autotaxi`, `autot
   cleared altitude until the departure check-in (`procedure::hold_at_cleared`).
 - **Charts are flown**: SID minimums (`nav::sid_minimums` from `sid_ident` / `plan_rwy`, as
   `climb_minimums`) are judged at the arm (`departure_gradients`), climbed at best rate and watched
-  (`watch_minimum`, a miss handed over). STAR windows (`nav::star_constraints`, `star_ident`,
+  (`watch_minimum`, a miss handed over); a minimum is a FLOOR held until its fix and met once
+  (`DepartureMinimums`; EGKK D156J hunted 5,000/6,000 and 210/250 at 5,900, #153); the owners are
+  plan, minimum, then the clearance's cap (`departure_target_ft`): a minimum above the clearance waits
+  for the check-in, said (`minimum_capped`, `cleared_climb`); the VS wheel is written only in VS mode
+  (`vs_action`: an ALT HOLD closing on our dial is left). STAR windows (`nav::star_constraints`, `star_ident`,
   `destination/plan_rwy`) clamp the plan (`apply_arrival_constraints`); each target is capped so a
   later "at or below" stays reachable (`arrival_ceiling_ft`, `star_ceiling`; plan altitudes too,
   `profile_ceiling_ft`); speed limits are slowed for in time (`arrival_speed_cap`, `star_speed`).
