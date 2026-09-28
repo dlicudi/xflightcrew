@@ -1260,7 +1260,47 @@ async fn run_session(
             }
             if !calls.is_empty() && mode::atc_enabled() && voice.radio_powered() {
                 if let Some(st) = atc_station.as_mut() {
-                    for call in calls {
+                    for queued in calls {
+                        // A position report dies with the position it reports,
+                        // judged as it is about to go out (each call waits
+                        // behind the one before it): LEMG's "5 mile final"
+                        // went out 93 s late, in the flare (#143).
+                        let age_s = queued.at.elapsed().as_secs_f64();
+                        if queued.holds != circuit::Holds::Always {
+                            let facts = crew_radio_facts(&xplane).await;
+                            if let Some(why) = circuit::stale_reason(queued.holds, age_s, &facts)
+                            {
+                                tracing::info!(
+                                    target: "xvoicelayer::radio",
+                                    call = %circuit::call_words(&queued.call),
+                                    why,
+                                    age_s,
+                                    "crew radio call dropped: no longer true"
+                                );
+                                blackbox::record(
+                                    "crew_radio",
+                                    serde_json::json!({
+                                        "event": "crew_radio_stale",
+                                        "call": circuit::call_words(&queued.call),
+                                        "why": why,
+                                        "age_s": (age_s * 10.0).round() / 10.0,
+                                        "on_ground": facts.on_ground,
+                                        "agl_ft": facts.agl_ft.map(|h| h.round()),
+                                        "gs_kts": facts.gs_kts.map(|g| g.round()),
+                                    }),
+                                );
+                                continue;
+                            }
+                        }
+                        blackbox::record(
+                            "crew_radio",
+                            serde_json::json!({
+                                "event": "crew_radio_sent",
+                                "call": circuit::call_words(&queued.call),
+                                "age_s": (age_s * 10.0).round() / 10.0,
+                            }),
+                        );
+                        let call = queued.call;
                         // A check-in is rendered NOW, with the frequency quiet
                         // (bounded), so the altitude it names is the one being
                         // passed as it is spoken.
@@ -3956,6 +3996,21 @@ static LAST_READBACK: std::sync::Mutex<Option<(String, Instant)>> = std::sync::M
 
 fn say(voice: &Voice, reporter: &Reporter, kind: ui::LogKind, line: &str) {
     say_or(voice, reporter, kind, line, pollers::command_waiting);
+}
+
+/// The live facts a queued crew call is judged against (#143), read together.
+/// A failed read is `None`: no measurement, never a reason to drop a call.
+async fn crew_radio_facts(xp: &XPlaneClient) -> circuit::RadioFacts {
+    let (ground, agl, gs) = tokio::join!(
+        xp.get_float(datarefs::ON_GROUND_ANY),
+        xp.get_float(datarefs::AGL_METERS),
+        xp.get_float(autotaxi::GS_MS),
+    );
+    circuit::RadioFacts {
+        on_ground: ground.ok().map(|v| v > 0.5),
+        agl_ft: agl.ok().map(|m| m * 3.28084),
+        gs_kts: gs.ok().map(|ms| ms.abs() * 1.943_844),
+    }
 }
 
 /// Is a pilot's line owed the command loop's attention: one already taken off

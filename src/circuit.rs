@@ -713,7 +713,7 @@ pub fn circuit_detail(leg: Leg, rwy_id: &str, alt_ft: f64, target_alt_ft: f64, i
 /// speaks both the copilot's transmission and the tower's reply. Empty in
 /// copilot-only mode or with no station — the calls are simply discarded, since
 /// real/external ATC owns the radio then.
-static CREW_RADIO: Mutex<VecDeque<CrewCall>> = Mutex::new(VecDeque::new());
+static CREW_RADIO: Mutex<VecDeque<Queued>> = Mutex::new(VecDeque::new());
 
 /// A call the crew has queued for the main loop to transmit. `Text` is the
 /// finished sentence; `CheckIn` is rendered by the main loop the moment it
@@ -731,8 +731,172 @@ pub enum CrewCall {
     },
 }
 
+/// What a queued call is still true for. A POSITION REPORT carries the
+/// condition it reports and dies with it: at LEMG (sortie
+/// 1790584300-approach, 2026-09-28) four "5 mile final runway one three"
+/// calls queued at 4.7 nm went out 93 s later, in the flare, at touchdown,
+/// on the rollout and stopped. Requests and readbacks keep their own rules
+/// (`Always`): a readback owed stays owed.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Holds {
+    /// No condition of its own: a request or a readback.
+    Always,
+    /// True while airborne, above the last [`REPORT_LANDING_AGL_FT`] when
+    /// `before_landing`, for `max_age_s`, and (when set) until the aircraft
+    /// has flown `max_travel_nm` from where it was made.
+    Airborne {
+        max_age_s: f64,
+        max_travel_nm: Option<f64>,
+        before_landing: bool,
+    },
+    /// True while on the ground, for `max_age_s` ("runway vacated").
+    OnGround { max_age_s: f64 },
+}
+
+/// A position report is not made in the flare: the last 100 ft is the
+/// flight model's landing phase.
+pub const REPORT_LANDING_AGL_FT: f64 = crate::flight::LANDING_AGL_FT;
+
+/// One entry in the crew radio queue: the call, what it holds for, and when
+/// it was queued.
+#[derive(Debug, Clone)]
+pub struct Queued {
+    pub call: CrewCall,
+    pub holds: Holds,
+    pub at: std::time::Instant,
+}
+
+/// The facts a queued call is judged against as it is about to go out, read
+/// live by the main loop. `None` is a failed read: no measurement, and a
+/// call is never dropped on it (fail open).
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct RadioFacts {
+    pub on_ground: Option<bool>,
+    pub agl_ft: Option<f64>,
+    pub gs_kts: Option<f64>,
+}
+
+/// What a crew call holds for, from its words. The words are matched per
+/// comma segment at the START of a segment, so the callsign in front and a
+/// runway after ("inbound for landing, runway one three") do not matter, and
+/// a readback of a controller's words ("join final", "report downwind") is
+/// never taken for our report.
+pub fn holds_for(call: &CrewCall) -> Holds {
+    let text = match call {
+        CrewCall::CheckIn { .. } => {
+            return Holds::Airborne {
+                max_age_s: 90.0,
+                max_travel_nm: None,
+                before_landing: false,
+            }
+        }
+        CrewCall::Text(t) => t.to_ascii_lowercase(),
+    };
+    for seg in text.split(',').map(str::trim) {
+        let mut words = seg.split_whitespace();
+        let first = words.next().unwrap_or("");
+        let second = words.next().unwrap_or("");
+        let third = words.next().unwrap_or("");
+        // "5 mile final": a distance, true for about a mile of flying.
+        if first.parse::<f64>().is_ok() && second.starts_with("mile") && third == "final" {
+            return Holds::Airborne {
+                max_age_s: 60.0,
+                max_travel_nm: Some(1.0),
+                before_landing: true,
+            };
+        }
+        match (first, second) {
+            ("final", _) => {
+                return Holds::Airborne {
+                    max_age_s: 60.0,
+                    max_travel_nm: None,
+                    before_landing: true,
+                }
+            }
+            ("downwind", _) => {
+                return Holds::Airborne {
+                    max_age_s: 60.0,
+                    max_travel_nm: Some(1.5),
+                    before_landing: true,
+                }
+            }
+            ("turning", "base") | ("base", _) => {
+                return Holds::Airborne {
+                    max_age_s: 45.0,
+                    max_travel_nm: Some(1.0),
+                    before_landing: true,
+                }
+            }
+            ("going", "around") => {
+                return Holds::Airborne {
+                    max_age_s: 30.0,
+                    max_travel_nm: None,
+                    before_landing: false,
+                }
+            }
+            ("inbound", "for") => {
+                return Holds::Airborne {
+                    max_age_s: 120.0,
+                    max_travel_nm: None,
+                    before_landing: true,
+                }
+            }
+            ("runway", "vacated") => return Holds::OnGround { max_age_s: 300.0 },
+            _ => {}
+        }
+    }
+    Holds::Always
+}
+
+/// Why a queued call is no longer true, `None` while it still is. Pure:
+/// `age_s` since it was queued, the live facts as it is about to go out.
+/// The distance flown is the age at the present groundspeed.
+pub fn stale_reason(holds: Holds, age_s: f64, facts: &RadioFacts) -> Option<&'static str> {
+    match holds {
+        Holds::Always => None,
+        Holds::OnGround { max_age_s } => {
+            if facts.on_ground == Some(false) {
+                Some("airborne")
+            } else if age_s > max_age_s {
+                Some("max_age")
+            } else {
+                None
+            }
+        }
+        Holds::Airborne {
+            max_age_s,
+            max_travel_nm,
+            before_landing,
+        } => {
+            if facts.on_ground == Some(true) {
+                return Some("on_ground");
+            }
+            if before_landing && facts.agl_ft.is_some_and(|h| h < REPORT_LANDING_AGL_FT) {
+                return Some("landing");
+            }
+            if let (Some(max), Some(gs)) = (max_travel_nm, facts.gs_kts) {
+                if age_s * gs / 3600.0 > max {
+                    return Some("moved_on");
+                }
+            }
+            if age_s > max_age_s {
+                return Some("max_age");
+            }
+            None
+        }
+    }
+}
+
+/// The crew radio's words for the log, a check-in by its destination.
+pub fn call_words(call: &CrewCall) -> String {
+    match call {
+        CrewCall::Text(t) => t.clone(),
+        CrewCall::CheckIn { to, .. } => format!("check-in with {to}"),
+    }
+}
+
 /// Drain the pending crew radio calls (main loop only).
-pub fn take_crew_radio() -> Vec<CrewCall> {
+pub fn take_crew_radio() -> Vec<Queued> {
     let mut q = CREW_RADIO.lock().unwrap_or_else(|e| e.into_inner());
     q.drain(..).collect()
 }
@@ -748,25 +912,41 @@ pub fn crew_radio_pending() -> bool {
         .is_empty()
 }
 
+/// Queue a call, collapsing it into an identical one queued just before it
+/// and not yet drained: stacked approach setups at LEMG queued four
+/// identical "5 mile final" reports in the same tenth of a second
+/// (2026-09-28).
+fn enqueue(call: CrewCall) {
+    let mut q = CREW_RADIO.lock().unwrap_or_else(|e| e.into_inner());
+    if q.back().is_some_and(|b| b.call == call) {
+        drop(q);
+        crate::blackbox::record(
+            "crew_radio",
+            serde_json::json!({ "event": "crew_radio_collapsed", "call": call_words(&call) }),
+        );
+        return;
+    }
+    let holds = holds_for(&call);
+    q.push_back(Queued {
+        call,
+        holds,
+        at: std::time::Instant::now(),
+    });
+}
+
 /// Queue a radio call for the main loop to transmit. Public so the full-auto
 /// orchestrator can request taxi through the same channel.
 pub fn transmit(call: String) {
-    CREW_RADIO
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .push_back(CrewCall::Text(call));
+    enqueue(CrewCall::Text(call));
 }
 
 /// Queue the departure check-in, rendered with the live altitude when spoken.
 pub fn transmit_check_in(callsign: Option<String>, to: String, climb_to_ft: f64) {
-    CREW_RADIO
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .push_back(CrewCall::CheckIn {
-            callsign,
-            to,
-            climb_to_ft,
-        });
+    enqueue(CrewCall::CheckIn {
+        callsign,
+        to,
+        climb_to_ft,
+    });
 }
 
 /// The aircraft's callsign, spoken the way the tower says it ("Speedbird
@@ -3710,19 +3890,196 @@ mod tests {
         assert_eq!(spell_runway("13C"), "one three center");
     }
 
+    /// The crew radio queue is process-wide: its tests take turns.
+    static QUEUE_LOCK: Mutex<()> = Mutex::new(());
+
     #[test]
     fn crew_radio_queue_is_fifo_and_drains_once() {
+        let _g = QUEUE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let _ = take_crew_radio(); // clear any residue
         transmit("Downwind runway two seven".to_string());
         transmit("Final runway two seven".to_string());
         assert_eq!(
-            take_crew_radio(),
+            take_crew_radio()
+                .into_iter()
+                .map(|q| q.call)
+                .collect::<Vec<_>>(),
             vec![
                 CrewCall::Text("Downwind runway two seven".to_string()),
                 CrewCall::Text("Final runway two seven".to_string())
             ]
         );
         assert!(take_crew_radio().is_empty(), "a second drain is empty");
+    }
+
+    const LEMG_FIVE_MILE: &str =
+        "November eight one six November November, 5 mile final runway one three";
+
+    /// LEMG, sortie 1790584300-approach (2026-09-28): four stacked approach
+    /// setups queued the same "5 mile final" in the same tenth of a second
+    /// (t 84315.9). One report goes on the queue; a different call after it
+    /// still does, and the same words again once the first has gone are a
+    /// new call.
+    #[test]
+    fn identical_calls_queued_back_to_back_collapse_to_one() {
+        let _g = QUEUE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _ = take_crew_radio();
+        for _ in 0..4 {
+            transmit(LEMG_FIVE_MILE.to_string());
+        }
+        transmit("November eight one six November November, going around".to_string());
+        transmit(LEMG_FIVE_MILE.to_string());
+        let calls: Vec<String> = take_crew_radio()
+            .into_iter()
+            .map(|q| call_words(&q.call))
+            .collect();
+        assert_eq!(
+            calls,
+            vec![
+                LEMG_FIVE_MILE.to_string(),
+                "November eight one six November November, going around".to_string(),
+                LEMG_FIVE_MILE.to_string(),
+            ]
+        );
+        transmit(LEMG_FIVE_MILE.to_string());
+        assert_eq!(
+            take_crew_radio().len(),
+            1,
+            "a drained call is not collapsed into"
+        );
+    }
+
+    /// The recorded timeline: queued at t 84315.9 (4.7 nm, 1,350 ft AGL,
+    /// 172 kt); sent at 84409.1 (88 ft AGL, 149 kt, the flare), 84421.2
+    /// (on the wheels), 84438.9 (rollout) and 84452.7 (stopped). Every one
+    /// of those four is stale; the call made on time is not.
+    #[test]
+    fn a_five_mile_final_report_dies_with_the_five_mile_final() {
+        let holds = holds_for(&CrewCall::Text(LEMG_FIVE_MILE.to_string()));
+        assert!(matches!(
+            holds,
+            Holds::Airborne {
+                max_travel_nm: Some(_),
+                before_landing: true,
+                ..
+            }
+        ));
+        let air = |agl_ft: f64, gs_kts: f64| RadioFacts {
+            on_ground: Some(false),
+            agl_ft: Some(agl_ft),
+            gs_kts: Some(gs_kts),
+        };
+        let ground = |gs_kts: f64| RadioFacts {
+            on_ground: Some(true),
+            agl_ft: Some(0.3),
+            gs_kts: Some(gs_kts),
+        };
+        // On time: two seconds after the queue, still at 4.6 nm.
+        assert_eq!(stale_reason(holds, 2.0, &air(1335.0, 172.0)), None);
+        // In the flare, 93.2 s late.
+        assert_eq!(
+            stale_reason(holds, 93.2, &air(87.5, 149.0)),
+            Some("landing")
+        );
+        // The same 93 s on a long final with the height still in hand: the
+        // aircraft has flown almost 4 nm past the position it reports.
+        assert_eq!(
+            stale_reason(holds, 93.2, &air(900.0, 149.0)),
+            Some("moved_on")
+        );
+        // Touchdown, rollout, stopped.
+        assert_eq!(
+            stale_reason(holds, 105.3, &ground(122.0)),
+            Some("on_ground")
+        );
+        assert_eq!(stale_reason(holds, 123.0, &ground(45.0)), Some("on_ground"));
+        assert_eq!(stale_reason(holds, 136.8, &ground(0.0)), Some("on_ground"));
+        // A queue that sat with no groundspeed read still ages out.
+        let blind = RadioFacts {
+            on_ground: None,
+            agl_ft: None,
+            gs_kts: None,
+        };
+        assert_eq!(stale_reason(holds, 93.2, &blind), Some("max_age"));
+        // Failed reads alone never drop a call made on time.
+        assert_eq!(stale_reason(holds, 2.0, &blind), None);
+    }
+
+    #[test]
+    fn position_reports_carry_their_condition_and_the_rest_do_not() {
+        let t = |s: &str| holds_for(&CrewCall::Text(s.to_string()));
+        let cs = "November eight one six November November, ";
+        for report in [
+            "final runway one three",
+            "final",
+            "downwind runway two seven",
+            "turning base",
+            "going around",
+            "inbound for landing, runway one three",
+        ] {
+            assert!(
+                matches!(t(&format!("{cs}{report}")), Holds::Airborne { .. }),
+                "{report}"
+            );
+            assert!(
+                matches!(t(report), Holds::Airborne { .. }),
+                "no callsign: {report}"
+            );
+        }
+        assert!(matches!(
+            t(&format!("{cs}runway vacated")),
+            Holds::OnGround { .. }
+        ));
+        assert!(matches!(
+            holds_for(&CrewCall::CheckIn {
+                callsign: None,
+                to: "Malaga Departure".into(),
+                climb_to_ft: 5000.0
+            }),
+            Holds::Airborne { .. }
+        ));
+        // Readbacks and requests keep their own rules: a readback owed
+        // stays owed, including one that repeats a controller's "final".
+        for other in [
+            "cleared to land runway one three",
+            "cleared for takeoff runway one three",
+            "lining up runway one three",
+            "request taxi, runway one three",
+            "ready for departure, for circuits",
+            "request clearance",
+            "Malaga Departure on one two one decimal zero two five",
+            "join final runway one three",
+            "wilco, report downwind",
+            "squawking seven thousand",
+        ] {
+            assert_eq!(t(&format!("{cs}{other}")), Holds::Always, "{other}");
+        }
+    }
+
+    #[test]
+    fn runway_vacated_holds_on_the_ground_only() {
+        let h = holds_for(&CrewCall::Text("runway vacated".into()));
+        let facts = |g: bool| RadioFacts {
+            on_ground: Some(g),
+            agl_ft: None,
+            gs_kts: Some(10.0),
+        };
+        assert_eq!(stale_reason(h, 20.0, &facts(true)), None);
+        assert_eq!(stale_reason(h, 20.0, &facts(false)), Some("airborne"));
+    }
+
+    #[test]
+    fn a_going_around_call_is_not_killed_by_the_low_balk_it_reports() {
+        // A balk can be called from under 100 ft once it climbs; the call
+        // is still true there.
+        let h = holds_for(&CrewCall::Text("going around".into()));
+        let low = RadioFacts {
+            on_ground: Some(false),
+            agl_ft: Some(60.0),
+            gs_kts: Some(140.0),
+        };
+        assert_eq!(stale_reason(h, 3.0, &low), None);
+        assert_eq!(stale_reason(h, 45.0, &low), Some("max_age"));
     }
 
     #[test]
