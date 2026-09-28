@@ -450,8 +450,8 @@ cabin_air:
 # the wheels (the quarter-path default's 114 floats a slow wing longer),
 # and the prediction flies it in rough air too (`rough_hold: false`): the
 # 737's rough-air hold, pull only ever back, turned this elevator's pulls
-# into floats that stalled onto the runway in gusts (a quarter of 200
-# gusty landings past 400 fpm, against none).
+# into floats that stalled onto the runway in gusts (57 of 160 gusty
+# landings past 400 fpm, the worst 1,098, against none past 236).
 # VERIFY: blackbox `flare_ask`, `flare_unexplained`, `flare_elev` against
 # `vvi` from `arrest_hands`, and no `roundout_held` that ends in a hand-back.
 flare_elevator:

@@ -13656,10 +13656,10 @@ mod lemg12_sf50_balloon_tests {
 
     /// Rough air, every recorded gate and plant, ten gust seeds each at
     /// the 40 fpm rms the rough-air gate starts at: the SF50's prediction
-    /// flown in any air lands them all under 400. The 737's rough-air hold
-    /// on the same elevator (pull only ever back) turns the pulls into
-    /// floats that bleed the speed onto the runway: a quarter of them past
-    /// 400 fpm.
+    /// flown in any air lands all 160 under 400 (the worst 236). The 737's
+    /// rough-air hold on the same elevator (pull only ever back) turns the
+    /// pulls into floats that bleed the speed onto the runway: 57 of them
+    /// past 400 fpm, the worst 1,098.
     #[test]
     fn in_rough_air_the_sf50_flies_its_prediction() {
         let held = {
