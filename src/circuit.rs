@@ -1805,6 +1805,55 @@ fn authored_circuit(
     ])
 }
 
+/// How the authored route flies this tick's waypoint altitude (#80).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct AuthoredVertical {
+    /// A dial write owed: the waypoint's level to the hundred.
+    pub dial_ft: Option<f64>,
+    /// The autopilot's altitude hold has the level: the VS law stands off.
+    pub ap_level: bool,
+}
+
+/// A captured hold this far from the level is no hold of ours: the dial was
+/// just moved and the autopilot is still holding the old level.
+pub const AUTHORED_HOLD_BAND_FT: f64 = 200.0;
+
+/// The authored route's vertical where the airframe declares
+/// `ap_altitude_capture`: each waypoint's altitude is a level target, so it
+/// goes on the altitude dial (`circuit_dial_ft` with no rate: the route has
+/// no glidepath, autoland parks the dial at the handoff), and a CAPTURED hold
+/// on that dial within [`AUTHORED_HOLD_BAND_FT`] owns the leg
+/// (`ap_holds_level`). The LXGB route flew its levels on the VS law behind
+/// whatever the dial held (dev-history 2026-09-21: "the authored LXGB route
+/// has no altitude capture"). Off, or with either read failed (no
+/// measurement), nothing is written and the VS law flies it as before. Pure.
+pub fn authored_vertical(
+    ap_capture: bool,
+    wp_alt_ft: f64,
+    alt_ft: f64,
+    dial_ft: Option<f64>,
+    alt_hold_status: Option<f64>,
+) -> AuthoredVertical {
+    let none = AuthoredVertical { dial_ft: None, ap_level: false };
+    if !ap_capture || !alt_ft.is_finite() || !wp_alt_ft.is_finite() {
+        return none;
+    }
+    let (Some(dial), Some(hold)) = (
+        dial_ft.filter(|v| v.is_finite()),
+        alt_hold_status.filter(|v| v.is_finite()),
+    ) else {
+        return none;
+    };
+    match circuit_dial_ft(0.0, wp_alt_ft, dial, alt_ft) {
+        Some(want) => AuthoredVertical { dial_ft: Some(want), ap_level: false },
+        None => AuthoredVertical {
+            dial_ft: None,
+            ap_level: ap_holds_level(0.0, wp_alt_ft, dial, hold)
+                && (alt_ft - wp_alt_ft).abs() <= AUTHORED_HOLD_BAND_FT,
+        },
+    }
+}
+
 /// The waypoint to fly to from `(a_m, x_m)` (runway frame): the end of the
 /// route leg the aircraft is nearest to, or the one after it when the
 /// aircraft is already past that leg's end. Leg 0 runs from the threshold
@@ -2015,6 +2064,11 @@ async fn fly_authored_route(
     let mut closure: Option<Closure> = None;
     let mut stalls = 0u32;
     let mut lights_done = false;
+    // The autopilot's own capture on the level legs, where the airframe
+    // declares it (`ap_altitude_capture`), as the rectangle does (#80).
+    let ap_capture = AP_ALTITUDE_CAPTURE.load(Ordering::SeqCst);
+    let mut vs_refused: Option<std::time::Instant> = None;
+    let mut vs_refused_said = false;
     loop {
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         if ABORT.load(Ordering::SeqCst) {
@@ -2041,6 +2095,13 @@ async fn fly_authored_route(
             xp.get_float(IAS),
             xp.get_float(&thr_dref),
         );
+        // Read only where the capture is declared: nothing else uses them.
+        let (dial_r, alt_hold_r) = if ap_capture {
+            let (d, h) = tokio::join!(xp.get_float(ALT_DIAL), xp.get_float(ALT_HOLD_STATUS));
+            (d.ok(), h.ok())
+        } else {
+            (None, None)
+        };
         let (Ok(lat), Ok(lon)) = (lat_r, lon_r) else {
             continue;
         };
@@ -2117,13 +2178,51 @@ async fn fly_authored_route(
             0.0
         };
         let vs_cmd = climb_limit_fpm(vs_raw, ias, ias_trend, full_kts, floor_kts);
-        if !vs_on {
-            let _ = xp.run_command(CMD_VS_MODE).await;
-            last_vs_cmd = None;
+        // Each waypoint's altitude is a LEVEL target: with the capture
+        // declared it goes on the dial, and a captured hold on it owns the
+        // leg while the VS law stands off (`authored_vertical`).
+        let vert = authored_vertical(ap_capture, wp.alt_msl_ft, alt_msl_ft, dial_r, alt_hold_r);
+        if let Some(want) = vert.dial_ft {
+            let ok = xp.set_float(ALT_DIAL, want).await.is_ok();
+            crate::blackbox::record(
+                "circuit",
+                serde_json::json!({"event": "alt_dial", "was": dial_r, "now": want,
+                                   "wpt": idx, "ok": ok, "authored": true}),
+            );
         }
-        if last_vs_cmd.is_none_or(|v| (v - vs_cmd).abs() > 40.0) {
-            let _ = xp.set_float(VS_DIAL, vs_cmd).await;
-            last_vs_cmd = Some(vs_cmd);
+        if vert.ap_level {
+            // Whatever the VS dial says is stale the moment VS re-engages.
+            last_vs_cmd = None;
+            vs_refused = None;
+        } else {
+            if !vs_on {
+                let _ = xp.run_command(CMD_VS_MODE).await;
+                last_vs_cmd = None;
+            }
+            if last_vs_cmd.is_none_or(|v| (v - vs_cmd).abs() > 40.0) {
+                let _ = xp.set_float(VS_DIAL, vs_cmd).await;
+                last_vs_cmd = Some(vs_cmd);
+            }
+            // The capture rests on VS taking the aircraft back OUT of the
+            // hold for the next level: an autopilot that will not is said
+            // once, with a base leg's height still to act on.
+            if ap_capture && !vs_on {
+                let since = *vs_refused.get_or_insert_with(std::time::Instant::now);
+                if vs_stuck(since.elapsed().as_secs_f64()) && !vs_refused_said {
+                    vs_refused_said = true;
+                    crate::blackbox::record(
+                        "circuit",
+                        serde_json::json!({"event": "vs_refused", "wpt": idx, "cmd_vs": vs_cmd, "authored": true}),
+                    );
+                    alert(
+                        &voice,
+                        Priority::Warning,
+                        "The autopilot won't take vertical speed. Check the vertical mode.",
+                    );
+                }
+            } else {
+                vs_refused = None;
+            }
         }
 
         // Power holds the pattern speed — the same law the rectangle loop uses.
@@ -2152,7 +2251,7 @@ async fn fly_authored_route(
             serde_json::json!({
                 "event": "authored_leg", "wpt": idx, "d_m": d_m, "bug": bug_mag,
                 "alt_msl": alt_msl_ft, "tgt_alt": wp.alt_msl_ft, "cmd_vs": vs_cmd,
-                "vs_raw": vs_raw, "ias": ias, "phi": phi,
+                "vs_raw": vs_raw, "ias": ias, "phi": phi, "ap_level": vert.ap_level,
             }),
         );
 
@@ -4504,6 +4603,47 @@ mod tests {
         // 27 (west): sea is to the left → left-hand (anticlockwise), left = true.
         assert!(sea_side_is_left(267.5));
         assert!(sea_side_is_left(270.0));
+    }
+
+    /// #80: the LXGB route's levels are the autopilot's where the airframe
+    /// declares the capture. The climb to the 1,650 ft pattern puts 1,700
+    /// on a dial left at 100 (the circuit's own rounding), a captured hold
+    /// at the pattern owns the downwind, the base's lower waypoint moves the
+    /// dial and the old hold is no longer ours, and off (or a failed read)
+    /// nothing is written.
+    #[test]
+    fn the_authored_route_levels_on_the_autopilots_capture() {
+        let route = authored_circuit(&lxgb_rwy(), &g(), 11.0, 1650.0, false).unwrap();
+        let tpa = route[2].alt_msl_ft;
+        let handoff = route.last().unwrap().alt_msl_ft;
+        // Climbing out with a stale dial: the level goes on it.
+        let v = authored_vertical(true, tpa, 900.0, Some(100.0), Some(1.0));
+        assert_eq!(v.dial_ft, Some(((tpa / 100.0).round()) * 100.0));
+        assert!(!v.ap_level);
+        let dial = v.dial_ft.unwrap();
+        // Armed, still climbing: the VS law climbs.
+        assert!(!authored_vertical(true, tpa, 1200.0, Some(dial), Some(1.0)).ap_level);
+        // Captured at the pattern: the hold owns the downwind.
+        let v = authored_vertical(true, tpa, tpa + 30.0, Some(dial), Some(2.0));
+        assert_eq!(v, AuthoredVertical { dial_ft: None, ap_level: true });
+        // The base's waypoint is lower: a new dial, the old hold not ours.
+        let v = authored_vertical(true, handoff, tpa, Some(dial), Some(2.0));
+        assert!(v.dial_ft.is_some() && !v.ap_level);
+        let low = v.dial_ft.unwrap();
+        assert!(!authored_vertical(true, handoff, tpa, Some(low), Some(2.0)).ap_level);
+        // Off, or a failed read: the VS law as before, the dial untouched.
+        assert_eq!(
+            authored_vertical(false, tpa, tpa, Some(dial), Some(2.0)),
+            AuthoredVertical { dial_ft: None, ap_level: false }
+        );
+        assert_eq!(
+            authored_vertical(true, tpa, tpa, None, Some(2.0)),
+            AuthoredVertical { dial_ft: None, ap_level: false }
+        );
+        assert_eq!(
+            authored_vertical(true, tpa, f64::NAN, Some(dial), Some(2.0)),
+            AuthoredVertical { dial_ft: None, ap_level: false }
+        );
     }
 
     #[test]
