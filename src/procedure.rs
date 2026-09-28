@@ -3748,12 +3748,15 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, plan: Pla
             }
             None => (leg, false),
         };
+        // Round a pattern the descent is paced on the pattern's miles, not
+        // the straight line to an IF it is flying away from (#156).
+        let pattern_nm = final_join.pattern_to_go_nm(&legs, idx, lat, lon, gs_kts, mag_var);
         let v = vertical_tick(
             leg_for_vertical,
             carry_alt,
             prev_cmd_alt,
             alt_ft,
-            dist_nm,
+            pattern_nm.or(dist_nm),
             gs_kts,
             pilot_altitude(),
             terrain_floor_ahead_ft().map(|f| floor_indicated(f, true_alt_ft, alt_ft)),
@@ -4156,7 +4159,7 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, plan: Pla
                 "agl_ft": agl_ft, "crab": crab, "psi": psi_v, "bug": bug_mag, "tgt": target_mag,
                 // How the lateral is flown and where on the course it is
                 // (`course_leg`): the FAF's line during a final's join.
-                "steer": steer.word(), "along_nm": steer_pos.map(|p| p.0), "xtk_nm": steer_pos.map(|p| p.1),
+                "steer": steer.word(), "along_nm": steer_pos.map(|p| p.0), "xtk_nm": steer_pos.map(|p| p.1), "pattern_nm": pattern_nm,
                 // The capture radius in force, so a fix that will not close
                 // can be told from one the aircraft simply has not reached.
                 "cap_nm": capture_nm,
@@ -5568,6 +5571,199 @@ mod tests {
             assert!(c.max_ft.is_none_or(|m| alt <= m + 300.0), "{} at {alt:.0}", c.fix);
         }
         assert!(max_vs < 250.0, "the descent climbed at {max_vs:.0} fpm: {crossings:?}");
+    }
+
+    /// EGBB I15 as the CIFP codes it (IF CF15, CF FF15 at 2,500 ft, CF RW15),
+    /// resolved (earth_fix.dat; the threshold from apt.dat).
+    fn egbb_i15() -> Vec<ProcLeg> {
+        let rows = "APPCH:010,I,I15, ,CF15,EG,P,C,E  I, ,   ,IF, ,IBIR,EG,P,I,      ,3248,0106,    ,    ,J,02500,02500,     , ,   ,    ,   , , , , , ,0,D,S;\n\
+                    APPCH:020,I,I15, ,FF15,EG,P,C,E  F, ,   ,CF, ,IBIR,EG,P,I,      ,3248,0083,1450,0023,H,02500,02500,     , ,   ,-300,   ,BHX,EG,D,B, ,0,D,S;\n\
+                    APPCH:030,I,I15, ,RW15,EG,P,G,G  M, ,   ,CF, ,IBIR,EG,P,I,      ,3248,0016,1450,0067, ,00358,     ,     , ,   ,-300,   , , , , , ,0,D,S;\n";
+        let raw = crate::nav::parse_proc_legs(rows.lines().map(str::trim), crate::nav::ProcKind::Appch, "I15", None);
+        let mut legs = crate::nav::straight_in_legs(raw, "15").expect("straight in");
+        let at = |ident: &str, lat: f64, lon: f64| Fix { ident: ident.into(), lat, lon };
+        legs[0].fix = Some(at("CF15", 52.587216667, -1.896825));
+        legs[1].fix = Some(at("FF15", 52.555586111, -1.861436111));
+        legs[2].fix = Some(at("RW15", 52.4656497, -1.7611282));
+        legs
+    }
+
+    #[derive(Debug, Default)]
+    struct JoinRun {
+        /// Seconds from GROVE to the FAF's capture (the autoland handoff).
+        secs: f64,
+        alt: f64,
+        ias: f64,
+        brake_outs: usize,
+        /// The fastest after the first minute (the join's own, not GROVE's).
+        max_ias: f64,
+        /// The fastest while descending.
+        max_descent_ias: f64,
+        /// Miles to the FAF at its capture.
+        faf_nm: f64,
+    }
+
+    /// The approach armed at GROVE (+2862, sortie 1790601822-full_auto):
+    /// 7,022 ft, 217 kt, tracking 119 at 242 kt over the ground, abeam
+    /// runway 15's threshold 7.6 nm to the right of the final. The follower's
+    /// lateral (`FinalJoin`'s pattern, the course legs, the heading set as a
+    /// pilot sets it, a 25 degree autopilot), its vertical paced on
+    /// `pattern_nm` or, as flown, on the straight line to the IF, and the
+    /// approach's 210.25 kt on the fitted 737 ([`fly_arrival`]'s plant and
+    /// laws), to the FAF's capture.
+    fn fly_egbb_join(law: ArrivalLaw) -> JoinRun {
+        use crate::course_leg::{course_passed, course_track, CourseLine, FinalJoin, Join, Steer};
+        const VAR: f64 = -0.9;
+        const RATE: f64 = 2_000.0;
+        let legs = egbb_i15();
+        let plant = Plant::default();
+        let (mut lat, mut lon) = (52.403079551600634, -1.9394949225789109);
+        let (mut hdg, mut bank) = (118.6f64, 0.0f64);
+        let (mut alt, mut ias) = (7_021.5f64, 217.1f64);
+        let target = crate::autoland::clean_approach_ias(145.0);
+        let mut join = FinalJoin::default();
+        let mut hold = HeadingHold::default();
+        let mut bug_true = hdg;
+        let (mut idx, mut was) = (0usize, Steer::Direct);
+        let (mut carry, mut prev) = (alt, alt);
+        let (mut drag_out, mut drag_held) = (false, f64::INFINITY);
+        let (mut lag1, mut vs) = (-464.0f64, -464.0f64);
+        let mut dial_queue: std::collections::VecDeque<f64> = std::collections::VecDeque::new();
+        let (mut thr, mut thrust) = (0.0f64, 0.0f64);
+        let (mut trend, mut prev_ias) = (0.0f64, ias);
+        let mut idle = IdleDescent::default();
+        let mut run = JoinRun::default();
+        let dt = 0.5;
+        for tick in 0..6_000 {
+            let now = tick as f64 * dt;
+            let tas = ias * (1.0 + 0.02 * alt / 1_000.0);
+            let gs = tas + 25.0;
+            let leg = &legs[idx];
+            let (mut steer, mut track) = (Steer::Direct, None);
+            match join.step(&legs, idx, lat, lon, hdg, gs, VAR, alt, RATE) {
+                Some(Join::Skip { .. }) => {
+                    idx += 1;
+                    continue;
+                }
+                Some(Join::Pattern { track_true, leg, .. }) => {
+                    steer = Steer::Pattern(leg);
+                    track = Some(track_true);
+                }
+                _ => {}
+            }
+            let line = CourseLine::of_leg(leg, VAR);
+            if track.is_none() {
+                if let Some((t, s)) = line.as_ref().and_then(|l| course_track(l, lat, lon, hdg, gs, was == Steer::Track)) {
+                    track = Some(t);
+                    steer = s;
+                }
+            }
+            let f = leg.fix.clone().unwrap();
+            let d = crate::nav::haversine_nm(lat, lon, f.lat, f.lon);
+            let track = track.unwrap_or_else(|| crate::nav::bearing_deg(lat, lon, f.lat, f.lon));
+            was = steer;
+            let mag = |t: f64| crate::autoland::true_to_mag(t, VAR);
+            if let Some(h) = hold.decide(steer.key(idx), mag(track), mag(hdg), bank, now) {
+                bug_true = h - VAR;
+            }
+            let cap = capture_radius_nm(gs, leg_turn_deg(lat, lon, leg, legs.get(idx + 1)).unwrap_or(0.0));
+            let done = leg_done(leg, Some(d), alt, cap, lat, lon)
+                || line.as_ref().is_some_and(|l| course_passed(l, lat, lon, cap));
+            if done {
+                if idx == 1 {
+                    (run.secs, run.alt, run.ias, run.faf_nm) = (now, alt, ias, d);
+                    return run;
+                }
+                idx += 1;
+                continue;
+            }
+            // The vertical: the pattern's miles, or (as flown) the line.
+            let dist = match law {
+                ArrivalLaw::Protected => join.pattern_to_go_nm(&legs, idx, lat, lon, gs, VAR).or(Some(d)),
+                ArrivalLaw::AsFlown => Some(d),
+            };
+            let v = vertical_tick(leg, carry, prev, alt, dist, gs, None, None, RATE, DescentProfile::none());
+            carry = v.carry;
+            prev = v.prev_cmd;
+            let want = vs_law_fpm(v.want_alt, alt, v.target_fpm, RATE, 1_500.0);
+            let governed = if law == ArrivalLaw::Protected { idle.governor_kts(target, None) } else { target };
+            let (cmd, out) = match law {
+                ArrivalLaw::AsFlown => {
+                    let over = ias - target;
+                    let settled = drag_held >= DRAG_MIN_HOLD_S;
+                    let out = if drag_out {
+                        want < DRAG_KEEP_BELOW_FPM && (over > DRAG_IN_KTS || !settled)
+                    } else {
+                        want <= -DRAG_MIN_DESCENT_FPM && over > DRAG_OUT_KTS && settled
+                    };
+                    (want, out)
+                }
+                ArrivalLaw::Protected => {
+                    idle.step(want);
+                    (
+                        speed_protected_vs(want, Some(ias - target), trend),
+                        descent_drag(drag_out, drag_held, ias, Some(target), want, alt - v.want_alt),
+                    )
+                }
+            };
+            if out && !drag_out {
+                run.brake_outs += 1;
+            }
+            drag_held = if out == drag_out { drag_held + dt } else { 0.0 };
+            drag_out = out;
+            dial_queue.push_back(vs_dial_fpm(cmd));
+            let dial = if dial_queue.len() > plant.dead_ticks { dial_queue.pop_front().unwrap() } else { vs };
+            thr = (thr + crate::tools::speedhold::throttle_adjust(governed - ias, trend)).clamp(0.0, 1.0);
+            for _ in 0..10 {
+                let h = dt / 10.0;
+                lag1 += (dial - lag1) * h / 1.5;
+                vs += (lag1 - vs) * h / 1.5;
+                alt += vs * h / 60.0;
+                thrust += (thr - thrust) * h / 2.0;
+                ias += b738_accel_kts_s(&plant, thrust, vs, gs, drag_out, alt) * h;
+            }
+            trend += ((ias - prev_ias) / dt - trend) * dt / (IAS_TREND_TAU_S + dt);
+            prev_ias = ias;
+            if now > 60.0 {
+                run.max_ias = run.max_ias.max(ias);
+            }
+            if vs < -500.0 {
+                run.max_descent_ias = run.max_descent_ias.max(ias);
+            }
+            // The heading mode: a rate-limited roll to 25 degrees, the short way.
+            let err = ((bug_true - hdg + 540.0).rem_euclid(360.0)) - 180.0;
+            let want_bank = (err * 1.5).clamp(-25.0, 25.0);
+            bank += (want_bank - bank).clamp(-5.0 * dt, 5.0 * dt);
+            let v_ms = gs * 0.514_444;
+            hdg = (hdg + (9.81 * bank.to_radians().tan() / v_ms).to_degrees() * dt).rem_euclid(360.0);
+            (lat, lon) = crate::nav::project_latlon(lat, lon, hdg, gs * dt / 3600.0);
+        }
+        panic!("never reached the FAF: {run:?}");
+    }
+
+    /// #156, #126: the join from GROVE held a 4,011 ft plateau round the
+    /// pattern (its path to the IF paced on the straight line), came down
+    /// the last 4 nm at up to 2,240 fpm with the speedbrake out three times
+    /// around 210.25, and was handed to autoland at 222 kt. Flown on the
+    /// pattern's miles at idle with the speed on the pitch, it reaches the
+    /// 2,500 ft platform before the FAF and is handed over at the approach
+    /// speed, the brake needed at most once.
+    #[test]
+    fn the_join_from_grove_arrives_at_the_faf_at_its_speed_and_height() {
+        let old = fly_egbb_join(ArrivalLaw::AsFlown);
+        let new = fly_egbb_join(ArrivalLaw::Protected);
+        // As flown: 218 kt at the handoff, four extensions (the flight: 222,
+        // three).
+        assert!(old.ias > 215.0 && old.brake_outs >= 2, "the test must bite: {old:?}");
+        assert!(new.ias <= 213.0, "{new:?}");
+        assert!(new.max_descent_ias <= 215.0 && old.max_descent_ias > 218.0, "{new:?} {old:?}");
+        // At the FAF's capture on its 2,500 ft platform or on the way to it,
+        // under the glideslope (3 degrees, 318 ft a mile, through 2,500 ft
+        // at the FAF): the ILS is joined from below.
+        assert!(new.alt >= 2_400.0 && new.alt <= 2_500.0 + new.faf_nm * 318.0, "{new:?}");
+        assert!(new.brake_outs <= 1, "{new:?}");
+        // The pattern is the pattern: the join is no longer for it.
+        assert!(new.secs <= old.secs + 30.0, "{new:?} {old:?}");
     }
 
     /// #156 / #32: HEMEL's "at FL220" in the FL180 plan is flown at the

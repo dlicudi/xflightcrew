@@ -250,6 +250,45 @@ impl FinalJoin {
         self.rev.is_some()
     }
 
+    /// The miles still to fly round the pattern to the IF (leg `idx`), on
+    /// the FAF's course line: the rest of the outbound leg to the base
+    /// turn, the base across, and the inbound back to the IF. `None` when
+    /// no pattern is being flown. The descent to the IF's altitude is paced
+    /// on THESE miles, never on the straight line to a fix the pattern is
+    /// flying away from.
+    ///
+    /// EGBB 15 (2026-09-28, sortie 1790601822-full_auto, #156): from GROVE,
+    /// abeam the threshold 7.6 nm off, the pattern flew outbound for 250 s
+    /// with the IF never more than about 5 nm away, so the path to its
+    /// 2,500 ft held a 4,011 ft plateau the whole downwind and base; the
+    /// descent came in the last 4 nm before the FAF at up to 2,240 fpm, the
+    /// speedbrake out again at 218 kt, handed to autoland at 222 kt and
+    /// 2,111 ft AGL. Pure.
+    pub fn pattern_to_go_nm(
+        &self,
+        legs: &[ProcLeg],
+        idx: usize,
+        lat: f64,
+        lon: f64,
+        gs_kts: f64,
+        mag_var: f64,
+    ) -> Option<f64> {
+        let rev = self.rev.as_ref().filter(|_| self.idx == Some(idx))?;
+        let at_if = legs.get(idx)?.fix.as_ref()?;
+        let line = CourseLine::of_leg(legs.get(idx + 1)?, mag_var)?;
+        let along = line.along_nm(lat, lon);
+        let xtk = line.xtk_nm(lat, lon).abs();
+        let if_along = line.along_nm(at_if.lat, at_if.lon).max(0.0);
+        let turn_along = FAF_ESTABLISHED_NM + 2.0 * reversal::sizing_radius_nm(gs_kts);
+        Some(match rev.leg {
+            reversal::Leg::Outbound => {
+                (turn_along - along).max(0.0) + xtk + (turn_along.max(along) - if_along).max(0.0)
+            }
+            reversal::Leg::Base => xtk + (along - if_along).max(0.0),
+            reversal::Leg::Inbound => xtk + (along - if_along).max(0.0),
+        })
+    }
+
     /// Advance the join for leg `idx`. `None` unless that leg is an IF
     /// followed by a course leg (a CF with a course and a fix): the only
     /// shape this decides. `track_true` is the ground track, `platform_ft`
