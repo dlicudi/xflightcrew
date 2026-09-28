@@ -154,6 +154,65 @@ pub fn final_turn_radius_m(approach_kts: f64) -> f64 {
     turn_radius_at(approach_kts.max(60.0) * 0.514_444, AP_BANK_FINAL_DEG)
 }
 
+/// A heading error beyond this is a turn the autopilot flies at its own bank
+/// limit, degrees: the samples [`BankWatch`] keeps.
+const BANK_SAMPLE_ERR_DEG: f64 = 20.0;
+/// ...of which it needs this many before it says anything.
+const BANK_MIN_SAMPLES: usize = 4;
+/// The measured bank is rounded shallow by this, as `AP_BANK_FINAL_DEG` was
+/// (15.8 measured, 15.5 used): the turn should still err EARLY.
+const MEASURED_BANK_SHALLOW: f64 = 0.95;
+
+/// The bank the autopilot flew through the turn onto BASE, measured from the
+/// roll angle while the heading was still well off the leg's.
+///
+/// `AP_BANK_FINAL_DEG` is a Baron's autopilot (15.8 degrees back-solved at
+/// Southampton), and the 737's banks 25: LEMG 13 (sortie
+/// 1790591256-full_auto, 2026-09-28) the base turn held 23 to 27 degrees,
+/// the capture was 1.3 x the 2,500 m radius clamp = 3,250 m where the
+/// aircraft turns in about 1,800, the turn onto final began 3.1 km out and
+/// rolled onto the 30 degree intercept 1.3 km short of the centreline, and
+/// the final leg was still closing at 12 degrees, 111 m off, when it let go
+/// at 1.9 nm.
+#[derive(Debug, Default, Clone)]
+pub struct BankWatch {
+    samples: Vec<f64>,
+}
+
+impl BankWatch {
+    /// One tick on base: the bank read and the heading error to the leg.
+    pub fn note(&mut self, phi_deg: f64, hdg_err_deg: f64) {
+        let err = ((hdg_err_deg + 540.0).rem_euclid(360.0)) - 180.0;
+        if phi_deg.is_finite() && err.abs() > BANK_SAMPLE_ERR_DEG && phi_deg.abs() > 5.0 {
+            self.samples.push(phi_deg.abs());
+        }
+    }
+
+    /// The steady bank of that turn (the median of the samples), once there
+    /// are enough of them.
+    pub fn steady_bank_deg(&self) -> Option<f64> {
+        if self.samples.len() < BANK_MIN_SAMPLES {
+            return None;
+        }
+        let mut s = self.samples.clone();
+        s.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        Some(s[s.len() / 2])
+    }
+}
+
+/// The base-to-final capture sized on the bank the autopilot really flies
+/// (`bank_deg`, from [`BankWatch`]) at the base leg's airspeed: the same
+/// 1.3 radii [`Geometry::for_radii`] keeps, on the measured radius. Never a
+/// bank shallower than the pattern's own 14 degrees or steeper than 30.
+/// `None` without a usable airspeed.
+pub fn final_capture_on_bank(ias_kts: f64, bank_deg: f64) -> Option<f64> {
+    if !(ias_kts.is_finite() && ias_kts > 40.0 && bank_deg.is_finite()) {
+        return None;
+    }
+    let bank = (bank_deg * MEASURED_BANK_SHALLOW).clamp(AP_BANK_DEG, 30.0);
+    Some((1.3 * turn_radius_at(ias_kts * 0.514_444, bank)).max(250.0))
+}
+
 /// The pattern's dimensions, all derived from one turn radius.
 #[derive(Debug, Clone, Copy)]
 pub struct Geometry {
@@ -260,7 +319,28 @@ const LAST_DITCH_XTK_M: f64 = 2.0 * ESTABLISHED_XTK_M;
 /// last-ditch valve, which is the exact bypass this test exists to guard
 /// (audit, 2026-08-02). The track is also the honest question: it is what
 /// autoland inherits.
-pub fn ready_for_autoland(xtk_m: f64, along_m: f64, hdg_err_deg: f64) -> bool {
+///
+/// And established is judged by what autoland will make of it. 300 m and 12
+/// degrees let go of a 737 at 1.9 nm still 111 m left and closing at 12
+/// degrees (LEMG 13, sortie 1790591256-full_auto, 2026-09-28): autoland's
+/// pursuit is a thirty-second law, it had 46 s of final, and the time model
+/// it is gated on says 24 m at the threshold on a runway 45 m wide. It flew
+/// the final 30 to 50 m off and landed 37 m right, off the pavement. So the
+/// handoff, on a runway of known width (`limit_m`, its landing limit,
+/// [`crate::autoland::landing_xtk_limit_m`]), waits until the aircraft is ON
+/// the line: within [`ON_LINE_LIMITS`] landing limits of it, tracking within
+/// [`ON_LINE_TRACK_DEG`] of the course, and with the offset autoland's own
+/// pursuit leaves at the threshold ([`crate::reversal::predicted_residual_m`]
+/// at `gs_kts`) inside the limit. The circuit's intercept closes on a 900 m
+/// aim, three times quicker than autoland's, and keeps flying it until then.
+/// `None`: the old test alone.
+pub fn ready_for_autoland(
+    xtk_m: f64,
+    along_m: f64,
+    hdg_err_deg: f64,
+    gs_kts: f64,
+    limit_m: Option<f64>,
+) -> bool {
     if !interceptable(xtk_m, along_m) {
         return false;
     }
@@ -285,7 +365,31 @@ pub fn ready_for_autoland(xtk_m: f64, along_m: f64, hdg_err_deg: f64) -> bool {
     // still 6 degrees off the runway heading, still turning (2026-08-01).
     // Established means BOTH, and the final leg's own intercept is what gets
     // us there (see `final_intercept_hdg`).
-    hdg_err_deg.abs() <= ROLLED_OUT_HDG_DEG && xtk_m.abs() <= ESTABLISHED_XTK_M
+    let rolled_out = hdg_err_deg.abs() <= ROLLED_OUT_HDG_DEG && xtk_m.abs() <= ESTABLISHED_XTK_M;
+    match limit_m {
+        None => rolled_out,
+        Some(limit) => {
+            rolled_out
+                && hdg_err_deg.abs() <= ON_LINE_TRACK_DEG
+                && xtk_m.abs() <= ON_LINE_LIMITS * limit
+                && handoff_residual_m(xtk_m, along_m, gs_kts) <= limit
+        }
+    }
+}
+
+/// ON the line, for a handoff on a runway of known width: within this many
+/// landing limits of the centreline (45 m on LEMG's 45 m strip, about half a
+/// dot of localiser three miles out)...
+const ON_LINE_LIMITS: f64 = 3.0;
+/// ...and tracking within this of the course: rolled out, not still turning
+/// off the intercept (a handoff mid-roll-out teaches the final's crab filter
+/// and track trim the turn).
+const ON_LINE_TRACK_DEG: f64 = 5.0;
+
+/// The offset autoland's final pursuit will still carry at the threshold if
+/// it takes the aircraft here, metres (its own time model).
+pub fn handoff_residual_m(xtk_m: f64, along_m: f64, gs_kts: f64) -> f64 {
+    crate::reversal::predicted_residual_m(xtk_m / M_PER_NM, along_m.abs() / M_PER_NM, gs_kts)
 }
 
 /// How close to the centreline counts as ESTABLISHED, metres.
@@ -2224,7 +2328,8 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, p: Params
     // Two radii, because the base-to-final turn is flown slower than the
     // pattern and is the one dimension where an over-estimate rolls us out
     // short of the centreline rather than merely wide.
-    let geom = Geometry::for_radii(turn_radius_m(gs_est_mps), final_turn_radius_m(approach_kts));
+    let mut geom =
+        Geometry::for_radii(turn_radius_m(gs_est_mps), final_turn_radius_m(approach_kts));
     // The floor under the climb's speed protection, captured before `p` moves.
     let p_climb_floor_kts = p.climb_floor_kts;
     // ...and the speed the climb is flown at, for the limiter's full-rate
@@ -2580,6 +2685,8 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, p: Params
     // The gear the go-around still owes raising.
     let mut gear_up_owed = false;
     let mut go_arounds: u32 = 0;
+    // The bank flown through the turn onto base.
+    let mut base_bank = BankWatch::default();
 
     loop {
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
@@ -2696,7 +2803,26 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, p: Params
             .ok()
             .map(|hp| ((hp - rwy_course + 540.0).rem_euclid(360.0)) - 180.0)
             .unwrap_or(180.0);
-        if turning_final && ready_for_autoland(x_m, a_m.abs(), hdg_err) {
+        // Established by autoland's own measure: its pursuit's residual at
+        // the threshold inside the runway's landing limit. The IAS stands in
+        // for the groundspeed (a failed read: the approach speed).
+        let handoff_gs = ias_r
+            .as_ref()
+            .ok()
+            .copied()
+            .filter(|v| v.is_finite() && *v > 40.0)
+            .unwrap_or(p_approach_ias);
+        let rwy_width_m = crate::autoland::runway_width_m(&rwy);
+        let landing_limit_m = crate::autoland::landing_xtk_limit_m(rwy_width_m);
+        if turning_final
+            && ready_for_autoland(
+                x_m,
+                a_m.abs(),
+                hdg_err,
+                handoff_gs,
+                rwy_width_m.map(|_| landing_limit_m),
+            )
+        {
             let alt_msl = field_elev_ft + agl_ft;
             let arr = ArrivalCtx {
                 xp: &xp,
@@ -2730,6 +2856,9 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, p: Params
                     "rwy": rwy_id,
                     "xtk_m": x_m,
                     "along_m": a_m,
+                    "trk_err": hdg_err,
+                    "residual_m": handoff_residual_m(x_m, a_m, handoff_gs),
+                    "limit_m": landing_limit_m,
                 }),
             );
             crate::autoland::ABORT.store(false, Ordering::SeqCst);
@@ -2765,6 +2894,18 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, p: Params
             Leg::Final => final_intercept_hdg(rwy_course, x_m),
             _ => leg_heading(rwy_course, leg, left),
         };
+        // The bank the autopilot really flies, from the turn onto base, sizes
+        // the turn onto final (see `final_capture_on_bank`).
+        if leg == Leg::Base {
+            if let (Some(psi), Ok(phi)) = (psi_v, phi_r.as_ref()) {
+                base_bank.note(*phi, psi - leg_hdg);
+            }
+            if let (Some(bank), Ok(ias)) = (base_bank.steady_bank_deg(), ias_r.as_ref()) {
+                if let Some(c) = final_capture_on_bank(*ias, bank) {
+                    geom.final_capture_m = c;
+                }
+            }
+        }
         let want_hdg = leg_hdg + crab;
         let target_mag = true_to_mag(want_hdg, mag_var);
         // Through the one door every pursuit steer takes: the bug leads the
@@ -3194,6 +3335,14 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, p: Params
                         "Turning final. Bringing us in.",
                     ]),
                 );
+                crate::blackbox::record(
+                    "circuit",
+                    serde_json::json!({
+                        "event": "final_turn", "capture_m": geom.final_capture_m,
+                        "bank_measured": base_bank.steady_bank_deg(),
+                        "x_m": x_m, "a_m": a_m,
+                    }),
+                );
                 // The final report — this is what earns the landing clearance.
                 transmit(radio_call(
                     &callsign,
@@ -3402,6 +3551,10 @@ mod tests {
         assert!(!vs_stuck(3.0) && vs_stuck(VS_REFUSED_SECS));
     }
     use super::*;
+
+    /// The Baron's approach speed the older handover tests were flown at, and
+    /// the landing limit of a runway of unknown width (the old 37 m).
+    const BARON_KTS: f64 = 105.0;
 
     /// The base leg hands autoland an aircraft ON the path it is about to fly,
     /// whatever size the pattern is. Luton 2026-07-28: a flat 700 ft target put
@@ -4446,16 +4599,16 @@ mod tests {
         // ...but the aircraft is still 90 degrees across the centreline, and
         // handing it over there is what made it approach and land at an angle.
         assert!(
-            !ready_for_autoland(1813.0, 4092.0, hdg_err_on_base),
+            !ready_for_autoland(1813.0, 4092.0, hdg_err_on_base, BARON_KTS, None),
             "still turning: fly the turn, do not hand over the diagonal"
         );
 
         // Rolled out on the runway course with the designed 0.3-radii trim
         // left: this is the straight-in autoland is for.
-        assert!(ready_for_autoland(250.0, 3500.0, 3.0));
-        assert!(ready_for_autoland(-250.0, 3500.0, -3.0));
+        assert!(ready_for_autoland(250.0, 3500.0, 3.0, BARON_KTS, None));
+        assert!(ready_for_autoland(-250.0, 3500.0, -3.0, BARON_KTS, None));
         // Just outside the rollout tolerance, still turning.
-        assert!(!ready_for_autoland(250.0, 3500.0, 25.0));
+        assert!(!ready_for_autoland(250.0, 3500.0, 25.0, BARON_KTS, None));
 
         // The live failure (2026-08-01): rolled out on HEADING — eight
         // degrees, comfortably inside the tolerance — and 776 m to the side,
@@ -4467,19 +4620,19 @@ mod tests {
             "the geometry was closeable, which is exactly why heading alone let it through"
         );
         assert!(
-            !ready_for_autoland(776.0, 3128.0, 8.0),
+            !ready_for_autoland(776.0, 3128.0, 8.0, BARON_KTS, None),
             "parallel and 776 m off is not established"
         );
 
         // The last-ditch valve: out of room and still not aligned, autoland's
         // intercept beats a pattern leg that has nowhere left to go.
-        assert!(ready_for_autoland(300.0, 1200.0, 40.0));
+        assert!(ready_for_autoland(300.0, 1200.0, 40.0, BARON_KTS, None));
         // ...but never something autoland cannot fly at all, however close.
-        assert!(!ready_for_autoland(2815.0, 1200.0, 0.0));
+        assert!(!ready_for_autoland(2815.0, 1200.0, 0.0, BARON_KTS, None));
 
         // A failed heading read must not read as aligned — the caller passes
         // 180, the worst case, so the handover simply waits a tick.
-        assert!(!ready_for_autoland(1813.0, 4092.0, 180.0));
+        assert!(!ready_for_autoland(1813.0, 4092.0, 180.0, BARON_KTS, None));
     }
 
     /// Where the 776 m came from, in arithmetic. The pattern radius estimate
@@ -5026,5 +5179,238 @@ mod final_leg_kts_tests {
             checked += 1;
         }
         assert!(checked >= 3, "only {checked} profiles with a schedule");
+    }
+}
+
+/// Issue #147: the LEMG 13 circuit's final and handoff, flown from the
+/// recorded base leg of sortie 1790591256-full_auto (2026-09-28) against
+/// the real apt.dat geometry and a 737 fitted to the recorded turns.
+#[cfg(test)]
+mod issue_147_circuit_tests {
+    use super::*;
+    use crate::autoland::lemg_replay::{at, fly_final, lemg, FinalLoop, Flown, Jet, LEMG_WIDTH_M};
+    use crate::autoland::{along_track_nm, cross_track_nm, landing_xtk_limit_m};
+
+    /// The recorded airspeed, by leg: from the start of the base turn
+    /// (212 kt slowing to 156 through the turn, 167 by its end), and from
+    /// the start of the final turn (170, flaps out to 142, then 149).
+    fn ias_at(leg: Leg, t: f64) -> f64 {
+        let pts: &[(f64, f64)] = match leg {
+            Leg::Base => &[(0.0, 212.0), (35.0, 156.0), (52.0, 167.0)],
+            _ => &[(0.0, 170.0), (17.0, 142.0), (47.0, 149.0)],
+        };
+        if t >= pts[pts.len() - 1].0 {
+            return pts[pts.len() - 1].1;
+        }
+        for w in pts.windows(2) {
+            if t >= w[0].0 && t <= w[1].0 {
+                return w[0].1 + (w[1].1 - w[0].1) * (t - w[0].0) / (w[1].0 - w[0].0);
+            }
+        }
+        pts[0].1
+    }
+
+    /// The circuit's handoff: where it let go and how.
+    #[derive(Debug)]
+    struct Handoff {
+        x_m: f64,
+        a_m: f64,
+        trk_err: f64,
+        residual_m: f64,
+        capture_m: f64,
+    }
+
+    /// Fly the circuit from the recorded base-leg start (4,067 m short of 13,
+    /// 6,865 m left, heading 311.8, 212 kt) to its handoff, in a wind from
+    /// `wind_from` at `wind_mps`. `on_bank` sizes the turn onto final on the
+    /// bank the base turn flew; `on_line` gates the handoff on the runway's
+    /// landing limit. Neither: the circuit as it flew (3,250 m capture, 300 m
+    /// and 12 degrees).
+    fn fly_circuit(on_bank: bool, on_line: bool, wind_from: f64, wind_mps: f64) -> (Handoff, Jet) {
+        let rwy = lemg("13");
+        let mut geom = Geometry::for_radii(2500.0, 2500.0);
+        assert_eq!(
+            geom.final_capture_m, 3250.0,
+            "the capture the sortie armed with"
+        );
+        let (lat, lon) = at(&rwy, 4067.2, -6864.6);
+        let mut jet = Jet::new(lat, lon, 311.8, ias_at(Leg::Base, 0.0));
+        jet.wind_to_deg = (wind_from + 180.0).rem_euclid(360.0);
+        jet.wind_mps = wind_mps;
+        let mut leg = Leg::Base;
+        let mut leg_t = 0.0;
+        let mut watch = BankWatch::default();
+        let mut bug = 311.8;
+        let limit = on_line.then(|| landing_xtk_limit_m(Some(LEMG_WIDTH_M)));
+        let dt = 0.6;
+        let mut t = 0.0;
+        while t < 400.0 {
+            let ias = ias_at(leg, t - leg_t);
+            jet.tas_mps = ias * 0.514_444;
+            let a_m = -along_track_nm(jet.lat, jet.lon, &rwy) * M_PER_NM;
+            let x_m = cross_track_nm(jet.lat, jet.lon, &rwy) * M_PER_NM;
+            let trk = jet.track();
+            let trk_err = ((trk - rwy.course_deg + 540.0).rem_euclid(360.0)) - 180.0;
+            if leg == Leg::Final && ready_for_autoland(x_m, a_m.abs(), trk_err, ias, limit) {
+                return (
+                    Handoff {
+                        x_m,
+                        a_m,
+                        trk_err,
+                        residual_m: handoff_residual_m(x_m, a_m, ias),
+                        capture_m: geom.final_capture_m,
+                    },
+                    jet,
+                );
+            }
+            let crab = ((jet.psi - trk + 540.0).rem_euclid(360.0)) - 180.0;
+            let leg_hdg = match leg {
+                Leg::Final => final_intercept_hdg(rwy.course_deg, x_m),
+                _ => leg_heading(rwy.course_deg, leg, true),
+            };
+            if leg == Leg::Base && on_bank {
+                watch.note(jet.phi, jet.psi - leg_hdg);
+                if let Some(c) = watch
+                    .steady_bank_deg()
+                    .and_then(|b| final_capture_on_bank(ias, b))
+                {
+                    geom.final_capture_m = c;
+                }
+            }
+            bug = bug_toward(bug, leg_hdg + crab, jet.psi, jet.phi, BUG_SLEW_PER_TICK);
+            jet.step(bug, dt);
+            if pattern_advance(leg, a_m, x_m, &geom, rwy.length_m, true) {
+                if let Some(n) = next_leg(leg) {
+                    leg = n;
+                    leg_t = t;
+                }
+            }
+            t += dt;
+        }
+        panic!("never handed over");
+    }
+
+    /// The recorded base turn of sortie 1790591256 (state records, 2 s
+    /// apart, heading true against the base leg's 221.7): the 737's
+    /// autopilot banks 25 degrees, not the Baron's 15.5, and the capture it
+    /// sizes is two thirds of the 3,250 m the sortie armed with.
+    #[test]
+    fn the_base_turn_measures_the_737s_bank() {
+        let base = leg_heading(131.685, Leg::Base, true);
+        let rec = [
+            (-2.5, 311.3),
+            (-13.6, 309.2),
+            (-23.2, 305.2),
+            (-26.6, 300.6),
+            (-26.9, 296.4),
+            (-26.5, 291.0),
+            (-26.1, 286.9),
+            (-25.1, 283.4),
+            (-24.9, 278.9),
+            (-25.1, 274.0),
+            (-24.6, 268.5),
+            (-25.4, 265.6),
+            (-24.4, 260.6),
+            (-25.0, 254.9),
+            (-25.3, 249.0),
+            (-24.8, 242.7),
+            (-25.5, 236.8),
+            (-25.1, 231.1),
+            (-24.9, 225.4),
+            (-19.9, 220.6),
+            (-10.6, 218.8),
+        ];
+        let mut w = BankWatch::default();
+        for (phi, hdg) in rec {
+            w.note(phi, hdg - base);
+        }
+        let bank = w.steady_bank_deg().expect("a measured bank");
+        assert!((24.5..=25.5).contains(&bank), "{bank:.1}");
+        // At the 167 kt the base leg ended at.
+        let c = final_capture_on_bank(167.0, bank).unwrap();
+        assert!((2100.0..2350.0).contains(&c), "{c:.0}");
+        // A Baron's 15.8 at 105 kt keeps what it had (15.5 designed).
+        let baron = final_capture_on_bank(105.0, 15.8).unwrap();
+        let designed = 1.3 * final_turn_radius_m(105.0);
+        assert!(
+            baron >= designed && baron < designed * 1.1,
+            "{baron:.0} against {designed:.0}"
+        );
+        // Nothing measured, nothing said; no airspeed, no capture.
+        assert_eq!(BankWatch::default().steady_bank_deg(), None);
+        assert_eq!(final_capture_on_bank(f64::NAN, 25.0), None);
+    }
+
+    /// The circuit as it flew hands autoland a 737 still closing at 12
+    /// degrees about 100 m off at 1.5 to 2 nm (recorded: 111 m, 12 degrees,
+    /// 1.9 nm), which autoland on a 45 m strip now refuses as a go-around.
+    /// Sized on the measured bank and handed over only ON the line, it lets
+    /// go inside 45 m and 5 degrees above 2 nm, and autoland's own final
+    /// reaches the roundout gate within a few metres, with no balk.
+    #[test]
+    fn the_lemg_13_circuit_hands_over_on_the_line() {
+        let rwy = lemg("13");
+        let limit = landing_xtk_limit_m(Some(LEMG_WIDTH_M));
+        let (old, mut jet) = fly_circuit(false, false, 106.0, 6.0);
+        assert!(
+            (80.0..130.0).contains(&old.x_m.abs())
+                && old.trk_err.abs() > 10.0
+                && old.residual_m > limit,
+            "the replay hands over as the sortie did: {old:?}"
+        );
+        let f: Flown = fly_final(
+            &mut jet,
+            &mut FinalLoop::new(Some(LEMG_WIDTH_M), 3.0),
+            &rwy,
+            0.35,
+        );
+        assert_eq!(
+            f.balk.map(|b| b.0),
+            Some("unstabilised_below_floor"),
+            "{f:?}"
+        );
+
+        let (new, mut jet) = fly_circuit(true, true, 106.0, 6.0);
+        assert!(new.capture_m < 2400.0, "{new:?}");
+        assert!(
+            new.x_m.abs() <= 3.0 * limit && new.trk_err.abs() <= 5.0,
+            "{new:?}"
+        );
+        assert!(new.residual_m <= limit && new.a_m.abs() > 3700.0, "{new:?}");
+        let f = fly_final(
+            &mut jet,
+            &mut FinalLoop::new(Some(LEMG_WIDTH_M), 3.0),
+            &rwy,
+            0.35,
+        );
+        assert!(f.balk.is_none(), "{f:?}");
+        assert!(
+            f.gate_xtk_m.abs() < 5.0 && f.worst_low_xtk_m < limit,
+            "{f:?}"
+        );
+        assert!(f.worst_short_bank_deg < 5.0, "{f:?}");
+    }
+
+    /// Not tuned to one wind: calm, the recorded one, a stronger one from the
+    /// other side of the final.
+    #[test]
+    fn the_lemg_13_circuit_lands_on_the_line_in_other_winds() {
+        let rwy = lemg("13");
+        let limit = landing_xtk_limit_m(Some(LEMG_WIDTH_M));
+        for (from, mps) in [(0.0, 0.0), (106.0, 9.0), (200.0, 8.0), (40.0, 7.0)] {
+            let (h, mut jet) = fly_circuit(true, true, from, mps);
+            assert!(
+                h.x_m.abs() <= 3.0 * limit && h.residual_m <= limit,
+                "wind {from}/{mps}: {h:?}"
+            );
+            let f = fly_final(
+                &mut jet,
+                &mut FinalLoop::new(Some(LEMG_WIDTH_M), 3.0),
+                &rwy,
+                0.35,
+            );
+            assert!(f.balk.is_none(), "wind {from}/{mps}: {f:?}");
+            assert!(f.gate_xtk_m.abs() < limit, "wind {from}/{mps}: {f:?}");
+        }
     }
 }
