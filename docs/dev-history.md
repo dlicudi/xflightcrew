@@ -9638,3 +9638,13 @@ on-the-line handoff. Replays: as flown the handoff is ~100 m off and goes around
 35 m off at 2.25 nm and reaches the gate 3 m off. Expect more go-arounds where a final is not on the
 line. Next sortie: `circuit final_turn` capture ~2,200, `handoff_autoland` |xtk| <= 45 and residual
 <= limit, `threshold_elev` width_m 45.11, xtk within 15 m below 500 ft. Offline only.
+
+## 2026-09-28: a circuit's zone request is cleared for the circuit (issue #148)
+
+Runner sorties 1790590663 and 1790591256 (LEMG 13): "request clearance, runway one three, for circuits"
+was noted as circuit traffic yet answered "cleared to leave the Malaga zone, not above two thousand
+feet, ...", and the crew read the zone cap back: the circuits flag lived on `Station` only. `respond()`
+now fills `Ctx.circuit` (`circuit_height_ft` = field + 1,000 to the hundred, dialect) and the tower
+answers "runway one three, circuit height one thousand one hundred feet, QNH ..., squawk ..., report
+ready for departure" (FAA: "closed traffic approved, pattern altitude ..."); the suggested readback is
+a readback. Not linked: the crew's circuit.rs sizes its own pattern height. Offline only.

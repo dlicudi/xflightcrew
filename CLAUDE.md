@@ -276,7 +276,9 @@ Config: `XCOPILOT_ATC_AIRPORT` / `_VOICE` / `_RATE` / `_REGION`.
   the HOLD went on. **Circuit traffic stays with the tower** (`tower::wants_circuits`,
   `Station.circuits`): "for circuits" on the taxi or ready call withholds the departure handoff
   (`departure_handoff_withheld`) and the radar watch; full auto's circuit says it (`taxi_call`,
-  `ready_call`; LEMG 31 2026-09-28). **A reject is a radio call** (`Intent::RejectingTakeoff`, the crew's
+  `ready_call`; LEMG 31 2026-09-28); its zone request is cleared FOR THE CIRCUIT, never out of the
+  zone (`Ctx.circuit`, `tower::circuit_clearance_lines`: runway, circuit height `circuit_height_ft`,
+  pressure, code, "report ready"; FAA "closed traffic approved"). **A reject is a radio call** (`Intent::RejectingTakeoff`, the crew's
   `autotakeoff::REJECT_CALL`): the clearance and all it armed die; a held release lives only in
   TaxiCleared/LinedUp and dies at a roll (`void_takeoff_hold_by_roll`; EGKK 2026-09-27).
 - **The tower's book is the runway's**: a landing holds its strip until the vacated report, a
