@@ -382,6 +382,7 @@ impl Station {
         *WAKE.lock().unwrap_or_else(|e| e.into_inner()) = None;
         *WAKE_PREV.lock().unwrap_or_else(|e| e.into_inner()) = None;
         *DEPARTURE_STREAM.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        *ARRIVAL_STREAM.lock().unwrap_or_else(|e| e.into_inner()) = None;
         *TAXI_ROUTE.lock().unwrap_or_else(|e| e.into_inner()) = None;
         // The previous field's worksheets die with it: a region handoff calls
         // install() WITHOUT uninstall(), and anything left armed here keeps
@@ -440,6 +441,7 @@ impl Station {
         *WAKE.lock().unwrap_or_else(|e| e.into_inner()) = None;
         *WAKE_PREV.lock().unwrap_or_else(|e| e.into_inner()) = None;
         *DEPARTURE_STREAM.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        *ARRIVAL_STREAM.lock().unwrap_or_else(|e| e.into_inner()) = None;
         *GO_AROUND_LAST.lock().unwrap_or_else(|e| e.into_inner()) = None;
         *LANDING_HOLD.lock().unwrap_or_else(|e| e.into_inner()) = None;
         *PENDING_LANDING_RELEASE
@@ -1929,6 +1931,10 @@ impl Station {
     /// landing 09 (the real field's runway), and cleared a departure into
     /// the reciprocal stream (2026-09-15).
     ///
+    /// `arrival_end` is the live lander on final, else the remembered
+    /// touchdowns, and `departure_end` the remembered liftoffs, both from
+    /// [`field_streams`] (issue #164).
+    ///
     /// `departure_end` is the live DEPARTURE stream ([`departure_end`]): with
     /// no arrival stream it is the runway in use in calm the same way, and a
     /// stated runway on its reciprocal is refused. ONE STRIP, ONE DIRECTION:
@@ -2165,7 +2171,12 @@ impl Station {
         note_ground_traffic(&targets, now);
         *TOWER_WIND.lock().unwrap_or_else(|e| e.into_inner()) =
             Some((wx.wind_from_deg, wx.wind_kts));
-        let arrival_end = arrival_end(&targets, &self.apt.runways, self.apt.elev_ft);
+        // The live lander on final, else the remembered touchdowns (#164).
+        let (arrival_end, departure_end) = field_streams(
+            &self.apt.runways,
+            arrival_end(&targets, &self.apt.runways, self.apt.elev_ft),
+            now,
+        );
         if on_ground && self.stated_runway.is_some() {
             if let (Ok(lat), Ok(lon)) = (
                 xp.get_float(datarefs::LATITUDE).await,
@@ -2174,7 +2185,6 @@ impl Station {
                 self.note_caller_on_strip(on_ground, lat, lon);
             }
         }
-        let departure_end = departure_end(Instant::now());
         let ident = self.pick_runway_with(
             wx.wind_from_deg,
             wx.wind_kts,
@@ -6367,12 +6377,15 @@ fn resequence_after_go_around(
         .map(|r| r.ident_a.clone())
         .collect();
     let field = active_field();
-    let arrival = arrival_end(
-        targets,
+    let (arrival, departure) = field_streams(
         &runways,
-        field.as_ref().map(|f| f.3).unwrap_or(0.0),
+        arrival_end(
+            targets,
+            &runways,
+            field.as_ref().map(|f| f.3).unwrap_or(0.0),
+        ),
+        now,
     );
-    let departure = departure_end(now);
     let streams: Vec<String> = arrival.iter().chain(departure.iter()).cloned().collect();
     let wind = surface_wind_at(field.as_ref().map(|f| (f.1, f.2)))
         .or(*TOWER_WIND.lock().unwrap_or_else(|e| e.into_inner()));
@@ -6795,9 +6808,9 @@ struct WakePrev {
 }
 
 /// The live DEPARTURE stream: the runway end the last ghost lifted off, by
-/// its roll direction, and when. The arrival stream is a snapshot
-/// ([`arrival_end`]); a departure is an event, so it is remembered here, for
-/// [`DEPARTURE_STREAM_SECS`], by the same watch that starts the wake clock.
+/// its roll direction, and when. A departure is an event, so it is
+/// remembered here, for [`DEPARTURE_STREAM_SECS`], by the same watch that
+/// starts the wake clock; landings likewise ([`ARRIVAL_STREAM`]).
 static DEPARTURE_STREAM: Mutex<Option<(String, Instant)>> = Mutex::new(None);
 
 /// How long a ghost's liftoff still says which way the field departs.
@@ -6812,6 +6825,70 @@ pub fn departure_end(now: Instant) -> Option<String> {
         .as_ref()
         .filter(|(_, at)| now.saturating_duration_since(*at).as_secs() < DEPARTURE_STREAM_SECS)
         .map(|(end, _)| end.clone())
+}
+
+/// The remembered ARRIVAL stream: the runway end the last ghost touched down
+/// on, by its track from the air to the pavement, and when. [`arrival_end`]
+/// sees a lander only while it is on final; between landers nothing knew the
+/// field was landing 12, and the SR22's stated 30 was cleared head-on to it in
+/// calm (sortie 1790610218-approach, LEMG 2026-09-28: Ryanair 431 and 590
+/// landed 12 at t 1790610003 and 1790610134, "cleared to land runway three
+/// zero" at t 1790610223, sent round twice, issue #164). Kept, like the
+/// departure stream, for [`ARRIVAL_STREAM_SECS`] by the wake watch.
+static ARRIVAL_STREAM: Mutex<Option<(String, Instant)>> = Mutex::new(None);
+
+/// How long a ghost's touchdown still says which way the field lands.
+pub const ARRIVAL_STREAM_SECS: u64 = 600;
+
+/// The end the field has been landing on: the last ghost touchdown within
+/// [`ARRIVAL_STREAM_SECS`], else `None`. The memory only: the live sighting
+/// on final ([`arrival_end`]) outranks it through [`field_streams`].
+pub fn arrival_stream_end(now: Instant) -> Option<String> {
+    ARRIVAL_STREAM
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .filter(|(_, at)| now.saturating_duration_since(*at).as_secs() < ARRIVAL_STREAM_SECS)
+        .map(|(end, _)| end.clone())
+}
+
+/// The streams the field is working, `(arrival, departure)`, as the runway
+/// pick, the stated-runway refusal and the re-sequence read them. The
+/// arrival is the live lander on final ([`arrival_end`], passed as `live`),
+/// else the remembered touchdown ([`arrival_stream_end`]); the departure is
+/// the remembered liftoff ([`departure_end`]). When the two point against
+/// each other the field has turned round: the OLDER memory is dropped (a
+/// live lander is now).
+pub fn field_streams(
+    runways: &[nav::Runway],
+    live: Option<String>,
+    now: Instant,
+) -> (Option<String>, Option<String>) {
+    let fresh = |at: &Instant| now.saturating_duration_since(*at).as_secs();
+    let landed = ARRIVAL_STREAM
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+        .filter(|(_, at)| fresh(at) < ARRIVAL_STREAM_SECS);
+    let departed = DEPARTURE_STREAM
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+        .filter(|(_, at)| fresh(at) < DEPARTURE_STREAM_SECS);
+    let arrival = match live {
+        Some(end) => Some((end, now)),
+        None => landed,
+    };
+    match (arrival, departed) {
+        (Some((a, at_a)), Some((d, at_d))) if ends_oppose(runways, &a, &d) => {
+            if at_a >= at_d {
+                (Some(a), None)
+            } else {
+                (None, Some(d))
+            }
+        }
+        (a, d) => (a.map(|x| x.0), d.map(|x| x.0)),
+    }
 }
 
 /// Does this flight id carry an airline prefix (ICAO 3-letter or IATA
@@ -6863,6 +6940,38 @@ pub fn wake_note_targets(targets: &[TcasTarget], now: Instant) {
                 let end = main_runway_of(&end);
                 tracing::info!(ghost = %t.callsign, runway = %end, "departure stream");
                 *DEPARTURE_STREAM.lock().unwrap_or_else(|e| e.into_inner()) = Some((end, now));
+            }
+        }
+        // Any touchdown ON a runway says which way the field lands: the end
+        // by its track from the last airborne sample (issue #164).
+        if !was_ground && t.on_ground {
+            let on_pavement = ACTIVE_RUNWAYS
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .iter()
+                .any(|r| on_runway(r, t.lat, t.lon).is_some());
+            if on_pavement {
+                if let Some(end) = departure_runway_ident(t.lat, t.lon, prev.lat, prev.lon) {
+                    let end = main_runway_of(&end);
+                    tracing::info!(ghost = %t.callsign, runway = %end, "arrival stream");
+                    let changed = ARRIVAL_STREAM
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .as_ref()
+                        .is_none_or(|(e, at)| {
+                            *e != end
+                                || now.saturating_duration_since(*at).as_secs()
+                                    >= ARRIVAL_STREAM_SECS
+                        });
+                    if changed {
+                        sim::blackbox::record(
+                            "atc",
+                            serde_json::json!({"event": "arrival_stream", "ghost": t.callsign,
+                                "runway": end}),
+                        );
+                    }
+                    *ARRIVAL_STREAM.lock().unwrap_or_else(|e| e.into_inner()) = Some((end, now));
+                }
             }
         }
         if was_ground && !t.on_ground && is_airline(&t.callsign) {
@@ -10584,6 +10693,7 @@ mod tests {
         *SURFACE_WIND.lock().unwrap() = None;
         *ACTIVE_FIELD.lock().unwrap() = None;
         *DEPARTURE_STREAM.lock().unwrap() = None;
+        *ARRIVAL_STREAM.lock().unwrap() = None;
     }
 
     const SR22: &str = "November five five zero Charlie Romeo";
@@ -13210,6 +13320,104 @@ mod tests {
         *WAKE.lock().unwrap() = None;
         *WAKE_PREV.lock().unwrap() = None;
         *DEPARTURE_STREAM.lock().unwrap() = None;
+        *ACTIVE_FIELD.lock().unwrap() = None;
+        *ACTIVE_RUNWAYS.lock().unwrap() = Vec::new();
+    }
+
+    /// Issue #164, the recorded LEMG 30 final (sortie 1790610218-approach,
+    /// 2026-09-28): the replay landed 12 (Ryanair 431 t 1790610003, Ryanair
+    /// 590 t 1790610134) and, with no lander on final at that instant, "final
+    /// runway three zero" in 300 at 4 was cleared to land 30 (t 1790610223),
+    /// head-on to the stream, and sent round twice. A ghost's touchdown is
+    /// remembered for ARRIVAL_STREAM_SECS: the stated 30 is refused for 12
+    /// while it is, and stands once the memory lapses. The departure memory
+    /// keeps working alongside, and a newer stream that points against the
+    /// older one means the field has turned round.
+    #[test]
+    fn a_ghost_touchdown_remembers_the_arrival_stream() {
+        let _guard = SIDE_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        *CLEARANCE.lock().unwrap() = None;
+        let runways = lemg_runways();
+        let lerp = |p: (f64, f64), q: (f64, f64), f: f64| {
+            (p.0 + (q.0 - p.0) * f, p.1 + (q.1 - p.1) * f)
+        };
+        let (t12, t30) = ((runways[0].lat_a, runways[0].lon_a), (runways[0].lat_b, runways[0].lon_b));
+        let (t13, t31) = ((runways[1].lat_a, runways[1].lon_a), (runways[1].lat_b, runways[1].lon_b));
+        *ACTIVE_RUNWAYS.lock().unwrap() = runways.clone();
+        let field = lerp(t12, t30, 0.5);
+        *ACTIVE_FIELD.lock().unwrap() = Some(("Malaga".into(), field.0, field.1));
+        *WAKE.lock().unwrap() = None;
+        *WAKE_PREV.lock().unwrap() = None;
+        *DEPARTURE_STREAM.lock().unwrap() = None;
+        *ARRIVAL_STREAM.lock().unwrap() = None;
+        let t0 = Instant::now();
+        let sec = std::time::Duration::from_secs;
+        let ghost = |id: &str, p: (f64, f64), ground: bool, vs: f64| TcasTarget {
+            callsign: id.into(),
+            lat: p.0,
+            lon: p.1,
+            ele_ft: if ground { 52.0 } else { 90.0 },
+            on_ground: ground,
+            vs_fpm: vs,
+        };
+        // Ryanair 590 over the 12 threshold, then on the pavement: landed 12.
+        wake_note_targets(&[ghost("RYR590", lerp(t12, t30, 0.0), false, -600.0)], t0);
+        assert!(arrival_stream_end(t0).is_none(), "airborne: no stream yet");
+        wake_note_targets(&[ghost("RYR590", lerp(t12, t30, 0.08), true, 0.0)], t0 + sec(2));
+        assert_eq!(arrival_stream_end(t0 + sec(3)).as_deref(), Some("12"));
+        // A ghost settling off every strip (a taxiway, a pad) says nothing.
+        let off = (field.0 + 0.01, field.1);
+        wake_note_targets(&[ghost("GA1", off, false, -300.0)], t0 + sec(4));
+        wake_note_targets(&[ghost("GA1", (off.0 + 0.0005, off.1), true, 0.0)], t0 + sec(5));
+        assert_eq!(arrival_stream_end(t0 + sec(6)).as_deref(), Some("12"));
+
+        let fresh = || {
+            let mut st = lxgb();
+            st.apt.name = "Malaga".into();
+            st.apt.runways = runways.clone();
+            st.runway_in_use = None;
+            st
+        };
+        // 89 s later, no lander on final: the stream is still 12, and the
+        // SR22's stated 30 in calm is refused for it.
+        let now = t0 + sec(89);
+        let (arr, dep) = field_streams(&runways, None, now);
+        assert_eq!((arr.as_deref(), dep.as_deref()), (Some("12"), None));
+        let mut st = fresh();
+        st.note_stated_runway("final runway three zero", tower::Intent::ReportFinal);
+        assert_eq!(st.pick_runway_with(300.0, 4.0, arr.as_deref(), dep.as_deref()), "12");
+        // The memory lapsed: no stream, the stated 30 stands in calm.
+        let later = t0 + sec(2 + ARRIVAL_STREAM_SECS);
+        assert!(arrival_stream_end(later).is_none(), "stale");
+        let (arr, dep) = field_streams(&runways, None, later);
+        assert_eq!((arr.as_deref(), dep.as_deref()), (None, None));
+        let mut st = fresh();
+        st.note_stated_runway("final runway three zero", tower::Intent::ReportFinal);
+        assert_eq!(st.pick_runway_with(300.0, 4.0, arr.as_deref(), dep.as_deref()), "30");
+
+        // The departure memory keeps working beside it: a 13 liftoff (same
+        // direction as 12) is kept with the landings.
+        let dep_t = t0 + sec(20);
+        wake_note_targets(&[ghost("VLG8176", lerp(t13, t31, 0.70), true, 0.0)], dep_t);
+        wake_note_targets(&[ghost("VLG8176", lerp(t13, t31, 0.78), false, 1500.0)], dep_t + sec(3));
+        assert_eq!(departure_end(dep_t + sec(4)).as_deref(), Some("13"));
+        let (arr, dep) = field_streams(&runways, None, dep_t + sec(4));
+        assert_eq!((arr.as_deref(), dep.as_deref()), (Some("12"), Some("13")));
+        // A newer departure off 31 (against the 12 landings): the field has
+        // turned round, the older landing memory is dropped...
+        let turn_t = t0 + sec(60);
+        wake_note_targets(&[ghost("EZY2716", lerp(t31, t13, 0.70), true, 0.0)], turn_t);
+        wake_note_targets(&[ghost("EZY2716", lerp(t31, t13, 0.78), false, 1500.0)], turn_t + sec(3));
+        let (arr, dep) = field_streams(&runways, None, turn_t + sec(4));
+        assert_eq!((arr.as_deref(), dep.as_deref()), (None, Some("31")));
+        // ...and a live lander on 12 outranks that older departure.
+        let (arr, dep) = field_streams(&runways, Some("12".into()), turn_t + sec(10));
+        assert_eq!((arr.as_deref(), dep.as_deref()), (Some("12"), None));
+
+        *WAKE.lock().unwrap() = None;
+        *WAKE_PREV.lock().unwrap() = None;
+        *DEPARTURE_STREAM.lock().unwrap() = None;
+        *ARRIVAL_STREAM.lock().unwrap() = None;
         *ACTIVE_FIELD.lock().unwrap() = None;
         *ACTIVE_RUNWAYS.lock().unwrap() = Vec::new();
     }
