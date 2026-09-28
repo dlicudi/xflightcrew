@@ -443,6 +443,21 @@ pub fn enable_load_gate(base: &str) {
     guard.get_or_insert_with(HashMap::new).entry(gate_key(base)).or_default();
 }
 
+/// Forget everything this process holds for `base`: a test server's port is
+/// reused by a later test, which must not inherit the last one's gate or ids.
+#[cfg(test)]
+async fn forget_base(base: &str) {
+    if let Some(m) = LOAD_GATES.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+        m.remove(&gate_key(base));
+    }
+    for k in [base.to_string(), gate_key(base)] {
+        ID_CACHE.lock().await.remove(&k);
+        COMMAND_CACHE.lock().await.remove(&k);
+        VALUE_CACHE.lock().await.remove(&k);
+        ABSENT.lock().await.remove(&k);
+    }
+}
+
 /// A flight is loading on some enabled sim, by the last fresh reading: for
 /// the blocking pollers and the WebSocket, which do not go through the
 /// client. Stale or unknown is false (fail open).
@@ -1895,6 +1910,10 @@ mod failure_sequences {
         server.join().unwrap();
     }
 
+    /// The load gate's one-flag-read-at-a-time lock is process-wide (one
+    /// sim live); two gate tests at once would skip each other's check.
+    static GATE_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
     /// An older plugin has no `xcopilot/sim/loading`: the gate asks once,
     /// finds it absent and lets the read go, then asks nothing more for a
     /// while (the server answers exactly these three requests).
@@ -1905,13 +1924,15 @@ mod failure_sequences {
             reply(
                 "GET /api/v1/datarefs?",
                 200,
-                r#"{"data":[{"id":1,"name":"test/dial"}]}"#,
+                r#"{"data":[{"id":1,"name":"test/quiet_window_dial"}]}"#,
             ),
             reply("GET /api/v1/datarefs/1/value", 200, r#"{"data":7}"#),
         ]);
+        let _serial = GATE_TEST_LOCK.lock().await;
+        forget_base(&base).await;
         enable_load_gate(&base);
         let xp = XPlaneClient::new(base.clone());
-        assert_eq!(xp.get_float("test/dial").await.unwrap(), 7.0);
+        assert_eq!(xp.get_float("test/quiet_window_dial").await.unwrap(), 7.0);
         server.join().unwrap();
         // The next reads within the absent window ask the flag nothing (a
         // cached value here; the server is gone).
@@ -1944,6 +1965,7 @@ mod failure_sequences {
             ),
             reply("GET /api/v1/datarefs/1/value", 200, r#"{"data":7}"#),
         ]);
+        let _serial = GATE_TEST_LOCK.lock().await;
         enable_load_gate(&base);
         let xp = XPlaneClient::new(base.clone());
         // First check: loading.
