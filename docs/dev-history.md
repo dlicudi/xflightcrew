@@ -9896,3 +9896,18 @@ monitor's `valve_sync` forced it to follow the master (a hand write of 0 read ba
 names it `oxygen_masks`; missions and callouts switch on only the supply; `MaskWatch` dons the masks
 airborne at a 12,500 ft cabin (supply first), doffs only its own under 11,500, never over the pilot.
 Offline only.
+
+## 2026-09-28: the arrival flies its speeds at idle; windows said; altimeter at the transition; anti-ice at our level; glideslope aim (issues #156, #32, #126)
+
+EGKK-EGBB (sortie 1790601822). HEME1B's HEMEL "at FL220" was clamped into an FL180 plan and crossed at
+14,638 unsaid; the VS law followed the path at up to 2,000 fpm at idle so the 737 gained speed and the
+speedbrake came out six times (a speed model fitted to the sortie: the 737 holds speed at idle only near
+2.9 degrees down). Windows above the cruise are now capped and said; the descent gives way to its speed
+(`speed_protected_vs`), the governor holds 5 kt under at idle (`IdleDescent`), STAR limits are flown 3 kt
+under, the speedbrake is for height. On the fitted model the old laws repeat the flight (OSKOT 215,
+GROVE 220, 6 extensions); the new cross PUFAX 247, OSKOT 211, GROVE 211 with none. The join from GROVE
+sat on a 4,011 ft plateau (paced on the straight line to the IF) then dived: now paced on the pattern's
+own miles (211 kt at the handoff, was 218.5). OFP cruise 299/300 vs the 306 caution: capped at 0.9 Vne
+less 10 (296). Altimeter: standard at 6,149 ft (was 8,297), QNH at 7,384 ft (was 6,180). Anti-ice never
+off: the monitor read the lowest of the sim's 13 dewpoint levels; now the aircraft's own. Glideslope:
+the aim leans toward the beam (EGBB 15: 327 ft, crossing at 81). Open: the join pattern's length. Offline only.

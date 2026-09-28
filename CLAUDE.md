@@ -655,6 +655,15 @@ everything blackboxes to `logs/blackbox.jsonl` (kinds: `atc`, `autotaxi`, `autot
 - **The autopilot's own modes are tools, not yet the follower's** (`tools::autoflight` `ap_mode`:
   autothrust, level change, GPSS; `systems::ap_modes`: proved > `autoflight:` > type): toggles read
   before firing, refused where the map says No; the follower adopts `engage` later (probes owed).
+- **A STAR window over the plan's cruise is flown at the cruise and said once**
+  (`windows_above_cruise`); one the airframe cannot make is said with the number (`star_window_miss`).
+  **A descent flies its speed first, at idle** (`speed_protected_vs`, `IdleDescent`); STAR limits are
+  flown 3 kt under (`STAR_SPEED_MARGIN_KTS`); the speedbrake is for HEIGHT the protected descent cannot
+  lose (`descent_drag` `high_ft`); a join pattern's descent is paced on the pattern's miles
+  (`FinalJoin::pattern_to_go_nm`). The OFP cruise is capped under the overspeed caution
+  (`cruise_cap_kts`); the altimeter is set AT the transition, crossed in the direction flown
+  (`transition_crossed`); icing reads the moisture at our own level (`dewpoint_at`); with the ILS tuned
+  autoland's aim leans toward the glideslope (`aim_with_glideslope`; EGKK-EGBB 2026-09-28).
 - **The arrival is re-picked in flight** (`RepickWatch`): the destination tower's runway at once, the
   METAR's wind runway on two readings in a row beyond 25 nm (never in calm, never against the tower),
   at most `MAX_ARRIVAL_REPICKS`; the new STAR is spliced from its entry (`plan_audit::star_splice`,
