@@ -10049,3 +10049,14 @@ builders now drive only the lead-on points still ahead (`lead_on_ahead`: past th
 projection onto the stub, and over 5 m from it). The 3.54 m step at 1790586103.4 was at 5 kt, lat 3.2
 m and err 12 to 15 degrees: a vertex cut while rolling, not a stopped aircraft. Test
 `a_line_up_from_past_the_hold_never_runs_back_to_it`. Offline only.
+
+## 2026-09-28: a light aircraft waited 360 s for a tug on LEMG's GA apron (issue #170)
+
+SR22 on LEMG tie-down 100 (sorties 1790605551, 1790618416): `pushback` `waiting` to 350 s, the push
+abandoned at 360 s, then the turn-round under its own power joined the route in 14 s. Every push
+since July by stand: tugs serve light GA (EGHI GA 1/2 hooked in 81 to 101 s), but LEMG's GA
+tie-downs hooked at 261 to 289 s (Baron, 102 and 93) or never (Baron 103, SR22 100 twice), and jets
+hook at 42 to 251 s (737 EGKK 10: 251 s), so a 60 s bound on the wait would drop real pushes. Now a
+light aircraft (`acf_m_max` at or under 5,700 kg, `pushback::tug_for_weight`) calls no tug and turns
+itself off the stand (`full_auto` `pushback_skipped` `why: light_aircraft`, `mtow_kg`); a failed read
+keeps the tug. Test `a_light_aircraft_turns_itself_off_the_stand`. Offline only.

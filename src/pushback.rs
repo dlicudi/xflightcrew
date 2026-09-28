@@ -737,6 +737,24 @@ pub fn on_a_stand(stand: Option<(f64, f64)>, psi: f64, known: bool) -> bool {
     }
 }
 
+/// The heaviest aircraft that turns itself off a stand instead of calling a
+/// tug: ICAO's light class (5,700 kg maximum takeoff mass).
+pub const LIGHT_MTOW_KG: f64 = 5_700.0;
+
+/// Does this airframe call a tug at all? `mtow_kg` is `acf_m_max`; a failed
+/// read is no measurement and keeps the tug. A light aircraft turns round on
+/// the apron under its own power, as it would in life, instead of waiting
+/// minutes for a vehicle: LEMG's GA tie-downs (100 to 107) kept an SR22
+/// waiting 360 s twice for a tug that never came (sorties 1790605551 and
+/// 1790618416, 2026-09-28), and the Baron's pushes there hooked at 261 to
+/// 289 s when one came; the turn-round that followed joined in 14 s.
+pub fn tug_for_weight(mtow_kg: Option<f64>) -> bool {
+    match mtow_kg {
+        Some(w) if w.is_finite() && w > 0.0 => w > LIGHT_MTOW_KG,
+        _ => true,
+    }
+}
+
 /// Is the aircraft PARKED at a stand: within [`STAND_M`] of one, whichever
 /// way the nose points. The heading is the tug's question (which way to
 /// push), not the securing's: EDLP 7C was reached 2 m from its spot and 147
@@ -1760,6 +1778,22 @@ mod tests {
         // A field with no stand rows keeps the bearing-only rule.
         assert!(on_a_stand(None, 95.0, false));
         assert!(!on_a_stand(None, 95.0, true));
+    }
+
+    #[test]
+    fn a_light_aircraft_turns_itself_off_the_stand() {
+        use super::tug_for_weight;
+        // SR22 (1,633 kg), SF50 (2,727 kg), Baron (2,495 kg): no tug.
+        for kg in [1_633.0, 2_727.0, 2_495.0, 5_700.0] {
+            assert!(!tug_for_weight(Some(kg)), "{kg}");
+        }
+        // Citation X, 737-800: the tug.
+        assert!(tug_for_weight(Some(16_375.0)));
+        assert!(tug_for_weight(Some(79_016.0)));
+        // Unread or nonsense: no measurement, the tug as before.
+        assert!(tug_for_weight(None));
+        assert!(tug_for_weight(Some(0.0)));
+        assert!(tug_for_weight(Some(f64::NAN)));
     }
 
     use super::*;

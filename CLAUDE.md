@@ -452,6 +452,8 @@ everything blackboxes to `logs/blackbox.jsonl` (kinds: `atc`, `autotaxi`, `autot
   - Direction from the cleared route's first leg; a tug only ON A STAND (`pushback::on_a_stand` via
     `party_line::nearest_stand`; a field without stand rows keeps the bearing rule), else every
     restart mid-taxiway calls a tug. "Skip the pushback" is `pushback::SKIP`; bare "stop" aborts.
+  - **A light aircraft turns itself off the stand** (`pushback::tug_for_weight`, `acf_m_max` at
+    or under 5,700 kg; unread keeps the tug): LEMG's GA tug took 261 to 289 s or never came (#170).
 - **Taxi guide** (`src/taxi_guide.rs`): early gentle cue, quiet inside the range where the
   compliance watch takes over (never two voices on one mistake); gates on `pushback::ACTIVE`;
   "which way?" is question-shaped so a readback never triggers it.
