@@ -9971,3 +9971,13 @@ chord. Brake-steer plant fitted over both taxis: 0.45 s delay, 2.17 s lag, 299 -
 unit of differential brake, 1.7 deg/s left pull; through it the corner flies 4.93 m inside on 16 m
 and 2.75 m on a free nose's 12 m (`FREE_NOSE_AIM_FLOOR_M`). The 350 s wait for a tug that never came
 before these taxis is not addressed. Offline only.
+
+## 2026-09-28: the duty engine's last disagreement, a standalone autoland's stop (issue #34)
+
+11 of 216 `duty` records since 1790586000 disagreed, all `taxi_to_stand` "down, heading in" at
+TaxiIn under mission "autoland" (latest t 1790611965.0): the flight model enters TaxiIn at taxi
+speed while autoland is still stopping on the runway (`stopped_brakes` 0.2 s later), then control
+goes to the pilot and the mission ends 1.5 to 3.2 s on. A standalone autoland's mission IS the
+landing; nobody owes a stand. `duty::next` now says Vacate at TaxiIn under mission "autoland" (the
+rollout's duty carries on, autoland agrees), and TaxiToStand stays full auto's. Replayed through
+`DutyTrail`: nothing in the logs since 1790586000 disagrees now. Offline only.
