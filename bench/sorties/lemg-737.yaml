@@ -23,7 +23,9 @@
 #       command: the typed mission, as a pilot says it ("fly a circuit",
 #                "full auto", "fly the flight plan"); required except on an
 #                approach.
-#       deadline_min: minutes from the command to the verdict (default 20).
+#       deadline_min: minutes from the command to the verdict (default 20,
+#                     scaled up for an airframe slower on the approach than
+#                     the 737's 145 kt, at most 2.5 times).
 #       sim_speed: X-Plane's time multiplier while the sortie flies (1 to 16,
 #                  default 1; put back to 1 after the case). Unmeasured: the
 #                  laws tick in wall time, so treat 2x as an experiment.
@@ -31,24 +33,27 @@
 #                 command (default 10, for the profile detection).
 #
 # A runway YAML would read as a number may be quoted or not: 13 and "13"
-# are the same runway.
+# are the same runway. `runway: wind` is the into-wind end, picked at the
+# case's setup by the tower's own rule (best_runway_for_wind) from the
+# field's METAR, else the sim's wind with the aircraft on the field; the row
+# names the runway and the wind.
 
 cases:
-  - name: LEMG 13, 10 nm final
+  - name: LEMG into the wind, 10 nm final
     setup:
-      approach: { field: LEMG, runway: "13", final_nm: 10 }
+      approach: { field: LEMG, runway: wind, final_nm: 10 }
     deadline_min: 10
 
-  - name: LEMG 13, 5 nm final
+  - name: LEMG into the wind, 5 nm final
     setup:
-      approach: { field: LEMG, runway: "13", final_nm: 5 }
+      approach: { field: LEMG, runway: wind, final_nm: 5 }
     deadline_min: 8
 
   # "Fly a circuit" is full auto's circuit: on the runway it skips the
   # start and the taxi, works the tower, and flies the pattern to a landing
   # and the taxi in, all one sortie.
-  - name: LEMG 13 runway start, circuit
+  - name: LEMG runway start into the wind, circuit
     setup:
-      runway_start: { field: LEMG, runway: "13", engines_running: true }
+      runway_start: { field: LEMG, runway: wind, engines_running: true }
     command: fly a circuit
     deadline_min: 20
