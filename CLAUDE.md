@@ -124,6 +124,10 @@ Datarefs and commands stay in the Rust tools; YAML is per-airframe config.
   made-up names fed fallbacks that impersonated a measurement for months).
 - **The plugin side too** (`health::PLUGIN_DATAREFS`, test-pinned): a stale `.xpl` is said at boot
   and red on Health. Editing `plugin/src` is done only after `make -C plugin`, install AND reload.
+- **Position is one frame** (`xcopilot/position`, `sim::position::read`): the plugin copies lat,
+  lon, elevation, true heading, groundspeed, vertical speed and y_agl after the flight model each frame,
+  read in one request; an older plugin falls back to split reads (`pos: split`). Read separately, lat
+  and lon paired two frames: 2.9 m of cross-track for a tick on LEMG 13 (#157).
 - **A failed read is NO measurement**: a loop skips the tick and blackboxes `null`. A "dataref" may
   be a command; read-only switches need read-before-fire `*_toggle` tools, in full auto's copies
   too. Paired lights are written together (one lit pod confirms half).
@@ -291,6 +295,15 @@ Config: `XCOPILOT_ATC_AIRPORT` / `_VOICE` / `_RATE` / `_REGION`.
 - **The tower's book is the runway's**: a landing holds its strip until the vacated report, a
   runway start is lined up, a cleared crossing that keeps moving is legal
   (`station::runway_occupancy_authorised`, the incursion watch's one question; EGKK 2026-09-27).
+- **The runway watch ticks whoever flies the final** (`go_around_tick` / `landing_hold_tick` run
+  ahead of the monitor's `quiet` block, which closes under `autoland::ACTIVE`); **the crew never lands
+  uncleared**: autoland's `UnclearedWatch` asks at 1,000 ft and goes around at 300 ft while the book is
+  Inbound (`landing_clearance_asked`, `uncleared_go_around`; EGBB 15 2026-09-28). The strip we LANDED
+  on, cleared or not, is ours while rolling off it (`landed_strip`); the incursion shout names the end
+  we point down. **One departure on the runway at a time** (LinedUp/TakeoffCleared claim the whole
+  strip, no ghost departure within `WAKE_SECS` of our liftoff, a ghost change not seen live is never
+  narrated, `PARTY_LINE_FRESH_S`; the wake clock on the departure's own end). The taxi request names
+  the cleared runway; departure clears no higher than the FILED cruise (`capped_departure_climb`).
 - **A landing is never cleared onto an occupied runway, and the go-around is judged on time**: a
   final onto a ghost on our strip is "continue approach ..., expect late landing clearance"
   (`LANDING_HOLD`), cleared by the monitor once the strip is clear or its occupants move off in time
@@ -440,6 +453,10 @@ everything blackboxes to `logs/blackbox.jsonl` (kinds: `atc`, `autotaxi`, `autot
   until the loops weave. The rollout blackboxes `rollout` per tick with the REAL tick time. So a
   steady drift is held off only by a standing offset: the scheduled roll feeds its own drift
   forward (`DriftFilter`, the final's crab pattern; EGBB 2026-09-27).
+- **The declared rudder is believed only up to the speed it was measured at** (`RollSteer` held flat
+  above `roll_rudder:` `at_kts`, ceiling `RUDDER_FULL_DEG_FAST`; extrapolated as v^2 it cut the gain to a
+  third by Vr: EGKK 08R lifted off 5.4 m left, 2026-09-28). The scheduled roll's cut is `RollCut`: the
+  median of three cross-track reads (a mixed-frame pair read up to 2.9 m off for a tick until `xcopilot/position`), cut harder from `XTK_GAIN_REF_KTS` to `at_kts`, plus a slow cross-track trim.
 - **The handoff line is true** about who has the aircraft and the height (`handoff_to_caller`). **A
   pilot handoff is FLYABLE**: it waits for the clean-up (`handoff_waits_for_clean_up`), sets a
   capturable dial (`handoff_altitude_dial_ft`), and gives the governor the overspeed guard's speed
@@ -972,7 +989,9 @@ confirms it closes it (`fixes #N` in the commit). Known gaps are `owed` issues.
   parks); in the air it is taken back at once; the row's "Before" says which.
   A case scripts `steps` (`say` at `start`, `after_s`, `ias_above`, `agl_above`, `phase`, `event`),
   loads `setup.aircraft` (waits for its `profile_probe`), reads `plan_origin` / `runway: plan` from
-  SimBrief, and may `expect_give_up`; specs `bench/sorties/backlog-737.yaml`, `backlog-types.yaml`.
+  SimBrief, and may `expect_give_up`; `runway: wind` is the tower's into-wind end at the setup (`resolve_wind`, METAR else
+  the sim's wind on the field); an unset deadline scales with the approach speed; **a reposition or
+  swap is a new flight to the scorer** (`Scorer::new_flight`); specs `bench/sorties/backlog-737.yaml`, `backlog-types.yaml`.
 - A law that misbehaves in the air while its test passes: suspect the plant. A first-order lag
   cannot ring; fly second-order plants through the real transport delay.
 

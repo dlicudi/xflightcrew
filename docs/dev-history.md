@@ -9821,3 +9821,54 @@ sweep. `RotatePitch::ceiling_guard` lets the nose close on the ceiling no faster
 and the target stops 0.5 under it: replay 21.96 to 17.83, under 18 across the plant sweep.
 #154: `speedhold::AirspaceLimit` latches the 250 below 10,000 cap (lifted only at 10,300); a level at
 10,000 +-50 ft flipped the old rule ~325 times, the latch never. Offline only.
+
+## 2026-09-28: the 737's roll believes its rudder only to the speed it was measured at (issues #123, #59)
+
+EGKK 08R (1790601822) lifted off 5.4 m left (worst 5.8) with the heading error a standing +0.8 to +1.1
+degrees for 30 s from 100 kt; LEMG 13 1790591256 reached 9.0 m after a yaw gust at 100-107 kt. The
+profile's `roll_rudder:` (11.5 deg/s per unit at 80 kt, fitted 30-86 kt) was extrapolated as v^2; fitted
+against the logged steer on all eight rolls of the 28th the rudder is 4-6 deg/s per unit from 45 to 110
+kt and 8.5 at 132 (the 27th: roughly v^1.25), so by Vr the loop had a third of the gain it assumed.
+Cross-track also spiked for single ticks (lat and lon read separately: up to 2.9 m on LEMG's diagonal
+runway). `RollSteer` now holds the declared rudder flat above `at_kts`; `RollCut` takes the median of
+three reads, cuts harder at speed and adds a slow trim. A superposition replay (the recorded aircraft
+plus the fitted response to the steer difference) reproduces the as-flown steer within 0.01 and, with
+the new law, keeps all eight rolls within 3 m worst and 2 m at liftoff (EGKK 1.3/-0.4). Roll ticks now
+log the sim's yaw rate as `r` (it was the brake split's error) and `xtk_used`, `cut`, `cut_i`. Open:
+the scorer still reads the raw spiky xtk; a consistent position read from the plugin would remove the
+spikes at the source (filed). Offline only.
+
+## 2026-09-28: the tower after a withheld landing, and the departures around us (issues #155, #149)
+
+EGKK-EGBB (sortie 1790601822, t0 = 1790601822). (1) The landing hold armed at +3314.5 was never released
+or judged: `go_around_tick` and `landing_hold_tick` sat inside the monitor's `if !quiet` block, and
+`quiet` includes `autoland::ACTIVE`, so an autoland final never got a release or a go-around order at
+all; the 737 landed uncleared. They now run ahead of it, and autoland's `UnclearedWatch` asks at
+1,000 ft and goes around at 300 ft while uncleared. (2) Four "exit the runway" (naming 33) during our
+own vacate on 15: an uncleared landing's strip was not ours; `landed_strip` now covers it while
+rolling off, and the shout names the end we point down. (3) "request taxi, runway two six left" after
+an 08R clearance: the taxi call now names the cleared runway. (4) Departure cleared FL220 (HEME1B's
+HEMEL window) against the filed FL180: the check-in and departure's climb are capped at the filed
+cruise. (5) A ghost cleared for takeoff on 08R 1.6 s after us: the wake clock sat on the other strip's
+end, a ghost liftoff was narrated 17 s late, TakeoffCleared claimed only a direction; fixed (one
+departure on the runway at a time). (6) "1 miles" in traffic advisories. Offline only.
+
+## 2026-09-28: the runner's wind runway and the scorer's new flight (issue #158)
+
+The swap from the SR22 still on final to LEMG 30 (1,270 ft, 549 fpm down, past its deadline) to the SF50
+on 13's threshold scored "landing FAIL, touched down at 549 fpm": the scorer's airborne track outlived
+the jump. `Scorer::new_flight` now runs on every `flight` `reposition` and `flight_meta`. The specs named
+13 with the wind at 280/5 while the tower sent arrivals to 30: `runway: wind` picks the tower's end at
+each setup (`nav::best_runway_for_wind`), a default deadline scales with the airframe's approach speed,
+rows are flushed (pipe through `grep --line-buffered`). Offline only.
+
+## 2026-09-28: position from one frame (issue #157)
+
+The 737 roll work (#123) found latitude and longitude, read as separate Web API requests, can come from
+different frames: up to 2.9 m of cross-track for one tick on LEMG 13 above 120 kt, 0.7 m on EGKK 08R.
+The livestate WebSocket cache is per dataref and would not fix it. The plugin now publishes
+`xcopilot/position` (10 doubles, after the flight model, every frame), read in one request by
+`sim::position::read`, with a split-read fallback remembered for 10 s; adopted by the takeoff roll and
+reject stop, the autoland tick and rollout, the auto taxi drive, both circuit ticks, taxi-in and the
+monitor snapshot. Replaying 1790591256 with each request two frames late: split reads 3.0 m worst, the
+snapshot 0. Records carry `pos`. Needs `make install` and a plugin reload. Offline only.

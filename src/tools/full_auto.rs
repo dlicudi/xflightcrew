@@ -855,6 +855,7 @@ impl FullAuto {
                 // Airborne: no clearance to ask for.
                 ifr: false,
                 cruise_schedule: fp.schedule.clone(),
+                cruise_ft: Some(fp.cruise_alt_ft).filter(|c| *c > 0.0),
             }),
             ack,
         ))
@@ -1475,6 +1476,7 @@ impl FullAuto {
                     fp.transition_altitude_ft.unwrap_or(self.transition_altitude_ft),
                 ),
                 cruise_schedule: fp.schedule.clone(),
+                cruise_ft: Some(fp.cruise_alt_ft).filter(|c| *c > 0.0),
             }),
             ack,
         ))

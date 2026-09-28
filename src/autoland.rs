@@ -912,6 +912,65 @@ fn go_around_call_due(
     !w.touched && radio_ft - w.low_ft >= GO_AROUND_RISE_FT && vvi_fpm.is_none_or(|v| v > 0.0)
 }
 
+/// Radio height at which a final the tower is working but has NOT cleared
+/// asks again: "final runway one five, request landing clearance" (a final
+/// report, which the tower judges afresh against the strip).
+pub const CLEARANCE_QUERY_FT: f64 = 1000.0;
+/// Radio height at which a final still without its landing clearance goes
+/// around: a crew never lands uncleared (EGKK-EGBB 15, sortie
+/// 1790601822-full_auto, 2026-09-28: "expect late landing clearance" at
+/// 7 nm, then nothing, and autoland landed; "you landed on runway one five
+/// without clearance"). Above the flare by far: the order is the gate path's
+/// (`GoAroundLatch::order`), flown from wherever we are.
+pub const UNCLEARED_GO_AROUND_FT: f64 = 300.0;
+
+/// What the crew owes a final the tower is working and has not cleared.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnclearedStep {
+    /// Ask again, once per approach.
+    Ask,
+    /// Go around.
+    GoAround,
+}
+
+/// The crew's watch on its own landing clearance. `working` is the tower's
+/// book saying it has us in sequence and has not cleared us (`Inbound`: the
+/// "continue approach, expect late landing clearance" answer, or a final
+/// report not yet answered); without a tower working us (an uncontrolled
+/// field, no two-way contact) there is nothing to be cleared by and the
+/// watch is silent. Pure.
+#[derive(Debug, Default)]
+pub struct UnclearedWatch {
+    asked: bool,
+}
+
+impl UnclearedWatch {
+    pub fn step(
+        &mut self,
+        working: bool,
+        radio_ft: f64,
+        on_ground: bool,
+        missed: bool,
+    ) -> Option<UnclearedStep> {
+        if missed {
+            // The next approach asks again.
+            self.asked = false;
+            return None;
+        }
+        if !working || on_ground || !radio_ft.is_finite() {
+            return None;
+        }
+        if radio_ft <= UNCLEARED_GO_AROUND_FT {
+            return Some(UnclearedStep::GoAround);
+        }
+        if radio_ft <= CLEARANCE_QUERY_FT && !self.asked {
+            self.asked = true;
+            return Some(UnclearedStep::Ask);
+        }
+        None
+    }
+}
+
 /// Cancel an active autoland; returns whether one was flying.
 pub fn abort() -> bool {
     ABORT.store(true, Ordering::SeqCst);
@@ -1225,6 +1284,8 @@ pub fn run_autoland_scoped(
             // flag: sharing that flag, the main loop's FSM sync consumed every
             // order before this loop's tick saw it (LEMG 31, 2026-09-28).
             let mut orders = crate::party_line::GoAroundOrders::arm();
+            // The crew's own watch on the landing clearance (#155).
+            let mut uncleared = UnclearedWatch::default();
             // The final report owed on a SECOND approach. The circuit or the
             // arrival makes the first one, which is what earns the landing
             // clearance; a missed approach then flies away, and until this
@@ -1340,12 +1401,20 @@ pub fn run_autoland_scoped(
                 }
                 // One read burst — nine sequential HTTP awaits is the slow-tick
                 // disease that gave the takeoff its slew weave (sortie four).
-                let (lat_r, lon_r, elev_r, agl_r, gs_r, var_r, ias_r, psi_r, hpath_r, ground_r, phi_r) = tokio::join!(
-                    xp.get_float(LAT), xp.get_float(LON), xp.get_float(ELEV_M),
-                    xp.get_float(AGL_M), xp.get_float(GS_MS), xp.get_float(MAG_VAR),
-                    xp.get_float(IAS), xp.get_float(PSI_TRUE), xp.get_float(HPATH_TRUE),
+                // Position, height, groundspeed and heading as ONE frame saw
+                // them (#157): read separately, latitude and longitude paired
+                // two frames, metres of cross-track for a tick at speed.
+                let (pos, var_r, ias_r, hpath_r, ground_r, phi_r) = tokio::join!(
+                    sim::position::read(&xp), xp.get_float(MAG_VAR),
+                    xp.get_float(IAS), xp.get_float(HPATH_TRUE),
                     xp.get_float(ON_GROUND), xp.get_float(PHI_TRUE),
                 );
+                let (lat_r, lon_r) = sim::position::lat_lon(&pos);
+                let elev_r = sim::position::field(&pos, |p| p.elev_m);
+                let agl_r = sim::position::field(&pos, |p| p.agl_m);
+                let gs_r = sim::position::field(&pos, |p| p.gs_ms);
+                let psi_r = sim::position::field(&pos, |p| p.psi_true_deg);
+                let pos_source = sim::position::source_word(&pos);
                 let (Ok(lat), Ok(lon), Ok(elev_m), Ok(agl_m), Ok(gs_ms), Ok(var), Ok(ias), Ok(on_ground)) =
                     (lat_r, lon_r, elev_r, agl_r, gs_r, var_r, ias_r, ground_r)
                 else { tokio::time::sleep(std::time::Duration::from_millis(300)).await; continue };
@@ -1553,6 +1622,7 @@ pub fn run_autoland_scoped(
                             "event": "rollout", "gs": gs_kts, "xtk_m": xtk_m,
                             "xtk_rate": xtk_rate, "err": err, "steer": steer,
                             "trim": roll_law.trim(), "psi": psi, "dt": roll_dt,
+                            "pos": pos_source,
                         }),
                     );
                     let thr_dref = throttle_dref();
@@ -1683,6 +1753,51 @@ pub fn run_autoland_scoped(
                         serde_json::json!({"event": "ordered_go_around", "radio": radio_ft,
                                            "dist": raw.dist_nm}),
                     );
+                }
+                // A final the tower is working but has not cleared: ask
+                // again at 1,000 ft, go around at 300 (`UnclearedWatch`).
+                // The tower's hold is judged by the monitor on its own; this
+                // is the crew never landing uncleared (#155).
+                match uncleared.step(
+                    crate::party_line::clearance_state() == Some(crate::tower::State::Inbound),
+                    radio_ft,
+                    on_ground > 0.5,
+                    go_around.active(),
+                ) {
+                    Some(UnclearedStep::Ask) => {
+                        if going_around_callsign.is_none() {
+                            going_around_callsign = Some(crate::circuit::crew_callsign(&xp).await);
+                        }
+                        let cs = going_around_callsign.clone().flatten();
+                        crate::circuit::transmit(crate::circuit::radio_call(
+                            &cs,
+                            &format!(
+                                "final runway {}, request landing clearance",
+                                crate::circuit::spell_runway(&rwy.id)
+                            ),
+                        ));
+                        crate::blackbox::record(
+                            "autoland",
+                            serde_json::json!({"event": "landing_clearance_asked", "rwy": rwy.id,
+                                               "radio": radio_ft, "dist": raw.dist_nm,
+                                               "held": crate::party_line::landing_hold_armed()}),
+                        );
+                    }
+                    Some(UnclearedStep::GoAround) => {
+                        if go_around.order(on_ground > 0.5) {
+                            crate::blackbox::record(
+                                "autoland",
+                                serde_json::json!({"event": "uncleared_go_around", "rwy": rwy.id,
+                                                   "radio": radio_ft, "dist": raw.dist_nm,
+                                                   "held": crate::party_line::landing_hold_armed()}),
+                            );
+                            announce(
+                                "No landing clearance. Going around.".into(),
+                                Priority::Caution,
+                            );
+                        }
+                    }
+                    None => {}
                 }
                 // Unstabilised at the thousand-foot gate is a go-around, not a
                 // quiet re-intercept: the latch only arms itself below the
@@ -2458,6 +2573,9 @@ pub fn run_autoland_scoped(
                     "ground": on_ground > 0.5,
                     "phase": format!("{:?}", g.phase), "ga": ga, "crab": crab, "crab_raw": crab_raw,
                     "trim": trim, "xtk_m": xtk_now * M_PER_NM,
+                    // "plugin": one frame's position; "split": an older
+                    // plugin's separate reads (#157).
+                    "pos": pos_source,
                     "flare_elev": flare_elev, "flare_ail": flare_ail, "hands": arrest_hands,
                     // The autopilot not yet confirmed and read off: the
                     // elevator above is the level hold's (`ApEngage`).
@@ -7250,6 +7368,50 @@ mod tests {
     /// later. The call now waits for the climb; a balk the wheels take never
     /// calls. The first approach's `off_centreline_low` at 96 ft still calls
     /// as soon as it climbs.
+    /// EGKK-EGBB 15, sortie 1790601822-full_auto (2026-09-28, #155): the
+    /// final report at +3314.2 got "continue approach, expect late landing
+    /// clearance" and the tower never came back; the book stayed Inbound down
+    /// the whole final (the recorded autoland ticks' radio heights below,
+    /// +3313.6 to +3452.0) and the wheels touched uncleared at +3472.2. The
+    /// crew now asks at 1,000 ft (the +3390.8 tick, 990 ft) and goes around at
+    /// 300 (the +3435.7 tick, 296 ft), once each; cleared, or with no tower
+    /// working us, it says nothing; a missed approach asks again next time.
+    #[test]
+    fn an_uncleared_final_asks_then_goes_around() {
+        let radio = [
+            2103.0, 2097.0, 1991.0, 1886.0, 1796.0, 1692.0, 1593.0, 1499.0, 1394.0, 1298.0,
+            1200.0, 1096.0, 990.0, 893.0, 795.0, 694.0, 596.0, 499.0, 396.0, 296.0, 199.0, 95.0,
+        ];
+        let run = |working: bool| {
+            let mut w = UnclearedWatch::default();
+            radio
+                .iter()
+                .filter_map(|&r| w.step(working, r, false, false).map(|s| (r, s)))
+                .collect::<Vec<_>>()
+        };
+        let steps = run(true);
+        assert_eq!(steps.first(), Some(&(990.0, UnclearedStep::Ask)));
+        assert_eq!(steps.get(1), Some(&(296.0, UnclearedStep::GoAround)));
+        assert_eq!(
+            steps.iter().filter(|s| s.1 == UnclearedStep::Ask).count(),
+            1,
+            "asked once: {steps:?}"
+        );
+        // Cleared (or no tower working us): silent all the way down.
+        assert!(run(false).is_empty());
+        // Never on the wheels.
+        let mut w = UnclearedWatch::default();
+        assert_eq!(w.step(true, 0.0, true, false), None);
+        // A missed approach resets the question for the next approach.
+        let mut w = UnclearedWatch::default();
+        assert_eq!(w.step(true, 900.0, false, false), Some(UnclearedStep::Ask));
+        assert_eq!(w.step(true, 900.0, false, false), None);
+        assert_eq!(w.step(true, 250.0, false, true), None);
+        assert_eq!(w.step(true, 900.0, false, false), Some(UnclearedStep::Ask));
+        // An unread height is no measurement.
+        assert_eq!(UnclearedWatch::default().step(true, f64::NAN, false, false), None);
+    }
+
     #[test]
     fn a_low_balk_is_called_on_the_radio_only_once_it_climbs() {
         let due = |w: &BalkWatch, on_ground, radio, vvi| {
