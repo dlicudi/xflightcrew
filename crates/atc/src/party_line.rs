@@ -18,6 +18,7 @@
 //! in separate crates this is convention, not compiler-checked; keep the
 //! surface small enough to audit by eye.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard};
 
 use crate::nav;
@@ -101,6 +102,14 @@ pub(crate) static PENDING_LINE_UP: Mutex<bool> = Mutex::new(false);
 /// loop consumes it and voids the landing clearance in the tower FSM, so the
 /// coach can never keep suggesting the readback of a cancelled clearance.
 pub(crate) static PENDING_GO_AROUND: Mutex<bool> = Mutex::new(false);
+
+/// Every go-around order the tower has given, counted and never reset: the
+/// crew's loops each watch it through a [`GoAroundOrders`], so one reader
+/// can never consume another's order. The FSM sync above is a `take_*` flag
+/// for the main loop alone; the loops that FLY the order used to take that
+/// same flag, and the main loop (polling every ~150 ms against autoland's
+/// ~400 ms tick) won it: 15 orders in the logs, not one `ordered_go_around`.
+pub(crate) static GO_AROUND_ORDERS: AtomicU64 = AtomicU64::new(0);
 
 /// A CONDITIONAL line-up's condition, as the world sees it: `Some(false)`
 /// while the named arrival is still on final, `Some(true)` once it is down on
@@ -514,7 +523,38 @@ pub fn take_pending_line_up() -> bool {
     std::mem::take(&mut *lock(&PENDING_LINE_UP))
 }
 
-/// Consume the go-around-ordered flag. Main loop only.
+/// Consume the go-around-ordered flag. Main loop only (the tower FSM sync):
+/// a loop that FLIES the order watches it through [`GoAroundOrders`].
 pub fn take_pending_go_around() -> bool {
     std::mem::take(&mut *lock(&PENDING_GO_AROUND))
+}
+
+/// One crew loop's watch on the tower's go-around orders. Armed when the
+/// loop starts flying (every order given before is history: an order shouted
+/// at an earlier approach must not balk this one), then asked each tick.
+/// Each watch sees each order once, whoever else is watching, and reading it
+/// takes nothing from the main loop's FSM sync. LEMG 31 (sortie
+/// 1790584715-full_auto, 2026-09-28): the order came on the circuit's final
+/// at 736 ft; nothing in the circuit read it, and the flag was gone before
+/// autoland armed at 2 nm, which drained whatever was left anyway.
+#[derive(Debug, Clone, Copy)]
+pub struct GoAroundOrders {
+    seen: u64,
+}
+
+impl GoAroundOrders {
+    /// Start watching: only orders given from now on count.
+    pub fn arm() -> Self {
+        Self {
+            seen: GO_AROUND_ORDERS.load(Ordering::SeqCst),
+        }
+    }
+
+    /// Whether the tower has ordered a go-around since the last look.
+    pub fn take(&mut self) -> bool {
+        let now = GO_AROUND_ORDERS.load(Ordering::SeqCst);
+        let fresh = now != self.seen;
+        self.seen = now;
+        fresh
+    }
 }

@@ -1207,11 +1207,12 @@ pub fn run_autoland_scoped(
             // The lever the approach was flown on, for a balloon to hold.
             let mut approach_thr: Option<f64> = None;
             let mut go_around = GoAroundLatch::new();
-            // Drain any go-around order left on the party line before this
-            // approach existed. The flag is a latch, not a queue: an order
-            // shouted at somebody else's approach half an hour ago must not
-            // balk this one on its first tick.
-            let _ = crate::party_line::take_pending_go_around();
+            // Watch the tower's go-around orders from here: an order shouted
+            // at somebody else's approach half an hour ago must not balk this
+            // one on its first tick. A WATCH, never the main loop's `take_*`
+            // flag: sharing that flag, the main loop's FSM sync consumed every
+            // order before this loop's tick saw it (LEMG 31, 2026-09-28).
+            let mut orders = crate::party_line::GoAroundOrders::arm();
             // The final report owed on a SECOND approach. The circuit or the
             // arrival makes the first one, which is what earns the landing
             // clearance; a missed approach then flies away, and until this
@@ -1654,11 +1655,10 @@ pub fn run_autoland_scoped(
                     );
                 }
                 // A controller's order beats anything the approach thinks of
-                // itself. Consumed here rather than in the main loop because
-                // this is the thing that can ACT on it; the flag is drained
-                // at arm time above, so only an order given during this
-                // approach can trip it.
-                if crate::party_line::take_pending_go_around()
+                // itself. Watched here because this is the thing that can ACT
+                // on it; the watch is armed with the approach above, so only
+                // an order given during this approach can trip it.
+                if orders.take()
                     && go_around.order(on_ground > 0.5)
                 {
                     crate::blackbox::record(
