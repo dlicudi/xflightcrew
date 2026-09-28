@@ -724,6 +724,110 @@ fn rollout_brake_ratio(gs_kts: f64, target_kts: f64, remaining_m: f64) -> f64 {
     (decel * BRAKE_RATIO_PER_MPS2).clamp(0.2, 0.8)
 }
 
+/// The rollout's differential brake on an airframe that steers on its brakes
+/// (a castoring nosewheel, `taxi.brake_steer`), as the real aircraft is
+/// steered down the runway: the stopping brake moved from the outside wheel
+/// to the inside one, the total unchanged.
+///
+/// LEMG 13 (issue #166, 2026-09-28, the SR22, sortie 1790619465): the
+/// rollout steered on the rudder alone with both brakes at 0.24. The nose
+/// swung 6 degrees right in the first two seconds on the wheels, and for ten
+/// seconds from 70 kt it sat 3 to 6 degrees right of the runway while the
+/// steer asked for left, growing to 0.69 and the trim to its 0.3 cap: fitted
+/// over those ticks the rudder's yaw is under 2 deg/s per unit of steer, no
+/// authority at all, and the aircraft rolled from 1.6 m to 12.1 m right of
+/// the centreline. The takeoff's split (`autotakeoff::roll_brake_split`)
+/// fades out from 20 to 40 kt because a brake on the roll costs the
+/// acceleration; on the rollout the brake is wanted anyway, so it steers at
+/// every speed. The heading error is the takeoff roll's target less the
+/// heading (`roll_target_heading`), damped on its own rate; the SR22's taxi
+/// ticks give its brakes 40 to 75 deg/s of yaw per unit of difference at
+/// taxi pace, and the gain holds the recorded rollout inside 2.6 m from 15 to
+/// 60 deg/s per unit.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct RolloutBrakeSteer {
+    prev_err: Option<f64>,
+    rate: f64,
+}
+
+/// Brake difference per degree of heading error...
+const ROLLOUT_BRAKE_STEER_PER_DEG: f64 = 0.03;
+/// ...led by this many seconds of the error's rate...
+const ROLLOUT_BRAKE_STEER_LEAD_S: f64 = 0.8;
+/// ...never more than this difference between the wheels...
+const ROLLOUT_BRAKE_STEER_MAX: f64 = 0.3;
+/// ...and none below this groundspeed, where the stop owns the brakes.
+const ROLLOUT_BRAKE_STEER_MIN_KTS: f64 = 4.0;
+
+/// One tick of [`RolloutBrakeSteer`]: the brakes, as (the symmetric channel,
+/// the left wheel, the right wheel). The plugin gives each wheel the harder
+/// of the symmetric channel and its own, so the outside wheel's brake is the
+/// symmetric channel and the inside one's its own.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RolloutBrakes {
+    pub sym: f64,
+    pub left: f64,
+    pub right: f64,
+}
+
+impl RolloutBrakeSteer {
+    /// The heading error (degrees, target right of the nose positive), the
+    /// tick, groundspeed and the stopping brake the rollout wants.
+    pub fn step(&mut self, err_deg: f64, dt_s: f64, gs_kts: f64, brake: f64) -> RolloutBrakes {
+        let brake = if brake.is_finite() {
+            brake.clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        let plain = RolloutBrakes {
+            sym: brake,
+            left: 0.0,
+            right: 0.0,
+        };
+        if !err_deg.is_finite() || !dt_s.is_finite() || dt_s <= 0.0 {
+            // A failed read is no measurement: the plain stop.
+            return plain;
+        }
+        if let Some(p) = self.prev_err {
+            self.rate = (err_deg - p) / dt_s.clamp(0.05, 3.0);
+        }
+        self.prev_err = Some(err_deg);
+        if !gs_kts.is_finite() || gs_kts < ROLLOUT_BRAKE_STEER_MIN_KTS {
+            return plain;
+        }
+        let diff = (ROLLOUT_BRAKE_STEER_PER_DEG
+            * (err_deg + ROLLOUT_BRAKE_STEER_LEAD_S * self.rate))
+            .clamp(-ROLLOUT_BRAKE_STEER_MAX, ROLLOUT_BRAKE_STEER_MAX);
+        let half = diff.abs() / 2.0;
+        let outside = (brake - half).max(0.0);
+        let inside = (brake + half).min(1.0);
+        if diff > 0.0 {
+            // Nose right: the right wheel brakes harder.
+            RolloutBrakes {
+                sym: outside,
+                left: 0.0,
+                right: inside,
+            }
+        } else if diff < 0.0 {
+            RolloutBrakes {
+                sym: outside,
+                left: inside,
+                right: 0.0,
+            }
+        } else {
+            plain
+        }
+    }
+}
+
+/// Whether the live airframe steers on its brakes (the takeoff's own test).
+fn rollout_brake_steers() -> bool {
+    crate::aircraft::nose_castors()
+        || crate::aircraft::live_profile()
+            .and_then(|p| p.taxi.as_ref().map(|t| t.brake_steer))
+            .unwrap_or(false)
+}
+
 /// Set by full auto before its landing: a vacate drive follows this rollout,
 /// so end it at taxi pace instead of a dead stop. Consumed (swapped false) by
 /// the rollout that honours it and cleared on abort, so a standalone "land for
@@ -1403,6 +1507,10 @@ pub fn run_autoland_scoped(
             let mut wheels_on: u32 = 0;
             let mut vacate_follows = false;
             let mut roll_law = crate::autotakeoff::RollSteer::default();
+            // A castoring nosewheel steers the rollout on its brakes too
+            // (`RolloutBrakeSteer`, issue #166).
+            let rollout_brake_steer = rollout_brake_steers();
+            let mut rollout_brakes = RolloutBrakeSteer::default();
             // The landing readback last sent, so an owed one goes out once
             // (the party line keeps it owed until the tower hears it).
             let mut readback_sent: Option<String> = None;
@@ -1649,6 +1757,29 @@ pub fn run_autoland_scoped(
                     let psi = psi_r.as_ref().copied().unwrap_or(rwy.course_deg);
                     let err = ((target - psi + 540.0).rem_euclid(360.0)) - 180.0;
                     let steer = roll_law.step(err, roll_dt, gs_kts, 0.0);
+                    // Brake by wanted deceleration, not a fixed clamp: a
+                    // comfortable rate when the runway allows it, harder
+                    // only when stopping in what remains demands it; on a
+                    // castoring nosewheel, split between the wheels to steer
+                    // (`RolloutBrakeSteer`; an unread heading steers nothing).
+                    let along_m = along_track_nm(lat, lon, &rwy) * M_PER_NM;
+                    let remaining_m = (rwy.length_m + along_m).max(0.0);
+                    let target_kts = if vacate_follows { VACATE_HANDOFF_KTS } else { 0.0 };
+                    let brake = rollout_brake_ratio(gs_kts, target_kts, remaining_m);
+                    let brakes = if rollout_brake_steer {
+                        rollout_brakes.step(
+                            if psi_r.is_ok() { err } else { f64::NAN },
+                            roll_dt,
+                            gs_kts,
+                            brake,
+                        )
+                    } else {
+                        RolloutBrakes {
+                            sym: brake,
+                            left: 0.0,
+                            right: 0.0,
+                        }
+                    };
                     // The rollout kept no record of its own: the EGLF and LFPB
                     // weaves had to be reconstructed from the 1 Hz `state`
                     // samples, which is no way to read a control loop.
@@ -1659,6 +1790,9 @@ pub fn run_autoland_scoped(
                             "xtk_rate": xtk_rate, "err": err, "steer": steer,
                             "trim": roll_law.trim(), "psi": psi, "dt": roll_dt,
                             "pos": pos_source,
+                            // The brakes as written: the symmetric channel and
+                            // each wheel's steering channel (issue #166).
+                            "brake": brakes.sym, "bl": brakes.left, "br": brakes.right,
                         }),
                     );
                     let thr_dref = throttle_dref();
@@ -1675,6 +1809,12 @@ pub fn run_autoland_scoped(
                     if vacate_follows && gs_kts <= VACATE_HANDOFF_KTS {
                         let _ = xp.set_float(TAXI_BRAKE, 0.0).await;
                         let _ = xp.set_float(TAXI_STEER, 0.0).await;
+                        if rollout_brake_steer {
+                            let _ = tokio::join!(
+                                xp.set_float(crate::autotaxi::LEFT_BRAKE, 0.0),
+                                xp.set_float(crate::autotaxi::RIGHT_BRAKE, 0.0),
+                            );
+                        }
                         crate::blackbox::record(
                             "autoland",
                             serde_json::json!({ "event": "rolling_handoff", "gs": gs_kts }),
@@ -1682,14 +1822,17 @@ pub fn run_autoland_scoped(
                         break;
                     }
                     if gs_kts > 2.0 {
-                        // Brake by wanted deceleration, not a fixed clamp: a
-                        // comfortable rate when the runway allows it, harder
-                        // only when stopping in what remains demands it.
-                        let along_m = along_track_nm(lat, lon, &rwy) * M_PER_NM;
-                        let remaining_m = (rwy.length_m + along_m).max(0.0);
-                        let target_kts = if vacate_follows { VACATE_HANDOFF_KTS } else { 0.0 };
-                        let brake = rollout_brake_ratio(gs_kts, target_kts, remaining_m);
-                        let _ = xp.set_float(TAXI_BRAKE, brake).await;
+                        // The steering pair every tick with the stop: the
+                        // plugin's channels are one-second heartbeats.
+                        if rollout_brake_steer {
+                            let _ = tokio::join!(
+                                xp.set_float(TAXI_BRAKE, brakes.sym),
+                                xp.set_float(crate::autotaxi::LEFT_BRAKE, brakes.left),
+                                xp.set_float(crate::autotaxi::RIGHT_BRAKE, brakes.right),
+                            );
+                        } else {
+                            let _ = xp.set_float(TAXI_BRAKE, brakes.sym).await;
+                        }
                         set_panel(&format!("AUTOLAND {} {} ROLLOUT", rwy.icao, rwy.id));
                         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
                         continue;
@@ -1703,6 +1846,12 @@ pub fn run_autoland_scoped(
                     // `parking_brake_ratio` at 0.03 (2026-09-22).
                     let _ = xp.set_float(TAXI_BRAKE, ROLLOUT_BRAKE_HOLD).await;
                     let _ = xp.set_float(TAXI_STEER, 0.0).await;
+                    if rollout_brake_steer {
+                        let _ = tokio::join!(
+                            xp.set_float(crate::autotaxi::LEFT_BRAKE, 0.0),
+                            xp.set_float(crate::autotaxi::RIGHT_BRAKE, 0.0),
+                        );
+                    }
                     let valve = crate::aircraft::live_profile().and_then(|p| p.park_brake_valve_set);
                     let set = crate::tools::controls::set_park_brake_confirmed(&xp, valve, 3).await;
                     crate::blackbox::record(
@@ -13694,5 +13843,644 @@ mod lemg12_sf50_balloon_tests {
             held_hard * 5 > n,
             "held: {held_hard} of {n} past 400, worst {worst_held:.0}"
         );
+    }
+}
+
+/// Issue #166: LEMG 13, the SR22 (sortie 1790619465-approach, 2026-09-28),
+/// 4.7 kt of wind from 145, the final's air 20 fpm rms (smooth). The arrest
+/// took the servos at 50.6 ft sinking 476 fpm and flew the 172's tracker on
+/// this elevator: 0.14 of pull had the sink at +10 by 45 ft, the roundout
+/// then PUSHED 0.10 and the sink rebuilt to -471 at 28 ft; again to -52;
+/// the flare's full 0.35 from 22 ft met the step to idle a dead time later
+/// (-528 at 12.5 ft), ballooned to +298 at 22 ft, was let go to neutral in
+/// one tick, the balloon's thrust came back and went again, and the sink
+/// the 0.35 met too late was -585 fpm at 1.4 ft (575 on the scorecard).
+///
+/// The plant is the SR22's elevator with the servos out in the form of
+/// [`FlareModel`] (a standing change of sink per unit of pull through two
+/// lags after a dead time), plus what the model does not carry, fitted to
+/// the same 38 ticks: the thrust (fpm per unit of lever through a lag) and
+/// the speed (fpm of sink per knot lost from the gate), the speed itself
+/// -2.70 kt/s less 5.1 per 1,000 fpm of climb plus 2.74 per unit of lever
+/// (0.32 kt/s rms). Each plant is a fit: the whole record, and the record's
+/// parts (the first arrest, the arrest to the flare, the flare), so a law
+/// that lands on all of them does not depend on one fit being right. Rough
+/// air is a random vertical gust (an Ornstein-Uhlenbeck sink, 1.5 s). The
+/// plugin's pitch channel and the loop's tick (0.35 s) are inside the dead
+/// time.
+///
+/// What the plants say: at idle with full flap this wing bleeds 2.7 kt a
+/// second and sinks about 115 fpm harder for each knot, so a flare that cuts
+/// the lever at its gate has lost the lift it is flaring with before the
+/// column's dead time is out. The profile declares the model (6,000 fpm per
+/// unit through 1.0 s lags after 0.8 s: under every fit's gain but the
+/// arrest's, so it pulls for the weakest; the fitted 10,000 / 1.45 / 0.9
+/// lands the same gates at 291) and a retard held until a second from the
+/// wheels (`flare_power` `retard_at_s`).
+#[cfg(test)]
+mod lemg13_sr22_flare_tests {
+    use super::*;
+
+    /// The recorded arrest (s from `arrest_hands` taken, radio ft, vvi fpm,
+    /// the elevator written, IAS kt), to the last tick before the wheels.
+    const REC: [(f64, f64, f64, f64, f64); 38] = [
+        (0.0, 50.63, -475.8, 0.126, 92.23),
+        (0.4, 46.72, -475.0, 0.139, 92.32),
+        (0.9, 43.75, -447.2, 0.105, 92.48),
+        (1.3, 43.15, -357.5, -0.028, 92.58),
+        (1.8, 44.21, -179.0, -0.100, 92.47),
+        (2.2, 45.21, -43.5, -0.100, 92.08),
+        (2.7, 45.18, 9.7, -0.100, 91.43),
+        (3.1, 43.88, -37.5, -0.100, 90.88),
+        (3.6, 41.09, -152.1, 0.016, 90.42),
+        (4.0, 37.69, -268.3, 0.114, 90.17),
+        (4.5, 33.87, -404.7, 0.206, 90.09),
+        (4.8, 30.61, -464.0, 0.202, 90.16),
+        (5.2, 28.07, -471.1, 0.127, 90.32),
+        (5.6, 27.52, -386.1, -0.035, 90.37),
+        (6.0, 28.40, -214.6, -0.100, 90.20),
+        (6.4, 28.87, -91.0, -0.100, 89.81),
+        (6.9, 28.15, -52.1, -0.100, 89.17),
+        (7.3, 25.98, -115.3, -0.045, 88.66),
+        (7.8, 21.76, -261.7, 0.221, 88.22),
+        (8.0, 19.03, -352.8, 0.312, 88.11),
+        (8.4, 14.87, -475.2, 0.350, 88.14),
+        (8.7, 12.51, -528.0, 0.350, 88.26),
+        (9.0, 11.12, -503.4, 0.350, 88.30),
+        (9.3, 11.41, -408.4, 0.350, 88.14),
+        (9.6, 13.00, -236.7, 0.000, 87.65),
+        (9.9, 15.08, -74.4, 0.000, 87.05),
+        (10.2, 18.24, 123.9, 0.000, 86.08),
+        (10.5, 20.25, 239.6, 0.000, 85.12),
+        (10.8, 21.73, 298.4, 0.000, 83.79),
+        (11.1, 22.04, 276.3, 0.000, 82.81),
+        (11.4, 21.47, 189.7, 0.000, 81.66),
+        (11.7, 20.14, 83.4, 0.053, 80.85),
+        (12.1, 17.81, -74.6, 0.176, 80.11),
+        (12.4, 15.00, -195.5, 0.269, 79.80),
+        (12.7, 11.14, -349.1, 0.350, 79.65),
+        (13.0, 7.55, -469.4, 0.350, 79.67),
+        (13.3, 3.83, -558.4, 0.350, 79.71),
+        (13.6, 1.37, -584.8, 0.350, 79.65),
+    ];
+    /// The lever as commanded (s, ratio): approach power, the arrest's
+    /// "only back", idle at the flare gate, the balloon's approach thrust,
+    /// idle again.
+    const THR: [(f64, f64); 5] = [
+        (-10.0, 0.318),
+        (1.5, 0.309),
+        (7.9, 0.0),
+        (10.3, 0.309),
+        (12.2, 0.0),
+    ];
+    const TICK_S: f64 = 0.35;
+    /// The SR22's landing-configuration stall (POH, profile `vs0_kts`).
+    const VSO_KTS: f64 = 60.0;
+    /// The final's approach thrust and speed at the gate.
+    const APPROACH_THR: f64 = 0.318;
+    const APPROACH_IAS: f64 = 92.0;
+    /// Groundspeed less airspeed (4.7 kt from 145 on runway 13).
+    const HEADWIND_KTS: f64 = 3.0;
+
+    /// One fit: (fpm per unit, lag 1, lag 2, dead time), the column the
+    /// autopilot left in the pipe, fpm per unit of lever and its lag, fpm
+    /// of sink per knot lost.
+    #[derive(Debug, Clone, Copy, PartialEq)]
+    struct Fit {
+        el: (f64, f64, f64, f64),
+        pre: f64,
+        thr_fpm: f64,
+        thr_lag: f64,
+        per_kt: f64,
+    }
+
+    /// The whole record (39 fpm rms), then fitted to its parts alone: the
+    /// first arrest (3 fpm rms there), the arrest to the flare gate (26),
+    /// the flare (37, and 50 over the whole record).
+    const PLANTS: [Fit; 4] = [
+        Fit {
+            el: (10000.0, 1.46, 1.43, 0.92),
+            pre: -0.058,
+            thr_fpm: 316.0,
+            thr_lag: 2.70,
+            per_kt: 115.0,
+        },
+        Fit {
+            el: (7720.0, 0.95, 1.72, 0.77),
+            pre: -0.062,
+            thr_fpm: 1074.0,
+            thr_lag: 1.10,
+            per_kt: 34.0,
+        },
+        Fit {
+            el: (6240.0, 1.03, 1.03, 1.17),
+            pre: -0.132,
+            thr_fpm: 1160.0,
+            thr_lag: 2.78,
+            per_kt: 183.0,
+        },
+        Fit {
+            el: (9070.0, 1.42, 1.31, 0.86),
+            pre: -0.038,
+            thr_fpm: 1.0,
+            thr_lag: 0.16,
+            per_kt: 94.0,
+        },
+    ];
+    const WHOLE: usize = 0;
+
+    /// Gates the arrest must land from (radio ft, vvi fpm, trend fpm/s,
+    /// IAS kt): the recorded one, and the same final a little steeper,
+    /// shallower, slower and faster.
+    const GATES: [(f64, f64, f64, f64); 5] = [
+        (50.63, -475.8, 1.0, 92.23),
+        (50.0, -560.0, -20.0, 92.0),
+        (50.0, -400.0, 20.0, 92.0),
+        (50.0, -480.0, 0.0, 86.0),
+        (50.0, -480.0, 0.0, 97.0),
+    ];
+
+    struct Plant {
+        fit: Fit,
+        h: f64,
+        v: f64,
+        ias: f64,
+        ias0: f64,
+        base: f64,
+        b1: f64,
+        b2: f64,
+        thr: f64,
+        thr_cmd: f64,
+        stall: f64,
+        gust: f64,
+        rng: u64,
+        rough_fpm: f64,
+        t: f64,
+        written: Vec<(f64, f64)>,
+    }
+
+    impl Plant {
+        /// As recorded: the autopilot's column settled in the pipe.
+        fn recorded_gate(fit: Fit) -> Self {
+            let (_, h, v, _, ias) = REC[0];
+            let b = fit.el.0 * fit.pre;
+            Plant {
+                fit,
+                h,
+                v,
+                ias,
+                ias0: ias,
+                base: v - b,
+                b1: b,
+                b2: b,
+                thr: APPROACH_THR,
+                thr_cmd: APPROACH_THR,
+                stall: 0.0,
+                gust: 0.0,
+                rng: 0,
+                rough_fpm: 0.0,
+                t: 0.0,
+                written: vec![(-10.0, fit.pre)],
+            }
+        }
+        /// At a gate: sinking `v` with `trend`, the column that made the
+        /// trend already in the pipe.
+        fn at(fit: Fit, h: f64, v: f64, trend: f64, ias: f64) -> Self {
+            let mut p = Self::recorded_gate(fit);
+            let b = fit.el.0 * fit.pre;
+            p.h = h;
+            p.v = v;
+            p.ias = ias;
+            p.ias0 = ias;
+            p.b1 = b + trend * fit.el.2;
+            p.base = v - b;
+            p
+        }
+        fn rough(mut self, seed: u64, rms_fpm: f64) -> Self {
+            self.rng = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+            self.rough_fpm = rms_fpm;
+            self
+        }
+        fn gauss(&mut self) -> f64 {
+            let mut u = || {
+                self.rng ^= self.rng << 13;
+                self.rng ^= self.rng >> 7;
+                self.rng ^= self.rng << 17;
+                ((self.rng >> 11) as f64 + 0.5) / (1u64 << 53) as f64
+            };
+            let (a, b) = (u(), u());
+            (-2.0 * a.ln()).sqrt() * (std::f64::consts::TAU * b).cos()
+        }
+        fn write(&mut self, e: f64) {
+            self.written.push((self.t, e));
+        }
+        fn step(&mut self, dt: f64) {
+            let (k, l1, l2, dead) = self.fit.el;
+            let due = self.t - dead;
+            let arriving = self
+                .written
+                .iter()
+                .take_while(|(t, _)| *t <= due + 1e-9)
+                .last()
+                .map_or(0.0, |w| w.1);
+            self.b1 += (k * arriving - self.b1) * dt / l1;
+            self.b2 += (self.b1 - self.b2) * dt / l2;
+            self.thr += (self.thr_cmd - self.thr) * dt / self.fit.thr_lag;
+            if self.rough_fpm > 0.0 {
+                const TC: f64 = 1.5;
+                let n = self.gauss();
+                self.gust += -self.gust / TC * dt + self.rough_fpm * (2.0 * dt / TC).sqrt() * n;
+            }
+            if self.ias < VSO_KTS {
+                self.stall += 800.0 * dt;
+            }
+            self.v = self.base
+                + self.b2
+                + self.fit.thr_fpm * (self.thr - APPROACH_THR)
+                + self.fit.per_kt * (self.ias - self.ias0)
+                + self.gust
+                - self.stall;
+            self.ias += (-2.70 - 5.1 * self.v / 1000.0 + 2.74 * self.thr) * dt;
+            self.h += self.v / 60.0 * dt;
+            self.t += dt;
+        }
+        /// The recorded column and lever, written as they were, to `until`.
+        fn recorded(&mut self, until: f64) {
+            while self.t < until - 1e-9 {
+                let e = REC
+                    .iter()
+                    .take_while(|r| r.0 <= self.t + 1e-9)
+                    .last()
+                    .map_or(0.0, |r| r.3);
+                if self.written.last().map(|w| w.1) != Some(e) {
+                    self.write(e);
+                }
+                self.thr_cmd = THR
+                    .iter()
+                    .take_while(|r| r.0 <= self.t + 1e-9)
+                    .last()
+                    .map_or(APPROACH_THR, |r| r.1);
+                self.step(0.01);
+            }
+        }
+    }
+
+    fn sr22() -> crate::aircraft::AircraftProfile {
+        crate::aircraft::load("cirrus_sr22").expect("the SR22 profile loads")
+    }
+
+    /// Which elevator law flies.
+    enum Law {
+        Model(FlareModel),
+        Tracker(FlarePitch, Option<f64>),
+    }
+
+    impl Law {
+        /// Today's: the profile's model.
+        fn today() -> Self {
+            Law::Model(
+                FlareModel::from_profile(sr22().flare_elevator)
+                    .expect("the SR22 declares its model"),
+            )
+        }
+        /// The law the SR22 flew at LEMG 13: no `flare_elevator:`, the
+        /// default tracker (the servos latched as today).
+        fn as_flown() -> Self {
+            Law::Tracker(FlarePitch::with_gains(FlareGains::default()), None)
+        }
+        fn step(&mut self, h: f64, gs: f64, v: f64, dt: f64, flare: bool, rough: bool) -> f64 {
+            match self {
+                Law::Model(m) => m.step(h, gs, v, dt, flare, rough).elev,
+                Law::Tracker(p, prev) => {
+                    let trend = prev.map_or(0.0, |p| (v - p) / dt);
+                    *prev = Some(v);
+                    let nominal = -(gs / 60.0) * gp_ft_per_nm();
+                    let (roundout, flare_vs) = arrest_targets_fpm(nominal);
+                    p.step(if flare { flare_vs } else { roundout }, v, trend, dt, flare)
+                }
+            }
+        }
+    }
+
+    #[derive(Debug)]
+    struct Landed {
+        wheels_fpm: f64,
+        pushed_climbing: bool,
+        secs: f64,
+        min_ias: f64,
+    }
+
+    /// The arrest from here to the wheels at the loop's tick, the servos
+    /// kept: the flare below its gate and a flare stays a flare to the
+    /// band's top (`hold_flare`), the roundout above. The lever as the loop
+    /// flies it: the arrest's approach thrust, then the profile's
+    /// `flare_power` (idle at the flare gate when it declares none), the
+    /// approach thrust again while climbing (`balloon_power`).
+    fn land(p: &mut Plant, law: &mut Law, rough: bool) -> Landed {
+        land_with(p, law, rough, sr22().flare_power)
+    }
+
+    fn land_with(
+        p: &mut Plant,
+        law: &mut Law,
+        rough: bool,
+        cfg: Option<crate::aircraft::FlarePowerProfile>,
+    ) -> Landed {
+        let mut power = FlarePower::default();
+        let start = p.t;
+        let (mut next, mut flaring) = (p.t, false);
+        let mut out = Landed {
+            wheels_fpm: 0.0,
+            pushed_climbing: false,
+            secs: 0.0,
+            min_ias: p.ias,
+        };
+        while p.h > 0.0 && p.t - start < 40.0 {
+            if p.t + 1e-9 >= next {
+                next += TICK_S;
+                let gs = p.ias - HEADWIND_KTS;
+                let (flare_ft, band_ft) = arrest_gates_ft(25.0, gs);
+                flaring = p.h <= flare_ft || (flaring && p.h <= band_ft);
+                let e = law.step(p.h, gs, p.v, TICK_S, flaring, rough);
+                out.pushed_climbing |= p.v > BALLOON_CLIMB_FPM && e < -1e-9;
+                p.write(e);
+                p.thr_cmd = if !flaring {
+                    power.reset();
+                    APPROACH_THR.min(p.thr_cmd.max(0.0))
+                } else if let Some(t) = balloon_power(Some(p.v), Some(APPROACH_THR), p.h > band_ft)
+                {
+                    t
+                } else {
+                    match cfg {
+                        Some(c) => power
+                            .step(
+                                c,
+                                p.thr_cmd,
+                                p.v,
+                                TICK_S,
+                                p.h,
+                                Some(p.ias),
+                                Some(APPROACH_IAS),
+                            )
+                            .unwrap_or(p.thr_cmd),
+                        None => 0.0,
+                    }
+                };
+            }
+            p.step(0.01);
+            out.min_ias = out.min_ias.min(p.ias);
+        }
+        out.wheels_fpm = p.v;
+        out.secs = p.t - start;
+        out
+    }
+
+    /// The plant is the recording: the column and lever as written give
+    /// back the sink as measured, balloon included, 39 fpm rms on the whole
+    /// record's fit and the wheels at -494 against the recorded -585 (the
+    /// parts' fits are other flares: 50 to 160 over the whole).
+    #[test]
+    fn the_sr22_plant_replays_the_lemg_flare() {
+        let mut p = Plant::recorded_gate(PLANTS[WHOLE]);
+        let mut sq = 0.0;
+        for r in REC.iter().skip(1) {
+            p.recorded(r.0);
+            sq += (p.v - r.2).powi(2);
+        }
+        let rms = (sq / (REC.len() - 1) as f64).sqrt();
+        assert!(rms < 45.0, "the whole record's fit: {rms:.1} fpm rms");
+        assert!((p.v - REC[REC.len() - 1].2).abs() < 100.0, "{:.0}", p.v);
+    }
+
+    /// From every gate on every plant, calm air: the SR22's declared flare
+    /// (its model, the thrust held to the last second) lands under 300 fpm
+    /// (the worst 273) without pushing a climb, slowing within 5 kt of Vso
+    /// or floating; the same model with the lever cut at the flare gate goes
+    /// past 300 somewhere; the tracker it flew goes past 400 (the worst
+    /// 1,267, a float that stalled onto the runway).
+    #[test]
+    fn the_sr22_flare_lands_every_gate_on_every_plant() {
+        let (mut idle_worst, mut tracker_worst) = (0.0_f64, 0.0_f64);
+        for (h, v, trend, ias) in GATES {
+            for fit in PLANTS {
+                let mut p = Plant::at(fit, h, v, trend, ias);
+                let l = land(&mut p, &mut Law::today(), false);
+                assert!(l.wheels_fpm > -300.0, "{fit:?} from {h} ft {v} fpm: {l:?}");
+                assert!(!l.pushed_climbing, "{fit:?} from {h} ft");
+                assert!(l.min_ias > VSO_KTS + 5.0, "{fit:?}: {l:?}");
+                assert!(l.secs < 12.0, "{fit:?}: floated {l:?}");
+                let mut p = Plant::at(fit, h, v, trend, ias);
+                idle_worst =
+                    idle_worst.min(land_with(&mut p, &mut Law::today(), false, None).wheels_fpm);
+                let mut p = Plant::at(fit, h, v, trend, ias);
+                tracker_worst = tracker_worst
+                    .min(land_with(&mut p, &mut Law::as_flown(), false, None).wheels_fpm);
+            }
+        }
+        assert!(idle_worst < -300.0, "idle at the gate: {idle_worst:.0}");
+        assert!(tracker_worst < -400.0, "as flown: {tracker_worst:.0}");
+    }
+
+    /// Rough air (40 fpm rms, where the rough-air gate starts), every gate
+    /// and plant, ten gust seeds each: under 400 fpm (the worst 353), never
+    /// a push while climbing.
+    #[test]
+    fn in_rough_air_the_sr22_flare_still_lands() {
+        let (mut worst, mut n) = (0.0_f64, 0);
+        for (h, v, trend, ias) in GATES {
+            for fit in PLANTS {
+                for seed in 1..=10u64 {
+                    let mut p = Plant::at(fit, h, v, trend, ias).rough(seed, 40.0);
+                    let l = land(&mut p, &mut Law::today(), true);
+                    assert!(!l.pushed_climbing, "{fit:?} seed {seed}");
+                    worst = worst.min(l.wheels_fpm);
+                    n += 1;
+                }
+            }
+        }
+        eprintln!("worst {worst:.0} over {n}");
+        assert!(worst > -400.0, "{worst:.0} over {n}");
+    }
+}
+
+/// Issue #166, the rollout: LEMG 13, the SR22 (sortie 1790619465-approach,
+/// 2026-09-28), both brakes at 0.24 and the rudder alone steering. The
+/// recorded heading IS the plant here: fitted, the steer explains none of it
+/// (under 2 deg/s per unit), so what the SR22 did on the wheels is taken as
+/// the disturbance and the brakes' yaw is added on top of it, a first-order
+/// yaw rate (0.5 s) behind 0.3 s of the plugin's channel, at the loop's
+/// 0.4 s tick. The brakes' authority is not in this record (nothing split
+/// them); the SR22's taxi ticks give 40 to 75 deg/s per unit of difference
+/// at taxi pace, with less weight on the wheels at 70 kt, so the law is
+/// flown from 15 to 60.
+#[cfg(test)]
+mod lemg13_sr22_rollout_tests {
+    use super::*;
+
+    /// The recorded rollout ticks (s from the first, groundspeed kt, true
+    /// heading, cross-track m right, the heading error, the rudder steer).
+    const REC: [(f64, f64, f64, f64, f64, f64); 36] = [
+        (0.0, 73.9, 131.22, 1.65, 0.14, 0.004),
+        (0.4, 72.9, 132.07, 1.55, -0.67, -0.045),
+        (0.8, 71.8, 133.34, 1.56, -1.96, -0.094),
+        (1.2, 70.8, 133.78, 1.74, -2.52, -0.102),
+        (1.6, 68.8, 136.47, 2.15, -5.44, -0.257),
+        (2.0, 66.7, 137.92, 2.70, -7.19, -0.305),
+        (2.5, 66.0, 136.75, 3.40, -6.34, -0.229),
+        (2.8, 64.5, 134.53, 4.07, -4.43, -0.166),
+        (3.3, 62.6, 132.86, 4.71, -3.03, -0.160),
+        (3.6, 60.5, 132.71, 5.31, -3.15, -0.219),
+        (4.1, 58.3, 133.85, 5.87, -4.51, -0.304),
+        (4.4, 56.2, 135.59, 6.34, -6.47, -0.405),
+        (4.8, 53.9, 136.96, 6.87, -8.11, -0.463),
+        (5.2, 51.4, 137.45, 7.53, -8.98, -0.485),
+        (5.6, 49.2, 136.96, 8.16, -8.89, -0.492),
+        (6.1, 46.5, 135.41, 8.97, -7.89, -0.490),
+        (6.5, 44.2, 134.09, 9.62, -7.04, -0.510),
+        (6.9, 42.2, 133.30, 10.14, -6.59, -0.552),
+        (7.3, 39.6, 132.86, 10.67, -6.61, -0.600),
+        (7.7, 37.1, 132.88, 11.09, -6.67, -0.631),
+        (8.1, 34.6, 133.05, 11.39, -6.84, -0.671),
+        (8.5, 32.0, 133.04, 11.63, -6.80, -0.686),
+        (8.9, 29.5, 132.63, 11.84, -6.36, -0.662),
+        (9.3, 27.4, 132.04, 11.98, -5.72, -0.624),
+        (9.7, 25.0, 131.27, 12.06, -4.85, -0.575),
+        (10.1, 22.8, 130.56, 12.07, -4.03, -0.527),
+        (10.6, 20.3, 129.81, 12.01, -3.12, -0.472),
+        (11.0, 18.2, 129.16, 11.91, -2.32, -0.417),
+        (11.4, 15.8, 128.43, 11.76, -1.41, -0.349),
+        (11.8, 13.9, 127.83, 11.61, -0.69, -0.291),
+        (12.2, 11.5, 127.09, 11.42, 0.21, -0.216),
+        (12.6, 9.5, 126.42, 11.25, 0.99, -0.149),
+        (13.0, 7.1, 125.61, 11.07, 1.90, -0.074),
+        (13.4, 5.1, 124.91, 10.95, 2.65, -0.010),
+        (13.9, 3.2, 124.19, 10.85, 3.39, 0.039),
+        (14.2, 0.6, 123.26, 10.79, 4.32, 0.147),
+    ];
+    /// LEMG 13's true course: the first tick's heading plus its error plus
+    /// the cut its 1.65 m asked (131.22 + 0.14 + 0.33).
+    const COURSE: f64 = 131.69;
+    const TICK_S: f64 = 0.4;
+    const CHANNEL_DEAD_S: f64 = 0.3;
+    const YAW_LAG_S: f64 = 0.5;
+
+    /// Column `i` of the record at `t`, linear between ticks.
+    fn at(t: f64, i: usize) -> f64 {
+        let col = |r: &(f64, f64, f64, f64, f64, f64)| match i {
+            1 => r.1,
+            2 => r.2,
+            _ => r.3,
+        };
+        if t <= REC[0].0 {
+            return col(&REC[0]);
+        }
+        for w in REC.windows(2) {
+            if (w[0].0..=w[1].0).contains(&t) {
+                let f = (t - w[0].0) / (w[1].0 - w[0].0);
+                return col(&w[0]) + f * (col(&w[1]) - col(&w[0]));
+            }
+        }
+        col(&REC[REC.len() - 1])
+    }
+
+    /// The rollout from the first tick to the stop with the brakes split by
+    /// the law (or not), `authority` deg/s of yaw per unit of brake
+    /// difference at the wheels. The worst cross-track, metres.
+    fn roll(authority: f64, split: bool) -> f64 {
+        let end = REC[REC.len() - 1].0;
+        let dt = 0.01;
+        let (mut t, mut next) = (0.0, 0.0);
+        let (mut dpsi, mut yaw, mut dx) = (0.0_f64, 0.0_f64, 0.0_f64);
+        let mut rate = crate::autotakeoff::XtkRate::default();
+        let mut prev: Option<f64> = None;
+        let mut law = RolloutBrakeSteer::default();
+        let mut written: Vec<(f64, f64)> = vec![(-10.0, 0.0)];
+        let mut worst: f64 = 0.0;
+        while t < end {
+            let gs = at(t, 1);
+            if t + 1e-9 >= next {
+                next += TICK_S;
+                let x = at(t, 3) + dx;
+                let r = rate.update(prev.map_or(0.0, |p| (x - p) / TICK_S), TICK_S);
+                prev = Some(x);
+                let target = crate::autotakeoff::roll_target_heading(COURSE, x, r, gs);
+                let psi = at(t, 2) + dpsi;
+                let err = ((target - psi + 540.0).rem_euclid(360.0)) - 180.0;
+                let brake = rollout_brake_ratio(gs, 0.0, 2500.0);
+                let b = if split {
+                    law.step(err, TICK_S, gs, brake)
+                } else {
+                    RolloutBrakes {
+                        sym: brake,
+                        left: 0.0,
+                        right: 0.0,
+                    }
+                };
+                // The plugin: each wheel the harder of the pair.
+                let diff = b.sym.max(b.right) - b.sym.max(b.left);
+                written.push((t, diff));
+            }
+            let arriving = written
+                .iter()
+                .take_while(|(tw, _)| *tw <= t - CHANNEL_DEAD_S + 1e-9)
+                .last()
+                .map_or(0.0, |w| w.1);
+            yaw += (authority * arriving - yaw) * dt / YAW_LAG_S;
+            dpsi += yaw * dt;
+            dx += gs * 0.514_444 * dpsi.to_radians().sin() * dt;
+            worst = worst.max((at(t, 3) + dx).abs());
+            t += dt;
+        }
+        worst
+    }
+
+    /// As flown the record is the plant: 12.1 m right. Split by the law the
+    /// brakes hold the same rollout inside 2.6 m at every authority from 15
+    /// to 60 deg/s per unit, and inside 3.5 m at 10 and 90 (3.1 and 3.3; the start is 1.65 m off).
+    #[test]
+    fn the_sr22_rollout_steers_on_its_brakes() {
+        let flown = roll(30.0, false);
+        assert!((flown - 12.07).abs() < 0.1, "as flown: {flown:.2}");
+        for a in [15.0, 20.0, 30.0, 45.0, 60.0] {
+            let w = roll(a, true);
+            assert!(w < 2.6, "{a} deg/s per unit: {w:.2} m");
+        }
+        for a in [10.0, 90.0] {
+            let w = roll(a, true);
+            assert!(w < 3.5, "{a} deg/s per unit: {w:.2} m");
+        }
+    }
+
+    /// The law: nose right of the target is the left wheel, the difference
+    /// taken off the outside wheel so the stop is kept, capped, damped on
+    /// the error's rate; nothing below 4 kt or on an unread heading.
+    #[test]
+    fn a_rollout_brake_split_keeps_the_stop() {
+        let mut law = RolloutBrakeSteer::default();
+        let b = law.step(-5.0, 0.4, 60.0, 0.24);
+        assert!((b.left - 0.315).abs() < 1e-9, "{b:?}");
+        assert!((b.sym - 0.165).abs() < 1e-9, "{b:?}");
+        assert_eq!(b.right, 0.0);
+        // The error closing at 5 deg/s leads it off.
+        let b = law.step(-3.0, 0.4, 60.0, 0.24);
+        assert!(b.right > 0.0 && b.left == 0.0, "{b:?}");
+        // Capped at 0.3 of difference.
+        let mut law = RolloutBrakeSteer::default();
+        let b = law.step(40.0, 0.4, 60.0, 0.24);
+        assert!((b.right - b.sym - 0.3).abs() < 1e-9, "{b:?}");
+        // A light stop cannot go below zero on the outside wheel.
+        let mut law = RolloutBrakeSteer::default();
+        let b = law.step(40.0, 0.4, 60.0, 0.05);
+        assert_eq!(b.sym, 0.0);
+        assert!((b.right - 0.2).abs() < 1e-9, "{b:?}");
+        // Slow, or no heading: the plain stop.
+        let mut law = RolloutBrakeSteer::default();
+        let plain = RolloutBrakes {
+            sym: 0.24,
+            left: 0.0,
+            right: 0.0,
+        };
+        assert_eq!(law.step(-5.0, 0.4, 3.0, 0.24), plain);
+        assert_eq!(law.step(f64::NAN, 0.4, 60.0, 0.24), plain);
     }
 }

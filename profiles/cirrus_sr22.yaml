@@ -117,6 +117,47 @@ flaps:
     - { label: "50", spoken: fifty percent, ratio: 0.5, vfe_kts: 150.0 }
     - { label: full, spoken: full,          ratio: 1.0, vfe_kts: 110.0 }
 
+# THE FLARE (issue #166; LEMG 13, sortie 1790619465, 2026-09-28): on the
+# 172's tracker this elevator answers hard and late. The arrest took the
+# servos at 51 ft sinking 476 fpm, pulled 0.14 and had the sink at +10 by
+# 45 ft, then PUSHED 0.10 (the roundout is free both ways) and the sink
+# rebuilt to -471 at 28 ft; the same again to -52; then the flare's full
+# 0.35 at 22 ft met the step to idle a dead time later (-528 at 12 ft),
+# ballooned to +298 at 22 ft, was let go to neutral in one tick, and the
+# sink it rebuilt met the runway at -585 fpm (575 on the scorecard).
+# Fitted with the servos out to that arrest and flare (38 ticks, 39 fpm
+# rms, the lever and the speed carried as the plant's own terms): 10,000 fpm
+# of standing sink per unit of pull through two 1.45 s lags after 0.9 s of
+# dead time; at idle with full flap the speed bleeds 2.7 kt a second, and
+# each knot lost is about 115 fpm more sink. So:
+#   * the arrest is flown on a model of this elevator, as the SF50's and the
+#     737's are, declared under every fit's gain but the arrest's (6,000
+#     through 1.0 s lags after 0.8 s) so it pulls for the weakest;
+#   * the lever stays at approach power through the flare until a second
+#     from the wheels, then walks off at 0.03 a second (a float still takes
+#     it off): cut at the flare gate, the lift the flare flies on has gone
+#     before the column's dead time is out.
+# Through every fitted plant from five gates: every calm landing under 300
+# fpm (the worst 273; the fitted model 291), under 400 in 40 fpm rms of
+# gusts (353); the model with the lever cut at the gate past 300, the
+# tracker as flown past 400 (1,267, a float that stalled onto the runway).
+# VERIFY: blackbox `flare_ask`, `flare_unexplained`, `flare_elev` against
+# `vvi` from `arrest_hands`, the `power` events' `retard` key, and the
+# landing's `sink_fpm` under 300.
+flare_elevator:
+  gain: 1.0
+  max: 0.35
+  max_push: 0.05
+  balloon_ease_per_s: 0.15
+  model:
+    fpm_per_elevator: 6000.0
+    lag_s: 1.0
+    dead_s: 0.8
+flare_power:
+  reduction_per_second: 0.03
+  retard_max_per_s: 0.03
+  retard_at_s: 1.0
+
 # XChecklist file to interpret (GoofyJP, read-only).
 # Taxi steering. The nosewheel CASTORS: the yoke-heading channel (nosewheel
 # + rudder) has only prop wash behind it at taxi speed, and measured over the
