@@ -23,10 +23,10 @@ use sim::xplane::SimView;
 // `party_line`'s accessors, never these statics.
 pub use crate::party_line::RegionHandoff;
 pub(crate) use crate::party_line::{
-    ARRIVAL_PIN, ASSIGNED_SQUAWK, CLEARANCE, DEPARTURE_HANDOFF, IFR_CLEARANCE, IFR_FLIGHT,
-    IfrFlight, LANDING_HANDOFF, LINE_UP_CONDITION,
-    PENDING_GO_AROUND, PENDING_LINE_UP, PENDING_STATION, PENDING_TAKEOFF_CLEARANCE, REGION_HANDOFF,
-    SQUAWK_NUDGE, TAKEOFF_HOLD, TAXI_ROUTE, TAXI_TO_STAND, VECTORS, ZONE_CHALLENGE,
+    IfrFlight, ARRIVAL_PIN, ASSIGNED_SQUAWK, CLEARANCE, DEPARTURE_HANDOFF, GO_AROUND_ORDERS,
+    IFR_CLEARANCE, IFR_FLIGHT, LANDING_HANDOFF, LINE_UP_CONDITION, PENDING_GO_AROUND,
+    PENDING_LINE_UP, PENDING_STATION, PENDING_TAKEOFF_CLEARANCE, REGION_HANDOFF, SQUAWK_NUDGE,
+    TAKEOFF_HOLD, TAXI_ROUTE, TAXI_TO_STAND, VECTORS, ZONE_CHALLENGE,
 };
 
 // The airline telephony and the ghost speaker live with the callsign
@@ -4837,6 +4837,8 @@ pub fn go_around_tick(
     // is shouting go around (seen live, 2026-07-14). The sync is handed to
     // the main loop, which owns the `Station`, same as the hold release.
     *PENDING_GO_AROUND.lock().unwrap_or_else(|e| e.into_inner()) = true;
+    // ...and the order itself, for every crew loop that flies it.
+    GO_AROUND_ORDERS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     Some(if tuned {
         ComplianceCall {
             line: format!(
@@ -8203,6 +8205,71 @@ mod tests {
         assert_eq!(st.twr.state, tower::State::Parked);
 
         *GHOSTS.lock().unwrap() = None;
+        *ACTIVE_RUNWAYS.lock().unwrap() = Vec::new();
+        *CLEARANCE.lock().unwrap() = None;
+    }
+
+    /// The order reaches every loop that flies it, whoever reads first. LEMG
+    /// 31 (sortie 1790584715-full_auto, 2026-09-28): the order at t
+    /// 1790585525.5 was taken by the main loop's FSM sync (the clearance went
+    /// ClearedToLand to Inbound at 1527.1) and the circuit flying the final
+    /// never saw it; autoland, armed at 1555.6, drained the flag at its arm.
+    /// The one flag had two consumers and the main loop's ~150 ms poll beat
+    /// autoland's ~400 ms tick every time: no `ordered_go_around` in the logs.
+    #[test]
+    fn a_go_around_order_reaches_every_loop_that_flies_it() {
+        let _guard = SIDE_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // LEMG 13/31, the recorded clearance: runway 31, cleared to land.
+        *ACTIVE_RUNWAYS.lock().unwrap() = vec![nav::Runway {
+            width_m: 45.0,
+            surface: 1,
+            ident_a: "13".into(),
+            ident_b: "31".into(),
+            lat_a: 36.6853,
+            lon_a: -4.5093,
+            lat_b: 36.6653,
+            lon_b: -4.4833,
+        }];
+        *GO_AROUND_LAST.lock().unwrap() = None;
+        *PENDING_GO_AROUND.lock().unwrap() = false;
+        *CLEARANCE.lock().unwrap() = Some(ClearanceSnap {
+            state: tower::State::ClearedToLand,
+            callsign: "November eight one six November November".into(),
+            runway_ident: "31".into(),
+            pending_readback: None,
+            holds_runway: false,
+        });
+        // A departure on the far end of the same strip.
+        let on_the_strip = TcasTarget {
+            callsign: "VLG8176".into(),
+            lat: 36.6803,
+            lon: -4.5028,
+            ele_ft: 50.0,
+            on_ground: true,
+            vs_fpm: 0.0,
+        };
+        // Armed before the order: the circuit's watch and autoland's.
+        let mut circuit = crate::party_line::GoAroundOrders::arm();
+        let mut autoland = crate::party_line::GoAroundOrders::arm();
+        let call = go_around_tick(
+            std::slice::from_ref(&on_the_strip),
+            736.0,
+            false,
+            true,
+            Instant::now(),
+        )
+        .expect("the recorded order");
+        assert!(call.line.contains("report downwind"), "{}", call.line);
+        // The main loop syncs the FSM first, as it did live...
+        assert!(crate::party_line::take_pending_go_around());
+        // ...and both loops still see the order, once each.
+        assert!(circuit.take(), "the circuit flying the final sees it");
+        assert!(!circuit.take(), "once");
+        assert!(autoland.take(), "a second reader is not robbed");
+        // A loop armed after the order does not fly an old one.
+        let mut later = crate::party_line::GoAroundOrders::arm();
+        assert!(!later.take());
+        *GO_AROUND_LAST.lock().unwrap() = None;
         *ACTIVE_RUNWAYS.lock().unwrap() = Vec::new();
         *CLEARANCE.lock().unwrap() = None;
     }
