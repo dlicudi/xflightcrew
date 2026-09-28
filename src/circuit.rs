@@ -53,6 +53,7 @@ const CMD_VS_MODE: &str = "sim/autopilot/vertical_speed";
 const VS_DIAL: &str = "sim/cockpit/autopilot/vertical_velocity";
 const HDG_BUG: &str = "sim/cockpit2/autopilot/heading_dial_deg_mag_pilot";
 const HDG_STATUS: &str = "sim/cockpit2/autopilot/heading_status";
+const SERVOS_ON: &str = sim::datarefs::SERVOS_ON;
 const VS_STATUS: &str = "sim/cockpit2/autopilot/vvi_status";
 const IAS: &str = "sim/flightmodel/position/indicated_airspeed";
 /// Gear handle — the circuit lowers it turning base (autoland's own
@@ -1640,6 +1641,256 @@ impl Closure {
     }
 }
 
+/// The leg's altitude target (MSL): the pattern altitude, the downwind's
+/// descent from abeam the touchdown point, base and final's path. Pure; the
+/// descent is ratcheted through `descent_target`.
+pub fn leg_target_ft(
+    leg: Leg,
+    a_m: f64,
+    field_elev_ft: f64,
+    tpa_msl_ft: f64,
+    downwind_past_m: f64,
+    descent_target: &mut Option<f64>,
+) -> f64 {
+    match leg {
+        // Abeam the touchdown point and later, START DOWN: the 180, where
+        // a real pattern reduces power. Holding TPA to the base turn left
+        // the whole descent to one short leg it could not fit (see
+        // DOWNWIND_DESCENT_AGL_FT). Deliberately a FLAT target and not the
+        // path: the path's distance term here is the Manhattan
+        // |along| + |across|, which on an OUTBOUND downwind shrinks as the
+        // aircraft flies away from the runway and would ratchet us down to
+        // a few hundred feet while still abeam. Ratcheted like base, so it
+        // can only ever descend.
+        Leg::Downwind if a_m < 0.0 => {
+            let want = (field_elev_ft + DOWNWIND_DESCENT_AGL_FT).min(tpa_msl_ft);
+            let t = descent_target.map_or(want, |d: f64| d.min(want));
+            *descent_target = Some(t);
+            t
+        }
+        // Base and final descend the 3 degree PATH, not to a flat height.
+        Leg::Base | Leg::Final => {
+            // ...and RATCHETED: an approach descends. Whatever the geometry
+            // does mid-turn, the target may fall and hold, never climb back:
+            // a target that rises is a level-off with the runway ahead, and
+            // the aircraft chases it every time.
+            let want = approach_leg_alt_ft(
+                field_elev_ft,
+                tpa_msl_ft,
+                path_dist_m(leg, a_m, downwind_past_m),
+            );
+            let t = descent_target.map_or(want, |d: f64| d.min(want));
+            *descent_target = Some(t);
+            t
+        }
+        _ => {
+            *descent_target = None;
+            tpa_msl_ft
+        }
+    }
+}
+
+/// Higher than this over the pattern altitude is not a pattern (#160).
+/// LEMG 13 SF50 (sortie 1790607325): nothing was flying the aircraft, and
+/// the circuit rode it from the 1,606 ft pattern to 21,900 ft in circles for
+/// 14 minutes, the leg ticks writing VS -500 and a bug on the nose the whole
+/// way. At this margin it gives up at 3,100 ft, 42 s after the takeoff.
+pub const PATTERN_CEILING_MARGIN_FT: f64 = 1500.0;
+/// The margin must hold this long: one frame's glitch is not a climb-away.
+pub const PATTERN_GUARD_SUSTAIN_S: f64 = 3.0;
+/// A leg lasting this many times its flown length at the pattern speed, plus
+/// [`LEG_TIME_MARGIN_S`], is a pattern that is not being flown: that downwind
+/// ran 778 s, until the sortie ended, against its 244 s (limit 669).
+pub const LEG_TIME_FACTOR: f64 = 2.5;
+pub const LEG_TIME_MARGIN_S: f64 = 60.0;
+/// The servos out this long: someone took the autopilot out, or it dropped
+/// out. The circuit's knobs mean nothing without it.
+pub const SERVOS_OFF_S: f64 = 3.0;
+
+/// Why the circuit gave the aircraft back (blackbox `pattern_guard`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum PatternTrip {
+    /// Above the pattern altitude by `above_ft` for [`PATTERN_GUARD_SUSTAIN_S`].
+    AbovePattern { above_ft: f64 },
+    /// On one leg `secs` against a `limit_s`.
+    LegOverdue { leg: Leg, secs: f64, limit_s: f64 },
+    /// The servos read out for `secs`.
+    ServosOff { secs: f64 },
+}
+
+impl PatternTrip {
+    /// The blackbox's `why`.
+    pub fn why(&self) -> &'static str {
+        match self {
+            PatternTrip::AbovePattern { .. } => "above_pattern",
+            PatternTrip::LegOverdue { .. } => "leg_overdue",
+            PatternTrip::ServosOff { .. } => "servos_off",
+        }
+    }
+
+    /// The first half of the spoken give-up. No dashes (TTS).
+    pub fn words(&self) -> String {
+        match self {
+            PatternTrip::AbovePattern { above_ft } => format!(
+                "Circuit abandoned, {:.0} feet above pattern height.",
+                (above_ft / 100.0).round() * 100.0
+            ),
+            PatternTrip::LegOverdue { leg, secs, .. } => format!(
+                "Circuit abandoned, {} for {:.0} minutes.",
+                format!("{leg:?}").to_lowercase(),
+                (secs / 60.0).max(1.0).round()
+            ),
+            PatternTrip::ServosOff { .. } => "The autopilot is off. Circuit cancelled.".into(),
+        }
+    }
+}
+
+/// How long `leg` may take before [`PatternGuard`] calls it overdue: its
+/// length in the pattern's own geometry plus its turn, flown at the pattern
+/// speed, times [`LEG_TIME_FACTOR`], plus [`LEG_TIME_MARGIN_S`]. Pure.
+pub fn leg_limit_s(leg: Leg, g: &Geometry, runway_len_m: f64, pattern_kts: f64) -> f64 {
+    let radius = g.lead_m / 0.9;
+    let turn = std::f64::consts::FRAC_PI_2 * radius;
+    let upwind = runway_len_m.max(0.0) + g.upwind_past_m;
+    let dist = match leg {
+        Leg::Upwind => upwind + turn,
+        Leg::Crosswind | Leg::Base => g.width_m + turn,
+        Leg::Downwind => upwind + g.downwind_past_m + 2.0 * turn,
+        Leg::Final => g.downwind_past_m + turn,
+    };
+    let mps = pattern_kts.max(40.0) * 0.514_444;
+    LEG_TIME_FACTOR * dist / mps + LEG_TIME_MARGIN_S
+}
+
+/// The circuit's own give-up (#160): the aircraft far above the pattern, a
+/// leg that never ends, or the servos out. Fed every tick; a failed read is
+/// no measurement and changes no clock. Pure.
+#[derive(Debug, Default, Clone)]
+pub struct PatternGuard {
+    leg: Option<Leg>,
+    leg_t0: f64,
+    above_since: Option<f64>,
+    servos_off_since: Option<f64>,
+}
+
+impl PatternGuard {
+    /// `pattern_ft` is the height the pattern is flying to (the pattern
+    /// altitude, or a terrain floor over it); `servos` the servos' reading.
+    pub fn step(
+        &mut self,
+        now_s: f64,
+        leg: Leg,
+        alt_msl_ft: f64,
+        pattern_ft: f64,
+        leg_limit_s: f64,
+        servos: Option<bool>,
+    ) -> Option<PatternTrip> {
+        if self.leg != Some(leg) {
+            self.leg = Some(leg);
+            self.leg_t0 = now_s;
+        }
+        if alt_msl_ft.is_finite() && pattern_ft.is_finite() {
+            let above_ft = alt_msl_ft - pattern_ft;
+            if above_ft > PATTERN_CEILING_MARGIN_FT {
+                let since = *self.above_since.get_or_insert(now_s);
+                if now_s - since >= PATTERN_GUARD_SUSTAIN_S {
+                    return Some(PatternTrip::AbovePattern { above_ft });
+                }
+            } else {
+                self.above_since = None;
+            }
+        }
+        match servos {
+            Some(false) => {
+                let since = *self.servos_off_since.get_or_insert(now_s);
+                if now_s - since >= SERVOS_OFF_S {
+                    return Some(PatternTrip::ServosOff {
+                        secs: now_s - since,
+                    });
+                }
+            }
+            Some(true) => self.servos_off_since = None,
+            None => {}
+        }
+        let secs = now_s - self.leg_t0;
+        (leg_limit_s.is_finite() && secs > leg_limit_s).then_some(PatternTrip::LegOverdue {
+            leg,
+            secs,
+            limit_s: leg_limit_s,
+        })
+    }
+}
+
+/// Hand the aircraft back FLYABLE and say so loudly. Wings to the heading
+/// flown and VS 0 on an autopilot we own (the servos in if they read out),
+/// the speed to the governor at `hold_kts`; a pilot's disconnect is left
+/// alone. Only what reads back is claimed.
+#[allow(clippy::too_many_arguments)]
+async fn give_up_pattern(
+    xp: &XPlaneClient,
+    base_url: &str,
+    voice: &Option<Voice>,
+    trip: PatternTrip,
+    leg: Leg,
+    alt_msl_ft: f64,
+    pattern_ft: f64,
+    mag_var: f64,
+    hold_kts: f64,
+) {
+    ACTIVE.store(false, Ordering::SeqCst);
+    let psi = xp.get_float(PSI_TRUE).await.ok().filter(|v| v.is_finite());
+    let hdg_mag = psi.map(|p| true_to_mag(p, mag_var).round().rem_euclid(360.0));
+    let ours = !matches!(trip, PatternTrip::ServosOff { .. });
+    if ours {
+        let servos = xp.get_float(SERVOS_ON).await.ok();
+        if servos.is_some_and(|v| v < 0.5) {
+            let _ = xp.run_command(CMD_SERVOS_ON).await;
+        }
+        if let Some(h) = hdg_mag {
+            write_bug(xp, h).await;
+        }
+        if xp.get_float(VS_STATUS).await.is_ok_and(|v| v <= 0.5) {
+            let _ = xp.run_command(CMD_VS_MODE).await;
+        }
+        let _ = xp.set_float(VS_DIAL, 0.0).await;
+    }
+    let (servos_after, hdg_st, vs_st) = tokio::join!(
+        xp.get_float(SERVOS_ON),
+        xp.get_float(HDG_STATUS),
+        xp.get_float(VS_STATUS)
+    );
+    let holding = ours
+        && [&servos_after, &hdg_st, &vs_st]
+            .iter()
+            .all(|r| r.as_ref().is_ok_and(|v| *v > 0.5));
+    let (leg_secs, limit_s, above_ft) = match trip {
+        PatternTrip::LegOverdue { secs, limit_s, .. } => (Some(secs), Some(limit_s), None),
+        PatternTrip::AbovePattern { above_ft } => (None, None, Some(above_ft)),
+        PatternTrip::ServosOff { secs } => (Some(secs), None, None),
+    };
+    crate::blackbox::record(
+        "circuit",
+        serde_json::json!({
+            "event": "pattern_guard", "why": trip.why(), "leg": format!("{leg:?}"),
+            "alt_msl": alt_msl_ft, "pattern_ft": pattern_ft, "above_ft": above_ft,
+            "secs": leg_secs, "limit_s": limit_s, "hdg_mag": hdg_mag,
+            "servos_after": servos_after.ok(), "holding": holding, "hold_kts": hold_kts,
+        }),
+    );
+    let tail = match (holding, hdg_mag) {
+        (true, Some(h)) => format!("Autopilot on heading {h:03.0}, levelling off. Your aircraft."),
+        (true, None) => "Autopilot levelling off. Your aircraft.".to_string(),
+        (false, _) if ours => "The autopilot is not flying it. Your aircraft.".to_string(),
+        (false, _) => "Your aircraft.".to_string(),
+    };
+    alert(
+        voice,
+        Priority::Warning,
+        &format!("{} {tail}", trip.words()),
+    );
+    crate::tools::speedhold::arm_flight(base_url.to_string(), voice.clone(), hold_kts);
+}
+
 /// The next leg in sequence, or `None` past Final.
 pub fn next_leg(leg: Leg) -> Option<Leg> {
     match leg {
@@ -2911,6 +3162,8 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, p: Params
     // The pattern's knob from here on (`BugHold`, issue #93).
     let mut bug_hold = BugHold::default();
     let loop_t0 = std::time::Instant::now();
+    // The pattern's own give-up (#160).
+    let mut pattern_guard = PatternGuard::default();
     // Forward terrain guard cadence + throttle; a fired guard raises the
     // vertical target floor for a while instead of pressing dead buttons.
     let mut tick: u32 = 0;
@@ -2995,12 +3248,13 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, p: Params
         let elev_m = sim::position::field(&pos, |p| p.elev_m);
         let psi_r = sim::position::field(&pos, |p| p.psi_true_deg);
         let thr_dref = throttle_dref();
-        let (ias_r, thr_r, dial_r, alt_hold_r, phi_r) = tokio::join!(
+        let (ias_r, thr_r, dial_r, alt_hold_r, phi_r, servos_r) = tokio::join!(
             xp.get_float(IAS),
             xp.get_float(&thr_dref),
             xp.get_float(ALT_DIAL),
             xp.get_float(ALT_HOLD_STATUS),
             xp.get_float(PHI),
+            xp.get_float(SERVOS_ON),
         );
         let (Ok(lat), Ok(lon)) = (lat, lon) else {
             continue;
@@ -3274,42 +3528,14 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, p: Params
             alert(&voice, Priority::Advisory, "Gear down.");
             gear_lowered = true;
         }
-        let leg_target = match leg {
-            // Abeam the touchdown point and later, START DOWN — the 180, where
-            // a real pattern reduces power. Holding TPA to the base turn left
-            // the whole descent to one short leg it could not fit (see
-            // DOWNWIND_DESCENT_AGL_FT). Deliberately a FLAT target and not the
-            // path: the path's distance term here is the Manhattan
-            // |along| + |across|, which on an OUTBOUND downwind shrinks as the
-            // aircraft flies away from the runway and would ratchet us down to
-            // a few hundred feet while still abeam. Ratcheted like base, so it
-            // can only ever descend.
-            Leg::Downwind if a_m < 0.0 => {
-                let want = (field_elev_ft + DOWNWIND_DESCENT_AGL_FT).min(tpa_msl_ft);
-                let t = descent_target.map_or(want, |d: f64| d.min(want));
-                descent_target = Some(t);
-                t
-            }
-            // Base and final descend the 3° PATH, not to a flat height.
-            Leg::Base | Leg::Final => {
-                // ...and RATCHETED: an approach descends. Whatever the
-                // geometry does mid-turn, the target may fall and hold, never
-                // climb back — a target that rises is a level-off with the
-                // runway ahead, and the aircraft chases it every time.
-                let want = approach_leg_alt_ft(
-                    field_elev_ft,
-                    tpa_msl_ft,
-                    path_dist_m(leg, a_m, geom.downwind_past_m),
-                );
-                let t = descent_target.map_or(want, |d: f64| d.min(want));
-                descent_target = Some(t);
-                t
-            }
-            _ => {
-                descent_target = None;
-                tpa_msl_ft
-            }
-        };
+        let leg_target = leg_target_ft(
+            leg,
+            a_m,
+            field_elev_ft,
+            tpa_msl_ft,
+            geom.downwind_past_m,
+            &mut descent_target,
+        );
         // The guard floor never applies on base/final: descending toward the
         // runway is the POINT there, and autoland brings its own terrain
         // floor. A ridge-probe floor that lingered into base handed autoland
@@ -3320,6 +3546,33 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, p: Params
         } else {
             guard_floor_ft.map_or(leg_target, |(f, _)| leg_target.max(f))
         };
+        // Still a pattern (#160): not far above it, no leg without end, an
+        // autopilot in. Else the aircraft goes back, flyable and said loudly.
+        let pattern_ft = tpa_msl_ft.max(target_alt);
+        let servos = servos_r
+            .as_ref()
+            .ok()
+            .filter(|v| v.is_finite())
+            .map(|v| *v > 0.5);
+        if let Some(trip) = pattern_guard.step(
+            loop_t0.elapsed().as_secs_f64(),
+            leg,
+            alt_msl_ft,
+            pattern_ft,
+            leg_limit_s(leg, &geom, rwy.length_m, pattern_kts),
+            servos,
+        ) {
+            let hold_kts = crate::autoland::hand_back_speed_kts(
+                p_approach_ias,
+                last_flap.unwrap_or(0.0),
+                &crate::aircraft::flap_limits(),
+            );
+            give_up_pattern(
+                &xp, &base_url, &voice, trip, leg, alt_msl_ft, pattern_ft, mag_var, hold_kts,
+            )
+            .await;
+            return;
+        }
         // Vertical speed, derived from successive altitude reads (the same
         // trick the speed law uses on IAS) — the lead term the capture needs.
         if alt_msl_ft.is_finite() {
@@ -6150,6 +6403,483 @@ mod issue_150_climb_out_tests {
                 "{:.1} ({tag})",
                 new.min_ias
             );
+        }
+    }
+}
+
+/// The SF50's LEMG 13 circuit (sortie 1790607325, 2026-09-28, issue #160):
+/// the recorded ticks through the circuit's give-up, and this sortie's
+/// handoff flown through a fitted autopilot plant.
+#[cfg(test)]
+mod pattern_guard_tests {
+    use super::*;
+    use serde_json::Value;
+
+    const SORTIE: &str = include_str!("../bench/sorties/1790607325-full_auto.trimmed.jsonl");
+    /// The sortie's begin.
+    const T0: f64 = 1790607325.1;
+    /// As armed: LEMG 13, left hand, raised for terrain.
+    const FIELD_FT: f64 = 48.0;
+    const COURSE: f64 = 131.685_387_322_115_45;
+    const RWY_LEN_M: f64 = 3200.0;
+    /// The SF50's numbers as the profile gives them to the circuit.
+    const VY: f64 = 120.0;
+    const VAPP: f64 = 87.0;
+    const VS_CLEAN: f64 = 80.0;
+
+    fn recs() -> Vec<Value> {
+        SORTIE
+            .lines()
+            .filter_map(|l| serde_json::from_str(l).ok())
+            .collect()
+    }
+
+    fn is(r: &Value, kind: &str, event: &str) -> bool {
+        r["kind"] == kind && r["event"] == event
+    }
+
+    fn num(r: &Value, k: &str) -> f64 {
+        r[k].as_f64().unwrap_or(f64::NAN)
+    }
+
+    fn leg_of(r: &Value) -> Leg {
+        match r["leg"].as_str().unwrap_or("") {
+            "Upwind" => Leg::Upwind,
+            "Crosswind" => Leg::Crosswind,
+            "Downwind" => Leg::Downwind,
+            "Base" => Leg::Base,
+            _ => Leg::Final,
+        }
+    }
+
+    fn armed() -> Value {
+        recs()
+            .into_iter()
+            .find(|r| is(r, "circuit", "armed"))
+            .unwrap()
+    }
+
+    fn pattern_kts() -> f64 {
+        pattern_speed_kts(VY, VAPP, Some(VS_CLEAN))
+    }
+
+    /// The geometry the circuit armed, from the same functions.
+    fn geometry() -> Geometry {
+        let gs_est = VY * 0.514_444 * 1.1;
+        Geometry::for_radii(
+            turn_radius_m(gs_est),
+            final_turn_radius_m(approach_leg_kts(pattern_kts(), VAPP)),
+        )
+    }
+
+    #[test]
+    fn the_armed_pattern_is_rebuilt_from_its_numbers() {
+        let a = armed();
+        let g = geometry();
+        assert_eq!(pattern_kts(), 120.0);
+        assert!((g.width_m - num(&a, "width_m")).abs() < 1.0, "{g:?} {a}");
+        assert!((g.downwind_past_m - num(&a, "downwind_past_m")).abs() < 1.0);
+        assert!((g.final_capture_m - num(&a, "radius_m")).abs() < 1.0);
+        assert_eq!(a["left"], true);
+        // The recorded legs changed where this geometry says they do.
+        let legs: Vec<Value> = recs()
+            .into_iter()
+            .filter(|r| is(r, "circuit", "leg"))
+            .collect();
+        for w in legs.windows(2) {
+            let (was, now) = (leg_of(&w[0]), leg_of(&w[1]));
+            if was != now {
+                assert!(
+                    pattern_advance(
+                        was,
+                        num(&w[0], "a_m"),
+                        num(&w[0], "x_m"),
+                        &g,
+                        RWY_LEN_M,
+                        true
+                    ),
+                    "{was:?} -> {now:?} at {}",
+                    w[0]
+                );
+            }
+        }
+        // Upwind 405 s, crosswind 405 s, downwind 669 s, at 120 kt.
+        let lim = |l| leg_limit_s(l, &g, RWY_LEN_M, pattern_kts()).round();
+        assert_eq!(lim(Leg::Upwind), 348.0);
+        assert_eq!(lim(Leg::Crosswind), 348.0);
+        assert_eq!(lim(Leg::Downwind), 669.0);
+    }
+
+    /// Replayed through the guard, the recorded circuit is given back at
+    /// 3,302 ft, 1,695 over its pattern on the crosswind, 46 s after the
+    /// takeoff handed it over; it flew on to 21,882 ft for 14 more minutes. With the height guard blind the
+    /// downwind is called overdue at +976 s, before the sortie's end.
+    #[test]
+    fn the_recorded_climb_away_is_given_back_at_the_pattern_margin() {
+        let all = recs();
+        let a = armed();
+        let tpa = num(&a, "tpa_msl_ft");
+        let g = geometry();
+        let handoff = all
+            .iter()
+            .find(|r| is(r, "circuit", "takeoff_handoff"))
+            .unwrap();
+        let handoff_s = num(handoff, "t") - T0;
+        let legs: Vec<&Value> = all.iter().filter(|r| is(r, "circuit", "leg")).collect();
+        let fly = |blind: bool| {
+            let mut guard = PatternGuard::default();
+            for r in &legs {
+                let (now, leg) = (num(r, "t") - T0, leg_of(r));
+                let pattern = if blind {
+                    f64::NAN
+                } else {
+                    tpa.max(num(r, "target_alt"))
+                };
+                let limit = leg_limit_s(leg, &g, RWY_LEN_M, pattern_kts());
+                if let Some(trip) = guard.step(now, leg, num(r, "alt_msl"), pattern, limit, None) {
+                    return Some((now, leg, num(r, "alt_msl"), trip));
+                }
+            }
+            None
+        };
+        let (at, leg, alt, trip) = fly(false).expect("given back");
+        println!(
+            "tripped +{at:.1} s ({:.1} s after the handoff) on {leg:?} at {alt:.0} ft: {trip:?}",
+            at - handoff_s
+        );
+        let PatternTrip::AbovePattern { above_ft } = trip else {
+            panic!("{trip:?}")
+        };
+        assert!((1500.0..1750.0).contains(&above_ft), "{above_ft}");
+        assert!(at - handoff_s < 50.0, "{}", at - handoff_s);
+        assert!(alt < 3350.0, "{alt}");
+        assert_eq!(leg, Leg::Crosswind);
+        assert_eq!(
+            trip.words(),
+            "Circuit abandoned, 1700 feet above pattern height."
+        );
+        let top = all
+            .iter()
+            .filter(|r| r["kind"] == "state")
+            .map(|r| num(r, "agl"))
+            .fold(0.0, f64::max);
+        assert!(top > 21_800.0, "the recording went on to {top:.0}");
+        // The backstop: a downwind that never ends.
+        let (at, leg, _, trip) = fly(true).expect("overdue");
+        println!("blind: +{at:.1} s {leg:?} {trip:?}");
+        assert_eq!(leg, Leg::Downwind);
+        let PatternTrip::LegOverdue { secs, limit_s, .. } = trip else {
+            panic!("{trip:?}")
+        };
+        assert!(secs > limit_s && secs < limit_s + 5.0, "{secs} {limit_s}");
+        let end = all.iter().find(|r| is(r, "sortie", "end")).unwrap();
+        assert!(at < num(end, "t") - T0, "inside the sortie");
+        assert!((950.0..1000.0).contains(&at), "{at}");
+    }
+
+    /// The servos out is the pilot's disconnect or a dropout: given back
+    /// after [`SERVOS_OFF_S`]; a failed read starts and stops no clock; the
+    /// height guard needs its margin held, not one frame of it.
+    #[test]
+    fn the_guard_needs_its_evidence_held() {
+        let mut g = PatternGuard::default();
+        let step = |g: &mut PatternGuard, t: f64, alt: f64, servos: Option<bool>| {
+            g.step(t, Leg::Downwind, alt, 1600.0, 600.0, servos)
+        };
+        assert_eq!(step(&mut g, 0.0, 1600.0, Some(false)), None);
+        assert_eq!(step(&mut g, 2.0, 1600.0, None), None);
+        assert_eq!(step(&mut g, 2.9, 1600.0, Some(false)), None);
+        assert!(matches!(
+            step(&mut g, 3.0, 1600.0, Some(false)),
+            Some(PatternTrip::ServosOff { .. })
+        ));
+        let mut g = PatternGuard::default();
+        assert_eq!(step(&mut g, 0.0, 1600.0, Some(false)), None);
+        assert_eq!(step(&mut g, 2.0, 1600.0, Some(true)), None);
+        assert_eq!(
+            step(&mut g, 4.0, 1600.0, Some(false)),
+            None,
+            "the clock restarted"
+        );
+        // One frame over the margin is no climb-away; a failed read neither
+        // starts nor clears it.
+        let mut g = PatternGuard::default();
+        assert_eq!(step(&mut g, 0.0, 3200.0, Some(true)), None);
+        assert_eq!(step(&mut g, 1.0, 1700.0, Some(true)), None);
+        assert_eq!(step(&mut g, 2.0, 3200.0, Some(true)), None);
+        assert_eq!(step(&mut g, 4.0, f64::NAN, Some(true)), None);
+        assert!(matches!(
+            step(&mut g, 5.0, 3200.0, Some(true)),
+            Some(PatternTrip::AbovePattern { .. })
+        ));
+        // A leg's clock restarts on every leg, a go-around's upwind included.
+        let mut g = PatternGuard::default();
+        assert_eq!(g.step(0.0, Leg::Final, 800.0, 1600.0, 100.0, None), None);
+        assert_eq!(g.step(90.0, Leg::Upwind, 800.0, 1600.0, 100.0, None), None);
+        assert!(g
+            .step(191.0, Leg::Upwind, 800.0, 1600.0, 100.0, None)
+            .is_some());
+    }
+
+    /// The SF50 with its autopilot IN, fitted to its 2026-09-23 ETND circuit
+    /// (VS: two lags of 1.5 s behind a dead time, 123 fpm rms over 463 s;
+    /// the heading mode banks at most 27 degrees): the circuit's own laws
+    /// through the plant, tick by tick as `fly` composes them.
+    struct Sf50 {
+        t: f64,
+        a_m: f64,
+        x_m: f64,
+        psi: f64,
+        bank: f64,
+        alt: f64,
+        x1: f64,
+        vs: f64,
+        ias: f64,
+        dead_s: f64,
+        dial: f64,
+        queue: std::collections::VecDeque<(f64, f64)>,
+    }
+
+    const LAG1_S: f64 = 1.5;
+    const LAG2_S: f64 = 1.5;
+    const MAX_BANK: f64 = 27.0;
+
+    impl Sf50 {
+        fn set_dial(&mut self, fpm: f64) {
+            self.queue.push_back((self.t + self.dead_s, fpm));
+        }
+        fn advance(&mut self, bug: f64, want_kts: f64, secs: f64) {
+            let dt = 0.05;
+            let mut left = secs;
+            while left > 1e-9 {
+                while self.queue.front().is_some_and(|&(t, _)| t <= self.t) {
+                    self.dial = self.queue.pop_front().map_or(self.dial, |(_, v)| v);
+                }
+                self.x1 += (self.dial - self.x1) * dt / LAG1_S;
+                self.vs += (self.x1 - self.vs) * dt / LAG2_S;
+                self.alt += self.vs / 60.0 * dt;
+                let err = (bug - self.psi + 540.0).rem_euclid(360.0) - 180.0;
+                let want = (err * 1.5).clamp(-MAX_BANK, MAX_BANK);
+                self.bank += (want - self.bank).clamp(-5.0 * dt, 5.0 * dt);
+                self.ias += (want_kts - self.ias) * dt / 10.0;
+                let v = self.ias * 0.514_444;
+                let rate = (9.81 * self.bank.to_radians().tan() / v).to_degrees();
+                self.psi = (self.psi + rate * dt).rem_euclid(360.0);
+                let rel = (self.psi - COURSE).to_radians();
+                self.a_m += v * rel.cos() * dt;
+                self.x_m += v * rel.sin() * dt;
+                self.t += dt;
+                left -= dt;
+            }
+        }
+    }
+
+    struct Flown {
+        legs: Vec<(Leg, f64)>,
+        max_alt: f64,
+        downwind_alt: (f64, f64),
+        handed_over: Option<f64>,
+        turned_deg: f64,
+        max_bank: f64,
+        tripped: Option<PatternTrip>,
+    }
+
+    /// From this sortie's handoff (the first circuit tick's position, height,
+    /// heading and speed; the climb flown, 2,778 fpm, and the dial the
+    /// takeoff left, 1,500) to the handover onto final.
+    fn fly_circuit(dead_s: f64) -> Flown {
+        let all = recs();
+        let a = armed();
+        let tpa = num(&a, "tpa_msl_ft");
+        let g = geometry();
+        let first = all.iter().find(|r| is(r, "circuit", "leg")).unwrap();
+        let climb = all
+            .iter()
+            .rev()
+            .find(|r| is(r, "autotakeoff", "climb"))
+            .unwrap();
+        let handoff = all
+            .iter()
+            .find(|r| is(r, "circuit", "takeoff_handoff"))
+            .unwrap();
+        let mut p = Sf50 {
+            t: num(first, "t") - T0,
+            a_m: num(first, "a_m"),
+            x_m: num(first, "x_m"),
+            psi: num(first, "psi"),
+            bank: 0.0,
+            alt: num(first, "alt_msl"),
+            x1: num(climb, "vs"),
+            vs: num(climb, "vs"),
+            ias: num(first, "ias"),
+            dead_s,
+            dial: num(handoff, "vs_cmd"),
+            queue: Default::default(),
+        };
+        let kts = pattern_kts();
+        let approach_kts = approach_leg_kts(kts, VAPP);
+        let floor = climb_floor_kts(None, Some(VS_CLEAN));
+        let mut leg = Leg::Upwind;
+        let mut bug = COURSE;
+        let mut knob = COURSE;
+        let mut hold = BugHold::default();
+        let mut carry = ClimbCarry::new(Some(num(handoff, "vs_cmd")));
+        let mut descent_target = None;
+        let mut guard = PatternGuard::default();
+        let (mut vs_est, mut prev_alt) = (p.vs, p.alt);
+        let (mut closure, mut prev_along) = (0.0, p.a_m);
+        let mut last_vs: Option<f64> = None;
+        let mut turning_final = false;
+        let t0 = p.t;
+        let mut out = Flown {
+            legs: vec![(leg, 0.0)],
+            max_alt: p.alt,
+            downwind_alt: (f64::INFINITY, f64::NEG_INFINITY),
+            handed_over: None,
+            turned_deg: 0.0,
+            max_bank: 0.0,
+            tripped: None,
+        };
+        let tick = 0.6;
+        let mut psi_was = p.psi;
+        while p.t - t0 < 900.0 {
+            let now = p.t - t0;
+            let trk_err = (p.psi - COURSE + 540.0).rem_euclid(360.0) - 180.0;
+            if turning_final && ready_for_autoland(p.x_m, p.a_m.abs(), trk_err, p.ias, None) {
+                out.handed_over = Some(now);
+                break;
+            }
+            let leg_hdg = match leg {
+                Leg::Final => final_intercept_hdg(COURSE, p.x_m),
+                _ => leg_heading(COURSE, leg, true),
+            };
+            bug = bug_toward(bug, leg_hdg, p.psi, p.bank, BUG_SLEW_PER_TICK);
+            let db = if leg == Leg::Final {
+                CIRCUIT_FINAL_DEADBAND
+            } else {
+                CIRCUIT_LEG_DEADBAND
+            };
+            if let Some(b) = hold.decide(leg as u32, bug, now, db) {
+                knob = b.round();
+            }
+            if let Some(s) = hold.set() {
+                bug = s;
+            }
+            let target = leg_target_ft(
+                leg,
+                p.a_m,
+                FIELD_FT,
+                tpa,
+                g.downwind_past_m,
+                &mut descent_target,
+            );
+            if let Some(trip) = guard.step(
+                now,
+                leg,
+                p.alt,
+                tpa.max(target),
+                leg_limit_s(leg, &g, RWY_LEN_M, kts),
+                Some(true),
+            ) {
+                out.tripped = Some(trip);
+                break;
+            }
+            vs_est = 0.6 * vs_est + 0.4 * (p.alt - prev_alt) / tick * 60.0;
+            prev_alt = p.alt;
+            let closing = (prev_along.abs() - p.a_m.abs()) / tick * 1.943_844;
+            closure = (0.6 * closure + 0.4 * closing).clamp(0.0, 400.0);
+            prev_along = p.a_m;
+            let rate = if leg == Leg::Final {
+                path_descent_fpm(closure)
+            } else {
+                0.0
+            };
+            let want = alt_capture_vs(target, rate, p.alt, vs_est);
+            let want_kts = if matches!(leg, Leg::Base | Leg::Final) {
+                approach_kts
+            } else {
+                kts
+            };
+            let law = climb_limit_fpm(
+                want,
+                p.ias,
+                0.0,
+                climb_full_rate_kts(want_kts, VY, floor),
+                floor,
+            );
+            let cmd = carry.step(
+                law,
+                tick,
+                matches!(leg, Leg::Base | Leg::Final),
+                p.ias <= floor,
+            );
+            if last_vs.is_none_or(|v| (v - cmd).abs() > 40.0) {
+                p.set_dial(cmd);
+                last_vs = Some(cmd);
+            }
+            if leg == Leg::Downwind && p.a_m >= 0.0 && now > 120.0 {
+                out.downwind_alt.0 = out.downwind_alt.0.min(p.alt);
+                out.downwind_alt.1 = out.downwind_alt.1.max(p.alt);
+            }
+            if pattern_advance(leg, p.a_m, p.x_m, &g, RWY_LEN_M, true) {
+                if let Some(n) = next_leg(leg) {
+                    leg = n;
+                    out.legs.push((leg, now));
+                    turning_final |= leg == Leg::Final;
+                }
+            }
+            p.advance(knob, want_kts, tick);
+            out.max_alt = out.max_alt.max(p.alt);
+            out.max_bank = out.max_bank.max(p.bank.abs());
+            out.turned_deg += ((p.psi - psi_was + 540.0).rem_euclid(360.0) - 180.0).abs();
+            psi_was = p.psi;
+        }
+        out
+    }
+
+    /// With the autopilot flying, the same handoff levels at the pattern
+    /// height, turns crosswind, downwind and base, and hands over on final:
+    /// one lap of turning, never the ten the recording flew, through the
+    /// fitted dead time and either side of it.
+    #[test]
+    fn with_the_servos_in_the_sf50_levels_and_turns_base() {
+        let tpa = num(&armed(), "tpa_msl_ft");
+        for dead in [1.0, 2.5, 4.0] {
+            let f = fly_circuit(dead);
+            println!(
+                "dead {dead}: legs {:?}, max {:.0} ft (tpa {tpa:.0}), downwind {:.0}..{:.0}, \
+                 handed over +{:?} s, turned {:.0} deg, bank {:.1}, tripped {:?}",
+                f.legs,
+                f.max_alt,
+                f.downwind_alt.0,
+                f.downwind_alt.1,
+                f.handed_over,
+                f.turned_deg,
+                f.max_bank,
+                f.tripped
+            );
+            assert_eq!(f.tripped, None, "dead {dead}");
+            let names: Vec<Leg> = f.legs.iter().map(|(l, _)| *l).collect();
+            assert_eq!(
+                names,
+                [
+                    Leg::Upwind,
+                    Leg::Crosswind,
+                    Leg::Downwind,
+                    Leg::Base,
+                    Leg::Final
+                ],
+                "dead {dead}"
+            );
+            assert!(f.handed_over.is_some(), "dead {dead}");
+            assert!(f.max_alt < tpa + 150.0, "dead {dead}: {:.0}", f.max_alt);
+            assert!(
+                (f.downwind_alt.0 - tpa).abs() < 100.0 && (f.downwind_alt.1 - tpa).abs() < 100.0,
+                "dead {dead}: downwind {:?}",
+                f.downwind_alt
+            );
+            assert!(f.turned_deg < 450.0, "dead {dead}: {:.0}", f.turned_deg);
+            assert!(f.max_bank <= MAX_BANK + 0.1);
         }
     }
 }

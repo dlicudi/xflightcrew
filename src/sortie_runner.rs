@@ -1295,6 +1295,8 @@ impl CaseMachine {
         let outcome = st(r, "outcome").to_string();
         let stages = std::mem::take(&mut self.stages);
         let crashed = r.get("crashed").and_then(Value::as_bool) == Some(true);
+        // Ended in the air: never finished, whoever's words flew it (#160).
+        let airborne = r.get("ended_airborne").and_then(Value::as_bool) == Some(true);
         let why_of = |s: &Value| -> Vec<String> {
             s.get("why")
                 .and_then(Value::as_array)
@@ -1342,6 +1344,7 @@ impl CaseMachine {
             && commands > 0
             && own_words
             && !crashed
+            && !airborne
             && failed.is_empty()
             && !stages.is_empty()
             && outcome != "gave_up"
@@ -1356,6 +1359,9 @@ impl CaseMachine {
         if !pass {
             if crashed {
                 why.push("the aircraft crashed".into());
+            }
+            if airborne && !crashed {
+                why.push("it ended in the air".into());
             }
             if let Some(e) = expected_why {
                 why.push(e);
@@ -3215,6 +3221,19 @@ mod tests {
         // No script, a command: attended, as before.
         let v = run(0, 1, true);
         assert!(!v.pass && v.reason.starts_with("attended"), "{v:?}");
+        // Ended in the air (#160): the script's words never make that a pass.
+        let mut m = CaseMachine::new(0.0, 900.0);
+        m.pending_steps = 1;
+        m.feed(&rec(0.5, "tool", json!({"name": "full_auto"})));
+        m.feed(&begin(1.0, "s"));
+        m.note_step_sent(10.0, "line 0");
+        m.feed(&consumed(10.1, "line 0"));
+        m.feed(&landing("s", true));
+        let mut r = result(60.0, "s", false, "ended", 1);
+        r["ended_airborne"] = json!(true);
+        let v = finished(m.feed(&r));
+        assert!(!v.pass, "{v:?}");
+        assert_eq!(v.reason, "it ended in the air");
     }
 
     /// A rejected takeoff is meant to end full auto: that give-up passes,

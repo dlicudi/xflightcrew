@@ -475,6 +475,34 @@ impl Scorer {
                 self.contact_tick(r, t);
             }
             ("state", _) => self.state_tick(r, t, &mut out),
+            // The circuit gave the aircraft back as no pattern (#160): far
+            // above its height, a leg without end, the servos out.
+            ("circuit", "pattern_guard") => {
+                let why = match s(r, "why") {
+                    "above_pattern" => format!(
+                        "{:.0} ft above the pattern on the {}",
+                        f(r, "above_ft").unwrap_or(0.0),
+                        s(r, "leg").to_lowercase()
+                    ),
+                    "leg_overdue" => format!(
+                        "{} for {:.0} s against {:.0}",
+                        s(r, "leg").to_lowercase(),
+                        f(r, "secs").unwrap_or(0.0),
+                        f(r, "limit_s").unwrap_or(0.0)
+                    ),
+                    "servos_off" => "the autopilot's servos went out".to_string(),
+                    other => format!("gave up: {other}"),
+                };
+                let sortie = self.sortie.clone();
+                self.push(
+                    "circuit",
+                    sortie,
+                    vec![why],
+                    json!({ "leg": s(r, "leg"), "alt_msl": f(r, "alt_msl"),
+                            "pattern_ft": f(r, "pattern_ft") }),
+                    &mut out,
+                );
+            }
             ("full_auto", _) if s(r, "stage") == "give_up" => {
                 if self.roll.is_some() {
                     self.close_roll(Some("give_up"), &mut out);
@@ -548,10 +576,18 @@ impl Scorer {
                 // flew a 737 into the ground 8.8 nm short of LEMG 12, the
                 // runner's "my controls" ended the sortie 0.1 s before the
                 // impact record, and it was written `pass: true, stages: 0`.
+                // A mission that ends in the air never finished: the SF50
+                // circuit 1790607325 climbed away from its downwind to
+                // 21,900 ft, the deadline ended it there, and it was written
+                // PASS on its alignment and takeoff (#160). Every mission
+                // this scores (full auto, the approach, the helicopter route)
+                // ends on the ground.
+                let ended_airborne = self.airborne_since.is_some();
                 let pass = failed.is_empty()
                     && unattended
                     && s(r, "outcome") != "gave_up"
                     && !self.crashed
+                    && !ended_airborne
                     && !self.results.is_empty();
                 let mut v = json!({
                     "outcome": s(r, "outcome"),
@@ -563,6 +599,7 @@ impl Scorer {
                     "commands": self.commands,
                     "unattended": unattended,
                     "crashed": self.crashed,
+                    "ended_airborne": ended_airborne,
                     "pass": pass,
                 });
                 if let (Some(o), Some(id)) = (v.as_object_mut(), self.sortie.clone()) {
@@ -976,7 +1013,7 @@ pub fn line(v: &Value) -> String {
         })
         .collect();
         return format!(
-            "SORTIE {}: {} stages, {}, {} interventions{}, {} commands, {}, outcome {}{}",
+            "SORTIE {}: {} stages, {}, {} interventions{}, {} commands, {}, outcome {}{}{}",
             if v.get("pass").and_then(Value::as_bool) == Some(true) { "PASS" } else { "FAIL" },
             n("stages"),
             if failed.is_empty() {
@@ -994,6 +1031,11 @@ pub fn line(v: &Value) -> String {
             },
             s(v, "outcome"),
             if v.get("crashed").and_then(Value::as_bool) == Some(true) { ", crashed" } else { "" },
+            if v.get("ended_airborne").and_then(Value::as_bool) == Some(true) {
+                ", ended airborne"
+            } else {
+                ""
+            },
         );
     }
     format!(
@@ -1562,9 +1604,11 @@ mod tests {
         let sortie = card.iter().find(|v| s(v, "kind") == "sortie_result").unwrap();
         assert_eq!(sortie["stages"], 0);
         assert_eq!(sortie["pass"], false, "nothing scored, nothing proved: {sortie}");
+        // Its last state was 47 ft up: it ended in the air, too (#160).
         assert_eq!(
             line(sortie),
-            "SORTIE FAIL: 0 stages, none failed, 0 interventions, 0 commands, unattended, outcome ended"
+            "SORTIE FAIL: 0 stages, none failed, 0 interventions, 0 commands, unattended, \
+             outcome ended, ended airborne"
         );
 
         let taxi_sortie = |before: Option<Value>, during: Option<Value>| {
@@ -1693,5 +1737,87 @@ mod tests {
         assert_eq!(l.len(), 1, "{card:?}");
         assert_eq!(l[0]["t_touchdown"], 40.0);
         assert_eq!(l[0]["pass"], true);
+    }
+
+    /// The SF50's LEMG 13 circuit (1790607325, 2026-09-28, #160), trimmed
+    /// to 1,279 of its 2,252 records (every circuit tick to +320 s and every
+    /// fifth after, the state records cut to what the scorer reads, api_load
+    /// and duty dropped). Nothing flew the aircraft from 300 ft: it climbed
+    /// in circles to 21,882 ft and the deadline ended the sortie there. Live
+    /// it was written PASS on its alignment and takeoff.
+    const LEMG_SF50_CIRCUIT: &str =
+        include_str!("../bench/sorties/1790607325-full_auto.trimmed.jsonl");
+
+    #[test]
+    fn a_mission_that_ends_in_the_air_never_passes() {
+        let recs = records(LEMG_SF50_CIRCUIT);
+        let live = recs
+            .iter()
+            .find(|r| s(r, "kind") == "sortie_result")
+            .unwrap();
+        assert_eq!(live["pass"], true, "the verdict that hid it");
+        let card = score_all(recs.iter());
+        let text = block(&card);
+        print!("{text}");
+        assert_eq!(
+            text,
+            "  Mission 1790607325-full_auto:\n\
+             \x20   alignment pass\n\
+             \x20   takeoff   pass\n\
+             \x20   SORTIE FAIL: 2 stages, none failed, \
+             0 interventions, 0 commands, unattended, outcome ended, ended airborne\n"
+        );
+        let sortie = card.last().unwrap();
+        assert_eq!(sortie["ended_airborne"], true);
+        let top = recs
+            .iter()
+            .filter(|r| s(r, "kind") == "state")
+            .filter_map(|r| f(r, "agl"))
+            .fold(0.0, f64::max);
+        assert!(top > 21_800.0, "{top}");
+        // With the circuit's own guard it gives the aircraft back at the
+        // pattern's margin, and says so as a failed stage.
+        let body: Vec<Value> = recs
+            .iter()
+            .filter(|r| !matches!(s(r, "kind"), "sortie" | "sortie_result" | "stage_result"))
+            .filter(|r| f(r, "t").is_some_and(|t| t < 1790607590.0))
+            .cloned()
+            .collect();
+        let mut guarded = vec![
+            json!({"t": 1790607325.1, "kind": "sortie", "event": "begin",
+                                      "label": "full_auto", "sortie": "1790607325-full_auto"}),
+        ];
+        guarded.extend(body);
+        guarded.push(
+            json!({"t": 1790607593.6, "kind": "circuit", "event": "pattern_guard",
+                            "why": "above_pattern", "leg": "Crosswind", "above_ft": 1695.2,
+                            "alt_msl": 3301.5, "pattern_ft": 1606.3,
+                            "sortie": "1790607325-full_auto"}),
+        );
+        let end = json!({"t": 1790607600.0, "kind": "sortie", "event": "end",
+                         "outcome": "ended", "sortie": "1790607325-full_auto"});
+        let mut given_back = guarded.clone();
+        given_back.push(end.clone());
+        let card = score_all(given_back.iter());
+        let circuit = card.iter().find(|v| s(v, "stage") == "circuit").unwrap();
+        assert_eq!(circuit["pass"], false);
+        assert_eq!(
+            circuit["why"][0],
+            "1695 ft above the pattern on the crosswind"
+        );
+        assert_eq!(card.last().unwrap()["pass"], false);
+        assert_eq!(card.last().unwrap()["ended_airborne"], true);
+        // The ground clears it: a mission that ends on its wheels is judged
+        // on its stages as before.
+        let mut landed = guarded;
+        landed.push(
+            json!({"t": 1790607595.0, "kind": "state", "ground": true, "agl": 0.0,
+                           "vsi": 0.0, "hdg": 130.0, "track": 130.0, "crashed": false}),
+        );
+        landed.push(end);
+        assert_eq!(
+            score_all(landed.iter()).last().unwrap()["ended_airborne"],
+            false
+        );
     }
 }
