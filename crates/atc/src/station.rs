@@ -697,7 +697,10 @@ impl Station {
                 // zone clearance capped them at two thousand, and "radar
                 // contact" alone left "climbing five thousand" unanswered
                 // (LXGB, 2026-09-15).
-                return match climb_announced(transcript) {
+                let cap = self.filed_cruise_ft();
+                return match climb_announced(transcript)
+                    .map(|alt| capped_departure_climb(&alt, cap, ctx.transition_level_ft))
+                {
                     Some(alt) => format!(
                         "{}, {} {position}, radar contact, climb {alt}.",
                         ctx.callsign, ctx.airport
@@ -1327,6 +1330,20 @@ impl Station {
     /// would assign), the code already held otherwise. A reissued clearance
     /// supersedes the published one until it is read back. `None` = the
     /// destination is unknown to the index.
+    /// The cruise level this flight FILED, feet: the accepted IFR
+    /// clearance's destination and this field's filed route to it. `None`
+    /// without a clearance, a filed route or a filed level.
+    fn filed_cruise_ft(&self) -> Option<i64> {
+        let dest = IFR_CLEARANCE
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()?
+            .dest
+            .clone();
+        let (_, apt) = self.procedures.as_ref()?;
+        crate::party_line::filed_route_for(apt, &dest)?.cruise_ft
+    }
+
     fn ifr_offer(&mut self, dest: &str, ctx: &tower::Ctx) -> Option<tower::IfrOffer> {
         let (icao, name, dest_pos) = resolve_destination(dest)?;
         let runway = self.runway_in_use.clone().unwrap_or_default();
@@ -4488,6 +4505,41 @@ const FINAL_NM: f64 = 4.0;
 /// (fail toward caution). A ghost lifting off Malaga runway 30 read as
 /// "traffic on short final" to the runway 12 incursion watch, 2026-07-12.
 const CLIMBOUT_FPM: f64 = 300.0;
+
+/// The climb departure gives a check-in: the one it announced, never above
+/// the FILED cruise (`cap`, feet). EGKK-EGBB (sortie 1790601822-full_auto,
+/// 2026-09-28, #155): filed FL180, the crew announced "climbing flight level
+/// two two zero" (HEME1B's HEMEL window on its legs) and departure cleared
+/// FL220. A level departure cannot hear, or no cap, stands as announced. The
+/// cap is said as the announcement said its level: a flight level at or
+/// above the field's transition level, or when the field has none and the
+/// crew said one.
+pub fn capped_departure_climb(
+    announced: &str,
+    cap: Option<i64>,
+    transition_level_ft: Option<f64>,
+) -> String {
+    let (Some(heard), Some(cap)) = (
+        tower::heard_altitude_ft(announced),
+        cap.filter(|c| *c > 0),
+    ) else {
+        return announced.to_string();
+    };
+    if heard <= cap {
+        return announced.to_string();
+    }
+    let level = atis::is_flight_level(cap as f64, transition_level_ft)
+        || (transition_level_ft.is_none() && announced.to_lowercase().contains("flight level"));
+    sim::blackbox::record(
+        "atc",
+        serde_json::json!({"event": "climb_capped", "announced_ft": heard, "cleared_ft": cap}),
+    );
+    if level {
+        atis::spoken_flight_level(cap as f64)
+    } else {
+        atis::spoken_alt(cap as f64)
+    }
+}
 
 /// The altitude a departure check-in announces ("passing one thousand
 /// climbing five thousand" gives "five thousand"), for the controller to
@@ -11928,6 +11980,37 @@ mod tests {
         assert_eq!(arrival_end(&both, &runways, 11.0).as_deref(), Some("27"));
     }
 
+    /// Issue #155, sortie 1790601822-full_auto (EGKK-EGBB, 2026-09-28): the
+    /// check-in at +1209.7 "passing four thousand seven hundred climbing
+    /// flight level two two zero" earned "radar contact, climb flight level
+    /// two two zero" on a plan filed at FL180 (`initial_altitude` 18000).
+    /// Departure clears no higher than the filed cruise; at or under it, or
+    /// with nothing filed, the announced climb stands.
+    #[test]
+    fn departure_clears_no_higher_than_the_filed_cruise() {
+        let heard = "london gatwick departure, whiskey alpha tango six two six, passing four \
+                     thousand seven hundred climbing flight level two two zero";
+        let announced = climb_announced(heard).expect("a climb");
+        assert_eq!(announced, "flight level two two zero");
+        // EGKK's transition level unknown to the test: the crew's own form.
+        assert_eq!(
+            capped_departure_climb(&announced, Some(18_000), None),
+            "flight level one eight zero"
+        );
+        assert_eq!(
+            capped_departure_climb(&announced, Some(18_000), Some(7_000.0)),
+            "flight level one eight zero"
+        );
+        assert_eq!(capped_departure_climb(&announced, None, None), announced);
+        assert_eq!(capped_departure_climb(&announced, Some(24_000), None), announced);
+        assert_eq!(capped_departure_climb("five thousand", Some(18_000), None), "five thousand");
+        // Below the transition level a capped climb is feet.
+        assert_eq!(
+            capped_departure_climb("seven thousand", Some(4_000), Some(6_000.0)),
+            crate::atis::spoken_alt(4_000.0)
+        );
+    }
+
     #[test]
     fn the_climb_announced_is_what_departure_clears() {
         assert_eq!(
@@ -15058,6 +15141,7 @@ mod tests {
             dest: "LEMD".into(),
             fixes: vec!["SMIDX".into(), "STHXX".into(), "ENRTE".into()],
             sid: None,
+            cruise_ft: None,
         })
     }
 
@@ -15067,6 +15151,7 @@ mod tests {
             dest: "LEMD".into(),
             fixes: vec!["ENRTE".into()],
             sid: None,
+            cruise_ft: None,
         })
     }
 

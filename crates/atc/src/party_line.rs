@@ -119,6 +119,9 @@ pub struct FiledRoute {
     pub fixes: Vec<String>,
     /// The SID the plan was filed with, when it names one.
     pub sid: Option<String>,
+    /// The filed cruise level, feet: no controller clears the departure
+    /// higher (`station::capped_departure_climb`). `None` when not filed.
+    pub cruise_ft: Option<i64>,
 }
 
 /// Register the crew's provider of [`FiledRoute`]. Called once at boot.
