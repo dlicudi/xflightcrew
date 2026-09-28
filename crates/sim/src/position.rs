@@ -276,7 +276,10 @@ mod tests {
         let p = read(&fake).await.unwrap();
         assert_eq!(p, sample());
         let (lat, lon, src) = read_lat_lon(&fake).await.unwrap();
-        assert_eq!((lat, lon, src), (sample().lat, sample().lon, Source::Plugin));
+        assert_eq!(
+            (lat, lon, src),
+            (sample().lat, sample().lon, Source::Plugin)
+        );
     }
 
     /// An older plugin: the stock datarefs, read as they always were, and the
@@ -287,10 +290,16 @@ mod tests {
         split_reads(&fake);
         let p = read(&fake).await.unwrap();
         assert_eq!(p.source, Source::Split);
-        assert_eq!((p.lat, p.lon, p.psi_true_deg, p.gs_ms), (51.15, -0.19, 77.5, 40.0));
+        assert_eq!(
+            (p.lat, p.lon, p.psi_true_deg, p.gs_ms),
+            (51.15, -0.19, 77.5, 40.0)
+        );
         assert_eq!((p.elev_m, p.vs_fpm, p.agl_m), (60.0, 0.0, 1.9));
         assert_eq!(p.frame, None);
-        assert_eq!(read_lat_lon(&fake).await.unwrap(), (51.15, -0.19, Source::Split));
+        assert_eq!(
+            read_lat_lon(&fake).await.unwrap(),
+            (51.15, -0.19, Source::Split)
+        );
         // A plugin that has not copied a frame yet is the same fallback.
         let mut unready = encode(&sample());
         unready[..8].copy_from_slice(&0.0_f64.to_le_bytes());

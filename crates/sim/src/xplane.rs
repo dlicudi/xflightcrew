@@ -499,7 +499,12 @@ impl XPlaneClient {
         })
         .await?;
 
-        let Some(id) = index.data.into_iter().find(|d| d.name == name).map(|d| d.id) else {
+        let Some(id) = index
+            .data
+            .into_iter()
+            .find(|d| d.name == name)
+            .map(|d| d.id)
+        else {
             if optional {
                 ABSENT
                     .lock()
@@ -1462,11 +1467,7 @@ mod failure_sequences {
     /// request; a second would fail differently).
     #[tokio::test]
     async fn a_missing_optional_plugin_dataref_is_asked_once_then_remembered() {
-        let (base, server) = server(vec![reply(
-            "GET /api/v1/datarefs?",
-            200,
-            r#"{"data":[]}"#,
-        )]);
+        let (base, server) = server(vec![reply("GET /api/v1/datarefs?", 200, r#"{"data":[]}"#)]);
         let xp = XPlaneClient::new(base);
         let first = xp.get_bytes("xcopilot/position").await.unwrap_err();
         assert!(first.to_string().contains("not found"), "{first:#}");

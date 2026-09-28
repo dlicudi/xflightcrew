@@ -1956,14 +1956,15 @@ async fn drive(xp: XPlaneClient, voice: Option<Voice>, route: Route, base_kts: f
         // One read burst, not a chain: sequential HTTP awaits stretched the
         // takeoff tick to half a second and bought a slew-limit weave
         // (sortie four) — the same medicine here keeps the steer tick honest.
-        let (yield_r, lat_r, lon_r, psi_r, gs_r, tug_r) = tokio::join!(
+        // Position, heading and groundspeed as ONE frame saw them (#157).
+        let (yield_r, pos, tug_r) = tokio::join!(
             xp.get_float(STEER_YIELD),
-            xp.get_float(LAT),
-            xp.get_float(LON),
-            xp.get_float(PSI_TRUE),
-            xp.get_float(GS_MS),
+            sim::position::read(&xp),
             xp.get_float(TUG_ATTACHED),
         );
+        let (lat_r, lon_r) = sim::position::lat_lon(&pos);
+        let psi_r = sim::position::field(&pos, |p| p.psi_true_deg);
+        let gs_r = sim::position::field(&pos, |p| p.gs_ms);
         let tug_on = tug_r.is_ok_and(|v| v > 0.5);
         if tug_on {
             let t0 = *tug_since.get_or_insert_with(std::time::Instant::now);
@@ -2372,6 +2373,8 @@ async fn drive(xp: XPlaneClient, voice: Option<Voice>, route: Route, base_kts: f
                 "turn_dps": route_turn_dps,
                 "steer": steer, "lat_m": offset, "remaining_m": remaining, "trim": trim,
                 "bs": bs_on, "bl": bl, "br": br, "tug": tug_on,
+                // "plugin": one frame's position; "split": separate reads (#157).
+                "pos": sim::position::source_word(&pos),
             }),
         );
         let steer_write = if route.pace.brake_steer || crate::aircraft::nose_castors() {
