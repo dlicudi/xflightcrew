@@ -3681,18 +3681,7 @@ pub fn sids_for_route_in<'a>(
     runway: &str,
     route: &[String],
 ) -> Vec<SidChoice> {
-    let mut idents: Vec<(String, String)> = Vec::new();
-    for line in lines.clone() {
-        let Some(body) = line.strip_prefix("SID:") else { continue };
-        let f: Vec<&str> = body.split(',').collect();
-        let (id, tr) = (cifp_field(&f, 2), cifp_field(&f, 3));
-        let serves = tr
-            .strip_prefix("RW")
-            .is_some_and(|r| runway_matches(r.trim_end_matches('B'), runway) || r.eq_ignore_ascii_case(runway));
-        if serves && !idents.iter().any(|(i, t)| i == id && t == tr) {
-            idents.push((id.to_string(), tr.to_string()));
-        }
-    }
+    let idents = sid_transitions_in(lines.clone(), runway);
     let mut out: Vec<SidChoice> = Vec::new();
     for (id, tr) in idents {
         let fixes: Vec<String> = parse_proc_legs(lines.clone(), ProcKind::Sid, &id, Some(&tr))
@@ -3726,6 +3715,71 @@ pub fn sids_for_route(cifp_dir: &str, icao: &str, runway: &str, route: &[String]
         return Vec::new();
     };
     sids_for_route_in(text.lines(), runway, route)
+}
+
+/// Every SID that serves `runway`, with its runway transition ("RW08R",
+/// "RW26B"), in file order. Pure over the CIFP file's lines.
+pub fn sid_transitions_in<'a>(lines: impl Iterator<Item = &'a str>, runway: &str) -> Vec<(String, String)> {
+    let mut idents: Vec<(String, String)> = Vec::new();
+    for line in lines {
+        let Some(body) = line.strip_prefix("SID:") else { continue };
+        let f: Vec<&str> = body.split(',').collect();
+        let (id, tr) = (cifp_field(&f, 2), cifp_field(&f, 3));
+        let serves = tr
+            .strip_prefix("RW")
+            .is_some_and(|r| runway_matches(r.trim_end_matches('B'), runway) || r.eq_ignore_ascii_case(runway));
+        if serves && !id.is_empty() && !idents.iter().any(|(i, t)| i == id && t == tr) {
+            idents.push((id.to_string(), tr.to_string()));
+        }
+    }
+    idents
+}
+
+/// [`sid_transitions_in`] from the airport's CIFP file. Empty with no file.
+pub fn sid_transitions(cifp_dir: &str, icao: &str, runway: &str) -> Vec<(String, String)> {
+    let path = std::path::Path::new(cifp_dir).join(format!("{icao}.dat"));
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    sid_transitions_in(text.lines(), runway)
+}
+
+/// The departure for a FILED route: the filed SID itself when it serves the
+/// runway and joins the route, else the best of [`sids_for_route`] (it
+/// serves the runway and joins the route furthest along, the fewest fixes
+/// on a tie). ONE rule for both sides of the frequency: the tower clears it
+/// (the station's IFR clearance) and the crew flies it
+/// (`full_auto::choose_departure` walks the same order), so a clearance is
+/// never a SID the crew cannot fly to its route. EGKK 08R (sortie
+/// 1790601822, 2026-09-28): the tower cleared KENE3P, whose exit KENET lay
+/// nearest the bearing to Birmingham, for a route filed LAM L610 HEMEL; the
+/// crew flew LAM5P. `None` when no SID off the runway meets the route.
+/// Pure over the CIFP file's lines.
+pub fn sid_for_filed_route_in<'a>(
+    lines: impl Iterator<Item = &'a str> + Clone,
+    runway: &str,
+    route: &[String],
+    filed_sid: Option<&str>,
+) -> Option<SidChoice> {
+    let mut all = sids_for_route_in(lines, runway, route);
+    let filed = filed_sid.and_then(|f| all.iter().position(|c| c.ident.eq_ignore_ascii_case(f)));
+    match filed {
+        Some(i) => Some(all.swap_remove(i)),
+        None => all.into_iter().next(),
+    }
+}
+
+/// [`sid_for_filed_route_in`] from the airport's CIFP file.
+pub fn sid_for_filed_route(
+    cifp_dir: &str,
+    icao: &str,
+    runway: &str,
+    route: &[String],
+    filed_sid: Option<&str>,
+) -> Option<SidChoice> {
+    let path = std::path::Path::new(cifp_dir).join(format!("{icao}.dat"));
+    let text = std::fs::read_to_string(path).ok()?;
+    sid_for_filed_route_in(text.lines(), runway, route, filed_sid)
 }
 
 /// An arrival procedure the crew can fly to the runway it expects, and where
@@ -4438,6 +4492,46 @@ SID:070,5,LEGL1W,RW10,LEGLO,LI,E,A,EE  ,R,010,TF, , , , , ,      ,    ,    ,    
         assert!(!ten.iter().any(|c| c.ident == "BRL2Y"), "a SID off the route never joins it");
         let twenty_eight = sids_for_route_in(text.lines(), "28", &route);
         assert_eq!(twenty_eight[0].ident, "LEGL1P");
+    }
+
+    /// The EGKK route of sortie 1790601822 (2026-09-28, #152), its navlog
+    /// from the OFP: filed LAM6M off 26L, LAM L610 HEMEL.
+    fn egkk_egbb_route() -> Vec<String> {
+        [
+            "D257B", "DET31", "DET29", "ACORN", "D258K", "TOC", "D156O", "D156J", "LAM", "HEMEL",
+            "BUZAD", "WELIN", "TOD", "PUFAX", "HON", "OSKOT", "GROVE",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect()
+    }
+
+    /// EGKK 08R, the real CIFP (X-Plane's own EGKK SIDs, trimmed to the four
+    /// that matter): KENE3P serves 08R but ends at KENET, off the filed
+    /// route; LAM5P and LAM1Z both end at LAM, and LAM5P is the shorter. The
+    /// tower cleared KENE3P (its exit nearest the bearing to Birmingham) and
+    /// the crew flew LAM5P; the one rule for both sides picks LAM5P. Off 26L
+    /// the filed LAM6M stands.
+    #[test]
+    fn the_sid_for_the_filed_route_at_egkk_is_the_one_that_reaches_lam() {
+        let text = include_str!("../bench/cifp/EGKK_sids.dat");
+        let route = egkk_egbb_route();
+        let serving: Vec<String> =
+            sid_transitions_in(text.lines(), "08R").into_iter().map(|(i, _)| i).collect();
+        assert!(serving.contains(&"KENE3P".to_string()), "KENE3P serves 08R: {serving:?}");
+        let all = sids_for_route_in(text.lines(), "08R", &route);
+        assert!(!all.iter().any(|c| c.ident == "KENE3P"), "KENE3P never joins: {all:?}");
+        let pick = sid_for_filed_route_in(text.lines(), "08R", &route, Some("LAM6M")).unwrap();
+        assert_eq!((pick.ident.as_str(), pick.join.as_str()), ("LAM5P", "LAM"));
+        // The filed SID, when it serves the runway, is the one.
+        let pick = sid_for_filed_route_in(text.lines(), "26L", &route, Some("LAM6M")).unwrap();
+        assert_eq!(pick.ident, "LAM6M");
+        // The filed SID is preferred over a shorter one that joins as far.
+        let pick = sid_for_filed_route_in(text.lines(), "08R", &route, Some("LAM1Z")).unwrap();
+        assert_eq!(pick.ident, "LAM1Z");
+        // A route no SID reaches: none, never a SID that leads elsewhere.
+        let elsewhere: Vec<String> = vec!["SAM".into(), "GWC".into()];
+        assert_eq!(sid_for_filed_route_in(text.lines(), "08R", &elsewhere, None), None);
     }
 
     use super::*;
@@ -5723,6 +5817,54 @@ STAR:030,6,ALWYS3,RW28B,ARRTU,K2,P,C,E   , ,   ,TF, , , , , ,      ,    ,    ,  
             plan.is_some_and(|p| p.path.len() >= 2),
             "a taxi back from the runway"
         );
+    }
+
+    /// #152 on the installed data (sortie 1790601822, 2026-09-28): off 08R
+    /// the exit nearest Birmingham's bearing is KENE3P's, the SID the tower
+    /// cleared; it never joins the filed LAM L610 HEMEL, and the filed
+    /// route's SID off 08R is LAM5P, the one the crew flew.
+    /// `cargo test -p atc -- --ignored real_install_egkk_08r_filed_route --nocapture`
+    #[test]
+    #[ignore] // needs the real X-Plane install; run with --ignored
+    fn real_install_egkk_08r_filed_route() {
+        let apt =
+            &crate::nav::test_xplane_path("Global Scenery/Global Airports/Earth nav data/apt.dat");
+        let (Ok(Some(egkk)), Ok(Some(egbb))) =
+            (find_airport(apt, "EGKK"), find_airport(apt, "EGBB"))
+        else {
+            return;
+        };
+        let first = |a: &str, b: &str| {
+            if std::path::Path::new(a).exists() {
+                a.to_string()
+            } else {
+                b.to_string()
+            }
+        };
+        let cifp = first(
+            &crate::nav::test_xplane_path("Custom Data/CIFP"),
+            &crate::nav::test_xplane_path("Resources/default data/CIFP"),
+        );
+        let fix = first(
+            &crate::nav::test_xplane_path("Custom Data/earth_fix.dat"),
+            &crate::nav::test_xplane_path("Resources/default data/earth_fix.dat"),
+        );
+        let navd = first(
+            &crate::nav::test_xplane_path("Custom Data/earth_nav.dat"),
+            &crate::nav::test_xplane_path("Resources/default data/earth_nav.dat"),
+        );
+        let exits = sid_exits(&cifp, &fix, &navd, &egkk, "EGKK");
+        let toward = sid_toward(&exits, "08R", egkk.position().unwrap(), egbb.position().unwrap());
+        println!("EGKK 08R toward EGBB by bearing: {toward:?}");
+        assert_eq!(toward.map(|t| t.0).as_deref(), Some("KENE3P"), "the old pick");
+        let serving = sid_transitions(&cifp, "EGKK", "08R");
+        assert!(serving.iter().any(|(i, t)| i == "KENE3P" && t == "RW08R"), "{serving:?}");
+        let route = egkk_egbb_route();
+        let all = sids_for_route(&cifp, "EGKK", "08R", &route);
+        println!("EGKK 08R SIDs joining the route: {all:?}");
+        assert!(!all.iter().any(|c| c.ident == "KENE3P"));
+        let pick = sid_for_filed_route(&cifp, "EGKK", "08R", &route, Some("LAM6M")).unwrap();
+        assert_eq!((pick.ident.as_str(), pick.join.as_str()), ("LAM5P", "LAM"));
     }
 
     #[test]

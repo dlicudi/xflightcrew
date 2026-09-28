@@ -500,6 +500,15 @@
 - {text: "speedbird 306, cancelling i f r, continuing VFR", intent: cancel_ifr, radio: true}
 - {text: "cancel ifr clearance", intent: cancel_ifr, radio: true}
 
+# --- 2026-09-28: a SID asked for by name (issue #152) ------------------------
+# EGKK 08R, sortie 1790601822: cleared KENE3P, the crew flew LAM5P without a
+# word. It now asks first; the words must parse as the request, and the
+# clearance itself (with "departure" in it) must never.
+- {text: "Whiskey Alpha Tango six two six, unable Kene three Papa, request the Lam five Papa departure", intent: request_sid, radio: true}
+- {text: "request the lambourne five papa departure", intent: request_sid, radio: true}
+- {text: "cleared to Birmingham via the Kene three Papa departure, runway zero eight right, climb five thousand feet, squawk four five four five", intent: unknown}
+- {text: "request runway two six left for departure", intent: request_runway, radio: true}
+
 # --- 2026-09-28: circuit traffic says so (issue #133) ------------------------
 # LEMG 31, sortie 1790584715: the circuit asked a plain "request taxi" and was
 # handed to Malaga Departure on the crosswind leg. "For circuits" rides the
