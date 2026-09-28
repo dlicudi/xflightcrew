@@ -545,7 +545,14 @@ pub fn landing_remark(
                 false,
             )),
             s if s < NICE_FPM && chatter == Chatter::Chatty => {
-                Some((format!("Smooth one, about {r} feet a minute."), false))
+                // A contact that rounds to nothing (t=1790530411: the vario
+                // read +48 at the wheels) has no number worth saying.
+                let line = if r < 10 {
+                    "Smooth one, barely a sink.".to_string()
+                } else {
+                    format!("Smooth one, about {r} feet a minute.")
+                };
+                Some((line, false))
             }
             _ => None,
         };
@@ -1403,7 +1410,7 @@ mod tests {
             "said +926s Back where we started.",
             "window contact_plus48",
             "touchdown +2392s sink 0 auto true airborne 2370s same_field false here 1",
-            "said +2416s Smooth one, about 0 feet a minute.",
+            "said +2416s Smooth one, barely a sink.",
             "said +2416s Forty minutes in the air.",
         ];
         assert_eq!(got, want, "{got:#?}");
