@@ -61,6 +61,9 @@ const FLAP_HANDLE: &str = "sim/cockpit2/controls/flap_ratio";
 /// conservative "positive climb, gear up, then flaps" point.
 const FLAP_RETRACT_AGL_FT: f64 = 400.0;
 const CMD_SERVOS_ON: &str = "sim/autopilot/servos_on";
+/// Servos and flight director off: an autopilot left on by the last flight.
+const CMD_AP_OFF: &str = "sim/autopilot/servos_fdir_off";
+const SERVOS_ON: &str = sim::datarefs::SERVOS_ON;
 const CMD_HDG_MODE: &str = "sim/autopilot/heading";
 const CMD_VS_MODE: &str = "sim/autopilot/vertical_speed";
 const VS_DIAL: &str = "sim/cockpit/autopilot/vertical_velocity";
@@ -2600,18 +2603,68 @@ async fn move_speed_window(
     );
 }
 
+/// An autopilot found on at the roll: its servos in, or its heading or
+/// vertical-speed mode lit. Pure.
+pub fn ap_inherited(servos: f64, heading: f64, vertical: f64) -> bool {
+    servos > 0.5 || heading > 0.5 || vertical > 0.5
+}
+
+/// A takeoff starts with the autopilot OFF, whatever the last flight left
+/// on. LEMG 13 SF50 (sortie 1790607325, issue #160): the runner loaded the
+/// SF50 onto the runway while the SR22 before it was on autoland, and the
+/// roll began with `autopilot_on` 1 and HDG and VS lit (`ap_state` 50; the 23
+/// other recorded takeoffs began with neither lit). At 300 ft the engage found both
+/// modes lit, pressed nothing, and nothing flew the aircraft: VS commanded
+/// 1,932 then 1,500 and -500 while it climbed at 2,000 to 3,400 fpm, the bug
+/// on 132 while the heading drifted to 111 and the bank grew from 1 to 45
+/// degrees left in 100 s, to 21,900 ft in circles. Servos and flight
+/// director off on the ground (the takeoff's own channels fly the roll and the
+/// rotation), read back, blackboxed `ap_inherited`; the engage at 300 ft is
+/// then the fresh engage every good takeoff made. A failed read is no
+/// measurement: nothing is written. `None` = nothing was on (or no reading).
+async fn clear_inherited_autopilot(xp: &dyn crate::xplane::XPlane) -> Option<bool> {
+    let (servos, heading, vertical) = tokio::join!(
+        xp.get_float(SERVOS_ON),
+        xp.get_float(HDG_STATUS),
+        xp.get_float(VS_STATUS)
+    );
+    let [servos, heading, vertical] =
+        crate::control::measurements("autotakeoff", [servos, heading, vertical])?;
+    if !ap_inherited(servos, heading, vertical) {
+        return None;
+    }
+    let fired = xp.run_command(CMD_AP_OFF).await.is_ok();
+    let after = xp.get_float(SERVOS_ON).await.ok();
+    let cleared = fired && after.is_some_and(|v| v < 0.5);
+    crate::blackbox::record(
+        "autotakeoff",
+        serde_json::json!({
+            "event": "ap_inherited", "servos": servos, "hdg": heading, "vs": vertical,
+            "servos_after": after, "cleared": cleared,
+        }),
+    );
+    Some(cleared)
+}
+
 /// A mode command is only a request; handoff needs live mode and dial readbacks.
+/// The SERVOS are read too: lit modes are not an autopilot flying (#160).
 async fn engage_climb(xp: &dyn crate::xplane::XPlane, vs: f64, last: &mut Option<f64>) -> bool {
     if crate::xplane::sim_frozen(xp).await {
         return false;
     }
-    let (heading, vertical) = tokio::join!(xp.get_float(HDG_STATUS), xp.get_float(VS_STATUS));
-    let Some([heading, vertical]) =
-        crate::control::measurements("autotakeoff", [heading, vertical])
+    let (heading, vertical, servos) = tokio::join!(
+        xp.get_float(HDG_STATUS),
+        xp.get_float(VS_STATUS),
+        xp.get_float(SERVOS_ON)
+    );
+    let Some([heading, vertical, servos]) =
+        crate::control::measurements("autotakeoff", [heading, vertical, servos])
     else {
         return false;
     };
-    if (heading <= 0.5 || vertical <= 0.5) && xp.run_command(CMD_SERVOS_ON).await.is_err() {
+    if (heading <= 0.5 || vertical <= 0.5 || servos <= 0.5)
+        && xp.run_command(CMD_SERVOS_ON).await.is_err()
+    {
         return false;
     }
     if heading <= 0.5 && xp.run_command(CMD_HDG_MODE).await.is_err() {
@@ -2626,8 +2679,13 @@ async fn engage_climb(xp: &dyn crate::xplane::XPlane, vs: f64, last: &mut Option
     if !crate::control::set_confirmed("autotakeoff", xp, VS_DIAL, vs, last, 40.0).await {
         return false;
     }
-    let (heading, vertical) = tokio::join!(xp.get_float(HDG_STATUS), xp.get_float(VS_STATUS));
-    matches!((heading, vertical), (Ok(h), Ok(v)) if h.is_finite() && v.is_finite() && h > 0.5 && v > 0.5)
+    let (heading, vertical, servos) = tokio::join!(
+        xp.get_float(HDG_STATUS),
+        xp.get_float(VS_STATUS),
+        xp.get_float(SERVOS_ON)
+    );
+    matches!((heading, vertical, servos), (Ok(h), Ok(v), Ok(s))
+        if h.is_finite() && v.is_finite() && s.is_finite() && h > 0.5 && v > 0.5 && s > 0.5)
 }
 
 async fn fly(xp: XPlaneClient, voice: Option<Voice>, p: Params) {
@@ -2731,6 +2789,9 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, p: Params) {
     // the handle used to be written after "Rolling", and an A330's CONF 2
     // was still running out at sixty knots (EGPF, 2026-09-21). After full
     // auto's after-start call this finds everything set and says nothing.
+    // Nothing the last flight left engaged flies this one (#160); before the
+    // configuration, which sets the flight directors an airframe declares.
+    clear_inherited_autopilot(&xp).await;
     let config =
         crate::takeoff_config::set_for_takeoff(&xp, p.takeoff_flap_ratio, p.level_ft, true).await;
     if let Some(line) = crate::takeoff_config::line("Takeoff config", &config) {
@@ -4070,6 +4131,7 @@ mod tests {
             (crate::datarefs::IS_IN_REPLAY, 0.0),
             (super::HDG_STATUS, 0.0),
             (super::VS_STATUS, 0.0),
+            (super::SERVOS_ON, 0.0),
             (super::VS_DIAL, 700.0),
         ]);
         let mut last = None;
@@ -4081,9 +4143,65 @@ mod tests {
         assert!(xp.ran(super::CMD_VS_MODE));
         xp.set_read(super::HDG_STATUS, 1.0);
         xp.set_read(super::VS_STATUS, 1.0);
+        // Lit modes with the servos out are not an autopilot flying (#160).
+        assert!(!super::engage_climb(&xp, 700.0, &mut last).await);
+        xp.set_read(super::SERVOS_ON, 1.0);
         assert!(super::engage_climb(&xp, 700.0, &mut last).await);
         xp.set_read(super::VS_STATUS, f64::NAN);
         assert!(!super::engage_climb(&xp, 700.0, &mut last).await);
+        xp.set_read(super::VS_STATUS, 1.0);
+        xp.set_read(super::SERVOS_ON, f64::NAN);
+        assert!(!super::engage_climb(&xp, 700.0, &mut last).await);
+    }
+
+    /// LEMG 13 SF50 (1790607325, #160): the roll began with HDG and VS lit
+    /// from the SR22 before it, and the 300 ft engage pressed nothing, so
+    /// nothing flew the climb. Lit modes with the servos out now press the
+    /// servos in; lit modes on the ground are taken off before the roll.
+    #[tokio::test]
+    async fn an_autopilot_left_on_is_never_taken_for_an_engage() {
+        // The engage: HDG and VS lit, servos out. The old gate read the two
+        // modes, found them on, and pressed nothing.
+        let xp = crate::xplane::FakeXPlane::with_reads(&[
+            (crate::datarefs::PAUSED, 0.0),
+            (crate::datarefs::IS_IN_REPLAY, 0.0),
+            (super::HDG_STATUS, 1.0),
+            (super::VS_STATUS, 1.0),
+            (super::SERVOS_ON, 0.0),
+            (super::VS_DIAL, 1500.0),
+        ]);
+        let mut last = None;
+        let _ = super::engage_climb(&xp, 1500.0, &mut last).await;
+        assert!(xp.ran(super::CMD_SERVOS_ON), "the servos are pressed in");
+        // A clean start (every other recorded takeoff: HDG and VS off) is
+        // left alone on the ground.
+        let clean = crate::xplane::FakeXPlane::with_reads(&[
+            (super::SERVOS_ON, 0.0),
+            (super::HDG_STATUS, 0.0),
+            (super::VS_STATUS, 0.0),
+        ]);
+        assert_eq!(super::clear_inherited_autopilot(&clean).await, None);
+        assert!(!clean.ran(super::CMD_AP_OFF));
+        // The recorded roll: ap on, HDG and VS lit.
+        let left_on = crate::xplane::FakeXPlane::with_reads(&[
+            (super::SERVOS_ON, 1.0),
+            (super::HDG_STATUS, 1.0),
+            (super::VS_STATUS, 1.0),
+        ]);
+        left_on.set_on_command(super::CMD_AP_OFF, super::SERVOS_ON, 0.0);
+        assert_eq!(super::clear_inherited_autopilot(&left_on).await, Some(true));
+        assert!(left_on.ran(super::CMD_AP_OFF), "taken off before the roll");
+        // Lit modes alone (a flight director left with modes) count too.
+        assert!(super::ap_inherited(0.0, 1.0, 0.0));
+        assert!(super::ap_inherited(0.0, 0.0, 1.0));
+        assert!(!super::ap_inherited(0.0, 0.0, 0.0));
+        // A failed read is no measurement: nothing is pressed.
+        let unread = crate::xplane::FakeXPlane::with_reads(&[
+            (super::HDG_STATUS, 1.0),
+            (super::VS_STATUS, 1.0),
+        ]);
+        assert_eq!(super::clear_inherited_autopilot(&unread).await, None);
+        assert!(!unread.ran(super::CMD_AP_OFF));
     }
 
     use super::*;
