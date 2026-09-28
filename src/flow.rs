@@ -259,6 +259,25 @@ pub fn landing_config(gear_down: bool, flap_ratio: f64, has_flaps: bool) -> bool
     gear_down && (!has_flaps || flap_ratio >= crate::autoland::LANDING_FLAP_RATIO)
 }
 
+/// The landing configuration an automation's Monitor list audits: the gear
+/// and flap of [`landing_config`] AND autoland's own landing items set for
+/// this approach (`autoland_configured`, its `landing_config` event: the
+/// spoilers armed, the autobrake). The circuit puts the landing flap out on
+/// the final turn, but autoland arms the spoilers and the autobrake only once
+/// it has the final: the A330's list ran at +411 s with the gear and flap
+/// down and named both, 48 s before autoland set them (LEMG 30, sortie
+/// 1790633832-full_auto, #169). With a pilot flying it is [`landing_config`]
+/// alone (and the trigger ignores it). Pure.
+pub fn landing_config_for(
+    automation: bool,
+    gear_down: bool,
+    flap_ratio: f64,
+    has_flaps: bool,
+    autoland_configured: bool,
+) -> bool {
+    landing_config(gear_down, flap_ratio, has_flaps) && (!automation || autoland_configured)
+}
+
 /// Climb list once the climb is established, not at liftoff, and AFTER the
 /// exterior-lights rule has put the landing light out at 1,000 ft: at 800 the
 /// cross-check read "landing lights off, not set" every departure.
@@ -1830,6 +1849,23 @@ mod tests {
         assert!(!landing_config(true, 0.75, true), "CONF 3 is not the landing flap");
         assert!(!landing_config(false, 1.0, true), "gear up");
         assert!(landing_config(true, 0.0, false), "no flaps to set");
+    }
+
+    /// #169, LEMG 30 (sortie 1790633832-full_auto, 2026-09-28): the circuit
+    /// put the A330's landing flap out on the final turn (+408.7 s), the
+    /// Monitor list ran at +410.9 and named the speed brake and the autobrake,
+    /// and autoland set both at +459.3, once the circuit handed it the final.
+    /// Under an automation the list's configuration is autoland's too.
+    #[test]
+    fn an_automations_landing_config_is_autolands() {
+        // The circuit's final: gear down, full flap, autoland not yet set.
+        assert!(!landing_config_for(true, true, 1.0, true, false));
+        // Autoland's landing_config event.
+        assert!(landing_config_for(true, true, 1.0, true, true));
+        // Autoland's items alone are not the configuration.
+        assert!(!landing_config_for(true, true, 0.5, true, true));
+        // A pilot flying: the gear and flap, as before.
+        assert!(landing_config_for(false, true, 1.0, true, false));
     }
 
     /// #174 (EGKK 08R, sortie 1790624015-full_auto): the Monitor CLIMB list

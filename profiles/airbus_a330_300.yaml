@@ -346,6 +346,47 @@ arrest_lead:
   gain: 1.5
   max_climb_fpm: 100.0
   trend_seconds: 1.5
+# The flare on the A330's own elevator (#180). The sidestick with the servos
+# out is a RATE plant: the four recorded arrests (LEMG 13 and 30, sorties
+# 1790621184, 1790633832, 1790634412 x2, 2026-09-28) fit a change of sink of
+# 600 to 820 fpm a second per unit of pull after 0.8 to 1.6 s, 6 to 21 fpm
+# rms each, and a neutral stick HOLDS the sink it has: the tracker's pull
+# arrested 1,155 fpm into a +277 climb and its "only back" neutral floated
+# the first LEMG 30 approach at 30 to 48 ft for 17 s. Every recorded arrest
+# took 17 to 20 s from the 87 to 91 ft gate. On the model, through all five
+# fits from every recorded gate: under 250 fpm in still air inside 13 s.
+flare_elevator:
+  gain: 1.0
+  max: 0.4
+  # Forward to end a float: neutral holds it on this plant.
+  max_push: 0.3
+  tau_s: 4.0
+  model:
+    rate: true
+    fpm_per_elevator: 780.0
+    lag_s: 0.3
+    lag2_s: 0.4
+    dead_s: 1.2
+    ground_fpm: 120.0
+    ground_ft: 50.0
+    horizon_s: 2.5
+    touchdown_fpm: 100.0
+    observer_s: 0.8
+# The arrest's wings on the sidestick's roll rate (#180): 11 to 13 deg/s per
+# unit after 0.25 to 0.37 s (the same four arrests, 0.04 to 0.8 degree rms).
+# The stiff law rang +/-2 to 4 degrees at 1.5 to 2 s through that delay.
+arrest_roll:
+  deg_s_per_unit: 13.0
+  dead_s: 0.45
+  close_s: 0.6
+# The speed governor on these engines (#169): about 2.5 kt/s per unit of
+# lever through a 4.6 s spool (fitted to the circuit's clean legs, sortie
+# 1790633832-full_auto). The shared 5 s projection and 0.04 a tick ran the
+# clean circuit 227.5 to 265 kt at the level-off.
+speed_governor:
+  lead_s: 8.0
+  gain: 0.006
+  max_step: 0.08
 # --- Jet/turboprop figures, added 2026-09-20 after the 737 shakedown. Every
 # law below defaults to a Cessna 172's number when a profile is silent, and on
 # BIKF-EGPH that flew an airliner on a 0.8 nm capture radius, a 700 fpm

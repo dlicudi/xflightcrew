@@ -3265,10 +3265,12 @@ pub async fn run(
                     agl_ft: snap.agl_ft,
                     vsi_fpm: snap.vsi_fpm,
                     automation: crate::flow::automation_flying(),
-                    landing_config: crate::flow::landing_config(
+                    landing_config: crate::flow::landing_config_for(
+                        crate::flow::automation_flying(),
                         snap.gear_down,
                         snap.flap_ratio,
                         !crate::aircraft::flap_limits().is_empty(),
+                        crate::autoland::landing_configured(),
                     ),
                     climb_config: crate::flow::climb_config(
                         snap.flap_ratio,

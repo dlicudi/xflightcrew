@@ -551,7 +551,9 @@ everything blackboxes to `logs/blackbox.jsonl` (kinds: `atc`, `autotaxi`, `autot
 (`src/circuit.rs`, `src/procedure.rs`, `src/full_auto.rs`)
 - The pattern is sized to the AP's real turn radius, side and height by terrain and airspace,
   `pattern_speed_kts` >= 1.3 Vs clean. `climb_limit_fpm` fades climb toward blue line / 1.15 Vs (a
-  climb is never worth more than the airspeed left). Throttle laws watch a speed PROJECTION.
+  climb is never worth more than the airspeed left). Throttle laws watch a speed PROJECTION, led
+  and stepped per airframe where the engines lag (`speed_governor:`, `throttle_adjust_live`; the
+  A330's level-off ran 265 kt and its downwind 3 km wide over unsampled terrain, #169).
 - Base descends the PATH; final uses along-track `path_dist_m`, never track-miles; a REAL intercept
   (`final_intercept_hdg`) on the turn actually flown (`final_turn_radius_m`, `AP_BANK_FINAL_DEG`);
   `ready_for_autoland` needs ESTABLISHED (`ESTABLISHED_XTK_M`), and on a runway of known width ON
@@ -797,7 +799,9 @@ everything blackboxes to `logs/blackbox.jsonl` (kinds: `atc`, `autotaxi`, `autot
   (`arrest_gates_ft`, `arrest_targets_fpm`). Ticks log `cmd_vs`, `vs_dial`, `vvi`, `vvi_trend`.
 - **The arrest takes the servos out at the roundout gate** (`arrest_hands_step`, `arrest_hands`),
   since an engaged servo writes the yoke back over `xcopilot/pitch`: `servos_off_any`, the track on
-  `xcopilot/roll` (`WingsLevel`). **The AP comes out at the wheels** (`disconnect_autopilot`): a
+  `xcopilot/roll` (`WingsLevel`; on a declared roll-RATE plant, `arrest_roll:`, the bank its
+  written ailerons WILL make, `WingsLevel::rate_plant`, target included: the stiff law rang the A330
+  +/-2 to 4 degrees, #180). **The AP comes out at the wheels** (`disconnect_autopilot`): a
   heading servo on the ground winds the yoke over. **Once taken, the servos stay out** (`hold_roundout`,
   `roundout_held`): a roundout balloon back over the band is still the arrest, to `BALLOON_COMMIT_FT`
   with room to stop, else a `balloon` balk; only a go-around gives them back; a roundout climb never
@@ -826,14 +830,19 @@ everything blackboxes to `logs/blackbox.jsonl` (kinds: `atc`, `autotaxi`, `autot
 - **In the flare the column only comes BACK** (`FlarePitch::step` `ratchet`, `FLARE_PITCH_MAX`):
   forward column a few feet up is a nosewheel landing. A BALLOON eases toward neutral, never a push
   (`hold_flare`; above the band `balloon`). Gains per airframe (`flare_elevator:`,
-  `autoland::FlareGains`).
+  `autoland::FlareGains`). **Except on a RATE plant** (`flare_elevator.model.rate`, the A330's
+  sidestick: the pull asks a change of sink and neutral HOLDS it): no ratchet, and a float or a
+  balloon is pushed down to `max_push` (the tracker's neutral floated LEMG 30 at 30 to 48 ft 17 s,
+  #180).
 - **A low flare with room to stop is COMMITTED** (`autoland::commit_flare`, `committed_flare`): no
   `overflew_the_runway` go-around while the pavement covers the landing distance (a go-around from
   an idle flare cannot climb); a balloon under `BALLOON_COMMIT_FT` likewise (`balloon_power`,
   `BALLOON_LEAD_S`). The need is the book LESS the air already flown from 50 ft
-  (`flare_pavement_need_m`; LFBD 11 missed by 12 m). **A low balk is called on the radio only once it
-  CLIMBS** (`go_around_call_due`, `BalkWatch`); one the wheels take keeps the clearance
-  (`balk_landed`).
+  (`flare_pavement_need_m`; LFBD 11 missed by 12 m). **Once committed it stays committed**
+  (`commit_flare_latched`): judged afresh, a 46 ft commit lasted one tick (LEMG 30 A330, #180);
+  latched, it holds while the pavement covers the ground roll, else `commit_released`.
+  **A low balk is called on the radio only once it CLIMBS** (`go_around_call_due`, `BalkWatch`);
+  one the wheels take keeps the clearance (`balk_landed`).
 - A debrief touchdown is the steepest recent sink (`instructor::touchdown_sink_fpm`).
 
 ### Taxi in
@@ -954,8 +963,9 @@ as held, never written (one writer per dataref).
 
 **Who starts one**: `flow::Tracker`, one-shot per flight, every boundary SUSTAINED (a single-tick
 boundary audits the automation's own actions half done; `CLIMB_AGL_FT`, `CLIMB_SECS`). Under an
-automation Monitor starts at once (BEFORE LANDING only once gear and landing flap are set,
-`Sample.landing_config`: a circuit's downwind descent is not the landing config, #169; CLIMB only
+automation Monitor starts at once (BEFORE LANDING only once gear and landing flap are set AND
+autoland has set its own items, `flow::landing_config_for`, `autoland::landing_configured`: a
+circuit's final turn is not the landing config, #169; CLIMB only
 once the flaps are up, `climb_config`, #174); with a pilot flying the copilot PROPOSES
 (`PROPOSAL_TTL`) and never acts by itself; the after-landing list runs as Crew once OFF the runway
 pavement (`Sample.on_runway`, the vacate's test; #174). DESCENT is also the model's `Descent`; a
