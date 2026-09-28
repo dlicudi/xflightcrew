@@ -844,13 +844,24 @@ fn restriction_at<'a>(
 /// past the first restricted fix the profile only goes DOWN unless a fix's
 /// own minimum says otherwise, so SimBrief's 8,000 after a 7,000 "at or
 /// below" is never a climb back. Returns how many legs it changed.
+///
+/// A window above the plan's cruise (the highest altitude planned before
+/// the first restricted fix) is flown at the cruise, never climbed to
+/// ([`windows_above_cruise`] says which): EGKK-EGBB (2026-09-28, sortie
+/// 1790601822-full_auto) clamped HEME1B's "HEMEL at FL220" into an FL180
+/// plan, the follower climbed for 22,000 and crossed HEMEL at 14,638, the
+/// window unmade and unsaid (#156, #32).
 pub fn apply_arrival_constraints(legs: &mut [ProcLeg], cons: &[crate::nav::StarConstraint]) -> usize {
+    let cruise = plan_cruise_before_star(legs, cons);
     let mut changed = 0;
     let mut prev: Option<f64> = None;
     for leg in legs.iter_mut() {
         let Some(alt) = leg.alt1_ft else { continue };
         let own = restriction_at(cons, leg);
         let mut want = own.map_or(alt, |c| c.clamp_ft(alt));
+        if let (Some(c), Some(_)) = (cruise, own) {
+            want = want.min(c.max(alt));
+        }
         if let Some(p) = prev {
             want = want.min(p);
             if let Some(min) = own.and_then(|c| c.min_ft) {
@@ -866,6 +877,37 @@ pub fn apply_arrival_constraints(legs: &mut [ProcLeg], cons: &[crate::nav::StarC
         }
     }
     changed
+}
+
+/// The plan's cruise as the STAR meets it: the highest altitude planned on
+/// the legs before the first restricted fix. `None` when the plan starts on
+/// the STAR (nothing before it to call a cruise).
+fn plan_cruise_before_star(legs: &[ProcLeg], cons: &[crate::nav::StarConstraint]) -> Option<f64> {
+    let first = legs.iter().position(|l| restriction_at(cons, l).is_some())?;
+    legs[..first].iter().filter_map(|l| l.alt1_ft).reduce(f64::max)
+}
+
+/// A STAR window this far above the cruise is one the plan does not make.
+const ABOVE_CRUISE_SLACK_FT: f64 = 100.0;
+
+/// The STAR's "at or above" windows over the plan's cruise
+/// ([`plan_cruise_before_star`]): `(fix, window's minimum, cruise)`. The
+/// follower flies them at the cruise ([`apply_arrival_constraints`]) and
+/// says so once, as a crew briefing the arrival would. Pure.
+pub fn windows_above_cruise(
+    legs: &[ProcLeg],
+    cons: &[crate::nav::StarConstraint],
+    cruise_ft: f64,
+) -> Vec<(String, f64, f64)> {
+    let mut out = Vec::new();
+    for leg in legs {
+        if let Some(min) = restriction_at(cons, leg).and_then(|c| c.min_ft) {
+            if min > cruise_ft + ABOVE_CRUISE_SLACK_FT && !out.iter().any(|(f, _, _): &(String, f64, f64)| *f == leg.fix_ident) {
+                out.push((leg.fix_ident.clone(), min, cruise_ft));
+            }
+        }
+    }
+    out
 }
 
 /// The highest altitude leg `idx`'s fix may be crossed at so that every
@@ -983,6 +1025,11 @@ pub fn ceilinged_leg_alt(
 const ARRIVAL_DECEL_KTS_S: f64 = 0.5;
 /// Slowed this far before the fix, nm, on top of the deceleration itself.
 const ARRIVAL_SPEED_LEAD_NM: f64 = 2.0;
+/// Knots under a STAR's speed LIMIT the follower flies: a maximum is not a
+/// target, and the speed held down a descent at idle wanders a few knots
+/// either side of what is asked (OSKOT and GROVE's 210 crossed at 216 and
+/// 218, EGKK-EGBB 2026-09-28, #156).
+pub const STAR_SPEED_MARGIN_KTS: f64 = 3.0;
 
 /// The arrival's speed limit now: the lowest of every limit already passed
 /// (a limit holds from its fix on) and every one ahead whose slow-down has
@@ -1603,6 +1650,104 @@ const DRAG_MIN_HOLD_S: f64 = 15.0;
 /// Seconds between spoken speedbrake calls: a change sooner than this is
 /// flown and blackboxed, not said.
 const DRAG_SPEAK_GAP_S: f64 = 120.0;
+/// Feet above the level commanded now at which a descent held back for its
+/// speed ([`speed_protected_vs`]) gets the speedbrake: the height is owed and
+/// idle alone cannot lose it at the speed allowed...
+const DRAG_HIGH_FT: f64 = 400.0;
+/// ...and back within this of it, the brake goes in.
+const DRAG_ON_PATH_FT: f64 = 150.0;
+/// Slower than the target by this, a high descent needs no brake: the
+/// protection lets the whole rate through.
+const DRAG_SLOW_KTS: f64 = 4.0;
+
+/// The airspeed trend's smoothing for the speed protection, seconds.
+const IAS_TREND_TAU_S: f64 = 2.0;
+
+/// A descent is flown at IDLE with the speed on the pitch, as a crew flies
+/// one (level change, VNAV SPD): while the vertical law wants down, the
+/// governor's target sits [`IDLE_DESCENT_MARGIN_KTS`] under the speed owed,
+/// so its lever stays closed at the speed, and [`speed_protected_vs`] holds
+/// the speed owed by giving way. Power comes back only past the margin.
+///
+/// EGKK-EGBB (2026-09-28, sortie 1790601822-full_auto): OSKOT's 210 was made
+/// level, the governor overshot to 204 and was adding power (lever 0.3) as
+/// the descent to GROVE began: 216 at OSKOT, 218 at GROVE, with the
+/// speedbrake out and in three times in the join after. With the governor
+/// at the speed owed, every start of a descent was a lever still coming back.
+#[derive(Debug, Default, Clone, Copy, PartialEq)]
+pub struct IdleDescent {
+    on: bool,
+}
+
+/// The vertical law wanting this much descent starts an idle descent...
+const IDLE_DESCENT_ON_FPM: f64 = -800.0;
+/// ...and wanting less than this ends it (a level-off's last feet).
+const IDLE_DESCENT_OFF_FPM: f64 = -300.0;
+/// Knots under the speed owed the governor holds in an idle descent.
+pub const IDLE_DESCENT_MARGIN_KTS: f64 = 5.0;
+
+impl IdleDescent {
+    /// Update from the descent the vertical law wants, fpm; whether the
+    /// descent is flown at idle.
+    pub fn step(&mut self, vs_want_fpm: f64) -> bool {
+        if self.on {
+            if vs_want_fpm >= IDLE_DESCENT_OFF_FPM {
+                self.on = false;
+            }
+        } else if vs_want_fpm <= IDLE_DESCENT_ON_FPM {
+            self.on = true;
+        }
+        self.on
+    }
+
+    pub fn on(&self) -> bool {
+        self.on
+    }
+
+    /// The governor's target for the speed owed `kts`, never under `floor`.
+    pub fn governor_kts(&self, kts: f64, floor: Option<f64>) -> f64 {
+        if self.on {
+            crate::aircraft::floored_target(kts - IDLE_DESCENT_MARGIN_KTS, floor).min(kts)
+        } else {
+            kts
+        }
+    }
+}
+/// Knots over the governor's target, projected [`SPEED_PROTECT_LEAD_S`]
+/// ahead on the airspeed trend, at which a descent starts giving way...
+const SPEED_PROTECT_FROM_KTS: f64 = 0.0;
+/// ...and this many knots more flies it level, where a jet at idle loses
+/// speed (the 737 about 0.9 kt/s at 8,000 ft, fitted on sortie
+/// 1790601822-full_auto).
+const SPEED_PROTECT_SPAN_KTS: f64 = 6.0;
+/// The airspeed trend's lead, seconds.
+const SPEED_PROTECT_LEAD_S: f64 = 3.0;
+
+/// The descent a speed over its target may keep, fpm: the commanded descent
+/// given way in proportion to the projected excess, level at
+/// [`SPEED_PROTECT_FROM_KTS`] + [`SPEED_PROTECT_SPAN_KTS`] over. A crew
+/// descending at idle on a speed limit flies the SPEED and lets the path
+/// go (the speed is owed to the fix and the approach; the height can be
+/// lost with the speedbrake), where the VS law alone flew the path and let
+/// the speed go. Climbs, level flight and an unknown target pass through.
+///
+/// EGKK-EGBB 737 (2026-09-28, sortie 1790601822-full_auto, #156, #32):
+/// 2,000 fpm at idle down the HEME1B, PUFAX crossed at 254 against 250,
+/// OSKOT 216 and GROVE 218 against 210, and six speedbrake extensions
+/// each started at 8 kt over. The fitted plant descends at constant speed
+/// at idle at about 2.9 degrees; a 2,000 fpm catch-up is four and gains
+/// 0.3 kt/s. Pure.
+pub fn speed_protected_vs(vs_cmd: f64, over_kts: Option<f64>, trend_kts_s: f64) -> f64 {
+    let Some(over) = over_kts.filter(|o| o.is_finite()) else {
+        return vs_cmd;
+    };
+    if vs_cmd >= 0.0 {
+        return vs_cmd;
+    }
+    let proj = over + trend_kts_s.clamp(-3.0, 3.0) * SPEED_PROTECT_LEAD_S;
+    let keep = 1.0 - ((proj - SPEED_PROTECT_FROM_KTS) / SPEED_PROTECT_SPAN_KTS).clamp(0.0, 1.0);
+    vs_cmd * keep
+}
 
 /// What a descent that is running away with the speed gets: whether the
 /// speedbrake should be out, and the fraction of the commanded rate to fly.
@@ -1623,34 +1768,37 @@ const DRAG_SPEAK_GAP_S: f64 = 120.0;
 /// aircraft still 6 and 13 kt fast. Out, the brake now stays out through a
 /// level-off until the speed is in or a climb is commanded, and neither
 /// state is left inside [`DRAG_MIN_HOLD_S`].
+///
+/// EGKK-EGBB, 2026-09-28 (sortie 1790601822-full_auto, #156, #126): six
+/// extensions down the HEME1B and three more in the join, every one at
+/// 8 kt over. The shallower descent is now [`speed_protected_vs`]'s, flown
+/// before the speed runs away, so the brake is for what a crew uses it
+/// for: HEIGHT the protected descent cannot lose. Out when the aircraft is
+/// [`DRAG_HIGH_FT`] above the level commanded (`high_ft`, the target's
+/// shortfall) with the speed not slow, or a runaway past
+/// [`DRAG_OUT_KTS`]; in once back within [`DRAG_ON_PATH_FT`] with the speed
+/// in, or [`DRAG_SLOW_KTS`] slow, or a climb. `vs_want_fpm` is the descent
+/// the vertical law WANTS, before the speed protection held it back. Pure.
 pub fn descent_drag(
     out: bool,
     held_s: f64,
     ias_kts: f64,
     target_kts: Option<f64>,
-    vs_cmd_fpm: f64,
-) -> (bool, f64) {
+    vs_want_fpm: f64,
+    high_ft: f64,
+) -> bool {
     let Some(target) = target_kts else {
-        return (false, 1.0);
+        return false;
     };
     let over = ias_kts - target;
     let settled = held_s >= DRAG_MIN_HOLD_S;
-    let want_out = if out {
-        vs_cmd_fpm < DRAG_KEEP_BELOW_FPM && (over > DRAG_IN_KTS || !settled)
+    if out {
+        let done = over < -DRAG_SLOW_KTS || (over <= DRAG_IN_KTS && high_ft <= DRAG_ON_PATH_FT);
+        vs_want_fpm < DRAG_KEEP_BELOW_FPM && (!done || !settled)
     } else {
-        vs_cmd_fpm <= -DRAG_MIN_DESCENT_FPM && over > DRAG_OUT_KTS && settled
-    };
-    if vs_cmd_fpm > -DRAG_MIN_DESCENT_FPM {
-        return (want_out, 1.0);
+        let high = high_ft > DRAG_HIGH_FT && over > -DRAG_SLOW_KTS / 2.0;
+        vs_want_fpm <= -DRAG_MIN_DESCENT_FPM && (over > DRAG_OUT_KTS || high) && settled
     }
-    let scale = if over > 20.0 {
-        0.5
-    } else if over > 12.0 {
-        0.75
-    } else {
-        1.0
-    };
-    (want_out, scale)
 }
 
 /// Minutes of the commanded rate inside which a VS mode that drops heading
@@ -2650,6 +2798,9 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, plan: Pla
     let mut prev_cmd_alt = carry_alt;
     let mut last_vs_cmd: Option<f64> = None;
     let mut prev_ias: Option<(f64, std::time::Instant)> = None;
+    let mut ias_trend_f = 0.0_f64;
+    // A descent flown at idle, the speed on the pitch (`IdleDescent`).
+    let mut idle_descent = IdleDescent::default();
     // The altitude PRESELECT is driven to the leg target too: a stale dial
     // with capture armed (1,122 ft on the Jerez departure, from nobody's
     // loop) would otherwise level the climb wherever it happened to sit —
@@ -2961,6 +3112,9 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, plan: Pla
                 }
             }
         }
+        // The speed owed this tick (the governor's target outside an idle
+        // descent), for the vertical's speed protection below.
+        let mut speed_owed: Option<f64> = None;
         if let Some(planned) = power_hold_target(&end, cruise_ias_kts) {
             // The OFP's cruise schedule on a cruise leg of an enroute flight:
             // the speed its cost index planned, held as IAS or Mach,
@@ -3004,8 +3158,10 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, plan: Pla
             let planned = pilot_speed().unwrap_or(planned);
             // The STAR's speed limits: slowed in time for each, held after.
             let star_cap = arrival_speed_cap(&legs, &arrival_constraints, idx, lat, lon, ias, gs * MS_TO_KTS, &mut star_speed_begun);
+            // Flown a little under the limit (`STAR_SPEED_MARGIN_KTS`): a
+            // maximum is not a target.
             let planned = match &star_cap {
-                Some((kts, fix)) if *kts < planned => {
+                Some((kts, fix)) if *kts - STAR_SPEED_MARGIN_KTS < planned => {
                     if said_star_speed.insert(fix.clone()) {
                         crate::blackbox::record(
                             "procedure",
@@ -3017,7 +3173,7 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, plan: Pla
                             &format!("Slowing to {kts:.0} knots for {fix}."),
                         );
                     }
-                    *kts
+                    *kts - STAR_SPEED_MARGIN_KTS
                 }
                 _ => planned,
             };
@@ -3082,16 +3238,22 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, plan: Pla
             // With memory (`AirspaceLimit`): a level at or near 10,000 ft
             // must not flip the cap on the altimeter's wander (#154).
             let want = crate::aircraft::floored_target(airspace.limit(alt_ft, planned), floor);
-            if crate::tools::speedhold::flight_target().is_some_and(|t| (t - want).abs() > 0.5) {
+            speed_owed = Some(want);
+            // In a descent the governor sits under the speed owed and the
+            // pitch holds it (`IdleDescent`); on a MAP's final the speed is
+            // the landing's, flown on power.
+            let governed = if on_map_final { want } else { idle_descent.governor_kts(want, floor) };
+            if crate::tools::speedhold::flight_target().is_some_and(|t| (t - governed).abs() > 0.5) {
                 crate::blackbox::record(
                     "procedure",
                     serde_json::json!({
                         "event": "speed_limit", "alt_ft": alt_ft,
-                        "planned": planned, "target": want,
+                        "planned": planned, "target": governed, "owed": want,
+                        "idle_descent": idle_descent.on(),
                         "airspace_capped": airspace.capped(),
                     }),
                 );
-                crate::tools::speedhold::arm_flight_with_floor(base_url.clone(), voice.clone(), want, floor);
+                crate::tools::speedhold::arm_flight_with_floor(base_url.clone(), voice.clone(), governed, floor);
             }
         }
 
@@ -3685,6 +3847,9 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, plan: Pla
             }
         });
         prev_ias = Some((ias, now_ias));
+        // Smoothed for the descent's speed protection (the tick-to-tick
+        // difference of a half-second tick is mostly the ASI's noise).
+        ias_trend_f += (ias_trend - ias_trend_f) * (dt / (IAS_TREND_TAU_S + dt)).clamp(0.0, 1.0);
         let climb_cap = if minimums_state.unmet(&climb_minimums, &legs, idx, alt_ft).is_some() {
             best_climb_fpm()
         } else {
@@ -3716,14 +3881,22 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, plan: Pla
             // Down from cruise: the destination's transition level rules.
             crate::tools::instruments::note_descending();
         }
-        // A descent that outruns the governor (`descent_drag`): speedbrake
-        // where the airframe has one, a shallower rate either way.
+        // The descent flies the SPEED first (`speed_protected_vs`): a descent
+        // that would outrun the governor gives way before the speed does,
+        // and the height it leaves behind is the speedbrake's
+        // (`descent_drag`). A published MAP path keeps its own rate.
+        let vs_want = vs_cmd;
+        let target_kts = speed_owed.or_else(crate::tools::speedhold::flight_target);
+        if path.is_none() {
+            vs_cmd = speed_protected_vs(vs_cmd, target_kts.map(|t| ias - t), ias_trend_f);
+            idle_descent.step(vs_want);
+        } else {
+            idle_descent.step(0.0);
+        }
         {
             let ours = DRAG_OURS.load(Ordering::SeqCst);
             let held_s = drag_changed.map_or(f64::INFINITY, |c: std::time::Instant| c.elapsed().as_secs_f64());
-            let (want_out, scale) =
-                descent_drag(ours, held_s, ias, crate::tools::speedhold::flight_target(), vs_cmd);
-            vs_cmd *= scale;
+            let want_out = descent_drag(ours, held_s, ias, target_kts, vs_want, alt_ft - want_alt);
             let has_speedbrake = crate::takeoff_config::has_speedbrake();
             // Never with flap or gear (`drag_barred`), read only while the
             // drag is out or wanted. A failed read is no measurement: a brake
@@ -3757,8 +3930,9 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, plan: Pla
                         crate::blackbox::record(
                             "procedure",
                             serde_json::json!({"event": "speedbrake", "out": want_out,
-                                "ias": ias, "target": crate::tools::speedhold::flight_target(),
-                                "vs_cmd": vs_cmd, "held_s": held_s.is_finite().then_some(held_s),
+                                "ias": ias, "target": target_kts,
+                                "vs_cmd": vs_cmd, "vs_want": vs_want, "high_ft": alt_ft - want_alt,
+                                "held_s": held_s.is_finite().then_some(held_s),
                                 "said": said,
                                 "why": if want_out { "speed" } else { barred.unwrap_or("speed") }}),
                         );
@@ -3841,6 +4015,9 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, plan: Pla
             serde_json::json!({
                 "event": "leg", "idx": idx, "type": leg.leg_type, "fix": leg.fix_ident,
                 "dist_nm": dist_nm, "alt_ft": alt_ft, "alt_true": true_alt_ft, "want_alt": want_alt,
+                // The vertical as commanded: the law's want, the speed's
+                // hold on it (`speed_protected_vs`), the wheel.
+                "vs_want": vs_want, "vs_cmd": vs_cmd, "ias": ias, "spd_tgt": target_kts,
                 "agl_ft": agl_ft, "crab": crab, "psi": psi_v, "bug": bug_mag, "tgt": target_mag,
                 // How the lateral is flown and where on the course it is
                 // (`course_leg`): the FAF's line during a final's join.
@@ -4222,38 +4399,44 @@ mod tests {
     }
 
     /// EGPH-EGTE, 2026-09-21: 2,000 fpm down at idle, 258 kt through ten
-    /// thousand against 250, 278 at the last fix.
+    /// thousand against 250, 278 at the last fix. Since #156 the descent
+    /// gives way to the speed first (`speed_protected_vs`) and the brake is
+    /// for the height that leaves (or a runaway past 8 kt).
     #[test]
-    fn a_descent_that_outruns_the_governor_gets_drag_then_a_shallower_rate() {
-        // Through ten thousand, 8 over: not yet. 9 over: brakes.
-        assert_eq!(
-            descent_drag(false, f64::INFINITY, 258.0, Some(250.0), -2000.0),
-            (false, 1.0)
-        );
-        assert_eq!(
-            descent_drag(false, f64::INFINITY, 259.0, Some(250.0), -2000.0),
-            (true, 1.0)
-        );
-        // Out, they stay out until the speed is nearly back...
-        assert_eq!(descent_drag(true, f64::INFINITY, 254.0, Some(250.0), -2000.0), (true, 1.0));
-        assert_eq!(
-            descent_drag(true, f64::INFINITY, 252.0, Some(250.0), -2000.0),
-            (false, 1.0)
-        );
-        // ...and a runaway shallows the descent as well.
-        assert_eq!(
-            descent_drag(true, f64::INFINITY, 267.0, Some(250.0), -2000.0),
-            (true, 0.75)
-        );
-        assert_eq!(descent_drag(true, f64::INFINITY, 278.0, Some(250.0), -2000.0), (true, 0.5));
-        // Never put out level or climbing; one already out stays out
-        // through a level-off (the speed is still owed) and comes in for a
-        // commanded climb (#126). No governor target: nothing.
-        assert_eq!(descent_drag(false, f64::INFINITY, 278.0, Some(250.0), 0.0), (false, 1.0));
-        assert_eq!(descent_drag(true, f64::INFINITY, 278.0, Some(250.0), 0.0), (true, 1.0));
-        assert_eq!(descent_drag(true, f64::INFINITY, 278.0, Some(250.0), 800.0), (false, 1.0));
-        assert_eq!(descent_drag(false, f64::INFINITY, 278.0, Some(250.0), 800.0), (false, 1.0));
-        assert_eq!(descent_drag(false, f64::INFINITY, 278.0, None, -2000.0), (false, 1.0));
+    fn a_descent_gives_way_to_its_speed_and_the_brake_is_for_height() {
+        // On the target and steady: the whole descent. Three over: half.
+        // Six over: level. Building at 1 kt/s from two over is five in
+        // three seconds: already mostly held back.
+        assert_eq!(speed_protected_vs(-2000.0, Some(0.0), 0.0), -2000.0);
+        assert_eq!(speed_protected_vs(-2000.0, Some(-3.0), 0.0), -2000.0);
+        assert!((speed_protected_vs(-2000.0, Some(3.0), 0.0) + 1000.0).abs() < 1.0);
+        assert_eq!(speed_protected_vs(-2000.0, Some(6.0), 0.0), 0.0);
+        assert!(speed_protected_vs(-2000.0, Some(2.0), 1.0) > -400.0);
+        // Slowing toward the target lets the descent back early.
+        assert!(speed_protected_vs(-2000.0, Some(4.0), -1.0) < -1600.0);
+        // Climbs, level and no target pass through.
+        assert_eq!(speed_protected_vs(1500.0, Some(20.0), 0.0), 1500.0);
+        assert_eq!(speed_protected_vs(-2000.0, None, 0.0), -2000.0);
+        // The brake: never for 8 kt over any more, 9 is a runaway.
+        assert!(!descent_drag(false, f64::INFINITY, 258.0, Some(250.0), -2000.0, 0.0));
+        assert!(descent_drag(false, f64::INFINITY, 259.0, Some(250.0), -2000.0, 0.0));
+        // High on the level commanded with the speed at the target: out...
+        assert!(!descent_drag(false, f64::INFINITY, 250.5, Some(250.0), -2000.0, 350.0));
+        assert!(descent_drag(false, f64::INFINITY, 250.5, Some(250.0), -2000.0, 450.0));
+        // ...not when slow (the protection lets the whole rate through), not
+        // for a level or a climb, not inside its hold.
+        assert!(!descent_drag(false, f64::INFINITY, 244.0, Some(250.0), -2000.0, 900.0));
+        assert!(!descent_drag(false, f64::INFINITY, 250.5, Some(250.0), 0.0, 900.0));
+        assert!(!descent_drag(false, 5.0, 250.5, Some(250.0), -2000.0, 900.0));
+        // Out, it stays out until back on the level with the speed in...
+        assert!(descent_drag(true, f64::INFINITY, 251.0, Some(250.0), -2000.0, 300.0));
+        assert!(!descent_drag(true, f64::INFINITY, 251.0, Some(250.0), -2000.0, 100.0));
+        assert!(descent_drag(true, f64::INFINITY, 255.0, Some(250.0), -2000.0, 100.0));
+        // ...or slow, or a climb; and through a level-off still fast (#126).
+        assert!(!descent_drag(true, f64::INFINITY, 245.0, Some(250.0), -2000.0, 600.0));
+        assert!(!descent_drag(true, f64::INFINITY, 278.0, Some(250.0), 800.0, 0.0));
+        assert!(descent_drag(true, f64::INFINITY, 278.0, Some(250.0), 0.0, 0.0));
+        assert!(!descent_drag(false, f64::INFINITY, 278.0, None, -2000.0, 900.0));
     }
 
     /// EGKK 26L, 2026-09-27 (sortie 1790510400-full_auto, stock 737): out at
@@ -4268,10 +4451,7 @@ mod tests {
             .map(|r| (*r, None))
             .collect();
         // The speed rule, alone, wanted it out at the sortie's numbers...
-        assert_eq!(
-            descent_drag(false, f64::INFINITY, 218.36, Some(210.25), -2000.0),
-            (true, 1.0)
-        );
+        assert!(descent_drag(false, f64::INFINITY, 218.36, Some(210.25), -2000.0, 0.0));
         // ...clean it may be, and flaps 1 is still the clean descent...
         assert_eq!(drag_barred(0.0, false, &b738), None);
         assert_eq!(drag_barred(0.125, false, &b738), None);
@@ -4286,13 +4466,10 @@ mod tests {
         assert_eq!(drag_barred(0.0, false, &[]), None);
         // The 5 s re-deployment at full flap: 153.6 kt against 145 and
         // 968 fpm down is out by speed, in by configuration.
-        assert_eq!(descent_drag(false, f64::INFINITY, 153.56, Some(145.0), -967.7).0, true);
+        assert!(descent_drag(false, f64::INFINITY, 153.56, Some(145.0), -967.7, 0.0));
         assert_eq!(drag_barred(1.0, true, &b738), Some("gear"));
-        // A runaway still shallows the descent with the brake barred.
-        assert_eq!(
-            descent_drag(false, f64::INFINITY, 235.0, Some(210.0), -2000.0),
-            (true, 0.5)
-        );
+        // A runaway still levels the descent with the brake barred.
+        assert_eq!(speed_protected_vs(-2000.0, Some(25.0), 0.0), 0.0);
     }
 
     /// EGKK-EGBB, 2026-09-27 (sortie 1790541304-full_auto, #126), the
@@ -4347,7 +4524,7 @@ mod tests {
         let (mut changes, mut said) = (Vec::new(), Vec::new());
         for &(t, ias, vs) in EGBB_APPROACH {
             let want = if new {
-                descent_drag(out, t - since, ias, Some(TARGET), vs).0
+                descent_drag(out, t - since, ias, Some(TARGET), vs, 0.0)
             } else {
                 // The rule as flown: the descent gate, then 8 out / 3 in.
                 vs <= -DRAG_MIN_DESCENT_FPM
@@ -4908,35 +5085,102 @@ mod tests {
         (legs, cons, speeds)
     }
 
-    /// Fly the follower's real vertical (the ceilings, `vertical_tick`, the VS
-    /// law, the descent drag, the 100 fpm dial) down the recorded UNTO2A from
-    /// the ROLAS leg at FL370, through the 737's VS mode as the autoland
-    /// sorties model it: two 1.5 s lags behind 2 s of dead time, the loop
-    /// ticking every half second. Returns the altitude at each fix as the
-    /// leg sequences (1.2 nm out, FOFUS's recorded capture) and the highest
-    /// vertical speed flown.
-    fn fly_unto2a() -> (Vec<(String, f64)>, f64) {
-        let (legs, cons, speeds) = lemg_unto2a();
+    /// The stock 737's airspeed in a clean descent, kt/s: fitted on sortie
+    /// 1790601822-full_auto (EGKK-EGBB, +1700 to +3310, 1,022 state ticks,
+    /// 0.33 kt/s rms) from the lever, the flight path angle, the speedbrake
+    /// and the altitude. At idle it holds its speed at about 2.9 degrees
+    /// down at 8,000 ft and loses 0.9 kt/s level.
+    fn b738_accel_kts_s(p: &Plant, thr: f64, vs_fpm: f64, gs_kts: f64, brake: bool, alt_ft: f64) -> f64 {
+        let down_deg = -(vs_fpm / (gs_kts.max(60.0) * 101.27)).atan().to_degrees();
+        -0.554 + p.drag_kts_s + 3.028 * thr + 0.299 * p.gamma_scale * down_deg - if brake { 0.432 } else { 0.0 }
+            - 0.402 * alt_ft / 10_000.0
+    }
+
+    /// The fitted plant, and how far a sweep moves it.
+    #[derive(Debug, Clone, Copy)]
+    struct Plant {
+        /// Scales the flight path angle's effect on the airspeed.
+        gamma_scale: f64,
+        /// Added to the idle deceleration, kt/s (negative: more drag).
+        drag_kts_s: f64,
+        /// The VS mode's dead time, half-second ticks.
+        dead_ticks: usize,
+    }
+
+    impl Default for Plant {
+        fn default() -> Self {
+            Plant { gamma_scale: 1.0, drag_kts_s: 0.0, dead_ticks: 4 }
+        }
+    }
+
+    /// Which laws an [`fly_arrival`] run flies.
+    #[derive(Clone, Copy, PartialEq)]
+    enum ArrivalLaw {
+        /// The descent as flown on 2026-09-28: no speed protection, the
+        /// speedbrake out at 8 over, in at 3, the rate cut to 0.75 and 0.5
+        /// past 12 and 20 over.
+        AsFlown,
+        /// `speed_protected_vs` and the height-keyed `descent_drag`.
+        Protected,
+    }
+
+    #[derive(Debug, Default)]
+    struct ArrivalRun {
+        /// (fix, altitude, airspeed) as each leg sequenced.
+        crossings: Vec<(String, f64, f64)>,
+        max_vs: f64,
+        /// The most height regained above the lowest reached, ft: a
+        /// level-off's overshoot coming back, or a descent climbing.
+        climb_back_ft: f64,
+        /// Speedbrake extensions.
+        brake_outs: usize,
+    }
+
+    /// Fly the follower's real vertical and speed (the ceilings,
+    /// `vertical_tick`, the VS law, the STAR's speed limits, the 250 below
+    /// ten thousand, the governor's `throttle_adjust`, the speed protection
+    /// and the drag, the 100 fpm dial) down `legs` from `idx` against the
+    /// fitted 737 ([`b738_accel_kts_s`]): the VS mode as the autoland
+    /// sorties model it (two 1.5 s lags behind 2 s of dead time), the lever
+    /// spooling on a 2 s lag, the loop ticking every half second.
+    /// `planned(idx)` is the cruise or profile speed on each leg, `gs(idx,
+    /// frac, tas)` the groundspeed, `capture_nm` how far out a leg sequences.
+    #[allow(clippy::too_many_arguments)]
+    fn fly_arrival(
+        legs: &[ProcLeg],
+        cons: &[crate::nav::StarConstraint],
+        mut idx: usize,
+        (mut lat, mut lon): (f64, f64),
+        mut alt: f64,
+        mut ias: f64,
+        planned: impl Fn(usize) -> f64,
+        gs_of: impl Fn(usize, f64, f64) -> f64,
+        capture_nm: f64,
+        law: ArrivalLaw,
+        plant: Plant,
+    ) -> ArrivalRun {
         const RATE: f64 = 2_000.0;
-        const CAPTURE_NM: f64 = 1.2;
         let dt = 0.5;
-        let (mut lat, mut lon) = (legs[0].fix.as_ref().unwrap().lat, legs[0].fix.as_ref().unwrap().lon);
-        let mut idx = 1usize;
-        let mut alt = 37_000.0;
         let (mut carry, mut prev) = (alt, alt);
         let mut latch = None;
         let (mut drag_out, mut drag_held) = (false, f64::INFINITY);
         let mut begun = std::collections::HashSet::new();
+        let mut airspace = crate::tools::speedhold::AirspaceLimit::default();
         let (mut lag1, mut vs) = (0.0f64, 0.0f64);
         let mut dial_queue: std::collections::VecDeque<f64> = std::collections::VecDeque::new();
-        let mut crossings = Vec::new();
-        let mut max_vs = f64::MIN;
-        let mut leg_len = crate::nav::haversine_nm(lat, lon, legs[1].fix.as_ref().unwrap().lat, legs[1].fix.as_ref().unwrap().lon);
+        let mut run = ArrivalRun { max_vs: f64::MIN, ..Default::default() };
+        let start = legs[idx - 1].fix.clone().unwrap();
+        let mut leg_len = crate::nav::haversine_nm(start.lat, start.lon, legs[idx].fix.as_ref().unwrap().lat, legs[idx].fix.as_ref().unwrap().lon);
+        let tas = |ias: f64, alt: f64| ias * (1.0 + 0.02 * alt / 1_000.0);
+        let (mut thr, mut thrust) = (0.3f64, 0.3f64);
+        let (mut trend, mut prev_ias) = (0.0f64, ias);
+        let mut idle = IdleDescent::default();
+        let mut low = alt;
         for _ in 0..40_000 {
             let f = legs[idx].fix.clone().unwrap();
             let d = crate::nav::haversine_nm(lat, lon, f.lat, f.lon);
-            if d < CAPTURE_NM {
-                crossings.push((legs[idx].fix_ident.clone(), alt));
+            if d < capture_nm {
+                run.crossings.push((legs[idx].fix_ident.clone(), alt, ias));
                 idx += 1;
                 if idx == legs.len() {
                     break;
@@ -4946,35 +5190,221 @@ mod tests {
                 continue;
             }
             let frac = (1.0 - d / leg_len).clamp(0.0, 1.0);
-            let ((g0, g1), (i0, i1)) = speeds[idx];
-            let (gs, ias) = (g0 + (g1 - g0) * frac, i0 + (i1 - i0) * frac);
+            let gs = gs_of(idx, frac, tas(ias, alt));
+            // The speed the governor holds: the leg's, the STAR's limits,
+            // the 250 below ten thousand.
+            let mut target = planned(idx);
+            if let Some((kts, _)) = arrival_speed_cap(legs, cons, idx, lat, lon, ias, gs, &mut begun) {
+                target = target.min(if law == ArrivalLaw::Protected { kts - STAR_SPEED_MARGIN_KTS } else { kts });
+            }
+            let target = airspace.limit(alt, target);
+            // The governor's own target: the speed owed, or under it at
+            // idle in a descent (`IdleDescent`, the last tick's verdict).
+            let governed = if law == ArrivalLaw::Protected { idle.governor_kts(target, None) } else { target };
+            // The vertical.
             let mut l = legs[idx].clone();
-            if let Some((a, _)) = ceilinged_leg_alt(&legs, &cons, idx, gs, RATE, &mut latch) {
+            if let Some((a, _)) = ceilinged_leg_alt(legs, cons, idx, gs, RATE, &mut latch) {
                 l.alt1_ft = Some(a);
             }
             let v = vertical_tick(&l, carry, prev, alt, Some(d), gs, None, None, RATE, DescentProfile::none());
             carry = v.carry;
             prev = v.prev_cmd;
-            let mut cmd = vs_law_fpm(v.want_alt, alt, v.target_fpm, RATE, 1_500.0);
-            let target = arrival_speed_cap(&legs, &cons, idx, lat, lon, ias, gs, &mut begun).map_or(255.0, |c| c.0);
-            let (out, scale) = descent_drag(drag_out, drag_held, ias, Some(target), cmd);
+            let want = vs_law_fpm(v.want_alt, alt, v.target_fpm, RATE, 1_500.0);
+            let (cmd, out) = match law {
+                ArrivalLaw::AsFlown => {
+                    let over = ias - target;
+                    let settled = drag_held >= DRAG_MIN_HOLD_S;
+                    let out = if drag_out {
+                        want < DRAG_KEEP_BELOW_FPM && (over > DRAG_IN_KTS || !settled)
+                    } else {
+                        want <= -DRAG_MIN_DESCENT_FPM && over > DRAG_OUT_KTS && settled
+                    };
+                    let scale = if want > -DRAG_MIN_DESCENT_FPM {
+                        1.0
+                    } else if over > 20.0 {
+                        0.5
+                    } else if over > 12.0 {
+                        0.75
+                    } else {
+                        1.0
+                    };
+                    (want * scale, out)
+                }
+                ArrivalLaw::Protected => {
+                    idle.step(want);
+                    (
+                        speed_protected_vs(want, Some(ias - target), trend),
+                        descent_drag(drag_out, drag_held, ias, Some(target), want, alt - v.want_alt),
+                    )
+                }
+            };
+            if out && !drag_out {
+                run.brake_outs += 1;
+            }
             drag_held = if out == drag_out { drag_held + dt } else { 0.0 };
             drag_out = out;
-            cmd *= scale;
             dial_queue.push_back(vs_dial_fpm(cmd));
             // 2 s of dead time at the half-second tick.
-            let dial = if dial_queue.len() > 4 { dial_queue.pop_front().unwrap() } else { 0.0 };
+            let dial = if dial_queue.len() > plant.dead_ticks { dial_queue.pop_front().unwrap() } else { 0.0 };
+            // The governor's tick, on the smoothed trend.
+            thr = (thr + crate::tools::speedhold::throttle_adjust(governed - ias, trend)).clamp(0.0, 1.0);
             for _ in 0..10 {
                 let h = dt / 10.0;
                 lag1 += (dial - lag1) * h / 1.5;
                 vs += (lag1 - vs) * h / 1.5;
                 alt += vs * h / 60.0;
+                thrust += (thr - thrust) * h / 2.0;
+                ias += b738_accel_kts_s(&plant, thrust, vs, gs, drag_out, alt) * h;
             }
-            max_vs = max_vs.max(vs);
+            trend += ((ias - prev_ias) / dt - trend) * dt / (IAS_TREND_TAU_S + dt);
+            prev_ias = ias;
+            run.max_vs = run.max_vs.max(vs);
+            low = low.min(alt);
+            run.climb_back_ft = run.climb_back_ft.max(alt - low);
             let brg = crate::nav::bearing_deg(lat, lon, f.lat, f.lon);
             (lat, lon) = crate::nav::project_latlon(lat, lon, brg, gs * dt / 3600.0);
         }
-        (crossings, max_vs)
+        run
+    }
+
+    /// The recorded UNTO2A from the ROLAS leg at FL370 (LIBP-LEMG,
+    /// 2026-09-26), sequenced 1.2 nm out (FOFUS's recorded capture), the
+    /// recorded groundspeed on each leg (the wind), flown closed loop.
+    /// Returns the altitude at each fix and the highest vertical speed.
+    fn fly_unto2a() -> (Vec<(String, f64)>, f64, f64) {
+        let (legs, cons, speeds) = lemg_unto2a();
+        let first = legs[0].fix.clone().unwrap();
+        let run = fly_arrival(
+            &legs,
+            &cons,
+            1,
+            (first.lat, first.lon),
+            37_000.0,
+            257.0,
+            |_| 255.0,
+            |i, frac, tas| {
+                // The recorded groundspeed less the recorded airspeed's TAS:
+                // the wind, carried at the airspeed flown here.
+                let ((g0, g1), (i0, i1)) = speeds[i];
+                let (g, rec) = (g0 + (g1 - g0) * frac, i0 + (i1 - i0) * frac);
+                let alt = legs[i].alt1_ft.unwrap_or(20_000.0);
+                tas + g - rec * (1.0 + 0.02 * alt / 1_000.0)
+            },
+            1.2,
+            ArrivalLaw::Protected,
+            Plant::default(),
+        );
+        (run.crossings.into_iter().map(|(f, a, _)| (f, a)).collect(), run.max_vs, run.climb_back_ft)
+    }
+
+    /// EGBB's HEME1B as the 737 flew it on 2026-09-28 (sortie
+    /// 1790601822-full_auto): LAM at the FL180 cruise, then the STAR's
+    /// fixes (earth_fix.dat, HON the VOR), the navlog's straight line from
+    /// the cruise at HEMEL to GROVE's FL070 (`plan_audit::realtitude_star`'s
+    /// rule) under the windows `procedure` `star_constraints` logged.
+    fn egbb_heme1b() -> (Vec<ProcLeg>, Vec<crate::nav::StarConstraint>) {
+        let fixes: [(&str, f64, f64); 8] = [
+            ("LAM", 51.646, 0.151667),
+            ("HEMEL", 51.805555556, -0.419383333),
+            ("BUZAD", 51.942244444, -0.552280556),
+            ("WELIN", 52.247291667, -0.852336111),
+            ("PUFAX", 52.314447222, -1.345055556),
+            ("HON", 52.356677778, -1.663725000),
+            ("OSKOT", 52.341655556, -2.058408333),
+            ("GROVE", 52.393822222, -1.928811111),
+        ];
+        let mut legs: Vec<ProcLeg> = fixes.iter().map(|(id, la, lo)| leg(id, *la, *lo)).collect();
+        legs[0].alt1_ft = Some(18_000.0);
+        let star = crate::plan_audit::realtitude_star(legs[1..].to_vec(), Some(18_000.0), Some(7_000.0), 1);
+        legs.truncate(1);
+        legs.extend(star);
+        let c = |fix: &str, min: Option<f64>, max: Option<f64>, kts: Option<f64>| crate::nav::StarConstraint {
+            fix: fix.into(),
+            min_ft: min,
+            max_ft: max,
+            max_kts: kts,
+        };
+        let cons = vec![
+            c("HEMEL", Some(22_000.0), Some(22_000.0), None),
+            c("PUFAX", None, None, Some(250.0)),
+            c("HON", Some(9_000.0), Some(9_000.0), None),
+            c("OSKOT", None, None, Some(210.0)),
+            c("GROVE", Some(7_000.0), Some(7_000.0), Some(210.0)),
+        ];
+        (legs, cons)
+    }
+
+    /// The HEME1B from BUZAD at FL180 and 302 kt, as recorded at +1995: the
+    /// OFP's cruise on WELIN (299, or the capped 296), the profile's 255
+    /// after, no wind (the recorded groundspeed at FL180 was within 10 kt of
+    /// the TAS). Sequenced at the recorded 0.9 nm.
+    fn fly_heme1b(law: ArrivalLaw, plant: Plant) -> ArrivalRun {
+        let (mut legs, cons) = egbb_heme1b();
+        apply_arrival_constraints(&mut legs, &cons);
+        let welin_kts = if law == ArrivalLaw::AsFlown { 299.0 } else { 296.0 };
+        let buzad = legs[2].fix.clone().unwrap();
+        fly_arrival(
+            &legs,
+            &cons,
+            3,
+            (buzad.lat, buzad.lon),
+            18_031.0,
+            302.0,
+            |i| if i == 3 { welin_kts } else { 255.0 },
+            |_, _, tas| tas - 10.0,
+            0.9,
+            law,
+            plant,
+        )
+    }
+
+    /// #156 (and #32's windows): PUFAX 254 against 250, OSKOT 216 and GROVE
+    /// 218 against 210, six speedbrake extensions down the HEME1B, each at
+    /// 8 kt over. Flown on the fitted 737, the old laws repeat the busts;
+    /// the protected descent crosses every limit within 2 kt, every window
+    /// within 300 ft, and needs the brake at most twice.
+    #[test]
+    fn the_heme1b_is_flown_at_its_speeds_with_the_brake_for_height() {
+        let old = fly_heme1b(ArrivalLaw::AsFlown, Plant::default());
+        let new = fly_heme1b(ArrivalLaw::Protected, Plant::default());
+        let at = |run: &ArrivalRun, fix: &str| {
+            run.crossings.iter().find(|c| c.0 == fix).cloned().unwrap_or_else(|| panic!("{fix}: {:?}", run.crossings))
+        };
+        let busts = |run: &ArrivalRun| {
+            [("PUFAX", 250.0), ("OSKOT", 210.0), ("GROVE", 210.0)]
+                .iter()
+                .filter(|(f, kts)| at(run, f).2 > kts + 2.0)
+                .count()
+        };
+        assert!(busts(&old) >= 1 || old.brake_outs > 2, "the test must bite: {old:?}");
+        assert_eq!(busts(&new), 0, "{new:?}");
+        assert!(new.brake_outs <= 2, "{} extensions: {new:?}", new.brake_outs);
+        let hon = at(&new, "HON").1;
+        assert!((hon - 9_000.0).abs() <= 300.0, "HON at {hon:.0}: {new:?}");
+        let grove = at(&new, "GROVE").1;
+        assert!((grove - 7_000.0).abs() <= 300.0, "GROVE at {grove:.0}: {new:?}");
+        assert!(new.climb_back_ft < 100.0, "{:.0} ft regained: {new:?}", new.climb_back_ft);
+        // Not a fit to one plant: the flight path's effect 25 % either way,
+        // the idle deceleration 0.15 kt/s either way, the VS mode's dead
+        // time 1 to 3 s. Every limit within 3 kt, the brake rare.
+        let (mut worst, mut outs) = ((0.0f64, String::new()), 0usize);
+        for gamma_scale in [0.75, 1.0, 1.25] {
+            for drag_kts_s in [-0.15, 0.0, 0.15] {
+                for dead_ticks in [2, 4, 6] {
+                    let plant = Plant { gamma_scale, drag_kts_s, dead_ticks };
+                    let run = fly_heme1b(ArrivalLaw::Protected, plant);
+                    for (fix, kts) in [("PUFAX", 250.0), ("OSKOT", 210.0), ("GROVE", 210.0)] {
+                        let over = at(&run, fix).2 - kts;
+                        if over > worst.0 {
+                            worst = (over, format!("{fix} on {plant:?}: {run:?}"));
+                        }
+                    }
+                    outs = outs.max(run.brake_outs);
+                }
+            }
+        }
+        assert!(worst.0 <= 3.0, "{:.1} over at {}", worst.0, worst.1);
+        assert!(outs <= 4, "{outs} extensions");
     }
 
     /// FOFUS on UNTO2A is 7,000 to 10,000 ft and the 737 crossed it at 10,386
@@ -4982,20 +5412,27 @@ mod tests {
     /// against the last one (never reached), the proportional VS law trailed
     /// the path by 500 ft, and MG539's ceiling rose 600 ft as the aircraft
     /// slowed and the descent climbed back. Replayed on the recorded legs,
-    /// every window is made, FOFUS inside its top, and nothing climbs.
+    /// closed loop on the fitted 737 since #156 (the speed flown, not the
+    /// speed recorded): every window within the card's 300 ft slack, FOFUS
+    /// within 200 ft of its top as the leg sequences 1.2 nm out (the path
+    /// reaches a constraint 1 nm before its fix), and nothing climbs. The
+    /// old laws on the same plant climbed at 293 fpm.
     #[test]
     fn the_recorded_unto2a_crosses_fofus_inside_its_window() {
-        let (crossings, max_vs) = fly_unto2a();
+        let (crossings, max_vs, climb_back) = fly_unto2a();
         let (_, cons, _) = lemg_unto2a();
         let at = |fix: &str| crossings.iter().find(|(f, _)| f == fix).map(|c| c.1).unwrap();
         let fofus = at("FOFUS");
-        assert!((7_000.0..=10_100.0).contains(&fofus), "FOFUS at {fofus:.0}: {crossings:?}");
+        assert!((7_000.0..=10_200.0).contains(&fofus), "FOFUS at {fofus:.0}: {crossings:?}");
+        // A level-off's overshoot comes back; a descent never climbs (MG539
+        // regained 600 ft).
+        assert!(climb_back < 100.0, "{climb_back:.0} ft regained: {crossings:?}");
         for c in &cons {
             let alt = at(&c.fix);
-            assert!(c.min_ft.is_none_or(|m| alt >= m - 100.0), "{} at {alt:.0}", c.fix);
-            assert!(c.max_ft.is_none_or(|m| alt <= m + 100.0), "{} at {alt:.0}", c.fix);
+            assert!(c.min_ft.is_none_or(|m| alt >= m - 300.0), "{} at {alt:.0}", c.fix);
+            assert!(c.max_ft.is_none_or(|m| alt <= m + 300.0), "{} at {alt:.0}", c.fix);
         }
-        assert!(max_vs < 150.0, "the descent climbed at {max_vs:.0} fpm: {crossings:?}");
+        assert!(max_vs < 250.0, "the descent climbed at {max_vs:.0} fpm: {crossings:?}");
     }
 
     #[test]
