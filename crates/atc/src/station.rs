@@ -1191,6 +1191,7 @@ impl Station {
             | tower::Intent::RequestStartup
             | tower::Intent::RequestShutdown
             | tower::Intent::RequestIfrClearance { .. }
+            | tower::Intent::RequestTransit
             | tower::Intent::RequestClearance => format!(
                 "{}, contact {} Tower on {}.",
                 ctx.callsign,
@@ -1524,6 +1525,7 @@ impl Station {
             | tower::Intent::RequestStartup
             | tower::Intent::RequestShutdown
             | tower::Intent::RequestIfrClearance { .. }
+            | tower::Intent::RequestTransit
             | tower::Intent::RequestClearance => format!(
                 "{}, contact {} Tower on {}.",
                 ctx.callsign,
@@ -13372,6 +13374,60 @@ mod tests {
             !crate::party_line::take_zone_challenge(),
             "no challenge was spoken"
         );
+        Station::uninstall();
+    }
+
+    /// #83: the answer to a transit field's challenge is a transit request,
+    /// and it is two-way contact: the tower clears it through and its zone
+    /// watch asks no more (EDVW-ETND 2026-09-23: challenged on every
+    /// cooldown, nobody answered).
+    #[test]
+    fn a_transit_answers_the_zone_challenge_and_the_watch_stands_down() {
+        let _guard = SIDE_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (flat, flon) = (36.1512, -5.3554);
+        *ACTIVE_FIELD.lock().unwrap() = Some(("Gibraltar".into(), flat, flon));
+        *ACTIVE_PANEL.lock().unwrap() = Some((
+            "Gibraltar".into(),
+            11.0,
+            vec![("tower".to_string(), 131200_i64)],
+        ));
+        *CLEARANCE.lock().unwrap() = None;
+        *COMPLIANCE.lock().unwrap() = ComplianceState::NEW;
+        *ZONE_CHALLENGE.lock().unwrap() = false;
+        let t0 = Instant::now();
+        let t = t0 + std::time::Duration::from_secs_f64(ZONE_COOLDOWN_SECS + 1.0);
+        compliance_tick(flat + 0.03, flon, 1500.0, false, 100.0, true, t)
+            .expect("challenged");
+        assert!(crate::party_line::take_zone_challenge());
+        let wx = Wx {
+            wind_from_deg: 90.0,
+            wind_kts: 8.0,
+        };
+        let mut st = lxgb();
+        let ctx = st.make_ctx(
+            wx,
+            "QNH one zero one seven".into(),
+            "Delta Hotel Xray Alpha Bravo".into(),
+            false,
+            false,
+            None,
+            false,
+            None,
+        );
+        let call = "Gibraltar Tower, Delta Hotel Xray Alpha Bravo, helicopter, one thousand five hundred feet, request zone transit";
+        let intent = tower::parse_intent(call);
+        assert_eq!(intent, tower::Intent::RequestTransit);
+        let r = st.respond(call, Service::Tower, intent, &ctx, wx);
+        assert!(r.contains("cleared to transit the Gibraltar zone"), "{r}");
+        assert!(CLEARANCE.lock().unwrap().is_some(), "two-way contact");
+        // Past the cooldown, still in the zone: no second challenge.
+        let t = t + std::time::Duration::from_secs_f64(ZONE_COOLDOWN_SECS + 1.0);
+        assert!(
+            compliance_tick(flat + 0.03, flon, 1500.0, false, 100.0, true, t).is_none(),
+            "the watch stands down once the transit has called"
+        );
+        assert!(!crate::party_line::take_zone_challenge());
+        *CLEARANCE.lock().unwrap() = None;
         Station::uninstall();
     }
 
