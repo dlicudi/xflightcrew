@@ -9526,3 +9526,19 @@ failed read never drops a call), and identical calls collapse at the enqueue. Th
 from 84309.6 to 84397.1 is most likely the #135 hold (merged); `crew_radio_sent` `age_s` will show.
 Tests `a_five_mile_final_report_dies_with_the_five_mile_final`,
 `identical_calls_queued_back_to_back_collapse_to_one`. Offline only.
+
+## 2026-09-28: a checklist belongs to its flight; radar contact is the radar unit's (issues #137, #138)
+
+LEMG sorties 1790585651 and 1790586620: the After landing checklist began as Crew in the taxi in
+(628.2, 593.0) and, blocked on its own speech, still ran when full auto was armed (651.1, 620.3):
+"Speed brake, down." and "Flaps, up." (680.4 and 682.9; 640.0 and 666.0) over full auto's takeoff
+flaps, the second 1.8 s after full auto gave up. A Crew list is now stood down, latched, when an
+automation takes the aircraft after it began (`CrewWatch`, `mission_owner`), and any list on a new
+flight (`InitWatch` on `init_seq`, the crew's setups, `Reposition`). Gap: a same-field runway start
+from X-Plane's own flight screen moves neither.
+
+Sortie 1790584715 (t 1790585265.4, route squawk_watch): the zone clearance's Departure radar watch said
+"radar contact" in the tower's voice 4.3 s after rotation, and Departure said it again at the
+check-in. The watch now speaks only tuned to a radar unit and not while a check-in is owed; the
+check-in's reply satisfies it. Next sortie: `checklist` `stood_down` by "full auto"; exactly one
+"radar contact", from DEP at the check-in. Offline only.

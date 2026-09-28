@@ -254,6 +254,9 @@ Config: `XCOPILOT_ATC_AIRPORT` / `_VOICE` / `_RATE` / `_REGION`.
   ICAO or FAA phrasing; SID, altitude and code read back ENFORCED; the crew sees it only once
   accepted (`party_line::assigned_clearance`). **Cancel IFR** (`Intent::CancelIfr`,
   `Station::cancel_ifr`) retires the clearance, `IFR_FLIGHT` and the frozen runway.
+- **"Radar contact" is the radar unit's, on its own frequency** (`squawk_tick` `tuned`,
+  `radar_unit`): tuned to a tower the watch holds it; with a departure handoff armed it is the
+  check-in's reply (`check_in_owed`, `radar_contact_at_check_in`); nudges are still relayed.
 - **Levels are the field's**: at or above apt.dat's `1302 transition_level`
   (`Ctx.transition_level_ft`) a level is a flight level in clearance, readback and correction
   (`tower::climb_item`); `heard_altitude_ft` hears either form; the crew's check-in says flight
@@ -736,6 +739,12 @@ boundary audits the automation's own actions half done; `CLIMB_AGL_FT`, `CLIMB_S
 automation Monitor starts at once; with a pilot flying the copilot PROPOSES (`PROPOSAL_TTL`) and
 never acts by itself; the after-landing list runs at once as Crew. The profile's `checklist_flow:`
 maps titles. Panel: `flow::status()`.
+
+**A list belongs to the flight it began in** (`flow::stand_down`): an automation taking the aircraft
+after a Crew list began stands it down (`CrewWatch` over `mission_owner`, latched, also called at full
+auto's start); a new flight stands down any list (`InitWatch` on `init_seq`, the ramp and approach
+setups, the model's `Reposition`); a Crew list asked for under a mission names what it does not find
+as held, never writes (blackbox `checklist` `stood_down`; LEMG 2026-09-28).
 
 ## App modes & cabin crew
 
