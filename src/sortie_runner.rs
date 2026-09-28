@@ -324,6 +324,9 @@ pub struct Verdict {
     /// The case ended with the aircraft airborne and its loops left flying
     /// ([`HandBack::LeaveFlying`]): the next case's setup replaces them.
     pub left_flying: bool,
+    /// How the last case's aircraft came to rest before this case's setup,
+    /// and how long it took ([`SettleWatch`]).
+    pub settle: Option<Settle>,
 }
 
 /// The line that stops a run on a wreck that outlived its setup.
@@ -722,8 +725,13 @@ fn stage_numbers(s: &Value) -> String {
 pub fn row_line(r: &Row) -> String {
     let v = &r.verdict;
     let stages: Vec<String> = v.stages.iter().map(stage_numbers).collect();
+    let before = v
+        .settle
+        .and_then(|s| s.words())
+        .map(|w| format!(" ({w})"))
+        .unwrap_or_default();
     format!(
-        "{} {} #{}: {} in {:.0} s, sortie {}, {}{}{}",
+        "{} {} #{}: {} in {:.0} s{before}, sortie {}, {}{}{}",
         if v.pass { "PASS" } else { "FAIL" },
         r.case,
         r.rep,
@@ -756,14 +764,18 @@ fn cell(s: &str) -> String {
 pub fn table(spec_path: &str, started: &str, rows: &[Row]) -> String {
     let mut out = format!(
         "# Sortie run {started}\n\nSpec: `{spec_path}`\n\n\
-         | Case | # | Sortie | Verdict | Stages | Interventions | Secs | Reason |\n\
-         |---|---|---|---|---|---|---|---|\n"
+         | Case | # | Sortie | Verdict | Stages | Interventions | Secs | Before | Reason |\n\
+         |---|---|---|---|---|---|---|---|---|\n"
     );
     for r in rows {
         let v = &r.verdict;
         let stages: Vec<String> = v.stages.iter().map(stage_numbers).collect();
+        let before = v
+            .settle
+            .and_then(|s| s.words())
+            .unwrap_or_else(|| "-".into());
         out.push_str(&format!(
-            "| {} | {} | {} | {} | {} | {} | {:.0} | {} |\n",
+            "| {} | {} | {} | {} | {} | {} | {:.0} | {} | {} |\n",
             cell(&r.case),
             r.rep,
             v.sortie.as_deref().unwrap_or("-"),
@@ -771,6 +783,7 @@ pub fn table(spec_path: &str, started: &str, rows: &[Row]) -> String {
             cell(&stages.join("; ")),
             v.interventions,
             r.secs,
+            cell(&before),
             cell(&v.reason),
         ));
     }
@@ -897,8 +910,14 @@ pub struct Pace {
     pub still_max_s: f64,
     /// The case's `settle_s` is multiplied by this (1 live).
     pub settle_scale: f64,
-    /// Longest wait for the loops of the last case to let go.
+    /// Longest wait for the loops of the last case to let go once "my
+    /// controls" is typed.
     pub idle_max_s: f64,
+    /// Before a setup the last case's aircraft is at rest (no loop driving,
+    /// on the ground under [`STOPPED_KTS`]) this long...
+    pub quiet_s: f64,
+    /// ...waited for this long (its taxi-in finishing), then "my controls".
+    pub stop_max_s: f64,
     /// Longest wait for the last case's wreck to clear ([`CRASH_CLEAR_S`]).
     pub crash_clear_s: f64,
 }
@@ -911,6 +930,8 @@ impl Pace {
         still_max_s: 240.0,
         settle_scale: 1.0,
         idle_max_s: 60.0,
+        quiet_s: QUIET_S,
+        stop_max_s: STOP_MAX_S,
         crash_clear_s: CRASH_CLEAR_S,
     };
 }
@@ -973,27 +994,198 @@ pub async fn preflight(sim: &dyn RunnerSim) -> Result<()> {
     Ok(())
 }
 
-/// Between cases: the last case's loops let go, else "my controls". Loops the
-/// last case LEFT flying (airborne at its end) are taken back at once, right
-/// before this case's setup replaces the flight: the aircraft is nobody's
-/// only for the seconds between the two lines.
-async fn wait_idle(sim: &dyn RunnerSim, pace: &Pace, take_back_now: bool) -> Result<()> {
-    let t0 = now_s();
-    let mut told: Option<f64> = None;
-    loop {
-        match sim.read_string(STATUS_AUTO).await {
-            Ok(s) if !loop_flying(&s) => return Ok(()),
-            _ => {}
+/// Below this the last case's aircraft is stopped.
+pub const STOPPED_KTS: f64 = 1.0;
+/// `sim/flightmodel/position/groundspeed` is metres per second.
+const MPS_TO_KTS: f64 = 1.943_844;
+/// At rest this long before a setup: a taxi-in stops between its vacate and
+/// its drive to the stand (2.5 s at LEMG 31, 2026-09-28) with no loop
+/// driving, and that pause is not its end.
+pub const QUIET_S: f64 = 10.0;
+/// The longest wait for the last case's taxi-in to finish by itself (LEMG
+/// 31's stand was 3,350 m away at 18 kt, about six minutes).
+pub const STOP_MAX_S: f64 = 600.0;
+
+/// How the last case's aircraft was left before this case's setup: the run
+/// row carries it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum SettleEnd {
+    /// At rest by itself (or nothing to wait for).
+    AtRest,
+    /// Still moving on the ground at the bound: "my controls", then stopped
+    /// (`full_auto::hand_back_hold` stops and parks it).
+    MyControls,
+    /// In the air: taken back with "my controls" right before the setup
+    /// replaces the flight, never handed to nobody for longer (#132).
+    TakenBack,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Settle {
+    /// From the case's start to its setup.
+    pub secs: f64,
+    pub end: SettleEnd,
+}
+
+impl Settle {
+    /// The row's words; `None` when nothing was waited for.
+    pub fn words(&self) -> Option<String> {
+        match self.end {
+            SettleEnd::AtRest if self.secs < 1.0 => None,
+            SettleEnd::AtRest => Some(format!(
+                "waited {:.0} s for the last aircraft to stop",
+                self.secs
+            )),
+            SettleEnd::MyControls => Some(format!(
+                "my controls after {:.0} s, the last aircraft still moving",
+                self.secs
+            )),
+            SettleEnd::TakenBack => Some("the last aircraft taken back in the air".into()),
         }
-        match told {
-            None if take_back_now || now_s() - t0 > pace.idle_max_s => {
-                type_line(sim, ABORT_LINE, pace).await?;
-                told = Some(now_s());
+    }
+}
+
+/// What the driver does next between cases.
+#[derive(Debug, Clone, PartialEq)]
+pub enum SettleStep {
+    Wait,
+    TypeMyControls,
+    Ready(Settle),
+    Fail(String),
+}
+
+/// Between cases: the last case's aircraft at rest before the next setup
+/// reloads the sim. A full-auto sortie's verdict comes at its `taxi_in`
+/// stage with the aircraft still rolling (13 to 16 kt, sorties 1790584715
+/// and 1790585651, LEMG 2026-09-28), and the next runway start was posted
+/// 0.3 s later under the running taxi. At rest is no loop driving (the
+/// panel's marker) AND on the ground under [`STOPPED_KTS`], held
+/// [`Pace::quiet_s`]; past [`Pace::stop_max_s`] on the ground "my controls"
+/// stops it. In the air (or loops the last case LEFT flying) it is taken
+/// back at once, right before this case's setup replaces the flight. A
+/// failed read is no measurement: never at rest.
+pub struct SettleWatch {
+    started: f64,
+    quiet_since: Option<f64>,
+    /// "my controls" typed at, and whether in the air.
+    told: Option<(f64, bool)>,
+    take_back_now: bool,
+    quiet_s: f64,
+    stop_max_s: f64,
+    idle_max_s: f64,
+}
+
+impl SettleWatch {
+    pub fn new(now: f64, pace: &Pace, take_back_now: bool) -> Self {
+        Self {
+            started: now,
+            quiet_since: None,
+            told: None,
+            take_back_now,
+            quiet_s: pace.quiet_s,
+            stop_max_s: pace.stop_max_s,
+            idle_max_s: pace.idle_max_s,
+        }
+    }
+
+    /// At rest for `quiet_s`: the quiet clock runs only while it holds.
+    fn held(&mut self, now: f64, at_rest: bool) -> bool {
+        if !at_rest {
+            self.quiet_since = None;
+            return false;
+        }
+        let since = *self.quiet_since.get_or_insert(now);
+        now - since >= self.quiet_s
+    }
+
+    /// One poll: the marker (`Some(true)`: a loop driving), groundspeed in
+    /// knots, the wheels.
+    pub fn tick(
+        &mut self,
+        now: f64,
+        loop_flying: Option<bool>,
+        gs_kts: Option<f64>,
+        on_ground: Option<bool>,
+    ) -> SettleStep {
+        let idle = loop_flying == Some(false);
+        let at_rest =
+            idle && on_ground == Some(true) && gs_kts.is_some_and(|g| g.abs() < STOPPED_KTS);
+        let secs = now - self.started;
+        let ready = |end| SettleStep::Ready(Settle { secs, end });
+        match self.told {
+            None => {
+                if self.take_back_now || on_ground == Some(false) {
+                    // Nothing flying it: the setup replaces the flight.
+                    if idle {
+                        return ready(SettleEnd::AtRest);
+                    }
+                    self.told = Some((now, true));
+                    return SettleStep::TypeMyControls;
+                }
+                if self.held(now, at_rest) {
+                    return ready(SettleEnd::AtRest);
+                }
+                if secs > self.stop_max_s {
+                    // Unreadable wheels are no measurement: treated as flying.
+                    self.told = Some((now, on_ground != Some(true)));
+                    self.quiet_since = None;
+                    return SettleStep::TypeMyControls;
+                }
+                SettleStep::Wait
             }
-            Some(t) if now_s() - t > pace.idle_max_s => {
-                return Err(anyhow!("a loop is still flying after my controls"));
+            Some((t, true)) => {
+                if idle {
+                    ready(SettleEnd::TakenBack)
+                } else if now - t > self.idle_max_s {
+                    SettleStep::Fail("a loop is still flying after my controls".into())
+                } else {
+                    SettleStep::Wait
+                }
             }
-            _ => {}
+            Some((t, false)) => {
+                if self.held(now, at_rest) {
+                    return ready(SettleEnd::MyControls);
+                }
+                if now - t > self.idle_max_s {
+                    let what = match (idle, gs_kts) {
+                        (false, _) => "a loop is still driving".to_string(),
+                        (true, Some(g)) => format!("still moving at {:.0} kt", g.abs()),
+                        (true, None) => "its groundspeed unreadable".to_string(),
+                    };
+                    return SettleStep::Fail(format!(
+                        "the last aircraft never stopped after my controls ({what})"
+                    ));
+                }
+                SettleStep::Wait
+            }
+        }
+    }
+}
+
+/// Drive [`SettleWatch`] against the sim until the next setup may go.
+async fn settle_before_setup(
+    sim: &dyn RunnerSim,
+    pace: &Pace,
+    take_back_now: bool,
+) -> Result<Settle> {
+    let mut w = SettleWatch::new(now_s(), pace, take_back_now);
+    loop {
+        let (status, gs, ground) = tokio::join!(
+            sim.read_string(STATUS_AUTO),
+            sim.read(GROUNDSPEED),
+            sim.read(crate::datarefs::ON_GROUND_ANY),
+        );
+        let step = w.tick(
+            now_s(),
+            status.ok().map(|s| loop_flying(&s)),
+            gs.ok().map(|v| v * MPS_TO_KTS),
+            ground.ok().map(|g| g > 0.5),
+        );
+        match step {
+            SettleStep::Ready(s) => return Ok(s),
+            SettleStep::Fail(why) => return Err(anyhow!("{why}")),
+            SettleStep::TypeMyControls => type_line(sim, ABORT_LINE, pace).await?,
+            SettleStep::Wait => {}
         }
         tokio::time::sleep(pace.poll).await;
     }
@@ -1113,9 +1305,14 @@ pub async fn run_case(
         outcome: "runner".into(),
         ..Verdict::default()
     };
-    if let Err(e) = wait_idle(sim, pace, take_back_now).await {
-        return failed(e.to_string());
-    }
+    let settle = match settle_before_setup(sim, pace, take_back_now).await {
+        Ok(s) => s,
+        Err(e) => return failed(e.to_string()),
+    };
+    let failed = |reason: String| Verdict {
+        settle: Some(settle),
+        ..failed(reason)
+    };
     if let Err(e) = set_up_start(sim, case, apt_dat, pace).await {
         return failed(format!("setup: {e}"));
     }
@@ -1168,6 +1365,7 @@ pub async fn run_case(
         let _ = sim.write_float(SIM_SPEED, 1.0).await;
     }
     let mut verdict = verdict;
+    verdict.settle = Some(settle);
     let on_ground = match verdict.abort {
         true => sim
             .read(crate::datarefs::ON_GROUND_ANY)
@@ -1813,6 +2011,10 @@ mod tests {
                 ],
                 interventions: 1,
                 reason: "taxi: 5.8 m off the line | x".into(),
+                settle: Some(Settle {
+                    secs: 42.3,
+                    end: SettleEnd::AtRest,
+                }),
                 ..Verdict::default()
             },
         };
@@ -1833,7 +2035,11 @@ mod tests {
             lines[7],
             "| LEMG circuit | 1 | 1790600300-full_auto | FAIL | taxi FAIL (lat 5.8/3 m, cut 1/5 m); \
              alignment pass (err 0.4/3 deg, xtk 0.3/2 m); takeoff pass (xtk 1.1/5 m) | 1 | 900 | \
-             taxi: 5.8 m off the line / x |"
+             waited 42 s for the last aircraft to stop | taxi: 5.8 m off the line / x |"
+        );
+        assert!(
+            lines[6].contains("| 181 | - |"),
+            "nothing waited for is a dash: {t}"
         );
         assert_eq!(*lines.last().unwrap(), "1 of 2 passed.");
     }
@@ -1918,9 +2124,26 @@ mod tests {
         /// A typed mission begins and then never ends (the deadline's case).
         endless: std::sync::atomic::AtomicBool,
         commands: std::sync::Mutex<Vec<String>>,
+        /// After a mission's verdict the aircraft rolls on (its taxi-in, no
+        /// loop on the marker, as LEMG 31 read) for this many groundspeed
+        /// reads; `u32::MAX` until "my controls".
+        roll_after_mission: std::sync::atomic::AtomicU32,
+        rolling_reads: std::sync::atomic::AtomicU32,
+        /// A setup (mailbox post or approach line) while it rolled.
+        setups_while_rolling: std::sync::atomic::AtomicU32,
     }
 
+    /// The fake's taxi-in pace, 14 kt in metres per second.
+    const ROLL_MPS: f64 = 7.2;
+
     impl FakeSim {
+        /// A setup reloads the sim: whatever rolled is stopped, and counted.
+        fn setup_posted(&self) {
+            use std::sync::atomic::Ordering::SeqCst;
+            if self.rolling_reads.swap(0, SeqCst) > 0 {
+                self.setups_while_rolling.fetch_add(1, SeqCst);
+            }
+        }
         fn new(log: std::path::PathBuf) -> Self {
             Self {
                 typed: Default::default(),
@@ -1932,6 +2155,9 @@ mod tests {
                 airborne: false.into(),
                 endless: false.into(),
                 commands: Default::default(),
+                roll_after_mission: 0.into(),
+                rolling_reads: 0.into(),
+                setups_while_rolling: 0.into(),
             }
         }
     }
@@ -1946,6 +2172,17 @@ mod tests {
                 "xcopilot/sim/init_seq" => posted,
                 crate::datarefs::ON_GROUND_ANY => flag(!self.airborne.load(SeqCst)),
                 crate::datarefs::HAS_CRASHED => flag(self.crashed.load(SeqCst)),
+                GROUNDSPEED => {
+                    let left = self.rolling_reads.load(SeqCst);
+                    if left > 0 && left != u32::MAX {
+                        self.rolling_reads.store(left - 1, SeqCst);
+                    }
+                    if left > 0 {
+                        ROLL_MPS
+                    } else {
+                        0.0
+                    }
+                }
                 _ => 0.0,
             })
         }
@@ -1972,8 +2209,12 @@ mod tests {
             use std::sync::atomic::Ordering::SeqCst;
             let line = String::from_utf8_lossy(bytes).to_string();
             if name == "xcopilot/sim/init_flight" {
+                self.setup_posted();
                 self.inits.lock().unwrap().push(line);
                 return Ok(());
+            }
+            if line.starts_with("put us on") {
+                self.setup_posted();
             }
             assert_eq!(name, TYPED);
             self.typed.lock().unwrap().push(line.clone());
@@ -1984,6 +2225,9 @@ mod tests {
                 .unwrap();
             if line == ABORT_LINE {
                 self.flying.store(false, SeqCst);
+                // hand_back_hold: brakes to a stop in a few reads.
+                let left = self.rolling_reads.load(SeqCst);
+                self.rolling_reads.store(left.min(3), SeqCst);
             } else if self.endless.load(SeqCst) {
                 let s = format!("{}-endless", self.typed.lock().unwrap().len());
                 self.flying.store(true, SeqCst);
@@ -2010,6 +2254,8 @@ mod tests {
                 ] {
                     writeln!(f, "{r}").unwrap();
                 }
+                self.rolling_reads
+                    .store(self.roll_after_mission.load(SeqCst), SeqCst);
             }
             Ok(())
         }
@@ -2035,6 +2281,8 @@ mod tests {
             still_max_s: 1.0,
             settle_scale: 0.0,
             idle_max_s: 1.0,
+            quiet_s: 0.02,
+            stop_max_s: 0.5,
             crash_clear_s: 0.2,
         };
         let mut tail = BlackboxTail::at_end(&log);
@@ -2085,6 +2333,8 @@ mod tests {
             still_max_s: 1.0,
             settle_scale: 0.0,
             idle_max_s: 1.0,
+            quiet_s: 0.02,
+            stop_max_s: 0.5,
             crash_clear_s: 0.2,
         }
     }
@@ -2192,6 +2442,256 @@ mod tests {
         assert!(!rows[0].verdict.left_flying);
         assert_eq!(*sim.typed.lock().unwrap(), vec![setup, ABORT_LINE]);
         assert!(sim.commands.lock().unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #145, LEMG 31 (sortie 1790584715, 2026-09-28): the verdict came at
+    /// the taxi_in stage at 1790585617.8 with the aircraft at 16.1 kt, and
+    /// the next runway start was posted 0.3 s later. On the way to the
+    /// stand the taxi-in stood still with no loop driving from 618.2 to
+    /// 620.7 (vacated, then the taxi request), which is not its end.
+    #[test]
+    fn the_next_setup_waits_for_the_last_aircraft_at_rest() {
+        let pace = Pace {
+            quiet_s: QUIET_S,
+            stop_max_s: STOP_MAX_S,
+            idle_max_s: 60.0,
+            ..Pace::LIVE
+        };
+        let t0 = 1790585617.8;
+        let mut w = SettleWatch::new(t0, &pace, false);
+        // Rolling at 16 kt, the marker idle: never at rest.
+        assert_eq!(
+            w.tick(t0, Some(false), Some(16.1), Some(true)),
+            SettleStep::Wait
+        );
+        // The vacate-to-request pause: stopped 2.5 s, then driving again.
+        assert_eq!(
+            w.tick(618.2 + 1790585000.0, Some(false), Some(0.2), Some(true)),
+            SettleStep::Wait
+        );
+        assert_eq!(
+            w.tick(620.6 + 1790585000.0, Some(false), Some(0.2), Some(true)),
+            SettleStep::Wait
+        );
+        assert_eq!(
+            w.tick(620.9 + 1790585000.0, Some(true), Some(0.5), Some(true)),
+            SettleStep::Wait
+        );
+        // A loop driving at walking pace, or a failed read, is not at rest.
+        let t = 1790585700.0;
+        assert_eq!(
+            w.tick(t, Some(true), Some(0.0), Some(true)),
+            SettleStep::Wait
+        );
+        assert_eq!(
+            w.tick(t + 20.0, None, Some(0.0), Some(true)),
+            SettleStep::Wait
+        );
+        assert_eq!(
+            w.tick(t + 40.0, Some(false), None, Some(true)),
+            SettleStep::Wait
+        );
+        assert_eq!(
+            w.tick(t + 60.0, Some(false), Some(0.0), None),
+            SettleStep::Wait
+        );
+        // At the stand: at rest, held QUIET_S.
+        let s = 1790585960.0;
+        assert_eq!(
+            w.tick(s, Some(false), Some(0.3), Some(true)),
+            SettleStep::Wait
+        );
+        assert_eq!(
+            w.tick(s + QUIET_S - 0.5, Some(false), Some(0.3), Some(true)),
+            SettleStep::Wait
+        );
+        match w.tick(s + QUIET_S, Some(false), Some(0.3), Some(true)) {
+            SettleStep::Ready(Settle {
+                secs,
+                end: SettleEnd::AtRest,
+            }) => {
+                assert!((secs - (s + QUIET_S - t0)).abs() < 1e-6, "{secs}")
+            }
+            other => panic!("{other:?}"),
+        }
+
+        // Past the bound on the ground: "my controls", then at rest.
+        let mut w = SettleWatch::new(0.0, &pace, false);
+        assert_eq!(
+            w.tick(STOP_MAX_S, Some(false), Some(14.0), Some(true)),
+            SettleStep::Wait
+        );
+        assert_eq!(
+            w.tick(STOP_MAX_S + 0.5, Some(false), Some(14.0), Some(true)),
+            SettleStep::TypeMyControls
+        );
+        assert_eq!(
+            w.tick(STOP_MAX_S + 5.0, Some(false), Some(6.0), Some(true)),
+            SettleStep::Wait
+        );
+        assert_eq!(
+            w.tick(STOP_MAX_S + 20.0, Some(false), Some(0.0), Some(true)),
+            SettleStep::Wait
+        );
+        assert_eq!(
+            w.tick(
+                STOP_MAX_S + 20.0 + QUIET_S,
+                Some(false),
+                Some(0.0),
+                Some(true)
+            ),
+            SettleStep::Ready(Settle {
+                secs: STOP_MAX_S + 20.0 + QUIET_S,
+                end: SettleEnd::MyControls
+            })
+        );
+        // ...and one that never stops fails the case, naming the speed.
+        let mut w = SettleWatch::new(0.0, &pace, false);
+        w.tick(STOP_MAX_S + 0.5, Some(false), Some(14.0), Some(true));
+        match w.tick(STOP_MAX_S + 61.0, Some(false), Some(9.0), Some(true)) {
+            SettleStep::Fail(why) => assert!(why.contains("still moving at 9 kt"), "{why}"),
+            other => panic!("{other:?}"),
+        }
+
+        // In the air nothing is waited for: never handed to nobody for
+        // longer than the take-back before the setup (#132).
+        let mut w = SettleWatch::new(0.0, &pace, false);
+        assert_eq!(
+            w.tick(0.0, Some(true), Some(140.0), Some(false)),
+            SettleStep::TypeMyControls
+        );
+        assert_eq!(
+            w.tick(1.0, Some(true), Some(140.0), Some(false)),
+            SettleStep::Wait
+        );
+        assert_eq!(
+            w.tick(2.0, Some(false), Some(140.0), Some(false)),
+            SettleStep::Ready(Settle {
+                secs: 2.0,
+                end: SettleEnd::TakenBack
+            })
+        );
+        // Loops left flying with the wheels unreadable: taken back at once.
+        let mut w = SettleWatch::new(0.0, &pace, true);
+        assert_eq!(
+            w.tick(0.0, Some(true), None, None),
+            SettleStep::TypeMyControls
+        );
+        // Past the bound with the wheels unreadable: no measurement, as flying.
+        let mut w = SettleWatch::new(0.0, &pace, false);
+        assert_eq!(
+            w.tick(STOP_MAX_S + 1.0, Some(true), Some(3.0), None),
+            SettleStep::TypeMyControls
+        );
+        assert_eq!(
+            w.tick(STOP_MAX_S + 2.0, Some(false), None, None),
+            SettleStep::Ready(Settle {
+                secs: STOP_MAX_S + 2.0,
+                end: SettleEnd::TakenBack
+            })
+        );
+    }
+
+    fn circuit_spec() -> Spec {
+        parse_spec(
+            "cases: [{name: circuit, setup: {runway_start: {field: LEMG, runway: 31, engines_running: true}},\n\
+              command: fly a circuit}]",
+        )
+        .unwrap()
+    }
+
+    /// #145 on the fake sim: the circuit's verdict leaves the aircraft
+    /// rolling on its taxi-in with the marker idle; the next runway start
+    /// goes only once it is at rest, and the row says how long that took.
+    #[tokio::test]
+    async fn a_rolling_taxi_in_is_waited_out_before_the_next_setup() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let (dir, log) = scratch_log("taxi-in");
+        let sim = FakeSim::new(log.clone());
+        sim.roll_after_mission.store(30, SeqCst);
+        let mut tail = BlackboxTail::at_end(&log);
+        let pace = Pace {
+            stop_max_s: 5.0,
+            ..quick_pace()
+        };
+        let rows = run_all(
+            &sim,
+            &mut tail,
+            &circuit_spec(),
+            2,
+            "",
+            &pace,
+            &mut |_: &Row| {},
+        )
+        .await;
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().all(|r| r.verdict.pass), "{:?}", rows[1].verdict);
+        assert_eq!(
+            sim.setups_while_rolling.load(SeqCst),
+            0,
+            "no setup under a running taxi-in"
+        );
+        assert_eq!(sim.inits.lock().unwrap().len(), 2);
+        assert_eq!(
+            *sim.typed.lock().unwrap(),
+            vec!["fly a circuit", "fly a circuit"],
+            "a taxi-in that finishes by itself is never interrupted"
+        );
+        let settle = rows[1].verdict.settle.expect("the wait is on the row");
+        assert_eq!(settle.end, SettleEnd::AtRest);
+        assert!(settle.secs > 0.0);
+        assert_eq!(
+            rows[0].verdict.settle.map(|s| s.end),
+            Some(SettleEnd::AtRest),
+            "the first case had nothing to wait for"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A taxi-in that never ends by itself (the LEMG 31 drive stood down 1 km
+    /// off its line and was taken over by a second one): past the bound on
+    /// the ground "my controls" stops it (`hand_back_hold` parks), then the
+    /// setup, and the row says so.
+    #[tokio::test]
+    async fn a_taxi_in_past_the_bound_gets_my_controls_then_the_setup() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let (dir, log) = scratch_log("taxi-in-bound");
+        let sim = FakeSim::new(log.clone());
+        sim.roll_after_mission.store(u32::MAX, SeqCst);
+        let mut tail = BlackboxTail::at_end(&log);
+        let pace = Pace {
+            stop_max_s: 0.1,
+            ..quick_pace()
+        };
+        let mut seen = Vec::new();
+        let rows = run_all(
+            &sim,
+            &mut tail,
+            &circuit_spec(),
+            2,
+            "",
+            &pace,
+            &mut |r: &Row| seen.push(row_line(r)),
+        )
+        .await;
+        assert_eq!(rows.len(), 2);
+        assert_eq!(sim.setups_while_rolling.load(SeqCst), 0);
+        assert_eq!(
+            *sim.typed.lock().unwrap(),
+            vec!["fly a circuit", ABORT_LINE, "fly a circuit"],
+        );
+        assert_eq!(
+            rows[1].verdict.settle.map(|s| s.end),
+            Some(SettleEnd::MyControls)
+        );
+        assert!(
+            seen[1].contains("my controls after 0 s, the last aircraft still moving"),
+            "{}",
+            seen[1]
+        );
+        // The run's last taxi-in is left to finish: no setup follows it.
+        assert_eq!(sim.rolling_reads.load(SeqCst), u32::MAX);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
