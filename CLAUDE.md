@@ -443,6 +443,15 @@ everything blackboxes to `logs/blackbox.jsonl` (kinds: `atc`, `autotaxi`, `autot
   (`handoff_waits_for_schedule`), each step only once the flaps ARRIVE at the last
   (`paced_flap_step`) and called by its detent ("Flaps one.", `flap_step_line`). A circuit keeps
   the old climb-out.
+- **The initial climb holds V2 + 15 by pitch** (`autotakeoff::ClimbHold`, profile
+  `climb_pitch_max_deg`): liftoff to the 300 ft engage, the attitude target walks on the airspeed
+  trend, floored at the rotation attitude and capped by what the tail has cleared; silent profiles
+  keep 8 degrees (LEMG 13 2026-09-28: 162 to 185 kt at 8 degrees).
+- **A jet configures its autoflight before the roll** (`takeoff_config:` `flight_directors`,
+  `autothrottle_armed` (armed, never engaged: the takeoff owns the levers), `v2_kts`; probed) and
+  reduces thrust at `thrust_reduction_agl_ft` to `climb_thrust_ratio` at a crew's pace
+  (`thrust_reduced`, blackbox `thrust_reduction` with `n1`); the BEFORE TAKEOFF list audits it as a
+  Monitor once the roll's transponder check is done (`before_takeoff_audit`). A330: FD and V2 only.
 - **A runway start is a lined-up aircraft and still calls** (`tower::Ctx::own_on_runway`), never
   an incursion (`ComplianceState.runway_start`: a strip first seen stopped); its clearance comes
   first from the strip and names it (`full_auto::zone_clearance_from_the_strip`; asked again when the
@@ -683,7 +692,7 @@ spoken "taxi to parking" leaves the engines to the pilot.
 
 ### Still owed
 Issues labelled `owed` + `area:approach-landing` / `area:takeoff` / `area:full-auto` (retard #76,
-slow go-around #77, rotation #78, SID/STAR re-pick #79, authored-route capture #80, `ils_coupled` #81).
+slow go-around #77, SID/STAR re-pick #79, authored-route capture #80, `ils_coupled` #81).
 
 ## Helicopters: the hover loop
 

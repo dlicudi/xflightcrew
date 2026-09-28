@@ -9682,3 +9682,17 @@ report clear"); the call is two-way contact, so the zone watch stops challenging
 answers the destination's tower with the inbound call and any other field's with a transit request,
 each at most twice. Blackbox `heli_route` `final_tick`, `slow_tailwind`, `zone_challenge`. #84 not
 done. Offline only.
+
+## 2026-09-28: the initial climb and the jet's autoflight (issues #78, #91)
+
+Sortie 1790596335 (and the other four LEMG 13 circuits): rotate 145.45, liftoff 162.62, 185 kt at the
+300 ft AP engage, theta 11.47 with the elevator at -0.37 nose-down against an 8 degree target.
+`ClimbHold` now walks the attitude target on the airspeed trend toward `initial_climb_kts` - 5 (V2 +
+15), floored at 8 and capped by `climb_pitch_max_deg` (737 18, A330 17.5, VERIFY) and the tail
+clearance. On a plant fitted to that sortie (moment 130, alpha 4, thrust excess 0.185) the old law
+reproduces 186.5 kt at 300 ft; the new one 166-167. #91: `takeoff_config:` gains flight directors,
+autothrottle ARMED (never engaged), V2 in the MCP, thrust reduction at a declared height (737 1,000 ft
+to lever 0.9, VERIFY against N1) and a read-only BEFORE TAKEOFF audit; the 737 list's SPEED BRAKE
+item tested `<0.05` and passed an armed lever (-0.5), now `-0.05|0.05`. Open: the circuit's 300 ft AP
+handover from a ~3,400 fpm pitch climb to VS 1500, the circuit's 500 ft flap dump at 190 kt, the MCP
+speed after V2 (filed). Offline only.
