@@ -1677,6 +1677,23 @@ impl Voice {
         speaker: StationSpeaker,
         text: impl Into<String>,
     ) {
+        self.say_station_until(priority, speaker, text, || false);
+    }
+
+    /// [`Voice::say_station`] that stops WAITING (never speaking) once `stop`
+    /// says so, as [`Voice::say_until`] does for the crew's own line. The
+    /// command loop's crew-radio drain waited out the tower's whole reply
+    /// with a pilot's "my controls" already in hand: LEMG (2026-09-28,
+    /// sortie 1790586620) took the line off the channel at +0.0, spoke the
+    /// crew's "request taxi" and then the 242-character taxi clearance, and
+    /// routed the release only at +26.1 s while full auto taxied on.
+    pub fn say_station_until(
+        &self,
+        priority: Priority,
+        speaker: StationSpeaker,
+        text: impl Into<String>,
+        stop: impl Fn() -> bool,
+    ) {
         let latch = Arc::new(Latch {
             spoken: Mutex::new(false),
             cv: Condvar::new(),
@@ -1686,10 +1703,7 @@ impl Voice {
         // loop already reporter.log to the panel; mirroring here double-wrote
         // the tower's reply to the transcript (2026-07-23).
         self.enqueue_station(priority, text, Some(latch.clone()), speaker);
-        let mut spoken = latch.spoken.lock().unwrap();
-        while !*spoken {
-            spoken = latch.cv.wait(spoken).unwrap();
-        }
+        wait_spoken_or(&latch, stop);
     }
 }
 
@@ -2712,6 +2726,31 @@ mod tests {
         *inner.tuned_station.lock().unwrap() = None;
         assert!(station_unhearable(&inner, Some(Tower)));
         assert!(!station_unhearable(&inner, None));
+    }
+
+    /// #135, LEMG 2026-09-28 (sortie 1790586620): the command loop's crew
+    /// radio drain waited out the tower's whole 242-character taxi clearance
+    /// with the pilot's "my controls" already taken off the channel, and the
+    /// release was routed 26.1 s after it was typed. The station's wait gives
+    /// way to a pilot's line; the reply itself stays queued and still plays.
+    #[test]
+    fn a_station_reply_wait_gives_way_to_a_pilots_line() {
+        let voice = Voice::new(Config::default());
+        // A held frequency never plays: the reply sits queued, as the taxi
+        // clearance did behind the crew's own call.
+        voice.set_hold(true);
+        let t0 = Instant::now();
+        let typed_at = std::time::Duration::from_millis(150);
+        voice.say_station_until(
+            Priority::Readback,
+            StationSpeaker::Tower,
+            "taxi to holding point Hotel Sierra two runway three one",
+            || t0.elapsed() >= typed_at,
+        );
+        let waited = t0.elapsed();
+        assert!(waited < std::time::Duration::from_secs(2), "{waited:?}");
+        // Still owed to the frequency, never dropped by the give-way.
+        assert_eq!(voice.inner.radio_queue.lock().unwrap().heap.len(), 1);
     }
 
     #[test]

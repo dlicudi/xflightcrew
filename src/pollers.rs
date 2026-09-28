@@ -720,10 +720,14 @@ mod tests {
         assert!(!command_waiting());
 
         let main = include_str!("main.rs");
-        assert!(
-            main.contains("voice.say_until(Priority::Readback, line, pollers::command_waiting)")
-        );
+        assert!(main.contains("say_or(voice, reporter, kind, line, pollers::command_waiting)"));
+        assert!(main.contains("voice.say_until(Priority::Readback, line, stop)"));
         assert!(!main.contains("voice.say(Priority::Readback, line)"));
+        // #135: the crew-radio drain gives way to a line already in hand too,
+        // the tower's reply included (it waited out a whole taxi clearance
+        // with "my controls" taken and unrouted, LEMG 2026-09-28).
+        assert!(main.contains("let pilot_waiting = || pilot_line_pending(input.is_some());"));
+        assert!(main.contains("voice.say_station_until("));
     }
 
     /// A panel edit is `key=value` lines; the value keeps its own '='.
