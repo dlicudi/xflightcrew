@@ -1053,7 +1053,14 @@ pub fn run_autoland_scoped(
             let mut missed_since: Option<std::time::Instant> = None;
             let mut gear_down = false;
             let mut landing_config_done = false;
-            let mut last_flap: Option<f64> = None;
+            // The flap the wing is flying on at the arm: the schedule's first
+            // write must know what it would take away (`flap_kept_flying`).
+            // A failed read is no measurement: unknown, as before.
+            let mut last_flap: Option<f64> = xp
+                .get_float(FLAP_RATIO)
+                .await
+                .ok()
+                .filter(|f| f.is_finite() && (0.0..=1.0).contains(f));
             let mut vs_diverged: u32 = 0;
             let mut prev_vs_err: Option<f64> = None;
             // Warned once per approach when the VSI cannot be read.
@@ -1695,6 +1702,28 @@ pub fn run_autoland_scoped(
                         "autoland",
                         serde_json::json!({"event": "reversal_overflown", "alt": alt,
                             "radio": radio_ft, "dist": raw.dist_nm, "flown": reversals_flown}),
+                    );
+                }
+                // An inbound leg the glidepath has come down to is an
+                // approach: the pattern is done, the path takes the descent.
+                if reversal.as_ref().is_some_and(|r| {
+                    crate::reversal::path_joined(
+                        r,
+                        along_nm,
+                        xtk_now,
+                        track_true,
+                        rwy.course_deg,
+                        alt - raw.glidepath_alt_ft,
+                    )
+                }) {
+                    reversal = None;
+                    go_around.finish_reposition();
+                    missed = None;
+                    crate::blackbox::record(
+                        "autoland",
+                        serde_json::json!({"event": "reversal_done", "why": "path_joined",
+                            "dist": raw.dist_nm, "xtk_m": xtk_now * M_PER_NM,
+                            "above_path_ft": alt - raw.glidepath_alt_ft}),
                     );
                 }
                 if let Some(rev) = reversal.as_mut() {
@@ -2451,7 +2480,12 @@ pub fn run_autoland_scoped(
                         target - ias,
                         crate::aircraft::approach_thrust_min(),
                         last_flap.is_some_and(|f| f >= LANDING_FLAP_RATIO),
-                    );
+                    )
+                    .max(climb_power_floor(
+                        g.phase,
+                        g.target_vs_fpm,
+                        crate::aircraft::approach_thrust_min(),
+                    ));
                     thr_now.map(|throttle| (throttle + adj).clamp(min_thr, 1.0))
                 };
                 if g.phase != ApproachPhase::Flare && missed.is_none() {
@@ -2529,11 +2563,14 @@ pub fn run_autoland_scoped(
                 } else {
                     flap_schedule(g.dist_nm, alt - g.glidepath_alt_ft)
                 };
-                let flap = flap_held_within_limits(
-                    wanted,
-                    ias,
-                    &crate::aircraft::flap_limits(),
+                let limits = crate::aircraft::flap_limits();
+                let flap = flap_kept_flying(
+                    flap_held_within_limits(wanted, ias, &limits, last_flap),
                     last_flap,
+                    ias,
+                    &limits,
+                    ga,
+                    retract_speed_kts,
                 );
                 if last_flap != Some(flap) {
                     last_flap = Some(flap);
@@ -3134,6 +3171,58 @@ pub fn flap_held_within_limits(
     flap_within_limits(cur, ias_kts - FLAP_RETRACT_MARGIN_KTS, limits)
 }
 
+/// An APPROACH never takes away the flap the wing is flying on. A detent comes
+/// in only at the speed that flies what is left (`retract_kts`: the cleaner
+/// configuration's manoeuvring speed where the profile declares one, else its
+/// speed floor), unless a placard forces it (over the current detent's Vfe,
+/// [`flap_within_limits`]) or the go-around asks for its half (`go_around`).
+/// LEMG 13, 2026-09-28: every sim-started 10 nm final handed autoland the 737
+/// with flaps 2 (0.25) at idle, the distance schedule wanted it clean, and
+/// the flaps came up on the first tick at a 58 kt airspeed read (the sim's
+/// ASI still waking) and 146 kt a second later, under the 139 kt clean
+/// stall; with the lever at idle and a climb on the dial the aircraft sank
+/// at up to 4,400 fpm (sortie 1790583434-approach bottomed at 200 ft AGL,
+/// 1790584266-approach turned onto 12's line over rising ground and hit).
+/// `current` is `None` only when the flap position was never read. Pure.
+pub fn flap_kept_flying(
+    flap: f64,
+    current: Option<f64>,
+    ias_kts: f64,
+    limits: &[(f64, Option<f64>)],
+    go_around: bool,
+    retract_kts: impl Fn(f64) -> Option<f64>,
+) -> f64 {
+    let Some(cur) = current else {
+        return flap;
+    };
+    if go_around || flap + 1e-6 >= cur {
+        return flap;
+    }
+    // Over the placard of what is out: the placard wins, it is the other
+    // edge of the same envelope.
+    if flap_within_limits(cur, ias_kts, limits) + 1e-6 < cur {
+        return flap;
+    }
+    match retract_kts(flap) {
+        Some(need) if !(ias_kts >= need) => cur,
+        _ => flap,
+    }
+}
+
+/// The speed a flap setting may be retracted TO for this airframe: the
+/// detent's declared manoeuvring speed (`retract_above_kts`), else its speed
+/// floor (1.2 x the stall in it), else nothing known.
+fn retract_speed_kts(ratio: f64) -> Option<f64> {
+    crate::aircraft::live_profile()
+        .and_then(|p| {
+            crate::aircraft::flap_schedule(p.flaps.as_ref())
+                .into_iter()
+                .find(|(r, _)| (r - ratio).abs() < 1e-3)
+                .map(|(_, k)| k)
+        })
+        .or_else(|| crate::aircraft::config_floor_kts(ratio))
+}
+
 /// Speed to command at this distance: clean far out, approach speed by the FAP,
 /// linear between. Pure, so the schedule is testable without a sim.
 pub fn scheduled_ias(dist_nm: f64, approach_ias: f64) -> f64 {
@@ -3288,6 +3377,25 @@ pub fn approach_power_floor(
         _ => IDLE_THROTTLE,
     }
 }
+/// A climb is flown on thrust. Repositioning (Intercept) with the vertical
+/// law asking to CLIMB, the lever never sits below the airframe's approach
+/// thrust floor (idle when none is declared): the speed law alone reads a
+/// dive's rising airspeed as "fast" and idles. LEMG 13, 2026-09-28 (sortie
+/// 1790584266-approach): +100 to +2,000 fpm on the dial under the reposition
+/// floor, the lever at 0.10 from the arm until 467 ft radio, the 737 sinking
+/// 1,200 to 3,700 fpm. Final and the flare keep their own rules. Pure.
+pub fn climb_power_floor(
+    phase: ApproachPhase,
+    target_vs_fpm: f64,
+    approach_thrust_min: Option<f64>,
+) -> f64 {
+    if phase == ApproachPhase::Intercept && target_vs_fpm > 0.0 {
+        approach_thrust_min.unwrap_or(IDLE_THROTTLE).max(IDLE_THROTTLE)
+    } else {
+        IDLE_THROTTLE
+    }
+}
+
 /// Don't enforce the terrain floor inside this range ON FINAL — here a low
 /// radio altitude IS the approach (short final), not terrain to climb over.
 /// The gate applies to Final only: in Intercept the aircraft is repositioning,
@@ -7035,6 +7143,120 @@ mod tests {
         assert_eq!(held(0.5, 150.0, Some(1.0)), 0.5);
         // No flap profile: the schedule stands.
         assert_eq!(flap_held_within_limits(1.0, 300.0, &[], Some(0.0)), 1.0);
+    }
+
+    /// LEMG 13, 2026-09-28 (sortie 1790584266-approach, and every LEMG setup
+    /// of the run): the sim handed autoland the 737 at flaps 2 (0.25), the
+    /// schedule wanted clean at 9.9 nm, and the first tick took the flaps up
+    /// at a 58 kt airspeed read, the next at 146, under the 139 kt clean
+    /// stall. An approach keeps the flap the wing flies on until the speed
+    /// flies the cleaner configuration (the 737's "up" is declared at 210).
+    #[test]
+    fn the_approach_keeps_the_flap_the_wing_is_flying_on() {
+        let p = crate::aircraft::load("boeing_737_800").unwrap();
+        let sched = crate::aircraft::flap_schedule(p.flaps.as_ref());
+        let retract = |r: f64| {
+            sched
+                .iter()
+                .find(|(x, _)| (x - r).abs() < 1e-3)
+                .map(|(_, k)| *k)
+        };
+        let limits = [
+            (0.0, None),
+            (0.25, Some(250.0)),
+            (0.5, Some(210.0)),
+            (0.875, Some(175.0)),
+            (1.0, Some(162.0)),
+        ];
+        let wanted = flap_schedule(9.88, 2379.2 - 3240.9);
+        assert_eq!(wanted, 0.0, "the distance schedule wants clean at 9.9 nm");
+        // The old rule took them away on the recorded ticks...
+        assert_eq!(flap_held_within_limits(wanted, 58.2, &limits, Some(0.25)), 0.0);
+        assert_eq!(flap_held_within_limits(wanted, 146.7, &limits, Some(0.25)), 0.0);
+        // ...the approach keeps them, every tick of the dive.
+        for ias in [58.2, 146.7, 163.6, 166.0, 172.2, 203.5] {
+            let held = flap_held_within_limits(wanted, ias, &limits, Some(0.25));
+            assert_eq!(
+                flap_kept_flying(held, Some(0.25), ias, &limits, false, retract),
+                0.25,
+                "{ias} kt"
+            );
+        }
+        // At the manoeuvring speed they come in.
+        assert_eq!(flap_kept_flying(0.0, Some(0.25), 212.2, &limits, false, retract), 0.0);
+        // No declared speed: the configuration's floor stands in.
+        assert_eq!(flap_kept_flying(0.0, Some(0.25), 160.0, &limits, false, |_| Some(167.0)), 0.25);
+        assert_eq!(flap_kept_flying(0.0, Some(0.25), 170.0, &limits, false, |_| Some(167.0)), 0.0);
+        // Nothing known: the schedule stands, as before.
+        assert_eq!(flap_kept_flying(0.0, Some(0.25), 150.0, &limits, false, |_| None), 0.0);
+        // A placard still wins, and so does the go-around's half.
+        assert_eq!(flap_kept_flying(0.875, Some(1.0), 172.0, &limits, false, retract), 0.875);
+        assert_eq!(flap_kept_flying(0.5, Some(1.0), 145.0, &limits, true, retract), 0.5);
+        // Extending is never held back, and an unread flap changes nothing.
+        assert_eq!(flap_kept_flying(0.5, Some(0.25), 180.0, &limits, false, retract), 0.5);
+        assert_eq!(flap_kept_flying(0.0, None, 58.2, &limits, false, retract), 0.0);
+    }
+
+    /// Same sortie: +100 to +2,000 fpm on the dial under the reposition
+    /// floor while the speed law held the lever at 0.10 (the dive's rising
+    /// airspeed read as "fast"). A climb is flown on thrust.
+    #[test]
+    fn a_commanded_climb_is_never_flown_at_idle() {
+        use ApproachPhase::*;
+        assert_eq!(climb_power_floor(Intercept, 100.0, Some(0.3)), 0.3);
+        assert_eq!(climb_power_floor(Intercept, 2000.0, Some(0.3)), 0.3);
+        assert_eq!(climb_power_floor(Intercept, 2000.0, None), 0.1);
+        assert_eq!(climb_power_floor(Intercept, -700.0, Some(0.3)), 0.1);
+        assert_eq!(climb_power_floor(Intercept, 0.0, Some(0.3)), 0.1);
+        assert_eq!(climb_power_floor(Final, 500.0, Some(0.3)), 0.1);
+        assert_eq!(climb_power_floor(Flare, 500.0, Some(0.3)), 0.1);
+    }
+
+    /// Sortie 1790584266-approach, replayed: autoland armed on 12 from the
+    /// stale clearance, 3.6 km beside its centreline. The guidance never
+    /// descended or flared there: every recorded tick is an Intercept, no
+    /// arrest, and from 1,470 ft radio down to 16 ft the law asked to CLIMB
+    /// (the reposition floor). The dive was the aircraft's: flaps taken away
+    /// under the clean stall at idle (see the two tests above). Pinned so a
+    /// later gate cannot flare or descend off a centreline this far away.
+    #[test]
+    fn the_lemg_crash_ticks_were_never_a_descent_or_a_flare() {
+        let rwy = Runway {
+            icao: "LEMG".into(),
+            id: "12".into(),
+            // apt.dat's LEMG 12 threshold and its course to 30's.
+            thr_lat: 36.6910753,
+            thr_lon: -4.5078270,
+            course_deg: crate::nav::bearing_deg(36.6910753, -4.5078270, 36.6795648, -4.4805125),
+            length_m: 2750.0,
+            surface: 1,
+            dist_nm: 0.0,
+            elev_ft: 48.0,
+        };
+        // (dist nm, xtk m, alt ft, radio ft, ias kt), as recorded.
+        let ticks = [
+            (9.72, -3547.73, 2302.61, 1469.68, 166.04),
+            (9.55, -3491.5, 2198.82, 1079.73, 163.1),
+            (9.47, -3481.21, 2152.65, 909.03, 163.04),
+            (9.37, -3482.11, 2078.31, 864.14, 170.6),
+            (9.27, -3495.28, 1944.93, 728.23, 173.39),
+            (9.16, -3519.9, 1821.9, 467.69, 175.85),
+            (9.06, -3546.88, 1697.67, 274.78, 185.54),
+            (8.96, -3575.45, 1560.96, 131.37, 192.15),
+            (8.84, -3607.9, 1436.3, 72.21, 203.51),
+            (8.81, -3619.45, 1401.01, 46.95, 207.8),
+            (8.77, -3631.42, 1370.29, 16.36, 212.19),
+        ];
+        for (dist, xtk_m, alt, radio, ias) in ticks {
+            let (dist, ias): (f64, f64) = (dist, ias);
+            let lateral = xtk_m / M_PER_NM;
+            let along = (dist * dist - lateral * lateral).sqrt();
+            let (lat, lon) = crate::reversal::pattern_point(&rwy, along, lateral);
+            let g = guidance(lat, lon, alt, radio, ias.max(174.0), ias, &rwy, 145.0, 25.0, 0.0);
+            assert_eq!(g.phase, ApproachPhase::Intercept, "{dist} nm {radio} ft");
+            assert!(!g.arresting, "{dist} nm {radio} ft");
+            assert!(g.target_vs_fpm > 0.0, "{dist} nm {radio} ft: {}", g.target_vs_fpm);
+        }
     }
 
     /// EGTE 2026-09-21: handed back at 152 kt with half flap and a flat 0.75
