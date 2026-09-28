@@ -2476,8 +2476,73 @@ async fn fly(xp: XPlaneClient, config: Config, voice: Option<Voice>, tools: SubT
                 }
                 _ => Err(String::new()),
             };
+            // A departure other than the tower's is ASKED for on the radio
+            // before it is flown, never flown silently (EGKK 08R, sortie
+            // 1790601822: cleared KENE3P, flew LAM5P, #152). Refused or
+            // unanswered, the aircraft is handed back here on the ramp.
+            let cleared_words =
+                cleared_sid.as_deref().map(crate::tower::spoken_sid).unwrap_or_default();
+            let mut sid_refused = false;
+            let replanned = match replanned {
+                Ok(r) => match cleared_sid_plan(r.sid.as_deref(), cleared_sid.as_deref()) {
+                    ClearedSidPlan::Fly => Ok(r),
+                    ClearedSidPlan::Request(want) => {
+                        if request_sid(&callsign, cleared_sid.as_deref(), &want).await {
+                            Ok(Rechosen {
+                                line: format!(
+                                    "The tower gave us the {} departure. {}",
+                                    crate::tower::spoken_sid(&want),
+                                    r.line
+                                ),
+                                source: "cleared",
+                                sid: r.sid,
+                            })
+                        } else {
+                            sid_refused = true;
+                            Err(format!(
+                                "The tower cleared us via the {cleared_words} departure, it doesn't join our route, and they didn't give us the {}.",
+                                crate::tower::spoken_sid(&want)
+                            ))
+                        }
+                    }
+                    ClearedSidPlan::Cannot => {
+                        sid_refused = true;
+                        Err(format!(
+                            "The tower cleared us via the {cleared_words} departure, and no departure from runway {} joins our route.",
+                            crate::circuit::spell_runway(rwy.as_deref().unwrap_or_default())
+                        ))
+                    }
+                },
+                // The planned runway stands and the tower's SID does not fit
+                // the route: the plan's own SID is asked for, and flown only
+                // once the tower names it.
+                Err(no) if only_cleared => {
+                    event("cleared_sid_unflyable", json!({ "sid": cleared_sid, "why": no }));
+                    let asked = match planned_sid.as_deref() {
+                        Some(p) => request_sid(&callsign, cleared_sid.as_deref(), p).await,
+                        None => false,
+                    };
+                    match planned_sid.as_deref() {
+                        Some(p) if asked => Ok(Rechosen {
+                            line: format!(
+                                "The tower gave us the {} departure we planned.",
+                                crate::tower::spoken_sid(p)
+                            ),
+                            source: "cleared",
+                            sid: Some(p.to_string()),
+                        }),
+                        _ => {
+                            sid_refused = true;
+                            Err(format!(
+                                "The tower cleared us via the {cleared_words} departure, it doesn't join our route, and they didn't give us ours."
+                            ))
+                        }
+                    }
+                }
+                Err(no) => Err(no),
+            };
             match replanned {
-                Ok(Rechosen { line, source }) => {
+                Ok(Rechosen { line, source, .. }) => {
                     event(
                         "departure_rechosen",
                         json!({ "line": line, "source": source, "cleared_sid": cleared_sid }),
@@ -2491,23 +2556,19 @@ async fn fly(xp: XPlaneClient, config: Config, voice: Option<Voice>, tools: SubT
                         }
                     }
                 }
-                // The planned runway stands and only the tower's SID would
-                // not fit the route: said, and the plan's departure flown.
-                Err(no) if only_cleared => {
-                    event(
+                // The tower's SID cannot be flown to the route and it gave
+                // us no other: handed back on the ramp, the brakes on.
+                Err(no) if sid_refused => {
+                    event("cleared_sid_not_flown", json!({ "sid": cleared_sid, "why": no }));
+                    give_up(
+                        &xp,
+                        tools.taxi.park_brake_valve_set,
+                        &voice,
+                        &format!("{no} Your aircraft."),
                         "cleared_sid_not_flown",
-                        json!({ "sid": cleared_sid, "why": no }),
-                    );
-                    if let Some(sid) = &cleared_sid {
-                        announce(
-                            &voice,
-                            Priority::Advisory,
-                            &format!(
-                                "The tower cleared us via the {} departure, and it doesn't join our route. Flying the planned departure.",
-                                crate::tower::spoken_sid(sid)
-                            ),
-                        );
-                    }
+                    )
+                    .await;
+                    return;
                 }
                 Err(no) => {
                     event("departure_runway_mismatch", json!({ "why": why, "no": no }));
@@ -4677,7 +4738,7 @@ async fn choose_departure(
                     choice.ident, choice.join,
                 )
             };
-            Ok(Rechosen { line, source })
+            Ok(Rechosen { line, source, sid: Some(choice.ident.clone()) })
         }
         Err(Some(exit)) => {
             let idx = route
@@ -4696,6 +4757,7 @@ async fn choose_departure(
                     "Runway {spoken} in use and no departure from it joins our route, so direct to {exit}, watching the terrain."
                 ),
                 source: "chosen",
+                sid: None,
             })
         }
         Err(None) if only_cleared => Err("The cleared departure doesn't join our route.".to_string()),
@@ -4709,6 +4771,65 @@ async fn choose_departure(
 pub struct Rechosen {
     pub line: String,
     pub source: &'static str,
+    /// The SID flown; `None` direct to the planned SID's exit.
+    pub sid: Option<String>,
+}
+
+/// What the crew does about the tower's SID, once its own departure is
+/// chosen (issue #152: at EGKK 08R the tower cleared KENE3P and the crew
+/// flew LAM5P without a word on the radio). Pure.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ClearedSidPlan {
+    /// Fly what was chosen: it is the tower's SID, or there is no IFR SID.
+    Fly,
+    /// Ask the tower for this SID before flying it.
+    Request(String),
+    /// The tower's SID cannot be flown and there is no SID to ask for.
+    Cannot,
+}
+
+/// [`ClearedSidPlan`] for a flown SID (`None`: direct to the exit, or the
+/// plan's own departure) against the IFR clearance's SID. Pure.
+pub fn cleared_sid_plan(flown: Option<&str>, cleared: Option<&str>) -> ClearedSidPlan {
+    match (cleared, flown) {
+        (None, _) => ClearedSidPlan::Fly,
+        (Some(c), Some(f)) if f.eq_ignore_ascii_case(c) => ClearedSidPlan::Fly,
+        (Some(_), Some(f)) => ClearedSidPlan::Request(f.to_string()),
+        (Some(_), None) => ClearedSidPlan::Cannot,
+    }
+}
+
+/// The crew's call asking for another SID: "..., unable Kene three Papa,
+/// request the Lam five Papa departure" (`tower::requested_departure` reads
+/// it back). Pure.
+pub fn sid_request_call(callsign: &Option<String>, cleared: Option<&str>, want: &str) -> String {
+    let unable = cleared
+        .map(|c| format!("unable {}, ", crate::tower::spoken_sid(c)))
+        .unwrap_or_default();
+    crate::circuit::radio_call(
+        callsign,
+        &format!("{unable}request the {} departure", crate::tower::spoken_sid(want)),
+    )
+}
+
+/// Ask the tower for `want` in place of the cleared SID, and wait for the
+/// held clearance to name it (`party_line::assigned_clearance`). True when
+/// it does; blackbox `full_auto` `sid_requested` either way.
+async fn request_sid(callsign: &Option<String>, cleared: Option<&str>, want: &str) -> bool {
+    crate::circuit::transmit(sid_request_call(callsign, cleared, want));
+    waiting("the tower to approve the departure");
+    let named = |c: Option<crate::party_line::IfrClearance>| {
+        c.and_then(|c| c.sid).is_some_and(|s| s.eq_ignore_ascii_case(want))
+    };
+    let approved = wait_until(60.0, 500, || async {
+        named(crate::party_line::assigned_clearance())
+    })
+    .await;
+    event(
+        "sid_requested",
+        json!({ "cleared": cleared, "asked": want, "approved": approved }),
+    );
+    approved
 }
 
 /// The SIDs to try, the tower's first: the clearance's SID moved to the
@@ -4745,6 +4866,39 @@ pub fn departure_source(flown: Option<&str>, cleared: Option<&str>) -> &'static 
         (Some(f), Some(c)) if f.eq_ignore_ascii_case(c) => "cleared",
         _ => "chosen",
     }
+}
+
+/// The route the crew FILED, for the tower's IFR clearance
+/// (`party_line::provide_filed_route`, registered at boot): the loaded
+/// plan's origin, destination, navlog fixes (the fields themselves left out,
+/// as `procedure::enroute_legs` leaves them) and SID. Read at the moment of
+/// asking, so a replaced plan is a new route and a cleared one none.
+pub fn filed_route() -> Option<crate::party_line::FiledRoute> {
+    filed_route_of(crate::simbrief::loaded_plan().as_ref())
+}
+
+/// [`filed_route`] of one plan. Pure.
+pub fn filed_route_of(
+    plan: Option<&crate::simbrief::FlightPlan>,
+) -> Option<crate::party_line::FiledRoute> {
+    let p = plan?;
+    let n = p.waypoints.len();
+    let fixes: Vec<String> = p
+        .waypoints
+        .iter()
+        .enumerate()
+        .filter(|(i, w)| {
+            (*i != 0 || !w.ident.eq_ignore_ascii_case(&p.origin))
+                && (*i + 1 != n || !w.ident.eq_ignore_ascii_case(&p.destination))
+        })
+        .map(|(_, w)| w.ident.clone())
+        .collect();
+    Some(crate::party_line::FiledRoute {
+        origin: p.origin.clone(),
+        dest: p.destination.clone(),
+        fixes,
+        sid: p.procedures.sid.clone(),
+    })
 }
 
 /// The SID the IFR clearance hands the crew for the runway it was cleared
@@ -6778,6 +6932,71 @@ mod tests {
                 spoken_lbs: true,
             }),
         }
+    }
+
+    /// #152, the EGKK-EGBB plan of sortie 1790601822 (the pilot's OFP,
+    /// trimmed): its filed route, as the tower is given it, picks LAM5P off
+    /// 08R on the real EGKK SIDs, the same SID the crew's own order puts
+    /// first; with the tower's SID the crew's is the cleared one, and the
+    /// old clearance (KENE3P, off the route) is asked away on the radio in
+    /// words the tower reads back to LAM5P.
+    #[test]
+    fn the_filed_route_clears_the_sid_the_crew_flies_at_egkk() {
+        let v: serde_json::Value =
+            serde_json::from_str(include_str!("../bench/ofp/egkk-egbb-738.trimmed.json")).unwrap();
+        let mut p = plan(false);
+        p.origin = "EGKK".into();
+        p.destination = "EGBB".into();
+        p.procedures.sid = Some("LAM6M".into());
+        p.waypoints = std::iter::once("EGKK")
+            .chain(v["navlog"]["fix"].as_array().unwrap().iter().map(|f| f["ident"].as_str().unwrap()))
+            .map(|i| crate::simbrief::Waypoint { ident: i.into(), lat: 0.0, lon: 0.0, alt: 0.0 })
+            .collect();
+        let filed = super::filed_route_of(Some(&p)).unwrap();
+        assert_eq!(filed.fixes.first().map(String::as_str), Some("D257B"));
+        assert_eq!(filed.fixes.last().map(String::as_str), Some("GROVE"), "the fields left out");
+        let cifp = include_str!("../crates/atc/bench/cifp/EGKK_sids.dat");
+        let tower = crate::nav::sid_for_filed_route_in(cifp.lines(), "08R", &filed.fixes, filed.sid.as_deref())
+            .unwrap();
+        assert_eq!(tower.ident, "LAM5P");
+        let crew = super::prefer_cleared_sid(
+            crate::nav::sids_for_route_in(cifp.lines(), "08R", &filed.fixes),
+            Some(&tower.ident),
+            false,
+        );
+        assert_eq!(crew[0].ident, "LAM5P");
+        assert_eq!(super::departure_source(Some(&crew[0].ident), Some("LAM5P")), "cleared");
+        // The sortie's clearance: KENE3P, never among the crew's.
+        assert_eq!(
+            super::cleared_sid_plan(Some(&crew[0].ident), Some("KENE3P")),
+            super::ClearedSidPlan::Request("LAM5P".into())
+        );
+        let call = super::sid_request_call(
+            &Some("Whiskey Alpha Tango six two six".into()),
+            Some("KENE3P"),
+            "LAM5P",
+        );
+        assert_eq!(crate::tower::parse_intent(&call), crate::tower::Intent::RequestSid, "{call}");
+        let words = crate::tower::requested_departure(&call).unwrap();
+        let idents: Vec<String> = crate::nav::sid_transitions_in(cifp.lines(), "08R")
+            .into_iter()
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(crate::tower::match_sid(&words, &idents), Some("LAM5P"));
+    }
+
+    #[test]
+    fn a_cleared_sid_is_flown_asked_away_or_handed_back() {
+        use super::{cleared_sid_plan, ClearedSidPlan};
+        assert_eq!(cleared_sid_plan(Some("LAM5P"), None), ClearedSidPlan::Fly);
+        assert_eq!(cleared_sid_plan(None, None), ClearedSidPlan::Fly);
+        assert_eq!(cleared_sid_plan(Some("lam5p"), Some("LAM5P")), ClearedSidPlan::Fly);
+        assert_eq!(
+            cleared_sid_plan(Some("LAM5P"), Some("KENE3P")),
+            ClearedSidPlan::Request("LAM5P".into())
+        );
+        // Direct to the planned exit is no SID to ask for.
+        assert_eq!(cleared_sid_plan(None, Some("KENE3P")), ClearedSidPlan::Cannot);
     }
 
     /// The 172's book and both fields, all fine: fuel at the block, loaded

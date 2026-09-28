@@ -121,6 +121,14 @@ pub enum Intent {
     /// retires the IFR clearance and the flight's IFR standing, so the next
     /// region handoff terminates the service like any VFR flight's.
     CancelIfr,
+    /// "unable Kene three Papa, request the Lam five Papa departure": an IFR
+    /// flight asking to fly a different SID from the runway it was cleared
+    /// on. The SID's words are read by [`requested_departure`] (the station
+    /// matches them against the field's SIDs, [`match_sid`]); the station
+    /// holds the IFR book and amends the clearance, or says the cleared one
+    /// stands. The crew's alternative to flying another SID silently (EGKK
+    /// 08R, 2026-09-28, #152).
+    RequestSid,
     /// "request vectors" — the tower redirects to the approach frequency.
     RequestVectors,
     /// "good evening, Merida" / "hello tower" — an initial hail carrying no
@@ -587,6 +595,11 @@ pub fn parse_intent(transcript: &str) -> Intent {
     if let Some(dest) = ifr_request(&t) {
         return Intent::RequestIfrClearance { dest };
     }
+    // A named departure procedure ("request the Lam five Papa departure"),
+    // before "departure" can read as a takeoff or a runway request.
+    if requested_departure(&t).is_some() {
+        return Intent::RequestSid;
+    }
     // A request for a named runway ("request runway zero eight", "unable two
     // six, request zero eight left for length"), before the takeoff, landing
     // and taxi words below can claim "for takeoff" or "for departure". The
@@ -987,6 +1000,7 @@ pub fn intent_from_label(label: &str) -> Option<Intent> {
         "request_runway" => Intent::RequestRunway,
         "request_backtrack" => Intent::RequestBacktrack,
         "cancel_ifr" => Intent::CancelIfr,
+        "request_sid" => Intent::RequestSid,
         "request_vectors" => Intent::RequestVectors,
         "greeting" => Intent::Greeting,
         "flight_following" => Intent::RequestFlightFollowing,
@@ -1501,6 +1515,106 @@ pub fn requested_runway(transcript: &str) -> Option<String> {
             _ => designator_at(rest),
         }
     })
+}
+
+/// The SID a transmission asks for: the words between the LAST request word
+/// and "departure" ("unable Kene three Papa, request the Lam five Papa
+/// departure" is "lam five papa"). A name word, then a number spoken or
+/// written, then letters; never a runway, a taxi or a clearance ("request
+/// runway two six left for departure" is the runway request). `None` when
+/// the call names none. Pure.
+pub fn requested_departure(transcript: &str) -> Option<String> {
+    let toks = lower_tokens(transcript);
+    let req = toks
+        .iter()
+        .rposition(|w| matches!(w.as_str(), "request" | "requesting" | "requests"))?;
+    let dep = toks.iter().skip(req + 1).position(|w| w == "departure")? + req + 1;
+    let mut words: Vec<&str> = toks[req + 1..dep].iter().map(String::as_str).collect();
+    if words.first() == Some(&"the") {
+        words.remove(0);
+    }
+    const NOT_A_SID: [&str; 14] = [
+        "runway", "taxi", "for", "to", "via", "and", "clearance", "ifr", "vfr", "immediate",
+        "takeoff", "backtrack", "a", "the",
+    ];
+    let digit = |w: &str| spoken_digit(w).is_some();
+    // An ident written whole ("lam5p").
+    let typed = |w: &str| {
+        w.starts_with(|c: char| c.is_ascii_alphabetic()) && w.chars().any(|c| c.is_ascii_digit())
+    };
+    let ok = match words.as_slice() {
+        [one] => typed(one),
+        _ => {
+            words.len() >= 2
+                && words.iter().all(|w| !NOT_A_SID.contains(w))
+                && words.iter().any(|w| digit(w))
+                && !digit(words[0])
+        }
+    };
+    ok.then(|| words.join(" "))
+}
+
+/// A digit as spoken or written ("five", "niner", "nine", "5"). Pure.
+fn spoken_digit(w: &str) -> Option<char> {
+    Some(match w {
+        "zero" | "0" => '0',
+        "one" | "1" => '1',
+        "two" | "2" => '2',
+        "three" | "3" => '3',
+        "four" | "4" => '4',
+        "five" | "5" => '5',
+        "six" | "6" => '6',
+        "seven" | "7" => '7',
+        "eight" | "8" => '8',
+        "nine" | "niner" | "9" => '9',
+        _ => return None,
+    })
+}
+
+/// Which of `idents` (the field's SIDs) the words of [`requested_departure`]
+/// name: the name word begins with the ident's letters ("lam", "lambourne"
+/// for LAM5P), the digits match, and the NATO letters spell the suffix; an
+/// ident typed whole ("lam5p") also names it. `None` when none, or more than
+/// one, fits. Pure.
+pub fn match_sid<'a>(words: &str, idents: &'a [String]) -> Option<&'a str> {
+    let toks: Vec<&str> = words.split_whitespace().collect();
+    let read = |ident: &str| -> bool {
+        if toks.len() == 1 {
+            return toks[0].eq_ignore_ascii_case(ident);
+        }
+        let at = ident.find(|c: char| c.is_ascii_digit()).unwrap_or(ident.len());
+        let (name, rest) = ident.split_at(at);
+        let Some(first) = toks.first() else { return false };
+        if name.is_empty() || !first.starts_with(&name.to_ascii_lowercase()) {
+            return false;
+        }
+        let mut digits = String::new();
+        let mut letters = String::new();
+        for w in &toks[1..] {
+            if let Some(d) = spoken_digit(w) {
+                if !letters.is_empty() {
+                    return false;
+                }
+                digits.push(d);
+            } else if w.chars().count() == 1 {
+                letters.push(w.chars().next().unwrap_or(' ').to_ascii_uppercase());
+            } else {
+                let Some(c) = w.chars().next() else { return false };
+                let c = c.to_ascii_uppercase();
+                if !crate::atis::nato(c).eq_ignore_ascii_case(w) {
+                    return false;
+                }
+                letters.push(c);
+            }
+        }
+        rest.eq_ignore_ascii_case(&format!("{digits}{letters}"))
+    };
+    let mut hits = idents.iter().filter(|i| read(i));
+    let first = hits.next()?;
+    if hits.next().is_some() {
+        return None;
+    }
+    Some(first.as_str())
 }
 
 /// [`canon_runway`] for the station: does this strip ident match a canonical
@@ -2326,6 +2440,8 @@ impl Tower {
             // The station answers a cancellation (it holds the IFR book);
             // the tower alone has nothing to cancel.
             Intent::CancelIfr => format!("{}, say again.", ctx.callsign),
+            // Likewise a SID amendment: the station holds the IFR book.
+            Intent::RequestSid => format!("{}, say again.", ctx.callsign),
             Intent::RequestTakeoff => match self.state {
                 // Already cleared, but traffic has since appeared on final:
                 // the clearance is CANCELLED, not repeated — the 2026-07-10
@@ -3554,6 +3670,7 @@ mod tests {
             RequestRunway,
             RequestBacktrack,
             CancelIfr,
+            RequestSid,
             RequestVectors,
             Greeting,
             RequestFlightFollowing,
@@ -3634,7 +3751,7 @@ mod tests {
                         RejectingTakeoff => start,
                         // A backtrack is a ground request (ctx() is airborne: a
                         // garble) and a cancellation is the station's book.
-                        RequestBacktrack | CancelIfr => start,
+                        RequestBacktrack | CancelIfr | RequestSid => start,
                         // The IFR clearance clears a route, not a runway: the
                         // sequence stands (and with no offer it is "say again").
                         RequestIfrClearance { .. } => start,
@@ -4656,6 +4773,35 @@ mod tests {
     /// taxi to the runway the station resolved, refused with its reason,
     /// "say again" when the words named no runway. Never a takeoff or a
     /// landing clearance.
+    #[test]
+    fn a_named_departure_is_a_sid_request_and_nothing_else_is() {
+        // #152: the crew's words for another SID parse as the request and
+        // name it back; the calls around it keep their own readings.
+        let call = "Whiskey Alpha Tango six two six, unable Kene three Papa, request the Lam five Papa departure";
+        assert_eq!(parse_intent(call), Intent::RequestSid);
+        assert_eq!(requested_departure(call).as_deref(), Some("lam five papa"));
+        let idents: Vec<String> =
+            ["KENE3P", "LAM5P", "LAM1Z", "LAM5W"].iter().map(|s| s.to_string()).collect();
+        assert_eq!(match_sid("lam five papa", &idents), Some("LAM5P"));
+        assert_eq!(match_sid("lambourne five papa", &idents), Some("LAM5P"));
+        assert_eq!(match_sid("lam1z", &idents), Some("LAM1Z"));
+        assert_eq!(match_sid("kene three papa", &idents), Some("KENE3P"));
+        assert_eq!(match_sid("lam five", &idents), None, "no suffix names none");
+        assert_eq!(match_sid("dover two papa", &idents), None);
+        assert_eq!(parse_intent("request LAM5P departure"), Intent::RequestSid);
+        for other in [
+            "request runway two six left for departure",
+            "ready for departure",
+            "request departure",
+            "request taxi for departure",
+            "request IFR clearance to Echo Golf Bravo Bravo",
+            "cleared to Birmingham via the Kene three Papa departure, runway zero eight right, squawk four five four five",
+        ] {
+            assert_ne!(parse_intent(other), Intent::RequestSid, "{other}");
+        }
+        assert_eq!(intent_from_label("request_sid"), Some(Intent::RequestSid));
+    }
+
     #[test]
     fn a_runway_request_is_granted_as_a_taxi_or_refused_with_the_reason() {
         assert_eq!(requested_runway("request runway zero eight left").as_deref(), Some("8L"));

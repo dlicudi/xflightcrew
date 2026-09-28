@@ -102,6 +102,40 @@ pub(crate) static CALLSIGN_INPUTS: Mutex<Option<fn() -> crate::callsign::Inputs>
 /// [`CALLSIGN_INPUTS`]: nothing here can go stale.
 pub(crate) static CALLSIGN_TELEPHONY: Mutex<Option<fn() -> String>> = Mutex::new(None);
 
+/// The crew's provider of the route it FILED (`provide_filed_route`,
+/// registered once at boot): the loaded plan's origin, destination and fix
+/// idents, read when an IFR clearance is made up, so the tower clears the
+/// SID that joins it (`nav::sid_for_filed_route`, the crew's own rule). A
+/// function for the same reason as [`CALLSIGN_INPUTS`].
+pub(crate) static FILED_ROUTE: Mutex<Option<fn() -> Option<FiledRoute>>> = Mutex::new(None);
+
+/// A flight plan as filed, what a controller's strip would show: where from,
+/// where to, and the fixes between (SID fixes included, as the navlog lists
+/// them; the fields themselves left out).
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct FiledRoute {
+    pub origin: String,
+    pub dest: String,
+    pub fixes: Vec<String>,
+    /// The SID the plan was filed with, when it names one.
+    pub sid: Option<String>,
+}
+
+/// Register the crew's provider of [`FiledRoute`]. Called once at boot.
+pub fn provide_filed_route(f: fn() -> Option<FiledRoute>) {
+    *lock(&FILED_ROUTE) = Some(f);
+}
+
+/// The filed route from `origin` to `dest` right now; `None` without a
+/// provider, without a plan, or for a plan between other fields (a
+/// clearance to somewhere else is not this plan's).
+pub fn filed_route_for(origin: &str, dest: &str) -> Option<FiledRoute> {
+    let f = (*lock(&FILED_ROUTE))?;
+    f().filter(|r| {
+        r.origin.eq_ignore_ascii_case(origin) && r.dest.eq_ignore_ascii_case(dest) && !r.fixes.is_empty()
+    })
+}
+
 /// Set when the monitor speaks the released takeoff clearance; the main
 /// loop consumes it and syncs the tower FSM to what was said on frequency.
 pub(crate) static PENDING_TAKEOFF_CLEARANCE: Mutex<bool> = Mutex::new(false);
