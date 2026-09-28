@@ -15,6 +15,13 @@
 //! to 311 MB and every debrief read all of it). A TAP sees each record after
 //! it is written and may return more records (the live scorer's
 //! `stage_result`); those are written untapped, so a tap never recurses.
+//!
+//! **One record is one write** (#144, 2026-09-28): the line is formatted
+//! whole, newline included, and goes out in a single `write_all` under an
+//! advisory file lock ([`append_line`]). A `writeln!` of a `Value` is one
+//! `write(2)` per token, and a second PROCESS appending the same file (the
+//! sortie runner's own `api_load`) interleaved with it byte by byte: 70
+//! corrupt lines in one day's log, each pair losing two records.
 
 use std::io::Write;
 use std::sync::Mutex;
@@ -115,6 +122,25 @@ fn open_main() -> Option<std::fs::File> {
     std::fs::OpenOptions::new().create(true).append(true).open(path).ok()
 }
 
+/// Append one whole line to an append-mode file: one `write_all` of the
+/// formatted bytes under an exclusive advisory lock, so neither another
+/// thread's handle nor another process can land inside it. Best-effort: a
+/// lock that fails still writes.
+pub fn append_line(f: &mut std::fs::File, line: &[u8]) {
+    let locked = f.lock().is_ok();
+    let _ = f.write_all(line);
+    if locked {
+        let _ = f.unlock();
+    }
+}
+
+/// A record as the bytes of its line, newline included.
+fn line_bytes(line: &serde_json::Value) -> Vec<u8> {
+    let mut buf = serde_json::to_vec(line).unwrap_or_default();
+    buf.push(b'\n');
+    buf
+}
+
 fn write(kind: &str, fields: &serde_json::Value) -> serde_json::Value {
     let ts = now_s();
     let mut line = serde_json::json!({ "t": (ts * 10.0).round() / 10.0, "kind": kind });
@@ -129,17 +155,18 @@ fn write(kind: &str, fields: &serde_json::Value) -> serde_json::Value {
             out.insert("sortie".into(), s.id.clone().into());
         }
     }
+    let bytes = line_bytes(&line);
     {
         let mut guard = FILE.lock().unwrap_or_else(|e| e.into_inner());
         if guard.is_none() {
             *guard = Some(open_main());
         }
         if let Some(Some(f)) = guard.as_mut() {
-            let _ = writeln!(f, "{line}");
+            append_line(f, &bytes);
         }
     }
     if let Some(Sortie { file: Some(f), .. }) = sortie.as_mut() {
-        let _ = writeln!(f, "{line}");
+        append_line(f, &bytes);
     }
     line
 }
@@ -153,5 +180,67 @@ pub fn record(kind: &str, fields: serde_json::Value) {
         for (k, f) in tap(&line) {
             write(&k, &f);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// #144: many writers, each with its OWN append handle to one file (as
+    /// two processes are), each record long enough to be many tokens. Every
+    /// line must parse and every record must arrive whole, exactly once.
+    #[test]
+    fn concurrent_appenders_never_interleave_a_line() {
+        let dir = std::env::temp_dir().join(format!("bb-hammer-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("blackbox.jsonl");
+        let _ = std::fs::remove_file(&path);
+        const THREADS: u64 = 16;
+        const PER: u64 = 400;
+        let handles: Vec<_> = (0..THREADS)
+            .map(|w| {
+                let path = path.clone();
+                std::thread::spawn(move || {
+                    let mut f = std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(&path)
+                        .unwrap();
+                    for i in 0..PER {
+                        let rec = serde_json::json!({
+                            "t": 1790580993.8, "kind": "autoland", "writer": w, "i": i,
+                            "event": "power", "throttle_before": 0.27267703,
+                            "throttle_command": 0.28063357596207755, "vvi": -42.181896,
+                            "top": vec!["sim/flightmodel2/misc/has_crashed x58"; 8],
+                            "write_ok": true,
+                        });
+                        append_line(&mut f, &line_bytes(&rec));
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+        let text = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut seen = std::collections::HashSet::new();
+        for line in text.lines() {
+            let v: serde_json::Value = serde_json::from_str(line)
+                .unwrap_or_else(|e| panic!("unparsable line ({e}): {line}"));
+            assert!(seen.insert((v["writer"].as_u64().unwrap(), v["i"].as_u64().unwrap())));
+        }
+        assert_eq!(seen.len() as u64, THREADS * PER);
+    }
+
+    #[test]
+    fn a_line_is_formatted_whole_with_its_newline() {
+        let rec = serde_json::json!({"kind": "api_load", "top": ["a", "b"]});
+        let b = line_bytes(&rec);
+        assert_eq!(*b.last().unwrap(), b'\n');
+        assert_eq!(b.iter().filter(|&&c| c == b'\n').count(), 1);
+        let back: serde_json::Value = serde_json::from_slice(&b[..b.len() - 1]).unwrap();
+        assert_eq!(back, rec);
     }
 }
