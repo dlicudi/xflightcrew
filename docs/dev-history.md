@@ -9976,3 +9976,10 @@ LEMG, sorties 1790605551 and 1790618416: a circuit from the ramp asked a plain "
 `strip_clearance_call` said "for circuits". The ramp's call is now `zone_clearance_call` ("request
 clearance, for circuits" on a circuit mission, blackbox `full_auto request_clearance circuits`), and the
 tower clears the circuit without a stated runway too. Offline only.
+
+## 2026-09-28: the 737's coupled ILS off until proven (issue #81)
+
+Blackbox `ils coupling` 2026-09-26 to 09-28: 46 arms on the 737, 43 Armed then Abandoned (42 with
+`appr_reads [0,0]`: `app_press` never read back in `app_status`), 2 reached Coupled and were then
+abandoned, 1 stopped at LocCaptured. `ils_coupled: false` on `boeing_737_800`; autoland flies the
+heading knob as every other type. #81 stays open.

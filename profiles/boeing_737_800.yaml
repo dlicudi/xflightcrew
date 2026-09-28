@@ -477,7 +477,9 @@ advisor:
 # glideslope captured, the heading and VS dials left alone after capture.
 # On the heading knob the 737 wove 10 to 15 m either side of LEMG 13's
 # centreline all the way down (2026-09-26). First flown on this type then.
-ils_coupled: true
+# Off until proven (#81): 43 of 46 arms (2026-09-26 to 09-28) went Armed to
+# Abandoned with the APP press never read back (appr_reads [0,0]); 2 coupled, then abandoned.
+ils_coupled: false
 # Its own APP button: the stock sim/autopilot/approach armed nothing and the
 # coupling gave up after six seconds (LEMG 13, 2026-09-26).
 approach_command: laminar/B738/autopilot/app_press
