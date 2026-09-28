@@ -1868,6 +1868,38 @@ impl Tower {
         self.pending = None;
     }
 
+    /// The landing clearance as the tower speaks it ("..., runway one three,
+    /// wind one three zero degrees, five knots, cleared to land."): the reply
+    /// to a final report, and the line a withheld clearance is released with.
+    pub fn landing_clearance_line(&self, ctx: &Ctx) -> String {
+        let clearance = if self.touch_and_go {
+            "cleared touch and go"
+        } else {
+            "cleared to land"
+        };
+        format!(
+            "{}, runway {}, wind {}, {}.",
+            ctx.callsign, ctx.runway, ctx.wind, clearance
+        )
+    }
+
+    /// The MONITOR released a withheld landing clearance (the strip cleared,
+    /// `station::landing_hold_tick`): the state moves to ClearedToLand and the
+    /// readback is owed, exactly as if the clearance had been the reply to
+    /// the final report.
+    pub fn release_landing(&mut self, runway: String, instruction: String) {
+        self.state = State::ClearedToLand;
+        self.vacated = false;
+        self.pending = Some(PendingReadback {
+            awaited: Awaited::Landing {
+                runway,
+                touch_and_go: self.touch_and_go,
+            },
+            instruction,
+            nudges: 0,
+        });
+    }
+
     fn arm(&mut self, awaited: Awaited, instruction: &str) {
         self.pending = Some(PendingReadback {
             awaited,
@@ -2432,17 +2464,24 @@ impl Tower {
             // A final report earns the clearance from ANY state: a vectored
             // arrival reaches the tower already on final, with no inbound call
             // to this frequency — the tower doesn't argue with geometry.
+            // Never cleared to land onto an occupied runway: the arrival
+            // continues and the clearance follows once the strip is clear
+            // (the station arms the release watch, `landing_hold_tick`).
+            // LEMG 13 (sortie 1790594471-full_auto, 2026-09-28): "cleared to
+            // land" at 3.8 nm with a departure on the runway, then "go
+            // around, traffic on the runway" 0.8 s later.
+            Intent::ReportFinal if ctx.runway_occupied && !ctx.on_ground => {
+                self.state = State::Inbound;
+                self.pending = None;
+                format!(
+                    "{}, continue approach runway {}, traffic on the runway. \
+                     Expect late landing clearance.",
+                    ctx.callsign, ctx.runway
+                )
+            }
             Intent::ReportFinal => {
                 self.state = State::ClearedToLand;
-                let clearance = if self.touch_and_go {
-                    "cleared touch and go"
-                } else {
-                    "cleared to land"
-                };
-                let line = format!(
-                    "{}, runway {}, wind {}, {}.",
-                    ctx.callsign, ctx.runway, ctx.wind, clearance
-                );
+                let line = self.landing_clearance_line(ctx);
                 self.arm(
                     Awaited::Landing {
                         runway: ctx.runway.clone(),
@@ -3878,6 +3917,52 @@ mod tests {
         let mut twr = Tower::new();
         let r = twr.handle(Intent::RequestTakeoff, &airborne);
         assert!(!r.contains("present position"), "{r}");
+    }
+
+    /// LEMG 13 (sortie 1790594471-full_auto, 2026-09-28): "final runway one
+    /// three" at 3.8 nm with the departure TO4611 on the runway was answered
+    /// "cleared to land", and the go-around order followed 0.8 s later. A
+    /// final report onto an occupied runway continues; the clearance comes
+    /// when the strip clears (the station's release watch), with its
+    /// readback owed as if it had been the reply.
+    #[test]
+    fn a_final_onto_an_occupied_runway_continues_and_is_cleared_later() {
+        let mut occupied = ctx();
+        occupied.runway_occupied = true;
+        let mut twr = Tower::new();
+        twr.state = State::Inbound;
+        let r = twr.handle(Intent::ReportFinal, &occupied);
+        assert!(r.contains("continue approach runway zero niner"), "{r}");
+        assert!(r.contains("traffic on the runway"), "{r}");
+        assert!(!r.contains("cleared to land"), "{r}");
+        assert_eq!(twr.state, State::Inbound);
+        assert!(twr.pending().is_none(), "nothing to read back yet");
+        assert!(!twr.holds_runway());
+        // The release, as the monitor speaks it.
+        let line = twr.landing_clearance_line(&ctx());
+        assert!(
+            line.ends_with("wind zero niner zero degrees, three knots, cleared to land."),
+            "{line}"
+        );
+        twr.release_landing("zero niner".into(), line);
+        assert_eq!(twr.state, State::ClearedToLand);
+        assert_eq!(
+            twr.suggested_readback("November one seven two Sierra Papa")
+                .as_deref(),
+            Some("Cleared to land runway zero niner, November one seven two Sierra Papa.")
+        );
+        assert!(twr.holds_runway());
+        // A clear runway is cleared at once, as before.
+        let mut twr = Tower::new();
+        twr.state = State::Inbound;
+        let r = twr.handle(Intent::ReportFinal, &ctx());
+        assert!(r.ends_with("cleared to land."), "{r}");
+        // On the ground the occupancy is our own business, not a final's.
+        let mut twr = Tower::new();
+        let mut down = occupied.clone();
+        down.on_ground = true;
+        let r = twr.handle(Intent::ReportFinal, &down);
+        assert!(r.contains("cleared to land"), "{r}");
     }
 
     #[test]

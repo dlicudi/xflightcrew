@@ -3881,6 +3881,11 @@ pub async fn run(
                         );
                     }
                     let hold_armed = crate::party_line::takeoff_hold_armed();
+                    // A landing clearance withheld for traffic on the runway
+                    // ("continue approach"): the watch releases it once the
+                    // strip clears, or the go-around order comes (LEMG 13,
+                    // 2026-09-28).
+                    let landing_held = crate::party_line::landing_hold_armed();
                     // Party-line flavor stands down while the taxi guide is
                     // working AND the aircraft is rolling: its cues are
                     // perishable, and a three-line Ryanair landing exchange
@@ -3900,7 +3905,8 @@ pub async fn run(
                     // the party line is narrating it.
                     let wake_watch = tower_tuned && snap.on_ground;
                     if let Some((_, flat, flon, felev)) = crate::station::active_field() {
-                        if chatter_on || hold_armed || cleared_to_land || wake_watch {
+                        if chatter_on || hold_armed || landing_held || cleared_to_land || wake_watch
+                        {
                             let targets = crate::station::read_tcas_targets(xp.view()).await;
                             crate::station::wake_note_targets(&targets, now);
                             // Safety outranks flavor: the go-around order first.
@@ -3930,6 +3936,29 @@ pub async fn run(
                                         s.action(&format!("{}: {}", who.tag(), call.line));
                                     }
                                     voice.alert_station(Priority::Warning, who, call.line);
+                                }
+                            } else if landing_held {
+                                if let Some(line) =
+                                    crate::station::landing_hold_tick(&targets, snap.on_ground, now)
+                                {
+                                    crate::blackbox::record(
+                                        "atc",
+                                        serde_json::json!({
+                                            "route": "landing_release", "reply": &line,
+                                        }),
+                                    );
+                                    // The tower's clearance on the tower
+                                    // frequency only, like the takeoff release.
+                                    if tower_tuned {
+                                        if let Some(s) = status.as_ref() {
+                                            s.action(&format!("TWR: {line}"));
+                                        }
+                                        voice.alert_station(
+                                            Priority::Advisory,
+                                            crate::voice::StationSpeaker::Tower,
+                                            line,
+                                        );
+                                    }
                                 }
                             } else if hold_armed {
                                 if let Some(line) = crate::station::takeoff_hold_tick(

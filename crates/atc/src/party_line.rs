@@ -22,7 +22,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard};
 
 use crate::nav;
-use crate::station::{ClearanceSnap, TakeoffHold, TaxiWatch, VectorPlan};
+use crate::station::{ClearanceSnap, LandingHold, TakeoffHold, TaxiWatch, VectorPlan};
 use crate::tower;
 
 // ---- published state (world-side writes live in station.rs) ----
@@ -58,6 +58,19 @@ pub(crate) static TAXI_TO_STAND: Mutex<bool> = Mutex::new(false);
 /// A takeoff clearance withheld for landing traffic — armed by the reply
 /// path, released by the monitor once the final has stayed clear.
 pub(crate) static TAKEOFF_HOLD: Mutex<Option<TakeoffHold>> = Mutex::new(None);
+
+/// A landing clearance withheld for traffic on the runway ("continue
+/// approach, traffic on the runway") -- armed by the reply path to a final
+/// report, released by the monitor's traffic watch once the strip is clear or
+/// its occupant will be off it before we arrive
+/// (`station::landing_hold_tick`). LEMG 13, 2026-09-28: the tower cleared the
+/// circuit to land with a departure lined up and cancelled it 0.8 s later.
+pub(crate) static LANDING_HOLD: Mutex<Option<LandingHold>> = Mutex::new(None);
+
+/// The landing clearance the monitor released (its spoken runway and the
+/// instruction), for the station to sync its FSM before it answers the next
+/// call (the readback): `Station::sync_landing_release`.
+pub(crate) static PENDING_LANDING_RELEASE: Mutex<Option<(String, String)>> = Mutex::new(None);
 
 /// An armed vectors-to-final plan — the approach controller's worksheet.
 pub(crate) static VECTORS: Mutex<Option<VectorPlan>> = Mutex::new(None);
@@ -411,6 +424,13 @@ pub fn take_squawk_nudge() -> Option<SquawkNudge> {
 /// A takeoff clearance is currently being withheld for traffic.
 pub fn takeoff_hold_armed() -> bool {
     lock(&TAKEOFF_HOLD).is_some()
+}
+
+/// A landing clearance is currently being withheld for traffic on the
+/// runway: the monitor's traffic watch must keep reading the picture to
+/// release it (or order the go-around).
+pub fn landing_hold_armed() -> bool {
+    lock(&LANDING_HOLD).is_some()
 }
 
 /// The condition of a CONDITIONAL line-up ("behind the landing X, line up
