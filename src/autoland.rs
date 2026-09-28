@@ -515,6 +515,172 @@ pub fn vs_not_held_line(target_vs_fpm: f64) -> &'static str {
     }
 }
 const VS_DIVERGED_GIVE_UP_TICKS: u32 = 140;
+
+/// THE AUTOPILOT IS ENGAGED AND CONFIRMED, never assumed. The arm used to
+/// fire `servos_on` once and never read it back. After `setup_approach` the
+/// sim is still starting the new flight when autoland arms (IAS reads 0 to
+/// 12 kt for the first second), and that one press was lost: LEMG 13
+/// (sortie 1790587073-approach, 2026-09-28) flew with `ap_state` 132 and the
+/// servos off from the arm until the VS watchdog's re-press at +9.5 s, the
+/// aircraft flown by nobody while autoland commanded a climb: -900 fpm at
+/// the start growing to -3,450, 2,318 to 1,697 ft MSL, 405 ft AGL over the
+/// rising ground. Two of six runs lost the press the same way (1790583434,
+/// 1790583663 reached 200 and 145 ft AGL); the re-arms that engaged did so
+/// on the re-arm's own press.
+///
+/// So the press is re-fired every [`ENGAGE_RETRY_S`] until the servos READ
+/// on for [`ENGAGE_CONFIRM_READS`] ticks running with the sim live (an
+/// airspeed that is a flight's, [`ENGAGE_LIVE_IAS_KTS`]: the flight start
+/// can drop an engage made before it), each try blackboxed `ap_engage`. A
+/// failed read is no measurement: it neither confirms nor breaks the run.
+/// Until confirmed, with the servos read OFF, the loop holds the aircraft
+/// level itself on the elevator channel ([`engage_hold_gains`]). No
+/// confirmation within [`ENGAGE_GIVE_UP_S`] of live flight is said and the
+/// approach handed over.
+#[derive(Debug, Clone, Default)]
+pub struct ApEngage {
+    tries: u32,
+    last_fire_s: Option<f64>,
+    live_since_s: Option<f64>,
+    on_reads: u32,
+    /// The last GOOD servo read (true = on); `None` = never read.
+    last_read: Option<bool>,
+    confirmed: bool,
+}
+
+/// Seconds between presses while the servos do not read on: every tick at
+/// the loop's 0.6 s (`servos_on` is not a toggle).
+pub const ENGAGE_RETRY_S: f64 = 0.5;
+/// Consecutive live ticks the servos must read on to be confirmed.
+pub const ENGAGE_CONFIRM_READS: u32 = 2;
+/// An airspeed that is a flight's, not a flight still being started.
+pub const ENGAGE_LIVE_IAS_KTS: f64 = 30.0;
+/// Seconds of live flight without a confirmed engage before the approach is
+/// handed over.
+pub const ENGAGE_GIVE_UP_S: f64 = 10.0;
+
+/// What the engage watch wants this tick.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct EngageStep {
+    /// Press the flight director and `servos_on` now (try number `try_n`).
+    pub fire: bool,
+    pub try_n: u32,
+    /// Hold the aircraft on the elevator channel this tick: not confirmed,
+    /// and the servos last READ off.
+    pub hold: bool,
+    /// Confirmed on this tick (the record is written once).
+    pub confirmed_now: bool,
+    /// No engage within the bound: say it and hand over.
+    pub give_up: bool,
+}
+
+impl ApEngage {
+    /// The press at the arm (try 1): the arm fires before the first tick.
+    pub fn arm(&mut self, now_s: f64) -> EngageStep {
+        self.tries = 1;
+        self.last_fire_s = Some(now_s);
+        EngageStep {
+            fire: true,
+            try_n: 1,
+            hold: false,
+            ..Default::default()
+        }
+    }
+
+    pub fn confirmed(&self) -> bool {
+        self.confirmed
+    }
+
+    pub fn tries(&self) -> u32 {
+        self.tries
+    }
+
+    /// One tick. `servos` is the `servos_on` read (`None` = failed read),
+    /// `ias_kts` the airspeed read this tick.
+    pub fn step(&mut self, now_s: f64, servos: Option<f64>, ias_kts: f64) -> EngageStep {
+        if self.confirmed {
+            return EngageStep::default();
+        }
+        let live = ias_kts.is_finite() && ias_kts >= ENGAGE_LIVE_IAS_KTS;
+        if live && self.live_since_s.is_none() {
+            self.live_since_s = Some(now_s);
+        }
+        match servos {
+            Some(v) if v > 0.5 => {
+                self.last_read = Some(true);
+                if live {
+                    self.on_reads += 1;
+                } else {
+                    self.on_reads = 0;
+                }
+            }
+            Some(_) => {
+                self.last_read = Some(false);
+                self.on_reads = 0;
+            }
+            None => {}
+        }
+        if self.on_reads >= ENGAGE_CONFIRM_READS {
+            self.confirmed = true;
+            return EngageStep {
+                confirmed_now: true,
+                try_n: self.tries,
+                ..Default::default()
+            };
+        }
+        if self
+            .live_since_s
+            .is_some_and(|t0| now_s - t0 >= ENGAGE_GIVE_UP_S)
+        {
+            return EngageStep {
+                give_up: true,
+                try_n: self.tries,
+                ..Default::default()
+            };
+        }
+        let due = self
+            .last_fire_s
+            .is_none_or(|t| now_s - t >= ENGAGE_RETRY_S - 1e-9);
+        // Pressed while the servos last READ off, or were never read; a
+        // failed read after an "on" waits for the next measurement.
+        let fire = due && self.last_read != Some(true);
+        if fire {
+            self.tries += 1;
+            self.last_fire_s = Some(now_s);
+        }
+        EngageStep {
+            fire,
+            try_n: self.tries,
+            hold: self.last_read == Some(false),
+            ..Default::default()
+        }
+    }
+}
+
+/// The elevator law that holds the aircraft LEVEL until the autopilot is
+/// confirmed: the flare's free tracker ([`FlarePitch`] outside the
+/// ratchet) at two thirds of its default gain and a wider pull. Not the
+/// airframe's flare numbers: those are sized for the last forty feet (the
+/// 737's is pull-only to 0.45), and the recorded new-flight start at LEMG 13
+/// needs about 0.7 of standing pull to hold level (fitted to 1790587073:
+/// -900 fpm at the start plus 0.54 of nose-down mistrim through the 737's
+/// flare plant, 112 fpm rms). Swept against that plant and the LEMG 12 and
+/// fastest flare plants at the loop's 0.6 s tick: the least height lost
+/// with the least ringing.
+pub fn engage_hold_gains() -> FlareGains {
+    FlareGains {
+        p: 0.04,
+        d: 0.05,
+        trim_rate: 0.015,
+        max: 0.8,
+        min: -0.2,
+        balloon_ease_per_s: None,
+    }
+}
+
+/// The words when the autopilot will not come in.
+pub const ENGAGE_GIVE_UP_LINE: &str =
+    "The autopilot will not engage. Abandoning the approach. Your aircraft.";
 /// Past the arm distance by this much, still not on a missed approach, the
 /// approach is abandoned: the aircraft is leaving, not arriving.
 const RECEDING_GIVE_UP_NM: f64 = 5.0;
@@ -994,9 +1160,23 @@ pub fn run_autoland_scoped(
                 }
             }
 
-            // Engage the AP (FD up first for airframes that need it).
-            for c in &cfg.fd_commands { let _ = xp.run_command(c).await; }
-            let _ = xp.run_command(CMD_SERVOS_ON).await;
+            // Engage the AP (FD up first for airframes that need it), and
+            // CONFIRM it: the tick re-presses until the servos read on
+            // (`ApEngage`), holding the aircraft level until then.
+            let engage_t0 = std::time::Instant::now();
+            let mut engage = ApEngage::default();
+            let mut engage_pitch = FlarePitch::with_gains(engage_hold_gains());
+            let mut engage_held = false;
+            {
+                let e = engage.arm(0.0);
+                for c in &cfg.fd_commands { let _ = xp.run_command(c).await; }
+                let ok = xp.run_command(CMD_SERVOS_ON).await.is_ok();
+                crate::blackbox::record(
+                    "autoland",
+                    serde_json::json!({"event": "ap_engage", "try": e.try_n, "sent": ok,
+                        "at_s": 0.0, "servos": null, "ias": null}),
+                );
+            }
             // The altitude dial OUT OF THE WAY. Autoland flies the vertical
             // through the VS dial and never touched the altitude dial, so it
             // sat wherever the follower or the pilot left it: at LEAX the
@@ -2002,9 +2182,50 @@ pub fn run_autoland_scoped(
                 // watchdog does not count it, and the blackbox keeps `null`
                 // so the debrief can see the gauge was missing.
                 let throttle_name = throttle_dref();
-                let (vvi_read, throttle_read) = tokio::join!(
+                let (vvi_read, throttle_read, servos_read) = tokio::join!(
                     xp.get_float(VVI_FPM), xp.get_float(&throttle_name),
+                    async {
+                        if engage.confirmed() { None } else { xp.get_float(SERVOS_ON).await.ok() }
+                    },
                 );
+                // The engage watch (see `ApEngage`): re-press until the
+                // servos read on with the sim live, each try on the tape.
+                let engage_now = engage_t0.elapsed().as_secs_f64();
+                // Airborne only: a servo pressed on the wheels winds the
+                // yoke over (`disconnect_autopilot`).
+                let es = if on_ground < 0.5 && !rolling_out {
+                    engage.step(engage_now, servos_read.filter(|v| v.is_finite()), ias)
+                } else {
+                    EngageStep::default()
+                };
+                if es.fire {
+                    for c in &cfg.fd_commands { let _ = xp.run_command(c).await; }
+                    let ok = xp.run_command(CMD_SERVOS_ON).await.is_ok();
+                    crate::blackbox::record(
+                        "autoland",
+                        serde_json::json!({"event": "ap_engage", "try": es.try_n, "sent": ok,
+                            "at_s": engage_now, "servos": servos_read, "ias": ias,
+                            "radio": radio_ft}),
+                    );
+                }
+                if es.confirmed_now {
+                    crate::blackbox::record(
+                        "autoland",
+                        serde_json::json!({"event": "ap_engaged", "tries": es.try_n,
+                            "at_s": engage_now, "held": engage_held, "radio": radio_ft}),
+                    );
+                }
+                if es.give_up {
+                    gave_up = true;
+                    let _ = xp.set_float(&throttle_dref(), GIVE_UP_THROTTLE).await;
+                    announce(ENGAGE_GIVE_UP_LINE.into(), Priority::Warning);
+                    crate::blackbox::record(
+                        "autoland",
+                        serde_json::json!({"event": "give_up", "reason": "ap_not_engaged",
+                            "tries": es.try_n, "at_s": engage_now, "radio": radio_ft}),
+                    );
+                    break;
+                }
                 let thr_now = throttle_read.ok().filter(|v| v.is_finite());
                 let vvi = match vvi_read {
                     Ok(v) => Some(v),
@@ -2067,6 +2288,18 @@ pub fn run_autoland_scoped(
                             m.coast(tick_dt, radio_ft);
                         }
                         None
+                    }
+                    // NOBODY IS FLYING: the autopilot is not confirmed and
+                    // its servos read off. Level on the elevator until it
+                    // is (`ApEngage`, `engage_hold_gains`); the same
+                    // channel, the same single write below.
+                    (false, Some(v), false) if es.hold => {
+                        engage_held = true;
+                        flare_pitch.reset();
+                        if let Some(m) = flare_model.as_mut() {
+                            m.reset();
+                        }
+                        Some(engage_pitch.step(0.0, v, vvi_trend, tick_dt, false))
                     }
                     _ => {
                         flare_pitch.reset();
@@ -2176,6 +2409,9 @@ pub fn run_autoland_scoped(
                     "phase": format!("{:?}", g.phase), "ga": ga, "crab": crab, "crab_raw": crab_raw,
                     "trim": trim, "xtk_m": xtk_now * M_PER_NM,
                     "flare_elev": flare_elev, "flare_ail": flare_ail, "hands": arrest_hands,
+                    // The autopilot not yet confirmed and read off: the
+                    // elevator above is the level hold's (`ApEngage`).
+                    "ap_hold": es.hold,
                     // The model flare's own numbers: the sink it flew toward,
                     // the height that was taken at, and the sink the
                     // elevator did not explain.
@@ -2586,8 +2822,11 @@ pub fn run_autoland_scoped(
                 // ...and never inside the arrest, where the autopilot has
                 // no vertical to hold: a watchdog re-engaging the servos at
                 // fifty feet would be the fight this change removes.
+                // ...nor before the engage is confirmed: `ApEngage` owns the
+                // press until then, and the aircraft is held level meanwhile.
                 let not_held = g.phase != ApproachPhase::Flare
                     && !g.arresting
+                    && engage.confirmed()
                     && vs_err.is_some_and(|e| vs_not_held(e, prev_vs_err));
                 prev_vs_err = vs_err;
                 if not_held {
@@ -9818,5 +10057,308 @@ mod lemg_737_flare_tests {
         let again = m.step(76.0, 139.0, -760.0, 0.22);
         assert!(again.elev >= 0.0 && again.elev <= 0.45);
         assert!(again.unexplained_fpm.is_finite() && again.ahead_ft < 76.0);
+    }
+}
+
+#[cfg(test)]
+mod ap_engage_tests {
+    use super::*;
+
+    /// An arm over an autopilot already flying (the circuit's, full auto's):
+    /// confirmed on the second live read, never held, never re-pressed.
+    #[test]
+    fn an_engaged_autopilot_is_confirmed_and_never_held() {
+        let mut e = ApEngage::default();
+        assert!(e.arm(0.0).fire);
+        let s = e.step(0.6, Some(1.0), 150.0);
+        assert!(!s.fire && !s.hold && !s.confirmed_now);
+        let s = e.step(1.2, Some(1.0), 150.0);
+        assert!(s.confirmed_now && !s.hold);
+        assert_eq!(e.tries(), 1);
+        assert_eq!(
+            e.step(1.8, Some(0.0), 150.0),
+            EngageStep::default(),
+            "confirmed is sticky"
+        );
+    }
+
+    /// The lost press: re-pressed every tick while the servos read off,
+    /// held level meanwhile, confirmed only on live reads; a read on while
+    /// the flight is still starting (IAS 5) is not a confirmation, and the
+    /// flight start dropping it is pressed again.
+    #[test]
+    fn a_lost_press_is_pressed_again_until_the_servos_read_on() {
+        let mut e = ApEngage::default();
+        e.arm(0.0);
+        let s = e.step(0.05, Some(0.0), 12.0);
+        assert!(!s.fire && s.hold, "too soon to press again, but held");
+        let s = e.step(0.65, Some(0.0), 85.0);
+        assert!(s.fire && s.hold && s.try_n == 2);
+        let s = e.step(1.25, Some(1.0), 5.0);
+        assert!(
+            !s.fire && !s.hold && !s.confirmed_now,
+            "not live: no confirmation"
+        );
+        let s = e.step(1.85, Some(0.0), 132.0);
+        assert!(s.fire && s.hold && s.try_n == 3, "the start dropped it");
+        let s = e.step(2.45, None, 150.0);
+        assert!(
+            !s.confirmed_now && s.hold && s.fire && s.try_n == 4,
+            "a failed read is no measurement: still pressed, still held"
+        );
+        let s = e.step(3.05, Some(1.0), 160.0);
+        assert!(!s.confirmed_now && !s.fire && !s.hold);
+        let s = e.step(3.65, None, 160.0);
+        assert!(!s.confirmed_now, "a failed read does not confirm");
+        let s = e.step(4.25, Some(1.0), 160.0);
+        assert!(s.confirmed_now && s.try_n == 4);
+    }
+
+    /// An autopilot that never comes in: said and handed over after
+    /// ENGAGE_GIVE_UP_S of live flight, never before, never while starting.
+    #[test]
+    fn an_autopilot_that_never_engages_is_handed_over() {
+        let mut e = ApEngage::default();
+        e.arm(0.0);
+        let mut t = 0.6;
+        while t < 5.0 {
+            assert!(!e.step(t, Some(0.0), 0.0).give_up, "not live yet at {t}");
+            t += 0.6;
+        }
+        let live_from = t;
+        let mut gave = None;
+        while t < 30.0 {
+            if e.step(t, Some(0.0), 170.0).give_up {
+                gave = Some(t);
+                break;
+            }
+            t += 0.6;
+        }
+        let gave = gave.expect("gave up");
+        assert!(
+            gave - live_from >= ENGAGE_GIVE_UP_S - 1e-9
+                && gave - live_from < ENGAGE_GIVE_UP_S + 0.7,
+            "{gave} from {live_from}"
+        );
+        assert!(
+            !ENGAGE_GIVE_UP_LINE.contains('\u{2014}') && !ENGAGE_GIVE_UP_LINE.contains('\u{2013}')
+        );
+    }
+
+    /// The 737's pitch plant, fitted to the seven LEMG flares of 2026-09-26
+    /// (profiles/boeing_737_800.yaml `flare_elevator.model`: 4,970 fpm per
+    /// unit of elevator through lags of 0.84 and 3.1 s after 1.35 s of dead
+    /// time), with the new-flight start of LEMG 13 (sortie
+    /// 1790587073-approach, 2026-09-28) as its disturbance: the sim starts
+    /// the flight at 1.3 s descending 900 fpm with 0.54 of nose-down
+    /// mistrim, read through a 1 s VSI (fitted to the recorded ticks, 112
+    /// fpm rms). The servos: the flight start drops any engage made before
+    /// it; a press after it lands at the next frame.
+    struct NewFlight {
+        t: f64,
+        hist: std::collections::VecDeque<f64>,
+        x1: f64,
+        x2: f64,
+        vsi: f64,
+        alt_ft: f64,
+        servos: bool,
+        pressed: bool,
+    }
+
+    const DT: f64 = 0.05;
+    const START_S: f64 = 1.3;
+    const START_FPM: f64 = -900.0;
+    const MISTRIM: f64 = -0.54;
+    const FPM_PER_ELEV: f64 = 4970.0;
+    const DEAD_S: f64 = 1.35;
+    const ALT0_FT: f64 = 2318.2;
+
+    impl NewFlight {
+        fn new() -> Self {
+            let n = (DEAD_S / DT).round() as usize;
+            Self {
+                t: 0.0,
+                hist: std::iter::repeat_n(0.0, n).collect(),
+                x1: 0.0,
+                x2: 0.0,
+                vsi: 0.0,
+                alt_ft: ALT0_FT,
+                servos: false,
+                pressed: false,
+            }
+        }
+        fn press(&mut self) {
+            self.pressed = true;
+        }
+        /// Fly to `until` with `elev` on the channel (the loop's
+        /// sample-and-hold: one write per tick).
+        fn run(&mut self, until: f64, elev: f64) {
+            while self.t < until - 1e-9 {
+                let live = self.t >= START_S;
+                if !live {
+                    // The flight start wipes whatever was engaged before it.
+                    self.servos = false;
+                    self.pressed = false;
+                } else if self.pressed {
+                    self.servos = true;
+                    self.pressed = false;
+                }
+                let e_in = if live { MISTRIM + elev } else { 0.0 };
+                self.hist.push_back(e_in);
+                let e = self.hist.pop_front().unwrap_or(0.0);
+                self.x1 += (FPM_PER_ELEV * e - self.x1) * DT / 0.84;
+                self.x2 += (self.x1 - self.x2) * DT / 3.1;
+                let truth = if live { START_FPM + self.x2 } else { 0.0 };
+                self.vsi += (truth - self.vsi) * DT / 1.0;
+                self.alt_ft += truth / 60.0 * DT;
+                self.t += DT;
+            }
+        }
+    }
+
+    /// The autoland ticks of 1790587073 (seconds from the setup's result,
+    /// IAS kt, the VSI read fpm) until the AP came in at +10.9 s.
+    const TICKS: [(f64, f64, f64); 18] = [
+        (0.9, 12.4, -5.0),
+        (1.5, 85.3, -207.0),
+        (2.1, 132.1, -533.0),
+        (2.7, 153.8, -819.0),
+        (3.3, 162.4, -1017.0),
+        (3.9, 165.9, -1167.0),
+        (4.5, 167.7, -1311.0),
+        (5.1, 168.9, -1502.0),
+        (5.7, 169.6, -1720.0),
+        (6.3, 170.2, -1965.0),
+        (6.9, 170.9, -2208.0),
+        (7.5, 171.8, -2428.0),
+        (8.1, 173.1, -2642.0),
+        (8.7, 174.4, -2836.0),
+        (9.3, 175.6, -3027.0),
+        (9.9, 176.9, -3193.0),
+        (10.5, 178.1, -3337.0),
+        (11.0, 179.4, -3450.0),
+    ];
+    /// The arm's one press, just before the first tick (threshold_elev +0.8).
+    const ARM_S: f64 = 0.85;
+
+    /// The old arm: one press, never read back. Nobody flies until the
+    /// watchdog's re-press at +9.5 s. The plant reproduces the tape.
+    #[test]
+    fn the_old_arm_lets_the_new_flight_sink_until_the_watchdog() {
+        let mut p = NewFlight::new();
+        p.run(ARM_S, 0.0);
+        p.press();
+        let mut sq = 0.0;
+        for &(t, _, vvi) in &TICKS {
+            p.run(t, 0.0);
+            assert!(!p.servos, "the arm's press was lost at {t}");
+            sq += (p.vsi - vvi).powi(2);
+        }
+        let rms = (sq / TICKS.len() as f64).sqrt();
+        assert!(
+            rms < 150.0,
+            "the plant is the recorded flight: {rms:.0} fpm rms"
+        );
+        assert!(
+            p.vsi < -3000.0,
+            "the sink handed to the late AP: {:.0}",
+            p.vsi
+        );
+        assert!(
+            ALT0_FT - p.alt_ft > 250.0,
+            "lost {:.0} ft before anyone flew",
+            ALT0_FT - p.alt_ft
+        );
+    }
+
+    /// The new arm on the same flight: pressed until the servos READ on,
+    /// and held level on the elevator until then. The AP is in within two
+    /// seconds of the flight starting and inherits a sink it can hold.
+    #[test]
+    fn a_setup_approach_is_flown_from_the_first_tick() {
+        let mut p = NewFlight::new();
+        p.run(ARM_S, 0.0);
+        let mut e = ApEngage::default();
+        assert!(e.arm(0.0).fire);
+        p.press();
+        let mut law = FlarePitch::with_gains(engage_hold_gains());
+        let mut prev: Option<(f64, f64)> = None;
+        let mut elev = 0.0;
+        let mut confirmed_at = None;
+        let mut held_ticks = 0;
+        for &(t, ias, _) in &TICKS {
+            p.run(t, elev);
+            let servos = Some(if p.servos { 1.0 } else { 0.0 });
+            let s = e.step(t - ARM_S, servos, ias);
+            if s.fire {
+                p.press();
+            }
+            if s.confirmed_now {
+                confirmed_at = Some((t, p.vsi, p.alt_ft));
+                break;
+            }
+            let trend = prev.map_or(0.0, |(v, t0)| (p.vsi - v) / (t - t0));
+            let dt = prev.map_or(0.6, |(_, t0)| t - t0);
+            prev = Some((p.vsi, t));
+            elev = if s.hold {
+                held_ticks += 1;
+                law.step(0.0, p.vsi, trend, dt, false)
+            } else {
+                0.0
+            };
+        }
+        let (t, vsi, alt) = confirmed_at.expect("the autopilot is confirmed");
+        assert!(t <= 3.5, "confirmed at +{t} s, the old arm at +10.9");
+        assert!(held_ticks >= 1, "held from the first tick");
+        assert!(vsi > -1000.0, "the AP inherits {vsi:.0} fpm, not -3,200");
+        assert!(
+            ALT0_FT - alt < 60.0,
+            "lost {:.0} ft before the AP was in",
+            ALT0_FT - alt
+        );
+    }
+
+    /// The hold alone, with an autopilot that never comes in: the new
+    /// flight's sink is arrested on the elevator and the approach handed
+    /// over at the bound with the aircraft level, not at -3,450 fpm.
+    #[test]
+    fn with_no_autopilot_the_hold_keeps_the_new_flight_level_until_the_hand_over() {
+        let mut p = NewFlight::new();
+        p.run(ARM_S, 0.0);
+        let mut e = ApEngage::default();
+        e.arm(0.0);
+        let mut law = FlarePitch::with_gains(engage_hold_gains());
+        let mut prev: Option<(f64, f64)> = None;
+        let mut elev = 0.0;
+        let mut worst_vsi: f64 = 0.0;
+        let mut lowest = p.alt_ft;
+        let mut t = 0.9;
+        let mut gave = false;
+        while t < 30.0 {
+            p.run(t, elev);
+            lowest = lowest.min(p.alt_ft);
+            if t > 4.0 {
+                worst_vsi = worst_vsi.min(p.vsi);
+            }
+            let ias = if t < 1.5 { 12.0 } else { 170.0 };
+            let s = e.step(t - ARM_S, Some(0.0), ias);
+            if s.give_up {
+                gave = true;
+                break;
+            }
+            let trend = prev.map_or(0.0, |(v, t0)| (p.vsi - v) / (t - t0));
+            let dt = prev.map_or(0.6, |(_, t0)| t - t0);
+            prev = Some((p.vsi, t));
+            assert!(s.hold);
+            elev = law.step(0.0, p.vsi, trend, dt, false);
+            assert!(elev <= engage_hold_gains().max + 1e-9);
+            t += 0.6;
+        }
+        assert!(gave, "handed over");
+        // The flight starts at -900 and the elevator arrives 1.35 s late:
+        // the peak is that start, never the -3,450 nobody arrested.
+        assert!(worst_vsi > -1200.0, "the sink never builds: {worst_vsi:.0}");
+        assert!(p.vsi.abs() < 400.0, "level at the hand-over: {:.0}", p.vsi);
+        assert!(ALT0_FT - lowest < 150.0, "lost {:.0} ft", ALT0_FT - lowest);
     }
 }
