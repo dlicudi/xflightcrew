@@ -9995,3 +9995,15 @@ while active and the sim decays it ~0.8 s after its 1 s expiry (measured 2026-07
 start when another loop's brake command is still live, before setting. Test
 `the_hand_back_parks_after_the_brake_command_lets_go_of_the_ratio` (a sim whose command rides the
 ratio; the old code reads back false). Offline only.
+
+## 2026-09-28: a stopped aircraft's line-up distance jumped 14.9 m (issue #60)
+
+LEMG 31 (sorties 1790584715 t 1790585130.1, 1790585651 t 1790586080.1): the taxi rolled 7.4 m
+through its holding stop (`past_end_ticks` 36), and `line_up_path_from_lead_on` built aircraft, hold
+node (now BEHIND), then forward along the stub back through the aircraft. At rest the engage tick's
+joining projection (`project_signed_facing`) took the forward pass, 14.8 m along (236.0 of 255.8 to
+go), and the next tick's plain projection the leg back, 0 m (250.8 to go, lat 0.000). Both line-up
+builders now drive only the lead-on points still ahead (`lead_on_ahead`: past the aircraft's
+projection onto the stub, and over 5 m from it). The 3.54 m step at 1790586103.4 was at 5 kt, lat 3.2
+m and err 12 to 15 degrees: a vertex cut while rolling, not a stopped aircraft. Test
+`a_line_up_from_past_the_hold_never_runs_back_to_it`. Offline only.
