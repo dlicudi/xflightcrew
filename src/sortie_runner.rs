@@ -789,7 +789,7 @@ pub fn table(spec_path: &str, started: &str, rows: &[Row]) -> String {
 pub struct BlackboxTail {
     path: std::path::PathBuf,
     offset: u64,
-    partial: String,
+    partial: Vec<u8>,
 }
 
 impl BlackboxTail {
@@ -800,7 +800,7 @@ impl BlackboxTail {
         Self {
             path,
             offset,
-            partial: String::new(),
+            partial: Vec::new(),
         }
     }
 
@@ -828,11 +828,14 @@ impl BlackboxTail {
             return Vec::new();
         }
         self.offset += buf.len() as u64;
-        self.partial.push_str(&String::from_utf8_lossy(&buf));
+        // Bytes until a newline: a read that ends inside a multi-byte
+        // character must not mangle it. A line that does not parse (two
+        // records interleaved, #144) is skipped alone; the next line stands.
+        self.partial.extend_from_slice(&buf);
         let mut out = Vec::new();
-        while let Some(i) = self.partial.find('\n') {
-            let line: String = self.partial.drain(..=i).collect();
-            if let Ok(v) = serde_json::from_str::<Value>(line.trim()) {
+        while let Some(i) = self.partial.iter().position(|&b| b == b'\n') {
+            let line: Vec<u8> = self.partial.drain(..=i).collect();
+            if let Ok(v) = serde_json::from_slice::<Value>(line.trim_ascii()) {
                 out.push(v);
             }
         }
@@ -1856,6 +1859,40 @@ mod tests {
         // Rotated: the new, shorter file from its start.
         std::fs::write(&p, "{\"kind\":\"c\"}\n").unwrap();
         assert_eq!(tail.poll()[0]["kind"], "c");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #144: a corrupt line (two records interleaved, as the 2026-09-28 log
+    /// held 70 of) is skipped and the whole line after it is still read; a
+    /// multi-byte character split across two polls arrives intact.
+    #[test]
+    fn the_tail_skips_a_corrupt_line_and_keeps_the_next() {
+        use std::io::Write;
+        let dir = std::env::temp_dir().join(format!("xvl-tail-bad-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("bb.jsonl");
+        std::fs::write(&p, "").unwrap();
+        let mut tail = BlackboxTail::at_end(&p);
+        let mut f = std::fs::OpenOptions::new().append(true).open(&p).unwrap();
+        write!(
+            f,
+            "{{\"{{dtcache_hits\"\"::0.6,,\"event\":\"power\"\n\
+             throttle_before\":0.27,\"write_ok\":true}}\n\
+             {{\"kind\":\"stage_result\",\"stage\":\"landing\"}}\n"
+        )
+        .unwrap();
+        f.flush().unwrap();
+        let got = tail.poll();
+        assert_eq!(got.len(), 1, "{got:?}");
+        assert_eq!(got[0]["kind"], "stage_result");
+        let line = "{\"kind\":\"said\",\"text\":\"10\u{b0}C\"}\n".as_bytes();
+        let cut = line.iter().position(|&b| b == 0xC2).unwrap() + 1;
+        f.write_all(&line[..cut]).unwrap();
+        f.flush().unwrap();
+        assert!(tail.poll().is_empty());
+        f.write_all(&line[cut..]).unwrap();
+        f.flush().unwrap();
+        assert_eq!(tail.poll()[0]["text"], "10\u{b0}C");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
