@@ -509,9 +509,59 @@ pub struct IcingRead {
     pub switches: Vec<(IceKind, Option<bool>)>,
 }
 
+/// The sim's dewpoint levels, as the monitor reads them.
+pub const DEWPOINT_LEVELS: &str = "sim/weather/aircraft/dewpoint_deg_c";
+/// ...and the altitudes of those thirteen levels, metres.
+pub const ATMOSPHERE_LEVELS_M: &str = "sim/weather/region/atmosphere_alt_levels_m";
+
+/// The dewpoint AT the aircraft, degrees C: the sim's thirteen levels
+/// (`dewpoint_deg_c`, at `atmosphere_alt_levels_m`) interpolated at `alt_m`,
+/// held at the end levels outside them. `None` when the arrays are empty,
+/// unequal or not finite (a failed read is no measurement).
+///
+/// EGKK-EGBB, 2026-09-28 (sortie 1790601822-full_auto, #156): the monitor
+/// took element 0, the LOWEST level's dewpoint, for the air at the aircraft.
+/// Climbing through 4,800 ft the spread against the surface dewpoint said
+/// "visible moisture", engine anti-ice went on at +1222.8, and at every cold
+/// level after (FL180 included) the spread only grew more negative: the air
+/// was never clear, the 5 minute clear timer never ran, and the anti-ice
+/// stayed on to the stand. Pure.
+pub fn dewpoint_at(levels_m: &[f64], dewpoints_c: &[f64], alt_m: f64) -> Option<f64> {
+    if levels_m.is_empty() || levels_m.len() != dewpoints_c.len() || !alt_m.is_finite() {
+        return None;
+    }
+    let mut pts: Vec<(f64, f64)> = levels_m
+        .iter()
+        .zip(dewpoints_c)
+        .map(|(a, d)| (*a, *d))
+        .collect();
+    if pts.iter().any(|(a, d)| !a.is_finite() || !d.is_finite()) {
+        return None;
+    }
+    pts.sort_by(|a, b| a.0.total_cmp(&b.0));
+    let (lo, hi) = (pts[0], pts[pts.len() - 1]);
+    if alt_m <= lo.0 {
+        return Some(lo.1);
+    }
+    if alt_m >= hi.0 {
+        return Some(hi.1);
+    }
+    pts.windows(2).find_map(|w| {
+        let ((a0, d0), (a1, d1)) = (w[0], w[1]);
+        (alt_m >= a0 && alt_m <= a1).then(|| {
+            if a1 - a0 < 1e-6 {
+                d0
+            } else {
+                d0 + (d1 - d0) * (alt_m - a0) / (a1 - a0)
+            }
+        })
+    })
+}
+
 /// Visible moisture at +10 C or colder: the book's icing conditions. The
 /// sim gives no cloud flag at the aircraft, so moisture is a spread of 3 C
-/// or less between the air and its dewpoint. Pure.
+/// or less between the air and its dewpoint AT THE AIRCRAFT
+/// ([`dewpoint_at`]). Pure.
 pub fn icing_conditions(r: &IcingRead) -> bool {
     (-40.0..=10.0).contains(&r.oat_c) && (r.oat_c - r.dewpoint_c) <= 3.0
 }
@@ -814,5 +864,48 @@ mod tests {
             assert!(read.starts_with("sim/cockpit2/ice/"), "{k:?}");
             assert!(on.iter().all(|c| c.starts_with("sim/ice/")));
         }
+    }
+
+    /// #156, EGKK-EGBB 2026-09-28: the spread was judged against the LOWEST
+    /// level's dewpoint. A moist surface and a dry column aloft: at FL180
+    /// the lowest level made -20 C air "visible moisture" (a spread of -28),
+    /// so the air was never clear and the crew's engine anti-ice never came
+    /// off. At the aircraft's own level the spread is 8: clear.
+    #[test]
+    fn the_dewpoint_is_the_aircrafts_level_not_the_ground() {
+        let levels = [
+            300.0, 1_000.0, 1_500.0, 2_000.0, 3_000.0, 4_000.0, 5_500.0, 7_000.0,
+        ];
+        let dew = [8.0, 5.0, 1.0, -3.0, -10.0, -18.0, -28.0, -38.0];
+        // Out of order in the sim's array is still the same levels.
+        let mut shuffled: Vec<(f64, f64)> = levels.iter().copied().zip(dew).collect();
+        shuffled.reverse();
+        let (l2, d2): (Vec<f64>, Vec<f64>) = shuffled.into_iter().unzip();
+        let fl180_m = 18_000.0 / 3.280_84;
+        let at = dewpoint_at(&levels, &dew, fl180_m).unwrap();
+        assert!((at - -27.9).abs() < 0.1, "{at}");
+        assert_eq!(dewpoint_at(&l2, &d2, fl180_m), Some(at));
+        let air = |dewpoint_c: f64| IcingRead {
+            oat_c: -20.0,
+            dewpoint_c,
+            ..Default::default()
+        };
+        assert!(
+            icing_conditions(&air(dew[0])),
+            "the old read: the ground's dewpoint"
+        );
+        assert!(!icing_conditions(&air(at)), "at the level flown: clear");
+        // Held at the end levels, and no answer from a failed read.
+        assert_eq!(dewpoint_at(&levels, &dew, 0.0), Some(8.0));
+        assert_eq!(dewpoint_at(&levels, &dew, 12_000.0), Some(-38.0));
+        assert_eq!(dewpoint_at(&[], &[], 1_000.0), None);
+        assert_eq!(dewpoint_at(&levels, &dew[..3], 1_000.0), None);
+        assert_eq!(dewpoint_at(&levels, &[f64::NAN; 8], 1_000.0), None);
+        // Cloud at the level (a spread under 3) is still icing conditions.
+        assert!(icing_conditions(&IcingRead {
+            oat_c: -4.0,
+            dewpoint_c: dewpoint_at(&[300.0, 2_000.0], &[2.0, -5.0], 1_900.0).unwrap(),
+            ..Default::default()
+        }));
     }
 }

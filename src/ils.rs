@@ -103,6 +103,67 @@ pub async fn tune_from(
     ok.then_some(ils)
 }
 
+/// A runway's glideslope antenna as `earth_nav.dat` places it (row code 6):
+/// where the beam the needles read starts, its site elevation and angle.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Glideslope {
+    pub lat: f64,
+    pub lon: f64,
+    pub elev_ft: f64,
+    pub angle_deg: f64,
+}
+
+/// The glideslope row of `icao` runway `rwy` in `earth_nav.dat` text. The
+/// bearing field is `angle x 100000 + course` with the angle in hundredths
+/// (300145.887 is 3.00 degrees on 145.887). `None` without one. Pure over
+/// the text.
+pub fn parse_glideslope<'a>(lines: impl Iterator<Item = &'a str>, icao: &str, rwy: &str) -> Option<Glideslope> {
+    lines.filter(|l| l.trim_start().starts_with("6 ")).find_map(|l| {
+        let f: Vec<&str> = l.split_whitespace().collect();
+        if f.len() < 11 || !f[8].eq_ignore_ascii_case(icao) || !f[10].eq_ignore_ascii_case(rwy) {
+            return None;
+        }
+        let num = |i: usize| f[i].parse::<f64>().ok().filter(|v| v.is_finite());
+        let angle_deg = (num(6)? / 1_000.0).floor() / 100.0;
+        (1.5..=8.0).contains(&angle_deg).then_some(Glideslope {
+            lat: num(1)?,
+            lon: num(2)?,
+            elev_ft: num(3)?,
+            angle_deg,
+        })
+    })
+}
+
+/// [`parse_glideslope`] from the nav file on disk.
+pub fn find_glideslope(nav_path: &str, icao: &str, rwy: &str) -> Option<Glideslope> {
+    let text = std::fs::read_to_string(nav_path).ok()?;
+    parse_glideslope(text.lines(), icao, rwy)
+}
+
+/// The aim elevation, ft, that puts a glidepath of `gp_deg` aimed
+/// `aim_nm` past the threshold ON the glideslope `gs` (the needles'
+/// path: the antenna's elevation, its angle, from its point abeam on the
+/// runway `course_true` from the threshold). `None` when the angles
+/// differ by more than a tenth of a degree (the path could only cross the
+/// beam, never lie on it). Pure.
+pub fn glideslope_aim_ft(
+    gs: &Glideslope,
+    thr_lat: f64,
+    thr_lon: f64,
+    course_true: f64,
+    aim_nm: f64,
+    gp_deg: f64,
+) -> Option<f64> {
+    if (gs.angle_deg - gp_deg).abs() > 0.1 {
+        return None;
+    }
+    let d = crate::nav::haversine_nm(thr_lat, thr_lon, gs.lat, gs.lon);
+    let brg = crate::nav::bearing_deg(thr_lat, thr_lon, gs.lat, gs.lon);
+    let beyond_nm = d * (brg - course_true).to_radians().cos();
+    let ft_per_nm = 6076.12 * gs.angle_deg.to_radians().tan();
+    Some(gs.elev_ft + (beyond_nm - aim_nm) * ft_per_nm)
+}
+
 /// A needle past this many dots...
 pub const XCHECK_DOTS: f64 = 1.0;
 /// ...held this long...
@@ -610,6 +671,43 @@ pub fn spawn_setup_watch(base: String, ils: crate::nav::Ils, mut watch: SetupWat
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #156, EGBB 15 (2026-09-28, sortie 1790601822-full_auto): the probe aimed
+    /// the path at 297 ft (header 327) under a glideslope whose antenna
+    /// earth_nav.dat puts at 348 ft, 0.34 nm past the threshold: the needle
+    /// read 1.2 dots low at 497 ft. With the ILS tuned the aim moves up
+    /// toward the beam as far as a threshold crossing of 80 ft over the
+    /// pavement: 327.
+    #[test]
+    fn the_path_lies_toward_the_glideslope_when_the_ils_is_tuned() {
+        let rows = " 4  52.442050000   -1.734913889      348    11010    18  52345.887 IBIR EGBB EG 15 ILS-cat-III\n \
+                     6  52.460202778   -1.757769444      348    11010    18 300145.887 IBIR EGBB EG 15 GS\n \
+                     6  52.447877778   -1.743875000      364    11010    18 300325.887  IBM EGBB EG 33 GS\n";
+        let gs = parse_glideslope(rows.lines(), "EGBB", "15").expect("the 15 glideslope");
+        assert_eq!((gs.elev_ft, gs.angle_deg), (348.0, 3.0));
+        assert_eq!(parse_glideslope(rows.lines(), "EGBB", "33").unwrap().elev_ft, 364.0);
+        assert_eq!(parse_glideslope(rows.lines(), "EGBB", "06"), None);
+        // apt.dat's 15 and 33 thresholds: the course true.
+        let (t15, t33) = ((52.4656497, -1.7611282), (52.4428974, -1.7358498));
+        let course = crate::nav::bearing_deg(t15.0, t15.1, t33.0, t33.1);
+        let aim_nm = crate::autoland::TOUCHDOWN_AIM_NM;
+        let on_beam = glideslope_aim_ft(&gs, t15.0, t15.1, course, aim_nm, 3.0).expect("same angle");
+        assert!((390.0..420.0).contains(&on_beam), "{on_beam}");
+        // Capped by the threshold crossing: 297 + 30 = 327 (the header).
+        let aim = crate::autoland::aim_with_glideslope(297.0, Some(on_beam));
+        assert!((aim - 327.0).abs() < 0.01, "{aim}");
+        let tch = aim + aim_nm * 6076.12 * 3f64.to_radians().tan() - 297.0;
+        assert!((75.0..85.0).contains(&tch), "{tch}");
+        // Nearer the beam by those 30 ft: at 1.4 nm from the threshold.
+        let beam_at = |x: f64| on_beam + (x + aim_nm) * 318.4;
+        let path_at = |a: f64, x: f64| a + (x + aim_nm) * 318.4;
+        assert!((beam_at(1.4) - path_at(aim, 1.4)) < (beam_at(1.4) - path_at(297.0, 1.4)) - 29.0);
+        // No glideslope, or a path at another angle: the pavement's aim.
+        assert_eq!(crate::autoland::aim_with_glideslope(297.0, None), 297.0);
+        assert_eq!(glideslope_aim_ft(&gs, t15.0, t15.1, course, aim_nm, 4.5), None);
+        // A beam under the pavement's aim moves it at most 15 ft down.
+        assert_eq!(crate::autoland::aim_with_glideslope(300.0, Some(250.0)), 285.0);
+    }
 
     /// EGPH 24's real localiser (Custom Data): antenna past the 06 end,
     /// true 238.824, magnetic 239.

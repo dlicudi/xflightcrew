@@ -1203,10 +1203,32 @@ pub fn run_autoland_scoped(
                     &[(rwy.thr_lat, rwy.thr_lon), (aim_lat, aim_lon)],
                 )
                 .await;
-                let (aim, seen) = aim_elevation_ft(rwy.elev_ft, probed.as_deref());
+                let (pavement_aim, seen) = aim_elevation_ft(rwy.elev_ft, probed.as_deref());
+                // With the ILS tuned, the path lies on its glideslope as far
+                // as the threshold crossing allows (`aim_with_glideslope`).
+                let gs_aim = if ils.is_some() {
+                    let (nav, icao, id) = (
+                        crate::settings::live().nav_data_path.clone(),
+                        rwy.icao.clone(),
+                        rwy.id.clone(),
+                    );
+                    tokio::task::spawn_blocking(move || crate::ils::find_glideslope(&nav, &icao, &id))
+                        .await
+                        .ok()
+                        .flatten()
+                        .and_then(|gs| {
+                            crate::ils::glideslope_aim_ft(
+                                &gs, rwy.thr_lat, rwy.thr_lon, rwy.course_deg, TOUCHDOWN_AIM_NM, gp_deg,
+                            )
+                        })
+                } else {
+                    None
+                };
+                let aim = aim_with_glideslope(pavement_aim, gs_aim);
                 crate::blackbox::record("autoland", serde_json::json!({
                     "event": "threshold_elev", "rwy": format!("{} {}", rwy.icao, rwy.id),
                     "header_ft": rwy.elev_ft, "probed_ft": seen, "aim_ft": aim,
+                    "pavement_aim_ft": pavement_aim, "gs_aim_ft": gs_aim,
                     // The pavement the lateral gates judge against.
                     "width_m": runway_width_m(&rwy),
                     "xtk_limit_m": landing_xtk_limit_m(runway_width_m(&rwy)),
@@ -1214,16 +1236,27 @@ pub fn run_autoland_scoped(
                 }));
                 if (aim - rwy.elev_ft).abs() > THRESHOLD_ELEV_TRUST_FT {
                     let diff = aim - rwy.elev_ft;
-                    announce(
+                    let line = if gs_aim.is_some() {
+                        format!(
+                            "Runway {} on the glideslope, aiming at {:.0} feet.",
+                            crate::circuit::spell_runway(&rwy.id),
+                            aim
+                        )
+                    } else {
                         format!(
                             "Runway {} threshold is {:.0} feet {} the field elevation. Aiming at {:.0} feet.",
                             crate::circuit::spell_runway(&rwy.id),
                             diff.abs(),
                             if diff < 0.0 { "below" } else { "above" },
                             aim
-                        ),
-                        Priority::Advisory,
-                    );
+                        )
+                    };
+                    announce(line, Priority::Advisory);
+                    rwy.elev_ft = aim;
+                } else if (aim - pavement_aim).abs() > 0.5 {
+                    // The glideslope put the aim back near the header: the
+                    // header's number, said nothing (a correct aim earns no
+                    // chatter).
                     rwy.elev_ft = aim;
                 }
             }
@@ -4088,6 +4121,29 @@ pub fn aim_elevation_ft(header_ft: f64, probed_ft: Option<&[f64]>) -> (f64, Opti
         return (header_ft, Some(probed));
     }
     (probed, Some(probed))
+}
+
+/// How far a tuned glideslope may move the aim from the pavement's, ft:
+/// the path's threshold crossing (51.6 ft at 3 degrees aimed 300 m in)
+/// stays inside a book's 35 to 80 ft.
+pub const GS_AIM_BELOW_FT: f64 = 15.0;
+pub const GS_AIM_ABOVE_FT: f64 = 30.0;
+
+/// The aim elevation with the runway's ILS glideslope tuned: the path that
+/// lies ON the glideslope (`ils::glideslope_aim_ft`), as far as a book's
+/// threshold crossing over the pavement (`pavement_aim_ft`, from
+/// [`aim_elevation_ft`]) allows; the pavement's aim without one. Pure.
+///
+/// EGBB 15, 2026-09-28 (sortie 1790601822-full_auto, #156): the probe put
+/// the aim at 297 ft (the header 327) while the glideslope's antenna stands
+/// at 348 ft, 0.34 nm in: the needle read 1.2 dots low at 497 ft on a path
+/// autoland was flying as it meant to. Aimed at 327 the path lies
+/// 30 ft nearer the beam with the wheels still crossing the numbers at 81 ft.
+pub fn aim_with_glideslope(pavement_aim_ft: f64, gs_aim_ft: Option<f64>) -> f64 {
+    match gs_aim_ft.filter(|g| g.is_finite()) {
+        Some(g) => pavement_aim_ft + (g - pavement_aim_ft).clamp(-GS_AIM_BELOW_FT, GS_AIM_ABOVE_FT),
+        None => pavement_aim_ft,
+    }
 }
 
 /// The gentlest retard below the retard height, lever per second.

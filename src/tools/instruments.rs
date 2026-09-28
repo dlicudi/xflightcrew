@@ -450,6 +450,42 @@ pub fn correct_setting_inhg(
     }
 }
 
+/// A climb or descent this steep is going THROUGH the transition, fpm: a
+/// level wander at the transition is not.
+pub const TRANSITION_CROSSING_FPM: f64 = 300.0;
+
+/// The setting owed the moment the transition is crossed in the direction
+/// flown: STANDARD climbing through the transition altitude, QNH descending
+/// through the transition level (`transition_ft` is the one in force,
+/// [`transition_in_force_ft`]), `None` otherwise or when the knob already
+/// has it. A crew sets it AT the transition, not after a settling band.
+///
+/// EGKK-EGBB, 2026-09-28 (sortie 1790601822-full_auto, #156): standard went
+/// in at about 8,300 ft, 38 s after the climb passed EGKK's 6,000 ft
+/// transition altitude, and QNH at 6,180 ft, more than a minute under
+/// EGBB's FL75 transition level on standard. Both waited out the monitor's
+/// 500 ft "either setting stands" band (there against a knob flipping QNH,
+/// standard, QNH on a level AT the transition, which this does not touch:
+/// level is not crossing) and its 20 s sustain for the weather's drift.
+/// Pure.
+pub fn transition_crossed(
+    indicated_alt_ft: f64,
+    vsi_fpm: f64,
+    transition_ft: f64,
+    baro_inhg: f64,
+    qnh_pa: f64,
+) -> Option<f64> {
+    let qnh = (qnh_pa / PA_PER_INHG).clamp(28.0, 31.5);
+    let want = if vsi_fpm >= TRANSITION_CROSSING_FPM && indicated_alt_ft >= transition_ft {
+        STANDARD_INHG
+    } else if vsi_fpm <= -TRANSITION_CROSSING_FPM && indicated_alt_ft < transition_ft {
+        qnh
+    } else {
+        return None;
+    };
+    ((baro_inhg - want).abs() >= ALTIMETER_TOLERANCE_INHG).then_some(want)
+}
+
 /// THIS FLIGHT's transition: the origin's altitude on the way up, the
 /// destination's level on the way down, from the plan. `None` fields fall
 /// back to the airframe's default. Process-wide because the consumers are
