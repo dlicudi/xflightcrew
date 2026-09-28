@@ -9770,3 +9770,16 @@ The load reported 51.14830 N 0.18915 W on the ground at 157 ft AGL for 16 s befo
 flight's station is now the towered field under its settled position (the watch, the ramp setup, the
 approach setup's named field); full auto's mission waits up to 20 s for the departure field's station
 or gives up naming both. Offline only.
+
+## 2026-09-28: the circuit's climb-out continuous with the takeoff (issue #150)
+
+LEMG 13 circuits 1790596335 and 1790599750: at the 300 ft engage the pitch was climbing 2,457 and
+2,328 fpm and the engage wrote 1,500; at the 500 ft handoff the circuit's first tick wrote 456 (a
+1,044 fpm drop in 0.8 s) and `clean_up_at_handoff` put the flaps 5, 1, up within a second at 191 kt,
+19 kt under the flaps-up speed; the MCP window stayed on V2. After #78 the engage would have been a
+1,891 fpm push. `ClimbVs` starts from the climb flown and slews every command at 200 fpm/s (a speed
+hold with a seeded integral below the acceleration height); the circuit takes the VS and the flaps
+from the takeoff (`ClimbCarry`, `flaps_to_caller`, paced flap steps: 1 at 190, up at 210.5 kt on the
+closed-loop plant); the window moves to the flaps-up speed once. Pinned by
+`bench/takeoffs/lemg13_circuit_climb_outs.jsonl`. Still open: the pattern's own 700 fpm climb cap and
+its 226 kt overrun. Offline only.

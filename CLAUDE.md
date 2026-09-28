@@ -452,6 +452,11 @@ everything blackboxes to `logs/blackbox.jsonl` (kinds: `atc`, `autotaxi`, `autot
   `climb_pitch_max_deg`): liftoff to the 300 ft engage, the attitude target walks on the airspeed
   trend, floored at the rotation attitude and capped by what the tail has cleared; silent profiles
   keep 8 degrees (LEMG 13 2026-09-28: 162 to 185 kt at 8 degrees).
+- **The autopilot takes the climb being flown** (`autotakeoff::ClimbVs`, `vh_ind_fpm`): the 300 ft
+  engage writes the climb the pitch was flying and every later command, the circuit's included
+  (`circuit::ClimbCarry`), moves at `CLIMB_VS_SLEW_FPM_S`; a circuit takes its flaps from the
+  takeoff (`flaps_to_caller`) and walks them up on the paced schedule; the MCP window leaves V2 at the
+  first flap step (`speed_window_after_acceleration`; LEMG 13 2026-09-28).
 - **A jet configures its autoflight before the roll** (`takeoff_config:` `flight_directors`,
   `autothrottle_armed` (armed, never engaged: the takeoff owns the levers), `v2_kts`; probed) and
   reduces thrust at `thrust_reduction_agl_ft` to `climb_thrust_ratio` at a crew's pace
