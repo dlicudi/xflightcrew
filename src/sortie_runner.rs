@@ -1756,7 +1756,27 @@ impl CaseMachine {
                         self.stages.push(r.clone());
                         Step::Wait
                     }
-                    ("full_auto" | "heli_route", "give_up") if mine => {
+                    // Full auto writes its give-up as a stage with the reason
+                    // under `detail`; the sortie's end repeats it. Either
+                    // names the give-up (the reject at LEMG 13, 2026-09-28,
+                    // was read as no reason at all).
+                    ("full_auto" | "heli_route", _)
+                        if mine && (event == "give_up" || st(r, "stage") == "give_up") =>
+                    {
+                        let reason = match st(r, "reason") {
+                            "" => r
+                                .get("detail")
+                                .and_then(|d| d.get("reason"))
+                                .and_then(Value::as_str)
+                                .unwrap_or(""),
+                            s => s,
+                        };
+                        self.give_up = Some(reason.to_string());
+                        Step::Wait
+                    }
+                    ("sortie", "end")
+                        if mine && st(r, "outcome") == "gave_up" && self.give_up.is_none() =>
+                    {
                         self.give_up = Some(st(r, "reason").to_string());
                         Step::Wait
                     }
@@ -3943,6 +3963,34 @@ mod tests {
             !v.pass && v.reason.contains("attended (1 interventions"),
             "{v:?}"
         );
+        // The give-up as full auto really writes it (LEMG 13, sortie
+        // 1790631201-full_auto): a stage with the reason under detail.
+        let mut m = CaseMachine::new(0.0, 900.0);
+        m.expect_give_up = Some("takeoff_not_completed".into());
+        m.pending_steps = 1;
+        m.feed(&rec(0.5, "tool", json!({"name": "full_auto"})));
+        m.feed(&begin(1.0, "s"));
+        m.note_step_sent(30.0, "reject the takeoff");
+        m.feed(&consumed(30.1, "reject the takeoff"));
+        m.feed(&rec(30.2, "tool", json!({"name": "auto_takeoff", "sortie": "s"})));
+        m.feed(&rec(
+            40.0,
+            "stage_result",
+            json!({"stage": "takeoff", "pass": false, "why": ["ended by reject"], "sortie": "s"}),
+        ));
+        m.feed(&rec(
+            41.0,
+            "full_auto",
+            json!({"stage": "give_up", "detail": {"reason": "takeoff_not_completed"},
+                   "sortie": "s"}),
+        ));
+        let v = finished(m.feed(&rec(
+            42.0,
+            "sortie_result",
+            json!({"pass": false, "outcome": "gave_up", "interventions": 0,
+                   "commands": 1, "unattended": false, "sortie": "s"}),
+        )));
+        assert!(v.pass, "{v:?}");
     }
 
     #[test]
