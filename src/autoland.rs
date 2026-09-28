@@ -2733,7 +2733,15 @@ pub fn run_autoland_scoped(
                 } else if g.phase == ApproachPhase::Flare {
                     match cfg.flare_power {
                         Some(power) => match (thr_now, vvi) {
-                            (Some(throttle), Some(vs)) => flare_power.step(power, throttle, vs, dt_s, radio_ft),
+                            (Some(throttle), Some(vs)) => flare_power.step(
+                                power,
+                                throttle,
+                                vs,
+                                dt_s,
+                                radio_ft,
+                                Some(ias),
+                                Some(approach_ias),
+                            ),
                             _ => None, // No measurement: no guessed power and no ramp advance.
                         },
                         None => Some(0.0),
@@ -2804,6 +2812,11 @@ pub fn run_autoland_scoped(
                     "throttle_before": thr_now, "throttle_command": thr,
                     "throttle_after": throttle_after, "write_ok": throttle_written,
                     "progressive_flare": cfg.flare_power.is_some(), "dt": dt_s,
+                    // Which key moved the flare's lever this tick (issue
+                    // #76): entry, height, slow or timed.
+                    "retard": (g.phase == ApproachPhase::Flare)
+                        .then(|| flare_power.last_key.map(RetardKey::word))
+                        .flatten(),
                     "vvi": vvi, "radio": radio_ft, "ias": ias,
                 }));
 
@@ -3904,16 +3917,59 @@ pub fn aim_elevation_ft(header_ft: f64, probed_ft: Option<&[f64]>) -> (f64, Opti
 
 /// The gentlest retard below the retard height, lever per second.
 const RETARD_MIN_PER_S: f64 = 0.03;
+/// The retard waits while the airspeed is this far under the approach speed
+/// (kt), unless the profile says otherwise (`retard_slow_kts`).
+const RETARD_SLOW_KTS: f64 = 5.0;
+/// Time to the wheels is taken at no less than this sink (fpm): a float is
+/// not an infinite time, it is a slow retard.
+const RETARD_SINK_FLOOR_FPM: f64 = 100.0;
 
-/// Per-approach state: a go-around resets this, so a second flare starts from
-/// its own power. Never adds power or impersonates an airspeed governor in the
-/// flare. The existing overflight/go-around guard still bounds runway usage.
+/// Why the retard did what it did this tick (the `power` tick's `retard`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RetardKey {
+    /// The first flare tick: the approach's power is where it starts.
+    Entry,
+    /// Above the retard height.
+    Height,
+    /// More time to the wheels than `retard_at_s`.
+    Time,
+    /// Slower than the approach speed less the margin: the thrust stays.
+    Slow,
+    /// Walking to idle, timed to the wheels.
+    Timed,
+}
+
+impl RetardKey {
+    pub fn word(self) -> &'static str {
+        match self {
+            RetardKey::Entry => "entry",
+            RetardKey::Height => "height",
+            RetardKey::Time => "time",
+            RetardKey::Slow => "slow",
+            RetardKey::Timed => "timed",
+        }
+    }
+}
+
+/// THE FLARE RETARD, keyed on what it is for: HEIGHT (nothing above the
+/// retard height), TIME to the wheels (the lever reaches idle as they
+/// arrive: the rate is what is left over the seconds left, radio over
+/// sink) and SPEED (a flare slower than the approach speed less
+/// [`RETARD_SLOW_KTS`] keeps its thrust). Never on the sink itself: that is
+/// the sink the arrest is removing, so the old law held the lever while the
+/// arrest worked and let it go in the float the arrest had made. It "fired
+/// latest exactly when it should already be finished" (EGLF 06 2026-09-22;
+/// LEMG 13 2026-09-26 and 2026-09-28; issue #76).
+///
+/// Per approach: a go-around resets it, so a second flare starts from its
+/// own power. Never adds power or impersonates an airspeed governor in the
+/// flare; a lever still up at the wheels is the rollout's to close.
 #[derive(Default)]
 struct FlarePower {
-    previous_sink: Option<f64>,
     last_command: Option<f64>,
-    /// The sink has come inside `retard_inside_fpm` this flare.
-    inside: bool,
+    last_key: Option<RetardKey>,
+    /// The time to the wheels has come inside `retard_at_s` (latched).
+    due: bool,
 }
 
 impl FlarePower {
@@ -3921,6 +3977,9 @@ impl FlarePower {
         *self = Self::default();
     }
 
+    /// The lever this tick; `None` when a measurement is missing (no guessed
+    /// power and no ramp advance). An unread airspeed is no speed key.
+    #[allow(clippy::too_many_arguments)]
     fn step(
         &mut self,
         cfg: crate::aircraft::FlarePowerProfile,
@@ -3928,61 +3987,75 @@ impl FlarePower {
         vvi: f64,
         dt: f64,
         radio_ft: f64,
+        ias: Option<f64>,
+        approach_ias: Option<f64>,
     ) -> Option<f64> {
         if !measured.is_finite()
             || !vvi.is_finite()
+            || !radio_ft.is_finite()
             || !dt.is_finite()
             || dt <= 0.0
             || !cfg.reduction_per_second.is_finite()
             || cfg.reduction_per_second <= 0.0
-            || !cfg.hold_sink_fpm.is_finite()
-            || cfg.hold_sink_fpm <= 0.0
-            || !cfg.lead_seconds.is_finite()
-            || cfg.lead_seconds < 0.0
         {
             return None;
         }
-        let sink = -vvi;
-        let worsening = self
-            .previous_sink
-            .map_or(0.0, |old| ((sink - old) / dt).max(0.0));
-        self.previous_sink = Some(sink);
-        self.inside |= cfg.retard_inside_fpm.is_some_and(|f| sink <= f);
-        let floor_reached = cfg
-            .retard_by_ft
-            .is_some_and(|h| radio_ft.is_finite() && radio_ft <= h);
-        let waiting = cfg.retard_inside_fpm.is_some() && !self.inside && !floor_reached;
         // First flare tick preserves the observed approach power. Readback may
         // lag a write, but it must never restart the ramp or increase power.
         let current = measured
             .clamp(0.0, 1.0)
             .min(self.last_command.unwrap_or(1.0));
-        // A jet retards by HEIGHT: nothing above the retard height, and below
-        // it at the rate that reaches idle as the wheels arrive (time to
-        // touchdown from the height and the sink), never slower than a
-        // gentle floor nor faster than the profile's own rate x 4.
-        let rate = match cfg.retard_below_ft.filter(|h| h.is_finite() && *h > 0.0) {
-            _ if waiting => 0.0,
-            Some(h) if radio_ft.is_finite() && radio_ft > h => 0.0,
-            Some(_) if radio_ft.is_finite() => {
-                let to_touch_s = radio_ft.max(0.0) / sink.max(100.0) * 60.0;
+        let slow_kts = cfg
+            .retard_slow_kts
+            .filter(|k| k.is_finite() && *k >= 0.0)
+            .unwrap_or(RETARD_SLOW_KTS);
+        let slow = match (ias, approach_ias) {
+            (Some(v), Some(a)) if v.is_finite() && a.is_finite() => v < a - slow_kts,
+            _ => false,
+        };
+        let above = cfg
+            .retard_below_ft
+            .filter(|h| h.is_finite() && *h > 0.0)
+            .is_some_and(|h| radio_ft > h);
+        let sink = (-vvi).max(RETARD_SINK_FLOOR_FPM);
+        let to_touch_s = (radio_ft.max(0.0) / sink * 60.0).max(0.5);
+        let fast = match (ias, approach_ias, cfg.retard_fast_kts) {
+            (Some(v), Some(a), Some(k)) if v.is_finite() && a.is_finite() && k.is_finite() => {
+                v > a + k
+            }
+            _ => false,
+        };
+        self.due |= !above
+            && (fast
+                || cfg
+                    .retard_at_s
+                    .filter(|s| s.is_finite() && *s > 0.0)
+                    .is_none_or(|s| to_touch_s <= s));
+        let key = if self.last_command.is_none() {
+            RetardKey::Entry
+        } else if above {
+            RetardKey::Height
+        } else if !self.due {
+            RetardKey::Time
+        } else if slow {
+            RetardKey::Slow
+        } else {
+            RetardKey::Timed
+        };
+        let next = match key {
+            RetardKey::Timed => {
                 let fastest = cfg
                     .retard_max_per_s
                     .filter(|r| r.is_finite() && *r > 0.0)
-                    .unwrap_or(cfg.reduction_per_second * 4.0)
+                    .unwrap_or(cfg.reduction_per_second)
                     .max(RETARD_MIN_PER_S);
-                (current / to_touch_s.max(0.5)).clamp(RETARD_MIN_PER_S, fastest)
+                let rate = (current / to_touch_s).clamp(RETARD_MIN_PER_S, fastest);
+                (current - rate * dt.min(1.0)).max(0.0)
             }
-            _ => cfg.reduction_per_second,
-        };
-        let next = if self.last_command.is_none()
-            || sink.max(sink + worsening * cfg.lead_seconds) > cfg.hold_sink_fpm
-        {
-            current
-        } else {
-            (current - rate * dt.min(1.0)).max(0.0)
+            _ => current,
         };
         self.last_command = Some(next);
+        self.last_key = Some(key);
         Some(next)
     }
 }
@@ -6456,75 +6529,89 @@ mod tests {
     }
 
     #[test]
-    fn baron_recorded_flare_does_not_cut_power_into_renewed_sink() {
-        // LEBL 20, 2026-09-16. Replay measurements, NOT a flight-model prediction:
-        // the old rule commanded zero throughout these actual sink rates.
+    fn baron_recorded_flare_walks_the_power_off_and_never_cuts_it() {
+        // LEBL 20, 2026-09-16. Replay measurements, NOT a flight-model
+        // prediction: the old rule commanded zero throughout these sink rates.
+        // Issue #76: the retard is timed, not held for the sink the arrest is
+        // removing and let go in the float it made: the lever walks off at
+        // the airframe's own rate from the flare gate, never a step.
         let mut power = FlarePower::default();
         let cfg = baron_flare_power();
+        assert_eq!(cfg.retard_below_ft, None, "the Baron retards from the flare gate");
         let samples = [
             -393.65, -278.33, -148.51, -49.71, -24.33, -84.22, -211.0, -360.38, -515.28,
         ];
         let mut throttle = 0.30;
         let mut commands = Vec::new();
         for vs in samples {
-            throttle = power.step(cfg, throttle, vs, 0.67, 10.0).unwrap();
+            throttle = power
+                .step(cfg, throttle, vs, 0.67, 10.0, Some(112.0), Some(110.0))
+                .unwrap();
             commands.push(throttle);
         }
         assert_eq!(commands[0], 0.30, "no step to idle at flare entry");
-        assert_eq!(commands[1], commands[0], "hold while still sinking fast");
-        assert!(
-            commands[4] < commands[1],
-            "taper after the pitch arrests descent"
-        );
-        assert!(
-            commands[5] < commands[4],
-            "small initial trend remains below limit"
-        );
-        assert_eq!(commands[6], commands[5], "stop the cut when sink returns");
-        assert_eq!(commands[8], commands[6]);
-        assert!(
-            commands[8] > 0.0,
-            "retain residual power rather than force idle"
-        );
+        for w in commands.windows(2) {
+            assert!(w[1] < w[0], "walking off whatever the sink: {commands:?}");
+            assert!(
+                w[0] - w[1] <= cfg.reduction_per_second * 0.67 + 1e-9,
+                "never faster than the airframe's rate: {commands:?}"
+            );
+        }
+        assert!(commands[8] > 0.0, "not cut: {commands:?}");
+        // The same flare slow (8 kt under the approach speed): the thrust
+        // stays, the sink it would cost is the wheels'.
+        let mut power = FlarePower::default();
+        let mut throttle = 0.30;
+        for vs in samples {
+            throttle = power
+                .step(cfg, throttle, vs, 0.67, 10.0, Some(102.0), Some(110.0))
+                .unwrap();
+            assert_eq!(throttle, 0.30);
+        }
+        assert_eq!(power.last_key, Some(RetardKey::Slow));
     }
 
     #[test]
-    fn flare_power_foresees_sink_and_resets_for_a_new_approach() {
+    fn flare_power_never_restarts_and_resets_for_a_new_approach() {
         let cfg = baron_flare_power();
         let mut power = FlarePower::default();
-        assert_eq!(power.step(cfg, 0.3, -50.0, 0.5, 10.0), Some(0.3));
-        // Still less than 200 fpm down, but deteriorating at 200 fpm per second.
-        assert_eq!(power.step(cfg, 0.3, -150.0, 0.5, 10.0), Some(0.3));
-        // A balloon needs power coming off, not a sink-triggered hold.
-        assert!(power.step(cfg, 0.3, 100.0, 0.5, 10.0).unwrap() < 0.3);
+        let (ias, app) = (Some(110.0), Some(110.0));
+        assert_eq!(power.step(cfg, 0.3, -50.0, 0.5, 10.0, ias, app), Some(0.3));
+        assert_eq!(power.last_key, Some(RetardKey::Entry));
+        assert!(power.step(cfg, 0.3, -150.0, 0.5, 10.0, ias, app).unwrap() < 0.3);
+        // A balloon: power coming off, not held.
+        assert!(power.step(cfg, 0.3, 100.0, 0.5, 10.0, ias, app).unwrap() < 0.3);
         // A lagging throttle read must not restart/increase the command.
-        assert!(power.step(cfg, 0.4, -100.0, 0.5, 10.0).unwrap() < 0.3);
+        assert!(power.step(cfg, 0.4, -100.0, 0.5, 10.0, ias, app).unwrap() < 0.3);
         power.reset();
-        assert_eq!(power.step(cfg, 0.45, -300.0, 0.5, 10.0), Some(0.45));
+        assert_eq!(power.step(cfg, 0.45, -300.0, 0.5, 10.0, ias, app), Some(0.45));
+        // An unread airspeed is no speed key: the retard goes on by time.
+        assert!(power.step(cfg, 0.45, -300.0, 0.5, 10.0, None, app).unwrap() < 0.45);
     }
 
     #[test]
     fn flare_power_reaches_idle_smoothly_and_rejects_missing_measurements() {
         let cfg = baron_flare_power();
         let mut power = FlarePower::default();
-        let mut throttle = power.step(cfg, 0.3, -100.0, 0.5, 10.0).unwrap();
+        let (ias, app) = (Some(110.0), Some(110.0));
+        let mut throttle = power.step(cfg, 0.3, -100.0, 0.5, 10.0, ias, app).unwrap();
         for _ in 0..30 {
-            let next = power.step(cfg, throttle, -100.0, 0.5, 10.0).unwrap();
+            let next = power.step(cfg, throttle, -100.0, 0.5, 10.0, ias, app).unwrap();
             assert!((0.0..=throttle).contains(&next));
             assert!(throttle - next <= cfg.reduction_per_second * 0.5 + 1e-9);
             throttle = next;
         }
         assert_eq!(throttle, 0.0);
-        assert_eq!(power.step(cfg, f64::NAN, -100.0, 0.5, 10.0), None);
-        assert_eq!(power.step(cfg, 0.3, f64::NAN, 0.5, 10.0), None);
-        assert_eq!(power.step(cfg, 0.3, -100.0, 0.0, 10.0), None);
+        assert_eq!(power.step(cfg, f64::NAN, -100.0, 0.5, 10.0, ias, app), None);
+        assert_eq!(power.step(cfg, 0.3, f64::NAN, 0.5, 10.0, ias, app), None);
+        assert_eq!(power.step(cfg, 0.3, -100.0, 0.0, 10.0, ias, app), None);
+        assert_eq!(power.step(cfg, 0.3, -100.0, 0.5, f64::NAN, ias, app), None);
         let invalid = crate::aircraft::FlarePowerProfile {
             reduction_per_second: -1.0,
             ..cfg
         };
-        assert_eq!(power.step(invalid, 0.3, -100.0, 0.5, 10.0), None);
+        assert_eq!(power.step(invalid, 0.3, -100.0, 0.5, 10.0, ias, app), None);
     }
-
     /// LEMG 13 (2026-09-26, 737): the arrest levelled at 20 ft, the sink-keyed
     /// retard took the lever to idle IN the float, and the sink came back to
     /// -859 fpm. A jet retards by height: nothing above it, and below it a
@@ -6585,25 +6672,40 @@ mod tests {
     fn a_jet_retards_by_height_timed_to_the_touchdown() {
         let cfg = crate::aircraft::FlarePowerProfile {
             reduction_per_second: 0.08,
-            hold_sink_fpm: 400.0,
-            lead_seconds: 1.0,
             retard_below_ft: Some(20.0),
-            retard_inside_fpm: None,
-            retard_by_ft: None,
             retard_max_per_s: None,
+            retard_slow_kts: None,
+            retard_at_s: None,
+            retard_fast_kts: None,
         };
+        let (ias, app) = (Some(145.0), Some(145.0));
         let mut power = FlarePower::default();
         // First tick keeps the approach power; at 36 ft in a float, still held.
-        assert_eq!(power.step(cfg, 0.35, -170.0, 0.2, 36.0), Some(0.35));
-        assert_eq!(power.step(cfg, 0.35, -170.0, 0.2, 30.0), Some(0.35));
+        assert_eq!(power.step(cfg, 0.35, -170.0, 0.2, 36.0, ias, app), Some(0.35));
+        assert_eq!(power.step(cfg, 0.35, -170.0, 0.2, 30.0, ias, app), Some(0.35));
+        assert_eq!(power.last_key, Some(RetardKey::Height));
         // Below 20 ft at 170 fpm: about 7 s to the wheels, about 0.05 a second.
-        let next = power.step(cfg, 0.35, -170.0, 1.0, 20.0).unwrap();
+        let next = power.step(cfg, 0.35, -170.0, 1.0, 20.0, ias, app).unwrap();
         assert!((0.29..0.31).contains(&next), "{next}");
-        // A normal sink closer in: a quicker retard, never past 4x the rate.
+        assert_eq!(power.last_key, Some(RetardKey::Timed));
+        // A normal sink closer in: a quicker retard, never past the rate.
         let mut quick = FlarePower::default();
-        quick.step(cfg, 0.3, -300.0, 0.2, 10.0);
-        let next = quick.step(cfg, 0.3, -300.0, 1.0, 10.0).unwrap();
-        assert!((0.0..0.2).contains(&next), "{next}");
+        quick.step(cfg, 0.3, -300.0, 0.2, 10.0, ias, app);
+        let next = quick.step(cfg, 0.3, -300.0, 1.0, 10.0, ias, app).unwrap();
+        assert!((0.3 - 0.08 - 1e-9..0.3).contains(&next), "{next}");
+        // Sinking 600 at 12 ft is the SAME retard as 300: the sink the arrest
+        // is removing never holds the lever (issue #76), it only shortens
+        // the time left.
+        let mut hard = FlarePower::default();
+        hard.step(cfg, 0.3, -600.0, 0.2, 12.0, ias, app);
+        assert!(hard.step(cfg, 0.3, -600.0, 0.2, 12.0, ias, app).unwrap() < 0.3);
+        // Slow: 6 kt under the approach speed keeps the thrust at any height.
+        let mut slow = FlarePower::default();
+        slow.step(cfg, 0.3, -200.0, 0.2, 10.0, Some(139.0), app);
+        assert_eq!(slow.step(cfg, 0.3, -200.0, 0.2, 10.0, Some(139.0), app), Some(0.3));
+        assert_eq!(slow.last_key, Some(RetardKey::Slow));
+        // ...and the speed back, the retard resumes from where it stood.
+        assert!(slow.step(cfg, 0.3, -200.0, 0.2, 9.0, Some(142.0), app).unwrap() < 0.3);
     }
 
     #[test]
@@ -9812,7 +9914,7 @@ mod approach_power_floor_tests {
 /// was wrong: LEMG 12 flew its law to 407.
 #[cfg(test)]
 mod lemg_737_flare_tests {
-    use super::{arrest_targets_fpm, flare_target_with, FlareModel, FlarePower};
+    use super::{arrest_targets_fpm, flare_target_with, FlareModel, FlarePower, RetardKey};
     use std::collections::VecDeque;
 
     /// Where each recorded arrest began: the `arrest_hands` tick.
@@ -9921,6 +10023,93 @@ mod lemg_737_flare_tests {
     const GROUND_FPM: f64 = 405.3;
     const GROUND_FT: f64 = 43.2;
     const FPM_PER_KT: f64 = 62.7;
+    /// The 737 profile's approach speed (`reference.approach_kts`), the
+    /// retard's speed key's reference.
+    const APPROACH_IAS: f64 = 145.0;
+
+    /// The retard as it flew until issue #76: held while the sink (with a
+    /// second of its worsening) was over 400, nothing above 20 ft, and on
+    /// 2026-09-28 not before the sink had come inside 185 once or 10 ft;
+    /// then timed to the wheels at 0.03 to 0.08 a second. Kept to replay
+    /// the landings it flew.
+    #[derive(Clone, Copy)]
+    struct SinkKeyed {
+        inside_fpm: Option<f64>,
+        by_ft: Option<f64>,
+        max_per_s: f64,
+        previous_sink: Option<f64>,
+        last: Option<f64>,
+        inside: bool,
+    }
+
+    impl SinkKeyed {
+        /// As flown on 2026-09-28.
+        fn as_flown() -> Self {
+            SinkKeyed {
+                inside_fpm: Some(185.0),
+                by_ft: Some(10.0),
+                max_per_s: 0.08,
+                previous_sink: None,
+                last: None,
+                inside: false,
+            }
+        }
+        /// LEMG 12's (2026-09-26): by height alone, up to 0.32 a second.
+        fn height_only() -> Self {
+            SinkKeyed {
+                inside_fpm: None,
+                by_ft: None,
+                max_per_s: 0.32,
+                ..Self::as_flown()
+            }
+        }
+        fn step(&mut self, measured: f64, vvi: f64, dt: f64, radio_ft: f64) -> f64 {
+            let sink = -vvi;
+            let worsening = self
+                .previous_sink
+                .map_or(0.0, |old| ((sink - old) / dt).max(0.0));
+            self.previous_sink = Some(sink);
+            self.inside |= self.inside_fpm.is_some_and(|f| sink <= f);
+            let floor = self.by_ft.is_some_and(|h| radio_ft <= h);
+            let waiting = self.inside_fpm.is_some() && !self.inside && !floor;
+            let current = measured.clamp(0.0, 1.0).min(self.last.unwrap_or(1.0));
+            let rate = if waiting || radio_ft > 20.0 {
+                0.0
+            } else {
+                let to_touch_s = radio_ft.max(0.0) / sink.max(100.0) * 60.0;
+                (current / to_touch_s.max(0.5)).clamp(0.03, self.max_per_s)
+            };
+            let next = if self.last.is_none() || sink.max(sink + worsening) > 400.0 {
+                current
+            } else {
+                (current - rate * dt.min(1.0)).max(0.0)
+            };
+            self.last = Some(next);
+            next
+        }
+    }
+
+    /// Which retard a replay flies.
+    enum Retard {
+        Keyed(FlarePower, crate::aircraft::FlarePowerProfile),
+        Sink(SinkKeyed),
+    }
+
+    impl Retard {
+        /// The 737 profile's, today's law.
+        fn profile() -> Self {
+            Retard::Keyed(
+                FlarePower::default(),
+                profile_737().flare_power.expect("the 737 retards"),
+            )
+        }
+        fn step(&mut self, lever: f64, vvi: f64, dt: f64, h: f64, ias: f64) -> Option<f64> {
+            match self {
+                Retard::Keyed(p, cfg) => p.step(*cfg, lever, vvi, dt, h, Some(ias), Some(APPROACH_IAS)),
+                Retard::Sink(s) => Some(s.step(lever, vvi, dt, h)),
+            }
+        }
+    }
     /// Each flare's own gain and dead time, in the order of [`GATES`].
     const PLANTS: [Fit; 8] = [
         Fit {
@@ -10226,22 +10415,15 @@ mod lemg_737_flare_tests {
     /// (the first law's), the elevator reaching the aircraft a dead time
     /// after it is written, the speed on the fitted speed model.
     fn fly(g: Gate, fit: Fit, law: Law) -> Landing {
-        let mut power_cfg = profile_737().flare_power.expect("the 737 retards");
-        if matches!(law, Law::First(_)) {
-            power_cfg.retard_inside_fpm = None;
-            power_cfg.retard_by_ft = None;
-            power_cfg.retard_max_per_s = None;
-        }
-        fly_with(g, fit, law, power_cfg)
+        let power = if matches!(law, Law::First(_)) {
+            Retard::Sink(SinkKeyed::height_only())
+        } else {
+            Retard::profile()
+        };
+        fly_with(g, fit, law, power)
     }
 
-    fn fly_with(
-        g: Gate,
-        fit: Fit,
-        mut law: Law,
-        power_cfg: crate::aircraft::FlarePowerProfile,
-    ) -> Landing {
-        let mut power = FlarePower::default();
+    fn fly_with(g: Gate, fit: Fit, mut law: Law, mut power: Retard) -> Landing {
         let mut p = Plant::at(g, fit);
         let (tick, dt) = (0.22, 0.01);
         let mut h = g.radio_ft;
@@ -10270,7 +10452,7 @@ mod lemg_737_flare_tests {
                 out.min_elev = out.min_elev.min(e);
                 p.write(e);
                 if h <= flare_ft {
-                    if let Some(l) = power.step(power_cfg, lever, v, tick, h) {
+                    if let Some(l) = power.step(lever, v, tick, h, p.ias) {
                         lever = l;
                     }
                 }
@@ -10355,7 +10537,7 @@ mod lemg_737_flare_tests {
             l.sink_fpm
         );
         // The prediction flare as flown (277 at the wheels, 0.30 of lever):
-        // with the retard's 10 ft floor the lever is coming off at the
+        // with the height, time and speed keys the lever is coming off at the
         // wheels and the sink it rebuilds is small.
         let l = fly(
             GATES[PREDICTION_FLOWN],
@@ -10364,46 +10546,100 @@ mod lemg_737_flare_tests {
         );
         assert!(l.sink_fpm < 300.0, "{:.0}", l.sink_fpm);
         assert!(
-            l.lever_at_wheels < 0.2 && l.lever_at_wheels > 0.0,
+            l.lever_at_wheels < 0.30 && l.lever_at_wheels > 0.0,
             "walking off, not cut: {:.2}",
             l.lever_at_wheels
         );
     }
 
-    /// The retard waits for the flare: LEMG 12 was still sinking 300 at
-    /// 20 ft when the lever went 0.44 to 0.16. Held until the sink is
-    /// inside 185, then timed to the wheels as before; declared on the 737
-    /// only.
+    /// Issue #76: the retard keyed on height, time to the wheels and speed,
+    /// never on the sink. Replayed through the fitted 737 flare plant (its
+    /// dead time, both lags, the ground and the speed model) and the air
+    /// each recording carries: all sixteen LEMG 13 approaches of 2026-09-28
+    /// (sorties 1790586843 to 1790590296), and every recorded gate of
+    /// 2026-09-26 through every flare's own plant (64 landings).
+    ///
+    /// As flown, the sink-keyed retard started off when the ARREST brought
+    /// the sink inside 185 (15.8 ft in 1790589309, mid-float) and stopped
+    /// again when the sink it cost came back past 400: through the plant the
+    /// sixteen land at 268 fpm mean, 300 worst. Keyed on what it is for they
+    /// land softer on average and at worst, and none climbs.
     #[test]
-    fn the_retard_waits_for_the_sink_to_come_inside() {
+    fn the_retard_is_keyed_on_height_time_and_speed_never_the_sink() {
         let cfg = profile_737().flare_power.expect("the 737 retards");
-        assert_eq!(cfg.retard_inside_fpm, Some(185.0));
-        let mut power = FlarePower::default();
-        assert_eq!(power.step(cfg, 0.44, -300.0, 0.22, 20.0), Some(0.44));
-        assert_eq!(power.step(cfg, 0.44, -300.0, 0.22, 17.0), Some(0.44));
-        assert_eq!(power.step(cfg, 0.44, -295.0, 0.22, 11.0), Some(0.44));
-        // Inside: the ramp starts, and a sink that grows again after it
-        // does not stop it (the flare has been inside once).
-        let a = power.step(cfg, 0.44, -180.0, 0.22, 8.0).unwrap();
-        assert!(a < 0.44, "{a}");
-        let b = power.step(cfg, 0.44, -200.0, 0.22, 7.0).unwrap();
+        assert_eq!(cfg.retard_below_ft, Some(20.0));
+        assert_eq!(cfg.retard_at_s, Some(2.0));
+        let (mut old_worst, mut old_sum, mut new_worst, mut new_sum) = (0.0f64, 0.0, 0.0f64, 0.0);
+        for s in LEMG_13_SORTIES {
+            let r = recording(s);
+            let a = r.arrest();
+            let rough = r.air().rough();
+            let old = fly_through_air_with(&a, CALM_FIT, rough, true, Retard::Sink(SinkKeyed::as_flown()));
+            let new = fly_through_air(&a, CALM_FIT, rough, true);
+            assert!(!new.climbed, "{s}: climbed");
+            assert!(new.sink_fpm > 150.0, "{s}: a landing, not a float: {:.0}", new.sink_fpm);
+            assert!(new.float_m < 1200.0, "{s}: floated {:.0} m", new.float_m);
+            old_worst = old_worst.max(old.sink_fpm);
+            new_worst = new_worst.max(new.sink_fpm);
+            old_sum += old.sink_fpm;
+            new_sum += new.sink_fpm;
+        }
+        let n = LEMG_13_SORTIES.len() as f64;
+        assert!(
+            (old_sum / n - 268.0).abs() < 10.0 && (old_worst - 300.0).abs() < 10.0,
+            "the old retard replays as characterised: {:.0} mean, {old_worst:.0} worst",
+            old_sum / n
+        );
+        assert!(
+            new_sum / n < old_sum / n - 15.0 && new_worst < old_worst,
+            "{:.0} mean, {new_worst:.0} worst against {:.0}, {old_worst:.0}",
+            new_sum / n,
+            old_sum / n
+        );
+        // The 2026-09-26 gates through every plant: under the scorecard's
+        // 400 with margin, none climbing, no float past 1,200 m.
+        for (k, fit) in PLANTS.iter().enumerate() {
+            for (i, g) in GATES.iter().enumerate() {
+                let l = fly(*g, *fit, Law::Model(model()));
+                assert!(l.sink_fpm < 340.0, "gate {i}, plant {k}: {:.0}", l.sink_fpm);
+                assert!(!l.climbed && l.float_m < 1200.0, "gate {i}, plant {k}");
+            }
+        }
+    }
+
+    /// The keys one by one on the 737's numbers: above 20 ft nothing; below
+    /// it, nothing while more than 2 s from the wheels unless faster than the approach speed;
+    /// then timed to the wheels at no more than 0.04 a second; and a flare
+    /// 5 kt slow keeps its thrust. LEMG 12 (2026-09-26) sinking 300 at
+    /// 20 ft: 4 s from the wheels, so the lever stays (it went 0.44 to 0.16
+    /// by height alone and landed at 407).
+    #[test]
+    fn the_737_retard_keys() {
+        let cfg = profile_737().flare_power.expect("the 737 retards");
+        let app = Some(APPROACH_IAS);
+        let on = Some(APPROACH_IAS);
+        let mut p = FlarePower::default();
+        assert_eq!(p.step(cfg, 0.44, -300.0, 0.22, 25.0, on, app), Some(0.44));
+        assert_eq!(p.step(cfg, 0.44, -300.0, 0.22, 21.0, on, app), Some(0.44));
+        assert_eq!(p.last_key, Some(RetardKey::Height));
+        assert_eq!(p.step(cfg, 0.44, -300.0, 0.22, 19.0, on, app), Some(0.44));
+        assert_eq!(p.last_key, Some(RetardKey::Time));
+        // 10 ft at 300 fpm is 2 s: off it comes, at no more than 0.04 a second.
+        let a = p.step(cfg, 0.44, -300.0, 0.22, 10.0, on, app).unwrap();
+        assert!(a < 0.44 && a >= 0.44 - 0.04 * 0.22 - 1e-9, "{a}");
+        assert_eq!(p.last_key, Some(RetardKey::Timed));
+        // Once due it stays due: a float after it does not re-hold the lever.
+        let b = p.step(cfg, 0.44, -60.0, 0.22, 9.5, on, app).unwrap();
         assert!(b < a, "{a} -> {b}");
-        // Never inside (LEMG 13, the first prediction flare: 0.30 of lever
-        // at the wheels): by 10 ft it goes anyway, at no more than 0.08 a
-        // second.
-        assert_eq!(cfg.retard_by_ft, Some(10.0));
-        let mut power = FlarePower::default();
-        assert_eq!(power.step(cfg, 0.30, -270.0, 0.22, 12.0), Some(0.30));
-        let c = power.step(cfg, 0.30, -270.0, 0.22, 10.0).unwrap();
-        assert!(c < 0.30 && c >= 0.30 - 0.08 * 0.22 - 1e-9, "{c}");
-        // Undeclared (every other airframe): by height alone.
-        let old = crate::aircraft::FlarePowerProfile {
-            retard_inside_fpm: None,
-            ..cfg
-        };
-        let mut power = FlarePower::default();
-        power.step(old, 0.44, -300.0, 0.22, 20.0);
-        assert!(power.step(old, 0.44, -300.0, 0.22, 17.0).unwrap() < 0.44);
+        // Fast: 2 kt over the approach speed starts it at 19 ft.
+        let mut f = FlarePower::default();
+        f.step(cfg, 0.3, -300.0, 0.22, 19.0, Some(148.0), app);
+        assert!(f.step(cfg, 0.3, -300.0, 0.22, 18.0, Some(148.0), app).unwrap() < 0.3);
+        // Slow: 6 kt under keeps it, however close the wheels.
+        let mut s = FlarePower::default();
+        s.step(cfg, 0.3, -300.0, 0.22, 5.0, Some(139.0), app);
+        assert_eq!(s.step(cfg, 0.3, -300.0, 0.22, 4.0, Some(139.0), app), Some(0.3));
+        assert_eq!(s.last_key, Some(RetardKey::Slow));
     }
 
     /// Only an airframe that declares a model flies it; the SF50 and every
@@ -10448,6 +10684,28 @@ mod lemg_737_flare_tests {
     /// wheels, and the flight model's touchdown): 1790589309 (422 fpm) and
     /// 1790589773 (335) in gusts, 1790588609 (236) in calm air.
     const LEMG_13_FLARES: &str = include_str!("../bench/landings/lemg13_gusty_flares.jsonl");
+    /// The other thirteen LEMG 13 approaches of that night's build (sorties
+    /// 1790586843 to 1790590296, 225 to 315 fpm), the same fields.
+    const LEMG_13_CALM_FLARES: &str = include_str!("../bench/landings/lemg13_calm_flares.jsonl");
+    /// Every one of the sixteen, in order.
+    const LEMG_13_SORTIES: [&str; 16] = [
+        "1790586843",
+        "1790587073",
+        "1790587296",
+        "1790587535",
+        "1790587771",
+        "1790588007",
+        "1790588156",
+        "1790588305",
+        "1790588460",
+        "1790588609",
+        "1790589309",
+        "1790589541",
+        "1790589773",
+        "1790590005",
+        "1790590150",
+        "1790590296",
+    ];
 
     #[derive(Clone, Copy, Debug)]
     struct Tick {
@@ -10473,7 +10731,7 @@ mod lemg_737_flare_tests {
     fn recording(sortie: &str) -> Recording {
         let mut ticks = Vec::new();
         let mut touchdown_fpm = f64::NAN;
-        for line in LEMG_13_FLARES.lines() {
+        for line in LEMG_13_FLARES.lines().chain(LEMG_13_CALM_FLARES.lines()) {
             let v: serde_json::Value = serde_json::from_str(line).expect("a bench line");
             if !v["sortie"].as_str().is_some_and(|s| s.starts_with(sortie)) {
                 continue;
@@ -10581,6 +10839,8 @@ mod lemg_737_flare_tests {
         eased: f64,
         climbed: bool,
         float_m: f64,
+        lever_at_wheels: f64,
+        ias_at_wheels: f64,
     }
 
     /// Fly a recorded gate through a fit and the recorded air, the law
@@ -10589,14 +10849,27 @@ mod lemg_737_flare_tests {
     /// lever held in a climb, the elevator arriving a dead time after it is
     /// written through two lags.
     fn fly_through_air(a: &[Tick], fit: Fit, rough: bool, with_air: bool) -> Flown {
+        fly_through_air_with(a, fit, rough, with_air, Retard::profile())
+    }
+
+    /// ...with the retard as it flew on 2026-09-28 (the sink-keyed law).
+    fn fly_as_flown(a: &[Tick], fit: Fit, rough: bool, with_air: bool) -> Flown {
+        fly_through_air_with(a, fit, rough, with_air, Retard::Sink(SinkKeyed::as_flown()))
+    }
+
+    fn fly_through_air_with(
+        a: &[Tick],
+        fit: Fit,
+        rough: bool,
+        with_air: bool,
+        mut power: Retard,
+    ) -> Flown {
         let (air, speed) = if with_air {
             air_of(a, fit)
         } else {
             (vec![0.0], Vec::new())
         };
         let times: Vec<f64> = a.iter().map(|k| k.t - a[0].t).collect();
-        let power_cfg = profile_737().flare_power.expect("the 737 retards");
-        let mut power = FlarePower::default();
         let mut law = model();
         let mut p = Plant::at(gate_of(a), fit);
         let (mut h, approach_lever) = (a[0].radio, a[0].lever);
@@ -10609,6 +10882,8 @@ mod lemg_737_flare_tests {
             eased: 0.0,
             climbed: false,
             float_m: 0.0,
+            lever_at_wheels: 0.0,
+            ias_at_wheels: 0.0,
         };
         while h > 0.0 && p.t < 40.0 {
             if p.t + 1e-9 >= next {
@@ -10633,7 +10908,7 @@ mod lemg_737_flare_tests {
                     lever = if v > 0.0 {
                         approach_lever
                     } else {
-                        power.step(power_cfg, lever, v, law_dt, h).unwrap_or(lever)
+                        power.step(lever, v, law_dt, h, p.ias).unwrap_or(lever)
                     };
                 }
                 p.air_kts_s = if with_air {
@@ -10662,6 +10937,8 @@ mod lemg_737_flare_tests {
             }
         }
         out.sink_fpm = -p.vvi;
+        out.lever_at_wheels = lever;
+        out.ias_at_wheels = p.ias;
         out
     }
 
@@ -10724,7 +11001,7 @@ mod lemg_737_flare_tests {
         assert_eq!(r.touchdown_fpm, 422.0);
         assert!(r.air().rough());
         let a = r.arrest();
-        let flown = fly_through_air(&a, CALM_FIT, false, true);
+        let flown = fly_as_flown(&a, CALM_FIT, false, true);
         assert!(
             (flown.sink_fpm - r.touchdown_fpm).abs() < 40.0,
             "the replay lands where the aircraft did: {:.0}",
@@ -10744,7 +11021,7 @@ mod lemg_737_flare_tests {
         // 1790589773 (335 fpm, the same gusts): 380 as flown here, under
         // 320 held.
         let a = recording("1790589773").arrest();
-        let flown = fly_through_air(&a, CALM_FIT, false, true);
+        let flown = fly_as_flown(&a, CALM_FIT, false, true);
         let held = fly_through_air(&a, CALM_FIT, true, true);
         assert!(flown.sink_fpm > 350.0, "{:.0}", flown.sink_fpm);
         assert!(
@@ -10781,7 +11058,7 @@ mod lemg_737_flare_tests {
         let r = recording("1790588609");
         assert!(!r.air().rough());
         let a = r.arrest();
-        let flown = fly_through_air(&a, CALM_FIT, false, true);
+        let flown = fly_as_flown(&a, CALM_FIT, false, true);
         assert!(
             (flown.sink_fpm - r.touchdown_fpm).abs() < 30.0,
             "{:.0} against {:.0}",

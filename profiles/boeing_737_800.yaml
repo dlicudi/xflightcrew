@@ -57,26 +57,30 @@ barometer: true
 approach_thrust_min: 0.3
 flare_power:
   reduction_per_second: 0.08
-  hold_sink_fpm: 400.0
-  lead_seconds: 1.0
-  # Retard by height, as the crew does: nothing above 20 ft, then timed to
-  # idle at the wheels. Keyed on the sink, it cut to idle in the float at
-  # LEMG 13 and the 737 arrived at -859 fpm, 2.4 g (2026-09-26).
+  # The retard is keyed on height, time to the wheels and speed, never on
+  # the sink the arrest is removing (issue #76). Keyed on the sink it cut to
+  # idle in the float at LEMG 13 (-859 fpm, 2.4 g, 2026-09-26), and on
+  # 2026-09-28 it started when the arrest brought the sink inside 185 (15.8
+  # ft, mid-float in 1790589309) and stopped again when the sink it cost
+  # came back past 400. Nothing above 20 ft, as the crew does.
   retard_below_ft: 20.0
-  # ...and not until the flare has the sink inside 185 fpm: at LEMG 12
-  # (2026-09-26) it was still sinking 300 at 20 ft, the retard took the
-  # lever 0.44 to 0.16, and the speed it cost came back as sink at the
-  # wheels (407). A lever still up at the wheels is the rollout's to close.
-  retard_inside_fpm: 185.0
-  # ...but by 10 ft whatever the sink, and no faster than 0.08 a second:
-  # the first prediction flare (LEMG 13, 2026-09-26, 277 fpm) never came
-  # inside 185 and touched down at 138 kt with 0.30 of lever. Replayed
-  # from that gate through its own fitted plant: 271 fpm with 0.13 left at
-  # the wheels (the rollout closes the rest); cut to idle by the wheels,
-  # 299; from 15 ft, 308. Every recorded gate through every flare's plant:
-  # 304 at worst.
-  retard_by_ft: 10.0
-  retard_max_per_s: 0.08
+  # ...and below it, at or under the approach speed, not while more than
+  # 2 s from the wheels (radio over sink): LEMG 12 (2026-09-26) sinking 300
+  # at 20 ft is 4 s out, where the height retard walked 0.44 to 0.16 and
+  # landed at 407. Any faster than the approach speed it starts at 20 ft:
+  # a fast flare floats.
+  retard_at_s: 2.0
+  retard_fast_kts: 0.0
+  # A flare 5 kt under the approach speed keeps its thrust: a knot taken is
+  # 63 fpm at the wheels (the fitted plant).
+  retard_slow_kts: 5.0
+  # No faster than 0.04 a second (0.08: 292 worst, 347 through the strong
+  # 17:25 plant). A lever still up at the wheels is the rollout's to close.
+  # Replayed through the fitted plant and the recorded air: the sixteen
+  # LEMG 13 approaches of 2026-09-28 at 238 fpm mean, 277 worst (the
+  # sink-keyed law: 268, 300); the gusty two through nine plants, 293, none
+  # climbing; the 2026-09-26 gates through every flare's plant, 316 worst.
+  retard_max_per_s: 0.04
 # The rudder on the takeoff roll (autotakeoff::RollSteer): yaw rate per unit
 # of steer, growing with the square of the speed. Fitted to both EGKK 26L
 # rolls of 2026-09-27 (8 kt crosswind from the left, 30 to 86 kt; 3 s
