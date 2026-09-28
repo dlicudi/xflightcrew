@@ -610,6 +610,9 @@ impl Station {
             serde_json::json!({
                 "route": "keyed",
                 "outcome": if reply.is_empty() { "silence" } else { "reply" },
+                // A readback has no intent of its own ("Unknown"): its
+                // silence is the controller accepting it (#176).
+                "readback": reply.is_empty() && tower::is_readback(transcript),
                 "service": service.name(), "transcript": transcript,
                 "intent": format!("{:?}", tower::parse_intent(transcript)),
                 "state": format!("{before:?}>{:?}", self.twr.state), "reply": reply,

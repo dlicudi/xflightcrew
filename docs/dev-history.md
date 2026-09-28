@@ -10189,3 +10189,19 @@ had "set up the ILS"'s "above the glideslope" warning (it fired on a negative ne
 reading, `ils::above_glideslope`, words "N dots high, we're above" / "low, below", and no
 glideslope call under 200 ft radio (`XCHECK_GS_FLOOR_AGL_FT`; the localizer is still watched).
 Test `a_positive_glideslope_needle_is_above_the_beam`. Offline only.
+
+## 2026-09-28: the departure handoff read back 37 s late (issue #176)
+
+EGKK 08R to EGBB 15, 737 (sortie 1790624015-full_auto). The tower's "contact London Gatwick
+Departure on 134.125" went out at +1082.9 (960 ft); the crew's readback went at +1120.2, `age_s`
+0.0, the moment the takeoff handed over at 2,747 ft AGL. Only `wait_enroute_working_the_radio`
+took `take_departure_handoff()`, and full auto's takeoff wait was a bare `wait_until(!running)`,
+so nothing owned the radio from liftoff to the takeoff's handoff. The takeoff wait is now
+`wait_takeoff_working_the_radio` (500 ms poll): the handoff is obeyed on the next poll (readback
+on the tower, retune, check-in; blackbox `full_auto` `departure_handoff` `during: takeoff`), and the
+IFR clearance's ceiling is not put back after a check-in made inside it. The tower's "intent
+Unknown, silence" is its readback path (a readback has no intent; seven sorties since 09-21 show
+the same line): the `atc` record now carries `readback`. Tests
+`the_takeoff_reads_back_the_departure_handoff_at_once`,
+`the_takeoff_wait_takes_the_departure_handoff`.
+Offline only.
