@@ -3422,6 +3422,11 @@ mod tests {
                 "VACATE_HANDOFF_KTS",
                 "taxi speed off the runway, not a flight speed",
             ),
+            (
+                "autoland",
+                "ROLLOUT_BRAKE_STEER_MIN_KTS",
+                "the rollout's brake split stops at walking pace, the taxi's own floor; only brake_steer airframes",
+            ),
             // --- Aerodynamic ramps: airflow over a surface, not performance ---
             (
                 "autotakeoff",
