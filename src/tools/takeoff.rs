@@ -214,6 +214,9 @@ impl Tool for AutoTakeoff {
                 // Registry copy: the pilot asked, the pilot gets the
                 // aircraft. Full auto's copy sets true — see the field doc.
                 handoff_to_caller: self.handoff_to_caller,
+                // A departure hands off at or above its acceleration height,
+                // with the schedule walked or the flaps cleaned up.
+                flaps_to_caller: false,
                 handoff_speed_kts: self.cruise_ias_kts,
                 base_url: ctx.config.xplane_base_url.clone(),
                 park_brake_valve_set: self.park_brake_valve_set,
