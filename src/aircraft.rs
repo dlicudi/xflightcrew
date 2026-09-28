@@ -259,6 +259,12 @@ pub struct FlareModelProfile {
     /// Smoothing on the unexplained sink, seconds.
     #[serde(default = "default_model_observer_s")]
     pub observer_s: f64,
+    /// In rough air the flare's pull only comes back (absent: yes, the
+    /// 737's LEMG 13 downdraft). `false` flies the prediction in any air: a
+    /// strong elevator whose held pull becomes a float bleeds the speed of
+    /// a slow wing into the ground (the SF50, issue #163).
+    #[serde(default)]
+    pub rough_hold: Option<bool>,
 }
 
 fn default_model_ground_ft() -> f64 {
