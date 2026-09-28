@@ -387,7 +387,8 @@ everything blackboxes to `logs/blackbox.jsonl` (kinds: `atc`, `autotaxi`, `autot
 - **A stage not moving the aircraft is holding it**: brakes for every wait, abort and give-up. **A
   mission that ENDS on the ground stops and parks** (`full_auto::hand_back_hold`, governor or not, a
   pilot's "my controls" included): wheel brakes to a stop below `HAND_BACK_BRAKE_MAX_KTS`, then
-  `set_park_brake_confirmed`, read back and said; airborne, fast, a tug on the bar or an unread speed
+  `set_park_brake_confirmed` once the held brake command's ride on the ratio has decayed
+  (`HAND_BACK_BRAKE_TAIL_S`; LEMG SR22, #35), read back and said; airborne, fast, a tug on the bar or an unread speed
   is `hand_back_skipped`. A give-up the abort flag ended is the pilot's cancel (`give_up_words`) (LFPB
   2026-09-22; LEMG 2026-09-28: 5.8 kt and rising after "your aircraft").
 - **One writer per dataref.** Plugin channels (`taxi_steer`, `taxi_brake`, `taxi_brake_l/_r`,

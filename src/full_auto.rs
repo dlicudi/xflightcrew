@@ -520,6 +520,10 @@ const HAND_BACK_STOP_S: f64 = 15.0;
 /// One wheel-brake pulse per this long while stopping, inside the held
 /// command's own expiry so the squeeze is continuous.
 const HAND_BACK_TICK_MS: u64 = 400;
+/// From the last held-brake pulse to a parking brake that can stick: the
+/// hold itself plus the ratio's measured decay (~0.8 s) and slack, the same
+/// margin as `tools::brake_cmd_quiet`.
+const HAND_BACK_BRAKE_TAIL_S: f64 = crate::tools::BRAKE_HOLD_SECS + 1.0;
 
 /// ...and on the ground it means the aircraft is STOPPED and the PARKING
 /// BRAKE holds it, not a control loop of ours and not nothing.
@@ -588,6 +592,9 @@ async fn hand_back_hold(xp: &dyn crate::xplane::XPlane, valve_set: Option<f64>) 
     let t0 = tokio::time::Instant::now();
     let mut kts = from_kts;
     let mut pulses = 0u32;
+    // A brake command another loop issued just before us (the governor's
+    // stop channel) rides the same ratio: counted as a pulse at the start.
+    let mut last_pulse = (!crate::tools::brake_cmd_quiet()).then_some(t0);
     while kts >= HAND_BACK_STOPPED_KTS && t0.elapsed().as_secs_f64() < HAND_BACK_STOP_S {
         if xp
             .run_command_for(crate::tools::BRAKES_REGULAR, crate::tools::BRAKE_HOLD_SECS)
@@ -596,6 +603,7 @@ async fn hand_back_hold(xp: &dyn crate::xplane::XPlane, valve_set: Option<f64>) 
         {
             crate::tools::note_brake_cmd();
             pulses += 1;
+            last_pulse = Some(tokio::time::Instant::now());
         }
         tokio::time::sleep(std::time::Duration::from_millis(HAND_BACK_TICK_MS)).await;
         match xp.get_float(crate::autotaxi::GS_MS).await {
@@ -605,6 +613,18 @@ async fn hand_back_hold(xp: &dyn crate::xplane::XPlane, valve_set: Option<f64>) 
         }
     }
     let stopped = kts < HAND_BACK_STOPPED_KTS;
+    // The held brake command RIDES `parking_brake_ratio` while it is active
+    // and the sim decays it for ~0.8 s after expiry (`tools::brake_cmd_quiet`),
+    // so a parking brake set inside that window is written over. LEMG
+    // 2026-09-28 (sortie 1790605551, SR22): three pulses from 4.2 kt, then all
+    // three tries inside 1.6 s of the last one, `park` read back 0.294 (the
+    // regular effort decaying) and "the parking brake didn't set"; the 737
+    // and the later SR22 held only on their SECOND try, the one that landed
+    // after the tail. Stopped, the aircraft waits out the tail first.
+    if let Some(at) = last_pulse {
+        let quiet_at = at + std::time::Duration::from_secs_f64(HAND_BACK_BRAKE_TAIL_S);
+        tokio::time::sleep_until(quiet_at).await;
+    }
     // Tried three times, and the failure KEPT: at LIPK (2026-09-26) one
     // attempt read back unset with its error swallowed, and the governor
     // went on squeezing a 172 on its wheel brakes for fifteen minutes (the
@@ -6869,6 +6889,130 @@ mod tests {
             (PARK, 0.0),
         ]);
         assert_eq!(hand_back_hold(&stuck, Some(1.0)).await, Some(false));
+    }
+
+    /// The SR22 at LEMG as the sim behaves: the held regular-brake command
+    /// rides `parking_brake_ratio` at the regular effort (~0.36) while
+    /// active and decays it over ~0.8 s after its 1 s expiry, writing over
+    /// any parking brake set inside that window; a set after it sticks.
+    /// Each pulse slows the aircraft 1.5 m/s/s for the 0.4 s tick.
+    struct RidingBrake {
+        sim: crate::xplane::FakeXPlane,
+        gs_ms: std::sync::Mutex<f64>,
+        braking: std::sync::atomic::AtomicBool,
+        last_pulse: std::sync::Mutex<Option<tokio::time::Instant>>,
+        set_at: std::sync::Mutex<Option<tokio::time::Instant>>,
+    }
+
+    impl RidingBrake {
+        const PARK: &'static str = TaxiingJet::PARK;
+        const EFFORT: f64 = 0.36;
+        const DECAY_S: f64 = 0.8;
+
+        fn rolling_at_kts(kts: f64) -> Self {
+            RidingBrake {
+                sim: crate::xplane::FakeXPlane::with_reads(&[
+                    (crate::datarefs::ON_GROUND_ANY, 1.0),
+                    (crate::autotaxi::TUG_ATTACHED, 0.0),
+                ]),
+                gs_ms: std::sync::Mutex::new(kts / super::MS_TO_KTS),
+                braking: std::sync::atomic::AtomicBool::new(false),
+                last_pulse: std::sync::Mutex::new(None),
+                set_at: std::sync::Mutex::new(None),
+            }
+        }
+
+        /// The ratio the sim shows now: the command's ride, else a set that
+        /// came after the tail, else nothing (a set inside it was lost).
+        fn park(&self) -> f64 {
+            let now = tokio::time::Instant::now();
+            let ride = self.last_pulse.lock().unwrap().map(|p| {
+                let since = (now - p).as_secs_f64() - crate::tools::BRAKE_HOLD_SECS;
+                (since, p + std::time::Duration::from_secs_f64(1.0 + Self::DECAY_S))
+            });
+            let set = *self.set_at.lock().unwrap();
+            match ride {
+                Some((since, _)) if since < 0.0 => Self::EFFORT,
+                Some((since, _)) if since < Self::DECAY_S => {
+                    Self::EFFORT * (1.0 - since / Self::DECAY_S)
+                }
+                Some((_, free)) => match set {
+                    Some(s) if s >= free => 1.0,
+                    _ => 0.0,
+                },
+                None => set.map_or(0.0, |_| 1.0),
+            }
+        }
+
+        fn set_now(&self) {
+            *self.set_at.lock().unwrap() = Some(tokio::time::Instant::now());
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::xplane::XPlane for RidingBrake {
+        async fn get_float(&self, name: &str) -> anyhow::Result<f64> {
+            if name == Self::PARK {
+                return Ok(self.park());
+            }
+            if name != crate::autotaxi::GS_MS {
+                return self.sim.get_float(name).await;
+            }
+            let mut gs = self.gs_ms.lock().unwrap();
+            if self.braking.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                *gs = (*gs - 1.5 * 0.4).max(0.0);
+            }
+            Ok(*gs)
+        }
+        async fn set_float(&self, name: &str, value: f64) -> anyhow::Result<()> {
+            if name == Self::PARK && value > 0.5 {
+                self.set_now();
+            }
+            self.sim.set_float(name, value).await
+        }
+        async fn set_int(&self, name: &str, value: i64) -> anyhow::Result<()> {
+            self.sim.set_int(name, value).await
+        }
+        async fn run_command(&self, name: &str) -> anyhow::Result<()> {
+            if name == TaxiingJet::SET {
+                self.set_now();
+            }
+            self.sim.run_command(name).await
+        }
+        async fn run_command_for(&self, name: &str, secs: f64) -> anyhow::Result<()> {
+            if name == crate::tools::BRAKES_REGULAR {
+                self.braking.store(true, std::sync::atomic::Ordering::SeqCst);
+                *self.last_pulse.lock().unwrap() = Some(tokio::time::Instant::now());
+            }
+            self.sim.run_command_for(name, secs).await
+        }
+        async fn get_float_array(&self, name: &str) -> anyhow::Result<Vec<f64>> {
+            self.sim.get_float_array(name).await
+        }
+        async fn set_int_array_elem(&self, name: &str, i: usize, v: i64) -> anyhow::Result<()> {
+            self.sim.set_int_array_elem(name, i, v).await
+        }
+        async fn set_float_array_elem(&self, name: &str, i: usize, v: f64) -> anyhow::Result<()> {
+            self.sim.set_float_array_elem(name, i, v).await
+        }
+    }
+
+    /// #35, LEMG 2026-09-28 (sortie 1790605551, SR22, t 1790606569.6):
+    /// `hand_back_brakes` from 4.2 kt, three pulses, stopped, then three
+    /// parking-brake tries inside 1.6 s of the last pulse, all written over
+    /// by the held command's ride on the ratio: `held: false`, `park` 0.294,
+    /// "the parking brake didn't set". The 737 (t 1790601686.9) and the later
+    /// SR22 (t 1790619440.1) held on try two, after the tail. Stopped, the
+    /// hand-back waits the tail out and the first try sets.
+    #[tokio::test(start_paused = true)]
+    async fn the_hand_back_parks_after_the_brake_command_lets_go_of_the_ratio() {
+        let sr22 = RidingBrake::rolling_at_kts(4.2);
+        let held = super::hand_back_hold(&sr22, Some(1.0)).await;
+        let pulses = sr22.sim.ran_count(crate::tools::BRAKES_REGULAR);
+        assert_eq!(pulses, 3, "the record's three pulses");
+        assert_eq!(held, Some(true), "the parking brake reads set");
+        assert_eq!(sr22.park(), 1.0);
+        assert_eq!(sr22.sim.ran_count(TaxiingJet::SET), 1, "set on the first try");
     }
 
     /// #135: the pilot's cancel ends the taxi wait, and the give-up says so

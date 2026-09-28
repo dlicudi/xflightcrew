@@ -9981,3 +9981,17 @@ goes to the pilot and the mission ends 1.5 to 3.2 s on. A standalone autoland's 
 landing; nobody owes a stand. `duty::next` now says Vacate at TaxiIn under mission "autoland" (the
 rollout's duty carries on, autoland agrees), and TaxiToStand stays full auto's. Replayed through
 `DutyTrail`: nothing in the logs since 1790586000 disagrees now. Offline only.
+
+## 2026-09-28: the hand-back's parking brake written over by our own brake command (issue #35)
+
+LEMG, SR22 (sortie 1790605551, t 1790606569.6): `hand_back_brakes` from 4.2 kt, three
+`brakes_regular` pulses, stopped, then three `park_brake_set` tries inside 1.6 s of the last pulse,
+`held: false`, `park` 0.294, "the parking brake didn't set". Not the valve sense (1.0 = set, as the
+SR22's autoland stops read back). The held command rides `parking_brake_ratio` at the regular effort
+while active and the sim decays it ~0.8 s after its 1 s expiry (measured 2026-07-14,
+`tools::brake_cmd_quiet`), so a set inside that window is written over; 0.294 is that decay. The 737
+(t 1790601686.9) and the later SR22 (t 1790619440.1) held only on try two, the one past the tail.
+`hand_back_hold` now waits `HAND_BACK_BRAKE_TAIL_S` (hold + 1.0 s) after its last pulse, or from its
+start when another loop's brake command is still live, before setting. Test
+`the_hand_back_parks_after_the_brake_command_lets_go_of_the_ratio` (a sim whose command rides the
+ratio; the old code reads back false). Offline only.
