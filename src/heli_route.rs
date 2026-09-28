@@ -200,6 +200,64 @@ pub fn final_command(d_m: f64, from_ft: f64, from_mps: f64) -> (f64, f64) {
     (speed, height)
 }
 
+/// The final's GROUNDSPEED ceiling, m/s: the hover mode's own range, the
+/// hand-over speed flown over the ground. The mode is a groundspeed hold and
+/// its let-go is a groundspeed: climbing out of LSZS (2026-09-24) it held 35
+/// kt over the ground at 50 to 56 kt indicated in the valley wind, and the
+/// one let-go it has shown came at 39 kt over the ground and 37 indicated
+/// (EDDV, 2026-09-23).
+pub const FINAL_MAX_GS_MPS: f64 = HANDOVER_KTS * 0.514_444;
+/// The final's AIRSPEED ceiling, kt (true, from the wind at the aircraft):
+/// the most the hover mode is recorded holding (56 kt indicated at LSZS). A
+/// headwind stronger than the difference slows the final over the ground.
+pub const FINAL_MAX_AIR_KTS: f64 = 55.0;
+
+/// Headwind (positive into the nose of the track) and crosswind, m/s, of a
+/// wind blowing FROM `from_deg` (true) at `mps`, on a true `track_deg`.
+pub fn wind_components(track_deg: f64, from_deg: f64, mps: f64) -> (f64, f64) {
+    let rel = (from_deg - track_deg).to_radians();
+    (mps * rel.cos(), mps * rel.sin())
+}
+
+/// The final's groundspeed cap, m/s: as fast over the ground as the hover
+/// mode flies ([`FINAL_MAX_GS_MPS`]), and no faster through the air than
+/// [`FINAL_MAX_AIR_KTS`]; never under the groundspeed it was handed over at
+/// (`from_mps`, itself inside the mode's range). `wind` is (headwind,
+/// crosswind) on the final's track, m/s; `None` (no read) keeps the old
+/// cap, the handed-over groundspeed. Until #82 that WAS the cap: into ETND
+/// (2026-09-23) the slow-down reached 38 kt indicated with 21.6 kt over the
+/// ground in a 17 kt headwind, and the final flew 4.4 km at 21.6 kt, six and
+/// a half minutes. Pure.
+pub fn final_cap_mps(from_mps: f64, wind: Option<(f64, f64)>) -> f64 {
+    let base = from_mps.clamp(0.0, FINAL_MAX_GS_MPS);
+    let Some((head, cross)) = wind.filter(|(h, x)| h.is_finite() && x.is_finite()) else {
+        return base;
+    };
+    let air = FINAL_MAX_AIR_KTS * 0.514_444;
+    // Airspeed = |ground + head, cross|: the fastest ground that keeps it
+    // at the ceiling.
+    let by_air = (air * air - cross * cross).max(0.0).sqrt() - head;
+    by_air.min(FINAL_MAX_GS_MPS).max(base)
+}
+
+/// The slow-down's IAS target, kt: the hand-over speed, less the tailwind the
+/// aircraft is flying in (groundspeed over indicated), so the GROUNDSPEED
+/// arrives inside the hover mode's takeover range ([`hover::TAKEOVER_MAX_MPS`]);
+/// never under [`SLOW_MIN_KTS`]. A headwind leaves it at [`HANDOVER_KTS`]:
+/// slower over the ground is already inside the range. With 38 kt indicated
+/// a 12 kt tailwind is 50 kt over the ground, and the takeover, which waits
+/// for 39, never came: the route flew on over the pad. Pure.
+pub fn slow_target_kts(ias_kts: f64, gs_kts: f64) -> f64 {
+    if !(ias_kts.is_finite() && gs_kts.is_finite()) {
+        return HANDOVER_KTS;
+    }
+    (HANDOVER_KTS - (gs_kts - ias_kts).max(0.0)).max(SLOW_MIN_KTS)
+}
+/// The slowest the slow-down flies under the cruise modes: altitude hold at
+/// 35 kt drifted backwards and sank once (ETHC, 2026-09-23), so the tailwind
+/// correction stops here.
+pub const SLOW_MIN_KTS: f64 = 30.0;
+
 /// The route's ground-track sampled every `step_m` (lat, lon), both ends
 /// included.
 pub fn sample_legs(line: &[(f64, f64)], step_m: f64) -> Vec<(f64, f64)> {
@@ -1293,6 +1351,7 @@ async fn fly(
     let mut final_from: Option<(f64, f64)> = None;
     let mut bug_set: Option<f64> = None;
     let mut unheld_since: Option<std::time::Instant> = None;
+    let mut slow_tail_said = false;
     let mut last = std::time::Instant::now();
     let mut tick_n = 0u64;
     if route.arrive_only {
@@ -1675,11 +1734,18 @@ async fn fly(
                     }
                 }
                 let want = match phase {
-                    Phase::Slow => HANDOVER_KTS,
+                    Phase::Slow => slow_target_kts(s.ias, s.gs * 1.943_84),
                     Phase::Approach => APPROACH_KTS,
                     _ if climbing => CLIMB_KTS,
                     _ => cruise_speed,
                 };
+                if phase == Phase::Slow && want < HANDOVER_KTS - 0.5 && !slow_tail_said {
+                    slow_tail_said = true;
+                    crate::blackbox::record(
+                        "heli_route",
+                        serde_json::json!({ "event": "slow_tailwind", "ias": s.ias, "gs_kts": s.gs * 1.943_84, "target_kts": want }),
+                    );
+                }
                 // Level in the cruise with the collective pinned at its cap:
                 // the speed the power makes becomes the cruise, said once.
                 if phase == Phase::Cruise && !climbing {
@@ -1766,7 +1832,32 @@ async fn fly(
                     return false;
                 }
                 let (from_ft, from_mps) = final_from.unwrap_or((depart_agl_ft, DEPART_MPS));
-                let (speed, height) = final_command(to_pad, from_ft, from_mps);
+                // The final's speed cap is the hover mode's GROUNDSPEED range
+                // and an airspeed ceiling through the wind at the aircraft,
+                // never the groundspeed a headwind left at the hand-over. A
+                // failed wind read keeps the old cap.
+                let track_pad = bearing(here, pad);
+                let (wdir, wspd) = tokio::join!(
+                    xp.get_float(crate::datarefs::WIND_DIR_DEG_TRUE),
+                    xp.get_float(crate::datarefs::WIND_SPEED_MSC),
+                );
+                let wind = match (wdir, wspd) {
+                    (Ok(d), Ok(v)) => Some(wind_components(track_pad, d, v)),
+                    _ => None,
+                };
+                let cap = final_cap_mps(from_mps, wind);
+                let (speed, height) = final_command(to_pad, from_ft, cap);
+                if tick_n % 4 == 0 {
+                    crate::blackbox::record(
+                        "heli_route",
+                        serde_json::json!({
+                            "event": "final_tick", "to_pad_m": to_pad, "cmd_mps": speed,
+                            "cap_mps": cap, "from_mps": from_mps, "height_ft": height,
+                            "agl": s.agl_ft, "ias": s.ias, "gs": s.gs,
+                            "head_mps": wind.map(|w| w.0), "cross_mps": wind.map(|w| w.1),
+                        }),
+                    );
+                }
                 if to_pad < ARRIVED_M || speed < 1.0 {
                     hover::retarget(Goal::Land);
                     crate::blackbox::record(
@@ -2010,6 +2101,147 @@ mod tests {
             }
         }
         assert!(bad.is_empty(), "{bad:#?}");
+    }
+
+    /// The ETND final (2026-09-23, #82), replayed: handed over 4,391 m from
+    /// the pad at 11.1 m/s (21.6 kt) over the ground and 39.5 indicated, a
+    /// 17 kt headwind. The route re-aims every half second, the hover loop
+    /// slews its command at its own ramp, and the mode's groundspeed follows
+    /// through a second-order lag and 0.3 s of transport delay. The old cap
+    /// (the handed-over groundspeed) flew it at 21.6 kt; the cap keyed on the
+    /// mode's groundspeed range and an airspeed ceiling flies it at 38, the
+    /// airspeed never past the ceiling, and still stops on the pad.
+    #[test]
+    fn a_headwind_final_flies_the_modes_groundspeed_not_the_handover_speed() {
+        let fly = |wind: Option<(f64, f64)>| {
+            let head = wind.map_or(0.0, |w| w.0);
+            let (mut d, mut v, mut v1, mut cmd) = (4391.0_f64, 11.1_f64, 11.1_f64, 11.1_f64);
+            let mut want = 11.1_f64;
+            let mut q = std::collections::VecDeque::from(vec![11.1; 3]);
+            let dt = 0.1;
+            let (mut t, mut worst_air, mut worst_cmd): (f64, f64, f64) = (0.0, 0.0, 0.0);
+            let mut arrived = None;
+            for i in 0..20_000 {
+                if i % 5 == 0 {
+                    let cap = final_cap_mps(11.1, wind);
+                    let (s, _) = final_command(d, 2004.0, cap);
+                    if d < ARRIVED_M || s < 1.0 {
+                        arrived = Some((d, v));
+                        break;
+                    }
+                    want = s;
+                }
+                // The hover loop's slew (RAMP_ACCEL_MPS2), then the mode.
+                cmd += (want - cmd).clamp(-0.4 * dt, 0.4 * dt);
+                q.push_back(cmd);
+                let c = q.pop_front().unwrap();
+                v1 += (c - v1) * dt / 1.2;
+                v += (v1 - v) * dt / 1.2;
+                d -= v * dt;
+                t += dt;
+                worst_air = worst_air.max((v + head) * 1.943_84);
+                worst_cmd = worst_cmd.max(cmd);
+            }
+            (t, worst_air, worst_cmd, arrived.expect("reached the pad"))
+        };
+        // Headwind 8.7 m/s (17 kt), straight down the final.
+        let etnd = Some(wind_components(270.0, 270.0, 8.7));
+        let (old_t, _, old_cmd, (_, old_end)) = fly(None);
+        let (new_t, air, new_cmd, (d_end, v_end)) = fly(etnd);
+        eprintln!("ETND final: {old_t:.0} s at the hand-over's speed, {new_t:.0} s now, {air:.1} kt through the air");
+        assert!(
+            old_t > 380.0,
+            "the recorded final took 6.5 min: {old_t:.0} s"
+        );
+        assert!(
+            (old_cmd - 11.1).abs() < 0.01,
+            "old cap was the hand-over speed"
+        );
+        assert!(new_t < old_t - 120.0, "{new_t:.0} s against {old_t:.0} s");
+        assert!(
+            new_cmd <= FINAL_MAX_GS_MPS + 1e-9,
+            "inside the mode's range: {new_cmd:.2}"
+        );
+        assert!(air <= FINAL_MAX_AIR_KTS + 1.0, "airspeed {air:.1} kt");
+        // The taper is the same one: over the pad no faster than before.
+        assert!(
+            d_end <= ARRIVED_M && v_end < old_end + 0.5,
+            "stops on the pad: {d_end:.0} m at {v_end:.1} m/s (old {old_end:.1})"
+        );
+        // A gale is held to the airspeed ceiling, and never slowed under the
+        // groundspeed it came in at; calm air flies the mode's range.
+        let gale = final_cap_mps(5.0, Some((25.0, 0.0)));
+        assert!((gale - 5.0).abs() < 1e-9, "{gale}");
+        let strong = final_cap_mps(5.0, Some((15.0, 0.0)));
+        assert!(
+            ((strong + 15.0) * 1.943_84 - FINAL_MAX_AIR_KTS).abs() < 0.1,
+            "{strong}"
+        );
+        assert!((final_cap_mps(19.0, Some((0.0, 0.0))) - FINAL_MAX_GS_MPS).abs() < 1e-9);
+        // A crosswind eats airspeed too; a tailwind is capped by the ground.
+        assert!(final_cap_mps(5.0, Some((10.0, 12.0))) < final_cap_mps(5.0, Some((10.0, 0.0))));
+        assert!((final_cap_mps(19.0, Some((-10.0, 0.0))) - FINAL_MAX_GS_MPS).abs() < 1e-9);
+        // No wind read: the old cap, never a guess.
+        assert_eq!(final_cap_mps(11.1, None), 11.1);
+        assert_eq!(final_cap_mps(11.1, Some((f64::NAN, 0.0))), 11.1);
+        // The wind's components: from the nose is a headwind, from the right
+        // a positive crosswind, from behind a negative headwind.
+        let (h, x) = wind_components(90.0, 90.0, 10.0);
+        assert!((h - 10.0).abs() < 1e-9 && x.abs() < 1e-9);
+        let (h, x) = wind_components(90.0, 180.0, 10.0);
+        assert!(h.abs() < 1e-9 && (x - 10.0).abs() < 1e-9);
+        assert!((wind_components(90.0, 270.0, 10.0).0 + 10.0).abs() < 1e-9);
+    }
+
+    /// The slow-down in a tailwind: 38 kt indicated with 12 kt behind is 50
+    /// over the ground, and the hover loop's takeover waits for 39. The
+    /// target comes down by the tailwind (to its floor), so the speed law on
+    /// the collective brings the GROUNDSPEED into the takeover's range; a
+    /// headwind leaves it alone.
+    #[test]
+    fn a_tailwind_slowdown_arrives_inside_the_takeover_range() {
+        assert_eq!(
+            slow_target_kts(38.0, 21.6),
+            HANDOVER_KTS,
+            "a headwind changes nothing"
+        );
+        assert_eq!(slow_target_kts(38.0, 38.0), HANDOVER_KTS);
+        assert_eq!(slow_target_kts(38.0, 44.0), 32.0);
+        assert_eq!(slow_target_kts(38.0, 60.0), SLOW_MIN_KTS);
+        assert_eq!(slow_target_kts(f64::NAN, 40.0), HANDOVER_KTS);
+        // Through the speed law and a lagged plant, a 6 kt tailwind: the old
+        // target settles 44 kt over the ground, outside the takeover; the new
+        // one inside it.
+        let fly = |tail: f64, keyed: bool| {
+            let mut law = SpeedLaw::from(0.45, 70.0);
+            law.set_floor(APPROACH_COLLECTIVE_MIN);
+            let (mut v, mut acc) = (70.0_f64, 0.0_f64);
+            let dt = 0.5;
+            for _ in 0..600 {
+                let want = if keyed {
+                    slow_target_kts(v, v + tail)
+                } else {
+                    HANDOVER_KTS
+                };
+                let c = law.step(want, v, dt);
+                let level = hover::level_collective(v * 0.5144);
+                acc += (20.0 * (c - level) - acc) * (dt / 2.0);
+                v += acc * dt;
+            }
+            (v + tail) * 0.514_444
+        };
+        let old = fly(6.0, false);
+        let new = fly(6.0, true);
+        assert!(
+            old > hover::TAKEOVER_MAX_MPS,
+            "old: {:.1} kt over the ground",
+            old * 1.943_84
+        );
+        assert!(
+            new < hover::TAKEOVER_MAX_MPS,
+            "new: {:.1} kt over the ground",
+            new * 1.943_84
+        );
     }
 
     #[test]
