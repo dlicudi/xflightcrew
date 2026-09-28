@@ -2558,12 +2558,11 @@ impl SettleWatch {
                     self.retold = true;
                     return SettleStep::TypeMyControls;
                 }
-                if now - t > self.idle_max_s {
-                    let what = match (idle, gs_kts) {
-                        (false, _) => "a loop is still driving".to_string(),
-                        (true, Some(g)) => format!("still moving at {:.0} kt", g.abs()),
-                        (true, None) => "its groundspeed unreadable".to_string(),
-                    };
+                // At rest when the bound comes is settling: the quiet clock
+                // runs out by itself (#168: stopped 9 s of the 10 at the
+                // bound, and failed "still moving at 0 kt").
+                if now - t > self.idle_max_s && self.quiet_since.is_none() {
+                    let what = unsettled(loop_flying, gs_kts, on_ground);
                     return SettleStep::Fail(format!(
                         "the last aircraft never stopped after my controls ({what})"
                     ));
@@ -2571,6 +2570,19 @@ impl SettleWatch {
                 SettleStep::Wait
             }
         }
+    }
+}
+
+/// What was not at rest, named from the same reads the rest test takes.
+fn unsettled(loop_flying: Option<bool>, gs_kts: Option<f64>, on_ground: Option<bool>) -> String {
+    match (loop_flying, on_ground, gs_kts) {
+        (Some(true), ..) => "a loop is still driving".into(),
+        (None, ..) => "the panel marker unreadable".into(),
+        (_, None, _) => "its wheels unreadable".into(),
+        (_, Some(false), _) => "off the ground".into(),
+        (_, _, None) => "its groundspeed unreadable".into(),
+        (_, _, Some(g)) if g.abs() >= STOPPED_KTS => format!("still moving at {:.1} kt", g.abs()),
+        (_, _, Some(g)) => format!("at {:.1} kt, not yet held still", g.abs()),
     }
 }
 
@@ -5151,7 +5163,7 @@ mod tests {
         let mut w = SettleWatch::new(0.0, &pace, false);
         w.tick(STOP_MAX_S + 0.5, Some(false), Some(14.0), Some(true));
         match w.tick(STOP_MAX_S + 61.0, Some(false), Some(9.0), Some(true)) {
-            SettleStep::Fail(why) => assert!(why.contains("still moving at 9 kt"), "{why}"),
+            SettleStep::Fail(why) => assert!(why.contains("still moving at 9.0 kt"), "{why}"),
             other => panic!("{other:?}"),
         }
 
@@ -5414,6 +5426,73 @@ mod tests {
         // Unreadable wheels are no measurement: never stopped on a guess.
         let mut w = SettleWatch::new(0.0, &pace, false).stop_now(true);
         assert_eq!(w.tick(0.0, Some(true), Some(14.0), None), SettleStep::Wait);
+    }
+
+    /// #168, run 20260928-203723Z case 2 (737 LEMG 13): a rejected takeoff
+    /// rolled on unbraked at 73 kt, "my controls" at 1790627961.4, the park
+    /// brake set at 2007.9, under a knot by 2012.7. The 60 s bound came at
+    /// 2021.4 with the aircraft 9 s into its 10 s quiet hold, and the case
+    /// failed "still moving at 0 kt". At rest at the bound is settling.
+    #[test]
+    fn a_stopped_aircraft_at_the_bound_settles() {
+        let pace = Pace {
+            quiet_s: QUIET_S,
+            stop_max_s: STOP_MAX_S,
+            idle_max_s: 60.0,
+            ..Pace::LIVE
+        };
+        // The state records' groundspeed (kt), the brake at 2007.9.
+        let gs = [
+            (1961.4, 72.9),
+            (1979.5, 60.3),
+            (2006.4, 50.6),
+            (2007.9, 50.1),
+            (2009.5, 36.1),
+            (2011.1, 17.7),
+            (2012.7, 0.1),
+            (2014.3, 0.0),
+            (2040.0, 0.0),
+        ];
+        let at = |t: f64| {
+            let i = gs.windows(2).position(|w| t < w[1].0).unwrap_or(gs.len() - 2);
+            let ((t0, g0), (t1, g1)) = (gs[i], gs[i + 1]);
+            g0 + (g1 - g0) * ((t - t0) / (t1 - t0)).clamp(0.0, 1.0)
+        };
+        let t0 = 1790627961.2;
+        let mut w = SettleWatch::new(t0, &pace, false).stop_now(true);
+        assert_eq!(
+            w.tick(t0, Some(false), Some(73.3), Some(true)),
+            SettleStep::TypeMyControls
+        );
+        let mut t = 1961.7;
+        let end = loop {
+            let step = w.tick(t0 - 1961.2 + t, Some(false), Some(at(t)), Some(true));
+            if step != SettleStep::Wait {
+                break (t, step);
+            }
+            t += 0.5;
+            assert!(t < 2040.0, "never settled");
+        };
+        assert!(end.0 > 2021.4 && end.0 < 2024.0, "settled at {}", end.0);
+        assert!(
+            matches!(end.1, SettleStep::Ready(Settle { end: SettleEnd::Stopped, .. })),
+            "{:?}",
+            end.1
+        );
+        // Still rolling at the bound: the reason names the speed.
+        let mut w = SettleWatch::new(0.0, &pace, false).stop_now(true);
+        w.tick(0.0, Some(false), Some(73.0), Some(true));
+        match w.tick(61.0, Some(false), Some(4.2), Some(true)) {
+            SettleStep::Fail(why) => assert!(why.contains("still moving at 4.2 kt"), "{why}"),
+            s => panic!("{s:?}"),
+        }
+        // Not a groundspeed at all: the reason says which read failed.
+        let mut w = SettleWatch::new(0.0, &pace, false).stop_now(true);
+        w.tick(0.0, Some(false), Some(73.0), Some(true));
+        match w.tick(61.0, Some(false), Some(0.0), None) {
+            SettleStep::Fail(why) => assert!(why.contains("wheels unreadable"), "{why}"),
+            s => panic!("{s:?}"),
+        }
     }
 
     /// The fake sim's taxi-in never ends by itself; with `after: stop` the

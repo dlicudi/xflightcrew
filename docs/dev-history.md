@@ -10205,3 +10205,17 @@ the same line): the `atc` record now carries `readback`. Tests
 `the_takeoff_reads_back_the_departure_handoff_at_once`,
 `the_takeoff_wait_takes_the_departure_handoff`.
 Offline only.
+
+## 2026-09-28: the settle failed a stopped aircraft "still moving at 0 kt" (issue #168)
+
+Runner run 20260928-203723Z case 2 (737 LEMG). The last case's rejected takeoff rolled on unbraked
+at 73 kt; `after: stop` typed "my controls" at 1790627961.4 (`hand_back_hold` skips a fast
+aircraft). The park brake set from outside at 2007.9 stopped it by 2012.7, but `SettleWatch`'s
+60 s bound from "my controls" came at 2021.4, 9 s into the 10 s quiet hold, and the case failed.
+The reason printed the groundspeed rounded to 0 kt, since it named only the marker and the speed.
+At rest when the bound comes is now settling (the quiet clock runs out by itself), and the
+reason names the read that was not settled (`unsettled`: a loop driving, marker, wheels or
+groundspeed unreadable, off the ground, the speed to one decimal). A failed settle still skips
+only that case. Test `a_stopped_aircraft_at_the_bound_settles` (the recorded groundspeeds).
+Still open: an airliner coasting from a reject at idle takes minutes, past the 60 s bound.
+Offline only.
