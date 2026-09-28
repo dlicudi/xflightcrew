@@ -265,7 +265,10 @@ Config: `XCOPILOT_ATC_AIRPORT` / `_VOICE` / `_RATE` / `_REGION`.
   parallel under 760 m away is its main twin (`close_parallel_main`; EGKK 26R, 2026-09-27).
   LinedUp and conditional line-up.
 - Release threads the arrival stream (`DEPART_GAP_NM`; strip clear = LUAW); wake timed from when
-  the HOLD went on. **A reject is a radio call** (`Intent::RejectingTakeoff`, the crew's
+  the HOLD went on. **Circuit traffic stays with the tower** (`tower::wants_circuits`,
+  `Station.circuits`): "for circuits" on the taxi or ready call withholds the departure handoff
+  (`departure_handoff_withheld`) and the radar watch; full auto's circuit says it (`taxi_call`,
+  `ready_call`; LEMG 31 2026-09-28). **A reject is a radio call** (`Intent::RejectingTakeoff`, the crew's
   `autotakeoff::REJECT_CALL`): the clearance and all it armed die; a held release lives only in
   TaxiCleared/LinedUp and dies at a roll (`void_takeoff_hold_by_roll`; EGKK 2026-09-27).
 - **The tower's book is the runway's**: a landing holds its strip until the vacated report, a
@@ -293,6 +296,10 @@ Config: `XCOPILOT_ATC_AIRPORT` / `_VOICE` / `_RATE` / `_REGION`.
   until quiet), else a held readback lands on the next frequency. A live number
   (`CrewCall::CheckIn`) is rendered as it goes out, after a bounded wait on `radio_on_air`.
 - With a radio key bound, **physical routing beats content routing both ways**.
+- **The command loop never holds a pilot's line behind its own speech**: `say`, the crew-radio
+  drain and the tower's reply give way to a line in hand or waiting (`pilot_line_pending`,
+  `Voice::say_station_until`); blackbox `typed` `routed` `held_ms` (LEMG 2026-09-28: "my controls"
+  routed 26.1 s late).
 - **Any PTT mutes everything while held**; release rejoins LIVE, no replay. Recovery is procedural
   and knows what was cut (`voice::SpeechMemory`, `router::recall_line`): silenced lines are OWED;
   "what were you saying?" says them, "say again" the newest of owed, readback and volunteered line.
@@ -326,9 +333,11 @@ everything blackboxes to `logs/blackbox.jsonl` (kinds: `atc`, `autotaxi`, `autot
 
 ### Holding, writers, reads
 - **A stage not moving the aircraft is holding it**: brakes for every wait, abort and give-up. **A
-  mission that ENDS hands the hold to the PARKING brake** (`full_auto::hand_back_brakes` through
-  `drive_park_brake`; taxi flavour, on the ground, slow): else the governor goes on holding the
-  aircraft on its wheel brakes after "your aircraft" (LFPB 2026-09-22).
+  mission that ENDS on the ground stops and parks** (`full_auto::hand_back_hold`, governor or not, a
+  pilot's "my controls" included): wheel brakes to a stop below `HAND_BACK_BRAKE_MAX_KTS`, then
+  `set_park_brake_confirmed`, read back and said; airborne, fast, a tug on the bar or an unread speed
+  is `hand_back_skipped`. A give-up the abort flag ended is the pilot's cancel (`give_up_words`) (LFPB
+  2026-09-22; LEMG 2026-09-28: 5.8 kt and rising after "your aircraft").
 - **One writer per dataref.** Plugin channels (`taxi_steer`, `taxi_brake`, `taxi_brake_l/_r`,
   `pitch`) are 1 s expiring heartbeats written EVERY tick (a change-gate drops them mid-turn);
   debounced yield latches (`steer_yield`, `pitch_yield`) drop the override that frame; writer death
@@ -536,7 +545,7 @@ everything blackboxes to `logs/blackbox.jsonl` (kinds: `atc`, `autotaxi`, `autot
   METAR tailwind, `DESTINATION_BONUS_NM`) is the emergency path.
 - **A new flight takes its clearances with it** (`party_line::retire_for_new_flight`, called by
   `setup_approach` before the arm; the old station publishes nothing until the new one is installed,
-  `NEW_FLIGHT_PENDING`; a refused stated runway is blackboxed `stated_runway_refused`; LEMG 2026-09-28).
+  `NEW_FLIGHT_PENDING`, and its radar watch; a refused stated runway is blackboxed `stated_runway_refused`; LEMG 2026-09-28).
 - **The tower's clearance outranks the plan** (`runway_from_clearance`), watched THROUGH the
   approach since its answer comes after the arm: owed readbacks (`party_line::readback_owed`), a
   re-arm on another end (`clearance_switch`, never `going_around`) moves the ONE arrival runway
@@ -824,7 +833,8 @@ confirms it closes it (`fixes #N` in the commit). Known gaps are `owed` issues.
   since the case's line (`CRASH_CLEAR_S`), and a wreck that outlives the setup stops the run.
   **An airborne aircraft is never handed to nobody** (`hand_back`): on the ground a crash or deadline
   types "my controls"; in the air the loops keep it until the next setup, and a run that ends in the
-  air pauses X-Plane (`secure_at_end`); Ctrl-C pauses first.
+  air pauses X-Plane (`secure_at_end`); Ctrl-C pauses first. A line the app has TAKEN is never
+  retyped (`Phase::Queued`, `QUEUED_S`).
 - A law that misbehaves in the air while its test passes: suspect the plant. A first-order lag
   cannot ring; fly second-order plants through the real transport delay.
 

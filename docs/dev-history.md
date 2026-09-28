@@ -9463,3 +9463,35 @@ run that ends in the air pauses the sim (`secure_at_end`, also Ctrl-C).
 
 Also seen, filed: the circuit handed to Departure on the crosswind leg; the runway-start case set up
 on 12 with 1,376 m left and then asked for taxi. Offline only for the fixes.
+
+## 2026-09-28: a pilot's line never waits behind the crew, a ground give-up parks, circuits stay with the tower (issues #135, #133)
+
+#135, LEMG runner circuit case 5 (sortie 1790586620): "my controls" was typed at 637.4 and read at
+once, but routed at 663.5: the loop pass drained full auto's "request taxi" (queued since 621.9) and
+waited out the tower's 242-character taxi clearance through `say_station` (no give-way) while full
+auto taxied at 5 kt. The second "my controls" waited 4.9 s behind the same reply; "fly a circuit" had
+waited 11.7 s behind the previous taxi-in reply. The release stopped the governor at 663.9, so
+`give_up` taxi_stalled at 664.2 skipped `hand_back_brakes` (gated on `taxi_hold_active`) and said
+"The taxi didn't finish. Your aircraft." over 4.9 kt rising to 6.0, park 0.0 until set by hand over
+the Web API at 690.8. The runner retyped the command it thought lost (614.4), failed the case as "did
+not take", and both copies ran. Fixes: the drain's waits give way to a pilot line in hand or waiting
+(`pilot_line_pending`, `say_or`, `Voice::say_station_until`, blackbox `typed` `routed` `held_ms`);
+every full-auto give-up on the ground brakes to a stop and parks (`hand_back_hold`, `hand_back_brakes`
+/ `hand_back_skipped`); an aborted wait is a cancel ("Cancelled. Your aircraft."); the runner never
+retypes a taken line (`Phase::Queued`). Still open: "my controls" in a standalone auto taxi releases
+without stopping; the After landing checklist ran on into the next departure ("Flaps, up." over the
+takeoff flaps).
+
+#133, LEMG 31 runner circuits (sorties 1790584715, 1790585651): the tower said "contact Malaga
+Departure on 121.025" on the crosswind leg at 772 / 753 ft: every takeoff clearance armed the
+handoff and nothing on the radio said "circuit". 1790584715 also heard "radar contact" in the tower's
+voice 0.4 s after rotate: a Departure radar watch left over from the previous superseded mission's
+zone clearance (t 1790584509.4, squawk 4501). The crew now says "request taxi for circuits" / "ready
+for departure, for circuits"; the station keeps the flight (`circuit_traffic`,
+`departure_handoff_withheld`, no watch); `retire_for_new_flight` also retires the watch. Also seen:
+after the tower's go-around order at 1790585525.5 autoland flew on and landed, and the tower said
+"you landed on runway three one without clearance".
+
+Next sortie: `typed` `routed` `held_ms` under 1 s while the crew talks; after a ground "my controls"
+`give_up` abort, `hand_back_brakes` held stopped park; circuit calls "for circuits",
+`departure_handoff_withheld`, no `atc_handoff`. Offline only.
