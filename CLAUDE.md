@@ -876,7 +876,10 @@ confirms it closes it (`fixes #N` in the commit). Known gaps are `owed` issues.
   **An airborne aircraft is never handed to nobody** (`hand_back`): on the ground a crash or deadline
   types "my controls"; in the air the loops keep it until the next setup, and a run that ends in the
   air pauses X-Plane (`secure_at_end`); Ctrl-C pauses first. A line the app has TAKEN is never
-  retyped (`Phase::Queued`, `QUEUED_S`).
+  retyped (`Phase::Queued`, `QUEUED_S`). **No setup under a moving aircraft** (`SettleWatch`,
+  `settle_before_setup`): before each setup the last aircraft is at rest (marker idle, on the ground
+  under `STOPPED_KTS`, held `QUIET_S`), waited up to `STOP_MAX_S`, then "my controls" (`hand_back_hold`
+  parks); in the air it is taken back at once; the row's "Before" says which.
 - A law that misbehaves in the air while its test passes: suspect the plant. A first-order lag
   cannot ring; fly second-order plants through the real transport delay.
 

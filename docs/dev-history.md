@@ -9593,3 +9593,13 @@ away, and the running vacate "joined" 1,033 m off (bypassing `MAX_JOIN_M`), the 
 12/30, and the tower planned correctly from there. `relocation_jump_m` (100 m + 60 m/s x dt) stands the
 drive and the taxi-in down; the vacate re-checks its start; "runway vacated" needs `on_runway` false.
 Owed (#145): the runner must not set up over a running taxi-in. Offline only.
+
+## 2026-09-28: no runner setup under a moving aircraft (issue #145)
+
+A circuit's `sortie_result` is written at the `taxi_in` stage, so the runner took its verdict with the
+aircraft rolling (1790584715: 16.1 kt at 1790585617.8, panel marker idle) and posted the next runway
+start 0.3 s later; the taxi-in's join at 618.1 found itself 1,032 m off. The runner now waits for the
+aircraft at rest before any setup (marker idle, on the ground, under 1 kt, held 10 s: the taxi-in
+stands 2.5 s between vacate and drive), up to 600 s, then types "my controls" (`hand_back_hold`
+parks) and waits for the stop; in the air it keeps #132's take-back. The run table's "Before" column
+records it. Offline only.
