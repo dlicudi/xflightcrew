@@ -9514,3 +9514,15 @@ again when the held one names another runway); `setup::spawn_new_flight_watch` /
 `setup` `foreign_new_flight`); `new_flight_loading` refuses to arm full auto mid-load. Next runner
 night: `foreign_new_flight` once per runner start, `runway_start` Lined 13, `strip_clearance`
 cleared 13, no `request_taxi`. Offline only.
+
+## 2026-09-28: a position report dies with its position (issue #143)
+
+LEMG 13 sortie 1790584300-approach: four stacked setups queued "5 mile final runway one three" at
+84315.9 (4.7 nm, 1,350 ft AGL); they went out at 84409.1 (88 ft AGL, in the flare), 84421.2
+(touchdown), 84438.9 (rollout) and 84452.7 (stopped), each answered "cleared to land": the queue had
+neither validity nor dedup. A crew call now carries the condition it reports (`circuit::holds_for`),
+judged just before it goes out (`stale_reason`: on_ground, landing, moved_on, max_age, airborne; a
+failed read never drops a call), and identical calls collapse at the enqueue. The loop not draining
+from 84309.6 to 84397.1 is most likely the #135 hold (merged); `crew_radio_sent` `age_s` will show.
+Tests `a_five_mile_final_report_dies_with_the_five_mile_final`,
+`identical_calls_queued_back_to_back_collapse_to_one`. Offline only.

@@ -292,6 +292,12 @@ Config: `XCOPILOT_ATC_AIRPORT` / `_VOICE` / `_RATE` / `_REGION`.
   air; a routine line in progress is cut when the radio keys and its remainder follows once quiet,
   perishable (`interrupt_intercom_for_radio`). A Warning talks over and is never stepped on.
   Radio-only cuts (retune, avionics off, crash, replay) never touch the copilot.
+- **A position report dies with the position it reports** (`circuit::holds_for`, `stale_reason`,
+  judged as it goes out from `crew_radio_facts`): mile-final, final, downwind, base, going-around,
+  inbound and the check-in hold only airborne (approach reports above 100 ft, within about a mile
+  flown) with a max age; "runway vacated" only on the ground; readbacks and requests keep their own
+  rules; dropped = `crew_radio_stale`, identical queued calls collapse (`crew_radio_collapsed`), a sent
+  call logs `age_s` (LEMG 13 2026-09-28: "5 mile final" x4, the first in the flare).
 - **A crew call is routed on the frequency it was keyed on, before it is spoken** (`say` blocks
   until quiet), else a held readback lands on the next frequency. A live number
   (`CrewCall::CheckIn`) is rendered as it goes out, after a bounded wait on `radio_on_air`.
@@ -329,7 +335,7 @@ everything blackboxes to `logs/blackbox.jsonl` (kinds: `atc`, `autotaxi`, `autot
 `pushback`, `checklist`, `taxi_guide`, `cockpit_auto`, `full_auto`, `circuit`, `procedure`,
 `cabin`, `instructor`, `loading`, `turbine_start`, `heli_start`, `hover`, `heli_circuit`,
 `heli_route`, `rapport`, `cabin_air`, `api_load`, `plan_audit`, `handover`, `start_item`,
-`sim_radio`, `fuel_pumps`, `electrical`, `typed`).
+`sim_radio`, `fuel_pumps`, `electrical`, `typed`, `crew_radio`).
 
 ### Holding, writers, reads
 - **A stage not moving the aircraft is holding it**: brakes for every wait, abort and give-up. **A
