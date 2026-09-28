@@ -92,6 +92,10 @@ const CONTACT_RADIO_FT: f64 = 1.0;
 const BOUNCE_FT: f64 = 2.0;
 /// A contact this long before the state record's touchdown belongs to it.
 const CONTACT_WITHIN_S: f64 = 30.0;
+/// The flight model's `touchdown` event this close to the state record that
+/// saw the wheels is the same contact (it is recorded just before it, from
+/// the same monitor tick).
+const FLIGHT_TD_WITHIN_S: f64 = 2.0;
 /// Rollout: most off the centreline.
 pub const ROLLOUT_MAX_XTK_M: f64 = 5.0;
 /// A stream quiet this long has ended.
@@ -343,6 +347,9 @@ pub struct Scorer {
     /// Recent autoland (t, vvi) for the first contact's sink.
     flare_vvi: Vec<(f64, f64)>,
     contact: Option<Contact>,
+    /// The flight model's last `touchdown` (t, sink): the landing's sink
+    /// when it belongs to the state record's touchdown (#142).
+    flight_td: Option<(f64, f64)>,
 }
 
 /// The taxi events that mean the drive STOPPED short, not arrived. Each used
@@ -502,6 +509,9 @@ impl Scorer {
             {
                 self.crashed = true
             }
+            ("flight", _) if s(r, "ev") == "touchdown" => {
+                self.flight_td = f(r, "sink").map(|sink| (t, sink.min(0.0).abs()))
+            }
             ("rapport", _) if r.get("impact").and_then(Value::as_bool) == Some(true) => {
                 self.crashed = true
             }
@@ -513,6 +523,7 @@ impl Scorer {
                 self.crew_brake_discounted = 0;
                 self.crew_brake_t = None;
                 self.commands = 0;
+                self.flight_td = None;
             }
             ("sortie", "end") => {
                 self.close_taxi("sortie_end", &mut out);
@@ -770,13 +781,19 @@ impl Scorer {
             self.air.clear();
             return;
         }
-        let sink = self
-            .air
-            .iter()
-            .map(|(_, v, ..)| *v)
-            .chain(f(r, "vsi"))
-            .fold(0.0_f64, f64::min)
+        // The state samples' own sink, the flight model's window: it ENDS at
+        // this ground sample and is truly TOUCHDOWN_WINDOW_S long (the 3 s
+        // kept behind the last AIRBORNE sample reached ~4.4 s back and
+        // scored the pre-flare descent, 1790585651: 461 fpm on a 130).
+        let recent: Vec<(f64, f64)> = self.air.iter().map(|(ta, v, ..)| (*ta, *v)).collect();
+        let sink = crate::instructor::touchdown_sink_fpm(&recent, t, f(r, "vsi").unwrap_or(0.0))
+            .min(0.0)
             .abs();
+        let model = self
+            .flight_td
+            .take()
+            .filter(|(tf, _)| *tf >= since && (t - tf).abs() <= FLIGHT_TD_WITHIN_S)
+            .map(|(_, s)| s);
         let drift = self
             .air
             .last()
@@ -787,10 +804,18 @@ impl Scorer {
         // The first contact, when the autoland ticks saw one before this
         // sample, is the touchdown; this sample is then the second contact.
         let first = self.contact.take().filter(|c| t - c.t <= CONTACT_WITHIN_S && c.t >= since);
+        // The first contact's sink is the flight model's touchdown when it
+        // logged one; else the autoland window ending AT the contact; else
+        // the state samples'. After a bounce the model's touchdown (its
+        // first ground SAMPLE) is the second contact, so the first stays the
+        // autoland window's. Never the max of two windows (#142: that max
+        // was the stretched state window's 461 fpm on 1790585651).
         let (t_td, sink, bounce) = match first {
-            Some(c) if c.up_ft > BOUNCE_FT => (c.t, c.sink, Some((c.up_ft, sink))),
-            Some(c) => (c.t, c.sink.max(sink), None),
-            None => (t, sink, None),
+            Some(c) if c.up_ft > BOUNCE_FT => {
+                (c.t, c.sink, Some((c.up_ft, model.unwrap_or(sink))))
+            }
+            Some(c) => (c.t, model.unwrap_or(c.sink), None),
+            None => (t, model.unwrap_or(sink), None),
         };
         self.flare_vvi.clear();
         self.landing = Some(Landing {
@@ -1045,6 +1070,67 @@ mod tests {
 
     fn records(text: &str) -> Vec<Value> {
         text.lines().filter_map(|l| serde_json::from_str(l).ok()).collect()
+    }
+
+    /// The 737's two LEMG 31 landings of 2026-09-28 (1790584715, 1790585651),
+    /// trimmed to their landings: every `state` from 45 s before the flight
+    /// model's touchdown to 40 s after, the autoland guidance and rollout
+    /// ticks from 5 s before the first contact, the `flight` touchdown and
+    /// the sortie's begin and end. Live the stage scored 397 and 461 fpm
+    /// (the second a FAIL): the state samples' window was kept 3 s behind
+    /// the last AIRBORNE sample, ~4.4 s before the ground one, and reached
+    /// the pre-flare descent (-461 at 1790586565.1, 2.8 s before contact).
+    /// The contact's vvi was -180 and -166; the flight model said 105 and
+    /// 130 (#142).
+    const LEMG_31_LANDINGS: [(&str, f64, f64, f64); 2] = [
+        (
+            include_str!("../bench/sorties/1790584715-landing.trimmed.jsonl"),
+            105.0,
+            5.9,
+            1790585602.0,
+        ),
+        (
+            include_str!("../bench/sorties/1790585651-landing.trimmed.jsonl"),
+            130.0,
+            9.7,
+            1790586567.9,
+        ),
+    ];
+
+    #[test]
+    fn the_landing_sink_is_the_first_contacts_not_the_descent_before_it() {
+        for (text, model_sink, xtk, contact_t) in LEMG_31_LANDINGS {
+            let recs = records(text);
+            let landing = |recs: &[Value]| {
+                score_all(recs.iter()).into_iter().find(|v| s(v, "stage") == "landing").unwrap()
+            };
+            let l = landing(&recs);
+            println!("{}", line(&l));
+            assert_eq!(l["sink_fpm"], model_sink, "the flight model's touchdown: {l}");
+            assert_eq!(l["t_touchdown"], contact_t, "the first contact's time: {l}");
+            assert_eq!(l["rollout_max_xtk_m"], xtk, "{l}");
+            let why: Vec<&str> =
+                l["why"].as_array().unwrap().iter().filter_map(Value::as_str).collect();
+            assert_eq!(why, vec![format!("{xtk:.1} m off the centreline rolling out")], "{l}");
+            // With no flight model record (older logs), the autoland window
+            // that ENDS at the contact: never the descent seconds before it.
+            let no_model: Vec<Value> =
+                recs.iter().filter(|r| s(r, "kind") != "flight").cloned().collect();
+            let l = landing(&no_model);
+            println!("without the model: {} {}", line(&l), l["sink_fpm"]);
+            let sink = l["sink_fpm"].as_f64().unwrap();
+            assert!(sink < TOUCHDOWN_MAX_SINK_FPM && sink >= 166.0, "{l}");
+            // And with neither the model nor autoland ticks, the state
+            // samples' own window, TOUCHDOWN_WINDOW_S before the ground one.
+            let states: Vec<Value> = recs
+                .iter()
+                .filter(|r| matches!(s(r, "kind"), "state" | "sortie"))
+                .cloned()
+                .collect();
+            let l = landing(&states);
+            println!("state only: {} {}", line(&l), l["sink_fpm"]);
+            assert!(l["sink_fpm"].as_f64().unwrap() < TOUCHDOWN_MAX_SINK_FPM, "{l}");
+        }
     }
 
     #[test]
