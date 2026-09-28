@@ -9885,3 +9885,14 @@ ahead, latches the retard at `retard_max_per_s`; slow only delays a retard not y
 balloon from 25 fpm. Through the fit: as flown 5.6 s of float, 940 m, 234 fpm; now no float, 660 m, 318
 fpm. LEMG's sixteen: mean 238 to 244, worst 277. Open: the flare model learning the elevator strength
 in flight. Offline only.
+
+## 2026-09-28: the SF50 crew breathed through masks all flight (issue #159)
+
+The pilot heard the crew breathing sound through a runner SF50 case. `sf50_oxygen.lua`: the master
+button (`slider_20`) sets `demand_flow_setting` 0/2, the supply; clicking the masks sets `o2_valve_on`,
+"wearing masks", which plays the breathing "regardless if there is an actual oxy flow". The 2026-09-24
+fix had read `o2_valve_on` as a valve behind the button: `ensure_on` put it on every mission and the
+monitor's `valve_sync` forced it to follow the master (a hand write of 0 read back 1). The profile now
+names it `oxygen_masks`; missions and callouts switch on only the supply; `MaskWatch` dons the masks
+airborne at a 12,500 ft cabin (supply first), doffs only its own under 11,500, never over the pilot.
+Offline only.

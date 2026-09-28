@@ -163,10 +163,12 @@ Read first, left alone in state, read back, named when not taken, one milestone 
 - **Armed for the roll is an Airbus habit**: a Boeing declares `takeoff_speedbrake_down` (lever
   DOWN, raised on a reject, `on_reject`); roll-armed spoilers are disarmed after the gear
   (`after_liftoff`).
-- **Cabin air** (`src/tools/cabin_air.rs`, `cabin_air:`): bleed and crew oxygen on for EVERY
-  full-auto mission (an airborne resume too) and at the cabin-altitude callout; past the warning
-  band a flying follower is handed 10,000 ft. A TOGGLE oxygen button fires only when it reads off,
-  and the valve behind it is written too (a hypoxic climb, 2026-09-24).
+- **Cabin air** (`src/tools/cabin_air.rs`, `cabin_air:`): bleed and the oxygen SUPPLY on for EVERY
+  full-auto mission (an airborne resume too) and at the cabin-altitude callout; past the warning band a
+  flying follower is handed 10,000 ft. A TOGGLE master fires only when it reads off. **The masks are
+  not the supply** (`oxygen_masks`; the SF50's `o2_valve_on` is WEARING them, breathing sound and all):
+  `masks_tick`/`MaskWatch` dons them airborne in the warning band (supply first), doffs only its own
+  below 11,500, never over the pilot (a hypoxic climb 2026-09-24; masks all flight, #159).
 - **Centre tank pumps** (`src/tools/fuel_pumps.rs`, `fuel_tank_pumps_off_when_empty:`): an empty
   centre with its pumps on and an engine running is switched off by the monitor's
   `centre_tank_dry` with an automation flying, advised once with a pilot flying (the altimeter's
