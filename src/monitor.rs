@@ -4281,10 +4281,11 @@ pub async fn run(
                             // waits for it.
                             if landing_held {
                             } else if hold_armed {
-                                if let Some(line) = crate::station::takeoff_hold_tick(
+                                if let Some(line) = crate::station::takeoff_hold_tick_from(
                                     &targets,
                                     felev,
                                     snap.on_ground,
+                                    Some((snap.lat, snap.lon)),
                                     now,
                                 ) {
                                     crate::blackbox::record(
