@@ -179,6 +179,11 @@ pub struct CruiseSchedule {
     pub fixes: Vec<NavlogSpeed>,
     /// The planned levels, the initial one first. One entry = no step.
     pub steps: Vec<StepClimb>,
+    /// The navlog's own top of descent (its `TOD` entry), lat and lon: where
+    /// the plan leaves its cruise. `tod_to_dest_nm` is the navlog's miles
+    /// from it along the ARRIVAL as flown (EGKK-EGBB: 61 against 42 of
+    /// direct legs), so a point before it is measured from its position.
+    pub tod: Option<(f64, f64)>,
 }
 
 /// The navlog fixes' stages and planned speeds. A fix without a stage is
@@ -262,6 +267,7 @@ pub fn parse_schedule(v: &Value) -> CruiseSchedule {
         steps: text("/general/stepclimb_string")
             .map(|s| parse_step_climbs(&s))
             .unwrap_or_default(),
+        tod: navlog_tod(v),
     }
 }
 
@@ -394,6 +400,12 @@ pub async fn fetch(user_id: &str) -> Result<FlightPlan> {
         .await
         .context("decoding SimBrief JSON")?;
 
+    plan_from_ofp(&v)
+}
+
+/// A SimBrief OFP (the fetcher's JSON) made the plan. Pure: the enroute
+/// setup's placement is tested on a trimmed real OFP through it.
+pub fn plan_from_ofp(v: &Value) -> Result<FlightPlan> {
     // The fetcher reports a status; anything but Success means no usable plan.
     if let Some(status) = v.pointer("/fetch/status").and_then(Value::as_str) {
         if !status.eq_ignore_ascii_case("Success") {
@@ -696,6 +708,18 @@ fn navlog_tod_to_dest(v: &Value) -> f64 {
         }
     }
     sum
+}
+
+/// The navlog's `TOD` entry's position.
+fn navlog_tod(v: &Value) -> Option<(f64, f64)> {
+    let f = v
+        .pointer("/navlog/fix")?
+        .as_array()?
+        .iter()
+        .find(|f| f.get("ident").and_then(Value::as_str) == Some("TOD"))?;
+    let lat = f.get("pos_lat").and_then(num_of)?;
+    let lon = f.get("pos_long").and_then(num_of)?;
+    (lat.abs() <= 90.0 && lon.abs() <= 180.0).then_some((lat, lon))
 }
 
 /// A JSON value as `f64`, whether a number or a numeric string (SimBrief sends

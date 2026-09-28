@@ -10263,3 +10263,45 @@ groundspeed unreadable, off the ground, the speed to one decimal). A failed sett
 only that case. Test `a_stopped_aircraft_at_the_bound_settles` (the recorded groundspeeds).
 Still open: an airliner coasting from a reject at idle takes minutes, past the 60 s bound.
 Offline only.
+
+## 2026-09-28: an arrival sortie starts in the air on the plan (issue #177, refs #67)
+
+Test wall time: the EGKK-EGBB arrival (#156 windows, #161 join, #109 TOD, #126/#104 drag) cost a
+gate to gate flight per try. A runner case may now start airborne on the SimBrief plan:
+`setup: {enroute: {at: fix | before_tod_nm | before_destination_nm, value}}`, the point checked on
+the fetched plan (a fix it lacks or an end of it, no TOD on the navlog, a placement under 3,000 ft
+refused naming the case). The runner types the app's words ("put us enroute 30 miles before top of
+descent", `grammar::enroute_setup_call`, tool `setup_enroute`), waits for `setup`
+`enroute_result` (or `enroute_refused`, the tool's words), then the case's command.
+`setup_enroute::place` (pure, on the trimmed OFP): the navlog's `tod_to_dest_nm` (61) is the
+ARRIVAL as flown, 19 nm more than the direct legs, and would put the TOD before WELIN; the TOD is
+the navlog's own `TOD` position (`CruiseSchedule.tod`) projected onto the route (16 nm past
+WELIN). 30 nm before it is 13.9 nm short of WELIN on the BUZAD leg, FL180, the OFP's 299 kt
+(capped to the 737's 296 under the caution), TAS 394. The altitude is the navlog's with the TOD at
+cruise, straight lines between; the speed the next fix's planned IAS (its Mach only on a CRUISE
+fix: HON's M0.41 belongs to OSKOT's 5,700 and is 218 kt at 11,900), else the profile's cruise, 250
+below 10,000. The sim starts it with `lle_air_start` (the SDK's air start: MSL metres, true
+heading, speed in m/s, taken as TAS; engines running) through the approach setup's mailbox
+(`run_init`); the follow-up retires the last flight's clearances and checklists, presses the
+servos until they READ on (`autoland::ApEngage`), sets HDG and ALT HOLD, arms the governor at the
+placement's IAS and brings gear and flaps up if they are not.
+
+The world's state for an IFR flight joining mid-route (decided here): it is already IFR and
+identified. `station::arm_new_flight_enroute` publishes `IFR_FLIGHT` (airborne, code
+`discrete_squawk(callsign)`, so every region handoff keeps the code and goes to a radar position,
+never "radar services terminated"), arms the station of the nearest field WITH a radar unit
+(service-weighted, within 60 nm; a nearer tower-only field is passed over), and the crew tunes
+COM1 to its approach (else departure) frequency and squawks the code with ALT. No clearance, no
+departure handoff and no radar watch are published: nothing is owed, as for a flight handed over
+mid-route. The resume's own `Route.ifr` stays false (it only caps a departure's climb).
+
+"Fly the flight plan" in the air was refused ("we're already flying, say navigate"); it is now the
+checked RESUME (`resume || (flight && !on_ground)`), the state gates a pure `resume_gate`. Tests
+`thirty_miles_before_the_top_of_descent_is_on_the_buzad_welin_leg_at_cruise`,
+`a_point_on_the_descent_or_over_a_fix_is_the_plans_profile_there`,
+`a_point_off_the_plan_is_refused`, `the_resume_joins_the_leg_the_placement_is_on`,
+`an_enroute_case_parses_and_refuses_what_is_no_point`,
+`an_enroute_point_is_checked_on_the_plan`, `an_enroute_case_is_set_up_in_the_air_then_resumed`
+(the fake sim), `a_new_flight_in_the_air_is_an_ifr_flight_under_a_radar_unit`. Unknown until
+flown: whether the SDK's speed is TAS, whether the start comes trimmed with the gear up, and the
+height lost before the engage. Offline only.

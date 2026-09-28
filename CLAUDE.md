@@ -551,8 +551,9 @@ everything blackboxes to `logs/blackbox.jsonl` (kinds: `atc`, `autotaxi`, `autot
   pattern (`raise_for_terrain`, said), a descending leg refuses. Downwind fixed
   (`LXGB_ROCK_CLEAR_M`).
 - Full auto: engine start per class (`StartKind`); power-up INLINE (racing bring-ups shut a
-  cross-tie); waits on `driving()`, not `ACTIVE`; refuses to arm airborne, naming the tools that
-  fly; ends with `taxi_in_after_landing`. **A resume past the route near the destination is the
+  cross-tie); waits on `driving()`, not `ACTIVE`; airborne, "fly the flight plan" is the checked
+  RESUME of the plan on the shelf (`resume_gate`, `resume_join`; #67); ends with
+  `taxi_in_after_landing`. **A resume past the route near the destination is the
   arrival** (`resume_join`, `ARRIVAL_REJOIN_NM`, autoland on the plan's runway); every refusal names
   its number. Cruise is a SPEED: the OFP's on its cruise legs
   (`procedure::scheduled_cruise_kts`: the lower of planned IAS and planned Mach at the level,
@@ -1074,6 +1075,15 @@ confirms it closes it (`fixes #N` in the commit). Known gaps are `owed` issues.
   SimBrief, and may `expect_give_up`; `runway: wind` is the tower's into-wind end at the setup (`resolve_wind`, METAR else
   the sim's wind on the field); an unset deadline scales with the approach speed; **a reposition or
   swap is a new flight to the scorer** (`Scorer::new_flight`); specs `bench/sorties/backlog-737.yaml`, `backlog-types.yaml`.
+  **An arrival case starts IN THE AIR on the plan** (`setup: {enroute: {at: fix | before_tod_nm |
+  before_destination_nm, value}}`, checked on the fetched plan): the runner types the app's
+  `setup_enroute` words and waits for `setup` `enroute_result`, then the case's "fly the flight
+  plan" (the airborne resume). `setup_enroute::place`: on the leg, the plan's altitude (the
+  navlog's own TOD position, never `tod_to_dest_nm`, which is the arrival as flown), the OFP's
+  IAS, `lle_air_start` through the mailbox; the follow-up retires the last flight, confirms the
+  servos (`ApEngage`), HDG and ALT HOLD, the governor, and hands the world an IFR flight mid-route
+  (`station::arm_new_flight_enroute`: the code kept, the nearest RADAR unit, COM1 on it; #177). Its
+  cruise may be fast-forwarded only by `sim_speed` steps, through the same guard.
   **Fast forward only where the laws tolerate it** (`SpeedGuard`; our ticks are wall time, so 4x is
   4x the gain and delay): a step or the case's `sim_speed: N` is what the spec WANTS; the runner flies
   it only airborne, in Climb/Cruise/Descent, over `FAST_FLOOR_AGL_FT`, servos on, no `slow_loop` on

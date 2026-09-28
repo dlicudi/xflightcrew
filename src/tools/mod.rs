@@ -40,6 +40,7 @@ pub mod recover;
 pub mod reminder;
 pub mod reverse;
 pub mod setup;
+pub mod setup_enroute;
 pub mod signs;
 pub mod speedhold;
 pub mod takeoff;
@@ -180,6 +181,8 @@ pub const ROTORCRAFT_WITHHELD: &[&str] = &[
     "reverse_thrust",
     // A new flight on a runway final is landed by autoland.
     "setup_approach",
+    // A new flight in the air on the plan is resumed by full auto.
+    "setup_enroute",
     // The autopilot's own speed and GPS modes (#92) share the autopilot the
     // hover loop holds, and were measured on no helicopter.
     "ap_mode",
@@ -237,6 +240,8 @@ impl Registry {
         // (`setup_approach`): set with the autoland below, `None` without an
         // autopilot (the new flight is then the pilot's).
         let mut approach_land: Option<(autopilot::ApConfig, f64)> = None;
+        // The autopilot a new flight in the air is held on (`setup_enroute`).
+        let mut enroute_ap: Option<autopilot::ApConfig> = None;
         if profile.autopilot {
             // Per-airframe engagement prerequisites (FD switch, AC power) — the C90
             // needs them; the GA singles leave this default (plain servos-on).
@@ -286,6 +291,7 @@ impl Registry {
                 prop: profile.prop.clone(),
             }));
             approach_land = Some((ap.clone(), approach_ias));
+            enroute_ap = Some(ap.clone());
             // Auto takeoff — the departure sibling: the roll steers through
             // the plugin's channel, the climb-out rides this same AP. Speeds
             // from the airframe's reference figures, conservative fallbacks
@@ -724,6 +730,11 @@ impl Registry {
         tools.push(Box::new(loading::LoadAircraft));
         tools.push(Box::new(setup::SetUpFlight));
         tools.push(Box::new(setup::SetUpApproach { land: approach_land }));
+        tools.push(Box::new(setup_enroute::SetUpEnroute {
+            ap: enroute_ap,
+            cruise_ias_kts: profile.reference.as_ref().and_then(|r| r.cruise_ias_kts),
+            vne_kts: profile.vne_kts,
+        }));
 
         // Reminders ("wake me at top of descent", "tell me at the next waypoint") are
         // crew memory, not an airframe system, so available on any aircraft.

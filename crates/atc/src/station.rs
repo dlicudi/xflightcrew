@@ -4054,6 +4054,69 @@ pub fn arm_new_flight_at(lat: f64, lon: f64, on_ground: bool, now: Instant) -> O
     Some((icao, khz))
 }
 
+/// A NEW FLIGHT started AIRBORNE on its plan (the sortie runner's enroute
+/// setup): an IFR flight mid-route, already identified, never a departure
+/// and never a field's circuit traffic.
+#[derive(Debug, Clone, PartialEq)]
+pub struct EnrouteStation {
+    /// The field whose radar unit works the flight, and its tower (the
+    /// station built for it).
+    pub icao: String,
+    pub tower_khz: i64,
+    /// "Approach" or "Departure", and its frequency: where COM1 goes.
+    pub position: &'static str,
+    pub khz: i64,
+    /// The flight's discrete code, kept unit to unit ([`IFR_FLIGHT`]).
+    pub code: i64,
+}
+
+/// The radar unit an airborne IFR flight at this position is worked by: the
+/// region's fields that HAVE one (approach or departure; a tower-only field
+/// is passed over, as the enroute handoff passes it), service-weighted like
+/// the airborne region pick, within [`SWITCH_MAX_NM`]. Pure over the index.
+fn enroute_field_in(region: &[RegionApt], lat: f64, lon: f64) -> Option<&RegionApt> {
+    region
+        .iter()
+        .filter(|a| radar_position(&a.apt).is_some() && a.apt.freq(nav::FREQ_TOWER).is_some())
+        .map(|a| (crate::nav::haversine_nm(lat, lon, a.lat, a.lon), a))
+        .filter(|(d, _)| *d <= SWITCH_MAX_NM)
+        .map(|(d, a)| (d - SERVICE_BIAS_NM * region_services(&a.apt) as f64, a))
+        .min_by(|x, y| x.0.total_cmp(&y.0))
+        .map(|(_, a)| a)
+}
+
+/// A NEW FLIGHT put in the air on its plan, mid-route: the world holds it
+/// as an IFR flight already under radar service. Its code
+/// ([`discrete_squawk`] of the callsign) is published as [`IFR_FLIGHT`],
+/// airborne, so every region handoff after this keeps it and goes to a
+/// radar position; the station for the nearest field with a radar unit is
+/// rebuilt ([`arm_new_flight`]), and its approach (else departure)
+/// frequency is the one to tune. No clearance, no departure handoff, no
+/// radar watch: the flight is picked up identified, as a real one handed
+/// over mid-route would be. Called after [`retire_for_new_flight`]. `None`:
+/// no radar unit within reach (nothing armed, the code still published).
+pub fn arm_new_flight_enroute(
+    lat: f64,
+    lon: f64,
+    callsign: &str,
+    now: Instant,
+) -> Option<EnrouteStation> {
+    let code = discrete_squawk(callsign);
+    *IFR_FLIGHT.lock().unwrap_or_else(|e| e.into_inner()) = Some(IfrFlight {
+        code,
+        callsign: callsign.to_string(),
+        airborne: true,
+    });
+    let (icao, position, khz) = {
+        let region = REGION.lock().unwrap_or_else(|e| e.into_inner());
+        let a = enroute_field_in(&region, lat, lon)?;
+        let (position, khz) = radar_position(&a.apt)?;
+        (a.icao.clone(), position, khz)
+    };
+    let tower_khz = arm_new_flight(&icao, now)?;
+    Some(EnrouteStation { icao, tower_khz, position, khz, code })
+}
+
 /// Whether the installed station is the departure field's, judged at a
 /// mission's arm.
 #[derive(Debug, Clone, PartialEq)]
@@ -12475,6 +12538,42 @@ mod tests {
             surface: 1,
         }];
         vec![malaga, gatwick]
+    }
+
+    /// The enroute setup's world: an IFR flight mid-route is worked by the
+    /// nearest field with a RADAR unit (a tower-only field nearer is passed
+    /// over), keeps a discrete code, and is airborne from the start.
+    #[test]
+    fn a_new_flight_in_the_air_is_an_ifr_flight_under_a_radar_unit() {
+        let _guard = SIDE_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut region = lemg_and_egkk();
+        let mut bham = region_apt("EGBB Birmingham", 52.4539, -1.7481);
+        bham.apt.freqs.push(nav::AtcFreq {
+            kind: nav::FREQ_APPROACH,
+            khz: 123980,
+            name: "Approach".into(),
+        });
+        let tower_only = region_apt("EGBW Wellesbourne", 52.192, -1.614);
+        region.push(bham);
+        region.push(tower_only);
+        // 30 nm before the top of descent on EGKK-EGBB (between BUZAD and
+        // WELIN): Wellesbourne is nearer and has only a tower.
+        let (lat, lon) = (52.05, -0.66);
+        assert_eq!(enroute_field_in(&region, lat, lon).unwrap().icao, "EGBB");
+        // Nothing with radar within reach: nothing.
+        assert!(enroute_field_in(&region, 45.0, 10.0).is_none());
+        *REGION.lock().unwrap() = region;
+        *IFR_FLIGHT.lock().unwrap() = None;
+        let st = arm_new_flight_enroute(lat, lon, "WAT626", Instant::now()).unwrap();
+        assert_eq!((st.icao.as_str(), st.position, st.khz), ("EGBB", "Approach", 123980));
+        assert_eq!(st.tower_khz, 118100);
+        assert_eq!(st.code, discrete_squawk("WAT626"));
+        let f = IFR_FLIGHT.lock().unwrap().clone().unwrap();
+        assert!(f.airborne && f.code == st.code && f.callsign == "WAT626");
+        *IFR_FLIGHT.lock().unwrap() = None;
+        *PENDING_STATION.lock().unwrap() = None;
+        *LAST_REGION_SWITCH.lock().unwrap() = None;
+        REGION.lock().unwrap().clear();
     }
 
     #[test]

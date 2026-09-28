@@ -49,10 +49,10 @@ static KNOWN_INIT_SEQ: std::sync::atomic::AtomicI64 =
     std::sync::atomic::AtomicI64::new(i64::MIN);
 
 /// Held by a setup's follow-up: the flag stays up until it drops.
-struct Loading;
+pub(crate) struct Loading;
 
 impl Loading {
-    fn begin() -> Loading {
+    pub(crate) fn begin() -> Loading {
         NEW_FLIGHT_LOADING.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         Loading
     }
@@ -281,7 +281,7 @@ pub async fn settled_position(xp: &crate::xplane::XPlaneClient, t: SettleTiming)
 }
 
 /// How long a new flight waits for its station to be installed.
-const STATION_UP_S: u64 = 15;
+pub(crate) const STATION_UP_S: u64 = 15;
 
 /// What a new flight's station came to.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -310,7 +310,7 @@ pub async fn new_flight_station(fix: Fix, wait_s: u64) -> NewFlightStation {
 }
 
 /// Wait for the armed swap to be installed with this tower, at most `wait_s`.
-async fn await_station_up(khz: i64, wait_s: u64) -> bool {
+pub(crate) async fn await_station_up(khz: i64, wait_s: u64) -> bool {
     let t0 = std::time::Instant::now();
     let up = || {
         !crate::party_line::station_swap_pending()
@@ -751,7 +751,7 @@ pub fn pick_runway(
 /// The automation that holds the aircraft now, by name, if any: a new flight
 /// ends it, so the pilot takes it back first (a misheard ask must not pull
 /// the aircraft out from under a landing).
-fn flying_now() -> Option<&'static str> {
+pub(crate) fn flying_now() -> Option<&'static str> {
     use std::sync::atomic::Ordering::Relaxed;
     [
         (crate::full_auto::ACTIVE.load(Relaxed), "Full auto"),
