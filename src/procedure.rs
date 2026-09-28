@@ -175,6 +175,74 @@ pub struct PlannedTod {
     pub held_ft: Option<f64>,
 }
 
+/// The follower's legs as flown and the index of the leg flying, republished
+/// when either changes: what an in-flight re-pick (#79) splices into.
+static ROUTE_AHEAD: std::sync::Mutex<Option<(usize, Vec<ProcLeg>)>> = std::sync::Mutex::new(None);
+
+/// The legs the follower flies and the leg flying; `None` between procedures.
+pub fn route_ahead() -> Option<(usize, Vec<ProcLeg>)> {
+    if !ACTIVE.load(Ordering::Relaxed) {
+        return None;
+    }
+    ROUTE_AHEAD.lock().unwrap_or_else(|e| e.into_inner()).clone()
+}
+
+fn publish_route_ahead(v: Option<(usize, Vec<ProcLeg>)>) {
+    *ROUTE_AHEAD.lock().unwrap_or_else(|e| e.into_inner()) = v;
+}
+
+/// A new tail for the flying route: the arrival re-picked in flight (#79,
+/// `full_auto::repick_arrival`). `legs` replace the route from `from` on,
+/// where the route must still hold `entry` (the STAR's first fix, the one
+/// the splice was computed against); `constraints` are the new STAR's
+/// windows, replacing the old ones whole.
+#[derive(Debug, Clone)]
+pub struct Splice {
+    pub from: usize,
+    pub entry: String,
+    pub legs: Vec<ProcLeg>,
+    pub constraints: Vec<crate::nav::StarConstraint>,
+    pub why: String,
+}
+
+static SPLICE: std::sync::Mutex<Option<Splice>> = std::sync::Mutex::new(None);
+
+/// Offer the flying follower a new tail; it takes it on its next tick, or
+/// refuses it (`splice_stale`) when the leg flying is already past the entry.
+/// False with no follower flying.
+pub fn offer_splice(s: Splice) -> bool {
+    if !ACTIVE.load(Ordering::SeqCst) {
+        return false;
+    }
+    *SPLICE.lock().unwrap_or_else(|e| e.into_inner()) = Some(s);
+    true
+}
+
+fn take_splice() -> Option<Splice> {
+    SPLICE.lock().unwrap_or_else(|e| e.into_inner()).take()
+}
+
+/// The route with the splice applied, flying leg `idx`: the legs before
+/// `from` kept and the new ones after, so `idx` still names the same leg.
+/// Refused when the route no longer holds the entry at `from` (another
+/// splice came first) or the leg flying is past it (a turn onto the old
+/// STAR's next fix is already in hand: the arrival sets up from there). Pure.
+pub fn apply_splice(legs: &[ProcLeg], idx: usize, s: &Splice) -> Result<Vec<ProcLeg>, &'static str> {
+    let at = legs.get(s.from).ok_or("route_changed")?;
+    if !at.fix_ident.eq_ignore_ascii_case(&s.entry) {
+        return Err("route_changed");
+    }
+    if idx > s.from {
+        return Err("past_entry");
+    }
+    if s.legs.is_empty() || !s.legs[0].fix_ident.eq_ignore_ascii_case(&s.entry) {
+        return Err("no_entry");
+    }
+    let mut out = legs[..s.from].to_vec();
+    out.extend(s.legs.iter().cloned());
+    Ok(out)
+}
+
 static TOD: std::sync::Mutex<Option<PlannedTod>> = std::sync::Mutex::new(None);
 
 /// The follower's planned top of descent for the leg being flown; `None`
@@ -1944,6 +2012,8 @@ pub fn start_scoped(
             publish_fix_dist(None);
             clear_pilot_altitude();
             publish_terrain_floor(None);
+            publish_route_ahead(None);
+            take_splice();
             crate::tools::speedhold::release();
             hold_at_cleared(None, "follower_ended");
         });
@@ -2074,13 +2144,13 @@ impl HeadingHold {
 async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, plan: Plan) {
     let Plan {
         name,
-        legs,
+        mut legs,
         end,
         vy_kts,
         cruise_ias_kts,
         transition_altitude_ft,
         climb_minimums,
-        arrival_constraints,
+        mut arrival_constraints,
         visual_deg,
         missed_legs,
     } = plan;
@@ -2099,7 +2169,7 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, plan: Pla
             serde_json::json!({"event": "minimum_above_cruise", "fix": m.fix, "min_ft": m.min_ft, "cruise_ft": cruise_ft}),
         );
     }
-    let handoff = handoff_index(&legs);
+    let mut handoff = handoff_index(&legs);
     let _detail = crate::auto_status::DetailGuard::hold(&DETAIL);
     // Process-wide facts must never outlive the flight that set them.
     clear_pilot_altitude();
@@ -2220,7 +2290,7 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, plan: Pla
     // own procedure owns the heights.
     let descent_cruise_ft = (cruise_ft > 0.0 && !matches!(end, EndAction::Approach { .. }))
         .then_some(cruise_ft);
-    let plan_top = descent_cruise_ft.and_then(|c| plan_top_index(&legs, c));
+    let mut plan_top = descent_cruise_ft.and_then(|c| plan_top_index(&legs, c));
     let mut plan_peak_ft = prev_cmd_alt;
     let mut descent_held_logged: Option<usize> = None;
     let mut climb_held_logged: Option<usize> = None;
@@ -2242,6 +2312,8 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, plan: Pla
     let mut tick_clock = std::time::Instant::now();
     // The FMS is sequenced once per leg, when the follower first steers at it.
     let mut fms_leg: Option<usize> = None;
+    // The leg index last published with the route (`route_ahead`).
+    let mut route_published: Option<usize> = None;
     // Terrain look-ahead: probed on its own slow cadence (the ground does not
     // move), disabled for the flight the first time the plugin has no answer so
     // an old build degrades to the previous behaviour instead of stalling the
@@ -2269,6 +2341,39 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, plan: Pla
         if crate::xplane::sim_frozen(&xp).await {
             tick_clock = std::time::Instant::now();
             continue;
+        }
+        // An arrival re-picked in flight (#79): the new STAR's legs from its
+        // entry, and its windows, taken whole between two ticks.
+        if let Some(s) = take_splice() {
+            match apply_splice(&legs, idx, &s) {
+                Ok(new) => {
+                    crate::blackbox::record(
+                        "procedure",
+                        serde_json::json!({"event": "star_spliced", "idx": idx, "from": s.from, "entry": s.entry,
+                            "why": s.why, "fixes": new[s.from..].iter().map(|l| l.fix_ident.clone()).collect::<Vec<_>>(),
+                            "alts": new[s.from..].iter().map(|l| l.alt1_ft.map(f64::round)).collect::<Vec<_>>(),
+                            "constraints": s.constraints.len()}),
+                    );
+                    legs = new;
+                    arrival_constraints = s.constraints;
+                    handoff = handoff_index(&legs);
+                    plan_top = descent_cruise_ft.and_then(|c| plan_top_index(&legs, c));
+                    star_speed_begun.clear();
+                    said_star_speed.clear();
+                    star_ceiling_logged = None;
+                    ceiling_latch = None;
+                    fms_leg = None;
+                    route_published = None;
+                }
+                Err(why) => crate::blackbox::record(
+                    "procedure",
+                    serde_json::json!({"event": "splice_stale", "idx": idx, "from": s.from, "entry": s.entry, "why": why}),
+                ),
+            }
+        }
+        if route_published != Some(idx) {
+            route_published = Some(idx);
+            publish_route_ahead(Some((idx, legs.clone())));
         }
 
         let (
@@ -3346,6 +3451,38 @@ mod tests {
             navaid_region: String::new(),
             navaid: None,
         }
+    }
+
+    /// #79: an in-flight re-pick replaces the route from the STAR's entry on,
+    /// the leg flying keeps its index, and a splice the aircraft has flown
+    /// past (or computed against another route) is refused, never applied.
+    #[test]
+    fn a_splice_replaces_the_route_from_its_entry_while_the_entry_is_ahead() {
+        let legs: Vec<ProcLeg> = ["A", "B", "BAMEK", "OLD1", "OLD2"]
+            .iter()
+            .enumerate()
+            .map(|(i, f)| fix_leg(f, 45.0 + i as f64 * 0.1, 10.0))
+            .collect();
+        let s = Splice {
+            from: 2,
+            entry: "BAMEK".into(),
+            legs: ["BAMEK", "NEW1", "NEW2", "NEW3"].iter().map(|f| fix_leg(f, 44.8, 11.0)).collect(),
+            constraints: Vec::new(),
+            why: "wind".into(),
+        };
+        for idx in [0, 1, 2] {
+            let out = apply_splice(&legs, idx, &s).unwrap();
+            let ids: Vec<&str> = out.iter().map(|l| l.fix_ident.as_str()).collect();
+            assert_eq!(ids, ["A", "B", "BAMEK", "NEW1", "NEW2", "NEW3"]);
+            assert_eq!(out[idx].fix_ident, legs[idx].fix_ident, "the leg flying keeps its index");
+        }
+        assert_eq!(apply_splice(&legs, 3, &s).unwrap_err(), "past_entry");
+        let moved = Splice { from: 1, ..s.clone() };
+        assert_eq!(apply_splice(&legs, 0, &moved).unwrap_err(), "route_changed");
+        let off_end = Splice { from: 9, ..s.clone() };
+        assert_eq!(apply_splice(&legs, 0, &off_end).unwrap_err(), "route_changed");
+        let headless = Splice { legs: vec![fix_leg("NEW1", 44.8, 11.0)], ..s };
+        assert_eq!(apply_splice(&legs, 0, &headless).unwrap_err(), "no_entry");
     }
 
     /// LSZS 03 hand-over at the MAP (1.98 nm, 6,598 ft, threshold 5,602):

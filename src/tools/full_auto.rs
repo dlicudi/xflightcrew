@@ -838,6 +838,7 @@ impl FullAuto {
         Ok(ResumeArm::Route(
             Mission::Resume(Route {
                 arrival_rwy: fp.procedures.dest_rwy.clone(),
+                arrival_star: fp.procedures.star.clone(),
                 dest_icao: fp.destination.clone(),
                 dest_name: fp.destination,
                 climb_minimums: Vec::new(),
@@ -1451,6 +1452,7 @@ impl FullAuto {
                 // The arm's runway, carried to the approach: the local
                 // route's checked final, else the one the STAR flown serves.
                 arrival_rwy: local_runway.clone().or_else(|| fp.procedures.dest_rwy.clone()),
+                arrival_star: fp.procedures.star.clone(),
                 dest_icao: fp.destination.clone(),
                 dest_name,
                 departure_rwy: fp.procedures.sid.as_ref().and(fp.procedures.origin_rwy.clone()),

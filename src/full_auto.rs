@@ -216,6 +216,9 @@ pub struct Route {
     /// (`plan_audit::choose_arrival`'s pick, else the plan's own), published
     /// as [`arrival_runway`] for the whole mission.
     pub arrival_rwy: Option<String>,
+    /// The STAR flown to it (`plan_audit::choose_arrival`'s pick, else the
+    /// plan's): an in-flight re-pick keeps it when it serves the new runway.
+    pub arrival_star: Option<String>,
     /// The planned SID's ident, when the plan has one (`general/sid_ident`):
     /// the departure an IFR clearance's SID is measured against.
     pub sid: Option<String>,
@@ -1217,6 +1220,7 @@ async fn wait_enroute_working_the_radio(
     callsign: &Option<String>,
     climb_to_ft: f64,
     dest: Option<(f64, f64, i64)>,
+    arr: &mut ArrivalRepick,
 ) -> bool {
     let deadline = Instant::now() + Duration::from_secs_f64(4.0 * 3600.0);
     // Landing and taxi lights off once clear of the pattern: one read per
@@ -1326,6 +1330,45 @@ async fn wait_enroute_working_the_radio(
                 "zone_challenge",
                 json!({ "answered": false, "home_khz": home }),
             );
+        }
+        // The arrival re-picked in flight (#79): the destination's tower
+        // naming another end, or its METAR moving to one.
+        let tower_rwy = dest
+            .filter(|(_, _, dkhz)| home == Some(*dkhz))
+            .filter(|_| {
+                matches!(
+                    crate::party_line::clearance_state(),
+                    Some(crate::tower::State::Inbound | crate::tower::State::ClearedToLand)
+                )
+            })
+            .and_then(|_| crate::party_line::clearance_runway());
+        let wind_due = arr.last_check.is_none_or(|t| t.elapsed().as_secs_f64() >= REPICK_CHECK_SECS);
+        if tower_rwy.is_some() || wind_due {
+            let wind_rwy = if wind_due {
+                arr.last_check = Some(Instant::now());
+                let far = match (arr.dest_pos, tokio::join!(xp.get_float(LAT), xp.get_float(LON))) {
+                    (Some((dlat, dlon)), (Ok(lat), Ok(lon))) => {
+                        crate::nav::haversine_nm(lat, lon, dlat, dlon) > REPICK_MIN_DEST_NM
+                    }
+                    _ => false,
+                };
+                if far {
+                    wind_runway(
+                        &arr.runways,
+                        crate::weather::surface_wind(&crate::tools::autoland::xplane_root(), &arr.dest_icao),
+                    )
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            let current = arrival_runway();
+            if let Some((rwy, why)) = arr.watch.decide(current.as_deref(), tower_rwy.as_deref(), wind_rwy.as_deref()) {
+                if let Some(line) = repick_arrival(xp, ctx.config, arr, &rwy, why).await {
+                    announce(voice, Priority::Advisory, &line);
+                }
+            }
         }
         tokio::time::sleep(Duration::from_millis(2000)).await;
     }
@@ -3023,7 +3066,8 @@ async fn fly_route(
                 let khz = a.freq(crate::nav::FREQ_TOWER)?.khz;
                 Some((lat, lon, khz))
             });
-    if !wait_enroute_working_the_radio(xp, ctx, voice, callsign, climb_to_ft, dest_tower).await {
+    let mut arrival = ArrivalRepick::of(route, &crate::tools::autoland::apt_dat_path());
+    if !wait_enroute_working_the_radio(xp, ctx, voice, callsign, climb_to_ft, dest_tower, &mut arrival).await {
         if !ABORT.load(SeqCst) {
             give_up(
                 xp,
@@ -4188,6 +4232,219 @@ pub fn departure_runway_mismatch(planned: Option<&str>, cleared: Option<&str>) -
             crate::circuit::spell_runway(p)
         )
     })
+}
+
+/// Re-picks of the arrival runway one flight allows: a wind sitting on the
+/// fence would otherwise swap STARs every few minutes.
+pub const MAX_ARRIVAL_REPICKS: u32 = 2;
+/// A wind re-pick is judged no closer than this to the destination: inside
+/// it the arrival stage's own pick (`build_arrival`) has the runway.
+pub const REPICK_MIN_DEST_NM: f64 = 25.0;
+/// How often the destination's METAR is read for a re-pick.
+pub const REPICK_CHECK_SECS: f64 = 60.0;
+
+/// When the arrival runway chosen at the arm is re-picked in flight (#79):
+/// the METAR moves, or the destination's tower names another end. Pure, fed
+/// by the enroute wait (`wait_enroute_working_the_radio`).
+///
+/// The tower outranks the wind and is taken at once. A wind pick must be the
+/// same on two readings in a row (a METAR on the fence, a file mid-write),
+/// and nothing moves a runway the mission does not hold (a circuit, a plan
+/// with none: `retarget_arrival_runway`'s own rule) or more than
+/// [`MAX_ARRIVAL_REPICKS`] times.
+#[derive(Debug, Default)]
+pub struct RepickWatch {
+    wind_seen: Option<String>,
+    repicks: u32,
+}
+
+impl RepickWatch {
+    /// The runway to move to and why ("tower" | "wind"), or `None`.
+    pub fn decide(
+        &mut self,
+        current: Option<&str>,
+        tower: Option<&str>,
+        wind: Option<&str>,
+    ) -> Option<(String, &'static str)> {
+        let current = current?;
+        if self.repicks >= MAX_ARRIVAL_REPICKS {
+            return None;
+        }
+        let differs = |r: &str| !r.trim().eq_ignore_ascii_case(current.trim());
+        if let Some(t) = tower.filter(|t| !t.trim().is_empty() && differs(t)) {
+            self.repicks += 1;
+            self.wind_seen = None;
+            return Some((t.trim().to_string(), "tower"));
+        }
+        // With the tower on frequency and naming our end, the wind has no say.
+        if tower.is_some() {
+            self.wind_seen = None;
+            return None;
+        }
+        match wind.filter(|w| differs(w)) {
+            Some(w) if self.wind_seen.as_deref().is_some_and(|s| s.eq_ignore_ascii_case(w)) => {
+                self.repicks += 1;
+                self.wind_seen = None;
+                Some((w.to_string(), "wind"))
+            }
+            Some(w) => {
+                self.wind_seen = Some(w.to_string());
+                None
+            }
+            None => {
+                self.wind_seen = None;
+                None
+            }
+        }
+    }
+}
+
+/// The destination runway the surface wind picks now, or `None` in a calm
+/// (under [`WIND_DECISIVE_KTS`]: the plan's end stands). Pure.
+pub fn wind_runway(runways: &[crate::nav::Runway], wind: Option<(f64, f64)>) -> Option<String> {
+    let (dir, kts) = wind.filter(|(_, k)| *k >= WIND_DECISIVE_KTS)?;
+    crate::nav::best_runway_for_wind(runways, dir, kts).map(|(r, _, _)| r)
+}
+
+/// The arrival as the enroute leg carries it: what a re-pick reads and moves.
+pub struct ArrivalRepick {
+    pub dest_icao: String,
+    /// The destination's reference point and runways (apt.dat), read once.
+    pub dest_pos: Option<(f64, f64)>,
+    pub runways: Vec<crate::nav::Runway>,
+    pub star: Option<String>,
+    pub fms_payload: String,
+    pub watch: RepickWatch,
+    pub last_check: Option<Instant>,
+}
+
+impl ArrivalRepick {
+    /// The route's arrival, the destination read from apt.dat (none found:
+    /// no wind re-pick, the tower's still counts).
+    pub fn of(route: &Route, apt_dat: &str) -> Self {
+        let apt = crate::nav::find_airport(apt_dat, &route.dest_icao).ok().flatten();
+        ArrivalRepick {
+            dest_icao: route.dest_icao.clone(),
+            dest_pos: apt.as_ref().and_then(|a| a.position()),
+            runways: apt.map(|a| a.runways).unwrap_or_default(),
+            star: route.arrival_star.clone(),
+            fms_payload: route.fms_payload.clone(),
+            watch: RepickWatch::default(),
+            last_check: None,
+        }
+    }
+}
+
+/// A re-pick's splice for the follower flying `legs` at `idx`: the STAR
+/// serving `rwy` from the legs ahead (`plan_audit::star_splice`, the arm's
+/// rule), the new STAR's windows clamped into it (`nav::star_constraints`,
+/// `procedure::apply_arrival_constraints`), and the whole new route for the
+/// GPS. `None`: no STAR from here serves `rwy`.
+#[allow(clippy::too_many_arguments)]
+pub fn arrival_splice(
+    cifp_dir: &str,
+    fix_path: &str,
+    nav_path: &str,
+    apt: &crate::nav::AirportInfo,
+    dest: &str,
+    rwy: &str,
+    star: Option<&str>,
+    legs: &[crate::nav::ProcLeg],
+    idx: usize,
+    why: &str,
+) -> Option<(crate::procedure::Splice, String, Vec<crate::nav::ProcLeg>)> {
+    let s = crate::plan_audit::star_splice(cifp_dir, fix_path, nav_path, apt, dest, rwy, star, legs, idx)?;
+    let mut full: Vec<crate::nav::ProcLeg> = legs[..s.entry_index].to_vec();
+    full.extend(s.legs);
+    let fixes: Vec<String> = full.iter().map(|l| l.fix_ident.clone()).collect();
+    let fixes: Vec<&str> = fixes.iter().map(String::as_str).collect();
+    let cons = crate::nav::star_constraints(cifp_dir, dest, &s.ident, Some(rwy), &fixes);
+    crate::procedure::apply_arrival_constraints(&mut full, &cons);
+    let splice = crate::procedure::Splice {
+        from: s.entry_index,
+        entry: s.entry,
+        legs: full[s.entry_index..].to_vec(),
+        constraints: cons,
+        why: why.to_string(),
+    };
+    Some((splice, s.ident, full))
+}
+
+/// The line for a re-pick. Pure.
+pub fn repick_line(dest: &str, rwy: &str, why: &str, star: Option<(&str, &str)>) -> String {
+    let spoken = crate::circuit::spell_runway(rwy);
+    let head = if why == "tower" {
+        format!("Tower wants runway {spoken}")
+    } else {
+        format!("The wind at {dest} now favours runway {spoken}")
+    };
+    match star {
+        Some((ident, entry)) => format!("{head}, so the {ident} arrival from {entry}."),
+        None => format!("{head}, and no arrival from here serves it; I'll fly the route and set up from there."),
+    }
+}
+
+/// Re-pick the arrival in flight (#79): the new runway through
+/// [`retarget_arrival_runway`], the one write point, the STAR serving it
+/// spliced into the flying follower (`procedure::offer_splice`) and the GPS
+/// reloaded with the procedure flown, as the arm's pick does. Blackbox
+/// `full_auto` `arrival_repick`. Returns the line to say.
+async fn repick_arrival(
+    xp: &XPlaneClient,
+    config: &Config,
+    arr: &mut ArrivalRepick,
+    rwy: &str,
+    why: &'static str,
+) -> Option<String> {
+    let was = arrival_runway();
+    if !retarget_arrival_runway(rwy, why) {
+        return None;
+    }
+    let ahead = crate::procedure::route_ahead();
+    let (cifp, fixp, navp, aptp) = (
+        config.cifp_dir.clone(),
+        config.fix_data_path.clone(),
+        config.nav_data_path.clone(),
+        config.apt_data_path.clone(),
+    );
+    let (dest, star, r) = (arr.dest_icao.clone(), arr.star.clone(), rwy.to_string());
+    let spliced = tokio::task::spawn_blocking(move || {
+        let (idx, legs) = ahead?;
+        let apt = crate::nav::find_airport(&aptp, &dest).ok().flatten()?;
+        arrival_splice(&cifp, &fixp, &navp, &apt, &dest, &r, star.as_deref(), &legs, idx, why)
+    })
+    .await
+    .ok()
+    .flatten();
+    let line = match spliced {
+        Some((splice, ident, full)) => {
+            let entry = splice.entry.clone();
+            event(
+                "arrival_repick",
+                json!({ "why": why, "was": was, "now": rwy, "star": ident, "was_star": arr.star, "entry": entry,
+                    "from": splice.from, "fixes": splice.legs.iter().map(|l| l.fix_ident.clone()).collect::<Vec<_>>(),
+                    "constraints": splice.constraints.len() }),
+            );
+            let offered = crate::procedure::offer_splice(splice);
+            if offered {
+                arr.star = Some(ident.clone());
+                arr.fms_payload = payload_with_legs(&arr.fms_payload, &full);
+                if !arr.fms_payload.is_empty() {
+                    let _ = xp.set_data("xcopilot/fms/route", arr.fms_payload.as_bytes()).await;
+                    let _ = xp.set_int("xcopilot/fms/load", 1).await;
+                }
+            }
+            repick_line(&arr.dest_icao, rwy, why, Some((&ident, &entry)))
+        }
+        None => {
+            event(
+                "arrival_repick",
+                json!({ "why": why, "was": was, "now": rwy, "star": null, "was_star": arr.star }),
+            );
+            repick_line(&arr.dest_icao, rwy, why, None)
+        }
+    };
+    Some(line)
 }
 
 /// The crew's own departure from `cleared`, spliced into the route: the
@@ -6409,6 +6666,7 @@ mod tests {
             origin_rwy: Some("28".into()),
             fms_payload: "LIME,45.6689,9.7003,0|ME609,45.7,9.8,5000|LIPE,44.5354,11.2887,0".into(),
             arrival_rwy: None,
+            arrival_star: None,
             sid: Some("LEGL1P".into()),
             ifr: true,
         };
@@ -7400,5 +7658,124 @@ mod arrival_watch_tests {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod arrival_repick_tests {
+    use super::{repick_line, wind_runway, RepickWatch, MAX_ARRIVAL_REPICKS};
+
+    /// #79: the tower's end is taken at once; the wind's only on the second
+    /// reading in a row; nothing moves a runway the mission does not hold, a
+    /// wind pick with the tower naming our end, or past the cap.
+    #[test]
+    fn the_arrival_is_repicked_by_the_tower_at_once_and_by_the_wind_when_it_stays() {
+        let mut w = RepickWatch::default();
+        assert_eq!(w.decide(None, Some("12"), None), None, "no mission runway: nothing to move");
+        assert_eq!(w.decide(Some("30"), None, Some("12")), None, "one METAR is not a trend");
+        assert_eq!(w.decide(Some("30"), None, None), None, "calm: the plan's end stands");
+        assert_eq!(w.decide(Some("30"), None, Some("12")), None, "the calm reset it");
+        assert_eq!(w.decide(Some("30"), None, Some("12")), Some(("12".into(), "wind")));
+        // The tower's end, taken at once; its own end silences the wind.
+        let mut w = RepickWatch::default();
+        assert_eq!(w.decide(Some("12"), Some("12"), Some("30")), None);
+        assert_eq!(w.decide(Some("12"), Some("12"), Some("30")), None);
+        assert_eq!(w.decide(Some("12"), Some("30"), None), Some(("30".into(), "tower")));
+        // A fence-sitting wind cannot swap the arrival for ever.
+        let mut w = RepickWatch::default();
+        let mut rwy = "30".to_string();
+        let mut moves = 0;
+        for _ in 0..20 {
+            let other = if rwy == "30" { "12" } else { "30" };
+            if let Some((r, _)) = w.decide(Some(&rwy), None, Some(other)) {
+                rwy = r;
+                moves += 1;
+            }
+        }
+        assert_eq!(moves, MAX_ARRIVAL_REPICKS);
+    }
+
+    #[test]
+    fn a_repick_is_said_with_its_reason_and_what_is_flown() {
+        assert_eq!(
+            repick_line("LIPE", "12", "wind", Some(("BAME5M", "BAMEK"))),
+            "The wind at LIPE now favours runway one two, so the BAME5M arrival from BAMEK."
+        );
+        assert!(repick_line("LIPE", "12", "tower", None).starts_with("Tower wants runway one two, and no arrival"));
+        assert_eq!(wind_runway(&[], Some((120.0, 15.0))), None);
+    }
+
+    /// LIPE in flight: armed on BAME2S for 30, the METAR swings to 120/15
+    /// while the follower flies the route. The re-pick splices BAME5M for 12
+    /// from BAMEK into the legs ahead, the legs flown stay, BAME5M's windows
+    /// come with it, and the follower takes it while BAMEK is still ahead.
+    /// Needs the X-Plane install.
+    /// `cargo test -- --ignored real_install_lipe_star_repicked_in_flight --nocapture`
+    #[test]
+    #[ignore]
+    fn real_install_lipe_star_repicked_in_flight() {
+        use crate::nav::ProcKind;
+        let config = crate::config::Config::from_env().expect("config");
+        let apt = crate::nav::find_airport(&config.apt_data_path, "LIPE").unwrap().unwrap();
+        let (alat, alon) = apt.position().unwrap();
+        let mut star =
+            crate::nav::load_proc_legs(&config.cifp_dir, "LIPE", ProcKind::Star, "BAME2S", Some("RW30"));
+        crate::nav::resolve_proc_fixes(&config.fix_data_path, &config.nav_data_path, &apt, "LIPE", &mut star, alat, alon);
+        let waypoints: Vec<crate::simbrief::Waypoint> = std::iter::once(crate::simbrief::Waypoint {
+            ident: "ENRT1".into(),
+            lat: 45.3,
+            lon: 10.4,
+            alt: 12000.0,
+        })
+        .chain(
+            star.iter()
+                .filter_map(|l| l.fix.as_ref().map(|f| (l.fix_ident.clone(), f.lat, f.lon)))
+                .enumerate()
+                .map(|(i, (ident, lat, lon))| crate::simbrief::Waypoint {
+                    ident,
+                    lat,
+                    lon,
+                    alt: 12000.0 - 1500.0 * i as f64,
+                }),
+        )
+        .collect();
+        let legs = crate::procedure::enroute_legs(&waypoints, "LIME", "LIPE", 12000.0);
+        let (splice, ident, full) = super::arrival_splice(
+            &config.cifp_dir,
+            &config.fix_data_path,
+            &config.nav_data_path,
+            &apt,
+            "LIPE",
+            "12",
+            Some("BAME2S"),
+            &legs,
+            1,
+            "wind",
+        )
+        .expect("a STAR from the route serves 12");
+        println!(
+            "{ident} from {} at {}: {:?}",
+            splice.entry,
+            splice.from,
+            full.iter().map(|l| (l.fix_ident.clone(), l.alt1_ft.map(f64::round))).collect::<Vec<_>>()
+        );
+        assert_eq!(ident, "BAME5M");
+        assert_eq!(splice.entry, "BAMEK");
+        assert!(splice.from >= 1);
+        assert_eq!(
+            full[..splice.from].iter().map(|l| &l.fix_ident).collect::<Vec<_>>(),
+            legs[..splice.from].iter().map(|l| &l.fix_ident).collect::<Vec<_>>(),
+            "the legs flown stay"
+        );
+        assert_eq!(full.last().map(|l| l.fix_ident.as_str()), Some("EMDUD"));
+        assert!(full.iter().all(|l| l.fix.is_some() && l.alt1_ft.is_some()));
+        assert!(!splice.constraints.is_empty(), "BAME5M's windows for 12 apply");
+        // The follower takes it while the entry is ahead, never after.
+        let applied = crate::procedure::apply_splice(&legs, splice.from, &splice).unwrap();
+        assert_eq!(applied.len(), full.len());
+        assert_eq!(
+            crate::procedure::apply_splice(&legs, splice.from + 1, &splice).unwrap_err(),
+            "past_entry"
+        );
     }
 }
