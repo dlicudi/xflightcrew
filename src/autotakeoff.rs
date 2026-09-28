@@ -87,6 +87,9 @@ const PHI: &str = "sim/flightmodel/position/true_phi";
 const PITCH_RATE: &str = "sim/flightmodel/position/Q";
 /// Yaw rate, deg/s, nose right positive: the roll law's damping.
 const YAW_RATE: &str = "sim/flightmodel/position/R";
+/// The flight model's vertical speed, fpm: the climb the pitch is flying
+/// when the autopilot takes it (`ClimbVs`).
+const VS_FPM: &str = "sim/flightmodel/position/vh_ind_fpm";
 
 const M_TO_FT: f64 = 3.280_84;
 const MS_TO_KTS: f64 = 1.943_844;
@@ -479,6 +482,11 @@ pub struct Params {
     /// while nobody flies — and the whole trust model here rests on the
     /// copilot being right about who has the aircraft.
     pub handoff_to_caller: bool,
+    /// The caller walks the flap schedule after the handoff (the circuit,
+    /// which takes the aircraft at 500 ft, under a jet's acceleration
+    /// height): the handoff leaves the flaps where they are and hands them
+    /// over ([`take_climb_handover`]) instead of cleaning up in one shot.
+    pub flaps_to_caller: bool,
     /// The speed the governor is armed at when the PILOT takes the handoff
     /// (the profile's cruise IAS, capped to 250 below 10,000 ft), and the
     /// base URL it is armed over. `None` leaves the throttle where the climb
@@ -1881,6 +1889,159 @@ pub fn handoff_waits_for_schedule(retracted: bool, has_schedule: bool, waited_s:
     !retracted && has_schedule && waited_s < SCHEDULE_WAIT_S
 }
 
+/// The fastest the commanded climb moves once the autopilot has it, fpm per
+/// second: about a tenth of a g of pitch change (0.1 x 9.81 m/s/s is 193 fpm
+/// a second), a crew's hand lowering the nose, not a step.
+///
+/// LEMG 13 (the five circuits of 2026-09-28, e.g. 1790596335-full_auto): the
+/// pitch was climbing 2,300 to 2,500 fpm through 300 ft and the engage wrote
+/// 1,500; the circuit took it at 500 ft and wrote 456, a thousand fpm off the
+/// dial in 0.8 s. After #78 the pitch climbs about 3,100 fpm at V2 + 15, so
+/// the old engage would have been a 1,900 fpm push.
+pub const CLIMB_VS_SLEW_FPM_S: f64 = 200.0;
+
+/// `prev` toward `want` at [`CLIMB_VS_SLEW_FPM_S`] over `dt_s` (bounded to a
+/// second, so a stalled tick cannot turn into a step). Pure.
+pub fn climb_vs_slewed(prev: f64, want: f64, dt_s: f64) -> f64 {
+    slew(prev, want, CLIMB_VS_SLEW_FPM_S * dt_s.clamp(0.0, 1.0))
+}
+
+/// The speed hold's integral, fpm per second per knot off the speed: the
+/// proportional part ([`climb_out_vs_fpm`], 100 fpm a knot) closes near 0.1
+/// rad/s against the 737's VS mode, and this puts the integral's corner a
+/// quarter of that down (0.025 rad/s), about fourteen degrees of the margin.
+const CLIMB_SPEED_TRIM_FPM_S_PER_KT: f64 = 2.5;
+/// A speed-holding climb never commands less than this: airborne, it climbs.
+const CLIMB_HOLD_FLOOR_FPM: f64 = 150.0;
+
+/// The autopilot's climb from the 300 ft engage to the handoff (#150).
+///
+/// The engage TAKES the climb the pitch was flying (`flown_fpm`, the flight
+/// model's vertical speed) and the command moves from there toward the law
+/// at [`CLIMB_VS_SLEW_FPM_S`], never a step. Below a declared acceleration
+/// height ([`ClimbOut`]) the law is a speed-holding climb: the proportional
+/// speed hold plus an integral trim, seeded at the engage so that the law
+/// itself starts at the climb flown. A proportional hold alone settles where
+/// the excess thrust is spent, 100 fpm a knot over the speed: 190 kt at the
+/// 737's 3,900 fpm of excess, where the pitch had held 165.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ClimbVs {
+    /// The last command; `None` until the first step (the engage).
+    cmd: Option<f64>,
+    /// The speed hold's integral trim, fpm; `None` outside the hold.
+    trim: Option<f64>,
+}
+
+impl ClimbVs {
+    /// One tick: `(law, command)`, fpm. `flown_fpm` is read only at the
+    /// first step; a failed read (`None`) is no measurement, and the engage
+    /// then writes the law as it always did. Pure.
+    #[allow(clippy::too_many_arguments)]
+    pub fn step(
+        &mut self,
+        ias_kts: f64,
+        target_kts: f64,
+        base_fpm: f64,
+        vne_kts: Option<f64>,
+        agl_ft: f64,
+        climb_out: Option<ClimbOut>,
+        flown_fpm: Option<f64>,
+        dt_s: f64,
+    ) -> (f64, f64) {
+        let flown = flown_fpm.filter(|v| v.is_finite()).map(|v| v.max(0.0));
+        let p = climb_out_vs_fpm(ias_kts, target_kts, base_fpm, vne_kts, agl_ft, climb_out);
+        let law = match climb_out {
+            Some(c) if agl_ft < c.accel_agl_ft => {
+                let hi = c
+                    .max_fpm
+                    .max(climb_vs_protected(ias_kts, target_kts, base_fpm, vne_kts));
+                let lo = CLIMB_HOLD_FLOOR_FPM.min(hi);
+                let trim = match (self.trim, self.cmd) {
+                    (Some(t), Some(_)) => {
+                        t + CLIMB_SPEED_TRIM_FPM_S_PER_KT
+                            * (ias_kts - target_kts)
+                            * dt_s.clamp(0.0, 1.0)
+                    }
+                    // The engage: the law starts where the pitch is.
+                    (_, None) => flown.map_or(0.0, |f| f - p),
+                    // Back under a height the climb had left: from zero.
+                    (None, Some(_)) => 0.0,
+                };
+                let trim = trim.clamp(lo - p, hi - p);
+                self.trim = Some(trim);
+                p + trim
+            }
+            _ => {
+                self.trim = None;
+                p
+            }
+        };
+        let cmd = match self.cmd.or(flown) {
+            Some(prev) => climb_vs_slewed(prev, law, dt_s),
+            None => law,
+        };
+        self.cmd = Some(cmd);
+        (law, cmd)
+    }
+}
+
+/// Whether the handoff leaves the flaps where they are for the CALLER to
+/// clean up on the schedule: an orchestrator that says it will
+/// ([`Params::flaps_to_caller`], the circuit), an airframe with a schedule
+/// to walk, and flaps still out. The one-shot clean-up at the circuit's 500
+/// ft took the 737 from 1 to up one second after 5 to 1, at 191 kt against a
+/// 210 kt flaps-up speed (LEMG 13, 2026-09-28). Pure.
+pub fn leaves_flaps_to_caller(retracted: bool, flaps_to_caller: bool, has_schedule: bool) -> bool {
+    !retracted && flaps_to_caller && has_schedule
+}
+
+/// What the takeoff hands its caller besides the aircraft: the climb it was
+/// commanding and the flaps it left out (`None` when clean or cleaned up).
+/// Set at the handoff, cleared at every start, taken once.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct ClimbHandover {
+    pub vs_cmd: Option<f64>,
+    pub flaps_left: Option<f64>,
+}
+
+static CLIMB_HANDOVER: std::sync::Mutex<Option<ClimbHandover>> = std::sync::Mutex::new(None);
+
+fn publish_climb_handover(h: Option<ClimbHandover>) {
+    *CLIMB_HANDOVER.lock().unwrap_or_else(|e| e.into_inner()) = h;
+}
+
+/// The last completed takeoff's [`ClimbHandover`], once.
+pub fn take_climb_handover() -> Option<ClimbHandover> {
+    CLIMB_HANDOVER
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .take()
+}
+
+/// The speed the MCP window goes to once the takeoff accelerates: the flaps-up
+/// manoeuvring speed a crew sets at the acceleration height (the schedule's
+/// top retraction speed; the 737's 210), else the climb speed. Pure.
+pub fn clean_up_speed_kts(schedule: &[(f64, f64)], vy_kts: f64) -> f64 {
+    schedule
+        .iter()
+        .map(|(_, kts)| *kts)
+        .filter(|k| k.is_finite() && *k > 0.0)
+        .fold(None, |m: Option<f64>, k| Some(m.map_or(k, |m| m.max(k))))
+        .unwrap_or(vy_kts)
+}
+
+/// The MCP speed window off V2 to `kts` (#150): written and read back
+/// (within a knot). Only an airframe whose window the takeoff set to V2
+/// (`takeoff_config: v2_kts`) is touched; the caller gates on that.
+pub async fn speed_window_after_acceleration(xp: &dyn crate::xplane::XPlane, kts: f64) -> bool {
+    const WINDOW: &str = crate::aircraft::TakeoffConfigProfile::SPEED_WINDOW;
+    xp.set_float(WINDOW, kts).await.is_ok()
+        && xp
+            .get_float(WINDOW)
+            .await
+            .is_ok_and(|v| (v - kts).abs() <= 1.0)
+}
+
 /// A roll leaving the centreline is rejected while it is still on the
 /// pavement. LILB 03 (2026-09-25): the Evolution swung left at full power
 /// with the steering pinned right, and the only reject in the roll was the
@@ -2098,6 +2259,27 @@ pub fn reject_call_due(state: Option<crate::tower::State>) -> bool {
         state,
         Some(crate::tower::State::TakeoffCleared | crate::tower::State::LinedUp)
     )
+}
+
+/// The MCP window off V2 when it is `owed`, once, blackboxed `speed_window`
+/// with where it went (`at`: the first flap step or the handoff).
+async fn move_speed_window(
+    xp: &XPlaneClient,
+    owed: &mut bool,
+    kts: f64,
+    at: &str,
+    agl_ft: f64,
+    ias: f64,
+) {
+    if !std::mem::take(owed) {
+        return;
+    }
+    let ok = speed_window_after_acceleration(xp, kts).await;
+    crate::blackbox::record(
+        "autotakeoff",
+        serde_json::json!({"event": "speed_window", "to": kts, "ok": ok, "at": at,
+                           "agl": agl_ft, "ias": ias}),
+    );
 }
 
 /// A mode command is only a request; handoff needs live mode and dial readbacks.
@@ -2331,6 +2513,16 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, p: Params) {
     let mut reduced = false;
     let mut wings = WingsLevel::default();
     let mut last_vs_cmd: Option<f64> = None;
+    // The autopilot's climb from the engage on: the climb flown, carried
+    // into the law without a step (#150).
+    let mut climb_vs = ClimbVs::default();
+    // The MCP window leaves V2 once the takeoff accelerates, on an airframe
+    // whose window the takeoff set (`takeoff_config: v2_kts`); once.
+    let mut window_owed = crate::aircraft::live_profile()
+        .and_then(|lp| lp.takeoff_config.as_ref().and_then(|t| t.v2_kts))
+        .is_some_and(|v| v.is_finite() && v > 0.0);
+    let window_kts = clean_up_speed_kts(&p.flap_schedule, p.vy_kts);
+    publish_climb_handover(None);
     let mut last_thr_cmd = 0.3_f64;
     // The manual's takeoff torque, for this airframe, read once per roll.
     let power_limit = takeoff_power();
@@ -2413,6 +2605,7 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, p: Params) {
             roll_yield,
             torque_nm,
             yaw_r,
+            vs_read,
         ) = tokio::join!(
             xp.get_float(LAT),
             xp.get_float(LON),
@@ -2430,7 +2623,10 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, p: Params) {
             xp.get_float(ROLL_YIELD),
             xp.get_float_array(ENGN_TRQ),
             xp.get_float(YAW_RATE),
+            xp.get_float(VS_FPM),
         );
+        // A failed read is no measurement: the engage then writes the law.
+        let vs_flown = vs_read.ok().filter(|v| v.is_finite());
         let torque_ftlb = torque_nm
             .ok()
             .and_then(|v| v.first().copied())
@@ -2735,6 +2931,8 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, p: Params) {
                     flaps_retracted = true;
                     let _ = xp.set_float(FLAP_HANDLE, 0.0).await;
                     alert(&voice, Priority::Advisory, "Flaps up.");
+                    move_speed_window(&xp, &mut window_owed, window_kts, "flap_step", agl_ft, ias)
+                        .await;
                 }
             } else if flap_retract_step(&p.flap_schedule, flap_cmd, ias).is_some() {
                 // Each step waits for the flaps to ARRIVE at the last one:
@@ -2763,6 +2961,8 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, p: Params) {
                         Priority::Advisory,
                         &flap_step_line(next, detent.as_deref()),
                     );
+                    move_speed_window(&xp, &mut window_owed, window_kts, "flap_step", agl_ft, ias)
+                        .await;
                 }
             }
         }
@@ -2807,6 +3007,8 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, p: Params) {
                         // on, knots per second (`ClimbHold`).
                         "accel": pitch_law.accel_kts_s(),
                         "phi": phi_deg, "ail": ail, "hdg_err": hdg_err,
+                        // The climb the engage will take (#150).
+                        "vs": vs_flown,
                     }),
                 );
                 tokio::time::sleep(std::time::Duration::from_millis(150)).await;
@@ -2817,25 +3019,8 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, p: Params) {
             // the dial to the CURRENT rate, stomping any preset (the sync
             // that made VS-mode rotation impossible in the first place).
             // The pitch channel simply expires; the servo owns the elevator.
-            let vs = climb_out_vs_fpm(
-                ias,
-                p.initial_climb_kts,
-                p.climb_fpm,
-                climb_guard_vne(p.vne_kts),
-                agl_ft,
-                climb_out,
-            );
-            if !engage_climb(&xp, vs, &mut last_vs_cmd).await {
-                continue;
-            }
-            ap_engaged = true;
-            let trim = xp.get_float(ELEV_TRIM).await.ok();
-            crate::blackbox::record(
-                "autotakeoff",
-                serde_json::json!({
-                    "event": "ap_engaged", "ias": ias, "agl": agl_ft, "cmd_vs": vs, "trim": trim,
-                }),
-            );
+            // Each try takes the climb flown NOW (#150).
+            climb_vs = ClimbVs::default();
         }
         // With departure minimums ahead (full auto's SID), the climb-out is
         // flown at the airframe's BEST rate, holding its initial climb speed
@@ -2847,16 +3032,34 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, p: Params) {
         } else {
             (p.climb_fpm, climb_out)
         };
-        let vs = climb_out_vs_fpm(
+        // The climb flown at the engage, carried into the law at a crew's
+        // pace; below a declared acceleration height the law holds the speed
+        // (`ClimbVs`).
+        let (law_vs, vs) = climb_vs.step(
             ias,
             p.initial_climb_kts,
             base_fpm,
             climb_guard_vne(p.vne_kts),
             agl_ft,
             climb_out,
+            vs_flown,
+            dt,
         );
         if !engage_climb(&xp, vs, &mut last_vs_cmd).await {
             continue;
+        }
+        if !ap_engaged {
+            ap_engaged = true;
+            let trim = xp.get_float(ELEV_TRIM).await.ok();
+            crate::blackbox::record(
+                "autotakeoff",
+                serde_json::json!({
+                    "event": "ap_engaged", "ias": ias, "agl": agl_ft, "cmd_vs": vs, "trim": trim,
+                    // The climb the pitch was flying and the law's own rate:
+                    // `cmd_vs` starts at the first and walks to the second.
+                    "vs": vs_flown, "law_vs": law_vs,
+                }),
+            );
         }
         DETAIL.set(format!(
             "climbing, {} ft, handoff at {} ft",
@@ -2866,7 +3069,8 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, p: Params) {
         crate::auto_status::set_ap_targets(None, None, Some(vs));
         crate::blackbox::record(
             "autotakeoff",
-            serde_json::json!({"event": "climb", "ias": ias, "agl": agl_ft, "cmd_vs": vs}),
+            serde_json::json!({"event": "climb", "ias": ias, "agl": agl_ft, "cmd_vs": vs,
+                               "law_vs": law_vs, "vs": vs_flown}),
         );
         if agl_ft >= p.handoff_agl_ft.max(AP_ENGAGE_AGL_FT + 50.0) {
             // At the height, dirty, and a few knots short of the clean-up:
@@ -2874,17 +3078,36 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, p: Params) {
             let floor = crate::aircraft::speed_floor_kts();
             let waited = handoff_wait.get_or_insert_with(std::time::Instant::now);
             let waited_s = waited.elapsed().as_secs_f64();
-            if handoff_waits_for_clean_up(flaps_retracted, ias, floor, waited_s)
-                || (climb_out.is_some()
-                    && handoff_waits_for_schedule(
-                        flaps_retracted,
-                        !p.flap_schedule.is_empty(),
-                        waited_s,
-                    ))
+            // A caller that walks the schedule itself takes the flaps as
+            // they are (#150): no wait, no one-shot.
+            let flaps_left = leaves_flaps_to_caller(
+                flaps_retracted,
+                p.flaps_to_caller,
+                !p.flap_schedule.is_empty(),
+            );
+            if !flaps_left
+                && (handoff_waits_for_clean_up(flaps_retracted, ias, floor, waited_s)
+                    || (climb_out.is_some()
+                        && handoff_waits_for_schedule(
+                            flaps_retracted,
+                            !p.flap_schedule.is_empty(),
+                            waited_s,
+                        )))
             {
                 tokio::time::sleep(std::time::Duration::from_millis(400)).await;
                 continue;
             }
+            if flaps_left {
+                crate::blackbox::record(
+                    "autotakeoff",
+                    serde_json::json!({"event": "flaps_handoff", "ias": ias,
+                                       "floor": floor, "up": false, "to_caller": true,
+                                       "flap": flap_cmd}),
+                );
+            }
+            // The takeoff accelerates on from here in the caller's hands: the
+            // window leaves V2 now if no flap step has moved it.
+            move_speed_window(&xp, &mut window_owed, window_kts, "handoff", agl_ft, ias).await;
             // Never hand over dirty. The schedule above waits for Vy, which a
             // trainer passes in the first few hundred feet and a jet does not
             // reach before this loop ends: a 737 lifting at V2+20 hands off at
@@ -2895,7 +3118,9 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, p: Params) {
             // flies it clean, or is TOLD it is not — the floor is the
             // airframe's clean-configuration minimum, so a retraction can
             // never be one into the stall it was meant to avoid.
-            if let Some(up) = clean_up_at_handoff(flaps_retracted, ias, floor) {
+            if let Some(up) =
+                clean_up_at_handoff(flaps_retracted, ias, floor).filter(|_| !flaps_left)
+            {
                 if up {
                     let _ = xp.set_float(FLAP_HANDLE, 0.0).await;
                     alert(&voice, Priority::Advisory, "Flaps up.");
@@ -2983,8 +3208,13 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, p: Params) {
             crate::blackbox::record(
                 "autotakeoff",
                 serde_json::json!({"event": "handoff", "agl": agl_ft, "ias": ias,
-                                   "to_caller": p.handoff_to_caller}),
+                                   "to_caller": p.handoff_to_caller, "cmd_vs": vs,
+                                   "flaps_left": flaps_left.then_some(flap_cmd)}),
             );
+            publish_climb_handover(Some(ClimbHandover {
+                vs_cmd: Some(vs),
+                flaps_left: flaps_left.then_some(flap_cmd),
+            }));
             RUN.record(sim::run::Outcome::Completed);
             return;
         }
@@ -3027,6 +3257,146 @@ pub fn spoken_height_ft(agl_ft: f64) -> String {
     }
     out.push_str(" feet");
     out
+}
+
+/// The recorded LEMG 13 circuit climb-outs and the 737's VS mode, shared by
+/// this module's tests and the circuit's (#150).
+#[cfg(test)]
+pub(crate) mod climb_out_bench {
+    const LEMG13: &str = include_str!("../bench/takeoffs/lemg13_circuit_climb_outs.jsonl");
+
+    /// One climb-out as the blackbox drew it: `autotakeoff` `climb_manual`
+    /// (t, agl, ias), the `ap_engaged` tick (t, agl, ias, cmd_vs), every VS
+    /// command after it (`climb`, then the circuit's `leg`, as (t, cmd_vs)),
+    /// the handoff time, and every flap handle move (t, ratio), the
+    /// one-shot `flaps_handoff` as 0.
+    pub struct Recorded {
+        pub sortie: String,
+        pub manual: Vec<(f64, f64, f64)>,
+        pub engage: (f64, f64, f64, f64),
+        pub commands: Vec<(f64, f64)>,
+        pub handoff_t: f64,
+        pub flaps: Vec<(f64, f64)>,
+    }
+
+    pub fn load() -> Vec<Recorded> {
+        let recs: Vec<serde_json::Value> = LEMG13
+            .lines()
+            .filter_map(|l| serde_json::from_str(l).ok())
+            .collect();
+        let mut sorties: Vec<String> = recs
+            .iter()
+            .filter_map(|r| r["sortie"].as_str().map(str::to_string))
+            .collect();
+        sorties.dedup();
+        let f = |r: &serde_json::Value, k: &str| r[k].as_f64().unwrap_or(f64::NAN);
+        sorties
+            .into_iter()
+            .map(|sortie| {
+                let mine: Vec<&serde_json::Value> = recs
+                    .iter()
+                    .filter(|r| r["sortie"] == sortie.as_str())
+                    .collect();
+                let ev =
+                    |r: &serde_json::Value, k: &str, e: &str| r["kind"] == k && r["event"] == e;
+                let manual = mine
+                    .iter()
+                    .filter(|r| ev(r, "autotakeoff", "climb_manual"))
+                    .map(|r| (f(r, "t"), f(r, "agl"), f(r, "ias")))
+                    .collect();
+                let e = mine
+                    .iter()
+                    .find(|r| ev(r, "autotakeoff", "ap_engaged"))
+                    .expect("an engage");
+                let commands = mine
+                    .iter()
+                    .filter(|r| ev(r, "autotakeoff", "climb") || ev(r, "circuit", "leg"))
+                    .map(|r| (f(r, "t"), f(r, "cmd_vs")))
+                    .collect();
+                let handoff_t = mine
+                    .iter()
+                    .find(|r| ev(r, "autotakeoff", "handoff"))
+                    .map(|r| f(r, "t"))
+                    .expect("a handoff");
+                let flaps = mine
+                    .iter()
+                    .filter_map(|r| {
+                        if ev(r, "autotakeoff", "flap_step") {
+                            Some((f(r, "t"), f(r, "to")))
+                        } else if ev(r, "autotakeoff", "flaps_handoff") && r["up"] == true {
+                            Some((f(r, "t"), 0.0))
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+                Recorded {
+                    sortie,
+                    manual,
+                    engage: (f(e, "t"), f(e, "agl"), f(e, "ias"), f(e, "cmd_vs")),
+                    commands,
+                    handoff_t,
+                    flaps,
+                }
+            })
+            .collect()
+    }
+
+    /// The climb the pitch was flying as the autopilot took it: the slope
+    /// of the last second of hand-flown heights, fpm (over the runway the
+    /// height above it is the altitude less a constant).
+    pub fn flown_fpm(manual: &[(f64, f64, f64)]) -> f64 {
+        let t_end = manual.last().expect("hand-flown ticks").0;
+        let last: Vec<&(f64, f64, f64)> = manual.iter().filter(|m| m.0 >= t_end - 1.0).collect();
+        let n = last.len() as f64;
+        let (mt, mh) = (
+            last.iter().map(|m| m.0).sum::<f64>() / n,
+            last.iter().map(|m| m.1).sum::<f64>() / n,
+        );
+        let num: f64 = last.iter().map(|m| (m.0 - mt) * (m.1 - mh)).sum();
+        let den: f64 = last.iter().map(|m| (m.0 - mt).powi(2)).sum();
+        num / den * 60.0
+    }
+
+    /// The 737's VS mode as EGPH 24 drew it (2026-09-21): 2 s of dead time,
+    /// then two 1.5 s lags. The LEMG 13 engages agree: the dial read 1,500
+    /// and the aircraft held 2,150 to 2,250 for the four seconds to 500 ft.
+    pub struct VsMode {
+        delay: std::collections::VecDeque<f64>,
+        vs1: f64,
+        pub vs: f64,
+    }
+
+    impl VsMode {
+        pub fn new(vs: f64, dt: f64) -> Self {
+            let n = (2.0 / dt).round() as usize;
+            VsMode {
+                delay: std::collections::VecDeque::from(vec![vs; n]),
+                vs1: vs,
+                vs,
+            }
+        }
+        pub fn step(&mut self, cmd: f64, dt: f64) -> f64 {
+            self.delay.push_back(cmd);
+            let seen = self.delay.pop_front().unwrap_or(cmd);
+            self.vs1 += (seen - self.vs1) * dt / 1.5;
+            self.vs += (self.vs1 - self.vs) * dt / 1.5;
+            self.vs
+        }
+    }
+
+    /// Knots a second at `ias` climbing `vs_fpm` with a thrust-to-weight
+    /// excess `tw` (#78's fit to LEMG 13: 0.185).
+    pub fn accel_kts_s(tw: f64, ias: f64, vs_fpm: f64) -> f64 {
+        let sin_gamma = (vs_fpm / (ias * 101.27)).clamp(-1.0, 1.0);
+        (tw - sin_gamma) * 9.81 / 0.514_444
+    }
+
+    /// The climb the #78 pitch hold flies at V2 + 15 on that fit: every bit of
+    /// the excess into the path, about 3,090 fpm at 165 kt.
+    pub fn held_climb_fpm(tw: f64, ias: f64) -> f64 {
+        ias * 101.27 * tw
+    }
 }
 
 #[cfg(test)]
@@ -5549,6 +5919,166 @@ mod tests {
             };
             assert_eq!(ClimbOut::from_profile(&p).is_some(), want, "{id}");
         }
+    }
+
+    /// #150, replayed: on both recorded LEMG 13 circuits the pitch was
+    /// climbing 2,300 to 2,500 fpm through 300 ft and the engage wrote 1,500.
+    /// The engage now writes the climb flown, a slew step from it at most,
+    /// whether the law it walks to is the circuit's or a jet's speed hold.
+    #[test]
+    fn the_engage_takes_the_climb_the_pitch_was_flying() {
+        let recorded = climb_out_bench::load();
+        assert_eq!(recorded.len(), 2);
+        let jet = Some(ClimbOut {
+            accel_agl_ft: 1000.0,
+            max_fpm: 3000.0,
+        });
+        let vne = climb_guard_vne(Some(340.0));
+        let dt = 0.4;
+        for r in &recorded {
+            let flown = climb_out_bench::flown_fpm(&r.manual);
+            let (_, agl, ias, cmd) = r.engage;
+            assert!(
+                flown - cmd > 700.0,
+                "{}: flown {flown:.0}, the engage wrote {cmd:.0}",
+                r.sortie
+            );
+            // The circuit's takeoff (no climb-out below 500 ft): the law is
+            // the old rate, the command starts at the climb flown.
+            let (law, first) =
+                ClimbVs::default().step(ias, 170.0, 1500.0, vne, agl, None, Some(flown), dt);
+            assert_eq!(law, 1500.0, "{}", r.sortie);
+            assert!(
+                (first - flown).abs() <= CLIMB_VS_SLEW_FPM_S * dt + 1e-6,
+                "{}: flown {flown:.0}, first {first:.0}",
+                r.sortie
+            );
+            // A departure's speed hold starts where the pitch is.
+            let (law, first) =
+                ClimbVs::default().step(ias, 170.0, 1500.0, vne, agl, jet, Some(flown), dt);
+            assert!((law - flown).abs() < 1.0, "{}: law {law:.0}", r.sortie);
+            assert!((first - flown).abs() < 1.0, "{}", r.sortie);
+            // A failed read is no measurement: the law, as it always was.
+            let (law, first) =
+                ClimbVs::default().step(ias, 170.0, 1500.0, vne, agl, None, None, dt);
+            assert_eq!((law, first), (1500.0, 1500.0));
+        }
+    }
+
+    /// #150 with #78: the pitch holds V2 + 15 to 300 ft (165 kt, all the
+    /// excess in the path: about 3,090 fpm on #78's LEMG 13 fit). Engaged on
+    /// the old proportional law the dial read 1,200 (five knots slow) and the
+    /// 737 ran to the acceleration height well past V2 + 20; the speed hold
+    /// seeded at the climb flown keeps the band through the 737's VS mode
+    /// (2 s dead, two 1.5 s lags), then lowers the nose at the height at a
+    /// crew's pace.
+    #[test]
+    fn a_jet_takes_the_held_climb_and_keeps_its_speed_to_the_height() {
+        let (tw, dt) = (0.185, 0.4);
+        let c = Some(ClimbOut {
+            accel_agl_ft: 1000.0,
+            max_fpm: 3000.0,
+        });
+        let vne = climb_guard_vne(Some(340.0));
+        let fly = |new: bool| {
+            let (mut agl, mut ias) = (300.0_f64, 165.0_f64);
+            let flown = climb_out_bench::held_climb_fpm(tw, ias);
+            let mut ap = climb_out_bench::VsMode::new(flown, dt);
+            let mut law = ClimbVs::default();
+            let (mut prev, mut max_step) = (flown, 0.0_f64);
+            let (mut lo, mut hi, mut at_height) = (ias, ias, None);
+            let mut reversals = (0usize, 0.0_f64);
+            while agl < 1300.0 {
+                let cmd = if new {
+                    law.step(ias, 170.0, 1500.0, vne, agl, c, Some(ap.vs), dt).1
+                } else {
+                    climb_out_vs_fpm(ias, 170.0, 1500.0, vne, agl, c)
+                };
+                let step = cmd - prev;
+                max_step = max_step.max(step.abs());
+                if agl < 1000.0 && step.abs() > 20.0 {
+                    if step.signum() == -reversals.1 {
+                        reversals.0 += 1;
+                    }
+                    reversals.1 = step.signum();
+                }
+                prev = cmd;
+                let vs = ap.step(cmd, dt);
+                ias += climb_out_bench::accel_kts_s(tw, ias, vs) * dt;
+                agl += vs / 60.0 * dt;
+                if agl < 1000.0 {
+                    lo = lo.min(ias);
+                    hi = hi.max(ias);
+                } else if at_height.is_none() {
+                    at_height = Some(ias);
+                }
+            }
+            (max_step, lo, hi, at_height.unwrap(), reversals.0)
+        };
+        let (old_step, _, old_hi, old_at, _) = fly(false);
+        assert!(old_step > 1500.0, "the old engage pushes: {old_step:.0}");
+        assert!(
+            old_hi > 185.0 && old_at > 185.0,
+            "the old law runs away: {old_hi:.1}"
+        );
+        let (step, lo, hi, at, reversals) = fly(true);
+        assert!(
+            step <= CLIMB_VS_SLEW_FPM_S * dt + 1e-6,
+            "the command stepped {step:.0} fpm in a tick"
+        );
+        assert!(
+            lo >= 160.0 && hi <= 180.0,
+            "{lo:.1} to {hi:.1} below the height"
+        );
+        assert!((160.0..=180.0).contains(&at), "at the height {at:.1}");
+        assert!(reversals <= 1, "the speed hold hunted: {reversals}");
+    }
+
+    /// #150: the circuit takes the aircraft at 500 ft and walks the schedule
+    /// itself; a departure (or a clean airframe, or one with no schedule)
+    /// still cleans up at the handoff as it always did. The window leaves V2
+    /// for the flaps-up speed a crew bugs, only where the takeoff set V2.
+    #[tokio::test]
+    async fn the_circuit_takes_the_flaps_and_the_window_leaves_v2() {
+        assert!(leaves_flaps_to_caller(false, true, true));
+        assert!(!leaves_flaps_to_caller(true, true, true), "clean already");
+        assert!(
+            !leaves_flaps_to_caller(false, false, true),
+            "a departure cleans up"
+        );
+        assert!(
+            !leaves_flaps_to_caller(false, true, false),
+            "no schedule to walk"
+        );
+
+        let b738 = crate::aircraft::load("boeing_737_800").expect("737 profile loads");
+        let sched = crate::aircraft::flap_schedule(b738.flaps.as_ref());
+        assert_eq!(
+            clean_up_speed_kts(&sched, 210.0),
+            210.0,
+            "the 737's flaps-up speed"
+        );
+        assert_eq!(
+            clean_up_speed_kts(&[], 74.0),
+            74.0,
+            "no schedule: the climb speed"
+        );
+        assert!(
+            b738.takeoff_config
+                .as_ref()
+                .and_then(|t| t.v2_kts)
+                .is_some(),
+            "the 737's takeoff sets V2, so its window is ours to move"
+        );
+
+        use crate::xplane::FakeXPlane;
+        const WINDOW: &str = crate::aircraft::TakeoffConfigProfile::SPEED_WINDOW;
+        let xp = FakeXPlane::with_reads(&[(WINDOW, 150.0)]);
+        // The fake never takes a write: written, and read back as not taken.
+        assert!(!speed_window_after_acceleration(&xp, 210.0).await);
+        assert_eq!(xp.last_write(WINDOW), Some(210.0));
+        xp.set_read(WINDOW, 210.0);
+        assert!(speed_window_after_acceleration(&xp, 210.0).await);
     }
 
     #[test]

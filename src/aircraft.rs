@@ -3360,6 +3360,7 @@ mod tests {
             ("autotakeoff", "ROLL_ALIGN_KTS", "walking-pace pivot at a crooked roll start; only brake_steer airframes"),
             ("autotakeoff", "CLIMB_ACCEL_MAX_KTS_S", "the climb hold's asked-for trend: a speed ERROR closed, and only on airframes declaring climb_pitch_max_deg"),
             ("autotakeoff", "CLIMB_PITCH_DOWN_DEG_S", "the climb hold's target walk down, a law rate below the rotation's own 2.5 deg/s; declared airframes only"),
+            ("autotakeoff", "CLIMB_HOLD_FLOOR_FPM", "the positive floor climb_vs_fpm already keeps (airborne, it climbs); only airframes declaring a climb-out"),
             ("speedhold", "IDLE_FAST_KTS", "margin over the pilot's own target, not an airframe speed"),
             // --- Properties of the SIM or the SENSORS, not the airframe ---
             (

@@ -248,6 +248,9 @@ impl Tool for Circuit {
                     handoff_agl_ft: 500.0,
                     // The CIRCUIT takes it at the handoff, not the pilot.
                     handoff_to_caller: true,
+                    // ...and walks the flap schedule from there
+                    // (`circuit::run`), never the takeoff's one shot at 500 ft.
+                    flaps_to_caller: true,
                     handoff_speed_kts: None,
                     base_url: ctx.config.xplane_base_url.clone(),
                     park_brake_valve_set: self.park_brake_valve_set,
