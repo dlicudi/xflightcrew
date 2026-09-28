@@ -366,6 +366,7 @@ impl Station {
         *GHOSTS.lock().unwrap_or_else(|e| e.into_inner()) = None;
         *WAKE.lock().unwrap_or_else(|e| e.into_inner()) = None;
         *WAKE_PREV.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        *DEPARTURE_STREAM.lock().unwrap_or_else(|e| e.into_inner()) = None;
         *TAXI_ROUTE.lock().unwrap_or_else(|e| e.into_inner()) = None;
         // The previous field's worksheets die with it: a region handoff calls
         // install() WITHOUT uninstall(), and anything left armed here keeps
@@ -423,6 +424,7 @@ impl Station {
         *GHOSTS.lock().unwrap_or_else(|e| e.into_inner()) = None;
         *WAKE.lock().unwrap_or_else(|e| e.into_inner()) = None;
         *WAKE_PREV.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        *DEPARTURE_STREAM.lock().unwrap_or_else(|e| e.into_inner()) = None;
         *GO_AROUND_LAST.lock().unwrap_or_else(|e| e.into_inner()) = None;
         // The party line: no clearance, no route, no vectors, no pending
         // anything — a re-enable starts from a cold contact, like a fresh
@@ -1690,7 +1692,7 @@ impl Station {
     /// (≥ 5 kt): in calm the into-wind pick flip-flops on noise, and a
     /// controller doesn't swap the runway between two transmissions.
     fn pick_runway(&mut self, wind_from: f64, wind_kts: f64) -> String {
-        self.pick_runway_with(wind_from, wind_kts, None)
+        self.pick_runway_with(wind_from, wind_kts, None, None)
     }
 
     /// [`pick_runway`] with the live arrival stream: in calm wind, with no
@@ -1698,23 +1700,48 @@ impl Station {
     /// in use. LXGB at 07001KT: the tower picked 27 while LiveTraffic was
     /// landing 09 (the real field's runway), and cleared a departure into
     /// the reciprocal stream (2026-09-15).
+    ///
+    /// `departure_end` is the live DEPARTURE stream ([`departure_end`]): with
+    /// no arrival stream it is the runway in use in calm the same way, and a
+    /// stated runway on its reciprocal is refused. ONE STRIP, ONE DIRECTION:
+    /// in calm an uncommitted runway in use that points against the live
+    /// stream is turned round to it. LEMG (sortie 1790584715-full_auto,
+    /// 2026-09-28): 31 stood in use from an earlier into-wind pick, the
+    /// replay departed 13 off the same pavement and landed 12, and the
+    /// tower cleared our circuit to land 31 while Vueling and Easy rolled
+    /// head-on toward it.
     fn pick_runway_with(
         &mut self,
         wind_from: f64,
         wind_kts: f64,
         arrival_end: Option<&str>,
+        departure_end: Option<&str>,
     ) -> String {
+        // The stream the field is working: arrivals first (where the traffic
+        // is landing is what the field IS), else the last departures.
+        let stream_end = arrival_end
+            .filter(|e| strip(&self.apt.runways, e).is_some())
+            .or(departure_end.filter(|e| strip(&self.apt.runways, e).is_some()));
         // A RUNWAY START IS GIVEN THE RUNWAY IT IS LINED UP ON when the wind
         // does not argue: an arrival stream on another end sequences around
         // a departure already on its runway, it does not send it off to taxi.
         // LEMG (sortie 1790584715-full_auto, 2026-09-28): the 737 set up on
         // 13's threshold in 342 at 3 kt was cleared off 31 and taxied 400 s
         // round the field to line up there.
+        // ...but never INTO the live traffic: a start whose end points against
+        // the arrival or departure stream (13 departures, a start on 31) is
+        // the head-on of issue #140, refused and left to the stream below.
         if std::mem::take(&mut self.stated_on_strip) && !self.runway_committed() {
             if let Some(ident) = self.stated_ident() {
+                let into_stream = [arrival_end, departure_end]
+                    .into_iter()
+                    .flatten()
+                    .any(|end| ends_oppose(&self.apt.runways, end, &ident));
                 let hw = nav::headwind_for(&self.apt.runways, &ident, wind_from, wind_kts);
                 let best = nav::best_runway_for_wind(&self.apt.runways, wind_from, wind_kts);
-                if stated_runway_stands(&self.apt.runways, &ident, hw, best, wind_from, wind_kts) {
+                if !into_stream
+                    && stated_runway_stands(&self.apt.runways, &ident, hw, best, wind_from, wind_kts)
+                {
                     self.stated_runway = None;
                     self.runway_in_use = Some(ident.clone());
                     return ident;
@@ -1722,11 +1749,9 @@ impl Station {
             }
         }
         if wind_kts < CALM_WIND_KTS && self.runway_in_use.is_none() {
-            if let Some(end) = arrival_end {
-                if strip(&self.apt.runways, end).is_some() {
-                    self.runway_in_use = Some(end.to_string());
-                    return end.to_string();
-                }
+            if let Some(end) = stream_end {
+                self.runway_in_use = Some(end.to_string());
+                return end.to_string();
             }
         }
         // A departure being SEQUENCED owns its runway. Once a taxi clearance
@@ -1769,7 +1794,11 @@ impl Station {
                 .flat_map(|r| [r.ident_a.clone(), r.ident_b.clone()])
                 .find(|id| tower::runway_matches(id, &stated));
             if let Some(ident) = ident {
-                let stream_elsewhere = arrival_end.is_some_and(|end| end != ident);
+                // The departures' reciprocal is refused too: landing into
+                // them is the head-on the stream rule exists to prevent.
+                let stream_elsewhere = arrival_end.is_some_and(|end| end != ident)
+                    || departure_end
+                        .is_some_and(|end| ends_oppose(&self.apt.runways, end, &ident));
                 let hw = nav::headwind_for(&self.apt.runways, &ident, wind_from, wind_kts);
                 let best = nav::best_runway_for_wind(&self.apt.runways, wind_from, wind_kts);
                 let wind_indifferent = stated_runway_stands(
@@ -1792,12 +1821,31 @@ impl Station {
                 sim::blackbox::record(
                     "atc",
                     serde_json::json!({"event": "stated_runway_refused", "stated": ident,
-                        "stream_end": arrival_end, "headwind_kts": hw,
+                        "stream_end": arrival_end, "departure_end": departure_end,
+                        "headwind_kts": hw,
                         "best": best.as_ref().map(|b| b.0.clone()),
                         "best_headwind_kts": best.as_ref().map(|b| b.2),
                         "wind_from": wind_from, "wind_kts": wind_kts,
                         "wind_indifferent": wind_indifferent}),
                 );
+            }
+        }
+        // One strip, one direction: in calm the stream's direction is the
+        // runway in use. A pick that points against it (the reciprocal, or a
+        // near-parallel's opposite end) turns round to the stream's end; the
+        // wind below never moves a calm pick, so nothing else would.
+        if wind_kts < CALM_WIND_KTS {
+            if let (Some(cur), Some(end)) = (self.runway_in_use.clone(), stream_end) {
+                if ends_oppose(&self.apt.runways, &cur, end) {
+                    tracing::info!(from = %cur, to = %end, "runway in use turned to the live stream");
+                    sim::blackbox::record(
+                        "atc",
+                        serde_json::json!({"event": "runway_follows_stream", "from": cur,
+                            "to": end, "arrival_end": arrival_end,
+                            "departure_end": departure_end, "wind_kts": wind_kts}),
+                    );
+                    self.runway_in_use = Some(end.to_string());
+                }
             }
         }
         if wind_kts >= CALM_WIND_KTS || self.runway_in_use.is_none() {
@@ -1894,8 +1942,13 @@ impl Station {
                 self.note_caller_on_strip(on_ground, lat, lon);
             }
         }
-        let ident =
-            self.pick_runway_with(wx.wind_from_deg, wx.wind_kts, arrival_end.as_deref());
+        let departure_end = departure_end(Instant::now());
+        let ident = self.pick_runway_with(
+            wx.wind_from_deg,
+            wx.wind_kts,
+            arrival_end.as_deref(),
+            departure_end.as_deref(),
+        );
         let (final_traffic, runway_occupied) = match strip(&self.apt.runways, &ident) {
             Some(r) => {
                 let r = r.clone();
@@ -4025,6 +4078,26 @@ fn strip<'a>(runways: &'a [nav::Runway], ident: &str) -> Option<&'a nav::Runway>
         .find(|r| r.ident_a == ident || r.ident_b == ident)
 }
 
+/// The heading of one runway END, from its strip's geometry.
+fn end_heading(runways: &[nav::Runway], ident: &str) -> Option<f64> {
+    let r = strip(runways, ident)?;
+    Some(if r.ident_a == ident {
+        r.heading_a_deg()
+    } else {
+        r.heading_b_deg()
+    })
+}
+
+/// Two runway ends point against each other: the reciprocal of one strip,
+/// or a near-parallel's opposite end (LEMG 31 against 12). More than 120
+/// degrees apart; a crossing strip is not opposed. Unknown ends never are.
+fn ends_oppose(runways: &[nav::Runway], a: &str, b: &str) -> bool {
+    match (end_heading(runways, a), end_heading(runways, b)) {
+        (Some(ha), Some(hb)) => angle_diff_deg(ha, hb).abs() > 120.0,
+        _ => false,
+    }
+}
+
 /// The arrivals in one strip's final corridor: nearest distance, its spoken
 /// callsign (names the condition of a conditional line-up), and how many are
 /// in the stream (a conditional is only legal against exactly one).
@@ -4707,6 +4780,37 @@ pub fn player_blocked_strip(on_ground: bool, lat: f64, lon: f64) -> Option<Strin
     })
 }
 
+/// What OUR clearance claims of a strip, for the party line, on the ground
+/// or in the air: `(end, whole)`. Cleared to land and not yet reported off,
+/// the WHOLE strip is ours (nobody else is cleared onto it, either end);
+/// sequenced for it in any other way (taxi, line-up, takeoff, the circuit's
+/// Inbound, a go-around's), its DIRECTION is (nobody is cleared off or onto
+/// its reciprocal). `None` without a clearance or a runway.
+fn own_strip_claim() -> Option<(String, bool)> {
+    let clr = CLEARANCE.lock().unwrap_or_else(|e| e.into_inner());
+    let c = clr.as_ref().filter(|c| !c.runway_ident.is_empty())?;
+    match c.state {
+        tower::State::ClearedToLand if c.holds_runway => Some((c.runway_ident.clone(), true)),
+        tower::State::TaxiCleared
+        | tower::State::LinedUp
+        | tower::State::TakeoffCleared
+        | tower::State::Inbound => Some((c.runway_ident.clone(), false)),
+        _ => None,
+    }
+}
+
+/// Whether a ghost's movement on `ghost_end` conflicts with our claim: the
+/// same strip, and either the whole strip is ours or the ghost uses the
+/// other direction. One strip, one direction (LEMG 2026-09-28).
+fn conflicts_with_claim(ghost_end: &str, claim: &(String, bool)) -> bool {
+    let runways = ACTIVE_RUNWAYS.lock().unwrap_or_else(|e| e.into_inner());
+    let same = matches!(
+        (strip(&runways, ghost_end), strip(&runways, &claim.0)),
+        (Some(x), Some(y)) if std::ptr::eq(x, y)
+    );
+    same && (claim.1 || ghost_end != claim.0)
+}
+
 /// One pass of the party line: narrate at most ONE exchange for the ghost
 /// traffic — an arrival's final call answered with the landing clearance
 /// while the ghost is still descending (spoken BEFORE reality lands it), a
@@ -4729,6 +4833,8 @@ pub fn chatter_tick(
     if out_of_reach() {
         return None;
     }
+    // Read before the ghost memory's lock: our own clearance's claim.
+    let claim = own_strip_claim();
     let mut guard = GHOSTS.lock().unwrap_or_else(|e| e.into_inner());
     let mem = guard.get_or_insert_with(std::collections::HashMap::new);
     mem.retain(|_, m| now.duration_since(m.last_seen).as_secs() < 180);
@@ -4804,6 +4910,27 @@ pub fn chatter_tick(
                 m.prev_lon = t.lon;
                 continue;
             }
+            // Our clearance claims this strip (cleared to land on it, or
+            // sequenced the other way): the tower narrates no clearance it
+            // could not have given. Silent, not "continue": the ghost may
+            // be the one flying against us, and the truth about it is the
+            // go-around watch's, not flavour. The clearance may still come
+            // once the claim is gone and the ghost is re-seen in the band.
+            if let (Some(a), Some(c)) = (&aim, &claim) {
+                if conflicts_with_claim(a, c) {
+                    sim::blackbox::record(
+                        "atc",
+                        serde_json::json!({"event": "party_line_withheld", "ghost": t.callsign,
+                            "call": "landing", "runway": a, "ours": c.0, "whole": c.1}),
+                    );
+                    m.last_seen = now;
+                    m.prev_ele_ft = t.ele_ft;
+                    m.prev_ground = t.on_ground;
+                    m.prev_lat = t.lat;
+                    m.prev_lon = t.lon;
+                    continue;
+                }
+            }
             m.announced_landing = true;
             let rwy = aim.as_deref().map(atis::spoken_runway);
             let lines = match &rwy {
@@ -4859,7 +4986,25 @@ pub fn chatter_tick(
                 }
                 _ => false,
             };
-            if held {
+            // In the air too, and by direction: nobody is cleared off the
+            // strip we are cleared to land on, nor off its reciprocal while
+            // we are sequenced for it (LEMG, sortie 1790584715-full_auto:
+            // "Vueling eight one seven six, runway one three, cleared for
+            // takeoff" with our circuit on downwind for 31, "Easy two seven
+            // one six" after our go-around from the 31 final).
+            let claimed = match (&ident, &claim) {
+                (Some(a), Some(c)) => conflicts_with_claim(a, c),
+                _ => false,
+            };
+            if claimed {
+                sim::blackbox::record(
+                    "atc",
+                    serde_json::json!({"event": "party_line_withheld", "ghost": t.callsign,
+                        "call": "takeoff", "runway": ident, "ours": claim.as_ref().map(|c| c.0.clone()),
+                        "whole": claim.as_ref().map(|c| c.1)}),
+                );
+            }
+            if held || claimed {
                 m.last_seen = now;
                 m.prev_ele_ft = t.ele_ft;
                 m.prev_ground = t.on_ground;
@@ -5285,8 +5430,38 @@ pub const WAKE_SECS: u64 = 120;
 
 /// Ground/air memory per ghost for liftoff detection, independent of the
 /// party line (which is config-gated and must not be a safety dependency).
-static WAKE_PREV: Mutex<Option<std::collections::HashMap<String, (bool, Instant)>>> =
+static WAKE_PREV: Mutex<Option<std::collections::HashMap<String, WakePrev>>> =
     Mutex::new(None);
+
+/// One ghost's last sample for the liftoff watch: on the ground, when seen,
+/// and where (the roll direction names the END it departed).
+#[derive(Clone, Copy)]
+struct WakePrev {
+    on_ground: bool,
+    seen: Instant,
+    lat: f64,
+    lon: f64,
+}
+
+/// The live DEPARTURE stream: the runway end the last ghost lifted off, by
+/// its roll direction, and when. The arrival stream is a snapshot
+/// ([`arrival_end`]); a departure is an event, so it is remembered here, for
+/// [`DEPARTURE_STREAM_SECS`], by the same watch that starts the wake clock.
+static DEPARTURE_STREAM: Mutex<Option<(String, Instant)>> = Mutex::new(None);
+
+/// How long a ghost's liftoff still says which way the field departs.
+pub const DEPARTURE_STREAM_SECS: u64 = 600;
+
+/// The end the field is departing from right now: the last ghost liftoff
+/// within [`DEPARTURE_STREAM_SECS`], else `None`.
+pub fn departure_end(now: Instant) -> Option<String> {
+    DEPARTURE_STREAM
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .filter(|(_, at)| now.saturating_duration_since(*at).as_secs() < DEPARTURE_STREAM_SECS)
+        .map(|(end, _)| end.clone())
+}
 
 /// Does this flight id carry an airline prefix (ICAO 3-letter or IATA
 /// 2-letter + digit)? The wake heuristic's "medium or heavier".
@@ -5314,14 +5489,29 @@ pub fn wake_note_targets(targets: &[TcasTarget], now: Instant) {
     };
     let mut guard = WAKE_PREV.lock().unwrap_or_else(|e| e.into_inner());
     let mem = guard.get_or_insert_with(std::collections::HashMap::new);
-    mem.retain(|_, (_, seen)| now.duration_since(*seen).as_secs() < 300);
+    mem.retain(|_, p| now.duration_since(p.seen).as_secs() < 300);
     for t in targets {
         if crate::nav::haversine_nm(t.lat, t.lon, flat, flon) > 3.0 {
             continue;
         }
-        let e = mem.entry(t.callsign.clone()).or_insert((t.on_ground, now));
-        let was_ground = e.0;
-        *e = (t.on_ground, now);
+        let here = WakePrev {
+            on_ground: t.on_ground,
+            seen: now,
+            lat: t.lat,
+            lon: t.lon,
+        };
+        let prev = *mem.entry(t.callsign.clone()).or_insert(here);
+        mem.insert(t.callsign.clone(), here);
+        let was_ground = prev.on_ground;
+        // Any liftoff says which way the field departs, airline or not: the
+        // end by the roll direction, as the party line names it.
+        if was_ground && !t.on_ground {
+            if let Some(end) = departure_runway_ident(t.lat, t.lon, prev.lat, prev.lon) {
+                let end = main_runway_of(&end);
+                tracing::info!(ghost = %t.callsign, runway = %end, "departure stream");
+                *DEPARTURE_STREAM.lock().unwrap_or_else(|e| e.into_inner()) = Some((end, now));
+            }
+        }
         if was_ground && !t.on_ground && is_airline(&t.callsign) {
             if let Some(ident) = nearest_runway_ident(t.lat, t.lon) {
                 tracing::info!(ghost = %t.callsign, runway = %ident, "wake clock started");
@@ -10280,15 +10470,20 @@ mod tests {
     fn calm_wind_follows_the_arrival_stream() {
         let path = lxgb_apt_file();
         let mut st = Station::load(path.to_str().unwrap(), "LXGB").expect("LXGB loads");
-        assert_eq!(st.pick_runway_with(70.0, 1.0, Some("09")), "09");
-        // Held now: the stream is somebody else's problem once we are sequenced.
-        assert_eq!(st.pick_runway_with(70.0, 1.0, Some("27")), "09");
+        assert_eq!(st.pick_runway_with(70.0, 1.0, Some("09"), None), "09");
+        // Held once we are sequenced: a taxi clearance owns its runway.
+        st.twr.state = tower::State::TaxiCleared;
+        assert_eq!(st.pick_runway_with(70.0, 1.0, Some("27"), None), "09");
+        // Uncommitted, a stream that turned round turns the calm pick with
+        // it: one strip, one direction (LEMG 2026-09-28, issue #140).
+        st.twr.state = tower::State::Parked;
+        assert_eq!(st.pick_runway_with(70.0, 1.0, Some("27"), None), "27");
         // A real wind is not overruled by traffic.
         let mut st = Station::load(path.to_str().unwrap(), "LXGB").expect("LXGB loads");
-        assert_eq!(st.pick_runway_with(250.0, 12.0, Some("09")), "27");
+        assert_eq!(st.pick_runway_with(250.0, 12.0, Some("09"), None), "27");
         // An end this field does not have is ignored.
         let mut st = Station::load(path.to_str().unwrap(), "LXGB").expect("LXGB loads");
-        assert_eq!(st.pick_runway_with(70.0, 1.0, Some("18")), st.pick_runway(70.0, 1.0));
+        assert_eq!(st.pick_runway_with(70.0, 1.0, Some("18"), None), st.pick_runway(70.0, 1.0));
     }
 
     #[test]
@@ -10413,6 +10608,230 @@ mod tests {
         }
     }
 
+    /// LEMG 12/30 and 13/31 from apt.dat.
+    fn lemg_runways() -> Vec<nav::Runway> {
+        vec![
+            nav::Runway {
+                width_m: 45.11,
+                surface: 1,
+                ident_a: "12".into(),
+                ident_b: "30".into(),
+                lat_a: 36.6910753,
+                lon_a: -4.5078270,
+                lat_b: 36.6795648,
+                lon_b: -4.4805125,
+            },
+            nav::Runway {
+                width_m: 45.11,
+                surface: 1,
+                ident_a: "13".into(),
+                ident_b: "31".into(),
+                lat_a: 36.6845573,
+                lon_a: -4.5126253,
+                lat_b: 36.6654027,
+                lon_b: -4.4858140,
+            },
+        ]
+    }
+
+    /// Issue #140, the recorded runway in use: LEMG (sortie
+    /// 1790584715-full_auto, 2026-09-28), wind calm. 31 stood in use from an
+    /// earlier into-wind pick while the replay landed 12 (Ryanair 8168,
+    /// t 1790585296.6) and departed 13 (Vueling 8176 t 1790585447.7, Easy
+    /// 2716 t 1790585551.4). A calm, uncommitted pick turns to the live
+    /// stream; a committed one holds; a stated runway into the departures is
+    /// refused; a real wind still wins.
+    #[test]
+    fn the_calm_runway_in_use_turns_to_the_live_stream() {
+        let _guard = SIDE_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        *CLEARANCE.lock().unwrap() = None;
+        let runways = lemg_runways();
+        assert!(ends_oppose(&runways, "31", "13"), "the reciprocal");
+        assert!(ends_oppose(&runways, "31", "12"), "the near-parallel's other end");
+        assert!(!ends_oppose(&runways, "13", "12"), "one direction");
+        let fresh = |in_use: &str| {
+            let mut st = lxgb();
+            st.apt.name = "Malaga".into();
+            st.apt.runways = runways.clone();
+            st.runway_in_use = Some(in_use.into());
+            st
+        };
+        // The departures alone turn 31 round to 13.
+        let mut st = fresh("31");
+        assert_eq!(st.pick_runway_with(350.0, 3.0, None, Some("13")), "13");
+        // The arrivals first: 12, the field's landing runway, same direction.
+        let mut st = fresh("31");
+        assert_eq!(st.pick_runway_with(350.0, 3.0, Some("12"), Some("13")), "12");
+        // A pick already with the stream is left alone (13 is not against 12).
+        let mut st = fresh("13");
+        assert_eq!(st.pick_runway_with(350.0, 3.0, Some("12"), Some("13")), "13");
+        // Committed: the circuit's Inbound and a taxi clearance hold 31.
+        for state in [tower::State::Inbound, tower::State::TaxiCleared] {
+            let mut st = fresh("31");
+            st.twr.state = state;
+            assert_eq!(st.pick_runway_with(350.0, 3.0, None, Some("13")), "31", "{state:?}");
+        }
+        // "Downwind runway three one" into the 13 departures, uncommitted:
+        // refused, the stream's end instead.
+        let mut st = fresh("31");
+        st.note_stated_runway("downwind runway three one", tower::Intent::ReportDownwind);
+        assert_eq!(st.pick_runway_with(350.0, 3.0, None, Some("13")), "13");
+        // With the departures on 31 it stands.
+        let mut st = fresh("13");
+        st.note_stated_runway("downwind runway three one", tower::Intent::ReportDownwind);
+        assert_eq!(st.pick_runway_with(350.0, 3.0, None, Some("31")), "31");
+        // A real wind is not overruled by the traffic (310 at 15: 31).
+        let mut st = fresh("31");
+        assert_eq!(st.pick_runway_with(310.0, 15.0, None, Some("13")), "31");
+        // No stream known: a calm pick stands as before.
+        let mut st = fresh("31");
+        assert_eq!(st.pick_runway_with(350.0, 3.0, None, None), "31");
+    }
+
+    /// Issue #140: the departure stream is the END a ghost rolled from, by
+    /// its roll direction, remembered for DEPARTURE_STREAM_SECS by the wake
+    /// watch (which runs whether or not the party line is on).
+    #[test]
+    fn a_ghost_liftoff_names_the_departure_stream() {
+        let _guard = SIDE_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let runways = lemg_runways();
+        let (a, b) = ((runways[1].lat_a, runways[1].lon_a), (runways[1].lat_b, runways[1].lon_b));
+        let along = |f: f64| (a.0 + (b.0 - a.0) * f, a.1 + (b.1 - a.1) * f);
+        *ACTIVE_RUNWAYS.lock().unwrap() = runways.clone();
+        let field = along(0.5);
+        *ACTIVE_FIELD.lock().unwrap() = Some(("Malaga".into(), field.0, field.1));
+        *WAKE.lock().unwrap() = None;
+        *WAKE_PREV.lock().unwrap() = None;
+        *DEPARTURE_STREAM.lock().unwrap() = None;
+        let t0 = Instant::now();
+        let sec = std::time::Duration::from_secs;
+        let at = |f: f64, ground: bool| {
+            let (lat, lon) = along(f);
+            TcasTarget {
+                callsign: "VLG8176".into(),
+                lat,
+                lon,
+                ele_ft: if ground { 52.0 } else { 160.0 },
+                on_ground: ground,
+                vs_fpm: if ground { 0.0 } else { 1500.0 },
+            }
+        };
+        wake_note_targets(&[at(0.70, true)], t0);
+        assert!(departure_end(t0).is_none(), "rolling: no stream yet");
+        wake_note_targets(&[at(0.78, false)], t0 + sec(3));
+        // Lifted off past midfield, nearer the 31 threshold: rolled on 13.
+        assert_eq!(departure_end(t0 + sec(4)).as_deref(), Some("13"));
+        assert!(departure_end(t0 + sec(3 + DEPARTURE_STREAM_SECS)).is_none(), "stale");
+
+        *WAKE.lock().unwrap() = None;
+        *WAKE_PREV.lock().unwrap() = None;
+        *DEPARTURE_STREAM.lock().unwrap() = None;
+        *ACTIVE_FIELD.lock().unwrap() = None;
+        *ACTIVE_RUNWAYS.lock().unwrap() = Vec::new();
+    }
+
+    /// Issue #140, the recorded party line: LEMG (sortie
+    /// 1790584715-full_auto). Our circuit on downwind for 31 (Inbound) heard
+    /// "Vueling eight one seven six, runway one three, cleared for takeoff"
+    /// (t 1790585447.7); cleared to land 31 (t 1790585501.7), the tower
+    /// ordered the go-around for traffic on the runway (t 1790585525.5) and
+    /// then narrated "Easy two seven one six, runway one three, cleared for
+    /// takeoff" (t 1790585551.4). One strip, one direction: nobody is
+    /// cleared onto or off the reciprocal of our runway, and nobody onto
+    /// either end of the strip we are cleared to land on. The other strip's
+    /// traffic and our own direction's are still narrated.
+    #[test]
+    fn the_party_line_clears_nobody_against_our_runway() {
+        let _guard = SIDE_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let runways = lemg_runways();
+        *ACTIVE_RUNWAYS.lock().unwrap() = runways.clone();
+        *GHOSTS.lock().unwrap() = None;
+        let lerp = |p: (f64, f64), q: (f64, f64), f: f64| {
+            (p.0 + (q.0 - p.0) * f, p.1 + (q.1 - p.1) * f)
+        };
+        let (t13, t31) = ((runways[1].lat_a, runways[1].lon_a), (runways[1].lat_b, runways[1].lon_b));
+        let (t12, t30) = ((runways[0].lat_a, runways[0].lon_a), (runways[0].lat_b, runways[0].lon_b));
+        let field = lerp(t13, t31, 0.5);
+        let felev = 52.0;
+        let t0 = Instant::now();
+        let sec = std::time::Duration::from_secs;
+        let set_clearance = |state: tower::State, holds: bool| {
+            *CLEARANCE.lock().unwrap() = Some(ClearanceSnap {
+                state,
+                callsign: "November eight one six November November".into(),
+                runway_ident: "31".into(),
+                pending_readback: None,
+                holds_runway: holds,
+            });
+        };
+        let ghost = |cs: &str, pos: (f64, f64), ele: f64, ground: bool, vs: f64| TcasTarget {
+            callsign: cs.into(),
+            lat: pos.0,
+            lon: pos.1,
+            ele_ft: ele,
+            on_ground: ground,
+            vs_fpm: vs,
+        };
+        // Airborne: the ground-only blocked strip is None, as in the sortie.
+        let tick = |t: TcasTarget, at: Instant| {
+            chatter_tick(&[t], "Malaga", field.0, field.1, felev, None, at)
+        };
+        // A departure: rolling at 70 % of the strip, airborne at 78 %.
+        let depart = |cs: &str, from: (f64, f64), to: (f64, f64), at: Instant| {
+            assert!(tick(ghost(cs, lerp(from, to, 0.70), felev, true, 0.0), at).is_none());
+            tick(ghost(cs, lerp(from, to, 0.78), felev + 120.0, false, 1500.0), at + sec(3))
+        };
+
+        // Downwind for 31 (Inbound): Vueling off 13 is not cleared.
+        set_clearance(tower::State::Inbound, false);
+        assert!(
+            depart("VLG8176", t13, t31, t0).is_none(),
+            "no takeoff narrated off the reciprocal of our runway"
+        );
+        // Cleared to land 31: Easy off 13 is not cleared either.
+        set_clearance(tower::State::ClearedToLand, true);
+        assert!(depart("EZY2716", t13, t31, t0 + sec(10)).is_none());
+        // After the go-around order (the FSM back to Inbound): still not.
+        set_clearance(tower::State::Inbound, false);
+        assert!(depart("EZS2716", t13, t31, t0 + sec(20)).is_none());
+        // Cleared to land 31, a departure off 31 ahead of us: the whole
+        // strip is ours, not narrated.
+        set_clearance(tower::State::ClearedToLand, true);
+        assert!(depart("IBE3001", t31, t13, t0 + sec(30)).is_none());
+        // Inbound for 31, a departure off 31: our direction, narrated.
+        set_clearance(tower::State::Inbound, false);
+        let ex = depart("IBE3002", t31, t13, t0 + sec(40)).expect("our direction is narrated");
+        assert!(ex.lines[0].text.contains("runway three one, cleared for takeoff"), "{}", ex.lines[0].text);
+        // The other strip is not ours: a departure off 12 is narrated.
+        let ex = depart("IBE3003", t12, t30, t0 + sec(50)).expect("the other strip is narrated");
+        assert!(ex.lines[0].text.contains("runway one two, cleared for takeoff"), "{}", ex.lines[0].text);
+
+        // Landings. Cleared to land 31: Ryanair on final 12 is narrated,
+        // a ghost on final 31 behind us is not given the same clearance.
+        set_clearance(tower::State::ClearedToLand, true);
+        let final12 = |f: f64| lerp(t12, t30, f);
+        assert!(tick(ghost("RYR8168", final12(-0.8), 900.0, false, -700.0), t0 + sec(60)).is_none());
+        let ex = tick(ghost("RYR8168", final12(-0.7), 750.0, false, -700.0), t0 + sec(63))
+            .expect("the other strip's landing is narrated");
+        assert!(ex.lines[1].text.contains("runway one two, cleared to land"), "{}", ex.lines[1].text);
+        let final31 = |f: f64| lerp(t31, t13, f);
+        assert!(tick(ghost("RYR4458", final31(-0.6), 900.0, false, -700.0), t0 + sec(70)).is_none());
+        assert!(
+            tick(ghost("RYR4458", final31(-0.5), 750.0, false, -700.0), t0 + sec(73)).is_none(),
+            "no second landing clearance on the strip we are cleared to land on"
+        );
+        // Our landing done and reported off: the claim is gone and the
+        // ghost, still descending, gets its clearance.
+        set_clearance(tower::State::ClearedToLand, false);
+        let ex = tick(ghost("RYR4458", final31(-0.4), 600.0, false, -700.0), t0 + sec(76))
+            .expect("cleared once the strip is free");
+        assert!(ex.lines[1].text.contains("runway three one, cleared to land"), "{}", ex.lines[1].text);
+
+        *GHOSTS.lock().unwrap() = None;
+        *CLEARANCE.lock().unwrap() = None;
+        *ACTIVE_RUNWAYS.lock().unwrap() = Vec::new();
+    }
+
     /// Issue #129, the recorded case: LEMG (sortie 1790580676-approach,
     /// 2026-09-28), the 737 on a 10 nm final for 13 in 350 at 3 kt, said
     /// "ten mile final runway one three" and at t 1790580681.3 was told
@@ -10496,11 +10915,11 @@ mod tests {
         let mut st = lxgb();
         st.apt.runways = runways.clone();
         st.note_stated_runway("final runway one three", tower::Intent::ReportFinal);
-        assert_eq!(st.pick_runway_with(60.0, 6.0, None), "13");
+        assert_eq!(st.pick_runway_with(60.0, 6.0, None, None), "13");
         let mut st = lxgb();
         st.apt.runways = runways.clone();
         st.note_stated_runway("final runway one three", tower::Intent::ReportFinal);
-        assert_eq!(st.pick_runway_with(60.0, 6.0, Some("12")), "12");
+        assert_eq!(st.pick_runway_with(60.0, 6.0, Some("12"), None), "12");
         // A crossing strip with a tailwind in limits but a far worse
         // crosswind does not stand (LXGB-like 09/27 plus a synthetic 18/36,
         // wind 360 at 12: 09 has no tailwind but a 12 kt crosswind).
@@ -10580,41 +10999,41 @@ mod tests {
         let mut st = station();
         st.note_stated_runway(words, intent.clone());
         st.note_caller_on_strip(true, lat, lon);
-        assert_eq!(st.pick_runway_with(342.6, 2.9, Some("12")), "13");
+        assert_eq!(st.pick_runway_with(342.6, 2.9, Some("12"), None), "13");
         assert_eq!(st.runway_in_use.as_deref(), Some("13"));
         // ...and it holds for the takeoff call that follows (no stated
         // runway, nothing committed, calm).
-        assert_eq!(st.pick_runway_with(342.6, 2.9, Some("12")), "13");
+        assert_eq!(st.pick_runway_with(342.6, 2.9, Some("12"), None), "13");
         // The same words from an aircraft NOT on the strip: the stream's end,
         // as before.
         let mut st = station();
         st.note_stated_runway(words, intent.clone());
         st.note_caller_on_strip(true, 36.6950, -4.4900);
-        assert_eq!(st.pick_runway_with(342.6, 2.9, Some("12")), "12");
+        assert_eq!(st.pick_runway_with(342.6, 2.9, Some("12"), None), "12");
         // Airborne is never a runway start.
         let mut st = station();
         st.note_stated_runway(words, intent.clone());
         st.note_caller_on_strip(false, lat, lon);
-        assert_eq!(st.pick_runway_with(342.6, 2.9, Some("12")), "12");
+        assert_eq!(st.pick_runway_with(342.6, 2.9, Some("12"), None), "12");
         // A wind that really argues still wins: 310 at 12 is 12 kt of tailwind
         // on 13.
         let mut st = station();
         st.note_stated_runway(words, intent.clone());
         st.note_caller_on_strip(true, lat, lon);
-        assert_ne!(st.pick_runway_with(310.0, 12.0, None), "13");
+        assert_ne!(st.pick_runway_with(310.0, 12.0, None, None), "13");
         // A flight the tower is sequencing keeps its runway.
         let mut st = station();
         st.runway_in_use = Some("31".into());
         st.twr.state = tower::State::TaxiCleared;
         st.note_stated_runway(words, intent.clone());
         st.note_caller_on_strip(true, lat, lon);
-        assert_eq!(st.pick_runway_with(342.6, 2.9, Some("12")), "31");
+        assert_eq!(st.pick_runway_with(342.6, 2.9, Some("12"), None), "31");
 
         // The clearance the crew reads names 13.
         let mut st = station();
         st.note_stated_runway(words, intent);
         st.note_caller_on_strip(true, lat, lon);
-        assert_eq!(st.pick_runway_with(342.6, 2.9, Some("12")), "13");
+        assert_eq!(st.pick_runway_with(342.6, 2.9, Some("12"), None), "13");
         let wx = Wx {
             wind_from_deg: 342.6,
             wind_kts: 2.9,
@@ -10624,6 +11043,48 @@ mod tests {
         assert!(r.contains("cleared to leave"), "{r}");
         assert_eq!(crate::party_line::clearance_runway().as_deref(), Some("13"));
         *CLEARANCE.lock().unwrap() = None;
+    }
+
+    /// Issues #134 and #140 together (LEMG 2026-09-28, calm): a runway start
+    /// keeps the runway it is lined up on unless that runway points INTO the
+    /// live traffic. Lined up on 13 with ghosts departing 13 and landing 12:
+    /// 13. Lined up on 31 with ghosts departing 13 (or landing 13): refused,
+    /// the stream's end. On 31 with the departures on 31: 31.
+    #[test]
+    fn a_runway_start_keeps_its_strip_unless_it_faces_the_stream() {
+        let _guard = SIDE_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        *CLEARANCE.lock().unwrap() = None;
+        let runways = lemg_runways();
+        let (t13, t31) = (
+            (runways[1].lat_a, runways[1].lon_a),
+            (runways[1].lat_b, runways[1].lon_b),
+        );
+        let along = |f: f64| (t13.0 + (t31.0 - t13.0) * f, t13.1 + (t31.1 - t13.1) * f);
+        let start = |words: &str, pos: (f64, f64)| {
+            let mut st = lxgb();
+            st.apt.name = "Malaga".into();
+            st.apt.runways = runways.clone();
+            st.note_stated_runway(words, tower::parse_intent(words));
+            st.note_caller_on_strip(true, pos.0, pos.1);
+            st
+        };
+        let on13 = "november eight one six november november, request clearance, runway one three";
+        let on31 = "november eight one six november november, request clearance, runway three one";
+        // On 13's threshold, the world departing 13 and landing 12: 13.
+        let mut st = start(on13, along(0.01));
+        assert_eq!(st.pick_runway_with(342.6, 2.9, Some("12"), Some("13")), "13");
+        // On 31's threshold facing the 13 departures: refused, 13.
+        let mut st = start(on31, along(0.99));
+        assert_eq!(st.pick_runway_with(342.6, 2.9, None, Some("13")), "13");
+        // Facing an arrival stream on 13 too.
+        let mut st = start(on31, along(0.99));
+        assert_eq!(st.pick_runway_with(342.6, 2.9, Some("13"), None), "13");
+        // With the world on 31 the start on 31 stands.
+        let mut st = start(on31, along(0.99));
+        assert_eq!(st.pick_runway_with(342.6, 2.9, None, Some("31")), "31");
+        // No live traffic: #134's rule alone, the start stands.
+        let mut st = start(on31, along(0.99));
+        assert_eq!(st.pick_runway_with(342.6, 2.9, None, None), "31");
     }
 
     /// Two parallels have the SAME heading to within rounding error, so which
