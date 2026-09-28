@@ -9911,3 +9911,16 @@ own miles (211 kt at the handoff, was 218.5). OFP cruise 299/300 vs the 306 caut
 less 10 (296). Altimeter: standard at 6,149 ft (was 8,297), QNH at 7,384 ft (was 6,180). Anti-ice never
 off: the monitor read the lowest of the sim's 13 dewpoint levels; now the aircraft's own. Glideslope:
 the aim leans toward the beam (EGBB 15: 327 ft, crossing at 81). Open: the join pattern's length. Offline only.
+
+## 2026-09-28: the SF50 circuit nobody flew (issue #160)
+
+LEMG 13 runway start, sortie 1790607325: the runner loaded the SF50 while the SR22 before it was on
+autoland, and the roll began with the autopilot on, HDG and VS lit (ap_state 50; 23 other takeoffs began
+with neither). `engage_climb` read the two mode lamps, pressed nothing, and from 300 ft nothing flew: VS
+dial 1,932, 1,500, then -500 against 2,000-3,400 fpm flown at 0.95 throttle; bank growing 1 to 45
+degrees in 100 s; ten 360s on a downwind that never ended; 21,882 ft at the deadline, scored PASS on
+alignment and takeoff. Not #150 or #93: through a plant fitted to the ETND circuit, ClimbCarry and
+BugHold level and turn base. A takeoff now clears an inherited autopilot on the ground and the engage
+reads the servos; the circuit's `PatternGuard` gives up past 1,500 ft over the pattern, a leg past 2.5x
+its length, or servos out (the recording is given back at 3,302 ft, 46 s after the handoff); a sortie
+ending airborne fails. Offline only.

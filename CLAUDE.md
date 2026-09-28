@@ -455,6 +455,12 @@ everything blackboxes to `logs/blackbox.jsonl` (kinds: `atc`, `autotaxi`, `autot
   until the loops weave. The rollout blackboxes `rollout` per tick with the REAL tick time. So a
   steady drift is held off only by a standing offset: the scheduled roll feeds its own drift
   forward (`DriftFilter`, the final's crab pattern; EGBB 2026-09-27).
+- **A takeoff starts with the autopilot OFF and an engage reads the SERVOS**
+  (`autotakeoff::clear_inherited_autopilot`, `ap_inherited`; `engage_climb` needs `servos_on` with HDG
+  and VS): modes left lit by the last flight were taken for an engage and nothing flew the SF50 from
+  300 ft to 21,900 (LEMG 13 2026-09-28, #160). **A pattern that is no pattern is given back loudly**
+  (`circuit::PatternGuard`, `pattern_guard`: 1,500 ft over its height, a leg past `leg_limit_s`, or the
+  servos out).
 - **The declared rudder is believed only up to the speed it was measured at** (`RollSteer` held flat
   above `roll_rudder:` `at_kts`, ceiling `RUDDER_FULL_DEG_FAST`; extrapolated as v^2 it cut the gain to a
   third by Vr: EGKK 08R lifted off 5.4 m left, 2026-09-28). The scheduled roll's cut is `RollCut`: the
@@ -974,7 +980,7 @@ confirms it closes it (`fixes #N` in the commit). Known gaps are `owed` issues.
 - `xvl debrief` (`src/debrief.rs`) after every flight, before diagnosing by hand.
 - **A sortie is one file with a verdict** (`full_auto::SortieGuard`, `sortie`,
   `logs/sorties/<id>.jsonl`; `src/scorecard.rs` `stage_result`, `sortie_result`: PASS with no failed
-  stage, no give-up, no crash inside it, at least one stage scored, and UNATTENDED: no `intervention` and no `tool` record, the pilot's command to
+  stage, no give-up, no crash inside it, at least one stage scored, ended on the ground (`ended_airborne`), and UNATTENDED: no `intervention` and no `tool` record, the pilot's command to
   the crew), grouped by mission in `xvl debrief`. `state` logs `in` and `ctl`; speech is `said`. A
   complaint not yet a scorecard number is not yet testable.
 - **A verdict that is wrong hides the real failures** (2026-09-26): the crew's own flare and
