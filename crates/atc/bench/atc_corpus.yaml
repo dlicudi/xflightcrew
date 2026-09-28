@@ -478,3 +478,24 @@
 - {text: "Walker 25 16, ready to taxi", intent: request_taxi, radio: true, callsign: "Walker two five one six"}
 - {text: "Walker 2517, ready to taxi", intent: request_taxi, radio: false, callsign: "Walker two five one six"}
 - {text: "walker, ready to taxi", intent: request_taxi, radio: false, callsign: "Walker two five one six"}
+
+# --- 2026-09-28: flight levels (issue #97) -----------------------------------
+# A level at or above the transition level is read back as a flight level;
+# whisper writes it in words, digits or "FL". A readback, never a request.
+- {text: "cleared to birmingham via the lam six mike departure, runway two six left, climb flight level seven zero, squawk four five three six, whiskey alpha tango one seven three", intent: unknown}
+- {text: "climb flight level 120, speedbird three zero six", intent: unknown}
+- {text: "climb FL120, speedbird 306.", intent: unknown}
+
+# --- 2026-09-28: backtrack from a runway start (issue #128) ------------------
+# EGKK 26L, sortie 1790527340: lined up with 1,340 m ahead and 1,897 needed.
+# The crew asks to backtrack; the approval's readback earns silence.
+- {text: "Whiskey Alpha Tango one seven three, request backtrack runway two six left.", intent: request_backtrack, radio: true}
+- {text: "gatwick tower, requesting back track for full length", intent: request_backtrack, radio: true}
+- {text: "request back-track runway two six left", intent: request_backtrack, radio: true}
+- {text: "Backtracking and lining up runway two six left, Whiskey Alpha Tango one seven three.", intent: unknown}
+- {text: "Lining up runway two six left, Whiskey Alpha Tango one seven three.", intent: unknown}
+
+# --- 2026-09-28: cancel IFR (issue #96) --------------------------------------
+- {text: "London control, speedbird three zero six, cancel IFR", intent: cancel_ifr, radio: true}
+- {text: "speedbird 306, cancelling i f r, continuing VFR", intent: cancel_ifr, radio: true}
+- {text: "cancel ifr clearance", intent: cancel_ifr, radio: true}

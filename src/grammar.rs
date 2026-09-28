@@ -1389,7 +1389,64 @@ fn onoff(t: &str) -> Option<bool> {
     }
 }
 
+/// "flight level one two zero" (or "fl120", "fl 120", "level 120") said as
+/// the feet it means, "12000 feet", so every altitude rule below reads a
+/// level the way it reads an altitude (issue #97). Summed as digits it was
+/// "climb 120": a 120 fpm climb, or an altitude of 120 ft. `None` when no
+/// level (10 to 600) is named.
+pub fn flight_level_as_feet(t: &str) -> Option<String> {
+    let toks: Vec<&str> = t.split_whitespace().collect();
+    let clean = |w: &str| {
+        w.trim_matches(|c: char| !c.is_ascii_alphanumeric())
+            .to_ascii_lowercase()
+    };
+    let digits_from = |start: usize| -> (String, usize) {
+        let mut d = String::new();
+        let mut j = start;
+        while j < toks.len() && d.len() < 3 {
+            let w = clean(toks[j]);
+            if !w.is_empty() && w.chars().all(|c| c.is_ascii_digit()) {
+                if d.len() + w.len() > 3 {
+                    break;
+                }
+                d.push_str(&w);
+            } else if let Some((v, false)) = crate::phrase::word_value(&w).filter(|(v, m)| !m && *v <= 9) {
+                d.push_str(&v.to_string());
+            } else {
+                break;
+            }
+            j += 1;
+        }
+        (d, j)
+    };
+    let level = |d: &str| -> Option<i64> {
+        let n: i64 = d.parse().ok()?;
+        (d.len() >= 2 && (10..=600).contains(&n)).then_some(n * 100)
+    };
+    for i in 0..toks.len() {
+        let w = clean(toks[i]);
+        let (from, ft, to) = if w == "level" || w == "fl" {
+            let (d, j) = digits_from(i + 1);
+            let from = if w == "level" && i > 0 && clean(toks[i - 1]) == "flight" { i - 1 } else { i };
+            (from, level(&d), j)
+        } else if let Some(rest) = w.strip_prefix("fl").filter(|r| !r.is_empty() && r.chars().all(|c| c.is_ascii_digit())) {
+            (i, level(rest), i + 1)
+        } else {
+            continue;
+        };
+        if let Some(ft) = ft {
+            let mut out: Vec<String> = toks[..from].iter().map(|w| w.to_string()).collect();
+            out.push(format!("{ft} feet"));
+            out.extend(toks[to..].iter().map(|w| w.to_string()));
+            return Some(out.join(" "));
+        }
+    }
+    None
+}
+
 fn parse_one(t: &str) -> Option<ToolCall> {
+    let fl_text = flight_level_as_feet(t);
+    let t = fl_text.as_deref().unwrap_or(t);
     let num = number(t);
 
     // Reminders: "wake me at top of descent", "tell me when we reach 5000 feet",
@@ -4475,6 +4532,27 @@ mod tests {
             one("climb to 7000").unwrap(),
             ("set_altitude".into(), json!({"altitude":7000}))
         );
+    }
+
+    #[test]
+    fn a_flight_level_is_an_altitude_target() {
+        assert_eq!(
+            one("climb flight level one two zero").unwrap(),
+            ("set_altitude".into(), json!({"altitude":12000}))
+        );
+        assert_eq!(
+            one("descend to flight level 80").unwrap(),
+            ("set_altitude".into(), json!({"altitude":8000}))
+        );
+        assert_eq!(
+            one("climb and maintain fl350").unwrap(),
+            ("set_altitude".into(), json!({"altitude":35000}))
+        );
+        assert_eq!(
+            one("climb to flight level one five zero at 1500").unwrap(),
+            ("set_climb".into(), json!({"altitude":15000,"fpm":1500}))
+        );
+        assert_eq!(flight_level_as_feet("set flaps 20"), None);
     }
 
     #[test]

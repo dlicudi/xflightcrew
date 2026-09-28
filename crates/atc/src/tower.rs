@@ -109,6 +109,18 @@ pub enum Intent {
     /// [`Ctx::runway_refusal`]. ETND 2026-09-24: an SF50 was cleared onto
     /// 446 m of grass and had no words to ask for the paved 1,240 m beside it.
     RequestRunway,
+    /// "request backtrack runway two six left" / "requesting backtrack for
+    /// full length": an aircraft ON the runway (a runway start mid-strip) or
+    /// at its holding point asking to taxi down the runway to the threshold
+    /// and turn round. Answered with a line-up ("backtrack approved runway
+    /// ..., line up and wait") when the strip and its final are clear. EGKK
+    /// 2026-09-27: a 737 started 1,340 m from the end of 26L, needing 1,897,
+    /// had no words for it and was taxied off the runway to its far hold.
+    RequestBacktrack,
+    /// "cancel IFR" / "cancelling IFR": an IFR flight going VFR. The station
+    /// retires the IFR clearance and the flight's IFR standing, so the next
+    /// region handoff terminates the service like any VFR flight's.
+    CancelIfr,
     /// "request vectors" — the tower redirects to the approach frequency.
     RequestVectors,
     /// "good evening, Merida" / "hello tower" — an initial hail carrying no
@@ -207,6 +219,10 @@ pub struct Ctx {
     /// `runway` IS the requested runway and the route is planned to it) and
     /// on every other call. An empty runway means the words named none.
     pub runway_refusal: Option<(String, String)>,
+    /// The field's transition LEVEL, feet (apt.dat `1302 transition_level`):
+    /// an assigned level at or above it is spoken as a flight level
+    /// ([`crate::atis::spoken_level`]). `None` = unknown, everything in feet.
+    pub transition_level_ft: Option<f64>,
 }
 
 /// The IFR departure clearance as issued and, once read back correctly, as
@@ -383,6 +399,14 @@ pub fn parse_intent(transcript: &str) -> Intent {
     if t.contains("say again") {
         return Intent::Unknown;
     }
+    // "Cancel IFR" / "cancelling IFR": before every other reading, the
+    // clearance word included ("cancel my IFR clearance" is not a request
+    // for one). Whisper writes the letters spaced or dotted.
+    if (word("cancel") || word("cancelling") || word("canceling"))
+        && (word("ifr") || t.contains("i f r") || t.contains("i.f.r") || t.contains("instrument flight"))
+    {
+        return Intent::CancelIfr;
+    }
     // A line-up phrase is a READBACK of "line up and wait", never a request —
     // and "behind the landing traffic, lining up" must not read the word
     // "landing" as an arrival call (corpus 2026-07-11).
@@ -489,6 +513,14 @@ pub fn parse_intent(transcript: &str) -> Intent {
     // and taxi words below can claim "for takeoff" or "for departure". The
     // designator must follow the request word itself: "request taxi, runway
     // two seven" stays the taxi request with a stated runway.
+    // A backtrack request, before the runway request can read "request
+    // backtrack runway two six left" as a request for runway two six left.
+    // Request-shaped only: "backtracking" is the readback of the approval.
+    if (word("backtrack") || t.contains("back track") || t.contains("back-track"))
+        && (word("request") || word("requesting") || word("requests"))
+    {
+        return Intent::RequestBacktrack;
+    }
     if requested_runway(&t).is_some() {
         return Intent::RequestRunway;
     }
@@ -859,6 +891,8 @@ pub fn intent_from_label(label: &str) -> Option<Intent> {
         "request_taxi_in" => Intent::RequestTaxiIn,
         "runway_vacated" => Intent::RunwayVacated,
         "request_runway" => Intent::RequestRunway,
+        "request_backtrack" => Intent::RequestBacktrack,
+        "cancel_ifr" => Intent::CancelIfr,
         "request_vectors" => Intent::RequestVectors,
         "greeting" => Intent::Greeting,
         "flight_following" => Intent::RequestFlightFollowing,
@@ -980,6 +1014,9 @@ pub enum Awaited {
         dest_spoken: String,
         runway_spoken: String,
         faa: bool,
+        /// The initial altitude was given as a flight level (at or above the
+        /// field's transition level), so the readback says it that way too.
+        level: bool,
     },
 }
 
@@ -1125,6 +1162,13 @@ pub fn heard_altitude_ft(transcript: &str) -> Option<i64> {
             }
         }
     }
+    // A flight level: "flight level one two zero", "flight level 120",
+    // "FL120", "FL 120" is feet on the standard setting (12,000). Before the
+    // thousands, so a level said in the same breath as an altitude is the
+    // level assigned.
+    if let Some(ft) = heard_flight_level_ft(&toks, &skip) {
+        return Some(ft);
+    }
     for (i, w) in toks.iter().enumerate() {
         if skip[i] {
             continue;
@@ -1159,6 +1203,36 @@ pub fn heard_altitude_ft(transcript: &str) -> Option<i64> {
                 // ("12345") is not one.
                 if (1000..=60000).contains(&v) && v % 100 == 0 {
                     return Some(v);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// The flight level a transmission names, in feet: two or three digits
+/// after "flight level" (or "level" on its own, which whisper leaves when it
+/// eats "flight"), or after "fl"; "fl120" written as one token too. `None`
+/// when no level is said. Levels are 10 to 600.
+fn heard_flight_level_ft(toks: &[String], skip: &[bool]) -> Option<i64> {
+    let level = |d: &str| -> Option<i64> {
+        let n: i64 = d.parse().ok()?;
+        (d.len() >= 2 && (10..=600).contains(&n)).then_some(n * 100)
+    };
+    for (i, w) in toks.iter().enumerate() {
+        if skip.get(i).copied().unwrap_or(false) {
+            continue;
+        }
+        if w == "level" || w == "fl" {
+            let (d, _) = digits_at(toks, i + 1, 3);
+            if let Some(ft) = level(&d) {
+                return Some(ft);
+            }
+        }
+        if let Some(rest) = w.strip_prefix("fl") {
+            if !rest.is_empty() && rest.chars().all(|c| c.is_ascii_digit()) {
+                if let Some(ft) = level(rest) {
+                    return Some(ft);
                 }
             }
         }
@@ -1429,6 +1503,24 @@ fn check_ifr_readback(t: &str, c: &IfrClearance) -> ReadbackCheck {
     }
 }
 
+/// The climb item of an IFR clearance, in the dialect and the level's own
+/// words: ICAO "climb five thousand feet" / "climb flight level one two
+/// zero"; FAA "climb and maintain five thousand" / "climb and maintain
+/// flight level one eight zero". Shared by the clearance, its readback and
+/// the correction, so the three always say the level the same way.
+pub fn climb_item(alt_ft: i64, level: bool, faa: bool) -> String {
+    let words = if level {
+        crate::atis::spoken_flight_level(alt_ft as f64)
+    } else {
+        crate::atis::spoken_alt(alt_ft as f64)
+    };
+    match (faa, level) {
+        (true, _) => format!("climb and maintain {words}"),
+        (false, true) => format!("climb {words}"),
+        (false, false) => format!("climb {words} feet"),
+    }
+}
+
 /// The IFR clearance, phrased in the field's dialect: the sentence the
 /// tower says (with the callsign) and the instruction a challenge repeats
 /// (without it). ICAO / CAP 413: "cleared to Edinburgh via the Gosa one
@@ -1438,7 +1530,8 @@ fn check_ifr_readback(t: &str, c: &IfrClearance) -> ReadbackCheck {
 /// frequency ..., squawk ...". No SID: "after departure fly runway heading".
 pub fn ifr_clearance_line(ctx: &Ctx, offer: &IfrOffer) -> (String, String) {
     let c = &offer.clearance;
-    let alt = crate::atis::spoken_alt(c.initial_alt_ft as f64);
+    let level = crate::atis::is_flight_level(c.initial_alt_ft as f64, ctx.transition_level_ft);
+    let climb = climb_item(c.initial_alt_ft, level, offer.faa);
     let code = crate::atis::spoken_digits(&format!("{:04}", c.squawk));
     let body = if offer.faa {
         let route = match &c.sid {
@@ -1451,7 +1544,7 @@ pub fn ifr_clearance_line(ctx: &Ctx, offer: &IfrOffer) -> (String, String) {
             .map(|f| format!(", departure frequency {f}"))
             .unwrap_or_default();
         format!(
-            "cleared to {} airport {route}, climb and maintain {alt}{freq}, squawk {code}.",
+            "cleared to {} airport {route}, {climb}{freq}, squawk {code}.",
             offer.dest_spoken
         )
     } else {
@@ -1460,7 +1553,7 @@ pub fn ifr_clearance_line(ctx: &Ctx, offer: &IfrOffer) -> (String, String) {
             None => format!(", runway {}, after departure fly runway heading", ctx.runway),
         };
         format!(
-            "cleared to {}{route}, climb {alt} feet, squawk {code}{}.",
+            "cleared to {}{route}, {climb}, squawk {code}{}.",
             offer.dest_spoken,
             qnh_clause(ctx)
         )
@@ -1475,22 +1568,23 @@ fn ifr_readback_line(
     dest_spoken: &str,
     runway_spoken: &str,
     faa: bool,
+    level: bool,
     callsign: &str,
 ) -> String {
-    let alt = crate::atis::spoken_alt(c.initial_alt_ft as f64);
+    let climb = climb_item(c.initial_alt_ft, level, faa);
     let code = crate::atis::spoken_digits(&format!("{:04}", c.squawk));
     if faa {
         let route = match &c.sid {
             Some(sid) => format!("via the {} departure, then as filed", spoken_sid(sid)),
             None => "as filed, runway heading".to_string(),
         };
-        format!("Cleared to {dest_spoken} {route}, climb and maintain {alt}, squawk {code}, {callsign}.")
+        format!("Cleared to {dest_spoken} {route}, {climb}, squawk {code}, {callsign}.")
     } else {
         let route = match &c.sid {
             Some(sid) => format!(" via the {} departure, runway {runway_spoken}", spoken_sid(sid)),
             None => format!(", runway {runway_spoken}, runway heading"),
         };
-        format!("Cleared to {dest_spoken}{route}, climb {alt} feet, squawk {code}, {callsign}.")
+        format!("Cleared to {dest_spoken}{route}, {climb}, squawk {code}, {callsign}.")
     }
 }
 
@@ -1506,6 +1600,7 @@ fn ifr_correction(
         clearance: c,
         runway_spoken,
         faa,
+        level,
         ..
     } = awaited
     else {
@@ -1517,14 +1612,7 @@ fn ifr_correction(
                 "the {} departure",
                 c.sid.as_deref().map(spoken_sid).unwrap_or_default()
             ),
-            IfrItem::Altitude => {
-                let alt = crate::atis::spoken_alt(c.initial_alt_ft as f64);
-                if *faa {
-                    format!("climb and maintain {alt}")
-                } else {
-                    format!("climb {alt} feet")
-                }
-            }
+            IfrItem::Altitude => climb_item(c.initial_alt_ft, *level, *faa),
             IfrItem::Squawk => format!(
                 "squawk {}",
                 crate::atis::spoken_digits(&format!("{:04}", c.squawk))
@@ -1606,6 +1694,16 @@ impl Tower {
             self.accepted_ifr = Some(clearance.clone());
             self.pending = None;
         }
+    }
+
+    /// "Cancel IFR": an IFR clearance still owed its readback, or accepted
+    /// and not yet published, dies here. True when there was one.
+    pub fn cancel_ifr(&mut self) -> bool {
+        let owed = self.ifr_readback_owed();
+        if owed {
+            self.pending = None;
+        }
+        owed | self.accepted_ifr.take().is_some()
     }
 
     /// An IFR clearance's readback is owed.
@@ -1735,7 +1833,8 @@ impl Tower {
                 dest_spoken,
                 runway_spoken,
                 faa,
-            } => ifr_readback_line(clearance, dest_spoken, runway_spoken, *faa, callsign),
+                level,
+            } => ifr_readback_line(clearance, dest_spoken, runway_spoken, *faa, *level, callsign),
         })
     }
 
@@ -1754,6 +1853,11 @@ impl Tower {
         };
         if stale {
             self.pending = None;
+            return None;
+        }
+        // "Cancel IFR" is never answered "read back": the clearance it
+        // would echo is the one being cancelled (the station retires it).
+        if intent == Intent::CancelIfr {
             return None;
         }
         // Safety outranks discipline: an emergency or a go-around is never
@@ -1904,6 +2008,10 @@ impl Tower {
                             dest_spoken: offer.dest_spoken.clone(),
                             runway_spoken: ctx.runway.clone(),
                             faa: offer.faa,
+                            level: crate::atis::is_flight_level(
+                                offer.clearance.initial_alt_ft as f64,
+                                ctx.transition_level_ft,
+                            ),
                         },
                         &instruction,
                     );
@@ -2019,6 +2127,51 @@ impl Tower {
                     qnh_clause(ctx)
                 )
             }
+            // A backtrack: the strip and its final must be clear, as for a
+            // line-up; then onto (or down) the runway to the threshold,
+            // turned round and lined up. From the runway itself (a runway
+            // start) or from a taxi clearance's hold; from anywhere else it
+            // is a taxi request first.
+            Intent::RequestBacktrack => {
+                if !ctx.on_ground || ctx.helicopter {
+                    return format!("{}, say again.", ctx.callsign);
+                }
+                let at_runway = ctx.own_on_runway
+                    || matches!(self.state, State::TaxiCleared | State::LinedUp | State::TakeoffCleared);
+                if !at_runway {
+                    return self.handle(Intent::RequestTaxi, ctx);
+                }
+                if ctx.runway_occupied {
+                    let line = format!("{}, hold position, traffic on the runway.", ctx.callsign);
+                    self.arm(Awaited::HoldPosition, &line);
+                    return line;
+                }
+                if let Some(nm) = ctx.final_traffic_nm {
+                    let line = format!(
+                        "{}, hold position, traffic on {}. Expect backtrack after the landing traffic.",
+                        ctx.callsign,
+                        spoken_final(nm)
+                    );
+                    self.arm(Awaited::HoldPosition, &line);
+                    return line;
+                }
+                self.state = State::LinedUp;
+                let line = format!(
+                    "{}, backtrack approved runway {}, line up and wait.",
+                    ctx.callsign, ctx.runway
+                );
+                self.arm(
+                    Awaited::LineUp {
+                        runway: ctx.runway.clone(),
+                        behind: false,
+                    },
+                    &line,
+                );
+                line
+            }
+            // The station answers a cancellation (it holds the IFR book);
+            // the tower alone has nothing to cancel.
+            Intent::CancelIfr => format!("{}, say again.", ctx.callsign),
             Intent::RequestTakeoff => match self.state {
                 // Already cleared, but traffic has since appeared on final:
                 // the clearance is CANCELLED, not repeated — the 2026-07-10
@@ -2403,6 +2556,7 @@ mod tests {
             own_on_runway: false,
             helicopter: false,
             runway_refusal: None,
+            transition_level_ft: None,
             wake_secs_left: None,
             taxi_via: Vec::new(),
             taxi_crossings: Vec::new(),
@@ -2598,6 +2752,148 @@ mod tests {
         twr.handle(ifr_request(), &c);
         twr.accept_ifr_unenforced();
         assert!(twr.take_accepted_ifr().is_some());
+    }
+
+    /// Issue #97: an initial altitude at or above the field's transition
+    /// LEVEL is a flight level, in the clearance, the coach's readback and
+    /// the correction; below it, feet with the QNH. The readback checker
+    /// takes either form for the same number.
+    #[test]
+    fn a_level_at_or_above_the_transition_level_is_a_flight_level() {
+        let cs = "November one seven two Sierra Papa";
+        // A field whose transition level is 5,000 ft (apt.dat says FL050):
+        // the 5,000 ft initial altitude is flight level five zero.
+        let c = Ctx {
+            transition_level_ft: Some(5000.0),
+            ..ifr_ctx(Some("GOSA1C"), false)
+        };
+        let mut twr = Tower::new();
+        let r = twr.handle(ifr_request(), &c);
+        assert!(r.contains("runway zero niner, climb flight level five zero, squawk"), "{r}");
+        assert!(!r.contains("feet"), "{r}");
+        let rb = twr.suggested_readback(cs).unwrap();
+        assert!(rb.contains("climb flight level five zero, squawk four five two one"), "{rb}");
+        assert_eq!(twr.gate(&rb.to_lowercase(), parse_intent(&rb.to_lowercase()), &c), Some(String::new()));
+        // A wrong level is corrected in flight-level words.
+        let mut twr = Tower::new();
+        twr.handle(ifr_request(), &c);
+        let t = "cleared to edinburgh via the gosa one charlie departure, flight level six zero, squawk four five two one";
+        assert_eq!(
+            twr.gate(t, parse_intent(t), &c).unwrap(),
+            format!("{cs}, negative, climb flight level five zero.")
+        );
+        // The same number said in feet is the same clearance.
+        let t = "gosa one charlie, climb five thousand feet, squawk four five two one";
+        assert_eq!(twr.gate(t, parse_intent(t), &c), Some(String::new()));
+        // FAA: "climb and maintain flight level".
+        let c = Ctx {
+            transition_level_ft: Some(5000.0),
+            ..ifr_ctx(Some("BIG2F"), true)
+        };
+        let r = Tower::new().handle(ifr_request(), &c);
+        assert!(r.contains("climb and maintain flight level five zero, departure frequency"), "{r}");
+        // Below the transition level (EGKK's is 7,000): feet, as before.
+        let c = Ctx {
+            transition_level_ft: Some(7000.0),
+            ..ifr_ctx(Some("GOSA1C"), false)
+        };
+        let r = Tower::new().handle(ifr_request(), &c);
+        assert!(r.contains("climb five thousand feet, squawk"), "{r}");
+    }
+
+    /// Issue #128: a runway start with too little runway ahead asks to
+    /// backtrack; the tower lines it up down the strip when the strip and
+    /// its final are clear, holds it when not, and a parked aircraft asking
+    /// gets its taxi first.
+    #[test]
+    fn a_backtrack_is_a_line_up_from_the_runway() {
+        let cs = "November one seven two Sierra Papa";
+        for t in [
+            "gatwick tower, whiskey alpha tango one seven three, request backtrack runway two six left",
+            "requesting backtrack for full length",
+            "request back track runway zero niner",
+        ] {
+            assert_eq!(parse_intent(t), Intent::RequestBacktrack, "{t}");
+        }
+        // The approval's readback, and plain chatter, are not requests.
+        assert_eq!(
+            parse_intent("backtracking runway two six left, line up and wait, whiskey alpha tango one seven three"),
+            Intent::Unknown
+        );
+        assert_ne!(parse_intent("we could backtrack"), Intent::RequestBacktrack);
+        let on_strip = Ctx {
+            on_ground: true,
+            own_on_runway: true,
+            ..ctx()
+        };
+        let mut twr = Tower::new();
+        let r = twr.handle(Intent::RequestBacktrack, &on_strip);
+        assert_eq!(r, format!("{cs}, backtrack approved runway zero niner, line up and wait."));
+        assert_eq!(twr.state, State::LinedUp);
+        assert!(twr.holds_runway());
+        let rb = twr.suggested_readback(cs).unwrap();
+        let t = rb.to_lowercase();
+        assert_eq!(twr.gate(&t, parse_intent(&t), &on_strip), Some(String::new()));
+        // Then "ready for departure" from the threshold is a lined-up call.
+        let r = twr.handle(Intent::RequestTakeoff, &on_strip);
+        assert!(r.contains("cleared for takeoff"), "{r}");
+        // Traffic on final or on the strip: hold, still Parked.
+        let mut twr = Tower::new();
+        let r = twr.handle(
+            Intent::RequestBacktrack,
+            &Ctx {
+                final_traffic_nm: Some(3.0),
+                ..on_strip.clone()
+            },
+        );
+        assert!(r.contains("hold position, traffic on 3 mile final"), "{r}");
+        assert_eq!(twr.state, State::Parked);
+        let r = Tower::new().handle(
+            Intent::RequestBacktrack,
+            &Ctx {
+                runway_occupied: true,
+                ..on_strip.clone()
+            },
+        );
+        assert!(r.contains("hold position, traffic on the runway"), "{r}");
+        // At the hold on a taxi clearance: the same approval.
+        let mut twr = Tower::new();
+        twr.state = State::TaxiCleared;
+        let r = twr.handle(Intent::RequestBacktrack, &Ctx { on_ground: true, ..ctx() });
+        assert!(r.contains("backtrack approved"), "{r}");
+        // From the stand: the taxi first, no runway.
+        let mut twr = Tower::new();
+        let r = twr.handle(Intent::RequestBacktrack, &Ctx { on_ground: true, ..ctx() });
+        assert!(r.contains("taxi to holding point Alpha"), "{r}");
+        assert_eq!(twr.state, State::TaxiCleared);
+        // Airborne: a garble.
+        let r = Tower::new().handle(Intent::RequestBacktrack, &ctx());
+        assert_eq!(r, format!("{cs}, say again."));
+    }
+
+    #[test]
+    fn a_flight_level_is_heard_in_every_spelling() {
+        assert_eq!(heard_altitude_ft("climb flight level one two zero"), Some(12000));
+        assert_eq!(heard_altitude_ft("climbing flight level 120"), Some(12000));
+        assert_eq!(heard_altitude_ft("climb fl120"), Some(12000));
+        assert_eq!(heard_altitude_ft("climb FL 90"), Some(9000));
+        assert_eq!(heard_altitude_ft("level seven zero"), Some(7000));
+        assert_eq!(
+            heard_altitude_ft("flight level one two zero, squawk four five two one"),
+            Some(12000)
+        );
+        assert_eq!(heard_altitude_ft("squawk four five two one"), None);
+        assert_eq!(heard_altitude_ft("level off at five thousand"), Some(5000));
+        assert_eq!(crate::atis::spoken_flight_level(7000.0), "flight level seven zero");
+        assert_eq!(crate::atis::spoken_flight_level(35000.0), "flight level three five zero");
+        assert!(crate::atis::is_flight_level(7000.0, Some(7000.0)));
+        assert!(!crate::atis::is_flight_level(6000.0, Some(7000.0)));
+        assert!(!crate::atis::is_flight_level(20000.0, None), "unknown: feet");
+        assert_eq!(crate::nav::parse_transition_level("7000"), Some(7000.0));
+        assert_eq!(crate::nav::parse_transition_level("FL070"), Some(7000.0));
+        assert_eq!(crate::nav::parse_transition_level("180"), Some(18000.0));
+        assert_eq!(crate::nav::parse_transition_level("By"), None);
+        assert_eq!(crate::nav::parse_transition_level("0"), None);
     }
 
     #[test]
@@ -2946,6 +3242,8 @@ mod tests {
             RequestTaxiIn,
             RunwayVacated,
             RequestRunway,
+            RequestBacktrack,
+            CancelIfr,
             RequestVectors,
             Greeting,
             RequestFlightFollowing,
@@ -3007,6 +3305,9 @@ mod tests {
                     // is a garble there and moves nothing (the ground half
                     // has its own test).
                     RejectingTakeoff => start,
+                    // A backtrack is a ground request (ctx() is airborne: a
+                    // garble) and a cancellation is the station's book.
+                    RequestBacktrack | CancelIfr => start,
                     // The IFR clearance clears a route, not a runway: the
                     // sequence stands (and with no offer it is "say again").
                     RequestIfrClearance { .. } => start,

@@ -986,6 +986,10 @@ impl Station {
         ctx: &tower::Ctx,
         wx: Wx,
     ) -> String {
+        // "Cancel IFR" is the IFR book's, whichever position hears it.
+        if intent == tower::Intent::CancelIfr {
+            return self.cancel_ifr(ctx);
+        }
         match service {
             Service::Tower => {
                 let was = self.twr.state;
@@ -1077,6 +1081,8 @@ impl Station {
             | tower::Intent::RequestTaxiIn
             | tower::Intent::RunwayVacated
             | tower::Intent::RequestRunway
+            | tower::Intent::RequestBacktrack
+            | tower::Intent::CancelIfr
             | tower::Intent::RequestStartup
             | tower::Intent::RequestShutdown
             | tower::Intent::RequestIfrClearance { .. }
@@ -1107,6 +1113,37 @@ impl Station {
             tower::Intent::Unknown => {
                 format!("{}, {} Departure, say again.", ctx.callsign, ctx.airport)
             }
+        }
+    }
+
+    /// "Cancel IFR" (issue #96): the flight's IFR standing ends. The
+    /// clearance (owed, accepted or published) and the flight's IFR code
+    /// are retired, and with them the runway frozen for the SID, so the next
+    /// region handoff is a VFR one (the service terminated, seven thousand)
+    /// and a later request is a fresh clearance. A flight with nothing to
+    /// cancel is told so rather than acknowledged.
+    fn cancel_ifr(&mut self, ctx: &tower::Ctx) -> String {
+        let owed = self.twr.cancel_ifr();
+        let published = IFR_CLEARANCE
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+            .is_some();
+        let flight = IFR_FLIGHT
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+            .is_some();
+        if !(owed || published || flight) {
+            tracing::info!("cancel IFR with no IFR flight");
+            return format!("{}, roger, you are not on an IFR clearance.", ctx.callsign);
+        }
+        self.ifr_runway = None;
+        self.ifr_bearings = None;
+        tracing::info!(owed, published, flight, "IFR cancelled");
+        match self.dialect {
+            Dialect::Faa => format!("{}, IFR cancellation received.", ctx.callsign),
+            Dialect::Icao => format!("{}, IFR flight cancelled.", ctx.callsign),
         }
     }
 
@@ -1317,6 +1354,8 @@ impl Station {
             | tower::Intent::RequestTaxiIn
             | tower::Intent::RunwayVacated
             | tower::Intent::RequestRunway
+            | tower::Intent::RequestBacktrack
+            | tower::Intent::CancelIfr
             | tower::Intent::RequestStartup
             | tower::Intent::RequestShutdown
             | tower::Intent::RequestIfrClearance { .. }
@@ -1422,29 +1461,36 @@ impl Station {
         // scope, not on faith (it used to be instant theatre).
         let squawk = self.assign_squawk(&ctx.callsign, StationSpeaker::Approach);
         tracing::info!(runway = %ident, alt = target_alt_ft, ils, "vectors armed");
+        // At or above the transition level the descent is to a flight level
+        // and carries no QNH (the pressure goes with the first altitude).
+        let level = atis::is_flight_level(target_alt_ft, ctx.transition_level_ft);
+        let (icao_alt, faa_alt, qnh) = if level {
+            let fl = atis::spoken_flight_level(target_alt_ft);
+            (fl.clone(), fl, String::new())
+        } else {
+            (
+                format!("to altitude {} feet", spoken_alt(target_alt_ft)),
+                spoken_alt(target_alt_ft),
+                tower::qnh_clause(ctx),
+            )
+        };
         let plan_phrase = match (ils, self.dialect) {
             // CAP 413 / ICAO: "vectoring ILS approach", altitudes are "to
             // altitude ... feet" with the QNH attached.
             (true, Dialect::Icao) => format!(
-                "Vectoring ILS approach runway {}. Descend to altitude {} feet{}.",
+                "Vectoring ILS approach runway {}. Descend {icao_alt}{qnh}.",
                 runway_spoken,
-                spoken_alt(target_alt_ft),
-                tower::qnh_clause(ctx)
             ),
             // FAA: "expect vectors ILS runway ... approach", "descend and
             // maintain", and the pressure clause speaks altimeter in inches
             // (ctx.qnh carries the dialect-correct phrase).
             (true, Dialect::Faa) => format!(
-                "Expect vectors ILS runway {} approach. Descend and maintain {}{}.",
+                "Expect vectors ILS runway {} approach. Descend and maintain {faa_alt}{qnh}.",
                 runway_spoken,
-                spoken_alt(target_alt_ft),
-                tower::qnh_clause(ctx)
             ),
             (false, _) => format!(
-                "Expect vectors, visual approach runway {}. Descend and maintain {}{}.",
+                "Expect vectors, visual approach runway {}. Descend and maintain {faa_alt}{qnh}.",
                 runway_spoken,
-                spoken_alt(target_alt_ft),
-                tower::qnh_clause(ctx)
             ),
         };
         format!(
@@ -1816,6 +1862,7 @@ impl Station {
             helicopter: false,
             ifr: None,
             runway_refusal: None,
+            transition_level_ft: self.apt.transition_level_ft,
         }
     }
 }
@@ -1881,6 +1928,8 @@ pub fn is_radio_call(t: &str, airport_lc: &str) -> bool {
         // to their copilot. "IFR" alone is not radio speech ("we're IFR
         // today" is crew talk); the IFR request carries "request" anyway.
         || t.contains("ready to copy")
+        // "Cancel IFR" is said to a controller, never to the copilot.
+        || tower::parse_intent(t) == tower::Intent::CancelIfr
 }
 
 /// Publish an IFR clearance whose readback the tower accepted, for the
@@ -1927,6 +1976,13 @@ pub(crate) fn resolve_destination(dest: &str) -> Option<(String, String, (f64, f
         for code in &codes {
             if let Some(a) = region.iter().find(|a| a.icao.eq_ignore_ascii_case(code)) {
                 return Some((a.icao.clone(), a.apt.name.clone(), (a.lat, a.lon)));
+            }
+        }
+        // Beyond the region index: any land field by its code.
+        let dir = FIELD_DIR.lock().unwrap_or_else(|e| e.into_inner());
+        for code in &codes {
+            if let Some((icao, name, pos)) = dir.iter().find(|(i, _, _)| i.eq_ignore_ascii_case(code)) {
+                return Some((icao.clone(), name.clone(), *pos));
             }
         }
     }
@@ -2762,6 +2818,15 @@ pub struct RegionApt {
 
 static REGION: Mutex<Vec<RegionApt>> = Mutex::new(Vec::new());
 
+/// Every land field in apt.dat, towered or not, as (ICAO, name, position):
+/// the IFR clearance's destination directory beyond the region index
+/// (issue #96). An IFR flight files to any field with a runway, and the
+/// region index holds only staffed towers, so "IFR clearance to" a
+/// tower-less field (or one whose tower row is a Gateway placeholder) was
+/// "say again destination". Built by the same scan as [`REGION`]; codes
+/// only (a name across forty thousand fields is a guess).
+static FIELD_DIR: Mutex<Vec<(String, String, (f64, f64))>> = Mutex::new(Vec::new());
+
 /// The active station's identity + position, for the switch decision. Set by
 /// [`Station::from_airport`].
 static ACTIVE_FIELD: Mutex<Option<(String, f64, f64)>> = Mutex::new(None);
@@ -2792,7 +2857,11 @@ pub fn region_loaded() -> bool {
 
 pub fn load_region(apt_path: &str) {
     let mut v: Vec<RegionApt> = Vec::new();
+    let mut dir: Vec<(String, String, (f64, f64))> = Vec::new();
     let res = nav::scan_airports(apt_path, |icao, apt| {
+        if let Some(pos) = apt.position() {
+            dir.push((icao.to_string(), apt.name.clone(), pos));
+        }
         // Staffed towers only: a Gateway "unnamed entity" TWR row (an
         // ultralight strip's air-to-air frequency, mistyped) must not become
         // a handoff target or "the nearest station" (LEMY, 2026-07-10).
@@ -2809,8 +2878,9 @@ pub fn load_region(apt_path: &str) {
     });
     match res {
         Ok(()) => {
-            tracing::info!(towered_fields = v.len(), "enroute region indexed");
+            tracing::info!(towered_fields = v.len(), fields = dir.len(), "enroute region indexed");
             *REGION.lock().unwrap_or_else(|e| e.into_inner()) = v;
+            *FIELD_DIR.lock().unwrap_or_else(|e| e.into_inner()) = dir;
         }
         Err(e) => tracing::warn!("region index failed ({e:#}); staying single-airport"),
     }
@@ -8830,6 +8900,7 @@ mod tests {
     fn lxgb() -> Station {
         Station {
             apt: nav::AirportInfo {
+                transition_level_ft: None,
                 name: "Gibraltar".into(),
                 elev_ft: 11.0,
                 runways: Vec::new(),
@@ -9003,6 +9074,7 @@ mod tests {
         RegionApt {
             icao: name.get(0..4).unwrap_or("XXXX").to_uppercase(),
             apt: nav::AirportInfo {
+                transition_level_ft: None,
                 name: name.into(),
                 elev_ft: 0.0,
                 runways: Vec::new(),
@@ -9195,6 +9267,7 @@ mod tests {
         // LEMY: an ultralight strip whose air-to-air frequency the Gateway
         // typed as "1054 130125 unnamed entity" — a frequency, not a tower.
         let apt = nav::AirportInfo {
+            transition_level_ft: None,
             name: "Merida - Royanejos".into(),
             elev_ft: 883.0,
             runways: Vec::new(),
@@ -9207,6 +9280,7 @@ mod tests {
         assert!(apt.staffed_tower().is_none());
         // A real tower row (Badajoz: "TWR CIVIL") stays staffed.
         let apt = nav::AirportInfo {
+            transition_level_ft: None,
             name: "Badajoz- Talavera La Real".into(),
             elev_ft: 607.0,
             runways: Vec::new(),
@@ -11435,6 +11509,7 @@ mod tests {
             helicopter: false,
             ifr: None,
             runway_refusal: None,
+            transition_level_ft: None,
             wake_secs_left: None,
             taxi_via: Vec::new(),
             taxi_crossings: Vec::new(),
@@ -11840,6 +11915,7 @@ mod tests {
         RegionApt {
             icao: "EGPH".into(),
             apt: nav::AirportInfo {
+                transition_level_ft: None,
                 name: "Edinburgh".into(),
                 elev_ft: 136.0,
                 runways: Vec::new(),
@@ -11940,6 +12016,96 @@ mod tests {
         assert_eq!(crate::party_line::assigned_clearance(), None, "uninstall retires it");
         assert_eq!(crate::party_line::ifr_flight_code(), None, "uninstall ends the IFR flight");
         *REGION.lock().unwrap() = Vec::new();
+        *SQUAWK_WATCH.lock().unwrap() = None;
+    }
+
+    /// Issue #96: a destination beyond the region index (no staffed tower)
+    /// is cleared by its ICAO code from the whole-file directory; "cancel
+    /// IFR" retires the clearance and the flight's IFR standing, and a VFR
+    /// flight asking is told it has none.
+    #[test]
+    fn an_ifr_clearance_reaches_any_field_and_cancel_ifr_ends_it() {
+        let _guard = SIDE_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        Station::uninstall();
+        *SQUAWK_WATCH.lock().unwrap() = None;
+        *REGION.lock().unwrap() = vec![edinburgh()];
+        // Glenforsa, a Mull grass strip with no tower row: not in the region
+        // index, in the directory by its code only.
+        *FIELD_DIR.lock().unwrap() = vec![("EGHM".into(), "Glenforsa".into(), (56.52, -5.91))];
+        assert_eq!(resolve_destination("EGHM").map(|r| r.0).as_deref(), Some("EGHM"));
+        assert_eq!(resolve_destination("glenforsa"), None, "names only from the region index");
+        let wx = Wx {
+            wind_from_deg: 90.0,
+            wind_kts: 10.0,
+        };
+        let path = lxgb_apt_file();
+        let mut st = Station::load(path.to_str().unwrap(), "LXGB").expect("LXGB loads");
+        st.set_procedures_now(lxgb_cifp_dir().to_str().unwrap(), "", "", "LXGB");
+        let ctx = st.make_ctx(
+            wx,
+            "QNH one zero one seven".into(),
+            "November one seven two Sierra Papa".into(),
+            true,
+            false,
+            None,
+            false,
+            None,
+        );
+        let cs = "November one seven two Sierra Papa";
+        // Nothing to cancel yet.
+        let r = st.route_keyed(
+            "gibraltar tower, november one seven two sierra papa, cancel ifr",
+            Service::Tower,
+            &ctx,
+            wx,
+        );
+        assert_eq!(r, format!("{cs}, roger, you are not on an IFR clearance."));
+        let r = st.route_keyed(
+            "gibraltar tower, november one seven two sierra papa, request ifr clearance to echo golf hotel mike",
+            Service::Tower,
+            &ctx,
+            wx,
+        );
+        assert!(r.starts_with(&format!("{cs}, cleared to Glenforsa")), "{r}");
+        let rb = crate::party_line::readback_owed().expect("owed");
+        assert_eq!(st.route_keyed(&rb.to_lowercase(), Service::Tower, &ctx, wx), "");
+        assert_eq!(
+            crate::party_line::assigned_clearance().map(|c| c.dest).as_deref(),
+            Some("EGHM")
+        );
+        assert!(crate::party_line::ifr_flight_code().is_some());
+        assert!(st.ifr_runway.is_some(), "the SID's runway is frozen");
+        // Cancelled: the clearance, the flight's IFR code and the frozen
+        // runway all go.
+        let r = st.route_keyed(
+            "gibraltar tower, november one seven two sierra papa, cancelling i f r",
+            Service::Tower,
+            &ctx,
+            wx,
+        );
+        assert_eq!(r, format!("{cs}, IFR flight cancelled."));
+        assert_eq!(crate::party_line::assigned_clearance(), None);
+        assert_eq!(crate::party_line::ifr_flight_code(), None);
+        assert!(st.ifr_runway.is_none());
+        // An owed readback is cancelled too, with nothing published after.
+        st.route_keyed(
+            "gibraltar tower, november one seven two sierra papa, request ifr clearance to edinburgh",
+            Service::Tower,
+            &ctx,
+            wx,
+        );
+        let r = st.route_keyed(
+            "november one seven two sierra papa, cancel ifr",
+            Service::Tower,
+            &ctx,
+            wx,
+        );
+        assert_eq!(r, format!("{cs}, IFR flight cancelled."));
+        assert!(crate::party_line::readback_owed().is_none_or(|r| !r.starts_with("Cleared to")));
+        assert_eq!(crate::party_line::assigned_clearance(), None);
+        Station::uninstall();
+        *REGION.lock().unwrap() = Vec::new();
+        *FIELD_DIR.lock().unwrap() = Vec::new();
         *SQUAWK_WATCH.lock().unwrap() = None;
     }
 
@@ -12270,6 +12436,7 @@ mod tests {
                 helicopter: false,
                 ifr: None,
                 runway_refusal: None,
+                transition_level_ft: None,
                 wake_secs_left: None,
                 taxi_via: Vec::new(),
                 taxi_crossings: Vec::new(),
@@ -12533,6 +12700,7 @@ mod tests {
             helicopter: false,
             ifr: None,
             runway_refusal: None,
+            transition_level_ft: None,
             wake_secs_left: None,
             taxi_via: Vec::new(),
             taxi_crossings: Vec::new(),

@@ -1286,19 +1286,38 @@ pub fn departure_check_in(
     alt_ft: f64,
     climb_to_ft: f64,
 ) -> String {
+    departure_check_in_above(callsign, to, alt_ft, climb_to_ft, f64::INFINITY)
+}
+
+/// [`departure_check_in`] with the flight's transition altitude: a level
+/// above it (passed or climbed to) is a flight level ("passing flight level
+/// seven zero climbing flight level one five zero"), one at or below it
+/// feet, the way the climb is flown on the altimeter (issue #97; the
+/// setting rule is `instruments::correct_setting_inhg`'s).
+pub fn departure_check_in_above(
+    callsign: &Option<String>,
+    to: &str,
+    alt_ft: f64,
+    climb_to_ft: f64,
+    transition_ft: f64,
+) -> String {
     let who = callsign
         .as_ref()
         .map(|c| format!("{c}, "))
         .unwrap_or_default();
+    let said = |ft: f64| {
+        if ft > transition_ft {
+            crate::atis::spoken_flight_level(ft)
+        } else {
+            crate::atis::spoken_alt(ft)
+        }
+    };
     let climb = if climb_to_ft > alt_ft + 200.0 {
-        format!(" climbing {}", crate::atis::spoken_alt(climb_to_ft))
+        format!(" climbing {}", said(climb_to_ft))
     } else {
         String::new()
     };
-    format!(
-        "{to}, {who}passing {}{climb}",
-        crate::atis::spoken_alt(alt_ft)
-    )
+    format!("{to}, {who}passing {}{climb}", said(alt_ft))
 }
 
 async fn wait_until<F, Fut>(secs: f64, step_ms: u64, mut cond: F) -> bool
@@ -6104,7 +6123,7 @@ mod tests {
         assert_eq!(super::arrival_wind(None, None), (None, "none"));
     }
 
-    use super::departure_check_in;
+    use super::{departure_check_in, departure_check_in_above};
 
     /// The runway chosen at the arm is the runway the arrival sets up for
     /// (LIBP-LEMG 2026-09-26: UNTO2A chosen for 12, the ILS 13 flown after a
@@ -6319,6 +6338,27 @@ mod tests {
     // The first call to Departure has to read as a CHECK-IN to the station
     // (a readback carrying "passing"/"climbing", never a request), or the
     // departure controller answers "say again" instead of "radar contact".
+    #[test]
+    fn a_climb_above_the_transition_altitude_checks_in_with_a_flight_level() {
+        let cs = Some("Speedbird three zero six".to_string());
+        let call = departure_check_in_above(&cs, "London Departure", 3000.0, 15000.0, 6000.0);
+        assert_eq!(
+            call,
+            "London Departure, Speedbird three zero six, passing three thousand climbing flight level one five zero"
+        );
+        let call = departure_check_in_above(&cs, "London Departure", 7020.0, 15000.0, 6000.0);
+        assert!(call.contains("passing flight level seven zero climbing flight level one five zero"), "{call}");
+        // At or below the transition altitude it stays feet.
+        let call = departure_check_in_above(&cs, "London Departure", 2000.0, 6000.0, 6000.0);
+        assert!(call.ends_with("passing two thousand climbing six thousand"), "{call}");
+        // The departure controller clears the climb the check-in announced,
+        // in its own words.
+        assert_eq!(
+            crate::station::climb_announced(&call.replace("six thousand", "flight level one two zero")),
+            Some("flight level one two zero".into())
+        );
+    }
+
     #[test]
     fn the_departure_check_in_is_shaped_to_earn_radar_contact() {
         let cs = Some("November four five X-ray Sierra".to_string());
