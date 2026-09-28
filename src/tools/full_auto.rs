@@ -353,6 +353,15 @@ impl Tool for FullAuto {
                 "Full auto isn't running.".to_string()
             });
         }
+        // A new flight still loading is no place to start one: every read
+        // is the sim mid-reload. LEMG (#134, sortie 1790584476-full_auto):
+        // "fly a circuit" armed 0.6 s after "put us on a 5 mile final",
+        // judged the load's transient position (runway 12's midpoint, AGL
+        // -84 ft) as "on 12, 1,376 m left", and flew on as a zombie under
+        // the approach that followed.
+        if let Some(line) = crate::tools::setup::new_flight_loading_refusal() {
+            return Ok(line);
+        }
         if crate::full_auto::running() {
             return Ok("I'm already running the full sequence. Say cancel to stop.".to_string());
         }

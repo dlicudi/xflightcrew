@@ -511,6 +511,10 @@ async fn main() -> Result<()> {
     // ...and its text fields (callsign, airline telephony), through the
     // registry: env-pinned ones are shown read-only, edits persist.
     spawn_text_settings_poller(config.xplane_base_url.clone());
+    // A new flight another writer starts through the plugin's mailbox (the
+    // sortie runner's runway and ramp starts) ends the old one here too:
+    // loops stood down, clearances retired (#134).
+    tools::setup::spawn_new_flight_watch(config.xplane_base_url.clone());
 
     // In-sim status panel (the bundled plugin): mirror phase/heard/action into its
     // datarefs. Best-effort — a no-op if the plugin isn't loaded.

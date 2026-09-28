@@ -910,6 +910,88 @@ pub(crate) async fn get_zone_clearance(
     }
 }
 
+/// A runway start's zone clearance call: the runway it is lined up on,
+/// named, so the tower can give it that runway (`station`'s stated-runway
+/// pick for a caller on the strip), and "for circuits" on a circuit, since
+/// the zone request states the flight's intent afresh. Pure.
+pub(crate) fn strip_clearance_call(runway: &str, circuits: bool) -> String {
+    format!(
+        "request clearance, runway {}{}",
+        crate::circuit::spell_runway(runway),
+        if circuits { ", for circuits" } else { "" }
+    )
+}
+
+/// Does a held zone clearance already serve a runway start on `runway`?
+/// Only one naming that runway, with its code held. Pure.
+pub(crate) fn strip_clearance_held(
+    runway: &str,
+    cleared: Option<&str>,
+    squawk: Option<i64>,
+) -> bool {
+    squawk.is_some() && cleared.is_some_and(|c| crate::autotakeoff::runway_matches(runway, c))
+}
+
+/// [`get_zone_clearance`] for a runway start: asked FOR the strip we are
+/// lined up on ([`strip_clearance_call`]), and asked even with a code held
+/// when the held clearance names another runway. At LEMG (sortie
+/// 1790584715-full_auto, 2026-09-28) the last case's zone clearance (31,
+/// 4501) was still held when the runner put the 737 on 13's threshold: the
+/// arm asked nothing, read "cleared off 31" and taxied 400 s round the
+/// field. The tower still decides: a wind that argues, or a flight it is
+/// sequencing, keeps its runway, and the taxied departure goes there.
+async fn zone_clearance_from_the_strip(
+    xp: &XPlaneClient,
+    ctx: &ToolCtx<'_>,
+    voice: &Option<Voice>,
+    callsign: &Option<String>,
+    runway: &str,
+) {
+    if !crate::mode::atc_enabled()
+        || !crate::party_line::station_reaches()
+        || crate::party_line::assigned_clearance().is_some()
+        || strip_clearance_held(
+            runway,
+            crate::party_line::clearance_runway().as_deref(),
+            crate::party_line::assigned_squawk(),
+        )
+    {
+        return;
+    }
+    if let Some(khz) = crate::party_line::home_tower_khz() {
+        let _ = xp.set_float(COM1_FREQ_KHZ, khz as f64).await;
+    }
+    let owed_before = crate::party_line::readback_owed();
+    crate::circuit::transmit(crate::circuit::radio_call(
+        callsign,
+        &strip_clearance_call(runway, flying_circuits()),
+    ));
+    event("request_clearance", json!({ "runway": runway }));
+    // The answer is a NEW readback owed (a held code answers nothing: it may
+    // be the last flight's), or the clearance naming our runway with a code.
+    waiting("the clearance");
+    let answered = wait_until(60.0, 500, || async {
+        let owed = crate::party_line::readback_owed();
+        (owed.is_some() && owed != owed_before)
+            || strip_clearance_held(
+                runway,
+                crate::party_line::clearance_runway().as_deref(),
+                crate::party_line::assigned_squawk(),
+            )
+    })
+    .await;
+    event(
+        "strip_clearance",
+        json!({ "runway": runway, "answered": answered,
+                "cleared": crate::party_line::clearance_runway() }),
+    );
+    ensure_squawk(xp, ctx, voice).await;
+    if let Some(rb) = crate::party_line::readback_owed() {
+        crate::circuit::transmit(rb.trim_end_matches('.').to_string());
+        event("clearance_readback", json!({}));
+    }
+}
+
 /// The IFR clearance the tower owes a readback for is out: its coach line
 /// is the IFR readback ("Cleared to ... squawk ..."), not the zone
 /// clearance's ("Not above ...") nor a stale landing one ("Cleared to land
@@ -1922,8 +2004,16 @@ async fn fly(xp: XPlaneClient, config: Config, voice: Option<Voice>, tools: SubT
     let mut clearance_asked = false;
     if start != RunwayStart::None && towered {
         // The clearance first, from the strip too (IFR route or zone): it
-        // names the runway the departure is flown from.
-        get_zone_clearance(&xp, &ctx, &voice, &callsign, ifr_dest.as_deref()).await;
+        // names the runway the departure is flown from. A zone clearance is
+        // asked FOR the strip we sit on, and asked again when the one held
+        // names another (a clearance the last flight left, LEMG #134).
+        match (ifr_dest.as_deref(), start.runway()) {
+            (None, Some(rwy)) => {
+                let rwy = rwy.to_string();
+                zone_clearance_from_the_strip(&xp, &ctx, &voice, &callsign, &rwy).await;
+            }
+            _ => get_zone_clearance(&xp, &ctx, &voice, &callsign, ifr_dest.as_deref()).await,
+        }
         clearance_asked = true;
         bail_if_abort!();
         let cleared = crate::party_line::clearance_runway();
@@ -5562,6 +5652,86 @@ mod runway_start_tests {
             lateral_m: 300.0,
         };
         assert_eq!(classify_runway_start(Err(Some(none_near)), 0.0), RunwayStart::None);
+    }
+
+    /// LEMG's two strips, the rows as apt.dat has them (12/30 with 190 m
+    /// displaced on 12; 13/31 with 75 m on each end).
+    fn lemg() -> Vec<crate::autoland::Runway> {
+        use std::io::Write;
+        let apt = std::env::temp_dir().join("xvl-runway-start-lemg-apt.dat");
+        let mut f = std::fs::File::create(&apt).unwrap();
+        writeln!(f, "1     48 0 0 LEMG Malaga").unwrap();
+        writeln!(f, "100 45.11 1 1 0.00 1 3 0  12 36.6910753 -4.5078270 0 190 3 1 1 1 30 36.6795648 -4.4805125 0 489 3 0 0 1").unwrap();
+        writeln!(f, "100 45.11 27 27 0.00 1 3 0  13 36.6845573 -4.5126253 0 75 3 1 0 2 31 36.6654027 -4.4858140 0 75 3 1 0 3").unwrap();
+        f.flush().unwrap();
+        crate::autoland::nearby_runways(apt.to_str().unwrap(), 36.68, -4.50, 3.0).unwrap()
+    }
+
+    /// #134 (LEMG, 2026-09-28): the runner's runway start for 13 DID put the
+    /// 737 on 13's threshold (36.684289 N 4.512250 W, 131.4 true at t
+    /// 1790584459.1, sortie 1790584715's arm fit "13"). The "Short on 12,
+    /// 1,375.8 m left of 2,019.4" of sortie 1790584476 was judged at
+    /// 36.68532005 N 4.49416975 W: runway 12's exact midpoint, the position
+    /// X-Plane reports while a flight loads (AGL -84 ft), read because a
+    /// queued "put us on a 5 mile final" was reloading the sim under the
+    /// arm. The classifier was right about what it read; nothing may arm
+    /// during a load (`setup::new_flight_loading_refusal`).
+    #[test]
+    fn the_lemg_runway_start_is_on_one_three_and_the_twelve_was_a_load() {
+        let cands = lemg();
+        let need = 2019.3635616820702;
+        let (r, remaining) =
+            crate::autotakeoff::runway_fit(&cands, 36.684288506540085, -4.51224958630406, 131.4, need)
+                .expect("lined up on 13");
+        assert_eq!(r.id, "13");
+        assert!(remaining > 3000.0, "{remaining}");
+        assert_eq!(
+            classify_runway_start(Ok(r.id.clone()), 0.0),
+            RunwayStart::Lined { runway: "13".into() }
+        );
+        // The load's transient: 12's midpoint, pointing down 13's course.
+        let (lat, lon): (f64, f64) = (
+            (36.6910753 + 36.6795648) / 2.0,
+            (-4.5078270 + -4.4805125) / 2.0,
+        );
+        assert!((lat - 36.68532005).abs() < 1e-7 && (lon + 4.49416975).abs() < 1e-7);
+        assert!(crate::autotakeoff::runway_fit(&cands, lat, lon, 131.4, need).is_none());
+        let why = crate::autotakeoff::why_no_fit_cleared(&cands, lat, lon, 131.4, need, None);
+        let crate::autotakeoff::NoFit::TooLittleLeft { id, remaining_m, .. } = &why else {
+            panic!("{why:?}");
+        };
+        assert_eq!(id, "12");
+        assert!((remaining_m - 1375.8).abs() < 5.0, "{remaining_m}");
+    }
+
+    /// #134: a runway start's zone clearance names its strip (the tower
+    /// gives it that runway, `station`), says "for circuits" on a circuit,
+    /// and is asked again when the held one names another runway: the last
+    /// case's (31, 4501) is what sent sortie 1790584715 to taxi.
+    #[test]
+    fn a_runway_start_asks_its_clearance_for_its_own_runway() {
+        use crate::tower::{parse_intent, stated_runway, wants_circuits, Intent};
+        for circuits in [false, true] {
+            let call = crate::circuit::radio_call(
+                &Some("November eight one six November November".into()),
+                &strip_clearance_call("13", circuits),
+            );
+            assert_eq!(parse_intent(&call), Intent::RequestClearance, "{call}");
+            assert_eq!(stated_runway(&call).as_deref(), Some("13"), "{call}");
+            assert_eq!(wants_circuits(&call), circuits, "{call}");
+        }
+        assert!(!strip_clearance_held("13", Some("31"), Some(4501)), "asked again");
+        assert!(!strip_clearance_held("13", None, Some(4501)));
+        assert!(!strip_clearance_held("13", Some("13"), None));
+        assert!(strip_clearance_held("13", Some("13"), Some(4501)));
+        // The zone request from the strip goes before the under-clearance
+        // judgement; an IFR flight keeps its own clearance path.
+        let src = include_str!("full_auto.rs");
+        let strip = src
+            .find("zone_clearance_from_the_strip(&xp, &ctx")
+            .expect("the runway start asks from the strip");
+        let judged = src.find("start = start.under_clearance(").unwrap();
+        assert!(strip < judged);
     }
 
     /// The clearance names the runway: the one we sit on stands, a zero-

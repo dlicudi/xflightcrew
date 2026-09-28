@@ -20,6 +20,133 @@ const INIT_RESULT: &str = "xcopilot/sim/init_result";
 const INIT_SEQ: &str = "xcopilot/sim/init_seq";
 const TYPED: &str = "xcopilot/typed";
 
+// ---- A new flight in progress, and one someone else started ---------------
+//
+// Two facts about the flight-initialisation mailbox the rest of the crew
+// must respect (#134, LEMG 2026-09-28):
+// - While the app's OWN new flight loads, nothing arms on the old one: every
+//   read is the sim mid-reload. "Fly a circuit" armed 0.6 s after a queued
+//   "put us on a 5 mile final" (sortie 1790584476-full_auto), judged the
+//   load's transient position (runway 12's midpoint, 36.68532005 N
+//   4.49416975 W, AGL -84 ft) as "on 12, 1,376 m left of 2,019 needed", and
+//   flew on under the approach that replaced the flight.
+// - A new flight posted by ANOTHER writer (the sortie runner's runway and
+//   ramp starts go straight to the plugin) is a new flight all the same: the
+//   loops flying the old one stand down and its clearances are retired. The
+//   runner put the 737 on 13's threshold while the last case's zone
+//   clearance (31, squawk 4501) was still held, and full auto taxied to 31.
+
+/// The app is starting a new flight (a setup tool committed to it): set
+/// before the follow-up is spawned, cleared once it has armed or failed.
+static NEW_FLIGHT_LOADING: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+/// Mailbox runs this process has in flight ([`run_init`]).
+static OWN_INITS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+/// The highest init sequence number this process has accounted for (its own
+/// answered runs, and every run the watch has seen): the watch acts only
+/// past it. `i64::MIN` until the first read.
+static KNOWN_INIT_SEQ: std::sync::atomic::AtomicI64 =
+    std::sync::atomic::AtomicI64::new(i64::MIN);
+
+/// Held by a setup's follow-up: the flag stays up until it drops.
+struct Loading;
+
+impl Loading {
+    fn begin() -> Loading {
+        NEW_FLIGHT_LOADING.store(true, std::sync::atomic::Ordering::SeqCst);
+        Loading
+    }
+}
+
+impl Drop for Loading {
+    fn drop(&mut self) {
+        NEW_FLIGHT_LOADING.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// A new flight is loading through this app's mailbox.
+pub fn new_flight_loading() -> bool {
+    NEW_FLIGHT_LOADING.load(std::sync::atomic::Ordering::SeqCst)
+        || OWN_INITS.load(std::sync::atomic::Ordering::SeqCst) > 0
+}
+
+/// The words a mission's arm answers with while a new flight loads.
+pub fn new_flight_loading_refusal() -> Option<String> {
+    new_flight_loading()
+        .then(|| "A new flight is still loading. Ask again once it's up.".to_string())
+}
+
+/// What the watch makes of one read of the mailbox's counter and result.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum InitSeen {
+    /// Nothing new (or the first read: the baseline).
+    Nothing,
+    /// A run nobody here posted has finished; `new_flight` when it made one
+    /// (result 0).
+    Foreign { new_flight: bool },
+}
+
+/// Judge one read against what this process has accounted for: a counter
+/// past `known` with an answer (`result >= 0`) is someone else's run.
+/// Returns the verdict and the new `known`. Pure.
+pub fn judge_init_seq(known: i64, seq: i64, result: i64) -> (InitSeen, i64) {
+    if known == i64::MIN {
+        return (InitSeen::Nothing, seq);
+    }
+    if seq <= known || result < 0 {
+        return (InitSeen::Nothing, known);
+    }
+    (InitSeen::Foreign { new_flight: result == 0 }, seq)
+}
+
+/// Watch the flight-initialisation mailbox for runs this app did not post
+/// (the sortie runner's starts): each new flight stands every loop down and
+/// retires the last flight's clearances, the station for the field rebuilt,
+/// as the app's own approach setup does (blackbox `setup`
+/// `foreign_new_flight`). A slow poll: the runner waits for the aircraft to
+/// sit still and settles fifteen seconds before its command.
+pub fn spawn_new_flight_watch(base: String) {
+    spawn_off_loop(async move {
+        use std::sync::atomic::Ordering::SeqCst;
+        let xp = crate::xplane::XPlaneClient::new(base);
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            // Our own run accounts for its own number.
+            if new_flight_loading() {
+                continue;
+            }
+            let (seq, res) = tokio::join!(xp.get_float(INIT_SEQ), xp.get_float(INIT_RESULT));
+            let (Ok(seq), Ok(res)) = (seq, res) else {
+                continue;
+            };
+            let (seen, known) =
+                judge_init_seq(KNOWN_INIT_SEQ.load(SeqCst), seq as i64, res as i64);
+            KNOWN_INIT_SEQ.fetch_max(known, SeqCst);
+            if seen == (InitSeen::Foreign { new_flight: true }) && !new_flight_loading() {
+                foreign_new_flight(seq as i64);
+            }
+        }
+    });
+}
+
+/// Someone else started a new flight: nothing keeps flying the old one, and
+/// the world forgets it.
+fn foreign_new_flight(seq: i64) {
+    crate::flight_state::stand_down();
+    let field = crate::station::active_icao().map(|(icao, _, _)| icao);
+    let tower = match (&field, crate::mode::atc_enabled()) {
+        (Some(icao), true) => {
+            crate::party_line::retire_for_new_flight();
+            crate::station::arm_new_flight(icao, std::time::Instant::now())
+        }
+        _ => None,
+    };
+    crate::blackbox::record(
+        "setup",
+        json!({ "event": "foreign_new_flight", "seq": seq, "field": field, "tower": tower }),
+    );
+}
+
 /// The ICAO type an `.acf` declares (`P acf/_ICAO B738`). Pure.
 pub fn acf_icao(acf_text: &str) -> Option<String> {
     acf_text.lines().find_map(|l| {
@@ -170,7 +297,9 @@ impl Tool for SetUpFlight {
             "setup",
             json!({ "event": "init", "acf": acf, "airport": origin, "ramp": stand_name, "json": body }),
         );
+        let loading = Loading::begin();
         spawn_off_loop(async move {
+            let _loading = loading;
             follow_up(base, voice, body, origin, stand_name).await;
         });
         Ok(format!(
@@ -609,7 +738,8 @@ impl Tool for SetUpApproach {
         // never wrote the mailbox, and the second wrote it (the sim
         // repositioned 6 s later) but never read the result: no arm, no line,
         // not even the timeout, and the 737 dived with nobody flying.
-        spawn_off_loop(approach_follow_up(job));
+        let loading = Loading::begin();
+        spawn_off_loop(approach_follow_up(job, loading));
         Ok(format!(
             "Setting up a {final_nm} mile final for runway {} at {}.",
             crate::circuit::spell_runway(&rwy),
@@ -813,10 +943,35 @@ pub async fn run_init(
         run.outcome = InitOutcome::NoBaseline;
         return run;
     };
+    // Our own run: the new-flight watch stands aside while it is out, and
+    // its number is ours once answered (unanswered, the next one is).
+    use std::sync::atomic::Ordering::SeqCst;
+    OWN_INITS.fetch_add(1, SeqCst);
+    let (run, seq) = run_posted(mb, body, t, report, run, seq0).await;
+    KNOWN_INIT_SEQ.fetch_max(seq.unwrap_or(seq0 as i64 + 1), SeqCst);
+    OWN_INITS.fetch_sub(1, SeqCst);
+    run
+}
+
+/// [`run_init`] from the post on, with the counter it saw answered.
+async fn run_posted(
+    mb: &dyn InitMailbox,
+    body: &[u8],
+    t: InitTiming,
+    report: &(dyn Fn(InitWait) + Sync),
+    mut run: InitRun,
+    seq0: f64,
+) -> (InitRun, Option<i64>) {
+    let read = |name: &'static str| async move {
+        match tokio::time::timeout(t.read_timeout, mb.read(name)).await {
+            Ok(Ok(v)) => Some(v),
+            _ => None,
+        }
+    };
     let posted = tokio::time::timeout(std::time::Duration::from_secs(5), mb.post(body)).await;
     if !matches!(posted, Ok(Ok(()))) {
         run.outcome = InitOutcome::Unreachable;
-        return run;
+        return (run, Some(seq0 as i64));
     }
     let t0 = tokio::time::Instant::now();
     let mut reported = t0;
@@ -827,7 +982,7 @@ pub async fn run_init(
         if let (Some(seq), Some(res)) = (seq, res) {
             if seq > seq0 && res >= 0.0 {
                 run.outcome = InitOutcome::Done(res as i64);
-                return run;
+                return (run, Some(seq as i64));
             }
         }
         run.read_errors += u32::from(seq.is_none()) + u32::from(res.is_none());
@@ -836,7 +991,7 @@ pub async fn run_init(
             report(InitWait { seq0, seq, result: res, read_errors: run.read_errors, polls: run.polls });
         }
     }
-    run
+    (run, None)
 }
 
 /// Did this init start a new flight? Answered, or written and never
@@ -846,7 +1001,7 @@ pub fn new_flight_began(outcome: &InitOutcome) -> bool {
     matches!(outcome, InitOutcome::Done(0) | InitOutcome::TimedOut)
 }
 
-async fn approach_follow_up(job: ApproachJob) {
+async fn approach_follow_up(job: ApproachJob, loading: Loading) {
     let xp = crate::xplane::XPlaneClient::new(job.base.clone());
     let say = |line: &str| {
         if let Some(v) = &job.voice {
@@ -912,6 +1067,8 @@ async fn approach_follow_up(job: ApproachJob) {
             crate::flight::note_crew_takeover("setup_approach");
         }
     }
+    // Armed (or not): the new flight exists and is somebody's.
+    drop(loading);
     // Always on file and always said: a setup that ends in silence is the
     // one the pilot cannot act on. `arm_ms` is result-seen to armed.
     crate::blackbox::record(
@@ -1306,6 +1463,74 @@ mod tests {
         assert_eq!(InitOutcome::TimedOut.name(), "timeout");
         assert_eq!(InitOutcome::Done(0).name(), "ok");
         assert_eq!(InitOutcome::Done(6).name(), "refused");
+    }
+
+    /// #134: the watch acts only on a run nobody here posted, once it has an
+    /// answer. The first read is the baseline (a flight loaded before boot
+    /// is no new flight); a run still pending (-1) waits; a refusal (6) made
+    /// no flight.
+    #[test]
+    fn the_watch_acts_on_a_new_flight_someone_else_started() {
+        let (seen, known) = judge_init_seq(i64::MIN, 8, 0);
+        assert_eq!((seen, known), (InitSeen::Nothing, 8));
+        assert_eq!(judge_init_seq(8, 8, 0), (InitSeen::Nothing, 8));
+        assert_eq!(judge_init_seq(8, 9, -1), (InitSeen::Nothing, 8), "pending");
+        assert_eq!(
+            judge_init_seq(8, 9, 0),
+            (InitSeen::Foreign { new_flight: true }, 9)
+        );
+        assert_eq!(
+            judge_init_seq(8, 9, 6),
+            (InitSeen::Foreign { new_flight: false }, 9)
+        );
+        // An older number (a plugin reload restarted the counter) is no run.
+        assert_eq!(judge_init_seq(9, 0, 0), (InitSeen::Nothing, 9));
+    }
+
+    /// The app's own run accounts for its own number: the watch never takes
+    /// it for someone else's (it would stand down the autoland the approach
+    /// setup just armed).
+    #[tokio::test]
+    async fn the_apps_own_run_is_never_foreign() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let mb = Reloading::new(0, 0, 1, 0);
+        let run = run_init(&mb, b"{}", FAST, &quiet).await;
+        assert_eq!(run.outcome, InitOutcome::Done(0));
+        let (seen, _) = judge_init_seq(KNOWN_INIT_SEQ.load(SeqCst), 1, 0);
+        assert_eq!(seen, InitSeen::Nothing);
+        // Unanswered, the next number is presumed ours too.
+        let mb = Reloading::new(0, 0, u32::MAX, 0);
+        let t = InitTiming { deadline: std::time::Duration::from_millis(60), ..FAST };
+        assert_eq!(run_init(&mb, b"{}", t, &quiet).await.outcome, InitOutcome::TimedOut);
+        let (seen, _) = judge_init_seq(KNOWN_INIT_SEQ.load(SeqCst), 1, 0);
+        assert_eq!(seen, InitSeen::Nothing);
+    }
+
+    /// While the app's own new flight loads, a mission's arm is refused in
+    /// words; the flag drops with the follow-up. And the full-auto tool asks
+    /// before anything else it does (LEMG sortie 1790584476-full_auto: "fly a
+    /// circuit" armed 0.6 s after "put us on a 5 mile final").
+    #[test]
+    fn nothing_arms_while_a_new_flight_loads() {
+        {
+            let _loading = Loading::begin();
+            assert!(new_flight_loading());
+            let line = new_flight_loading_refusal().expect("refused while loading");
+            assert!(line.contains("still loading"), "{line}");
+        }
+        let src = include_str!("full_auto.rs");
+        let refusal = src
+            .find("new_flight_loading_refusal()")
+            .expect("the full-auto tool asks");
+        let running = src
+            .find("crate::full_auto::running()")
+            .expect("the running check");
+        assert!(refusal < running, "asked before anything arms");
+        // The approach follow-up holds the flag until it has armed.
+        let this = include_str!("setup.rs");
+        let arm = this.find("crate::autoland::run_autoland(").unwrap();
+        let drop_at = this.find("drop(loading);").unwrap();
+        assert!(arm < drop_at, "the flag drops after the arm");
     }
 
     #[test]
