@@ -112,6 +112,11 @@ static OVERRIDES: Mutex<Vec<(String, String)>> = Mutex::new(Vec::new());
 
 /// A proposed section (index into the lists) and when it was offered.
 static PROPOSAL: Mutex<Option<(usize, Instant)>> = Mutex::new(None);
+
+/// The running flow's flavour (`None` when no flow runs).
+static RUNNING: Mutex<Option<Flavour>> = Mutex::new(None);
+/// Why a running Crew flow was stood down, for its closing line.
+static STOOD_DOWN: Mutex<Option<StandDown>> = Mutex::new(None);
 /// How long "Climb checklist when you're ready?" stays answerable.
 pub const PROPOSAL_TTL: Duration = Duration::from_secs(120);
 
@@ -381,6 +386,132 @@ fn automation_flying() -> bool {
         || crate::procedure::ACTIVE.load(Relaxed)
         || crate::circuit::ACTIVE.load(Relaxed)
         || crate::autoland::ACTIVE.load(Relaxed)
+}
+
+/// The automation that has TAKEN the aircraft, if any: a mission or a loop
+/// that flies it (full auto from its first stage, the takeoff, the circuit,
+/// the follower, autoland, the helicopter's loops). The ground drives
+/// (the taxi, the tug) are not on it: they share the cockpit with an
+/// after-landing clean-up, which is where that list runs.
+pub fn mission_owner() -> Option<&'static str> {
+    use std::sync::atomic::Ordering::Relaxed;
+    if crate::full_auto::ACTIVE.load(Relaxed) {
+        Some("full auto")
+    } else if crate::heli_route::ACTIVE.load(Relaxed) {
+        Some("the route")
+    } else if crate::autoland::ACTIVE.load(Relaxed) {
+        Some("autoland")
+    } else if crate::circuit::ACTIVE.load(Relaxed) || crate::heli_circuit::ACTIVE.load(Relaxed) {
+        Some("the circuit")
+    } else if crate::procedure::ACTIVE.load(Relaxed) {
+        Some("the follower")
+    } else if crate::autotakeoff::ACTIVE.load(Relaxed) {
+        Some("the takeoff")
+    } else if crate::hover::ACTIVE.load(Relaxed) {
+        Some("the hover")
+    } else {
+        None
+    }
+}
+
+/// Why a Crew flow stopped before its end.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum StandDown {
+    /// An automation took the aircraft after the list began (its name).
+    Mission(&'static str),
+    /// A new flight was set up or the sim moved the aircraft (the cause).
+    NewFlight(&'static str),
+}
+
+impl StandDown {
+    fn by(self) -> &'static str {
+        match self {
+            StandDown::Mission(m) | StandDown::NewFlight(m) => m,
+        }
+    }
+}
+
+/// A Crew flow's watch for an automation TAKING the aircraft under it: the
+/// owner at the list's start is the baseline (a list the pilot asked for
+/// under full auto names the mission's items as held and goes on); an owner
+/// appearing where there was none stands the list down. Pure.
+///
+/// LEMG (2026-09-28, sorties 1790585651 and 1790586620): the After landing
+/// list began as Crew in the taxi in, blocked on its own speech, and ran on
+/// into the next full-auto departure: "Speed brake, down." at +20 s and
+/// "Flaps, up." at +46 s over the takeoff flaps full auto had set at
+/// +0.3 s, twice. The second "Flaps, up." came 1.8 s AFTER full auto gave
+/// up, so the stand-down is a latch, never a check of the moment.
+#[derive(Clone, Copy, Debug)]
+pub struct CrewWatch {
+    last: Option<&'static str>,
+}
+
+impl CrewWatch {
+    pub fn new(at_start: Option<&'static str>) -> CrewWatch {
+        CrewWatch { last: at_start }
+    }
+
+    /// The owner now; `Some(owner)` once, when one took the aircraft.
+    pub fn step(&mut self, now: Option<&'static str>) -> Option<&'static str> {
+        let took = match (self.last, now) {
+            (None, Some(owner)) => Some(owner),
+            _ => None,
+        };
+        self.last = now;
+        took
+    }
+}
+
+/// A new flight set up by the plugin's init mailbox while a list runs
+/// (the crew's ramp, runway and approach setups, the sortie runner): the
+/// plugin's `init_seq` counts completed inits. The first good read is the
+/// baseline; a failed read is no measurement. Pure.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct InitWatch {
+    base: Option<f64>,
+}
+
+impl InitWatch {
+    /// `true` once the counter moved off the baseline.
+    pub fn step(&mut self, seq: Option<f64>) -> bool {
+        match (self.base, seq) {
+            (None, Some(s)) => {
+                self.base = Some(s);
+                false
+            }
+            (Some(b), Some(s)) => s != b,
+            _ => false,
+        }
+    }
+}
+
+/// Stand a running flow down where it is, and drop any open proposal. An
+/// automation taking the aircraft stands down a CREW flow only (a Monitor
+/// flow writes nothing and is the audit that automation wants); a new flight
+/// stands down every flavour, since the list belongs to the flight that was.
+/// The first cause is the one said. `true` when a flow was stood down.
+pub fn stand_down(why: StandDown) -> bool {
+    *lock(&PROPOSAL) = None;
+    let running = *lock(&RUNNING);
+    let applies = match why {
+        StandDown::Mission(_) => running == Some(Flavour::Crew),
+        StandDown::NewFlight(_) => running.is_some(),
+    };
+    if !ACTIVE.load(SeqCst) || !applies {
+        return false;
+    }
+    lock(&STOOD_DOWN).get_or_insert(why);
+    ABORT.store(true, SeqCst);
+    true
+}
+
+/// The stood-down list's closing line. Pure.
+pub fn stood_down_line(title: &str, why: StandDown) -> String {
+    match why {
+        StandDown::Mission(m) => format!("{title} checklist stopped, {m} has the aircraft."),
+        StandDown::NewFlight(_) => format!("{title} checklist dropped, new flight."),
+    }
 }
 
 /// The monitor crossed a phase boundary: run the section as the flying
@@ -801,6 +932,8 @@ pub fn start(idx: usize, flavour: Flavour, config: Config, voice: Voice) -> bool
     *lock(&REPLY) = None;
     *lock(&WAITING) = None;
     *lock(&PROPOSAL) = None;
+    *lock(&STOOD_DOWN) = None;
+    *lock(&RUNNING) = Some(flavour);
     std::thread::Builder::new()
         .name("checklist-flow".into())
         .spawn(move || {
@@ -813,10 +946,12 @@ pub fn start(idx: usize, flavour: Flavour, config: Config, voice: Voice) -> bool
             }
             DETAIL.clear();
             *lock(&WAITING) = None;
+            *lock(&RUNNING) = None;
             ACTIVE.store(false, SeqCst);
         })
         .map(|_| true)
         .unwrap_or_else(|_| {
+            *lock(&RUNNING) = None;
             ACTIVE.store(false, SeqCst);
             false
         })
@@ -1096,7 +1231,23 @@ async fn run(cl: &Checklist, flavour: Flavour, xp: &XPlaneClient, config: &Confi
     // The monitor's discrepancies, named in its one summary line.
     let mut not_set: Vec<String> = Vec::new();
     let mut aborted = false;
+    // A Crew list writes the cockpit: an automation taking the aircraft
+    // after it began stands it down (the list belongs to the flight that
+    // was); one already flying at its start names its items as held.
+    let mut watch = CrewWatch::new(mission_owner());
+    // ...and a new flight set up under any list ends it.
+    let mut init = InitWatch::default();
+    let init_seq = || async { xp.get_float(crate::tools::setup::INIT_SEQ).await.ok() };
+    init.step(init_seq().await);
     for (i, item) in cl.items.iter().enumerate() {
+        if flavour == Flavour::Crew {
+            if let Some(owner) = watch.step(mission_owner()) {
+                stand_down(StandDown::Mission(owner));
+            }
+        }
+        if init.step(init_seq().await) {
+            stand_down(StandDown::NewFlight("setup"));
+        }
         if ABORT.load(SeqCst) {
             aborted = true;
             break;
@@ -1107,7 +1258,17 @@ async fn run(cl: &Checklist, flavour: Flavour, xp: &XPlaneClient, config: &Confi
             Some((d, idx, _)) => checklist::read_dataref(xp, d, idx).await,
             None => None,
         };
-        let held = cond.and_then(|(d, _, _)| held_by_automation(d));
+        let held = cond
+            .and_then(|(d, _, _)| held_by_automation(d))
+            .or_else(|| {
+                // Under a mission a Crew list writes nothing: every item not in
+                // state is the mission's (one writer per dataref).
+                if flavour == Flavour::Crew && cond.is_some() {
+                    mission_owner()
+                } else {
+                    None
+                }
+            });
         match plan(flavour, item, value, held) {
             Step::Skip => {}
             Step::Say(line) => say(&line),
@@ -1192,13 +1353,19 @@ async fn run(cl: &Checklist, flavour: Flavour, xp: &XPlaneClient, config: &Confi
             }
         }
     }
-    let summary = summary_line(&cl.title, flavour, aborted, failed, discrepancies, &not_set);
+    let stood_down = if aborted { *lock(&STOOD_DOWN) } else { None };
+    let summary = match stood_down {
+        Some(why) => stood_down_line(&cl.title, why),
+        None => summary_line(&cl.title, flavour, aborted, failed, discrepancies, &not_set),
+    };
     crate::blackbox::record(
         "checklist",
         json!({
-            "event": if aborted { "abort" } else { "complete" },
+            "event": if stood_down.is_some() { "stood_down" } else if aborted { "abort" } else { "complete" },
             "title": cl.title, "flavour": flavour.name(),
             "failed": failed, "discrepancies": discrepancies,
+            "by": stood_down.map(StandDown::by),
+            "new_flight": matches!(stood_down, Some(StandDown::NewFlight(_))),
         }),
     );
     say(&summary);
@@ -1815,5 +1982,127 @@ mod tests {
         assert_eq!(proposal(), Some(2));
         decline_proposal();
         assert_eq!(proposal(), None);
+    }
+
+    /// Walk a Crew list's item boundaries against a recorded timeline of
+    /// who had the aircraft; the items the list would have written, and the
+    /// stand-down (when, by whom).
+    fn crew_items_written(
+        boundaries: &[(f64, &'static str)],
+        owner_at: impl Fn(f64) -> Option<&'static str>,
+        start_t: f64,
+    ) -> (Vec<&'static str>, Option<(f64, &'static str)>) {
+        let mut watch = CrewWatch::new(owner_at(start_t));
+        let mut written = Vec::new();
+        for &(t, item) in boundaries {
+            if let Some(owner) = watch.step(owner_at(t)) {
+                return (written, Some((t, owner)));
+            }
+            written.push(item);
+        }
+        (written, None)
+    }
+
+    #[test]
+    fn a_mission_start_stands_the_after_landing_list_down() {
+        // Sortie 1790586620 (LEMG, 2026-09-28): the After landing list began
+        // as Crew at 593.0 with nobody flying; full auto started at 620.3
+        // and gave up at 664.2. Each item was read and written just before
+        // its line was spoken (the runner blocks on its own speech): the
+        // narration at 623.2, "Speed brake, down." at 640.0 and "Flaps, up."
+        // at 666.0, over the takeoff flaps full auto set at 620.6.
+        let full_auto = |t: f64| (620.3..664.2).contains(&t).then_some("full auto");
+        let boundaries = [
+            (593.0, "After landing."),
+            (623.2, "Speed brake, down."),
+            (640.0, "Flaps, up."),
+            (666.0, "Landing lights, off."),
+            (679.8, "Strobe lights, off."),
+        ];
+        let (written, stood) = crew_items_written(&boundaries, full_auto, 593.0);
+        assert_eq!(written, vec!["After landing."]);
+        assert_eq!(stood, Some((623.2, "full auto")));
+        // The give-up at 664.2 does not revive it: the stand-down aborts the
+        // runner, which never reads the watch again.
+
+        // Sortie 1790585651: began at 628.2, full auto from 651.1 on; "Speed
+        // brake, down." at 680.4, "Flaps, up." at 682.9.
+        let full_auto = |t: f64| (t >= 651.1).then_some("full auto");
+        let boundaries = [
+            (628.2, "After landing."),
+            (663.7, "Speed brake, down."),
+            (680.4, "Flaps, up."),
+            (682.9, "Landing lights, off."),
+        ];
+        let (written, stood) = crew_items_written(&boundaries, full_auto, 628.2);
+        assert_eq!(written, vec!["After landing."]);
+        assert_eq!(stood, Some((663.7, "full auto")));
+    }
+
+    #[test]
+    fn a_list_asked_for_under_a_mission_runs_and_names_its_items_held() {
+        // The mission was flying when the list began: no stand-down...
+        let mut w = CrewWatch::new(Some("full auto"));
+        assert_eq!(w.step(Some("full auto")), None);
+        // ...but one that ends and another that starts is a new taker.
+        assert_eq!(w.step(None), None);
+        assert_eq!(w.step(Some("the circuit")), Some("the circuit"));
+        // Its items not in state are the mission's, never written.
+        let flaps = act_item("Flaps, up.", Cond::Eq(0.0));
+        assert_eq!(
+            plan(Flavour::Crew, &flaps, Some(1.0), Some("full auto")),
+            Step::Held("Flaps, up. Full auto has it.".into())
+        );
+        // In state it is only confirmed.
+        assert_eq!(
+            plan(Flavour::Crew, &flaps, Some(0.0), Some("full auto")),
+            Step::Say("Flaps, up.".into())
+        );
+    }
+
+    #[test]
+    fn a_new_flight_is_the_init_counter_moving() {
+        let mut w = InitWatch::default();
+        // A failed read is no baseline and no new flight.
+        assert!(!w.step(None));
+        assert!(!w.step(Some(4.0)));
+        assert!(!w.step(None));
+        assert!(!w.step(Some(4.0)));
+        assert!(w.step(Some(5.0)));
+    }
+
+    #[test]
+    fn stand_down_by_cause_and_flavour() {
+        let _g = crate::mode::TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        // Nothing running: nothing to stand down.
+        ACTIVE.store(false, SeqCst);
+        *lock(&RUNNING) = None;
+        assert!(!stand_down(StandDown::Mission("full auto")));
+        // A Monitor list is the mission's own audit: it goes on...
+        ACTIVE.store(true, SeqCst);
+        *lock(&RUNNING) = Some(Flavour::Monitor);
+        *lock(&STOOD_DOWN) = None;
+        assert!(!stand_down(StandDown::Mission("full auto")));
+        assert!(!ABORT.load(SeqCst));
+        // ...but not into a new flight.
+        assert!(stand_down(StandDown::NewFlight("setup")));
+        assert!(ABORT.load(SeqCst));
+        ABORT.store(false, SeqCst);
+        *lock(&STOOD_DOWN) = None;
+        // A Crew list stops for the mission, and the first cause is kept.
+        *lock(&RUNNING) = Some(Flavour::Crew);
+        assert!(stand_down(StandDown::Mission("full auto")));
+        assert!(stand_down(StandDown::NewFlight("reposition")));
+        assert_eq!(*lock(&STOOD_DOWN), Some(StandDown::Mission("full auto")));
+        assert_eq!(
+            stood_down_line("After landing", StandDown::Mission("full auto")),
+            "After landing checklist stopped, full auto has the aircraft."
+        );
+        ACTIVE.store(false, SeqCst);
+        ABORT.store(false, SeqCst);
+        *lock(&RUNNING) = None;
+        *lock(&STOOD_DOWN) = None;
     }
 }

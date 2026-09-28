@@ -17,7 +17,7 @@ use crate::voice::{Priority, Voice};
 
 const INIT_JSON: &str = "xcopilot/sim/init_flight";
 const INIT_RESULT: &str = "xcopilot/sim/init_result";
-const INIT_SEQ: &str = "xcopilot/sim/init_seq";
+pub(crate) const INIT_SEQ: &str = "xcopilot/sim/init_seq";
 const TYPED: &str = "xcopilot/typed";
 
 /// The ICAO type an `.acf` declares (`P acf/_ICAO B738`). Pure.
@@ -213,7 +213,10 @@ async fn follow_up(base: String, voice: Option<Voice>, body: String, origin: Str
     };
     crate::blackbox::record("setup", json!({ "event": "result", "result": result }));
     match result {
-        Some(0) => {}
+        // A checklist of the flight that ended ends with it.
+        Some(0) => {
+            crate::flow::stand_down(crate::flow::StandDown::NewFlight("setup"));
+        }
         Some(code) => {
             let why = match code {
                 1 => "the request was invalid",
@@ -887,6 +890,8 @@ async fn approach_follow_up(job: ApproachJob) {
     // "cleared to land 12" 1.3 s into a new 10 nm final for 13.
     if new_flight_began(&run.outcome) {
         crate::party_line::retire_for_new_flight();
+        // A checklist of the flight that ended ends with it.
+        crate::flow::stand_down(crate::flow::StandDown::NewFlight("setup"));
     }
     // The arm first, the record and the words after: the aircraft is
     // already flying.

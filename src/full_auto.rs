@@ -1549,6 +1549,11 @@ async fn fly(xp: XPlaneClient, config: Config, voice: Option<Voice>, tools: SubT
     // left by the previous arrival would keep the region from ever handing
     // this departure on (see `release_arrival_station`).
     release_arrival_station();
+    // The mission has the aircraft: a Crew checklist still running from the
+    // last flight (the after-landing list, blocked on its own speech) must
+    // not write under it. LEMG (2026-09-28): "Flaps, up." over the takeoff
+    // flaps set 45 s earlier, on two missions in a row.
+    crate::flow::stand_down(crate::flow::StandDown::Mission("full auto"));
     macro_rules! bail_if_abort {
         () => {
             if ABORT.load(SeqCst) {
