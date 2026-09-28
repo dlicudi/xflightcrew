@@ -410,6 +410,11 @@ everything blackboxes to `logs/blackbox.jsonl` (kinds: `atc`, `autotaxi`, `autot
   JOIN (refused past `MAX_JOIN_M`); errors can only slow the pace; a governor evaporating on the
   ground ARRESTS ("your aircraft"). Castoring nosewheels brake-steer through the PLUGIN channels
   only: REST `*_brake_ratio` writes are re-driven by hardware every frame.
+- **A drive is judged by the ground it makes, never a flat clock** (`autotaxi::ProgressWatch`,
+  `drive_stalled`, `full_auto::wait_for_drive`): 20 m in 120 s, or the route at half its pace plus
+  2 min (`route_deadline_s`); pause, tug and a spoken stop hold it (blackbox `drive_no_progress`; an
+  SR22 given up at 600 s with 2 km to go, #165). **A free castoring nose flies a corner on a 12 m aim**
+  (`corner_aim_floor_m`, `steer_look_m`; the 16 m floor chorded 5.3 m inside the LEMG ramp vertices).
 - **The sim brakes against hard rudder** and our steer is rudder, so the plugin holds
   `override_toe_brakes` while `xcopilot/taxi_steer` applies; a pilot brake latches
   `xcopilot/brake_yield`. Never "fix" a corner that stops the aircraft by tuning the governor.

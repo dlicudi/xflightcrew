@@ -9957,3 +9957,17 @@ the lever 0.16 to 0.27 (the tail engine pushes the nose down); taken again at 48
 roundout climb never pushes, and the SF50 flies a `FlareModel` fitted to its three clean arrests (8,000
 fpm per unit, 1.2/1.2 s, 0.9 s dead, 66 fpm rms) with `rough_hold: false` (the 737's hold put 57 of 160
 gusty plant landings past 400). The recorded balloon, recovered: 258 fpm calm, 308 in gusts. Offline only.
+
+## 2026-09-28: the SR22's LEMG ramp taxis (issue #165)
+
+Sorties 1790605551 and 1790618416: SR22 from the LEMG ramp to HE1 (routes 4,661 m and 4,791 m), both
+given up as `taxi_stalled` at exactly 600 s. That was full auto's flat wait on `driving()`, not a
+stall: 4 to 9 kt with 1,998 m and 2,104 m to go, 8.6 kt average, the longest spell without 20 m of
+progress 37.8 s (the turn-round join). The wait is now progress-based (`ProgressWatch`, 20 m in 120 s
+or `route_deadline_s`; pause, tug and a spoken stop hold the clock). The scorer's 5.3 m cut was every
+ramp vertex (4.2 to 5.3 m): the SR22 turned at up to 14 deg/s at 3 kt on the braked wheel, but the
+16 m corner aim brought the nose round about 40 degrees early and the rate lead rolled it down the
+chord. Brake-steer plant fitted over both taxis: 0.45 s delay, 2.17 s lag, 299 - 35.8 v deg/s per
+unit of differential brake, 1.7 deg/s left pull; through it the corner flies 4.93 m inside on 16 m
+and 2.75 m on a free nose's 12 m (`FREE_NOSE_AIM_FLOOR_M`). The 350 s wait for a tug that never came
+before these taxis is not addressed. Offline only.
