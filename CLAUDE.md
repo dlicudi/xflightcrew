@@ -440,6 +440,11 @@ everything blackboxes to `logs/blackbox.jsonl` (kinds: `atc`, `autotaxi`, `autot
   until the loops weave. The rollout blackboxes `rollout` per tick with the REAL tick time. So a
   steady drift is held off only by a standing offset: the scheduled roll feeds its own drift
   forward (`DriftFilter`, the final's crab pattern; EGBB 2026-09-27).
+- **The declared rudder is believed only up to the speed it was measured at** (`RollSteer` held flat
+  above `roll_rudder:` `at_kts`, ceiling `RUDDER_FULL_DEG_FAST`; extrapolated as v^2 it cut the gain to a
+  third by Vr: EGKK 08R lifted off 5.4 m left, 2026-09-28). The scheduled roll's cut is `RollCut`: the
+  median of three cross-track reads (lat and lon are separate requests; a mixed pair reads up to 2.9 m
+  off for a tick), cut harder from `XTK_GAIN_REF_KTS` to `at_kts`, plus a slow cross-track trim.
 - **The handoff line is true** about who has the aircraft and the height (`handoff_to_caller`). **A
   pilot handoff is FLYABLE**: it waits for the clean-up (`handoff_waits_for_clean_up`), sets a
   capturable dial (`handoff_altitude_dial_ft`), and gives the governor the overspeed guard's speed

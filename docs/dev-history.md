@@ -9821,3 +9821,19 @@ sweep. `RotatePitch::ceiling_guard` lets the nose close on the ceiling no faster
 and the target stops 0.5 under it: replay 21.96 to 17.83, under 18 across the plant sweep.
 #154: `speedhold::AirspaceLimit` latches the 250 below 10,000 cap (lifted only at 10,300); a level at
 10,000 +-50 ft flipped the old rule ~325 times, the latch never. Offline only.
+
+## 2026-09-28: the 737's roll believes its rudder only to the speed it was measured at (issues #123, #59)
+
+EGKK 08R (1790601822) lifted off 5.4 m left (worst 5.8) with the heading error a standing +0.8 to +1.1
+degrees for 30 s from 100 kt; LEMG 13 1790591256 reached 9.0 m after a yaw gust at 100-107 kt. The
+profile's `roll_rudder:` (11.5 deg/s per unit at 80 kt, fitted 30-86 kt) was extrapolated as v^2; fitted
+against the logged steer on all eight rolls of the 28th the rudder is 4-6 deg/s per unit from 45 to 110
+kt and 8.5 at 132 (the 27th: roughly v^1.25), so by Vr the loop had a third of the gain it assumed.
+Cross-track also spiked for single ticks (lat and lon read separately: up to 2.9 m on LEMG's diagonal
+runway). `RollSteer` now holds the declared rudder flat above `at_kts`; `RollCut` takes the median of
+three reads, cuts harder at speed and adds a slow trim. A superposition replay (the recorded aircraft
+plus the fitted response to the steer difference) reproduces the as-flown steer within 0.01 and, with
+the new law, keeps all eight rolls within 3 m worst and 2 m at liftoff (EGKK 1.3/-0.4). Roll ticks now
+log the sim's yaw rate as `r` (it was the brake split's error) and `xtk_used`, `cut`, `cut_i`. Open:
+the scorer still reads the raw spiky xtk; a consistent position read from the plugin would remove the
+spikes at the source (filed). Offline only.
