@@ -285,6 +285,12 @@ pub struct Snapshot {
     /// airframe that declares `fuel_tank_pumps_off_when_empty`. `None` = not
     /// declared or a read failed this tick: no measurement, no callout.
     pub fuel_tanks: Option<crate::tools::fuel_pumps::Tanks>,
+    /// Where the aircraft IS, feet above sea level (`position/elevation`):
+    /// the altimeter cross-check's truth (#94). `None` = no read.
+    pub alt_true_ft: Option<f64>,
+    /// The ice picture and the anti-ice switches (#100), read by the poll
+    /// loop on a slow clock in cold air. `None` = warm air or not read.
+    pub icing: Option<crate::tools::anti_ice::IcingRead>,
     pub phase: Phase,
 }
 
@@ -328,6 +334,11 @@ impl Snapshot {
             .ok();
         let baro_inhg = xp.get_float(BARO_KNOB).await.ok();
         let qnh_pa = xp.get_float(crate::datarefs::QNH_PASCALS).await.ok();
+        let alt_true_ft = xp
+            .get_float(sim::datarefs::ELEVATION_M)
+            .await
+            .ok()
+            .map(|m| m * M_TO_FT);
         let automation_flying = {
             use std::sync::atomic::Ordering::Relaxed;
             crate::procedure::ACTIVE.load(Relaxed)
@@ -606,6 +617,8 @@ impl Snapshot {
             qnh_pa,
             automation_flying,
             fuel_tanks: None, // filled in by the poll loop (per airframe)
+            alt_true_ft,
+            icing: None, // filled in by the poll loop (slow clock)
             phase: Phase::Ground,
         };
         // The coarse phase is the flight model's, set by the monitor tick
@@ -1898,6 +1911,121 @@ impl Check for CentreTankDry {
 /// Seconds an empty centre with its pumps on must hold before it is said.
 const CENTRE_DRY_SUSTAIN_S: u64 = 5;
 
+/// The altimeter against where the aircraft IS (#94). EGSS (2026-09-22) flew
+/// 4,675 ft indicated at 16,884 true; every automation flies the altimeter,
+/// so only a cross-check against the true height sees the altimeter itself
+/// is wrong. The knob's part is `AltimeterSetting`'s; this speaks only what
+/// the knob and the air's temperature do NOT explain (a static port, a
+/// lying dial), airborne, sustained. Advisory: the pilot's instruments.
+pub(crate) fn altimeter_truth_of(
+    s: &Snapshot,
+    transition_altitude_ft: f64,
+) -> Option<crate::tools::instruments::AltimeterTruth> {
+    use crate::tools::instruments as ins;
+    let (baro, pa, truth) = (s.baro_inhg?, s.qnh_pa?, s.alt_true_ft?);
+    if pa <= 0.0 || baro <= 0.0 {
+        return None;
+    }
+    let ta = ins::transition_in_force_ft(transition_altitude_ft);
+    let reference = ins::correct_setting_inhg(s.alt_ft, ta, pa);
+    Some(ins::altimeter_truth(
+        s.alt_ft,
+        truth,
+        baro,
+        pa / ins::PA_PER_INHG,
+        reference,
+        s.oat_c,
+    ))
+}
+
+struct AltimeterTruthCheck {
+    transition_altitude_ft: f64,
+}
+
+impl Check for AltimeterTruthCheck {
+    fn id(&self) -> &'static str {
+        "altimeter_disagrees"
+    }
+    fn severity(&self) -> Severity {
+        Severity::Caution
+    }
+    fn eval(&self, s: &Snapshot) -> Option<String> {
+        if s.on_ground {
+            return None;
+        }
+        let t = altimeter_truth_of(s, self.transition_altitude_ft)?;
+        // A gross setting is the knob, said and fixed by its own check.
+        if t.setting_gross() || !t.instrument_suspect() {
+            return None;
+        }
+        let off = (t.residual_ft.abs() / 100.0).round() * 100.0;
+        let way = if t.residual_ft > 0.0 { "higher" } else { "lower" };
+        Some(format!(
+            "Altimeter disagrees with GPS altitude, we're about {off:.0} feet {way} than it says. \
+             Cross-check the standby."
+        ))
+    }
+    /// A climb or descent rate lags the static system for a few seconds.
+    fn min_duration(&self) -> Duration {
+        Duration::from_secs(30)
+    }
+}
+
+/// Icing conditions and the anti-ice switches (#100,
+/// `tools::anti_ice::practice_wants`, the one decision): probes, windows,
+/// engines and props on in visible moisture at +10 C or colder, the wing
+/// once ice accretes. The altimeter's shape: with an automation flying the
+/// crew switches them (`fix_write` sentinel, through `anti_ice::monitor_fix`,
+/// read back); with the pilot flying it is said once per episode.
+pub(crate) const ICING: &str = "icing";
+
+struct Icing;
+
+impl Check for Icing {
+    fn id(&self) -> &'static str {
+        ICING
+    }
+    fn severity(&self) -> Severity {
+        Severity::Advisory
+    }
+    fn eval(&self, s: &Snapshot) -> Option<String> {
+        if s.on_ground || !s.engine_running {
+            return None;
+        }
+        let r = s.icing.as_ref()?;
+        let wants = crate::tools::anti_ice::practice_wants(r);
+        if wants.is_empty() {
+            return None;
+        }
+        Some(crate::tools::anti_ice::practice_line(
+            r,
+            &wants,
+            s.automation_flying && crate::mode::crew_actuates(),
+        ))
+    }
+    /// A cloud passed through in seconds is not icing conditions.
+    fn min_duration(&self) -> Duration {
+        Duration::from_secs(20)
+    }
+    fn fix_write(&self, s: &Snapshot) -> Option<(&'static str, f64)> {
+        if !s.automation_flying {
+            return None;
+        }
+        let r = s.icing.as_ref()?;
+        (!crate::tools::anti_ice::practice_wants(r).is_empty())
+            .then_some((crate::tools::anti_ice::MONITOR_FIX, 1.0))
+    }
+}
+
+/// Seconds clear of icing before the crew switches off what it switched on.
+const ICING_CLEAR_S: u64 = 300;
+
+/// Seconds between ice reads (a slow clock: the API is frame time).
+const ICING_READ_S: u64 = 10;
+
+/// Air this cold or colder is worth reading the ice picture in.
+const ICING_READ_OAT_C: f64 = 12.0;
+
 /// Cruising further below the optimum altitude than a step is worth saying.
 ///
 /// The altitude a jet flies best at rises as fuel burns off — roughly a level
@@ -2093,6 +2221,12 @@ fn build_checks(profile: &AircraftProfile) -> Vec<Box<dyn Check>> {
         Box::new(AltimeterSetting {
             transition_altitude_ft: profile.transition_altitude_ft,
         }),
+        // Universal: the altimeter itself against the true height (#94).
+        Box::new(AltimeterTruthCheck {
+            transition_altitude_ft: profile.transition_altitude_ft,
+        }),
+        // Universal: the tool finds what anti-ice is fitted (#100).
+        Box::new(Icing),
     ];
     // Centre tank pumps: only where the profile declares which tanks.
     if !profile.fuel_tank_pumps_off_when_empty.is_empty() {
@@ -2655,6 +2789,11 @@ pub async fn run(
     // (static per airframe, read once per swap).
     let mut pump_tanks = live.get().fuel_tank_pumps_off_when_empty.clone();
     let mut tank_lateral: Option<Vec<f64>> = None;
+    // The ice picture (#100), read on its own slow clock in cold air, and
+    // since when the air has been clear of icing (the crew then switches off
+    // what it switched on).
+    let mut icing_read: Option<(Instant, crate::tools::anti_ice::IcingRead)> = None;
+    let mut icing_clear_since: Option<Instant> = None;
     let mut avionics_readback = avionics_readback_dref(&live.get());
     // The cockpit duties the copilot performs unasked, per airframe: interior
     // lights flagged `auto_at_night`, and a GPS welcome page to acknowledge.
@@ -2807,6 +2946,8 @@ pub async fn run(
             drefs = advisor_drefs(&live.get());
             pump_tanks = live.get().fuel_tank_pumps_off_when_empty.clone();
             tank_lateral = None;
+            icing_read = None;
+            icing_clear_since = None;
             avionics_readback = avionics_readback_dref(&live.get());
             (night_lights, gps_ack) = cockpit_duties(&live.get());
             // A new airframe is a new cockpit: whatever we set on the last one
@@ -2876,6 +3017,47 @@ pub async fn run(
                 snap.fuel_tanks = read_fuel_tanks(&xp, &pump_tanks, &mut tank_lateral).await;
             }
             let now = Instant::now();
+            // The altimeter cross-check, published for a follower that wants
+            // to know whether the altimeter it flies can be believed (#94).
+            let truth = altimeter_truth_of(&snap, live.get().transition_altitude_ft);
+            crate::tools::instruments::publish_altimeter_truth(truth);
+            // The ice picture (#100): cold air only, every ICING_READ_S.
+            if snap.on_ground || snap.oat_c > ICING_READ_OAT_C {
+                icing_read = None;
+            } else if icing_read
+                .as_ref()
+                .is_none_or(|(at, _)| now.duration_since(*at) >= Duration::from_secs(ICING_READ_S))
+            {
+                let systems = crate::tools::anti_ice::resolved_live();
+                let r = crate::tools::anti_ice::read_icing(&xp, snap.oat_c, snap.dewpoint_c, &systems)
+                    .await;
+                icing_read = Some((now, r));
+            }
+            snap.icing = icing_read.as_ref().map(|(_, r)| r.clone());
+            // Clear of icing long enough: the crew switches off only what it
+            // switched on itself, and only while an automation flies.
+            let icing_now = snap.icing.as_ref().is_some_and(|r| {
+                crate::tools::anti_ice::icing_conditions(r) || crate::tools::anti_ice::accreting(r)
+            });
+            if icing_now {
+                icing_clear_since = None;
+            } else {
+                let since = *icing_clear_since.get_or_insert(now);
+                let claimed = crate::tools::anti_ice::claimed();
+                if !claimed.is_empty()
+                    && !snap.on_ground
+                    && snap.automation_flying
+                    && crate::mode::crew_actuates()
+                    && now.duration_since(since) >= Duration::from_secs(ICING_CLEAR_S)
+                {
+                    let failed = crate::tools::anti_ice::monitor_fix(&xp, &claimed, false).await;
+                    voice.alert(
+                        Priority::Advisory,
+                        failed.unwrap_or_else(|| "Clear of icing, anti-ice off.".to_string()),
+                    );
+                    icing_clear_since = Some(now);
+                }
+            }
             // The flight model FIRST, every tick whatever is quiet: the
             // consumers below read its phase, memory and this tick's events
             // (`flight.rs`). Its events are blackboxed `flight`, its phase
@@ -4632,6 +4814,23 @@ pub async fn run(
                                         if let Some(line) = crate::tools::fuel_pumps::failed_line(&done) {
                                             voice.alert(Priority::Caution, line);
                                         }
+                                    } else if dref == crate::tools::anti_ice::MONITOR_FIX {
+                                        // A set of switches, each read back
+                                        // through the tool's one writer.
+                                        let wants = snap
+                                            .icing
+                                            .as_ref()
+                                            .map(crate::tools::anti_ice::practice_wants)
+                                            .unwrap_or_default();
+                                        if let Some(line) = crate::tools::anti_ice::monitor_fix(
+                                            &xp,
+                                            &wants,
+                                            value > 0.5,
+                                        )
+                                        .await
+                                        {
+                                            voice.alert(Priority::Caution, line);
+                                        }
                                     } else {
                                         let _ = xp.set_float(dref, value).await;
                                     }
@@ -5430,6 +5629,8 @@ mod tests {
             qnh_pa: None,
             automation_flying: false,
             fuel_tanks: None,
+            alt_true_ft: None,
+            icing: None,
             phase: Phase::Ground,
         }
     }
@@ -5458,6 +5659,81 @@ mod tests {
             lateral_m: vec![-7.01, 0.0, 7.01],
         });
         s
+    }
+
+    /// #94, EGSS 2026-09-22: 4,675 ft indicated at 16,884 true with the
+    /// knob at 17.50. That is the KNOB (the setting check says it and fixes
+    /// it); the instrument check stays silent. A frozen static port with the
+    /// knob right is the instrument's and is said.
+    #[test]
+    fn the_altimeter_is_cross_checked_against_the_true_height() {
+        let c = AltimeterTruthCheck {
+            transition_altitude_ft: 6_000.0,
+        };
+        let mut egss = snap(true, true);
+        egss.on_ground = false;
+        egss.alt_ft = 4_675.0;
+        egss.alt_true_ft = Some(16_884.0);
+        egss.baro_inhg = Some(17.50);
+        egss.qnh_pa = Some(30.40 * crate::tools::instruments::PA_PER_INHG);
+        egss.oat_c = -18.0;
+        let t = altimeter_truth_of(&egss, 6_000.0).expect("all read");
+        assert!(t.setting_gross(), "{t:?}");
+        assert!(c.eval(&egss).is_none(), "the knob is the setting check's");
+        let mut frozen = egss;
+        frozen.alt_ft = 5_000.0;
+        frozen.alt_true_ft = Some(9_000.0);
+        frozen.baro_inhg = Some(30.10);
+        frozen.qnh_pa = Some(30.10 * crate::tools::instruments::PA_PER_INHG);
+        frozen.oat_c = -5.0;
+        let line = c.eval(&frozen).expect("a static fault is said");
+        assert!(line.contains("about 4200 feet higher"), "{line}");
+        assert!(c.min_duration() >= Duration::from_secs(20));
+        // No truth read: no measurement, no word.
+        frozen.alt_true_ft = None;
+        assert!(c.eval(&frozen).is_none());
+        // On the ground the static is the field's.
+        frozen.alt_true_ft = Some(9_000.0);
+        frozen.on_ground = true;
+        assert!(c.eval(&frozen).is_none());
+    }
+
+    /// #100: icing conditions with an automation flying switch the systems
+    /// through the sentinel; a pilot flying is advised and nothing written;
+    /// warm air or no read is silence.
+    #[test]
+    fn icing_is_switched_by_the_crew_or_advised_to_the_pilot() {
+        use crate::aircraft::IceKind;
+        let _g = crate::mode::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut s = snap(true, true);
+        s.on_ground = false;
+        s.oat_c = -4.0;
+        s.dewpoint_c = -5.0;
+        s.icing = Some(crate::tools::anti_ice::IcingRead {
+            oat_c: -4.0,
+            dewpoint_c: -5.0,
+            switches: vec![(IceKind::Engine, Some(false)), (IceKind::Pitot, Some(true))],
+            ..Default::default()
+        });
+        s.automation_flying = true;
+        assert_eq!(
+            Icing.eval(&s).as_deref(),
+            Some("Icing conditions, engine anti-ice on.")
+        );
+        assert_eq!(
+            Icing.fix_write(&s),
+            Some((crate::tools::anti_ice::MONITOR_FIX, 1.0))
+        );
+        s.automation_flying = false;
+        assert_eq!(
+            Icing.eval(&s).as_deref(),
+            Some("Icing conditions, recommend engine anti-ice on.")
+        );
+        assert!(Icing.fix_write(&s).is_none());
+        s.icing.as_mut().unwrap().switches = vec![(IceKind::Engine, Some(true))];
+        assert!(Icing.eval(&s).is_none(), "already on");
+        s.icing = None;
+        assert!(Icing.eval(&s).is_none());
     }
 
     #[test]

@@ -48,6 +48,20 @@ reverse_thrust: true   # rollout only, self-stowing (VERIFY on this airframe)
 # with the replaced barometer_up/down commands, a hundredth a press (proven
 # live: eleven presses, 30.11 to 30.00 and back).
 barometer: true
+# The STD fast path (#94): `B738_efis_std_*_CMDhandler` toggles STD, and
+# `B738_baro_memory` resets the memory to 29.92 while STD shows (unless the
+# knob was turned in STD), so two presses leave the memory at 29.92 in QNH
+# display from anywhere. A set far from the ask goes there first and steps
+# the knob from 29.92 (EGSS 2026-09-22: 0 to 30.40 was 3,040 presses; this
+# is 2 plus 48). The dial read after the presses is the verdict. VERIFY: the
+# pair was pressed live once (2026-09-22) and never through this path.
+# At flight start the xlua copies the STOCK dial into its memory
+# (`B738_set_glare_all_modes`), which is how a stock dial at 0.0 at load
+# became a memory at 0.0.
+altimeter:
+  std_command: laminar/B738/EFIS_control/capt/push_button/std_press
+  std_presses: 2
+  copilot_std_command: laminar/B738/EFIS_control/fo/push_button/std_press
 # The approach is flown ON thrust (about 55-60% N1 with flaps 40): the speed
 # law never pulls the lever under this on a stabilised final, and the flare
 # retards it progressively instead of cutting it (a swept wing at idle sinks

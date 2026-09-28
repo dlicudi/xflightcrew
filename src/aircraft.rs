@@ -89,6 +89,91 @@ pub struct CabinAirProfile {
     pub oxygen_valve: Option<String>,
 }
 
+/// The altimeter knobs' own fast paths (`tools::instruments::set_altimeter`,
+/// issue #94). On a stock airframe the dial write stands and none of this is
+/// used. The 737's xlua owns its baro MEMORY and copies it into the stock dial
+/// every frame, so the only way in is its knob, a hundredth a press: EGSS
+/// (2026-09-22) loaded with the memory at 0.0 and 0 to 30.40 is 3,040 API
+/// commands. Its STD button pressed twice puts the memory at 29.92 from
+/// anywhere (`B738_baro_memory` resets it while STD shows and nobody has
+/// preselected), so a set far from the ask goes to 29.92 first and steps from
+/// there. Each name is a hypothesis until the probe and the readback agree.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct AltimeterProfile {
+    /// Pressed `std_presses` times to put the captain's setting at 29.92.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub std_command: Option<String>,
+    #[serde(default = "one_press")]
+    pub std_presses: usize,
+    /// The first officer's STD button, pressed the same number of times.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub copilot_std_command: Option<String>,
+}
+
+fn one_press() -> usize {
+    1
+}
+
+/// What an anti-ice or de-ice system protects (`tools::anti_ice`, issue #100).
+/// The wing is four different machines, so it is four kinds: a crew switches
+/// boots on once ice has formed, and bleed or electric heat before it does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IceKind {
+    Pitot,
+    Window,
+    /// Engine inlet / cowl anti-ice.
+    Engine,
+    Prop,
+    WingBoots,
+    WingBleed,
+    WingHeat,
+    WingTks,
+}
+
+/// One anti-ice or de-ice system. The commands and readback default to the
+/// stock `sim/ice/*` pair for the kind (`tools::anti_ice::stock`); a profile
+/// overrides them where an add-on owns the switch.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AntiIceSystem {
+    pub kind: IceKind,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub on_commands: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub off_commands: Vec<String>,
+    /// Read back after the switch; `name[i]` reads one element. At or above
+    /// 0.5 is on. Per-engine kinds without an index read every engine.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub readback: Option<String>,
+}
+
+/// The anti-ice systems this airframe has. Declared, else read from the
+/// `.acf`'s electrical loads (`systems::IceKit`), which can say THAT a wing is
+/// protected but not how: an undeclared wing is left alone and said.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct AntiIceProfile {
+    #[serde(default)]
+    pub systems: Vec<AntiIceSystem>,
+}
+
+/// The autopilot's own modes this airframe flies (issue #92): declared after
+/// a probe; otherwise the systems survey's autopilot type decides, and a
+/// readback that confirms a mode is remembered for the airframe
+/// (`systems::ap_modes`). `None` fields say nothing.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct AutoflightProfile {
+    /// The stock autothrottle (`sim/autopilot/autothrottle_on`) flies this
+    /// airframe's thrust.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub autothrust: Option<bool>,
+    /// Level change / FLC (`sim/autopilot/level_change`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub level_change: Option<bool>,
+    /// GPS steering / LNAV (`sim/autopilot/gpss`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lnav: Option<bool>,
+}
+
 /// The flare's ELEVATOR law for this airframe (`autoland::FlareGains`): the
 /// default was fitted to the 172 and the 737. The SF50 answers the column
 /// about twice as hard and needs a standing pull at a flare's speed: on the
@@ -709,6 +794,16 @@ pub struct AircraftProfile {
     /// quick-look saving. E.g. `gear: {x: -0.35, y: 0.83, z: -0.44, psi: 12, the: -20}`.
     #[serde(default)]
     pub view_map: std::collections::HashMap<String, PanelView>,
+    /// The altimeter knobs' fast paths ([`AltimeterProfile`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub altimeter: Option<AltimeterProfile>,
+    /// Anti-ice and de-ice systems ([`AntiIceProfile`]); `None` reads them
+    /// from the `.acf`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub anti_ice: Option<AntiIceProfile>,
+    /// The autopilot's own modes ([`AutoflightProfile`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub autoflight: Option<AutoflightProfile>,
 }
 
 /// A saved 3D-cockpit camera position — the pilot's-head datarefs
@@ -4907,6 +5002,9 @@ fn cessna_172sp() -> AircraftProfile {
             ]
         },
         checklist_flow: Default::default(),
+        altimeter: None,
+        anti_ice: None,
+        autoflight: None,
         lights: vec![
             light(
                 "nav",
@@ -5308,6 +5406,9 @@ fn cirrus_sr22() -> AircraftProfile {
             ]
         },
         checklist_flow: Default::default(),
+        altimeter: None,
+        anti_ice: None,
+        autoflight: None,
     }
 }
 

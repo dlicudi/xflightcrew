@@ -52,6 +52,33 @@ parking_brake: true    # set_parking_brake
 park_brake_valve_set: 0.0  # valve sense: 0 = SET on the C90 (verified live — the sim
                            # pins the ratio to 1 while the valve is 0)
 pitot_heat: true       # set_pitot_heat
+# Ice protection (set_anti_ice, #100), from C90_sys.lua / C90_sys50_iceRain.lua
+# (2026-09-28): every switch is the xlua's own, so the stock sim/ice commands
+# would be overwritten. Engine anti-ice is the ice VANE (the selector writes
+# anti_ice_engine_air[i] 0/1; the inlet lip heat follows the running engine by
+# itself). The windshield switch is HIGH/OFF/NORMAL (-1/0/1): up from OFF is
+# NORMAL (window[0]). The surface de-ice switch is momentary: up is ONE boot
+# cycle (surface_boot_on reads 3 while it runs, 7 s). Prop de-ice up is AUTO,
+# read from its switch (the heat itself cycles every 90 s). All VERIFY live.
+anti_ice:
+  systems:
+    - kind: pitot
+    - kind: engine
+      on_commands: [laminar/c90/iceRain/switch/engine_antiice_sel_L_up, laminar/c90/iceRain/switch/engine_antiice_sel_R_up]
+      off_commands: [laminar/c90/iceRain/switch/engine_antiice_sel_L_dn, laminar/c90/iceRain/switch/engine_antiice_sel_R_dn]
+      readback: sim/cockpit2/ice/anti_ice_engine_air
+    - kind: window
+      on_commands: [laminar/c90/iceRain/switch/windshield_antiice_up_L, laminar/c90/iceRain/switch/windshield_antiice_up_R]
+      off_commands: [laminar/c90/iceRain/switch/windshield_antiice_dn_L, laminar/c90/iceRain/switch/windshield_antiice_dn_R]
+      readback: sim/cockpit2/ice/ice_window_heat_on_window[0]
+    - kind: prop
+      on_commands: [laminar/c90/iceRain/switch/prop_deice_up]
+      off_commands: [laminar/c90/iceRain/switch/prop_deice_dn]
+      readback: laminar/c90/iceRain/switch/prop_deice_pos
+    - kind: wing_boots
+      on_commands: [laminar/c90/iceRain/switch/surface_deice_up]
+      off_commands: []
+      readback: sim/cockpit2/ice/ice_surface_boot_on
 pitch_trim: true       # set_pitch_trim (universal elevator_trim)
 fuel_pump: true        # standby boost pumps — fuel_pump_on[0,1], both engines (verified via fuel_pump_1_tog)
 engines: 2             # twin — per-engine accessory tools (boost pumps) write elements 0 AND 1;

@@ -63,6 +63,69 @@ pub fn altimeter_took(actual: f64, wanted: f64) -> bool {
     (actual - wanted).abs() < BARO_STEP_INHG / 2.0
 }
 
+/// The first officer's altimeter and its knob (#94: the 737's copilot side
+/// was still 0.0 after the captain's was walked to 30.42 at EGSS).
+const BARO_COPILOT: &str = "sim/cockpit2/gauges/actuators/barometer_setting_in_hg_copilot";
+const CMD_BARO_COPILOT_UP: &str = "sim/instruments/barometer_copilot_up";
+const CMD_BARO_COPILOT_DOWN: &str = "sim/instruments/barometer_copilot_down";
+
+/// One side's altimeter: its dial, its knob and, where the airframe declares
+/// one, a STD button that puts it at 29.92 from anywhere.
+struct Side<'a> {
+    name: &'static str,
+    dial: &'static str,
+    up: &'static str,
+    down: &'static str,
+    std: Option<(&'a str, usize)>,
+}
+
+impl<'a> Side<'a> {
+    fn pilot(cfg: &'a crate::aircraft::AltimeterProfile) -> Self {
+        Self {
+            name: "pilot",
+            dial: BARO,
+            up: CMD_BARO_UP,
+            down: CMD_BARO_DOWN,
+            std: cfg.std_command.as_deref().map(|c| (c, cfg.std_presses.max(1))),
+        }
+    }
+    fn copilot(cfg: &'a crate::aircraft::AltimeterProfile) -> Self {
+        Self {
+            name: "copilot",
+            dial: BARO_COPILOT,
+            up: CMD_BARO_COPILOT_UP,
+            down: CMD_BARO_COPILOT_DOWN,
+            std: cfg
+                .copilot_std_command
+                .as_deref()
+                .map(|c| (c, cfg.std_presses.max(1))),
+        }
+    }
+}
+
+/// The airframe's altimeter fast paths, published per swap
+/// (`flight_state::publish_airframe`), `None` the stock knob alone.
+static ALTIMETER: std::sync::Mutex<Option<crate::aircraft::AltimeterProfile>> =
+    std::sync::Mutex::new(None);
+
+pub fn publish_altimeter(p: Option<crate::aircraft::AltimeterProfile>) {
+    *ALTIMETER.lock().unwrap_or_else(|e| e.into_inner()) = p;
+}
+
+fn altimeter_profile() -> crate::aircraft::AltimeterProfile {
+    ALTIMETER
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+        .unwrap_or_default()
+}
+
+/// The STD button earns its presses when going to 29.92 first leaves at
+/// least ten knob presses fewer than stepping from where the dial is. Pure.
+pub fn std_fast_path_pays(now: f64, wanted: f64) -> bool {
+    (now - wanted).abs() - (STANDARD_INHG - wanted).abs() >= 10.0 * BARO_STEP_INHG
+}
+
 /// Set the altimeter and PROVE it. The stock dial is written and re-read a
 /// frame later; when the write did not stand, the knob is stepped there with
 /// the barometer commands and read again. Returns what the dial reads
@@ -76,31 +139,215 @@ pub fn altimeter_took(actual: f64, wanted: f64) -> bool {
 /// replaced `barometer_up/down` handlers move the memory a hundredth per
 /// press, so the steps are the one path in. On a stock airframe the first
 /// write stands and no command is sent.
+///
+/// A crew sets BOTH altimeters: the first officer's follows the captain's
+/// through the same proving setter (best effort, blackboxed `altimeter`
+/// `copilot`; a failed read there is no measurement and nothing is pressed).
 pub async fn set_altimeter(xp: &dyn crate::xplane::XPlane, inhg: f64) -> Result<f64> {
+    set_altimeter_with(xp, inhg, &altimeter_profile()).await
+}
+
+/// [`set_altimeter`] with the airframe's fast paths given, not published.
+pub async fn set_altimeter_with(
+    xp: &dyn crate::xplane::XPlane,
+    inhg: f64,
+    cfg: &crate::aircraft::AltimeterProfile,
+) -> Result<f64> {
     let inhg = inhg.clamp(28.0, 31.5);
-    xp.set_float(BARO, inhg).await?;
-    tokio::time::sleep(std::time::Duration::from_millis(BARO_SETTLE_MS)).await;
-    let actual = xp.get_float(BARO).await?;
+    let now = set_side(xp, &Side::pilot(cfg), inhg).await?;
+    copilot_follow(xp, inhg, cfg).await;
+    Ok(now)
+}
+
+/// The first officer's side to `inhg`, when it reads something else.
+async fn copilot_follow(
+    xp: &dyn crate::xplane::XPlane,
+    inhg: f64,
+    cfg: &crate::aircraft::AltimeterProfile,
+) {
+    let Ok(was) = xp.get_float(BARO_COPILOT).await else {
+        return;
+    };
+    if altimeter_took(was, inhg) {
+        return;
+    }
+    let now = set_side(xp, &Side::copilot(cfg), inhg).await.ok();
+    crate::blackbox::record(
+        "altimeter",
+        serde_json::json!({
+            "event": "copilot", "was": was, "now": now, "want": inhg,
+            "took": now.is_some_and(|n| altimeter_took(n, inhg)),
+        }),
+    );
+}
+
+async fn set_side(xp: &dyn crate::xplane::XPlane, side: &Side<'_>, inhg: f64) -> Result<f64> {
+    let settle = || tokio::time::sleep(std::time::Duration::from_millis(BARO_SETTLE_MS));
+    xp.set_float(side.dial, inhg).await?;
+    settle().await;
+    let actual = xp.get_float(side.dial).await?;
     if altimeter_took(actual, inhg) {
         return Ok(actual);
     }
     let mut now = actual;
+    // The STD button: 29.92 from anywhere in a press or two, then the knob
+    // from there. Each press is its own frame (the 737 resets its memory in
+    // before_physics only while STD SHOWS), and the dial says whether it
+    // worked; a button that did not take leaves the knob to step from where
+    // it is.
+    if let Some((cmd, presses)) = side.std {
+        if std_fast_path_pays(now, inhg) {
+            for _ in 0..presses {
+                xp.run_command(cmd).await?;
+                settle().await;
+            }
+            let after = xp.get_float(side.dial).await?;
+            crate::blackbox::record(
+                "altimeter",
+                serde_json::json!({
+                    "event": "std_fast_path", "side": side.name, "cmd": cmd,
+                    "presses": presses, "before": now, "after": after,
+                    "took": altimeter_took(after, STANDARD_INHG),
+                }),
+            );
+            now = after;
+            if altimeter_took(now, inhg) {
+                return Ok(now);
+            }
+        }
+    }
     let mut presses = 0;
     for round in 1..=BARO_MAX_ROUNDS {
-        let (cmd, n) = baro_steps(now, inhg);
+        let (up_down, n) = baro_steps(now, inhg);
+        let cmd = if up_down == CMD_BARO_UP {
+            side.up
+        } else {
+            side.down
+        };
         for _ in 0..n {
             xp.run_command(cmd).await?;
         }
         presses += n;
-        tokio::time::sleep(std::time::Duration::from_millis(BARO_SETTLE_MS)).await;
+        settle().await;
         let before = now;
-        now = xp.get_float(BARO).await?;
-        tracing::info!(target: "xvoicelayer::instruments", asked = inhg, dial_write_read = actual, cmd, round, presses, now, "altimeter stepped");
+        now = xp.get_float(side.dial).await?;
+        tracing::info!(target: "xvoicelayer::instruments", side = side.name, asked = inhg, dial_write_read = actual, cmd, round, presses, now, "altimeter stepped");
         if !keep_stepping(before, now, inhg, n) {
             break;
         }
     }
     Ok(now)
+}
+
+/// Feet of indicated altitude per inch of mercury on the knob: the
+/// altimeter's datum shifts about 27 to 30 ft per hectopascal, and an inch
+/// is 33.86 of them.
+pub const FT_PER_INHG: f64 = 960.0;
+
+/// What the altimeter says against where the aircraft IS, and how much of
+/// the difference the setting and the air's temperature explain. EGSS
+/// (2026-09-22): 4,675 ft indicated at 16,884 true, a knob at 17.50 against a
+/// QNH of 30.40, and the follower "levelled at 4,600 ft". The follower flies
+/// the altimeter (LINTO 2026-09-14), so the cross-check is the one thing that
+/// sees the altimeter itself is wrong. All in feet; positive = the aircraft
+/// is HIGHER than the altimeter says.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct AltimeterTruth {
+    pub indicated_ft: f64,
+    pub true_ft: f64,
+    /// `true_ft - indicated_ft`.
+    pub error_ft: f64,
+    /// The part the knob explains against the air's actual QNH: an
+    /// altimeter reads true only on QNH (and in ISA air). On 29.92 in the
+    /// flight levels this is the ordinary pressure-altitude difference.
+    pub pressure_ft: f64,
+    /// How far the knob is off the setting it SHOULD carry here (QNH below
+    /// the transition, 29.92 above; `correct_setting_inhg`), in feet.
+    pub misset_ft: f64,
+    /// The part the air's departure from ISA explains: about 4 ft per 1,000
+    /// per degree, so 10 % at cruise on a hot or cold day.
+    pub temperature_ft: f64,
+    /// What neither explains: a static system, a frozen port, a lying dial.
+    pub residual_ft: f64,
+    /// How large the residual may be before it is said.
+    pub gate_ft: f64,
+}
+
+impl AltimeterTruth {
+    /// The altimeter itself disagrees with the aircraft's height.
+    pub fn instrument_suspect(&self) -> bool {
+        self.residual_ft.abs() > self.gate_ft
+    }
+    /// A mis-set knob is costing more than [`ALTIMETER_GROSS_FT`].
+    pub fn setting_gross(&self) -> bool {
+        self.misset_ft.abs() > ALTIMETER_GROSS_FT.max(self.gate_ft)
+    }
+}
+
+/// A setting error this large is no longer "altimeter check": it is a
+/// different altitude (EGSS was 12,000 ft).
+pub const ALTIMETER_GROSS_FT: f64 = 1_000.0;
+
+/// ISA temperature at a pressure altitude, degrees C (tropopause floor).
+fn isa_c(pressure_alt_ft: f64) -> f64 {
+    (15.0 - 1.98 * pressure_alt_ft / 1000.0).max(-56.5)
+}
+
+/// The cross-check. `setting_inhg` is the knob, `qnh_inhg` the air's
+/// sea-level pressure, `reference_inhg` the setting that SHOULD be on the
+/// knob here (`correct_setting_inhg`). Pure.
+pub fn altimeter_truth(
+    indicated_ft: f64,
+    true_ft: f64,
+    setting_inhg: f64,
+    qnh_inhg: f64,
+    reference_inhg: f64,
+    oat_c: f64,
+) -> AltimeterTruth {
+    let error_ft = true_ft - indicated_ft;
+    // A knob BELOW the air's QNH reads low: the aircraft is higher.
+    let pressure_ft = (qnh_inhg - setting_inhg) * FT_PER_INHG;
+    let misset_ft = (reference_inhg - setting_inhg) * FT_PER_INHG;
+    // Height above the sea-level pressure datum, where the column's
+    // temperature acts.
+    let above_datum = (indicated_ft + pressure_ft).max(0.0);
+    let isa = isa_c(above_datum);
+    let temperature_ft = (oat_c - isa) / (273.15 + isa) * above_datum;
+    let residual_ft = error_ft - pressure_ft - temperature_ft;
+    let gate_ft = 300.0 + 0.05 * above_datum + 0.05 * pressure_ft.abs();
+    AltimeterTruth {
+        indicated_ft,
+        true_ft,
+        error_ft,
+        pressure_ft,
+        misset_ft,
+        temperature_ft,
+        residual_ft,
+        gate_ft,
+    }
+}
+
+/// The monitor's last cross-check, for a follower that wants to know whether
+/// the altimeter it flies can be believed: the seam issue #94 owes the
+/// follower (it reads [`altimeter_truth_now`], never a copy of its own).
+static ALTIMETER_TRUTH: std::sync::Mutex<Option<(std::time::Instant, AltimeterTruth)>> =
+    std::sync::Mutex::new(None);
+
+pub fn publish_altimeter_truth(t: Option<AltimeterTruth>) {
+    *ALTIMETER_TRUTH.lock().unwrap_or_else(|e| e.into_inner()) =
+        t.map(|t| (std::time::Instant::now(), t));
+}
+
+/// The cross-check if it is fresh (under five seconds old), else `None`: an
+/// old verdict is no measurement. No consumer yet, on purpose: the follower
+/// (another change's files) adopts it.
+#[allow(dead_code)]
+pub fn altimeter_truth_now() -> Option<AltimeterTruth> {
+    ALTIMETER_TRUTH
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .filter(|(at, _)| at.elapsed() < std::time::Duration::from_secs(5))
+        .map(|(_, t)| t)
 }
 
 /// Another round of presses is earned only by a dial that is not there yet
@@ -358,8 +605,17 @@ impl Tool for SetAltimeterCurrent {
         let pa = ctx.xplane.get_float(crate::datarefs::QNH_PASCALS).await?;
         let transition_ft = transition_in_force_ft(self.transition_altitude_ft);
         let inhg = correct_setting_inhg(alt, transition_ft, pa);
-        ctx.xplane.set_float(BARO, inhg).await?;
-        let actual = ctx.xplane.get_float(BARO).await?;
+        // Through the proving setter: a raw write here was a silent no-op on
+        // the 737, and the readback then "Rogered" whatever the dial held.
+        let actual = set_altimeter(ctx.xplane, inhg).await?;
+        if !altimeter_took(actual, inhg) {
+            return Ok(AltimeterSync {
+                was: actual,
+                now: actual,
+                want: inhg,
+            }
+            .line());
+        }
         if alt >= transition_ft {
             let fl = (transition_ft / 100.0).round() as i64;
             return Ok(format!(
@@ -536,7 +792,7 @@ mod tests {
         use crate::xplane::FakeXPlane;
         // The fake never reflects a write into its reads: the 737 exactly.
         let fake = FakeXPlane::with_reads(&[(BARO, 30.11)]);
-        let now = set_altimeter(&fake, 30.00).await.unwrap();
+        let now = set_altimeter_with(&fake, 30.00, &Default::default()).await.unwrap();
         assert!(fake.wrote(BARO), "the dial is tried first");
         assert_eq!(
             fake.ran_count(CMD_BARO_DOWN),
@@ -570,7 +826,7 @@ mod tests {
         use crate::xplane::FakeXPlane;
         let fake = FakeXPlane::with_reads(&[(BARO, 0.0)]);
         fake.step_on_command(CMD_BARO_UP, BARO, BARO_STEP_INHG);
-        let now = set_altimeter(&fake, 30.40).await.unwrap();
+        let now = set_altimeter_with(&fake, 30.40, &Default::default()).await.unwrap();
         assert!(altimeter_took(now, 30.40), "{now}");
         assert_eq!(fake.ran_count(CMD_BARO_UP), 3040);
     }
@@ -580,7 +836,7 @@ mod tests {
     async fn a_dead_knob_gets_one_round() {
         use crate::xplane::FakeXPlane;
         let fake = FakeXPlane::with_reads(&[(BARO, 0.0)]);
-        let now = set_altimeter(&fake, 30.40).await.unwrap();
+        let now = set_altimeter_with(&fake, 30.40, &Default::default()).await.unwrap();
         assert_eq!(fake.ran_count(CMD_BARO_UP), BARO_MAX_STEPS);
         let sync = AltimeterSync {
             was: 0.0,
@@ -628,7 +884,7 @@ mod tests {
         fake.step_on_command(CMD_BARO_DOWN, BARO, -BARO_STEP_INHG);
         fake.land_press_late(18);
         let want = 1024.0 * 100.0 / PA_PER_INHG;
-        let now = set_altimeter(&fake, want).await.unwrap();
+        let now = set_altimeter_with(&fake, want, &Default::default()).await.unwrap();
         assert!(altimeter_took(now, want), "{now}");
         assert_eq!(fake.ran_count(CMD_BARO_UP), 19);
         assert_eq!(fake.ran_count(CMD_BARO_DOWN), 1);
@@ -663,6 +919,131 @@ mod tests {
         assert_eq!(correct_setting_inhg(25_000.0, 6_000.0, 98_000.0), 29.92);
         // A silly pressure is clamped, never written raw.
         assert_eq!(correct_setting_inhg(0.0, 18_000.0, 0.0), 28.0);
+    }
+
+    /// EGSS, 2026-09-22: the 737's memory loaded at 0.0. With its STD button
+    /// declared, one ask is two STD presses (29.92 from anywhere) and 48
+    /// knob presses to 30.40, where the knob alone was 3,040.
+    #[tokio::test]
+    async fn the_737_goes_to_standard_first_and_steps_from_there() {
+        use crate::xplane::FakeXPlane;
+        let cfg = crate::aircraft::load("boeing_737_800")
+            .unwrap()
+            .altimeter
+            .expect("the 737 declares its STD buttons");
+        let std = cfg.std_command.clone().unwrap();
+        assert_eq!(cfg.std_presses, 2);
+        let fake = FakeXPlane::with_reads(&[(BARO, 0.0)]);
+        fake.step_on_command(CMD_BARO_UP, BARO, BARO_STEP_INHG);
+        fake.set_on_command(&std, BARO, STANDARD_INHG);
+        let now = set_altimeter_with(&fake, 30.40, &cfg).await.unwrap();
+        assert!(altimeter_took(now, 30.40), "{now}");
+        assert_eq!(fake.ran_count(&std), 2);
+        assert_eq!(fake.ran_count(CMD_BARO_UP), 48);
+        // Standard itself is the button and nothing else.
+        let fake = FakeXPlane::with_reads(&[(BARO, 17.50)]);
+        fake.set_on_command(&std, BARO, STANDARD_INHG);
+        let now = set_altimeter_with(&fake, STANDARD_INHG, &cfg).await.unwrap();
+        assert!(altimeter_took(now, STANDARD_INHG));
+        assert!(!fake.ran(CMD_BARO_UP) && !fake.ran(CMD_BARO_DOWN));
+        // Close to the ask the knob is quicker and the button is left alone.
+        assert!(!std_fast_path_pays(30.11, 30.00));
+        assert!(std_fast_path_pays(0.0, 30.40));
+        assert!(std_fast_path_pays(17.50, STANDARD_INHG));
+    }
+
+    /// A STD button that does nothing costs its presses and no more: the
+    /// knob steps from where the dial really is.
+    #[tokio::test]
+    async fn a_std_button_that_does_not_take_leaves_the_knob_to_it() {
+        use crate::xplane::FakeXPlane;
+        let cfg = crate::aircraft::AltimeterProfile {
+            std_command: Some("laminar/fake/std".into()),
+            std_presses: 2,
+            copilot_std_command: None,
+        };
+        let fake = FakeXPlane::with_reads(&[(BARO, 29.00)]);
+        fake.step_on_command(CMD_BARO_UP, BARO, BARO_STEP_INHG);
+        let now = set_altimeter_with(&fake, 30.40, &cfg).await.unwrap();
+        assert!(altimeter_took(now, 30.40), "{now}");
+        assert_eq!(fake.ran_count("laminar/fake/std"), 2);
+        assert_eq!(fake.ran_count(CMD_BARO_UP), 140);
+    }
+
+    /// The copilot's side follows the captain's, through its own knob and
+    /// STD button; a side that already agrees is not touched.
+    #[tokio::test]
+    async fn the_first_officers_altimeter_is_set_too() {
+        use crate::xplane::FakeXPlane;
+        let cfg = crate::aircraft::load("boeing_737_800")
+            .unwrap()
+            .altimeter
+            .unwrap();
+        let fo_std = cfg.copilot_std_command.clone().unwrap();
+        let fake = FakeXPlane::with_reads(&[(BARO, 30.40), (BARO_COPILOT, 0.0)]);
+        fake.step_on_command(CMD_BARO_COPILOT_UP, BARO_COPILOT, BARO_STEP_INHG);
+        fake.set_on_command(&fo_std, BARO_COPILOT, STANDARD_INHG);
+        let now = set_altimeter_with(&fake, 30.40, &cfg).await.unwrap();
+        assert!(altimeter_took(now, 30.40));
+        assert_eq!(fake.ran_count(&fo_std), 2);
+        assert_eq!(fake.ran_count(CMD_BARO_COPILOT_UP), 48);
+        assert!(!fake.ran(CMD_BARO_UP), "the captain's side already read right");
+        // Agreeing: nothing pressed on either side.
+        let fake = FakeXPlane::with_reads(&[(BARO, 30.40), (BARO_COPILOT, 30.40)]);
+        set_altimeter_with(&fake, 30.40, &cfg).await.unwrap();
+        assert!(!fake.ran(&fo_std) && !fake.ran(CMD_BARO_COPILOT_UP));
+    }
+
+    /// "Set the altimeter" on a knob that will not move is said, never
+    /// "Roger" with the number the dial still holds.
+    #[tokio::test]
+    async fn set_the_altimeter_says_when_it_did_not_take() {
+        use crate::xplane::FakeXPlane;
+        let fake = FakeXPlane::with_reads(&[
+            (crate::datarefs::ALTITUDE_FT, 2_000.0),
+            (crate::datarefs::QNH_PASCALS, 102_946.0),
+            (BARO, 30.11),
+        ]);
+        let cfg = crate::config::Config::default();
+        let ctx = ToolCtx {
+            xplane: &fake,
+            config: &cfg,
+            voice: None,
+            status: None,
+            reminders: None,
+        };
+        let out = SetAltimeterCurrent {
+            transition_altitude_ft: 18_000.0,
+        }
+        .execute(&json!({}), &ctx)
+        .await
+        .unwrap();
+        assert!(out.starts_with("The altimeter did not take"), "{out}");
+    }
+
+    /// The cross-check against the aircraft's true height, on the numbers
+    /// of the three flights that shaped it.
+    #[test]
+    fn the_altimeter_is_cross_checked_against_true_altitude() {
+        // EGSS 2026-09-22: 4,675 indicated at 16,884 true, knob 17.50, QNH
+        // 30.40 (below the transition, so QNH is the reference too).
+        let egss = altimeter_truth(4_675.0, 16_884.0, 17.50, 30.40, 30.40, -18.0);
+        assert!(egss.setting_gross(), "{egss:?}");
+        assert!(!egss.instrument_suspect(), "the knob explains it: {egss:?}");
+        assert!(egss.error_ft > 12_000.0);
+        // LINTO 2026-09-14: 6,838 indicated, 7,012 true, knob 30.15 against
+        // 30.10, OAT 16 C (ISA+14): nothing wrong worth a word.
+        let linto = altimeter_truth(6_838.0, 7_012.0, 30.15, 30.10, 30.10, 16.1);
+        assert!(!linto.setting_gross() && !linto.instrument_suspect(), "{linto:?}");
+        // A cold day at FL350 on standard over a low QNH: 3,100 ft of true
+        // against pressure altitude and none of it a fault.
+        let cold = altimeter_truth(35_000.0, 31_900.0, 29.92, 29.40, 29.92, -70.0);
+        assert!(!cold.setting_gross() && !cold.instrument_suspect(), "{cold:?}");
+        // A frozen static port: the knob is right and the altimeter reads
+        // 5,000 at 9,000 true.
+        let frozen = altimeter_truth(5_000.0, 9_000.0, 30.10, 30.10, 30.10, -5.0);
+        assert!(frozen.instrument_suspect(), "{frozen:?}");
+        assert!(!frozen.setting_gross());
     }
 
     #[test]
