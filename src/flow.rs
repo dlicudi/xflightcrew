@@ -240,6 +240,16 @@ pub struct Sample {
     pub automation: bool,
     /// Gear down and flaps at the landing detent ([`landing_config`]).
     pub landing_config: bool,
+    /// The flaps are up ([`climb_config`]): the climb-out schedule is done.
+    pub climb_config: bool,
+    /// On runway pavement (`None` = no runway data, or airborne).
+    pub on_runway: Option<bool>,
+}
+
+/// The climb-out the CLIMB list audits: the flap handle up (its own test,
+/// `flap_ratio < 0.05`), or an airframe with no flap profile. Pure.
+pub fn climb_config(flap_ratio: f64, has_flaps: bool) -> bool {
+    !has_flaps || flap_ratio < 0.05
 }
 
 /// The landing configuration the BEFORE LANDING list audits: the gear down
@@ -271,7 +281,7 @@ pub const DESCENT_SECS: f64 = 20.0;
 pub const BEFORE_LANDING_AGL_FT: f64 = 1500.0;
 pub const BEFORE_LANDING_SECS: f64 = 10.0;
 /// After-landing list: this long after the rollout slowed through 30 kt
-/// (the model's taxi-in).
+/// (the model's taxi-in) AND off the runway pavement.
 pub const AFTER_LANDING_SECS: f64 = 10.0;
 
 /// Phase-boundary detector, one per monitor loop. Each section fires ONCE per
@@ -341,7 +351,13 @@ impl Tracker {
             self.level_since = None;
             self.descending_since = None;
             self.low_descent_since = None;
-            let landed = phase == Phase::TaxiIn && m.landings > 0;
+            // The list is for OFF the runway: it waited only for the taxi
+            // speed and ran "landing lights, off" on the strip during a
+            // 730 m roll to the exit (EGBB 15, #174). The pavement's word,
+            // the same test as "runway vacated"; no runway data is no
+            // evidence and leaves the old trigger.
+            let landed =
+                phase == Phase::TaxiIn && m.landings > 0 && s.on_runway != Some(true);
             let stopped = held(&mut self.taxi_in_since, landed, AFTER_LANDING_TAXI_IN_SECS);
             if stopped && !self.fired("after landing") {
                 // The flight is over: the next one starts from scratch.
@@ -358,7 +374,13 @@ impl Tracker {
             s.vsi_fpm > 300.0 && s.agl_ft >= CLIMB_AGL_FT,
             CLIMB_SECS,
         );
-        if climbing && !self.fired("climb") {
+        // Under an automation the list audits the climb-out, so it waits for
+        // the paced flap schedule to finish: a 737 is still at flaps one at
+        // 1,550 ft and the list read "flaps, up on schedule" at 0.125 (EGKK
+        // 08R, sortie 1790624015-full_auto, #174). A pilot flying is proposed
+        // the list on the old trigger.
+        let clean = !s.automation || s.climb_config;
+        if climbing && clean && !self.fired("climb") {
             return self.fire("climb");
         }
         let level = held(
@@ -366,14 +388,18 @@ impl Tracker {
             s.vsi_fpm.abs() < 300.0 && s.agl_ft >= CRUISE_MIN_AGL_FT,
             CRUISE_LEVEL_SECS,
         );
-        if level && !self.fired("cruise") {
+        // A level-off inside the descent is a step of it, never a cruise.
+        if level && !self.fired("cruise") && !self.fired("descent") {
             return self.fire("cruise");
         }
+        // The model's descent too: an idle descent saws between -2,000 fpm
+        // and level, restarting the held needle every 15 s, and the list came
+        // 7,000 ft into it (EGKK-EGBB, #174). The model reads the height lost.
         let descending = held(
             &mut self.descending_since,
             s.vsi_fpm < -300.0 && peak >= CRUISE_MIN_AGL_FT,
             DESCENT_SECS,
-        );
+        ) || (phase == Phase::Descent && peak >= CRUISE_MIN_AGL_FT);
         if descending && !self.fired("descent") {
             return self.fire("descent");
         }
@@ -1658,6 +1684,9 @@ mod tests {
         /// An automation flying, and whether it has configured to land.
         automation: bool,
         configured: bool,
+        /// Flaps up (the climb list's wait under an automation).
+        clean: bool,
+        on_runway: Option<bool>,
     }
 
     impl Rig {
@@ -1671,6 +1700,8 @@ mod tests {
                 fired: Vec::new(),
                 automation: false,
                 configured: false,
+                clean: true,
+                on_runway: None,
             }
         }
         /// `n` seconds on the ground at `gs`, or airborne at `vsi` (the
@@ -1701,6 +1732,8 @@ mod tests {
                     vsi_fpm: vsi,
                     automation: self.automation,
                     landing_config: self.configured,
+                    climb_config: self.clean,
+                    on_runway: self.on_runway,
                 };
                 if let Some(sec) = self.t.tick(&s, &self.f, &ev, now) {
                     self.fired.push((self.agl, sec));
@@ -1797,6 +1830,128 @@ mod tests {
         assert!(!landing_config(true, 0.75, true), "CONF 3 is not the landing flap");
         assert!(!landing_config(false, 1.0, true), "gear up");
         assert!(landing_config(true, 0.0, false), "no flaps to set");
+    }
+
+    /// #174 (EGKK 08R, sortie 1790624015-full_auto): the Monitor CLIMB list
+    /// audited at 1,550 ft with the 737 at flaps one, 13 s before the paced
+    /// schedule put them up at 2,747 ft, and named "flaps, up on schedule".
+    /// Under an automation it waits for the flaps; a pilot flying is proposed
+    /// the list on the old trigger.
+    #[test]
+    fn an_automations_climb_list_waits_for_the_flaps() {
+        let mut r = Rig::new();
+        r.automation = true;
+        r.clean = false;
+        r.fly(5, true, 0.0, 0.0).fly(8, true, 0.0, 50.0);
+        // 2,000 fpm to 2,700 ft, flaps one all the way.
+        r.fly(81, false, 2000.0, 170.0);
+        assert!(r.names().is_empty(), "{:?}", r.fired);
+        r.clean = true;
+        r.fly(1, false, 2000.0, 190.0);
+        assert_eq!(r.names(), vec!["climb"]);
+
+        let mut p = Rig::new();
+        p.clean = false;
+        p.fly(5, true, 0.0, 0.0).fly(8, true, 0.0, 50.0).fly(81, false, 2000.0, 170.0);
+        assert_eq!(p.names(), vec!["climb"]);
+
+        assert!(climb_config(0.0, true));
+        assert!(!climb_config(0.125, true), "flaps one");
+        assert!(climb_config(0.5, false), "no flaps to raise");
+    }
+
+    /// Recorded `state` records through the flight model and the tracker,
+    /// with the pavement's word per tick; the sections and when (+s).
+    fn replay_tracker(
+        text: &str,
+        automation: bool,
+        on_runway: impl Fn(f64) -> Option<bool>,
+    ) -> Vec<(f64, &'static str)> {
+        let t0 = 1790624015.0;
+        let start = Instant::now();
+        let mut r = crate::flight::Replay::default();
+        let mut tr = Tracker::default();
+        let mut fired = Vec::new();
+        let mut first = None;
+        for v in text.lines().filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok()) {
+            let Some((s, ev)) = r.feed(&v) else { continue };
+            let f0 = *first.get_or_insert(s.t);
+            let now = start + Duration::from_secs_f64(s.t - f0);
+            let fs = Sample {
+                agl_ft: s.agl_ft,
+                vsi_fpm: s.vsi_fpm,
+                automation,
+                landing_config: true,
+                climb_config: true,
+                on_runway: if s.on_ground { on_runway(s.t - t0) } else { None },
+            };
+            if let Some(sec) = tr.tick(&fs, &r.flight, &ev, now) {
+                fired.push((s.t - t0, sec));
+            }
+        }
+        fired
+    }
+
+    /// #174 (EGBB 15): the Crew AFTER LANDING list ran at +2846, on the
+    /// runway, during a 730 m roll to exit C ("landing lights, off" on the
+    /// strip); the vacate was +3005.4 (`taxi_in` `vacated`, `on_runway`
+    /// false). The list waits for the pavement.
+    #[test]
+    fn the_after_landing_list_waits_for_the_vacate() {
+        const ROLL: &str = include_str!("../bench/flight/egbb15_rollout_to_vacate.jsonl");
+        let blind = replay_tracker(ROLL, false, |_| None);
+        let at = blind.iter().find(|(_, n)| *n == "after landing").map(|(t, _)| *t);
+        assert!(at.is_some_and(|t| t < 2850.0), "the recorded failure: {blind:?}");
+        let fed = replay_tracker(ROLL, false, |t| Some(t < 3005.4));
+        let at = fed.iter().find(|(_, n)| *n == "after landing").map(|(t, _)| *t);
+        assert!(at.is_some_and(|t| t >= 3005.4), "{fed:?}");
+    }
+
+    /// #174 (EGKK-EGBB): the DESCENT list came at +1750, 7,000 ft into an
+    /// idle descent that saws between -2,000 fpm and level; the model's
+    /// descent (the height lost) runs it near the top, and the level-off at
+    /// 12,700 inside it earns no cruise list.
+    #[test]
+    fn the_descent_list_runs_near_the_top_of_a_sawtooth_descent() {
+        const TOD: &str = include_str!("../bench/flight/egkk_egbb_top_of_descent.jsonl");
+        let fired = replay_tracker(TOD, true, |_| None);
+        let at = fired.iter().find(|(_, n)| *n == "descent").map(|(t, _)| *t);
+        assert!(at.is_some_and(|t| t < 1630.0), "{fired:?}");
+        let cruise = fired.iter().find(|(_, n)| *n == "cruise").map(|(t, _)| *t);
+        assert!(cruise.is_none_or(|c| c < 1594.0), "{fired:?}");
+    }
+
+    /// The vacate's lights and the list's agree: landing light off, which
+    /// the list checks; the taxi light on, which it does not (one state for
+    /// every writer at that moment).
+    #[test]
+    fn the_vacate_lights_agree_with_the_after_landing_list() {
+        let text = std::fs::read_to_string("checklists/boeing_737_800.txt").unwrap();
+        let section: Vec<&str> = text
+            .lines()
+            .skip_while(|l| !l.starts_with("sw_checklist:AFTER LANDING"))
+            .take_while(|l| !l.starts_with("sw_remark:AFTER LANDING COMPLETE"))
+            .collect();
+        assert!(section.iter().any(|l| l.contains("landing_lights_on:0")), "{section:?}");
+        assert!(!section.iter().any(|l| l.contains("taxi_light_on")), "{section:?}");
+        let lp = |key: &str| crate::aircraft::LightProfile {
+            key: key.into(),
+            spoken: key.into(),
+            dataref: format!("sim/test/{key}"),
+            command_on: None,
+            command_off: None,
+            also_datarefs: Vec::new(),
+            toggles: Vec::new(),
+            auto_at_night: false,
+        };
+        let both = crate::tools::lights::Exterior {
+            landing: Some(lp("landing")),
+            taxi: Some(lp("taxi")),
+        };
+        for dark in [false, true] {
+            let (landing, _) = crate::tools::lights::after_vacate_for(&both, dark);
+            assert_eq!(landing, Some(false));
+        }
     }
 
     /// An impact is no landing, and a wreck runs no list (the S-76 at LILB,

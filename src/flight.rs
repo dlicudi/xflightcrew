@@ -449,6 +449,13 @@ const VS_BAND_FPM: f64 = 300.0;
 const CLIMB_SECS: f64 = 15.0;
 const LEVEL_SECS: f64 = 30.0;
 const DESCENT_SECS: f64 = 20.0;
+/// ...or the height LOST over the last [`DESCENT_SECS`] is a descent past the
+/// band, whatever the needle did inside the window: an idle descent that
+/// protects its speed saws between -2,000 and level every 15 s, and each
+/// level tick restarted the held clock (EGKK-EGBB 2026-09-28, #174: Climb
+/// from the 16,300 ft top to 12,700, then Cruise to 9,345). The window's
+/// oldest sample may be at most this old (a gap in the record is no trend).
+const TREND_MAX_SECS: f64 = 2.0 * DESCENT_SECS;
 /// A level this far under the peak, in a descent, is a step of the descent
 /// until it has held this long.
 const STEP_BELOW_PEAK_FT: f64 = 1000.0;
@@ -557,6 +564,8 @@ pub struct Flight {
     go_around_floor_ft: f64,
     /// Airborne `(t, vsi)` for the touchdown sink.
     recent: VecDeque<(f64, f64)>,
+    /// Airborne `(t, alt)` over the descent window ([`Flight::losing_height`]).
+    alt_track: VecDeque<(f64, f64)>,
     /// Off the wheels again during the rollout: a bounce if it comes down.
     off_again: bool,
     situation: Situation,
@@ -590,6 +599,7 @@ impl Flight {
             roll_peak_kts: 0.0,
             go_around_floor_ft: f64::MAX,
             recent: VecDeque::new(),
+            alt_track: VecDeque::new(),
             off_again: false,
             situation: Situation::default(),
             situation_seen: false,
@@ -727,6 +737,7 @@ impl Flight {
         self.since_t = s.t;
         self.timers = Timers::default();
         self.recent.clear();
+        self.alt_track.clear();
         self.roll_peak_kts = 0.0;
         self.go_around_floor_ft = f64::MAX;
         self.off_again = false;
@@ -960,9 +971,11 @@ impl Flight {
         use Phase::*;
         let t = s.t;
         if s.on_ground {
+            self.alt_track.clear();
             self.touch_down(s, ev);
             return;
         }
+        let losing_height = self.losing_height(s);
         self.recent.push_back((t, s.vsi_fpm));
         while self
             .recent
@@ -996,7 +1009,8 @@ impl Flight {
         let descending = self
             .timers
             .descending
-            .feed(s.vsi_fpm < -VS_BAND_FPM, t, DESCENT_SECS);
+            .feed(s.vsi_fpm < -VS_BAND_FPM, t, DESCENT_SECS)
+            || losing_height;
         let approach = s.approach == Some(true)
             || self.timers.approach.feed(
                 s.agl_ft < APPROACH_AGL_FT && s.vsi_fpm < APPROACH_VS_FPM,
@@ -1079,6 +1093,29 @@ impl Flight {
             }
             _ => {}
         }
+    }
+
+    /// Whether the height lost over the last [`DESCENT_SECS`] is a descent
+    /// past the band: the trend of the altitude, not the needle's run.
+    /// Keeps one sample at or before the window's start as its anchor.
+    fn losing_height(&mut self, s: &Sample) -> bool {
+        let t = s.t;
+        self.alt_track.push_back((t, s.alt_ft));
+        while self
+            .alt_track
+            .get(1)
+            .is_some_and(|&(t1, _)| t - t1 >= DESCENT_SECS)
+        {
+            self.alt_track.pop_front();
+        }
+        let Some(&(t0, a0)) = self.alt_track.front() else {
+            return false;
+        };
+        let span = t - t0;
+        if !(DESCENT_SECS..=TREND_MAX_SECS).contains(&span) {
+            return false;
+        }
+        (s.alt_ft - a0) / span * 60.0 < -VS_BAND_FPM
     }
 
     /// A level-off well below the flight's highest level, in a descent, is a
@@ -2179,6 +2216,37 @@ mod tests {
         seg(120, -1000.0, &mut v);
         let (seen, _, _) = phases(v);
         assert_eq!(seen, vec![Phase::Cruise, Phase::Descent]);
+    }
+
+    /// EGKK-EGBB 2026-09-28 (sortie 1790624015-full_auto, #174): the 737's
+    /// idle descent from the 16,300 ft top saws between -2,000 fpm and level
+    /// every 15 s, and every level tick restarted the held needle. Live the
+    /// model said Climb to 12,700, Cruise to 9,345, and Descent only at
+    /// +1748.9. The height lost over the window is the descent.
+    #[test]
+    fn a_sawtooth_descent_from_the_top_is_a_descent() {
+        const TOD: &str = include_str!("../bench/flight/egkk_egbb_top_of_descent.jsonl");
+        let t0 = 1790624015.0;
+        let mut r = Replay::default();
+        let mut went_down: Option<(f64, f64)> = None;
+        let mut after = Vec::new();
+        for v in TOD.lines().filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok()) {
+            let Some((s, _)) = r.feed(&v) else { continue };
+            let live = v["fphase"].as_str().unwrap_or("");
+            if went_down.is_none() && r.flight.phase() == Phase::Descent {
+                went_down = Some((s.t - t0, s.alt_ft));
+                // The recorded failure, on the same tick.
+                assert_eq!(live, "Climb", "live at +{:.1}", s.t - t0);
+            }
+            if went_down.is_some() {
+                after.push(r.flight.phase());
+            }
+        }
+        assert!(r.flight.refused().is_empty(), "{:?}", r.flight.refused());
+        let (at, alt) = went_down.expect("a descent");
+        assert!(at < 1630.0 && alt > 14_500.0, "Descent at +{at:.1}, {alt:.0} ft");
+        // The 35 s level-off at 12,700 is a step of it, not a cruise.
+        assert!(after.iter().all(|p| *p == Phase::Descent), "{after:?}");
     }
 
     #[test]

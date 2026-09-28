@@ -10176,3 +10176,27 @@ same picture for a takeoff request. Tests `a_lemg_12_arrival_is_not_traffic_for_
 `a_held_runway_start_is_released_once_its_traffic_has_gone`,
 `a_held_runway_start_arms_the_release_and_takes_the_hold_readback`,
 `a_held_crew_reads_back_the_hold_before_asking_again`. Offline only.
+
+## 2026-09-28: the model lagged the descent, three lists at the wrong time (issue #174)
+
+EGKK 08R to EGBB 15, 737 (sortie 1790624015-full_auto). (1) `fphase` stayed Climb from the
+16,300 ft top (+1594) to 12,700, Cruise to 9,345, Descent only at +1748.9. The idle descent saws:
+-2,000 fpm, then a tick or two at -370 to +300 every 15 s, and each restarted the 20 s held needle
+(the tracker's own descent list too). The model now also reads the height LOST over 20 s
+(`Flight::losing_height`, anchor at most 40 s old): Descent near 15,000 ft, and the 35 s level-off
+at 12,700 stays a step of it. The tracker's descent list takes the model's Descent; a level-off
+after it earns no cruise list. (2) The Monitor CLIMB list ran at 1,550 ft (+1106) with flaps one
+(0.125) and the taxi light on: the paced schedule put the flaps up at +1119.8 (2,747 ft), and
+`lights_climb` lived only in the follower's loop, which starts at the takeoff's handoff (2,765 ft).
+The rule stands (off passing 1,000 ft AGL): the takeoff switches them itself
+(`autotakeoff::LIGHTS_OFF_AGL_FT`, blackbox `autotakeoff` `lights_climb`), and under an automation
+the list waits for the flap handle up (`flow::climb_config`, its own `< 0.05` test). (3) The Crew
+AFTER LANDING list ran at +2846 on the runway during a 730 m roll to exit C (vacated +3005.4): it
+waited only for the model's taxi-in. It now also waits for the pavement (`flow::Sample.on_runway`,
+`party_line::on_runway`, the vacate report's test). The issue's "lights_vacated turned them back
+ON" is a misread: `did` is true when the switch READ BACK as wanted, so landing went OFF (as the
+list has it) and taxi on (the list does not check it). Tests
+`a_sawtooth_descent_from_the_top_is_a_descent`, `an_automations_climb_list_waits_for_the_flaps`,
+`the_after_landing_list_waits_for_the_vacate`,
+`the_descent_list_runs_near_the_top_of_a_sawtooth_descent`,
+`the_vacate_lights_agree_with_the_after_landing_list` (records in `bench/flight/`). Offline only.
