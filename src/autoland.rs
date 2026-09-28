@@ -145,9 +145,14 @@ pub fn nearby_runways(
                 let Some((e1, e2, length_m, surface)) = parse_runway_100(&line) else {
                     continue;
                 };
+                let width_m: Option<f64> =
+                    line.split_whitespace().nth(1).and_then(|s| s.parse().ok());
                 for e in [e1, e2] {
                     let dist_nm = haversine_nm(lat, lon, e.lat, e.lon);
                     if dist_nm <= max_nm {
+                        if let Some(w) = width_m {
+                            note_runway_width(&icao, &e.id, w);
+                        }
                         out.push(Runway {
                             icao: icao.clone(),
                             id: e.id,
@@ -1143,6 +1148,10 @@ pub fn run_autoland_scoped(
                 crate::blackbox::record("autoland", serde_json::json!({
                     "event": "threshold_elev", "rwy": format!("{} {}", rwy.icao, rwy.id),
                     "header_ft": rwy.elev_ft, "probed_ft": seen, "aim_ft": aim,
+                    // The pavement the lateral gates judge against.
+                    "width_m": runway_width_m(&rwy),
+                    "xtk_limit_m": landing_xtk_limit_m(runway_width_m(&rwy)),
+                    "flare_xtk_limit_m": flare_xtk_limit_m(runway_width_m(&rwy)),
                 }));
                 if (aim - rwy.elev_ft).abs() > THRESHOLD_ELEV_TRUST_FT {
                     let diff = aim - rwy.elev_ft;
@@ -1620,7 +1629,10 @@ pub fn run_autoland_scoped(
                 let crab_raw = CrabFilter::raw(psi_r.as_ref().ok().copied(), hpath_r.as_ref().ok().copied());
                 let crab = crab_filter.update(crab_raw, dt_s.clamp(0.0, 3.0));
 
-                let raw = guidance(lat, lon, alt, radio_ft, gs_kts, ias, &rwy, approach_ias, 25.0, xtk_rate);
+                let raw = guidance_on(
+                    lat, lon, alt, radio_ft, gs_kts, ias, &rwy, approach_ias, 25.0, xtk_rate,
+                    runway_width_m(&rwy),
+                );
                 let raw = hold_flare(raw, flaring, radio_ft, gs_kts, 25.0);
                 // A missed approach called low is flown by the latch (full power,
                 // straight ahead) until clear of the ground — the raw intercept
@@ -1670,7 +1682,11 @@ pub fn run_autoland_scoped(
                 // Unstabilised at the thousand-foot gate is a go-around, not a
                 // quiet re-intercept: the latch only arms itself below the
                 // terrain floor, so it is ordered.
-                if raw.balk == Some("unstabilised_at_gate") {
+                // So is one found unstabilised below the floor on the FIRST
+                // tick (a handoff that arrives that way, LEMG 13 2026-09-28):
+                // with no final before it, the latch's own transition never
+                // sees it.
+                if matches!(raw.balk, Some("unstabilised_at_gate" | "unstabilised_below_floor")) {
                     go_around.order(on_ground > 0.5);
                 }
                 let mut missed = go_around.update(
@@ -2338,7 +2354,8 @@ pub fn run_autoland_scoped(
                         let pursuit_bug = g.target_heading_deg + crab + trim;
                         let sf = short_final
                             .get_or_insert_with(|| ShortFinal::new(off_course(pursuit_bug), to));
-                        (rwy.course_deg + sf.step(xtk_now * M_PER_NM, to, gs_kts, tick_dt))
+                        (rwy.course_deg
+                            + sf.step(xtk_now * M_PER_NM, to, gs_kts, tick_dt, phi_r.as_ref().ok().copied()))
                             .rem_euclid(360.0)
                     }
                     (ApproachPhase::Final | ApproachPhase::Flare, ..) => {
@@ -3115,7 +3132,15 @@ pub const TRACK_TRIM_TAU_S: f64 = 30.0;
 /// is a broken autopilot, not something to trim.
 pub const TRACK_TRIM_MAX_DEG: f64 = 5.0;
 /// A track error beyond this is a turn in progress, not a bias: not integrated.
-const TRACK_TRIM_ERR_CAP_DEG: f64 = 10.0;
+/// It was 10, and a handoff still converging is a turn in progress: LEMG 31
+/// (sortie 1790584715-full_auto, 2026-09-28) the 737 came off the circuit's
+/// intercept tracking 303 to 309 for a 311.7 runway, the trim learnt +0.78
+/// degrees from those six seconds of roll-out, and with the autopilot
+/// flying its bug to a tenth of a degree the final then sat 30 to 32 m right
+/// of the centreline from 1.4 nm to 0.3, the trim cancelling the pursuit's
+/// 0.75 degree cut; LEMG 13 (1790591256) learnt -0.57 the same way and sat
+/// 50 m left. The biases it exists for were 1.1 to 1.9 degrees.
+const TRACK_TRIM_ERR_CAP_DEG: f64 = 3.0;
 
 /// Integral trim on the final's TRACK error, in degrees added to the heading
 /// bug alongside the wind crab.
@@ -3158,11 +3183,30 @@ impl TrackTrim {
         hpath_true: Option<f64>,
         dt_s: f64,
     ) -> f64 {
+        self.update_capped(
+            phase,
+            wanted_track_deg,
+            hpath_true,
+            dt_s,
+            TRACK_TRIM_ERR_CAP_DEG,
+        )
+    }
+
+    /// [`TrackTrim::update`] with the turn-in-progress cap given (the replay
+    /// tests fly the old 10 degrees against the new).
+    pub(crate) fn update_capped(
+        &mut self,
+        phase: ApproachPhase,
+        wanted_track_deg: f64,
+        hpath_true: Option<f64>,
+        dt_s: f64,
+        cap_deg: f64,
+    ) -> f64 {
         match phase {
             ApproachPhase::Final => {
                 if let Some(h) = hpath_true {
                     let err = (wanted_track_deg - h + 540.0).rem_euclid(360.0) - 180.0;
-                    if err.abs() <= TRACK_TRIM_ERR_CAP_DEG {
+                    if err.abs() <= cap_deg {
                         self.deg = (self.deg + err * dt_s / TRACK_TRIM_TAU_S)
                             .clamp(-TRACK_TRIM_MAX_DEG, TRACK_TRIM_MAX_DEG);
                     }
@@ -3327,6 +3371,15 @@ pub const STABILISED_GATE_AGL_FT: f64 = 1000.0;
 
 pub fn stabilised_xtk(xtk_nm: f64, along_nm: f64) -> bool {
     crate::circuit::interceptable(xtk_nm * M_PER_NM, along_nm * M_PER_NM)
+}
+
+/// Will the final's pursuit have the offset inside `limit_m` by the
+/// threshold ([`crate::reversal::predicted_residual_m`], the stabilised
+/// gate's own time model)? The question below the terrain floor, where
+/// "interceptable" is true of any offset a landing could still be saved from
+/// and of many it could not.
+pub fn lands_on_the_pavement(xtk_nm: f64, along_nm: f64, gs_kts: f64, limit_m: f64) -> bool {
+    crate::reversal::predicted_residual_m(xtk_nm, along_nm, gs_kts) <= limit_m
 }
 /// Airspeed this far below the approach speed triggers speed protection (nose
 /// down to regain it), before the decay reaches a stall and disconnects the AP.
@@ -4437,31 +4490,71 @@ const SHORT_FINAL_BIAS_TAU_S: f64 = 2.0;
 /// was a steady degree, and a P law holds a steady offset against a steady
 /// error however it is damped. Seeded with the bug the pursuit was flying,
 /// so the hand-over is continuous.
+///
+/// What the track does against the bug is only a BIAS while the aircraft is
+/// flying that bug steadily. Learnt while it is still turning onto it, the
+/// autopilot's own lag reads as bias: LEMG 13 (sortie 1790591256-full_auto,
+/// 2026-09-28) the short final began 32 m left at 0.29 nm, the cut went to
+/// its 3 degree cap, the track lagged it by 5.4 degrees a tick later, the 2 s
+/// learner took that for a bias and ran to its 5 degree clamp, and the bug
+/// stood 8 degrees right of the runway: 16 degrees of bank at 90 ft, across
+/// the centreline at the threshold and 37 m right at the wheels. The same
+/// shape at 11 degrees of bank in the circuit before it (1790590663). So a
+/// tick banked past [`SHORT_FINAL_LEARN_BANK_DEG`], or one whose track is
+/// more than [`SHORT_FINAL_LEARN_ERR_DEG`] from what the bias already
+/// explains, teaches nothing, and the bias is bounded by what one really was
+/// (a degree, 2026-09-26) with room: [`SHORT_FINAL_MAX_BIAS_DEG`].
 #[derive(Debug, Clone, Copy)]
 pub struct ShortFinal {
     bias_deg: f64,
     prev_bug_deg: f64,
 }
 
+/// The most bias the short final carries, degrees.
+const SHORT_FINAL_MAX_BIAS_DEG: f64 = 2.5;
+/// Banked past this, the track is turning and teaches no bias, degrees.
+const SHORT_FINAL_LEARN_BANK_DEG: f64 = 5.0;
+/// A track further than this from the bug plus the bias learnt is a turn
+/// still under way, not a bias, degrees.
+const SHORT_FINAL_LEARN_ERR_DEG: f64 = 3.0;
+
 impl ShortFinal {
     /// `entry_bug_off_deg`: the bug (true) less the course on the tick the
     /// short final begins; `track_off_deg`: the track less the course then.
     pub fn new(entry_bug_off_deg: f64, track_off_deg: f64) -> Self {
+        let seed = track_off_deg - entry_bug_off_deg;
         Self {
-            bias_deg: (track_off_deg - entry_bug_off_deg).clamp(-5.0, 5.0),
+            bias_deg: if seed.is_finite() {
+                seed.clamp(-SHORT_FINAL_MAX_BIAS_DEG, SHORT_FINAL_MAX_BIAS_DEG)
+            } else {
+                0.0
+            },
             prev_bug_deg: entry_bug_off_deg,
         }
     }
 
-    /// One tick: the bug offset from the course, degrees.
-    pub fn step(&mut self, xtk_m: f64, track_off_deg: f64, gs_kts: f64, dt_s: f64) -> f64 {
+    /// One tick: the bug offset from the course, degrees. `bank_deg` is the
+    /// bank read this tick (`None` when unread: judged on the track alone).
+    pub fn step(
+        &mut self,
+        xtk_m: f64,
+        track_off_deg: f64,
+        gs_kts: f64,
+        dt_s: f64,
+        bank_deg: Option<f64>,
+    ) -> f64 {
         if !track_off_deg.is_finite() || !xtk_m.is_finite() {
             return self.prev_bug_deg;
         }
         let dt = dt_s.clamp(0.05, 1.0);
         let e = track_off_deg - self.prev_bug_deg;
-        let a = (dt / SHORT_FINAL_BIAS_TAU_S).min(1.0);
-        self.bias_deg = (self.bias_deg + (e - self.bias_deg) * a).clamp(-5.0, 5.0);
+        let turning = bank_deg.is_some_and(|b| b.abs() > SHORT_FINAL_LEARN_BANK_DEG)
+            || (e - self.bias_deg).abs() > SHORT_FINAL_LEARN_ERR_DEG;
+        if !turning {
+            let a = (dt / SHORT_FINAL_BIAS_TAU_S).min(1.0);
+            self.bias_deg = (self.bias_deg + (e - self.bias_deg) * a)
+                .clamp(-SHORT_FINAL_MAX_BIAS_DEG, SHORT_FINAL_MAX_BIAS_DEG);
+        }
         let v = (gs_kts.max(0.0) * 0.514_444).max(30.0);
         let side = v * track_off_deg.to_radians().sin();
         let bug = short_final_cut_deg(xtk_m, side, gs_kts) - self.bias_deg;
@@ -4607,6 +4700,78 @@ fn roundout_reaches_pavement(along_nm: f64, radio_alt_ft: f64, gs_kts: f64) -> b
 /// touching down there is how the LXGB 09 rollout ended in wreckage
 /// (2026-07-22). A balked landing straight ahead is always the better trade.
 const FLARE_MAX_XTK_NM: f64 = 0.02;
+
+/// How far inside the pavement's edge a landing's centreline offset must stay,
+/// metres: a jet's main gear (the 737's is 5.7 m across, 2.9 m either side)
+/// plus a margin for the arrest's last closure.
+const LANDING_EDGE_MARGIN_M: f64 = 7.5;
+/// ...and how close to the edge the flare may still be at the flare gate: the
+/// gear on the pavement with a metre to spare.
+const FLARE_EDGE_MARGIN_M: f64 = 4.0;
+
+/// The most centreline offset a landing may carry to the wheels on a runway
+/// `width_m` wide, metres: the stabilised gates below the terrain floor and
+/// the low gate judge against it. `FLARE_MAX_XTK_NM`'s 37 m is a 60 m strip's
+/// half-width plus margin, and on LEMG 13's 45 m it is 14.5 m past the edge:
+/// the 737 flew the last 500 ft 30 to 50 m off, the gates never fired, and it
+/// touched down 37 m right of the centreline, in the grass (sortie
+/// 1790591256-full_auto, 2026-09-28). Unknown width keeps the old 37 m; a
+/// narrow strip keeps at least a quarter of its width.
+pub fn landing_xtk_limit_m(width_m: Option<f64>) -> f64 {
+    let legacy = FLARE_MAX_XTK_NM * M_PER_NM;
+    match width_m.filter(|w| w.is_finite() && *w > 1.0) {
+        Some(w) => ((w / 2.0 - LANDING_EDGE_MARGIN_M).max(w / 4.0)).min(legacy),
+        None => legacy,
+    }
+}
+
+/// The offset the FLARE gate balks beyond, metres: the gear still on the
+/// pavement ([`FLARE_EDGE_MARGIN_M`] inside the edge), never tighter than the
+/// landing limit, never looser than the old 37 m.
+pub fn flare_xtk_limit_m(width_m: Option<f64>) -> f64 {
+    let legacy = FLARE_MAX_XTK_NM * M_PER_NM;
+    match width_m.filter(|w| w.is_finite() && *w > 1.0) {
+        Some(w) => (w / 2.0 - FLARE_EDGE_MARGIN_M)
+            .max(landing_xtk_limit_m(Some(w)))
+            .min(legacy),
+        None => legacy,
+    }
+}
+
+/// The pavement widths read with the runways (apt.dat's `100` row, field 1),
+/// keyed by field and end. A runway's width is scenery, not flight state: it
+/// is noted as `nearby_runways` reads it, so the arm that found the runway
+/// knows its width without a second pass over apt.dat.
+static RUNWAY_WIDTHS: std::sync::Mutex<Option<std::collections::HashMap<(String, String), f64>>> =
+    std::sync::Mutex::new(None);
+
+fn width_key(icao: &str, id: &str) -> (String, String) {
+    (
+        icao.trim().to_ascii_uppercase(),
+        id.trim().to_ascii_uppercase(),
+    )
+}
+
+/// Note a runway end's pavement width, metres.
+pub fn note_runway_width(icao: &str, id: &str, width_m: f64) {
+    if !(width_m.is_finite() && width_m > 1.0) {
+        return;
+    }
+    if let Ok(mut m) = RUNWAY_WIDTHS.lock() {
+        m.get_or_insert_with(Default::default)
+            .insert(width_key(icao, id), width_m);
+    }
+}
+
+/// The pavement width of `rwy` when apt.dat gave one; `None` otherwise.
+pub fn runway_width_m(rwy: &Runway) -> Option<f64> {
+    RUNWAY_WIDTHS
+        .lock()
+        .ok()?
+        .as_ref()?
+        .get(&width_key(&rwy.icao, &rwy.id))
+        .copied()
+}
 
 /// Inside the FAP and within this of the runway's course, an approach that
 /// needs repositioning goes around first instead of turning at once.
@@ -5181,6 +5346,41 @@ pub fn guidance(
     flare_radio_ft: f64,
     xtk_rate_nm_min: f64,
 ) -> Guidance {
+    guidance_on(
+        cur_lat,
+        cur_lon,
+        cur_alt_ft,
+        radio_alt_ft,
+        gs_kts,
+        ias_kts,
+        rwy,
+        approach_ias,
+        flare_radio_ft,
+        xtk_rate_nm_min,
+        None,
+    )
+}
+
+/// [`guidance`] on a runway of known pavement width (`width_m`, apt.dat's):
+/// the lateral gates below the terrain floor judge the final against the
+/// pavement ([`landing_xtk_limit_m`], [`flare_xtk_limit_m`]). `None` is the
+/// old 37 m everywhere.
+#[allow(clippy::too_many_arguments)]
+pub fn guidance_on(
+    cur_lat: f64,
+    cur_lon: f64,
+    cur_alt_ft: f64,
+    radio_alt_ft: f64,
+    gs_kts: f64,
+    ias_kts: f64,
+    rwy: &Runway,
+    approach_ias: f64,
+    flare_radio_ft: f64,
+    xtk_rate_nm_min: f64,
+    width_m: Option<f64>,
+) -> Guidance {
+    let landing_xtk_nm = landing_xtk_limit_m(width_m) / M_PER_NM;
+    let flare_xtk_nm = flare_xtk_limit_m(width_m) / M_PER_NM;
     let dist_nm = haversine_nm(cur_lat, cur_lon, rwy.thr_lat, rwy.thr_lon);
     let recip = (rwy.course_deg + 180.0) % 360.0;
 
@@ -5227,7 +5427,7 @@ pub fn guidance(
         // the approach path miles from the field (seen live: "flared" at 7 ft AGL
         // 4.1 nm out at LEMI, power cut over open ground; and again into a dip
         // 0.4 nm short at LERL). Flare only over the runway environment.
-        if xtk.abs() > FLARE_MAX_XTK_NM {
+        if xtk.abs() > flare_xtk_nm {
             // ...and only over the PAVEMENT. The final's P-only tracking left a
             // standing 0.10 nm cross-track under the LXGB crosswind and the
             // flare froze it: touchdown 185 m right of the centreline, in the
@@ -5319,7 +5519,7 @@ pub fn guidance(
         } else {
             (-xtk * 80.0).clamp(-8.0, 8.0)
         };
-        if radio_alt_ft < 100.0 && dist_nm < 0.6 && xtk.abs() > FLARE_MAX_XTK_NM {
+        if radio_alt_ft < 100.0 && dist_nm < 0.6 && xtk.abs() > landing_xtk_nm {
             // Not going to make the pavement: balk NOW, with height to work
             // with. The 22 ft flare-gate balk arrested nothing — the aircraft
             // still skimmed the ground at 91 kt before climbing (2026-07-22).
@@ -5357,8 +5557,15 @@ pub fn guidance(
             (ApproachPhase::Intercept, rwy.course_deg)
         } else if radio_alt_ft < TERRAIN_FLOOR_AGL_FT
             && (STABILISED_MIN_ALONG_NM..FAP_NM).contains(&along_nm)
-            && !stabilised_xtk(xtk, along_nm)
+            && !(stabilised_xtk(xtk, along_nm)
+                && (width_m.is_none()
+                    || lands_on_the_pavement(xtk, along_nm, gs_kts, landing_xtk_nm * M_PER_NM)))
         {
+            // ...and "interceptable" is not stabilised either: a 35 degree
+            // cut reaches 50 m from anywhere, and the 737 rode 30 to 50 m
+            // beside a 45 m strip from 500 ft to the wheels (LEMG 13,
+            // 2026-09-28). Below the floor the pursuit's own TIME must bring
+            // the offset onto the pavement by the threshold.
             // Below the terrain floor and not laterally stabilised: a balk
             // with height in hand. That flare gate above was the ONLY lateral
             // balk, so a final that never converged (handed off 50 degrees
@@ -6306,9 +6513,15 @@ mod tests {
         // Wraps: 359 wanted, 1 flown is -2, not +358.
         let mut w = super::TrackTrim::new();
         assert!(w.update(ApproachPhase::Final, 359.0, Some(1.0), 3.0) < 0.0);
+        // A 5 degree error is a roll-out still converging, not a bias.
+        let before = t.value();
+        assert_eq!(
+            t.update(ApproachPhase::Final, 90.0, Some(85.0), 1.0),
+            before
+        );
         // Capped, and reset by the intercept (a go-around starts clean).
         for _ in 0..10_000 {
-            t.update(ApproachPhase::Final, 90.0, Some(85.0), 1.0);
+            t.update(ApproachPhase::Final, 90.0, Some(87.5), 1.0);
         }
         assert_eq!(t.value(), super::TRACK_TRIM_MAX_DEG);
         assert_eq!(
@@ -7191,7 +7404,7 @@ mod tests {
             while t < t_end {
                 let track = hdg + drift(t);
                 let bug = if new {
-                    course + sf.step(x, track - course, gs, dt)
+                    course + sf.step(x, track - course, gs, dt, None)
                 } else {
                     course + (-x / M_PER_NM * 80.0).clamp(-8.0, 8.0) + crab_trim(t)
                 };
@@ -10360,5 +10573,589 @@ mod ap_engage_tests {
         assert!(worst_vsi > -1200.0, "the sink never builds: {worst_vsi:.0}");
         assert!(p.vsi.abs() < 400.0, "level at the hand-over: {:.0}", p.vsi);
         assert!(ALT0_FT - lowest < 150.0, "lost {:.0} ft", ALT0_FT - lowest);
+    }
+}
+
+/// LEMG 13 and 31 as apt.dat has them, a 737's heading response and the
+/// autoland loop's lateral composition, for the replays of the 2026-09-28
+/// circuits (issue #147): the circuit's final, the handoff and autoland's
+/// final flown against the same plant.
+#[cfg(test)]
+pub(crate) mod lemg_replay {
+    use super::*;
+
+    /// LEMG's 13/31 row from the installed apt.dat (Global Airports), 45.11 m
+    /// wide.
+    pub const LEMG_13_31: &str = "100 45.11 1 1 0.00 1 3 0  13 36.6845573 -4.5126253 0 75 3 1 0 2 31 36.6654027 -4.4858140 0 75 3 1 0 3";
+    pub const LEMG_WIDTH_M: f64 = 45.11;
+
+    /// One end of LEMG 13/31, parsed from the row the app reads.
+    pub fn lemg(id: &str) -> Runway {
+        let (e1, e2, length_m, surface) =
+            parse_runway_100(LEMG_13_31).expect("the LEMG row parses");
+        let e = if e1.id == id { e1 } else { e2 };
+        Runway {
+            icao: "LEMG".into(),
+            id: e.id,
+            thr_lat: e.lat,
+            thr_lon: e.lon,
+            course_deg: e.course,
+            length_m,
+            surface,
+            dist_nm: 0.0,
+            elev_ft: 48.0,
+        }
+    }
+
+    /// The point `along_m` short of the threshold (positive on the approach
+    /// side) and `xtk_m` right of the inbound course.
+    pub fn at(rwy: &Runway, along_m: f64, xtk_m: f64) -> (f64, f64) {
+        let recip = (rwy.course_deg + 180.0).rem_euclid(360.0);
+        let (lat, lon) = project_latlon(rwy.thr_lat, rwy.thr_lon, recip, along_m / M_PER_NM);
+        let side = if xtk_m >= 0.0 {
+            rwy.course_deg + 90.0
+        } else {
+            rwy.course_deg - 90.0
+        };
+        project_latlon(lat, lon, side.rem_euclid(360.0), xtk_m.abs() / M_PER_NM)
+    }
+
+    /// A 737 in heading mode, fitted to the recorded LEMG ticks: the
+    /// autopilot banks 2 degrees per degree of heading error up to 25 (the
+    /// base and final turns held 23 to 27), rolls toward it through a 1 s lag
+    /// at no more than 7 degrees a second (0 to 16 degrees in 3.6 s on the
+    /// short final of sortie 1790591256), turns coordinated, and flies the
+    /// bug of the tick before (the loop's transport delay). The wind blows
+    /// from 106 degrees at 6 m/s: a 2 degree crab on 131 and 3.7 on 158, as
+    /// recorded.
+    pub struct Jet {
+        pub lat: f64,
+        pub lon: f64,
+        pub psi: f64,
+        pub phi: f64,
+        pub tas_mps: f64,
+        pub wind_to_deg: f64,
+        pub wind_mps: f64,
+        queued: Option<f64>,
+    }
+
+    impl Jet {
+        pub fn new(lat: f64, lon: f64, psi: f64, tas_kts: f64) -> Self {
+            Self {
+                lat,
+                lon,
+                psi,
+                phi: 0.0,
+                tas_mps: tas_kts * 0.514_444,
+                wind_to_deg: 286.0,
+                wind_mps: 6.0,
+                queued: None,
+            }
+        }
+
+        fn ground(&self) -> (f64, f64) {
+            let (s, c) = self.psi.to_radians().sin_cos();
+            let (ws, wc) = self.wind_to_deg.to_radians().sin_cos();
+            (
+                self.tas_mps * s + self.wind_mps * ws,
+                self.tas_mps * c + self.wind_mps * wc,
+            )
+        }
+
+        /// The ground track, degrees true.
+        pub fn track(&self) -> f64 {
+            let (e, n) = self.ground();
+            e.atan2(n).to_degrees().rem_euclid(360.0)
+        }
+
+        pub fn gs_kts(&self) -> f64 {
+            let (e, n) = self.ground();
+            e.hypot(n) / 0.514_444
+        }
+
+        /// One loop tick of `dt` seconds with this tick's `bug` (true).
+        pub fn step(&mut self, bug: f64, dt: f64) {
+            let applied = self.queued.replace(bug).unwrap_or(bug);
+            let n = 20;
+            let h = dt / n as f64;
+            for _ in 0..n {
+                let err = ((applied - self.psi + 540.0).rem_euclid(360.0)) - 180.0;
+                let want = (2.0 * err).clamp(-25.0, 25.0);
+                self.phi += ((want - self.phi) / 1.0).clamp(-7.0, 7.0) * h;
+                let rate = (9.81 * self.phi.to_radians().tan() / self.tas_mps).to_degrees();
+                self.psi = (self.psi + rate * h).rem_euclid(360.0);
+                let (e, nn) = self.ground();
+                let (lat, lon) = project_latlon(
+                    self.lat,
+                    self.lon,
+                    e.atan2(nn).to_degrees().rem_euclid(360.0),
+                    e.hypot(nn) * h / M_PER_NM,
+                );
+                self.lat = lat;
+                self.lon = lon;
+            }
+        }
+    }
+
+    /// The autoland loop's lateral answer, composed as the loop composes it:
+    /// guidance on the runway's width, the crab filter, the track trim (its
+    /// turn cap given, so the replays can fly the old one), the short final
+    /// inside [`SHORT_FINAL_NM`]. The vertical is flown exactly on the path.
+    pub struct FinalLoop {
+        pub crab: CrabFilter,
+        pub trim: TrackTrim,
+        pub short_final: Option<ShortFinal>,
+        pub width_m: Option<f64>,
+        pub trim_cap_deg: f64,
+    }
+
+    impl FinalLoop {
+        pub fn new(width_m: Option<f64>, trim_cap_deg: f64) -> Self {
+            Self {
+                crab: CrabFilter::new(),
+                trim: TrackTrim::new(),
+                short_final: None,
+                width_m,
+                trim_cap_deg,
+            }
+        }
+
+        /// One tick: the bug (true) and the guidance behind it.
+        pub fn step(&mut self, jet: &Jet, rwy: &Runway, dt: f64) -> (f64, Guidance) {
+            let (psi, trk, gs) = (jet.psi, jet.track(), jet.gs_kts());
+            let crab = self.crab.update(CrabFilter::raw(Some(psi), Some(trk)), dt);
+            let dist = haversine_nm(jet.lat, jet.lon, rwy.thr_lat, rwy.thr_lon);
+            let alt = rwy.elev_ft + (dist + TOUCHDOWN_AIM_NM) * GLIDEPATH_FT_PER_NM;
+            let g = guidance_on(
+                jet.lat,
+                jet.lon,
+                alt,
+                alt - rwy.elev_ft,
+                gs,
+                145.0,
+                rwy,
+                145.0,
+                25.0,
+                0.0,
+                self.width_m,
+            );
+            let trim = self.trim.update_capped(
+                g.phase,
+                g.target_heading_deg,
+                Some(trk),
+                dt,
+                self.trim_cap_deg,
+            );
+            let off = |a: f64| ((a - rwy.course_deg + 540.0).rem_euclid(360.0)) - 180.0;
+            let in_short =
+                g.phase == ApproachPhase::Final && g.dist_nm <= SHORT_FINAL_NM && !g.arresting;
+            let bug = match g.phase {
+                ApproachPhase::Final if in_short => {
+                    let xtk_m = cross_track_nm(jet.lat, jet.lon, rwy) * M_PER_NM;
+                    let pursuit = g.target_heading_deg + crab + trim;
+                    let sf = self
+                        .short_final
+                        .get_or_insert_with(|| ShortFinal::new(off(pursuit), off(trk)));
+                    rwy.course_deg + sf.step(xtk_m, off(trk), gs, dt, Some(jet.phi))
+                }
+                ApproachPhase::Intercept => {
+                    self.short_final = None;
+                    g.target_heading_deg
+                }
+                _ => {
+                    self.short_final = None;
+                    g.target_heading_deg + crab + trim
+                }
+            };
+            (bug.rem_euclid(360.0), g)
+        }
+    }
+
+    /// What a flown final came to: the offset at the roundout gate (the last
+    /// tick above 80 ft on the path), the worst offset below 500 ft, the
+    /// worst bank on the short final, and the first balk (why, radio, xtk).
+    #[derive(Debug, Default)]
+    pub struct Flown {
+        pub gate_xtk_m: f64,
+        pub worst_low_xtk_m: f64,
+        pub worst_short_bank_deg: f64,
+        pub balk: Option<(&'static str, f64, f64)>,
+    }
+
+    /// Fly `jet` down the final with `lp` to the roundout gate (80 ft on the
+    /// path) or the first balk.
+    pub fn fly_final(jet: &mut Jet, lp: &mut FinalLoop, rwy: &Runway, dt: f64) -> Flown {
+        let mut out = Flown::default();
+        for _ in 0..3000 {
+            let (bug, g) = lp.step(jet, rwy, dt);
+            let xtk_m = cross_track_nm(jet.lat, jet.lon, rwy) * M_PER_NM;
+            let radio = g.glidepath_alt_ft - rwy.elev_ft;
+            if let Some(why) = g.balk {
+                out.balk = Some((why, radio, xtk_m));
+                return out;
+            }
+            if radio < 80.0 {
+                return out;
+            }
+            out.gate_xtk_m = xtk_m;
+            if radio < 500.0 {
+                out.worst_low_xtk_m = out.worst_low_xtk_m.max(xtk_m.abs());
+            }
+            if g.dist_nm <= SHORT_FINAL_NM {
+                out.worst_short_bank_deg = out.worst_short_bank_deg.max(jet.phi.abs());
+            }
+            jet.step(bug, dt);
+        }
+        out
+    }
+}
+
+/// Issue #147: LEMG 13 and 31, the 737's full-auto circuits of 2026-09-28,
+/// replayed against the real apt.dat geometry.
+#[cfg(test)]
+mod issue_147_tests {
+    use super::lemg_replay::*;
+    use super::*;
+
+    /// The logged cross-track is the aircraft's real offset, and the flip
+    /// across the threshold was the aircraft crossing the centreline, not a
+    /// reference changing: sortie 1790591256-full_auto's `state` positions
+    /// against apt.dat's 13/31 row, with the offsets computed independently
+    /// (east/north metres off the 13 threshold, projected on the line to 31)
+    /// and the `autoland` tick's `xtk_m` nearest in time.
+    #[test]
+    fn the_lemg_13_cross_track_is_the_true_offset_across_the_threshold() {
+        let rwy = lemg("13");
+        assert!((rwy.course_deg - 131.70).abs() < 0.02, "{}", rwy.course_deg);
+        // (lat, lon, true along-track m (approach side positive), true
+        // cross-track m (right positive), the logged xtk_m, radio ft)
+        let pts: [(f64, f64, f64, f64, f64, f64); 7] = [
+            (
+                36.70614964963893,
+                -4.541190214471253,
+                3499.0,
+                -98.4,
+                -91.9,
+                465.0,
+            ),
+            (
+                36.69694294373395,
+                -4.529138374167257,
+                2015.6,
+                -48.8,
+                -48.2,
+                413.0,
+            ),
+            (
+                36.68657643707785,
+                -4.514858502002209,
+                298.0,
+                -35.2,
+                -32.4,
+                90.0,
+            ),
+            (
+                36.68514500057357,
+                -4.513137373226305,
+                77.6,
+                -18.4,
+                -14.6,
+                44.0,
+            ),
+            (
+                36.68453229043331,
+                -4.5124318927144085,
+                -14.7,
+                -9.4,
+                -2.2,
+                34.0,
+            ),
+            (
+                36.683699213228394,
+                -4.511474633941739,
+                -140.1,
+                3.0,
+                7.8,
+                32.0,
+            ),
+            (
+                36.67955142537449,
+                -4.506237707168569,
+                -795.6,
+                36.7,
+                38.2,
+                0.0,
+            ),
+        ];
+        for (lat, lon, along, xtk, logged, radio) in pts {
+            let x = cross_track_nm(lat, lon, &rwy) * M_PER_NM;
+            let a = along_track_nm(lat, lon, &rwy) * M_PER_NM;
+            // A metre, plus the flat-earth sum's own 0.1 % over distance.
+            let tol = 1.0 + along.abs() * 1e-3;
+            assert!(
+                (x - xtk).abs() < tol,
+                "at {radio} ft: {x:.1} m against {xtk:.1} true"
+            );
+            assert!(
+                (a - along).abs() < 2.0,
+                "at {radio} ft: {a:.0} m along against {along:.0}"
+            );
+            // The loop's own number agrees with the position to within the
+            // tick it was sampled apart (7.7 m/s sideways over the threshold).
+            assert!(
+                (x - logged).abs() < 8.0,
+                "at {radio} ft: logged {logged:.1}, {x:.1} m"
+            );
+        }
+        // Left of the line 300 m short, across it at the threshold, right of
+        // it at the wheels: an S-turn, and 36.7 m on a 45 m strip is 14 m
+        // into the grass.
+        let wheels = cross_track_nm(pts[6].0, pts[6].1, &rwy) * M_PER_NM;
+        assert!(wheels > LEMG_WIDTH_M / 2.0 + 10.0, "{wheels:.1}");
+    }
+
+    /// The old short-final learner, as it flew (a 2 s low-pass of the track
+    /// against the last bug, clamped at 5 degrees, no gate).
+    struct OldShortFinal {
+        bias_deg: f64,
+        prev_bug_deg: f64,
+    }
+
+    impl OldShortFinal {
+        fn step(&mut self, xtk_m: f64, track_off_deg: f64, gs_kts: f64, dt: f64) -> f64 {
+            let e = track_off_deg - self.prev_bug_deg;
+            let a = (dt / SHORT_FINAL_BIAS_TAU_S).min(1.0);
+            self.bias_deg = (self.bias_deg + (e - self.bias_deg) * a).clamp(-5.0, 5.0);
+            let side = gs_kts * 0.514_444 * track_off_deg.to_radians().sin();
+            let bug = short_final_cut_deg(xtk_m, side, gs_kts) - self.bias_deg;
+            self.prev_bug_deg = bug;
+            bug
+        }
+    }
+
+    /// LEMG 13 (sortie 1790591256-full_auto): the short final began at
+    /// 0.29 nm, 31.8 m left, heading 129.4 and tracking 130.3, the pursuit's
+    /// bug 0.33 left of the runway. The old learner took the autopilot's lag
+    /// for a bias: the bug ran to 8 degrees right in two seconds and the 737
+    /// banked 16 at 90 ft (13.6 in the plant), and it was still turning onto
+    /// the line at the gate. Replayed against the fitted 737, 0.4 s ticks.
+    #[test]
+    fn the_short_final_learns_no_bias_from_its_own_turn() {
+        let rwy = lemg("13");
+        let off = |a: f64| ((a - rwy.course_deg + 540.0).rem_euclid(360.0)) - 180.0;
+        let fly = |old: bool| -> (f64, f64, f64) {
+            let (lat, lon) = at(&rwy, 0.29 * M_PER_NM, -31.8);
+            let mut jet = Jet::new(lat, lon, 129.4, 146.0);
+            jet.wind_mps = 2.5;
+            jet.phi = -0.4;
+            let entry_bug = -0.33;
+            let mut o = OldShortFinal {
+                bias_deg: (off(jet.track()) - entry_bug).clamp(-5.0, 5.0),
+                prev_bug_deg: entry_bug,
+            };
+            let mut n = ShortFinal::new(entry_bug, off(jet.track()));
+            let (mut worst_bug, mut worst_bank) = (0.0_f64, 0.0_f64);
+            let dt = 0.4;
+            // To the roundout gate: 80 ft is about 220 m short at 146 kt.
+            while along_track_nm(jet.lat, jet.lon, &rwy) * M_PER_NM > 220.0 {
+                let x = cross_track_nm(jet.lat, jet.lon, &rwy) * M_PER_NM;
+                let b = if old {
+                    o.step(x, off(jet.track()), jet.gs_kts(), dt)
+                } else {
+                    n.step(x, off(jet.track()), jet.gs_kts(), dt, Some(jet.phi))
+                };
+                worst_bug = worst_bug.max(b.abs());
+                worst_bank = worst_bank.max(jet.phi.abs());
+                jet.step(rwy.course_deg + b, dt);
+            }
+            (worst_bug, worst_bank, n.bias_deg)
+        };
+        let (old_bug, old_bank, _) = fly(true);
+        let (bug, bank, bias) = fly(false);
+        assert!(
+            old_bug > 7.5 && old_bank > 12.0,
+            "the replay winds up: bug {old_bug:.1}, bank {old_bank:.1}"
+        );
+        assert!(
+            bug <= SHORT_FINAL_MAX_CUT_DEG + SHORT_FINAL_MAX_BIAS_DEG + 1e-9,
+            "the bug stays inside cut plus bias: {bug:.1}"
+        );
+        assert!(bias.abs() <= SHORT_FINAL_MAX_BIAS_DEG, "{bias:.2}");
+        assert!(
+            bank < 10.0 && bank < old_bank - 3.0,
+            "bank {bank:.1} against {old_bank:.1}"
+        );
+    }
+
+    /// The same final's positions, judged by the gates on LEMG's 45 m
+    /// pavement: at the handoff (98 m off at 1.9 nm, 471 ft) the pursuit's
+    /// own time model leaves 20 m at the threshold, 5 m past the landing
+    /// limit, and the final is not stabilised below the floor; 49 m off at
+    /// 1.1 nm the same; 29 m off at 78 ft is off the centreline low. On a
+    /// runway of unknown width all three were FINAL, which is what flew.
+    #[test]
+    fn the_lemg_13_final_goes_around_below_the_floor_on_a_45_m_strip() {
+        let rwy = lemg("13");
+        assert!((landing_xtk_limit_m(Some(LEMG_WIDTH_M)) - 15.05).abs() < 0.01);
+        // (lat, lon, alt ft MSL, radio ft, gs kt, the balk wanted)
+        let pts = [
+            (
+                36.70614964963893,
+                -4.541190214471253,
+                533.4,
+                471.6,
+                148.6,
+                "unstabilised_below_floor",
+            ),
+            (
+                36.69694294373395,
+                -4.529138374167257,
+                479.5,
+                432.0,
+                150.1,
+                "unstabilised_below_floor",
+            ),
+            (
+                36.68578005055136,
+                -4.513846406166833,
+                136.2,
+                77.6,
+                146.5,
+                "off_centreline_low",
+            ),
+        ];
+        for (lat, lon, alt, radio, gs, want) in pts {
+            let g = guidance_on(
+                lat,
+                lon,
+                alt,
+                radio,
+                gs,
+                gs,
+                &rwy,
+                145.0,
+                25.0,
+                0.0,
+                Some(LEMG_WIDTH_M),
+            );
+            assert_eq!(g.balk, Some(want), "at {radio} ft");
+            assert_eq!(g.phase, ApproachPhase::Intercept, "at {radio} ft");
+            let old = guidance(lat, lon, alt, radio, gs, gs, &rwy, 145.0, 25.0, 0.0);
+            assert_eq!(
+                (old.phase, old.balk),
+                (ApproachPhase::Final, None),
+                "what flew, at {radio} ft"
+            );
+        }
+        // On the line it is a final: 5 m off at 1.1 nm and at 78 ft.
+        for (along, radio) in [(2015.6, 432.0), (171.7, 77.6)] {
+            let (lat, lon) = at(&rwy, along, -5.0);
+            let alt = rwy.elev_ft + radio;
+            let g = guidance_on(
+                lat,
+                lon,
+                alt,
+                radio,
+                148.0,
+                148.0,
+                &rwy,
+                145.0,
+                25.0,
+                0.0,
+                Some(LEMG_WIDTH_M),
+            );
+            assert_eq!(
+                (g.phase, g.balk),
+                (ApproachPhase::Final, None),
+                "5 m off at {radio} ft"
+            );
+        }
+    }
+
+    /// LEMG 31 (sortie 1790584715-full_auto): handed over 103 m right at
+    /// 1.8 nm, still rolling out of the circuit's intercept (heading 299 for
+    /// a 311.7 runway, 15 degrees of bank). The trim learnt the roll-out as a
+    /// bias (+0.78 recorded) and the final sat 30 to 32 m right from 1.4 nm
+    /// to 0.3 with the autopilot on its bug. Replayed: the old 10 degree cap
+    /// parks it there; the 3 degree cap learns a fraction and closes.
+    #[test]
+    fn the_track_trim_learns_no_bias_from_the_handoffs_roll_out() {
+        let rwy = lemg("31");
+        let fly = |cap: f64| -> (f64, f64) {
+            let (lat, lon) = at(&rwy, 3392.9, 103.1);
+            let mut jet = Jet::new(lat, lon, 299.4, 149.0);
+            jet.wind_mps = 3.0;
+            jet.phi = 14.8;
+            let mut lp = FinalLoop::new(None, cap);
+            let mut at_half = f64::NAN;
+            let mut worst_trim = 0.0_f64;
+            for _ in 0..1000 {
+                let (bug, g) = lp.step(&jet, &rwy, 0.35);
+                if g.dist_nm < 0.5 {
+                    at_half = cross_track_nm(jet.lat, jet.lon, &rwy) * M_PER_NM;
+                    break;
+                }
+                worst_trim = worst_trim.max(lp.trim.value().abs());
+                jet.step(bug, 0.35);
+            }
+            (at_half, worst_trim)
+        };
+        let (old_x, old_trim) = fly(10.0);
+        let (x, trim) = fly(TRACK_TRIM_ERR_CAP_DEG);
+        assert!(
+            (25.0..40.0).contains(&old_x),
+            "the replay parks as it flew: {old_x:.1} m at 0.5 nm"
+        );
+        assert!(old_trim > 0.9, "and learns the roll-out: {old_trim:.2}");
+        assert!(
+            x.abs() < landing_xtk_limit_m(Some(LEMG_WIDTH_M)),
+            "{x:.1} m at 0.5 nm"
+        );
+        assert!(trim < 0.5, "{trim:.2}");
+    }
+
+    /// The limits follow the pavement, and a runway of unknown width keeps
+    /// the old 37 m.
+    #[test]
+    fn the_landing_limits_follow_the_pavement() {
+        let legacy = FLARE_MAX_XTK_NM * M_PER_NM;
+        assert_eq!(landing_xtk_limit_m(None), legacy);
+        assert_eq!(flare_xtk_limit_m(None), legacy);
+        assert!((landing_xtk_limit_m(Some(45.11)) - 15.05).abs() < 0.01);
+        assert!((flare_xtk_limit_m(Some(45.11)) - 18.55).abs() < 0.01);
+        assert!((landing_xtk_limit_m(Some(60.0)) - 22.5).abs() < 1e-9);
+        // A narrow strip keeps a quarter of its width; a wide one the old cap.
+        assert!((landing_xtk_limit_m(Some(18.0)) - 4.5).abs() < 1e-9);
+        assert_eq!(landing_xtk_limit_m(Some(150.0)), legacy);
+        assert_eq!(landing_xtk_limit_m(Some(f64::NAN)), legacy);
+        assert!(flare_xtk_limit_m(Some(18.0)) >= landing_xtk_limit_m(Some(18.0)));
+    }
+
+    /// The width is read with the runway: `nearby_runways` notes it, and the
+    /// arm's runway finds it.
+    #[test]
+    fn the_runway_read_from_apt_dat_carries_its_width() {
+        let dir = std::env::temp_dir().join(format!("xvl-147-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let apt = dir.join("apt.dat");
+        std::fs::write(
+            &apt,
+            format!("I\n1200 test\n\n1     48 0 0 LEMG Malaga\n{LEMG_13_31}\n99\n"),
+        )
+        .unwrap();
+        let rwy = lemg("13");
+        let found = runway_by_id(
+            apt.to_str().unwrap(),
+            rwy.thr_lat,
+            rwy.thr_lon,
+            "13",
+            5.0,
+            Some("LEMG"),
+        )
+        .unwrap()
+        .expect("LEMG 13");
+        assert_eq!(runway_width_m(&found), Some(LEMG_WIDTH_M));
+        assert_eq!(runway_width_m(&lemg("31")), Some(LEMG_WIDTH_M));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
