@@ -3650,8 +3650,13 @@ mod tests {
             ),
             (
                 "autotakeoff",
-                "REJECT_HANDOVER_KTS",
-                "STANDSTILL-ISH: a rejected roll slow enough to hand over",
+                "REJECT_STOPPED_KTS",
+                "STANDSTILL: a rejected roll has stopped, the parking brake goes on",
+            ),
+            (
+                "autotakeoff",
+                "REJECT_STEER_MIN_KTS",
+                "STANDSTILL-ISH: a walk, the stop lets go of the steering",
             ),
             (
                 "speedhold",

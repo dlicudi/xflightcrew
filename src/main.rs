@@ -1259,6 +1259,19 @@ async fn run_session(
             // the caller (full auto) reads the resulting silence as the TOWER
             // not answering, which sent it hunting a clearance that was never
             // asked for (Heathrow 2026-07-27).
+            // A readback that cannot go out is OUT for the crew waiting on it
+            // (`circuit::readback_out`): it is gone either way.
+            let delivered =
+                mode::atc_enabled() && voice.radio_powered() && atc_station.is_some();
+            if !delivered {
+                for q in &calls {
+                    if let circuit::CrewCall::Text(t) = &q.call {
+                        if q.readback != circuit::Readback::No {
+                            circuit::note_readback_out(t);
+                        }
+                    }
+                }
+            }
             if !calls.is_empty() && mode::atc_enabled() && !voice.radio_powered() {
                 tracing::warn!(
                     calls = calls.len(),
@@ -1299,14 +1312,38 @@ async fn run_session(
                                 continue;
                             }
                         }
+                        // A copy of the tower's suggested readback goes out only
+                        // while the tower still waits for those words: a copy
+                        // queued twice went out in the takeoff roll (LEMG 13,
+                        // 2026-09-28, #172).
+                        if let (circuit::Readback::OwedCopy, circuit::CrewCall::Text(t)) =
+                            (queued.readback, &queued.call)
+                        {
+                            let owed = crate::party_line::readback_owed();
+                            if circuit::owed_copy_stale(t, owed.as_deref()) {
+                                circuit::note_readback_out(t);
+                                blackbox::record(
+                                    "crew_radio",
+                                    serde_json::json!({
+                                        "event": "crew_radio_stale",
+                                        "call": t,
+                                        "why": "not_owed",
+                                        "age_s": (age_s * 10.0).round() / 10.0,
+                                    }),
+                                );
+                                continue;
+                            }
+                        }
                         blackbox::record(
                             "crew_radio",
                             serde_json::json!({
                                 "event": "crew_radio_sent",
                                 "call": circuit::call_words(&queued.call),
                                 "age_s": (age_s * 10.0).round() / 10.0,
+                                "readback": queued.readback != circuit::Readback::No,
                             }),
                         );
+                        let queued_readback = queued.readback != circuit::Readback::No;
                         let call = queued.call;
                         // A check-in is rendered NOW, with the frequency quiet
                         // (bounded), so the altitude it names is the one being
@@ -1348,6 +1385,9 @@ async fn run_session(
                         let routed = st
                             .handle_transmission(&call.to_ascii_lowercase(), xplane.view())
                             .await;
+                        if queued_readback {
+                            circuit::note_readback_out(&call);
+                        }
                         say_or(
                             &voice,
                             &reporter,

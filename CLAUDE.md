@@ -392,10 +392,12 @@ everything blackboxes to `logs/blackbox.jsonl` (kinds: `atc`, `autotaxi`, `autot
 ### Holding, writers, reads
 - **A stage not moving the aircraft is holding it**: brakes for every wait, abort and give-up. **A
   mission that ENDS on the ground stops and parks** (`full_auto::hand_back_hold`, governor or not, a
-  pilot's "my controls" included): wheel brakes to a stop below `HAND_BACK_BRAKE_MAX_KTS`, then
-  `set_park_brake_confirmed` once the held brake command's ride on the ratio has decayed
-  (`HAND_BACK_BRAKE_TAIL_S`; LEMG SR22, #35), read back and said; airborne, fast, a tug on the bar or an unread speed
-  is `hand_back_skipped`. A give-up the abort flag ended is the pilot's cancel (`give_up_words`) (LFPB
+  pilot's "my controls" included): wheel brakes to a stop, from ANY speed (`brakes_max` above
+  `HAND_BACK_BRAKE_MAX_KTS`: a fast skip left a rejected 737 rolling at 70 kt with nobody braking,
+  LEMG 13 #112), then `set_park_brake_confirmed` once the held brake command's ride on the ratio
+  has decayed (`HAND_BACK_BRAKE_TAIL_S`; LEMG SR22, #35), read back and said; airborne, a pilot on
+  the toe brakes at speed (`pilot_braking`), a tug on the bar or an unread speed is
+  `hand_back_skipped`. A give-up the abort flag ended is the pilot's cancel (`give_up_words`) (LFPB
   2026-09-22; LEMG 2026-09-28: 5.8 kt and rising after "your aircraft").
 - **One writer per dataref.** Plugin channels (`taxi_steer`, `taxi_brake`, `taxi_brake_l/_r`,
   `pitch`) are 1 s expiring heartbeats written EVERY tick (a change-gate drops them mid-turn);
@@ -478,6 +480,13 @@ everything blackboxes to `logs/blackbox.jsonl` (kinds: `atc`, `autotaxi`, `autot
   until the loops weave. The rollout blackboxes `rollout` per tick with the REAL tick time. So a
   steady drift is held off only by a standing offset: the scheduled roll feeds its own drift
   forward (`DriftFilter`, the final's crab pattern; EGBB 2026-09-27).
+- **A reject from any speed is FLOWN to a full stop, then parked, then handed back**
+  (`autotakeoff::reject_rolling`, every ground reject, the pilot's "reject the takeoff" included):
+  `reject_hands` (idle, an ENGAGED autothrottle out and read back, `brakes_max`),
+  `stop_on_centreline` to `REJECT_STOPPED_KTS` (idle every tick, maximum braking renewed, the roll
+  law steering), `hand_back_hold` for the parking brake, and only then `reject_end_line`; the
+  caller ends `takeoff_not_completed` (`circuit::stood_down`). LEMG 13 2026-09-28 (#112): "your
+  aircraft" at 63 kt, the spool-down to 73, two minutes unbraked.
 - **A takeoff starts with the autopilot OFF and an engage reads the SERVOS**
   (`autotakeoff::clear_inherited_autopilot`, `ap_inherited`; `engage_climb` needs `servos_on` with HDG
   and VS): modes left lit by the last flight were taken for an engage and nothing flew the SF50 from
@@ -602,6 +611,11 @@ everything blackboxes to `logs/blackbox.jsonl` (kinds: `atc`, `autotaxi`, `autot
 - **The crew works the radio as it flies**: a conditional line-up waits on
   `party_line::line_up_condition_clear()`; a held departure reads the hold back before any other
   call (`OwedReadback`, `readback_hold`) and asks again after 150 s held (`reask_held`, #172);
+  **a readback goes out once**: recorded queued and out (`circuit::transmit_readback`,
+  `last_readback`, `note_readback_out`), never queued again before it is out, a copy of the
+  tower's words dropped once not owed (`owed_copy_stale`, `crew_radio_stale` `not_owed`); **heard,
+  read back, then rolled** (`readback_before_moving`, `readback_out`; LEMG 13 rolled 18 s before
+  its readback, #172);
   `take_departure_handoff()` (readback, retune, check-in) from the takeoff's climb on
   (`wait_takeoff_working_the_radio`; read back 37 s late after the takeoff's handoff, #176);
   an IFR readback is judged from when it goes OUT (`ReadbackWait`, `circuit::crew_radio_pending`);

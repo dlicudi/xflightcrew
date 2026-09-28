@@ -444,10 +444,18 @@ async fn light(tools: &SubTools, ctx: &ToolCtx<'_>, key: &str, on: bool) -> bool
         .is_ok()
 }
 
-/// The fastest a give-up brakes the aircraft to a stop and sets the PARKING
-/// brake: taxi speeds. Above it (a rollout, a takeoff roll) the loop that
-/// owns the speed does the stopping, and a park brake is a chock anyway.
+/// Above this a hand-back stops the aircraft on MAXIMUM braking (a rollout, a
+/// takeoff roll), below it on the regular effort (taxi speeds). It used to be
+/// the fastest a hand-back braked at all, "the loop that owns the speed does
+/// the stopping": at LEMG 13 (2026-09-28, sortie 1790627884-full_auto) no
+/// loop owned it after the pilot's reject, and the 737 rolled 70 to 52 kt for
+/// two minutes with nobody braking.
 const HAND_BACK_BRAKE_MAX_KTS: f64 = 25.0;
+/// A pilot's own toe brake past this (either pedal) owns a fast stop: the
+/// held brake commands ride the parking-brake ratio, never the toe ratios.
+const PILOT_TOE_BRAKE: f64 = 0.3;
+const TOE_BRAKE_L: &str = "sim/cockpit2/controls/left_brake_ratio";
+const TOE_BRAKE_R: &str = "sim/cockpit2/controls/right_brake_ratio";
 
 /// A mission's sortie in the blackbox: begun at the mission's start, ended
 /// by `give_up` ("gave_up") or, on any other exit, when this drops ("ended").
@@ -490,6 +498,12 @@ async fn give_up(
     let held = hand_back_brakes(xp, valve_set).await;
     clear_stage();
     announce(voice, Priority::Caution, &hand_back_line(line, held));
+}
+
+/// The circuit mission ended because its takeoff never completed (and not
+/// by the pilot's cancel, which is its own give-up). Pure.
+fn circuit_takeoff_failed(stood_down: Option<&str>, aborted: bool) -> bool {
+    !aborted && stood_down == Some(crate::circuit::TAKEOFF_NOT_COMPLETED)
 }
 
 /// The give-up's line and reason, relabelled as the pilot's cancel when the
@@ -543,15 +557,31 @@ const HAND_BACK_BRAKE_TAIL_S: f64 = crate::tools::BRAKE_HOLD_SECS + 1.0;
 /// "my controls" stopped the governor, the give-up came 0.6 s later with
 /// nothing of ours holding the 737, and it was left rolling at 4.9 kt, then
 /// 5.8 kt and rising, `parking_brake_ratio` 0.0, with "your aircraft" said
-/// over it. Now any end of the mission on the ground below
-/// [`HAND_BACK_BRAKE_MAX_KTS`] brakes to a stop on the wheel brakes (the
-/// pilot's own held brake key, which expires by itself) and then sets the
-/// parking brake, read back. Airborne, faster, a tug on the bar, or a speed
-/// we could not read: nothing, and the reason is blackboxed.
+/// over it. Now any end of the mission on the ground brakes to a stop on the
+/// wheel brakes (the pilot's own held brake key, which expires by itself;
+/// maximum effort above [`HAND_BACK_BRAKE_MAX_KTS`]) and then sets the
+/// parking brake, read back. Airborne, a pilot already on the toe brakes at
+/// speed, a tug on the bar, or a speed we could not read: nothing, and the
+/// reason is blackboxed.
 async fn hand_back_brakes(xp: &XPlaneClient, valve_set: Option<f64>) -> Option<bool> {
     // Unscoped: the give-up has already cancelled this mission's client.
     let free = xp.unscoped();
     hand_back_hold(&free, valve_set).await
+}
+
+/// A pilot is standing on the toe brakes: either read past
+/// [`PILOT_TOE_BRAKE`]. An unread pedal is no foot. Pure.
+fn pilot_on_the_brakes(left: Option<f64>, right: Option<f64>) -> bool {
+    [left, right]
+        .iter()
+        .any(|v| v.is_some_and(|x| x.is_finite() && x > PILOT_TOE_BRAKE))
+}
+
+/// How long the hand-back brakes toward a stop from `from_kts`: the taxi
+/// budget, or longer from a rollout's speed (maximum braking stops a 737
+/// from 90 kt in about 8 s; the rest is margin). Pure.
+fn hand_back_stop_s(from_kts: f64) -> f64 {
+    HAND_BACK_STOP_S.max(from_kts * 0.6)
 }
 
 /// [`hand_back_brakes`] against any sim, so the gates and the stop are a
@@ -584,8 +614,13 @@ pub(crate) async fn hand_back_hold(
     else {
         return skipped("no_groundspeed", None);
     };
+    // Fast is no longer a reason to let go: nobody else is stopping it. A
+    // pilot already standing on the toe brakes is; only then is it theirs.
     if from_kts >= HAND_BACK_BRAKE_MAX_KTS {
-        return skipped("too_fast", Some(from_kts));
+        let (l, r) = tokio::join!(xp.get_float(TOE_BRAKE_L), xp.get_float(TOE_BRAKE_R));
+        if pilot_on_the_brakes(l.ok(), r.ok()) {
+            return skipped("pilot_braking", Some(from_kts));
+        }
     }
     // A tug on the bar owns the aircraft: brakes against it are a fight.
     if tug.is_ok_and(|t| t > 0.5) {
@@ -598,9 +633,17 @@ pub(crate) async fn hand_back_hold(
     // A brake command another loop issued just before us (the governor's
     // stop channel) rides the same ratio: counted as a pulse at the start.
     let mut last_pulse = (!crate::tools::brake_cmd_quiet()).then_some(t0);
-    while kts >= HAND_BACK_STOPPED_KTS && t0.elapsed().as_secs_f64() < HAND_BACK_STOP_S {
+    let stop_s = hand_back_stop_s(from_kts);
+    while kts >= HAND_BACK_STOPPED_KTS && t0.elapsed().as_secs_f64() < stop_s {
+        // Maximum effort from a rollout's speed, the regular one at a taxi's.
+        let effort = if kts >= HAND_BACK_BRAKE_MAX_KTS {
+            crate::autotakeoff::BRAKES_MAX
+        } else {
+            crate::tools::BRAKES_REGULAR
+        };
+        crate::tools::note_brake_cmd();
         if xp
-            .run_command_for(crate::tools::BRAKES_REGULAR, crate::tools::BRAKE_HOLD_SECS)
+            .run_command_for(effort, crate::tools::BRAKE_HOLD_SECS)
             .await
             .is_ok()
         {
@@ -954,7 +997,7 @@ pub(crate) async fn get_zone_clearance(
     // nothing, and answers a correct one with silence). Never done
     // before 2026-09-15: the squawk was set and the taxi asked for.
     if let Some(rb) = crate::party_line::readback_owed() {
-        crate::circuit::transmit(rb.trim_end_matches('.').to_string());
+        crate::circuit::transmit_readback(rb.trim_end_matches('.').to_string(), true);
         event("clearance_readback", json!({}));
     }
 }
@@ -1049,7 +1092,7 @@ async fn zone_clearance_from_the_strip(
     );
     ensure_squawk(xp, ctx, voice).await;
     if let Some(rb) = crate::party_line::readback_owed() {
-        crate::circuit::transmit(rb.trim_end_matches('.').to_string());
+        crate::circuit::transmit_readback(rb.trim_end_matches('.').to_string(), true);
         event("clearance_readback", json!({}));
     }
 }
@@ -3145,6 +3188,20 @@ async fn fly(xp: XPlaneClient, config: Config, voice: Option<Voice>, tools: SubT
             // a mile is what "our job is done" used to mean here.
             taxi_in_after_landing(&xp, &config, &voice, &tools, true).await;
             drop_departure_handoff("circuit_ended");
+            // A circuit whose takeoff never completed ends the MISSION as the
+            // takeoff's give-up, the runner's `expect_give_up` included, not
+            // a silent "ended" (LEMG 13, 2026-09-28: `no_autoland`).
+            if circuit_takeoff_failed(crate::circuit::stood_down(), ABORT.load(SeqCst)) {
+                give_up(
+                    &xp,
+                    tools.taxi.park_brake_valve_set,
+                    &voice,
+                    "Full auto is off. Your aircraft.",
+                    crate::circuit::TAKEOFF_NOT_COMPLETED,
+                )
+                .await;
+                return;
+            }
             stop_active();
         }
         Mission::Flight(route) | Mission::Resume(route) => {
@@ -3273,13 +3330,21 @@ async fn fly_route(
             }
             return;
         }
-        if crate::autotakeoff::outcome() != Some(sim::run::Outcome::Completed) {
+        let outcome = crate::autotakeoff::outcome();
+        if outcome != Some(sim::run::Outcome::Completed) {
+            // A reject has stopped, parked and said "your aircraft" itself.
+            let line = match outcome {
+                Some(sim::run::Outcome::Failed(_)) => {
+                    "The takeoff was rejected, so the flight is off."
+                }
+                _ => "The takeoff handed control back. Your aircraft.",
+            };
             give_up(
                 xp,
                 tools.taxi.park_brake_valve_set,
                 voice,
-                "The takeoff handed control back. Your aircraft.",
-                "takeoff_not_completed",
+                line,
+                crate::circuit::TAKEOFF_NOT_COMPLETED,
             )
             .await;
             return;
@@ -5548,7 +5613,7 @@ async fn backtrack_from_runway_start(
             // Held for traffic: "hold position" is read back like any
             // instruction, then asked again once it has had its minute.
             if let Some(rb) = crate::party_line::readback_owed() {
-                crate::circuit::transmit(rb.trim_end_matches('.').to_string());
+                crate::circuit::transmit_readback(rb.trim_end_matches('.').to_string(), true);
             }
         }
         if ABORT.load(SeqCst) {
@@ -5563,7 +5628,7 @@ async fn backtrack_from_runway_start(
             ));
         }
         if let Some(rb) = crate::party_line::readback_owed() {
-            crate::circuit::transmit(rb.trim_end_matches('.').to_string());
+            crate::circuit::transmit_readback(rb.trim_end_matches('.').to_string(), true);
             event("backtrack_readback", json!({}));
         }
     }
@@ -5607,28 +5672,34 @@ async fn backtrack_from_runway_start(
     }
 }
 
-/// When the crew reads back an instruction the tower is waiting on: once
-/// per distinct text, again only if it is still owed after
-/// [`OwedReadback::AGAIN`] (a readback dropped stale on the radio). Pure.
-#[derive(Default)]
-struct OwedReadback {
-    sent: Option<(String, Instant)>,
-}
+/// When the crew reads back an instruction the tower is waiting on, judged
+/// against the crew radio's own record of its last readback
+/// (`circuit::last_readback`), whoever queued it: never while the same words
+/// are queued and not yet out, and again only if the tower still waits
+/// [`OwedReadback::AGAIN`] after they WENT OUT (a readback dropped stale on
+/// the radio). LEMG 13 (2026-09-28, sortie 1790627884-full_auto): the
+/// clearance's readback queued at +13.7 was still queued at +34.0, this
+/// queued it again, and the copy went out in the takeoff roll. Pure.
+struct OwedReadback;
 
 impl OwedReadback {
     const AGAIN: Duration = Duration::from_secs(30);
 
     /// The readback to transmit now, if any.
-    fn due(&mut self, owed: Option<&str>, now: Instant) -> Option<String> {
+    fn due(
+        owed: Option<&str>,
+        last: Option<&crate::circuit::ReadbackRec>,
+        now: Instant,
+    ) -> Option<String> {
         let owed = owed?;
-        let again = match &self.sent {
-            Some((text, at)) => text != owed || now.duration_since(*at) >= Self::AGAIN,
+        let words = crate::circuit::readback_words(owed);
+        let again = match last.filter(|r| r.words == words) {
             None => true,
+            Some(r) => r
+                .out_at
+                .is_some_and(|out| now.saturating_duration_since(out) >= Self::AGAIN),
         };
-        again.then(|| {
-            self.sent = Some((owed.to_string(), now));
-            owed.to_string()
-        })
+        again.then(|| owed.to_string())
     }
 }
 
@@ -5667,7 +5738,6 @@ async fn ensure_takeoff_cleared(
     let deadline = Instant::now() + Duration::from_secs_f64(OVERALL_SECS);
     let mut last_call = Instant::now(); // request_departure just called
     let mut announced_hold = false;
-    let mut readback = OwedReadback::default();
     loop {
         if ABORT.load(SeqCst) {
             return false;
@@ -5685,8 +5755,9 @@ async fn ensure_takeoff_cleared(
         // read back before anything else is said: the ready call repeated
         // over it earned "read back" three times (LEMG 13, #172).
         let owed = crate::party_line::readback_owed();
-        if let Some(rb) = readback.due(owed.as_deref(), Instant::now()) {
-            crate::circuit::transmit(rb.trim_end_matches('.').to_string());
+        let last = crate::circuit::last_readback();
+        if let Some(rb) = OwedReadback::due(owed.as_deref(), last.as_ref(), Instant::now()) {
+            crate::circuit::transmit_readback(rb.trim_end_matches('.').to_string(), true);
             event("readback_hold", json!({ "call": rb }));
             last_call = Instant::now();
         } else if owed.is_some() {
@@ -5737,23 +5808,76 @@ async fn ensure_takeoff_cleared(
     // departure sequence; the line-up's is owed at the moment it's issued.
     let lined_up_only = matches!(crate::party_line::clearance_state(), Some(LinedUp));
     if let Some(rwy) = crate::party_line::clearance_runway() {
-        if lined_up_only {
-            crate::circuit::transmit(crate::circuit::radio_call(
-                callsign,
-                &format!("lining up runway {}", crate::circuit::spell_runway(&rwy)),
-            ));
+        let spelled = crate::circuit::spell_runway(&rwy);
+        let sent = if lined_up_only {
+            let call =
+                crate::circuit::radio_call(callsign, &format!("lining up runway {spelled}"));
+            crate::circuit::transmit_readback(call.clone(), false);
             event("readback_line_up", json!({ "runway": rwy }));
+            Some(call)
         } else if !*read_back {
             *read_back = true;
-            crate::circuit::transmit(crate::circuit::radio_call(
+            let call = crate::circuit::radio_call(
                 callsign,
-                &format!(
-                    "cleared for takeoff runway {}",
-                    crate::circuit::spell_runway(&rwy)
-                ),
-            ));
+                &format!("cleared for takeoff runway {spelled}"),
+            );
+            crate::circuit::transmit_readback(call.clone(), false);
             event("readback_takeoff", json!({ "runway": rwy }));
+            Some(call)
+        } else {
+            None
+        };
+        // Heard, read back, THEN moved: the roll began at +52.8 on the
+        // tower's state, before its "cleared for takeoff" was spoken at
+        // +53.5, and the readback went out at +71.2 in the roll (LEMG 13,
+        // 2026-09-28, sortie 1790627884-full_auto). The readback rides the
+        // crew radio behind the clearance it answers, so once it is out the
+        // clearance has been heard.
+        if let Some(call) = sent {
+            let t0 = Instant::now();
+            let out = readback_before_moving(
+                READBACK_OUT_S,
+                READBACK_POLL_MS,
+                || crate::circuit::readback_out(&call),
+                || voice.as_ref().is_some_and(|v| v.radio_on_air()),
+            )
+            .await;
+            event(
+                "readback_out",
+                json!({ "out": out, "waited_ms": t0.elapsed().as_millis() as u64 }),
+            );
         }
+    }
+    true
+}
+
+/// The longest the crew waits for its takeoff or line-up readback to go out
+/// before it moves anyway: a busy frequency never strands it on the runway.
+const READBACK_OUT_S: f64 = 45.0;
+/// ...and then for its words to finish on the air.
+const READBACK_ON_AIR_S: f64 = 10.0;
+const READBACK_POLL_MS: u64 = 250;
+
+/// Wait, bounded, until the readback has gone OUT (`out`) and the frequency
+/// is quiet again (`on_air` false). True when it went out in time. The
+/// pilot's cancel ends the wait.
+async fn readback_before_moving(
+    secs: f64,
+    poll_ms: u64,
+    out: impl Fn() -> bool,
+    on_air: impl Fn() -> bool,
+) -> bool {
+    let poll = Duration::from_millis(poll_ms);
+    let t0 = tokio::time::Instant::now();
+    while !out() {
+        if ABORT.load(SeqCst) || t0.elapsed().as_secs_f64() >= secs {
+            return false;
+        }
+        tokio::time::sleep(poll).await;
+    }
+    let t1 = tokio::time::Instant::now();
+    while on_air() && t1.elapsed().as_secs_f64() < READBACK_ON_AIR_S && !ABORT.load(SeqCst) {
+        tokio::time::sleep(poll).await;
     }
     true
 }
@@ -6838,26 +6962,35 @@ mod tests {
     /// position, traffic on the runway", the crew repeated "ready for
     /// departure" at +76 and +116 and was told "read back" each time. An
     /// owed readback goes out first, once per instruction, and again only
-    /// if the tower still waits for it 30 s on.
+    /// if the tower still waits for it 30 s after it went OUT.
     #[test]
     fn a_held_crew_reads_back_the_hold_before_asking_again() {
         use super::OwedReadback;
+        use crate::circuit::{readback_words, ReadbackRec};
         use crate::tower::{parse_intent, Intent};
         use std::time::{Duration, Instant};
         let hold = "Holding position, November eight one six November November.";
         let t0 = Instant::now();
-        let mut rb = OwedReadback::default();
-        assert_eq!(rb.due(None, t0), None, "nothing owed, nothing said");
-        assert_eq!(rb.due(Some(hold), t0).as_deref(), Some(hold));
-        assert_eq!(rb.due(Some(hold), t0 + Duration::from_secs(5)), None, "said once");
+        let rec = |words: &str, out: Option<u64>| ReadbackRec {
+            words: readback_words(words),
+            queued_at: t0,
+            out_at: out.map(|s| t0 + Duration::from_secs(s)),
+        };
+        assert_eq!(OwedReadback::due(None, None, t0), None, "nothing owed, nothing said");
+        assert_eq!(OwedReadback::due(Some(hold), None, t0).as_deref(), Some(hold));
+        let queued = rec(hold, None);
+        let at = |s| t0 + Duration::from_secs(s);
+        assert_eq!(OwedReadback::due(Some(hold), Some(&queued), at(5)), None, "queued once");
+        let out = rec(hold, Some(2));
+        assert_eq!(OwedReadback::due(Some(hold), Some(&out), at(5)), None, "said once");
         assert_eq!(
-            rb.due(Some(hold), t0 + Duration::from_secs(31)).as_deref(),
+            OwedReadback::due(Some(hold), Some(&out), at(33)).as_deref(),
             Some(hold),
-            "still owed: said again"
+            "still owed 30 s after it went out: said again"
         );
         let other = "Lining up runway one three, November eight one six November November.";
         assert_eq!(
-            rb.due(Some(other), t0 + Duration::from_secs(32)).as_deref(),
+            OwedReadback::due(Some(other), Some(&out), at(34)).as_deref(),
             Some(other),
             "a new instruction is read back at once"
         );
@@ -7136,7 +7269,7 @@ mod tests {
             self.sim.run_command(name).await
         }
         async fn run_command_for(&self, name: &str, secs: f64) -> anyhow::Result<()> {
-            if name == crate::tools::BRAKES_REGULAR {
+            if name == crate::tools::BRAKES_REGULAR || name == crate::autotakeoff::BRAKES_MAX {
                 self.braking.store(true, std::sync::atomic::Ordering::SeqCst);
             }
             self.sim.run_command_for(name, secs).await
@@ -7181,6 +7314,63 @@ mod tests {
         );
     }
 
+    /// LEMG 13 (2026-09-28, sortie 1790627884-full_auto): the pilot's reject
+    /// handed back at 70 kt, the hand-back skipped anything over 25 kt ("the
+    /// loop that owns the speed does the stopping"), no loop owned it, and
+    /// the 737 rolled 70 to 52 kt for two minutes with nobody braking. A
+    /// fast hand-back on the ground brakes to a stop, at maximum effort
+    /// while fast, then parks.
+    #[tokio::test(start_paused = true)]
+    async fn a_fast_hand_back_on_the_ground_is_braked_to_a_stop() {
+        let jet = TaxiingJet::rolling_at_kts(70.0);
+        let held = super::hand_back_hold(&jet, Some(1.0)).await;
+        assert_eq!(held, Some(true), "the parking brake reads set");
+        assert!(jet.sim.ran(crate::autotakeoff::BRAKES_MAX), "maximum effort while fast");
+        assert!(jet.sim.ran(crate::tools::BRAKES_REGULAR), "the regular effort once slow");
+        let at_park = jet.gs_at_park.lock().unwrap().expect("park brake set");
+        assert!(
+            at_park * super::MS_TO_KTS < super::HAND_BACK_STOPPED_KTS,
+            "the parking brake went on at {:.1} kt",
+            at_park * super::MS_TO_KTS
+        );
+        assert!(!super::pilot_on_the_brakes(Some(0.1), None), "a resting foot");
+        assert!(super::pilot_on_the_brakes(None, Some(0.9)), "one pedal is a stop");
+    }
+
+    /// The circuit mission ends as the takeoff's give-up when its takeoff
+    /// never completed (the runner's `expect_give_up`), never as "ended";
+    /// the pilot's cancel stays the cancel.
+    #[test]
+    fn a_circuit_whose_takeoff_was_rejected_gives_up() {
+        use super::circuit_takeoff_failed;
+        let rejected = Some(crate::circuit::TAKEOFF_NOT_COMPLETED);
+        assert!(circuit_takeoff_failed(rejected, false));
+        assert!(!circuit_takeoff_failed(rejected, true), "the pilot's cancel");
+        assert!(!circuit_takeoff_failed(None, false), "flew and landed");
+        assert!(!circuit_takeoff_failed(Some("abort_takeoff_phase"), false));
+    }
+
+    /// LEMG 13 (2026-09-28, sortie 1790627884-full_auto): the roll began at
+    /// +52.8, the tower's "cleared for takeoff" was spoken at +53.5 and the
+    /// readback went out at +71.2 in the roll. The crew waits for its
+    /// readback to go out and the frequency to go quiet, bounded.
+    #[tokio::test(start_paused = true)]
+    async fn the_roll_waits_for_the_takeoff_readback() {
+        use super::readback_before_moving;
+        let t0 = tokio::time::Instant::now();
+        let since = move || t0.elapsed().as_secs_f64();
+        // Out at 18 s (the tower's clearance spoken first), on the air 3 s.
+        let went = readback_before_moving(45.0, 250, || since() >= 18.0, || since() < 21.0).await;
+        assert!(went);
+        let waited = since();
+        assert!((21.0..22.0).contains(&waited), "moved at {waited:.1} s");
+        // A frequency that never takes it: the crew moves at the bound.
+        let t1 = tokio::time::Instant::now();
+        let went = readback_before_moving(45.0, 250, || false, || false).await;
+        assert!(!went);
+        assert!(t1.elapsed().as_secs_f64() >= 45.0);
+    }
+
     /// LFPB 2026-09-22: the line-up refused at the holding point, full auto
     /// said "your aircraft", and the taxi governor went on holding the 737 on
     /// its wheel brakes for twenty-seven minutes with `park` at 0.0. Stopped,
@@ -7214,14 +7404,17 @@ mod tests {
         assert!(!air.ran(SET), "no park brake in the air");
         assert!(!air.ran(crate::tools::BRAKES_REGULAR), "no brakes in the air");
 
-        // Rolling fast: the loop that owns the speed stops it, not a give-up.
-        let fast = FakeXPlane::with_reads(&[
+        // Rolling fast with the pilot standing on the toe brakes: theirs.
+        let braking = FakeXPlane::with_reads(&[
             (crate::datarefs::ON_GROUND_ANY, 1.0),
             (crate::autotaxi::GS_MS, 40.0),
+            (super::TOE_BRAKE_L, 0.8),
+            (super::TOE_BRAKE_R, 0.8),
             (PARK, 0.0),
         ]);
-        assert_eq!(hand_back_hold(&fast, Some(1.0)).await, None);
-        assert!(!fast.ran(SET), "not at 78 knots");
+        assert_eq!(hand_back_hold(&braking, Some(1.0)).await, None);
+        assert!(!braking.ran(SET), "the pilot is stopping it");
+        assert!(!braking.ran(crate::autotakeoff::BRAKES_MAX), "no fight on the pedals");
 
         // A tug on the bar owns the aircraft.
         let tug = FakeXPlane::with_reads(&[

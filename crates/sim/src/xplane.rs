@@ -1119,6 +1119,12 @@ impl FakeXPlane {
         self.reads.lock().unwrap().insert(name.to_string(), value);
     }
 
+    /// The value a read of `name` returns now, without counting as a read:
+    /// for a plant built around the fake to see its own switches.
+    pub fn read_value(&self, name: &str) -> Option<f64> {
+        self.reads.lock().unwrap().get(name).copied()
+    }
+
     /// The most recent value written to `name`, if any.
     pub fn last_write(&self, name: &str) -> Option<f64> {
         self.writes
