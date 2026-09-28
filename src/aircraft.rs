@@ -37,7 +37,9 @@ pub struct FlarePowerProfile {
     /// under the approach speed (kt; absent: `autoland::RETARD_SLOW_KTS`).
     /// The thrust is what holds a slow flare's speed, and a knot the retard
     /// takes comes back as sink at the wheels (the 737's plant: 63 fpm a
-    /// knot).
+    /// knot). It defers only a retard not yet begun on a flare still
+    /// sinking: a float takes the thrust off whatever the speed
+    /// (`autoland::RETARD_FLOAT_FPM`; EGBB 15, 2026-09-28, issue #146).
     #[serde(default)]
     pub retard_slow_kts: Option<f64>,
     /// The TIME key: below the retard height the lever starts off only once
