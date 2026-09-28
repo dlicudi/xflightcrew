@@ -91,6 +91,16 @@ const SLOW_DATAREFS: &[&str] = &[
 /// request rate they were driving.
 const SLOW_DATAREF_TTL: std::time::Duration = std::time::Duration::from_millis(500);
 
+/// Plugin datarefs the app reads WITH a fallback: an older `.xpl` lacks
+/// them, and the caller then reads the stock datarefs instead. Without a
+/// memory of the miss every control tick would pay an index lookup for a
+/// name that is not there (a request of frame time each), so a miss is
+/// remembered for [`ABSENT_RECHECK`] and asked again after, which also
+/// finds the dataref once a newer plugin is reloaded.
+const OPTIONAL_DATAREFS: &[&str] = &["xcopilot/position"];
+/// How long a missing [`OPTIONAL_DATAREFS`] name is taken as missing.
+const ABSENT_RECHECK: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// The cache window for one dataref: the long one for the flags that never
 /// move, the configured one for everything else. Disabling the cache
 /// (`XCOPILOT_DREF_CACHE_MS=0`) disables both, so the escape hatch still works.
@@ -298,6 +308,11 @@ pub trait XPlane: Send + Sync {
     async fn get_float_array(&self, name: &str) -> Result<Vec<f64>>;
     async fn set_int_array_elem(&self, name: &str, index: usize, value: i64) -> Result<()>;
     async fn set_float_array_elem(&self, name: &str, index: usize, value: f64) -> Result<()>;
+    /// A `data`-typed dataref's raw bytes (the Web API sends them base64).
+    /// Defaulted so a test double that never needs one need not say so.
+    async fn get_bytes(&self, name: &str) -> Result<Vec<u8>> {
+        Err(anyhow!("no byte read for {name}"))
+    }
 }
 
 /// True when what the sim shows is not the aircraft flying NOW: paused, or
@@ -349,6 +364,9 @@ static ID_CACHE: std::sync::LazyLock<Mutex<PerBase<i64>>> =
 static COMMAND_CACHE: std::sync::LazyLock<Mutex<PerBase<i64>>> =
     std::sync::LazyLock::new(Default::default);
 static VALUE_CACHE: std::sync::LazyLock<Mutex<PerBase<(std::time::Instant, serde_json::Value)>>> =
+    std::sync::LazyLock::new(Default::default);
+/// When each [`OPTIONAL_DATAREFS`] name was last found missing.
+static ABSENT: std::sync::LazyLock<Mutex<PerBase<std::time::Instant>>> =
     std::sync::LazyLock::new(Default::default);
 
 #[derive(Deserialize)]
@@ -450,6 +468,19 @@ impl XPlaneClient {
         {
             return Ok(id);
         }
+        let optional = OPTIONAL_DATAREFS.contains(&name);
+        if optional
+            && ABSENT
+                .lock()
+                .await
+                .get(&self.base)
+                .and_then(|m| m.get(name))
+                .is_some_and(|at| at.elapsed() < ABSENT_RECHECK)
+        {
+            return Err(anyhow!(
+                "dataref not found: {name} (absent, asked again shortly)"
+            ));
+        }
 
         let url = format!("{}/api/v1/datarefs", self.base);
         let index: DatarefIndex = with_retry(|| async {
@@ -468,12 +499,17 @@ impl XPlaneClient {
         })
         .await?;
 
-        let id = index
-            .data
-            .into_iter()
-            .find(|d| d.name == name)
-            .map(|d| d.id)
-            .ok_or_else(|| anyhow!("dataref not found: {name}"))?;
+        let Some(id) = index.data.into_iter().find(|d| d.name == name).map(|d| d.id) else {
+            if optional {
+                ABSENT
+                    .lock()
+                    .await
+                    .entry(self.base.clone())
+                    .or_default()
+                    .insert(name.to_string(), std::time::Instant::now());
+            }
+            return Err(anyhow!("dataref not found: {name}"));
+        };
 
         ID_CACHE
             .lock()
@@ -934,6 +970,9 @@ impl XPlane for XPlaneClient {
     async fn set_float_array_elem(&self, name: &str, index: usize, value: f64) -> Result<()> {
         XPlaneClient::set_float_array_elem(self, name, index, value).await
     }
+    async fn get_bytes(&self, name: &str) -> Result<Vec<u8>> {
+        XPlaneClient::get_bytes(self, name).await
+    }
 }
 
 /// Recording fake for tests: reads come from a preset table, writes and commands
@@ -973,6 +1012,8 @@ pub struct FakeXPlane {
     /// takes), so a readback after the write sees it. Opt-in: by default a
     /// preset array stays as set, which is a switch that did not take.
     live_arrays: std::sync::Mutex<std::collections::HashSet<String>>,
+    /// Data-typed reads (a plugin's packed buffer), raw bytes.
+    byte_reads: std::sync::Mutex<HashMap<String, Vec<u8>>>,
 }
 
 impl FakeXPlane {
@@ -989,6 +1030,7 @@ impl FakeXPlane {
             held: std::sync::Mutex::new(Vec::new()),
             index_writes: std::sync::Mutex::new(Vec::new()),
             live_arrays: std::sync::Mutex::new(std::collections::HashSet::new()),
+            byte_reads: std::sync::Mutex::new(HashMap::new()),
         }
     }
 
@@ -1100,6 +1142,20 @@ impl FakeXPlane {
             .lock()
             .unwrap()
             .insert(name.to_string(), values.to_vec());
+    }
+
+    /// Preset a data-typed read's raw bytes; `None` removes it (the read
+    /// then fails, as a dataref an older plugin lacks does).
+    pub fn set_read_bytes(&self, name: &str, bytes: Option<&[u8]>) {
+        let mut reads = self.byte_reads.lock().unwrap();
+        match bytes {
+            Some(b) => {
+                reads.insert(name.to_string(), b.to_vec());
+            }
+            None => {
+                reads.remove(name);
+            }
+        }
     }
 
     /// Whether `name` was ever written.
@@ -1235,6 +1291,14 @@ impl XPlane for FakeXPlane {
         self.writes.lock().unwrap().push((name.to_string(), value));
         self.note_index_write(name, index, value);
         Ok(())
+    }
+    async fn get_bytes(&self, name: &str) -> Result<Vec<u8>> {
+        self.byte_reads
+            .lock()
+            .unwrap()
+            .get(name)
+            .cloned()
+            .ok_or_else(|| anyhow!("FakeXPlane: no byte read preset for {name}"))
     }
 }
 
@@ -1389,6 +1453,56 @@ mod failure_sequences {
         assert_eq!(xp.get_float("test/dial").await.unwrap(), 7.0);
         xp.set_float("test/dial", 9.0).await.unwrap();
         assert_eq!(xp.get_float("test/dial").await.unwrap(), 9.0);
+        server.join().unwrap();
+    }
+
+    /// An older plugin lacks `xcopilot/position`: the miss is asked once and
+    /// then remembered, so a control tick falling back to the stock reads
+    /// does not pay an index lookup every time (the server here answers ONE
+    /// request; a second would fail differently).
+    #[tokio::test]
+    async fn a_missing_optional_plugin_dataref_is_asked_once_then_remembered() {
+        let (base, server) = server(vec![reply(
+            "GET /api/v1/datarefs?",
+            200,
+            r#"{"data":[]}"#,
+        )]);
+        let xp = XPlaneClient::new(base);
+        let first = xp.get_bytes("xcopilot/position").await.unwrap_err();
+        assert!(first.to_string().contains("not found"), "{first:#}");
+        server.join().unwrap();
+        let second = xp.get_bytes("xcopilot/position").await.unwrap_err();
+        assert!(second.to_string().contains("absent"), "{second:#}");
+    }
+
+    /// With the plugin: one request, base64 of the packed doubles, parsed
+    /// into the frame it holds.
+    #[tokio::test]
+    async fn the_position_snapshot_is_one_request() {
+        let p = crate::position::Position {
+            lat: 36.675,
+            lon: -4.4991,
+            elev_m: 16.0,
+            psi_true_deg: 128.0,
+            gs_ms: 60.0,
+            vs_fpm: 0.0,
+            agl_m: 2.0,
+            frame: Some(99),
+            sim_time_s: Some(12.5),
+            source: crate::position::Source::Plugin,
+        };
+        let b64 = base64::engine::general_purpose::STANDARD.encode(crate::position::encode(&p));
+        let body: &'static str = Box::leak(format!(r#"{{"data":"{b64}"}}"#).into_boxed_str());
+        let (base, server) = server(vec![
+            reply(
+                "GET /api/v1/datarefs?",
+                200,
+                r#"{"data":[{"id":5,"name":"xcopilot/position"}]}"#,
+            ),
+            reply("GET /api/v1/datarefs/5/value", 200, body),
+        ]);
+        let xp = XPlaneClient::new(base);
+        assert_eq!(crate::position::read(&xp).await.unwrap(), p);
         server.join().unwrap();
     }
 
