@@ -1578,7 +1578,7 @@ impl Station {
         wind_kts: f64,
         arrival_end: Option<&str>,
     ) -> String {
-        if wind_kts < 5.0 && self.runway_in_use.is_none() {
+        if wind_kts < CALM_WIND_KTS && self.runway_in_use.is_none() {
             if let Some(end) = arrival_end {
                 if strip(&self.apt.runways, end).is_some() {
                     self.runway_in_use = Some(end.to_string());
@@ -1616,7 +1616,14 @@ impl Station {
         // sent a 737 round the field from a five mile final (same sortie). A
         // controller with nothing else on the runway clears the end the
         // traffic is lined up on. Only uncommitted, only without an arrival
-        // stream on another end, only inside the swap margin.
+        // stream on another end.
+        // "Does not argue" is the pick's own calm (under CALM_WIND_KTS any
+        // end stands), a tailwind within STATED_RUNWAY_TAILWIND_KTS on no
+        // worse a crosswind than the best end's, or a headwind inside the
+        // swap margin. LEMG (sortie 1790580676-approach, 2026-09-28): "10
+        // mile final runway one three" into 350 at 3 earned "negative, runway
+        // three one" because 13's -2.3 kt trailed 31's +2.3 kt by 4.7, over
+        // the 3 kt margin, in a wind the same function calls calm.
         if let Some(stated) = self.stated_runway.take() {
             let ident = self
                 .apt
@@ -1627,19 +1634,16 @@ impl Station {
             if let Some(ident) = ident {
                 let stream_elsewhere = arrival_end.is_some_and(|end| end != ident);
                 let hw = nav::headwind_for(&self.apt.runways, &ident, wind_from, wind_kts);
-                let best = nav::best_runway_for_wind(&self.apt.runways, wind_from, wind_kts)
-                    .map(|(_, _, hw)| hw);
-                let wind_indifferent = match (hw, best) {
-                    (Some(hw), Some(best)) => best - hw <= RUNWAY_SWAP_MARGIN_KTS,
-                    _ => false,
-                };
+                let best = nav::best_runway_for_wind(&self.apt.runways, wind_from, wind_kts);
+                let wind_indifferent =
+                    stated_runway_stands(&self.apt.runways, &ident, hw, best, wind_from, wind_kts);
                 if !stream_elsewhere && wind_indifferent {
                     self.runway_in_use = Some(ident.clone());
                     return ident;
                 }
             }
         }
-        if wind_kts >= 5.0 || self.runway_in_use.is_none() {
+        if wind_kts >= CALM_WIND_KTS || self.runway_in_use.is_none() {
             if let Some((id, _, hw)) =
                 nav::best_runway_for_wind(&self.apt.runways, wind_from, wind_kts)
             {
@@ -2759,7 +2763,7 @@ pub fn atis_tick(com1_khz: i64, wx: &AtisWx, now: Instant) -> Option<String> {
     }
     // Runway from the wind — but in calm keep the edition's pick, or the
     // coin-toss flip would cut a fresh edition per broadcast.
-    let runway = if wx.wind_kts < 5.0 {
+    let runway = if wx.wind_kts < CALM_WIND_KTS {
         st.edition.as_ref().map(|e| e.runway.clone())
     } else {
         None
@@ -4735,6 +4739,57 @@ pub struct TakeoffHold {
 /// the runway in use. Big enough that two parallels (identical headings,
 /// headwinds equal to rounding error) can never trade places on noise.
 const RUNWAY_SWAP_MARGIN_KTS: f64 = 3.0;
+
+/// Under this the wind does not pick the runway: the pick keeps the runway in
+/// use (the into-wind choice flip-flops on noise), the ATIS keeps its
+/// edition's runway, and an arrival's stated runway stands.
+const CALM_WIND_KTS: f64 = 5.0;
+
+/// The tailwind an arrival's (or a taxi request's) stated runway may carry and
+/// still stand: ICAO PANS-ATM 7.2.3 accepts a preferential runway with up to
+/// 5 kt of tailwind on a dry runway.
+const STATED_RUNWAY_TAILWIND_KTS: f64 = 5.0;
+
+/// Whether the wind argues with the runway the pilot named. `hw` is its
+/// headwind (negative = tailwind), `best` the into-wind pick. It stands in
+/// calm; within STATED_RUNWAY_TAILWIND_KTS of tailwind when its crosswind is
+/// no worse than the best end's by more than the swap margin (the reciprocal
+/// of the best end has the same crosswind; a crossing strip may not); or with
+/// a headwind inside the swap margin of the best.
+fn stated_runway_stands(
+    runways: &[nav::Runway],
+    ident: &str,
+    hw: Option<f64>,
+    best: Option<(String, f64, f64)>,
+    wind_from: f64,
+    wind_kts: f64,
+) -> bool {
+    let (Some(hw), Some((_, best_hdg, best_hw))) = (hw, best) else {
+        return false;
+    };
+    if wind_kts < CALM_WIND_KTS {
+        return true;
+    }
+    if best_hw - hw <= RUNWAY_SWAP_MARGIN_KTS {
+        return true;
+    }
+    let crosswind =
+        |hdg: f64| (wind_kts * nav::angle_diff_deg(wind_from, hdg).to_radians().sin()).abs();
+    let stated_hdg = runways.iter().find_map(|r| {
+        if r.ident_a == ident {
+            Some(r.heading_a_deg())
+        } else if r.ident_b == ident {
+            Some(r.heading_b_deg())
+        } else {
+            None
+        }
+    });
+    let Some(stated_hdg) = stated_hdg else {
+        return false;
+    };
+    hw >= -STATED_RUNWAY_TAILWIND_KTS
+        && crosswind(stated_hdg) <= crosswind(best_hdg) + RUNWAY_SWAP_MARGIN_KTS
+}
 
 /// The final must stay clear this long before the held clearance releases —
 /// an arrival crossing the fence vanishes from the airborne band while still
@@ -10025,6 +10080,108 @@ mod tests {
             st.twr.state = state;
             assert_eq!(st.pick_runway(270.0, 15.0), "09", "{state:?}");
         }
+    }
+
+    /// Issue #129, the recorded case: LEMG (sortie 1790580676-approach,
+    /// 2026-09-28), the 737 on a 10 nm final for 13 in 350 at 3 kt, said
+    /// "ten mile final runway one three" and at t 1790580681.3 was told
+    /// "negative, runway three one ... cleared to land": 13's -2.3 kt
+    /// trailed 31's +2.3 kt by 4.7, over the 3 kt swap margin, in a wind the
+    /// pick itself calls calm. LEMG 12/30 and 13/31 from apt.dat.
+    #[test]
+    fn the_lemg_final_for_one_three_keeps_its_runway_in_a_calm() {
+        let _guard = SIDE_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        *CLEARANCE.lock().unwrap() = None;
+        let runways = vec![
+            nav::Runway {
+                width_m: 45.11,
+                surface: 1,
+                ident_a: "12".into(),
+                ident_b: "30".into(),
+                lat_a: 36.6910753,
+                lon_a: -4.5078270,
+                lat_b: 36.6795648,
+                lon_b: -4.4805125,
+            },
+            nav::Runway {
+                width_m: 45.11,
+                surface: 1,
+                ident_a: "13".into(),
+                ident_b: "31".into(),
+                lat_a: 36.6845573,
+                lon_a: -4.5126253,
+                lat_b: 36.6654027,
+                lon_b: -4.4858140,
+            },
+        ];
+        let wx = Wx {
+            wind_from_deg: 350.0,
+            wind_kts: 3.0,
+        };
+        // The recorded numbers: 13 on a tailwind, 31 the into-wind pick,
+        // 4.7 kt apart.
+        let hw13 = nav::headwind_for(&runways, "13", 350.0, 3.0).unwrap();
+        let (best, _, best_hw) = nav::best_runway_for_wind(&runways, 350.0, 3.0).unwrap();
+        assert!(best == "31" || best == "30", "{best}");
+        assert!(
+            best_hw - hw13 > RUNWAY_SWAP_MARGIN_KTS,
+            "{best_hw} vs {hw13}"
+        );
+
+        let mut st = lxgb();
+        st.apt.name = "Malaga".into();
+        st.apt.runways = runways.clone();
+        let words = "november eight one six november november, ten mile final runway one three";
+        let intent = tower::parse_intent(words);
+        assert_eq!(intent, tower::Intent::ReportFinal);
+        st.note_stated_runway(words, intent);
+        let ctx = scripted_ctx(&mut st, wx);
+        assert_eq!(st.runway_in_use.as_deref(), Some("13"));
+        let r = st.route_keyed(words, Service::Tower, &ctx, wx);
+        assert!(!r.contains("negative"), "{r}");
+        assert!(r.contains("runway one three"), "{r}");
+        assert!(r.contains("cleared to land"), "{r}");
+
+        // A tailwind within 5 kt stands in a real wind too (350 at 6: 13
+        // carries 4.6 kt of tailwind on the same crosswind as 31)...
+        let mut st = lxgb();
+        st.apt.runways = runways.clone();
+        st.note_stated_runway("final runway one three", tower::Intent::ReportFinal);
+        assert_eq!(st.pick_runway(350.0, 6.0), "13");
+        // ...but not past it (350 at 10: 7.7 kt of tailwind).
+        let mut st = lxgb();
+        st.apt.runways = runways.clone();
+        st.note_stated_runway("final runway one three", tower::Intent::ReportFinal);
+        assert_ne!(st.pick_runway(350.0, 10.0), "13");
+        // A crossing strip with a tailwind in limits but a far worse
+        // crosswind does not stand (LXGB-like 09/27 plus a synthetic 18/36,
+        // wind 360 at 12: 09 has no tailwind but a 12 kt crosswind).
+        let mut st = lxgb();
+        st.apt.runways = vec![
+            nav::Runway {
+                width_m: 45.0,
+                surface: 1,
+                ident_a: "09".into(),
+                ident_b: "27".into(),
+                lat_a: 36.0,
+                lon_a: -5.02,
+                lat_b: 36.0,
+                lon_b: -4.98,
+            },
+            nav::Runway {
+                width_m: 45.0,
+                surface: 1,
+                ident_a: "18".into(),
+                ident_b: "36".into(),
+                lat_a: 36.02,
+                lon_a: -5.0,
+                lat_b: 35.98,
+                lon_b: -5.0,
+            },
+        ];
+        st.note_stated_runway("final runway zero nine", tower::Intent::ReportFinal);
+        assert_eq!(st.pick_runway(0.0, 12.0), "36");
+        *CLEARANCE.lock().unwrap() = None;
     }
 
     /// Two parallels have the SAME heading to within rounding error, so which
