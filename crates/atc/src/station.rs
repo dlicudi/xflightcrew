@@ -24,9 +24,9 @@ use sim::xplane::SimView;
 pub use crate::party_line::RegionHandoff;
 pub(crate) use crate::party_line::{
     IfrFlight, ARRIVAL_PIN, ASSIGNED_SQUAWK, CLEARANCE, DEPARTURE_HANDOFF, GO_AROUND_ORDERS,
-    IFR_CLEARANCE, IFR_FLIGHT, LANDING_HANDOFF, LINE_UP_CONDITION, PENDING_GO_AROUND,
-    PENDING_LINE_UP, PENDING_STATION, PENDING_TAKEOFF_CLEARANCE, REGION_HANDOFF, SQUAWK_NUDGE,
-    TAKEOFF_HOLD, TAXI_ROUTE, TAXI_TO_STAND, VECTORS, ZONE_CHALLENGE,
+    IFR_CLEARANCE, IFR_FLIGHT, LANDING_HANDOFF, LANDING_HOLD, LINE_UP_CONDITION, PENDING_GO_AROUND,
+    PENDING_LANDING_RELEASE, PENDING_LINE_UP, PENDING_STATION, PENDING_TAKEOFF_CLEARANCE,
+    REGION_HANDOFF, SQUAWK_NUDGE, TAKEOFF_HOLD, TAXI_ROUTE, TAXI_TO_STAND, VECTORS, ZONE_CHALLENGE,
 };
 
 // The airline telephony and the ghost speaker live with the callsign
@@ -363,6 +363,11 @@ impl Station {
         *PENDING_LINE_UP.lock().unwrap_or_else(|e| e.into_inner()) = false;
         *PENDING_GO_AROUND.lock().unwrap_or_else(|e| e.into_inner()) = false;
         *GO_AROUND_LAST.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        *LANDING_HOLD.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        *PENDING_LANDING_RELEASE
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = None;
+        *STRIP_SEEN.lock().unwrap_or_else(|e| e.into_inner()) = None;
         *GHOSTS.lock().unwrap_or_else(|e| e.into_inner()) = None;
         *WAKE.lock().unwrap_or_else(|e| e.into_inner()) = None;
         *WAKE_PREV.lock().unwrap_or_else(|e| e.into_inner()) = None;
@@ -426,6 +431,11 @@ impl Station {
         *WAKE_PREV.lock().unwrap_or_else(|e| e.into_inner()) = None;
         *DEPARTURE_STREAM.lock().unwrap_or_else(|e| e.into_inner()) = None;
         *GO_AROUND_LAST.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        *LANDING_HOLD.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        *PENDING_LANDING_RELEASE
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = None;
+        *STRIP_SEEN.lock().unwrap_or_else(|e| e.into_inner()) = None;
         // The party line: no clearance, no route, no vectors, no pending
         // anything — a re-enable starts from a cold contact, like a fresh
         // boot.
@@ -529,6 +539,7 @@ impl Station {
         ctx: &tower::Ctx,
         wx: Wx,
     ) -> Option<String> {
+        self.sync_landing_release();
         if !is_radio_call(transcript, &spoken_airport(&self.apt.name).to_lowercase())
             && !crate::callsign::addressed(transcript, &ctx.callsign)
         {
@@ -604,6 +615,7 @@ impl Station {
         ctx: &tower::Ctx,
         wx: Wx,
     ) -> String {
+        self.sync_landing_release();
         self.note_information(transcript);
         let intent = tower::parse_intent(transcript);
         // The readback gate first: a runway-critical clearance is waiting
@@ -748,6 +760,7 @@ impl Station {
         ctx: &tower::Ctx,
         wx: Wx,
     ) -> String {
+        self.sync_landing_release();
         let was = self.twr.state;
         if service == Service::Tower {
             self.note_departure_intent(&intent, transcript);
@@ -844,6 +857,34 @@ impl Station {
                 pending_readback: self.twr.suggested_readback(&ctx.callsign),
                 holds_runway: self.twr.holds_runway(),
             });
+        }
+        // A withheld landing clearance lives only while the flight is still
+        // Inbound for it: cleared (a new final report), gone around, landed
+        // or elsewhere retires it. A final report onto an occupied runway
+        // ("continue approach", tower.rs) arms it, for the monitor's watch
+        // to release once the strip clears (`landing_hold_tick`).
+        if service == Service::Tower {
+            if self.twr.state != tower::State::Inbound || intent == tower::Intent::GoAround {
+                *LANDING_HOLD.lock().unwrap_or_else(|e| e.into_inner()) = None;
+            }
+            if intent == tower::Intent::ReportFinal
+                && self.twr.state == tower::State::Inbound
+                && !ctx.on_ground
+                && ctx.runway_occupied
+            {
+                let ident = self.runway_in_use.clone().unwrap_or_default();
+                sim::blackbox::record(
+                    "atc",
+                    serde_json::json!({"event": "landing_withheld", "runway": ident,
+                        "why": "runway_occupied"}),
+                );
+                *LANDING_HOLD.lock().unwrap_or_else(|e| e.into_inner()) = Some(LandingHold {
+                    callsign: ctx.callsign.clone(),
+                    runway: ctx.runway.clone(),
+                    runway_ident: ident,
+                    line: self.twr.landing_clearance_line(ctx),
+                });
+            }
         }
         // A fresh taxi clearance publishes its route for the off-route
         // compliance watch (and clears any stale one when route-less).
@@ -1019,6 +1060,21 @@ impl Station {
     /// back in the pattern, exactly as if the pilot had called it. The
     /// coach's next line becomes the acknowledgment the order deserves,
     /// never the readback of the clearance that just died.
+    /// Sync the tower FSM with a withheld landing clearance the MONITOR
+    /// released (see [`landing_hold_tick`]): ClearedToLand with its readback
+    /// owed, exactly as if it had been the reply to the final report. Run
+    /// before the station answers anything, so the crew's readback of the
+    /// released clearance meets a tower that knows it gave it.
+    fn sync_landing_release(&mut self) {
+        let released = PENDING_LANDING_RELEASE
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+        if let Some((runway, line)) = released {
+            self.twr.release_landing(runway, line);
+        }
+    }
+
     pub fn apply_monitor_go_around(&mut self) {
         self.twr.apply_go_around();
         if let Some(c) = CLEARANCE.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
@@ -3641,6 +3697,10 @@ pub fn retire_for_new_flight() {
         .unwrap_or_else(|e| e.into_inner()) = false;
     *PENDING_LINE_UP.lock().unwrap_or_else(|e| e.into_inner()) = false;
     *PENDING_GO_AROUND.lock().unwrap_or_else(|e| e.into_inner()) = false;
+    *LANDING_HOLD.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    *PENDING_LANDING_RELEASE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = None;
 }
 
 /// A NEW FLIGHT at `icao` (the crew's "put us on a ten mile final", which
@@ -3718,6 +3778,8 @@ pub(crate) fn out_of_reach() -> bool {
 /// field). A route the crew planned for itself is left alone.
 pub fn note_aircraft(lat: f64, lon: f64, on_ground: bool) {
     use std::sync::atomic::Ordering::Relaxed;
+    // Where we are, for the go-around judgement's time to the threshold.
+    note_own_fix(lat, lon, on_ground, Instant::now());
     // The crew's own route and runway end at the liftoff: a departure's
     // runway must never read as a cleared one at the destination (autoland
     // takes the cleared runway).
@@ -5067,10 +5129,376 @@ pub fn chatter_tick(
 /// not stutter.
 static GO_AROUND_LAST: Mutex<Option<Instant>> = Mutex::new(None);
 
-/// The tower protects the one aircraft it controls: cleared to land, low,
-/// and a ghost is ON the runway — the clearance is cancelled out loud
-/// instead of letting the world contradict it. Crew phrasing when the pilot
-/// isn't tuned (a safety net must not depend on the radio).
+/// Our recent airborne positions (lat, lon, when), from the monitor's
+/// [`note_aircraft`]: the go-around judgement's distance and time to the
+/// threshold. Cleared on the ground.
+static OWN_FIXES: Mutex<std::collections::VecDeque<(f64, f64, Instant)>> =
+    Mutex::new(std::collections::VecDeque::new());
+
+/// Recent positions of ghosts on the ground, by callsign: how a strip's
+/// occupant is MOVING (rolling, vacating, standing) is what says whether it
+/// will still be there when we arrive.
+type GroundTracks =
+    std::collections::HashMap<String, std::collections::VecDeque<(f64, f64, Instant)>>;
+static STRIP_SEEN: Mutex<Option<GroundTracks>> = Mutex::new(None);
+
+/// How much track history the judgements keep.
+const TRACK_KEEP_S: f64 = 8.0;
+/// A velocity is measured over at least this long (a tick-to-tick
+/// difference is noise).
+const TRACK_MIN_DT_S: f64 = 1.0;
+
+/// Record our own position for the go-around judgement. Airborne only: on
+/// the ground there is no threshold to reach.
+pub(crate) fn note_own_fix(lat: f64, lon: f64, on_ground: bool, now: Instant) {
+    let mut f = OWN_FIXES.lock().unwrap_or_else(|e| e.into_inner());
+    if on_ground {
+        f.clear();
+        return;
+    }
+    if f.back()
+        .is_some_and(|b| now.saturating_duration_since(b.2).as_secs_f64() < 0.05)
+    {
+        return;
+    }
+    f.push_back((lat, lon, now));
+    while f
+        .front()
+        .is_some_and(|a| now.saturating_duration_since(a.2).as_secs_f64() > TRACK_KEEP_S)
+    {
+        f.pop_front();
+    }
+}
+
+/// The tower decides a go-around only inside this time to the threshold: a
+/// runway occupant further out than that is a sequencing matter ("continue
+/// approach"), never a cancellation. About two miles at approach speed.
+const GO_AROUND_DECIDE_S: f64 = 60.0;
+/// The runway must be clear this long before we cross the threshold.
+const RUNWAY_CLEAR_MARGIN_S: f64 = 10.0;
+/// Groundspeed assumed on final when ours is not measured.
+const DEFAULT_FINAL_KTS: f64 = 140.0;
+/// A departure's roll: it lifts off near this speed, accelerating at this
+/// rate (a jet from brake release lifts in about 35 s).
+const LIFTOFF_KTS: f64 = 150.0;
+const ROLL_ACCEL_KTS_S: f64 = 4.0;
+/// A lander ahead rolling out (fast, not accelerating) is off at a turn-off
+/// within this.
+const ROLLOUT_CLEAR_S: f64 = 40.0;
+/// A ghost standing still this close to the threshold we land on is a
+/// departure lined up: it is off the runway a roll after it starts.
+const LINED_UP_ZONE_M: f64 = 800.0;
+/// Under this a ghost is standing, not moving.
+const MOVING_KTS: f64 = 3.0;
+
+/// How a runway occupant will leave the strip, judged from its track.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) enum StripExit {
+    /// Moving off it: a departure rolling our way, the lander ahead rolling
+    /// out, an aircraft crossing or vacating. Off in about this many seconds.
+    Clearing(f64),
+    /// Standing at the threshold we land on: a departure lined up, off one
+    /// roll (this many seconds) after it starts.
+    LinedUp(f64),
+    /// Standing elsewhere, backtracking, or unknown: no telling when.
+    Stays,
+}
+
+impl StripExit {
+    fn secs(&self) -> Option<f64> {
+        match self {
+            StripExit::Clearing(s) | StripExit::LinedUp(s) => Some(*s),
+            StripExit::Stays => None,
+        }
+    }
+}
+
+/// Seconds for a departure rolling at `kts` to lift off.
+fn roll_to_liftoff_s(kts: f64) -> f64 {
+    (LIFTOFF_KTS - kts).max(0.0) / ROLL_ACCEL_KTS_S
+}
+
+/// Half the strip's width for occupancy (the same slack [`on_runway`] uses).
+fn strip_half_width_m(r: &nav::Runway) -> f64 {
+    if r.width_m > 1.0 {
+        r.width_m / 2.0 + RUNWAY_EDGE_SLACK_M
+    } else {
+        RUNWAY_HALF_WIDTH_M
+    }
+}
+
+/// A frame on the landing END: origin its threshold, `u` along the landing
+/// direction; positions in metres, along and to the left.
+struct LandingFrame {
+    lat0: f64,
+    lon0: f64,
+    m_lat: f64,
+    m_lon: f64,
+    u: (f64, f64),
+}
+
+impl LandingFrame {
+    fn new(r: &nav::Runway, landing_end: &str) -> Option<Self> {
+        let (lat0, lon0, lat1, lon1) = if r.ident_a == landing_end {
+            (r.lat_a, r.lon_a, r.lat_b, r.lon_b)
+        } else if r.ident_b == landing_end {
+            (r.lat_b, r.lon_b, r.lat_a, r.lon_a)
+        } else {
+            return None;
+        };
+        let m_lat = 111_320.0;
+        let m_lon = 111_320.0 * lat0.to_radians().cos();
+        let (bx, by) = ((lon1 - lon0) * m_lon, (lat1 - lat0) * m_lat);
+        let len = (bx * bx + by * by).sqrt();
+        if len < 1.0 {
+            return None;
+        }
+        Some(Self {
+            lat0,
+            lon0,
+            m_lat,
+            m_lon,
+            u: (bx / len, by / len),
+        })
+    }
+
+    /// Metres east and north of the threshold.
+    fn xy(&self, lat: f64, lon: f64) -> (f64, f64) {
+        (
+            (lon - self.lon0) * self.m_lon,
+            (lat - self.lat0) * self.m_lat,
+        )
+    }
+
+    /// (along, cross) of a position, metres.
+    fn place(&self, lat: f64, lon: f64) -> (f64, f64) {
+        let (x, y) = self.xy(lat, lon);
+        (x * self.u.0 + y * self.u.1, -x * self.u.1 + y * self.u.0)
+    }
+}
+
+/// The velocity (along, cross; m/s) between sample `newest` and the latest
+/// one at least [`TRACK_MIN_DT_S`] older, with that older sample's index.
+fn track_velocity(
+    f: &LandingFrame,
+    track: &[(f64, f64, f64)],
+    newest: usize,
+) -> Option<((f64, f64), usize)> {
+    let (lat, lon, t) = track[newest];
+    let i = (0..newest)
+        .rev()
+        .find(|&i| t - track[i].2 >= TRACK_MIN_DT_S)?;
+    let (a1, c1) = f.place(lat, lon);
+    let (a0, c0) = f.place(track[i].0, track[i].1);
+    let dt = t - track[i].2;
+    Some((((a1 - a0) / dt, (c1 - c0) / dt), i))
+}
+
+/// How a ghost on our strip will leave it, from its track (lat, lon, seconds;
+/// oldest first, the last is now). Pure: the go-around judgement's and the
+/// landing release's one question.
+pub(crate) fn strip_exit(
+    r: &nav::Runway,
+    landing_end: &str,
+    track: &[(f64, f64, f64)],
+) -> StripExit {
+    let Some(f) = LandingFrame::new(r, landing_end) else {
+        return StripExit::Stays;
+    };
+    let Some(&(lat, lon, _)) = track.last() else {
+        return StripExit::Stays;
+    };
+    let (along, cross) = f.place(lat, lon);
+    let standing = || {
+        if along < LINED_UP_ZONE_M {
+            StripExit::LinedUp(roll_to_liftoff_s(0.0))
+        } else {
+            StripExit::Stays
+        }
+    };
+    let Some(((va, vc), older)) = track_velocity(&f, track, track.len() - 1) else {
+        // First sight: standing until it is seen to move.
+        return standing();
+    };
+    let kts = (va * va + vc * vc).sqrt() * 1.943_844;
+    if kts < MOVING_KTS {
+        return standing();
+    }
+    let angle = vc.abs().atan2(va.abs()).to_degrees();
+    if angle <= 30.0 {
+        if va <= 0.0 {
+            // Toward us along the strip: a backtrack, or the other direction.
+            return StripExit::Stays;
+        }
+        // Our way along the strip: a departure rolling, or the lander ahead
+        // rolling out. Slow or accelerating is a roll; fast and slowing is a
+        // rollout, off at a turn-off.
+        let accel = track_velocity(&f, track, older).map(|((pa, pc), _)| {
+            let prev_kts = (pa * pa + pc * pc).sqrt() * 1.943_844;
+            (kts - prev_kts) / (track[track.len() - 1].2 - track[older].2)
+        });
+        return if kts < 40.0 || accel.is_some_and(|a| a >= 0.5) {
+            StripExit::Clearing(roll_to_liftoff_s(kts))
+        } else {
+            StripExit::Clearing(ROLLOUT_CLEAR_S)
+        };
+    }
+    // Across the strip: crossing or vacating, off at the edge it heads for.
+    let half = strip_half_width_m(r);
+    let dist = if vc.signum() == cross.signum() {
+        half - cross.abs()
+    } else {
+        half + cross.abs()
+    };
+    StripExit::Clearing(dist.max(0.0) / vc.abs())
+}
+
+/// Our distance (nm) and time (s) to the landing threshold from the fixes the
+/// monitor noted. `None` without a fresh fix (a test, the first tick).
+fn own_time_to_threshold(r: &nav::Runway, landing_end: &str, now: Instant) -> Option<(f64, f64)> {
+    let f = LandingFrame::new(r, landing_end)?;
+    let fixes = OWN_FIXES.lock().unwrap_or_else(|e| e.into_inner());
+    let &(lat, lon, at) = fixes.back()?;
+    if now.saturating_duration_since(at).as_secs_f64() > 3.0 {
+        return None;
+    }
+    let (x, y) = f.xy(lat, lon);
+    let dist_m = (x * x + y * y).sqrt();
+    let gs_kts = fixes
+        .iter()
+        .rev()
+        .find(|p| at.saturating_duration_since(p.2).as_secs_f64() >= TRACK_MIN_DT_S)
+        .map(|p| {
+            let dt = at.saturating_duration_since(p.2).as_secs_f64();
+            crate::nav::haversine_nm(p.0, p.1, lat, lon) / dt * 3600.0
+        })
+        .filter(|g| *g >= 40.0)
+        .unwrap_or(DEFAULT_FINAL_KTS);
+    Some((dist_m / 1852.0, dist_m / (gs_kts / 1.943_844)))
+}
+
+/// The go-around is due: we are inside [`GO_AROUND_DECIDE_S`] of the
+/// threshold and some occupant will not be off the runway
+/// [`RUNWAY_CLEAR_MARGIN_S`] before we cross it. Further out it is only
+/// sequencing: a departure lined up gets its roll, a vacating arrival its
+/// turn-off. An unmeasured time decides as before: the order.
+pub(crate) fn go_around_due(own_s: Option<f64>, exits: &[StripExit]) -> bool {
+    if exits.is_empty() {
+        return false;
+    }
+    let Some(t) = own_s else {
+        return true;
+    };
+    t <= GO_AROUND_DECIDE_S
+        && exits
+            .iter()
+            .any(|e| e.secs().is_none_or(|s| s + RUNWAY_CLEAR_MARGIN_S > t))
+}
+
+/// A withheld landing clearance may go out: the strip is clear, or every
+/// occupant is MOVING off it and will be gone [`RUNWAY_CLEAR_MARGIN_S`]
+/// before we arrive (a departure rolling, an arrival vacating). A lined-up
+/// or standing aircraft never earns it.
+pub(crate) fn landing_release_due(own_s: Option<f64>, exits: &[StripExit]) -> bool {
+    exits.iter().all(|e| match (e, own_s) {
+        (StripExit::Clearing(s), Some(t)) => s + RUNWAY_CLEAR_MARGIN_S <= t,
+        _ => false,
+    })
+}
+
+/// The ghosts on the ground on our strip and how each will leave it; notes
+/// every ground ghost's position for the tracks.
+fn strip_exits(
+    targets: &[TcasTarget],
+    ours: Option<&nav::Runway>,
+    landing_end: &str,
+    now: Instant,
+) -> Vec<(String, StripExit)> {
+    let mut guard = STRIP_SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    let seen = guard.get_or_insert_with(std::collections::HashMap::new);
+    for t in targets.iter().filter(|t| t.on_ground) {
+        let tr = seen.entry(t.callsign.clone()).or_default();
+        if tr
+            .back()
+            .is_none_or(|b| now.saturating_duration_since(b.2).as_secs_f64() >= 0.05)
+        {
+            tr.push_back((t.lat, t.lon, now));
+        }
+        while tr
+            .front()
+            .is_some_and(|a| now.saturating_duration_since(a.2).as_secs_f64() > TRACK_KEEP_S)
+        {
+            tr.pop_front();
+        }
+    }
+    seen.retain(|_, tr| {
+        tr.back()
+            .is_some_and(|b| now.saturating_duration_since(b.2).as_secs_f64() <= TRACK_KEEP_S)
+    });
+    targets
+        .iter()
+        .filter(|t| {
+            t.on_ground
+                && match ours {
+                    Some(r) => on_runway(r, t.lat, t.lon).is_some(),
+                    None => on_active_runway(t.lat, t.lon).is_some(),
+                }
+        })
+        .map(|t| {
+            let exit = match (ours, seen.get(&t.callsign)) {
+                (Some(r), Some(tr)) => {
+                    let track: Vec<(f64, f64, f64)> = tr
+                        .iter()
+                        .map(|p| (p.0, p.1, -now.saturating_duration_since(p.2).as_secs_f64()))
+                        .collect();
+                    strip_exit(r, landing_end, &track)
+                }
+                _ => StripExit::Stays,
+            };
+            (t.callsign.clone(), exit)
+        })
+        .collect()
+}
+
+/// The last "go-around deferred" record: the judgement is logged at a
+/// cadence, not every tick.
+static GO_AROUND_DEFER_LOGGED: Mutex<Option<Instant>> = Mutex::new(None);
+
+/// The occupants a runway judgement used, for the blackbox.
+fn exits_json(exits: &[(String, StripExit)]) -> serde_json::Value {
+    serde_json::Value::Array(
+        exits
+            .iter()
+            .map(|(cs, e)| {
+                let (kind, s) = match e {
+                    StripExit::Clearing(s) => ("clearing", Some(*s)),
+                    StripExit::LinedUp(s) => ("lined_up", Some(*s)),
+                    StripExit::Stays => ("stays", None),
+                };
+                serde_json::json!({"ghost": cs, "exit": kind,
+                    "clear_s": s.map(|s| (s * 10.0).round() / 10.0)})
+            })
+            .collect(),
+    )
+}
+
+/// Our numbers for the blackbox: distance (nm) and time (s) to the threshold.
+fn own_json(own: Option<(f64, f64)>) -> (serde_json::Value, serde_json::Value) {
+    (
+        serde_json::json!(own.map(|o| (o.0 * 100.0).round() / 100.0)),
+        serde_json::json!(own.map(|o| o.1.round())),
+    )
+}
+
+/// The tower protects the one aircraft it controls: cleared to land (or held
+/// for the landing clearance), low, and a ghost on the runway that will still
+/// be there when we arrive: the clearance is cancelled out loud instead of
+/// letting the world contradict it. Crew phrasing when the pilot isn't tuned
+/// (a safety net must not depend on the radio). Judged on TIME: inside
+/// [`GO_AROUND_DECIDE_S`] of the threshold, against how the occupant is
+/// leaving ([`strip_exit`]). LEMG 13 (sortie 1790594471-full_auto,
+/// 2026-09-28): ordered at 3.8 nm, about 80 s out, for the departure TO4611
+/// that lifted off 81 s later.
 pub fn go_around_tick(
     targets: &[TcasTarget],
     own_agl_ft: f64,
@@ -5081,30 +5509,61 @@ pub fn go_around_tick(
     if on_ground || own_agl_ft > 800.0 {
         return None;
     }
-    let (callsign, runway_ident) = CLEARANCE
+    let cleared = CLEARANCE
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .as_ref()
         .filter(|c| c.state == tower::State::ClearedToLand)
-        .map(|c| (c.callsign.clone(), c.runway_ident.clone()))?;
+        .map(|c| (c.callsign.clone(), c.runway_ident.clone()));
+    let held = || {
+        LANDING_HOLD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .map(|h| (h.callsign.clone(), h.runway_ident.clone()))
+    };
+    let (callsign, runway_ident) = cleared.or_else(held)?;
     // Only a ghost on OUR strip cancels the clearance — a parallel runway's
     // occupant is not our conflict (Heathrow, 2026-07-10).
     let ours = {
         let runways = ACTIVE_RUNWAYS.lock().unwrap_or_else(|e| e.into_inner());
         strip(&runways, &runway_ident).cloned()
     };
-    targets.iter().find(|t| {
-        t.on_ground
-            && match &ours {
-                Some(r) => on_runway(r, t.lat, t.lon).is_some(),
-                None => on_active_runway(t.lat, t.lon).is_some(),
-            }
-    })?;
+    let exits = strip_exits(targets, ours.as_ref(), &runway_ident, now);
+    if exits.is_empty() {
+        return None;
+    }
+    let own = ours
+        .as_ref()
+        .and_then(|r| own_time_to_threshold(r, &runway_ident, now));
+    let plain: Vec<StripExit> = exits.iter().map(|e| e.1).collect();
+    let (own_nm, own_s) = own_json(own);
+    if !go_around_due(own.map(|o| o.1), &plain) {
+        let mut logged = GO_AROUND_DEFER_LOGGED
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if logged.is_none_or(|t| now.saturating_duration_since(t).as_secs_f64() >= 10.0) {
+            *logged = Some(now);
+            sim::blackbox::record(
+                "atc",
+                serde_json::json!({"event": "go_around_deferred", "runway": runway_ident,
+                    "own_nm": own_nm, "own_s": own_s, "occupants": exits_json(&exits)}),
+            );
+        }
+        return None;
+    }
     let mut last = GO_AROUND_LAST.lock().unwrap_or_else(|e| e.into_inner());
     if last.is_some_and(|t| now.duration_since(t).as_secs_f64() < 30.0) {
         return None;
     }
     *last = Some(now);
+    sim::blackbox::record(
+        "atc",
+        serde_json::json!({"event": "go_around_judged", "runway": runway_ident,
+            "own_nm": own_nm, "own_s": own_s, "occupants": exits_json(&exits)}),
+    );
+    // A withheld landing is over: the order is the answer it was waiting for.
+    *LANDING_HOLD.lock().unwrap_or_else(|e| e.into_inner()) = None;
     // The order voids the clearance in the FSM too, or the coach keeps
     // suggesting "cleared to land ..." as the readback owed while the tower
     // is shouting go around (seen live, 2026-07-14). The sync is handed to
@@ -5126,6 +5585,68 @@ pub fn go_around_tick(
             crew: true,
         }
     })
+}
+
+/// A landing clearance withheld for traffic on the runway: armed by the reply
+/// to a final report ("continue approach, traffic on the runway"), released
+/// by [`landing_hold_tick`].
+pub struct LandingHold {
+    callsign: String,
+    /// Spoken, for the readback ("one three").
+    runway: String,
+    /// The END we land on ("13").
+    runway_ident: String,
+    /// The clearance as it will be spoken (the wind of the final report).
+    line: String,
+}
+
+/// One pass of the withheld-landing watch: once our strip is clear, or its
+/// occupant is moving off it in time ([`landing_release_due`]), the tower
+/// comes back unprompted with the landing clearance. The published clearance
+/// moves to ClearedToLand at once (the crew reads the readback owed); the
+/// station's FSM syncs before it answers the next call
+/// ([`Station::sync_landing_release`]). Landed, the hold is moot: dropped.
+/// The go-around order, when the traffic stays, is [`go_around_tick`]'s.
+pub fn landing_hold_tick(targets: &[TcasTarget], on_ground: bool, now: Instant) -> Option<String> {
+    let mut guard = LANDING_HOLD.lock().unwrap_or_else(|e| e.into_inner());
+    let hold = guard.as_ref()?;
+    if on_ground || out_of_reach() {
+        *guard = None;
+        return None;
+    }
+    let ours = {
+        let runways = ACTIVE_RUNWAYS.lock().unwrap_or_else(|e| e.into_inner());
+        strip(&runways, &hold.runway_ident).cloned()
+    };
+    let exits = strip_exits(targets, ours.as_ref(), &hold.runway_ident, now);
+    let own = ours
+        .as_ref()
+        .and_then(|r| own_time_to_threshold(r, &hold.runway_ident, now));
+    let plain: Vec<StripExit> = exits.iter().map(|e| e.1).collect();
+    if !landing_release_due(own.map(|o| o.1), &plain) {
+        return None;
+    }
+    let hold = guard.take()?;
+    let (own_nm, own_s) = own_json(own);
+    sim::blackbox::record(
+        "atc",
+        serde_json::json!({"event": "landing_released", "runway": hold.runway_ident,
+            "own_nm": own_nm, "own_s": own_s, "occupants": exits_json(&exits)}),
+    );
+    if let Some(c) = CLEARANCE.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+        c.state = tower::State::ClearedToLand;
+        c.holds_runway = true;
+        c.runway_ident = hold.runway_ident.clone();
+        c.pending_readback = Some(format!(
+            "Cleared to land runway {}, {}.",
+            hold.runway, hold.callsign
+        ));
+    }
+    *LANDING_HANDOFF.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    *PENDING_LANDING_RELEASE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = Some((hold.runway.clone(), hold.line.clone()));
+    Some(hold.line)
 }
 
 /// A takeoff clearance withheld for landing traffic — armed by the reply
@@ -8548,6 +9069,9 @@ mod tests {
     #[test]
     fn a_go_around_order_reaches_every_loop_that_flies_it() {
         let _guard = SIDE_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // No own fix: the judgement falls back to the order (unmeasured time).
+        OWN_FIXES.lock().unwrap().clear();
+        *STRIP_SEEN.lock().unwrap() = None;
         // LEMG 13/31, the recorded clearance: runway 31, cleared to land.
         *ACTIVE_RUNWAYS.lock().unwrap() = vec![nav::Runway {
             width_m: 45.0,
@@ -8606,6 +9130,9 @@ mod tests {
     #[test]
     fn go_around_ordered_when_a_ghost_takes_the_runway() {
         let _guard = SIDE_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // No own fix: the judgement falls back to the order (unmeasured time).
+        OWN_FIXES.lock().unwrap().clear();
+        *STRIP_SEEN.lock().unwrap() = None;
         *ACTIVE_RUNWAYS.lock().unwrap() = vec![nav::Runway {
             width_m: 0.0,
             surface: 0,
@@ -8739,6 +9266,342 @@ mod tests {
 
         *CLEARANCE.lock().unwrap() = None;
         *GO_AROUND_LAST.lock().unwrap() = None;
+        *ACTIVE_RUNWAYS.lock().unwrap() = Vec::new();
+    }
+
+    /// A point on LEMG runway 13's frame: `along` metres past the 13
+    /// threshold (negative = on the final), `cross` to the left.
+    fn lemg13_point(along: f64, cross: f64) -> (f64, f64) {
+        let r = &lemg_runways()[1];
+        let f = LandingFrame::new(r, "13").unwrap();
+        let x = along * f.u.0 - cross * f.u.1;
+        let y = along * f.u.1 + cross * f.u.0;
+        (f.lat0 + y / f.m_lat, f.lon0 + x / f.m_lon)
+    }
+
+    fn ghost_at(cs: &str, (lat, lon): (f64, f64)) -> TcasTarget {
+        TcasTarget {
+            callsign: cs.into(),
+            lat,
+            lon,
+            ele_ft: 50.0,
+            on_ground: true,
+            vs_fpm: 0.0,
+        }
+    }
+
+    /// How a runway occupant leaves, from its track: the question the
+    /// go-around order and the landing release both ask (LEMG 13).
+    #[test]
+    fn a_runway_occupant_is_judged_by_how_it_moves() {
+        let r = &lemg_runways()[1];
+        let at = |along: f64, cross: f64, t: f64| {
+            let (lat, lon) = lemg13_point(along, cross);
+            (lat, lon, t)
+        };
+        // Standing at the threshold we land on: a departure lined up, off
+        // one roll after it starts.
+        let lined = strip_exit(r, "13", &[at(60.0, 0.0, -2.0), at(60.0, 0.0, 0.0)]);
+        assert_eq!(lined, StripExit::LinedUp(37.5));
+        // First sight there: the same.
+        assert_eq!(
+            strip_exit(r, "13", &[at(60.0, 0.0, 0.0)]),
+            StripExit::LinedUp(37.5)
+        );
+        // Standing mid-runway: nobody can say when it goes.
+        assert_eq!(
+            strip_exit(r, "13", &[at(1600.0, 0.0, -2.0), at(1600.0, 0.0, 0.0)]),
+            StripExit::Stays
+        );
+        // Rolling our way and accelerating: a departure, off at its liftoff.
+        let roll = strip_exit(
+            r,
+            "13",
+            &[
+                at(100.0, 0.0, -2.0),
+                at(105.0, 0.0, -1.0),
+                at(112.0, 0.0, 0.0),
+            ],
+        );
+        match roll {
+            StripExit::Clearing(s) => assert!((30.0..36.0).contains(&s), "{s}"),
+            other => panic!("{other:?}"),
+        }
+        // Fast and slowing: the lander ahead rolling out, off at a turn-off.
+        let rollout = strip_exit(
+            r,
+            "13",
+            &[
+                at(900.0, 0.0, -2.0),
+                at(935.0, 0.0, -1.0),
+                at(965.0, 0.0, 0.0),
+            ],
+        );
+        assert_eq!(rollout, StripExit::Clearing(ROLLOUT_CLEAR_S));
+        // Backtracking toward us: stays.
+        assert_eq!(
+            strip_exit(r, "13", &[at(500.0, 0.0, -2.0), at(490.0, 0.0, 0.0)]),
+            StripExit::Stays
+        );
+        // Vacating to the side at 5 m/s from 10 m left of the centreline:
+        // off at the left edge (22.6 + 10 slack - 10) in about 4.5 s.
+        match strip_exit(r, "13", &[at(2000.0, 0.0, -2.0), at(2000.0, 10.0, 0.0)]) {
+            StripExit::Clearing(s) => assert!((4.0..5.0).contains(&s), "{s}"),
+            other => panic!("{other:?}"),
+        }
+        // The judgement: nothing is due outside a minute of the threshold.
+        assert!(!go_around_due(Some(81.0), &[StripExit::Stays]));
+        assert!(go_around_due(Some(55.0), &[StripExit::Stays]));
+        // A lined-up departure is given its roll until the roll no longer fits.
+        assert!(!go_around_due(Some(50.0), &[StripExit::LinedUp(37.5)]));
+        assert!(go_around_due(Some(45.0), &[StripExit::LinedUp(37.5)]));
+        // Unmeasured: the order, as before.
+        assert!(go_around_due(None, &[StripExit::LinedUp(37.5)]));
+        assert!(!go_around_due(Some(10.0), &[]));
+        // The release: clear, or everyone moving off in time; never a
+        // standing aircraft.
+        assert!(landing_release_due(Some(80.0), &[]));
+        assert!(landing_release_due(None, &[]));
+        assert!(landing_release_due(
+            Some(80.0),
+            &[StripExit::Clearing(34.0)]
+        ));
+        assert!(!landing_release_due(
+            Some(40.0),
+            &[StripExit::Clearing(34.0)]
+        ));
+        assert!(!landing_release_due(
+            Some(80.0),
+            &[StripExit::LinedUp(37.5)]
+        ));
+        assert!(!landing_release_due(None, &[StripExit::Clearing(5.0)]));
+    }
+
+    /// Issue #149, the recorded sequence: LEMG 13, sortie
+    /// 1790594471-full_auto (2026-09-28). The circuit reported final at
+    /// 3.8 nm and 722 ft (t 1790595127.0); the tower cleared it to land and,
+    /// 0.8 s later (t 1790595128.1), ordered the go-around for traffic on the
+    /// runway: the departure TO4611, which lifted off 13 at t 1790595209.2,
+    /// 81 s after the order, about as long again as we had to fly. The final
+    /// is continued, the order comes only when the traffic will still be
+    /// there when we arrive, and the clearance once the strip clears.
+    #[test]
+    fn lemg13_the_tower_continues_the_final_and_clears_it_when_the_runway_clears() {
+        let _guard = SIDE_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let reset = || {
+            *ACTIVE_RUNWAYS.lock().unwrap() = Vec::new();
+            *CLEARANCE.lock().unwrap() = None;
+            *LANDING_HOLD.lock().unwrap() = None;
+            *PENDING_LANDING_RELEASE.lock().unwrap() = None;
+            *PENDING_GO_AROUND.lock().unwrap() = false;
+            *GO_AROUND_LAST.lock().unwrap() = None;
+            *STRIP_SEEN.lock().unwrap() = None;
+            OWN_FIXES.lock().unwrap().clear();
+            *LANDING_HANDOFF.lock().unwrap() = None;
+        };
+        reset();
+        *ACTIVE_RUNWAYS.lock().unwrap() = lemg_runways();
+        let mut st = lxgb();
+        st.apt.name = "Malaga".into();
+        st.apt.elev_ft = 52.0;
+        st.apt.runways = lemg_runways();
+        st.runway_in_use = Some("13".into());
+        st.circuits = true;
+        st.twr.state = tower::State::Inbound;
+        let wx = Wx {
+            wind_from_deg: 130.0,
+            wind_kts: 5.0,
+        };
+        let cs = "November eight one six November November";
+        let mut ctx = st.make_ctx(
+            wx,
+            "QNH one zero one niner".into(),
+            cs.into(),
+            false,
+            false,
+            None,
+            true, // TO4611 on runway 13
+            None,
+        );
+        assert_eq!(ctx.runway, "one three");
+        // The crew's final report, as transmitted.
+        let r = st.route_keyed(
+            "november eight one six november november, final runway one three",
+            Service::Tower,
+            &ctx,
+            wx,
+        );
+        assert!(r.contains("continue approach runway one three"), "{r}");
+        assert!(!r.contains("cleared to land"), "{r}");
+        assert!(crate::party_line::landing_hold_armed());
+        assert_eq!(
+            crate::party_line::clearance_state(),
+            Some(tower::State::Inbound)
+        );
+        let base = Instant::now();
+        let at = |s: f64| base + std::time::Duration::from_secs_f64(s);
+        // Our recorded fixes: t 1790595122.3 and 1128.2 (base on the turn
+        // to final, 7.3 km from the threshold, 174 kt).
+        note_own_fix(36.7447615, -4.5512901, false, at(0.0));
+        note_own_fix(36.7408962, -4.5555152, false, at(5.9));
+        let own = own_time_to_threshold(&lemg_runways()[1], "13", at(5.9)).unwrap();
+        assert!((3.8..4.1).contains(&own.0), "{own:?}");
+        assert!((75.0..90.0).contains(&own.1), "{own:?}");
+        // TO4611 standing on the runway at the 13 end, two looks.
+        let to4611 = ghost_at("TO4611", lemg13_point(60.0, 0.0));
+        assert!(
+            go_around_tick(std::slice::from_ref(&to4611), 736.0, false, true, at(4.9)).is_none()
+        );
+        assert!(
+            go_around_tick(std::slice::from_ref(&to4611), 722.8, false, true, at(5.9)).is_none(),
+            "no order 80 s out: the recorded go-around at 3.8 nm is gone"
+        );
+        assert!(!*PENDING_GO_AROUND.lock().unwrap());
+        // Nor the clearance: a lined-up departure is not a clear runway.
+        assert!(landing_hold_tick(std::slice::from_ref(&to4611), false, at(5.9)).is_none());
+        assert!(crate::party_line::landing_hold_armed());
+
+        // Case A: it rolls in time. Brake release, then 5, 7 m/s and
+        // accelerating while we are 3 nm out at 150 kt.
+        let own_at = |d_m: f64, t: f64| {
+            let (lat, lon) = lemg13_point(-d_m, 0.0);
+            note_own_fix(lat, lon, false, at(t));
+        };
+        let mut released = None;
+        for (along, t) in [(60.0, 18.0), (60.0, 19.0), (60.0, 20.0), (66.0, 21.0)] {
+            own_at(3.0 * 1852.0 + (21.0 - t) * 77.0, t);
+            let g = ghost_at("TO4611", lemg13_point(along, 0.0));
+            assert!(go_around_tick(std::slice::from_ref(&g), 700.0, false, true, at(t)).is_none());
+            if let Some(line) = landing_hold_tick(std::slice::from_ref(&g), false, at(t)) {
+                released.get_or_insert((t, line));
+            }
+        }
+        let (t, line) = released.expect("cleared once the departure rolls and will be off in time");
+        assert_eq!(
+            t, 21.0,
+            "at the first look that sees it rolling, not while it stood"
+        );
+        assert_eq!(
+            line,
+            format!(
+                "{cs}, runway one three, wind one three zero degrees, five knots, cleared to land."
+            )
+        );
+        assert!(!crate::party_line::landing_hold_armed());
+        assert_eq!(
+            crate::party_line::clearance_state(),
+            Some(tower::State::ClearedToLand)
+        );
+        let owed = crate::party_line::readback_owed().expect("the readback is owed");
+        assert_eq!(owed, format!("Cleared to land runway one three, {cs}."));
+        // The crew reads it back: the tower knows it gave it.
+        ctx.runway_occupied = false;
+        let r = st.route_keyed(owed.trim_end_matches('.'), Service::Tower, &ctx, wx);
+        assert_eq!(r, "", "the readback is accepted");
+        assert_eq!(st.twr.state, tower::State::ClearedToLand);
+        assert_eq!(crate::party_line::readback_owed(), None);
+
+        // Case B: it never rolls. Cleared, a lined-up aircraft is given its
+        // roll until the roll no longer fits before we arrive; then the order.
+        *STRIP_SEEN.lock().unwrap() = None;
+        OWN_FIXES.lock().unwrap().clear();
+        let standing = ghost_at("TO4611", lemg13_point(60.0, 0.0));
+        own_at(2.6 * 1852.0 + 77.0, 40.0);
+        own_at(2.6 * 1852.0, 41.0);
+        assert!(
+            go_around_tick(
+                std::slice::from_ref(&standing),
+                650.0,
+                false,
+                true,
+                at(41.0)
+            )
+            .is_none(),
+            "2.6 nm, 62 s: sequencing, not a go-around"
+        );
+        own_at(2.0 * 1852.0 + 77.0, 48.0);
+        own_at(2.0 * 1852.0, 49.0);
+        assert!(
+            go_around_tick(
+                std::slice::from_ref(&standing),
+                600.0,
+                false,
+                true,
+                at(49.0)
+            )
+            .is_none(),
+            "2.0 nm, 48 s: a roll starting now still clears"
+        );
+        own_at(1.8 * 1852.0 + 77.0, 50.5);
+        own_at(1.8 * 1852.0, 51.5);
+        let call = go_around_tick(
+            std::slice::from_ref(&standing),
+            560.0,
+            false,
+            true,
+            at(51.5),
+        )
+        .expect("1.8 nm, 43 s, still standing: the order");
+        assert!(
+            call.line.contains("go around, traffic on the runway"),
+            "{}",
+            call.line
+        );
+        assert!(*PENDING_GO_AROUND.lock().unwrap());
+        reset();
+    }
+
+    /// A withheld landing is the go-around watch's too, and it retires with
+    /// the landing or a new answer.
+    #[test]
+    fn a_withheld_landing_is_ordered_around_or_retired() {
+        let _guard = SIDE_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        *ACTIVE_RUNWAYS.lock().unwrap() = lemg_runways();
+        *CLEARANCE.lock().unwrap() = Some(ClearanceSnap {
+            state: tower::State::Inbound,
+            callsign: "November eight one six November November".into(),
+            runway_ident: "13".into(),
+            pending_readback: None,
+            holds_runway: false,
+        });
+        *GO_AROUND_LAST.lock().unwrap() = None;
+        *PENDING_GO_AROUND.lock().unwrap() = false;
+        *STRIP_SEEN.lock().unwrap() = None;
+        OWN_FIXES.lock().unwrap().clear();
+        let hold = || LandingHold {
+            callsign: "November eight one six November November".into(),
+            runway: "one three".into(),
+            runway_ident: "13".into(),
+            line: "cleared to land.".into(),
+        };
+        *LANDING_HOLD.lock().unwrap() = Some(hold());
+        let base = Instant::now();
+        let at = |s: f64| base + std::time::Duration::from_secs_f64(s);
+        // A ghost standing mid-runway, us at a mile: the order, and the hold
+        // dies with it.
+        let squatter = ghost_at("EZY7038", lemg13_point(1600.0, 0.0));
+        let (lat, lon) = lemg13_point(-1852.0 - 77.0, 0.0);
+        note_own_fix(lat, lon, false, at(0.0));
+        let (lat, lon) = lemg13_point(-1852.0, 0.0);
+        note_own_fix(lat, lon, false, at(1.0));
+        assert!(
+            go_around_tick(std::slice::from_ref(&squatter), 400.0, false, true, at(1.0)).is_some()
+        );
+        assert!(!crate::party_line::landing_hold_armed());
+        // Landed with the hold standing: dropped, nothing said.
+        *LANDING_HOLD.lock().unwrap() = Some(hold());
+        assert!(landing_hold_tick(&[], true, at(2.0)).is_none());
+        assert!(!crate::party_line::landing_hold_armed());
+        // A new flight retires it.
+        *LANDING_HOLD.lock().unwrap() = Some(hold());
+        retire_for_new_flight();
+        assert!(!crate::party_line::landing_hold_armed());
+        NEW_FLIGHT_PENDING.store(false, std::sync::atomic::Ordering::SeqCst);
+        *CLEARANCE.lock().unwrap() = None;
+        *PENDING_GO_AROUND.lock().unwrap() = false;
+        *GO_AROUND_LAST.lock().unwrap() = None;
+        *STRIP_SEEN.lock().unwrap() = None;
+        OWN_FIXES.lock().unwrap().clear();
         *ACTIVE_RUNWAYS.lock().unwrap() = Vec::new();
     }
 
