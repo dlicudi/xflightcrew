@@ -633,6 +633,11 @@ everything blackboxes to `logs/blackbox.jsonl` (kinds: `atc`, `autotaxi`, `autot
   since an engaged servo writes the yoke back over `xcopilot/pitch`: `servos_off_any`, the track on
   `xcopilot/roll` (`WingsLevel`). **The AP comes out at the wheels** (`disconnect_autopilot`): a
   heading servo on the ground winds the yoke over.
+- **A model flare holds its column in rough air** (`FlareModel::step` `rough`, `FinalAir`,
+  `ROUGH_AIR_FPM`): past 40 fpm rms of stray on the final, only a measured climb eases the pull; in
+  smooth air the prediction flies it and a near-level float never takes it forward. A gust and a
+  strong elevator look alike for the seconds that matter (LEMG 13 2026-09-28: 422 fpm in gusts; a
+  still-air hold through the 09-26 17:25 plant ballooned to 506).
 - **In the flare the column only comes BACK** (`FlarePitch::step` `ratchet`, `FLARE_PITCH_MAX`):
   forward column a few feet up is a nosewheel landing. A BALLOON eases toward neutral, never a push
   (`hold_flare`; above the band `balloon`). Gains per airframe (`flare_elevator:`,
