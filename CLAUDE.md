@@ -450,7 +450,10 @@ everything blackboxes to `logs/blackbox.jsonl` (kinds: `atc`, `autotaxi`, `autot
   climb is never worth more than the airspeed left). Throttle laws watch a speed PROJECTION.
 - Base descends the PATH; final uses along-track `path_dist_m`, never track-miles; a REAL intercept
   (`final_intercept_hdg`) on the turn actually flown (`final_turn_radius_m`, `AP_BANK_FINAL_DEG`);
-  `ready_for_autoland` needs ESTABLISHED (`ESTABLISHED_XTK_M`). The glidepath feeds forward
+  `ready_for_autoland` needs ESTABLISHED (`ESTABLISHED_XTK_M`), and on a runway of known width ON
+  THE LINE (within landing limits, tracking within `ON_LINE_TRACK_DEG`, autoland's own residual at the
+  threshold inside the landing limit). **The turn onto final is sized on the bank the autopilot
+  flew** (`BankWatch`, `final_capture_on_bank`; the 737 banks 25, not the Baron's 15.5). The glidepath feeds forward
   `path_descent_fpm` (a P controller cannot track a ramp).
 - **The sim's heading mode never reverses a turn in progress** (a bug outside a bank goes the long
   way): every steer goes through `circuit::bug_toward` (on the nose until wings level), leading from
@@ -578,8 +581,11 @@ everything blackboxes to `logs/blackbox.jsonl` (kinds: `atc`, `autotaxi`, `autot
 - **A straight-in is only as good as its fixes** (`RECON_ALIGN_DEG`; `approach_plan_for` refuses a
   FAF autoland cannot intercept, `faf_off_course`, `interceptable`). Clean speed
   (`power_hold_target`); gear and flaps wait for their limits (`gear_may_extend`,
-  `flap_within_limits`); no taxi-in after `has_crashed`. Below the floor a final must be
-  interceptable (`stabilised_xtk`) or it balks with height in hand.
+  `flap_within_limits`); no taxi-in after `has_crashed`. **A final is judged against the
+  pavement it lands on** (`runway_width_m`, `guidance_on`, `landing_xtk_limit_m`,
+  `flare_xtk_limit_m`): below the floor it must be interceptable AND its pursuit must leave the
+  offset inside the landing limit at the threshold (`lands_on_the_pavement`), or it balks with height
+  in hand, ordered even on the first tick (LEMG 13 45 m, 36.7 m right at the wheels, 2026-09-28).
 - **A CF leg is flown on its course** (`course_leg::course_track`: a 30 degree intercept rolled out
   at the fly-by lead), never homed on; **an IF behind us is joined by autoland's pattern** against
   the FAF's course until the intercept fits 2 nm out (`FinalJoin`; EGKK 26L 2026-09-27).
@@ -620,7 +626,8 @@ everything blackboxes to `logs/blackbox.jsonl` (kinds: `atc`, `autotaxi`, `autot
   else its capture ignores the VS dial; the glidepath aims at the pavement (`aim_elevation_ft`,
   `threshold_elev`), not the apt.dat header.
 - **The crab is LOW-PASSED** (`CrabFilter`, `CRAB_TAU_S`; `crab`, `crab_raw`) and cancels wind only;
-  a bias is `TrackTrim`'s. Each balk names its gate (`Guidance.balk`; ticks carry `trim`, `xtk_m`).
+  a bias is `TrackTrim`'s, **learnt only from a settled track** (the trim inside 3 degrees,
+  the short final wings level and bounded: `TRACK_TRIM_ERR_CAP_DEG`, `SHORT_FINAL_LEARN_*`). Each balk names its gate (`Guidance.balk`; ticks carry `trim`, `xtk_m`).
   **A tower's go-around order outranks everything, and reaches whoever flies the final**: each loop
   watches it (`party_line::GoAroundOrders`, never the main loop's `take_pending_go_around`); autoland
   latches it (`GoAroundLatch::order`), the circuit flies it from Base or Final

@@ -9619,3 +9619,22 @@ and 292, but in still air through the 09-26 17:25 plant (6,429) it ballooned fou
 the column (only a climb eases it); smooth air keeps the prediction plus a float hold (inside 150 fpm,
 never forward). Ticks `rough_air`, `flare_ask`; `arrest_hands` `air_rms`, `rough`. Open: the
 roundout's 0.45 kick on a deep gusty gate; 89541 never pulled the sink inside 285. Offline only.
+
+## 2026-09-28: a final is judged against its pavement; the circuit turns on the bank it flies (issue #147)
+
+Sortie 1790591256 (LEMG 13 runner circuit): the 737 touched down 36.7 m right of the centreline on a
+22.5 m half-width, by state lat/lon against apt.dat (the logged xtk was true within a tick; the sign
+flip was a real S-turn). The circuit armed a 3,250 m capture (1.3 x the 2,500 m clamp, a Baron's 15.5
+degree bank) while the 737 banked 23 to 27: the turn onto final began 3.1 km out and rolled onto the
+30 degree intercept 1.3 km short, and the 300 m / 12 degree gate let go at 1.9 nm, 111 m left and
+closing at 12 degrees. Autoland's track trim learned -0.57 and its crab filter -3.1 from that
+roll-out, and the final sat 30 to 50 m left from 500 ft; `interceptable` and the 37 m gates (14.5 m
+off a 45 m strip) never fired. At 0.29 nm the short final's 2 s learner took the autopilot's lag for
+a bias (bug 8 right, 16 degrees of bank at 90 ft). LEMG 31 (1790584715) parked 30 to 32 m right on
++0.78 of trim; 1790590663 banked 11 degrees on the same windup. Fixes: width-aware pavement gates
+(`landing_xtk_limit_m` half-width less 7.5 m, `flare_xtk_limit_m` less 4 m) and the first-tick
+go-around order; trim cap 3; a short-final learner only wings level; a measured-bank capture; an
+on-the-line handoff. Replays: as flown the handoff is ~100 m off and goes around; fixed, it hands over
+35 m off at 2.25 nm and reaches the gate 3 m off. Expect more go-arounds where a final is not on the
+line. Next sortie: `circuit final_turn` capture ~2,200, `handoff_autoland` |xtk| <= 45 and residual
+<= limit, `threshold_elev` width_m 45.11, xtk within 15 m below 500 ft. Offline only.
