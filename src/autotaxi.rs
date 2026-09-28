@@ -406,6 +406,109 @@ pub fn halt() {
     LAST_ARRIVED.store(false, Ordering::Relaxed);
 }
 
+/// A drive is judged STALLED by its progress along the route, never by a
+/// flat clock. Full auto waited 600 s for every taxi, and at LEMG (sorties
+/// 1790605551 and 1790618416, 2026-09-28) the SR22's 4,661 m and 4,791 m
+/// routes from the ramp to Hotel Echo one were given up as "taxi_stalled"
+/// at exactly 600 s, still rolling at 4 to 9 kt with 1,998 m and 2,104 m to
+/// go: 4.7 km at the 10 kt pace is 906 s of straight taxiway alone. The
+/// drive's own guards stand a real stall down (stagnant 30 s, off route, a
+/// tug that never lets go at 180 s); this is the backstop behind them: no
+/// [`PROGRESS_STEP_M`] gained along the route for this long while the sim
+/// is live, no tug holds it and nobody said "stop". The longest those two
+/// taxis went without 20 m was the turn-round join, 37.8 s.
+pub const DRIVE_NO_PROGRESS_S: f64 = 120.0;
+/// What counts as ground gained along the route, m.
+pub const PROGRESS_STEP_M: f64 = 20.0;
+/// The route's own deadline: the whole length at half the pace, plus two
+/// minutes, with every excused hold added on. 4,661 m at 10 kt: 1,932 s.
+pub fn route_deadline_s(total_m: f64, base_kts: f64) -> f64 {
+    total_m.max(0.0) / (0.5 * base_kts.max(2.0) / MS_TO_KTS) + 120.0
+}
+
+/// The progress watch, pure: `note` each fix's along-route progress with
+/// a monotonic time; `hold` while a pause, a tug or a spoken stop excuses
+/// standing still.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct ProgressWatch {
+    /// (best progress m, when it last advanced a step).
+    best: Option<(f64, f64)>,
+    /// When the route's deadline falls, and the last time seen.
+    deadline: Option<f64>,
+    last_t: Option<f64>,
+}
+
+impl ProgressWatch {
+    /// A drive starting at `t_s` with this much time to finish.
+    pub fn start(t_s: f64, deadline_s: f64) -> Self {
+        ProgressWatch {
+            best: Some((f64::NEG_INFINITY, t_s)),
+            deadline: Some(t_s + deadline_s),
+            last_t: Some(t_s),
+        }
+    }
+    pub fn note(&mut self, progress_m: f64, t_s: f64) {
+        self.last_t = Some(t_s);
+        match self.best {
+            Some((b, _)) if progress_m < b + PROGRESS_STEP_M => {}
+            _ => self.best = Some((progress_m, t_s)),
+        }
+    }
+    /// Standing still for a reason that is not a stall: the clock restarts
+    /// and the deadline moves on by the time held.
+    pub fn hold(&mut self, t_s: f64) {
+        if let (Some(d), Some(l)) = (self.deadline.as_mut(), self.last_t) {
+            *d += (t_s - l).max(0.0);
+        }
+        self.last_t = Some(t_s);
+        if let Some((_, t)) = self.best.as_mut() {
+            *t = t_s;
+        }
+    }
+    /// Seconds since the route last gave up a step, 0 before the first fix.
+    pub fn stalled_s(&self, t_s: f64) -> f64 {
+        self.best.map_or(0.0, |(_, t)| (t_s - t).max(0.0))
+    }
+    /// No step for [`DRIVE_NO_PROGRESS_S`], or past the route's deadline.
+    pub fn stuck(&self, t_s: f64) -> bool {
+        self.stalled_s(t_s) > DRIVE_NO_PROGRESS_S || self.deadline.is_some_and(|d| t_s > d)
+    }
+}
+
+/// The running drive's watch, restarted by every [`start`]; its clock is
+/// seconds since [`EPOCH`].
+static PROGRESS: std::sync::Mutex<ProgressWatch> = std::sync::Mutex::new(ProgressWatch {
+    best: None,
+    deadline: None,
+    last_t: None,
+});
+static EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+
+fn clock_s() -> f64 {
+    EPOCH.get_or_init(std::time::Instant::now).elapsed().as_secs_f64()
+}
+
+fn progress_note(progress_m: f64) {
+    if let Ok(mut w) = PROGRESS.lock() {
+        w.note(progress_m, clock_s());
+    }
+}
+
+fn progress_hold() {
+    if let Ok(mut w) = PROGRESS.lock() {
+        w.hold(clock_s());
+    }
+}
+
+/// A drive is running and is stuck by [`ProgressWatch::stuck`]: what a
+/// caller waiting for the drive gives up on.
+pub fn drive_stalled() -> bool {
+    driving() && PROGRESS.lock().is_ok_and(|w| w.stuck(clock_s()))
+}
+
+/// The backstop behind [`drive_stalled`] for a caller's own wait, s.
+pub const DRIVE_CEILING_S: f64 = 7200.0;
+
 /// One-line status for the dashboard's "managing" panel.
 /// The taxi's live line for the panel: metres left to the stop point,
 /// rounded to ten so the feed is not re-sent every tick.
@@ -1579,18 +1682,71 @@ pub fn lookahead_m_with(gs_kts: f64, aim_s: f64) -> f64 {
 /// GENTLE bend is where that bites: the Evolution's 9 s aim at 12 kt is 55 m,
 /// and a 107 m radius bend at LIME put it 8.5 m inside the line with the
 /// steering near zero, 13 m on another (2026-09-25). The aim is capped so the
-/// geometric cut stays under [`BEND_MAX_CUT_M`]; never under the ordinary
-/// 16 m minimum, so sharp corners and straights are exactly as they were.
+/// geometric cut stays under [`BEND_MAX_CUT_M`]; never under the corner
+/// floor ([`corner_aim_floor_m`]: 16 m, a free castoring nose's 12 m), and
+/// straights are exactly as they were.
+/// Test-only since the live loop takes the floor per nose
+/// ([`steer_look_m`]); the tests pin the 16 m baseline.
+#[cfg(test)]
 pub fn bend_lookahead_cap_m(gs_kts: f64, turn_dps: f64) -> f64 {
+    bend_lookahead_cap_floor_m(gs_kts, turn_dps, BEND_AIM_FLOOR_M)
+}
+
+/// [`bend_lookahead_cap_m`] with the corner's own floor: see
+/// [`corner_aim_floor_m`].
+pub fn bend_lookahead_cap_floor_m(gs_kts: f64, turn_dps: f64, floor_m: f64) -> f64 {
     let v = gs_kts * 0.514_444;
     if v < 0.5 || turn_dps.abs() < 0.2 {
         return f64::INFINITY;
     }
     let radius_m = v / turn_dps.abs().to_radians();
-    (2.0 * radius_m * BEND_MAX_CUT_M).sqrt().max(16.0)
+    (2.0 * radius_m * BEND_MAX_CUT_M).sqrt().max(floor_m)
 }
 /// The most a gentle bend may be cut, m.
 pub const BEND_MAX_CUT_M: f64 = 1.5;
+/// The shortest aim a corner is flown on: a shorter one asks for a turn
+/// tighter than a nosewheel's lock can fly, and the aircraft runs wide.
+pub const BEND_AIM_FLOOR_M: f64 = 16.0;
+/// The shortest aim a castoring nose with no steering of its own
+/// (`aircraft::nose_free`) flies a corner on. It turns on a braked wheel,
+/// with no lock to run out of: the SR22 turned LEMG's ramp corners at 14
+/// deg/s at 3 kt, a 6.5 m radius, and still ran 4.2 to 5.3 m INSIDE them
+/// (sorties 1790605551 and 1790618416, 2026-09-28), because the 16 m aim
+/// reached round the vertex and the pursuit flew the chord. Pure pursuit
+/// cuts a 90 degree vertex by about a fifth of its aim, whatever flies it.
+pub const FREE_NOSE_AIM_FLOOR_M: f64 = 12.0;
+
+/// The corner aim floor for this nose. Pure.
+pub fn corner_aim_floor_m(free_nose: bool) -> f64 {
+    if free_nose {
+        FREE_NOSE_AIM_FLOOR_M
+    } else {
+        BEND_AIM_FLOOR_M
+    }
+}
+
+/// The pure-pursuit aim for one tick, metres: the airframe's aim time,
+/// capped in a bend ([`bend_lookahead_cap_floor_m`] over
+/// [`BEND_PROBE_M`]) and by what is left of the route. `turn_probe_dps` is
+/// `Route::route_turn_rate_dps(progress, BEND_PROBE_M, gs_kts)`.
+///
+/// The route cap: near the stop the pursuit point must walk the path
+/// through the final corner, not chord across it. The 16 m minimum aim
+/// against a corner ~20 m before the hold parked the aircraft off the paint,
+/// and stop_straighten then froze the leftover angle (LXGB Echo,
+/// 2026-07-24, twice). Only bites close-in, where the stop ramp has already
+/// slowed us below weave speeds.
+pub fn steer_look_m(
+    pace: &Pace,
+    gs_kts: f64,
+    turn_probe_dps: f64,
+    remaining_m: f64,
+    free_nose: bool,
+) -> f64 {
+    lookahead_m_with(gs_kts, pace.lookahead_s)
+        .min(bend_lookahead_cap_floor_m(gs_kts, turn_probe_dps, corner_aim_floor_m(free_nose)))
+        .min((remaining_m * 0.6).max(6.0))
+}
 /// The route span the bend's curvature is read over, m.
 pub const BEND_PROBE_M: f64 = 25.0;
 
@@ -1678,6 +1834,9 @@ pub fn start(base_url: String, voice: Option<Voice>, route: Route, base_kts: f64
     let gen = DRIVE_GEN.fetch_add(1, Ordering::SeqCst) + 1;
     LAST_ARRIVED.store(false, Ordering::Relaxed);
     RELOCATED.store(false, Ordering::Relaxed);
+    if let Ok(mut w) = PROGRESS.lock() {
+        *w = ProgressWatch::start(clock_s(), route_deadline_s(route.total, base_kts));
+    }
     std::thread::spawn(move || {
         let Ok(rt) = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -1950,6 +2109,7 @@ async fn drive(xp: XPlaneClient, voice: Option<Voice>, route: Route, base_kts: f
         // pedals are the pilot's until the sim is live again.
         if crate::xplane::sim_frozen(&xp).await {
             stalled_since = None; // a pause is not a stall
+            progress_hold();
             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
             continue;
         }
@@ -2000,6 +2160,7 @@ async fn drive(xp: XPlaneClient, voice: Option<Voice>, route: Route, base_kts: f
             // No steer heartbeat: the nosewheel is the tug's, and the
             // channel expires on its own. Nothing here is a stall.
             stalled_since = None;
+            progress_hold();
             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
             continue;
         } else if tug_held {
@@ -2075,6 +2236,12 @@ async fn drive(xp: XPlaneClient, voice: Option<Voice>, route: Route, base_kts: f
         };
         let lateral = offset.abs();
         let remaining = route.remaining(progress);
+        progress_note(progress);
+        if ext_stopped {
+            // Held by a spoken "stop" (or both pedals): a stop somebody
+            // asked for is not a stall.
+            progress_hold();
+        }
         DETAIL.set(format!(
             "{} m to go",
             (remaining.max(0.0) / 10.0).round() as i64 * 10
@@ -2091,16 +2258,15 @@ async fn drive(xp: XPlaneClient, voice: Option<Voice>, route: Route, base_kts: f
             }
         }
         // Steering error first: the join state and the guard both need it.
-        // The aim is capped by what's LEFT of the route: near the stop the
-        // pursuit point must walk the path through the final corner, not
-        // chord across it — the 16 m minimum aim against a corner ~20 m
-        // before the hold parked the aircraft off the paint, and
-        // stop_straighten then froze the leftover angle (LXGB Echo,
-        // 2026-07-24, twice). Only bites close-in, where the stop ramp has
-        // already slowed us below weave speeds.
-        let look = lookahead_m_with(gs_kts, route.pace.lookahead_s)
-            .min(bend_lookahead_cap_m(gs_kts, route.route_turn_rate_dps(progress, BEND_PROBE_M, gs_kts)))
-            .min((remaining * 0.6).max(6.0));
+        // The aim: the airframe's, capped in a bend and near the stop
+        // (see [`steer_look_m`]).
+        let look = steer_look_m(
+            &route.pace,
+            gs_kts,
+            route.route_turn_rate_dps(progress, BEND_PROBE_M, gs_kts),
+            remaining,
+            crate::aircraft::nose_free(),
+        );
         // Inside the stop zone, fly the route's FINAL BEARING instead of
         // pursuing an aim point that has stopped moving. See
         // `final_bearing_deg`: past the end the pursuit error runs to 160°+
@@ -2370,7 +2536,7 @@ async fn drive(xp: XPlaneClient, voice: Option<Voice>, route: Route, base_kts: f
                 // damps, and the pair is how a wide corner gets told apart
                 // from a swing in the trace.
                 "event": "drive", "gs": gs_kts, "err": err, "yaw_dps": yaw_rate,
-                "turn_dps": route_turn_dps,
+                "turn_dps": route_turn_dps, "look_m": look,
                 "steer": steer, "lat_m": offset, "remaining_m": remaining, "trim": trim,
                 "bs": bs_on, "bl": bl, "br": br, "tug": tug_on,
                 // "plugin": one frame's position; "split": separate reads (#157).
@@ -4276,5 +4442,286 @@ mod tests {
         assert!(!super::pivot_due(63.0, 9.0, false), "a taxi corner at pace keeps the taxi split");
         assert!(!super::pivot_due(30.0, 3.0, false));
         assert!(super::pivot_due(-70.0, 9.0, true), "a join as before");
+    }
+
+    /// The SR22's brake-steer yaw plant, fitted over both LEMG taxis (sorties
+    /// 1790605551 and 1790618416, 2026-09-28; output error over 5 s windows,
+    /// 1.7 deg/s rms): yaw follows the differential brake (right minus left)
+    /// through a 0.45 s transport delay and a 2.17 s lag, at
+    /// 299 - 35.8 v deg/s per unit of brake (v in m/s: a braked wheel swings
+    /// a slow aircraft harder), with a 1.7 deg/s pull to the left. The
+    /// rudder half of the steer adds nothing measurable at taxi speed.
+    struct Sr22Plant {
+        r: f64,
+        /// (time, brake difference, groundspeed m/s) commanded.
+        sent: std::collections::VecDeque<(f64, f64, f64)>,
+    }
+
+    impl Sr22Plant {
+        const DELAY_S: f64 = 0.45;
+        const TAU_S: f64 = 2.17;
+        const PULL_DPS: f64 = -1.7;
+        fn gain(v_ms: f64) -> f64 {
+            (299.0 - 35.8 * v_ms).max(10.0)
+        }
+        fn new(r: f64) -> Self {
+            Sr22Plant { r, sent: std::collections::VecDeque::new() }
+        }
+        /// Command at `t`, then advance `dt`: the yaw rate, deg/s.
+        fn step(&mut self, t: f64, brake_diff: f64, v_ms: f64, dt: f64) -> f64 {
+            self.sent.push_back((t, brake_diff, v_ms));
+            // Sample and hold: the newest command at least DELAY_S old.
+            while self.sent.len() > 1 && self.sent[1].0 <= t - Self::DELAY_S + 1e-9 {
+                self.sent.pop_front();
+            }
+            let (t0, b, v) = self.sent[0];
+            let (b, v) = if t0 <= t - Self::DELAY_S + 1e-9 { (b, v) } else { (0.0, v_ms) };
+            let pull = if v_ms > 0.5 { Self::PULL_DPS } else { 0.0 };
+            let want = b * Self::gain(v) + pull;
+            self.r += (want - self.r) * (dt / Self::TAU_S).min(1.0);
+            self.r
+        }
+    }
+
+    /// The recorded corner (sortie 1790605551, t +434.1 to +448.0 s from the
+    /// drive's engage): (s, gs kt, right minus left brake, logged yaw_dps).
+    const LEMG_CORNER: &[(f64, f64, f64, f64)] = &[
+        (434.1, 6.64, 0.042, -4.38), (434.3, 6.54, 0.044, -3.74), (434.5, 6.43, 0.045, -3.00), (434.7, 6.33, 0.044, -2.15),
+        (434.9, 6.20, 0.044, -1.50), (435.1, 6.09, 0.045, -0.83), (435.3, 6.01, 0.044, -0.17), (435.5, 5.85, 0.047, 0.45),
+        (435.7, 5.74, 0.051, 1.04), (435.9, 5.62, 0.056, 1.76), (436.1, 5.50, 0.062, 2.06), (436.3, 5.36, 0.068, 2.73),
+        (436.5, 5.20, 0.075, 3.41), (436.6, 5.03, 0.082, 4.16), (436.8, 4.85, 0.092, 5.34), (437.0, 4.66, 0.103, 6.06),
+        (437.2, 4.38, 0.111, 6.94), (437.4, 4.15, 0.119, 8.10), (437.6, 3.90, 0.120, 9.32), (437.9, 3.61, 0.106, 10.67),
+        (438.1, 3.41, 0.088, 12.02), (438.3, 3.26, 0.064, 13.18), (438.5, 3.15, 0.039, 13.94), (438.7, 3.12, 0.021, 14.36),
+        (438.9, 3.13, 0.007, 14.34), (439.1, 3.19, 0.000, 13.99), (439.3, 3.26, 0.000, 13.38), (439.5, 3.35, 0.000, 12.67),
+        (439.7, 3.47, 0.000, 11.83), (439.9, 3.58, 0.000, 10.90), (440.1, 3.68, 0.000, 9.95), (440.4, 3.87, 0.000, 8.99),
+        (440.6, 4.00, 0.000, 7.60), (440.8, 4.15, 0.000, 6.90), (441.0, 4.33, 0.000, 6.45), (441.2, 4.50, 0.000, 5.09),
+        (441.4, 4.65, 0.017, 4.29), (441.6, 4.76, 0.067, 3.47), (441.8, 4.88, 0.099, 2.96), (442.0, 4.87, 0.130, 3.06),
+        (442.2, 4.78, 0.136, 3.80), (442.4, 4.69, 0.128, 5.04), (442.6, 4.62, 0.111, 6.30), (442.9, 4.59, 0.080, 7.56),
+        (443.1, 4.61, 0.053, 8.55), (443.3, 4.69, 0.027, 9.02), (443.5, 4.87, 0.000, 9.09), (443.7, 5.07, 0.000, 8.57),
+        (443.9, 5.28, 0.000, 7.73), (444.1, 5.49, 0.000, 6.69), (444.3, 5.71, 0.000, 5.70), (444.5, 5.93, 0.000, 4.70),
+        (444.7, 6.19, 0.000, 3.69), (444.9, 6.40, 0.013, 2.64), (445.1, 6.57, 0.031, 1.78), (445.4, 6.75, 0.052, 1.20),
+        (445.6, 6.85, 0.071, 0.87), (445.7, 6.90, 0.097, 0.88), (446.0, 6.89, 0.122, 1.35), (446.2, 6.86, 0.125, 2.48),
+        (446.4, 6.73, 0.132, 3.38), (446.6, 6.65, 0.136, 4.03), (446.8, 6.53, 0.135, 5.30), (446.9, 6.41, 0.117, 7.35),
+        (447.1, 6.34, 0.084, 8.14), (447.3, 6.30, 0.056, 8.07), (447.5, 6.33, 0.017, 9.29), (447.8, 6.44, 0.000, 8.34),
+        (448.0, 6.57, 0.000, 7.78),
+    ];
+
+    /// The recorded brakes through the plant, with the loop's own yaw filter
+    /// (an even EMA of the tick's rate), come back as the recorded yaw: the
+    /// plant the corner test flies is the aircraft. A plant without the lag
+    /// swings nearly twice as hard.
+    #[test]
+    fn the_sr22_brake_plant_replays_the_recorded_corner() {
+        let replay = |tau: f64| -> (f64, f64) {
+            let mut p = Sr22Plant::new(LEMG_CORNER[0].3);
+            let (mut ema, mut se, mut peak) = (LEMG_CORNER[0].3, 0.0_f64, 0.0_f64);
+            for w in LEMG_CORNER.windows(2) {
+                let ((t, gs, b, _), (t1, _, _, logged)) = (w[0], w[1]);
+                let dt = t1 - t;
+                p.sent.push_back((t, b, gs * 0.514_444));
+                while p.sent.len() > 1 && p.sent[1].0 <= t - Sr22Plant::DELAY_S + 1e-9 {
+                    p.sent.pop_front();
+                }
+                let (_, bd, v) = p.sent[0];
+                let want = bd * Sr22Plant::gain(v) + Sr22Plant::PULL_DPS;
+                p.r += (want - p.r) * (dt / tau).min(1.0);
+                ema = 0.5 * ema + 0.5 * p.r;
+                se += (ema - logged).powi(2);
+                peak = peak.max(ema);
+            }
+            ((se / (LEMG_CORNER.len() - 1) as f64).sqrt(), peak)
+        };
+        let (rms, peak) = replay(Sr22Plant::TAU_S);
+        assert!(rms < 3.0, "the plant tracks the recorded yaw: {rms:.2} deg/s rms");
+        assert!((peak - 14.36).abs() < 2.0, "and its peak: {peak:.1} vs 14.4 deg/s");
+        let (fast, fast_peak) = replay(0.3);
+        assert!(fast > 2.5 * rms && fast_peak > 20.0, "no lag is not this aircraft: {fast:.1} rms, {fast_peak:.1} peak");
+    }
+
+    /// One drive tick of the law, as `drive` runs it, through the SR22 plant.
+    /// Returns the scorer's own verdict on the line: (max cut inside a
+    /// vertex, max off the line), from [`crate::scorecard::LineJudge`].
+    fn fly_sr22_corner(path_m: &[(f64, f64)], start: (f64, f64), aim_floor_free: bool) -> (f64, f64) {
+        use crate::scorecard::{LineJudge, CORNER_TURN_DPS};
+        let pace = Pace::from_profile(crate::aircraft::load("cirrus_sr22").expect("sr22").taxi.as_ref());
+        assert!(pace.brake_steer);
+        let watch = TaxiWatch {
+            path: path_m.iter().map(|&(x, y)| ll(x, y)).collect(),
+            via: String::new(),
+            seg: vec![(String::new(), false); path_m.len() - 1],
+            holding_point: String::new(),
+            lead_on: Vec::new(),
+        };
+        let route = Route::build(&watch).expect("route");
+        let dt = 0.2;
+        let (mut x, mut y) = start;
+        let mut psi = taxi_guide::bearing(path_m[0], path_m[1]);
+        let mut v = 10.0 / MS_TO_KTS;
+        let mut plant = Sr22Plant::new(0.0);
+        let (mut yaw, mut prev_psi, mut prev_steer, mut bs, mut bs_prev) = (0.0_f64, psi, 0.0_f64, 0.0_f64, (0.0_f64, 0.0_f64));
+        let mut trim = StraightTrim::default();
+        let mut turn_dir = None;
+        let mut judge = LineJudge::default();
+        let end_m = route.total_m() - 100.0;
+        for i in 0..3000 {
+            let t = i as f64 * dt;
+            let gs = v * MS_TO_KTS;
+            let (lat, lon) = ll(x, y);
+            let (progress, offset) = route.fix_signed(lat, lon).expect("a fix");
+            if progress > end_m {
+                break;
+            }
+            let remaining = route.remaining(progress);
+            // The floor under test; the brakes are the free nose's either way.
+            let look = lookahead_m_with(gs, pace.lookahead_s)
+                .min(bend_lookahead_cap_floor_m(
+                    gs,
+                    route.route_turn_rate_dps(progress, BEND_PROBE_M, gs),
+                    corner_aim_floor_m(aim_floor_free),
+                ))
+                .min((remaining * 0.6).max(6.0));
+            let err = committed_err(route.heading_err_deg(lat, lon, psi, progress, look), &mut turn_dir);
+            let route_turn = route.route_turn_rate_dps(progress, look, gs);
+            let raw = taxi_guide::angle_diff(psi, prev_psi) / dt;
+            prev_psi = psi;
+            yaw = yaw * 0.5 + raw.clamp(-90.0, 90.0) * 0.5;
+            let tr = trim.step(offset, route_turn, gs, false, remaining, dt);
+            let want = stop_straighten(
+                (steer_cmd_with(damped_err_deg(err, yaw, route_turn, pace.steer_lead_s), pace.steer_full_deg) + tr)
+                    .clamp(-1.0, 1.0)
+                    * steer_authority(gs),
+                remaining,
+                gs,
+            );
+            let steer = slew_steer(prev_steer, want, pace.steer_slew_per_s, dt);
+            prev_steer = steer;
+            bs = smooth_toward(bs, steer, BRAKE_STEER_TAU_S, dt);
+            let pivot = pivot_due(err, gs, false);
+            let (wl, wr) = if pivot { pivot_brake_split(steer, gs) } else { brake_steer_split_band(bs, gs, true) };
+            let k = pivot_rate_scale(if pivot { steer } else { bs }, yaw);
+            let bl = slew_steer(bs_prev.0, wl * k, Some(BRAKE_STEER_SLEW_PER_S), dt);
+            let br = slew_steer(bs_prev.1, wr * k, Some(BRAKE_STEER_SLEW_PER_S), dt);
+            bs_prev = (bl, br);
+            // What the blackbox would log, judged as the scorer judges it.
+            let asked = (route_turn.abs() >= CORNER_TURN_DPS).then(|| route_turn.signum());
+            let cutting = judge.corner(t, gs, offset, Some(remaining), asked, yaw);
+            judge.judge(offset, cutting);
+            // The governor holds the schedule at the SR22's measured pace.
+            let sched = schedule_kts(pace.straight, &route, progress, gs).min(pace.track_cap_kts(offset.abs(), err));
+            v = (v + (sched / MS_TO_KTS - v).clamp(-0.7 * dt, 0.5 * dt)).max(0.0);
+            let r = plant.step(t, br - bl, v, dt);
+            psi = (psi + r * dt).rem_euclid(360.0);
+            x += v * psi.to_radians().sin() * dt;
+            y += v * psi.to_radians().cos() * dt;
+        }
+        judge.flush();
+        (judge.max_cut, judge.max_lat)
+    }
+
+    /// LEMG, the SR22 from the ramp (sorties 1790605551 and 1790618416,
+    /// 2026-09-28): 4.2 to 5.3 m inside the corners, 5.3 m at the worst,
+    /// over the scorer's 5 m. The ramp corner at +436 s: 311 degrees, round
+    /// through about 90 at one vertex and 20 more at the next, 6 m on. The
+    /// 16 m aim reaches round the vertex, the nose comes round early at 14
+    /// deg/s, the rate lead takes it off and the aircraft rolls the chord
+    /// across the inside. Flown through the fitted plant: the free nose's
+    /// shorter corner aim keeps it inside the lateral limit, and the swing
+    /// out of the corner stays inside it too.
+    #[test]
+    fn a_castoring_nose_turns_the_lemg_ramp_corner_on_the_line() {
+        let th1 = 90.0_f64.to_radians();
+        let th2 = 110.0_f64.to_radians();
+        let b = (6.0 * th1.sin(), 6.0 * th1.cos());
+        let path = [(0.0, -250.0), (0.0, 0.0), b, (b.0 + 250.0 * th2.sin(), b.1 + 250.0 * th2.cos())];
+        let (old_cut, old_lat) = fly_sr22_corner(&path, (0.0, -200.0), false);
+        let (cut, lat) = fly_sr22_corner(&path, (0.0, -200.0), true);
+        eprintln!("16 m floor: cut {old_cut:.2} lat {old_lat:.2}; free nose: cut {cut:.2} lat {lat:.2}");
+        // The scorer's worst: a cut the projection jumped across, or the same
+        // chord judged as the line when the nose stopped turning first.
+        let (old, new) = (old_cut.max(old_lat), cut.max(lat));
+        assert!(old > 4.5, "the plant must reproduce the recorded 5.3 m: {old:.2} m");
+        assert!(new <= crate::scorecard::TAXI_MAX_LAT_M, "inside the line's own limit: {new:.2} m");
+        assert!(new < old - 1.5, "{new:.2} vs {old:.2} m");
+        // A plain right angle the same way.
+        let path = [(0.0, -250.0), (0.0, 0.0), (250.0, 0.0)];
+        let (old_cut, old_lat) = fly_sr22_corner(&path, (0.0, -200.0), false);
+        let (cut, lat) = fly_sr22_corner(&path, (0.0, -200.0), true);
+        eprintln!("90 degrees: 16 m floor cut {old_cut:.2} lat {old_lat:.2}; free nose cut {cut:.2} lat {lat:.2}");
+        let (old, new) = (old_cut.max(old_lat), cut.max(lat));
+        assert!(new < old && new <= crate::scorecard::TAXI_MAX_LAT_M, "{new:.2} vs {old:.2}");
+    }
+
+    /// The aim is only shorter where a free nose turns a corner: a straight,
+    /// a gentle bend and every other nose fly exactly the old aim.
+    #[test]
+    fn only_a_free_nose_in_a_corner_gets_the_shorter_aim() {
+        let pace = Pace::from_profile(crate::aircraft::load("cirrus_sr22").expect("sr22").taxi.as_ref());
+        // Straight: no bend cap at all.
+        assert_eq!(steer_look_m(&pace, 10.0, 0.0, 1000.0, true), steer_look_m(&pace, 10.0, 0.0, 1000.0, false));
+        // The LEMG vertex at 5 kt (the recorded 14 deg/s of route turn).
+        assert_eq!(steer_look_m(&pace, 5.0, 14.0, 1000.0, false), 16.0);
+        assert_eq!(steer_look_m(&pace, 5.0, 14.0, 1000.0, true), FREE_NOSE_AIM_FLOOR_M);
+        // A gentle bend's own cap is longer than either floor: unchanged.
+        assert_eq!(bend_lookahead_cap_floor_m(12.0, -3.3, 12.0), bend_lookahead_cap_m(12.0, -3.3));
+        assert_eq!(corner_aim_floor_m(false), BEND_AIM_FLOOR_M);
+    }
+
+    /// LEMG (2026-09-28): full auto gave both SR22 taxis up as
+    /// "taxi_stalled" at exactly 600 s, still rolling. The drives' remaining
+    /// metres every minute (sorties 1790605551, engaged at 4,605 m of a
+    /// 4,661 m route, and 1790618416, 4,736 m of 4,791): never stuck by the
+    /// ground they made, and each well inside its own deadline.
+    #[test]
+    fn a_long_taxi_is_judged_by_the_ground_it_makes() {
+        const S1: &[(f64, f64)] = &[
+            (0.0, 4605.4), (60.1, 4471.8), (120.1, 4201.5), (180.1, 3922.8), (240.1, 3638.2), (300.1, 3375.7),
+            (360.1, 3065.3), (420.1, 2738.3), (480.2, 2537.5), (540.3, 2274.0), (599.9, 1997.7),
+        ];
+        const S2: &[(f64, f64)] = &[
+            (0.0, 4735.9), (60.2, 4600.9), (120.2, 4328.2), (180.2, 4058.3), (240.2, 3767.1), (300.2, 3525.7),
+            (360.3, 3231.3), (420.4, 2926.2), (480.4, 2624.2), (540.6, 2404.2), (600.0, 2103.9),
+        ];
+        for (ticks, total) in [(S1, 4660.6), (S2, 4791.1)] {
+            let deadline = route_deadline_s(total, 10.0);
+            let mut w = ProgressWatch::start(0.0, deadline);
+            let r0 = ticks[0].1;
+            for &(t, rem) in ticks {
+                w.note(r0 - rem, t);
+                assert!(!w.stuck(t), "t {t}: {:.0} s without {PROGRESS_STEP_M} m", w.stalled_s(t));
+            }
+            // At the pace it was making, the rest of the route fits.
+            let (t, rem) = ticks[ticks.len() - 1];
+            let finish = t + rem / ((r0 - rem) / t);
+            assert!(finish < deadline, "finish {finish:.0} s against {deadline:.0} s");
+            assert!(finish > 600.0, "and the flat 600 s never could: {finish:.0} s");
+        }
+        assert!((route_deadline_s(4660.6, 10.0) - 1932.0).abs() < 1.0);
+        // A drive that stops making ground IS stuck, whatever it creeps.
+        let mut w = ProgressWatch::start(0.0, 5000.0);
+        w.note(2607.7, 599.9);
+        for k in 0..200 {
+            w.note(2607.7 + 0.05 * k as f64, 600.0 + k as f64);
+        }
+        assert!(w.stuck(799.0), "{:.0} s", w.stalled_s(799.0));
+        // A pause, a tug or a spoken stop restarts the clock.
+        w.hold(799.0);
+        assert!(!w.stuck(799.0));
+        // A join that turns away from the route's start is not progress,
+        // and not a stall until it has had the whole window.
+        let mut j = ProgressWatch::start(0.0, 5000.0);
+        j.note(40.0, 0.0);
+        j.note(30.0, 100.0);
+        assert!(!j.stuck(100.0) && (j.stalled_s(100.0) - 100.0).abs() < 1e-9);
+        j.note(61.0, 110.0);
+        assert_eq!(j.stalled_s(110.0), 0.0);
+        // The route's deadline, moved on by the time held.
+        let mut d = ProgressWatch::start(0.0, 100.0);
+        for k in 0..=100 {
+            d.note(25.0 * k as f64, k as f64);
+        }
+        assert!(!d.stuck(100.0));
+        d.hold(150.0);
+        assert!(!d.stuck(149.0) && !d.stuck(150.0), "50 s held, 50 s more");
+        assert!(d.stuck(151.0));
     }
 }
