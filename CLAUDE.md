@@ -261,7 +261,12 @@ Config: `XCOPILOT_ATC_AIRPORT` / `_VOICE` / `_RATE` / `_REGION`.
   (`Ctx.transition_level_ft`) a level is a flight level in clearance, readback and correction
   (`tower::climb_item`); `heard_altitude_ft` hears either form; the crew's check-in says flight
   levels above the flight's transition altitude (`departure_check_in_above`).
-- Runway in use: calm wind follows the arrival stream (`arrival_end`); FROZEN while a departure or
+- Runway in use: calm wind follows the live stream, arrivals first (`arrival_end`) else the last ghost
+  liftoff's end (`departure_end`, `DEPARTURE_STREAM_SECS`); **one strip, one direction**: an
+  uncommitted calm pick against the stream turns round to it (`ends_oppose`, `runway_follows_stream`),
+  a stated runway into the departures is refused, and **the party line clears nobody against our
+  runway** (`own_strip_claim`, `conflicts_with_claim`, in the air too; `party_line_withheld`; LEMG 31
+  vs 13, 2026-09-28); FROZEN while a departure or
   arrival is committed, an IFR clearance included (`ifr_runway`), with wind hysteresis (parallels
   flip-flop invisibly); an arrival's STATED runway stands when the wind does not argue: in calm, or within a 5 kt tailwind on no worse a crosswind (`stated_runway_stands`, `note_stated_runway`; LEMG 13, 2026-09-28).
   **The wind picks a direction, the longest parallel the strip** (`best_runway_for_wind`); a
@@ -434,7 +439,8 @@ everything blackboxes to `logs/blackbox.jsonl` (kinds: `atc`, `autotaxi`, `autot
   held one names another runway); the tower gives a caller standing on the stated strip that runway
   ahead of the calm-wind stream when the wind does not argue (`note_caller_on_strip`); too little ahead is a BACKTRACK, never a taxi (`full_auto::RunwayStart`,
   `backtrack_from_runway_start`, `Intent::RequestBacktrack`; EGKK 26L 2026-09-27); a clearance for
-  another runway is taxied to (`under_clearance`). `why_no_fit` diagnoses the aligned end we are
+  another runway is taxied to (`under_clearance`); a start whose end opposes the live stream takes the
+  stream's end (a 31 start facing 13 departures takes 13). `why_no_fit` diagnoses the aligned end we are
   ON (parallels tie on heading).
 
 ### Circuit, procedure, full auto
@@ -844,7 +850,11 @@ confirms it closes it (`fixes #N` in the commit). Known gaps are `owed` issues.
   (`monitor::CrewBrakeLatch`, `crew_brake_discounted`); a taxi is judged from its first tick ON the line after a
   join and never past its planned stop, and inside a route VERTEX it turns through (the projection
   jumped across it) is a cut, `TAXI_MAX_CUT_M`, not off the line; a drive that stops short (`stagnant`, `off_route`, a
-  give-up) fails; a landing is scored at its FIRST contact and a bounce is recorded (`bounce_ft`).
+  give-up) fails; a landing is scored at its FIRST contact and at its sink: the flight model's `touchdown` when logged,
+  else the autoland window ending at the contact, else `touchdown_sink_fpm`, never the max of two
+  windows (461 fpm on a 130, LEMG 31 2026-09-28); a bounce is recorded (`bounce_ft`). **A blackbox
+  record is one write** (`blackbox::append_line`, one `write_all` under a file lock: the runner is a
+  second process on the same file; 70 corrupt lines 2026-09-28).
   `bench/sorties/` holds trimmed real sorties whose verdicts `cargo test` pins.
 - **A night of landings is one command** (`xvl sortie bench/sorties/<spec>.yaml --repeat N`,
   `src/sortie_runner.rs`): set up, type the mission, the `sortie_result` is the row

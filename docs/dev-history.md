@@ -9542,3 +9542,28 @@ Sortie 1790584715 (t 1790585265.4, route squawk_watch): the zone clearance's Dep
 check-in. The watch now speaks only tuned to a radar unit and not while a check-in is owed; the
 check-in's reply satisfies it. Next sortie: `checklist` `stood_down` by "full auto"; exactly one
 "radar contact", from DEP at the check-in. Offline only.
+
+## 2026-09-28: one strip, one direction; the first contact's sink; one write per record (issues #140, #142, #144)
+
+#140, sortie 1790584715-full_auto, calm: 31 stood in use from an earlier into-wind pick (350/3) while
+LiveTraffic landed 12 (Ryanair 8168, t 1790585296.6) and departed 13 off our strip. The calm pick only
+followed arrivals and only when nothing was in use, and departures were never seen; the party line's
+ghost-release protection was ground-only and direction-blind: "Vueling 8176, runway one three,
+cleared for takeoff" (t 1790585447.7) with our circuit downwind 31, the go-around for traffic on the
+runway (t 1790585525.5, Easy rolling head-on), then "Easy 2716, runway one three, cleared for
+takeoff" (t 1790585551.4). `wake_note_targets` now remembers the departure end (`departure_end`,
+600 s); an uncommitted calm pick against the stream turns round (`ends_oppose` > 120 deg,
+`runway_follows_stream`); a stated runway into the departures is refused; `chatter_tick` withholds a
+ghost clearance against our claim (`own_strip_claim`, `party_line_withheld`). Merged with #134: a
+runway start keeps its strip unless its end opposes the stream.
+
+#142: the landing stage scored 461 (FAIL) and 397 against contact vvi -166 and -180 and flight model
+130 and 105 (sorties 1790585651, 1790584715): the state window kept 3 s behind the last airborne
+sample and was combined with a max. The first contact's sink is now the flight model's; re-scoring
+today's 23 sorties flipped no verdict and lowered every landing sink. Pinned by two trimmed landings
+in bench/sorties.
+
+#144: 70 corrupt lines in logs/blackbox.jsonl, interleaved byte by byte: `writeln!` of a Value is one
+write(2) per token and the sortie runner is a second process appending the same file. Now one
+`write_all` of the whole line under a file lock (`blackbox::append_line`), and the runner's tail is
+byte-based. Offline only.
