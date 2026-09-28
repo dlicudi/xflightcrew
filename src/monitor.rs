@@ -509,12 +509,21 @@ impl Snapshot {
             .get_float("sim/cockpit2/temperature/outside_air_temp_degc")
             .await
             .unwrap_or(15.0);
-        let dewpoint_c = xp
-            .get_float_array("sim/weather/aircraft/dewpoint_deg_c")
-            .await
-            .ok()
-            .and_then(engine0)
-            .unwrap_or(-30.0);
+        // The dewpoint AT the aircraft, not the lowest of the sim's levels
+        // (`anti_ice::dewpoint_at`; the wrong level kept the anti-ice on for
+        // a whole flight, #156). Unread is dry: no false advisory.
+        let dewpoint_c = {
+            let (dew, levels) = tokio::join!(
+                xp.get_float_array(crate::tools::anti_ice::DEWPOINT_LEVELS),
+                xp.get_float_array(crate::tools::anti_ice::ATMOSPHERE_LEVELS_M),
+            );
+            let alt_m = alt_true_ft.unwrap_or(alt_ft) / M_TO_FT;
+            match (dew, levels) {
+                (Ok(d), Ok(l)) => crate::tools::anti_ice::dewpoint_at(&l, &d, alt_m),
+                _ => None,
+            }
+            .unwrap_or(-30.0)
+        };
         let carb_heat_on = xp
             .get_float_array("sim/cockpit2/engine/actuators/carb_heat_ratio")
             .await
@@ -2794,6 +2803,9 @@ pub async fn run(
     // what it switched on).
     let mut icing_read: Option<(Instant, crate::tools::anti_ice::IcingRead)> = None;
     let mut icing_clear_since: Option<Instant> = None;
+    // The last icing verdict blackboxed (`icing` `conditions`), so a change
+    // is one record with the numbers it was judged on.
+    let mut icing_logged: Option<bool> = None;
     let mut avionics_readback = avionics_readback_dref(&live.get());
     // The cockpit duties the copilot performs unasked, per airframe: interior
     // lights flagged `auto_at_night`, and a GPS welcome page to acknowledge.
@@ -2948,6 +2960,7 @@ pub async fn run(
             tank_lateral = None;
             icing_read = None;
             icing_clear_since = None;
+            icing_logged = None;
             avionics_readback = avionics_readback_dref(&live.get());
             (night_lights, gps_ack) = cockpit_duties(&live.get());
             // A new airframe is a new cockpit: whatever we set on the last one
@@ -3039,6 +3052,15 @@ pub async fn run(
             let icing_now = snap.icing.as_ref().is_some_and(|r| {
                 crate::tools::anti_ice::icing_conditions(r) || crate::tools::anti_ice::accreting(r)
             });
+            if snap.icing.is_some() && icing_logged != Some(icing_now) {
+                icing_logged = Some(icing_now);
+                crate::blackbox::record(
+                    "icing",
+                    serde_json::json!({"event": "conditions", "icing": icing_now,
+                        "oat_c": snap.oat_c, "dewpoint_c": snap.dewpoint_c, "alt_ft": snap.alt_ft,
+                        "claimed": crate::tools::anti_ice::claimed().len()}),
+                );
+            }
             if icing_now {
                 icing_clear_since = None;
             } else {
@@ -3051,6 +3073,11 @@ pub async fn run(
                     && now.duration_since(since) >= Duration::from_secs(ICING_CLEAR_S)
                 {
                     let failed = crate::tools::anti_ice::monitor_fix(&xp, &claimed, false).await;
+                    crate::blackbox::record(
+                        "icing",
+                        serde_json::json!({"event": "clear_off", "systems": claimed.len(),
+                            "took": failed.is_none(), "oat_c": snap.oat_c, "dewpoint_c": snap.dewpoint_c}),
+                    );
                     voice.alert(
                         Priority::Advisory,
                         failed.unwrap_or_else(|| "Clear of icing, anti-ice off.".to_string()),
