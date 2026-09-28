@@ -908,6 +908,9 @@ confirms it closes it (`fixes #N` in the commit). Known gaps are `owed` issues.
   `settle_before_setup`): before each setup the last aircraft is at rest (marker idle, on the ground
   under `STOPPED_KTS`, held `QUIET_S`), waited up to `STOP_MAX_S`, then "my controls" (`hand_back_hold`
   parks); in the air it is taken back at once; the row's "Before" says which.
+  A case scripts `steps` (`say` at `start`, `after_s`, `ias_above`, `agl_above`, `phase`, `event`),
+  loads `setup.aircraft` (waits for its `profile_probe`), reads `plan_origin` / `runway: plan` from
+  SimBrief, and may `expect_give_up`; specs `bench/sorties/backlog-737.yaml`, `backlog-types.yaml`.
 - A law that misbehaves in the air while its test passes: suspect the plant. A first-order lag
   cannot ring; fly second-order plants through the real transport delay.
 
