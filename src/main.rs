@@ -2776,7 +2776,11 @@ async fn run_session(
             // as "1 is top descent"), so match top+descent loosely rather than the
             // exact phrase. This also keeps such an utterance out of the vertical-speed
             // grammar, which would otherwise read "descend 1 feet per minute".
+            // "Put us enroute 30 miles before top of descent" is the enroute
+            // setup, not a question (answered "Top of descent about 893 miles
+            // ahead" at LEMG, 2026-09-28, and the setup never ran).
             if !is_reminder
+                && !crate::grammar::enroute_setup_request(&command)
                 && ((tl.contains("top") && tl.contains("descent"))
                     || tl.contains("t o d")
                     || tl
