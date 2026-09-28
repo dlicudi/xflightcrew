@@ -396,14 +396,22 @@ flaps:
 # controls proven live in that rescue: `fresh_air_on` took the pack from 0
 # to 1; `slider_20` TOGGLES the oxygen button (it read 2 = on, and the blind
 # press turned it OFF), so it is fired only when it reads off; and with the
-# button on the stock valve sat SHUT until written 1 (felt altitude 24,400
-# to 17,100 ft within seconds).
+# button on, `o2_valve_on` read 0 until written 1 (felt altitude 24,400 to
+# 17,100 ft within seconds).
+# SUPPLY vs MASKS (#159, 2026-09-28): sf50_oxygen.lua is explicit. The master
+# button (slider_20's after-handler) sets `demand_flow_setting` 0 / 2 = the
+# SUPPLY; clicking the cockpit masks sets `o2_valve_on` = WEARING them, and
+# "opening o2 valve (wearing masks) will play breathing sound regardless if
+# there is an actual oxy flow". No script writes `o2_valve_on`. So the supply
+# goes on for every mission and the masks only in the cabin-altitude warning
+# band (`tools::cabin_air::MaskWatch`); worn for every mission, the breathing
+# played the whole flight.
 cabin_air:
   bleed_on_command: laminar/SF50/fresh_air_on
   bleed_read: sim/cockpit2/bleedair/actuators/pack_center
   oxygen_toggle: sim/operation/slider_20
   oxygen_read: sim/cockpit2/oxygen/actuators/demand_flow_setting
-  oxygen_valve: sim/cockpit2/oxygen/actuators/o2_valve_on
+  oxygen_masks: sim/cockpit2/oxygen/actuators/o2_valve_on
 
 # THE FLARE (EDLP 24, 2026-09-24, and ETND 26 the evening before). On the
 # 172/737 law this airframe answers the column about twice as hard: 0.18 of
@@ -603,7 +611,7 @@ locations:
   fire extinguisher: "the engine fire suppression switch on the overhead panel. It puts the fire out and the engine with it"
   cabin dump: "the cabin pressure dump button on the overhead panel. It depressurizes instantly if the outflow valve has failed"
   pressurization: "automatic in the cruise, off the bleed air. The dump button on the overhead is the manual way out"
-  oxygen: "the oxygen master button. The aircraft wants it on before you go, and it opens the crew demand valve"
+  oxygen: "the oxygen master button. The aircraft wants it on before you go; it feeds the crew masks, which you click to put on"
   bleed air: "the bleed air button. BLEED feeds the pack and pressurizes the cabin, FRESH is ram air. The start sequence leaves it on BLEED"
   thrust lever: "the single thrust lever on the center pedestal. One engine, one lever, and no reverse on this aircraft"
   throttle: "the single thrust lever on the center pedestal"
