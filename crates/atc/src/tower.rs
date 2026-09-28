@@ -1371,6 +1371,26 @@ pub fn stated_runway(transcript: &str) -> Option<String> {
     runway_after_keyword(transcript)
 }
 
+/// Does a departure request say the flight stays in the pattern ("request
+/// taxi for circuits", "ready for departure, closed traffic", "remain in the
+/// pattern")? Read from the words beside the intent, like
+/// [`requested_runway`]: the station keeps such a flight on the tower (no
+/// "contact Departure", no radar watch). LEMG 31 (sortie 1790584715,
+/// 2026-09-28): a right-hand circuit was sent to Malaga Departure on the
+/// crosswind leg, because nothing on the radio said it was a circuit.
+pub fn wants_circuits(transcript: &str) -> bool {
+    let t = transcript.to_lowercase();
+    let word = |w: &str| t.split(|c: char| !c.is_alphanumeric()).any(|tok| tok == w);
+    word("circuit")
+        || word("circuits")
+        || t.contains("closed traffic")
+        || t.contains("closed pattern")
+        || t.contains("pattern work")
+        || t.contains("remain in the pattern")
+        || t.contains("stay in the pattern")
+        || t.contains("remain in the circuit")
+}
+
 /// The runway a REQUEST names, canonical: the designator right after
 /// "request"/"requesting" (optionally "request runway ..."). `None` when the
 /// request is for something else ("request taxi, runway two seven").
@@ -3559,6 +3579,42 @@ mod tests {
         assert!(r.contains("cleared to land"), "{r}");
         // "missed approach" is the same call in IFR words.
         assert_eq!(parse_intent("missed approach"), Intent::GoAround);
+    }
+
+    /// A circuit is said on the request, and the words beside it never
+    /// change what is being asked for.
+    #[test]
+    fn a_circuit_departure_says_so_and_stays_the_same_request() {
+        let cs = "november eight one six november november";
+        for (call, intent) in [
+            (
+                format!("{cs}, request taxi for circuits"),
+                Intent::RequestTaxi,
+            ),
+            (
+                format!("{cs}, ready for departure, for circuits"),
+                Intent::RequestTakeoff,
+            ),
+            (
+                format!("{cs}, request taxi for closed traffic"),
+                Intent::RequestTaxi,
+            ),
+            (
+                format!("{cs}, ready for departure, remain in the pattern"),
+                Intent::RequestTakeoff,
+            ),
+        ] {
+            assert_eq!(parse_intent(&call), intent, "{call}");
+            assert!(wants_circuits(&call), "{call}");
+        }
+        for call in [
+            format!("{cs}, request taxi"),
+            format!("{cs}, ready for departure"),
+            format!("{cs}, request taxi, runway three one"),
+            format!("{cs}, downwind runway three one"),
+        ] {
+            assert!(!wants_circuits(&call), "{call}");
+        }
     }
 
     #[test]

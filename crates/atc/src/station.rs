@@ -100,6 +100,13 @@ pub struct Station {
     /// (Departure, or Approach at a field without one): its first readback
     /// there is the check-in. `None` until a takeoff clearance arms it.
     handed_to: Option<Service>,
+    /// This flight said it stays in the pattern ("request taxi for
+    /// circuits", [`tower::wants_circuits`]): the tower keeps it, so no
+    /// takeoff clearance arms a departure handoff and no radar watch runs.
+    /// Set by each departure request that carries the words, cleared by a
+    /// taxi, zone or IFR request that does not (a new departure says what it
+    /// is again); the station is rebuilt for a new flight.
+    circuits: bool,
     /// The ATIS information letter the pilot last reported having ("with
     /// information Alpha"). When it matches the current broadcast, clearances
     /// skip the QNH — the whole point of an ATIS.
@@ -239,6 +246,7 @@ impl Station {
             requested_ident: None,
             dep_checked_in: false,
             handed_to: None,
+            circuits: false,
             pilot_info: None,
             assigned_squawk: None,
             planned_route: None,
@@ -731,6 +739,9 @@ impl Station {
         wx: Wx,
     ) -> String {
         let was = self.twr.state;
+        if service == Service::Tower {
+            self.note_departure_intent(&intent, transcript);
+        }
         // A departure clearance in a RADAR environment carries a discrete
         // code — the zone clearance is where a real controller assigns it
         // (Heathrow flew a whole day on 7000, 2026-07-10). Tower-only strips
@@ -1225,6 +1236,11 @@ impl Station {
             .get_or_insert_with(|| discrete_squawk(callsign));
         // Publish it for the crew (the transponder gets dialled to this).
         *ASSIGNED_SQUAWK.lock().unwrap_or_else(|e| e.into_inner()) = Some(code);
+        // Circuit traffic gets no radar service: the code, but no watch
+        // (no "radar contact" from a tower working the pattern by eye).
+        if self.circuits {
+            return atis::spoken_digits(&code.to_string());
+        }
         let mut w = SQUAWK_WATCH.lock().unwrap_or_else(|e| e.into_inner());
         // Same code from a new controller: the watch keeps its history (no
         // second grace period, no second "radar contact") but the VOICE is
@@ -1246,10 +1262,56 @@ impl Station {
         atis::spoken_digits(&code.to_string())
     }
 
+    /// What a departure request says about where the flight is going: the
+    /// pattern ("request taxi for circuits") or away. A taxi, zone or IFR
+    /// request states it afresh (said or not); a "ready for departure" can
+    /// only add it, since pilots do not repeat "for circuits" on every call.
+    /// Declaring circuits retires any radar watch and any armed handoff: the
+    /// tower keeps pattern traffic. LEMG 31 (sortie 1790584715, 2026-09-28):
+    /// a zone clearance from the mission before left a Departure watch
+    /// armed, and the tower's voice said "radar contact" to the circuit
+    /// 0.4 s after rotation.
+    fn note_departure_intent(&mut self, intent: &tower::Intent, transcript: &str) {
+        let said = tower::wants_circuits(transcript);
+        let now = match intent {
+            tower::Intent::RequestTaxi | tower::Intent::RequestClearance => said,
+            tower::Intent::RequestIfrClearance { .. } => false,
+            tower::Intent::RequestTakeoff => self.circuits || said,
+            _ => return,
+        };
+        if now == self.circuits {
+            return;
+        }
+        self.circuits = now;
+        sim::blackbox::record(
+            "atc",
+            serde_json::json!({"event": "circuit_traffic", "circuits": now,
+                "intent": format!("{intent:?}")}),
+        );
+        tracing::info!(circuits = now, "departure intent noted");
+        if now {
+            *SQUAWK_WATCH.lock().unwrap_or_else(|e| e.into_inner()) = None;
+            *SQUAWK_NUDGE.lock().unwrap_or_else(|e| e.into_inner()) = None;
+            *HANDOFF.lock().unwrap_or_else(|e| e.into_inner()) = None;
+            *DEPARTURE_HANDOFF.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        }
+    }
+
     /// Arm the after-takeoff handoff. Spoken by [`handoff_tick`] once the
     /// flight is airborne and climbing through ~700 ft above the field —
     /// a tower doesn't say "contact departure" to an aircraft still rolling.
     fn arm_departure_handoff(&mut self, ctx: &tower::Ctx) {
+        // Circuit traffic is the tower's own: the pattern comes back to this
+        // runway, and "contact Departure" on the crosswind leg sends it to a
+        // controller who does not work it (LEMG 31, 2026-09-28).
+        if self.circuits {
+            sim::blackbox::record(
+                "atc",
+                serde_json::json!({"event": "departure_handoff_withheld", "why": "circuits"}),
+            );
+            tracing::info!("circuit traffic: the tower keeps it, no departure handoff");
+            return;
+        }
         // Prefer departure; fall back to approach; a tower-only field keeps
         // its traffic and no handoff arms.
         let (name, khz) = match (self.departure_khz, self.approach_khz) {
@@ -3386,6 +3448,11 @@ pub fn retire_for_new_flight() {
     *LINE_UP_CONDITION.lock().unwrap_or_else(|e| e.into_inner()) = None;
     *DEPARTURE_HANDOFF.lock().unwrap_or_else(|e| e.into_inner()) = None;
     *ASSIGNED_SQUAWK.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    // The radar watch on that code, and its nudge, were the old flight's
+    // too: a watch left armed says "radar contact" at the next liftoff.
+    *SQUAWK_WATCH.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    *SQUAWK_NUDGE.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    *HANDOFF.lock().unwrap_or_else(|e| e.into_inner()) = None;
     *IFR_CLEARANCE.lock().unwrap_or_else(|e| e.into_inner()) = None;
     *IFR_FLIGHT.lock().unwrap_or_else(|e| e.into_inner()) = None;
     *PENDING_TAKEOFF_CLEARANCE
@@ -9109,6 +9176,7 @@ mod tests {
             requested_ident: None,
             dep_checked_in: false,
             handed_to: None,
+            circuits: false,
             pilot_info: None,
             assigned_squawk: None,
             planned_route: None,
@@ -9359,8 +9427,19 @@ mod tests {
         });
         *LANDING_HANDOFF.lock().unwrap() = Some("12".into());
         *PENDING_GO_AROUND.lock().unwrap() = true;
+        // The last flight's radar watch too (its "radar contact" fired at
+        // the next liftoff, LEMG sortie 1790584715).
+        let _ = lxgb().assign_squawk(
+            "November eight one six November November",
+            StationSpeaker::Departure,
+        );
+        assert!(squawk_watch_active());
         assert_eq!(crate::party_line::clearance_runway().as_deref(), Some("12"));
         crate::party_line::retire_for_new_flight();
+        assert!(
+            !squawk_watch_active(),
+            "the radar watch was the old flight's"
+        );
         assert_eq!(crate::party_line::clearance_state(), None);
         assert_eq!(crate::party_line::clearance_runway(), None);
         assert_eq!(crate::party_line::readback_owed(), None);
@@ -11840,6 +11919,96 @@ mod tests {
             fails.len().min(40),
             fails.join("\n")
         );
+    }
+
+    /// LEMG 31 (sortie 1790584715-full_auto, 2026-09-28): a right-hand
+    /// circuit heard "contact Malaga Departure on one two one decimal zero
+    /// two five" on the crosswind leg at 772 ft, and "radar contact" in the
+    /// tower's voice 0.4 s after rotation from a Departure watch a zone
+    /// clearance had armed. A flight that says it is a circuit stays with
+    /// the tower: no handoff, no radar watch. The next departure that does
+    /// not say so is handed off as before.
+    #[test]
+    fn circuit_traffic_stays_with_the_tower() {
+        let _guard = SIDE_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let path = lxgb_apt_file();
+        let wx = Wx {
+            wind_from_deg: 250.0,
+            wind_kts: 12.0,
+        };
+        let mut st = Station::load(path.to_str().unwrap(), "LXGB").expect("LXGB loads");
+        assert_eq!(st.departure_khz, Some(130400), "a field with a Departure");
+        let ctx = scripted_ctx(&mut st, wx);
+        *HANDOFF.lock().unwrap() = None;
+        *SQUAWK_WATCH.lock().unwrap() = None;
+        let _ = crate::party_line::take_departure_handoff();
+
+        // The zone clearance arms the radar watch (the LEMG leftover).
+        let r = st.route_keyed("request clearance", Service::Tower, &ctx, wx);
+        assert!(r.contains("squawk"), "{r}");
+        assert!(squawk_watch_active(), "zone clearance armed the watch");
+
+        // The circuit says so on the taxi request: the watch goes.
+        let r = st.route_keyed(
+            "november one seven two sierra papa, request taxi for circuits",
+            Service::Tower,
+            &ctx,
+            wx,
+        );
+        assert!(r.contains("taxi to holding point"), "{r}");
+        assert!(st.circuits, "circuits noted");
+        assert!(!squawk_watch_active(), "no radar watch for pattern traffic");
+        // A plain "ready" does not undo it.
+        let r = st.route_keyed(
+            "november one seven two sierra papa, ready for departure",
+            Service::Tower,
+            &ctx,
+            wx,
+        );
+        assert!(r.contains("cleared for takeoff"), "{r}");
+        assert_eq!(st.twr.state, tower::State::TakeoffCleared);
+        assert!(
+            handoff_tick(900.0, false).is_none(),
+            "the tower keeps a circuit"
+        );
+        assert!(handoff_tick(2500.0, false).is_none(), "at any height");
+        assert!(
+            crate::party_line::take_departure_handoff().is_none(),
+            "nothing published for the crew"
+        );
+        // The hold-release path arms through the same door.
+        st.arm_departure_handoff(&ctx);
+        assert!(
+            handoff_tick(900.0, false).is_none(),
+            "released circuit kept too"
+        );
+
+        // The pattern calls still work the tower.
+        let r = st.route_keyed(
+            "november one seven two sierra papa, downwind runway two seven",
+            Service::Tower,
+            &ctx,
+            wx,
+        );
+        assert!(r.contains("report base"), "{r}");
+
+        // A new departure that says nothing of circuits is a departure.
+        let mut st = Station::load(path.to_str().unwrap(), "LXGB").expect("LXGB loads");
+        let ctx = scripted_ctx(&mut st, wx);
+        st.route_keyed("request taxi for circuits", Service::Tower, &ctx, wx);
+        assert!(st.circuits);
+        st.route_keyed("request taxi", Service::Tower, &ctx, wx);
+        assert!(!st.circuits, "a taxi request states the intent afresh");
+        let r = st.route_keyed("ready for departure", Service::Tower, &ctx, wx);
+        assert!(r.contains("cleared for takeoff"), "{r}");
+        let line = handoff_tick(900.0, false).expect("a departure is handed off");
+        assert!(
+            line.contains("Departure on one three zero decimal four"),
+            "{line}"
+        );
+        let _ = crate::party_line::take_departure_handoff();
+        *SQUAWK_WATCH.lock().unwrap() = None;
+        *CLEARANCE.lock().unwrap() = None;
     }
 
     #[test]
