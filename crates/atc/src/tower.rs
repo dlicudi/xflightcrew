@@ -441,6 +441,22 @@ pub fn go_around_resequenced_line(callsign: &str, from: &str, to: &str) -> Strin
     )
 }
 
+/// A reply that moves a flight off the runway its clearance named says so
+/// first (issue #178): "<callsign>, runway change, runway one three in use.
+/// Taxi to holding point ...". `to` is spoken. A reply not opening with the
+/// callsign is returned as it is. Pure.
+pub fn runway_change_line(callsign: &str, to: &str, reply: &str) -> String {
+    let Some(rest) = reply.strip_prefix(&format!("{callsign}, ")) else {
+        return reply.to_string();
+    };
+    let mut chars = rest.chars();
+    let rest = match chars.next() {
+        Some(c) => c.to_uppercase().chain(chars).collect::<String>(),
+        None => return reply.to_string(),
+    };
+    format!("{callsign}, runway change, runway {to} in use. {rest}")
+}
+
 pub fn qnh_clause(ctx: &Ctx) -> String {
     if ctx.qnh.is_empty() {
         String::new()
@@ -2883,6 +2899,26 @@ mod tests {
             ifr: None,
             circuit: None,
         }
+    }
+
+    /// Issue #178: a runway change opens the reply, after the callsign; a
+    /// reply not addressed to the caller is left alone.
+    #[test]
+    fn a_runway_change_opens_the_reply() {
+        let cs = "November eight one six November November";
+        let taxi = format!(
+            "{cs}, taxi to holding point Hotel November one runway one three first via \
+             Echo one one. Report ready for departure."
+        );
+        assert_eq!(
+            runway_change_line(cs, "one three", &taxi),
+            format!(
+                "{cs}, runway change, runway one three in use. Taxi to holding point Hotel \
+                 November one runway one three first via Echo one one. Report ready for \
+                 departure."
+            )
+        );
+        assert_eq!(runway_change_line(cs, "one three", "say again"), "say again");
     }
 
     /// ctx() on the ground as circuit traffic, code 4501, in the ICAO or the

@@ -10315,3 +10315,40 @@ blackbox `full_auto` `readback_out`). Tests `a_rejected_takeoff_is_flown_to_a_st
 `a_readback_copy_goes_out_only_while_the_tower_waits_for_it`,
 `the_roll_waits_for_the_takeoff_readback`.
 Offline only.
+
+## 2026-09-28: a runway start read back 13 from 30 and said "lined up" (issue #178)
+
+LEMG, runner 737 runway start on 30 (`runway: wind`, METAR 300/5), "fly a circuit", sortie
+1790631369-full_auto. +24.5 "request clearance, runway three zero, for circuits": cleared for the
+circuit on 30 (Parked, `strip_clearance` cleared 30). +46.1 D85023's touchdown on 12 made 13 the
+arrival stream's end and at +46.6 the calm pick (tower wind 2.1 kt) turned 30 to 13
+(`runway_follows_stream`): a zone or circuit clearance is not `runway_committed`. +58.1 "ready for
+departure" earned "taxi to holding point Hotel November one runway one three first" with nothing to
+say the runway had moved, and no route published (only RequestTaxi / RequestRunway published one).
+Full auto's runway-start branch only waited for LinedUp or TakeoffCleared: it sat on 30, called
+ready again at +86.6 (the tower, in TaxiCleared, took it as at the hold: "line up runway one three
+behind"), read that back from 30 at +111.2, read back "cleared for takeoff runway one three" at
++219.5 and said "Lined up and ready. Flying the circuit." Autotakeoff's `wrong_runway` (cleared 13,
+fitted 30) stopped it at +229.1.
+
+Which runway should win: the stream. One strip, one direction outranks a runway start's claim once
+live traffic lands head-on (12 against 30), and the tower cannot hold LiveTraffic off its runway;
+the METAR's 5 kt down 30 is inside the stated-runway tailwind margin, so the wind does not argue
+for 30 either. So the tower keeps turning round, but SAYS it: `Station::state_runway_change`
+remembers the runway it last named to a flight on the ground (`told_runway`: zone, circuit or IFR
+clearance, runway request, taxi, line-up) and opens the next ground taxi, takeoff or backtrack
+reply on another runway with "runway change, runway one three in use." (`tower::runway_change_line`,
+blackbox `atc` `runway_change_stated` with `from`, `to`); airborne forgets it. A ready call
+answered "taxi ... first" now publishes its route like a taxi request (`taxi_first`).
+
+The crew: a runway start calls ready before choosing its branch, with its own runway
+(`request_departure(.., Some(on))`, `ensure_takeoff_cleared(.., Some(on))`); a TaxiCleared,
+LinedUp or TakeoffCleared for another runway, the reciprocal included (`cleared_elsewhere`), ends
+the wait BEFORE any readback or ready call (`ClearanceWait::OtherRunway`), is said ("The tower
+wants runway one three, and we're on three zero. Taxiing there.", `other_runway_line`), blackboxed
+`full_auto` `runway_start_other_runway` with `at: ready`, and drops the start to the taxied
+departure (route from the tower, drive, hold, line-up). Tests
+`a_runway_turned_under_a_cleared_start_is_said`,
+`a_runway_change_is_said_only_when_the_runway_moved`, `a_runway_change_opens_the_reply`,
+`a_runway_start_never_reads_back_another_runway`, `the_runway_start_waits_with_its_own_runway`. Not done: the runner's `runway: wind` still picks the
+into-wind end against a live stream. Offline only.

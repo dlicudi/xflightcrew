@@ -92,6 +92,10 @@ pub struct Station {
     /// on the ground: a runway start asking for the runway it is lined up on
     /// (`note_caller_on_strip`), consumed by the same pick.
     stated_on_strip: bool,
+    /// The runway the tower last named to this flight on the ground (its
+    /// zone, circuit or IFR clearance, a taxi, a line-up): a later reply on
+    /// another runway states the change (`state_runway_change`, #178).
+    told_runway: Option<String>,
     /// The runway a "request runway ..." call named, canonical ("8L"), for
     /// the ctx that answers it (`note_stated_runway`, `apply_runway_request`).
     runway_request: Option<String>,
@@ -254,6 +258,7 @@ impl Station {
             runway_in_use: None,
             stated_runway: None,
             stated_on_strip: false,
+            told_runway: None,
             runway_request: None,
             requested_ident: None,
             dep_checked_in: false,
@@ -851,6 +856,11 @@ impl Station {
             _ => ctx,
         };
         let reply = self.respond_inner(transcript, service, intent.clone(), ctx, wx);
+        let reply = if service == Service::Tower {
+            self.state_runway_change(&intent, ctx, reply)
+        } else {
+            reply
+        };
         // A granted runway request makes that runway the one in use; the
         // taxi (or the join) it bought freezes the pick on it from here.
         if service == Service::Tower && intent == tower::Intent::RequestRunway {
@@ -907,8 +917,13 @@ impl Station {
         }
         // A fresh taxi clearance publishes its route for the off-route
         // compliance watch (and clears any stale one when route-less).
+        // ...and so does a ready call answered "taxi to holding point ...
+        // first": it is a taxi clearance with a route like any other (#178).
+        let taxi_first =
+            intent == tower::Intent::RequestTakeoff && was != tower::State::TaxiCleared;
         if service == Service::Tower
-            && matches!(intent, tower::Intent::RequestTaxi | tower::Intent::RequestRunway)
+            && (matches!(intent, tower::Intent::RequestTaxi | tower::Intent::RequestRunway)
+                || taxi_first)
             && self.twr.state == tower::State::TaxiCleared
         {
             *TAXI_ROUTE.lock().unwrap_or_else(|e| e.into_inner()) = self
@@ -1871,6 +1886,56 @@ impl Station {
             && self.stated_ident().is_some_and(|ident| {
                 strip(&self.apt.runways, &ident).is_some_and(|r| on_runway(r, lat, lon).is_some())
             });
+    }
+
+    /// A RUNWAY CHANGE IS SAID. The runway in use may turn after a flight's
+    /// clearance named another (the calm-wind stream, `pick_runway_with`);
+    /// the next ground reply that sends it to the new runway opens "runway
+    /// change, runway one three in use". LEMG (sortie 1790631369-full_auto,
+    /// 2026-09-28, #178): a runway start on 30 was cleared for the circuit
+    /// on 30, a lander on 12 turned the field round to 13, and "ready for
+    /// departure" earned "taxi to holding point Hotel November one runway
+    /// one three first" with nothing to say the runway had moved. Airborne
+    /// forgets it: an arrival's runway is its own business.
+    fn state_runway_change(
+        &mut self,
+        intent: &tower::Intent,
+        ctx: &tower::Ctx,
+        reply: String,
+    ) -> String {
+        if !ctx.on_ground {
+            self.told_runway = None;
+            return reply;
+        }
+        if reply.is_empty() {
+            return reply;
+        }
+        let now = self.runway_in_use.clone();
+        match intent {
+            tower::Intent::RequestClearance
+            | tower::Intent::RequestIfrClearance { .. }
+            | tower::Intent::RequestRunway => {
+                self.told_runway = now;
+                reply
+            }
+            tower::Intent::RequestTakeoff
+            | tower::Intent::RequestTaxi
+            | tower::Intent::RequestBacktrack => {
+                let from = std::mem::replace(&mut self.told_runway, now.clone());
+                match (from, now) {
+                    (Some(from), Some(to)) if from != to => {
+                        sim::blackbox::record(
+                            "atc",
+                            serde_json::json!({"event": "runway_change_stated",
+                                "from": from, "to": to}),
+                        );
+                        tower::runway_change_line(&ctx.callsign, &ctx.runway, &reply)
+                    }
+                    _ => reply,
+                }
+            }
+            _ => reply,
+        }
     }
 
     /// The strip end the held stated runway names at this field.
@@ -12216,6 +12281,7 @@ mod tests {
             runway_in_use: None,
             stated_runway: None,
             stated_on_strip: false,
+            told_runway: None,
             runway_request: None,
             requested_ident: None,
             dep_checked_in: false,
@@ -14039,6 +14105,108 @@ mod tests {
         // No live traffic: #134's rule alone, the start stands.
         let mut st = start(on31, along(0.99));
         assert_eq!(st.pick_runway_with(342.6, 2.9, None, None), "31");
+    }
+
+    /// Issue #178, the recorded sortie: LEMG (1790631369-full_auto,
+    /// 2026-09-28), a 737 lined up on 30, the tower's wind 2 kt. "Request
+    /// clearance, runway three zero, for circuits" was cleared for the
+    /// circuit on 30; then a lander on 12 made 13 the stream's end and the
+    /// calm pick turned round to it (one strip, one direction: the stream
+    /// wins against an uncommitted clearance). The ready call's "taxi to
+    /// holding point ... runway one three first" must SAY the runway changed,
+    /// once, and publish its route for the crew to drive.
+    #[test]
+    fn a_runway_turned_under_a_cleared_start_is_said() {
+        let _guard = SIDE_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        *CLEARANCE.lock().unwrap() = None;
+        *TAXI_ROUTE.lock().unwrap() = None;
+        let runways = lemg_runways();
+        let (t12, t30) = (
+            (runways[0].lat_a, runways[0].lon_a),
+            (runways[0].lat_b, runways[0].lon_b),
+        );
+        let on30 = (t12.0 + (t30.0 - t12.0) * 0.98, t12.1 + (t30.1 - t12.1) * 0.98);
+        let mut st = lxgb();
+        st.apt.name = "Malaga".into();
+        st.apt.runways = runways;
+        let wx = Wx {
+            wind_from_deg: 300.0,
+            wind_kts: 2.06,
+        };
+        let clearance = "november one seven two sierra papa, request clearance, runway three \
+                         zero, for circuits";
+        st.note_stated_runway(clearance, tower::parse_intent(clearance));
+        st.note_caller_on_strip(true, on30.0, on30.1);
+        assert_eq!(st.pick_runway_with(wx.wind_from_deg, wx.wind_kts, None, None), "30");
+        let mut ctx = scripted_ctx(&mut st, wx);
+        ctx.on_ground = true;
+        ctx.own_on_runway = true;
+        let r = st.route_keyed(clearance, Service::Tower, &ctx, wx);
+        assert!(r.contains("runway three zero, circuit height"), "{r}");
+        // +46.1: D85023's touchdown makes 13 the arrival stream's end.
+        assert_eq!(st.pick_runway_with(wx.wind_from_deg, wx.wind_kts, Some("13"), None), "13");
+        // +58.1: the ready call from 30, off the strip in use.
+        let ready = "november one seven two sierra papa, ready for departure, for circuits";
+        let mut ctx = scripted_ctx(&mut st, wx);
+        ctx.on_ground = true;
+        ctx.holding_point = "Hotel November one".into();
+        st.planned_route = Some(nav::TaxiRoutePlan {
+            via: Vec::new(),
+            crossings: Vec::new(),
+            holding_point: "HN1".into(),
+            path: vec![on30, t12],
+            seg: vec![("E11".into(), false)],
+            lead_on: Vec::new(),
+        });
+        let r = st.route_keyed(ready, Service::Tower, &ctx, wx);
+        assert!(
+            r.starts_with(
+                "November one seven two Sierra Papa, runway change, runway one three in use. \
+                 Taxi to holding point Hotel November one runway one three first"
+            ),
+            "{r}"
+        );
+        assert_eq!(st.twr.state, tower::State::TaxiCleared);
+        assert_eq!(crate::party_line::clearance_runway().as_deref(), Some("13"));
+        // The route rides the party line like a "request taxi" answer.
+        assert!(TAXI_ROUTE.lock().unwrap().is_some());
+        // Said once: the next ground call on 13 carries no change.
+        let mut ctx = scripted_ctx(&mut st, wx);
+        ctx.on_ground = true;
+        let r = st.route_keyed(ready, Service::Tower, &ctx, wx);
+        assert!(!r.contains("runway change"), "{r}");
+        *CLEARANCE.lock().unwrap() = None;
+        *TAXI_ROUTE.lock().unwrap() = None;
+    }
+
+    /// The change is only a change: a clearance and a taxi on the same
+    /// runway say nothing; a flight airborne forgets what it was told.
+    #[test]
+    fn a_runway_change_is_said_only_when_the_runway_moved() {
+        let mut st = lxgb();
+        let wx = Wx {
+            wind_from_deg: 300.0,
+            wind_kts: 2.0,
+        };
+        st.runway_in_use = Some("13".into());
+        let mut c = scripted_ctx(&mut st, wx);
+        c.on_ground = true;
+        let mut air = c.clone();
+        air.on_ground = false;
+        let taxi = format!("{}, taxi to holding point Alpha runway one three.", c.callsign);
+        st.state_runway_change(&tower::Intent::RequestClearance, &c, "cleared".into());
+        let r = st.state_runway_change(&tower::Intent::RequestTaxi, &c, taxi.clone());
+        assert_eq!(r, taxi);
+        st.runway_in_use = Some("31".into());
+        let r = st.state_runway_change(&tower::Intent::RequestTakeoff, &air, taxi.clone());
+        assert_eq!(r, taxi);
+        let r = st.state_runway_change(&tower::Intent::RequestTaxi, &c, taxi.clone());
+        assert_eq!(r, taxi, "airborne forgot the runway it was told");
+        // Told 31 on the ground, then moved to 13: said.
+        st.state_runway_change(&tower::Intent::RequestClearance, &c, "cleared".into());
+        st.runway_in_use = Some("13".into());
+        let r = st.state_runway_change(&tower::Intent::RequestTaxi, &c, taxi.clone());
+        assert!(r.contains(", runway change, runway "), "{r}");
     }
 
     /// Two parallels have the SAME heading to within rounding error, so which
