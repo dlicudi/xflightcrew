@@ -598,7 +598,8 @@ everything blackboxes to `logs/blackbox.jsonl` (kinds: `atc`, `autotaxi`, `autot
 - **The crew works the radio as it flies**: a conditional line-up waits on
   `party_line::line_up_condition_clear()`; a held departure reads the hold back before any other
   call (`OwedReadback`, `readback_hold`) and asks again after 150 s held (`reask_held`, #172);
-  `take_departure_handoff()` (readback, retune, check-in);
+  `take_departure_handoff()` (readback, retune, check-in) from the takeoff's climb on
+  (`wait_takeoff_working_the_radio`; read back 37 s late after the takeoff's handoff, #176);
   an IFR readback is judged from when it goes OUT (`ReadbackWait`, `circuit::crew_radio_pending`);
   `take_region_handoff()` (survives `Station::install`; 7000 via `SetTransponder`;
   `region_coach_line` with a pilot flying). **An IFR flight keeps its code** (party line

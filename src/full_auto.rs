@@ -1601,6 +1601,55 @@ where
     }
 }
 
+/// The takeoff wait's poll: a departure handoff is read back within this of
+/// the tower's line reaching the party line.
+const TAKEOFF_POLL_MS: u64 = 500;
+
+/// How the takeoff wait ended: `finished` false at the deadline or an abort;
+/// `checked_in` when the departure handoff was obeyed inside it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TakeoffWait {
+    finished: bool,
+    checked_in: bool,
+}
+
+/// Wait for the takeoff to end, working the radio as it climbs: `obey` takes
+/// the tower's departure handoff (readback on the tower, retune, check-in) on
+/// the poll it is published, true once obeyed. Until #176 only the enroute
+/// wait took it, so the readback waited for the takeoff's handoff (EGKK 08R,
+/// sortie 1790624015: given at +1082.9, 960 ft; read back at +1120.2, on a
+/// tower that had gone quiet).
+async fn wait_takeoff_working_the_radio<R, RF, H, HF>(
+    secs: f64,
+    step_ms: u64,
+    mut running: R,
+    mut obey: H,
+) -> TakeoffWait
+where
+    R: FnMut() -> RF,
+    RF: std::future::Future<Output = bool>,
+    H: FnMut() -> HF,
+    HF: std::future::Future<Output = bool>,
+{
+    let deadline = Instant::now() + Duration::from_secs_f64(secs);
+    let mut checked_in = false;
+    loop {
+        if ABORT.load(SeqCst) {
+            return TakeoffWait { finished: false, checked_in };
+        }
+        if !checked_in && obey().await {
+            checked_in = true;
+        }
+        if !running().await {
+            return TakeoffWait { finished: true, checked_in };
+        }
+        if Instant::now() >= deadline {
+            return TakeoffWait { finished: false, checked_in };
+        }
+        tokio::time::sleep(Duration::from_millis(step_ms)).await;
+    }
+}
+
 /// Wait for the auto drive (taxi, line-up, backtrack) to end. False when
 /// it gained no ground along its route for `autotaxi::DRIVE_NO_PROGRESS_S`,
 /// ran past `autotaxi::DRIVE_CEILING_S`, or the mission was aborted. Never
@@ -3146,6 +3195,9 @@ async fn fly_route(
     // (The GPS already has the route: fly() writes the FMS mailbox at arm
     // time, at the gate, so the taxi happens with the plan on the map.)
 
+    // Checked in with departure during the takeoff's climb: the clearance's
+    // ceiling has done its job and is not put back after the takeoff.
+    let mut checked_in = false;
     if !matches!(tools.mission, Mission::Resume(_)) {
         // --- Takeoff: the proven loop, armed through its tool so every arm-time
         // gate applies (the pitch-channel probe included).
@@ -3178,7 +3230,28 @@ async fn fly_route(
             return;
         }
         waiting("the takeoff");
-        if !wait_until(360.0, 1000, || async { !crate::autotakeoff::running() }).await {
+        // The takeoff's climb works the radio too: the tower hands us to
+        // departure at field + 700 ft, long before the takeoff hands over
+        // (#176, EGKK 08R: read back 37 s late at 2,760 ft AGL, after the
+        // takeoff's handoff).
+        let climb_to_ft = check_in_climb_ft(&route.legs, route.cruise_ft);
+        let obey = move || async move {
+            let Some((to, khz)) = crate::party_line::take_departure_handoff() else {
+                return false;
+            };
+            event("departure_handoff", json!({ "during": "takeoff", "to": &to, "khz": khz }));
+            obey_departure_handoff(xp, callsign, to, khz, climb_to_ft).await;
+            true
+        };
+        let wait = wait_takeoff_working_the_radio(
+            360.0,
+            TAKEOFF_POLL_MS,
+            || async { crate::autotakeoff::running() },
+            obey,
+        )
+        .await;
+        checked_in = wait.checked_in;
+        if !wait.finished {
             if !ABORT.load(SeqCst) {
                 give_up(
                     xp,
@@ -3261,6 +3334,7 @@ async fn fly_route(
     // at the check-in, `obey_departure_handoff`).
     let ceiling = crate::party_line::assigned_clearance()
         .filter(|_| route.ifr && !matches!(tools.mission, Mission::Resume(_)))
+        .filter(|_| !checked_in)
         .map(|c| c.initial_alt_ft as f64);
     crate::procedure::hold_at_cleared(ceiling, "ifr_clearance");
     if !crate::procedure::start_scoped(
@@ -6516,6 +6590,66 @@ mod cleared_runway_tests {
 
 #[cfg(test)]
 mod tests {
+    /// EGKK 08R, sortie 1790624015-full_auto (#176): the tower's "contact
+    /// London Gatwick Departure" reached the party line at +1082.9 (960 ft)
+    /// while the takeoff flew until its handoff at +1119.9; only the enroute
+    /// wait took it, so the readback went at +1120.2. The takeoff's wait now
+    /// obeys it on the next poll, on the tower, long before the handoff.
+    #[tokio::test(start_paused = true)]
+    async fn the_takeoff_reads_back_the_departure_handoff_at_once() {
+        use super::{wait_takeoff_working_the_radio, TakeoffWait, TAKEOFF_POLL_MS};
+        use std::cell::Cell;
+        let t0 = tokio::time::Instant::now();
+        // Seconds since the sortie began; the takeoff wait opened at +1040.
+        let now = move || 1040.0 + t0.elapsed().as_secs_f64();
+        let (given, handed_over) = (1082.9, 1119.9);
+        let obeyed = Cell::new(None::<f64>);
+        let wait = wait_takeoff_working_the_radio(
+            360.0,
+            TAKEOFF_POLL_MS,
+            || async { now() < handed_over },
+            || async {
+                // The party line holds the handoff from the moment it is
+                // spoken until someone takes it.
+                if obeyed.get().is_none() && now() >= given {
+                    obeyed.set(Some(now()));
+                    // The readback holds the frequency before the retune.
+                    tokio::time::sleep(std::time::Duration::from_secs(4)).await;
+                    return true;
+                }
+                false
+            },
+        )
+        .await;
+        assert_eq!(wait, TakeoffWait { finished: true, checked_in: true });
+        let at = obeyed.get().expect("the handoff was obeyed in the takeoff");
+        assert!(at - given <= TAKEOFF_POLL_MS as f64 / 1000.0 + 1e-6, "read back at +{at}");
+        assert!(at < handed_over - 30.0, "not held for the takeoff's handoff: +{at}");
+        // No handoff spoken (a circuit, an untowered field): the wait still
+        // ends with the takeoff and nothing is owed.
+        let t1 = tokio::time::Instant::now();
+        let wait = wait_takeoff_working_the_radio(
+            360.0,
+            TAKEOFF_POLL_MS,
+            || async { t1.elapsed().as_secs_f64() < 80.0 },
+            || async { false },
+        )
+        .await;
+        assert_eq!(wait, TakeoffWait { finished: true, checked_in: false });
+    }
+
+    /// The fly_route takeoff wait is the one that works the radio, and the
+    /// clearance's ceiling is not put back over a check-in made inside it.
+    #[test]
+    fn the_takeoff_wait_takes_the_departure_handoff() {
+        let src = include_str!("full_auto.rs");
+        let body = src.split("async fn fly_route(").nth(1).expect("fly_route");
+        let takeoff = body.split("event(\"airborne\"").next().unwrap();
+        assert!(takeoff.contains("wait_takeoff_working_the_radio("));
+        assert!(takeoff.contains("take_departure_handoff()"));
+        assert!(body.contains(".filter(|_| !checked_in)"));
+    }
+
     /// EGKK, 2026-09-28 (#151): the arm found Malaga's station up at Gatwick
     /// stand 71. It arms the field's station once, waits for the main loop
     /// to install it, and refuses in words when it never comes.
