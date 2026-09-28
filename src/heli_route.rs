@@ -1032,6 +1032,69 @@ fn call_inbound(base_url: &str, khz: i64) {
     });
 }
 
+/// What the route owes a tower that asked "say callsign and intentions"
+/// (the zone watch's challenge, `party_line::take_zone_challenge`, drained
+/// every tick whoever asked it).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ChallengeAnswer {
+    /// The destination's own tower: the inbound call is the answer, as for
+    /// the aeroplanes (`full_auto::inbound_due`).
+    Inbound(i64),
+    /// Any other field's tower: we are crossing its zone.
+    Transit,
+}
+
+/// The answers one field gets before the route stops answering it: a call
+/// the tower heard is two-way contact and ends its questions, so a third
+/// challenge means the frequency is not hearing us.
+pub const CHALLENGE_ANSWERS_MAX: u32 = 2;
+
+/// The answer owed a challenge heard on the station `home_khz`, with the
+/// destination's tower `dest_khz` and `answered` answers already given that
+/// station. `None`: no challenge, no tower to answer, or answered enough.
+/// A crossing field is never answered "inbound" (the aeroplanes' rule). Pure.
+pub fn challenge_answer(
+    challenged: bool,
+    home_khz: Option<i64>,
+    dest_khz: Option<i64>,
+    answered: u32,
+) -> Option<ChallengeAnswer> {
+    let home = home_khz.filter(|_| challenged)?;
+    if answered >= CHALLENGE_ANSWERS_MAX {
+        return None;
+    }
+    Some(if dest_khz == Some(home) {
+        ChallengeAnswer::Inbound(home)
+    } else {
+        ChallengeAnswer::Transit
+    })
+}
+
+/// The transit call on the frequency the challenge came on (COM1 is on it:
+/// the watch only asks aloud when it is): who, what, how high, and the
+/// request. Off the control loop.
+fn call_transit(base_url: &str, level_ft: f64) {
+    let base = base_url.to_string();
+    tokio::spawn(async move {
+        let xp = XPlaneClient::new(base);
+        let callsign = crate::circuit::crew_callsign(&xp).await;
+        let alt = xp
+            .get_float("sim/cockpit2/gauges/indicators/altitude_ft_pilot")
+            .await
+            .unwrap_or(level_ft);
+        crate::circuit::transmit(crate::circuit::radio_call(&callsign, &transit_words(alt)));
+    });
+}
+
+/// The transit request's words, the level to the hundred: "helicopter, two
+/// thousand two hundred feet, request zone transit". Pure.
+pub fn transit_words(alt_ft: f64) -> String {
+    format!(
+        "helicopter, {} feet, request zone transit",
+        crate::atis::spoken_alt(alt_ft)
+    )
+}
+
 /// The taxi-in's settings, for the parking at the destination (the same
 /// [`crate::taxi_in::start`] the aeroplanes use).
 #[derive(Clone)]
@@ -1352,6 +1415,11 @@ async fn fly(
     let mut bug_set: Option<f64> = None;
     let mut unheld_since: Option<std::time::Instant> = None;
     let mut slow_tail_said = false;
+    // The inbound call went out (at the approach, or as the answer to the
+    // destination's challenge): the approach does not make it twice.
+    let mut inbound_made = false;
+    // Answers given each station's zone challenge, by frequency.
+    let mut answered: std::collections::HashMap<i64, u32> = std::collections::HashMap::new();
     let mut last = std::time::Instant::now();
     let mut tick_n = 0u64;
     if route.arrive_only {
@@ -1417,6 +1485,34 @@ async fn fly(
         // The radio is worked whatever the phase: the handoffs arrive in the
         // climb (the tower's) and anywhere enroute (the region's).
         obey_handoffs(&base_url, &voice, cruise_alt_ft);
+        // A tower asking who we are: the destination's gets the inbound
+        // call, any other field's the transit request. Drained every pass
+        // whoever asked (#83: EDVW-ETND 2026-09-23 crossed zones with the
+        // question unanswered).
+        let challenged = crate::party_line::take_zone_challenge();
+        if challenged && crate::mode::atc_enabled() {
+            let home = crate::party_line::home_tower_khz();
+            let n = home.map_or(0, |k| *answered.get(&k).unwrap_or(&0));
+            let answer = challenge_answer(true, home, route.dest_tower_khz, n);
+            crate::blackbox::record(
+                "heli_route",
+                serde_json::json!({
+                    "event": "zone_challenge", "home_khz": home, "dest_khz": route.dest_tower_khz,
+                    "answer": answer.map(|a| format!("{a:?}")), "answered_before": n,
+                    "phase": format!("{phase:?}"),
+                }),
+            );
+            if let (Some(k), Some(a)) = (home, answer) {
+                *answered.entry(k).or_insert(0) += 1;
+                match a {
+                    ChallengeAnswer::Inbound(khz) => {
+                        inbound_made = true;
+                        call_inbound(&base_url, khz);
+                    }
+                    ChallengeAnswer::Transit => call_transit(&base_url, level_ft),
+                }
+            }
+        }
         match phase {
             Phase::Depart => {
                 let running = hover::ACTIVE.load(Ordering::SeqCst);
@@ -1588,7 +1684,8 @@ async fn fly(
                                 Priority::Readback,
                                 format!("Starting down for {}.", route.destination),
                             );
-                            if let Some(khz) = route.dest_tower_khz {
+                            if let Some(khz) = route.dest_tower_khz.filter(|_| !inbound_made) {
+                                inbound_made = true;
                                 call_inbound(&base_url, khz);
                             }
                         }
@@ -1603,7 +1700,8 @@ async fn fly(
                                 Priority::Readback,
                                 format!("Slowing for {}.", route.destination),
                             );
-                            if let Some(khz) = route.dest_tower_khz {
+                            if let Some(khz) = route.dest_tower_khz.filter(|_| !inbound_made) {
+                                inbound_made = true;
                                 call_inbound(&base_url, khz);
                             }
                         }
@@ -2241,6 +2339,45 @@ mod tests {
             new < hover::TAKEOVER_MAX_MPS,
             "new: {:.1} kt over the ground",
             new * 1.943_84
+        );
+    }
+
+    /// #83: a tower's "say callsign and intentions" is answered: the
+    /// destination's own tower with the inbound call, any other field's with
+    /// a transit request the tower parses as one, and a station that keeps
+    /// asking is not answered forever (EDVW-ETND 2026-09-23: every transit
+    /// field's challenge went unanswered).
+    #[test]
+    fn a_zone_challenge_is_answered_inbound_at_home_and_transit_elsewhere() {
+        assert_eq!(challenge_answer(false, Some(131200), Some(131200), 0), None);
+        assert_eq!(challenge_answer(true, None, Some(131200), 0), None);
+        assert_eq!(
+            challenge_answer(true, Some(131200), Some(131200), 0),
+            Some(ChallengeAnswer::Inbound(131200))
+        );
+        assert_eq!(
+            challenge_answer(true, Some(118500), Some(131200), 0),
+            Some(ChallengeAnswer::Transit),
+            "a crossing field is never answered inbound"
+        );
+        assert_eq!(
+            challenge_answer(true, Some(118500), None, 1),
+            Some(ChallengeAnswer::Transit)
+        );
+        assert_eq!(
+            challenge_answer(true, Some(118500), None, CHALLENGE_ANSWERS_MAX),
+            None
+        );
+        let words = transit_words(2240.0);
+        assert_eq!(
+            words,
+            "helicopter, two thousand two hundred feet, request zone transit"
+        );
+        let call = crate::circuit::radio_call(&Some("Delta Hotel Xray".into()), &words);
+        assert_eq!(
+            crate::tower::parse_intent(&call),
+            crate::tower::Intent::RequestTransit,
+            "{call}"
         );
     }
 

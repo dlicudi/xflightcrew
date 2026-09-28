@@ -138,6 +138,15 @@ pub enum Intent {
     /// CLEARANCE (2026-07-10) — the exact mishear-to-clearance failure the
     /// corpus exists to prevent.
     RequestFrequencyChange,
+    /// "request zone transit" / "transiting your zone northbound": an
+    /// aircraft passing through the zone to somewhere else, the answer to the
+    /// zone watch's "say callsign and intentions" from a field it is only
+    /// crossing. Cleared through with the pressure and "report leaving the
+    /// zone"; the sequence is untouched (it neither departs nor lands here).
+    /// Until #83 a helicopter route had no words for it and a transit field
+    /// challenged it on every cooldown (EDVW-ETND, 2026-09-23); full auto
+    /// blackboxed the question unanswered.
+    RequestTransit,
     Unknown,
 }
 
@@ -564,6 +573,13 @@ pub fn parse_intent(transcript: &str) -> Intent {
     {
         return Intent::Unknown;
     }
+    // A zone transit, before the IFR clearance and every runway and landing
+    // word: "request clearance to transit the zone" names no destination,
+    // and "transiting to Diepholz for landing" is still a transit HERE. The
+    // readback ("cleared to transit") was already stopped by the guard above.
+    if transit_request(&t) {
+        return Intent::RequestTransit;
+    }
     // The IFR clearance, right after the question guard and before every
     // runway word: a destination's name must never read as a runway call
     // ("clearance to Lands End" is not a landing request), and "ready to
@@ -900,6 +916,21 @@ fn ifr_request(t: &str) -> Option<Option<String>> {
     None
 }
 
+/// A zone transit (lower case in): "transit" / "transiting" as a word, or
+/// crossing or passing THROUGH the zone. "Cross runway two seven" is a
+/// runway crossing, never this: the zone word is required with "cross".
+fn transit_request(t: &str) -> bool {
+    let words: Vec<&str> = t
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|w| !w.is_empty())
+        .collect();
+    let has = |w: &str| words.contains(&w);
+    let zone = has("zone") || t.contains("control zone") || has("ctr");
+    has("transit")
+        || has("transiting")
+        || ((has("cross") || has("crossing") || has("through")) && zone)
+}
+
 /// "stopping", "rejecting takeoff", "aborting the takeoff" (lower case in):
 /// a departure calling its own stop. The takeoff word must sit with the
 /// reject word so "abort" alone (a cockpit word) never reaches it; "stopping"
@@ -960,6 +991,7 @@ pub fn intent_from_label(label: &str) -> Option<Intent> {
         "greeting" => Intent::Greeting,
         "flight_following" => Intent::RequestFlightFollowing,
         "frequency_change" => Intent::RequestFrequencyChange,
+        "request_transit" => Intent::RequestTransit,
         "unknown" => Intent::Unknown,
         _ => return None,
     })
@@ -2588,6 +2620,27 @@ impl Tower {
                     ctx.callsign, ctx.airport
                 )
             }
+            // Through the zone to somewhere else: cleared through, the
+            // pressure, report leaving. No state change: a transit neither
+            // departs nor lands here. The dialect rides the pressure phrase
+            // (`qnh_clause` is the one seam: "altimeter" is the FAA's).
+            Intent::RequestTransit => {
+                if ctx.qnh.to_lowercase().starts_with("altimeter") {
+                    format!(
+                        "{}, transition through the {} airspace approved{}, report clear.",
+                        ctx.callsign,
+                        ctx.airport,
+                        qnh_clause(ctx)
+                    )
+                } else {
+                    format!(
+                        "{}, cleared to transit the {} zone{}, report leaving the zone.",
+                        ctx.callsign,
+                        ctx.airport,
+                        qnh_clause(ctx)
+                    )
+                }
+            }
             // Radio housekeeping: approve and let them go. No state change.
             Intent::RequestFrequencyChange => {
                 format!("{}, frequency change approved.", ctx.callsign)
@@ -3156,6 +3209,49 @@ mod tests {
         assert_eq!(parse_intent("request clearance for taxi"), Intent::RequestTaxi);
     }
 
+    /// #83: a transit field's "say callsign and intentions" is answered with
+    /// a transit request, and the tower clears it through the zone without
+    /// touching the sequence. A runway crossing, the readback and every
+    /// existing request keep their answers.
+    #[test]
+    fn a_zone_transit_is_cleared_through_and_changes_nothing() {
+        for call in [
+            "Hameln Tower, Delta Hotel Xray, S-76 helicopter, two thousand two hundred feet, request zone transit",
+            "request transit of your zone northbound",
+            "transiting your control zone to Diepholz",
+            "request clearance to transit the zone",
+            "request to cross your zone",
+            "passing through the zone, two thousand feet",
+        ] {
+            assert_eq!(parse_intent(call), Intent::RequestTransit, "{call}");
+        }
+        assert_ne!(parse_intent("request to cross runway two seven"), Intent::RequestTransit);
+        assert_eq!(
+            parse_intent("cleared to transit the zone, report leaving"),
+            Intent::Unknown,
+            "the readback is not a request"
+        );
+        assert_eq!(parse_intent("can we transit your zone"), Intent::Unknown);
+        assert_eq!(parse_intent("request clearance to leave the zone"), Intent::RequestClearance);
+        assert_eq!(parse_intent("inbound for landing"), Intent::RequestLanding { touch_and_go: false });
+        assert_eq!(intent_from_label("request_transit"), Some(Intent::RequestTransit));
+        for state in [State::Parked, State::Inbound, State::TakeoffCleared] {
+            let mut twr = Tower::new();
+            twr.state = state;
+            let r = twr.handle(Intent::RequestTransit, &ctx());
+            assert_eq!(twr.state, state, "{state:?}: {r}");
+            assert!(r.starts_with("November one seven two Sierra Papa, cleared to transit the Gibraltar zone"), "{r}");
+            assert!(r.contains("QNH one zero one seven") && r.contains("report leaving the zone"), "{r}");
+        }
+        let faa = Ctx {
+            qnh: "altimeter three zero zero one".into(),
+            ..ctx()
+        };
+        let r = Tower::new().handle(Intent::RequestTransit, &faa);
+        assert!(r.contains("transition through the Gibraltar airspace approved"), "{r}");
+        assert!(r.contains("altimeter three zero zero one"), "{r}");
+    }
+
     /// ctx() with one arrival on final at `nm`.
     fn busy(nm: f64) -> Ctx {
         Ctx {
@@ -3462,6 +3558,7 @@ mod tests {
             Greeting,
             RequestFlightFollowing,
             RequestFrequencyChange,
+            RequestTransit,
             Unknown,
         ];
         // The plain flight, and circuit traffic in both dialects (#148),
@@ -3544,6 +3641,9 @@ mod tests {
                         // A hail, flight following, and radio housekeeping are
                         // answered without touching the sequence.
                         Greeting | RequestFlightFollowing | RequestFrequencyChange => start,
+                        // A transit passes through: it neither departs nor
+                        // lands here, and the sequence stands.
+                        RequestTransit => start,
                         // A position report off the runway is acknowledged and
                         // changes nothing — see the handler.
                         RunwayVacated => start,
