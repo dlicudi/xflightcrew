@@ -3401,9 +3401,16 @@ pub async fn run(
             // still silence it; a normal landing does not.
             let cabin_quiet = gates.cabin_quiet;
             feed_surface_wind();
-            // The oxygen valve follows the oxygen master (crew hands only).
+            // The crew's oxygen masks: on in the cabin-altitude warning band,
+            // off again below it, never over the pilot (crew hands only;
+            // #159: they used to follow the master and breathed all flight).
             if crate::mode::crew_actuates() {
-                let _ = crate::tools::cabin_air::sync_valve(&xp).await;
+                if let Some((urgent, line)) =
+                    crate::tools::cabin_air::masks_tick(&xp, snap.on_ground).await
+                {
+                    let p = if urgent { Priority::Warning } else { Priority::Advisory };
+                    voice.alert(p, line);
+                }
             }
             // Cabin crew watches (crew-side, airframes with a cabin crew
             // only): the owed "cabin secure" report after an acknowledged
@@ -4791,7 +4798,8 @@ pub async fn run(
                                     let _ = xp.run_command(cmd).await;
                                 }
                                 // A cabin climbing through ten thousand: the
-                                // crew's own air first (bleed, oxygen), and
+                                // crew's own air first (bleed, the oxygen
+                                // supply; the masks are `masks_tick`'s), and
                                 // past the warning band a follower that is
                                 // flying goes DOWN (its terrain floor still
                                 // rules). Two "cabin altitude" callouts went by
