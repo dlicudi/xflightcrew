@@ -339,6 +339,10 @@ pub struct Memory {
     pub joined_airborne: bool,
     pub origin: Option<(f64, f64)>,
     pub takeoff_t: Option<f64>,
+    /// When this flight last left the ground, or was first seen in the air:
+    /// the takeoff, a touch and go, or the join. The time aloft a landing
+    /// ends (rapport's "an hour in the air").
+    pub aloft_t: Option<f64>,
     pub fuel_at_takeoff_kg: Option<f64>,
     pub peak_alt_ft: f64,
     pub peak_agl_ft: f64,
@@ -730,6 +734,7 @@ impl Flight {
         self.memory = Memory {
             flight_no: self.memory.flight_no + u32::from(to.airborne()),
             joined_airborne: to.airborne(),
+            aloft_t: to.airborne().then_some(s.t),
             ..Memory::default()
         };
         if !first {
@@ -931,6 +936,7 @@ impl Flight {
                 self.off_again = false;
                 self.memory.touch_and_goes += 1;
                 self.memory.takeoff_t = Some(t);
+                self.memory.aloft_t = Some(t);
                 ev.push(Event::TouchAndGo);
             }
             return;
@@ -1162,6 +1168,7 @@ impl Flight {
             flight_no: self.memory.flight_no + 1,
             origin: s.lat.zip(s.lon),
             takeoff_t: Some(s.t),
+            aloft_t: Some(s.t),
             fuel_at_takeoff_kg: s.fuel_kg,
             ..Memory::default()
         };

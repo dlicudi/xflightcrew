@@ -43,6 +43,21 @@ pub const EXCURSION_ALLOW_S: f64 = 3.0;
 /// A deviation past this multiple of the tolerance fails the axis outright,
 /// however brief.
 pub const GROSS_MULT: f64 = 2.0;
+/// The taxi lesson's centreline (#88), metres off the cleared route: the
+/// sortie scorecard's own line at private (`scorecard::TAXI_MAX_LAT_M`, the
+/// crew's taxi is held to it), tighter at commercial. Inside a route VERTEX
+/// while turning through it the offset is a cut, judged at
+/// `scorecard::TAXI_MAX_CUT_M` by the same `scorecard::LineJudge`: no wheel
+/// follows a polyline's corner.
+pub const TAXI_LINE_PRIVATE_M: f64 = crate::scorecard::TAXI_MAX_LAT_M;
+pub const TAXI_LINE_COMMERCIAL_M: f64 = 2.0;
+/// A route turn this close ahead (the turn card's next decision point) asks
+/// for the turn: the corner opens, as the drive's `turn_dps` opens it for
+/// the scorecard.
+pub const LINE_CORNER_AHEAD_M: f64 = 15.0;
+/// The line is not judged this close to the route's end: the stop at the
+/// hold short, where the projection runs onto the last stub.
+pub const LINE_END_M: f64 = 5.0;
 /// Level flight for the level-off judgement: this little vertical speed for
 /// [`LEVEL_OFF_HOLD_S`].
 pub const LEVEL_OFF_VSI_FPM: f64 = 150.0;
@@ -189,6 +204,8 @@ pub struct Standards {
     pub ias_minus: f64,
     /// (target bank, tolerance) where a bank is the task.
     pub bank: Option<(f64, f64)>,
+    /// Metres off the cleared route (the taxi's centreline).
+    pub line_m: Option<f64>,
 }
 
 impl Task {
@@ -243,6 +260,12 @@ impl Task {
             Level::Private => (100.0, 10.0, 10.0),
             Level::Commercial => (50.0, 5.0, 5.0),
         };
+        // The taxi's centreline: the sortie scorecard's line at private,
+        // tighter at commercial (the ACS names no figure).
+        let line = match level {
+            Level::Private => TAXI_LINE_PRIVATE_M,
+            Level::Commercial => TAXI_LINE_COMMERCIAL_M,
+        };
         let steep_bank = match level {
             Level::Private => 45.0,
             Level::Commercial => 50.0,
@@ -257,6 +280,7 @@ impl Task {
                 ias_plus: TAXI_OVER_KTS,
                 ias_minus: 100.0,
                 bank: None,
+                line_m: Some(line),
             },
             // Centreline as the roll heading; Vy +10/-5 in the initial climb.
             Task::Takeoff => Standards {
@@ -265,6 +289,7 @@ impl Task {
                 ias_plus: 10.0,
                 ias_minus: 5.0,
                 bank: None,
+                line_m: None,
             },
             Task::StraightAndLevel => Standards {
                 alt_ft: Some(alt),
@@ -272,6 +297,7 @@ impl Task {
                 ias_plus: ias,
                 ias_minus: ias,
                 bank: None,
+                line_m: None,
             },
             Task::Climb | Task::Descent => Standards {
                 alt_ft: Some(alt),
@@ -279,6 +305,7 @@ impl Task {
                 ias_plus: 10.0,
                 ias_minus: 5.0,
                 bank: None,
+                line_m: None,
             },
             Task::SteepTurns => Standards {
                 alt_ft: Some(alt),
@@ -286,6 +313,7 @@ impl Task {
                 ias_plus: ias,
                 ias_minus: ias,
                 bank: Some((steep_bank, 5.0)),
+                line_m: None,
             },
             Task::SlowFlight => Standards {
                 alt_ft: Some(alt),
@@ -293,6 +321,7 @@ impl Task {
                 ias_plus: ias,
                 ias_minus: 0.0,
                 bank: Some((0.0, 10.0)),
+                line_m: None,
             },
             Task::Pattern => Standards {
                 alt_ft: Some(alt),
@@ -300,6 +329,7 @@ impl Task {
                 ias_plus: ias,
                 ias_minus: ias,
                 bank: None,
+                line_m: None,
             },
             Task::Landing => Standards {
                 alt_ft: None,
@@ -307,6 +337,7 @@ impl Task {
                 ias_plus: 10.0,
                 ias_minus: 5.0,
                 bank: None,
+                line_m: None,
             },
         }
     }
@@ -398,6 +429,59 @@ pub struct Sample {
     /// Groundspeed, knots (the taxi's pace, the takeoff roll).
     pub gs_kts: f64,
     pub engine_running: bool,
+    /// Where the aircraft stands against the cleared taxi route, while one
+    /// is published and the aircraft is on the ground; `None` otherwise.
+    pub taxi: Option<TaxiLine>,
+}
+
+/// The aircraft against the cleared taxi route, from the taxi guide's turn
+/// card (`taxi_guide::TurnCard`, the same projection the panel's arrow
+/// draws).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TaxiLine {
+    /// Signed cross-track, metres, positive right of the route.
+    pub xtk_m: f64,
+    /// Route left to its end, metres.
+    pub remaining_m: f64,
+    /// The side (+1 right, -1 left) of a route turn inside
+    /// [`LINE_CORNER_AHEAD_M`], if there is one.
+    pub turn: Option<f64>,
+    /// Past the guide's off-route line: the controller's conversation.
+    pub off_route: bool,
+}
+
+impl TaxiLine {
+    pub fn from_card(c: &crate::taxi_guide::TurnCard) -> TaxiLine {
+        TaxiLine {
+            xtk_m: c.xtk_m,
+            remaining_m: c.remaining_m,
+            turn: (c.kind == 'T' && c.dist_m <= LINE_CORNER_AHEAD_M && c.turn_deg != 0.0)
+                .then(|| c.turn_deg.signum()),
+            off_route: c.kind == 'X',
+        }
+    }
+
+    /// The blackbox `state` record's `taxi` field: `[xtk, remaining, turn,
+    /// off]`, turn 0 for none.
+    pub fn json(&self) -> Value {
+        json!([
+            (self.xtk_m * 10.0).round() / 10.0,
+            self.remaining_m.round(),
+            self.turn.unwrap_or(0.0),
+            u8::from(self.off_route)
+        ])
+    }
+
+    pub fn from_json(v: &Value) -> Option<TaxiLine> {
+        let a = v.as_array()?;
+        let turn = a.get(2)?.as_f64()?;
+        Some(TaxiLine {
+            xtk_m: a.first()?.as_f64()?,
+            remaining_m: a.get(1)?.as_f64()?,
+            turn: (turn != 0.0).then_some(turn.signum()),
+            off_route: a.get(3)?.as_f64()? > 0.5,
+        })
+    }
 }
 
 /// What the instructor assigned for the task.
@@ -575,6 +659,9 @@ impl Task {
                 "no more than {:.0} knots over the pace",
                 s.ias_plus
             ));
+            if let Some(l) = s.line_m {
+                std.push(format!("centreline within {l:.0} metres"));
+            }
         }
         if let Some(a) = s.alt_ft {
             std.push(format!("altitude within {a:.0} feet"));
@@ -645,6 +732,8 @@ pub enum Axis {
     Airspeed,
     Bank,
     Pace,
+    /// The taxi's cross-track to the cleared route.
+    Centreline,
 }
 
 impl Axis {
@@ -655,6 +744,7 @@ impl Axis {
             Axis::Airspeed => "airspeed",
             Axis::Bank => "bank",
             Axis::Pace => "pace",
+            Axis::Centreline => "centreline",
         }
     }
 }
@@ -751,6 +841,16 @@ impl AxisScore {
                 if dev > 0.0 { "steep" } else { "shallow" }
             ),
             Axis::Pace => format!("Pace, {:.0} over.", mag.round()),
+            Axis::Centreline => format!(
+                "Centreline, {:.0} {} {}.",
+                mag.round(),
+                if mag.round() == 1.0 {
+                    "metre"
+                } else {
+                    "metres"
+                },
+                if dev > 0.0 { "right" } else { "left" }
+            ),
         }
     }
 
@@ -767,6 +867,8 @@ impl AxisScore {
             (Axis::Bank, true) => " Shallow it a little.",
             (Axis::Bank, false) => " A little more bank.",
             (Axis::Pace, _) => " Ease the power back and hold it with the brakes.",
+            (Axis::Centreline, true) => " A touch of left rudder, onto the line.",
+            (Axis::Centreline, false) => " A touch of right rudder, onto the line.",
         }
     }
 
@@ -810,6 +912,7 @@ impl AxisGrade {
             Axis::Altitude => "feet",
             Axis::Heading | Axis::Bank => "degrees",
             Axis::Airspeed | Axis::Pace => "knots",
+            Axis::Centreline => "metres",
         }
     }
 
@@ -829,6 +932,8 @@ impl AxisGrade {
             (Axis::Bank, false) => "shallow",
             (Axis::Pace, true) => "over",
             (Axis::Pace, false) => "under",
+            (Axis::Centreline, true) => "right",
+            (Axis::Centreline, false) => "left",
         };
         let unit = if mag.round() == 1.0 {
             self.unit().trim_end_matches('s')
@@ -961,6 +1066,21 @@ pub struct Scorer {
     ias: Option<AxisScore>,
     bank: Option<AxisScore>,
     pace: Option<AxisScore>,
+    /// The taxi's centreline: the narrated axis and the scorecard's judge
+    /// behind its grade (vertex cuts are cuts).
+    line: Option<AxisScore>,
+    line_judge: crate::scorecard::LineJudge,
+    /// On the line once: judged from the first tick inside the tolerance
+    /// (the stand is off the route; the scorecard's capture).
+    line_captured: bool,
+    /// Left the cleared route (the guide's off-route line).
+    left_route: bool,
+    /// The open corner's state last tick (`LineJudge::open_vertex`), the
+    /// seconds past the tolerance inside it, and the seconds inside corners
+    /// that closed as drawn CURVES: those are time off the line after all.
+    corner_state: Option<bool>,
+    corner_out_s: f64,
+    curve_out_s: f64,
     started_t: Option<f64>,
     last: Option<Sample>,
     /// Seconds the aircraft has been level (climb/descent level-off watch).
@@ -1011,6 +1131,9 @@ impl Scorer {
             None
         };
         let ias = if task == Task::Taxi { None } else { ias };
+        let line = s
+            .line_m
+            .map(|tol| AxisScore::new(Axis::Centreline, 0.0, tol, tol));
         Scorer {
             task,
             level,
@@ -1020,6 +1143,13 @@ impl Scorer {
             ias,
             bank,
             pace,
+            line,
+            line_judge: crate::scorecard::LineJudge::default(),
+            line_captured: false,
+            left_route: false,
+            corner_state: None,
+            corner_out_s: 0.0,
+            curve_out_s: 0.0,
             started_t: None,
             last: None,
             level_s: 0.0,
@@ -1066,6 +1196,8 @@ impl Scorer {
             Axis::Airspeed => &mut self.ias,
             Axis::Bank => &mut self.bank,
             Axis::Pace => &mut self.pace,
+            // The line is the route's: nothing to retarget.
+            Axis::Centreline => return,
         };
         if let Some(a) = slot.as_mut() {
             a.target = target;
@@ -1076,6 +1208,7 @@ impl Scorer {
             Axis::Airspeed => self.targets.ias_kts = Some(target),
             Axis::Bank => self.targets.bank_deg = Some(target),
             Axis::Pace => self.targets.pace_kts = Some(target),
+            Axis::Centreline => {}
         }
     }
 
@@ -1122,6 +1255,9 @@ impl Scorer {
                         gs - self.targets.pace_kts.unwrap_or(gs),
                         &mut lines,
                     );
+                }
+                if let Some(l) = self.line_tick(s, &prev, dt) {
+                    lines.push(l);
                 }
                 self.moved_m += gs * KTS_TO_MPS * dt;
                 if s.on_ground && gs > ROLL_KTS * 2.0 {
@@ -1395,22 +1531,107 @@ impl Scorer {
     }
 
     pub fn grade(&self) -> Grade {
-        let axes: Vec<AxisGrade> = [&self.alt, &self.hdg, &self.ias, &self.bank, &self.pace]
+        let mut axes: Vec<AxisGrade> = [&self.alt, &self.hdg, &self.ias, &self.bank, &self.pace]
             .into_iter()
             .flatten()
             .map(AxisScore::grade)
             .collect();
+        let mut notes = self.notes.clone();
+        let mut task_failed = self.task_failed;
+        if let Some(a) = &self.line {
+            let (g, cut) = self.line_grade(a);
+            if cut > crate::scorecard::TAXI_MAX_CUT_M {
+                notes.push(format!("Cut a corner by {cut:.0} metres."));
+                task_failed = true;
+            }
+            if self.left_route {
+                notes.push("Left the cleared route.".into());
+                task_failed = true;
+            }
+            axes.push(g);
+        }
         let pass = self.complete
-            && !self.task_failed
+            && !task_failed
             && axes.iter().filter(|a| a.judged_s > 0.0).all(|a| a.pass);
         Grade {
             task: self.task,
             level: self.level,
             axes,
-            notes: self.notes.clone(),
+            notes,
             complete: self.complete,
             pass,
         }
+    }
+
+    /// The taxi's centreline for one tick: judged while moving on the
+    /// cleared route, from the first tick inside the tolerance, short of the
+    /// route's end. The offset goes to the scorecard's `LineJudge` (the
+    /// grade's numbers); the narration hears it too, except inside a corner
+    /// being turned through within `TAXI_MAX_CUT_M` (a cut is not an
+    /// excursion) and off the route altogether (the guide and the tower own
+    /// that; the grade fails it).
+    fn line_tick(&mut self, s: &Sample, prev: &Sample, dt: f64) -> Option<String> {
+        let tl = s.taxi?;
+        let axis = self.line.as_mut()?;
+        let gs = s.gs_kts.abs();
+        let yaw = if dt > 0.0 {
+            wrap180(s.hdg_deg - prev.hdg_deg) / dt
+        } else {
+            0.0
+        };
+        let cutting =
+            self.line_judge
+                .corner(s.t_s, gs, tl.xtk_m, Some(tl.remaining_m), tl.turn, yaw);
+        let now = self.line_judge.open_vertex();
+        if let (Some(was_vertex), None) = (self.corner_state, now) {
+            if !was_vertex {
+                self.curve_out_s += self.corner_out_s;
+            }
+            self.corner_out_s = 0.0;
+        }
+        self.corner_state = now;
+        if !s.on_ground || gs <= TAXI_MOVING_KTS || tl.remaining_m < LINE_END_M {
+            return None;
+        }
+        if tl.off_route {
+            if self.line_captured {
+                self.left_route = true;
+            }
+            return None;
+        }
+        if !self.line_captured {
+            if tl.xtk_m.abs() > axis.tol_plus {
+                return None;
+            }
+            self.line_captured = true;
+        }
+        self.line_judge.judge(tl.xtk_m, cutting);
+        if cutting && tl.xtk_m.abs() > axis.tol_plus {
+            self.corner_out_s += dt;
+        }
+        let dev = if cutting && tl.xtk_m.abs() <= crate::scorecard::TAXI_MAX_CUT_M {
+            0.0
+        } else {
+            tl.xtk_m
+        };
+        axis.feed(dev, dt, s.t_s)
+    }
+
+    /// The centreline's grade: the narrated axis's time outside, the
+    /// judge's worst offset (a drawn curve's inside included) with the side
+    /// the axis saw, and the deepest vertex cut.
+    fn line_grade(&self, a: &AxisScore) -> (AxisGrade, f64) {
+        let mut judge = self.line_judge.clone();
+        judge.flush();
+        let mut g = a.grade();
+        let side = if g.worst < 0.0 { -1.0 } else { 1.0 };
+        let worst = g.worst.abs().max(judge.max_lat);
+        g.worst = side * worst;
+        let open_curve = self.line_judge.open_vertex() == Some(false);
+        g.out_s += self.curve_out_s + if open_curve { self.corner_out_s } else { 0.0 };
+        g.pass =
+            g.judged_s > 0.0 && worst <= g.tol_plus * GROSS_MULT && g.out_s <= EXCURSION_ALLOW_S;
+        (g, judge.max_cut)
     }
 }
 
@@ -2445,6 +2666,7 @@ pub fn grade_flight(
                 track_deg: f(e, "track"),
                 gs_kts: f(e, "gs").unwrap_or(0.0),
                 engine_running: e.get("eng").and_then(Value::as_bool).unwrap_or(true),
+                taxi: e.get("taxi").and_then(TaxiLine::from_json),
             })
         })
         .collect();
@@ -2619,6 +2841,41 @@ pub fn grade_flight(
             g.written()
         ));
     }
+    // Taxis on a cleared route (state records carrying `taxi`): pace and
+    // the centreline, one line each, the same scorer as the lesson.
+    let mut i = 0;
+    while i < samples.len() {
+        if samples[i].taxi.is_none() || !samples[i].on_ground {
+            i += 1;
+            continue;
+        }
+        let a = i;
+        while i < samples.len() && samples[i].taxi.is_some() && samples[i].on_ground {
+            i += 1;
+        }
+        let run = &samples[a..i];
+        let moved = run.iter().any(|s| s.gs_kts.abs() > TAXI_MOVING_KTS);
+        if run.len() < 5 || !moved {
+            continue;
+        }
+        // No profile named: the default straight-leg pace, as the lesson.
+        let mut taxi_refs = refs.clone();
+        if taxi_refs.taxi_kts <= 0.0 {
+            taxi_refs.taxi_kts = DEFAULT_TAXI_KTS;
+        }
+        let targets = Task::Taxi.assign(&run[0], &taxi_refs, level);
+        let mut scorer = Scorer::new(Task::Taxi, level, targets);
+        for s in run {
+            scorer.tick_offline(s);
+        }
+        let g = scorer.grade_offline();
+        out.push(format!(
+            "{}Z taxi for {}: {}",
+            hms(run[0].t_s),
+            mins(run[run.len() - 1].t_s - run[0].t_s),
+            g.written()
+        ));
+    }
     // The final approach and touchdown: the last airborne run before a
     // touchdown, judged below FINAL_AGL_FT.
     if let Some(app) = refs.approach_kts {
@@ -2710,6 +2967,13 @@ impl Scorer {
                     s.ias_kts - self.targets.ias_kts.unwrap_or(s.ias_kts),
                 );
             }
+            Task::Taxi => {
+                let gs = s.gs_kts.abs();
+                if gs > TAXI_MOVING_KTS {
+                    judge(&mut self.pace, gs - self.targets.pace_kts.unwrap_or(gs));
+                }
+                self.line_tick(s, &prev, dt);
+            }
             _ => {}
         }
     }
@@ -2794,6 +3058,7 @@ mod tests {
             track_deg: Some(hdg),
             gs_kts: ias,
             engine_running: true,
+            taxi: None,
         }
     }
 
@@ -3345,6 +3610,7 @@ mod tests {
             track_deg: Some(hdg),
             gs_kts: gs,
             engine_running: eng,
+            taxi: None,
         }
     }
 
@@ -3397,6 +3663,165 @@ mod tests {
         }
         assert!(sc.complete() && !sc.grade().pass);
         assert!(sc.grade().notes[0].contains("without stopping"));
+    }
+
+    /// A taxi on a cleared route at 12 kt: `off(i)` is the cross-track at
+    /// tick `i` (1 s ticks), a right corner flown from tick 30 to 38 (the
+    /// route asks for it from 28; the heading swings 90 to 180), the
+    /// projection jumping `jump` metres along the route at tick 34 (a
+    /// vertex; 0 is a drawn curve), then a stop. Returns the lines said and
+    /// the samples fed.
+    fn taxi_on_route(
+        level: Level,
+        off: impl Fn(usize) -> f64,
+        jump: f64,
+    ) -> (Scorer, Vec<String>, Vec<Sample>) {
+        let t = Targets {
+            pace_kts: Some(15.0),
+            ..Targets::default()
+        };
+        let mut sc = Scorer::new(Task::Taxi, level, t);
+        let (mut lines, mut fed) = (Vec::new(), Vec::new());
+        let mut rem = 800.0;
+        for i in 0..90usize {
+            let moving = i < 78;
+            let gs = if moving { 12.0 } else { 0.0 };
+            let hdg = match i {
+                0..=30 => 90.0,
+                31..=38 => 90.0 + (i - 30) as f64 * 11.25,
+                _ => 180.0,
+            };
+            if moving {
+                rem -= 12.0 * KTS_TO_MPS + if i == 34 { jump } else { 0.0 };
+            }
+            let s = Sample {
+                taxi: Some(TaxiLine {
+                    xtk_m: off(i),
+                    remaining_m: rem,
+                    turn: (28..=34).contains(&i).then_some(1.0),
+                    off_route: false,
+                }),
+                ..gnd(i as f64, gs, hdg, true)
+            };
+            lines.extend(sc.tick(&s));
+            fed.push(s);
+        }
+        (sc, lines, fed)
+    }
+
+    fn centreline(g: &Grade) -> &AxisGrade {
+        g.axes
+            .iter()
+            .find(|a| a.axis == Axis::Centreline)
+            .expect("a centreline axis")
+    }
+
+    #[test]
+    fn the_taxi_is_judged_on_the_centreline_and_a_vertex_cut_is_a_cut() {
+        // Off the stand 20 m from the line, joined by tick 5, 0.3 m down the
+        // straights, 3.8 m inside the right corner while turning through it.
+        let off = |i: usize| match i {
+            0..=4 => 20.0 - i as f64 * 4.9,
+            32..=36 => 3.8,
+            _ => 0.3,
+        };
+        let (sc, lines, _) = taxi_on_route(Level::Private, off, 5.0);
+        assert!(sc.complete());
+        assert_eq!(
+            lines,
+            vec!["Stopped. Holding short, I take it.".to_string()],
+            "a cut inside a vertex is no excursion, the join is not judged"
+        );
+        let g = sc.grade();
+        assert!(g.pass, "{}", g.spoken());
+        assert_eq!(centreline(&g).worst.abs().round(), 0.0, "{:?}", g.axes);
+        assert!(
+            g.notes.iter().all(|n| !n.contains("corner")),
+            "{:?}",
+            g.notes
+        );
+        // The same offset inside a drawn CURVE (no projection jump) is off
+        // the line, as the scorecard reads it: 3.8 m for 5 s, its time
+        // outside counted once the corner closes as a curve.
+        let (sc, lines, _) = taxi_on_route(Level::Private, off, 0.0);
+        let g = sc.grade();
+        assert_eq!((centreline(&g).worst * 10.0).round() / 10.0, 3.8);
+        assert_eq!(centreline(&g).out_s, 5.0);
+        assert!(!centreline(&g).pass);
+        assert_eq!(lines.len(), 1, "never narrated in the corner: {lines:?}");
+        // Commercial holds the line to 2 m: the same curve fails it.
+        let (sc, _, _) = taxi_on_route(Level::Commercial, off, 0.0);
+        assert!(!centreline(&sc.grade()).pass);
+        // A vertex cut deeper than TAXI_MAX_CUT_M fails the task.
+        let deep = |i: usize| if (33..=34).contains(&i) { 6.0 } else { 0.3 };
+        let (sc, _, _) = taxi_on_route(Level::Private, deep, 5.0);
+        let g = sc.grade();
+        assert!(!g.pass);
+        assert!(
+            g.notes.contains(&"Cut a corner by 6 metres.".to_string()),
+            "{:?}",
+            g.notes
+        );
+    }
+
+    #[test]
+    fn a_wander_off_the_line_is_narrated_once_with_its_correction() {
+        let off = |i: usize| if (10..18).contains(&i) { 4.2 } else { 0.3 };
+        let (sc, lines, _) = taxi_on_route(Level::Private, off, 5.0);
+        assert_eq!(
+            lines,
+            vec![
+                "Centreline, 4 metres right. A touch of left rudder, onto the line.".to_string(),
+                "Good, back on centreline.".to_string(),
+                "Stopped. Holding short, I take it.".to_string(),
+            ]
+        );
+        let g = sc.grade();
+        assert!(!g.pass);
+        assert_eq!(
+            centreline(&g).spoken(),
+            "Centreline: 4 metres right at worst, outside for 8 seconds."
+        );
+        // The brief says the standard.
+        let brief = Task::Taxi.brief(
+            &Task::Taxi.assign(&gnd(0.0, 0.0, 90.0, true), &Refs::default(), Level::Private),
+            Level::Private,
+        );
+        assert!(brief.contains("centreline within 3 metres"), "{brief}");
+    }
+
+    #[test]
+    fn the_debrief_grades_a_taxi_from_its_state_records() {
+        let off = |i: usize| if (10..18).contains(&i) { 4.2 } else { 0.3 };
+        let (_, _, fed) = taxi_on_route(Level::Private, off, 5.0);
+        let states: Vec<Value> = fed
+            .iter()
+            .map(|s| {
+                json!({"kind": "state", "t": 1_790_000_000.0 + s.t_s, "alt": s.alt_ft,
+                    "agl": 0.0, "hdg": s.hdg_deg, "ias": s.ias_kts, "vsi": 0.0,
+                    "ground": true, "gs": s.gs_kts, "eng": true,
+                    "taxi": s.taxi.map(|l| l.json())})
+            })
+            .collect();
+        let refs: Vec<&Value> = states.iter().collect();
+        let lines = grade_flight(&refs, None, Level::Private);
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(
+            lines[0]
+                .contains("taxi for 89 s: pace 3 knots under, centreline 4 metres right (FAIL)"),
+            "{lines:?}"
+        );
+        // A state record without the field grades no taxi.
+        let bare: Vec<Value> = states
+            .iter()
+            .map(|v| {
+                let mut v = v.clone();
+                v.as_object_mut().unwrap().remove("taxi");
+                v
+            })
+            .collect();
+        let refs: Vec<&Value> = bare.iter().collect();
+        assert!(grade_flight(&refs, None, Level::Private).is_empty());
     }
 
     #[test]

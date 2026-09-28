@@ -33,10 +33,10 @@ pub const TAXI_MAX_CUT_M: f64 = 5.0;
 /// The route's own turn rate (the drive's `turn_dps`) at or above which a
 /// corner is open, and the yaw rate a tick must carry the same way to be
 /// turning through it.
-const CORNER_TURN_DPS: f64 = 2.0;
-const CORNER_YAW_DPS: f64 = 2.0;
+pub const CORNER_TURN_DPS: f64 = 2.0;
+pub const CORNER_YAW_DPS: f64 = 2.0;
 /// A corner is closed this long after the route last asked for the turn.
-const CORNER_TAIL_S: f64 = 10.0;
+pub const CORNER_TAIL_S: f64 = 10.0;
 /// A tick's `remaining_m` falling by more than the ground covered plus this
 /// much (and this many seconds of groundspeed, for the ticks' own timing
 /// jitter: straights at 18 kt read up to 1.3 m over) is the projection
@@ -121,14 +121,8 @@ struct Taxi {
     t_last: f64,
     ticks: usize,
     max_gs: f64,
-    max_lat: f64,
-    /// Most inside a route VERTEX while turning through it
-    /// ([`TAXI_MAX_CUT_M`]).
-    max_cut: f64,
-    /// The corner being turned through.
-    corner: Option<Corner>,
-    /// The last tick's time and `remaining_m`, for the projection's jump.
-    prev_rem: Option<(f64, f64)>,
+    /// Off the line and inside its vertices.
+    line: LineJudge,
     brake_rate: f64,
     brake_reversals: usize,
     yaw_swings: usize,
@@ -159,11 +153,95 @@ struct Corner {
     vertex: bool,
 }
 
-impl Taxi {
-    /// Judge the corner being closed: inside a vertex it is a cut, inside a
-    /// drawn curve it is off the line like any other tick (the law's own
-    /// bend cap keeps a curve's cut to 1.5 m, so one past the limit is real).
-    fn flush_corner(&mut self) {
+/// The centreline, judged: most off the line ([`TAXI_MAX_LAT_M`]) and most
+/// inside a route VERTEX while turning through it ([`TAXI_MAX_CUT_M`]). One
+/// measure for the sortie's taxi drive and the instructor's taxi lesson
+/// (`instructor::Task::Taxi`), so a pilot and the crew are held to the same
+/// line. Pure: fed per tick with the signed offset (positive right of the
+/// route), the route left, the side the route asks a turn and the yaw.
+#[derive(Debug, Default, Clone)]
+pub struct LineJudge {
+    /// Most off the line, metres (a drawn curve's inside included).
+    pub max_lat: f64,
+    /// Most inside a route vertex while turning through it, metres.
+    pub max_cut: f64,
+    /// The corner being turned through.
+    corner: Option<Corner>,
+    /// The last tick's time and `remaining_m`, for the projection's jump.
+    prev_rem: Option<(f64, f64)>,
+}
+
+impl LineJudge {
+    /// One tick's geometry: `asked` is the side (+1 right, -1 left) the route
+    /// asks a turn this tick, if it does. A corner opens where the route asks
+    /// for a turn and stays open while the aircraft is still turning that way
+    /// (the projection has passed the vertex by the time the offset peaks,
+    /// and the route's turn reads zero there). Returns whether `lat_m` is on
+    /// the open corner's inside: a CUT, judged when the corner closes.
+    pub fn corner(
+        &mut self,
+        t: f64,
+        gs_kts: f64,
+        lat_m: f64,
+        remaining_m: Option<f64>,
+        asked: Option<f64>,
+        yaw_dps: f64,
+    ) -> bool {
+        // The projection leaping along the route faster than the aircraft
+        // moves is its foot crossing from one leg of a vertex to the next:
+        // 2 |lat| tan(D/2) at once, 3 to 7 m at EGBB and EGKK.
+        let jumped = match (self.prev_rem, remaining_m) {
+            (Some((t1, r1)), Some(r2)) => {
+                let v = gs_kts * KTS_TO_MS;
+                (r1 - r2) - v * (t - t1).max(0.0) > CORNER_JUMP_M + CORNER_JUMP_S * v
+            }
+            _ => false,
+        };
+        self.prev_rem = remaining_m.map(|m| (t, m));
+        if let Some(side) = asked {
+            match self.corner.as_mut() {
+                Some(c) if c.side == side => c.asked_t = t,
+                _ => {
+                    self.flush();
+                    self.corner = Some(Corner {
+                        side,
+                        asked_t: t,
+                        inside: 0.0,
+                        vertex: false,
+                    });
+                }
+            }
+        }
+        if self
+            .corner
+            .is_some_and(|c| yaw_dps * c.side < CORNER_YAW_DPS || t - c.asked_t > CORNER_TAIL_S)
+        {
+            self.flush();
+        }
+        if let Some(c) = self.corner.as_mut() {
+            c.vertex |= jumped;
+        }
+        self.corner.is_some_and(|c| lat_m * c.side > 0.0)
+    }
+
+    /// The corner being turned through, if one is open: whether the
+    /// projection has jumped across it yet (a vertex, not a drawn curve).
+    pub fn open_vertex(&self) -> Option<bool> {
+        self.corner.map(|c| c.vertex)
+    }
+
+    /// Judge one tick's offset, `cutting` as [`LineJudge::corner`] said.
+    pub fn judge(&mut self, lat_m: f64, cutting: bool) {
+        match self.corner.as_mut() {
+            Some(c) if cutting => c.inside = c.inside.max(lat_m.abs()),
+            _ => self.max_lat = self.max_lat.max(lat_m.abs()),
+        }
+    }
+
+    /// Close the open corner: inside a vertex it is a cut, inside a drawn
+    /// curve it is off the line like any other tick (the law's own bend cap
+    /// keeps a curve's cut to 1.5 m, so one past the limit is real).
+    pub fn flush(&mut self) {
         if let Some(c) = self.corner.take() {
             if c.vertex {
                 self.max_cut = self.max_cut.max(c.inside);
@@ -473,47 +551,11 @@ impl Scorer {
             f(r, "yaw_dps").unwrap_or(0.0),
         );
         x.max_gs = x.max_gs.max(gs);
-        // A corner opens where the route asks for a turn and stays open while
-        // the aircraft is still turning that way (the projection has passed
-        // the vertex by the time the offset peaks, and the route's turn reads
-        // zero there).
         let turn = f(r, "turn_dps").unwrap_or(0.0);
-        let rem = f(r, "remaining_m");
-        // The projection leaping along the route faster than the aircraft
-        // moves is its foot crossing from one leg of a vertex to the next:
-        // 2 |lat| tan(D/2) at once, 3 to 7 m at EGBB and EGKK.
-        let jumped = match (x.prev_rem, rem) {
-            (Some((t1, r1)), Some(r2)) => {
-                let v = gs * KTS_TO_MS;
-                (r1 - r2) - v * (t - t1).max(0.0) > CORNER_JUMP_M + CORNER_JUMP_S * v
-            }
-            _ => false,
-        };
-        x.prev_rem = rem.map(|m| (t, m));
-        if turn.abs() >= CORNER_TURN_DPS {
-            match x.corner.as_mut() {
-                Some(c) if c.side == turn.signum() => c.asked_t = t,
-                _ => {
-                    x.flush_corner();
-                    x.corner = Some(Corner {
-                        side: turn.signum(),
-                        asked_t: t,
-                        inside: 0.0,
-                        vertex: false,
-                    });
-                }
-            }
-        }
-        if x
-            .corner
-            .is_some_and(|c| yaw * c.side < CORNER_YAW_DPS || t - c.asked_t > CORNER_TAIL_S)
-        {
-            x.flush_corner();
-        }
-        if let Some(c) = x.corner.as_mut() {
-            c.vertex |= jumped;
-        }
-        let cutting = x.corner.is_some_and(|c| lat * c.side > 0.0);
+        let asked = (turn.abs() >= CORNER_TURN_DPS).then(|| turn.signum());
+        let cutting = x
+            .line
+            .corner(t, gs, lat, f(r, "remaining_m"), asked, yaw);
         let past_end = f(r, "remaining_m").is_some_and(|m| m < TAXI_PAST_END_M);
         if past_end {
             x.past_end_ticks += 1;
@@ -525,10 +567,7 @@ impl Scorer {
                 }
             }
             if x.capture == Capture::Tracking {
-                match x.corner.as_mut() {
-                    Some(c) if cutting => c.inside = c.inside.max(lat.abs()),
-                    _ => x.max_lat = x.max_lat.max(lat.abs()),
-                }
+                x.line.judge(lat, cutting);
             } else {
                 x.closest_uncaptured =
                     Some(x.closest_uncaptured.map_or(lat.abs(), |c: f64| c.min(lat.abs())));
@@ -567,7 +606,7 @@ impl Scorer {
         if x.ticks < 5 {
             return;
         }
-        x.flush_corner();
+        x.line.flush();
         x.ended_by = by.to_string();
         let mut fails = Vec::new();
         if stopped {
@@ -587,11 +626,11 @@ impl Scorer {
         if let Some(c) = x.capture_secs.filter(|c| *c > TAXI_CAPTURE_MAX_S) {
             fails.push(format!("{c:.0} s to reach the line after the join"));
         }
-        if x.max_lat > TAXI_MAX_LAT_M {
-            fails.push(format!("{:.1} m off the line", x.max_lat));
+        if x.line.max_lat > TAXI_MAX_LAT_M {
+            fails.push(format!("{:.1} m off the line", x.line.max_lat));
         }
-        if x.max_cut > TAXI_MAX_CUT_M {
-            fails.push(format!("{:.1} m inside a corner", x.max_cut));
+        if x.line.max_cut > TAXI_MAX_CUT_M {
+            fails.push(format!("{:.1} m inside a corner", x.line.max_cut));
         }
         if x.brake_rate > TAXI_MAX_BRAKE_RATE {
             fails.push(format!("brake moved {:.1}/s", x.brake_rate));
@@ -599,8 +638,8 @@ impl Scorer {
         let stage = if x.line_up { "line_up" } else { "taxi" };
         let sortie = x.sortie.clone();
         self.push(stage, sortie, fails, json!({
-            "secs": r1(x.t_last - x.t0), "max_gs": r1(x.max_gs), "max_lat_m": r1(x.max_lat),
-            "max_cut_m": r1(x.max_cut),
+            "secs": r1(x.t_last - x.t0), "max_gs": r1(x.max_gs), "max_lat_m": r1(x.line.max_lat),
+            "max_cut_m": r1(x.line.max_cut),
             "brake_rate": r2(x.brake_rate), "brake_reversals": x.brake_reversals,
             "yaw_swings": x.yaw_swings, "end_err_deg": r1(x.last_err),
             "end_lat_m": r1(x.last_lat), "ended_by": x.ended_by,
