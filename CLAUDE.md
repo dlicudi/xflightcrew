@@ -721,7 +721,10 @@ everything blackboxes to `logs/blackbox.jsonl` (kinds: `atc`, `autotaxi`, `autot
   still-air hold through the 09-26 17:25 plant ballooned to 506).
 - **The flare retard is keyed on height, time to the wheels and speed, never on the sink the
   arrest is removing** (`FlarePower`, `retard_below_ft`, `retard_at_s`, `retard_fast_kts`,
-  `retard_slow_kts`, `retard_max_per_s`; `power` `retard`; LEMG 13 2026-09-28).
+  `retard_slow_kts`, `retard_max_per_s`; `power` `retard`; LEMG 13 2026-09-28), and **a FLOAT takes the
+  thrust off** (a sink under `RETARD_FLOAT_FPM` now or `RETARD_FLOAT_LEAD_S` ahead retards at any height
+  and speed; slow only delays a retard not yet begun); a climb is a balloon only past
+  `BALLOON_CLIMB_FPM` (EGBB 15 2026-09-28).
 - **A slow, low go-around pitches for speed** (`go_around_vs_fpm`: level over the configuration's
   floor, below it a descent no steeper than the ground 10 s away; `go_around_flap_due`): 0 fpm held
   into a stall (EDLP 24 SF50, 2026-09-24).

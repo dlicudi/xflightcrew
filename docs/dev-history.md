@@ -9872,3 +9872,16 @@ The livestate WebSocket cache is per dataref and would not fix it. The plugin no
 reject stop, the autoland tick and rollout, the auto taxi drive, both circuit ticks, taxi-in and the
 monitor snapshot. Replaying 1790591256 with each request two frames late: split reads 3.0 m worst, the
 snapshot 0. Records carry `pos`. Needs `make install` and a plugin reload. Offline only.
+
+## 2026-09-28: a float takes the thrust off (issues #76, #146)
+
+EGBB 15 (737, sortie 1790601822), rough air (41.4 fpm rms): the model flare held 0.28 of column while its
+ask was 0 from 24.9 ft and levelled at 22.7 ft on 0.30 of lever; the retard key went entry, height, time
+(a float is 13 s from the wheels at 100 fpm), then slow (135.6 kt), and the lever never moved; at +1 fpm
+the column eased 0.28 to 0.20, then went to the cap: 288 at the touchdown. The flare's own fit is 6,300
+fpm per unit, 1.7 s dead time: the float is the rough-air hold on a strong elevator (an ease ahead of the
+profile cost the gusty LEMG flares 375+), so the fix is the thrust: a sink under 100 fpm, now or 1.5 s
+ahead, latches the retard at `retard_max_per_s`; slow only delays a retard not yet begun; a climb is a
+balloon from 25 fpm. Through the fit: as flown 5.6 s of float, 940 m, 234 fpm; now no float, 660 m, 318
+fpm. LEMG's sixteen: mean 238 to 244, worst 277. Open: the flare model learning the elevator strength
+in flight. Offline only.
