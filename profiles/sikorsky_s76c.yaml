@@ -98,6 +98,16 @@ heli_start:
   # Locked before the rotor turns, read first (it is a toggle): unlocked, the
   # torque spun the S-76 on the ground at up to 20 deg/s (ETNW, 2026-09-23).
   tail_wheel_lock: sim/flight_controls/tail_wheel_lock_toggle
+# The hover's power budget (src/hover.rs `PowerBudget`, #84) is this
+# airframe's too, and lives beside its power curve in the code until a second
+# helicopter flies: the lever a hover needs goes with weight over density
+# ratio, fitted on the 30 lift-offs of 2026-09-22..25 (0.555 at 163 ft light,
+# 0.644 at hilltop EDVW heavy, 0.711 at LSZS 5,605 ft), references 3,930 kg
+# for the lift-off and 4,180 kg for the curve (3,435 kg empty from the acf,
+# the logged fuel, an assumed 170 kg crew). The most lever it plans on is the
+# law's 0.90 less 0.05. The acf's engines are 802.5 hp each, flat rated to
+# 4,000 m (`_crit_alt_mtr`): no recorded droop with both at FLY was a power
+# limit, so the budget is the lever's, and the rotor guard judges the power.
 auto_prep: false
 magnetos: false
 carb_heat: false

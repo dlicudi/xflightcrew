@@ -18,6 +18,12 @@
 //! helicopter over a range of responses, because the S-76's real hover
 //! collective and gain are only known after the first lift.
 //!
+//! Every lever figure the loop owns is scaled by the POWER BUDGET
+//! ([`PowerBudget`], [`LoadingEstimate`], [`PowerFeed`]): weight over density
+//! ratio from `m_total`, the pressure altitude and the OAT, corrected by the
+//! lever the rotor actually lifts at. A hover the lever cannot give is refused
+//! on the ground, or held in the ground cushion, with its numbers (#84).
+//!
 //! The loop hands back a helicopter the pilot can hold: the collective stays
 //! where it was (a write is not an expiring override here, so it does not
 //! drop), the autopilot is disengaged with the command that actually does it
@@ -377,6 +383,72 @@ pub fn droop_ceiling(nr: f64, cmd: f64, dt_s: f64) -> f64 {
     }
 }
 
+/// A droop is SAID once it has lasted this long, or at once below
+/// [`DROOP_LOWER`]. Every droop recorded with both engines at FLY was the
+/// governor catching a load change: three in the hover taxis of 2026-09-23
+/// (nr 0.970 to 0.974 at 0.69 collective, one of them at hilltop EDVW), each
+/// back above 97 % inside 1.4 s, each announced as "Rotor's drooping" while
+/// nothing was wrong. The ceiling still holds the lever from the first tick.
+const DROOP_SPEAK_S: f64 = 2.0;
+
+/// What a droop of `since_s` seconds earns this tick.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct DroopCall {
+    pub speak: bool,
+    /// Airborne and low: set it down.
+    pub set_down: bool,
+    /// Still on the ground, lifting: the rotor droops before the wheels are
+    /// light, so the lift is given up and the lever comes down. Before, the
+    /// ramp sat at the guard's ceiling on a drooped rotor for as long as the
+    /// pilot let it: the set-down was only ever for an aircraft in the air.
+    pub abandon_lift: bool,
+}
+
+/// `lifting`: on the ground with the ramp asking for a climb.
+pub fn droop_call(
+    nr: f64,
+    since_s: f64,
+    on_ground: bool,
+    lifting: bool,
+    h_ft: f64,
+    landing: bool,
+) -> DroopCall {
+    if nr >= DROOP_HOLD || !nr.is_finite() {
+        return DroopCall::default();
+    }
+    let long = since_s > DROOP_SET_DOWN_S && !landing;
+    DroopCall {
+        speak: since_s >= DROOP_SPEAK_S || nr < DROOP_LOWER,
+        set_down: long && !on_ground && h_ft < MAX_HOVER_FT,
+        abandon_lift: long && on_ground && lifting,
+    }
+}
+
+/// The line for a droop the power cannot answer: what the rotor fell to, on
+/// how much lever, in what air.
+pub fn power_short_line(on_ground: bool, nr_min: f64, collective: f64, air: Option<Air>) -> String {
+    let air = air
+        .filter(Air::valid)
+        .map(|a| {
+            format!(
+                ", density altitude {} feet at {} kilograms",
+                crate::answers::with_commas(round_to(a.density_alt_ft(), 100.0)),
+                crate::answers::with_commas(round_to(a.weight_kg, 10.0)),
+            )
+        })
+        .unwrap_or_default();
+    let what = format!(
+        "rotor at {:.0} percent on {:.0} percent collective{air}",
+        nr_min * 100.0,
+        collective * 100.0
+    );
+    if on_ground {
+        format!("Not enough power to lift: {what}. Collective down.")
+    } else {
+        format!("Not enough power: {what}. Setting it down.")
+    }
+}
+
 /// Set by [`release`]: the loop's next tick ends WITHOUT turning the
 /// autopilot off, for a caller about to put it in its cruise modes.
 static RELEASED: AtomicBool = AtomicBool::new(false);
@@ -469,6 +541,9 @@ pub struct CollectiveLaw {
     /// Airborne, the power curve's figure for the speed of the moment: the
     /// trim is held to a band around it and the lever never far under it.
     level: Option<f64>,
+    /// On the ground, lifting: the lever goes here at the up-rate before the
+    /// lift-off ramp takes over (see [`PowerBudget::prelift`]).
+    prelift: Option<f64>,
 }
 
 impl CollectiveLaw {
@@ -480,7 +555,13 @@ impl CollectiveLaw {
             airborne: false,
             ceiling: None,
             level: None,
+            prelift: None,
         }
+    }
+
+    /// Where a lift-off from the ground starts its ramp.
+    pub fn set_prelift(&mut self, p: Option<f64>) {
+        self.prelift = p;
     }
 
     pub fn airborne(&self) -> bool {
@@ -522,8 +603,19 @@ impl CollectiveLaw {
         let dt = dt_s.clamp(0.02, 0.5);
         if on_ground && !self.airborne {
             if target_vs_fpm > 0.0 {
-                // Finding lift-off: a steady ramp, the trim riding with it.
-                self.cmd = (self.cmd + LIFT_RAMP * dt)
+                // Finding lift-off: up to the budget's start at a pilot's
+                // hand, then a steady ramp, the trim riding with it.
+                let rate = if self.prelift.is_some_and(|p| self.cmd < p) {
+                    PRELIFT_RATE
+                } else {
+                    LIFT_RAMP
+                };
+                let top = self
+                    .prelift
+                    .filter(|p| self.cmd < *p)
+                    .unwrap_or(COLLECTIVE_MAX);
+                self.cmd = (self.cmd + rate * dt)
+                    .min(top)
                     .min(COLLECTIVE_MAX)
                     .min(self.ceiling.unwrap_or(COLLECTIVE_MAX));
                 self.trim = self.cmd;
@@ -599,6 +691,364 @@ pub fn level_collective(speed_mps: f64) -> f64 {
         }
     }
     POWER_CURVE.last().map_or(0.5, |p| p.1)
+}
+
+// ---------------------------------------------------------------------------
+// The power budget: density altitude and weight
+// ---------------------------------------------------------------------------
+//
+// The curve and the lift-off figures were measured light and low (EDDV,
+// ~160-300 ft). At hilltop EDVW (1,298 ft, heavy, 2026-09-23) the same S-76
+// lifted off at 0.644 against 0.555 and needed 0.683 at ten feet against
+// 0.580: the ramp spent 16 s finding the lift-off from a flat pitch, the hover
+// crept from five feet to nine in twelve seconds and never made its twelve,
+// and the pilot took it ("bring us down"). Every figure the loop owns (the
+// lift-off, the trim band, a takeover's start, a hand-back's lever) was the
+// light aircraft's.
+//
+// Thrust at a governed rotor speed goes with the density and the pitch, so
+// the lever a hover needs goes with weight over density ratio (W/sigma). The
+// 30 lift-offs recorded 2026-09-22..25 carry it: 0.711 at LSZS (5,605 ft)
+// against 0.604 at the same fuel low down, 1.18 where ISA density says 1.18;
+// the lever, not the acf's blade pitch (-2.2 to 10 degrees), is what scales.
+// No OAT or payload was logged, so the fit is at ISA with a 170 kg crew.
+
+/// The lift-off and the nine-foot hover, found by the lift-off ramp at
+/// 163 ft with 325 kg of fuel (2026-09-22): 3,435 kg empty + fuel + an
+/// assumed 170 kg crew.
+const LIFTOFF_REF: f64 = 0.555;
+const IGE_REF: f64 = 0.582;
+const IGE_REF_WEIGHT_KG: f64 = 3930.0;
+const IGE_REF_SIGMA: f64 = 0.995;
+/// The power curve's own loading: the flights of 2026-09-23 at ~300 ft with
+/// ~575 kg of fuel. An ESTIMATE (the payload was never logged); the lift-off
+/// corrects it within the hover ([`LoadingEstimate`]) and the `liftoff`
+/// record calibrates it for good.
+const CURVE_WEIGHT_KG: f64 = 4180.0;
+const CURVE_SIGMA: f64 = 0.991;
+/// The lift-off figures' loading on the curve's scale.
+const IGE_REF_LOADING: f64 = (IGE_REF_WEIGHT_KG / IGE_REF_SIGMA) / (CURVE_WEIGHT_KG / CURVE_SIGMA);
+/// The most lever the hover may plan on: the law's own ceiling less room for
+/// the height loop to correct with.
+const HOVER_HEADROOM: f64 = 0.05;
+/// A hover this close to the most lever is tight (blackboxed, not said).
+const TIGHT_MARGIN: f64 = 0.05;
+/// A hover higher than this is out of the ground cushion: at a loading whose
+/// out-of-ground-effect hover is beyond the lever, a "hover at N" is held here.
+pub const GROUND_CUSHION_FT: f64 = 20.0;
+/// The ramp starts this far under the predicted lift-off, reached at the
+/// law's up-rate, so a heavy rotor does not spend 16 s at 0.04/s finding it
+/// and a light one is not thrown off the ground by a prediction too high (the
+/// recorded lift-offs scatter 0.03 round the fit).
+const PRELIFT_BELOW: f64 = 0.08;
+/// The lever's rate up to the prelift: on the wheels, under the lift-off, the
+/// lever moves nothing but the rotor's pitch; the down-rate's figure.
+const PRELIFT_RATE: f64 = RATE_DOWN;
+/// A loading outside this is a bad read, never a helicopter.
+const LOADING_MIN: f64 = 0.6;
+const LOADING_MAX: f64 = 1.8;
+
+/// The air and the weight the hover flies in.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Air {
+    pub pressure_alt_ft: f64,
+    pub oat_c: f64,
+    pub weight_kg: f64,
+}
+
+impl Air {
+    /// Readings that could be an aircraft in the atmosphere. Anything else is
+    /// no measurement.
+    pub fn valid(&self) -> bool {
+        self.pressure_alt_ft.is_finite()
+            && self.oat_c.is_finite()
+            && self.weight_kg.is_finite()
+            && (-2_000.0..40_000.0).contains(&self.pressure_alt_ft)
+            && (-70.0..60.0).contains(&self.oat_c)
+            && self.weight_kg > 300.0
+    }
+    /// Density ratio from the pressure altitude (ISA pressure) and the
+    /// outside air temperature.
+    pub fn sigma(&self) -> f64 {
+        let delta = (1.0 - 6.875_6e-6 * self.pressure_alt_ft)
+            .max(0.01)
+            .powf(5.2559);
+        let theta = (self.oat_c + 273.15) / 288.15;
+        delta / theta
+    }
+    /// The ISA altitude of that density, the figure a helicopter pilot plans
+    /// a hover by.
+    pub fn density_alt_ft(&self) -> f64 {
+        (1.0 - self.sigma().max(0.01).powf(1.0 / 4.2559)) / 6.875_6e-6
+    }
+    /// Weight over density ratio, as a ratio to the power curve's own.
+    pub fn loading(&self) -> f64 {
+        (self.weight_kg / self.sigma()) / (CURVE_WEIGHT_KG / CURVE_SIGMA)
+    }
+}
+
+/// The lever a curve figure needs at `loading` (1.0 is the curve's own).
+pub fn scale_lever(lever_ref: f64, loading: f64) -> f64 {
+    lever_ref * loading
+}
+
+/// The loading a measured lever says, against the figure the curve had for
+/// the same state. `None` when the figures cannot be a loading.
+pub fn loading_from(lever: f64, lever_ref: f64) -> Option<f64> {
+    (lever.is_finite() && lever_ref > 0.0)
+        .then(|| lever / lever_ref)
+        .filter(|l| (LOADING_MIN..=LOADING_MAX).contains(l))
+}
+
+/// [`level_collective`] at a loading.
+pub fn level_collective_at(speed_mps: f64, loading: f64) -> f64 {
+    scale_lever(level_collective(speed_mps), loading).clamp(0.0, COLLECTIVE_MAX)
+}
+
+/// What this hover's loading is best known as: predicted from the air and
+/// the weight, and once the rotor has lifted, MEASURED by the lever it lifted
+/// at. The measurement then carries the prediction's changes (fuel burnt, a
+/// climb) as a ratio, so a wrong reference weight is corrected by the first
+/// lift-off and never again leans on the estimate.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct LoadingEstimate {
+    predicted: Option<f64>,
+    /// (measured at lift-off, the prediction of that moment)
+    lifted: Option<(f64, Option<f64>)>,
+}
+
+impl LoadingEstimate {
+    pub fn predict(&mut self, air: Option<Air>) {
+        if let Some(l) = air
+            .filter(Air::valid)
+            .map(|a| a.loading())
+            .filter(|l| (LOADING_MIN..=LOADING_MAX).contains(l))
+        {
+            self.predicted = Some(l);
+        }
+    }
+    /// The rotor lifted at `lever`: the loading it says, if it can be one.
+    pub fn lifted_at(&mut self, lever: f64) -> Option<f64> {
+        let m = loading_from(lever, LIFTOFF_REF / IGE_REF_LOADING)?;
+        self.lifted = Some((m, self.predicted));
+        Some(m)
+    }
+    pub fn predicted(&self) -> Option<f64> {
+        self.predicted
+    }
+    /// The loading of the moment; the curve's own (1.0) when nothing is known,
+    /// which is the loop as it was.
+    pub fn now(&self) -> f64 {
+        let l = match (self.lifted, self.predicted) {
+            (Some((m, Some(then))), Some(now)) => m * now / then,
+            (Some((m, _)), _) => m,
+            (None, Some(p)) => p,
+            (None, None) => 1.0,
+        };
+        l.clamp(LOADING_MIN, LOADING_MAX)
+    }
+}
+
+/// The height the ground cushion is gone by (about the S-76's rotor
+/// diameter, 44 ft).
+const GE_FADE_FT: f64 = 40.0;
+/// The cushion's feed-forward works only this slow: faster, the power
+/// curve's own knee is the change that matters.
+const GE_FF_MAX_MPS: f64 = 2.0;
+
+/// The lever a hover over the spot needs at `h_ft` and `loading`: the
+/// lift-off on the wheels, the nine-foot figure, the curve's out-of-ground-
+/// effect hover by `GE_FADE_FT`. At EDVW the need rose 0.039 between the
+/// lift-off and ten feet, which the trim found at its integral rate: five
+/// feet to nine took twelve seconds.
+pub fn hover_need(h_ft: f64, loading: f64) -> f64 {
+    let lift = LIFTOFF_REF / IGE_REF_LOADING;
+    let ige = IGE_REF / IGE_REF_LOADING;
+    let oge = level_collective(0.0);
+    let h = h_ft.max(0.0);
+    let need = if h <= 9.0 {
+        lift + (ige - lift) * h / 9.0
+    } else if h < GE_FADE_FT {
+        ige + (oge - ige) * (h - 9.0) / (GE_FADE_FT - 9.0)
+    } else {
+        oge
+    };
+    need * loading
+}
+
+/// The power figures of one hover, tick by tick: the loading it believes,
+/// the power curve's and the ground cushion's feed-forward into the trim,
+/// the band, and the lift-off that measures the loading. The loop and the
+/// tests fly the same one.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct PowerFeed {
+    pub loading: LoadingEstimate,
+    prev_speed: Option<f64>,
+    prev_h: Option<f64>,
+    was_airborne: bool,
+    was_lifting: bool,
+}
+
+/// A lift-off, measured.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct LiftOff {
+    pub lever: f64,
+    pub predicted: Option<f64>,
+    pub measured: Option<f64>,
+}
+
+impl PowerFeed {
+    pub fn new(loading: LoadingEstimate, law: &CollectiveLaw) -> Self {
+        Self {
+            loading,
+            was_airborne: law.airborne(),
+            ..Self::default()
+        }
+    }
+
+    /// Before the law steps: move the trim by the known changes in the need
+    /// (speed along the curve; height through the cushion, over the spot)
+    /// and set the band. Returns the band's level figure.
+    pub fn before(
+        &mut self,
+        law: &mut CollectiveLaw,
+        cmd_speed: f64,
+        speed_h: Option<f64>,
+        h_ft: f64,
+        on_ground: bool,
+    ) -> Option<f64> {
+        let l = self.loading.now();
+        if let Some(prev) = self.prev_speed {
+            law.shift_trim(level_collective_at(cmd_speed, l) - level_collective_at(prev, l));
+        }
+        self.prev_speed = Some(cmd_speed);
+        let hovering = !on_ground && law.airborne() && cmd_speed < GE_FF_MAX_MPS;
+        if let (true, Some(prev)) = (hovering, self.prev_h) {
+            law.shift_trim(hover_need(h_ft, l) - hover_need(prev, l));
+        }
+        self.prev_h = hovering.then_some(h_ft);
+        let level = (!on_ground && law.airborne())
+            .then(|| level_collective_at(cmd_speed.max(speed_h.unwrap_or(0.0)), l));
+        law.set_level(level);
+        level
+    }
+
+    /// After the law stepped from `lever_before`: a lift-off this tick is
+    /// measured (only a lift the ramp made: a bounce is not one).
+    pub fn after(
+        &mut self,
+        law: &CollectiveLaw,
+        lever_before: f64,
+        lifting: bool,
+    ) -> Option<LiftOff> {
+        let lifted = law.airborne() && !self.was_airborne && (lifting || self.was_lifting);
+        self.was_airborne = law.airborne();
+        self.was_lifting = lifting;
+        lifted.then(|| {
+            let predicted = self.loading.predicted();
+            LiftOff {
+                lever: lever_before,
+                predicted,
+                measured: self.loading.lifted_at(lever_before),
+            }
+        })
+    }
+}
+
+/// What the hover needs at a loading, against what the lever has.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PowerBudget {
+    pub loading: f64,
+    pub liftoff: f64,
+    /// In ground effect: a hover taxi's height.
+    pub ige: f64,
+    /// Out of ground effect.
+    pub oge: f64,
+    pub available: f64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum PowerVerdict {
+    Fine,
+    /// The out-of-ground-effect hover is within `TIGHT_MARGIN` of the lever.
+    Tight,
+    /// A hover taxi is flyable; a hover out of the ground cushion is not.
+    NoOge,
+    /// Not even a hover in the ground cushion.
+    NoHover,
+}
+
+impl PowerBudget {
+    pub fn at(loading: f64) -> Self {
+        Self {
+            loading,
+            liftoff: scale_lever(LIFTOFF_REF / IGE_REF_LOADING, loading),
+            ige: scale_lever(IGE_REF / IGE_REF_LOADING, loading),
+            oge: scale_lever(level_collective(0.0), loading),
+            available: COLLECTIVE_MAX - HOVER_HEADROOM,
+        }
+    }
+    pub fn verdict(&self) -> PowerVerdict {
+        if self.ige > self.available {
+            PowerVerdict::NoHover
+        } else if self.oge > self.available {
+            PowerVerdict::NoOge
+        } else if self.oge > self.available - TIGHT_MARGIN {
+            PowerVerdict::Tight
+        } else {
+            PowerVerdict::Fine
+        }
+    }
+    /// Where the lift-off ramp starts.
+    pub fn prelift(&self) -> f64 {
+        (self.liftoff - PRELIFT_BELOW).clamp(0.0, self.available)
+    }
+    /// The spoken line for a hover the lever cannot give, with its numbers.
+    pub fn line(&self, air: Option<Air>) -> Option<String> {
+        let pct = |c: f64| (c * 100.0).round();
+        let why = match air.filter(Air::valid) {
+            Some(a) => format!(
+                "density altitude {} feet at {} kilograms",
+                crate::answers::with_commas(round_to(a.density_alt_ft(), 100.0)),
+                crate::answers::with_commas(round_to(a.weight_kg, 10.0)),
+            ),
+            None => "at this weight".to_string(),
+        };
+        match self.verdict() {
+            PowerVerdict::NoHover => Some(format!(
+                "Not enough power to hover here: {why} needs {:.0} percent collective, and {:.0} is all we have.",
+                pct(self.ige),
+                pct(self.available)
+            )),
+            PowerVerdict::NoOge => Some(format!(
+                "No hover out of ground effect here: {why} needs {:.0} percent collective, and {:.0} is all we have. Keeping it low.",
+                pct(self.oge),
+                pct(self.available)
+            )),
+            _ => None,
+        }
+    }
+    pub fn record(&self, air: Option<Air>, event: &str) -> serde_json::Value {
+        let air = air.filter(Air::valid);
+        serde_json::json!({
+            "event": event,
+            "pa_ft": air.map(|a| a.pressure_alt_ft),
+            "oat_c": air.map(|a| a.oat_c),
+            "weight_kg": air.map(|a| a.weight_kg),
+            "sigma": air.map(|a| a.sigma()),
+            "da_ft": air.map(|a| a.density_alt_ft()),
+            "loading": self.loading,
+            "need_liftoff": self.liftoff,
+            "need_ige": self.ige,
+            "need_oge": self.oge,
+            "available": self.available,
+            "verdict": format!("{:?}", self.verdict()),
+        })
+    }
+}
+
+fn round_to(v: f64, step: f64) -> f64 {
+    (v / step).round() * step
 }
 
 /// Climb rate per foot of height error, and the limits either way.
@@ -683,6 +1133,12 @@ impl DriftTrim {
 // The loop
 // ---------------------------------------------------------------------------
 
+/// Pressure altitude (a double): with the OAT it is the density the power
+/// budget is flown by.
+const PRESSURE_ALT: &str = "sim/flightmodel2/position/pressure_altitude";
+/// How often the air and the weight are read again in flight (fuel burns, a
+/// departure climbs).
+const AIR_REFRESH_S: f64 = 10.0;
 const Y_AGL: &str = "sim/flightmodel/position/y_agl";
 const VS_FPM: &str = "sim/flightmodel/position/vh_ind_fpm";
 const ONGROUND: &str = "sim/flightmodel/failures/onground_any";
@@ -950,7 +1406,50 @@ pub(crate) async fn cruise_modes(xp: &XPlaneClient) -> bool {
     h.is_ok_and(|v| v > 0.5) && a.is_ok_and(|v| v > 0.5)
 }
 
+/// The air and the weight, read together; `None` unless all three read and
+/// could be an aircraft (a failed read is no measurement).
+async fn read_air(xp: &XPlaneClient) -> Option<Air> {
+    let (pa, oat, w) = tokio::join!(
+        xp.get_float(PRESSURE_ALT),
+        xp.get_float(crate::datarefs::OAT_DEG_C),
+        xp.get_float(crate::datarefs::TOTAL_WEIGHT_KG),
+    );
+    Some(Air {
+        pressure_alt_ft: pa.ok()?,
+        oat_c: oat.ok()?,
+        weight_kg: w.ok()?,
+    })
+    .filter(Air::valid)
+}
+
 async fn fly(xp: XPlaneClient, voice: Option<Voice>, collective: String) {
+    // The power budget first, before the autopilot takes anything: a hover
+    // the lever cannot give is refused on the ground with its numbers.
+    let mut air = read_air(&xp).await;
+    let mut air_at = Instant::now();
+    let mut loading = LoadingEstimate::default();
+    loading.predict(air);
+    let budget0 = PowerBudget::at(loading.now());
+    let mut rec = budget0.record(air, "power_budget");
+    rec["known"] = serde_json::json!(loading.predicted().is_some());
+    crate::blackbox::record("hover", rec);
+    let on_ground0 = xp.get_float(ONGROUND).await.is_ok_and(|g| g > 0.5);
+    if loading.predicted().is_some() && budget0.verdict() == PowerVerdict::NoHover {
+        if on_ground0 {
+            crate::blackbox::record(
+                "hover",
+                serde_json::json!({ "event": "refused", "why": "power", "need_ige": budget0.ige, "available": budget0.available }),
+            );
+            if let Some(line) = budget0.line(air) {
+                say(&voice, Priority::Caution, line);
+            }
+            return;
+        }
+        // Already flying: nothing to refuse, but the pilot hears the numbers.
+        if let Some(line) = budget0.line(air) {
+            say(&voice, Priority::Warning, line);
+        }
+    }
     let drift0 = DriftTrim::default();
     // The autopilot holds the position; its hover mode captured on the ground
     // in the live test, so it is engaged before anything lifts. It captures
@@ -998,7 +1497,12 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, collective: String) {
     // law's own rate.
     if v0 != drift0.target() {
         law.airborne = true;
-        law.trim = level_collective(v0[0].hypot(v0[1]));
+        law.trim = level_collective_at(v0[0].hypot(v0[1]), loading.now());
+    } else if loading.predicted().is_some() {
+        // On the wheels with the air and the weight known: the lever goes
+        // to just under the predicted lift-off at once. Unknown, the ramp
+        // finds it from where the lever is, as it always did.
+        law.set_prelift(Some(budget0.prelift()));
     }
     let mut drift = DriftTrim::default();
     let mut ramp = VelocityRamp::default();
@@ -1023,18 +1527,55 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, collective: String) {
     let mut touchdown_braked = false;
     let mut tick_n: u64 = 0;
     let mut last_recapture: Option<Instant> = None;
-    let mut ff_speed: Option<f64> = None;
     let rotor_cfg = rotor();
     let mut droop_since: Option<Instant> = None;
+    let mut droop_said = false;
+    let mut nr_min: f64 = 1.0;
     let mut goal_kind: Option<std::mem::Discriminant<Goal>> = None;
     let mut goal_since = Instant::now();
+    let mut capped_said = false;
+    let mut feed = PowerFeed::new(loading, &law);
+    // Only a hover this loop lifted from the ground is held in the cushion: a
+    // takeover in the air is already holding its height, and the droop guard
+    // judges what it really has.
+    let lifted_here = !law.airborne();
     while ACTIVE.load(Ordering::SeqCst) {
         tokio::time::sleep(TICK).await;
         if crate::xplane::sim_frozen(&xp).await {
             last = Instant::now();
             continue;
         }
-        let Some(g) = goal() else { break };
+        let Some(mut g) = goal() else { break };
+        if air_at.elapsed().as_secs_f64() > AIR_REFRESH_S {
+            air_at = Instant::now();
+            if let Some(a) = read_air(&xp).await {
+                air = Some(a);
+                feed.loading.predict(air);
+            }
+        }
+        // A hover out of the ground cushion that the lever cannot hold is
+        // held in it, and said once with the numbers.
+        let budget = PowerBudget::at(feed.loading.now());
+        if let Goal::Hover { height_ft } = g {
+            if lifted_here
+                && height_ft > GROUND_CUSHION_FT
+                && budget.verdict() == PowerVerdict::NoOge
+            {
+                g = Goal::Hover {
+                    height_ft: GROUND_CUSHION_FT,
+                };
+                retarget(g);
+                let mut rec = budget.record(air, "hover_capped");
+                rec["asked_ft"] = serde_json::json!(height_ft);
+                crate::blackbox::record("hover", rec);
+                if !capped_said {
+                    capped_said = true;
+                    if let Some(line) = budget.line(air) {
+                        say(&voice, Priority::Caution, line);
+                    }
+                }
+            }
+        }
         let nr = match &rotor_cfg {
             Some((dref, governed)) if *governed > 0.0 => xp
                 .get_float_array(dref)
@@ -1295,58 +1836,102 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, collective: String) {
         }
 
         let tvs = target_vs_fpm(g, h_ft, cmd_v[0].hypot(cmd_v[1]));
-        // The power curve's step for the speed the command moved by.
-        let cmd_speed_now = cmd_v[0].hypot(cmd_v[1]);
-        if let Some(prev) = ff_speed {
-            law.shift_trim(level_collective(cmd_speed_now) - level_collective(prev));
-        }
-        ff_speed = Some(cmd_speed_now);
-        // The power curve's band, airborne only (the lift-off finds its own).
-        law.set_level(
-            (!on_ground && law.airborne())
-                .then(|| level_collective(cmd_v[0].hypot(cmd_v[1]).max(speed_h.unwrap_or(0.0)))),
-        );
-        // The rotor guard, and a lift the power cannot hold is set down.
+        // The power curve and the ground cushion at this hover's loading
+        // (the curve's own when the air and the weight are unknown).
+        let load_now = feed.loading.now();
+        let level = feed.before(&mut law, cmd_v[0].hypot(cmd_v[1]), speed_h, h_ft, on_ground);
+        // The rotor guard: the lever held on a drooping rotor from the first
+        // tick, said once it lasts, and a lift the power cannot hold is set
+        // down, or never leaves the ground.
+        let lifting = on_ground && !law.airborne() && tvs > 0.0;
         match nr {
             Some(n) if n < DROOP_HOLD => {
                 law.set_ceiling(Some(droop_ceiling(n, law.cmd(), dt)));
+                nr_min = nr_min.min(n);
                 let since = *droop_since.get_or_insert_with(|| {
                     crate::blackbox::record(
                         "hover",
-                        serde_json::json!({ "event": "rotor_droop", "nr": n, "collective": law.cmd() }),
-                    );
-                    say(
-                        &voice,
-                        Priority::Warning,
-                        format!("Rotor's drooping, {:.0} percent. Easing the collective.", n * 100.0),
+                        serde_json::json!({
+                            "event": "rotor_droop", "nr": n, "collective": law.cmd(),
+                            "loading": load_now, "need_ige": budget.ige, "need_oge": budget.oge,
+                            "da_ft": air.map(|a| a.density_alt_ft()), "weight_kg": air.map(|a| a.weight_kg),
+                            "ground": on_ground, "h_ft": h_ft,
+                        }),
                     );
                     now
                 });
-                if (now - since).as_secs_f64() > DROOP_SET_DOWN_S
-                    && h_ft < MAX_HOVER_FT
-                    && !matches!(g, Goal::Land)
-                    && !on_ground
-                {
-                    *lock_goal() = Some(Goal::Land);
-                    set_motion(Motion::default());
-                    crate::blackbox::record(
-                        "hover",
-                        serde_json::json!({ "event": "droop_set_down", "nr": n, "h_ft": h_ft }),
-                    );
+                let call = droop_call(
+                    n,
+                    (now - since).as_secs_f64(),
+                    on_ground,
+                    lifting,
+                    h_ft,
+                    matches!(g, Goal::Land),
+                );
+                if call.speak && !droop_said {
+                    droop_said = true;
                     say(
                         &voice,
                         Priority::Warning,
-                        "Not enough power. Setting it down.",
+                        format!(
+                            "Rotor's drooping, {:.0} percent. Easing the collective.",
+                            n * 100.0
+                        ),
+                    );
+                }
+                if call.set_down || call.abandon_lift {
+                    *lock_goal() = Some(Goal::Land);
+                    set_motion(Motion::default());
+                    let mut rec = budget.record(
+                        air,
+                        if call.abandon_lift {
+                            "lift_abandoned"
+                        } else {
+                            "droop_set_down"
+                        },
+                    );
+                    rec["nr"] = serde_json::json!(n);
+                    rec["nr_min"] = serde_json::json!(nr_min);
+                    rec["collective"] = serde_json::json!(law.cmd());
+                    rec["h_ft"] = serde_json::json!(h_ft);
+                    crate::blackbox::record("hover", rec);
+                    say(
+                        &voice,
+                        Priority::Warning,
+                        power_short_line(call.abandon_lift, nr_min, law.cmd(), air),
                     );
                 }
             }
             _ => {
                 law.set_ceiling(None);
-                droop_since = None;
+                if let Some(since) = droop_since.take() {
+                    crate::blackbox::record(
+                        "hover",
+                        serde_json::json!({ "event": "droop_cleared", "secs": (now - since).as_secs_f64(), "nr_min": nr_min, "said": droop_said }),
+                    );
+                }
+                droop_said = false;
+                nr_min = 1.0;
             }
         }
+        // The lever the rotor stood on before this tick: at a lift-off it is
+        // the lift-off's (the step that notices it adds the height loop's).
+        let lever_before = law.cmd();
         let cmd = law.step(tvs, vs, on_ground, dt);
         let _ = xp.set_float_index(&collective, 0, cmd).await;
+        // The lift-off is a MEASUREMENT of the loading: the lever the rotor
+        // lifted at against the reference's 0.555. It corrects the prediction
+        // (and the reference weight behind it) for the rest of this hover.
+        if let Some(lift) = feed.after(&law, lever_before, lifting) {
+            let mut rec = PowerBudget::at(feed.loading.now()).record(air, "liftoff");
+            rec["collective"] = serde_json::json!(lift.lever);
+            rec["predicted_loading"] = serde_json::json!(lift.predicted);
+            rec["predicted_liftoff"] =
+                serde_json::json!(lift.predicted.map(|l| PowerBudget::at(l).liftoff));
+            rec["measured_loading"] = serde_json::json!(lift.measured);
+            rec["prelift"] = serde_json::json!(lifted_here.then(|| budget0.prelift()));
+            crate::blackbox::record("hover", rec);
+        }
 
         tick_n += 1;
         if tick_n % 2 == 0 {
@@ -1361,6 +1946,7 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, collective: String) {
                     "psi": psi.as_ref().ok(), "yaw_rate": yaw_rate.as_ref().ok(),
                     "cmd_v": cmd_v, "err_v": err, "track_now": track_now, "nr": nr,
                     "pedal": pedal, "pedal_trim": pedals.trim(),
+                    "level": level, "loading": load_now,
                 }),
             );
         }
@@ -1921,11 +2507,465 @@ mod tests {
         let c = law.step(-100.0, 0.0, true, 0.1);
         assert!(c < 0.3 && c >= 0.0);
     }
+    // -----------------------------------------------------------------------
+    // The power budget (#84)
+    // -----------------------------------------------------------------------
+
+    /// Every lift-off the S-76 made 2026-09-22..25 (blackbox `hover` ticks:
+    /// the last lever on the wheels), with the field (state `alt`, ft) and
+    /// the fuel (kg): (alt, fuel, lever).
+    const RECORDED_LIFTOFFS: &[(f64, f64, f64)] = &[
+        (162.7, 325.3, 0.555),
+        (216.9, 412.4, 0.560),
+        (216.3, 412.5, 0.572),
+        (210.8, 394.8, 0.565),
+        (217.1, 411.5, 0.575),
+        (217.0, 386.8, 0.561),
+        (215.9, 350.4, 0.558),
+        (237.7, 313.0, 0.561),
+        (230.0, 260.7, 0.546),
+        (229.9, 228.0, 0.556),
+        (229.9, 186.7, 0.547),
+        (232.8, 412.1, 0.578),
+        (230.4, 368.3, 0.567),
+        (246.0, 305.8, 0.563),
+        (257.7, 411.8, 0.583),
+        (271.5, 620.4, 0.617),
+        (265.6, 581.2, 0.609),
+        (299.5, 604.4, 0.613),
+        (307.9, 518.2, 0.594),
+        (320.5, 626.5, 0.642),
+        (377.5, 545.6, 0.604),
+        (385.8, 671.9, 0.629),
+        (1297.8, 569.4, 0.644), // EDVW, the hilltop of #84
+        (1371.3, 704.6, 0.665),
+        (384.0, 463.3, 0.606),
+        (5605.1, 543.5, 0.711), // LSZS
+        (1094.6, 365.4, 0.622),
+        (1096.7, 773.1, 0.676),
+        (1062.5, 773.7, 0.656),
+        (1252.5, 503.4, 0.656),
+    ];
+
+    /// No OAT or payload was logged: the standard day and a 170 kg crew.
+    fn isa_air(alt_ft: f64, fuel_kg: f64) -> Air {
+        Air {
+            pressure_alt_ft: alt_ft,
+            oat_c: 15.0 - 1.98 * alt_ft / 1000.0,
+            weight_kg: 3435.0 + fuel_kg + 170.0,
+        }
+    }
+
+    /// The prediction the lift-off starts from is the recorded lift-offs',
+    /// and it errs low, never past the prelift margin: a high one would put
+    /// the lever over the lift-off at the fast rate.
+    #[test]
+    fn the_lift_off_goes_with_weight_over_density() {
+        let (mut new_err, mut old_err) = (0.0, 0.0);
+        for &(alt, fuel, lever) in RECORDED_LIFTOFFS {
+            let air = isa_air(alt, fuel);
+            assert!(air.valid());
+            let b = PowerBudget::at(air.loading());
+            new_err += (b.liftoff - lever).abs();
+            old_err += (LIFTOFF_REF - lever).abs();
+            assert!(
+                b.prelift() < lever,
+                "prelift {:.3} over the lift-off {lever} at {alt} ft, {fuel} kg",
+                b.prelift()
+            );
+            assert!(
+                (b.liftoff - lever).abs() < 0.06,
+                "{alt} ft {fuel} kg: {:.3} vs {lever}",
+                b.liftoff
+            );
+        }
+        let n = RECORDED_LIFTOFFS.len() as f64;
+        let (new_err, old_err) = (new_err / n, old_err / n);
+        assert!(new_err < 0.02, "mean error {new_err:.3}");
+        assert!(
+            old_err > 2.0 * new_err,
+            "the budget earns its place: {old_err:.3} vs {new_err:.3}"
+        );
+        // LSZS, 5,605 ft: 0.711 measured; the light figure was 0.156 short.
+        let lszs = PowerBudget::at(isa_air(5605.1, 543.5).loading()).liftoff;
+        assert!((lszs - 0.711).abs() < 0.03, "LSZS {lszs:.3}");
+    }
+
+    #[test]
+    fn the_air_is_the_standard_atmosphere() {
+        let sl = Air {
+            pressure_alt_ft: 0.0,
+            oat_c: 15.0,
+            weight_kg: 4000.0,
+        };
+        assert!((sl.sigma() - 1.0).abs() < 1e-3);
+        assert!(sl.density_alt_ft().abs() < 30.0);
+        let isa5 = Air {
+            pressure_alt_ft: 5000.0,
+            oat_c: 5.1,
+            weight_kg: 4000.0,
+        };
+        assert!((isa5.sigma() - 0.8617).abs() < 0.002, "{}", isa5.sigma());
+        assert!((isa5.density_alt_ft() - 5000.0).abs() < 60.0);
+        // A hot hilltop: 1,300 ft at 30 C flies like 3,300 ft.
+        let hot = Air {
+            pressure_alt_ft: 1300.0,
+            oat_c: 30.0,
+            weight_kg: 4000.0,
+        };
+        let da = hot.density_alt_ft();
+        assert!((3000.0..3600.0).contains(&da), "{da}");
+        // Heavier, higher, hotter: each needs more.
+        let base = isa_air(300.0, 500.0).loading();
+        assert!(isa_air(300.0, 800.0).loading() > base);
+        assert!(isa_air(3000.0, 500.0).loading() > base);
+        assert!(hot.loading() > Air { oat_c: 0.0, ..hot }.loading());
+        // A failed or absurd read is no measurement.
+        assert!(!Air {
+            weight_kg: f64::NAN,
+            ..sl
+        }
+        .valid());
+        assert!(!Air {
+            weight_kg: 0.0,
+            ..sl
+        }
+        .valid());
+        assert!(!Air { oat_c: 300.0, ..sl }.valid());
+        let mut est = LoadingEstimate::default();
+        est.predict(Some(Air {
+            weight_kg: f64::NAN,
+            ..sl
+        }));
+        assert_eq!(est.predicted(), None);
+        assert_eq!(
+            est.now(),
+            1.0,
+            "unknown is the curve's own: the loop as it was"
+        );
+    }
+
+    #[test]
+    fn the_budget_refuses_and_warns_with_its_numbers() {
+        let at = |pa: f64, w: f64| {
+            let air = Air {
+                pressure_alt_ft: pa,
+                oat_c: 15.0 - 1.98 * pa / 1000.0,
+                weight_kg: w,
+            };
+            (PowerBudget::at(air.loading()), air)
+        };
+        // The curve's own flights: fine.
+        let (b, _) = at(300.0, 4180.0);
+        assert_eq!(b.verdict(), PowerVerdict::Fine);
+        assert!((b.oge - 0.66).abs() < 0.01);
+        // Maximum gross at 2,500 ft: a hover taxi, no hover out of the cushion.
+        let (b, air) = at(2500.0, 5307.0);
+        assert_eq!(b.verdict(), PowerVerdict::NoOge, "{b:?}");
+        let line = b.line(Some(air)).unwrap();
+        assert!(
+            line.contains("out of ground effect") && line.contains("percent collective"),
+            "{line}"
+        );
+        assert!(
+            line.contains("density altitude 2,500 feet") && line.contains("5,310 kilograms"),
+            "{line}"
+        );
+        // Maximum gross at 8,000 ft on a hot day: nothing.
+        let hot = Air {
+            pressure_alt_ft: 8000.0,
+            oat_c: 25.0,
+            weight_kg: 5307.0,
+        };
+        let b = PowerBudget::at(hot.loading());
+        assert_eq!(b.verdict(), PowerVerdict::NoHover, "{b:?}");
+        let line = b.line(Some(hot)).unwrap();
+        assert!(line.starts_with("Not enough power to hover here"), "{line}");
+        assert!(
+            line.contains(&format!("{:.0} is all we have", b.available * 100.0)),
+            "{line}"
+        );
+        // Between them: tight, and said by nobody.
+        let (b, _) = at(2000.0, 5000.0);
+        assert_eq!(b.verdict(), PowerVerdict::Tight, "{b:?}");
+        assert!(b.line(None).is_none());
+    }
+
+    #[test]
+    fn a_droop_is_held_at_once_said_when_it_lasts_and_a_lift_that_droops_is_given_up() {
+        // The governor catching a turn (nr 0.970, back inside 1.4 s): held,
+        // not said.
+        let c = droop_call(0.9696, 0.5, false, false, 9.0, false);
+        assert!(!c.speak && !c.set_down && !c.abandon_lift);
+        assert!(droop_call(0.9696, 2.1, false, false, 9.0, false).speak);
+        assert!(
+            droop_call(0.93, 0.0, false, false, 9.0, false).speak,
+            "deep: at once"
+        );
+        // Lasting, low, in the air: set down.
+        let c = droop_call(0.95, 5.5, false, false, 9.0, false);
+        assert!(c.set_down && !c.abandon_lift);
+        // Lasting on the wheels while lifting: the lift is given up.
+        let c = droop_call(0.95, 5.5, true, true, 0.0, false);
+        assert!(c.abandon_lift && !c.set_down);
+        assert_eq!(
+            droop_call(0.95, 5.5, true, false, 0.0, false),
+            DroopCall {
+                speak: true,
+                ..DroopCall::default()
+            }
+        );
+        assert!(
+            !droop_call(0.95, 5.5, false, false, 9.0, true).set_down,
+            "already landing"
+        );
+        assert_eq!(
+            droop_call(0.99, 9.0, false, false, 9.0, false),
+            DroopCall::default()
+        );
+        let hill = isa_air(1297.8, 569.4);
+        let line = power_short_line(true, 0.931, 0.873, Some(hill));
+        assert!(
+            line.starts_with(
+                "Not enough power to lift: rotor at 93 percent on 87 percent collective"
+            ),
+            "{line}"
+        );
+        assert!(
+            line.contains("density altitude 1,300 feet") && line.ends_with("Collective down."),
+            "{line}"
+        );
+        assert!(power_short_line(false, 0.93, 0.8, None).ends_with("Setting it down."));
+    }
+
+    #[test]
+    fn the_loading_is_measured_at_lift_off_and_carries_the_prediction() {
+        let hill = isa_air(1297.8, 569.4);
+        let mut est = LoadingEstimate::default();
+        est.predict(Some(hill));
+        let p = est.predicted().unwrap();
+        // EDVW lifted at 0.644: heavier than the fuel and the field say.
+        let m = est.lifted_at(0.644).unwrap();
+        assert!(m > p, "{m} vs {p}");
+        assert!((PowerBudget::at(est.now()).liftoff - 0.644).abs() < 1e-9);
+        // 100 kg of fuel later the measurement carries the change.
+        est.predict(Some(Air {
+            weight_kg: hill.weight_kg - 100.0,
+            ..hill
+        }));
+        let ratio = (hill.weight_kg - 100.0) / hill.weight_kg;
+        assert!((est.now() - m * ratio).abs() < 1e-9);
+        // A lift-off with nothing predicted is the measurement alone.
+        let mut bare = LoadingEstimate::default();
+        let m = bare.lifted_at(0.644).unwrap();
+        assert_eq!(bare.now(), m);
+        // A lever that cannot be a loading is no measurement.
+        assert_eq!(LoadingEstimate::default().lifted_at(0.05), None);
+    }
+
+    /// A vertical axis through the S-76's damped response (3,800 fpm per unit
+    /// of collective, settling over 2.5 s) and a TRANSPORT DELAY (the lever
+    /// written reaches the rotor two ticks later), on a cushion that fades
+    /// EXPONENTIALLY (the budget's model is piecewise linear: the plant is
+    /// not the model), sized by the hover of EDVW: 0.644 on the wheels,
+    /// 0.683 at ten feet.
+    struct Rotor {
+        h_ft: f64,
+        vs: f64,
+        accel: f64,
+        lift: f64,
+        oge: f64,
+        queue: std::collections::VecDeque<f64>,
+    }
+
+    impl Rotor {
+        fn new(lift: f64, oge: f64, c0: f64) -> Self {
+            Self {
+                h_ft: 0.0,
+                vs: 0.0,
+                accel: 0.0,
+                lift,
+                oge,
+                queue: vec![c0; 2].into(),
+            }
+        }
+        fn need(&self) -> f64 {
+            self.oge - (self.oge - self.lift) * (-self.h_ft / 13.0).exp()
+        }
+        fn on_ground(&self) -> bool {
+            self.h_ft <= 0.0 && self.vs <= 0.0
+        }
+        fn step(&mut self, c: f64, dt: f64) {
+            self.queue.push_back(c);
+            let c = self.queue.pop_front().unwrap();
+            let want = (3800.0 * (c - self.need()) - self.vs) / 2.5;
+            self.accel += (want - self.accel) * (dt / 0.4).min(1.0);
+            self.vs += self.accel * dt;
+            self.h_ft += self.vs / 60.0 * dt;
+            if self.h_ft <= 0.0 {
+                self.h_ft = 0.0;
+                self.vs = self.vs.max(0.0);
+                self.accel = self.accel.max(0.0);
+            }
+        }
+    }
+
+    /// (seconds to leave the ground, seconds to 11 ft of a 12 ft hover, peak
+    /// height, worst error over the last minute), from the request. `budget`
+    /// false is the loop as it was: the ramp from a flat pitch and the light
+    /// curve. The tick is the live loop's (~0.37 s in the EDVW records).
+    fn lift_to_twelve(lift: f64, oge: f64, air: Option<Air>, budget: bool) -> (f64, f64, f64, f64) {
+        let dt = 0.37;
+        let mut p = Rotor::new(lift, oge, 0.0);
+        let mut law = CollectiveLaw::from(0.0);
+        let mut est = LoadingEstimate::default();
+        if budget {
+            est.predict(air);
+            law.set_prelift(Some(PowerBudget::at(est.now()).prelift()));
+        }
+        let mut feed = PowerFeed::new(est, &law);
+        let (mut t_lift, mut t_11, mut peak, mut worst) =
+            (f64::INFINITY, f64::INFINITY, 0.0_f64, 0.0_f64);
+        let g = Goal::Hover { height_ft: 12.0 };
+        for i in 0..((120.0 / dt) as usize) {
+            let t = i as f64 * dt;
+            let on_ground = p.on_ground();
+            let tvs = target_vs_fpm(g, p.h_ft, 0.0);
+            let lifting = on_ground && !law.airborne() && tvs > 0.0;
+            if budget {
+                feed.before(&mut law, 0.0, Some(0.0), p.h_ft, on_ground);
+            } else {
+                law.set_level((!on_ground && law.airborne()).then(|| level_collective(0.0)));
+            }
+            let before = law.cmd();
+            let c = law.step(tvs, p.vs, on_ground, dt);
+            if budget {
+                feed.after(&law, before, lifting);
+            }
+            p.step(c, dt);
+            if p.h_ft > 0.0 && t_lift.is_infinite() {
+                t_lift = t;
+            }
+            if p.h_ft >= 11.0 && t_11.is_infinite() {
+                t_11 = t;
+            }
+            peak = peak.max(p.h_ft);
+            if t > 60.0 {
+                worst = worst.max((p.h_ft - 12.0).abs());
+            }
+        }
+        (t_lift, t_11, peak, worst)
+    }
+
+    /// EDVW (#84): the heavy hilltop hover. The loop as it was spent the
+    /// recorded 16 s finding the lift-off and crept up to its height; with
+    /// the budget the lever starts under the predicted lift-off, the cushion
+    /// is fed forward, and it neither leaps nor creeps.
+    #[test]
+    fn a_heavy_hilltop_hover_starts_at_its_lever_and_makes_its_height() {
+        let loading = 0.644 / (LIFTOFF_REF / IGE_REF_LOADING);
+        let (lift, oge) = (0.644, level_collective(0.0) * loading);
+        let hill = isa_air(1297.8, 569.4);
+        let (old_lift, old_11, _, _) = lift_to_twelve(lift, oge, Some(hill), false);
+        let (new_lift, new_11, peak, worst) = lift_to_twelve(lift, oge, Some(hill), true);
+        assert!(old_lift > 14.0, "the recorded slow ramp: {old_lift:.1} s");
+        assert!(new_lift < 9.0, "lifted at {new_lift:.1} s");
+        assert!(
+            new_11 + 8.0 < old_11,
+            "11 ft at {new_11:.1} s vs {old_11:.1} s"
+        );
+        assert!(peak < 14.5, "peak {peak:.1} ft");
+        assert!(worst < 1.0, "held to {worst:.1} ft");
+    }
+
+    /// Across loadings and predictions that are wrong both ways (a payload
+    /// nobody loaded, a hot day read as standard): never a leap off the
+    /// ground, always its height, never slower than the loop was.
+    #[test]
+    fn a_wrong_prediction_neither_leaps_nor_creeps() {
+        let mut bad = Vec::new();
+        for true_loading in [0.95, 1.1, 1.3] {
+            let lift = LIFTOFF_REF / IGE_REF_LOADING * true_loading;
+            let oge = level_collective(0.0) * true_loading;
+            for wrong in [0.88, 1.0, 1.08] {
+                // An air whose prediction is `wrong` times the truth.
+                let w = true_loading * wrong * CURVE_WEIGHT_KG / CURVE_SIGMA * 1.0;
+                let air = Air {
+                    pressure_alt_ft: 0.0,
+                    oat_c: 15.0,
+                    weight_kg: w,
+                };
+                let (_, old_11, _, _) = lift_to_twelve(lift, oge, Some(air), false);
+                let (_, new_11, peak, worst) = lift_to_twelve(lift, oge, Some(air), true);
+                let line = format!(
+                    "loading {true_loading} predicted x{wrong}: 11 ft {new_11:.1} s (was {old_11:.1}), peak {peak:.1}, held {worst:.1}"
+                );
+                if peak > 15.0 || worst > 1.0 || new_11 > old_11 || new_11 > 25.0 {
+                    bad.push(line);
+                }
+            }
+        }
+        assert!(bad.is_empty(), "{bad:#?}");
+    }
+
+    /// A takeover of a heavy helicopter in the air: the trim starts at the
+    /// light curve's 0.66 and the height goes while the integral finds the
+    /// rest; at the budget's figure it holds. A hand-back's lever likewise.
+    #[test]
+    fn a_heavy_takeover_starts_its_trim_at_the_scaled_curve() {
+        let true_loading = 1.25;
+        let need = level_collective(0.0) * true_loading;
+        let fly = |trim0: f64, level: f64| {
+            let dt = 0.37;
+            let mut law = CollectiveLaw::from(trim0);
+            law.airborne = true;
+            law.trim = trim0;
+            let (mut h, mut vs, mut acc) = (400.0_f64, 0.0_f64, 0.0_f64);
+            let mut queue = std::collections::VecDeque::from(vec![trim0; 2]);
+            let mut worst: f64 = 0.0;
+            for _ in 0..((60.0 / dt) as usize) {
+                law.set_level(Some(level));
+                queue.push_back(law.step(
+                    target_vs_fpm(Goal::Hover { height_ft: 400.0 }, h, 0.0),
+                    vs,
+                    false,
+                    dt,
+                ));
+                let c = queue.pop_front().unwrap();
+                let want = (3800.0 * (c - need) - vs) / 2.5;
+                acc += (want - acc) * (dt / 0.4_f64).min(1.0);
+                vs += acc * dt;
+                h += vs / 60.0 * dt;
+                worst = worst.max((h - 400.0).abs());
+            }
+            (worst, law.steady())
+        };
+        // The prediction 4 % light, as the recorded lift-offs err.
+        let predicted = level_collective_at(0.0, true_loading * 0.96);
+        let (old, old_steady) = fly(level_collective(0.0), level_collective(0.0));
+        let (new, new_steady) = fly(predicted, predicted);
+        assert!(new < 20.0, "height held to {new:.1} ft");
+        assert!(
+            old > 1.5 * new,
+            "the scaled curve earns its place: {old:.1} vs {new:.1} ft"
+        );
+        assert!(
+            (new_steady - need).abs() < 0.04,
+            "hand-back lever {new_steady:.3} vs {need:.3}"
+        );
+        assert!(
+            need - old_steady > 0.07,
+            "the light band left {old_steady:.3} vs {need:.3}"
+        );
+    }
+
     #[test]
     fn the_touchdown_brake_waits_for_a_stop() {
         assert!(super::touchdown_brake_due(0.3));
-        assert!(!super::touchdown_brake_due(9.7), "the ridge set-down at 19 kt");
+        assert!(
+            !super::touchdown_brake_due(9.7),
+            "the ridge set-down at 19 kt"
+        );
         assert!(!super::touchdown_brake_due(f64::NAN));
     }
-
 }
