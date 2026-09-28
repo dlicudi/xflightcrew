@@ -568,7 +568,8 @@ everything blackboxes to `logs/blackbox.jsonl` (kinds: `atc`, `autotaxi`, `autot
 - **Exterior lights follow the practice** (`src/tools/lights.rs` `Exterior`; `dark_now` =
   `cockpit_auto::dusk_or_dark`): taxi light for the taxi (the landing light after dusk where there is
   none); landing light over each runway span (`Route.runway_spans`); landing AND taxi off passing
-  1,000 ft AGL (`lights_climb`, `after_climb`); landing off, taxi on at the vacate
+  1,000 ft AGL, by the takeoff itself (`autotakeoff` `lights_climb`, `after_climb`; the follower
+  and circuit repeat it for a joined flight); landing off, taxi on at the vacate
   (`after_vacate`); all off at the stand.
 - **The crew picks its own procedures**: a cleared runway the SID does not serve gets that runway's
   SID joining furthest along (`nav::sids_for_route`, `full_auto::choose_departure`); a METAR
@@ -890,8 +891,9 @@ Still owed: issues labelled `area:helicopter` (`owed`: none;
 
 `src/flight.rs`: the ONE answer to "where are we and what do we hold". Pure, fed per monitor tick,
 time from the sample so recorded flights replay (`flight::Replay`). Tracks `Phase` (sustained, in
-the `legal` table), `Control`, `Abnormal`, `Memory`, `Situation` (the pilot's takeover via
-`flight::note_pilot_takeover`).
+the `legal` table; a descent is also the height LOST over 20 s, `losing_height`: an idle descent
+saws to level every 15 s, #174), `Control`, `Abnormal`, `Memory`, `Situation` (the pilot's
+takeover via `flight::note_pilot_takeover`).
 
 - **A ground strike is not a landing**: a climb into it or a sink past `IMPACT_SINK_FPM` is an
   `Impact`; a wreck has no phases until at rest.
@@ -925,9 +927,11 @@ as held, never written (one writer per dataref).
 **Who starts one**: `flow::Tracker`, one-shot per flight, every boundary SUSTAINED (a single-tick
 boundary audits the automation's own actions half done; `CLIMB_AGL_FT`, `CLIMB_SECS`). Under an
 automation Monitor starts at once (BEFORE LANDING only once gear and landing flap are set,
-`Sample.landing_config`: a circuit's downwind descent is not the landing config, #169); with a
-pilot flying the copilot PROPOSES (`PROPOSAL_TTL`) and
-never acts by itself; the after-landing list runs at once as Crew. The profile's `checklist_flow:`
+`Sample.landing_config`: a circuit's downwind descent is not the landing config, #169; CLIMB only
+once the flaps are up, `climb_config`, #174); with a pilot flying the copilot PROPOSES
+(`PROPOSAL_TTL`) and never acts by itself; the after-landing list runs as Crew once OFF the runway
+pavement (`Sample.on_runway`, the vacate's test; #174). DESCENT is also the model's `Descent`; a
+level-off inside it earns no cruise list. The profile's `checklist_flow:`
 maps titles. Panel: `flow::status()`.
 
 **A list belongs to the flight it began in** (`flow::stand_down`): an automation taking the aircraft

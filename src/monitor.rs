@@ -3270,6 +3270,15 @@ pub async fn run(
                         snap.flap_ratio,
                         !crate::aircraft::flap_limits().is_empty(),
                     ),
+                    climb_config: crate::flow::climb_config(
+                        snap.flap_ratio,
+                        !crate::aircraft::flap_limits().is_empty(),
+                    ),
+                    on_runway: if snap.on_ground {
+                        crate::party_line::on_runway(snap.lat, snap.lon)
+                    } else {
+                        None
+                    },
                 };
                 if let Some(section) = flow_tracker.tick(&sample, &flight, &flight_events, now) {
                     crate::flow::phase_boundary(section, &config, &voice);

@@ -313,6 +313,11 @@ pub fn flap_retract_step(schedule: &[(f64, f64)], current: f64, ias: f64) -> Opt
         .map(|(ratio, _)| *ratio)
 }
 
+/// Height above the field at which the takeoff switches the landing and
+/// taxi lights off (`lights::after_climb`; the circuit and full auto's
+/// follower do the same from their own loops for a flight they joined).
+pub const LIGHTS_OFF_AGL_FT: f64 = 1000.0;
+
 /// [`flap_retract_step`], paced on the flaps themselves: the step is taken
 /// only once the flaps `deployed` have arrived at the `commanded` detent.
 /// `None` for a failed read (no measurement, no step). Pure.
@@ -2959,6 +2964,7 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, p: Params) {
     let mut handoff_wait: Option<std::time::Instant> = None;
     let _detail = crate::auto_status::DetailGuard::hold(&DETAIL);
     let mut gear_raised = !p.retract_gear;
+    let mut lights_off = false;
     let mut positive_called = false;
     let mut thr_challenged = false;
     // The initial climb's speed hold by pitch, on an airframe that declares
@@ -3453,6 +3459,17 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, p: Params) {
                         .await;
                 }
             }
+        }
+        // Landing and taxi lights off passing 1,000 ft, the practice: the
+        // takeoff owns the aircraft to its handoff, and a 737 handing off at
+        // 2,765 ft carried them into the climb list (EGKK 08R, #174).
+        if !lights_off && agl_ft >= LIGHTS_OFF_AGL_FT {
+            lights_off = true;
+            let did = crate::tools::lights::after_climb(&xp).await;
+            crate::blackbox::record(
+                "autotakeoff",
+                serde_json::json!({"event": "lights_climb", "off": did, "agl_ft": agl_ft.round()}),
+            );
         }
         if !ap_engaged {
             if agl_ft < AP_ENGAGE_AGL_FT {
