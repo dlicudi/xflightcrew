@@ -61,23 +61,330 @@ pub struct Spec {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(try_from = "CaseRaw")]
 pub struct Case {
     pub name: String,
     pub setup: Setup,
+    /// The aircraft the setup loads (`setup.aircraft`, an `.acf` path
+    /// relative to the X-Plane root, or [`AIRCRAFT_FROM_PLAN`]); `None`
+    /// keeps the loaded one.
+    pub aircraft: Option<String>,
     /// The mission, typed as a pilot would ("full auto", "fly the flight
     /// plan"). An approach case has none: the setup itself arms autoland.
-    #[serde(default)]
+    /// Sugar for a first step `when: start`.
     pub command: Option<String>,
-    #[serde(default)]
+    /// The lines typed AFTER the opening one (the command, or the approach
+    /// setup's own words), each when its trigger fires.
+    pub steps: Vec<ScriptStep>,
     pub deadline_min: Option<f64>,
     /// X-Plane's time multiplier for the flying (`sim/time/sim_speed`), set
     /// once the mission's sortie begins and put back to 1 at the case's end.
-    #[serde(default)]
     pub sim_speed: Option<u32>,
     /// Seconds after a ramp or runway start is still before the command.
-    #[serde(default)]
     pub settle_s: Option<f64>,
+    /// The case is MEANT to end in this give-up (a rejected takeoff ends
+    /// full auto with `takeoff_not_completed`): that outcome passes, with
+    /// every other rule of the verdict standing.
+    pub expect_give_up: Option<String>,
+}
+
+/// `setup.aircraft: plan`: the SimBrief plan's type, the installed `.acf`
+/// the set-up tool would load for it (`setup::find_acf`).
+pub const AIRCRAFT_FROM_PLAN: &str = "plan";
+/// `field: plan_origin` / `field: plan_destination`: the pilot's SimBrief
+/// plan's ends, fetched once per run through the app's own
+/// `simbrief::fetch` (the id from `XCOPILOT_SIMBRIEF_ID`).
+pub const FIELD_PLAN_ORIGIN: &str = "PLAN_ORIGIN";
+pub const FIELD_PLAN_DESTINATION: &str = "PLAN_DESTINATION";
+/// `runway: plan`: the plan's runway at that end (`origin/plan_rwy`,
+/// `destination/plan_rwy`).
+pub const RUNWAY_FROM_PLAN: &str = "PLAN";
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CaseRaw {
+    name: String,
+    setup: SetupMap,
+    #[serde(default)]
+    command: Option<String>,
+    #[serde(default)]
+    steps: Vec<StepRaw>,
+    #[serde(default)]
+    deadline_min: Option<f64>,
+    #[serde(default)]
+    sim_speed: Option<u32>,
+    #[serde(default)]
+    settle_s: Option<f64>,
+    #[serde(default)]
+    expect_give_up: Option<String>,
+}
+
+impl TryFrom<CaseRaw> for Case {
+    type Error = String;
+    fn try_from(c: CaseRaw) -> std::result::Result<Self, String> {
+        let aircraft = c
+            .setup
+            .aircraft
+            .clone()
+            .map(|a| a.trim().to_string())
+            .filter(|a| !a.is_empty());
+        let setup = Setup::try_from(c.setup)?;
+        let steps = c
+            .steps
+            .into_iter()
+            .map(ScriptStep::try_from)
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(Case {
+            name: c.name,
+            setup,
+            aircraft,
+            command: c.command,
+            steps,
+            deadline_min: c.deadline_min,
+            sim_speed: c.sim_speed,
+            settle_s: c.settle_s,
+            expect_give_up: c.expect_give_up,
+        })
+    }
+}
+
+// ---- The script: lines typed after the opening one ------------------------------
+
+/// When a scripted line is typed. Every clock and watch starts at the
+/// previous line (the first later step's at the opening line's answer, or
+/// on an approach at its sortie's begin: the reload is not the flight).
+#[derive(Debug, Clone, PartialEq)]
+pub enum Trigger {
+    /// The opening line, right after the setup (only the first step).
+    Start,
+    /// Seconds since the previous line.
+    AfterS(f64),
+    /// Indicated airspeed above this, knots (read from the sim).
+    IasAbove(f64),
+    /// Height above the ground above this, feet (read from the sim).
+    AglAbove(f64),
+    /// The flight model's phase (`flight::Phase`, as the `state` record's
+    /// `fphase` and the `flight` `phase` event's `to` spell it).
+    Phase(String),
+    /// A blackbox record of this kind (and event) appears.
+    Event { kind: String, event: Option<String> },
+}
+
+/// The flight model's phases, as `format!("{:?}")` writes them (pinned
+/// against `flight::Phase` by a test).
+pub const PHASES: &[&str] = &[
+    "Parked",
+    "EngineStart",
+    "Ready",
+    "Pushback",
+    "TaxiOut",
+    "Holding",
+    "LinedUp",
+    "TakeoffRoll",
+    "RejectedTakeoff",
+    "InitialClimb",
+    "Climb",
+    "Cruise",
+    "Descent",
+    "Approach",
+    "Landing",
+    "GoAround",
+    "Hover",
+    "Rollout",
+    "TaxiIn",
+];
+
+/// One scripted line.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ScriptStep {
+    /// The typed line, as a pilot says it.
+    pub say: String,
+    pub when: Trigger,
+    /// The tool the line must route to (a test pins it against the grammar;
+    /// `plan_flight` is the local planner's branch in the command loop).
+    pub tool: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StepRaw {
+    say: String,
+    #[serde(default)]
+    when: Option<serde_yaml::Value>,
+    #[serde(default)]
+    tool: Option<String>,
+}
+
+impl TryFrom<StepRaw> for ScriptStep {
+    type Error = String;
+    fn try_from(s: StepRaw) -> std::result::Result<Self, String> {
+        let say = s.say.trim().to_string();
+        if say.is_empty() {
+            return Err("a step needs a say".into());
+        }
+        let when = match s.when {
+            None => return Err(format!("step {say:?} needs a when")),
+            Some(v) => trigger(&v).map_err(|e| format!("step {say:?}: {e}"))?,
+        };
+        Ok(ScriptStep {
+            say,
+            when,
+            tool: s.tool,
+        })
+    }
+}
+
+/// `start`, or a map with exactly one of `after_s`, `ias_above`,
+/// `agl_above`, `phase`, `event: {kind, event}`.
+fn trigger(v: &serde_yaml::Value) -> std::result::Result<Trigger, String> {
+    use serde_yaml::Value as Y;
+    const WHICH: &str =
+        "when is start, or one of after_s, ias_above, agl_above, phase, event: {kind, event}";
+    if v.as_str() == Some("start") {
+        return Ok(Trigger::Start);
+    }
+    let Some(m) = v.as_mapping() else {
+        return Err(WHICH.into());
+    };
+    if m.len() != 1 {
+        return Err(WHICH.into());
+    }
+    let (k, x) = m.iter().next().ok_or(WHICH)?;
+    let num = |what: &str| -> std::result::Result<f64, String> {
+        x.as_f64()
+            .filter(|n| n.is_finite() && *n >= 0.0)
+            .ok_or_else(|| format!("{what} needs a number, zero or more"))
+    };
+    match k.as_str().unwrap_or("") {
+        "after_s" => Ok(Trigger::AfterS(num("after_s")?)),
+        "ias_above" => Ok(Trigger::IasAbove(num("ias_above")?)),
+        "agl_above" => Ok(Trigger::AglAbove(num("agl_above")?)),
+        "phase" => {
+            let p = x.as_str().unwrap_or("").trim();
+            PHASES
+                .iter()
+                .find(|n| n.eq_ignore_ascii_case(p))
+                .map(|n| Trigger::Phase(n.to_string()))
+                .ok_or_else(|| format!("phase {p:?} is none of {}", PHASES.join(", ")))
+        }
+        "event" => {
+            let m = x.as_mapping().ok_or("event is {kind, event}")?;
+            let mut kind = None;
+            let mut event = None;
+            for (k, v) in m {
+                match (k.as_str(), v) {
+                    (Some("kind"), Y::String(s)) => kind = Some(s.trim().to_string()),
+                    (Some("event"), Y::String(s)) => event = Some(s.trim().to_string()),
+                    _ => return Err("event is {kind, event}".into()),
+                }
+            }
+            let kind = kind.filter(|k| !k.is_empty()).ok_or("event needs a kind")?;
+            Ok(Trigger::Event {
+                kind,
+                event: event.filter(|e| !e.is_empty()),
+            })
+        }
+        _ => Err(WHICH.into()),
+    }
+}
+
+/// The later steps of a case, fired in order off the blackbox and the sim.
+/// Pure: the driver feeds it records and readings and types what it says.
+#[derive(Debug, Clone, Default)]
+pub struct Script {
+    steps: Vec<ScriptStep>,
+    next: usize,
+    /// The previous line's time (the arm's, for the first): `None` until armed.
+    since: Option<f64>,
+    /// The flight model's phase, last seen.
+    phase: Option<String>,
+    /// The next step's event has appeared since the previous line.
+    event_seen: bool,
+}
+
+impl Script {
+    pub fn new(steps: Vec<ScriptStep>) -> Self {
+        Self {
+            steps,
+            ..Self::default()
+        }
+    }
+
+    /// The clocks start: the opening line was answered. Idempotent.
+    pub fn arm(&mut self, now: f64) {
+        self.since.get_or_insert(now);
+    }
+
+    pub fn armed(&self) -> bool {
+        self.since.is_some()
+    }
+
+    /// Steps not yet typed.
+    pub fn pending(&self) -> usize {
+        self.steps.len() - self.next
+    }
+
+    /// The step due next, if any.
+    pub fn next_step(&self) -> Option<&ScriptStep> {
+        self.steps.get(self.next)
+    }
+
+    /// One blackbox record, in the order the app wrote it.
+    pub fn feed(&mut self, r: &Value) {
+        match (st(r, "kind"), st(r, "event")) {
+            ("state", _) if !st(r, "fphase").is_empty() => {
+                self.phase = Some(st(r, "fphase").to_string())
+            }
+            ("flight", _) if st(r, "ev") == "phase" && !st(r, "to").is_empty() => {
+                self.phase = Some(st(r, "to").to_string())
+            }
+            _ => {}
+        }
+        if !self.armed() {
+            return;
+        }
+        if let Some(ScriptStep {
+            when: Trigger::Event { kind, event },
+            ..
+        }) = self.steps.get(self.next)
+        {
+            if st(r, "kind") == kind && event.as_deref().is_none_or(|e| st(r, "event") == e) {
+                self.event_seen = true;
+            }
+        }
+    }
+
+    /// Whether the next step is due now: `ias_kts` and `agl_ft` are the
+    /// sim's (`None`: unreadable, no measurement, never due on it).
+    pub fn due(&self, now: f64, ias_kts: Option<f64>, agl_ft: Option<f64>) -> bool {
+        let (Some(since), Some(s)) = (self.since, self.steps.get(self.next)) else {
+            return false;
+        };
+        match &s.when {
+            Trigger::Start => true,
+            Trigger::AfterS(n) => now - since >= *n,
+            Trigger::IasAbove(k) => ias_kts.is_some_and(|v| v > *k),
+            Trigger::AglAbove(h) => agl_ft.is_some_and(|v| v > *h),
+            Trigger::Phase(p) => self.phase.as_deref() == Some(p.as_str()),
+            Trigger::Event { .. } => self.event_seen,
+        }
+    }
+
+    /// Which sim reads the next step's trigger needs: (ias, agl).
+    pub fn wants_reads(&self) -> (bool, bool) {
+        match self.steps.get(self.next).map(|s| &s.when) {
+            Some(Trigger::IasAbove(_)) => (true, false),
+            Some(Trigger::AglAbove(_)) => (false, true),
+            _ => (false, false),
+        }
+    }
+
+    /// The next step was typed at `now`.
+    pub fn sent(&mut self, now: f64) {
+        self.next += 1;
+        self.since = Some(now);
+        self.event_seen = false;
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -109,6 +416,8 @@ pub enum Setup {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct SetupMap {
+    #[serde(default)]
+    aircraft: Option<String>,
     #[serde(default)]
     approach: Option<ApproachSpec>,
     #[serde(default)]
@@ -193,7 +502,7 @@ impl Case {
     }
 
     /// The line typed to start the case: the approach setup's own words, or
-    /// the case's command.
+    /// the case's command (its first step `when: start`).
     pub fn first_line(&self) -> String {
         match &self.setup {
             Setup::Approach {
@@ -201,9 +510,131 @@ impl Case {
                 runway,
                 final_nm,
             } => approach_line(field, runway, *final_nm),
-            _ => self.command.clone().unwrap_or_default(),
+            _ => match &self.command {
+                Some(c) => c.clone(),
+                None => self
+                    .steps
+                    .first()
+                    .map(|s| s.say.clone())
+                    .unwrap_or_default(),
+            },
         }
     }
+
+    /// The steps typed after the opening line.
+    pub fn later_steps(&self) -> Vec<ScriptStep> {
+        let opening_is_a_step =
+            !matches!(self.setup, Setup::Approach { .. }) && self.command.is_none();
+        self.steps
+            .iter()
+            .skip(usize::from(opening_is_a_step))
+            .cloned()
+            .collect()
+    }
+
+    fn field_mut(&mut self) -> (&mut String, Option<&mut String>) {
+        match &mut self.setup {
+            Setup::Approach { field, runway, .. } | Setup::RunwayStart { field, runway, .. } => {
+                (field, Some(runway))
+            }
+            Setup::Ramp { field, .. } => (field, None),
+        }
+    }
+
+    fn field(&self) -> &str {
+        match &self.setup {
+            Setup::Approach { field, .. }
+            | Setup::RunwayStart { field, .. }
+            | Setup::Ramp { field, .. } => field,
+        }
+    }
+
+    /// The case needs the pilot's SimBrief plan to be set up.
+    pub fn uses_plan(&self) -> bool {
+        matches!(self.field(), FIELD_PLAN_ORIGIN | FIELD_PLAN_DESTINATION)
+            || self.aircraft.as_deref() == Some(AIRCRAFT_FROM_PLAN)
+    }
+}
+
+/// What a case takes from the pilot's SimBrief plan.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct PlanFacts {
+    pub origin: String,
+    pub destination: String,
+    pub origin_rwy: Option<String>,
+    pub dest_rwy: Option<String>,
+    /// The ICAO type.
+    pub aircraft: String,
+}
+
+impl PlanFacts {
+    pub fn of(p: &crate::simbrief::FlightPlan) -> Self {
+        Self {
+            origin: p.origin.trim().to_ascii_uppercase(),
+            destination: p.destination.trim().to_ascii_uppercase(),
+            origin_rwy: p.procedures.origin_rwy.clone(),
+            dest_rwy: p.procedures.dest_rwy.clone(),
+            aircraft: p.aircraft.trim().to_ascii_uppercase(),
+        }
+    }
+}
+
+/// The plan's words in a case (`plan_origin`, `plan_destination`, runway
+/// `plan`, aircraft `plan`) made the plan's facts. `find_acf` is the set-up
+/// tool's installed aircraft for a type. Pure.
+pub fn resolve_case(
+    case: &Case,
+    plan: &PlanFacts,
+    find_acf: &dyn Fn(&str) -> Option<String>,
+) -> Result<Case> {
+    let mut c = case.clone();
+    let bad = |why: String| anyhow!("case {:?}: {why}", case.name);
+    let (field, runway) = c.field_mut();
+    let rwy = match field.as_str() {
+        FIELD_PLAN_ORIGIN => {
+            *field = plan.origin.clone();
+            plan.origin_rwy.clone()
+        }
+        FIELD_PLAN_DESTINATION => {
+            *field = plan.destination.clone();
+            plan.dest_rwy.clone()
+        }
+        _ => None,
+    };
+    if field.is_empty() {
+        return Err(bad("the flight plan has no such field".into()));
+    }
+    if let Some(r) = runway {
+        if r.as_str() == RUNWAY_FROM_PLAN {
+            *r = rwy
+                .map(|x| x.trim().to_ascii_uppercase())
+                .filter(|x| !x.is_empty())
+                .ok_or_else(|| bad("the flight plan names no runway there".into()))?;
+        }
+    }
+    if c.aircraft.as_deref() == Some(AIRCRAFT_FROM_PLAN) {
+        c.aircraft = Some(find_acf(&plan.aircraft).ok_or_else(|| {
+            bad(format!(
+                "no installed aircraft of the plan's type {}",
+                plan.aircraft
+            ))
+        })?);
+    }
+    Ok(c)
+}
+
+/// An `.acf` path as the detector keys it (`detect::model_key`).
+pub fn norm_acf(p: &str) -> String {
+    p.trim().replace('\\', "/").to_lowercase()
+}
+
+/// The app's detector has resolved and probed this aircraft: its
+/// `profile_probe` record, written once per model change (`detect.rs`).
+pub fn probe_is_for(r: &Value, want_acf: &str) -> bool {
+    st(r, "kind") == "profile_probe"
+        && r.pointer("/identity/relative_path")
+            .and_then(Value::as_str)
+            .is_some_and(|p| norm_acf(p) == norm_acf(want_acf))
 }
 
 /// The typed words for a new flight on a final (the grammar's
@@ -212,8 +643,17 @@ pub fn approach_line(field: &str, runway: &str, final_nm: i64) -> String {
     format!("put us on a {final_nm} mile final to {field} runway {runway}")
 }
 
-/// Parse and check a spec. Every problem is named with its case.
+/// Parse and check a spec against the X-Plane install: every
+/// `setup.aircraft` path must be an `.acf` under `xplane_root()`.
 pub fn parse_spec(text: &str) -> Result<Spec> {
+    parse_spec_with(text, &|rel| {
+        std::path::Path::new(&crate::config::xplane_path(rel)).is_file()
+    })
+}
+
+/// [`parse_spec`] with the install's answer to "is this `.acf` there?".
+/// Every problem is named with its case.
+pub fn parse_spec_with(text: &str, acf_exists: &dyn Fn(&str) -> bool) -> Result<Spec> {
     let spec: Spec = serde_yaml::from_str(text).map_err(|e| anyhow!("spec: {e}"))?;
     if spec.cases.is_empty() {
         return Err(anyhow!("spec: no cases"));
@@ -229,7 +669,11 @@ pub fn parse_spec(text: &str) -> Result<Spec> {
         if c.sim_speed.is_some_and(|s| !(1..=16).contains(&s)) {
             return bad("sim_speed is 1 to 16");
         }
-        let has_cmd = c.command.as_deref().is_some_and(|s| !s.trim().is_empty());
+        if c.command.as_deref().is_some_and(|s| s.trim().is_empty()) {
+            return bad("the command is empty");
+        }
+        let has_cmd = c.command.is_some();
+        let starts = c.steps.iter().filter(|s| s.when == Trigger::Start).count();
         match &c.setup {
             Setup::Approach { final_nm, .. } => {
                 if !(1..=crate::tools::setup::MAX_FINAL_NM).contains(final_nm) {
@@ -243,9 +687,47 @@ pub fn parse_spec(text: &str) -> Result<Spec> {
                 if has_cmd {
                     return bad("an approach case has no command: the setup arms autoland");
                 }
+                if starts > 0 {
+                    return bad("an approach case has no start step: the setup is the start");
+                }
             }
-            _ if !has_cmd => return bad("needs a command"),
+            _ if has_cmd && starts > 0 => {
+                return bad("the command is the start step: give one or the other")
+            }
+            _ if !has_cmd && c.steps.first().map(|s| &s.when) != Some(&Trigger::Start) => {
+                return bad("needs a command (or a first step when: start)")
+            }
+            _ if starts > 1 => return bad("only the first step is when: start"),
             _ => {}
+        }
+        if let Some(a) = c.aircraft.as_deref() {
+            if a != AIRCRAFT_FROM_PLAN {
+                if !a.to_ascii_lowercase().ends_with(".acf") {
+                    return bad(&format!("aircraft {a:?} is not an .acf path"));
+                }
+                if !acf_exists(a) {
+                    return bad(&format!(
+                        "aircraft {a:?} is not installed under {}",
+                        crate::config::xplane_root()
+                    ));
+                }
+            }
+        }
+        let plan_field = matches!(c.field(), FIELD_PLAN_ORIGIN | FIELD_PLAN_DESTINATION);
+        let plan_rwy = match &c.setup {
+            Setup::Approach { runway, .. } | Setup::RunwayStart { runway, .. } => {
+                runway == RUNWAY_FROM_PLAN
+            }
+            Setup::Ramp { .. } => false,
+        };
+        if plan_rwy && !plan_field {
+            return bad("runway plan needs field plan_origin or plan_destination");
+        }
+        if c.expect_give_up
+            .as_deref()
+            .is_some_and(|g| g.trim().is_empty())
+        {
+            return bad("expect_give_up names the give-up reason");
         }
     }
     Ok(spec)
@@ -327,6 +809,12 @@ pub struct Verdict {
     /// How the last case's aircraft came to rest before this case's setup,
     /// and how long it took ([`SettleWatch`]).
     pub settle: Option<Settle>,
+    /// Scripted steps typed into the verdict's sortie: the scorer counts
+    /// each as a pilot's command, the runner as the case's own words.
+    pub scripted: u64,
+    /// What the row says beside the verdict: the sorties a script ended on
+    /// the way, the scripted commands forgiven.
+    pub note: String,
 }
 
 /// The line that stops a run on a wreck that outlived its setup.
@@ -380,6 +868,20 @@ pub struct CaseMachine {
     /// The typed line, so the app's `typed` records are matched to it;
     /// `None` takes any typed line as this one.
     pub line: Option<String>,
+    /// Scripted steps not yet typed ([`CaseMachine::note_step_sent`]).
+    pub pending_steps: usize,
+    /// Scripted lines typed and not yet read by the app's command loop,
+    /// with when: one unread for [`QUEUED_S`] is let go (the deadline
+    /// judges what it did or did not do).
+    unread: Vec<(String, f64)>,
+    /// Scripted lines typed into the sortie now flying.
+    scripted: u64,
+    /// A sortie has begun in this case.
+    began: bool,
+    /// The sorties a script ended on the way to the verdict's.
+    earlier: Vec<String>,
+    /// See [`Case::expect_give_up`].
+    pub expect_give_up: Option<String>,
 }
 
 fn st<'a>(r: &'a Value, k: &str) -> &'a str {
@@ -415,7 +917,42 @@ impl CaseMachine {
             crash_clear: false,
             crash_clear_s: CRASH_CLEAR_S,
             line: None,
+            pending_steps: 0,
+            unread: Vec::new(),
+            scripted: 0,
+            began: false,
+            earlier: Vec::new(),
+            expect_give_up: None,
         }
+    }
+
+    /// The opening line has had its answer: a command's tool record or crew
+    /// line, or, on an approach setup (`sortie_begun`), its sortie's begin.
+    /// The script's clocks start here.
+    pub fn opened(&self, sortie_begun: bool) -> bool {
+        if sortie_begun {
+            self.began
+        } else {
+            !matches!(self.phase, Phase::AwaitAck { .. } | Phase::Queued { .. })
+        }
+    }
+
+    /// A scripted step was typed at `now`.
+    pub fn note_step_sent(&mut self, now: f64, line: &str) {
+        self.pending_steps = self.pending_steps.saturating_sub(1);
+        self.unread.push((line.trim().to_ascii_lowercase(), now));
+        match &mut self.phase {
+            Phase::Flying { .. } => self.scripted += 1,
+            // The step may be the one that begins the mission: its grace
+            // runs from here.
+            Phase::AwaitSortie { since } => *since = now,
+            _ => {}
+        }
+    }
+
+    /// Every scripted line typed and read: the next verdict is the case's.
+    fn script_done(&self) -> bool {
+        self.pending_steps == 0 && self.unread.is_empty()
     }
 
     fn fail(&mut self, reason: String, abort: bool) -> Step {
@@ -451,6 +988,12 @@ impl CaseMachine {
         let (kind, event) = (st(r, "kind"), st(r, "event"));
         if kind == "said" && st(r, "who") == "crew" {
             self.last_crew_line = Some(st(r, "text").to_string());
+        }
+        if kind == "typed" && event == "consumed" {
+            let text = st(r, "text").trim().to_ascii_lowercase();
+            if let Some(i) = self.unread.iter().position(|(l, _)| *l == text) {
+                self.unread.remove(i);
+            }
         }
         match self.phase.clone() {
             Phase::Done => Step::Wait,
@@ -499,6 +1042,10 @@ impl CaseMachine {
                     self.phase = Phase::Flying {
                         sortie: st(r, "sortie").to_string(),
                     };
+                    self.began = true;
+                    self.scripted = 0;
+                    self.stages.clear();
+                    self.give_up = None;
                     Step::Began
                 }
                 // The approach setup's own answer: armed, or why not.
@@ -523,6 +1070,27 @@ impl CaseMachine {
                         self.give_up = Some(st(r, "reason").to_string());
                         Step::Wait
                     }
+                    // A sortie the script ends on the way (its "my controls",
+                    // or the next mission superseding it) is not the case's
+                    // verdict: the next one is.
+                    ("sortie_result", _)
+                        if mine
+                            && (self.scripted > 0 || !self.unread.is_empty())
+                            && (!self.script_done() || st(r, "outcome") == "superseded") =>
+                    {
+                        self.earlier.push(format!(
+                            "{sortie} {} ({})",
+                            if r.get("pass") == Some(&Value::Bool(true)) {
+                                "passed"
+                            } else {
+                                "failed"
+                            },
+                            st(r, "outcome")
+                        ));
+                        self.stages.clear();
+                        self.phase = Phase::AwaitSortie { since: t };
+                        Step::Wait
+                    }
                     ("sortie_result", _) if mine => {
                         self.phase = Phase::Done;
                         Step::Finished(self.verdict_from(r, &sortie))
@@ -535,18 +1103,76 @@ impl CaseMachine {
 
     fn verdict_from(&mut self, r: &Value, sortie: &str) -> Verdict {
         let n = |k: &str| r.get(k).and_then(Value::as_u64).unwrap_or(0);
-        let pass = r.get("pass").and_then(Value::as_bool) == Some(true);
+        let mut pass = r.get("pass").and_then(Value::as_bool) == Some(true);
         let outcome = st(r, "outcome").to_string();
         let stages = std::mem::take(&mut self.stages);
+        let crashed = r.get("crashed").and_then(Value::as_bool) == Some(true);
+        let why_of = |s: &Value| -> Vec<String> {
+            s.get("why")
+                .and_then(Value::as_array)
+                .map(|a| {
+                    a.iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_string)
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        let failed: Vec<&Value> = stages
+            .iter()
+            .filter(|s| s.get("pass") != Some(&Value::Bool(true)))
+            .collect();
+        // The script's own lines are the case's words, not a pilot's: the
+        // scorer's "attended" is re-judged against them.
+        let (interventions, commands) = (n("interventions"), n("commands"));
+        let own_words = interventions == 0 && commands <= self.scripted;
+        let mut notes: Vec<String> = Vec::new();
+        if !self.earlier.is_empty() {
+            notes.push(format!("before it: {}", self.earlier.join(", ")));
+        }
+        let mut expected_why: Option<String> = None;
+        if let Some(g) = self.expect_give_up.clone() {
+            // Meant to end in this give-up: a stage it cut short ("ended by
+            // give_up") is the script's, any other failure still fails.
+            let gave = outcome == "gave_up" && self.give_up.as_deref() == Some(g.as_str());
+            let cut_short_only = failed
+                .iter()
+                .all(|s| why_of(s).iter().all(|w| w.starts_with("ended by")));
+            pass = gave && own_words && !crashed && cut_short_only;
+            if !gave {
+                expected_why = Some(format!(
+                    "expected the give-up {g}, the outcome was {outcome}{}",
+                    self.give_up
+                        .as_deref()
+                        .map(|x| format!(" ({x})"))
+                        .unwrap_or_default()
+                ));
+            } else if pass {
+                notes.push(format!("gave up as meant ({g})"));
+            }
+        } else if !pass
+            && commands > 0
+            && own_words
+            && !crashed
+            && failed.is_empty()
+            && !stages.is_empty()
+            && outcome != "gave_up"
+            && outcome != "superseded"
+        {
+            pass = true;
+        }
+        if pass && commands > 0 {
+            notes.push(format!("{commands} commands were the script's"));
+        }
         let mut why: Vec<String> = Vec::new();
         if !pass {
-            if r.get("crashed").and_then(Value::as_bool) == Some(true) {
+            if crashed {
                 why.push("the aircraft crashed".into());
             }
-            for s in stages
-                .iter()
-                .filter(|s| s.get("pass") != Some(&Value::Bool(true)))
-            {
+            if let Some(e) = expected_why {
+                why.push(e);
+            }
+            for s in failed.iter().copied() {
                 let reasons: Vec<&str> = s
                     .get("why")
                     .and_then(Value::as_array)
@@ -566,11 +1192,14 @@ impl CaseMachine {
             if outcome == "superseded" {
                 why.push("superseded by another mission".into());
             }
-            if r.get("unattended").and_then(Value::as_bool) == Some(false) {
+            if r.get("unattended").and_then(Value::as_bool) == Some(false) && !own_words {
                 why.push(format!(
-                    "attended ({} interventions, {} commands)",
-                    n("interventions"),
-                    n("commands")
+                    "attended ({interventions} interventions, {commands} commands{})",
+                    if self.scripted > 0 {
+                        format!(", {} of them the script's", self.scripted.min(commands))
+                    } else {
+                        String::new()
+                    }
                 ));
             }
             if stages.is_empty() && why.is_empty() {
@@ -581,12 +1210,14 @@ impl CaseMachine {
             pass,
             sortie: Some(sortie.to_string()),
             stages,
-            interventions: n("interventions"),
-            commands: n("commands"),
+            interventions,
+            commands,
             outcome,
             reason: why.join("; "),
             abort: false,
-            crashed: r.get("crashed").and_then(Value::as_bool) == Some(true),
+            crashed,
+            scripted: self.scripted,
+            note: notes.join("; "),
             ..Verdict::default()
         }
     }
@@ -597,6 +1228,7 @@ impl CaseMachine {
         if self.phase == Phase::Done {
             return Step::Wait;
         }
+        self.unread.retain(|(_, sent)| now - sent <= QUEUED_S);
         let sortie = match &self.phase {
             Phase::Flying { sortie } => Some(sortie.clone()),
             _ => None,
@@ -650,7 +1282,10 @@ impl CaseMachine {
                 format!("the app took the command but its loop never read it in {QUEUED_S:.0} s"),
                 true,
             ),
-            Phase::AwaitSortie { since } if now - since > SORTIE_GRACE_S => {
+            // A step still to come may be the one that begins it.
+            Phase::AwaitSortie { since }
+                if self.pending_steps == 0 && now - since > SORTIE_GRACE_S =>
+            {
                 let what = format!(
                     "no mission began{}",
                     self.tool
@@ -748,10 +1383,11 @@ pub fn row_line(r: &Row) -> String {
         } else {
             String::new()
         },
-        if v.reason.is_empty() {
-            String::new()
-        } else {
-            format!(": {}", v.reason)
+        match (v.reason.is_empty(), v.note.is_empty()) {
+            (true, true) => String::new(),
+            (true, false) => format!(" [{}]", v.note),
+            (false, true) => format!(": {}", v.reason),
+            (false, false) => format!(": {} [{}]", v.reason, v.note),
         },
     )
 }
@@ -784,7 +1420,11 @@ pub fn table(spec_path: &str, started: &str, rows: &[Row]) -> String {
             v.interventions,
             r.secs,
             cell(&before),
-            cell(&v.reason),
+            cell(&match (v.reason.is_empty(), v.note.is_empty()) {
+                (_, true) => v.reason.clone(),
+                (true, false) => format!("[{}]", v.note),
+                (false, false) => format!("{} [{}]", v.reason, v.note),
+            }),
         ));
     }
     if rows.last().is_some_and(|r| r.verdict.stop_run) {
@@ -920,6 +1560,8 @@ pub struct Pace {
     pub stop_max_s: f64,
     /// Longest wait for the last case's wreck to clear ([`CRASH_CLEAR_S`]).
     pub crash_clear_s: f64,
+    /// Longest wait for the app to swap to a case's aircraft ([`SWAP_MAX_S`]).
+    pub swap_max_s: f64,
 }
 
 impl Pace {
@@ -933,8 +1575,14 @@ impl Pace {
         quiet_s: QUIET_S,
         stop_max_s: STOP_MAX_S,
         crash_clear_s: CRASH_CLEAR_S,
+        swap_max_s: SWAP_MAX_S,
     };
 }
+
+/// From a setup that loads another aircraft to the app's `profile_probe`
+/// of it: the reload (up to two minutes, `InitTiming`), then the
+/// detector's three-second poll and the probe's index fetch.
+pub const SWAP_MAX_S: f64 = 180.0;
 
 fn now_s() -> f64 {
     std::time::SystemTime::now()
@@ -1192,17 +1840,32 @@ async fn settle_before_setup(
 }
 
 /// A ramp or runway start: write the mailbox, wait for the plugin's answer
-/// through the reload, then for the aircraft to sit still.
-async fn set_up_start(sim: &dyn RunnerSim, case: &Case, apt_dat: &str, pace: &Pace) -> Result<()> {
-    // An approach is set up by the app's own tool, from the typed line.
-    if matches!(case.setup, Setup::Approach { .. }) {
-        return Ok(());
-    }
-    let acf = sim
+/// through the reload, then for the aircraft to sit still and, when the case
+/// named another aircraft, for the app's detector to have swapped to it
+/// ([`probe_is_for`]). An approach case is set up by the app's own tool from
+/// the typed line, on the LOADED aircraft: another one is loaded first, on
+/// the same runway with its engines running, and waited for the same way.
+async fn set_up_start(
+    sim: &dyn RunnerSim,
+    tail: &mut BlackboxTail,
+    case: &Case,
+    apt_dat: &str,
+    pace: &Pace,
+) -> Result<()> {
+    let loaded = sim
         .read_string(ACF_PATH)
         .await
         .ok()
-        .filter(|p| !p.trim().is_empty())
+        .filter(|p| !p.trim().is_empty());
+    let swap = match (&case.aircraft, &loaded) {
+        (Some(w), Some(l)) => norm_acf(w) != norm_acf(l),
+        (Some(_), None) => true,
+        (None, _) => false,
+    };
+    let acf = case
+        .aircraft
+        .clone()
+        .or(loaded)
         .ok_or_else(|| anyhow!("can't read which aircraft is loaded"))?;
     let body = match &case.setup {
         Setup::RunwayStart {
@@ -1213,21 +1876,36 @@ async fn set_up_start(sim: &dyn RunnerSim, case: &Case, apt_dat: &str, pace: &Pa
         Setup::Ramp { field, stand } => {
             let stand = match stand {
                 Some(s) => s.clone(),
-                None => pick_stand(sim, apt_dat, field).await?,
+                None => {
+                    // The stand suits the aircraft being LOADED: its own
+                    // .acf's type when the case names one.
+                    let icao = match &case.aircraft {
+                        Some(a) => std::fs::read_to_string(crate::config::xplane_path(a))
+                            .ok()
+                            .and_then(|t| crate::tools::setup::acf_icao(&t))
+                            .unwrap_or_default(),
+                        None => sim.read_string(ACF_ICAO).await.unwrap_or_default(),
+                    };
+                    pick_stand(apt_dat, field, &icao)?
+                }
             };
             crate::tools::setup::init_json(&acf, field, &stand)
         }
+        Setup::Approach { field, runway, .. } if swap => {
+            runway_start_json(&acf, field, runway, true)
+        }
         Setup::Approach { .. } => return Ok(()),
     };
+    tail.skip_to_end();
     let run =
         crate::tools::setup::run_init(&Mailbox(sim), body.as_bytes(), pace.init, &|_| {}).await;
     match run.outcome {
         InitOutcome::Done(0) => {}
         InitOutcome::Done(code) => {
             let (field, rwy) = match &case.setup {
-                Setup::RunwayStart { field, runway, .. } => (field.as_str(), runway.as_str()),
+                Setup::RunwayStart { field, runway, .. }
+                | Setup::Approach { field, runway, .. } => (field.as_str(), runway.as_str()),
                 Setup::Ramp { field, .. } => (field.as_str(), ""),
-                _ => ("", ""),
             };
             return Err(anyhow!(
                 "{}",
@@ -1243,33 +1921,49 @@ async fn set_up_start(sim: &dyn RunnerSim, case: &Case, apt_dat: &str, pace: &Pa
         }
     }
     // Still for five seconds, the sim reloaded and its ids re-resolved by
-    // the client on the way.
+    // the client on the way; and the new aircraft's profile loaded and
+    // probed by the app (every tool the command reaches is the airframe's).
     let t0 = now_s();
     let mut still_since: Option<f64> = None;
-    while now_s() - t0 < pace.still_max_s {
+    let mut swapped = !swap;
+    loop {
         tokio::time::sleep(pace.poll).await;
+        if !swapped {
+            swapped = tail.poll().iter().any(|r| probe_is_for(r, &acf));
+        }
         let (g, gs) = (
             sim.read(crate::datarefs::ON_GROUND_ANY).await,
             sim.read(GROUNDSPEED).await,
         );
-        if g.is_ok_and(|g| g > 0.5) && gs.is_ok_and(|v| v.abs() < 0.5) {
+        let still = if g.is_ok_and(|g| g > 0.5) && gs.is_ok_and(|v| v.abs() < 0.5) {
             let s = *still_since.get_or_insert(now_s());
-            if now_s() - s >= pace.still_s {
-                let settle = case.settle_s.unwrap_or(DEFAULT_SETTLE_S) * pace.settle_scale;
-                tokio::time::sleep(std::time::Duration::from_secs_f64(settle)).await;
-                return Ok(());
-            }
+            now_s() - s >= pace.still_s
         } else {
             still_since = None;
+            false
+        };
+        if still && swapped {
+            let settle = case.settle_s.unwrap_or(DEFAULT_SETTLE_S) * pace.settle_scale;
+            tokio::time::sleep(std::time::Duration::from_secs_f64(settle)).await;
+            return Ok(());
+        }
+        let waited = now_s() - t0;
+        if !swapped && waited > pace.swap_max_s {
+            return Err(anyhow!(
+                "the app never took the {acf} (no profile_probe for it in {:.0} s): is xvl running?",
+                pace.swap_max_s
+            ));
+        }
+        if !still && waited > pace.still_max_s {
+            return Err(anyhow!("the aircraft never sat still after the setup"));
         }
     }
-    Err(anyhow!("the aircraft never sat still after the setup"))
 }
 
-/// The stand the setup tool would pick for the loaded type.
-async fn pick_stand(sim: &dyn RunnerSim, apt_dat: &str, field: &str) -> Result<String> {
-    let icao = sim.read_string(ACF_ICAO).await.unwrap_or_default();
-    let known = crate::aircraft::profile_for_type(&icao);
+/// The stand the setup tool would pick for this type (ICAO; empty: the
+/// setup tool's pick for an unknown type).
+fn pick_stand(apt_dat: &str, field: &str, icao: &str) -> Result<String> {
+    let known = crate::aircraft::profile_for_type(icao);
     let jet = known.as_ref().is_some_and(|p| {
         p.reference
             .as_ref()
@@ -1290,6 +1984,10 @@ async fn pick_stand(sim: &dyn RunnerSim, apt_dat: &str, field: &str) -> Result<S
         .map(|s| s.name.clone())
         .ok_or_else(|| anyhow!("no stand at {field} takes this aircraft"))
 }
+
+/// Indicated airspeed, knots.
+const IAS_KTS: &str = "sim/flightmodel/position/indicated_airspeed";
+const M_TO_FT: f64 = 3.280_84;
 
 /// Fly one case to its verdict. Setup failures are verdicts too.
 pub async fn run_case(
@@ -1313,7 +2011,7 @@ pub async fn run_case(
         settle: Some(settle),
         ..failed(reason)
     };
-    if let Err(e) = set_up_start(sim, case, apt_dat, pace).await {
+    if let Err(e) = set_up_start(sim, tail, case, apt_dat, pace).await {
         return failed(format!("setup: {e}"));
     }
     let line = case.first_line();
@@ -1321,18 +2019,29 @@ pub async fn run_case(
     if let Err(e) = type_line(sim, &line, pace).await {
         return failed(e.to_string());
     }
-    let mut m = match case.setup {
-        Setup::Approach { .. } => CaseMachine::once(now_s(), case.deadline_s()),
-        _ => CaseMachine::new(now_s(), case.deadline_s()),
+    let approach = matches!(case.setup, Setup::Approach { .. });
+    let mut m = match approach {
+        true => CaseMachine::once(now_s(), case.deadline_s()),
+        false => CaseMachine::new(now_s(), case.deadline_s()),
     };
     m.crash_clear_s = pace.crash_clear_s;
     m.line = Some(line.clone());
+    m.expect_give_up = case.expect_give_up.clone();
+    let mut script = Script::new(case.later_steps());
+    m.pending_steps = script.pending();
     let speed = case.sim_speed.filter(|s| *s != 1);
-    let verdict = loop {
+    let verdict = 'case: loop {
         tokio::time::sleep(pace.poll).await;
         let mut done = None;
         for r in tail.poll() {
-            match m.feed(&r) {
+            let step = m.feed(&r);
+            // The script's clocks start at the opening line's answer (an
+            // approach's: its sortie), and it hears every record after.
+            if !script.armed() && m.opened(approach) {
+                script.arm(now_s());
+            }
+            script.feed(&r);
+            match step {
                 Step::Finished(v) => {
                     done = Some(v);
                     break;
@@ -1347,6 +2056,36 @@ pub async fn run_case(
         }
         if let Some(v) = done {
             break v;
+        }
+        if script.armed() && script.pending() > 0 {
+            let (want_ias, want_agl) = script.wants_reads();
+            let ias = match want_ias {
+                true => sim.read(IAS_KTS).await.ok(),
+                false => None,
+            };
+            let agl = match want_agl {
+                true => sim
+                    .read(crate::datarefs::AGL_METERS)
+                    .await
+                    .ok()
+                    .map(|m| m * M_TO_FT),
+                false => None,
+            };
+            if script.due(now_s(), ias, agl) {
+                let say = script
+                    .next_step()
+                    .map(|s| s.say.clone())
+                    .unwrap_or_default();
+                if let Err(e) = type_line(sim, &say, pace).await {
+                    // Whatever was armed may still be flying: taken back.
+                    let mut v = failed(format!("step {say:?}: {e}"));
+                    v.abort = true;
+                    break 'case v;
+                }
+                let t = now_s();
+                script.sent(t);
+                m.note_step_sent(t, &say);
+            }
         }
         let crashed = sim
             .read(crate::datarefs::HAS_CRASHED)
@@ -1366,6 +2105,15 @@ pub async fn run_case(
     }
     let mut verdict = verdict;
     verdict.settle = Some(settle);
+    // A script that never finished proved less than it meant to.
+    if let Some(s) = script.next_step() {
+        verdict.pass = false;
+        let why = format!("the script's step {:?} never came ({:?})", s.say, s.when);
+        verdict.reason = match verdict.reason.is_empty() {
+            true => why,
+            false => format!("{}; {why}", verdict.reason),
+        };
+    }
     let on_ground = match verdict.abort {
         true => sim
             .read(crate::datarefs::ON_GROUND_ANY)
@@ -1465,7 +2213,10 @@ pub async fn main_cmd(args: &[String], base_url: &str, apt_dat: &str) -> Result<
         .ok_or_else(|| anyhow!("usage: xvl sortie <spec.yaml> [--repeat N] [--log path]"))?;
     let text =
         std::fs::read_to_string(&spec_path).map_err(|e| anyhow!("reading {spec_path}: {e}"))?;
-    let spec = parse_spec(&text)?;
+    let mut spec = parse_spec(&text)?;
+    if spec.cases.iter().any(Case::uses_plan) {
+        spec = with_the_plan(spec).await?;
+    }
     if !std::path::Path::new(&log).exists() {
         return Err(anyhow!(
             "{log} not found: run from the xvl checkout the app writes into"
@@ -1525,6 +2276,36 @@ pub async fn main_cmd(args: &[String], base_url: &str, apt_dat: &str) -> Result<
     Ok(passed == rows.len())
 }
 
+/// The plan's words in the spec made the pilot's SimBrief plan's facts,
+/// fetched once for the run through the app's own `simbrief::fetch`; the
+/// aircraft of the plan's type as the set-up tool finds it installed.
+async fn with_the_plan(spec: Spec) -> Result<Spec> {
+    let id = crate::settings::live().simbrief_id.clone();
+    let plan = crate::simbrief::fetch(&id)
+        .await
+        .map_err(|e| anyhow!("the spec names the flight plan, and it could not be fetched: {e}"))?;
+    let facts = PlanFacts::of(&plan);
+    eprintln!(
+        "flight plan: {} to {} ({}), runways {} and {}",
+        facts.origin,
+        facts.destination,
+        facts.aircraft,
+        facts.origin_rwy.as_deref().unwrap_or("-"),
+        facts.dest_rwy.as_deref().unwrap_or("-")
+    );
+    let root = crate::config::xplane_root();
+    let find = move |icao: &str| {
+        crate::tools::setup::find_acf(crate::tools::setup::aircraft_library(&root), icao)
+            .map(str::to_string)
+    };
+    let cases = spec
+        .cases
+        .iter()
+        .map(|c| resolve_case(c, &facts, &find))
+        .collect::<Result<Vec<_>>>()?;
+    Ok(Spec { cases })
+}
+
 /// A UTC stamp for the run's file name, from the clock alone.
 fn chrono_stamp() -> String {
     let secs = now_s() as i64;
@@ -1552,6 +2333,714 @@ mod tests {
     use super::*;
 
     const LEMG: &str = include_str!("../bench/sorties/lemg-737.yaml");
+
+    /// Every shipped spec, parsed against the install when there is one
+    /// (a machine without X-Plane checks the shapes, not the paths).
+    fn bench_specs() -> Vec<(std::path::PathBuf, Spec)> {
+        let installed = std::path::Path::new(&crate::config::xplane_root()).is_dir();
+        let mut out = Vec::new();
+        for f in std::fs::read_dir("bench/sorties").unwrap().flatten() {
+            let p = f.path();
+            if p.extension().is_some_and(|e| e == "yaml") {
+                let text = std::fs::read_to_string(&p).unwrap();
+                let spec = if installed {
+                    parse_spec(&text)
+                } else {
+                    parse_spec_with(&text, &|_| true)
+                };
+                out.push((
+                    p.clone(),
+                    spec.unwrap_or_else(|e| panic!("{}: {e}", p.display())),
+                ));
+            }
+        }
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        out
+    }
+
+    /// The profile a bench aircraft flies with: the detector's own answer
+    /// when the `.acf` is installed, pinned to this table either way.
+    fn bench_profile(acf: Option<&str>) -> crate::aircraft::AircraftProfile {
+        let Some(acf) = acf else {
+            return crate::aircraft::load("boeing_737_800").unwrap();
+        };
+        let file = acf.rsplit('/').next().unwrap();
+        let id = match file {
+            "b738.acf" => "boeing_737_800",
+            "Cirrus SR22.acf" => "cirrus_sr22",
+            "CirrusSF50.acf" => "cirrus_vision_sf50",
+            "A330.acf" => "airbus_a330_300",
+            "Cessna_CitationX.acf" => "citation_x",
+            "S-76C.acf" => "sikorsky_s76c",
+            other => panic!("{other}: add the bench aircraft to this table"),
+        };
+        if let Some(icao) = std::fs::read_to_string(crate::config::xplane_path(acf))
+            .ok()
+            .and_then(|t| crate::tools::setup::acf_icao(&t))
+        {
+            assert_eq!(
+                crate::detect::resolved_id(&icao, acf).as_deref(),
+                Some(id),
+                "{acf} ({icao}) is detected as another profile"
+            );
+        }
+        crate::aircraft::load(id).unwrap_or_else(|| panic!("profile {id}"))
+    }
+
+    /// The tool a typed line reaches, as the command loop routes it: the
+    /// local planner's branch first (`flightplan::parse_request`), then the
+    /// grammar.
+    fn routed(line: &str, prof: &crate::aircraft::AircraftProfile) -> Option<String> {
+        if crate::flightplan::parse_request(line).is_some_and(|r| r.dest.is_some()) {
+            return Some("plan_flight".into());
+        }
+        let reg = crate::tools::Registry::for_aircraft(prof);
+        crate::grammar::try_parse(line, &reg, prof).map(|c| c[0].name.clone())
+    }
+
+    /// Every line a shipped spec types is the app's real phrasing: each
+    /// step reaches the tool it names, each command reaches a tool, on the
+    /// case's own airframe.
+    #[test]
+    fn every_scripted_line_routes_to_its_tool() {
+        let mut checked = 0;
+        for (path, spec) in bench_specs() {
+            for c in &spec.cases {
+                let prof = bench_profile(c.aircraft.as_deref());
+                let at = |what: &str| format!("{} {:?} {what}", path.display(), c.name);
+                if let Some(cmd) = &c.command {
+                    assert!(routed(cmd, &prof).is_some(), "{}", at(cmd));
+                    checked += 1;
+                }
+                for s in &c.steps {
+                    let want = s
+                        .tool
+                        .as_deref()
+                        .unwrap_or_else(|| panic!("{}: name the tool", at(&s.say)));
+                    assert_eq!(
+                        routed(&s.say, &prof).as_deref(),
+                        Some(want),
+                        "{}",
+                        at(&s.say)
+                    );
+                    checked += 1;
+                }
+            }
+        }
+        assert!(checked >= 15, "{checked}");
+        // The reject is the pilot's command, auto_takeoff's off switch; the
+        // crew's radio call is autotakeoff::REJECT_CALL, a different line.
+        let b738 = bench_profile(None);
+        let reg = crate::tools::Registry::for_aircraft(&b738);
+        let calls = crate::grammar::try_parse("reject the takeoff", &reg, &b738).unwrap();
+        assert_eq!(calls[0].arguments, json!({"off": true}));
+        let calls = crate::grammar::try_parse("resume flight plan", &reg, &b738).unwrap();
+        assert_eq!(calls[0].arguments["resume"], true, "{calls:?}");
+    }
+
+    /// The aircraft named in a spec is an installed `.acf`, checked when the
+    /// spec is read, never found missing at the setup.
+    #[test]
+    fn a_setup_aircraft_must_be_an_installed_acf() {
+        let spec = |a: &str| {
+            format!(
+                "cases: [{{name: a, setup: {{aircraft: \"{a}\", runway_start: {{field: LEMG, runway: 13}}}}, command: fly a circuit}}]"
+            )
+        };
+        let there = |p: &str| p == "Aircraft/x/y.acf";
+        let s = parse_spec_with(&spec("Aircraft/x/y.acf"), &there).unwrap();
+        assert_eq!(s.cases[0].aircraft.as_deref(), Some("Aircraft/x/y.acf"));
+        let e = parse_spec_with(&spec("Aircraft/x/z.acf"), &there).unwrap_err();
+        assert!(e.to_string().contains("is not installed under"), "{e}");
+        let e = parse_spec_with(&spec("Aircraft/x/y"), &there).unwrap_err();
+        assert!(e.to_string().contains("not an .acf path"), "{e}");
+        // "plan" is resolved from the fetched plan, not checked here.
+        let s = parse_spec_with(&spec("plan"), &there).unwrap();
+        assert!(s.cases[0].uses_plan());
+        // Every setup kind takes one.
+        for setup in [
+            "{aircraft: Aircraft/x/y.acf, approach: {field: LEMG, runway: 13}}",
+            "{aircraft: Aircraft/x/y.acf, ramp: {field: LEMG}}",
+        ] {
+            let text = format!("cases: [{{name: a, setup: {setup}, steps: []}}]").replace(
+                "steps: []",
+                if setup.contains("ramp") {
+                    "command: full auto"
+                } else {
+                    "deadline_min: 5"
+                },
+            );
+            let s = parse_spec_with(&text, &there).unwrap_or_else(|e| panic!("{setup}: {e}"));
+            assert_eq!(s.cases[0].aircraft.as_deref(), Some("Aircraft/x/y.acf"));
+        }
+    }
+
+    #[test]
+    fn steps_parse_every_trigger_and_refuse_a_bad_script() {
+        let s = parse_spec_with(
+            "cases: [{name: a, setup: {runway_start: {field: LEMG, runway: 13}}, steps: [\n\
+               {say: fly a circuit, when: start, tool: full_auto},\n\
+               {say: a, when: {after_s: 20}},\n\
+               {say: b, when: {ias_above: 60}},\n\
+               {say: c, when: {agl_above: 400}},\n\
+               {say: d, when: {phase: takeoffroll}},\n\
+               {say: e, when: {event: {kind: autotakeoff, event: reject}}},\n\
+               {say: f, when: {event: {kind: loading}}}]}]",
+            &|_| true,
+        )
+        .unwrap();
+        let c = &s.cases[0];
+        assert_eq!(c.first_line(), "fly a circuit");
+        let whens: Vec<Trigger> = c.later_steps().into_iter().map(|s| s.when).collect();
+        assert_eq!(
+            whens,
+            vec![
+                Trigger::AfterS(20.0),
+                Trigger::IasAbove(60.0),
+                Trigger::AglAbove(400.0),
+                Trigger::Phase("TakeoffRoll".into()),
+                Trigger::Event {
+                    kind: "autotakeoff".into(),
+                    event: Some("reject".into())
+                },
+                Trigger::Event {
+                    kind: "loading".into(),
+                    event: None
+                },
+            ]
+        );
+        // The command is sugar for the start step; the steps after it.
+        let s = parse_spec_with(
+            "cases: [{name: a, setup: {ramp: {field: LEMG}}, command: full auto, steps: [{say: x, when: {after_s: 5}}]}]",
+            &|_| true,
+        )
+        .unwrap();
+        assert_eq!(s.cases[0].first_line(), "full auto");
+        assert_eq!(s.cases[0].later_steps().len(), 1);
+        // An approach's steps all come after its setup.
+        let s = parse_spec_with(
+            "cases: [{name: a, setup: {approach: {field: LEMG, runway: 13}}, steps: [{say: my controls, when: {after_s: 30}}]}]",
+            &|_| true,
+        )
+        .unwrap();
+        assert_eq!(s.cases[0].later_steps().len(), 1);
+        let bad = [
+            ("steps: [{say: x, when: {after_s: 5}}]", "needs a command"),
+            ("steps: [{say: x}]", "needs a when"),
+            (
+                "command: y, steps: [{say: x, when: start}]",
+                "the command is the start step",
+            ),
+            (
+                "steps: [{say: x, when: start}, {say: y, when: start}]",
+                "only the first step",
+            ),
+            ("steps: [{say: x, when: soon}]", "when is start"),
+            (
+                "steps: [{say: x, when: start}, {say: y, when: {phase: Taxiing}}]",
+                "phase \"Taxiing\"",
+            ),
+            (
+                "steps: [{say: x, when: start}, {say: y, when: {after_s: -1}}]",
+                "zero or more",
+            ),
+            (
+                "steps: [{say: x, when: start}, {say: y, when: {after_s: 1, ias_above: 2}}]",
+                "when is start",
+            ),
+            (
+                "steps: [{say: x, when: start}, {say: y, when: {event: {event: z}}}]",
+                "needs a kind",
+            ),
+            ("steps: [{say: x, when: start, tol: z}]", "unknown field"),
+            ("command: x, expect_give_up: \" \"", "expect_give_up"),
+        ];
+        for (tail, want) in bad {
+            let text = format!(
+                "cases: [{{name: a, setup: {{runway_start: {{field: LEMG, runway: 13}}}}, {tail}}}]"
+            );
+            let e = parse_spec_with(&text, &|_| true)
+                .expect_err(tail)
+                .to_string();
+            assert!(e.contains(want), "{tail}: {e}");
+        }
+        let e = parse_spec_with(
+            "cases: [{name: a, setup: {approach: {field: LEMG, runway: 13}}, steps: [{say: x, when: start}]}]",
+            &|_| true,
+        )
+        .unwrap_err();
+        assert!(e.to_string().contains("no start step"), "{e}");
+        let e = parse_spec_with(
+            "cases: [{name: a, setup: {approach: {field: LEMG, runway: plan}}}]",
+            &|_| true,
+        )
+        .unwrap_err();
+        assert!(e.to_string().contains("runway plan needs"), "{e}");
+    }
+
+    /// Every phase a spec may name is one the flight model has: this match
+    /// stops compiling when a phase is added, and the names are `{:?}`'s.
+    #[test]
+    fn the_phase_names_are_the_flight_models() {
+        use crate::flight::Phase as P;
+        let all = [
+            P::Parked,
+            P::EngineStart,
+            P::Ready,
+            P::Pushback,
+            P::TaxiOut,
+            P::Holding,
+            P::LinedUp,
+            P::TakeoffRoll,
+            P::RejectedTakeoff,
+            P::InitialClimb,
+            P::Climb,
+            P::Cruise,
+            P::Descent,
+            P::Approach,
+            P::Landing,
+            P::GoAround,
+            P::Hover,
+            P::Rollout,
+            P::TaxiIn,
+        ];
+        for p in all {
+            match p {
+                P::Parked
+                | P::EngineStart
+                | P::Ready
+                | P::Pushback
+                | P::TaxiOut
+                | P::Holding
+                | P::LinedUp
+                | P::TakeoffRoll
+                | P::RejectedTakeoff
+                | P::InitialClimb
+                | P::Climb
+                | P::Cruise
+                | P::Descent
+                | P::Approach
+                | P::Landing
+                | P::GoAround
+                | P::Hover
+                | P::Rollout
+                | P::TaxiIn => {}
+            }
+        }
+        let names: Vec<String> = all.iter().map(|p| format!("{p:?}")).collect();
+        assert_eq!(names, PHASES);
+    }
+
+    fn step(say: &str, when: Trigger) -> ScriptStep {
+        ScriptStep {
+            say: say.into(),
+            when,
+            tool: None,
+        }
+    }
+
+    #[test]
+    fn each_trigger_fires_on_its_own_measure_after_the_previous_line() {
+        let mut s = Script::new(vec![
+            step("a", Trigger::AfterS(20.0)),
+            step("b", Trigger::IasAbove(60.0)),
+            step("c", Trigger::AglAbove(400.0)),
+            step("d", Trigger::Phase("Climb".into())),
+            step(
+                "e",
+                Trigger::Event {
+                    kind: "autotakeoff".into(),
+                    event: Some("reject".into()),
+                },
+            ),
+            step(
+                "f",
+                Trigger::Event {
+                    kind: "loading".into(),
+                    event: None,
+                },
+            ),
+        ]);
+        // Nothing before the opening line is answered.
+        assert!(!s.due(1000.0, Some(200.0), Some(5000.0)));
+        s.arm(100.0);
+        assert!(!s.due(119.0, None, None));
+        assert!(s.due(120.0, None, None), "after_s from the arm");
+        s.sent(121.0);
+        assert_eq!(s.wants_reads(), (true, false));
+        assert!(!s.due(200.0, Some(60.0), None), "above, not at");
+        assert!(
+            !s.due(200.0, None, None),
+            "an unreadable airspeed is no measurement"
+        );
+        assert!(s.due(200.0, Some(61.0), None));
+        s.sent(201.0);
+        assert_eq!(s.wants_reads(), (false, true));
+        assert!(!s.due(210.0, Some(200.0), Some(390.0)));
+        assert!(s.due(210.0, None, Some(410.0)));
+        s.sent(211.0);
+        // The phase from the state records and the flight model's events.
+        s.feed(&json!({"kind": "state", "fphase": "InitialClimb"}));
+        assert!(!s.due(212.0, None, None));
+        s.feed(&json!({"kind": "flight", "ev": "phase", "from": "InitialClimb", "to": "Climb"}));
+        assert!(s.due(213.0, None, None));
+        s.sent(214.0);
+        // Another event, or another kind, is not it.
+        s.feed(&json!({"kind": "autotakeoff", "event": "roll"}));
+        s.feed(&json!({"kind": "autoland", "event": "reject"}));
+        assert!(!s.due(215.0, None, None));
+        s.feed(&json!({"kind": "autotakeoff", "event": "reject", "reason": "pilot"}));
+        assert!(s.due(215.0, None, None));
+        s.sent(216.0);
+        // An event seen before the previous line was typed does not count.
+        let mut early = Script::new(vec![
+            step("x", Trigger::AfterS(0.0)),
+            step(
+                "y",
+                Trigger::Event {
+                    kind: "loading".into(),
+                    event: None,
+                },
+            ),
+        ]);
+        early.arm(0.0);
+        early.feed(&json!({"kind": "loading", "event": "load_aircraft"}));
+        early.sent(1.0);
+        assert!(!early.due(2.0, None, None));
+        // Any event of the kind.
+        s.feed(&json!({"kind": "loading", "event": "load_aircraft"}));
+        assert!(s.due(217.0, None, None));
+        s.sent(218.0);
+        assert_eq!(s.pending(), 0);
+        assert!(!s.due(1e9, Some(1e3), Some(1e5)));
+    }
+
+    #[test]
+    fn the_plans_words_become_its_fields_runways_and_type() {
+        let plan = PlanFacts {
+            origin: "EGBB".into(),
+            destination: "EGKK".into(),
+            origin_rwy: Some("33".into()),
+            dest_rwy: Some("26l".into()),
+            aircraft: "B738".into(),
+        };
+        let find = |icao: &str| {
+            (icao == "B738")
+                .then(|| "Aircraft/Laminar Research/Boeing 737-800/b738.acf".to_string())
+        };
+        let spec = parse_spec_with(
+            "cases: [\n\
+             {name: a, setup: {aircraft: plan, ramp: {field: plan_origin}}, command: fly the flight plan},\n\
+             {name: b, setup: {approach: {field: plan_destination, runway: plan, final_nm: 15}}},\n\
+             {name: c, setup: {runway_start: {field: plan_origin, runway: 27}}, command: fly a circuit},\n\
+             {name: d, setup: {ramp: {field: LEMG}}, command: full auto}]",
+            &|_| false,
+        )
+        .unwrap();
+        assert!(spec.cases[..3].iter().all(Case::uses_plan));
+        assert!(!spec.cases[3].uses_plan());
+        let got: Vec<Case> = spec
+            .cases
+            .iter()
+            .map(|c| resolve_case(c, &plan, &find).unwrap())
+            .collect();
+        assert_eq!(
+            got[0].setup,
+            Setup::Ramp {
+                field: "EGBB".into(),
+                stand: None
+            }
+        );
+        assert_eq!(
+            got[0].aircraft.as_deref(),
+            Some("Aircraft/Laminar Research/Boeing 737-800/b738.acf")
+        );
+        assert_eq!(
+            got[1].setup,
+            Setup::Approach {
+                field: "EGKK".into(),
+                runway: "26L".into(),
+                final_nm: 15
+            }
+        );
+        assert_eq!(
+            got[1].first_line(),
+            "put us on a 15 mile final to EGKK runway 26L"
+        );
+        assert_eq!(
+            got[2].setup,
+            Setup::RunwayStart {
+                field: "EGBB".into(),
+                runway: "27".into(),
+                engines_running: false
+            }
+        );
+        assert_eq!(got[3].setup, spec.cases[3].setup);
+        // What the plan lacks is said, naming the case.
+        let bare = PlanFacts {
+            aircraft: "A20N".into(),
+            ..plan.clone()
+        };
+        let e = resolve_case(&spec.cases[0], &bare, &find).unwrap_err();
+        assert!(
+            e.to_string()
+                .contains("no installed aircraft of the plan's type A20N"),
+            "{e}"
+        );
+        let no_rwy = PlanFacts {
+            dest_rwy: None,
+            ..plan
+        };
+        let e = resolve_case(&spec.cases[1], &no_rwy, &find).unwrap_err();
+        assert!(e.to_string().contains("names no runway"), "{e}");
+    }
+
+    /// The detector's record for the model the case loads, and no other.
+    #[test]
+    fn the_swap_is_the_profile_probe_of_the_named_acf() {
+        let rec = |p: &str| {
+            json!({"kind": "profile_probe", "profile": "cirrus_sr22", "missing": [],
+                   "identity": {"icao": "SR22", "relative_path": p}})
+        };
+        let want = "Aircraft/Laminar Research/Cirrus SR22/Cirrus SR22.acf";
+        assert!(probe_is_for(&rec(want), want));
+        assert!(probe_is_for(
+            &rec("aircraft\\laminar research\\cirrus sr22\\cirrus sr22.acf"),
+            want
+        ));
+        assert!(!probe_is_for(
+            &rec("Aircraft/Laminar Research/Boeing 737-800/b738.acf"),
+            want
+        ));
+        assert!(!probe_is_for(
+            &json!({"kind": "systems", "identity": {"relative_path": want}}),
+            want
+        ));
+        // A plugin probe or an older record without the identity is no swap.
+        assert!(!probe_is_for(
+            &json!({"kind": "profile_probe", "profile": "cirrus_sr22"}),
+            want
+        ));
+    }
+
+    fn begin(t: f64, s: &str) -> Value {
+        rec(t, "sortie", json!({"event": "begin", "sortie": s}))
+    }
+
+    fn result(t: f64, s: &str, pass: bool, outcome: &str, commands: u64) -> Value {
+        rec(
+            t,
+            "sortie_result",
+            json!({"pass": pass, "outcome": outcome, "interventions": 0,
+                   "commands": commands, "unattended": commands == 0, "sortie": s}),
+        )
+    }
+
+    fn consumed(t: f64, text: &str) -> Value {
+        rec(t, "typed", json!({"event": "consumed", "text": text}))
+    }
+
+    /// The resume case: "my controls" ends the approach's sortie on the
+    /// way; the verdict is the resume's, typed after it.
+    #[test]
+    fn a_sortie_the_script_ends_is_not_the_verdict_the_next_one_is() {
+        let mut m = CaseMachine::once(0.0, 900.0);
+        m.pending_steps = 2;
+        m.feed(&rec(0.5, "tool", json!({"name": "setup_approach"})));
+        assert!(!m.opened(true), "an approach opens at its sortie");
+        assert!(m.opened(false));
+        assert_eq!(m.feed(&begin(60.0, "1-approach")), Step::Began);
+        assert!(m.opened(true));
+        m.note_step_sent(90.0, "my controls");
+        m.feed(&consumed(90.2, "my controls"));
+        m.feed(&rec(
+            90.3,
+            "tool",
+            json!({"name": "autopilot_off", "sortie": "1-approach"}),
+        ));
+        m.feed(&rec(
+            91.0,
+            "stage_result",
+            json!({"stage": "landing", "pass": false, "why": ["no touchdown"], "sortie": "1-approach"}),
+        ));
+        assert_eq!(
+            m.feed(&result(91.1, "1-approach", false, "ended", 1)),
+            Step::Wait,
+            "a step is still to come"
+        );
+        assert!(matches!(m.phase, Phase::AwaitSortie { .. }));
+        // No mission while a step is pending is no failure.
+        assert_eq!(m.tick(91.1 + SORTIE_GRACE_S + 5.0, Some(false)), Step::Wait);
+        let t = 91.1 + SORTIE_GRACE_S + 10.0;
+        m.note_step_sent(t, "resume flight plan");
+        m.feed(&consumed(t + 0.1, "resume flight plan"));
+        m.feed(&rec(t + 0.2, "tool", json!({"name": "full_auto"})));
+        assert_eq!(m.feed(&begin(t + 0.3, "2-full_auto")), Step::Began);
+        m.feed(&rec(
+            t + 300.0,
+            "stage_result",
+            json!({"stage": "landing", "pass": true, "why": [], "sortie": "2-full_auto"}),
+        ));
+        let v = finished(m.feed(&result(t + 301.0, "2-full_auto", true, "ended", 0)));
+        assert!(v.pass, "{v:?}");
+        assert_eq!(v.sortie.as_deref(), Some("2-full_auto"));
+        assert_eq!(v.stages.len(), 1, "only the verdict sortie's stages");
+        assert_eq!(v.note, "before it: 1-approach failed (ended)");
+        // And the grace runs again once every step is typed.
+        let mut m = CaseMachine::new(0.0, 900.0);
+        m.pending_steps = 1;
+        m.feed(&rec(0.5, "tool", json!({"name": "load_aircraft"})));
+        assert_eq!(m.tick(SORTIE_GRACE_S + 10.0, Some(false)), Step::Wait);
+        m.note_step_sent(SORTIE_GRACE_S + 20.0, "fly the flight plan");
+        assert_eq!(m.tick(2.0 * SORTIE_GRACE_S + 19.0, Some(false)), Step::Wait);
+        let v = finished(m.tick(2.0 * SORTIE_GRACE_S + 21.0, Some(false)));
+        assert!(v.reason.contains("no mission began"), "{v:?}");
+    }
+
+    /// A mission a step supersedes is on the way too; without a step it is
+    /// someone else's, and the case's failure.
+    #[test]
+    fn a_mission_superseded_by_a_step_hands_the_verdict_on() {
+        let mut m = CaseMachine::new(0.0, 900.0);
+        m.pending_steps = 1;
+        m.feed(&rec(0.5, "tool", json!({"name": "full_auto"})));
+        m.feed(&begin(1.0, "1-full_auto"));
+        m.note_step_sent(30.0, "fly the flight plan");
+        m.feed(&consumed(30.1, "fly the flight plan"));
+        assert_eq!(
+            m.feed(&result(30.2, "1-full_auto", false, "superseded", 1)),
+            Step::Wait
+        );
+        m.feed(&begin(30.3, "2-full_auto"));
+        m.feed(&rec(
+            99.0,
+            "stage_result",
+            json!({"stage": "landing", "pass": true, "sortie": "2-full_auto"}),
+        ));
+        let v = finished(m.feed(&result(100.0, "2-full_auto", true, "ended", 0)));
+        assert!(
+            v.pass && v.sortie.as_deref() == Some("2-full_auto"),
+            "{v:?}"
+        );
+
+        let mut m = CaseMachine::new(0.0, 900.0);
+        m.feed(&rec(0.5, "tool", json!({"name": "full_auto"})));
+        m.feed(&begin(1.0, "1-full_auto"));
+        let v = finished(m.feed(&result(30.2, "1-full_auto", false, "superseded", 0)));
+        assert!(v.reason.contains("superseded by another mission"), "{v:?}");
+    }
+
+    /// The scorer calls a sortie with a pilot's command attended; the
+    /// runner knows which commands were its script's.
+    #[test]
+    fn the_scripts_own_commands_are_not_a_pilots() {
+        let landing = |s: &str, pass: bool| {
+            rec(
+                50.0,
+                "stage_result",
+                json!({"stage": "landing", "pass": pass, "why": if pass { json!([]) } else { json!(["touched down at 700 fpm"]) }, "sortie": s}),
+            )
+        };
+        let run = |sent: usize, commands: u64, stage_pass: bool| {
+            let mut m = CaseMachine::new(0.0, 900.0);
+            m.pending_steps = sent;
+            m.feed(&rec(0.5, "tool", json!({"name": "full_auto"})));
+            m.feed(&begin(1.0, "s"));
+            for i in 0..sent {
+                let line = format!("line {i}");
+                m.note_step_sent(10.0, &line);
+                m.feed(&consumed(10.1, &line));
+            }
+            m.feed(&landing("s", stage_pass));
+            finished(m.feed(&result(60.0, "s", false, "ended", commands)))
+        };
+        let v = run(1, 1, true);
+        assert!(v.pass, "{v:?}");
+        assert_eq!(v.scripted, 1);
+        assert_eq!(v.note, "1 commands were the script's");
+        // One more than the script typed: a pilot's.
+        let v = run(1, 2, true);
+        assert!(!v.pass);
+        assert_eq!(
+            v.reason,
+            "attended (0 interventions, 2 commands, 1 of them the script's)"
+        );
+        // A failed stage still fails, and the script is not blamed.
+        let v = run(1, 1, false);
+        assert!(!v.pass);
+        assert_eq!(v.reason, "landing: touched down at 700 fpm");
+        // No script, a command: attended, as before.
+        let v = run(0, 1, true);
+        assert!(!v.pass && v.reason.starts_with("attended"), "{v:?}");
+    }
+
+    /// A rejected takeoff is meant to end full auto: that give-up passes,
+    /// the roll it cut short too, and a roll off the centreline does not.
+    #[test]
+    fn a_meant_give_up_passes_and_nothing_else_does() {
+        let run = |reason: &str, takeoff_why: Value, interventions: u64| {
+            let mut m = CaseMachine::new(0.0, 900.0);
+            m.expect_give_up = Some("takeoff_not_completed".into());
+            m.pending_steps = 1;
+            m.feed(&rec(0.5, "tool", json!({"name": "full_auto"})));
+            m.feed(&begin(1.0, "s"));
+            m.note_step_sent(30.0, "reject the takeoff");
+            m.feed(&consumed(30.1, "reject the takeoff"));
+            m.feed(&rec(
+                30.2,
+                "tool",
+                json!({"name": "auto_takeoff", "sortie": "s"}),
+            ));
+            m.feed(&rec(
+                40.0,
+                "stage_result",
+                json!({"stage": "alignment", "pass": true, "why": [], "sortie": "s"}),
+            ));
+            let pass = takeoff_why.as_array().is_some_and(|a| a.is_empty());
+            m.feed(&rec(
+                40.0,
+                "stage_result",
+                json!({"stage": "takeoff", "pass": pass, "why": takeoff_why, "sortie": "s"}),
+            ));
+            m.feed(&rec(
+                41.0,
+                "full_auto",
+                json!({"event": "give_up", "reason": reason, "sortie": "s"}),
+            ));
+            finished(m.feed(&rec(
+                42.0,
+                "sortie_result",
+                json!({"pass": false, "outcome": "gave_up", "interventions": interventions,
+                       "commands": 1, "unattended": false, "sortie": "s"}),
+            )))
+        };
+        let v = run("takeoff_not_completed", json!(["ended by give_up"]), 0);
+        assert!(v.pass, "{v:?}");
+        assert_eq!(
+            v.note,
+            "gave up as meant (takeoff_not_completed); 1 commands were the script's"
+        );
+        let v = run(
+            "takeoff_not_completed",
+            json!(["ended by give_up", "6.1 m off the centreline"]),
+            0,
+        );
+        assert!(!v.pass);
+        assert!(v.reason.contains("6.1 m off the centreline"), "{v:?}");
+        let v = run("takeoff_rejected", json!(["ended by give_up"]), 0);
+        assert!(!v.pass);
+        assert!(
+            v.reason
+                .contains("expected the give-up takeoff_not_completed, the outcome was gave_up (takeoff_rejected)"),
+            "{}",
+            v.reason
+        );
+        let v = run("takeoff_not_completed", json!([]), 1);
+        assert!(
+            !v.pass && v.reason.contains("attended (1 interventions"),
+            "{v:?}"
+        );
+    }
 
     #[test]
     fn the_shipped_spec_parses() {
@@ -1595,13 +3084,7 @@ mod tests {
             },
             "a final with no distance is the setup tool's ten miles"
         );
-        for f in std::fs::read_dir("bench/sorties").unwrap().flatten() {
-            let p = f.path();
-            if p.extension().is_some_and(|e| e == "yaml") {
-                let text = std::fs::read_to_string(&p).unwrap();
-                parse_spec(&text).unwrap_or_else(|e| panic!("{}: {e}", p.display()));
-            }
-        }
+        assert!(bench_specs().len() >= 3);
     }
 
     #[test]
@@ -2131,6 +3614,9 @@ mod tests {
         rolling_reads: std::sync::atomic::AtomicU32,
         /// A setup (mailbox post or approach line) while it rolled.
         setups_while_rolling: std::sync::atomic::AtomicU32,
+        /// A mailbox post loading another aircraft is answered by the app's
+        /// detector (`profile_probe` of it).
+        probe_on_swap: std::sync::atomic::AtomicBool,
     }
 
     /// The fake's taxi-in pace, 14 kt in metres per second.
@@ -2158,6 +3644,7 @@ mod tests {
                 roll_after_mission: 0.into(),
                 rolling_reads: 0.into(),
                 setups_while_rolling: 0.into(),
+                probe_on_swap: false.into(),
             }
         }
     }
@@ -2210,7 +3697,19 @@ mod tests {
             let line = String::from_utf8_lossy(bytes).to_string();
             if name == "xcopilot/sim/init_flight" {
                 self.setup_posted();
+                let v: Value = serde_json::from_str(&line).unwrap();
+                let acf = v["aircraft"]["path"].as_str().unwrap_or("").to_string();
                 self.inits.lock().unwrap().push(line);
+                if self.probe_on_swap.load(SeqCst) && !acf.ends_with("b738.acf") {
+                    use std::io::Write;
+                    let mut f = std::fs::OpenOptions::new()
+                        .append(true)
+                        .open(&self.log)
+                        .unwrap();
+                    let r = json!({"t": 1.0, "kind": "profile_probe", "missing": [],
+                                   "identity": {"relative_path": acf}});
+                    writeln!(f, "{r}").unwrap();
+                }
                 return Ok(());
             }
             if line.starts_with("put us on") {
@@ -2284,6 +3783,7 @@ mod tests {
             quiet_s: 0.02,
             stop_max_s: 0.5,
             crash_clear_s: 0.2,
+            swap_max_s: 1.0,
         };
         let mut tail = BlackboxTail::at_end(&log);
         let mut seen = Vec::new();
@@ -2325,6 +3825,53 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A case naming another aircraft loads it (an approach: on its runway,
+    /// engines running, before the app's own setup) and waits for the app's
+    /// detector to have swapped to it; one never taken is a setup failure.
+    #[tokio::test]
+    async fn a_named_aircraft_is_loaded_and_waited_for_before_the_first_line() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let (dir, log) = scratch_log("swap");
+        let sim = FakeSim::new(log.clone());
+        let sr22 = "Aircraft/Laminar Research/Cirrus SR22/Cirrus SR22.acf";
+        let case = |a: &str| {
+            parse_spec_with(
+                &format!(
+                    "cases: [{{name: a, setup: {{aircraft: \"{a}\", approach: {{field: LEMG, runway: 13, final_nm: 10}}}}}}]"
+                ),
+                &|_| true,
+            )
+            .unwrap()
+            .cases
+            .remove(0)
+        };
+        let mut tail = BlackboxTail::at_end(&log);
+        // The loaded aircraft: the approach tool sets it up, nothing posted.
+        let same = case("Aircraft/Laminar Research/Boeing 737-800/b738.acf");
+        set_up_start(&sim, &mut tail, &same, "", &quick_pace())
+            .await
+            .unwrap();
+        assert!(sim.inits.lock().unwrap().is_empty());
+        // Another: loaded on the runway with engines running, then the swap.
+        sim.probe_on_swap.store(true, SeqCst);
+        set_up_start(&sim, &mut tail, &case(sr22), "", &quick_pace())
+            .await
+            .unwrap();
+        let inits = sim.inits.lock().unwrap().clone();
+        assert_eq!(inits.len(), 1);
+        let v: Value = serde_json::from_str(&inits[0]).unwrap();
+        assert_eq!(v["aircraft"]["path"], sr22);
+        assert_eq!(v["runway_start"]["airport_id"], "LEMG");
+        assert_eq!(v["engine_status"]["all_engines"]["running"], true);
+        // An app that never probes it: named, not flown on the wrong type.
+        sim.probe_on_swap.store(false, SeqCst);
+        let e = set_up_start(&sim, &mut tail, &case(sr22), "", &quick_pace())
+            .await
+            .unwrap_err();
+        assert!(e.to_string().contains("the app never took"), "{e}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     fn quick_pace() -> Pace {
         Pace {
             poll: std::time::Duration::from_millis(5),
@@ -2336,6 +3883,7 @@ mod tests {
             quiet_s: 0.02,
             stop_max_s: 0.5,
             crash_clear_s: 0.2,
+            swap_max_s: 1.0,
         }
     }
 

@@ -1,0 +1,64 @@
+# The Laminar 737-800's unflown backlog, unattended:
+#   xvl sortie bench/sorties/backlog-737.yaml
+# The shape is lemg-737.yaml's header. Parse-tested (every line pinned to
+# the tool it must reach), not yet flown.
+
+cases:
+  # Gate to gate on the pilot's SimBrief plan: the ramp at the plan's
+  # origin (the setup tool's stand for a jet), the load sheet, then the
+  # whole mission. Issues #95 (load at the arm), #40 (SID from the cleared
+  # runway), #32 (the STAR's windows), #116/#118 (IFR clearance, check-in),
+  # #109/#127 (TOD), #126/#104 (descent drag), #137 (checklists), #141
+  # (taxi-in). Needs XCOPILOT_SIMBRIEF_ID and a 737 plan generated.
+  - name: 737 gate to gate on the SimBrief plan
+    setup:
+      aircraft: "Aircraft/Laminar Research/Boeing 737-800/b738.acf"
+      ramp: { field: plan_origin }
+    steps:
+      - { say: load the aircraft, when: start, tool: load_aircraft }
+      - say: fly the flight plan
+        when: { event: { kind: loading, event: load_aircraft } }
+        tool: full_auto
+    deadline_min: 300
+
+  # A rejected takeoff at 60 kt inside full auto's circuit: the pilot's
+  # "reject the takeoff" is auto_takeoff off, the loop flies it to a stop
+  # on the centreline and the crew calls "rejecting takeoff" on the radio.
+  # Full auto then ends ("takeoff_not_completed"), which is this case's
+  # pass. Issues #38 (to a stop on the centreline), #112 (its own park
+  # brake), #113 (its brake not a hand), #115 (the tower cancels the
+  # clearance).
+  - name: LEMG 13 rejected takeoff at 60 kt
+    setup:
+      aircraft: "Aircraft/Laminar Research/Boeing 737-800/b738.acf"
+      runway_start: { field: LEMG, runway: "13", engines_running: true }
+    steps:
+      - { say: fly a circuit, when: start, tool: full_auto }
+      - { say: reject the takeoff, when: { ias_above: 60 }, tool: auto_takeoff }
+    expect_give_up: takeoff_not_completed
+    deadline_min: 10
+
+  # Resume: on a final to the plan's destination runway the pilot takes it
+  # back, then hands the plan back 20 s later; full auto's resume joins the
+  # arrival. Issues #67 (resume refusals), #54 (hand-over words). Needs the
+  # SimBrief plan on the shelf.
+  - name: resume the plan on a final to its destination
+    setup:
+      aircraft: "Aircraft/Laminar Research/Boeing 737-800/b738.acf"
+      approach: { field: plan_destination, runway: plan, final_nm: 15 }
+    steps:
+      - { say: my controls, when: { after_s: 30 }, tool: autopilot_off }
+      - { say: resume flight plan, when: { after_s: 20 }, tool: full_auto }
+    deadline_min: 15
+
+  # The local planner: a direct plan from Malaga to Seville, then flown.
+  # Issues #73 (an enroute point for a local plan), #95 (the arm on a
+  # local plan).
+  - name: LEMG to LEZL on a local plan
+    setup:
+      aircraft: "Aircraft/Laminar Research/Boeing 737-800/b738.acf"
+      ramp: { field: LEMG }
+    steps:
+      - { say: plan a flight to LEZL, when: start, tool: plan_flight }
+      - { say: fly the flight plan, when: { after_s: 15 }, tool: full_auto }
+    deadline_min: 90
