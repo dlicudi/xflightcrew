@@ -420,9 +420,16 @@ flaps:
     - { label: "0",    spoken: up,    ratio: 0.0, retract_above_kts: 210.0 }
     # 180 (about F speed at mid weights), under CONF 2's 196 placard; the 200
     # this carried stepped the flaps four knots over it. VERIFY
-    - { label: "1",    spoken: one,   ratio: 0.25, vfe_kts: 215.0, retract_above_kts: 180.0 } # acf Vfe1
-    - { label: "2",    spoken: two,   ratio: 0.5,  vfe_kts: 196.0 } # VERIFY
-    - { label: "3",    spoken: three, ratio: 0.75, vfe_kts: 186.0 } # VERIFY
+    # vs_kts: the stall IN each configuration, at the weight of Vs 175 / Vso
+    # 125. The slats take most of the reduction at the first notch, so the
+    # straight line between the two (162 / 150 / 138) put a normal 175 kt
+    # CONF 2 base inside the "getting slow" band (EGPF 2026-09-21). From the
+    # acf's own schedule (aircraft::detent_stall_from_acf: slats 70/87/100 %
+    # of 8 degrees, flap 8/14/22 of 32 degrees at CL 1.1, ends at 175 and
+    # 125): 147 / 139 / 131. VERIFY against the PFD's VLS band.
+    - { label: "1",    spoken: one,   ratio: 0.25, vfe_kts: 215.0, retract_above_kts: 180.0, vs_kts: 147.0 } # acf Vfe1
+    - { label: "2",    spoken: two,   ratio: 0.5,  vfe_kts: 196.0, vs_kts: 139.0 } # VERIFY
+    - { label: "3",    spoken: three, ratio: 0.75, vfe_kts: 186.0, vs_kts: 131.0 } # VERIFY
     - { label: full,   spoken: full,  ratio: 1.0,  vfe_kts: 180.0 } # acf Vfe
 
 # The normal checklist (checklists/airbus_a330_300.txt, 2026-09-20, from the

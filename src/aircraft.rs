@@ -1459,6 +1459,137 @@ pub struct FlapDetent {
     /// knots below flaps-up manoeuvring speed (BIKF-EGPH, 2026-09-20).
     #[serde(default)]
     pub retract_above_kts: Option<f64>,
+    /// The stall speed IN this configuration, kts, at the same weight as
+    /// `vs_clean_kts` and `vs0_kts`. `None` = the straight line between
+    /// them. A slatted wing takes most of its reduction at the first
+    /// detent: the A330's CONF 2 is 139 by its own .acf, the line said 150,
+    /// and the monitor called "getting slow" at 175 kt (EGPF 2026-09-21).
+    #[serde(default)]
+    pub vs_kts: Option<f64>,
+}
+
+/// Flaps lower the stall speed by up to this fraction at full extension
+/// when the profile declares no landing-configuration stall (172: clean Vs
+/// 48, full-flap Vs0 40, about 17%).
+pub const FLAP_STALL_REDUCTION: f64 = 0.17;
+
+/// The declared per-detent stall speeds as `(handle ratio, kts)`, cleanest
+/// first. Empty when no detent declares one. Pure.
+pub fn detent_stall_points(f: Option<&FlapProfile>) -> Vec<(f64, f64)> {
+    let mut v: Vec<(f64, f64)> = f
+        .map(|f| f.detents.as_slice())
+        .unwrap_or(&[])
+        .iter()
+        .filter_map(|d| Some((d.ratio, d.vs_kts?)))
+        .filter(|(r, k)| r.is_finite() && k.is_finite() && *r > 0.0 && *r <= 1.0 && *k > 0.0)
+        .collect();
+    v.sort_by(|a, b| a.0.total_cmp(&b.0));
+    v
+}
+
+/// The stall speed at a flap handle ratio: through the airframe's declared
+/// per-detent stall speeds when it has them (clean at 0, Vso at 1 unless a
+/// detent says otherwise, straight between neighbours), else the straight
+/// line from the clean stall to Vso, else the trainer's fixed reduction.
+/// Never above clean. Pure.
+pub fn stall_speed_in_config(
+    vs_clean_kts: f64,
+    vs0_kts: Option<f64>,
+    points: &[(f64, f64)],
+    flap_ratio: f64,
+) -> f64 {
+    let f = if flap_ratio.is_finite() {
+        flap_ratio.clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    let vs0 = vs0_kts.filter(|v| *v > 0.0 && *v < vs_clean_kts);
+    let mut knots: Vec<(f64, f64)> = points
+        .iter()
+        .copied()
+        .filter(|(r, k)| r.is_finite() && k.is_finite() && *r > 0.0 && *r <= 1.0 && *k > 0.0)
+        .map(|(r, k)| (r, k.min(vs_clean_kts)))
+        .collect();
+    if knots.is_empty() {
+        return match vs0 {
+            Some(vs0) => vs_clean_kts - (vs_clean_kts - vs0) * f,
+            None => vs_clean_kts * (1.0 - FLAP_STALL_REDUCTION * f),
+        };
+    }
+    knots.sort_by(|a, b| a.0.total_cmp(&b.0));
+    knots.insert(0, (0.0, vs_clean_kts));
+    if let (Some(v0), true) = (vs0, knots.last().is_some_and(|k| k.0 < 1.0)) {
+        knots.push((1.0, v0));
+    }
+    for w in knots.windows(2) {
+        let ((r0, k0), (r1, k1)) = (w[0], w[1]);
+        if f <= r1 {
+            let t = if r1 > r0 { (f - r0) / (r1 - r0) } else { 1.0 };
+            return k0 + (k1 - k0) * t;
+        }
+    }
+    knots.last().map(|k| k.1).unwrap_or(vs_clean_kts)
+}
+
+/// Lift-curve slope the .acf model assumes, per degree of angle of attack a
+/// slat adds (thin-aerofoil order; the per-detent result moves under 1 kt
+/// between 0.08 and 0.12 on the A330).
+const ACF_LIFT_SLOPE_PER_DEG: f64 = 0.1;
+
+/// The per-detent stall speeds (detents 1..n, whole kts) an `.acf` implies,
+/// or `None` unless it declares SLATS (`acf/_slat1_inc` over 0 with a
+/// non-zero `_slat1_dn`): a flap-only wing keeps the straight line. X-Plane
+/// flies the wing from these numbers: each detent adds the slat's stall-angle
+/// increase (`_slat1_inc` x its `_slat1_dn/i` fraction) and the flap's lift
+/// (`_flap1_cl` x `_flap1_dn/i` over the last notch); the two ends are
+/// calibrated to the file's own `_Vs_kts` and `_Vso_kts` (lift goes as
+/// 1/V^2). The A330: 147 / 139 / 131 for CONF 1 / 2 / 3. Pure.
+pub fn detent_stall_from_acf(acf_text: &str) -> Option<Vec<f64>> {
+    let mut vals: std::collections::HashMap<&str, f64> = std::collections::HashMap::new();
+    for l in acf_text.lines() {
+        let mut it = l.split_whitespace();
+        if it.next() != Some("P") {
+            continue;
+        }
+        if let (Some(k), Some(v)) = (it.next(), it.next().and_then(|v| v.parse::<f64>().ok())) {
+            if k.starts_with("acf/") {
+                vals.insert(k, v);
+            }
+        }
+    }
+    let get = |k: &str| vals.get(k).copied().filter(|v| v.is_finite());
+    let n = get("acf/_flap_detents").map(|d| d.round() as usize).filter(|d| *d > 0)?;
+    let vs = get("acf/_Vs_kts").filter(|v| *v > 0.0)?;
+    let vso = get("acf/_Vso_kts").filter(|v| *v > 0.0 && *v < vs)?;
+    let slat_inc = get("acf/_slat1_inc").unwrap_or(0.0);
+    let flap: Vec<f64> = (0..=n)
+        .map(|i| get(&format!("acf/_flap1_dn/{i}")).unwrap_or(0.0).max(0.0))
+        .collect();
+    let slat: Vec<f64> = (0..=n)
+        .map(|i| get(&format!("acf/_slat1_dn/{i}")).unwrap_or(0.0).clamp(0.0, 1.0))
+        .collect();
+    if slat_inc <= 0.0 || slat.iter().all(|s| *s <= 0.0) {
+        return None;
+    }
+    let flap_max = flap.iter().copied().fold(0.0, f64::max);
+    let s = ACF_LIFT_SLOPE_PER_DEG * slat_inc;
+    let fcl = get("acf/_flap1_cl").unwrap_or(0.0).max(0.0);
+    let lift = |i: usize| {
+        s * slat[i] + if flap_max > 0.0 { fcl * flap[i] / flap_max } else { 0.0 }
+    };
+    let full = lift(n);
+    if full <= 0.0 {
+        return None;
+    }
+    let (a, b) = (1.0 / (vs * vs), 1.0 / (vso * vso));
+    Some(
+        (1..=n)
+            .map(|i| {
+                let phi = (lift(i) / full).clamp(0.0, 1.0);
+                (a + phi * (b - a)).powf(-0.5).round()
+            })
+            .collect(),
+    )
 }
 
 /// Static reference figures recited on request (V-speeds, weights, limits), from
@@ -2483,6 +2614,42 @@ pub fn publish_approach_floor(vs0_kts: Option<f64>, vs_clean_kts: Option<f64>) {
     *APPROACH_FLOOR_KTS.lock().unwrap_or_else(|e| e.into_inner()) = by_vso.or(clean);
 }
 
+/// The live airframe's stall table: its clean and landing stall and the
+/// detents that declare their own (`FlapDetent::vs_kts`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct StallCurve {
+    pub vs_clean_kts: f64,
+    pub vs0_kts: Option<f64>,
+    pub points: Vec<(f64, f64)>,
+}
+
+static STALL_CURVE: std::sync::Mutex<Option<StallCurve>> = std::sync::Mutex::new(None);
+
+/// Publish the stall table. Called on EVERY profile swap; `None` (the
+/// straight line) unless the profile has a clean stall AND a detent that
+/// declares its own.
+pub fn publish_stall_curve(
+    vs_clean_kts: Option<f64>,
+    vs0_kts: Option<f64>,
+    flaps: Option<&FlapProfile>,
+) {
+    let points = detent_stall_points(flaps);
+    let curve = vs_clean_kts
+        .filter(|v| v.is_finite() && *v > 0.0)
+        .filter(|_| !points.is_empty())
+        .map(|vs| StallCurve {
+            vs_clean_kts: vs,
+            vs0_kts,
+            points,
+        });
+    *STALL_CURVE.lock().unwrap_or_else(|e| e.into_inner()) = curve;
+}
+
+/// The live airframe's stall table, when its profile declares one.
+pub fn stall_curve() -> Option<StallCurve> {
+    STALL_CURVE.lock().unwrap_or_else(|e| e.into_inner()).clone()
+}
+
 /// The live airframe's landing-configuration floor, kts.
 pub fn approach_floor_kts() -> Option<f64> {
     *APPROACH_FLOOR_KTS.lock().unwrap_or_else(|e| e.into_inner())
@@ -2501,6 +2668,15 @@ pub fn config_floor_kts(flap_ratio: f64) -> Option<f64> {
     } else {
         0.0
     };
+    // Declared per-detent stall speeds: the floor is 1.2 x the stall IN this
+    // configuration, not a line between the clean and landing floors (the
+    // A330's CONF 2 floor is 167 by its stall table, 180 by the line).
+    if let Some(c) = stall_curve() {
+        return Some(
+            (SPEED_FLOOR_RATIO * stall_speed_in_config(c.vs_clean_kts, c.vs0_kts, &c.points, r))
+                .round(),
+        );
+    }
     match (speed_floor_kts(), approach_floor_kts()) {
         (Some(clean), Some(landing)) => Some((clean + (landing - clean) * r).round()),
         (Some(clean), None) => Some(clean),
@@ -2731,7 +2907,12 @@ pub fn generic_from_acf(icao: &str, acf_text: &str) -> AircraftProfile {
             // A generic airframe declares no manoeuvring speeds, so it keeps
             // the one-step clean-up on `initial_climb_kts`.
             retract_above_kts: None,
+            vs_kts: None,
         }];
+        // A slatted wing's per-detent stall, from the same file; only when
+        // every notch maps one to one (a slats-only notch at 0 degrees is
+        // dropped from `degs`, and the stall line is then kept).
+        let acf_stall = detent_stall_from_acf(acf_text).filter(|v| v.len() == n);
         for (i, d) in degs.iter().enumerate() {
             let full = i + 1 == n;
             let vfe = match (vfe1, vfem) {
@@ -2752,6 +2933,7 @@ pub fn generic_from_acf(icao: &str, acf_text: &str) -> AircraftProfile {
                 ratio: (d / last * 10_000.0).round() / 10_000.0,
                 vfe_kts: vfe.map(f64::round),
                 retract_above_kts: None,
+                vs_kts: acf_stall.as_ref().and_then(|v| v.get(i).copied()),
             });
         }
         p.flaps = Some(FlapProfile {
@@ -4431,6 +4613,7 @@ mod tests {
 fn cessna_172sp() -> AircraftProfile {
     let detent = |label: &str, spoken: &str, ratio: f64, vfe: Option<f64>| FlapDetent {
         retract_above_kts: None,
+        vs_kts: None,
         label: label.into(),
         spoken: spoken.into(),
         ratio,
@@ -4758,6 +4941,7 @@ fn cessna_172sp() -> AircraftProfile {
 fn cirrus_sr22() -> AircraftProfile {
     let detent = |label: &str, spoken: &str, ratio: f64, vfe: Option<f64>| FlapDetent {
         retract_above_kts: None,
+        vs_kts: None,
         label: label.into(),
         spoken: spoken.into(),
         ratio,
@@ -5232,12 +5416,82 @@ P _engn/0/_type RCP_INJ
         assert_eq!(super::approach_floor_kts(), None);
     }
 
+    /// EGPF 2026-09-21: the A330's monitor called "getting slow" through a
+    /// CONF 2 base at 175 kt because its stall ran on a straight line from
+    /// 175 clean to 125 full (150 at CONF 2, caution under 180). The profile
+    /// now declares each notch; the line stays for a profile that declares
+    /// nothing, and the floor follows the declared stall.
+    #[test]
+    fn a_declared_stall_table_replaces_the_straight_line() {
+        let a330 = super::load("airbus_a330_300").expect("the A330 loads");
+        let pts = super::detent_stall_points(a330.flaps.as_ref());
+        assert_eq!(pts, vec![(0.25, 147.0), (0.5, 139.0), (0.75, 131.0)]);
+        let at = |r: f64| super::stall_speed_in_config(175.0, Some(125.0), &pts, r);
+        assert_eq!((at(0.0), at(0.5), at(1.0)), (175.0, 139.0, 125.0));
+        assert!((at(0.375) - 143.0).abs() < 1e-9, "straight between notches");
+        assert!(at(f64::NAN) == 175.0, "an unreadable flap is clean");
+        // Nothing declared: exactly the old line, and the trainer's 17 %
+        // without a Vso.
+        assert_eq!(super::stall_speed_in_config(175.0, Some(125.0), &[], 0.5), 150.0);
+        assert!((super::stall_speed_in_config(48.0, None, &[], 1.0) - 48.0 * 0.83).abs() < 1e-9);
+        // A declared stall above clean is clamped, never a raised stall.
+        assert_eq!(super::stall_speed_in_config(100.0, Some(80.0), &[(0.5, 130.0)], 0.5), 100.0);
+        for id in ["cessna_172sp", "boeing_737_800", "cirrus_vision_sf50", "citation_x", "md82"] {
+            let p = super::load(id).expect(id);
+            assert!(
+                super::detent_stall_points(p.flaps.as_ref()).is_empty(),
+                "{id} declares nothing and keeps the line"
+            );
+        }
+
+        let _g = FLOOR_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        super::publish_speed_floor(Some(175.0));
+        super::publish_approach_floor(Some(125.0), Some(175.0));
+        super::publish_stall_curve(Some(175.0), Some(125.0), a330.flaps.as_ref());
+        assert_eq!(super::config_floor_kts(0.0), Some(210.0));
+        assert_eq!(super::config_floor_kts(0.5), Some(167.0), "the line said 180");
+        assert_eq!(super::config_floor_kts(1.0), Some(150.0));
+        super::publish_stall_curve(Some(175.0), Some(125.0), None);
+        assert_eq!(super::stall_curve(), None);
+        assert_eq!(super::config_floor_kts(0.5), Some(180.0), "no table, the line");
+        super::publish_speed_floor(None);
+        super::publish_approach_floor(None, None);
+    }
+
+    /// The A330's .acf: slats 0 / 0.70 / 0.87 / 1 / 1 of 8 degrees, flaps
+    /// 0 / 8 / 14 / 22 / 32 at CL 1.1, Vs 175, Vso 125. The profile's table
+    /// is what this reads; a flap-only wing (the 172: slat_inc 0) reads
+    /// nothing and keeps the line.
+    #[test]
+    fn the_acf_gives_a_slatted_wings_stall_table() {
+        let mut a330 = String::from(
+            "P acf/_Vs_kts 175.0\nP acf/_Vso_kts 125.0\nP acf/_flap_detents 4\n\
+             P acf/_slat1_inc 8.0\nP acf/_flap1_cl 1.1\n",
+        );
+        for (i, (f, s)) in [(0.0, 0.0), (8.0, 0.695652187), (14.0, 0.869565189), (22.0, 1.0), (32.0, 1.0)]
+            .iter()
+            .enumerate()
+        {
+            a330.push_str(&format!("P acf/_flap1_dn/{i} {f}\nP acf/_slat1_dn/{i} {s}\n"));
+        }
+        assert_eq!(
+            super::detent_stall_from_acf(&a330),
+            Some(vec![147.0, 139.0, 131.0, 125.0])
+        );
+        let c172 = "P acf/_Vs_kts 48\nP acf/_Vso_kts 40\nP acf/_flap_detents 3\n\
+                    P acf/_slat1_inc 0\nP acf/_flap1_cl 0.86\n\
+                    P acf/_flap1_dn/1 10\nP acf/_flap1_dn/2 20\nP acf/_flap1_dn/3 30\n\
+                    P acf/_slat1_dn/1 1\nP acf/_slat1_dn/2 1\nP acf/_slat1_dn/3 1\n";
+        assert_eq!(super::detent_stall_from_acf(c172), None);
+    }
+
     /// The 737 (Vs 139, Vso 114): flaps up floors at 167, flaps 40 at 137,
     /// flaps 5 (0.375) at 156. A wing with no Vso floors flat at the clean
     /// number; no stall speeds at all floors nothing.
     #[test]
     fn the_floor_follows_the_flaps() {
         let _g = FLOOR_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        super::publish_stall_curve(None, None, None);
         super::publish_speed_floor(Some(139.0));
         super::publish_approach_floor(Some(114.0), Some(139.0));
         assert_eq!(super::config_floor_kts(0.0), Some(167.0));

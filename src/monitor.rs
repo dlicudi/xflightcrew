@@ -884,11 +884,8 @@ const FLARE_AGL_FT: f64 = 50.0;
 /// auto-recovery would fight intentional slow flight). Airborne and above the
 /// flare only, sustained so a momentary dip in a turn doesn't trip it. Banded
 /// like the fuel check: a caution as you approach the stall, an urgent prompt
-/// below it.
-/// Flaps lower the stall speed by up to this fraction at full extension (172:
-/// clean Vs ≈ 48, full-flap Vs0 ≈ 40 → ~17%). The threshold scales with flaps so
-/// a normal slow-but-safe flaps-down approach doesn't trip it.
-const FLAP_STALL_REDUCTION: f64 = 0.17;
+/// below it. The threshold scales with flaps (`aircraft::stall_speed_in_config`)
+/// so a normal slow-but-safe flaps-down approach doesn't trip it.
 
 /// How far ahead (seconds) to project a decaying airspeed. At a 3 kt/s washout
 /// this fires the caution ~12 kt early — enough lead to call it well before a
@@ -913,6 +910,10 @@ struct StallSpeed {
     /// applies, which on the A330 (Vs 175, Vso 125) put a stabilised 150 kt
     /// final inside the WARNING band the whole way down (2026-09-20).
     vs0_kts: Option<f64>,
+    /// The detents that declare their own stall speed, `(ratio, kts)`
+    /// (`aircraft::detent_stall_points`): a slatted wing is not a straight
+    /// line (the A330's CONF 2 is 139, not 150; EGPF 2026-09-21).
+    detent_stall: Vec<(f64, f64)>,
     /// Fires when IAS ≤ this × the flap-adjusted stall speed …
     at_or_below_factor: f64,
     /// … and (if set) still above this × it — the more urgent band owns below.
@@ -927,11 +928,7 @@ const AUTO_CAUTION_FACTOR: f64 = 1.13;
 /// stall to the landing-configuration stall when the profile declares one,
 /// else the trainer's fixed reduction. Never above clean, never below Vso.
 pub fn stall_speed_at_flap(vs_clean_kts: f64, vs0_kts: Option<f64>, flap_ratio: f64) -> f64 {
-    let f = flap_ratio.clamp(0.0, 1.0);
-    match vs0_kts.filter(|v| *v > 0.0 && *v < vs_clean_kts) {
-        Some(vs0) => vs_clean_kts - (vs_clean_kts - vs0) * f,
-        None => vs_clean_kts * (1.0 - FLAP_STALL_REDUCTION * f),
-    }
+    crate::aircraft::stall_speed_in_config(vs_clean_kts, vs0_kts, &[], flap_ratio)
 }
 
 impl Check for StallSpeed {
@@ -948,7 +945,12 @@ impl Check for StallSpeed {
             return None;
         }
         // Stall speed for the current flap setting.
-        let vs = stall_speed_at_flap(self.vs_clean_kts, self.vs0_kts, s.flap_ratio);
+        let vs = crate::aircraft::stall_speed_in_config(
+            self.vs_clean_kts,
+            self.vs0_kts,
+            &self.detent_stall,
+            s.flap_ratio,
+        );
         // Anticipate: when the speed is washing off, project it forward so the
         // band trips while there's still margin to recover. Only a *decaying*
         // trend counts (`.min(0.0)`), so this can lower the effective speed but
@@ -2194,11 +2196,13 @@ fn build_checks(profile: &AircraftProfile) -> Vec<Box<dyn Check>> {
         // applied to the *flap-adjusted* stall speed at eval time, so a slow but
         // safe flaps-down approach doesn't trip it.
         let vs0 = profile.reference.as_ref().and_then(|r| r.vs0_kts);
+        let detent_stall = crate::aircraft::detent_stall_points(profile.flaps.as_ref());
         checks.push(Box::new(StallSpeed {
             id: "airspeed_caution",
             severity: Severity::Caution,
             vs_clean_kts: vs,
             vs0_kts: vs0,
+            detent_stall: detent_stall.clone(),
             at_or_below_factor: 1.20,
             above_factor: Some(1.10),
         }));
@@ -2207,6 +2211,7 @@ fn build_checks(profile: &AircraftProfile) -> Vec<Box<dyn Check>> {
             severity: Severity::Warning,
             vs_clean_kts: vs,
             vs0_kts: vs0,
+            detent_stall,
             at_or_below_factor: 1.10,
             above_factor: None,
         }));
@@ -6266,6 +6271,46 @@ mod tests {
         assert!(a.eval(&s).is_none(), "switch off → handled elsewhere");
     }
 
+    /// EGPF 2026-09-21, the A330's circuit (pilot bands, the trend
+    /// projected): the four "getting slow" calls in CONF 1 and 2, from the
+    /// recorded `state` ticks (ias, flap, ias trend over the preceding
+    /// ticks). On the straight line each is in the caution band; on the
+    /// profile's declared table none is, and a genuinely slow CONF 2 still is.
+    #[test]
+    fn the_a330s_recorded_conf_2_base_is_not_slow() {
+        let p = crate::aircraft::load("airbus_a330_300").expect("the A330 loads");
+        let checks = build_checks(&p);
+        let caution = checks
+            .iter()
+            .find(|c| c.id() == "airspeed_caution")
+            .expect("the A330 has a stall caution");
+        let line = StallSpeed {
+            id: "line",
+            severity: Severity::Caution,
+            vs_clean_kts: 175.0,
+            vs0_kts: Some(125.0),
+            detent_stall: Vec::new(),
+            at_or_below_factor: 1.20,
+            above_factor: Some(1.10),
+        };
+        let mut s = snap(true, true);
+        s.on_ground = false;
+        s.agl_ft = 900.0;
+        s.automation_flying = false;
+        // t 1789976359.2, 751.7, 788.6, 837.3.
+        for (ias, flap, trend) in [(183.5, 0.25, 0.0), (175.2, 0.5, -1.7), (177.2, 0.5, -0.8), (177.3, 0.5, -0.5)] {
+            s.ias_kts = ias;
+            s.flap_ratio = flap;
+            s.ias_trend_kts_per_s = trend;
+            assert!(line.eval(&s).is_some(), "the old line called {ias} at {flap}");
+            assert!(caution.eval(&s).is_none(), "{ias} kt at flap {flap} is not slow");
+        }
+        s.ias_kts = 160.0;
+        s.flap_ratio = 0.5;
+        s.ias_trend_kts_per_s = 0.0;
+        assert!(caution.eval(&s).is_some(), "160 in CONF 2 is 1.15 x 139");
+    }
+
     #[test]
     fn airspeed_bands_and_flare_and_ground_suppression() {
         // Vs=48 clean → caution ≤57.6 (and >52.8), warning ≤52.8.
@@ -6274,6 +6319,7 @@ mod tests {
             severity: Severity::Caution,
             vs_clean_kts: 48.0,
             vs0_kts: None,
+            detent_stall: Vec::new(),
             at_or_below_factor: 1.20,
             above_factor: Some(1.10),
         };
@@ -6282,6 +6328,7 @@ mod tests {
             severity: Severity::Warning,
             vs_clean_kts: 48.0,
             vs0_kts: None,
+            detent_stall: Vec::new(),
             at_or_below_factor: 1.10,
             above_factor: None,
         };

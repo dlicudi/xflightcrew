@@ -1505,7 +1505,8 @@ pub(crate) struct SpeedContext {
     pub(crate) flap_ratio: f64,
     /// The governor's flight target, when it is holding one.
     pub(crate) hold_kts: Option<f64>,
-    /// The airframe's floor (1.2 x clean Vs), republished per swap.
+    /// The airframe's floor in the configuration flown (1.2 x the stall with
+    /// these flaps, `aircraft::config_floor_kts`), republished per swap.
     pub(crate) floor_kts: Option<f64>,
 }
 
@@ -1808,9 +1809,15 @@ pub(crate) async fn answer_state_query(
                     on_ground: on_ground.map(|g| g > 0.5).unwrap_or(false),
                     vvi_fpm: vvi.unwrap_or(0.0),
                     agl_ft: agl_m.map(|m| m * 3.28084).unwrap_or(f64::MAX),
+                    // The floor for the flaps actually out: an A330 on a
+                    // CONF FULL final at 145 is not "below the 210 knot
+                    // floor". A failed flap read keeps the clean floor.
+                    floor_kts: match &flap {
+                        Ok(f) => aircraft::config_floor_kts(*f),
+                        Err(_) => aircraft::speed_floor_kts(),
+                    },
                     flap_ratio: flap.unwrap_or(0.0),
                     hold_kts: tools::speedhold::flight_target(),
-                    floor_kts: aircraft::speed_floor_kts(),
                 };
                 if let Some(verdict) = speed_verdict(v, &ctx, profile.reference.as_ref()) {
                     line.push_str(", ");
