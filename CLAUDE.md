@@ -283,7 +283,10 @@ Config: `XCOPILOT_ATC_AIRPORT` / `_VOICE` / `_RATE` / `_REGION`.
   uncommitted calm pick against the stream turns round to it (`ends_oppose`, `runway_follows_stream`),
   a stated runway into the departures is refused, and **the party line clears nobody against our
   runway** (`own_strip_claim`, `conflicts_with_claim`, in the air too; `party_line_withheld`; LEMG 31
-  vs 13, 2026-09-28); FROZEN while a departure or
+  vs 13, 2026-09-28); the stream turns even a zone or circuit clearance's runway, but the turn is
+  SAID: the next ground taxi or ready reply opens "runway change, runway X in use"
+  (`state_runway_change`, `told_runway`, blackbox `runway_change_stated`; a "taxi ... first"
+  publishes its route; LEMG 30 to 13, #178); FROZEN while a departure or
   arrival is committed, an IFR clearance included (`ifr_runway`), with wind hysteresis (parallels
   flip-flop invisibly); an arrival's STATED runway stands when the wind does not argue: in calm, or within a 5 kt tailwind on no worse a crosswind (`stated_runway_stands`, `note_stated_runway`; LEMG 13, 2026-09-28).
   **The wind picks a direction, the longest parallel the strip** (`best_runway_for_wind`); a
@@ -536,8 +539,12 @@ everything blackboxes to `logs/blackbox.jsonl` (kinds: `atc`, `autotaxi`, `autot
   held one names another runway); the tower gives a caller standing on the stated strip that runway
   ahead of the calm-wind stream when the wind does not argue (`note_caller_on_strip`); too little ahead is a BACKTRACK, never a taxi (`full_auto::RunwayStart`,
   `backtrack_from_runway_start`, `Intent::RequestBacktrack`; EGKK 26L 2026-09-27); a clearance for
-  another runway is taxied to (`under_clearance`); a start whose end opposes the live stream takes the
-  stream's end (a 31 start facing 13 departures takes 13). `why_no_fit` diagnoses the aligned end we are
+  another runway is taxied to (`under_clearance`), and so is a taxi, line-up or takeoff for one
+  answering the ready call, the reciprocal too: the wait ends before any readback, nothing is read
+  back from the wrong strip and "lined up" is never said (`cleared_elsewhere`,
+  `runway_start_other_runway` `at: ready`; LEMG 30 read back 13, #178); a start whose end opposes
+  the live stream takes the stream's end (a 31 start facing 13 departures takes 13). `why_no_fit`
+  diagnoses the aligned end we are
   ON (parallels tie on heading).
 
 ### Circuit, procedure, full auto

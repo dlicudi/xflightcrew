@@ -2364,6 +2364,50 @@ async fn fly(xp: XPlaneClient, config: Config, voice: Option<Voice>, tools: SubT
             runway: runway.clone(),
         };
     }
+    // A runway start calls ready from the strip, and the answer may be for
+    // another runway: the field turned round under a clearance for ours (the
+    // calm-wind stream), or the tower sequences us elsewhere. Then the start
+    // is no start: nothing is read back from here, the crew taxis to the
+    // cleared runway like any departure (#178).
+    let mut start_cleared = false;
+    if let Some(on) = start.runway().map(str::to_string) {
+        if crate::mode::atc_enabled() && crate::party_line::clearance_state().is_some() {
+            if let Some(khz) = crate::party_line::home_tower_khz() {
+                let _ = xp.set_float(COM1_FREQ_KHZ, khz as f64).await;
+            }
+            transponder_before_departure(&xp, &voice, "runway_start").await;
+            request_departure(&callsign, Some(&on)).await;
+            bail_if_abort!();
+            let mut read_back = false;
+            waiting("the takeoff clearance");
+            match ensure_takeoff_cleared(&voice, &callsign, &mut read_back, false, Some(&on)).await
+            {
+                ClearanceWait::Cleared => start_cleared = true,
+                ClearanceWait::NotCleared => {
+                    give_up(
+                        &xp,
+                        tools.taxi.park_brake_valve_set,
+                        &voice,
+                        "We're on the runway, but the tower never cleared us for takeoff. \
+                         Your aircraft. Say full auto again once we're cleared.",
+                        "no_takeoff_clearance",
+                    )
+                    .await;
+                    return;
+                }
+                ClearanceWait::OtherRunway(cleared) => {
+                    event(
+                        "runway_start_other_runway",
+                        json!({ "on": on, "cleared": cleared, "at": "ready",
+                                "state": format!("{:?}", crate::party_line::clearance_state()) }),
+                    );
+                    announce(&voice, Priority::Advisory, &other_runway_line(&on, &cleared));
+                    start = RunwayStart::None;
+                }
+            }
+            bail_if_abort!();
+        }
+    }
     if start == RunwayStart::None {
         event("departure_field", json!({ "towered": towered }));
         // Clearance first — the real order is clearance, THEN taxi. Only with a
@@ -2881,7 +2925,7 @@ async fn fly(xp: XPlaneClient, config: Config, voice: Option<Voice>, tools: SubT
         // crew-radio drain (with the tower's reply), so we only transmit here.
         let atc_running = crate::party_line::clearance_state().is_some();
         if atc_running {
-            request_departure(&callsign).await;
+            request_departure(&callsign, None).await;
             bail_if_abort!();
         }
 
@@ -2910,7 +2954,9 @@ async fn fly(xp: XPlaneClient, config: Config, voice: Option<Voice>, tools: SubT
                 // Held SHORT: a line-up-and-wait is a good enough answer to
                 // get us moving — the clearance is asked for again from the
                 // runway, below.
-                if !ensure_takeoff_cleared(&voice, &callsign, &mut read_back, true).await {
+                if ensure_takeoff_cleared(&voice, &callsign, &mut read_back, true, None).await
+                    != ClearanceWait::Cleared
+                {
                     give_up(
                         &xp,
                         tools.taxi.park_brake_valve_set,
@@ -3086,7 +3132,10 @@ async fn fly(xp: XPlaneClient, config: Config, voice: Option<Voice>, tools: SubT
 
         // The takeoff clearance, if the line-up went on under line-up-and-wait
         // (already satisfied when the held-short path above got it first).
-        if atc_running && !ensure_takeoff_cleared(&voice, &callsign, &mut read_back, false).await {
+        if atc_running
+            && ensure_takeoff_cleared(&voice, &callsign, &mut read_back, false, None).await
+                != ClearanceWait::Cleared
+        {
             give_up(
                 &xp,
                 tools.taxi.park_brake_valve_set,
@@ -3106,7 +3155,8 @@ async fn fly(xp: XPlaneClient, config: Config, voice: Option<Voice>, tools: SubT
         // to "you are inside controlled airspace without clearance" (EGPF,
         // 2026-09-21). The tower now takes a "ready" from the strip as a
         // lined-up aircraft (`Ctx::own_on_runway`), so the same call and the
-        // same wait as the taxied departure apply.
+        // same wait as the taxied departure apply, made above: only a
+        // clearance for THIS runway gets here (`cleared_elsewhere`, #178).
         // A SID with minimums: the takeoff's own climb-out at best rate, as
         // from a taxied line-up.
         crate::autotakeoff::DEPARTURE_MINIMUMS.store(
@@ -3119,27 +3169,7 @@ async fn fly(xp: XPlaneClient, config: Config, voice: Option<Voice>, tools: SubT
             "lights_takeoff",
             json!({ "strobe": strobe, "landing": landing, "runway_start": true }),
         );
-        if crate::mode::atc_enabled() && crate::party_line::clearance_state().is_some() {
-            if let Some(khz) = crate::party_line::home_tower_khz() {
-                let _ = xp.set_float(COM1_FREQ_KHZ, khz as f64).await;
-            }
-            transponder_before_departure(&xp, &voice, "runway_start").await;
-            request_departure(&callsign).await;
-            bail_if_abort!();
-            let mut read_back = false;
-            waiting("the takeoff clearance");
-            if !ensure_takeoff_cleared(&voice, &callsign, &mut read_back, false).await {
-                give_up(
-                    &xp,
-                    tools.taxi.park_brake_valve_set,
-                    &voice,
-                    "We're on the runway, but the tower never cleared us for takeoff. \
-                     Your aircraft. Say full auto again once we're cleared.",
-                    "no_takeoff_clearance",
-                )
-                .await;
-                return;
-            }
+        if start_cleared {
             ensure_squawk(&xp, &ctx, &voice).await;
             bail_if_abort!();
         }
@@ -5543,7 +5573,9 @@ fn taxi_call(mission: &Mission, cleared: Option<&str>) -> String {
 /// Call the tower for departure and wait for it to move us to a departure
 /// clearance (line-up-and-wait or cleared for takeoff). The call itself is
 /// voiced + transcribed by the crew-radio drain, along with the tower's reply.
-async fn request_departure(callsign: &Option<String>) {
+/// A runway start (`on_runway`) stops waiting as soon as the answer is for
+/// another runway ([`cleared_elsewhere`]): a taxi is not coming as a line-up.
+async fn request_departure(callsign: &Option<String>, on_runway: Option<&str>) {
     use crate::tower::State::{LinedUp, TakeoffCleared};
     // The call itself is heard; a line announcing it first is a crew narrating
     // its own hands (LIPK 2026-09-26: said, queued behind the tower, and
@@ -5558,9 +5590,60 @@ async fn request_departure(callsign: &Option<String>) {
         matches!(
             crate::party_line::clearance_state(),
             Some(LinedUp) | Some(TakeoffCleared)
+        ) || cleared_elsewhere(
+            on_runway,
+            crate::party_line::clearance_state(),
+            crate::party_line::clearance_runway().as_deref(),
         )
+        .is_some()
     })
     .await;
+}
+
+/// A RUNWAY START IS NEVER CLEARED FROM A RUNWAY IT IS NOT ON. Standing on
+/// `on`, the tower's taxi, line-up or takeoff for another runway (the
+/// reciprocal of our own strip included) is that runway, returned: the crew
+/// taxis to it and never reads back a line-up or a takeoff it is not in
+/// position for. LEMG (sortie 1790631369-full_auto, 2026-09-28, #178): lined
+/// up on 30, the ready call was answered "taxi to holding point Hotel
+/// November one runway one three first", the crew sat, read back "lining up
+/// runway one three" and "cleared for takeoff runway one three" from 30, and
+/// said "Lined up and ready" until autotakeoff's wrong_runway stopped it. A
+/// zone clearance alone (Parked) is judged at the arm (`under_clearance`).
+/// Pure.
+pub(crate) fn cleared_elsewhere(
+    on: Option<&str>,
+    state: Option<crate::tower::State>,
+    cleared: Option<&str>,
+) -> Option<String> {
+    use crate::tower::State::{LinedUp, TakeoffCleared, TaxiCleared};
+    let on = on.filter(|r| !r.is_empty())?;
+    let cleared = cleared.filter(|r| !r.is_empty())?;
+    (matches!(state, Some(TaxiCleared | LinedUp | TakeoffCleared))
+        && !crate::autotakeoff::runway_matches(on, cleared))
+    .then(|| cleared.to_string())
+}
+
+/// What the crew says when a runway start is sent to another runway: where
+/// it is, where it goes, and that it taxis (never "lined up"). Pure.
+pub(crate) fn other_runway_line(on: &str, cleared: &str) -> String {
+    format!(
+        "The tower wants runway {}, and we're on {}. Taxiing there.",
+        crate::atis::spoken_runway(cleared),
+        crate::atis::spoken_runway(on)
+    )
+}
+
+/// How a wait for the takeoff clearance ended ([`ensure_takeoff_cleared`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ClearanceWait {
+    /// Cleared (or, held short, lined up) and read back.
+    Cleared,
+    /// No clearance in the wait, or the pilot's cancel.
+    NotCleared,
+    /// A runway start answered for another runway ([`cleared_elsewhere`]):
+    /// nothing was read back, the caller taxis there.
+    OtherRunway(String),
 }
 
 /// How long one backtrack request waits for the tower's line-up before it
@@ -5718,12 +5801,16 @@ impl OwedReadback {
 /// the runway, only the takeoff clearance will do. Without the distinction a
 /// sequenced departure waited out its whole budget behind the hold line while
 /// the tower believed it was lined up (Heathrow 27L, 2026-07-27).
+///
+/// `on_runway` is a runway start's own runway: an answer for another one
+/// ends the wait unread ([`ClearanceWait::OtherRunway`]).
 async fn ensure_takeoff_cleared(
     voice: &Option<Voice>,
     callsign: &Option<String>,
     read_back: &mut bool,
     accept_line_up: bool,
-) -> bool {
+    on_runway: Option<&str>,
+) -> ClearanceWait {
     use crate::tower::State::{LinedUp, TakeoffCleared};
     /// Wait this long overall for the clearance — long enough to sit out a
     /// traffic hold, bounded so a dead frequency eventually hands back.
@@ -5740,16 +5827,25 @@ async fn ensure_takeoff_cleared(
     let mut announced_hold = false;
     loop {
         if ABORT.load(SeqCst) {
-            return false;
+            return ClearanceWait::NotCleared;
         }
         let state = crate::party_line::clearance_state();
+        // Before anything is read back or called: an answer for another
+        // runway is not ours to read back from this one (#178).
+        if let Some(other) = cleared_elsewhere(
+            on_runway,
+            state,
+            crate::party_line::clearance_runway().as_deref(),
+        ) {
+            return ClearanceWait::OtherRunway(other);
+        }
         if matches!(state, Some(TakeoffCleared))
             || (accept_line_up && matches!(state, Some(LinedUp)))
         {
             break;
         }
         if Instant::now() >= deadline {
-            return false;
+            return ClearanceWait::NotCleared;
         }
         // An instruction the tower wants read back ("hold position") is
         // read back before anything else is said: the ready call repeated
@@ -5848,7 +5944,7 @@ async fn ensure_takeoff_cleared(
             );
         }
     }
-    true
+    ClearanceWait::Cleared
 }
 
 /// The longest the crew waits for its takeoff or line-up readback to go out
@@ -6695,6 +6791,73 @@ mod runway_start_tests {
         assert_eq!(lined.clone().under_clearance(Some("9")), lined);
         assert_eq!(lined.under_clearance(Some("27")), RunwayStart::None);
         assert_eq!(RunwayStart::None.under_clearance(Some("27")), RunwayStart::None);
+    }
+
+    /// Issue #178, the party line as the crew read it in sortie
+    /// 1790631369-full_auto (LEMG, 2026-09-28), lined up on 30: +25.3
+    /// Parked 30 (the circuit clearance), +47.5 Parked 13 (the field turned
+    /// round, nothing said to us), +58.6 TaxiCleared 13 ("taxi to holding
+    /// point Hotel November one runway one three first"), +87.3 LinedUp 13,
+    /// +219.3 TakeoffCleared 13. From the taxi on, every answer is for
+    /// another runway: the crew taxis, reads back nothing from 30 and never
+    /// says "lined up". Its own runway, the reciprocal and a taxied departure
+    /// (no start) are judged too.
+    #[test]
+    fn a_runway_start_never_reads_back_another_runway() {
+        use crate::tower::State::{LinedUp, Parked, TakeoffCleared, TaxiCleared};
+        let on = Some("30");
+        let records = [
+            (Parked, "30", None),
+            (Parked, "13", None),
+            (TaxiCleared, "13", Some("13")),
+            (LinedUp, "13", Some("13")),
+            (TakeoffCleared, "13", Some("13")),
+        ];
+        for (state, rwy, want) in records {
+            assert_eq!(
+                cleared_elsewhere(on, Some(state), Some(rwy)).as_deref(),
+                want,
+                "{state:?} {rwy}"
+            );
+        }
+        // Our own runway, however it is spelt: the takeoff is ours.
+        assert_eq!(cleared_elsewhere(on, Some(TakeoffCleared), Some("30")), None);
+        assert_eq!(cleared_elsewhere(Some("09"), Some(LinedUp), Some("9")), None);
+        // The reciprocal of the strip we sit on is another runway.
+        assert_eq!(
+            cleared_elsewhere(on, Some(LinedUp), Some("12")).as_deref(),
+            Some("12")
+        );
+        // No start, no runway known, no state: nothing to judge.
+        assert_eq!(cleared_elsewhere(None, Some(TakeoffCleared), Some("13")), None);
+        assert_eq!(cleared_elsewhere(on, Some(TakeoffCleared), None), None);
+        assert_eq!(cleared_elsewhere(on, None, Some("13")), None);
+        // What the crew says: where it is going and that it taxis.
+        let line = other_runway_line("30", "13");
+        assert!(line.contains("runway one three"), "{line}");
+        assert!(line.contains("Taxiing"), "{line}");
+        assert!(!line.to_lowercase().contains("lined up"), "{line}");
+    }
+
+    /// The runway start's wait is the one that can see another runway, and
+    /// it looks before any readback goes out; the taxied waits pass `None`.
+    /// Read from the source: the wait itself needs a live party line.
+    #[test]
+    fn the_runway_start_waits_with_its_own_runway() {
+        let src = include_str!("full_auto.rs");
+        let wait = src
+            .find("async fn ensure_takeoff_cleared(")
+            .expect("the wait");
+        let body = &src[wait..];
+        let check = body.find("cleared_elsewhere(").expect("the check");
+        let readback = body.find("OwedReadback::due(").expect("the readback");
+        assert!(check < readback, "the runway is judged before a readback");
+        let call = concat!(
+            "ensure_takeoff_cleared(&voice, &callsign, &mut read_back, false, ",
+            "Some(&on))"
+        );
+        assert_eq!(src.matches(call).count(), 1);
+        assert!(src.contains(concat!("request_departure(&callsign, ", "Some(&on))")));
     }
 
     /// The arm reads the start once, before any taxi request, and a short
