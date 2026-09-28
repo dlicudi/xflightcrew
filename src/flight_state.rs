@@ -59,6 +59,11 @@ pub(crate) fn publish_airframe(p: &AircraftProfile) {
         p.reference.as_ref().and_then(|r| r.vs0_kts),
         p.vs_clean_kts,
     );
+    crate::aircraft::publish_stall_curve(
+        p.vs_clean_kts,
+        p.reference.as_ref().and_then(|r| r.vs0_kts),
+        p.flaps.as_ref(),
+    );
     crate::aircraft::publish_approach_thrust_min(p.approach_thrust_min);
     crate::aircraft::publish_arrest_lead(p.arrest_lead);
     crate::aircraft::publish_flare_elevator(p.flare_elevator);

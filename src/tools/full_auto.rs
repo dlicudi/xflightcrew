@@ -105,6 +105,80 @@ impl StartKind {
 /// joining its first fix.
 const DEPARTURE_REJOIN_NM: f64 = 15.0;
 
+/// A resume this near the plan's destination, past the last enroute fix and
+/// abeam no leg, is the ARRIVAL: the approach to the plan's runway. LIPE-LIPK
+/// (2026-09-25): 6.6 nm from Forli at 2,800 ft over the coastal plain, the
+/// plan's last enroute fix LUMAV 51 nm behind, and the refusal said "climb
+/// to 7,500 feet first, the sector altitude" (the Apennines' 25 nm circle)
+/// and "request an approach"; the pilot's "land the aircraft" then
+/// self-picked Cervia.
+pub(crate) const ARRIVAL_REJOIN_NM: f64 = 25.0;
+
+/// Where an airborne resume joins the plan. Pure.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum ResumeJoin {
+    /// The enroute leg ending at this index.
+    Leg(usize),
+    /// Past the route, near the destination: fly its arrival.
+    Arrival { dist_nm: f64 },
+    /// No flyable join; the line says why, with its number.
+    Refused(String),
+}
+
+/// The join for an airborne resume at (`lat`, `lon`): abeam a leg inside the
+/// corridor, else direct to the first fix near the origin (LILB
+/// 2026-09-25; the SR22's 8 nm refusal climbing out of Samedan, LSZS
+/// 2026-09-24, is this case), else the arrival past the route near the
+/// destination, else the refusal, naming the destination's distance when it
+/// has nothing better. Pure.
+pub(crate) fn resume_join(
+    legs: &[crate::nav::ProcLeg],
+    waypoints: &[crate::simbrief::Waypoint],
+    destination: &str,
+    lat: f64,
+    lon: f64,
+    mag_var: Option<f64>,
+) -> ResumeJoin {
+    let why = match crate::interaction::rejoin_index(legs, lat, lon, mag_var) {
+        Ok(i) => return ResumeJoin::Leg(i),
+        Err(why) => why,
+    };
+    if legs.is_empty() || !lat.is_finite() || !lon.is_finite() {
+        return ResumeJoin::Refused(why);
+    }
+    if waypoints
+        .first()
+        .is_some_and(|o| crate::nav::haversine_nm(lat, lon, o.lat, o.lon) <= DEPARTURE_REJOIN_NM)
+    {
+        return ResumeJoin::Leg(0);
+    }
+    let dest = waypoints
+        .last()
+        .filter(|d| d.ident.eq_ignore_ascii_case(destination));
+    if let Some(d) = dest {
+        let to_dest = crate::nav::haversine_nm(lat, lon, d.lat, d.lon);
+        let last_fix = legs.iter().rev().find_map(|l| l.fix.as_ref());
+        let past_route =
+            last_fix.is_none_or(|f| to_dest < crate::nav::haversine_nm(f.lat, f.lon, d.lat, d.lon));
+        if to_dest <= ARRIVAL_REJOIN_NM && past_route {
+            return ResumeJoin::Arrival { dist_nm: to_dest };
+        }
+        return ResumeJoin::Refused(format!("{why} {} is {:.0} miles away.", d.ident, to_dest));
+    }
+    ResumeJoin::Refused(why)
+}
+
+/// What an airborne resume arms: the route follower, or autoland on the
+/// plan's arrival runway.
+pub(crate) enum ResumeArm {
+    Route(Mission, String),
+    Arrival {
+        dest: String,
+        rwy: String,
+        ack: String,
+    },
+}
+
 pub struct FullAuto {
     // engine start
     /// Engine count, so a piston TWIN gets both starters cranked. The piston
@@ -307,7 +381,26 @@ impl Tool for FullAuto {
             }
         } else if a.resume {
             match self.build_resume_mission(ctx).await {
-                Ok(v) => v,
+                Ok(ResumeArm::Route(m, ack)) => (m, ack),
+                Ok(ResumeArm::Arrival { dest, rwy, ack }) => {
+                    // The arrival is autoland's, as a planned arrival hands it
+                    // down: the plan's runway, never a self-pick.
+                    if crate::autoland::ACTIVE.load(std::sync::atomic::Ordering::SeqCst) {
+                        return Ok("Autoland is already flying the approach.".to_string());
+                    }
+                    crate::autoland::ABORT.store(false, std::sync::atomic::Ordering::SeqCst);
+                    crate::autoland::run_autoland(
+                        ctx.config.xplane_base_url.clone(),
+                        crate::tools::autoland::apt_dat_path(),
+                        self.cfg.clone(),
+                        self.approach_ias,
+                        ctx.voice.cloned(),
+                        ctx.status.cloned(),
+                        Some(crate::autoland::PlannedRunway::at(&dest, &rwy)),
+                    );
+                    crate::flight::note_crew_takeover("resume_arrival");
+                    return Ok(ack);
+                }
                 Err(why) => return Ok(why),
             }
         } else if a.flight {
@@ -468,10 +561,16 @@ impl FullAuto {
     async fn build_resume_mission(
         &self,
         ctx: &ToolCtx<'_>,
-    ) -> std::result::Result<(Mission, String), String> {
+    ) -> std::result::Result<ResumeArm, String> {
         let built = self.resume_mission_checked(ctx).await;
         match &built {
-            Ok((_, ack)) => crate::full_auto::event("resume", json!({ "ack": ack })),
+            Ok(ResumeArm::Route(_, ack)) => {
+                crate::full_auto::event("resume", json!({ "ack": ack }))
+            }
+            Ok(ResumeArm::Arrival { dest, rwy, ack }) => crate::full_auto::event(
+                "resume_arrival",
+                json!({ "dest": dest, "rwy": rwy, "ack": ack }),
+            ),
             Err(why) => crate::full_auto::event("resume_refused", json!({ "why": why })),
         }
         built
@@ -480,7 +579,7 @@ impl FullAuto {
     async fn resume_mission_checked(
         &self,
         ctx: &ToolCtx<'_>,
-    ) -> std::result::Result<(Mission, String), String> {
+    ) -> std::result::Result<ResumeArm, String> {
         let fp = crate::simbrief::loaded_plan().ok_or_else(||
             "No plan is loaded. I'm monitoring only; you have control. Load and review the flight plan first.".to_string())?;
         if fp.source == crate::simbrief::PlanSource::Local {
@@ -534,19 +633,33 @@ impl FullAuto {
         if let Some(why) = gate {
             return Err(why);
         }
-        if !engines.ok().is_some_and(|v| {
-            v.len() >= self.engines
-                && v.iter()
-                    .take(self.engines)
-                    .all(|v| v.is_finite() && *v > 0.5)
-        }) {
-            return Err("I can't confirm all engines running. I haven't taken control; stabilise the aircraft first.".into());
+        let running = engines.as_ref().ok().map(|v| {
+            v.iter()
+                .take(self.engines)
+                .filter(|v| v.is_finite() && **v > 0.5)
+                .count()
+        });
+        if running != Some(self.engines) {
+            return Err(match running {
+                Some(n) => format!(
+                    "I can confirm {n} of {} engine{} running. I haven't taken control; stabilise the aircraft first.",
+                    self.engines,
+                    if self.engines == 1 { "" } else { "s" }
+                ),
+                None => "I can't read the engines. I haven't taken control; try again once the sim answers.".into(),
+            });
         }
-        if !aircraft
-            .ok()
-            .is_some_and(|a| a.trim().eq_ignore_ascii_case(&fp.aircraft))
-        {
-            return Err("The loaded plan's aircraft doesn't match this aircraft. Review a matching plan first; you have control.".into());
+        match aircraft.as_ref().map(|a| a.trim().to_string()) {
+            Ok(a) if a.eq_ignore_ascii_case(&fp.aircraft) => {}
+            Ok(a) => {
+                return Err(format!(
+                    "The loaded plan is for a {}, and this is a {a}. Review a matching plan first; you have control.",
+                    fp.aircraft,
+                ))
+            }
+            Err(_) => {
+                return Err("I can't read this aircraft's type to check it against the plan. I haven't taken control.".into())
+            }
         }
         let mut legs = crate::procedure::enroute_legs(
             &fp.waypoints,
@@ -567,27 +680,34 @@ impl FullAuto {
             let msa = crate::nav::airport_msa_ft(&msa_path, icao)?;
             (altitude < msa).then_some(msa)
         });
-        let index = match crate::interaction::rejoin_index(
+        let index = match resume_join(
             &legs,
+            &fp.waypoints,
+            &fp.destination,
             lat,
             lon,
             mag_var.ok().filter(|v| v.is_finite()),
         ) {
-            Ok(i) => i,
-            // Just departed: the enroute legs start at the first fix, so an
-            // aircraft climbing out of the origin is abeam none of them and
-            // every resume was refused (LILB, 2026-09-25). Near the origin it
-            // goes direct to the first fix; the join's terrain probe below
-            // is the gate, as for any rejoin.
-            Err(_)
-                if !legs.is_empty()
-                    && fp.waypoints.first().is_some_and(|o| {
-                        crate::nav::haversine_nm(lat, lon, o.lat, o.lon) <= DEPARTURE_REJOIN_NM
-                    }) =>
-            {
-                0
+            ResumeJoin::Leg(i) => i,
+            ResumeJoin::Arrival { dist_nm } => {
+                let Some(rwy) = fp.procedures.dest_rwy.clone() else {
+                    return Err(format!(
+                        "We're past the route, {dist_nm:.0} miles from {}, and the plan names no runway. I haven't taken control; say land for me.",
+                        fp.destination
+                    ));
+                };
+                return Ok(ResumeArm::Arrival {
+                    ack: format!(
+                        "Past the route, {dist_nm:.0} miles from {}. Flying the approach to runway {}. Say my controls to take over.",
+                        fp.destination,
+                        atc::atis::spoken_runway(&rwy),
+                    ),
+                    dest: fp.destination.clone(),
+                    rwy,
+                });
             }
-            Err(why) => {
+            // Below the sector altitude a heading is never advice alone.
+            ResumeJoin::Refused(why) => {
                 return Err(match low_msa {
                     Some(msa) => format!(
                         "Climb to {} first, the sector altitude, before turning. {why}",
@@ -607,11 +727,17 @@ impl FullAuto {
         let fix = first.fix.as_ref().unwrap();
         let distance = crate::nav::haversine_nm(lat, lon, fix.lat, fix.lon);
         if distance > 30.0 {
-            return Err("The next fix is too far away to verify the rejoin terrain. I haven't taken control; follow the GPS or request an approach.".into());
+            return Err(format!(
+                "{} is {distance:.0} miles away; I check the rejoin terrain within 30. I haven't taken control; follow the GPS or request an approach.",
+                fix.ident
+            ));
         }
         let target = first.alt1_ft.unwrap_or(fp.cruise_alt_ft);
         if !target.is_finite() || target <= 0.0 || target > self.cfg.service_ceiling_ft {
-            return Err("The resumed altitude is outside this aircraft's limits. Review the plan; you have control.".into());
+            return Err(format!(
+                "The plan's {target:.0} feet at {} is outside this aircraft's {:.0} foot ceiling. Review the plan; you have control.",
+                fix.ident, self.cfg.service_ceiling_ft
+            ));
         }
         // Use the LOWER of present/target true altitude over the complete join.
         let true_ft = xp
@@ -633,8 +759,20 @@ impl FullAuto {
         for chunk in points.chunks(crate::terrain::MAX_POINTS) {
             let terrain = crate::terrain::sample_ft(&xp, chunk).await.ok_or_else(||
                 "The terrain probe isn't answering, so I can't check the rejoin. I haven't taken control. Check the plugin build on the Health screen.".to_string())?;
-            if terrain.iter().any(|h| !h.is_finite() || *h > floor) {
-                return Err("The rejoin lacks terrain clearance at the planned altitude. I haven't taken control.".into());
+            if terrain.iter().any(|h| !h.is_finite()) {
+                return Err("The terrain probe gave no answer on part of the rejoin. I haven't taken control.".into());
+            }
+            if let Some(high) = terrain
+                .iter()
+                .copied()
+                .filter(|h| *h > floor)
+                .reduce(f64::max)
+            {
+                return Err(format!(
+                    "The ground rises to {high:.0} feet on the way to {}, inside a thousand feet of {:.0}. I haven't taken control.",
+                    fix.ident,
+                    altitude.min(target)
+                ));
             }
         }
         let apt = ctx.config.apt_data_path.clone();
@@ -659,10 +797,12 @@ impl FullAuto {
         else {
             return Err("Connection changed during verification. I haven't taken control.".into());
         };
-        if crate::nav::haversine_nm(lat, lon, new_lat, new_lon) > 1.0
-            || (new_alt - altitude).abs() > 200.0
-        {
-            return Err("The aircraft moved beyond the verified rejoin. I haven't taken control; stabilise and try again.".into());
+        let moved_nm = crate::nav::haversine_nm(lat, lon, new_lat, new_lon);
+        if moved_nm > 1.0 || (new_alt - altitude).abs() > 200.0 {
+            return Err(format!(
+                "We moved {moved_nm:.1} miles and {:.0} feet while I checked the rejoin. I haven't taken control; stabilise and try again.",
+                (new_alt - altitude).abs()
+            ));
         }
         let ack = format!("Resuming toward {} at {:.0} feet, continuing to {} and the arrival. {} Say my controls to take over.", fix.ident,target,fp.destination,arrival);
         // THE one payload builder, never a hand-rolled join. This site had a
@@ -686,7 +826,7 @@ impl FullAuto {
                 descending: false,
             },
         ));
-        Ok((
+        Ok(ResumeArm::Route(
             Mission::Resume(Route {
                 arrival_rwy: fp.procedures.dest_rwy.clone(),
                 dest_icao: fp.destination.clone(),
@@ -1455,5 +1595,71 @@ mod tests {
         assert!(jet > StartKind::Piston.engine_start_secs());
         assert!(StartKind::Piston.engine_start_secs() >= 30.0);
         assert!(StartKind::Turboprop.engine_start_secs() >= 30.0);
+    }
+
+    fn plan(points: &[(&str, f64, f64)]) -> Vec<crate::simbrief::Waypoint> {
+        points
+            .iter()
+            .map(|(id, lat, lon)| crate::simbrief::Waypoint {
+                ident: id.to_string(),
+                lat: *lat,
+                lon: *lon,
+                alt: 5000.0,
+            })
+            .collect()
+    }
+
+    /// The two recorded resume refusals of #67, joined from their positions.
+    /// LSZS-LILO (SR22, 2026-09-24, t 1790265324.8): 3.3 nm out of Samedan at
+    /// 7,412 ft, "8 miles right of course on the 4634N01010E to 4626N01003E
+    /// leg" behind "climb to 15,500 feet first"; it is a departure joining
+    /// its first fix. LIPE-LIPK (172, 2026-09-25, t 1790370381.1): 6.5 nm
+    /// from Forli at 2,800 ft, abeam no leg with LUMAV 41 nm behind, "climb
+    /// to 7,500 feet first"; it is the arrival.
+    #[test]
+    fn a_resume_near_a_field_joins_the_departure_or_flies_the_arrival() {
+        let lszs = plan(&[
+            ("LSZS", 46.5341, 9.8841),
+            ("4636N00959E", 46.6, 9.98333),
+            ("4642N01006E", 46.7, 10.1),
+            ("4639N01011E", 46.65, 10.18333),
+            ("4634N01010E", 46.56667, 10.16667),
+            ("4626N01003E", 46.43333, 10.05),
+            ("4610N00957E", 46.16667, 9.95),
+            ("LILO", 46.1581, 9.8869),
+        ]);
+        let legs = crate::procedure::enroute_legs(&lszs, "LSZS", "LILO", 10400.0);
+        let (lat, lon) = (46.57445, 9.93876);
+        assert!(crate::interaction::rejoin_index(&legs, lat, lon, None)
+            .is_err_and(|w| w.contains("4634N01010E to 4626N01003E")));
+        assert_eq!(
+            resume_join(&legs, &lszs, "LILO", lat, lon, None),
+            ResumeJoin::Leg(0)
+        );
+
+        let lipk = plan(&[
+            ("LIPE", 44.5309, 11.2922),
+            ("D037N", 44.715, 11.50),
+            ("LUMAV", 44.81, 11.61),
+            ("LIPK", 44.1948, 12.0701),
+        ]);
+        let legs = crate::procedure::enroute_legs(&lipk, "LIPE", "LIPK", 5000.0);
+        let (lat, lon) = (44.13632, 12.20075);
+        match resume_join(&legs, &lipk, "LIPK", lat, lon, None) {
+            ResumeJoin::Arrival { dist_nm } => assert!((6.0..7.0).contains(&dist_nm), "{dist_nm}"),
+            other => panic!("the arrival, not {other:?}"),
+        }
+        // Past the route but 30 nm out: refused, and the refusal names the
+        // destination's distance.
+        match resume_join(&legs, &lipk, "LIPK", 43.75, 12.35, None) {
+            ResumeJoin::Refused(why) => assert!(why.contains("LIPK is 29 miles away"), "{why}"),
+            other => panic!("refused, not {other:?}"),
+        }
+        // Back up the route, farther from the field than LUMAV is, is not
+        // past it: the corridor refusal stands.
+        assert!(matches!(
+            resume_join(&legs, &lipk, "LIPK", 44.95, 11.2, None),
+            ResumeJoin::Refused(_)
+        ));
     }
 }
