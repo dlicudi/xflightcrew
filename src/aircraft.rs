@@ -3604,6 +3604,16 @@ mod tests {
                 "MARGIN: over the airframe's own per-detent Vfe",
             ),
             (
+                "autoland",
+                "PLACARD_TARGET_MARGIN_KTS",
+                "MARGIN: under the airframe's own per-detent Vfe",
+            ),
+            (
+                "autoland",
+                "PATH_CATCH_UP_FPM",
+                "MARGIN: over the path's own sink at the groundspeed",
+            ),
+            (
                 "procedure",
                 "DRAG_OUT_KTS",
                 "MARGIN: over the governor's own target",
