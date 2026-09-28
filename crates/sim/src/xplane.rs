@@ -955,6 +955,9 @@ pub struct FakeXPlane {
     /// A command that moves a read: (dataref, delta per press). A stepped
     /// knob whose dial write does not stand (the 737's altimeter) is this.
     command_steps: std::sync::Mutex<HashMap<String, (String, f64)>>,
+    /// A command that SETS a read: (dataref, value). A button that puts a
+    /// setting somewhere absolute (the 737's STD, an autothrottle mode).
+    command_sets: std::sync::Mutex<HashMap<String, Vec<(String, f64)>>>,
     /// Presses (by ordinal, 1-based, over every command run) whose step lands
     /// one read LATE: a command the sim executes in a flight loop after the
     /// read that followed it. `presses` counts them; `held` are the late
@@ -980,6 +983,7 @@ impl FakeXPlane {
             writes: std::sync::Mutex::new(Vec::new()),
             commands: std::sync::Mutex::new(Vec::new()),
             command_steps: std::sync::Mutex::new(HashMap::new()),
+            command_sets: std::sync::Mutex::new(HashMap::new()),
             late_presses: std::sync::Mutex::new(std::collections::HashSet::new()),
             presses: std::sync::Mutex::new(0),
             held: std::sync::Mutex::new(Vec::new()),
@@ -1037,6 +1041,17 @@ impl FakeXPlane {
             .lock()
             .unwrap()
             .insert(command.to_string(), (dataref.to_string(), delta));
+    }
+
+    /// Make `command` set the read of `dataref` to `value` (several per
+    /// command allowed, applied in order).
+    pub fn set_on_command(&self, command: &str, dataref: &str, value: f64) {
+        self.command_sets
+            .lock()
+            .unwrap()
+            .entry(command.to_string())
+            .or_default()
+            .push((dataref.to_string(), value));
     }
 
     /// Preset the values reads will return.
@@ -1166,6 +1181,12 @@ impl XPlane for FakeXPlane {
             *n += 1;
             *n
         };
+        if let Some(sets) = self.command_sets.lock().unwrap().get(name) {
+            let mut reads = self.reads.lock().unwrap();
+            for (dref, value) in sets {
+                reads.insert(dref.clone(), *value);
+            }
+        }
         if let Some((dref, delta)) = self.command_steps.lock().unwrap().get(name) {
             if self.late_presses.lock().unwrap().contains(&nth) {
                 self.held

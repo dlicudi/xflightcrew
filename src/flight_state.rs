@@ -75,6 +75,11 @@ pub(crate) fn publish_airframe(p: &AircraftProfile) {
     crate::aircraft::publish_fuel_unit(p.fuel.as_ref());
     // A plan's transition belongs to the flight it was armed for.
     crate::tools::instruments::publish_flight_transition(None);
+    crate::tools::instruments::publish_altimeter(p.altimeter.clone());
+    // The altimeter cross-check was about the last airframe's instruments.
+    crate::tools::instruments::publish_altimeter_truth(None);
+    // What the crew switched on was the last airframe's anti-ice.
+    crate::tools::anti_ice::clear_claims();
 }
 
 /// Every loop that can hold the aircraft, stopped. Aborts go through each

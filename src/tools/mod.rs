@@ -11,7 +11,9 @@
 //! [`ToolCall`] names a tool and carries its arguments. No model picks tools;
 //! the LLM that once did was retired on 2026-09-13 (see docs/dev-history.md).
 
+pub mod anti_ice;
 pub mod approach;
+pub mod autoflight;
 pub mod autoland;
 pub mod autopilot;
 pub mod cabin_air;
@@ -178,6 +180,9 @@ pub const ROTORCRAFT_WITHHELD: &[&str] = &[
     "reverse_thrust",
     // A new flight on a runway final is landed by autoland.
     "setup_approach",
+    // The autopilot's own speed and GPS modes (#92) share the autopilot the
+    // hover loop holds, and were measured on no helicopter.
+    "ap_mode",
 ];
 
 impl Registry {
@@ -256,6 +261,9 @@ impl Registry {
             tools.push(Box::new(autopilot::SetClimb { cfg: ap.clone() }));
             tools.push(Box::new(autopilot::LevelOff { cfg: ap.clone() }));
             tools.push(Box::new(autopilot::AutopilotOff));
+            // The autopilot's own modes, read back (#92): refused per
+            // airframe by `systems::ap_modes`, never assumed.
+            tools.push(Box::new(autoflight::ApModeTool));
             // Emergency upset/stall recovery — takes the controls, so it needs the
             // autopilot (for the level-hold handoff) present. It also drives the
             // props full forward for max power, and holds ≈1.3×Vs.
@@ -647,6 +655,10 @@ impl Registry {
         if profile.speedbrake {
             tools.push(Box::new(controls::SetSpeedbrake));
         }
+
+        // Anti-ice and de-ice (#100): every airframe; the tool finds what
+        // is fitted (the profile's `anti_ice:`, else the `.acf`) and says so.
+        tools.push(Box::new(anti_ice::SetAntiIce));
 
         if profile.pitot_heat {
             tools.push(Box::new(instruments::SetPitotHeat {

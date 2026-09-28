@@ -398,6 +398,15 @@ pub fn try_parse(
             )]);
         }
     }
+    // "Autothrottle on" is the MD-82's own tool where it has one; elsewhere
+    // the stock autothrottle through the mode tool (#92).
+    if c.name == "autothrottle"
+        && registry.get("autothrottle").is_none()
+        && registry.get("ap_mode").is_some()
+    {
+        let on = c.arguments.get("on").and_then(|v| v.as_bool()).unwrap_or(true);
+        c = call("ap_mode", json!({ "mode": "autothrust", "on": on }));
+    }
     if c.name == "set_speed"
         && registry.get("set_speed").is_none()
         && registry.get("hold_speed").is_some()
@@ -1389,6 +1398,38 @@ fn onoff(t: &str) -> Option<bool> {
     }
 }
 
+/// The anti-ice grammar (#100). `None` without an ice word and a state.
+fn anti_ice_call(t: &str) -> Option<ToolCall> {
+    let on = onoff(t)?;
+    let anti = (has(t, "anti") && (has(t, "ice") || has(t, "icing")))
+        || has(t, "antiice")
+        || has(t, "deice")
+        || (has(t, "de") && has(t, "ice"))
+        || t.contains("ice protection");
+    let window = (has(t, "window") || has(t, "windshield") || has(t, "windscreen"))
+        && (has(t, "heat") || anti);
+    let prop = (has(t, "prop") || has(t, "props") || has(t, "propeller"))
+        && (has(t, "heat") || anti);
+    let boots = has(t, "boots") || has(t, "boot");
+    let engine = (has(t, "engine") || has(t, "engines") || has(t, "inlet") || has(t, "cowl"))
+        && (anti || (has(t, "inlet") && has(t, "heat")));
+    let wing = (has(t, "wing") || has(t, "wings")) && anti;
+    let system = if window {
+        "window"
+    } else if prop {
+        "prop"
+    } else if boots || wing {
+        "wing"
+    } else if engine {
+        "engine"
+    } else if anti {
+        "all"
+    } else {
+        return None;
+    };
+    Some(call("set_anti_ice", json!({ "system": system, "on": on })))
+}
+
 /// "flight level one two zero" (or "fl120", "fl 120", "level 120") said as
 /// the feet it means, "12000 feet", so every altitude rule below reads a
 /// level the way it reads an altitude (issue #97). Summed as digits it was
@@ -1743,6 +1784,17 @@ fn parse_one(t: &str) -> Option<ToolCall> {
         return Some(call("set_flaps", json!({ "notch": notch })));
     }
 
+    // The autopilot's own modes (#92): level change and GPS steering. A mode
+    // word with no "off" is an engage; "level change" carries no number, so
+    // the flight-level rule never sees it.
+    if t.contains("level change") || has(t, "flch") || has(t, "flc") {
+        let on = !(has(t, "off") || t.contains("disengage") || t.contains("cancel"));
+        return Some(call("ap_mode", json!({ "mode": "level_change", "on": on })));
+    }
+    if has(t, "gpss") || t.contains("gps steering") || has(t, "lnav") || t.contains("l nav") {
+        let on = !(has(t, "off") || t.contains("disengage") || t.contains("cancel"));
+        return Some(call("ap_mode", json!({ "mode": "lnav", "on": on })));
+    }
     // Autothrottle (jets) — before the throttle rule. "autothrottle on/off".
     if t.contains("autothrottle") || t.contains("auto throttle") {
         let on = !(has(t, "off") || t.contains("disconnect") || t.contains("disengage"));
@@ -2047,6 +2099,12 @@ fn parse_one(t: &str) -> Option<ToolCall> {
     let is_prop = t
         .split(|c: char| !c.is_ascii_alphanumeric())
         .any(|w| w.starts_with("prop"));
+    // "Prop heat on" / "prop de-ice on" is the ice protection, not the lever.
+    if is_prop {
+        if let Some(c) = anti_ice_call(t) {
+            return Some(c);
+        }
+    }
     if is_prop {
         if let Some(n) = num {
             return Some(call("set_prop", json!({ "rpm": n })));
@@ -2387,6 +2445,14 @@ fn parse_one(t: &str) -> Option<ToolCall> {
         if let Some(on) = onoff(t) {
             return Some(call("set_centre_pumps", json!({ "on": on })));
         }
+    }
+
+    // Anti-ice and de-ice (#100): "anti-ice on", "engine anti-ice on", "wing
+    // anti-ice off", "window heat on", "prop heat on", "boots on", "ice
+    // protection on", "de-ice off". Pitot heat and carb heat keep their own
+    // tools below.
+    if let Some(c) = anti_ice_call(t) {
+        return Some(c);
     }
 
     // <system> on/off
@@ -3527,6 +3593,45 @@ mod tests {
         assert_eq!(one("it was heat on").unwrap(), on);
         assert_eq!(one("a bit of heat on").unwrap(), on);
         assert_eq!(one("pitot heat off").unwrap().1, json!({"on":false}));
+    }
+
+    /// #100: the ice words reach `set_anti_ice` with the system named, and
+    /// pitot and carb heat keep their own tools.
+    #[test]
+    fn anti_ice_words_resolve() {
+        let ai = |s: &str, on: bool| ("set_anti_ice".to_string(), json!({"system": s, "on": on}));
+        assert_eq!(one("anti-ice on").unwrap(), ai("all", true));
+        assert_eq!(one("Anti ice off.").unwrap(), ai("all", false));
+        assert_eq!(one("turn on the ice protection").unwrap(), ai("all", true));
+        assert_eq!(one("de-ice on").unwrap(), ai("all", true));
+        assert_eq!(one("engine anti-ice on").unwrap(), ai("engine", true));
+        assert_eq!(one("engine anti ice off").unwrap(), ai("engine", false));
+        assert_eq!(one("wing anti-ice on").unwrap(), ai("wing", true));
+        assert_eq!(one("boots on").unwrap(), ai("wing", true));
+        assert_eq!(one("window heat on").unwrap(), ai("window", true));
+        assert_eq!(one("prop heat on").unwrap(), ai("prop", true));
+        assert_eq!(one("pitot heat on").unwrap().0, "set_pitot_heat");
+        assert!(one("carb heat on").is_none_or(|c| c.0 != "set_anti_ice"));
+        assert!(one("anti-ice").is_none(), "no state, no switch");
+    }
+
+    /// #92: the autopilot's own modes on an airliner; "autothrottle on" on
+    /// an airframe without the MD-82's tool is the stock autothrottle.
+    #[test]
+    fn autopilot_mode_words_resolve() {
+        let m = |mode: &str, on: bool| ("ap_mode".to_string(), json!({"mode": mode, "on": on}));
+        let b = "boeing_737_800";
+        assert_eq!(one_on(b, "level change").unwrap(), m("level_change", true));
+        assert_eq!(one_on(b, "FLCH").unwrap(), m("level_change", true));
+        assert_eq!(one_on(b, "level change off").unwrap(), m("level_change", false));
+        assert_eq!(one_on(b, "GPS steering on").unwrap(), m("lnav", true));
+        assert_eq!(one_on(b, "engage LNAV").unwrap(), m("lnav", true));
+        assert_eq!(one_on(b, "autothrottle on").unwrap(), m("autothrust", true));
+        assert_eq!(one_on(b, "autothrottle off").unwrap(), m("autothrust", false));
+        // The MD-82 keeps its own switch.
+        assert_eq!(one_on("md82", "autothrottle on").unwrap().0, "autothrottle");
+        // A flight level is still a flight level.
+        assert_ne!(one_on(b, "climb flight level one two zero").unwrap().0, "ap_mode");
     }
 
     #[test]
