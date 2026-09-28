@@ -556,7 +556,10 @@ async fn hand_back_brakes(xp: &XPlaneClient, valve_set: Option<f64>) -> Option<b
 
 /// [`hand_back_brakes`] against any sim, so the gates and the stop are a
 /// plain `cargo test`. `Some(held)` when it was a ground hand-back.
-async fn hand_back_hold(xp: &dyn crate::xplane::XPlane, valve_set: Option<f64>) -> Option<bool> {
+pub(crate) async fn hand_back_hold(
+    xp: &dyn crate::xplane::XPlane,
+    valve_set: Option<f64>,
+) -> Option<bool> {
     let skipped = |why: &str, kts: Option<f64>| {
         crate::blackbox::record(
             "full_auto",

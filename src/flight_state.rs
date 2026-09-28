@@ -107,6 +107,8 @@ pub(crate) fn stand_down() {
     crate::tools::engine::MIX_MANAGED.store(false, SeqCst);
     crate::tools::engine::LEAN_SEEKING.store(false, SeqCst);
     crate::pushback::ACTIVE.store(false, SeqCst);
+    // A new flight's setup owns the aircraft: the taxi-in only lets go.
+    crate::taxi_in::abort(false);
     // The arrival's hold on the station is a fact about a flight, not about
     // the world: nothing is flying to that destination any more, so the
     // region's ordinary nearest-field handoffs resume.
