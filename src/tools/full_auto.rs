@@ -1110,6 +1110,21 @@ impl FullAuto {
                        "grid_cautions": grid_cautions}),
             );
             if !crate::flightplan::local_terrain_clear(&route, &heights) {
+                // Name the first point that failed, so a refusal can be
+                // judged (LEMG-LEBL was refused with no point, 2026-09-28).
+                let bad = heights
+                    .iter()
+                    .zip(&route.terrain)
+                    .enumerate()
+                    .find(|(_, (h, (_, floor)))| !h.is_finite() || **h > *floor);
+                let n = route.terrain.len();
+                if let Some((i, (h, ((lat, lon), floor)))) = bad {
+                    crate::blackbox::record(
+                        "full_auto",
+                        json!({"event": "local_terrain_blocked", "index": i, "of": n,
+                               "lat": lat, "lon": lon, "ground_ft": h, "floor_ft": floor}),
+                    );
+                }
                 return Err("Terrain blocks the local climb or arrival corridor. Choose another destination or route.".into());
             }
             // Price the authored track, including the final alignment, into

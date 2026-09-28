@@ -570,6 +570,10 @@ pub fn runway_needed_ft(landing_ft: Option<f64>, takeoff_ft: Option<f64>) -> Opt
     landing_ft.or(takeoff_ft).filter(|f| *f > 0.0)
 }
 
+/// The least climb a local route is credited from its first mile: under a
+/// SID's 200 ft/nm minimum gradient, far under any airframe's real climb.
+const LOCAL_CLIMB_FT_PER_NM: f64 = 150.0;
+
 /// A local flight joins an eight-mile final through a sixteen-mile alignment
 /// fix. Cruise and descent remain ordinary procedure legs, with no new laws.
 pub struct LocalRoute {
@@ -727,14 +731,20 @@ pub fn local_route(
                 // Conservative reachable climb along the route; the takeoff
                 // supplies the first 500 feet, before the follower owns any
                 // lateral turn.
-                (origin.elev_ft
+                // Never less than a gentle 150 ft/nm from the start (under a
+                // SID's 200 ft/nm minimum): a flat floor at field elevation
+                // for the first three miles refused LEMG-LEBL on ground 5 ft
+                // above the field a mile out (2026-09-28).
+                ((origin.elev_ft
                     + 500.0
                     + (distance_nm + d * f - 3.0).max(0.0) / (cruise_kts + 30.0)
                         * 60.0
                         * climb_fpm
                         * 0.7)
                     .min(cruise)
-                    - 500.0
+                    - 500.0)
+                    .max(origin.elev_ft + (distance_nm + d * f) * LOCAL_CLIMB_FT_PER_NM)
+                    .min(cruise)
             } else if leg == final_leg {
                 dest.elev_ft + 50.0 + d * (1.0 - f) * 300.0
             } else {
@@ -1328,6 +1338,19 @@ mod tests {
         let mut heights = vec![0.0; route.terrain.len()];
         assert!(local_terrain_clear(&route, &heights));
         assert!(!local_terrain_clear(&route, &heights[..heights.len() - 1]));
+        // Ground a few feet above the field a mile out is under the
+        // route's first climb (LEMG-LEBL: 52.8 ft against a flat 48 ft floor).
+        let (start, _) = route.terrain[0];
+        let mile = route
+            .terrain
+            .iter()
+            .position(|((lat, lon), _)| nav::haversine_nm(start.0, start.1, *lat, *lon) >= 1.0)
+            .unwrap();
+        assert!(mile < 20, "the first mile is at point {mile}");
+        assert!(route.terrain[mile].1 >= airport.elev_ft + 140.0, "{:?}", route.terrain[mile]);
+        heights[mile] = airport.elev_ft + 5.0;
+        assert!(local_terrain_clear(&route, &heights));
+        heights[mile] = 0.0;
         heights[10] = route.terrain[10].1 + 1.0;
         assert!(!local_terrain_clear(&route, &heights));
         heights[10] = f64::NAN;
