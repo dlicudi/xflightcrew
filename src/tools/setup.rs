@@ -839,6 +839,13 @@ pub async fn run_init(
     run
 }
 
+/// Did this init start a new flight? Answered, or written and never
+/// answered (the sim may well have moved us): yes. Refused, or never written
+/// (no baseline, plugin unreachable): the old flight goes on. Pure.
+pub fn new_flight_began(outcome: &InitOutcome) -> bool {
+    matches!(outcome, InitOutcome::Done(0) | InitOutcome::TimedOut)
+}
+
 async fn approach_follow_up(job: ApproachJob) {
     let xp = crate::xplane::XPlaneClient::new(job.base.clone());
     let say = |line: &str| {
@@ -874,6 +881,13 @@ async fn approach_follow_up(job: ApproachJob) {
             job.land.is_some(),
         ),
     };
+    // The flight that ended takes its clearances with it, BEFORE anything
+    // arms: autoland reads the party line on its first pass, and at LEMG
+    // (sortie 1790584266-approach, 2026-09-28) it read the last case's
+    // "cleared to land 12" 1.3 s into a new 10 nm final for 13.
+    if new_flight_began(&run.outcome) {
+        crate::party_line::retire_for_new_flight();
+    }
     // The arm first, the record and the words after: the aircraft is
     // already flying.
     if let AfterInit::Arm { runway, .. } = &next {
@@ -1049,6 +1063,19 @@ mod tests {
             rwy("13", "31", (36.700, -4.510), (36.680, -4.480), 1),
             rwy("12", "30", (36.690, -4.525), (36.672, -4.490), 1),
         ]
+    }
+
+    /// A new flight retires the old one's clearances before the arm (LEMG,
+    /// sortie 1790584266-approach): answered, or written and never
+    /// answered, the sim may have moved us; refused or never written, the
+    /// old flight and its tower go on.
+    #[test]
+    fn a_new_flight_is_one_the_sim_may_have_started() {
+        assert!(new_flight_began(&InitOutcome::Done(0)));
+        assert!(new_flight_began(&InitOutcome::TimedOut));
+        assert!(!new_flight_began(&InitOutcome::Done(3)));
+        assert!(!new_flight_began(&InitOutcome::Unreachable));
+        assert!(!new_flight_began(&InitOutcome::NoBaseline));
     }
 
     #[test]

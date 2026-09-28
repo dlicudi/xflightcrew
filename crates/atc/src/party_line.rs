@@ -494,6 +494,16 @@ pub fn take_pending_station() -> Option<(String, nav::AirportInfo)> {
     lock(&PENDING_STATION).take()
 }
 
+/// A new flight exists (the sim repositioned us for a setup): everything the
+/// world published for the flight that ended is retired, before any loop
+/// reads it, and the old station publishes nothing until the new one is up
+/// ([`crate::station::retire_for_new_flight`]). The crew's one write here,
+/// like the `take_*` consumers: it ends a flight, it clears nothing a
+/// controller of THIS flight said.
+pub fn retire_for_new_flight() {
+    crate::station::retire_for_new_flight()
+}
+
 /// Consume the released-takeoff-clearance flag. Main loop only.
 pub fn take_pending_takeoff_clearance() -> bool {
     std::mem::take(&mut *lock(&PENDING_TAKEOFF_CLEARANCE))

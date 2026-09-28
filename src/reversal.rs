@@ -194,6 +194,41 @@ pub fn needed(
     heading_diff(arrival, rwy.course_deg).abs() > ARRIVAL_MAX_OFF_DEG
 }
 
+/// Inside this of the centreline an inbound leg is ON it.
+const PATH_JOIN_XTK_NM: f64 = 0.2;
+/// ...and tracking within this of the runway course.
+const PATH_JOIN_TRACK_DEG: f64 = 30.0;
+/// The glidepath has come down to the aircraft: no more than this below it.
+const PATH_JOIN_BELOW_FT: f64 = 50.0;
+/// ...and no higher above it than the ordinary guidance flies straight down
+/// (its `CAPTURE_ABOVE_FT`; above that it would aim at a join point behind).
+const PATH_JOIN_ABOVE_FT: f64 = 500.0;
+
+/// The inbound leg has JOINED the approach: on the centreline, pointing down
+/// it, on the approach side, with the glidepath come down to it. The pattern
+/// is done there, and the ordinary guidance takes the descent. Holding the
+/// platform past this point is how an inbound leg overflies the field.
+/// LEMG 12, 2026-09-28 (sortie 1790583663-approach): the pattern's inbound
+/// leg held its 2,921 ft platform along 12's centreline from 12.4 nm, crossed
+/// the glidepath at 8.9 nm (2,942 ft against 2,938, 58 m off), and flew on
+/// level because only a Final (inside 5.5 nm, within 500 ft of the path)
+/// could end it; at 5.5 nm it was 1,060 ft high, never a final, and went
+/// over the threshold at 2,900 ft ten minutes after the retarget. Pure.
+pub fn path_joined(
+    rev: &Reversal,
+    along_nm: f64,
+    xtk_nm: f64,
+    track_deg: f64,
+    course_deg: f64,
+    above_path_ft: f64,
+) -> bool {
+    rev.leg == Leg::Inbound
+        && along_nm > 0.0
+        && xtk_nm.abs() <= PATH_JOIN_XTK_NM
+        && heading_diff(track_deg, course_deg).abs() <= PATH_JOIN_TRACK_DEG
+        && (-PATH_JOIN_BELOW_FT..=PATH_JOIN_ABOVE_FT).contains(&above_path_ft)
+}
+
 /// A point `along_nm` out on the approach side and `lateral_nm` to the right
 /// of the inbound course.
 pub fn pattern_point(rwy: &Runway, along_nm: f64, lateral_nm: f64) -> (f64, f64) {
@@ -333,6 +368,34 @@ pub fn stabilisable(xtk_nm: f64, along_nm: f64, gs_kts: f64) -> bool {
 mod tests {
     use super::*;
     use crate::autoland::{along_track_nm, cross_track_nm};
+
+    /// LEMG 12, 2026-09-28 (sortie 1790583663-approach): the inbound leg at
+    /// its 2,921 ft platform, recorded. At 9.9 nm the path is still 305 ft
+    /// above: keep the platform. At 8.9 nm it has come down to us (2,942 ft
+    /// against 2,938, 58 m off, tracking 116.8 for a 117 course): the
+    /// pattern is done. The old rule held the platform to the threshold.
+    #[test]
+    fn an_inbound_leg_the_glidepath_reaches_is_an_approach() {
+        let rev = Reversal {
+            side: -1.0,
+            leg: Leg::Inbound,
+            platform_ft: 2921.9,
+            high: false,
+        };
+        let joined = |along: f64, xtk_m: f64, trk: f64, above: f64| {
+            path_joined(&rev, along, xtk_m / M_PER_NM, trk, 117.0, above)
+        };
+        assert!(!joined(9.9, 95.9, 115.7, 2944.7 - 3249.0), "still under the path");
+        assert!(joined(8.93, 58.1, 116.8, 2942.3 - 2938.1), "the path came down to it");
+        assert!(joined(7.97, 49.4, 117.6, 2900.7 - 2635.7), "265 ft high: flown down");
+        // Not on the line, not pointing down it, or too high: still a pattern.
+        assert!(!joined(8.93, 800.0, 116.8, 4.0));
+        assert!(!joined(8.93, 58.1, 160.0, 4.0));
+        assert!(!joined(7.07, 48.8, 117.4, 2863.8 - 2349.0));
+        // Only the inbound leg, and only short of the field.
+        assert!(!path_joined(&Reversal { leg: Leg::Base, ..rev }, 8.93, 0.03, 116.8, 117.0, 4.0));
+        assert!(!joined(-0.2, 48.0, 113.0, 4.0));
+    }
 
     fn egte_08() -> Runway {
         Runway {

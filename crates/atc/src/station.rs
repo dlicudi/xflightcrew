@@ -310,6 +310,8 @@ impl Station {
     pub fn install(&self) {
         // A new station starts in reach; the next monitor tick judges it.
         OUT_OF_REACH.store(false, std::sync::atomic::Ordering::Relaxed);
+        // ...and is the new flight's station: its replies publish again.
+        NEW_FLIGHT_PENDING.store(false, std::sync::atomic::Ordering::SeqCst);
         *ACTIVE_FIELD.lock().unwrap_or_else(|e| e.into_inner()) = self
             .apt
             .position()
@@ -392,6 +394,7 @@ impl Station {
     /// the app leaves an ATC-capable mode; the region index and background
     /// caches (taxi net, ILS facts) survive so re-enabling is cheap.
     pub fn uninstall() {
+        NEW_FLIGHT_PENDING.store(false, std::sync::atomic::Ordering::SeqCst);
         *SURFACE_WIND.lock().unwrap_or_else(|e| e.into_inner()) = None;
         *ACTIVE_FIELD.lock().unwrap_or_else(|e| e.into_inner()) = None;
         *CONTROLLER_FREQS.lock().unwrap_or_else(|e| e.into_inner()) = Vec::new();
@@ -789,13 +792,18 @@ impl Station {
         // two-way contact has happened, and this is what the pilot is (and
         // isn't) cleared to do. Same reply-path-owns-its-static pattern as
         // HANDOFF and SQUAWK_WATCH.
-        *CLEARANCE.lock().unwrap_or_else(|e| e.into_inner()) = Some(ClearanceSnap {
-            state: self.twr.state,
-            callsign: ctx.callsign.clone(),
-            runway_ident: self.runway_in_use.clone().unwrap_or_default(),
-            pending_readback: self.twr.suggested_readback(&ctx.callsign),
-            holds_runway: self.twr.holds_runway(),
-        });
+        // ...unless a NEW flight has been set up and this station is the
+        // old one, still answering until the main loop installs the new
+        // (`retire_for_new_flight`): its worksheet is the ended flight's.
+        if !new_flight_pending() {
+            publish_clearance(ClearanceSnap {
+                state: self.twr.state,
+                callsign: ctx.callsign.clone(),
+                runway_ident: self.runway_in_use.clone().unwrap_or_default(),
+                pending_readback: self.twr.suggested_readback(&ctx.callsign),
+                holds_runway: self.twr.holds_runway(),
+            });
+        }
         // A fresh taxi clearance publishes its route for the off-route
         // compliance watch (and clears any stale one when route-less).
         if service == Service::Tower
@@ -1635,12 +1643,32 @@ impl Station {
                 let stream_elsewhere = arrival_end.is_some_and(|end| end != ident);
                 let hw = nav::headwind_for(&self.apt.runways, &ident, wind_from, wind_kts);
                 let best = nav::best_runway_for_wind(&self.apt.runways, wind_from, wind_kts);
-                let wind_indifferent =
-                    stated_runway_stands(&self.apt.runways, &ident, hw, best, wind_from, wind_kts);
+                let wind_indifferent = stated_runway_stands(
+                    &self.apt.runways,
+                    &ident,
+                    hw,
+                    best.clone(),
+                    wind_from,
+                    wind_kts,
+                );
                 if !stream_elsewhere && wind_indifferent {
                     self.runway_in_use = Some(ident.clone());
                     return ident;
                 }
+                // A refused stated runway names its reason on file: the
+                // stream's end or the wind's numbers. LEMG 13 into 060 at 6
+                // (sortie 1790583663-approach) was refused with the wind
+                // arithmetic saying it stands (headwind 2.0 against 12's 3.3,
+                // crosswind 5.7 against 5.0), and nothing recorded why.
+                sim::blackbox::record(
+                    "atc",
+                    serde_json::json!({"event": "stated_runway_refused", "stated": ident,
+                        "stream_end": arrival_end, "headwind_kts": hw,
+                        "best": best.as_ref().map(|b| b.0.clone()),
+                        "best_headwind_kts": best.as_ref().map(|b| b.2),
+                        "wind_from": wind_from, "wind_kts": wind_kts,
+                        "wind_indifferent": wind_indifferent}),
+                );
             }
         }
         if wind_kts >= CALM_WIND_KTS || self.runway_in_use.is_none() {
@@ -3317,6 +3345,54 @@ pub fn arm_station_for_freq(com1_khz: i64, lat: f64, lon: f64, alt_msl_ft: f64, 
             Some((a.icao.clone(), a.apt.clone()));
         *LAST_REGION_SWITCH.lock().unwrap_or_else(|e| e.into_inner()) = Some(now);
     }
+}
+
+/// A new flight has been set up and the station that knew the old one has
+/// not yet been replaced by the main loop ([`retire_for_new_flight`] sets it,
+/// `Station::install` and `Station::uninstall` clear it). While it stands the
+/// old station's replies publish no clearance picture.
+static NEW_FLIGHT_PENDING: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+pub(crate) fn new_flight_pending() -> bool {
+    NEW_FLIGHT_PENDING.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// The reply path's one write of the clearance picture.
+fn publish_clearance(snap: ClearanceSnap) {
+    *CLEARANCE.lock().unwrap_or_else(|e| e.into_inner()) = Some(snap);
+}
+
+/// THE FLIGHT THAT ENDED TAKES ITS CLEARANCES WITH IT. Called by the crew the
+/// moment a new flight exists (the sim has repositioned us for "put us on a
+/// ten mile final"), BEFORE anything flies it: the landing clearance, the
+/// approach handoff, the vectors, the held release, the taxi route, the IFR
+/// clearance and code and every pending flag on the party line belonged to the
+/// last flight. LEMG, 2026-09-28 (sortie 1790584266-approach): the previous
+/// case had been cleared to land on 12; the reposition to a 10 nm final for
+/// 13 armed autoland 1.3 s later, it read "cleared to land 12" off the party
+/// line before the crew's new final call went out, and turned the 737 toward
+/// a centreline 3.6 km away. The station for the field is rebuilt by
+/// [`arm_new_flight`] a few seconds later; until the main loop installs it the
+/// old station, still answering, publishes nothing.
+pub fn retire_for_new_flight() {
+    NEW_FLIGHT_PENDING.store(true, std::sync::atomic::Ordering::SeqCst);
+    *CLEARANCE.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    *LANDING_HANDOFF.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    *VECTORS.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    *TAKEOFF_HOLD.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    *TAXI_ROUTE.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    *TAXI_TO_STAND.lock().unwrap_or_else(|e| e.into_inner()) = false;
+    *LINE_UP_CONDITION.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    *DEPARTURE_HANDOFF.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    *ASSIGNED_SQUAWK.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    *IFR_CLEARANCE.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    *IFR_FLIGHT.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    *PENDING_TAKEOFF_CLEARANCE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = false;
+    *PENDING_LINE_UP.lock().unwrap_or_else(|e| e.into_inner()) = false;
+    *PENDING_GO_AROUND.lock().unwrap_or_else(|e| e.into_inner()) = false;
 }
 
 /// A NEW FLIGHT at `icao` (the crew's "put us on a ten mile final", which
@@ -9263,6 +9339,62 @@ mod tests {
         *LAST_REGION_SWITCH.lock().unwrap() = None;
     }
 
+    /// LEMG, 2026-09-28 (sortie 1790584266-approach): the previous case was
+    /// cleared to land on 12; the reposition to a 10 nm final for 13 armed
+    /// autoland 1.3 s later and it read "cleared to land 12" off the party
+    /// line before the crew's new final call went out (event
+    /// `runway_from_clearance`, planned 13, cleared 12, xtk -3,638 m on 12's
+    /// line). A new flight retires the old one's clearances before anything
+    /// reads them, and the old station, still answering until the new one is
+    /// installed, publishes nothing.
+    #[test]
+    fn a_new_flight_retires_the_last_flights_landing_clearance() {
+        let _guard = SIDE_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        *CLEARANCE.lock().unwrap() = Some(ClearanceSnap {
+            state: tower::State::ClearedToLand,
+            callsign: "November eight one six November November".into(),
+            runway_ident: "12".into(),
+            pending_readback: None,
+            holds_runway: false,
+        });
+        *LANDING_HANDOFF.lock().unwrap() = Some("12".into());
+        *PENDING_GO_AROUND.lock().unwrap() = true;
+        assert_eq!(crate::party_line::clearance_runway().as_deref(), Some("12"));
+        crate::party_line::retire_for_new_flight();
+        assert_eq!(crate::party_line::clearance_state(), None);
+        assert_eq!(crate::party_line::clearance_runway(), None);
+        assert_eq!(crate::party_line::readback_owed(), None);
+        assert_eq!(crate::party_line::landing_handoff_runway(), None);
+        assert!(!crate::party_line::take_pending_go_around());
+        // The old station answers a call before the swap: nothing published.
+        let wx = Wx { wind_from_deg: 90.0, wind_kts: 8.0 };
+        let mut old = lxgb();
+        let ctx = old.make_ctx(
+            wx,
+            "QNH one zero one seven".into(),
+            "November one seven two Sierra Papa".into(),
+            false,
+            false,
+            None,
+            false,
+            None,
+        );
+        old.respond("", Service::Tower, tower::Intent::ReportFinal, &ctx, wx);
+        assert!(
+            CLEARANCE.lock().unwrap().is_none(),
+            "the old station's word is not this flight's"
+        );
+        // The new flight's station is up: its replies are the clearance.
+        let mut new = lxgb();
+        new.install();
+        new.respond("", Service::Tower, tower::Intent::ReportFinal, &ctx, wx);
+        assert_eq!(
+            crate::party_line::clearance_state(),
+            Some(tower::State::ClearedToLand)
+        );
+        Station::uninstall();
+    }
+
     /// LFLL-EGLL, 2026-09-17. Inbound to Heathrow with the inbound call made
     /// and answered, the region's tick found London City eight miles off the
     /// nose against Heathrow's fifteen — nearer AND service-weighted — and
@@ -10153,6 +10285,23 @@ mod tests {
         st.apt.runways = runways.clone();
         st.note_stated_runway("final runway one three", tower::Intent::ReportFinal);
         assert_ne!(st.pick_runway(350.0, 10.0), "13");
+        // Sortie 1790583663-approach: "10 mile final runway one three" into
+        // 060 at 6 earned "negative, runway one two". The wind does not argue
+        // (13's headwind 2.0 against 12's 3.3, inside the margin), so 13
+        // stands on the wind alone; the only way to that "negative" is an
+        // arrival stream the traffic picture put on another end.
+        let hw13 = nav::headwind_for(&runways, "13", 60.0, 6.0).unwrap();
+        let (best, _, best_hw) = nav::best_runway_for_wind(&runways, 60.0, 6.0).unwrap();
+        assert_eq!(best, "12");
+        assert!(best_hw - hw13 <= RUNWAY_SWAP_MARGIN_KTS, "{best_hw} vs {hw13}");
+        let mut st = lxgb();
+        st.apt.runways = runways.clone();
+        st.note_stated_runway("final runway one three", tower::Intent::ReportFinal);
+        assert_eq!(st.pick_runway_with(60.0, 6.0, None), "13");
+        let mut st = lxgb();
+        st.apt.runways = runways.clone();
+        st.note_stated_runway("final runway one three", tower::Intent::ReportFinal);
+        assert_eq!(st.pick_runway_with(60.0, 6.0, Some("12")), "12");
         // A crossing strip with a tailwind in limits but a far worse
         // crosswind does not stand (LXGB-like 09/27 plus a synthetic 18/36,
         // wind 360 at 12: 09 has no tailwind but a 12 kt crosswind).
