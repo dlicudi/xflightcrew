@@ -37,7 +37,9 @@ pub struct FlarePowerProfile {
     /// under the approach speed (kt; absent: `autoland::RETARD_SLOW_KTS`).
     /// The thrust is what holds a slow flare's speed, and a knot the retard
     /// takes comes back as sink at the wheels (the 737's plant: 63 fpm a
-    /// knot).
+    /// knot). It defers only a retard not yet begun on a flare still
+    /// sinking: a float takes the thrust off whatever the speed
+    /// (`autoland::RETARD_FLOAT_FPM`; EGBB 15, 2026-09-28, issue #146).
     #[serde(default)]
     pub retard_slow_kts: Option<f64>,
     /// The TIME key: below the retard height the lever starts off only once
@@ -71,26 +73,31 @@ pub struct ArrestLeadProfile {
 /// The cabin's air: how THIS airframe's bleed (pressurisation) and crew
 /// oxygen are switched and read. Declared, never guessed: the SF50's bleed is
 /// an xlua slider behind `laminar/SF50/fresh_air_on` (the stock pack dataref
-/// is its output), and its oxygen button is a toggle command in front of a
-/// stock valve that can sit shut behind a set button. EDLP-LOWI
-/// (2026-09-24): full auto resumed with the engine already running, the bleed
-/// was never switched, the cabin followed the aircraft to 24,000 ft and the
-/// pilot blacked out; the oxygen button read on and the valve was shut.
+/// is its output), its oxygen master is a toggle command in front of the
+/// SUPPLY (`demand_flow_setting`), and the crew MASKS are `o2_valve_on`
+/// (worn: the breathing sound plays while it reads 1, `sf50_oxygen.lua`).
+/// EDLP-LOWI (2026-09-24): full auto resumed with the engine already running,
+/// the bleed was never switched, the cabin followed the aircraft to 24,000 ft
+/// and the pilot blacked out; the master read on and the masks were off.
+/// The masks were then worn for every mission (#159): now only in the
+/// cabin-altitude warning band (`tools::cabin_air::MaskWatch`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CabinAirProfile {
     /// Fired to put the bleed ON.
     pub bleed_on_command: String,
     /// Reads at or above 0.5 with the bleed on.
     pub bleed_read: String,
-    /// The crew oxygen: a TOGGLE (read first, fired only when off).
+    /// The crew oxygen SUPPLY (the master): a TOGGLE (read first, fired only
+    /// when off). On for every mission.
     #[serde(default)]
     pub oxygen_toggle: Option<String>,
-    /// Reads at or above 1 with the oxygen on.
+    /// Reads at or above 1 with the supply on.
     #[serde(default)]
     pub oxygen_read: Option<String>,
-    /// A valve behind the button, written 1.
+    /// The crew MASKS, 1 = worn. Never the mission's: donned only in the
+    /// cabin-altitude warning band and taken off below it.
     #[serde(default)]
-    pub oxygen_valve: Option<String>,
+    pub oxygen_masks: Option<String>,
 }
 
 /// The altimeter knobs' own fast paths (`tools::instruments::set_altimeter`,

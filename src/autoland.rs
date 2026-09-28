@@ -912,6 +912,65 @@ fn go_around_call_due(
     !w.touched && radio_ft - w.low_ft >= GO_AROUND_RISE_FT && vvi_fpm.is_none_or(|v| v > 0.0)
 }
 
+/// Radio height at which a final the tower is working but has NOT cleared
+/// asks again: "final runway one five, request landing clearance" (a final
+/// report, which the tower judges afresh against the strip).
+pub const CLEARANCE_QUERY_FT: f64 = 1000.0;
+/// Radio height at which a final still without its landing clearance goes
+/// around: a crew never lands uncleared (EGKK-EGBB 15, sortie
+/// 1790601822-full_auto, 2026-09-28: "expect late landing clearance" at
+/// 7 nm, then nothing, and autoland landed; "you landed on runway one five
+/// without clearance"). Above the flare by far: the order is the gate path's
+/// (`GoAroundLatch::order`), flown from wherever we are.
+pub const UNCLEARED_GO_AROUND_FT: f64 = 300.0;
+
+/// What the crew owes a final the tower is working and has not cleared.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnclearedStep {
+    /// Ask again, once per approach.
+    Ask,
+    /// Go around.
+    GoAround,
+}
+
+/// The crew's watch on its own landing clearance. `working` is the tower's
+/// book saying it has us in sequence and has not cleared us (`Inbound`: the
+/// "continue approach, expect late landing clearance" answer, or a final
+/// report not yet answered); without a tower working us (an uncontrolled
+/// field, no two-way contact) there is nothing to be cleared by and the
+/// watch is silent. Pure.
+#[derive(Debug, Default)]
+pub struct UnclearedWatch {
+    asked: bool,
+}
+
+impl UnclearedWatch {
+    pub fn step(
+        &mut self,
+        working: bool,
+        radio_ft: f64,
+        on_ground: bool,
+        missed: bool,
+    ) -> Option<UnclearedStep> {
+        if missed {
+            // The next approach asks again.
+            self.asked = false;
+            return None;
+        }
+        if !working || on_ground || !radio_ft.is_finite() {
+            return None;
+        }
+        if radio_ft <= UNCLEARED_GO_AROUND_FT {
+            return Some(UnclearedStep::GoAround);
+        }
+        if radio_ft <= CLEARANCE_QUERY_FT && !self.asked {
+            self.asked = true;
+            return Some(UnclearedStep::Ask);
+        }
+        None
+    }
+}
+
 /// Cancel an active autoland; returns whether one was flying.
 pub fn abort() -> bool {
     ABORT.store(true, Ordering::SeqCst);
@@ -1258,6 +1317,8 @@ pub fn run_autoland_scoped(
             // flag: sharing that flag, the main loop's FSM sync consumed every
             // order before this loop's tick saw it (LEMG 31, 2026-09-28).
             let mut orders = crate::party_line::GoAroundOrders::arm();
+            // The crew's own watch on the landing clearance (#155).
+            let mut uncleared = UnclearedWatch::default();
             // The final report owed on a SECOND approach. The circuit or the
             // arrival makes the first one, which is what earns the landing
             // clearance; a missed approach then flies away, and until this
@@ -1373,12 +1434,20 @@ pub fn run_autoland_scoped(
                 }
                 // One read burst — nine sequential HTTP awaits is the slow-tick
                 // disease that gave the takeoff its slew weave (sortie four).
-                let (lat_r, lon_r, elev_r, agl_r, gs_r, var_r, ias_r, psi_r, hpath_r, ground_r, phi_r) = tokio::join!(
-                    xp.get_float(LAT), xp.get_float(LON), xp.get_float(ELEV_M),
-                    xp.get_float(AGL_M), xp.get_float(GS_MS), xp.get_float(MAG_VAR),
-                    xp.get_float(IAS), xp.get_float(PSI_TRUE), xp.get_float(HPATH_TRUE),
+                // Position, height, groundspeed and heading as ONE frame saw
+                // them (#157): read separately, latitude and longitude paired
+                // two frames, metres of cross-track for a tick at speed.
+                let (pos, var_r, ias_r, hpath_r, ground_r, phi_r) = tokio::join!(
+                    sim::position::read(&xp), xp.get_float(MAG_VAR),
+                    xp.get_float(IAS), xp.get_float(HPATH_TRUE),
                     xp.get_float(ON_GROUND), xp.get_float(PHI_TRUE),
                 );
+                let (lat_r, lon_r) = sim::position::lat_lon(&pos);
+                let elev_r = sim::position::field(&pos, |p| p.elev_m);
+                let agl_r = sim::position::field(&pos, |p| p.agl_m);
+                let gs_r = sim::position::field(&pos, |p| p.gs_ms);
+                let psi_r = sim::position::field(&pos, |p| p.psi_true_deg);
+                let pos_source = sim::position::source_word(&pos);
                 let (Ok(lat), Ok(lon), Ok(elev_m), Ok(agl_m), Ok(gs_ms), Ok(var), Ok(ias), Ok(on_ground)) =
                     (lat_r, lon_r, elev_r, agl_r, gs_r, var_r, ias_r, ground_r)
                 else { tokio::time::sleep(std::time::Duration::from_millis(300)).await; continue };
@@ -1586,6 +1655,7 @@ pub fn run_autoland_scoped(
                             "event": "rollout", "gs": gs_kts, "xtk_m": xtk_m,
                             "xtk_rate": xtk_rate, "err": err, "steer": steer,
                             "trim": roll_law.trim(), "psi": psi, "dt": roll_dt,
+                            "pos": pos_source,
                         }),
                     );
                     let thr_dref = throttle_dref();
@@ -1716,6 +1786,51 @@ pub fn run_autoland_scoped(
                         serde_json::json!({"event": "ordered_go_around", "radio": radio_ft,
                                            "dist": raw.dist_nm}),
                     );
+                }
+                // A final the tower is working but has not cleared: ask
+                // again at 1,000 ft, go around at 300 (`UnclearedWatch`).
+                // The tower's hold is judged by the monitor on its own; this
+                // is the crew never landing uncleared (#155).
+                match uncleared.step(
+                    crate::party_line::clearance_state() == Some(crate::tower::State::Inbound),
+                    radio_ft,
+                    on_ground > 0.5,
+                    go_around.active(),
+                ) {
+                    Some(UnclearedStep::Ask) => {
+                        if going_around_callsign.is_none() {
+                            going_around_callsign = Some(crate::circuit::crew_callsign(&xp).await);
+                        }
+                        let cs = going_around_callsign.clone().flatten();
+                        crate::circuit::transmit(crate::circuit::radio_call(
+                            &cs,
+                            &format!(
+                                "final runway {}, request landing clearance",
+                                crate::circuit::spell_runway(&rwy.id)
+                            ),
+                        ));
+                        crate::blackbox::record(
+                            "autoland",
+                            serde_json::json!({"event": "landing_clearance_asked", "rwy": rwy.id,
+                                               "radio": radio_ft, "dist": raw.dist_nm,
+                                               "held": crate::party_line::landing_hold_armed()}),
+                        );
+                    }
+                    Some(UnclearedStep::GoAround) => {
+                        if go_around.order(on_ground > 0.5) {
+                            crate::blackbox::record(
+                                "autoland",
+                                serde_json::json!({"event": "uncleared_go_around", "rwy": rwy.id,
+                                                   "radio": radio_ft, "dist": raw.dist_nm,
+                                                   "held": crate::party_line::landing_hold_armed()}),
+                            );
+                            announce(
+                                "No landing clearance. Going around.".into(),
+                                Priority::Caution,
+                            );
+                        }
+                    }
+                    None => {}
                 }
                 // Unstabilised at the thousand-foot gate is a go-around, not a
                 // quiet re-intercept: the latch only arms itself below the
@@ -2491,6 +2606,9 @@ pub fn run_autoland_scoped(
                     "ground": on_ground > 0.5,
                     "phase": format!("{:?}", g.phase), "ga": ga, "crab": crab, "crab_raw": crab_raw,
                     "trim": trim, "xtk_m": xtk_now * M_PER_NM,
+                    // "plugin": one frame's position; "split": an older
+                    // plugin's separate reads (#157).
+                    "pos": pos_source,
                     "flare_elev": flare_elev, "flare_ail": flare_ail, "hands": arrest_hands,
                     // The autopilot not yet confirmed and read off: the
                     // elevator above is the level hold's (`ApEngage`).
@@ -2779,6 +2897,7 @@ pub fn run_autoland_scoped(
                 if g.phase != ApproachPhase::Flare || missed.is_some() {
                     flare_power.reset();
                 }
+                let mut ballooned = false;
                 let thr = if missed == Some(MissedStage::Climb) {
                     // The balked landing itself is firewall, not a governor
                     // holding approach speed — the LXGB miss flew its last 20
@@ -2804,6 +2923,7 @@ pub fn run_autoland_scoped(
                 {
                     // A balloon at idle only bleeds the speed the settle
                     // needs: hold the approach's own thrust until it sinks.
+                    ballooned = true;
                     Some(hold)
                 } else if g.phase == ApproachPhase::Flare {
                     match cfg.flare_power {
@@ -2888,9 +3008,15 @@ pub fn run_autoland_scoped(
                     "throttle_after": throttle_after, "write_ok": throttle_written,
                     "progressive_flare": cfg.flare_power.is_some(), "dt": dt_s,
                     // Which key moved the flare's lever this tick (issue
-                    // #76): entry, height, slow or timed.
+                    // #76): entry, height, time, slow, float or timed; a
+                    // climb's approach thrust is "balloon" (issue #146: the
+                    // last key's word hid it).
                     "retard": (g.phase == ApproachPhase::Flare)
-                        .then(|| flare_power.last_key.map(RetardKey::word))
+                        .then(|| if ballooned {
+                            Some("balloon")
+                        } else {
+                            flare_power.last_key.map(RetardKey::word)
+                        })
                         .flatten(),
                     "vvi": vvi, "radio": radio_ft, "ias": ias,
                 }));
@@ -4028,6 +4154,27 @@ const RETARD_SLOW_KTS: f64 = 5.0;
 /// Time to the wheels is taken at no less than this sink (fpm): a float is
 /// not an infinite time, it is a slow retard.
 const RETARD_SINK_FLOOR_FPM: f64 = 100.0;
+/// A flare sinking less than this (fpm) is FLOATING: the arrest is done and
+/// the thrust is what holds it up, so the retard starts, whatever the height
+/// and the speed. EGBB 15 (737, 2026-09-28, sortie 1790601822): levelled at
+/// 22.7 ft on 0.30 of lever, held by the height key over 20 ft, then by the
+/// time key (a float is 13 s from the wheels), then by the speed key once
+/// the float had bled 7 kt; the lever never moved and the float ran 4 s.
+pub const RETARD_FLOAT_FPM: f64 = 100.0;
+/// ...or will be, this many seconds ahead on the sink's trend: the float is
+/// met where the arrest is heading, not where it arrives. Thrust acts through
+/// the speed and the column through the 737's 1.5 s dead time, so a retard
+/// begun at the float itself is late: at EGBB 15 the sink came from -300 to
+/// -111 in 2.1 s. Replayed through that flare's fitted plant (6,300 fpm per
+/// unit, 1.7 s) and its air, a lead of 1 s left 3.6 s of float, 1.5 s none.
+pub const RETARD_FLOAT_LEAD_S: f64 = 1.5;
+/// The sink's trend for the float ahead is smoothed over this, seconds.
+const RETARD_TREND_TAU_S: f64 = 0.5;
+/// A flare is CLIMBING (a balloon) only past this, fpm. A near-level float
+/// reads a few fpm either side of zero (EGBB 15: -2, +1, +2, 0 at 22.9 ft),
+/// and +1 is not a climb: it eased the held column 0.28 to 0.20 and would
+/// put the approach thrust back on a lever the float is taking off.
+pub const BALLOON_CLIMB_FPM: f64 = 25.0;
 
 /// Why the retard did what it did this tick (the `power` tick's `retard`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -4038,8 +4185,13 @@ pub enum RetardKey {
     Height,
     /// More time to the wheels than `retard_at_s`.
     Time,
-    /// Slower than the approach speed less the margin: the thrust stays.
+    /// Slower than the approach speed less the margin, the retard not yet
+    /// begun and the aircraft still sinking: the thrust stays.
     Slow,
+    /// Floating (sink under [`RETARD_FLOAT_FPM`], now or
+    /// [`RETARD_FLOAT_LEAD_S`] ahead on its trend): walking off at the
+    /// airframe's quickest retard, at any height and any speed.
+    Float,
     /// Walking to idle, timed to the wheels.
     Timed,
 }
@@ -4051,6 +4203,7 @@ impl RetardKey {
             RetardKey::Height => "height",
             RetardKey::Time => "time",
             RetardKey::Slow => "slow",
+            RetardKey::Float => "float",
             RetardKey::Timed => "timed",
         }
     }
@@ -4059,12 +4212,17 @@ impl RetardKey {
 /// THE FLARE RETARD, keyed on what it is for: HEIGHT (nothing above the
 /// retard height), TIME to the wheels (the lever reaches idle as they
 /// arrive: the rate is what is left over the seconds left, radio over
-/// sink) and SPEED (a flare slower than the approach speed less
-/// [`RETARD_SLOW_KTS`] keeps its thrust). Never on the sink itself: that is
-/// the sink the arrest is removing, so the old law held the lever while the
-/// arrest worked and let it go in the float the arrest had made. It "fired
-/// latest exactly when it should already be finished" (EGLF 06 2026-09-22;
-/// LEMG 13 2026-09-26 and 2026-09-28; issue #76).
+/// sink), the FLOAT (an arrested sink held up by thrust, or one the trend
+/// will arrest within [`RETARD_FLOAT_LEAD_S`]: off it comes at any height,
+/// at the airframe's quickest) and SPEED (a flare slower than the approach speed less
+/// [`RETARD_SLOW_KTS`] may DEFER the retard while it is still sinking; it
+/// never holds power in a float and never stops a retard that has begun).
+/// Never on the sink the arrest is removing: the old law held the lever
+/// while the arrest worked and let it go in the float the arrest had made.
+/// It "fired latest exactly when it should already be finished" (EGLF 06
+/// 2026-09-22; LEMG 13 2026-09-26 and 2026-09-28; issue #76). The float is
+/// the other half: height, time and speed each held 0.30 through a 4 s
+/// float at 22.7 ft (EGBB 15, 2026-09-28; issue #146).
 ///
 /// Per approach: a go-around resets it, so a second flare starts from its
 /// own power. Never adds power or impersonates an airspeed governor in the
@@ -4073,8 +4231,15 @@ impl RetardKey {
 struct FlarePower {
     last_command: Option<f64>,
     last_key: Option<RetardKey>,
-    /// The time to the wheels has come inside `retard_at_s` (latched).
+    /// The last sink read and its smoothed rate of change (fpm per second,
+    /// positive = easing), for the float ahead.
+    prev_vvi: Option<f64>,
+    trend_fpm_s: f64,
+    /// The time to the wheels has come inside `retard_at_s`, or the flare
+    /// has floated (latched).
     due: bool,
+    /// The lever has started off (latched): the speed key no longer holds.
+    begun: bool,
 }
 
 impl FlarePower {
@@ -4118,6 +4283,14 @@ impl FlarePower {
             (Some(v), Some(a)) if v.is_finite() && a.is_finite() => v < a - slow_kts,
             _ => false,
         };
+        // The sink's trend, smoothed over RETARD_TREND_TAU_S: a float the
+        // arrest will reach a lever's lag from now is a float now.
+        if let Some(p) = self.prev_vvi {
+            let raw = (vvi - p) / dt;
+            self.trend_fpm_s += (raw - self.trend_fpm_s) * (dt / RETARD_TREND_TAU_S).min(1.0);
+        }
+        self.prev_vvi = Some(vvi);
+        let floating = vvi + self.trend_fpm_s.max(0.0) * RETARD_FLOAT_LEAD_S > -RETARD_FLOAT_FPM;
         let above = cfg
             .retard_below_ft
             .filter(|h| h.is_finite() && *h > 0.0)
@@ -4130,34 +4303,46 @@ impl FlarePower {
             }
             _ => false,
         };
-        self.due |= !above
-            && (fast
-                || cfg
-                    .retard_at_s
-                    .filter(|s| s.is_finite() && *s > 0.0)
-                    .is_none_or(|s| to_touch_s <= s));
+        self.due |= floating
+            || (!above
+                && (fast
+                    || cfg
+                        .retard_at_s
+                        .filter(|s| s.is_finite() && *s > 0.0)
+                        .is_none_or(|s| to_touch_s <= s)));
         let key = if self.last_command.is_none() {
             RetardKey::Entry
-        } else if above {
-            RetardKey::Height
+        } else if floating {
+            RetardKey::Float
         } else if !self.due {
-            RetardKey::Time
-        } else if slow {
+            if above {
+                RetardKey::Height
+            } else {
+                RetardKey::Time
+            }
+        } else if slow && !self.begun {
             RetardKey::Slow
         } else {
             RetardKey::Timed
         };
-        let next = match key {
-            RetardKey::Timed => {
-                let fastest = cfg
-                    .retard_max_per_s
-                    .filter(|r| r.is_finite() && *r > 0.0)
-                    .unwrap_or(cfg.reduction_per_second)
-                    .max(RETARD_MIN_PER_S);
-                let rate = (current / to_touch_s).clamp(RETARD_MIN_PER_S, fastest);
+        let fastest = cfg
+            .retard_max_per_s
+            .filter(|r| r.is_finite() && *r > 0.0)
+            .unwrap_or(cfg.reduction_per_second)
+            .max(RETARD_MIN_PER_S);
+        let rate = match key {
+            // A float has no time to the wheels: the thrust holding it up
+            // is what comes off, as quickly as the airframe allows.
+            RetardKey::Float => Some(fastest),
+            RetardKey::Timed => Some((current / to_touch_s).clamp(RETARD_MIN_PER_S, fastest)),
+            _ => None,
+        };
+        let next = match rate {
+            Some(rate) => {
+                self.begun = true;
                 (current - rate * dt.min(1.0)).max(0.0)
             }
-            _ => current,
+            None => current,
         };
         self.last_command = Some(next);
         self.last_key = Some(key);
@@ -4165,9 +4350,10 @@ impl FlarePower {
     }
 }
 
-/// The lever in a flare that is CLIMBING: the approach's own thrust, never
-/// more, while the vertical speed is above zero; `None` otherwise (the flare's
-/// usual idle or progressive law). Pure.
+/// The lever in a flare that is CLIMBING (past [`BALLOON_CLIMB_FPM`]): the
+/// approach's own thrust, never more; `None` otherwise (the flare's usual
+/// idle or progressive law). A near-level float is not a climb: its thrust
+/// is the retard's to take off. Pure.
 /// `above_band` holds it too: a committed balloon still above the roundout
 /// band comes back down on approach power, not at idle.
 pub fn balloon_power(
@@ -4176,7 +4362,7 @@ pub fn balloon_power(
     above_band: bool,
 ) -> Option<f64> {
     match (vvi_fpm, approach_thr) {
-        (Some(v), Some(t)) if (v > 0.0 || above_band) && t.is_finite() => {
+        (Some(v), Some(t)) if (v > BALLOON_CLIMB_FPM || above_band) && t.is_finite() => {
             Some(t.clamp(0.0, 1.0))
         }
         _ => None,
@@ -4444,7 +4630,7 @@ impl FlarePitch {
 /// keeps the prediction and holds only a near-level float
 /// ([`FLARE_HOLD_MIN_SINK_FPM`]); rough air ([`FinalAir`]) holds from the
 /// flare gate. Either way a float is not a balloon: only a measured CLIMB
-/// lets the held pull go, eased at the airframe's `balloon_ease_per_s`
+/// (past [`BALLOON_CLIMB_FPM`], never a +1 fpm float) lets the held pull go, eased at the airframe's `balloon_ease_per_s`
 /// toward the ask, never a push, and more pull comes whenever the prediction
 /// of the sink at the horizon asks for it.
 #[derive(Debug, Clone)]
@@ -4471,6 +4657,9 @@ pub struct FlareModel {
     unexplained: Option<f64>,
     /// Seconds since the last write (a failed read coasts).
     coasting_s: f64,
+    /// A climb past this eases the held pull ([`BALLOON_CLIMB_FPM`]; a
+    /// replay of the law as flown before issue #146 sets it to zero).
+    climb_fpm: f64,
 }
 
 /// One tick of [`FlareModel`], for the blackbox as much as the channel.
@@ -4517,6 +4706,7 @@ impl FlareModel {
             el: 0.0,
             unexplained: None,
             coasting_s: 0.0,
+            climb_fpm: BALLOON_CLIMB_FPM,
         }
     }
 
@@ -4540,8 +4730,18 @@ impl FlareModel {
 
     /// A new approach: nothing written, nothing owed, nothing held.
     pub fn reset(&mut self) {
+        let climb_fpm = self.climb_fpm;
         *self = Self::new(self.cfg, self.max, self.min, self.tau_s)
             .with_balloon_ease(self.balloon_ease_per_s);
+        self.climb_fpm = climb_fpm;
+    }
+
+    /// The law as flown before issue #146: any climb, +1 fpm included,
+    /// eased the held pull. Replays only.
+    #[cfg(test)]
+    fn easing_on_any_climb(mut self) -> Self {
+        self.climb_fpm = 0.0;
+        self
     }
 
     fn lag2(&self) -> f64 {
@@ -4667,9 +4867,12 @@ impl FlareModel {
         let elev = if flare {
             // The roundout's last ask is where the flare starts.
             let held = self.held.unwrap_or(ask);
-            let next = if vvi_fpm > 0.0 {
+            let next = if vvi_fpm > self.climb_fpm {
                 // A BALLOON, measured: the pull has beaten the ground and the
-                // aircraft climbs. Eased toward the ask, never a push.
+                // aircraft climbs. Eased toward the ask, never a push. A
+                // near-level float is not one: +1 fpm at 22.9 ft eased the
+                // held 0.28 to 0.20 at EGBB 15 (2026-09-28), a dead time
+                // before the sink the retard would rebuild.
                 let eased = ask.max(0.0);
                 match self.balloon_ease_per_s {
                     Some(rate) => eased.max(held - rate * dt),
@@ -6761,17 +6964,34 @@ mod tests {
             );
         }
         assert!(commands[8] > 0.0, "not cut: {commands:?}");
-        // The same flare slow (8 kt under the approach speed): the thrust
-        // stays, the sink it would cost is the wheels'.
+        // Slow (8 kt under the approach speed) and still sinking steadily:
+        // the thrust stays, the sink it would cost is the wheels'.
+        let mut power = FlarePower::default();
+        for _ in 0..5 {
+            let t = power
+                .step(cfg, 0.30, -300.0, 0.67, 10.0, Some(102.0), Some(110.0))
+                .unwrap();
+            assert_eq!(t, 0.30);
+        }
+        assert_eq!(power.last_key, Some(RetardKey::Slow));
+        // The recorded flare slow: it FLOATS (-393 to -278 in 0.67 s is a
+        // float 1.5 s ahead, then -50 and -24), and slow never holds power
+        // in a float (issue #146): the lever walks off and never comes back.
         let mut power = FlarePower::default();
         let mut throttle = 0.30;
+        let mut slow = Vec::new();
         for vs in samples {
             throttle = power
                 .step(cfg, throttle, vs, 0.67, 10.0, Some(102.0), Some(110.0))
                 .unwrap();
-            assert_eq!(throttle, 0.30);
+            slow.push(throttle);
         }
-        assert_eq!(power.last_key, Some(RetardKey::Slow));
+        assert_eq!(slow[0], 0.30);
+        for w in slow.windows(2) {
+            assert!(w[1] < w[0], "{slow:?}");
+        }
+        assert!(slow[8] > 0.0, "not cut: {slow:?}");
+        assert_ne!(power.last_key, Some(RetardKey::Slow));
     }
 
     #[test]
@@ -7204,6 +7424,50 @@ mod tests {
     /// later. The call now waits for the climb; a balk the wheels take never
     /// calls. The first approach's `off_centreline_low` at 96 ft still calls
     /// as soon as it climbs.
+    /// EGKK-EGBB 15, sortie 1790601822-full_auto (2026-09-28, #155): the
+    /// final report at +3314.2 got "continue approach, expect late landing
+    /// clearance" and the tower never came back; the book stayed Inbound down
+    /// the whole final (the recorded autoland ticks' radio heights below,
+    /// +3313.6 to +3452.0) and the wheels touched uncleared at +3472.2. The
+    /// crew now asks at 1,000 ft (the +3390.8 tick, 990 ft) and goes around at
+    /// 300 (the +3435.7 tick, 296 ft), once each; cleared, or with no tower
+    /// working us, it says nothing; a missed approach asks again next time.
+    #[test]
+    fn an_uncleared_final_asks_then_goes_around() {
+        let radio = [
+            2103.0, 2097.0, 1991.0, 1886.0, 1796.0, 1692.0, 1593.0, 1499.0, 1394.0, 1298.0,
+            1200.0, 1096.0, 990.0, 893.0, 795.0, 694.0, 596.0, 499.0, 396.0, 296.0, 199.0, 95.0,
+        ];
+        let run = |working: bool| {
+            let mut w = UnclearedWatch::default();
+            radio
+                .iter()
+                .filter_map(|&r| w.step(working, r, false, false).map(|s| (r, s)))
+                .collect::<Vec<_>>()
+        };
+        let steps = run(true);
+        assert_eq!(steps.first(), Some(&(990.0, UnclearedStep::Ask)));
+        assert_eq!(steps.get(1), Some(&(296.0, UnclearedStep::GoAround)));
+        assert_eq!(
+            steps.iter().filter(|s| s.1 == UnclearedStep::Ask).count(),
+            1,
+            "asked once: {steps:?}"
+        );
+        // Cleared (or no tower working us): silent all the way down.
+        assert!(run(false).is_empty());
+        // Never on the wheels.
+        let mut w = UnclearedWatch::default();
+        assert_eq!(w.step(true, 0.0, true, false), None);
+        // A missed approach resets the question for the next approach.
+        let mut w = UnclearedWatch::default();
+        assert_eq!(w.step(true, 900.0, false, false), Some(UnclearedStep::Ask));
+        assert_eq!(w.step(true, 900.0, false, false), None);
+        assert_eq!(w.step(true, 250.0, false, true), None);
+        assert_eq!(w.step(true, 900.0, false, false), Some(UnclearedStep::Ask));
+        // An unread height is no measurement.
+        assert_eq!(UnclearedWatch::default().step(true, f64::NAN, false, false), None);
+    }
+
     #[test]
     fn a_low_balk_is_called_on_the_radio_only_once_it_climbs() {
         let due = |w: &BalkWatch, on_ground, radio, vvi| {
@@ -10302,6 +10566,50 @@ mod lemg_737_flare_tests {
     enum Retard {
         Keyed(FlarePower, crate::aircraft::FlarePowerProfile),
         Sink(SinkKeyed),
+        /// Height, time and speed as flown on 2026-09-28 after issue #76,
+        /// before the float key (issue #146).
+        NoFloat(NoFloatKeyed, crate::aircraft::FlarePowerProfile),
+    }
+
+    /// The keyed retard without the float key, as flown at EGBB 15
+    /// (2026-09-28): nothing above the retard height, nothing while more
+    /// than `retard_at_s` from the wheels (a float counted at 100 fpm),
+    /// and once due, nothing while slow. Kept to replay the landing it flew.
+    #[derive(Default, Clone, Copy)]
+    struct NoFloatKeyed {
+        last: Option<f64>,
+        due: bool,
+    }
+
+    impl NoFloatKeyed {
+        fn step(
+            &mut self,
+            cfg: crate::aircraft::FlarePowerProfile,
+            measured: f64,
+            vvi: f64,
+            dt: f64,
+            radio_ft: f64,
+            ias: f64,
+        ) -> f64 {
+            let current = measured.clamp(0.0, 1.0).min(self.last.unwrap_or(1.0));
+            let slow = ias < APPROACH_IAS - cfg.retard_slow_kts.unwrap_or(5.0);
+            let above = cfg.retard_below_ft.is_some_and(|h| radio_ft > h);
+            let to_touch_s = (radio_ft.max(0.0) / (-vvi).max(100.0) * 60.0).max(0.5);
+            let fast = cfg.retard_fast_kts.is_some_and(|k| ias > APPROACH_IAS + k);
+            self.due |= !above && (fast || cfg.retard_at_s.is_none_or(|s| to_touch_s <= s));
+            let next = if self.last.is_none() || above || !self.due || slow {
+                current
+            } else {
+                let fastest = cfg
+                    .retard_max_per_s
+                    .unwrap_or(cfg.reduction_per_second)
+                    .max(0.03);
+                let rate = (current / to_touch_s).clamp(0.03, fastest);
+                (current - rate * dt.min(1.0)).max(0.0)
+            };
+            self.last = Some(next);
+            next
+        }
     }
 
     impl Retard {
@@ -10312,10 +10620,18 @@ mod lemg_737_flare_tests {
                 profile_737().flare_power.expect("the 737 retards"),
             )
         }
+        /// ...and the retard as it flew at EGBB 15.
+        fn no_float() -> Self {
+            Retard::NoFloat(
+                NoFloatKeyed::default(),
+                profile_737().flare_power.expect("the 737 retards"),
+            )
+        }
         fn step(&mut self, lever: f64, vvi: f64, dt: f64, h: f64, ias: f64) -> Option<f64> {
             match self {
                 Retard::Keyed(p, cfg) => p.step(*cfg, lever, vvi, dt, h, Some(ias), Some(APPROACH_IAS)),
                 Retard::Sink(s) => Some(s.step(lever, vvi, dt, h)),
+                Retard::NoFloat(k, cfg) => Some(k.step(*cfg, lever, vvi, dt, h, ias)),
             }
         }
     }
@@ -10783,7 +11099,7 @@ mod lemg_737_flare_tests {
             let r = recording(s);
             let a = r.arrest();
             let rough = r.air().rough();
-            let old = fly_through_air_with(&a, CALM_FIT, rough, true, Retard::Sink(SinkKeyed::as_flown()));
+            let old = fly_as_flown(&a, CALM_FIT, rough, true);
             let new = fly_through_air(&a, CALM_FIT, rough, true);
             assert!(!new.climbed, "{s}: climbed");
             assert!(new.sink_fpm > 150.0, "{s}: a landing, not a float: {:.0}", new.sink_fpm);
@@ -10916,6 +11232,186 @@ mod lemg_737_flare_tests {
         "1790590296",
     ];
 
+    /// EGBB 15 (737, EGKK-EGBB full auto, 2026-09-28, sortie 1790601822):
+    /// the autoland ticks from 400 ft to the wheels and the flight model's
+    /// touchdown (288 fpm). Rough air (41 fpm rms); the column held 0.28
+    /// through a float at 22.7 ft, eased to 0.20 at +1 fpm; the lever stayed
+    /// 0.30 from the flare to 2.3 ft (retard keys height, time, slow).
+    const EGBB_15_FLOAT: &str = include_str!("../bench/landings/egbb15_rough_float.jsonl");
+
+    /// EGBB 15's own flare, fitted open loop to the recorded elevator, lever
+    /// and speed from the arrest gate to the wheels (36 fpm rms): a strong
+    /// elevator, 6,300 fpm per unit through 1.7 s of dead time, on a trim
+    /// that held -1,025. The law's 3,500 is the weakest flare's on purpose,
+    /// so the pull it holds in rough air is more than this aircraft needs.
+    const EGBB_FIT: Fit = Fit {
+        fpm_per_elevator: 6300.0,
+        dead_s: 1.7,
+    };
+    const EGBB_TRIM_FPM: f64 = -1025.0;
+
+    #[test]
+    fn the_egbb_plant_is_fitted_to_its_own_flare() {
+        let a = recording("1790601822").arrest();
+        let mut p = Plant::at(gate_of(&a, Some(EGBB_TRIM_FPM)), EGBB_FIT);
+        let mut sq = 0.0;
+        for w in a.windows(2) {
+            let (t0, t1) = (w[0].t - a[0].t, w[1].t - a[0].t);
+            p.write(w[0].elev);
+            while p.t + 1e-9 < t1 {
+                let f = (p.t - t0) / (t1 - t0);
+                p.step(
+                    w[0].lever,
+                    w[0].radio,
+                    Some(w[0].ias + (w[1].ias - w[0].ias) * f),
+                    0.01,
+                );
+            }
+            sq += (p.vvi - w[1].vvi).powi(2);
+        }
+        let rms = (sq / (a.len() - 1) as f64).sqrt();
+        assert!(rms < 40.0, "the fit follows the record: {rms:.0} fpm rms");
+        // The law that flew is the law in the harness: fed the recorded
+        // sinks in rough air, easing on any climb, it writes what was
+        // written (the 0.28 hold, the ease to 0.20 at +1 fpm, the cap).
+        let mut m = model().easing_on_any_climb();
+        let mut worst: f64 = 0.0;
+        for (n, k) in a.iter().enumerate() {
+            let dt = if n == 0 { 0.22 } else { k.t - a[n - 1].t };
+            let e = m.step(k.radio, k.ias - 4.0, k.vvi, dt, k.flare, true).elev;
+            worst = worst.max((e - k.elev).abs());
+        }
+        assert!(worst < 0.04, "elevator {worst:.3} off the record");
+    }
+
+    /// Issues #76 and #146, EGBB 15 (sortie 1790601822): the column held
+    /// 0.28 in rough air and levelled the 737 at 22.7 ft on 0.30 of lever;
+    /// the retard, keyed on height (over 20 ft), then time (a float is 13 s
+    /// from the wheels), then speed (the float bled it 7 kt under), never
+    /// moved the lever, and the float ran on its thrust. Through the flare's
+    /// own fit and the air it carried, as flown: 5.6 s under 100 fpm of sink,
+    /// 940 m from the flare gate, the lever at 0.30 at the wheels. With the
+    /// float key (a sink under 100 fpm now or 1.5 s ahead on its trend takes
+    /// the lever off at the airframe's quickest, at any height or speed) and
+    /// a column that eases only for a climb past 25 fpm: no float, 280 m
+    /// shorter, the lever off at the wheels, a landing under 350 fpm.
+    #[test]
+    fn the_egbb_float_takes_the_thrust_off_and_lands_without_it() {
+        let r = recording("1790601822");
+        assert_eq!(r.touchdown_fpm, 288.0);
+        assert!(r.air().rough(), "{:?}", r.air().rms_fpm());
+        let a = r.arrest();
+        let trim = Some(EGBB_TRIM_FPM);
+        let flown = fly_through_air_with(&a, EGBB_FIT, trim, true, true, Retard::no_float(), true);
+        assert!(
+            flown.float_s > 4.0,
+            "as flown it floats: {:.1} s",
+            flown.float_s
+        );
+        assert!(
+            (flown.lever_at_wheels - a[0].lever).abs() < 1e-9,
+            "and the lever never moves: {:.3}",
+            flown.lever_at_wheels
+        );
+        let f = fly_through_air_with(&a, EGBB_FIT, trim, true, true, Retard::profile(), false);
+        assert!(f.float_s < 0.2, "no float: {:.1} s", f.float_s);
+        assert!(
+            f.float_m < flown.float_m - 200.0,
+            "{:.0} m against {:.0}",
+            f.float_m,
+            flown.float_m
+        );
+        assert!(
+            f.lever_at_wheels < 0.05,
+            "the lever off: {:.3}",
+            f.lever_at_wheels
+        );
+        assert!(
+            f.sink_fpm > 150.0 && f.sink_fpm < 350.0,
+            "a landing: {:.0}",
+            f.sink_fpm
+        );
+        assert!(!f.climbed && f.eased < 1e-9, "never forward, never up");
+        // Not one plant's luck: around the fit (elevator 5,700 to 6,900,
+        // dead time 1.6 to 1.8 s) the worst landing is softer, the mean float
+        // shorter, and the lever always comes off.
+        let (mut old_worst, mut new_worst) = (0.0f64, 0.0f64);
+        let (mut old_m, mut new_m, mut n) = (0.0, 0.0, 0.0);
+        for k in [5700.0, 6300.0, 6900.0] {
+            for d in [1.6, 1.7, 1.8] {
+                let fit = Fit {
+                    fpm_per_elevator: k,
+                    dead_s: d,
+                };
+                let old = fly_through_air_with(&a, fit, trim, true, true, Retard::no_float(), true);
+                let new = fly_through_air_with(&a, fit, trim, true, true, Retard::profile(), false);
+                old_worst = old_worst.max(old.sink_fpm);
+                new_worst = new_worst.max(new.sink_fpm);
+                old_m += old.float_m;
+                new_m += new.float_m;
+                n += 1.0;
+                assert!(
+                    new.lever_at_wheels < 0.11,
+                    "{k} {d}: {:.3}",
+                    new.lever_at_wheels
+                );
+                assert!(new.sink_fpm < 430.0, "{k} {d}: {:.0}", new.sink_fpm);
+            }
+        }
+        assert!(
+            new_worst < old_worst - 100.0,
+            "worst {new_worst:.0} against {old_worst:.0}"
+        );
+        assert!(
+            new_m < old_m - 50.0 * n,
+            "mean float {:.0} m against {:.0}",
+            new_m / n,
+            old_m / n
+        );
+    }
+
+    /// The float key on the 737's numbers: a float at 22.7 ft (over the
+    /// retard height), 5 kt slow and far from the wheels, walks the lever
+    /// off at 0.04 a second; a sink easing fast enough to float within 1.5 s
+    /// is one already; slow defers only a retard not yet begun and a sink
+    /// still sinking; a +1 fpm float is no balloon for the lever.
+    #[test]
+    fn a_float_takes_the_thrust_off_at_any_height_and_speed() {
+        let cfg = profile_737().flare_power.expect("the 737 retards");
+        let app = Some(APPROACH_IAS);
+        let slow = Some(APPROACH_IAS - 6.0);
+        let mut p = FlarePower::default();
+        assert_eq!(p.step(cfg, 0.30, -140.0, 0.25, 22.9, slow, app), Some(0.30));
+        let a = p.step(cfg, 0.30, -86.0, 0.25, 22.7, slow, app).unwrap();
+        assert_eq!(p.last_key, Some(RetardKey::Float));
+        assert!((a - (0.30 - 0.04 * 0.25)).abs() < 1e-9, "{a}");
+        // The sink rebuilding under it: the retard goes on, timed, and the
+        // speed never holds it again.
+        let b = p.step(cfg, 0.30, -250.0, 0.25, 12.0, slow, app).unwrap();
+        assert!(b < a, "{a} -> {b}");
+        assert_eq!(p.last_key, Some(RetardKey::Timed));
+        // At 24.9 ft sinking 300 and easing 140 fpm a second (EGBB, 2.1 s
+        // before the float): the float ahead takes the thrust now.
+        let mut q = FlarePower::default();
+        q.step(cfg, 0.30, -440.0, 0.3, 26.7, app, app);
+        q.step(cfg, 0.30, -398.0, 0.3, 25.8, app, app);
+        let c = q.step(cfg, 0.30, -300.0, 0.3, 24.9, app, app).unwrap();
+        assert_eq!(q.last_key, Some(RetardKey::Float));
+        assert!(c < 0.30);
+        // Still sinking 300 steadily over 20 ft: the height holds it.
+        let mut h = FlarePower::default();
+        h.step(cfg, 0.30, -300.0, 0.3, 26.0, app, app);
+        assert_eq!(h.step(cfg, 0.30, -300.0, 0.3, 25.0, app, app), Some(0.30));
+        assert_eq!(h.last_key, Some(RetardKey::Height));
+        // A near-level float is not a balloon: no approach thrust back.
+        assert_eq!(super::balloon_power(Some(1.0), Some(0.30), false), None);
+        assert_eq!(super::balloon_power(Some(2.0), Some(0.30), false), None);
+        assert_eq!(
+            super::balloon_power(Some(60.0), Some(0.30), false),
+            Some(0.30)
+        );
+    }
+
     #[derive(Clone, Copy, Debug)]
     struct Tick {
         t: f64,
@@ -10940,7 +11436,11 @@ mod lemg_737_flare_tests {
     fn recording(sortie: &str) -> Recording {
         let mut ticks = Vec::new();
         let mut touchdown_fpm = f64::NAN;
-        for line in LEMG_13_FLARES.lines().chain(LEMG_13_CALM_FLARES.lines()) {
+        for line in LEMG_13_FLARES
+            .lines()
+            .chain(LEMG_13_CALM_FLARES.lines())
+            .chain(EGBB_15_FLOAT.lines())
+        {
             let v: serde_json::Value = serde_json::from_str(line).expect("a bench line");
             if !v["sortie"].as_str().is_some_and(|s| s.starts_with(sortie)) {
                 continue;
@@ -10998,7 +11498,9 @@ mod lemg_737_flare_tests {
         dead_s: 1.55,
     };
 
-    fn gate_of(a: &[Tick]) -> Gate {
+    /// The recorded gate; `trim` is a fitted trimmed sink (fpm), else the
+    /// gate's own sink (the trim folded into the air).
+    fn gate_of(a: &[Tick], trim: Option<f64>) -> Gate {
         Gate {
             radio_ft: a[0].radio,
             vvi_fpm: a[0].vvi,
@@ -11007,7 +11509,7 @@ mod lemg_737_flare_tests {
             throttle: a[0].lever,
             // What the air does is taken from the recording; the trim is
             // folded into it.
-            trimmed_sink_fpm: a[0].vvi,
+            trimmed_sink_fpm: trim.unwrap_or(a[0].vvi),
             flown_fpm: f64::NAN,
         }
     }
@@ -11016,8 +11518,8 @@ mod lemg_737_flare_tests {
     /// and lever flown open loop, and per tick the sink (fpm, at the tick)
     /// and speed change (kt/s, over the interval after it) the fit does not
     /// explain.
-    fn air_of(a: &[Tick], fit: Fit) -> (Vec<f64>, Vec<f64>) {
-        let mut p = Plant::at(gate_of(a), fit);
+    fn air_of(a: &[Tick], fit: Fit, trim: Option<f64>) -> (Vec<f64>, Vec<f64>) {
+        let mut p = Plant::at(gate_of(a, trim), fit);
         let dt = 0.01;
         let (mut air, mut speed) = (vec![0.0], Vec::new());
         for w in a.windows(2) {
@@ -11050,6 +11552,8 @@ mod lemg_737_flare_tests {
         float_m: f64,
         lever_at_wheels: f64,
         ias_at_wheels: f64,
+        /// Seconds of the flare sinking under [`super::RETARD_FLOAT_FPM`].
+        float_s: f64,
     }
 
     /// Fly a recorded gate through a fit and the recorded air, the law
@@ -11058,29 +11562,52 @@ mod lemg_737_flare_tests {
     /// lever held in a climb, the elevator arriving a dead time after it is
     /// written through two lags.
     fn fly_through_air(a: &[Tick], fit: Fit, rough: bool, with_air: bool) -> Flown {
-        fly_through_air_with(a, fit, rough, with_air, Retard::profile())
+        fly_through_air_with(a, fit, None, rough, with_air, Retard::profile(), false)
     }
 
-    /// ...with the retard as it flew on 2026-09-28 (the sink-keyed law).
+    /// ...with the retard as it flew on 2026-09-28 (the sink-keyed law) and
+    /// the column and lever taking any climb for a balloon.
     fn fly_as_flown(a: &[Tick], fit: Fit, rough: bool, with_air: bool) -> Flown {
-        fly_through_air_with(a, fit, rough, with_air, Retard::Sink(SinkKeyed::as_flown()))
+        fly_through_air_with(
+            a,
+            fit,
+            None,
+            rough,
+            with_air,
+            Retard::Sink(SinkKeyed::as_flown()),
+            true,
+        )
     }
 
+    /// `any_climb`: the column eases and the lever takes the approach
+    /// thrust back on any climb, +1 fpm included (as flown before issue
+    /// #146); else only past [`super::BALLOON_CLIMB_FPM`].
     fn fly_through_air_with(
         a: &[Tick],
         fit: Fit,
+        trim: Option<f64>,
         rough: bool,
         with_air: bool,
         mut power: Retard,
+        any_climb: bool,
     ) -> Flown {
+        let climb_fpm = if any_climb {
+            0.0
+        } else {
+            super::BALLOON_CLIMB_FPM
+        };
         let (air, speed) = if with_air {
-            air_of(a, fit)
+            air_of(a, fit, trim)
         } else {
             (vec![0.0], Vec::new())
         };
         let times: Vec<f64> = a.iter().map(|k| k.t - a[0].t).collect();
-        let mut law = model();
-        let mut p = Plant::at(gate_of(a), fit);
+        let mut law = if any_climb {
+            model().easing_on_any_climb()
+        } else {
+            model()
+        };
+        let mut p = Plant::at(gate_of(a, trim), fit);
         let (mut h, approach_lever) = (a[0].radio, a[0].lever);
         let mut lever = approach_lever;
         let (dt, mut i, mut next) = (0.01, 0usize, 0.0);
@@ -11093,6 +11620,7 @@ mod lemg_737_flare_tests {
             float_m: 0.0,
             lever_at_wheels: 0.0,
             ias_at_wheels: 0.0,
+            float_s: 0.0,
         };
         while h > 0.0 && p.t < 40.0 {
             if p.t + 1e-9 >= next {
@@ -11111,10 +11639,10 @@ mod lemg_737_flare_tests {
                     }
                     flaring = true;
                     peak = peak.max(e);
-                    if v <= 0.0 {
+                    if v <= climb_fpm {
                         out.eased = out.eased.max(peak - e);
                     }
-                    lever = if v > 0.0 {
+                    lever = if v > climb_fpm {
                         approach_lever
                     } else {
                         power.step(lever, v, law_dt, h, p.ias).unwrap_or(lever)
@@ -11143,6 +11671,9 @@ mod lemg_737_flare_tests {
             if flaring {
                 out.float_m += (p.ias - 4.0) * 0.514_444 * dt;
                 out.climbed |= p.vvi > 0.0;
+                if p.vvi > -super::RETARD_FLOAT_FPM {
+                    out.float_s += dt;
+                }
             }
         }
         out.sink_fpm = -p.vvi;

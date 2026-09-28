@@ -41,8 +41,10 @@ use crate::xplane::XPlaneClient;
 const LAT: &str = "sim/flightmodel/position/latitude";
 const LON: &str = "sim/flightmodel/position/longitude";
 const PSI_TRUE: &str = "sim/flightmodel/position/psi";
+#[cfg(test)]
 const GS_MS: &str = "sim/flightmodel/position/groundspeed";
 const IAS: &str = "sim/flightmodel/position/indicated_airspeed";
+#[cfg(test)]
 const AGL_M: &str = "sim/flightmodel/position/y_agl";
 const MAG_VAR: &str = "sim/flightmodel/position/magnetic_variation";
 const ON_GROUND: &str = "sim/flightmodel/failures/onground_any";
@@ -87,9 +89,6 @@ const PHI: &str = "sim/flightmodel/position/true_phi";
 const PITCH_RATE: &str = "sim/flightmodel/position/Q";
 /// Yaw rate, deg/s, nose right positive: the roll law's damping.
 const YAW_RATE: &str = "sim/flightmodel/position/R";
-/// The flight model's vertical speed, fpm: the climb the pitch is flying
-/// when the autopilot takes it (`ClimbVs`).
-const VS_FPM: &str = "sim/flightmodel/position/vh_ind_fpm";
 
 const M_TO_FT: f64 = 3.280_84;
 const MS_TO_KTS: f64 = 1.943_844;
@@ -811,6 +810,12 @@ pub fn runway_matches(fitted: &str, cleared: &str) -> bool {
 /// earlier ("P alone converged asymptotically and S-ed under wind") and the
 /// roll never got it.
 pub fn roll_target_heading(course_deg: f64, xtk_m: f64, xtk_rate_m_s: f64, gs_kts: f64) -> f64 {
+    (course_deg - roll_cut_deg(xtk_m, xtk_rate_m_s, gs_kts)).rem_euclid(360.0)
+}
+
+/// The cut [`roll_target_heading`] takes off the course, degrees (right of
+/// the centreline positive, so the target moves left).
+fn roll_cut_deg(xtk_m: f64, xtk_rate_m_s: f64, gs_kts: f64) -> f64 {
     let offset = if xtk_m.is_finite() { xtk_m } else { 0.0 };
     let rate = if xtk_rate_m_s.is_finite() {
         xtk_rate_m_s
@@ -825,8 +830,7 @@ pub fn roll_target_heading(course_deg: f64, xtk_m: f64, xtk_rate_m_s: f64, gs_kt
         XTK_GAIN_REF_KTS
     };
     let gain = XTK_GAIN_DEG_PER_M * (XTK_GAIN_REF_KTS / pace);
-    let corr = ((offset + rate * XTK_LEAD_S) * gain).clamp(-XTK_MAX_DEG, XTK_MAX_DEG);
-    (course_deg - corr).rem_euclid(360.0)
+    ((offset + rate * XTK_LEAD_S) * gain).clamp(-XTK_MAX_DEG, XTK_MAX_DEG)
 }
 
 /// The cross-track RATE the centreline law leads with, smoothed. Raw, it is
@@ -937,6 +941,181 @@ pub const XTK_RATE_MAX_M_S: f64 = 5.0;
 /// The smoothing of the cross-track rate, seconds.
 pub const XTK_RATE_TAU_S: f64 = 1.0;
 
+/// On a scheduled roll (`roll_rudder:`) at the declared rudder's speed and
+/// over, the cut is this many times [`roll_target_heading`]'s, blended in
+/// from [`XTK_GAIN_REF_KTS`] (see [`roll_fast_blend`]): a lateral closure of
+/// about 3.5 s where the cut alone holds 7.
+pub const ROLL_CUT_FAST_MULT: f64 = 2.0;
+/// The cross-track trim: degrees of cut per metre-second of offset at
+/// [`XTK_GAIN_REF_KTS`], scaled by ref/gs like the cut, from
+/// [`DRIFT_FROM_KTS`]...
+pub const XTK_TRIM_DEG_PER_M_S: f64 = 0.06;
+/// ...and the most it may cut at that pace, degrees (less as the speed rises).
+pub const XTK_TRIM_MAX_DEG: f64 = 1.0;
+/// Ceiling on the scheduled law's gain from the declared rudder's speed:
+/// never more than full steer per this many degrees (the default law's
+/// [`ROLL_FULL_DEG`] below [`XTK_GAIN_REF_KTS`], blended between).
+const RUDDER_FULL_DEG_FAST: f64 = 8.0;
+
+/// How far a scheduled roll is into holding the line harder: 0 below
+/// [`XTK_GAIN_REF_KTS`] (the pace the cut is quoted at, and nothing below it
+/// changes), 1 from the speed the airframe's rudder was measured at
+/// (`roll_rudder:` `at_kts`, 80 on the 737), linear between.
+fn roll_fast_blend(gs_kts: f64, rudder_at_kts: f64) -> f64 {
+    if !gs_kts.is_finite() {
+        return 0.0;
+    }
+    let span = rudder_at_kts - XTK_GAIN_REF_KTS;
+    if span.is_nan() || span <= 1.0 {
+        return if gs_kts >= XTK_GAIN_REF_KTS { 1.0 } else { 0.0 };
+    }
+    ((gs_kts - XTK_GAIN_REF_KTS) / span).clamp(0.0, 1.0)
+}
+
+/// One tick of the roll's centreline cut, as [`RollCut::update`] computes it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CutTick {
+    /// The cross-track the cut was taken on, metres right (the read, or on a
+    /// scheduled roll the median of the last three reads).
+    pub xtk_m: f64,
+    /// The smoothed cross-track rate it leads with, m/s right.
+    pub rate_m_s: f64,
+    /// The drift fed forward ([`DriftFilter`]), degrees; zero on the default law.
+    pub drift_deg: f64,
+    /// The proportional cut, degrees (right of the line positive).
+    pub cut_deg: f64,
+    /// The cross-track trim's cut, degrees; zero on the default law.
+    pub cut_i_deg: f64,
+    /// The heading target less the runway course, degrees.
+    pub target_off_deg: f64,
+}
+
+/// The centreline half of the takeoff roll: from the cross-track read and
+/// the heading off the runway to the heading target, the one path the roll
+/// loop and its replays share.
+///
+/// Every airframe gets the cut it flew ([`roll_target_heading`], plus the
+/// [`DriftFilter`] on a `roll_rudder:` airframe). A SCHEDULED roll adds
+/// three things, each read off the 737 rolls of 2026-09-28 (EGKK 08R lifted
+/// off 5.4 m left, LEMG 13 1790591256 9.0 m left at 150 kt):
+///
+/// - The cross-track is the MEDIAN of the last three reads. Latitude and
+///   longitude arrive in separate requests, so a read can pair two frames:
+///   on LEMG's diagonal runway that is up to 2.9 m of cross-track for one
+///   tick above 120 kt (0.7 at EGKK's east-west one), and each spike is
+///   metres of target and a flick of rudder. A single-tick spike never
+///   passes a median; a real movement is late by one tick. The source is
+///   fixed since (#157: the plugin's `xcopilot/position`, one frame in one
+///   request); the median stays as the defence for an older plugin's split
+///   reads and any other single-tick glitch.
+/// - From [`XTK_GAIN_REF_KTS`] the cut grows to [`ROLL_CUT_FAST_MULT`] times
+///   the closure-time cut: the heading loop under it now holds the line, and
+///   a 7 s lateral closure let a yaw gust at 100 kt carry the aircraft 4 m.
+/// - A slow trim on the cross-track itself ([`XTK_TRIM_DEG_PER_M_S`], capped
+///   at [`XTK_TRIM_MAX_DEG`]): whatever the drift feed and the heading trim
+///   leave standing, it takes out by rotation.
+#[derive(Debug, Default, Clone)]
+pub struct RollCut {
+    /// The declared rudder's speed on a scheduled roll; `None` on the default law.
+    rudder_at_kts: Option<f64>,
+    /// The cut as flown on 2026-09-28, for the replays that pin the change.
+    #[cfg(test)]
+    as_flown: bool,
+    recent: std::collections::VecDeque<f64>,
+    prev_xtk: Option<f64>,
+    rate: XtkRate,
+    drift: DriftFilter,
+    /// Metre-seconds of cross-track, for the trim.
+    integral: f64,
+}
+
+impl RollCut {
+    /// The cut for a roll on the law scheduled on a rudder measured at
+    /// `rudder_at_kts`, or (`None`) on the default law.
+    pub fn new(rudder_at_kts: Option<f64>) -> Self {
+        Self {
+            rudder_at_kts,
+            ..Self::default()
+        }
+    }
+
+    /// The cut for the roll this steering law flies.
+    pub fn for_law(law: &RollSteer) -> Self {
+        Self::new(law.rudder.map(|r| r.at_kts))
+    }
+
+    #[cfg(test)]
+    fn as_flown(mut self) -> Self {
+        self.as_flown = true;
+        self
+    }
+
+    fn improved(&self) -> bool {
+        #[cfg(test)]
+        if self.as_flown {
+            return false;
+        }
+        self.rudder_at_kts.is_some()
+    }
+
+    /// One tick: the cross-track read (metres right), the heading less the
+    /// runway course (degrees right), groundspeed and the tick.
+    pub fn update(&mut self, xtk_read_m: f64, psi_off_deg: f64, gs_kts: f64, dt_s: f64) -> CutTick {
+        let improved = self.improved();
+        let xtk = if improved && xtk_read_m.is_finite() {
+            self.recent.push_back(xtk_read_m);
+            while self.recent.len() > 3 {
+                self.recent.pop_front();
+            }
+            if self.recent.len() == 3 {
+                let mut v: Vec<f64> = self.recent.iter().copied().collect();
+                v.sort_by(|a, b| a.total_cmp(b));
+                v[1]
+            } else {
+                xtk_read_m
+            }
+        } else {
+            xtk_read_m
+        };
+        let raw = match self.prev_xtk {
+            Some(p) if dt_s > 0.0 => (xtk - p) / dt_s,
+            _ => 0.0,
+        };
+        self.prev_xtk = Some(xtk);
+        let rate = self.rate.update(raw, dt_s);
+        let drift = if self.rudder_at_kts.is_some() {
+            self.drift.update(psi_off_deg, rate, gs_kts, dt_s)
+        } else {
+            0.0
+        };
+        let mut cut = roll_cut_deg(xtk, rate, gs_kts);
+        let mut cut_i = 0.0;
+        if improved {
+            let at = self.rudder_at_kts.unwrap_or(XTK_GAIN_REF_KTS);
+            let mult = 1.0 + (ROLL_CUT_FAST_MULT - 1.0) * roll_fast_blend(gs_kts, at);
+            cut = (cut * mult).clamp(-XTK_MAX_DEG, XTK_MAX_DEG);
+            if gs_kts >= DRIFT_FROM_KTS && xtk.is_finite() && dt_s.is_finite() && dt_s > 0.0 {
+                let lim = XTK_TRIM_MAX_DEG / XTK_TRIM_DEG_PER_M_S;
+                self.integral = (self.integral + xtk * dt_s).clamp(-lim, lim);
+            }
+            let pace = if gs_kts.is_finite() {
+                gs_kts.abs().max(XTK_GAIN_REF_KTS)
+            } else {
+                XTK_GAIN_REF_KTS
+            };
+            cut_i = XTK_TRIM_DEG_PER_M_S * self.integral * (XTK_GAIN_REF_KTS / pace);
+        }
+        CutTick {
+            xtk_m: xtk,
+            rate_m_s: rate,
+            drift_deg: drift,
+            cut_deg: cut,
+            cut_i_deg: cut_i,
+            target_off_deg: -(cut + cut_i) - drift,
+        }
+    }
+}
+
 /// Slew limit: move from `prev` toward `want` by at most `max_step`.
 pub fn slew(prev: f64, want: f64, max_step: f64) -> f64 {
     prev + (want - prev).clamp(-max_step, max_step)
@@ -1043,6 +1222,9 @@ pub struct RollSteer {
     /// The airframe's measured rudder, when its profile declares one: the
     /// law is then scheduled on it (see [`RollSteer::step_with_yaw`]).
     rudder: Option<crate::aircraft::RollRudderProfile>,
+    /// The schedule as flown on 2026-09-28, for the replays that pin the change.
+    #[cfg(test)]
+    as_flown: bool,
 }
 
 /// The rudder led in WITH the power: proportional to the throttle
@@ -1084,6 +1266,26 @@ impl RollSteer {
     /// Whether this law is scheduled on a declared rudder.
     pub fn scheduled(&self) -> bool {
         self.rudder.is_some()
+    }
+
+    /// The schedule as flown on 2026-09-28 (the declared v² extrapolated to
+    /// Vr, [`ROLL_FULL_DEG`] at every speed).
+    #[cfg(test)]
+    fn as_flown(mut self) -> Self {
+        self.as_flown = true;
+        self
+    }
+
+    /// The groundspeed the declared rudder is read at, and the degrees of
+    /// error full steer is never asked for under, at this groundspeed.
+    fn schedule(&self, rudder: crate::aircraft::RollRudderProfile, gs_kts: f64) -> (f64, f64) {
+        #[cfg(test)]
+        if self.as_flown {
+            return (gs_kts, ROLL_FULL_DEG);
+        }
+        let blend = roll_fast_blend(gs_kts, rudder.at_kts);
+        let full = ROLL_FULL_DEG + (RUDDER_FULL_DEG_FAST - ROLL_FULL_DEG) * blend;
+        (gs_kts.min(rudder.at_kts), full)
     }
 
     /// One control tick: heading error (deg, right positive), the time
@@ -1178,10 +1380,26 @@ impl RollSteer {
         thr: f64,
         yaw_dps: f64,
     ) -> f64 {
-        let authority = rudder.yaw_dps_at(gs_kts).max(1e-3);
+        // The declared rudder is believed up to the speed it was measured at
+        // and not past it. It was fitted from 30 to 86 kt (EGKK 26L) as
+        // growing with v²; the 737 rolls of 2026-09-28, fitted to Vr the same
+        // way (three-second heading predictions from the logged steer, 0.3 s
+        // dead time, 0.47 s lag), hold 4 to 6 deg/s per unit from 45 to
+        // 110 kt and 8.5 at 132, and the 27th's rolls refitted to Vr 7 to
+        // 12.6: about v^1.25, never v². Extrapolated, the schedule read 31
+        // at 132 kt and cut the gain to a third: the nose sat a degree off
+        // its target for thirty seconds from 100 kt at EGKK 08R, steer
+        // creeping 0.03 to 0.09, and the aircraft lifted off 5.4 m left.
+        // Held at the declared figure above its speed the heading closes in
+        // about a second at Vr on either day's rudder.
+        let (at_kts, full_deg) = self.schedule(rudder, gs_kts);
+        let authority = rudder.yaw_dps_at(at_kts).max(1e-3);
         // Where the rudder is still dead the gain would be enormous: never
-        // more per degree than the default law's full authority.
-        let kp = (RUDDER_CLOSE_PER_S / authority).min(1.0 / ROLL_FULL_DEG);
+        // more per degree than the default law's full authority at a walk,
+        // [`RUDDER_FULL_DEG_FAST`] once the roll is under way (from 60 kt the
+        // declared rudder is already stronger than either day's measured one,
+        // so the old ceiling was the gain there).
+        let kp = (RUDDER_CLOSE_PER_S / authority).min(1.0 / full_deg);
         let pd = (kp * (err_deg - STEER_LEAD_S * yaw_dps)).clamp(-1.0, 1.0);
         let cap = LOW_SPEED_STEER_CAP
             + (MAX_ROLL_STEER - LOW_SPEED_STEER_CAP)
@@ -2245,13 +2463,11 @@ async fn stop_on_centreline(xp: &XPlaneClient, rwy: &Runway, law: &mut RollSteer
     let mut prev_xtk: Option<f64> = None;
     let mut rate_filter = XtkRate::default();
     while t0.elapsed().as_secs_f64() < REJECT_STOP_MAX_S {
-        let (lat, lon, psi, gs, yaw_r) = tokio::join!(
-            xp.get_float(LAT),
-            xp.get_float(LON),
-            xp.get_float(PSI_TRUE),
-            xp.get_float(GS_MS),
-            xp.get_float(YAW_RATE)
-        );
+        // One frame's position (#157), as the roll reads it.
+        let (pos, yaw_r) = tokio::join!(sim::position::read(xp), xp.get_float(YAW_RATE));
+        let (lat, lon) = sim::position::lat_lon(&pos);
+        let psi = sim::position::field(&pos, |p| p.psi_true_deg);
+        let gs = sim::position::field(&pos, |p| p.gs_ms);
         let Some([lat, lon, psi, gs]) = crate::control::measurements("autotakeoff", [lat, lon, psi, gs])
         else {
             tokio::time::sleep(std::time::Duration::from_millis(200)).await;
@@ -2284,7 +2500,8 @@ async fn stop_on_centreline(xp: &XPlaneClient, rwy: &Runway, law: &mut RollSteer
         crate::blackbox::record(
             "autotakeoff",
             serde_json::json!({"event": "reject_rollout", "gs": gs_kts, "xtk_m": xtk_m,
-                               "err": err, "steer": steer, "r": yaw_dps}),
+                               "err": err, "steer": steer, "r": yaw_dps,
+                               "pos": sim::position::source_word(&pos)}),
         );
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
     }
@@ -2632,13 +2849,9 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, p: Params) {
     let mut last_err = 0.0_f64;
     let mut steer_law = RollSteer::for_airframe();
     let brake_steer = brake_steers();
-    // Previous cross-track, for the roll's own closure rate (see
-    // [`roll_target_heading`]). Metres, right-positive.
-    let mut prev_xtk_m: Option<f64> = None;
-    let mut rate_filter = XtkRate::default();
-    // The drift the cut is fed, on the scheduled law only (see
-    // [`DriftFilter`]); every other airframe flies the target it flew.
-    let mut drift_filter = DriftFilter::default();
+    // The centreline cut: the closure-time cut on every airframe, fed the
+    // drift and held harder on the scheduled law only (see [`RollCut`]).
+    let mut roll_cut = RollCut::for_law(&steer_law);
     // The heading error's last value, for the yaw rate an aligning pivot
     // is capped on (the roll reads no yaw rate of its own).
     let mut prev_align_err: Option<f64> = None;
@@ -2690,12 +2903,8 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, p: Params) {
         // the sleep rate.
         let thr_dref = throttle_dref();
         let (
-            lat,
-            lon,
-            psi,
-            gs_ms,
+            pos,
             ias,
-            agl_m,
             on_ground,
             steer_yield,
             thr_read,
@@ -2706,14 +2915,14 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, p: Params) {
             roll_yield,
             torque_nm,
             yaw_r,
-            vs_read,
         ) = tokio::join!(
-            xp.get_float(LAT),
-            xp.get_float(LON),
-            xp.get_float(PSI_TRUE),
-            xp.get_float(GS_MS),
+            // Position, heading, groundspeed, height and vertical speed as
+            // ONE frame saw them (#157): read separately, latitude and
+            // longitude paired two frames, up to 2.9 m of cross-track for a
+            // tick on LEMG 13. An older plugin falls back to the separate
+            // reads, and the tick says which (`pos`).
+            sim::position::read(&xp),
             xp.get_float(IAS),
-            xp.get_float(AGL_M),
             xp.get_float(ON_GROUND),
             xp.get_float(STEER_YIELD),
             xp.get_float(&thr_dref),
@@ -2724,8 +2933,15 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, p: Params) {
             xp.get_float(ROLL_YIELD),
             xp.get_float_array(ENGN_TRQ),
             xp.get_float(YAW_RATE),
-            xp.get_float(VS_FPM),
         );
+        let (lat, lon) = sim::position::lat_lon(&pos);
+        let psi = sim::position::field(&pos, |p| p.psi_true_deg);
+        let gs_ms = sim::position::field(&pos, |p| p.gs_ms);
+        let agl_m = sim::position::field(&pos, |p| p.agl_m);
+        // The flight model's vertical speed (`vh_ind_fpm`): the climb the
+        // pitch is flying when the autopilot takes it (`ClimbVs`).
+        let vs_read = sim::position::field(&pos, |p| p.vs_fpm);
+        let pos_source = sim::position::source_word(&pos);
         // A failed read is no measurement: the engage then writes the law.
         let vs_flown = vs_read.ok().filter(|v| v.is_finite());
         let torque_ftlb = torque_nm
@@ -2852,16 +3068,10 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, p: Params) {
             // Steer the centreline: PD plus the learned P-factor trim,
             // slew-limited (no tick slams the wheel).
             let xtk_m = cross_track_nm(lat, lon, &rwy) * M_PER_NM;
-            let xtk_rate = rate_filter.update(prev_xtk_m.map_or(0.0, |p| (xtk_m - p) / dt), dt);
-            prev_xtk_m = Some(xtk_m);
             let psi_off = ((psi - rwy.course_deg + 540.0).rem_euclid(360.0)) - 180.0;
-            let drift = if steer_law.scheduled() {
-                drift_filter.update(psi_off, xtk_rate, gs_kts, dt)
-            } else {
-                0.0
-            };
-            let cut = roll_target_heading(rwy.course_deg, xtk_m, xtk_rate, gs_kts);
-            let target = (cut - drift).rem_euclid(360.0);
+            let cut = roll_cut.update(xtk_m, psi_off, gs_kts, dt);
+            let (xtk_rate, drift) = (cut.rate_m_s, cut.drift_deg);
+            let target = (rwy.course_deg + cut.target_off_deg).rem_euclid(360.0);
             let err = ((target - psi + 540.0).rem_euclid(360.0)) - 180.0;
             last_err = err;
             if !rotated {
@@ -2881,10 +3091,10 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, p: Params) {
             let steer = steer_law.step_with_yaw(err, dt, gs_kts, thr_cmd, yaw_dps);
             // The brake half, on an airframe that has no other low-speed
             // steering; zero once rotated (the channel expires anyway).
-            let yaw_dps = prev_align_err.map_or(0.0, |p| -(err - p) / dt.max(0.05));
+            let align_yaw = prev_align_err.map_or(0.0, |p| -(err - p) / dt.max(0.05));
             prev_align_err = Some(err);
             let (bl, br) = if brake_steer && !rotated {
-                roll_brake_split_aligning(steer, gs_kts, err, yaw_dps)
+                roll_brake_split_aligning(steer, gs_kts, err, align_yaw)
             } else {
                 (0.0, 0.0)
             };
@@ -2928,8 +3138,18 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, p: Params) {
                     // off a roll (LIBP 04 held 3 degrees of error for six
                     // seconds at 86 to 105 kt on 0.15 to 0.25 of steer).
                     "psi": psi, "tgt": target, "drift": drift,
-                    // The sim's yaw rate the scheduled law damps on, and
-                    // whether it flew (the 737's `roll_rudder:`).
+                    // The cross-track the cut was taken on (the median of
+                    // three reads on the scheduled law), its proportional
+                    // cut and the cross-track trim's (see [`RollCut`]).
+                    "xtk_used": cut.xtk_m, "cut": cut.cut_deg, "cut_i": cut.cut_i_deg,
+                    // Which read the position came from: "plugin" is one
+                    // frame (xcopilot/position), "split" the separate stock
+                    // reads of an older plugin (#157).
+                    "pos": pos_source,
+                    // The sim's yaw rate the scheduled law damps on (null on a
+                    // failed read), and whether it flew (the 737's
+                    // `roll_rudder:`). Until 2026-09-28 `r` carried the
+                    // brake split's differenced error instead, spikes and all.
                     "r": yaw_dps, "law": if steer_law.scheduled() { "rudder" } else { "default" },
                     "thr": thr_cmd, "remaining_m": remaining, "dt": dt, "trq_ftlb": torque_ftlb,
                 }),
@@ -4153,7 +4373,9 @@ mod tests {
     /// A 737 takeoff roll through the plant fitted to both EGKK 26L rolls of
     /// 2026-09-27 (30 to 86 kt, three-second predictions of the heading
     /// 0.07 degrees rms): a unit of steer holds 6.45 deg/s of yaw at 60 kt,
-    /// growing with v², reached through a 0.47 s lag after 0.3 s of dead
+    /// growing with v² to the 86 kt that fit reached and as v^1.25 past it
+    /// (every 737 roll of the 27th and 28th refitted to Vr: never v², 12.6
+    /// at 132 kt where v² reads 31), reached through a 0.47 s lag after 0.3 s of dead
     /// time (second order from steer to heading), plus the nosewheel at a
     /// walk; the crosswind from the left yaws it into the wind by
     /// 2.48 deg/s per 60 kt less 0.99 at the recorded 7.4 kt, in proportion.
@@ -4239,7 +4461,9 @@ mod tests {
                     applied = queue.pop_front().map_or(applied, |(_, s)| s);
                 }
                 let nose = 0.23 * gs * (1.0 - gs / 40.0).max(0.0);
-                let rudder = kscale * 6.45 * (gs / 60.0).powi(2) + nose;
+                let fitted = gs.min(86.0);
+                let past = (gs.max(86.0) / 86.0).powf(1.25);
+                let rudder = kscale * 6.45 * (fitted / 60.0).powi(2) * past + nose;
                 let weathervane = xw_kt / 7.4 * (2.48 * gs / 60.0 - 0.99).max(0.0);
                 yaw += (rudder * applied - weathervane - yaw) * H / LAG_S;
                 psi += yaw * H;
@@ -4352,9 +4576,14 @@ mod tests {
 
     /// No wind (the LIBP case the trim scaling was for): the scheduled law
     /// recovers an offset without weaving and overshoots no more than the
-    /// default law, with the real rudder as declared, half of it or two and a
-    /// half times it; and a crosswind with a rudder not as declared is still
-    /// held in half the default law's excursion or less.
+    /// default law, with the real rudder as the plant has it, half of it or
+    /// 1.75 times it; and a crosswind with a rudder not as declared is still
+    /// held in half the default law's excursion or less. (Until 2026-09-28
+    /// the strong case was 2.5 times a plant growing as v² to Vr: 100 deg/s
+    /// per unit at 150 kt, eight times what either day's rolls measured. On
+    /// the refitted plant 1.75 is still 3.4 to 5 times the measured rudder
+    /// at Vr; at 2 an engage 2 m off and 1.5 degrees crooked at 80 kt swings
+    /// twice, at 2.5 the loop rings near Vr.)
     #[test]
     fn the_scheduled_roll_law_does_not_weave() {
         // The far side of the centreline from where it started.
@@ -4364,7 +4593,7 @@ mod tests {
                 .map(|k| -k.xtk * xtk0.signum())
                 .fold(0.0, f64::max)
         };
-        for kscale in [0.5, 1.0, 2.5] {
+        for kscale in [0.5, 1.0, 1.75] {
             for (gs0, xtk0, psi_off) in [(0.0, 3.0, 1.0), (40.0, 3.0, 2.0), (80.0, -2.0, -1.5)] {
                 let old = fly_737_roll(
                     default_737_law(),
@@ -4615,6 +4844,361 @@ mod tests {
             at_kts: 80.0,
         };
         assert!(!RollSteer::with_rudder(true, silly).scheduled());
+    }
+
+    /// The 737 rolls of 2026-09-28 (bench/takeoffs, every `roll` tick of
+    /// EGKK 08R 1790601822 and the seven LEMG 13 circuits), one Vec per roll.
+    fn rolls_0928() -> Vec<(String, Vec<serde_json::Value>)> {
+        const TEXT: &str = include_str!("../bench/takeoffs/b738_rolls_2026-09-28.jsonl");
+        let mut rolls: Vec<(String, Vec<serde_json::Value>)> = Vec::new();
+        for r in TEXT
+            .lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        {
+            let id = r["sortie"].as_str().unwrap_or("").to_string();
+            match rolls.last_mut() {
+                Some((last, ticks)) if *last == id => ticks.push(r),
+                _ => rolls.push((id, vec![r])),
+            }
+        }
+        rolls
+    }
+
+    /// The 737's rudder on 2026-09-28, deg/s of yaw per unit of steer: the
+    /// recorded steer through 0.3 s of dead time and a 0.47 s lag, fitted
+    /// per speed band to three-second heading predictions of all eight
+    /// rolls with a disturbance per roll (0.29 degrees rms).
+    fn rudder_0928(gs: f64) -> f64 {
+        const PTS: [(f64, f64); 7] = [
+            (30.0, 3.5),
+            (45.0, 3.5),
+            (70.0, 4.0),
+            (90.0, 5.4),
+            (110.0, 5.8),
+            (132.0, 8.5),
+            (170.0, 10.5),
+        ];
+        if gs <= PTS[0].0 {
+            return PTS[0].1;
+        }
+        for w in PTS.windows(2) {
+            if gs <= w[1].0 {
+                let f = (gs - w[0].0) / (w[1].0 - w[0].0);
+                return w[0].1 + (w[1].1 - w[0].1) * f;
+            }
+        }
+        PTS[PTS.len() - 1].1
+    }
+
+    /// The same fit over the 737 rolls of 2026-09-27 (EGKK 26L twice, EGBB,
+    /// LEMG twice) to Vr: about v^1.25, 7.2 at 80 kt.
+    fn rudder_0927(gs: f64) -> f64 {
+        7.2 * (gs.max(0.0) / 80.0).powf(1.25)
+    }
+
+    /// One recorded roll replayed under a law: the aircraft is the recorded
+    /// one plus the response to the DIFFERENCE between the law's steer and
+    /// the recorded steer, through the fitted rudder, the loop's 0.3 s of
+    /// dead time and the 0.47 s lag, and the ground geometry. Everything the
+    /// recorded roll met (gusts, the tyres' slip, the cross-track spikes of
+    /// the position read) is met again as it came. Returns per tick
+    /// (gs, cross-track the law read, the TRUE cross-track (the median of
+    /// five reads, which no single-tick spike passes), steer), and the
+    /// largest difference between the replayed steer and the recorded one.
+    fn replay_roll(
+        ticks: &[serde_json::Value],
+        mut law: RollSteer,
+        mut cut: RollCut,
+        rudder: &dyn Fn(f64) -> f64,
+    ) -> (Vec<(f64, f64, f64, f64)>, f64) {
+        const DEAD_S: f64 = 0.3;
+        const LAG_S: f64 = 0.47;
+        const H: f64 = 0.01;
+        let g = |r: &serde_json::Value, k: &str| r[k].as_f64().unwrap_or(0.0);
+        let n = ticks.len();
+        let mut ts = vec![0.0; n];
+        for k in 1..n {
+            ts[k] = ts[k - 1] + g(&ticks[k], "dt");
+        }
+        let psi: Vec<f64> = ticks.iter().map(|r| g(r, "psi")).collect();
+        // The sim's yaw rate the law damped on, as the heading's own rate
+        // (the recorded `r` was not it; see the roll tick's comment).
+        let yaw_rec: Vec<f64> = (0..n)
+            .map(|k| {
+                let (a, b) = (k.saturating_sub(1), (k + 1).min(n - 1));
+                let d = ((psi[b] - psi[a] + 540.0).rem_euclid(360.0)) - 180.0;
+                if ts[b] > ts[a] {
+                    d / (ts[b] - ts[a])
+                } else {
+                    0.0
+                }
+            })
+            .collect();
+        let xtk_rec: Vec<f64> = ticks.iter().map(|r| g(r, "xtk_m")).collect();
+        let truth: Vec<f64> = (0..n)
+            .map(|k| {
+                let mut w: Vec<f64> = xtk_rec[k.saturating_sub(2)..(k + 3).min(n)].to_vec();
+                w.sort_by(|a, b| a.total_cmp(b));
+                w[w.len() / 2]
+            })
+            .collect();
+        // The runway course, from a tick of the law as flown.
+        let r5 = &ticks[5];
+        let course = g(r5, "tgt")
+            + g(r5, "drift")
+            + roll_cut_deg(g(r5, "xtk_m"), g(r5, "xtk_rate"), g(r5, "gs"));
+        let (mut dyaw, mut dpsi, mut dx) = (0.0_f64, 0.0_f64, 0.0_f64);
+        let mut queue: std::collections::VecDeque<(f64, f64)> = Default::default();
+        let mut applied = 0.0_f64;
+        let mut t = 0.0_f64;
+        let mut out = Vec::with_capacity(n);
+        let mut dev = 0.0_f64;
+        for k in 0..n {
+            let r = &ticks[k];
+            let dt = if k == 0 { 0.2 } else { g(r, "dt") };
+            if k > 0 {
+                let (gs0, gs1) = (g(&ticks[k - 1], "gs"), g(r, "gs"));
+                let end = ts[k];
+                while t < end - 1e-9 {
+                    while queue.front().is_some_and(|(at, _)| *at <= t) {
+                        applied = queue.pop_front().map_or(applied, |(_, s)| s);
+                    }
+                    let gs = gs0 + (gs1 - gs0) * (1.0 - (end - t) / dt);
+                    dyaw += (rudder(gs) * applied - dyaw) * H / LAG_S;
+                    dpsi += dyaw * H;
+                    dx += gs / MS_TO_KTS * dpsi.to_radians() * H;
+                    t += H;
+                }
+                t = end;
+            }
+            let gs = g(r, "gs");
+            let psi_off = ((psi[k] + dpsi - course + 540.0).rem_euclid(360.0)) - 180.0;
+            let c = cut.update(xtk_rec[k] + dx, psi_off, gs, dt);
+            let err = c.target_off_deg - psi_off;
+            let steer = law.step_with_yaw(err, dt, gs, 1.0, Some(yaw_rec[k] + dyaw));
+            dev = dev.max((steer - g(r, "steer")).abs());
+            queue.push_back((t + DEAD_S, steer - g(r, "steer")));
+            out.push((gs, c.xtk_m, truth[k] + dx, steer));
+        }
+        (out, dev)
+    }
+
+    /// Worst true offset from 30 kt, the true offset at liftoff (the last
+    /// roll tick), and tick-to-tick steer jumps past 0.08 (the weave).
+    fn roll_verdict(out: &[(f64, f64, f64, f64)]) -> (f64, f64, usize) {
+        let worst = out
+            .iter()
+            .filter(|o| o.0 >= 30.0)
+            .map(|o| o.2.abs())
+            .fold(0.0, f64::max);
+        let lift = out.last().map_or(0.0, |o| o.2);
+        let swings = out
+            .windows(2)
+            .filter(|w| w[0].0 >= 30.0 && (w[1].3 - w[0].3).abs() > 0.08)
+            .count();
+        (worst, lift, swings)
+    }
+
+    /// The replay is the flight: the law as flown on 2026-09-28, replayed
+    /// through it, writes the recorded steer tick for tick (so the replay
+    /// carries everything the aircraft met), and the recorded offsets are
+    /// the failures being fixed: EGKK 08R lifted off 5.4 m left (5.8 m worst,
+    /// the takeoff FAIL), LEMG 1790591256 9.0 m worst and 5.9 at liftoff.
+    #[test]
+    fn the_recorded_737_rolls_replay_as_flown() {
+        let rolls = rolls_0928();
+        assert_eq!(rolls.len(), 8, "eight rolls on the bench");
+        let mut failed = 0;
+        for (id, ticks) in &rolls {
+            let law = RollSteer::with_rudder(true, rudder_737()).as_flown();
+            let (_, dev) = replay_roll(
+                ticks,
+                law,
+                RollCut::for_law(&RollSteer::with_rudder(true, rudder_737())).as_flown(),
+                &rudder_0928,
+            );
+            assert!(
+                dev < 0.01,
+                "{id}: the replayed law strays {dev:.4} from the recorded steer"
+            );
+            let xs: Vec<f64> = ticks
+                .iter()
+                .filter(|r| r["gs"].as_f64().unwrap_or(0.0) >= 30.0)
+                .map(|r| r["xtk_m"].as_f64().unwrap_or(0.0))
+                .collect();
+            let worst = xs.iter().map(|x| x.abs()).fold(0.0, f64::max);
+            let lift = xs.last().copied().unwrap_or(0.0);
+            if worst > 3.0 || lift.abs() > 2.0 {
+                failed += 1;
+            }
+            if id.starts_with("1790601822") {
+                assert!(
+                    (5.7..=5.9).contains(&worst) && (-5.5..=-5.3).contains(&lift),
+                    "{worst} {lift}"
+                );
+            }
+        }
+        assert!(
+            failed >= 4,
+            "the rolls as flown: {failed} outside 3 m worst or 2 m at liftoff"
+        );
+    }
+
+    /// The fix, replayed through every recorded roll of 2026-09-28: the
+    /// heading loop scheduled on the declared rudder only up to the speed it
+    /// was measured at, the cut held harder from 40 kt with a cross-track
+    /// trim, and the cross-track read through a median of three. On the
+    /// rudder fitted to these rolls and to the 27th's, each lifts off within
+    /// 2 m of the centreline and never strays 3 m (the scorer's roll limit
+    /// is 5), with no weave; on a rudder 0.6 or 3 times that day's it stays
+    /// within 3.5 m and does not weave. And no roll is worse than it flew.
+    #[test]
+    fn the_737_roll_holds_the_centreline_through_liftoff() {
+        let rolls = rolls_0928();
+        let fly = |ticks: &[serde_json::Value], rudder: &dyn Fn(f64) -> f64| {
+            let law = RollSteer::with_rudder(true, rudder_737());
+            roll_verdict(
+                &replay_roll(
+                    ticks,
+                    law,
+                    RollCut::for_law(&RollSteer::with_rudder(true, rudder_737())),
+                    rudder,
+                )
+                .0,
+            )
+        };
+        for (id, ticks) in &rolls {
+            let flown = {
+                let law = RollSteer::with_rudder(true, rudder_737()).as_flown();
+                roll_verdict(
+                    &replay_roll(
+                        ticks,
+                        law,
+                        RollCut::for_law(&RollSteer::with_rudder(true, rudder_737())).as_flown(),
+                        &rudder_0928,
+                    )
+                    .0,
+                )
+            };
+            for (name, rudder) in [
+                ("09-28", &rudder_0928 as &dyn Fn(f64) -> f64),
+                ("09-27", &rudder_0927),
+            ] {
+                let (worst, lift, swings) = fly(ticks, rudder);
+                println!(
+                    "{id} {name}: worst {worst:.1} m, liftoff {lift:+.1} m (flown {:.1}, {:+.1})",
+                    flown.0, flown.1
+                );
+                assert!(
+                    worst <= 3.0,
+                    "{id} on the {name} rudder: {worst:.1} m worst"
+                );
+                assert!(
+                    lift.abs() <= 2.0,
+                    "{id} on the {name} rudder: {lift:+.1} m at liftoff"
+                );
+                assert_eq!(swings, 0, "{id} on the {name} rudder: the steer weaves");
+                assert!(
+                    worst <= flown.0 + 0.3,
+                    "{id}: {worst:.1} m against {:.1} flown",
+                    flown.0
+                );
+            }
+            for scale in [0.6, 3.0] {
+                let rudder = move |gs: f64| scale * rudder_0928(gs);
+                let (worst, lift, swings) = fly(ticks, &rudder);
+                assert!(
+                    worst <= 3.5 && lift.abs() <= 2.5,
+                    "{id} on x{scale} the rudder: {worst:.1} m worst, {lift:+.1} at liftoff"
+                );
+                assert_eq!(swings, 0, "{id} on x{scale} the rudder: the steer weaves");
+            }
+        }
+    }
+
+    /// The cross-track read pairs two frames now and then (latitude and
+    /// longitude are separate requests): on LEMG 13 up to 2.9 m for one tick
+    /// above 120 kt. The median of three never passes a single-tick spike,
+    /// follows a real movement a tick late, and the default law reads the
+    /// raw value as it always has.
+    #[test]
+    fn a_single_tick_position_spike_never_reaches_the_cut() {
+        let mut cut = RollCut::for_law(&RollSteer::with_rudder(true, rudder_737()));
+        let mut plain = RollCut::new(None);
+        let mut seen = Vec::new();
+        for (k, x) in [0.5, 0.52, 0.54, 3.4, 0.58, 0.60, 0.62]
+            .into_iter()
+            .enumerate()
+        {
+            let c = cut.update(x, 0.0, 120.0, 0.22);
+            let p = plain.update(x, 0.0, 120.0, 0.22);
+            if k == 3 {
+                assert_eq!(p.xtk_m, 3.4, "the default law reads the raw value");
+            }
+            seen.push(c.xtk_m);
+        }
+        assert!(
+            seen.iter().all(|x| *x < 0.7),
+            "a spike reached the cut: {seen:?}"
+        );
+        // A real step is followed, one tick late.
+        let mut cut = RollCut::for_law(&RollSteer::with_rudder(true, rudder_737()));
+        let steps: Vec<f64> = [0.0, 0.0, 0.0, 2.0, 2.0, 2.0]
+            .into_iter()
+            .map(|x| cut.update(x, 0.0, 120.0, 0.22).xtk_m)
+            .collect();
+        assert_eq!(steps[3], 0.0);
+        assert_eq!(steps[4], 2.0);
+    }
+
+    /// Below 40 kt the scheduled roll's cut is the one it flew on what it
+    /// reads: no trim, no extra gain; the heading law is unchanged below
+    /// 40 kt, and past the declared speed its gain holds.
+    #[test]
+    fn the_slow_roll_is_the_one_it_was() {
+        let mut new = RollCut::for_law(&RollSteer::with_rudder(true, rudder_737()));
+        for (x, gs) in [
+            (0.3, 5.0),
+            (0.6, 12.0),
+            (1.0, 20.0),
+            (1.4, 30.0),
+            (1.6, 39.0),
+        ] {
+            for _ in 0..3 {
+                let c = new.update(x, 0.4, gs, 0.25);
+                assert_eq!(
+                    c.cut_deg,
+                    roll_cut_deg(c.xtk_m, c.rate_m_s, gs),
+                    "{x} m at {gs} kt"
+                );
+                assert_eq!(c.cut_i_deg, 0.0);
+            }
+        }
+        // From 80 kt the cut is twice the closure-time cut on the same reads.
+        let mut fast = RollCut::for_law(&RollSteer::with_rudder(true, rudder_737()));
+        for _ in 0..3 {
+            let c = fast.update(1.0, 0.0, 120.0, 0.25);
+            assert!((c.cut_deg - 2.0 * roll_cut_deg(c.xtk_m, c.rate_m_s, 120.0)).abs() < 1e-12);
+        }
+        let mut a = RollSteer::with_rudder(true, rudder_737());
+        let mut b = RollSteer::with_rudder(true, rudder_737()).as_flown();
+        for (err, gs) in [(2.0, 10.0), (1.0, 25.0), (-1.5, 35.0), (0.5, 39.0)] {
+            assert_eq!(
+                a.step_with_yaw(err, 0.25, gs, 1.0, Some(0.2)),
+                b.step_with_yaw(err, 0.25, gs, 1.0, Some(0.2))
+            );
+        }
+        // Past the declared speed the gain holds instead of falling as 1/v².
+        let kp = |gs: f64| {
+            let mut l = RollSteer::with_rudder(true, rudder_737());
+            l.step_with_yaw(1.0, 0.25, gs, 1.0, Some(0.0))
+        };
+        assert!(
+            (kp(140.0) - kp(80.0)).abs() < 1e-9,
+            "{} {}",
+            kp(140.0),
+            kp(80.0)
+        );
     }
 
     #[test]
@@ -6616,5 +7200,202 @@ mod tests {
         }
         assert!(p > 0.05, "prop leads right: {p}");
         assert!(j.abs() < 1e-9, "jet leads nothing: {j}");
+    }
+
+    /// A sim whose frames run on while the Web API answers: every request is
+    /// served `frames_per_request` frames after the one before it, as the
+    /// API serves each request from whichever flight-loop frame it lands in.
+    /// The aircraft flies `truth` (time s, along m, cross-track m right of
+    /// `course`) from `thr`. `plugin` is a plugin that publishes
+    /// `xcopilot/position`, copied in the frame its request lands in.
+    struct FrameSim {
+        thr: (f64, f64),
+        course: f64,
+        truth: Vec<(f64, f64, f64)>,
+        t0: std::sync::Mutex<f64>,
+        frame: std::sync::atomic::AtomicU64,
+        frames_per_request: u64,
+        plugin: bool,
+    }
+
+    const SIM_FPS: f64 = 30.0;
+
+    impl FrameSim {
+        /// The aircraft at time `t`: (lat, lon), groundspeed m/s.
+        fn at(&self, t: f64) -> ((f64, f64), f64) {
+            let k = self
+                .truth
+                .windows(2)
+                .position(|w| t < w[1].0)
+                .unwrap_or(self.truth.len() - 2);
+            let (a, b) = (self.truth[k], self.truth[k + 1]);
+            let f = ((t - a.0) / (b.0 - a.0)).clamp(0.0, 1.5);
+            let along = a.1 + f * (b.1 - a.1);
+            let xtk = a.2 + f * (b.2 - a.2);
+            let gs = (b.1 - a.1) / (b.0 - a.0);
+            let on_line = project_latlon(self.thr.0, self.thr.1, self.course, along / M_PER_NM);
+            let right = (self.course + 90.0).rem_euclid(360.0);
+            (project_latlon(on_line.0, on_line.1, right, xtk / M_PER_NM), gs)
+        }
+        /// The time the next request is served at.
+        fn next_t(&self) -> f64 {
+            let f = self
+                .frame
+                .fetch_add(self.frames_per_request, std::sync::atomic::Ordering::SeqCst);
+            *self.t0.lock().unwrap() + f as f64 / SIM_FPS
+        }
+        /// Start a tick's reads at `t`.
+        fn tick_at(&self, t: f64) {
+            *self.t0.lock().unwrap() = t;
+            self.frame.store(0, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::xplane::XPlane for FrameSim {
+        async fn get_float(&self, name: &str) -> anyhow::Result<f64> {
+            let ((lat, lon), gs) = self.at(self.next_t());
+            Ok(match name {
+                LAT => lat,
+                LON => lon,
+                PSI_TRUE => self.course,
+                GS_MS => gs,
+                _ => 0.0,
+            })
+        }
+        async fn get_bytes(&self, name: &str) -> anyhow::Result<Vec<u8>> {
+            anyhow::ensure!(
+                self.plugin && name == sim::position::POSITION,
+                "dataref not found: {name}"
+            );
+            let t = self.next_t();
+            let ((lat, lon), gs) = self.at(t);
+            Ok(sim::position::encode(&sim::position::Position {
+                lat,
+                lon,
+                elev_m: 0.0,
+                psi_true_deg: self.course,
+                gs_ms: gs,
+                vs_fpm: 0.0,
+                agl_m: 0.0,
+                frame: Some((t * SIM_FPS).round() as u64),
+                sim_time_s: Some(t),
+                source: sim::position::Source::Plugin,
+            }))
+        }
+        async fn set_float(&self, _: &str, _: f64) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn set_int(&self, _: &str, _: i64) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn run_command(&self, _: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn run_command_for(&self, _: &str, _: f64) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn get_float_array(&self, _: &str) -> anyhow::Result<Vec<f64>> {
+            Ok(vec![])
+        }
+        async fn set_int_array_elem(&self, _: &str, _: usize, _: i64) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn set_float_array_elem(&self, _: &str, _: usize, _: f64) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// #157: latitude and longitude read as two requests pair two frames. The
+    /// LEMG 13 roll of 1790591256 (every `roll` tick, its groundspeed and
+    /// cross-track as the truth, on 13's diagonal) is flown through a sim
+    /// that serves each request two frames after the last (30 fps), and each
+    /// tick is read the way the roll reads it. Split, the cross-track the law
+    /// is handed is off the aircraft's own by up to 3.0 m above 120 kt (the
+    /// 2.9 m flown), a different error every tick; from the plugin's
+    /// one-frame snapshot it is the aircraft's own, every tick. On EGKK 08R's
+    /// east-west strip the same lag is under half of it.
+    #[tokio::test]
+    async fn one_frames_position_never_pairs_two_frames() {
+        async fn worst(
+            ticks: &[serde_json::Value],
+            course: f64,
+            plugin: bool,
+        ) -> (f64, sim::position::Source) {
+            // Along-track from the logged groundspeed, the logged
+            // cross-track as the aircraft's.
+            let mut truth = Vec::new();
+            let (mut along, mut last_t) = (0.0, None::<f64>);
+            for r in ticks {
+                let t = r["t"].as_f64().unwrap();
+                let gs_ms = r["gs"].as_f64().unwrap() / MS_TO_KTS;
+                if let Some(t0) = last_t {
+                    along += gs_ms * (t - t0);
+                }
+                last_t = Some(t);
+                truth.push((t, along, r["xtk_m"].as_f64().unwrap()));
+            }
+            let sim = FrameSim {
+                thr: (36.6893, -4.5147),
+                course,
+                truth: truth.clone(),
+                t0: std::sync::Mutex::new(0.0),
+                frame: std::sync::atomic::AtomicU64::new(0),
+                frames_per_request: 2,
+                plugin,
+            };
+            let rwy = Runway {
+                icao: "TEST".into(),
+                id: "13".into(),
+                thr_lat: sim.thr.0,
+                thr_lon: sim.thr.1,
+                course_deg: course,
+                length_m: 3200.0,
+                surface: 1,
+                dist_nm: 0.0,
+                elev_ft: 0.0,
+            };
+            let (mut worst, mut source) = (0.0_f64, sim::position::Source::Split);
+            for (r, (t, _, _)) in ticks.iter().zip(&truth) {
+                if r["gs"].as_f64().unwrap() < 120.0 {
+                    continue;
+                }
+                sim.tick_at(*t);
+                let pos = sim::position::read(&sim).await.unwrap();
+                source = pos.source;
+                let read_m = cross_track_nm(pos.lat, pos.lon, &rwy) * M_PER_NM;
+                // The aircraft's own cross-track in the frame the reading
+                // began in.
+                let ((lat, lon), _) = sim.at(*t);
+                let own_m = cross_track_nm(lat, lon, &rwy) * M_PER_NM;
+                worst = worst.max((read_m - own_m).abs());
+            }
+            (worst, source)
+        }
+        let rolls = rolls_0928();
+        let (_, lemg) = rolls
+            .iter()
+            .find(|(id, _)| id.starts_with("1790591256"))
+            .expect("the LEMG 13 roll");
+        // LEMG 13 true course by the rolls' heading on the line.
+        let (split, src) = worst(lemg, 132.2, false).await;
+        assert_eq!(src, sim::position::Source::Split);
+        assert!(
+            split > 1.5,
+            "split reads should pair two frames on the diagonal: {split:.2} m"
+        );
+        let (snap, src) = worst(lemg, 132.2, true).await;
+        assert_eq!(src, sim::position::Source::Plugin);
+        assert!(
+            snap < 0.005,
+            "one frame's position is the aircraft's: {snap:.4} m"
+        );
+        // The same lag on EGKK 08R's course: under half the diagonal's
+        // (1.2 m against 3.0 here).
+        let (east_west, _) = worst(lemg, 77.6, false).await;
+        assert!(
+            east_west < 0.5 * split,
+            "{east_west:.2} m east-west vs {split:.2} diagonal"
+        );
     }
 }

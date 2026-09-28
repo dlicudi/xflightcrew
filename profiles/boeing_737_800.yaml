@@ -86,7 +86,12 @@ flare_power:
   retard_at_s: 2.0
   retard_fast_kts: 0.0
   # A flare 5 kt under the approach speed keeps its thrust: a knot taken is
-  # 63 fpm at the wheels (the fitted plant).
+  # 63 fpm at the wheels (the fitted plant). Only while it is still sinking
+  # and the retard has not begun: a FLOAT (under 100 fpm, now or 1.5 s
+  # ahead on the trend) takes the lever off at retard_max_per_s whatever
+  # the height or the speed. EGBB 15 (2026-09-28) floated 4 s at 22.7 ft on
+  # 0.30 held by height, time and then this key; replayed through that
+  # flare's own fit, the float key lands it with no float, 280 m shorter.
   retard_slow_kts: 5.0
   # No faster than 0.04 a second (0.08: 292 worst, 347 through the strong
   # 17:25 plant). A lever still up at the wheels is the rollout's to close.

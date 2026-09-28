@@ -2137,7 +2137,7 @@ pub static ITEMS: &[Item] = &[
         since: S0924,
         airframe: None,
         fly: "SF50 (the only profile with cabin_air) full auto above FL100",
-        evidence: "full_auto cabin_air: bleed, oxygen, changed; cabin_air valve_sync",
+        evidence: "full_auto cabin_air: bleed, oxygen (the supply), changed; cabin_air masks don/doff/released",
         pass: "bleed and oxygen both read on",
         check: Some(c_cabin_air),
     },

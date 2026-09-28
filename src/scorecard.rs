@@ -509,6 +509,15 @@ impl Scorer {
             {
                 self.crashed = true
             }
+            // A reposition (the flight model saw the aircraft jump: a new
+            // flight, a setup, a reload) or another airframe is not a
+            // landing: the air track before it belonged to another flight.
+            // The runner's swap from the SR22 still on final to 30 at
+            // 1,270 ft to the SF50 on 13's threshold (1790607309.3,
+            // 2026-09-28) scored "touched down at 549 fpm", the SR22's
+            // approach sink met by the SF50's wheels on the runway (#158).
+            ("flight", _) if s(r, "ev") == "reposition" => self.new_flight(&mut out),
+            ("flight_meta", _) => self.new_flight(&mut out),
             ("flight", _) if s(r, "ev") == "touchdown" => {
                 self.flight_td = f(r, "sink").map(|sink| (t, sink.min(0.0).abs()))
             }
@@ -564,6 +573,17 @@ impl Scorer {
             _ => {}
         }
         out
+    }
+
+    /// A new flight: whatever was airborne before it never lands. A landing
+    /// already open (its wheels met the runway before the jump) is judged.
+    fn new_flight(&mut self, out: &mut Vec<(String, Value)>) {
+        self.close_landing(out);
+        self.airborne_since = None;
+        self.air.clear();
+        self.contact = None;
+        self.flare_vvi.clear();
+        self.flight_td = None;
     }
 
     fn taxi_tick(&mut self, r: &Value, t: f64) {
@@ -1582,5 +1602,96 @@ mod tests {
         let before = json!({"t": -5.0, "kind": "flight", "ev": "impact", "sink": -3353.0});
         let sortie = taxi_sortie(Some(before), None);
         assert_eq!(sortie["pass"], true, "{sortie}");
+    }
+
+    /// #158: the runner's swap from the SR22 still on final to LEMG 30
+    /// (1,270 ft, 549 fpm down) to the SF50 on 13's threshold was scored as a
+    /// landing: "touched down at 549 fpm", `t_touchdown` 1790607309.3, the
+    /// flight model's `reposition` itself. The records around it as recorded
+    /// (the SR22's descent before 1790607300.4 at its recorded sink).
+    #[test]
+    fn a_reposition_is_never_a_touchdown() {
+        let air = |t: f64, agl: f64, vsi: f64| {
+            json!({"t": t, "kind": "state", "ground": false, "agl": agl, "vsi": vsi,
+                   "hdg": 299.3, "track": 298.2, "crashed": false})
+        };
+        let ground = |t: f64, vsi: f64, track: f64| {
+            json!({"t": t, "kind": "state", "ground": true, "agl": 0.0, "vsi": vsi,
+                   "hdg": 132.0, "track": track, "crashed": false})
+        };
+        let mut recs = Vec::new();
+        for i in 0..36 {
+            let t = 1790607250.0 + i as f64 * 1.4;
+            recs.push(air(t, 1700.0 - i as f64 * 12.0, -549.0));
+        }
+        recs.push(air(1790607300.4, 1271.1, -548.1));
+        recs.push(json!({"t": 1790607300.7, "kind": "flight", "ev": "reposition", "to": "Approach"}));
+        for t in [1790607300.7, 1790607301.1, 1790607301.7] {
+            recs.push(air(t, -193.9, -549.3));
+        }
+        recs.push(json!({"t": 1790607302.1, "kind": "flight_meta", "aircraft": "cirrus_vision_sf50"}));
+        for t in [1790607302.1, 1790607303.5, 1790607308.7] {
+            recs.push(air(t, -193.9, -549.3));
+        }
+        recs.push(json!({"t": 1790607309.3, "kind": "flight", "ev": "reposition", "to": "LinedUp"}));
+        for t in [1790607309.3, 1790607309.6, 1790607310.0] {
+            recs.push(ground(t, 0.0, 0.0));
+        }
+        recs.push(json!({"t": 1790607309.9, "kind": "autoland", "radio": 1073.5, "vvi": 0.0,
+                         "ground": false}));
+        for i in 0..10 {
+            recs.push(ground(1790607311.8 + i as f64 * 0.35, 1.6, 139.8));
+        }
+        recs.push(ground(1790607330.0, 0.0, 139.8));
+        let landings = |recs: &[Value]| -> Vec<Value> {
+            score_all(recs.iter())
+                .into_iter()
+                .filter(|v| s(v, "stage") == "landing")
+                .collect()
+        };
+        assert!(landings(&recs).is_empty(), "{:?}", landings(&recs));
+        // The same stream with no word of the new flight is the recorded
+        // verdict: the scorer path the markers now close.
+        let blind: Vec<Value> = recs
+            .iter()
+            .filter(|r| s(r, "kind") != "flight_meta" && s(r, "ev") != "reposition")
+            .cloned()
+            .collect();
+        let old = landings(&blind);
+        assert_eq!(old.len(), 1, "{old:?}");
+        assert_eq!(old[0]["sink_fpm"], 549.0);
+        assert_eq!(old[0]["t_touchdown"], 1790607309.3);
+        // Either marker alone is a new flight.
+        for keep in ["flight_meta", "reposition"] {
+            let one: Vec<Value> = recs
+                .iter()
+                .filter(|r| match keep {
+                    "flight_meta" => s(r, "ev") != "reposition",
+                    _ => s(r, "kind") != "flight_meta"
+                        && !(s(r, "ev") == "reposition" && s(r, "to") == "Approach"),
+                })
+                .cloned()
+                .collect();
+            assert!(landings(&one).is_empty(), "{keep}: {:?}", landings(&one));
+        }
+    }
+
+    /// A landing whose wheels met the runway BEFORE a reposition is still
+    /// judged: the new flight closes it, it does not erase it.
+    #[test]
+    fn a_landing_before_a_reposition_is_still_judged() {
+        let mut recs = Vec::new();
+        for i in 0..40 {
+            recs.push(json!({"t": i as f64, "kind": "state", "ground": false, "agl": 500.0,
+                             "vsi": -180.0, "hdg": 130.0, "track": 130.0, "crashed": false}));
+        }
+        recs.push(json!({"t": 40.0, "kind": "state", "ground": true, "agl": 0.0, "vsi": -180.0,
+                         "hdg": 130.0, "track": 130.0, "crashed": false}));
+        recs.push(json!({"t": 42.0, "kind": "flight", "ev": "reposition", "to": "LinedUp"}));
+        let card = score_all(recs.iter());
+        let l: Vec<&Value> = card.iter().filter(|v| s(v, "stage") == "landing").collect();
+        assert_eq!(l.len(), 1, "{card:?}");
+        assert_eq!(l[0]["t_touchdown"], 40.0);
+        assert_eq!(l[0]["pass"], true);
     }
 }

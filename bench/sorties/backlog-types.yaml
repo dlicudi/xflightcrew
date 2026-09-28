@@ -3,6 +3,9 @@
 # Every case loads its aircraft (setup.aircraft) and waits for the app to
 # swap to it before the first line. The shape is lemg-737.yaml's header.
 # Parse-tested (every line pinned to the tool it must reach), not yet flown.
+# `runway: wind` is the tower's into-wind end at each case's setup (#158);
+# the finals carry no deadline of their own, so each gets the default scaled
+# to its airframe's approach speed.
 
 cases:
   # SR22 from a stand: taxi, the line-up pivot on the brake (#46, #60),
@@ -14,41 +17,38 @@ cases:
     command: fly a circuit
     deadline_min: 35
 
-  - name: SR22 LEMG 13, 10 nm final
+  - name: SR22 LEMG into the wind, 10 nm final
     setup:
       aircraft: "Aircraft/Laminar Research/Cirrus SR22/Cirrus SR22.acf"
-      approach: { field: LEMG, runway: "13", final_nm: 10 }
-    deadline_min: 12
+      approach: { field: LEMG, runway: wind, final_nm: 10 }
 
   # SF50: the gear warning envelope and cabin air on the circuit (#44,
   # #41); the flare gains and the committed flare on the final (#44).
-  - name: SF50 LEMG 13 runway start, circuit
+  - name: SF50 LEMG runway start into the wind, circuit
     setup:
       aircraft: "Aircraft/Laminar Research/Cirrus Vision SF50/CirrusSF50.acf"
-      runway_start: { field: LEMG, runway: "13", engines_running: true }
+      runway_start: { field: LEMG, runway: wind, engines_running: true }
     command: fly a circuit
     deadline_min: 20
 
-  - name: SF50 LEMG 13, 10 nm final
+  - name: SF50 LEMG into the wind, 10 nm final
     setup:
       aircraft: "Aircraft/Laminar Research/Cirrus Vision SF50/CirrusSF50.acf"
-      approach: { field: LEMG, runway: "13", final_nm: 10 }
-    deadline_min: 10
+      approach: { field: LEMG, runway: wind, final_nm: 10 }
 
   # A330: transponder knobs, spoilers, runway start, altitude capture
   # (#43); the circuit's base at speed (#72).
-  - name: A330 LEMG 13 runway start, circuit
+  - name: A330 LEMG runway start into the wind, circuit
     setup:
       aircraft: "Aircraft/Laminar Research/Airbus A330-300/A330.acf"
-      runway_start: { field: LEMG, runway: "13", engines_running: true }
+      runway_start: { field: LEMG, runway: wind, engines_running: true }
     command: fly a circuit
     deadline_min: 25
 
-  - name: A330 LEMG 13, 10 nm final
+  - name: A330 LEMG into the wind, 10 nm final
     setup:
       aircraft: "Aircraft/Laminar Research/Airbus A330-300/A330.acf"
-      approach: { field: LEMG, runway: "13", final_nm: 10 }
-    deadline_min: 10
+      approach: { field: LEMG, runway: wind, final_nm: 10 }
 
   # Citation X cold and dark at a gate: the start from a cold APU (#52),
   # then the whole circuit.
@@ -59,11 +59,10 @@ cases:
     command: fly a circuit
     deadline_min: 35
 
-  - name: Citation X LEMG 13, 10 nm final
+  - name: Citation X LEMG into the wind, 10 nm final
     setup:
       aircraft: "Aircraft/Laminar Research/Cessna Citation X/Cessna_CitationX.acf"
-      approach: { field: LEMG, runway: "13", final_nm: 10 }
-    deadline_min: 10
+      approach: { field: LEMG, runway: wind, final_nm: 10 }
 
   # S-76C from a helicopter stand at Malaga to Gibraltar on a local plan:
   # the cold start, the climb checked at the arm, the approach at speed to
@@ -79,9 +78,9 @@ cases:
       - { say: fly the flight plan, when: { after_s: 15 }, tool: hover }
     deadline_min: 60
 
-  - name: S-76 LEMG 13 runway start, circuit
+  - name: S-76 LEMG runway start into the wind, circuit
     setup:
       aircraft: "Aircraft/Laminar Research/Sikorsky S-76/S-76C.acf"
-      runway_start: { field: LEMG, runway: "13", engines_running: true }
+      runway_start: { field: LEMG, runway: wind, engines_running: true }
     command: fly a circuit
     deadline_min: 20

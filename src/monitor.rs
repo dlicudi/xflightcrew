@@ -234,6 +234,9 @@ pub struct Snapshot {
     /// Position (`sim/flightmodel/position/latitude`/`longitude`).
     pub lat: f64,
     pub lon: f64,
+    /// Which read the position came from (`None` = it failed): the plugin's
+    /// one frame, or an older plugin's separate reads (#157).
+    pub pos_source: Option<sim::position::Source>,
     /// Ground track, degrees true (`sim/flightmodel/position/hpath`). `None` =
     /// the read failed; consumers treat it as "track unknown", never 0.
     pub track_deg: Option<f64>,
@@ -361,14 +364,13 @@ impl Snapshot {
             advisor_values.push(xp.get_float(dref).await.ok());
         }
         // Position + the descent picture vs the planned destination (if any).
-        let lat = xp
-            .get_float("sim/flightmodel/position/latitude")
-            .await
-            .unwrap_or(0.0);
-        let lon = xp
-            .get_float("sim/flightmodel/position/longitude")
-            .await
-            .unwrap_or(0.0);
+        // One frame's latitude and longitude (#157): read separately they
+        // paired two frames, metres apart at speed, and this is the position
+        // the taxi guide projects and the `state` record the scorer judges.
+        let (lat, lon, pos_source) = match sim::position::read_lat_lon(xp).await {
+            Ok((lat, lon, src)) => (lat, lon, Some(src)),
+            Err(_) => (0.0, 0.0, None),
+        };
         let track_deg = xp.get_float("sim/flightmodel/position/hpath").await.ok();
         let heading_deg = xp
             .get_float("sim/flightmodel/position/psi")
@@ -611,6 +613,7 @@ impl Snapshot {
             advisor_values,
             lat,
             lon,
+            pos_source,
             track_deg,
             heading_deg,
             bank_deg,
@@ -3479,9 +3482,16 @@ pub async fn run(
             // still silence it; a normal landing does not.
             let cabin_quiet = gates.cabin_quiet;
             feed_surface_wind();
-            // The oxygen valve follows the oxygen master (crew hands only).
+            // The crew's oxygen masks: on in the cabin-altitude warning band,
+            // off again below it, never over the pilot (crew hands only;
+            // #159: they used to follow the master and breathed all flight).
             if crate::mode::crew_actuates() {
-                let _ = crate::tools::cabin_air::sync_valve(&xp).await;
+                if let Some((urgent, line)) =
+                    crate::tools::cabin_air::masks_tick(&xp, snap.on_ground).await
+                {
+                    let p = if urgent { Priority::Warning } else { Priority::Advisory };
+                    voice.alert(p, line);
+                }
             }
             // Cabin crew watches (crew-side, airframes with a cabin crew
             // only): the owed "cabin secure" report after an acknowledged
@@ -3606,6 +3616,86 @@ pub async fn run(
                     }
                 }
             }
+            // The landing's runway watch: the go-around order (a ghost on the
+            // runway that will still be there when we arrive) and the release
+            // of a withheld landing clearance. NOT under `quiet`, for the
+            // compliance watch's reason: `quiet` includes `autoland::ACTIVE`,
+            // and an autoland final is exactly the approach this watch guards.
+            // Gated with the chatter, "continue approach, expect late landing
+            // clearance" at 7 nm was never released and never judged into a
+            // go-around, and autoland landed uncleared (EGKK-EGBB 15, sortie
+            // 1790601822-full_auto, 2026-09-28, issue #155). Ticks on every
+            // live tick but a wreck; speaks unless a recovery, the panel's
+            // mute or a wreck silences the world (a muted call is consumed).
+            // The TCAS read is shared with the traffic watches below.
+            let landing_held = crate::party_line::landing_hold_armed();
+            let cleared_to_land = crate::party_line::clearance_state()
+                == Some(crate::tower::State::ClearedToLand);
+            let mut runway_watch_targets: Option<Vec<crate::station::TcasTarget>> = None;
+            if gates.compliance_ticks
+                && (landing_held || cleared_to_land)
+                && crate::station::active_field().is_some()
+            {
+                let targets = crate::station::read_tcas_targets(xp.view()).await;
+                let tower_tuned =
+                    matches!(tuned_speaker, Some(crate::voice::StationSpeaker::Tower));
+                // Safety outranks flavor: the go-around order first.
+                if let Some(call) = crate::station::go_around_tick(
+                    &targets,
+                    snap.agl_ft,
+                    snap.on_ground,
+                    tuned_speaker.is_some(),
+                    now,
+                ) {
+                    crate::blackbox::record(
+                        "atc",
+                        serde_json::json!({
+                            "route": "go_around_order", "crew": call.crew,
+                            "reply": &call.line, "autoland": gates.autoland,
+                            "said": gates.compliance_speaks,
+                        }),
+                    );
+                    if !gates.compliance_speaks {
+                        // A recovery, the panel's mute: consumed, unsaid.
+                    } else if call.crew {
+                        voice.alert(Priority::Warning, call.line);
+                    } else {
+                        // Whoever you're tuned to gives the order: a
+                        // go-around shout is any controller's to deliver,
+                        // in their own voice.
+                        let who = tuned_speaker.unwrap_or(crate::voice::StationSpeaker::Tower);
+                        if let Some(s) = status.as_ref() {
+                            s.action(&format!("{}: {}", who.tag(), call.line));
+                        }
+                        voice.alert_station(Priority::Warning, who, call.line);
+                    }
+                } else if landing_held {
+                    if let Some(line) =
+                        crate::station::landing_hold_tick(&targets, snap.on_ground, now)
+                    {
+                        crate::blackbox::record(
+                            "atc",
+                            serde_json::json!({
+                                "route": "landing_release", "reply": &line,
+                                "autoland": gates.autoland, "said": gates.compliance_speaks,
+                            }),
+                        );
+                        // The tower's clearance on the tower frequency only,
+                        // like the takeoff release.
+                        if tower_tuned && gates.compliance_speaks {
+                            if let Some(s) = status.as_ref() {
+                                s.action(&format!("TWR: {line}"));
+                            }
+                            voice.alert_station(
+                                Priority::Advisory,
+                                crate::voice::StationSpeaker::Tower,
+                                line,
+                            );
+                        }
+                    }
+                }
+                runway_watch_targets = Some(targets);
+            }
             if !quiet {
                 // Tell the speech arbiter what COM1 hears (controllers AND
                 // the ATIS loop): it cuts a live station transmission the
@@ -3664,7 +3754,14 @@ pub async fn run(
                     snap.groundspeed_kts,
                 );
                 if snap.on_ground && snap.groundspeed_kts < 30.0 && !runway_is_ours {
-                    if let Some(rwy) = crate::station::on_active_runway(snap.lat, snap.lon) {
+                    // Named by the end we point down, as the compliance
+                    // watch names it: rolling out on 15 past midfield is
+                    // not "runway three three" (EGKK-EGBB, #155).
+                    if let Some(rwy) = crate::station::on_active_runway_facing(
+                        snap.lat,
+                        snap.lon,
+                        Some(snap.heading_deg).filter(|h| *h != 0.0),
+                    ) {
                         let due =
                             incursion_last.is_none_or(|t| now.duration_since(t).as_secs() >= 15);
                         if due {
@@ -3687,11 +3784,11 @@ pub async fn run(
                                         .unwrap_or_else(|| "aircraft on the runway".to_string());
                                     let line = if urgent {
                                         format!(
-                                            "{callsign}, traffic on short final — exit the runway immediately."
+                                            "{callsign}, traffic on short final, exit the runway immediately."
                                         )
                                     } else {
                                         format!(
-                                            "{callsign}, traffic on {nm:.0} mile final — exit the runway, expedite."
+                                            "{callsign}, traffic on {nm:.0} mile final, exit the runway, expedite."
                                         )
                                     };
                                     if let Some(s) = status.as_ref() {
@@ -3700,10 +3797,10 @@ pub async fn run(
                                     voice.alert_station(Priority::Warning, who, line);
                                 } else {
                                     let line = if urgent {
-                                        "Traffic short final and we're on the runway — clear the runway NOW.".to_string()
+                                        "Traffic short final and we're on the runway. Clear the runway NOW.".to_string()
                                     } else {
                                         format!(
-                                            "Traffic on {nm:.0} mile final and we're still on the runway — expedite."
+                                            "Traffic on {nm:.0} mile final and we're still on the runway. Expedite."
                                         )
                                     };
                                     voice.alert(Priority::Warning, line);
@@ -4126,8 +4223,6 @@ pub async fn run(
                 {
                     let tower_tuned =
                         matches!(tuned_speaker, Some(crate::voice::StationSpeaker::Tower));
-                    let cleared_to_land = crate::party_line::clearance_state()
-                        == Some(crate::tower::State::ClearedToLand);
                     // A held release is spent once we ROLL on the runway: the
                     // tower saw the takeoff it was holding. Left armed it
                     // outlived a reject and replayed "traffic clear, cleared
@@ -4145,10 +4240,8 @@ pub async fn run(
                     }
                     let hold_armed = crate::party_line::takeoff_hold_armed();
                     // A landing clearance withheld for traffic on the runway
-                    // ("continue approach"): the watch releases it once the
-                    // strip clears, or the go-around order comes (LEMG 13,
-                    // 2026-09-28).
-                    let landing_held = crate::party_line::landing_hold_armed();
+                    // ("continue approach") or given: the runway watch above
+                    // judged it this tick; the flavour below waits for it.
                     // Party-line flavor stands down while the taxi guide is
                     // working AND the aircraft is rolling: its cues are
                     // perishable, and a three-line Ryanair landing exchange
@@ -4170,59 +4263,17 @@ pub async fn run(
                     if let Some((_, flat, flon, felev)) = crate::station::active_field() {
                         if chatter_on || hold_armed || landing_held || cleared_to_land || wake_watch
                         {
-                            let targets = crate::station::read_tcas_targets(xp.view()).await;
+                            // One read per tick: the runway watch's, when it
+                            // made one.
+                            let targets = match runway_watch_targets.take() {
+                                Some(t) => t,
+                                None => crate::station::read_tcas_targets(xp.view()).await,
+                            };
                             crate::station::wake_note_targets(&targets, now);
-                            // Safety outranks flavor: the go-around order first.
-                            if let Some(call) = crate::station::go_around_tick(
-                                &targets,
-                                snap.agl_ft,
-                                snap.on_ground,
-                                tuned_speaker.is_some(),
-                                now,
-                            ) {
-                                crate::blackbox::record(
-                                    "atc",
-                                    serde_json::json!({
-                                        "route": "go_around_order", "crew": call.crew,
-                                        "reply": &call.line,
-                                    }),
-                                );
-                                if call.crew {
-                                    voice.alert(Priority::Warning, call.line);
-                                } else {
-                                    // Whoever you're tuned to gives the order —
-                                    // a go-around shout is any controller's to
-                                    // deliver, in their own voice.
-                                    let who = tuned_speaker
-                                        .unwrap_or(crate::voice::StationSpeaker::Tower);
-                                    if let Some(s) = status.as_ref() {
-                                        s.action(&format!("{}: {}", who.tag(), call.line));
-                                    }
-                                    voice.alert_station(Priority::Warning, who, call.line);
-                                }
-                            } else if landing_held {
-                                if let Some(line) =
-                                    crate::station::landing_hold_tick(&targets, snap.on_ground, now)
-                                {
-                                    crate::blackbox::record(
-                                        "atc",
-                                        serde_json::json!({
-                                            "route": "landing_release", "reply": &line,
-                                        }),
-                                    );
-                                    // The tower's clearance on the tower
-                                    // frequency only, like the takeoff release.
-                                    if tower_tuned {
-                                        if let Some(s) = status.as_ref() {
-                                            s.action(&format!("TWR: {line}"));
-                                        }
-                                        voice.alert_station(
-                                            Priority::Advisory,
-                                            crate::voice::StationSpeaker::Tower,
-                                            line,
-                                        );
-                                    }
-                                }
+                            // A withheld landing clearance is the runway
+                            // watch's (above, whoever flies); the flavour
+                            // waits for it.
+                            if landing_held {
                             } else if hold_armed {
                                 if let Some(line) = crate::station::takeoff_hold_tick(
                                     &targets,
@@ -4598,6 +4649,7 @@ pub async fn run(
                 "state",
                 serde_json::json!({
                     "lat": lat, "lon": lon, "hdg": r1(snap.heading_deg), "alt": r1(alt),
+                    "pos": snap.pos_source.map(|s| s.as_str()),
                     "bank": r1(snap.bank_deg), "track": snap.track_deg.map(r1),
                     "ias": r1(snap.ias_kts), "gs": r1(snap.groundspeed_kts),
                     "vsi": r1(snap.vsi_fpm), "agl": r1(snap.agl_ft),
@@ -4827,7 +4879,8 @@ pub async fn run(
                                     let _ = xp.run_command(cmd).await;
                                 }
                                 // A cabin climbing through ten thousand: the
-                                // crew's own air first (bleed, oxygen), and
+                                // crew's own air first (bleed, the oxygen
+                                // supply; the masks are `masks_tick`'s), and
                                 // past the warning band a follower that is
                                 // flying goes DOWN (its terrain floor still
                                 // rules). Two "cabin altitude" callouts went by
@@ -5508,6 +5561,32 @@ mod tests {
         assert!(tick < quiet_block, "compliance tick inside the quiet block");
     }
 
+    /// Sortie 1790601822-full_auto (EGKK-EGBB 15, 2026-09-28, #155): the
+    /// landing hold armed at +3314.5 on the final autoland was flying, and
+    /// the go-around judgement and the release both lived inside the `if
+    /// !quiet` world block, which `autoland::ACTIVE` closes: no
+    /// `landing_released`, no `go_around_deferred`, no `go_around_judged`
+    /// in 158 s, and the tower then called the landing uncleared. Both call
+    /// sites sit ahead of that block, under the compliance gate.
+    #[test]
+    fn the_landing_runway_watch_is_not_under_the_quiet_gate() {
+        let all = include_str!("monitor.rs");
+        let src = &all[..all.find("\nmod tests {").expect("tests")];
+        let quiet_block = src.find("            if !quiet {\n").expect("world block");
+        for call in [
+            "crate::station::go_around_tick(",
+            "crate::station::landing_hold_tick(",
+        ] {
+            let at: Vec<usize> = src.match_indices(call).map(|(i, _)| i).collect();
+            assert_eq!(at.len(), 1, "{call}: one call site");
+            assert!(at[0] < quiet_block, "{call} is back under `quiet`");
+            let gate = src[..at[0]]
+                .rfind("if gates.compliance_ticks\n")
+                .expect("the runway watch's gate");
+            assert!(!src[gate..at[0]].contains("if !quiet"), "{call}");
+        }
+    }
+
     /// 1790441293 (737, LEMG 13): the `state` records' `in` at the four
     /// `yoke_under_ap` interventions, every one the crew's own channel read
     /// back (the takeoff's climb_manual pitch -0.371 at the AP engage, then
@@ -5697,6 +5776,7 @@ mod tests {
             advisor_values: vec![],
             lat: 0.0,
             lon: 0.0,
+            pos_source: None,
             track_deg: None,
             fps: None,
             dest_dist_nm: None,

@@ -983,6 +983,92 @@ static void WriteAlert(void*, void* in, int offset, int len) {
     panel::append_log("COPILOT", col, text);
 }
 
+// ---- position snapshot (plugin -> app) ----------------------------------------
+
+// xcopilot/position: where the aircraft is, as ONE frame saw it. Latitude
+// and longitude used to arrive in separate Web API requests, so one reading
+// could pair two frames: on LEMG's diagonal 13/31 up to 2.9 m of cross-track
+// for a single tick above 120 kt (issue #157, 2026-09-28). A flight loop
+// after the flight model copies every field into one buffer each frame; the
+// app reads the buffer in one request. A data dataref of native (little-
+// endian) doubles, since a float array would round latitude to ~0.4 m:
+//   [0] layout version (1; 0 until the first frame is copied)
+//   [1] frame (XPLMGetCycleNumber)   [2] sim time, s (total_running_time_sec)
+//   [3] latitude, deg   [4] longitude, deg   [5] elevation MSL, m
+//   [6] true heading (psi), deg   [7] groundspeed, m/s
+//   [8] vertical speed, fpm (vh_ind_fpm)   [9] height above ground (y_agl), m
+// A field whose sim dataref is missing is NaN: the app reads no measurement.
+static const int kPositionFields = 10;
+static double g_position[kPositionFields] = {0};
+static XPLMDataRef g_position_dref = nullptr;
+static XPLMFlightLoopID g_position_loop = nullptr;
+static XPLMDataRef g_pos_lat = nullptr;
+static XPLMDataRef g_pos_lon = nullptr;
+static XPLMDataRef g_pos_elev = nullptr;
+static XPLMDataRef g_pos_psi = nullptr;
+static XPLMDataRef g_pos_gs = nullptr;
+static XPLMDataRef g_pos_vs = nullptr;
+static XPLMDataRef g_pos_agl = nullptr;
+static XPLMDataRef g_pos_time = nullptr;
+
+static double PosD(XPLMDataRef r) { return r ? XPLMGetDatad(r) : std::nan(""); }
+static double PosF(XPLMDataRef r) {
+    return r ? static_cast<double>(XPLMGetDataf(r)) : std::nan("");
+}
+
+static float PositionLoop(float, float, int, void*) {
+    g_position[1] = static_cast<double>(XPLMGetCycleNumber());
+    g_position[2] = PosF(g_pos_time);
+    g_position[3] = PosD(g_pos_lat);
+    g_position[4] = PosD(g_pos_lon);
+    g_position[5] = PosD(g_pos_elev);
+    g_position[6] = PosF(g_pos_psi);
+    g_position[7] = PosF(g_pos_gs);
+    g_position[8] = PosF(g_pos_vs);
+    g_position[9] = PosF(g_pos_agl);
+    g_position[0] = 1.0;
+    return -1.0f;  // every frame
+}
+
+static int ReadPosition(void*, void* out, int offset, int max) {
+    const int size = static_cast<int>(sizeof g_position);
+    if (!out) return size;
+    if (offset < 0 || offset >= size || max <= 0) return 0;
+    int n = size - offset;
+    if (n > max) n = max;
+    std::memcpy(out, reinterpret_cast<const char*>(g_position) + offset,
+                static_cast<size_t>(n));
+    return n;
+}
+
+static void StartPosition() {
+    g_pos_lat = XPLMFindDataRef("sim/flightmodel/position/latitude");
+    g_pos_lon = XPLMFindDataRef("sim/flightmodel/position/longitude");
+    g_pos_elev = XPLMFindDataRef("sim/flightmodel/position/elevation");
+    g_pos_psi = XPLMFindDataRef("sim/flightmodel/position/psi");
+    g_pos_gs = XPLMFindDataRef("sim/flightmodel/position/groundspeed");
+    g_pos_vs = XPLMFindDataRef("sim/flightmodel/position/vh_ind_fpm");
+    g_pos_agl = XPLMFindDataRef("sim/flightmodel/position/y_agl");
+    g_pos_time = XPLMFindDataRef("sim/time/total_running_time_sec");
+    g_position_dref = XPLMRegisterDataAccessor(
+        "xcopilot/position", xplmType_Data, 0,
+        nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
+        nullptr, nullptr, nullptr, nullptr, ReadPosition, nullptr, nullptr, nullptr);
+    XPLMCreateFlightLoop_t params;
+    params.structSize = sizeof params;
+    params.phase = xplm_FlightLoop_Phase_AfterFlightModel;
+    params.callbackFunc = PositionLoop;
+    params.refcon = nullptr;
+    g_position_loop = XPLMCreateFlightLoop(&params);
+    XPLMScheduleFlightLoop(g_position_loop, -1.0f, 1);
+}
+
+static void StopPosition() {
+    if (g_position_loop) { XPLMDestroyFlightLoop(g_position_loop); g_position_loop = nullptr; }
+    if (g_position_dref) { XPLMUnregisterDataAccessor(g_position_dref); g_position_dref = nullptr; }
+    g_position[0] = 0.0;
+}
+
 // ---- registration and accessors ----------------------------------------------
 
 namespace drefs {
@@ -1205,9 +1291,11 @@ void start() {
     g_joy_axis_values = XPLMFindDataRef("sim/joystick/joystick_axis_values");
     g_joy_axis_assignments = XPLMFindDataRef("sim/joystick/joystick_axis_assignments");
     XPLMRegisterFlightLoopCallback(TaxiAssistLoop, -1.0f, nullptr);
+    StartPosition();
 }
 
 void stop_first() {
+    StopPosition();
     XPLMUnregisterFlightLoopCallback(TaxiAssistLoop, nullptr);
     // Leave no brake behind: if the loop was mid-apply, release the ratios
     // and drop the override ourselves — nobody else will after the callback

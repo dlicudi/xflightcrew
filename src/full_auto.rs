@@ -230,6 +230,23 @@ pub struct Route {
     /// (`procedure::scheduled_cruise_kts`, `step_climb_at`). The levels are
     /// already in `legs` (`procedure::apply_step_climbs` at the arm).
     pub cruise_schedule: crate::simbrief::CruiseSchedule,
+    /// The FILED cruise level, feet (the plan's `initial_altitude`): the
+    /// highest the departure check-in asks for. `None` when the plan has none.
+    pub cruise_ft: Option<f64>,
+}
+
+/// The climb the departure check-in announces, the one departure then clears:
+/// the highest level the route's legs hold, never above the FILED cruise.
+/// The legs carry the STAR's windows too (`apply_arrival_constraints`), and
+/// EGKK-EGBB (sortie 1790601822-full_auto, 2026-09-28, #155) filed FL180
+/// checked in "climbing flight level two two zero", HEME1B's HEMEL window,
+/// and was cleared to it. Pure.
+pub fn check_in_climb_ft(legs: &[crate::nav::ProcLeg], filed_cruise_ft: Option<f64>) -> f64 {
+    let highest = legs.iter().filter_map(|l| l.alt1_ft).fold(0.0, f64::max);
+    match filed_cruise_ft.filter(|c| c.is_finite() && *c > 0.0) {
+        Some(c) if highest > c => c,
+        _ => highest,
+    }
 }
 
 /// Does this plan fly IFR? A SimBrief plan is an airline plan and always
@@ -2262,11 +2279,12 @@ async fn fly(xp: XPlaneClient, config: Config, voice: Option<Voice>, tools: SubT
             // The planned departure's runway, asked for (the tower honours it
             // unless the wind really favours another end): a SID exists for
             // one runway, and in calm air the pick could have been the other.
+            let cleared_rwy = crate::party_line::assigned_clearance().map(|c| c.runway);
             crate::circuit::transmit(crate::circuit::radio_call(
                 &callsign,
-                &taxi_call(&tools.mission),
+                &taxi_call(&tools.mission, cleared_rwy.as_deref()),
             ));
-            event("request_taxi", json!({}));
+            event("request_taxi", json!({ "cleared_rwy": cleared_rwy }));
             // The call queues behind our own intercom lines AND anyone the
             // tower is already working — the clock must outlast a worked
             // arrival. 25 s gave up ONE SECOND before a busy Jerez frequency
@@ -3211,11 +3229,7 @@ async fn fly_route(
     // Generous ceiling — ABORT bails out of the wait immediately. The wait
     // works the radio: the tower's after-takeoff handoff is owed a readback,
     // a retune and a check-in.
-    let climb_to_ft = route
-        .legs
-        .iter()
-        .filter_map(|l| l.alt1_ft)
-        .fold(0.0, f64::max);
+    let climb_to_ft = check_in_climb_ft(&route.legs, route.cruise_ft);
     // The destination's own position and tower, for the inbound call at the
     // zone approach: the apt.dat row, never `home_tower_khz`, which is
     // whoever the region last handed us to.
@@ -4898,6 +4912,7 @@ pub fn filed_route_of(
         dest: p.destination.clone(),
         fixes,
         sid: p.procedures.sid.clone(),
+        cruise_ft: Some(p.cruise_alt_ft.round() as i64).filter(|c| *c > 0),
     })
 }
 
@@ -5210,12 +5225,16 @@ fn ready_call(circuits: bool) -> &'static str {
 
 /// The taxi request: a planned departure asks for its runway (a SID exists
 /// for one runway, and in calm air the pick could have been the other); a
-/// circuit says it is one, since the tower keeps pattern traffic.
-fn taxi_call(mission: &Mission) -> String {
+/// circuit says it is one, since the tower keeps pattern traffic. A runway
+/// the IFR clearance already named (`cleared`) is the one asked for: EGKK
+/// (sortie 1790601822-full_auto, 2026-09-28, #155) was cleared "via the Kene
+/// three Papa departure, runway zero eight right" and then asked "request
+/// taxi, runway two six left", the plan's runway.
+fn taxi_call(mission: &Mission, cleared: Option<&str>) -> String {
     match mission {
-        Mission::Flight(r) => r
-            .departure_rwy
-            .as_deref()
+        Mission::Flight(r) => cleared
+            .filter(|c| !c.is_empty())
+            .or(r.departure_rwy.as_deref())
             .map(|rwy| format!("request taxi, runway {}", crate::circuit::spell_runway(rwy)))
             .unwrap_or_else(|| "request taxi".to_string()),
         Mission::Circuit { .. } => "request taxi for circuits".to_string(),
@@ -6453,7 +6472,8 @@ mod tests {
         // it to Malaga Departure on the crosswind leg.
         let cs = Some("November eight one six November November".to_string());
         let circuit = Mission::Circuit { right: true };
-        let taxi = crate::circuit::radio_call(&cs, &taxi_call(&circuit));
+        let taxi = crate::circuit::radio_call(&cs, &taxi_call(&circuit, Some("31")));
+        assert!(!taxi.contains("three one"), "a circuit asks for circuits: {taxi}");
         assert_eq!(parse_intent(&taxi), Intent::RequestTaxi, "{taxi}");
         assert!(wants_circuits(&taxi), "{taxi}");
         let ready = crate::circuit::radio_call(&cs, ready_call(true));
@@ -6463,6 +6483,88 @@ mod tests {
         let ready = crate::circuit::radio_call(&cs, ready_call(false));
         assert_eq!(parse_intent(&ready), Intent::RequestTakeoff);
         assert!(!wants_circuits(&ready), "{ready}");
+    }
+
+    fn egkk_egbb_route() -> super::Route {
+        // The plan's leg altitudes as the arm's audit logged them (t
+        // 1790601822.7): the SID climb, FL180 cruise, HEME1B's HEMEL window
+        // at 22,000, the descent.
+        let alts = [
+            ("D257B", 1885.0), ("DET31", 4370.0), ("DET29", 5418.0), ("ACORN", 12411.0),
+            ("D258K", 14645.0), ("D156O", 18000.0), ("D156J", 18000.0), ("LAM", 18000.0),
+            ("HEMEL", 22000.0), ("BUZAD", 18872.0), ("WELIN", 16500.0), ("PUFAX", 11900.0),
+            ("HON", 9000.0), ("OSKOT", 5700.0), ("GROVE", 7000.0),
+        ];
+        super::Route {
+            local_runway: None,
+            dest_icao: "EGBB".into(),
+            dest_name: "Birmingham".into(),
+            legs: alts
+                .iter()
+                .map(|(id, a)| crate::nav::ProcLeg {
+                    fix_ident: (*id).into(),
+                    alt1_ft: Some(*a),
+                    ..Default::default()
+                })
+                .collect(),
+            climb_minimums: Vec::new(),
+            arrival_constraints: Vec::new(),
+            departure_rwy: Some("26L".into()),
+            origin_icao: "EGKK".into(),
+            origin_rwy: Some("26L".into()),
+            fms_payload: String::new(),
+            arrival_rwy: Some("33".into()),
+            arrival_star: Some("HEME1B".into()),
+            sid: Some("LAM5P".into()),
+            ifr: true,
+            cruise_schedule: Default::default(),
+            cruise_ft: Some(18_000.0),
+        }
+    }
+
+    /// Sortie 1790601822-full_auto (EGKK-EGBB, 2026-09-28, #155): the IFR
+    /// clearance named "runway zero eight right" at +142.8 and the taxi
+    /// request at +159.0 still asked for "runway two six left", the plan's.
+    /// The cleared runway is the one asked for; without a clearance the
+    /// plan's stands.
+    #[test]
+    fn the_taxi_request_names_the_cleared_runway() {
+        use super::{taxi_call, Mission};
+        use crate::tower::{parse_intent, Intent};
+        let flight = Mission::Flight(egkk_egbb_route());
+        let cs = Some("Whiskey Alpha Tango six two six".to_string());
+        let call = crate::circuit::radio_call(&cs, &taxi_call(&flight, Some("08R")));
+        assert!(call.ends_with("request taxi, runway zero eight right"), "{call}");
+        assert_eq!(parse_intent(&call), Intent::RequestTaxi, "{call}");
+        assert_eq!(
+            taxi_call(&flight, None),
+            "request taxi, runway two six left",
+            "no clearance: the plan's runway"
+        );
+        assert_eq!(taxi_call(&flight, Some("")), "request taxi, runway two six left");
+    }
+
+    /// Same sortie: the check-in at +1209.4 said "climbing flight level two
+    /// two zero" (the legs' highest, HEMEL's STAR window) against a plan
+    /// filed at FL180, and departure cleared it. The check-in climb is capped
+    /// at the filed cruise; a plan with no cruise keeps the legs' highest.
+    #[test]
+    fn the_departure_check_in_climbs_no_higher_than_the_filed_cruise() {
+        use super::check_in_climb_ft;
+        let route = egkk_egbb_route();
+        assert_eq!(check_in_climb_ft(&route.legs, route.cruise_ft), 18_000.0);
+        assert_eq!(check_in_climb_ft(&route.legs, None), 22_000.0);
+        assert_eq!(check_in_climb_ft(&route.legs, Some(0.0)), 22_000.0);
+        // A cruise above every leg: the legs' highest (the old number).
+        assert_eq!(check_in_climb_ft(&route.legs[..8], Some(24_000.0)), 18_000.0);
+        let call = super::departure_check_in_above(
+            &Some("Whiskey Alpha Tango six two six".into()),
+            "London Gatwick Departure",
+            4700.0,
+            check_in_climb_ft(&route.legs, route.cruise_ft),
+            6000.0,
+        );
+        assert!(call.ends_with("climbing flight level one eight zero"), "{call}");
     }
 
     /// The crew flies the departure it was cleared on: with the station's
@@ -7052,6 +7154,7 @@ mod tests {
             sid: Some("LEGL1P".into()),
             ifr: true,
             cruise_schedule: Default::default(),
+            cruise_ft: Some(12_000.0),
         };
         let fallback_route = route.clone();
         // The Evolution's own climb (profile best_climb_fpm); the GA default
