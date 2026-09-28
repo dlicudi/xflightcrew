@@ -83,7 +83,7 @@ const STEER_YIELD: &str = "xcopilot/steer_yield";
 /// followed an early tug release could not turn right for fifteen seconds
 /// and the record could not say whether a re-summoned tug had hooked back
 /// on (LEMG, 2026-09-12). A slow dataref, so the read is nearly free.
-const TUG_ATTACHED: &str = "sim/aircraft/overflow/pushback_attached";
+pub(crate) const TUG_ATTACHED: &str = "sim/aircraft/overflow/pushback_attached";
 /// A tug on the bar owns the aircraft: the drive holds (target zero, no
 /// steer heartbeat, the stagnation clock parked) until the bar comes off,
 /// and stands down after this long if it never does. The taxi that engaged
