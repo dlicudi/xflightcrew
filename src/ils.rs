@@ -170,6 +170,21 @@ pub const XCHECK_DOTS: f64 = 1.0;
 pub const XCHECK_HOLD_S: f64 = 8.0;
 /// ...below this height on final is said.
 pub const XCHECK_BELOW_AGL_FT: f64 = 3000.0;
+/// No glideslope call under a decision height's worth of radio height: the
+/// crew is landing on the pavement by then, and the beam's origin is an
+/// antenna beside the touchdown zone, not the aim (#175: "1.5 dots" at
+/// 142 ft on autoland's own path).
+pub const XCHECK_GS_FLOOR_AGL_FT: f64 = 200.0;
+
+/// Which side of the glideslope we are, from `nav1_vdef_dots_pilot`.
+/// POSITIVE is the aircraft ABOVE the beam (the diamond sits below
+/// centre, fly down), verified against earth_nav.dat's antennas on every
+/// recorded call (#175: 47 of 47, e.g. EGBB 15 +1.37 at 221 ft above the
+/// beam, LEMG 13 -2.50 at 213 ft below it). DataRefs.txt only says "CDI
+/// vertical deflection in dots".
+pub fn above_glideslope(vdef_dots: f64) -> bool {
+    vdef_dots > 0.0
+}
 
 /// The raw-data cross-check. Pure.
 #[derive(Debug, Default)]
@@ -203,7 +218,8 @@ impl XCheck {
     pub fn step(&mut self, n: Needles, on_final: bool, agl_ft: f64, dt: f64) -> Option<String> {
         let live = on_final && agl_ft < XCHECK_BELOW_AGL_FT;
         let loc = n.hdef.filter(|_| live && n.loc_valid);
-        let gs = n.vdef.filter(|_| live && n.gs_valid);
+        let gs_live = live && agl_ft >= XCHECK_GS_FLOOR_AGL_FT;
+        let gs = n.vdef.filter(|_| gs_live && n.gs_valid);
         let mut out = None;
         match loc {
             Some(h) if h.abs() > XCHECK_DOTS => {
@@ -229,13 +245,12 @@ impl XCheck {
                 self.gs_out_s += dt;
                 if self.gs_out_s >= XCHECK_HOLD_S && !self.gs_said && out.is_none() {
                     self.gs_said = true;
-                    // The needle shows where the glideslope IS: above us
-                    // (positive) means we are low.
+                    let high = above_glideslope(v);
                     out = Some(format!(
                         "Glideslope {:.1} dots {}, we're {} the ILS path.",
                         v.abs(),
-                        side(v, "up", "down"),
-                        side(v, "below", "above")
+                        if high { "high" } else { "low" },
+                        if high { "above" } else { "below" }
                     ));
                 }
             }
@@ -857,12 +872,34 @@ mod tests {
         assert!((0..40).all(|_| hi.step(needles(2.0, 2.0), true, 5000.0, 0.5).is_none()));
     }
 
+    /// #175, EGBB 15 (sortie 1790624015-full_auto, 2026-09-28). At +2683.8 the
+    /// needle read +1.37 at 1,859 ft radio with the aircraft 221 ft above the
+    /// beam by earth_nav.dat's antenna (autoland 279 ft over its own path) and
+    /// was called "below"; at +2795.1 it read -1.52 at 142 ft on autoland's path
+    /// (67 ft under the beam) and was called "above". Other sorties agree:
+    /// LEMG 12 +1.49 at 191 ft above, LEMG 13 -2.50 at 213 ft below.
     #[test]
-    fn a_glideslope_needle_up_means_we_are_low() {
+    fn a_positive_glideslope_needle_is_above_the_beam() {
+        let said = |v: f64, radio: f64| -> Vec<String> {
+            let mut x = XCheck::default();
+            (0..40).filter_map(|_| x.step(needles(-0.32, v), true, radio, 0.3)).collect()
+        };
+        let high = said(1.3744881, 1859.0);
+        assert_eq!(high.len(), 1, "{high:?}");
+        assert!(high[0].contains("1.4 dots high, we're above"), "{}", high[0]);
+        let lemg12 = said(1.4870062, 1819.0);
+        assert!(lemg12[0].contains("above"), "{}", lemg12[0]);
+        let low = said(-2.4999995, 518.0);
+        assert!(low[0].contains("2.5 dots low, we're below"), "{}", low[0]);
+        // The flare's needle: under the floor, nothing.
+        assert!(said(-1.519844, 142.0).is_empty());
+        assert!(said(-1.5, XCHECK_GS_FLOOR_AGL_FT - 1.0).is_empty());
+        // The localizer is still watched there.
         let mut x = XCheck::default();
-        let said: Vec<String> = (0..40).filter_map(|_| x.step(needles(0.0, 1.4), true, 1200.0, 0.5)).collect();
-        assert_eq!(said.len(), 1);
-        assert!(said[0].contains("below"), "{}", said[0]);
+        let loc: Vec<String> =
+            (0..40).filter_map(|_| x.step(needles(1.6, -1.5), true, 142.0, 0.3)).collect();
+        assert_eq!(loc.len(), 1);
+        assert!(loc[0].starts_with("Localizer"), "{}", loc[0]);
     }
 
     fn inp(appr: f64, gs: f64) -> CouplingIn {

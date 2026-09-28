@@ -723,7 +723,9 @@ everything blackboxes to `logs/blackbox.jsonl` (kinds: `atc`, `autotaxi`, `autot
   landing** (`map_short_of_runway`), handed over at the FAF (`handoff_index`; EGKK 26L 2026-09-27).
 - **The ILS is tuned, watched and, per airframe, flown** (`src/ils.rs`): `ils::tune` at every arm
   (read back, `ils` `tuned`); `XCheck` calls a needle held off on final; `Coupling` only with the
-  profile's `ils_coupled`, never writing what a capture owns.
+  profile's `ils_coupled`, never writing what a capture owns. **A positive `vdef` is ABOVE the
+  beam** (`ils::above_glideslope`, checked on earth_nav.dat's antennas; #175 had it inverted), and
+  no glideslope call under 200 ft radio (`XCHECK_GS_FLOOR_AGL_FT`).
 - **The copilot knows the systems before reaching for one** (`src/systems.rs`: the `.acf` and
   `preconfigured_ap_type`, blackbox `systems`, reset per swap): a fact, never a licence.
 - **"Set up the ILS" is a pilot monitoring's setup** (`src/tools/approach.rs`, `SetupWatch`): APPR
