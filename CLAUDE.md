@@ -736,7 +736,12 @@ everything blackboxes to `logs/blackbox.jsonl` (kinds: `atc`, `autotaxi`, `autot
 - **The arrest takes the servos out at the roundout gate** (`arrest_hands_step`, `arrest_hands`),
   since an engaged servo writes the yoke back over `xcopilot/pitch`: `servos_off_any`, the track on
   `xcopilot/roll` (`WingsLevel`). **The AP comes out at the wheels** (`disconnect_autopilot`): a
-  heading servo on the ground winds the yoke over.
+  heading servo on the ground winds the yoke over. **Once taken, the servos stay out** (`hold_roundout`,
+  `roundout_held`): a roundout balloon back over the band is still the arrest, to `BALLOON_COMMIT_FT`
+  with room to stop, else a `balloon` balk; only a go-around gives them back; a roundout climb never
+  pushes (LEMG 12 SF50 2026-09-28: handed back at 50.5 ft, the AP dived, -814 fpm). The SF50 flies a
+  declared model (`flare_elevator.model`: 8,000 fpm per unit, 1.2/1.2 s, 0.9 s dead) with `rough_hold:
+  false` (the 737's rough-air hold floated its strong elevator onto the runway).
 - **A model flare holds its column in rough air** (`FlareModel::step` `rough`, `FinalAir`,
   `ROUGH_AIR_FPM`): past 40 fpm rms of stray on the final, only a measured climb eases the pull; in
   smooth air the prediction flies it and a near-level float never takes it forward. A gust and a

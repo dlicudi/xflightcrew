@@ -9945,3 +9945,15 @@ wake watch now remembers every ghost touchdown on a runway's pavement for `ARRIV
 `arrival_stream_end`, blackbox `atc arrival_stream`); `field_streams` is the one reader for the runway
 pick, the stated-runway refusal, `runway_follows_stream`, the runway-start rule and `resequence_runway`;
 opposed arrival and departure memories keep only the newer. Offline only.
+
+## 2026-09-28: LEMG 12 in the SF50, the servos handed back in a balloon (issue #163)
+
+Sortie 1790611629, rough air (42 fpm rms): the arrest took the servos at 51 ft and the tracker's roundout
+pulled 0.11 to 0.19 into a balloon (the column alone reproduces it at 9.8 fpm rms through the fitted
+plant) and pushed -0.05 at +62 and +214 fpm; at 50.48 ft, over the 50 ft band read from radio height
+alone, the roundout ended and the servos went back; the AP flew its -445 fpm dial while the governor took
+the lever 0.16 to 0.27 (the tail engine pushes the nose down); taken again at 48.4 ft, 45 to 3 ft in 1.5 s,
+-814 fpm. `hold_roundout` keeps the arrest over the band (balk only above 100 ft or without room), a
+roundout climb never pushes, and the SF50 flies a `FlareModel` fitted to its three clean arrests (8,000
+fpm per unit, 1.2/1.2 s, 0.9 s dead, 66 fpm rms) with `rough_hold: false` (the 737's hold put 57 of 160
+gusty plant landings past 400). The recorded balloon, recovered: 258 fpm calm, 308 in gusts. Offline only.
