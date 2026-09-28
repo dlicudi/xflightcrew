@@ -946,12 +946,18 @@ impl Station {
         // hold position (traffic, wake, occupied strip), a conditional or
         // plain line-up, a cancellation — arms the release watch, so the
         // tower comes back unprompted the moment the runway is truly free.
+        // A RUNWAY START is held from Parked: its first ready call puts it
+        // LinedUp and holds it in one reply, and the watch never armed (LEMG
+        // 13, sortie 1790623420-full_auto, 2026-09-28, issue #172: "hold
+        // position, traffic on the runway" at +50 with nothing to release it).
+        let runway_start_held =
+            was == tower::State::Parked && self.twr.state == tower::State::LinedUp;
         if service == Service::Tower
             && intent == tower::Intent::RequestTakeoff
-            && matches!(
+            && (matches!(
                 was,
                 tower::State::TaxiCleared | tower::State::LinedUp | tower::State::TakeoffCleared
-            )
+            ) || runway_start_held)
             && self.twr.state != tower::State::TakeoffCleared
             && (ctx.final_traffic_nm.is_some()
                 || ctx.runway_occupied
@@ -973,6 +979,11 @@ impl Station {
                 &self.runway_in_use.clone().unwrap_or_default(),
                 Instant::now(),
             );
+            // So is the traffic it was held for: asking again names nobody new.
+            let held_for = held
+                .as_ref()
+                .filter(|h| h.runway_ident == self.runway_in_use.clone().unwrap_or_default())
+                .and_then(|h| h.held_for.clone());
             *held = Some(TakeoffHold {
                 callsign: ctx.callsign.clone(),
                 runway: ctx.runway.clone(),
@@ -987,6 +998,8 @@ impl Station {
                 behind: self.twr.pending().is_some_and(|p| {
                     matches!(p.awaited, tower::Awaited::LineUp { behind: true, .. })
                 }),
+                held_for,
+                cut_in_logged: Default::default(),
             });
             // Name the runway: at a parallel-runway field "held for traffic"
             // is only diagnosable if you can see WHICH strip the watch is
@@ -2191,13 +2204,27 @@ impl Station {
             arrival_end.as_deref(),
             departure_end.as_deref(),
         );
+        // Our own position, for a takeoff request made ON the strip: only
+        // the pavement ahead of us is in the way of the roll.
+        let own = if on_ground && intent == tower::Intent::RequestTakeoff {
+            match (
+                xp.get_float(datarefs::LATITUDE).await,
+                xp.get_float(datarefs::LONGITUDE).await,
+            ) {
+                (Ok(lat), Ok(lon)) => Some((lat, lon)),
+                _ => None,
+            }
+        } else {
+            None
+        };
         let (final_traffic, runway_occupied) = match strip(&self.apt.runways, &ident) {
             Some(r) => {
                 let r = r.clone();
                 // The landing judgement's own test: on the pavement and not
-                // stale data (`occupies`, issue #162).
-                let occupied = targets.iter().any(|t| occupies(&r, t, now).is_some());
-                (final_traffic_for(&targets, &r, self.apt.elev_ft), occupied)
+                // stale data (`occupies`, issue #162); a departure standing
+                // on the strip is not held by a ghost behind its tail (#172).
+                let occupied = departure_strip_occupied(&r, &ident, &targets, own, now);
+                (final_traffic_for(&targets, &r, &self.apt.runways, self.apt.elev_ft), occupied)
             }
             None => (None, false),
         };
@@ -4558,6 +4585,9 @@ pub struct FinalTraffic {
     pub nm: f64,
     pub callsign: Option<String>,
     pub count: usize,
+    /// Every arrival in the corridor, by its raw callsign: the traffic a
+    /// held departure was held FOR ([`TakeoffHold::held_for`]).
+    pub ghosts: Vec<String>,
 }
 
 /// Lateral capture around the extended centerline: half of the tightest
@@ -4641,6 +4671,7 @@ pub fn arrival_end(targets: &[TcasTarget], runways: &[nav::Runway], field_elev_f
             .filter(|t| !t.on_ground)
             .filter(|t| (30.0..1500.0).contains(&(t.ele_ft - field_elev_ft)))
             .filter(|t| t.vs_fpm <= CLIMBOUT_FPM)
+            .filter(|t| !on_independent_final(t, rwy, runways))
         {
             let (px, py) = (
                 (t.lon - rwy.lon_a) * m_per_deg_lon,
@@ -4677,9 +4708,14 @@ pub fn arrival_end(targets: &[TcasTarget], runways: &[nav::Runway], field_elev_f
 /// runway-blind version of this check held a Heathrow 09R departure for the
 /// endless 09L arrivals — indefinitely (2026-07-10); a parallel runway's
 /// stream is not your traffic.
+///
+/// `runways` is the field's (the strip's own included): an arrival on an
+/// INDEPENDENT runway's final ([`on_independent_final`]) is that runway's
+/// traffic, even where its final crosses ours (LEMG, issue #172).
 pub fn final_traffic_for(
     targets: &[TcasTarget],
     rwy: &nav::Runway,
+    runways: &[nav::Runway],
     field_elev_ft: f64,
 ) -> Option<FinalTraffic> {
     let m_per_deg_lat = 111_320.0;
@@ -4698,6 +4734,7 @@ pub fn final_traffic_for(
         .filter(|t| !t.on_ground)
         .filter(|t| (30.0..1500.0).contains(&(t.ele_ft - field_elev_ft)))
         .filter(|t| t.vs_fpm <= CLIMBOUT_FPM)
+        .filter(|t| !on_independent_final(t, rwy, runways))
         .filter_map(|t| {
             let (px, py) = (
                 (t.lon - rwy.lon_a) * m_per_deg_lon,
@@ -4721,7 +4758,81 @@ pub fn final_traffic_for(
         nm: *nm,
         callsign: (!nearest.callsign.is_empty()).then(|| spoken_ghost(&nearest.callsign)),
         count: hits.len(),
+        ghosts: hits.iter().map(|(_, t)| t.callsign.clone()).collect(),
     })
+}
+
+/// A position against one strip's centreline in flat metres: (along as a
+/// share of the length from `ident_a`, metres off the centreline, length).
+fn centreline_place(r: &nav::Runway, lat: f64, lon: f64) -> Option<(f64, f64, f64)> {
+    let m_lon = 111_320.0 * r.lat_a.to_radians().cos();
+    let (bx, by) = ((r.lon_b - r.lon_a) * m_lon, (r.lat_b - r.lat_a) * 111_320.0);
+    let len2 = bx * bx + by * by;
+    if len2 < 1.0 {
+        return None;
+    }
+    let (px, py) = ((lon - r.lon_a) * m_lon, (lat - r.lat_a) * 111_320.0);
+    Some((
+        (px * bx + py * by) / len2,
+        (px * by - py * bx).abs() / len2.sqrt(),
+        len2.sqrt(),
+    ))
+}
+
+/// The nearest two strips come to each other, metres (0 when they cross):
+/// the least of the four end-to-other-strip distances.
+fn strips_apart_m(a: &nav::Runway, b: &nav::Runway) -> f64 {
+    let m_lon = 111_320.0 * a.lat_a.to_radians().cos();
+    let xy = |lat: f64, lon: f64| ((lon - a.lon_a) * m_lon, (lat - a.lat_a) * 111_320.0);
+    let (p1, p2) = (xy(a.lat_a, a.lon_a), xy(a.lat_b, a.lon_b));
+    let (q1, q2) = (xy(b.lat_a, b.lon_a), xy(b.lat_b, b.lon_b));
+    let cross = |o: (f64, f64), p: (f64, f64), q: (f64, f64)| {
+        (p.0 - o.0) * (q.1 - o.1) - (p.1 - o.1) * (q.0 - o.0)
+    };
+    if cross(p1, p2, q1) * cross(p1, p2, q2) < 0.0 && cross(q1, q2, p1) * cross(q1, q2, p2) < 0.0 {
+        return 0.0;
+    }
+    let to_seg = |p: (f64, f64), s0: (f64, f64), s1: (f64, f64)| {
+        let (dx, dy) = (s1.0 - s0.0, s1.1 - s0.1);
+        let l2 = dx * dx + dy * dy;
+        let t = if l2 < 1.0 {
+            0.0
+        } else {
+            (((p.0 - s0.0) * dx + (p.1 - s0.1) * dy) / l2).clamp(0.0, 1.0)
+        };
+        ((p.0 - s0.0 - t * dx).powi(2) + (p.1 - s0.1 - t * dy).powi(2)).sqrt()
+    };
+    to_seg(p1, q1, q2)
+        .min(to_seg(p2, q1, q2))
+        .min(to_seg(q1, p1, p2))
+        .min(to_seg(q2, p1, p2))
+}
+
+/// Is this arrival on ANOTHER runway's final, one far enough from `rwy`
+/// ([`nav::CLOSE_PARALLEL_M`], ICAO's segregated-parallel minimum) to be
+/// worked on its own, and nearer that final's centreline than ours? Then it
+/// is that runway's traffic. LEMG's 12 and 13 are 14 degrees apart and 826 m
+/// at the thresholds (1,490 m at the far end); 12's final crosses 13's
+/// extended centreline about 2 nm out, and a Ryanair landing 12 held a 737
+/// lined up on 13 as "traffic on 2 mile final" (sortie 1790623420-full_auto,
+/// 2026-09-28, issue #172). A close parallel or a crossing strip is one
+/// runway's traffic.
+fn on_independent_final(t: &TcasTarget, rwy: &nav::Runway, runways: &[nav::Runway]) -> bool {
+    let Some((_, own_cross, _)) = centreline_place(rwy, t.lat, t.lon) else {
+        return false;
+    };
+    runways
+        .iter()
+        .filter(|r| !(r.ident_a == rwy.ident_a && r.ident_b == rwy.ident_b))
+        .filter(|r| strips_apart_m(r, rwy) >= nav::CLOSE_PARALLEL_M)
+        .any(|r| {
+            let Some((along, cross, len)) = centreline_place(r, t.lat, t.lon) else {
+                return false;
+            };
+            let beyond = FINAL_NM * 1852.0 / len;
+            let on_final = (-beyond..0.0).contains(&along) || (1.0..=1.0 + beyond).contains(&along);
+            on_final && cross <= CORRIDOR_HALF_M && cross < own_cross
+        })
 }
 
 /// The nearest airborne traffic on final for the strip we're standing ON:
@@ -4738,16 +4849,16 @@ pub async fn inbound_traffic_for_strip(xp: SimView<'_>, ident: &str) -> Option<f
 
 /// The sync core of [`inbound_traffic_for_strip`], testable without a sim.
 fn inbound_final_for_strip(targets: &[TcasTarget], ident: &str) -> Option<f64> {
-    let rwy = {
+    let (rwy, runways) = {
         let runways = ACTIVE_RUNWAYS.lock().unwrap_or_else(|e| e.into_inner());
-        strip(&runways, ident)?.clone()
+        (strip(&runways, ident)?.clone(), runways.clone())
     };
     let elev_ft = ACTIVE_PANEL
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .as_ref()?
         .1;
-    final_traffic_for(targets, &rwy, elev_ft).map(|t| t.nm)
+    final_traffic_for(targets, &rwy, &runways, elev_ft).map(|t| t.nm)
 }
 
 // --- Live-traffic watches (party line, go-around, held clearance) -----------
@@ -6492,6 +6603,13 @@ pub struct TakeoffHold {
     /// the pavement is the pilot's only once X has passed. The watch
     /// publishes that condition for the crew every tick.
     behind: bool,
+    /// The traffic this hold is FOR, by raw callsign: the strip's occupants
+    /// at the watch's first tick and every arrival seen on our final since.
+    /// Seeded by [`takeoff_hold_tick_from`]; kept across a re-request on
+    /// the same runway. `None` until seeded.
+    held_for: Option<std::collections::HashSet<String>>,
+    /// Cut-ins already blackboxed (`hold_cut_in`), once per ghost.
+    cut_in_logged: std::collections::HashSet<String>,
 }
 
 /// How much better another runway's headwind must be before the tower swaps
@@ -6622,15 +6740,120 @@ pub fn void_takeoff_hold_by_roll(gs_kts: f64) -> bool {
     voided
 }
 
+/// [`takeoff_hold_tick_from`] without our own position: every occupant of
+/// the pavement holds the departure.
 pub fn takeoff_hold_tick(
     targets: &[TcasTarget],
     field_elev_ft: f64,
     player_on_ground: bool,
     now: Instant,
 ) -> Option<String> {
+    takeoff_hold_tick_from(targets, field_elev_ft, player_on_ground, None, now)
+}
+
+/// A ghost more than this behind our reference point, on the departure
+/// end's heading, is behind our tail: it is not in the way of our roll.
+const OWN_TAIL_M: f64 = 40.0;
+
+/// A ghost on our strip standing this long is standing: a lined-up or
+/// parked replay, not a roll or a rollout.
+const CUT_IN_STANDING_S: f64 = 10.0;
+
+/// What a departure sees on its own strip.
+#[derive(Debug, Default, PartialEq)]
+struct StripPicture {
+    /// Something on the pavement holds the departure.
+    blocked: bool,
+    /// The occupants ahead of our tail, raw callsigns (the watch's seed).
+    occupants: Vec<String>,
+    /// Ghosts standing on the strip that the hold was not held for: a
+    /// replay's departure queue lining up in front of an aircraft the tower
+    /// gave the runway to. The party line withholds their clearance
+    /// (`party_line_withheld`); the hold is not held for them.
+    cut_in: Vec<String>,
+}
+
+/// A departure's traffic on its own strip: a ghost that OCCUPIES the
+/// pavement ([`occupies`]: on it, and not stale data) and, when we stand on
+/// that pavement ourselves (`own`), is not behind our tail on the departure
+/// end's heading. With `held_for` (a hold issued to an aircraft ON the
+/// strip), a ghost the hold was not held for holds it only while it moves
+/// (a roll leaving, a rollout); standing, it is a cut-in. The same pavement
+/// and stale-ghost rules as the landing judgement (#162): the incursion
+/// watch's wider capture, and a replay queue of 13 departures lining up in
+/// front of it, held a 737 lined up on LEMG 13 for five minutes after the
+/// traffic it was promised a clearance behind had landed (sortie
+/// 1790623420-full_auto, 2026-09-28, issue #172).
+fn departure_strip_picture(
+    r: &nav::Runway,
+    departure_end: &str,
+    targets: &[TcasTarget],
+    own: Option<(f64, f64)>,
+    held_for: Option<&std::collections::HashSet<String>>,
+    now: Instant,
+) -> StripPicture {
+    let frame = LandingFrame::new(r, departure_end);
+    let own_along = match (&frame, own) {
+        (Some(f), Some((lat, lon))) if on_runway_pavement(r, lat, lon).is_some() => {
+            Some(f.place(lat, lon).0)
+        }
+        _ => None,
+    };
+    let mut out = StripPicture::default();
+    for t in targets {
+        if occupies(r, t, now).is_none() {
+            continue;
+        }
+        if let (Some(f), Some(ours)) = (&frame, own_along) {
+            if f.place(t.lat, t.lon).0 < ours - OWN_TAIL_M {
+                continue;
+            }
+        }
+        out.occupants.push(t.callsign.clone());
+        let cut_in = held_for.is_some_and(|set| {
+            !set.contains(&t.callsign) && standing_secs(&t.callsign, now) >= CUT_IN_STANDING_S
+        });
+        if cut_in {
+            out.cut_in.push(t.callsign.clone());
+        } else {
+            out.blocked = true;
+        }
+    }
+    out
+}
+
+/// [`departure_strip_picture`]'s verdict for the tower's reply: the hold
+/// standing on this runway (if any) says who it was held for.
+fn departure_strip_occupied(
+    r: &nav::Runway,
+    departure_end: &str,
+    targets: &[TcasTarget],
+    own: Option<(f64, f64)>,
+    now: Instant,
+) -> bool {
+    let held_for = TAKEOFF_HOLD
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .filter(|h| h.lined_up && h.runway_ident == departure_end)
+        .and_then(|h| h.held_for.clone());
+    departure_strip_picture(r, departure_end, targets, own, held_for.as_ref(), now).blocked
+}
+
+/// One pass of the held-clearance watch with our own position (`own`, for
+/// the occupant behind our tail; see [`departure_strip_occupied`]).
+pub fn takeoff_hold_tick_from(
+    targets: &[TcasTarget],
+    field_elev_ft: f64,
+    player_on_ground: bool,
+    own: Option<(f64, f64)>,
+    now: Instant,
+) -> Option<String> {
     if out_of_reach() {
         return None;
     }
+    // The standing clocks the stale-ghost rule reads (idempotent per tick).
+    note_ground_traffic(targets, now);
     let mut guard = TAKEOFF_HOLD.lock().unwrap_or_else(|e| e.into_inner());
     let hold = guard.as_mut()?;
     // Airborne, the hold is moot: either the pilot departed through the
@@ -6644,20 +6867,48 @@ pub fn takeoff_hold_tick(
         return None;
     }
     // Our strip, cloned out so the runway lock isn't held across the checks.
-    let rwy = {
+    let (rwy, runways) = {
         let runways = ACTIVE_RUNWAYS.lock().unwrap_or_else(|e| e.into_inner());
-        strip(&runways, &hold.runway_ident).cloned()
+        (strip(&runways, &hold.runway_ident).cloned(), runways.clone())
     };
     // The two conditions are DIFFERENT in kind, and conflating them is what
     // made the release unreachable under injected traffic: the runway being
     // occupied is absolute, while an arrival on final is a question of GAP.
     let inbound = rwy
         .as_ref()
-        .and_then(|r| final_traffic_for(targets, r, field_elev_ft));
-    let on_strip = match &rwy {
-        Some(r) => targets
-            .iter()
-            .any(|t| t.on_ground && on_runway(r, t.lat, t.lon).is_some()),
+        .and_then(|r| final_traffic_for(targets, r, &runways, field_elev_ft));
+    // The traffic this hold is for: the strip's occupants at its first
+    // tick, and every arrival on our final since.
+    if hold.held_for.is_none() {
+        let seed = rwy.as_ref().map(|r| {
+            departure_strip_picture(r, &hold.runway_ident, targets, own, None, now).occupants
+        });
+        hold.held_for = Some(seed.unwrap_or_default().into_iter().collect());
+    }
+    if let (Some(set), Some(f)) = (hold.held_for.as_mut(), inbound.as_ref()) {
+        set.extend(f.ghosts.iter().cloned());
+    }
+    // Held ON the strip, the runway is ours: a ghost lining up in front of
+    // us is the replay's queue, not the traffic we were held for.
+    let held_for = if hold.lined_up {
+        hold.held_for.clone()
+    } else {
+        None
+    };
+    let picture = rwy.as_ref().map(|r| {
+        departure_strip_picture(r, &hold.runway_ident, targets, own, held_for.as_ref(), now)
+    });
+    for g in picture.iter().flat_map(|p| p.cut_in.iter()) {
+        if hold.cut_in_logged.insert(g.clone()) {
+            sim::blackbox::record(
+                "atc",
+                serde_json::json!({"event": "hold_cut_in", "ghost": g,
+                    "runway": hold.runway_ident}),
+            );
+        }
+    }
+    let on_strip = match &picture {
+        Some(p) => p.blocked,
         None => targets
             .iter()
             .any(|t| t.on_ground && on_active_runway(t.lat, t.lon).is_some()),
@@ -11196,6 +11447,8 @@ mod tests {
             logged_at: Instant::now(),
             lined_up: false,
             behind: false,
+            held_for: None,
+            cut_in_logged: Default::default(),
         });
         *PENDING_TAKEOFF_CLEARANCE.lock().unwrap() = false;
         *CLEARANCE.lock().unwrap() = Some(ClearanceSnap {
@@ -11302,6 +11555,8 @@ mod tests {
             logged_at: t0,
             lined_up: false,
             behind: false,
+            held_for: None,
+            cut_in_logged: Default::default(),
         });
         assert!(takeoff_hold_tick(&[], elev, false, t0 + sec(120)).is_none());
         assert!(
@@ -11362,6 +11617,8 @@ mod tests {
             logged_at: t0,
             lined_up: false,
             behind: false,
+            held_for: None,
+            cut_in_logged: Default::default(),
         });
         // An arrival on the 26L final: `nm` beyond the 26L threshold along the
         // extended centreline (landing westbound, so the approach lies east of
@@ -11502,6 +11759,8 @@ mod tests {
             logged_at: t0,
             lined_up: false,
             behind: false,
+            held_for: None,
+            cut_in_logged: Default::default(),
         });
         // A heavy just rotated off our strip.
         let departed = |at: Instant| {
@@ -14657,6 +14916,8 @@ mod tests {
             logged_at: Instant::now(),
             lined_up: true,
             behind: false,
+            held_for: None,
+            cut_in_logged: Default::default(),
         });
         assert!(
             !void_takeoff_hold_by_roll(25.0),
@@ -14814,6 +15075,8 @@ mod tests {
             logged_at: armed_at,
             lined_up: false,
             behind: false,
+            held_for: None,
+            cut_in_logged: Default::default(),
         };
         // Nothing standing: the clock starts now.
         assert_eq!(hold_armed_at(None, "27R", t0), t0);
@@ -17264,5 +17527,257 @@ mod tests {
                 plan.crossings
             );
         }
+    }
+
+    /// A point `along` metres down a runway end's heading from its
+    /// threshold (negative: out on its final), `right` metres to its right.
+    fn lemg_point(r: &nav::Runway, end_a: bool, along: f64, right: f64) -> (f64, f64) {
+        let (lat0, lon0, lat1, lon1) = if end_a {
+            (r.lat_a, r.lon_a, r.lat_b, r.lon_b)
+        } else {
+            (r.lat_b, r.lon_b, r.lat_a, r.lon_a)
+        };
+        let m_lon = 111_320.0 * lat0.to_radians().cos();
+        let (bx, by) = ((lon1 - lon0) * m_lon, (lat1 - lat0) * 111_320.0);
+        let len = (bx * bx + by * by).sqrt();
+        let (ux, uy) = (bx / len, by / len);
+        let (x, y) = (ux * along + uy * right, uy * along - ux * right);
+        (lat0 + y / 111_320.0, lon0 + x / m_lon)
+    }
+
+    fn lemg_ghost(callsign: &str, at: (f64, f64), ele_ft: f64, on_ground: bool) -> TcasTarget {
+        TcasTarget {
+            callsign: callsign.into(),
+            lat: at.0,
+            lon: at.1,
+            ele_ft,
+            on_ground,
+            vs_fpm: if on_ground { 0.0 } else { -700.0 },
+        }
+    }
+
+    /// Issue #172, question 3: LEMG 12/30 and 13/31 are 14 degrees apart,
+    /// 826 m at the 12 and 13 thresholds and 1,490 m at the far ends, so
+    /// neither is the other's close parallel. 12's final crosses 13's
+    /// extended centreline about 2 nm out: FR655 on 12's final at 2.08 nm
+    /// (sortie 1790623420-full_auto, +157 s) sat 70 m off 13's line, inside
+    /// its 500 m corridor, and was "traffic on 2 mile final" to a 737 lined
+    /// up on 13. It is 12's traffic.
+    #[test]
+    fn a_lemg_12_arrival_is_not_traffic_for_13() {
+        let rw = lemg_runways();
+        let apart = strips_apart_m(&rw[0], &rw[1]);
+        assert!((800.0..860.0).contains(&apart), "{apart}");
+        assert!(apart >= nav::CLOSE_PARALLEL_M);
+        assert_eq!(nav::close_parallel_main(&rw, "12"), "12");
+        assert_eq!(nav::close_parallel_main(&rw, "13"), "13");
+        let elev = 52.0;
+        let fr655 =
+            lemg_ghost("FR655", lemg_point(&rw[0], true, -3852.0, 0.0), elev + 660.0, false);
+        let (_, cross, _) = centreline_place(&rw[1], fr655.lat, fr655.lon).unwrap();
+        assert!(cross < CORRIDOR_HALF_M, "inside 13's corridor: {cross}");
+        assert!(
+            final_traffic_for(std::slice::from_ref(&fr655), &rw[1], &rw, elev).is_none(),
+            "12's lander is not 13's traffic"
+        );
+        let on_12 = final_traffic_for(std::slice::from_ref(&fr655), &rw[0], &rw, elev)
+            .expect("12's own traffic");
+        assert!((on_12.nm - 2.08).abs() < 0.05, "{}", on_12.nm);
+        // A lander on 13's own final at the same range stays 13's.
+        let own = lemg_ghost("VY1", lemg_point(&rw[1], true, -3852.0, 0.0), elev + 660.0, false);
+        assert!(final_traffic_for(std::slice::from_ref(&own), &rw[1], &rw, elev).is_some());
+        // The calm-wind stream reads it as 12's too.
+        assert_eq!(arrival_end(std::slice::from_ref(&fr655), &rw, elev).as_deref(), Some("12"));
+        // A close parallel's stream is still one runway's: a strip 200 m off
+        // 13 hands its lander to 13's corridor.
+        let mut close = rw[1].clone();
+        let (a, b) = (
+            lemg_point(&rw[1], true, 0.0, -200.0),
+            lemg_point(&rw[1], false, 0.0, 200.0),
+        );
+        close.ident_a = "13L".into();
+        close.ident_b = "31R".into();
+        (close.lat_a, close.lon_a, close.lat_b, close.lon_b) = (a.0, a.1, b.0, b.1);
+        let pair = vec![rw[1].clone(), close.clone()];
+        let on_close =
+            lemg_ghost("VY2", lemg_point(&close, true, -3000.0, 0.0), elev + 500.0, false);
+        assert!(final_traffic_for(std::slice::from_ref(&on_close), &rw[1], &pair, elev).is_some());
+    }
+
+    /// Issue #172, question 1, from the sortie's records: the 737 lined up
+    /// on LEMG 13 45 m from the threshold was held (U25702 lined up ahead,
+    /// FR655 on 12's final), promised a clearance after the landing traffic,
+    /// and then held five minutes by the replay's 13 departures lining up in
+    /// front of it. The hold is kept for what it was held FOR: the ghost
+    /// ahead at the first tick leaves, a later ghost standing in front is a
+    /// cut-in (blackbox `hold_cut_in`), 12's lander is never ours, and the
+    /// promise is kept.
+    #[test]
+    fn a_held_runway_start_is_released_once_its_traffic_has_gone() {
+        let _guard = SIDE_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        *WAKE.lock().unwrap() = None;
+        *PENDING_TAKEOFF_CLEARANCE.lock().unwrap() = false;
+        let rw = lemg_runways();
+        *ACTIVE_RUNWAYS.lock().unwrap() = rw.clone();
+        *CLEARANCE.lock().unwrap() = Some(ClearanceSnap {
+            state: tower::State::LinedUp,
+            callsign: "November eight one six November November".into(),
+            runway_ident: "13".into(),
+            pending_readback: None,
+            holds_runway: true,
+        });
+        let t0 = Instant::now();
+        let sec = std::time::Duration::from_secs;
+        *TAKEOFF_HOLD.lock().unwrap() = Some(TakeoffHold {
+            callsign: "November eight one six November November".into(),
+            runway: "one three".into(),
+            runway_ident: "13".into(),
+            clear_since: None,
+            armed_at: t0,
+            logged_at: t0,
+            lined_up: true,
+            behind: false,
+            held_for: None,
+            cut_in_logged: Default::default(),
+        });
+        let elev = 52.0;
+        let own = Some(lemg_point(&rw[1], true, 45.0, 0.0));
+        let fr655_final =
+            lemg_ghost("FR655", lemg_point(&rw[0], true, -3852.0, 0.0), elev + 660.0, false);
+        let fr655_down = lemg_ghost("FR655", lemg_point(&rw[0], true, 900.0, 0.0), elev, true);
+        let u25702 = lemg_ghost("U25702", lemg_point(&rw[1], true, 136.0, 0.0), elev, true);
+        let ei887 = lemg_ghost("EI887", lemg_point(&rw[1], true, 140.0, 2.0), elev, true);
+        let tick = |targets: &[TcasTarget], s: u64| {
+            takeoff_hold_tick_from(targets, elev, true, own, t0 + sec(s))
+        };
+        // U25702 lined up ahead of us: held, whatever 12 is doing.
+        assert!(tick(&[fr655_final.clone(), u25702.clone()], 0).is_none());
+        assert!(tick(&[fr655_final.clone(), u25702.clone()], 30).is_none());
+        // It rolls and goes; FR655 lands on 12; EI887 lines up in front.
+        assert!(tick(&[fr655_down.clone(), ei887.clone()], 60).is_none(), "EI887 moving on");
+        assert!(tick(&[fr655_down.clone(), ei887.clone()], 65).is_none());
+        // Standing, EI887 is the replay's queue, not our traffic: the strip
+        // is clear for the hold from here, and 15 s on the tower keeps its
+        // word.
+        assert!(tick(&[fr655_down.clone(), ei887.clone()], 71).is_none());
+        let line = tick(&[fr655_down.clone(), ei887.clone()], 87).expect("the promised release");
+        assert!(line.contains("cleared for takeoff"), "{line}");
+        assert!(line.contains("one three"), "{line}");
+        assert!(*PENDING_TAKEOFF_CLEARANCE.lock().unwrap());
+
+        // Held from the taxiway (not lined up), a ghost on the strip is
+        // traffic whatever its seed: the queue ahead of the hold line is
+        // the stream we join.
+        *PENDING_TAKEOFF_CLEARANCE.lock().unwrap() = false;
+        *TAKEOFF_HOLD.lock().unwrap() = Some(TakeoffHold {
+            callsign: "November eight one six November November".into(),
+            runway: "one three".into(),
+            runway_ident: "13".into(),
+            clear_since: None,
+            armed_at: t0,
+            logged_at: t0,
+            lined_up: false,
+            behind: false,
+            held_for: Some(Default::default()),
+            cut_in_logged: Default::default(),
+        });
+        for s in [200, 230, 260] {
+            assert!(
+                takeoff_hold_tick_from(std::slice::from_ref(&ei887), elev, true, None, t0 + sec(s))
+                    .is_none(),
+                "held at +{s}"
+            );
+        }
+
+        // Only the pavement AHEAD of our tail is in the way of the roll: from
+        // an intersection 900 m down 13, a ghost standing 200 m behind us is
+        // not traffic, one 200 m ahead is.
+        let mid = Some(lemg_point(&rw[1], true, 900.0, 0.0));
+        let behind = lemg_ghost("VY3", lemg_point(&rw[1], true, 700.0, 0.0), elev, true);
+        let ahead = lemg_ghost("VY4", lemg_point(&rw[1], true, 1100.0, 0.0), elev, true);
+        let now = t0 + sec(300);
+        assert!(!departure_strip_picture(&rw[1], "13", &[behind.clone()], mid, None, now).blocked);
+        assert!(departure_strip_picture(&rw[1], "13", &[ahead], mid, None, now).blocked);
+        assert!(
+            departure_strip_picture(&rw[1], "13", &[behind], None, None, now).blocked,
+            "without our position every occupant counts"
+        );
+        // A holding point 90 m off the centreline is not the pavement.
+        let hold_line = lemg_ghost("VY5", lemg_point(&rw[1], true, 60.0, 90.0), elev, true);
+        assert!(!departure_strip_picture(&rw[1], "13", &[hold_line], own, None, now).blocked);
+
+        *TAKEOFF_HOLD.lock().unwrap() = None;
+        *CLEARANCE.lock().unwrap() = None;
+        *PENDING_TAKEOFF_CLEARANCE.lock().unwrap() = false;
+        ACTIVE_RUNWAYS.lock().unwrap().clear();
+    }
+
+    /// Issue #172: a RUNWAY START's first ready call is answered "hold
+    /// position, traffic on the runway" from Parked (the tower moves it
+    /// LinedUp in the same reply), and the release watch never armed: the
+    /// crew nudged "ready for departure" every 40 s and was told "read
+    /// back" three times. Now the watch arms, and "holding position" is the
+    /// readback the tower takes.
+    #[test]
+    fn a_held_runway_start_arms_the_release_and_takes_the_hold_readback() {
+        let _guard = SIDE_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        *WAKE.lock().unwrap() = None;
+        *TAKEOFF_HOLD.lock().unwrap() = None;
+        let path = lxgb_apt_file();
+        let mut st = Station::load(path.to_str().unwrap(), "LXGB").expect("LXGB loads");
+        let wx = Wx {
+            wind_from_deg: 90.0,
+            wind_kts: 8.0,
+        };
+        let mut ctx = scripted_ctx(&mut st, wx);
+        ctx.on_ground = true;
+        ctx.own_on_runway = true;
+        ctx.runway_occupied = true;
+        let cs = "november one seven two sierra papa";
+        assert_eq!(st.twr.state, tower::State::Parked);
+        let r = st.route_keyed(
+            &format!("{cs}, ready for departure, for circuits"),
+            Service::Tower,
+            &ctx,
+            wx,
+        );
+        assert!(r.contains("hold position, traffic on the runway"), "{r}");
+        assert_eq!(st.twr.state, tower::State::LinedUp);
+        assert!(
+            TAKEOFF_HOLD.lock().unwrap().as_ref().is_some_and(|h| h.lined_up),
+            "the release watch is armed for the runway start"
+        );
+        let owed = CLEARANCE
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(|c| c.pending_readback.clone())
+            .expect("the hold is owed its readback");
+        assert!(owed.starts_with("Holding position"), "{owed}");
+        // The crew's readback, as full auto transmits it.
+        let r = st.route_keyed(owed.trim_end_matches('.'), Service::Tower, &ctx, wx);
+        assert_eq!(r, "", "read back: a quiet frequency");
+        assert!(
+            CLEARANCE
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .pending_readback
+                .is_none()
+        );
+        // Asking again is answered with the hold, never "read back".
+        let r = st.route_keyed(
+            &format!("{cs}, ready for departure, for circuits"),
+            Service::Tower,
+            &ctx,
+            wx,
+        );
+        assert!(!r.contains("read back"), "{r}");
+        assert!(r.contains("hold position"), "{r}");
+
+        *TAKEOFF_HOLD.lock().unwrap() = None;
+        *CLEARANCE.lock().unwrap() = None;
+        *HANDOFF.lock().unwrap_or_else(|e| e.into_inner()) = None;
     }
 }

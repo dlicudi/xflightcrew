@@ -5454,6 +5454,31 @@ async fn backtrack_from_runway_start(
     }
 }
 
+/// When the crew reads back an instruction the tower is waiting on: once
+/// per distinct text, again only if it is still owed after
+/// [`OwedReadback::AGAIN`] (a readback dropped stale on the radio). Pure.
+#[derive(Default)]
+struct OwedReadback {
+    sent: Option<(String, Instant)>,
+}
+
+impl OwedReadback {
+    const AGAIN: Duration = Duration::from_secs(30);
+
+    /// The readback to transmit now, if any.
+    fn due(&mut self, owed: Option<&str>, now: Instant) -> Option<String> {
+        let owed = owed?;
+        let again = match &self.sent {
+            Some((text, at)) => text != owed || now.duration_since(*at) >= Self::AGAIN,
+            None => true,
+        };
+        again.then(|| {
+            self.sent = Some((owed.to_string(), now));
+            owed.to_string()
+        })
+    }
+}
+
 /// Wait until the tower actually clears the takeoff, through a traffic hold if
 /// that's what it takes (a final can be minutes out). Re-report "ready for
 /// departure" periodically while merely waiting, but stay SILENT while
@@ -5481,10 +5506,15 @@ async fn ensure_takeoff_cleared(
     const OVERALL_SECS: f64 = 480.0;
     /// Re-report "ready" this often while lined up and NOT held for traffic.
     const NUDGE_EVERY: Duration = Duration::from_secs(40);
+    /// Held for traffic, ask again after this long without a word: a real
+    /// hold lasts a landing or two, and the tower keeps its own promise
+    /// well inside it (`station::takeoff_hold_tick`).
+    const HELD_REASK: Duration = Duration::from_secs(150);
 
     let deadline = Instant::now() + Duration::from_secs_f64(OVERALL_SECS);
     let mut last_call = Instant::now(); // request_departure just called
     let mut announced_hold = false;
+    let mut readback = OwedReadback::default();
     loop {
         if ABORT.load(SeqCst) {
             return false;
@@ -5498,7 +5528,33 @@ async fn ensure_takeoff_cleared(
         if Instant::now() >= deadline {
             return false;
         }
-        if crate::party_line::takeoff_hold_armed() {
+        // An instruction the tower wants read back ("hold position") is
+        // read back before anything else is said: the ready call repeated
+        // over it earned "read back" three times (LEMG 13, #172).
+        let owed = crate::party_line::readback_owed();
+        if let Some(rb) = readback.due(owed.as_deref(), Instant::now()) {
+            crate::circuit::transmit(rb.trim_end_matches('.').to_string());
+            event("readback_hold", json!({ "call": rb }));
+            last_call = Instant::now();
+        } else if owed.is_some() {
+            // Owed and just read back: wait for the tower to hear it.
+        } else if crate::party_line::takeoff_hold_armed() {
+            // Held, and a promise is only as good as its keeping: past
+            // HELD_REASK the crew asks again, so a hold that outlived its
+            // traffic is never waited out in silence (LEMG 13, sortie
+            // 1790623420-full_auto: "expect clearance after the landing
+            // traffic", then 5 min of nothing and no_takeoff_clearance).
+            if last_call.elapsed() >= HELD_REASK {
+                event(
+                    "reask_held",
+                    json!({ "why": "held", "since_call_s": last_call.elapsed().as_secs() }),
+                );
+                crate::circuit::transmit(crate::circuit::radio_call(
+                    callsign,
+                    ready_call(flying_circuits()),
+                ));
+                last_call = Instant::now();
+            }
             // Held for traffic: wait it out, silently. Say so once.
             if !announced_hold {
                 announce(
@@ -6563,6 +6619,38 @@ mod tests {
         let ready = crate::circuit::radio_call(&cs, ready_call(false));
         assert_eq!(parse_intent(&ready), Intent::RequestTakeoff);
         assert!(!wants_circuits(&ready), "{ready}");
+    }
+
+    /// LEMG 13 (sortie 1790623420-full_auto, 2026-09-28, #172): told "hold
+    /// position, traffic on the runway", the crew repeated "ready for
+    /// departure" at +76 and +116 and was told "read back" each time. An
+    /// owed readback goes out first, once per instruction, and again only
+    /// if the tower still waits for it 30 s on.
+    #[test]
+    fn a_held_crew_reads_back_the_hold_before_asking_again() {
+        use super::OwedReadback;
+        use crate::tower::{parse_intent, Intent};
+        use std::time::{Duration, Instant};
+        let hold = "Holding position, November eight one six November November.";
+        let t0 = Instant::now();
+        let mut rb = OwedReadback::default();
+        assert_eq!(rb.due(None, t0), None, "nothing owed, nothing said");
+        assert_eq!(rb.due(Some(hold), t0).as_deref(), Some(hold));
+        assert_eq!(rb.due(Some(hold), t0 + Duration::from_secs(5)), None, "said once");
+        assert_eq!(
+            rb.due(Some(hold), t0 + Duration::from_secs(31)).as_deref(),
+            Some(hold),
+            "still owed: said again"
+        );
+        let other = "Lining up runway one three, November eight one six November November.";
+        assert_eq!(
+            rb.due(Some(other), t0 + Duration::from_secs(32)).as_deref(),
+            Some(other),
+            "a new instruction is read back at once"
+        );
+        // What goes out is a readback, not another request.
+        let sent = hold.trim_end_matches('.');
+        assert_ne!(parse_intent(sent), Intent::RequestTakeoff, "{sent}");
     }
 
     #[test]

@@ -10147,3 +10147,32 @@ gusty under 400 (353); the lever cut at the gate goes past 300, the tracker to 1
 brakes 0.24/0.24, rudder alone (under 2 deg/s per unit), 3 to 9 degrees right for ten seconds, 1.6
 to 12.1 m; `RolloutBrakeSteer` holds the replay inside 2.6 m for 15 to 60 deg/s per unit of brake
 difference. Offline only.
+
+## 2026-09-28: a lined-up 737 held for 12's lander, never released (issue #172)
+
+LEMG 13 runway start, "fly a circuit" (sortie 1790623420-full_auto): given up
+`no_takeoff_clearance` at +514 s, never rolled. Three faults. (1) The runway start's first ready
+call (+50) was held "traffic on the runway" from Parked (the tower moves it LinedUp in the same
+reply), and the release watch arms only from TaxiCleared/LinedUp/TakeoffCleared: nothing to release
+it. It arms for a held runway start now. (2) The crew never read back "hold position": the hold was
+not armed, so `ensure_takeoff_cleared` nudged "ready for departure" every 40 s and the tower said
+"read back" at +76 and +116. The loop now transmits an owed readback first (`OwedReadback`: once
+per text, again after 30 s if still owed; blackbox `full_auto` `readback_hold`), and a hold that
+outlives 150 s of silence is asked again (`reask_held`). (3) The watch armed at +157 ("expect
+clearance after the landing traffic", FR655 at 2.08 nm on 12's final) ticked every 15 s to the
+give-up: `final_nm` counted 12's landers and `on_strip` stayed true from 19:27:19Z while the
+replay's 13 departures (SK584, U25702, EI887, U23746) lined up in front of us, 45 m past the
+threshold. apt.dat: 12/30 and 13/31 are 14 degrees apart, 826 m at the 12 and 13 thresholds and
+1,490 m at the far ends, so `close_parallel_main` (5 degrees, 760 m) keeps them apart; but 12's
+final crosses 13's extended centreline about 2 nm out (70 m off it at 2.08 nm, inside the 500 m
+corridor). An arrival nearer an INDEPENDENT runway's final (strips at least `CLOSE_PARALLEL_M`
+apart, `strips_apart_m`) is that runway's (`on_independent_final`, in `final_traffic_for` and
+`arrival_end`). The hold's strip test is now the landing judgement's pavement and stale-ghost rule
+(`occupies`), only ahead of our tail when we stand on the strip (`OWN_TAIL_M`), and a hold issued
+ON the strip is kept for what it was held for (`TakeoffHold.held_for`: the occupants at its first
+tick and every arrival seen on our final): a ghost that stands 10 s in front of us after that is the
+replay's queue, blackboxed `hold_cut_in`, not our traffic. The reply's `runway_occupied` reads the
+same picture for a takeoff request. Tests `a_lemg_12_arrival_is_not_traffic_for_13`,
+`a_held_runway_start_is_released_once_its_traffic_has_gone`,
+`a_held_runway_start_arms_the_release_and_takes_the_hold_readback`,
+`a_held_crew_reads_back_the_hold_before_asking_again`. Offline only.

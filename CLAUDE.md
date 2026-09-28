@@ -288,7 +288,12 @@ Config: `XCOPILOT_ATC_AIRPORT` / `_VOICE` / `_RATE` / `_REGION`.
   parallel under 760 m away is its main twin (`close_parallel_main`; EGKK 26R, 2026-09-27).
   LinedUp and conditional line-up.
 - Release threads the arrival stream (`DEPART_GAP_NM`; strip clear = LUAW); wake timed from when
-  the HOLD went on. **Circuit traffic stays with the tower** (`tower::wants_circuits`,
+  the HOLD went on; a held runway start arms it too. **A hold keeps its word** (#172): an arrival
+  nearer an INDEPENDENT runway's final is that runway's (`on_independent_final`; LEMG 12's final
+  crosses 13's line 2 nm out); the strip is the pavement ahead of our tail (`occupies`,
+  `OWN_TAIL_M`), and held ON it, a ghost standing in front after the first tick is the replay's
+  queue (`TakeoffHold.held_for`, blackbox `hold_cut_in`).
+  **Circuit traffic stays with the tower** (`tower::wants_circuits`,
   `Station.circuits`): "for circuits" on the taxi or ready call withholds the departure handoff
   (`departure_handoff_withheld`) and the radar watch; full auto's circuit says it (`taxi_call`,
   `ready_call`, the ramp's `zone_clearance_call`; LEMG 31 2026-09-28); its zone request is cleared FOR THE CIRCUIT, never out of the
@@ -591,7 +596,9 @@ everything blackboxes to `logs/blackbox.jsonl` (kinds: `atc`, `autotaxi`, `autot
   trip burn, overweight landing, crosswind, unpressurised height. The all-clear names what could
   not be checked.
 - **The crew works the radio as it flies**: a conditional line-up waits on
-  `party_line::line_up_condition_clear()`; `take_departure_handoff()` (readback, retune, check-in);
+  `party_line::line_up_condition_clear()`; a held departure reads the hold back before any other
+  call (`OwedReadback`, `readback_hold`) and asks again after 150 s held (`reask_held`, #172);
+  `take_departure_handoff()` (readback, retune, check-in);
   an IFR readback is judged from when it goes OUT (`ReadbackWait`, `circuit::crew_radio_pending`);
   `take_region_handoff()` (survives `Station::install`; 7000 via `SetTransponder`;
   `region_coach_line` with a pilot flying). **An IFR flight keeps its code** (party line
