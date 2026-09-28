@@ -9861,3 +9861,14 @@ the jump. `Scorer::new_flight` now runs on every `flight` `reposition` and `flig
 13 with the wind at 280/5 while the tower sent arrivals to 30: `runway: wind` picks the tower's end at
 each setup (`nav::best_runway_for_wind`), a default deadline scales with the airframe's approach speed,
 rows are flushed (pipe through `grep --line-buffered`). Offline only.
+
+## 2026-09-28: position from one frame (issue #157)
+
+The 737 roll work (#123) found latitude and longitude, read as separate Web API requests, can come from
+different frames: up to 2.9 m of cross-track for one tick on LEMG 13 above 120 kt, 0.7 m on EGKK 08R.
+The livestate WebSocket cache is per dataref and would not fix it. The plugin now publishes
+`xcopilot/position` (10 doubles, after the flight model, every frame), read in one request by
+`sim::position::read`, with a split-read fallback remembered for 10 s; adopted by the takeoff roll and
+reject stop, the autoland tick and rollout, the auto taxi drive, both circuit ticks, taxi-in and the
+monitor snapshot. Replaying 1790591256 with each request two frames late: split reads 3.0 m worst, the
+snapshot 0. Records carry `pos`. Needs `make install` and a plugin reload. Offline only.

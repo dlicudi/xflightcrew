@@ -124,6 +124,10 @@ Datarefs and commands stay in the Rust tools; YAML is per-airframe config.
   made-up names fed fallbacks that impersonated a measurement for months).
 - **The plugin side too** (`health::PLUGIN_DATAREFS`, test-pinned): a stale `.xpl` is said at boot
   and red on Health. Editing `plugin/src` is done only after `make -C plugin`, install AND reload.
+- **Position is one frame** (`xcopilot/position`, `sim::position::read`): the plugin copies lat,
+  lon, elevation, true heading, groundspeed, vertical speed and y_agl after the flight model each frame,
+  read in one request; an older plugin falls back to split reads (`pos: split`). Read separately, lat
+  and lon paired two frames: 2.9 m of cross-track for a tick on LEMG 13 (#157).
 - **A failed read is NO measurement**: a loop skips the tick and blackboxes `null`. A "dataref" may
   be a command; read-only switches need read-before-fire `*_toggle` tools, in full auto's copies
   too. Paired lights are written together (one lit pod confirms half).
@@ -452,8 +456,7 @@ everything blackboxes to `logs/blackbox.jsonl` (kinds: `atc`, `autotaxi`, `autot
 - **The declared rudder is believed only up to the speed it was measured at** (`RollSteer` held flat
   above `roll_rudder:` `at_kts`, ceiling `RUDDER_FULL_DEG_FAST`; extrapolated as v^2 it cut the gain to a
   third by Vr: EGKK 08R lifted off 5.4 m left, 2026-09-28). The scheduled roll's cut is `RollCut`: the
-  median of three cross-track reads (lat and lon are separate requests; a mixed pair reads up to 2.9 m
-  off for a tick), cut harder from `XTK_GAIN_REF_KTS` to `at_kts`, plus a slow cross-track trim.
+  median of three cross-track reads (a mixed-frame pair read up to 2.9 m off for a tick until `xcopilot/position`), cut harder from `XTK_GAIN_REF_KTS` to `at_kts`, plus a slow cross-track trim.
 - **The handoff line is true** about who has the aircraft and the height (`handoff_to_caller`). **A
   pilot handoff is FLYABLE**: it waits for the clean-up (`handoff_waits_for_clean_up`), sets a
   capturable dial (`handoff_altitude_dial_ft`), and gives the governor the overspeed guard's speed
