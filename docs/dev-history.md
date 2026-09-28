@@ -9669,3 +9669,16 @@ plus its off switch. The demonstration's grade is the instructor's (`demo_end` `
 student's attempt in progress is closed as theirs. #87: authored answers plus lexical (BM25) retrieval
 over the existing handbook chunks, no model (the 2026-07-08 fps measurement; a teaching voice must not
 invent); see docs/tasks/2026-09-28-instructor-handbook-questions.md. Offline only.
+
+## 2026-09-28: the heli final's headwind cap; transit fields' zone challenges (issues #82, #83)
+
+#82 (ETND 2026-09-23): in a 17 kt headwind the final flew 4.4 km at 21.6 kt over the ground and took
+6.5 minutes. The final is now capped by what the hover mode can hold over the ground and through the
+air, not by the speed left at the hand-over; a slow-down in a tailwind aims lower by the tailwind so
+the groundspeed arrives inside the hover loop's 39 kt takeover. Replayed: 402 s to 248 s.
+#83: the tower understands "request zone transit" (a runway crossing and readbacks excluded) and
+clears it through with the pressure and "report leaving the zone" (FAA "transition ... approved,
+report clear"); the call is two-way contact, so the zone watch stops challenging. The heli route
+answers the destination's tower with the inbound call and any other field's with a transit request,
+each at most twice. Blackbox `heli_route` `final_tick`, `slow_tailwind`, `zone_challenge`. #84 not
+done. Offline only.

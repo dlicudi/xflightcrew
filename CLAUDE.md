@@ -709,6 +709,10 @@ physical drive.
   mode at zero when slow, the lever at `steady()`).
 - The start reads every throttle back at FLY and locks the tail wheel first (read, then TOGGLE).
 - Airborne requests take over below `TAKEOVER_MAX_MPS` and `DEPART_MAX_FT`.
+- **The final is capped by what the hover mode can hold** over the ground and through the air (a
+  slow-down in a tailwind aims lower by the tailwind; ETND 17 kt headwind, #82); **a transit field's
+  challenge is answered with a transit request**, the destination's with the inbound call, each
+  station at most twice (`heli_route` `zone_challenge`; tower "request zone transit", #83).
 - **Circuit** (`src/heli_circuit.rs`, `heli_circuit`): `Fly` vectors, a final tapering at
   `FINAL_DECEL_MPS2` led by the height loop's lag, then `Land`.
 - **Route** (`src/heli_route.rs`, `heli_route`): the whole flight, as full auto: cold start, lift,
@@ -735,7 +739,7 @@ physical drive.
 - Words: "hover at N", "set it down", "hold position", "take off", "fly a circuit"; the AP's mode
   tools are refused while the loop flies (`hover::blocks`).
 
-Still owed: issues labelled `area:helicopter` (`owed`: headwind cap #82, transit challenges #83;
+Still owed: issues labelled `area:helicopter` (`owed`: hover taxi power #84;
 `unflown`: approach and gate #47, fast climb #48).
 
 ## The flight model: one state, read by everyone (in SHADOW)
