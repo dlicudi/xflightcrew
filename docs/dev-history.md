@@ -9726,3 +9726,16 @@ monitor's `icing` practice switches or advises. DC-3 relies on its `.acf` loads 
 #92: `ap_mode` (autothrust, level change, GPSS) with readback and a capability map (proved >
 `autoflight:` > survey type); not wired into the follower or autoland. No airframe declares
 `autoflight:` yet: autothrust on the A330 and 737, FLCH and GPSS need live probes. Offline only.
+
+## 2026-09-28: the OFP cruise schedule and planned step climbs (issue #101); #80 recorded
+
+The pilot's EGKK-EGBB OFP (B738, CI 77, FL180) planned 299-300 KIAS / M0.625-0.628 on its cruise fixes;
+the 737 profile held 255 at every level, and `enroute_legs` commanded the plan's highest level from the
+first leg, so a stepped plan climbed straight to its top. The fetch now reads each navlog fix's stage,
+IAS and Mach plus the cost index and `stepclimb_string` (`simbrief::CruiseSchedule`); a cruise leg
+holds the lower of the planned IAS and the planned Mach at the level flown (`cas_for_mach`) inside the
+airframe's floor and ceiling (`cruise_pick`); `apply_step_climbs` gives every climb and cruise leg the
+level in force, all or nothing. Blackbox `full_auto cruise_schedule`, `procedure cruise_schedule`,
+`step_climb`. Fixture `bench/ofp/egkk-egbb-738.trimmed.json`. #80 was built earlier as `efecb12`
+(`circuit::authored_vertical`: the authored route's levels on the AP's dial where
+`ap_altitude_capture` is declared). Offline only.

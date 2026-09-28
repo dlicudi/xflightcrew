@@ -492,7 +492,10 @@ everything blackboxes to `logs/blackbox.jsonl` (kinds: `atc`, `autotaxi`, `autot
   cross-tie); waits on `driving()`, not `ACTIVE`; refuses to arm airborne, naming the tools that
   fly; ends with `taxi_in_after_landing`. **A resume past the route near the destination is the
   arrival** (`resume_join`, `ARRIVAL_REJOIN_NM`, autoland on the plan's runway); every refusal names
-  its number. Cruise is a SPEED (`reference.cruise_ias_kts`).
+  its number. Cruise is a SPEED: the OFP's on its cruise legs
+  (`procedure::scheduled_cruise_kts`: the lower of planned IAS and planned Mach at the level,
+  `cas_for_mach`; `cruise_pick` only inside floor and ceiling), else `reference.cruise_ias_kts`. **A
+  planned step is flown at its fix** (`apply_step_climbs` at the arm, all or nothing; `step_climb_at`).
 - **The arrival is briefed at the arm** (`full_auto::brief_arrival`); a destination the data lacks
   is refused there, not on the approach.
 - **The next fix is `procedure::active_leg()` first**: the GPS sits on the plan's first entry.
@@ -708,7 +711,7 @@ spoken "taxi to parking" leaves the engines to the pilot.
 
 ### Still owed
 Issues labelled `owed` + `area:approach-landing` / `area:takeoff` / `area:full-auto` (retard #76,
-slow go-around #77, authored-route capture #80, `ils_coupled` #81).
+slow go-around #77, `ils_coupled` #81).
 
 ## Helicopters: the hover loop
 
