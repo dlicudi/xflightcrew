@@ -577,7 +577,10 @@ everything blackboxes to `logs/blackbox.jsonl` (kinds: `atc`, `autotaxi`, `autot
   (`full_auto::payload_with_legs`). A cleared SID that serves the runway is flown first
   (`prefer_cleared_sid`, `departure_rechosen` source cleared|chosen); a departure other than the cleared SID is ASKED for on the radio and flown only once the
   clearance names it (`request_sid`), else handed back on the ramp, never flown silently, and the climb is capped at the
-  cleared altitude until the departure check-in (`procedure::hold_at_cleared`).
+  cleared altitude until the departure check-in (`procedure::hold_at_cleared`). **A spliced SID
+  flies the PLAN's levels** (`rederive_sid_altitudes`): its "at" and "at or above" are minimums,
+  only an "at or below" caps the climb (`apply_sid_ceilings`; LAM5P's "at 5,000" held 6,000 to LAM
+  under an FL180 clearance, #173).
 - **Charts are flown**: SID minimums (`nav::sid_minimums` from `sid_ident` / `plan_rwy`, as
   `climb_minimums`) are judged at the arm (`departure_gradients`), climbed at best rate and watched
   (`watch_minimum`, a miss handed over); a minimum is a FLOOR held until its fix and met once
@@ -692,7 +695,8 @@ everything blackboxes to `logs/blackbox.jsonl` (kinds: `atc`, `autotaxi`, `autot
   autothrust, level change, GPSS; `systems::ap_modes`: proved > `autoflight:` > type): toggles read
   before firing, refused where the map says No; the follower adopts `engage` later (probes owed).
 - **A STAR window over the plan's cruise is flown at the cruise and said once**
-  (`windows_above_cruise`); one the airframe cannot make is said with the number (`star_window_miss`).
+  (`windows_above_cruise`); one the airframe cannot make is said with the number (`star_window_miss`),
+  an "at or above" judged on the climb being FLOWN, not while a clearance holds us (`window_climb_fpm`).
   **A descent flies its speed first, at idle** (`speed_protected_vs`, `IdleDescent`); STAR limits are
   flown 3 kt under (`STAR_SPEED_MARGIN_KTS`); the speedbrake is for HEIGHT the protected descent cannot
   lose (`descent_drag` `high_ft`); a join pattern's descent is paced on the pattern's miles

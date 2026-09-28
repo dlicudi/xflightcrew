@@ -4754,24 +4754,9 @@ async fn choose_departure(
             // The whole chart for the gradient, fixless legs included; the
             // flown copy below keeps only what the follower can steer at.
             let chart = legs.clone();
-            let mut sid: Vec<crate::nav::ProcLeg> = Vec::new();
-            for l in legs {
-                if l.fix_ident.is_empty() || l.fix_ident.starts_with("RW") {
-                    continue;
-                }
-                if l.fix.is_none() {
-                    sid.clear();
-                    break;
-                }
-                let last = l.fix_ident.eq_ignore_ascii_case(&choice.join);
-                sid.push(l);
-                if last {
-                    break;
-                }
-            }
-            if sid.last().is_none_or(|l| !l.fix_ident.eq_ignore_ascii_case(&choice.join)) {
+            let Some(sid) = flown_sid_legs(legs, &choice.join) else {
                 continue;
-            }
+            };
             let mins = crate::nav::sid_minimums(&cifp, &origin, &choice.ident, &cl);
             let checks = departure_gradients(der, apt.elev_ft, &chart, &mins, vy_kts, best_climb);
             match gradient_verdict(&choice.ident, &checks) {
@@ -4811,6 +4796,9 @@ async fn choose_departure(
                 .position(|l| l.fix_ident.eq_ignore_ascii_case(&choice.join))
                 .ok_or_else(|| "The new departure doesn't meet the route.".to_string())?;
             let mut legs = sid;
+            // The chart's altitudes are constraints, the plan's the levels
+            // (#173): re-derived while the plan's own legs are still here.
+            rederive_sid_altitudes(&mut legs, &route.legs, &choice.join);
             legs.extend(route.legs.drain(idx + 1..));
             route.legs = legs;
             route.fms_payload = payload_with_legs(&route.fms_payload, &route.legs);
@@ -4857,6 +4845,93 @@ async fn choose_departure(
         Err(None) if only_cleared => Err("The cleared departure doesn't join our route.".to_string()),
         Err(None) => Err("No departure from that runway joins our route.".to_string()),
     }
+}
+
+/// The SID legs the follower flies, up to `join`: its fix legs, the runway
+/// and the fixless legs left out. `None` when a fix is unplaced or the
+/// chart never reaches `join`. Pure.
+pub fn flown_sid_legs(
+    legs: Vec<crate::nav::ProcLeg>,
+    join: &str,
+) -> Option<Vec<crate::nav::ProcLeg>> {
+    let mut sid: Vec<crate::nav::ProcLeg> = Vec::new();
+    for l in legs {
+        if l.fix_ident.is_empty() || l.fix_ident.starts_with("RW") {
+            continue;
+        }
+        l.fix.as_ref()?;
+        let last = l.fix_ident.eq_ignore_ascii_case(join);
+        sid.push(l);
+        if last {
+            return Some(sid);
+        }
+    }
+    None
+}
+
+/// A chart leg's own ceiling: an "at or below" (`-`), or a `B` window's
+/// upper edge (ARINC 424 codes it first). "At" and "at or above" bound
+/// nothing from above once departure clears higher: they are minimums
+/// (`nav::sid_minimums`), held as floors by `DepartureMinimums`.
+fn sid_leg_ceiling_ft(l: &crate::nav::ProcLeg) -> Option<f64> {
+    match l.alt_desc {
+        '-' | 'B' => l.alt1_ft,
+        _ => None,
+    }
+}
+
+/// Each leg's altitude lowered to the tightest ceiling at it or further on
+/// (`own[i]`, [`sid_leg_ceiling_ft`] of the chart's leg `i`): a fix to be
+/// crossed at or below a level is never approached above it. Pure.
+fn apply_sid_ceilings(legs: &mut [crate::nav::ProcLeg], own: &[Option<f64>]) {
+    let mut ceiling: Option<f64> = None;
+    for (leg, c) in legs.iter_mut().zip(own).rev() {
+        if let Some(c) = c {
+            ceiling = Some(ceiling.map_or(*c, |x: f64| x.min(*c)));
+        }
+        if let (Some(c), Some(a)) = (ceiling, leg.alt1_ft) {
+            if a > c {
+                leg.alt1_ft = Some(c);
+                leg.alt_desc = '-';
+            }
+        }
+    }
+}
+
+/// A SID the crew spliced in (`choose_departure`) flown at the PLAN's
+/// levels, the chart's altitudes kept only as constraints (#173): a fix the
+/// plan also has keeps the plan's altitude, any other the plan's altitude at
+/// `join`, and only the chart's "at or below"s lower them
+/// ([`apply_sid_ceilings`]); "at" and "at or above" are the departure's
+/// minimums (`climb_minimums`). EGKK 08R (sortie 1790624015-full_auto,
+/// 2026-09-28): the cleared LAM5P's coded "at 5,000" at ACORN and D156O
+/// became the plan's level, the 6,000 minimum at LAM floored it, and the
+/// follower held 6,000 to LAM after departure cleared FL180 (the filed
+/// plan: 16,000 at ACORN, 18,000 by D156O). Unchanged without `join` in the
+/// plan. Pure.
+pub fn rederive_sid_altitudes(
+    sid: &mut [crate::nav::ProcLeg],
+    plan: &[crate::nav::ProcLeg],
+    join: &str,
+) {
+    let Some(join_plan) = plan.iter().find(|l| l.fix_ident.eq_ignore_ascii_case(join)) else {
+        return;
+    };
+    let own: Vec<Option<f64>> = sid.iter().map(sid_leg_ceiling_ft).collect();
+    for leg in sid.iter_mut() {
+        match plan.iter().find(|p| p.fix_ident.eq_ignore_ascii_case(&leg.fix_ident)) {
+            Some(p) => {
+                leg.alt1_ft = p.alt1_ft;
+                leg.alt_desc = p.alt_desc;
+            }
+            None => {
+                leg.alt1_ft = join_plan.alt1_ft;
+                leg.alt_desc = ' ';
+            }
+        }
+        leg.alt2_ft = None;
+    }
+    apply_sid_ceilings(sid, &own);
 }
 
 /// A departure the crew spliced into the route: the line to say and whose
@@ -5088,6 +5163,7 @@ pub fn charted_departure_legs(
 ) -> Option<Vec<crate::nav::ProcLeg>> {
     let join_plan = plan.iter().find(|l| l.fix_ident.eq_ignore_ascii_case(join))?;
     let mut out = Vec::new();
+    let mut own = Vec::new();
     for l in chart {
         let mut leg = l.clone();
         let ident = l.fix_ident.to_ascii_uppercase();
@@ -5127,7 +5203,10 @@ pub fn charted_departure_legs(
         }
         let last = l.fix_ident.eq_ignore_ascii_case(join);
         out.push(leg);
+        own.push(sid_leg_ceiling_ft(l));
         if last {
+            // ...and the chart's "at or below"s still bound it (#173).
+            apply_sid_ceilings(&mut out, &own);
             return Some(out);
         }
     }
@@ -7394,6 +7473,131 @@ mod tests {
             .map(|(i, _)| i)
             .collect();
         assert_eq!(crate::tower::match_sid(&words, &idents), Some("LAM5P"));
+    }
+
+    /// #173, sortie 1790624015-full_auto (EGKK 08R to EGBB, 2026-09-28): the
+    /// cleared LAM5P spliced in carried its chart's "at 5,000" at ACORN and
+    /// D156O as the plan's level (the recorded `climb_no_descent` plan_ft),
+    /// LAM's 6,000 minimum floored it, and after departure cleared FL180
+    /// the follower held 6,000 to LAM. Re-derived from the filed plan (the
+    /// pilot's OFP), every SID leg is the plan's 18,000, and the recorded
+    /// ticks past the check-in, replayed through the departure owners, want
+    /// 18,000 where the sortie wanted 6,000.
+    #[test]
+    fn a_rechosen_sid_is_flown_at_the_plans_levels() {
+        let ofp: serde_json::Value =
+            serde_json::from_str(include_str!("../bench/ofp/egkk-egbb-738.trimmed.json")).unwrap();
+        let num = |f: &serde_json::Value, k: &str| f[k].as_str().unwrap().parse::<f64>().unwrap();
+        let wps: Vec<crate::simbrief::Waypoint> = ofp["navlog"]["fix"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|f| f["type"] != "ltlg")
+            .map(|f| crate::simbrief::Waypoint {
+                ident: f["ident"].as_str().unwrap().into(),
+                lat: num(f, "pos_lat"),
+                lon: num(f, "pos_long"),
+                alt: num(f, "altitude_feet"),
+            })
+            .collect();
+        let plan = crate::procedure::enroute_legs(&wps, "EGKK", "EGBB", 18_000.0);
+        let cifp = include_str!("../crates/atc/bench/cifp/EGKK_sids.dat");
+        let mut chart = crate::nav::parse_proc_legs(
+            cifp.lines(),
+            crate::nav::ProcKind::Sid,
+            "LAM5P",
+            Some("RW08R"),
+        );
+        for (i, l) in chart.iter_mut().enumerate() {
+            if !l.fix_ident.is_empty() {
+                let lat = 51.2 + i as f64 * 0.05;
+                l.fix = Some(crate::nav::Fix { ident: l.fix_ident.clone(), lat, lon: 0.1 });
+            }
+        }
+        let raw = super::flown_sid_legs(chart, "LAM").expect("LAM5P reaches LAM");
+        let ids: Vec<&str> = raw.iter().map(|l| l.fix_ident.as_str()).collect();
+        assert_eq!(ids[1..], ["D258T", "ACORN", "D156O", "D156J", "LAM"]);
+        let recs: Vec<serde_json::Value> =
+            include_str!("../bench/follower/egkk_lam5p_held_6000.jsonl")
+                .lines()
+                .filter_map(|l| serde_json::from_str(l).ok())
+                .collect();
+        // The old splice: the chart's altitudes, as the sortie logged them.
+        let held = |r: &&serde_json::Value| {
+            r["kind"] == "climb_no_descent" && r["idx"].as_u64() > Some(0)
+        };
+        for r in recs.iter().filter(held) {
+            let i = r["idx"].as_u64().unwrap() as usize;
+            assert_eq!(raw[i].alt1_ft, r["plan_ft"].as_f64(), "{r}");
+        }
+        let mut sid = raw.clone();
+        super::rederive_sid_altitudes(&mut sid, &plan, "LAM");
+        assert!(sid.iter().all(|l| l.alt1_ft == Some(18_000.0)), "{:?}",
+            sid.iter().map(|l| (&l.fix_ident, l.alt1_ft)).collect::<Vec<_>>());
+
+        let mins = crate::nav::sid_minimums_in(cifp.lines(), "LAM5P", "08R");
+        assert!(mins.iter().any(|m| m.fix == "LAM" && m.min_ft == 6_000.0), "{mins:?}");
+        let released = recs
+            .iter()
+            .find(|r| r["kind"] == "cleared_ceiling" && r["ft"].is_null())
+            .and_then(|r| r["t"].as_f64())
+            .unwrap();
+        let ticks: Vec<&serde_json::Value> = recs
+            .iter()
+            .filter(|r| r["kind"] == "leg" && r["t"].as_f64().unwrap() > released + 5.0)
+            .filter(|r| r["idx"].as_u64().unwrap() < sid.len() as u64)
+            .collect();
+        assert!(ticks.len() > 100, "{}", ticks.len());
+        let (mut was_6000, mut carry) = (0, 18_000.0);
+        for r in &ticks {
+            let i = r["idx"].as_u64().unwrap() as usize;
+            if i > 0 {
+                assert_eq!(r["fix"].as_str(), Some(sid[i].fix_ident.as_str()));
+            }
+            if (r["want_alt"].as_f64().unwrap() - 6_000.0).abs() < 1.0 {
+                was_6000 += 1;
+            }
+            let plan_ft = crate::procedure::commanded_alt_ft(&sid[i], carry);
+            carry = plan_ft;
+            let floor = crate::procedure::DepartureMinimums::floor(&mins, &sid, i).map(|m| m.1);
+            let t = crate::procedure::departure_target_ft(plan_ft, floor, None, false, None);
+            assert_eq!(t.want_ft, 18_000.0, "{r}");
+            assert!(!t.raised_by_minimum);
+        }
+        let n = ticks.len();
+        assert!(was_6000 * 10 >= n * 8, "the sortie held 6,000: {was_6000}/{n}");
+    }
+
+    /// A SID's "at or below" still bounds the re-derived climb, up to its
+    /// fix; "at" and "at or above" never do (they are the minimums).
+    #[test]
+    fn a_sids_at_or_below_stays_a_ceiling() {
+        let leg = |id: &str, desc: char, alt: Option<f64>| {
+            let w = crate::simbrief::Waypoint { ident: id.into(), lat: 51.0, lon: 0.0, alt: 0.0 };
+            crate::nav::ProcLeg {
+                alt_desc: desc,
+                alt1_ft: alt,
+                ..crate::procedure::enroute_legs(&[w], "XXXX", "YYYY", 18_000.0)[0].clone()
+            }
+        };
+        let plan = vec![leg("JOIN", ' ', Some(18_000.0)), leg("C", ' ', Some(12_000.0))];
+        let mut sid = vec![
+            leg("A", '+', Some(3_000.0)),
+            leg("B", ' ', Some(5_000.0)),
+            leg("C", '-', Some(7_000.0)),
+            leg("D", 'B', Some(9_000.0)),
+            leg("JOIN", '+', Some(6_000.0)),
+        ];
+        super::rederive_sid_altitudes(&mut sid, &plan, "JOIN");
+        let alts: Vec<f64> = sid.iter().map(|l| l.alt1_ft.unwrap()).collect();
+        assert_eq!(alts, vec![7_000.0, 7_000.0, 7_000.0, 9_000.0, 18_000.0]);
+        assert_eq!(sid[0].alt_desc, '-');
+        assert_eq!(sid[4].alt_desc, ' ');
+        // No join in the plan: the chart as it was.
+        let mut same = sid.clone();
+        super::rederive_sid_altitudes(&mut same, &plan[1..], "JOIN");
+        assert_eq!(same.iter().map(|l| l.alt1_ft).collect::<Vec<_>>(),
+            sid.iter().map(|l| l.alt1_ft).collect::<Vec<_>>());
     }
 
     #[test]
