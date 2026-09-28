@@ -265,6 +265,14 @@ pub struct FlareModelProfile {
     /// a slow wing into the ground (the SF50, issue #163).
     #[serde(default)]
     pub rough_hold: Option<bool>,
+    /// A RATE plant: the elevator asks a rate of change of sink, and a
+    /// neutral column HOLDS the sink it has (an Airbus's fly-by-wire normal
+    /// law: the A330's sidestick). `fpm_per_elevator` is then fpm per
+    /// SECOND per unit, `ground_fpm` fpm per second at the wheels, and the
+    /// flare may push (to `max_push`): a float or a balloon is ended forward,
+    /// since neutral holds it. Absent: the standing-sink plant.
+    #[serde(default)]
+    pub rate: bool,
 }
 
 fn default_model_ground_ft() -> f64 {
@@ -293,6 +301,73 @@ impl FlareModelProfile {
 
 fn default_max_push() -> f64 {
     0.10
+}
+
+/// How the airframe's bank answers the roll channel with the servos out, for
+/// the landing arrest's wings (`autotakeoff::WingsLevel::rate_plant`). An
+/// Airbus's sidestick asks a ROLL RATE and a neutral stick holds the bank, so
+/// the stiff wings-level law (full aileron at 6 degrees of error) led only by
+/// the bank's measured rate rang through the loop's own delay: the A330 at
+/// LEMG 30 (sorties 1790633832 and 1790634412, 2026-09-28) swung +/-2 to 4
+/// degrees at a 1.5 to 2 s period with 0.3 to 0.5 of aileron, fitted 11 to 13
+/// deg/s per unit after 0.25 to 0.37 s. Declared, the arrest flies the bank
+/// the ailerons already written WILL make (a predictor over the dead time)
+/// toward its target over `close_s`.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct ArrestRollProfile {
+    /// Roll rate per unit of aileron, deg/s.
+    pub deg_s_per_unit: f64,
+    /// Before the aileron is felt, seconds (the loop's write included).
+    pub dead_s: f64,
+    /// The bank error is closed over this, seconds.
+    pub close_s: f64,
+}
+
+impl ArrestRollProfile {
+    /// Used only when every number is a sane one.
+    pub fn valid(self) -> Option<Self> {
+        ((2.0..=60.0).contains(&self.deg_s_per_unit)
+            && (0.0..=1.5).contains(&self.dead_s)
+            && (0.2..=3.0).contains(&self.close_s))
+        .then_some(self)
+    }
+}
+
+/// How the speed governor leads this airframe's engines
+/// (`tools::speedhold::throttle_adjust_with`). The shared law projects the
+/// speed 5 s ahead and moves the lever at most 0.015 a tick near its target
+/// and 0.04 when urgent: GA numbers. The A330's engines lag about 4.6 s and a
+/// unit of lever is about 2.5 kt/s, so the lever came off 0.93 at the
+/// autopilot's capture only at 0.06 a second and the clean circuit ran 227.5
+/// to 265 kt on the downwind (LEMG 30, sortie 1790633832-full_auto, #169).
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct SpeedGovernorProfile {
+    /// The speed is projected this far ahead, seconds.
+    pub lead_s: f64,
+    /// Lever per knot of projected error, per tick.
+    pub gain: f64,
+    /// The most the lever moves in a tick when the projection is urgent.
+    pub max_step: f64,
+}
+
+impl SpeedGovernorProfile {
+    /// Used only when every number is a sane one.
+    pub fn valid(self) -> Option<Self> {
+        ((2.0..=20.0).contains(&self.lead_s)
+            && (0.001..=0.02).contains(&self.gain)
+            && (0.02..=0.2).contains(&self.max_step))
+        .then_some(self)
+    }
+}
+
+/// The live airframe's arrest roll plant, when declared and sane.
+pub fn arrest_roll() -> Option<ArrestRollProfile> {
+    live_profile().and_then(|p| p.arrest_roll).and_then(ArrestRollProfile::valid)
+}
+
+/// The live airframe's speed governor, when declared and sane.
+pub fn speed_governor() -> Option<SpeedGovernorProfile> {
+    live_profile().and_then(|p| p.speed_governor).and_then(SpeedGovernorProfile::valid)
 }
 
 /// How hard this airframe's rudder yaws it on the takeoff roll
@@ -435,6 +510,12 @@ pub struct AircraftProfile {
     /// The rudder's authority on the takeoff roll, when measured.
     #[serde(default)]
     pub roll_rudder: Option<RollRudderProfile>,
+    /// The bank's answer to the roll channel in the arrest, when fitted.
+    #[serde(default)]
+    pub arrest_roll: Option<ArrestRollProfile>,
+    /// The speed governor's lead on this airframe's engines, when fitted.
+    #[serde(default)]
+    pub speed_governor: Option<SpeedGovernorProfile>,
     /// Bleed air and crew oxygen, where the airframe has them.
     #[serde(default)]
     pub cabin_air: Option<CabinAirProfile>,
@@ -4967,6 +5048,8 @@ fn cessna_172sp() -> AircraftProfile {
         arrest_lead: None,
         flare_elevator: None,
         roll_rudder: None,
+        arrest_roll: None,
+        speed_governor: None,
         cabin_air: None,
         pressurised: Some(false),
         park_brake_valve_set: None,
@@ -5291,6 +5374,8 @@ fn cirrus_sr22() -> AircraftProfile {
         arrest_lead: None,
         flare_elevator: None,
         roll_rudder: None,
+        arrest_roll: None,
+        speed_governor: None,
         cabin_air: None,
         pressurised: Some(false),
         park_brake_valve_set: None,

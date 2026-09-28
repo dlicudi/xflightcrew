@@ -351,6 +351,31 @@ pub fn status() -> Option<String> {
 /// 10 knots slow"). The slow side gets extra authority: overspeed is a
 /// comfort problem, stall is not.
 pub fn throttle_adjust(err_kts: f64, trend_kts_s: f64) -> f64 {
+    throttle_adjust_with(err_kts, trend_kts_s, None)
+}
+
+/// [`throttle_adjust`] for the live airframe: its declared governor
+/// (`speed_governor:`), else the shared law.
+pub fn throttle_adjust_live(err_kts: f64, trend_kts_s: f64) -> f64 {
+    throttle_adjust_with(err_kts, trend_kts_s, crate::aircraft::speed_governor())
+}
+
+/// [`throttle_adjust`] on an airframe's own governor: the projection's lead,
+/// the gain and the urgent step are the profile's, the gentle step scaled
+/// with the urgent one. A big jet's engines lag seconds behind a lever that
+/// moves a few knots a second per unit: the shared 5 s lead and 0.04 a tick
+/// left the A330 with 0.93 of lever at its level-off and 265 kt on the
+/// downwind (LEMG 30, sortie 1790633832-full_auto, #169). `None` is the
+/// shared law, exactly. Pure.
+pub fn throttle_adjust_with(
+    err_kts: f64,
+    trend_kts_s: f64,
+    gov: Option<crate::aircraft::SpeedGovernorProfile>,
+) -> f64 {
+    let (lead_s, gain, urgent, gentle) = match gov {
+        Some(g) => (g.lead_s, g.gain, g.max_step, 0.015 * g.max_step / 0.04),
+        None => (THROTTLE_LEAD_S, 0.003, 0.04, 0.015),
+    };
     if err_kts.abs() < 1.5 && trend_kts_s.abs() < 1.0 {
         return 0.0; // in the groove and steady: hands off
     }
@@ -367,16 +392,16 @@ pub fn throttle_adjust(err_kts: f64, trend_kts_s: f64) -> f64 {
     // still burning off and brings the power back before the undershoot, and
     // the escalation gates watch the SAME projection — urgency about where
     // the speed will be, not where it was.
-    let proj = err_kts - trend_kts_s * THROTTLE_LEAD_S;
-    let max_up = if proj > 10.0 { 0.04 } else { 0.015 };
+    let proj = err_kts - trend_kts_s * lead_s;
+    let max_up = if proj > 10.0 { urgent } else { gentle };
     // The fast side scales with urgency too. A flat 0.015 was sized on GA,
     // where nothing accelerates hard at pattern power; a jet off the runway
     // accelerated 125 to 241 knots across one upwind-to-downwind while the
     // circuit's law pulled the lever at the polite rate the whole way (SF50,
     // Luton 2026-07-28). Well past the target, or building fast: pull like
     // you mean it. Overspeed is a comfort problem right up until it's Vmo.
-    let max_down = if proj < -10.0 { 0.04 } else { 0.015 };
-    (proj * 0.003).clamp(-max_down, max_up)
+    let max_down = if proj < -10.0 { urgent } else { gentle };
+    (proj * gain).clamp(-max_down, max_up)
 }
 
 /// How far ahead [`throttle_adjust`] projects the airspeed, seconds. Longer
@@ -1171,7 +1196,7 @@ async fn governor(xp: XPlaneClient, voice: Option<crate::voice::Voice>) {
                             v.say(crate::voice::Priority::Caution, line);
                         }
                     }
-                    let adj = throttle_adjust(target - ias, trend);
+                    let adj = throttle_adjust_live(target - ias, trend);
                     if adj != 0.0 {
                         let cmd = (thr + adj).clamp(0.0, 1.0);
                         glide(&xp, &throttle_dref(), cmd, 200).await; // ~most of the tick
@@ -1607,6 +1632,81 @@ mod tests {
         assert!(released < 0.4, "{released}");
         // Small trims pass through unslewed.
         assert_eq!(brake_slew(0.2, 0.22, 0.1), 0.22);
+    }
+
+    /// #169, LEMG 30 (sortie 1790633832-full_auto, 2026-09-28): the clean
+    /// A330 circuit ran 227.5 to 265 kt from the crosswind's level-off, the
+    /// lever at 1.0 through the climb the limiter had cut and still 0.93
+    /// when the autopilot's own capture took the level, pulled 0.04 a tick.
+    /// Replayed on the recorded climb (vertical speed, s from the sortie
+    /// start, every other state sample) through a thrust plant of the
+    /// A330's order: A kt/s per unit of lever over a trim, through a spool
+    /// lag, less gravity's share of the climb (the fit on the clean legs:
+    /// 2.5 kt/s, 0.125, 4.6 s; the idle decay after the level-off says
+    /// nearer 4). On every plant from 2.5 to 5 kt/s and 2 to 7 s the
+    /// A330's governor (`speed_governor:`) peaks lower and settles tighter
+    /// than the shared law, and never 10 kt over the pattern speed.
+    #[test]
+    fn the_a330_governor_catches_the_level_off() {
+        const VS: [(f64, f64); 42] = [
+            (177.1, 787.0), (180.2, 366.0), (183.6, 146.0), (186.9, 117.0), (190.5, 346.0),
+            (194.1, 706.0), (197.8, 944.0), (201.4, 699.0), (204.9, 218.0), (208.6, -248.0),
+            (211.8, -494.0), (214.7, -526.0), (218.1, -363.0), (221.4, -177.0), (225.0, -40.0),
+            (228.7, 56.0), (232.0, 124.0), (235.4, 112.0), (239.1, 136.0), (242.5, 347.0),
+            (245.5, 534.0), (248.6, 607.0), (252.1, 700.0), (255.6, 778.0), (259.3, 825.0),
+            (263.1, 791.0), (266.3, 816.0), (269.8, 828.0), (273.3, 789.0), (276.9, 695.0),
+            (280.5, 477.0), (284.1, 345.0), (287.4, 284.0), (290.8, 298.0), (294.2, 344.0),
+            (297.5, 325.0), (300.6, 275.0), (303.9, 233.0), (307.2, 191.0), (310.9, 155.0),
+            (314.2, -110.0), (317.8, -376.0),
+        ];
+        let gov = crate::aircraft::load("airbus_a330_300")
+            .and_then(|p| p.speed_governor)
+            .and_then(crate::aircraft::SpeedGovernorProfile::valid)
+            .expect("the A330 declares its governor");
+        let vs_at = |t: f64| {
+            let i = VS.iter().position(|p| p.0 > t).unwrap_or(VS.len() - 1).max(1);
+            let (a, b) = (VS[i - 1], VS[i]);
+            a.1 + (b.1 - a.1) * ((t - a.0) / (b.0 - a.0)).clamp(0.0, 1.0)
+        };
+        let fly = |g: Option<crate::aircraft::SpeedGovernorProfile>, a: f64, trim: f64, lag: f64| {
+            let (want, tick, h) = (227.5, 0.65, 0.05);
+            let (mut ias, mut lever, mut eff) = (223.2_f64, 0.66_f64, 0.66_f64);
+            let (mut t, mut next, mut trend, mut prev) = (177.1, 177.1, 0.0_f64, 223.2_f64);
+            let (mut peak, mut sq, mut n) = (0.0_f64, 0.0, 0);
+            while t < 317.8 {
+                if t >= next {
+                    next += tick;
+                    trend = 0.6 * trend + 0.4 * (ias - prev) / tick;
+                    prev = ias;
+                    lever = (lever + throttle_adjust_with(want - ias, trend, g)).clamp(0.0, 1.0);
+                }
+                eff += (lever - eff) * h / lag;
+                let gamma = vs_at(t) / (ias * 101.27);
+                ias += (a * (eff - trim) - 0.545 * (ias - 220.0) / 100.0 - 19.07 * gamma) * h;
+                t += h;
+                peak = peak.max(ias);
+                if t > 225.0 {
+                    sq += (ias - want).powi(2);
+                    n += 1;
+                }
+            }
+            (peak, (sq / n as f64).sqrt())
+        };
+        for (a, trim) in [(2.5, 0.125), (4.0, 0.18), (5.0, 0.2)] {
+            for lag in [2.0, 4.6, 7.0] {
+                let (old_peak, old_rms) = fly(None, a, trim, lag);
+                let (peak, rms) = fly(Some(gov), a, trim, lag);
+                assert!(peak < old_peak, "{a} kt/s, {lag} s: {peak:.1} vs {old_peak:.1}");
+                assert!(rms <= old_rms, "{a} kt/s, {lag} s: {rms:.1} vs {old_rms:.1}");
+                assert!(peak < 227.5 + 12.0, "{a} kt/s, {lag} s: {peak:.1}");
+            }
+        }
+        // No declared governor is the shared law, exactly.
+        assert_eq!(throttle_adjust_with(-5.0, 4.0, None), throttle_adjust(-5.0, 4.0));
+        // At the capture (+190.5 s: 222.3 kt, 2.6 kt/s up) the shared law
+        // pulled the polite 0.015; the A330's pulls harder.
+        assert_eq!(throttle_adjust(5.2, 2.6), -0.015);
+        assert!(throttle_adjust_with(5.2, 2.6, Some(gov)) < -0.03);
     }
 
     #[test]

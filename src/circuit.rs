@@ -2814,7 +2814,7 @@ async fn fly_authored_route(
 
         // Power holds the pattern speed — the same law the rectangle loop uses.
         if let (true, Ok(thr)) = (ias.is_finite(), thr_r) {
-            let delta = crate::tools::speedhold::throttle_adjust(pattern_kts - ias, ias_trend);
+            let delta = crate::tools::speedhold::throttle_adjust_live(pattern_kts - ias, ias_trend);
             if delta != 0.0 {
                 let _ = xp
                     .set_float(&throttle_dref(), (thr + delta).clamp(0.0, 1.0))
@@ -4046,7 +4046,7 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, p: Params
                 alert(&voice, Priority::Advisory, "Gear up.");
             }
             // The leg's speed, the same number the climb limiter was fed.
-            let delta = crate::tools::speedhold::throttle_adjust(want_kts - ias, ias_trend);
+            let delta = crate::tools::speedhold::throttle_adjust_live(want_kts - ias, ias_trend);
             if delta != 0.0 {
                 let _ = xp
                     .set_float(&throttle_dref(), (thr + delta).clamp(0.0, 1.0))

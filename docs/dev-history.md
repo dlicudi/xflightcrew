@@ -10423,3 +10423,45 @@ departure (route from the tower, drive, hold, line-up). Tests
 `a_runway_change_is_said_only_when_the_runway_moved`, `a_runway_change_opens_the_reply`,
 `a_runway_start_never_reads_back_another_runway`, `the_runway_start_waits_with_its_own_runway`. Not done: the runner's `runway: wind` still picks the
 into-wind end against a live stream. Offline only.
+
+## 2026-09-28: the A330's flare floated, its roll rang, a commit lasted a tick (#180, #169)
+
+LEMG 30, sortie 1790634412-approach, first approach (final's air 119 fpm rms). The arrest took
+the servos at 86.8 ft and flew the default tracker (no `flare_elevator:`): 0.35 of pull for five
+seconds took -1,155 fpm to +277, then neutral, and the aircraft floated at 30 to 48 ft for 17 s.
+Every recorded A330 arrest (1790621184, 1790633832, 1790634412 x2) took 17 to 20 s from the gate.
+Fit: the sidestick with the servos out is a RATE plant (600 to 820 fpm a second per unit after 0.8
+to 1.6 s, lags 0.1 to 0.6 s, a ground rate and a sink of 43 to 83 fpm per knot lost; 6 to 21 fpm
+rms per arrest); a standing-sink fit needs a 93 s lag. Neutral HOLDS the sink, so the tracker's
+"only back" floated. `FlareModelProfile.rate`: the model predicts the sink from the one measured
+plus the column's rate, the rate nothing explains measured from the sink's change, no ratchet, may
+push to `max_push`. A330 declares 780 / 0.3 / 0.4 / 1.2 s, ground 120 from 50 ft, horizon 2.5,
+touchdown 100, tau 4, push 0.3: every gate on every fit under 250 fpm in under 13 s (sweep worst
+-187, 12.4 s), 40 fpm rms gusts worst -501, 4 in 100 past 400.
+
+Roll: bank -3.4 to +4.9 to -2.7 over 12 s on the float was the 5 degree cap stopping a gate
+crossing at 3.8 m/s (the short final's cut); the ringing (+/-2 to 4 degrees at 1.5 to 2 s,
+1790633832 and the second approach) was the stiff wings-level law on a roll-RATE plant (11 to 13
+deg/s per unit, 0.25 to 0.37 s dead) plus the loop's delay. `arrest_roll:` (13, 0.45 s, close 0.6
+s): `WingsLevel::rate_plant` flies the bank its written ailerons will make, and the bank target
+takes the same prediction. Sim over 9 to 20 deg/s and 0.35 to 0.6 s: wobble 2.4 to 0.8 degrees.
+
+Commit: at 46.4 ft, 1,432 m ahead, book 1,448 m, the need at that height was 1,427 (21 m of air
+credit); 0.3 s later 1,409 < need, released, arrest handed back, `overflew_the_runway`.
+`commit_flare_latched`: once committed the flare holds while the pavement covers the ground roll
+(the need at the wheels), blackbox `commit_released` when it does not.
+
+#169: the clean circuit's 265 kt was the level-off: lever 1.0 while the limiter held the climb to
+150 fpm, still 0.93 at the AP's capture, then 0.04 a tick (0.06/s) against a ~4.6 s spool at 2.5 to
+4 kt/s per unit. `speed_governor:` (lead 8 s, gain 0.006, step 0.08; `throttle_adjust_with`),
+circuit and flight governor. The 510 to 1,969 ft AGL swing: the overspeed widened the downwind to
+8.4 to 8.7 km off the centreline against a 5.5 km pattern, over a 1,224 ft ridge the side check
+never sampled; `terrain_guard_climb` raised TPA 1,548 to 2,190. BEFORE LANDING: the circuit's
+final turn set gear and flap at +408.7, the list ran +410.9, autoland (handed the final at +458)
+set spoilers and autobrake at +459.3; `flow::landing_config_for` waits for
+`autoland::landing_configured()` under an automation. Tests
+`the_a330_plant_replays_the_float`, `the_a330_flare_lands_every_gate_on_every_plant`,
+`in_rough_air_the_a330_lands_its_prediction`, `a_rate_plant_pushes_a_float_down`,
+`a_committed_flare_stays_committed`, `the_a330_arrest_wings_do_not_ring`,
+`the_a330_governor_catches_the_level_off`, `an_automations_landing_config_is_autolands`. Offline
+only.
