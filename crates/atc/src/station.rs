@@ -752,6 +752,26 @@ impl Station {
         if service == Service::Tower {
             self.note_departure_intent(&intent, transcript);
         }
+        // A zone request from circuit traffic (noted just above, from THIS
+        // call's words) is answered with the circuit clearance: a circuit
+        // never leaves the zone (LEMG 13, sorties 1790590663 and 1790591256,
+        // 2026-09-28: "for circuits" got "cleared to leave the Malaga zone").
+        let circuit_ctx;
+        let ctx = if service == Service::Tower
+            && intent == tower::Intent::RequestClearance
+            && self.circuits
+        {
+            circuit_ctx = tower::Ctx {
+                circuit: Some(tower::CircuitOffer {
+                    height_ft: tower::circuit_height_ft(self.apt.elev_ft),
+                    faa: self.dialect == Dialect::Faa,
+                }),
+                ..ctx.clone()
+            };
+            &circuit_ctx
+        } else {
+            ctx
+        };
         // A departure clearance in a RADAR environment carries a discrete
         // code — the zone clearance is where a real controller assigns it
         // (Heathrow flew a whole day on 7000, 2026-07-10). Tower-only strips
@@ -2086,6 +2106,7 @@ impl Station {
             own_on_runway: false,
             helicopter: false,
             ifr: None,
+            circuit: None,
             runway_refusal: None,
             transition_level_ft: self.apt.transition_level_ft,
         }
@@ -12740,6 +12761,66 @@ mod tests {
         let _ = crate::party_line::take_departure_handoff();
     }
 
+    /// LEMG 13 (sorties 1790590663 and 1790591256, 2026-09-28): the runway
+    /// start's "request clearance, runway one three, for circuits" was
+    /// answered "cleared to leave the Malaga zone, not above two thousand
+    /// feet". Circuit traffic gets the circuit clearance in the field's
+    /// dialect (runway, height, pressure, code, report ready), and the crew's
+    /// readback of it, the owed line as the crew transmits it, is silence.
+    #[test]
+    fn a_circuit_zone_request_is_cleared_for_the_circuit() {
+        let _guard = SIDE_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let path = lxgb_apt_file();
+        let wx = Wx {
+            wind_from_deg: 250.0,
+            wind_kts: 12.0,
+        };
+        for faa in [false, true] {
+            *SQUAWK_WATCH.lock().unwrap() = None;
+            *CLEARANCE.lock().unwrap() = None;
+            let mut st = Station::load(path.to_str().unwrap(), "LXGB").expect("LXGB loads");
+            if faa {
+                st.set_dialect(Dialect::Faa);
+            }
+            let ctx = scripted_ctx(&mut st, wx);
+            let r = st.route_keyed(
+                "november one seven two sierra papa, request clearance, runway two seven, \
+                 for circuits",
+                Service::Tower,
+                &ctx,
+                wx,
+            );
+            assert!(st.circuits, "circuits noted from the zone request");
+            assert!(!r.contains("leave the"), "{r}");
+            assert!(r.contains("runway two seven"), "{r}");
+            assert!(r.contains("squawk"), "{r}");
+            assert!(r.ends_with("report ready for departure."), "{r}");
+            if faa {
+                assert!(
+                    r.contains("closed traffic approved, pattern altitude one thousand"),
+                    "{r}"
+                );
+            } else {
+                assert!(r.contains("circuit height one thousand feet"), "{r}");
+            }
+            assert!(!squawk_watch_active(), "no radar watch for pattern traffic");
+            let owed = crate::party_line::readback_owed().expect("readback suggested");
+            assert!(!owed.contains("above"), "{owed}");
+            // The crew transmits the owed line, stop trimmed: silence, paid.
+            let r = st.route_keyed(owed.trim_end_matches('.'), Service::Tower, &ctx, wx);
+            assert_eq!(r, "", "the readback is accepted");
+            assert_eq!(crate::party_line::readback_owed(), None);
+            assert_eq!(st.twr.state, tower::State::Parked);
+            // A plain zone request states the intent afresh: a departure.
+            let r = st.route_keyed("request clearance", Service::Tower, &ctx, wx);
+            assert!(!st.circuits);
+            assert!(r.contains("cleared to leave the Gibraltar zone"), "{r}");
+        }
+        *SQUAWK_WATCH.lock().unwrap() = None;
+        *CLEARANCE.lock().unwrap() = None;
+        *HANDOFF.lock().unwrap() = None;
+    }
+
     #[test]
     fn circuit_traffic_stays_with_the_tower() {
         let _guard = SIDE_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -12846,6 +12927,7 @@ mod tests {
             own_on_runway: false,
             helicopter: false,
             ifr: None,
+            circuit: None,
             runway_refusal: None,
             transition_level_ft: None,
             wake_secs_left: None,
@@ -13773,6 +13855,7 @@ mod tests {
                 own_on_runway: false,
                 helicopter: false,
                 ifr: None,
+                circuit: None,
                 runway_refusal: None,
                 transition_level_ft: None,
                 wake_secs_left: None,
@@ -14037,6 +14120,7 @@ mod tests {
             own_on_runway: false,
             helicopter: false,
             ifr: None,
+            circuit: None,
             runway_refusal: None,
             transition_level_ft: None,
             wake_secs_left: None,

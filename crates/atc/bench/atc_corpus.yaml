@@ -508,3 +508,13 @@
 - {text: "November eight one six November November, ready for departure, for circuits", intent: request_takeoff, radio: true}
 - {text: "request taxi for closed traffic", intent: request_taxi, radio: true}
 - {text: "ready for departure, remain in the pattern", intent: request_takeoff, radio: true}
+
+# --- 2026-09-28: a circuit's clearance is the pattern's (issue #148) ----------
+# LEMG 13, sorties 1790590663 and 1790591256: the runway-start circuit asked
+# for its clearance "for circuits" and was cleared to leave the zone. The
+# request stays a zone request; the circuit clearance's readbacks, both
+# dialects, are readbacks (silence), never a new request.
+- {text: "november eight one six november november, request clearance, runway one three, for circuits", intent: request_clearance, radio: true}
+- {text: "request clearance for closed traffic", intent: request_clearance, radio: true}
+- {text: "Runway one three, circuit height one thousand one hundred feet, QNH one zero one niner, squawk four five zero one, November eight one six November November", intent: unknown, readback: true}
+- {text: "Closed traffic runway one three, pattern altitude one thousand one hundred, altimeter three zero zero one, squawk four five zero one, November eight one six November November", intent: unknown, readback: true}

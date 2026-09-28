@@ -332,6 +332,7 @@ fn main() -> Result<()> {
                     // No airport index here: an IFR request is asked to say
                     // its destination again, never cleared.
                     ifr: None,
+                    circuit: None,
                     runway_refusal: None,
                     transition_level_ft: apt.transition_level_ft,
                 };
