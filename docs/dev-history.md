@@ -9783,3 +9783,14 @@ from the takeoff (`ClimbCarry`, `flaps_to_caller`, paced flap steps: 1 at 190, u
 closed-loop plant); the window moves to the flaps-up speed once. Pinned by
 `bench/takeoffs/lemg13_circuit_climb_outs.jsonl`. Still open: the pattern's own 700 fpm climb cap and
 its 226 kt overrun. Offline only.
+
+## 2026-09-28: one SID rule for tower and crew (issue #152)
+
+EGKK-EGBB (sortie 1790601822): the tower cleared "via the Kene three Papa departure, runway 08R" by
+bearing (exit 296, Birmingham 325); KENE3P serves 08R but ends at KENET, off the filed LAM6M LAM L610
+HEMEL, so the crew silently flew LAM5P (joins at LAM). The tower's bearing rule and the crew's route
+rule were two rules. Now one, `nav::sid_for_filed_route` (the filed SID if it serves the runway and
+joins, else furthest join, fewest fixes), the filed route reaching the station through a crew
+provider; the crew asks for a SID other than the cleared one (`Intent::RequestSid`,
+`Station::amend_sid`) and hands back on the ramp if refused. Blackbox `atc ifr_clearance` `sid_basis`,
+`sid_join`. Offline only.

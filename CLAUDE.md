@@ -254,8 +254,10 @@ Config: `XCOPILOT_ATC_AIRPORT` / `_VOICE` / `_RATE` / `_REGION`.
   climb it announced (`climb_announced`).
 - **IFR clearance** (`Intent::RequestIfrClearance`: "IFR clearance to X", "clearance to <place>",
   "ready to copy"; a bare "request clearance" stays the zone one): destination from the region
-  index, else any land field by its ICAO (`FIELD_DIR`), else "say again destination"; SID off the runway in use whose exit points at the
-  destination (`nav::sid_toward`, else runway heading, never invented); 5,000 ft or field + 3,000;
+  index, else any land field by its ICAO (`FIELD_DIR`), else "say again destination"; SID off the runway in use that JOINS THE FILED
+  ROUTE (`nav::sid_for_filed_route`, the crew's own order, via `party_line::provide_filed_route`; a
+  route no SID joins is runway heading; no plan: `nav::sid_toward`), never invented; a SID asked for by
+  name (`Intent::RequestSid`, `Station::amend_sid`) amends the clearance or the cleared one stands; 5,000 ft or field + 3,000;
   ICAO or FAA phrasing; SID, altitude and code read back ENFORCED; the crew sees it only once
   accepted (`party_line::assigned_clearance`). **Cancel IFR** (`Intent::CancelIfr`,
   `Station::cancel_ifr`) retires the clearance, `IFR_FLIGHT` and the frozen runway.
@@ -518,7 +520,8 @@ everything blackboxes to `logs/blackbox.jsonl` (kinds: `atc`, `autotaxi`, `autot
   favouring another end gets its STAR entering earliest (`nav::stars_for_route`,
   `plan_audit::choose_arrival`, `star_chosen`). Either reloads the GPS
   (`full_auto::payload_with_legs`). A cleared SID that serves the runway is flown first
-  (`prefer_cleared_sid`, `departure_rechosen` source cleared|chosen), and the climb is capped at the
+  (`prefer_cleared_sid`, `departure_rechosen` source cleared|chosen); a departure other than the cleared SID is ASKED for on the radio and flown only once the
+  clearance names it (`request_sid`), else handed back on the ramp, never flown silently, and the climb is capped at the
   cleared altitude until the departure check-in (`procedure::hold_at_cleared`).
 - **Charts are flown**: SID minimums (`nav::sid_minimums` from `sid_ident` / `plan_rwy`, as
   `climb_minimums`) are judged at the arm (`departure_gradients`), climbed at best rate and watched
