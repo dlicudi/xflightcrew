@@ -1016,7 +1016,7 @@ pub async fn run(
     // read-back, never left to a line said before anything was set (#110).
     if out.is_ok() && ABORT.load(SeqCst) {
         send(ctx, "stop").await;
-        abort_brakes(ctx.xplane, voice, valve_set, "ended").await;
+        abort_brakes(&xp.unscoped(), voice, valve_set, "ended").await;
         out = Err("abort".into());
     }
     // Stop-and-let-go on EVERY exit, unconditionally. A pushback command is a
@@ -1186,7 +1186,7 @@ async fn run_inner(
         if aborted {
             // Set for the wait already; driven again for the read-back the
             // pilot's "stop" is answered from.
-            abort_brakes(ctx.xplane, voice, valve_set, "waiting").await;
+            abort_brakes(&xp.unscoped(), voice, valve_set, "waiting").await;
         }
         event(json!({ "event": "no_tug", "waited_s": TUG_WAIT_SECS }));
         return Err(if aborted { "abort" } else { "no_tug" }.into());
@@ -1247,7 +1247,7 @@ async fn run_inner(
             // abort that only stops the TUG leaves the aircraft rolling —
             // the same hole the re-hook wait had. Answered from the brake's
             // read-back, never before it (#110).
-            abort_brakes(ctx.xplane, voice, valve_set, "pushing").await;
+            abort_brakes(&xp.unscoped(), voice, valve_set, "pushing").await;
             event(json!({ "event": "abort", "back_m": r1(back_m) }));
             return Err("abort".into());
         }
@@ -1544,7 +1544,7 @@ async fn run_inner(
         // Stopped while waiting for the tug to let go: the pilot's word, so
         // the parking brake, on the bar or not, and the line from what the
         // brake reads.
-        abort_brakes(ctx.xplane, voice, valve_set, "tug_wait").await;
+        abort_brakes(&xp.unscoped(), voice, valve_set, "tug_wait").await;
         event(json!({ "event": "abort", "back_m": r1(back_m), "stage": "tug_wait" }));
         return Err("abort".into());
     }
@@ -1597,6 +1597,11 @@ pub fn stop_line(held: bool) -> &'static str {
 /// (tried three times, read back). The line is the pilot's answer only when
 /// the pilot's stop word ([`ABORT`]) ended it, taken once; a full auto abort
 /// from elsewhere is spoken for by full auto. Blackbox `abort_brakes`.
+///
+/// Callers pass an UNSCOPED client: the stop has already cancelled the
+/// mission's, and scoped the brake was refused three times as "automation
+/// cancelled" (LEMG 737 push, 1790693535, 2026-09-29: "The parking brake did
+/// not set, hold the brakes.", #110), the hand-back's bug of 2026-09-26.
 async fn abort_brakes(
     xp: &dyn crate::xplane::XPlane,
     voice: &Option<Voice>,
