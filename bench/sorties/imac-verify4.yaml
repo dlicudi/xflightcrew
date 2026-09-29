@@ -1,0 +1,38 @@
+# iMac verify batch 4: the misheard speed airborne (#46), the Lancair's
+# untowered circuit with the 3 deg line-up acceptance (#45 #46), the S-76's
+# slow-down (#191 #47). Every case ends on the ground.
+after: stop
+cases:
+  # #46: "set speed 885" airborne after the takeoff's handoff, with no
+  # circuit holding the throttle: refused as a mishear, not flown.
+  - name: "SR22 LEMG 13 take off, a misheard speed airborne (#46)"
+    setup:
+      aircraft: "Aircraft/Laminar Research/Cirrus SR22/Cirrus SR22.acf"
+      runway_start: { field: LEMG, runway: 13, engines_running: true }
+    command: take off
+    steps:
+      - { say: set speed 885, when: { agl_above: 1200 }, tool: hold_speed }
+      - { say: put us on a 2 mile final to LEMG runway 13, when: { agl_above: 1500 }, tool: setup_approach }
+    traffic: off
+    deadline_min: 8
+
+  # #45 #46: line_up_aligned ok (within 3 on the bound), roll_aligned, the
+  # untowered departure and circuit.
+  - name: "Lancair Evolution LILB circuit from the ramp (#45 #46)"
+    setup:
+      aircraft: "Aircraft/Laminar Research/Lancair Evolution/N844X.acf"
+      ramp: { field: LILB }
+    command: fly a circuit
+    deadline_min: 35
+
+  # #191 #47: approach gs_kts/slow_m/path_deg, slow at the gate, Slow ticks
+  # ias following target, handover_hover ~1,400 m out, no orbit, no TOD talk.
+  - name: "S-76 LEMG to LXGB on a local plan (#191 #47)"
+    setup:
+      aircraft: "Aircraft/Laminar Research/Sikorsky S-76/S-76C.acf"
+      ramp: { field: LEMG }
+    steps:
+      - { say: plan a flight to LXGB, when: start, tool: plan_flight }
+      - { say: fly the flight plan, when: { after_s: 15 }, tool: hover }
+    deadline_min: 60
+    traffic: off
