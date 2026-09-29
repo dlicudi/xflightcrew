@@ -27,7 +27,9 @@
 //! 180 degree bug step does). The side is sticky: a pattern that changes its
 //! mind crosses the final it is trying to join.
 //!
-//! All pure; the autoland loop owns the one `Reversal` and applies it.
+//! All pure but [`plan`], which probes the ground under both sides' corridors
+//! (#182); the autoland loop runs it beside itself, owns the one `Reversal`
+//! and applies it.
 
 use crate::autoland::Runway;
 use crate::nav::{bearing_deg, project_latlon};
@@ -380,6 +382,402 @@ pub const RESIDUAL_MAX_M: f64 = 120.0;
 
 pub fn stabilisable(xtk_nm: f64, along_nm: f64, gs_kts: f64) -> bool {
     predicted_residual_m(xtk_nm, along_nm, gs_kts) <= RESIDUAL_MAX_M
+}
+
+// ---------------------------------------------------------------------------
+// Terrain (#182): the pattern is judged on the corridor it is flown in, by
+// the circuit's own rule (`circuit::choose_pattern_with`).
+//
+// LEMG 13, 2026-09-29 (sortie 1790668215-full_auto, 737): the old rule
+// probed eight points on the drawn downwind line, 1.9 nm apart, and flew
+// its platform 1,000 ft over the highest. The left-hand downwind at 2,600
+// ft (probed 1,644) was flown 0.4 to 0.6 nm outside the line and passed
+// 522 ft over 2,043 ft of hill behind Malaga (t+1795), 633 ft on the
+// pattern before it (t+1320). Neither base nor inbound was probed at all.
+// ---------------------------------------------------------------------------
+
+/// Sample spacing on the drawn pattern and on its corridor copies, nm. The
+/// circuit's 150 / 300 m are for a two-mile rectangle; a reversal is thirty
+/// miles of legs and is probed while flying, so a little coarser (the hills
+/// behind Malaga are kilometres wide).
+const LINE_STEP_NM: f64 = 0.2;
+const CORRIDOR_STEP_NM: f64 = 0.3;
+/// The downwind is probed from where the aircraft is, or a mile past the
+/// threshold, and never from further back than this.
+const PROBE_BEHIND_NM: f64 = 8.0;
+/// A platform whose join point lies further out than this is no pattern to
+/// fly round a runway: refused, with the number. 4,150 ft over the field.
+const MAX_JOIN_NM: f64 = 15.0;
+/// Corridor probes before the platform must have settled: a raise moves the
+/// join point, and the base, over other ground.
+const MAX_PROBE_ROUNDS: u32 = 4;
+/// ...settled within this.
+const SETTLED_FT: f64 = 50.0;
+/// The refusal's hold looks this far along the track it holds.
+const HOLD_LOOK_NM: f64 = 12.0;
+
+/// One probe point of a pattern, on the runway's axes.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ProbePt {
+    /// Out along the extended centreline, nm (positive on the approach side).
+    pub along_nm: f64,
+    /// Right of the inbound course, nm.
+    pub lateral_nm: f64,
+    pub leg: Leg,
+    /// On the drawn line (the old check's points), not a corridor copy.
+    pub line: bool,
+    /// Flown at the platform; else on the path down from it.
+    pub level: bool,
+}
+
+/// The legs one side's pattern flies at `platform_ft`: the downwind (from
+/// where the aircraft is, `along_now`, to the base) and the base, drawn and
+/// in the corridor the autopilot really flies, `circuit::CORRIDOR_OUT_RADII`
+/// outside and `circuit::CORRIDOR_IN_RADII` inside (on the LEMG 13 downwind
+/// it flew 0.3 to 0.45 radii outside). The inbound is both sides' and is
+/// [`inbound_frame`]'s. Pure.
+pub fn side_frame(
+    side: f64,
+    platform_ft: f64,
+    elev_ft: f64,
+    gs_kts: f64,
+    along_now: f64,
+) -> Vec<ProbePt> {
+    let r = sizing_radius_nm(gs_kts);
+    let offset = OFFSET_RADII * r;
+    let base_along = crate::autoland::join_point_nm(platform_ft, elev_ft) + BASE_BEYOND_JOIN_NM + r;
+    let a0 = along_now.clamp(-PROBE_BEHIND_NM, -1.0);
+    let mut copies = vec![(0.0, true, LINE_STEP_NM)];
+    copies.extend(
+        crate::circuit::CORRIDOR_OUT_RADII
+            .iter()
+            .map(|k| (k * r, false, CORRIDOR_STEP_NM)),
+    );
+    copies.push((
+        -crate::circuit::CORRIDOR_IN_RADII * r,
+        false,
+        CORRIDOR_STEP_NM,
+    ));
+    let mut out = Vec::new();
+    for (d, line, step) in copies {
+        let x = side * (offset + d);
+        let a1 = base_along + d;
+        for (leg, from, to) in [
+            (Leg::Outbound, (a0, x), (a1, x)),
+            (Leg::Base, (a1, x), (a1, 0.0)),
+        ] {
+            for (along_nm, lateral_nm) in crate::circuit::densify(&[from, to], step) {
+                out.push(ProbePt {
+                    along_nm,
+                    lateral_nm,
+                    leg,
+                    line,
+                    level: true,
+                });
+            }
+        }
+    }
+    out
+}
+
+/// The inbound leg on the centreline, from beyond the widest base in to
+/// `circuit::DESCENT_CHECK_FROM_M` (inside it the descent is the landing's):
+/// level at the platform until the 3 degree path comes down to it
+/// ([`path_joined`]), then on the path. Pure.
+pub fn inbound_frame(platform_ft: f64, elev_ft: f64, gs_kts: f64) -> Vec<ProbePt> {
+    let r = sizing_radius_nm(gs_kts);
+    let base_along = crate::autoland::join_point_nm(platform_ft, elev_ft) + BASE_BEYOND_JOIN_NM + r;
+    let top = (platform_ft - elev_ft) / crate::autoland::GLIDEPATH_FT_PER_NM;
+    let from = base_along + r;
+    let to = crate::circuit::DESCENT_CHECK_FROM_M / M_PER_NM;
+    crate::circuit::densify(&[(from, 0.0), (to, 0.0)], LINE_STEP_NM)
+        .into_iter()
+        .map(|(along_nm, _)| ProbePt {
+            along_nm,
+            lateral_nm: 0.0,
+            leg: Leg::Inbound,
+            line: true,
+            level: along_nm > top,
+        })
+        .collect()
+}
+
+/// A side's terrain facts from its probe points and the ground under each
+/// (feet MSL, same order), in the circuit's terms: the highest ground under
+/// the legs flown at the platform, the drawn line's highest (the old
+/// number), and the path's samples as the circuit's final. Pure.
+pub fn side_facts(pts: &[ProbePt], ground_ft: &[f64]) -> crate::circuit::SideFacts {
+    use crate::circuit::{DescentLeg, GroundSample};
+    let mut f = crate::circuit::SideFacts::default();
+    let max = |m: Option<f64>, v: f64| Some(m.map_or(v, |m: f64| m.max(v)));
+    for (p, &e) in pts.iter().zip(ground_ft) {
+        if p.line && p.leg != Leg::Inbound {
+            f.line_max_ft = max(f.line_max_ft, e);
+        }
+        if p.level {
+            f.terrain_max_ft = max(f.terrain_max_ft, e);
+        } else {
+            let m = p.along_nm * M_PER_NM;
+            f.descent.push(GroundSample {
+                leg: DescentLeg::Final,
+                path_m: m,
+                thr_m: m,
+                ground_ft: e,
+            });
+        }
+    }
+    f
+}
+
+/// What the corridor says about a pattern.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Judgement {
+    /// The side to fly: +1 right of the inbound course, -1 left.
+    pub side: f64,
+    pub platform_ft: f64,
+    /// The circuit's word for the pick (`default_side_clear`,
+    /// `switched_side_for_terrain`, `raised_for_terrain`, ...).
+    pub why: &'static str,
+    pub pick: crate::circuit::PatternPick,
+    /// `Some`: no pattern here clears the ground; spoken, with the numbers.
+    pub refused: Option<String>,
+}
+
+/// Judge both sides at the default platform by the circuit's rule
+/// ([`crate::circuit::choose_pattern_with`], `PickRules::reversal`): 1,000 ft
+/// over the level legs' corridor, the other side if it is clean, else the
+/// lower side raised; the path down from the platform keeps the circuit's
+/// 500 ft (tapering inside 2 nm). The loop flies no steepened path and no
+/// join point past [`MAX_JOIN_NM`]: those are refusals. Pure.
+pub fn judge(
+    default_side: f64,
+    l: &crate::circuit::SideFacts,
+    r: &crate::circuit::SideFacts,
+    elev_ft: f64,
+    default_platform_ft: f64,
+) -> Judgement {
+    let pick = crate::circuit::choose_pattern_with(
+        default_side < 0.0,
+        l,
+        r,
+        elev_ft,
+        default_platform_ft - elev_ft,
+        crate::circuit::PickRules::reversal(),
+    );
+    let check = if pick.left {
+        &pick.descent_left
+    } else {
+        &pick.descent_right
+    };
+    let join = crate::autoland::join_point_nm(pick.tpa_msl_ft, elev_ft);
+    let refused = if pick.refused.is_some() {
+        Some(
+            check
+                .problem
+                .clone()
+                .or_else(|| pick.descent_left.problem.clone())
+                .unwrap_or_else(|| "the final does not clear the ground".into()),
+        )
+    } else if pick.shape.steep() {
+        Some(format!(
+            "the final would pass {:.0} feet over the ground, clearing it needs a {:.1} degree path",
+            (check.default_min_ft.unwrap_or(0.0).max(0.0) / 10.0).round() * 10.0,
+            pick.shape.glidepath_deg()
+        ))
+    } else if join > MAX_JOIN_NM {
+        Some(format!(
+            "clearing the hills needs {:.0} feet, joining the final {:.0} miles out",
+            (pick.tpa_msl_ft / 100.0).ceil() * 100.0,
+            join
+        ))
+    } else {
+        None
+    };
+    Judgement {
+        side: if pick.left { -1.0 } else { 1.0 },
+        platform_ft: pick.tpa_msl_ft,
+        why: pick.why,
+        pick,
+        refused,
+    }
+}
+
+/// The next corridor to probe after a judgement at `built_for_ft`: `Some`
+/// (the raised platform) while a raise moves the pattern past the corridor
+/// it was judged on, `None` once it has settled. Pure.
+pub fn reprobe_at(built_for_ft: f64, j: &Judgement) -> Option<f64> {
+    (j.refused.is_none() && j.platform_ft > built_for_ft + SETTLED_FT).then_some(j.platform_ft)
+}
+
+/// The altitude a refusal climbs to and holds, feet MSL: 1,000 ft over the
+/// highest ground under and ahead along the track it holds (`ahead_max_ft`),
+/// never below where the aircraft is or the default platform, in hundreds.
+/// No ground data: the highest ground the corridor found instead. Pure.
+pub fn hold_altitude_ft(
+    ahead_max_ft: Option<f64>,
+    corridor_max_ft: Option<f64>,
+    alt_ft: f64,
+    default_platform_ft: f64,
+) -> f64 {
+    let ground = ahead_max_ft
+        .or(corridor_max_ft)
+        .unwrap_or(f64::NEG_INFINITY);
+    let want = (ground + crate::circuit::PATTERN_TERRAIN_CLEAR_FT)
+        .max(alt_ft)
+        .max(default_platform_ft);
+    (want / 100.0).ceil() * 100.0
+}
+
+/// A pattern planned over the probed ground, for the loop to fly.
+#[derive(Debug, Clone)]
+pub struct PatternPlan {
+    pub side: f64,
+    pub platform_ft: f64,
+    pub why: &'static str,
+    /// No pattern clears the ground: why, with the numbers.
+    pub refused: Option<String>,
+    /// ...and the altitude the refusal climbs to and holds.
+    pub hold_ft: Option<f64>,
+    /// The facts for the `reversal` record.
+    pub record: serde_json::Value,
+}
+
+/// Ground under `pts` (runway axes), feet MSL, in probe-sized chunks; any
+/// unanswered chunk is no data at all, never a partial picture read as clear.
+async fn ground_under(
+    xp: &crate::xplane::XPlaneClient,
+    rwy: &Runway,
+    pts: &[ProbePt],
+) -> Option<Vec<f64>> {
+    let lls: Vec<(f64, f64)> = pts
+        .iter()
+        .map(|p| pattern_point(rwy, p.along_nm, p.lateral_nm))
+        .collect();
+    let mut out = Vec::with_capacity(lls.len());
+    for chunk in lls.chunks(crate::terrain::MAX_POINTS) {
+        out.extend(crate::terrain::sample_ft(xp, chunk).await?);
+    }
+    Some(out)
+}
+
+fn check_json(c: &crate::circuit::DescentCheck) -> serde_json::Value {
+    serde_json::json!({"default_min_ft": c.default_min_ft, "flown_min_ft": c.flown_min_ft,
+                       "glidepath_deg": c.shape.map(|s| s.glidepath_deg()),
+                       "problem": c.problem})
+}
+
+/// Plan the pattern over the ground the sim reports (#182): probe both
+/// sides' corridors at the default platform, judge them ([`judge`]), and
+/// while a raise moves the pattern out, probe again where it moved to
+/// ([`reprobe_at`]). A refusal also probes the track ahead for the height
+/// its hold climbs to ([`hold_altitude_ft`]). No probe data: the old
+/// behaviour, the default platform on [`pick_side`]'s side. Runs beside the
+/// loop, which keeps flying while the plugin answers (a few seconds).
+#[allow(clippy::too_many_arguments)]
+pub async fn plan(
+    xp: crate::xplane::XPlaneClient,
+    rwy: Runway,
+    along_now: f64,
+    xtk_now: f64,
+    gs_kts: f64,
+    default_platform_ft: f64,
+    (lat, lon, track_deg, alt_ft): (f64, f64, f64, f64),
+) -> PatternPlan {
+    let mut built_for = default_platform_ft;
+    let mut rounds = 0u32;
+    let mut first_lines: Option<(Option<f64>, Option<f64>)> = None;
+    let no_data = |rounds: u32| {
+        let side = pick_side(xtk_now, None, None);
+        PatternPlan {
+            side,
+            platform_ft: default_platform_ft,
+            why: "no_terrain_data",
+            refused: None,
+            hold_ft: None,
+            record: serde_json::json!({"terrain": "none", "rounds": rounds}),
+        }
+    };
+    loop {
+        rounds += 1;
+        let (lp, rp) = (
+            side_frame(-1.0, built_for, rwy.elev_ft, gs_kts, along_now),
+            side_frame(1.0, built_for, rwy.elev_ft, gs_kts, along_now),
+        );
+        let ip = inbound_frame(built_for, rwy.elev_ft, gs_kts);
+        let (Some(lg), Some(rg), Some(ig)) = (
+            ground_under(&xp, &rwy, &lp).await,
+            ground_under(&xp, &rwy, &rp).await,
+            ground_under(&xp, &rwy, &ip).await,
+        ) else {
+            return no_data(rounds);
+        };
+        let facts = |pts: &[ProbePt], g: &[f64]| {
+            let all: Vec<ProbePt> = pts.iter().chain(ip.iter()).copied().collect();
+            let ground: Vec<f64> = g.iter().chain(ig.iter()).copied().collect();
+            side_facts(&all, &ground)
+        };
+        let (l, r) = (facts(&lp, &lg), facts(&rp, &rg));
+        let lines = *first_lines.get_or_insert((l.line_max_ft, r.line_max_ft));
+        let default_side = pick_side(xtk_now, lines.0, lines.1);
+        let j = judge(default_side, &l, &r, rwy.elev_ft, default_platform_ft);
+        let next = reprobe_at(built_for, &j);
+        let unsettled = next.is_some() && rounds >= MAX_PROBE_ROUNDS;
+        if next.is_some() && !unsettled {
+            built_for = next.unwrap_or(built_for);
+            continue;
+        }
+        // Flown at the corridor it was judged on, never under the pick.
+        let platform_ft = built_for.max(j.platform_ft);
+        let refused = if unsettled {
+            Some(format!(
+                "the ground keeps rising under a longer pattern, {:.0} feet and climbing",
+                (j.platform_ft / 100.0).ceil() * 100.0
+            ))
+        } else {
+            j.refused.clone()
+        };
+        let hold_ft = match refused {
+            Some(_) => {
+                let mut pts = vec![(lat, lon)];
+                pts.extend(crate::procedure::look_ahead_points(
+                    lat,
+                    lon,
+                    track_deg,
+                    HOLD_LOOK_NM,
+                    crate::terrain::MAX_POINTS - 1,
+                ));
+                let ahead = crate::terrain::max_elevation_ft(&xp, &pts).await;
+                let corridor = [l.terrain_max_ft, r.terrain_max_ft]
+                    .into_iter()
+                    .flatten()
+                    .reduce(f64::max);
+                Some(hold_altitude_ft(
+                    ahead,
+                    corridor,
+                    alt_ft,
+                    default_platform_ft,
+                ))
+            }
+            None => None,
+        };
+        let record = serde_json::json!({
+            "terrain": "probed", "rounds": rounds, "side_pick": j.why,
+            "left_line_ft": l.line_max_ft, "right_line_ft": r.line_max_ft,
+            "left_corridor_max_ft": l.terrain_max_ft, "right_corridor_max_ft": r.terrain_max_ft,
+            "judged_at_ft": built_for, "picked_ft": j.platform_ft,
+            "left_descent": check_json(&j.pick.descent_left),
+            "right_descent": check_json(&j.pick.descent_right),
+            "refused": refused, "hold_ft": hold_ft,
+        });
+        return PatternPlan {
+            side: j.side,
+            platform_ft,
+            why: j.why,
+            refused,
+            hold_ft,
+            record,
+        };
+    }
 }
 
 #[cfg(test)]
@@ -792,5 +1190,249 @@ mod tests {
             -800.0
         );
         assert_eq!(platform_vs_fpm(1700.0, 1800.0, true, 800.0, 2000.0), -400.0);
+    }
+
+    // ---- Terrain (#182) ----
+
+    fn interp(pts: &[(f64, f64)], x: f64) -> f64 {
+        if x <= pts[0].0 {
+            return pts[0].1;
+        }
+        for w in pts.windows(2) {
+            let ((x0, y0), (x1, y1)) = (w[0], w[1]);
+            if x <= x1 {
+                return y0 + (y1 - y0) * (x - x0) / (x1 - x0);
+            }
+        }
+        pts[pts.len() - 1].1
+    }
+
+    /// LEMG 13's ground on the runway's axes (along, lateral right of the
+    /// inbound course, nm), from sortie 1790668215-full_auto's `state`
+    /// records (alt less agl) and its `reversal` records. The centreline as
+    /// the 737 flew it in (t+1422 to t+1585). Left (north east, the hills
+    /// behind Malaga): the drawn downwind 3.9 nm out read 1,644 ft; flown 0.4
+    /// to 0.6 nm further out it crossed 1,966 and 2,043 ft at 8.5 and 8.7 nm
+    /// (t+1791 to t+1795, 522 ft under the 2,644 ft platform). Right (the
+    /// Guadalhorce valley): 1,653 at most, the old probe's number.
+    fn lemg13_ground(along: f64, lat: f64) -> f64 {
+        if lat.abs() < 0.6 {
+            return interp(
+                &[
+                    (1.0, 60.0),
+                    (2.1, 72.0),
+                    (3.6, 137.0),
+                    (5.15, 168.0),
+                    (5.9, 265.0),
+                    (6.3, 327.0),
+                    (6.7, 478.0),
+                    (7.15, 611.0),
+                    (7.6, 817.0),
+                    (8.0, 959.0),
+                    (8.8, 1110.0),
+                    (9.7, 885.0),
+                    (10.6, 760.0),
+                    (11.1, 1063.0),
+                    (12.0, 900.0),
+                ],
+                along,
+            );
+        }
+        if lat < 0.0 {
+            if (6.5..=10.5).contains(&along) && lat <= -4.3 {
+                return 2043.0;
+            }
+            if (6.5..=10.5).contains(&along) && lat <= -3.0 {
+                return 1644.0;
+            }
+            return if along > 0.0 { 900.0 } else { 100.0 };
+        }
+        if (3.0..=10.0).contains(&along) && lat >= 3.0 {
+            1653.0
+        } else {
+            300.0
+        }
+    }
+
+    /// The loop of [`plan`] with the ground from `g` instead of the sim.
+    fn plan_over(
+        g: impl Fn(f64, f64) -> f64,
+        along_now: f64,
+        xtk_now: f64,
+        gs: f64,
+        elev: f64,
+        default_platform: f64,
+    ) -> (Judgement, f64, u32) {
+        let under = |pts: &[ProbePt]| -> Vec<f64> {
+            pts.iter().map(|p| g(p.along_nm, p.lateral_nm)).collect()
+        };
+        let mut built_for = default_platform;
+        let mut rounds = 0;
+        loop {
+            rounds += 1;
+            let ip = inbound_frame(built_for, elev, gs);
+            let facts = |side: f64| {
+                let pts: Vec<ProbePt> = side_frame(side, built_for, elev, gs, along_now)
+                    .into_iter()
+                    .chain(ip.iter().copied())
+                    .collect();
+                side_facts(&pts, &under(&pts))
+            };
+            let (l, r) = (facts(-1.0), facts(1.0));
+            let side = pick_side(xtk_now, l.line_max_ft, r.line_max_ft);
+            let j = judge(side, &l, &r, elev, default_platform);
+            match reprobe_at(built_for, &j) {
+                Some(p) if rounds < MAX_PROBE_ROUNDS => built_for = p,
+                _ => {
+                    let flown = built_for.max(j.platform_ft);
+                    return (j, flown, rounds);
+                }
+            }
+        }
+    }
+
+    /// The least height over the ground of every level point of a side's
+    /// pattern flown at `platform_ft`, corridor included.
+    fn least_over(
+        g: impl Fn(f64, f64) -> f64,
+        side: f64,
+        platform_ft: f64,
+        gs: f64,
+        along_now: f64,
+    ) -> f64 {
+        side_frame(side, platform_ft, 48.0, gs, along_now)
+            .into_iter()
+            .chain(inbound_frame(platform_ft, 48.0, gs))
+            .filter(|p| p.level)
+            .map(|p| platform_ft - g(p.along_nm, p.lateral_nm))
+            .fold(f64::INFINITY, f64::min)
+    }
+
+    /// #182, the recorded LEMG 13 reversal at t+1589.3 (sortie
+    /// 1790668215-full_auto): 1.88 nm out on the centreline after a go-around,
+    /// 170 kt. The old rule flew the left-hand downwind at 2,644 ft (the drawn
+    /// line's 1,644 plus 1,000) and passed 522 ft over the hill outside it.
+    /// Judged on the corridor, the left needs 3,043 and the right 2,653: the
+    /// right is flown, 1,000 ft over everything under its level legs.
+    #[test]
+    fn lemg_13_reversal_is_flown_over_its_corridor_not_its_line() {
+        let (gs, along, xtk) = (170.4, 1.884, 0.0077);
+        // The old rule's number, and what its corridor held.
+        assert!(least_over(lemg13_ground, -1.0, 2644.0, gs, along) < 700.0);
+        let (j, flown, rounds) = plan_over(lemg13_ground, along, xtk, gs, 48.0, 48.0 + 1590.0);
+        assert!(j.refused.is_none(), "{:?}", j.refused);
+        assert_eq!(j.side, 1.0, "the lower side, raised: {j:?}");
+        assert_eq!(j.why, "raised_for_terrain");
+        assert!((flown - 2653.0).abs() < 1.0, "{flown}");
+        assert!(rounds >= 2, "the raise moved the base out: probed again");
+        let least = least_over(lemg13_ground, j.side, flown, gs, along);
+        assert!(least >= 999.0, "1,000 ft over the level legs: {least}");
+        // The descent from the platform keeps its floor all the way in (500
+        // ft, tapering inside 2 nm: 306 ft at the 1 nm sample), on the
+        // standard path.
+        let check = if j.pick.left {
+            &j.pick.descent_left
+        } else {
+            &j.pick.descent_right
+        };
+        assert!(
+            check.problem.is_none() && !j.pick.shape.steep(),
+            "{check:?}"
+        );
+        assert!(check.default_min_ft.unwrap() > 300.0, "{check:?}");
+    }
+
+    /// Over level ground the pattern is the one it always was: the standard
+    /// left-hand side off the centreline, at the default platform, probed
+    /// once.
+    #[test]
+    fn a_level_field_keeps_the_old_pattern() {
+        let flat = |_: f64, _: f64| 20.0;
+        let (j, flown, rounds) = plan_over(flat, -1.0, 0.0, 160.0, 48.0, 1638.0);
+        assert_eq!((j.side, j.why, rounds), (-1.0, "default_side_clear", 1));
+        assert!((flown - 1638.0).abs() < 1.0);
+        assert!(j.refused.is_none());
+        // Beside the runway, its own side stands.
+        let (j, _, _) = plan_over(flat, -1.0, 1.2, 160.0, 48.0, 1638.0);
+        assert_eq!(j.side, 1.0);
+    }
+
+    /// The corridor is the autopilot's, not the line: a hill half a radius
+    /// outside the drawn downwind fouls the side the line alone called clear.
+    #[test]
+    fn a_hill_outside_the_drawn_downwind_switches_sides() {
+        let gs = 170.0;
+        let offset = OFFSET_RADII * sizing_radius_nm(gs);
+        let hill = move |along: f64, lat: f64| {
+            if lat < -(offset + 0.3) && (3.0..=8.0).contains(&along) {
+                1200.0
+            } else {
+                20.0
+            }
+        };
+        let line = side_frame(-1.0, 1638.0, 48.0, gs, -1.0);
+        assert!(line
+            .iter()
+            .filter(|p| p.line)
+            .all(|p| hill(p.along_nm, p.lateral_nm) < 100.0));
+        let (j, flown, _) = plan_over(hill, -1.0, 0.0, gs, 48.0, 1638.0);
+        assert_eq!((j.side, j.why), (1.0, "switched_side_for_terrain"));
+        assert!((flown - 1638.0).abs() < 1.0);
+    }
+
+    /// A final in the hills is no pattern to fly: refused with the numbers,
+    /// never steepened (the loop flies autoland's own path).
+    #[test]
+    fn a_final_the_path_cannot_clear_is_refused_with_the_numbers() {
+        let ridge = |h: f64| {
+            move |along: f64, lat: f64| {
+                if lat.abs() < 0.6 && (3.8..=4.2).contains(&along) {
+                    h
+                } else {
+                    20.0
+                }
+            }
+        };
+        let (j, _, _) = plan_over(ridge(1500.0), -1.0, 0.0, 160.0, 48.0, 1638.0);
+        let why = j.refused.expect("refused");
+        assert!(
+            why.contains("the final would pass 0 feet over 1500 feet of ground 4.0 miles out"),
+            "{why}"
+        );
+        assert!(
+            !why.contains('\u{2014}') && !why.contains('\u{2013}'),
+            "no dashes: {why}"
+        );
+        // A lower ridge a steeper, legal path would clear is still refused:
+        // autoland flies its approach's own path.
+        let (j, _, _) = plan_over(ridge(900.0), -1.0, 0.0, 160.0, 48.0, 1638.0);
+        let why = j.refused.expect("refused, never steepened");
+        assert!(why.contains("degree path"), "{why}");
+    }
+
+    /// Mountains all round: a platform whose join point is past 15 nm is
+    /// refused.
+    #[test]
+    fn a_pattern_raised_past_its_join_limit_is_refused() {
+        let high = |_: f64, lat: f64| if lat.abs() > 1.0 { 4200.0 } else { 20.0 };
+        let (j, _, _) = plan_over(high, -1.0, 0.0, 160.0, 48.0, 1638.0);
+        let why = j.refused.expect("refused");
+        assert!(
+            why.contains("5200 feet") && why.contains("miles out"),
+            "{why}"
+        );
+    }
+
+    /// The refusal's hold: 1,000 ft over the ground ahead, never lower than
+    /// the aircraft or the platform, in hundreds.
+    #[test]
+    fn the_refusals_hold_clears_the_ground_ahead() {
+        assert_eq!(
+            hold_altitude_ft(Some(2043.0), Some(900.0), 2500.0, 1638.0),
+            3100.0
+        );
+        assert_eq!(hold_altitude_ft(Some(100.0), None, 2500.0, 1638.0), 2500.0);
+        assert_eq!(hold_altitude_ft(None, Some(2200.0), 800.0, 1638.0), 3200.0);
+        assert_eq!(hold_altitude_ft(None, None, 800.0, 1638.0), 1700.0);
     }
 }

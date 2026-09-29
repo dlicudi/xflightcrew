@@ -127,6 +127,12 @@ impl GoAroundWatch {
         }
     }
 
+    /// The runway the tower's latest order since the arm re-sequenced us to
+    /// ("expect runway one three"), if it named one (#182).
+    pub fn expected_runway(&self) -> Option<String> {
+        self.tower.expected_runway()
+    }
+
     /// A go-around ordered since the last look, and by whom: both are
     /// consumed, the tower's named when both came (it can see the runway).
     pub fn take(&mut self) -> Option<GoAroundBy> {

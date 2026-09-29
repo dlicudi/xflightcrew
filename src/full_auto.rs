@@ -8924,14 +8924,21 @@ mod tests {
         // A go-around: the ident published with Inbound is the runway in
         // use, never a clearance. Nothing moves.
         assert_eq!(
-            crate::autoland::clearance_switch("12", Some(Inbound), Some("30"), None, true),
+            crate::autoland::clearance_switch("12", Some(Inbound), Some("30"), None, true, None),
             None
         );
         assert_eq!(super::arrival_runway().as_deref(), Some("12"));
 
         // "Cleared to land runway three zero" on the approach.
-        let to = crate::autoland::clearance_switch("12", Some(ClearedToLand), Some("30"), None, false)
-            .expect("an arrival clearance to the other end is a switch");
+        let to = crate::autoland::clearance_switch(
+            "12",
+            Some(ClearedToLand),
+            Some("30"),
+            None,
+            false,
+            None,
+        )
+        .expect("an arrival clearance to the other end is a switch");
         assert!(super::retarget_arrival_runway(&to, "clearance"));
         assert_eq!(super::arrival_runway().as_deref(), Some("30"));
         // The new loop's arm flies the end handed down: no second event.

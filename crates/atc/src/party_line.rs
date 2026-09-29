@@ -161,6 +161,17 @@ pub(crate) static PENDING_GO_AROUND: Mutex<bool> = Mutex::new(false);
 /// ~400 ms tick) won it: 15 orders in the logs, not one `ordered_go_around`.
 pub(crate) static GO_AROUND_ORDERS: AtomicU64 = AtomicU64::new(0);
 
+/// The runway the tower's LATEST go-around order re-sequenced the arrival to
+/// ("go around, traffic on the runway ... expect runway one three"), with
+/// that order's number in [`GO_AROUND_ORDERS`]; `None` when the latest order
+/// named none. Written with the order, before its count moves, so a watch
+/// that sees the order sees its runway. Read through
+/// [`GoAroundOrders::expected_runway`]. LEMG, 2026-09-29 (sortie
+/// 1790668215-full_auto): re-sequenced from 30 to 13 at t+649, the crew
+/// flew 5.5 minutes of pattern to 30, because during a missed approach the
+/// runway published with `Inbound` is only the runway in use (EGTE).
+pub(crate) static RESEQUENCED_ORDER: Mutex<Option<(u64, String)>> = Mutex::new(None);
+
 /// A CONDITIONAL line-up's condition, as the world sees it: `Some(false)`
 /// while the named arrival is still on final, `Some(true)` once it is down on
 /// the strip or gone, `None` when no conditional line-up stands. Published by
@@ -597,14 +608,30 @@ pub fn take_pending_go_around() -> bool {
 #[derive(Debug, Clone, Copy)]
 pub struct GoAroundOrders {
     seen: u64,
+    /// The count when the watch was armed: an order at or before it is
+    /// history.
+    armed: u64,
 }
 
 impl GoAroundOrders {
     /// Start watching: only orders given from now on count.
     pub fn arm() -> Self {
+        let now = GO_AROUND_ORDERS.load(Ordering::SeqCst);
         Self {
-            seen: GO_AROUND_ORDERS.load(Ordering::SeqCst),
+            seen: now,
+            armed: now,
         }
+    }
+
+    /// The runway the latest go-around order given since this watch was
+    /// armed re-sequenced us to ("expect runway one three"), if it named
+    /// one. Takes nothing: the order itself is still [`Self::take`]'s.
+    pub fn expected_runway(&self) -> Option<String> {
+        let now = GO_AROUND_ORDERS.load(Ordering::SeqCst);
+        lock(&RESEQUENCED_ORDER)
+            .as_ref()
+            .filter(|(n, _)| *n > self.armed && *n <= now)
+            .map(|(_, rwy)| rwy.clone())
     }
 
     /// Whether the tower has ordered a go-around since the last look.

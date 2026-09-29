@@ -741,7 +741,9 @@ everything blackboxes to `logs/blackbox.jsonl` (kinds: `atc`, `autotaxi`, `autot
   approach since its answer comes after the arm: owed readbacks (`party_line::readback_owed`), a
   re-arm on another end (`clearance_switch`, never `going_around`) moves the ONE arrival runway
   (`full_auto::retarget_arrival_runway`, also the #79 re-pick's write point); a superseded loop leaves
-  `ACTIVE` to its successor. Arrival wind is the destination METAR (`weather::surface_wind`,
+  `ACTIVE` to its successor. A go-around order's "expect runway X" (`GoAroundOrders::expected_runway`,
+  party line `RESEQUENCED_ORDER`) is taken once the climb away is flown (`clearance_switch` `expected`,
+  `runway_from_clearance` `resequenced`; LEMG 30 to 13 flew 5.5 min to the wrong end, #182). Arrival wind is the destination METAR (`weather::surface_wind`,
   `arrival_wind`), not the datarefs aloft.
 - **A straight-in to THIS runway or none** (`nav::straight_in_legs`: the exact designator, no RF
   arc, legs cut at the threshold; circling is not an approach); another end before a visual; the
@@ -811,7 +813,12 @@ everything blackboxes to `logs/blackbox.jsonl` (kinds: `atc`, `autotaxi`, `autot
   (`reversal::overflown`); `pattern_ias`; each is blackboxed with its `why` (`reversal::why`), and
   "Overflew the runway" is said only with the runway behind (`dropped_final_line`; it was said at
   5.2 nm, #171). **The stabilised gate is about TIME** (`unstabilised_at_gate`,
-  `reversal::predicted_residual_m`), not position.
+  `reversal::predicted_residual_m`), not position. **Its side and platform are the circuit's rule over
+  its corridor** (`reversal::plan`, beside the loop: `side_frame`, `inbound_frame`, `judge` through
+  `circuit::choose_pattern_with` `PickRules::reversal`, re-probed while a raise moves the base); no
+  steepened path, no join past 15 nm: a refusal climbs straight ahead to 1,000 ft over the ground ahead
+  and hands over only level there (`TerrainHold`, `give_up` `terrain_refused`); every non-final leg
+  keeps `circuit::live_floor_ft` (`live_floor_leg`, `terrain_floor`; LEMG 13 522 ft AGL, #182).
 - The receding guard measures from the furthest legitimate point (`recede_ref_nm`); flaps never cycle
   on a placard (`flap_held_within_limits`); **an approach never takes away the flap the wing flies
   on** (`flap_kept_flying`, `last_flap` read at the arm), nor asks for less than is out
