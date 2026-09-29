@@ -802,6 +802,51 @@ const GO_AROUND_PLACARD_MARGIN_KTS: f64 = 10.0;
 /// ...and reaches this far past the next retraction speed, so the step is
 /// taken rather than hovered at.
 const GO_AROUND_RETRACT_MARGIN_KTS: f64 = 5.0;
+/// Where a retraction speed sits inside the placard margin of the flap being
+/// left, the step is taken this far under the placard less its margin.
+const CLEANUP_STEP_UNDER_CAP_KTS: f64 = 3.0;
+
+/// The placard of the flap `flap` out: the lowest Vfe declared at or under
+/// it. Infinite when none is. Pure.
+fn placard_of(flap: f64, limits: &[(f64, Option<f64>)]) -> f64 {
+    limits
+        .iter()
+        .filter(|(ratio, _)| *ratio <= flap + 1e-6)
+        .filter_map(|(_, vfe)| *vfe)
+        .fold(f64::INFINITY, f64::min)
+}
+
+/// The retraction schedule a clean-up walks from `from` out (#169): the
+/// next step's speed held under the placard of `from`, less the placard
+/// margin and [`CLEANUP_STEP_UNDER_CAP_KTS`], so the speed that takes the
+/// step can be flown inside the placard. Every other step, and a step that
+/// already fits (every profile but the A330's CONF 1), is unchanged. The
+/// A330 retracts CONF 1 at 210 under a 215 placard: the clean-up flew
+/// 212.5, 2.5 kt under it, and the level-off ran 224 (LEMG 30, sortie
+/// 1790698132-full_auto, 2026-09-29); it now steps at 202 and flies 205.
+/// Pure.
+pub fn cleanup_schedule(
+    schedule: &[(f64, f64)],
+    limits: &[(f64, Option<f64>)],
+    from: f64,
+) -> Vec<(f64, f64)> {
+    let next = schedule
+        .iter()
+        .map(|(r, _)| *r)
+        .filter(|r| *r < from - 1e-6)
+        .max_by(f64::total_cmp);
+    let cap = placard_of(from, limits) - GO_AROUND_PLACARD_MARGIN_KTS - CLEANUP_STEP_UNDER_CAP_KTS;
+    schedule
+        .iter()
+        .map(|&(ratio, kts)| {
+            if next.is_some_and(|n| (n - ratio).abs() < 1e-6) {
+                (ratio, kts.min(cap))
+            } else {
+                (ratio, kts)
+            }
+        })
+        .collect()
+}
 
 /// Whether the circuit flies a tower's go-around order on this leg: the
 /// approach legs, the only ones a landing clearance stands on. The order
@@ -873,25 +918,18 @@ pub fn go_around_speed_kts(
     if flap <= 1e-6 {
         return pattern_kts;
     }
-    let next_retract = schedule
-        .iter()
+    let placard = placard_of(flap, limits);
+    let cap = placard - GO_AROUND_PLACARD_MARGIN_KTS;
+    // The step's speed as the walk takes it ([`cleanup_schedule`]): never
+    // inside the placard margin, so the margin always wins (#169).
+    let next_retract = cleanup_schedule(schedule, limits, flap)
+        .into_iter()
         .filter(|(ratio, _)| *ratio < flap - 1e-6)
         .max_by(|a, b| a.0.total_cmp(&b.0))
-        .map(|(_, kts)| *kts);
-    let placard = limits
-        .iter()
-        .filter(|(ratio, _)| *ratio <= flap + 1e-6)
-        .filter_map(|(_, vfe)| *vfe)
-        .fold(f64::INFINITY, f64::min);
-    let cap = placard - GO_AROUND_PLACARD_MARGIN_KTS;
-    let target = match next_retract {
-        // The two margins squeeze: the A330's CONF 1 retracts at 210 under
-        // a 215 placard. Fly the middle of the gap.
-        Some(r) if r + GO_AROUND_RETRACT_MARGIN_KTS > cap && placard > r => (r + placard) / 2.0,
-        _ => pattern_kts
-            .max(next_retract.map_or(0.0, |r| r + GO_AROUND_RETRACT_MARGIN_KTS))
-            .min(cap),
-    };
+        .map(|(_, kts)| kts);
+    let target = pattern_kts
+        .max(next_retract.map_or(0.0, |r| r + GO_AROUND_RETRACT_MARGIN_KTS))
+        .min(cap);
     target.max(floor_kts.unwrap_or(0.0))
 }
 
@@ -5341,6 +5379,9 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, p: Params
             // one detent at a time, paced on the flaps arriving.
             if let Some(cmd) = cleaning_up {
                 let clean_ok = crate::aircraft::config_floor_kts(0.0).unwrap_or(pattern_kts * 0.9);
+                // The step's speed inside the placard of what is out (#169).
+                let flap_schedule =
+                    cleanup_schedule(&flap_schedule, &crate::aircraft::flap_limits(), cmd);
                 let due = if flap_schedule.is_empty() {
                     go_around_flap_step(&flap_schedule, cmd, None, ias, clean_ok)
                 } else {
@@ -7549,6 +7590,56 @@ mod final_leg_kts_tests {
         );
     }
 
+    /// #169, LEMG 30 (sortie 1790698132-full_auto, 2026-09-29): "Flaps
+    /// one." at 1,305 ft and the circuit wanted 212.5 kt, 2.5 under CONF 1's
+    /// 215 placard (the old middle of the 210 retract to 215 gap), and the
+    /// level-off ran 224. Now the placard margin wins: 205, and the step up
+    /// is taken at 202. CONF 2 (196) keeps 186 and its step at 180, and the
+    /// 737's schedule is untouched.
+    #[test]
+    fn the_a330_cleans_up_conf_1_inside_its_placard() {
+        let p = crate::aircraft::load("airbus_a330_300").expect("the A330 profile");
+        let sched = crate::aircraft::flap_schedule(p.flaps.as_ref());
+        let limits = limits_of(p.flaps.as_ref());
+        let pattern = 227.5;
+        assert_eq!(go_around_speed_kts(pattern, 0.25, &sched, &limits, None), 205.0);
+        let walk = cleanup_schedule(&sched, &limits, 0.25);
+        assert_eq!(walk, vec![(0.0, 202.0), (0.25, 180.0)]);
+        assert_eq!(go_around_flap_step(&walk, 0.25, Some(0.25), 201.9, 0.0), None);
+        assert_eq!(go_around_flap_step(&walk, 0.25, Some(0.25), 202.0, 0.0), Some(0.0));
+        // The recorded reading, past the handle: arrived, stepped at once.
+        let mut pace = autotakeoff::FlapPace::default();
+        pace.stepped(0.5);
+        let judged = pace.judged(0.0, 0.25, Some(0.106));
+        assert_eq!(go_around_flap_step(&walk, 0.25, judged, 212.1, 0.0), Some(0.0));
+        // CONF 2 already fits.
+        assert_eq!(go_around_speed_kts(pattern, 0.5, &sched, &limits, None), 186.0);
+        assert_eq!(cleanup_schedule(&sched, &limits, 0.5), sched);
+        // The leg's speed is the same number.
+        let speeds = LegSpeeds {
+            pattern_kts: pattern,
+            approach_kts: 180.0,
+            approach_ias: 150.0,
+        };
+        let want = leg_want_kts(
+            Leg::Crosswind,
+            speeds,
+            Some(0.25),
+            Some(0.25),
+            &sched,
+            &limits,
+            |_| None,
+        );
+        assert_eq!(want, 205.0);
+        // The 737 walks its own numbers from every detent.
+        let b = crate::aircraft::load("boeing_737_800").expect("the 737 profile");
+        let bs = crate::aircraft::flap_schedule(b.flaps.as_ref());
+        let bl = limits_of(b.flaps.as_ref());
+        for from in [0.125, 0.25, 0.375, 0.5] {
+            assert_eq!(cleanup_schedule(&bs, &bl, from), bs, "737 from {from}");
+        }
+    }
+
     /// No airframe's go-around hovers with its flaps out: at every stage of
     /// the clean-up the speed it flies is inside the placard of what is out
     /// AND takes the next step, from the go-around's half to clean.
@@ -7579,7 +7670,15 @@ mod final_leg_kts_tests {
                     placard + 1e-6 >= flap,
                     "{id}: {kts} kt is over flap {flap}'s placard"
                 );
-                let next = go_around_flap_step(&sched, flap, Some(flap), kts, 0.0);
+                // ...and never inside the placard margin (#169).
+                let vfe = placard_of(flap, &limits);
+                assert!(
+                    kts <= vfe - GO_AROUND_PLACARD_MARGIN_KTS + 1e-9,
+                    "{id}: {kts} kt is within the margin of flap {flap}'s {vfe}"
+                );
+                // The walk steps on the schedule the circuit walks.
+                let walk = cleanup_schedule(&sched, &limits, flap);
+                let next = go_around_flap_step(&walk, flap, Some(flap), kts, 0.0);
                 assert!(next.is_some(), "{id}: hovers at flap {flap}, {kts} kt");
                 flap = next.unwrap();
                 steps += 1;

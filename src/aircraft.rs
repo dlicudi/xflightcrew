@@ -3996,6 +3996,11 @@ mod tests {
                 "GO_AROUND_RETRACT_MARGIN_KTS",
                 "MARGIN: over the airframe's own flap retraction speed",
             ),
+            (
+                "circuit",
+                "CLEANUP_STEP_UNDER_CAP_KTS",
+                "MARGIN: under the airframe's own flap placard less its margin",
+            ),
         ];
 
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");

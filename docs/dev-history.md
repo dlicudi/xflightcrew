@@ -11114,3 +11114,32 @@ Next flight (SR22): `autotakeoff` `rotate_tick` `pitch` 0.45 to 0.6 at Vr fallin
 theta at 7 about 2 s after `rotate`, `wheels` false near 80 to 85 KIAS, `liftoff` `ias` under
 about 88 (the 8 ft gate lags wheels-off), `climb_manual` theta under 10 with no drop under 7, and
 `stage_result` takeoff `liftoff_xtk_m` against the 5.4 m of 1790694884. Offline only.
+
+## 2026-09-29: the A330's CONF 1 clean-up inside its placard (#169)
+
+iMac 2026-09-29, sortie 1790698132-full_auto (A330 LEMG 30 circuit, PASS unattended) still ran
+the crosswind over CONF 1: "Flaps one." at 1,305 ft (+143.8 s), `want_kts` 212.5 (the middle of
+the 210 retract to 215 placard gap), the climb from 2,468 fpm to level by +155 s with the lever at
+1.0, 224.4 kt at +160.4 s, "Flap overspeed, 224 knots over the 215 flap limit". The step up was
+withheld 15 s (`flap_step_withheld` at 0.25, `deployed` 0.106 then 0.011): CONF 1 is slats, so
+the flap reading falls PAST the 0.25 handle toward 0, and `FlapPace` waited for it to stop.
+
+- **A retraction reading past the commanded detent has arrived** (`FlapPace::arrived`: from a
+  step, at or under the detent plus `FLAP_ARRIVED`); it stepped at the first read (+153.6 s).
+- **The placard margin wins** (`circuit::cleanup_schedule`, `CLEANUP_STEP_UNDER_CAP_KTS` 3): the
+  next step's speed is held under the placard of the flap it leaves, less the 10 kt margin and 3,
+  and `go_around_speed_kts` flies that plus 5, capped at placard less 10. A330 CONF 1: 205 kt, the
+  step at 202 (was 212.5, step at 210). Every other profile's schedule already fits and is
+  unchanged (the 737's pinned from every detent); the squeeze branch is gone.
+- **A declared governor pulls up to twice its urgent step** 10 to 20 kt of projection past the
+  target (`DEEP_PULL_MAX`); the shared law is unchanged. On the recorded climb through the
+  existing plants the peak falls on every fast plant and never rises (4 kt/s, 4.6 s, the plant
+  that reproduces the flight: 221.2 to under 219).
+
+Tests: `the_a330_cleans_up_conf_1_inside_its_placard`, `a_stalled_deploy_reading_still_steps`,
+`every_profile_cleans_up_a_go_around_inside_its_placards` (now: never inside the margin),
+`the_a330_governor_pulls_harder_far_past_the_target`.
+
+Next flight (A330 circuit): `circuit` `leg` `want_kts` 205 after "Flaps one.", `climb_flap_step`
+to 0 near 202 kt with no `flap_step_withheld` once past it, `ias` under 215 with CONF 1 out, no
+`flap_overspeed` callout. Offline only.
