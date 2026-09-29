@@ -6804,6 +6804,86 @@ mod tests {
         assert!(TodPassed.eval(&s).is_some(), "20.9 nm of route under a 25 nm ring");
     }
 
+    /// #109 on a real SimBrief plan (EGKK-EGBB, the stock 737's OFP, bench
+    /// copy): the ring the monitor gets (`plan::tod_ring_nm`) and the route
+    /// it measures along (the plan's waypoints, as `plan.rs` publishes
+    /// them). The navlog's `tod_to_dest_nm` is 61 nm, the arrival as flown;
+    /// the legs from its TOD are 42, so against them it called the descent
+    /// 19 nm early. Measured from the TOD's position the ring is reached at
+    /// the OFP's own TOD; the straight line to EGBB is inside it 24 nm of
+    /// route before that, where the old comparison called the descent point
+    /// "passed". Flown through the checks at FL180 cruise.
+    #[test]
+    fn a_real_plans_ring_is_reached_at_its_own_top_of_descent() {
+        let v: serde_json::Value =
+            serde_json::from_str(include_str!("../bench/ofp/egkk-egbb-738.trimmed.json")).unwrap();
+        let fp = crate::simbrief::plan_from_ofp(&v).unwrap();
+        let route: Vec<(f64, f64)> = fp.waypoints.iter().map(|w| (w.lat, w.lon)).collect();
+        assert!((fp.tod_to_dest_nm - 61.0).abs() < 0.5, "{}", fp.tod_to_dest_nm);
+        let ring = crate::plan::tod_ring_nm(&fp, &route);
+        assert!((ring - 42.2).abs() < 0.5, "{ring}");
+        let fixes = v.pointer("/navlog/fix").and_then(|f| f.as_array()).unwrap();
+        let at = |id: &str| {
+            let f = fixes.iter().find(|f| f["ident"] == id).unwrap();
+            let n = |k: &str| f[k].as_str().unwrap().parse::<f64>().unwrap();
+            (n("pos_lat"), n("pos_long"))
+        };
+        let (tod, dest) = (at("TOD"), *route.last().unwrap());
+        // At the OFP's TOD the route still to fly IS the ring.
+        let rem = route_remaining_nm(&route, tod.0, tod.1).unwrap();
+        let straight = crate::nav::haversine_nm(tod.0, tod.1, dest.0, dest.1);
+        assert!((rem - ring).abs() < 2.0, "route {rem:.1} vs ring {ring}");
+        assert!(straight < ring - 20.0, "the straight line is {straight:.1}");
+        // Flown from the origin in quarter miles: where each comparison
+        // first says "inside the ring", as route miles before the TOD.
+        let total = crate::route_finder::path_nm(&route);
+        let rem_tod = route_remaining_nm(&route, tod.0, tod.1).unwrap();
+        let (mut along_first, mut straight_first) = (None, None);
+        let mut s = 0.0;
+        while s <= total {
+            let p = crate::route_finder::point_along(&route, s);
+            let r = route_remaining_nm(&route, p.0, p.1).unwrap();
+            if along_first.is_none() && r <= ring {
+                along_first = Some(r - rem_tod);
+            }
+            let d = crate::nav::haversine_nm(p.0, p.1, dest.0, dest.1);
+            if straight_first.is_none() && d <= ring {
+                straight_first = Some(r - rem_tod);
+            }
+            s += 0.25;
+        }
+        let (along_first, straight_first) = (along_first.unwrap(), straight_first.unwrap());
+        assert!(along_first.abs() < 2.0, "along the legs, {along_first:.1} nm from the TOD");
+        assert!(straight_first > 20.0, "straight line, {straight_first:.1} nm early");
+        // Through the checks, 5 nm of route before the TOD and 5 after.
+        let cruise_at = |before_nm: f64, route_known: bool| {
+            let p = crate::route_finder::point_along(&route, total - rem_tod - before_nm);
+            let mut s = snap(true, true);
+            s.on_ground = false;
+            s.phase = Phase::Cruise;
+            s.alt_ft = 18_000.0;
+            s.agl_ft = 17_500.0;
+            s.vsi_fpm = 0.0;
+            s.groundspeed_kts = 300.0;
+            s.ias_kts = 250.0;
+            (s.lat, s.lon) = p;
+            s.dest_dist_nm = Some(crate::nav::haversine_nm(p.0, p.1, dest.0, dest.1));
+            s.dest_elev_ft = Some(339.0);
+            s.tod_ring_nm = Some(ring);
+            s.dest_route_nm = if route_known { route_remaining_nm(&route, p.0, p.1) } else { None };
+            s
+        };
+        let before = cruise_at(5.0, true);
+        assert_eq!(TodPassed.eval(&before), None, "5 nm before the TOD");
+        let msg = TodAhead.eval(&before).expect("the run-up to the TOD");
+        assert!(msg.contains("ahead"), "{msg}");
+        assert!(TodPassed.eval(&cruise_at(-5.0, true)).is_some(), "5 nm past it");
+        // The straight line, 20 nm of route before the TOD: "passed".
+        assert!(TodPassed.eval(&cruise_at(20.0, false)).is_some(), "the old comparison");
+        assert_eq!(TodPassed.eval(&cruise_at(20.0, true)), None);
+        assert_eq!(TodAhead.eval(&cruise_at(20.0, true)), None);
+    }
+
     /// #127: EGKK-EGBB (sortie 1790541304-full_auto +1604) said "Top of
     /// descent in about a minute, 1 miles ahead" at 300 kt. A mile is said
     /// "a mile", and the time is the distance at this groundspeed.

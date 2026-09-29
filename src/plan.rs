@@ -248,11 +248,8 @@ pub(crate) async fn time_to_tod(
     let Some(dest) = fp.waypoints.last().cloned() else {
         return "No destination in the plan.".to_string();
     };
-    let ring_nm = if fp.tod_to_dest_nm > 0.0 {
-        fp.tod_to_dest_nm
-    } else {
-        fp.cruise_alt_ft / 1000.0 * TOD_NM_PER_1000FT
-    };
+    let route: Vec<(f64, f64)> = fp.waypoints.iter().map(|w| (w.lat, w.lon)).collect();
+    let ring_nm = tod_ring_nm(fp, &route);
     let (lat, lon) = match (
         xp.get_float("sim/flightmodel/position/latitude").await,
         xp.get_float("sim/flightmodel/position/longitude").await,
@@ -260,8 +257,34 @@ pub(crate) async fn time_to_tod(
         (Ok(a), Ok(b)) => (a, b),
         _ => return "I can't read our position right now.".to_string(),
     };
-    let to_tod = nav::haversine_nm(lat, lon, dest.lat, dest.lon) - ring_nm;
-    tod_phrase(to_tod, xp).await
+    // Along the plan's legs, as the ring is (#109); the straight line only
+    // without a route.
+    let to_go = crate::monitor::route_remaining_nm(&route, lat, lon)
+        .unwrap_or_else(|| nav::haversine_nm(lat, lon, dest.lat, dest.lon));
+    tod_phrase(to_go - ring_nm, xp).await
+}
+
+/// The plan's top-of-descent ring, miles to go along `route` (the plan's
+/// waypoints) at the top of descent. Measured from the navlog's own TOD
+/// POSITION along the same legs the monitor measures the aircraft along:
+/// SimBrief's `tod_to_dest_nm` is the arrival AS FLOWN (EGKK-EGBB: 61 nm,
+/// the GROVE-EGBB leg alone 25 for 7.5 nm of line), and against the legs'
+/// 42 nm it called the descent 19 nm early (#109, the real OFP in
+/// `a_real_plans_ring_is_reached_at_its_own_top_of_descent`). Then the
+/// navlog's figure, then the rule of thumb.
+pub(crate) fn tod_ring_nm(fp: &simbrief::FlightPlan, route: &[(f64, f64)]) -> f64 {
+    if let Some(r) = fp
+        .schedule
+        .tod
+        .and_then(|(lat, lon)| crate::monitor::route_remaining_nm(route, lat, lon))
+    {
+        return r;
+    }
+    if fp.tod_to_dest_nm > 0.0 {
+        fp.tod_to_dest_nm
+    } else {
+        fp.cruise_alt_ft / 1000.0 * TOD_NM_PER_1000FT
+    }
 }
 
 /// Format a distance-to-TOD as a spoken line, paced by groundspeed.
@@ -423,11 +446,8 @@ pub(crate) async fn ensure_plan(
     if let Some((_, fp)) = cache.as_ref() {
         simbrief::publish_plan(fp);
         if let Some(w) = fp.waypoints.last() {
-            let ring = if fp.tod_to_dest_nm > 0.0 {
-                fp.tod_to_dest_nm
-            } else {
-                fp.cruise_alt_ft / 1000.0 * TOD_NM_PER_1000FT
-            };
+            let route: Vec<(f64, f64)> = fp.waypoints.iter().map(|w| (w.lat, w.lon)).collect();
+            let ring = tod_ring_nm(fp, &route);
             // Field elevation comes from apt.dat, the authoritative source — the
             // plan's destination-waypoint altitude is a *crossing* altitude
             // (spoken live as "4600 feet" for a 2,084 ft field, and it skews the
@@ -471,7 +491,7 @@ pub(crate) async fn ensure_plan(
                 elev_ft,
                 tod_ring_nm: ring,
                 // The ring is along-route: the legs it is measured along (#109).
-                route: fp.waypoints.iter().map(|w| (w.lat, w.lon)).collect(),
+                route,
             });
         }
     }
