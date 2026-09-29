@@ -1142,6 +1142,9 @@ const ALIGN_QUIET_DPS: f64 = 1.0;
 /// A line-up is ALIGNED within this of the runway's course: the scorecard
 /// judges the roll's first tick at 3.
 pub const ALIGNED_DEG: f64 = 2.0;
+/// ...and a line-up out of time or runway still hands over within this: the
+/// roll holds its power until the nose is inside [`ALIGNED_DEG`].
+pub const ALIGN_ACCEPT_DEG: f64 = 3.0;
 /// Stopped, for the aligned verdict: groundspeed and yaw rate under these.
 const ALIGN_SETTLED_KTS: f64 = 0.5;
 const ALIGN_SETTLED_DPS: f64 = 0.7;
@@ -1212,11 +1215,23 @@ impl LineUpAlign {
             self.creeping = false;
             return AlignStep::Done { err_deg: err };
         }
-        if t_s - t0 > ALIGN_MAX_S {
-            return AlignStep::GiveUp { err_deg: err, why: "time" };
-        }
-        if rolled_m > ALIGN_MAX_ROLL_M {
-            return AlignStep::GiveUp { err_deg: err, why: "rolled" };
+        let out_of_bounds = if t_s - t0 > ALIGN_MAX_S {
+            Some("time")
+        } else if rolled_m > ALIGN_MAX_ROLL_M {
+            Some("rolled")
+        } else {
+            None
+        };
+        if let Some(why) = out_of_bounds {
+            // Out of bounds but inside what the roll's own hold straightens
+            // (`autotakeoff::RollAlign`) and the alignment stage passes: done,
+            // not a give-up (LILB 03 Evolution 1790720549, 2026-09-30: the
+            // turn-round settled 2.2 off in 24.6 s and the mission gave up).
+            if err.abs() <= ALIGN_ACCEPT_DEG {
+                self.creeping = false;
+                return AlignStep::Done { err_deg: err };
+            }
+            return AlignStep::GiveUp { err_deg: err, why };
         }
         // Creep while the nose still has to come round; stop once it is
         // close and not carried past (half the band, with hysteresis).
@@ -5014,6 +5029,13 @@ mod tests {
         assert!(matches!(
             j.step(0.0, 107.0, 2.0, 0.0, super::ALIGN_MAX_ROLL_M + 1.0),
             AlignStep::GiveUp { why: "rolled", .. }
+        ));
+        // Out of runway but inside what the roll straightens: done (LILB 03
+        // Evolution 1790720549: 2.2 off, the mission gave up).
+        let mut j = LineUpAlign::new(23.96);
+        assert!(matches!(
+            j.step(0.0, 21.76, 0.3, 0.2, super::ALIGN_MAX_ROLL_M + 1.0),
+            AlignStep::Done { .. }
         ));
         assert_eq!(
             super::not_aligned_line(-10.7),
