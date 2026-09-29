@@ -10899,3 +10899,34 @@ Blackbox: `circuit` `authored_route_unsafe` (`on`), `terrain_hold` (`hold_ft`, `
 `terrain_hold_level` or `terrain_hold_given_back`, then `stand_down`. Tests `terrain_hold_tests`
 (the Rock's 1,398 ft, the 1,098 ft ridge entered at 1,130 on 2026-09-15, the 1,650 ft pattern).
 Offline only.
+
+## 2026-09-29: the field's circuit data from apt.dat, layer 1 of #182
+
+apt.dat has carried per field whether circuits are allowed and the pattern side per runway, and
+nothing read it: `1302 allows_circuits` (LEMG and EGKK say 0; 317 fields no, 90 yes) and `1101
+<rwy> left|right` inside the `1000` flows (4,979 rows: 3,775 left, 1,204 right; LEMG 13 and 31 left,
+EGKK 08R and 26L left, LSZS 03 and 21 left, LXGB 09 left).
+
+- **Read** (`atc::nav`, `find_airport` and `scan_airports`): `AirportInfo.allows_circuits`
+  (`parse_allows_circuits`) and `pattern_sides` (`note_pattern_side`: first flow sets an end, a
+  flow that disagrees drops it; `pattern_left(rwy)` matches "09" to "9"). Test
+  `circuits_flag_and_pattern_sides_are_read_from_the_flows`; `--ignored
+  real_install_circuits_flags` passes on this install.
+- **The tower** (`Station::circuit_offer`, `CircuitOffer.left` / `not_available`): the circuit
+  clearance names the published side ("runway one three, left hand circuit, circuit height ...";
+  FAA "left closed traffic approved"), and at a field whose data says no circuits it SAYS so first
+  ("circuits are not normally available at Malaga, ...", blackbox `atc` `circuits_not_allowed`)
+  and still clears the one asked for: the bench flies its circuits at LEMG and EGKK, and refusing
+  them waits on the runner's cases moving or declaring a waiver. The readback carries the side and
+  is still a readback.
+- **The crew** (`circuit::fly`): the published side is the side asked of `choose_pattern`
+  (`pattern_side_wanted`), so terrain and airspace still veto it and say so; before the takeoff
+  `field_circuit_line` says a field without circuits ("flown as asked") and a published side
+  other than the one asked for. Not at LXGB, whose sea side (09 right) stays the authored route's
+  over apt.dat's 09 left. `circuit` `armed` carries `asked_left`, `published_left`,
+  `allows_circuits`.
+
+Not done: `1110` runway use per flow (arrivals 12 / departures 13 at LEMG, under the flow's wind,
+ceiling, visibility and time rules) feeding the runway in use: it sits against the calm-wind
+stream rules and the frozen runway, a change of its own. Autoland's reversal still picks its side
+by terrain alone. Offline only.

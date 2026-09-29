@@ -372,6 +372,52 @@ pub struct AirportInfo {
     /// it an altitude in feet with the QNH. `None` = the file says nothing,
     /// and every altitude stays in feet as before.
     pub transition_level_ft: Option<f64>,
+    /// apt.dat `1302 allows_circuits` (#182): `Some(false)` where the field's
+    /// data says no circuits (LEMG and EGKK say 0; 317 fields say no, 90
+    /// yes, 2026-09-29), `None` when the file is silent.
+    pub allows_circuits: Option<bool>,
+    /// apt.dat `1101 <rwy> left|right`, the VFR traffic pattern side per
+    /// runway end inside the `1000` flows (LEMG: 13 left, 31 left), in file
+    /// order, one entry per end: `Some(true)` left, `None` when the flows
+    /// disagree. Read through [`AirportInfo::pattern_left`].
+    pub pattern_sides: Vec<(String, Option<bool>)>,
+}
+
+/// A `1302 allows_circuits` value: "0" no, "1" yes, else unknown.
+pub fn parse_allows_circuits(v: &str) -> Option<bool> {
+    match v.trim() {
+        "0" => Some(false),
+        "1" => Some(true),
+        _ => None,
+    }
+}
+
+/// One `1101 <rwy> left|right` row (fields after the code) into `sides`:
+/// the first flow naming an end sets it, a flow that disagrees makes it
+/// `None` (no published side is better than a wrong one).
+pub fn note_pattern_side<'a>(
+    sides: &mut Vec<(String, Option<bool>)>,
+    mut fields: impl Iterator<Item = &'a str>,
+) {
+    let (Some(rwy), Some(side)) = (fields.next(), fields.next()) else {
+        return;
+    };
+    let left = match side {
+        s if s.eq_ignore_ascii_case("left") => true,
+        s if s.eq_ignore_ascii_case("right") => false,
+        _ => return,
+    };
+    match sides.iter_mut().find(|(r, _)| same_runway_end(r, rwy)) {
+        Some((_, known)) if *known != Some(left) => *known = None,
+        Some(_) => {}
+        None => sides.push((rwy.to_string(), Some(left))),
+    }
+}
+
+/// Two runway designators name the same end: "09" and "9", "08r" and "08R".
+pub fn same_runway_end(a: &str, b: &str) -> bool {
+    let norm = |s: &str| s.trim().trim_start_matches('0').to_ascii_uppercase();
+    norm(a) == norm(b)
 }
 
 /// A `1302 transition_level` value in feet: "7000" as written, "FL070" and a
@@ -391,6 +437,16 @@ pub fn parse_transition_level(v: &str) -> Option<f64> {
 }
 
 impl AirportInfo {
+    /// The published VFR pattern side for runway end `rwy` (apt.dat `1101`,
+    /// #182): `Some(true)` left, `Some(false)` right, `None` unpublished or
+    /// disagreeing between the field's flows.
+    pub fn pattern_left(&self, rwy: &str) -> Option<bool> {
+        self.pattern_sides
+            .iter()
+            .find(|(r, _)| same_runway_end(r, rwy))
+            .and_then(|(_, left)| *left)
+    }
+
     /// The field's reference position — the first runway threshold (apt.dat
     /// has no single airport lat/lon row; a threshold is within a mile of any
     /// sane answer). `None` for a field with no runway rows.
@@ -475,6 +531,8 @@ pub fn find_airport(path: &str, icao: &str) -> Result<Option<AirportInfo>> {
     let mut in_airport = false;
     let mut elev_ft = 0.0_f64;
     let mut transition_level_ft = None;
+    let mut allows_circuits = None;
+    let mut pattern_sides = Vec::new();
     // Reused byte buffer + a cheap prefix test before any splitting: the file is
     // ~400 MB and 13M lines, and a String-per-line scan is unusable in a debug
     // build. Only `1 `/`16 `/`17 ` (headers), `100 ` (runways), and the comm
@@ -512,11 +570,16 @@ pub fn find_airport(path: &str, icao: &str) -> Result<Option<AirportInfo>> {
                     runways.push(r);
                 }
             }
-            Some("1302") if in_airport => {
-                if f.next() == Some("transition_level") {
+            Some("1302") if in_airport => match f.next() {
+                Some("transition_level") => {
                     transition_level_ft = f.next().and_then(parse_transition_level);
                 }
-            }
+                Some("allows_circuits") => {
+                    allows_circuits = f.next().and_then(parse_allows_circuits);
+                }
+                _ => {}
+            },
+            Some("1101") if in_airport => note_pattern_side(&mut pattern_sides, f),
             Some(code) if in_airport => {
                 if let Some(fr) = parse_comm_row(code, f) {
                     freqs.push(fr);
@@ -537,6 +600,8 @@ pub fn find_airport(path: &str, icao: &str) -> Result<Option<AirportInfo>> {
         runways,
         freqs,
         transition_level_ft,
+        allows_circuits,
+        pattern_sides,
     }))
 }
 
@@ -617,6 +682,8 @@ pub fn scan_airports(path: &str, mut f: impl FnMut(&str, AirportInfo)) -> Result
                             runways: Vec::new(),
                             freqs: Vec::new(),
                             transition_level_ft: None,
+                            allows_circuits: None,
+                            pattern_sides: Vec::new(),
                         },
                     ));
                 }
@@ -630,9 +697,21 @@ pub fn scan_airports(path: &str, mut f: impl FnMut(&str, AirportInfo)) -> Result
             }
             Some("1302") => {
                 if let Some((_, apt)) = cur.as_mut() {
-                    if fields.next() == Some("transition_level") {
-                        apt.transition_level_ft = fields.next().and_then(parse_transition_level);
+                    match fields.next() {
+                        Some("transition_level") => {
+                            apt.transition_level_ft =
+                                fields.next().and_then(parse_transition_level);
+                        }
+                        Some("allows_circuits") => {
+                            apt.allows_circuits = fields.next().and_then(parse_allows_circuits);
+                        }
+                        _ => {}
                     }
+                }
+            }
+            Some("1101") => {
+                if let Some((_, apt)) = cur.as_mut() {
+                    note_pattern_side(&mut apt.pattern_sides, fields);
                 }
             }
             Some(code) => {
@@ -5787,6 +5866,79 @@ STAR:030,6,ALWYS3,RW28B,ARRTU,K2,P,C,E   , ,   ,TF, , , , , ,      ,    ,    ,  
             let a = find_airport(apt, icao).unwrap().expect(icao);
             assert_eq!(a.transition_level_ft, Some(want), "{icao}");
         }
+    }
+
+    /// #182: `1302 allows_circuits` and the `1101` pattern side per runway,
+    /// the rows as LEMG writes them (2026-09-29 apt.dat): three flows, 13
+    /// left twice and 31 left; a runway whose flows disagree has no side.
+    #[test]
+    fn circuits_flag_and_pattern_sides_are_read_from_the_flows() {
+        let path = std::env::temp_dir().join(format!("xc-apt-1101-{}.dat", std::process::id()));
+        std::fs::write(
+            &path,
+            "I\n1000 Version\n\n\
+             1 52 0 0 LEMG Malaga\n\
+             100 45.00 1 0 0.25 0 2 1 13 36.6738 -4.4992 0 0 2 0 0 0 31 36.6624 -4.4827 0 0 2 0 0 0\n\
+             1302 allows_circuits 0\n\
+             1302 transition_level 7000\n\
+             1000 12/13 Rwy ATC Flow\n\
+             1101 13 left\n\
+             1110 13 121025 departures heavy|jets 000000 000000\n\
+             1000 Rwy 31 ATC Flow\n\
+             1101 31 left\n\
+             1101 13 left\n\
+             1101 9 right\n\
+             1101 09 left\n\
+             1 11 0 0 LXGB Gibraltar\n\
+             1302 allows_circuits 1\n\
+             1101 09 left\n",
+        )
+        .unwrap();
+        let p = path.to_str().unwrap();
+        let lemg = find_airport(p, "LEMG").unwrap().unwrap();
+        assert_eq!(lemg.allows_circuits, Some(false));
+        assert_eq!(lemg.transition_level_ft, Some(7000.0));
+        assert_eq!(lemg.pattern_left("13"), Some(true));
+        assert_eq!(lemg.pattern_left("31"), Some(true));
+        assert_eq!(lemg.pattern_left("09"), None, "the flows disagree");
+        assert_eq!(lemg.pattern_left("12"), None, "unpublished");
+        assert_eq!(lemg.freqs.len(), 0, "no row read as a frequency");
+        let mut seen = Vec::new();
+        scan_airports(p, |icao, a| {
+            seen.push((icao.to_string(), a.allows_circuits, a.pattern_left("09")))
+        })
+        .unwrap();
+        assert_eq!(
+            seen,
+            vec![
+                ("LEMG".to_string(), Some(false), None),
+                ("LXGB".to_string(), Some(true), Some(true)),
+            ]
+        );
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(parse_allows_circuits("1"), Some(true));
+        assert_eq!(parse_allows_circuits("yes"), None);
+        assert!(same_runway_end("09", "9") && same_runway_end("08r", "08R"));
+        assert!(!same_runway_end("08R", "08L"));
+    }
+
+    /// The real LEMG and EGKK: no circuits, 13/31 and 08R/26L left.
+    /// `cargo test -p atc -- --ignored real_install_circuits_flags`
+    #[test]
+    #[ignore] // needs the real X-Plane install; run with --ignored
+    fn real_install_circuits_flags() {
+        let apt =
+            &crate::nav::test_xplane_path("Global Scenery/Global Airports/Earth nav data/apt.dat");
+        if !std::path::Path::new(apt).exists() {
+            return;
+        }
+        let lemg = find_airport(apt, "LEMG").unwrap().expect("LEMG");
+        assert_eq!(lemg.allows_circuits, Some(false));
+        assert_eq!(lemg.pattern_left("13"), Some(true));
+        assert_eq!(lemg.pattern_left("31"), Some(true));
+        let egkk = find_airport(apt, "EGKK").unwrap().expect("EGKK");
+        assert_eq!(egkk.allows_circuits, Some(false));
+        assert_eq!(egkk.pattern_left("26L"), Some(true));
     }
 
     #[test]

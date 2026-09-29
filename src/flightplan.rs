@@ -1310,6 +1310,8 @@ mod tests {
         fp.waypoints[1].lon = 0.0;
         let airport = nav::AirportInfo {
             transition_level_ft: None,
+            allows_circuits: None,
+            pattern_sides: Vec::new(),
             name: "Flat field".into(),
             elev_ft: 0.0,
             freqs: vec![],
@@ -1492,6 +1494,8 @@ mod tests {
                 surface: 1,
             }],
             transition_level_ft: None,
+            allows_circuits: None,
+            pattern_sides: Vec::new(),
         }
     }
 

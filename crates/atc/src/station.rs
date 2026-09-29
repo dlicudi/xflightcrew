@@ -808,10 +808,7 @@ impl Station {
             && self.circuits
         {
             circuit_ctx = tower::Ctx {
-                circuit: Some(tower::CircuitOffer {
-                    height_ft: tower::circuit_height_ft(self.apt.elev_ft),
-                    faa: self.dialect == Dialect::Faa,
-                }),
+                circuit: Some(self.circuit_offer(&ctx.runway)),
                 ..ctx.clone()
             };
             &circuit_ctx
@@ -1502,6 +1499,34 @@ impl Station {
             faa: self.dialect == Dialect::Faa,
             departure_freq: self.departure_khz.or(self.approach_khz).map(atis::spoken_mhz),
         })
+    }
+
+    /// The circuit clearance's facts (#182): the height, the dialect, the
+    /// runway's published side (apt.dat `1101`, found by its spoken
+    /// designator) and whether the field's data allows circuits (`1302
+    /// allows_circuits`; LEMG says 0, blackbox `atc` `circuits_not_allowed`).
+    fn circuit_offer(&self, spoken_runway: &str) -> tower::CircuitOffer {
+        let left = self
+            .apt
+            .runways
+            .iter()
+            .flat_map(|r| [&r.ident_a, &r.ident_b])
+            .find(|id| atis::spoken_runway(id) == spoken_runway)
+            .and_then(|id| self.apt.pattern_left(id));
+        let not_available = self.apt.allows_circuits == Some(false);
+        if not_available {
+            sim::blackbox::record(
+                "atc",
+                serde_json::json!({"event": "circuits_not_allowed", "field": self.apt.name,
+                                   "runway": spoken_runway}),
+            );
+        }
+        tower::CircuitOffer {
+            height_ft: tower::circuit_height_ft(self.apt.elev_ft),
+            faa: self.dialect == Dialect::Faa,
+            left,
+            not_available,
+        }
     }
 
     /// Issue this flight its discrete code (idempotent — the same flight
@@ -12437,6 +12462,8 @@ mod tests {
         Station {
             apt: nav::AirportInfo {
                 transition_level_ft: None,
+                allows_circuits: None,
+                pattern_sides: Vec::new(),
                 name: "Gibraltar".into(),
                 elev_ft: 11.0,
                 runways: Vec::new(),
@@ -12617,6 +12644,8 @@ mod tests {
             icao: name.get(0..4).unwrap_or("XXXX").to_uppercase(),
             apt: nav::AirportInfo {
                 transition_level_ft: None,
+                allows_circuits: None,
+                pattern_sides: Vec::new(),
                 name: name.into(),
                 elev_ft: 0.0,
                 runways: Vec::new(),
@@ -12999,6 +13028,8 @@ mod tests {
         // typed as "1054 130125 unnamed entity" — a frequency, not a tower.
         let apt = nav::AirportInfo {
             transition_level_ft: None,
+            allows_circuits: None,
+            pattern_sides: Vec::new(),
             name: "Merida - Royanejos".into(),
             elev_ft: 883.0,
             runways: Vec::new(),
@@ -13012,6 +13043,8 @@ mod tests {
         // A real tower row (Badajoz: "TWR CIVIL") stays staffed.
         let apt = nav::AirportInfo {
             transition_level_ft: None,
+            allows_circuits: None,
+            pattern_sides: Vec::new(),
             name: "Badajoz- Talavera La Real".into(),
             elev_ft: 607.0,
             runways: Vec::new(),
@@ -16211,6 +16244,49 @@ mod tests {
     /// feet". Circuit traffic gets the circuit clearance in the field's
     /// dialect (runway, height, pressure, code, report ready), and the crew's
     /// readback of it, the owed line as the crew transmits it, is silence.
+    /// #182: the field's own data (apt.dat `1302 allows_circuits 0`, the
+    /// runway's `1101` side) reaches the circuit clearance: the tower says a
+    /// field without circuits first, names the published side, and the
+    /// crew's readback of it is still silence.
+    #[test]
+    fn a_circuit_clearance_carries_the_fields_circuit_data() {
+        let _guard = SIDE_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let path = lxgb_apt_file();
+        let wx = Wx {
+            wind_from_deg: 250.0,
+            wind_kts: 12.0,
+        };
+        *SQUAWK_WATCH.lock().unwrap() = None;
+        *CLEARANCE.lock().unwrap() = None;
+        let mut st = Station::load(path.to_str().unwrap(), "LXGB").expect("LXGB loads");
+        st.apt.allows_circuits = Some(false);
+        st.apt.pattern_sides = vec![("27".into(), Some(false))];
+        let ctx = scripted_ctx(&mut st, wx);
+        let r = st.route_keyed(
+            "november one seven two sierra papa, request clearance, runway two seven, \
+             for circuits",
+            Service::Tower,
+            &ctx,
+            wx,
+        );
+        assert!(
+            r.contains("circuits are not normally available at Gibraltar, runway two seven, \
+                        right hand circuit, circuit height"),
+            "{r}"
+        );
+        let owed = crate::party_line::readback_owed().expect("readback suggested");
+        assert!(owed.contains("right hand circuit"), "{owed}");
+        let r = st.route_keyed(owed.trim_end_matches('.'), Service::Tower, &ctx, wx);
+        assert_eq!(r, "", "the readback is accepted");
+        // Silent data: the clearance as before.
+        let offer = st.circuit_offer("two seven");
+        st.apt.allows_circuits = None;
+        st.apt.pattern_sides.clear();
+        assert!(offer.not_available && offer.left == Some(false));
+        let offer = st.circuit_offer("two seven");
+        assert!(!offer.not_available && offer.left.is_none());
+    }
+
     #[test]
     fn a_circuit_zone_request_is_cleared_for_the_circuit() {
         let _guard = SIDE_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -16796,6 +16872,8 @@ mod tests {
             icao: "EGPH".into(),
             apt: nav::AirportInfo {
                 transition_level_ft: None,
+                allows_circuits: None,
+                pattern_sides: Vec::new(),
                 name: "Edinburgh".into(),
                 elev_ft: 136.0,
                 runways: Vec::new(),

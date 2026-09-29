@@ -2485,6 +2485,8 @@ mod tests {
     fn no_helipad_lands_on_the_runway_near_the_arrival() {
         let apt = crate::nav::AirportInfo {
             transition_level_ft: None,
+            allows_circuits: None,
+            pattern_sides: Vec::new(),
             name: "Alzate Brianza".into(),
             elev_ft: 1_258.0,
             runways: vec![crate::nav::Runway {

@@ -4012,6 +4012,42 @@ pub fn descent_shape_line(shape: DescentShape, field_elev_ft: f64) -> String {
     format!("High ground under the approach, {}.", parts.join(", then "))
 }
 
+/// The side the circuit asks the terrain pick for (#182): the runway's
+/// published pattern side (apt.dat `1101`; LEMG 13 and 31 left) over the
+/// one asked for, which only a runway without one keeps. Terrain and
+/// airspace still veto it in [`choose_pattern`], and say so. Pure.
+pub fn pattern_side_wanted(asked_left: bool, published_left: Option<bool>) -> bool {
+    published_left.unwrap_or(asked_left)
+}
+
+/// What the crew says about the field's circuit data before the takeoff
+/// (#182): a published side that is not the one asked for, and a field
+/// whose data says no circuits (`1302 allows_circuits 0`; LEMG, EGKK),
+/// flown as asked. `None` when there is nothing to say. No dashes. Pure.
+pub fn field_circuit_line(
+    field: &str,
+    runway: &str,
+    asked_left: bool,
+    published_left: Option<bool>,
+    allows_circuits: Option<bool>,
+) -> Option<String> {
+    let mut parts = Vec::new();
+    if allows_circuits == Some(false) {
+        parts.push(format!(
+            "The airport data says no circuits at {field}, flying this one as asked."
+        ));
+    }
+    if let Some(left) = published_left.filter(|l| *l != asked_left) {
+        parts.push(format!(
+            "Runway {} has a published {} hand circuit, flying it {}.",
+            spell_runway(runway),
+            if left { "left" } else { "right" },
+            if left { "left" } else { "right" },
+        ));
+    }
+    (!parts.is_empty()).then(|| parts.join(" "))
+}
+
 /// Bail out cleanly: clear our flag and let whatever sub-loop is flying stand
 /// down. Never leaves the aircraft with nobody watching the loop.
 fn stand_down(voice: &Option<Voice>, line: &str, reason: &'static str) {
@@ -4056,6 +4092,20 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, p: Params
     let rwy_id = rwy.id.clone();
     let callsign = crew_callsign(&xp).await;
     let field_elev_ft = rwy.elev_ft;
+    // The field's own circuit data (#182): apt.dat's `1302 allows_circuits`
+    // and the runway's `1101` pattern side. LEMG says no circuits and 13
+    // left, and the 737 has flown circuits there nightly on whatever side
+    // the terrain picked.
+    let field = {
+        let (path, icao) = (p.apt_dat.clone(), rwy.icao.clone());
+        tokio::task::spawn_blocking(move || crate::nav::find_airport(&path, &icao).ok().flatten())
+            .await
+            .ok()
+            .flatten()
+    };
+    let published_left = field.as_ref().and_then(|a| a.pattern_left(&rwy.id));
+    let allows_circuits = field.as_ref().and_then(|a| a.allows_circuits);
+    let want_left = pattern_side_wanted(p.left_pattern, published_left);
 
     // Geometry scaled to the AP's real turn radius at pattern speed (~Vy plus
     // a bit) — fixed constants smaller than the turn diameter degenerated the
@@ -4116,7 +4166,7 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, p: Params
     };
     let (mut l_facts, mut r_facts) = probe(geom).await;
     let mut pick = choose_pattern(
-        p.left_pattern,
+        want_left,
         &l_facts,
         &r_facts,
         field_elev_ft,
@@ -4134,7 +4184,7 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, p: Params
                 ..geom
             };
             let (l, r) = probe(g).await;
-            let again = choose_pattern(p.left_pattern, &l, &r, field_elev_ft, p.tpa_agl_ft);
+            let again = choose_pattern(want_left, &l, &r, field_elev_ft, p.tpa_agl_ft);
             crate::blackbox::record(
                 "circuit",
                 serde_json::json!({"event": "downwind_shortened", "downwind_past_m": dn,
@@ -4203,6 +4253,8 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, p: Params
             "airspaces_near": spaces.len(),
             "radius_m": geom.final_capture_m, "width_m": geom.width_m,
             "downwind_past_m": geom.downwind_past_m,
+            "asked_left": p.left_pattern, "published_left": published_left,
+            "allows_circuits": allows_circuits,
         }),
     );
     // Never flown into the ground (#182): refused on the runway, with the
@@ -4248,12 +4300,12 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, p: Params
             Priority::Caution,
             &format!(
                 "Terrain on the {} side, flying a {}-hand circuit instead.",
-                side_word(p.left_pattern),
+                side_word(want_left),
                 side_word(left)
             ),
         ),
         "switched_side_for_airspace" => {
-            let name = if p.left_pattern {
+            let name = if want_left {
                 &l_facts.airspace
             } else {
                 &r_facts.airspace
@@ -4263,7 +4315,7 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, p: Params
                 Priority::Caution,
                 &format!(
                     "The {} side runs into {}, flying a {}-hand circuit instead.",
-                    side_word(p.left_pattern),
+                    side_word(want_left),
                     name.as_deref().unwrap_or("restricted airspace"),
                     side_word(left)
                 ),
@@ -4291,6 +4343,17 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, p: Params
             );
         }
         _ => {}
+    }
+    // The field's data, said before the takeoff (#182). Not at the Rock,
+    // whose side is the sea's.
+    if let Some(line) = field
+        .as_ref()
+        .filter(|_| !lxgb)
+        .and_then(|a| {
+            field_circuit_line(&a.name, &rwy.id, p.left_pattern, published_left, allows_circuits)
+        })
+    {
+        alert(&voice, Priority::Advisory, &line);
     }
     if !lxgb && descent_shape != DescentShape::default() {
         alert(
@@ -9011,5 +9074,59 @@ mod terrain_hold_tests {
                 .map(|t| t.why()),
             Some("servos_off")
         );
+    }
+}
+
+/// #182 layer 1: the field's own circuit data. LEMG's apt.dat (2026-09-29)
+/// says `1302 allows_circuits 0` and `1101 13 left`, `1101 31 left`.
+#[cfg(test)]
+mod field_circuit_tests {
+    use super::*;
+
+    /// The published side is the side asked of the terrain pick; a runway
+    /// without one keeps the pilot's.
+    #[test]
+    fn the_published_side_is_asked_of_the_terrain_pick() {
+        assert!(pattern_side_wanted(false, Some(true)), "LEMG 13 left");
+        assert!(!pattern_side_wanted(true, Some(false)));
+        assert!(!pattern_side_wanted(false, None), "unpublished: as asked");
+        assert!(pattern_side_wanted(true, None));
+    }
+
+    /// ...and terrain still vetoes it, said as a switch: the published left
+    /// over 1,400 ft of ridge flies right (the Rock's numbers, LXGB).
+    #[test]
+    fn terrain_still_vetoes_the_published_side() {
+        let facts = |t: f64| SideFacts {
+            terrain_max_ft: Some(t),
+            ..Default::default()
+        };
+        let want = pattern_side_wanted(false, Some(true));
+        let pick = choose_pattern(want, &facts(1400.0), &facts(11.0), 11.0, 1000.0);
+        assert!(pick.refused.is_none());
+        assert!(!pick.left);
+        assert_eq!(pick.why, "switched_side_for_terrain");
+        let pick = choose_pattern(want, &facts(11.0), &facts(5.0), 11.0, 1000.0);
+        assert!(pick.left, "both clear: the published side stands");
+    }
+
+    /// Said once before the takeoff: a field without circuits, flown as
+    /// asked, and a published side other than the one asked for.
+    #[test]
+    fn the_field_data_is_said_before_the_takeoff() {
+        let line = field_circuit_line("Malaga", "31", false, Some(true), Some(false)).unwrap();
+        assert_eq!(
+            line,
+            "The airport data says no circuits at Malaga, flying this one as asked. Runway \
+             three one has a published left hand circuit, flying it left."
+        );
+        assert!(!line.contains('-') && !line.contains('\u{2014}'));
+        assert_eq!(
+            field_circuit_line("Malaga", "13", true, Some(true), Some(true)),
+            None
+        );
+        assert_eq!(field_circuit_line("Malaga", "13", true, None, None), None);
+        let line = field_circuit_line("Gatwick", "26L", true, Some(true), Some(false)).unwrap();
+        assert!(!line.contains("published"), "{line}");
     }
 }
