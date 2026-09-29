@@ -1,0 +1,38 @@
+# iMac verify batch for the fixes merged 2026-09-29 (build after 54a2402).
+after: stop
+cases:
+  # #166: the SR22's rollout split trim; rollout btrim, err, xtk_m.
+  - name: "SR22 LEMG 13, 10 nm final (#166)"
+    setup:
+      aircraft: "Aircraft/Laminar Research/Cirrus SR22/Cirrus SR22.acf"
+      approach: { field: LEMG, runway: 13, final_nm: 10 }
+    traffic: off
+
+  # #184: rotate_rate 5 and the faded standing rudder; roll steer/trim/err,
+  # rotate to liftoff ias; then the circuit's landing (#166 again). #182:
+  # atc circuits_not_allowed, circuit armed published_left.
+  - name: "SR22 LEMG runway start 13, circuit (#184 #182 #166)"
+    setup:
+      aircraft: "Aircraft/Laminar Research/Cirrus SR22/Cirrus SR22.acf"
+      runway_start: { field: LEMG, runway: 13, engines_running: true }
+    command: fly a circuit
+    traffic: off
+    deadline_min: 30
+
+  # #169 and #185 on the A330, from 30 (13's circuit is refused for terrain).
+  - name: "A330 LEMG runway start 30, circuit (#169)"
+    setup:
+      aircraft: "Aircraft/Laminar Research/Airbus A330-300/A330.acf"
+      runway_start: { field: LEMG, runway: 30, engines_running: true }
+    command: fly a circuit
+    traffic: off
+    deadline_min: 30
+
+  # #78, #123, #31 on the 737 from 30.
+  - name: "737 LEMG runway start 30, circuit (#78 #123 #31)"
+    setup:
+      aircraft: "Aircraft/Laminar Research/Boeing 737-800/b738.acf"
+      runway_start: { field: LEMG, runway: 30, engines_running: true }
+    command: fly a circuit
+    traffic: off
+    deadline_min: 30
