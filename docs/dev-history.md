@@ -10870,3 +10870,32 @@ speed past 73 kt (0.50 at 45 to 75 kt with a 3 kt crosswind, about 0.2 at 90) wh
 and the trim 0.14, at kp 1/31 per degree. `roll_rudder:` gains `power_steer_to_kts` (the lead falls
 as (to/v)^2 past it), `close_per_s` and `trim_per_s`; the SR22 declares 73, 1.5 and 0.45. Replayed:
 2.1 m to wheels-off (flown 9.5), the first roll 1.0 m (flown 9.8). Offline only.
+
+## 2026-09-29: SAFETY, the Rock refused in the air is a hold, never "your aircraft" (#182)
+
+Review of 528b7d1 (merged f7580d4): at LXGB the rectangle's `refused` was known on the runway, but
+the authored Rock route was only judged after the takeoff, so with both refused the circuit stood
+down IN THE AIR, at the takeoff's handoff height, with "The Rock circuit isn't clear from here ...
+Your aircraft." An airborne aircraft handed to nobody under an unattended mission (the #181 rule).
+
+- **Judged on the runway first.** Where the rectangle is refused at LXGB, the authored route is
+  checked before the takeoff (`check_authored_route`: `leg_terrain_ft` + `raise_for_terrain`, the
+  same legs fixed to the runway); refused both ways it is a plain refusal on the runway (`circuit`
+  `authored_route_unsafe` `on: runway`, `stand_down` `terrain_refused`).
+- **Refused in the air, a hold** (the probe answering otherwise after the takeoff): the reversal's
+  `TerrainHold` (moved from autoland to `reversal.rs`, one type for both) through
+  `circuit::hold_clear_of_terrain`: climb straight ahead on the autopilot to 1,000 ft over the
+  highest ground under and 12 nm ahead (`reversal::hold_altitude_ahead_ft`, the probe autoland's
+  refusal already made; the corridors' and the route legs' highest stands in unanswered), never
+  under the aircraft or the pattern; the altitude dial on it, the governor on
+  `hand_back_speed_kts`, said with the numbers ("... Climbing straight ahead to 2400 feet and
+  holding it."); handed over only after 8 ticks level there ("Level at N feet, straight ahead, the
+  autopilot holding heading and altitude. Your aircraft."). The circuit's `PatternGuard` still
+  gives it back loudly (servos out; a climb not there in its time at 300 fpm plus a minute) through
+  `give_up_pattern`, the recovery when slow or upset. Full auto sees `terrain_refused`.
+
+Blackbox: `circuit` `authored_route_unsafe` (`on`), `terrain_hold` (`hold_ft`, `ahead_ft`,
+`corridor_max_ft`, `alt`, `hdg_true`, `hold_kts`, `why`), `terrain_hold_tick` every 5 s,
+`terrain_hold_level` or `terrain_hold_given_back`, then `stand_down`. Tests `terrain_hold_tests`
+(the Rock's 1,398 ft, the 1,098 ft ridge entered at 1,130 on 2026-09-15, the 1,650 ft pattern).
+Offline only.

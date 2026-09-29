@@ -2252,6 +2252,212 @@ async fn give_up_pattern(
     crate::tools::speedhold::arm_flight(base_url.to_string(), voice.clone(), hold_kts);
 }
 
+/// The climb rate a terrain hold's give-up clock credits, feet per minute:
+/// a laden light single's, so the clock never runs out on a climb that is
+/// going.
+const TERRAIN_HOLD_CREDIT_FPM: f64 = 300.0;
+
+/// How long a terrain hold's climb may take before the circuit's guard
+/// ([`PatternGuard`]) gives it back: the climb at
+/// [`TERRAIN_HOLD_CREDIT_FPM`] plus [`LEG_TIME_MARGIN_S`]. Pure.
+pub fn terrain_hold_limit_s(alt_ft: f64, hold_ft: f64) -> f64 {
+    let climb = if alt_ft.is_finite() && hold_ft.is_finite() {
+        (hold_ft - alt_ft).max(0.0)
+    } else {
+        0.0
+    };
+    climb / TERRAIN_HOLD_CREDIT_FPM * 60.0 + LEG_TIME_MARGIN_S
+}
+
+/// The spoken airborne refusal (#182): the reason with its numbers, then
+/// what the autopilot is doing about it. No dashes (TTS). Pure.
+pub fn terrain_hold_line(why: &str, hold_ft: f64) -> String {
+    format!("{why} Climbing straight ahead to {hold_ft:.0} feet and holding it.")
+}
+
+/// ...and the hand-over once level there: autoland's words. Pure.
+pub fn terrain_hold_level_line(hold_ft: f64) -> String {
+    format!(
+        "Level at {hold_ft:.0} feet, straight ahead, the autopilot holding heading and \
+         altitude. Your aircraft."
+    )
+}
+
+/// Airborne and no circuit clears the ground (#182; LXGB, the Rock route
+/// and the rectangle both refused after the takeoff): the reversal's
+/// refusal ([`crate::reversal::TerrainHold`]), never "your aircraft" low
+/// over the hills. Climb straight ahead on the autopilot to 1,000 ft over
+/// the highest ground under and 12 nm ahead
+/// ([`crate::reversal::hold_altitude_ahead_ft`], the corridors' highest
+/// standing in for an unanswered probe), the altitude dial on it and the
+/// governor on the configuration's speed, said with the numbers; handed
+/// over only once level there. The circuit's guard still gives it back
+/// loudly (servos out, a climb that never ends), through the recovery
+/// when slow or upset.
+#[allow(clippy::too_many_arguments)]
+async fn hold_clear_of_terrain(
+    xp: &XPlaneClient,
+    base_url: &str,
+    voice: &Option<Voice>,
+    why: &str,
+    corridor_max_ft: Option<f64>,
+    default_platform_ft: f64,
+    fallback_hdg_true: f64,
+    mag_var: f64,
+    hold_kts: f64,
+    floor_kts: Option<f64>,
+) {
+    let (pos, hpath_r) = tokio::join!(sim::position::read(xp), xp.get_float(HPATH));
+    let (lat, lon) = sim::position::lat_lon(&pos);
+    let alt_ft = sim::position::field(&pos, |p| p.elev_m)
+        .map(|m| m * M_TO_FT)
+        .unwrap_or(f64::NAN);
+    let psi = sim::position::field(&pos, |p| p.psi_true_deg)
+        .ok()
+        .filter(|v| v.is_finite());
+    let track = hpath_r.ok().filter(|v| v.is_finite()).or(psi);
+    let hdg_true = psi.unwrap_or(fallback_hdg_true);
+    let (ahead_ft, hold_ft) = match (lat, lon) {
+        (Ok(lat), Ok(lon)) => {
+            crate::reversal::hold_altitude_ahead_ft(
+                xp,
+                (lat, lon, track.unwrap_or(hdg_true), alt_ft),
+                corridor_max_ft,
+                default_platform_ft,
+            )
+            .await
+        }
+        _ => (
+            None,
+            crate::reversal::hold_altitude_ft(None, corridor_max_ft, alt_ft, default_platform_ft),
+        ),
+    };
+    let mut hold = crate::reversal::TerrainHold::refused(hdg_true, hold_ft);
+    crate::blackbox::record(
+        "circuit",
+        serde_json::json!({
+            "event": "terrain_hold", "hold_ft": hold_ft, "ahead_ft": ahead_ft,
+            "corridor_max_ft": corridor_max_ft, "alt": alt_ft, "hdg_true": hdg_true,
+            "hold_kts": hold_kts, "why": why,
+        }),
+    );
+    alert(voice, Priority::Warning, &terrain_hold_line(why, hold_ft));
+    // The autopilot's own capture holds the level: the dial on the hold.
+    let bug_mag = true_to_mag(hdg_true, mag_var).rem_euclid(360.0);
+    if xp.get_float(SERVOS_ON).await.is_ok_and(|v| v < 0.5) {
+        let _ = xp.run_command(CMD_SERVOS_ON).await;
+    }
+    let _ = xp.set_float(ALT_DIAL, hold_ft).await;
+    write_bug(xp, bug_mag).await;
+    crate::tools::speedhold::arm_flight(base_url.to_string(), voice.clone(), hold_kts);
+    let limit_s = terrain_hold_limit_s(alt_ft, hold_ft);
+    let mut guard = PatternGuard::default();
+    let t0 = std::time::Instant::now();
+    let mut last_vs: Option<f64> = None;
+    let mut tick: u32 = 0;
+    loop {
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        if ABORT.load(Ordering::SeqCst) {
+            stand_down(voice, "Circuit cancelled. Your aircraft.", "abort_terrain_hold");
+            return;
+        }
+        if crate::xplane::sim_frozen(xp).await {
+            continue;
+        }
+        let (pos, ias_r, servos_r, hdg_st, vs_st) = tokio::join!(
+            sim::position::read(xp),
+            xp.get_float(IAS),
+            xp.get_float(SERVOS_ON),
+            xp.get_float(HDG_STATUS),
+            xp.get_float(VS_STATUS),
+        );
+        // A failed read is no measurement: the tick is skipped.
+        let Some(alt) = sim::position::field(&pos, |p| p.elev_m)
+            .ok()
+            .map(|m| m * M_TO_FT)
+            .filter(|v| v.is_finite())
+        else {
+            continue;
+        };
+        tick += 1;
+        if hold.level_now(alt) {
+            let _ = xp.set_float(VS_DIAL, 0.0).await;
+            crate::blackbox::record(
+                "circuit",
+                serde_json::json!({"event": "terrain_hold_level", "hold_ft": hold.alt_ft,
+                                   "alt": alt, "secs": t0.elapsed().as_secs_f64()}),
+            );
+            stand_down(voice, &terrain_hold_level_line(hold.alt_ft), TERRAIN_REFUSED);
+            return;
+        }
+        let servos = servos_r
+            .as_ref()
+            .ok()
+            .filter(|v| v.is_finite())
+            .map(|v| *v > 0.5);
+        if let Some(trip) = guard.step(
+            t0.elapsed().as_secs_f64(),
+            Leg::Upwind,
+            alt,
+            hold.alt_ft,
+            limit_s,
+            servos,
+        ) {
+            crate::blackbox::record(
+                "circuit",
+                serde_json::json!({"event": "terrain_hold_given_back", "why": trip.why(),
+                                   "hold_ft": hold.alt_ft, "alt": alt}),
+            );
+            *STOOD_DOWN.lock().unwrap_or_else(|e| e.into_inner()) = Some(TERRAIN_REFUSED);
+            give_up_pattern(
+                xp,
+                base_url,
+                voice,
+                trip,
+                Leg::Upwind,
+                alt,
+                hold.alt_ft,
+                mag_var,
+                hold_kts,
+                floor_kts,
+            )
+            .await;
+            return;
+        }
+        // Modes re-engaged only when their status reads off, the dial
+        // rewritten after (an engage syncs it away). The capture at the
+        // hold is ALT HOLD, not a dropped VS mode.
+        if hdg_st.is_ok_and(|v| v <= 0.5) {
+            let _ = xp.run_command(CMD_HDG_MODE).await;
+            write_bug(xp, bug_mag).await;
+        }
+        if vs_st.is_ok_and(|v| v <= 0.5) && hold.alt_ft - alt > crate::reversal::HOLD_LEVEL_FT {
+            let _ = xp.run_command(CMD_VS_MODE).await;
+            last_vs = None;
+        }
+        let ias = ias_r.ok().filter(|v| v.is_finite());
+        let slow = matches!((ias, floor_kts), (Some(i), Some(f)) if i < f);
+        let vs = crate::reversal::platform_vs_fpm(
+            hold.alt_ft,
+            alt,
+            slow,
+            crate::autoland::max_climb_fpm(),
+            crate::procedure::descent_fpm(),
+        );
+        if last_vs.is_none_or(|v| (v - vs).abs() >= 10.0) {
+            let _ = xp.set_float(VS_DIAL, vs).await;
+            last_vs = Some(vs);
+        }
+        if tick % 10 == 1 {
+            crate::blackbox::record(
+                "circuit",
+                serde_json::json!({"event": "terrain_hold_tick", "alt": alt, "hold_ft": hold.alt_ft,
+                                   "vs_cmd": vs, "ias": ias, "slow": slow, "servos": servos}),
+            );
+        }
+    }
+}
+
 /// The next leg in sequence, or `None` past Final.
 pub fn next_leg(leg: Leg) -> Option<Leg> {
     match leg {
@@ -3376,6 +3582,35 @@ fn raise_for_terrain(
     Ok((raised, tpa_needed))
 }
 
+/// The authored route checked over its legs' ground ([`leg_terrain_ft`],
+/// [`raise_for_terrain`]): the ground per leg and the route to fly at its
+/// pattern altitude, or why not. The same answer on the runway and in the
+/// air (the route is fixed to the runway, not to the aircraft).
+async fn check_authored_route(
+    xp: &XPlaneClient,
+    rwy: &crate::autoland::Runway,
+    route: &[AuthoredWpt],
+    tpa_msl_ft: f64,
+    field_elev_ft: f64,
+    pattern_kts: f64,
+) -> (Vec<Option<f64>>, Result<(Vec<AuthoredWpt>, f64), String>) {
+    let leg_max = leg_terrain_ft(xp, rwy, route).await;
+    let verdict = raise_for_terrain(
+        route,
+        tpa_msl_ft,
+        &leg_max,
+        field_elev_ft,
+        authored_climb_gradient(pattern_kts),
+    );
+    (leg_max, verdict)
+}
+
+/// The Rock refused both ways (#182): the spoken line, the rectangle's
+/// numbers in it. Pure.
+pub fn rock_refused_line(rectangle_line: &str) -> String {
+    format!("The Rock circuit isn't clear from here. {rectangle_line}")
+}
+
 /// Height above the field at which the authored circuit switches the landing
 /// and taxi lights off (the rectangle and full auto's flight do it through
 /// the same `lights::after_climb`).
@@ -3977,6 +4212,35 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, p: Params
         stand_down(&voice, &format!("{line} Your aircraft."), TERRAIN_REFUSED);
         return;
     }
+    // ...and at the Rock, where the rectangle is refused, the authored route
+    // is judged HERE too, on the runway, before anything flies: its legs are
+    // fixed to the runway, so the answer after the takeoff is the same one.
+    // Refused both ways in the air, the circuit handed an airborne aircraft
+    // to nobody with "Your aircraft" (#182 review of 528b7d1, 2026-09-29).
+    if let (Some(line), true) = (refused.as_deref(), lxgb) {
+        let route = authored_circuit(&rwy, &geom, field_elev_ft, tpa_msl_ft, left);
+        let why = match &route {
+            Some(route) => {
+                check_authored_route(&xp, &rwy, route, tpa_msl_ft, field_elev_ft, pattern_kts)
+                    .await
+                    .1
+                    .err()
+            }
+            None => Some("no authored route".to_string()),
+        };
+        if let Some(why) = why {
+            crate::blackbox::record(
+                "circuit",
+                serde_json::json!({"event": "authored_route_unsafe", "why": why, "on": "runway"}),
+            );
+            stand_down(
+                &voice,
+                &format!("{} Your aircraft.", rock_refused_line(line)),
+                TERRAIN_REFUSED,
+            );
+            return;
+        }
+    }
     let side_word = |l: bool| if l { "left" } else { "right" };
     match side_pick {
         "switched_side_for_terrain" => alert(
@@ -4140,19 +4404,15 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, p: Params
         // the ridge 523 ft up (2026-09-14). Terrain under a pattern-altitude
         // leg raises the pattern altitude; terrain under a descending leg,
         // or a raise past MAX_TERRAIN_RAISE_FT, refuses the route.
-        let leg_max = leg_terrain_ft(&xp, &rwy, &route).await;
-        let authored = match raise_for_terrain(
-            &route,
-            tpa_msl_ft,
-            &leg_max,
-            field_elev_ft,
-            authored_climb_gradient(pattern_kts),
-        ) {
+        let (leg_max, verdict) =
+            check_authored_route(&xp, &rwy, &route, tpa_msl_ft, field_elev_ft, pattern_kts).await;
+        let authored = match verdict {
             Ok(v) => Some(v),
             Err(why) => {
                 crate::blackbox::record(
                     "circuit",
-                    serde_json::json!({"event": "authored_route_unsafe", "why": why}),
+                    serde_json::json!({"event": "authored_route_unsafe", "why": why,
+                                       "on": "airborne"}),
                 );
                 None
             }
@@ -4205,13 +4465,36 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, p: Params
             return;
         }
         // ...and the standard pattern is flown only where it clears the
-        // ground itself (#182).
+        // ground itself (#182). Refused both ways in the AIR (the runway's
+        // judgement passed, the probe answered otherwise after the takeoff):
+        // never "your aircraft" at the handoff height, the reversal's hold
+        // instead, climbing clear of the ground ahead on the autopilot.
         if let Some(line) = refused.as_deref() {
-            stand_down(
-                &voice,
-                &format!("The Rock circuit isn't clear from here. {line} Your aircraft."),
-                TERRAIN_REFUSED,
+            let corridor = [l_facts.terrain_max_ft, r_facts.terrain_max_ft]
+                .into_iter()
+                .chain(leg_max.iter().copied())
+                .flatten()
+                .reduce(f64::max);
+            let mag_var = xp.get_float(MAG_VAR).await.unwrap_or(0.0);
+            let hold_kts = crate::autoland::hand_back_speed_kts(
+                p_approach_ias,
+                handover.flaps_left.unwrap_or(0.0),
+                &crate::aircraft::flap_limits(),
             );
+            let floor = crate::aircraft::config_floor_kts(handover.flaps_left.unwrap_or(0.0));
+            hold_clear_of_terrain(
+                &xp,
+                &base_url,
+                &voice,
+                &rock_refused_line(line),
+                corridor,
+                tpa_msl_ft,
+                rwy_course,
+                mag_var,
+                hold_kts,
+                floor,
+            )
+            .await;
             return;
         }
         alert(
@@ -8629,5 +8912,104 @@ mod readback_tests {
                        November.";
         assert!(owed_copy_stale(copy, Some(takeoff)));
         assert_eq!(readback_words(&owed), readback_words(copy));
+    }
+}
+
+/// #182 (review of 528b7d1, 2026-09-29): at LXGB the Rock route and the
+/// rectangle refused in the AIR stood the circuit down with "Your aircraft"
+/// at the takeoff's handoff height. The numbers are the Rock's: 1,398 ft of
+/// granite, the 1,098 ft ridge under 09's downwind entered at 1,130 ft in
+/// the climb (2026-09-15), the 1,650 ft pattern.
+#[cfg(test)]
+mod terrain_hold_tests {
+    use super::*;
+    use crate::reversal::{hold_altitude_ft, TerrainHold, HOLD_LEVEL_TICKS};
+
+    fn no_dashes(line: &str) {
+        assert!(
+            !line.contains('-') && !line.contains('\u{2013}') && !line.contains('\u{2014}'),
+            "{line}"
+        );
+    }
+
+    /// The refusal in the air climbs straight ahead to 1,000 ft over the
+    /// ground ahead, never lower than the aircraft or the pattern, and says
+    /// so with the numbers; the corridors' highest (the Rock) stands in
+    /// when the probe ahead does not answer. On the runway the same reason
+    /// is a plain refusal.
+    #[test]
+    fn a_rock_refusal_in_the_air_climbs_clear_and_says_the_numbers() {
+        // Ahead probed: the ridge's 1,098 plus 1,000.
+        assert_eq!(
+            hold_altitude_ft(Some(1098.0), Some(1398.0), 1130.0, 1650.0),
+            2100.0
+        );
+        // Unanswered: the Rock's 1,398 plus 1,000.
+        let hold = hold_altitude_ft(None, Some(1398.0), 1130.0, 1650.0);
+        assert_eq!(hold, 2400.0);
+        // Nothing probed at all: never under the pattern.
+        assert_eq!(hold_altitude_ft(None, None, 1130.0, 1650.0), 1700.0);
+        let why = rock_refused_line(
+            "The standard pattern here does not clear the ground: the base needs 3.9 degrees.",
+        );
+        let line = terrain_hold_line(&why, hold);
+        assert!(
+            line.starts_with("The Rock circuit isn't clear from here."),
+            "{line}"
+        );
+        assert!(
+            line.contains("Climbing straight ahead to 2400 feet"),
+            "{line}"
+        );
+        assert!(!line.contains("Your aircraft"), "{line}");
+        no_dashes(&line);
+        let level = terrain_hold_level_line(hold);
+        assert!(level.contains("2400 feet") && level.ends_with("Your aircraft."));
+        no_dashes(&level);
+    }
+
+    /// Handed over only once level at the hold (the autopilot holding it),
+    /// never in the climb from the handoff height.
+    #[test]
+    fn the_rock_hold_hands_over_only_once_level() {
+        let mut h = TerrainHold::refused(267.5, 2400.0);
+        for alt in [1130.0, 1400.0, 1800.0, 2200.0, 2290.0] {
+            assert!(!h.level_now(alt), "climbing at {alt}: still ours");
+        }
+        for _ in 0..HOLD_LEVEL_TICKS - 1 {
+            assert!(!h.level_now(2380.0));
+        }
+        assert!(h.level_now(2410.0));
+    }
+
+    /// The circuit's guard still gives the hold back loudly: a climb that
+    /// has not got there in its time (1,270 ft at 300 fpm plus a minute),
+    /// or the servos out; a failed read changes no clock.
+    #[test]
+    fn the_rock_holds_guard_gives_back_a_climb_that_never_ends() {
+        let limit = terrain_hold_limit_s(1130.0, 2400.0);
+        assert!((limit - 314.0).abs() < 0.5, "{limit}");
+        assert_eq!(terrain_hold_limit_s(f64::NAN, 2400.0), LEG_TIME_MARGIN_S);
+        let mut g = PatternGuard::default();
+        assert!(g
+            .step(0.0, Leg::Upwind, 1130.0, 2400.0, limit, Some(true))
+            .is_none());
+        assert!(g
+            .step(300.0, Leg::Upwind, 2100.0, 2400.0, limit, None)
+            .is_none());
+        assert_eq!(
+            g.step(320.0, Leg::Upwind, 2200.0, 2400.0, limit, Some(true))
+                .map(|t| t.why()),
+            Some("leg_overdue")
+        );
+        let mut g = PatternGuard::default();
+        assert!(g
+            .step(0.0, Leg::Upwind, 1130.0, 2400.0, limit, Some(false))
+            .is_none());
+        assert_eq!(
+            g.step(3.5, Leg::Upwind, 1200.0, 2400.0, limit, Some(false))
+                .map(|t| t.why()),
+            Some("servos_off")
+        );
     }
 }
