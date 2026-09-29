@@ -10524,3 +10524,36 @@ content-routed to a tuned tower) orders it too unless it comes inside 60 s of th
 `a_flying_answer_stands_and_the_tool_reads_it_back`,
 `the_gate_refuses_without_an_approach_and_after_touchdown`,
 `a_radio_going_around_is_an_order_unless_it_reads_back_the_tower`. Offline only.
+
+## 2026-09-29: the join to a final, straight or round (#64, #131, #161)
+
+#64: already fixed in 1dc4397 (autoland's clearance switch writes
+`full_auto::retarget_arrival_runway` before the new loop arms, test
+`a_clearance_switch_moves_the_arrival_runway_and_the_ils`); still unflown: the blackbox holds no
+`full_auto` `arrival_runway` with `why: clearance` yet (only arm, wind, mission_ended).
+
+#131 (LEMG, sortie 1790583663-approach): re-armed from a 10 nm final for 13 onto 12, 3.5 km beside
+its centreline, the aircraft (the setup's dive, since fixed by `climb_power_floor`) zoomed to 513 ft
+over the path at 7.6 nm, 1,566 m left, tracking 151. The flat 500 ft rule put the join point 10.8 nm
+out behind it and a reversal began, still flying at the 10 min deadline. `aims_at_join_point`: the
+join point only when the height cannot come off on the way in (`straight_in_losable`: the path law's
+catch-up for the minutes to the 1,000 ft gate, at 0.8, on a final `circuit::interceptable` from
+here); the guidance and the reversal's aim ask the same, so a pattern only when a re-intercept is
+not flyable. Test `a_retarget_to_the_near_parallel_reintercepts_its_final` (both recorded ticks).
+
+#161 (EGBB 15 from GROVE, sorties 1790635335 and 1790624015): 466 s and 429 s from GROVE to the FAF,
+established 6.7 and 6.6 nm before it where 2 was asked, handed over 400 ft over the glideslope. Four
+causes: `intercept_room_nm` charged the turn `r sin(turn)` and no closing (6.5 nm for 2.1 flown, the
+skip 4 nm late; now the turn as flown, `turn_run_close_nm`); the base turn sat a flat two radii past
+the established point (now `base_turn_along_nm`: the base turn, a 30 degree intercept off the base
+and its roll-out leave 2 nm, 0.5 slack and a 0.5 base margin); the track law set a 14 degree pursuit
+cut at the roll-out and `HeadingHold` left it 30 s, crossing the line 340 m (now the cut for the
+offset left after the turn, the lead plus 5 s of roll-in, `ROLL_LAG_S`); and after the skip the
+FAF's straight-line pacing held the descent level while the IF, joined from outside it, was still
+ahead (now `FinalJoin::skipped_if_ahead_nm` keeps the IF's altitude on the miles to it, logged
+`if_owed_nm`; the pattern's miles end at the base). Replayed on the fitted 737 from the three GROVE
+states: as flown 430, 456, 440 s (recorded 466, 429); now 342, 400, 408 s, established 2.0 to 2.4 nm
+out off a base, on the 2,500 ft platform at 208 to 214 kt. The EGKK I26L join test passes unchanged.
+Tests `the_recorded_joins_from_grove_replay_their_times`,
+`the_join_from_grove_is_shorter_and_hands_over_on_the_platform`,
+`the_intercept_room_counts_the_turn_it_flies`. Offline only.

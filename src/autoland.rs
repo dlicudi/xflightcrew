@@ -2084,7 +2084,14 @@ pub fn run_autoland_scoped(
                 // happens, so the phase change says nothing more.
                 let mut reversal_began = false;
                 if reversal.is_none() {
-                    let aim_along_nm = if alt - raw.glidepath_alt_ft > 500.0 {
+                    // The guidance's own aim: a join point behind only when
+                    // the height cannot come off on the way in (#131).
+                    let aim_along_nm = if aims_at_join_point(
+                        alt - raw.glidepath_alt_ft,
+                        along_nm,
+                        xtk_now,
+                        gs_kts,
+                    ) {
                         join_point_nm(alt, rwy.elev_ft)
                     } else {
                         FAP_NM
@@ -3853,6 +3860,43 @@ const GLIDEPATH_GAIN_MAX_MULT: f64 = 3.0;
 pub const TOUCHDOWN_AIM_NM: f64 = 300.0 / M_PER_NM;
 /// Final approach point: intercept the extended centreline this far out (nm).
 const FAP_NM: f64 = 5.0;
+/// Above the path by this much the guidance still flies the straight-in and
+/// dives onto the path; a join point behind was the only answer past it.
+const CAPTURE_ABOVE_FT: f64 = 500.0;
+/// The share of the path law's catch-up rate a straight-in is planned on.
+const STRAIGHT_IN_CATCH_UP_SHARE: f64 = 0.8;
+
+/// Can the height above the path come off on the way in, straight in? The
+/// catch-up the path law flies over its path's own sink
+/// ([`path_descent_cap_fpm`]) for the minutes to the stabilised gate, on a
+/// final the pursuit can intercept from here (`circuit::interceptable`).
+/// LEMG 12 (sortie 1790583663-approach, #131): re-armed from 13's final
+/// 3.5 km beside 12's, the aircraft was 513 ft over the path at 7.6 nm; the
+/// 500 ft rule put the join point 10.8 nm out behind it, and a ten minute
+/// reversal began where a steeper descent onto an intercept was a minute
+/// and a half. Pure.
+pub fn straight_in_losable(above_path_ft: f64, along_nm: f64, xtk_nm: f64, gs_kts: f64) -> bool {
+    let gate_nm = STABILISED_GATE_AGL_FT / gp_ft_per_nm() - TOUCHDOWN_AIM_NM;
+    let run_nm = along_nm - gate_nm;
+    if run_nm <= 0.0 || !crate::circuit::interceptable(xtk_nm * M_PER_NM, along_nm * M_PER_NM) {
+        return false;
+    }
+    let gs = gs_kts.max(60.0);
+    let nominal = -(gs / 60.0) * gp_ft_per_nm();
+    let catch_up_fpm = nominal - path_descent_cap_fpm(nominal);
+    let minutes = run_nm / gs * 60.0;
+    above_path_ft <= CAPTURE_ABOVE_FT + catch_up_fpm * minutes * STRAIGHT_IN_CATCH_UP_SHARE
+}
+
+/// Does the guidance aim at the join point (out along the centreline, behind
+/// an aircraft inside it) rather than fly the straight-in? Only when the
+/// height above the path cannot come off on the way in
+/// ([`straight_in_losable`]). The reversal's own aim asks the same, so a
+/// pattern is flown only when a re-intercept is not flyable. Pure.
+pub fn aims_at_join_point(above_path_ft: f64, along_nm: f64, xtk_nm: f64, gs_kts: f64) -> bool {
+    above_path_ft > CAPTURE_ABOVE_FT
+        && !straight_in_losable(above_path_ft, along_nm, xtk_nm, gs_kts)
+}
 /// Can a final still be made from `xtk_nm` off the centreline with `along_nm`
 /// to run — will the pursuit's steepest cut close the offset, with margin,
 /// before the threshold? The circuit asks exactly this before it hands over
@@ -6541,13 +6585,13 @@ pub fn guidance_on(
     let glidepath_alt_ft = rwy.elev_ft + (dist_nm + TOUCHDOWN_AIM_NM) * gp_ft_per_nm();
     let alt_err = cur_alt_ft - glidepath_alt_ft;
 
-    // Above this much excess, we can't just dive onto the path — fly to the JOIN
-    // point instead: where a 3° descent (with 15% margin) meets our CURRENT
-    // altitude, out along the extended centreline. When we're inside it (armed
-    // high overhead — the failure seen live: 7,000 ft at 6 nm, VS pegged, never
-    // capturing) that means flying OUTBOUND first; the point walks back toward
-    // the FAP as altitude burns off (a teardrop join).
-    const CAPTURE_ABOVE_FT: f64 = 500.0;
+    // Above what the way in can lose, we can't just dive onto the path: fly to
+    // the JOIN point instead: where a 3° descent (with 15% margin) meets our
+    // CURRENT altitude, out along the extended centreline. When we're inside it
+    // (armed high overhead, the failure seen live: 7,000 ft at 6 nm, VS pegged,
+    // never capturing) that means flying OUTBOUND first; the point walks back
+    // toward the FAP as altitude burns off (a teardrop join). See
+    // [`aims_at_join_point`] for the height a straight-in keeps.
     let join_nm = join_point_nm(cur_alt_ft, rwy.elev_ft);
 
     // Are we past the threshold, on the departure side, still airborne — by
@@ -6613,7 +6657,7 @@ pub fn guidance_on(
             ApproachPhase::Intercept,
             bearing_deg(cur_lat, cur_lon, fap_lat, fap_lon),
         )
-    } else if alt_err > CAPTURE_ABOVE_FT {
+    } else if aims_at_join_point(alt_err, along_nm, xtk, gs_kts) {
         // Too high for this distance — descend toward the join point.
         let (jlat, jlon) = project_latlon(rwy.thr_lat, rwy.thr_lon, recip, join_nm);
         (
@@ -9080,6 +9124,59 @@ mod tests {
             assert!(!g.arresting, "{dist} nm {radio} ft");
             assert!(g.target_vs_fpm > 0.0, "{dist} nm {radio} ft: {}", g.target_vs_fpm);
         }
+    }
+
+    /// #131, sortie 1790583663-approach: re-armed from a 10 nm final for 13
+    /// onto 12 (courses 131 and 117), 3.5 km beside 12's centreline, and at
+    /// 7.6 nm 1,566 m left, 513 ft over the path, tracking 151 at 204 kt,
+    /// a reversal began ("Repositioning for runway one two") that was still
+    /// flying ten minutes later. From both recorded positions the final is
+    /// re-intercepted: the guidance steers in toward the FAP, never out to a
+    /// join point behind, and no pattern is needed. Too high to lose on the
+    /// way in, or too far off to intercept, it is still a join point.
+    #[test]
+    fn a_retarget_to_the_near_parallel_reintercepts_its_final() {
+        let rwy = Runway {
+            icao: "LEMG".into(),
+            id: "12".into(),
+            thr_lat: 36.6910753,
+            thr_lon: -4.5078270,
+            course_deg: crate::nav::bearing_deg(36.6910753, -4.5078270, 36.6795648, -4.4805125),
+            length_m: 2750.0,
+            surface: 1,
+            dist_nm: 0.0,
+            elev_ft: 48.0,
+        };
+        let at = |dist: f64, xtk_m: f64| {
+            let lateral = xtk_m / M_PER_NM;
+            let along = (dist * dist - lateral * lateral).sqrt();
+            let (lat, lon) = crate::reversal::pattern_point(&rwy, along, lateral);
+            (lat, lon, along, lateral)
+        };
+        // (dist nm, xtk m, alt ft, radio ft, ias, gs, track): the retarget's
+        // first tick on 12, and the tick the reversal began.
+        for (dist, xtk_m, alt, radio, ias, gs, track) in [
+            (9.67, -3525.0, 2274.0, 1373.0, 168.0, 177.0, 132.0),
+            (7.60, -1566.0, 3030.0, 2124.0, 194.0, 204.0, 151.0),
+        ] {
+            let (lat, lon, along, lateral) = at(dist, xtk_m);
+            let g = guidance(lat, lon, alt, radio, gs, ias, &rwy, 145.0, 25.0, 0.0);
+            let above = alt - g.glidepath_alt_ft;
+            assert!(!aims_at_join_point(above, along, lateral, gs), "{dist} nm {above:.0} ft over");
+            let toward = super::heading_diff(g.target_heading_deg, rwy.course_deg);
+            assert!(toward.abs() < 45.0, "{dist} nm: steering {toward:.0} off the course");
+            let aim = FAP_NM;
+            assert!(!crate::reversal::needed(&rwy, lat, lon, track, aim, false), "{dist} nm");
+        }
+        // The rule as it was: the join point 10.8 nm out, behind at 7.6 nm.
+        let (lat, lon, _, _) = at(7.60, -1566.0);
+        let behind = join_point_nm(3030.0, rwy.elev_ft);
+        assert!(behind > 10.0 && crate::reversal::needed(&rwy, lat, lon, 151.0, behind, false));
+        // Past what the way in can lose, or beside a final no cut reaches.
+        assert!(aims_at_join_point(1_200.0, 7.5, -0.85, 204.0));
+        assert!(aims_at_join_point(600.0, 3.5, 0.0, 204.0), "inside the gate: no room");
+        assert!(aims_at_join_point(600.0, 7.5, -5.0, 204.0), "not interceptable");
+        assert!(!aims_at_join_point(450.0, 3.5, 0.0, 204.0), "within 500 ft: as before");
     }
 
     /// EGTE 2026-09-21: handed back at 152 kt with half flap and a flat 0.75
