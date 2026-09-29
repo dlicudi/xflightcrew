@@ -11230,3 +11230,46 @@ Next flight (SR22): `rotate_tick` `wheels` false with `pitch_ff` staying near 0.
 released (`steer` is the law's, the written rudder 0) and `err` closing on a small bank; `liftoff`
 `ias` under about 88; `stage_result` takeoff `liftoff_xtk_m` (at the wheels) and `float_max_xtk_m`.
 The drift that starts on the wheels at 65 to 75 kt is not fixed here. Offline only.
+
+## 2026-09-29: the SR22 holds off and is held on; the bounce (#166)
+
+iMac (19 fps, the autoland tick 0.4 to 0.46 s), LEMG 13, 5 nm finals at 80 kt: 1790701546,
+1790702352, 1790702623 (and at 90 kt 1790689843, 1790694457, 1790697159, 1790699819). Every
+landing hopped, 4.5 to 9.9 ft, the hops going on at idle and neutral column to 55 to 60 kt.
+
+The cause: the jets' firm-touchdown flare on a light single. The model's target was 107 fpm at the
+runway, the lever held at approach power to a second from the wheels, so the IAS stayed 80 to 81
+to the contact (207 to 215 fpm, 0.10 of pull on the column). After it the loop made the hop: the
+ratchet held the 0.10 as the gear threw it back up, the balloon ease let it go to neutral, the
+balloon's approach thrust (0.265) came back at 3 to 4 ft, and the flare rebuilt 0.10 on the way
+down for the next contact; the rollout latched once on a 0.115 pull at 75 kt and flew 9.9 ft.
+
+The fix (per airframe; the 737, A330 and SF50 declare none of it and fly byte-identical code
+paths):
+- **A hold-off** (`flare_elevator.model.hold_off_ft`, `FlareModel::target_fpm`): the exponential
+  flare levels at 2 ft over the runway (`tau_s` 7) and settles at `touchdown_fpm` 50, the pull up
+  to 0.5, so the wheels come down on the speed, near the stall.
+- **The speed's bleed led** (`model.fpm_per_kt` 115, `FlareModel::note_speed`): the prediction
+  carries the IAS trend ahead as sink, so the pull keeps up with the idle wing.
+- **The model refitted at 80 kt**: 6,000 fpm per unit through 1.4 s lags after 1.15 s, 380 fpm of
+  the tail's ground effect from 40 ft (39 to 63 fpm rms over the three flares).
+- **The lever off from 20 ft** (`flare_power` `retard_below_ft` 20, up to 0.1 a second).
+- **Held on** (`autoland::TouchHold`): from the first wheels-on or radio under 0.5 ft, the pull it
+  touched with, no more and no less, in the air too; the lever closed, never the balloon's thrust
+  (`power` `retard` "touched"); the rollout writes it every tick and lets go only on the wheels
+  below 45 kt, easing to neutral. Blackbox `touch_hold`, tick and rollout `touch_hold`/`touch_elev`.
+
+The plant (`lemg13_sr22_bounce_tests`, the three 80 kt records in `bench/landings/`): the refitted
+elevator carried to the ground by a vertical lag, a soft gear that bottoms at 0.4 ft, and a
+nose-up kick on contact (in proportion to the sink met up to 369 fpm, scaled by the dynamic
+pressure). Replayed open loop it gives back the first hops (5.8, 5.0, 6.0 ft against 4.9, 4.9,
+4.5); closed loop the law as flown bounces 3.8 to 5.9 ft on every plant that replays; the hold-off
+from five 75 kt gates, calm and rough, touches at 124 fpm or less at 64 to 69 kt and hops at most
+1.2 ft. Plants that do not replay the records (the elevator 15 % either way, the tail's ground
+effect 40 %, another fit with a heavy vertical) were not kept; on some of them the hold-off holds
+to the plant's 60 kt stall. The 09-28 flare tests now pin the 90 kt law they were written for
+(`flare_0928`).
+
+Next SR22 landings: `touch_hold` once, `ias` at it 60 to 68, `sink_fpm` under 250, `bounce_ft`
+under 1.5, no `bounce` spell over 1.5 ft; `power` `retard` from 20 ft to idle by about 10; if it
+floats long or stalls in, `hold_off_ft` and `touchdown_fpm` are the knobs. Offline only.

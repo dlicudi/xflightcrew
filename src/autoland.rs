@@ -925,6 +925,83 @@ impl BounceHold {
     }
 }
 
+/// A light single HELD ON after its first contact (a hold-off flare,
+/// `flare_elevator.model.hold_off_ft`, issue #166). From the first tick the
+/// wheels read on, or the radio under [`TOUCH_RADIO_FT`], the column holds
+/// the pull it touched with: never more (a pull added on the wheels lifts a
+/// wing that still flies back off) and never less (no push, and no let-go:
+/// the flare's balloon ease and the rollout's expiring channel took the
+/// SR22's 0.10 to neutral within a second, and at 75 to 80 kt neutral
+/// floated it 3 to 10 ft; LEMG 13 1790702352, 1790702623, 2026-09-29), with
+/// the lever closed (never the balloon's approach thrust: each of those hops
+/// had it back at 0.265). It lets go only on the wheels, slower than
+/// [`TOUCH_HOLD_RELEASE_KTS`], easing to neutral at
+/// [`TOUCH_HOLD_EASE_PER_S`]. A go-around forgets it. Pure.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct TouchHold {
+    held: Option<f64>,
+    released: bool,
+}
+
+/// Under this radio height a hold-off is on the runway, ft: at rest the
+/// SR22's radio reads 0.1 to 0.2, and a contact between two 0.45 s ticks
+/// was read at 0.3 ft on its way back up with no wheels flag (1790702352).
+pub const TOUCH_RADIO_FT: f64 = 0.5;
+/// The held pull goes on the wheels below this groundspeed, kt: the hops of
+/// the four iMac SR22 rollouts died out between 54 and 60 kt.
+pub const TOUCH_HOLD_RELEASE_KTS: f64 = 45.0;
+/// ...eased to neutral this fast, elevator per second.
+pub const TOUCH_HOLD_EASE_PER_S: f64 = 0.05;
+
+impl TouchHold {
+    /// This tick's contact (`on_wheels`, or the radio under
+    /// [`TOUCH_RADIO_FT`]) with the elevator last written; true on the
+    /// first one, which takes that pull (a push is taken as neutral).
+    pub fn note(&mut self, contact: bool, written: Option<f64>) -> bool {
+        if self.held.is_some() || !contact {
+            return false;
+        }
+        self.held = Some(written.filter(|e| e.is_finite()).unwrap_or(0.0).max(0.0));
+        true
+    }
+
+    /// The wheels have touched this approach.
+    pub fn touched(&self) -> bool {
+        self.held.is_some()
+    }
+
+    /// The pull held, for the blackbox.
+    pub fn held(&self) -> Option<f64> {
+        self.held
+    }
+
+    /// The column this tick: the pull held; on the wheels below the release
+    /// speed eased toward neutral; `None` once let go (the channel expires
+    /// by itself) or before any contact.
+    pub fn elev(&mut self, gs_kts: f64, on_wheels: bool, dt: f64) -> Option<f64> {
+        let h = self.held?;
+        if self.released {
+            return None;
+        }
+        if on_wheels && gs_kts.is_finite() && gs_kts < TOUCH_HOLD_RELEASE_KTS {
+            let next = h - TOUCH_HOLD_EASE_PER_S * dt.clamp(0.0, 1.0);
+            if next <= 0.0 {
+                self.released = true;
+                self.held = Some(0.0);
+                return Some(0.0);
+            }
+            self.held = Some(next);
+            return Some(next);
+        }
+        Some(h)
+    }
+
+    /// A go-around: the next approach starts free.
+    pub fn reset(&mut self) {
+        *self = Self::default();
+    }
+}
+
 /// Whether the live airframe steers on its brakes (the takeoff's own test).
 fn rollout_brake_steers() -> bool {
     crate::aircraft::nose_castors()
@@ -1623,6 +1700,11 @@ pub fn run_autoland_scoped(
             let mut rollout_brakes = RolloutBrakeSteer::for_airframe();
             // The wheels off again after the rollout latched (a bounce).
             let mut bounce_hold = BounceHold::default();
+            // A hold-off airframe held on from its first contact
+            // (`TouchHold`), and the elevator the flare last wrote.
+            let holds_off = flare_model.as_ref().is_some_and(|m| m.holds_off());
+            let mut touch_hold = TouchHold::default();
+            let mut last_flare_elev: Option<f64> = None;
             // The landing readback last sent, so an owed one goes out once
             // (the party line keeps it owed until the tower hears it).
             let mut readback_sent: Option<String> = None;
@@ -1855,6 +1937,23 @@ pub fn run_autoland_scoped(
                     // standalone landing into a rolling handoff to nobody.
                     if !rolling_out {
                         rolling_out = true;
+                        // A hold-off airframe holds the pull it touched with
+                        // (`TouchHold`); the flare's own contact, if it saw
+                        // one first, already took it.
+                        // Only a column the flare was flying: never a take
+                        // of the pitch the arrest never had.
+                        if holds_off
+                            && !pitch_yielded
+                            && last_flare_elev.is_some()
+                            && touch_hold.note(true, last_flare_elev)
+                        {
+                            crate::blackbox::record(
+                                "autoland",
+                                serde_json::json!({"event": "touch_hold", "held": touch_hold.held(),
+                                    "at": "rollout", "radio": radio_ft, "gs": gs_kts, "ias": ias,
+                                    "on_ground": on_ground > 0.5}),
+                            );
+                        }
                         // The arrest's last aileron rides the roll channel's
                         // 1 s heartbeat onto the wheels unless it is
                         // centred: full right at the handover banked a 737
@@ -2006,6 +2105,14 @@ pub fn run_autoland_scoped(
                             right: 0.0,
                         }
                     };
+                    // A hold-off airframe keeps the pull it touched with
+                    // (`TouchHold`), in the air too: the channel is a 1 s
+                    // heartbeat, so it is written every tick it is held.
+                    let touch_elev = if pitch_yielded {
+                        None
+                    } else {
+                        touch_hold.elev(gs_kts, !airborne, roll_dt)
+                    };
                     // The rollout kept no record of its own: the EGLF and LFPB
                     // weaves had to be reconstructed from the 1 Hz `state`
                     // samples, which is no way to read a control loop.
@@ -2013,6 +2120,8 @@ pub fn run_autoland_scoped(
                         "autoland",
                         serde_json::json!({
                             "event": "rollout", "gs": gs_kts, "xtk_m": xtk_m,
+                            // The held pull (#166), when one is.
+                            "touch_elev": touch_elev,
                             "xtk_rate": xtk_rate, "err": err, "steer": steer,
                             "trim": roll_law.trim(), "psi": psi, "dt": roll_dt,
                             "pos": pos_source,
@@ -2031,9 +2140,16 @@ pub fn run_autoland_scoped(
                         }),
                     );
                     let thr_dref = throttle_dref();
-                    let (_, _) = tokio::join!(
+                    let (_, _, _) = tokio::join!(
                         xp.set_float(&thr_dref, 0.0),
                         xp.set_float(TAXI_STEER, steer),
+                        async {
+                            if let Some(e) = touch_elev {
+                                // Ours, not a hand (the scorer's yoke check).
+                                crate::monitor::note_crew_yoke();
+                                let _ = xp.set_float(FLARE_PITCH, e).await;
+                            }
+                        },
                     );
                     // A vacate follows: hand off ROLLING at taxi pace — the
                     // completion of a landing is clearing the runway, and a
@@ -3129,6 +3245,33 @@ pub fn run_autoland_scoped(
                     final_air.note(v, g.target_vs_fpm);
                 }
                 let mut model_out: Option<FlareModelOut> = None;
+                // A model that carries the speed leads its bleed (`fpm_per_kt`).
+                if let Some(m) = flare_model.as_mut() {
+                    m.note_speed(ias, tick_dt);
+                }
+                // A HOLD-OFF held on from its first contact (`TouchHold`):
+                // the wheels, or the radio under TOUCH_RADIO_FT, in the
+                // flare. A go-around or a new pattern starts free.
+                if missed.is_some() || g.phase == ApproachPhase::Intercept {
+                    touch_hold.reset();
+                    last_flare_elev = None;
+                } else if holds_off
+                    && !pitch_yielded
+                    && g.phase == ApproachPhase::Flare
+                    && touch_hold.note(on_ground > 0.5 || radio_ft < TOUCH_RADIO_FT, last_flare_elev)
+                {
+                    crate::blackbox::record(
+                        "autoland",
+                        serde_json::json!({"event": "touch_hold", "held": touch_hold.held(),
+                            "at": "flare", "radio": radio_ft, "gs": gs_kts, "ias": ias,
+                            "vvi": vvi, "on_ground": on_ground > 0.5}),
+                    );
+                }
+                let touch_elev = if touch_hold.touched() && !pitch_yielded {
+                    touch_hold.elev(gs_kts, on_ground > 0.5, tick_dt)
+                } else {
+                    None
+                };
                 let flare_elev = match (g.arresting, vvi, pitch_yielded) {
                     // Once the pilot has taken the pitch it stays taken for
                     // this approach — the debounce the taxi and takeoff
@@ -3183,6 +3326,16 @@ pub fn run_autoland_scoped(
                         None
                     }
                 };
+                // Held on: the pull it touched with, whatever the flare
+                // would have asked.
+                let flare_elev = if touch_hold.touched() && !pitch_yielded {
+                    touch_elev
+                } else {
+                    flare_elev
+                };
+                if flare_elev.is_some() {
+                    last_flare_elev = flare_elev;
+                }
                 // THE ARREST TAKES THE SERVOS. The pitch channel writes the
                 // yoke under the joystick override and the autopilot's pitch
                 // servo writes it back the same frame: LFPG 09R (2026-09-22)
@@ -3307,6 +3460,8 @@ pub fn run_autoland_scoped(
                     // The prediction's own ask before the flare's ratchet:
                     // `flare_elev` over it is the pull held.
                     "flare_ask": model_out.map(|o| o.ask),
+                    // A hold-off's pull held from its first contact (#166).
+                    "touch_hold": touch_hold.held(),
                     "rough_air": g.arresting.then(|| final_air.rough()),
                     "lever": last_lever,
                     "phi": phi_r.as_ref().ok().copied(),
@@ -3597,6 +3752,12 @@ pub fn run_autoland_scoped(
                     // sticky version, Luton 2026-07-28) the MD-82 accelerated to
                     // 284 KIAS on the outbound leg and was still gaining.
                     Some(1.0)
+                } else if touch_hold.touched() {
+                    // A hold-off held on (`TouchHold`): the lever closed,
+                    // never the balloon's approach thrust. Each iMac SR22
+                    // hop had 0.265 back on at 3 to 4 ft (LEMG 13
+                    // 1790702352, 1790702623, 2026-09-29).
+                    Some(0.0)
                 } else if let Some(hold) = g
                     .phase
                     .eq(&ApproachPhase::Flare)
@@ -3705,7 +3866,9 @@ pub fn run_autoland_scoped(
                     // climb's approach thrust is "balloon" (issue #146: the
                     // last key's word hid it).
                     "retard": (g.phase == ApproachPhase::Flare)
-                        .then(|| if ballooned {
+                        .then(|| if touch_hold.touched() {
+                            Some("touched")
+                        } else if ballooned {
                             Some("balloon")
                         } else {
                             flare_power.last_key.map(RetardKey::word)
@@ -5608,6 +5771,10 @@ pub struct FlareModel {
     model_rate: f64,
     /// Seconds since the last write (a failed read coasts).
     coasting_s: f64,
+    /// The airspeed last read and its smoothed trend (kt/s), for a model
+    /// that carries the speed (`fpm_per_kt`).
+    last_ias: Option<f64>,
+    ias_trend: f64,
     /// A climb past this eases the held pull ([`BALLOON_CLIMB_FPM`]; a
     /// replay of the law as flown before issue #146 sets it to zero).
     climb_fpm: f64,
@@ -5633,6 +5800,9 @@ pub struct FlareModelOut {
 const FLARE_MODEL_STEP_S: f64 = 0.02;
 /// The prediction's step, seconds.
 const FLARE_PREDICT_STEP_S: f64 = 0.05;
+/// The airspeed trend a speed-carrying model leads with is smoothed over
+/// this, seconds.
+const FLARE_SPEED_TREND_TAU_S: f64 = 1.0;
 /// The pitch channel expires this long after its last write.
 const FLARE_CHANNEL_EXPIRY_S: f64 = 1.0;
 
@@ -5660,6 +5830,8 @@ impl FlareModel {
             last_vvi: None,
             model_rate: 0.0,
             coasting_s: 0.0,
+            last_ias: None,
+            ias_trend: 0.0,
             climb_fpm: BALLOON_CLIMB_FPM,
         }
     }
@@ -5755,6 +5927,28 @@ impl FlareModel {
         }
     }
 
+    /// The airspeed this tick, for a model that carries the speed
+    /// (`fpm_per_kt`): its trend is smoothed over [`FLARE_SPEED_TREND_TAU_S`].
+    /// Nothing else reads it.
+    pub fn note_speed(&mut self, ias_kts: f64, dt_s: f64) {
+        if !ias_kts.is_finite() || !dt_s.is_finite() || dt_s <= 0.0 {
+            return;
+        }
+        if let Some(p) = self.last_ias {
+            let raw = ((ias_kts - p) / dt_s).clamp(-6.0, 3.0);
+            self.ias_trend += (raw - self.ias_trend) * (dt_s / FLARE_SPEED_TREND_TAU_S).min(1.0);
+        }
+        self.last_ias = Some(ias_kts);
+    }
+
+    /// The sink the speed's trend adds over the next `ahead_s` (fpm,
+    /// negative while it bleeds); nothing without `fpm_per_kt`.
+    fn speed_sink_ahead(&self, ahead_s: f64) -> f64 {
+        self.cfg
+            .fpm_per_kt
+            .map_or(0.0, |k| k * self.ias_trend.min(0.0) * ahead_s.max(0.0))
+    }
+
     /// The model's sink and height at the horizon if `el_new` were held
     /// from now, the elevator already written arriving on schedule.
     fn predict(&self, el_new: f64, radio_ft: f64, vvi_fpm: f64, unexplained: f64) -> (f64, f64) {
@@ -5779,7 +5973,8 @@ impl FlareModel {
             } else {
                 b1 += (k * arriving - self.ground(h) - b1) * dt / l1;
                 b2 += (b1 - b2) * dt / l2;
-                v = unexplained + b2;
+                // The speed still to bleed, as sink, from now to then.
+                v = unexplained + b2 + self.speed_sink_ahead(t - self.t);
             }
             h = (h + v / 60.0 * dt).max(0.0);
         }
@@ -5806,7 +6001,18 @@ impl FlareModel {
         let nominal = -(gs_kts.max(0.0) / 60.0) * gp_ft_per_nm();
         let (_, arrest) = arrest_targets_fpm(nominal);
         let touchdown = self.cfg.touchdown_fpm.map_or(arrest, |t| -t);
-        flare_target_with(radio_ft, touchdown, nominal, Some(self.tau_s))
+        // A HOLD-OFF levels at its height, then settles: the same
+        // exponential, measured from the hold-off height, not the runway.
+        let above = match self.cfg.hold_off_ft {
+            Some(hold) => (radio_ft - hold).max(0.0),
+            None => radio_ft,
+        };
+        flare_target_with(above, touchdown, nominal, Some(self.tau_s))
+    }
+
+    /// The airframe flies a light single's hold-off (`hold_off_ft`).
+    pub fn holds_off(&self) -> bool {
+        self.cfg.hold_off_ft.is_some()
     }
 
     /// One tick on a RATE plant (`FlareModelProfile::rate`, the A330's
@@ -15335,6 +15541,38 @@ mod lemg13_sr22_flare_tests {
         crate::aircraft::load("cirrus_sr22").expect("the SR22 profile loads")
     }
 
+    /// The SR22's flare as declared from 2026-09-28 to the hold-off of
+    /// 2026-09-29 (the 90 kt finals these plants were fitted to): the model
+    /// 6,000 fpm through 1.0 s lags after 0.8 s, no hold-off, 0.35 of pull,
+    /// the lever held to a second from the wheels. Today's hold-off is
+    /// `lemg13_sr22_bounce_tests`.
+    pub(super) fn flare_0928() -> crate::aircraft::FlareElevatorProfile {
+        let mut fe = sr22().flare_elevator.expect("a flare_elevator");
+        fe.max = 0.35;
+        fe.tau_s = None;
+        let mut m = fe.model.expect("a model");
+        m.lag_s = 1.0;
+        m.lag2_s = None;
+        m.dead_s = 0.8;
+        m.ground_fpm = 0.0;
+        m.hold_off_ft = None;
+        m.touchdown_fpm = None;
+        m.fpm_per_kt = None;
+        fe.model = Some(m);
+        fe
+    }
+
+    pub(super) fn power_0928() -> crate::aircraft::FlarePowerProfile {
+        crate::aircraft::FlarePowerProfile {
+            reduction_per_second: 0.03,
+            retard_below_ft: None,
+            retard_max_per_s: Some(0.03),
+            retard_slow_kts: None,
+            retard_at_s: Some(1.0),
+            retard_fast_kts: None,
+        }
+    }
+
     /// Which elevator law flies.
     enum Law {
         Model(FlareModel),
@@ -15342,12 +15580,9 @@ mod lemg13_sr22_flare_tests {
     }
 
     impl Law {
-        /// Today's: the profile's model.
+        /// The 90 kt law these plants were written for ([`flare_0928`]).
         fn today() -> Self {
-            Law::Model(
-                FlareModel::from_profile(sr22().flare_elevator)
-                    .expect("the SR22 declares its model"),
-            )
+            Law::Model(FlareModel::from_profile(Some(flare_0928())).expect("the 09-28 model"))
         }
         /// The law the SR22 flew at LEMG 13: no `flare_elevator:`, the
         /// default tracker (the servos latched as today).
@@ -15383,7 +15618,7 @@ mod lemg13_sr22_flare_tests {
     /// `flare_power` (idle at the flare gate when it declares none), the
     /// approach thrust again while climbing (`balloon_power`).
     fn land(p: &mut Plant, law: &mut Law, rough: bool) -> Landed {
-        land_with(p, law, rough, sr22().flare_power)
+        land_with(p, law, rough, Some(power_0928()))
     }
 
     fn land_with(
@@ -15506,6 +15741,621 @@ mod lemg13_sr22_flare_tests {
         }
         eprintln!("worst {worst:.0} over {n}");
         assert!(worst > -400.0, "{worst:.0} over {n}");
+    }
+}
+
+/// Issue #166, the BOUNCE: LEMG 13, the SR22 on the iMac (a 0.4 to 0.46 s
+/// loop), three 5 nm finals at the POH's 80 kt on 2026-09-29 (sorties
+/// 1790701546, 1790702352, 1790702623), the final's air 42 to 45 fpm rms.
+/// Each flew the jets' firm-touchdown flare to the wheels: the target a sink
+/// of 107 fpm at the runway, the lever held at approach power to a second
+/// from the wheels, the IAS 80 to 81 all the way down, first contact at 207
+/// to 215 fpm with 0.10 of pull on the column. Each then flew: the ratchet
+/// held the 0.10 as it came back up, the balloon ease let it go to neutral,
+/// the balloon's approach thrust (0.265) came back at 3 to 4 ft, and the
+/// wheels met again with the pull the flare had rebuilt on the way down:
+/// 4.5 to 4.9 ft, then 4.9 to 6.0, then 9.9 ft after the rollout latched on
+/// a 0.115 pull at 75 kt. At neutral and idle the hops went on to 55 to 60 kt.
+///
+/// The plant: the standing-sink elevator of [`FlareModel`] refitted to the
+/// three 80 kt flares, carried to the ground by the vertical speed through a
+/// lag of its own (the lift the pull adds is an ACCELERATION: a hop needs an
+/// aircraft that can move faster than its standing sink), the tail's ground
+/// effect sinking it from 40 ft, the gear a soft spring and damper, and the
+/// mains' contact pitching the nose up (a climb tendency in proportion to the
+/// sink met up to 369 fpm, scaled by the dynamic pressure, decaying; unbound
+/// it ran away), the gear bottoming at 0.4 ft. Fitted open loop, the column
+/// and lever as written, to the three flares' sink before contact and their
+/// first six hops after it. A fit is only as good as the model it fits: the
+/// elevator's authority on the wheels and the pitch the gear makes are not
+/// measured (no attitude in the autoland ticks), only their sum.
+///
+/// What it says: the flare as flown bounces 3.8 to 5.9 ft in every plant,
+/// as it did in the sim. The hold-off (`hold_off_ft` 2 ft, `touchdown_fpm`
+/// 50, `tau_s` 7, the speed's bleed led (`fpm_per_kt`), the lever to idle
+/// from 20 ft, `TouchHold` from the first contact) touches once at 124 fpm
+/// or less at 64 to 69 kt, the hop at most 1.2 ft. The sim decides: VERIFY
+/// on the next SR22 landings `touch_hold` (held pull, at, ias), the ticks'
+/// `touch_hold` and `flare_ask` below 20 ft, the `power` events' `retard`
+/// (float or timed from 20 ft, then `touched`), `bounce` events (none, or one
+/// spell under 1.5 ft), the landing's `sink_fpm` and `bounce_ft`.
+#[cfg(test)]
+mod lemg13_sr22_bounce_tests {
+    use super::*;
+
+    const FLOWN: [&str; 3] = [
+        include_str!("../bench/landings/sr22_lemg13_flare_1790701546.jsonl"),
+        include_str!("../bench/landings/sr22_lemg13_flare_1790702352.jsonl"),
+        include_str!("../bench/landings/sr22_lemg13_flare_1790702623.jsonl"),
+    ];
+    /// The recorded first hops over the runway (ft): the peak between the
+    /// first contact and the second, and between the second and the third.
+    const FLOWN_HOPS: [(f64, f64); 3] = [(4.9, 5.6), (4.9, 6.0), (4.5, 4.9)];
+
+    /// The loop's tick on the iMac.
+    const TICK_S: f64 = 0.45;
+    /// The SR22's landing-configuration stall (POH `vs0_kts`): the plant
+    /// sinks past it.
+    const VSO_KTS: f64 = 60.0;
+    /// The SR22 at rest reads this on its radio altimeter, ft.
+    const RADIO_AT_REST_FT: f64 = 0.15;
+    /// On the wheels the rollout's brakes and the rolling drag, kt/s (the
+    /// recorded rollouts: 3 to 5).
+    const ROLL_DECEL_KTS_S: f64 = 3.0;
+    /// The gear's travel, ft.
+    const GEAR_TRAVEL_FT: f64 = 0.4;
+
+    /// One recorded flare: the arrest's ticks from the servos taken (s,
+    /// radio ft, vvi fpm, IAS or the rollout's groundspeed kt), the elevator
+    /// as written (s, ratio) and the lever as commanded (s, ratio).
+    struct Flown {
+        ticks: Vec<(f64, f64, Option<f64>, f64, bool)>,
+        writes: Vec<(f64, f64)>,
+        levers: Vec<(f64, f64)>,
+    }
+
+    fn flown(src: &str) -> Flown {
+        let rows: Vec<serde_json::Value> = src
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| serde_json::from_str(l).expect("a record"))
+            .collect();
+        let t0 = rows
+            .iter()
+            .find(|r| r["event"] == "arrest_hands")
+            .and_then(|r| r["t"].as_f64())
+            .expect("the arrest took the servos");
+        let mut out = Flown {
+            ticks: vec![],
+            writes: vec![],
+            levers: vec![],
+        };
+        for r in &rows {
+            let t = r["t"].as_f64().unwrap() - t0;
+            match r["event"].as_str() {
+                None => {
+                    out.ticks.push((
+                        t,
+                        r["radio"].as_f64().unwrap(),
+                        r["vvi"].as_f64(),
+                        r["ias"].as_f64().unwrap(),
+                        false,
+                    ));
+                    if let Some(e) = r["flare_elev"].as_f64() {
+                        out.writes.push((t, e));
+                    }
+                }
+                Some("power") => {
+                    if let Some(l) = r["throttle_command"].as_f64() {
+                        out.levers.push((t, l));
+                    }
+                }
+                Some("rollout") => {
+                    out.ticks.push((
+                        t,
+                        r["radio"].as_f64().unwrap(),
+                        None,
+                        r["gs"].as_f64().unwrap(),
+                        true,
+                    ));
+                    out.levers.push((t, 0.0));
+                }
+                _ => {}
+            }
+        }
+        out
+    }
+
+    /// The plant's numbers.
+    #[derive(Debug, Clone, Copy)]
+    struct Fit {
+        /// Standing sink per unit of elevator (fpm), its two equal lags (s)
+        /// and the dead time (s).
+        k: f64,
+        lag: f64,
+        dead: f64,
+        /// The tail's ground effect: sink at the runway (fpm), from 40 ft.
+        tail_fpm: f64,
+        /// fpm of sink per knot lost from the gate.
+        per_kt: f64,
+        /// The vertical speed's own lag toward the standing sink (s).
+        path_s: f64,
+        /// The wing's ground cushion: climb at the runway (fpm) fading by
+        /// this height (ft).
+        wing_fpm: f64,
+        wing_ft: f64,
+        /// The gear: spring (ft/s^2 per ft) and damper (per s).
+        spring: f64,
+        damper: f64,
+        /// The mains' contact: climb tendency per fpm of sink met, and its
+        /// decay (s).
+        kick: f64,
+        kick_s: f64,
+        /// ...met up to this sink (fpm), and scaled by the dynamic pressure
+        /// against 80 kt: the nose the gear lifts is worth what the wing
+        /// makes of it.
+        kick_cap: f64,
+    }
+
+    /// The best fit (the three flares' sink before contact, 39 to 63 fpm
+    /// rms, and their first six hops): a soft gear and a strong nose-up
+    /// kick. Replayed, the first hops are 5.8, 5.0 and 6.0 ft against 4.9,
+    /// 4.9 and 4.5; closed loop, the law as flown bounces 5.9 ft on it.
+    const FIT: Fit = Fit {
+        k: 6170.0,
+        lag: 1.42,
+        dead: 1.19,
+        tail_fpm: 380.0,
+        per_kt: 122.0,
+        path_s: 0.34,
+        wing_fpm: 85.0,
+        wing_ft: 4.9,
+        spring: 9.3,
+        damper: 2.7,
+        kick: 4.95,
+        kick_s: 1.38,
+        kick_cap: 369.0,
+    };
+    /// The plants that replay the records (`the_plant_replays_the_80_kt_bounces`):
+    /// the best fit, its dead time 0.2 s shorter (3.8, 6.5, 3.6 ft) and its
+    /// kick a fifth weaker (3.9, 3.1, 4.1). A law that lands on all of them
+    /// does not depend on one number being right. The elevator 15 % weaker
+    /// or stronger, the tail's ground effect 40 % either way, the speed's
+    /// sink 30 % either way, or another fit (a heavy vertical and a stiff
+    /// gear) do not replay the three flares (first hops of 1.1 to 36 ft)
+    /// and are not plants of this aircraft.
+    fn plants() -> Vec<Fit> {
+        vec![
+            FIT,
+            Fit {
+                dead: FIT.dead - 0.2,
+                ..FIT
+            },
+            Fit {
+                kick: FIT.kick * 0.8,
+                ..FIT
+            },
+        ]
+    }
+
+    struct Plant {
+        fit: Fit,
+        t: f64,
+        h: f64,
+        /// Vertical speed, fpm.
+        w: f64,
+        ias: f64,
+        ias0: f64,
+        base: f64,
+        b1: f64,
+        b2: f64,
+        thr: f64,
+        thr0: f64,
+        thr_cmd: f64,
+        kick: f64,
+        stall: f64,
+        /// The elevator as written, with the plugin's 1 s expiry.
+        written: Vec<(f64, f64)>,
+        /// Recorded IAS to follow (a replay) instead of the speed model.
+        ias_track: Option<Vec<(f64, f64)>>,
+        on_wheels: bool,
+        /// Every contact: (time, sink met fpm, IAS).
+        contacts: Vec<(f64, f64, f64)>,
+        /// Highest point after the first contact.
+        bounce_ft: f64,
+    }
+
+    impl Plant {
+        /// At the arrest gate, sinking steadily with `pipe` on the column
+        /// and the lever holding the speed.
+        fn at(fit: Fit, h: f64, vvi: f64, ias: f64, pipe: f64) -> Self {
+            let b = fit.k * pipe;
+            // The lever the speed model holds this sink on.
+            let thr0 = ((2.70 + 5.1 * vvi / 1000.0) / 2.74).clamp(0.0, 1.0);
+            let mut p = Plant {
+                fit,
+                t: 0.0,
+                h,
+                w: vvi,
+                ias,
+                ias0: ias,
+                base: 0.0,
+                b1: b,
+                b2: b,
+                thr: thr0,
+                thr0,
+                thr_cmd: thr0,
+                kick: 0.0,
+                stall: 0.0,
+                written: vec![(-10.0, pipe)],
+                ias_track: None,
+                on_wheels: false,
+                contacts: vec![],
+                bounce_ft: 0.0,
+            };
+            p.base = vvi - b - p.ground(h);
+            p
+        }
+
+        fn ground(&self, h: f64) -> f64 {
+            let h = h.max(0.0);
+            -self.fit.tail_fpm * (1.0 - h / 40.0).max(0.0)
+                + self.fit.wing_fpm * (1.0 - h / self.fit.wing_ft).max(0.0)
+        }
+
+        fn write(&mut self, e: f64) {
+            self.written.push((self.t, e));
+        }
+
+        fn arriving(&self) -> f64 {
+            let due = self.t - self.fit.dead;
+            match self.written.iter().take_while(|(t, _)| *t <= due + 1e-9).last() {
+                // The autopilot's column at the gate never expires.
+                Some((tw, e)) if due - tw <= 1.0 || *tw < -1.0 => *e,
+                _ => 0.0,
+            }
+        }
+
+        fn standing(&self) -> f64 {
+            self.base
+                + self.b2
+                + 316.0 * (self.thr - self.thr0)
+                + self.fit.per_kt * (self.ias - self.ias0)
+                + self.ground(self.h)
+                + self.kick
+                - self.stall
+        }
+
+        fn step(&mut self, dt: f64) {
+            let f = self.fit;
+            let e = self.arriving();
+            self.b1 += (f.k * e - self.b1) * dt / f.lag;
+            self.b2 += (self.b1 - self.b2) * dt / f.lag;
+            self.thr += (self.thr_cmd - self.thr) * dt / 2.7;
+            self.kick -= self.kick * dt / f.kick_s;
+            match &self.ias_track {
+                Some(tr) => {
+                    self.ias = tr
+                        .iter()
+                        .take_while(|(t, _)| *t <= self.t)
+                        .last()
+                        .map_or(self.ias0, |x| x.1)
+                }
+                None => {
+                    self.ias += if self.on_wheels {
+                        -ROLL_DECEL_KTS_S
+                    } else {
+                        -2.70 - 5.1 * self.w / 1000.0 + 2.74 * self.thr
+                    } * dt
+                }
+            }
+            if self.ias < VSO_KTS && !self.on_wheels {
+                self.stall += 800.0 * dt;
+            }
+            let mut a = (self.standing() - self.w) / f.path_s;
+            if self.h < 0.0 {
+                let g = (f.spring * -self.h - f.damper * self.w / 60.0) * 60.0;
+                if g > 0.0 {
+                    a += g;
+                }
+            }
+            self.w += a * dt;
+            let was = self.h;
+            self.h += self.w / 60.0 * dt;
+            // The gear bottoms out: the soft spring the hops were fitted
+            // with is only the first few inches of it.
+            if self.h < -GEAR_TRAVEL_FT {
+                self.h = -GEAR_TRAVEL_FT;
+                self.w = self.w.max(0.0);
+            }
+            if was >= 0.0 && self.h < 0.0 {
+                self.kick +=
+                    f.kick * (-self.w).max(0.0).min(f.kick_cap) * (self.ias / 80.0).powi(2);
+                self.contacts.push((self.t, self.w, self.ias));
+            }
+            self.on_wheels = self.h <= 0.0;
+            if !self.contacts.is_empty() {
+                self.bounce_ft = self.bounce_ft.max(self.h);
+            }
+            self.t += dt;
+        }
+
+        fn radio(&self) -> f64 {
+            self.h.max(0.0) + RADIO_AT_REST_FT
+        }
+    }
+
+    /// The hops of a height series: the peak between each contact and the
+    /// next (a contact is the radio under 0.8 ft).
+    fn hops(series: &[(f64, f64)]) -> Vec<f64> {
+        let mut out = vec![];
+        let mut i = 0;
+        while i < series.len() {
+            if series[i].1 < 0.8 {
+                while i < series.len() && series[i].1 < 0.8 {
+                    i += 1;
+                }
+                let mut peak = 0.0_f64;
+                let start = i;
+                while i < series.len() && series[i].1 >= 0.8 {
+                    peak = peak.max(series[i].1);
+                    i += 1;
+                }
+                if i > start && i < series.len() {
+                    out.push(peak);
+                }
+            } else {
+                i += 1;
+            }
+        }
+        out
+    }
+
+    /// The recorded column and lever, open loop, from the recorded gate: the
+    /// plant's radio at every recorded tick.
+    fn replay(f: &Flown, fit: Fit) -> Vec<(f64, f64)> {
+        let (_, h, v, ias, _) = f.ticks[0];
+        let mut p = Plant::at(fit, h, v.unwrap(), ias, f.writes[0].1);
+        p.ias_track = Some(f.ticks.iter().map(|x| (x.0, x.3)).collect());
+        p.thr0 = f.levers.first().map_or(p.thr0, |l| l.1);
+        p.thr = p.thr0;
+        p.written = vec![(-10.0, f.writes[0].1)];
+        let mut out = vec![];
+        let (mut wi, mut li) = (0, 0);
+        for &(t, ..) in &f.ticks {
+            while p.t < t - 1e-9 {
+                while wi < f.writes.len() && f.writes[wi].0 <= p.t + 1e-9 {
+                    let e = f.writes[wi].1;
+                    p.write(e);
+                    wi += 1;
+                }
+                while li < f.levers.len() && f.levers[li].0 <= p.t + 1e-9 {
+                    p.thr_cmd = f.levers[li].1;
+                    li += 1;
+                }
+                p.step(0.01);
+            }
+            out.push((t, p.radio()));
+        }
+        out
+    }
+
+    /// The loop's laws over the plant, from a gate to the wheels and on to
+    /// `until` s. `hold_off`: today's SR22 (its profile); else the flare as
+    /// flown at 80 kt (no hold-off, the lever to a second from the wheels,
+    /// the rollout letting the channel go).
+    #[derive(Debug)]
+    struct Landing {
+        first_fpm: f64,
+        first_ias: f64,
+        contacts: usize,
+        bounce_ft: f64,
+        min_ias: f64,
+        secs_to_wheels: f64,
+    }
+
+    fn sr22() -> crate::aircraft::AircraftProfile {
+        crate::aircraft::load("cirrus_sr22").expect("the SR22 profile loads")
+    }
+
+    /// The profile as flown on 2026-09-29 at 80 kt: the model without the
+    /// hold-off, the lever held to a second from the wheels.
+    fn as_flown() -> (FlareModel, crate::aircraft::FlarePowerProfile) {
+        (
+            FlareModel::from_profile(Some(super::lemg13_sr22_flare_tests::flare_0928()))
+                .expect("the 09-28 model"),
+            super::lemg13_sr22_flare_tests::power_0928(),
+        )
+    }
+
+    fn today() -> (FlareModel, crate::aircraft::FlarePowerProfile) {
+        let p = sr22();
+        (
+            FlareModel::from_profile(p.flare_elevator).expect("the SR22 declares its model"),
+            p.flare_power.expect("the SR22 declares its retard"),
+        )
+    }
+
+    fn land(
+        p: &mut Plant,
+        model: &mut FlareModel,
+        power_cfg: crate::aircraft::FlarePowerProfile,
+        approach_ias: f64,
+        rough: bool,
+        until: f64,
+    ) -> Landing {
+        let holds_off = model.holds_off();
+        let mut power = FlarePower::default();
+        let mut touch = TouchHold::default();
+        let mut last_elev: Option<f64> = None;
+        let (mut next, mut flaring, mut rolling, mut wheels_on) = (0.0, false, false, 0u32);
+        let mut min_ias = p.ias;
+        let approach_thr = p.thr0;
+        while p.t < until {
+            if p.t + 1e-9 >= next {
+                next += TICK_S;
+                let gs = p.ias;
+                let radio = p.radio();
+                let on_ground = p.on_wheels;
+                wheels_on = wheels_on_count(wheels_on, on_ground, radio);
+                if should_start_rollout(rolling, on_ground, radio, gs, p.ias, approach_ias, wheels_on) {
+                    if !rolling && holds_off {
+                        touch.note(true, last_elev);
+                    }
+                    rolling = true;
+                }
+                if rolling {
+                    p.thr_cmd = 0.0;
+                    if let Some(e) = touch.elev(gs, on_ground, TICK_S) {
+                        p.write(e);
+                    }
+                } else {
+                    let (flare_ft, band_ft) = arrest_gates_ft(25.0, gs);
+                    flaring = radio <= flare_ft || (flaring && radio <= band_ft);
+                    if holds_off && flaring {
+                        touch.note(on_ground || radio < TOUCH_RADIO_FT, last_elev);
+                    }
+                    model.note_speed(p.ias, TICK_S);
+                    let o = model.step(radio, gs, p.w, TICK_S, flaring, rough);
+                    let e = if touch.touched() {
+                        touch.elev(gs, on_ground, TICK_S)
+                    } else {
+                        Some(o.elev)
+                    };
+                    if let Some(e) = e {
+                        p.write(e);
+                        last_elev = Some(e);
+                    }
+                    p.thr_cmd = if touch.touched() {
+                        0.0
+                    } else if !flaring {
+                        power.reset();
+                        approach_thr
+                    } else if let Some(t) =
+                        balloon_power(Some(p.w), Some(approach_thr), radio > band_ft)
+                    {
+                        t
+                    } else {
+                        power
+                            .step(power_cfg, p.thr_cmd, p.w, TICK_S, radio, Some(p.ias), Some(approach_ias))
+                            .unwrap_or(p.thr_cmd)
+                    };
+                }
+            }
+            p.step(0.01);
+            if p.contacts.is_empty() {
+                min_ias = min_ias.min(p.ias);
+            }
+        }
+        let first = p.contacts.first().copied().unwrap_or((f64::NAN, f64::NAN, f64::NAN));
+        Landing {
+            first_fpm: -first.1,
+            first_ias: first.2,
+            contacts: p.contacts.len(),
+            bounce_ft: p.bounce_ft,
+            min_ias,
+            secs_to_wheels: first.0,
+        }
+    }
+
+    /// The plant is the recording: the three flares' column and lever as
+    /// written, open loop, give back their first hop within 2 ft on every
+    /// plant (4.9, 4.9 and 4.5 recorded).
+    #[test]
+    fn the_plant_replays_the_80_kt_bounces() {
+        for fit in plants() {
+            for (src, want) in FLOWN.iter().zip(FLOWN_HOPS) {
+                let f = flown(src);
+                let got = hops(&replay(&f, fit));
+                assert!(!got.is_empty(), "{fit:?}: no hop");
+                assert!((got[0] - want.0).abs() < 2.0, "{fit:?}: {got:?} against {want:?}");
+            }
+        }
+    }
+
+    /// Gates at 75 kt (the final since 6c4276f): the recorded three scaled to
+    /// the slower path, a little steeper and shallower, faster and slower.
+    const GATES_75: [(f64, f64, f64, f64); 5] = [
+        (49.0, -356.0, 75.0, -0.027),
+        (49.0, -420.0, 75.0, -0.02),
+        (49.0, -300.0, 75.0, -0.03),
+        (46.0, -356.0, 77.0, -0.027),
+        (50.0, -356.0, 73.0, -0.027),
+    ];
+
+    /// The flare as flown (the 80 kt law, `lemg13_sr22_flare_tests::
+    /// flare_0928`), closed loop from the three recorded gates, bounces on
+    /// every plant as it did in the sim (3.8 to 5.9 ft). The hold-off from
+    /// every 75 kt gate on every plant, calm and rough: one contact under 250
+    /// fpm near the stall (57 to 70 kt), never over 1.5 ft after it, never
+    /// slower than 57 kt before it (the best fit: 124 fpm at 64.5 to 68.5
+    /// kt, 1.2 ft), and every plant's hold-off under a third of its flare
+    /// as flown.
+    #[test]
+    fn the_hold_off_touches_once_where_the_flare_as_flown_bounced() {
+        let mut worst = (0.0_f64, 0.0_f64);
+        for fit in plants() {
+            let mut flown_worst = 0.0_f64;
+            for src in FLOWN {
+                let f = flown(src);
+                let (_, h, v, ias, _) = f.ticks[0];
+                let mut p = Plant::at(fit, h, v.unwrap(), ias, f.writes[0].1);
+                let (mut m, pw) = as_flown();
+                flown_worst = flown_worst.max(land(&mut p, &mut m, pw, 80.0, true, 30.0).bounce_ft);
+            }
+            assert!(flown_worst > 3.0, "{fit:?} as flown: {flown_worst:.2} ft");
+            let mut held = 0.0_f64;
+            for (h, v, ias, pipe) in GATES_75 {
+                for rough in [false, true] {
+                    let mut p = Plant::at(fit, h, v, ias, pipe);
+                    let (mut m, pw) = today();
+                    let l = land(&mut p, &mut m, pw, 75.0, rough, 40.0);
+                    assert!(l.first_fpm < 250.0, "{fit:?} {h} {v} {ias}: {l:?}");
+                    assert!(l.bounce_ft < 1.5, "{fit:?} {h} {v} {ias}: {l:?}");
+                    assert!((57.0..=70.0).contains(&l.first_ias), "{fit:?}: {l:?}");
+                    assert!(l.min_ias > 57.0, "{fit:?}: {l:?}");
+                    held = held.max(l.bounce_ft);
+                    worst = (worst.0.max(l.first_fpm), worst.1.max(l.bounce_ft));
+                }
+            }
+            assert!(held < flown_worst / 3.0, "{fit:?}: {held:.2} against {flown_worst:.2}");
+        }
+        eprintln!("held off: worst {:.0} fpm, {:.2} ft", worst.0, worst.1);
+    }
+
+    /// Held on: the pull it touched with, never more and never less, the
+    /// lever closed; let go only on the wheels below the release speed.
+    #[test]
+    fn touch_hold_keeps_the_pull_it_touched_with() {
+        let mut t = TouchHold::default();
+        assert!(!t.note(false, Some(0.3)), "no contact");
+        assert_eq!(t.elev(70.0, false, 0.45), None, "nothing held before a contact");
+        assert!(t.note(true, Some(0.31)));
+        assert!(!t.note(true, Some(0.5)), "the first contact's pull, once");
+        assert_eq!(t.elev(66.0, true, 0.45), Some(0.31));
+        assert_eq!(t.elev(64.0, false, 0.45), Some(0.31), "a hop keeps it");
+        let e = t.elev(40.0, true, 1.0).unwrap();
+        assert!((e - (0.31 - TOUCH_HOLD_EASE_PER_S)).abs() < 1e-9, "{e}");
+        for _ in 0..20 {
+            t.elev(30.0, true, 1.0);
+        }
+        assert_eq!(t.elev(30.0, true, 1.0), None, "let go at neutral");
+        let mut push = TouchHold::default();
+        push.note(true, Some(-0.04));
+        assert_eq!(push.elev(70.0, true, 0.45), Some(0.0), "never a push");
+    }
+
+    /// Only an airframe that declares the hold-off flies it: the 737, the
+    /// A330 and the SF50 keep their firm-touchdown flares.
+    #[test]
+    fn only_the_sr22_holds_off() {
+        for id in ["boeing_737_800", "airbus_a330_300", "cirrus_vision_sf50"] {
+            let p = crate::aircraft::load(id).expect("the profile loads");
+            let m = FlareModel::from_profile(p.flare_elevator).expect("a model");
+            assert!(!m.holds_off(), "{id}");
+        }
+        let (m, _) = today();
+        assert!(m.holds_off());
     }
 }
 

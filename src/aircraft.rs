@@ -273,6 +273,25 @@ pub struct FlareModelProfile {
     /// since neutral holds it. Absent: the standing-sink plant.
     #[serde(default)]
     pub rate: bool,
+    /// A light single's HOLD-OFF flare (the SR22, issue #166), ft: the
+    /// exponential flare levels at this height over the runway instead of
+    /// flying to it, then settles at `touchdown_fpm` while the idle wing
+    /// bleeds its speed, so the wheels come down on the SPEED, near the
+    /// stall, not on a sink; and from the first contact the column holds the
+    /// pull it touched with, never more and never less, the lever closed
+    /// (`autoland::TouchHold`). Absent: the jets' firm-touchdown flare. The
+    /// SR22 flew that to the wheels at its approach speed (80 kt, 215 fpm)
+    /// and every landing hopped 4 to 10 ft (LEMG 13, 2026-09-29).
+    #[serde(default)]
+    pub hold_off_ft: Option<f64>,
+    /// fpm of sink per knot the speed loses (positive): the prediction
+    /// carries the airspeed's trend ahead as sink, so a hold-off at idle
+    /// pulls for the knots still to bleed instead of a tick late for each
+    /// (`autoland::FlareModel::note_speed`). Absent: the speed is only what
+    /// the model does not explain. The SR22: 115 fpm a knot at idle with
+    /// full flap (LEMG 13 sortie 1790619465, 2026-09-28).
+    #[serde(default)]
+    pub fpm_per_kt: Option<f64>,
 }
 
 fn default_model_ground_ft() -> f64 {
@@ -293,7 +312,9 @@ impl FlareModelProfile {
             && self.horizon_s.is_none_or(|h| (0.3..=8.0).contains(&h))
             && self
                 .touchdown_fpm
-                .is_none_or(|t| (50.0..=400.0).contains(&t))
+                .is_none_or(|t| (20.0..=400.0).contains(&t))
+            && self.hold_off_ft.is_none_or(|h| (0.5..=5.0).contains(&h))
+            && self.fpm_per_kt.is_none_or(|k| (0.0..=400.0).contains(&k))
             && (0.05..=3.0).contains(&self.observer_s))
         .then_some(self)
     }
