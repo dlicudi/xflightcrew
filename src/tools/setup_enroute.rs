@@ -380,7 +380,10 @@ pub const SETTLE_LEVEL_S: f64 = 10.0;
 /// altimeter on the setting owed there...
 pub const SETTLE_IAS_KTS: f64 = 10.0;
 /// ...or, after this long, what did not settle is said and put on file.
-pub const SETTLE_MAX_S: f64 = 60.0;
+/// The placement zooms a few hundred feet and the 737's VS mode answers the
+/// wheel in about 20 s: 60 s left EGKK-EGBB 149 ft off the dial, healthy and
+/// closing, called unsettled (2026-09-29, #177).
+pub const SETTLE_MAX_S: f64 = 120.0;
 /// The VS wheel toward the dial: fpm per foot off, and its bounds.
 const SETTLE_VS_PER_FT: f64 = 2.0;
 const SETTLE_VS_MIN_FPM: f64 = 300.0;
@@ -1258,6 +1261,16 @@ mod tests {
                 assert_eq!(end, Settle::Settling, "{t_s}");
             }
         }
+        // The same last look, held until the budget runs out.
+        let (_, alt_ft, ias_kts, _) = PHUGOID[PHUGOID.len() - 1];
+        let last = SettleSample {
+            t_s: SETTLE_MAX_S,
+            alt_ft,
+            ias_kts,
+            governed_kts: Some(296.0),
+            altimeter_ok: Some(false),
+        };
+        end = j.step(18_000.0, &last);
         let Settle::Unsettled(why) = end else { panic!("{end:?}") };
         assert_eq!(
             why,
@@ -1268,7 +1281,8 @@ mod tests {
             ]
         );
         let line = unsettled_line(&why);
-        assert!(line.starts_with("it has not settled after 60 seconds: 2985 feet"), "{line}");
+        let head = format!("it has not settled after {SETTLE_MAX_S:.0} seconds: 2985 feet");
+        assert!(line.starts_with(&head), "{line}");
         assert!(!line.contains('\u{2014}') && !line.contains('\u{2013}'));
     }
 
@@ -1303,7 +1317,7 @@ mod tests {
         let bare = |t_s| SettleSample { governed_kts: None, ..s(t_s, 18_000.0, 296.0) };
         assert_eq!(k.step(18_000.0, &bare(0.0)), Settle::Settling);
         assert_eq!(k.step(18_000.0, &bare(30.0)), Settle::Settling);
-        let Settle::Unsettled(why) = k.step(18_000.0, &bare(60.0)) else { panic!() };
+        let Settle::Unsettled(why) = k.step(18_000.0, &bare(SETTLE_MAX_S)) else { panic!() };
         assert_eq!(why, vec!["no speed hold".to_string()]);
     }
 

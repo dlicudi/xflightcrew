@@ -1172,7 +1172,7 @@ confirms it closes it (`fixes #N` in the commit). Known gaps are `owed` issues.
   a phugoid to 26,200 ft, `vertical_toward_dial`), the governor, and hands the world an IFR flight
   mid-route (`station::arm_new_flight_enroute`: the code kept, the nearest RADAR unit, COM1 on it;
   #177). **Ready only once settled** (`SettleJudge`: 150 ft of the dial for 10 s, the governor
-  within 10 kt, the altimeter set for the level; 60 s, else `enroute_settle` names what did not and
+  within 10 kt, the altimeter set for the level; 120 s, else `enroute_settle` names what did not and
   the result is `unsettled`). Its
   cruise may be fast-forwarded only by `sim_speed` steps, through the same guard.
   **Fast forward only where the laws tolerate it** (`SpeedGuard`; our ticks are wall time, so 4x is
