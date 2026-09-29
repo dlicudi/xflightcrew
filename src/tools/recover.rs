@@ -119,10 +119,15 @@ pub fn recovery_inputs(s: &RecoveryState) -> RecoveryCmd {
         // Unstall: push the nose down (reduce AoA), keep wings only gently level
         // (aggressive aileron near the stall risks a wing drop / spin), full power.
         // The push scales with how deep the stall is.
+        // Steeply banked, the push has unloaded the wing, so the roll gets full
+        // authority (upset recovery: push, ROLL, power): a 737 at 103 degrees
+        // held to 0.25 rolled on through inverted, 700 ft lost (LEMG 13
+        // 2026-09-29, a mouse yoke's full back and left; #181).
         let push = -STALL_PUSH * (s.stall_ratio.clamp(0.0, 1.0)).max(0.4);
+        let cap = stall_roll_cap(s.bank_deg);
         return RecoveryCmd {
             pitch: push.clamp(-STALL_PUSH, 0.0),
-            roll: roll.clamp(-0.25, 0.25),
+            roll: roll.clamp(-cap, cap),
             throttle: Some(RECOVERY_THROTTLE),
             stable: false,
         };
@@ -147,6 +152,15 @@ pub fn recovery_inputs(s: &RecoveryState) -> RecoveryCmd {
         throttle,
         stable,
     }
+}
+
+/// The stall branch's aileron limit: gentle near wings level (a wing drop
+/// risk), the flying branch's full 0.6 from 90 degrees of bank.
+pub fn stall_roll_cap(bank_deg: f64) -> f64 {
+    const GENTLE: f64 = 0.25;
+    const FULL: f64 = 0.6;
+    let f = ((bank_deg.abs() - 45.0) / 45.0).clamp(0.0, 1.0);
+    GENTLE + (FULL - GENTLE) * f
 }
 
 pub struct Recover {
@@ -964,6 +978,18 @@ mod tests {
         assert_eq!(c.throttle, Some(RECOVERY_THROTTLE));
         assert!(c.roll.abs() <= 0.25, "roll stays gentle near the stall");
         assert!(!c.stable);
+    }
+
+    #[test]
+    fn a_steep_stalled_bank_rolls_with_full_authority() {
+        // LEMG 13 2026-09-29: 103 degrees left, stall warning, rolling on left.
+        let mut s = state(-103.0, -0.2, 1.0, 178.0);
+        s.roll_rate_dps = -55.0;
+        let c = recovery_inputs(&s);
+        assert!(c.pitch < 0.0, "still unloads");
+        assert!((c.roll - 0.6).abs() < 1e-9, "full right aileron, got {}", c.roll);
+        assert_eq!(stall_roll_cap(30.0), 0.25);
+        assert!((stall_roll_cap(-67.5) - 0.425).abs() < 1e-9);
     }
 
     #[test]
