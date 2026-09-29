@@ -1234,6 +1234,7 @@ pub fn run_autoland_scoped(
                             cleared.as_deref(),
                             None,
                             false,
+                            None,
                         );
                         match switch_to.as_deref() {
                             Some(c) => match runway_by_id(
@@ -1537,6 +1538,24 @@ pub fn run_autoland_scoped(
             // how this loop gets round to a final it is on the wrong side of.
             let mut reversal: Option<crate::reversal::Reversal> = None;
             let mut reversals_flown: u32 = 0;
+            // The pattern's plan over the probed ground (#182), probed beside
+            // the loop (the plugin answers in seconds; the aircraft flies on),
+            // and when it began. Begun in the go-around's climb, so it is
+            // ready when the reposition wants it.
+            let mut reversal_plan: Option<(
+                tokio::task::JoinHandle<crate::reversal::PatternPlan>,
+                std::time::Instant,
+            )> = None;
+            // Straight ahead at a held altitude: while that plan is probed,
+            // or because no pattern here clears the ground (#182).
+            let mut hold: Option<TerrainHold> = None;
+            // The live floor over the ground under and ahead on every leg
+            // but the final (#182, the circuit's `live_floor_ft`): the floor
+            // and when it tripped, when it was last probed, and whether the
+            // spell has been said.
+            let mut live_floor: Option<(f64, std::time::Instant)> = None;
+            let mut live_floor_probed: Option<std::time::Instant> = None;
+            let mut live_floor_said = false;
             // How far out this approach has legitimately been: the arm
             // distance, pushed out by any pattern flown since.
             let mut recede_ref_nm = rwy.dist_nm;
@@ -1623,36 +1642,57 @@ pub fn run_autoland_scoped(
                         }
                         Some(_) => {}
                     }
+                    // A re-sequence the go-around order named is taken once
+                    // the climb away is flown (#182).
+                    let expected = if go_around.climbing() {
+                        None
+                    } else {
+                        orders.expected_runway()
+                    };
                     if let Some(c) = clearance_switch(
                         &rwy.id,
                         crate::party_line::clearance_state(),
                         cleared.as_deref(),
                         clearance_checked.as_deref(),
                         go_around.active(),
+                        expected.as_deref(),
                     ) {
                         clearance_checked = Some(c.clone());
+                        let resequenced = go_around.active();
                         match runway_by_id(&apt_dat, lat, lon, &c, 40.0, Some(rwy.icao.as_str())) {
                             Ok(Some(r)) if r.icao == rwy.icao => {
                                 crate::blackbox::record(
                                     "autoland",
                                     serde_json::json!({"event": "runway_from_clearance",
                                         "planned": rwy.id, "cleared": r.id, "in_flight": true,
+                                        "resequenced": resequenced,
                                         "radio": radio_ft, "dist": r.dist_nm}),
                                 );
                                 announce(
-                                    format!(
-                                        "Tower cleared us for runway {}, not {}. Setting up for runway {}.",
-                                        crate::circuit::spell_runway(&r.id),
-                                        crate::circuit::spell_runway(&rwy.id),
-                                        crate::circuit::spell_runway(&r.id)
-                                    ),
+                                    if resequenced {
+                                        format!(
+                                            "Tower expects us on runway {}. Setting up for runway {}.",
+                                            crate::circuit::spell_runway(&r.id),
+                                            crate::circuit::spell_runway(&r.id)
+                                        )
+                                    } else {
+                                        format!(
+                                            "Tower cleared us for runway {}, not {}. Setting up for runway {}.",
+                                            crate::circuit::spell_runway(&r.id),
+                                            crate::circuit::spell_runway(&rwy.id),
+                                            crate::circuit::spell_runway(&r.id)
+                                        )
+                                    },
                                     Priority::Caution,
                                 );
                                 // The mission's ONE arrival runway moves
                                 // with us, before the new loop arms: its
                                 // ILS tune, the crew's calls, the vacate
                                 // and the card read the cleared end (#64).
-                                crate::full_auto::retarget_arrival_runway(&r.id, "clearance");
+                                crate::full_auto::retarget_arrival_runway(
+                                    &r.id,
+                                    if resequenced { "resequenced" } else { "clearance" },
+                                );
                                 // A new loop owns the aircraft from its first
                                 // tick; this one exits on the generation bump
                                 // and leaves ACTIVE to it.
@@ -2086,7 +2126,8 @@ pub fn run_autoland_scoped(
                 // Set on the tick a pattern begins: its own line says what
                 // happens, so the phase change says nothing more.
                 let mut reversal_began = false;
-                if reversal.is_none() {
+                // A refused pattern is not asked for again: its hold flies.
+                if reversal.is_none() && !hold.as_ref().is_some_and(|h| h.refused) {
                     // The guidance's own aim: a join point behind only when
                     // the height cannot come off on the way in (#131).
                     let aim_along_nm = if aims_at_join_point(
@@ -2215,69 +2256,122 @@ pub fn run_autoland_scoped(
                         );
                         break;
                     }
-                    if wanted {
-                        reversals_flown += 1;
-                        // On the centreline there is no side yet: probe the
-                        // ground under both downwinds and fly the lower.
-                        let r_nm = crate::reversal::sizing_radius_nm(gs_kts);
-                        let default_platform = rwy.elev_ft + REPOSITION_MIN_AGL_FT;
-                        let join = join_point_nm(default_platform, rwy.elev_ft);
-                        let line = |side: f64| -> Vec<(f64, f64)> {
-                            (0..8)
-                                .map(|i| {
-                                    let along = -1.0 + (join + 2.0 + r_nm) * i as f64 / 7.0;
-                                    crate::reversal::pattern_point(&rwy, along, side * 3.0 * r_nm)
-                                })
-                                .collect()
-                        };
-                        let max_of = |v: Option<Vec<f64>>| {
-                            v.map(|v| v.into_iter().fold(f64::NEG_INFINITY, f64::max))
-                                .filter(|m| m.is_finite())
-                        };
-                        // One mailbox, so one after the other.
-                        let (left_pts, right_pts) = (line(-1.0), line(1.0));
-                        let left_ft = crate::terrain::sample_ft(&xp, &left_pts).await;
-                        let right_ft = crate::terrain::sample_ft(&xp, &right_pts).await;
-                        let (left_ft, right_ft) = (max_of(left_ft), max_of(right_ft));
-                        let side = crate::reversal::pick_side(xtk_now, left_ft, right_ft);
-                        let under = if side < 0.0 { left_ft } else { right_ft };
-                        let platform_ft = under
-                            .map_or(default_platform, |t| default_platform.max(t + 1000.0));
-                        reversal = Some(crate::reversal::Reversal {
-                            side,
-                            leg: crate::reversal::Leg::Outbound,
-                            platform_ft,
-                            high: false,
-                        });
-                        if missed == Some(MissedStage::Reposition) {
-                            go_around.hold_reposition();
+                    // The pattern is planned over the probed ground (#182,
+                    // `reversal::plan`), beside the loop: begun in the
+                    // go-around's climb (the reposition will want it), or the
+                    // tick it is wanted; a plan over a minute old is stale.
+                    let default_platform = rwy.elev_ft + REPOSITION_MIN_AGL_FT;
+                    if reversal_plan
+                        .as_ref()
+                        .is_some_and(|(_, t)| t.elapsed().as_secs_f64() > REVERSAL_PLAN_FRESH_S)
+                    {
+                        reversal_plan = None;
+                    }
+                    if (wanted || missed == Some(MissedStage::Climb)) && reversal_plan.is_none() {
+                        let task = crate::reversal::plan(
+                            XPlaneClient::new(base_url.clone()).with_parents(xp.cancellation()),
+                            rwy.clone(),
+                            along_nm,
+                            xtk_now,
+                            gs_kts,
+                            default_platform,
+                            (lat, lon, track_true, alt),
+                        );
+                        reversal_plan = Some((tokio::spawn(task), std::time::Instant::now()));
+                    }
+                    // Waiting on the plan: straight ahead, never lower than
+                    // the platform the old rule would have flown.
+                    if wanted && hold.is_none() {
+                        hold = Some(TerrainHold::waiting(track_true, alt.max(default_platform)));
+                    }
+                    if !wanted && hold.as_ref().is_some_and(|h| !h.refused) {
+                        hold = None;
+                    }
+                    let ready = wanted
+                        && reversal_plan.as_ref().is_some_and(|(h, _)| h.is_finished());
+                    let planned = if ready {
+                        match reversal_plan.take() {
+                            Some((h, _)) => h.await.ok(),
+                            None => None,
                         }
-                        reversal_began = true;
+                    } else {
+                        None
+                    };
+                    if let Some(plan) = planned {
                         let above_path_ft = alt - raw.glidepath_alt_ft;
-                        crate::blackbox::record(
-                            "autoland",
-                            serde_json::json!({"event": "reversal", "side": side,
-                                "platform_ft": platform_ft, "left_ft": left_ft, "right_ft": right_ft,
-                                "xtk_m": xtk_now * M_PER_NM, "dist": raw.dist_nm,
-                                "track": track_true, "missed": missed.is_some(),
-                                "final_called": raw.phase == ApproachPhase::Final,
-                                "why": crate::reversal::why(
-                                    missed.is_some(),
-                                    raw.phase == ApproachPhase::Final,
-                                    above_path_ft,
-                                ),
-                                "above_path_ft": above_path_ft, "aim_nm": aim_along_nm,
-                                "along": along_nm, "ias": ias, "gs": gs_kts}),
-                        );
-                        announce(
-                            format!(
-                                "Repositioning for runway {}: {} downwind at {:.0} feet.",
-                                crate::circuit::spell_runway(&rwy.id),
-                                if side < 0.0 { "left-hand" } else { "right-hand" },
-                                (platform_ft / 100.0).round() * 100.0
+                        let mut record = serde_json::json!({"event": "reversal", "side": plan.side,
+                            "platform_ft": plan.platform_ft,
+                            "xtk_m": xtk_now * M_PER_NM, "dist": raw.dist_nm,
+                            "track": track_true, "missed": missed.is_some(),
+                            "final_called": raw.phase == ApproachPhase::Final,
+                            "why": crate::reversal::why(
+                                missed.is_some(),
+                                raw.phase == ApproachPhase::Final,
+                                above_path_ft,
                             ),
-                            Priority::Advisory,
-                        );
+                            "above_path_ft": above_path_ft, "aim_nm": aim_along_nm,
+                            "along": along_nm, "ias": ias, "gs": gs_kts});
+                        if let (Some(r), Some(p)) = (record.as_object_mut(), plan.record.as_object()) {
+                            r.extend(p.clone());
+                        }
+                        crate::blackbox::record("autoland", record);
+                        match (plan.refused.as_deref(), plan.hold_ft) {
+                            // No pattern here clears the ground: climb straight
+                            // ahead to a height clear of it and hold it on the
+                            // autopilot, said with the numbers; the aircraft is
+                            // handed over only once it is there.
+                            (Some(why), hold_ft) => {
+                                let to = hold_ft.unwrap_or_else(|| alt.max(default_platform));
+                                hold = Some(TerrainHold::refused(track_true, to));
+                                announce(
+                                    format!(
+                                        "No pattern for runway {} clears the ground: {why}. \
+                                         Climbing straight ahead to {:.0} feet and holding it.",
+                                        crate::circuit::spell_runway(&rwy.id),
+                                        to
+                                    ),
+                                    Priority::Warning,
+                                );
+                            }
+                            (None, _) => {
+                                hold = None;
+                                reversals_flown += 1;
+                                reversal = Some(crate::reversal::Reversal {
+                                    side: plan.side,
+                                    leg: crate::reversal::Leg::Outbound,
+                                    platform_ft: plan.platform_ft,
+                                    high: false,
+                                });
+                                if missed == Some(MissedStage::Reposition) {
+                                    go_around.hold_reposition();
+                                }
+                                reversal_began = true;
+                                if matches!(
+                                    plan.why,
+                                    "switched_side_for_terrain" | "raised_for_terrain"
+                                ) {
+                                    crate::blackbox::record(
+                                        "autoland",
+                                        serde_json::json!({"event": "reversal_terrain",
+                                            "why": plan.why, "platform_ft": plan.platform_ft}),
+                                    );
+                                }
+                                announce(
+                                    format!(
+                                        "Repositioning for runway {}: {} downwind at {:.0} feet{}.",
+                                        crate::circuit::spell_runway(&rwy.id),
+                                        if plan.side < 0.0 { "left-hand" } else { "right-hand" },
+                                        (plan.platform_ft / 100.0).round() * 100.0,
+                                        match plan.why {
+                                            "raised_for_terrain" => ", raised for the high ground",
+                                            "switched_side_for_terrain" => ", the other side is high ground",
+                                            _ => "",
+                                        }
+                                    ),
+                                    Priority::Advisory,
+                                );
+                            }
+                        }
                     }
                 }
                 // Fly it: the pattern owns the heading, the platform and the
@@ -2565,8 +2659,136 @@ pub fn run_autoland_scoped(
                     }
                     None => g,
                 };
-                let outbound = pattern
-                    .is_some_and(|(_, leg, _)| leg != crate::reversal::Leg::Inbound);
+                // ...or the hold's (#182): straight ahead at its altitude,
+                // while the pattern is planned or because none clears the
+                // ground. A refusal hands over only once it is there, the
+                // autopilot holding heading and altitude and the governor the
+                // speed (`gave_up`): never "your aircraft" low over the hills.
+                let slow = approach_ias - ias > SPEED_FLOOR_MARGIN_KTS;
+                if pattern.is_some() {
+                    hold = None;
+                }
+                let hold_done = hold.as_mut().is_some_and(|h| h.level_now(alt));
+                if hold_done {
+                    let h = hold.take().expect("a hold that is done exists");
+                    gave_up = true;
+                    let _ = xp.set_float(VS_DIAL, 0.0).await;
+                    crate::blackbox::record(
+                        "autoland",
+                        serde_json::json!({"event": "give_up", "reason": "terrain_refused",
+                                           "hold_ft": h.alt_ft, "alt": alt, "radio": radio_ft}),
+                    );
+                    announce(
+                        format!(
+                            "Level at {:.0} feet, straight ahead, the autopilot holding heading and \
+                             altitude{}. Your aircraft.",
+                            h.alt_ft,
+                            if gear_down { ", gear is down" } else { "" }
+                        ),
+                        Priority::Warning,
+                    );
+                    break;
+                }
+                let g = match (pattern, hold) {
+                    (None, Some(h)) => Guidance {
+                        target_heading_deg: h.hdg_true,
+                        target_vs_fpm: crate::reversal::platform_vs_fpm(
+                            h.alt_ft,
+                            alt,
+                            slow,
+                            max_climb_fpm(),
+                            crate::procedure::descent_fpm(),
+                        ),
+                        target_ias_kts: pattern_ias(approach_ias, &crate::aircraft::flap_limits()),
+                        phase: ApproachPhase::Intercept,
+                        balk: None,
+                        arresting: false,
+                        ..g
+                    },
+                    _ => g,
+                };
+                // The live floor (#182): every leg but the final keeps
+                // `circuit::live_floor_ft` over the ground under and 1.5 nm
+                // ahead, probed every 2 s: the level legs climb 800 ft clear
+                // of it, the base and an intercept only keep the floor. The
+                // go-around's climb is its own; the final is the landing's.
+                // A steep (visual segment, mountain) approach's intercept is
+                // a valley's, flown on its published path: its walls ahead
+                // are not ours to climb away from.
+                let floor_leg = live_floor_leg(
+                    g.phase,
+                    missed,
+                    pattern.map(|(_, leg, _)| leg),
+                    hold.is_some(),
+                )
+                .filter(|_| {
+                    pattern.is_some()
+                        || hold.is_some()
+                        || missed.is_some()
+                        || glidepath_deg() <= 3.0 + 1e-9
+                });
+                let mut g = g;
+                if let Some(leg) = floor_leg {
+                    if live_floor_probed.is_none_or(|t| t.elapsed().as_secs_f64() >= LIVE_FLOOR_EVERY_S) {
+                        live_floor_probed = Some(std::time::Instant::now());
+                        let mut pts = vec![(lat, lon)];
+                        pts.extend(crate::procedure::look_ahead_points(
+                            lat,
+                            lon,
+                            track_true,
+                            crate::circuit::LIVE_LOOK_NM,
+                            crate::circuit::LIVE_LOOK_POINTS,
+                        ));
+                        if let Some(e) = crate::terrain::max_elevation_ft(&xp, &pts).await {
+                            if let Some(floor) = crate::circuit::live_floor_ft(leg, alt, e) {
+                                let raised = live_floor.is_none_or(|(f, _)| floor > f);
+                                live_floor = Some((
+                                    live_floor.map_or(floor, |(f, _)| f.max(floor)),
+                                    std::time::Instant::now(),
+                                ));
+                                if raised {
+                                    crate::blackbox::record(
+                                        "autoland",
+                                        serde_json::json!({"event": "terrain_floor",
+                                            "leg": format!("{leg:?}"),
+                                            "pattern_leg": pattern.map(|(_, l, _)| l.word()),
+                                            "hold": hold.is_some(), "ground_ft": e, "alt": alt,
+                                            "radio": radio_ft, "floor_ft": floor}),
+                                    );
+                                }
+                                if !live_floor_said {
+                                    live_floor_said = true;
+                                    announce(
+                                        format!(
+                                            "Terrain ahead. Holding {:.0} feet.",
+                                            (floor / 50.0).ceil() * 50.0
+                                        ),
+                                        Priority::Warning,
+                                    );
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    live_floor = None;
+                }
+                // A spell ends with its floor: the next one is said again.
+                live_floor = live_floor.filter(|(_, t)| t.elapsed().as_secs_f64() < LIVE_FLOOR_HOLD_S);
+                if live_floor.is_none() {
+                    live_floor_said = false;
+                }
+                if let Some((floor, _)) = live_floor {
+                    g.target_vs_fpm = g.target_vs_fpm.max(crate::reversal::platform_vs_fpm(
+                        floor,
+                        alt,
+                        slow,
+                        max_climb_fpm(),
+                        crate::procedure::descent_fpm(),
+                    ));
+                }
+                let g = g;
+                let outbound = hold.is_some()
+                    || pattern.is_some_and(|(_, leg, _)| leg != crate::reversal::Leg::Inbound);
                 let trim = track_trim.update(
                     g.phase,
                     g.target_heading_deg,
@@ -2921,6 +3143,9 @@ pub fn run_autoland_scoped(
                     // in the log and an overshoot cannot be read back to the
                     // leg that flew it.
                     "leg": pattern.map(|(_, leg, _)| leg.word()),
+                    // The hold's altitude (#182): planning, or refused.
+                    "hold_ft": hold.map(|h| h.alt_ft),
+                    "floor_ft": live_floor.map(|(f, _)| f),
                 }));
 
                 // Lateral: heading bug in MAGNETIC (guidance is TRUE — see
@@ -3439,6 +3664,7 @@ pub fn run_autoland_scoped(
                 // the turn inbound began (EGTE, 2026-09-21).
                 if missed.is_none()
                     && reversal.is_none()
+                    && hold.is_none()
                     && g.dist_nm > recede_ref_nm + RECEDING_GIVE_UP_NM
                 {
                     gave_up = true;
@@ -3561,18 +3787,30 @@ pub fn run_autoland_scoped(
 /// other end; nobody had cleared anything (2026-09-21). A missed approach is
 /// flown to its end, and the tower's answer to the next final report is where
 /// a new end comes from.
+///
+/// ...unless the tower's go-around ORDER itself named the end
+/// (`expected`, "expect runway one three", `GoAroundWatch::expected_runway`),
+/// and the published clearance agrees: that is a re-sequence, taken once the
+/// climb away is flown (the caller passes `expected` only then). LEMG,
+/// 2026-09-29 (sortie 1790668215-full_auto): sent round off 30 and
+/// re-sequenced to 13 at t+649, the reposition flew a right-hand pattern for
+/// 30 from t+661 and learnt of 13 only at t+984, 5.5 minutes later. Pure.
 pub fn clearance_switch(
     flying: &str,
     state: Option<crate::tower::State>,
     cleared: Option<&str>,
     already_checked: Option<&str>,
     going_around: bool,
+    expected: Option<&str>,
 ) -> Option<String> {
     use crate::tower::State::{ClearedToLand, Inbound};
-    if going_around || !matches!(state, Some(ClearedToLand | Inbound)) {
+    if !matches!(state, Some(ClearedToLand | Inbound)) {
         return None;
     }
     let c = cleared?.trim();
+    if going_around && !expected.is_some_and(|e| e.trim().eq_ignore_ascii_case(c)) {
+        return None;
+    }
     if !clearance_differs(flying, c) {
         return None;
     }
@@ -4376,6 +4614,153 @@ const FLOOR_BELOW_PATH_FT: f64 = -100.0;
 /// routing is the real fix; until then, climb to the altitude the rejoin
 /// needs and the highest terrain a sane approach corridor hides.
 const REPOSITION_MIN_AGL_FT: f64 = FAP_NM * GLIDEPATH_FT_PER_NM;
+/// A pattern plan older than this is stale: the aircraft has flown on from
+/// where its downwind was probed from.
+const REVERSAL_PLAN_FRESH_S: f64 = 60.0;
+
+/// Straight ahead at a held altitude, the loop's own command (#182): while
+/// the reversal's plan is probed (`waiting`), or because no pattern clears
+/// the ground (`refused`), which climbs to a height clear of the ground ahead
+/// and hands the aircraft over only once it holds it there.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct TerrainHold {
+    hdg_true: f64,
+    alt_ft: f64,
+    refused: bool,
+    /// Consecutive ticks level at the hold's altitude.
+    level_ticks: u32,
+}
+
+/// The live floor is probed this often, and a tripped floor stands this
+/// long after its last trip (the circuit's 2 s and 60 s).
+const LIVE_FLOOR_EVERY_S: f64 = 2.0;
+const LIVE_FLOOR_HOLD_S: f64 = 60.0;
+
+/// Ticks level at a refusal's altitude before the aircraft is handed over.
+const HOLD_LEVEL_TICKS: u32 = 8;
+/// ...level within this.
+const HOLD_LEVEL_FT: f64 = 100.0;
+
+impl TerrainHold {
+    fn waiting(hdg_true: f64, alt_ft: f64) -> Self {
+        TerrainHold {
+            hdg_true,
+            alt_ft,
+            refused: false,
+            level_ticks: 0,
+        }
+    }
+
+    fn refused(hdg_true: f64, alt_ft: f64) -> Self {
+        TerrainHold {
+            refused: true,
+            ..Self::waiting(hdg_true, alt_ft)
+        }
+    }
+
+    /// One tick at `alt_ft`: true once a refusal has held its altitude long
+    /// enough to be handed over (the autopilot holding it). Pure.
+    fn level_now(&mut self, alt_ft: f64) -> bool {
+        if (alt_ft - self.alt_ft).abs() <= HOLD_LEVEL_FT {
+            self.level_ticks += 1;
+        } else {
+            self.level_ticks = 0;
+        }
+        self.refused && self.level_ticks >= HOLD_LEVEL_TICKS
+    }
+}
+
+/// The circuit's leg whose live floor (`circuit::live_floor_ft`) a reversal
+/// leg or a hold keeps: the level legs climb clear of ground ahead, the base
+/// (and the ordinary intercept, descending to its path) only keeps the floor
+/// itself. `None` on the final and in the go-around's own climb. Pure.
+fn live_floor_leg(
+    phase: ApproachPhase,
+    missed: Option<MissedStage>,
+    pattern_leg: Option<crate::reversal::Leg>,
+    holding: bool,
+) -> Option<crate::circuit::Leg> {
+    use crate::circuit::Leg as C;
+    if phase != ApproachPhase::Intercept || missed == Some(MissedStage::Climb) {
+        return None;
+    }
+    Some(match pattern_leg {
+        Some(crate::reversal::Leg::Base) => C::Base,
+        Some(_) => C::Downwind,
+        None if holding || missed.is_some() => C::Downwind,
+        None => C::Base,
+    })
+}
+
+#[cfg(test)]
+mod terrain_hold_tests {
+    use super::*;
+
+    /// #182: the live floor rides every leg but the final and the go-around's
+    /// own climb; the level legs climb clear of ground ahead, the base and
+    /// an intercept keep the floor itself. LEMG 13 (sortie
+    /// 1790668215-full_auto, t+1795): 2,565 ft over 2,043 on the downwind
+    /// was 522 ft, a hair outside the 500 ft trip (the corridor plan is the
+    /// fix, the floor the backstop); 25 ft lower it climbs to 2,843.
+    #[test]
+    fn the_live_floor_rides_every_leg_but_the_final() {
+        use crate::circuit::Leg as C;
+        use crate::reversal::Leg as R;
+        let i = ApproachPhase::Intercept;
+        assert_eq!(
+            live_floor_leg(i, None, Some(R::Outbound), false),
+            Some(C::Downwind)
+        );
+        assert_eq!(live_floor_leg(i, None, Some(R::Base), false), Some(C::Base));
+        assert_eq!(
+            live_floor_leg(i, None, Some(R::Inbound), false),
+            Some(C::Downwind)
+        );
+        assert_eq!(live_floor_leg(i, None, None, true), Some(C::Downwind));
+        assert_eq!(
+            live_floor_leg(i, Some(MissedStage::Reposition), None, false),
+            Some(C::Downwind)
+        );
+        assert_eq!(live_floor_leg(i, None, None, false), Some(C::Base));
+        assert_eq!(
+            live_floor_leg(i, Some(MissedStage::Climb), None, false),
+            None
+        );
+        assert_eq!(
+            live_floor_leg(ApproachPhase::Final, None, None, false),
+            None
+        );
+        assert_eq!(
+            live_floor_leg(ApproachPhase::Flare, None, None, false),
+            None
+        );
+        assert_eq!(
+            crate::circuit::live_floor_ft(C::Downwind, 2564.7, 2043.0),
+            None
+        );
+        let floor = crate::circuit::live_floor_ft(C::Downwind, 2540.0, 2043.0);
+        assert_eq!(floor, Some(2843.0));
+    }
+
+    /// A refusal hands over only once level at its altitude, the autopilot
+    /// holding it; a hold waiting on the plan never does.
+    #[test]
+    fn a_refusal_hands_over_only_once_level_at_its_altitude() {
+        let mut h = TerrainHold::refused(133.0, 3100.0);
+        for _ in 0..20 {
+            assert!(!h.level_now(2600.0), "climbing: still ours");
+        }
+        for _ in 0..HOLD_LEVEL_TICKS - 1 {
+            assert!(!h.level_now(3080.0));
+        }
+        assert!(h.level_now(3060.0));
+        let mut w = TerrainHold::waiting(133.0, 1700.0);
+        for _ in 0..50 {
+            assert!(!w.level_now(1700.0));
+        }
+    }
+}
+
 /// Only climb with this much surplus over the approach speed. Climbing slow in a
 /// marginal airframe bleeds energy to a stall (the reason this loop was
 /// descent-only) — so a low-and-slow aircraft holds level and lets the throttle
@@ -5972,6 +6357,11 @@ impl GoAroundLatch {
     /// Is a missed approach being flown right now?
     pub fn active(&self) -> bool {
         self.stage.is_some()
+    }
+
+    /// ...and still in its straight-ahead climb away from the ground?
+    pub fn climbing(&self) -> bool {
+        self.stage == Some(MissedStage::Climb)
     }
 
     /// The loop flies the reposition as a pattern: hold the stage until told.
@@ -7884,7 +8274,7 @@ mod tests {
     #[test]
     fn a_landing_clearance_for_another_end_moves_the_approach_once() {
         use crate::tower::State::*;
-        let sw = |f, st, c, a| super::clearance_switch(f, st, c, a, false);
+        let sw = |f, st, c, a| super::clearance_switch(f, st, c, a, false, None);
         assert_eq!(
             sw("27", Some(ClearedToLand), Some("09"), None),
             Some("09".into())
@@ -7892,7 +8282,7 @@ mod tests {
         // EGTE 2026-09-21: the go-around's own state change published the
         // flipped runway in use. A missed approach is never re-aimed.
         assert_eq!(
-            super::clearance_switch("08", Some(Inbound), Some("26"), None, true),
+            super::clearance_switch("08", Some(Inbound), Some("26"), None, true, None),
             None
         );
         // Told to join the other end on the inbound call: same switch, earlier.
@@ -7908,6 +8298,100 @@ mod tests {
         assert_eq!(sw("27", Some(TakeoffCleared), Some("09"), None), None);
         assert_eq!(sw("27", Some(TaxiCleared), Some("09"), None), None);
         assert_eq!(sw("27", None, Some("09"), None), None);
+    }
+
+    /// #182, LEMG 2026-09-29 (sortie 1790668215-full_auto): at t+649.4 the
+    /// tower sent the 737 round off 30 ("go around, traffic on the runway
+    /// ... expect runway one three", atc `resequenced` 30 to 13, oncoming),
+    /// and the FSM sync published 13 with `Inbound`. The missed approach
+    /// read no switch; the reposition flew a right-hand pattern for 30 from
+    /// t+661.3 and found 13 only at t+984.6, once `reversal_done` ended the
+    /// missed approach. The order's own runway is a re-sequence: taken once
+    /// the climb away is flown, and only when the clearance agrees with it.
+    #[test]
+    fn a_go_around_order_that_resequences_moves_the_approach_after_the_climb() {
+        use crate::tower::State::{ClearedToLand, Inbound};
+        // Past the climb (the caller passes the order's runway): 13 now.
+        assert_eq!(
+            super::clearance_switch("30", Some(Inbound), Some("13"), None, true, Some("13")),
+            Some("13".into())
+        );
+        // In the climb, or with an order that named none (EGTE's runway in
+        // use flipping under a go-around): the missed approach is flown.
+        assert_eq!(
+            super::clearance_switch("30", Some(Inbound), Some("13"), None, true, None),
+            None
+        );
+        // The clearance must agree with the order: a runway in use that has
+        // moved on again is not what the tower told us to expect.
+        assert_eq!(
+            super::clearance_switch("30", Some(Inbound), Some("12"), None, true, Some("13")),
+            None
+        );
+        // Looked up once, and never onto a departure's runway.
+        assert_eq!(
+            super::clearance_switch(
+                "30",
+                Some(Inbound),
+                Some("13"),
+                Some("13"),
+                true,
+                Some("13")
+            ),
+            None
+        );
+        assert_eq!(
+            super::clearance_switch(
+                "30",
+                Some(crate::tower::State::TakeoffCleared),
+                Some("13"),
+                None,
+                true,
+                Some("13")
+            ),
+            None
+        );
+        // Already flying the expected end: nothing to do.
+        assert_eq!(
+            super::clearance_switch(
+                "13",
+                Some(ClearedToLand),
+                Some("13"),
+                None,
+                true,
+                Some("13")
+            ),
+            None
+        );
+        // The latch says when the climb is flown: straight ahead to 800 ft
+        // radio, then the reposition (the recorded 748 ft order, 856 ft at
+        // the pattern's start).
+        let mut latch = super::GoAroundLatch::new();
+        assert!(latch.order(false));
+        assert!(latch.climbing());
+        latch.update(
+            Some(ApproachPhase::Final),
+            ApproachPhase::Intercept,
+            748.0,
+            1.53,
+            1.53,
+            5.75,
+            0.008,
+        );
+        assert!(latch.climbing(), "still climbing away at 748 ft");
+        latch.update(
+            Some(ApproachPhase::Intercept),
+            ApproachPhase::Intercept,
+            856.0,
+            1.0,
+            1.0,
+            5.75,
+            0.009,
+        );
+        assert!(
+            !latch.climbing() && latch.active(),
+            "repositioning: the re-sequence is taken"
+        );
     }
 
     #[test]

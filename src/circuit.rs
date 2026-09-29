@@ -651,8 +651,8 @@ const LIVE_FLOOR_CLIMB_FT: f64 = 800.0;
 /// How far ahead along the track the live floor looks, nm, and in how many
 /// points: 1.5 nm is 25 s at a jet's 210 kt pattern speed, time to arrest a
 /// 1,500 fpm descent; four points and the one under us are one probe query.
-const LIVE_LOOK_NM: f64 = 1.5;
-const LIVE_LOOK_POINTS: usize = 4;
+pub const LIVE_LOOK_NM: f64 = 1.5;
+pub const LIVE_LOOK_POINTS: usize = 4;
 
 /// The floor the circuit holds over `ground_ft` (the highest ground under
 /// and ahead), `None` while `alt_msl_ft` keeps [`LIVE_FLOOR_FT`] over it
@@ -1097,7 +1097,7 @@ const AIRBORNE_MIN_AGL_FT: f64 = 300.0;
 /// leg nobody is looking out of (#182). It was 600, checked on the drawn line
 /// alone: the 737's LEMG 13 left side read 729 ft and was flown at 1,548
 /// (sortie 1790599750), the downwind 1.3 km outside that line.
-const PATTERN_TERRAIN_CLEAR_FT: f64 = 1000.0;
+pub const PATTERN_TERRAIN_CLEAR_FT: f64 = 1000.0;
 /// The authored LXGB route's own figure ([`raise_for_terrain`]), kept at the
 /// 600 ft it was flown and checked on (2026-07-26, 2026-09-15): its legs are
 /// the drawn lines themselves, joined and captured within
@@ -2311,8 +2311,8 @@ pub fn pattern_advance(
 /// all but the worst, and 0.25 in covers the tight airframe. The LEMG 13
 /// base turn that went 305 ft over the ground (1790599750) was 1,200 m
 /// outside the corner, between the two outer copies.
-const CORRIDOR_OUT_RADII: [f64; 2] = [0.5, 1.0];
-const CORRIDOR_IN_RADII: f64 = 0.25;
+pub const CORRIDOR_OUT_RADII: [f64; 2] = [0.5, 1.0];
+pub const CORRIDOR_IN_RADII: f64 = 0.25;
 /// Sample spacing on the corridor's copies, metres: twice the line's
 /// [`LEG_SAMPLE_M`], so the probe stays a few seconds on the runway. The
 /// line itself keeps its 150 m (the Rock's 300 m ridge).
@@ -2334,7 +2334,7 @@ const DESCENT_FLOOR_FULL_NM: f64 = 2.0;
 /// final: PANS-OPS's upper limit for a procedure that is not a steep approach
 /// (anything past it needs an approval no profile declares). Autoland is
 /// handed the same angle (`autoland::set_next_glidepath_deg`).
-const STEEP_PATH_MAX_DEG: f64 = 3.5;
+pub const STEEP_PATH_MAX_DEG: f64 = 3.5;
 /// A raise smaller than this is carried out but not said: with 1,000 ft of
 /// clearance a 1,000 ft pattern lifts over any ground above the field, and
 /// "flying it at 1,030 feet" is noise.
@@ -2488,7 +2488,18 @@ pub fn check_descent(
     field_elev_ft: f64,
     tpa_msl_ft: f64,
 ) -> DescentCheck {
-    let default = DescentShape::default();
+    check_descent_from(samples, field_elev_ft, tpa_msl_ft, DescentShape::default())
+}
+
+/// [`check_descent`] from a `default` descent other than the circuit's (its
+/// 800 ft downwind platform): autoland's reversal holds its pattern altitude
+/// until the path meets it (`reversal::judge`, #182). Pure.
+pub fn check_descent_from(
+    samples: &[GroundSample],
+    field_elev_ft: f64,
+    tpa_msl_ft: f64,
+    default: DescentShape,
+) -> DescentCheck {
     let over_ground = |shape: DescentShape| {
         samples
             .iter()
@@ -2609,6 +2620,58 @@ pub fn choose_pattern(
     field_elev_ft: f64,
     tpa_agl_ft: f64,
 ) -> PatternPick {
+    choose_pattern_with(
+        default_left,
+        l,
+        r,
+        field_elev_ft,
+        tpa_agl_ft,
+        PickRules::circuit(tpa_agl_ft),
+    )
+}
+
+/// How [`choose_pattern_with`] raises a side and where its descent starts:
+/// the circuit's rectangle, or autoland's reversal (`reversal::judge`, #182),
+/// one rule behind both.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PickRules {
+    /// A raised side flies this far over the highest ground under its level
+    /// legs, at least [`PATTERN_TERRAIN_CLEAR_FT`].
+    pub raise_over_ft: f64,
+    /// The descent starts from the pattern altitude itself (the reversal's
+    /// inbound holds its platform until the 3 degree path comes down to it),
+    /// not from the circuit's 800 ft downwind platform.
+    pub descend_from_pattern: bool,
+}
+
+impl PickRules {
+    /// The circuit: a raised pattern keeps a pattern height over the ground.
+    pub fn circuit(tpa_agl_ft: f64) -> Self {
+        PickRules {
+            raise_over_ft: tpa_agl_ft.max(PATTERN_TERRAIN_CLEAR_FT),
+            descend_from_pattern: false,
+        }
+    }
+
+    /// Autoland's reversal: the lowest legal platform (its join point moves
+    /// out with every foot of it), descending on the path from it.
+    pub fn reversal() -> Self {
+        PickRules {
+            raise_over_ft: PATTERN_TERRAIN_CLEAR_FT,
+            descend_from_pattern: true,
+        }
+    }
+}
+
+/// [`choose_pattern`] under `rules`. Pure.
+pub fn choose_pattern_with(
+    default_left: bool,
+    l: &SideFacts,
+    r: &SideFacts,
+    field_elev_ft: f64,
+    tpa_agl_ft: f64,
+    rules: PickRules,
+) -> PatternPick {
     let tpa = field_elev_ft + tpa_agl_ft;
     let level_ok = |f: &SideFacts, at: f64| {
         f.terrain_max_ft
@@ -2618,11 +2681,23 @@ pub fn choose_pattern(
     // over the ground: a 1,000 ft clearance under an 800 ft pattern would
     // otherwise leave it lower than the rule.
     let raise = |f: &SideFacts| match f.terrain_max_ft {
-        Some(m) => (m + tpa_agl_ft.max(PATTERN_TERRAIN_CLEAR_FT)).max(tpa),
+        Some(m) => (m + rules.raise_over_ft.max(PATTERN_TERRAIN_CLEAR_FT)).max(tpa),
         None => tpa,
     };
     let side_facts = |left: bool| if left { l } else { r };
-    let descent = |left: bool, at: f64| check_descent(&side_facts(left).descent, field_elev_ft, at);
+    let from = |at: f64| {
+        if rules.descend_from_pattern {
+            DescentShape {
+                platform_agl_ft: at - field_elev_ft,
+                ..DescentShape::default()
+            }
+        } else {
+            DescentShape::default()
+        }
+    };
+    let descent = |left: bool, at: f64| {
+        check_descent_from(&side_facts(left).descent, field_elev_ft, at, from(at))
+    };
     let pick = |left: bool, at: f64, why: &'static str, shape: DescentShape| PatternPick {
         left,
         tpa_msl_ft: at,
@@ -2846,7 +2921,7 @@ fn corridor_frame(g: &Geometry, runway_len_m: f64, left: bool) -> Vec<FramePt> {
 /// Inside this of the threshold the descent is autoland's (the circuit hands
 /// over further out, and the last mile's ground is the runway's own slope,
 /// which the path's floor would read as a hill).
-const DESCENT_CHECK_FROM_M: f64 = M_PER_NM;
+pub const DESCENT_CHECK_FROM_M: f64 = M_PER_NM;
 
 /// The part of the descent a probe point is flown on, as [`leg_target_ft`]
 /// flies it: `None` for the legs flown level (the crosswind, the downwind
@@ -2952,7 +3027,7 @@ fn shorter_downwinds(dn_m: f64, min_m: f64) -> Vec<f64> {
 /// than `step_m`. The Rock's ridge is ~300 m wide and the rectangle's eight
 /// downwind samples were 580 m apart: the probe reported 650 ft of terrain
 /// under a side whose ridge stands at ~1,150 (2026-09-14).
-fn densify(pts: &[(f64, f64)], step_m: f64) -> Vec<(f64, f64)> {
+pub fn densify(pts: &[(f64, f64)], step_m: f64) -> Vec<(f64, f64)> {
     let mut out = Vec::with_capacity(pts.len() * 4);
     for (i, &(a, x)) in pts.iter().enumerate() {
         if i > 0 {

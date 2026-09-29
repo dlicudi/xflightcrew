@@ -10755,3 +10755,68 @@ runway 30 downwind 475 (1790633832), 31 downwind 636, 13 downwind 650. The `arme
 `refused`; `left_max_ft` / `right_max_ft` stay the line's. The corridor probe is about 44 queries on
 a jet (about 5 s on the runway, 2 s before). Offline only; the next LEMG circuit's `armed` record
 should name the refusal or the raised shape.
+
+## 2026-09-29: SAFETY, autoland's reversal judged by the circuit's corridor rule; a go-around's "expect runway" taken (#181, #182)
+
+Sortie 1790668215-full_auto (737, LEMG, t0 = 1790668000). Two faults in one missed approach.
+
+**The reversal had no terrain rule worth the name.** `reversal` records: t+985.9 and t+1589.3,
+"Repositioning for runway one three: left-hand downwind at 2600 feet", `left_ft` 1,607 / 1,644
+(eight points on the DRAWN downwind line, 1.9 nm apart) plus 1,000. From the `state` records
+(ground = alt less agl, on 13's axes): the downwind was flown 4.6 to 4.8 nm left against a drawn
+3.9 (r 1.3 to 1.4 nm, so 0.3 to 0.45 r outside, the circuit's measured spread), and passed 633 ft
+AGL at t+1320 and 522 ft AGL over 2,043 ft of hill at t+1795 (2,565 MSL, 8.7 nm out). The base and
+the inbound were never probed (the inbound crossed 1,180 ft on the centreline at 10.5 nm). The
+t+661 pattern for 30 was over the sea at 1,700 ft AGL; its 677 ft was the go-around point itself
+(t+656, 1.3 nm out), not the pattern.
+
+- `reversal::plan` (run beside the autoland loop, `tokio::spawn`, begun in the go-around's climb):
+  `side_frame` probes each side's downwind (from the aircraft, or 1 nm past the threshold) and base
+  on the drawn line every 0.2 nm and on copies `circuit::CORRIDOR_OUT_RADII` out and
+  `CORRIDOR_IN_RADII` in every 0.3 nm; `inbound_frame` the centreline from beyond the widest base,
+  level until the 3 degree path meets the platform and then the path to 1 nm. `side_facts` puts
+  it in the circuit's terms and `judge` is `circuit::choose_pattern_with` under
+  `PickRules::reversal` (raise to 1,000 over the level legs' highest ground, the descent from the
+  platform itself: `check_descent_from`), so the side, switch and raise are the circuit's one rule.
+  A raise moves the join point and the base out, so the corridor is probed again where it moved
+  (`reprobe_at`, at most 4 rounds; flown at the higher of the corridor judged and the pick).
+- Refused: a final the 3 degree path cannot clear by the circuit's 500 ft (tapering inside 2 nm;
+  autoland flies its own path, so a steepened shape is a refusal too), a join point past 15 nm, or
+  a platform still rising after 4 probes. The loop then climbs straight ahead (`TerrainHold`) to
+  1,000 ft over the ground 12 nm ahead (`hold_altitude_ft`), said with the numbers ("No pattern for
+  runway X clears the ground: ... Climbing straight ahead to N feet and holding it."), and hands
+  over only after 8 ticks level there, the autopilot holding heading and altitude and the governor
+  the speed (`give_up` `terrain_refused`). While the plan is probed the loop holds its track and
+  at least the old platform.
+- The live floor rides every autoland leg but the final and the go-around's own climb
+  (`live_floor_leg`, `circuit::live_floor_ft` every 2 s, 60 s spells): the reversal's downwind,
+  inbound, hold and reposition climb 800 ft clear of ground inside 500 ft under or 1.5 nm ahead;
+  the base and an ordinary intercept keep 500; not on a steep approach's intercept. Blackbox
+  `autoland` `terrain_floor`; ticks carry `hold_ft` and `floor_ft`. (The recorded 522 ft sat just
+  outside the trip: the corridor plan is the fix, the floor the backstop.)
+- The `reversal` record now carries `terrain`, `rounds`, `side_pick`, `left_line_ft` /
+  `right_line_ft` (the old numbers), `left_corridor_max_ft` / `right_corridor_max_ft`,
+  `judged_at_ft`, `picked_ft`, both sides' descent checks, `refused` and `hold_ft`
+  (`left_ft` / `right_ft` are gone).
+
+On a model of the recorded ground (`lemg13_ground`), the t+1589 pattern is flown right-hand
+(the Guadalhorce side, 1,653 ft) at 2,653 ft, `raised_for_terrain`, 1,000 ft over every level
+point; the left side would have needed 3,043. The real corridor copies were never probed, so the
+next flight's numbers are the test.
+
+**The re-sequence was not taken.** At t+649.4 the tower sent the 737 round off 30 ("go around,
+traffic on the runway ... expect runway one three", atc `resequenced` 30 to 13, oncoming), and the
+FSM sync published 13 with `Inbound`. `clearance_switch` refuses every switch during a missed
+approach (EGTE 2026-09-21: the runway in use flipping under a go-around is not a clearance), and
+the pattern held the missed approach open until `reversal_done` at t+983.5: the pattern flew for
+30 from t+661 and found 13 only at t+984.6 ("Tower cleared us for runway one three, not three
+zero"). Now the order carries its runway: the station publishes `RESEQUENCED_ORDER` (the order's
+number and the runway, before the count moves; `None` for an order naming none; retired with
+`PENDING_RESEQUENCE`), the crew reads it through `GoAroundOrders::expected_runway` (only orders
+since its watch armed), and `clearance_switch` takes a switch during a missed approach only when
+the published clearance equals that runway and the climb away is flown (`GoAroundLatch::climbing`).
+Said "Tower expects us on runway one three"; `runway_from_clearance` `resequenced: true`, arrival
+`why: resequenced`. On these records the switch comes at the reposition, about t+661.
+
+Offline only. Next LEMG go-around: `runway_from_clearance` with `resequenced` right after the
+climb, then a `reversal` record with `terrain: probed` and the corridor numbers.

@@ -26,7 +26,8 @@ pub(crate) use crate::party_line::{
     IfrFlight, ARRIVAL_PIN, ASSIGNED_SQUAWK, CLEARANCE, DEPARTURE_HANDOFF, GO_AROUND_ORDERS,
     IFR_CLEARANCE, IFR_FLIGHT, LANDING_HANDOFF, LANDING_HOLD, LINE_UP_CONDITION, PENDING_GO_AROUND,
     PENDING_LANDING_RELEASE, PENDING_LINE_UP, PENDING_STATION, PENDING_TAKEOFF_CLEARANCE,
-    REGION_HANDOFF, SQUAWK_NUDGE, TAKEOFF_HOLD, TAXI_ROUTE, TAXI_TO_STAND, VECTORS, ZONE_CHALLENGE,
+    REGION_HANDOFF, RESEQUENCED_ORDER, SQUAWK_NUDGE, TAKEOFF_HOLD, TAXI_ROUTE, TAXI_TO_STAND,
+    VECTORS, ZONE_CHALLENGE,
 };
 
 // The airline telephony and the ghost speaker live with the callsign
@@ -383,6 +384,7 @@ impl Station {
         *PENDING_LINE_UP.lock().unwrap_or_else(|e| e.into_inner()) = false;
         *PENDING_GO_AROUND.lock().unwrap_or_else(|e| e.into_inner()) = false;
         *PENDING_RESEQUENCE.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        *RESEQUENCED_ORDER.lock().unwrap_or_else(|e| e.into_inner()) = None;
         *GO_AROUND_LAST.lock().unwrap_or_else(|e| e.into_inner()) = None;
         *LANDING_HOLD.lock().unwrap_or_else(|e| e.into_inner()) = None;
         *PENDING_LANDING_RELEASE
@@ -485,6 +487,7 @@ impl Station {
         *PENDING_LINE_UP.lock().unwrap_or_else(|e| e.into_inner()) = false;
         *PENDING_GO_AROUND.lock().unwrap_or_else(|e| e.into_inner()) = false;
         *PENDING_RESEQUENCE.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        *RESEQUENCED_ORDER.lock().unwrap_or_else(|e| e.into_inner()) = None;
         *ZONE_CHALLENGE.lock().unwrap_or_else(|e| e.into_inner()) = false;
     }
 
@@ -4077,6 +4080,7 @@ pub fn retire_for_new_flight() {
     *PENDING_LINE_UP.lock().unwrap_or_else(|e| e.into_inner()) = false;
     *PENDING_GO_AROUND.lock().unwrap_or_else(|e| e.into_inner()) = false;
     *PENDING_RESEQUENCE.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    *RESEQUENCED_ORDER.lock().unwrap_or_else(|e| e.into_inner()) = None;
     *LANDING_HOLD.lock().unwrap_or_else(|e| e.into_inner()) = None;
     *PENDING_LANDING_RELEASE
         .lock()
@@ -6504,8 +6508,6 @@ pub fn go_around_tick(
     // is shouting go around (seen live, 2026-07-14). The sync is handed to
     // the main loop, which owns the `Station`, same as the hold release.
     *PENDING_GO_AROUND.lock().unwrap_or_else(|e| e.into_inner()) = true;
-    // ...and the order itself, for every crew loop that flies it.
-    GO_AROUND_ORDERS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     // An occupant that will not leave on its own clock (standing, or using
     // the other direction) would send the next approach round the same way:
     // the tower re-sequences now (issue #162). Only a flight on the
@@ -6515,6 +6517,16 @@ pub fn go_around_tick(
     } else {
         None
     };
+    // The runway the order names rides with it, published BEFORE its count
+    // moves, so a crew watch that sees the order sees its runway (#182).
+    *RESEQUENCED_ORDER.lock().unwrap_or_else(|e| e.into_inner()) = expect.clone().map(|to| {
+        (
+            GO_AROUND_ORDERS.load(std::sync::atomic::Ordering::SeqCst) + 1,
+            to,
+        )
+    });
+    // ...and the order itself, for every crew loop that flies it.
+    GO_AROUND_ORDERS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     Some(if tuned {
         let expect = expect
             .map(|to| format!("expect runway {}, ", atis::spoken_runway(&to)))
@@ -11135,6 +11147,7 @@ mod tests {
         *PENDING_LANDING_RELEASE.lock().unwrap() = None;
         *PENDING_GO_AROUND.lock().unwrap() = false;
         *PENDING_RESEQUENCE.lock().unwrap() = None;
+        *RESEQUENCED_ORDER.lock().unwrap() = None;
         *GO_AROUND_LAST.lock().unwrap() = None;
         *STRIP_SEEN.lock().unwrap() = None;
         *STANDING.lock().unwrap() = None;
@@ -11267,6 +11280,9 @@ mod tests {
         ] {
             assert!(go_around_tick(&[lander(along, gnd)], 380.0, false, true, at(t)).is_none());
         }
+        // The crew's watch, armed on the approach (#182).
+        let watch = crate::party_line::GoAroundOrders::arm();
+        assert_eq!(watch.expected_runway(), None);
         let call = go_around_tick(
             std::slice::from_ref(&touchdown),
             359.0,
@@ -11285,6 +11301,14 @@ mod tests {
         assert_eq!(
             *PENDING_RESEQUENCE.lock().unwrap(),
             Some(("30".to_string(), "12".to_string()))
+        );
+        // The order's runway rides with the order, for the crew that flies
+        // it (#182): a watch armed before it sees "12", one armed after
+        // (a later approach) sees nothing.
+        assert_eq!(watch.expected_runway().as_deref(), Some("12"));
+        assert_eq!(
+            crate::party_line::GoAroundOrders::arm().expected_runway(),
+            None
         );
         // The FSM sync.
         let mut st = lxgb();
@@ -11337,6 +11361,29 @@ mod tests {
         );
         // Said once: the next go-around call is the plain answer.
         assert!(st.resequenced.is_none());
+        reset_runway_watch();
+    }
+
+    /// #182: the runway a go-around order names is the LATEST order's. An
+    /// order that names none leaves nothing for the crew to re-aim on (a
+    /// new flight, install and uninstall retire it with `PENDING_RESEQUENCE`).
+    #[test]
+    fn an_order_without_a_runway_retires_the_last_orders_runway() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let _guard = SIDE_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let watch = crate::party_line::GoAroundOrders::arm();
+        *RESEQUENCED_ORDER.lock().unwrap() = Some((GO_AROUND_ORDERS.load(SeqCst) + 1, "13".into()));
+        GO_AROUND_ORDERS.fetch_add(1, SeqCst);
+        assert_eq!(watch.expected_runway().as_deref(), Some("13"));
+        // Published before the count moves: never seen early by a watch armed
+        // between the two writes.
+        *RESEQUENCED_ORDER.lock().unwrap() = Some((GO_AROUND_ORDERS.load(SeqCst) + 1, "12".into()));
+        assert_eq!(watch.expected_runway(), None, "its order is not given yet");
+        GO_AROUND_ORDERS.fetch_add(1, SeqCst);
+        assert_eq!(watch.expected_runway().as_deref(), Some("12"));
+        *RESEQUENCED_ORDER.lock().unwrap() = None;
+        GO_AROUND_ORDERS.fetch_add(1, SeqCst);
+        assert_eq!(watch.expected_runway(), None);
         reset_runway_watch();
     }
 
