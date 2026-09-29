@@ -462,6 +462,50 @@ pub fn speed_governor() -> Option<SpeedGovernorProfile> {
     live_profile().and_then(|p| p.speed_governor).and_then(SpeedGovernorProfile::valid)
 }
 
+/// The rotation's elevator on the wheels (`autotakeoff::RotatePitch`),
+/// fitted: the column the nose needs to come up at a rate and to be held up
+/// on the main wheels, and the column that holds the attitude once flying.
+/// Declared, the rotation law feeds that column forward (a share of it,
+/// `autotakeoff::ROTATE_MODEL_SHARE`) and its own P+I only corrects; `None`
+/// is the P+I alone, as ever.
+///
+/// Why it exists (LEMG, the SR22, 2026-09-29, #184): on the wheels the tail
+/// holds the nose down with a SPRING (its angle of attack is the attitude),
+/// 0.033 of column per degree, as stiff as the law's own 0.03 per degree of
+/// error. The proportional pull met the spring near 3 degrees and the
+/// integrator, 0.01 per degree-second, took five more seconds to find the
+/// rest: the nose sat at 3 degrees through 88 to 94 KIAS and the aircraft
+/// lifted off at 98 to 100 KIAS on every flight, rotate 73 (1790682305 at a
+/// 0.25 s tick, 1790690995 and 1790694884 at 0.4 s).
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct RotateElevatorProfile {
+    /// The airspeed the column figures are given at, knots; the column
+    /// figures scale as `(ref_kts / ias)^2`.
+    pub ref_kts: f64,
+    /// Pitch rate on the wheels, deg/s, per unit of column past what holds
+    /// the nose where it is, at `ref_kts`.
+    pub deg_s_per_unit: f64,
+    /// The column that just lifts the nosewheel at `ref_kts`.
+    pub breakout: f64,
+    /// More column per degree of nose-up past the roll attitude, on the main
+    /// wheels (the tail's spring; the same at every speed).
+    pub per_deg: f64,
+    /// The column that holds the attitude once flying, at `ref_kts`.
+    pub air_hold: f64,
+}
+
+impl RotateElevatorProfile {
+    /// Used only when every number is a sane one.
+    pub fn valid(self) -> Option<Self> {
+        ((30.0..=300.0).contains(&self.ref_kts)
+            && (1.0..=200.0).contains(&self.deg_s_per_unit)
+            && (0.0..=0.6).contains(&self.breakout)
+            && (0.0..=0.1).contains(&self.per_deg)
+            && (-0.5..=0.6).contains(&self.air_hold))
+            .then_some(self)
+    }
+}
+
 /// How hard this airframe's rudder yaws it on the takeoff roll
 /// (`autotakeoff::RollSteer`): the yaw rate, deg/s, that a whole unit of the
 /// steer channel holds at `at_kts`, growing with the square of the speed.
@@ -649,6 +693,9 @@ pub struct AircraftProfile {
     /// The rudder's authority on the takeoff roll, when measured.
     #[serde(default)]
     pub roll_rudder: Option<RollRudderProfile>,
+    /// The rotation's elevator on the wheels, when fitted.
+    #[serde(default)]
+    pub rotate_elevator: Option<RotateElevatorProfile>,
     /// The bank's answer to the roll channel in the arrest, when fitted.
     #[serde(default)]
     pub arrest_roll: Option<ArrestRollProfile>,
@@ -3900,6 +3947,11 @@ mod tests {
                 "MARGIN: under the airframe's own gear placard",
             ),
             (
+                "autotakeoff",
+                "ROTATE_MODEL_MIN_KTS",
+                "FLOOR on a dead ASI's (ref/ias)^2 in the airframe's own declared rotation model",
+            ),
+            (
                 "procedure",
                 "DRAG_MIN_DESCENT_FPM",
                 "a gate on the COMMANDED rate, which is already the airframe's descent_fpm",
@@ -5198,6 +5250,7 @@ fn cessna_172sp() -> AircraftProfile {
         arrest_lead: None,
         flare_elevator: None,
         roll_rudder: None,
+        rotate_elevator: None,
         arrest_roll: None,
         rollout_brakes: None,
         speed_governor: None,
@@ -5526,6 +5579,7 @@ fn cirrus_sr22() -> AircraftProfile {
         arrest_lead: None,
         flare_elevator: None,
         roll_rudder: None,
+        rotate_elevator: None,
         arrest_roll: None,
         rollout_brakes: None,
         speed_governor: None,

@@ -1611,7 +1611,31 @@ pub struct RotatePitch {
     /// The rotation's rate, degrees a second ([`ROTATE_RATE_DEG_S`] unless
     /// the airframe declares its own, `rotate_rate_deg_s`).
     rotate_rate: Option<f64>,
+    /// The airframe's fitted rotation elevator (`rotate_elevator:`), fed
+    /// forward by [`RotatePitch::model_pull`]; `None` is the P+I alone.
+    model: Option<crate::aircraft::RotateElevatorProfile>,
+    /// On the wheels, as the caller last said ([`RotatePitch::on_wheels`]).
+    wheels: bool,
+    /// The attitude the rotation started from (the roll attitude).
+    rest: Option<f64>,
+    /// The model's column, as last fed forward.
+    model_out: f64,
 }
+
+/// The share of the fitted rotation model fed forward; the P+I finds the
+/// rest. Under one on purpose: a column short of the need is closed from
+/// below by the loop, one past it is an overshoot at liftoff. Against the
+/// SR22 plant fitted to LEMG (#184) the whole model lifted off 82 kt and
+/// overshot to 10.7 degrees; 0.8 lifted off 83 and held under 9.6.
+pub const ROTATE_MODEL_SHARE: f64 = 0.8;
+/// Once the wheels leave, the model's column moves to the flying hold
+/// with this time constant, seconds: the tail's spring is gone at once,
+/// and a 0.4 s tick plus the write's delay already hold the ground column
+/// on the flying aircraft for most of a second.
+const ROTATE_MODEL_AIR_TAU_S: f64 = 0.2;
+/// The slowest airspeed the model's `(ref / ias)^2` is taken at, knots: a
+/// rotation is never below it, and a dead ASI must not ask for full column.
+const ROTATE_MODEL_MIN_KTS: f64 = 40.0;
 
 /// The hand-flown initial climb's speed hold: from liftoff to the autopilot's
 /// engage the rotation's attitude target is walked by the airspeed TREND, so
@@ -1708,7 +1732,59 @@ impl RotatePitch {
             ceiling_limit: None,
             unguarded: false,
             rotate_rate: None,
+            model: None,
+            wheels: true,
+            rest: None,
+            model_out: 0.0,
         }
+    }
+
+    /// The airframe's fitted rotation elevator (`rotate_elevator:`); `None`
+    /// (or an insane declaration) keeps the P+I alone, unchanged.
+    pub fn with_rotate_model(
+        mut self,
+        model: Option<crate::aircraft::RotateElevatorProfile>,
+    ) -> Self {
+        self.model = model.and_then(crate::aircraft::RotateElevatorProfile::valid);
+        self
+    }
+
+    /// Whether the wheels are on the runway this tick (`onground_any`).
+    /// Read only by a declared rotation model.
+    pub fn on_wheels(&mut self, on: bool) {
+        self.wheels = on;
+    }
+
+    /// The model's column right now, for the blackbox (`roll` `pitch_ff`).
+    pub fn model_pull(&self) -> f64 {
+        self.model_out
+    }
+
+    /// The fitted rotation column, fed forward: on the wheels the column that
+    /// holds the TARGET attitude against the tail's spring plus the breakout
+    /// and the column that turns the nose at the ramp's rate; flying, the
+    /// column that holds an attitude, reached over
+    /// [`ROTATE_MODEL_AIR_TAU_S`]. A share of it ([`ROTATE_MODEL_SHARE`]).
+    fn model_step(&mut self, ias: Option<f64>, target: f64, want_rate: f64, dt: f64) -> f64 {
+        let Some(m) = self.model else {
+            return 0.0;
+        };
+        let Some(ias) = ias.filter(|v| v.is_finite()) else {
+            // No airspeed: the last column stands (a failed read is no
+            // measurement).
+            return self.model_out;
+        };
+        let q = (ias.max(ROTATE_MODEL_MIN_KTS) / m.ref_kts).powi(2);
+        let rest = self.rest.unwrap_or(target);
+        self.model_out = if self.wheels {
+            ROTATE_MODEL_SHARE
+                * (m.per_deg * (target - rest).max(0.0)
+                    + (m.breakout + want_rate.max(0.0) / m.deg_s_per_unit) / q)
+        } else {
+            let goal = ROTATE_MODEL_SHARE * m.air_hold / q;
+            goal + (self.model_out - goal) * (-dt / ROTATE_MODEL_AIR_TAU_S).exp()
+        };
+        self.model_out
     }
 
     /// The law without its ceiling guard: what flew EGKK 08R (#78), for the
@@ -1798,6 +1874,9 @@ impl RotatePitch {
             .ceiling
             .map_or(ROTATE_PITCH_DEG, |c| ROTATE_PITCH_DEG.min(c));
         let prev_target = self.target;
+        if prev_target.is_none() {
+            self.rest = Some(theta_deg);
+        }
         let ramped = match prev_target {
             None => theta_deg.min(cap),
             Some(t) if t < cap => (t + self.rotate_rate() * dt).min(cap),
@@ -1862,7 +1941,9 @@ impl RotatePitch {
         // wanted from it — hold the standing pull the trim state demands, so
         // that on target and steady the elevator does not fall away.
         self.trim = (self.trim + err * PITCH_TRIM_PER_DEG_S * dt).clamp(self.pitch_min, PITCH_MAX);
-        let out = (err * PITCH_P_PER_DEG + self.trim).clamp(self.pitch_min, PITCH_MAX);
+        // A declared rotation model's column, fed forward (zero without one).
+        let fed = self.model_step(air.map(|(ias, _)| ias), target, want_rate, dt);
+        let out = (err * PITCH_P_PER_DEG + self.trim + fed).clamp(self.pitch_min, PITCH_MAX);
         self.out = match self.hold {
             Some(h) if !self.unguarded => {
                 self.ceiling_guard(h.pitch_max_deg, theta_deg, rate, dt, out, err)
@@ -3229,7 +3310,9 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, p: Params) {
         p.pitch_authority_down.map_or(PITCH_MIN, |a| -a.abs()),
     )
     .with_climb_hold(climb_hold)
-    .with_rotate_rate(crate::aircraft::live_profile().and_then(|lp| lp.reference.as_ref().and_then(|r| r.rotate_rate_deg_s)));
+    .with_rotate_rate(crate::aircraft::live_profile().and_then(|lp| lp.reference.as_ref().and_then(|r| r.rotate_rate_deg_s)))
+    // The airframe's fitted rotation elevator (#184), fed forward.
+    .with_rotate_model(crate::aircraft::live_profile().and_then(|lp| lp.rotate_elevator));
     // Thrust reduction at the declared height (`takeoff_config:`).
     let reduction = crate::takeoff_config::thrust_reduction();
     let mut reduced = false;
@@ -3606,7 +3689,21 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, p: Params) {
             if rotated {
                 // Wings held level through the pull — the rudder steering
                 // still owns the heading until liftoff.
+                pitch_law.on_wheels(on_ground >= 0.5);
                 let pitch = pitch_law.step_climb(theta_deg, pitch_rate, dt, Some((ias, agl_ft)));
+                if pitch_law.model.is_some() {
+                    // The column the rotation wrote and the model's share of
+                    // it (#184: the roll record carries no column, and the
+                    // SR22's lag was the column's).
+                    crate::blackbox::record(
+                        "autotakeoff",
+                        serde_json::json!({"event": "rotate_tick", "ias": ias, "theta": theta_deg,
+                                           "q": pitch_rate, "dt": dt, "pitch": pitch,
+                                           "pitch_ff": pitch_law.model_pull(),
+                                           "pitch_tgt": pitch_law.target_deg(),
+                                           "wheels": on_ground >= 0.5}),
+                    );
+                }
                 let ail = wings.step(phi_deg, 0.0, dt);
                 crate::monitor::note_crew_yoke();
                 let (wp, wr) = tokio::join!(
@@ -3755,6 +3852,7 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, p: Params) {
                 // gently toward runway heading, since the rudder steering
                 // ended at liftoff.
                 let hdg_err = ((rwy.course_deg - psi + 540.0).rem_euclid(360.0)) - 180.0;
+                pitch_law.on_wheels(false);
                 let pitch = pitch_law.step_climb(theta_deg, pitch_rate, dt, Some((ias, agl_ft)));
                 let ail = wings.step(phi_deg, climb_bank_target(hdg_err), dt);
                 crate::monitor::note_crew_yoke();
@@ -6523,6 +6621,402 @@ mod tests {
         assert!((airline - (-1.75 + 2.5 * 1.75)).abs() < 0.3, "{airline}");
         assert!((single - (-1.75 + 5.0 * 1.75)).abs() < 1e-6, "{single}");
         assert!((target_after(Some(50.0)) - ROTATE_PITCH_DEG).abs() < 1e-6, "bounded at 6");
+    }
+
+    /// One rotation tick as the blackbox has it (a `roll` record from the one
+    /// the rotation began on, then `climb_manual`).
+    #[derive(Debug, Clone, Copy)]
+    struct RotTick {
+        t: f64,
+        dt: f64,
+        ias: f64,
+        theta: f64,
+        q: f64,
+        /// Height, feet; zero on a roll record (it carries none).
+        agl: f64,
+        /// The column the law logged (climb ticks only).
+        pitch: Option<f64>,
+    }
+
+    /// The three SR22 rotations of LEMG 13, 2026-09-29 (#184), by sortie,
+    /// with the rotation rate each flew: 1790682305 (MacBook, 0.25 s tick)
+    /// and 1790690995 at the airline 2.5, 1790694884 at the declared 5.
+    fn sr22_rotations() -> Vec<(&'static str, Option<f64>, Vec<RotTick>)> {
+        let recs: Vec<serde_json::Value> =
+            include_str!("../bench/takeoffs/sr22_rotation_lemg_2026-09-29.jsonl")
+                .lines()
+                .filter_map(|l| serde_json::from_str(l).ok())
+                .collect();
+        let f = |r: &serde_json::Value, k: &str| r[k].as_f64();
+        [
+            ("1790682305-full_auto", None),
+            ("1790690995-full_auto", None),
+            ("1790694884-full_auto", Some(5.0)),
+        ]
+        .into_iter()
+        .map(|(sid, rate)| {
+            let ticks = recs
+                .iter()
+                .filter(|r| r["sortie"] == sid)
+                .filter(|r| r["event"] == "roll" || r["event"] == "climb_manual")
+                .map(|r| RotTick {
+                    t: f(r, "t").unwrap(),
+                    dt: f(r, "dt").unwrap(),
+                    ias: f(r, "ias").unwrap(),
+                    theta: f(r, "theta").unwrap(),
+                    q: f(r, "q").unwrap(),
+                    agl: f(r, "agl").unwrap_or(0.0),
+                    pitch: f(r, "pitch").filter(|_| r["event"] == "climb_manual"),
+                })
+                .collect();
+            (sid, rate, ticks)
+        })
+        .collect()
+    }
+
+    /// The SR22's rotation law as it flew: GA authority, no ceiling, no
+    /// hold, the sortie's rate.
+    fn sr22_law(rate: Option<f64>) -> RotatePitch {
+        RotatePitch::with_authority(None, PITCH_MIN).with_rotate_rate(rate)
+    }
+
+    /// The SR22's fitted rotation, as the profile declares it.
+    fn rotate_model_sr22() -> crate::aircraft::RotateElevatorProfile {
+        let text = std::fs::read_to_string("profiles/cirrus_sr22.yaml").unwrap();
+        let p: crate::aircraft::AircraftProfile = serde_yaml::from_str(&text).unwrap();
+        p.rotate_elevator
+            .and_then(|m| m.valid())
+            .expect("the SR22 declares its rotation")
+    }
+
+    /// Open loop over the recorded ticks: the column the law writes on each.
+    fn replay_rotation(law: &mut RotatePitch, ticks: &[RotTick]) -> Vec<f64> {
+        ticks
+            .iter()
+            .map(|k| {
+                law.on_wheels(k.agl <= 0.0);
+                law.step_climb(k.theta, Some(k.q), k.dt, Some((k.ias, k.agl)))
+            })
+            .collect()
+    }
+
+    /// The SR22's pitch through the rotation, fitted to those three (#184):
+    /// a rate plant (the column sets a pitch rate through a lag `tau`, after
+    /// the write's delay). On the wheels the nose turns
+    /// `k_ground x ((v/ref)^2 x (u - per_deg x (theta - rest)) - breakout)`
+    /// deg/s and never below the roll attitude: the breakout is the nose's
+    /// weight about the mains, the `per_deg` the tail's spring (its angle of
+    /// attack is the attitude on the wheels). Fitted by least squares on the
+    /// attitude to 5 degrees, the column replayed from the ticks: 0.35 degree
+    /// rms. Flying, `k_air x ((v/ref)^2 x u - air_hold)`: the climb from the
+    /// first climb tick to 150 ft on its own, 0.14 degree rms. The wheels
+    /// leave where `v^2 x (theta - LIFT_ZERO_DEG)` reaches the lift the
+    /// flown rotations had at about 94 kt and 4.5 degrees (the first climb
+    /// tick was already 16 ft up, so the wheels left one to two seconds
+    /// before the logged liftoff); the zero-lift attitude is an estimate.
+    struct Sr22Rotation {
+        theta: f64,
+        q: f64,
+        v: f64,
+        wheels: bool,
+        /// Multipliers on the fitted elevator and spring (robustness).
+        k_mult: f64,
+        spring_mult: f64,
+    }
+
+    impl Sr22Rotation {
+        const REF_KTS: f64 = 90.0;
+        const K_GROUND: f64 = 29.2;
+        const BREAKOUT: f64 = 0.104;
+        const PER_DEG: f64 = 0.0328;
+        const TAU_S: f64 = 0.131;
+        const DELAY_S: f64 = 0.26;
+        const K_AIR: f64 = 11.56;
+        const AIR_HOLD: f64 = 0.164;
+        const REST_DEG: f64 = -1.65;
+        const LIFT_ZERO_DEG: f64 = -6.0;
+        const LIFT_KTS: f64 = 94.0;
+        const LIFT_DEG: f64 = 4.5;
+        /// Groundspeed gained per second on the roll (74 to 98 KIAS in 5.6 s)
+        /// and a third of it climbing.
+        const ACCEL_KTS_S: f64 = 4.3;
+
+        fn new(theta: f64, v: f64) -> Self {
+            Sr22Rotation {
+                theta,
+                q: 0.0,
+                v,
+                wheels: true,
+                k_mult: 1.0,
+                spring_mult: 1.0,
+            }
+        }
+
+        fn advance(&mut self, u: f64, dur_s: f64) {
+            let h = 0.005_f64;
+            let mut left = dur_s;
+            let lift = Self::LIFT_KTS.powi(2) * (Self::LIFT_DEG - Self::LIFT_ZERO_DEG);
+            while left > 1e-9 {
+                let step = h.min(left);
+                let dq = (self.v / Self::REF_KTS).powi(2);
+                let want = if self.wheels {
+                    Self::K_GROUND
+                        * self.k_mult
+                        * (dq
+                            * (u - Self::PER_DEG
+                                * self.spring_mult
+                                * (self.theta - Self::REST_DEG))
+                            - Self::BREAKOUT)
+                } else {
+                    Self::K_AIR * self.k_mult * (dq * u - Self::AIR_HOLD)
+                };
+                self.q += (want - self.q) / Self::TAU_S * step;
+                self.theta += self.q * step;
+                if self.wheels && self.theta < Self::REST_DEG {
+                    self.theta = Self::REST_DEG;
+                    self.q = self.q.max(0.0);
+                }
+                self.v += Self::ACCEL_KTS_S * step * if self.wheels { 1.0 } else { 0.3 };
+                if self.wheels && self.v.powi(2) * (self.theta - Self::LIFT_ZERO_DEG) >= lift {
+                    self.wheels = false;
+                }
+                left -= step;
+            }
+        }
+    }
+
+    /// What a closed-loop rotation did, as the blackbox would say it.
+    #[derive(Debug, Clone, Copy)]
+    struct RotationFlown {
+        /// Airspeed where the wheels left, KIAS.
+        liftoff_kts: f64,
+        /// Seconds from Vr to the nose at 7 degrees.
+        to_7_deg_s: f64,
+        /// Highest attitude, and the lowest from two seconds after the wheels
+        /// left to the end (a nose that drops back after liftoff).
+        max_theta: f64,
+        min_after: f64,
+    }
+
+    /// Fly `law` against the fitted SR22 from Vr, through the write's delay,
+    /// at `tick` seconds with a jitter and the runway's rate noise.
+    fn fly_sr22_rotation(
+        mut law: RotatePitch,
+        mut plant: Sr22Rotation,
+        tick: f64,
+        seed: u32,
+    ) -> RotationFlown {
+        let mut seed = seed.wrapping_mul(2_654_435_761).wrapping_add(1);
+        let mut noise = move || {
+            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            f64::from(seed >> 8) / f64::from(1_u32 << 23) - 1.0
+        };
+        let mut pending: Vec<(f64, f64)> = Vec::new();
+        let mut applied = 0.0;
+        let mut t = 0.0_f64;
+        let (mut liftoff, mut lift_t) = (f64::NAN, f64::NAN);
+        let mut to_7 = f64::NAN;
+        let (mut max_theta, mut min_after) = (f64::MIN, f64::MAX);
+        while t < 14.0 {
+            let dt = tick + 0.2 * tick * noise();
+            let on = plant.wheels;
+            let q_read = plant.q + noise() * if on { 1.0 } else { 0.1 };
+            law.on_wheels(on);
+            let agl = if on { 0.0 } else { 10.0 };
+            let theta_read = plant.theta + 0.1 * noise();
+            let cmd = law.step_climb(theta_read, Some(q_read), dt, Some((plant.v, agl)));
+            pending.push((t + Sr22Rotation::DELAY_S, cmd));
+            let end = t + dt;
+            while t < end - 1e-9 {
+                let next = pending
+                    .iter()
+                    .map(|&(at, _)| at)
+                    .filter(|&at| at > t && at < end)
+                    .fold(end, f64::min)
+                    .min(t + 0.01);
+                plant.advance(applied, next - t);
+                t = next;
+                while let Some(i) = pending.iter().position(|&(at, _)| at <= t) {
+                    applied = pending.remove(i).1;
+                }
+                if !plant.wheels && liftoff.is_nan() {
+                    liftoff = plant.v;
+                    lift_t = t;
+                }
+                if to_7.is_nan() && plant.theta >= 7.0 {
+                    to_7 = t;
+                }
+                max_theta = max_theta.max(plant.theta);
+                if lift_t.is_finite() && t > lift_t + 2.0 {
+                    min_after = min_after.min(plant.theta);
+                }
+            }
+        }
+        RotationFlown {
+            liftoff_kts: liftoff,
+            to_7_deg_s: to_7,
+            max_theta,
+            min_after,
+        }
+    }
+
+    /// The replay IS the law as flown: stepped over the recorded ticks, the
+    /// rotation law writes the column every climb tick logged, on all three
+    /// flights. The roll records carry no column; this is how the SR22's was
+    /// read: 0.03 to 0.36 through the whole rotation (PITCH_MAX 0.65).
+    #[test]
+    fn the_sr22_rotation_replays_as_flown() {
+        for (sid, rate, ticks) in sr22_rotations() {
+            let out = replay_rotation(&mut sr22_law(rate), &ticks);
+            let mut climbs = 0;
+            for (k, u) in ticks.iter().zip(&out) {
+                if let Some(logged) = k.pitch {
+                    assert!((u - logged).abs() < 1e-9, "{sid} at {}: {u} vs {logged}", k.t);
+                    climbs += 1;
+                }
+            }
+            assert!(climbs >= 10, "{sid}: {climbs} climb ticks");
+            let ground_max = ticks
+                .iter()
+                .zip(&out)
+                .filter(|(k, _)| k.agl <= 0.0)
+                .map(|(_, u)| *u)
+                .fold(f64::MIN, f64::max);
+            assert!(ground_max < 0.37, "{sid}: the rotation never pulled past {ground_max}");
+        }
+    }
+
+    /// The plant is the flown rotation: driven by the column each flight
+    /// wrote (replayed), from the attitude at Vr, it keeps the recorded
+    /// attitude on the wheels to 5 degrees within half a degree rms and a
+    /// degree on every tick: the nose held back near 3 degrees at 88 to 94
+    /// kt on the two iMac flights, 0.3 to 0.4 of column against the spring.
+    #[test]
+    fn the_sr22_plant_is_the_flown_rotation() {
+        let mut sq = 0.0;
+        let mut n = 0.0;
+        for (sid, rate, ticks) in sr22_rotations() {
+            let cols = replay_rotation(&mut sr22_law(rate), &ticks);
+            let ground: Vec<_> = ticks
+                .iter()
+                .zip(&cols)
+                .take_while(|(k, _)| k.agl <= 0.0 && k.theta <= 5.0)
+                .collect();
+            let mut plant = Sr22Rotation::new(ground[0].0.theta, ground[0].0.ias);
+            let mut pending: Vec<(f64, f64)> = ground
+                .iter()
+                .map(|(k, u)| (k.t + Sr22Rotation::DELAY_S, **u))
+                .collect();
+            let mut applied = 0.0;
+            let mut t = ground[0].0.t;
+            for (k, _) in &ground {
+                while t < k.t - 1e-9 {
+                    while pending.first().is_some_and(|&(at, _)| at <= t) {
+                        applied = pending.remove(0).1;
+                    }
+                    let step = 0.01_f64.min(k.t - t);
+                    // The airspeed as recorded, not the plant's own.
+                    plant.v = k.ias;
+                    plant.advance(applied, step);
+                    t += step;
+                }
+                let e = plant.theta - k.theta;
+                sq += e * e;
+                n += 1.0;
+                assert!(
+                    e.abs() < 1.0,
+                    "{sid} at {} kt: plant {} vs flown {}",
+                    k.ias,
+                    plant.theta,
+                    k.theta
+                );
+            }
+        }
+        let rms = (sq / n).sqrt();
+        assert!(rms < 0.5, "the fit holds: {rms:.2} degree rms over {n} ticks");
+    }
+
+    /// #184: the SR22 rotated at Vr 73 and lifted off at 98 to 100 KIAS on
+    /// every flight, the nose 5 degrees behind the ramp. Against the fitted
+    /// plant, at the iMac's 0.4 s tick and the MacBook's 0.25, the law as it
+    /// flew lifts off past 90 kt with the nose at 7 degrees 5 s after Vr; fed
+    /// the declared model it lifts off by 85 kt, the nose at 7 inside 2.6 s,
+    /// never higher than the old law went (10.3) and not dropping back under
+    /// 7 degrees once flying. The model is a hypothesis about the plant, so
+    /// the elevator and the spring at 0.7 to 1.3 of the fit must still beat
+    /// the old law and stay under 11 degrees.
+    #[test]
+    fn the_sr22_rotates_near_vr() {
+        let model = rotate_model_sr22();
+        let vr = 73.5;
+        for tick in [0.25, 0.4] {
+            for seed in 0..6 {
+                let old = fly_sr22_rotation(
+                    sr22_law(Some(5.0)),
+                    Sr22Rotation::new(Sr22Rotation::REST_DEG, vr),
+                    tick,
+                    seed,
+                );
+                assert!(old.liftoff_kts > 90.0, "the flown law, tick {tick}: {old:?}");
+                assert!(old.to_7_deg_s > 5.0, "the flown law, tick {tick}: {old:?}");
+                let new = fly_sr22_rotation(
+                    sr22_law(Some(5.0)).with_rotate_model(Some(model)),
+                    Sr22Rotation::new(Sr22Rotation::REST_DEG, vr),
+                    tick,
+                    seed,
+                );
+                assert!(new.liftoff_kts < 85.0, "tick {tick} seed {seed}: {new:?}");
+                assert!(new.to_7_deg_s < 2.6, "tick {tick} seed {seed}: {new:?}");
+                assert!(new.max_theta < 10.0, "tick {tick} seed {seed}: {new:?}");
+                assert!(new.max_theta <= old.max_theta + 0.2, "{new:?} vs {old:?}");
+                assert!(new.min_after > 7.0, "tick {tick} seed {seed}: {new:?}");
+            }
+        }
+        for k_mult in [0.7, 1.0, 1.3] {
+            for spring_mult in [0.7, 1.3] {
+                let plant = || Sr22Rotation {
+                    k_mult,
+                    spring_mult,
+                    ..Sr22Rotation::new(Sr22Rotation::REST_DEG, vr)
+                };
+                let old = fly_sr22_rotation(sr22_law(Some(5.0)), plant(), 0.4, 1);
+                let new = fly_sr22_rotation(
+                    sr22_law(Some(5.0)).with_rotate_model(Some(model)),
+                    plant(),
+                    0.4,
+                    1,
+                );
+                assert!(
+                    new.liftoff_kts < old.liftoff_kts - 3.0,
+                    "elevator x{k_mult}, spring x{spring_mult}: {new:?} vs {old:?}"
+                );
+                assert!(new.max_theta < 11.0, "elevator x{k_mult}, spring x{spring_mult}: {new:?}");
+            }
+        }
+    }
+
+    /// No declaration, no change: the law without a model writes the same
+    /// column tick for tick whether the wheels are said to be down or not,
+    /// and a model that is not sane is no model.
+    #[test]
+    fn an_undeclared_rotation_model_changes_nothing() {
+        for (_, rate, ticks) in sr22_rotations() {
+            let mut a = sr22_law(rate);
+            let mut b = sr22_law(rate).with_rotate_model(None);
+            let insane = crate::aircraft::RotateElevatorProfile {
+                breakout: 5.0,
+                ..rotate_model_sr22()
+            };
+            let mut c = sr22_law(rate).with_rotate_model(Some(insane));
+            for k in &ticks {
+                b.on_wheels(true);
+                c.on_wheels(k.agl <= 0.0);
+                let air = Some((k.ias, k.agl));
+                let x = a.step_climb(k.theta, Some(k.q), k.dt, air);
+                assert_eq!(x.to_bits(), b.step_climb(k.theta, Some(k.q), k.dt, air).to_bits());
+                assert_eq!(x.to_bits(), c.step_climb(k.theta, Some(k.q), k.dt, air).to_bits());
+            }
+        }
     }
 
     #[test]

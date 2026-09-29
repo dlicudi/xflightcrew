@@ -11073,3 +11073,44 @@ tick. Offline only.
 Next SR22 landing: autoland `bounce` records, `rollout` `ground` false ticks with `bl`/`br` 0 and
 `air_ail` set, no nose slew at the `Landed` tick, `xtk_m` inside 5 m, and below 35 kt `bl`/`br` no
 longer 0.39 each tick.
+
+## 2026-09-29: the SR22's rotation feeds its fitted elevator forward (#184)
+
+iMac and MacBook, LEMG 13, three SR22 rotations (1790682305 at a 0.25 s tick, 1790690995 at the
+airline 2.5 deg/s, 1790694884 at the declared 5): rotate 73 to 74 KIAS, liftoff 98 to 100 KIAS
+every time, 5.7 to 6.2 s later. With rate 5 the target was at 8 degrees 2 s after Vr and the nose at
+2.9. Not the tick (the 0.25 s flight was the same) and not the trim: `pitch_authority` read the
+trim at 0.0, inside the takeoff band, so the trim step does nothing for the SR22 (the autopilot
+later trims 0.25 to 0.37 at 100 kt; neutral puts the whole pull on the column).
+
+The column, replayed from the ticks (the roll record carries none; the replay writes every logged
+`climb_manual` column exactly): 0.03 to 0.36 through the whole rotation, PITCH_MAX 0.65 never
+near. A plant fitted to the three (column replayed, attitude to 5 degrees, 0.35 degree rms): on the
+wheels the nose turns 29 deg/s per unit of column past a breakout of 0.104 at 90 kt (as 1/v^2)
+plus 0.033 per degree it is already up. That last is the tail's spring (its angle of attack is
+the attitude on the wheels), as stiff as the law's own P of 0.03 per degree: the P met it near 3
+degrees, the flown shelf at 88 to 94 kt, and the integrator (0.01 per degree-second) took five
+seconds to find the other 0.2. Flying, 0.164 holds an attitude at 90 kt (0.14 rms).
+
+- **A declared rotation model is fed forward** (`rotate_elevator:` `ref_kts`, `deg_s_per_unit`,
+  `breakout`, `per_deg`, `air_hold`; `RotatePitch::with_rotate_model`, `on_wheels` from
+  `onground_any`): on the wheels the column for the TARGET against the spring, the breakout and
+  the ramp's rate; flying, the attitude hold, reached in 0.2 s (`ROTATE_MODEL_AIR_TAU_S`: the
+  spring is gone at wheels-off). A share of it (`ROTATE_MODEL_SHARE` 0.8: the whole model
+  overshot to 10.7 in the plant); the P+I corrects. Undeclared, the law is bit-identical
+  (`an_undeclared_rotation_model_changes_nothing`); only the SR22 declares one. Blackbox
+  `rotate_tick` (`pitch`, `pitch_ff`, `wheels`) per rotation tick, only where declared.
+
+Plant, 0.25 and 0.4 s ticks, six noise seeds: the law as flown lifts off 93 kt, the nose at 7
+degrees 5.8 s after Vr, 10.3 at most; fed forward 83 kt, 2.1 s, 8.5 to 9.6 at most, never back
+under 7.6 once flying; elevator and spring at 0.7 to 1.3 of the fit, 82 to 85 kt, under 10.9. The
+wheels-off line (lift as v^2 x (theta + 6), matched at 94 kt and 4.5 degrees, the first climb
+tick being 16 ft up) is an estimate.
+
+Tests: `the_sr22_rotation_replays_as_flown`, `the_sr22_plant_is_the_flown_rotation`,
+`the_sr22_rotates_near_vr`, `an_undeclared_rotation_model_changes_nothing`.
+
+Next flight (SR22): `autotakeoff` `rotate_tick` `pitch` 0.45 to 0.6 at Vr falling with the nose,
+theta at 7 about 2 s after `rotate`, `wheels` false near 80 to 85 KIAS, `liftoff` `ias` under
+about 88 (the 8 ft gate lags wheels-off), `climb_manual` theta under 10 with no drop under 7, and
+`stage_result` takeoff `liftoff_xtk_m` against the 5.4 m of 1790694884. Offline only.
