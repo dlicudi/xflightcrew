@@ -484,6 +484,9 @@ async fn servos_out(xp: &XPlaneClient) -> Option<f64> {
 /// One tick of column and wheel, through the plugin's channels, or the raw
 /// joystick override where the plugin has none.
 async fn write_controls(xp: &XPlaneClient, plugin: bool, pitch: f64, roll: f64) {
+    // Our own column, not a pilot's hand: the scorer counted the recovery's
+    // writes as yoke_under_ap interventions (A330 LEMG, 2026-09-29).
+    crate::monitor::note_crew_yoke();
     if plugin {
         let _ = tokio::join!(xp.set_float(CH_PITCH, pitch), xp.set_float(CH_ROLL, roll));
     } else {
