@@ -11315,4 +11315,62 @@ Next castoring-nose line-ups (SR22, Evolution, RV-10, SF50): `line_up_aligned` `
 `err_deg` inside 2 and `secs` under 20; the roll's first tick `err` inside 3 (alignment PASS);
 `roll_aligned` at once or within a few seconds; no `bl`/`br` alternation at 0.45 from 4 to 18 kt.
 If `line_up_align` ticks show `creep` with no yaw building, the governor's breakaway is the knob.
+
+## 2026-09-29: the A330's final is led onto the line; the trim learns no roll-out (#189)
+
+LEMG 30, A330, iMac (19 fps, circuit tick 0.7 s; sortie 1790710769-full_auto, build c281979): the
+final turn sized itself right (24.7 degrees measured, capture 2,567 m at 2,541 off) and rolled onto
+the 30 degree intercept, but the final leg's pursuit (`final_intercept_hdg`, a 900 m aim on the
+bare offset) ran the aircraft 67 m through the centreline: the A330's heading mode rolls at about 3
+degrees a second through a 2 s lag and flies the bug two ticks late, so its heading sat 12 to 14
+degrees behind a bug already back on the course and it crossed cutting 13 degrees. The earlier A330
+circuit (1790698132) did the same, 66 m, and was handed over 40.9 m off at 4.15 degrees; the 737
+(1790700986) ran 20 to 28 m through, the SR22 (1790710117) never crossed.
+
+The handoff was not the valve: `ready_for_autoland` passed 43.4 m (inside three landing limits,
+45.2), 3.56 degrees of track, a predicted residual of 7.9 m, and autoland's pursuit bore that out,
+4.4 m nine seconds later. What went around was `TrackTrim`: it learnt -0.51 degrees from the last
+3.6 degrees of the roll-out in ten seconds (the 3 degree error cap let them in), calm air and the
+aircraft on its bug, and held the final 0.3 to 0.5 degrees left of the course: 17.8 m off at 0.5 nm,
+`off_centreline_low` at 99 ft (15.2 m), then a 7 minute reversal. The other three circuits of the
+evening learnt 0.37 to 0.61 the same way and drifted 6 to 14 m.
+
+- **The A330's final leads the offset by its track** (`circuit::final_led_xtk_m`, profile
+  `circuit_final_lead_s` 3.5, `final_lead_s`): the pursuit aims from where the ground track will
+  have carried the aircraft 3.5 s on, the derivative term the heading lag takes away. Silent
+  profiles (every other airframe) and a failed track read fly the bare pursuit, byte-identical:
+  led, the 737's LEMG 13 replay (`the_lemg_13_circuit_hands_over_on_the_line`) handed over at
+  3.5 km instead of 4.2 and autoland's final wandered 17 to 22 m below 500 ft (13 bare), at leads
+  of 1.5 to 3.5 s alike.
+- **The trim learns only a settled track** (`TrackTrim`, `TRACK_TRIM_STEADY_DPS` 0.25 degrees a
+  second smoothed over 1.5 s, held `TRACK_TRIM_SETTLE_S` 3): a roll-out, and the handoff's straight
+  second before autoland's first bank, teach it nothing; a bias held down a final still does
+  (`the_track_trim_takes_a_biased_final_to_the_centreline` unchanged). The cost: the #93 replays
+  that START a final rolling out or with no crab in a crosswind (`the_final_on_a_held_knob_keeps_the_line`)
+  had the old trim learn that onset for them; held-knob gate offsets now 3.2, 2.1, 11.9, 5.3 m
+  against 1.6, 5.2, 7.8, 0.2, no balk, worst below 500 ft unchanged. Its gate assert allows 5 m or
+  2 over the free knob, its move count 10 (the free bug barely moves now).
+
+Plant: the replay's `Jet` takes a fitted heading mode (`HeadingFit`); `A330_HEADING` (2 per degree
+to 25, 3 degrees a second, 2 s, two ticks late) flies the recorded circuit ticks 1.0 and 1.4
+degrees rms (the 737's fit 4.0 and 5.1). From the recorded final-turn point on the real 12/30 row
+the bare pursuit runs 56 to 69 m through and hands over 43 m off coming back (recorded 67, 43.4,
+3.56), and with the old trim autoland goes around `off_centreline_low` at 99 ft, 15.9 m (recorded
+99 ft, 15.2 m). Led, the A330 never crosses and hands over 41 to 44 m off from its own side at 3 to
+4 degrees, 4.6 to 4.8 km out, at ticks of 0.6 to 0.8 s. Either handoff flown
+by today's autoland reaches the roundout gate within 5 m with no balk. Not changed: the capture,
+`ready_for_autoland`, the last-ditch valve. Aside, not fixed here: CONF 1 went out on base at
+214.5 kt against its 215 placard.
+
+Tests: `issue_189_tests` (`the_bare_pursuit_runs_the_a330_through_the_line`,
+`the_led_pursuit_brings_the_a330_onto_the_line`, `only_the_a330_leads_its_final`,
+`the_recorded_handoff_went_around_on_a_learnt_roll_out`, `the_lead_follows_the_track`),
+`the_track_trim_learns_no_roll_out`; the #147 roll-out replay flies the old cap without the gate.
+
+Next A330 circuit: `circuit` `leg` ticks on Final with `x_m` never past the line by more than
+about 10 m before `handoff_autoland`, whose `xtk_m` has the sign of the `final_turn` `x_m` (the
+base's side of the line, not coming back after running through). Every circuit (A330, 737, SR22):
+`autoland`
+ticks after it with `trim` 0 until the track has settled (at least 3 s after the roll-out), then
+within a few tenths, `xtk_m` inside 5 m from 1 nm, no `going_around` `off_centreline_low`.
 Offline only.
