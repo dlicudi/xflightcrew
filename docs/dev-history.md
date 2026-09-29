@@ -11374,3 +11374,69 @@ base's side of the line, not coming back after running through). Every circuit (
 ticks after it with `trim` 0 until the track has settled (at least 3 s after the roll-out), then
 within a few tenths, `xtk_m` inside 5 m from 1 nm, no `going_around` `off_centreline_low`.
 Offline only.
+
+## 2026-09-30: the S-76 slows for the pad it can make; an overshoot goes around, never orbits (#191)
+
+LEMG-LXGB, S-76, iMac 2026-09-29 (sortie 1790715215-heli_route): the approach started 14.6 km out
+at 125 kt from 4,180 ft (gate 500 ft over a sea-level pad) and came down on the 0.35 collective
+floor at the 1,200 fpm cap, holding 118 kt: 6.5 degrees at that speed is 1,360 fpm, so it reached
+the slow-down 300 ft high. The slow-down began 2.16 km out (`approach_slow_m`, sized for 70 kt at 1
+kt/s) at 117 kt, the lever on the floor; the speed bled 117 to 88 kt in 55 s toward 78, the speed
+at which 0.35 IS the level lever. At the pad it was 94 kt; the bug then chased the pad's bearing 5
+degrees a tick and the aircraft circled 600 to 1,340 m out at 79 kt, 500 ft AGL, 12 degrees of
+bank, for 1,593 s. The hover loop waits for 40 kt and never came. Meanwhile the monitor's ring
+said "High on the profile" and "past the descent point, about 1600 feet a minute".
+
+Plant (`S76` in the tests): the autopilot holds the vertical speed on the pitch, so the lever is
+energy, `dV/dt = (K (c - level(V)) - g vz) / V`, with the level lever `CRUISE_POWER_CURVE` fitted
+to the flight (0.675 at 125 kt, 0.60 at 117, 0.46 at 100, 0.35 at 78, the bucket 0.34 near 65, the
+hover curve's shape under it) and `K` 230 W/kg per unit (`COLLECTIVE_POWER_WKG`: the 1,200 fpm
+descent at 118 kt held its speed on 0.35). It replays the recorded slow-down within 0.53 kt for
+95 s: 93.8 kt at the pad (94.9 recorded), 78.0 at 300 s.
+
+- **The slow-down is planned at what the S-76 makes** (`SLOW_DECEL_KTS_S` 0.7 over the ground:
+  60 % of the plant's worst level deceleration, 1.2 kt/s in the bucket, on a 0.25 lever):
+  `ApproachPath` (fixed at the approach's start from the gate and the groundspeed) levels at the
+  gate where the planned slow-down from that speed to the hand-over reaches the final's start
+  (`approach_slow_m`, `slow_down_m`, 300 m margin), and its path is as steep as 85 % of the sink
+  cap allows at the speed flown (`approach_tan`: 4.6 degrees at 125 kt), so the gate is reached.
+  The slow-down also starts sooner if the speed now needs more room.
+- **The slowing is the autopilot's nose-up** (`SlowLaw`): the lever goes under the level one
+  (down to `SLOW_COLLECTIVE_MIN` 0.25, the cruise floor) and the vertical mode holding the level
+  raises the nose; a feedforward of the schedule's deceleration, a trim moved by the curve's
+  slope, P and a slow I, a speed under target asking the lever up by at most 3 kt of error, a
+  ceiling of the level lever plus 0.10 (LILO's 0.65 at 25 kt, the 2026-09-24 crash, cannot
+  recur), and a pitch guard past 10 degrees. It flies a groundspeed schedule to the hand-over speed
+  at the final's start (`slow_schedule_kts`, `slow_want_kts`, only ever coming down).
+- **An overshoot goes around** (`slow_check`, `Phase::Around`): the pad behind the nose above the
+  hand-over speed, or more than 1.5 kt/s still needed to reach it by half the final's length, turns
+  the chase into a straight line on the course being flown, the level raised to clear the ground
+  5 km ahead by 400 ft, the target coming down at the planned rate; slowed, the hover loop takes
+  it wherever it is and flies back to the pad. Not slowed in 180 s or past 6 km: given back on
+  heading and altitude hold at the level lever for its speed, said (`go_around_failed`). The
+  recorded start (2,251 m at 118.9 kt) needed 2.1 kt/s: it would have gone around at once.
+- **The ring stays silent while the helicopter route flies** (`monitor::follower_flying`, the
+  follower's rule).
+
+Replay: from the recorded cruise and from 1,000 and 2,000 ft (a ridge holding the gate at 900),
+10 kt of headwind to 6 of tailwind, the slow-down starts at the gate (524 to 564 ft, 932 at the
+ridge) and the hover loop takes over 1,378 to 1,429 m out against a 1,363 m final (2,539 to 2,565
+against 2,523), the nose at most 9.9 degrees, the lever 0.26 to 0.41; on plants 30 % weaker or
+stronger with the level lever 0.04 either way, always before the pad. From the recorded overflight
+(94 kt), the go-around hands over after 78 to 104 s, 2.4 to 3.7 km past the pad, level. A tailwind
+over 9 kt still cannot reach the takeover's groundspeed at the 30 kt floor (unchanged, not fixed
+here).
+
+Tests: `the_plant_replays_the_recorded_overshoot`,
+`the_slowdown_reaches_the_takeover_speed_where_the_final_begins`,
+`the_slowdown_holds_on_plants_nobody_has_measured`, `a_slowdown_that_cannot_make_the_pad_goes_around`,
+`the_slow_law_never_climbs_away_under_its_target`, `the_approach_path_and_gate` (rewritten; the
+old `the_approach_comes_down_at_speed_to_the_gate` is folded into the replay),
+`monitor::a_helicopter_route_owns_its_descent_too`.
+
+Next S-76 route: `heli_route` `approach` with `slow_m` and `path_deg`; `slow` at the gate (`agl`
+within about 100 ft of `gate_agl`) with `need_m` under `slow_m`; Slow `tick`s whose `ias` follows
+`target` down within a few knots, `collective` 0.25 to 0.45, `theta` under 10; `handover_hover`
+near the final's start (`to_pad_m` about 1,400 for a 500 ft gate) under 40 kt; no `go_around`
+(if one, its `why`, `need_kts_s`, a fixed `bug` and a `handover_hover` `from` Around); no TOD or
+profile advisories in `said`. Offline only.

@@ -15,9 +15,14 @@
 //! - **Cruise**: altitude hold works the pitch, the collective the airspeed
 //!   (the helicopter's own split, the inverse of the hover's), the bug steers
 //!   fix to fix, turning early by the turn's size.
-//! - **Slow** on the last leg: the same law to [`HANDOVER_KTS`], level, so the
-//!   hover loop takes over a steady aircraft. The morning's takeover caught
-//!   one decelerating hard at a cruise collective, and the pitch rang.
+//! - **Slow** on the last leg: level at the gate, a schedule down to
+//!   [`HANDOVER_KTS`] where the final begins at a deceleration the S-76 makes
+//!   ([`SLOW_DECEL_KTS_S`]), flown by [`SlowLaw`] (the lever under the level
+//!   one, so the autopilot's nose-up does the slowing), so the hover loop
+//!   takes over a steady aircraft. The morning's takeover caught one
+//!   decelerating hard at a cruise collective, and the pitch rang. A
+//!   slow-down that cannot make the pad goes around straight ahead
+//!   ([`slow_check`], `Phase::Around`), never an orbit (#191).
 //! - **Arrive** on the hover loop: a final at 6 degrees to the helipad nearest
 //!   the inbound fix, the speed tapering to stop over it, then down.
 
@@ -307,26 +312,46 @@ pub fn cruise_altitude_ft(ground_ft: f64, terrain_ft: Option<f64>) -> f64 {
     ((floor + CRUISE_AGL_FT) / 100.0).ceil() * 100.0
 }
 
-/// Where the slow-down starts, metres before the pad: the deceleration from
-/// cruise to the hand-over speed at the law's rate, then the final's length
-/// from the cruise height on the glidepath, and a margin.
+/// The slow-down's PLANNED deceleration, kt/s (over the ground). The S-76's
+/// own, fitted to 1790715215-heli_route (LEMG-LXGB, iMac 2026-09-29): the
+/// slow-down began 2.16 km out at 117 KIAS with the collective on the old
+/// 0.35 floor and bled 117 to 88 kt in 55 s (0.53 kt/s), toward 78 kt,
+/// where 0.35 is the level lever: the floor was a speed the helicopter
+/// could not go under, and it orbited the pad at 79 kt for 26 minutes. With
+/// the slow-down's lever down to [`SLOW_COLLECTIVE_MIN`] the fitted power
+/// curve ([`CRUISE_POWER_CURVE`], [`COLLECTIVE_POWER_WKG`]) makes 1.2 kt/s
+/// level at its worst (the bucket, 65 to 80 kt) and 2.7 at 118: the plan
+/// flies 60 % of the worst.
+pub const SLOW_DECEL_KTS_S: f64 = 0.7;
+/// A slow-down that would need more than this to reach the hand-over speed
+/// at the final cannot make it: it goes around ([`slow_check`]).
+pub const SLOW_DECEL_MAX_KTS_S: f64 = 1.5;
+/// Room left over the planned slow-down, m: the law's lag and the level-off.
+const SLOW_MARGIN_M: f64 = 300.0;
+
+/// Distance flown slowing from `from_kts` to `to_kts` at the planned
+/// deceleration, m (both groundspeeds). Pure.
+pub fn slow_down_m(from_kts: f64, to_kts: f64) -> f64 {
+    (from_kts * from_kts - to_kts * to_kts).max(0.0) / (2.0 * SLOW_DECEL_KTS_S) * 0.514_444
+}
+
+/// The slow-down's groundspeed schedule, kt, `to_final_m` before the final
+/// begins: `to_kts` there, and at the planned deceleration before it
+/// (v^2 = vh^2 + 2 a d). Pure.
+pub fn slow_schedule_kts(to_final_m: f64, to_kts: f64) -> f64 {
+    (to_kts * to_kts + 2.0 * SLOW_DECEL_KTS_S * to_final_m.max(0.0) / 0.514_444).sqrt()
+}
+
+/// Where the slow-down starts, metres before the pad, when there is no
+/// approach (no pad elevation): at the cruise height, the planned slow-down
+/// from the cruise speed, then the final's length from there, and a margin.
 pub fn slow_start_m(cruise_kts: f64, agl_ft: f64) -> f64 {
-    let kt = 0.5144;
-    let secs = (cruise_kts - HANDOVER_KTS).max(0.0) / DECEL_KTS_S;
-    let decel_m = secs * (cruise_kts + HANDOVER_KTS) / 2.0 * kt;
-    let final_m = (agl_ft - FINAL_HOVER_FT).max(0.0) / 3.28084 / GLIDE_DEG.to_radians().tan();
-    decel_m + final_m + 1000.0
+    slow_down_m(cruise_kts, HANDOVER_KTS) + final_len_m(agl_ft) + 1000.0
 }
 
 /// The final's length on its own path from `agl_ft`, m.
 pub fn final_len_m(agl_ft: f64) -> f64 {
     (agl_ft - FINAL_HOVER_FT).max(0.0) / 3.28084 / GLIDE_DEG.to_radians().tan()
-}
-
-/// Distance flown slowing from `from_kts` to `to_kts` at the law's rate, m.
-fn decel_m(from_kts: f64, to_kts: f64) -> f64 {
-    let secs = (from_kts - to_kts).max(0.0) / DECEL_KTS_S;
-    secs * (from_kts + to_kts) / 2.0 * 0.5144
 }
 
 /// The gate's height over the pad: [`GATE_FT`], or higher where the ground
@@ -336,30 +361,250 @@ pub fn gate_agl_ft(pad_ft: f64, floor_ft: Option<f64>) -> f64 {
     floor_ft.map_or(GATE_FT, |f| (f + APPROACH_CLEAR_FT - pad_ft).max(GATE_FT))
 }
 
-/// Where the slow-down to the hand-over speed starts on an approach, m before
-/// the pad: level at the gate, it ends where the final's path from the gate
-/// begins, so the final starts ON its path, never above it (from above,
-/// `final_command` dives to it: 2,000 ft into ETND, 2026-09-23).
-pub fn approach_slow_m(gate_agl: f64) -> f64 {
-    final_len_m(gate_agl) + decel_m(APPROACH_KTS, HANDOVER_KTS)
+/// The approach's geometry, fixed at its start from the gate and the
+/// groundspeed it is flown at: the descent comes down at speed to the gate
+/// where the slow-down begins, and the slow-down is level at the gate to
+/// where the final's own path from the gate begins, so the final starts ON
+/// its path, never above it (from above, `final_command` dives to it: 2,000
+/// ft into ETND, 2026-09-23).
+///
+/// Until #191 both ends were the 70 kt book's: a path of 6.5 degrees, which
+/// at the 118 kt a floored collective actually holds on the way down is
+/// 1,360 fpm against the 1,200 cap (the S-76 reached the slow-down 300 ft
+/// over the gate), and a slow-down sized from 70 kt at 1 kt/s (2.25 km) that
+/// began at 117. Now the path is as steep as the cap allows at the speed
+/// flown ([`approach_tan`]) and the level segment is the planned slow-down
+/// from that speed ([`slow_down_m`]).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ApproachPath {
+    /// The gate's height over the pad, ft.
+    pub gate_agl: f64,
+    /// Where the path meets the gate and the slow-down starts, m before the pad.
+    pub slow_m: f64,
+    /// The path's gradient (rise over run).
+    pub tan: f64,
 }
 
-/// The approach's target altitude (ft, the dial's) at `d_m` from the pad: the
-/// path down to the gate where the slow-down starts, never above the cruise.
-pub fn approach_target_ft(d_m: f64, pad_ft: f64, gate_agl: f64, cruise_ft: f64) -> f64 {
-    let gate = pad_ft + gate_agl;
-    let path = gate
-        + (d_m - approach_slow_m(gate_agl)).max(0.0) * APPROACH_DEG.to_radians().tan() * 3.28084;
-    path.min(cruise_ft.max(gate))
+/// The approach path's gradient at a groundspeed: 6.5 degrees, or what 85 %
+/// of the vertical-speed cap makes at that speed if shallower. Pure.
+pub fn approach_tan(gs_kts: f64) -> f64 {
+    let by_cap = APPROACH_MAX_SINK_FPM * 0.85 / (gs_kts.max(1.0) * 101.269);
+    APPROACH_DEG.to_radians().tan().min(by_cap)
 }
 
-/// Where the approach starts, m before the pad: the slow-down from the cruise
-/// speed to the approach speed, then the path from the cruise height.
-pub fn approach_start_m(cruise_ft: f64, pad_ft: f64, gate_agl: f64, cruise_kts: f64) -> f64 {
-    let above = (cruise_ft - pad_ft - gate_agl).max(0.0);
-    let path_m = above / 3.28084 / APPROACH_DEG.to_radians().tan();
-    approach_slow_m(gate_agl) + path_m + decel_m(cruise_kts, APPROACH_KTS)
+impl ApproachPath {
+    pub fn new(gate_agl: f64, gs_kts: f64) -> Self {
+        let kts = gs_kts.max(APPROACH_KTS);
+        Self {
+            gate_agl,
+            slow_m: approach_slow_m(gate_agl, kts),
+            tan: approach_tan(kts),
+        }
+    }
+    /// The target altitude (ft, the dial's) at `d_m` from the pad: the path
+    /// down to the gate where the slow-down starts, never above the cruise.
+    pub fn target_ft(&self, d_m: f64, pad_ft: f64, cruise_ft: f64) -> f64 {
+        let gate = pad_ft + self.gate_agl;
+        let path = gate + (d_m - self.slow_m).max(0.0) * self.tan * 3.28084;
+        path.min(cruise_ft.max(gate))
+    }
+    /// Where the approach starts, m before the pad: the slow-down, then the
+    /// path from the cruise height.
+    pub fn start_m(&self, cruise_ft: f64, pad_ft: f64) -> f64 {
+        let above = (cruise_ft - pad_ft - self.gate_agl).max(0.0);
+        self.slow_m + above / 3.28084 / self.tan
+    }
 }
+
+/// Where the slow-down to the hand-over speed starts on an approach flown at
+/// `gs_kts`, m before the pad: the final's length from the gate, the planned
+/// slow-down before it, and a margin.
+pub fn approach_slow_m(gate_agl: f64, gs_kts: f64) -> f64 {
+    final_len_m(gate_agl) + slow_down_m(gs_kts, HANDOVER_KTS) + SLOW_MARGIN_M
+}
+
+/// The collective level flight needs at an indicated airspeed in the
+/// cruise modes, the S-76 at the end of a 45 minute flight, fitted to
+/// 1790715215-heli_route (2026-09-29): 0.675 at 125 kt (the cruise), 0.60 at
+/// 117 and 0.46 at 100 (the approach at the 0.35 floor held 118 kt at 1,200
+/// fpm down), 0.35 at 78 (where the 0.35 floor held it level, turning, for
+/// 26 minutes), the bucket about 0.34 near 65, and under it the hover loop's
+/// own curve ([`hover::level_collective`]) scaled to that loading. The slow
+/// law uses its SLOPE to move the trim as the target comes down and its
+/// value for a ceiling; the test plant uses the whole curve.
+pub const CRUISE_POWER_CURVE: &[(f64, f64)] = &[
+    (0.0, 0.55),
+    (10.0, 0.51),
+    (16.0, 0.46),
+    (23.0, 0.41),
+    (30.0, 0.38),
+    (40.0, 0.36),
+    (55.0, 0.345),
+    (65.0, 0.34),
+    (78.0, 0.35),
+    (100.0, 0.46),
+    (117.0, 0.60),
+    (125.0, 0.675),
+    (140.0, 0.80),
+];
+
+/// W/kg of excess power per unit of collective, fitted with the curve: the
+/// descent at 118 kt on 0.35 (level lever 0.61) held its speed at 1,200 fpm
+/// (60 W/kg), and the level slow-down's 0.75 kt/s at 117 with 690 fpm of sink
+/// agrees within 5 %. The plant's `dV/dt = (K (c - level) - g vz) / V`
+/// replays the recorded slow-down within a knot for 95 s.
+pub const COLLECTIVE_POWER_WKG: f64 = 230.0;
+
+fn curve_at(ias_kts: f64) -> (f64, f64) {
+    let c = CRUISE_POWER_CURVE;
+    let s = ias_kts.max(0.0);
+    for w in c.windows(2) {
+        let ((s0, c0), (s1, c1)) = (w[0], w[1]);
+        if s <= s1 {
+            let slope = (c1 - c0) / (s1 - s0);
+            return (c0 + slope * (s - s0), slope);
+        }
+    }
+    let n = c.len();
+    let slope = (c[n - 1].1 - c[n - 2].1) / (c[n - 1].0 - c[n - 2].0);
+    (c[n - 1].1 + slope * (s - c[n - 1].0), slope)
+}
+
+/// The level collective at an indicated airspeed ([`CRUISE_POWER_CURVE`]).
+pub fn cruise_level_collective(ias_kts: f64) -> f64 {
+    curve_at(ias_kts).0
+}
+
+/// The slow-down's lever floor: the cruise law's own. The approach's 0.35
+/// ([`APPROACH_COLLECTIVE_MIN`]) is the level lever at 78 kt, so it could
+/// never slow the S-76 under 78 (#191). What the 0.25 did at LILO
+/// (2026-09-24, a crash) was a speed law chasing a 38 kt step: the collective
+/// on the floor, the VS mode's nose up to 15 degrees, then the law's trim
+/// driving 0.65 at 25 kt and the climb that rang. The slow law flies a
+/// SCHEDULE, never asks the lever back up by more than [`SLOW_UP_ERR_KTS`] of
+/// error, keeps it under the level lever plus [`SLOW_CEILING_OVER_LEVEL`] and
+/// hands to the hover loop at the hand-over speed.
+pub const SLOW_COLLECTIVE_MIN: f64 = 0.25;
+/// The nose-up the slow-down is allowed before the lever comes up to ease
+/// the deceleration, degrees; per degree past it, [`SLOW_PITCH_GUARD`].
+pub const SLOW_PITCH_MAX_DEG: f64 = 10.0;
+const SLOW_PITCH_GUARD: f64 = 0.04;
+const SLOW_KP_PER_KT: f64 = 0.008;
+const SLOW_KI_PER_KT_S: f64 = 0.001;
+/// A speed under the schedule asks the lever up by no more than this much
+/// error: the slow-down never re-accelerates hard (LILO's 0.65).
+const SLOW_UP_ERR_KTS: f64 = 3.0;
+/// The slow-down's lever stays under the level lever at the speed flown plus
+/// this (the backside's climb at LILO).
+const SLOW_CEILING_OVER_LEVEL: f64 = 0.10;
+
+/// The collective for the slow-down: the autopilot holds the level (or the
+/// descent to the gate) on the pitch, so a lever under the level one is a
+/// nose-up deceleration, which is how a helicopter slows (the cyclic stays
+/// the autopilot's). A feedforward of the schedule's deceleration through
+/// the fitted power ([`COLLECTIVE_POWER_WKG`]), a trim that follows the
+/// level curve's slope as the target comes down, P and a slow I on the speed
+/// error, a pitch guard, slewed like a pilot's hand. Pure.
+#[derive(Debug, Clone, Copy)]
+pub struct SlowLaw {
+    cmd: f64,
+    trim: f64,
+    want: Option<f64>,
+}
+
+impl SlowLaw {
+    pub fn from(collective: f64) -> Self {
+        Self {
+            cmd: collective,
+            trim: collective,
+            want: None,
+        }
+    }
+    /// One step: `want_kts` the indicated target (never rising), `decel_kts_s`
+    /// the schedule's deceleration now (0 once at the hand-over speed).
+    pub fn step(
+        &mut self,
+        want_kts: f64,
+        decel_kts_s: f64,
+        ias_kts: f64,
+        theta_deg: f64,
+        dt_s: f64,
+    ) -> f64 {
+        let dt = dt_s.clamp(0.05, 1.0);
+        if let Some(prev) = self.want {
+            self.trim += curve_at(want_kts).1 * (want_kts - prev);
+        }
+        self.want = Some(want_kts);
+        let (level, _) = curve_at(ias_kts);
+        let ceiling = (level + SLOW_CEILING_OVER_LEVEL).clamp(SLOW_COLLECTIVE_MIN, COLLECTIVE_MAX);
+        let err = (want_kts - ias_kts).min(SLOW_UP_ERR_KTS);
+        let ff = -decel_kts_s.max(0.0) * 0.514_444 * (ias_kts * 0.514_444).max(8.0) / COLLECTIVE_POWER_WKG;
+        let guard = (theta_deg - SLOW_PITCH_MAX_DEG).max(0.0) * SLOW_PITCH_GUARD;
+        self.trim = (self.trim + err * SLOW_KI_PER_KT_S * dt).clamp(SLOW_COLLECTIVE_MIN, ceiling);
+        let want = ((self.trim + ff + err * SLOW_KP_PER_KT).clamp(SLOW_COLLECTIVE_MIN, ceiling) + guard)
+            .min(COLLECTIVE_MAX);
+        self.cmd += (want - self.cmd).clamp(-COLLECTIVE_SLEW * dt, COLLECTIVE_SLEW * dt);
+        self.cmd
+    }
+}
+
+/// The slow-down's indicated target, kt: a groundspeed schedule ending at
+/// the hand-over's own speed ([`slow_target_kts`]) over the ground where the
+/// final begins, less the wind along the track (a headwind adds), never
+/// under the hand-over's, never above `prev` (the target only comes down;
+/// the first is the speed the slow-down began at). Pure.
+pub fn slow_want_kts(to_final_m: f64, ias_kts: f64, gs_kts: f64, prev: f64) -> f64 {
+    let wind = gs_kts - ias_kts;
+    let to_ias = slow_target_kts(ias_kts, gs_kts);
+    let to_gs = (to_ias + wind).max(1.0);
+    (slow_schedule_kts(to_final_m, to_gs) - wind).max(to_ias).min(prev)
+}
+
+/// How a slow-down stands against the pad.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum SlowCheck {
+    OnTrack,
+    /// The pad is behind us and we are still faster than the hand-over.
+    Overflown,
+    /// The deceleration left to reach the hand-over speed by the final is
+    /// past [`SLOW_DECEL_MAX_KTS_S`] (`need` kt/s), or there is no room left.
+    TooFast { need: f64 },
+}
+
+/// Whether the slow-down can still make the pad (#191): the pad behind the
+/// nose with the speed still above the hand-over is overflown; the
+/// deceleration still needed (over the ground, to where half the final is
+/// left, the least a hand-over can start its final from) past the most the
+/// S-76 is planned to make is too fast. Either goes around; a slow enough
+/// aircraft is the hover loop's wherever it is. Pure.
+pub fn slow_check(gs_kts: f64, ias_kts: f64, remaining_m: f64, final_m: f64, pad_behind: bool) -> SlowCheck {
+    if ias_kts < HANDOVER_KTS + 2.0 {
+        return SlowCheck::OnTrack;
+    }
+    if pad_behind {
+        return SlowCheck::Overflown;
+    }
+    let room = remaining_m - final_m * 0.5;
+    let to = (slow_target_kts(ias_kts, gs_kts) + gs_kts - ias_kts).max(1.0);
+    if room <= 0.0 {
+        return SlowCheck::TooFast { need: f64::INFINITY };
+    }
+    let need = (gs_kts * gs_kts - to * to).max(0.0) / (2.0 * room / 0.514_444);
+    if need > SLOW_DECEL_MAX_KTS_S {
+        SlowCheck::TooFast { need }
+    } else {
+        SlowCheck::OnTrack
+    }
+}
+
+/// The go-around's bounds (#191): slowing straight ahead on the course it
+/// began on, a slow-down that has not reached the hand-over speed in this
+/// long, or this far past the pad, is given back.
+pub const AROUND_MAX_S: f64 = 180.0;
+pub const AROUND_MAX_M: f64 = 6_000.0;
+/// The ground ahead of a go-around is probed this far, and the level raised
+/// to clear it by [`APPROACH_CLEAR_FT`].
+const AROUND_PROBE_M: f64 = 5_000.0;
 
 /// The vertical-speed dial on the approach: the target's own descent rate
 /// (`target_ft` now against `ahead_ft`, the target 10 s down the track),
@@ -1187,7 +1432,22 @@ enum Phase {
     Cruise,
     Approach,
     Slow,
+    /// Too fast for the pad (#191): straight ahead on the course the
+    /// slow-down was flying, level clear of the ground ahead, slowing to the
+    /// hand-over speed, then the hover loop turns back and flies the final.
+    /// Never a chase of the pad's bearing at speed (it orbited 26 minutes).
+    Around,
     Arrive,
+}
+
+/// A go-around from a slow-down that could not make the pad.
+struct Around {
+    since: std::time::Instant,
+    /// The course held, true and on the dial (magnetic).
+    course_true: f64,
+    bug: f64,
+    /// The pad's distance where it began, m.
+    from_pad_m: f64,
 }
 
 struct Sample {
@@ -1379,6 +1639,13 @@ async fn fly(
         _ => None,
     };
     let mut gate: Option<(f64, f64)> = None;
+    // The approach's geometry (#191), fixed at its start from the gate and
+    // the groundspeed then; re-made at the same speed when the gate comes down.
+    let mut path: Option<ApproachPath> = None;
+    let mut approach_kts = 0.0_f64;
+    let mut slow_law: Option<SlowLaw> = None;
+    let mut slow_want = f64::INFINITY;
+    let mut around: Option<Around> = None;
     let mut level_ft = cruise_alt_ft;
     let mut vs_written: Option<f64> = None;
     crate::blackbox::record(
@@ -1611,7 +1878,7 @@ async fn fly(
                     }
                 }
             }
-            Phase::Cruise | Phase::Approach | Phase::Slow => {
+            Phase::Cruise | Phase::Approach | Phase::Slow | Phase::Around => {
                 // The cruise modes are the autopilot's to keep: a mode that
                 // dropped is put back, an autopilot turned off is the pilot's.
                 if s.ap < 0.5 {
@@ -1637,8 +1904,11 @@ async fn fly(
                 // every tick and rounded, it flipped a degree each way as the
                 // bearing crossed a half, the heading hold chased every flip
                 // and the pilot saw the yaw jitter (EDDV-ETHC, 2026-09-23).
+                // A go-around holds the course it began on (written once at
+                // its start): chasing the pad's bearing at speed is the orbit.
                 let want_bug = (track - variation).rem_euclid(360.0);
                 let bug = match bug_set {
+                    _ if around.is_some() => around.as_ref().map_or(0.0, |a| a.bug),
                     Some(b) if angle_diff(want_bug, b).abs() < BUG_HYSTERESIS_DEG => b,
                     _ => {
                         let b = want_bug.round().rem_euclid(360.0);
@@ -1653,9 +1923,13 @@ async fn fly(
                 // last leg: the fix before the pad can lie past it.
                 let pts_m: Vec<(f64, f64)> = pts.iter().map(|p| p.1).collect();
                 let remaining = remaining_m(here, &pts_m, leg);
+                let gs_kts = s.gs * 1.943_84;
                 if phase == Phase::Cruise {
                     match pad_ft {
-                        Some(pad) if remaining < approach_start_m(cruise_alt_ft, pad, GATE_FT, cruise_speed) => {
+                        Some(pad)
+                            if remaining
+                                < ApproachPath::new(GATE_FT, gs_kts).start_m(cruise_alt_ft, pad) =>
+                        {
                             // The gate clears the ground still to be crossed,
                             // probed now along what is left of the route; a
                             // failed probe falls back on the whole route's.
@@ -1672,12 +1946,15 @@ async fn fly(
                             let floor = ahead.map(|f| f + ind_offset_ft.unwrap_or(0.0));
                             let g = gate_agl_ft(pad, floor);
                             gate = Some((pad, g));
+                            approach_kts = gs_kts;
+                            let p = ApproachPath::new(g, gs_kts);
+                            path = Some(p);
                             gate_leg = Some(leg);
                             level_ft = pad + g;
                             phase = Phase::Approach;
                             crate::blackbox::record(
                                 "heli_route",
-                                serde_json::json!({ "event": "approach", "to_pad_m": to_pad, "remaining_m": remaining, "pad_ft": pad, "floor_ft": floor, "gate_agl": g, "ias": s.ias }),
+                                serde_json::json!({ "event": "approach", "to_pad_m": to_pad, "remaining_m": remaining, "pad_ft": pad, "floor_ft": floor, "gate_agl": g, "ias": s.ias, "gs_kts": gs_kts, "slow_m": p.slow_m, "path_deg": p.tan.atan().to_degrees() }),
                             );
                             say(
                                 &voice,
@@ -1689,11 +1966,13 @@ async fn fly(
                                 call_inbound(&base_url, khz);
                             }
                         }
-                        None if remaining < slow_start_m(cruise_speed, depart_agl_ft) => {
+                        None if remaining < slow_start_m(gs_kts.max(cruise_speed), depart_agl_ft) => {
                             phase = Phase::Slow;
+                            slow_law = Some(SlowLaw::from(law.as_ref().map_or(0.45, |l| l.cmd())));
+                            slow_want = s.ias;
                             crate::blackbox::record(
                                 "heli_route",
-                                serde_json::json!({ "event": "slow", "to_pad_m": to_pad, "ias": s.ias, "approach": false }),
+                                serde_json::json!({ "event": "slow", "to_pad_m": to_pad, "ias": s.ias, "gs_kts": gs_kts, "approach": false }),
                             );
                             say(
                                 &voice,
@@ -1727,6 +2006,7 @@ async fn fly(
                             let ng = gate_agl_ft(pad, Some(ahead + ind_offset_ft.unwrap_or(0.0)));
                             if ng < g - 50.0 {
                                 gate = Some((pad, ng));
+                                path = Some(ApproachPath::new(ng, approach_kts));
                                 level_ft = pad + ng;
                                 crate::blackbox::record(
                                     "heli_route",
@@ -1736,16 +2016,81 @@ async fn fly(
                         }
                     }
                 }
+                // The slow-down starts where the path meets the gate, or
+                // sooner if the speed flown now needs more room than the
+                // approach was planned for (#191: it began 2.16 km out at
+                // 117 kt on a plan made for 70).
                 if phase == Phase::Approach {
-                    if let Some((_, g)) = gate {
-                        if remaining < approach_slow_m(g) {
+                    if let (Some((_, g)), Some(p)) = (gate, path) {
+                        let need_m = final_len_m(g) + slow_down_m(gs_kts, HANDOVER_KTS) + SLOW_MARGIN_M;
+                        if remaining < p.slow_m.max(need_m) {
                             phase = Phase::Slow;
+                            slow_law = Some(SlowLaw::from(law.as_ref().map_or(0.45, |l| l.cmd())));
+                            slow_want = s.ias;
                             crate::blackbox::record(
                                 "heli_route",
-                                serde_json::json!({ "event": "slow", "to_pad_m": to_pad, "ias": s.ias, "agl": s.agl_ft, "approach": true }),
+                                serde_json::json!({ "event": "slow", "to_pad_m": to_pad, "remaining_m": remaining, "ias": s.ias, "gs_kts": gs_kts, "agl": s.agl_ft, "approach": true, "slow_m": p.slow_m, "need_m": need_m }),
                             );
                             say(&voice, Priority::Readback, "Slowing for the pad.");
                         }
+                    }
+                }
+                // A slow-down that cannot make the pad goes around, once:
+                // straight ahead on the course it flies, the level raised
+                // clear of the ground ahead, slowing to the hand-over, and
+                // the hover loop brings it back (#191: the pad's bearing
+                // chased at 88 kt was a 26 minute orbit at 79).
+                if phase == Phase::Slow {
+                    let final_m = gate.map_or(final_len_m(depart_agl_ft), |(_, g)| final_len_m(g));
+                    let behind = leg + 1 == pts.len()
+                        && to_pad < 3000.0
+                        && angle_diff(bearing(here, pad), s.psi).abs() > 90.0;
+                    let check = slow_check(gs_kts, s.ias, remaining, final_m, behind);
+                    if check != SlowCheck::OnTrack {
+                        let course = s.psi;
+                        let end = crate::nav::project_latlon(s.lat, s.lon, course, AROUND_PROBE_M / 1852.0);
+                        let ground = crate::terrain::max_elevation_ft(
+                            &xp,
+                            &sample_corridor(&[(s.lat, s.lon), end], 500.0, 500.0),
+                        )
+                        .await;
+                        let floor = ground.map(|f| f + ind_offset_ft.unwrap_or(0.0));
+                        let from = level_ft;
+                        if let Some(f) = floor {
+                            level_ft = level_ft.max(((f + APPROACH_CLEAR_FT) / 100.0).ceil() * 100.0);
+                        }
+                        let b = (course - variation).rem_euclid(360.0).round().rem_euclid(360.0);
+                        let _ = xp
+                            .set_float("sim/cockpit2/autopilot/heading_dial_deg_mag_pilot", b)
+                            .await;
+                        bug_set = Some(b);
+                        around = Some(Around {
+                            since: std::time::Instant::now(),
+                            course_true: course,
+                            bug: b,
+                            from_pad_m: to_pad,
+                        });
+                        slow_want = slow_want.min(s.ias);
+                        phase = Phase::Around;
+                        let (why, need) = match check {
+                            SlowCheck::Overflown => ("overflown", None),
+                            SlowCheck::TooFast { need } => ("too_fast", need.is_finite().then_some(need)),
+                            SlowCheck::OnTrack => ("", None),
+                        };
+                        crate::blackbox::record(
+                            "heli_route",
+                            serde_json::json!({
+                                "event": "go_around", "why": why, "need_kts_s": need, "ias": s.ias,
+                                "gs_kts": gs_kts, "to_pad_m": to_pad, "remaining_m": remaining,
+                                "final_m": final_m, "course": course, "bug": b, "level_from": from,
+                                "level_ft": level_ft, "floor_ft": floor, "agl": s.agl_ft,
+                            }),
+                        );
+                        say(
+                            &voice,
+                            Priority::Caution,
+                            "Too fast for the pad. Going around: straight ahead, slowing, then back to it on the hover.",
+                        );
                     }
                 }
                 // The vertical is the autopilot's, and it must actually be
@@ -1780,24 +2125,27 @@ async fn fly(
                 // (moved under altitude hold it leaves the pitch unheld).
                 let mut vs_cmd: Option<f64> = None;
                 let mut target_alt: Option<f64> = None;
-                if let (Some((pad, g)), Ok(alt), Phase::Approach | Phase::Slow) =
-                    (gate, alt_now.as_ref().copied(), phase)
-                {
-                    let target = approach_target_ft(remaining, pad, g, cruise_alt_ft);
-                    let ahead = approach_target_ft(
-                        (remaining - s.gs * 10.0).max(0.0),
-                        pad,
-                        g,
-                        cruise_alt_ft,
-                    );
+                // A go-around holds its level (the gate, or higher for the
+                // ground ahead), on the same mode.
+                let vplan = match (phase, gate, path) {
+                    (Phase::Around, _, _) => Some((level_ft, level_ft, level_ft)),
+                    (Phase::Approach | Phase::Slow, Some((pad, g)), Some(p)) => Some((
+                        p.target_ft(remaining, pad, cruise_alt_ft),
+                        p.target_ft((remaining - s.gs * 10.0).max(0.0), pad, cruise_alt_ft),
+                        pad + g,
+                    )),
+                    _ => None,
+                };
+                if let (Some((target, ahead, dial)), Ok(alt)) = (vplan, alt_now.as_ref().copied()) {
                     let vs = approach_vs_fpm(alt, target, ahead);
                     let engaged = vvi_mode.is_some_and(|v| v > 1.5);
-                    if !engaged && vs <= -100.0 && alt > pad + g + 60.0 {
-                        descend_on_vs(&xp, pad + g, vs).await;
+                    let off_level = (vs <= -100.0 && alt > dial + 60.0) || (vs >= 100.0 && alt < dial - 60.0);
+                    if !engaged && off_level {
+                        descend_on_vs(&xp, dial, vs).await;
                         vs_written = Some(vs);
                         crate::blackbox::record(
                             "heli_route",
-                            serde_json::json!({ "event": "descent_vs", "alt": alt, "target": target, "vs": vs, "dial": (pad + g).round() }),
+                            serde_json::json!({ "event": "descent_vs", "alt": alt, "target": target, "vs": vs, "dial": dial.round() }),
                         );
                     } else if engaged && vs_written.is_none_or(|w| (w - vs).abs() >= 50.0) {
                         let _ = xp
@@ -1831,17 +2179,41 @@ async fn fly(
                         );
                     }
                 }
-                let want = match phase {
-                    Phase::Slow => slow_target_kts(s.ias, s.gs * 1.943_84),
-                    Phase::Approach => APPROACH_KTS,
-                    _ if climbing => CLIMB_KTS,
-                    _ => cruise_speed,
+                // The slow-down flies its schedule (#191): the groundspeed
+                // that reaches the hand-over speed where the final begins at
+                // the planned deceleration, as an airspeed, never rising; a
+                // go-around brings it down at the planned rate from where it
+                // began.
+                let final_m = gate.map_or(final_len_m(depart_agl_ft), |(_, g)| final_len_m(g));
+                let handover_want = slow_target_kts(s.ias, gs_kts);
+                let (want, decel) = match phase {
+                    Phase::Slow => {
+                        slow_want = slow_want_kts(remaining - final_m, s.ias, gs_kts, slow_want);
+                        let d = if slow_want > handover_want + 0.5 {
+                            SLOW_DECEL_KTS_S
+                        } else {
+                            0.0
+                        };
+                        (slow_want, d)
+                    }
+                    Phase::Around => {
+                        slow_want = (slow_want - SLOW_DECEL_KTS_S * dt.clamp(0.0, 1.0)).max(handover_want);
+                        let d = if slow_want > handover_want + 0.5 {
+                            SLOW_DECEL_KTS_S
+                        } else {
+                            0.0
+                        };
+                        (slow_want, d)
+                    }
+                    Phase::Approach => (APPROACH_KTS, 0.0),
+                    _ if climbing => (CLIMB_KTS, 0.0),
+                    _ => (cruise_speed, 0.0),
                 };
-                if phase == Phase::Slow && want < HANDOVER_KTS - 0.5 && !slow_tail_said {
+                if phase == Phase::Slow && handover_want < HANDOVER_KTS - 0.5 && !slow_tail_said {
                     slow_tail_said = true;
                     crate::blackbox::record(
                         "heli_route",
-                        serde_json::json!({ "event": "slow_tailwind", "ias": s.ias, "gs_kts": s.gs * 1.943_84, "target_kts": want }),
+                        serde_json::json!({ "event": "slow_tailwind", "ias": s.ias, "gs_kts": gs_kts, "target_kts": handover_want }),
                     );
                 }
                 // Level in the cruise with the collective pinned at its cap:
@@ -1866,18 +2238,27 @@ async fn fly(
                         _ => {}
                     }
                 }
+                // The slow-down's lever is the slow law's (down to the
+                // cruise floor, the autopilot's nose-up doing the slowing);
+                // the approach keeps the speed law on its 0.35 floor.
+                let slowing = matches!(phase, Phase::Slow | Phase::Around);
                 if let Some(l) = law.as_mut() {
-                    l.set_floor(if matches!(phase, Phase::Approach | Phase::Slow) {
+                    l.set_floor(if phase == Phase::Approach {
                         APPROACH_COLLECTIVE_MIN
                     } else {
                         COLLECTIVE_MIN
                     });
-                    let c = l.step(want, s.ias, dt);
+                    let (c, target) = if slowing {
+                        let sl = slow_law.get_or_insert_with(|| SlowLaw::from(l.cmd()));
+                        (sl.step(want, decel, s.ias, s.theta, dt), want)
+                    } else {
+                        (l.step(want, s.ias, dt), l.target())
+                    };
                     let _ = xp.set_float_index(&collective, 0, c).await;
                     if tick_n % 4 == 0 {
                         crate::blackbox::record(
                             "heli_route",
-                            serde_json::json!({ "event": "tick", "phase": format!("{phase:?}"), "fix": ident, "d_fix_m": dist(here, to), "to_pad_m": to_pad, "ias": s.ias, "target": l.target(), "collective": c, "agl": s.agl_ft, "bug": bug, "hdg": s.mag, "theta": s.theta, "phi": s.phi, "alt_hold": alt_hold, "vvi_mode": vvi_mode, "alt": alt_now.as_ref().ok(), "target_alt": target_alt, "vs_cmd": vs_cmd }),
+                            serde_json::json!({ "event": "tick", "phase": format!("{phase:?}"), "fix": ident, "d_fix_m": dist(here, to), "to_pad_m": to_pad, "remaining_m": remaining, "ias": s.ias, "gs_kts": gs_kts, "target": target, "decel": decel, "collective": c, "agl": s.agl_ft, "bug": bug, "hdg": s.mag, "theta": s.theta, "phi": s.phi, "alt_hold": alt_hold, "vvi_mode": vvi_mode, "alt": alt_now.as_ref().ok(), "target_alt": target_alt, "vs_cmd": vs_cmd }),
                         );
                     }
                 }
@@ -1896,7 +2277,7 @@ async fn fly(
                 // a helicopter at these speeds, and waiting for the gate's
                 // height kept the cycle above going over the ridge.
                 let slowed = s.ias < HANDOVER_KTS + 2.0;
-                if phase == Phase::Slow
+                if slowing
                     && (at_gate || slowed)
                     && s.ias < HANDOVER_KTS + 2.0
                     && s.gs < hover::TAKEOVER_MAX_MPS
@@ -1912,14 +2293,37 @@ async fn fly(
                         },
                     );
                     final_from = Some((s.agl_ft, s.gs));
+                    let from = format!("{phase:?}");
                     phase = Phase::Arrive;
                     crate::blackbox::record(
                         "heli_route",
-                        serde_json::json!({ "event": "handover_hover", "to_pad_m": to_pad, "ias": s.ias, "gs": s.gs, "agl": s.agl_ft }),
+                        serde_json::json!({ "event": "handover_hover", "to_pad_m": to_pad, "ias": s.ias, "gs": s.gs, "agl": s.agl_ft, "from": from, "theta": s.theta }),
                     );
                     say(&voice, Priority::Readback, "Final for the pad.");
                     // The loop's own start takes a second; let it.
                     tokio::time::sleep(Duration::from_millis(1500)).await;
+                } else if let Some(a) = around.as_ref().filter(|_| phase == Phase::Around) {
+                    // Bounded: not slowed in AROUND_MAX_S, or this far from
+                    // the pad, the aircraft is given back level on heading
+                    // and altitude hold, the lever at the level one for its
+                    // speed (a steady cruise, never a chase).
+                    let secs = a.since.elapsed().as_secs_f64();
+                    if secs > AROUND_MAX_S || to_pad > AROUND_MAX_M {
+                        crate::blackbox::record(
+                            "heli_route",
+                            serde_json::json!({ "event": "go_around_failed", "secs": secs, "to_pad_m": to_pad, "from_pad_m": a.from_pad_m, "ias": s.ias, "gs_kts": gs_kts, "course": a.course_true }),
+                        );
+                        record_end(&voice, "slow_failed", "around");
+                        let lever = cruise_level_collective(s.ias.max(APPROACH_KTS));
+                        let _ = xp.set_float_index(&collective, 0, lever).await;
+                        let _ = hover::cruise_modes(&xp).await;
+                        say(
+                            &voice,
+                            Priority::Warning,
+                            "I couldn't slow for the pad. Route stopped, autopilot on heading and altitude, your controls.",
+                        );
+                        return false;
+                    }
                 }
             }
             Phase::Arrive => {
@@ -1993,6 +2397,7 @@ async fn fly(
         }
         DETAIL.set(match phase {
             Phase::Arrive => format!("final {:.1} nm", to_pad / 1852.0),
+            Phase::Around => format!("going around, pad {:.1} nm", to_pad / 1852.0),
             _ => format!("{} {:.1} nm", ident, dist(here, to) / 1852.0),
         });
     }
@@ -2011,109 +2416,374 @@ fn record_end(_voice: &Option<Voice>, why: &str, phase: &str) {
 mod tests {
     use super::*;
 
-    /// The approach, flown on a plant: speed through the law's own ramp and a
-    /// first-order lag, the vertical-speed mode as two 1.5 s lags with a
-    /// second of dead time, the dial rewritten by the real law every half
-    /// second. From a 1,000 ft and a 2,000 ft cruise over flat ground and over
-    /// a ridge near the pad: at the gate when the slow-down starts, never
-    /// under the path's floor, never past the sink cap, and minutes faster
-    /// than the old slow-down at the cruise height.
-    #[test]
-    fn the_approach_comes_down_at_speed_to_the_gate() {
-        struct Case {
-            cruise_agl: f64,
-            ridge_ft: Option<f64>,
-        }
-        for case in [
-            Case {
-                cruise_agl: 1000.0,
-                ridge_ft: None,
-            },
-            Case {
-                cruise_agl: 2000.0,
-                ridge_ft: None,
-            },
-            Case {
-                cruise_agl: 1500.0,
-                ridge_ft: Some(400.0),
-            },
-        ] {
-            let pad = 100.0;
-            let cruise = pad + case.cruise_agl;
-            let g = gate_agl_ft(pad, case.ridge_ft.map(|r| pad + r));
-            let start = approach_start_m(cruise, pad, GATE_FT, CRUISE_KTS);
-            let slow_at = approach_slow_m(g);
-            let dt = 0.5;
-            let (mut d, mut ias, mut alt) = (start, CRUISE_KTS, cruise);
-            let (mut target_kts, mut v1, mut v2) = (CRUISE_KTS, 0.0_f64, 0.0_f64);
-            let mut dial_hist = std::collections::VecDeque::from(vec![0.0; 2]);
-            let mut t = 0.0;
-            let mut worst_sink: f64 = 0.0;
-            let mut alt_at_slow = None;
-            while d > final_len_m(g) {
-                let want = if d < slow_at {
-                    HANDOVER_KTS
-                } else {
-                    APPROACH_KTS
-                };
-                target_kts += (want - target_kts).clamp(-DECEL_KTS_S * dt, DECEL_KTS_S * dt);
-                ias += (target_kts - ias) * dt / 3.0;
-                let target = approach_target_ft(d, pad, g, cruise);
-                let ahead = approach_target_ft((d - ias * 0.5144 * 10.0).max(0.0), pad, g, cruise);
-                let vs = approach_vs_fpm(alt, target, ahead);
-                worst_sink = worst_sink.max(-vs);
-                // Level at the gate once captured: the dial is the gate.
-                let vs = if alt <= pad + g + 5.0 && vs < 0.0 {
-                    0.0
-                } else {
-                    vs
-                };
-                dial_hist.push_back(vs);
-                let delayed = dial_hist.pop_front().unwrap();
-                v1 += (delayed - v1) * dt / 1.5;
-                v2 += (v1 - v2) * dt / 1.5;
-                alt += v2 / 60.0 * dt;
-                assert!(
-                    alt > pad + g - 60.0,
-                    "{}: {alt:.0} ft under the gate {:.0} at {d:.0} m",
-                    case.cruise_agl,
-                    pad + g
-                );
-                if alt_at_slow.is_none() && d < slow_at {
-                    alt_at_slow = Some(alt);
-                }
-                d -= ias * 0.5144 * dt;
-                t += dt;
+    /// The S-76 in the cruise modes, fitted to 1790715215-heli_route (LEMG-
+    /// LXGB, iMac 2026-09-29): the autopilot holds the vertical speed on the
+    /// pitch (the dial through a second of dead time and two 1.5 s lags), so
+    /// the collective is energy: `dV/dt = (K (c - level(V)) - g vz) / V`, the
+    /// level lever [`CRUISE_POWER_CURVE`] (shifted by `off`), `K`
+    /// [`COLLECTIVE_POWER_WKG`] (scaled by `k`), the lever through a 0.5 s
+    /// lag. The attitude is the trim's (-1.1 degrees at 125 kt, 3 at 78,
+    /// as flown) plus the deceleration's tilt plus 0.4 of the path angle
+    /// (-2.3 degrees in the 1,200 fpm descent at 115 kt, as flown). `wind`
+    /// is along the track, kt (a tailwind positive).
+    struct S76 {
+        v: f64,
+        alt: f64,
+        c: f64,
+        vz: f64,
+        v1: f64,
+        q: std::collections::VecDeque<f64>,
+        k: f64,
+        off: f64,
+        acc: f64,
+    }
+
+    impl S76 {
+        fn new(v: f64, alt: f64, c: f64, vz: f64, k: f64, off: f64) -> Self {
+            Self {
+                v,
+                alt,
+                c,
+                vz,
+                v1: vz,
+                q: std::collections::VecDeque::from(vec![vz; 10]),
+                k,
+                off,
+                acc: 0.0,
             }
-            let at_slow = alt_at_slow.expect("reached the slow-down");
-            assert!(
-                (at_slow - (pad + g)).abs() < 80.0,
-                "{}: {at_slow:.0} ft at the slow-down, gate {:.0}",
-                case.cruise_agl,
-                pad + g
-            );
-            assert!(worst_sink <= APPROACH_MAX_SINK_FPM + 1.0);
-            // The old way: slow at the cruise height, the final from there.
-            let old = slow_start_m(CRUISE_KTS, case.cruise_agl);
-            let final_old = final_len_m(case.cruise_agl);
-            let new_final = final_len_m(g);
-            let old_s = (CRUISE_KTS - HANDOVER_KTS) / DECEL_KTS_S
-                + (old - decel_m(CRUISE_KTS, HANDOVER_KTS) - final_old).max(0.0)
-                    / (HANDOVER_KTS * 0.5144)
-                + final_old / (HANDOVER_KTS * 0.5144);
-            let new_s = t + new_final / (HANDOVER_KTS * 0.5144);
-            eprintln!(
-                "cruise {} ft AGL, gate {g:.0}: approach {:.0} s + final {:.0} s against the old {:.0} s",
-                case.cruise_agl,
-                t,
-                new_final / (HANDOVER_KTS * 0.5144),
-                old_s
-            );
-            assert!(
-                new_s < old_s - 60.0,
-                "{}: {new_s:.0} s against {old_s:.0} s",
-                case.cruise_agl
-            );
+        }
+        /// 0.1 s of flight on a lever command and a vertical-speed dial.
+        fn step(&mut self, cmd: f64, dial_fpm: f64) {
+            let dt = 0.1;
+            self.c += (cmd - self.c) * dt / 0.5;
+            self.q.push_back(dial_fpm);
+            let d = self.q.pop_front().unwrap();
+            self.v1 += (d - self.v1) * dt / 1.5;
+            self.vz += (self.v1 - self.vz) * dt / 1.5;
+            let vm = (self.v * 0.514_444).max(8.0);
+            let level = cruise_level_collective(self.v) + self.off;
+            self.acc = (COLLECTIVE_POWER_WKG * self.k * (self.c - level) - 9.81 * self.vz * 0.00508) / vm;
+            self.v += self.acc / 0.514_444 * dt;
+            self.alt += self.vz / 60.0 * dt;
+        }
+        fn theta(&self) -> f64 {
+            let trim = 3.0 - 4.0 * (self.v - 78.0) / 47.0;
+            let gamma = (self.vz * 0.00508).atan2((self.v * 0.514_444).max(8.0)).to_degrees();
+            trim + (-self.acc / 9.81).atan().to_degrees() + 0.4 * gamma
+        }
+    }
+
+    /// #191, the plant against the record: the slow-down of
+    /// 1790715215-heli_route replayed from its start (2,161 m from the pad,
+    /// 117 KIAS, 810 ft on the altimeter over a 503 ft gate, the lever on
+    /// the 0.35 floor, 600 fpm down) with the old law (the speed law on
+    /// APPROACH_COLLECTIVE_MIN toward the 37 kt hand-over target) flies the
+    /// recorded airspeeds within 1.5 kt for 95 s: 94 kt at the pad, then the
+    /// floor's own level speed near 78, where it orbited for 26 minutes.
+    /// The hand-over (under 40 kt) never comes.
+    #[test]
+    fn the_plant_replays_the_recorded_overshoot() {
+        let recorded = [
+            (5.5, 112.6),
+            (11.1, 108.5),
+            (22.1, 102.3),
+            (33.1, 97.1),
+            (38.5, 94.9),
+            (52.7, 89.3),
+            (72.3, 83.2),
+            (94.4, 79.9),
+        ];
+        let mut p = S76::new(117.0, 810.0, 0.35, -600.0, 1.0, 0.0);
+        let mut law = SpeedLaw::from(0.35, 67.8);
+        law.set_floor(APPROACH_COLLECTIVE_MIN);
+        let (mut d, mut t) = (2161.0_f64, 0.0_f64);
+        let mut at_pad = None;
+        let mut next = 0;
+        let mut worst: f64 = 0.0;
+        while t < 300.0 {
+            let c = law.step(37.3, p.v, 0.5);
+            let dial = approach_vs_fpm(p.alt, 503.0, 503.0);
+            for _ in 0..5 {
+                p.step(c, dial);
+                d -= p.v * 0.514_444 * 0.1;
+                t += 0.1;
+                if at_pad.is_none() && d <= 0.0 {
+                    at_pad = Some(p.v);
+                }
+                if next < recorded.len() && t >= recorded[next].0 {
+                    worst = worst.max((p.v - recorded[next].1).abs());
+                    next += 1;
+                }
+            }
+            assert!(p.v > HANDOVER_KTS + 2.0, "the old law never slows to the hand-over");
+        }
+        let at_pad = at_pad.unwrap();
+        eprintln!("replay: {at_pad:.1} kt at the pad (recorded 94.9 at 81 m), {:.1} kt at 300 s, worst {worst:.2} kt off", p.v);
+        assert!(worst < 1.5, "the plant flies the record: worst {worst:.2} kt");
+        assert!((90.0..98.0).contains(&at_pad), "{at_pad:.1} kt at the pad");
+        assert!((76.0..81.0).contains(&p.v), "the floor's level speed: {:.1}", p.v);
+    }
+
+    struct Arrival {
+        /// (distance from the pad, KIAS, altitude) at the hover loop's takeover.
+        hand: Option<(f64, f64, f64)>,
+        final_m: f64,
+        slow_at: (f64, f64),
+        worst_theta: f64,
+        lever: (f64, f64),
+        lowest_ft: f64,
+        worst_sink: f64,
+        went_around: Option<SlowCheck>,
+    }
+
+    /// The arrival as the route flies it, on the plant: the approach from its
+    /// start (the path, the speed law on its 0.35 floor), the slow-down where
+    /// the loop starts it, its schedule and the slow law, the go-around
+    /// check, the takeover when slowed. Every half second, as the loop.
+    fn fly_arrival(v0: f64, cruise_agl: f64, gate_agl: f64, k: f64, off: f64, wind: f64) -> Arrival {
+        let pad = 3.0;
+        let cruise = pad + cruise_agl;
+        let gs0 = v0 + wind;
+        let start = ApproachPath::new(GATE_FT, gs0).start_m(cruise, pad);
+        let path = ApproachPath::new(gate_agl, gs0);
+        let final_m = final_len_m(gate_agl);
+        let c0 = cruise_level_collective(v0) + off;
+        let mut p = S76::new(v0, cruise, c0, 0.0, k, off);
+        let mut law = SpeedLaw::from(c0, v0);
+        law.set_floor(APPROACH_COLLECTIVE_MIN);
+        let mut slow: Option<SlowLaw> = None;
+        let mut want = f64::INFINITY;
+        let mut d = start;
+        let mut out = Arrival {
+            hand: None,
+            final_m,
+            slow_at: (0.0, 0.0),
+            worst_theta: f64::MIN,
+            lever: (1.0, 0.0),
+            lowest_ft: f64::MAX,
+            worst_sink: 0.0,
+            went_around: None,
+        };
+        for _ in 0..4000 {
+            let gs = p.v + wind;
+            if slow.is_none() {
+                let need = final_m + slow_down_m(gs, HANDOVER_KTS) + SLOW_MARGIN_M;
+                if d < path.slow_m.max(need) {
+                    slow = Some(SlowLaw::from(law.cmd()));
+                    want = p.v;
+                    out.slow_at = (d, p.alt);
+                }
+            }
+            let target = path.target_ft(d, pad, cruise);
+            let ahead = path.target_ft((d - gs * 0.514_444 * 10.0).max(0.0), pad, cruise);
+            let dial = approach_vs_fpm(p.alt, target, ahead);
+            out.worst_sink = out.worst_sink.max(-dial);
+            let c = match slow.as_mut() {
+                None => law.step(APPROACH_KTS, p.v, 0.5),
+                Some(sl) => {
+                    let check = slow_check(gs, p.v, d, final_m, d < 0.0);
+                    if check != SlowCheck::OnTrack && out.went_around.is_none() {
+                        out.went_around = Some(check);
+                    }
+                    want = slow_want_kts(d - final_m, p.v, gs, want);
+                    let decel = if want > slow_target_kts(p.v, gs) + 0.5 {
+                        SLOW_DECEL_KTS_S
+                    } else {
+                        0.0
+                    };
+                    if p.v < HANDOVER_KTS + 2.0 && gs * 0.514_444 < hover::TAKEOVER_MAX_MPS {
+                        out.hand = Some((d, p.v, p.alt));
+                        break;
+                    }
+                    let c = sl.step(want, decel, p.v, p.theta(), 0.5);
+                    out.lever = (out.lever.0.min(c), out.lever.1.max(c));
+                    c
+                }
+            };
+            for _ in 0..5 {
+                p.step(c, dial);
+                d -= (p.v + wind) * 0.514_444 * 0.1;
+                out.lowest_ft = out.lowest_ft.min(p.alt);
+                if slow.is_some() {
+                    out.worst_theta = out.worst_theta.max(p.theta());
+                }
+            }
+        }
+        out
+    }
+
+    /// #191, the fix on the fitted plant: from the recorded cruise (4,180 ft,
+    /// 125 kt, the pad at sea level, the 500 ft gate) and from a 1,000 and a
+    /// 2,000 ft cruise with a ridge that holds the gate at 900, the approach
+    /// reaches the gate by the time the slow-down starts, the slow-down
+    /// flies its schedule down to the hand-over speed where the final
+    /// begins, level at the gate, the nose never past the guard, the lever
+    /// never under the cruise floor, and the go-around never needed; in a
+    /// 10 kt headwind and a 6 kt tailwind (the most the hand-over's 30 kt
+    /// floor, [`SLOW_MIN_KTS`], brings inside the takeover's groundspeed). The old slow-down handed over
+    /// nowhere (`the_plant_replays_the_recorded_overshoot`).
+    #[test]
+    fn the_slowdown_reaches_the_takeover_speed_where_the_final_begins() {
+        let mut bad = Vec::new();
+        for (v0, cruise_agl, gate) in [(125.0, 4177.0, GATE_FT), (120.0, 1000.0, GATE_FT), (120.0, 2000.0, 900.0)] {
+            for wind in [-10.0, 0.0, 6.0] {
+                let r = fly_arrival(v0, cruise_agl, gate, 1.0, 0.0, wind);
+                let tag = format!("{cruise_agl} ft AGL, gate {gate}, wind {wind}");
+                let Some((d, v, alt)) = r.hand else {
+                    bad.push(format!("{tag}: no takeover"));
+                    continue;
+                };
+                eprintln!(
+                    "{tag}: slow-down at {:.0} m ({:.0} ft), takeover {d:.0} m out at {v:.1} kt ({alt:.0} ft), final {:.0} m, nose {:.1}, lever {:.2}..{:.2}",
+                    r.slow_at.0, r.slow_at.1, r.final_m, r.worst_theta, r.lever.0, r.lever.1
+                );
+                if (d - r.final_m).abs() > 400.0 {
+                    bad.push(format!("{tag}: takeover {d:.0} m out, the final is {:.0}", r.final_m));
+                }
+                if (r.slow_at.1 - (3.0 + gate)).abs() > 120.0 {
+                    bad.push(format!("{tag}: {:.0} ft at the slow-down, gate {:.0}", r.slow_at.1, 3.0 + gate));
+                }
+                if r.lowest_ft < 3.0 + gate - 60.0 {
+                    bad.push(format!("{tag}: {:.0} ft, under the gate", r.lowest_ft));
+                }
+                if r.worst_theta > SLOW_PITCH_MAX_DEG + 1.0 {
+                    bad.push(format!("{tag}: nose {:.1}", r.worst_theta));
+                }
+                if r.lever.0 < SLOW_COLLECTIVE_MIN - 1e-9 {
+                    bad.push(format!("{tag}: lever {:.3}", r.lever.0));
+                }
+                if r.worst_sink > APPROACH_MAX_SINK_FPM + 1.0 {
+                    bad.push(format!("{tag}: sink {:.0}", r.worst_sink));
+                }
+                if let Some(g) = r.went_around {
+                    bad.push(format!("{tag}: went around {g:?}"));
+                }
+            }
+        }
+        assert!(bad.is_empty(), "{bad:#?}");
+    }
+
+    /// The same arrival on plants nobody has measured: the power 30 % weaker
+    /// or stronger, the level lever 0.04 lower or higher (another weight, a
+    /// hot day), each wind. The takeover always comes before the pad, the
+    /// nose stays within the guard and a degree or two; where the plan was
+    /// too hopeful the go-around check says so rather than fly past.
+    #[test]
+    fn the_slowdown_holds_on_plants_nobody_has_measured() {
+        let mut bad = Vec::new();
+        for k in [0.7, 1.0, 1.3] {
+            for off in [-0.04, 0.0, 0.04] {
+                for wind in [-10.0, 0.0, 6.0] {
+                    let r = fly_arrival(125.0, 4177.0, GATE_FT, k, off, wind);
+                    let tag = format!("k {k} off {off} wind {wind}");
+                    match r.hand {
+                        Some((d, _, _)) if d > 0.0 => {}
+                        Some((d, _, _)) if r.went_around.is_some() => {
+                            eprintln!("{tag}: past the pad {d:.0} m, went around first")
+                        }
+                        other => bad.push(format!("{tag}: takeover {other:?}")),
+                    }
+                    if r.worst_theta > SLOW_PITCH_MAX_DEG + 2.0 {
+                        bad.push(format!("{tag}: nose {:.1}", r.worst_theta));
+                    }
+                }
+            }
+        }
+        assert!(bad.is_empty(), "{bad:#?}");
+    }
+
+    /// #191, the overshoot is never an orbit. The recorded slow-down began
+    /// with 2,251 m to go at 118.9 kt over the ground: 2.1 kt/s needed to
+    /// half the final's length where the plan flies 0.7, so it is TOO FAST
+    /// at once; the pad behind
+    /// at 88 kt is OVERFLOWN; a slowed aircraft is the hover loop's wherever
+    /// it is; the new slow-down's own start is on track. Flown from the
+    /// recorded overflight (94 kt at the pad, 575 ft), the go-around holds
+    /// its course and level and slows at the planned rate to the takeover
+    /// inside its bounds, where the old one turned after the pad at 5
+    /// degrees a tick and circled for 26 minutes.
+    #[test]
+    fn a_slowdown_that_cannot_make_the_pad_goes_around() {
+        let final_m = final_len_m(GATE_FT);
+        match slow_check(118.9, 117.7, 2251.0, final_m, false) {
+            SlowCheck::TooFast { need } => assert!(need > 2.0, "{need}"),
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(slow_check(88.0, 88.0, 700.0, final_m, true), SlowCheck::Overflown);
+        assert_eq!(slow_check(39.0, 39.0, 50.0, final_m, true), SlowCheck::OnTrack);
+        assert_eq!(slow_check(39.0, 39.0, -500.0, final_m, false), SlowCheck::OnTrack);
+        let start = ApproachPath::new(GATE_FT, 126.0).slow_m;
+        assert_eq!(slow_check(126.0, 125.0, start, final_m, false), SlowCheck::OnTrack);
+        assert!(matches!(
+            slow_check(80.0, 80.0, final_m * 0.4, final_m, false),
+            SlowCheck::TooFast { .. }
+        ));
+        // The go-around, flown: the target down at the planned rate from the
+        // speed it began at, the level held at the gate.
+        for (k, off) in [(1.0, 0.0), (0.7, -0.04), (1.3, 0.04)] {
+            let mut p = S76::new(94.0, 575.0, 0.35, -150.0, k, off);
+            let mut sl = SlowLaw::from(0.35);
+            let mut want = p.v;
+            let (mut t, mut past) = (0.0_f64, 0.0_f64);
+            let mut worst_theta: f64 = f64::MIN;
+            let hand = loop {
+                if p.v < HANDOVER_KTS + 2.0 && p.v * 0.514_444 < hover::TAKEOVER_MAX_MPS {
+                    break Some((t, past, p.v));
+                }
+                if t > AROUND_MAX_S {
+                    break None;
+                }
+                let floor = slow_target_kts(p.v, p.v);
+                want = (want - SLOW_DECEL_KTS_S * 0.5).max(floor);
+                let decel = if want > floor + 0.5 { SLOW_DECEL_KTS_S } else { 0.0 };
+                let c = sl.step(want, decel, p.v, p.theta(), 0.5);
+                let dial = approach_vs_fpm(p.alt, 503.0, 503.0);
+                for _ in 0..5 {
+                    p.step(c, dial);
+                    past += p.v * 0.514_444 * 0.1;
+                    worst_theta = worst_theta.max(p.theta());
+                }
+                t += 0.5;
+            };
+            let (t, past, v) = hand.unwrap_or_else(|| panic!("k {k} off {off}: not slowed in {AROUND_MAX_S} s"));
+            eprintln!("go-around k {k} off {off}: takeover at {v:.1} kt after {t:.0} s, {past:.0} m past the pad, nose {worst_theta:.1}, {:.0} ft", p.alt);
+            assert!(past < AROUND_MAX_M, "{past:.0} m");
+            assert!(worst_theta < SLOW_PITCH_MAX_DEG + 2.0, "{worst_theta:.1}");
+            assert!((p.alt - 503.0).abs() < 80.0, "{:.0} ft", p.alt);
+        }
+    }
+
+    /// LILO-LILB (2026-09-24, crashed): the speed law on a 0.25 floor at 86
+    /// kt drove the lever to 0.65 once the nose-up had the speed at 25 kt,
+    /// and the helicopter climbed into a growing cycle. The slow law under
+    /// its target never asks more than the level lever and its margin, and
+    /// a nose past the guard eases the deceleration.
+    #[test]
+    fn the_slow_law_never_climbs_away_under_its_target() {
+        let mut sl = SlowLaw::from(0.30);
+        let mut c = 0.30;
+        for _ in 0..200 {
+            c = sl.step(HANDOVER_KTS, 0.0, 25.0, 6.0, 0.5);
+        }
+        assert!(c <= cruise_level_collective(25.0) + 0.1 + 1e-9, "{c}");
+        assert!(c < 0.55, "never LILO's 0.65: {c}");
+        // Past the guard the lever comes up by the guard's share.
+        let mut calm = SlowLaw::from(0.30);
+        let mut steep = SlowLaw::from(0.30);
+        let (mut a, mut b) = (0.0, 0.0);
+        for _ in 0..40 {
+            a = calm.step(60.0, SLOW_DECEL_KTS_S, 90.0, 5.0, 0.5);
+            b = steep.step(60.0, SLOW_DECEL_KTS_S, 90.0, SLOW_PITCH_MAX_DEG + 3.0, 0.5);
+        }
+        assert!(b > a + 0.1, "{a:.3} {b:.3}");
+        // Never under the cruise floor, never slewed fast.
+        let mut hard = SlowLaw::from(0.60);
+        let mut last = 0.60;
+        for _ in 0..100 {
+            let c = hard.step(38.0, SLOW_DECEL_KTS_S, 117.0, 0.0, 0.5);
+            assert!((c - last).abs() <= COLLECTIVE_SLEW * 0.5 + 1e-9);
+            assert!(c >= SLOW_COLLECTIVE_MIN - 1e-9);
+            last = c;
         }
     }
 
@@ -2123,23 +2793,39 @@ mod tests {
         assert_eq!(gate_agl_ft(100.0, None), GATE_FT);
         assert_eq!(gate_agl_ft(100.0, Some(150.0)), GATE_FT);
         assert_eq!(gate_agl_ft(100.0, Some(600.0)), 900.0);
-        // The path: level at the cruise far out, down to the gate at the
-        // slow-down, level at the gate inside it.
+        // The path: level at the cruise far out, down to the gate where the
+        // slow-down starts, level at the gate inside it.
         let (pad, cruise) = (100.0, 1100.0);
-        let slow = approach_slow_m(GATE_FT);
-        assert_eq!(approach_target_ft(20_000.0, pad, GATE_FT, cruise), cruise);
-        assert_eq!(
-            approach_target_ft(slow, pad, GATE_FT, cruise),
-            pad + GATE_FT
+        let p = ApproachPath::new(GATE_FT, 120.0);
+        assert_eq!(p.target_ft(40_000.0, pad, cruise), cruise);
+        assert_eq!(p.target_ft(p.slow_m, pad, cruise), pad + GATE_FT);
+        assert_eq!(p.target_ft(100.0, pad, cruise), pad + GATE_FT);
+        // The level segment is the planned slow-down from the speed flown,
+        // to where the final begins, and a margin.
+        assert!(
+            (p.slow_m - (final_len_m(GATE_FT) + slow_down_m(120.0, HANDOVER_KTS) + SLOW_MARGIN_M)).abs() < 1e-6
         );
-        assert_eq!(
-            approach_target_ft(100.0, pad, GATE_FT, cruise),
-            pad + GATE_FT
-        );
-        // It starts where the path from the cruise meets the level, plus the
-        // slow-down to the approach speed.
-        let start = approach_start_m(cruise, pad, GATE_FT, CRUISE_KTS);
-        assert!(start > slow + decel_m(CRUISE_KTS, APPROACH_KTS));
+        assert!(ApproachPath::new(GATE_FT, 125.0).slow_m > ApproachPath::new(GATE_FT, 90.0).slow_m);
+        // As steep as the vertical-speed cap allows at the speed flown: 6.5
+        // degrees at 70 kt, shallower at 125 (6.5 degrees would be 1,450 fpm).
+        assert!((ApproachPath::new(GATE_FT, 50.0).tan - APPROACH_DEG.to_radians().tan()).abs() < 1e-12);
+        let fast = ApproachPath::new(GATE_FT, 125.0);
+        assert!(fast.tan * 125.0 * 101.269 <= APPROACH_MAX_SINK_FPM * 0.85 + 1e-6);
+        assert!(fast.tan < APPROACH_DEG.to_radians().tan());
+        // It starts where the path from the cruise meets the level.
+        let start = p.start_m(cruise, pad);
+        assert!((start - (p.slow_m + (cruise - pad - GATE_FT) / 3.28084 / p.tan)).abs() < 1e-6);
+        // The schedule: the hand-over speed where the final begins, the
+        // speed flown where the slow-down begins, and the target only down.
+        assert!((slow_schedule_kts(0.0, HANDOVER_KTS) - HANDOVER_KTS).abs() < 1e-9);
+        assert!((slow_schedule_kts(slow_down_m(117.0, HANDOVER_KTS), HANDOVER_KTS) - 117.0).abs() < 1e-6);
+        assert_eq!(slow_want_kts(10_000.0, 100.0, 100.0, 100.0), 100.0);
+        assert!(slow_want_kts(1_000.0, 100.0, 100.0, 100.0) < 70.0);
+        // The schedule is over the ground: a tailwind ends it lower, at the
+        // hand-over's own target; a headwind flies more airspeed on the way.
+        assert!((slow_want_kts(0.0, 40.0, 50.0, 90.0) - slow_target_kts(40.0, 50.0)).abs() < 1e-9);
+        assert!(slow_want_kts(3_000.0, 80.0, 70.0, 200.0) > slow_want_kts(3_000.0, 80.0, 80.0, 200.0));
+        assert!((slow_want_kts(0.0, 60.0, 50.0, 200.0) - HANDOVER_KTS).abs() < 1e-9);
         // The final from the gate begins on its own path.
         assert!((final_command(final_len_m(GATE_FT), GATE_FT, 19.5).1 - GATE_FT).abs() < 60.0);
         // The vertical law: level on the target, down toward it, and up when
