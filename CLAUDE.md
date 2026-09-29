@@ -1115,6 +1115,13 @@ confirms it closes it (`fixes #N` in the commit). Known gaps are `owed` issues.
   SimBrief, may `expect_give_up`, and `traffic: off` hides LiveTraffic's aircraft for a case that is not about ATC (`livetraffic/cfg/aircrafts_displayed`, touched only when a case wants a change, shown again at the run's end); `runway: wind` is the tower's into-wind end at the setup (`resolve_wind`, METAR else
   the sim's wind on the field); an unset deadline scales with the approach speed; **a reposition or
   swap is a new flight to the scorer** (`Scorer::new_flight`); specs `bench/sorties/backlog-737.yaml`, `backlog-types.yaml`.
+  **`--check` first, no sim** (`xvl sortie <spec> --check`, exit 1 on a problem): every typed line
+  (setup words, command, each `say`) routed as the loop routes it, word-only branches first
+  (`main::question_shortcut`, the loop's own, order test-pinned; `pre_grammar_capture`), to its
+  step's tool; every record the runner reads pinned to its producer (`READ_SHAPES`,
+  `shape_problems`), event and give-up words to the source; plan words need a SimBrief id,
+  `runway: wind` is skipped (the enroute setup answered as a TOD question; a give-up read in a
+  shape never written, d270a29).
   **An arrival case starts IN THE AIR on the plan** (`setup: {enroute: {at: fix | before_tod_nm |
   before_destination_nm, value}}`, checked on the fetched plan): the runner types the app's
   `setup_enroute` words and waits for `setup` `enroute_result`, then the case's "fly the flight

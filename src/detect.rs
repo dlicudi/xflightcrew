@@ -671,9 +671,9 @@ pub(crate) fn spawn_aircraft_detector(
     });
 }
 
-/// The tests' view of the resolver: the curated profile an ICAO and .acf
-/// path resolve to (no author or description), `None` when generic.
-#[cfg(test)]
+/// The resolver for an ICAO and .acf path alone (no author or
+/// description): the curated profile they resolve to, `None` when generic.
+/// The tests' view, and `xvl sortie --check`'s.
 pub(crate) fn resolved_id(icao: &str, relative_path: &str) -> Option<String> {
     let who = AcfIdentity {
         icao: icao.into(),

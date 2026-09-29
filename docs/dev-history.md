@@ -10475,3 +10475,28 @@ the 737 reject held for a lander on 12. A case may now say `traffic: off`: the r
 when a case wants a change from what it last set, and shows the traffic again at the run's end; a spec
 without `traffic` reads and writes nothing (its fake-sim tests unchanged). Test
 traffic_is_a_switch_per_case.
+
+## 2026-09-29: `xvl sortie <spec> --check`, the runner's lines and records checked offline
+
+Two runner bugs cost flights on 2026-09-28 that no test could see: the command loop's pre-grammar
+branch for a top of descent question took "put us enroute 30 miles before top of descent" ("Top of
+descent about 893 miles ahead", the setup never ran), and the CaseMachine read full auto's give-up
+as `event` `give_up` with a top-level `reason`, a shape it never wrote (d270a29).
+`every_scripted_line_routes_to_its_tool` went through the grammar only. The loop's word-only
+branches (fuel, reminders, plan check, systems, TOD, weather, ETA, runway, traffic, next waypoint,
+the route load and brief, 25 in all) are now one pure `main::question_shortcut` the loop itself
+asks (order pinned by `the_loop_asks_every_shortcut_in_order`); `pre_grammar_capture` adds the
+other word-only captures (undo, lessons, conversation, cabin, taxi and radio coach, recall, the
+question opener). `--check` routes every typed line of every case (the setup's words, the command,
+each `say`) on the case's airframe and fails a capture or a wrong tool; `READ_SHAPES` pins every
+record the runner matches on to its producer's code and fields (`shape_problems`), and a spec's
+event triggers and `expect_give_up` to words the app writes. Found on its first run: "put us
+enroute 40 miles before the destination" was taken as the flight plan brief ("route" in "enroute"
+plus "the"); a setup's words are now never a shortcut. And the runner's `heli_route` `give_up`
+had no producer (dropped; the sortie's `end` carries the reason). The shipped specs all pass
+(approach lines with `runway: wind` or the plan's runway unresolved are skipped, said). Tests
+`a_setup_is_never_a_question`, `the_check_passes_every_shipped_spec`,
+`the_check_fails_a_line_the_loop_would_not_route_to_its_tool`,
+`every_record_the_runner_reads_is_one_the_app_writes`,
+`every_field_the_runner_reads_is_in_the_shape_table`,
+`a_specs_event_and_give_up_are_words_the_app_writes`. Offline only.
