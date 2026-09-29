@@ -2752,6 +2752,25 @@ fn crew_yoke_fresh() -> bool {
     ms > 0 && process_secs() - (ms - 1) as f64 / 1000.0 <= CREW_YOKE_FRESH_S
 }
 
+/// Millis since the process epoch of the pilot's last "my controls" that
+/// stopped a flying loop, 0 = never.
+static PILOT_RELEASE_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// How long a pilot's own "my controls" answers the automation-stopped
+/// watch: the crew already said "You have the aircraft."
+const PILOT_RELEASE_QUIET_S: f64 = 15.0;
+
+/// The pilot took the aircraft from a flying loop ("my controls",
+/// `tools::autopilot::AutopilotOff`): the stop is not news.
+pub fn note_pilot_release() {
+    let ms = (process_secs() * 1000.0) as u64 + 1;
+    PILOT_RELEASE_MS.store(ms, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn pilot_released_recently() -> bool {
+    let ms = PILOT_RELEASE_MS.load(std::sync::atomic::Ordering::Relaxed);
+    ms > 0 && process_secs() - (ms - 1) as f64 / 1000.0 <= PILOT_RELEASE_QUIET_S
+}
+
 /// Which interventions the tick sees, pure: `[steer_yield, pitch_yield,
 /// brake_yield, yoke_under_ap]`. The yoke is a hand only when WE are not the
 /// one moving it: under our own pitch/roll channel the ratio is the loop's
@@ -4914,7 +4933,12 @@ pub async fn run(
                     if now.duration_since(since) >= Duration::from_secs(3) {
                         had_flying_control = false;
                         landing_summary.note_interruption();
+                        // The pilot's own "my controls" was answered already;
+                        // said again it landed on the next "you have control"
+                        // (LEMG 13 1790690743, 2026-09-29, #54).
+                        if !pilot_released_recently() {
                         voice.alert(Priority::Caution, "Flight automation has stopped. I'm monitoring only; you have control. Check the autopilot.".to_string());
+                        }
                     }
                 } else if snap.on_ground {
                     had_flying_control = false;

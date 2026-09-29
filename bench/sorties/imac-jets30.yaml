@@ -1,0 +1,23 @@
+# iMac follow-up: the jets' circuits from LEMG 30 (13's circuit is refused
+# for terrain on the runway, correctly: #183). Landings and circuits only.
+after: stop
+cases:
+  # #169: the A330's circuit speed against the flap it keeps; leg ias vs
+  # want_kts, no flap overspeed. Also #185 (flare roll on a slow tick).
+  - name: "A330 LEMG runway start 30, circuit (#169 #185)"
+    setup:
+      aircraft: "Aircraft/Laminar Research/Airbus A330-300/A330.acf"
+      runway_start: { field: LEMG, runway: 30, engines_running: true }
+    command: fly a circuit
+    traffic: off
+    deadline_min: 30
+
+  # #78 climb_manual theta vs the ceiling; #123 line-up and roll; #31 and
+  # #185 the flare roll and the rollout.
+  - name: "737 LEMG runway start 30, circuit (#78 #123 #31 #185)"
+    setup:
+      aircraft: "Aircraft/Laminar Research/Boeing 737-800/b738.acf"
+      runway_start: { field: LEMG, runway: 30, engines_running: true }
+    command: fly a circuit
+    traffic: off
+    deadline_min: 30

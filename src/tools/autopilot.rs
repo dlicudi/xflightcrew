@@ -1275,6 +1275,7 @@ impl Tool for AutopilotOff {
         // acknowledge *that* rather than the AP-off wording.
         let was_flying = crate::tools::recover::abort() | crate::autoland::abort();
         if was_flying {
+            crate::monitor::note_pilot_release();
             return Ok("You have the aircraft.".to_string());
         }
         if !servos_engaged(ctx).await? {
