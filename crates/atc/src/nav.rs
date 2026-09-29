@@ -1253,6 +1253,73 @@ fn paint_between(
     (stations.into_iter().map(point_at).collect(), hi - lo)
 }
 
+/// A route's first edge is joined AHEAD of the aircraft's projection onto
+/// it, never at the snapped node behind it. The planner snaps the start to
+/// the nearest node, and when the aircraft sits abeam the middle of an edge
+/// that node is behind it along the way the route goes: the route then runs
+/// back to the node and hairpins onto the edge. LILB ramp, Lancair Evolution
+/// (1790712974, 1790720549, 1790721973; 2026-09-29 and 30): parked at
+/// 45.771275 9.164289 facing 28.9, the nearest node 16.7 m away on a bearing
+/// of 98, the edge beyond it running 335: a 124 degree reversal 17 m from
+/// brake release, flown at 8 to 9 kt with the projection jumping onto the
+/// second leg, and every taxi failed 14.2 to 16.3 m off the line. Now the
+/// route joins the edge past the projection by the offset itself (bounded
+/// by [`JOIN_AHEAD_LEAD_M`] and [`JOIN_AHEAD_MAX_LEAD_M`]: a 45 degree
+/// join), and an edge wholly behind the projection is dropped. Only the network's first taxiway leg, only when
+/// the aircraft is within [`JOIN_AHEAD_MAX_LAT_M`] of it. Pure.
+pub fn join_first_edge_ahead(
+    path: &mut Vec<(f64, f64)>,
+    seg: &mut Vec<(String, bool)>,
+    here: (f64, f64),
+) {
+    let m_per_deg_lon = 111_320.0 * here.0.to_radians().cos();
+    let to_m = |p: (f64, f64)| ((p.1 - here.1) * m_per_deg_lon, (p.0 - here.0) * 111_320.0);
+    while path.len() >= 2 && seg.len() + 1 == path.len() {
+        if seg[0].1 {
+            return; // a runway leg is the runway's geometry
+        }
+        let (a, b) = (to_m(path[0]), to_m(path[1]));
+        let (ex, ey) = (b.0 - a.0, b.1 - a.1);
+        let len = (ex * ex + ey * ey).sqrt();
+        if len < 0.5 {
+            return;
+        }
+        // The aircraft is the origin: its projection along a->b, and its
+        // distance off the edge's line.
+        let t = (-a.0 * ex - a.1 * ey) / len;
+        let off = (a.0 * ey - a.1 * ex).abs() / len;
+        if off > JOIN_AHEAD_MAX_LAT_M || t < JOIN_AHEAD_MIN_M {
+            return;
+        }
+        let join = t + off.clamp(JOIN_AHEAD_LEAD_M, JOIN_AHEAD_MAX_LEAD_M);
+        if join >= len - JOIN_AHEAD_MIN_M {
+            // The whole edge is behind the join: its far node is the join
+            // (a route never shorter than two points), then look again.
+            if path.len() <= 2 {
+                return;
+            }
+            path.remove(0);
+            seg.remove(0);
+            continue;
+        }
+        let k = join / len;
+        let (p0, p1) = (path[0], path[1]);
+        path[0] = (p0.0 + (p1.0 - p0.0) * k, p0.1 + (p1.1 - p0.1) * k);
+        return;
+    }
+}
+/// The aircraft's projection must be this far past the edge's start before
+/// the node counts as behind it, and a join this close to the edge's end is
+/// the end node.
+const JOIN_AHEAD_MIN_M: f64 = 3.0;
+/// The join sits this far past the projection at least, and at most
+/// [`JOIN_AHEAD_MAX_LEAD_M`]: the offset itself between, a 45 degree join.
+const JOIN_AHEAD_LEAD_M: f64 = 5.0;
+const JOIN_AHEAD_MAX_LEAD_M: f64 = 30.0;
+/// Further off the first edge than this, the start is not beside it: the
+/// planner's node stands.
+const JOIN_AHEAD_MAX_LAT_M: f64 = 60.0;
+
 /// Move a planned route onto the paint it is an approximation of, returning
 /// the resampled `(path, seg)`.
 ///
@@ -2577,6 +2644,9 @@ impl TaxiNet {
         (path, seg) = ride_paint(&self.paint, &path, &seg);
         let lead_seg = vec![(String::new(), false); lead_on.len().saturating_sub(1)];
         lead_on = ride_paint(&self.paint, &lead_on, &lead_seg).0;
+        // ...and the route JOINS its first taxiway ahead of the aircraft,
+        // never at a snapped node behind it (`join_first_edge_ahead`).
+        join_first_edge_ahead(&mut path, &mut seg, (from_lat, from_lon));
         // The route starts where the AIRCRAFT is, not at the node it snapped
         // to: the apron leg from the stand to the network is part of the
         // cleared route, so the off-route watch and the taxi guide measure
@@ -7102,6 +7172,104 @@ SID:030,5,BLN4L,RW30,BLN,LE,D, ,VE  , ,   ,TF, , , , , ,      ,    ,    ,    ,  
             far.path, plain.path,
             "with no entrance authored, they agree"
         );
+    }
+
+    /// LILB's own network (apt.dat 1201/1202 as authored) and the Lancair
+    /// Evolution's stand: 45.771275 9.164289, facing 28.9 (1790712974,
+    /// 1790720549, 1790721973; 2026-09-29 and 30). The nearest node (5) is
+    /// 16.7 m away on a bearing of 98 and the edge beyond it runs 335: the
+    /// route ran to it and hairpinned 124 degrees, and every taxi failed
+    /// 14.2 to 16.3 m off the line. Now it joins taxiway A ahead of the
+    /// aircraft: no turn anywhere on the route past 90 degrees, the first
+    /// leg within 30 degrees of the nose, and node 5 not on the route.
+    #[test]
+    fn a_route_joins_its_first_taxiway_ahead_never_back_at_the_node() {
+        let mut net = TaxiNet::default();
+        for (id, p) in [
+            (0, (45.771927, 9.164043)),
+            (1, (45.772005, 9.163885)),
+            (2, (45.767882, 9.161007)),
+            (3, (45.772092, 9.163689)),
+            (4, (45.772017, 9.163642)),
+            (5, (45.771252, 9.164503)),
+            (6, (45.772075, 9.164124)),
+        ] {
+            net.nodes.insert(id, p);
+        }
+        let e = |a, b, name: &str, runway, zone: &[&str]| TaxiEdge {
+            a,
+            b,
+            name: name.into(),
+            runway,
+            oneway: false,
+            zone_of: zone.iter().map(|s| s.to_string()).collect(),
+        };
+        net.edges.push(e(0, 5, "taxiway_A", false, &[]));
+        net.edges.push(e(1, 0, "taxiway_A", false, &[]));
+        net.edges.push(e(1, 6, "taxiway_A", false, &[]));
+        net.edges.push(e(4, 1, "taxiway_A", false, &["03", "21"]));
+        net.edges.push(e(3, 4, "runway", true, &["03", "21"]));
+        net.edges.push(e(4, 2, "runway", true, &["03", "21"]));
+        let (lat, lon, psi) = (45.771275, 9.164289, 28.9);
+        let zone = ["03".to_string(), "21".to_string()];
+        let plan = net
+            .plan_to_runway(lat, lon, 45.7671573, 9.1605458, 40.0, &zone, None)
+            .expect("a route to 03");
+        let turn = |a: (f64, f64), b: (f64, f64), c: (f64, f64)| {
+            let d = bearing_deg(b.0, b.1, c.0, c.1) - bearing_deg(a.0, a.1, b.0, b.1);
+            ((d + 540.0).rem_euclid(360.0) - 180.0).abs()
+        };
+        // As planned before: out to node 5 and back up the taxiway.
+        let node5 = net.nodes[&5];
+        let node0 = net.nodes[&0];
+        assert!(turn((lat, lon), node5, node0) > 120.0, "the recorded hairpin");
+        assert_eq!(plan.path[0], (lat, lon), "starts at the aircraft");
+        assert!(!plan.path.contains(&node5), "node 5 is behind us: {:?}", plan.path);
+        assert_eq!(plan.seg.len(), plan.path.len() - 1);
+        let first = bearing_deg(lat, lon, plan.path[1].0, plan.path[1].1);
+        let off_nose = ((first - psi + 540.0).rem_euclid(360.0) - 180.0).abs();
+        assert!(off_nose < 30.0, "first leg {first:.0} vs nose {psi}");
+        for w in plan.path.windows(3) {
+            let t = turn(w[0], w[1], w[2]);
+            assert!(t <= 90.0, "a {t:.0} degree turn at {:?}", w[1]);
+        }
+        // The route still ends at the 21_hold edge's hold (node 1), and is
+        // shorter by the leg back to the node.
+        assert_eq!(*plan.path.last().unwrap(), net.nodes[&1]);
+        let total: f64 = plan
+            .path
+            .windows(2)
+            .map(|w| haversine_nm(w[0].0, w[0].1, w[1].0, w[1].1) * 1852.0)
+            .sum();
+        assert!(total < 110.0, "{total:.1} m (was 115.1)");
+    }
+
+    /// The join is pure geometry: abeam an edge's start it changes nothing,
+    /// a runway leg is never moved, and an edge wholly behind is dropped.
+    #[test]
+    fn join_first_edge_ahead_leaves_a_start_abeam_its_node_alone() {
+        let here = (51.0, -1.0);
+        let north = |m: f64| (51.0 + m / 111_320.0, -1.0);
+        // Standing on the start node: unchanged.
+        let mut path = vec![north(0.0), north(100.0), north(200.0)];
+        let mut seg = vec![(String::new(), false); 2];
+        join_first_edge_ahead(&mut path, &mut seg, here);
+        assert_eq!(path[0], north(0.0));
+        // 40 m past the start node on the centreline: the join is 5 m ahead.
+        let mut path = vec![north(-40.0), north(100.0), north(200.0)];
+        join_first_edge_ahead(&mut path, &mut seg, here);
+        assert!((path[0].0 - north(5.0).0).abs() * 111_320.0 < 0.01, "{:?}", path[0]);
+        // Past the first edge entirely: its far node is the join.
+        let mut path = vec![north(-100.0), north(-2.0), north(200.0)];
+        let mut seg = vec![(String::new(), false); 2];
+        join_first_edge_ahead(&mut path, &mut seg, here);
+        assert_eq!(path, vec![north(-2.0), north(200.0)]);
+        assert_eq!(seg.len(), 1);
+        // A runway leg is the runway's.
+        let mut path = vec![north(-40.0), north(100.0)];
+        let mut seg = vec![(String::new(), true)];
+        join_first_edge_ahead(&mut path, &mut seg, here);
+        assert_eq!(path[0], north(-40.0));
     }
 
     /// A strip running north with a taxiway parallel to it, joined abeam each

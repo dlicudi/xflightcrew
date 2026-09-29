@@ -3690,6 +3690,8 @@ mod tests {
             ("autotakeoff", "ROLL_ALIGN_KTS", "walking-pace pivot at a crooked roll start; only brake_steer airframes"),
             ("autotakeoff", "ROLL_ALIGN_HOLD_KTS", "walking pace under which a crooked roll start waits for the nose; only brake_steer airframes"),
             ("autotaxi", "ALIGN_SETTLED_KTS", "a stopped aircraft, for the line-up's aligned verdict; any airframe"),
+            ("autotaxi", "ALIGN_TRIM_MIN_KTS", "rolling at all, for the line-up alignment's standing-yaw trim; any airframe"),
+            ("autotaxi", "ALIGN_TRIM_PER_DEG_S", "the alignment trim's integration rate, brake per degree second; tuned on the yaw plant, any castoring nose"),
             ("autotakeoff", "CLIMB_ACCEL_MAX_KTS_S", "the climb hold's asked-for trend: a speed ERROR closed, and only on airframes declaring climb_pitch_max_deg"),
             ("autotakeoff", "CLIMB_PITCH_DOWN_DEG_S", "the climb hold's target walk down, a law rate below the rotation's own 2.5 deg/s; declared airframes only"),
             ("autotakeoff", "CLIMB_HOLD_FLOOR_FPM", "the positive floor climb_vs_fpm already keeps (airborne, it climbs); only airframes declaring a climb-out"),

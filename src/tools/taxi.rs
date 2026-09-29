@@ -395,6 +395,10 @@ impl Tool for LineUp {
             force_backtrack,
             heading,
             (!lead_on.is_empty()).then_some(&lead_on[..]),
+            autotaxi::TurnRound {
+                pivots: self.pace.brake_steer || crate::aircraft::nose_castors(),
+                width_m: None,
+            },
         ) else {
             return Ok(match cleared {
                 Some(c) => format!(
@@ -438,6 +442,8 @@ impl Tool for LineUp {
         // A plain line-up ends pointing down the runway (a backtrack's leg
         // two carries its own).
         route.align_course_deg = (!backtracking).then_some(rwy.course_deg);
+        // ...rolling only the runway the takeoff fit can spare.
+        route.align_runway = (!backtracking).then(|| (rwy.clone(), needed_m));
         route.done_line = Some(if backtracking {
             "At the numbers. Coming around.".to_string()
         } else {
@@ -469,6 +475,7 @@ impl Tool for LineUp {
                 route,
                 rwy.clone(),
                 drive_kts,
+                needed_m,
             );
             return Ok(format!(
                 "Backtracking runway {spoken} for the full length.{}",

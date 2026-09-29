@@ -11440,3 +11440,64 @@ within about 100 ft of `gate_agl`) with `need_m` under `slow_m`; Slow `tick`s wh
 near the final's start (`to_pad_m` about 1,400 for a 500 ft gate) under 40 kt; no `go_around`
 (if one, its `why`, `need_kts_s`, a fixed `bug` and a `handover_hover` `from` Around); no TOD or
 profile advisories in `said`. Offline only.
+
+## 2026-09-30: the Evolution joins the ramp taxiway ahead; the turn-round and the alignment spend less runway (#45)
+
+iMac 2026-09-29 and 30, Lancair Evolution from the LILB ramp to runway 03 (601 m, 15 m wide,
+untowered), three sorties (1790712974, 1790720549, 1790721973):
+- **Taxi FAIL 14.2, 16.1, 16.3 m off the line, every time.** The planner snapped the start to the
+  nearest node (5), 16.7 m from the stand on a bearing of 98 with the aircraft facing 28.9, and the
+  edge beyond it runs 335: the route ran out to the node and hairpinned 124 degrees. The drive
+  turned 70 degrees onto the first leg, the projection jumped to the second leg at 8.6 kt with the
+  nose 120 degrees off it, and full steer carved it 16 m wide before the capture.
+- **Line-up out of runway.** The backtrack's leg one stopped 24.9 m down and 14.9 m right of the
+  centreline (the teardrop pocket is 12 m off: in the grass of a 15 m strip), heading 172 for a 024
+  runway; the turn-round took the short way, LEFT, outward to 21.6 m, and crossed back 58 degrees
+  off; leg two's entry was 55 m down and its drive stopped 84 m down (516.1 m left against a 500 m
+  fit). The alignment then took 13 degrees off in 2 m and crept 38 m more with the nose held 2.0 to
+  2.2 off (a standing yaw against 0.02 of brake from the soft law), the idle PT6 running the 2 kt
+  creep up to 5.7 kt: 474.8 m left, `line_up_no_fit` TooLittleLeft, give-up `line_up_failed`.
+  Before the alignment existed (1790712974) the roll engaged with 516.7 m.
+
+The fix (the 500 m floor and the fit rule unchanged):
+- **A route joins its first taxiway ahead of the aircraft, never at a node behind it**
+  (`nav::join_first_edge_ahead`, in `plan_inner` after the paint): the aircraft's projection onto
+  the first edge is past its start node by more than 3 m, so the join sits past the projection by
+  the offset itself (5 to 30 m, a 45 degree join); an edge wholly behind is dropped; a runway leg is
+  never moved; beyond 60 m off the edge the node stands. At LILB the first leg is now 9 degrees off
+  the nose, the turn onto taxiway A 45 degrees, no turn on the route past 90.
+- **The alignment rolls only the runway the fit can spare** (`LineUpAlign::with_spare`,
+  `align_spare_m`, `align_roll_limit_m`; `Route.align_runway` from the line-up tool's need, floored
+  at `autotakeoff::MIN_REMAINING_M`): the runway ahead where it starts less the need, 2 m kept back,
+  the creep's own stop counted before it is asked (`rolled + stop >= limit` ends it, Done inside 3
+  degrees as before). Under 12 m to roll the creep is 1 kt (the nose pivots nearly in place). A
+  creep over its speed by 1 kt is stopped until back under it. A slow trim (0.006 brake per degree
+  second, to 0.12) takes out the standing yaw while creeping and not already coming round. Blackbox
+  `line_up_align_budget` (`spare_m`, `roll_limit_m`, `creep_kts`), `line_up_align` ticks carry
+  `trim`, `line_up_aligned` carries `rolled_m`.
+- **A pivoting airframe turns round nearer the numbers, on the pavement, toward the centreline**
+  (`TurnRound`, `turn_round_hint`, `Route.turn_hint`; pivots = `brake_steer` or a castoring nose):
+  the pocket 25 m down (turn from 50) and half the width less 2 m off (4 to 12; 6 with no width),
+  and leg two's entry at twice the offset (10 to 30 m) then 12 m of centreline, the alignment
+  finishing the heading. Every backtrack's turn-round now turns TOWARD the centreline from the first
+  tick (the drive's `turn_dir` seeded from the hint), the way the teardrop was laid out; the
+  teardrop's geometry is unchanged for airframes that do not pivot.
+
+On the recorded start and a yaw plant with the recorded standing yaw, the old alignment creeps its
+40 m 2.2 off at 5.8 kt (as flown); the new one aligns inside 1.3 degrees in 6.6 to 12.9 m, inside
+the 16.1 m spare, on the Evolution's idle-push governor and the SR22's. Leg two from the recorded
+pocket stops 67 m down (85 before); from the new pocket under 50.
+
+Tests: `nav::a_route_joins_its_first_taxiway_ahead_never_back_at_the_node` (LILB's own network and
+stand), `join_first_edge_ahead_leaves_a_start_abeam_its_node_alone`, the real-install
+`real_install_self_taxi_lilb` (no turn past 90), `a_line_up_spends_only_the_runway_the_fit_can_spare`,
+`a_marginal_fit_pivots_nearly_in_place`, `a_pivoting_turn_round_turns_across_the_strip_near_the_numbers`.
+
+Next Evolution at LILB: taxi `stage_result` `max_lat_m` under 3 with no `projection_jump`, the
+first `drive` tick's `err` near 9 (was 70); `backtrack_turn` `pivots` true, `width_m` 15,
+`from_along_m` about 20 to 30 and `from_ct_m` about 5 to 7, `turn_hint` +1 with the heading
+passing through west (not east) in `state`; the line-up drive's end under 50 m down;
+`line_up_align_budget` `spare_m` positive, `line_up_aligned` `ok` true with `rolled_m` under
+`roll_limit_m`, no `line_up_align` tick with `gs` much over 3; `runway_check` passing, no
+`line_up_no_fit`. The SR22's LEMG taxi (4.7 to 5.0 m, #165) is a long corner, not this start.
+Offline only.

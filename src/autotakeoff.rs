@@ -106,7 +106,7 @@ const LATERAL_MAX_M: f64 = 40.0;
 const BEFORE_THRESHOLD_MAX_M: f64 = 100.0;
 /// Runway remaining below this at arm time is not a takeoff, whatever the
 /// POH says — floor for airframes with no published takeoff distance.
-const MIN_REMAINING_M: f64 = 500.0;
+pub const MIN_REMAINING_M: f64 = 500.0;
 /// Reject once the remaining runway is inside this with rotation still short:
 /// enough pavement to stop a light single from below Vr.
 const REJECT_REMAINING_M: f64 = 250.0;

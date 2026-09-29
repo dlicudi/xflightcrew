@@ -552,6 +552,15 @@ pub struct Route {
     /// does not end until the nose points down it ([`LineUpAlign`]). `None`
     /// for every other drive.
     pub align_course_deg: Option<f64>,
+    /// ...and the runway it lines up on with the takeoff fit's need, m: the
+    /// alignment rolls only the runway the fit can spare
+    /// ([`LineUpAlign::with_spare`]). `None` keeps [`ALIGN_MAX_ROLL_M`].
+    pub align_runway: Option<(crate::autoland::Runway, f64)>,
+    /// The way a reversal at the route's start is turned (+1 right, -1
+    /// left), when the geometry knows it: a backtrack's turn-round turns
+    /// TOWARD the centreline ([`turn_round_hint`]). `None` leaves the
+    /// first sign of the error to decide ([`committed_err`]).
+    pub turn_hint: Option<f64>,
 }
 
 /// How far before a runway span the landing light comes on.
@@ -635,6 +644,8 @@ impl Route {
             pace: Pace::default(),
             runway_spans,
             align_course_deg: None,
+            align_runway: None,
+            turn_hint: None,
         })
     }
 
@@ -1151,10 +1162,52 @@ const ALIGN_SETTLED_DPS: f64 = 0.7;
 /// The creep the governor is given while the nose still has to come round:
 /// a castoring nose pivots on a braked wheel only with the aircraft moving.
 pub const ALIGN_CREEP_KTS: f64 = 2.0;
+/// ...and with little runway to spare ([`ALIGN_TIGHT_ROLL_M`]), a slower
+/// one: the same brake turns the nose through more degrees per metre.
+pub const ALIGN_TIGHT_CREEP_KTS: f64 = 1.0;
+/// A creep this far over its speed is stopped until it is back under it:
+/// the Evolution's idle thrust ran the 2 kt creep up to 5.7 kt with the
+/// governor asking 2 (LILB 03, 1790721973, 2026-09-30).
+pub const ALIGN_CREEP_OVER_KTS: f64 = 1.0;
 /// The alignment's bounds: time from the arrival, and ground rolled down
-/// the runway doing it.
+/// the runway doing it (the runway it can spare lowers the second).
 pub const ALIGN_MAX_S: f64 = 40.0;
 pub const ALIGN_MAX_ROLL_M: f64 = 40.0;
+/// Runway kept back from the spare, m: the fit is judged where the aircraft
+/// stops, a creep's stop is anticipated, this is the rest.
+pub const ALIGN_SPARE_MARGIN_M: f64 = 2.0;
+/// Under this much runway to roll, the tight creep.
+pub const ALIGN_TIGHT_ROLL_M: f64 = 12.0;
+/// The stop a creep needs, for the runway bound: the governor's brake takes
+/// about this deceleration after this latency.
+const ALIGN_STOP_DECEL_MS2: f64 = 0.5;
+const ALIGN_STOP_LATENCY_S: f64 = 0.5;
+/// The trim that holds a standing yaw: brake per degree of error per
+/// second of creep, bounded, integrated only while the nose is not already
+/// coming round by [`ALIGN_TRIM_TURNING_DPS`].
+const ALIGN_TRIM_PER_DEG_S: f64 = 0.006;
+const ALIGN_TRIM_MAX: f64 = 0.12;
+const ALIGN_TRIM_TURNING_DPS: f64 = 0.5;
+const ALIGN_TRIM_MIN_KTS: f64 = 0.7;
+
+/// How far a line-up's alignment may roll, from the runway it can spare
+/// (the runway ahead less what the takeoff fit needs), never more than
+/// [`ALIGN_MAX_ROLL_M`]; `None` (no runway known) is that bound. Pure.
+pub fn align_roll_limit_m(spare_m: Option<f64>) -> f64 {
+    match spare_m {
+        Some(s) => (s - ALIGN_SPARE_MARGIN_M).clamp(0.0, ALIGN_MAX_ROLL_M),
+        None => ALIGN_MAX_ROLL_M,
+    }
+}
+
+/// The runway an alignment at `(lat, lon)` can spare: what is ahead on
+/// `rwy` less what the takeoff fit needs (`need_m`, floored at the fit's
+/// own [`crate::autotakeoff::MIN_REMAINING_M`], as `runway_fit` judges it).
+/// Negative when the fit is already lost. Pure.
+pub fn align_spare_m(rwy: &crate::autoland::Runway, need_m: f64, lat: f64, lon: f64) -> f64 {
+    let past_m = (-crate::autoland::along_track_nm(lat, lon, rwy) * M_PER_NM).max(0.0);
+    rwy.length_m - past_m - need_m.max(crate::autotakeoff::MIN_REMAINING_M)
+}
 
 /// What the line-up's alignment wants this tick ([`LineUpAlign::step`]).
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -1178,7 +1231,17 @@ pub enum AlignStep {
 /// roll 0.3 to 0.5 off. So after the arrival the nose is brought round on
 /// the brakes ([`align_pivot_brakes`]) at a creep, stopped, and judged
 /// stopped; again if the stop swung it; bounded by [`ALIGN_MAX_S`] and
-/// [`ALIGN_MAX_ROLL_M`]. Pure: the drive feeds it.
+/// the runway it can roll ([`align_roll_limit_m`]). Pure: the drive feeds it.
+///
+/// It spends as little runway as it can. LILB 03 Evolution (1790721973,
+/// 2026-09-30): the pivot took 13 degrees off in the first 2 m, then crept
+/// 38 m more with the nose held 2.0 to 2.2 off by a standing yaw the 0.02
+/// of brake its soft law gave could not beat, the idle thrust running the
+/// creep from 2 to 5.7 kt, and stopped with 474.8 m ahead of a 500 m fit
+/// (516.1 at the turn-round's stop). So: a slow trim holds the standing
+/// yaw, a creep over its speed is stopped, and the roll is bounded by the
+/// runway the fit can spare, the stop anticipated; with little to spare the
+/// creep is halved and the nose pivots nearly in place.
 #[derive(Debug, Clone)]
 pub struct LineUpAlign {
     pub course_deg: f64,
@@ -1187,11 +1250,42 @@ pub struct LineUpAlign {
     /// How many times the governor was asked to creep (a stop that swung
     /// the nose is a second).
     pub creeps: u32,
+    /// Ground it may roll, m ([`align_roll_limit_m`]).
+    pub roll_limit_m: f64,
+    /// The creep it asks the governor for.
+    pub creep_kts: f64,
+    /// The standing-yaw trim, signed brake (+ right).
+    pub trim: f64,
+    over: bool,
+    last_t: Option<f64>,
 }
 
 impl LineUpAlign {
+    #[cfg(test)]
     pub fn new(course_deg: f64) -> Self {
-        LineUpAlign { course_deg, t0: None, creeping: false, creeps: 0 }
+        Self::with_spare(course_deg, None)
+    }
+
+    /// An alignment that may roll only the runway `spare_m` the takeoff fit
+    /// does not need.
+    pub fn with_spare(course_deg: f64, spare_m: Option<f64>) -> Self {
+        let roll_limit_m = align_roll_limit_m(spare_m);
+        let creep_kts = if roll_limit_m < ALIGN_TIGHT_ROLL_M {
+            ALIGN_TIGHT_CREEP_KTS
+        } else {
+            ALIGN_CREEP_KTS
+        };
+        LineUpAlign {
+            course_deg,
+            t0: None,
+            creeping: false,
+            creeps: 0,
+            roll_limit_m,
+            creep_kts,
+            trim: 0.0,
+            over: false,
+            last_t: None,
+        }
     }
 
     /// Signed error, positive = the runway is right of the nose.
@@ -1208,6 +1302,8 @@ impl LineUpAlign {
         rolled_m: f64,
     ) -> AlignStep {
         let t0 = *self.t0.get_or_insert(t_s);
+        let dt = self.last_t.map_or(0.0, |l| (t_s - l).clamp(0.0, 1.0));
+        self.last_t = Some(t_s);
         let err = self.err_deg(psi_true);
         let led = err - yaw_dps * ALIGN_LEAD_S;
         let settled = gs_kts < ALIGN_SETTLED_KTS && yaw_dps.abs() < ALIGN_SETTLED_DPS;
@@ -1215,9 +1311,12 @@ impl LineUpAlign {
             self.creeping = false;
             return AlignStep::Done { err_deg: err };
         }
+        // The stop this speed still needs, counted against the runway.
+        let v = gs_kts / MS_TO_KTS;
+        let stop_m = v * ALIGN_STOP_LATENCY_S + v * v / (2.0 * ALIGN_STOP_DECEL_MS2);
         let out_of_bounds = if t_s - t0 > ALIGN_MAX_S {
             Some("time")
-        } else if rolled_m > ALIGN_MAX_ROLL_M {
+        } else if rolled_m + stop_m >= self.roll_limit_m {
             Some("rolled")
         } else {
             None
@@ -1227,8 +1326,8 @@ impl LineUpAlign {
             // (`autotakeoff::RollAlign`) and the alignment stage passes: done,
             // not a give-up (LILB 03 Evolution 1790720549, 2026-09-30: the
             // turn-round settled 2.2 off in 24.6 s and the mission gave up).
+            self.creeping = false;
             if err.abs() <= ALIGN_ACCEPT_DEG {
-                self.creeping = false;
                 return AlignStep::Done { err_deg: err };
             }
             return AlignStep::GiveUp { err_deg: err, why };
@@ -1237,12 +1336,35 @@ impl LineUpAlign {
         // close and not carried past (half the band, with hysteresis).
         let off = err.abs() > ALIGNED_DEG || led.abs() > ALIGNED_DEG;
         let close = err.abs() <= ALIGNED_DEG * 0.5 && led.abs() <= ALIGNED_DEG;
-        let creep = if self.creeping { !close } else { off };
-        if creep && !self.creeping {
+        let want = if self.creeping { !close } else { off };
+        // ...never faster than the creep: over it, stopped until back under.
+        if gs_kts > self.creep_kts + ALIGN_CREEP_OVER_KTS {
+            self.over = true;
+        } else if gs_kts <= self.creep_kts {
+            self.over = false;
+        }
+        if want && !self.creeping {
             self.creeps += 1;
         }
-        self.creeping = creep;
+        self.creeping = want;
+        let creep = want && !self.over;
+        // The standing yaw (the propeller, a slope, a crosswind) is what a
+        // soft law settles against: trimmed out while rolling and not
+        // already coming round.
+        if want
+            && gs_kts > ALIGN_TRIM_MIN_KTS
+            && err.abs() > ALIGN_QUIET_DEG
+            && yaw_dps * err.signum() < ALIGN_TRIM_TURNING_DPS
+        {
+            self.trim = (self.trim + ALIGN_TRIM_PER_DEG_S * err * dt)
+                .clamp(-ALIGN_TRIM_MAX, ALIGN_TRIM_MAX);
+        }
         let (bl, br) = align_pivot_brakes(err, yaw_dps);
+        let mut b = (br - bl + self.trim).clamp(-PIVOT_BRAKE_MAX, PIVOT_BRAKE_MAX);
+        if b * yaw_dps > 0.0 && yaw_dps.abs() > ALIGN_RATE_MAX_DPS {
+            b = 0.0;
+        }
+        let (bl, br) = if b >= 0.0 { (0.0, b) } else { (-b, 0.0) };
         AlignStep::Align { bl, br, creep }
     }
 }
@@ -1398,10 +1520,19 @@ pub fn line_up_path(
 /// runway after its turn; the takeoff then found 448 m left against 599
 /// needed (2026-09-25). At most [`BACKTRACK_SETTLE_MAX_M`] plus
 /// [`BACKTRACK_ALIGN_M`].
+///
+/// An airframe that PIVOTS (`turn.pivots`: a castoring nose or brake
+/// steering, whose line-up then ends in [`LineUpAlign`]) settles in less:
+/// the entry at twice the offset, then [`PIVOT_SETTLE_M`], the alignment
+/// finishing the heading. LILB 03 Evolution (1790721973, 2026-09-30): from
+/// the pocket 24.9 m past the numbers and 14.9 m off, the entry was 55 m
+/// down and the drive stopped 84 m down, 516.1 m left against 500 (the
+/// alignment then crept 40 m more and lost the fit).
 pub fn backtrack_leg_two_path(
     rwy: &crate::autoland::Runway,
     lat: f64,
     lon: f64,
+    turn: TurnRound,
 ) -> Option<Vec<(f64, f64)>> {
     use crate::autoland::{along_track_nm, cross_track_nm, project_latlon};
     let lateral = (cross_track_nm(lat, lon, rwy) * M_PER_NM).abs();
@@ -1409,8 +1540,13 @@ pub fn backtrack_leg_two_path(
         return None;
     }
     let a0 = (-along_track_nm(lat, lon, rwy) * M_PER_NM).max(0.0);
-    let entry_m = a0 + (lateral * 4.0).clamp(BACKTRACK_SETTLE_MIN_M, BACKTRACK_SETTLE_MAX_M);
-    let stop_m = entry_m + BACKTRACK_ALIGN_M;
+    let (entry_m, stop_m) = if turn.pivots {
+        let entry = a0 + (lateral * 2.0).clamp(PIVOT_ENTRY_MIN_M, BACKTRACK_SETTLE_MAX_M);
+        (entry, entry + PIVOT_SETTLE_M)
+    } else {
+        let entry = a0 + (lateral * 4.0).clamp(BACKTRACK_SETTLE_MIN_M, BACKTRACK_SETTLE_MAX_M);
+        (entry, entry + BACKTRACK_ALIGN_M)
+    };
     if rwy.length_m - stop_m < LINE_UP_MIN_REMAINING_M.min(rwy.length_m * 0.5) {
         return None;
     }
@@ -1421,6 +1557,71 @@ pub fn backtrack_leg_two_path(
 const BACKTRACK_SETTLE_MIN_M: f64 = 10.0;
 const BACKTRACK_SETTLE_MAX_M: f64 = 30.0;
 const BACKTRACK_ALIGN_M: f64 = 30.0;
+/// A pivoting airframe's leg two: the entry at least this far down from
+/// where it turned, and this much centreline after it (the route's end:
+/// the drive stops [`STOP_SHORT_M`] before it).
+const PIVOT_ENTRY_MIN_M: f64 = 10.0;
+const PIVOT_SETTLE_M: f64 = 12.0;
+
+/// The way a backtrack's turn-round turns: TOWARD the centreline, across
+/// the strip, the way the teardrop pocket was laid out for (+1 right, -1
+/// left); `None` on the centreline itself. The pocket leg arrives pointing
+/// a little OUTWARD, so the shorter way round is outward, and the drive
+/// took it: LILB 03 Evolution (1790721973, 2026-09-30) stood 14.9 m right
+/// of the centreline heading 172 for a 024 runway, turned left through
+/// 113 and 44 with the aircraft carried out to 21.6 m, in the grass of a
+/// 15 m strip, and crossed back 58 degrees off. Pure.
+pub fn turn_round_hint(rwy: &crate::autoland::Runway, lat: f64, lon: f64) -> Option<f64> {
+    let ct_m = crate::autoland::cross_track_nm(lat, lon, rwy) * M_PER_NM;
+    (ct_m.abs() >= TURN_HINT_MIN_OFFSET_M).then(|| ct_m.signum())
+}
+const TURN_HINT_MIN_OFFSET_M: f64 = 1.0;
+
+/// How a backtrack turns round at the numbers ([`backtrack_pocket_path`],
+/// [`backtrack_leg_two_path`]).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TurnRound {
+    /// The airframe pivots on a braked wheel: a castoring nose or brake
+    /// steering (the line-up then ends in [`LineUpAlign`]).
+    pub pivots: bool,
+    /// The strip's pavement width, m, when apt.dat gave one.
+    pub width_m: Option<f64>,
+}
+
+impl TurnRound {
+    /// The teardrop every airframe flew before: room for a steered nose.
+    pub const TEARDROP: TurnRound = TurnRound { pivots: false, width_m: None };
+
+    /// Where the turn begins down the strip, where the pocket sits down it
+    /// and how far off the centreline, m. A pivoting airframe turns nearer
+    /// the numbers and on the PAVEMENT: the teardrop's 12 m off put the
+    /// Evolution's pocket in the grass beside LILB's 15 m strip, 30 m down
+    /// (1790721973, 2026-09-30).
+    pub fn pocket(&self) -> (f64, f64, f64) {
+        if !self.pivots {
+            return (
+                BACKTRACK_TURN_START_M,
+                BACKTRACK_TURN_START_M / 2.0,
+                BACKTRACK_POCKET_OFFSET_M,
+            );
+        }
+        let offset = self.width_m.map_or(PIVOT_POCKET_OFFSET_M, |w| {
+            (w / 2.0 - PIVOT_POCKET_EDGE_M)
+                .clamp(PIVOT_POCKET_MIN_OFFSET_M, BACKTRACK_POCKET_OFFSET_M)
+        });
+        (PIVOT_TURN_START_M, PIVOT_POCKET_ALONG_M, offset)
+    }
+}
+/// A pivoting airframe's pocket: the turn begins this far down, the pocket
+/// this far down (the drive has been seen to run 5 m past it at the
+/// backtrack's pace), this far off the centreline with no width known, and
+/// this far inside the pavement's edge with one, never nearer the
+/// centreline than the minimum.
+const PIVOT_TURN_START_M: f64 = 50.0;
+const PIVOT_POCKET_ALONG_M: f64 = 25.0;
+const PIVOT_POCKET_OFFSET_M: f64 = 6.0;
+const PIVOT_POCKET_EDGE_M: f64 = 2.0;
+const PIVOT_POCKET_MIN_OFFSET_M: f64 = 4.0;
 
 /// Where a plain line-up from this position would enter and stop (meters
 /// past the threshold), or `None` when the position isn't a hold-short
@@ -1635,7 +1836,9 @@ pub fn backtrack_pocket_path(
     rwy: &crate::autoland::Runway,
     lat: f64,
     lon: f64,
+    turn: TurnRound,
 ) -> Option<Vec<(f64, f64)>> {
+    let (turn_start_m, pocket_m, pocket_off_m) = turn.pocket();
     use crate::autoland::{along_track_nm, cross_track_nm, project_latlon};
     let lateral = (cross_track_nm(lat, lon, rwy) * M_PER_NM).abs();
     if lateral > LINE_UP_MAX_LATERAL_M {
@@ -1648,9 +1851,9 @@ pub fn backtrack_pocket_path(
     let c = |d_m: f64| project_latlon(rwy.thr_lat, rwy.thr_lon, rwy.course_deg, d_m / M_PER_NM);
     // Enter the runway swinging toward the threshold (the mirror of the
     // line-up's entry lead), never inside the turn pocket itself.
-    let entry_m = (past_m - lateral.clamp(30.0, 60.0)).max(BACKTRACK_TURN_START_M + 30.0);
+    let entry_m = (past_m - lateral.clamp(30.0, 60.0)).max(turn_start_m + 30.0);
     let entry = c(entry_m);
-    let turn_start = c(BACKTRACK_TURN_START_M);
+    let turn_start = c(turn_start_m);
     // Swing the teardrop toward the side the aircraft CAME IN on — the taxiway/
     // apron side, which is the way the painted turn-pad leads. A fixed hand
     // turned the wrong way against the yellow line at LXGB 09 (2026-07-26).
@@ -1662,13 +1865,8 @@ pub fn backtrack_pocket_path(
     } else {
         rwy.course_deg - 90.0
     };
-    let mid = c(BACKTRACK_TURN_START_M / 2.0);
-    let pocket = project_latlon(
-        mid.0,
-        mid.1,
-        pocket_bearing,
-        BACKTRACK_POCKET_OFFSET_M / M_PER_NM,
-    );
+    let mid = c(pocket_m);
+    let pocket = project_latlon(mid.0, mid.1, pocket_bearing, pocket_off_m / M_PER_NM);
     Some(vec![(lat, lon), entry, turn_start, pocket])
 }
 
@@ -1689,8 +1887,10 @@ pub fn backtrack_pocket_path_from_lead_on(
     lat: f64,
     lon: f64,
     lead_on: &[(f64, f64)],
+    turn: TurnRound,
 ) -> Option<Vec<(f64, f64)>> {
     use crate::autoland::{along_track_nm, cross_track_nm, project_latlon};
+    let (turn_start_m, pocket_m, pocket_off_m) = turn.pocket();
     let (&first, &last) = (lead_on.first()?, lead_on.last()?);
     // OURS, and ending on THIS centreline — the same two tests the plain
     // lead-on line-up applies, for the same reason: a foreign stub is
@@ -1710,24 +1910,19 @@ pub fn backtrack_pocket_path_from_lead_on(
         return None;
     }
     let junction_a = -along_track_nm(last.0, last.1, rwy) * M_PER_NM;
-    if junction_a < BACKTRACK_TURN_START_M + 30.0 {
+    if junction_a < turn_start_m + 30.0 {
         return None;
     }
     let c = |d_m: f64| project_latlon(rwy.thr_lat, rwy.thr_lon, rwy.course_deg, d_m / M_PER_NM);
-    let turn_start = c(BACKTRACK_TURN_START_M);
+    let turn_start = c(turn_start_m);
     let entry_ct_m = cross_track_nm(lat, lon, rwy) * M_PER_NM;
     let pocket_bearing = if entry_ct_m >= 0.0 {
         rwy.course_deg + 90.0
     } else {
         rwy.course_deg - 90.0
     };
-    let mid = c(BACKTRACK_TURN_START_M / 2.0);
-    let pocket = project_latlon(
-        mid.0,
-        mid.1,
-        pocket_bearing,
-        BACKTRACK_POCKET_OFFSET_M / M_PER_NM,
-    );
+    let mid = c(pocket_m);
+    let pocket = project_latlon(mid.0, mid.1, pocket_bearing, pocket_off_m / M_PER_NM);
     // Aircraft, up the drawn stub, a fillet around the junction (the network
     // draws a right angle, the paint curves), then down the strip to the
     // pocket.
@@ -1763,9 +1958,14 @@ pub fn pick_line_up_plan(
     force_backtrack: bool,
     heading_deg: Option<f64>,
     lead_on: Option<&[(f64, f64)]>,
+    turn: TurnRound,
 ) -> Option<(crate::autoland::Runway, LineUpPlan)> {
     let mut best: Option<(crate::autoland::Runway, LineUpPlan, f64)> = None;
     for r in cands {
+        let turn = TurnRound {
+            width_m: turn.width_m.or_else(|| crate::autoland::runway_width_m(r)),
+            ..turn
+        };
         if let Some(c) = cleared {
             if !crate::autotakeoff::runway_matches(&r.id, c) {
                 continue;
@@ -1807,8 +2007,8 @@ pub fn pick_line_up_plan(
             // ONTO the runway, and inventing that entry is what put an
             // aircraft in the grass (see `backtrack_pocket_path_from_lead_on`).
             let via_lead_bt = lead_on
-                .and_then(|lo| backtrack_pocket_path_from_lead_on(r, lat, lon, lo))
-                .or_else(|| backtrack_pocket_path(r, lat, lon));
+                .and_then(|lo| backtrack_pocket_path_from_lead_on(r, lat, lon, lo, turn))
+                .or_else(|| backtrack_pocket_path(r, lat, lon, turn));
             match via_lead_bt {
                 Some(p) => Some(LineUpPlan::Backtrack(p)),
                 None => plain.map(LineUpPlan::Plain),
@@ -2088,10 +2288,15 @@ pub fn start_backtrack(
     route: Route,
     rwy: crate::autoland::Runway,
     base_kts: f64,
+    need_m: f64,
 ) {
     // Leg two is built here, far from the tool that knows the airframe — carry
     // the pace across rather than letting the fresh route fall back to GA.
     let pace = route.pace;
+    let turn = TurnRound {
+        pivots: pace.brake_steer || crate::aircraft::nose_castors(),
+        width_m: crate::autoland::runway_width_m(&rwy),
+    };
     BACKTRACKING.store(true, Ordering::Relaxed);
     start(base_url.clone(), voice.clone(), route, base_kts);
     std::thread::spawn(move || {
@@ -2126,7 +2331,7 @@ pub fn start_backtrack(
             // Leg two of a backtrack: the aircraft has turned around and is
             // already on the strip pointing down it; settle and straighten
             // in the least runway that does it.
-            let Some(path) = backtrack_leg_two_path(&rwy, lat, lon) else {
+            let Some(path) = backtrack_leg_two_path(&rwy, lat, lon, turn) else {
                 BACKTRACKING.store(false, Ordering::Relaxed);
                 alert(
                     &voice,
@@ -2154,10 +2359,16 @@ pub fn start_backtrack(
             let spoken = crate::atis::spoken_runway(&rwy.id);
             route2.pace = pace;
             route2.align_course_deg = Some(rwy.course_deg);
+            route2.align_runway = Some((rwy.clone(), need_m));
+            route2.turn_hint = turn_round_hint(&rwy, lat, lon);
             route2.done_line = Some(format!("Lined up runway {spoken}. Holding position."));
             crate::blackbox::record(
                 "autotaxi",
-                serde_json::json!({"event": "backtrack_turn", "rwy": rwy.id}),
+                serde_json::json!({"event": "backtrack_turn", "rwy": rwy.id,
+                                   "pivots": turn.pivots, "width_m": turn.width_m,
+                                   "turn_hint": route2.turn_hint,
+                                   "from_along_m": -crate::autoland::along_track_nm(lat, lon, &rwy) * M_PER_NM,
+                                   "from_ct_m": crate::autoland::cross_track_nm(lat, lon, &rwy) * M_PER_NM}),
             );
             crate::tools::speedhold::set_taxi_target(base_kts);
             start(base_url, voice, route2, base_kts);
@@ -2194,9 +2405,11 @@ async fn align_on_the_runway(
     xp: &XPlaneClient,
     voice: &Option<Voice>,
     course: f64,
+    fit: Option<&(crate::autoland::Runway, f64)>,
     gen: u64,
 ) -> AlignEnd {
-    let mut judge = LineUpAlign::new(course);
+    // The runway it may roll is judged from where the drive stopped.
+    let mut judge: Option<LineUpAlign> = None;
     let t0 = std::time::Instant::now();
     let mut frozen_s = 0.0_f64;
     let mut start: Option<(f64, f64)> = None;
@@ -2244,6 +2457,16 @@ async fn align_on_the_runway(
         progress_hold();
         let gs_kts = gs_ms * MS_TO_KTS;
         let from = *start.get_or_insert((lat, lon));
+        let judge = judge.get_or_insert_with(|| {
+            let spare = fit.map(|(rwy, need)| align_spare_m(rwy, *need, lat, lon));
+            let j = LineUpAlign::with_spare(course, spare);
+            crate::blackbox::record(
+                "autotaxi",
+                serde_json::json!({"event": "line_up_align_budget", "spare_m": spare,
+                                   "roll_limit_m": j.roll_limit_m, "creep_kts": j.creep_kts}),
+            );
+            j
+        });
         let rolled_m = crate::autoland::haversine_nm(from.0, from.1, lat, lon) * M_PER_NM;
         let t_s = t0.elapsed().as_secs_f64() - frozen_s;
         last_err = judge.err_deg(psi);
@@ -2256,7 +2479,7 @@ async fn align_on_the_runway(
             "autotaxi",
             serde_json::json!({"event": "line_up_align", "err": last_err, "yaw_dps": yaw,
                                "gs": gs_kts, "bl": bl, "br": br, "creep": creep,
-                               "rolled_m": rolled_m, "t_s": t_s}),
+                               "trim": judge.trim, "rolled_m": rolled_m, "t_s": t_s}),
         );
         match step {
             AlignStep::Done { .. } => break AlignEnd::Aligned,
@@ -2264,7 +2487,7 @@ async fn align_on_the_runway(
             AlignStep::Align { .. } => {}
         }
         if last_creep != Some(creep) {
-            speedhold::set_taxi_target(if creep { ALIGN_CREEP_KTS } else { 0.0 });
+            speedhold::set_taxi_target(if creep { judge.creep_kts } else { 0.0 });
             last_creep = Some(creep);
         }
         // The rudder helps what it can (a steerable castoring nose, the
@@ -2288,10 +2511,21 @@ async fn align_on_the_runway(
         AlignEnd::NotAligned(_) => Some(false),
         AlignEnd::Interrupted => None,
     };
+    let (creeps, rolled) = match (&judge, start) {
+        (Some(j), Some(from)) => {
+            let here = sim::position::read(xp).await;
+            let (la, lo) = sim::position::lat_lon(&here);
+            let rolled = la.ok().zip(lo.ok()).map(|(la, lo)| {
+                crate::autoland::haversine_nm(from.0, from.1, la, lo) * M_PER_NM
+            });
+            (j.creeps, rolled)
+        }
+        _ => (0, None),
+    };
     crate::blackbox::record(
         "autotaxi",
         serde_json::json!({"event": "line_up_aligned", "ok": ok, "err_deg": last_err,
-                           "course": course, "creeps": judge.creeps,
+                           "course": course, "creeps": creeps, "rolled_m": rolled,
                            "secs": t0.elapsed().as_secs_f64() - frozen_s}),
     );
     end
@@ -2369,7 +2603,9 @@ async fn drive(xp: XPlaneClient, voice: Option<Voice>, route: Route, base_kts: f
     // Last steering command, so the slew limiter has something to move FROM.
     let mut prev_steer = 0.0f64;
     let mut straight_trim = StraightTrim::default();
-    let mut turn_dir: Option<f64> = None;
+    // A turn-round the geometry knows the way of is turned that way from
+    // the first tick (`Route.turn_hint`).
+    let mut turn_dir: Option<f64> = route.turn_hint;
     // Whether the brake-steer assist currently has a wheel braked, so every
     // exit path can release it exactly once — and the last commanded pair,
     // so the assist's own slew has something to move from.
@@ -2708,7 +2944,9 @@ async fn drive(xp: XPlaneClient, voice: Option<Voice>, route: Route, base_kts: f
             if let Some(course) = route.align_course_deg.filter(|_| {
                 route.pace.brake_steer || crate::aircraft::nose_castors()
             }) {
-                match align_on_the_runway(&xp, &voice, course, gen).await {
+                match align_on_the_runway(&xp, &voice, course, route.align_runway.as_ref(), gen)
+                    .await
+                {
                     AlignEnd::Aligned => {}
                     AlignEnd::NotAligned(err) => crooked = Some(err),
                     AlignEnd::Interrupted => break,
@@ -4168,6 +4406,7 @@ mod tests {
             false,
             None,
             Some(&plan.lead_on),
+            TurnRound::TEARDROP,
         );
         let (rwy, lp) = picked.expect("a line-up plan");
         println!("picked runway {}", rwy.id);
@@ -4232,6 +4471,7 @@ mod tests {
             false,
             Some(266.9),
             Some(&plan.lead_on),
+            TurnRound::TEARDROP,
         )
         .expect("a line-up plan for runway 07");
         assert_eq!(rwy.id, "07");
@@ -4414,6 +4654,7 @@ mod tests {
             false,
             Some(270.0),
             Some(&lead_on),
+            TurnRound::TEARDROP,
         )
         .expect("picked");
         assert_eq!(r.id, "36");
@@ -4451,7 +4692,7 @@ mod tests {
         // straight in, perpendicular, to the junction.
         let (hlat, hlon) = at(430.0, 45.0);
         let lead_on = vec![at(430.0, 0.0)];
-        let path = backtrack_pocket_path_from_lead_on(&rwy, hlat, hlon, &lead_on)
+        let path = backtrack_pocket_path_from_lead_on(&rwy, hlat, hlon, &lead_on, TurnRound::TEARDROP)
             .expect("backtrack via the stub");
         // Every point of the entry, up to the junction, stays on the stub's
         // own along-track station — it never drifts down the runway before
@@ -4480,7 +4721,7 @@ mod tests {
         );
         // The synthetic fallback is what it replaces: that one leaves the stub
         // immediately, which is the bug.
-        let synth = backtrack_pocket_path(&rwy, hlat, hlon).expect("synthetic exists");
+        let synth = backtrack_pocket_path(&rwy, hlat, hlon, TurnRound::TEARDROP).expect("synthetic exists");
         assert!(
             (a_of(synth[1]) - 430.0).abs() > 25.0,
             "the old diagonal aimed down the runway from the start"
@@ -4540,7 +4781,7 @@ mod tests {
         };
         let on = crate::autoland::project_latlon(0.0, 0.0, 0.0, 38.0 / 1852.0);
         let (lat, lon) = crate::autoland::project_latlon(on.0, on.1, 90.0, 3.0 / 1852.0);
-        let path = backtrack_leg_two_path(&rwy, lat, lon).expect("fits");
+        let path = backtrack_leg_two_path(&rwy, lat, lon, TurnRound::TEARDROP).expect("fits");
         let stop = path.last().unwrap();
         let stop_m = -along_track_nm(stop.0, stop.1, &rwy) * 1852.0;
         assert!(stop_m <= 38.0 + 60.0 + 0.5, "stops by {stop_m:.0} m");
@@ -4569,7 +4810,7 @@ mod tests {
         };
         let mid = crate::autoland::project_latlon(0.0, 0.0, 0.0, 1170.0 / 1852.0);
         let (hlat, hlon) = crate::autoland::project_latlon(mid.0, mid.1, 90.0, 40.0 / 1852.0);
-        let path = backtrack_pocket_path(&rwy, hlat, hlon).expect("feasible");
+        let path = backtrack_pocket_path(&rwy, hlat, hlon, TurnRound::TEARDROP).expect("feasible");
         // The route heads TOWARD the threshold: each point's along-track
         // shrinks, and the pocket ends up beside the numbers, off the
         // centreline (turning room, never a pivot).
@@ -4600,7 +4841,7 @@ mod tests {
         // Near the numbers already: no backtrack, the plain line-up owns it.
         let near = crate::autoland::project_latlon(0.0, 0.0, 0.0, 60.0 / 1852.0);
         let (nlat, nlon) = crate::autoland::project_latlon(near.0, near.1, 90.0, 40.0 / 1852.0);
-        assert!(backtrack_pocket_path(&rwy, nlat, nlon).is_none());
+        assert!(backtrack_pocket_path(&rwy, nlat, nlon, TurnRound::TEARDROP).is_none());
     }
 
     #[test]
@@ -4625,17 +4866,17 @@ mod tests {
         let mid = crate::autoland::project_latlon(0.0, 0.0, 0.0, 1170.0 / 1852.0);
         let (hlat, hlon) = crate::autoland::project_latlon(mid.0, mid.1, 90.0, 40.0 / 1852.0);
         assert!(matches!(
-            pick_line_up_plan(&cands, hlat, hlon, Some("36"), 400.0, false, None, None),
+            pick_line_up_plan(&cands, hlat, hlon, Some("36"), 400.0, false, None, None, TurnRound::TEARDROP),
             Some((_, LineUpPlan::Backtrack(_)))
         ));
         assert!(matches!(
-            pick_line_up_plan(&cands, hlat, hlon, Some("36"), 700.0, false, None, None),
+            pick_line_up_plan(&cands, hlat, hlon, Some("36"), 700.0, false, None, None, TurnRound::TEARDROP),
             Some((_, LineUpPlan::Backtrack(_)))
         ));
         // The pilot asked for the full length in so many words: backtrack
         // even though the plain remaining would do.
         assert!(matches!(
-            pick_line_up_plan(&cands, hlat, hlon, Some("36"), 400.0, true, None, None),
+            pick_line_up_plan(&cands, hlat, hlon, Some("36"), 400.0, true, None, None, TurnRound::TEARDROP),
             Some((_, LineUpPlan::Backtrack(_)))
         ));
         // Abeam the numbers a backtrack is impossible — the ask still gets
@@ -4643,7 +4884,7 @@ mod tests {
         let near = crate::autoland::project_latlon(0.0, 0.0, 0.0, 60.0 / 1852.0);
         let (nlat, nlon) = crate::autoland::project_latlon(near.0, near.1, 90.0, 40.0 / 1852.0);
         assert!(matches!(
-            pick_line_up_plan(&cands, nlat, nlon, Some("36"), 700.0, true, None, None),
+            pick_line_up_plan(&cands, nlat, nlon, Some("36"), 700.0, true, None, None, TurnRound::TEARDROP),
             Some((_, LineUpPlan::Plain(_)))
         ));
     }
@@ -5004,6 +5245,211 @@ mod tests {
                 assert!(rolled < 25.0, "{why}: rolled {rolled:.1} m");
             }
         }
+    }
+
+    /// LILB 03 as apt.dat draws it: 601 m of 15 m pavement.
+    fn lilb_03() -> crate::autoland::Runway {
+        let (a, b) = ((45.7671573, 9.1605458), (45.7720916, 9.1636892));
+        crate::autoland::Runway {
+            icao: "LILB".into(),
+            id: "03".into(),
+            thr_lat: a.0,
+            thr_lon: a.1,
+            course_deg: crate::autoland::bearing_deg(a.0, a.1, b.0, b.1),
+            length_m: crate::autoland::haversine_nm(a.0, a.1, b.0, b.1) * 1852.0,
+            surface: 1,
+            dist_nm: 0.0,
+            elev_ft: 1258.0,
+        }
+    }
+
+    /// The alignment as flown at LILB 03 (1790721973, 2026-09-30), from the
+    /// turn-round's stop: 12.99 off, swinging -5.56 deg/s at 1.44 kt, at
+    /// 45.767857 9.160965 (85 m down a 601 m strip, 16.1 m more than the
+    /// 500 m fit). The Evolution's idle thrust runs a creep up at 0.2 kt/s
+    /// whatever the governor asks, and a standing yaw of 0.025 brake left
+    /// held the nose 2.0 to 2.2 off against the soft law (0.02 of brake
+    /// right, still, for 20 s). On that plant the old law creeps its whole
+    /// 40 m 2.2 off, as flown (40.7 m, 474.8 m left); now the trim takes the
+    /// standing yaw out, the creep is stopped past 3 kt, and the roll stays
+    /// inside the 16.1 m the fit can spare. And on the SR22's governor, which
+    /// holds its creep, the same.
+    #[test]
+    fn a_line_up_spends_only_the_runway_the_fit_can_spare() {
+        use super::yaw_plant::{signed, Plant};
+        use super::{AlignStep, LineUpAlign};
+        let rwy = lilb_03();
+        let (lat, lon) = (45.767_857_048, 9.160_965_298);
+        let spare = super::align_spare_m(&rwy, 500.0, lat, lon);
+        assert!((spare - 16.1).abs() < 0.5, "spare {spare:.1}");
+        // The Evolution's governor: idle thrust accelerates any creep; a
+        // stop brakes at 1.5 kt/s. The SR22's holds the creep.
+        let idle_push = |gs: f64, want: f64, tick: f64| {
+            if want > 0.0 {
+                gs + 0.2 * tick
+            } else {
+                (gs - 1.5 * tick).max(0.0)
+            }
+        };
+        let holds = |gs: f64, want: f64, tick: f64| {
+            if gs < want {
+                (gs + 0.7 * tick).min(want)
+            } else {
+                (gs - 1.5 * tick).max(want)
+            }
+        };
+        let course = rwy.course_deg;
+        let pull = -0.025;
+        // The old law on the same plant: the soft brake alone, a creep the
+        // governor cannot hold, the flat 40 m bound.
+        {
+            let mut p = Plant::new(140.0, 3.0, 12.99, -5.56);
+            let (mut gs, mut rolled, mut creeping) = (1.44_f64, 0.0_f64, false);
+            while rolled < super::ALIGN_MAX_ROLL_M {
+                let led = p.err + p.yaw * super::ALIGN_LEAD_S * -1.0;
+                creeping = if creeping {
+                    !(p.err.abs() <= 1.0 && led.abs() <= 2.0)
+                } else {
+                    p.err.abs() > 2.0 || led.abs() > 2.0
+                };
+                let cmd = signed(super::align_pivot_brakes(p.err, p.yaw)) + pull;
+                gs = idle_push(gs, if creeping { 2.0 } else { 0.0 }, 0.3);
+                p.run(cmd, (gs / 1.5).min(1.0), 0.3);
+                rolled += gs / 1.943_844 * 0.3;
+            }
+            eprintln!("old law: {:.2} off at {gs:.1} kt after {rolled:.1} m", p.err);
+            assert!(p.err.abs() > 1.9 && gs > 5.0, "as flown: {:.1} off at {gs:.1} kt", p.err);
+        }
+        for (name, gov) in [("Evolution", &idle_push as &dyn Fn(f64, f64, f64) -> f64), ("SR22", &holds)] {
+            for (k, d) in [(140.0, 3.0), (70.0, 1.5)] {
+                for tick in [0.3, 0.45] {
+                    let mut judge = LineUpAlign::with_spare(course, Some(spare));
+                    let mut p = Plant::new(k, d, 12.99, -5.56);
+                    let (mut gs, mut rolled, mut t) = (1.44_f64, 0.0_f64, 0.0_f64);
+                    let end = loop {
+                        match judge.step(t, course - p.err, gs, p.yaw, rolled) {
+                            AlignStep::Align { bl, br, creep } => {
+                                gs = gov(gs, if creep { judge.creep_kts } else { 0.0 }, tick);
+                                // The standing yaw only while rolling.
+                                p.run(signed((bl, br)) + pull, (gs / 1.5).min(1.0), tick);
+                                rolled += gs / 1.943_844 * tick;
+                            }
+                            other => break other,
+                        }
+                        t += tick;
+                    };
+                    // The caller stops it: the governor's brake from here.
+                    while gs > 0.0 {
+                        gs = gov(gs, 0.0, tick);
+                        rolled += gs / 1.943_844 * tick;
+                    }
+                    let why = format!("{name} k {k} tick {tick}");
+                    eprintln!("{why}: {end:?} rolled {rolled:.1} m in {t:.1} s, trim {:.3}", judge.trim);
+                    match end {
+                        AlignStep::Done { err_deg } => {
+                            assert!(err_deg.abs() <= super::ALIGN_ACCEPT_DEG, "{why}: {err_deg}")
+                        }
+                        other => panic!("{why}: {other:?}"),
+                    }
+                    assert!(rolled <= spare, "{why}: rolled {rolled:.1} of {spare:.1} m");
+                    assert!(t < super::ALIGN_MAX_S, "{why}: {t:.1} s");
+                }
+            }
+        }
+    }
+
+    /// With the fit already marginal the alignment pivots nearly in place:
+    /// the tight creep, and never past the runway it can spare, whatever it
+    /// then says about the heading.
+    #[test]
+    fn a_marginal_fit_pivots_nearly_in_place() {
+        use super::yaw_plant::{signed, Plant};
+        use super::{AlignStep, LineUpAlign};
+        assert_eq!(super::align_roll_limit_m(None), super::ALIGN_MAX_ROLL_M);
+        assert_eq!(super::align_roll_limit_m(Some(-3.0)), 0.0);
+        assert_eq!(super::align_roll_limit_m(Some(100.0)), super::ALIGN_MAX_ROLL_M);
+        for spare in [3.0, 6.0, 10.0] {
+            let mut judge = LineUpAlign::with_spare(24.0, Some(spare));
+            assert_eq!(judge.creep_kts, super::ALIGN_TIGHT_CREEP_KTS);
+            let mut p = Plant::new(140.0, 3.0, 11.8, -2.3);
+            let (mut gs, mut rolled, mut t, tick) = (0.5_f64, 0.0_f64, 0.0_f64, 0.42);
+            let end = loop {
+                match judge.step(t, 24.0 - p.err, gs, p.yaw, rolled) {
+                    AlignStep::Align { bl, br, creep } => {
+                        gs = if creep { gs + 0.2 * tick } else { (gs - 1.5 * tick).max(0.0) };
+                        p.run(signed((bl, br)) - 0.025, (gs / 1.5).min(1.0), tick);
+                        rolled += gs / 1.943_844 * tick;
+                    }
+                    other => break other,
+                }
+                t += tick;
+            };
+            while gs > 0.0 {
+                gs = (gs - 1.5 * tick).max(0.0);
+                rolled += gs / 1.943_844 * tick;
+            }
+            assert!(rolled <= spare, "spare {spare}: rolled {rolled:.1} m, {end:?}");
+        }
+    }
+
+    /// The turn-round at LILB 03 on a pivoting airframe. The recorded one
+    /// (1790721973, 2026-09-30) stopped its leg one 24.9 m down and 14.9 m
+    /// right of the centreline of a 15 m strip, heading 172, turned LEFT
+    /// (the short way, outward) into the grass, and leg two ended 85 m down.
+    /// Now: the pocket sits on the pavement nearer the numbers, the turn is
+    /// committed toward the centreline from the first tick, and leg two
+    /// settles in less than half the runway, the teardrop kept for every
+    /// airframe that does not pivot.
+    #[test]
+    fn a_pivoting_turn_round_turns_across_the_strip_near_the_numbers() {
+        use crate::autoland::{along_track_nm, cross_track_nm};
+        let rwy = lilb_03();
+        let pivot = super::TurnRound { pivots: true, width_m: Some(15.0) };
+        let (start, pocket_m, off) = pivot.pocket();
+        assert!(start < super::BACKTRACK_TURN_START_M && pocket_m < 30.0, "{start} {pocket_m}");
+        assert!(off <= 15.0 / 2.0 - 2.0 + 1e-9 && off >= 4.0, "on the pavement: {off}");
+        assert_eq!(super::TurnRound::TEARDROP.pocket(), (60.0, 30.0, 12.0));
+        // Leg one from LILB's 21 hold (node 1) ends at that pocket.
+        let path = super::backtrack_pocket_path(&rwy, 45.772005, 9.163885, pivot).expect("leg one");
+        let end = *path.last().unwrap();
+        let along = -along_track_nm(end.0, end.1, &rwy) * 1852.0;
+        let ct = cross_track_nm(end.0, end.1, &rwy) * 1852.0;
+        assert!((along - pocket_m).abs() < 0.5 && (ct - off).abs() < 0.5, "{along:.1} {ct:.1}");
+        // Where the recorded leg one stopped: turned RIGHT, toward the
+        // centreline, from the first tick, whatever the error's sign.
+        let (plat, plon) = (45.767_307_48, 9.160_850_79);
+        assert_eq!(super::turn_round_hint(&rwy, plat, plon), Some(1.0));
+        let mut dir = super::turn_round_hint(&rwy, plat, plon);
+        // The join logged -174.4 to its aim (the nose 148 off the course).
+        assert!(super::committed_err(-174.4, &mut dir) > 170.0);
+        assert!(super::committed_err(-120.0, &mut dir) > 0.0, "held through the turn");
+        let mut dir = super::turn_round_hint(&rwy, plat, plon);
+        let e0 = super::LineUpAlign::new(rwy.course_deg).err_deg(172.1);
+        assert!(super::committed_err(e0, &mut dir) > 140.0, "{e0:.0}, right from the first tick");
+        // Mirror side: left.
+        let (llat, llon) = crate::autoland::project_latlon(plat, plon, rwy.course_deg - 90.0, 29.8 / 1852.0);
+        assert_eq!(super::turn_round_hint(&rwy, llat, llon), Some(-1.0));
+        // Leg two from the recorded stop: 85 m of runway as a teardrop,
+        // 67 pivoting; from the new pocket, under 50.
+        let stop_of = |p: Vec<(f64, f64)>| {
+            let e = *p.last().unwrap();
+            -along_track_nm(e.0, e.1, &rwy) * 1852.0
+        };
+        let old = stop_of(super::backtrack_leg_two_path(&rwy, plat, plon, super::TurnRound::TEARDROP).unwrap());
+        let new = stop_of(super::backtrack_leg_two_path(&rwy, plat, plon, pivot).unwrap());
+        assert!((old - 84.9).abs() < 1.0 && new < 68.0, "old {old:.1} new {new:.1}");
+        let (pl, po) = (end.0, end.1);
+        let from_pocket = stop_of(super::backtrack_leg_two_path(&rwy, pl, po, pivot).unwrap());
+        assert!(from_pocket < 50.0, "{from_pocket:.1}");
+        // The route is still a drivable one.
+        let watch = TaxiWatch {
+            path: super::backtrack_leg_two_path(&rwy, pl, po, pivot).unwrap(),
+            via: String::new(),
+            seg: Vec::new(),
+            holding_point: String::new(),
+            lead_on: Vec::new(),
+        };
+        assert!(Route::build(&watch).is_some());
     }
 
     #[test]

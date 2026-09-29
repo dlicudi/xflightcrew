@@ -13195,6 +13195,17 @@ mod tests {
         let t = t.expect("planned");
         assert_eq!(t.runway, "03");
         assert!(TAXI_ROUTE.lock().unwrap().as_ref().is_some_and(|w| w.path.len() >= 2));
+        // The Evolution's taxis from here (#45, 2026-09-29 and 30) failed
+        // 14.2 to 16.3 m off a route that ran back to node 5 and hairpinned
+        // 124 degrees: no turn on the published route past 90 now.
+        let path = TAXI_ROUTE.lock().unwrap().as_ref().map(|w| w.path.clone()).unwrap();
+        println!("{path:?}");
+        for w in path.windows(3) {
+            let brg = |a: (f64, f64), b: (f64, f64)| crate::nav::bearing_deg(a.0, a.1, b.0, b.1);
+            let d = brg(w[1], w[2]) - brg(w[0], w[1]);
+            let t = ((d + 540.0).rem_euclid(360.0) - 180.0).abs();
+            assert!(t <= 90.0, "a {t:.0} degree turn at {:?}", w[1]);
+        }
         // No ICAO: the field found by the scan is the same one.
         let found = plan_self_taxi(&apt, None, lat, lon, None, None).expect("found");
         println!("{found:?}");
