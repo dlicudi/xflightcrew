@@ -10870,3 +10870,42 @@ speed past 73 kt (0.50 at 45 to 75 kt with a 3 kt crosswind, about 0.2 at 90) wh
 and the trim 0.14, at kp 1/31 per degree. `roll_rudder:` gains `power_steer_to_kts` (the lead falls
 as (to/v)^2 past it), `close_per_s` and `trim_per_s`; the SR22 declares 73, 1.5 and 0.45. Replayed:
 2.1 m to wheels-off (flown 9.5), the first roll 1.0 m (flown 9.8). Offline only.
+
+## 2026-09-29: the SR22's rollout split learns its standing yaw (#166)
+
+iMac (19 fps, rollout ticks 0.42 to 0.6 s). LEMG 13 1790689843-approach, 10 nm final, calm, touchdown
+30 fpm: rollout FAIL 9.1 m (bench/landings/sr22_lemg13_rollout_1790689843.jsonl, all 42 ticks). The
+shared split (`RolloutBrakeSteer`, 0.03 per degree, 0.8 s lead) steered from the first tick at 88 kt.
+At 2.9 to 3.3 s (79 kt) the nose jumped 2.2 degrees right with no input behind it (the nosewheel
+coming down), and from then the heading swung +/-2 degrees at about a 2 s period: the lead on the
+raw differenced error flipped the split to the right wheel at 4.3 and 4.9 s (error -1.7 and 0.0,
+rate +4.5 and +3.3 deg/s) and the nose answered right again, as it did at 14.9 to 17.9 s (the
+alternating bl/br). From 6 s (71 kt) to 12 s (47 kt) the heading error sat at -2.5 to -3.4 degrees
+with 0.07 to 0.11 of wheel difference (the plugin gives the inside wheel `brake + diff/2` and the
+outside `brake - diff/2`, so 3 degrees is 0.09) and 0.2 to 0.3 of left rudder, the heading holding
+at 132 to 134 against a target near 129.5: 1.5 to 9.1 m right.
+
+Fitted over the ticks (three-tick heading predictions, dead time and lag gridded): the wheel
+difference 15 to 30 deg/s per unit after 0.5 to 0.6 s (low speed: the nose answers a tick late,
+about 35 per unit at 10 to 20 kt), the rudder at idle next to nothing (its coefficient changes sign
+between fits), and a standing yaw of about 1.3 deg/s RIGHT above 40 kt that is gone by 40: the
+propeller windmilling (`trq` -111 at 87 kt, -73, -50, -20 at 60, +10 at 43). The first #166 rollout
+swung right on the wheels the same way. So not a sign, a cap or the 40 kt fade (the rollout split
+does not fade): a P-only split holds a standing yaw off only at a standing error, and the gain
+cannot rise at this tick (0.06 per degree swung +/-4 degrees in the replay: about 1 s of delay with
+the tick's hold).
+
+`rollout_brakes:` (`aircraft::RolloutBrakesProfile`: `per_deg`, `lead_s`, `trim_per_s`,
+`trim_max`, each left out the shared law's) gives the split a trim that learns the standing
+difference; the SR22 declares 0.025, 1.2 s, 0.8 and 0.15. Undeclared airframes (the SF50, the
+Evolution, the RV-10) fly the old law bit for bit. Replayed by superposition on the record (the
+recorded heading and cross-track as the plant under the recorded split, plus the yaw of the
+difference a law writes, at the record's own ticks): as flown 9.06 m at every authority; declared
+2.5 m at the fit (20 per unit, 0.6 s, 0.2 s lag), 2.3 to 3.4 m at 10 to 35 per unit, 0.4 to 0.8 s,
+0.1 to 0.5 s; the 2026-09-28 rollout inside 2.9 m from 10 to 90 (the shared law 3.1 to 3.3 at the
+ends). The rollout tick now logs `btrim`. Tests `the_sr22_rollout_split_learns_its_standing_yaw`,
+`the_sr22_declared_split_holds_the_first_rollout_too`, `a_declared_trim_learns_and_is_bounded`.
+Doubts: one calm rollout on one machine; the replay cannot see the nose-down swing change with the
+law. Offline only. Next SR22 landing: `autoland` `rollout` `btrim` walking to about -0.05 to -0.1
+by 70 kt, `err` inside 1.5 degrees from 70 to 40 kt, the split side
+flipping less above 40 kt, `xtk_m` inside 3 m, and `state` `in.trq` against `btrim`.

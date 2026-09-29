@@ -333,6 +333,57 @@ impl ArrestRollProfile {
     }
 }
 
+/// The rollout's differential brake on a castoring nosewheel
+/// (`autoland::RolloutBrakeSteer`), when the shared law does not fit. Each
+/// number left out is the shared law's (0.03 per degree, 0.8 s of lead, no
+/// trim), so an airframe that declares nothing flies it unchanged.
+///
+/// LEMG 13 (sortie 1790689843-approach, 2026-09-29, the SR22 on the iMac at
+/// a 0.46 s loop): fitted over the rollout, the split turns the nose 15 to
+/// 30 deg/s per unit of wheel difference after 0.5 to 0.6 s, and above 40 kt
+/// the idle, windmilling propeller (torque -110 to -20 ft-lb) yaws it right
+/// at about 1.3 deg/s that the rudder, at idle, does not answer. A split
+/// proportional to the heading error holds that off only at a standing
+/// error: the nose sat 3 degrees right of the target for ten seconds from
+/// 75 kt with 0.08 of difference, and the aircraft rolled from 1.2 m to
+/// 9.1 m right. The trim learns the standing split.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct RolloutBrakesProfile {
+    /// Wheel difference per degree of heading error.
+    #[serde(default)]
+    pub per_deg: Option<f64>,
+    /// Seconds of the error's rate led in (the channel's delay plus half a
+    /// tick).
+    #[serde(default)]
+    pub lead_s: Option<f64>,
+    /// The trim's corner, per second of the same gain: the trim moves
+    /// `per_deg * trim_per_s` of difference per degree-second of error.
+    #[serde(default)]
+    pub trim_per_s: Option<f64>,
+    /// The trim's limit, units of wheel difference.
+    #[serde(default)]
+    pub trim_max: Option<f64>,
+}
+
+impl RolloutBrakesProfile {
+    /// Each number kept only when it is a sane one.
+    pub fn valid(self) -> Self {
+        Self {
+            per_deg: self.per_deg.filter(|v| (0.005..=0.1).contains(v)),
+            lead_s: self.lead_s.filter(|v| (0.0..=3.0).contains(v)),
+            trim_per_s: self.trim_per_s.filter(|v| (0.05..=2.0).contains(v)),
+            trim_max: self.trim_max.filter(|v| (0.0..=0.3).contains(v)),
+        }
+    }
+}
+
+/// The live airframe's rollout brake law, when declared.
+pub fn rollout_brakes() -> Option<RolloutBrakesProfile> {
+    live_profile()
+        .and_then(|p| p.rollout_brakes)
+        .map(RolloutBrakesProfile::valid)
+}
+
 /// How the speed governor leads this airframe's engines
 /// (`tools::speedhold::throttle_adjust_with`). The shared law projects the
 /// speed 5 s ahead and moves the lever at most 0.015 a tick near its target
@@ -560,6 +611,9 @@ pub struct AircraftProfile {
     /// The bank's answer to the roll channel in the arrest, when fitted.
     #[serde(default)]
     pub arrest_roll: Option<ArrestRollProfile>,
+    /// The rollout's differential brake on a castoring nosewheel, when fitted.
+    #[serde(default)]
+    pub rollout_brakes: Option<RolloutBrakesProfile>,
     /// The speed governor's lead on this airframe's engines, when fitted.
     #[serde(default)]
     pub speed_governor: Option<SpeedGovernorProfile>,
@@ -5096,6 +5150,7 @@ fn cessna_172sp() -> AircraftProfile {
         flare_elevator: None,
         roll_rudder: None,
         arrest_roll: None,
+        rollout_brakes: None,
         speed_governor: None,
         cabin_air: None,
         pressurised: Some(false),
@@ -5422,6 +5477,7 @@ fn cirrus_sr22() -> AircraftProfile {
         flare_elevator: None,
         roll_rudder: None,
         arrest_roll: None,
+        rollout_brakes: None,
         speed_governor: None,
         cabin_air: None,
         pressurised: Some(false),
