@@ -745,6 +745,15 @@ pub fn flies_go_around_order(leg: Leg) -> bool {
     matches!(leg, Leg::Base | Leg::Final)
 }
 
+/// The intercom line for a go-around the circuit flies on an order: the
+/// tower's is named as its instruction, the pilot's is the readback. Pure.
+pub fn go_around_line(by: crate::go_around::GoAroundBy) -> &'static str {
+    match by {
+        crate::go_around::GoAroundBy::Tower => "Going around. Tower's instruction.",
+        crate::go_around::GoAroundBy::Pilot => "Going around.",
+    }
+}
+
 /// The flap the go-around selects at the order: the deepest of the
 /// airframe's detents (`limits`, as [`crate::aircraft::flap_limits`]) at or
 /// under the go-around's half, never more than `current` (a base at flaps 5
@@ -3402,9 +3411,11 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, p: Params
     // The tower's go-around orders, watched from the pattern on: a landing
     // clearance only stands on the approach legs, and there the order
     // outranks everything (see `flies_go_around_order`).
-    let mut orders = crate::party_line::GoAroundOrders::arm();
+    // The pilot's order rides the same watch and is flown the same way
+    // (`go_around`, #77).
+    let mut orders = crate::go_around::GoAroundWatch::arm();
     // An order seen while handing over, flown on the next tick.
-    let mut order_owed = false;
+    let mut order_owed: Option<crate::go_around::GoAroundBy> = None;
     // A clean-up in progress, the takeoff's (#150) or a go-around's: the flap
     // it has commanded, until clean.
     let mut cleaning_up: Option<f64> = takeoff_flaps_to_clean(handover.flaps_left, &flap_schedule);
@@ -3482,8 +3493,14 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, p: Params
         // from then on). LEMG 31 (sortie 1790584715-full_auto, 2026-09-28):
         // the order came at 736 ft, 5.7 km out, and the circuit flew on,
         // handed over at 2 nm and landed "without clearance".
-        if std::mem::take(&mut order_owed) | orders.take() {
+        let fresh = orders.take();
+        if let Some(by) = order_owed.take().or(fresh) {
             let ias_now = ias_r.as_ref().ok().copied();
+            crate::go_around::answer(if flies_go_around_order(leg) {
+                crate::go_around::Answer::Flying
+            } else {
+                crate::go_around::Answer::NotOnApproach
+            });
             if flies_go_around_order(leg) {
                 go_arounds += 1;
                 let limits = crate::aircraft::flap_limits();
@@ -3501,7 +3518,7 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, p: Params
                         "event": "ordered_go_around", "leg": format!("{leg:?}"),
                         "agl_ft": agl_ft, "a_m": a_m, "x_m": x_m, "ias": ias_now,
                         "flap_was": last_flap, "flap": flap, "flap_ok": flap_ok,
-                        "thr_ok": thr_ok.is_ok(), "n": go_arounds,
+                        "thr_ok": thr_ok.is_ok(), "n": go_arounds, "by": by.label(),
                     }),
                 );
                 if let Some(was) = last_flap {
@@ -3517,19 +3534,17 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, p: Params
                 turning_final = false;
                 descent_target = None;
                 last_vs_cmd = None;
-                alert(
-                    &voice,
-                    Priority::Warning,
-                    "Going around. Tower's instruction.",
-                );
-                // The tower voided the clearance; it is owed the call, and the
-                // downwind report it asked for comes round with the pattern.
+                alert(&voice, Priority::Warning, go_around_line(by));
+                // The tower voided the clearance, or the pilot did: it is owed
+                // the call, and the downwind report comes round with the
+                // pattern.
                 transmit(radio_call(&callsign, "going around"));
             } else {
                 crate::blackbox::record(
                     "circuit",
                     serde_json::json!({"event": "go_around_order_ignored",
-                                       "leg": format!("{leg:?}"), "agl_ft": agl_ft}),
+                                       "leg": format!("{leg:?}"), "agl_ft": agl_ft,
+                                       "by": by.label()}),
                 );
             }
         }
@@ -3591,8 +3606,8 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, p: Params
             }
             // The arrival lookup takes a while off the reactor: an order
             // given meanwhile is still this leg's, never autoland's to miss.
-            if orders.take() {
-                order_owed = true;
+            if let Some(by) = orders.take() {
+                order_owed = Some(by);
                 continue;
             }
             crate::blackbox::record(

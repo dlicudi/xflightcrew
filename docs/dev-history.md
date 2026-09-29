@@ -10500,3 +10500,27 @@ had no producer (dropped; the sortie's `end` carries the reason). The shipped sp
 `every_record_the_runner_reads_is_one_the_app_writes`,
 `every_field_the_runner_reads_is_in_the_shape_table`,
 `a_specs_event_and_give_up_are_words_the_app_writes`. Offline only.
+
+## 2026-09-29: the pilot's go-around (#77, #102)
+
+`--check` said "go around -> reaches no tool": only the tower's order (party line
+`GO_AROUND_ORDERS`) could send autoland or the circuit round. The pilot's order is now the crew's
+own counter (`src/go_around.rs`), watched with the tower's through one `GoAroundWatch` (armed with
+the loop, each order once per watch), so autoland (`GoAroundLatch::order`) and the circuit (Base or
+Final) fly it exactly as the tower's: climb-out, clean-up, pattern, the "going around" call once it
+climbs. Blackbox `ordered_go_around` / `go_around_order_ignored` carry `by`; kind `go_around`
+(`ordered`, `refused`, `answered`, `radio_call`). The `go_around` tool (every fixed-wing
+airframe, withheld on rotorcraft) takes "go around", "going around", "go-around", "take it around",
+"missed approach", "go missed" with filler only; refuses with no approach flying or the wheels down
+("We're down, staying down."); the loop answers (`Flying`, `Already`, `OnGround`,
+`NotOnApproach`) and the readback is that answer. A pilot's "going around" on the air (keyed, or
+content-routed to a tuned tower) orders it too unless it comes inside 60 s of the tower's order
+(the readback). Case "SF50 LEMG 13, 5 nm final, pilot's go-around" (`backlog-types.yaml`,
+`traffic: off`, "go around" at phase Landing) passes `--check`. Tests
+`the_pilots_go_around_is_its_tool_and_a_readback_is_not`,
+`a_watch_sees_a_pilot_order_once_and_armed_later_never`,
+`autoland_flies_a_pilot_order_as_it_flies_the_towers`,
+`the_circuit_flies_a_pilot_order_on_the_approach_legs_only`,
+`a_flying_answer_stands_and_the_tool_reads_it_back`,
+`the_gate_refuses_without_an_approach_and_after_touchdown`,
+`a_radio_going_around_is_an_order_unless_it_reads_back_the_tower`. Offline only.

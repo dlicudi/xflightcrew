@@ -301,6 +301,12 @@ pub fn try_parse(
     profile: &AircraftProfile,
 ) -> Option<Vec<ToolCall>> {
     let t = normalize(transcript);
+    // The pilot's go-around: a closed set of words, so a readback of the
+    // tower's order (a callsign, "roger", "wilco") never lands here.
+    if go_around_request(&t) {
+        let c = call("go_around", json!({}));
+        return valid(&c, registry, profile).then_some(vec![c]);
+    }
     // Full auto (the whole flight from cold) and the circuit are each ONE
     // intent even though their phrasings carry "and" ("start up and fly", "take
     // off and land") — checked on the raw text BEFORE the compound gate would
@@ -727,6 +733,39 @@ fn altimeter_inhg(t: &str) -> Option<f64> {
 fn has(t: &str, word: &str) -> bool {
     t.split(|c: char| !c.is_ascii_alphanumeric())
         .any(|w| w == word)
+}
+
+/// The pilot's go-around order (#77, #102): "go around", "going around",
+/// "go-around", "take it around", "missed approach", "go missed". CLOSED:
+/// the phrase plus filler only ("let's go around", "we're going around
+/// now"), so the tower's order read back with a callsign or a "roger", or a
+/// "don't go around", is never the pilot's order. Pure.
+pub fn go_around_request(t: &str) -> bool {
+    const PHRASES: &[&str] = &[
+        "go around",
+        "going around",
+        "goaround",
+        "take it around",
+        "take us around",
+        "taking it around",
+        "missed approach",
+        "go missed",
+        "going missed",
+    ];
+    const FILLER: &[&str] = &[
+        "go", "going", "around", "goaround", "take", "taking", "it", "us", "missed",
+        "approach", "we", "were", "are", "well", "lets", "let", "im", "i", "am", "ill",
+        "do", "a", "the", "fly", "execute", "please", "now", "ok", "okay", "right",
+    ];
+    let t = normalize(t).replace('-', " ");
+    let words: Vec<&str> = t
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|w| !w.is_empty())
+        .collect();
+    let joined = words.join(" ");
+    !words.is_empty()
+        && words.iter().all(|w| FILLER.contains(w))
+        && PHRASES.iter().any(|p| joined.contains(p))
 }
 
 /// The SimBrief-flight intent — full auto with the pilot's actual flight plan
@@ -3298,6 +3337,44 @@ mod tests {
             let c = v.remove(0);
             (c.name, c.arguments)
         })
+    }
+
+    /// The pilot's go-around reaches its tool on every fixed-wing airframe;
+    /// the tower's order read back, a negation or a helicopter never does
+    /// (#77, #102).
+    #[test]
+    fn the_pilots_go_around_is_its_tool_and_a_readback_is_not() {
+        for p in [
+            "go around",
+            "Go around!",
+            "going around",
+            "Go-around.",
+            "take it around",
+            "missed approach",
+            "go missed",
+            "let's go around",
+            "we're going around",
+            "do a go around",
+            "go around, go around",
+        ] {
+            assert_eq!(one(p).map(|c| c.0).as_deref(), Some("go_around"), "{p:?}");
+            assert!(crate::router::looks_like_command(p), "{p:?} passes the gate");
+        }
+        for id in ["cirrus_vision_sf50", "boeing_737_800", "cessna_172sp"] {
+            assert_eq!(one_on(id, "go around").map(|c| c.0).as_deref(), Some("go_around"));
+        }
+        for r in [
+            "go around, november one two three",
+            "roger, going around",
+            "wilco, going around",
+            "going around, speedbird three zero six",
+            "don't go around",
+            "we're not going around",
+            "why did we go around",
+        ] {
+            assert!(one(r).is_none_or(|(tool, _)| tool != "go_around"), "{r:?}");
+        }
+        assert!(one_on("sikorsky_s76c", "go around").is_none_or(|(t, _)| t != "go_around"));
     }
 
     #[test]
