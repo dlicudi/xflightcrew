@@ -1505,6 +1505,8 @@ impl RollSteer {
                 * (gs_kts / LOW_SPEED_FULL_KTS).clamp(0.0, 1.0);
         let lead = if self.jet {
             0.0
+        } else if let Some(ps) = rudder.power_steer {
+            ps * thr.clamp(0.0, 1.0)
         } else {
             power_lead(thr, gs_kts)
         };
@@ -5378,6 +5380,7 @@ mod tests {
         let silly = crate::aircraft::RollRudderProfile {
             yaw_dps: 0.0,
             at_kts: 80.0,
+            power_steer: None,
         };
         assert!(!RollSteer::with_rudder(true, silly).scheduled());
     }
@@ -5511,7 +5514,10 @@ mod tests {
             let psi_off = ((psi[k] + dpsi - course + 540.0).rem_euclid(360.0)) - 180.0;
             let c = cut.update(xtk_rec[k] + dx, psi_off, gs, dt);
             let err = c.target_off_deg - psi_off;
-            let steer = law.step_with_yaw(err, dt, gs, 1.0, Some(yaw_rec[k] + dyaw));
+            // The throttle as recorded (a propeller's power lead rides it);
+            // the 737's ticks carry none and a jet takes no lead.
+            let thr = r["thr"].as_f64().unwrap_or(1.0);
+            let steer = law.step_with_yaw(err, dt, gs, thr, Some(yaw_rec[k] + dyaw));
             dev = dev.max((steer - g(r, "steer")).abs());
             queue.push_back((t + DEAD_S, steer - g(r, "steer")));
             out.push((gs, c.xtk_m, truth[k] + dx, steer));
@@ -5650,6 +5656,105 @@ mod tests {
                 assert_eq!(swings, 0, "{id} on x{scale} the rudder: the steer weaves");
             }
         }
+    }
+
+    /// The SR22's LEMG 13 roll of 2026-09-29 (sortie 1790677606-full_auto),
+    /// every `roll` tick from brake release to the reject.
+    fn sr22_roll_0929() -> Vec<serde_json::Value> {
+        const TEXT: &str = include_str!("../bench/takeoffs/sr22_roll_lemg13_2026-09-29.jsonl");
+        TEXT.lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .collect()
+    }
+
+    /// The SR22's rudder fitted to that roll, deg/s of yaw per unit of steer:
+    /// the sim's yaw rate `r` against the steer through the same 0.3 s of
+    /// dead time and 0.47 s lag, over 15 kt to the reject (73 kt), with a
+    /// standing rudder of its own (the propeller): 31 deg/s at 60 kt growing
+    /// as v², 0.35 to 0.37 of steer standing from 30 kt (0.39 deg/s rms;
+    /// v^1.5 fits 0.40).
+    fn rudder_sr22_0929(gs: f64) -> f64 {
+        31.0 * (gs.max(0.0) / 60.0).powi(2)
+    }
+
+    /// The SR22's rudder as the profile declares it (`roll_rudder:`).
+    fn rudder_sr22() -> crate::aircraft::RollRudderProfile {
+        let text = std::fs::read_to_string("profiles/cirrus_sr22.yaml").unwrap();
+        let p: crate::aircraft::AircraftProfile = serde_yaml::from_str(&text).unwrap();
+        p.roll_rudder
+            .and_then(|r| r.valid())
+            .expect("the SR22 declares its rudder")
+    }
+
+    /// The SR22's roll as flown: the default law replayed through the
+    /// recorded roll writes the recorded steer tick for tick, and the offset
+    /// is the failure being fixed (9.8 m left at the reject, 66 kt).
+    #[test]
+    fn the_sr22_roll_replays_as_flown() {
+        let ticks = sr22_roll_0929();
+        assert_eq!(ticks.len(), 63);
+        let (out, dev) = replay_roll(
+            &ticks,
+            RollSteer::default(),
+            RollCut::new(None),
+            &rudder_sr22_0929,
+        );
+        assert!(
+            dev < 0.01,
+            "the replayed law strays {dev:.4} from the recorded steer"
+        );
+        let (worst, end, _) = roll_verdict(&out);
+        assert!(worst > 9.0 && end < -9.0, "{worst:.1} {end:+.1}");
+    }
+
+    /// The fix: the SR22 declares its rudder and its propeller's standing
+    /// rudder (`roll_rudder:` `power_steer`), led in with the throttle for
+    /// the whole roll. Replayed through the recorded roll on the fitted
+    /// rudder at half to three times, and on an aircraft needing 0.08 of
+    /// steer less or more than it did that day, it never strays 3 m and
+    /// does not weave; on the fitted rudder and the day's need, 1.5 m. The
+    /// declared rudder alone (the generic power lead) still strays over 4 m:
+    /// the propeller's standing rudder is the part the default law lacked.
+    #[test]
+    fn the_sr22_roll_holds_the_centreline_on_its_propeller() {
+        let ticks = sr22_roll_0929();
+        let declared = rudder_sr22();
+        assert_eq!(declared.power_steer, Some(0.35));
+        let fly =
+            |ticks: &[serde_json::Value], rd: crate::aircraft::RollRudderProfile, scale: f64| {
+                let law = RollSteer::with_rudder(false, rd);
+                let cut = RollCut::for_law(&law);
+                let plant = move |gs: f64| scale * rudder_sr22_0929(gs);
+                roll_verdict(&replay_roll(ticks, law, cut, &plant).0)
+            };
+        for need in [-0.08, 0.0, 0.08] {
+            // The recorded steer relabelled: the aircraft needed `need` more.
+            let shifted: Vec<serde_json::Value> = ticks
+                .iter()
+                .map(|r| {
+                    let mut r = r.clone();
+                    r["steer"] = serde_json::json!(r["steer"].as_f64().unwrap_or(0.0) - need);
+                    r
+                })
+                .collect();
+            for scale in [0.5, 1.0, 2.0, 3.0] {
+                let (worst, end, swings) = fly(&shifted, declared, scale);
+                println!("need {need:+} x{scale}: worst {worst:.2} m, end {end:+.2} m");
+                assert!(worst <= 3.0, "need {need:+}, rudder x{scale}: {worst:.1} m");
+                assert_eq!(
+                    swings, 0,
+                    "need {need:+}, rudder x{scale}: the steer weaves"
+                );
+            }
+        }
+        let (worst, _, _) = fly(&ticks, declared, 1.0);
+        assert!(worst <= 1.5, "{worst:.2} m on the fitted rudder");
+        let generic = crate::aircraft::RollRudderProfile {
+            power_steer: None,
+            ..declared
+        };
+        let (worst, _, _) = fly(&ticks, generic, 1.0);
+        assert!(worst > 4.0, "{worst:.2} m without the propeller's rudder");
     }
 
     /// The cross-track read pairs two frames now and then (latitude and

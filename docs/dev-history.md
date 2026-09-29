@@ -10820,3 +10820,35 @@ Said "Tower expects us on runway one three"; `runway_from_clearance` `resequence
 
 Offline only. Next LEMG go-around: `runway_from_clearance` with `resequenced` right after the
 climb, then a `reversal` record with `terrain: probed` and the corridor numbers.
+
+## 2026-09-29: the SR22 declares its rudder and its propeller's standing rudder
+
+LEMG 13 runway start, sortie 1790677606-full_auto (bench/takeoffs/sr22_roll_lemg13_2026-09-29.jsonl,
+63 roll ticks; wind 0.6 kt). The SR22 declared no `roll_rudder:`, so the DEFAULT law flew (`law:
+default`, no drift feed, no cut trim). The brake split fired only 2.7 to 5.9 s after brake release
+(5 to 22 kt, right brake up to 0.17, the right way) and never after. From 6 s (full power, 27 kt)
+the nose yawed left at 0.6 to 1.0 deg/s against 0.24 to 0.35 of right steer: the heading error grew
+0.96 (27 kt), 2.94 (38), 4.26 (44), 5.31 (50), 6.00 (55, tick 47), cross-track -0.26, -0.89, -1.74,
+-2.93, -4.47 m; the steer then sat 0.39 to 0.41 (ticks 47 to 62) while the nose came back at 1 deg/s
+too late, and the excursion reject fired at -10.0 m, 73.6 kt. The steer was made of a power lead of
+0.1 (the generic 0.25 fading by 60 % at 40 kt), a trim of 0.07 to 0.19 (0.01 per degree-second,
+bled as 1/v² by the acceleration) and a P term of 0.03 per degree (the authority floor from 50
+kt): a standing need of about 0.37 was reachable only with 5 to 6 degrees of error.
+
+Fitted, the sim's yaw rate `r` against the steer through 0.3 s dead time and 0.47 s lag, 15 kt to
+the reject, with a standing rudder per speed band: 31 deg/s per unit at 60 kt as v² (v to v^2.5
+all within 0.36 to 0.42 deg/s rms), standing 0.25 to 0.31 below 30 kt and 0.34 to 0.38 from 30 to
+73 kt, whatever the lag and exponent. The five older SR22 rolls in the blackbox (LXGB 27 and 09, LEMG 13
+1789244061) show the same: 0.4 to 0.55 of steer held at 30 to 55 kt and 7 to 20 m off.
+
+The profile now declares `roll_rudder: {yaw_dps: 31, at_kts: 60, power_steer: 0.35}`, and a new
+`RollRudderProfile.power_steer` replaces the generic power lead on the scheduled law: `power_steer
+x throttle` for the whole roll (under the same low-speed cap). Replayed through the recorded roll
+(the superposition replay of 2026-09-28, the recorded throttle now fed): as flown 9.6 m, steer
+reproduced exactly; declared rudder alone with the generic lead 4.3 m; with the power steer 1.2 m,
+and within 2.9 m and no weave on the rudder at 0.5 to 3 times and a need 0.08 less or more. Tests
+`the_sr22_roll_replays_as_flown`, `the_sr22_roll_holds_the_centreline_on_its_propeller`. Doubts:
+one roll, calm; the replay does not model the brake split (the scheduled law steers harder from 15
+kt, so the split may ask more right brake to 40 kt); the roll ends at the reject, so Vr to liftoff
+is untested. Offline only. Next SR22 takeoff: `autotakeoff` `roll` `law: rudder`, `err` under 2
+degrees from 30 kt, `xtk_m` inside 3 m, `trim` and `steer` near 0.35 to 0.4.
