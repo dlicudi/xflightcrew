@@ -792,6 +792,15 @@ pub(crate) fn project_signed(path: &[(f64, f64)], lat: f64, lon: f64) -> Option<
 /// never a movement of the aircraft. Past [`FACING_REACH_M`] the facing pick
 /// is not a leg we are joining, it is a leg somewhere else, and the nearest
 /// paint is the honest answer.
+///
+/// ...and the reach is measured from the paint under us, not only from the
+/// aircraft. LEMG 13 (sortie 1790646817-full_auto, 2026-09-29, #178): a
+/// runway start turning round to a route behind it had the plain answer 8.3
+/// m off when a far leg swung into the window 149.4 m away, a metre inside
+/// the old flat 150 m reach, and the join's own guard (90 m) stopped the
+/// aircraft "off the cleared route" 11 s into its turn. A facing leg is a
+/// join only within [`FACING_JUMP_M`] of the plain answer, never past
+/// [`FACING_REACH_M`].
 pub(crate) fn project_signed_facing(
     path: &[(f64, f64)],
     lat: f64,
@@ -799,16 +808,24 @@ pub(crate) fn project_signed_facing(
     heading_true: f64,
 ) -> Option<(f64, f64)> {
     let plain = project_signed_with(path, lat, lon, None);
+    let reach = plain.map_or(FACING_REACH_M, |p| {
+        (p.1.abs() + FACING_JUMP_M).min(FACING_REACH_M)
+    });
     match project_signed_with(path, lat, lon, Some(heading_true)) {
         Some(facing)
-            if facing.1.abs() <= FACING_REACH_M
-                || plain.is_none_or(|p| facing.1.abs() <= p.1.abs()) =>
+            if facing.1.abs() <= reach || plain.is_none_or(|p| facing.1.abs() <= p.1.abs()) =>
         {
             Some(facing)
         }
         _ => plain,
     }
 }
+
+/// How much further off than the plain nearest paint a facing leg may lie
+/// and still be the leg we join: the join's own room past the plain answer
+/// (the established guard plus the turning circle), so a pick the drive
+/// would call off route is never made.
+const FACING_JUMP_M: f64 = crate::autotaxi::OFF_ROUTE_STOP_M + crate::autotaxi::JOIN_GROW_M;
 
 /// How far off a facing segment may lie and still be read as the leg the
 /// aircraft is joining. The auto-taxi's own engage limit
@@ -970,6 +987,36 @@ mod tests {
         ];
         let (_, off3) = project_signed_facing(&near, lat, lon, 10.0).unwrap();
         assert!(off3.abs() > 20.0, "the facing leg 39 m out: {off3}");
+    }
+
+    /// #178, LEMG 13 (sortie 1790646817-full_auto, 2026-09-29): a runway
+    /// start on 13 (heading 132) joining a route whose first leg runs 334,
+    /// behind it. 11 s into the left turn round, nose 107 true, the plain
+    /// nearest was the route's start 8.3 m off; a later leg running 110,
+    /// about 149 m away, entered the facing window and became the projection
+    /// (lateral 149.4 m, a metre inside the old flat 150 m reach), and the
+    /// join's 90 m guard stopped the taxi "off the cleared route".
+    #[test]
+    fn a_turn_round_join_never_jumps_to_a_far_facing_leg() {
+        let at = |x0: f64, y0: f64, brg: f64, d: f64| {
+            (x0 + d * brg.to_radians().sin(), y0 + d * brg.to_radians().cos())
+        };
+        let b = at(0.0, 0.0, 334.0, 215.0);
+        let c = at(b.0, b.1, 110.0, 400.0);
+        let route = [ll(0.0, 0.0), ll(b.0, b.1), ll(c.0, c.1)];
+        // Where the aircraft was: 8 m on from the start, nose round to 107.
+        let here = at(0.0, 0.0, 111.0, 8.0);
+        let (lat, lon) = ll(here.0, here.1);
+        let (_, plain) = project_signed(&route, lat, lon).unwrap();
+        assert!((plain.abs() - 8.0).abs() < 0.5, "the paint under us: {plain}");
+        // The far leg alone, as the old reach saw it: inside 150 m.
+        let far = project_signed_with(&route, lat, lon, Some(107.0)).unwrap();
+        assert!(far.1.abs() > 140.0 && far.1.abs() <= FACING_REACH_M, "{far:?}");
+        let (along, off) = project_signed_facing(&route, lat, lon, 107.0).unwrap();
+        assert!(
+            off.abs() < 10.0 && along < 1.0,
+            "the join stays on the paint it is turning to: along {along}, off {off}"
+        );
     }
 
     /// Right of the route is positive, left is negative, and the plain

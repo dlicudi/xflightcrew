@@ -436,8 +436,10 @@ everything blackboxes to `logs/blackbox.jsonl` (kinds: `atc`, `autotaxi`, `autot
   `override_toe_brakes` while `xcopilot/taxi_steer` applies; a pilot brake latches
   `xcopilot/brake_yield`. Never "fix" a corner that stops the aircraft by tuning the governor.
 - **A jump in a projection is never a movement** (`taxi_guide::project_signed_facing`): a facing
-  pick must be within `MAX_JOIN_M` or nearer than the plain answer, else a jump stops the drive
-  (EBLG 2026-09-22).
+  pick must be within `MAX_JOIN_M` AND the join's room (`FACING_JUMP_M`) of the plain answer, or
+  nearer than it, and a join offset growing faster than the aircraft moved keeps the plain answer
+  (`autotaxi::join_fix`, `projection_jump`), else a jump stops the drive (EBLG 2026-09-22; LEMG
+  13 turn-round, #178).
 - **Routes ride the paint** (`ride_paint`): 1201/1202 for topology, names, crossings; drawn `120`
   centrelines for geometry, sliding sideways only; runway legs and the vacate's start never move;
   thin data degrades, never refuses; a chord of a drawn curve rides the curve between two samples on
@@ -537,10 +539,13 @@ everything blackboxes to `logs/blackbox.jsonl` (kinds: `atc`, `autotaxi`, `autot
   an incursion (`ComplianceState.runway_start`: a strip first seen stopped); its clearance comes
   first from the strip and names it (`full_auto::zone_clearance_from_the_strip`; asked again when the
   held one names another runway); the tower gives a caller standing on the stated strip that runway
-  ahead of the calm-wind stream when the wind does not argue (`note_caller_on_strip`); too little ahead is a BACKTRACK, never a taxi (`full_auto::RunwayStart`,
+  ahead of the calm-wind stream when the wind does not argue (`note_caller_on_strip`; its own
+  strip carries a tailwind to `ON_STRIP_TAILWIND_KTS`, 10 kt, and is HELD for its later calls,
+  `start_strip`; LEMG 13 cleared on 30 in 6.9 kt of tailwind, #178); too little ahead, or a
+  clearance for the strip's reciprocal (`is_reciprocal`), is a BACKTRACK, never a taxi (`full_auto::RunwayStart`,
   `backtrack_from_runway_start`, `Intent::RequestBacktrack`; EGKK 26L 2026-09-27); a clearance for
   another runway is taxied to (`under_clearance`), and so is a taxi, line-up or takeoff for one
-  answering the ready call, the reciprocal too: the wait ends before any readback, nothing is read
+  answering the ready call (the reciprocal backtracks, once): the wait ends before any readback, nothing is read
   back from the wrong strip and "lined up" is never said (`cleared_elsewhere`,
   `runway_start_other_runway` `at: ready`; LEMG 30 read back 13, #178); a start whose end opposes
   the live stream takes the stream's end (a 31 start facing 13 departures takes 13). `why_no_fit`
