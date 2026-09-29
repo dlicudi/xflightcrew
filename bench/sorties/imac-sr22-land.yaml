@@ -1,0 +1,8 @@
+# SR22 landings at the POH 80 kt final (iMac): the flare and bounce.
+after: stop
+cases:
+  - name: "SR22 LEMG 13, 2 nm final at 75 kt (#166)"
+    setup:
+      aircraft: "Aircraft/Laminar Research/Cirrus SR22/Cirrus SR22.acf"
+      approach: { field: LEMG, runway: 13, final_nm: 2 }
+    traffic: off
