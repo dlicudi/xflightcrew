@@ -1,0 +1,32 @@
+# iMac circuits for the offline fixes of 2026-09-29: #188 (the circuit meets
+# the path over raised ground), #169 (A330 CONF 1 under its placard), #31.
+after: stop
+cases:
+  # #188: circuit leg descent_fpm, downwind_extended, handoff_autoland
+  # above_path_ft under 200, no autoland late_go_around.
+  - name: "SR22 LEMG runway start 13, circuit (#188)"
+    setup:
+      aircraft: "Aircraft/Laminar Research/Cirrus SR22/Cirrus SR22.acf"
+      runway_start: { field: LEMG, runway: 13, engines_running: true }
+    command: fly a circuit
+    traffic: off
+    deadline_min: 30
+
+  # #169: want_kts 205 after "Flaps one.", ias under 215 with CONF 1 out,
+  # climb_flap_step to 0 near 202, no flap overspeed.
+  - name: "A330 LEMG runway start 30, circuit (#169)"
+    setup:
+      aircraft: "Aircraft/Laminar Research/Airbus A330-300/A330.acf"
+      runway_start: { field: LEMG, runway: 30, engines_running: true }
+    command: fly a circuit
+    traffic: off
+    deadline_min: 30
+
+  # #31: rollout xtk growth; #78 climb_manual theta.
+  - name: "737 LEMG runway start 30, circuit (#31 #78)"
+    setup:
+      aircraft: "Aircraft/Laminar Research/Boeing 737-800/b738.acf"
+      runway_start: { field: LEMG, runway: 30, engines_running: true }
+    command: fly a circuit
+    traffic: off
+    deadline_min: 30
