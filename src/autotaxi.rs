@@ -156,7 +156,7 @@ pub(crate) const MAX_JOIN_M: f64 = 150.0;
 /// Extra lateral allowance granted while joining, on top of the engage
 /// distance: room for the turning circle of a turn-around without ever
 /// letting a broken law wander further from the route than it started.
-const JOIN_GROW_M: f64 = 40.0;
+pub(crate) const JOIN_GROW_M: f64 = 40.0;
 /// An engage further off than [`OFF_ROUTE_STOP_M`] or with the nose more than
 /// this far off the aim is a JOIN (the widened guard, the join pace).
 const JOIN_ALLOW_ERR_DEG: f64 = 45.0;
@@ -1142,6 +1142,35 @@ pub fn join_allowance_m(lateral: f64, err_deg: f64) -> f64 {
     }
 }
 
+/// A JUMP IN A PROJECTION IS NEVER A MOVEMENT, tick to tick. While joining,
+/// the facing pick (`taxi_guide::project_signed_facing`) can move to another
+/// leg between two ticks as the nose swings; an offset that grew by more than
+/// the aircraft moved (plus [`PROJECTION_JUMP_SLACK_M`]) is that jump, and
+/// the plain nearest paint stands for the tick. LEMG 13 (sortie
+/// 1790646817-full_auto, 2026-09-29, #178): a turn-round join 8.3 m off read
+/// 149.4 m the next tick at 5.6 kt, and the off-route guard stopped the
+/// taxi. `(fix, jumped)`. Pure.
+pub(crate) fn join_fix(
+    facing: Option<(f64, f64)>,
+    plain: Option<(f64, f64)>,
+    prev_lateral: Option<f64>,
+    moved_m: f64,
+) -> (Option<(f64, f64)>, bool) {
+    match (facing, plain, prev_lateral) {
+        (Some(f), Some(p), Some(prev))
+            if f.1.abs() > prev + moved_m.max(0.0) + PROJECTION_JUMP_SLACK_M
+                && p.1.abs() < f.1.abs() =>
+        {
+            (Some(p), true)
+        }
+        _ => (facing, false),
+    }
+}
+
+/// Measurement noise a join's offset may grow by, beyond the distance
+/// actually moved, in one tick.
+const PROJECTION_JUMP_SLACK_M: f64 = 5.0;
+
 /// True when a join has captured the route: on the line and pointed along it.
 pub fn join_done(lateral: f64, err_deg: f64) -> bool {
     lateral < JOIN_DONE_LAT_M && err_deg.abs() < JOIN_DONE_ERR_DEG
@@ -2066,6 +2095,9 @@ async fn drive(xp: XPlaneClient, voice: Option<Voice>, route: Route, base_kts: f
     let mut overspeed_since: Option<std::time::Instant> = None;
     // The last good fix, for the relocation guard ([`relocation_jump_m`]).
     let mut last_fix: Option<((f64, f64), std::time::Instant)> = None;
+    // The last tick's lateral, for the join's jump test (`join_fix`).
+    let mut last_lateral: Option<f64> = None;
+    let mut last_jumped = false;
     loop {
         if !ACTIVE.load(Ordering::Relaxed) || DRIVE_GEN.load(Ordering::SeqCst) != gen {
             crate::blackbox::record(
@@ -2232,15 +2264,34 @@ async fn drive(xp: XPlaneClient, voice: Option<Voice>, route: Route, base_kts: f
                 break;
             }
         }
+        let moved_m = last_fix.map_or(0.0, |(from, _)| {
+            crate::autoland::haversine_nm(from.0, from.1, lat, lon) * M_PER_NM
+        });
         last_fix = Some(((lat, lon), now));
         // Signed here, magnitude everywhere below: the gates ask how far off
         // the route we are, and the record wants to know which side. While
         // still JOINING, project along the nose: the nearest paint can be a
         // leg already behind us (the pushback that let go 60 m short of its
         // node, Malaga 2026-09-11 — the join drove a loop back to the node).
+        // ...never onto a leg the aircraft did not move to (`join_fix`).
         let joining = join_allow.is_none_or(|a| a > 0.0);
         let fixed = if joining {
-            route.fix_signed_facing(lat, lon, psi)
+            let (fix, jumped) = join_fix(
+                route.fix_signed_facing(lat, lon, psi),
+                route.fix_signed(lat, lon),
+                last_lateral,
+                moved_m,
+            );
+            if jumped && !last_jumped {
+                crate::blackbox::record(
+                    "autotaxi",
+                    serde_json::json!({"event": "projection_jump", "prev_lat_m": last_lateral,
+                                       "moved_m": moved_m,
+                                       "facing": route.fix_signed_facing(lat, lon, psi)}),
+                );
+            }
+            last_jumped = jumped;
+            fix
         } else {
             route.fix_signed(lat, lon)
         };
@@ -2249,6 +2300,7 @@ async fn drive(xp: XPlaneClient, voice: Option<Voice>, route: Route, base_kts: f
             continue;
         };
         let lateral = offset.abs();
+        last_lateral = Some(lateral);
         let remaining = route.remaining(progress);
         progress_note(progress);
         if ext_stopped {
@@ -3309,6 +3361,37 @@ mod tests {
             Pace::default().join_cap_kts(err),
             SHARP_KTS,
             "turn-arounds happen at the sharp pace"
+        );
+    }
+
+    /// #178, the recorded drive ticks (LEMG 13, sortie
+    /// 1790646817-full_auto, 2026-09-29): +877.3 lat_m 8.32 at 5.6 kt, the
+    /// next tick 0.3 s on the facing pick read 149.37 m (progress 145.6) and
+    /// the join's guard stopped the taxi. The aircraft moved under a metre:
+    /// the plain nearest stands. A pick that shrinks the offset, or grows it
+    /// no faster than the aircraft moved, is still taken.
+    #[test]
+    fn a_join_projection_that_jumps_is_not_a_movement() {
+        let moved = 5.6 * 0.514 * 0.3;
+        let (fix, jumped) =
+            join_fix(Some((145.56, -149.37)), Some((5.0, 8.4)), Some(8.32), moved);
+        assert!(jumped);
+        assert_eq!(fix, Some((5.0, 8.4)));
+        assert!(OFF_ROUTE_STOP_M + join_allowance_m(0.0027, -144.98) < 149.37, "it tripped");
+        // The facing pick nearer than the last tick: a real join.
+        assert_eq!(
+            join_fix(Some((120.0, 3.0)), Some((5.0, 8.4)), Some(8.32), moved),
+            (Some((120.0, 3.0)), false)
+        );
+        // Grown by what we moved: taken.
+        assert_eq!(
+            join_fix(Some((6.0, 9.0)), Some((5.0, 8.9)), Some(8.32), moved),
+            (Some((6.0, 9.0)), false)
+        );
+        // The first tick has nothing to jump from.
+        assert_eq!(
+            join_fix(Some((145.0, 60.0)), Some((5.0, 8.4)), None, 0.0),
+            (Some((145.0, 60.0)), false)
         );
     }
 

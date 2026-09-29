@@ -10524,3 +10524,26 @@ content-routed to a tuned tower) orders it too unless it comes inside 60 s of th
 `a_flying_answer_stands_and_the_tool_reads_it_back`,
 `the_gate_refuses_without_an_approach_and_after_touchdown`,
 `a_radio_going_around_is_an_order_unless_it_reads_back_the_tower`. Offline only.
+
+## 2026-09-29: a runway start keeps its strip, backtracks its reciprocal, joins without a jump (#178)
+
+Sortie 1790646817-full_auto (A330, LEMG 13 runway start, traffic off). Tower: "request clearance,
+runway one three, for circuits" was cleared on 30 (`stated_runway_refused` best 30): the tower's
+wind 293 at 7.3 was 6.9 kt down 13, over the 5 kt `STATED_RUNWAY_TAILWIND_KTS`, and no traffic
+argued. A caller ON its strip now takes a tailwind to `ON_STRIP_TAILWIND_KTS` (10 kt,
+`runway_stands_within`), a stream against it still wins; the granted strip is HELD
+(`Station.start_strip`) for the start's later calls, since 30's 14 kt better headwind would win the
+wind pick's hysteresis on the ready call; dropped airborne, on a restated runway or a stream.
+Crew: a start cleared for the RECIPROCAL of its own strip (13 cleared 31) is `RunwayStart::Short`
+for that end (`under_clearance`, `is_reciprocal` over `station::reciprocal_end`): "request
+backtrack", the line-up tool's full-length backtrack, turn at the numbers; the ready call's
+`OtherRunway` answer the same, once. Another strip (LEMG's 30 is 12/30) stays the taxi. Autotaxi:
+the join went `off_route` at 149.4 m 11 s in at 5.6 kt: plain nearest 8.3 m, a far leg entered the
+facing window a metre inside the flat 150 m `FACING_REACH_M`, over the join's 90 m guard. A facing
+pick now reaches only `FACING_JUMP_M` (65 m, the join's room) past the plain answer, and while
+joining an offset that grows faster than the aircraft moved (+5 m) keeps the plain answer for the
+tick (`autotaxi::join_fix`, blackbox `autotaxi` `projection_jump`). Tests
+`a_runway_start_keeps_its_strip_in_a_light_tailwind`,
+`a_runway_start_cleared_for_its_reciprocal_backtracks`,
+`a_turn_round_join_never_jumps_to_a_far_facing_leg`,
+`a_join_projection_that_jumps_is_not_a_movement`. Offline only.

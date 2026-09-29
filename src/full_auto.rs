@@ -2335,20 +2335,25 @@ async fn fly(xp: XPlaneClient, config: Config, voice: Option<Voice>, tools: SubT
         let cleared = crate::party_line::clearance_runway();
         let on = start.runway().map(str::to_string);
         start = start.under_clearance(cleared.as_deref());
-        if start == RunwayStart::None {
+        if start.runway() != on.as_deref() {
+            let backtrack = start != RunwayStart::None;
             event(
                 "runway_start_other_runway",
-                json!({ "on": on, "cleared": cleared }),
+                json!({ "on": on, "cleared": cleared, "backtrack": backtrack }),
             );
-            if let Some(c) = &cleared {
-                announce(
+            match (&cleared, &on) {
+                (Some(c), Some(o)) if backtrack => {
+                    announce(&voice, Priority::Advisory, &backtrack_line(o, c));
+                }
+                (Some(c), _) => announce(
                     &voice,
                     Priority::Advisory,
                     &format!(
                         "We're cleared off runway {}, not this one. Asking for the taxi.",
                         crate::atis::spoken_runway(c)
                     ),
-                );
+                ),
+                _ => {}
             }
         }
     }
@@ -2370,7 +2375,10 @@ async fn fly(xp: XPlaneClient, config: Config, voice: Option<Voice>, tools: SubT
     // is no start: nothing is read back from here, the crew taxis to the
     // cleared runway like any departure (#178).
     let mut start_cleared = false;
-    if let Some(on) = start.runway().map(str::to_string) {
+    // At most one backtrack: a reciprocal answer to the ready call is flown
+    // down the strip, and the ready call made again from its far end.
+    let mut backtracked = false;
+    while let Some(on) = start.runway().map(str::to_string) {
         if crate::mode::atc_enabled() && crate::party_line::clearance_state().is_some() {
             if let Some(khz) = crate::party_line::home_tower_khz() {
                 let _ = xp.set_float(COM1_FREQ_KHZ, khz as f64).await;
@@ -2396,17 +2404,36 @@ async fn fly(xp: XPlaneClient, config: Config, voice: Option<Voice>, tools: SubT
                     return;
                 }
                 ClearanceWait::OtherRunway(cleared) => {
+                    let backtrack = !backtracked && is_reciprocal(&on, &cleared);
                     event(
                         "runway_start_other_runway",
                         json!({ "on": on, "cleared": cleared, "at": "ready",
+                                "backtrack": backtrack,
                                 "state": format!("{:?}", crate::party_line::clearance_state()) }),
                     );
+                    if backtrack {
+                        announce(&voice, Priority::Advisory, &backtrack_line(&on, &cleared));
+                        if let Err((line, why)) = backtrack_from_runway_start(
+                            &xp, &ctx, &voice, &tools, &callsign, &cleared, towered,
+                        )
+                        .await
+                        {
+                            give_up(&xp, tools.taxi.park_brake_valve_set, &voice, &line, why)
+                                .await;
+                            return;
+                        }
+                        bail_if_abort!();
+                        backtracked = true;
+                        start = RunwayStart::Lined { runway: cleared };
+                        continue;
+                    }
                     announce(&voice, Priority::Advisory, &other_runway_line(&on, &cleared));
                     start = RunwayStart::None;
                 }
             }
             bail_if_abort!();
         }
+        break;
     }
     if start == RunwayStart::None {
         event("departure_field", json!({ "towered": towered }));
@@ -5634,6 +5661,23 @@ pub(crate) fn other_runway_line(on: &str, cleared: &str) -> String {
     )
 }
 
+/// Whether `cleared` is the other end of the strip `on` ("13" and "31",
+/// "08R" and "26L"): the runway start's backtrack, not a taxi. Pure.
+pub(crate) fn is_reciprocal(on: &str, cleared: &str) -> bool {
+    crate::station::reciprocal_end(on.trim())
+        .is_some_and(|r| crate::autotakeoff::runway_matches(&r, cleared.trim()))
+}
+
+/// What the crew says when a runway start is cleared from the far end of its
+/// own strip: it backtracks down it. Pure.
+pub(crate) fn backtrack_line(on: &str, cleared: &str) -> String {
+    format!(
+        "The tower wants runway {}, and we're on {}, the same strip. Asking to backtrack.",
+        crate::atis::spoken_runway(cleared),
+        crate::atis::spoken_runway(on)
+    )
+}
+
 /// How a wait for the takeoff clearance ended ([`ensure_takeoff_cleared`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ClearanceWait {
@@ -6564,10 +6608,22 @@ impl RunwayStart {
     /// flown from that runway: the taxied departure goes there. Asking for
     /// the strip we sit on would unpick a clearance already read back, and
     /// the tower treats only the strip in use as a lined-up aircraft
-    /// (`Ctx::own_on_runway`). Pure.
+    /// (`Ctx::own_on_runway`).
+    ///
+    /// ...but the RECIPROCAL of our own strip is not another runway: it is
+    /// this pavement the other way, reached by a backtrack down it (turn at
+    /// its far end, line up), never a taxi off it and back (#178). Pure.
     pub(crate) fn under_clearance(self, cleared: Option<&str>) -> RunwayStart {
         match (self.runway(), cleared) {
-            (Some(on), Some(c)) if !crate::autotakeoff::runway_matches(on, c) => RunwayStart::None,
+            (Some(on), Some(c)) if !crate::autotakeoff::runway_matches(on, c) => {
+                if is_reciprocal(on, c) {
+                    RunwayStart::Short {
+                        runway: c.to_string(),
+                    }
+                } else {
+                    RunwayStart::None
+                }
+            }
             _ => self,
         }
     }
@@ -6789,8 +6845,48 @@ mod runway_start_tests {
         assert_eq!(short.clone().under_clearance(Some("26R")), RunwayStart::None);
         let lined = RunwayStart::Lined { runway: "09".into() };
         assert_eq!(lined.clone().under_clearance(Some("9")), lined);
-        assert_eq!(lined.under_clearance(Some("27")), RunwayStart::None);
+        assert_eq!(lined.clone().under_clearance(Some("22")), RunwayStart::None);
         assert_eq!(RunwayStart::None.under_clearance(Some("27")), RunwayStart::None);
+        // The far end of our own strip is a backtrack down it (#178).
+        assert_eq!(
+            lined.under_clearance(Some("27")),
+            RunwayStart::Short { runway: "27".into() }
+        );
+    }
+
+    /// #178, sortie 1790646817-full_auto (LEMG, 2026-09-29): lined up on
+    /// 13, cleared for the circuit on 30. 30 is the OTHER strip (12/30), so
+    /// the taxi was right there; cleared on 31, the far end of 13's own
+    /// pavement, the start backtracks down the runway (the Short branch:
+    /// "request backtrack", the line-up tool's full-length backtrack, turned
+    /// round at the numbers), never a taxi off it and an own-power turn.
+    #[test]
+    fn a_runway_start_cleared_for_its_reciprocal_backtracks() {
+        assert!(is_reciprocal("13", "31"));
+        assert!(is_reciprocal("31", "13"));
+        assert!(is_reciprocal("08R", "26L"));
+        assert!(is_reciprocal("9", "27"));
+        assert!(!is_reciprocal("13", "30"), "LEMG's 30 is the 12/30 strip");
+        assert!(!is_reciprocal("08R", "26R"), "a parallel's end is another runway");
+        assert!(!is_reciprocal("13", "13"));
+        let on13 = RunwayStart::Lined { runway: "13".into() };
+        assert_eq!(on13.clone().under_clearance(Some("30")), RunwayStart::None);
+        assert_eq!(
+            on13.under_clearance(Some("31")),
+            RunwayStart::Short { runway: "31".into() }
+        );
+        assert_eq!(
+            backtrack_line("13", "31"),
+            "The tower wants runway three one, and we're on one three, the same strip. \
+             Asking to backtrack."
+        );
+        // The ready call's answer for the reciprocal is flown the same way,
+        // once, before the taxi fallback.
+        let src = include_str!("full_auto.rs");
+        let ready = src.find("ClearanceWait::OtherRunway(cleared) => {").unwrap();
+        let bt = src[ready..].find("backtrack_from_runway_start(").unwrap();
+        let taxi = src[ready..].find("other_runway_line(&on, &cleared)").unwrap();
+        assert!(bt < taxi);
     }
 
     /// Issue #178, the party line as the crew read it in sortie

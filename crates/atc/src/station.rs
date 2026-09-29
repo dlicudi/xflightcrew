@@ -92,6 +92,11 @@ pub struct Station {
     /// on the ground: a runway start asking for the runway it is lined up on
     /// (`note_caller_on_strip`), consumed by the same pick.
     stated_on_strip: bool,
+    /// The strip a runway start was GIVEN (`note_caller_on_strip`): held for
+    /// its later calls on the ground while no stream opposes it and its
+    /// tailwind stays within [`ON_STRIP_TAILWIND_KTS`], where the wind pick's
+    /// hysteresis would otherwise turn it round on the next call (#178).
+    start_strip: Option<String>,
     /// The runway the tower last named to this flight on the ground (its
     /// zone, circuit or IFR clearance, a taxi, a line-up): a later reply on
     /// another runway states the change (`state_runway_change`, #178).
@@ -258,6 +263,7 @@ impl Station {
             runway_in_use: None,
             stated_runway: None,
             stated_on_strip: false,
+            start_strip: None,
             told_runway: None,
             runway_request: None,
             requested_ident: None,
@@ -1905,6 +1911,7 @@ impl Station {
     ) -> String {
         if !ctx.on_ground {
             self.told_runway = None;
+            self.start_strip = None;
             return reply;
         }
         if reply.is_empty() {
@@ -2046,21 +2053,53 @@ impl Station {
         // ...but never INTO the live traffic: a start whose end points against
         // the arrival or departure stream (13 departures, a start on 31) is
         // the head-on of issue #140, refused and left to the stream below.
+        // ...and a start's own strip carries a pilot's tailwind, not the
+        // runway-in-use's: LEMG 13 (sortie 1790646817-full_auto, 2026-09-29,
+        // #178), lined up on 13 with no traffic, 293 at 7.3 was 6.9 kt down
+        // 13, over the 5 kt of STATED_RUNWAY_TAILWIND_KTS, and the circuit
+        // was cleared on 30 across the field. Once given, the strip is HELD
+        // for the start's later calls (`start_strip`): 30's 14 kt better
+        // headwind would win the wind pick's hysteresis on the ready call.
+        let start_ok = |st: &Self, ident: &str| {
+            let into_stream = [arrival_end, departure_end]
+                .into_iter()
+                .flatten()
+                .any(|end| ends_oppose(&st.apt.runways, end, ident));
+            let hw = nav::headwind_for(&st.apt.runways, ident, wind_from, wind_kts);
+            let best = nav::best_runway_for_wind(&st.apt.runways, wind_from, wind_kts);
+            !into_stream
+                && runway_stands_within(
+                    &st.apt.runways,
+                    ident,
+                    hw,
+                    best,
+                    wind_from,
+                    wind_kts,
+                    ON_STRIP_TAILWIND_KTS,
+                )
+        };
         if std::mem::take(&mut self.stated_on_strip) && !self.runway_committed() {
             if let Some(ident) = self.stated_ident() {
-                let into_stream = [arrival_end, departure_end]
-                    .into_iter()
-                    .flatten()
-                    .any(|end| ends_oppose(&self.apt.runways, end, &ident));
-                let hw = nav::headwind_for(&self.apt.runways, &ident, wind_from, wind_kts);
-                let best = nav::best_runway_for_wind(&self.apt.runways, wind_from, wind_kts);
-                if !into_stream
-                    && stated_runway_stands(&self.apt.runways, &ident, hw, best, wind_from, wind_kts)
-                {
+                if start_ok(self, &ident) {
                     self.stated_runway = None;
                     self.runway_in_use = Some(ident.clone());
+                    self.start_strip = Some(ident.clone());
                     return ident;
                 }
+            }
+        }
+        if let Some(held) = self.start_strip.take() {
+            let restated = self
+                .stated_runway
+                .as_deref()
+                .is_some_and(|s| !tower::runway_matches(&held, s));
+            if !restated
+                && self.runway_in_use.as_deref() == Some(held.as_str())
+                && start_ok(self, &held)
+            {
+                self.stated_runway = None;
+                self.start_strip = Some(held.clone());
+                return held;
             }
         }
         if wind_kts < CALM_WIND_KTS && self.runway_in_use.is_none() {
@@ -2227,8 +2266,10 @@ impl Station {
         let on_ground = xp.get_float(datarefs::ON_GROUND_ANY).await.unwrap_or(0.0) > 0.5;
         // An IFR clearance's runway is held for its departure only: airborne
         // it has been flown (or abandoned), and the pick is free again.
+        // So is a runway start's strip (`start_strip`).
         if !on_ground {
             self.ifr_runway = None;
+            self.start_strip = None;
         }
         // The wind a tower reads out and picks its runway by is the wind ON
         // THE FIELD. The sim's wind datarefs are the air the aircraft is in:
@@ -6772,6 +6813,34 @@ fn stated_runway_stands(
     wind_from: f64,
     wind_kts: f64,
 ) -> bool {
+    runway_stands_within(
+        runways,
+        ident,
+        hw,
+        best,
+        wind_from,
+        wind_kts,
+        STATED_RUNWAY_TAILWIND_KTS,
+    )
+}
+
+/// The tailwind a RUNWAY START's own strip may carry and still be given it:
+/// a pilot lined up and asking for the runway under him takes a tailwind
+/// within the common transport limit of 10 kt, as a controller with nothing
+/// else on the field approves a pilot's request (#178). A stream on the
+/// other end still wins.
+const ON_STRIP_TAILWIND_KTS: f64 = 10.0;
+
+/// [`stated_runway_stands`] with its tailwind limit.
+fn runway_stands_within(
+    runways: &[nav::Runway],
+    ident: &str,
+    hw: Option<f64>,
+    best: Option<(String, f64, f64)>,
+    wind_from: f64,
+    wind_kts: f64,
+    tailwind_kts: f64,
+) -> bool {
     let (Some(hw), Some((_, best_hdg, best_hw))) = (hw, best) else {
         return false;
     };
@@ -6795,7 +6864,7 @@ fn stated_runway_stands(
     let Some(stated_hdg) = stated_hdg else {
         return false;
     };
-    hw >= -STATED_RUNWAY_TAILWIND_KTS
+    hw >= -tailwind_kts
         && crosswind(stated_hdg) <= crosswind(best_hdg) + RUNWAY_SWAP_MARGIN_KTS
 }
 
@@ -7583,7 +7652,7 @@ pub(crate) fn plan_vacate_from(
 
 /// The other end of the same strip: "09L" -> "27R", "36" -> "18". `None` when
 /// the ident isn't a runway designator we can turn around.
-fn reciprocal_end(id: &str) -> Option<String> {
+pub fn reciprocal_end(id: &str) -> Option<String> {
     let digits: String = id.chars().take_while(|c| c.is_ascii_digit()).collect();
     let side: String = id[digits.len()..].to_string();
     let n: u32 = digits.parse().ok()?;
@@ -12344,6 +12413,7 @@ mod tests {
             runway_in_use: None,
             stated_runway: None,
             stated_on_strip: false,
+            start_strip: None,
             told_runway: None,
             runway_request: None,
             requested_ident: None,
@@ -14204,6 +14274,66 @@ mod tests {
         // No live traffic: #134's rule alone, the start stands.
         let mut st = start(on31, along(0.99));
         assert_eq!(st.pick_runway_with(342.6, 2.9, None, None), "31");
+    }
+
+    /// Issue #178, sortie 1790646817-full_auto (LEMG, 2026-09-29): an A330
+    /// lined up on 13 at (36.68418, -4.51210), no traffic, the tower's wind
+    /// 293 at 7.3 (6.9 kt down 13), asked "request clearance, runway one
+    /// three, for circuits" and was cleared on 30 (`stated_runway_refused`
+    /// best 30). A start's own strip carries a tailwind to 10 kt, and holds
+    /// for the start's later calls against the wind pick's hysteresis.
+    #[test]
+    fn a_runway_start_keeps_its_strip_in_a_light_tailwind() {
+        let _guard = SIDE_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        *CLEARANCE.lock().unwrap() = None;
+        let (lat, lon) = (36.684182150183844, -4.512099772280839);
+        let words = "delta alpha india kilo november heavy, request clearance, runway one \
+                     three, for circuits";
+        let station = || {
+            let mut st = lxgb();
+            st.apt.name = "Malaga".into();
+            st.apt.runways = lemg_runways();
+            st.note_stated_runway(words, tower::parse_intent(words));
+            st.note_caller_on_strip(true, lat, lon);
+            st
+        };
+        let (from, kts) = (292.9542, 7.2747811592147995);
+        let mut st = station();
+        assert_eq!(st.pick_runway_with(from, kts, None, None), "13");
+        // The ready call names no runway: the start keeps 13, where the
+        // hysteresis alone would take 30's 14 kt better headwind.
+        assert_eq!(st.pick_runway_with(from, kts, None, None), "13");
+        assert_eq!(st.pick_runway_with(from, kts, None, None), "13");
+        // Airborne, the hold is gone and the wind picks again.
+        let wx = Wx {
+            wind_from_deg: from,
+            wind_kts: kts,
+        };
+        let c = scripted_ctx(&mut st, wx);
+        assert!(!c.on_ground);
+        st.state_runway_change(&tower::Intent::ReportDownwind, &c, "x".into());
+        assert_eq!(st.pick_runway_with(from, kts, None, None), "30");
+        // Not on the strip: the arrival's 5 kt rule, refused as before.
+        let mut st = station();
+        st.stated_on_strip = false;
+        assert_eq!(st.pick_runway_with(from, kts, None, None), "30");
+        // A real tailwind still wins: 310 at 12 down 13.
+        let mut st = station();
+        assert_ne!(st.pick_runway_with(310.0, 12.0, None, None), "13");
+        // A stream on the reciprocal ends the hold (the wind picks 30).
+        let mut st = station();
+        assert_eq!(st.pick_runway_with(from, kts, None, None), "13");
+        assert_ne!(st.pick_runway_with(from, kts, Some("31"), None), "13");
+        assert_eq!(st.start_strip, None);
+        // The clearance the crew reads names 13.
+        let mut st = station();
+        assert_eq!(st.pick_runway_with(from, kts, None, None), "13");
+        let mut ctx = scripted_ctx(&mut st, wx);
+        ctx.on_ground = true;
+        ctx.own_on_runway = true;
+        let r = st.route_keyed(words, Service::Tower, &ctx, wx);
+        assert!(r.contains("runway one three, circuit height"), "{r}");
+        *CLEARANCE.lock().unwrap() = None;
     }
 
     /// Issue #178, the recorded sortie: LEMG (1790631369-full_auto,
