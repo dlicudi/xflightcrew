@@ -102,6 +102,10 @@ reference:
   rotate_rate_deg_s: 5.0
   best_glide_kts: 88.0
   vs0_kts: 60.0
+  # POH final with full flap: 80 KIAS. Undeclared, the autoland fell back
+  # to 1.3 x the CLEAN stall (91) and floated and bounced every landing
+  # (LEMG 13, 2026-09-29).
+  approach_kts: 80.0
   max_crosswind_kts: 21.0
   cruise_kts: 180.0          # normal cruise (manual lists 213 KTAS max)
   best_climb_fpm: 1200.0

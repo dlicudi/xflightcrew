@@ -4267,6 +4267,43 @@ mod tests {
     /// A330 cleaned up "above 230" out of a CONF 1 whose Vfe is 215, so the
     /// clean-up could never legally happen and never did: flap 1 rode the
     /// climb to 330 kt (EGPH, 2026-09-20).
+    /// Every fixed-wing profile declares its landing approach speed, and it
+    /// sits where a crew flies one: 1.1 to 1.7 times its landing stall (a
+    /// jet's Vref is about 1.15 to 1.23; the
+    /// light singles' POH finals run 1.5 to 1.6: the 172SP's 65 on a Vso of
+    /// 40, the RV-10's 80 on 50).
+    /// Undeclared, the SR22 fell back to 1.3 x its CLEAN stall (91 against the
+    /// POH's 80) and floated and bounced every landing (LEMG 13, 2026-09-29).
+    #[test]
+    fn every_aeroplane_declares_a_landing_speed_near_its_landing_stall() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("profiles");
+        let mut checked = 0;
+        for e in std::fs::read_dir(dir).unwrap().flatten() {
+            let path = e.path();
+            if path.extension().is_none_or(|x| x != "yaml") {
+                continue;
+            }
+            let text = std::fs::read_to_string(&path).unwrap();
+            let Ok(profile) = serde_yaml::from_str::<AircraftProfile>(&text) else {
+                continue;
+            };
+            let name = path.file_stem().unwrap().to_string_lossy().to_string();
+            // Rotorcraft have no landing speed.
+            if profile.vs_clean_kts.is_none() && profile.flaps.is_none() {
+                continue;
+            }
+            let r = profile.reference.as_ref();
+            let app = r.and_then(|r| r.approach_kts);
+            assert!(app.is_some(), "{name}: no reference approach_kts");
+            if let Some(vso) = r.and_then(|r| r.vs0_kts) {
+                let k = app.unwrap() / vso;
+                assert!((1.1..=1.7).contains(&k), "{name}: approach {app:?} is {k:.2} x Vso {vso}");
+            }
+            checked += 1;
+        }
+        assert!(checked >= 10, "{checked}");
+    }
+
     #[test]
     fn every_profiles_flap_schedule_can_be_flown_inside_its_placards() {
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("profiles");

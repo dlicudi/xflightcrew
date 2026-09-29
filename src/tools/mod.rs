@@ -283,12 +283,21 @@ impl Registry {
                 stall_speed_kts: vs,
             }));
             // Native emergency autoland — needs the AP for approach guidance. Prefer
-            // the airframe's real approach speed; fall back to ~1.3×Vs.
+            // the airframe's real approach speed; else the rule the generic
+            // profile uses, max(1.3 Vso, 1.2 Vs): the LANDING configuration's
+            // stall, not 1.3 times the clean one (the SR22, declaring none,
+            // flew its finals at 90 to 92 KIAS against the POH's 80, floated and
+            // bounced three times, LEMG 13 2026-09-29).
             let approach_ias = profile
                 .reference
                 .as_ref()
                 .and_then(|r| r.approach_kts)
-                .unwrap_or((vs * 1.3).max(70.0));
+                .unwrap_or_else(|| {
+                    fallback_approach_kts(
+                        profile.reference.as_ref().and_then(|r| r.vs0_kts),
+                        vs,
+                    )
+                });
             tools.push(Box::new(autoland::Autoland {
                 cfg: ap.clone(),
                 approach_ias,
@@ -857,8 +866,24 @@ pub struct ToolCall {
     pub arguments: Value,
 }
 
+/// The approach speed an airframe that declares none flies: max(1.3 Vso,
+/// 1.2 Vs), as `aircraft::generic_from_acf` sets it, and never under 70.
+pub(crate) fn fallback_approach_kts(vs0_kts: Option<f64>, vs_clean_kts: f64) -> f64 {
+    let by_vso = vs0_kts.filter(|v| v.is_finite() && *v > 0.0).map_or(0.0, |v| v * 1.3);
+    by_vso.max(vs_clean_kts * 1.2).max(70.0).round()
+}
+
 #[cfg(test)]
 mod departure_lights_tests {
+    /// An airframe declaring no approach speed flies max(1.3 Vso, 1.2 Vs):
+    /// the SR22's would have been 84, not the 91 of 1.3 x its clean stall.
+    #[test]
+    fn the_fallback_approach_is_the_landing_stalls() {
+        assert_eq!(super::fallback_approach_kts(Some(60.0), 70.0), 84.0);
+        assert_eq!(super::fallback_approach_kts(Some(114.0), 139.0), 167.0);
+        assert_eq!(super::fallback_approach_kts(None, 48.0), 70.0);
+    }
+
     /// Full auto flew DARK — no beacon, no nav, no taxi light, no strobes, no
     /// landing lights — while the arrival explicitly switched strobes, taxi
     /// and landing off at the stand. Turning off what was never turned on is
