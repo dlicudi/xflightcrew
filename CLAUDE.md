@@ -967,8 +967,13 @@ physical drive.
   `final_command`).
 - **The climb is checked at the arm** (`heli_route::climb_conflict`): a climb into a ridge crashed
   one (LILO-LILB 2026-09-24). `fast_climb` only where the ground allows.
-- **Below 50 kt collective is not a speed control**: approach and slow-down floor it
-  (`APPROACH_COLLECTIVE_MIN`); the hover loop takes over once slowed, whatever the height.
+- **Below 50 kt collective is not a speed control**: the approach floors it
+  (`APPROACH_COLLECTIVE_MIN`); the slow-down lowers it under level power (`SlowLaw`, to
+  `SLOW_COLLECTIVE_MIN`, the AP holding altitude raises the nose) on a groundspeed schedule
+  planned from where the pad can be made (`ApproachPath`, `SLOW_DECEL_KTS_S`); a slow-down
+  that cannot make it goes around on a fixed bug, bounded, never orbits (`slow_check`; LXGB
+  S-76 orbited 26 min at the 0.35 floor = level power at 78 kt, #191); the hover loop takes
+  over once slowed, whatever the height.
 - No helipad: the runway end nearest the arrival (`runway_spot`). A hover taxi off a runway is said
   and waits for "my controls". Parking brake only when stopped (`touchdown_brake_due`).
 - **Parking is the aeroplanes' tool** (`taxi_to_parking`); only the drive differs
