@@ -1,0 +1,20 @@
+# iMac types, short (2026-09-29): the Citation X's cold-APU start (#52) is
+# judged at the start (turbine_start crank verdicts, lit engines), then the
+# deadline types "my controls" on the ground; the Lancair's untowered LILB
+# departure and circuit (#45).
+after: stop
+cases:
+  - name: "Citation X LEMG cold gate, the start (#52)"
+    setup:
+      aircraft: "Aircraft/Laminar Research/Cessna Citation X/Cessna_CitationX.acf"
+      ramp: { field: LEMG }
+    command: fly a circuit
+    deadline_min: 10
+    traffic: off
+
+  - name: "Lancair Evolution LILB circuit from the ramp, untowered (#45)"
+    setup:
+      aircraft: "Aircraft/Laminar Research/Lancair Evolution/N844X.acf"
+      ramp: { field: LILB }
+    command: fly a circuit
+    deadline_min: 35
