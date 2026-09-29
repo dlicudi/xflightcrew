@@ -108,6 +108,11 @@ pub struct Case {
     pub expect_give_up: Option<String>,
     /// See [`After`]; the spec's when `None`.
     pub after: Option<After>,
+    /// `traffic: off` hides LiveTraffic's aircraft for the case (a tower
+    /// holding or ordering a go-around for them cost about 25 min on
+    /// 2026-09-28 in cases that did not test ATC); any other case shows
+    /// them, and the run's end puts them back.
+    pub traffic: Option<bool>,
 }
 
 /// `setup.aircraft: plan`: the SimBrief plan's type, the installed `.acf`
@@ -147,6 +152,27 @@ struct CaseRaw {
     expect_give_up: Option<String>,
     #[serde(default)]
     after: Option<After>,
+    #[serde(default, deserialize_with = "on_off")]
+    traffic: Option<bool>,
+}
+
+/// `on`/`off` (or a YAML bool) for a switch.
+fn on_off<'de, D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Option<bool>, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum V {
+        B(bool),
+        S(String),
+    }
+    match Option::<V>::deserialize(d)? {
+        None => Ok(None),
+        Some(V::B(b)) => Ok(Some(b)),
+        Some(V::S(s)) => match s.trim().to_ascii_lowercase().as_str() {
+            "on" => Ok(Some(true)),
+            "off" => Ok(Some(false)),
+            o => Err(serde::de::Error::custom(format!("traffic is on or off, not {o}"))),
+        },
+    }
 }
 
 impl TryFrom<CaseRaw> for Case {
@@ -175,6 +201,7 @@ impl TryFrom<CaseRaw> for Case {
             settle_s: c.settle_s,
             expect_give_up: c.expect_give_up,
             after: c.after,
+            traffic: c.traffic,
         })
     }
 }
@@ -848,6 +875,26 @@ fn record_sim_speed(
 
 /// The sim at 1x, read first: before a setup, at a run's end, on Ctrl-C.
 /// An unreadable multiplier is written anyway. Returns whether it reads 1.
+/// LiveTraffic's own display switch; an unread one (no LiveTraffic) is left
+/// alone. Blackboxed `sortie_runner` `traffic`.
+const TRAFFIC_SHOWN: &str = "livetraffic/cfg/aircrafts_displayed";
+
+async fn set_traffic(sim: &dyn RunnerSim, on: bool) {
+    let Ok(now) = sim.read(TRAFFIC_SHOWN).await else {
+        return;
+    };
+    if (now > 0.5) == on {
+        return;
+    }
+    let wrote = sim.write_float(TRAFFIC_SHOWN, if on { 1.0 } else { 0.0 }).await;
+    let read = sim.read(TRAFFIC_SHOWN).await.ok();
+    crate::blackbox::record(
+        "sortie_runner",
+        serde_json::json!({"event": "traffic", "on": on, "read_back": read,
+                           "error": wrote.err().map(|e| e.to_string())}),
+    );
+}
+
 async fn ensure_real_time(sim: &dyn RunnerSim, reason: &str) -> bool {
     if sim.read(SIM_SPEED).await.ok() == Some(1.0) {
         return true;
@@ -3224,9 +3271,18 @@ pub async fn run_all(
     on_row: &mut (dyn FnMut(&Row) + Send),
 ) -> Vec<Row> {
     let mut rows: Vec<Row> = Vec::new();
+    // What the runner last set LiveTraffic to: shown, as found. Only a case
+    // that wants otherwise touches it, so a spec without `traffic` reads
+    // and writes nothing.
+    let mut traffic_shown = true;
     'run: for case in &spec.cases {
         for rep in 1..=repeat.max(1) {
             let t0 = now_s();
+            let want = case.traffic.unwrap_or(true);
+            if want != traffic_shown {
+                set_traffic(sim, want).await;
+                traffic_shown = want;
+            }
             let left_flying = rows.last().is_some_and(|r| r.verdict.left_flying);
             let stop_now = rows.last().is_some_and(|r| r.verdict.stop_owed);
             let verdict =
@@ -3244,6 +3300,9 @@ pub async fn run_all(
                 break 'run;
             }
         }
+    }
+    if !traffic_shown {
+        set_traffic(sim, true).await;
     }
     if !ensure_real_time(sim, "the run ended").await {
         eprintln!("sim_speed did not read back 1 at the run's end: check it");
@@ -4229,6 +4288,22 @@ mod tests {
     }
 
     #[test]
+    fn traffic_is_a_switch_per_case() {
+        let spec = parse_spec(
+            "cases: [{name: a, setup: {approach: {field: LEMG, runway: 13}}, traffic: off},\n\
+             {name: b, setup: {approach: {field: LEMG, runway: 13}}, traffic: on},\n\
+             {name: c, setup: {approach: {field: LEMG, runway: 13}}}]",
+        )
+        .unwrap();
+        let t: Vec<_> = spec.cases.iter().map(|c| c.traffic).collect();
+        assert_eq!(t, vec![Some(false), Some(true), None]);
+        let bad = parse_spec(
+            "cases: [{name: a, setup: {approach: {field: LEMG, runway: 13}}, traffic: dim}]",
+        );
+        assert!(bad.is_err());
+    }
+
+    #[test]
     fn a_bad_spec_is_refused_naming_the_case() {
         let cases = [
             ("cases: []", "no cases"),
@@ -5180,6 +5255,7 @@ mod tests {
             settle_s: None,
             expect_give_up: None,
             after: None,
+            traffic: None,
         };
         let ok = resolve_case(&case(EnroutePoint::BeforeTod(30.0)), &facts, &find).unwrap();
         assert_eq!(

@@ -10465,3 +10465,13 @@ set spoilers and autobrake at +459.3; `flow::landing_config_for` waits for
 `a_committed_flare_stays_committed`, `the_a330_arrest_wings_do_not_ring`,
 `the_a330_governor_catches_the_level_off`, `an_automations_landing_config_is_autolands`. Offline
 only.
+
+## 2026-09-29: the runner hides live traffic where ATC is not under test
+
+Tonight's cases lost about 25 minutes to LiveTraffic aircraft in cases that did not test ATC: the SF50
+LEMG final ordered round for traffic on the runway (about 12 min), the A330 final likewise (about 8),
+the 737 reject held for a lander on 12. A case may now say `traffic: off`: the runner writes
+`livetraffic/cfg/aircrafts_displayed` 0 before its setup (blackbox `sortie_runner` `traffic`), only
+when a case wants a change from what it last set, and shows the traffic again at the run's end; a spec
+without `traffic` reads and writes nothing (its fake-sim tests unchanged). Test
+traffic_is_a_switch_per_case.

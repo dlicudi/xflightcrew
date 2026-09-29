@@ -1112,7 +1112,7 @@ confirms it closes it (`fixes #N` in the commit). Known gaps are `owed` issues.
   `STOP_RETYPE_S` (a full-auto landing's taxi-in held the next setup 113 to 306 s, #168).
   A case scripts `steps` (`say` at `start`, `after_s`, `ias_above`, `agl_above`, `phase`, `event`),
   loads `setup.aircraft` (waits for its `profile_probe`), reads `plan_origin` / `runway: plan` from
-  SimBrief, and may `expect_give_up`; `runway: wind` is the tower's into-wind end at the setup (`resolve_wind`, METAR else
+  SimBrief, may `expect_give_up`, and `traffic: off` hides LiveTraffic's aircraft for a case that is not about ATC (`livetraffic/cfg/aircrafts_displayed`, touched only when a case wants a change, shown again at the run's end); `runway: wind` is the tower's into-wind end at the setup (`resolve_wind`, METAR else
   the sim's wind on the field); an unset deadline scales with the approach speed; **a reposition or
   swap is a new flight to the scorer** (`Scorer::new_flight`); specs `bench/sorties/backlog-737.yaml`, `backlog-types.yaml`.
   **An arrival case starts IN THE AIR on the plan** (`setup: {enroute: {at: fix | before_tod_nm |
