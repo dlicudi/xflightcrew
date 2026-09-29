@@ -11273,3 +11273,46 @@ to the plant's 60 kt stall. The 09-28 flare tests now pin the 90 kt law they wer
 Next SR22 landings: `touch_hold` once, `ias` at it 60 to 68, `sink_fpm` under 250, `bounce_ft`
 under 1.5, no `bounce` spell over 1.5 ft; `power` `retard` from 20 ft to idle by about 10; if it
 floats long or stalls in, `hold_off_ft` and `touchdown_fpm` are the knobs. Offline only.
+
+## 2026-09-29: a castoring nose lines up POINTING down the runway (#46, #45)
+
+iMac 2026-09-29, 19 fps (taxi tick 0.3 to 0.5 s). The line-up finished its position but not its
+heading, and the roll began crooked:
+- **1790690995 (SR22, LEMG 12)**: the drive arrived 5.0 degrees off its final bearing, still yawing
+  left at 1.7 deg/s at 2.1 kt, said "Lined up" and stopped at 107 true on a 117.7 runway. The roll
+  began 10.8 off (alignment FAIL), the aligning pivot (full brake from 15 degrees on the error
+  alone, let go only past 15 deg/s) swung it to -11.6 at 17.5 deg/s while the time ramp took the
+  lever from 0.3 to 0.5, then +/-12 degrees from 4 to 18 kt.
+- **1790712974 (Evolution, LILB 03)**: the backtrack's turn-round ended 11.8 off (10.9 true on 24);
+  then the heading bug's knob slew ran 4.7 s AFTER "Brakes released", nothing steering, and the idle
+  PT6 swung it to 0.6 true at 2.6 kt. The roll began 24.6 off, swung through to -4.4 at 21.6 deg/s
+  and was rejected 9.1 m off. Runway starts roll 0.3 to 0.5 off: the fault is the line-up's end.
+
+The fix (castoring or `brake_steer` airframes only; nosewheel-steering airframes and jets fly the
+same code as before, except the bug preset, below):
+- **The aligning pivot is a PD on the sim's `R`** (`autotaxi::align_pivot_brakes`: led 2.0 s,
+  the whole 0.45 of brake at 40 degrees of led error, never pushing a turn past 6 deg/s; the led
+  error of the other sign is the opposite brake). Tuned on a second-order yaw plant with a 0.3 s
+  brake delay fitted to the two records (`autotaxi::yaw_plant`; the old law on it at 0.42 s swings
+  +/-13 at 19 deg/s): from 10.8 and 24.6 over ticks of 0.3 to 0.5 s and four plants it settles
+  inside 2 degrees and swings at most 2.5 through. The roll's `roll_brake_split_aligning` uses it.
+- **The line-up ends stopped and aligned** (`autotaxi::LineUpAlign`, `Route.align_course_deg`, set
+  by the plain line-up and the backtrack's leg two): at the arrival the nose is brought round on
+  the brakes with the governor at a 2 kt creep, stopped, and judged stopped (under 0.5 kt and 0.7
+  deg/s) within 2 degrees of the runway's course; again if the stop swung it; bounded by 40 s and
+  40 m rolled, else "On the runway, but N degrees off its heading and I couldn't straighten us"
+  instead of "Lined up". Blackbox `autotaxi` `line_up_align` per tick, `line_up_aligned` (`ok`,
+  `err_deg`, `creeps`, `secs`); the scorecard's `line_up` stage carries `aligned_err_deg` and fails
+  a stop left crooked.
+- **The roll's power waits for the nose** (`autotakeoff::RollAlign`): below 6 kt, more than 2
+  degrees off or swinging past 3 deg/s, the lever stays at 0.3 and the ramp and the stagnation clock
+  wait; straight, it never holds again; 20 s crooked is a reject at walking pace, said ("I can't
+  straighten us on the runway"). Blackbox `roll_aligned` / `not_aligned`, roll ticks `align_hold`.
+- **The heading bug is preset before the governor stands down** (every airframe): the aircraft
+  is held on the brakes while the knob slews, never rolling free before the roll.
+
+Next castoring-nose line-ups (SR22, Evolution, RV-10, SF50): `line_up_aligned` `ok` true with
+`err_deg` inside 2 and `secs` under 20; the roll's first tick `err` inside 3 (alignment PASS);
+`roll_aligned` at once or within a few seconds; no `bl`/`br` alternation at 0.45 from 4 to 18 kt.
+If `line_up_align` ticks show `creep` with no yaw building, the governor's breakaway is the knob.
+Offline only.

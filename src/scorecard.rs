@@ -147,6 +147,8 @@ struct Taxi {
     capture_secs: Option<f64>,
     past_end_ticks: usize,
     sortie: Option<String>,
+    /// A line-up's alignment verdict (`line_up_aligned`): ok, degrees off.
+    aligned: Option<(bool, f64)>,
 }
 
 /// A corner of the route the drive is turning through.
@@ -428,6 +430,15 @@ impl Scorer {
             // The backtrack's turn is the line-up's second leg.
             ("autotaxi", "line_up_path" | "backtrack_turn") => self.line_up_next = true,
             ("autotaxi", "drive") => self.taxi_tick(r, t),
+            // The line-up's pivot onto the runway's course (#46): its
+            // verdict is the drive's, judged at the holding point.
+            ("autotaxi", "line_up_aligned") => {
+                if let (Some(x), Some(ok)) =
+                    (self.taxi.as_mut(), r.get("ok").and_then(Value::as_bool))
+                {
+                    x.aligned = Some((ok, f(r, "err_deg").unwrap_or(0.0)));
+                }
+            }
             ("autotaxi", "holding_point") => self.close_taxi(event, &mut out),
             ("autotaxi", e) if TAXI_FAILURES.contains(&e) => {
                 // A drive replaced by the next one was not stopped short.
@@ -748,6 +759,9 @@ impl Scorer {
         if x.brake_rate > TAXI_MAX_BRAKE_RATE {
             fails.push(format!("brake moved {:.1}/s", x.brake_rate));
         }
+        if let Some((false, e)) = x.aligned {
+            fails.push(format!("stopped {:.0} degrees off the runway", e.abs()));
+        }
         let stage = if x.line_up { "line_up" } else { "taxi" };
         let sortie = x.sortie.clone();
         self.push(stage, sortie, fails, json!({
@@ -757,6 +771,7 @@ impl Scorer {
             "yaw_swings": x.yaw_swings, "end_err_deg": r1(x.last_err),
             "end_lat_m": r1(x.last_lat), "ended_by": x.ended_by,
             "capture_secs": x.capture_secs.map(r1), "past_end_ticks": x.past_end_ticks,
+            "aligned_err_deg": x.aligned.map(|a| r1(a.1)),
         }), out);
     }
 

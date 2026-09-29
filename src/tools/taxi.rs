@@ -435,6 +435,9 @@ impl Tool for LineUp {
             );
         };
         route.pace = self.pace;
+        // A plain line-up ends pointing down the runway (a backtrack's leg
+        // two carries its own).
+        route.align_course_deg = (!backtracking).then_some(rwy.course_deg);
         route.done_line = Some(if backtracking {
             "At the numbers. Coming around.".to_string()
         } else {

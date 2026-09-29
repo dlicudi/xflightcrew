@@ -1283,30 +1283,112 @@ pub fn roll_brake_split(steer: f64, gs_kts: f64) -> (f64, f64) {
 }
 
 /// [`roll_brake_split`], plus the start of a roll that begins crooked: below
-/// [`ROLL_ALIGN_KTS`] a heading error past [`ROLL_ALIGN_ERR_DEG`] pivots on
-/// the inside brake in proportion to the ERROR, not the roll law's steer,
-/// whose deflection is capped tiny at walking pace (prop wash) and whose brake
-/// split has no authority under 2 kt. LIME 28 (2026-09-25): the Evolution
-/// started its roll 21 degrees off the runway, the steer sat at 0.17 with no
-/// brake at all, the error grew to 30 at 6 kt and the pilot's pedals ended
-/// it. The pivot's own yaw-rate ceiling applies, so it cannot spin.
+/// [`ROLL_ALIGN_KTS`] a heading error past [`ROLL_ALIGN_ERR_DEG`], or a swing
+/// past [`crate::autotaxi::ALIGN_RATE_MAX_DPS`], is the aligning pivot's
+/// ([`crate::autotaxi::align_pivot_brakes`]): the roll law's steer is capped
+/// tiny at walking pace (prop wash) and its brake split has no authority
+/// under 2 kt. LIME 28 (2026-09-25): the Evolution started its roll 21
+/// degrees off the runway, the steer sat at 0.17 with no brake at all, the
+/// error grew to 30 at 6 kt and the pilot's pedals ended it.
+///
+/// The pivot was full brake from 15 degrees on the error alone, capped only
+/// past 15 deg/s, and at the iMac's 0.3 to 0.45 s tick it pirouetted: the
+/// SR22 at LEMG 12 (1790690995, 2026-09-29) from 10.8 off to -11.6 at 17.5
+/// deg/s, then +/-12 degrees from 4 to 18 kt; the Evolution at LILB 03
+/// (1790712974) from 24.6 off through -4.4 at 21.6 deg/s. Now the PD led on
+/// `yaw_dps` (the sim's `R` where read), which catches the swing with the
+/// opposite brake before it overshoots.
 pub fn roll_brake_split_aligning(steer: f64, gs_kts: f64, err_deg: f64, yaw_dps: f64) -> (f64, f64) {
     let (l, r) = roll_brake_split(steer, gs_kts);
-    if gs_kts >= ROLL_ALIGN_KTS || err_deg.abs() <= ROLL_ALIGN_ERR_DEG {
+    if gs_kts >= ROLL_ALIGN_KTS
+        || (err_deg.abs() <= ROLL_ALIGN_ERR_DEG
+            && yaw_dps.abs() <= crate::autotaxi::ALIGN_RATE_MAX_DPS)
+    {
         return (l, r);
     }
-    let want = (err_deg / ROLL_ALIGN_FULL_DEG).clamp(-1.0, 1.0);
-    // Full pivot authority from a standstill: power is coming up behind it.
-    let (pl, pr) = crate::autotaxi::pivot_brake_split(want, gs_kts.max(2.0));
-    let k = crate::autotaxi::pivot_rate_scale(want, yaw_dps);
-    (l.max(pl * k), r.max(pr * k))
+    crate::autotaxi::align_pivot_brakes(err_deg, yaw_dps)
 }
 /// The aligning pivot works below this groundspeed...
 const ROLL_ALIGN_KTS: f64 = 15.0;
-/// ...on a heading error past this...
-const ROLL_ALIGN_ERR_DEG: f64 = 3.0;
-/// ...at full pivot brake from this error.
-const ROLL_ALIGN_FULL_DEG: f64 = 15.0;
+/// ...on a heading error past this: the aligned band itself, since the
+/// power waits until the nose is inside it ([`RollAlign`]); at 3 a nose
+/// held 2 to 3 off had no brake and no power to come round.
+const ROLL_ALIGN_ERR_DEG: f64 = crate::autotaxi::ALIGNED_DEG;
+
+/// The roll's power waits for the nose on a brake-steered airframe
+/// ([`RollAlign`]): below this groundspeed...
+const ROLL_ALIGN_HOLD_KTS: f64 = 6.0;
+/// ...while the nose is more than [`crate::autotaxi::ALIGNED_DEG`] off, or
+/// swinging faster than this, the lever stays at [`ROLL_PIVOT_THR`] and the
+/// ramp and the stagnation clock wait...
+const ROLL_ALIGNED_DPS: f64 = 3.0;
+/// ...the pivot's power (the ramp's own first step)...
+const ROLL_PIVOT_THR: f64 = 0.3;
+/// ...and for no longer than this: a nose that will not come round is a
+/// reject at walking pace, said.
+pub const ROLL_ALIGN_MAX_S: f64 = 20.0;
+
+/// Whether the roll's power may come up: a castoring nose that starts its
+/// roll crooked is pivoted straight at the pivot's power FIRST, then rolled.
+/// The time ramp ran the lever from 0.3 to 0.5 while the nose was still
+/// coming round, and the power drove the pirouette (LEMG 12 SR22 and LILB 03
+/// Evolution, 2026-09-29: 10.8 and 24.6 degrees off at the first tick,
+/// swinging +/-12 and through 29 degrees at 0.41 to 0.59 of lever). Once
+/// straight (or rolling past [`ROLL_ALIGN_HOLD_KTS`]) it never holds again:
+/// a gust-yaw at speed is the roll law's. Pure.
+#[derive(Debug, Default, Clone)]
+pub struct RollAlign {
+    held_s: f64,
+    done: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum RollAlignState {
+    /// Power at the pivot's, the ramp waiting.
+    Hold,
+    /// Straight (or rolling): the roll's own power.
+    Go,
+    /// [`ROLL_ALIGN_MAX_S`] held and still crooked.
+    Failed,
+}
+
+impl RollAlign {
+    pub fn step(&mut self, err_deg: f64, yaw_dps: f64, gs_kts: f64, dt: f64) -> RollAlignState {
+        if self.done {
+            return RollAlignState::Go;
+        }
+        if gs_kts >= ROLL_ALIGN_HOLD_KTS
+            || (err_deg.abs() <= crate::autotaxi::ALIGNED_DEG && yaw_dps.abs() <= ROLL_ALIGNED_DPS)
+        {
+            self.done = true;
+            return RollAlignState::Go;
+        }
+        self.held_s += dt.max(0.0);
+        if self.held_s > ROLL_ALIGN_MAX_S {
+            return RollAlignState::Failed;
+        }
+        RollAlignState::Hold
+    }
+
+    /// Seconds the power has waited for the nose.
+    pub fn held_s(&self) -> f64 {
+        self.held_s
+    }
+
+    /// Whether it has let the power come up.
+    pub fn done(&self) -> bool {
+        self.done
+    }
+}
+
+/// The lever while [`RollAlign`] holds: never over the pivot's.
+pub fn aligning_throttle(want: f64, holding: bool) -> f64 {
+    if holding {
+        want.min(ROLL_PIVOT_THR)
+    } else {
+        want
+    }
+}
 
 /// Full brake-steering authority on the roll below this groundspeed...
 const ROLL_BRAKE_FULL_KTS: f64 = 20.0;
@@ -3265,6 +3347,17 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, p: Params) {
     // (first sortie it braked against the roll, second it let a refused
     // takeoff roll away — both LXGB, 2026-07-20). Its loop exits within a
     // tick; the moment of free-wheeling is the throttle ramp's first beat.
+    // The heading bug is preset HERE, while the governor still holds the
+    // aircraft on its brakes: the knob slews by presses, one round trip a
+    // degree, and preset after "Brakes released" the Evolution stood 4.7 s
+    // with its brakes off and nothing steering, idling from 10.6 to 0.6
+    // true before the roll's first tick (LILB 03, 1790712974, 2026-09-29).
+    let _ = crate::tools::autopilot::drive_heading_bug_step(
+        &xp,
+        true_to_mag(rwy.course_deg, var),
+        360.0,
+    )
+    .await;
     crate::tools::speedhold::ACTIVE.store(false, Ordering::Relaxed);
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     // The line-up ends "brakes set" — the parking-brake ratio latched. It
@@ -3317,20 +3410,14 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, p: Params) {
         ),
     );
 
-    // Pre-set the flight director and heading bug NOW, parked: the bug
-    // slews by knob presses (one HTTP round trip per degree), and doing
-    // that later would stall the loop while the steer channel expires
-    // mid-roll. No VS dial preset — VS-mode engage syncs the dial to the
-    // current rate anyway, so it's written after the engage instead.
+    // Pre-set the flight director NOW (the heading bug was preset before
+    // the brakes came off, above): doing it later would stall the loop
+    // while the steer channel expires mid-roll. No VS dial preset: VS-mode
+    // engage syncs the dial to the current rate anyway, so it's written
+    // after the engage instead.
     for c in &p.cfg.fd_commands {
         let _ = xp.run_command(c).await;
     }
-    let _ = crate::tools::autopilot::drive_heading_bug_step(
-        &xp,
-        true_to_mag(rwy.course_deg, var),
-        360.0,
-    )
-    .await;
 
     // Takeoff flaps from the profile, set before speed builds. 0.0 on a
     // clean-takeoff type still runs, guaranteeing the config off the gate.
@@ -3412,6 +3499,10 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, p: Params) {
     // The heading error's last value, for the yaw rate an aligning pivot
     // is capped on (the roll reads no yaw rate of its own).
     let mut prev_align_err: Option<f64> = None;
+    // The power waits for the nose on a brake-steered airframe
+    // ([`RollAlign`]); held from the first tick until the first read says.
+    let mut roll_align = RollAlign::default();
+    let mut align_hold = brake_steer;
     let mut last_tick: Option<std::time::Instant> = None;
     let roll_start = std::time::Instant::now();
     let mut frozen_secs = 0.0_f64;
@@ -3562,13 +3653,16 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, p: Params) {
         // last COMMAND is challenged ONCE (a hardware axis the sim
         // re-drives jitters; a hand keeps winning), then it's a pilot
         // reject — hands off everything.
-        let elapsed = roll_start.elapsed().as_secs_f64() - frozen_secs;
-        let thr_want = torque_limited(
-            tick_throttle_want(airborne, elapsed, last_err, gs_kts, ias, p.vne_kts),
-            last_thr_cmd,
-            torque_ftlb,
-            ias,
-            power_limit.as_ref(),
+        let elapsed = roll_start.elapsed().as_secs_f64() - frozen_secs - roll_align.held_s();
+        let thr_want = aligning_throttle(
+            torque_limited(
+                tick_throttle_want(airborne, elapsed, last_err, gs_kts, ias, p.vne_kts),
+                last_thr_cmd,
+                torque_ftlb,
+                ias,
+                power_limit.as_ref(),
+            ),
+            align_hold && !airborne,
         );
         let (thr_want, reducing) = thrust_reduced(thr_want, airborne, agl_ft, reduction);
         let thr_cmd = throttle_slew(last_thr_cmd, thr_want, dt);
@@ -3675,8 +3769,47 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, p: Params) {
             let steer = steer_law.step_with_yaw(err, dt, gs_kts, thr_cmd, yaw_dps);
             // The brake half, on an airframe that has no other low-speed
             // steering; zero once rotated (the channel expires anyway).
-            let align_yaw = prev_align_err.map_or(0.0, |p| -(err - p) / dt.max(0.05));
+            // The sim's yaw rate where read; else the error differenced.
+            let align_yaw = yaw_dps
+                .unwrap_or_else(|| prev_align_err.map_or(0.0, |p| -(err - p) / dt.max(0.05)));
             prev_align_err = Some(err);
+            if brake_steer && !rotated && align_hold {
+                match roll_align.step(err, align_yaw, gs_kts, dt) {
+                    RollAlignState::Hold => {}
+                    RollAlignState::Go => {
+                        align_hold = false;
+                        crate::blackbox::record(
+                            "autotakeoff",
+                            serde_json::json!({"event": "roll_aligned", "err": err,
+                                               "yaw_dps": align_yaw, "gs": gs_kts,
+                                               "held_s": roll_align.held_s()}),
+                        );
+                    }
+                    RollAlignState::Failed => {
+                        crate::blackbox::record(
+                            "autotakeoff",
+                            serde_json::json!({"event": "not_aligned", "err": err,
+                                               "yaw_dps": align_yaw, "gs": gs_kts,
+                                               "held_s": roll_align.held_s()}),
+                        );
+                        reject_rolling(
+                            &xp,
+                            &voice,
+                            &format!(
+                                "I can't straighten us on the runway, {:.0} degrees off. \
+                                 Rejecting takeoff.",
+                                err.abs()
+                            ),
+                            "not_aligned",
+                            &rwy,
+                            &mut steer_law,
+                            p.park_brake_valve_set,
+                        )
+                        .await;
+                        return;
+                    }
+                }
+            }
             let (bl, br) = if brake_steer && !rotated {
                 roll_brake_split_aligning(steer, gs_kts, err, align_yaw)
             } else {
@@ -3752,6 +3885,8 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, p: Params) {
                     // brake split's differenced error instead, spikes and all.
                     "r": yaw_dps, "law": if steer_law.scheduled() { "rudder" } else { "default" },
                     "thr": thr_cmd, "remaining_m": remaining, "dt": dt, "trq_ftlb": torque_ftlb,
+                    // The power waiting for the nose ([`RollAlign`]).
+                    "align_hold": align_hold,
                 }),
             );
             // Rotate: ELEVATOR, through the plugin's pitch channel — the AP
@@ -8801,7 +8936,8 @@ mod tests {
     fn a_crooked_roll_start_pivots_on_the_inside_brake() {
         // LIME 28: 21 degrees right of the nose at 1 kt, steer 0.17, no brake.
         let (l, r) = super::roll_brake_split_aligning(0.17, 0.9, 21.0, 0.0);
-        assert!(r > 0.3 && l == 0.0, "right brake, from a standstill: {l} {r}");
+        // The soft aligning PD (#46): 21 of 40 degrees of led error.
+        assert!(r > 0.2 && l == 0.0, "right brake, from a standstill: {l} {r}");
         // Proportional: small errors get less.
         let (_, r6) = super::roll_brake_split_aligning(0.17, 0.9, 6.0, 0.0);
         assert!(r6 < r, "{r6} < {r}");
@@ -8817,6 +8953,78 @@ mod tests {
             super::roll_brake_split_aligning(0.17, 16.0, 21.0, 0.0),
             super::roll_brake_split(0.17, 16.0)
         );
+    }
+
+    /// The roll's power waits for the nose on a brake-steered airframe. The
+    /// first roll ticks of 2026-09-29: the SR22 at LEMG 12 10.8 degrees off
+    /// at 0.07 kt (1790690995, t 1790692260.5), the lever then walked 0.3 to
+    /// 0.5 through a +/-12 degree pirouette; the Evolution at LILB 03 24.6 off
+    /// at 2.6 kt (1790712974, t 1790713247.3), 0.32 to 0.59 through a swing
+    /// to -4.4 at 21.6 deg/s. Runway starts roll 0.3 to 0.5 off: no wait.
+    #[test]
+    fn a_crooked_roll_start_holds_the_power_until_the_nose_is_straight() {
+        use super::{aligning_throttle, RollAlign, RollAlignState};
+        let mut a = RollAlign::default();
+        assert_eq!(a.step(10.8, 0.1, 0.07, 0.15), RollAlignState::Hold);
+        assert_eq!(aligning_throttle(0.41, true), 0.3, "the pivot's power, not the ramp's");
+        let mut b = RollAlign::default();
+        assert_eq!(b.step(24.6, -4.8, 2.6, 0.15), RollAlignState::Hold);
+        // Straight and steady: the power comes up, and never waits again.
+        assert_eq!(a.step(1.2, 0.5, 0.3, 0.4), RollAlignState::Go);
+        assert_eq!(a.step(12.0, 20.0, 9.0, 0.4), RollAlignState::Go);
+        assert_eq!(aligning_throttle(0.8, false), 0.8);
+        // A runway start is straight at once.
+        let mut c = RollAlign::default();
+        assert_eq!(c.step(0.4, 0.0, 0.0, 0.15), RollAlignState::Go);
+        assert!(c.held_s() == 0.0 && c.done());
+        // Rolling already (past a walking pace): the roll law's.
+        let mut d = RollAlign::default();
+        assert_eq!(d.step(8.0, 0.0, 7.0, 0.15), RollAlignState::Go);
+        // A nose that will not come round: a reject, said, after the bound.
+        let mut e = RollAlign::default();
+        let mut t = 0.0;
+        let end = loop {
+            let s = e.step(10.8, 0.0, 0.1, 0.42);
+            if s != RollAlignState::Hold {
+                break s;
+            }
+            t += 0.42;
+        };
+        assert_eq!(end, RollAlignState::Failed);
+        assert!((t - super::ROLL_ALIGN_MAX_S).abs() < 0.5, "{t}");
+    }
+
+    /// The roll start closed on the fitted plant ([`crate::autotaxi::yaw_plant`]):
+    /// the aligning split at the pivot's power from the SR22's 10.8 and the
+    /// Evolution's 24.6 degrees lets the power up with the nose straight and
+    /// swings no more than 2 degrees through. As flown the SR22 swung to
+    /// -11.6 in 3 s and the Evolution to -4.4.
+    #[test]
+    fn a_crooked_roll_start_comes_straight_before_the_power() {
+        use crate::autotaxi::yaw_plant::{signed, Plant};
+        use super::{RollAlign, RollAlignState};
+        for e0 in [10.8, 24.6] {
+            for tick in [0.3, 0.42, 0.5] {
+                let mut p = Plant::new(140.0, 3.0, e0, 0.0);
+                let mut a = RollAlign::default();
+                let mut through = 0.0_f64;
+                let mut t = 0.0;
+                loop {
+                    match a.step(p.err, p.yaw, 1.0, tick) {
+                        RollAlignState::Hold => {}
+                        RollAlignState::Go => break,
+                        RollAlignState::Failed => panic!("{e0} at {tick}: never straight"),
+                    }
+                    let lr = super::roll_brake_split_aligning(0.1, 1.0, p.err, p.yaw);
+                    p.run(signed(lr), 1.0, tick);
+                    through = through.max(-p.err * e0.signum());
+                    t += tick;
+                }
+                assert!(p.err.abs() <= crate::autotaxi::ALIGNED_DEG, "{e0} at {tick}: {}", p.err);
+                assert!(through <= 2.0, "{e0} at {tick}: {through:.1} through");
+                assert!(t < 12.0, "{e0} at {tick}: {t:.1} s");
+            }
+        }
     }
 
     #[test]
