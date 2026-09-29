@@ -205,6 +205,25 @@ roll_rudder:
   close_per_s: 1.5
   trim_per_s: 0.45
 
+# The rollout's brake split (autoland::RolloutBrakeSteer), fitted to LEMG 13
+# 2026-09-29 (sortie 1790689843-approach, calm, the iMac's 0.46 s loop): the
+# wheel difference turns the nose 15 to 30 deg/s per unit after 0.5 to
+# 0.6 s, the rudder at idle next to nothing, and above 40 kt the windmilling
+# propeller yaws it right at about 1.3 deg/s. The shared law (0.03 per
+# degree, no trim) held that off only 3 degrees right of its target: 0.08 of
+# difference for ten seconds from 75 kt and 1.2 m to 9.1 m right of the
+# centreline. More gain rings through the delay at this tick (0.06 per degree
+# swung +/-4 degrees in the replay), so the gain comes down a little, the
+# lead covers the delay plus half a tick, and a trim learns the standing
+# split: replayed through the record, 2.5 m at the fitted plant and 2.3 to
+# 3.4 m at 10 to 35 deg/s per unit and 0.4 to 0.8 s of delay, and the
+# 2026-09-28 rollout (#166) inside 2.9 m from 10 to 90.
+rollout_brakes:
+  per_deg: 0.025
+  lead_s: 1.2
+  trim_per_s: 0.8
+  trim_max: 0.15
+
 checklist: checklists/cirrus_sr22.txt
 
 # Lights — datarefs verified against the rustdecks SR22 deck; universal commands.

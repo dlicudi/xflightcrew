@@ -756,10 +756,21 @@ fn rollout_brake_ratio(gs_kts: f64, target_kts: f64, remaining_m: f64) -> f64 {
 /// ticks give its brakes 40 to 75 deg/s of yaw per unit of difference at
 /// taxi pace, and the gain holds the recorded rollout inside 2.6 m from 15 to
 /// 60 deg/s per unit.
+///
+/// A standing yaw is held off only by a standing error on a proportional
+/// split, so an airframe may declare a trim that learns it (`rollout_brakes:`,
+/// [`crate::aircraft::RolloutBrakesProfile`]): the SR22's idle propeller
+/// yawed it right at about 1.3 deg/s above 40 kt and the nose sat 3 degrees
+/// off for ten seconds, 1.2 m to 9.1 m right (LEMG 13 1790689843,
+/// 2026-09-29). Undeclared, the law is the one above, unchanged.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct RolloutBrakeSteer {
     prev_err: Option<f64>,
     rate: f64,
+    /// The learnt standing difference (right wheel positive).
+    trim: f64,
+    /// The airframe's numbers, `None` the shared law.
+    gains: Option<crate::aircraft::RolloutBrakesProfile>,
 }
 
 /// Brake difference per degree of heading error...
@@ -770,6 +781,8 @@ const ROLLOUT_BRAKE_STEER_LEAD_S: f64 = 0.8;
 const ROLLOUT_BRAKE_STEER_MAX: f64 = 0.3;
 /// ...and none below this groundspeed, where the stop owns the brakes.
 const ROLLOUT_BRAKE_STEER_MIN_KTS: f64 = 4.0;
+/// A declared trim's limit when the profile names none.
+const ROLLOUT_BRAKE_TRIM_MAX: f64 = 0.15;
 
 /// One tick of [`RolloutBrakeSteer`]: the brakes, as (the symmetric channel,
 /// the left wheel, the right wheel). The plugin gives each wheel the harder
@@ -783,6 +796,25 @@ pub struct RolloutBrakes {
 }
 
 impl RolloutBrakeSteer {
+    /// The law for the live airframe (its `rollout_brakes:`, else the
+    /// shared law).
+    pub fn for_airframe() -> Self {
+        Self::with_gains(crate::aircraft::rollout_brakes())
+    }
+
+    /// The law on these numbers (`None` the shared law).
+    pub fn with_gains(gains: Option<crate::aircraft::RolloutBrakesProfile>) -> Self {
+        Self {
+            gains,
+            ..Self::default()
+        }
+    }
+
+    /// The learnt standing difference, for the record.
+    pub fn trim(&self) -> f64 {
+        self.trim
+    }
+
     /// The heading error (degrees, target right of the nose positive), the
     /// tick, groundspeed and the stopping brake the rollout wants.
     pub fn step(&mut self, err_deg: f64, dt_s: f64, gs_kts: f64, brake: f64) -> RolloutBrakes {
@@ -807,8 +839,21 @@ impl RolloutBrakeSteer {
         if !gs_kts.is_finite() || gs_kts < ROLLOUT_BRAKE_STEER_MIN_KTS {
             return plain;
         }
-        let diff = (ROLLOUT_BRAKE_STEER_PER_DEG
-            * (err_deg + ROLLOUT_BRAKE_STEER_LEAD_S * self.rate))
+        let g = self.gains;
+        let per_deg = g
+            .and_then(|g| g.per_deg)
+            .unwrap_or(ROLLOUT_BRAKE_STEER_PER_DEG);
+        let lead_s = g
+            .and_then(|g| g.lead_s)
+            .unwrap_or(ROLLOUT_BRAKE_STEER_LEAD_S);
+        if let (Some(corner), Some(max)) = (
+            g.and_then(|g| g.trim_per_s),
+            g.map(|g| g.trim_max.unwrap_or(ROLLOUT_BRAKE_TRIM_MAX)),
+        ) {
+            self.trim =
+                (self.trim + per_deg * corner * err_deg * dt_s.clamp(0.05, 1.0)).clamp(-max, max);
+        }
+        let diff = (per_deg * (err_deg + lead_s * self.rate) + self.trim)
             .clamp(-ROLLOUT_BRAKE_STEER_MAX, ROLLOUT_BRAKE_STEER_MAX);
         let half = diff.abs() / 2.0;
         let outside = (brake - half).max(0.0);
@@ -1527,7 +1572,7 @@ pub fn run_autoland_scoped(
             // A castoring nosewheel steers the rollout on its brakes too
             // (`RolloutBrakeSteer`, issue #166).
             let rollout_brake_steer = rollout_brake_steers();
-            let mut rollout_brakes = RolloutBrakeSteer::default();
+            let mut rollout_brakes = RolloutBrakeSteer::for_airframe();
             // The landing readback last sent, so an owed one goes out once
             // (the party line keeps it owed until the tower hears it).
             let mut readback_sent: Option<String> = None;
@@ -1860,6 +1905,8 @@ pub fn run_autoland_scoped(
                             // The brakes as written: the symmetric channel and
                             // each wheel's steering channel (issue #166).
                             "brake": brakes.sym, "bl": brakes.left, "br": brakes.right,
+                            // The split's learnt standing difference (#166).
+                            "btrim": rollout_brakes.trim(),
                         }),
                     );
                     let thr_dref = throttle_dref();
@@ -15420,13 +15467,22 @@ mod lemg13_sr22_rollout_tests {
     /// the law (or not), `authority` deg/s of yaw per unit of brake
     /// difference at the wheels. The worst cross-track, metres.
     fn roll(authority: f64, split: bool) -> f64 {
+        roll_with(authority, split, None)
+    }
+
+    /// [`roll`] on an airframe's declared numbers (`rollout_brakes:`).
+    pub(super) fn roll_with(
+        authority: f64,
+        split: bool,
+        gains: Option<crate::aircraft::RolloutBrakesProfile>,
+    ) -> f64 {
         let end = REC[REC.len() - 1].0;
         let dt = 0.01;
         let (mut t, mut next) = (0.0, 0.0);
         let (mut dpsi, mut yaw, mut dx) = (0.0_f64, 0.0_f64, 0.0_f64);
         let mut rate = crate::autotakeoff::XtkRate::default();
         let mut prev: Option<f64> = None;
-        let mut law = RolloutBrakeSteer::default();
+        let mut law = RolloutBrakeSteer::with_gains(gains);
         let mut written: Vec<(f64, f64)> = vec![(-10.0, 0.0)];
         let mut worst: f64 = 0.0;
         while t < end {
@@ -15515,6 +15571,188 @@ mod lemg13_sr22_rollout_tests {
         };
         assert_eq!(law.step(-5.0, 0.4, 3.0, 0.24), plain);
         assert_eq!(law.step(f64::NAN, 0.4, 60.0, 0.24), plain);
+    }
+}
+
+/// Issue #166 again, the split flown: LEMG 13, the SR22 on the iMac
+/// (sortie 1790689843-approach, 2026-09-29, a 10 nm final in calm air,
+/// touchdown at 30 fpm, the loop at 0.46 s). The shared split steered from
+/// the first tick at 88 kt and the nose still sat 3 degrees right of its
+/// target for ten seconds from 75 kt, 0.08 of wheel difference against a
+/// standing right yaw, and the rollout went from 1.2 m to 9.1 m right
+/// (`bench/landings/sr22_lemg13_rollout_1790689843.jsonl`, every rollout
+/// tick as written).
+///
+/// Fitted over those ticks (three-tick heading predictions), the wheel
+/// difference turns the nose 15 to 30 deg/s per unit after 0.5 to 0.6 s
+/// with a standing 1.3 deg/s right above 40 kt, the rudder next to nothing
+/// at idle. The replay takes the recorded heading and cross-track as the
+/// plant under the recorded split and adds the yaw of the DIFFERENCE a law
+/// writes from it, through that delay and a first-order lag, at the
+/// record's own ticks: the shared law reproduces the rollout as flown.
+#[cfg(test)]
+mod lemg13_sr22_rollout_split_tests {
+    use super::*;
+
+    const TICKS: &str = include_str!("../bench/landings/sr22_lemg13_rollout_1790689843.jsonl");
+    /// LEMG 13's true course, as in the 2026-09-28 record: the first tick's
+    /// heading plus its error plus the cut its 1.17 m asked at 88 kt.
+    const COURSE: f64 = 131.69;
+
+    /// (s from the first tick, the tick's dt, groundspeed, heading,
+    /// cross-track m right, the stopping brake, the wheel difference as the
+    /// plugin applied it, right positive).
+    fn ticks() -> Vec<(f64, f64, f64, f64, f64, f64, f64)> {
+        let mut t = 0.0;
+        let mut out = Vec::new();
+        for (i, line) in TICKS.lines().filter(|l| !l.trim().is_empty()).enumerate() {
+            let r: serde_json::Value = serde_json::from_str(line).unwrap();
+            let f = |k: &str| r[k].as_f64().unwrap();
+            let dt = f("dt");
+            if i > 0 {
+                t += dt;
+            }
+            let (sym, bl, br) = (f("brake"), f("bl"), f("br"));
+            let inside = bl.max(br);
+            let stop = if inside > 0.0 { (sym + inside) / 2.0 } else { sym };
+            out.push((t, dt, f("gs"), f("psi"), f("xtk_m"), stop, sym.max(br) - sym.max(bl)));
+        }
+        out
+    }
+
+    /// The rollout replayed under `gains` (`None` the shared law) with the
+    /// brakes' `authority` deg/s per unit of difference, `dead_s` before it
+    /// and a `lag_s` yaw lag. The worst cross-track, metres.
+    fn replay(
+        gains: Option<crate::aircraft::RolloutBrakesProfile>,
+        authority: f64,
+        dead_s: f64,
+        lag_s: f64,
+    ) -> f64 {
+        let rec = ticks();
+        let end = rec[rec.len() - 1].0;
+        let h = 0.01;
+        let at = |t: f64, i: usize| -> f64 {
+            let col = |r: &(f64, f64, f64, f64, f64, f64, f64)| match i {
+                2 => r.2,
+                _ => r.4,
+            };
+            for w in rec.windows(2) {
+                if (w[0].0..=w[1].0).contains(&t) {
+                    let f = (t - w[0].0) / (w[1].0 - w[0].0);
+                    return col(&w[0]) + f * (col(&w[1]) - col(&w[0]));
+                }
+            }
+            col(&rec[rec.len() - 1])
+        };
+        let mut law = RolloutBrakeSteer::with_gains(gains);
+        let mut rate = crate::autotakeoff::XtkRate::default();
+        let mut prev: Option<f64> = None;
+        let (mut dpsi, mut yaw, mut dx) = (0.0_f64, 0.0_f64, 0.0_f64);
+        let mut written: Vec<(f64, f64)> = vec![(-10.0, 0.0)];
+        let (mut t, mut k) = (0.0, 0);
+        let mut worst: f64 = 0.0;
+        while t < end {
+            if k < rec.len() && t + 1e-9 >= rec[k].0 {
+                let (_, dt, gs, psi, xtk, stop, flown) = rec[k];
+                let x = xtk + dx;
+                let r = rate.update(prev.map_or(0.0, |p| (x - p) / dt), dt);
+                prev = Some(x);
+                let target = crate::autotakeoff::roll_target_heading(COURSE, x, r, gs);
+                let err = ((target - (psi + dpsi) + 540.0).rem_euclid(360.0)) - 180.0;
+                let b = law.step(err, dt, gs, stop);
+                let diff = if gs > 2.0 {
+                    b.sym.max(b.right) - b.sym.max(b.left)
+                } else {
+                    0.0
+                };
+                written.push((rec[k].0, diff - flown));
+                k += 1;
+            }
+            let arriving = written
+                .iter()
+                .take_while(|(tw, _)| *tw <= t - dead_s + 1e-9)
+                .last()
+                .map_or(0.0, |w| w.1);
+            yaw += (authority * arriving - yaw) * h / lag_s;
+            dpsi += yaw * h;
+            dx += at(t, 2) * 0.514_444 * dpsi.to_radians().sin() * h;
+            worst = worst.max((at(t, 4) + dx).abs());
+            t += h;
+        }
+        worst
+    }
+
+    fn sr22() -> Option<crate::aircraft::RolloutBrakesProfile> {
+        let g = crate::aircraft::load("cirrus_sr22")
+            .and_then(|p| p.rollout_brakes)
+            .map(crate::aircraft::RolloutBrakesProfile::valid);
+        assert!(
+            g.is_some_and(|g| g.per_deg.is_some() && g.trim_per_s.is_some()),
+            "the SR22 declares its rollout brakes: {g:?}"
+        );
+        g
+    }
+
+    /// As flown the shared law reproduces the record (9.06 m) whatever the
+    /// plant. The SR22's declared split holds it inside 2.6 m at the fitted
+    /// plant (20 deg/s per unit, 0.6 s, 0.2 s), and inside 3.5 m from 10 to
+    /// 35 deg/s per unit, 0.4 to 0.8 s of delay and 0.1 to 0.5 s of lag.
+    #[test]
+    fn the_sr22_rollout_split_learns_its_standing_yaw() {
+        for a in [10.0, 20.0, 35.0] {
+            let flown = replay(None, a, 0.6, 0.2);
+            assert!((flown - 9.06).abs() < 0.1, "as flown at {a}: {flown:.2}");
+        }
+        let g = sr22();
+        let fitted = replay(g, 20.0, 0.6, 0.2);
+        assert!(fitted < 2.6, "at the fit: {fitted:.2} m");
+        let (mut best, mut worst) = (f64::MAX, 0.0_f64);
+        for a in [10.0, 15.0, 20.0, 25.0, 35.0] {
+            for dead in [0.4, 0.6, 0.8] {
+                for lag in [0.1, 0.2, 0.5] {
+                    let w = replay(g, a, dead, lag);
+                    assert!(w < 3.5, "{a} deg/s per unit, {dead} s, {lag} s: {w:.2} m");
+                    (best, worst) = (best.min(w), worst.max(w));
+                }
+            }
+        }
+        eprintln!("fitted {fitted:.2} m, {best:.2} to {worst:.2} m over the plants");
+    }
+
+    /// The 2026-09-28 rollout (#166, rudder alone as flown) under the SR22's
+    /// declared split: inside 3.0 m from 10 to 90 deg/s per unit.
+    #[test]
+    fn the_sr22_declared_split_holds_the_first_rollout_too() {
+        let g = sr22();
+        for a in [10.0, 15.0, 20.0, 30.0, 45.0, 60.0, 90.0] {
+            let w = super::lemg13_sr22_rollout_tests::roll_with(a, true, g);
+            let shared = super::lemg13_sr22_rollout_tests::roll_with(a, true, None);
+            eprintln!("{a}: declared {w:.2} m, shared {shared:.2} m");
+            assert!(w < 3.0, "{a} deg/s per unit: {w:.2} m");
+        }
+    }
+
+    /// The trim: a standing error walks it toward the inside wheel at the
+    /// declared corner, bounded; undeclared, the law has none.
+    #[test]
+    fn a_declared_trim_learns_and_is_bounded() {
+        let g = sr22();
+        let mut law = RolloutBrakeSteer::with_gains(g);
+        for _ in 0..200 {
+            law.step(-3.0, 0.46, 60.0, 0.22);
+        }
+        let max = g.and_then(|g| g.trim_max).unwrap();
+        assert!((law.trim() + max).abs() < 1e-9, "{}", law.trim());
+        let mut shared = RolloutBrakeSteer::default();
+        for _ in 0..200 {
+            shared.step(-3.0, 0.46, 60.0, 0.22);
+        }
+        assert_eq!(shared.trim(), 0.0);
+        // Below the brakes' floor it neither steers nor learns.
+        let mut slow = RolloutBrakeSteer::with_gains(g);
+        slow.step(-3.0, 0.46, 3.0, 0.22);
+        assert_eq!(slow.trim(), 0.0);
     }
 }
 
