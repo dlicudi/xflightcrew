@@ -775,6 +775,13 @@ pub struct AircraftProfile {
     /// thrust went 162 to 185 kt between liftoff and 300 ft.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub climb_pitch_max_deg: Option<f64>,
+    /// How far ahead the circuit's final leg leads the offset it pursues,
+    /// seconds (see `circuit::final_led_xtk_m`): an autopilot whose heading
+    /// answers its bug slowly runs through the centreline on the bare
+    /// pursuit. Silent: no lead, the pursuit every airframe has flown. The
+    /// A330 ran 66 to 67 m through at LEMG 30 (2026-09-29, #189).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub circuit_final_lead_s: Option<f64>,
     /// Path to an XChecklist file to interpret (relative to the working dir).
     /// `None` means no checklists for this airframe. The file is read-only input;
     /// the copilot interprets it (see [`crate::checklist`]).
@@ -5443,6 +5450,7 @@ fn cessna_172sp() -> AircraftProfile {
         // clearance, and only ever needs the rotation held BACK.
         pitch_authority_down: None,
         climb_pitch_max_deg: None,
+        circuit_final_lead_s: None,
         // Reference figures from the X-Plane C172 Pilot's Operating Manual.
         reference: Some(ReferenceProfile {
             kind: Some("single-engine aircraft".into()),
@@ -5831,6 +5839,7 @@ fn cirrus_sr22() -> AircraftProfile {
         // clearance, and only ever needs the rotation held BACK.
         pitch_authority_down: None,
         climb_pitch_max_deg: None,
+        circuit_final_lead_s: None,
         // Reference figures from the X-Plane Cirrus SR22 Pilot's Operating Manual
         // (the modeled aircraft is the turbo TSIO-550-K, ceiling 25,000 ft).
         reference: Some(ReferenceProfile {

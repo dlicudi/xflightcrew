@@ -379,6 +379,13 @@ arrest_roll:
   deg_s_per_unit: 13.0
   dead_s: 0.45
   close_s: 0.6
+# The circuit's final leads its offset by this many seconds of the ground
+# track (#189): the heading mode rolls at about 3 deg/s through a 2 s lag and
+# flies the bug two ticks late (fitted to the LEMG 30 circuits of 2026-09-29,
+# sorties 1790710769 and 1790698132), and on the bare pursuit ran 66 to 67 m
+# through the centreline both times. VERIFY: `circuit` `handoff_autoland`
+# `xtk_m` on the base's side of the line, Final `x_m` never past it by 10 m.
+circuit_final_lead_s: 3.5
 # The speed governor on these engines (#169): about 2.5 kt/s per unit of
 # lever through a 4.6 s spool (fitted to the circuit's clean legs, sortie
 # 1790633832-full_auto). The shared 5 s projection and 0.04 a tick ran the
