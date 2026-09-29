@@ -1,0 +1,9 @@
+after: stop
+cases:
+  - name: 737 EGKK ramp, taxi out and circuit (#123 taxi line)
+    setup:
+      aircraft: "Aircraft/Laminar Research/Boeing 737-800/b738.acf"
+      ramp: { field: EGKK }
+    traffic: off
+    command: fly a circuit
+    deadline_min: 40
