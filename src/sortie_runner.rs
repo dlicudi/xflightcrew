@@ -691,13 +691,13 @@ impl SpeedGuard {
         if self.sortie.is_none() || self.latched.is_some() {
             return;
         }
+        if let Some(g) = give_up_of(r) {
+            self.latched = Some(format!("a give-up ({g})"));
+            return;
+        }
         self.latched = match (kind, event) {
             ("intervention", _) => Some(format!("an intervention ({})", st(r, "what"))),
             ("tool", _) => Some(format!("a pilot's command ({})", st(r, "name"))),
-            ("full_auto" | "heli_route", "give_up") => {
-                Some(format!("a give-up ({})", st(r, "reason")))
-            }
-            ("full_auto", _) if st(r, "stage") == "give_up" => Some("a give-up".into()),
             ("flight", _)
                 if st(r, "ev") == "impact"
                     || (st(r, "ev") == "abnormal" && st(r, "to") == "Crashed") =>
@@ -1723,6 +1723,246 @@ fn st<'a>(r: &'a Value, k: &str) -> &'a str {
     r.get(k).and_then(Value::as_str).unwrap_or("")
 }
 
+/// Full auto's give-up as it writes it (`full_auto::event`): a `full_auto`
+/// stage `give_up`, the reason under `detail`. `None`: not one. The
+/// helicopter's route writes none (its end is `heli_route` `ended`); the
+/// sortie's `end` carries the reason for both.
+fn give_up_of(r: &Value) -> Option<&str> {
+    (st(r, "kind") == "full_auto" && st(r, "stage") == "give_up").then(|| {
+        r.pointer("/detail/reason")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+    })
+}
+
+/// A blackbox record the runner reads, as the app writes it: its `kind`,
+/// the field that picks it out (`key` = `value`; empty: any record of the
+/// kind), the fields read from it, and where the app writes it (a file and
+/// a snippet of the writing code, compared without whitespace). A test pins
+/// every entry to the source, and every field the runner reads to this
+/// table: the runner read full auto's give-up in a shape it never wrote
+/// (d270a29, LEMG 13 2026-09-28), and a heli_route give_up nobody writes.
+pub struct ReadShape {
+    pub kind: &'static str,
+    pub key: &'static str,
+    pub value: &'static str,
+    pub fields: &'static [&'static str],
+    pub producer: &'static [(&'static str, &'static str)],
+}
+
+/// Fields the blackbox writer adds to every record (`sim::blackbox::write`):
+/// `t`, `kind`, and `sortie` while one runs.
+pub const WRITER_FIELDS: &[&str] = &["t", "kind", "sortie"];
+
+/// Every record shape the runner's machines match on.
+pub const READ_SHAPES: &[ReadShape] = &[
+    ReadShape {
+        kind: "said",
+        key: "who",
+        value: "crew",
+        fields: &["who", "text"],
+        producer: &[("src/voice.rs", r#"crate::blackbox::record("said","#)],
+    },
+    ReadShape {
+        kind: "typed",
+        key: "event",
+        value: "taken",
+        fields: &["text"],
+        producer: &[(
+            "src/pollers.rs",
+            r#""typed", serde_json::json!({ "event": "taken", "text""#,
+        )],
+    },
+    ReadShape {
+        kind: "typed",
+        key: "event",
+        value: "consumed",
+        fields: &["text"],
+        producer: &[(
+            "src/main.rs",
+            r#""typed", serde_json::json!({ "event": "consumed", "text""#,
+        )],
+    },
+    ReadShape {
+        kind: "tool",
+        key: "",
+        value: "",
+        fields: &["name"],
+        producer: &[("src/main.rs", r#""tool", serde_json::json!({ "name": call.name"#)],
+    },
+    ReadShape {
+        kind: "sortie",
+        key: "event",
+        value: "begin",
+        fields: &[],
+        producer: &[(
+            "crates/sim/src/blackbox.rs",
+            r#"o.insert("event".into(), "begin".into());"#,
+        )],
+    },
+    ReadShape {
+        kind: "sortie",
+        key: "event",
+        value: "end",
+        fields: &["outcome"],
+        producer: &[("crates/sim/src/blackbox.rs", r#"o.insert("event".into(), "end".into());"#)],
+    },
+    ReadShape {
+        kind: "sortie",
+        key: "outcome",
+        value: "gave_up",
+        fields: &["reason"],
+        producer: &[("src/full_auto.rs", r#"end_sortie("gave_up", json!({ "reason": reason"#)],
+    },
+    ReadShape {
+        kind: "full_auto",
+        key: "stage",
+        value: "give_up",
+        fields: &["detail", "reason"],
+        producer: &[
+            (
+                "src/full_auto.rs",
+                r#"record("full_auto", json!({ "stage": stage, "detail": detail }))"#,
+            ),
+            ("src/full_auto.rs", r#"event("give_up", json!({ "reason": reason }));"#),
+        ],
+    },
+    ReadShape {
+        kind: "stage_result",
+        key: "",
+        value: "",
+        fields: &["stage", "pass", "why"],
+        producer: &[("src/scorecard.rs", r#"out.push(("stage_result".into(), metrics));"#)],
+    },
+    ReadShape {
+        kind: "stage_result",
+        key: "stage",
+        value: "landing",
+        fields: &["sink_fpm", "drift_deg", "rollout_max_xtk_m"],
+        producer: &[("src/scorecard.rs", r#"self.push("landing","#)],
+    },
+    ReadShape {
+        kind: "stage_result",
+        key: "stage",
+        value: "takeoff",
+        fields: &["max_xtk_m"],
+        producer: &[("src/scorecard.rs", r#"self.push("takeoff","#)],
+    },
+    ReadShape {
+        kind: "stage_result",
+        key: "stage",
+        value: "alignment",
+        fields: &["err_deg", "xtk_m"],
+        producer: &[("src/scorecard.rs", r#"self.push("alignment","#)],
+    },
+    ReadShape {
+        kind: "stage_result",
+        key: "stage",
+        value: "taxi",
+        fields: &["max_lat_m", "max_cut_m"],
+        producer: &[(
+            "src/scorecard.rs",
+            r#"let stage = if x.line_up { "line_up" } else { "taxi" };"#,
+        )],
+    },
+    ReadShape {
+        kind: "sortie_result",
+        key: "",
+        value: "",
+        fields: &[
+            "outcome",
+            "interventions",
+            "commands",
+            "unattended",
+            "crashed",
+            "ended_airborne",
+            "pass",
+        ],
+        producer: &[("src/scorecard.rs", r#"out.push(("sortie_result".into(), v));"#)],
+    },
+    ReadShape {
+        kind: "setup",
+        key: "event",
+        value: "approach_result",
+        fields: &["outcome", "result", "armed"],
+        producer: &[("src/tools/setup.rs", r#"json!({ "event": "approach_result", "outcome""#)],
+    },
+    ReadShape {
+        kind: "setup",
+        key: "event",
+        value: "enroute_refused",
+        fields: &["why"],
+        producer: &[(
+            "src/tools/setup_enroute.rs",
+            r#"json!({ "event": "enroute_refused", "why""#,
+        )],
+    },
+    ReadShape {
+        kind: "setup",
+        key: "event",
+        value: "enroute_result",
+        fields: &["outcome", "engaged", "why"],
+        producer: &[(
+            "src/tools/setup_enroute.rs",
+            r#"json!({ "event": "enroute_result", "outcome""#,
+        )],
+    },
+    ReadShape {
+        kind: "state",
+        key: "",
+        value: "",
+        fields: &["fphase"],
+        producer: &[("src/monitor.rs", r#""fphase": format!("{:?}", flight.phase())"#)],
+    },
+    ReadShape {
+        kind: "flight",
+        key: "ev",
+        value: "phase",
+        fields: &["to"],
+        producer: &[
+            ("src/monitor.rs", r#"crate::blackbox::record("flight", ev.to_json());"#),
+            ("src/flight.rs", r#"json!({ "ev": "phase", "from": ph(from), "to": ph(to)"#),
+        ],
+    },
+    ReadShape {
+        kind: "flight",
+        key: "ev",
+        value: "impact",
+        fields: &[],
+        producer: &[("src/flight.rs", r#""ev": "impact","#)],
+    },
+    ReadShape {
+        kind: "flight",
+        key: "ev",
+        value: "abnormal",
+        fields: &["to"],
+        producer: &[
+            ("src/flight.rs", r#"json!({ "ev": "abnormal", "from": abn(from), "to": abn(to) })"#),
+            ("src/flight.rs", "    Crashed,"),
+        ],
+    },
+    ReadShape {
+        kind: "intervention",
+        key: "",
+        value: "",
+        fields: &["what"],
+        producer: &[(
+            "src/flight.rs",
+            r#"record("intervention", serde_json::json!({ "what": what }))"#,
+        )],
+    },
+    ReadShape {
+        kind: "profile_probe",
+        key: "",
+        value: "",
+        fields: &["identity", "relative_path"],
+        producer: &[
+            ("src/detect.rs", r#""missing": missing, "identity": identity }"#),
+            ("src/detect.rs", r#""relative_path": self.who.relative_path,"#),
+        ],
+    },
+];
+
 impl CaseMachine {
     /// A line that must never go twice (a SETUP: a second one would start
     /// another new flight under the first one's reload) fails unanswered
@@ -1905,18 +2145,8 @@ impl CaseMachine {
                     // under `detail`; the sortie's end repeats it. Either
                     // names the give-up (the reject at LEMG 13, 2026-09-28,
                     // was read as no reason at all).
-                    ("full_auto" | "heli_route", _)
-                        if mine && (event == "give_up" || st(r, "stage") == "give_up") =>
-                    {
-                        let reason = match st(r, "reason") {
-                            "" => r
-                                .get("detail")
-                                .and_then(|d| d.get("reason"))
-                                .and_then(Value::as_str)
-                                .unwrap_or(""),
-                            s => s,
-                        };
-                        self.give_up = Some(reason.to_string());
+                    _ if mine && give_up_of(r).is_some() => {
+                        self.give_up = give_up_of(r).map(str::to_string);
                         Step::Wait
                     }
                     ("sortie", "end")
@@ -3321,10 +3551,388 @@ pub async fn run_all(
 
 /// `xvl sortie <spec.yaml> [--repeat N] [--log logs/blackbox.jsonl]`: the
 /// entry from main. Returns whether every case passed.
+// ---- The check: every typed line routed offline, no sim --------------------------
+
+/// The tool a typed line reaches through the grammar, as the command loop
+/// routes it: the words normalised (`grammar::normalize`), the local
+/// planner's branch named `plan_flight`.
+pub fn route_of(
+    line: &str,
+    reg: &crate::tools::Registry,
+    prof: &crate::aircraft::AircraftProfile,
+) -> Option<String> {
+    if crate::flightplan::parse_request(line).is_some_and(|r| r.dest.is_some()) {
+        return Some("plan_flight".into());
+    }
+    let matchable = crate::grammar::normalize(line);
+    crate::grammar::try_parse(&matchable, reg, prof).map(|c| c[0].name.clone())
+}
+
+/// One typed line of a case, checked.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LineCheck {
+    pub case: String,
+    pub line: String,
+    /// The tool (or the pre-grammar branch) it reaches; "-" when checked
+    /// not at all or reaching nothing.
+    pub routes_to: String,
+    /// Why the line will not do what the case wants; `None`: OK.
+    pub problem: Option<String>,
+    /// What the check could not judge, or what only a running flight
+    /// decides.
+    pub note: String,
+}
+
+/// What a line must reach.
+enum Want<'a> {
+    /// The step's own tool (`plan_flight`: the local planner).
+    Tool(&'a str),
+    /// Any tool: a case's command.
+    AnyTool,
+}
+
+/// One line routed as the command loop routes a typed line: taken by a
+/// pre-grammar branch (`main::pre_grammar_capture`, the loop's own
+/// `question_shortcut`), else the grammar. Pure.
+fn check_line(
+    case: &str,
+    line: &str,
+    want: Want,
+    reg: &crate::tools::Registry,
+    prof: &crate::aircraft::AircraftProfile,
+    note: &str,
+) -> LineCheck {
+    let capture = crate::pre_grammar_capture(line, reg, prof);
+    let plan_flight = crate::Shortcut::PlanFlight.name();
+    let (routes_to, mut problem) = match capture {
+        Some(c) if c == plan_flight => (c.to_string(), None),
+        Some(c) => (
+            c.to_string(),
+            Some(format!("taken before the grammar ({c})")),
+        ),
+        None => match route_of(line, reg, prof) {
+            Some(t) => (t, None),
+            None => ("-".to_string(), Some("reaches no tool".to_string())),
+        },
+    };
+    if problem.is_none() {
+        if let Want::Tool(w) = want {
+            if routes_to != w {
+                problem = Some(format!("the step names {w}"));
+            }
+        }
+    }
+    let notes: Vec<&str> = [crate::state_capture_note(line), Some(note)]
+        .into_iter()
+        .flatten()
+        .filter(|n| !n.is_empty())
+        .collect();
+    LineCheck {
+        case: case.to_string(),
+        line: line.to_string(),
+        routes_to,
+        problem,
+        note: notes.join("; "),
+    }
+}
+
+/// Every line a case types, checked on the airframe's profile (`note`:
+/// why this profile, when not its own): the setup's words (an approach's
+/// only once its field and runway are known, an enroute point's always),
+/// the command, every step that says something. Pure.
+pub fn check_case(
+    case: &Case,
+    prof: &crate::aircraft::AircraftProfile,
+    note: &str,
+) -> Vec<LineCheck> {
+    let reg = crate::tools::Registry::for_aircraft(prof);
+    let name = case.name.as_str();
+    let mut out = Vec::new();
+    let skipped = |line: String, why: &str| LineCheck {
+        case: name.to_string(),
+        line,
+        routes_to: "-".into(),
+        problem: None,
+        note: why.to_string(),
+    };
+    match &case.setup {
+        Setup::Approach {
+            field,
+            runway,
+            final_nm,
+        } => {
+            let line = approach_line(field, runway, *final_nm);
+            if matches!(field.as_str(), FIELD_PLAN_ORIGIN | FIELD_PLAN_DESTINATION)
+                || runway == RUNWAY_FROM_PLAN
+            {
+                out.push(skipped(line, "not checked: the field or runway is the plan's"));
+            } else if runway == RUNWAY_FROM_WIND {
+                out.push(skipped(line, "not checked: the runway is picked at the setup"));
+            } else {
+                out.push(check_line(name, &line, Want::Tool("setup_approach"), &reg, prof, note));
+            }
+        }
+        Setup::Enroute { point, .. } => {
+            let line = crate::tools::setup_enroute::enroute_line(point);
+            out.push(check_line(name, &line, Want::Tool("setup_enroute"), &reg, prof, note));
+        }
+        Setup::RunwayStart { .. } | Setup::Ramp { .. } => {}
+    }
+    if let Some(cmd) = &case.command {
+        out.push(check_line(name, cmd, Want::AnyTool, &reg, prof, note));
+    }
+    for s in case.steps.iter().filter(|s| s.is_say()) {
+        match s.tool.as_deref() {
+            Some(t) => out.push(check_line(name, &s.say, Want::Tool(t), &reg, prof, note)),
+            None => {
+                let mut c = check_line(name, &s.say, Want::AnyTool, &reg, prof, note);
+                c.problem.get_or_insert_with(|| "the step names no tool".into());
+                out.push(c);
+            }
+        }
+    }
+    out
+}
+
+/// The profile a case's lines are checked on: the detector's for its
+/// `.acf` (read under `xplane_root()`), the generic one for an unmatched
+/// model, else the 737's; the second value says why when not its own.
+pub fn check_profile(acf: Option<&str>) -> (crate::aircraft::AircraftProfile, String) {
+    let b738 = || crate::aircraft::load("boeing_737_800").expect("the 737 profile");
+    let Some(acf) = acf.filter(|a| *a != AIRCRAFT_FROM_PLAN) else {
+        return (b738(), "on the 737: the aircraft is the loaded one or the plan's".into());
+    };
+    let Ok(text) = std::fs::read_to_string(crate::config::xplane_path(acf)) else {
+        return (b738(), "on the 737: the .acf is not readable here".into());
+    };
+    let icao = crate::tools::setup::acf_icao(&text).unwrap_or_default();
+    match crate::detect::resolved_id(&icao, acf).and_then(|id| crate::aircraft::load(&id)) {
+        Some(p) => (p, String::new()),
+        None => (
+            crate::aircraft::generic_from_acf(&icao, &text),
+            format!("no profile for this {icao}: the generic one"),
+        ),
+    }
+}
+
+/// The check as a table, one row per line.
+pub fn check_table(spec_path: &str, rows: &[LineCheck], notes: &[String]) -> String {
+    let mut out = format!("# sortie check: {spec_path}\n\n");
+    for n in notes {
+        out.push_str(&format!("- {n}\n"));
+    }
+    if !notes.is_empty() {
+        out.push('\n');
+    }
+    out.push_str("| Case | Line | Routes to | Result | Note |\n|---|---|---|---|---|\n");
+    for r in rows {
+        let result = match &r.problem {
+            Some(p) => format!("PROBLEM: {p}"),
+            None if r.routes_to == "-" => "skipped".into(),
+            None => "OK".into(),
+        };
+        out.push_str(&format!(
+            "| {} | {} | {} | {} | {} |\n",
+            cell(&r.case),
+            cell(&r.line),
+            cell(&r.routes_to),
+            cell(&result),
+            cell(&r.note)
+        ));
+    }
+    let bad = rows.iter().filter(|r| r.problem.is_some()).count();
+    out.push_str(&format!("\n{bad} problems in {} lines.\n", rows.len()));
+    out
+}
+
+/// A source file's code without its test module, and without whitespace
+/// (a snippet matches however the file is formatted).
+fn code_of(text: &str) -> String {
+    let flat: String = text.chars().filter(|c| !c.is_whitespace()).collect();
+    match flat.find("#[cfg(test)]mod") {
+        Some(i) => flat[..i].to_string(),
+        None => flat,
+    }
+}
+
+/// How far around a producer's snippet its fields are looked for, in
+/// characters of whitespace-free code (a `json!` of a dozen lines).
+const SHAPE_WINDOW: usize = 1_200;
+
+/// The [`READ_SHAPES`] the source does not write as the runner reads them:
+/// a producer's snippet missing from its file, or a field read that none of
+/// its producers writes near the snippet. `read`: a file's text by its path
+/// from the checkout's root.
+pub fn shape_problems(read: &dyn Fn(&str) -> Option<String>) -> Vec<String> {
+    let mut out = Vec::new();
+    for s in READ_SHAPES {
+        let what = match s.key {
+            "" => s.kind.to_string(),
+            k => format!("{} {k}={}", s.kind, s.value),
+        };
+        let mut windows = Vec::new();
+        for (file, snippet) in s.producer {
+            let Some(text) = read(file) else {
+                out.push(format!("{what}: {file} is not readable"));
+                continue;
+            };
+            let code = code_of(&text);
+            let snip = code_of(snippet);
+            match code.find(&snip) {
+                Some(i) => {
+                    let mut lo = i.saturating_sub(SHAPE_WINDOW);
+                    while !code.is_char_boundary(lo) {
+                        lo -= 1;
+                    }
+                    let mut hi = (i + snip.len() + SHAPE_WINDOW).min(code.len());
+                    while !code.is_char_boundary(hi) {
+                        hi += 1;
+                    }
+                    windows.push(code[lo..hi].to_string());
+                }
+                None => out.push(format!("{what}: {file} no longer writes {snippet:?}")),
+            }
+        }
+        for f in s.fields {
+            let lit = format!("\"{f}\"");
+            if !windows.is_empty() && !windows.iter().any(|w| w.contains(&lit)) {
+                out.push(format!("{what}: no producer writes the field {f}"));
+            }
+        }
+    }
+    // The writer's own fields, on every record.
+    let writer = "crates/sim/src/blackbox.rs";
+    match read(writer).map(|t| code_of(&t)) {
+        Some(code) => {
+            for f in WRITER_FIELDS {
+                if !code.contains(&format!("\"{f}\"")) {
+                    out.push(format!("{writer} no longer adds {f} to a record"));
+                }
+            }
+        }
+        None => out.push(format!("{writer} is not readable")),
+    }
+    out
+}
+
+/// Every `.rs` file under the checkout's `src/` and `crates/`, by its path
+/// from the root (`None`: not run from a checkout).
+fn checkout_sources() -> Option<Vec<(String, String)>> {
+    fn walk(dir: &std::path::Path, out: &mut Vec<(String, String)>) {
+        let Ok(rd) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for e in rd.flatten() {
+            let p = e.path();
+            if p.is_dir() && p.file_name().is_some_and(|n| n != "target") {
+                walk(&p, out);
+            } else if p.extension().is_some_and(|x| x == "rs") {
+                if let Ok(t) = std::fs::read_to_string(&p) {
+                    out.push((p.to_string_lossy().replace('\\', "/"), t));
+                }
+            }
+        }
+    }
+    if !std::path::Path::new("src/sortie_runner.rs").is_file() {
+        return None;
+    }
+    let mut out = Vec::new();
+    for root in ["src", "crates"] {
+        walk(std::path::Path::new(root), &mut out);
+    }
+    Some(out)
+}
+
+/// A spec's words the app must write for them to mean anything: every
+/// `event` trigger's kind and event, and every `expect_give_up`, as string
+/// literals somewhere in the app's code. `sources`: (path, text).
+pub fn spec_word_problems(spec: &Spec, sources: &[(String, String)]) -> Vec<String> {
+    let code: Vec<String> = sources
+        .iter()
+        .filter(|(p, _)| !p.ends_with("sortie_runner.rs"))
+        .map(|(_, t)| code_of(t))
+        .collect();
+    let written = |w: &str| {
+        let lit = format!("\"{w}\"");
+        code.iter().any(|c| c.contains(&lit))
+    };
+    let mut out = Vec::new();
+    for c in &spec.cases {
+        for s in &c.steps {
+            if let Trigger::Event { kind, event } = &s.when {
+                for w in std::iter::once(kind).chain(event.as_ref()) {
+                    if !written(w) {
+                        out.push(format!("case {:?}: no record writes {w:?}", c.name));
+                    }
+                }
+            }
+        }
+        if let Some(g) = &c.expect_give_up {
+            if !written(g) {
+                out.push(format!("case {:?}: no give-up is named {g:?}", c.name));
+            }
+        }
+    }
+    out
+}
+
+/// `xvl sortie <spec> --check`: the spec parsed, its plan words resolved
+/// when a SimBrief id is set (else said), every typed line routed offline
+/// on its airframe's profile. `Ok(true)`: no problem. No sim is asked.
+async fn check_cmd(spec_path: &str) -> Result<bool> {
+    let text =
+        std::fs::read_to_string(spec_path).map_err(|e| anyhow!("reading {spec_path}: {e}"))?;
+    let mut notes = Vec::new();
+    let mut shape_bad = 0;
+    let installed = std::path::Path::new(&crate::config::xplane_root()).is_dir();
+    let mut spec = if installed {
+        parse_spec(&text)?
+    } else {
+        notes.push("no X-Plane install here: the aircraft paths are not checked".into());
+        parse_spec_with(&text, &|_| true)?
+    };
+    if spec.cases.iter().any(Case::uses_plan) {
+        if crate::settings::live().simbrief_id.trim().is_empty() {
+            notes.push("no XCOPILOT_SIMBRIEF_ID: the plan's fields are not resolved".into());
+        } else {
+            match with_the_plan(spec.clone()).await {
+                Ok(s) => spec = s,
+                Err(e) => notes.push(format!("the plan's fields are not resolved: {e}")),
+            }
+        }
+    }
+    match checkout_sources() {
+        Some(src) => {
+            let read = |p: &str| {
+                src.iter()
+                    .find(|(path, _)| path == p)
+                    .map(|(_, t)| t.clone())
+            };
+            let problems: Vec<String> = shape_problems(&read)
+                .into_iter()
+                .chain(spec_word_problems(&spec, &src))
+                .collect();
+            for p in &problems {
+                notes.push(format!("PROBLEM: {p}"));
+            }
+            shape_bad = problems.len();
+        }
+        None => notes.push("not run from the checkout: the record shapes are not checked".into()),
+    }
+    let mut rows = Vec::new();
+    for c in &spec.cases {
+        let (prof, note) = check_profile(c.aircraft.as_deref());
+        rows.extend(check_case(c, &prof, &note));
+    }
+    print!("{}", check_table(spec_path, &rows, &notes));
+    Ok(shape_bad == 0 && rows.iter().all(|r| r.problem.is_none()))
+}
+
 pub async fn main_cmd(args: &[String], base_url: &str, apt_dat: &str) -> Result<bool> {
     let mut spec_path = None;
     let mut repeat = 1u32;
     let mut log = "logs/blackbox.jsonl".to_string();
+    let mut check = false;
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -3341,11 +3949,16 @@ pub async fn main_cmd(args: &[String], base_url: &str, apt_dat: &str) -> Result<
                     .ok_or_else(|| anyhow!("--log needs a path"))?
                     .clone()
             }
+            "--check" => check = true,
             _ => spec_path = Some(a.clone()),
         }
     }
-    let spec_path = spec_path
-        .ok_or_else(|| anyhow!("usage: xvl sortie <spec.yaml> [--repeat N] [--log path]"))?;
+    let spec_path = spec_path.ok_or_else(|| {
+        anyhow!("usage: xvl sortie <spec.yaml> [--repeat N] [--log path] [--check]")
+    })?;
+    if check {
+        return check_cmd(&spec_path).await;
+    }
     let text =
         std::fs::read_to_string(&spec_path).map_err(|e| anyhow!("reading {spec_path}: {e}"))?;
     let mut spec = parse_spec(&text)?;
@@ -3547,11 +4160,7 @@ mod tests {
     /// local planner's branch first (`flightplan::parse_request`), then the
     /// grammar.
     fn routed(line: &str, prof: &crate::aircraft::AircraftProfile) -> Option<String> {
-        if crate::flightplan::parse_request(line).is_some_and(|r| r.dest.is_some()) {
-            return Some("plan_flight".into());
-        }
-        let reg = crate::tools::Registry::for_aircraft(prof);
-        crate::grammar::try_parse(line, &reg, prof).map(|c| c[0].name.clone())
+        route_of(line, &crate::tools::Registry::for_aircraft(prof), prof)
     }
 
     /// Every line a shipped spec types is the app's real phrasing: each
@@ -3592,6 +4201,198 @@ mod tests {
         assert_eq!(calls[0].arguments, json!({"off": true}));
         let calls = crate::grammar::try_parse("resume flight plan", &reg, &b738).unwrap();
         assert_eq!(calls[0].arguments["resume"], true, "{calls:?}");
+    }
+
+    /// `xvl sortie --check` over every shipped spec: every line routed as
+    /// the command loop routes it (the pre-grammar shortcuts first), on the
+    /// case's own airframe, and no problem anywhere.
+    #[test]
+    fn the_check_passes_every_shipped_spec() {
+        let mut lines = 0;
+        for (path, spec) in bench_specs() {
+            for c in &spec.cases {
+                let prof = bench_profile(c.aircraft.as_deref());
+                for r in check_case(c, &prof, "") {
+                    assert!(r.problem.is_none(), "{} {r:?}", path.display());
+                    lines += 1;
+                }
+            }
+        }
+        assert!(lines >= 20, "{lines}");
+    }
+
+    fn check_spec_of(text: &str) -> Vec<LineCheck> {
+        let spec = parse_spec_with(text, &|_| true).unwrap();
+        let prof = bench_profile(None);
+        spec.cases
+            .iter()
+            .flat_map(|c| check_case(c, &prof, ""))
+            .collect()
+    }
+
+    /// The check fails a line a pre-grammar shortcut takes (the enroute
+    /// setup answered as a top of descent question, LEMG 2026-09-28), a
+    /// step that reaches another tool, and a command that reaches none;
+    /// the setup's own words are checked, an unknown runway is skipped.
+    #[test]
+    fn the_check_fails_a_line_the_loop_would_not_route_to_its_tool() {
+        let rows = check_spec_of(
+            r#"
+cases:
+  - name: a
+    setup: { enroute: { at: before_tod_nm, value: 30 } }
+    command: fly the flight plan
+  - name: a2
+    setup: { enroute: { at: before_destination_nm, value: 40 } }
+    command: fly the flight plan
+  - name: a3
+    setup: { enroute: { at: fix, value: WELIN } }
+    command: fly the flight plan
+  - name: b
+    setup: { ramp: { field: LEMG } }
+    steps:
+      - { say: fly a circuit, when: start, tool: full_auto }
+      - { say: how long to top of descent, when: { after_s: 5 }, tool: full_auto }
+      - { say: flaps five, when: { after_s: 5 }, tool: full_auto }
+  - name: c
+    setup: { runway_start: { field: LEMG, runway: "13" } }
+    command: banana split
+  - name: d
+    setup: { approach: { field: LEMG, runway: wind } }
+  - name: e
+    setup: { approach: { field: LEMG, runway: "13", final_nm: 8 } }
+"#,
+        );
+        let row = |line: &str| rows.iter().find(|r| r.line == line).unwrap();
+        // "Before the destination" carries "route" and "the", the flight
+        // plan brief's words: this check found it (2026-09-29).
+        for line in [
+            "put us enroute 30 miles before top of descent",
+            "put us enroute 40 miles before the destination",
+            "put us enroute at WELIN",
+        ] {
+            let r = row(line);
+            assert_eq!((r.routes_to.as_str(), &r.problem), ("setup_enroute", &None), "{line}");
+        }
+        assert!(row("fly the flight plan").problem.is_none());
+        let tod = row("how long to top of descent");
+        assert_eq!(tod.routes_to, "top of descent question");
+        assert_eq!(
+            tod.problem.as_deref(),
+            Some("taken before the grammar (top of descent question)")
+        );
+        assert_eq!(row("flaps five").problem.as_deref(), Some("the step names full_auto"));
+        assert_eq!(row("banana split").problem.as_deref(), Some("reaches no tool"));
+        let wind = row("put us on a 10 mile final to LEMG runway WIND");
+        assert_eq!((wind.routes_to.as_str(), &wind.problem), ("-", &None));
+        let e = row("put us on a 8 mile final to LEMG runway 13");
+        assert_eq!((e.routes_to.as_str(), &e.problem), ("setup_approach", &None));
+        let table = check_table("x.yaml", &rows, &["a note".into()]);
+        assert!(table.contains("| PROBLEM: the step names full_auto |"), "{table}");
+        assert!(table.contains("- a note\n"), "{table}");
+        assert!(table.ends_with("3 problems in 12 lines.\n"), "{table}");
+    }
+
+    fn source(path: &str) -> Option<String> {
+        std::fs::read_to_string(path).ok()
+    }
+
+    /// Every record shape the runner matches on is one the app writes, at
+    /// the snippet named and with the fields read; a producer that changes
+    /// shape is caught. d270a29: full auto's give-up was read as `event`
+    /// `give_up` with a top-level `reason`, a shape it never wrote.
+    #[test]
+    fn every_record_the_runner_reads_is_one_the_app_writes() {
+        assert_eq!(shape_problems(&source), Vec::<String>::new());
+        // Full auto writing its give-up the way the runner once read it.
+        let moved = |p: &str| {
+            let t = source(p)?;
+            Some(match p {
+                "src/full_auto.rs" => t.replace(
+                    r#"json!({ "stage": stage, "detail": detail })"#,
+                    r#"json!({ "event": stage, "reason": detail })"#,
+                ),
+                "src/scorecard.rs" => t.replace(r#""ended_airborne""#, r#""airborne""#),
+                _ => t,
+            })
+        };
+        let problems = shape_problems(&moved);
+        assert!(
+            problems.iter().any(|p| p.starts_with("full_auto stage=give_up: src/full_auto.rs")),
+            "{problems:?}"
+        );
+        assert!(
+            problems
+                .iter()
+                .any(|p| p == "sortie_result: no producer writes the field ended_airborne"),
+            "{problems:?}"
+        );
+    }
+
+    /// Every field the runner's code reads from a record is in
+    /// [`READ_SHAPES`] (or the writer's own), so a new read is pinned to a
+    /// producer the day it is written.
+    #[test]
+    fn every_field_the_runner_reads_is_in_the_shape_table() {
+        let text = source("src/sortie_runner.rs").unwrap();
+        let code = &text[..text.find("#[cfg(test)]\nmod tests").unwrap()];
+        let mut known: Vec<&str> = WRITER_FIELDS.to_vec();
+        for s in READ_SHAPES {
+            known.push(s.key);
+            known.extend(s.fields);
+        }
+        known.push("event");
+        let mut read = Vec::new();
+        for prefix in ["st(r, \"", "st(s, \"", ".get(\"", "n(\"", "f(\"", "pointer(\""] {
+            for (i, _) in code.match_indices(prefix) {
+                let before = code[..i].chars().next_back().unwrap_or(' ');
+                if prefix.len() <= 3 && (before.is_alphanumeric() || before == '_') {
+                    continue;
+                }
+                let rest = &code[i + prefix.len()..];
+                let lit = &rest[..rest.find('"').unwrap()];
+                read.extend(lit.split('/').filter(|w| !w.is_empty()).map(str::to_string));
+            }
+        }
+        assert!(read.iter().any(|f| f == "reason"), "{read:?}");
+        assert!(read.iter().any(|f| f == "relative_path"), "{read:?}");
+        let unknown: Vec<&String> = read.iter().filter(|f| !known.contains(&f.as_str())).collect();
+        assert!(unknown.is_empty(), "read but not in READ_SHAPES: {unknown:?}");
+    }
+
+    /// A spec's event triggers and expected give-ups name words the app
+    /// writes; a made-up one is caught.
+    #[test]
+    fn a_specs_event_and_give_up_are_words_the_app_writes() {
+        let sources = checkout_sources().unwrap();
+        for (path, spec) in bench_specs() {
+            assert_eq!(
+                spec_word_problems(&spec, &sources),
+                Vec::<String>::new(),
+                "{}",
+                path.display()
+            );
+        }
+        let spec = parse_spec_with(
+            r#"
+cases:
+  - name: x
+    setup: { ramp: { field: LEMG } }
+    command: fly a circuit
+    expect_give_up: took_a_nap
+    steps:
+      - { say: flaps five, when: { event: { kind: loading, event: nap_time } }, tool: flaps }
+"#,
+            &|_| true,
+        )
+        .unwrap();
+        assert_eq!(
+            spec_word_problems(&spec, &sources),
+            vec![
+                "case \"x\": no record writes \"nap_time\"".to_string(),
+                "case \"x\": no give-up is named \"took_a_nap\"".to_string(),
+            ]
+        );
     }
 
     /// The aircraft named in a spec is an installed `.acf`, checked when the
@@ -4176,7 +4977,7 @@ mod tests {
             m.feed(&rec(
                 41.0,
                 "full_auto",
-                json!({"event": "give_up", "reason": reason, "sortie": "s"}),
+                json!({"stage": "give_up", "detail": {"reason": reason}, "sortie": "s"}),
             ));
             finished(m.feed(&rec(
                 42.0,
@@ -4451,7 +5252,8 @@ mod tests {
         m.feed(&rec(
             50.0,
             "full_auto",
-            json!({"event": "give_up", "reason": "stagnant", "sortie": "9-full_auto"}),
+            json!({"stage": "give_up", "detail": {"reason": "stagnant"},
+                   "sortie": "9-full_auto"}),
         ));
         m.feed(&rec(
             50.0,
@@ -6313,7 +7115,8 @@ mod tests {
         // impact; a new sortie clears it.
         for (r, want) in [
             (
-                json!({"kind": "full_auto", "event": "give_up", "reason": "ap_not_engaged"}),
+                json!({"kind": "full_auto", "stage": "give_up",
+                       "detail": {"reason": "ap_not_engaged"}}),
                 "give-up (ap_not_engaged)",
             ),
             (

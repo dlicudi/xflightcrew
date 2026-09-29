@@ -2251,7 +2251,16 @@ async fn run_session(
         // unreliable here (it had the fuel in its context and still said "I don't
         // have fuel information"). A fuel question reads the datarefs and is spoken
         // straight back.
-        if is_fuel_query(&command) && grammar::try_parse(&command, &registry, &profile).is_none() {
+        // The pre-grammar shortcuts' decisions, taken once from the words
+        // (`question_shortcut`): every branch below that answers on words
+        // alone asks this, so `xvl sortie --check` sees what the loop does.
+        let shortcut = question_shortcut(
+            &command,
+            &registry,
+            &profile,
+            fp_cache.as_ref().map(|(_, fp)| fp),
+        );
+        if shortcut == Some(Shortcut::Fuel) {
             // The landing-fuel projection needs the destination, which is only
             // populated by a plan fetch — after a restart it's empty until
             // something asks. Prime it (cached, cheap) so "will we have enough
@@ -2631,16 +2640,8 @@ async fn run_session(
             // Reminder memory: cancel or list what's armed ("cancel the reminders",
             // "do we have a reminder set?"). Checked before set_reminder so "cancel"
             // wins over arming.
-            if tl.contains("reminder") {
-                if tl.contains("cancel")
-                    || tl.contains("clear")
-                    || tl.contains("forget")
-                    || tl.contains("remove")
-                    || tl.contains("delete")
-                    || tl.contains("scrap")
-                    || tl.contains("never mind")
-                    || tl.contains("nevermind")
-                {
+            {
+                if shortcut == Some(Shortcut::ReminderCancel) {
                     let n = reminders.cancel_all();
                     let line = match n {
                         0 => "No reminders to cancel.".to_string(),
@@ -2653,14 +2654,7 @@ async fn run_session(
                 // A mention of reminders with no arming cue is a recall ("do we have a
                 // reminder?"). If it names a condition ("set a reminder to wake me at
                 // 5000 feet"), fall through to arm it instead.
-                let arming = tl.contains("wake")
-                    || tl.contains("descent")
-                    || tl.contains("feet")
-                    || tl.contains("altitude")
-                    || tl.contains("minute")
-                    || tl.contains("waypoint")
-                    || tl.contains("reach");
-                if !arming {
+                if shortcut == Some(Shortcut::ReminderList) {
                     let list = reminders.active();
                     let line = if list.is_empty() {
                         "No reminders set.".to_string()
@@ -2675,25 +2669,13 @@ async fn run_session(
             }
             // "Check the flight plan": the whole-flight audit, nothing armed. Before the
             // systems check, whose "check ... aircraft" these words can have.
-            if grammar::plan_check_request(&tl) {
+            if shortcut == Some(Shortcut::PlanCheck) {
                 reporter.status(ui::Phase::Thinking);
                 let line = plan::plan_check_report(&config, &xplane, &mut fp_cache).await;
                 say(&voice, &reporter, ui::LogKind::Readback, &line);
                 continue;
             }
-            if tl.contains("all systems") || tl.contains("systems check") || tl.contains("safe parameter")
-                || tl.contains("in the green") || tl.contains("status check")
-                // "Anything to check?" / "anything I should check?" — a systems
-                // check by intent; went completely unanswered live (no matcher,
-                // and the continuous-mode gate drops non-matches silently).
-                || (tl.contains("anything") && tl.contains("check"))
-                // "aircraft health check" / "check the aircraft" — same intent;
-                // two phrasings went silent live before a third one landed.
-                || (tl.contains("check") && (tl.contains("aircraft") || tl.contains("health")))
-                // "How's the aircraft health?" / "How's the aircraft doing?" —
-                // no "check" at all; both dead-ended on the Twotter flight.
-                || (tl.contains("aircraft") && (tl.contains("health") || tl.contains("doing")))
-            {
+            if shortcut == Some(Shortcut::SystemsCheck) {
                 let line = systems_check(&xplane, &profile).await;
                 say(&voice, &reporter, ui::LogKind::Readback, &line);
                 continue;
@@ -2701,22 +2683,28 @@ async fn run_session(
             // Power-loss diagnosis ("why have we lost power?", "the engine quit") —
             // went unrecognized live. Phrased as a question, but what it wants is
             // the engine's fuel/ignition chain read and the culprit named.
-            if is_power_loss_query(&tl) {
+            if shortcut == Some(Shortcut::PowerLoss) {
                 let line = power_loss_diagnosis(&xplane, &profile).await;
                 say(&voice, &reporter, ui::LogKind::Readback, &line);
                 continue;
             }
-            if let Some(line) = reference_limits(&profile, &tl) {
+            if let Some(line) = (shortcut == Some(Shortcut::ReferenceLimits))
+                .then(|| reference_limits(&profile, &tl))
+                .flatten()
+            {
                 conversation.reference(&profile.display_name, &line, Instant::now());
                 say(&voice, &reporter, ui::LogKind::Readback, &line);
                 continue;
             }
-            if systems::is_systems_query(&tl) {
+            if shortcut == Some(Shortcut::SystemsSurvey) {
                 let line = systems::current().line();
                 say(&voice, &reporter, ui::LogKind::Readback, &line);
                 continue;
             }
-            if let Some(line) = aircraft_info(&profile, &tl) {
+            if let Some(line) = (shortcut == Some(Shortcut::AircraftInfo))
+                .then(|| aircraft_info(&profile, &tl))
+                .flatten()
+            {
                 conversation.reference(&profile.display_name, &line, Instant::now());
                 say(&voice, &reporter, ui::LogKind::Readback, &line);
                 continue;
@@ -2729,7 +2717,13 @@ async fn run_session(
             // authorises nothing; "load it" is a separate word.
             {
                 let asked = plan_pending.is_some_and(|t| t.elapsed() < PLAN_ASK_WINDOW);
-                let req = flightplan::parse_request(&tl).or_else(|| {
+                // The shortcuts before it have all answered: here it is this
+                // one, a later one, or none, and the short answer to "to
+                // where?" comes ahead of the later ones as it always did.
+                let planned = (shortcut == Some(Shortcut::PlanFlight))
+                    .then(|| flightplan::parse_request(&tl))
+                    .flatten();
+                let req = planned.or_else(|| {
                     // An answer is a place, short, and not a command in its own right.
                     let words = tl.split_whitespace().count();
                     let reply = tl.trim().strip_prefix("to ").unwrap_or(tl.trim());
@@ -2764,12 +2758,6 @@ async fn run_session(
             // arm, not a status query to answer now. Let it fall through to the tool
             // layer so it doesn't get hijacked by the nav-progress branch below (both
             // mention "next waypoint").
-            let is_reminder = tl.contains("wake")
-                || tl.contains("remind")
-                || tl.contains("notify")
-                || tl.contains("let me know")
-                || tl.contains("tell me when")
-                || tl.contains("heads up");
             // Time/distance to top of descent ("how long before TOD"). Guarded by
             // is_reminder so "wake me at top of descent" still arms the reminder.
             // "top of descent" is reliably misheard ("when is top of descent" came in
@@ -2779,14 +2767,7 @@ async fn run_session(
             // "Put us enroute 30 miles before top of descent" is the enroute
             // setup, not a question (answered "Top of descent about 893 miles
             // ahead" at LEMG, 2026-09-28, and the setup never ran).
-            if !is_reminder
-                && !crate::grammar::enroute_setup_request(&command)
-                && ((tl.contains("top") && tl.contains("descent"))
-                    || tl.contains("t o d")
-                    || tl
-                        .split(|c: char| !c.is_ascii_alphanumeric())
-                        .any(|w| w == "tod"))
-            {
+            if shortcut == Some(Shortcut::TopOfDescent) {
                 let line = time_to_tod(&config, &xplane, &mut fp_cache).await;
                 conversation.observe(&command, &line, Instant::now());
                 say(&voice, &reporter, ui::LogKind::Readback, &line);
@@ -2797,7 +2778,7 @@ async fn run_session(
             // and reading them back for an arrival question is a confident wrong
             // answer (seen live 45 nm out of Malaga, 2026-09-12). The real-weather
             // METAR file is the honest source; without one, say so.
-            if !is_reminder && weather_words(&tl) {
+            if shortcut == Some(Shortcut::RemoteWeather) {
                 if let Some(target) =
                     remote_weather_target(&tl, fp_cache.as_ref().map(|(_, fp)| fp))
                 {
@@ -2821,7 +2802,7 @@ async fn run_session(
             // ETA to the destination ("time before we land", "when do we get in",
             // "how far before we land"): distance to the destination airport over
             // groundspeed. Beats the next-waypoint branch below (`eta_question`).
-            if !is_reminder && eta_question(&tl) {
+            if shortcut == Some(Shortcut::Eta) {
                 let line = eta_to_destination(&config, &xplane, &mut fp_cache).await;
                 conversation.observe(&command, &line, Instant::now());
                 say(&voice, &reporter, ui::LogKind::Readback, &line);
@@ -2829,13 +2810,7 @@ async fn run_session(
             }
             // Destination field elevation — from the plan's destination record,
             // never the LLM (which answered "9999 feet": our own cruise altitude).
-            if !is_reminder
-                && (tl.contains("destination") || tl.contains("arrival"))
-                && (tl.contains("altitude")
-                    || tl.contains("elevation")
-                    || tl.contains("height")
-                    || tl.contains("how high"))
-            {
+            if shortcut == Some(Shortcut::DestinationElevation) {
                 if !config.simbrief_id.trim().is_empty() {
                     let _ = ensure_plan(&config, &mut fp_cache, PlanFetch::Cached).await;
                 }
@@ -2858,22 +2833,13 @@ async fn run_session(
             // "Do we have enough runway for takeoff?": the takeoff's own fit
             // and pavement rule, said as two numbers. Ahead of the runway
             // ADVICE below, whose "use"/"should" would otherwise take it.
-            if !is_reminder && answers::takeoff_runway_query(&tl) {
+            if shortcut == Some(Shortcut::TakeoffRunway) {
                 reporter.status(ui::Phase::Thinking);
                 let line = answers::takeoff_runway_answer(&xplane, &profile).await;
                 say(&voice, &reporter, ui::LogKind::Readback, &line);
                 continue;
             }
-            if !is_reminder
-                && tl.contains("runway")
-                && (tl.contains("which")
-                    || tl.contains("what")
-                    || tl.contains("should")
-                    || tl.contains("use")
-                    || tl.contains("best")
-                    || tl.contains("active")
-                    || tl.contains("recommend"))
-            {
+            if shortcut == Some(Shortcut::RunwayAdvice) {
                 reporter.status(ui::Phase::Thinking);
                 let line = runway_advice(&config, &xplane, &mut fp_cache).await;
                 say(&voice, &reporter, ui::LogKind::Readback, &line);
@@ -2881,44 +2847,27 @@ async fn run_session(
             }
             // "Are we good for landing?" — the landing-config check. Phrased as a
             // question so "set flaps for landing" (a command) never lands here.
-            if !is_reminder
-                && (tl.contains("good for landing")
-                    || tl.contains("ready for landing")
-                    || tl.contains("ready to land")
-                    || tl.contains("good to land")
-                    || (tl.contains("landing") && tl.contains("are we")))
-            {
+            if shortcut == Some(Shortcut::LandingReadiness) {
                 let line = landing_readiness(&xplane, &profile).await;
                 say(&voice, &reporter, ui::LogKind::Readback, &line);
                 continue;
             }
             // "Do we need any lights on?" / "are we configured?" — the SOP table
             // answers. Guarded so light *commands* ("nav lights on") never match.
-            if !is_reminder
-                && (tl.contains("light") || tl.contains("configur"))
-                && (tl.contains("need")
-                    || tl.contains("should")
-                    || tl.contains("do we")
-                    || tl.contains("are we")
-                    || tl.contains("anything"))
-            {
+            if shortcut == Some(Shortcut::ConfigAdvice) {
                 let line = config_advice(&xplane, &profile).await;
                 say(&voice, &reporter, ui::LogKind::Readback, &line);
                 continue;
             }
             // "Any traffic around?" — the TCAS scan, spoken as clock positions.
-            if !is_reminder && tl.contains("traffic") {
+            if shortcut == Some(Shortcut::Traffic) {
                 let line = traffic_report(&xplane).await;
                 say(&voice, &reporter, ui::LogKind::Readback, &line);
                 continue;
             }
             // "Are we on course / on track?" — HSI deviation + waypoint, computed
             // (the LLM once answered this with the single word "heading").
-            if !is_reminder
-                && (tl.contains("on course")
-                    || tl.contains("off course")
-                    || tl.contains("on track"))
-            {
+            if shortcut == Some(Shortcut::OnCourse) {
                 let line = on_course_report(&xplane, Some(&live)).await;
                 say(&voice, &reporter, ui::LogKind::Readback, &line);
                 continue;
@@ -2928,7 +2877,7 @@ async fn run_session(
             // whisper spells a fix it has never seen phonetically ("pimmons"
             // for PIMOS, live 2026-09-12). Only a plan already on the shelf is
             // consulted: a stray "for X" must never trigger a SimBrief fetch.
-            if !is_reminder {
+            if shortcut == Some(Shortcut::NamedFix) {
                 if let Some(q) = fp_cache
                     .as_ref()
                     .and_then(|(_, fp)| fix_query(&tl, &fp.waypoints))
@@ -2941,17 +2890,7 @@ async fn run_session(
             }
             // Navigation progress (often a command, not a question): ETA / distance /
             // time to the next waypoint.
-            if !is_reminder
-                && (tl.contains("next waypoint")
-                    || tl.contains("next fix")
-                    || tl.contains("eta")
-                    || tl.contains("how far")
-                    || tl.contains("time to")
-                    || tl.contains("distance to")
-                    || tl.contains("how much left")
-                    || tl.contains("how much further")
-                    || tl.contains("how much longer"))
-            {
+            if shortcut == Some(Shortcut::NavProgress) {
                 let line = nav_progress(&xplane, Some(&live)).await;
                 conversation.observe(&command, &line, Instant::now());
                 say(&voice, &reporter, ui::LogKind::Readback, &line);
@@ -2959,24 +2898,10 @@ async fn run_session(
             }
             // "route" is reliably misheard as "root"/"road" (both meaningless in a
             // cockpit), so accept them as synonyms.
-            let routeish = tl.contains("route") || tl.contains("root") || tl.contains("road");
-            // Load the SimBrief route into the GPS/FMS (checked before the brief, so
-            // "load the flight plan" loads rather than just reading it back).
-            // "load it" / "send that" right after a local plan was briefed is the
-            // follow-up the brief itself invites.
-            let load_followup =
-                fp_cache.is_some() && tl.split_whitespace().any(|w| w == "it" || w == "that");
-            // Not the load SHEET ("load the fuel from the flight plan"): that is
-            // the `load_aircraft` tool's, through the grammar below.
-            let wants_load = !grammar::load_aircraft_request(&tl)
-                && (tl.contains("load") || tl.contains("program") || tl.contains("send"))
-                && (routeish
-                    || load_followup
-                    || tl.contains("plan")
-                    || tl.contains("gps")
-                    || tl.contains("fms")
-                    || tl.contains("flight"));
-            if wants_load {
+            // Load the SimBrief route into the GPS/FMS (checked before the
+            // brief, so "load the flight plan" loads rather than reads it back),
+            // never the load SHEET, which is `load_aircraft`'s.
+            if shortcut == Some(Shortcut::LoadRoute) {
                 reporter.status(ui::Phase::Thinking);
                 let line =
                     load_route_to_fms(&config, &xplane, &mut fp_cache, plan_fetch_for(&tl)).await;
@@ -2986,7 +2911,7 @@ async fn run_session(
             // "That's the wrong flight plan": the pilot has regenerated it on
             // SimBrief; fetch again and say whether anything actually changed
             // (whisper: "wrong flag plan", live 2026-09-14).
-            if wrong_plan_complaint(&tl) {
+            if shortcut == Some(Shortcut::WrongPlan) {
                 reporter.status(ui::Phase::Thinking);
                 let before = fp_cache.as_ref().map(|(_, fp)| fp.clone());
                 let line = match ensure_plan(&config, &mut fp_cache, PlanFetch::Forced).await {
@@ -3004,25 +2929,11 @@ async fn run_session(
             // refresh. Not when the intent is to *fly* it ("follow/navigate/track"
             // is the navigate tool; the word "fly" is the full-auto SimBrief
             // mission — both handled via the grammar/LLM path below).
-            let nav_intent = grammar::flight_plan_request(&tl)
-                || grammar::resume_plan_request(&tl)
-                || tl.contains("navigate")
-                || tl.contains("follow")
-                || tl.contains("track")
-                || tl
-                    .split(|c: char| !c.is_ascii_alphanumeric())
-                    .any(|w| w == "fly" || w == "execute");
-            let is_plan = !nav_intent
-                && (tl.contains("flight plan")
-                    || tl.contains("simbrief")
-                    || tl.contains("fetch the plan")
-                    || tl.contains("where are we going")
-                    || tl.contains("where are we headed")
-                    || (routeish
-                        && (tl.contains("our") || tl.contains("the") || tl.contains("what"))));
-            if is_plan {
+            if shortcut == Some(Shortcut::PlanBrief) {
                 reporter.status(ui::Phase::Thinking);
-                let want_route = routeish;
+                // "route" is reliably misheard as "root"/"road".
+                let want_route =
+                    tl.contains("route") || tl.contains("root") || tl.contains("road");
                 let line = flight_plan_report(
                     &config,
                     &xplane,
@@ -4319,6 +4230,369 @@ fn install_home_station(config: &Config, voice: &voice::Voice) -> Option<station
             .ok();
     }
     Some(st)
+}
+
+/// A branch of the command loop that answers (or acts on) a line from its
+/// words alone, before the grammar ever sees it. The loop routes through
+/// [`question_shortcut`], in this order, and `xvl sortie --check` asks the
+/// same function whether a scripted line is taken here instead of reaching
+/// its tool: LEMG (2026-09-28) "put us enroute 30 miles before top of
+/// descent" was answered "Top of descent about 893 miles ahead" and the
+/// setup never ran.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum Shortcut {
+    Fuel,
+    ReminderCancel,
+    ReminderList,
+    PlanCheck,
+    SystemsCheck,
+    PowerLoss,
+    ReferenceLimits,
+    SystemsSurvey,
+    AircraftInfo,
+    PlanFlight,
+    TopOfDescent,
+    RemoteWeather,
+    Eta,
+    DestinationElevation,
+    TakeoffRunway,
+    RunwayAdvice,
+    LandingReadiness,
+    ConfigAdvice,
+    Traffic,
+    OnCourse,
+    NamedFix,
+    NavProgress,
+    LoadRoute,
+    WrongPlan,
+    PlanBrief,
+}
+
+impl Shortcut {
+    /// Every shortcut, in the loop's order.
+    #[cfg(test)]
+    pub(crate) const ALL: [Shortcut; 25] = [
+        Shortcut::Fuel,
+        Shortcut::ReminderCancel,
+        Shortcut::ReminderList,
+        Shortcut::PlanCheck,
+        Shortcut::SystemsCheck,
+        Shortcut::PowerLoss,
+        Shortcut::ReferenceLimits,
+        Shortcut::SystemsSurvey,
+        Shortcut::AircraftInfo,
+        Shortcut::PlanFlight,
+        Shortcut::TopOfDescent,
+        Shortcut::RemoteWeather,
+        Shortcut::Eta,
+        Shortcut::DestinationElevation,
+        Shortcut::TakeoffRunway,
+        Shortcut::RunwayAdvice,
+        Shortcut::LandingReadiness,
+        Shortcut::ConfigAdvice,
+        Shortcut::Traffic,
+        Shortcut::OnCourse,
+        Shortcut::NamedFix,
+        Shortcut::NavProgress,
+        Shortcut::LoadRoute,
+        Shortcut::WrongPlan,
+        Shortcut::PlanBrief,
+    ];
+
+    /// The branch's name in a check's table; the local planner's is the
+    /// `plan_flight` a spec step names.
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            Shortcut::Fuel => "fuel question",
+            Shortcut::ReminderCancel => "reminder cancel",
+            Shortcut::ReminderList => "reminder list",
+            Shortcut::PlanCheck => "plan check",
+            Shortcut::SystemsCheck => "systems check",
+            Shortcut::PowerLoss => "power loss question",
+            Shortcut::ReferenceLimits => "reference limits",
+            Shortcut::SystemsSurvey => "systems survey",
+            Shortcut::AircraftInfo => "aircraft info",
+            Shortcut::PlanFlight => "plan_flight",
+            Shortcut::TopOfDescent => "top of descent question",
+            Shortcut::RemoteWeather => "weather question",
+            Shortcut::Eta => "eta question",
+            Shortcut::DestinationElevation => "destination elevation question",
+            Shortcut::TakeoffRunway => "takeoff runway question",
+            Shortcut::RunwayAdvice => "runway advice",
+            Shortcut::LandingReadiness => "landing readiness question",
+            Shortcut::ConfigAdvice => "config advice",
+            Shortcut::Traffic => "traffic question",
+            Shortcut::OnCourse => "on course question",
+            Shortcut::NamedFix => "named fix question",
+            Shortcut::NavProgress => "next waypoint question",
+            Shortcut::LoadRoute => "load the route",
+            Shortcut::WrongPlan => "wrong plan",
+            Shortcut::PlanBrief => "flight plan brief",
+        }
+    }
+}
+
+/// The command loop's pre-grammar shortcut for this line, if one takes it:
+/// the loop's decisions without their speech. `plan` is the flight plan on
+/// the shelf (`None`: the fix and "load it" readings cannot match). Pure.
+pub(crate) fn question_shortcut(
+    command: &str,
+    registry: &Registry,
+    profile: &aircraft::AircraftProfile,
+    plan: Option<&simbrief::FlightPlan>,
+) -> Option<Shortcut> {
+    use Shortcut::*;
+    let tl = command.to_ascii_lowercase();
+    // A new flight's setup is never a question: "put us enroute 30 miles
+    // before top of descent" was answered as one at LEMG (2026-09-28), and
+    // "enroute ... before the destination" carries "route" and "the", the
+    // flight plan brief's words (`xvl sortie --check`, 2026-09-29).
+    if grammar::enroute_setup_request(command) || grammar::approach_setup_request(&tl) {
+        return None;
+    }
+    if is_fuel_query(command) && grammar::try_parse(command, registry, profile).is_none() {
+        return Some(Fuel);
+    }
+    let has = |w: &str| tl.contains(w);
+    let any = |ws: &[&str]| ws.iter().any(|w| tl.contains(w));
+    // Reminder memory: cancel or list what's armed. "Cancel" wins over
+    // arming; a mention naming a condition falls through to arm it.
+    if has("reminder") {
+        let cancel = [
+            "cancel", "clear", "forget", "remove", "delete", "scrap", "never mind", "nevermind",
+        ];
+        if any(&cancel) {
+            return Some(ReminderCancel);
+        }
+        let arming = ["wake", "descent", "feet", "altitude", "minute", "waypoint", "reach"];
+        if !any(&arming) {
+            return Some(ReminderList);
+        }
+    }
+    // Before the systems check, whose "check ... aircraft" these words can have.
+    if grammar::plan_check_request(&tl) {
+        return Some(PlanCheck);
+    }
+    let systems_check = any(&[
+        "all systems",
+        "systems check",
+        "safe parameter",
+        "in the green",
+        "status check",
+    ])
+        // "Anything to check?" / "anything I should check?"
+        || (has("anything") && has("check"))
+        // "aircraft health check" / "check the aircraft"
+        || (has("check") && (has("aircraft") || has("health")))
+        // "How's the aircraft health?" / "How's the aircraft doing?"
+        || (has("aircraft") && (has("health") || has("doing")));
+    if systems_check {
+        return Some(SystemsCheck);
+    }
+    if is_power_loss_query(&tl) {
+        return Some(PowerLoss);
+    }
+    if reference_limits(profile, &tl).is_some() {
+        return Some(ReferenceLimits);
+    }
+    if systems::is_systems_query(&tl) {
+        return Some(SystemsSurvey);
+    }
+    if aircraft_info(profile, &tl).is_some() {
+        return Some(AircraftInfo);
+    }
+    // The local planner ("plan a flight to Malaga", "divert"); its short
+    // answer to "to where?" is the loop's, on its own clock.
+    if flightplan::parse_request(&tl).is_some() {
+        return Some(PlanFlight);
+    }
+    // "wake me / remind me / let me know / tell me when ..." is a reminder
+    // to arm, not a status query to answer now.
+    let is_reminder =
+        any(&["wake", "remind", "notify", "let me know", "tell me when", "heads up"]);
+    if !is_reminder {
+        // "top of descent" is reliably misheard, so top+descent loosely.
+        let tod = (has("top") && has("descent"))
+            || has("t o d")
+            || tl.split(|c: char| !c.is_ascii_alphanumeric()).any(|w| w == "tod");
+        if tod {
+            return Some(TopOfDescent);
+        }
+        if weather_words(&tl) && remote_weather_target(&tl, plan).is_some() {
+            return Some(RemoteWeather);
+        }
+        if eta_question(&tl) {
+            return Some(Eta);
+        }
+        if (has("destination") || has("arrival"))
+            && any(&["altitude", "elevation", "height", "how high"])
+        {
+            return Some(DestinationElevation);
+        }
+        if answers::takeoff_runway_query(&tl) {
+            return Some(TakeoffRunway);
+        }
+        if has("runway")
+            && any(&["which", "what", "should", "use", "best", "active", "recommend"])
+        {
+            return Some(RunwayAdvice);
+        }
+        // Phrased as a question so "set flaps for landing" never lands here.
+        if any(&["good for landing", "ready for landing", "ready to land", "good to land"])
+            || (has("landing") && has("are we"))
+        {
+            return Some(LandingReadiness);
+        }
+        // Guarded so light COMMANDS ("nav lights on") never match.
+        if (has("light") || has("configur"))
+            && any(&["need", "should", "do we", "are we", "anything"])
+        {
+            return Some(ConfigAdvice);
+        }
+        if has("traffic") {
+            return Some(Traffic);
+        }
+        if any(&["on course", "off course", "on track"]) {
+            return Some(OnCourse);
+        }
+        // Only a plan already on the shelf is consulted.
+        if plan.is_some_and(|fp| fix_query(&tl, &fp.waypoints).is_some()) {
+            return Some(NamedFix);
+        }
+        if any(&[
+            "next waypoint",
+            "next fix",
+            "eta",
+            "how far",
+            "time to",
+            "distance to",
+            "how much left",
+            "how much further",
+            "how much longer",
+        ]) {
+            return Some(NavProgress);
+        }
+    }
+    // "route" is reliably misheard as "root"/"road".
+    let routeish = any(&["route", "root", "road"]);
+    // "load it" / "send that" right after a local plan was briefed.
+    let load_followup =
+        plan.is_some() && tl.split_whitespace().any(|w| w == "it" || w == "that");
+    // Not the load SHEET ("load the fuel from the flight plan").
+    let wants_load = !grammar::load_aircraft_request(&tl)
+        && any(&["load", "program", "send"])
+        && (routeish || load_followup || any(&["plan", "gps", "fms", "flight"]));
+    if wants_load {
+        return Some(LoadRoute);
+    }
+    if wrong_plan_complaint(&tl) {
+        return Some(WrongPlan);
+    }
+    // Not when the intent is to FLY it (the navigate tool, full auto).
+    let nav_intent = grammar::flight_plan_request(&tl)
+        || grammar::resume_plan_request(&tl)
+        || any(&["navigate", "follow", "track"])
+        || tl
+            .split(|c: char| !c.is_ascii_alphanumeric())
+            .any(|w| w == "fly" || w == "execute");
+    let is_plan = !nav_intent
+        && (any(&[
+            "flight plan",
+            "simbrief",
+            "fetch the plan",
+            "where are we going",
+            "where are we headed",
+        ]) || (routeish && any(&["our", "the", "what"])));
+    if is_plan {
+        return Some(PlanBrief);
+    }
+    None
+}
+
+/// Where the command loop takes a TYPED line before the grammar, on its
+/// words alone: the undo, the lesson and checklist words, a fresh
+/// conversation's answers, the [`question_shortcut`]s, the cabin, the taxi
+/// question, the radio coach, the recall and the question opener (a
+/// question never reaches a tool). What only a running flight decides (a
+/// flow's reply, an offer's yes, the release guard, a tuned tower) is not
+/// here. `None`: the line reaches the grammar. Pure.
+pub(crate) fn pre_grammar_capture(
+    line: &str,
+    registry: &Registry,
+    profile: &aircraft::AircraftProfile,
+) -> Option<&'static str> {
+    let tl = line.to_ascii_lowercase();
+    if is_undo(line) {
+        return Some("undo");
+    }
+    if flow::instruct_request(line).is_some() {
+        return Some("checklist instruct");
+    }
+    if instructor::request(line).is_some() {
+        return Some("instructor");
+    }
+    if rapport::arrival_brief_request(line) {
+        return Some("arrival brief");
+    }
+    if conversation::Conversation::default()
+        .respond(line, Instant::now())
+        .is_some()
+    {
+        return Some("conversation");
+    }
+    let shortcut = question_shortcut(line, registry, profile, None);
+    if shortcut == Some(Shortcut::Fuel) {
+        return shortcut.map(Shortcut::name);
+    }
+    if cabin::Cabin::addressed(line).is_some() {
+        return Some("cabin call");
+    }
+    if is_taxi_query(line) && grammar::try_parse(line, registry, profile).is_none() {
+        return Some("taxi question");
+    }
+    if station::freq_query(&tl) {
+        return Some("frequency briefing");
+    }
+    if station::coach_query(&tl) {
+        return Some("radio coach");
+    }
+    if let Some(s) = shortcut {
+        return Some(s.name());
+    }
+    let matchable = grammar::normalize(line);
+    if atc_recall_request(&matchable) || recall_ask(&matchable).is_some() {
+        return Some("recall");
+    }
+    if conversational(&matchable, registry).is_some() {
+        return Some("conversational");
+    }
+    if location_answer(&matchable, profile).is_some() {
+        return Some("location");
+    }
+    let parsed = grammar::try_parse(&matchable, registry, profile).is_some();
+    let opener_q = looks_like_question(matchable.trim_end_matches(['?', '.', ' ']));
+    if looks_like_question(&matchable) && (opener_q || !parsed) {
+        return Some("state question");
+    }
+    None
+}
+
+/// What only a running flight decides, said beside a line's route in a
+/// check: the release guard while a loop holds a control, a radio call
+/// while a tower is tuned (no radio key). Pure.
+pub(crate) fn state_capture_note(line: &str) -> Option<&'static str> {
+    let tl = line.to_ascii_lowercase();
+    let setup = grammar::approach_setup_request(&tl) || grammar::enroute_setup_request(&tl);
+    if setup {
+        return None;
+    }
+    if release_intent(&tl) {
+        return Some("the release guard takes it while a loop holds a control");
+    }
+    if station::is_radio_call(&tl, "") && tower::parse_intent(&tl) != tower::Intent::Unknown {
+        return Some("a tuned tower takes it as a radio call");
+    }
+    None
 }
 
 /// Content-based ATC routing for setups without a dedicated radio PTT. Physical
@@ -6318,5 +6592,95 @@ mod scratch_probe {
             let r = crate::grammar::try_parse(&m, &registry, &profile);
             println!("PROBE {t:?} -> {m:?} -> {:?}", r.map(|c| c.iter().map(|x| format!("{} {}", x.name, x.arguments)).collect::<Vec<_>>()));
         }
+    }
+}
+
+#[cfg(test)]
+mod shortcut_tests {
+    //! The command loop's pre-grammar shortcuts are one function's decisions
+    //! (`question_shortcut`), asked by the loop and by `xvl sortie --check`.
+    use super::*;
+
+    fn b738() -> (aircraft::AircraftProfile, Registry) {
+        let p = aircraft::load("boeing_737_800").unwrap();
+        let r = Registry::for_aircraft(&p);
+        (p, r)
+    }
+
+    /// The loop asks every shortcut, each once, in the function's order: a
+    /// branch that decides on its own words again is a branch the check
+    /// cannot see.
+    #[test]
+    fn the_loop_asks_every_shortcut_in_order() {
+        let src = include_str!("main.rs");
+        let start = src.find("async fn run_session(").expect("the command loop");
+        let end = start + src[start..].find("\n}\n").expect("its end");
+        let body = &src[start..end];
+        let asked: Vec<String> = body
+            .match_indices("Some(Shortcut::")
+            .map(|(i, _)| {
+                let rest = &body[i + "Some(Shortcut::".len()..];
+                rest[..rest.find(')').unwrap()].to_string()
+            })
+            .collect();
+        let want: Vec<String> = Shortcut::ALL.iter().map(|s| format!("{s:?}")).collect();
+        assert_eq!(asked, want);
+        let mut sorted = Shortcut::ALL.to_vec();
+        sorted.sort();
+        assert_eq!(sorted, Shortcut::ALL.to_vec(), "ALL is the enum's order");
+        // The loop's own copies of the conditions are gone.
+        let gone = ["let is_reminder", "let wants_load", "let is_plan", "is_fuel_query(&command)"];
+        for gone in gone {
+            assert!(!body.contains(gone), "{gone}");
+        }
+    }
+
+    /// LEMG (2026-09-28): the enroute setup's words were answered as a top
+    /// of descent question and the setup never ran. No setup's words are a
+    /// shortcut's; the questions still are.
+    #[test]
+    fn a_setup_is_never_a_question() {
+        use tools::setup_enroute::{enroute_line, EnroutePoint};
+        let (p, r) = b738();
+        for point in [
+            EnroutePoint::BeforeTod(30.0),
+            EnroutePoint::BeforeTod(0.0),
+            EnroutePoint::Fix("WELIN".into()),
+            EnroutePoint::BeforeDestination(40.0),
+        ] {
+            let line = enroute_line(&point);
+            assert_eq!(question_shortcut(&line, &r, &p, None), None, "{line}");
+            assert_eq!(pre_grammar_capture(&line, &r, &p), None, "{line}");
+        }
+        let line = "put us on a 10 mile final to LEMG runway 13";
+        assert_eq!(pre_grammar_capture(line, &r, &p), None);
+        for (line, want) in [
+            ("how long to top of descent", Some(Shortcut::TopOfDescent)),
+            ("wake me at top of descent", None),
+            ("what's the weather at the destination", Some(Shortcut::RemoteWeather)),
+            ("how far to the next waypoint", Some(Shortcut::NavProgress)),
+            ("cancel the reminders", Some(Shortcut::ReminderCancel)),
+            ("do we have a reminder", Some(Shortcut::ReminderList)),
+            ("plan a flight to LEZL", Some(Shortcut::PlanFlight)),
+            ("load the flight plan", Some(Shortcut::LoadRoute)),
+            ("load the aircraft", None),
+            ("fly the flight plan", None),
+            ("what's our flight plan", Some(Shortcut::PlanBrief)),
+        ] {
+            assert_eq!(question_shortcut(line, &r, &p, None), want, "{line}");
+        }
+        // Past the shortcuts: a question never reaches a tool.
+        assert_eq!(
+            pre_grammar_capture("is the gear down?", &r, &p),
+            Some("state question")
+        );
+        for line in ["fly a circuit", "reject the takeoff", "resume flight plan", "flaps five"] {
+            assert_eq!(pre_grammar_capture(line, &r, &p), None, "{line}");
+        }
+        assert_eq!(
+            state_capture_note("my controls"),
+            Some("the release guard takes it while a loop holds a control")
+        );
+        assert_eq!(state_capture_note("fly a circuit"), None);
     }
 }
