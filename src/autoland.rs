@@ -1968,6 +1968,10 @@ pub fn run_autoland_scoped(
                         _ => None,
                     };
                     if let Some(a) = air_ail {
+                        // Ours, not a hand: unmarked, the scorer read this
+                        // bounce's bank as a pilot's yoke (LEMG 13 SR22
+                        // 1790697159, yoke_under_ap yr -0.18, 2026-09-29).
+                        crate::monitor::note_crew_yoke();
                         let _ = xp.set_float(FLARE_ROLL, a).await;
                     } else if bounce == BounceTick::Landed && arrest_hands {
                         // The rollout entry's centring, again at the wheels.
