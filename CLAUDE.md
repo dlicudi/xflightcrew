@@ -525,7 +525,7 @@ everything blackboxes to `logs/blackbox.jsonl` (kinds: `atc`, `autotaxi`, `autot
 - **The declared rudder is believed only up to the speed it was measured at** (`RollSteer` held flat
   above `roll_rudder:` `at_kts`, ceiling `RUDDER_FULL_DEG_FAST`; extrapolated as v^2 it cut the gain to a
   third by Vr: EGKK 08R lifted off 5.4 m left, 2026-09-28). **A propeller declares its standing
-  rudder** (`roll_rudder:` `power_steer`, times the throttle for the whole roll): the generic lead
+  rudder** (`roll_rudder:` `power_steer`, times the throttle, falling as (to/v)^2 past `power_steer_to_kts`; `close_per_s`, `trim_per_s`; #184): the generic lead
   fades to 0.1 and the SR22 needs 0.35 (LEMG 13 rejected 9.8 m left, 2026-09-29). The scheduled roll's cut is `RollCut`: the
   median of three cross-track reads (a mixed-frame pair read up to 2.9 m off for a tick until `xcopilot/position`), cut harder from `XTK_GAIN_REF_KTS` to `at_kts`, plus a slow cross-track trim.
 - **The handoff line is true** about who has the aircraft and the height (`handoff_to_caller`). **A
