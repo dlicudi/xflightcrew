@@ -166,9 +166,84 @@ fn roll_out_lead_nm(r_nm: f64) -> f64 {
     r_nm * (1.0 - INTERCEPT_DEG.to_radians().cos())
 }
 
+/// Seconds the heading mode takes to roll into a turn before it turns at
+/// its radius: the bank ramps in at about 5 degrees a second.
+const ROLL_LAG_S: f64 = 5.0;
+
+/// The cross-track a 30 degree cut still closes while the heading mode rolls
+/// into the roll-out, nm, added to the geometric lead. Without it the
+/// intercept rolled out about 400 m through the line and the pursuit was
+/// still bringing it back at the FAF (EGKK I26L, the #161 join). Pure.
+fn roll_lag_lead_nm(gs_kts: f64) -> f64 {
+    gs_kts.max(60.0) / 3600.0 * ROLL_LAG_S * INTERCEPT_DEG.to_radians().sin()
+}
+
+/// A turn at radius `r_nm` from `from_deg` to `to_deg`, both the track's
+/// angle TOWARD a line (0 along its course, 90 straight at it), the short
+/// way: the miles it runs along the course and the miles it closes on the
+/// line (either negative: back, or away). Pure.
+fn turn_run_close_nm(from_deg: f64, to_deg: f64, r_nm: f64) -> (f64, f64) {
+    let d = heading_diff(from_deg, to_deg);
+    let (a, b) = ((to_deg + d).to_radians(), to_deg.to_radians());
+    if d >= 0.0 {
+        (r_nm * (a.sin() - b.sin()), r_nm * (b.cos() - a.cos()))
+    } else {
+        (r_nm * (b.sin() - a.sin()), r_nm * (a.cos() - b.cos()))
+    }
+}
+
 /// The distance along the course an intercept from here consumes, nm: the
 /// turn onto the intercept heading, the cut, the roll-out.
+///
+/// The turn is counted as flown: it runs `r (sin a - sin b)` along the course
+/// and CLOSES `r (cos b - cos a)` on the line. Counted as `r sin(turn)` of
+/// along and no closing, a base leg's 60 degree turn onto the intercept was
+/// charged 1.9 radii it never used: at EGBB 15 (#161) the join skipped the IF
+/// at 8.4 nm before the FAF and was established at 6.7, where 2 was asked.
 pub fn intercept_room_nm(xtk_nm: f64, track_true: f64, course_true: f64, r_nm: f64) -> f64 {
+    let toward = heading_diff(track_true, course_true) * -xtk_nm.signum();
+    room_from_nm(toward, xtk_nm.abs(), r_nm)
+}
+
+/// [`intercept_room_nm`] from a track `toward_deg` at the line, `off_nm`
+/// beside it.
+fn room_from_nm(toward_deg: f64, off_nm: f64, r_nm: f64) -> f64 {
+    let (run_in, close_in) = turn_run_close_nm(toward_deg, INTERCEPT_DEG, r_nm);
+    let (run_out, close_out) = turn_run_close_nm(INTERCEPT_DEG, 0.0, r_nm);
+    run_in + (off_nm - close_in - close_out).max(0.0) / INTERCEPT_DEG.to_radians().tan() + run_out
+}
+
+/// The miles of final the join leaves beyond [`FAF_ESTABLISHED_NM`], for the
+/// heading mode's roll in and out, which the geometry does not count.
+const JOIN_SLACK_NM: f64 = 0.5;
+
+/// Where the join's base turn begins, nm along the FAF's course line beyond
+/// the FAF, from a downwind `off_nm` beside it: the turn onto base (it runs a
+/// radius further out and closes one), a 30 degree intercept off the base and
+/// its roll-out leave [`FAF_ESTABLISHED_NM`] of final and the slack. Sized
+/// as a flat two radii beyond the established point, the base came at 5.7 nm
+/// whatever the offset, and from GROVE the join took 430 s (#161). Pure.
+pub fn base_turn_along_nm(off_nm: f64, r_nm: f64) -> f64 {
+    let (run_base, close_base) = turn_run_close_nm(180.0, 90.0, r_nm);
+    let room = room_from_nm(90.0, (off_nm - close_base).max(0.0), r_nm);
+    FAF_ESTABLISHED_NM + JOIN_SLACK_NM + BASE_MARGIN_NM + room + run_base
+}
+
+/// The base is sized this much longer than the skip asks, so the skip
+/// always comes off the base: sized exactly, a base turn flown a few seconds
+/// slow left the intercept 0.15 nm short, the base ran on into the pattern's
+/// own inbound turn and the final was crossed 900 m (the GROVE replay).
+const BASE_MARGIN_NM: f64 = 0.5;
+
+/// The room as the join flew it on 2026-09-28 (turn charged `r sin(turn)`,
+/// closing nothing), for the replays of that geometry.
+#[cfg(test)]
+pub fn intercept_room_as_flown_nm(
+    xtk_nm: f64,
+    track_true: f64,
+    course_true: f64,
+    r_nm: f64,
+) -> f64 {
     let heading = course_true - xtk_nm.signum() * INTERCEPT_DEG;
     let turn = heading_diff(heading, track_true).abs().min(90.0);
     let lead = roll_out_lead_nm(r_nm);
@@ -195,9 +270,18 @@ pub fn course_track(
     let c = line.course_true();
     let r = crate::procedure::enroute_turn_radius_nm(gs_kts);
     let lead = roll_out_lead_nm(r);
-    let tracking_band = if was_track { 2.0 * lead } else { lead };
+    let lag = roll_lag_lead_nm(gs_kts);
+    let tracking_band = if was_track { 2.0 * lead + lag } else { lead + lag };
     if xtk.abs() <= tracking_band {
-        let cut = (xtk.abs() / TRACK_AIM_NM)
+        // The heading is SET, then left for up to 30 s (`HeadingHold`), so
+        // it is the cut for the offset left once the turn onto it is
+        // flown: from a 30 degree intercept that is the course itself. The
+        // bare pursuit set 14 degrees at the roll-out and crossed the line
+        // 340 m before the next correction (the #161 join at EGKK).
+        let toward = (heading_diff(track_true, c) * -xtk.signum()).clamp(0.0, 90.0);
+        let closing = r * (1.0 - toward.to_radians().cos())
+            + gs_kts.max(60.0) / 3600.0 * ROLL_LAG_S * toward.to_radians().sin();
+        let cut = ((xtk.abs() - closing).max(0.0) / TRACK_AIM_NM)
             .atan()
             .to_degrees()
             .min(INTERCEPT_DEG);
@@ -243,11 +327,56 @@ pub enum Join {
 pub struct FinalJoin {
     idx: Option<usize>,
     rev: Option<Reversal>,
+    /// The base turn as last sized ([`base_turn_along_nm`]), nm along.
+    base_at_nm: Option<f64>,
+    /// The IF skipped for an intercept, whose altitude is still owed while
+    /// it lies ahead along the final ([`FinalJoin::skipped_if_ahead_nm`]).
+    skipped_if: Option<usize>,
+    /// Fly the 2026-09-28 geometry (the replays' "as flown").
+    #[cfg(test)]
+    as_flown: bool,
 }
 
 impl FinalJoin {
     pub fn flying_pattern(&self) -> bool {
         self.rev.is_some()
+    }
+
+    /// The join as flown on 2026-09-28: the base two sizing radii beyond
+    /// the established point, the skip on the old room.
+    #[cfg(test)]
+    pub fn as_flown() -> Self {
+        FinalJoin { as_flown: true, ..Default::default() }
+    }
+
+    #[cfg(test)]
+    fn old_geometry(&self) -> bool {
+        self.as_flown
+    }
+
+    #[cfg(not(test))]
+    fn old_geometry(&self) -> bool {
+        false
+    }
+
+    /// The room an intercept from here needs, by this join's geometry.
+    fn room_nm(&self, xtk_nm: f64, track_true: f64, course_true: f64, r_nm: f64) -> f64 {
+        #[cfg(test)]
+        if self.as_flown {
+            return intercept_room_as_flown_nm(xtk_nm, track_true, course_true, r_nm);
+        }
+        intercept_room_nm(xtk_nm, track_true, course_true, r_nm)
+    }
+
+    /// Where the base turn begins, nm along the FAF's course: sized on the
+    /// downwind's offset and the turn radius, or the old flat two radii.
+    fn base_turn_nm(&self, xtk_nm: f64, gs_kts: f64) -> f64 {
+        let rs = reversal::sizing_radius_nm(gs_kts);
+        if self.old_geometry() {
+            return FAF_ESTABLISHED_NM + 2.0 * rs + reversal::BASE_BEYOND_JOIN_NM;
+        }
+        let r = crate::procedure::enroute_turn_radius_nm(gs_kts);
+        base_turn_along_nm(xtk_nm.abs(), r)
     }
 
     /// The miles still to fly round the pattern to the IF (leg `idx`), on
@@ -279,14 +408,56 @@ impl FinalJoin {
         let along = line.along_nm(lat, lon);
         let xtk = line.xtk_nm(lat, lon).abs();
         let if_along = line.along_nm(at_if.lat, at_if.lon).max(0.0);
-        let turn_along = FAF_ESTABLISHED_NM + 2.0 * reversal::sizing_radius_nm(gs_kts);
+        let turn_along = if self.old_geometry() {
+            FAF_ESTABLISHED_NM + 2.0 * reversal::sizing_radius_nm(gs_kts)
+        } else {
+            self.base_at_nm.unwrap_or_else(|| self.base_turn_nm(xtk, gs_kts))
+        };
+        if self.old_geometry() {
+            return Some(match rev.leg {
+                reversal::Leg::Outbound => {
+                    (turn_along - along).max(0.0)
+                        + xtk
+                        + (turn_along.max(along) - if_along).max(0.0)
+                }
+                reversal::Leg::Base | reversal::Leg::Inbound => xtk + (along - if_along).max(0.0),
+            });
+        }
+        // The IF's altitude by the end of the base, as a crew has the
+        // platform before it turns onto the intercept: the base turn runs a
+        // radius further out, and counted to the IF along the line the
+        // miles grew on the base and held the descent level there, handing
+        // over 300 ft over the glideslope (#161).
         Some(match rev.leg {
-            reversal::Leg::Outbound => {
-                (turn_along - along).max(0.0) + xtk + (turn_along.max(along) - if_along).max(0.0)
-            }
-            reversal::Leg::Base => xtk + (along - if_along).max(0.0),
+            reversal::Leg::Outbound => (turn_along - along).max(0.0) + xtk,
+            reversal::Leg::Base => xtk,
             reversal::Leg::Inbound => xtk + (along - if_along).max(0.0),
         })
+    }
+
+    /// On the leg after an IF skipped for the intercept (leg `idx`): the IF
+    /// (its index) and the miles along the final still to its abeam point,
+    /// while it lies ahead. A join from a base beyond the IF meets the final
+    /// OUTSIDE it, so the IF's altitude is still owed there; paced on the
+    /// FAF's distance instead, the path held level after the skip (at
+    /// EGBB 15 from 4,796 ft for 38 s, 1790624015) and handed over 400 ft
+    /// over the glideslope (#161). Pure.
+    pub fn skipped_if_ahead_nm(
+        &self,
+        legs: &[ProcLeg],
+        idx: usize,
+        lat: f64,
+        lon: f64,
+        mag_var: f64,
+    ) -> Option<(usize, f64)> {
+        if self.old_geometry() {
+            return None;
+        }
+        let i = self.skipped_if.filter(|i| i + 1 == idx)?;
+        let at_if = legs.get(i)?.fix.as_ref()?;
+        let line = CourseLine::of_leg(legs.get(idx)?, mag_var)?;
+        let d = line.along_nm(lat, lon) - line.along_nm(at_if.lat, at_if.lon);
+        (d > 0.0).then_some((i, d))
     }
 
     /// Advance the join for leg `idx`. `None` unless that leg is an IF
@@ -308,8 +479,12 @@ impl FinalJoin {
         descent_fpm: f64,
     ) -> Option<Join> {
         if self.idx != Some(idx) {
+            if self.skipped_if.is_some_and(|i| i + 1 != idx) {
+                self.skipped_if = None;
+            }
             self.idx = Some(idx);
             self.rev = None;
+            self.base_at_nm = None;
         }
         let leg = legs.get(idx)?;
         if leg.leg_type != "IF" {
@@ -327,8 +502,15 @@ impl FinalJoin {
                 return Some(Join::Direct);
             }
         }
-        if along - intercept_room_nm(xtk, track_true, c, r) >= FAF_ESTABLISHED_NM {
+        // Never off the downwind: from there the intercept is a teardrop
+        // the heading mode flies wide, and the base turn is sized for it.
+        let slack = if self.old_geometry() { 0.0 } else { JOIN_SLACK_NM };
+        let downwind = self.rev.is_some_and(|r| r.leg == reversal::Leg::Outbound);
+        let turn_ok = self.old_geometry() || !downwind;
+        if turn_ok && along - self.room_nm(xtk, track_true, c, r) >= FAF_ESTABLISHED_NM + slack {
             self.rev = None;
+            self.base_at_nm = None;
+            self.skipped_if = Some(idx);
             return Some(Join::Skip { why: "intercept" });
         }
         if self
@@ -338,12 +520,17 @@ impl FinalJoin {
             self.rev = None;
             return Some(Join::Skip { why: "out_of_room" });
         }
-        // The pattern against the FAF's course line: the base sits two
-        // sizing radii beyond the established point, so the turn off base
-        // onto the intercept (60 degrees, not the pattern's own 90 onto the
-        // line) and the cut fit with FAF_ESTABLISHED_NM to spare.
-        let rs = reversal::sizing_radius_nm(gs_kts);
-        let join_nm = FAF_ESTABLISHED_NM + 2.0 * rs;
+        // The pattern against the FAF's course line: the base turn where the
+        // turn onto base, the 60 degree turn off it onto the intercept and
+        // the cut leave FAF_ESTABLISHED_NM and the slack, sized on the
+        // downwind's offset while it is flown and then held (#161).
+        let on_downwind = self.rev.is_none_or(|r| r.leg == reversal::Leg::Outbound);
+        let base_at = match self.base_at_nm {
+            Some(b) if !on_downwind => b,
+            _ => self.base_turn_nm(xtk, gs_kts),
+        };
+        self.base_at_nm = Some(base_at);
+        let join_nm = base_at - reversal::BASE_BEYOND_JOIN_NM;
         let platform_ft = leg.alt1_ft.unwrap_or(alt_ft);
         let started = self.rev.is_none();
         let rev = self.rev.get_or_insert(Reversal {
@@ -621,6 +808,31 @@ mod tests {
         assert!(off.abs() < 10.0, "{off:.1} degrees off at the FAF");
     }
 
+    /// #161: the EGBB 15 join (sortie 1790635335) skipped CF15 off its
+    /// base at 8.44 nm before FF15, 2.34 nm right, tracking 051.5 at 229 kt
+    /// over the ground, and was on the course by about 6.3 nm: 2.1 nm of
+    /// final used. The turn counted as flown says so; charged `r sin(turn)`
+    /// and no closing, the room was 6.5 nm and the skip came 4 nm late.
+    #[test]
+    fn the_intercept_room_counts_the_turn_it_flies() {
+        let course = 145.0 + 0.9;
+        let r = crate::procedure::enroute_turn_radius_nm(229.0);
+        let new = intercept_room_nm(2.34, 51.5, course, r);
+        let old = intercept_room_as_flown_nm(2.34, 51.5, course, r);
+        assert!((1.8..=2.6).contains(&new), "{new:.2}");
+        assert!(old > 6.0, "{old:.2}");
+        // Along the course 2 nm off: the 30 degree turn in, the cut, the
+        // roll-out.
+        let flat = intercept_room_nm(2.0, course, course, r);
+        let c30 = INTERCEPT_DEG.to_radians();
+        let want = r + (2.0 - 2.0 * r * (1.0 - c30.cos())) / c30.tan();
+        assert!((flat - want).abs() < 1e-9, "{flat} {want}");
+        // A downwind 4.9 nm out: the base turn 4.2 nm beyond the FAF (the
+        // old flat 5.7) leaves the intercept its room, the final its 2 nm.
+        let b = base_turn_along_nm(4.9, r);
+        assert!((4.0..=4.4).contains(&b), "{b:.2}");
+    }
+
     /// The course law alone: 30 degrees toward the line from either side,
     /// the course inside the roll-out lead, a correction that never cuts
     /// more than the intercept, and no course at all when the line cannot be
@@ -655,7 +867,8 @@ mod tests {
             (heading_diff(t, c) + 30.0).abs() < 0.01,
             "from the right: course - 30"
         );
-        // Inside the lead (0.24 nm at 210 kt): the course, nearly.
+        // Inside the lead (0.24 nm at 210 kt, and 0.15 for the roll-in):
+        // the course, nearly.
         let (lat, lon) = at(6.0, -0.1);
         let (t, s) = course_track(&line, lat, lon, c, 210.0, false).unwrap();
         assert_eq!(s, Steer::Track);
@@ -663,8 +876,14 @@ mod tests {
             heading_diff(t, c) > 0.0 && heading_diff(t, c) < 5.0,
             "a gentle correction right"
         );
-        // Tracking holds to twice the lead.
+        // Rolling out of the 30 degree cut at the lead: the course itself,
+        // since the turn onto it closes the rest (#161).
         let (lat, lon) = at(6.0, -0.35);
+        let (t, s) = course_track(&line, lat, lon, c + 30.0, 210.0, false).unwrap();
+        assert_eq!(s, Steer::Track);
+        assert!(heading_diff(t, c).abs() < 0.01, "the course, got {:.1}", heading_diff(t, c));
+        // Tracking holds to twice the geometric lead.
+        let (lat, lon) = at(6.0, -0.45);
         assert_eq!(
             course_track(&line, lat, lon, c, 210.0, true).unwrap().1,
             Steer::Track

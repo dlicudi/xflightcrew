@@ -732,11 +732,12 @@ everything blackboxes to `logs/blackbox.jsonl` (kinds: `atc`, `autotaxi`, `autot
   an "at or above" judged on the climb being FLOWN, not while a clearance holds us (`window_climb_fpm`).
   **A descent flies its speed first, at idle** (`speed_protected_vs`, `IdleDescent`); STAR limits are
   flown 3 kt under (`STAR_SPEED_MARGIN_KTS`); the speedbrake is for HEIGHT the protected descent cannot
-  lose (`descent_drag` `high_ft`); a join pattern's descent is paced on the pattern's miles
-  (`FinalJoin::pattern_to_go_nm`). The OFP cruise is capped under the overspeed caution
-  (`cruise_cap_kts`); the altimeter is set AT the transition, crossed in the direction flown
-  (`transition_crossed`); icing reads the moisture at our own level (`dewpoint_at`); with the ILS tuned
-  autoland's aim leans toward the glideslope (`aim_with_glideslope`; EGKK-EGBB 2026-09-28).
+  lose (`descent_drag` `high_ft`); a join pattern's descent is paced on the pattern's miles to the
+  end of its base (`FinalJoin::pattern_to_go_nm`), and an IF skipped but still ahead keeps its
+  altitude (`skipped_if_ahead_nm`, `if_owed_nm`; #161). The OFP cruise is capped under the overspeed
+  caution (`cruise_cap_kts`); the altimeter is set AT the transition, crossed in the direction flown
+  (`transition_crossed`); icing reads the moisture at our own level (`dewpoint_at`); with the ILS
+  tuned autoland's aim leans toward the glideslope (`aim_with_glideslope`; EGKK-EGBB 2026-09-28).
 - **The arrival is re-picked in flight** (`RepickWatch`): the destination tower's runway at once, the
   METAR's wind runway on two readings in a row beyond 25 nm (never in calm, never against the tower),
   at most `MAX_ARRIVAL_REPICKS`; the new STAR is spliced from its entry (`plan_audit::star_splice`,
@@ -745,8 +746,11 @@ everything blackboxes to `logs/blackbox.jsonl` (kinds: `atc`, `autotaxi`, `autot
   radial) and **a hold as a racetrack** (`HoldFlight`: direct entry, each 180 split into two 90s,
   chart time else 1 / 1.5 min; HF one circuit, HA to its altitude or 6 circuits; HM flown through).
 - **A CF leg is flown on its course** (`course_leg::course_track`: a 30 degree intercept rolled out
-  at the fly-by lead), never homed on; **an IF behind us is joined by autoland's pattern** against
-  the FAF's course until the intercept fits 2 nm out (`FinalJoin`; EGKK 26L 2026-09-27).
+  at the fly-by lead plus the roll-in, `ROLL_LAG_S`, the heading SET for the offset left after the
+  turn), never homed on; **an IF behind us is joined by autoland's pattern** against the FAF's
+  course until the intercept fits 2 nm out (`FinalJoin`; EGKK 26L 2026-09-27), its base turn sized
+  on the downwind's offset and radius (`base_turn_along_nm`) and the intercept's turn counted as
+  flown (`intercept_room_nm`; charged `r sin(turn)`, GROVE's join took 430 s, #161).
 - **The autopilot is engaged and CONFIRMED, never assumed** (`ApEngage`): pressed every tick until
   `servos_on` reads on for two live ticks, each try blackboxed `ap_engage` then `ap_engaged`; until
   then the loop holds level on `xcopilot/pitch` (`engage_hold_gains`, `ap_hold`), and 10 s of live
@@ -769,12 +773,15 @@ everything blackboxes to `logs/blackbox.jsonl` (kinds: `atc`, `autotaxi`, `autot
   armed only from OFF (a toggle), with the servos in, inside coverage (`arm_verdict`), read back,
   never retried. A pilot hand flying keeps the aircraft. A localiser bearing is
   `magnetic x 360 + true` (`nav::loc_courses`).
-- **A reposition is a PATTERN, never a point** (`src/reversal.rs`, `reversal::needed`): the downwind
-  extends while the height cannot be lost (`reversal::too_high_to_turn`, `pattern_descent_fpm`); an
-  inbound past the threshold is OVER (`reversal::overflown`); `pattern_ias`; each is blackboxed with
-  its `why` (`reversal::why`), and "Overflew the runway" is said only with the runway behind
-  (`dropped_final_line`; it was said at 5.2 nm, #171). **The stabilised gate
-  is about TIME** (`unstabilised_at_gate`, `reversal::predicted_residual_m`), not position.
+- **A reposition is a PATTERN, never a point** (`src/reversal.rs`, `reversal::needed`), and only
+  when a re-intercept is not flyable: the join point behind is aimed at only when the height cannot
+  come off on the way in (`autoland::aims_at_join_point`, `straight_in_losable`; LEMG 12's retarget
+  flew ten minutes of pattern for 513 ft, #131). The downwind extends while the height cannot be
+  lost (`reversal::too_high_to_turn`, `pattern_descent_fpm`); an inbound past the threshold is OVER
+  (`reversal::overflown`); `pattern_ias`; each is blackboxed with its `why` (`reversal::why`), and
+  "Overflew the runway" is said only with the runway behind (`dropped_final_line`; it was said at
+  5.2 nm, #171). **The stabilised gate is about TIME** (`unstabilised_at_gate`,
+  `reversal::predicted_residual_m`), not position.
 - The receding guard measures from the furthest legitimate point (`recede_ref_nm`); flaps never cycle
   on a placard (`flap_held_within_limits`); **an approach never takes away the flap the wing flies
   on** (`flap_kept_flying`, `last_flap` read at the arm), nor asks for less than is out

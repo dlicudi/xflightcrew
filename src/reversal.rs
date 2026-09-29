@@ -50,7 +50,7 @@ const SIZING_BANK_DEG: f64 = 18.0;
 const OFFSET_RADII: f64 = 3.0;
 /// The base leg sits this far beyond the join point, so the inbound leg has a
 /// straight run before the path comes down to it.
-const BASE_BEYOND_JOIN_NM: f64 = 0.5;
+pub const BASE_BEYOND_JOIN_NM: f64 = 0.5;
 /// Nearer the centreline than this the aircraft has no side of its own yet (a
 /// go-around climbing straight ahead) and the caller's default stands.
 const OWN_SIDE_XTK_NM: f64 = 0.5;

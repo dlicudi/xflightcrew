@@ -3761,14 +3761,18 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, plan: Pla
             None => (leg, false),
         };
         // Round a pattern the descent is paced on the pattern's miles, not
-        // the straight line to an IF it is flying away from (#156).
+        // the straight line to an IF it is flying away from (#156); an IF
+        // skipped for the intercept but still ahead along the final keeps
+        // its altitude on the miles to it (#161).
         let pattern_nm = final_join.pattern_to_go_nm(&legs, idx, lat, lon, gs_kts, mag_var);
+        let owed_if = final_join.skipped_if_ahead_nm(&legs, idx, lat, lon, mag_var);
+        let leg_for_vertical = owed_if.map_or(leg_for_vertical, |(i, _)| &legs[i]);
         let v = vertical_tick(
             leg_for_vertical,
             carry_alt,
             prev_cmd_alt,
             alt_ft,
-            pattern_nm.or(dist_nm),
+            owed_if.map(|(_, d)| d).or(pattern_nm).or(dist_nm),
             gs_kts,
             pilot_altitude(),
             terrain_floor_ahead_ft().map(|f| floor_indicated(f, true_alt_ft, alt_ft)),
@@ -4178,6 +4182,8 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, plan: Pla
                 // How the lateral is flown and where on the course it is
                 // (`course_leg`): the FAF's line during a final's join.
                 "steer": steer.word(), "along_nm": steer_pos.map(|p| p.0), "xtk_nm": steer_pos.map(|p| p.1), "pattern_nm": pattern_nm,
+                // A skipped IF still ahead, its miles (#161).
+                "if_owed_nm": owed_if.map(|o| o.1),
                 // The capture radius in force, so a fix that will not close
                 // can be told from one the aircraft simply has not reached.
                 "cap_nm": capture_nm,
@@ -5619,6 +5625,11 @@ mod tests {
         max_descent_ias: f64,
         /// Miles to the FAF at its capture.
         faf_nm: f64,
+        /// Miles before the FAF the final was first established (300 m, 10
+        /// degrees).
+        established_nm: Option<f64>,
+        /// The steers in the order flown.
+        steers: Vec<&'static str>,
     }
 
     /// The approach armed at GROVE (+2862, sortie 1790601822-full_auto):
@@ -5630,16 +5641,79 @@ mod tests {
     /// approach's 210.25 kt on the fitted 737 ([`fly_arrival`]'s plant and
     /// laws), to the FAF's capture.
     fn fly_egbb_join(law: ArrivalLaw) -> JoinRun {
+        fly_egbb_join_from(&GROVE_1790601822, law, JoinGeometry::AsFlown)
+    }
+
+    /// Where the approach armed at GROVE: position, track, altitude, airspeed,
+    /// and the wind's share of the groundspeed, kt.
+    struct JoinStart {
+        lat: f64,
+        lon: f64,
+        hdg: f64,
+        alt: f64,
+        ias: f64,
+        wind_kts: f64,
+    }
+
+    /// Sortie 1790601822-full_auto, +2862.
+    const GROVE_1790601822: JoinStart = JoinStart {
+        lat: 52.403079551600634,
+        lon: -1.9394949225789109,
+        hdg: 118.6,
+        alt: 7_021.5,
+        ias: 217.1,
+        wind_kts: 25.0,
+    };
+
+    /// Sortie 1790635335-full_auto, +790.0 (t 1790636125): 7,185 ft, 209 kt,
+    /// tracking 116 at 226 kt over the ground; the procedure's first tick put
+    /// it 5.9 nm past the FAF, 7.7 nm right of the final. As flown the FAF
+    /// was captured 466 s later (+1256), established 6.7 nm before it.
+    const GROVE_1790635335: JoinStart = JoinStart {
+        lat: 52.40216798594475,
+        lon: -1.946318684047718,
+        hdg: 116.0,
+        alt: 7_185.3,
+        ias: 208.9,
+        wind_kts: -13.0,
+    };
+
+    /// Sortie 1790624015-full_auto, +2215.1 (t 1790626230): 4,797 ft, 204 kt,
+    /// tracking 104 at 209 kt; 6.1 nm past the FAF, 7.9 nm right. As flown
+    /// the FAF was captured 429 s later (+2644) at 211.5 kt, 2,899 ft.
+    const GROVE_1790624015: JoinStart = JoinStart {
+        lat: 52.39743536948908,
+        lon: -1.9473286705380015,
+        hdg: 103.9,
+        alt: 4_796.7,
+        ias: 204.3,
+        wind_kts: -15.0,
+    };
+
+    /// Which base and skip the join flies.
+    #[derive(Clone, Copy, PartialEq, Debug)]
+    enum JoinGeometry {
+        /// 2026-09-28: the base two sizing radii beyond the established
+        /// point, the skip on the old room.
+        AsFlown,
+        /// #161: the base sized on the offset and the radius.
+        Sized,
+    }
+
+    fn fly_egbb_join_from(start: &JoinStart, law: ArrivalLaw, geometry: JoinGeometry) -> JoinRun {
         use crate::course_leg::{course_passed, course_track, CourseLine, FinalJoin, Join, Steer};
         const VAR: f64 = -0.9;
         const RATE: f64 = 2_000.0;
         let legs = egbb_i15();
         let plant = Plant::default();
-        let (mut lat, mut lon) = (52.403079551600634, -1.9394949225789109);
-        let (mut hdg, mut bank) = (118.6f64, 0.0f64);
-        let (mut alt, mut ias) = (7_021.5f64, 217.1f64);
+        let (mut lat, mut lon) = (start.lat, start.lon);
+        let (mut hdg, mut bank) = (start.hdg, 0.0f64);
+        let (mut alt, mut ias) = (start.alt, start.ias);
         let target = crate::autoland::clean_approach_ias(145.0);
-        let mut join = FinalJoin::default();
+        let mut join = match geometry {
+            JoinGeometry::AsFlown => FinalJoin::as_flown(),
+            JoinGeometry::Sized => FinalJoin::default(),
+        };
         let mut hold = HeadingHold::default();
         let mut bug_true = hdg;
         let (mut idx, mut was) = (0usize, Steer::Direct);
@@ -5655,7 +5729,7 @@ mod tests {
         for tick in 0..6_000 {
             let now = tick as f64 * dt;
             let tas = ias * (1.0 + 0.02 * alt / 1_000.0);
-            let gs = tas + 25.0;
+            let gs = tas + start.wind_kts;
             let leg = &legs[idx];
             let (mut steer, mut track) = (Steer::Direct, None);
             match join.step(&legs, idx, lat, lon, hdg, gs, VAR, alt, RATE) {
@@ -5680,6 +5754,17 @@ mod tests {
             let d = crate::nav::haversine_nm(lat, lon, f.lat, f.lon);
             let track = track.unwrap_or_else(|| crate::nav::bearing_deg(lat, lon, f.lat, f.lon));
             was = steer;
+            if run.steers.last() != Some(&steer.word()) {
+                run.steers.push(steer.word());
+            }
+            if run.established_nm.is_none() {
+                let faf = CourseLine::of_leg(&legs[1], VAR).unwrap();
+                let (along, xtk_m) = (faf.along_nm(lat, lon), faf.xtk_nm(lat, lon) * 1852.0);
+                let off = ((hdg - faf.course_true() + 540.0).rem_euclid(360.0) - 180.0).abs();
+                if along > 0.0 && xtk_m.abs() < 300.0 && off < 10.0 {
+                    run.established_nm = Some(along);
+                }
+            }
             let mag = |t: f64| crate::autoland::true_to_mag(t, VAR);
             if let Some(h) = hold.decide(steer.key(idx), mag(track), mag(hdg), bank, now) {
                 bug_true = h - VAR;
@@ -5695,12 +5780,20 @@ mod tests {
                 idx += 1;
                 continue;
             }
-            // The vertical: the pattern's miles, or (as flown) the line.
-            let dist = match law {
-                ArrivalLaw::Protected => join.pattern_to_go_nm(&legs, idx, lat, lon, gs, VAR).or(Some(d)),
-                ArrivalLaw::AsFlown => Some(d),
+            // The vertical: the pattern's miles, or (as flown) the line; a
+            // skipped IF still ahead keeps its own altitude and distance.
+            let owed_if = join.skipped_if_ahead_nm(&legs, idx, lat, lon, VAR);
+            let dist = match (law, owed_if) {
+                (ArrivalLaw::Protected, Some((_, d_if))) => Some(d_if),
+                (ArrivalLaw::Protected, None) => {
+                    join.pattern_to_go_nm(&legs, idx, lat, lon, gs, VAR).or(Some(d))
+                }
+                (ArrivalLaw::AsFlown, _) => Some(d),
             };
-            let v = vertical_tick(leg, carry, prev, alt, dist, gs, None, None, RATE, DescentProfile::none());
+            let vleg = owed_if.map_or(leg, |(i, _)| &legs[i]);
+            let v = vertical_tick(
+                vleg, carry, prev, alt, dist, gs, None, None, RATE, DescentProfile::none(),
+            );
             carry = v.carry;
             prev = v.prev_cmd;
             let want = vs_law_fpm(v.want_alt, alt, v.target_fpm, RATE, 1_500.0);
@@ -5782,6 +5875,43 @@ mod tests {
         assert!(new.brake_outs <= 1, "{new:?}");
         // The pattern is the pattern: the join is no longer for it.
         assert!(new.secs <= old.secs + 30.0, "{new:?} {old:?}");
+    }
+
+    /// #161: the two recorded joins from GROVE, replayed on the geometry
+    /// they flew: the FAF captured within 20 s of the recorded 466 s
+    /// (1790635335) and 429 s (1790624015), established 5 nm or more before
+    /// it, and handed over high (the flight: 2,899 ft at 0.78 nm).
+    #[test]
+    fn the_recorded_joins_from_grove_replay_their_times() {
+        for (start, recorded) in [(&GROVE_1790635335, 466.0), (&GROVE_1790624015, 429.0)] {
+            let r = fly_egbb_join_from(start, ArrivalLaw::Protected, JoinGeometry::AsFlown);
+            assert!((r.secs - recorded).abs() <= 20.0, "{recorded} s recorded: {r:?}");
+            assert!(r.established_nm.is_some_and(|e| e > 5.0), "{r:?}");
+            assert!(r.alt > 2_500.0 + r.faf_nm * 318.0, "over the glideslope as flown: {r:?}");
+        }
+    }
+
+    /// #161: the join sized on the downwind's offset and the turn radius,
+    /// the intercept's turn counted as flown, and the skipped IF's 2,500 ft
+    /// still owed while it lies ahead: from each recorded GROVE state the
+    /// FAF is captured sooner, still established 2 nm before it off a
+    /// base, on the 2,500 ft platform and at the approach's 210 kt.
+    #[test]
+    fn the_join_from_grove_is_shorter_and_hands_over_on_the_platform() {
+        let mut saved = 0.0;
+        for start in [&GROVE_1790601822, &GROVE_1790635335, &GROVE_1790624015] {
+            let old = fly_egbb_join_from(start, ArrivalLaw::Protected, JoinGeometry::AsFlown);
+            let new = fly_egbb_join_from(start, ArrivalLaw::Protected, JoinGeometry::Sized);
+            assert!(new.secs <= old.secs - 30.0, "{new:?} {old:?}");
+            saved += old.secs - new.secs;
+            let flown = ["pattern_outbound", "pattern_base", "intercept", "track"];
+            assert_eq!(new.steers, flown, "{new:?}");
+            let est = new.established_nm.expect("established before the FAF");
+            assert!(est >= 2.0, "{new:?}");
+            assert!((2_450.0..=2_600.0).contains(&new.alt), "on the platform: {new:?}");
+            assert!(new.ias <= 215.0, "{new:?}");
+        }
+        assert!(saved >= 150.0, "{saved:.0} s saved over three joins");
     }
 
     /// #156 / #32: HEMEL's "at FL220" in the FL180 plan is flown at the
