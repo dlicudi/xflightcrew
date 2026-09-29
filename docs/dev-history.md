@@ -10969,3 +10969,45 @@ Not done: `1110` runway use per flow (arrivals 12 / departures 13 at LEMG, under
 ceiling, visibility and time rules) feeding the runway in use: it sits against the calm-wind
 stream rules and the frozen runway, a change of its own. Autoland's reversal still picks its side
 by terrain alone. Offline only.
+
+## 2026-09-29: SAFETY, a circuit's steep path is not a valley; an airborne end is held, never ended
+
+iMac, SR22, LEMG 13 runway start, "fly a circuit" under full auto (sortie 1790692781-full_auto).
+The circuit's corridor steepened its path to 3.26 degrees (#182) and handed it to autoland with
+`set_next_glidepath_deg`, the follower's LSZS visual-segment door. Autoland's reversal branch reads
+any path over 3 degrees as a published steep approach ("that is a valley"), so: at the handoff
+(t+456, 1.46 nm, 1,192 ft against a 633 ft path) no reversal pattern was allowed and the guidance
+homed on a join point BEHIND, a 180 to 311 at 1.3 nm, out to 3 nm and 1,975 m abeam, a turn back
+that overshot to +595 m and a pursuit that closed to 82.8 m at 1.21 nm, 496 ft:
+`unstabilised_below_floor` at t+693.5. The go-around's reposition then took the same branch, found
+no published missed approach (`missed_procedure` `flying: false`) and said "Going around, climbing
+straight ahead. Your aircraft." at 805 ft on a 1,000 fpm dial; full auto logged `no_taxi_in`
+(`on_ground: false`) and the mission ENDED airborne with the runner unattended.
+
+- **Who handed the angle is carried with it** (`autoland::set_next_circuit_glidepath_deg`, the
+  circuit's door; `set_next_glidepath_deg` stays the follower's, `published_steep`): only a
+  published visual segment is a valley; a circuit's steep path is flown at its angle and its
+  reversal is the terrain-probed pattern (`reversal::plan`, `TerrainHold` where none fits).
+- **A missed procedure that cannot be flown falls through to that pattern**, asked once
+  (`missed_procedure_tried`); only a flying one ends the loop.
+- **Full auto never ends airborne** (`full_auto::hold_airborne_end`, from the `no_taxi_in` branch
+  when autoland ended, airborne, uncrashed, not the pilot's cancel): a published missed approach
+  is waited for; an unflyable aircraft is the recovery's (`recover::take_over`, the governor
+  released first); else the servos in, HDG and VS 0 pressed only where they read off, WATCHED 12 s
+  (`airborne_end_verdict`: servos, a heading mode, a vertical mode, `ap_holding`, near level at
+  the end), and only a held level is handed over, said with heading and altitude; anything else is
+  the recovery's, "I have the aircraft until you say my controls".
+
+Tests: `a_circuit_path_is_steep_but_not_a_valley`, `an_unflyable_missed_procedure_is_never_your_aircraft`,
+`an_airborne_end_hands_over_only_a_held_autopilot`, `the_airborne_end_line_says_what_is_held`,
+`an_airborne_autoland_end_is_held_not_ended`.
+
+Also found, not fixed: the circuit handed over 680 ft above its path. The live terrain floor raised
+the downwind to 2,050 ft (t+220) and the base descended at its flat -500 fpm, 2,065 to 1,292 ft
+against a 607 ft target; `ready_for_autoland` judges the line, not the height. With the fix the
+arrival that high should go around at once (`late_go_around`) and fly the pattern.
+
+Next flight: `autoland` `glidepath` then `reversal` or `late_go_around` (never `missed_procedure`
+on a circuit); after a balk `reversal` with `missed: true`; any airborne end `full_auto`
+`airborne_end` with `verdict` `ap_holding` or `take_over` (`why`), then `recover` `take_over`.
+Offline only.

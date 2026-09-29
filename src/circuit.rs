@@ -2539,7 +2539,7 @@ const DESCENT_FLOOR_FULL_NM: f64 = 2.0;
 /// The steepest path the circuit will fly to clear the ground on its base and
 /// final: PANS-OPS's upper limit for a procedure that is not a steep approach
 /// (anything past it needs an approval no profile declares). Autoland is
-/// handed the same angle (`autoland::set_next_glidepath_deg`).
+/// handed the same angle (`autoland::set_next_circuit_glidepath_deg`).
 pub const STEEP_PATH_MAX_DEG: f64 = 3.5;
 /// A raise smaller than this is carried out but not said: with 1,000 ft of
 /// clearance a 1,000 ft pattern lifts over any ground above the field, and
@@ -4866,7 +4866,7 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, p: Params
             // A path steepened over the ground is autoland's path too (#182),
             // else it would take the aircraft handed over and dive for 3 degrees.
             if descent_shape.steep() {
-                crate::autoland::set_next_glidepath_deg(Some(descent_shape.glidepath_deg()));
+                crate::autoland::set_next_circuit_glidepath_deg(Some(descent_shape.glidepath_deg()));
             }
             crate::autoland::ABORT.store(false, Ordering::SeqCst);
             crate::autoland::run_autoland(
