@@ -1,0 +1,31 @@
+# iMac verify batch 3 (after the castoring-nose line-up alignment feed547 and
+# the A330 final lead / steady-track trim a61540d).
+after: stop
+cases:
+  # #46 #165: line_up_aligned ok, aligned_err_deg under 2, alignment under
+  # 3, no bl/br alternation 4 to 18 kt; the taxi's corner.
+  - name: "SR22 LEMG ramp circuit (#46 #165)"
+    setup:
+      aircraft: "Aircraft/Laminar Research/Cirrus SR22/Cirrus SR22.acf"
+      ramp: { field: LEMG }
+    command: fly a circuit
+    traffic: off
+    deadline_min: 40
+
+  # #45: untowered LILB, line_up_aligned, roll_aligned, no not_aligned.
+  - name: "Lancair Evolution LILB circuit from the ramp (#45 #46)"
+    setup:
+      aircraft: "Aircraft/Laminar Research/Lancair Evolution/N844X.acf"
+      ramp: { field: LILB }
+    command: fly a circuit
+    deadline_min: 35
+
+  # #189: final x_m never past the line by more than ~10 m before the
+  # handoff; autoland trim 0 until settled; no off_centreline_low.
+  - name: "A330 LEMG runway start 30, circuit (#189)"
+    setup:
+      aircraft: "Aircraft/Laminar Research/Airbus A330-300/A330.acf"
+      runway_start: { field: LEMG, runway: 30, engines_running: true }
+    command: fly a circuit
+    traffic: off
+    deadline_min: 30
