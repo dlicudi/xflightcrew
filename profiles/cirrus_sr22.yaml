@@ -217,20 +217,26 @@ roll_rudder:
 # fitted to three LEMG 13 rotations of 2026-09-29 (1790682305 at a 0.25 s
 # tick, 1790690995 and 1790694884 at 0.4 s): the column the law wrote,
 # replayed from the ticks, against the attitude to 5 degrees, 0.35 degree
-# rms; the climb after it on its own, 0.14. On the wheels the nose turns 29
-# deg/s per unit of column past the breakout (0.104 at 90 kt, as 1/v^2) plus
-# 0.033 per degree it is already up: the tail's spring, as stiff as the
-# law's own P, so the nose stopped at 3 degrees and lifted off at 98 to 100
-# KIAS each time, rotate 73. Flying, 0.164 holds an attitude at 90 kt.
-# Fed forward (a share), the plant lifts off near 83 kt (93 before), the nose
-# at 7 degrees 2.1 s after Vr (5.8 s before), 9.6 degrees at most (10.3
-# before); the wheels-off line is an estimate, so check it flown.
+# rms. On the wheels the nose turns 29 deg/s per unit of column past the
+# breakout (0.104 at 90 kt, as 1/v^2) plus 0.033 per degree it is already
+# up: the tail's spring, as stiff as the law's own P, so the nose stopped at
+# 3 degrees and lifted off at 98 to 100 KIAS each time, rotate 73.
+#
+# Flown fed forward (1790699819, 2026-09-29): wheels off at 81.4 KIAS 1.4 s
+# after Vr, then the model dropped to a flat 0.164 "flying" hold and the nose
+# fell 5.0 to 3.0; floating in ground effect, the 8 ft liftoff came at 94.7.
+# The spring is on the wing's angle of attack, so it leaves only as the path
+# comes up; ground effect holds the breakout until about half the span.
+# There 0.31 held 4.6 degrees at 88 KIAS a few feet up (breakout plus
+# spring); the 100 kt climbs hold 10 degrees on a 7 degree path with 0.1, the
+# spring less 0.06 (`air_base`).
 rotate_elevator:
   ref_kts: 90.0
   deg_s_per_unit: 29.2
   breakout: 0.104
   per_deg: 0.033
-  air_hold: 0.164
+  air_base: -0.06
+  ground_effect_ft: 20.0
 
 # The rollout's brake split (autoland::RolloutBrakeSteer), fitted to LEMG 13
 # 2026-09-29 (sortie 1790689843-approach, calm, the iMac's 0.46 s loop): the
