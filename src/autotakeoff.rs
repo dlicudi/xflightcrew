@@ -352,7 +352,9 @@ const FLAP_WITHHELD_LOG_S: f64 = 10.0;
 /// stepped again, the speed past the 210 retract speed for most of a
 /// minute: its deploy ratio never came within 0.03 of the handle. A
 /// reading that never left the old detent is not settled (a jammed flap is
-/// not an arrival). A failed read is no measurement.
+/// not an arrival). A retraction reading already past the commanded detent
+/// has arrived at once (the A330's CONF 1, 2026-09-29). A failed read is no
+/// measurement.
 #[derive(Debug, Clone, Default)]
 pub struct FlapPace {
     from: Option<f64>,
@@ -376,6 +378,18 @@ impl FlapPace {
             return false;
         };
         if crate::takeoff_config::flaps_arrived(d, commanded) {
+            return true;
+        }
+        // A retraction reading already PAST the commanded detent, cleaner
+        // than it, has arrived: nothing is left out that the next step's
+        // speed must respect. The A330's CONF 1 is slats: its reading ran
+        // 0.106 then 0.011 under the 0.25 handle, still falling, and the
+        // walk waited 15 s for it to stop while the crosswind ran to 224 kt
+        // over the 215 placard (LEMG 30, sortie 1790698132-full_auto,
+        // 2026-09-29).
+        if self.from.is_some_and(|f| f > commanded + 1e-6)
+            && d <= commanded + crate::takeoff_config::FLAP_ARRIVED
+        {
             return true;
         }
         if self
@@ -4619,6 +4633,20 @@ mod tests {
         // Arrived inside the tolerance needs no settling at all.
         let mut near = FlapPace::default();
         assert_eq!(step(&mut near, 0.0, Some(0.26)), Some(0.0));
+        // #169, LEMG 30 (sortie 1790698132-full_auto, 2026-09-29): the
+        // A330's CONF 1 reading falls past the handle (0.106, then 0.011,
+        // still moving): past the detent on the way in is arrived at once.
+        let mut slats = FlapPace::default();
+        slats.stepped(0.5);
+        assert_eq!(step(&mut slats, 0.0, Some(0.106)), Some(0.0));
+        assert_eq!(step(&mut slats, 0.7, Some(0.011)), Some(0.0));
+        // ...but not with no step to judge the direction by, and never a
+        // reading still above the detent.
+        let mut blind = FlapPace::default();
+        assert_eq!(step(&mut blind, 0.0, Some(0.106)), None);
+        let mut above = FlapPace::default();
+        above.stepped(0.5);
+        assert_eq!(step(&mut above, 0.0, Some(0.30)), None);
         // The withheld line: the first, then every ten seconds.
         let mut log = FlapPace::default();
         assert!(log.withheld_log_due(0.0));

@@ -400,9 +400,23 @@ pub fn throttle_adjust_with(
     // circuit's law pulled the lever at the polite rate the whole way (SF50,
     // Luton 2026-07-28). Well past the target, or building fast: pull like
     // you mean it. Overspeed is a comfort problem right up until it's Vmo.
-    let max_down = if proj < -10.0 { urgent } else { gentle };
+    let mut max_down = if proj < -10.0 { urgent } else { gentle };
+    // A declared governor pulls up to twice its urgent step as the
+    // projection runs 10 to 20 kt past: the A330's lever slews 0.08 a tick
+    // from 1.0 against a 4.6 s spool, and a climb given up at the level-off
+    // with the lever still at 1.0 ran 12 kt over the clean-up's 212.5
+    // (LEMG 30, sortie 1790698132-full_auto, 2026-09-29, #169). The shared
+    // law is unchanged.
+    if gov.is_some() && proj < -10.0 {
+        max_down = urgent * (-proj / 10.0).min(DEEP_PULL_MAX);
+    }
     (proj * gain).clamp(-max_down, max_up)
 }
+
+/// The most a declared governor's pull grows over its urgent step, as a
+/// multiple, for a projection far past the target (see
+/// [`throttle_adjust_with`]).
+const DEEP_PULL_MAX: f64 = 2.0;
 
 /// How far ahead [`throttle_adjust`] projects the airspeed, seconds. Longer
 /// than the lever slew it has to lead — 2.7 s (the old implicit lead) let a
@@ -1722,6 +1736,73 @@ mod tests {
         // pulled the polite 0.015; the A330's pulls harder.
         assert_eq!(throttle_adjust(5.2, 2.6), -0.015);
         assert!(throttle_adjust_with(5.2, 2.6, Some(gov)) < -0.03);
+    }
+
+    /// #169, LEMG 30 (sortie 1790698132-full_auto, 2026-09-29): with CONF 1
+    /// out and 212.5 wanted, the climb collapsed from 2,468 fpm to level in
+    /// ten seconds (the recorded `vs`, +143.8 to +168.6 s) with the lever at
+    /// 1.0, and the crosswind peaked 224.4 kt at +160.4 s. Replayed through
+    /// the same thrust plants as the clean level-off, the deeper pull peaks
+    /// lower on every plant with the fast engines and never higher; the old
+    /// law is this one with the pull capped at the urgent step. On the plant
+    /// that reproduces the flight (4 kt/s, 4.6 s: 221.2 at +164.3) it peaks
+    /// under 219.
+    #[test]
+    fn the_a330_governor_pulls_harder_far_past_the_target() {
+        const VS: [(f64, f64); 16] = [
+            (143.8, 2468.0), (145.5, 1931.0), (147.1, 1601.0), (148.6, 1059.0),
+            (150.5, 651.0), (151.9, 323.0), (153.6, 74.0), (155.3, -18.0), (157.1, 8.0),
+            (158.7, 70.0), (160.4, 146.0), (162.0, 165.0), (163.7, 188.0), (165.3, 182.0),
+            (167.1, 208.0), (168.6, 231.0),
+        ];
+        let gov = crate::aircraft::load("airbus_a330_300")
+            .and_then(|p| p.speed_governor)
+            .and_then(crate::aircraft::SpeedGovernorProfile::valid)
+            .expect("the A330 declares its governor");
+        let vs_at = |t: f64| {
+            let i = VS.iter().position(|p| p.0 > t).unwrap_or(VS.len() - 1).max(1);
+            let (a, b) = (VS[i - 1], VS[i]);
+            a.1 + (b.1 - a.1) * ((t - a.0) / (b.0 - a.0)).clamp(0.0, 1.0)
+        };
+        let fly = |deep: bool, a: f64, trim: f64, lag: f64| {
+            let (want, tick, h) = (212.5, 0.75, 0.05);
+            let (mut ias, mut lever, mut eff) = (180.9_f64, 1.0_f64, 1.0_f64);
+            let (mut t, mut next, mut trend, mut prev) = (143.8, 143.8, 2.5_f64, 180.9_f64);
+            let mut peak = 0.0_f64;
+            while t < 168.6 {
+                if t >= next {
+                    next += tick;
+                    trend = 0.6 * trend + 0.4 * (ias - prev) / tick;
+                    prev = ias;
+                    let mut d = throttle_adjust_with(want - ias, trend, Some(gov));
+                    if !deep {
+                        d = d.max(-gov.max_step);
+                    }
+                    lever = (lever + d).clamp(0.0, 1.0);
+                }
+                eff += (lever - eff) * h / lag;
+                let gamma = vs_at(t) / (ias * 101.27);
+                ias += (a * (eff - trim) - 0.545 * (ias - 220.0) / 100.0 - 19.07 * gamma) * h;
+                t += h;
+                peak = peak.max(ias);
+            }
+            peak
+        };
+        for (a, trim) in [(2.5, 0.125), (4.0, 0.18), (5.0, 0.2)] {
+            for lag in [2.0, 4.6, 7.0] {
+                let (old, new) = (fly(false, a, trim, lag), fly(true, a, trim, lag));
+                assert!(new <= old + 1e-9, "{a} kt/s, {lag} s: {new:.1} vs {old:.1}");
+                if a >= 4.0 {
+                    assert!(new < old - 1.0, "{a} kt/s, {lag} s: {new:.1} vs {old:.1}");
+                }
+            }
+        }
+        assert!(fly(true, 4.0, 0.18, 4.6) < 219.0);
+        // Twice the urgent step at most, and only past 10 kt of projection.
+        assert_eq!(throttle_adjust_with(-40.0, 0.0, Some(gov)), -2.0 * gov.max_step);
+        assert!((throttle_adjust_with(-11.0, 0.0, Some(gov)) + 0.066).abs() < 1e-9);
+        // The shared law never pulls past its urgent step.
+        assert_eq!(throttle_adjust(-40.0, 0.0), -0.04);
     }
 
     #[test]
