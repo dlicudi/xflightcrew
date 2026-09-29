@@ -11011,3 +11011,65 @@ Next flight: `autoland` `glidepath` then `reversal` or `late_go_around` (never `
 on a circuit); after a balk `reversal` with `missed: true`; any airborne end `full_auto`
 `airborne_end` with `verdict` `ap_holding` or `take_over` (`why`), then `recover` `take_over`.
 Offline only.
+
+## 2026-09-29: the SR22's rollouts latched on a bounce; the split on the wheels (#166)
+
+aa5ab0f flown on the iMac, LEMG 13 1790694457-approach (10 nm final, calm): rollout FAIL 9.4 m, drift
+3.8 degrees at the touchdown (bench/landings/sr22_lemg13_rollout_1790694457.jsonl, 25 ticks). The
+flare porpoised three times (radio 0.8, 0.4 and 1.3 ft, back up to 7.6, 11.4 and 10.2; `ground`
+false on every guidance tick; 88 kt at the first). The third contact (-2.7 s) kicked the bank from
+-1.7 to +7.2 degrees against full left aileron, and the sideways velocity went from -0.1 to +1.1 m/s
+in a tick. The rollout latched at the next contact (61 kt, 4.1 m right, the single-tick path:
+wheels read on, radio under 5 ft, IAS under the approach speed). The aircraft then flew up to 9 ft
+for about 4.5 s with the throttle closed, the roll channel let go, 0.39 of left brake against 0.09
+and 0.2 to 0.45 of left rudder. Wheel brakes do not turn an aircraft in the air: `err` held -5 to -8
+and `xtk_m` went 4.1 to 10.3. The wheels came down with the split already on, and the nose slewed
+from 134 to 127 in a second on a 131.5 track: the scorer's 3.8 degrees of drift. So the drift into
+the touchdown was not the arrest's decrab: psi and track agreed within 0.3 degrees from 20 s out to
+the third contact. The `state` samples run about 2.5 s behind their stamp (their groundspeed against
+the rollout ticks'), so read them shifted: ground false at +1.7 s (8.8 ft), true by about +4.4 s,
+where the deceleration jumps from 2 to 6 kt/s. 1790689843 was the same: it latched at the first
+contact at 88 kt and flew 3.5 to 3.8 ft for about 6 s, so most of the earlier fit (15 to 30 deg/s
+per unit, a standing right yaw in the "rollout") was air.
+
+On the wheels alone, from both sorties' ground ticks (two-tick predictions of heading and track): the
+difference turns the nose 45 deg/s per unit after 0.4 to 0.5 s at every speed. The nose weathervanes
+onto the track at 2 to 6 per second at 60 kt (fitted as v^2). The track follows the nose at 2 to 3 per
+second, with 1 to 2 deg/s of right yaw above 40 kt. The rudder at idle does nothing measurable. Below
+35 kt nothing damps the heading but the law: at 0.025 per degree, a 1.2 s lead on the raw difference
+and a 0.8 corner, the split went wheel to wheel at 0.39 each tick and the nose swung +/-7 degrees
+(bl/br alternating each 0.45 s tick). The differential is not capped by the low symmetric brake
+(inside 0.39 and outside 0.09 is 0.30, the cap), and the rudder channel is applied (`state`
+`in.yy` follows `steer`).
+
+Changes. The rollout holds a bounce (`autoland::BounceHold`, blackbox `bounce` off/on with radio,
+gs, xtk). With the wheels off it writes no brake and no rudder, flies the arrest's bank target on
+`xcopilot/roll` (when the arrest held the ailerons), re-centres the roll and starts the split afresh
+when the wheels come back. `rollout` ticks now carry `ground`, `radio`, `phi`, `trk`, `air_ail` and
+`bank_tgt`. This applies to every airframe, but only while the wheels are off after the latch. The
+SR22's split is scheduled on the speed (`rollout_brakes:` `gain_ref_kts` 40, `gain_min` 0.4,
+`gain_max` 1.5, `per_deg` 0.02) with a smoothed lead (`rate_tau_s` 0.25, `lead_s` 0.8) and a slower
+trim (0.6).
+
+Replayed (superposition on each record; on the wheels the fitted plant, in the air a point mass with
+the arrest's bank through 0.3 s and a 0.8 s roll lag):
+
+- As flown, both rollouts reproduce: 9.06 m and 10.97 m.
+- 1790689843: 4.46 m at the fit and under 5.2 over the neighbouring plants (the shared law with the
+  bounce held: 7.3).
+- 1790694457: 7.6 m, all of it the drift the bounce made before the wheels (4.1 m moving 1.7 m/s at
+  the latch, at most 2.5 degrees of bank near the ground).
+- The heading's span on 1790694457's wheels: 4.5 to 7.5 degrees where the old numbers swing 10 to 22.
+- The 2026-09-28 rollout (no weathervane in that replay): 2.3 to 5.4 m from 10 to 90 deg/s per unit
+  (it was 2.1 to 2.9).
+
+Tests: `the_sr22_rollouts_replay_with_the_bounce_held`, `the_sr22_split_does_not_bang_wheel_to_wheel_slow`,
+`a_bounce_is_a_spell_off_the_wheels`, `the_split_gain_follows_the_speed`, `the_sr22_split_on_the_first_rollout`.
+
+Still open: the bounce itself. The SR22 arrives at 88 to 90 KIAS (the approach floor from
+`vs_clean_kts` 70) and the flare porpoises onto the runway. The latch still takes a single contact
+tick. Offline only.
+
+Next SR22 landing: autoland `bounce` records, `rollout` `ground` false ticks with `bl`/`br` 0 and
+`air_ail` set, no nose slew at the `Landed` tick, `xtk_m` inside 5 m, and below 35 kt `bl`/`br` no
+longer 0.39 each tick.

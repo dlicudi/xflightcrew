@@ -347,6 +347,18 @@ impl ArrestRollProfile {
 /// error: the nose sat 3 degrees right of the target for ten seconds from
 /// 75 kt with 0.08 of difference, and the aircraft rolled from 1.2 m to
 /// 9.1 m right. The trim learns the standing split.
+///
+/// Flown so (LEMG 13 1790694457, 2026-09-29) and read again with the
+/// wheels: both rollouts had latched on a bounce, so the fit above was
+/// mostly air. On the wheels alone the difference turns the nose about
+/// 45 deg/s per unit after 0.4 to 0.5 s at every speed, the nose weathervanes
+/// onto the track at 2 to 6 deg/s per degree (as the square of the speed,
+/// quoted at 60 kt) and the track follows the nose at 2 to 3 per second. At
+/// 0.025 per degree with 1.2 s of lead on the raw error the split went wheel
+/// to wheel at 0.39 every tick below 35 kt, the nose +/-7 degrees: nothing
+/// damps the heading at taxi speed but the law. So the gain is scheduled on
+/// the speed (`gain_ref_kts`, `gain_min`, `gain_max`) and the lead's rate
+/// is smoothed (`rate_tau_s`).
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct RolloutBrakesProfile {
     /// Wheel difference per degree of heading error.
@@ -363,6 +375,20 @@ pub struct RolloutBrakesProfile {
     /// The trim's limit, units of wheel difference.
     #[serde(default)]
     pub trim_max: Option<f64>,
+    /// The error's rate for the lead is smoothed over this, seconds (`None`
+    /// the raw tick-to-tick difference).
+    #[serde(default)]
+    pub rate_tau_s: Option<f64>,
+    /// The gain (and the trim's rate) is `per_deg` at this groundspeed and
+    /// scales with it, knots (`None` the same gain at every speed)...
+    #[serde(default)]
+    pub gain_ref_kts: Option<f64>,
+    /// ...never under this share of it...
+    #[serde(default)]
+    pub gain_min: Option<f64>,
+    /// ...nor over this.
+    #[serde(default)]
+    pub gain_max: Option<f64>,
 }
 
 impl RolloutBrakesProfile {
@@ -373,6 +399,21 @@ impl RolloutBrakesProfile {
             lead_s: self.lead_s.filter(|v| (0.0..=3.0).contains(v)),
             trim_per_s: self.trim_per_s.filter(|v| (0.05..=2.0).contains(v)),
             trim_max: self.trim_max.filter(|v| (0.0..=0.3).contains(v)),
+            rate_tau_s: self.rate_tau_s.filter(|v| (0.0..=2.0).contains(v)),
+            gain_ref_kts: self.gain_ref_kts.filter(|v| (10.0..=150.0).contains(v)),
+            gain_min: self.gain_min.filter(|v| (0.1..=1.0).contains(v)),
+            gain_max: self.gain_max.filter(|v| (1.0..=3.0).contains(v)),
+        }
+    }
+
+    /// The share of `per_deg` flown at this groundspeed: 1 without a
+    /// declared `gain_ref_kts`.
+    pub fn gain_share(&self, gs_kts: f64) -> f64 {
+        match self.gain_ref_kts {
+            Some(r) if gs_kts.is_finite() => {
+                (gs_kts / r).clamp(self.gain_min.unwrap_or(1.0), self.gain_max.unwrap_or(1.0))
+            }
+            _ => 1.0,
         }
     }
 }

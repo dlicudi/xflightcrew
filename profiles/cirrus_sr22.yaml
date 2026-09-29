@@ -222,10 +222,29 @@ roll_rudder:
 # split: replayed through the record, 2.5 m at the fitted plant and 2.3 to
 # 3.4 m at 10 to 35 deg/s per unit and 0.4 to 0.8 s of delay, and the
 # 2026-09-28 rollout (#166) inside 2.9 m from 10 to 90.
+#
+# Flown so (LEMG 13 1790694457, 2026-09-29): 9.4 m, and below 35 kt the
+# split went wheel to wheel at 0.39 every tick, the nose +/-7 degrees. Both
+# rollouts had latched on a bounce (the latch now leaves the brakes off in
+# the air, autoland `BounceHold`), so the fit above was mostly air. On the
+# wheels alone (both sorties' ground ticks, two-tick predictions of heading
+# and track): 45 deg/s per unit after 0.4 to 0.5 s, the nose weathervaning
+# onto the track at 2 to 6 per second at 60 kt (as v^2), the track following
+# the nose at 2 to 3 per second. Nothing damps the heading at taxi speed but
+# the law, so the gain follows the speed (0.02 per degree at 40 kt, 0.4 of
+# it at 16 kt and under, 1.5 times at 60 and over) and the lead's rate is
+# smoothed over 0.25 s. Replayed (air phase flown by the arrest's wings, no
+# brake): 1790689843 4.5 m (4.2 to 5.0 over the fitted plants), 1790694457
+# 7.6 m (the bounce's own drift before the wheels), its ground heading span
+# 4.5 to 7.5 degrees where the old numbers swung 10 to 22.
 rollout_brakes:
-  per_deg: 0.025
-  lead_s: 1.2
-  trim_per_s: 0.8
+  per_deg: 0.02
+  lead_s: 0.8
+  rate_tau_s: 0.25
+  gain_ref_kts: 40.0
+  gain_min: 0.4
+  gain_max: 1.5
+  trim_per_s: 0.6
   trim_max: 0.15
 
 checklist: checklists/cirrus_sr22.txt
