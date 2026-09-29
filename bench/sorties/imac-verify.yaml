@@ -36,3 +36,15 @@ cases:
     command: fly a circuit
     traffic: off
     deadline_min: 30
+
+  # #110: the pilot's stop during the push sets the parking brake (unscoped
+  # client); pushback abort_brakes held true, "Stopping the push".
+  - name: "737 LEMG ramp, stop during the push (#110)"
+    setup:
+      aircraft: "Aircraft/Laminar Research/Boeing 737-800/b738.acf"
+      ramp: { field: LEMG }
+    command: fly a circuit
+    steps:
+      - { say: stop, when: { event: { kind: pushback, event: on_bar } }, tool: hold_speed }
+    expect_give_up: abort
+    traffic: off
