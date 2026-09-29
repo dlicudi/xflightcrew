@@ -456,12 +456,18 @@ impl SettleJudge {
 
 /// The line (and the result's `why`) for a flight that did not settle.
 pub fn unsettled_line(why: &[String]) -> String {
+    if why.iter().any(|w| w == NO_PITCH_WHY) {
+        return format!("{NO_PITCH_WHY}. I'm flying the pitch until you say my controls.");
+    }
     format!(
         "it has not settled after {SETTLE_MAX_S:.0} seconds: {}. The autopilot has it; I \
          haven't called it ready.",
         why.join(", ")
     )
 }
+
+/// The settle's reason when the autopilot's pitch moves nothing (#181).
+pub const NO_PITCH_WHY: &str = "the autopilot has no pitch control";
 
 /// The vertical mode while the new flight settles.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -749,6 +755,7 @@ async fn engage(xp: &crate::xplane::XPlaneClient, job: &EnrouteJob) -> Engaged {
 /// blackboxed (`enroute_vertical`), the end too (`enroute_settle`).
 async fn settle(
     xp: &crate::xplane::XPlaneClient,
+    base: &str,
     dial_ft: f64,
     altimeter_ok: Option<bool>,
 ) -> Settle {
@@ -756,6 +763,9 @@ async fn settle(
     let mut judge = SettleJudge::default();
     let mut last: Option<Vertical> = None;
     let mut last_sample = None;
+    // The VS the settle flies is an engage like any other: its pitch
+    // authority is checked from the first tick that flies it (#181).
+    let mut authority_armed = false;
     loop {
         let (alt, ias, vvi, vs_st, hold_st) = tokio::join!(
             xp.get_float(crate::datarefs::ALTITUDE_FT),
@@ -778,6 +788,41 @@ async fn settle(
                 if last != Some(want) || vs_off {
                     let _ = xp.set_float(VS_DIAL, rate).await;
                 }
+            }
+            let dial_fpm = match want {
+                Vertical::Vs(rate) => Some(rate),
+                _ => None,
+            };
+            if !authority_armed {
+                if let Some(rate) = dial_fpm {
+                    crate::climb_watch::arm_authority("setup_enroute", vvi, rate);
+                    authority_armed = true;
+                }
+            } else if let Some(crate::climb_watch::Authority::NoAuthority(why)) =
+                crate::climb_watch::feed_authority(Some(vvi), dial_fpm)
+            {
+                // Hand flown to the placement's level, never given back to
+                // an autopilot with no pitch.
+                crate::tools::speedhold::ACTIVE.store(false, std::sync::atomic::Ordering::SeqCst);
+                let started = crate::tools::recover::take_over(
+                    base.to_string(),
+                    None,
+                    crate::tools::recover::TakeOver {
+                        why: format!("setup_enroute_{why}"),
+                        min_safe_ias: None,
+                        hold_kts: None,
+                        ap_no_pitch: true,
+                        hold_ft: Some(dial_ft),
+                    },
+                );
+                crate::blackbox::record(
+                    "setup",
+                    json!({ "event": "enroute_ap_no_pitch", "why": why, "alt_ft": alt,
+                            "dial": dial_ft, "recovery_started": started, "t_s": t_s }),
+                );
+                let verdict = Settle::Unsettled(vec![NO_PITCH_WHY.to_string()]);
+                record_settle(&verdict, dial_ft, last_sample.as_ref());
+                return verdict;
             }
             if last != Some(want) {
                 crate::blackbox::record(
@@ -937,7 +982,7 @@ async fn enroute_follow_up(job: EnrouteJob, loading: super::setup::Loading) {
                             "want": s.want, "took": s.took() }),
                 );
             }
-            settle(&xp, p.alt_ft, sync.map(|s| s.took())).await
+            settle(&xp, &job.base, p.alt_ft, sync.map(|s| s.took())).await
         }
         false => Settle::Settling,
     };
@@ -1224,6 +1269,15 @@ mod tests {
         );
         let line = unsettled_line(&why);
         assert!(line.starts_with("it has not settled after 60 seconds: 2985 feet"), "{line}");
+        assert!(!line.contains('\u{2014}') && !line.contains('\u{2013}'));
+    }
+
+    /// #181: an autopilot with no pitch is never "the autopilot has it".
+    #[test]
+    fn a_setup_with_no_autopilot_pitch_says_who_flies_it() {
+        let line = unsettled_line(&[NO_PITCH_WHY.to_string()]);
+        assert!(line.starts_with("the autopilot has no pitch control."), "{line}");
+        assert!(line.contains("say my controls") && !line.contains("The autopilot has it"));
         assert!(!line.contains('\u{2014}') && !line.contains('\u{2013}'));
     }
 

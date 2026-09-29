@@ -140,6 +140,15 @@ pub async fn set_for_takeoff(
     let mut out = Outcome::default();
     let af = airframe().unwrap_or_default();
 
+    // Thrust against the parking brake is idled first: the levers are the
+    // takeoff's to open, after the brakes (#181, the 737 sat at thrust 1.0
+    // against its brake for 67 s, t 1790649044 to 1790649111).
+    match levers_to_idle(xp).await {
+        Some(true) => out.set.push("thrust idle".into()),
+        Some(false) => out.not_taken.push("the thrust levers".into()),
+        None => {}
+    }
+
     if let Some(want) = flap_ratio {
         match xp.get_float(FLAP_HANDLE).await {
             Ok(at) if (at - want).abs() > 0.01 => {
@@ -231,6 +240,46 @@ pub async fn set_for_takeoff(
                            "not_taken": out.not_taken, "waited_flaps": wait_flaps}),
     );
     out
+}
+
+/// Levers past this with the parking brake set are thrust against it.
+const LEVERS_OPEN: f64 = 0.05;
+/// The parking brake reads set from here.
+const PARK_SET: f64 = 0.5;
+
+/// Thrust against the parking brake on the ground: the levers are open and
+/// the brake is set. A failed read is no measurement (`false`). Pure.
+pub fn thrust_against_brake(
+    levers: Option<f64>,
+    park: Option<f64>,
+    on_ground: Option<f64>,
+) -> bool {
+    let ok = |v: Option<f64>| v.filter(|x| x.is_finite());
+    ok(levers).is_some_and(|l| l > LEVERS_OPEN)
+        && ok(park).is_some_and(|p| p >= PARK_SET)
+        && ok(on_ground).is_some_and(|g| g > 0.5)
+}
+
+/// The levers to idle when they hold thrust against the parking brake,
+/// read back. `None` = nothing to do (or nothing read).
+async fn levers_to_idle(xp: &dyn XPlane) -> Option<bool> {
+    let lever = crate::aircraft::throttle_dataref();
+    let (levers, park, ground) = tokio::join!(
+        xp.get_float(&lever),
+        xp.get_float(crate::tools::PARK_BRAKE),
+        xp.get_float(crate::datarefs::ON_GROUND_ANY)
+    );
+    let was = levers.ok();
+    if !thrust_against_brake(was, park.ok(), ground.ok()) {
+        return None;
+    }
+    let took = xp.set_float(&lever, 0.0).await.is_ok()
+        && xp.get_float(&lever).await.is_ok_and(|v| v <= LEVERS_OPEN);
+    crate::blackbox::record(
+        "autotakeoff",
+        serde_json::json!({"event": "thrust_idled", "was": was, "took": took}),
+    );
+    Some(took)
 }
 
 /// The lever to the down detent. `None` when it is already there,
@@ -644,6 +693,40 @@ mod tests {
         on_reject(&xp).await;
         assert!(!xp.wrote(SPEEDBRAKE));
         publish(None);
+    }
+
+    /// #181: the 737 stood at thrust 1.0 against its parking brake for 67 s
+    /// while full auto worked the radio. Open levers with the brake set are
+    /// idled first and read back; open levers with the brake off (a roll in
+    /// progress) or in the air, and a failed read, are left alone.
+    #[tokio::test(start_paused = true)]
+    async fn thrust_against_the_parking_brake_is_idled() {
+        let _g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        publish(None);
+        assert!(thrust_against_brake(Some(1.0), Some(1.0), Some(1.0)));
+        assert!(!thrust_against_brake(Some(0.02), Some(1.0), Some(1.0)), "idle");
+        assert!(!thrust_against_brake(Some(1.0), Some(0.0), Some(1.0)), "brake off");
+        assert!(!thrust_against_brake(Some(1.0), Some(1.0), Some(0.0)), "airborne");
+        assert!(!thrust_against_brake(None, Some(1.0), Some(1.0)), "no reading");
+        let lever = crate::aircraft::throttle_dataref();
+        let xp = FakeXPlane::with_reads(&[
+            (lever.as_str(), 1.0),
+            (crate::tools::PARK_BRAKE, 1.0),
+            (crate::datarefs::ON_GROUND_ANY, 1.0),
+            (ALT_DIAL, 5000.0),
+            (crate::datarefs::ELEVATION_M, 41.0),
+        ]);
+        let o = set_for_takeoff(&xp, None, None, false).await;
+        assert_eq!(xp.last_write(&lever), Some(0.0));
+        // The fake never moves: the levers are NAMED, never assumed idle.
+        assert!(o.not_taken.contains(&"the thrust levers".to_string()), "{o:?}");
+        let xp = FakeXPlane::with_reads(&[
+            (lever.as_str(), 1.0),
+            (crate::tools::PARK_BRAKE, 0.0),
+            (crate::datarefs::ON_GROUND_ANY, 1.0),
+        ]);
+        set_for_takeoff(&xp, None, None, false).await;
+        assert!(!xp.wrote(&lever), "no brake, no thrust against it");
     }
 
     /// Already set by the after-start call: nothing written, nothing said.

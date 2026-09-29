@@ -3249,11 +3249,18 @@ async fn fly(xp: XPlaneClient, config: Config, voice: Option<Voice>, tools: SubT
             // takeoff's give-up, the runner's `expect_give_up` included, not
             // a silent "ended" (LEMG 13, 2026-09-28: `no_autoland`).
             if circuit_takeoff_failed(crate::circuit::stood_down(), ABORT.load(SeqCst)) {
+                // A recovery holding the aircraft is never "your aircraft"
+                // (#181: the autopilot with no pitch).
+                let line = if crate::tools::recover::ACTIVE.load(SeqCst) {
+                    "Full auto is off. I have the aircraft until you say my controls."
+                } else {
+                    "Full auto is off. Your aircraft."
+                };
                 give_up(
                     &xp,
                     tools.taxi.park_brake_valve_set,
                     &voice,
-                    "Full auto is off. Your aircraft.",
+                    line,
                     crate::circuit::TAKEOFF_NOT_COMPLETED,
                 )
                 .await;
@@ -3391,6 +3398,10 @@ async fn fly_route(
         if outcome != Some(sim::run::Outcome::Completed) {
             // A reject has stopped, parked and said "your aircraft" itself.
             let line = match outcome {
+                // The recovery has the aircraft and has said why (#181).
+                Some(sim::run::Outcome::Failed(r)) if r == crate::autotakeoff::AP_NO_PITCH => {
+                    "The flight is off. I have the aircraft until you say my controls."
+                }
                 Some(sim::run::Outcome::Failed(_)) => {
                     "The takeoff was rejected, so the flight is off."
                 }

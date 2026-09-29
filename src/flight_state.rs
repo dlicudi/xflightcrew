@@ -93,6 +93,8 @@ pub(crate) fn stand_down() {
     crate::procedure::abort();
     crate::autoland::abort();
     crate::tools::recover::abort();
+    // The pitch-authority check was about the flight that ended (#181).
+    crate::climb_watch::disarm_authority();
     crate::approach_guide::cancel();
     crate::ils::stop_setup_watch();
     crate::autotakeoff::cancel();

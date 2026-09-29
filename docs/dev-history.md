@@ -10666,3 +10666,43 @@ Tests `the_lemg_stall_is_taken_before_the_floor`, `a_circuit_the_autopilot_flew_
 `an_autopilot_is_believed_only_while_it_holds`, `a_hand_flown_hold_is_level_and_bounded`,
 `a_takeoff_is_refused_without_the_autopilots_pitch`. Owed: the takeoff's own engaged climb (363 to
 505 ft) and an enroute ALT HOLD are not watched yet. Offline only.
+
+## 2026-09-29: the autopilot's pitch authority, checked at every engage (#181)
+
+From about t 1790648000 the autopilot's pitch servo moved nothing on the 737 and the A330, across
+reloads and app restarts; modes, dials and servos read right, the roll worked, our own
+`xcopilot/pitch` moved the elevator. Suspected sim state (it began after the SF50 sat paused
+airborne about 2 h and was unpaused over the Web API). Nothing we logged could show it.
+
+- `state.in.pitch` (monitor, airborne with the servos in or our column fresh, one join beside the
+  second batch): `servo_pitch_ratio`, the elevator SURFACE (`flightmodel2/wing/elevator1_deg`, the
+  wing that moved furthest, trailing edge down positive), `total_pitch_ratio`, `elevator_trim`,
+  `vvi_dial_fpm`, `altitude_hold_ft`, `override_joystick_pitch`, `override_flightdir_ptch`.
+  `recover` `start` `authority` carries the same.
+- `climb_watch::AuthorityCheck`, armed at each vertical engage (the takeoff's 300 ft engage, the
+  circuit's and the follower's VS engage, autoland's confirmed servos, the enroute settle's VS),
+  fed by whoever flies the dial, blackbox `ap_pitch_authority` `armed` / `verdict` with the
+  numbers.
+  No authority: the climb still moving AWAY from the dial (raw trend over 1 s at 150 fpm/s, 600 fpm
+  from the engage, 1,000 off); the servo moved 0.1 and the elevator never 0.3 degrees; at 15 s a
+  climb under 0.3 of the way to a dial that asked 1,000 and 2,000 off it, or a steady dial never
+  within 500 in the second half (both unless the elevator was seen following the servo). Confirmed
+  at half the ask. Replayed: 737 1790649043 at 4.8 s (the climb watch took it at 5.4), A330
+  1790651279 at 15.2 s (the watch at 42.9), A330 approach 1790651449 at 15.1 s; never on the 737
+  PASS 1790631752, the A330 1790621184 or approach 1790646179. Over all 101 recorded sorties the
+  only other trip is #160's SF50 (1790607325). A smoothed trend tripped four healthy approaches
+  whose autopilot had already reversed an inherited sink; the raw one trips none, down to 80
+  fpm/s.
+- No authority: `recover::take_over` with `ap_no_pitch` (hand flown from the first tick on the
+  hold law, never given back to the autopilot, "The autopilot has no pitch control, I'm flying the
+  pitch.") to the selected level after a takeoff (`takeover_hold_ft`), the pattern height in a
+  circuit, where we are otherwise; the takeoff ends `ap_no_pitch` (callers say "I have the
+  aircraft until you say my controls", never "rejected" or "your aircraft"); autoland abandons.
+- `recover` wrote the column 6 s into the next setup (t 1790651450): the tick's reads were held by
+  the load gate and returned into the new flight. Every streaming write now asks `may_write` first
+  (not aborted, not superseded, never while `sim_loading`), source-pinned; `recover` `stood_down`
+  names why.
+- `takeoff_config::set_for_takeoff` idles levers open against a set parking brake first (the 737
+  sat at thrust 1.0 against the brake 67 s from t 1790649044), read back (`thrust_idled`).
+
+Offline only; the next flight's `state.in.pitch` and `ap_pitch_authority` should name the fault.

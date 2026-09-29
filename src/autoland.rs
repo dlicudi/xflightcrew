@@ -1543,6 +1543,9 @@ pub fn run_autoland_scoped(
             // A give-up happened: the speed is handed to the flight governor
             // once the loop has ended (see below).
             let mut gave_up = false;
+            // The confirmed engage's pitch authority is checked from the
+            // next tick with a climb read (#181).
+            let mut authority_owed = false;
             let mut ils_xcheck = crate::ils::XCheck::default();
             let mut coupling = crate::ils::Coupling::Off;
             let mut coupling_armed_s = 0.0_f64;
@@ -2627,6 +2630,7 @@ pub fn run_autoland_scoped(
                         serde_json::json!({"event": "ap_engaged", "tries": es.try_n,
                             "at_s": engage_now, "held": engage_held, "radio": radio_ft}),
                     );
+                    authority_owed = true;
                 }
                 if es.give_up {
                     gave_up = true;
@@ -2669,6 +2673,45 @@ pub fn run_autoland_scoped(
                     Some(v) => vs_dial_fpm(g.target_vs_fpm, v, vvi_trend, g.arresting, arrest_lead),
                     None => g.target_vs_fpm,
                 };
+                // The servos' pitch AUTHORITY (#181): the arrest takes the
+                // servos out, so the check ends there; before it, a dial the
+                // autopilot's elevator does not fly is hand flown level by
+                // the recovery and the approach abandoned.
+                if g.arresting || !engage.confirmed() || es.hold {
+                    if g.arresting {
+                        crate::climb_watch::disarm_authority();
+                        authority_owed = false;
+                    }
+                } else if authority_owed {
+                    if let Some(v) = vvi {
+                        crate::climb_watch::arm_authority("autoland", v, vs_dial);
+                        authority_owed = false;
+                    }
+                } else if let Some(crate::climb_watch::Authority::NoAuthority(why)) =
+                    crate::climb_watch::feed_authority(vvi, Some(vs_dial))
+                {
+                    let started = crate::tools::recover::take_over(
+                        base_url.clone(),
+                        voice.clone(),
+                        crate::tools::recover::TakeOver {
+                            why: format!("autoland_{why}"),
+                            min_safe_ias: crate::aircraft::config_floor_kts(
+                                last_flap.unwrap_or(0.0),
+                            )
+                            .map(|f| f + crate::circuit::RECOVERY_MARGIN_KTS),
+                            hold_kts: None,
+                            ap_no_pitch: true,
+                            hold_ft: None,
+                        },
+                    );
+                    announce("Abandoning the approach.".into(), Priority::Warning);
+                    crate::blackbox::record(
+                        "autoland",
+                        serde_json::json!({"event": "give_up", "reason": "ap_no_pitch",
+                            "why": why, "recovery_started": started, "radio": radio_ft}),
+                    );
+                    break;
+                }
                 // THE ARREST FLIES THE ELEVATOR, not the autopilot's VS dial.
                 // Only while actually arresting, and only with both
                 // measurements in hand: anywhere else the dial is right and

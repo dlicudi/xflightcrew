@@ -4135,6 +4135,11 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, plan: Pla
             }
             if xp.get_float(VS_STATUS).await.is_ok_and(|v| v > 0.5) {
                 action = VsAction::Write;
+                // A vertical mode engaged: its pitch authority is checked
+                // afresh (#181).
+                if let Some(vs) = climb_watch.vs_fpm() {
+                    crate::climb_watch::arm_authority("procedure", vs, vs_cmd);
+                }
             }
         }
         if vs_action_logged != Some(action) {
@@ -4173,12 +4178,32 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, plan: Pla
                                    "floor": watch_floor, "alt_ft": alt_ft}),
             );
         }
-        if let crate::climb_watch::Verdict::TakeOver(why) = verdict {
+        // The autopilot's pitch AUTHORITY after an engage (#181): a
+        // takeoff's carried into the follower, or the follower's own.
+        let authority = crate::climb_watch::feed_authority(
+            climb_watch.vs_fpm(),
+            (action == VsAction::Write).then_some(vs_cmd),
+        );
+        let take = match (verdict, authority) {
+            (_, Some(crate::climb_watch::Authority::NoAuthority(_))) => {
+                Some(crate::climb_watch::Why::NoAuthority)
+            }
+            (crate::climb_watch::Verdict::TakeOver(why), _) => Some(why),
+            _ => None,
+        };
+        if let Some(why) = take {
             let hold_kts = target_kts;
+            let no_pitch = why.ap_has_no_pitch();
+            // The recovery says the missing pitch itself, first thing.
+            let line = if no_pitch {
+                "I have control.".to_string()
+            } else {
+                format!("{} I have control, recovering.", why.line())
+            };
             stand_down(
                 &voice,
-                &format!("{} I have control, recovering.", why.line()),
-                "climb_not_held",
+                &line,
+                if no_pitch { "no_pitch_authority" } else { "climb_not_held" },
             );
             crate::tools::recover::take_over(
                 base_url.clone(),
@@ -4188,6 +4213,8 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, plan: Pla
                     min_safe_ias: watch_floor
                         .map(|f| f + crate::circuit::RECOVERY_MARGIN_KTS),
                     hold_kts,
+                    ap_no_pitch: no_pitch,
+                    hold_ft: None,
                 },
             );
             return;

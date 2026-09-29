@@ -197,7 +197,12 @@ impl Tool for Recover {
             (self.stall_speed_kts * 1.3).max(70.0),
             ctx.voice.cloned(),
             ctx.status.cloned(),
-            Handback { why: "recover_tool".into(), hold_kts: None },
+            Handback {
+                why: "recover_tool".into(),
+                hold_kts: None,
+                ap_no_pitch: false,
+                hold_ft: None,
+            },
         );
         Ok("I have the aircraft — recovering. Say 'my controls' to take it back.".to_string())
     }
@@ -235,6 +240,11 @@ pub struct TakeOver {
     /// The governor's speed once the autopilot is seen to hold; `None` =
     /// cruise throttle, as the recover tool does.
     pub hold_kts: Option<f64>,
+    /// The autopilot's pitch moves nothing (`climb_watch::AuthorityCheck`):
+    /// the pitch is hand flown from the start and never given back to it.
+    pub ap_no_pitch: bool,
+    /// The height the hand-flown hold flies to; `None` = where we are.
+    pub hold_ft: Option<f64>,
 }
 
 /// Take the aircraft from a crew loop: the servos out, flown level on the
@@ -254,7 +264,7 @@ pub fn take_over(base: String, voice: Option<Voice>, t: TakeOver) -> bool {
     crate::blackbox::record(
         "recover",
         json!({"event": "take_over", "why": t.why, "min_safe_ias": min_safe_ias,
-               "hold_kts": t.hold_kts}),
+               "hold_kts": t.hold_kts, "ap_no_pitch": t.ap_no_pitch, "hold_ft": t.hold_ft}),
     );
     run_recovery(
         base,
@@ -263,7 +273,12 @@ pub fn take_over(base: String, voice: Option<Voice>, t: TakeOver) -> bool {
         min_safe_ias,
         voice,
         None,
-        Handback { why: t.why, hold_kts: t.hold_kts },
+        Handback {
+            why: t.why,
+            hold_kts: t.hold_kts,
+            ap_no_pitch: t.ap_no_pitch,
+            hold_ft: t.hold_ft.filter(|h| h.is_finite()),
+        },
     );
     true
 }
@@ -340,6 +355,15 @@ pub struct PitchAuthority {
     pub cg_mac_pct: Option<f64>,
     pub weight_kg: Option<f64>,
     pub trim: Option<f64>,
+    /// The autopilot's servo output, the elevator surface (degrees, trailing
+    /// edge down positive) and the summed column (#181: the servo moved
+    /// nothing, and nothing logged either).
+    pub servo: Option<f64>,
+    pub elev_deg: Option<f64>,
+    pub total: Option<f64>,
+    pub vvi_dial: Option<f64>,
+    pub alt_hold_ft: Option<f64>,
+    pub override_fd_pitch: Option<bool>,
 }
 
 impl PitchAuthority {
@@ -367,6 +391,9 @@ impl PitchAuthority {
             "failed": self.failed, "override_autopilot": self.override_autopilot,
             "override_pitch": self.override_pitch, "alt_mode": self.alt_mode,
             "cg_mac_pct": self.cg_mac_pct, "weight_kg": self.weight_kg, "trim": self.trim,
+            "servo": self.servo, "elev": self.elev_deg, "total": self.total,
+            "vvi_dial": self.vvi_dial, "alt_hold_ft": self.alt_hold_ft,
+            "override_fd_pitch": self.override_fd_pitch,
         })
     }
 }
@@ -388,6 +415,14 @@ pub async fn read_pitch_authority(xp: &dyn crate::xplane::XPlane) -> PitchAuthor
         xp.get_float(WEIGHT),
         xp.get_float(ELEV_TRIM)
     );
+    let (servo, elev, total, vvi_dial, alt_hold, ovr_fd) = tokio::join!(
+        xp.get_float(crate::datarefs::SERVO_PITCH_RATIO),
+        xp.get_float_array(crate::datarefs::ELEVATOR1_DEG),
+        xp.get_float(crate::datarefs::TOTAL_PITCH_RATIO),
+        xp.get_float(crate::datarefs::VVI_DIAL_FPM),
+        xp.get_float(crate::datarefs::ALTITUDE_HOLD_FT),
+        xp.get_float(crate::datarefs::OVERRIDE_FD_PITCH)
+    );
     let ok = |r: anyhow::Result<f64>| r.ok().filter(|v| v.is_finite());
     PitchAuthority {
         failed,
@@ -397,6 +432,12 @@ pub async fn read_pitch_authority(xp: &dyn crate::xplane::XPlane) -> PitchAuthor
         cg_mac_pct: ok(cg),
         weight_kg: ok(weight),
         trim: ok(trim),
+        servo: ok(servo),
+        elev_deg: elev.ok().and_then(|v| crate::datarefs::elevator_surface_deg(&v)),
+        total: ok(total),
+        vvi_dial: ok(vvi_dial),
+        alt_hold_ft: ok(alt_hold),
+        override_fd_pitch: ok(ovr_fd).map(|v| v > 0.5),
     }
 }
 
@@ -467,6 +508,10 @@ const VVI: &str = "sim/cockpit2/gauges/indicators/vvi_fpm_pilot";
 struct Handback {
     why: String,
     hold_kts: Option<f64>,
+    /// No autopilot pitch: hand flown from the start, never handed back.
+    ap_no_pitch: bool,
+    /// The hand-flown hold's height; `None` = where we are.
+    hold_ft: Option<f64>,
 }
 
 /// The servos out, read back: a servo left in writes the column back over
@@ -549,7 +594,11 @@ fn run_recovery(
         rt.block_on(async move {
             let base_url = base.clone();
             let xp = XPlaneClient::new(base);
-            let live = || GEN.load(Ordering::SeqCst) == my_gen && !ABORT.load(Ordering::SeqCst);
+            // Asked before EVERY write, not once a tick: a request held by
+            // the sim's load gate returns into the next flight (#181: a
+            // tick in flight when the setup began wrote the column 6 s into
+            // the new approach, t 1790651450).
+            let live = || may_write(my_gen);
             // The servos out FIRST: an engaged servo writes the column back
             // over ours, and the autopilot holds the nose up into a stall.
             let servos_after = servos_out(&xp).await;
@@ -567,210 +616,244 @@ fn run_recovery(
                 json!({"event": "start", "why": handback.why, "servos_after": servos_after,
                        "authority": authority.json(),
                        "channels": if plugin { "plugin" } else { "override" },
-                       "min_safe_ias": min_safe_ias}),
+                       "min_safe_ias": min_safe_ias, "ap_no_pitch": handback.ap_no_pitch}),
             );
             // Props full forward: the whole power band for the unstall.
             if let Some(p) = &prop {
                 let _ = xp.set_float(&p.dataref, p.max_rpm / RAD_PER_SEC_TO_RPM).await;
             }
 
-            let t0 = std::time::Instant::now();
-            let mut still_said = false;
-            let mut stable_ticks = 0;
-            let mut last_phase = ""; // announce ANNOUNCE-mode actions on phase change
-            while live() {
-                // Frozen sim (paused or replay): nothing to read, nothing to
-                // write, and a mid-recovery pause hands back nothing.
-                if crate::xplane::sim_frozen(&xp).await {
-                    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-                    continue;
-                }
-                let Some(s) = read_state(&xp, min_safe_ias, LEVEL_PITCH_DEG).await else {
-                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                    continue;
-                };
-                let cmd = recovery_inputs(&s);
-                write_controls(&xp, plugin, cmd.pitch, cmd.roll).await;
-                if let Some(t) = cmd.throttle {
-                    let _ = xp.set_float(&throttle_dref(), t).await;
-                }
-                // Re-trim to RELIEVE the yoke: a nose-up trim (from slowing toward a
-                // stall) fights a nose-down push, so when we're holding a big pitch
-                // input, walk the trim that way. This is what makes "nose down" work
-                // when the aircraft is trimmed against us. Rate-limited and bounded.
-                if cmd.pitch.abs() > 0.15 {
-                    let trim = xp.get_float(ELEV_TRIM).await.unwrap_or(0.0);
-                    let step = 0.012 * cmd.pitch.signum();
-                    let _ = xp.set_float(ELEV_TRIM, (trim + step).clamp(-0.6, 0.4)).await;
-                }
-                // ANNOUNCE mode: say what we're DOING as the phase changes (not every
-                // tick), rather than the monitor's pilot-directed advice (which is
-                // muted while we fly).
-                let phase = if s.stall_ratio > STALL_TRIP {
-                    "unstall"
-                } else if s.bank_deg.abs() > 25.0 {
-                    "roll"
-                } else {
-                    "pitch"
-                };
-                if phase != last_phase {
-                    last_phase = phase;
-                    crate::autoland::set_panel(&format!("RECOVERING: {}", phase.to_uppercase()));
-                    let line = match phase {
-                        "unstall" => "Breaking the stall, nose down, full power.",
-                        "roll" => "Rolling wings level.",
-                        _ => "Easing the nose to level.",
+            // An autopilot with no pitch is never given the aircraft back:
+            // its hold law flies it from the first tick (upsets included).
+            let hold = if handback.ap_no_pitch {
+                let alt = xp.get_float(CURRENT_ALT).await.ok().filter(|a| a.is_finite());
+                let hold = handback
+                    .hold_ft
+                    .or(alt.map(|a| (a / 100.0).round() * 100.0))
+                    .unwrap_or(f64::NAN);
+                say(&voice, &status, crate::climb_watch::NO_PITCH_LINE);
+                hold
+            } else {
+                let t0 = std::time::Instant::now();
+                let mut still_said = false;
+                let mut stable_ticks = 0;
+                let mut last_phase = ""; // announce ANNOUNCE-mode actions on phase change
+                while live() {
+                    // Frozen sim (paused or replay): nothing to read, nothing
+                    // to write, and a mid-recovery pause hands back nothing.
+                    if crate::xplane::sim_frozen(&xp).await {
+                        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                        continue;
+                    }
+                    let Some(s) = read_state(&xp, min_safe_ias, LEVEL_PITCH_DEG).await else {
+                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                        continue;
                     };
-                    say(&voice, &status, line);
-                }
-                if !still_said && t0.elapsed().as_secs() >= 60 {
-                    still_said = true;
-                    say(&voice, &status, "Still recovering. Say my controls to take it.");
-                }
-                tracing::info!(
-                    target: "xvoicelayer::recover",
-                    bank = s.bank_deg, pitch = s.pitch_deg, stall = s.stall_ratio,
-                    ias = s.ias_kts, yoke_pitch = cmd.pitch, yoke_roll = cmd.roll, "recover"
-                );
-                crate::blackbox::record("recover", serde_json::json!({
-                    "bank": s.bank_deg, "pitch": s.pitch_deg, "stall": s.stall_ratio,
-                    "ias": s.ias_kts, "yoke_pitch": cmd.pitch, "yoke_roll": cmd.roll,
-                }));
-                // Require a few consecutive stable ticks so a momentary pass through
-                // level doesn't end the recovery prematurely.
-                if cmd.stable {
-                    stable_ticks += 1;
-                    if stable_ticks >= 3 {
+                    let cmd = recovery_inputs(&s);
+                    if !live() {
                         break;
                     }
-                } else {
-                    stable_ticks = 0;
+                    write_controls(&xp, plugin, cmd.pitch, cmd.roll).await;
+                    if let Some(t) = cmd.throttle.filter(|_| live()) {
+                        let _ = xp.set_float(&throttle_dref(), t).await;
+                    }
+                    // Re-trim to RELIEVE the yoke: a nose-up trim (from slowing
+                    // toward a stall) fights a nose-down push, so when we're
+                    // holding a big pitch input, walk the trim that way. This is
+                    // what makes "nose down" work when the aircraft is trimmed
+                    // against us. Rate-limited and bounded.
+                    if cmd.pitch.abs() > 0.15 {
+                        let trim = xp.get_float(ELEV_TRIM).await.unwrap_or(0.0);
+                        let step = 0.012 * cmd.pitch.signum();
+                        if live() {
+                            let _ = xp.set_float(ELEV_TRIM, (trim + step).clamp(-0.6, 0.4)).await;
+                        }
+                    }
+                    // ANNOUNCE mode: say what we're DOING as the phase changes
+                    // (not every tick), rather than the monitor's
+                    // pilot-directed advice (which is muted while we fly).
+                    let phase = if s.stall_ratio > STALL_TRIP {
+                        "unstall"
+                    } else if s.bank_deg.abs() > 25.0 {
+                        "roll"
+                    } else {
+                        "pitch"
+                    };
+                    if phase != last_phase {
+                        last_phase = phase;
+                        crate::autoland::set_panel(&format!(
+                            "RECOVERING: {}",
+                            phase.to_uppercase()
+                        ));
+                        let line = match phase {
+                            "unstall" => "Breaking the stall, nose down, full power.",
+                            "roll" => "Rolling wings level.",
+                            _ => "Easing the nose to level.",
+                        };
+                        say(&voice, &status, line);
+                    }
+                    if !still_said && t0.elapsed().as_secs() >= 60 {
+                        still_said = true;
+                        say(&voice, &status, "Still recovering. Say my controls to take it.");
+                    }
+                    tracing::info!(
+                        target: "xvoicelayer::recover",
+                        bank = s.bank_deg, pitch = s.pitch_deg, stall = s.stall_ratio,
+                        ias = s.ias_kts, yoke_pitch = cmd.pitch, yoke_roll = cmd.roll, "recover"
+                    );
+                    crate::blackbox::record("recover", serde_json::json!({
+                        "bank": s.bank_deg, "pitch": s.pitch_deg, "stall": s.stall_ratio,
+                        "ias": s.ias_kts, "yoke_pitch": cmd.pitch, "yoke_roll": cmd.roll,
+                    }));
+                    // Require a few consecutive stable ticks so a momentary
+                    // pass through level doesn't end the recovery prematurely.
+                    if cmd.stable {
+                        stable_ticks += 1;
+                        if stable_ticks >= 3 {
+                            break;
+                        }
+                    } else {
+                        stable_ticks = 0;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                 }
-                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-            }
 
-            // If the pilot took it back, let go and don't grab it again via the AP.
-            if !live() {
+                // If the pilot took it back, let go and don't grab it again
+                // via the AP.
+                if !live() {
+                    stood_down(my_gen);
+                    release_controls(&xp, plugin).await;
+                    crate::autoland::set_panel("");
+                    finish(my_gen);
+                    return;
+                }
+
+                // Hand to the autopilot: FD up, servos on, then HOLD the
+                // current heading AND altitude (heading hold, not just
+                // wings-level, so it doesn't drift). The mode commands are
+                // toggles: only fire when the mode is off, and write the
+                // heading bug LAST (engaging snaps the dial). The column is
+                // let go first: the servo takes the elevator.
                 release_controls(&xp, plugin).await;
-                crate::autoland::set_panel("");
-                finish(my_gen);
-                return;
-            }
-
-            // Hand to the autopilot: FD up, servos on, then HOLD the current heading
-            // AND altitude (heading hold, not just wings-level, so it doesn't drift).
-            // The mode commands are toggles: only fire when the mode is off, and
-            // write the heading bug LAST (engaging snaps the dial). The column is
-            // let go first: the servo takes the elevator.
-            release_controls(&xp, plugin).await;
-            for c in &fd_commands {
-                let _ = xp.run_command(c).await;
-            }
-            let _ = xp.run_command(CMD_SERVOS_ON).await;
-            if xp.get_float(HEADING_STATUS).await.unwrap_or(0.0) <= 0.5 {
-                let _ = xp.run_command(CMD_HEADING_MODE).await;
-            }
-            // No compass read, no bug write: a heading of "zero" is a turn
-            // north, not a hold, and heading mode keeps whatever is dialled.
-            let hdg = xp.get_float(CURRENT_HDG).await.ok();
-            if let Some(h) = hdg {
-                let _ = crate::tools::autopilot::drive_heading_bug(&xp, h).await;
-            }
-            let alt = xp.get_float(CURRENT_ALT).await.unwrap_or(0.0);
-            let hold = (alt / 100.0).round() * 100.0;
-            let _ = xp.set_float(ALT_DIAL, hold).await;
-            if xp.get_float(ALT_HOLD_STATUS).await.unwrap_or(0.0) <= 0.5 {
-                let _ = xp.run_command(CMD_ALT_HOLD).await;
-            }
-            if handback.hold_kts.is_none() {
-                let _ = xp.set_float(&throttle_dref(), CRUISE_THROTTLE).await;
-            }
-
-            // The autopilot is WATCHED before it is believed (#181): the
-            // one that let the climb run away would let the level go too.
-            let verify_t0 = std::time::Instant::now();
-            let mut holding = true;
-            while live() && verify_t0.elapsed().as_secs_f64() < AP_VERIFY_S {
-                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-                if crate::xplane::sim_frozen(&xp).await {
-                    continue;
+                if !live() {
+                    stood_down(my_gen);
+                    crate::autoland::set_panel("");
+                    finish(my_gen);
+                    return;
                 }
-                let (vvi, pitch, bank, ias, servos) = tokio::join!(
-                    xp.get_float(VVI),
-                    xp.get_float(PITCH),
-                    xp.get_float(BANK),
-                    xp.get_float(IAS),
-                    xp.get_float(SERVOS_ON)
-                );
-                let (vvi, pitch, bank, ias, servos) =
-                    (vvi.ok(), pitch.ok(), bank.ok(), ias.ok(), servos.ok());
-                // A failed servo read is no measurement, not a disconnect.
-                let servos_in = servos.is_none_or(|v| v > 0.5);
-                if !servos_in
-                    || !ap_holding(vvi, pitch, bank, ias, min_safe_ias)
-                {
-                    holding = false;
+                for c in &fd_commands {
+                    let _ = xp.run_command(c).await;
+                }
+                let _ = xp.run_command(CMD_SERVOS_ON).await;
+                if xp.get_float(HEADING_STATUS).await.unwrap_or(0.0) <= 0.5 {
+                    let _ = xp.run_command(CMD_HEADING_MODE).await;
+                }
+                // No compass read, no bug write: a heading of "zero" is a turn
+                // north, not a hold, and heading mode keeps whatever is dialled.
+                let hdg = xp.get_float(CURRENT_HDG).await.ok();
+                if let Some(h) = hdg {
+                    let _ = crate::tools::autopilot::drive_heading_bug(&xp, h).await;
+                }
+                let alt = xp.get_float(CURRENT_ALT).await.unwrap_or(0.0);
+                let hold = (alt / 100.0).round() * 100.0;
+                let _ = xp.set_float(ALT_DIAL, hold).await;
+                if xp.get_float(ALT_HOLD_STATUS).await.unwrap_or(0.0) <= 0.5 {
+                    let _ = xp.run_command(CMD_ALT_HOLD).await;
+                }
+                if handback.hold_kts.is_none() {
+                    let _ = xp.set_float(&throttle_dref(), CRUISE_THROTTLE).await;
+                }
+
+                // The autopilot is WATCHED before it is believed (#181): the
+                // one that let the climb run away would let the level go too.
+                let verify_t0 = std::time::Instant::now();
+                let mut holding = true;
+                while live() && verify_t0.elapsed().as_secs_f64() < AP_VERIFY_S {
+                    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                    if crate::xplane::sim_frozen(&xp).await {
+                        continue;
+                    }
+                    let (vvi, pitch, bank, ias, servos) = tokio::join!(
+                        xp.get_float(VVI),
+                        xp.get_float(PITCH),
+                        xp.get_float(BANK),
+                        xp.get_float(IAS),
+                        xp.get_float(SERVOS_ON)
+                    );
+                    let (vvi, pitch, bank, ias, servos) =
+                        (vvi.ok(), pitch.ok(), bank.ok(), ias.ok(), servos.ok());
+                    // A failed servo read is no measurement, not a disconnect.
+                    let servos_in = servos.is_none_or(|v| v > 0.5);
+                    if !servos_in || !ap_holding(vvi, pitch, bank, ias, min_safe_ias) {
+                        holding = false;
+                        crate::blackbox::record(
+                            "recover",
+                            json!({"event": "ap_not_holding", "vvi": vvi, "pitch": pitch,
+                                   "bank": bank, "ias": ias, "servos": servos,
+                                   "after_s": verify_t0.elapsed().as_secs_f64()}),
+                        );
+                        break;
+                    }
+                }
+                if !live() {
+                    stood_down(my_gen);
+                    crate::autoland::set_panel("");
+                    finish(my_gen);
+                    return;
+                }
+
+                if holding {
+                    crate::autoland::set_panel("");
+                    finish(my_gen);
+                    if let Some(kts) = handback.hold_kts {
+                        crate::tools::speedhold::arm_flight(base_url.clone(), voice.clone(), kts);
+                    }
                     crate::blackbox::record(
                         "recover",
-                        json!({"event": "ap_not_holding", "vvi": vvi, "pitch": pitch,
-                               "bank": bank, "ias": ias, "servos": servos,
-                               "after_s": verify_t0.elapsed().as_secs_f64()}),
+                        json!({"event": "handed_to_autopilot", "hold_ft": hold, "hdg": hdg,
+                               "hold_kts": handback.hold_kts}),
                     );
-                    break;
+                    // The line says what is actually held: no compass read,
+                    // no heading claimed.
+                    let line = match hdg {
+                        Some(h) => format!(
+                            "Recovered. Autopilot holding heading {h:.0} and {hold:.0} feet. You have control when ready."
+                        ),
+                        None => format!(
+                            "Recovered. Autopilot holding the dialled heading and {hold:.0} feet. You have control when ready."
+                        ),
+                    };
+                    if let Some(s) = &status {
+                        s.action(&line);
+                    }
+                    if let Some(v) = &voice {
+                        v.say(Priority::Warning, line);
+                    }
+                    return;
                 }
-            }
-            if !live() {
-                crate::autoland::set_panel("");
-                finish(my_gen);
-                return;
-            }
+                hold
+            };
 
-            if holding {
-                crate::autoland::set_panel("");
-                finish(my_gen);
-                if let Some(kts) = handback.hold_kts {
-                    crate::tools::speedhold::arm_flight(base_url.clone(), voice.clone(), kts);
-                }
-                crate::blackbox::record(
-                    "recover",
-                    json!({"event": "handed_to_autopilot", "hold_ft": hold, "hdg": hdg,
-                           "hold_kts": handback.hold_kts}),
-                );
-                // The line says what is actually held: no compass read, no
-                // heading claimed.
-                let line = match hdg {
-                    Some(h) => format!(
-                        "Recovered. Autopilot holding heading {h:.0} and {hold:.0} feet. You have control when ready."
-                    ),
-                    None => format!(
-                        "Recovered. Autopilot holding the dialled heading and {hold:.0} feet. You have control when ready."
-                    ),
-                };
-                if let Some(s) = &status {
-                    s.action(&line);
-                }
-                if let Some(v) = &voice {
-                    v.say(Priority::Warning, line);
-                }
-                return;
-            }
-
-            // The autopilot will not hold it: taken back and hand flown
-            // level at the height it was given, until the pilot says so.
+            // Hand flown to the hold, until the pilot says so: the autopilot
+            // would not hold it, or has no pitch at all.
             let servos_after = servos_out(&xp).await;
             crate::blackbox::record(
                 "recover",
-                json!({"event": "hand_flying", "hold_ft": hold, "servos_after": servos_after}),
+                json!({"event": "hand_flying", "hold_ft": hold, "servos_after": servos_after,
+                       "ap_no_pitch": handback.ap_no_pitch}),
             );
             crate::autoland::set_panel("HAND FLYING: SAY MY CONTROLS");
-            say(
-                &voice,
-                &status,
-                &format!(
+            let line = if !hold.is_finite() {
+                "Wings level. Say my controls.".to_string()
+            } else if handback.ap_no_pitch {
+                format!("Holding {hold:.0} feet, wings level. Say my controls.")
+            } else {
+                format!(
                     "The autopilot won't hold it. I'm hand flying, wings level at {hold:.0} \
                      feet. Say my controls."
-                ),
-            );
+                )
+            };
+            say(&voice, &status, &line);
             while live() {
                 tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                 if crate::xplane::sim_frozen(&xp).await {
@@ -782,21 +865,57 @@ fn run_recovery(
                     continue;
                 };
                 let cmd = recovery_inputs(&s);
+                if !live() {
+                    break;
+                }
                 write_controls(&xp, plugin, cmd.pitch, cmd.roll).await;
                 let thr = if s.stall_ratio > STALL_TRIP {
                     cmd.throttle
                 } else {
                     hold_throttle(s.ias_kts, min_safe_ias)
                 };
-                if let Some(t) = thr {
+                if let Some(t) = thr.filter(|_| live()) {
                     let _ = xp.set_float(&throttle_dref(), t).await;
                 }
             }
+            stood_down(my_gen);
             release_controls(&xp, plugin).await;
             crate::autoland::set_panel("");
             finish(my_gen);
         });
     });
+}
+
+/// May the recovery of generation `my_gen` still write? Not after "my
+/// controls" or a stand-down ([`ABORT`]), a newer recovery, or while the sim
+/// loads a new flight (`xplane::sim_loading`): a new flight is never this
+/// recovery's.
+fn may_write(my_gen: u64) -> bool {
+    recovery_live(
+        GEN.load(Ordering::SeqCst),
+        my_gen,
+        ABORT.load(Ordering::SeqCst),
+        crate::xplane::sim_loading(),
+    )
+}
+
+/// [`may_write`]'s rule. Pure.
+pub fn recovery_live(gen: u64, my_gen: u64, aborted: bool, loading: bool) -> bool {
+    gen == my_gen && !aborted && !loading
+}
+
+/// Why a recovery let go, on the tape (blackbox `recover` `stood_down`).
+fn stood_down(my_gen: u64) {
+    let why = if GEN.load(Ordering::SeqCst) != my_gen {
+        "superseded"
+    } else if ABORT.load(Ordering::SeqCst) {
+        "abort"
+    } else if crate::xplane::sim_loading() {
+        "new_flight"
+    } else {
+        "ended"
+    };
+    crate::blackbox::record("recover", json!({"event": "stood_down", "why": why}));
 }
 
 /// The flag is this recovery's to drop only while it is the live one: a
@@ -945,6 +1064,44 @@ mod tests {
             ..ok
         };
         assert!(other.refusal().is_some());
+    }
+
+    /// #181 (t 1790651450): a recovery tick held by the sim's load gate
+    /// wrote the column 6 s into the next setup's approach. A recovery
+    /// writes only while it is the live one: not after "my controls" or a
+    /// stand-down, not once superseded, never while a new flight loads.
+    #[test]
+    fn a_recovery_never_writes_into_the_next_flight() {
+        assert!(recovery_live(3, 3, false, false));
+        assert!(!recovery_live(3, 3, true, false), "aborted");
+        assert!(!recovery_live(4, 3, false, false), "superseded");
+        assert!(!recovery_live(3, 3, false, true), "a new flight loading");
+    }
+
+    /// Every streaming write in the recovery's loops asks first, on the line
+    /// before it: a tick's reads can return into the next flight.
+    #[test]
+    fn every_streaming_write_asks_if_it_is_still_live() {
+        let src = include_str!("recover.rs");
+        let body = src.split("fn run_recovery(").nth(1).unwrap();
+        let body = body.split("fn may_write(").next().unwrap();
+        let lines: Vec<&str> = body.lines().collect();
+        let mut seen = 0;
+        for (i, l) in lines.iter().enumerate() {
+            let streaming = l.contains("write_controls(&xp, plugin, cmd.")
+                || l.contains("set_float(&throttle_dref(), t)")
+                || l.contains("set_float(ELEV_TRIM, (trim");
+            if !streaming {
+                continue;
+            }
+            seen += 1;
+            let before = &lines[i.saturating_sub(3)..i];
+            assert!(
+                before.iter().any(|b| b.contains("live()")),
+                "line {i} writes without asking: {l}"
+            );
+        }
+        assert!(seen >= 5, "the loops' writes were found: {seen}");
     }
 
     /// A hand-flown hold: level plus the height to make up, bounded; full
