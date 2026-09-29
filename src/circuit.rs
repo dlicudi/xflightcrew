@@ -1894,6 +1894,9 @@ pub const LEG_TIME_MARGIN_S: f64 = 60.0;
 /// out. The circuit's knobs mean nothing without it.
 pub const SERVOS_OFF_S: f64 = 3.0;
 
+/// The margin over the configuration's floor a recovery holds (#181).
+pub const RECOVERY_MARGIN_KTS: f64 = 10.0;
+
 /// Why the circuit gave the aircraft back (blackbox `pattern_guard`).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum PatternTrip {
@@ -1903,6 +1906,13 @@ pub enum PatternTrip {
     LegOverdue { leg: Leg, secs: f64, limit_s: f64 },
     /// The servos read out for `secs`.
     ServosOff { secs: f64 },
+    /// The autopilot did not hold the climb (#181, `climb_watch`): `ias`
+    /// and the climb `vs` when it was taken.
+    ClimbNotHeld {
+        why: crate::climb_watch::Why,
+        ias: f64,
+        vs: f64,
+    },
 }
 
 impl PatternTrip {
@@ -1912,6 +1922,7 @@ impl PatternTrip {
             PatternTrip::AbovePattern { .. } => "above_pattern",
             PatternTrip::LegOverdue { .. } => "leg_overdue",
             PatternTrip::ServosOff { .. } => "servos_off",
+            PatternTrip::ClimbNotHeld { .. } => "climb_not_held",
         }
     }
 
@@ -1928,6 +1939,7 @@ impl PatternTrip {
                 (secs / 60.0).max(1.0).round()
             ),
             PatternTrip::ServosOff { .. } => "The autopilot is off. Circuit cancelled.".into(),
+            PatternTrip::ClimbNotHeld { why, .. } => format!("{} Circuit cancelled.", why.line()),
         }
     }
 }
@@ -2023,8 +2035,48 @@ async fn give_up_pattern(
     pattern_ft: f64,
     mag_var: f64,
     hold_kts: f64,
+    floor_kts: Option<f64>,
 ) {
     ACTIVE.store(false, Ordering::SeqCst);
+    // Never "your aircraft" to an aircraft that is slow, stalling or upset,
+    // nor to one whose autopilot would not hold the climb (#181: handed
+    // back at 73 kt, the 737 rolled past 160 degrees with nobody flying).
+    // The recovery takes it: servos out, flown level, the autopilot given
+    // it back only once it is seen to hold.
+    let upset = match trip {
+        PatternTrip::ClimbNotHeld { .. } => Some("climb_not_held"),
+        _ => crate::tools::recover::read_unflyable(xp, floor_kts).await,
+    };
+    if let Some(what) = upset {
+        let started = crate::tools::recover::take_over(
+            base_url.to_string(),
+            voice.clone(),
+            crate::tools::recover::TakeOver {
+                why: format!("circuit_{what}"),
+                min_safe_ias: floor_kts.map(|f| f + RECOVERY_MARGIN_KTS),
+                hold_kts: Some(hold_kts),
+            },
+        );
+        let (watch, ias, vs) = match trip {
+            PatternTrip::ClimbNotHeld { why, ias, vs } => (Some(why.word()), Some(ias), Some(vs)),
+            _ => (None, None, None),
+        };
+        crate::blackbox::record(
+            "circuit",
+            serde_json::json!({
+                "event": "pattern_guard", "why": trip.why(), "leg": format!("{leg:?}"),
+                "alt_msl": alt_msl_ft, "pattern_ft": pattern_ft, "hold_kts": hold_kts,
+                "recovering": what, "recovery_started": started, "floor_kts": floor_kts,
+                "watch": watch, "ias": ias, "vs": vs,
+            }),
+        );
+        alert(
+            voice,
+            Priority::Warning,
+            &format!("{} I have control, recovering.", trip.words()),
+        );
+        return;
+    }
     let psi = xp.get_float(PSI_TRUE).await.ok().filter(|v| v.is_finite());
     let hdg_mag = psi.map(|p| true_to_mag(p, mag_var).round().rem_euclid(360.0));
     let ours = !matches!(trip, PatternTrip::ServosOff { .. });
@@ -2054,6 +2106,7 @@ async fn give_up_pattern(
         PatternTrip::LegOverdue { secs, limit_s, .. } => (Some(secs), Some(limit_s), None),
         PatternTrip::AbovePattern { above_ft } => (None, None, Some(above_ft)),
         PatternTrip::ServosOff { secs } => (Some(secs), None, None),
+        PatternTrip::ClimbNotHeld { .. } => (None, None, None),
     };
     crate::blackbox::record(
         "circuit",
@@ -3374,6 +3427,9 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, p: Params
     let loop_t0 = std::time::Instant::now();
     // The pattern's own give-up (#160).
     let mut pattern_guard = PatternGuard::default();
+    // The autopilot's answer to the dial (#181).
+    let mut climb_watch = crate::climb_watch::ClimbWatch::default();
+    let mut last_verdict = crate::climb_watch::Verdict::Flying;
     // Forward terrain guard cadence + throttle; a fired guard raises the
     // vertical target floor for a while instead of pressing dead buttons.
     let mut tick: u32 = 0;
@@ -3794,8 +3850,10 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, p: Params
                 last_flap.unwrap_or(0.0),
                 &crate::aircraft::flap_limits(),
             );
+            let floor = crate::aircraft::config_floor_kts(last_flap.unwrap_or(0.0));
             give_up_pattern(
                 &xp, &base_url, &voice, trip, leg, alt_msl_ft, pattern_ft, mag_var, hold_kts,
+                floor,
             )
             .await;
             return;
@@ -3873,7 +3931,7 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, p: Params
         // ...walked to from the climb the takeoff handed over (#150).
         let tick_dt = last_tick_at.map_or(0.5, |t| t.elapsed().as_secs_f64());
         last_tick_at = Some(std::time::Instant::now());
-        let vs_cmd = climb_carry.step(
+        let mut vs_cmd = climb_carry.step(
             law_vs,
             tick_dt,
             matches!(leg, Leg::Base | Leg::Final),
@@ -3911,6 +3969,53 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, p: Params
                 }
             }
         }
+        // The autopilot's answer, WATCHED (#181): a climb far over the dial
+        // with the speed going, or one still on under the floor, is sent
+        // down, and taken if it does not come down. The floor is the kept
+        // flap's while cleaning up (`climb_floor`), the landing flap's on
+        // base and final.
+        let watch_floor = match leg {
+            Leg::Base | Leg::Final => {
+                crate::aircraft::config_floor_kts(last_flap.unwrap_or(0.0)).or(Some(climb_floor))
+            }
+            _ => Some(climb_floor),
+        };
+        let verdict = climb_watch.step(
+            loop_t0.elapsed().as_secs_f64(),
+            alt_msl_ft,
+            ias_read,
+            watch_floor,
+            (!ap_level).then_some(vs_cmd),
+        );
+        if verdict != last_verdict {
+            last_verdict = verdict;
+            crate::blackbox::record(
+                "circuit",
+                serde_json::json!({"event": "climb_watch", "verdict": format!("{verdict:?}"),
+                                   "leg": format!("{leg:?}"), "ias": ias_read,
+                                   "vs": climb_watch.vs_fpm(), "cmd_vs": vs_cmd,
+                                   "floor": watch_floor, "agl_ft": agl_ft}),
+            );
+        }
+        if let crate::climb_watch::Verdict::TakeOver(why) = verdict {
+            let hold_kts = crate::autoland::hand_back_speed_kts(
+                p_approach_ias,
+                last_flap.unwrap_or(0.0),
+                &crate::aircraft::flap_limits(),
+            );
+            let trip = PatternTrip::ClimbNotHeld {
+                why,
+                ias: ias_read,
+                vs: climb_watch.vs_fpm().unwrap_or(f64::NAN),
+            };
+            give_up_pattern(
+                &xp, &base_url, &voice, trip, leg, alt_msl_ft, pattern_ft, mag_var, hold_kts,
+                watch_floor,
+            )
+            .await;
+            return;
+        }
+        vs_cmd = crate::climb_watch::dial_for(verdict, vs_cmd);
         if ap_level {
             // Whatever the VS dial says now is stale the moment VS re-engages.
             last_vs_cmd = None;
@@ -4084,6 +4189,8 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, p: Params
                 "alt_msl": alt_msl_ft, "target_alt": target_alt,
                 "ias": ias_now, "pat_kts": pattern_kts, "want_kts": want_kts,
                 "climb_floor": climb_floor,
+                // The climb the watch judges on (#181).
+                "vs": climb_watch.vs_fpm(),
             }),
         );
 
@@ -6651,6 +6758,43 @@ mod issue_150_climb_out_tests {
 mod pattern_guard_tests {
     use super::*;
     use serde_json::Value;
+
+    /// #181 (737 LEMG 13, sortie 1790649043): the servos-out give-up said
+    /// "Your aircraft." with the aircraft as the records last saw it before
+    /// the trip: 73 kt, under a 149.5 kt floor. That aircraft is never
+    /// handed to nobody: the give-up finds it unflyable and recovers.
+    #[test]
+    fn the_servos_out_give_up_at_73_kt_is_a_recovery() {
+        let src = include_str!("../bench/sorties/1790649043-full_auto.trimmed.jsonl");
+        let rows: Vec<Value> = src.lines().filter_map(|l| serde_json::from_str(l).ok()).collect();
+        let guard = rows
+            .iter()
+            .find(|r| r["kind"] == "circuit" && r["event"] == "pattern_guard")
+            .expect("the recorded give-up");
+        assert_eq!(guard["why"], "servos_off");
+        let t = guard["t"].as_f64().unwrap();
+        let last = rows
+            .iter()
+            .filter(|r| r["kind"] == "circuit" && r["event"] == "leg")
+            .rfind(|r| r["t"].as_f64().unwrap() <= t)
+            .unwrap();
+        let ias = last["ias"].as_f64();
+        let floor = last["climb_floor"].as_f64();
+        assert!(ias.unwrap() < 75.0, "{ias:?}");
+        assert_eq!(
+            crate::tools::recover::unflyable(ias, floor, None, None, None),
+            Some("slow")
+        );
+        // And the trip it would be now is a climb not held, never "servos".
+        let trip = PatternTrip::ClimbNotHeld {
+            why: crate::climb_watch::Why::NotFollowing,
+            ias: 155.9,
+            vs: 8066.0,
+        };
+        assert_eq!(trip.why(), "climb_not_held");
+        assert!(trip.words().starts_with("The autopilot isn't following the climb."));
+        assert!(!trip.words().contains('\u{2014}'));
+    }
 
     const SORTIE: &str = include_str!("../bench/sorties/1790607325-full_auto.trimmed.jsonl");
     /// The sortie's begin.

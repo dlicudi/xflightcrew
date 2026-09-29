@@ -3015,6 +3015,10 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, plan: Pla
     let mut last_flap: Option<f64> = None;
     let mut prev_alt_sample: Option<(f64, std::time::Instant)> = None;
     let mut climb_rate_fpm = 0.0_f64;
+    // The autopilot's answer to the VS wheel, watched (#181).
+    let mut climb_watch = crate::climb_watch::ClimbWatch::default();
+    let mut last_verdict = crate::climb_watch::Verdict::Flying;
+    let watch_t0 = std::time::Instant::now();
     let mut rate_samples = 0u32;
     let mut said_unable: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut said_warned_unable = 0usize;
@@ -4141,6 +4145,54 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, plan: Pla
                                    "alt_ft": alt_ft, "want_alt": want_alt, "dial": dial, "vs_cmd": vs_cmd}),
             );
         }
+        // The autopilot's answer, WATCHED (#181): the climb far over the
+        // wheel with the speed going, or one still on under the floor, is
+        // sent down and taken if it does not come down. The flap is read
+        // only under the clean floor (its configuration's floor then).
+        let clean_floor = crate::aircraft::speed_floor_kts();
+        let watch_floor = match clean_floor {
+            Some(f) if ias < f => match xp.get_float(FLAP_RATIO).await {
+                Ok(flap) => crate::aircraft::config_floor_kts(flap).or(Some(f)),
+                Err(_) => Some(f),
+            },
+            other => other,
+        };
+        let verdict = climb_watch.step(
+            watch_t0.elapsed().as_secs_f64(),
+            alt_ft,
+            ias,
+            watch_floor,
+            (action == VsAction::Write).then_some(vs_cmd),
+        );
+        if verdict != last_verdict {
+            last_verdict = verdict;
+            crate::blackbox::record(
+                "procedure",
+                serde_json::json!({"event": "climb_watch", "verdict": format!("{verdict:?}"),
+                                   "ias": ias, "vs": climb_watch.vs_fpm(), "vs_cmd": vs_cmd,
+                                   "floor": watch_floor, "alt_ft": alt_ft}),
+            );
+        }
+        if let crate::climb_watch::Verdict::TakeOver(why) = verdict {
+            let hold_kts = target_kts;
+            stand_down(
+                &voice,
+                &format!("{} I have control, recovering.", why.line()),
+                "climb_not_held",
+            );
+            crate::tools::recover::take_over(
+                base_url.clone(),
+                voice.clone(),
+                crate::tools::recover::TakeOver {
+                    why: format!("procedure_{}", why.word()),
+                    min_safe_ias: watch_floor
+                        .map(|f| f + crate::circuit::RECOVERY_MARGIN_KTS),
+                    hold_kts,
+                },
+            );
+            return;
+        }
+        let vs_cmd = crate::climb_watch::dial_for(verdict, vs_cmd);
         // The VS wheel in the 100 fpm clicks an autopilot has, moved only
         // when the click changes: the law's fine value every tick was the
         // same twitching the heading bug did (2026-09-26).

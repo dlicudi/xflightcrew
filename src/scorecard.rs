@@ -491,6 +491,13 @@ impl Scorer {
                         f(r, "limit_s").unwrap_or(0.0)
                     ),
                     "servos_off" => "the autopilot's servos went out".to_string(),
+                    // #181: the climb watch took it.
+                    "climb_not_held" => format!(
+                        "the autopilot did not hold the climb ({}, {:.0} kt, {:.0} fpm)",
+                        s(r, "watch"),
+                        f(r, "ias").unwrap_or(0.0),
+                        f(r, "vs").unwrap_or(0.0)
+                    ),
                     other => format!("gave up: {other}"),
                 };
                 let sortie = self.sortie.clone();

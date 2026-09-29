@@ -3014,6 +3014,25 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, p: Params) {
             return;
         }
     }
+    // The elevator is the autopilot's to take at 300 ft (#181): a failed
+    // servo or pitch trim, or another plugin on the autopilot's brains, and
+    // no automation takes off. Weight, balance and who holds the column are
+    // logged either way, for the next climb that does not follow its dial.
+    let authority = crate::tools::recover::read_pitch_authority(&xp).await;
+    let refusal = authority.refusal();
+    crate::blackbox::record(
+        "autotakeoff",
+        serde_json::json!({"event": "pitch_authority", "refused": refusal,
+                           "state": authority.json()}),
+    );
+    if let Some(why) = refusal {
+        alert(
+            &voice,
+            Priority::Warning,
+            &format!("{why} I'm not taking off. Your aircraft."),
+        );
+        return;
+    }
     // Every refusal gate has passed — NOW stand the taxi governor down (a
     // line-up ends with it holding position at target zero; it kept the
     // aircraft parked through the scan above). Doing this in the tool stood
