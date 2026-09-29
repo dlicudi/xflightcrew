@@ -90,6 +90,11 @@ pub const TOUCHDOWN_MAX_DRIFT_DEG: f64 = 5.0;
 const CONTACT_RADIO_FT: f64 = 1.0;
 /// Back up past this after a contact is a bounce (rapport's own 2 ft).
 const BOUNCE_FT: f64 = 2.0;
+/// The autoland ticks' sink window at a contact: they run at 5 Hz, so the
+/// contact tick is within 0.2 s of the wheels. The state samples' 2.5 s
+/// reached back into an arresting flare: the A330's 198 fpm contact scored
+/// 402 from 12 ft up (LEMG 13, 1790670284, flight model 262; #180).
+const CONTACT_SINK_WINDOW_S: f64 = 0.5;
 /// A contact this long before the state record's touchdown belongs to it.
 const CONTACT_WITHIN_S: f64 = 30.0;
 /// The flight model's `touchdown` event this close to the state record that
@@ -302,9 +307,13 @@ struct Landing {
 #[derive(Debug, Clone, Copy)]
 struct Contact {
     t: f64,
-    /// Steepest sink in the [`instructor::TOUCHDOWN_WINDOW_S`] before it.
+    /// Steepest sink in the [`CONTACT_SINK_WINDOW_S`] before it.
     sink: f64,
-    /// Highest radio height since (a bounce past [`BOUNCE_FT`]).
+    /// The radio height the wheels met the runway at: an antenna over a
+    /// tilted bogie reads ~4 ft on the ground (A330).
+    radio0: f64,
+    /// Highest radio height since, above `radio0` (a bounce past
+    /// [`BOUNCE_FT`]).
     up_ft: f64,
 }
 
@@ -810,14 +819,20 @@ impl Scorer {
         };
         match self.contact.as_mut() {
             None if wheels => {
-                let recent: Vec<(f64, f64)> = self.flare_vvi.clone();
+                let recent: Vec<(f64, f64)> = self
+                    .flare_vvi
+                    .iter()
+                    .copied()
+                    .filter(|(tv, _)| t - tv <= CONTACT_SINK_WINDOW_S)
+                    .collect();
                 self.contact = Some(Contact {
                     t,
                     sink: crate::instructor::touchdown_sink_fpm(&recent, t, vvi).abs(),
+                    radio0: radio.max(0.0),
                     up_ft: 0.0,
                 })
             }
-            Some(c) => c.up_ft = c.up_ft.max(radio),
+            Some(c) => c.up_ft = c.up_ft.max(radio - c.radio0),
             None => {}
         }
     }
@@ -1570,6 +1585,41 @@ mod tests {
         let l = out.iter().find(|v| v["stage"] == "landing").unwrap();
         assert_eq!(l["sink_fpm"], 240.0, "{l}");
         assert!(l["bounce_ft"].is_null());
+    }
+
+    /// LEMG 13 A330, 1790670284 (#180): the tilted bogie met the runway at
+    /// radio 3.7 ft and 198 fpm, the radio then FELL to 1.4. Scored 402 fpm
+    /// (the 2.5 s window reached 12 ft up the flare) and "bounced to 3 ft"
+    /// (the radio over the bogie). The flight model's touchdown was 262.
+    #[test]
+    fn an_arrested_flare_on_a_tilted_bogie_is_neither_firm_nor_a_bounce() {
+        let flare = [
+            (851.8 - 2.5, 12.4, -402.0),
+            (851.8 - 1.9, 10.0, -334.0),
+            (851.8 - 1.3, 7.9, -277.0),
+            (851.8 - 0.8, 6.0, -238.0),
+            (851.8 - 0.4, 4.8, -217.0),
+            (851.8 - 0.2, 4.3, -208.0),
+        ];
+        let wheels = [(851.8, 3.7, -198.0), (852.0, 3.2, -188.0), (852.4, 2.9, -177.0), (852.8, 1.4, -158.0)];
+        let mut recs: Vec<Value> = flare
+            .iter()
+            .map(|(t, radio, vvi)| {
+                json!({"t": t, "kind": "autoland", "radio": radio, "vvi": vvi, "phase": "Flare", "ground": false})
+            })
+            .chain(wheels.iter().map(|(t, radio, vvi)| {
+                json!({"t": t, "kind": "autoland", "radio": radio, "vvi": vvi, "phase": "Flare", "ground": true})
+            }))
+            .collect();
+        recs.insert(0, json!({"t": 700.0, "kind": "state", "ground": false, "vsi": -800.0}));
+        recs.push(json!({"t": 852.7, "kind": "flight", "ev": "touchdown", "sink": -262.0}));
+        recs.push(json!({"t": 853.0, "kind": "state", "ground": true, "vsi": -150.0, "hdg": 131.0, "track": 131.0}));
+        recs.push(json!({"t": 870.0, "kind": "sortie", "event": "end", "outcome": "ended"}));
+        let out = score_all(recs.iter());
+        let l = out.iter().find(|v| v["stage"] == "landing").unwrap();
+        assert!(l["bounce_ft"].is_null(), "{l}");
+        assert_eq!(l["sink_fpm"], 262.0, "{l}");
+        assert_eq!(l["pass"], true, "{l}");
     }
 
     /// The offline twin of the monitor's rule: a `yoke_under_ap` inside the
