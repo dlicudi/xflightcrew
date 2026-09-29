@@ -581,6 +581,13 @@ everything blackboxes to `logs/blackbox.jsonl` (kinds: `atc`, `autotaxi`, `autot
   climb is never worth more than the airspeed left). Throttle laws watch a speed PROJECTION, led
   and stepped per airframe where the engines lag (`speed_governor:`, `throttle_adjust_live`; the
   A330's level-off ran 265 kt and its downwind 3 km wide over unsampled terrain, #169).
+- **The rectangle is judged on the CORRIDOR it is flown in, down to the runway** (`choose_pattern`,
+  `corridor_frame`, `check_descent`; #182): level legs keep `PATTERN_TERRAIN_CLEAR_FT` (1,000; LXGB's
+  authored route its own 600) over copies 0.5 and 1.0 radii out and 0.25 in (the downwind was flown
+  0.5 r outside its line); the platform and path keep 500 ft (tapering inside 2 nm), raised or
+  steepened to 3.5 degrees, else a shorter downwind, else REFUSED with the numbers
+  (`terrain_refused`); live, `live_floor_ft` climbs off ground ahead (`terrain_floor`; LEMG 13's
+  base flew 305 ft over a hill).
 - Base descends the PATH; final uses along-track `path_dist_m`, never track-miles; a REAL intercept
   (`final_intercept_hdg`) on the turn actually flown (`final_turn_radius_m`, `AP_BANK_FINAL_DEG`);
   `ready_for_autoland` needs ESTABLISHED (`ESTABLISHED_XTK_M`), and on a runway of known width ON

@@ -10706,3 +10706,52 @@ airborne about 2 h and was unpaused over the Web API). Nothing we logged could s
   sat at thrust 1.0 against the brake 67 s from t 1790649044), read back (`thrust_idled`).
 
 Offline only; the next flight's `state.in.pitch` and `ap_pitch_authority` should name the fault.
+
+## 2026-09-29: SAFETY, the circuit judged on the corridor it flies, down to the runway (#181, #182)
+
+The generic rectangle flew the 737 and the A330 at LEMG far too close to the ground. From the
+`circuit` `leg` records (agl_ft): runway 13 base 305 ft AGL at 1,203 ft MSL (sortie 1790599750),
+runway 30 downwind 475 (1790633832), 31 downwind 636, 13 downwind 650. The `armed` record said
+`left_max_ft` 729 for the 13 side flown at 1,548 (48 ft field + 1,500). Three holes:
+
+- **600 ft over the drawn LINE.** `TERRAIN_CLEAR_FT` was 600 and `pattern_polyline` probed only the
+  ideal rectangle. Measured over all 17 jet circuits logged (r 2,500 m): the downwind was flown 930
+  to 2,200 m OUTSIDE its line (median 1,330, 0.53 r), once 3,170 (LEMG 30, 1.27 r), never inside;
+  the base ran 320 to 840 m past `downwind_past_m` (1,525 on that 30). The SF50 (r 1,885) flew
+  250 m inside. Now `corridor_frame` probes the line every 150 m plus copies 0.5 and 1.0 radii out
+  and 0.25 in every 300 m, and the level legs (crosswind, downwind until abeam) keep
+  `PATTERN_TERRAIN_CLEAR_FT` = 1,000 over all of it (SERA.5005(f)(1)). LXGB's authored route keeps
+  its own 600 (`AUTHORED_TERRAIN_CLEAR_FT`): its legs are the drawn lines, joined by a waypoint
+  follower, and 1,000 would lift or refuse the Rock circuit on an untested figure. A raise under
+  100 ft is flown but not said; with both sides raised the asked-for side stays unless the other
+  is 100 ft lower.
+- **The descent was never checked.** From abeam the threshold the downwind descends to 800 ft
+  over the FIELD, and the base holds the lower of that and the 3 degree path at the roll-out
+  distance (`leg_target_ft` ratchets across the legs: the 13 base's target was 848 MSL, flown at
+  1,203 by lag alone, over 898 ft of ground in the base turn 1,200 m outside the corner). Each
+  corridor point past abeam is classed as the leg flies it (`descent_leg_at`: platform, then base
+  from the downwind's LED turn, then final) and `check_descent` requires 500 ft over it
+  (`DESCENT_FLOOR_FT`, SERA.5005(f)(2)), tapering linearly inside 2 nm (the 3 degree path is only
+  636 ft over a level field there); inside 1 nm is autoland's. A side that fails raises its
+  platform, then steepens the path (base and final, and autoland via `set_next_glidepath_deg`) to
+  at most 3.5 degrees (PANS-OPS, no steep-approach approval); else a shorter downwind is tried
+  while 60 s of straight final remain (`shortest_downwind_past_m`; a jet's drawn one is already the
+  least); else the circuit is REFUSED on the runway with the numbers (`stand_down`
+  `terrain_refused`, full auto gives up with that reason). Replayed offline over the flown tracks
+  (ground = alt_msl - agl_ft, a narrower sample than the corridor): LEMG 13 left needs a 3.66 to
+  3.85 degree path on 6 of 11 jet circuits and the SF50's 3.9, so 13's left side is refused;
+  31/30's right side passes the descent but its level ground (770 to 1,270 flown) lifts the pattern
+  to that plus 1,500.
+- **No live floor on base.** The old forward guard probed one point 1.2 nm ahead, fired under 400
+  ft and never applied on base. `live_floor_ft` probes under the aircraft and four points to 1.5 nm
+  along the track (`procedure::look_ahead_points`, the follower's geometry) and, under 500 ft on
+  crosswind, downwind or base (400 on the upwind), holds 800 over the ground on the level legs and
+  500 on base; never on final. Said once a spell ("Terrain ahead. Holding N feet."), blackbox
+  `circuit` `terrain_floor`.
+
+`armed` now carries `left_corridor_max_ft` / `right_corridor_max_ft`, `left_descent` /
+`right_descent` (`default_min_ft`, the old law's least height over the ground; `flown_min_ft`;
+`platform_agl_ft`; `glidepath_deg`; `problem`), `descent_platform_agl_ft`, `glidepath_deg` and
+`refused`; `left_max_ft` / `right_max_ft` stay the line's. The corridor probe is about 44 queries on
+a jet (about 5 s on the runway, 2 s before). Offline only; the next LEMG circuit's `armed` record
+should name the refusal or the raised shape.

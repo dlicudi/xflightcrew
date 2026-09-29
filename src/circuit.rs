@@ -488,11 +488,17 @@ const ALT_MAX_EXTRA_DESCENT_FPM: f64 = 500.0;
 /// when something is flying down it, and how fast is the aircraft's business.
 /// Zero when nothing is closing (a base leg aims at a FIXED point, so its
 /// target does not move and there is nothing to feed forward).
+#[cfg(test)]
 pub fn path_descent_fpm(closure_kts: f64) -> f64 {
+    path_descent_fpm_on(closure_kts, crate::autoland::GLIDEPATH_FT_PER_NM)
+}
+
+/// [`path_descent_fpm`] on a path of `gp_ft_per_nm`.
+pub fn path_descent_fpm_on(closure_kts: f64, gp_ft_per_nm: f64) -> f64 {
     if closure_kts <= 0.0 {
         return 0.0;
     }
-    -crate::autoland::GLIDEPATH_FT_PER_NM * closure_kts / 60.0
+    -gp_ft_per_nm * closure_kts / 60.0
 }
 
 /// The commanded vertical speed for an altitude capture: the target's own
@@ -562,9 +568,27 @@ pub fn alt_capture_vs(target_ft: f64, target_rate_fpm: f64, alt_ft: f64, vs_fpm:
 /// threshold 70 ft up and went around). Where the path is lower than the
 /// floor, the path is the answer: it is converging on the runway, which is
 /// the one place we are allowed to be low.
+#[cfg(test)]
 pub fn approach_leg_alt_ft(field_elev_ft: f64, tpa_msl_ft: f64, dist_m: f64) -> f64 {
+    approach_leg_alt_on(
+        field_elev_ft,
+        tpa_msl_ft,
+        dist_m,
+        crate::autoland::GLIDEPATH_FT_PER_NM,
+    )
+}
+
+/// [`approach_leg_alt_ft`] on a path of `gp_ft_per_nm` (318 at 3 degrees;
+/// steeper only where the terrain under the pattern asks for it,
+/// [`DescentShape`]).
+pub fn approach_leg_alt_on(
+    field_elev_ft: f64,
+    tpa_msl_ft: f64,
+    dist_m: f64,
+    gp_ft_per_nm: f64,
+) -> f64 {
     let dist_nm = dist_m.abs() / M_PER_NM;
-    let path = field_elev_ft + dist_nm * crate::autoland::GLIDEPATH_FT_PER_NM;
+    let path = field_elev_ft + dist_nm * gp_ft_per_nm;
     let floor = (field_elev_ft + HANDOFF_AGL_FT).min(path);
     path.clamp(floor, tpa_msl_ft.max(floor))
 }
@@ -615,6 +639,48 @@ pub fn path_dist_m(leg: Leg, a_m: f64, rollout_m: f64) -> f64 {
 /// this is that descent's target — low enough to give base a reachable job,
 /// high enough to stay a sane downwind height.
 const DOWNWIND_DESCENT_AGL_FT: f64 = 800.0;
+
+/// The live floor over the ground under and ahead of the aircraft (#182): the
+/// same 500 ft the descending legs are planned to keep ([`DESCENT_FLOOR_FT`]).
+const LIVE_FLOOR_FT: f64 = 500.0;
+/// The upwind's trip, the old forward guard's figure.
+const UPWIND_FLOOR_FT: f64 = 400.0;
+/// ...and how far above the ground a level leg climbs once it trips, so a
+/// floor that trips does not sit on its own trigger (the old guard's 800).
+const LIVE_FLOOR_CLIMB_FT: f64 = 800.0;
+/// How far ahead along the track the live floor looks, nm, and in how many
+/// points: 1.5 nm is 25 s at a jet's 210 kt pattern speed, time to arrest a
+/// 1,500 fpm descent; four points and the one under us are one probe query.
+const LIVE_LOOK_NM: f64 = 1.5;
+const LIVE_LOOK_POINTS: usize = 4;
+
+/// The floor the circuit holds over `ground_ft` (the highest ground under
+/// and ahead), `None` while `alt_msl_ft` keeps [`LIVE_FLOOR_FT`] over it
+/// ([`UPWIND_FLOOR_FT`] on the upwind). On
+/// the level legs it climbs to [`LIVE_FLOOR_CLIMB_FT`]; on base only to the
+/// floor itself (the approach, handed over high only for the ground). Never
+/// on final (autoland's). Pure.
+pub fn live_floor_ft(leg: Leg, alt_msl_ft: f64, ground_ft: f64) -> Option<f64> {
+    if leg == Leg::Final || !alt_msl_ft.is_finite() || !ground_ft.is_finite() {
+        return None;
+    }
+    // The upwind is the takeoff's climb, handed over at about 500 ft: it
+    // keeps the old guard's 400 so level ground ahead is not a warning.
+    let trip = if leg == Leg::Upwind {
+        UPWIND_FLOOR_FT
+    } else {
+        LIVE_FLOOR_FT
+    };
+    if alt_msl_ft - ground_ft >= trip {
+        return None;
+    }
+    let over = if leg == Leg::Base {
+        LIVE_FLOOR_FT
+    } else {
+        LIVE_FLOOR_CLIMB_FT
+    };
+    Some(ground_ft + over)
+}
 
 /// The speed the pattern legs are flown at: the airframe's climb speed, but
 /// never more than [`PATTERN_MAX_APPROACH_MULT`] times its approach speed.
@@ -1022,9 +1088,24 @@ pub fn takeoff_flaps_to_clean(flaps_left: Option<f64>, schedule: &[(f64, f64)]) 
 /// An airborne AGL below this after the takeoff loop exits means it REJECTED
 /// (never flew) — the circuit is off, not into the pattern.
 const AIRBORNE_MIN_AGL_FT: f64 = 300.0;
-/// Terrain clearance a pattern side must have at TPA to be flyable; below it
-/// the circuit switches sides, and with BOTH sides fouled it raises the TPA.
-const TERRAIN_CLEAR_FT: f64 = 600.0;
+/// Terrain clearance the GENERIC rectangle must have at pattern altitude over
+/// every leg it flies level (the crosswind, and the downwind until abeam the
+/// threshold), over the whole corridor the autopilot really flies
+/// ([`corridor_frame`]); below it the circuit switches sides, and with BOTH
+/// sides fouled it raises the pattern altitude. 1,000 ft: SERA.5005(f)(1)'s
+/// figure over congested areas, and the standard for an automation flying a
+/// leg nobody is looking out of (#182). It was 600, checked on the drawn line
+/// alone: the 737's LEMG 13 left side read 729 ft and was flown at 1,548
+/// (sortie 1790599750), the downwind 1.3 km outside that line.
+const PATTERN_TERRAIN_CLEAR_FT: f64 = 1000.0;
+/// The authored LXGB route's own figure ([`raise_for_terrain`]), kept at the
+/// 600 ft it was flown and checked on (2026-07-26, 2026-09-15): its legs are
+/// the drawn lines themselves, joined and captured within
+/// [`AUTHORED_CAPTURE_M`] by a waypoint follower rather than a rectangle whose
+/// autopilot turns overshoot by a kilometre, and its climb model already
+/// refuses a leg entered low. The rectangle's 1,000 would lift or refuse the
+/// Rock circuit on a figure no sortie has tested (#182).
+const AUTHORED_TERRAIN_CLEAR_FT: f64 = 600.0;
 
 /// True while the circuit orchestrator runs.
 pub static ACTIVE: AtomicBool = AtomicBool::new(false);
@@ -1831,12 +1912,36 @@ impl Closure {
 /// The leg's altitude target (MSL): the pattern altitude, the downwind's
 /// descent from abeam the touchdown point, base and final's path. Pure; the
 /// descent is ratcheted through `descent_target`.
+#[cfg(test)]
 pub fn leg_target_ft(
     leg: Leg,
     a_m: f64,
     field_elev_ft: f64,
     tpa_msl_ft: f64,
     downwind_past_m: f64,
+    descent_target: &mut Option<f64>,
+) -> f64 {
+    leg_target_shaped(
+        leg,
+        a_m,
+        field_elev_ft,
+        tpa_msl_ft,
+        downwind_past_m,
+        DescentShape::default(),
+        descent_target,
+    )
+}
+
+/// [`leg_target_ft`] with the descent the pattern pick settled on
+/// ([`DescentShape`]: the downwind's platform and the path's slope, raised
+/// only where the ground under the pattern asks for it, #182).
+pub fn leg_target_shaped(
+    leg: Leg,
+    a_m: f64,
+    field_elev_ft: f64,
+    tpa_msl_ft: f64,
+    downwind_past_m: f64,
+    shape: DescentShape,
     descent_target: &mut Option<f64>,
 ) -> f64 {
     match leg {
@@ -1850,7 +1955,7 @@ pub fn leg_target_ft(
         // a few hundred feet while still abeam. Ratcheted like base, so it
         // can only ever descend.
         Leg::Downwind if a_m < 0.0 => {
-            let want = (field_elev_ft + DOWNWIND_DESCENT_AGL_FT).min(tpa_msl_ft);
+            let want = (field_elev_ft + shape.platform_agl_ft).min(tpa_msl_ft);
             let t = descent_target.map_or(want, |d: f64| d.min(want));
             *descent_target = Some(t);
             t
@@ -1861,10 +1966,11 @@ pub fn leg_target_ft(
             // does mid-turn, the target may fall and hold, never climb back:
             // a target that rises is a level-off with the runway ahead, and
             // the aircraft chases it every time.
-            let want = approach_leg_alt_ft(
+            let want = approach_leg_alt_on(
                 field_elev_ft,
                 tpa_msl_ft,
                 path_dist_m(leg, a_m, downwind_past_m),
+                shape.gp_ft_per_nm,
             );
             let t = descent_target.map_or(want, |d: f64| d.min(want));
             *descent_target = Some(t);
@@ -2193,69 +2299,416 @@ pub fn pattern_advance(
     }
 }
 
+/// How far outside (and inside) the drawn rectangle the pattern is probed, in
+/// turn radii: the autopilot does not fly the line. Measured from every
+/// jet circuit logged (`circuit` `leg` records against their `armed`
+/// geometry, 17 circuits of the 737 and A330 at LEMG and LIEA, r 2,500 m,
+/// 2026-09-26 to 09-29): the downwind was flown 930 to 2,200 m OUTSIDE its
+/// line (median 1,330, 0.53 r), once 3,170 (LEMG 30, sortie 1790633832,
+/// 1.27 r), and never inside it; the base ran 320 to 840 m past
+/// `downwind_past_m` (1,525 on that 30). The SF50 (r 1,885) flew 250 m
+/// INSIDE (0.13 r). So copies at 0.5 and 1.0 radii out cover the median and
+/// all but the worst, and 0.25 in covers the tight airframe. The LEMG 13
+/// base turn that went 305 ft over the ground (1790599750) was 1,200 m
+/// outside the corner, between the two outer copies.
+const CORRIDOR_OUT_RADII: [f64; 2] = [0.5, 1.0];
+const CORRIDOR_IN_RADII: f64 = 0.25;
+/// Sample spacing on the corridor's copies, metres: twice the line's
+/// [`LEG_SAMPLE_M`], so the probe stays a few seconds on the runway. The
+/// line itself keeps its 150 m (the Rock's 300 m ridge).
+const CORRIDOR_SAMPLE_M: f64 = 300.0;
+
+/// The least height over the ground a DESCENDING leg (the downwind from abeam
+/// the threshold, base, final) may be commanded to, from
+/// [`DESCENT_FLOOR_FULL_NM`] out, tapering in a straight line to nothing at
+/// the threshold (#182). 500 ft is SERA.5005(f)(2)'s minimum height away
+/// from congested areas; the taper is because the 3 degree path itself is
+/// only 636 ft over a level field at 2 nm (250 ft a mile against the path's
+/// 318, so a level field always passes and a hill on final does not). The
+/// old law descended to 800 ft over the FIELD from abeam the threshold and
+/// never looked at the ground: LEMG 13's base went 305 ft over a hill 900 ft
+/// high (sortie 1790599750), the LEMG 30 downwind 475 (1790633832).
+const DESCENT_FLOOR_FT: f64 = 500.0;
+const DESCENT_FLOOR_FULL_NM: f64 = 2.0;
+/// The steepest path the circuit will fly to clear the ground on its base and
+/// final: PANS-OPS's upper limit for a procedure that is not a steep approach
+/// (anything past it needs an approval no profile declares). Autoland is
+/// handed the same angle (`autoland::set_next_glidepath_deg`).
+const STEEP_PATH_MAX_DEG: f64 = 3.5;
+/// A raise smaller than this is carried out but not said: with 1,000 ft of
+/// clearance a 1,000 ft pattern lifts over any ground above the field, and
+/// "flying it at 1,030 feet" is noise.
+const RAISE_SAID_FT: f64 = 100.0;
+/// With both sides needing a raise, the asked-for side is kept unless the
+/// other one is lower by more than this.
+const RAISE_SIDE_MARGIN_FT: f64 = 100.0;
+
+/// Feet of path per nautical mile at `deg`.
+fn gp_ft_per_nm_at(deg: f64) -> f64 {
+    6076.12 * deg.to_radians().tan()
+}
+
+/// The descent the pattern flies from abeam the threshold: the downwind's
+/// platform (feet over the field) and the path base and final follow.
+/// The default is the law as it always flew (800 ft, 3 degrees); the pick
+/// raises either only where the ground under the pattern asks for it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct DescentShape {
+    pub platform_agl_ft: f64,
+    pub gp_ft_per_nm: f64,
+}
+
+impl Default for DescentShape {
+    fn default() -> Self {
+        DescentShape {
+            platform_agl_ft: DOWNWIND_DESCENT_AGL_FT,
+            gp_ft_per_nm: crate::autoland::GLIDEPATH_FT_PER_NM,
+        }
+    }
+}
+
+impl DescentShape {
+    /// The path's angle, degrees.
+    pub fn glidepath_deg(&self) -> f64 {
+        (self.gp_ft_per_nm / 6076.12).atan().to_degrees()
+    }
+
+    /// Steeper than the standard 3 degrees.
+    pub fn steep(&self) -> bool {
+        self.gp_ft_per_nm > crate::autoland::GLIDEPATH_FT_PER_NM + 0.5
+    }
+}
+
+/// Which part of the descent a ground sample sits under.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum DescentLeg {
+    /// The downwind from abeam the threshold: the flat platform.
+    Platform,
+    /// Base, the turn onto it included (the leg starts at the downwind's
+    /// led turn), and final: the lower of the platform and the path at
+    /// `path_m`.
+    Base,
+    Final,
+}
+
+impl DescentLeg {
+    fn on_path(self) -> bool {
+        !matches!(self, DescentLeg::Platform)
+    }
+
+    fn words(self) -> &'static str {
+        match self {
+            DescentLeg::Platform => "the downwind",
+            DescentLeg::Base => "the base",
+            DescentLeg::Final => "the final",
+        }
+    }
+}
+
+/// The ground under one point of a descending leg, with the distances its
+/// target and its floor are judged on.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct GroundSample {
+    pub leg: DescentLeg,
+    /// The distance the leg's path target is computed on ([`path_dist_m`]).
+    pub path_m: f64,
+    /// Straight-line distance to the threshold, for the floor's taper.
+    pub thr_m: f64,
+    pub ground_ft: f64,
+}
+
+/// The floor a descending leg keeps over the ground `thr_m` from the
+/// threshold ([`DESCENT_FLOOR_FT`]). Pure.
+pub fn descent_floor_ft(thr_m: f64) -> f64 {
+    DESCENT_FLOOR_FT * (thr_m.abs() / M_PER_NM / DESCENT_FLOOR_FULL_NM).clamp(0.0, 1.0)
+}
+
+/// The altitude the pattern commands over a descent sample, feet MSL: what
+/// [`leg_target_shaped`] ratchets to there (the platform, then the lower of
+/// it and the path). Pure.
+pub fn descent_target_ft(
+    s: &GroundSample,
+    field_elev_ft: f64,
+    tpa_msl_ft: f64,
+    shape: DescentShape,
+) -> f64 {
+    let platform = (field_elev_ft + shape.platform_agl_ft).min(tpa_msl_ft);
+    match s.leg {
+        DescentLeg::Platform => platform,
+        DescentLeg::Base | DescentLeg::Final => platform.min(approach_leg_alt_on(
+            field_elev_ft,
+            tpa_msl_ft,
+            s.path_m,
+            shape.gp_ft_per_nm,
+        )),
+    }
+}
+
+/// The lowest point of a descent flown with `shape`: (clearance over the
+/// ground, feet, less its floor; the sample). `None` without samples. Pure.
+fn worst_descent_sample(
+    samples: &[GroundSample],
+    field_elev_ft: f64,
+    tpa_msl_ft: f64,
+    shape: DescentShape,
+) -> Option<(f64, GroundSample)> {
+    samples
+        .iter()
+        .map(|s| {
+            let over = descent_target_ft(s, field_elev_ft, tpa_msl_ft, shape) - s.ground_ft;
+            (over - descent_floor_ft(s.thr_m), *s)
+        })
+        .min_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal))
+}
+
+/// How a side's descent from abeam the threshold clears its ground.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DescentCheck {
+    /// The shape to fly: the default, or raised (platform, then a steeper
+    /// path up to [`STEEP_PATH_MAX_DEG`]) to keep every sample over its
+    /// floor. `None`: nothing legal clears it.
+    pub shape: Option<DescentShape>,
+    /// The least height over the ground the DEFAULT descent would have
+    /// flown, feet (the number the old law never looked at), and where.
+    pub default_min_ft: Option<f64>,
+    /// ...and with the shape flown.
+    pub flown_min_ft: Option<f64>,
+    /// Spoken when refused: the worst point, no dashes.
+    pub problem: Option<String>,
+}
+
+/// Check a side's descending legs at pattern altitude `tpa_msl_ft` and find
+/// the least change that clears them: the downwind platform raised to the
+/// highest sample's need (never over the pattern altitude), the path steepened
+/// to the need of every base and final sample (never past
+/// [`STEEP_PATH_MAX_DEG`]). No samples: the default, the old behaviour (no
+/// probe, no verdict). Pure.
+pub fn check_descent(
+    samples: &[GroundSample],
+    field_elev_ft: f64,
+    tpa_msl_ft: f64,
+) -> DescentCheck {
+    let default = DescentShape::default();
+    let over_ground = |shape: DescentShape| {
+        samples
+            .iter()
+            .map(|s| descent_target_ft(s, field_elev_ft, tpa_msl_ft, shape) - s.ground_ft)
+            .fold(None, |m: Option<f64>, v| Some(m.map_or(v, |m| m.min(v))))
+    };
+    let default_min_ft = over_ground(default);
+    let Some((worst, at)) = worst_descent_sample(samples, field_elev_ft, tpa_msl_ft, default)
+    else {
+        return DescentCheck {
+            shape: Some(default),
+            default_min_ft: None,
+            flown_min_ft: None,
+            problem: None,
+        };
+    };
+    if worst >= 0.0 {
+        return DescentCheck {
+            shape: Some(default),
+            default_min_ft,
+            flown_min_ft: default_min_ft,
+            problem: None,
+        };
+    }
+    let need = |s: &GroundSample| s.ground_ft + descent_floor_ft(s.thr_m);
+    let platform_need = samples
+        .iter()
+        .map(need)
+        .fold(field_elev_ft + default.platform_agl_ft, f64::max);
+    let gp_need = samples
+        .iter()
+        .filter(|s| s.leg.on_path() && s.path_m > 1.0)
+        .map(|s| (need(s) - field_elev_ft) / (s.path_m / M_PER_NM))
+        .fold(default.gp_ft_per_nm, f64::max);
+    let gp_max = gp_ft_per_nm_at(STEEP_PATH_MAX_DEG);
+    if platform_need > tpa_msl_ft + 1.0 || gp_need > gp_max + 1e-6 {
+        let over = descent_target_ft(&at, field_elev_ft, tpa_msl_ft, default) - at.ground_ft;
+        let tail = if platform_need > tpa_msl_ft + 1.0 {
+            "clearing it needs more than the pattern altitude".to_string()
+        } else {
+            format!(
+                "clearing it needs a {:.1} degree path",
+                (gp_need / 6076.12).atan().to_degrees()
+            )
+        };
+        let problem = format!(
+            "{} would pass {:.0} feet over {:.0} feet of ground {:.1} miles out, {tail}",
+            at.leg.words(),
+            (over.max(0.0) / 10.0).round() * 10.0,
+            (at.ground_ft / 10.0).round() * 10.0,
+            at.thr_m / M_PER_NM,
+        );
+        return DescentCheck {
+            shape: None,
+            default_min_ft,
+            flown_min_ft: None,
+            problem: Some(problem),
+        };
+    }
+    let shape = DescentShape {
+        platform_agl_ft: (platform_need - field_elev_ft).max(default.platform_agl_ft),
+        gp_ft_per_nm: gp_need,
+    };
+    DescentCheck {
+        shape: Some(shape),
+        default_min_ft,
+        flown_min_ft: over_ground(shape),
+        problem: None,
+    }
+}
+
 /// What a candidate pattern side knows about the world under and around it:
-/// the highest sampled terrain (`None` = no probe data) and the first no-go
-/// airspace (prohibited/restricted/danger) its polyline enters at pattern
-/// height (`None` = clear or no data).
+/// the highest sampled terrain under the legs flown AT pattern altitude,
+/// corridor included (`None` = no probe data), the first no-go airspace
+/// (prohibited/restricted/danger) its polyline enters at pattern height
+/// (`None` = clear or no data), and the ground under its descending legs
+/// (empty = no probe data, the old behaviour). `line_max_ft` is the drawn
+/// rectangle alone, the number the old check used, for the record.
 #[derive(Debug, Clone, Default)]
 pub struct SideFacts {
     pub terrain_max_ft: Option<f64>,
     pub airspace: Option<String>,
+    pub line_max_ft: Option<f64>,
+    pub descent: Vec<GroundSample>,
 }
 
-/// Decide the pattern side and altitude — the generic rule, no per-airport
-/// exceptions: fly the side clear of BOTH terrain and no-go airspace; switch
-/// sides when only the other one is; when neither is clean, prefer the side
-/// without an airspace block, raised over its terrain; and when airspace is
-/// unavoidable, fall back to terrain-safety alone (terrain kills, paper
-/// doesn't) and say so. Missing data degrades gracefully: `None` terrain =
-/// assume clear (the old behavior), `None` airspace = clear.
-/// Returns (left, tpa_msl_ft, why).
+/// The pattern the pick settled on.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PatternPick {
+    pub left: bool,
+    pub tpa_msl_ft: f64,
+    pub why: &'static str,
+    /// The descent flown from abeam the threshold.
+    pub shape: DescentShape,
+    /// Each side's descent check at the altitude it was judged at (left,
+    /// right), for the record.
+    pub descent_left: DescentCheck,
+    pub descent_right: DescentCheck,
+    /// `Some`: no side can be flown clear of the ground. The spoken reason,
+    /// with the numbers; the circuit is never flown.
+    pub refused: Option<String>,
+}
+
+/// Decide the pattern side, altitude and descent — the generic rule, no
+/// per-airport exceptions: fly the side clear of terrain (level legs by
+/// [`PATTERN_TERRAIN_CLEAR_FT`], the descent by [`check_descent`]) and of
+/// no-go airspace; switch sides when only the other one is; when neither is
+/// clean, prefer the side without an airspace block, raised over its terrain;
+/// when airspace is unavoidable, fall back to terrain-safety alone (terrain
+/// kills, paper doesn't) and say so; and when no side's descent can be flown
+/// clear, REFUSE with the numbers (#182). Missing data degrades gracefully:
+/// `None` terrain = assume clear (the old behavior), `None` airspace = clear,
+/// no descent samples = the default descent. Pure.
 pub fn choose_pattern(
     default_left: bool,
     l: &SideFacts,
     r: &SideFacts,
     field_elev_ft: f64,
     tpa_agl_ft: f64,
-) -> (bool, f64, &'static str) {
+) -> PatternPick {
     let tpa = field_elev_ft + tpa_agl_ft;
-    let terrain_ok = |f: &SideFacts| f.terrain_max_ft.is_none_or(|m| tpa - m >= TERRAIN_CLEAR_FT);
-    let clean = |f: &SideFacts| terrain_ok(f) && f.airspace.is_none();
-    let raise = |f: &SideFacts| (f.terrain_max_ft.unwrap_or(field_elev_ft) + tpa_agl_ft).max(tpa);
-    let (df, of) = if default_left { (l, r) } else { (r, l) };
-    if clean(df) {
-        return (default_left, tpa, "default_side_clear");
+    let level_ok = |f: &SideFacts, at: f64| {
+        f.terrain_max_ft
+            .is_none_or(|m| at - m >= PATTERN_TERRAIN_CLEAR_FT - 0.5)
+    };
+    // Only as high as the level legs need, and at least a pattern height
+    // over the ground: a 1,000 ft clearance under an 800 ft pattern would
+    // otherwise leave it lower than the rule.
+    let raise = |f: &SideFacts| match f.terrain_max_ft {
+        Some(m) => (m + tpa_agl_ft.max(PATTERN_TERRAIN_CLEAR_FT)).max(tpa),
+        None => tpa,
+    };
+    let side_facts = |left: bool| if left { l } else { r };
+    let descent = |left: bool, at: f64| check_descent(&side_facts(left).descent, field_elev_ft, at);
+    let pick = |left: bool, at: f64, why: &'static str, shape: DescentShape| PatternPick {
+        left,
+        tpa_msl_ft: at,
+        why,
+        shape,
+        descent_left: descent(true, if left { at } else { raise(l) }),
+        descent_right: descent(false, if left { raise(r) } else { at }),
+        refused: None,
+    };
+    let clean = |left: bool| {
+        let f = side_facts(left);
+        level_ok(f, tpa) && f.airspace.is_none()
+    };
+    let df = side_facts(default_left);
+    let of = side_facts(!default_left);
+    if clean(default_left) {
+        if let Some(shape) = descent(default_left, tpa).shape {
+            return pick(default_left, tpa, "default_side_clear", shape);
+        }
     }
-    if clean(of) {
-        let why = if df.airspace.is_some() {
-            "switched_side_for_airspace"
-        } else {
-            "switched_side_for_terrain"
-        };
-        return (!default_left, tpa, why);
+    if clean(!default_left) {
+        if let Some(shape) = descent(!default_left, tpa).shape {
+            let why = if df.airspace.is_some() {
+                "switched_side_for_airspace"
+            } else {
+                "switched_side_for_terrain"
+            };
+            return pick(!default_left, tpa, why, shape);
+        }
     }
     // Neither side is clean. Airspace can't be out-climbed at pattern heights
     // (R-164 runs to 30,000), so prefer the side WITHOUT a block, raised over
-    // its terrain when needed.
-    match (df.airspace.is_some(), of.airspace.is_some()) {
-        (true, false) => (!default_left, raise(of), "raised_for_terrain"),
-        (false, true) => (default_left, raise(df), "raised_for_terrain"),
-        _ => {
-            // Both blocked (or both merely terrain-fouled): terrain safety
-            // alone picks — the LOWER side, high enough to clear it.
-            let (side_left, facts) =
-                if l.terrain_max_ft.unwrap_or(0.0) <= r.terrain_max_ft.unwrap_or(0.0) {
-                    (true, l)
-                } else {
-                    (false, r)
-                };
-            let why = if facts.airspace.is_some() {
-                "airspace_unavoidable"
-            } else {
-                "raised_for_terrain"
-            };
-            (side_left, raise(facts), why)
+    // its terrain when needed; the other side, raised, is the second choice.
+    let lower_left = {
+        let (dr, or) = (raise(df), raise(of));
+        if dr <= or + RAISE_SIDE_MARGIN_FT {
+            default_left
+        } else {
+            !default_left
         }
+    };
+    let first = match (df.airspace.is_some(), of.airspace.is_some()) {
+        (true, false) => !default_left,
+        (false, true) => default_left,
+        _ => lower_left,
+    };
+    let why_for = |left: bool| {
+        let f = side_facts(left);
+        if f.airspace.is_some() {
+            "airspace_unavoidable"
+        } else if raise(f) > tpa + 0.5 {
+            "raised_for_terrain"
+        } else if left != default_left {
+            "switched_side_for_terrain"
+        } else {
+            "default_side_clear"
+        }
+    };
+    for left in [first, !first] {
+        let at = raise(side_facts(left));
+        if let Some(shape) = descent(left, at).shape {
+            return pick(left, at, why_for(left), shape);
+        }
+    }
+    // Nothing legal clears the ground: never fly it.
+    let side_word = |left: bool| if left { "left" } else { "right" };
+    let problem = |left: bool| {
+        descent(left, raise(side_facts(left)))
+            .problem
+            .unwrap_or_else(|| "its descent does not clear the ground".into())
+    };
+    let words = format!(
+        "No circuit here clears the ground. On the {} side {}; on the {} side {}.",
+        side_word(first),
+        problem(first),
+        side_word(!first),
+        problem(!first)
+    );
+    PatternPick {
+        refused: Some(words),
+        ..pick(
+            first,
+            raise(side_facts(first)),
+            "refused_for_terrain",
+            DescentShape::default(),
+        )
     }
 }
 
@@ -2317,6 +2770,182 @@ fn pattern_polyline(
         .into_iter()
         .map(|(a, x)| frame_to_latlon(rwy, a, x))
         .collect()
+}
+
+/// One probe point of a pattern side, in the runway frame: the leg the
+/// circuit flies there and whether it is on the drawn line.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct FramePt {
+    a_m: f64,
+    x_m: f64,
+    leg: Leg,
+    line: bool,
+}
+
+/// The rectangle moved `d_m` outward (negative: inward) from its drawn line on
+/// every side, sampled every `step_m` and tagged by leg: the crosswind
+/// further along, the downwind further out, the base further back, and the
+/// final longer.
+fn rectangle_offset(
+    g: &Geometry,
+    runway_len_m: f64,
+    left: bool,
+    d_m: f64,
+    step_m: f64,
+) -> Vec<FramePt> {
+    let side = if left { -1.0 } else { 1.0 };
+    let a_up = runway_len_m + g.upwind_past_m + d_m;
+    let a_dn = -(g.downwind_past_m + d_m);
+    let x_out = side * (g.width_m + d_m);
+    let legs = [
+        (Leg::Crosswind, (a_up, 0.0), (a_up, x_out)),
+        (Leg::Downwind, (a_up, x_out), (a_dn, x_out)),
+        (Leg::Base, (a_dn, x_out), (a_dn, 0.0)),
+        (Leg::Final, (a_dn, 0.0), (0.0, 0.0)),
+    ];
+    let mut out = Vec::new();
+    for (leg, from, to) in legs {
+        for (a_m, x_m) in densify(&[from, to], step_m) {
+            out.push(FramePt {
+                a_m,
+                x_m,
+                leg,
+                line: d_m == 0.0,
+            });
+        }
+    }
+    out
+}
+
+/// Every point probed for one pattern side: the drawn line every
+/// [`LEG_SAMPLE_M`], and the corridor the autopilot actually flies
+/// ([`CORRIDOR_OUT_RADII`], [`CORRIDOR_IN_RADII`]) every
+/// [`CORRIDOR_SAMPLE_M`]. Pure.
+fn corridor_frame(g: &Geometry, runway_len_m: f64, left: bool) -> Vec<FramePt> {
+    let r = g.lead_m / 0.9;
+    let mut out = rectangle_offset(g, runway_len_m, left, 0.0, LEG_SAMPLE_M);
+    for k in CORRIDOR_OUT_RADII {
+        out.extend(rectangle_offset(
+            g,
+            runway_len_m,
+            left,
+            k * r,
+            CORRIDOR_SAMPLE_M,
+        ));
+    }
+    out.extend(rectangle_offset(
+        g,
+        runway_len_m,
+        left,
+        -CORRIDOR_IN_RADII * r,
+        CORRIDOR_SAMPLE_M,
+    ));
+    out
+}
+
+/// Inside this of the threshold the descent is autoland's (the circuit hands
+/// over further out, and the last mile's ground is the runway's own slope,
+/// which the path's floor would read as a hill).
+const DESCENT_CHECK_FROM_M: f64 = M_PER_NM;
+
+/// The part of the descent a probe point is flown on, as [`leg_target_ft`]
+/// flies it: `None` for the legs flown level (the crosswind, the downwind
+/// until abeam the threshold); the downwind after it is the platform until
+/// its led turn, where the BASE leg begins; the base's path is judged at
+/// the roll-out distance or further ([`path_dist_m`]). Pure.
+fn descent_leg_at(p: &FramePt, g: &Geometry) -> Option<(DescentLeg, f64)> {
+    match p.leg {
+        Leg::Upwind | Leg::Crosswind => None,
+        Leg::Downwind if p.a_m >= 0.0 => None,
+        Leg::Downwind if p.a_m > -(g.downwind_past_m - g.lead_m) => {
+            Some((DescentLeg::Platform, p.a_m.abs()))
+        }
+        Leg::Downwind | Leg::Base => Some((
+            DescentLeg::Base,
+            path_dist_m(Leg::Base, p.a_m, g.downwind_past_m),
+        )),
+        Leg::Final => Some((DescentLeg::Final, p.a_m.abs())),
+    }
+}
+
+/// A side's terrain facts from its probe points and the ground under each
+/// (feet MSL, same order): the drawn line's highest (the old number), the
+/// highest under the legs flown level, corridor included, and the descent's
+/// samples. Pure.
+fn corridor_facts(pts: &[FramePt], ground_ft: &[f64], g: &Geometry) -> SideFacts {
+    let mut f = SideFacts::default();
+    let max = |m: Option<f64>, v: f64| Some(m.map_or(v, |m: f64| m.max(v)));
+    for (p, &e) in pts.iter().zip(ground_ft) {
+        if p.line {
+            f.line_max_ft = max(f.line_max_ft, e);
+        }
+        match descent_leg_at(p, g) {
+            None => f.terrain_max_ft = max(f.terrain_max_ft, e),
+            Some((leg, path_m)) => {
+                let thr_m = p.a_m.hypot(p.x_m);
+                if thr_m >= DESCENT_CHECK_FROM_M {
+                    f.descent.push(GroundSample {
+                        leg,
+                        path_m,
+                        thr_m,
+                        ground_ft: e,
+                    });
+                }
+            }
+        }
+    }
+    f
+}
+
+/// Probe one pattern side's corridor ([`corridor_frame`]) through the plugin
+/// and read its facts ([`corridor_facts`]); airspace is the caller's. Any
+/// unanswered chunk is no data at all (`SideFacts::default()`), never a
+/// partial picture read as clear ground.
+async fn probe_side(
+    xp: &XPlaneClient,
+    rwy: &crate::autoland::Runway,
+    g: &Geometry,
+    left: bool,
+) -> SideFacts {
+    let pts = corridor_frame(g, rwy.length_m, left);
+    let lls: Vec<(f64, f64)> = pts
+        .iter()
+        .map(|p| frame_to_latlon(rwy, p.a_m, p.x_m))
+        .collect();
+    let mut ground = Vec::with_capacity(lls.len());
+    for chunk in lls.chunks(crate::terrain::MAX_POINTS) {
+        match crate::terrain::sample_ft(xp, chunk).await {
+            Some(v) => ground.extend(v),
+            None => return SideFacts::default(),
+        }
+    }
+    corridor_facts(&pts, &ground, g)
+}
+
+/// The shortest `downwind_past_m` that still leaves autoland a final: the
+/// base-to-final turn (`final_r_m`) plus [`FINAL_STRAIGHT_MIN_S`] of straight
+/// final at the approach speed. Pure.
+fn shortest_downwind_past_m(final_r_m: f64, approach_kts: f64) -> f64 {
+    (final_r_m + FINAL_STRAIGHT_MIN_S * approach_kts.max(40.0) * 0.514_444).max(2000.0)
+}
+
+/// The least straight final a shortened pattern may leave, seconds: the 737
+/// handed over at LEMG 13 with 46 s of final flew it 30 to 50 m off and
+/// landed off the pavement (sortie 1790591256-full_auto, 2026-09-28).
+const FINAL_STRAIGHT_MIN_S: f64 = 60.0;
+/// Each shortening of the downwind tried when no side's descent clears.
+const DOWNWIND_SHORTEN_STEP_M: f64 = 500.0;
+
+/// The shorter downwinds to try, longest first, never under `min_m`. For a
+/// jet the drawn `2 r + 1,200 m` is already under it and there are none. Pure.
+fn shorter_downwinds(dn_m: f64, min_m: f64) -> Vec<f64> {
+    let mut out = Vec::new();
+    let mut d = dn_m - DOWNWIND_SHORTEN_STEP_M;
+    while d >= min_m && out.len() < 4 {
+        out.push(d);
+        d -= DOWNWIND_SHORTEN_STEP_M;
+    }
+    out
 }
 
 /// Fill a frame polyline so no two consecutive samples are further apart
@@ -2607,7 +3236,7 @@ fn climb_reach_ft(route: &[AuthoredWpt], field_elev_ft: f64, gradient_ft_per_m: 
 }
 
 /// Raise the route's pattern altitude until every leg flown AT pattern
-/// altitude clears its terrain by [`TERRAIN_CLEAR_FT`], or refuse. Legs that
+/// altitude clears its terrain by [`AUTHORED_TERRAIN_CLEAR_FT`], or refuse. Legs that
 /// descend to the handoff height (into a waypoint below the TPA) cannot be
 /// raised and are refused when their terrain needs more than the height
 /// they end at; a raise past [`MAX_TERRAIN_RAISE_FT`] is refused too.
@@ -2635,7 +3264,7 @@ fn raise_for_terrain(
         let Some(Some(ground)) = leg_max_ft.get(i) else {
             continue;
         };
-        let need = ground + TERRAIN_CLEAR_FT;
+        let need = ground + AUTHORED_TERRAIN_CLEAR_FT;
         if at_tpa(&route[i - 1]) && at_tpa(&route[i]) {
             tpa_needed = tpa_needed.max(need);
             let entry = reach[i - 1].min(tpa_needed);
@@ -3050,6 +3679,28 @@ pub fn stood_down() -> Option<&'static str> {
 /// The circuit's takeoff never completed: a reject, a pilot taking the
 /// roll, or a takeoff that handed back on the ground.
 pub const TAKEOFF_NOT_COMPLETED: &str = "takeoff_not_completed";
+/// The circuit was refused on the runway: no side of it clears the ground
+/// (#182). Never flown.
+pub const TERRAIN_REFUSED: &str = "terrain_refused";
+
+/// The spoken line for a descent raised over the ground (#182). No dashes.
+/// Pure.
+pub fn descent_shape_line(shape: DescentShape, field_elev_ft: f64) -> String {
+    let mut parts = Vec::new();
+    if shape.platform_agl_ft > DOWNWIND_DESCENT_AGL_FT + 1.0 {
+        parts.push(format!(
+            "holding {:.0} feet on the downwind",
+            ((field_elev_ft + shape.platform_agl_ft) / 50.0).ceil() * 50.0
+        ));
+    }
+    if shape.steep() {
+        parts.push(format!(
+            "a {:.1} degree approach path",
+            shape.glidepath_deg()
+        ));
+    }
+    format!("High ground under the approach, {}.", parts.join(", then "))
+}
 
 /// Bail out cleanly: clear our flag and let whatever sub-loop is flying stand
 /// down. Never leaves the aircraft with nobody watching the loop.
@@ -3122,13 +3773,12 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, p: Params
     let p_vy_kts = p.takeoff.vy_kts;
 
     // The world under BOTH candidate patterns: terrain probed from the sim
-    // itself, and the no-go airspace polygons the G1000 draws (OpenAir file).
-    // One generic rule picks the side and height; missing data degrades to
-    // the old behavior, never to a guess.
+    // itself over the corridor the autopilot really flies (`corridor_frame`),
+    // and the no-go airspace polygons the G1000 draws (OpenAir file). One
+    // generic rule picks the side, height and descent; missing data degrades
+    // to the old behavior, never to a guess.
     let poly_l = pattern_polyline(&rwy, &geom, rwy.length_m, true);
     let poly_r = pattern_polyline(&rwy, &geom, rwy.length_m, false);
-    let l_max = crate::terrain::max_elevation_ft(&xp, &poly_l).await;
-    let r_max = crate::terrain::max_elevation_ft(&xp, &poly_r).await;
     let spaces = {
         let path = p.airspace_path.clone();
         tokio::task::spawn_blocking(move || crate::airspace::load_near(&path, lat, lon, 0.5))
@@ -3136,33 +3786,94 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, p: Params
             .unwrap_or_default()
     };
     let tpa_probe_ft = field_elev_ft + p.tpa_agl_ft;
-    let l_facts = SideFacts {
-        terrain_max_ft: l_max,
-        airspace: crate::airspace::first_conflict(&spaces, &poly_l, tpa_probe_ft)
-            .map(|a| a.spoken_name()),
+    let l_air =
+        crate::airspace::first_conflict(&spaces, &poly_l, tpa_probe_ft).map(|a| a.spoken_name());
+    let r_air =
+        crate::airspace::first_conflict(&spaces, &poly_r, tpa_probe_ft).map(|a| a.spoken_name());
+    let probe = |g: Geometry| {
+        let (xp, rwy, l_air, r_air) = (&xp, &rwy, l_air.clone(), r_air.clone());
+        async move {
+            let l = SideFacts {
+                airspace: l_air,
+                ..probe_side(xp, rwy, &g, true).await
+            };
+            let r = SideFacts {
+                airspace: r_air,
+                ..probe_side(xp, rwy, &g, false).await
+            };
+            (l, r)
+        }
     };
-    let r_facts = SideFacts {
-        terrain_max_ft: r_max,
-        airspace: crate::airspace::first_conflict(&spaces, &poly_r, tpa_probe_ft)
-            .map(|a| a.spoken_name()),
-    };
-    let (left, tpa_msl_ft, side_pick) = choose_pattern(
+    let (mut l_facts, mut r_facts) = probe(geom).await;
+    let mut pick = choose_pattern(
         p.left_pattern,
         &l_facts,
         &r_facts,
         field_elev_ft,
         p.tpa_agl_ft,
     );
+    let lxgb = rwy.icao == "LXGB";
+    // No side's descent clears the ground: a shorter downwind brings the base
+    // in over other ground, where the geometry still leaves autoland a final
+    // (`shortest_downwind_past_m`; a jet's drawn one is already the least).
+    if pick.refused.is_some() && !lxgb {
+        let least = shortest_downwind_past_m(geom.final_capture_m / 1.3, p_approach_ias);
+        for dn in shorter_downwinds(geom.downwind_past_m, least) {
+            let g = Geometry {
+                downwind_past_m: dn,
+                ..geom
+            };
+            let (l, r) = probe(g).await;
+            let again = choose_pattern(p.left_pattern, &l, &r, field_elev_ft, p.tpa_agl_ft);
+            crate::blackbox::record(
+                "circuit",
+                serde_json::json!({"event": "downwind_shortened", "downwind_past_m": dn,
+                                   "refused": again.refused.is_some()}),
+            );
+            if again.refused.is_none() {
+                (geom, l_facts, r_facts, pick) = (g, l, r, again);
+                break;
+            }
+        }
+    }
+    let tpa_msl_ft = pick.tpa_msl_ft;
     // Gibraltar: the ONLY safe side is SOUTH — over the sea, looping around the
     // Rock. NORTH is Spain (restricted, foreign soil). choose_pattern picks the
     // LOWER-TERRAIN side, which at LXGB is the flat isthmus to the north, and it
     // flew the pattern straight into Spanish airspace (2026-07-26). Override to
     // the sea side; the runway sets the turn direction — 09 loops right
     // (clockwise), 27 loops left (anticlockwise), both staying over the water.
-    let (left, side_pick) = if rwy.icao == "LXGB" {
-        (sea_side_is_left(rwy_course), "lxgb_south_over_the_sea")
+    // The authored route checks its own legs (`raise_for_terrain`); the
+    // rectangle it may fall back to flies the forced side's own descent.
+    let (left, side_pick, descent_shape, refused) = if lxgb {
+        let left = sea_side_is_left(rwy_course);
+        let forced = check_descent(
+            &if left { &l_facts } else { &r_facts }.descent,
+            field_elev_ft,
+            tpa_msl_ft,
+        );
+        let refused = forced.shape.is_none().then(|| {
+            format!(
+                "The standard pattern here does not clear the ground: {}.",
+                forced.problem.clone().unwrap_or_default()
+            )
+        });
+        (
+            left,
+            "lxgb_south_over_the_sea",
+            forced.shape.unwrap_or_default(),
+            refused,
+        )
     } else {
-        (left, side_pick)
+        (pick.left, pick.why, pick.shape, pick.refused.clone())
+    };
+    let check_json = |c: &DescentCheck| {
+        serde_json::json!({
+            "default_min_ft": c.default_min_ft, "flown_min_ft": c.flown_min_ft,
+            "platform_agl_ft": c.shape.map(|s| s.platform_agl_ft),
+            "glidepath_deg": c.shape.map(|s| s.glidepath_deg()),
+            "problem": c.problem,
+        })
     };
     crate::blackbox::record(
         "circuit",
@@ -3170,13 +3881,27 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, p: Params
             "event": "armed", "runway": rwy.id, "icao": rwy.icao,
             "course": rwy_course, "field_elev_ft": field_elev_ft,
             "tpa_msl_ft": tpa_msl_ft, "left": left, "side_pick": side_pick,
-            "left_max_ft": l_max, "right_max_ft": r_max,
+            "left_max_ft": l_facts.line_max_ft, "right_max_ft": r_facts.line_max_ft,
+            "left_corridor_max_ft": l_facts.terrain_max_ft,
+            "right_corridor_max_ft": r_facts.terrain_max_ft,
+            "left_descent": check_json(&pick.descent_left),
+            "right_descent": check_json(&pick.descent_right),
+            "descent_platform_agl_ft": descent_shape.platform_agl_ft,
+            "glidepath_deg": descent_shape.glidepath_deg(),
+            "refused": refused,
             "left_airspace": l_facts.airspace, "right_airspace": r_facts.airspace,
             "airspaces_near": spaces.len(),
             "radius_m": geom.final_capture_m, "width_m": geom.width_m,
             "downwind_past_m": geom.downwind_past_m,
         }),
     );
+    // Never flown into the ground (#182): refused on the runway, with the
+    // numbers. The Rock's authored route is checked after the takeoff, and
+    // its own refusal hands back there.
+    if let (Some(line), false) = (refused.as_deref(), lxgb) {
+        stand_down(&voice, &format!("{line} Your aircraft."), TERRAIN_REFUSED);
+        return;
+    }
     let side_word = |l: bool| if l { "left" } else { "right" };
     match side_pick {
         "switched_side_for_terrain" => alert(
@@ -3205,7 +3930,7 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, p: Params
                 ),
             );
         }
-        "raised_for_terrain" => alert(
+        "raised_for_terrain" if tpa_msl_ft - tpa_probe_ft >= RAISE_SAID_FT => alert(
             &voice,
             Priority::Caution,
             &format!("Terrain in the pattern, flying it at {tpa_msl_ft:.0} feet."),
@@ -3227,6 +3952,13 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, p: Params
             );
         }
         _ => {}
+    }
+    if !lxgb && descent_shape != DescentShape::default() {
+        alert(
+            &voice,
+            Priority::Caution,
+            &descent_shape_line(descent_shape, field_elev_ft),
+        );
     }
     alert(
         &voice,
@@ -3395,6 +4127,16 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, p: Params
                 p.approach_ias,
             )
             .await;
+            return;
+        }
+        // ...and the standard pattern is flown only where it clears the
+        // ground itself (#182).
+        if let Some(line) = refused.as_deref() {
+            stand_down(
+                &voice,
+                &format!("The Rock circuit isn't clear from here. {line} Your aircraft."),
+                TERRAIN_REFUSED,
+            );
             return;
         }
         alert(
@@ -3697,8 +4439,14 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, p: Params
                     "trk_err": hdg_err,
                     "residual_m": handoff_residual_m(x_m, a_m, handoff_gs),
                     "limit_m": landing_limit_m,
+                    "glidepath_deg": descent_shape.glidepath_deg(),
                 }),
             );
+            // A path steepened over the ground is autoland's path too (#182),
+            // else it would take the aircraft handed over and dive for 3 degrees.
+            if descent_shape.steep() {
+                crate::autoland::set_next_glidepath_deg(Some(descent_shape.glidepath_deg()));
+            }
             crate::autoland::ABORT.store(false, Ordering::SeqCst);
             crate::autoland::run_autoland(
                 base_url.clone(),
@@ -3783,24 +4531,43 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, p: Params
             let _ = xp.run_command(CMD_HDG_MODE).await;
         }
 
-        // Forward terrain guard — generic TAWS-lite, every ~2 s: probe the
-        // ground 1.2 nm ahead along the ground track; a hit raises the
-        // vertical target floor (flown by the VS law below) for a minute.
+        // Forward terrain floor, every ~2 s: the ground under us and along
+        // the ground track ahead (the follower's own probe geometry,
+        // `procedure::look_ahead_points`). Inside LIVE_FLOOR_FT of it on the
+        // upwind, crosswind, downwind or base, the circuit stops descending
+        // and climbs to its floor (`live_floor_ft`), said once a spell,
+        // blackbox `terrain_floor` (#182: LEMG 13's base at 305 ft AGL).
         // Silently inactive without the plugin probe (the old behavior).
         tick = tick.wrapping_add(1);
-        if tick.is_multiple_of(4) && alt_msl_ft.is_finite() {
+        if tick.is_multiple_of(4) && alt_msl_ft.is_finite() && leg != Leg::Final {
             if let Some(hp) = hp_v {
-                let (glat, glon) = crate::nav::project_latlon(lat, lon, hp, 1.2);
-                if let Some(e) = crate::terrain::max_elevation_ft(&xp, &[(glat, glon)]).await {
-                    if alt_msl_ft - e < 400.0 {
-                        guard_floor_ft = Some((e + 800.0, std::time::Instant::now()));
-                        if guard_warned.is_none_or(|t| t.elapsed().as_secs() >= 30) {
+                let mut pts = vec![(lat, lon)];
+                pts.extend(crate::procedure::look_ahead_points(
+                    lat,
+                    lon,
+                    hp,
+                    LIVE_LOOK_NM,
+                    LIVE_LOOK_POINTS,
+                ));
+                if let Some(e) = crate::terrain::max_elevation_ft(&xp, &pts).await {
+                    if let Some(floor) = live_floor_ft(leg, alt_msl_ft, e) {
+                        guard_floor_ft = Some((floor, std::time::Instant::now()));
+                        if guard_warned.is_none() {
                             guard_warned = Some(std::time::Instant::now());
                             crate::blackbox::record(
                                 "circuit",
-                                serde_json::json!({"event": "terrain_guard_climb", "elev_ft": e, "to_ft": e + 800.0}),
+                                serde_json::json!({"event": "terrain_floor", "leg": format!("{leg:?}"),
+                                                   "ground_ft": e, "alt_msl": alt_msl_ft,
+                                                   "agl_ft": agl_ft, "floor_ft": floor}),
                             );
-                            alert(&voice, Priority::Warning, "Terrain ahead. Climbing.");
+                            alert(
+                                &voice,
+                                Priority::Warning,
+                                &format!(
+                                    "Terrain ahead. Holding {:.0} feet.",
+                                    (floor / 50.0).ceil() * 50.0
+                                ),
+                            );
                         }
                     }
                 }
@@ -3813,6 +4580,10 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, p: Params
         // change; a dropped VS mode is re-engaged and the dial rewritten
         // (engage syncs it away — the takeoff's lesson).
         guard_floor_ft = guard_floor_ft.filter(|(_, t)| t.elapsed().as_secs() < 60);
+        // A spell ends with its floor: the next one is said again.
+        if guard_floor_ft.is_none() {
+            guard_warned = None;
+        }
         // GEAR DOWN abeam the touchdown point — the same moment the descent
         // starts, which is how a real pattern does it: power back, gear down,
         // start down. Putting it a leg later (on base) while the descent had
@@ -3830,20 +4601,23 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, p: Params
             alert(&voice, Priority::Advisory, "Gear down.");
             gear_lowered = true;
         }
-        let leg_target = leg_target_ft(
+        let leg_target = leg_target_shaped(
             leg,
             a_m,
             field_elev_ft,
             tpa_msl_ft,
             geom.downwind_past_m,
+            descent_shape,
             &mut descent_target,
         );
-        // The guard floor never applies on base/final: descending toward the
-        // runway is the POINT there, and autoland brings its own terrain
-        // floor. A ridge-probe floor that lingered into base handed autoland
-        // the approach 190 ft high and it balked over the numbers
-        // (2026-07-24).
-        let target_alt = if matches!(leg, Leg::Base | Leg::Final) {
+        // The floor never applies on final: descending toward the runway is
+        // the POINT there, and autoland brings its own terrain floor. A
+        // ridge-probe floor that lingered into base handed autoland the
+        // approach 190 ft high and it balked over the numbers (2026-07-24),
+        // so on base it is only the ground's own LIVE_FLOOR_FT (`live_floor_ft`)
+        // and only while that ground is there: a balk is better than the
+        // hill LEMG 13's base passed 305 ft over (#182).
+        let target_alt = if leg == Leg::Final {
             leg_target
         } else {
             guard_floor_ft.map_or(leg_target, |(f, _)| leg_target.max(f))
@@ -3906,7 +4680,7 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, p: Params
             prev_along = Some((a_m, t_now));
         }
         let target_rate = if leg == Leg::Final {
-            path_descent_fpm(closure_kts)
+            path_descent_fpm_on(closure_kts, descent_shape.gp_ft_per_nm)
         } else {
             0.0
         };
@@ -5094,41 +5868,62 @@ mod tests {
         SideFacts {
             terrain_max_ft: terrain,
             airspace: air.map(|s| s.to_string()),
+            ..Default::default()
         }
+    }
+
+    fn pick3(p: PatternPick) -> (bool, f64, &'static str) {
+        assert!(p.refused.is_none(), "refused: {:?}", p.refused);
+        (p.left, p.tpa_msl_ft, p.why)
     }
 
     #[test]
     fn terrain_pick_switches_sides_and_raises_when_boxed_in() {
         // The Gibraltar case: left downwind crosses the Rock (1,400 ft), right
-        // side is the flat bay — a default-left ask switches right at TPA.
-        let (left, tpa, why) = choose_pattern(
+        // side is the flat bay at field height: a default-left ask switches
+        // right at TPA.
+        let (left, tpa, why) = pick3(choose_pattern(
             true,
             &facts(Some(1400.0), None),
-            &facts(Some(50.0), None),
+            &facts(Some(11.0), None),
             11.0,
             1000.0,
-        );
+        ));
         assert!(!left, "switched off the Rock side");
         assert!((tpa - 1011.0).abs() < 1.0);
         assert_eq!(why, "switched_side_for_terrain");
         // Clear both sides: the asked-for side stands.
-        let (left, _, why) = choose_pattern(
+        let (left, tpa, why) = pick3(choose_pattern(
+            true,
+            &facts(Some(11.0), None),
+            &facts(Some(5.0), None),
+            11.0,
+            1000.0,
+        ));
+        assert!(left);
+        assert!((tpa - 1011.0).abs() < 1.0);
+        assert_eq!(why, "default_side_clear");
+        // 1,000 ft of clearance (#182): a 1,000 ft pattern over ground 19 ft
+        // above the field is lifted over it, on the side asked for when the
+        // other is no lower by RAISE_SIDE_MARGIN_FT.
+        let (left, tpa, why) = pick3(choose_pattern(
             true,
             &facts(Some(30.0), None),
             &facts(Some(20.0), None),
             11.0,
             1000.0,
-        );
-        assert!(left);
-        assert_eq!(why, "default_side_clear");
+        ));
+        assert!(left, "a few feet are no reason to change sides");
+        assert!((tpa - 1030.0).abs() < 1.0, "{tpa}");
+        assert_eq!(why, "raised_for_terrain");
         // Boxed in (a valley field): fly the LOWER side, high enough to clear.
-        let (left, tpa, why) = choose_pattern(
+        let (left, tpa, why) = pick3(choose_pattern(
             true,
             &facts(Some(2000.0), None),
             &facts(Some(1500.0), None),
             500.0,
             1000.0,
-        );
+        ));
         assert!(!left, "the lower side");
         assert!(
             (tpa - 2500.0).abs() < 1.0,
@@ -5136,8 +5931,13 @@ mod tests {
         );
         assert_eq!(why, "raised_for_terrain");
         // No probe data: default side, default height — the old behavior.
-        let (left, tpa, why) =
-            choose_pattern(true, &facts(None, None), &facts(None, None), 11.0, 1000.0);
+        let (left, tpa, why) = pick3(choose_pattern(
+            true,
+            &facts(None, None),
+            &facts(None, None),
+            11.0,
+            1000.0,
+        ));
         assert!(left);
         assert!((tpa - 1011.0).abs() < 1.0);
         assert_eq!(why, "default_side_clear");
@@ -5146,39 +5946,232 @@ mod tests {
     #[test]
     fn airspace_fouls_a_side_like_terrain_does() {
         // Default side flat but inside R-164: switch to the other flat side.
-        let (left, tpa, why) = choose_pattern(
+        let (left, tpa, why) = pick3(choose_pattern(
             true,
-            &facts(Some(20.0), Some("restricted area R 164")),
-            &facts(Some(30.0), None),
+            &facts(Some(10.0), Some("restricted area R 164")),
+            &facts(Some(11.0), None),
             11.0,
             1000.0,
-        );
+        ));
         assert!(!left, "switched away from the restricted side");
         assert!((tpa - 1011.0).abs() < 1.0);
         assert_eq!(why, "switched_side_for_airspace");
         // Other side blocked by airspace, default side merely high terrain:
         // stay on the default side, raised over its terrain.
-        let (left, tpa, why) = choose_pattern(
+        let (left, tpa, why) = pick3(choose_pattern(
             true,
             &facts(Some(1400.0), None),
             &facts(Some(20.0), Some("restricted area R 164")),
             11.0,
             1000.0,
-        );
+        ));
         assert!(left, "the airspace-free side, even with terrain");
         assert!((tpa - 2400.0).abs() < 1.0, "raised over the Rock: {tpa}");
         assert_eq!(why, "raised_for_terrain");
         // Both sides inside restricted airspace: terrain safety alone picks
         // the lower side, honestly labeled.
-        let (left, _, why) = choose_pattern(
+        let (left, _, why) = pick3(choose_pattern(
             true,
             &facts(Some(1400.0), Some("restricted area R 164")),
             &facts(Some(50.0), Some("restricted area R 164")),
             11.0,
             1000.0,
-        );
+        ));
         assert!(!left, "the lower-terrain side");
         assert_eq!(why, "airspace_unavoidable");
+    }
+
+    /// A descent sample `thr_nm` out on `leg`, its path judged at `path_nm`.
+    fn gs(leg: DescentLeg, path_nm: f64, thr_nm: f64, ground_ft: f64) -> GroundSample {
+        GroundSample {
+            leg,
+            path_m: path_nm * M_PER_NM,
+            thr_m: thr_nm * M_PER_NM,
+            ground_ft,
+        }
+    }
+
+    /// The LEMG 13 737 (sortie 1790599750, #182): the left side's drawn line
+    /// read 729 ft and the circuit flew it at 1,548 (48 ft field + 1,500):
+    /// the downwind 1.3 km outside that line, the base turn 305 ft over a
+    /// 900 ft hill. With the corridor the level legs read 1,150, and the
+    /// base (judged at the 6.2 km roll-out, 3.35 nm) crosses 900 ft ground
+    /// 4.6 nm from the threshold. The right side is the Sierra de Mijas.
+    #[test]
+    fn lemg_13_left_is_never_flown_at_1548() {
+        let left = SideFacts {
+            terrain_max_ft: Some(1150.0),
+            line_max_ft: Some(729.0),
+            descent: vec![
+                gs(DescentLeg::Platform, 1.0, 3.8, 400.0),
+                gs(DescentLeg::Base, 3.35, 4.6, 900.0),
+                gs(DescentLeg::Final, 2.0, 2.0, 60.0),
+            ],
+            ..Default::default()
+        };
+        let right = SideFacts {
+            terrain_max_ft: Some(1818.0),
+            line_max_ft: Some(1818.0),
+            descent: vec![gs(DescentLeg::Base, 3.35, 4.6, 1600.0)],
+            ..Default::default()
+        };
+        let p = choose_pattern(true, &left, &right, 48.0, 1500.0);
+        assert!(
+            !(p.refused.is_none() && p.left && (p.tpa_msl_ft - 1548.0).abs() < 1.0),
+            "flown at 1,548 over the corridor: {p:?}"
+        );
+        // Neither side's base can be flown 500 ft clear on a legal path: the
+        // left needs (900 + 500 - 48) / 3.35 = 404 ft a mile, 3.8 degrees.
+        let why = p.refused.expect("refused, never flown");
+        assert!(why.contains("left") && why.contains("degree"), "{why}");
+        assert!(
+            !why.contains('\u{2014}') && !why.contains('\u{2013}'),
+            "no dashes: {why}"
+        );
+        assert_eq!(p.why, "refused_for_terrain");
+        // The old law's own number on that base: 848 ft platform over 900.
+        assert!(p.descent_left.default_min_ft.unwrap() < 0.0);
+    }
+
+    /// A hill under the base that a steeper, still legal path clears: the
+    /// platform and the path are raised, never the pattern refused.
+    #[test]
+    fn a_hill_under_the_base_steepens_the_path_within_the_limit() {
+        let side = SideFacts {
+            terrain_max_ft: Some(200.0),
+            descent: vec![
+                gs(DescentLeg::Platform, 1.0, 3.8, 500.0),
+                gs(DescentLeg::Base, 3.35, 4.0, 750.0),
+            ],
+            ..Default::default()
+        };
+        let p = choose_pattern(true, &side, &side, 48.0, 1500.0);
+        assert!(p.refused.is_none(), "{p:?}");
+        assert!((p.tpa_msl_ft - 1548.0).abs() < 1.0);
+        // The platform is over the base's need too (the base flies the lower
+        // of it and the path): 750 + 500 = 1,250 MSL; the path
+        // (1,250 - 48) / 3.35 = 359 ft a mile, 3.4 degrees.
+        assert!(
+            (p.shape.platform_agl_ft - 1202.0).abs() < 1.0,
+            "{:?}",
+            p.shape
+        );
+        assert!(p.shape.steep());
+        let deg = p.shape.glidepath_deg();
+        assert!(deg > 3.0 && deg <= STEEP_PATH_MAX_DEG, "{deg}");
+        let flown = p.descent_left.flown_min_ft.unwrap();
+        assert!(flown >= 499.0, "500 ft kept: {flown}");
+        let line = descent_shape_line(p.shape, 48.0);
+        assert!(
+            line.contains("1250 feet") && line.contains("3.4 degree"),
+            "{line}"
+        );
+    }
+
+    /// A level field is never steepened: the floor's taper sits under the
+    /// 3 degree path all the way in.
+    #[test]
+    fn a_level_field_keeps_the_standard_descent() {
+        let flat: Vec<GroundSample> = (1..=8)
+            .map(|i| gs(DescentLeg::Final, i as f64 * 0.5, i as f64 * 0.5, 48.0))
+            .chain([gs(DescentLeg::Platform, 1.0, 3.0, 48.0)])
+            .collect();
+        let c = check_descent(&flat, 48.0, 1548.0);
+        assert_eq!(c.shape, Some(DescentShape::default()));
+        assert!(c.problem.is_none());
+    }
+
+    /// The live floor: inside 500 ft of the ground ahead the circuit stops
+    /// descending and climbs (800 over it on a level leg, 500 on base);
+    /// never on final; the upwind keeps the old guard's 400.
+    #[test]
+    fn the_live_floor_trips_inside_500_ft_and_never_on_final() {
+        // LEMG 13's base, 1,203 ft MSL over 898 ft of ground.
+        assert_eq!(live_floor_ft(Leg::Base, 1203.0, 898.0), Some(1398.0));
+        // LEMG 30's downwind, 475 ft AGL.
+        assert_eq!(live_floor_ft(Leg::Downwind, 848.0, 373.0), Some(1173.0));
+        assert_eq!(live_floor_ft(Leg::Downwind, 1548.0, 729.0), None);
+        assert_eq!(live_floor_ft(Leg::Final, 600.0, 500.0), None);
+        assert_eq!(live_floor_ft(Leg::Upwind, 570.0, 120.0), None, "450 over");
+        assert_eq!(live_floor_ft(Leg::Upwind, 570.0, 200.0), Some(1000.0));
+        assert_eq!(
+            live_floor_ft(Leg::Base, f64::NAN, 200.0),
+            None,
+            "no reading"
+        );
+    }
+
+    /// The corridor is the rectangle and its copies, tagged with the legs
+    /// the circuit flies there: the downwind until abeam level, then the
+    /// platform, then (past its led turn) the base; the base's path is
+    /// judged at the roll-out distance or further.
+    #[test]
+    fn the_corridor_probes_outside_the_drawn_line() {
+        let g = Geometry::for_radius(2500.0);
+        let pts = corridor_frame(&g, 3200.0, true);
+        let r = 2500.0;
+        let widest = pts.iter().map(|p| -p.x_m).fold(f64::MIN, f64::max);
+        assert!((widest - (g.width_m + r)).abs() < 1.0, "1 r out: {widest}");
+        let innermost_downwind = pts
+            .iter()
+            .filter(|p| p.leg == Leg::Downwind)
+            .map(|p| -p.x_m)
+            .fold(f64::MAX, f64::min);
+        assert!((innermost_downwind - (g.width_m - 0.25 * r)).abs() < 1.0);
+        assert!(pts.iter().all(|p| p.x_m <= 0.0), "left side only");
+        let furthest_base = pts.iter().map(|p| p.a_m).fold(f64::MAX, f64::min);
+        assert!((furthest_base + g.downwind_past_m + r).abs() < 1.0);
+        // Classification.
+        let at = |leg, a_m| FramePt {
+            a_m,
+            x_m: -g.width_m,
+            leg,
+            line: true,
+        };
+        assert_eq!(descent_leg_at(&at(Leg::Crosswind, 4000.0), &g), None);
+        assert_eq!(descent_leg_at(&at(Leg::Downwind, 100.0), &g), None);
+        assert_eq!(
+            descent_leg_at(&at(Leg::Downwind, -1000.0), &g).map(|d| d.0),
+            Some(DescentLeg::Platform)
+        );
+        let (leg, path) = descent_leg_at(&at(Leg::Downwind, -5341.0), &g).unwrap();
+        assert_eq!(
+            leg,
+            DescentLeg::Base,
+            "past the led turn the base has begun"
+        );
+        assert!((path - g.downwind_past_m).abs() < 1.0);
+        // Facts: the line alone vs the corridor.
+        let ground: Vec<f64> = pts
+            .iter()
+            .map(|p| {
+                if -p.x_m > g.width_m + 1000.0 {
+                    1150.0
+                } else {
+                    700.0
+                }
+            })
+            .collect();
+        let f = corridor_facts(&pts, &ground, &g);
+        assert_eq!(f.line_max_ft, Some(700.0));
+        assert_eq!(f.terrain_max_ft, Some(1150.0));
+        assert!(f.descent.iter().all(|s| s.thr_m >= DESCENT_CHECK_FROM_M));
+        assert!(f
+            .descent
+            .iter()
+            .any(|s| s.leg == DescentLeg::Base && s.ground_ft == 1150.0));
+    }
+
+    /// Shortening is only offered where a final is left: a jet's drawn
+    /// downwind is already the least, an SF50's has room.
+    #[test]
+    fn a_downwind_is_shortened_only_while_a_final_is_left() {
+        let jet = Geometry::for_radii(2500.0, 2500.0);
+        let least = shortest_downwind_past_m(2500.0, 140.0);
+        assert!(shorter_downwinds(jet.downwind_past_m, least).is_empty());
+        let sf50 = Geometry::for_radii(1885.0, 1114.0);
+        let tries = shorter_downwinds(sf50.downwind_past_m, shortest_downwind_past_m(1114.0, 90.0));
+        assert!(!tries.is_empty() && tries.iter().all(|d| *d < sf50.downwind_past_m));
     }
 
     /// Real-install dry run of the LXGB 27 side pick against the actual
@@ -5211,12 +6204,15 @@ mod tests {
         let l = SideFacts {
             terrain_max_ft: Some(1400.0),
             airspace: l_air,
+            ..Default::default()
         };
         let r = SideFacts {
             terrain_max_ft: Some(60.0),
             airspace: r_air,
+            ..Default::default()
         };
-        let (left, tpa_msl, why) = choose_pattern(true, &l, &r, 11.0, 1000.0);
+        let pick = choose_pattern(true, &l, &r, 11.0, 1000.0);
+        let (left, tpa_msl, why) = (pick.left, pick.tpa_msl_ft, pick.why);
         println!("DECISION: left={left} tpa={tpa_msl:.0} why={why}");
         assert!(
             !left || tpa_msl > 1900.0,
