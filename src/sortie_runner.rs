@@ -29,6 +29,8 @@ const ACF_PATH: &str = "sim/aircraft/view/acf_relative_path";
 const ACF_ICAO: &str = "sim/aircraft/view/acf_ICAO";
 const GROUNDSPEED: &str = "sim/flightmodel/position/groundspeed";
 const PAUSE_ON: &str = "sim/operation/pause_on";
+const PAUSE_TOGGLE: &str = "sim/operation/pause_toggle";
+const PAUSED: &str = "sim/time/paused";
 
 /// A case with no deadline of its own ends failed after this long.
 pub const DEFAULT_DEADLINE_MIN: f64 = 20.0;
@@ -3503,7 +3505,18 @@ pub async fn secure_at_end(sim: &dyn RunnerSim) -> bool {
         }
         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
     }
-    sim.command(PAUSE_ON).await.is_ok()
+    // Paused is what the sim SAYS, not what the command returned: an
+    // interrupted A330 climbing at 190 kt was reported "X-Plane paused" with
+    // `sim/time/paused` reading 0 (LEMG 30, 2026-09-29). Read back, and try
+    // the toggle once if the pause did not take.
+    for cmd in [PAUSE_ON, PAUSE_TOGGLE] {
+        let _ = sim.command(cmd).await;
+        tokio::time::sleep(std::time::Duration::from_millis(700)).await;
+        if sim.read(PAUSED).await.is_ok_and(|p| p > 0.5) {
+            return true;
+        }
+    }
+    false
 }
 
 /// How long the run's end waits for a low, descending aircraft to climb.
@@ -5766,6 +5779,10 @@ cases:
                         0.0
                     }
                 }
+                // The pause the runner commanded, read back.
+                PAUSED => f64::from(u8::from(
+                    self.commands.lock().unwrap().iter().any(|c| c == PAUSE_ON),
+                )),
                 _ => 0.0,
             })
         }
