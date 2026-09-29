@@ -390,6 +390,24 @@ pub struct RollRudderProfile {
     /// about 0.35 from 30 kt to Vr in calm air (LEMG 13, 2026-09-29).
     #[serde(default)]
     pub power_steer: Option<f64>,
+    /// The fastest groundspeed that standing rudder was measured at, knots:
+    /// past it the lead falls as the square of the speed (the propeller's
+    /// moment holds, the rudder's grows as v^2). `None` believes it to
+    /// `at_kts`. Held flat to Vr, the SR22's 0.35 plus the learned trim met a
+    /// need of 0.2 at 88 kt and swung the nose 5 degrees right on the wheels
+    /// (LEMG 13 1790682305, 2026-09-29).
+    #[serde(default)]
+    pub power_steer_to_kts: Option<f64>,
+    /// The heading closure the roll law's gain is sized for, per second
+    /// (`autotakeoff::RUDDER_CLOSE_PER_S` when `None`, the 737's). A standing
+    /// need the lead and trim did not predict is held off at `need / gain`
+    /// degrees, so a faster closure is a smaller standing error.
+    #[serde(default)]
+    pub close_per_s: Option<f64>,
+    /// The trim's corner, per second of the same gain
+    /// (`autotakeoff::RUDDER_TRIM_PER_S` when `None`).
+    #[serde(default)]
+    pub trim_per_s: Option<f64>,
 }
 
 impl RollRudderProfile {
@@ -397,11 +415,29 @@ impl RollRudderProfile {
     /// range is dropped).
     pub fn valid(self) -> Option<Self> {
         let power_steer = self.power_steer.filter(|s| (0.0..=0.6).contains(s));
+        let power_steer_to_kts = self.power_steer_to_kts.filter(|k| (20.0..=250.0).contains(k));
+        let close_per_s = self.close_per_s.filter(|c| (0.3..=3.0).contains(c));
+        let trim_per_s = self.trim_per_s.filter(|c| (0.05..=1.0).contains(c));
         ((0.5..=100.0).contains(&self.yaw_dps) && (20.0..=200.0).contains(&self.at_kts))
             .then_some(Self {
                 power_steer,
+                power_steer_to_kts,
+                close_per_s,
+                trim_per_s,
                 ..self
             })
+    }
+
+    /// The share of `power_steer` believed at this groundspeed: whole up to
+    /// the speed it was measured at ([`Self::power_steer_to_kts`], else
+    /// `at_kts`), falling as the square of the speed past it.
+    pub fn power_steer_share(&self, gs_kts: f64) -> f64 {
+        let to = self.power_steer_to_kts.unwrap_or(self.at_kts);
+        if gs_kts.is_finite() && gs_kts > to {
+            (to / gs_kts).powi(2)
+        } else {
+            1.0
+        }
     }
 
     /// The yaw rate a unit of steer holds at this groundspeed, deg/s.

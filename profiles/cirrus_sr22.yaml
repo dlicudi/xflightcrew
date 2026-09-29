@@ -185,10 +185,25 @@ taxi:
 # the propeller. The default law led 0.25 at a standstill fading to 0.1 by
 # 40 kt and its trim bled as 1/v^2, so the nose sat 5 to 6 degrees left with
 # the steer at 0.4 and the roll was rejected 9.8 m left at 66 kt.
+#
+# Flown so (LEMG 13 1790682305, 2026-09-29, about 3 kt of crosswind from the
+# left): the need was 0.5 from 45 to 75 kt, then fell to 0.2 by 88 kt as the
+# nose came up, while the lead held 0.35 and the trim 0.14; at 0.032 of steer
+# per degree the nose swung 5 degrees right with the steer still right, from
+# 4.1 m left at 68 kt to 7.5 m right at wheels-off (93 kt). Refitted over
+# both rolls (three-second heading predictions, 0.3 s dead time): the rudder
+# is 31 to 50 deg/s per unit at 60 kt growing nearer v than v^2 above it, so
+# the standing rudder is believed to the 73 kt it was measured at and falls
+# as v^2 past it, the heading closes at 1.5 per second and the trim's corner
+# is 0.45: replayed, both rolls stay within 3 m to wheels-off on the rudder
+# at half to twice either fit and 0.08 of need either way.
 roll_rudder:
   yaw_dps: 31.0
   at_kts: 60.0
   power_steer: 0.35
+  power_steer_to_kts: 73.0
+  close_per_s: 1.5
+  trim_per_s: 0.45
 
 checklist: checklists/cirrus_sr22.txt
 

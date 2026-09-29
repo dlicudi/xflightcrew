@@ -1498,7 +1498,18 @@ impl RollSteer {
         // [`RUDDER_FULL_DEG_FAST`] once the roll is under way (from 60 kt the
         // declared rudder is already stronger than either day's measured one,
         // so the old ceiling was the gain there).
-        let kp = (RUDDER_CLOSE_PER_S / authority).min(1.0 / full_deg);
+        //
+        // The closure and the trim's corner are the airframe's where it
+        // declares them (`roll_rudder:` `close_per_s`, `trim_per_s`): a need
+        // the lead and the trim did not predict is held off at need / kp
+        // degrees. The SR22's second LEMG 13 roll (1790682305, 2026-09-29)
+        // needed 0.5 at 45 to 75 kt in 3 kt of crosswind and 0.2 by 88 kt;
+        // at 0.032 per degree the nose sat 4 degrees left, then swung 5
+        // right with the steer still right, 4.1 m left to 7.5 m right on
+        // the wheels. Its lag is shorter than the 737's (0.3 s fitted), and
+        // 1.5 per second with a corner of 0.45 holds both of its rolls.
+        let close = rudder.close_per_s.unwrap_or(RUDDER_CLOSE_PER_S);
+        let kp = (close / authority).min(1.0 / full_deg);
         let pd = (kp * (err_deg - STEER_LEAD_S * yaw_dps)).clamp(-1.0, 1.0);
         let cap = LOW_SPEED_STEER_CAP
             + (MAX_ROLL_STEER - LOW_SPEED_STEER_CAP)
@@ -1506,15 +1517,18 @@ impl RollSteer {
         let lead = if self.jet {
             0.0
         } else if let Some(ps) = rudder.power_steer {
-            ps * thr.clamp(0.0, 1.0)
+            // Believed to the speed it was measured at, then falling as v^2:
+            // held flat, 0.35 met a need of 0.2 at 88 kt.
+            ps * thr.clamp(0.0, 1.0) * rudder.power_steer_share(gs_kts)
         } else {
             power_lead(thr, gs_kts)
         };
         let want = (pd + self.trim + lead).clamp(-cap, cap);
         if gs_kts > TRIM_MIN_GS_KTS {
             let e = err_deg.clamp(-STEER_TRIM_ERR_CLAMP_DEG, STEER_TRIM_ERR_CLAMP_DEG);
-            self.trim = (self.trim + RUDDER_TRIM_PER_S * kp * e * dt)
-                .clamp(-RUDDER_TRIM_MAX, RUDDER_TRIM_MAX);
+            let corner = rudder.trim_per_s.unwrap_or(RUDDER_TRIM_PER_S);
+            self.trim =
+                (self.trim + corner * kp * e * dt).clamp(-RUDDER_TRIM_MAX, RUDDER_TRIM_MAX);
         }
         if let Some(pg) = self
             .prev_gs
@@ -5381,6 +5395,9 @@ mod tests {
             yaw_dps: 0.0,
             at_kts: 80.0,
             power_steer: None,
+            power_steer_to_kts: None,
+            close_per_s: None,
+            trim_per_s: None,
         };
         assert!(!RollSteer::with_rudder(true, silly).scheduled());
     }
@@ -5460,10 +5477,15 @@ mod tests {
             ts[k] = ts[k - 1] + g(&ticks[k], "dt");
         }
         let psi: Vec<f64> = ticks.iter().map(|r| g(r, "psi")).collect();
-        // The sim's yaw rate the law damped on, as the heading's own rate
-        // (the recorded `r` was not it; see the roll tick's comment).
+        // The sim's yaw rate the law damped on: the recorded `r` where the
+        // tick carries it (the SR22's of 2026-09-29), else the heading's own
+        // rate (the 737 bench carries none; before 2026-09-28 `r` was not
+        // it, see the roll tick's comment).
         let yaw_rec: Vec<f64> = (0..n)
             .map(|k| {
+                if let Some(r) = ticks[k]["r"].as_f64().filter(|r| r.is_finite()) {
+                    return r;
+                }
                 let (a, b) = (k.saturating_sub(1), (k + 1).min(n - 1));
                 let d = ((psi[b] - psi[a] + 540.0).rem_euclid(360.0)) - 180.0;
                 if ts[b] > ts[a] {
@@ -5713,8 +5735,9 @@ mod tests {
     /// rudder at half to three times, and on an aircraft needing 0.08 of
     /// steer less or more than it did that day, it never strays 3 m and
     /// does not weave; on the fitted rudder and the day's need, 1.5 m. The
-    /// declared rudder alone (the generic power lead) still strays over 4 m:
-    /// the propeller's standing rudder is the part the default law lacked.
+    /// declared rudder alone (the generic power lead, on the closure and trim
+    /// of that day) still strays over 4 m: the propeller's standing rudder is
+    /// the part the default law lacked.
     #[test]
     fn the_sr22_roll_holds_the_centreline_on_its_propeller() {
         let ticks = sr22_roll_0929();
@@ -5749,12 +5772,192 @@ mod tests {
         }
         let (worst, _, _) = fly(&ticks, declared, 1.0);
         assert!(worst <= 1.5, "{worst:.2} m on the fitted rudder");
+        // Against the declared rudder's law as it stood that day (the 737's
+        // closure and trim): the faster closure since holds even the generic
+        // lead's roll nearer.
         let generic = crate::aircraft::RollRudderProfile {
             power_steer: None,
-            ..declared
+            ..rudder_sr22_as_flown()
         };
         let (worst, _, _) = fly(&ticks, generic, 1.0);
         assert!(worst > 4.0, "{worst:.2} m without the propeller's rudder");
+    }
+
+    /// The SR22's second LEMG 13 roll of 2026-09-29 (sortie
+    /// 1790682305-full_auto), flown on the declared rudder: every `roll`
+    /// tick from brake release to wheels-off. The wheels left between the
+    /// state records at 1790682400.9 (on the ground, 0.2 ft) and .401.9
+    /// (0.5 ft); the ticks after that are the ~1.6 s the roll law kept
+    /// steering in ground effect, and a replay of the tyres is no replay of
+    /// them.
+    fn sr22_rudder_roll_0929() -> Vec<serde_json::Value> {
+        const TEXT: &str =
+            include_str!("../bench/takeoffs/sr22_roll_lemg13_rudder_2026-09-29.jsonl");
+        TEXT.lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .filter(|r| r["t"].as_f64().is_some_and(|t| t <= SR22_RUDDER_WHEELS_OFF_T))
+            .collect()
+    }
+    const SR22_RUDDER_WHEELS_OFF_T: f64 = 1790682401.0;
+
+    /// The SR22's rudder refitted over BOTH rolls of 2026-09-29 (three-second
+    /// heading predictions from the sim's `r`, 0.3 s of dead time, a standing
+    /// need per roll and speed): 50 deg/s per unit at 60 kt growing as v
+    /// (0.08 and 0.23 degrees rms against 0.11 and 0.28 for the declared 31
+    /// as v^2; a v^2 rudder strong enough for the fast end misses the slow).
+    fn rudder_sr22_0929_linear(gs: f64) -> f64 {
+        50.0 * gs.max(0.0) / 60.0
+    }
+
+    /// The SR22's rudder as the profile declared it on 2026-09-29, the second
+    /// roll's law: the standing rudder held to Vr, the 737's closure and trim.
+    fn rudder_sr22_as_flown() -> crate::aircraft::RollRudderProfile {
+        crate::aircraft::RollRudderProfile {
+            power_steer_to_kts: Some(250.0),
+            close_per_s: None,
+            trim_per_s: None,
+            ..rudder_sr22()
+        }
+    }
+
+    /// The recorded steer relabelled: the aircraft needed `need` more.
+    fn needing(ticks: &[serde_json::Value], need: f64) -> Vec<serde_json::Value> {
+        ticks
+            .iter()
+            .map(|r| {
+                let mut r = r.clone();
+                r["steer"] = serde_json::json!(r["steer"].as_f64().unwrap_or(0.0) - need);
+                r
+            })
+            .collect()
+    }
+
+    /// Worst true offset from 30 kt up to `to_kts` of groundspeed.
+    fn worst_to(out: &[(f64, f64, f64, f64)], to_kts: f64) -> f64 {
+        out.iter()
+            .filter(|o| o.0 >= 30.0 && o.0 <= to_kts)
+            .map(|o| o.2.abs())
+            .fold(0.0, f64::max)
+    }
+
+    /// Rotation on the second roll: 73 kt indicated at 77.7 kt over the ground.
+    const SR22_RUDDER_ROTATE_GS: f64 = 78.0;
+
+    /// The second roll as flown: the declared rudder's law of 2026-09-29,
+    /// replayed through it, writes the recorded steer tick for tick, and the
+    /// offsets are the failure being fixed: 4.1 m left by rotation (the
+    /// recorded 4.1 at 68 kt), then the swing right to 6.5 m (the median of
+    /// the reads; 7.5 raw) at wheels-off, 93 kt.
+    #[test]
+    fn the_sr22_declared_roll_replays_as_flown() {
+        let ticks = sr22_rudder_roll_0929();
+        assert_eq!(ticks.len(), 84);
+        let law = RollSteer::with_rudder(false, rudder_sr22_as_flown());
+        let cut = RollCut::for_law(&law);
+        let (out, dev) = replay_roll(&ticks, law, cut, &rudder_sr22_0929);
+        assert!(
+            dev < 0.01,
+            "the replayed law strays {dev:.4} from the recorded steer"
+        );
+        let (worst, end, _) = roll_verdict(&out);
+        let to_rotate = worst_to(&out, SR22_RUDDER_ROTATE_GS);
+        println!(
+            "as flown: {to_rotate:.2} m to rotation, {worst:.2} m to wheels-off, {end:+.2} m there"
+        );
+        assert!((3.9..=4.3).contains(&to_rotate), "{to_rotate:.2}");
+        assert!(worst > 6.0 && end > 6.0, "{worst:.2} {end:+.2}");
+    }
+
+    /// The fix, replayed through both SR22 rolls of 2026-09-29 to wheels-off:
+    /// the propeller's standing rudder believed only to the 73 kt it was
+    /// measured at and falling as v^2 past it, the heading closed at 1.5 per
+    /// second with the trim's corner at 0.45 (`roll_rudder:`
+    /// `power_steer_to_kts`, `close_per_s`, `trim_per_s`). On either fit of the
+    /// rudder at half to twice (the declared 31 as v^2, the refit 50 as v, to
+    /// 1.6 times), and on an aircraft needing 0.08 of steer less or more than
+    /// it did either day, no roll strays 3 m; on the fits and the day's need
+    /// the second roll holds 2.5 m to wheels-off where it flew 6.5, the first
+    /// 1.5 m. The standing rudder believed to Vr, or the 737's closure, still
+    /// strays past 3.5 m on the second roll.
+    #[test]
+    fn the_sr22_roll_holds_the_centreline_past_its_measured_speed() {
+        let declared = rudder_sr22();
+        assert_eq!(declared.power_steer_to_kts, Some(73.0));
+        let fly = |ticks: &[serde_json::Value],
+                   rd: crate::aircraft::RollRudderProfile,
+                   plant: &dyn Fn(f64) -> f64| {
+            let law = RollSteer::with_rudder(false, rd);
+            let cut = RollCut::for_law(&law);
+            replay_roll(ticks, law, cut, plant).0
+        };
+        type Plant = Box<dyn Fn(f64) -> f64>;
+        let plants: Vec<(String, Plant)> = [0.5, 1.0, 2.0]
+            .into_iter()
+            .map(|k| {
+                let p: Plant = Box::new(move |gs: f64| k * rudder_sr22_0929(gs));
+                (format!("31 v^2 x{k}"), p)
+            })
+            .chain([0.5, 1.0, 1.6].into_iter().map(|k| {
+                let p: Plant = Box::new(move |gs: f64| k * rudder_sr22_0929_linear(gs));
+                (format!("50 v x{k}"), p)
+            }))
+            .collect();
+        for (name, ticks) in [("first", sr22_roll_0929()), ("second", sr22_rudder_roll_0929())] {
+            for need in [-0.08, 0.0, 0.08] {
+                let shifted = needing(&ticks, need);
+                for (plant_name, plant) in &plants {
+                    let out = fly(&shifted, declared, plant.as_ref());
+                    let (worst, end, swings) = roll_verdict(&out);
+                    println!(
+                        "{name} need {need:+} {plant_name}: worst {worst:.2} m, {end:+.2} m at the end, {swings} swings"
+                    );
+                    assert!(
+                        worst <= 3.0,
+                        "{name}, need {need:+}, {plant_name}: {worst:.2} m"
+                    );
+                    assert!(
+                        swings <= 1,
+                        "{name}, need {need:+}, {plant_name}: the steer weaves"
+                    );
+                }
+            }
+        }
+        let (worst, _, _) = roll_verdict(&fly(&sr22_roll_0929(), declared, &rudder_sr22_0929));
+        assert!(worst <= 1.5, "the first roll: {worst:.2} m");
+        for plant in [
+            &rudder_sr22_0929 as &dyn Fn(f64) -> f64,
+            &rudder_sr22_0929_linear,
+        ] {
+            let out = fly(&sr22_rudder_roll_0929(), declared, plant);
+            let (worst, _, swings) = roll_verdict(&out);
+            let to_rotate = worst_to(&out, SR22_RUDDER_ROTATE_GS);
+            println!("the second roll: {to_rotate:.2} m to rotation, {worst:.2} m to wheels-off");
+            assert!(worst <= 2.5, "the second roll: {worst:.2} m");
+            assert!(to_rotate <= 2.5, "the second roll to rotation: {to_rotate:.2} m");
+            assert_eq!(swings, 0);
+        }
+        for (why, rd) in [
+            (
+                "believed to Vr",
+                crate::aircraft::RollRudderProfile {
+                    power_steer_to_kts: Some(250.0),
+                    ..declared
+                },
+            ),
+            (
+                "the 737's closure",
+                crate::aircraft::RollRudderProfile {
+                    close_per_s: None,
+                    trim_per_s: None,
+                    ..declared
+                },
+            ),
+        ] {
+            let (worst, _, _) =
+                roll_verdict(&fly(&sr22_rudder_roll_0929(), rd, &rudder_sr22_0929));
+            println!("{why}: {worst:.2} m");
+            assert!(worst > 3.5, "{why}: {worst:.2} m");
+        }
     }
 
     /// The cross-track read pairs two frames now and then (latitude and
