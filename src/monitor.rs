@@ -623,7 +623,10 @@ impl Snapshot {
             tod_ring_nm,
             dest_route_nm,
             follower_tod: crate::procedure::planned_tod(),
-            follower_flying: crate::procedure::ACTIVE.load(std::sync::atomic::Ordering::Relaxed),
+            follower_flying: follower_flying(
+                crate::procedure::ACTIVE.load(std::sync::atomic::Ordering::Relaxed),
+                crate::heli_route::ACTIVE.load(std::sync::atomic::Ordering::Relaxed),
+            ),
             flight_peak_ft: crate::flight::published().map(|f| f.peak_alt_ft).filter(|p| *p > 0.0),
             baro_inhg,
             qnh_pa,
@@ -1000,6 +1003,16 @@ struct StallSpeed {
     at_or_below_factor: f64,
     /// … and (if set) still above this × it — the more urgent band owns below.
     above_factor: Option<f64>,
+}
+
+/// Whether a route automation owns the vertical profile, so the ring's TOD
+/// and profile advisories (and the step-climb advice) keep silent: the
+/// procedure follower, or the helicopter route, which flies its own approach
+/// down to its gate. LEMG-LXGB (S-76, iMac 2026-09-29, #191) heard "High on
+/// the profile" and "past the descent point, about 1600 feet a minute" while
+/// the route was flying its descent. Pure.
+pub fn follower_flying(procedure: bool, heli_route: bool) -> bool {
+    procedure || heli_route
 }
 
 /// With an automation flying, the caution band's top: the margin under its
@@ -6711,6 +6724,26 @@ mod tests {
         // With no follower flying, nothing above has changed.
         let plain = cruise_with_dest(38.0);
         assert!(TodPassed.eval(&plain).is_some(), "the ring is still there");
+    }
+
+    /// LEMG-LXGB, S-76, iMac 2026-09-29 (#191): the helicopter route flew its
+    /// own approach down to the gate while the ring said "High on the
+    /// profile" and "past the descent point, about 1600 feet a minute". The
+    /// route owns the descent as the follower does: the same silence.
+    #[test]
+    fn a_helicopter_route_owns_its_descent_too() {
+        assert!(!follower_flying(false, false));
+        assert!(follower_flying(true, false));
+        assert!(follower_flying(false, true));
+        let mut s = cruise_with_dest(38.0);
+        let mut high = cruise_with_dest(30.0);
+        high.vsi_fpm = -700.0;
+        high.alt_ft = 13_000.0;
+        assert!(TodPassed.eval(&s).is_some() && HighOnProfile.eval(&high).is_some());
+        s.follower_flying = follower_flying(false, true);
+        high.follower_flying = follower_flying(false, true);
+        assert_eq!(TodPassed.eval(&s), None, "the route's descent is not late");
+        assert_eq!(HighOnProfile.eval(&high), None, "nor high");
     }
 
     /// LSZS-LILO, SR22, 2026-09-24 (issue #68): "We're past the descent
