@@ -10909,3 +10909,63 @@ Doubts: one calm rollout on one machine; the replay cannot see the nose-down swi
 law. Offline only. Next SR22 landing: `autoland` `rollout` `btrim` walking to about -0.05 to -0.1
 by 70 kt, `err` inside 1.5 degrees from 70 to 40 kt, the split side
 flipping less above 40 kt, `xtk_m` inside 3 m, and `state` `in.trq` against `btrim`.
+
+## 2026-09-29: SAFETY, the Rock refused in the air is a hold, never "your aircraft" (#182)
+
+Review of 528b7d1 (merged f7580d4): at LXGB the rectangle's `refused` was known on the runway, but
+the authored Rock route was only judged after the takeoff, so with both refused the circuit stood
+down IN THE AIR, at the takeoff's handoff height, with "The Rock circuit isn't clear from here ...
+Your aircraft." An airborne aircraft handed to nobody under an unattended mission (the #181 rule).
+
+- **Judged on the runway first.** Where the rectangle is refused at LXGB, the authored route is
+  checked before the takeoff (`check_authored_route`: `leg_terrain_ft` + `raise_for_terrain`, the
+  same legs fixed to the runway); refused both ways it is a plain refusal on the runway (`circuit`
+  `authored_route_unsafe` `on: runway`, `stand_down` `terrain_refused`).
+- **Refused in the air, a hold** (the probe answering otherwise after the takeoff): the reversal's
+  `TerrainHold` (moved from autoland to `reversal.rs`, one type for both) through
+  `circuit::hold_clear_of_terrain`: climb straight ahead on the autopilot to 1,000 ft over the
+  highest ground under and 12 nm ahead (`reversal::hold_altitude_ahead_ft`, the probe autoland's
+  refusal already made; the corridors' and the route legs' highest stands in unanswered), never
+  under the aircraft or the pattern; the altitude dial on it, the governor on
+  `hand_back_speed_kts`, said with the numbers ("... Climbing straight ahead to 2400 feet and
+  holding it."); handed over only after 8 ticks level there ("Level at N feet, straight ahead, the
+  autopilot holding heading and altitude. Your aircraft."). The circuit's `PatternGuard` still
+  gives it back loudly (servos out; a climb not there in its time at 300 fpm plus a minute) through
+  `give_up_pattern`, the recovery when slow or upset. Full auto sees `terrain_refused`.
+
+Blackbox: `circuit` `authored_route_unsafe` (`on`), `terrain_hold` (`hold_ft`, `ahead_ft`,
+`corridor_max_ft`, `alt`, `hdg_true`, `hold_kts`, `why`), `terrain_hold_tick` every 5 s,
+`terrain_hold_level` or `terrain_hold_given_back`, then `stand_down`. Tests `terrain_hold_tests`
+(the Rock's 1,398 ft, the 1,098 ft ridge entered at 1,130 on 2026-09-15, the 1,650 ft pattern).
+Offline only.
+
+## 2026-09-29: the field's circuit data from apt.dat, layer 1 of #182
+
+apt.dat has carried per field whether circuits are allowed and the pattern side per runway, and
+nothing read it: `1302 allows_circuits` (LEMG and EGKK say 0; 317 fields no, 90 yes) and `1101
+<rwy> left|right` inside the `1000` flows (4,979 rows: 3,775 left, 1,204 right; LEMG 13 and 31 left,
+EGKK 08R and 26L left, LSZS 03 and 21 left, LXGB 09 left).
+
+- **Read** (`atc::nav`, `find_airport` and `scan_airports`): `AirportInfo.allows_circuits`
+  (`parse_allows_circuits`) and `pattern_sides` (`note_pattern_side`: first flow sets an end, a
+  flow that disagrees drops it; `pattern_left(rwy)` matches "09" to "9"). Test
+  `circuits_flag_and_pattern_sides_are_read_from_the_flows`; `--ignored
+  real_install_circuits_flags` passes on this install.
+- **The tower** (`Station::circuit_offer`, `CircuitOffer.left` / `not_available`): the circuit
+  clearance names the published side ("runway one three, left hand circuit, circuit height ...";
+  FAA "left closed traffic approved"), and at a field whose data says no circuits it SAYS so first
+  ("circuits are not normally available at Malaga, ...", blackbox `atc` `circuits_not_allowed`)
+  and still clears the one asked for: the bench flies its circuits at LEMG and EGKK, and refusing
+  them waits on the runner's cases moving or declaring a waiver. The readback carries the side and
+  is still a readback.
+- **The crew** (`circuit::fly`): the published side is the side asked of `choose_pattern`
+  (`pattern_side_wanted`), so terrain and airspace still veto it and say so; before the takeoff
+  `field_circuit_line` says a field without circuits ("flown as asked") and a published side
+  other than the one asked for. Not at LXGB, whose sea side (09 right) stays the authored route's
+  over apt.dat's 09 left. `circuit` `armed` carries `asked_left`, `published_left`,
+  `allows_circuits`.
+
+Not done: `1110` runway use per flow (arrivals 12 / departures 13 at LEMG, under the flow's wind,
+ceiling, visibility and time rules) feeding the runway in use: it sits against the calm-wind
+stream rules and the frozen runway, a change of its own. Autoland's reversal still picks its side
+by terrain alone. Offline only.

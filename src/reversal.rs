@@ -628,6 +628,80 @@ pub fn hold_altitude_ft(
     (want / 100.0).ceil() * 100.0
 }
 
+/// Straight ahead at a held altitude (#182): autoland's while the
+/// reversal's plan is probed (`waiting`), or because no pattern clears the
+/// ground (`refused`), which climbs to a height clear of the ground ahead and
+/// hands the aircraft over only once it holds it there. The circuit flies
+/// the same refusal when LXGB's Rock route and rectangle are both refused in
+/// the air (`circuit::hold_clear_of_terrain`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TerrainHold {
+    pub hdg_true: f64,
+    pub alt_ft: f64,
+    pub refused: bool,
+    /// Consecutive ticks level at the hold's altitude.
+    level_ticks: u32,
+}
+
+/// Ticks level at a refusal's altitude before the aircraft is handed over.
+pub const HOLD_LEVEL_TICKS: u32 = 8;
+/// ...level within this.
+pub const HOLD_LEVEL_FT: f64 = 100.0;
+
+impl TerrainHold {
+    pub fn waiting(hdg_true: f64, alt_ft: f64) -> Self {
+        TerrainHold {
+            hdg_true,
+            alt_ft,
+            refused: false,
+            level_ticks: 0,
+        }
+    }
+
+    pub fn refused(hdg_true: f64, alt_ft: f64) -> Self {
+        TerrainHold {
+            refused: true,
+            ..Self::waiting(hdg_true, alt_ft)
+        }
+    }
+
+    /// One tick at `alt_ft`: true once a refusal has held its altitude long
+    /// enough to be handed over (the autopilot holding it). Pure.
+    pub fn level_now(&mut self, alt_ft: f64) -> bool {
+        if (alt_ft - self.alt_ft).abs() <= HOLD_LEVEL_FT {
+            self.level_ticks += 1;
+        } else {
+            self.level_ticks = 0;
+        }
+        self.refused && self.level_ticks >= HOLD_LEVEL_TICKS
+    }
+}
+
+/// The highest ground under the aircraft and [`HOLD_LOOK_NM`] along
+/// `track_deg`, feet MSL, and the altitude a refusal holds over it
+/// ([`hold_altitude_ft`], `corridor_max_ft` standing in when the probe does
+/// not answer). One probe for autoland's reversal and the circuit.
+pub async fn hold_altitude_ahead_ft(
+    xp: &crate::xplane::XPlaneClient,
+    (lat, lon, track_deg, alt_ft): (f64, f64, f64, f64),
+    corridor_max_ft: Option<f64>,
+    default_platform_ft: f64,
+) -> (Option<f64>, f64) {
+    let mut pts = vec![(lat, lon)];
+    pts.extend(crate::procedure::look_ahead_points(
+        lat,
+        lon,
+        track_deg,
+        HOLD_LOOK_NM,
+        crate::terrain::MAX_POINTS - 1,
+    ));
+    let ahead = crate::terrain::max_elevation_ft(xp, &pts).await;
+    (
+        ahead,
+        hold_altitude_ft(ahead, corridor_max_ft, alt_ft, default_platform_ft),
+    )
+}
+
 /// A pattern planned over the probed ground, for the loop to fly.
 #[derive(Debug, Clone)]
 pub struct PatternPlan {
@@ -738,25 +812,18 @@ pub async fn plan(
         };
         let hold_ft = match refused {
             Some(_) => {
-                let mut pts = vec![(lat, lon)];
-                pts.extend(crate::procedure::look_ahead_points(
-                    lat,
-                    lon,
-                    track_deg,
-                    HOLD_LOOK_NM,
-                    crate::terrain::MAX_POINTS - 1,
-                ));
-                let ahead = crate::terrain::max_elevation_ft(&xp, &pts).await;
                 let corridor = [l.terrain_max_ft, r.terrain_max_ft]
                     .into_iter()
                     .flatten()
                     .reduce(f64::max);
-                Some(hold_altitude_ft(
-                    ahead,
+                let (_, hold) = hold_altitude_ahead_ft(
+                    &xp,
+                    (lat, lon, track_deg, alt_ft),
                     corridor,
-                    alt_ft,
                     default_platform_ft,
-                ))
+                )
+                .await;
+                Some(hold)
             }
             None => None,
         };
@@ -1421,6 +1488,24 @@ mod tests {
             why.contains("5200 feet") && why.contains("miles out"),
             "{why}"
         );
+    }
+
+    /// A refusal hands over only once level at its altitude, the autopilot
+    /// holding it; a hold waiting on the plan never does.
+    #[test]
+    fn a_refusal_hands_over_only_once_level_at_its_altitude() {
+        let mut h = TerrainHold::refused(133.0, 3100.0);
+        for _ in 0..20 {
+            assert!(!h.level_now(2600.0), "climbing: still ours");
+        }
+        for _ in 0..HOLD_LEVEL_TICKS - 1 {
+            assert!(!h.level_now(3080.0));
+        }
+        assert!(h.level_now(3060.0));
+        let mut w = TerrainHold::waiting(133.0, 1700.0);
+        for _ in 0..50 {
+            assert!(!w.level_now(1700.0));
+        }
     }
 
     /// The refusal's hold: 1,000 ft over the ground ahead, never lower than

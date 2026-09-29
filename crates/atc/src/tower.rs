@@ -260,6 +260,13 @@ pub struct CircuitOffer {
     /// FAA phraseology ("closed traffic", "pattern altitude") instead of
     /// ICAO / CAP 413 ("circuit height").
     pub faa: bool,
+    /// The runway's published pattern side (apt.dat `1101`, #182):
+    /// `Some(true)` left, named in the clearance; `None` unpublished.
+    pub left: Option<bool>,
+    /// The field's data says no circuits (apt.dat `1302 allows_circuits 0`,
+    /// #182; LEMG and EGKK): the tower says so, then clears the one asked
+    /// for (the bench flies its circuits there).
+    pub not_available: bool,
 }
 
 /// The circuit height on the QNH: 1,000 ft above the field, to the nearest
@@ -278,27 +285,47 @@ pub fn circuit_height_ft(field_elev_ft: f64) -> f64 {
 pub fn circuit_clearance_lines(ctx: &Ctx, offer: &CircuitOffer) -> (String, String) {
     let alt = crate::atis::spoken_alt(offer.height_ft);
     let qnh = qnh_clause(ctx);
+    let side = |faa: bool| match (offer.left, faa) {
+        (Some(true), false) => "left hand circuit, ",
+        (Some(false), false) => "right hand circuit, ",
+        (Some(true), true) => "left ",
+        (Some(false), true) => "right ",
+        (None, _) => "",
+    };
+    // A field whose data says no circuits: said first, once per clearance.
+    let notice = match (offer.not_available, offer.faa) {
+        (false, _) => String::new(),
+        (true, false) => format!("circuits are not normally available at {}, ", ctx.airport),
+        (true, true) => format!("closed traffic is not normally available at {}, ", ctx.airport),
+    };
     if offer.faa {
+        let s = side(true);
+        let rb = match offer.left {
+            Some(true) => "Left closed traffic",
+            Some(false) => "Right closed traffic",
+            None => "Closed traffic",
+        };
         (
             format!(
-                "{}, runway {}, closed traffic approved, pattern altitude {alt}{qnh}, \
+                "{}, {notice}runway {}, {s}closed traffic approved, pattern altitude {alt}{qnh}, \
                  squawk {}, report ready for departure.",
                 ctx.callsign, ctx.runway, ctx.squawk
             ),
             format!(
-                "Closed traffic runway {}, pattern altitude {alt}{qnh}, squawk {}, {}.",
+                "{rb} runway {}, pattern altitude {alt}{qnh}, squawk {}, {}.",
                 ctx.runway, ctx.squawk, ctx.callsign
             ),
         )
     } else {
+        let s = side(false);
         (
             format!(
-                "{}, runway {}, circuit height {alt} feet{qnh}, squawk {}, \
+                "{}, {notice}runway {}, {s}circuit height {alt} feet{qnh}, squawk {}, \
                  report ready for departure.",
                 ctx.callsign, ctx.runway, ctx.squawk
             ),
             format!(
-                "Runway {}, circuit height {alt} feet{qnh}, squawk {}, {}.",
+                "Runway {}, {s}circuit height {alt} feet{qnh}, squawk {}, {}.",
                 ctx.runway, ctx.squawk, ctx.callsign
             ),
         )
@@ -2935,6 +2962,8 @@ mod tests {
             circuit: Some(CircuitOffer {
                 height_ft: circuit_height_ft(52.0),
                 faa,
+                left: None,
+                not_available: false,
             }),
             ..ctx()
         }
@@ -3003,6 +3032,57 @@ mod tests {
             r.contains("cleared to leave the Gibraltar zone, not above two thousand"),
             "{r}"
         );
+    }
+
+    /// #182: apt.dat publishes the pattern side per runway (`1101 13 left`
+    /// at LEMG) and whether the field allows circuits at all (`1302
+    /// allows_circuits 0` at LEMG and EGKK). The clearance names the side,
+    /// says a field without circuits first, and its readback is still a
+    /// readback, never a request.
+    #[test]
+    fn a_circuit_clearance_names_the_published_side_and_a_field_without_circuits() {
+        for (faa, left, line, rb) in [
+            (
+                false,
+                Some(true),
+                "November one seven two Sierra Papa, circuits are not normally available at \
+                 Gibraltar, runway zero niner, left hand circuit, circuit height one thousand \
+                 one hundred feet, QNH one zero one niner, squawk four five zero one, report \
+                 ready for departure.",
+                "Runway zero niner, left hand circuit, circuit height one thousand one hundred \
+                 feet, QNH one zero one niner, squawk four five zero one, November one seven \
+                 two Sierra Papa.",
+            ),
+            (
+                true,
+                Some(false),
+                "November one seven two Sierra Papa, closed traffic is not normally available \
+                 at Gibraltar, runway zero niner, right closed traffic approved, pattern \
+                 altitude one thousand one hundred, altimeter three zero zero one, squawk four \
+                 five zero one, report ready for departure.",
+                "Right closed traffic runway zero niner, pattern altitude one thousand one \
+                 hundred, altimeter three zero zero one, squawk four five zero one, November \
+                 one seven two Sierra Papa.",
+            ),
+        ] {
+            let c = Ctx {
+                circuit: Some(CircuitOffer {
+                    height_ft: circuit_height_ft(52.0),
+                    faa,
+                    left,
+                    not_available: true,
+                }),
+                ..circuit_ctx(faa)
+            };
+            let mut twr = Tower::new();
+            assert_eq!(twr.handle(Intent::RequestClearance, &c), line);
+            let owed = twr.suggested_readback(&c.callsign).expect("readback");
+            assert_eq!(owed, rb);
+            let sent = owed.trim_end_matches('.');
+            assert_eq!(parse_intent(sent), Intent::Unknown, "{sent}");
+            assert!(is_readback(sent), "{sent}");
+            assert!(!line.contains('-') && !rb.contains('-'));
+        }
     }
 
     /// ctx() on the ground at an ICAO field, offered an IFR clearance to

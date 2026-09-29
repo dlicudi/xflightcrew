@@ -4673,57 +4673,12 @@ const REPOSITION_MIN_AGL_FT: f64 = FAP_NM * GLIDEPATH_FT_PER_NM;
 /// where its downwind was probed from.
 const REVERSAL_PLAN_FRESH_S: f64 = 60.0;
 
-/// Straight ahead at a held altitude, the loop's own command (#182): while
-/// the reversal's plan is probed (`waiting`), or because no pattern clears
-/// the ground (`refused`), which climbs to a height clear of the ground ahead
-/// and hands the aircraft over only once it holds it there.
-#[derive(Debug, Clone, Copy, PartialEq)]
-struct TerrainHold {
-    hdg_true: f64,
-    alt_ft: f64,
-    refused: bool,
-    /// Consecutive ticks level at the hold's altitude.
-    level_ticks: u32,
-}
-
 /// The live floor is probed this often, and a tripped floor stands this
 /// long after its last trip (the circuit's 2 s and 60 s).
 const LIVE_FLOOR_EVERY_S: f64 = 2.0;
 const LIVE_FLOOR_HOLD_S: f64 = 60.0;
 
-/// Ticks level at a refusal's altitude before the aircraft is handed over.
-const HOLD_LEVEL_TICKS: u32 = 8;
-/// ...level within this.
-const HOLD_LEVEL_FT: f64 = 100.0;
-
-impl TerrainHold {
-    fn waiting(hdg_true: f64, alt_ft: f64) -> Self {
-        TerrainHold {
-            hdg_true,
-            alt_ft,
-            refused: false,
-            level_ticks: 0,
-        }
-    }
-
-    fn refused(hdg_true: f64, alt_ft: f64) -> Self {
-        TerrainHold {
-            refused: true,
-            ..Self::waiting(hdg_true, alt_ft)
-        }
-    }
-
-    /// One tick at `alt_ft`: true once a refusal has held its altitude long
-    /// enough to be handed over (the autopilot holding it). Pure.
-    fn level_now(&mut self, alt_ft: f64) -> bool {
-        if (alt_ft - self.alt_ft).abs() <= HOLD_LEVEL_FT {
-            self.level_ticks += 1;
-        } else {
-            self.level_ticks = 0;
-        }
-        self.refused && self.level_ticks >= HOLD_LEVEL_TICKS
-    }
-}
+use crate::reversal::TerrainHold;
 
 /// The circuit's leg whose live floor (`circuit::live_floor_ft`) a reversal
 /// leg or a hold keeps: the level legs climb clear of ground ahead, the base
@@ -4796,24 +4751,6 @@ mod terrain_hold_tests {
         let floor = crate::circuit::live_floor_ft(C::Downwind, 2540.0, 2043.0);
         assert_eq!(floor, Some(2843.0));
     }
-
-    /// A refusal hands over only once level at its altitude, the autopilot
-    /// holding it; a hold waiting on the plan never does.
-    #[test]
-    fn a_refusal_hands_over_only_once_level_at_its_altitude() {
-        let mut h = TerrainHold::refused(133.0, 3100.0);
-        for _ in 0..20 {
-            assert!(!h.level_now(2600.0), "climbing: still ours");
-        }
-        for _ in 0..HOLD_LEVEL_TICKS - 1 {
-            assert!(!h.level_now(3080.0));
-        }
-        assert!(h.level_now(3060.0));
-        let mut w = TerrainHold::waiting(133.0, 1700.0);
-        for _ in 0..50 {
-            assert!(!w.level_now(1700.0));
-        }
-    }
 }
 
 /// Only climb with this much surplus over the approach speed. Climbing slow in a
@@ -4833,7 +4770,7 @@ const MAX_CLIMB_FPM: f64 = 800.0;
 /// again — the EGPH go-around (2026-09-20) climbed away from a balked
 /// approach at exactly this number. Never LESS than the GA figure, so
 /// nothing that flew before gets weaker.
-fn max_climb_fpm() -> f64 {
+pub(crate) fn max_climb_fpm() -> f64 {
     crate::procedure::climb_fpm().max(MAX_CLIMB_FPM)
 }
 /// While below the terrain floor, command the throttle governor to this much over
