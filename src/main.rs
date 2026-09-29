@@ -457,7 +457,16 @@ async fn main() -> Result<()> {
 
     // whisper model load is the one slow init — do it once, up front. Bias its
     // decoding toward the active aircraft's actual systems and phraseology.
-    let stt = Stt::load(&config.whisper_model_path, config.whisper_gpu)?;
+    // Text only (`XCOPILOT_LISTEN=off`): no model, no microphone, no PTT;
+    // lines come from the panel's typed box and the sortie runner.
+    let listen_off = config.listen_mode == "off";
+    LISTEN_OFF.store(listen_off, std::sync::atomic::Ordering::Relaxed);
+    let stt = if listen_off {
+        tracing::info!("listening off: text input only, no whisper model loaded");
+        Stt::disabled()
+    } else {
+        Stt::load(&config.whisper_model_path, config.whisper_gpu)?
+    };
     // The tool registry, STT prompt, and checklists are all derived from the
     // profile inside run_session — and rebuilt there when the aircraft switches.
 
@@ -465,7 +474,9 @@ async fn main() -> Result<()> {
     // listens only while the button/key is held, so there's no wake word and
     // ambient/ATC can't trigger it. A sim dataref (the bundled X-Plane plugin)
     // takes precedence over a global key — it needs no OS permission.
-    let ptt = if !config.ptt_dataref.is_empty() {
+    let ptt = if listen_off {
+        None
+    } else if !config.ptt_dataref.is_empty() {
         // Leak the names to 'static for the dedicated subscription (lives for
         // the whole run); a one-time leak of two config strings. The radio PTT
         // dataref rides in the same subscription — if the plugin predates it,
@@ -495,7 +506,7 @@ async fn main() -> Result<()> {
     // Continuous only when not using PTT. "Explicit" = the user clearly addressed
     // the copilot (any push-to-talk); a non-command is then ignored silently rather
     // than answered with an apology.
-    let continuous = config.listen_mode == "continuous" && ptt.is_none();
+    let continuous = config.listen_mode == "continuous" && ptt.is_none() && !listen_off;
     let explicit = !continuous;
 
     // The speech arbiter is shared by the command loop and the monitor, so it's
@@ -505,7 +516,7 @@ async fn main() -> Result<()> {
     // The panel's copilot-voice picker: publish the roster, poll for picks,
     // swap live. Only where the pick can matter — the `say` backend ignores
     // piper models entirely.
-    if config.tts_backend != "say" {
+    if config.tts_backend != "say" && config.tts_backend != "off" {
         spawn_voice_picker(
             config.xplane_base_url.clone(),
             voice.clone(),
@@ -3858,6 +3869,9 @@ fn analyze_commands() -> Result<()> {
     Ok(())
 }
 
+/// Text only: nothing is captured (`XCOPILOT_LISTEN=off`).
+static LISTEN_OFF: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// Capture one utterance (continuous VAD or push-to-talk) and transcribe it.
 /// Returns `None` on silence/noise or a capture error. The bool is true when
 /// the RADIO PTT was held during capture — the utterance was transmitted (for
@@ -3869,6 +3883,12 @@ fn listen_once(
     ptt: &Option<Ptt>,
     idle_timeout: Option<Duration>,
 ) -> Option<(stt::Transcription, bool)> {
+    if LISTEN_OFF.load(std::sync::atomic::Ordering::Relaxed) {
+        // Never Enter-to-talk: wait out the caller's tick so the typed
+        // channel is polled at the same pace.
+        std::thread::sleep(idle_timeout.unwrap_or(Duration::from_millis(200)));
+        return None;
+    }
     let mut from_radio = false;
     let audio = match (ptt, ptt_mic, listener) {
         // Hold-a-key push-to-talk (works while X-Plane has focus), warm mic.

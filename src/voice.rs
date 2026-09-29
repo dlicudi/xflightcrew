@@ -1741,6 +1741,12 @@ enum StationVoice {
 
 impl StationVoice {
     fn build(config: &Config, model: &str, person: u64) -> Self {
+        if config.tts_backend == "off" {
+            return StationVoice::Say(Box::new(Config {
+                tts_backend: "off".into(),
+                ..Config::default()
+            }));
+        }
         #[cfg(feature = "onnx-tts")]
         if !model.is_empty() {
             match crate::tts_onnx::OnnxTts::load(model) {
@@ -1892,6 +1898,11 @@ pub fn pilot_engine() -> Option<(String, String)> {
 
 impl Speaker {
     fn build(mut config: Config) -> Self {
+        if config.tts_backend == "off" {
+            tracing::info!("TTS off: text only, nothing synthesised");
+            publish_pilot_engine("off", "");
+            return Speaker::Subprocess(Box::new(config));
+        }
         #[cfg(feature = "onnx-tts")]
         if config.tts_backend == "onnx" {
             match crate::tts_onnx::OnnxTts::load(&config.piper_voice) {

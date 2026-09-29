@@ -196,7 +196,8 @@ list. Common knobs:
 |---|---|---|
 | `XCOPILOT_MODE` | `both` | `both`, `copilot`, `atc` |
 | `XCOPILOT_UI` | `plain` | `plain` or `tui` |
-| `XCOPILOT_LISTEN` | `continuous` | `continuous` or `ptt` |
+| `XCOPILOT_LISTEN` | `continuous` | `continuous`, `ptt`, or `off` (text only: no microphone, no whisper model) |
+| `XCOPILOT_TTS` | `onnx` | `onnx`, `say`, `piper`, or `off` (text only: nothing synthesised, lines paced as if spoken) |
 | `XCOPILOT_CONFIRM` | `true` | require "affirm" before safety-critical commands |
 | `XCOPILOT_MONITOR` | `true` | background problem callouts |
 | `XCOPILOT_ATC_AIRPORT` | `LXGB` | home field for the tower |

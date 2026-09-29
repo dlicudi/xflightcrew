@@ -54,7 +54,8 @@ const CAPTION_MARKERS: &[&str] = &[
 
 /// A loaded whisper model, reusable across utterances.
 pub struct Stt {
-    ctx: WhisperContext,
+    /// `None`: listening is off (`XCOPILOT_LISTEN=off`), no model loaded.
+    ctx: Option<WhisperContext>,
     /// Decoding bias prompt (whisper `initial_prompt`). Defaults to the generic
     /// cockpit vocab; [`set_prompt`](Self::set_prompt) swaps in a profile-aware one.
     prompt: String,
@@ -78,10 +79,25 @@ impl Stt {
         let ctx = WhisperContext::new_with_params(model_path, params)
             .with_context(|| format!("loading whisper model: {model_path}"))?;
         Ok(Self {
-            ctx,
+            ctx: Some(ctx),
             prompt: VOCAB_PROMPT.to_string(),
             radio_prompt: String::new(),
         })
+    }
+
+    /// No model: text-only sessions (`XCOPILOT_LISTEN=off`) never hear
+    /// anything, so the whisper load (memory, seconds, the GPU) is skipped.
+    pub fn disabled() -> Self {
+        Self {
+            ctx: None,
+            prompt: VOCAB_PROMPT.to_string(),
+            radio_prompt: String::new(),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_disabled(&self) -> bool {
+        self.ctx.is_none()
     }
 
     /// Replace the decoding bias prompt — used to install the per-aircraft vocab
@@ -151,7 +167,8 @@ impl Stt {
     /// The decode itself, with the chosen bias prompt.
     fn run(&self, audio: &[f32], prompt: &str) -> Result<Transcription> {
         let started = std::time::Instant::now();
-        let mut state = self.ctx.create_state().context("creating whisper state")?;
+        let ctx = self.ctx.as_ref().context("listening is off (XCOPILOT_LISTEN=off)")?;
+        let mut state = ctx.create_state().context("creating whisper state")?;
 
         // Beam search is more accurate than greedy for short, noisy commands.
         let mut params = FullParams::new(SamplingStrategy::BeamSearch {
@@ -321,6 +338,13 @@ fn is_prompt_echo(text: &str, prompt: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_disabled_stt_hears_nothing_and_never_panics() {
+        let s = super::Stt::disabled();
+        assert!(s.is_disabled());
+        assert!(s.transcribe(&[0.0; 1600]).is_err());
+    }
+
     use super::*;
     use std::process::Command;
 

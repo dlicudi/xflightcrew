@@ -19,8 +19,36 @@ use crate::config::Config;
 pub fn speak(config: &Config, text: &str) -> Result<()> {
     match config.tts_backend.as_str() {
         "say" => speak_say(config, text),
+        "off" => {
+            silent_pace(text);
+            Ok(())
+        }
         "piper" => speak_piper(config, text),
         other => bail!("unknown tts_backend: {other} (expected `say` or `piper`)"),
+    }
+}
+
+/// Text only (`XCOPILOT_TTS=off`): nothing is synthesised or played, but a
+/// line still takes about as long as it would to say (15 characters a
+/// second, at most 12 s), so the arbiter's order, the radio's on-air window
+/// and the loop's waits keep their shape.
+pub fn silent_pace(text: &str) {
+    let s = (text.chars().count() as f64 / 15.0).clamp(0.3, 12.0);
+    std::thread::sleep(std::time::Duration::from_secs_f64(s));
+}
+
+#[cfg(test)]
+mod off_tests {
+    #[test]
+    fn a_silent_line_is_paced_and_bounded() {
+        let t = std::time::Instant::now();
+        super::speak(
+            &crate::config::Config { tts_backend: "off".into(), ..Default::default() },
+            "Flaps up.",
+        )
+        .unwrap();
+        let s = t.elapsed().as_secs_f64();
+        assert!((0.55..1.5).contains(&s), "{s}");
     }
 }
 
