@@ -150,22 +150,50 @@ flaps:
 # fpm (the worst 273; the fitted model 291), under 400 in 40 fpm rms of
 # gusts (353); the model with the lever cut at the gate past 300, the
 # tracker as flown past 400 (1,267, a float that stalled onto the runway).
-# VERIFY: blackbox `flare_ask`, `flare_unexplained`, `flare_elev` against
-# `vvi` from `arrest_hands`, the `power` events' `retard` key, and the
-# landing's `sink_fpm` under 300.
+#
+# THE HOLD-OFF (issue #166; LEMG 13 on the iMac, 2026-09-29, sorties
+# 1790701546, 1790702352, 1790702623): flown that way at 80 kt, the flare
+# took the jets' firm touchdown to the wheels, 107 fpm asked at the runway
+# with the lever up to a second before it, and met the runway at 80 kt and
+# 207 to 215 fpm with 0.10 of pull; the ratchet held it, the balloon ease
+# let it go, the balloon's approach thrust came back at 3 to 4 ft, and every
+# landing hopped 4.5 to 9.9 ft down to 55 kt. A light single's flare instead:
+#   * the model refitted to those three flares (6,000 fpm per unit through
+#     1.4 s lags after 1.15 s, 380 fpm of the tail's ground effect from 40
+#     ft; 39 to 63 fpm rms), levelling at `hold_off_ft` over the runway on a
+#     7 s exponential, then settling at `touchdown_fpm`, the pull up to 0.5;
+#   * the speed's bleed carried ahead as sink (`fpm_per_kt`), so the pull
+#     keeps up with the idle wing instead of a tick behind each knot;
+#   * the lever off from 20 ft at up to 0.1 a second (idle by about 10 ft);
+#   * from the first contact the pull it touched with HELD, no more and no
+#     less, the lever closed, never the balloon's thrust, let go only on the
+#     wheels below 45 kt (`autoland::TouchHold`).
+# On the plants that replay the three bounces (the law as flown bounces 3.8
+# to 5.9 ft on them): one contact at 124 fpm or less, 64 to 69 kt, the hop
+# at most 1.2 ft (`lemg13_sr22_bounce_tests`).
+# VERIFY: blackbox `touch_hold` (held, at, ias), the ticks' `touch_hold`,
+# `flare_ask`, `flare_target` and `ias` below 20 ft, the `power` events'
+# `retard` (float or timed from 20 ft, then `touched`), `bounce` events, and
+# the landing's `sink_fpm` (under 250) and `bounce_ft` (under 1.5).
 flare_elevator:
   gain: 1.0
-  max: 0.35
+  max: 0.5
   max_push: 0.05
   balloon_ease_per_s: 0.15
+  tau_s: 7.0
   model:
     fpm_per_elevator: 6000.0
-    lag_s: 1.0
-    dead_s: 0.8
+    lag_s: 1.4
+    dead_s: 1.15
+    ground_fpm: 380.0
+    ground_ft: 40.0
+    hold_off_ft: 2.0
+    touchdown_fpm: 50.0
+    fpm_per_kt: 115.0
 flare_power:
-  reduction_per_second: 0.03
-  retard_max_per_s: 0.03
-  retard_at_s: 1.0
+  reduction_per_second: 0.1
+  retard_max_per_s: 0.1
+  retard_below_ft: 20.0
 
 # XChecklist file to interpret (GoofyJP, read-only).
 # Taxi steering. The nosewheel CASTORS: the yoke-heading channel (nosewheel
