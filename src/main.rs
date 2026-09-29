@@ -38,6 +38,7 @@ mod flight_state;
 mod flightplan;
 mod flow;
 mod full_auto;
+mod go_around;
 mod grammar;
 mod health;
 mod heli_circuit;
@@ -1234,6 +1235,9 @@ async fn run_session(
         // readback (seen live 2026-07-14: SAY kept "cleared to land" while
         // the tower shouted go around, and the pilot dutifully read it back).
         if party_line::take_pending_go_around() {
+            // The pilot's "going around" after it is the readback, which the
+            // crew already flies (`go_around::note_radio_call`).
+            go_around::note_tower_order();
             if let Some(st) = atc_station.as_mut() {
                 st.apply_monitor_go_around();
                 reporter.log(
@@ -1719,6 +1723,10 @@ async fn run_session(
         // the cockpit-command gates below. Physical routing beats content
         // routing whenever the transmit button is bound.
         if from_radio {
+            // "Going around" on the air is the pilot's decision, whoever
+            // hears it: the loop flying the approach flies it too (never the
+            // readback of our tower's order, which it already flies).
+            go_around::note_radio_call(&command);
             // Copilot-only mode: the pilot is talking to REAL external ATC
             // (VATSIM, SayIntentions, stock). Their transmission is none of
             // our business — no simulated reply, no void briefing, nothing
@@ -4628,6 +4636,8 @@ async fn try_route_content_atc(
         tempo::set_radio_turn(false);
         return false;
     };
+    // The pilot's own "going around" to the tower is flown too.
+    go_around::note_radio_call(tl);
     reporter.status(ui::Phase::Speaking);
     reporter.log(ui::LogKind::Readback, format!("{}: {reply}", who.tag()));
     voice.say_station(Priority::Readback, who, &reply);

@@ -392,7 +392,7 @@ everything blackboxes to `logs/blackbox.jsonl` (kinds: `atc`, `autotaxi`, `autot
 `pushback`, `checklist`, `taxi_guide`, `cockpit_auto`, `full_auto`, `circuit`, `procedure`,
 `cabin`, `instructor`, `loading`, `turbine_start`, `heli_start`, `hover`, `heli_circuit`,
 `heli_route`, `rapport`, `cabin_air`, `api_load`, `plan_audit`, `handover`, `start_item`,
-`sim_radio`, `fuel_pumps`, `electrical`, `typed`, `crew_radio`).
+`sim_radio`, `fuel_pumps`, `electrical`, `typed`, `crew_radio`, `go_around`).
 
 ### Holding, writers, reads
 - **A stage not moving the aircraft is holding it**: brakes for every wait, abort and give-up. **A
@@ -793,7 +793,12 @@ everything blackboxes to `logs/blackbox.jsonl` (kinds: `atc`, `autotaxi`, `autot
   watches it (`party_line::GoAroundOrders`, never the main loop's `take_pending_go_around`); autoland
   latches it (`GoAroundLatch::order`), the circuit flies it from Base or Final
   (`flies_go_around_order`, clean-up on `go_around_flap_step` / `go_around_speed_kts`; LEMG 31
-  2026-09-28).
+  2026-09-28). **The pilot's go-around is flown the same way** (`src/go_around.rs`: a crew-side
+  counter read through one `GoAroundWatch` beside the tower's, never the party line): the
+  `go_around` tool (closed words, so a readback with a callsign or "roger" never lands) refuses
+  with nothing flying an approach or the wheels down ("We're down, staying down"), and reads back
+  the loop's ANSWER, not the request; a pilot's own "going around" on the air orders it too,
+  unless it is the readback of the tower's order (`READBACK_WINDOW`).
 - **The landing arrest leads the AP's lag** (`vs_dial_fpm`, `Guidance.arresting`): gain, cap and
   horizon are the airframe's (`ArrestLeadProfile`); gates and targets are seconds of sink
   (`arrest_gates_ft`, `arrest_targets_fpm`). Ticks log `cmd_vs`, `vs_dial`, `vvi`, `vvi_trend`.

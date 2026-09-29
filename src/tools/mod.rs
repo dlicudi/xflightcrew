@@ -26,6 +26,7 @@ pub mod flaps;
 pub mod fuel_pumps;
 pub mod full_auto;
 pub mod gear;
+pub mod go_around;
 pub mod ground;
 pub mod heli;
 pub mod instruments;
@@ -186,6 +187,9 @@ pub const ROTORCRAFT_WITHHELD: &[&str] = &[
     // The autopilot's own speed and GPS modes (#92) share the autopilot the
     // hover loop holds, and were measured on no helicopter.
     "ap_mode",
+    // The pilot's go-around is ordered to autoland or the circuit; the hover
+    // loop has its own words for a balked arrival.
+    "go_around",
 ];
 
 impl Registry {
@@ -739,6 +743,11 @@ impl Registry {
         // Reminders ("wake me at top of descent", "tell me at the next waypoint") are
         // crew memory, not an airframe system, so available on any aircraft.
         tools.push(Box::new(reminder::SetReminder));
+
+        // The pilot's go-around: an order to whichever loop flies the
+        // approach, refused aloud when none does (every fixed-wing airframe,
+        // so "go around" always gets an answer).
+        tools.push(Box::new(go_around::GoAround));
 
         // A helicopter keeps its switches, radios and autopilot dials and
         // loses every fixed-wing law, whatever the other flags said: the

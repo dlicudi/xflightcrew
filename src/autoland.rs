@@ -1433,7 +1433,8 @@ pub fn run_autoland_scoped(
             // one on its first tick. A WATCH, never the main loop's `take_*`
             // flag: sharing that flag, the main loop's FSM sync consumed every
             // order before this loop's tick saw it (LEMG 31, 2026-09-28).
-            let mut orders = crate::party_line::GoAroundOrders::arm();
+            // The pilot's order rides the same watch (`go_around`, #77).
+            let mut orders = crate::go_around::GoAroundWatch::arm();
             // The crew's own watch on the landing clearance (#155).
             let mut uncleared = UnclearedWatch::default();
             // The final report owed on a SECOND approach. The circuit or the
@@ -1979,14 +1980,28 @@ pub fn run_autoland_scoped(
                 // itself. Watched here because this is the thing that can ACT
                 // on it; the watch is armed with the approach above, so only
                 // an order given during this approach can trip it.
-                if orders.take()
-                    && go_around.order(on_ground > 0.5)
-                {
-                    crate::blackbox::record(
-                        "autoland",
-                        serde_json::json!({"event": "ordered_go_around", "radio": radio_ft,
-                                           "dist": raw.dist_nm}),
-                    );
+                // The pilot's order is flown the same way and answered, so
+                // the `go_around` tool reads back what the aircraft does.
+                if let Some(by) = orders.take() {
+                    let already = go_around.active();
+                    let flown = go_around.order(on_ground > 0.5);
+                    if flown {
+                        crate::blackbox::record(
+                            "autoland",
+                            serde_json::json!({"event": "ordered_go_around", "radio": radio_ft,
+                                               "dist": raw.dist_nm, "by": by.label()}),
+                        );
+                    }
+                    // Answered for the tower's too: a pilot's order the
+                    // same tick is folded into it.
+                    use crate::go_around::Answer;
+                    crate::go_around::answer(if flown {
+                        Answer::Flying
+                    } else if already {
+                        Answer::Already
+                    } else {
+                        Answer::OnGround
+                    });
                 }
                 // A final the tower is working but has not cleared: ask
                 // again at 1,000 ft, go around at 300 (`UnclearedWatch`).

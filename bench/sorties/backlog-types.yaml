@@ -41,6 +41,17 @@ cases:
       aircraft: "Aircraft/Laminar Research/Cirrus Vision SF50/CirrusSF50.acf"
       approach: { field: LEMG, runway: wind, final_nm: 10 }
 
+  # SF50: the pilot's go-around in the flare, flown as the tower's is:
+  # the slow low go-around pitches for speed (#77), the balk calls the
+  # tower once it climbs (#102), then the pattern round and a landing.
+  - name: SF50 LEMG 13, 5 nm final, pilot's go-around
+    setup:
+      aircraft: "Aircraft/Laminar Research/Cirrus Vision SF50/CirrusSF50.acf"
+      approach: { field: LEMG, runway: 13, final_nm: 5 }
+    traffic: off
+    steps:
+      - { say: go around, when: { phase: Landing }, tool: go_around }
+
   # A330: transponder knobs, spoilers, runway start, altitude capture
   # (#43); the circuit's base at speed (#72).
   - name: A330 LEMG runway start into the wind, circuit
