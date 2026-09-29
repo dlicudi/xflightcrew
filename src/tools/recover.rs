@@ -41,6 +41,7 @@ const PITCH: &str = "sim/flightmodel/position/theta"; // pitch, deg (+ = nose up
 const ROLL_RATE: &str = "sim/flightmodel/position/P"; // deg/s
 const PITCH_RATE: &str = "sim/flightmodel/position/Q"; // deg/s
 const IAS: &str = "sim/flightmodel/position/indicated_airspeed"; // kt
+const VS_FPM: &str = "sim/flightmodel/position/vh_ind_fpm";
 const STALL_RATIO: &str = "sim/cockpit2/annunciators/stall_warning_ratio"; // 0..1
 const ELEV_TRIM: &str = "sim/cockpit2/controls/elevator_trim"; // -1 nose down .. +1 nose up
 
@@ -87,6 +88,24 @@ pub struct RecoveryState {
     /// The attitude the pitch-to-level phase aims at, degrees (level, or a
     /// hand-flown hold's correction toward its height).
     pub target_pitch_deg: f64,
+    /// Height above the ground, feet; `None` unread (no ground rule).
+    pub agl_ft: Option<f64>,
+    /// Vertical speed, feet per minute; `None` unread.
+    pub vs_fpm: Option<f64>,
+}
+
+/// Low and going down: the recovery climbs away from the ground, not just
+/// to level (a 737 unpaused at 200 ft, 7 degrees nose down, was eased up at
+/// 0.27 of column and struck the ground, LEMG 13 2026-09-29; #181).
+pub const GROUND_ESCAPE_AGL_FT: f64 = 1_000.0;
+const GROUND_ESCAPE_PITCH_DEG: f64 = 10.0;
+const GROUND_ESCAPE_PULL: f64 = 0.6;
+
+pub fn ground_escape(s: &RecoveryState) -> bool {
+    match (s.agl_ft, s.vs_fpm) {
+        (Some(agl), Some(vs)) => agl < GROUND_ESCAPE_AGL_FT && (vs < -200.0 || s.pitch_deg < -2.0),
+        _ => false,
+    }
 }
 
 /// What to command this tick.
@@ -136,9 +155,17 @@ pub fn recovery_inputs(s: &RecoveryState) -> RecoveryCmd {
     // Flying: roll upright and pitch to level, and keep the energy up — full power
     // while below the safe speed, otherwise leave the throttle where the handoff
     // will set cruise. (Props are driven to full forward once at recovery start.)
-    let pitch = KP_PITCH * (s.target_pitch_deg - s.pitch_deg) - KD_PITCH * s.pitch_rate_dps;
-    let throttle = (s.ias_kts < s.min_safe_ias).then_some(RECOVERY_THROTTLE);
-    let stable = s.bank_deg.abs() < 5.0
+    let escape = ground_escape(s);
+    let target = if escape {
+        s.target_pitch_deg.max(GROUND_ESCAPE_PITCH_DEG)
+    } else {
+        s.target_pitch_deg
+    };
+    let pitch = KP_PITCH * (target - s.pitch_deg) - KD_PITCH * s.pitch_rate_dps;
+    let pull_max = if escape { GROUND_ESCAPE_PULL } else { 0.4 };
+    let throttle = (escape || s.ias_kts < s.min_safe_ias).then_some(RECOVERY_THROTTLE);
+    let stable = !escape
+        && s.bank_deg.abs() < 5.0
         && s.pitch_deg.abs() < 8.0
         && s.roll_rate_dps.abs() < 5.0
         && s.stall_ratio <= STALL_TRIP
@@ -147,7 +174,7 @@ pub fn recovery_inputs(s: &RecoveryState) -> RecoveryCmd {
     RecoveryCmd {
         // More nose-DOWN authority than up — getting the nose down (out of a stall /
         // nose-high) is the hard, safety-critical direction.
-        pitch: pitch.clamp(-0.6, 0.4),
+        pitch: pitch.clamp(-0.6, pull_max),
         roll: roll.clamp(-0.6, 0.6),
         throttle,
         stable,
@@ -238,6 +265,12 @@ async fn read_state(
         ias_kts: xp.get_float(IAS).await.ok()?,
         stall_ratio: xp.get_float(STALL_RATIO).await.unwrap_or(0.0),
         min_safe_ias,
+        agl_ft: xp
+            .get_float(crate::datarefs::AGL_METERS)
+            .await
+            .ok()
+            .map(|m| m * 3.28084),
+        vs_fpm: xp.get_float(VS_FPM).await.ok(),
     })
 }
 
@@ -963,7 +996,33 @@ mod tests {
             stall_ratio: stall,
             min_safe_ias: 90.0,
             target_pitch_deg: LEVEL_PITCH_DEG,
+            agl_ft: None,
+            vs_fpm: None,
         }
+    }
+
+    #[test]
+    fn low_and_descending_climbs_away_from_the_ground() {
+        // LEMG 13 2026-09-29: unpaused at 200 ft, 7 degrees nose down, 218 kt.
+        let s = RecoveryState {
+            agl_ft: Some(204.0),
+            vs_fpm: Some(-2_500.0),
+            ..state(-23.8, -7.0, 0.0, 218.0)
+        };
+        let c = recovery_inputs(&s);
+        assert!(c.pitch >= 0.5, "a firm pull, got {}", c.pitch);
+        assert_eq!(c.throttle, Some(RECOVERY_THROTTLE));
+        assert!(!c.stable);
+        // High, the same attitude is only levelled, gently.
+        let high = RecoveryState { agl_ft: Some(5_000.0), ..s };
+        assert!(recovery_inputs(&high).pitch <= 0.4);
+        // Low but climbing and level is no escape: stable as before.
+        let fine = RecoveryState {
+            agl_ft: Some(600.0),
+            vs_fpm: Some(300.0),
+            ..state(1.0, 2.0, 0.0, 200.0)
+        };
+        assert!(recovery_inputs(&fine).stable);
     }
 
     #[test]

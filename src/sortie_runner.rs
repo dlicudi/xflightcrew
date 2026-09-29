@@ -3488,7 +3488,31 @@ pub async fn secure_at_end(sim: &dyn RunnerSim) -> bool {
     if on_ground == Some(true) {
         return false;
     }
+    // Never freeze a crisis: low and going down, the loops fly on until it
+    // climbs or has height (a 737 paused mid-recovery at 200 ft, 7 degrees
+    // nose down, was unpaused into the ground, LEMG 13 2026-09-29; #181).
+    let t0 = now_s();
+    while now_s() - t0 < PAUSE_WAIT_LOW_S {
+        let (agl, vs) = tokio::join!(
+            sim.read(crate::datarefs::AGL_METERS),
+            sim.read("sim/flightmodel/position/vh_ind_fpm")
+        );
+        let (Ok(agl), Ok(vs)) = (agl, vs) else { break };
+        if pause_safe(agl * 3.28084, vs) {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    }
     sim.command(PAUSE_ON).await.is_ok()
+}
+
+/// How long the run's end waits for a low, descending aircraft to climb.
+const PAUSE_WAIT_LOW_S: f64 = 90.0;
+
+/// An airborne aircraft may be frozen here: out of the ground's reach, or
+/// not going down.
+pub fn pause_safe(agl_ft: f64, vs_fpm: f64) -> bool {
+    agl_ft >= crate::tools::recover::GROUND_ESCAPE_AGL_FT || vs_fpm > -200.0
 }
 
 /// Every case, `repeat` times, in order; a row per case as it ends.
@@ -5087,6 +5111,13 @@ cases:
             "a final with no distance is the setup tool's ten miles"
         );
         assert!(bench_specs().len() >= 3);
+    }
+
+    #[test]
+    fn a_low_descending_aircraft_is_not_frozen() {
+        assert!(!pause_safe(204.0, -2_500.0));
+        assert!(pause_safe(204.0, 500.0));
+        assert!(pause_safe(3_000.0, -2_500.0));
     }
 
     #[test]

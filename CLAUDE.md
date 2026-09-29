@@ -517,6 +517,9 @@ everything blackboxes to `logs/blackbox.jsonl` (kinds: `atc`, `autotaxi`, `autot
   follow, a dial never answered or held is NO authority, and `take_over` with `ap_no_pitch` hand
   flies it (never back to the autopilot; "I'm flying the pitch"). The servo, elevator surface and
   dials ride `state.in.pitch` airborne (a servo moved nothing on two airframes, unlogged, #181).
+  **A recovery is an upset recovery**: steeply banked in a stall it unloads and rolls with full
+  aileron (`stall_roll_cap`), and low and going down it CLIMBS away (`ground_escape`, under
+  `GROUND_ESCAPE_AGL_FT`; a 737 eased up at 0.27 of column from 200 ft struck the ground, #181).
   **A recovery never writes into the next flight** (`recover::may_write` before every streaming
   write: aborted, superseded or `sim_loading`; a held tick wrote 6 s into a new setup).
 - **The declared rudder is believed only up to the speed it was measured at** (`RollSteer` held flat
@@ -1139,7 +1142,7 @@ confirms it closes it (`fixes #N` in the commit). Known gaps are `owed` issues.
   since the case's line (`CRASH_CLEAR_S`), and a wreck that outlives the setup stops the run.
   **An airborne aircraft is never handed to nobody** (`hand_back`): on the ground a crash or deadline
   types "my controls"; in the air the loops keep it until the next setup, and a run that ends in the
-  air pauses X-Plane (`secure_at_end`); Ctrl-C pauses first. A line the app has TAKEN is never
+  air pauses X-Plane (`secure_at_end`), never low and going down (`pause_safe`: it waits for the climb); Ctrl-C pauses first. A line the app has TAKEN is never
   retyped (`Phase::Queued`, `QUEUED_S`). **No setup under a moving aircraft** (`SettleWatch`,
   `settle_before_setup`): before each setup the last aircraft is at rest (marker idle, on the ground
   under `STOPPED_KTS`, held `QUIET_S`), waited up to `STOP_MAX_S`, then "my controls" (`hand_back_hold`
