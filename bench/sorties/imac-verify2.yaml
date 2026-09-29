@@ -1,0 +1,29 @@
+# iMac verify batch 2 (build after the SR22 rotation model, the bounce's
+# yoke marking and the pitch-authority baseline under our own column).
+after: stop
+cases:
+  # #184: rotate_tick pitch/pitch_ff, wheels false near 80 to 85 KIAS,
+  # liftoff ias under ~88, liftoff_xtk_m.
+  - name: "SR22 LEMG runway start 13, circuit (#184)"
+    setup:
+      aircraft: "Aircraft/Laminar Research/Cirrus SR22/Cirrus SR22.acf"
+      runway_start: { field: LEMG, runway: 13, engines_running: true }
+    command: fly a circuit
+    traffic: off
+    deadline_min: 30
+
+  # #186 false verdict fix, #78 theta ceiling, #31 rollout, #123 roll.
+  - name: "737 LEMG runway start 30, circuit (#78 #31 #123)"
+    setup:
+      aircraft: "Aircraft/Laminar Research/Boeing 737-800/b738.acf"
+      runway_start: { field: LEMG, runway: 30, engines_running: true }
+    command: fly a circuit
+    traffic: off
+    deadline_min: 30
+
+  # #166: bounce handling and the split, no yoke_under_ap intervention.
+  - name: "SR22 LEMG 13, 10 nm final (#166)"
+    setup:
+      aircraft: "Aircraft/Laminar Research/Cirrus SR22/Cirrus SR22.acf"
+      approach: { field: LEMG, runway: 13, final_nm: 10 }
+    traffic: off
