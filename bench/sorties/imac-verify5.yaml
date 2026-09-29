@@ -1,0 +1,30 @@
+# iMac verify batch 5 (after 83abc66: routes join their first taxiway ahead,
+# the pivoting turn-round and the runway-spare alignment).
+after: stop
+cases:
+  # #45: taxi max_lat under 3, first drive err ~9; backtrack_turn pivots,
+  # line_up_align_budget spare_m > 0, line_up_aligned ok, no line_up_no_fit.
+  - name: "Lancair Evolution LILB circuit from the ramp (#45)"
+    setup:
+      aircraft: "Aircraft/Laminar Research/Lancair Evolution/N844X.acf"
+      ramp: { field: LILB }
+    command: fly a circuit
+    deadline_min: 35
+
+  # Regression for the route-start join (every planned taxi) and #165.
+  - name: "SR22 LEMG ramp circuit (#165, route start)"
+    setup:
+      aircraft: "Aircraft/Laminar Research/Cirrus SR22/Cirrus SR22.acf"
+      ramp: { field: LEMG }
+    command: fly a circuit
+    traffic: off
+    deadline_min: 40
+
+  # Regression for the route-start join on a jet from a gate (#123's taxi).
+  - name: "737 EGKK ramp, taxi out and circuit (route start)"
+    setup:
+      aircraft: "Aircraft/Laminar Research/Boeing 737-800/b738.acf"
+      ramp: { field: EGKK }
+    command: fly a circuit
+    traffic: off
+    deadline_min: 40
