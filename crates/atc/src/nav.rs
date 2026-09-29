@@ -2568,6 +2568,12 @@ impl TaxiNet {
         if runway_nodes.is_empty() {
             return None;
         }
+        // How far from the threshold an entrance may be. With the strip
+        // known, anywhere along it: its own entrance, however far up, beats
+        // a neighbour's beside the numbers (KEDW 33, #36 sweep: 15/33 is
+        // 8.9 km of lakebed with no entrance within 3 km of the end, and the
+        // plain snap sent the route to 07C/25C).
+        let mut reach_m: f64 = 3000.0;
         // Ours, by geometry. The margin is the pavement's own half-width plus
         // a shoulder for an author whose node sits off the painted edge; the
         // along-track window is the strip's length plus the same, so a node
@@ -2576,10 +2582,7 @@ impl TaxiNet {
             let half = (r.width_m / 2.0).max(15.0) + STRIP_NODE_SHOULDER_M;
             let course = r.heading_a_deg();
             let length = haversine_nm(r.lat_a, r.lon_a, r.lat_b, r.lon_b) * 1852.0;
-            let on_strip = |id: &i64| {
-                let Some(&(plat, plon)) = self.nodes.get(id) else {
-                    return false;
-                };
+            let on_strip = |(plat, plon): (f64, f64)| {
                 let d = haversine_nm(r.lat_a, r.lon_a, plat, plon) * 1852.0;
                 let brg = bearing_deg(r.lat_a, r.lon_a, plat, plon);
                 let ang = angle_diff_deg(brg, course).to_radians();
@@ -2588,14 +2591,43 @@ impl TaxiNet {
                     && along >= -STRIP_NODE_SHOULDER_M
                     && along <= length + STRIP_NODE_SHOULDER_M
             };
-            let ours: std::collections::HashSet<i64> =
-                runway_nodes.iter().copied().filter(on_strip).collect();
+            // A node is ours when a runway edge ALONG the strip holds it:
+            // the edge runs the strip's course and its middle is on the
+            // rectangle. A node alone inside the shoulder is not enough:
+            // KEND 31 (#36 sweep) ends at node 54, the last node of
+            // 17L/35R's edge, 24 m off 13/31's centreline and so "on" it,
+            // and the route ended there; a crossing runway's edge can lie
+            // wholly inside our rectangle where it crosses (CYXX 01: 07/25's
+            // edge 167-168 over 01's numbers).
+            let ours: std::collections::HashSet<i64> = self
+                .edges
+                .iter()
+                .filter(|e| e.runway)
+                .filter(|e| {
+                    let (Some(&pa), Some(&pb)) = (self.nodes.get(&e.a), self.nodes.get(&e.b))
+                    else {
+                        return false;
+                    };
+                    let off = angle_diff_deg(bearing_deg(pa.0, pa.1, pb.0, pb.1), course).abs();
+                    off.min(180.0 - off) <= STRIP_EDGE_ALIGN_DEG
+                        && on_strip(((pa.0 + pb.0) / 2.0, (pa.1 + pb.1) / 2.0))
+                })
+                .flat_map(|e| [e.a, e.b])
+                .collect();
             if !ours.is_empty() {
                 runway_nodes = ours;
+                reach_m = reach_m.max(length + STRIP_NODE_SHOULDER_M);
             }
         }
+        // One hop over a TAXIWAY edge: the stub. A hop over a RUNWAY edge
+        // from our strip lands on runway pavement, and once `runway_nodes` is
+        // our strip's own that is the NEIGHBOUR's: KGJT 29 (issue #36, the
+        // real apt.dat sweep `real_install_converging_thresholds`) ends
+        // where 04/22's edge 38-66 runs onto it, node 38 on 04/22's
+        // centreline won as "one hop from runway 29", the route was planned
+        // to 04/22's entrance and its lead-on ended 122 m off 11/29.
         let mut adjacent: std::collections::HashSet<i64> = std::collections::HashSet::new();
-        for e in &self.edges {
+        for e in self.edges.iter().filter(|e| !e.runway) {
             if runway_nodes.contains(&e.a) {
                 adjacent.insert(e.b);
             }
@@ -2615,7 +2647,7 @@ impl TaxiNet {
             .filter(|id| runway_nodes.contains(id) || adjacent.contains(id))
             .filter_map(|id| dist_to(id).map(|d| (*id, d)))
             .min_by(|x, y| x.1.total_cmp(&y.1))
-            .filter(|(_, d)| *d < 3000.0)
+            .filter(|(_, d)| *d < reach_m)
             .map(|(id, _)| id)?;
         // A node one hop OFF the strip is where the stub starts, not where it
         // meets the runway: the route goes on to the runway node it joins, so
@@ -2656,6 +2688,11 @@ impl TaxiNet {
 /// node ON that strip. Authors place the centreline nodes by hand, and the
 /// runway rectangle is the only geometry we have to judge them against.
 const STRIP_NODE_SHOULDER_M: f64 = 15.0;
+
+/// How far off the strip's course a runway edge may run and still be one of
+/// the strip's own (authors' centreline nodes wander a degree or two; a
+/// crossing runway is tens of degrees off).
+const STRIP_EDGE_ALIGN_DEG: f64 = 15.0;
 
 /// Pick the runway end best aligned into the wind. Returns the end's ident,
 /// its true heading, and the headwind component (negative = tailwind).
@@ -7211,5 +7248,199 @@ SID:030,5,BLN4L,RW30,BLN,LE,D, ,VE  , ,   ,TF, , , , , ,      ,    ,    ,    ,  
             step.1 > -1.0000,
             "walked across the crossing runway's zone: {plan:?}"
         );
+    }
+    /// #36 over the real apt.dat: every field whose runway ends converge
+    /// (an end within 300 m of another strip's end on a course 10 degrees or
+    /// more away, the LFPB 07/09 shape), a taxi from its stands to each such
+    /// end planned with `plan_to_runway` and the strip, as the station
+    /// plans it. The route must end at the cleared strip's own entrance:
+    /// the lead-on ends on ITS centreline (the line-up's 20 m), never on the
+    /// neighbour's. The same plan without the strip (the old
+    /// nearest-entrance-anywhere rule) is counted beside it.
+    /// Fields are taken longest runway first; `XVL_SWEEP_FIELDS` sets how
+    /// many (default 120).
+    /// `cargo test --release -p atc -- --ignored real_install_converging_thresholds --nocapture`
+    #[test]
+    #[ignore] // needs the real X-Plane install; run with --ignored
+    fn real_install_converging_thresholds_taxi_to_their_own_strip() {
+        let apt =
+            &crate::nav::test_xplane_path("Global Scenery/Global Airports/Earth nav data/apt.dat");
+        if !std::path::Path::new(apt).exists() {
+            return;
+        }
+        let limit: usize = std::env::var("XVL_SWEEP_FIELDS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(120);
+        // (icao, runways, [(strip index, end is b, other strip index)]).
+        type Conv = (String, Vec<Runway>, Vec<(usize, bool, usize)>);
+        let mut fields: Vec<Conv> = Vec::new();
+        let (mut ends_total, mut ends_conv) = (0usize, 0usize);
+        scan_airports(apt, |icao, a| {
+            let rw = a.runways;
+            let mut conv = Vec::new();
+            for (i, r) in rw.iter().enumerate() {
+                for b in [false, true] {
+                    ends_total += 1;
+                    let (lat, lon, hdg) = if b {
+                        (r.lat_b, r.lon_b, r.heading_b_deg())
+                    } else {
+                        (r.lat_a, r.lon_a, r.heading_a_deg())
+                    };
+                    let other = rw.iter().enumerate().filter(|(j, _)| *j != i).find(|(_, o)| {
+                        [(o.lat_a, o.lon_a, o.heading_a_deg()), (o.lat_b, o.lon_b, o.heading_b_deg())]
+                            .iter()
+                            .any(|&(la, lo, h)| {
+                                haversine_nm(lat, lon, la, lo) * 1852.0 <= 300.0
+                                    && angle_diff_deg(h, hdg).abs() >= 10.0
+                            })
+                    });
+                    if let Some((j, _)) = other {
+                        ends_conv += 1;
+                        conv.push((i, b, j));
+                    }
+                }
+            }
+            if !conv.is_empty() {
+                fields.push((icao.to_string(), rw, conv));
+            }
+        })
+        .unwrap();
+        println!(
+            "{ends_conv} of {ends_total} runway ends converge, at {} fields",
+            fields.len()
+        );
+        fields.sort_by(|a, b| {
+            let l = |f: &Conv| f.1.iter().map(Runway::length_m).fold(0.0, f64::max);
+            l(b).total_cmp(&l(a))
+        });
+        // Cross- and along-track of `p` from strip `r`'s centreline, from end A.
+        let track = |r: &Runway, p: (f64, f64)| {
+            let d = haversine_nm(r.lat_a, r.lon_a, p.0, p.1) * 1852.0;
+            let ang = angle_diff_deg(bearing_deg(r.lat_a, r.lon_a, p.0, p.1), r.heading_a_deg())
+                .to_radians();
+            ((d * ang.sin()).abs(), d * ang.cos())
+        };
+        let on_strip = |r: &Runway, p: (f64, f64)| {
+            let (xt, along) = track(r, p);
+            xt <= r.width_m / 2.0 + 15.0 && along >= -15.0 && along <= r.length_m() + 15.0
+        };
+        // Where the drive ends: the lead-on's last point, else the holding
+        // point. Some(true) = our strip's entrance.
+        let judge = |s: &Runway, other: &Runway, plan: &TaxiRoutePlan| -> Option<bool> {
+            let last = plan.lead_on.last().or(plan.path.last()).copied()?;
+            if !plan.lead_on.is_empty() {
+                let ours = track(s, last).0 <= 20.0;
+                let theirs = track(other, last).0 <= 20.0 && on_strip(other, last);
+                return Some(ours || !theirs);
+            }
+            // Untrimmed: the holding point, nearer ours than theirs.
+            Some(track(s, last).0 <= track(other, last).0 || on_strip(s, last))
+        };
+        let (mut routes, mut none, mut ok, mut untrimmed, mut old_wrong) = (0, 0, 0, 0, 0);
+        let (mut with_net, mut wrong, mut thin) = (0usize, Vec::new(), Vec::new());
+        for (icao, rw, conv) in fields.iter().take(limit) {
+            let Ok(Some(net)) = find_taxi_net(apt, icao) else {
+                continue;
+            };
+            if net.stands.is_empty() {
+                continue;
+            }
+            with_net += 1;
+            let n = net.stands.len();
+            let starts: Vec<&Stand> = [0, n / 2, n - 1].iter().map(|&k| &net.stands[k]).collect();
+            for &(i, b, j) in conv {
+                let (s, other) = (&rw[i], &rw[j]);
+                let (end, tlat, tlon) = if b {
+                    (&s.ident_b, s.lat_b, s.lon_b)
+                } else {
+                    (&s.ident_a, s.lat_a, s.lon_a)
+                };
+                let zone = [s.ident_a.clone(), s.ident_b.clone()];
+                let standoff = (s.width_m / 2.0 + 30.0).max(HOLD_SHORT_STANDOFF_M);
+                for st in &starts {
+                    let old = net.plan_to_runway(st.lat, st.lon, tlat, tlon, standoff, &zone, None);
+                    if old.as_ref().and_then(|p| judge(s, other, p)) == Some(false) {
+                        old_wrong += 1;
+                    }
+                    let Some(plan) =
+                        net.plan_to_runway(st.lat, st.lon, tlat, tlon, standoff, &zone, Some(s))
+                    else {
+                        none += 1;
+                        continue;
+                    };
+                    routes += 1;
+                    if judge(s, other, &plan) == Some(true) {
+                        ok += 1;
+                        if plan.lead_on.is_empty() {
+                            untrimmed += 1;
+                        }
+                        continue;
+                    }
+                    let last = plan.lead_on.last().or(plan.path.last()).copied();
+                    // How much of OUR strip the network draws: nodes of
+                    // runway edges along it, and how many a taxiway reaches.
+                    // None reached is thin data: nothing but another
+                    // runway's pavement leads onto it.
+                    let aligned = |e: &&TaxiEdge| {
+                        let (Some(&pa), Some(&pb)) = (net.nodes.get(&e.a), net.nodes.get(&e.b))
+                        else {
+                            return false;
+                        };
+                        let off = angle_diff_deg(bearing_deg(pa.0, pa.1, pb.0, pb.1), s.heading_a_deg())
+                            .abs();
+                        off.min(180.0 - off) <= STRIP_EDGE_ALIGN_DEG
+                    };
+                    let mid_in_rect = |e: &&TaxiEdge| {
+                        let (Some(&pa), Some(&pb)) = (net.nodes.get(&e.a), net.nodes.get(&e.b))
+                        else {
+                            return false;
+                        };
+                        let (xt, along) = track(s, ((pa.0 + pb.0) / 2.0, (pa.1 + pb.1) / 2.0));
+                        xt <= (s.width_m / 2.0).max(15.0) + STRIP_NODE_SHOULDER_M
+                            && along >= -STRIP_NODE_SHOULDER_M
+                            && along <= s.length_m() + STRIP_NODE_SHOULDER_M
+                    };
+                    let own: std::collections::HashSet<i64> = net
+                        .edges
+                        .iter()
+                        .filter(|e| e.runway)
+                        .filter(mid_in_rect)
+                        .filter(aligned)
+                        .flat_map(|e| [e.a, e.b])
+                        .collect();
+                    let rwy_nodes = own.len();
+                    let any_nodes = own
+                        .iter()
+                        .filter(|n| net.edges.iter().any(|e| !e.runway && (e.a == **n || e.b == **n)))
+                        .count();
+                    let list = if any_nodes == 0 { &mut thin } else { &mut wrong };
+                    list.push(format!(
+                        "{icao} {end} [our strip: {rwy_nodes} runway nodes, {any_nodes} on a taxiway] (beside {}/{}) from {}: hold {} lead-on {} pts, end {:?} {:.0} m off ours, {:.0} m off theirs",
+                        other.ident_a,
+                        other.ident_b,
+                        st.name,
+                        plan.holding_point,
+                        plan.lead_on.len(),
+                        last,
+                        last.map_or(f64::NAN, |p| track(s, p).0),
+                        last.map_or(f64::NAN, |p| track(other, p).0),
+                    ));
+                }
+            }
+        }
+        println!(
+            "{with_net} fields with a network and stands: {routes} routes, {ok} on their own strip \
+             ({untrimmed} untrimmed holds nearer their own), {} on the neighbour's, {} on the \
+             neighbour's where no taxiway reaches ours (thin data degrades), \
+             {none} unplanned; the old nearest-anywhere rule: {old_wrong} on the neighbour's",
+            wrong.len(),
+            thin.len()
+        );
+        for w in wrong.iter().chain(&thin) {
+            println!("  {w}");
+        }
+        assert!(routes > 0, "the sweep planned nothing");
+        assert!(wrong.is_empty(), "{} routes end at the neighbour's entrance", wrong.len());
     }
 }
