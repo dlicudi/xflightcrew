@@ -558,6 +558,26 @@ pub fn telemetry() -> Option<PitchTelemetry> {
     g.filter(|(t, _)| now_s() - t <= TELEMETRY_FRESH_S).map(|(_, p)| p)
 }
 
+static SIM_SPEED: std::sync::Mutex<Option<(f64, f64)>> = std::sync::Mutex::new(None);
+
+/// The monitor's latest read of `sim/time/sim_speed` (`None`: unread).
+pub fn publish_sim_speed(v: Option<f64>) {
+    let v = v.filter(|x| x.is_finite());
+    *SIM_SPEED.lock().unwrap_or_else(|e| e.into_inner()) = v.map(|x| (now_s(), x));
+}
+
+/// Fast forward: the check's clock is the wall's, so at 4x it judges four
+/// times the flight in the window, and the autopilot's own lag reads as
+/// running away (EGKK-EGBB 1790675237: a top of descent at 4x overshot to
+/// -4,290 fpm on a -1,822 dial and was stood down as no authority, #181).
+/// A fresh read over this is no measurement.
+const FAST_FORWARD_OVER: f64 = 1.2;
+
+fn fast_forward() -> bool {
+    let g = SIM_SPEED.lock().unwrap_or_else(|e| e.into_inner());
+    g.is_some_and(|(t, v)| now_s() - t <= TELEMETRY_FRESH_S && v > FAST_FORWARD_OVER)
+}
+
 struct Armed {
     source: &'static str,
     check: AuthorityCheck,
@@ -586,7 +606,11 @@ pub fn arm_authority(source: &'static str, vs: f64, dial: f64) {
 pub fn feed_authority(vs: Option<f64>, dial: Option<f64>) -> Option<Authority> {
     let mut g = ARMED.lock().unwrap_or_else(|e| e.into_inner());
     let armed = g.as_mut()?;
-    let v = armed.check.step(now_s(), vs, dial, telemetry());
+    let v = if fast_forward() {
+        Authority::Inconclusive("fast_forward")
+    } else {
+        armed.check.step(now_s(), vs, dial, telemetry())
+    };
     if !v.is_final() {
         return None;
     }

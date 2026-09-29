@@ -4756,6 +4756,7 @@ pub async fn run(
             if let Some(p) = &inputs.pitch {
                 crate::climb_watch::publish_telemetry(p.telemetry());
             }
+            crate::climb_watch::publish_sim_speed(inputs.sim_speed);
             note_interventions(&inputs, flight.control());
             crate::blackbox::record(
                 "state",
