@@ -10580,3 +10580,32 @@ out off a base, on the 2,500 ft platform at 208 to 214 kt. The EGKK I26L join te
 Tests `the_recorded_joins_from_grove_replay_their_times`,
 `the_join_from_grove_is_shorter_and_hands_over_on_the_platform`,
 `the_intercept_room_counts_the_turn_it_flies`. Offline only.
+
+## 2026-09-29: the enroute air start settles before it is ready (#177, reopened)
+
+Second flown air start (build 0a26a46, EGKK-EGBB 30 nm before TOD, the 737 loaded on the EGKK runway
+first) refused "we moved 0.1 miles and 202 feet", then three minutes of slow and fast warnings.
+Blackbox t 1790648833 to 1790649030: the governor WAS armed and ran throughout (throttle full at 20
+kt, idle at 303 kt, following the speed; no record said so, now `speedhold` `governor_started` /
+`governor_stopped`). The speed was lost to the pitch: the setup engaged ALT HOLD
+(`sim/autopilot/altitude_hold`, ap_state 16386) in the placement's zoom (17,813 ft at +4,450 fpm)
+and the hold never arrested it: a phugoid 18,000 to 26,200 ft at up to 20,000 fpm, IAS to 10 kt,
+for three minutes. The first air start (1790635335) zoomed the same way under ALT HOLD; full auto's
+resume took it 2 s later and its VS mode (ap_state 50) stopped the climb at 18,687 ft in 5 s. The
+difference was the resume, not the governor. The refused resume was right: 202 ft in 1.1 s was
+10,600 to 11,900 fpm. The 737's ALT HOLD holds fine when it CAPTURES from VS (every other 737 hold
+in the log); `altitude_hold_ft` is read-only and unlogged, so what the engaged hold held is unknown.
+
+Fixes: the setup engages VS toward the dial (`vertical_toward_dial`: 2 fpm per foot, 300 to 1,500,
+zero inside 50 ft; a hold at the dial or closing inside 300 ft is the capture's and left) and keeps
+the wheel on it; it sets the altimeter for the level (`sync_altimeter` on the plan's transition,
+published as the resume does; blackbox `enroute_altimeter`), and reports ready only settled
+(`SettleJudge`: 150 ft of the dial for 10 s, the governor's target within 10 kt, the altimeter set;
+60 s, else `enroute_settle` lists what did not and `enroute_result` is `unsettled` with the line, so
+the runner stops there). The runner's enroute wait is 360 s. The resume's recheck is judged against
+the first read projected along its track, groundspeed and VSI (`rejoin_unsteady`: 0.5 nm, 200 ft,
+a VSI change over 1,000 fpm or beyond 6,000 is not steady); blackbox `full_auto` `rejoin_unsteady`.
+Tests `the_phugoid_air_start_is_never_called_ready`,
+`a_level_governed_flight_is_ready_after_ten_seconds`,
+`the_vertical_goes_to_the_dial_by_vs_never_an_alt_hold_off_it`, `steady_cruise_is_not_movement`,
+`the_air_starts_zoom_is_still_refused`. Offline only; check `enroute_vertical`, `enroute_settle`.

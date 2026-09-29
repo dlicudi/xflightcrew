@@ -367,6 +367,135 @@ pub struct SetUpEnroute {
     pub ap: Option<crate::tools::autopilot::ApConfig>,
     pub cruise_ias_kts: Option<f64>,
     pub vne_kts: Option<f64>,
+    /// The airframe's transition altitude, where the plan gives none.
+    pub transition_altitude_ft: f64,
+}
+
+/// The new flight is READY only once settled (#177): within this of the
+/// dial, feet...
+pub const SETTLE_ALT_FT: f64 = 150.0;
+/// ...for this long, seconds...
+pub const SETTLE_LEVEL_S: f64 = 10.0;
+/// ...with the governor holding the speed within this, knots, and the
+/// altimeter on the setting owed there...
+pub const SETTLE_IAS_KTS: f64 = 10.0;
+/// ...or, after this long, what did not settle is said and put on file.
+pub const SETTLE_MAX_S: f64 = 60.0;
+/// The VS wheel toward the dial: fpm per foot off, and its bounds.
+const SETTLE_VS_PER_FT: f64 = 2.0;
+const SETTLE_VS_MIN_FPM: f64 = 300.0;
+const SETTLE_VS_MAX_FPM: f64 = 1_500.0;
+/// Inside this of the dial the wheel is zero, feet.
+const SETTLE_VS_ZERO_FT: f64 = 50.0;
+
+/// One look at the new flight while it settles.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SettleSample {
+    /// Seconds since the settle began.
+    pub t_s: f64,
+    pub alt_ft: f64,
+    pub ias_kts: f64,
+    /// The governor's target; `None`: no governor holds the speed.
+    pub governed_kts: Option<f64>,
+    /// The altimeter reads the setting owed; `None`: unread.
+    pub altimeter_ok: Option<bool>,
+}
+
+/// What the settle came to.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Settle {
+    Settling,
+    Settled,
+    /// Out of time: what did not settle, each with its number.
+    Unsettled(Vec<String>),
+}
+
+/// Judges [`SettleSample`]s against the dial: level within
+/// [`SETTLE_ALT_FT`] for [`SETTLE_LEVEL_S`], speed governed within
+/// [`SETTLE_IAS_KTS`], altimeter set; bounded by [`SETTLE_MAX_S`].
+#[derive(Debug, Default)]
+pub struct SettleJudge {
+    level_since: Option<f64>,
+}
+
+impl SettleJudge {
+    pub fn step(&mut self, dial_ft: f64, s: &SettleSample) -> Settle {
+        let off = s.alt_ft - dial_ft;
+        self.level_since = match off.abs() <= SETTLE_ALT_FT {
+            true => self.level_since.or(Some(s.t_s)),
+            false => None,
+        };
+        let level_s = self.level_since.map_or(0.0, |t| s.t_s - t);
+        let speed_off = s.governed_kts.map(|g| s.ias_kts - g);
+        let speed = speed_off.is_some_and(|o| o.abs() <= SETTLE_IAS_KTS);
+        if level_s >= SETTLE_LEVEL_S && speed && s.altimeter_ok == Some(true) {
+            return Settle::Settled;
+        }
+        if s.t_s < SETTLE_MAX_S {
+            return Settle::Settling;
+        }
+        let mut why = Vec::new();
+        if off.abs() > SETTLE_ALT_FT {
+            why.push(format!("{:.0} feet off the {:.0} dial", off.abs(), dial_ft));
+        } else if level_s < SETTLE_LEVEL_S {
+            why.push(format!("level only {level_s:.0} seconds"));
+        }
+        match (s.governed_kts, speed) {
+            (None, _) => why.push("no speed hold".to_string()),
+            (Some(g), false) => why.push(format!("{:.0} knots against {g:.0}", s.ias_kts)),
+            _ => {}
+        }
+        match s.altimeter_ok {
+            Some(true) => {}
+            Some(false) => why.push("the altimeter is not set".to_string()),
+            None => why.push("the altimeter is unread".to_string()),
+        }
+        Settle::Unsettled(why)
+    }
+}
+
+/// The line (and the result's `why`) for a flight that did not settle.
+pub fn unsettled_line(why: &[String]) -> String {
+    format!(
+        "it has not settled after {SETTLE_MAX_S:.0} seconds: {}. The autopilot has it; I \
+         haven't called it ready.",
+        why.join(", ")
+    )
+}
+
+/// The vertical mode while the new flight settles.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Vertical {
+    /// The autopilot's altitude hold has the dial: leave it.
+    Leave,
+    /// VS mode at this rate (fpm, the wheel's 100 fpm clicks) toward the
+    /// dial, the dial armed for the capture.
+    Vs(f64),
+}
+
+/// Toward the dial by VS, the follower's way, never by an ALT HOLD engaged
+/// off it: after the air start the 737's hold, engaged in the placement's
+/// zoom at 4,450 fpm, flew a phugoid from 18,000 to 26,200 ft for three
+/// minutes (#177, 2026-09-29); the same zoom in the first air start stopped
+/// within 5 s of the follower's VS (1790635335). A hold at the dial, or
+/// closing on it inside [`crate::procedure::ALT_HOLD_LEAVE_FT`], is the
+/// capture's own and is left. Pure.
+pub fn vertical_toward_dial(
+    alt_ft: f64,
+    dial_ft: f64,
+    rate_fpm: f64,
+    alt_hold_on: bool,
+) -> Vertical {
+    let off = dial_ft - alt_ft;
+    let closing = off * rate_fpm > 0.0 && off.abs() <= crate::procedure::ALT_HOLD_LEAVE_FT;
+    if alt_hold_on && (off.abs() <= SETTLE_ALT_FT || closing) {
+        return Vertical::Leave;
+    }
+    if off.abs() <= SETTLE_VS_ZERO_FT {
+        return Vertical::Vs(0.0);
+    }
+    let rate = (off.abs() * SETTLE_VS_PER_FT).clamp(SETTLE_VS_MIN_FPM, SETTLE_VS_MAX_FPM);
+    Vertical::Vs(crate::procedure::vs_dial_fpm(rate.copysign(off)))
 }
 
 /// Say a refusal and put it on file, so the sortie runner can name it.
@@ -483,6 +612,15 @@ impl Tool for SetUpEnroute {
         );
         // The new flight ends this one: nothing may keep flying it.
         crate::flight_state::stand_down();
+        // The flight's transition, as the resume publishes it: the altimeter
+        // is set to it at the settle and the monitor checks against it.
+        crate::tools::instruments::publish_flight_transition(Some(
+            crate::tools::instruments::FlightTransition {
+                altitude_ft: plan.transition_altitude_ft,
+                level_ft: plan.transition_level_ft,
+                descending: false,
+            },
+        ));
         let job = EnrouteJob {
             base: ctx.config.xplane_base_url.clone(),
             voice: ctx.voice.cloned(),
@@ -490,6 +628,7 @@ impl Tool for SetUpEnroute {
             placement: p.clone(),
             words: words.clone(),
             ap,
+            transition_ft: self.transition_altitude_ft,
         };
         let loading = super::setup::Loading::begin();
         super::setup::spawn_off_loop(enroute_follow_up(job, loading));
@@ -508,11 +647,15 @@ struct EnrouteJob {
     placement: Placement,
     words: String,
     ap: crate::tools::autopilot::ApConfig,
+    /// The airframe's transition altitude, where the plan gives none.
+    transition_ft: f64,
 }
 
 const CMD_SERVOS_ON: &str = "sim/autopilot/servos_on";
 const CMD_HDG_MODE: &str = "sim/autopilot/heading";
-const CMD_ALT_HOLD: &str = "sim/autopilot/altitude_hold";
+const CMD_VS_MODE: &str = "sim/autopilot/vertical_speed";
+const VS_STATUS: &str = "sim/cockpit2/autopilot/vvi_status";
+const VS_DIAL: &str = "sim/cockpit/autopilot/vertical_velocity";
 const HDG_BUG: &str = "sim/cockpit2/autopilot/heading_dial_deg_mag_pilot";
 const ALT_DIAL: &str = "sim/cockpit2/autopilot/altitude_dial_ft";
 const ALT_HOLD_STATUS: &str = "sim/cockpit2/autopilot/altitude_hold_status";
@@ -524,12 +667,13 @@ struct Engaged {
     servos: bool,
     tries: u32,
     heading: bool,
-    altitude: bool,
+    /// VS mode, or the capture's altitude hold, reads engaged.
+    vertical: bool,
 }
 
 /// The heading bug and the altitude dial to the placement, then the servos
 /// pressed until they READ on with the sim live (`ApEngage`, as autoland
-/// engages after its setup), then heading and altitude hold, each read
+/// engages after its setup), then heading and VS toward the dial, each read
 /// back. At most `ENGAGE_GIVE_UP_S` of live flight.
 async fn engage(xp: &crate::xplane::XPlaneClient, job: &EnrouteJob) -> Engaged {
     use crate::autoland::ApEngage;
@@ -578,17 +722,107 @@ async fn engage(xp: &crate::xplane::XPlaneClient, job: &EnrouteJob) -> Engaged {
         let _ = xp.run_command(CMD_HDG_MODE).await;
     }
     let _ = xp.set_float(ALT_DIAL, p.alt_ft).await;
-    if xp.get_float(ALT_HOLD_STATUS).await.is_ok_and(|v| v <= 0.5) {
-        let _ = xp.run_command(CMD_ALT_HOLD).await;
+    // The vertical by VS toward the dial, never ALT HOLD off the zoom
+    // (`vertical_toward_dial`); the settle keeps the wheel on it.
+    let alt = xp.get_float(crate::datarefs::ALTITUDE_FT).await.unwrap_or(p.alt_ft);
+    if let Vertical::Vs(rate) = vertical_toward_dial(alt, p.alt_ft, 0.0, false) {
+        if xp.get_float(VS_STATUS).await.is_ok_and(|v| v <= 0.5) {
+            let _ = xp.run_command(CMD_VS_MODE).await;
+        }
+        let _ = xp.set_float(VS_DIAL, rate).await;
     }
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-    let (hdg, alt) = tokio::join!(
+    let (hdg, vs, alt) = tokio::join!(
         xp.get_float(crate::datarefs::HEADING_STATUS),
+        xp.get_float(VS_STATUS),
         xp.get_float(ALT_HOLD_STATUS),
     );
     out.heading = hdg.is_ok_and(|v| v > 0.5);
-    out.altitude = alt.is_ok_and(|v| v > 0.5);
+    out.vertical = vs.is_ok_and(|v| v > 0.5) || alt.is_ok_and(|v| v > 1.5);
     out
+}
+
+/// The dial the new flight settles on, the governor's speed and the
+/// altimeter: the vertical kept toward the dial by VS until the capture has
+/// it ([`vertical_toward_dial`]), judged by [`SettleJudge`] every half
+/// second, at most [`SETTLE_MAX_S`]. Each change of the vertical is
+/// blackboxed (`enroute_vertical`), the end too (`enroute_settle`).
+async fn settle(
+    xp: &crate::xplane::XPlaneClient,
+    dial_ft: f64,
+    altimeter_ok: Option<bool>,
+) -> Settle {
+    let t0 = std::time::Instant::now();
+    let mut judge = SettleJudge::default();
+    let mut last: Option<Vertical> = None;
+    let mut last_sample = None;
+    loop {
+        let (alt, ias, vvi, vs_st, hold_st) = tokio::join!(
+            xp.get_float(crate::datarefs::ALTITUDE_FT),
+            xp.get_float(crate::datarefs::AIRSPEED_KTS),
+            xp.get_float(crate::datarefs::VVI_FPM),
+            xp.get_float(VS_STATUS),
+            xp.get_float(ALT_HOLD_STATUS),
+        );
+        let t_s = t0.elapsed().as_secs_f64();
+        // A failed read is no measurement: the tick is skipped, the clock
+        // still runs.
+        if let Some([alt, ias, vvi]) = crate::control::measurements("setup", [alt, ias, vvi]) {
+            let hold_on = hold_st.is_ok_and(|v| v > 1.5);
+            let want = vertical_toward_dial(alt, dial_ft, vvi, hold_on);
+            if let Vertical::Vs(rate) = want {
+                let vs_off = vs_st.is_ok_and(|v| v <= 0.5);
+                if vs_off {
+                    let _ = xp.run_command(CMD_VS_MODE).await;
+                }
+                if last != Some(want) || vs_off {
+                    let _ = xp.set_float(VS_DIAL, rate).await;
+                }
+            }
+            if last != Some(want) {
+                crate::blackbox::record(
+                    "setup",
+                    json!({ "event": "enroute_vertical", "action": format!("{want:?}"),
+                            "alt_ft": alt, "dial": dial_ft, "vvi": vvi, "hold": hold_on,
+                            "t_s": t_s }),
+                );
+                last = Some(want);
+            }
+            let sample = SettleSample {
+                t_s,
+                alt_ft: alt,
+                ias_kts: ias,
+                governed_kts: crate::tools::speedhold::flight_target(),
+                altimeter_ok,
+            };
+            last_sample = Some(sample);
+            let verdict = judge.step(dial_ft, &sample);
+            if verdict != Settle::Settling {
+                record_settle(&verdict, dial_ft, Some(&sample));
+                return verdict;
+            }
+        } else if t_s >= SETTLE_MAX_S {
+            let verdict = Settle::Unsettled(vec!["the sim did not answer".to_string()]);
+            record_settle(&verdict, dial_ft, last_sample.as_ref());
+            return verdict;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+}
+
+fn record_settle(verdict: &Settle, dial_ft: f64, s: Option<&SettleSample>) {
+    let unsettled = match verdict {
+        Settle::Unsettled(why) => why.clone(),
+        _ => Vec::new(),
+    };
+    crate::blackbox::record(
+        "setup",
+        json!({ "event": "enroute_settle", "settled": *verdict == Settle::Settled,
+                "unsettled": unsettled, "dial": dial_ft, "t_s": s.map(|s| s.t_s),
+                "alt_ft": s.map(|s| s.alt_ft), "ias_kts": s.map(|s| s.ias_kts),
+                "governed_kts": s.and_then(|s| s.governed_kts),
+                "altimeter_ok": s.and_then(|s| s.altimeter_ok) }),
+    );
 }
 
 /// Gear up and flaps in, each only when it reads otherwise, read back.
@@ -690,12 +924,38 @@ async fn enroute_follow_up(job: EnrouteJob, loading: super::setup::Loading) {
                 .await;
         }
     }
+    // Ready only once settled (#177): the altimeter on the setting owed at
+    // the level (standard above the transition), then the level and the
+    // governed speed held.
+    let settled = match engaged.servos {
+        true => {
+            let sync = crate::tools::instruments::sync_altimeter(&xp, job.transition_ft).await;
+            if let Some(s) = &sync {
+                crate::blackbox::record(
+                    "setup",
+                    json!({ "event": "enroute_altimeter", "was": s.was, "now": s.now,
+                            "want": s.want, "took": s.took() }),
+                );
+            }
+            settle(&xp, p.alt_ft, sync.map(|s| s.took())).await
+        }
+        false => Settle::Settling,
+    };
+    let unsettled = match &settled {
+        Settle::Unsettled(why) => Some(unsettled_line(why)),
+        _ => None,
+    };
+    let outcome = match unsettled {
+        Some(_) => "unsettled",
+        None => run.outcome.name(),
+    };
     drop(loading);
     crate::blackbox::record(
         "setup",
-        json!({ "event": "enroute_result", "outcome": run.outcome.name(), "result": result,
-                "engaged": engaged.servos, "tries": engaged.tries,
-                "hdg_mode": engaged.heading, "alt_hold": engaged.altitude,
+        json!({ "event": "enroute_result", "outcome": outcome, "result": result,
+                "engaged": engaged.servos, "tries": engaged.tries, "why": unsettled,
+                "settled": settled == Settle::Settled,
+                "hdg_mode": engaged.heading, "vertical": engaged.vertical,
                 "gear_up": gear_up, "flaps_up": flaps_up,
                 "ias_kts": p.ias_kts, "alt_ft": p.alt_ft, "next_fix": p.next_fix,
                 "station": station.as_ref().map(|s| &s.icao),
@@ -705,7 +965,9 @@ async fn enroute_follow_up(job: EnrouteJob, loading: super::setup::Loading) {
                 "squawk_set": xpdr.0, "alt_mode": xpdr.1, "station_up": station_up,
                 "ms": t0.elapsed().as_millis() as u64 }),
     );
-    let line = if engaged.servos {
+    let line = if let Some(why) = unsettled {
+        format!("Enroute {}, but {why}", job.words)
+    } else if engaged.servos {
         format!(
             "Enroute {}, {} and {:.0} knots, heading for {}. Autopilot holding. Say fly the \
              flight plan and I'll take it.",
@@ -909,5 +1171,104 @@ mod tests {
         ] {
             assert!(crate::grammar::enroute_setup_call(t).is_none(), "{t}");
         }
+    }
+
+    /// #177, the second flown air start (2026-09-29, state records from
+    /// the enroute_result at t 1790648838.5, every five seconds): seconds,
+    /// feet, knots, fpm. ALT HOLD engaged in the zoom, the governor at 296
+    /// and full power, the altimeter at 30.03 at FL180.
+    const PHUGOID: [(f64, f64, f64, f64); 14] = [
+        (0.0, 18155.0, 268.0, 9310.0),
+        (4.8, 19184.0, 231.0, 15897.0),
+        (9.4, 20497.0, 192.0, 18086.0),
+        (14.1, 21881.0, 150.0, 16934.0),
+        (18.9, 23110.0, 104.0, 12920.0),
+        (23.6, 23918.0, 61.0, 7433.0),
+        (28.5, 24243.0, 20.0, 481.0),
+        (33.3, 23997.0, 39.0, -6490.0),
+        (38.0, 23166.0, 119.0, -14965.0),
+        (42.7, 21785.0, 178.0, -19209.0),
+        (47.5, 20334.0, 228.0, -15935.0),
+        (52.1, 19516.0, 255.0, -4309.0),
+        (56.7, 19730.0, 253.0, 9883.0),
+        (61.5, 20985.0, 223.0, 20282.0),
+    ];
+
+    /// That flight was called ready at +14 s. Judged by the settle it is
+    /// never settled, and at a minute it names all three things.
+    #[test]
+    fn the_phugoid_air_start_is_never_called_ready() {
+        let mut j = SettleJudge::default();
+        let mut end = Settle::Settling;
+        for (t_s, alt_ft, ias_kts, _) in PHUGOID {
+            let s = SettleSample {
+                t_s,
+                alt_ft,
+                ias_kts,
+                governed_kts: Some(296.0),
+                altimeter_ok: Some(false),
+            };
+            end = j.step(18_000.0, &s);
+            if t_s < SETTLE_MAX_S {
+                assert_eq!(end, Settle::Settling, "{t_s}");
+            }
+        }
+        let Settle::Unsettled(why) = end else { panic!("{end:?}") };
+        assert_eq!(
+            why,
+            vec![
+                "2985 feet off the 18000 dial".to_string(),
+                "223 knots against 296".to_string(),
+                "the altimeter is not set".to_string(),
+            ]
+        );
+        let line = unsettled_line(&why);
+        assert!(line.starts_with("it has not settled after 60 seconds: 2985 feet"), "{line}");
+        assert!(!line.contains('\u{2014}') && !line.contains('\u{2013}'));
+    }
+
+    /// A flight at the dial, the speed governed and standard set, is ready
+    /// after ten seconds level and not before; leaving the band restarts it.
+    #[test]
+    fn a_level_governed_flight_is_ready_after_ten_seconds() {
+        let mut j = SettleJudge::default();
+        let s = |t_s: f64, alt_ft: f64, ias_kts: f64| SettleSample {
+            t_s,
+            alt_ft,
+            ias_kts,
+            governed_kts: Some(296.0),
+            altimeter_ok: Some(true),
+        };
+        assert_eq!(j.step(18_000.0, &s(0.0, 18_120.0, 290.0)), Settle::Settling);
+        assert_eq!(j.step(18_000.0, &s(6.0, 18_200.0, 290.0)), Settle::Settling);
+        assert_eq!(j.step(18_000.0, &s(7.0, 18_060.0, 280.0)), Settle::Settling);
+        assert_eq!(j.step(18_000.0, &s(16.5, 17_950.0, 285.0)), Settle::Settling);
+        assert_eq!(j.step(18_000.0, &s(17.0, 17_990.0, 287.0)), Settle::Settled);
+        // Level but with nobody on the speed, or the altimeter unread: no.
+        let mut k = SettleJudge::default();
+        let bare = |t_s| SettleSample { governed_kts: None, ..s(t_s, 18_000.0, 296.0) };
+        assert_eq!(k.step(18_000.0, &bare(0.0)), Settle::Settling);
+        assert_eq!(k.step(18_000.0, &bare(30.0)), Settle::Settling);
+        let Settle::Unsettled(why) = k.step(18_000.0, &bare(60.0)) else { panic!() };
+        assert_eq!(why, vec!["no speed hold".to_string()]);
+    }
+
+    /// The vertical from the same records: toward the dial by VS at the
+    /// engage (17,813 ft climbing), back down by VS once the hold ran
+    /// through the dial, and a hold AT the dial or closing on it left alone.
+    #[test]
+    fn the_vertical_goes_to_the_dial_by_vs_never_an_alt_hold_off_it() {
+        assert_eq!(vertical_toward_dial(17_813.0, 18_000.0, 4_450.0, false), Vertical::Vs(400.0));
+        // PHUGOID +0: 155 ft through the dial at 9,310 fpm under ALT HOLD.
+        let (_, alt, _, vvi) = PHUGOID[0];
+        assert_eq!(vertical_toward_dial(alt, 18_000.0, vvi, true), Vertical::Vs(-300.0));
+        // +9.4: 2,497 ft over, the wheel at its bound.
+        let (_, alt, _, vvi) = PHUGOID[2];
+        assert_eq!(vertical_toward_dial(alt, 18_000.0, vvi, true), Vertical::Vs(-1_500.0));
+        assert_eq!(vertical_toward_dial(18_090.0, 18_000.0, -200.0, true), Vertical::Leave);
+        assert_eq!(vertical_toward_dial(18_250.0, 18_000.0, -900.0, true), Vertical::Leave);
+        assert_eq!(vertical_toward_dial(18_250.0, 18_000.0, 900.0, true), Vertical::Vs(-500.0));
+        assert_eq!(vertical_toward_dial(18_030.0, 18_000.0, 0.0, false), Vertical::Vs(0.0));
+        assert_eq!(vertical_toward_dial(17_900.0, 18_000.0, 0.0, false), Vertical::Vs(300.0));
     }
 }

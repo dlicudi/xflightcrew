@@ -577,7 +577,8 @@ everything blackboxes to `logs/blackbox.jsonl` (kinds: `atc`, `autotaxi`, `autot
   (`LXGB_ROCK_CLEAR_M`).
 - Full auto: engine start per class (`StartKind`); power-up INLINE (racing bring-ups shut a
   cross-tie); waits on `driving()`, not `ACTIVE`; airborne, "fly the flight plan" is the checked
-  RESUME of the plan on the shelf (`resume_gate`, `resume_join`; #67); ends with
+  RESUME of the plan on the shelf (`resume_gate`, `resume_join`; #67), its recheck judged against
+  the first read's own track and level, never raw movement (`rejoin_unsteady`; #177); ends with
   `taxi_in_after_landing`. **A resume past the route near the destination is the
   arrival** (`resume_join`, `ARRIVAL_REJOIN_NM`, autoland on the plan's runway); every refusal names
   its number. Cruise is a SPEED: the OFP's on its cruise legs
@@ -1145,8 +1146,12 @@ confirms it closes it (`fixes #N` in the commit). Known gaps are `owed` issues.
   plan" (the airborne resume). `setup_enroute::place`: on the leg, the plan's altitude (the
   navlog's own TOD position, never `tod_to_dest_nm`, which is the arrival as flown), the OFP's
   IAS, `lle_air_start` through the mailbox; the follow-up retires the last flight, confirms the
-  servos (`ApEngage`), HDG and ALT HOLD, the governor, and hands the world an IFR flight mid-route
-  (`station::arm_new_flight_enroute`: the code kept, the nearest RADAR unit, COM1 on it; #177). Its
+  servos (`ApEngage`), HDG and VS TOWARD THE DIAL (never ALT HOLD off the placement's zoom:
+  a phugoid to 26,200 ft, `vertical_toward_dial`), the governor, and hands the world an IFR flight
+  mid-route (`station::arm_new_flight_enroute`: the code kept, the nearest RADAR unit, COM1 on it;
+  #177). **Ready only once settled** (`SettleJudge`: 150 ft of the dial for 10 s, the governor
+  within 10 kt, the altimeter set for the level; 60 s, else `enroute_settle` names what did not and
+  the result is `unsettled`). Its
   cruise may be fast-forwarded only by `sim_speed` steps, through the same guard.
   **Fast forward only where the laws tolerate it** (`SpeedGuard`; our ticks are wall time, so 4x is
   4x the gain and delay): a step or the case's `sim_speed: N` is what the spec WANTS; the runner flies
