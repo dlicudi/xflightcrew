@@ -41,6 +41,9 @@ pub const ANSWER_WAIT: Duration = Duration::from_millis(2500);
 pub enum GoAroundBy {
     Tower,
     Pilot,
+    /// The circuit's own: a final still too high to hand over (#188,
+    /// `circuit::final_high_give_up`). No order to answer.
+    Crew,
 }
 
 impl GoAroundBy {
@@ -49,6 +52,7 @@ impl GoAroundBy {
         match self {
             GoAroundBy::Tower => "tower",
             GoAroundBy::Pilot => "pilot",
+            GoAroundBy::Crew => "crew",
         }
     }
 }
