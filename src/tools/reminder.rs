@@ -330,39 +330,45 @@ fn arm_waypoint(
     });
 }
 
-/// Destination position and the TOD ring (nm before the destination), resolved
-/// from the SimBrief plan: its planned TOD if the navlog has one, else the
-/// cruise-altitude rule of thumb. `None` if there's no plan to work from.
-async fn tod_ring(simbrief_id: &str) -> Option<(f64, f64, f64)> {
+/// The plan's legs and its TOD ring (nm to go along them at the top of
+/// descent, `plan::tod_ring_nm`), resolved from the SimBrief plan. `None` if
+/// there's no plan to work from.
+async fn tod_ring(simbrief_id: &str) -> Option<(Vec<(f64, f64)>, f64)> {
     if simbrief_id.trim().is_empty() {
         return None;
     }
     let fp = crate::simbrief::fetch(simbrief_id).await.ok()?;
-    let dest = fp.waypoints.last()?;
-    let ring_nm = if fp.tod_to_dest_nm > 0.0 {
-        fp.tod_to_dest_nm
-    } else {
-        fp.cruise_alt_ft / 1000.0 * crate::TOD_NM_PER_1000FT
-    };
-    Some((dest.lat, dest.lon, ring_nm))
+    let route: Vec<(f64, f64)> = fp.waypoints.iter().map(|w| (w.lat, w.lon)).collect();
+    if route.is_empty() {
+        return None;
+    }
+    let ring_nm = crate::plan::tod_ring_nm(&fp, &route);
+    Some((route, ring_nm))
 }
 
-/// Distance to TOD this instant: the FMS's own VNAV TOD if it has one, else our
-/// distance to the destination minus the precomputed ring. `None` if unknowable.
-async fn dist_to_tod(xp: &XPlaneClient, ring: Option<(f64, f64, f64)>) -> Option<f64> {
+/// Distance to TOD this instant: the FMS's own VNAV TOD if it has one, else the
+/// miles still to fly along the plan's legs minus the precomputed ring (#109:
+/// the straight line to the field against an along-route ring called it
+/// early on any winding route). `None` if unknowable.
+async fn dist_to_tod(xp: &XPlaneClient, ring: Option<&(Vec<(f64, f64)>, f64)>) -> Option<f64> {
     if let Ok(d) = xp.get_float(TOD_DIST).await {
         if d > 0.0 {
             return Some(d);
         }
     }
-    let (dlat, dlon, ring_nm) = ring?;
+    let (route, ring_nm) = ring?;
     let (lat, lon) = (xp.get_float(LAT).await.ok()?, xp.get_float(LON).await.ok()?);
-    Some(crate::nav::haversine_nm(lat, lon, dlat, dlon) - ring_nm)
+    let to_go = crate::monitor::route_remaining_nm(route, lat, lon).or_else(|| {
+        route
+            .last()
+            .map(|d| crate::nav::haversine_nm(lat, lon, d.0, d.1))
+    })?;
+    Some(to_go - ring_nm)
 }
 
 fn arm_tod(
     base: String,
-    ring: Option<(f64, f64, f64)>,
+    ring: Option<(Vec<(f64, f64)>, f64)>,
     life: Life,
     voice: Option<Voice>,
     status: Option<StatusSink>,
@@ -380,7 +386,7 @@ fn arm_tod(
             if life.cancelled() {
                 return;
             }
-            if let Some(d) = dist_to_tod(&xp, ring).await {
+            if let Some(d) = dist_to_tod(&xp, ring.as_ref()).await {
                 if d > 2.0 {
                     seen_ahead = true;
                 } else if seen_ahead {

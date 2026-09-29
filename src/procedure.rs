@@ -4634,6 +4634,94 @@ mod tests {
         assert_eq!(speed_protected_vs(-2000.0, Some(25.0), 0.0), 0.0);
     }
 
+    /// #104 replayed from the recorded sortie itself (EGKK 26L, stock 737,
+    /// `logs/sorties/1790510400-full_auto.jsonl`; not in the repo, so
+    /// ignored): every `state` tick while the flown speedbrake was out,
+    /// judged by `drag_barred` with the 737 profile's own detents and the
+    /// gear from the `map_config` records. As flown it stayed out 57 s with
+    /// gear down and flap past the first detent and was put out again at
+    /// flaps 40; by the rule it goes in on the first tick the gear or flaps
+    /// say so and the re-deployment is refused.
+    /// `XVL_SORTIE_DIR` overrides where the sortie file is looked for.
+    /// `cargo test --release -- --ignored real_sortie_speedbrake_barred --nocapture`
+    #[test]
+    #[ignore] // needs the recorded sortie; run with --ignored
+    fn real_sortie_speedbrake_barred_by_gear_and_flap() {
+        const SORTIE: &str = "1790510400-full_auto.jsonl";
+        let dirs = [
+            std::env::var("XVL_SORTIE_DIR").unwrap_or_default(),
+            format!("{}/logs/sorties", env!("CARGO_MANIFEST_DIR")),
+            format!("{}/GitHub/xvoicelayer/logs/sorties", std::env::var("HOME").unwrap_or_default()),
+        ];
+        let Some(text) = dirs
+            .iter()
+            .filter(|d| !d.is_empty())
+            .find_map(|d| std::fs::read_to_string(format!("{d}/{SORTIE}")).ok())
+        else {
+            return;
+        };
+        let t0 = 1_790_510_400.0;
+        let recs: Vec<serde_json::Value> =
+            text.lines().filter_map(|l| serde_json::from_str(l).ok()).collect();
+        let limits: Vec<(f64, Option<f64>)> = crate::aircraft::load("boeing_737_800")
+            .and_then(|p| p.flaps)
+            .expect("the 737's flaps")
+            .detents
+            .iter()
+            .map(|d| (d.ratio, d.vfe_kts))
+            .collect();
+        let t = |r: &serde_json::Value| r["t"].as_f64().unwrap_or(0.0) - t0;
+        let gear_down_at = recs
+            .iter()
+            .filter(|r| r["event"] == "map_config" && r["gear"] == true)
+            .map(t)
+            .fold(f64::INFINITY, f64::min);
+        // The brake as flown: (time, out).
+        let brake: Vec<(f64, bool)> = recs
+            .iter()
+            .filter(|r| r["kind"] == "procedure" && r["event"] == "speedbrake")
+            .map(|r| (t(r), r["out"] == true))
+            .collect();
+        let out_at = |at: f64| brake.iter().filter(|(bt, _)| *bt <= at).last().is_some_and(|b| b.1);
+        let (mut barred_out_s, mut first_barred, mut last_t) = (0.0, None, None::<f64>);
+        for r in recs.iter().filter(|r| r["kind"] == "state") {
+            let (at, flap) = (t(r), r["flap"].as_f64().unwrap_or(0.0));
+            let why = drag_barred(flap, at >= gear_down_at, &limits);
+            if out_at(at) && why.is_some() {
+                if let Some(prev) = last_t {
+                    barred_out_s += at - prev;
+                }
+                first_barred.get_or_insert((at, why.unwrap(), flap));
+                last_t = Some(at);
+            } else {
+                last_t = None;
+            }
+        }
+        let stowed = brake.iter().find(|(bt, out)| *bt > gear_down_at && !out).map(|b| b.0);
+        let redeployed: Vec<f64> =
+            brake.iter().filter(|(bt, out)| *bt > gear_down_at && *out).map(|b| b.0).collect();
+        println!(
+            "gear down +{gear_down_at:.1}; as flown out while barred {barred_out_s:.0} s, first barred \
+             tick {first_barred:?}, stowed +{stowed:?}, put out again at {redeployed:?}"
+        );
+        let (first_at, _, _) = first_barred.expect("the brake was out with gear or flap");
+        assert!(barred_out_s > 30.0, "{barred_out_s}");
+        // The rule stows it at the first barred tick, within a tick of the gear.
+        assert!(first_at - gear_down_at < 2.0, "+{first_at:.1}");
+        assert!(stowed.is_some_and(|s| s > first_at + 30.0), "as flown it stayed out");
+        // Every re-deployment after the gear came down is refused.
+        for at in &redeployed {
+            let flap = recs
+                .iter()
+                .filter(|r| r["kind"] == "state" && t(r) <= *at)
+                .last()
+                .and_then(|r| r["flap"].as_f64())
+                .unwrap_or(0.0);
+            assert!(drag_barred(flap, true, &limits).is_some(), "+{at:.1} at flap {flap}");
+        }
+        assert!(!redeployed.is_empty(), "the sortie's re-deployment at flaps 40");
+    }
+
     /// EGKK-EGBB, 2026-09-27 (sortie 1790541304-full_auto, #126), the
     /// approach at 210.25 kt: (seconds after +2600, the state records' IAS,
     /// the VS law's command rebuilt from the leg records' altitude and

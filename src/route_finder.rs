@@ -15,7 +15,8 @@
 //!   file the sim ships (`airspace.txt`, the one the circuit already reads,
 //!   P/R/Q only), checked along the line at the altitude the flight will be
 //!   at there. A volume in the way is flown round on the shortest path past
-//!   its convex hull, [`DOGLEG_MARGIN_NM`] clear, within
+//!   its convex hull, turning [`DOGLEG_MARGIN_NM`] clear of it and about
+//!   [`CHORD_CLEAR_FRACTION`] of that clear between turns, within
 //!   [`DOGLEG_MAX_DETOUR`] of direct. A volume the bound will not allow is
 //!   flown through and NAMED in the brief; a volume holding either field
 //!   (the flight starts or ends in it) is set aside and blackboxed.
@@ -55,8 +56,15 @@ pub const DOGLEG_MARGIN_NM: f64 = 2.0;
 /// Volumes routed round at once, and the lazy loop's passes.
 const DOGLEG_MAX_OBSTACLES: usize = 12;
 const DOGLEG_MAX_PASSES: usize = 24;
-/// The conflict check's step along the path, nm.
-const PATH_STEP_NM: f64 = 1.0;
+/// The conflict check's step along the path, nm. A mile stepped over the
+/// small ones: the #74 sweep over the real `airspace.txt`
+/// (`real_install_dog_legs_go_round_or_name_it`) found direct lines flown
+/// silently through R 63 and R 118 and dog-legs grazing parachute and
+/// aerobatic boxes a mile step never sampled.
+const PATH_STEP_NM: f64 = 0.25;
+/// How much of [`DOGLEG_MARGIN_NM`] a leg between two corners keeps from the
+/// hull it passes (the corners keep all of it).
+const CHORD_CLEAR_FRACTION: f64 = 0.75;
 /// Named turn points: XVLD1..XVLD9 (five characters, like the arm's XVLCR).
 const DOGLEG_MAX_TURNS: usize = 9;
 
@@ -664,9 +672,27 @@ fn visibility_path(
             }
         }
     }
+    // A leg between two offset corners is a CHORD of the offset ring and
+    // cuts back toward the hull: tested against the bare hull, EBAW-LFYG
+    // (#74 sweep) passed R 77's edge at 0.05 nm between two corners 2 nm
+    // out. Legs are tested against the hull pushed out by
+    // `CHORD_CLEAR_FRACTION` of the margin, so every leg keeps at least that
+    // (the corners keep the whole margin); the bare hull where a field sits
+    // inside the wider one (the flight starts or ends that close).
+    let walls: Vec<Vec<(f64, f64)>> = hulls
+        .iter()
+        .map(|h| {
+            let w = offset_hull(h, margin * CHORD_CLEAR_FRACTION);
+            if inside_convex(&w, o) || inside_convex(&w, d) {
+                h.clone()
+            } else {
+                w
+            }
+        })
+        .collect();
     let n = nodes.len();
     let visible =
-        |i: usize, j: usize| !hulls.iter().any(|h| segment_crosses(h, nodes[i], nodes[j]));
+        |i: usize, j: usize| !walls.iter().any(|h| segment_crosses(h, nodes[i], nodes[j]));
     let len = |i: usize, j: usize| {
         let (dx, dy) = (nodes[j].0 - nodes[i].0, nodes[j].1 - nodes[i].1);
         (dx * dx + dy * dy).sqrt()
@@ -776,12 +802,27 @@ pub fn dog_leg(o: (f64, f64), d: (f64, f64), spaces: &[Airspace], profile: &Prof
     let mut at_fields: Vec<String> = Vec::new();
     let mut active: Vec<usize> = Vec::new();
     let mut path = vec![o, d];
-    let give_up = |skip: &HashSet<usize>, at_fields: Vec<String>| {
-        // Direct, naming everything on the direct line but the fields' own.
+    // A volume over either field: the flight starts or ends inside it.
+    let over_field = |k: usize, h: &[(f64, f64)]| {
+        h.len() < 3
+            || inside_convex(h, oxy)
+            || inside_convex(h, dxy)
+            || spaces[k].contains(o.0, o.1)
+            || spaces[k].contains(d.0, d.1)
+    };
+    let give_up = |skip: &HashSet<usize>, mut at_fields: Vec<String>| {
+        // Direct, naming everything on the direct line but the fields' own,
+        // including a field's volume the search never reached: EDDG-EDVK
+        // (#74 sweep) named Kassel-Calden's own parachute zone as a volume
+        // "the route still enters".
         let mut named: Vec<String> = Vec::new();
         for k in conflicts(&[o, d], spaces, &boxes, profile, skip) {
             let s = spaces[k].spoken_name();
-            if !named.contains(&s) {
+            if over_field(k, &hull(k)) {
+                if !at_fields.contains(&s) {
+                    at_fields.push(s);
+                }
+            } else if !named.contains(&s) {
                 named.push(s);
             }
         }
@@ -816,12 +857,7 @@ pub fn dog_leg(o: (f64, f64), d: (f64, f64), spaces: &[Airspace], profile: &Prof
         };
         let h = hull(k);
         // A volume over either field cannot be flown round: set aside.
-        if h.len() < 3
-            || inside_convex(&h, oxy)
-            || inside_convex(&h, dxy)
-            || spaces[k].contains(o.0, o.1)
-            || spaces[k].contains(d.0, d.1)
-        {
+        if over_field(k, &h) {
             skip.insert(k);
             let s = spaces[k].spoken_name();
             if !at_fields.contains(&s) {
@@ -1218,5 +1254,238 @@ MISSING LE 11 CCCCC LE 11 N 1 50 200 Z9\n\
                 t.elapsed()
             );
         }
+    }
+    /// #74 over the real data: field pairs from apt.dat (Europe, hard
+    /// runway of 800 m or more, 25 to 100 nm apart) whose DIRECT line meets
+    /// a P/R/Q volume from the sim's `airspace.txt` at the altitude the
+    /// flight is at there (VFR, 4,500 ft cruise), not counting a volume over
+    /// either field. Each is planned by `dog_leg` and must either go round
+    /// (no blocking volume anywhere along the flown legs, within 1.30x
+    /// direct; the passes from the volumes gone round are printed) or fly direct and NAME
+    /// what it enters (every name one the direct line really meets); never
+    /// direct through a volume in silence. `XVL_DOGLEG_PAIRS` caps the pairs
+    /// (default 400).
+    /// `cargo test --release -- --ignored real_install_dog_legs --nocapture`
+    #[test]
+    #[ignore] // needs the real X-Plane install; run with --ignored
+    fn real_install_dog_legs_go_round_or_name_it() {
+        let c = crate::config::Config::from_env().expect("config");
+        if !std::path::Path::new(&c.airspace_path).exists()
+            || !std::path::Path::new(&c.apt_data_path).exists()
+        {
+            return;
+        }
+        let cap: usize = std::env::var("XVL_DOGLEG_PAIRS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(400);
+        let (la0, la1, lo0, lo1) = (36.0, 58.0, -10.0, 25.0);
+        let mut fields: Vec<(String, (f64, f64))> = Vec::new();
+        nav::scan_airports(&c.apt_data_path, |icao, a| {
+            let Some(p) = a.position() else { return };
+            let hard = a.runways.iter().any(|r| r.is_hard() && r.length_m() >= 800.0);
+            if hard
+                && icao.len() == 4
+                && icao.chars().all(|ch| ch.is_ascii_uppercase())
+                && (la0..=la1).contains(&p.0)
+                && (lo0..=lo1).contains(&p.1)
+            {
+                fields.push((icao.to_string(), p));
+            }
+        })
+        .unwrap();
+        fields.sort_by(|a, b| a.0.cmp(&b.0));
+        let all = crate::airspace::load_box(&c.airspace_path, la0 - 2.0, la1 + 2.0, lo0 - 3.0, lo1 + 3.0);
+        let bbox: Vec<(f64, f64, f64, f64)> = all
+            .iter()
+            .map(|a| {
+                a.poly.iter().fold((f64::MAX, f64::MIN, f64::MAX, f64::MIN), |b, (la, lo)| {
+                    (b.0.min(*la), b.1.max(*la), b.2.min(*lo), b.3.max(*lo))
+                })
+            })
+            .collect();
+        println!("{} fields, {} P/R/Q volumes", fields.len(), all.len());
+        let profile = Profile {
+            origin_elev_ft: 0.0,
+            dest_elev_ft: 0.0,
+            cruise_ft: 4500.0,
+            climb_ft_per_nm: Some(700.0 / 1.5),
+            descent_ft_per_nm: Some(250.0),
+        };
+        // Planar nm from p to the polygon's nearest edge.
+        let edge_nm = |a: &Airspace, p: (f64, f64)| {
+            let k = p.0.to_radians().cos();
+            let xy = |q: (f64, f64)| ((q.1 - p.1) * 60.0 * k, (q.0 - p.0) * 60.0);
+            let n = a.poly.len();
+            (0..n)
+                .map(|i| {
+                    let (ax, ay) = xy(a.poly[i]);
+                    let (bx, by) = xy(a.poly[(i + 1) % n]);
+                    let (dx, dy) = (bx - ax, by - ay);
+                    let l2 = dx * dx + dy * dy;
+                    let t = if l2 > 0.0 { (-(ax * dx + ay * dy) / l2).clamp(0.0, 1.0) } else { 0.0 };
+                    (ax + t * dx).hypot(ay + t * dy)
+                })
+                .fold(f64::INFINITY, f64::min)
+        };
+        let (mut pairs, mut round, mut named) = (0usize, 0usize, 0usize);
+        let (mut detours, mut clear_min, mut bad) = (Vec::new(), f64::INFINITY, Vec::new());
+        let (mut clear_at, mut near_fields, mut vertical) = (String::new(), 0usize, 0usize);
+        let mut clears: Vec<f64> = Vec::new();
+        let mut examples: Vec<String> = Vec::new();
+        'outer: for (i, (oi, o)) in fields.iter().enumerate() {
+            let o = *o;
+            // A few partners each, spread through the list.
+            for (di, d) in fields.iter().skip(i + 1).step_by(7).map(|(n, p)| (n, *p)) {
+                let direct = nav::haversine_nm(o.0, o.1, d.0, d.1);
+                if !(25.0..=100.0).contains(&direct) {
+                    continue;
+                }
+                // `load_spaces`'s box, over the preloaded file.
+                let half = direct * DOGLEG_MAX_DETOUR / 2.0 / 60.0 + 0.2;
+                let k = ((o.0 + d.0) / 2.0).to_radians().cos().max(0.2);
+                let (bl0, bl1) = (o.0.min(d.0) - half, o.0.max(d.0) + half);
+                let (bo0, bo1) = (o.1.min(d.1) - half / k, o.1.max(d.1) + half / k);
+                let spaces: Vec<Airspace> = all
+                    .iter()
+                    .zip(&bbox)
+                    .filter(|(_, b)| b.0 <= bl1 && b.1 >= bl0 && b.2 <= bo1 && b.3 >= bo0)
+                    .map(|(a, _)| a.clone())
+                    .collect();
+                // Volumes over a field are no dog-leg's business.
+                let over_field = |a: &Airspace| a.contains(o.0, o.1) || a.contains(d.0, d.1);
+                let meets = |path: &[(f64, f64)]| -> Vec<usize> {
+                    let total = path_nm(path);
+                    let steps = (total / 0.25).ceil().max(1.0) as usize;
+                    let mut out = Vec::new();
+                    for s in 0..=steps {
+                        let at = total * s as f64 / steps as f64;
+                        let p = point_along(path, at);
+                        let band = profile.band(at, total);
+                        for (k, a) in spaces.iter().enumerate() {
+                            if !out.contains(&k) && !over_field(a) && blocks_band(a, p, band) {
+                                out.push(k);
+                            }
+                        }
+                    }
+                    out
+                };
+                let on_direct = meets(&[o, d]);
+                if on_direct.is_empty() {
+                    continue;
+                }
+                pairs += 1;
+                let dl = dog_leg(o, d, &spaces, &profile);
+                let at_fields: HashSet<&String> = dl.at_fields.iter().collect();
+                let name = |k: usize| spaces[k].spoken_name();
+                if dl.turns.is_empty() {
+                    // Direct: everything it meets is named (or over a field
+                    // by the planner's own hull test).
+                    let silent: Vec<String> = on_direct
+                        .iter()
+                        .map(|k| name(*k))
+                        .filter(|n| !dl.crossed.contains(n) && !at_fields.contains(n))
+                        .collect();
+                    let unmet: Vec<&String> = dl
+                        .crossed
+                        .iter()
+                        .filter(|n| !on_direct.iter().any(|k| name(*k) == **n))
+                        .collect();
+                    if !silent.is_empty() || !unmet.is_empty() {
+                        bad.push(format!("{oi}-{di}: direct, silent through {silent:?}, named but not met {unmet:?}"));
+                    } else {
+                        named += 1;
+                        if examples.len() < 6 && !dl.crossed.is_empty() {
+                            examples.push(format!("{oi}-{di} {direct:.0} nm: direct, names {:?}", dl.crossed));
+                        }
+                    }
+                    continue;
+                }
+                round += 1;
+                let mut path = vec![o];
+                path.extend(dl.turns.iter().copied());
+                path.push(d);
+                let flown = path_nm(&path);
+                detours.push(flown / direct);
+                let still: Vec<String> = meets(&path)
+                    .into_iter()
+                    .map(name)
+                    .filter(|n| !at_fields.contains(n))
+                    .collect();
+                if !dl.crossed.is_empty() || !still.is_empty() || flown > direct * DOGLEG_MAX_DETOUR + 0.01 {
+                    bad.push(format!(
+                        "{oi}-{di}: round {:?} {flown:.1}/{direct:.1} nm, still enters {still:?}, crossed {:?}",
+                        dl.avoided, dl.crossed
+                    ));
+                    continue;
+                }
+                // Clearance from each volume flown round, along the legs;
+                // one within the margin of a field cannot be passed with the
+                // margin, so it is counted apart.
+                let total = flown;
+                let steps = (total / 0.1).ceil() as usize;
+                for k in on_direct.iter().filter(|k| dl.avoided.contains(&name(**k))) {
+                    let a = &spaces[*k];
+                    let near_field =
+                        edge_nm(a, o).min(edge_nm(a, d)) < DOGLEG_MARGIN_NM;
+                    let (mut c, mut under) = (f64::INFINITY, false);
+                    for s in 0..=steps {
+                        let p = point_along(&path, total * s as f64 / steps as f64);
+                        c = c.min(edge_nm(a, p));
+                        under |= a.contains(p.0, p.1);
+                    }
+                    if near_field {
+                        near_fields += 1;
+                    } else if under {
+                        // Inside its outline, outside its band (checked
+                        // above): passed over or under, not round.
+                        vertical += 1;
+                    } else {
+                        clears.push(c);
+                        if c < clear_min {
+                            clear_min = c;
+                            clear_at = format!("{oi}-{di} {}", name(*k));
+                        }
+                    }
+                }
+                if examples.len() < 12 {
+                    examples.push(format!(
+                        "{oi}-{di} {direct:.0} nm: round {:?}, {} turns, {flown:.0} nm ({:.2}x)",
+                        dl.avoided,
+                        dl.turns.len(),
+                        flown / direct
+                    ));
+                }
+                if pairs >= cap {
+                    break 'outer;
+                }
+            }
+        }
+        detours.sort_by(f64::total_cmp);
+        println!(
+            "{pairs} pairs meet a volume direct: {round} flown round (detour median {:.2}x, max {:.2}x, \
+             nearest pass {clear_min:.2} nm at {clear_at}, {near_fields} volumes within the margin \
+             of a field not measured, {vertical} passed over or under), {named} direct and named, {} wrong",
+            detours.get(detours.len() / 2).copied().unwrap_or(f64::NAN),
+            detours.last().copied().unwrap_or(f64::NAN),
+            bad.len()
+        );
+        // How far the legs pass from the named volumes they were flown round
+        // (a same-named volume can be one the final legs no longer meet in
+        // its band, passed at any distance): reported, not asserted.
+        println!(
+            "passes from volumes named as flown round: {} measured, {} under 1.5 nm, {} under 1.9 nm",
+            clears.len(),
+            clears.iter().filter(|c| **c < 1.5).count(),
+            clears.iter().filter(|c| **c < 1.9).count()
+        );
+        for e in &examples {
+            println!("  {e}");
+        }
+        for b in &bad {
+            println!("  BAD {b}");
+        }
+        assert!(round > 0, "no pair was flown round");
+        assert!(bad.is_empty(), "{} pairs", bad.len());
     }
 }
