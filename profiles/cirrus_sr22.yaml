@@ -96,6 +96,10 @@ reference:
   vx_kts: 88.0
   vy_kts: 101.0
   vr_kts: 73.0
+  # A light single lifts its nose briskly: at the airline 2.5 deg/s from the
+  # roll's -1.75 the SR22 took 6.2 s from Vr to lift off at 99.5 KIAS, 5.9 m
+  # of drift in those seconds (LEMG 12 1790690995, 2026-09-29).
+  rotate_rate_deg_s: 5.0
   best_glide_kts: 88.0
   vs0_kts: 60.0
   max_crosswind_kts: 21.0

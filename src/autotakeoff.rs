@@ -1608,6 +1608,9 @@ pub struct RotatePitch {
     ceiling_limit: Option<f64>,
     /// Tests only: the law as it flew EGKK 08R, without the guard.
     unguarded: bool,
+    /// The rotation's rate, degrees a second ([`ROTATE_RATE_DEG_S`] unless
+    /// the airframe declares its own, `rotate_rate_deg_s`).
+    rotate_rate: Option<f64>,
 }
 
 /// The hand-flown initial climb's speed hold: from liftoff to the autopilot's
@@ -1704,6 +1707,7 @@ impl RotatePitch {
             accel_kts_s: 0.0,
             ceiling_limit: None,
             unguarded: false,
+            rotate_rate: None,
         }
     }
 
@@ -1726,6 +1730,19 @@ impl RotatePitch {
     pub fn with_climb_hold(mut self, hold: Option<ClimbHold>) -> Self {
         self.hold = hold;
         self
+    }
+
+    /// The airframe's own rotation rate (`rotate_rate_deg_s`), bounded to
+    /// 1.5 to 6 degrees a second; `None` keeps [`ROTATE_RATE_DEG_S`].
+    pub fn with_rotate_rate(mut self, deg_s: Option<f64>) -> Self {
+        if let Some(r) = deg_s.filter(|r| r.is_finite()) {
+            self.rotate_rate = Some(r.clamp(1.5, 6.0));
+        }
+        self
+    }
+
+    fn rotate_rate(&self) -> f64 {
+        self.rotate_rate.unwrap_or(ROTATE_RATE_DEG_S)
     }
 
     /// The low-passed airspeed trend, knots per second, for the blackbox.
@@ -1783,11 +1800,11 @@ impl RotatePitch {
         let prev_target = self.target;
         let ramped = match prev_target {
             None => theta_deg.min(cap),
-            Some(t) if t < cap => (t + ROTATE_RATE_DEG_S * dt).min(cap),
+            Some(t) if t < cap => (t + self.rotate_rate() * dt).min(cap),
             // Past the ramp: the hold's target stands (the ramp never pulls
             // it back to the rotation attitude).
             Some(t) if self.hold.is_some() => t,
-            Some(t) => (t + ROTATE_RATE_DEG_S * dt).min(cap),
+            Some(t) => (t + self.rotate_rate() * dt).min(cap),
         };
         // The airspeed trend, whenever the caller has the airspeed.
         if let Some((ias, _)) = air.filter(|(v, _)| v.is_finite()) {
@@ -1828,7 +1845,7 @@ impl RotatePitch {
         // hold's walk is a commanded rate too.
         let want_rate = match (held, prev_target) {
             (Some(t), Some(p)) => (t - p) / dt,
-            _ if target < cap => ROTATE_RATE_DEG_S,
+            _ if target < cap => self.rotate_rate(),
             _ => 0.0,
         };
         let err = target - theta_deg - PITCH_LEAD_S * (rate - want_rate);
@@ -3211,7 +3228,8 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, p: Params) {
         p.tail_strike_deg,
         p.pitch_authority_down.map_or(PITCH_MIN, |a| -a.abs()),
     )
-    .with_climb_hold(climb_hold);
+    .with_climb_hold(climb_hold)
+    .with_rotate_rate(crate::aircraft::live_profile().and_then(|lp| lp.reference.as_ref().and_then(|r| r.rotate_rate_deg_s)));
     // Thrust reduction at the declared height (`takeoff_config:`).
     let reduction = crate::takeoff_config::thrust_reduction();
     let mut reduced = false;
@@ -6487,6 +6505,24 @@ mod tests {
             ga.step(0.0, None, 0.15);
         }
         assert!((ga.target_deg() - ROTATE_PITCH_DEG).abs() < 1e-6);
+    }
+
+    /// A declared rotation rate walks the target up that fast; none keeps
+    /// the airline 2.5 (the SR22 declares 5: LEMG 12 1790690995).
+    #[test]
+    fn a_declared_rotation_rate_walks_the_target_faster() {
+        let target_after = |rate: Option<f64>| {
+            let mut law = RotatePitch::with_authority(None, PITCH_MIN).with_rotate_rate(rate);
+            for _ in 0..8 {
+                law.step(-1.75, None, 0.25);
+            }
+            law.target_deg()
+        };
+        let airline = target_after(None);
+        let single = target_after(Some(5.0));
+        assert!((airline - (-1.75 + 2.5 * 1.75)).abs() < 0.3, "{airline}");
+        assert!((single - (-1.75 + 5.0 * 1.75)).abs() < 1e-6, "{single}");
+        assert!((target_after(Some(50.0)) - ROTATE_PITCH_DEG).abs() < 1e-6, "bounded at 6");
     }
 
     #[test]

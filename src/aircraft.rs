@@ -1934,6 +1934,13 @@ pub struct ReferenceProfile {
     pub acceleration_height_agl_ft: Option<f64>,
     #[serde(default)]
     pub vr_kts: Option<f64>, // rotate
+    /// How fast the rotation raises the nose, degrees a second; `None` is
+    /// the airline 2.5 (`autotakeoff::ROTATE_RATE_DEG_S`). A light single
+    /// rotates faster: the SR22 at 2.5 from its nose-down roll attitude
+    /// took 6.2 s from Vr 73 to lift off at 99.5 KIAS (LEMG 12 1790690995,
+    /// 2026-09-29), the drift growing 5.9 m in those seconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rotate_rate_deg_s: Option<f64>,
     /// Blue line: single-engine best rate of climb. A TWIN's number — the one
     /// speed a multi pilot flies the whole engine-failure drill against — and
     /// meaningless on a single, so it stays `None` there.
@@ -5288,6 +5295,7 @@ fn cessna_172sp() -> AircraftProfile {
             vyse_kts: None,
             vmca_kts: None,
             vr_kts: Some(55.0),
+            rotate_rate_deg_s: None,
             best_glide_kts: Some(68.0),
             vs0_kts: Some(40.0),
             approach_kts: Some(65.0),
@@ -5674,6 +5682,7 @@ fn cirrus_sr22() -> AircraftProfile {
             vyse_kts: None,
             vmca_kts: None,
             vr_kts: Some(73.0),
+            rotate_rate_deg_s: None,
             best_glide_kts: Some(88.0),
             vs0_kts: Some(60.0),
             approach_kts: None,
