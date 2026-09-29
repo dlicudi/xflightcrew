@@ -500,10 +500,15 @@ async fn give_up(
     announce(voice, Priority::Caution, &hand_back_line(line, held));
 }
 
-/// The circuit mission ended because its takeoff never completed (and not
-/// by the pilot's cancel, which is its own give-up). Pure.
+/// The circuit mission ended because its takeoff never completed, or the
+/// circuit was refused on the runway for the ground under it (#182), and
+/// not by the pilot's cancel, which is its own give-up. Pure.
 fn circuit_takeoff_failed(stood_down: Option<&str>, aborted: bool) -> bool {
-    !aborted && stood_down == Some(crate::circuit::TAKEOFF_NOT_COMPLETED)
+    !aborted
+        && matches!(
+            stood_down,
+            Some(crate::circuit::TAKEOFF_NOT_COMPLETED | crate::circuit::TERRAIN_REFUSED)
+        )
 }
 
 /// The give-up's line and reason, relabelled as the pilot's cancel when the
@@ -3256,14 +3261,11 @@ async fn fly(xp: XPlaneClient, config: Config, voice: Option<Voice>, tools: SubT
                 } else {
                     "Full auto is off. Your aircraft."
                 };
-                give_up(
-                    &xp,
-                    tools.taxi.park_brake_valve_set,
-                    &voice,
-                    line,
-                    crate::circuit::TAKEOFF_NOT_COMPLETED,
-                )
-                .await;
+                let reason = match crate::circuit::stood_down() {
+                    Some(crate::circuit::TERRAIN_REFUSED) => crate::circuit::TERRAIN_REFUSED,
+                    _ => crate::circuit::TAKEOFF_NOT_COMPLETED,
+                };
+                give_up(&xp, tools.taxi.park_brake_valve_set, &voice, line, reason).await;
                 return;
             }
             stop_active();
@@ -7680,6 +7682,11 @@ mod tests {
         assert!(!circuit_takeoff_failed(rejected, true), "the pilot's cancel");
         assert!(!circuit_takeoff_failed(None, false), "flew and landed");
         assert!(!circuit_takeoff_failed(Some("abort_takeoff_phase"), false));
+        // Refused on the runway for the ground under it (#182): a give-up too.
+        assert!(circuit_takeoff_failed(
+            Some(crate::circuit::TERRAIN_REFUSED),
+            false
+        ));
     }
 
     /// LEMG 13 (2026-09-28, sortie 1790627884-full_auto): the roll began at
