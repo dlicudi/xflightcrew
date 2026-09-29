@@ -2701,8 +2701,9 @@ impl Pace {
 
 /// From the typed enroute setup to its `enroute_result`: the reload (up to
 /// two minutes, `InitTiming::LIVE`), the autopilot's engage (at most a
-/// minute), the settle and the station (a minute and fifteen seconds).
-pub const ENROUTE_MAX_S: f64 = 300.0;
+/// minute), the settle and the station (a minute and fifteen seconds), then
+/// the level, speed and altimeter settling (a minute, #177).
+pub const ENROUTE_MAX_S: f64 = 360.0;
 
 /// From a setup that loads another aircraft to the app's `profile_probe`
 /// of it: the reload (up to two minutes, `InitTiming`), then the

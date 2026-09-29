@@ -1031,6 +1031,20 @@ async fn glide(xp: &XPlaneClient, dataref: &str, to: f64, over_ms: u64) {
 /// way out — never hand the pilot an aircraft with a hidden boot on the pedals.
 async fn governor(xp: XPlaneClient, voice: Option<crate::voice::Voice>) {
     tracing::info!("speed governor started");
+    // On file both ends: whether a governor held the speed after the
+    // enroute air start could only be inferred from the throttle trace
+    // (#177, 2026-09-29).
+    let life = |event: &str| {
+        crate::blackbox::record(
+            "speedhold",
+            serde_json::json!({
+                "event": event,
+                "mode": format!("{:?}", *MODE.lock().unwrap_or_else(|e| e.into_inner())),
+                "target": *TARGET_KTS.lock().unwrap_or_else(|e| e.into_inner()),
+            }),
+        );
+    };
+    life("governor_started");
     let mut braking = false;
     // Our own brake pollution, by channel: the proportional channel drives
     // the PEDAL ratios (gated by `braking`), and the held stop command rides
@@ -1433,6 +1447,7 @@ async fn governor(xp: XPlaneClient, voice: Option<crate::voice::Voice>) {
         }
     }
     tracing::info!("speed governor stopped");
+    life("governor_stopped");
     // A lever left in beta goes back to idle: the next thing on this lever
     // may be a takeoff, and a roll must never start with the prop in beta.
     if crate::aircraft::taxi_beta_max().is_some() && last_cmd.is_some_and(|c| c < 0.0) {

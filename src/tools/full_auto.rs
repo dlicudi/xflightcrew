@@ -206,6 +206,81 @@ pub(crate) fn resume_gate(
     }
 }
 
+/// One read of where the aircraft is and how it moves, for the resume's
+/// recheck ([`rejoin_unsteady`]): seconds, position, indicated feet, VSI
+/// (fpm), groundspeed (kt) and track (degrees true).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct Steady {
+    pub t_s: f64,
+    pub lat: f64,
+    pub lon: f64,
+    pub alt_ft: f64,
+    pub vs_fpm: f64,
+    pub gs_kts: f64,
+    pub track_true: f64,
+}
+
+/// Off the first read's own track and level at the recheck, nm and feet...
+pub(crate) const REJOIN_OFF_TRACK_NM: f64 = 0.5;
+pub(crate) const REJOIN_OFF_LEVEL_FT: f64 = 200.0;
+/// ...a vertical speed that changed this much between the reads, fpm...
+pub(crate) const REJOIN_VS_CHANGE_FPM: f64 = 1_000.0;
+/// ...or one no steady flight has, fpm: the aircraft is not steady.
+pub(crate) const REJOIN_MAX_VS_FPM: f64 = 6_000.0;
+
+/// Whether the aircraft stayed on the flight the rejoin was checked
+/// against: the recheck is judged against the FIRST read projected along
+/// its own track, groundspeed and vertical speed, never against raw
+/// movement (0.1 nm is 1.2 s at 296 kt). `None`: steady. EGKK-EGBB enroute
+/// setup (#177, 2026-09-29): 0.1 nm and 202 ft in 1.1 s was a zoom at
+/// 10,600 to 11,900 fpm, which this still refuses. Pure.
+pub(crate) fn rejoin_unsteady(a: &Steady, b: &Steady) -> Option<String> {
+    const NOT_TAKEN: &str = "I haven't taken control; stabilise and try again.";
+    let dt = (b.t_s - a.t_s).max(0.0);
+    let (plat, plon) =
+        crate::nav::project_latlon(a.lat, a.lon, a.track_true, a.gs_kts.max(0.0) * dt / 3600.0);
+    let off_nm = crate::nav::haversine_nm(plat, plon, b.lat, b.lon);
+    let off_ft = b.alt_ft - (a.alt_ft + a.vs_fpm * dt / 60.0);
+    let vs = if a.vs_fpm.abs() >= b.vs_fpm.abs() { a.vs_fpm } else { b.vs_fpm };
+    if vs.abs() > REJOIN_MAX_VS_FPM || (b.vs_fpm - a.vs_fpm).abs() > REJOIN_VS_CHANGE_FPM {
+        let dir = if vs > 0.0 { "climbing" } else { "descending" };
+        return Some(format!(
+            "We're {dir} at {:.0} feet a minute, {:.0} to {:.0} while I checked the rejoin. \
+             {NOT_TAKEN}",
+            vs.abs(),
+            a.vs_fpm,
+            b.vs_fpm
+        ));
+    }
+    if off_nm > REJOIN_OFF_TRACK_NM || off_ft.abs() > REJOIN_OFF_LEVEL_FT {
+        return Some(format!(
+            "We left the track by {off_nm:.1} miles and the level by {:.0} feet while I \
+             checked the rejoin. {NOT_TAKEN}",
+            off_ft.abs()
+        ));
+    }
+    None
+}
+
+/// A [`Steady`] read now, seconds since `clock`; `None` for a failed read.
+async fn steady_read(
+    xp: &crate::xplane::XPlaneClient,
+    clock: std::time::Instant,
+) -> Option<Steady> {
+    let (lat, lon, alt, vs, gs, track) = tokio::join!(
+        xp.get_float(crate::datarefs::LATITUDE),
+        xp.get_float(crate::datarefs::LONGITUDE),
+        xp.get_float(crate::datarefs::ALTITUDE_FT),
+        xp.get_float(crate::datarefs::VVI_FPM),
+        xp.get_float("sim/flightmodel/position/groundspeed"),
+        xp.get_float("sim/flightmodel/position/hpath"),
+    );
+    let t_s = clock.elapsed().as_secs_f64();
+    let [lat, lon, alt_ft, vs_fpm, gs_ms, track_true] =
+        crate::control::measurements("resume_recheck", [lat, lon, alt, vs, gs, track])?;
+    Some(Steady { t_s, lat, lon, alt_ft, vs_fpm, gs_kts: gs_ms * 1.943_844, track_true })
+}
+
 /// What an airborne resume arms: the route follower, or autoland on the
 /// plan's arrival runway.
 pub(crate) enum ResumeArm {
@@ -666,6 +741,9 @@ impl FullAuto {
         else {
             return Err("I can't verify the aircraft state. I haven't taken control; try again once the sim is connected.".into());
         };
+        // The flight the rejoin is checked against, for the recheck below.
+        let clock = std::time::Instant::now();
+        let first_read = steady_read(&xp, clock).await;
         // Each gate names itself: "stable flight" told a pilot in a 28 degree
         // orbit nothing about what to change (2026-09-16).
         let speed_floor =
@@ -830,22 +908,18 @@ impl FullAuto {
         .map_err(|_| "Arrival verification failed; you have control.".to_string())??;
         // Probes can take time: never arm from a position that has moved away
         // from the verified join while the pilot was waiting.
-        let (new_lat, new_lon, new_alt) = tokio::join!(
-            xp.get_float(crate::datarefs::LATITUDE),
-            xp.get_float(crate::datarefs::LONGITUDE),
-            xp.get_float(crate::datarefs::ALTITUDE_FT),
-        );
-        let Some([new_lat, new_lon, new_alt]) =
-            crate::control::measurements("resume_recheck", [new_lat, new_lon, new_alt])
-        else {
+        // Judged against the first read's own track and level, never raw
+        // movement: steady cruise moves (#177).
+        let (Some(was), Some(now)) = (first_read, steady_read(&xp, clock).await) else {
             return Err("Connection changed during verification. I haven't taken control.".into());
         };
-        let moved_nm = crate::nav::haversine_nm(lat, lon, new_lat, new_lon);
-        if moved_nm > 1.0 || (new_alt - altitude).abs() > 200.0 {
-            return Err(format!(
-                "We moved {moved_nm:.1} miles and {:.0} feet while I checked the rejoin. I haven't taken control; stabilise and try again.",
-                (new_alt - altitude).abs()
-            ));
+        if let Some(why) = rejoin_unsteady(&was, &now) {
+            crate::full_auto::event(
+                "rejoin_unsteady",
+                json!({ "dt_s": now.t_s - was.t_s, "was": format!("{was:?}"),
+                        "now": format!("{now:?}") }),
+            );
+            return Err(why);
         }
         let ack = format!("Resuming toward {} at {:.0} feet, continuing to {} and the arrival. {} Say my controls to take over.", fix.ident,target,fp.destination,arrival);
         // THE one payload builder, never a hand-rolled join. This site had a
@@ -1802,5 +1876,46 @@ mod tests {
             resume_join(&legs, &lipk, "LIPK", 44.95, 11.2, None),
             ResumeJoin::Refused(_)
         ));
+    }
+
+    fn steady(t_s: f64, lat: f64, lon: f64, alt_ft: f64, vs: f64, gs: f64, trk: f64) -> Steady {
+        Steady { t_s, lat, lon, alt_ft, vs_fpm: vs, gs_kts: gs, track_true: trk }
+    }
+
+    /// #177 from the blackbox. Sortie 1790635335's cruise after the resume
+    /// (state records +31.5 and +37.1 s): 0.6 nm on in 5.6 s, still on its
+    /// own track and level. The same flight twelve seconds on, 1.3 nm (the
+    /// old raw-movement rule refused past 1 nm), still steady.
+    #[test]
+    fn steady_cruise_is_not_movement() {
+        let a = steady(0.0, 52.102_544_76, -0.708_129_74, 18_629.0, -743.4, 395.8, 329.0);
+        let b = steady(5.6, 52.111_251_57, -0.716_650_71, 18_576.1, -689.5, 390.8, 328.8);
+        assert_eq!(rejoin_unsteady(&a, &b), None);
+        let run = 395.8 * 12.0 / 3600.0;
+        let (lat, lon) = crate::nav::project_latlon(a.lat, a.lon, a.track_true, run);
+        assert!(crate::nav::haversine_nm(a.lat, a.lon, lat, lon) > 1.0);
+        let c = steady(12.0, lat, lon, 18_629.0 - 743.4 * 0.2, -743.4, 395.8, 329.0);
+        assert_eq!(rejoin_unsteady(&a, &c), None);
+    }
+
+    /// The refused resume itself (2026-09-29, t 1790648838.7 and 840.2):
+    /// the air start's zoom through 18,155 and 18,436 ft at 9,300 to
+    /// 12,100 fpm. Still refused, and the line says why.
+    #[test]
+    fn the_air_starts_zoom_is_still_refused() {
+        let a = steady(0.0, 52.055_444_29, -0.663_412_19, 18_155.1, 9_309.5, 352.3, 330.3);
+        let b = steady(1.5, 52.057_500_98, -0.665_280_77, 18_436.4, 12_057.1, 337.6, 331.1);
+        let why = rejoin_unsteady(&a, &b).expect("a zoom is not steady");
+        assert!(why.contains("climbing at 12057 feet a minute"), "{why}");
+        // A jump off the track (a relocation) is refused on the track.
+        let (lat, lon) = crate::nav::project_latlon(a.lat, a.lon, 60.0, 2.0);
+        let c = steady(1.5, lat, lon, 18_155.1, 0.0, 352.3, 330.3);
+        let a0 = Steady { vs_fpm: 0.0, ..a };
+        let why = rejoin_unsteady(&a0, &c).expect("off the track");
+        assert!(why.contains("left the track"), "{why}");
+        // And a level that leaves the projection by 250 ft.
+        let d = steady(1.5, a.lat, a.lon, 18_405.0, 0.0, 0.0, 330.3);
+        let a1 = Steady { gs_kts: 0.0, ..a0 };
+        assert!(rejoin_unsteady(&a1, &d).is_some());
     }
 }

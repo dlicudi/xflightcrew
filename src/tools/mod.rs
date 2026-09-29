@@ -738,6 +738,7 @@ impl Registry {
             ap: enroute_ap,
             cruise_ias_kts: profile.reference.as_ref().and_then(|r| r.cruise_ias_kts),
             vne_kts: profile.vne_kts,
+            transition_altitude_ft: profile.transition_altitude_ft,
         }));
 
         // Reminders ("wake me at top of descent", "tell me at the next waypoint") are
