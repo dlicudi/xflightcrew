@@ -2607,6 +2607,7 @@ impl PitchInputs {
             servo: self.servo,
             elev_deg: self.elev_deg,
             total: self.total,
+            ours: self.ovr_pitch.is_some_and(|v| v > 0.5),
         }
     }
 }

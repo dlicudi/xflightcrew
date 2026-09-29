@@ -320,6 +320,9 @@ pub struct PitchTelemetry {
     pub servo: Option<f64>,
     pub elev_deg: Option<f64>,
     pub total: Option<f64>,
+    /// Our own pitch channel holds the elevator (the plugin's override):
+    /// the surface is ours, not the servo's.
+    pub ours: bool,
 }
 
 /// The authority verdict.
@@ -387,6 +390,20 @@ impl AuthorityCheck {
 
     fn note_telemetry(&mut self, tele: Option<PitchTelemetry>) {
         let Some(t) = tele else { return };
+        // Under our own channel the elevator is ours: no baseline, no
+        // movement. The takeoff held the column to its 300 ft handoff after
+        // the engage armed this check, and the servo winding meanwhile
+        // against an elevator we held read as "elevator not following"
+        // (LEMG 30 737 1790698748, 2026-09-29: servo0 -0.054 elev0 8.73 taken
+        // under the override; released, elevator 10.12 -> 8.65 with the
+        // servo -0.46 -> -0.39).
+        if t.ours {
+            self.servo0 = None;
+            self.elev0 = None;
+            self.servo_dev = 0.0;
+            self.elev_dev = 0.0;
+            return;
+        }
         if let Some(s) = t.servo.filter(|v| v.is_finite()) {
             let s0 = *self.servo0.get_or_insert(s);
             self.servo_dev = self.servo_dev.max((s - s0).abs());
@@ -1020,6 +1037,7 @@ mod tests {
             servo: Some(servo),
             elev_deg: Some(elev),
             total: None,
+            ours: false,
         })
     }
 
@@ -1050,6 +1068,34 @@ mod tests {
             }
         }
         assert_eq!(out, Authority::Confirmed("elevator_follows_servo"));
+    }
+
+    /// The column held by our own channel is no evidence (LEMG 30 737
+    /// 1790698748): a servo winding against an elevator the takeoff still
+    /// held until the handoff read as no authority. Baselined after the
+    /// release, the elevator follows.
+    #[test]
+    fn our_own_column_is_no_evidence_against_the_servo() {
+        let ours = |servo: f64, elev: f64| {
+            Some(PitchTelemetry { servo: Some(servo), elev_deg: Some(elev), total: None, ours: true })
+        };
+        let mut c = AuthorityCheck::new(0.0, 3_900.0, ours(-0.054, 8.73));
+        let mut out = Authority::Pending;
+        for i in 1..=5 {
+            let t = i as f64 * 0.5;
+            out = c.step(t, Some(3_900.0), Some(3_850.0), ours(-0.054 - 0.08 * i as f64, 8.73));
+        }
+        assert_eq!(out, Authority::Pending, "nothing judged under our column");
+        for i in 6..=40 {
+            let t = i as f64 * 0.5;
+            let s = -0.46 + 0.01 * (i - 5) as f64;
+            let e = 10.12 - 4.0 * (s + 0.46) / 0.07;
+            out = c.step(t, Some(3_900.0), Some(3_400.0), tele(s.min(-0.2), e.max(6.0)));
+            if out != Authority::Pending {
+                break;
+            }
+        }
+        assert_ne!(out, Authority::NoAuthority("elevator_not_following_servo"));
     }
 
     /// A gap in the feed (a pause, a loop that stopped) is no verdict; a
