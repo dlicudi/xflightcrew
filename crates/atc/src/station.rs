@@ -12972,6 +12972,63 @@ mod tests {
         }
     }
 
+    /// #24's short-runway branch at a real field (LFPB, the real apt.dat and
+    /// taxi network): the crew's call for the longer runway, in the words
+    /// `full_auto::runway_request_call` makes for a 737 cleared to 27 (1,847
+    /// m against 2,347 needed; `real_install_cleared_runway_fit` pins them),
+    /// from the stand the 2026-09-22 sortie pushed off. The tower grants 25
+    /// as the taxi to it, 25 is the runway in use and on the party line (what
+    /// `judge_cleared_runway` waits for), and the published route ends on
+    /// 07/25's own centreline.
+    /// `cargo test --release -p atc -- --ignored real_install_short_cleared_runway --nocapture`
+    #[test]
+    #[ignore] // needs the real X-Plane install; run with --ignored
+    fn real_install_short_cleared_runway_is_granted_the_longer_one() {
+        let _guard = SIDE_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let apt = crate::nav::test_xplane_path("Global Scenery/Global Airports/Earth nav data/apt.dat");
+        if !std::path::Path::new(&apt).exists() {
+            return;
+        }
+        let mut st = Station::load(&apt, "LFPB").expect("LFPB has a tower");
+        let net = nav::find_taxi_net(&apt, "LFPB").unwrap().expect("LFPB's network");
+        *TAXI_NET.lock().unwrap() = Some(std::sync::Arc::new(net));
+        *CLEARANCE.lock().unwrap() = None;
+        *TAXI_ROUTE.lock().unwrap() = None;
+        let wx = calm();
+        let words = "unable runway two seven, request runway two five for length";
+        let intent = tower::parse_intent(words);
+        assert_eq!(intent, tower::Intent::RequestRunway);
+        st.note_stated_runway(words, intent);
+        let mut ctx = scripted_ctx(&mut st, wx);
+        ctx.on_ground = true;
+        st.apply_runway_request(&mut ctx, Some((48.95620, 2.43880)));
+        let r = st.route_keyed(words, Service::Tower, &ctx, wx);
+        println!("{r}");
+        assert!(r.contains("runway two five approved, taxi to holding point"), "{r}");
+        assert_eq!(st.twr.state, tower::State::TaxiCleared);
+        assert_eq!(st.runway_in_use.as_deref(), Some("25"));
+        assert_eq!(crate::party_line::clearance_runway().as_deref(), Some("25"));
+        let route = TAXI_ROUTE.lock().unwrap().clone().expect("the taxi route published");
+        let strip = st.apt.runways.iter().find(|r| r.ident_b == "25").expect("07/25");
+        let last = *route.lead_on.last().or(route.path.last()).unwrap();
+        let d = nav::haversine_nm(strip.lat_a, strip.lon_a, last.0, last.1) * 1852.0;
+        let off = nav::angle_diff_deg(
+            nav::bearing_deg(strip.lat_a, strip.lon_a, last.0, last.1),
+            strip.heading_a_deg(),
+        );
+        let xt = (d * off.to_radians().sin()).abs();
+        println!(
+            "holding point {} via {}, {} lead-on points, ends {xt:.1} m off 07/25",
+            route.holding_point,
+            route.via,
+            route.lead_on.len()
+        );
+        assert!(xt < 20.0, "the route ends {xt:.1} m off 07/25's centreline");
+        *CLEARANCE.lock().unwrap() = None;
+        *TAXI_ROUTE.lock().unwrap() = None;
+        *TAXI_NET.lock().unwrap() = None;
+    }
+
     /// The real scenery: LILB's own taxi to runway 03, planned and published.
     /// `cargo test -p atc -- --ignored real_install_self_taxi_lilb --nocapture`
     #[test]
