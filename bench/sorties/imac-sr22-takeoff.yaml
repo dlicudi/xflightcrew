@@ -1,0 +1,14 @@
+# SR22 takeoffs (iMac, #184): rotation, float, roll. Short, and it ends on
+# the ground: at 800 ft AGL a 2 nm final to the same runway lands it (a run
+# that ends in the air pauses X-Plane).
+after: stop
+cases:
+  - name: "SR22 LEMG 13 runway start, take off (#184)"
+    setup:
+      aircraft: "Aircraft/Laminar Research/Cirrus SR22/Cirrus SR22.acf"
+      runway_start: { field: LEMG, runway: 13, engines_running: true }
+    command: take off
+    steps:
+      - { say: put us on a 2 mile final to LEMG runway 13, when: { agl_above: 800 }, tool: setup_approach }
+    traffic: off
+    deadline_min: 6
