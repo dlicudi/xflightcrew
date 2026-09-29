@@ -355,6 +355,9 @@ pub struct AuthorityCheck {
     /// Second half: |err| min and max, dial min and max.
     late: Option<(f64, f64, f64, f64)>,
     dial: Option<f64>,
+    /// Every dial since the arm, min and max: a VS between two of them is
+    /// lagging a dial that moved, never running away from it.
+    dials: Option<(f64, f64)>,
     done: Option<Authority>,
 }
 
@@ -375,6 +378,7 @@ impl AuthorityCheck {
             elev_dev: 0.0,
             late: None,
             dial: None,
+            dials: None,
             done: None,
         };
         c.note_telemetry(tele);
@@ -459,6 +463,9 @@ impl AuthorityCheck {
             };
         };
         self.dial = Some(dial);
+        let d = self.dials.get_or_insert((dial, dial));
+        *d = (d.0.min(dial), d.1.max(dial));
+        let (dial_lo, dial_hi) = *d;
         let ask = dial - self.vs0;
         let answer = self.vs - self.vs0;
         let err = self.vs - dial;
@@ -471,7 +478,13 @@ impl AuthorityCheck {
             return Authority::Pending;
         }
         let away_rate = self.slope(t, vs).map(|s| s * err.signum());
+        // Inside the dials asked since the arm the VS is still answering
+        // an earlier one: the follower eased -1,829 to -522 through a check
+        // and the 737's -1,588 on its way round was "away" (EGKK-EGBB
+        // 1790671979, the elevator following the servo; #181).
+        let lagging = vs >= dial_lo - AUTH_ERR_FPM / 2.0 && vs <= dial_hi + AUTH_ERR_FPM / 2.0;
         if err.abs() >= AUTH_ERR_FPM
+            && !lagging
             && answer.signum() == err.signum()
             && answer.abs() >= AWAY_FPM
             && away_rate.is_some_and(|r| r >= AWAY_RATE_FPM_S)
@@ -901,6 +914,27 @@ mod tests {
             Authority::NoAuthority(w) => Some((*w, *e)),
             _ => None,
         })
+    }
+
+    /// EGKK-EGBB 737 (1790671979, t 1790673833.4): the follower's descent
+    /// dial -1,829 eased to -522 inside the check while the 737 was still
+    /// steepening toward the first; the elevator followed the servo. That
+    /// is a lag, never "away" (it stood the flight down as no authority).
+    #[test]
+    fn a_vs_lagging_an_eased_dial_is_not_no_authority() {
+        let tele = |servo: f64, elev: f64| {
+            Some(PitchTelemetry { servo: Some(servo), elev_deg: Some(elev), ..Default::default() })
+        };
+        let mut c = AuthorityCheck::new(0.0, -511.0, tele(0.039, 0.69));
+        let mut last = Authority::Pending;
+        for i in 1..=52 {
+            let t = i as f64 * 0.2;
+            let vs = (-511.0 - 150.0 * t).max(-1_600.0);
+            let dial = if t < 4.0 { -1_829.0 } else { (-1_829.0 + 330.0 * (t - 4.0)).min(-522.0) };
+            last = c.step(t, Some(vs), Some(dial), tele(0.039 - 0.017 * t.min(10.0), 0.69 - 0.16 * t.min(10.0)));
+            assert!(!matches!(last, Authority::NoAuthority(_)), "t {t}: {last:?}");
+        }
+        assert!(matches!(last, Authority::Confirmed(_) | Authority::Pending), "{last:?}");
     }
 
     /// #181, the 737 (1790649043): the climb went AWAY from its dial after
