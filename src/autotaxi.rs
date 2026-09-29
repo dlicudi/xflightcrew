@@ -61,6 +61,9 @@ fn throttle_dref() -> String {
     crate::aircraft::throttle_dataref()
 }
 const ON_GROUND: &str = "sim/flightmodel/failures/onground_any";
+/// The sim's body yaw rate, deg/s, nose right positive: the aligning pivot's
+/// derivative ([`align_pivot_brakes`]).
+const YAW_RATE: &str = "sim/flightmodel/position/R";
 /// The plugin's proportional steering channel (-1..1, right positive).
 const TAXI_STEER: &str = "xcopilot/taxi_steer";
 /// The sim's own toe-brake inputs, for the differential-brake steering assist
@@ -545,6 +548,10 @@ pub struct Route {
     /// backtracks, a line-up's last leg. From the route's own segment flags,
     /// merged where contiguous. The drive lights the landing light over them.
     pub runway_spans: Vec<(f64, f64)>,
+    /// A LINE-UP's runway course, true degrees: on a castoring nose the drive
+    /// does not end until the nose points down it ([`LineUpAlign`]). `None`
+    /// for every other drive.
+    pub align_course_deg: Option<f64>,
 }
 
 /// How far before a runway span the landing light comes on.
@@ -627,6 +634,7 @@ impl Route {
             done_line: None,
             pace: Pace::default(),
             runway_spans,
+            align_course_deg: None,
         })
     }
 
@@ -1089,6 +1097,140 @@ pub fn pivot_due(err_deg: f64, gs_kts: f64, joining: bool) -> bool {
     err_deg.abs() > PIVOT_MIN_ERR_DEG && (joining || gs_kts < BRAKE_STEER_FULL_KTS)
 }
 const PIVOT_BRAKE_MAX: f64 = 0.45;
+
+/// The brakes of an ALIGNING pivot, a castoring nose turned onto a heading
+/// on its brakes at walking pace: a PD on the heading error, the derivative
+/// the sim's own yaw rate (`R`, positive nose right) led by
+/// [`ALIGN_LEAD_S`], soft ([`ALIGN_FULL_DEG`] of led error for the whole
+/// [`PIVOT_BRAKE_MAX`]) and never pushing a turn already past
+/// [`ALIGN_RATE_MAX_DPS`]. A led error of the other sign is the OPPOSITE
+/// brake: the swing is caught before it overshoots, not after.
+///
+/// Why: the takeoff's aligning pivot ran on the error alone, at full brake
+/// from 15 degrees, capped only past a 15 deg/s turn. At the iMac's 0.3 to
+/// 0.45 s tick (19 fps) and the brake's own half second, the SR22 at LEMG 12
+/// (1790690995, 2026-09-29) started its roll 10.8 degrees off, reached 17.5
+/// deg/s, overshot to -11.6, and pirouetted +/-12 degrees from 4 to 18 kt;
+/// the Evolution at LILB 03 (1790712974) swung from 25 degrees off to -4 at
+/// 21.6 deg/s. Tuned on a second-order yaw plant with a 0.3 s brake delay
+/// fitted to those ticks, over ticks of 0.3 to 0.5 s. Pure.
+pub fn align_pivot_brakes(err_deg: f64, yaw_dps: f64) -> (f64, f64) {
+    if err_deg.abs() < ALIGN_QUIET_DEG && yaw_dps.abs() < ALIGN_QUIET_DPS {
+        return (0.0, 0.0);
+    }
+    let led = err_deg - yaw_dps * ALIGN_LEAD_S;
+    let mut b = (led / ALIGN_FULL_DEG).clamp(-1.0, 1.0) * PIVOT_BRAKE_MAX;
+    if b * yaw_dps > 0.0 && yaw_dps.abs() > ALIGN_RATE_MAX_DPS {
+        b = 0.0;
+    }
+    if b >= 0.0 {
+        (0.0, b)
+    } else {
+        (-b, 0.0)
+    }
+}
+/// The aligning pivot's lead on the yaw rate, s: the tick, the brake's own
+/// lag and the yaw's coast after the brake comes off.
+pub const ALIGN_LEAD_S: f64 = 2.0;
+/// Led error for the pivot's whole brake.
+pub const ALIGN_FULL_DEG: f64 = 40.0;
+/// The aligning pivot never pushes a turn faster than this.
+pub const ALIGN_RATE_MAX_DPS: f64 = 6.0;
+/// Inside this error and yaw rate the pivot lets go.
+const ALIGN_QUIET_DEG: f64 = 1.0;
+const ALIGN_QUIET_DPS: f64 = 1.0;
+/// A line-up is ALIGNED within this of the runway's course: the scorecard
+/// judges the roll's first tick at 3.
+pub const ALIGNED_DEG: f64 = 2.0;
+/// Stopped, for the aligned verdict: groundspeed and yaw rate under these.
+const ALIGN_SETTLED_KTS: f64 = 0.5;
+const ALIGN_SETTLED_DPS: f64 = 0.7;
+/// The creep the governor is given while the nose still has to come round:
+/// a castoring nose pivots on a braked wheel only with the aircraft moving.
+pub const ALIGN_CREEP_KTS: f64 = 2.0;
+/// The alignment's bounds: time from the arrival, and ground rolled down
+/// the runway doing it.
+pub const ALIGN_MAX_S: f64 = 40.0;
+pub const ALIGN_MAX_ROLL_M: f64 = 40.0;
+
+/// What the line-up's alignment wants this tick ([`LineUpAlign::step`]).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum AlignStep {
+    /// The differential brakes, and whether the governor creeps (`true`) or
+    /// stops (`false`, its symmetric brake then outweighs these).
+    Align { bl: f64, br: f64, creep: bool },
+    /// Stopped with the nose within [`ALIGNED_DEG`] of the course.
+    Done { err_deg: f64 },
+    /// Out of time or of runway rolled: stop, `err_deg` off.
+    GiveUp { err_deg: f64, why: &'static str },
+}
+
+/// A line-up does not end until the nose points down the runway, on a
+/// castoring nose: its position can be right and its heading not. LEMG 12
+/// SR22 (1790690995, 2026-09-29): the drive ended 5.0 degrees off its final
+/// bearing, still yawing left at 1.7 deg/s, and stopped at 107 true on a
+/// 117.7 runway: the roll began 10.8 off (alignment FAIL). LILB 03 Evolution
+/// (1790712974): the backtrack's turn-round ended 11.8 off (13 at the
+/// stop) and the roll began 24.6 off. Runway STARTS, set on the numbers,
+/// roll 0.3 to 0.5 off. So after the arrival the nose is brought round on
+/// the brakes ([`align_pivot_brakes`]) at a creep, stopped, and judged
+/// stopped; again if the stop swung it; bounded by [`ALIGN_MAX_S`] and
+/// [`ALIGN_MAX_ROLL_M`]. Pure: the drive feeds it.
+#[derive(Debug, Clone)]
+pub struct LineUpAlign {
+    pub course_deg: f64,
+    t0: Option<f64>,
+    creeping: bool,
+    /// How many times the governor was asked to creep (a stop that swung
+    /// the nose is a second).
+    pub creeps: u32,
+}
+
+impl LineUpAlign {
+    pub fn new(course_deg: f64) -> Self {
+        LineUpAlign { course_deg, t0: None, creeping: false, creeps: 0 }
+    }
+
+    /// Signed error, positive = the runway is right of the nose.
+    pub fn err_deg(&self, psi_true: f64) -> f64 {
+        ((self.course_deg - psi_true + 540.0).rem_euclid(360.0)) - 180.0
+    }
+
+    pub fn step(
+        &mut self,
+        t_s: f64,
+        psi_true: f64,
+        gs_kts: f64,
+        yaw_dps: f64,
+        rolled_m: f64,
+    ) -> AlignStep {
+        let t0 = *self.t0.get_or_insert(t_s);
+        let err = self.err_deg(psi_true);
+        let led = err - yaw_dps * ALIGN_LEAD_S;
+        let settled = gs_kts < ALIGN_SETTLED_KTS && yaw_dps.abs() < ALIGN_SETTLED_DPS;
+        if settled && err.abs() <= ALIGNED_DEG {
+            self.creeping = false;
+            return AlignStep::Done { err_deg: err };
+        }
+        if t_s - t0 > ALIGN_MAX_S {
+            return AlignStep::GiveUp { err_deg: err, why: "time" };
+        }
+        if rolled_m > ALIGN_MAX_ROLL_M {
+            return AlignStep::GiveUp { err_deg: err, why: "rolled" };
+        }
+        // Creep while the nose still has to come round; stop once it is
+        // close and not carried past (half the band, with hysteresis).
+        let off = err.abs() > ALIGNED_DEG || led.abs() > ALIGNED_DEG;
+        let close = err.abs() <= ALIGNED_DEG * 0.5 && led.abs() <= ALIGNED_DEG;
+        let creep = if self.creeping { !close } else { off };
+        if creep && !self.creeping {
+            self.creeps += 1;
+        }
+        self.creeping = creep;
+        let (bl, br) = align_pivot_brakes(err, yaw_dps);
+        AlignStep::Align { bl, br, creep }
+    }
+}
 
 /// Steering held while still rolling, even after the distance fade has run
 /// out. Enough for the yaw damper to arrest a rotation, far short of the
@@ -1996,6 +2138,7 @@ pub fn start_backtrack(
             };
             let spoken = crate::atis::spoken_runway(&rwy.id);
             route2.pace = pace;
+            route2.align_course_deg = Some(rwy.course_deg);
             route2.done_line = Some(format!("Lined up runway {spoken}. Holding position."));
             crate::blackbox::record(
                 "autotaxi",
@@ -2007,6 +2150,136 @@ pub fn start_backtrack(
             BACKTRACKING.store(false, Ordering::Relaxed);
         });
     });
+}
+
+/// How a line-up's alignment ended ([`align_on_the_runway`]).
+enum AlignEnd {
+    Aligned,
+    /// Stopped this many degrees off the course (signed).
+    NotAligned(f64),
+    /// Stood down under it (pedals, "my controls", the hold gone, a newer
+    /// drive): no arrival.
+    Interrupted,
+}
+
+/// What a line-up that could not straighten says instead of "lined up".
+pub fn not_aligned_line(err_deg: f64) -> String {
+    format!(
+        "On the runway, but {:.0} degrees off its heading and I couldn't straighten us. \
+         Holding position.",
+        err_deg.abs()
+    )
+}
+
+/// Bring a castoring nose round onto the runway's course after a line-up's
+/// arrival ([`LineUpAlign`]): the differential brakes on the drive's own
+/// channels, the governor creeping or stopping. Every tick is blackboxed
+/// `line_up_align`, the verdict `line_up_aligned`.
+async fn align_on_the_runway(
+    xp: &XPlaneClient,
+    voice: &Option<Voice>,
+    course: f64,
+    gen: u64,
+) -> AlignEnd {
+    let mut judge = LineUpAlign::new(course);
+    let t0 = std::time::Instant::now();
+    let mut frozen_s = 0.0_f64;
+    let mut start: Option<(f64, f64)> = None;
+    let mut last_creep: Option<bool> = None;
+    let mut last_err = 0.0_f64;
+    let end = loop {
+        if !ACTIVE.load(Ordering::Relaxed)
+            || DRIVE_GEN.load(Ordering::SeqCst) != gen
+            || !speedhold::taxi_hold_active()
+        {
+            break AlignEnd::Interrupted;
+        }
+        if crate::xplane::sim_frozen(xp).await {
+            progress_hold();
+            frozen_s += 0.5;
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            continue;
+        }
+        let (yield_r, pos, yaw_r) = tokio::join!(
+            xp.get_float(STEER_YIELD),
+            sim::position::read(xp),
+            xp.get_float(YAW_RATE),
+        );
+        if yield_r.is_ok_and(|v| v > 0.5) {
+            crate::blackbox::record("autotaxi", serde_json::json!({"event": "pedal_yield"}));
+            crate::flight::note_pilot_takeover("taxi: pedals");
+            alert(
+                voice,
+                Priority::Advisory,
+                "Your steering. I still have the throttle and brakes.",
+            );
+            ACTIVE.store(false, Ordering::Relaxed);
+            break AlignEnd::Interrupted;
+        }
+        let (lat_r, lon_r) = sim::position::lat_lon(&pos);
+        let psi_r = sim::position::field(&pos, |p| p.psi_true_deg);
+        let gs_r = sim::position::field(&pos, |p| p.gs_ms);
+        // A failed read is no measurement: nothing written, the channels
+        // expire, the next tick asks again.
+        let (Ok(lat), Ok(lon), Ok(psi), Ok(gs_ms), Ok(yaw)) = (lat_r, lon_r, psi_r, gs_r, yaw_r)
+        else {
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            continue;
+        };
+        progress_hold();
+        let gs_kts = gs_ms * MS_TO_KTS;
+        let from = *start.get_or_insert((lat, lon));
+        let rolled_m = crate::autoland::haversine_nm(from.0, from.1, lat, lon) * M_PER_NM;
+        let t_s = t0.elapsed().as_secs_f64() - frozen_s;
+        last_err = judge.err_deg(psi);
+        let step = judge.step(t_s, psi, gs_kts, yaw, rolled_m);
+        let (bl, br, creep) = match step {
+            AlignStep::Align { bl, br, creep } => (bl, br, creep),
+            _ => (0.0, 0.0, false),
+        };
+        crate::blackbox::record(
+            "autotaxi",
+            serde_json::json!({"event": "line_up_align", "err": last_err, "yaw_dps": yaw,
+                               "gs": gs_kts, "bl": bl, "br": br, "creep": creep,
+                               "rolled_m": rolled_m, "t_s": t_s}),
+        );
+        match step {
+            AlignStep::Done { .. } => break AlignEnd::Aligned,
+            AlignStep::GiveUp { err_deg, .. } => break AlignEnd::NotAligned(err_deg),
+            AlignStep::Align { .. } => {}
+        }
+        if last_creep != Some(creep) {
+            speedhold::set_taxi_target(if creep { ALIGN_CREEP_KTS } else { 0.0 });
+            last_creep = Some(creep);
+        }
+        // The rudder helps what it can (a steerable castoring nose, the
+        // SF50's); the brakes do the turning.
+        let steer = ((last_err - yaw * ALIGN_LEAD_S) / ALIGN_FULL_DEG).clamp(-1.0, 1.0);
+        let _ = tokio::join!(
+            xp.set_float(TAXI_STEER, steer),
+            xp.set_float(LEFT_BRAKE, bl),
+            xp.set_float(RIGHT_BRAKE, br),
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    };
+    speedhold::set_taxi_target(0.0);
+    let _ = tokio::join!(
+        xp.set_float(TAXI_STEER, 0.0),
+        xp.set_float(LEFT_BRAKE, 0.0),
+        xp.set_float(RIGHT_BRAKE, 0.0),
+    );
+    let ok = match &end {
+        AlignEnd::Aligned => Some(true),
+        AlignEnd::NotAligned(_) => Some(false),
+        AlignEnd::Interrupted => None,
+    };
+    crate::blackbox::record(
+        "autotaxi",
+        serde_json::json!({"event": "line_up_aligned", "ok": ok, "err_deg": last_err,
+                           "course": course, "creeps": judge.creeps,
+                           "secs": t0.elapsed().as_secs_f64() - frozen_s}),
+    );
+    end
 }
 
 /// Say a line without blocking the loop (queued; gated off in ATC-only mode
@@ -2414,12 +2687,26 @@ async fn drive(xp: XPlaneClient, voice: Option<Voice>, route: Route, base_kts: f
         // holding position on the brakes, exactly as a spoken "stop" —
         // "go" past this point is the pilot's call (a crossing clearance).
         if remaining <= 1.0 && gs_kts < 1.5 {
+            // A line-up on a castoring nose ends POINTING down the runway,
+            // not merely on it ([`LineUpAlign`]).
+            let mut crooked: Option<f64> = None;
+            if let Some(course) = route.align_course_deg.filter(|_| {
+                route.pace.brake_steer || crate::aircraft::nose_castors()
+            }) {
+                match align_on_the_runway(&xp, &voice, course, gen).await {
+                    AlignEnd::Aligned => {}
+                    AlignEnd::NotAligned(err) => crooked = Some(err),
+                    AlignEnd::Interrupted => break,
+                }
+            }
             tracing::info!("auto taxi: holding point, done");
             LAST_ARRIVED.store(true, Ordering::Relaxed);
             crate::blackbox::record("autotaxi", serde_json::json!({"event": "holding_point"}));
             speedhold::set_taxi_target(0.0);
             let _ = xp.set_float(TAXI_STEER, 0.0).await;
-            let line = if let Some(done) = &route.done_line {
+            let line = if let Some(err) = crooked {
+                not_aligned_line(err)
+            } else if let Some(done) = &route.done_line {
                 done.clone()
             } else if route.holding_point.is_empty() {
                 "Holding point. Holding position, brakes set.".to_string()
@@ -2679,6 +2966,62 @@ async fn drive(xp: XPlaneClient, voice: Option<Voice>, route: Route, base_kts: f
         ACTIVE.store(false, Ordering::Relaxed);
     }
     tracing::info!(gen, "auto taxi stopped");
+}
+
+/// A castoring nose's yaw on its brakes, for the aligning pivot's tests: the
+/// brake command (signed, + right) reaches the wheel after `delay_s` through a
+/// `tau_s` lag, the yaw accelerates `k` deg/s^2 per unit of brake (times
+/// `authority`, the share the rolling speed gives) and decays at `d` per
+/// second. Fitted to the iMac's pirouettes of 2026-09-29 (LEMG 12 SR22
+/// 1790690995, LILB 03 Evolution 1790712974): 0.45 of brake built the yaw
+/// 25 to 40 deg/s per second, a brake let go turned the yaw 0.4 to 0.8 s
+/// later, and the old law on this plant at the 0.42 s tick swings
+/// +/-13 degrees at 19 deg/s where the SR22 swung +/-12 at up to 25.
+#[cfg(test)]
+pub(crate) mod yaw_plant {
+    pub struct Plant {
+        pub k: f64,
+        pub d: f64,
+        pub delay_s: f64,
+        pub tau_s: f64,
+        /// Heading error, degrees (+ = the course is right of the nose).
+        pub err: f64,
+        /// Yaw rate, deg/s (+ = nose right, reducing a + error).
+        pub yaw: f64,
+        brake: f64,
+        t: f64,
+        hist: Vec<(f64, f64)>,
+    }
+
+    impl Plant {
+        pub fn new(k: f64, d: f64, err: f64, yaw: f64) -> Self {
+            Plant { k, d, delay_s: 0.3, tau_s: 0.3, err, yaw, brake: 0.0, t: 0.0, hist: Vec::new() }
+        }
+
+        /// Hold the signed brake command `cmd` for `dt` seconds.
+        pub fn run(&mut self, cmd: f64, authority: f64, dt: f64) {
+            self.hist.push((self.t, cmd));
+            let h = 0.01;
+            let end = self.t + dt;
+            while self.t < end - 1e-9 {
+                let delayed = self
+                    .hist
+                    .iter()
+                    .rev()
+                    .find(|(tt, _)| *tt <= self.t - self.delay_s)
+                    .map_or(0.0, |(_, c)| *c);
+                self.brake += (delayed - self.brake) * h / self.tau_s;
+                self.yaw += (self.k * self.brake * authority - self.d * self.yaw) * h;
+                self.err -= self.yaw * h;
+                self.t += h;
+            }
+        }
+    }
+
+    /// The signed command of a (left, right) pair.
+    pub fn signed((l, r): (f64, f64)) -> f64 {
+        r - l
+    }
 }
 
 #[cfg(test)]
@@ -4527,6 +4870,156 @@ mod tests {
         assert!(bend_lookahead_cap_m(12.0, 0.1).is_infinite());
         assert!(bend_lookahead_cap_m(0.5, 10.0).is_infinite());
         assert_eq!(bend_lookahead_cap_m(8.0, 30.0), 16.0);
+    }
+
+    /// The aligning pivot on the fitted plant ([`super::yaw_plant`]): from
+    /// the SR22's 10.8 and the Evolution's 24.6 degrees (the roll's first
+    /// ticks, 1790690995 and 1790712974, 2026-09-29), at the iMac's 0.3 to
+    /// 0.5 s ticks and on a softer and a stiffer plant, it comes round and
+    /// STAYS within the aligned band, never swinging more than 2 degrees
+    /// through. The old law (full brake from 15 degrees on the error alone,
+    /// let go only past 15 deg/s) on the same plant pirouettes, as flown.
+    #[test]
+    fn the_aligning_pivot_catches_its_swing_on_the_imac_plant() {
+        use super::yaw_plant::{signed, Plant};
+        let old_law = |err: f64, yaw_diff: f64| {
+            if err.abs() <= 3.0 {
+                return 0.0;
+            }
+            let want = (err / 15.0).clamp(-1.0, 1.0);
+            let (l, r) = super::pivot_brake_split(want, 2.0);
+            signed((l, r)) * super::pivot_rate_scale(want, yaw_diff)
+        };
+        // As flown: the old law swings through by more than the start.
+        let mut p = Plant::new(140.0, 3.0, 10.8, 0.0);
+        let (mut prev, mut worst) = (p.err, 0.0_f64);
+        for _ in 0..48 {
+            let yaw_diff = -(p.err - prev) / 0.42;
+            prev = p.err;
+            p.run(old_law(p.err, yaw_diff), 1.0, 0.42);
+            worst = worst.max(-p.err);
+        }
+        assert!(worst > 8.0, "the old law pirouettes on this plant: {worst:.1}");
+
+        for (k, d) in [(140.0, 3.0), (70.0, 1.5), (100.0, 1.0), (200.0, 4.0)] {
+            for tick in [0.3, 0.42, 0.5] {
+                for e0 in [10.8, 24.6, -10.8, 5.0] {
+                    let mut p = Plant::new(k, d, e0, 0.0);
+                    let mut through = 0.0_f64;
+                    let mut settled_at: Option<f64> = None;
+                    let mut t = 0.0;
+                    while t < 25.0 {
+                        p.run(signed(super::align_pivot_brakes(p.err, p.yaw)), 1.0, tick);
+                        t += tick;
+                        through = through.max(-p.err * e0.signum());
+                        if p.err.abs() <= super::ALIGNED_DEG {
+                            settled_at.get_or_insert(t);
+                        } else {
+                            settled_at = None;
+                        }
+                    }
+                    let why = format!("k {k} d {d} tick {tick} from {e0}");
+                    assert!(through <= 2.5, "{why}: swung {through:.1} through");
+                    let at = settled_at.unwrap_or_else(|| panic!("{why}: never settled"));
+                    assert!(at < 20.0, "{why}: settled at {at:.1} s");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_aligning_pivot_brakes_the_inside_wheel_and_catches_a_swing() {
+        // The SR22's roll start: 10.8 off, still: the right (inside) brake.
+        let (l, r) = super::align_pivot_brakes(10.8, 0.0);
+        assert!(l == 0.0 && r > 0.1, "{l} {r}");
+        // Turning into it at 6 deg/s: the lead has already let go and holds
+        // the swing on the OTHER brake (10.8 - 12 is past the course).
+        let (l, r) = super::align_pivot_brakes(10.8, 6.0);
+        assert!(l > 0.0 && r == 0.0, "{l} {r}");
+        // Straight and still: nothing.
+        assert_eq!(super::align_pivot_brakes(0.5, 0.3), (0.0, 0.0));
+        // Never more than a pivot's brake.
+        let (l, _) = super::align_pivot_brakes(-170.0, 0.0);
+        assert!(l <= 0.45 + 1e-9);
+    }
+
+    /// The line-up's end, on the plant with the governor: the SR22 arrived
+    /// at LEMG 12 5.0 degrees off its final bearing, yawing away at 1.7
+    /// deg/s at 2.1 kt (1790690995, t 1790692240.7), and was declared lined
+    /// up; it stopped at 107 true on a 117.7 runway. The Evolution's LILB 03
+    /// turn-round arrived 11.8 off (13 at the stop) yawing away at 2.3
+    /// (1790712974, t 1790713229.1). Now the drive ends only STOPPED within
+    /// [`super::ALIGNED_DEG`], in bounded time and a few metres of runway.
+    #[test]
+    fn a_line_up_ends_stopped_and_pointing_down_the_runway() {
+        use super::yaw_plant::{signed, Plant};
+        use super::{AlignStep, LineUpAlign};
+        for (course, psi0, yaw0, gs0) in [(117.7, 112.7, -1.7, 2.1), (24.0, 12.2, -2.3, 1.9)] {
+            for (k, d) in [(140.0, 3.0), (70.0, 1.5)] {
+                let mut judge = LineUpAlign::new(course);
+                let e0 = judge.err_deg(psi0);
+                let mut p = Plant::new(k, d, e0, yaw0);
+                let (mut gs, mut rolled, mut t) = (gs0, 0.0_f64, 0.0_f64);
+                let tick = 0.42;
+                let end = loop {
+                    let psi = course - p.err;
+                    match judge.step(t, psi, gs, p.yaw, rolled) {
+                        AlignStep::Align { bl, br, creep } => {
+                            // The governor: toward the creep at 0.7 kt/s,
+                            // or braked to a stop at 1.5 kt/s.
+                            let want = if creep { super::ALIGN_CREEP_KTS } else { 0.0 };
+                            gs = if gs < want { (gs + 0.7 * tick).min(want) } else { (gs - 1.5 * tick).max(want) };
+                            // A braked wheel turns a castoring nose only
+                            // with the aircraft moving.
+                            p.run(signed((bl, br)), (gs / 1.5).min(1.0), tick);
+                            rolled += gs / 1.943_844 * tick;
+                        }
+                        other => break other,
+                    }
+                    t += tick;
+                };
+                let why = format!("course {course} k {k}");
+                match end {
+                    AlignStep::Done { err_deg } => {
+                        assert!(err_deg.abs() <= super::ALIGNED_DEG, "{why}: {err_deg}")
+                    }
+                    other => panic!("{why}: {other:?}"),
+                }
+                assert!(t < super::ALIGN_MAX_S, "{why}: {t:.1} s");
+                assert!(rolled < 25.0, "{why}: rolled {rolled:.1} m");
+            }
+        }
+    }
+
+    #[test]
+    fn a_line_up_already_straight_is_done_and_one_that_cannot_turn_says_so() {
+        use super::{AlignStep, LineUpAlign};
+        // A runway start's numbers: 0.4 off, stopped.
+        let mut j = LineUpAlign::new(117.7);
+        assert!(matches!(j.step(0.0, 117.3, 0.1, 0.0, 0.0), AlignStep::Done { .. }));
+        assert_eq!(j.creeps, 0);
+        // Brakes that turn nothing: the creep, then out of time, stopped.
+        let mut j = LineUpAlign::new(117.7);
+        let mut t = 0.0;
+        let end = loop {
+            match j.step(t, 107.0, 0.0, 0.0, 2.0) {
+                AlignStep::Align { creep, br, .. } => assert!(creep && br > 0.0),
+                other => break other,
+            }
+            t += 0.42;
+        };
+        assert!(matches!(end, AlignStep::GiveUp { why: "time", .. }), "{end:?}");
+        // ...or out of runway.
+        let mut j = LineUpAlign::new(117.7);
+        assert!(matches!(
+            j.step(0.0, 107.0, 2.0, 0.0, super::ALIGN_MAX_ROLL_M + 1.0),
+            AlignStep::GiveUp { why: "rolled", .. }
+        ));
+        assert_eq!(
+            super::not_aligned_line(-10.7),
+            "On the runway, but 11 degrees off its heading and I couldn't straighten us. \
+             Holding position."
+        );
     }
 
     #[test]
