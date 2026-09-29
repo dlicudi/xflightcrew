@@ -11114,3 +11114,46 @@ Next flight (SR22): `autotakeoff` `rotate_tick` `pitch` 0.45 to 0.6 at Vr fallin
 theta at 7 about 2 s after `rotate`, `wheels` false near 80 to 85 KIAS, `liftoff` `ias` under
 about 88 (the 8 ft gate lags wheels-off), `climb_manual` theta under 10 with no drop under 7, and
 `stage_result` takeoff `liftoff_xtk_m` against the 5.4 m of 1790694884. Offline only.
+
+## 2026-09-29: the circuit arrives on the path, never handed over high (#188)
+
+LEMG 13, SR22 (sorties 1790692781, 1790694884, 1790697583, all `full_auto`): terrain raised the
+pattern to 2,571 ft (the live floor held 1790692781's downwind at 2,050 too), the platform 970, the
+base's path gate 771. From abeam at 2,450 ft every descending leg flew the capture's standing
+authority, a flat -500 fpm (a target rate of 0 on downwind and base, `ALT_MAX_EXTRA_DESCENT_FPM`
+on top): 2,070 ft at the base turn, 1,742 at the final turn, 1,269 at the handoff at 1.51 nm, 659
+ft over the circuit's path and 545 over autoland's, which went around at once (`late_go_around`);
+1790692781 handed over at 1,209 AGL, 1,292 against a 607 ft path. `ready_for_autoland` judged only
+the line. 1,850 ft in the 144 s from abeam wanted 770 fpm, which the airframe has.
+
+- **The descent is sized on the height to lose** (`leg_descent_authority_fpm`,
+  `descent_authority_fpm`, `alt_capture_vs_on`): from abeam and on base, the height over the base's
+  own path gate over `DESCENT_PLAN_SHARE` 0.75 of the track to the roll-out (`to_rollout_m`); on
+  final, the height over the path to `FINAL_HIGH_LAST_M` (1 nm) on top of the path's rate. Never
+  under the old 500 (an ordinary circuit flies as before), never over `pattern_descent_cap_fpm`
+  (the reversal's: the enroute rate within 800 to 1,500). A live terrain floor over the leg target
+  is still the target.
+- **The downwind extends where even that cannot make the path** (`extend_downwind`, the reversal's
+  `too_high_to_turn` for the circuit): the cap across the base plus the final's catch-up to 1 nm,
+  planned on 0.75, against the height over the path at a roll-out HERE; at most
+  `MAX_DOWNWIND_EXTEND_M` (2 nm) past the drawn base turn (the live floor guards past the probed
+  corridor); `leg_limit_s` counts it. Said once ("High for the approach. Extending the downwind.").
+- **The handoff waits for the path** (`ready_for_autoland` `above_path_ft`, `HANDOFF_ABOVE_PATH_FT`
+  200, the last-ditch valve included; below the path is autoland's). A final still high inside 1 nm
+  is flown around by the circuit (`final_high_give_up`, `GoAroundBy::Crew`, "Too high to land from
+  here. Going around."), once: a second lap as high hands over (`high_handoff`) and autoland's own
+  late go-around and reversal take it.
+
+Plant (second-order VS through 0.8 s, 17 degree turns, the recorded geometry): the old law hands
+over 688 ft high at 2,629 m (recorded 659 at 3,007); now the base turns 976 m later and hands over
+5 ft under the path at 3,590 m, 800 fpm at most; from 2,900 ft abeam it extends 1,885 m and hands
+over on the path at 4,499 m.
+
+Tests: `the_raised_lemg_pattern_arrives_on_the_path`, `too_high_for_the_base_extends_the_downwind`,
+`an_ordinary_circuit_flies_as_before`, `the_descent_is_sized_on_the_height_to_lose`,
+`the_handoff_waits_for_the_path`, `the_crews_go_around_says_why`.
+
+Next circuit over raised ground: `circuit` `leg` `descent_fpm` over 500 from abeam with
+`above_path` falling, `downwind_extended` / `downwind_extension_end` (`extended_m`), and
+`handoff_autoland` `above_path_ft` under 200 with `high_handoff` false; no `autoland`
+`late_go_around`; `ordered_go_around` `by: crew` only if still high at a mile. Offline only.

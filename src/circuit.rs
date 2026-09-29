@@ -334,13 +334,26 @@ const LAST_DITCH_XTK_M: f64 = 2.0 * ESTABLISHED_XTK_M;
 /// at `gs_kts`) inside the limit. The circuit's intercept closes on a 900 m
 /// aim, three times quicker than autoland's, and keeps flying it until then.
 /// `None`: the old test alone.
+///
+/// And ON THE PATH, not only on the line (#188): `above_path_ft`, the height
+/// over the circuit's own glidepath at this distance ([`above_path_ft`]),
+/// must be inside [`HANDOFF_ABOVE_PATH_FT`], the last-ditch valve included.
+/// LEMG 13 SR22 (sortie 1790697583-full_auto, 2026-09-29): handed over on
+/// the line at 1.51 nm but 545 ft above autoland's path, which went around at
+/// once (`late_go_around`). The final keeps flying its own descent until then
+/// (see [`final_high_give_up`]). Below the path is autoland's to level out.
+/// `None`: not judged (a failed altitude read).
 pub fn ready_for_autoland(
     xtk_m: f64,
     along_m: f64,
     hdg_err_deg: f64,
     gs_kts: f64,
     limit_m: Option<f64>,
+    above_path_ft: Option<f64>,
 ) -> bool {
+    if above_path_ft.is_some_and(|h| h > HANDOFF_ABOVE_PATH_FT) {
+        return false;
+    }
     if !interceptable(xtk_m, along_m) {
         return false;
     }
@@ -520,6 +533,25 @@ pub fn path_descent_fpm_on(closure_kts: f64, gp_ft_per_nm: f64) -> f64 {
 /// perfect control. It is now the target's rate plus a fixed correction
 /// budget, which leaves a standing target's authority exactly where it was.
 pub fn alt_capture_vs(target_ft: f64, target_rate_fpm: f64, alt_ft: f64, vs_fpm: f64) -> f64 {
+    alt_capture_vs_on(
+        target_ft,
+        target_rate_fpm,
+        alt_ft,
+        vs_fpm,
+        ALT_MAX_EXTRA_DESCENT_FPM,
+    )
+}
+
+/// [`alt_capture_vs`] with `extra_descent_fpm` of descent authority beyond
+/// the target's own rate, sized on the height to lose (#188,
+/// [`leg_descent_authority_fpm`]).
+pub fn alt_capture_vs_on(
+    target_ft: f64,
+    target_rate_fpm: f64,
+    alt_ft: f64,
+    vs_fpm: f64,
+    extra_descent_fpm: f64,
+) -> f64 {
     // The lead compares two FUTURES. Projecting the aircraft forward while
     // comparing it against where the target is NOW is the same mistake in a
     // second coat: in a steady descent it reads the aircraft as lower than it
@@ -532,7 +564,7 @@ pub fn alt_capture_vs(target_ft: f64, target_rate_fpm: f64, alt_ft: f64, vs_fpm:
     let projected_target = target_ft + target_rate_fpm * lead;
     let correction = (projected_target - projected) * ALT_GAIN_FPM_PER_FT;
     (target_rate_fpm + correction)
-        .clamp(target_rate_fpm.min(0.0) - ALT_MAX_EXTRA_DESCENT_FPM, 700.0)
+        .clamp(target_rate_fpm.min(0.0) - extra_descent_fpm.max(0.0), 700.0)
 }
 
 /// The altitude the base/final legs fly to, ft MSL: the 3° path at the
@@ -682,6 +714,187 @@ pub fn live_floor_ft(leg: Leg, alt_msl_ft: f64, ground_ft: f64) -> Option<f64> {
     Some(ground_ft + over)
 }
 
+// ---- Arriving ON the path (#188) ----
+//
+// LEMG 13 SR22, 2026-09-29 (sorties 1790692781, 1790694884 and 1790697583,
+// all `full_auto`): terrain put the pattern at 2,571 ft (2,523 ft over the
+// field), the platform at 970 and the base's path target at 771. From abeam
+// at 2,450 ft the downwind, base and final were flown on the capture's
+// standing-target authority, a flat -500 fpm (`ALT_MAX_EXTRA_DESCENT_FPM`
+// over a rate of 0): 2,070 ft at the base turn, 1,742 at the final turn,
+// 1,269 at the handoff at 1.51 nm against a 610 ft path, 545 ft above
+// autoland's path, which went around at once (`late_go_around`). Losing
+// 1,850 ft in the 144 s from abeam to that handoff wanted 770 fpm, which
+// the airframe had. So the descent is SIZED on the height to lose over the
+// track left, bounded by what the airframe descends at in a pattern; the
+// downwind extends where even that cannot make the path; and the handoff
+// waits for the path.
+
+/// Handed to autoland no higher than this over the circuit's path, ft. Its
+/// path (touchdown aim) sits about 55 ft over ours; its straight-in dives
+/// from inside 500 ft above ([`crate::autoland::aims_at_join_point`]), so
+/// this leaves it a catch-up, never a dive.
+pub const HANDOFF_ABOVE_PATH_FT: f64 = 200.0;
+/// A final still higher than [`HANDOFF_ABOVE_PATH_FT`] this close in is
+/// flown around by the circuit itself, never handed over high: a mile, about
+/// 300 ft on the path, where the normal handoff has long happened (1.5 to 2.2
+/// nm in the LEMG circuits).
+pub const FINAL_HIGH_LAST_M: f64 = M_PER_NM;
+/// The share of the track left a descent is planned on: arrive with a
+/// quarter in hand for the capture's lag and a turn flown wider than drawn.
+const DESCENT_PLAN_SHARE: f64 = 0.75;
+/// The downwind is extended at most this far past its base turn: the
+/// corridor was probed to `downwind_past_m` and the live floor
+/// ([`live_floor_ft`]) is all that guards past it.
+pub const MAX_DOWNWIND_EXTEND_M: f64 = 2.0 * M_PER_NM;
+
+/// Height over the circuit's glidepath at `along_m` from the threshold, ft
+/// (the path [`approach_leg_alt_on`] flies, unfloored). `None` without a
+/// reading. Pure.
+pub fn above_path_ft(
+    alt_msl_ft: f64,
+    field_elev_ft: f64,
+    along_m: f64,
+    gp_ft_per_nm: f64,
+) -> Option<f64> {
+    (alt_msl_ft.is_finite() && along_m.is_finite())
+        .then(|| alt_msl_ft - (field_elev_ft + along_m.abs() / M_PER_NM * gp_ft_per_nm))
+}
+
+/// The steepest descent the pattern plans on, fpm (positive): the
+/// reversal's figure for a high pattern, the airframe's enroute rate within
+/// 800 to 1,500 ([`crate::reversal::pattern_descent_fpm`]).
+pub fn pattern_descent_cap_fpm(enroute_descent_fpm: f64) -> f64 {
+    crate::reversal::pattern_descent_fpm(f64::INFINITY, enroute_descent_fpm)
+}
+
+/// The descent authority the capture is given, fpm (positive): the rate that
+/// loses `above_ft` over [`DESCENT_PLAN_SHARE`] of `to_go_m` at `gs_kts`,
+/// never less than the old standing authority
+/// ([`ALT_MAX_EXTRA_DESCENT_FPM`], so an ordinary circuit flies exactly as it
+/// did) and never more than `cap_fpm`. Pure.
+pub fn descent_authority_fpm(above_ft: f64, to_go_m: f64, gs_kts: f64, cap_fpm: f64) -> f64 {
+    let top = cap_fpm.max(ALT_MAX_EXTRA_DESCENT_FPM);
+    if !above_ft.is_finite() || above_ft <= 0.0 || !to_go_m.is_finite() {
+        return ALT_MAX_EXTRA_DESCENT_FPM;
+    }
+    let v_mps = gs_kts.max(50.0) * 0.514_444;
+    let minutes = (to_go_m * DESCENT_PLAN_SHARE).max(1.0) / v_mps / 60.0;
+    (above_ft / minutes).clamp(ALT_MAX_EXTRA_DESCENT_FPM, top)
+}
+
+/// The track still to fly to the roll-out on final, m: the rest of the
+/// downwind past abeam to its base turn, then the base across to the
+/// centreline. `None` on the other legs. Pure.
+pub fn to_rollout_m(leg: Leg, a_m: f64, x_m: f64, g: &Geometry, left: bool) -> Option<f64> {
+    let side = if left { -1.0 } else { 1.0 };
+    let across = (side * x_m).max(0.0);
+    match leg {
+        Leg::Downwind if a_m < 0.0 => Some((g.downwind_past_m - a_m.abs()).max(0.0) + across),
+        Leg::Base => Some(across),
+        _ => None,
+    }
+}
+
+/// The capture's descent authority on `leg`, fpm (positive; see
+/// [`alt_capture_vs_on`]). From abeam and on base: the height over the
+/// path's roll-out gate (the base's own target) over the track to it. On
+/// final: the height over the path over the run to [`FINAL_HIGH_LAST_M`],
+/// on top of the path's own rate `path_rate_fpm`, the whole within the cap.
+/// Elsewhere the standing authority. Pure.
+#[allow(clippy::too_many_arguments)]
+pub fn leg_descent_authority_fpm(
+    leg: Leg,
+    a_m: f64,
+    x_m: f64,
+    alt_msl_ft: f64,
+    field_elev_ft: f64,
+    tpa_msl_ft: f64,
+    g: &Geometry,
+    left: bool,
+    shape: DescentShape,
+    gs_kts: f64,
+    cap_fpm: f64,
+    path_rate_fpm: f64,
+) -> f64 {
+    match leg {
+        Leg::Final => {
+            let above = above_path_ft(alt_msl_ft, field_elev_ft, a_m, shape.gp_ft_per_nm);
+            let to_go = (a_m.abs() - FINAL_HIGH_LAST_M).max(0.0);
+            descent_authority_fpm(
+                above.unwrap_or(0.0),
+                to_go,
+                gs_kts,
+                cap_fpm - path_rate_fpm.abs(),
+            )
+        }
+        _ => match to_rollout_m(leg, a_m, x_m, g, left) {
+            Some(to_go) => {
+                let gate = approach_leg_alt_on(
+                    field_elev_ft,
+                    tpa_msl_ft,
+                    path_dist_m(Leg::Base, a_m, g.downwind_past_m),
+                    shape.gp_ft_per_nm,
+                );
+                descent_authority_fpm(alt_msl_ft - gate, to_go, gs_kts, cap_fpm)
+            }
+            None => ALT_MAX_EXTRA_DESCENT_FPM,
+        },
+    }
+}
+
+/// Hold the downwind past its base turn: too high for the rest of the
+/// pattern to put the aircraft on the path (the reversal's
+/// [`crate::reversal::too_high_to_turn`], for the circuit). Turning base at
+/// `a_m` rolls out there, where the path is `approach_leg_alt_on`; what can
+/// come off on the way is the cap across the base plus the final's catch-up
+/// over the path's own rate (at least the standing
+/// [`ALT_MAX_EXTRA_DESCENT_FPM`]) down to [`FINAL_HIGH_LAST_M`], planned on
+/// [`DESCENT_PLAN_SHARE`] of it. Each metre flown on gains a little: the
+/// descent is steeper than the path. Never past [`MAX_DOWNWIND_EXTEND_M`]
+/// beyond the base point. Pure.
+#[allow(clippy::too_many_arguments)]
+pub fn extend_downwind(
+    alt_msl_ft: f64,
+    field_elev_ft: f64,
+    tpa_msl_ft: f64,
+    a_m: f64,
+    x_m: f64,
+    g: &Geometry,
+    left: bool,
+    shape: DescentShape,
+    gs_kts: f64,
+    cap_fpm: f64,
+) -> bool {
+    let along = a_m.abs();
+    if a_m >= 0.0
+        || !alt_msl_ft.is_finite()
+        || !x_m.is_finite()
+        || along >= g.downwind_past_m + MAX_DOWNWIND_EXTEND_M
+    {
+        return false;
+    }
+    let side = if left { -1.0 } else { 1.0 };
+    let across = (side * x_m).max(0.0);
+    let rollout = along.max(g.downwind_past_m);
+    let gate = approach_leg_alt_on(field_elev_ft, tpa_msl_ft, rollout, shape.gp_ft_per_nm);
+    let gs = gs_kts.max(50.0);
+    let v_mps = gs * 0.514_444;
+    let base_min = across / v_mps / 60.0;
+    let final_min = (rollout - FINAL_HIGH_LAST_M).max(0.0) / v_mps / 60.0;
+    let path_fpm = shape.gp_ft_per_nm * gs / 60.0;
+    let catch_up = (cap_fpm - path_fpm).max(ALT_MAX_EXTRA_DESCENT_FPM);
+    let can = (cap_fpm.max(ALT_MAX_EXTRA_DESCENT_FPM) * base_min + catch_up * final_min)
+        * DESCENT_PLAN_SHARE;
+    alt_msl_ft - gate > can
+}
+
+/// A final still above [`HANDOFF_ABOVE_PATH_FT`] inside
+/// [`FINAL_HIGH_LAST_M`]: never handed over, flown around. Pure.
+pub fn final_high_give_up(above_path_ft: Option<f64>, along_m: f64) -> bool {
+    above_path_ft.is_some_and(|h| h > HANDOFF_ABOVE_PATH_FT) && along_m.abs() <= FINAL_HIGH_LAST_M
+}
+
 /// The speed the pattern legs are flown at: the airframe's climb speed, but
 /// never more than [`PATTERN_MAX_APPROACH_MULT`] times its approach speed.
 ///
@@ -817,6 +1030,7 @@ pub fn go_around_line(by: crate::go_around::GoAroundBy) -> &'static str {
     match by {
         crate::go_around::GoAroundBy::Tower => "Going around. Tower's instruction.",
         crate::go_around::GoAroundBy::Pilot => "Going around.",
+        crate::go_around::GoAroundBy::Crew => "Too high to land from here. Going around.",
     }
 }
 
@@ -2070,7 +2284,14 @@ pub fn leg_limit_s(leg: Leg, g: &Geometry, runway_len_m: f64, pattern_kts: f64) 
         Leg::Final => g.downwind_past_m + turn,
     };
     let mps = pattern_kts.max(40.0) * 0.514_444;
-    LEG_TIME_FACTOR * dist / mps + LEG_TIME_MARGIN_S
+    // An extended downwind (#188) is still the pattern, and so is its longer
+    // final: the extension's own time, once (not factored, so the #160
+    // downwind that never ended still trips before its sortie did).
+    let extension = match leg {
+        Leg::Downwind | Leg::Final => MAX_DOWNWIND_EXTEND_M / mps,
+        _ => 0.0,
+    };
+    LEG_TIME_FACTOR * dist / mps + LEG_TIME_MARGIN_S + extension
 }
 
 /// The circuit's own give-up (#160): the aircraft far above the pattern, a
@@ -4676,6 +4897,12 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, p: Params
     // The gear the go-around still owes raising.
     let mut gear_up_owed = false;
     let mut go_arounds: u32 = 0;
+    // The circuit's own go-arounds for a final too high to hand over (#188).
+    let mut high_go_arounds: u32 = 0;
+    // The steepest the pattern descends at, this airframe (#188).
+    let descent_cap = pattern_descent_cap_fpm(crate::procedure::descent_fpm());
+    // The downwind held past its base turn for height, and where it began.
+    let mut extending: Option<f64> = None;
     // The bank flown through the turn onto base.
     let mut base_bank = BankWatch::default();
 
@@ -4724,6 +4951,19 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, p: Params
         // (negative on the approach side) and cross-track (right positive).
         let a_m = -along_track_nm(lat, lon, &rwy) * M_PER_NM;
         let x_m = cross_track_nm(lat, lon, &rwy) * M_PER_NM;
+        // Height over the circuit's own path here (#188): the handoff waits
+        // for it, and a final still high a mile out is flown around.
+        let above_path = above_path_ft(alt_msl_ft, field_elev_ft, a_m, descent_shape.gp_ft_per_nm);
+        // Once only: a second lap as high as the first is the same geometry,
+        // and autoland's own late go-around and reversal take it from there
+        // (blackbox `high_handoff`).
+        let high_final = leg == Leg::Final
+            && turning_final
+            && high_go_arounds == 0
+            && final_high_give_up(above_path, a_m);
+        if high_final {
+            high_go_arounds += 1;
+        }
 
         // --- The tower's go-around order, before anything else: a landing
         // clearance voided while the circuit flies its own final is flown
@@ -4732,13 +4972,17 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, p: Params
         // the order came at 736 ft, 5.7 km out, and the circuit flew on,
         // handed over at 2 nm and landed "without clearance".
         let fresh = orders.take();
-        if let Some(by) = order_owed.take().or(fresh) {
+        let crew = high_final.then_some(crate::go_around::GoAroundBy::Crew);
+        if let Some(by) = order_owed.take().or(fresh).or(crew) {
             let ias_now = ias_r.as_ref().ok().copied();
-            crate::go_around::answer(if flies_go_around_order(leg) {
-                crate::go_around::Answer::Flying
-            } else {
-                crate::go_around::Answer::NotOnApproach
-            });
+            // The crew's own go-around answers no order.
+            if by != crate::go_around::GoAroundBy::Crew {
+                crate::go_around::answer(if flies_go_around_order(leg) {
+                    crate::go_around::Answer::Flying
+                } else {
+                    crate::go_around::Answer::NotOnApproach
+                });
+            }
             if flies_go_around_order(leg) {
                 go_arounds += 1;
                 let limits = crate::aircraft::flap_limits();
@@ -4757,6 +5001,7 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, p: Params
                         "agl_ft": agl_ft, "a_m": a_m, "x_m": x_m, "ias": ias_now,
                         "flap_was": last_flap, "flap": flap, "flap_ok": flap_ok,
                         "thr_ok": thr_ok.is_ok(), "n": go_arounds, "by": by.label(),
+                        "above_path_ft": above_path,
                     }),
                 );
                 if let Some(was) = last_flap {
@@ -4815,6 +5060,9 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, p: Params
             .unwrap_or(p_approach_ias);
         let rwy_width_m = crate::autoland::runway_width_m(&rwy);
         let landing_limit_m = crate::autoland::landing_xtk_limit_m(rwy_width_m);
+        // On the path too (#188), until the one lap flown around for height
+        // comes back as high: then autoland's own go-around takes it.
+        let high_handoff = high_go_arounds > 0 && final_high_give_up(above_path, a_m);
         if turning_final
             && ready_for_autoland(
                 x_m,
@@ -4822,6 +5070,7 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, p: Params
                 hdg_err,
                 handoff_gs,
                 rwy_width_m.map(|_| landing_limit_m),
+                if high_handoff { None } else { above_path },
             )
         {
             let alt_msl = field_elev_ft + agl_ft;
@@ -4861,6 +5110,8 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, p: Params
                     "residual_m": handoff_residual_m(x_m, a_m, handoff_gs),
                     "limit_m": landing_limit_m,
                     "glidepath_deg": descent_shape.glidepath_deg(),
+                    "above_path_ft": above_path,
+                    "high_handoff": high_handoff,
                 }),
             );
             // A path steepened over the ground is autoland's path too (#182),
@@ -5105,8 +5356,26 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, p: Params
         } else {
             0.0
         };
+        // The descent sized on the height to lose over the track left, within
+        // the airframe's (#188): a flat 500 fpm from a pattern raised for the
+        // ground handed autoland the final 545 ft high. A terrain floor above
+        // the leg's target is still the target: never below it.
+        let descent_fpm = leg_descent_authority_fpm(
+            leg,
+            a_m,
+            x_m,
+            alt_msl_ft,
+            field_elev_ft,
+            tpa_msl_ft,
+            &geom,
+            left,
+            descent_shape,
+            handoff_gs,
+            descent_cap,
+            target_rate,
+        );
         let vs_want = if alt_msl_ft.is_finite() {
-            alt_capture_vs(target_alt, target_rate, alt_msl_ft, vs_est)
+            alt_capture_vs_on(target_alt, target_rate, alt_msl_ft, vs_est, descent_fpm)
         } else {
             0.0
         };
@@ -5433,11 +5702,57 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, p: Params
                 "climb_floor": climb_floor,
                 // The climb the watch judges on (#181).
                 "vs": climb_watch.vs_fpm(),
+                // The descent authority and the height over the path (#188).
+                "descent_fpm": descent_fpm, "above_path": above_path,
             }),
         );
 
         if !pattern_advance(leg, a_m, x_m, &geom, rwy.length_m, left) {
             continue;
+        }
+        // Too high for the rest of the pattern to meet the path: the
+        // downwind carries on (#188), said once, bounded by
+        // MAX_DOWNWIND_EXTEND_M.
+        if leg == Leg::Downwind
+            && extend_downwind(
+                alt_msl_ft,
+                field_elev_ft,
+                tpa_msl_ft,
+                a_m,
+                x_m,
+                &geom,
+                left,
+                descent_shape,
+                handoff_gs,
+                descent_cap,
+            )
+        {
+            if extending.is_none() {
+                extending = Some(a_m);
+                crate::blackbox::record(
+                    "circuit",
+                    serde_json::json!({"event": "downwind_extended", "a_m": a_m, "x_m": x_m,
+                                       "alt_msl": alt_msl_ft, "above_path": above_path,
+                                       "descent_cap_fpm": descent_cap,
+                                       "max_extend_m": MAX_DOWNWIND_EXTEND_M}),
+                );
+                alert(
+                    &voice,
+                    Priority::Advisory,
+                    "High for the approach. Extending the downwind.",
+                );
+            }
+            continue;
+        }
+        if leg == Leg::Downwind {
+            if let Some(from) = extending.take() {
+                crate::blackbox::record(
+                    "circuit",
+                    serde_json::json!({"event": "downwind_extension_end",
+                                       "extended_m": (a_m.abs() - from.abs()).max(0.0),
+                                       "alt_msl": alt_msl_ft, "above_path": above_path}),
+                );
+            }
         }
         let Some(nxt) = next_leg(leg) else { continue };
         leg = nxt;
@@ -7008,16 +7323,16 @@ mod tests {
         // ...but the aircraft is still 90 degrees across the centreline, and
         // handing it over there is what made it approach and land at an angle.
         assert!(
-            !ready_for_autoland(1813.0, 4092.0, hdg_err_on_base, BARON_KTS, None),
+            !ready_for_autoland(1813.0, 4092.0, hdg_err_on_base, BARON_KTS, None, None),
             "still turning: fly the turn, do not hand over the diagonal"
         );
 
         // Rolled out on the runway course with the designed 0.3-radii trim
         // left: this is the straight-in autoland is for.
-        assert!(ready_for_autoland(250.0, 3500.0, 3.0, BARON_KTS, None));
-        assert!(ready_for_autoland(-250.0, 3500.0, -3.0, BARON_KTS, None));
+        assert!(ready_for_autoland(250.0, 3500.0, 3.0, BARON_KTS, None, None));
+        assert!(ready_for_autoland(-250.0, 3500.0, -3.0, BARON_KTS, None, None));
         // Just outside the rollout tolerance, still turning.
-        assert!(!ready_for_autoland(250.0, 3500.0, 25.0, BARON_KTS, None));
+        assert!(!ready_for_autoland(250.0, 3500.0, 25.0, BARON_KTS, None, None));
 
         // The live failure (2026-08-01): rolled out on HEADING — eight
         // degrees, comfortably inside the tolerance — and 776 m to the side,
@@ -7029,19 +7344,19 @@ mod tests {
             "the geometry was closeable, which is exactly why heading alone let it through"
         );
         assert!(
-            !ready_for_autoland(776.0, 3128.0, 8.0, BARON_KTS, None),
+            !ready_for_autoland(776.0, 3128.0, 8.0, BARON_KTS, None, None),
             "parallel and 776 m off is not established"
         );
 
         // The last-ditch valve: out of room and still not aligned, autoland's
         // intercept beats a pattern leg that has nowhere left to go.
-        assert!(ready_for_autoland(300.0, 1200.0, 40.0, BARON_KTS, None));
+        assert!(ready_for_autoland(300.0, 1200.0, 40.0, BARON_KTS, None, None));
         // ...but never something autoland cannot fly at all, however close.
-        assert!(!ready_for_autoland(2815.0, 1200.0, 0.0, BARON_KTS, None));
+        assert!(!ready_for_autoland(2815.0, 1200.0, 0.0, BARON_KTS, None, None));
 
         // A failed heading read must not read as aligned — the caller passes
         // 180, the worst case, so the handover simply waits a tick.
-        assert!(!ready_for_autoland(1813.0, 4092.0, 180.0, BARON_KTS, None));
+        assert!(!ready_for_autoland(1813.0, 4092.0, 180.0, BARON_KTS, None, None));
     }
 
     /// Where the 776 m came from, in arithmetic. The pattern radius estimate
@@ -7675,7 +7990,7 @@ mod issue_147_circuit_tests {
             let x_m = cross_track_nm(jet.lat, jet.lon, &rwy) * M_PER_NM;
             let trk = jet.track();
             let trk_err = ((trk - rwy.course_deg + 540.0).rem_euclid(360.0)) - 180.0;
-            if leg == Leg::Final && ready_for_autoland(x_m, a_m.abs(), trk_err, ias, limit) {
+            if leg == Leg::Final && ready_for_autoland(x_m, a_m.abs(), trk_err, ias, limit, None) {
                 return (
                     Handoff {
                         x_m,
@@ -8348,17 +8663,19 @@ mod pattern_guard_tests {
                 );
             }
         }
-        // Upwind 405 s, crosswind 405 s, downwind 669 s, at 120 kt.
+        // Upwind 405 s, crosswind 405 s, downwind 669 s, at 120 kt, plus
+        // the downwind's extension (#188), 60 s.
         let lim = |l| leg_limit_s(l, &g, RWY_LEN_M, pattern_kts()).round();
         assert_eq!(lim(Leg::Upwind), 348.0);
         assert_eq!(lim(Leg::Crosswind), 348.0);
-        assert_eq!(lim(Leg::Downwind), 669.0);
+        assert_eq!(lim(Leg::Downwind), 729.0);
     }
 
     /// Replayed through the guard, the recorded circuit is given back at
     /// 3,302 ft, 1,695 over its pattern on the crosswind, 46 s after the
     /// takeoff handed it over; it flew on to 21,882 ft for 14 more minutes. With the height guard blind the
-    /// downwind is called overdue at +976 s, before the sortie's end.
+    /// downwind is called overdue at +1,033 s (976 before the #188 extension),
+    /// before the sortie's end.
     #[test]
     fn the_recorded_climb_away_is_given_back_at_the_pattern_margin() {
         let all = recs();
@@ -8419,7 +8736,8 @@ mod pattern_guard_tests {
         assert!(secs > limit_s && secs < limit_s + 5.0, "{secs} {limit_s}");
         let end = all.iter().find(|r| is(r, "sortie", "end")).unwrap();
         assert!(at < num(end, "t") - T0, "inside the sortie");
-        assert!((950.0..1000.0).contains(&at), "{at}");
+        // +976 s before #188; the extension adds its 60 s.
+        assert!((1010.0..1060.0).contains(&at), "{at}");
     }
 
     /// The servos out is the pilot's disconnect or a dropout: given back
@@ -8590,7 +8908,7 @@ mod pattern_guard_tests {
         while p.t - t0 < 900.0 {
             let now = p.t - t0;
             let trk_err = (p.psi - COURSE + 540.0).rem_euclid(360.0) - 180.0;
-            if turning_final && ready_for_autoland(p.x_m, p.a_m.abs(), trk_err, p.ias, None) {
+            if turning_final && ready_for_autoland(p.x_m, p.a_m.abs(), trk_err, p.ias, None, None) {
                 out.handed_over = Some(now);
                 break;
             }
@@ -9128,5 +9446,341 @@ mod field_circuit_tests {
         assert_eq!(field_circuit_line("Malaga", "13", true, None, None), None);
         let line = field_circuit_line("Gatwick", "26L", true, Some(true), Some(false)).unwrap();
         assert!(!line.contains("published"), "{line}");
+    }
+}
+
+/// Issue #188: the circuit handed autoland the final far above the path
+/// after a pattern raised for the ground. LEMG 13, SR22, 2026-09-29.
+#[cfg(test)]
+mod issue_188_on_the_path_tests {
+    use super::*;
+
+    // The armed record of sortie 1790697583-full_auto: a right-hand pattern
+    // raised to 2,571 ft for terrain, a 922 ft platform and a 3.26 degree
+    // path, radius 1,290 m.
+    const COURSE: f64 = 131.685_387_32;
+    const FIELD_FT: f64 = 48.0;
+    const TPA_FT: f64 = 2571.13;
+    const LEFT: bool = false;
+    /// The SR22's pattern cap: no `enroute_descent_fpm`, the GA 700, so the
+    /// reversal's 800.
+    const SR22_CAP: f64 = 800.0;
+
+    fn shape() -> DescentShape {
+        DescentShape {
+            platform_agl_ft: 921.96,
+            gp_ft_per_nm: 3.257_647_f64.to_radians().tan() * 6076.12,
+        }
+    }
+
+    fn geom() -> Geometry {
+        Geometry {
+            upwind_past_m: 645.0,
+            width_m: 2938.24,
+            downwind_past_m: 3871.13,
+            // The capture the measured bank set (`final_turn` capture_m).
+            final_capture_m: 1234.7,
+            lead_m: 0.9 * 1290.05,
+        }
+    }
+
+    /// A second-order VS plant through a dead time (the SR22's autopilot),
+    /// a banked turn onto the bug, the speed held on the leg's want.
+    struct Sr22 {
+        t: f64,
+        a_m: f64,
+        x_m: f64,
+        psi: f64,
+        bank: f64,
+        alt: f64,
+        x1: f64,
+        vs: f64,
+        ias: f64,
+        dial: f64,
+        queue: VecDeque<(f64, f64)>,
+    }
+
+    impl Sr22 {
+        fn set_dial(&mut self, fpm: f64) {
+            self.queue.push_back((self.t + 0.8, fpm));
+        }
+        fn advance(&mut self, hdg: f64, want_kts: f64, secs: f64) {
+            let dt = 0.05;
+            let mut left = secs;
+            while left > 1e-9 {
+                while self.queue.front().is_some_and(|&(t, _)| t <= self.t) {
+                    self.dial = self.queue.pop_front().map_or(self.dial, |(_, v)| v);
+                }
+                self.x1 += (self.dial - self.x1) * dt / 1.5;
+                self.vs += (self.x1 - self.vs) * dt / 1.5;
+                self.alt += self.vs / 60.0 * dt;
+                let err = (hdg - self.psi + 540.0).rem_euclid(360.0) - 180.0;
+                let want = (err * 1.5).clamp(-17.0, 17.0);
+                self.bank += (want - self.bank).clamp(-5.0 * dt, 5.0 * dt);
+                self.ias += (want_kts - self.ias) * dt / 10.0;
+                let v = self.ias * 0.514_444;
+                let rate = (9.81 * self.bank.to_radians().tan() / v).to_degrees();
+                self.psi = (self.psi + rate * dt).rem_euclid(360.0);
+                let rel = (self.psi - COURSE).to_radians();
+                self.a_m += v * rel.cos() * dt;
+                self.x_m += v * rel.sin() * dt;
+                self.t += dt;
+                left -= dt;
+            }
+        }
+    }
+
+    #[derive(Debug, Default)]
+    struct Flown {
+        /// Handed over: along (m, negative on the approach side), height over
+        /// the path (ft).
+        handoff: Option<(f64, f64)>,
+        /// Flown around by the circuit for height, at this along.
+        went_around: Option<f64>,
+        base_turn_a_m: Option<f64>,
+        min_agl_over_floor: f64,
+        max_vs_down: f64,
+    }
+
+    /// From abeam the threshold as the sortie flew it (t+307: a_m 8, x_m
+    /// 2,941, 2,449 ft still climbing at 274 fpm toward the 2,571 pattern,
+    /// 102 kt), through the rest of the downwind, base and final to the
+    /// handoff. `fixed`: the law as it flew (a standing 500 fpm authority, no
+    /// extension, no height gate). `start_alt` overrides the height abeam.
+    fn fly(fixed: bool, start_alt: f64, cap: f64) -> Flown {
+        let g = geom();
+        let s = shape();
+        let mut p = Sr22 {
+            t: 0.0,
+            a_m: 8.0,
+            x_m: 2941.0,
+            psi: (COURSE + 180.0).rem_euclid(360.0),
+            bank: 0.0,
+            alt: start_alt,
+            x1: 274.0,
+            vs: 274.0,
+            ias: 102.0,
+            dial: 250.0,
+            queue: VecDeque::new(),
+        };
+        let mut leg = Leg::Downwind;
+        let mut turning_final = false;
+        let mut descent_target = None;
+        let (mut vs_est, mut prev_alt) = (p.vs, p.alt);
+        let (mut closure, mut prev_along) = (0.0, p.a_m);
+        let mut last_vs: Option<f64> = None;
+        let mut out = Flown {
+            min_agl_over_floor: f64::INFINITY,
+            ..Default::default()
+        };
+        let tick = 0.5;
+        while p.t < 900.0 {
+            let above = above_path_ft(p.alt, FIELD_FT, p.a_m, s.gp_ft_per_nm);
+            if leg == Leg::Final && !fixed && final_high_give_up(above, p.a_m) {
+                out.went_around = Some(p.a_m);
+                break;
+            }
+            let trk_err = (p.psi - COURSE + 540.0).rem_euclid(360.0) - 180.0;
+            let judged = if fixed { None } else { above };
+            if turning_final && ready_for_autoland(p.x_m, p.a_m.abs(), trk_err, p.ias, None, judged)
+            {
+                out.handoff = Some((p.a_m, above.unwrap()));
+                break;
+            }
+            let hdg = match leg {
+                Leg::Final => final_intercept_hdg(COURSE, p.x_m),
+                _ => leg_heading(COURSE, leg, LEFT),
+            };
+            let target = leg_target_shaped(
+                leg,
+                p.a_m,
+                FIELD_FT,
+                TPA_FT,
+                g.downwind_past_m,
+                s,
+                &mut descent_target,
+            );
+            vs_est = 0.6 * vs_est + 0.4 * (p.alt - prev_alt) / tick * 60.0;
+            prev_alt = p.alt;
+            let closing = (prev_along.abs() - p.a_m.abs()) / tick * 1.943_844;
+            closure = (0.6 * closure + 0.4 * closing).clamp(0.0, 400.0);
+            prev_along = p.a_m;
+            let rate = if leg == Leg::Final {
+                path_descent_fpm_on(closure, s.gp_ft_per_nm)
+            } else {
+                0.0
+            };
+            let extra = if fixed {
+                ALT_MAX_EXTRA_DESCENT_FPM
+            } else {
+                leg_descent_authority_fpm(
+                    leg, p.a_m, p.x_m, p.alt, FIELD_FT, TPA_FT, &g, LEFT, s, p.ias, cap, rate,
+                )
+            };
+            let cmd = alt_capture_vs_on(target, rate, p.alt, vs_est, extra);
+            if last_vs.is_none_or(|v| (v - cmd).abs() > 20.0) {
+                p.set_dial(cmd);
+                last_vs = Some(cmd);
+            }
+            if pattern_advance(leg, p.a_m, p.x_m, &g, 5000.0, LEFT) {
+                let hold = !fixed
+                    && leg == Leg::Downwind
+                    && extend_downwind(
+                        p.alt, FIELD_FT, TPA_FT, p.a_m, p.x_m, &g, LEFT, s, p.ias, cap,
+                    );
+                if !hold {
+                    if let Some(n) = next_leg(leg) {
+                        if n == Leg::Base {
+                            out.base_turn_a_m = Some(p.a_m);
+                        }
+                        leg = n;
+                        turning_final |= leg == Leg::Final;
+                    }
+                }
+            }
+            // The recorded speeds: 101 on the pattern, 91 on final.
+            let want_kts = if leg == Leg::Final { 91.0 } else { 101.0 };
+            p.advance(hdg, want_kts, tick);
+            // Never under the path's own floor over the field (the base's
+            // `live_floor_ft` guards the ground; the plant has none).
+            if leg != Leg::Final {
+                let gate = approach_leg_alt_on(
+                    FIELD_FT,
+                    TPA_FT,
+                    p.a_m.abs().max(g.downwind_past_m),
+                    s.gp_ft_per_nm,
+                );
+                out.min_agl_over_floor = out.min_agl_over_floor.min(p.alt - gate);
+            }
+            out.max_vs_down = out.max_vs_down.max(-p.vs);
+        }
+        out
+    }
+
+    /// The recorded sortie, both ways: the old law hands over hundreds of
+    /// feet over the path (recorded 659 ft over ours at 3,007 m, 545 ft over
+    /// autoland's, `late_go_around`); today's arrives on it.
+    #[test]
+    fn the_raised_lemg_pattern_arrives_on_the_path() {
+        let old = fly(true, 2449.0, SR22_CAP);
+        println!("as flown: {old:?}");
+        let (a_old, above_old) = old.handoff.expect("the old law handed over");
+        assert!(above_old > 400.0, "the plant reproduces the high handoff: {above_old:.0}");
+        assert!(a_old.abs() > FINAL_HIGH_LAST_M);
+
+        let new = fly(false, 2449.0, SR22_CAP);
+        println!("now: {new:?}");
+        assert_eq!(new.went_around, None);
+        let (a, above) = new.handoff.expect("handed over");
+        assert!(above <= HANDOFF_ABOVE_PATH_FT, "{above:.0} ft over the path");
+        assert!(a.abs() > FINAL_HIGH_LAST_M, "handed over at {a:.0} m");
+        // Within what the airframe does, never a dive.
+        assert!(new.max_vs_down < SR22_CAP + 250.0, "{:.0} fpm", new.max_vs_down);
+    }
+
+    /// Higher than even the sized descent can lose (the 2,571 pattern
+    /// reached before abeam, plus a floor-raised 300 ft): the downwind
+    /// extends, bounded, and still arrives on the path or is flown around;
+    /// never handed over high.
+    #[test]
+    fn too_high_for_the_base_extends_the_downwind() {
+        let f = fly(false, 2900.0, SR22_CAP);
+        println!("{f:?}");
+        let base_at = f.base_turn_a_m.expect("turned base");
+        assert!(
+            base_at.abs() > geom().downwind_past_m,
+            "extended: base at {base_at:.0}"
+        );
+        assert!(base_at.abs() <= geom().downwind_past_m + MAX_DOWNWIND_EXTEND_M + 100.0);
+        match f.handoff {
+            Some((_, above)) => assert!(above <= HANDOFF_ABOVE_PATH_FT, "{above:.0}"),
+            None => assert!(f.went_around.is_some(), "neither handed over nor around"),
+        }
+    }
+
+    /// An ordinary circuit is untouched: a 1,000 ft pattern turns base where
+    /// drawn and flies the standing 500 fpm authority.
+    #[test]
+    fn an_ordinary_circuit_flies_as_before() {
+        let g = Geometry::for_radius(1290.0);
+        let s = DescentShape::default();
+        let (field, tpa) = (48.0, 1048.0);
+        // Abeam at pattern height, the platform 800 ft over the field.
+        let a = descent_authority_fpm(
+            1048.0 - approach_leg_alt_on(field, tpa, g.downwind_past_m, s.gp_ft_per_nm),
+            to_rollout_m(Leg::Downwind, -1.0, 2838.0, &g, LEFT).unwrap(),
+            100.0,
+            SR22_CAP,
+        );
+        assert_eq!(a, ALT_MAX_EXTRA_DESCENT_FPM);
+        assert!(!extend_downwind(
+            848.0,
+            field,
+            tpa,
+            -(g.downwind_past_m - g.lead_m),
+            g.width_m,
+            &g,
+            LEFT,
+            s,
+            100.0,
+            SR22_CAP
+        ));
+        // Level legs keep the standing authority.
+        assert_eq!(
+            leg_descent_authority_fpm(
+                Leg::Crosswind, 2000.0, 1000.0, 1048.0, field, tpa, &g, LEFT, s, 100.0, SR22_CAP,
+                0.0
+            ),
+            ALT_MAX_EXTRA_DESCENT_FPM
+        );
+    }
+
+    /// The sized authority: the height over the track at the planned share,
+    /// floored at the standing 500 and capped at the airframe's.
+    #[test]
+    fn the_descent_is_sized_on_the_height_to_lose() {
+        // The recorded base: 2,070 ft at the turn, 771 at the gate, 2,951 m
+        // across at 103 kt: 1,299 ft in 0.75 of 56 s is 1,860 fpm, capped.
+        let a = descent_authority_fpm(2070.0 - 771.0, 2951.0, 103.0, SR22_CAP);
+        assert_eq!(a, SR22_CAP);
+        // A small loss keeps the standing authority.
+        assert_eq!(descent_authority_fpm(100.0, 3000.0, 100.0, SR22_CAP), 500.0);
+        // Between: sized.
+        let mid = descent_authority_fpm(500.0, 3000.0, 100.0, 2000.0);
+        assert!((mid - 686.0).abs() < 5.0, "{mid:.0}");
+        // A jet's cap is its enroute rate, within 800 to 1,500.
+        assert_eq!(pattern_descent_cap_fpm(2000.0), 1500.0);
+        assert_eq!(pattern_descent_cap_fpm(700.0), 800.0);
+        // Below the gate, nothing extra.
+        assert_eq!(descent_authority_fpm(-50.0, 3000.0, 100.0, SR22_CAP), 500.0);
+    }
+
+    /// The handoff waits for the path; a mile out still high is flown around.
+    #[test]
+    fn the_handoff_waits_for_the_path() {
+        // 1790697583's handoff: on the line (2 m, residual 0.26), 1.51 nm,
+        // 659 ft over the circuit's path.
+        assert!(ready_for_autoland(2.0, 2910.0, -4.6, 92.0, Some(15.055), None));
+        assert!(!ready_for_autoland(2.0, 2910.0, -4.6, 92.0, Some(15.055), Some(659.0)));
+        assert!(ready_for_autoland(2.0, 2910.0, -4.6, 92.0, Some(15.055), Some(150.0)));
+        // Below the path is autoland's to level out.
+        assert!(ready_for_autoland(2.0, 2910.0, -4.6, 92.0, Some(15.055), Some(-200.0)));
+        // Nor does the last-ditch valve hand over high.
+        assert!(!ready_for_autoland(100.0, 1200.0, 0.0, 92.0, None, Some(400.0)));
+        assert!(final_high_give_up(Some(400.0), -1800.0));
+        assert!(!final_high_give_up(Some(400.0), -2500.0), "still room");
+        assert!(!final_high_give_up(Some(150.0), -1500.0), "on the path");
+        assert!(!final_high_give_up(None, -1500.0), "no reading");
+        let above = above_path_ft(1269.0, FIELD_FT, -3007.0, shape().gp_ft_per_nm).unwrap();
+        assert!((above - 659.0).abs() < 10.0, "{above:.0}");
+    }
+
+    /// The crew's go-around says why.
+    #[test]
+    fn the_crews_go_around_says_why() {
+        let line = go_around_line(crate::go_around::GoAroundBy::Crew);
+        assert!(line.contains("Too high"), "{line}");
+        assert_eq!(crate::go_around::GoAroundBy::Crew.label(), "crew");
+        assert!(!line.contains('\u{2014}') && !line.contains('\u{2013}'));
     }
 }
