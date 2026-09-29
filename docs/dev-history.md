@@ -10852,3 +10852,21 @@ one roll, calm; the replay does not model the brake split (the scheduled law ste
 kt, so the split may ask more right brake to 40 kt); the roll ends at the reject, so Vr to liftoff
 is untested. Offline only. Next SR22 takeoff: `autotakeoff` `roll` `law: rudder`, `err` under 2
 degrees from 30 kt, `xtk_m` inside 3 m, `trim` and `steer` near 0.35 to 0.4.
+
+## 2026-09-29: the arrest's wings on a slow tick; the rollout centres the roll; the SR22's standing rudder fades (#185, #184)
+
+iMac M1 (19 fps). EGKK 08R 1790687142-full_auto: the flare ticked every 0.4 to 0.44 s (MacBook 0.3) and
+the stiff wings-level law (full aileron at 6 degrees of bank error) rang -5.4 to +4.5 degrees with the
+aileron on its 0.5 stops on 12 of 17 ticks; the MacBook landings on file never reached the stops. The
+rollout latched with full right aileron in the channel and nothing centred it: bank +9.9 half a second
+after the wheels, heading 77.9 to 81.1, 6.1 m right (landing FAIL, 418 fpm). The stiff gain now softens
+by tick / 0.3 above 0.3 s (`STIFF_TUNED_TICK_S`; on the arrest test's 737 plant: no saturated tick and
+under 2 degrees at 0.4 and 0.44 s, the tuned tick unchanged), and the rollout entry writes
+`xcopilot/roll` 0 when the arrest held the ailerons. Offline only (#185).
+
+#184: the SR22's rudder roll (1790682305) swung from 4.1 m left at 65 kt to 9.5 m right on the wheels
+at 93 kt (the +16 to +18 m ticks were after wheels-off, 0.5 to 3 ft). The standing need falls with
+speed past 73 kt (0.50 at 45 to 75 kt with a 3 kt crosswind, about 0.2 at 90) while the lead held 0.35
+and the trim 0.14, at kp 1/31 per degree. `roll_rudder:` gains `power_steer_to_kts` (the lead falls
+as (to/v)^2 past it), `close_per_s` and `trim_per_s`; the SR22 declares 73, 1.5 and 0.45. Replayed:
+2.1 m to wheels-off (flown 9.5), the first roll 1.0 m (flown 9.8). Offline only.

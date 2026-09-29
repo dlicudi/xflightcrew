@@ -1,0 +1,62 @@
+# The iMac's other airframes, each on its own unflown fix:
+#   xvl sortie bench/sorties/imac-types.yaml --check
+#   xvl sortie bench/sorties/imac-types.yaml
+# The shape is lemg-737.yaml's header. Every case loads its aircraft
+# (setup.aircraft) and waits for the swap and its profile probe. No case
+# tests the taxi in.
+
+after: stop
+
+cases:
+  # #52 Citation X from a cold APU, then the whole circuit. Read:
+  # turbine_start `apu`, `apu_loaded` (air, volts), `crank` per engine
+  # (verdict Lit, peak_spool); PASS: every verdict Lit.
+  - name: "Citation X LEMG circuit from a cold gate (#52)"
+    setup:
+      aircraft: "Aircraft/Laminar Research/Cessna Citation X/Cessna_CitationX.acf"
+      ramp: { field: LEMG }
+    command: fly a circuit
+    deadline_min: 35
+    traffic: off
+
+  # #111 the MD-82's centre tank pump declaration (fuel_tank_pumps_off_when_empty
+  # [0]). Needs the centre tank EMPTY at the stand (X-Plane's default load
+  # for the MD-82 may carry centre fuel: set it to 0 in Weight and Balance
+  # before the batch, or read `acf_tank` quantities in the first `state`
+  # record). Read: `profile_probe` with no missing names, then `fuel_pumps`
+  # switched, source monitor (centre_tank_dry), took true, after the start
+  # while the circuit flies. The circuit itself is incidental.
+  - name: "MD-82 LEMG circuit from the ramp, centre tank pumps (#111)"
+    setup:
+      aircraft: "Aircraft/Laminar Research/McDonnell Douglas MD-82/MD80.acf"
+      ramp: { field: LEMG }
+    command: fly a circuit
+    deadline_min: 35
+    traffic: off
+
+  # #45 the Lancair Evolution at untowered LILB (Alzate Radio only): full
+  # auto departs as UNCONTROLLED with its own taxi. Read: full_auto
+  # `departure_field` towered false, then `lined_up`; every taxi stage_result
+  # passes; drive ticks brake travel (bs/bl/br) and join pivot yaw. A
+  # circuit the terrain refuses on the runway (`terrain_refused`, said with
+  # the numbers) still closes the departure half.
+  - name: "Lancair Evolution LILB circuit from the ramp, untowered (#45)"
+    setup:
+      aircraft: "Aircraft/Laminar Research/Lancair Evolution/N844X.acf"
+      ramp: { field: LILB }
+    command: fly a circuit
+    deadline_min: 35
+
+  # #22 the gyro auto-sync on a vacuum DG: the steam 172 on a local plan
+  # long enough for the drift to reach GYRO_DRIFT_ADVISORY_DEG (10). Read:
+  # `gyro_sync` took true, drift_deg, after_deg at least halved, and the
+  # spoken "re-synced" line; at most one took false then silence.
+  - name: "172 LEMG to LEZL on a local plan, gyro sync (#22)"
+    setup:
+      aircraft: "Aircraft/Laminar Research/Cessna 172 SP/Cessna_172SP.acf"
+      ramp: { field: LEMG }
+    steps:
+      - { say: plan a flight to LEZL, when: start, tool: plan_flight }
+      - { say: fly the flight plan, when: { after_s: 15 }, tool: full_auto }
+    deadline_min: 120
+    traffic: off

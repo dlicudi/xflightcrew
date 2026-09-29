@@ -1756,6 +1756,14 @@ pub fn run_autoland_scoped(
                     // standalone landing into a rolling handoff to nobody.
                     if !rolling_out {
                         rolling_out = true;
+                        // The arrest's last aileron rides the roll channel's
+                        // 1 s heartbeat onto the wheels unless it is
+                        // centred: full right at the handover banked a 737
+                        // 9.9 degrees on the mains and slid it 6.1 m right
+                        // (EGKK 08R 1790687142, 2026-09-29).
+                        if arrest_hands {
+                            let _ = xp.set_float(FLARE_ROLL, 0.0).await;
+                        }
                         disconnect_autopilot(&xp).await;
                         vacate_follows = VACATE_FOLLOWS.swap(false, Ordering::SeqCst);
                         // Wheels on this runway: the fact the vacate needs.
@@ -15971,5 +15979,58 @@ mod a330_lemg30_flare_tests {
         }
         assert!(stiff_ring > 1.5, "the stiff law rings: {stiff_ring:.2}");
         assert!(new_ring < 0.5 * stiff_ring, "{new_ring:.2} against {stiff_ring:.2}");
+    }
+
+    /// A slow tick is a slower loop: the iMac's 19 fps stretched the
+    /// arrest's tick to 0.4 to 0.44 s, and the stiff wings-level law, set
+    /// on 0.25 to 0.3, rang +/-5 degrees on the aileron's stops through the
+    /// 737's flare (EGKK 08R 1790687142, 2026-09-29: 12 of 17 flare ticks
+    /// at 0.5). On the arrest test's 737 roll plant (20 deg/s per unit,
+    /// 0.3 s lag, 0.3 s dead) the gain now softens with the tick.
+    #[test]
+    fn a_slow_tick_does_not_ring_the_arrest_wings() {
+        let fly = |tick: f64| -> (f64, usize) {
+            let mut wings = arrest_wings();
+            let (x0, v0, phi0, t_end, radio0): (f64, f64, f64, f64, f64) =
+                (1.2, -0.3, 3.9, 9.0, 60.0);
+            let (h, k, lag, dead) = (0.01, 20.0, 0.3, 0.3);
+            let (mut x, mut v, mut phi, mut p) = (x0, v0, phi0, 0.0_f64);
+            let mut acc = 9.81 * phi0.to_radians().tan();
+            let mut written: Vec<(f64, f64)> = Vec::new();
+            let (mut t, mut next) = (0.0, 0.0);
+            let (mut swing, mut sat) = (0.0_f64, 0usize);
+            while t < t_end {
+                if t + 1e-9 >= next {
+                    next += tick;
+                    let radio = radio0 * (1.0 - t / t_end);
+                    let tgt = arrest_bank_target(x, v, wings.predicted(phi), radio);
+                    let a = wings.step(phi, tgt, tick);
+                    sat += usize::from(a.abs() > 0.49);
+                    written.push((t, a));
+                }
+                let a = written
+                    .iter()
+                    .take_while(|w| w.0 <= t - dead + 1e-9)
+                    .last()
+                    .map_or(0.0, |w| w.1);
+                p += (k * a - p) * h / lag;
+                phi += p * h;
+                acc += (9.81 * phi.to_radians().tan() - acc) * h / 0.2;
+                v += acc * h;
+                x += v * h;
+                t += h;
+                if t > 3.0 {
+                    swing = swing.max(phi.abs());
+                }
+            }
+            (swing, sat)
+        };
+        let (fast, _) = fly(0.25);
+        for tick in [0.4, 0.44] {
+            let (swing, sat) = fly(tick);
+            assert_eq!(sat, 0, "tick {tick}: {sat} ticks on the stops");
+            assert!(swing < 2.0, "tick {tick}: swings {swing:.1} degrees");
+        }
+        assert!(fast < 2.0, "the tuned tick is the one it was: {fast:.1}");
     }
 }

@@ -4166,6 +4166,9 @@ mod tests {
             "A330.acf" => "airbus_a330_300",
             "Cessna_CitationX.acf" => "citation_x",
             "S-76C.acf" => "sikorsky_s76c",
+            "Cessna_172SP.acf" => "cessna_172sp",
+            "N844X.acf" => "lancair_evolution",
+            "MD80.acf" => "md82",
             other => panic!("{other}: add the bench aircraft to this table"),
         };
         if let Some(icao) = std::fs::read_to_string(crate::config::xplane_path(acf))

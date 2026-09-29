@@ -290,6 +290,9 @@ const AIL_FULL_BANK_DEG: f64 = 15.0;
 const AIL_LEAD_S: f64 = 0.3;
 const AIL_MAX: f64 = 0.5;
 const AIL_SLEW_PER_S: f64 = 2.0;
+/// The tick the stiff wings-level gain was set on, seconds (see
+/// `WingsLevel::step`).
+const STIFF_TUNED_TICK_S: f64 = 0.3;
 /// Default hand-back height above the field, feet (a normal departure); a
 /// circuit overrides it lower via `Params::handoff_agl_ft`.
 pub const DEFAULT_HANDOFF_AGL_FT: f64 = 1000.0;
@@ -2000,7 +2003,15 @@ impl WingsLevel {
         let rate = self.prev_bank.map_or(0.0, |p| (bank_deg - p) / dt);
         self.prev_bank = Some(bank_deg);
         let err = target_deg - bank_deg - AIL_LEAD_S * rate;
-        let full = self.full_bank_deg.unwrap_or(AIL_FULL_BANK_DEG);
+        // The stiff law's gain was set on a 0.25 to 0.3 s tick, and the
+        // tick is the loop's delay: at the iMac's 0.4 to 0.44 s (19 fps) the
+        // 737's arrest rang +/-5 degrees on the aileron's stops through the
+        // flare and touched down banked 9.9 (EGKK 08R 1790687142,
+        // 2026-09-29). A slower tick softens it in proportion.
+        let full = match self.full_bank_deg {
+            Some(f) => f * (dt / STIFF_TUNED_TICK_S).max(1.0),
+            None => AIL_FULL_BANK_DEG,
+        };
         let want = (err / full).clamp(-1.0, 1.0) * AIL_MAX;
         self.out = slew(self.out, want, AIL_SLEW_PER_S * dt);
         self.out

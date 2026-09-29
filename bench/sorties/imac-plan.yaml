@@ -1,0 +1,82 @@
+# The iMac's plan batch: the pilot's SimBrief plan (EGKK to EGBB, B738,
+# runways 26L and 33 at the time of writing; XCOPILOT_SIMBRIEF_ID is set) and
+# one local plan out of EGBB. Flown at 1x (no fast forward on this machine).
+#   xvl sortie bench/sorties/imac-plan.yaml --check
+#   xvl sortie bench/sorties/imac-plan.yaml
+# The shape is lemg-737.yaml's header. These cases are about ATC and the
+# arrival, so traffic is left alone (no LiveTraffic on the iMac anyway).
+# Only the gate to gate case tests the taxi in (#123's EGBB taxi-in): it parks.
+
+after: stop
+
+cases:
+  # Gate to gate. #173 (a cleared SID other than the filed one: procedure
+  # `departure_rechosen`, then `cleared_climb` to_ft equal to the cruise or
+  # next plan level right after `cleared_ceiling` why departure_check_in; no
+  # `climb_no_descent` with a chart plan_ft on SID legs; `leg` want_alt above
+  # the SID's stop altitude after the check-in; `star_window_unable` carries
+  # climb_fpm). Only exercised when the tower's runway at EGKK is not the
+  # filed 26L (calm: the stream; today's circuit got 08R).
+  # #156 (STAR windows HON 9,000 and GROVE 7,000 crossed within 300 ft,
+  # speeds held, anti-ice off when clear, STD/QNH on the crossing), #161
+  # (procedure `final_join` pattern then intercept, along_nm at the skip 4
+  # to 5 nm, if_owed_nm counting down, handoff_autoland 345 to 410 s after
+  # the arm), #155 items 2 to 5 (no incursion on our rollout, taxi request
+  # names the cleared runway, check-in level = the filed cruise, one takeoff
+  # clearance), #123 (stage_result taxi, line_up, takeoff and the EGBB taxi
+  # in: max_lat_m under 3, end_err_deg), #64 (only if the tower switches
+  # the arrival end: full_auto `arrival_runway` why clearance, ils tuned
+  # rwy and taxi_in vacating rwy the same end), #78 (climb_manual theta
+  # against 18), #34 (duty agrees), #22 does not apply (the 737 has no
+  # vacuum DG: no gyro_sync lines expected).
+  - name: "737 gate to gate on the SimBrief plan (#173 #156 #161 #123)"
+    setup:
+      aircraft: "Aircraft/Laminar Research/Boeing 737-800/b738.acf"
+      ramp: { field: plan_origin }
+    steps:
+      - { say: load the aircraft, when: start, tool: load_aircraft }
+      - say: fly the flight plan
+        when: { event: { kind: loading, event: load_aircraft } }
+        tool: full_auto
+    deadline_min: 240
+    after: park
+
+  # The arrival alone, 30 nm (along the route) before the plan's top of
+  # descent: #156 (HON 400 ft high was the last miss: procedure STAR window
+  # records and `leg` alt at HON and GROVE), #161 (the join, as above), #64
+  # (a clearance switch, if the tower's end is not the plan's 33), #67 (the
+  # airborne resume is accepted: full_auto `resume_gate` / `resume_join`).
+  - name: "EGKK-EGBB arrival from 30 nm before the top of descent (#156 #161)"
+    setup:
+      aircraft: "Aircraft/Laminar Research/Boeing 737-800/b738.acf"
+      enroute: { at: before_tod_nm, value: 30 }
+    command: fly the flight plan
+    deadline_min: 50
+
+  # #67 resume near the destination: the pilot takes it on a final to the
+  # plan's runway and hands the plan back; full auto's resume joins the
+  # arrival (`resume_join` near the destination, ARRIVAL_REJOIN_NM, autoland
+  # on the plan's runway) or refuses naming its number. #54 (`handover`
+  # record for "my controls"). Attended by design.
+  - name: "resume the plan on a final to its destination (#67)"
+    setup:
+      aircraft: "Aircraft/Laminar Research/Boeing 737-800/b738.acf"
+      approach: { field: plan_destination, runway: plan, final_nm: 15 }
+    steps:
+      - { say: my controls, when: { after_s: 30 }, tool: autopilot_off }
+      - { say: resume flight plan, when: { after_s: 20 }, tool: full_auto }
+    deadline_min: 15
+
+  # #118 the departure check-in on an Approach-only field: EGBB has
+  # Birmingham Approach 131.005 and no departure frequency in apt.dat.
+  # Read: atc keyed service approach, intent the check-in, outcome reply
+  # containing "radar contact, climb", state TakeoffCleared>Parked. The
+  # local plan replaces the SimBrief one on the shelf, so it runs last.
+  - name: "737 EGBB runway start, local plan to EGNX (#118)"
+    setup:
+      aircraft: "Aircraft/Laminar Research/Boeing 737-800/b738.acf"
+      runway_start: { field: EGBB, runway: wind, engines_running: true }
+    steps:
+      - { say: plan a flight to EGNX, when: start, tool: plan_flight }
+      - { say: fly the flight plan, when: { after_s: 15 }, tool: full_auto }
+    deadline_min: 60

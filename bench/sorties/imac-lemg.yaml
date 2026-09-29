@@ -1,0 +1,137 @@
+# The iMac's LEMG batch (X-Plane 12.4.4 at ~19 fps, no fast forward, no
+# LiveTraffic, text-only xvl): the open issues this machine can fly at
+# Malaga, safety first.
+#   xvl sortie bench/sorties/imac-lemg.yaml --check   (routes the lines, no sim)
+#   xvl sortie bench/sorties/imac-lemg.yaml
+# The shape is lemg-737.yaml's header. Every case ends on the ground; none
+# tests the taxi in, so `after: stop`. No LiveTraffic here, so `traffic: off`
+# only documents that the case is not about ATC (the runner reads the
+# LiveTraffic dataref first and leaves it alone when it is missing).
+# Each case names its issues and the blackbox records to read afterwards
+# (`xvl debrief` first, then logs/sorties/<id>.jsonl).
+
+after: stop
+
+cases:
+  # #166 SR22 autoland: 575 fpm, 12.1 m off on the rollout. Read:
+  # stage_result landing (sink_fpm under 400, rollout_max_xtk_m under 5,
+  # bounce_ft null); autoland ticks through the flare (flare model, `power`
+  # `retard` keyed on height / time to the wheels, `rough`); autoland
+  # `rollout` ticks bl/br (RolloutBrakeSteer on the inside wheel) and xtk_m
+  # growth after the first tick.
+  - name: "SR22 LEMG into the wind, 10 nm final (#166)"
+    setup:
+      aircraft: "Aircraft/Laminar Research/Cirrus SR22/Cirrus SR22.acf"
+      approach: { field: LEMG, runway: wind, final_nm: 10 }
+    traffic: off
+
+  # #169 A330 circuit: pattern speed over the kept flap, the 265 kt
+  # level-off, BEFORE LANDING audited before autoland configured. Read:
+  # circuit `leg` ias against want_kts through the level-off (want under
+  # 240) and the downwind x_m near the pattern width; circuit
+  # `flap_step_withheld` deployed, `climb_flap_step` down to 0; no "Flap
+  # overspeed" in `said`; checklist BEFORE LANDING `start` after autoland
+  # `landing_config`. Also #182's corridor: circuit `armed`
+  # left/right_corridor_max_ft, left/right_descent, glidepath_deg, refused;
+  # circuit `terrain_floor`. #34: no duty record with agrees false.
+  - name: "A330 LEMG runway start into the wind, circuit (#169)"
+    setup:
+      aircraft: "Aircraft/Laminar Research/Airbus A330-300/A330.acf"
+      runway_start: { field: LEMG, runway: wind, engines_running: true }
+    command: fly a circuit
+    deadline_min: 25
+    traffic: off
+
+  # 737 circuit: #78 (theta against climb_hold pitch_max_deg 18 in the
+  # autotakeoff `climb_manual` ticks, IAS at the 300 ft `ap_engaged` within
+  # V2 + 20), #123 (stage_result takeoff liftoff_xtk_m under 2, roll ticks
+  # `drift` in a crosswind), #31 (stage_result landing rollout_max_xtk_m and
+  # autoland `rollout` xtk_m growth after the first tick under 2 m, at most
+  # one crossing above 40 kt), #181 (ap_pitch_authority `verdict` confirmed
+  # for autotakeoff and autoland, no climb_watch trip), #182 (circuit `armed`
+  # corridor and descent fields at LEMG), #34 (duty agrees).
+  - name: "737 LEMG runway start into the wind, circuit (#78 #123 #31)"
+    setup:
+      aircraft: "Aircraft/Laminar Research/Boeing 737-800/b738.acf"
+      runway_start: { field: LEMG, runway: wind, engines_running: true }
+    command: fly a circuit
+    deadline_min: 20
+    traffic: off
+
+  # #31 rollout law (again, a second 737 landing per batch), #102
+  # opportunistic (a long float: autoland `committed_flare` radio / past_m /
+  # remaining_m, `balk_landed` called false, no `final_report` after it),
+  # #131 high arm (no autoland `reversal` why join_point_behind with
+  # above_path_ft a few hundred feet at 6+ nm; cmd_hdg within 45 degrees of
+  # the course).
+  - name: "737 LEMG into the wind, 10 nm final (#31 #102 #131)"
+    setup:
+      aircraft: "Aircraft/Laminar Research/Boeing 737-800/b738.acf"
+      approach: { field: LEMG, runway: wind, final_nm: 10 }
+    deadline_min: 10
+    traffic: off
+
+  # #54 "you have control" resolves from the flight model: the pilot takes
+  # the aircraft on the final, then hands it back; on the Approach phase the
+  # hand-over is autoland. Read: `handover` records (decide, took, why "on
+  # the approach", phase Approach, upset false), then an autoland arm and a
+  # landing; no `recover` record. Attended by design (two tool records).
+  - name: "737 LEMG 10 nm final, my controls then you have control (#54)"
+    setup:
+      aircraft: "Aircraft/Laminar Research/Boeing 737-800/b738.acf"
+      approach: { field: LEMG, runway: wind, final_nm: 10 }
+    steps:
+      - { say: my controls, when: { after_s: 30 }, tool: autopilot_off }
+      - { say: you have control, when: { after_s: 5 }, tool: take_over }
+    deadline_min: 12
+    traffic: off
+
+  # SR22 from the ramp: #170 (full_auto `pushback_skipped` why
+  # light_aircraft with mtow_kg, no pushback `engaged`, autotaxi `join` from
+  # the stand), #165 (stage_result taxi pass, no give_up taxi_stalled or
+  # drive_no_progress, max_cut_m, corner ticks), #60 SR22 half (stage_result
+  # line_up; autotaxi `engaged` total_m against the first two `drive`
+  # remaining_m at rest within a metre; `line_up_path` pts), #46 pivot
+  # (autotaxi drive bs/bl/br in the slow turn, aligned at the end). The
+  # takeoff roll also feeds #184 (fixed elsewhere).
+  - name: "SR22 LEMG circuit from the ramp (#170 #165 #60 #46)"
+    setup:
+      aircraft: "Aircraft/Laminar Research/Cirrus SR22/Cirrus SR22.acf"
+      ramp: { field: LEMG }
+    command: fly a circuit
+    deadline_min: 35
+    traffic: off
+
+  # #69 and #46 live: "set transponder" leaves standby (tool record
+  # set_transponder_mode, the squawk mode reads ALT after it); a misheard
+  # speed in the air is refused (speedhold `spoken_target_refused` asked
+  # 885, no new governor target). Attended by design.
+  - name: "SR22 LEMG runway start, transponder and a misheard speed (#69 #46)"
+    setup:
+      aircraft: "Aircraft/Laminar Research/Cirrus SR22/Cirrus SR22.acf"
+      runway_start: { field: LEMG, runway: wind, engines_running: true }
+    steps:
+      - { say: set transponder, when: start, tool: set_transponder_mode }
+      - { say: fly a circuit, when: { after_s: 10 }, tool: full_auto }
+      - { say: set speed 885, when: { agl_above: 800 }, tool: hold_speed }
+    deadline_min: 25
+    traffic: off
+
+  # #110 the steered push's stop line comes from the brake's read-back. The
+  # "stop" is taken live by the push pre-gate in main.rs (pushback::steered
+  # then full_auto::abort), not the grammar; --check can only route it as
+  # the grammar would (hold_speed). Read: pushback `abort_brakes`
+  # pilot_stop true, held true, BEFORE the said "Stopping the push. Brakes
+  # on, your aircraft."; full auto gives up `abort`.
+  - name: "737 LEMG ramp, stop during the push (#110)"
+    setup:
+      aircraft: "Aircraft/Laminar Research/Boeing 737-800/b738.acf"
+      ramp: { field: LEMG }
+    steps:
+      - { say: fly a circuit, when: start, tool: full_auto }
+      - say: stop
+        when: { event: { kind: pushback, event: brakes_released } }
+        tool: hold_speed
+    expect_give_up: abort
+    deadline_min: 20
+    traffic: off

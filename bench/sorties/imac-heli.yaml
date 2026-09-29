@@ -1,0 +1,45 @@
+# The iMac's S-76C batch: the heli route pad to field, twice.
+#   xvl sortie bench/sorties/imac-heli.yaml --check
+#   xvl sortie bench/sorties/imac-heli.yaml
+# The shape is lemg-737.yaml's header. The S-76's taxi in is a hover taxi
+# (part of what these cases test), so both park.
+
+after: park
+
+cases:
+  # LEMG to LXGB (a lowland field with no helipad), the whole route: #48
+  # (heli_route `start` cruise_alt_ft and terrain_ft, `gate_lowered`,
+  # `arrived`; the runway spot at LXGB; taxi_in `shutdown` `stopped`), #47
+  # (heli_route `approach`, `descent_vs`, `slow` approach true,
+  # `handover_hover` ias at 45 kt or less and to_pad_m, `arrived`
+  # on_ground), #50 (every hover `hand_back` leaves cruise_modes or
+  # hover_mode on; no "hover's gone unstable" with both false), #82
+  # (heli_route `final_tick` and `slow_tailwind` if the wind blows), #83
+  # (heli_route `zone_challenge`: a transit field answered with "request
+  # zone transit", the destination's with the inbound call, each at most
+  # twice).
+  - name: "S-76 LEMG to LXGB on a local plan (#47 #48 #50 #82 #83)"
+    setup:
+      aircraft: "Aircraft/Laminar Research/Sikorsky S-76/S-76C.acf"
+      ramp: { field: LEMG }
+    steps:
+      - { say: plan a flight to LXGB, when: start, tool: plan_flight }
+      - { say: fly the flight plan, when: { after_s: 15 }, tool: hover }
+    deadline_min: 60
+    traffic: off
+
+  # ETHB to EDVW, the original #84 route: the hover taxi at hilltop EDVW
+  # (1,141 ft). Read: hover `liftoff` / `prelift` with the LoadingEstimate
+  # and PowerBudget numbers; a hover the lever cannot give is refused on
+  # the wheels or held in the cushion with its numbers, never the droop
+  # guard's set-down 19 m short (`droop_ceiling`, DROOP_HOLD). The original
+  # was heavy: load the S-76 toward max gross in Weight and Balance before
+  # the case for the full test. Also #47, #48, #50 as above.
+  - name: "S-76 ETHB to EDVW on a local plan (#84)"
+    setup:
+      aircraft: "Aircraft/Laminar Research/Sikorsky S-76/S-76C.acf"
+      ramp: { field: ETHB }
+    steps:
+      - { say: plan a flight to EDVW, when: start, tool: plan_flight }
+      - { say: fly the flight plan, when: { after_s: 15 }, tool: hover }
+    deadline_min: 45
