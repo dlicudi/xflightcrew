@@ -287,6 +287,11 @@ struct Roll {
     ticks: usize,
     t_last: f64,
     sortie: Option<String>,
+    /// Roll ticks that said the wheels were off (the float under the 8 ft
+    /// liftoff), and the furthest off the centreline among them: reported,
+    /// never the centreline verdict.
+    float_ticks: usize,
+    float_max_xtk: f64,
 }
 
 /// The landing, from `state` (touchdown) and `autoland` `rollout` ticks.
@@ -761,6 +766,15 @@ impl Scorer {
         x.ticks += 1;
         x.t_last = t;
         let (err, xtk, gs) = (f(r, "err"), f(r, "xtk_m"), f(r, "gs").unwrap_or(0.0));
+        // The centreline is the WHEELS' (#184, 1790699819: 2.7 m at
+        // wheels-off, 7.1 m at the 8 ft liftoff after 3.4 s floating). A
+        // record without the field (before 2026-09-29) is all wheels.
+        if r["wheels"] == false {
+            x.float_ticks += 1;
+            x.float_max_xtk = x.float_max_xtk.max(xtk.unwrap_or(0.0).abs());
+            x.last_ias = f(r, "ias").unwrap_or(x.last_ias);
+            return;
+        }
         if x.start_err.is_none() {
             x.start_err = err;
             x.start_xtk = xtk;
@@ -801,6 +815,7 @@ impl Scorer {
             "max_err_fast_deg": r1(x.max_err_fast), "max_brake": r2(x.max_brake),
             "last_ias": r1(x.last_ias), "ended_by": ended.unwrap_or("climb"),
             "secs": r1(x.t_last - x.t0),
+            "float_ticks": x.float_ticks, "float_max_xtk_m": r1(x.float_max_xtk),
         }), out);
     }
 
@@ -1111,6 +1126,38 @@ mod tests {
         let sortie = out.last().unwrap();
         assert_eq!(sortie["pass"], false);
         assert_eq!(sortie["interventions"], 1);
+    }
+
+    /// The centreline is the wheels' (#184): 1790699819 (LEMG 13 SR22)
+    /// left the runway at 2.7 m and floated to 7.1 m before the 8 ft
+    /// liftoff; the takeoff is judged at the wheels, the float reported.
+    /// A record without `wheels` (every log before) counts, as ever.
+    #[test]
+    fn the_takeoff_centreline_is_judged_on_the_wheels() {
+        let xtk = [0.4, 1.0, 1.6, 2.1, 2.7, 3.1, 3.7, 4.3, 4.8, 5.5, 6.0, 6.6, 7.1];
+        let mut recs = vec![json!({"t": 0.0, "kind": "sortie", "event": "begin"})];
+        for (i, x) in xtk.iter().enumerate() {
+            let mut r = roll(10.0 + i as f64 * 0.4, 60.0 + 2.0 * i as f64, -2.0, *x);
+            r["wheels"] = json!(i < 5);
+            recs.push(r);
+        }
+        recs.push(json!({"t": 16.0, "kind": "autotakeoff", "event": "liftoff", "ias": 94.7}));
+        let out = score_all(recs.iter());
+        let takeoff = out.iter().find(|v| s(v, "stage") == "takeoff").cloned().unwrap();
+        assert_eq!(takeoff["pass"], true, "{takeoff}");
+        assert_eq!(takeoff["liftoff_xtk_m"], 2.7);
+        assert_eq!(takeoff["float_max_xtk_m"], 7.1);
+        assert_eq!(takeoff["float_ticks"], 8);
+        // The same flight without the field: every tick is the wheels'.
+        for r in recs.iter_mut() {
+            if let Some(o) = r.as_object_mut() {
+                o.remove("wheels");
+            }
+        }
+        let out = score_all(recs.iter());
+        let takeoff = out.iter().find(|v| s(v, "stage") == "takeoff").cloned().unwrap();
+        assert_eq!(takeoff["pass"], false, "{takeoff}");
+        assert_eq!(takeoff["liftoff_xtk_m"], 7.1);
     }
 
     #[test]

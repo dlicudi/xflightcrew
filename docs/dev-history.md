@@ -11114,3 +11114,47 @@ Next flight (SR22): `autotakeoff` `rotate_tick` `pitch` 0.45 to 0.6 at Vr fallin
 theta at 7 about 2 s after `rotate`, `wheels` false near 80 to 85 KIAS, `liftoff` `ias` under
 about 88 (the 8 ft gate lags wheels-off), `climb_manual` theta under 10 with no drop under 7, and
 `stage_result` takeoff `liftoff_xtk_m` against the 5.4 m of 1790694884. Offline only.
+
+## 2026-09-29: the SR22 keeps its pull off the wheels; the float is banked, not ruddered (#184)
+
+Flown on the iMac (build 8270d3f), 1790699819-full_auto (SR22 LEMG 13 runway start circuit): on the
+wheels the fed-forward rotation worked (Vr 74.6, column 0.36 to 0.39, wheels off 81.4 KIAS 1.4 s
+later at 5.0 degrees). Then the model's flat flying hold (0.164 at 90 kt) dropped the feed 0.40 to
+0.18 and the column 0.39 to 0.24; the nose sagged 5.0 to 3.0 at 84.6 kt, the wing floated in ground
+effect, and the 8 ft `liftoff` came at 94.7 KIAS. The roll law's rudder kept steering a heading
+target (err -2 to -2.7) through the 3.4 s float while the cross-track ran 2.7 to 7.1 m: takeoff
+FAIL 7.1 m. The drift itself began on the wheels at 68 kt (the heading swung 1.5 to 2 degrees
+right as the propeller lead faded), about 1.2 m/s from then to 8 ft.
+
+- **The spring is on the wing's angle of attack, not the wheels** (`rotate_elevator:` `air_base`,
+  `ground_effect_ft` replace `air_hold`; `RotatePitch::climb_fpm`): one law on and off the wheels,
+  the column for the target's attitude LESS the flight path (from `vh_ind_fpm`), and the breakout
+  held through ground effect, walking to `air_base` by 20 ft. The flight's own float says so: 0.31
+  held 4.6 degrees at 88 KIAS a few feet up (breakout plus spring), and the 100 kt climbs hold 10
+  degrees on a 7 degree path with 0.1 (spring less 0.06). On the wheels the law is unchanged.
+- **The float is the wings'** (`floating`, `FLOAT_BANK_MAX_DEG` 3): rotated with the wheels off
+  under the 8 ft liftoff, the rudder lets go (as it does at the liftoff) and the wings bank toward
+  the roll law's target heading, as the climb banks toward the course; the roll law is still
+  stepped, so a wheel that touches again has its rudder back next tick. All airframes.
+- **The scorer's centreline is the wheels'** (`roll` `wheels`; `stage_result` takeoff
+  `float_ticks`, `float_max_xtk_m`): 1790699819 left the runway 2.7 m off. Older records have no
+  field and count as before.
+
+The plant now flies the height: lift on the angle of attack (ten percent more in ground effect,
+weight at 104 kt and 3.2 degrees), the base of the pitch moment walking out of ground effect. With
+the elevator 1.4 and the spring 1.3 of the fit (the 1790699819 airframe: its nose came up 4.7
+deg/s on 0.38 of column), b2b1481's law replays wheels-off near 81.5 KIAS at 4.9 degrees and 8 ft
+at 88.5 to 97.8 (mean over 94); the new law 86.7 to 88.0, no sag, under 9.4 degrees. The nominal
+plant: the pre-#184 law 98 kt at 8 ft; now 85.4 to 86.2, nose at 7 in 2.1 s, 8.4 to 9.8 at most.
+A softer spring than declared (0.7) over-pulls to 11.2 and 12.4 (the old law 11.3 and 11.2).
+Replayed open loop, the law with b2b1481's flying hold writes every logged `rotate_tick` column
+of 1790699819; the model now is identical on the wheels and feeds 0.35 or more at wheels-off.
+
+Tests: `the_float_of_1790699819_replays_and_keeps_its_pull`, `the_sr22_climbs_out_of_ground_effect`,
+`the_sr22_rotates_near_vr`, `the_takeoff_centreline_is_judged_on_the_wheels`.
+
+Next flight (SR22): `rotate_tick` `wheels` false with `pitch_ff` staying near 0.3 or more and
+`theta` not falling after it, `agl`/`vs` now logged; `roll` `wheels` false ticks with the rudder
+released (`steer` is the law's, the written rudder 0) and `err` closing on a small bank; `liftoff`
+`ias` under about 88; `stage_result` takeoff `liftoff_xtk_m` (at the wheels) and `float_max_xtk_m`.
+The drift that starts on the wheels at 65 to 75 kt is not fixed here. Offline only.

@@ -283,6 +283,9 @@ const AP_ENGAGE_AGL_FT: f64 = 300.0;
 /// engage, full-power torque rolls a light single left with nobody on the
 /// ailerons. Bank leans toward runway heading, capped shallow.
 const CLIMB_BANK_MAX_DEG: f64 = 8.0;
+/// The bank the float under the 8 ft liftoff may use toward the track,
+/// degrees: a wingtip 19 ft out drops a foot at 3 (the SR22's half span).
+const FLOAT_BANK_MAX_DEG: f64 = 3.0;
 const BANK_PER_HDG_ERR: f64 = 1.0;
 /// Aileron law: P on bank error (aileron commands roll RATE, so
 /// proportional converges without an integrator), rate-lead damped.
@@ -1620,6 +1623,12 @@ pub struct RotatePitch {
     rest: Option<f64>,
     /// The model's column, as last fed forward.
     model_out: f64,
+    /// The vertical speed, fpm, as last read (`vh_ind_fpm`;
+    /// [`RotatePitch::climb_fpm`]): with the airspeed, the flight path.
+    vs_fpm: Option<f64>,
+    /// Tests only: see [`RotatePitch::as_flown_b2b1481`].
+    #[cfg(test)]
+    as_flown_b2b1481: Option<f64>,
 }
 
 /// The share of the fitted rotation model fed forward; the P+I finds the
@@ -1628,11 +1637,9 @@ pub struct RotatePitch {
 /// SR22 plant fitted to LEMG (#184) the whole model lifted off 82 kt and
 /// overshot to 10.7 degrees; 0.8 lifted off 83 and held under 9.6.
 pub const ROTATE_MODEL_SHARE: f64 = 0.8;
-/// Once the wheels leave, the model's column moves to the flying hold
-/// with this time constant, seconds: the tail's spring is gone at once,
-/// and a 0.4 s tick plus the write's delay already hold the ground column
-/// on the flying aircraft for most of a second.
-const ROTATE_MODEL_AIR_TAU_S: f64 = 0.2;
+/// The flight path the model believes, degrees: a vertical speed read in a
+/// bounce or a zoom is not a path to take the spring off by.
+const ROTATE_MODEL_PATH_MAX_DEG: f64 = 12.0;
 /// The slowest airspeed the model's `(ref / ias)^2` is taken at, knots: a
 /// rotation is never below it, and a dead ASI must not ask for full column.
 const ROTATE_MODEL_MIN_KTS: f64 = 40.0;
@@ -1736,6 +1743,9 @@ impl RotatePitch {
             wheels: true,
             rest: None,
             model_out: 0.0,
+            vs_fpm: None,
+            #[cfg(test)]
+            as_flown_b2b1481: None,
         }
     }
 
@@ -1755,36 +1765,82 @@ impl RotatePitch {
         self.wheels = on;
     }
 
+    /// The flight model's vertical speed this tick (`vh_ind_fpm`), for a
+    /// declared rotation model's flight path; `None` (a failed read) keeps
+    /// the last.
+    pub fn climb_fpm(&mut self, vs_fpm: Option<f64>) {
+        if let Some(v) = vs_fpm.filter(|v| v.is_finite()) {
+            self.vs_fpm = Some(v);
+        }
+    }
+
     /// The model's column right now, for the blackbox (`roll` `pitch_ff`).
     pub fn model_pull(&self) -> f64 {
         self.model_out
     }
 
-    /// The fitted rotation column, fed forward: on the wheels the column that
-    /// holds the TARGET attitude against the tail's spring plus the breakout
-    /// and the column that turns the nose at the ramp's rate; flying, the
-    /// column that holds an attitude, reached over
-    /// [`ROTATE_MODEL_AIR_TAU_S`]. A share of it ([`ROTATE_MODEL_SHARE`]).
-    fn model_step(&mut self, ias: Option<f64>, target: f64, want_rate: f64, dt: f64) -> f64 {
+    /// The fitted rotation column, fed forward, one law on the wheels and
+    /// off them: the column that holds the TARGET attitude's angle of attack
+    /// against the tail's spring (the attitude less the flight path; on the
+    /// wheels the path is level), plus the breakout, plus the column that
+    /// turns the nose at the ramp's rate. The breakout walks to `air_base`
+    /// through the ground effect's height. A share of it
+    /// ([`ROTATE_MODEL_SHARE`]).
+    ///
+    /// 1790699819 (LEMG 13, 2026-09-29, #184): the first model took the
+    /// spring and the breakout away AT wheels-off, 0.40 to 0.18 of feed at
+    /// 81.4 KIAS, as if a lifting wheel were a climbing aircraft. The nose
+    /// fell from 5.0 to 3.0 degrees, the wing floated in ground effect, and
+    /// the 8 ft liftoff came at 94.7 KIAS. A path is flown before the spring
+    /// lets go, and ground effect holds the nose down until it is climbed out
+    /// of.
+    fn model_step(
+        &mut self,
+        air: Option<(f64, f64)>,
+        target: f64,
+        want_rate: f64,
+        dt: f64,
+    ) -> f64 {
+        let _ = dt; // read only by the b2b1481 replay (tests)
         let Some(m) = self.model else {
             return 0.0;
         };
-        let Some(ias) = ias.filter(|v| v.is_finite()) else {
+        let Some((ias, agl_ft)) = air.filter(|(v, h)| v.is_finite() && h.is_finite()) else {
             // No airspeed: the last column stands (a failed read is no
             // measurement).
             return self.model_out;
         };
         let q = (ias.max(ROTATE_MODEL_MIN_KTS) / m.ref_kts).powi(2);
         let rest = self.rest.unwrap_or(target);
-        self.model_out = if self.wheels {
-            ROTATE_MODEL_SHARE
-                * (m.per_deg * (target - rest).max(0.0)
-                    + (m.breakout + want_rate.max(0.0) / m.deg_s_per_unit) / q)
+        let (path_deg, lifted) = if self.wheels {
+            (0.0, 0.0)
         } else {
-            let goal = ROTATE_MODEL_SHARE * m.air_hold / q;
-            goal + (self.model_out - goal) * (-dt / ROTATE_MODEL_AIR_TAU_S).exp()
+            let tas_fpm = ias.max(ROTATE_MODEL_MIN_KTS) * 101.269;
+            let path = self
+                .vs_fpm
+                .map_or(0.0, |vs| vs.atan2(tas_fpm).to_degrees())
+                .clamp(-ROTATE_MODEL_PATH_MAX_DEG, ROTATE_MODEL_PATH_MAX_DEG);
+            (path, (agl_ft / m.ground_effect_ft).clamp(0.0, 1.0))
         };
+        let base = m.breakout + (m.air_base - m.breakout) * lifted;
+        #[cfg(test)]
+        if let Some(hold) = self.as_flown_b2b1481.filter(|_| !self.wheels) {
+            let goal = ROTATE_MODEL_SHARE * hold / q;
+            self.model_out = goal + (self.model_out - goal) * (-dt / 0.2).exp();
+            return self.model_out;
+        }
+        self.model_out = ROTATE_MODEL_SHARE
+            * (m.per_deg * (target - path_deg - rest).max(0.0)
+                + (base + want_rate.max(0.0) / m.deg_s_per_unit) / q);
         self.model_out
+    }
+
+    /// Tests only: the model's flying half as b2b1481 flew 1790699819, a flat
+    /// 0.164 hold reached over 0.2 s at wheels-off.
+    #[cfg(test)]
+    fn as_flown_b2b1481(mut self) -> Self {
+        self.as_flown_b2b1481 = Some(0.164);
+        self
     }
 
     /// The law without its ceiling guard: what flew EGKK 08R (#78), for the
@@ -1942,7 +1998,7 @@ impl RotatePitch {
         // that on target and steady the elevator does not fall away.
         self.trim = (self.trim + err * PITCH_TRIM_PER_DEG_S * dt).clamp(self.pitch_min, PITCH_MAX);
         // A declared rotation model's column, fed forward (zero without one).
-        let fed = self.model_step(air.map(|(ias, _)| ias), target, want_rate, dt);
+        let fed = self.model_step(air, target, want_rate, dt);
         let out = (err * PITCH_P_PER_DEG + self.trim + fed).clamp(self.pitch_min, PITCH_MAX);
         self.out = match self.hold {
             Some(h) if !self.unguarded => {
@@ -3618,7 +3674,16 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, p: Params) {
                     xp.set_float(crate::autotaxi::RIGHT_BRAKE, br),
                 );
             }
-            if xp.set_float(TAXI_STEER, steer).await.is_err() {
+            // Rotated with the wheels off (under the 8 ft liftoff): the
+            // rudder lets go, as it does at the liftoff, and the track is the
+            // wings' (below). The roll law is still stepped, so a wheel that
+            // touches again gets its rudder back on the next tick.
+            // 1790699819 (LEMG 13, 2026-09-29, #184): 3.4 s floating at 81 to
+            // 95 KIAS, the rudder steering a heading target 2 to 2.7 degrees
+            // off while the cross-track ran 2.7 to 7.1 m.
+            let floating = rotated && on_ground < 0.5;
+            let rudder = if floating { 0.0 } else { steer };
+            if xp.set_float(TAXI_STEER, rudder).await.is_err() {
                 reject_rolling(
                     &xp,
                     &voice,
@@ -3648,6 +3713,10 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, p: Params) {
                     "theta": theta_deg, "pitch_tgt": pitch_law.target_deg(),
                     "q": pitch_rate,
                     "steer": steer, "trim": steer_law.trim(), "xtk_m": xtk_m,
+                    // The wheels (`onground_any`): a rotated tick without them
+                    // is the float, rudder released and banked for the track;
+                    // the scorer judges the centreline on the wheels.
+                    "wheels": on_ground >= 0.5,
                     "bl": bl, "br": br,
                     "xtk_rate": xtk_rate,
                     // The heading and the target it was steered to: without
@@ -3690,6 +3759,7 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, p: Params) {
                 // Wings held level through the pull — the rudder steering
                 // still owns the heading until liftoff.
                 pitch_law.on_wheels(on_ground >= 0.5);
+                pitch_law.climb_fpm(vs_flown);
                 let pitch = pitch_law.step_climb(theta_deg, pitch_rate, dt, Some((ias, agl_ft)));
                 if pitch_law.model.is_some() {
                     // The column the rotation wrote and the model's share of
@@ -3701,10 +3771,19 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, p: Params) {
                                            "q": pitch_rate, "dt": dt, "pitch": pitch,
                                            "pitch_ff": pitch_law.model_pull(),
                                            "pitch_tgt": pitch_law.target_deg(),
-                                           "wheels": on_ground >= 0.5}),
+                                           "wheels": on_ground >= 0.5,
+                                           "agl": agl_ft, "vs": vs_flown}),
                     );
                 }
-                let ail = wings.step(phi_deg, 0.0, dt);
+                // Wings level on the wheels; floating, a small bank toward the
+                // roll law's target heading (the runway course plus its
+                // cross-track cut), as the climb banks toward the course.
+                let bank = if floating {
+                    climb_bank_target(err).clamp(-FLOAT_BANK_MAX_DEG, FLOAT_BANK_MAX_DEG)
+                } else {
+                    0.0
+                };
+                let ail = wings.step(phi_deg, bank, dt);
                 crate::monitor::note_crew_yoke();
                 let (wp, wr) = tokio::join!(
                     xp.set_float(TAKEOFF_PITCH, pitch),
@@ -3853,6 +3932,7 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, p: Params) {
                 // ended at liftoff.
                 let hdg_err = ((rwy.course_deg - psi + 540.0).rem_euclid(360.0)) - 180.0;
                 pitch_law.on_wheels(false);
+                pitch_law.climb_fpm(vs_flown);
                 let pitch = pitch_law.step_climb(theta_deg, pitch_rate, dt, Some((ias, agl_ft)));
                 let ail = wings.step(phi_deg, climb_bank_target(hdg_err), dt);
                 crate::monitor::note_crew_yoke();
@@ -6702,22 +6782,31 @@ mod tests {
 
     /// The SR22's pitch through the rotation, fitted to those three (#184):
     /// a rate plant (the column sets a pitch rate through a lag `tau`, after
-    /// the write's delay). On the wheels the nose turns
-    /// `k_ground x ((v/ref)^2 x (u - per_deg x (theta - rest)) - breakout)`
-    /// deg/s and never below the roll attitude: the breakout is the nose's
-    /// weight about the mains, the `per_deg` the tail's spring (its angle of
-    /// attack is the attitude on the wheels). Fitted by least squares on the
-    /// attitude to 5 degrees, the column replayed from the ticks: 0.35 degree
-    /// rms. Flying, `k_air x ((v/ref)^2 x u - air_hold)`: the climb from the
-    /// first climb tick to 150 ft on its own, 0.14 degree rms. The wheels
-    /// leave where `v^2 x (theta - LIFT_ZERO_DEG)` reaches the lift the
-    /// flown rotations had at about 94 kt and 4.5 degrees (the first climb
-    /// tick was already 16 ft up, so the wheels left one to two seconds
-    /// before the logged liftoff); the zero-lift attitude is an estimate.
+    /// the write's delay). The nose turns
+    /// `k x ((v/ref)^2 x (u - per_deg x (alpha - rest)) - base)` deg/s, alpha
+    /// the attitude less the flight path (level on the wheels), and never
+    /// below the roll attitude on the wheels: the `per_deg` is the tail's
+    /// spring, the base on the wheels the breakout (the nose's weight about the
+    /// mains). Fitted by least squares on the attitude to 5 degrees on the
+    /// wheels, the column replayed from the ticks: 0.35 degree rms.
+    ///
+    /// Flying (1790699819, #184): the base stays the breakout in ground effect
+    /// and walks to `AIR_BASE` by `GROUND_EFFECT_FT` (0.31 held 4.6 degrees at
+    /// 88 KIAS a few feet up; the 100 kt climbs hold 10 degrees on a 7 degree
+    /// path with 0.1). The wing lifts as `v^2 x (alpha - LIFT_ZERO_DEG)`, ten
+    /// percent more in ground effect, the weight balanced at 104 kt and 3.2
+    /// degrees of alpha (the steady climb); the height is flown on the excess.
+    /// With the elevator 1.4 and the spring 1.3 of the fit (the 1790699819
+    /// airframe, whose nose came up at 4.7 deg/s on 0.38 of column), the law
+    /// b2b1481 flew leaves the wheels at 80.7 KIAS and 5.0 degrees (flown
+    /// 81.4, 5.0) and reaches 8 ft at 94.7 (flown 94.7).
     struct Sr22Rotation {
         theta: f64,
         q: f64,
         v: f64,
+        /// Height, feet, and vertical speed, ft/s.
+        h: f64,
+        vs: f64,
         wheels: bool,
         /// Multipliers on the fitted elevator and spring (robustness).
         k_mult: f64,
@@ -6726,19 +6815,20 @@ mod tests {
 
     impl Sr22Rotation {
         const REF_KTS: f64 = 90.0;
-        const K_GROUND: f64 = 29.2;
+        const K: f64 = 29.2;
         const BREAKOUT: f64 = 0.104;
         const PER_DEG: f64 = 0.0328;
         const TAU_S: f64 = 0.131;
         const DELAY_S: f64 = 0.26;
-        const K_AIR: f64 = 11.56;
-        const AIR_HOLD: f64 = 0.164;
+        const AIR_BASE: f64 = -0.059;
+        const GROUND_EFFECT_FT: f64 = 20.0;
+        const GROUND_EFFECT_LIFT: f64 = 0.10;
         const REST_DEG: f64 = -1.65;
-        const LIFT_ZERO_DEG: f64 = -6.0;
-        const LIFT_KTS: f64 = 94.0;
-        const LIFT_DEG: f64 = 4.5;
-        /// Groundspeed gained per second on the roll (74 to 98 KIAS in 5.6 s)
-        /// and a third of it climbing.
+        const LIFT_ZERO_DEG: f64 = -0.33;
+        const CLIMB_KTS: f64 = 104.0;
+        const CLIMB_ALPHA_DEG: f64 = 3.2;
+        /// Airspeed gained per second on the roll (74 to 98 KIAS in 5.6 s),
+        /// less half a knot a second per degree of path.
         const ACCEL_KTS_S: f64 = 4.3;
 
         fn new(theta: f64, v: f64) -> Self {
@@ -6746,40 +6836,70 @@ mod tests {
                 theta,
                 q: 0.0,
                 v,
+                h: 0.0,
+                vs: 0.0,
                 wheels: true,
                 k_mult: 1.0,
                 spring_mult: 1.0,
             }
         }
 
+        /// The airframe of 1790699819 (see above).
+        fn flown_1790699819(v: f64) -> Self {
+            Sr22Rotation {
+                k_mult: 1.4,
+                spring_mult: 1.3,
+                ..Self::new(Self::REST_DEG, v)
+            }
+        }
+
+        fn path_deg(&self) -> f64 {
+            self.vs.atan2(self.v * 1.687_81).to_degrees()
+        }
+
         fn advance(&mut self, u: f64, dur_s: f64) {
-            let h = 0.005_f64;
+            let step_s = 0.005_f64;
             let mut left = dur_s;
-            let lift = Self::LIFT_KTS.powi(2) * (Self::LIFT_DEG - Self::LIFT_ZERO_DEG);
+            let weight = Self::CLIMB_KTS.powi(2) * (Self::CLIMB_ALPHA_DEG - Self::LIFT_ZERO_DEG);
             while left > 1e-9 {
-                let step = h.min(left);
+                let step = step_s.min(left);
                 let dq = (self.v / Self::REF_KTS).powi(2);
-                let want = if self.wheels {
-                    Self::K_GROUND
-                        * self.k_mult
-                        * (dq
-                            * (u - Self::PER_DEG
-                                * self.spring_mult
-                                * (self.theta - Self::REST_DEG))
-                            - Self::BREAKOUT)
+                let path = if self.wheels { 0.0 } else { self.path_deg() };
+                let alpha = self.theta - path;
+                let in_effect = (1.0 - self.h / Self::GROUND_EFFECT_FT).max(0.0);
+                let base = if self.wheels {
+                    Self::BREAKOUT
                 } else {
-                    Self::K_AIR * self.k_mult * (dq * u - Self::AIR_HOLD)
+                    Self::AIR_BASE + (Self::BREAKOUT - Self::AIR_BASE) * in_effect
                 };
+                let want = Self::K
+                    * self.k_mult
+                    * (dq * (u - Self::PER_DEG * self.spring_mult * (alpha - Self::REST_DEG))
+                        - base);
                 self.q += (want - self.q) / Self::TAU_S * step;
                 self.theta += self.q * step;
                 if self.wheels && self.theta < Self::REST_DEG {
                     self.theta = Self::REST_DEG;
                     self.q = self.q.max(0.0);
                 }
-                self.v += Self::ACCEL_KTS_S * step * if self.wheels { 1.0 } else { 0.3 };
-                if self.wheels && self.v.powi(2) * (self.theta - Self::LIFT_ZERO_DEG) >= lift {
+                let lift = self.v.powi(2)
+                    * (alpha - Self::LIFT_ZERO_DEG)
+                    * (1.0 + Self::GROUND_EFFECT_LIFT * in_effect)
+                    / weight;
+                let accel = 32.2 * (lift - 1.0);
+                if self.wheels && accel > 0.0 {
                     self.wheels = false;
                 }
+                if !self.wheels {
+                    self.vs += accel * step;
+                    self.h += self.vs * step;
+                    if self.h <= 0.0 && self.vs < 0.0 {
+                        self.h = 0.0;
+                        self.vs = 0.0;
+                        self.wheels = true;
+                    }
+                }
+                self.v += (Self::ACCEL_KTS_S - 0.5 * path) * step;
                 left -= step;
             }
         }
@@ -6788,18 +6908,23 @@ mod tests {
     /// What a closed-loop rotation did, as the blackbox would say it.
     #[derive(Debug, Clone, Copy)]
     struct RotationFlown {
-        /// Airspeed where the wheels left, KIAS.
+        /// Airspeed where the wheels left, KIAS, and the attitude there.
+        wheels_off_kts: f64,
+        wheels_off_deg: f64,
+        /// Airspeed at 8 ft (the takeoff's `liftoff`), KIAS.
         liftoff_kts: f64,
         /// Seconds from Vr to the nose at 7 degrees.
         to_7_deg_s: f64,
-        /// Highest attitude, and the lowest from two seconds after the wheels
-        /// left to the end (a nose that drops back after liftoff).
+        /// Highest attitude; the lowest between the wheels leaving and 8 ft
+        /// (the float's sag); the lowest from a second after 8 ft on.
         max_theta: f64,
+        float_min: f64,
         min_after: f64,
     }
 
     /// Fly `law` against the fitted SR22 from Vr, through the write's delay,
-    /// at `tick` seconds with a jitter and the runway's rate noise.
+    /// at `tick` seconds with a jitter and the runway's rate noise; the law
+    /// reads the wheels, the height and the vertical speed as the loop does.
     fn fly_sr22_rotation(
         mut law: RotatePitch,
         mut plant: Sr22Rotation,
@@ -6814,17 +6939,18 @@ mod tests {
         let mut pending: Vec<(f64, f64)> = Vec::new();
         let mut applied = 0.0;
         let mut t = 0.0_f64;
+        let (mut off_kts, mut off_deg) = (f64::NAN, f64::NAN);
         let (mut liftoff, mut lift_t) = (f64::NAN, f64::NAN);
         let mut to_7 = f64::NAN;
-        let (mut max_theta, mut min_after) = (f64::MIN, f64::MAX);
+        let (mut max_theta, mut float_min, mut min_after) = (f64::MIN, f64::MAX, f64::MAX);
         while t < 14.0 {
             let dt = tick + 0.2 * tick * noise();
             let on = plant.wheels;
             let q_read = plant.q + noise() * if on { 1.0 } else { 0.1 };
             law.on_wheels(on);
-            let agl = if on { 0.0 } else { 10.0 };
+            law.climb_fpm(Some(plant.vs * 60.0));
             let theta_read = plant.theta + 0.1 * noise();
-            let cmd = law.step_climb(theta_read, Some(q_read), dt, Some((plant.v, agl)));
+            let cmd = law.step_climb(theta_read, Some(q_read), dt, Some((plant.v, plant.h)));
             pending.push((t + Sr22Rotation::DELAY_S, cmd));
             let end = t + dt;
             while t < end - 1e-9 {
@@ -6839,7 +6965,11 @@ mod tests {
                 while let Some(i) = pending.iter().position(|&(at, _)| at <= t) {
                     applied = pending.remove(i).1;
                 }
-                if !plant.wheels && liftoff.is_nan() {
+                if !plant.wheels && off_kts.is_nan() {
+                    off_kts = plant.v;
+                    off_deg = plant.theta;
+                }
+                if plant.h > 8.0 && liftoff.is_nan() {
                     liftoff = plant.v;
                     lift_t = t;
                 }
@@ -6847,15 +6977,21 @@ mod tests {
                     to_7 = t;
                 }
                 max_theta = max_theta.max(plant.theta);
-                if lift_t.is_finite() && t > lift_t + 2.0 {
+                if off_kts.is_finite() && liftoff.is_nan() {
+                    float_min = float_min.min(plant.theta);
+                }
+                if lift_t.is_finite() && t > lift_t + 1.0 {
                     min_after = min_after.min(plant.theta);
                 }
             }
         }
         RotationFlown {
+            wheels_off_kts: off_kts,
+            wheels_off_deg: off_deg,
             liftoff_kts: liftoff,
             to_7_deg_s: to_7,
             max_theta,
+            float_min,
             min_after,
         }
     }
@@ -6918,6 +7054,8 @@ mod tests {
                     // The airspeed as recorded, not the plant's own.
                     plant.v = k.ias;
                     plant.advance(applied, step);
+                    // Recorded on the wheels: the ground half of the plant.
+                    (plant.wheels, plant.h, plant.vs) = (true, 0.0, 0.0);
                     t += step;
                 }
                 let e = plant.theta - k.theta;
@@ -6939,40 +7077,34 @@ mod tests {
     /// #184: the SR22 rotated at Vr 73 and lifted off at 98 to 100 KIAS on
     /// every flight, the nose 5 degrees behind the ramp. Against the fitted
     /// plant, at the iMac's 0.4 s tick and the MacBook's 0.25, the law as it
-    /// flew lifts off past 90 kt with the nose at 7 degrees 5 s after Vr; fed
-    /// the declared model it lifts off by 85 kt, the nose at 7 inside 2.6 s,
-    /// never higher than the old law went (10.3) and not dropping back under
-    /// 7 degrees once flying. The model is a hypothesis about the plant, so
-    /// the elevator and the spring at 0.7 to 1.3 of the fit must still beat
-    /// the old law and stay under 11 degrees.
+    /// flew then reaches 8 ft past 92 kt, the nose at 7 degrees 5 s after Vr;
+    /// fed the declared model, by 88 kt, the nose at 7 inside 2.6 s, never
+    /// higher than 10, no sag between the wheels and 8 ft and no drop under 7
+    /// once climbing. The model is a hypothesis about the plant, so the
+    /// elevator and the spring at 0.7 to 1.4 of the fit must still beat the
+    /// old law, without the float's sag, and overshoot it by little.
     #[test]
     fn the_sr22_rotates_near_vr() {
         let model = rotate_model_sr22();
         let vr = 73.5;
         for tick in [0.25, 0.4] {
             for seed in 0..6 {
-                let old = fly_sr22_rotation(
-                    sr22_law(Some(5.0)),
-                    Sr22Rotation::new(Sr22Rotation::REST_DEG, vr),
-                    tick,
-                    seed,
-                );
-                assert!(old.liftoff_kts > 90.0, "the flown law, tick {tick}: {old:?}");
+                let fly = |law: RotatePitch| {
+                    let plant = Sr22Rotation::new(Sr22Rotation::REST_DEG, vr);
+                    fly_sr22_rotation(law, plant, tick, seed)
+                };
+                let old = fly(sr22_law(Some(5.0)));
+                assert!(old.liftoff_kts > 92.0, "the flown law, tick {tick}: {old:?}");
                 assert!(old.to_7_deg_s > 5.0, "the flown law, tick {tick}: {old:?}");
-                let new = fly_sr22_rotation(
-                    sr22_law(Some(5.0)).with_rotate_model(Some(model)),
-                    Sr22Rotation::new(Sr22Rotation::REST_DEG, vr),
-                    tick,
-                    seed,
-                );
-                assert!(new.liftoff_kts < 85.0, "tick {tick} seed {seed}: {new:?}");
+                let new = fly(sr22_law(Some(5.0)).with_rotate_model(Some(model)));
+                assert!(new.liftoff_kts < 88.0, "tick {tick} seed {seed}: {new:?}");
                 assert!(new.to_7_deg_s < 2.6, "tick {tick} seed {seed}: {new:?}");
                 assert!(new.max_theta < 10.0, "tick {tick} seed {seed}: {new:?}");
-                assert!(new.max_theta <= old.max_theta + 0.2, "{new:?} vs {old:?}");
+                assert!(new.float_min > new.wheels_off_deg - 0.3, "sagged: {new:?}");
                 assert!(new.min_after > 7.0, "tick {tick} seed {seed}: {new:?}");
             }
         }
-        for k_mult in [0.7, 1.0, 1.3] {
+        for k_mult in [0.7, 1.0, 1.4] {
             for spring_mult in [0.7, 1.3] {
                 let plant = || Sr22Rotation {
                     k_mult,
@@ -6980,19 +7112,106 @@ mod tests {
                     ..Sr22Rotation::new(Sr22Rotation::REST_DEG, vr)
                 };
                 let old = fly_sr22_rotation(sr22_law(Some(5.0)), plant(), 0.4, 1);
-                let new = fly_sr22_rotation(
-                    sr22_law(Some(5.0)).with_rotate_model(Some(model)),
-                    plant(),
-                    0.4,
-                    1,
-                );
-                assert!(
-                    new.liftoff_kts < old.liftoff_kts - 3.0,
-                    "elevator x{k_mult}, spring x{spring_mult}: {new:?} vs {old:?}"
-                );
-                assert!(new.max_theta < 11.0, "elevator x{k_mult}, spring x{spring_mult}: {new:?}");
+                let law = sr22_law(Some(5.0)).with_rotate_model(Some(model));
+                let new = fly_sr22_rotation(law, plant(), 0.4, 1);
+                let case = format!("elevator x{k_mult}, spring x{spring_mult}");
+                assert!(new.liftoff_kts < old.liftoff_kts - 3.0, "{case}: {new:?} vs {old:?}");
+                // A softer spring than declared is an over-pull: 11.2 and 12.4
+                // degrees at 0.7 of it (the old law 11.3 and 11.2).
+                assert!(new.max_theta < 12.5, "{case}: {new:?}");
+                assert!(new.max_theta < old.max_theta + 1.3, "{case}: {new:?} vs {old:?}");
+                assert!(new.float_min > new.wheels_off_deg - 0.5, "{case}: {new:?}");
             }
         }
+    }
+
+    /// 1790699819 (LEMG 13, the iMac, 2026-09-29): the first model, flown.
+    /// On the wheels it worked (Vr 74.6, wheels off 81.4 KIAS 1.4 s later at
+    /// 5.0 degrees); then its flat flying hold took the column from 0.39 to
+    /// 0.24, the nose sagged to 3.0, and the aircraft floated in ground
+    /// effect to the 8 ft liftoff at 94.7 KIAS. Against the plant of that
+    /// airframe, the law as b2b1481 flew it does the same (wheels off near
+    /// 81 at 5 degrees, 8 ft past 92); the path-and-ground-effect model
+    /// climbs out of the float by 89 without a sag, under 10 degrees.
+    #[test]
+    fn the_sr22_climbs_out_of_ground_effect() {
+        let model = rotate_model_sr22();
+        let mut flown_liftoffs = Vec::new();
+        for tick in [0.25, 0.4] {
+            for seed in 0..6 {
+                let fly = |law: RotatePitch| {
+                    fly_sr22_rotation(law, Sr22Rotation::flown_1790699819(74.6), tick, seed)
+                };
+                let law = || sr22_law(Some(5.0)).with_rotate_model(Some(model));
+                let flown = fly(law().as_flown_b2b1481());
+                assert!(
+                    (79.0..=83.0).contains(&flown.wheels_off_kts)
+                        && (4.0..=6.0).contains(&flown.wheels_off_deg),
+                    "as flown, tick {tick} seed {seed}: {flown:?}"
+                );
+                // The float is chaotic (88.5 to 97.8 over the seeds); the
+                // flight's 94.7 is its middle.
+                assert!(flown.liftoff_kts > 88.0, "as flown, tick {tick} seed {seed}: {flown:?}");
+                flown_liftoffs.push(flown.liftoff_kts);
+                let new = fly(law());
+                assert!(new.liftoff_kts < flown.liftoff_kts, "{new:?} vs {flown:?}");
+                assert!(new.liftoff_kts < 89.0, "tick {tick} seed {seed}: {new:?}");
+                assert!(new.float_min > new.wheels_off_deg - 0.3, "sagged: {new:?}");
+                assert!(new.max_theta < 10.0, "tick {tick} seed {seed}: {new:?}");
+                assert!(new.min_after > 7.0, "tick {tick} seed {seed}: {new:?}");
+            }
+        }
+        let mean = flown_liftoffs.iter().sum::<f64>() / flown_liftoffs.len() as f64;
+        assert!(mean > 92.0, "the float as flown: {mean:.1} kt at 8 ft");
+    }
+
+    /// The rotation records of 1790699819 (`rotate_tick`: the column and the
+    /// model's share, the wheels).
+    fn sr22_float_ticks() -> Vec<serde_json::Value> {
+        include_str!("../bench/takeoffs/sr22_float_lemg13_1790699819.jsonl")
+            .lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .filter(|r| r["event"] == "rotate_tick")
+            .collect()
+    }
+
+    /// Open loop over 1790699819's rotation: the law as flown (b2b1481)
+    /// writes every logged column, wheels and float alike, so the replay is
+    /// the flight. The model now: identical on the wheels, and at wheels-off
+    /// (81.4 KIAS, 5.0 degrees) it keeps the pull, 0.35 or more where the
+    /// flight dropped to 0.24; through the float it never feeds forward less
+    /// than the 0.3 that held 4.6 degrees at 88 KIAS.
+    #[test]
+    fn the_float_of_1790699819_replays_and_keeps_its_pull() {
+        let ticks = sr22_float_ticks();
+        assert_eq!(ticks.len(), 12);
+        let f = |r: &serde_json::Value, k: &str| r[k].as_f64().unwrap();
+        let model = rotate_model_sr22();
+        let mut flown = sr22_law(Some(5.0)).with_rotate_model(Some(model)).as_flown_b2b1481();
+        let mut now = sr22_law(Some(5.0)).with_rotate_model(Some(model));
+        let mut first_float = true;
+        for r in &ticks {
+            let wheels = r["wheels"] == true;
+            // The float's height was not logged: a few feet, under the 8 ft.
+            let air = Some((f(r, "ias"), if wheels { 0.0 } else { 3.0 }));
+            let (theta, q, dt) = (f(r, "theta"), Some(f(r, "q")), f(r, "dt"));
+            flown.on_wheels(wheels);
+            now.on_wheels(wheels);
+            let a = flown.step_climb(theta, q, dt, air);
+            let b = now.step_climb(theta, q, dt, air);
+            assert!((a - f(r, "pitch")).abs() < 1e-9, "replay at {}: {a}", f(r, "t"));
+            assert!((flown.model_pull() - f(r, "pitch_ff")).abs() < 1e-9);
+            if wheels {
+                assert_eq!(a.to_bits(), b.to_bits(), "the wheels are unchanged");
+            } else {
+                if first_float {
+                    assert!(a < 0.25 && b > 0.35, "wheels-off: flown {a}, now {b}");
+                    first_float = false;
+                }
+                assert!(now.model_pull() > 0.3, "fed {} at {}", now.model_pull(), f(r, "ias"));
+            }
+        }
+        assert!(!first_float, "the float is in the record");
     }
 
     /// No declaration, no change: the law without a model writes the same

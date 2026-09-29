@@ -464,7 +464,7 @@ pub fn speed_governor() -> Option<SpeedGovernorProfile> {
 
 /// The rotation's elevator on the wheels (`autotakeoff::RotatePitch`),
 /// fitted: the column the nose needs to come up at a rate and to be held up
-/// on the main wheels, and the column that holds the attitude once flying.
+/// on the main wheels, and how that column carries into the air.
 /// Declared, the rotation law feeds that column forward (a share of it,
 /// `autotakeoff::ROTATE_MODEL_SHARE`) and its own P+I only corrects; `None`
 /// is the P+I alone, as ever.
@@ -487,11 +487,21 @@ pub struct RotateElevatorProfile {
     pub deg_s_per_unit: f64,
     /// The column that just lifts the nosewheel at `ref_kts`.
     pub breakout: f64,
-    /// More column per degree of nose-up past the roll attitude, on the main
-    /// wheels (the tail's spring; the same at every speed).
+    /// More column per degree of the wing's angle of attack past the roll
+    /// attitude (the tail's spring; the same at every speed). On the wheels
+    /// the angle is the attitude; flying, the attitude less the flight path,
+    /// so the spring does not leave with the wheels: it leaves as the path
+    /// comes up.
     pub per_deg: f64,
-    /// The column that holds the attitude once flying, at `ref_kts`.
-    pub air_hold: f64,
+    /// Flying clear of ground effect, the column the breakout becomes, at
+    /// `ref_kts` (the spring apart). In ground effect the breakout stands:
+    /// 1790699819 needed about 0.31 to hold 4.6 degrees at 88 KIAS a few
+    /// feet up, the breakout plus the spring, and the 100 kt climbs hold on
+    /// 0.1 at 10 degrees on a 7 degree path, the spring less 0.06.
+    pub air_base: f64,
+    /// The height ground effect is gone by, feet; `air_base` is reached
+    /// linearly from the wheels to it (about half the span).
+    pub ground_effect_ft: f64,
 }
 
 impl RotateElevatorProfile {
@@ -501,7 +511,8 @@ impl RotateElevatorProfile {
             && (1.0..=200.0).contains(&self.deg_s_per_unit)
             && (0.0..=0.6).contains(&self.breakout)
             && (0.0..=0.1).contains(&self.per_deg)
-            && (-0.5..=0.6).contains(&self.air_hold))
+            && (-0.5..=0.6).contains(&self.air_base)
+            && (3.0..=150.0).contains(&self.ground_effect_ft))
             .then_some(self)
     }
 }
