@@ -392,7 +392,7 @@ everything blackboxes to `logs/blackbox.jsonl` (kinds: `atc`, `autotaxi`, `autot
 `pushback`, `checklist`, `taxi_guide`, `cockpit_auto`, `full_auto`, `circuit`, `procedure`,
 `cabin`, `instructor`, `loading`, `turbine_start`, `heli_start`, `hover`, `heli_circuit`,
 `heli_route`, `rapport`, `cabin_air`, `api_load`, `plan_audit`, `handover`, `start_item`,
-`sim_radio`, `fuel_pumps`, `electrical`, `typed`, `crew_radio`, `go_around`).
+`sim_radio`, `fuel_pumps`, `electrical`, `typed`, `crew_radio`, `go_around`, `recover`).
 
 ### Holding, writers, reads
 - **A stage not moving the aircraft is holding it**: brakes for every wait, abort and give-up. **A
@@ -499,7 +499,16 @@ everything blackboxes to `logs/blackbox.jsonl` (kinds: `atc`, `autotaxi`, `autot
   and VS): modes left lit by the last flight were taken for an engage and nothing flew the SF50 from
   300 ft to 21,900 (LEMG 13 2026-09-28, #160). **A pattern that is no pattern is given back loudly**
   (`circuit::PatternGuard`, `pattern_guard`: 1,500 ft over its height, a leg past `leg_limit_s`, or the
-  servos out).
+  servos out), **but never to nobody**: a give-up that reads the aircraft slow, stalling or upset
+  (`recover::unflyable`) recovers it instead (`recover::take_over`).
+- **The autopilot's ANSWER is watched, never assumed** (`src/climb_watch.rs`, circuit and follower,
+  blackbox `climb_watch`): a lit VS mode and a read-back dial flew a 737 from 166 kt to 73 at 9,600
+  fpm (LEMG 13, #181). The climb far over the dial with the speed going, or a climb on under the
+  floor, sends the dial down and is TAKEN if it does not answer (`PatternTrip::ClimbNotHeld`):
+  `take_over` puts the servos out (a servo writes the column back over ours), flies it level on
+  `xcopilot/pitch`, gives the autopilot back only once WATCHED holding (`ap_holding`), else hand
+  flies it level until "my controls". The takeoff logs who holds the elevator at the arm and refuses
+  a failed autopilot servo or trim (`read_pitch_authority`, `pitch_authority`).
 - **The declared rudder is believed only up to the speed it was measured at** (`RollSteer` held flat
   above `roll_rudder:` `at_kts`, ceiling `RUDDER_FULL_DEG_FAST`; extrapolated as v^2 it cut the gain to a
   third by Vr: EGKK 08R lifted off 5.4 m left, 2026-09-28). The scheduled roll's cut is `RollCut`: the

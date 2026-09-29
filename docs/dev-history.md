@@ -10609,3 +10609,60 @@ Tests `the_phugoid_air_start_is_never_called_ready`,
 `a_level_governed_flight_is_ready_after_ten_seconds`,
 `the_vertical_goes_to_the_dial_by_vs_never_an_alt_hold_off_it`, `steady_cruise_is_not_movement`,
 `the_air_starts_zoom_is_still_refused`. Offline only; check `enroute_vertical`, `enroute_settle`.
+
+## 2026-09-29: SAFETY, the autopilot's climb watched and no stall handed to nobody (#181)
+
+LEMG 13 (737 runway start, circuit, sortie 1790649043, build 0a26a46): `ap_engaged` at 363 ft,
+cmd_vs 3,934, the dial set_confirmed, `ap_state` 50 (HDG + VS + ALT arm, as on the clean 602513e
+run 1790631752). The VSI never followed: 4,000 at the engage, 4,605 at the 505 ft handoff, then
+6,118 / 7,632 / 8,733 / 9,678 fpm while the circuit walked the dial from 3,362 to -500; 166 kt to
+147 (the 149.5 floor at +105.7 s) to 73, thrust 1.0, 1,297 to 2,643 ft AGL. `pattern_guard` fired
+only on `servos_off` at 73 kt ("The autopilot is off. Circuit cancelled. Your aircraft.") and the
+737 rolled past 160 degrees at 0 kt with nobody flying. The same airframe instance (init seq 18,
+not reloaded for 19 and 20) had zoomed 18,000 to 26,200 ft under a lit ALT HOLD (`ap_state` 16386)
+in the EGKK-EGBB air start before it, an undamped phugoid; on the roll it lifted itself (theta 0.1
+at 117 kt to 10.1 at 142 with no rotation commanded, Vr 145) and needed -0.346 of column to hold
+the climb (the clean run -0.225).
+
+Cause, as far as the records go: the code path did not change (602513e..0a26a46 touches no VS
+write) and every command was right and read back; the airframe carried a nose-up moment its
+autopilot could not hold (an elevator servo, trim or balance state, not logged, unproven). Nothing
+of ours wrote `xcopilot/pitch` after the engage: `climb_manual` stops at 293 ft, the engage is at
+363, the enroute setup never writes the channel and no autoland ran in that case (the yoke read 0.0
+throughout, as it does under an engaged autopilot on the clean run). Our defect: nothing watched
+the autopilot's ANSWER, and the give-up handed a stalling aircraft to nobody.
+
+- `src/climb_watch.rs` `ClimbWatch` (pure, its own seeded climb estimate from the altitude): the
+  climb 2,500 fpm over the dial for 3 s, not coming down by 1,000, with 3 kt lost is
+  `TakeOver(NotFollowing)` (held speed: `NotFollowed`, logged once; the A330 of 1790621184 took 10 s
+  to bring 3,700 fpm to its dial at 180 kt and rising); under the floor with a climb on is `Descend`
+  (the dial to -1,000 at most), then `TakeOver(SlowClimb)` after 4 s unanswered with the speed still
+  falling, and at once under 0.9 of the floor. In the circuit (floor: the kept flap's, the landing
+  flap's on base and final; blackbox `circuit` `climb_watch`, `vs` on every leg tick) and the
+  follower (`procedure` `climb_watch`). Replayed: the #181 circuit is taken 3.5 s in at 156 kt, 1,013
+  ft AGL, 8,066 fpm against 2,782 (before the floor); the clean 602513e circuit trips nothing. Over
+  the 68 circuits in the logs, judged on the recorded `climb_floor`, the trips are #181, #160 (the
+  SF50 nothing flew) and one A330 base at 167.7 kt against the CLEAN 201 kt floor, which the landing
+  flap's floor the code uses (about 167 at CONF 2) does not take.
+- `tools::recover::take_over`: the servos out FIRST (`servos_off_any`, `servos_fdir_off` if it did
+  not take; an engaged servo writes the column back over ours), flown level on the plugin's
+  `xcopilot/pitch`/`roll` (the raw override where there is no plugin), the autopilot given it back
+  with HDG and ALT HOLD and WATCHED 12 s (`ap_holding`); one that does not hold is taken back and the
+  aircraft hand flown level at the height (`hold_pitch_deg`, `hold_throttle`) until "my controls",
+  said once. No deadline lets go of an unrecovered aircraft (the tool's 25 s did). Blackbox `recover`
+  `take_over`, `start` (with `authority`), `ap_not_holding`, `hand_flying`, `handed_to_autopilot`.
+- A circuit give-up (`give_up_pattern`) of any trip reads the aircraft (`recover::unflyable`: stall
+  warning, under the configuration's floor, bank past 45, nose past +25 or -15) and recovers instead
+  of "your aircraft"; the new trip `climb_not_held` always does (`pattern_guard` `recovering`).
+- The takeoff reads who holds the elevator at the arm (`recover::read_pitch_authority`: the
+  autopilot and pitch-trim failures, `override_autopilot`, `override_joystick_pitch`,
+  `altitude_mode`, CG %MAC, weight, trim; blackbox `autotakeoff` `pitch_authority`) and refuses on a
+  failed servo or trim or another plugin on the autopilot's brains.
+
+Tests `the_lemg_stall_is_taken_before_the_floor`, `a_circuit_the_autopilot_flew_is_never_taken`
+(both on trimmed bench sorties), `a_slow_climb_is_sent_down_then_taken_or_released`,
+`a_slow_autopilot_at_a_good_speed_is_only_noted`, `deep_under_the_floor_climbing_is_taken_at_once`,
+`the_servos_out_give_up_at_73_kt_is_a_recovery`, `a_stalling_or_upset_aircraft_is_unflyable`,
+`an_autopilot_is_believed_only_while_it_holds`, `a_hand_flown_hold_is_level_and_bounded`,
+`a_takeoff_is_refused_without_the_autopilots_pitch`. Owed: the takeoff's own engaged climb (363 to
+505 ft) and an enroute ALT HOLD are not watched yet. Offline only.

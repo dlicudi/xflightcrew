@@ -18,6 +18,7 @@ mod autotaxi;
 mod cabin;
 mod checklist;
 mod circuit;
+mod climb_watch;
 mod cockpit_auto;
 mod config;
 mod control;
