@@ -4145,6 +4145,14 @@ async fn taxi_in_after_landing(
             // a give-up, and `landed: true` was logged at 1,900 ft.
             json!({ "autoland_ended": landed, "on_ground": on_ground, "crashed": crashed }),
         );
+        // Autoland let go in the AIR and nobody asked for it: the mission is
+        // not over until someone is flying. LEMG 13 SR22 circuit 2026-09-29
+        // (sortie 1790692781-full_auto): "Going around, climbing straight
+        // ahead. Your aircraft." at 805 ft, and the mission ended with an
+        // unattended runner and nobody flying.
+        if landed && !on_ground && !crashed && !ABORT.load(SeqCst) {
+            hold_airborne_end(xp, &config.xplane_base_url, voice).await;
+        }
         return;
     }
     announce(
@@ -4170,6 +4178,223 @@ async fn taxi_in_after_landing(
         true,
     );
     RUN.record(sim::run::Outcome::HandedOff);
+}
+
+/// How long a published missed approach (`procedure`, flown from autoland's
+/// go-around) is left to finish before the airborne end is judged.
+const AIRBORNE_END_PROCEDURE_WAIT_S: f64 = 900.0;
+/// The autopilot is watched this long before an airborne end believes it.
+const AIRBORNE_END_VERIFY_S: f64 = crate::tools::recover::AP_VERIFY_S;
+/// The first seconds of that watch are the modes engaging, not judged.
+const AIRBORNE_END_GRACE_S: f64 = 3.0;
+/// ...and it ends this close to level (VS 0 commanded at the start).
+const AIRBORNE_END_LEVEL_FPM: f64 = 1_000.0;
+
+/// One look at the autopilot after the mission's landing let go airborne.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct AirborneLook {
+    pub servos: Option<f64>,
+    pub hdg_status: Option<f64>,
+    pub vs_status: Option<f64>,
+    pub alt_hold_status: Option<f64>,
+    pub vvi_fpm: Option<f64>,
+    pub pitch_deg: Option<f64>,
+    pub bank_deg: Option<f64>,
+    pub ias_kts: Option<f64>,
+}
+
+/// Is the autopilot holding the aircraft, or why not? A failed read of the
+/// servos or the modes is NOT holding (only what reads back is claimed); a
+/// failed attitude read is no evidence against. `last` is the end of the
+/// watch, where the climb or descent must have come to near level. Pure.
+pub(crate) fn airborne_end_verdict(
+    look: &AirborneLook,
+    min_safe_ias: f64,
+    last: bool,
+) -> Result<(), &'static str> {
+    let on = |v: Option<f64>| v.is_some_and(|x| x > 0.5);
+    if !on(look.servos) {
+        return Err("servos_off");
+    }
+    if !on(look.hdg_status) {
+        return Err("no_heading_mode");
+    }
+    if !(on(look.vs_status) || on(look.alt_hold_status)) {
+        return Err("no_vertical_mode");
+    }
+    if !crate::tools::recover::ap_holding(
+        look.vvi_fpm,
+        look.pitch_deg,
+        look.bank_deg,
+        look.ias_kts,
+        min_safe_ias,
+    ) {
+        return Err("not_holding");
+    }
+    if last
+        && look
+            .vvi_fpm
+            .filter(|v| v.is_finite())
+            .is_some_and(|v| v.abs() > AIRBORNE_END_LEVEL_FPM)
+    {
+        return Err("not_level");
+    }
+    Ok(())
+}
+
+async fn read_airborne_look(xp: &XPlaneClient) -> AirborneLook {
+    let (servos, hdg, vs, alt, vvi, pitch, bank, ias) = tokio::join!(
+        xp.get_float(crate::datarefs::SERVOS_ON),
+        xp.get_float(crate::datarefs::HEADING_STATUS),
+        xp.get_float("sim/cockpit2/autopilot/vvi_status"),
+        xp.get_float("sim/cockpit2/autopilot/altitude_hold_status"),
+        xp.get_float("sim/flightmodel/position/vh_ind_fpm"),
+        xp.get_float("sim/flightmodel/position/theta"),
+        xp.get_float("sim/flightmodel/position/phi"),
+        xp.get_float("sim/flightmodel/position/indicated_airspeed"),
+    );
+    AirborneLook {
+        servos: servos.ok(),
+        hdg_status: hdg.ok(),
+        vs_status: vs.ok(),
+        alt_hold_status: alt.ok(),
+        vvi_fpm: vvi.ok(),
+        pitch_deg: pitch.ok(),
+        bank_deg: bank.ok(),
+        ias_kts: ias.ok(),
+    }
+}
+
+/// The pilot's "my controls" or a new flight loading ended this: nothing of
+/// ours may touch the aircraft now.
+fn airborne_end_stood_down() -> bool {
+    ABORT.load(SeqCst) || crate::xplane::sim_loading()
+}
+
+/// The mission's landing let go in the air (a give-up after its go-arounds,
+/// or anything else that ended autoland airborne): never "your aircraft" to
+/// nobody. A published missed approach flying is waited for; then the
+/// autopilot is put on heading and VS 0 and WATCHED; only a held level is
+/// handed over, said with its numbers, the governor keeping the speed.
+/// Anything else (slow, upset, the servos out, a mode that will not hold)
+/// is the recovery's (`recover::take_over`), which flies it level and keeps
+/// it until "my controls". LEMG 13 SR22 circuit 2026-09-29: handed back at
+/// 805 ft climbing at 1,000 fpm, the runner unattended.
+async fn hold_airborne_end(xp: &XPlaneClient, base_url: &str, voice: &Option<Voice>) {
+    use std::sync::atomic::Ordering::Relaxed;
+    waiting("the missed approach");
+    wait_until(AIRBORNE_END_PROCEDURE_WAIT_S, 1000, || async {
+        !crate::procedure::ACTIVE.load(Relaxed) || airborne_end_stood_down()
+    })
+    .await;
+    if airborne_end_stood_down() {
+        return;
+    }
+    let floor = crate::aircraft::speed_floor_kts();
+    let min_safe = floor.filter(|f| f.is_finite() && *f > 0.0).unwrap_or(70.0);
+    let take_over = |why: &'static str, look: AirborneLook| {
+        // One writer on the lever: the governor autoland armed lets go first.
+        crate::tools::speedhold::release();
+        let started = crate::tools::recover::take_over(
+            base_url.to_string(),
+            voice.clone(),
+            crate::tools::recover::TakeOver {
+                why: format!("full_auto_airborne_{why}"),
+                min_safe_ias: floor.map(|f| f + 5.0),
+                hold_kts: None,
+                ap_no_pitch: false,
+                hold_ft: None,
+            },
+        );
+        event(
+            "airborne_end",
+            json!({ "verdict": "take_over", "why": why, "recovery_started": started,
+                    "servos": look.servos, "vvi": look.vvi_fpm, "ias": look.ias_kts,
+                    "pitch": look.pitch_deg, "bank": look.bank_deg }),
+        );
+        announce(
+            voice,
+            Priority::Warning,
+            "Full auto is off. I have the aircraft until you say my controls.",
+        );
+    };
+    if crate::tools::recover::ACTIVE.load(SeqCst) {
+        event("airborne_end", json!({ "verdict": "recovery_has_it" }));
+        announce(
+            voice,
+            Priority::Warning,
+            "Full auto is off. I have the aircraft until you say my controls.",
+        );
+        return;
+    }
+    if let Some(what) = crate::tools::recover::read_unflyable(xp, floor).await {
+        take_over(what, read_airborne_look(xp).await);
+        return;
+    }
+    // The autopilot on heading and VS 0: the servos in if they read out, the
+    // modes pressed only when they read off (toggles), the wheel written
+    // only in VS mode.
+    let look = read_airborne_look(xp).await;
+    if look.servos.is_some_and(|v| v < 0.5) {
+        let _ = xp.run_command("sim/autopilot/servos_on").await;
+    }
+    if look.hdg_status.is_some_and(|v| v < 0.5) {
+        let _ = xp.run_command("sim/autopilot/heading").await;
+    }
+    let alt_held = look.alt_hold_status.is_some_and(|v| v > 0.5);
+    if !alt_held {
+        if look.vs_status.is_some_and(|v| v < 0.5) {
+            let _ = xp.run_command("sim/autopilot/vertical_speed").await;
+        }
+        let _ = xp.set_float(VS_DIAL, 0.0).await;
+    }
+    let t0 = Instant::now();
+    let mut look = read_airborne_look(xp).await;
+    loop {
+        if airborne_end_stood_down() || crate::tools::recover::ACTIVE.load(SeqCst) {
+            return;
+        }
+        let secs = t0.elapsed().as_secs_f64();
+        let last = secs >= AIRBORNE_END_VERIFY_S;
+        if secs >= AIRBORNE_END_GRACE_S {
+            if let Err(why) = airborne_end_verdict(&look, min_safe, last) {
+                take_over(why, look);
+                return;
+            }
+        }
+        if last {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(1000)).await;
+        look = read_airborne_look(xp).await;
+    }
+    let (alt_r, hdg_r) = tokio::join!(
+        xp.get_float(crate::datarefs::ALTITUDE_FT),
+        xp.get_float(crate::datarefs::COMPASS_HEADING_DEG),
+    );
+    let alt = alt_r.ok().filter(|v| v.is_finite());
+    let hdg = hdg_r.ok().filter(|v| v.is_finite());
+    event(
+        "airborne_end",
+        json!({ "verdict": "ap_holding", "alt": alt, "hdg": hdg, "vvi": look.vvi_fpm,
+                "ias": look.ias_kts, "alt_hold": alt_held }),
+    );
+    announce(voice, Priority::Warning, &airborne_end_line(hdg, alt));
+}
+
+/// The hand-over line once the autopilot is seen holding. No dashes (TTS).
+/// Pure.
+pub(crate) fn airborne_end_line(hdg_mag: Option<f64>, alt_ft: Option<f64>) -> String {
+    let hdg = hdg_mag.map(|h| {
+        let h = h.round().rem_euclid(360.0);
+        format!(" heading {:03.0}", if h == 0.0 { 360.0 } else { h })
+    });
+    let alt = alt_ft.map(|a| format!(" at {:.0} feet", (a / 100.0).round() * 100.0));
+    format!(
+        "Full auto is off. The autopilot is holding{}{}, level. Your aircraft.",
+        hdg.unwrap_or_default(),
+        alt.unwrap_or_default()
+    )
 }
 
 /// The arrival, briefed AT THE GATE: what the destination offers and what
@@ -7669,6 +7894,78 @@ mod tests {
         );
         assert!(!super::pilot_on_the_brakes(Some(0.1), None), "a resting foot");
         assert!(super::pilot_on_the_brakes(None, Some(0.9)), "one pedal is a stop");
+    }
+
+    /// LEMG 13 SR22 circuit, 2026-09-29 (sortie 1790692781-full_auto):
+    /// autoland let go at 805 ft climbing and the mission ended airborne.
+    /// Only an autopilot READ holding on heading and a vertical mode, near
+    /// level by the end of the watch, is handed over; everything else is
+    /// the recovery's.
+    #[test]
+    fn an_airborne_end_hands_over_only_a_held_autopilot() {
+        use super::{airborne_end_verdict, AirborneLook};
+        let held = AirborneLook {
+            servos: Some(1.0),
+            hdg_status: Some(2.0),
+            vs_status: Some(2.0),
+            alt_hold_status: Some(0.0),
+            vvi_fpm: Some(-150.0),
+            pitch_deg: Some(2.0),
+            bank_deg: Some(1.0),
+            ias_kts: Some(110.0),
+        };
+        assert_eq!(airborne_end_verdict(&held, 75.0, true), Ok(()));
+        let alt = AirborneLook { vs_status: Some(0.0), alt_hold_status: Some(2.0), ..held };
+        assert_eq!(airborne_end_verdict(&alt, 75.0, true), Ok(()));
+        let off = AirborneLook { servos: Some(0.0), ..held };
+        assert_eq!(airborne_end_verdict(&off, 75.0, false), Err("servos_off"));
+        let unread = AirborneLook { servos: None, ..held };
+        assert_eq!(airborne_end_verdict(&unread, 75.0, false), Err("servos_off"));
+        let no_hdg = AirborneLook { hdg_status: Some(0.0), ..held };
+        assert_eq!(airborne_end_verdict(&no_hdg, 75.0, false), Err("no_heading_mode"));
+        let no_vert = AirborneLook { vs_status: Some(0.0), ..held };
+        assert_eq!(airborne_end_verdict(&no_vert, 75.0, false), Err("no_vertical_mode"));
+        let slow = AirborneLook { ias_kts: Some(60.0), ..held };
+        assert_eq!(airborne_end_verdict(&slow, 75.0, false), Err("not_holding"));
+        // The sortie's own hand-back: climbing 850 fpm on a 1,000 dial. Still
+        // settling mid-watch; at the end it must have come to level.
+        let climbing = AirborneLook { vvi_fpm: Some(1_400.0), ..held };
+        assert_eq!(airborne_end_verdict(&climbing, 75.0, false), Ok(()));
+        assert_eq!(airborne_end_verdict(&climbing, 75.0, true), Err("not_level"));
+        // A failed attitude read is no evidence against.
+        let blind = AirborneLook { vvi_fpm: None, pitch_deg: None, ..held };
+        assert_eq!(airborne_end_verdict(&blind, 75.0, true), Ok(()));
+    }
+
+    #[test]
+    fn the_airborne_end_line_says_what_is_held() {
+        let l = super::airborne_end_line(Some(131.6), Some(2_048.0));
+        assert_eq!(
+            l,
+            "Full auto is off. The autopilot is holding heading 132 at 2000 feet, level. \
+             Your aircraft."
+        );
+        assert!(super::airborne_end_line(Some(0.2), None).contains("heading 360,"));
+        assert!(!l.contains('\u{2014}') && !l.contains('\u{2013}'));
+    }
+
+    /// The landing that let go airborne is judged, never the mission's end
+    /// (source-pinned: the wait is not a plain test).
+    #[test]
+    fn an_airborne_autoland_end_is_held_not_ended() {
+        let src = include_str!("full_auto.rs");
+        let body = src
+            .split("async fn taxi_in_after_landing(")
+            .nth(1)
+            .unwrap()
+            .split("\"no_taxi_in\",")
+            .nth(1)
+            .unwrap()
+            .split("return;")
+            .next()
+            .unwrap();
+        assert!(body.contains("if landed && !on_ground && !crashed && !ABORT.load(SeqCst)"));
+        assert!(body.contains("hold_airborne_end(xp, &config.xplane_base_url, voice).await;"));
     }
 
     /// The circuit mission ends as the takeoff's give-up when its takeoff

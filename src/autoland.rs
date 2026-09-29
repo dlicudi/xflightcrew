@@ -1583,6 +1583,10 @@ pub fn run_autoland_scoped(
             // how this loop gets round to a final it is on the wrong side of.
             let mut reversal: Option<crate::reversal::Reversal> = None;
             let mut reversals_flown: u32 = 0;
+            // A published missed approach asked for once: one that cannot be
+            // flown falls through to our own pattern, never to "Your aircraft"
+            // with nobody there (LEMG 13 SR22 circuit 2026-09-29).
+            let mut missed_procedure_tried = false;
             // The pattern's plan over the probed ground (#182), probed beside
             // the loop (the plugin answers in seconds; the aircraft flies on),
             // and when it began. Begun in the go-around's climb, so it is
@@ -2198,7 +2202,12 @@ pub fn run_autoland_scoped(
                     // A steep, visual-segment approach (LSZS) is never
                     // repositioned by a pattern of our own: that is a valley.
                     // A go-around there flies the PUBLISHED missed approach.
-                    let steep = glidepath_deg() > 3.0 + 1e-9;
+                    // PUBLISHED steep only: a circuit's path steepened over
+                    // the ground (#182) is an ordinary field, its reversal
+                    // terrain-probed (LEMG 13 SR22 2026-09-29: 3.26 degrees
+                    // took the valley branch, no pattern when high on the
+                    // join, then no missed approach to fly after the balk).
+                    let steep = published_steep() && !missed_procedure_tried;
                     let wanted = match missed {
                         Some(MissedStage::Reposition) => true,
                         Some(MissedStage::Climb) => false,
@@ -2240,7 +2249,7 @@ pub fn run_autoland_scoped(
                         }
                     };
                     if wanted && steep {
-                        gave_up = true;
+                        missed_procedure_tried = true;
                         let missed_legs = crate::procedure::take_missed_legs();
                         let vy = crate::aircraft::live_profile()
                             .and_then(|p| p.reference.as_ref().and_then(|r| r.vy_kts))
@@ -2271,22 +2280,20 @@ pub fn run_autoland_scoped(
                             serde_json::json!({"event": "missed_procedure", "flying": flying, "radio": radio_ft}),
                         );
                         if flying {
+                            gave_up = true;
                             announce(
                                 "Flying the published missed approach.".to_string(),
                                 Priority::Caution,
                             );
-                        } else {
-                            let thr_dref = throttle_dref();
-                            let _ = tokio::join!(
-                                xp.set_float(&thr_dref, GIVE_UP_THROTTLE),
-                                xp.set_float(VS_DIAL, 1000.0),
-                            );
-                            announce(
-                                "Going around, climbing straight ahead. Your aircraft.".to_string(),
-                                Priority::Warning,
-                            );
+                            break;
                         }
-                        break;
+                        // No published missed approach to fly: our own
+                        // terrain-probed pattern below (`reversal::plan`,
+                        // which climbs straight ahead and HOLDS a height
+                        // clear of the ground where no pattern fits). The
+                        // old "climbing straight ahead" hand-back left
+                        // an unattended SR22 at 805 ft with nobody flying
+                        // (LEMG 13 2026-09-29).
                     }
                     if wanted && reversals_flown >= crate::reversal::MAX_REVERSALS {
                         gave_up = true;
@@ -4079,21 +4086,29 @@ pub const GLIDEPATH_FT_PER_NM: f64 = 318.0;
 /// 4.5 degree path, and every other test landing at the same moment flew it
 /// (the balloon test failed one run in three, 2026-09-24). One landing per
 /// process is the app's truth; one per test is the tests'.
+/// The angle carries WHO handed it down: `true` for a published visual
+/// segment (the follower at a MAP, with its missed approach stashed), `false`
+/// for a circuit's path steepened over the ground (#182). Only the first is
+/// a valley our own pattern must never fly into; the second is an ordinary
+/// field whose go-around the terrain-probed reversal flies (LEMG 13 SR22
+/// circuit 2026-09-29: a 3.26 degree circuit path was taken for LSZS, the
+/// go-around found no published missed approach and said "Your aircraft"
+/// at 805 ft to nobody).
 #[cfg(not(test))]
-static GLIDEPATH_DEG: std::sync::Mutex<f64> = std::sync::Mutex::new(3.0);
+static GLIDEPATH_DEG: std::sync::Mutex<(f64, bool)> = std::sync::Mutex::new((3.0, false));
 /// The angle the NEXT arm takes, consumed there.
 #[cfg(not(test))]
-static NEXT_GLIDEPATH_DEG: std::sync::Mutex<Option<f64>> = std::sync::Mutex::new(None);
+static NEXT_GLIDEPATH_DEG: std::sync::Mutex<Option<(f64, bool)>> = std::sync::Mutex::new(None);
 #[cfg(test)]
 thread_local! {
-    static GLIDEPATH_DEG_T: std::cell::Cell<f64> = const { std::cell::Cell::new(3.0) };
-    static NEXT_GLIDEPATH_DEG_T: std::cell::Cell<Option<f64>> = const { std::cell::Cell::new(None) };
+    static GLIDEPATH_DEG_T: std::cell::Cell<(f64, bool)> = const { std::cell::Cell::new((3.0, false)) };
+    static NEXT_GLIDEPATH_DEG_T: std::cell::Cell<Option<(f64, bool)>> = const { std::cell::Cell::new(None) };
 }
 /// The steepest path the landing will fly.
 pub const MAX_GLIDEPATH_DEG: f64 = 5.5;
 
 #[cfg(not(test))]
-fn next_glidepath(set: Option<Option<f64>>) -> Option<f64> {
+fn next_glidepath(set: Option<Option<(f64, bool)>>) -> Option<(f64, bool)> {
     let mut g = NEXT_GLIDEPATH_DEG.lock().unwrap_or_else(|e| e.into_inner());
     match set {
         Some(v) => {
@@ -4104,7 +4119,7 @@ fn next_glidepath(set: Option<Option<f64>>) -> Option<f64> {
     }
 }
 #[cfg(test)]
-fn next_glidepath(set: Option<Option<f64>>) -> Option<f64> {
+fn next_glidepath(set: Option<Option<(f64, bool)>>) -> Option<(f64, bool)> {
     NEXT_GLIDEPATH_DEG_T.with(|c| match set {
         Some(v) => {
             c.set(v);
@@ -4114,7 +4129,7 @@ fn next_glidepath(set: Option<Option<f64>>) -> Option<f64> {
     })
 }
 #[cfg(not(test))]
-fn live_glidepath(set: Option<f64>) -> f64 {
+fn live_glidepath(set: Option<(f64, bool)>) -> (f64, bool) {
     let mut g = GLIDEPATH_DEG.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(v) = set {
         *g = v;
@@ -4122,7 +4137,7 @@ fn live_glidepath(set: Option<f64>) -> f64 {
     *g
 }
 #[cfg(test)]
-fn live_glidepath(set: Option<f64>) -> f64 {
+fn live_glidepath(set: Option<(f64, bool)>) -> (f64, bool) {
     GLIDEPATH_DEG_T.with(|c| {
         if let Some(v) = set {
             c.set(v);
@@ -4131,21 +4146,35 @@ fn live_glidepath(set: Option<f64>) -> f64 {
     })
 }
 
-/// Hand the next autoland arm a glidepath angle (the follower does, at a MAP).
+/// Hand the next autoland arm a glidepath angle for a PUBLISHED visual
+/// segment (the follower does, at a MAP).
 pub fn set_next_glidepath_deg(deg: Option<f64>) {
-    next_glidepath(Some(deg));
+    next_glidepath(Some(deg.map(|d| (d, true))));
+}
+
+/// Hand the next autoland arm a circuit's path steepened over the ground
+/// (#182): flown at its angle, but not a valley ([`published_steep`]).
+pub fn set_next_circuit_glidepath_deg(deg: Option<f64>) {
+    next_glidepath(Some(deg.map(|d| (d, false))));
 }
 
 /// Take the handed-down angle for this arm (3 without one), clamped.
 fn arm_glidepath() -> f64 {
-    let deg = next_glidepath(None)
-        .filter(|d| d.is_finite())
-        .map_or(3.0, |d| d.clamp(3.0, MAX_GLIDEPATH_DEG));
-    live_glidepath(Some(deg))
+    let (deg, published) = next_glidepath(None)
+        .filter(|(d, _)| d.is_finite())
+        .map_or((3.0, false), |(d, p)| (d.clamp(3.0, MAX_GLIDEPATH_DEG), p));
+    live_glidepath(Some((deg, published && deg > 3.0 + 1e-9))).0
 }
 
 fn glidepath_deg() -> f64 {
-    live_glidepath(None)
+    live_glidepath(None).0
+}
+
+/// Is this approach a PUBLISHED steep visual segment (LSZS), the one kind no
+/// pattern of our own may reposition? A circuit's steepened path is not.
+fn published_steep() -> bool {
+    let (deg, published) = live_glidepath(None);
+    published && deg > 3.0 + 1e-9
 }
 
 /// Feet of path per nautical mile for this approach (318 at 3 degrees, the
@@ -11628,6 +11657,49 @@ mod approach_power_floor_tests {
         assert_eq!(super::gp_ft_per_nm(), super::GLIDEPATH_FT_PER_NM);
         let g3 = super::guidance(map_lat, map_lon, 6598.0, 996.0, 80.0, 90.0, &rwy, 87.0, 25.0, 0.0);
         assert!(6598.0 - g3.glidepath_alt_ft > 250.0, "a 3 degree path calls it high");
+    }
+
+    /// LEMG 13 SR22 circuit, 2026-09-29 (sortie 1790692781-full_auto): the
+    /// circuit steepened its path to 3.26 degrees over the ground (#182)
+    /// and autoland took that for LSZS's valley: no pattern when it arrived
+    /// 560 ft high, and after the balk no published missed approach, so
+    /// "climbing straight ahead. Your aircraft." to nobody at 805 ft. A
+    /// circuit's angle is flown but is not a published visual segment.
+    #[test]
+    fn a_circuit_path_is_steep_but_not_a_valley() {
+        super::set_next_circuit_glidepath_deg(Some(3.2576));
+        assert!((super::arm_glidepath() - 3.2576).abs() < 1e-9, "the angle is flown");
+        assert!(!super::published_steep(), "a circuit's path is not a valley");
+        super::set_next_glidepath_deg(Some(4.5));
+        assert!((super::arm_glidepath() - 4.5).abs() < 1e-9);
+        assert!(super::published_steep(), "the follower's MAP path is");
+        // A handed 3 degrees (or none) is never steep, whoever handed it.
+        super::set_next_glidepath_deg(Some(3.0));
+        assert_eq!(super::arm_glidepath(), 3.0);
+        assert!(!super::published_steep());
+        assert_eq!(super::arm_glidepath(), 3.0);
+        assert!(!super::published_steep());
+    }
+
+    /// The same sortie's other half: the steep branch's missed approach that
+    /// cannot be flown falls through to the terrain-probed pattern, never to
+    /// "Your aircraft" (source-pinned: the loop is not a plain test).
+    #[test]
+    fn an_unflyable_missed_procedure_is_never_your_aircraft() {
+        let src = include_str!("autoland.rs");
+        let body = src
+            .split("if wanted && steep {")
+            .nth(1)
+            .expect("the steep branch")
+            .split("if wanted && reversals_flown >= crate::reversal::MAX_REVERSALS")
+            .next()
+            .unwrap();
+        assert!(!body.contains("Your aircraft"), "no hand-back to nobody");
+        assert!(body.contains("missed_procedure_tried = true"), "asked once");
+        assert!(src.contains("let steep = published_steep() && !missed_procedure_tried;"));
+        let circuit = include_str!("circuit.rs");
+        assert!(circuit.contains("set_next_circuit_glidepath_deg(Some(descent_shape"));
+        assert!(!circuit.contains("autoland::set_next_glidepath_deg("));
     }
 }
 
