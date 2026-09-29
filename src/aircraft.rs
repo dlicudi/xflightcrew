@@ -384,13 +384,24 @@ pub struct RollRudderProfile {
     pub yaw_dps: f64,
     /// The groundspeed that figure was measured at, knots.
     pub at_kts: f64,
+    /// A propeller's standing rudder at full power, units of steer: led in
+    /// with the throttle for the whole roll in place of the generic power
+    /// lead (0.25 at a standstill, fading to 0.1 by 40 kt). The SR22 holds
+    /// about 0.35 from 30 kt to Vr in calm air (LEMG 13, 2026-09-29).
+    #[serde(default)]
+    pub power_steer: Option<f64>,
 }
 
 impl RollRudderProfile {
-    /// Used only when both numbers are sane ones.
+    /// Used only when both numbers are sane ones (a power steer out of
+    /// range is dropped).
     pub fn valid(self) -> Option<Self> {
+        let power_steer = self.power_steer.filter(|s| (0.0..=0.6).contains(s));
         ((0.5..=100.0).contains(&self.yaw_dps) && (20.0..=200.0).contains(&self.at_kts))
-            .then_some(self)
+            .then_some(Self {
+                power_steer,
+                ..self
+            })
     }
 
     /// The yaw rate a unit of steer holds at this groundspeed, deg/s.

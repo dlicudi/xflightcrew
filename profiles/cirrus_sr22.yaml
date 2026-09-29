@@ -178,6 +178,18 @@ taxi:
   lookahead_s: 9.0
   brake_steer: true
 
+# The takeoff roll's rudder (autotakeoff::RollSteer), fitted to LEMG 13
+# 2026-09-29 (sortie 1790677606): the sim's yaw rate against the steer, 15 kt
+# to 73 kt, 31 deg/s per unit at 60 kt growing as v^2, and a STANDING rudder
+# of 0.35 at full power from 30 kt (0.25 to 0.3 below it) in 0.6 kt of wind:
+# the propeller. The default law led 0.25 at a standstill fading to 0.1 by
+# 40 kt and its trim bled as 1/v^2, so the nose sat 5 to 6 degrees left with
+# the steer at 0.4 and the roll was rejected 9.8 m left at 66 kt.
+roll_rudder:
+  yaw_dps: 31.0
+  at_kts: 60.0
+  power_steer: 0.35
+
 checklist: checklists/cirrus_sr22.txt
 
 # Lights — datarefs verified against the rustdecks SR22 deck; universal commands.
