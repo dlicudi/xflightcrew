@@ -19,10 +19,10 @@ cases:
   # `retard` keyed on height / time to the wheels, `rough`); autoland
   # `rollout` ticks bl/br (RolloutBrakeSteer on the inside wheel) and xtk_m
   # growth after the first tick.
-  - name: "SR22 LEMG into the wind, 10 nm final (#166)"
+  - name: "SR22 LEMG runway 13, 10 nm final (#166)"
     setup:
       aircraft: "Aircraft/Laminar Research/Cirrus SR22/Cirrus SR22.acf"
-      approach: { field: LEMG, runway: wind, final_nm: 10 }
+      approach: { field: LEMG, runway: 13, final_nm: 10 }
     traffic: off
 
   # #169 A330 circuit: pattern speed over the kept flap, the 265 kt
@@ -34,10 +34,10 @@ cases:
   # `landing_config`. Also #182's corridor: circuit `armed`
   # left/right_corridor_max_ft, left/right_descent, glidepath_deg, refused;
   # circuit `terrain_floor`. #34: no duty record with agrees false.
-  - name: "A330 LEMG runway start into the wind, circuit (#169)"
+  - name: "A330 LEMG runway start runway 13, circuit (#169)"
     setup:
       aircraft: "Aircraft/Laminar Research/Airbus A330-300/A330.acf"
-      runway_start: { field: LEMG, runway: wind, engines_running: true }
+      runway_start: { field: LEMG, runway: 13, engines_running: true }
     command: fly a circuit
     deadline_min: 25
     traffic: off
@@ -50,10 +50,10 @@ cases:
   # one crossing above 40 kt), #181 (ap_pitch_authority `verdict` confirmed
   # for autotakeoff and autoland, no climb_watch trip), #182 (circuit `armed`
   # corridor and descent fields at LEMG), #34 (duty agrees).
-  - name: "737 LEMG runway start into the wind, circuit (#78 #123 #31)"
+  - name: "737 LEMG runway start runway 13, circuit (#78 #123 #31)"
     setup:
       aircraft: "Aircraft/Laminar Research/Boeing 737-800/b738.acf"
-      runway_start: { field: LEMG, runway: wind, engines_running: true }
+      runway_start: { field: LEMG, runway: 13, engines_running: true }
     command: fly a circuit
     deadline_min: 20
     traffic: off
@@ -64,10 +64,10 @@ cases:
   # #131 high arm (no autoland `reversal` why join_point_behind with
   # above_path_ft a few hundred feet at 6+ nm; cmd_hdg within 45 degrees of
   # the course).
-  - name: "737 LEMG into the wind, 10 nm final (#31 #102 #131)"
+  - name: "737 LEMG runway 13, 10 nm final (#31 #102 #131)"
     setup:
       aircraft: "Aircraft/Laminar Research/Boeing 737-800/b738.acf"
-      approach: { field: LEMG, runway: wind, final_nm: 10 }
+      approach: { field: LEMG, runway: 13, final_nm: 10 }
     deadline_min: 10
     traffic: off
 
@@ -79,7 +79,7 @@ cases:
   - name: "737 LEMG 10 nm final, my controls then you have control (#54)"
     setup:
       aircraft: "Aircraft/Laminar Research/Boeing 737-800/b738.acf"
-      approach: { field: LEMG, runway: wind, final_nm: 10 }
+      approach: { field: LEMG, runway: 13, final_nm: 10 }
     steps:
       - { say: my controls, when: { after_s: 30 }, tool: autopilot_off }
       - { say: you have control, when: { after_s: 5 }, tool: take_over }
@@ -109,7 +109,7 @@ cases:
   - name: "SR22 LEMG runway start, transponder and a misheard speed (#69 #46)"
     setup:
       aircraft: "Aircraft/Laminar Research/Cirrus SR22/Cirrus SR22.acf"
-      runway_start: { field: LEMG, runway: wind, engines_running: true }
+      runway_start: { field: LEMG, runway: 13, engines_running: true }
     steps:
       - { say: set transponder, when: start, tool: set_transponder_mode }
       - { say: fly a circuit, when: { after_s: 10 }, tool: full_auto }

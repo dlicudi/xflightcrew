@@ -3631,6 +3631,9 @@ fn check_line(
     let plan_flight = crate::Shortcut::PlanFlight.name();
     let (routes_to, mut problem) = match capture {
         Some(c) if c == plan_flight => (c.to_string(), None),
+        // A step that names the capture wants it: "say again", the cabin's
+        // open line, the instructor (#53, #56, #86, #88 could carry no case).
+        Some(c) if matches!(want, Want::Tool(w) if w == c) => (c.to_string(), None),
         Some(c) => (
             c.to_string(),
             Some(format!("taken before the grammar ({c})")),
@@ -4282,6 +4285,7 @@ cases:
       - { say: fly a circuit, when: start, tool: full_auto }
       - { say: how long to top of descent, when: { after_s: 5 }, tool: full_auto }
       - { say: flaps five, when: { after_s: 5 }, tool: full_auto }
+      - { say: what were you saying, when: { after_s: 5 }, tool: recall }
   - name: c
     setup: { runway_start: { field: LEMG, runway: "13" } }
     command: banana split
@@ -4310,6 +4314,9 @@ cases:
             Some("taken before the grammar (top of descent question)")
         );
         assert_eq!(row("flaps five").problem.as_deref(), Some("the step names full_auto"));
+        // A step that names the capture wants it.
+        let recall = row("what were you saying");
+        assert_eq!((recall.routes_to.as_str(), &recall.problem), ("recall", &None));
         assert_eq!(row("banana split").problem.as_deref(), Some("reaches no tool"));
         let wind = row("put us on a 10 mile final to LEMG runway WIND");
         assert_eq!((wind.routes_to.as_str(), &wind.problem), ("-", &None));
@@ -4318,7 +4325,7 @@ cases:
         let table = check_table("x.yaml", &rows, &["a note".into()]);
         assert!(table.contains("| PROBLEM: the step names full_auto |"), "{table}");
         assert!(table.contains("- a note\n"), "{table}");
-        assert!(table.ends_with("3 problems in 12 lines.\n"), "{table}");
+        assert!(table.ends_with("3 problems in 13 lines.\n"), "{table}");
     }
 
     fn source(path: &str) -> Option<String> {
