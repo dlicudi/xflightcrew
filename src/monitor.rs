@@ -2569,6 +2569,53 @@ struct Inputs {
     /// expiry and decay tail, `tools::brake_cmd_quiet`): the brake the
     /// plugin sees and the parking-brake ratio are OURS this tick.
     crew_brake: bool,
+    /// The pitch channel to the tail, read airborne while the servos or our
+    /// own column fly it (#181: the servo moved nothing and nothing logged
+    /// it); `None` = not read this tick.
+    pitch: Option<PitchInputs>,
+}
+
+/// The `state` record's `in.pitch`: the autopilot's servo, the elevator
+/// SURFACE (degrees, trailing edge down positive), the summed column, the
+/// trim, the dials the autopilot flies and who overrides the pitch. A failed
+/// read is `None`.
+#[derive(Debug, Clone, Copy, Default)]
+struct PitchInputs {
+    servo: Option<f64>,
+    elev_deg: Option<f64>,
+    total: Option<f64>,
+    trim: Option<f64>,
+    vs_dial: Option<f64>,
+    alt_hold_ft: Option<f64>,
+    ovr_pitch: Option<f64>,
+    ovr_fd_pitch: Option<f64>,
+}
+
+impl PitchInputs {
+    fn json(&self) -> serde_json::Value {
+        let r3 = |v: Option<f64>| v.map(|x| (x * 1000.0).round() / 1000.0);
+        serde_json::json!({
+            "servo": r3(self.servo), "elev": self.elev_deg.map(|x| (x * 100.0).round() / 100.0),
+            "tot": r3(self.total), "trim": r3(self.trim),
+            "vs_dial": self.vs_dial.map(r1), "alt_hold": self.alt_hold_ft.map(r1),
+            "ovr": self.ovr_pitch.map(|v| v > 0.5), "ovr_fd": self.ovr_fd_pitch.map(|v| v > 0.5),
+        })
+    }
+
+    fn telemetry(&self) -> crate::climb_watch::PitchTelemetry {
+        crate::climb_watch::PitchTelemetry {
+            servo: self.servo,
+            elev_deg: self.elev_deg,
+            total: self.total,
+        }
+    }
+}
+
+/// Is the pitch channel worth its eight reads this tick? Airborne, with the
+/// autopilot's servos in or our own column fresh: the Web API's load is the
+/// sim's frame time. Pure.
+fn pitch_reads_due(on_ground: bool, servos_on: bool, crew_yoke: bool) -> bool {
+    !on_ground && (servos_on || crew_yoke)
 }
 
 impl Inputs {
@@ -2584,11 +2631,38 @@ impl Inputs {
             "yield": [self.steer_yield.map(|v| v > 0.5), self.pitch_yield.map(|v| v > 0.5),
                       self.brake_yield.map(|v| v > 0.5)],
             "crew_brake": self.crew_brake,
+            "pitch": self.pitch.map(|p| p.json()),
         })
     }
 }
 
-async fn read_inputs(xp: &crate::xplane::XPlaneClient) -> Inputs {
+/// One join for the pitch channel's eight reads.
+async fn read_pitch(xp: &crate::xplane::XPlaneClient) -> PitchInputs {
+    use crate::datarefs as d;
+    let ok = |r: anyhow::Result<f64>| r.ok().filter(|v| v.is_finite());
+    let (servo, elev, total, trim, vs_dial, alt_hold, ovr, ovr_fd) = tokio::join!(
+        xp.get_float(d::SERVO_PITCH_RATIO),
+        xp.get_float_array(d::ELEVATOR1_DEG),
+        xp.get_float(d::TOTAL_PITCH_RATIO),
+        xp.get_float(d::ELEVATOR_TRIM),
+        xp.get_float(d::VVI_DIAL_FPM),
+        xp.get_float(d::ALTITUDE_HOLD_FT),
+        xp.get_float(d::OVERRIDE_JOYSTICK_PITCH),
+        xp.get_float(d::OVERRIDE_FD_PITCH),
+    );
+    PitchInputs {
+        servo: ok(servo),
+        elev_deg: elev.ok().and_then(|v| d::elevator_surface_deg(&v)),
+        total: ok(total),
+        trim: ok(trim),
+        vs_dial: ok(vs_dial),
+        alt_hold_ft: ok(alt_hold),
+        ovr_pitch: ok(ovr),
+        ovr_fd_pitch: ok(ovr_fd),
+    }
+}
+
+async fn read_inputs(xp: &crate::xplane::XPlaneClient, pitch_due: bool) -> Inputs {
     let ok = |r: anyhow::Result<f64>| r.ok().filter(|v| v.is_finite());
     let (throttle, beta, brake_l, brake_r, yoke_pitch, yoke_roll, yoke_yaw, ap_on) = tokio::join!(
         xp.get_float("sim/cockpit2/engine/actuators/throttle_ratio_all"),
@@ -2600,15 +2674,30 @@ async fn read_inputs(xp: &crate::xplane::XPlaneClient) -> Inputs {
         xp.get_float("sim/joystick/yoke_heading_ratio"),
         xp.get_float("sim/cockpit2/autopilot/autopilot_on"),
     );
-    let (ap_state, wind_dir, wind_ms, sim_speed, trq, steer_yield, pitch_yield, brake_yield) = tokio::join!(
-        xp.get_float("sim/cockpit/autopilot/autopilot_state"),
-        xp.get_float(crate::datarefs::WIND_DIR_DEG_TRUE),
-        xp.get_float(crate::datarefs::WIND_SPEED_MSC),
-        xp.get_float("sim/time/sim_speed"),
-        xp.get_float_array("sim/flightmodel/engine/ENGN_TRQ"),
-        xp.get_float("xcopilot/steer_yield"),
-        xp.get_float("xcopilot/pitch_yield"),
-        xp.get_float("xcopilot/brake_yield"),
+    // The pitch channel rides alongside the second batch, never after it.
+    let (
+        (ap_state, wind_dir, wind_ms, sim_speed, trq, steer_yield, pitch_yield, brake_yield),
+        pitch,
+    ) = tokio::join!(
+        async {
+            tokio::join!(
+                xp.get_float("sim/cockpit/autopilot/autopilot_state"),
+                xp.get_float(crate::datarefs::WIND_DIR_DEG_TRUE),
+                xp.get_float(crate::datarefs::WIND_SPEED_MSC),
+                xp.get_float("sim/time/sim_speed"),
+                xp.get_float_array("sim/flightmodel/engine/ENGN_TRQ"),
+                xp.get_float("xcopilot/steer_yield"),
+                xp.get_float("xcopilot/pitch_yield"),
+                xp.get_float("xcopilot/brake_yield"),
+            )
+        },
+        async {
+            if pitch_due {
+                Some(read_pitch(xp).await)
+            } else {
+                None
+            }
+        },
     );
     Inputs {
         throttle: ok(throttle),
@@ -2628,6 +2717,7 @@ async fn read_inputs(xp: &crate::xplane::XPlaneClient) -> Inputs {
         pitch_yield: ok(pitch_yield),
         brake_yield: ok(brake_yield),
         crew_brake: !crate::tools::brake_cmd_quiet(),
+        pitch,
     }
 }
 
@@ -4661,7 +4751,11 @@ pub async fn run(
             // The hands and the levers, batched in one join: what the pilot
             // and the loops were doing, so a sortie can prove nobody touched
             // it and a complaint ("jerky braking") has a number.
-            let inputs = read_inputs(&xp).await;
+            let pitch_due = pitch_reads_due(snap.on_ground, snap.ap_servos_on, crew_yoke_fresh());
+            let inputs = read_inputs(&xp, pitch_due).await;
+            if let Some(p) = &inputs.pitch {
+                crate::climb_watch::publish_telemetry(p.telemetry());
+            }
             note_interventions(&inputs, flight.control());
             crate::blackbox::record(
                 "state",
@@ -7443,6 +7537,34 @@ mod tests {
     /// `brake_yield` 0.5 s later, and the latch stayed up through the stop.
     /// A latch that rose on our command is ours for its whole episode; one
     /// that rose with our brakes quiet is a hand.
+    /// #181: the servo, the elevator surface and the dials ride every
+    /// airborne `state` tick the autopilot or our column flies, and only
+    /// those (eight reads a tick are the sim's frame time).
+    #[test]
+    fn the_pitch_channel_is_logged_airborne_under_a_servo_or_our_column() {
+        assert!(super::pitch_reads_due(false, true, false));
+        assert!(super::pitch_reads_due(false, false, true));
+        assert!(!super::pitch_reads_due(false, false, false));
+        assert!(!super::pitch_reads_due(true, true, true), "never on the wheels");
+        let i = super::Inputs {
+            pitch: Some(super::PitchInputs {
+                servo: Some(0.1234),
+                elev_deg: Some(-3.456),
+                vs_dial: Some(-500.0),
+                ovr_pitch: Some(0.0),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let j = i.json();
+        assert_eq!(j["pitch"]["servo"], 0.123);
+        assert_eq!(j["pitch"]["elev"], -3.46);
+        assert_eq!(j["pitch"]["vs_dial"], -500.0);
+        assert_eq!(j["pitch"]["ovr"], false);
+        assert!(j["pitch"]["tot"].is_null(), "a failed read is null");
+        assert!(super::Inputs::default().json()["pitch"].is_null());
+    }
+
     #[test]
     fn the_crews_own_reject_brake_is_not_a_pilot_on_the_brakes() {
         use crate::flight::Control;

@@ -2892,6 +2892,36 @@ async fn clear_inherited_autopilot(xp: &dyn crate::xplane::XPlane) -> Option<boo
     Some(cleared)
 }
 
+/// The takeoff's outcome when the autopilot's pitch moved nothing (#181):
+/// the callers end without "rejected" and without "your aircraft".
+pub const AP_NO_PITCH: &str = "ap_no_pitch";
+
+/// The autopilot took the climb and its pitch moves nothing (#181): the
+/// recovery flies the pitch on our column to the selected level (a climb
+/// still ahead) and never gives it back to the autopilot; the run ends
+/// [`AP_NO_PITCH`] for the caller.
+async fn no_pitch_take_over(xp: &XPlaneClient, p: &Params, voice: &Option<Voice>, why: &str) {
+    let (dial, alt) = tokio::join!(xp.get_float(ALT_DIAL), xp.get_float(ALT_IND_FT));
+    let hold_ft = crate::climb_watch::takeover_hold_ft(dial.ok(), alt.ok());
+    let started = crate::tools::recover::take_over(
+        p.base_url.clone(),
+        voice.clone(),
+        crate::tools::recover::TakeOver {
+            why: format!("autotakeoff_{why}"),
+            min_safe_ias: None,
+            hold_kts: None,
+            ap_no_pitch: true,
+            hold_ft,
+        },
+    );
+    crate::blackbox::record(
+        "autotakeoff",
+        serde_json::json!({"event": "ap_no_pitch", "why": why, "hold_ft": hold_ft,
+                           "recovery_started": started}),
+    );
+    RUN.record(sim::run::Outcome::Failed(AP_NO_PITCH.into()));
+}
+
 /// A mode command is only a request; handoff needs live mode and dial readbacks.
 /// The SERVOS are read too: lit modes are not an autopilot flying (#160).
 async fn engage_climb(xp: &dyn crate::xplane::XPlane, vs: f64, last: &mut Option<f64>) -> bool {
@@ -3770,6 +3800,16 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, p: Params) {
                     "vs": vs_flown, "law_vs": law_vs,
                 }),
             );
+            // The engage is a request: is the elevator the autopilot's
+            // (#181)? Fed here, then by whoever takes the climb.
+            if let Some(flown) = vs_flown {
+                crate::climb_watch::arm_authority("autotakeoff", flown, vs);
+            }
+        } else if let Some(crate::climb_watch::Authority::NoAuthority(why)) =
+            crate::climb_watch::feed_authority(vs_flown, Some(vs))
+        {
+            no_pitch_take_over(&xp, &p, &voice, why).await;
+            return;
         }
         DETAIL.set(format!(
             "climbing, {} ft, handoff at {} ft",

@@ -1942,6 +1942,12 @@ impl PatternTrip {
             PatternTrip::ClimbNotHeld { why, .. } => format!("{} Circuit cancelled.", why.line()),
         }
     }
+
+    /// The autopilot's pitch moves nothing (#181): hand flown, never given
+    /// back to it.
+    pub fn ap_has_no_pitch(&self) -> bool {
+        matches!(self, PatternTrip::ClimbNotHeld { why, .. } if why.ap_has_no_pitch())
+    }
 }
 
 /// How long `leg` may take before [`PatternGuard`] calls it overdue: its
@@ -2044,10 +2050,14 @@ async fn give_up_pattern(
     // The recovery takes it: servos out, flown level, the autopilot given
     // it back only once it is seen to hold.
     let upset = match trip {
+        PatternTrip::ClimbNotHeld { why, .. } if why.ap_has_no_pitch() => {
+            Some("no_pitch_authority")
+        }
         PatternTrip::ClimbNotHeld { .. } => Some("climb_not_held"),
         _ => crate::tools::recover::read_unflyable(xp, floor_kts).await,
     };
     if let Some(what) = upset {
+        let no_pitch = trip.ap_has_no_pitch();
         let started = crate::tools::recover::take_over(
             base_url.to_string(),
             voice.clone(),
@@ -2055,6 +2065,9 @@ async fn give_up_pattern(
                 why: format!("circuit_{what}"),
                 min_safe_ias: floor_kts.map(|f| f + RECOVERY_MARGIN_KTS),
                 hold_kts: Some(hold_kts),
+                ap_no_pitch: no_pitch,
+                // The pattern's height: a climb the takeoff began is kept.
+                hold_ft: no_pitch.then_some(pattern_ft).filter(|h| h.is_finite()),
             },
         );
         let (watch, ias, vs) = match trip {
@@ -2070,11 +2083,13 @@ async fn give_up_pattern(
                 "watch": watch, "ias": ias, "vs": vs,
             }),
         );
-        alert(
-            voice,
-            Priority::Warning,
-            &format!("{} I have control, recovering.", trip.words()),
-        );
+        // The recovery says the missing pitch itself, first thing.
+        let line = if no_pitch {
+            "Circuit cancelled.".to_string()
+        } else {
+            format!("{} I have control, recovering.", trip.words())
+        };
+        alert(voice, Priority::Warning, &line);
         return;
     }
     let psi = xp.get_float(PSI_TRUE).await.ok().filter(|v| v.is_finite());
@@ -3271,6 +3286,10 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, p: Params
     if outcome != Some(sim::run::Outcome::Completed) {
         // A reject has already stopped, parked and said "your aircraft".
         let line = match outcome {
+            // The recovery has the aircraft and has said why (#181).
+            Some(sim::run::Outcome::Failed(r)) if r == autotakeoff::AP_NO_PITCH => {
+                "The circuit is off. I have the aircraft until you say my controls."
+            }
             Some(sim::run::Outcome::Failed(_)) => {
                 "The takeoff was rejected, so the circuit is off."
             }
@@ -4016,6 +4035,30 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, p: Params
             return;
         }
         vs_cmd = crate::climb_watch::dial_for(verdict, vs_cmd);
+        // The autopilot's pitch AUTHORITY after an engage (#181), the
+        // takeoff's carried here: the dial this loop flies, 0 while the
+        // autopilot's capture holds the level.
+        let auth_dial = if ap_level { 0.0 } else { vs_cmd };
+        if let Some(crate::climb_watch::Authority::NoAuthority(_)) =
+            crate::climb_watch::feed_authority(climb_watch.vs_fpm(), Some(auth_dial))
+        {
+            let hold_kts = crate::autoland::hand_back_speed_kts(
+                p_approach_ias,
+                last_flap.unwrap_or(0.0),
+                &crate::aircraft::flap_limits(),
+            );
+            let trip = PatternTrip::ClimbNotHeld {
+                why: crate::climb_watch::Why::NoAuthority,
+                ias: ias_read,
+                vs: climb_watch.vs_fpm().unwrap_or(f64::NAN),
+            };
+            give_up_pattern(
+                &xp, &base_url, &voice, trip, leg, alt_msl_ft, pattern_ft, mag_var, hold_kts,
+                watch_floor,
+            )
+            .await;
+            return;
+        }
         if ap_level {
             // Whatever the VS dial says now is stale the moment VS re-engages.
             last_vs_cmd = None;
@@ -4024,6 +4067,10 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, p: Params
             if !vs_on {
                 let _ = xp.run_command(CMD_VS_MODE).await;
                 last_vs_cmd = None; // engage synced the dial; force a rewrite
+                // A vertical mode engaged: its authority is checked afresh.
+                if let Some(vs) = climb_watch.vs_fpm() {
+                    crate::climb_watch::arm_authority("circuit", vs, vs_cmd);
+                }
             }
             if last_vs_cmd.is_none_or(|v| (v - vs_cmd).abs() > 40.0) {
                 let _ = xp.set_float(VS_DIAL, vs_cmd).await;

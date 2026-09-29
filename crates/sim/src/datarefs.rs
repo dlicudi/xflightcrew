@@ -115,6 +115,33 @@ pub const TCAS_FLIGHT_ID: &str = "sim/cockpit2/tcas/targets/flight_id";
 /// corridor. Optional: a feed that doesn't populate it reads as level.
 pub const TCAS_VS_FPM: &str = "sim/cockpit2/tcas/targets/position/vertical_speed";
 
+// --- The pitch channel, as it reaches the tail (#181) ---
+/// The autopilot's pitch servo output, -1..1.
+pub const SERVO_PITCH_RATIO: &str = "sim/joystick/servo_pitch_ratio";
+/// The column the flight model gets: yoke, servo and stability summed.
+pub const TOTAL_PITCH_RATIO: &str = "sim/cockpit2/controls/total_pitch_ratio";
+/// The elevator SURFACE per wing, degrees, trailing edge down positive
+/// (reduced by [`elevator_surface_deg`]).
+pub const ELEVATOR1_DEG: &str = "sim/flightmodel2/wing/elevator1_deg";
+pub const ELEVATOR_TRIM: &str = "sim/cockpit2/controls/elevator_trim";
+/// The autopilot's VS dial as the autopilot reads it.
+pub const VVI_DIAL_FPM: &str = "sim/cockpit2/autopilot/vvi_dial_fpm";
+/// The altitude the autopilot's hold is holding.
+pub const ALTITUDE_HOLD_FT: &str = "sim/cockpit2/autopilot/altitude_hold_ft";
+pub const OVERRIDE_JOYSTICK_PITCH: &str = "sim/operation/override/override_joystick_pitch";
+pub const OVERRIDE_FD_PITCH: &str = "sim/operation/override/override_flightdir_ptch";
+
+/// The elevator's deflection from the per-wing array: the element that
+/// moved furthest (the wings without an elevator read 0). `None` for an
+/// empty or non-finite read.
+pub fn elevator_surface_deg(per_wing: &[f64]) -> Option<f64> {
+    per_wing
+        .iter()
+        .copied()
+        .filter(|v| v.is_finite())
+        .max_by(|a, b| a.abs().total_cmp(&b.abs()))
+}
+
 /// Audio panel: COM1 monitor selected (nonzero = COM1 is audible in the
 /// cockpit). The ATC broadcast respects this so it can be muted like a radio.
 #[allow(dead_code)] // consumed by the atc binary's tree, not the copilot's (yet)
@@ -143,3 +170,17 @@ pub const SERVOS_ON: &str = "sim/cockpit2/autopilot/servos_on";
 pub const APPROACH_STATUS: &str = "sim/cockpit2/autopilot/approach_status";
 pub const NAV_STATUS: &str = "sim/cockpit2/autopilot/nav_status";
 pub const HEADING_STATUS: &str = "sim/cockpit2/autopilot/heading_status";
+
+#[cfg(test)]
+mod tests {
+    /// The surface is the wing that moved furthest, its sign kept; a wing
+    /// without an elevator reads 0 and a failed element is no reading.
+    #[test]
+    fn the_elevator_is_the_wing_that_moved() {
+        use super::elevator_surface_deg as e;
+        assert_eq!(e(&[0.0, 0.0, -4.5, -4.5, 0.0]), Some(-4.5));
+        assert_eq!(e(&[0.0, 2.0, f64::NAN]), Some(2.0));
+        assert_eq!(e(&[]), None);
+        assert_eq!(e(&[f64::NAN]), None);
+    }
+}

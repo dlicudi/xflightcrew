@@ -160,7 +160,8 @@ Datarefs and commands stay in the Rust tools; YAML is per-airframe config.
 full auto after the start, the takeoff before brakes off (it WAITS for the flaps), autoland at the
 gear. Flaps, trim and the altitude dial (`initial_altitude_ft`: the caller's level, else field +
 3,000; a dial the pilot set stays); spoilers and autobrake where `takeoff_config:` declares them.
-Read first, left alone in state, read back, named when not taken, one milestone line.
+Read first, left alone in state, read back, named when not taken, one milestone line. Thrust
+against a set parking brake is idled first (`thrust_against_brake`; a 737 sat 67 s at 1.0, #181).
 - **Armed for the roll is an Airbus habit**: a Boeing declares `takeoff_speedbrake_down` (lever
   DOWN, raised on a reject, `on_reject`); roll-armed spoilers are disarmed after the gear
   (`after_liftoff`).
@@ -392,7 +393,8 @@ everything blackboxes to `logs/blackbox.jsonl` (kinds: `atc`, `autotaxi`, `autot
 `pushback`, `checklist`, `taxi_guide`, `cockpit_auto`, `full_auto`, `circuit`, `procedure`,
 `cabin`, `instructor`, `loading`, `turbine_start`, `heli_start`, `hover`, `heli_circuit`,
 `heli_route`, `rapport`, `cabin_air`, `api_load`, `plan_audit`, `handover`, `start_item`,
-`sim_radio`, `fuel_pumps`, `electrical`, `typed`, `crew_radio`, `go_around`, `recover`).
+`sim_radio`, `fuel_pumps`, `electrical`, `typed`, `crew_radio`, `go_around`, `recover`,
+`ap_pitch_authority`).
 
 ### Holding, writers, reads
 - **A stage not moving the aircraft is holding it**: brakes for every wait, abort and give-up. **A
@@ -509,6 +511,14 @@ everything blackboxes to `logs/blackbox.jsonl` (kinds: `atc`, `autotaxi`, `autot
   `xcopilot/pitch`, gives the autopilot back only once WATCHED holding (`ap_holding`), else hand
   flies it level until "my controls". The takeoff logs who holds the elevator at the arm and refuses
   a failed autopilot servo or trim (`read_pitch_authority`, `pitch_authority`).
+- **Every vertical engage proves its pitch AUTHORITY** (`climb_watch::AuthorityCheck`, blackbox
+  `ap_pitch_authority`; the takeoff's, the circuit's and follower's VS, autoland's servos, the
+  enroute settle): 4 to 15 s, the climb moving away from the dial, a servo the elevator does not
+  follow, a dial never answered or held is NO authority, and `take_over` with `ap_no_pitch` hand
+  flies it (never back to the autopilot; "I'm flying the pitch"). The servo, elevator surface and
+  dials ride `state.in.pitch` airborne (a servo moved nothing on two airframes, unlogged, #181).
+  **A recovery never writes into the next flight** (`recover::may_write` before every streaming
+  write: aborted, superseded or `sim_loading`; a held tick wrote 6 s into a new setup).
 - **The declared rudder is believed only up to the speed it was measured at** (`RollSteer` held flat
   above `roll_rudder:` `at_kts`, ceiling `RUDDER_FULL_DEG_FAST`; extrapolated as v^2 it cut the gain to a
   third by Vr: EGKK 08R lifted off 5.4 m left, 2026-09-28). The scheduled roll's cut is `RollCut`: the
