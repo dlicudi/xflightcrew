@@ -12192,3 +12192,49 @@ Next King Air autoland: `arrest_hands` then `flare_ask` / `flare_target` / `flar
 `rollout`; the `rollout` ticks' `yaw_r` read (not null), `steer` within 0.5 above 75 kt, `psi` within
 10 degrees of 131.7 after the contact, `xtk_m` inside 10 m, and the landing's `sink_fpm` under 250.
 Offline only.
+
+## 2026-09-30: a taxi corner is read from the route's curvature, not a vertex (#194)
+
+e31f338 (the fillet ride) flew on the iMac on db43c97: 1790765957-full_auto (Citation X, LEMG
+gate to HW1) failed the taxi 7.3 m off, worse than the 4.6 it fixed. At Quebec onto Delta (the
+route now 3,546 m) the drive went into the fillet at 17.4 kt (the governor held 17.4 against the
+Citation's 15 down Quebec, braking only 3 kt over): steer -1.00 for 3 s, err -44, `lat_m` 5.8 to
+7.3. The schedule never slowed for it. A corner was a VERTEX turning 30 degrees across chords of
+15 m either side, and its radius the circle through the route 8 m either side; a fillet drawn in 3
+to 5 m segments turns under 12 degrees at any vertex, and chords of 15 m turn 30 degrees only on
+arcs inside 28 m. The old jagged ride had been slowed to 3 kt by its own sawtooth.
+
+`autotaxi::route_bends` now reads the CURVATURE: the heading turned (the sum of signed vertex
+turns) over the 30 m centred on each metre of route; a corner is the stretch where that is 30
+degrees or more one way, or where any 8 m turns 30 degrees (a jog: LIRF's +27 then -47 in 9 m,
+which the vertex reading slowed for and a net-turn reading alone did not). It turns through the sum
+of its turning vertices, its radius is the tightest 8 m over the heading turned in it (on a drawn
+arc its radius; at a lone vertex of D, 8 / D, under the old circle's 4 / sin(D/2)), and its slow-down
+window runs from the stretch's start (up to 15 m before the turning, as a vertex's flagged
+neighbours did) to 15 m past its end. `Bend { start, end, deg, radius }`; `bend_cap_kts` plans the
+corner's pace to the start. The Quebec-onto-Delta fillet now reads 104 degrees on 21.3 m: the
+Citation's sharp pace, 6 kt (15 deg/s x 21.3 m would allow 10.8).
+
+The same arc drawn every 1, 3 or 5 m reads as the same corner (turn within 3 degrees, radius 0.75
+to 1.1 of the drawn one). Over 1,026 routes (stands and the two sorties' gates to every runway
+end at 24 fields) for the Citation, the 737, the A330, the SR22 and the Evolution: no station's
+corner cap is faster than the vertex reading's; 2,635 corners it missed are found; time spent at
+the corner caps 105.7 % (Evolution) to 115.6 % (737) of before. EGKK J to 08R and the LEMG gate are
+in the sweep.
+
+The Citation's nose refitted on all three sorties (8.5 deg/s per m/s per unit, capped at 12, not
+15, 1.3 s lag, 1.00 deg/s rms) and on 1790765957's corner over 10 kt (7.5 after 0.3 s, 0.48 rms),
+flown through the drive's law and the governor as it flies: the fillet from 17.4 kt under the
+vertex reading 5.9 m off (flown 7.3), under the curvature reading 1.7 to 2.0 m from 10, 15 or 17.4
+kt on either fit; the jagged ride (flown 4.6) 2.4 to 3.0 m either way. The SR22 corner replays
+(`CornerRun.vertex`) replay the old laws on the geometry they flew and the current law on the
+curvature reading, all inside the line.
+
+Tests `a_corner_reads_the_same_however_finely_it_is_drawn`, `the_quebec_delta_fillet_is_a_corner`,
+`the_citation_turns_quebec_onto_delta_on_the_line` (rewritten on both fits); ignored
+`real_install_corner_caps_are_never_faster`. `a_tight_corner_is_taken_at_the_yaw_rate_the_airframe_has`
+now allows 16.6 kt at 200 m (the window opens earlier).
+
+Next Citation LEMG taxi: `drive` ticks near 690 m to go with `gs` down to about 6 kt BEFORE
+`turn_dps` passes -5, `steer` under full lock, `lat_m` inside 3 m; the stage's `max_lat_m` under 3.
+Every other taxi should be no faster into a corner and a little slower on drawn fillets. Offline only.
