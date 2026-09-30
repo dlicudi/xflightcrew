@@ -1,0 +1,27 @@
+# iMac verify batch 8: the Evolution's line-up check, pocket,
+# wrong-way pivot and roll hold (#196); the SR22's walking-pace turn builder
+# (#165); the Citation's circuit with the authority check under our column.
+after: stop
+cases:
+  - name: "Lancair Evolution LILB circuit from the ramp (#196)"
+    setup:
+      aircraft: "Aircraft/Laminar Research/Lancair Evolution/N844X.acf"
+      ramp: { field: LILB }
+    command: fly a circuit
+    deadline_min: 35
+
+  - name: "SR22 LEMG ramp circuit (#165)"
+    setup:
+      aircraft: "Aircraft/Laminar Research/Cirrus SR22/Cirrus SR22.acf"
+      ramp: { field: LEMG }
+    command: fly a circuit
+    traffic: off
+    deadline_min: 40
+
+  - name: "Citation X LEMG cold gate circuit (#194)"
+    setup:
+      aircraft: "Aircraft/Laminar Research/Cessna Citation X/Cessna_CitationX.acf"
+      ramp: { field: LEMG }
+    command: fly a circuit
+    deadline_min: 40
+    traffic: off
