@@ -1,0 +1,33 @@
+# iMac verify batch 6: the Evolution's fitted rudder and torque limiter
+# (#45), the SR22's corner cap and swing catch (#165), the Citation's push
+# plan, planned join and corner speed (#190 #193).
+after: stop
+cases:
+  # #45: roll law "rudder", steer 0.7 to 0.85 err under 3 from 40 kt,
+  # trq_ftlb near 1,250, xtk inside 3 m to rotation; then the circuit.
+  - name: "Lancair Evolution LILB circuit from the ramp (#45)"
+    setup:
+      aircraft: "Aircraft/Laminar Research/Lancair Evolution/N844X.acf"
+      ramp: { field: LILB }
+    command: fly a circuit
+    deadline_min: 35
+
+  # #165: speedhold brake target ~3 to 4 at the corners, gs under 5 at the
+  # vertex, yaw under 25, taxi max_lat under 3.
+  - name: "SR22 LEMG ramp circuit (#165)"
+    setup:
+      aircraft: "Aircraft/Laminar Research/Cirrus SR22/Cirrus SR22.acf"
+      ramp: { field: LEMG }
+    command: fly a circuit
+    traffic: off
+    deadline_min: 40
+
+  # #190 #193: push_lane used false, a swing pattern, first drive err inside
+  # 45, join_turn or join_refused; the G4 corner's entry gs; the taxi stage.
+  - name: "Citation X LEMG cold gate, push and taxi (#190 #193)"
+    setup:
+      aircraft: "Aircraft/Laminar Research/Cessna Citation X/Cessna_CitationX.acf"
+      ramp: { field: LEMG }
+    command: fly a circuit
+    deadline_min: 40
+    traffic: off
