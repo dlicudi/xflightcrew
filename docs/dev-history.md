@@ -11638,3 +11638,50 @@ Next Evolution takeoff: `roll` ticks `law` "rudder", `steer` over 0.7 from 40 kt
 3 and `xtk_m` inside 3 m to rotation; `trim` building to 0.2 to 0.35; `trq_ftlb` against 1,250 (if
 it runs to 1,700 again and `steer` pins at 0.85 with `err` growing, the torque limiter is the next
 fix); no `excursion`. Offline only.
+
+## 2026-09-30: the SR22 takes LEMG's sharp corners slowly and catches its swing (#165)
+
+iMac 2026-09-29 and 30, SR22 from the LEMG GA stand to 12 (19 fps, taxi tick 0.3 to 0.42 s),
+three sorties, taxi FAIL every time: 1790690995 5.0 m, 1790718797 4.7 m, 1790725168 5.3 m. Two
+corners, both LEFT turns of about 100 degrees with a right jog 25 to 30 m before them: onto Delta at
+690 m to go (the first and third) and at 2,490 m (the second and third). Not an outside swing of a
+right corner: the "err 54, steer 0.56" of the issue is the nose 54 degrees LEFT of the new taxiway
+after the left corner, the aircraft creeping across its inside. Each went the same way:
+- in at 7.8 to 8.7 kt against the 6 kt turn cap (the governor's target read 6.0; it ran 1 to 2.7 kt
+  over out of the jog, the brake-steer drag having slowed it there);
+- at 8 kt the taxi split's 0.25 turned the free nose at 5 to 10 deg/s against the 39 the corner
+  asked, the error ran to 43 to 63 degrees, the pivot's brake (0.37 to 0.41) and the drag took it
+  to 2 kt, and the yaw built to 30 to 37.7 deg/s;
+- the rate ceiling asked for the inside brake off at 25 deg/s, the squeeze let it go at 0.4/s
+  (0.41, 0.29, 0.17, 0.05 in the first);
+- the steer reversed to 0.75 to 0.86 for 3 s while the free nose's 1.5 to 4 kt fade gave the
+  opposite wheel 0.04 to 0.085: the nose swung 30 to 65 degrees past and crept 4.7 to 5.3 m across.
+The scorer's verdict is right: the corner closes when the yaw reverses and the rest is off the line.
+
+The fix:
+- **The SR22 declares `taxi.max_yaw_dps: 20`**: a corner is taken no faster than 20 deg/s times its
+  radius (the 737's cap, `Route::bend_cap_kts`), about 3.5 kt for a 100 degree vertex; straights and
+  bends over about 9 m of radius keep the GA pace.
+- **A free nose catches its swing and lets go of a brake at once** (`BrakeSteer`, the drive's brake
+  half made pure): a swing past `SWING_CATCH_DPS` (8) against the steer puts the opposite wheel on
+  in proportion (to `SWING_CATCH_MAX` 0.2 at 30 deg/s more, authority from 1 kt), a damper; a brake
+  the law no longer wants comes off that tick. Only `nose_free` airframes (SR22, Evolution, RV-10);
+  every other brake-steer nose and every steered one is unchanged, the 737 and A330 included.
+
+The SR22 plant was refitted over these three corners and the 09-28 ramp corner together
+(`Sr22Plant::refit`: 400 - 50 v deg/s per unit of brake, lag 1.5 + 2 / v s, a pivot's kinematic
+limit): the first fit replayed the iMac swings at 4.1 to 8.5 deg/s rms, the refit 2.0 to 5.2. On it,
+over 90 corners (90 to 110 degrees, 0.3 to 0.42 s ticks, 1 to 2.7 kt over, the creep's pull), the law
+as flown fails 17 (worst 5.2 m); with both halves none does (worst 2.9); the cap alone left 1, a
+catch alone 6.
+
+Tests: `the_recorded_swings_are_caught_by_the_opposite_brake` (the logged steer through the old law
+gives back the logged brakes within 0.05; the new one's inside brake is off past the ceiling and the
+opposite wheel gets 0.145 to 0.2), `the_refit_plant_replays_the_imac_corners`,
+`a_free_nose_flies_the_lemg_corners_on_the_line`, `the_sr22_takes_a_sharp_corner_slowly_and_nothing_else`.
+
+Next SR22 taxi from the LEMG GA stand: the `speedhold` `brake` `target` near 3 to 4 at the 690 m and
+2,490 m corners (not 6.0), `autotaxi` `drive` `gs` under 5 at the vertex (the `remaining_m` jump),
+`yaw_dps` under 25, `br` (or `bl`) 0.1 to 0.2 while `steer` and `yaw_dps` disagree past 8, the
+inside brake 0 the tick `yaw_dps` passes 25 its way; `stage_result` taxi `max_lat_m` under 3 and the
+`secs` near 1,060 to 1,100 (the corners cost seconds, not minutes). Offline only.
