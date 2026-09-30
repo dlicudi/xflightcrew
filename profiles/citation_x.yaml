@@ -253,6 +253,10 @@ taxi:
   kts: 15.0
   turn_kts: 10.0
   sharp_kts: 6.0
+  # A corner is taken at this yaw rate times its radius (the 737's figure,
+  # VERIFY on the Citation): without it the G4-onto-A corner at LEMG, 84 deg,
+  # went in at 12 kt and ran 25 m off (1790712526, #193).
+  max_yaw_dps: 15.0
 
 # Four detents in the aircraft file (0/5/15/35 degrees). The POM gives a single
 # Vfe of 180 KIAS; the per-notch limits below are the usual descending ladder
