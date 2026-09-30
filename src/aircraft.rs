@@ -439,6 +439,60 @@ impl RolloutBrakesProfile {
     }
 }
 
+/// The rollout's steer on a STEERED nosewheel, when the takeoff roll's law
+/// does not fit it (`autoland::RolloutSteer`, issue #197).
+///
+/// LEMG 13 on the iMac (2026-09-30, the King Air C90B, sorties
+/// 1790757702, 1790758429 and 1790758604): each contact yawed the nose left
+/// at 8 to 15 deg/s with the steer at zero, the takeoff roll's default law
+/// answered with its whole 0.35 of authority at 80 kt on a differenced
+/// heading, and the nose swung 30 to 80 degrees right with the steer full
+/// left: fitted over the three rollouts (three to four and a half seconds
+/// of heading and track, 1.2 to 2.1 degrees rms), 45 to 65 deg/s of yaw per
+/// unit at 80 kt after 0.3 s, and a yaw the slip itself feeds (1.5 to 2.4
+/// deg/s per degree between the nose and the track) that no heading error
+/// sees coming. So the law damps on the MEASURED yaw rate
+/// (`sim/flightmodel/position/R`), and its gain rises as the speed falls.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct RolloutSteerProfile {
+    /// Steer per degree of heading error at `ref_kts` and above.
+    pub per_deg: f64,
+    /// The groundspeed `per_deg` is the gain at, knots; under it the gain
+    /// grows as `ref_kts / gs`...
+    pub ref_kts: f64,
+    /// ...down to this groundspeed, knots, and no further (the nosewheel's
+    /// own low-speed steering takes over under it).
+    pub min_kts: f64,
+    /// Seconds of the measured yaw rate damped against the error.
+    pub damp_s: f64,
+    /// The most steer at and above `fast_kts` (the rudder's authority grows
+    /// as v^2); the full 0.85 at `min_kts` and under.
+    pub max_fast: f64,
+    /// The groundspeed `max_fast` applies from, knots.
+    pub fast_kts: f64,
+}
+
+impl RolloutSteerProfile {
+    /// Used only when every number is a sane one.
+    pub fn valid(self) -> Option<Self> {
+        ((0.002..=0.1).contains(&self.per_deg)
+            && (20.0..=200.0).contains(&self.ref_kts)
+            && (5.0..=self.ref_kts).contains(&self.min_kts)
+            && (0.0..=3.0).contains(&self.damp_s)
+            && (0.1..=0.85).contains(&self.max_fast)
+            && self.fast_kts > self.min_kts
+            && self.fast_kts <= 200.0)
+            .then_some(self)
+    }
+}
+
+/// The live airframe's rollout steer law, when declared.
+pub fn rollout_steer() -> Option<RolloutSteerProfile> {
+    live_profile()
+        .and_then(|p| p.rollout_steer)
+        .and_then(RolloutSteerProfile::valid)
+}
+
 /// The live airframe's rollout brake law, when declared.
 pub fn rollout_brakes() -> Option<RolloutBrakesProfile> {
     live_profile()
@@ -759,6 +813,9 @@ pub struct AircraftProfile {
     /// The rollout's differential brake on a castoring nosewheel, when fitted.
     #[serde(default)]
     pub rollout_brakes: Option<RolloutBrakesProfile>,
+    /// The rollout's steer on a steered nosewheel, when fitted.
+    #[serde(default)]
+    pub rollout_steer: Option<RolloutSteerProfile>,
     /// The speed governor's lead on this airframe's engines, when fitted.
     #[serde(default)]
     pub speed_governor: Option<SpeedGovernorProfile>,
@@ -5376,6 +5433,7 @@ fn cessna_172sp() -> AircraftProfile {
         rotate_elevator: None,
         arrest_roll: None,
         rollout_brakes: None,
+        rollout_steer: None,
         speed_governor: None,
         cabin_air: None,
         pressurised: Some(false),
@@ -5706,6 +5764,7 @@ fn cirrus_sr22() -> AircraftProfile {
         rotate_elevator: None,
         arrest_roll: None,
         rollout_brakes: None,
+        rollout_steer: None,
         speed_governor: None,
         cabin_air: None,
         pressurised: Some(false),

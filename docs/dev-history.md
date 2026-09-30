@@ -12131,3 +12131,64 @@ Next flights: `stable_gate` `verdict` stable on every normal final (the 737's `i
 under 170 with `landing_flap` true); an `unstabilised` only where the final was; `arrival_slowdown`
 before a full-auto arrival and autoland's first tick near the clean approach speed; a go-around's
 `power` ticks leaving 1.0 by 400 ft radio and its IAS under 250. Offline only.
+
+## 2026-09-30: the King Air's flare on a model, its rollout damped on the yaw rate (#197)
+
+iMac, LEMG 13 from 4 nm, three King Air C90B autolands on fresh loads (no failures set):
+1790757702 crashed (off the runway 176 m right), 1790758429 came back at 19.7 m, 1790758604 went
+125.8 m off. Two faults, one feeding the other.
+
+The flare. The C90B had no `flare_elevator:`, so the jets' default tracker flew it: the arrest took
+the servos at 59 to 61 ft sinking 640 to 700 fpm at 110 to 114 KIAS, pulled 0.23 to 0.35 and
+ballooned (to 61 ft level, then from 17.5 to 39 ft on the balloon's approach thrust), let go to
+neutral, and the sink it rebuilt met the runway at 730 to 960 fpm on the gauge the tick before the
+wheels. The scorer's 256 / 518 / 357 were read from the 3 s `state` samples after the contact. Fitted
+to the three flares from the servos taken to the wheels (radio 1.9 to 2.1 ft rms, gauge 50 to 56 fpm):
+9,670 fpm of standing sink per unit of pull after 0.8 s of dead time, the path's 2.6 s, the gauge
+0.9 s behind it, 118 fpm per knot, the lever worth nothing but its speed; with the lever on a 4 s
+spool the fit takes 9,480, 2.3 s, 323 fpm of tail from 40 ft and 103 per knot instead (1.9 to 2.3 ft).
+The speed: -2.72 kt/s, 2.22 more per 1,000 fpm of climb, 1.93 per unit of lever. The profile now
+declares the model (the first fit's numbers, `touchdown_fpm` 150, `tau_s` 3, pull to 0.5, balloon
+eased at 0.15/s) and `flare_power` (off from 20 ft at 0.1/s). On the second fit and its neighbours
+(dead 0.1 s either way, path 10 %, gauge 20 %, a 150 fpm tail, a wing cushion) the tracker as flown
+meets the runway at 240 to 1,400 fpm from the recorded gates; the model from six 106 to 114 kt gates,
+calm and rough, touches every time under 135 fpm on the path and 125 on the gauge, at 86 kt or more,
+the hop after it under 1.8 ft on the SR22's gear, 951 m from the gate at most.
+
+The rollout. The nosewheel STEERS (`_gear_castors 0`, 48 degrees slow, 7 at speed, through the
+pedals), so the King Air is not a brake-steer airframe and the split was never the answer. Each
+contact yawed the nose 8 to 15 deg/s LEFT with the steer at zero, before any write (1790758429:
+131.7 at 1.6 ft, 128.7 on the wheels 0.4 s later): the hard contact's. The rollout ran the takeoff
+roll's DEFAULT law (`RollSteer::default()`, never the airframe's), whose authority is 0.35 at 80 kt
+on a heading differenced over the 0.45 s tick: it answered with its whole 0.35 right for a second
+and a half, and the nose swung 30 to 80 degrees right while the steer walked to full left at the
+trim's pace (0.03 a tick), recovering only below 45 kt. Fitted over the rollouts' first 3.5 to 4.5 s
+(heading and track, the steer as written, the contact's yaw as the first state): 43 to 62 deg/s per
+unit at 80 kt after 0.3 s, and a yaw the slip between nose and track feeds (1.5 to 2.3 deg/s per
+degree), which no heading error sees coming; a third fit without the slip term is a near integrator
+(219 through 3 s after 0.32 s). Slow, the nosewheel gives 12 to 40 deg/s per unit, and there the
+default law's full authority per 12 degrees sawed +/-10 to 15 degrees down to taxi pace. The sign is
+right everywhere (positive steer yaws right at every speed); `psi` is true heading.
+
+`autoland::RolloutSteer`, declared per airframe (`rollout_steer:`, `aircraft::RolloutSteerProfile`,
+the King Air only; every other airframe keeps the default law and reads nothing new): steer =
+per_deg(gs) x (error - 0.8 s x the MEASURED yaw rate, `sim/flightmodel/position/R`, read only for
+it), 0.025 per degree at 80 kt and over, rising as 80 / gs to 65 kt, at most 0.5 from 75 kt, the
+full 0.85 under 65, the takeoff roll's slew, nothing carried through a bounce. The rollout tick logs
+`yaw_r`. From the three recorded contacts on the three fits the default law swings the nose 24 to
+90 degrees (loses it past 45 from two of three on the best fit, as the sim did); the declared law
+holds it within 12.9 degrees and 12.9 m, and on the nosewheel settles within 3 degrees where the
+default sawed 20.
+
+Tests `lemg13_king_air::the_king_air_plant_replays_its_flares`,
+`the_king_air_flares_where_the_tracker_dropped_it_in`, and `lemg13_king_air_rollout_tests`
+(`the_king_air_yaw_plants_replay_the_rollouts`,
+`the_king_air_rollout_holds_the_runway_where_the_roll_law_lost_it`,
+`the_king_air_rollout_settles_on_the_nosewheel`, `rollout_steer_schedules_and_damps`), on
+`bench/landings/king_air_lemg13_landing_*.jsonl`.
+
+Next King Air autoland: `arrest_hands` then `flare_ask` / `flare_target` / `flare_elev` easing, never
+0.35 to 0 in a tick, no `power` `retard: balloon`, `vvi` under 250 at the last tick before the first
+`rollout`; the `rollout` ticks' `yaw_r` read (not null), `steer` within 0.5 above 75 kt, `psi` within
+10 degrees of 131.7 after the contact, `xtk_m` inside 10 m, and the landing's `sink_fpm` under 250.
+Offline only.
