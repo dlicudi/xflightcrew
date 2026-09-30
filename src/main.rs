@@ -70,6 +70,7 @@ mod route_finder;
 mod router;
 mod settings;
 mod simbrief;
+mod stable_approach;
 mod stt;
 mod stt_eval;
 mod systems;

@@ -12126,3 +12126,193 @@ stale plugin. In flight: autoland `power` `dt` (Final near 0.3, Flare near 0.2 a
 `rollout` `dt` near 0.4, `autotakeoff` `roll` `dt` near 0.25, `drive` records near 0.25 s apart,
 `pos: plugin`; `api_load` names `xcopilot/state` and no longer the stock position, VSI, freeze and
 status datarefs. Offline only.
+
+## 2026-09-30: one stabilised-approach rule; the arrival slows for autoland; a missed approach flies a speed (#199)
+
+iMac 2026-09-30, sortie 1790761044-full_auto: the stock 737 from a runway start on EGBB 33 to EGNX
+on a 40 nm local plan (3,000 ft cruise). The first approach flew the EGNX 09 final at 254 to 255
+KIAS with the flaps up and the throttle at idle, 1,362 to 1,419 fpm down from 1,000 ft above the
+runway to 121 ft radio; the approach speed was 145. The arrest pulled at 144 ft radio, ballooned
+(+1,224 fpm) and went around `balloon` at 150 ft, 0.06 nm out. The missed approach held the lever
+at 1.0 to the turn at 800 ft radio and the clean 737 went 250 to 309 kt there, 355 at 1,587 ft
+(1,460 ft radio) before the governor's 0.04-a-tick steps brought the lever back; the reversal then
+bled it off level at 1,880 ft, and the second approach landed (230 fpm, 1.0 m).
+
+Causes, from the records:
+- The arrival. `procedure` held cruise (255, capped at 250 by the 10,000 ft rule) to the last fix
+  of the local plan; the only arrival slow-down it had was a STAR's speed limits, and a local plan
+  has none. `enroute_complete` handed autoland a clean 737 at 252 kt, ON the path at 3,000 ft 8.4
+  nm out. The height was right; the speed was cruise.
+- Autoland could not slow on the path. At idle on a 3 degree path a clean 737 holds its speed
+  (g sin 3 degrees is about 1 kt/s, its idle drag no more); the flaps and gear wait for their
+  placards (`flap_within_limits`, `gear_may_extend`: 250 and 235 against 255), so the drag that
+  would have slowed it never came; the path law flew the path's own sink at 255 kt over the
+  ground, 1,350 fpm (`nominal_vs`).
+- Nothing judged it. The 1,000 ft gate (`unstabilised_at_gate`) was lateral only, and the 737 was
+  on the centreline; the speed, the configuration and the sink were never a question.
+- The go-around was firewalled for the whole straight-ahead climb (`MissedStage::Climb`), which
+  is 150 ft to 800 ft radio, with the VS mode holding 2,000 fpm: every knot of excess thrust went
+  into speed.
+- Every final on file also reached 1,000 ft with only half flap out: `flap_schedule` put the
+  landing flap out inside 3 nm, which on a 3 degree path IS the 1,000 ft gate (737 EGBB 33, sortie
+  1790759458-full_auto: 169 kt at 1,008 ft with flap 10, 151 by 500).
+
+The rule (`src/stable_approach.rs`, ONE rule, judged by autoland for every final it flies,
+straight-in and circuit): by the GATE, 1,000 ft above the runway on an instrument or straight-in
+final (`GateKind::Instrument`, the default) and 500 ft on a circuit's (`GateKind::Visual`,
+handed down by `circuit` through `autoland::set_next_gate`): gear down and the landing flap
+SELECTED; the speed no more than 7 under the landing target (`SLOW_KTS`, the margin speed
+protection acts at) and no more than 15 over from 500 ft down (`FAST_KTS`; between an instrument
+gate and 500 ft, configured, up to 25 over, `FAST_ABOVE_STABLE_KTS`: configured by 1,000, stable
+by 500); the sink no more than 1,000 fpm or the path's own sink at the TARGET speed over the
+ground plus 400 (`sink_limit_fpm`: a steep path or a tailwind demands more, a fast aircraft does
+not); within 0.7 degrees of the path (`PATH_TOL_DEG`, two dots, never under 50 ft); the lateral
+gate as it was. The target is the governor's own in the landing configuration
+(`approach_target_kts` at flap 1.0). A breach that holds 3 s (`StableWatch`, `PERSIST_S`) orders
+the go-around then (`GoAroundLatch::order`), judged from the gate to 200 ft above the runway in the
+Final phase, never in the arrest. Calibrated on the 57 finals in the blackbox (2026-09-29 and 30,
+each against its profile's approach speed, the flap left out since the records carry the old
+schedule): today's 737 finals (EGBB 33 twice, EGNX 09 second, the circuit), SR22 circuits and
+straight-ins, a Citation, the Baron, King Air, SF50 and Evolution stay stable; the EGNX 09 first
+approach is `fast` and `sink` from the gate (and `flap`, the placards never let it out); the
+2,200 to 5,400 fpm dives of the high approach setups (SR22, 172, RV-10, King Air, Baron) are
+`sink` or `high` at 800 to 950 ft. Two finals of 2026-09-29 that landed would have gone around: the
+A330 at 184 kt (target 154) at 941 ft with CONF 2 out (1790695800-approach) and a 737 dive 280 ft
+over the path at 1,000 ft, 4.2 degrees (1790700986-full_auto); a Citation 26 kt fast at 954 ft
+(1790740040) went around anyway, lateral. The SR22's 91 kt finals before 2026-09-29 19:30 were
+flown to its old 80 kt approach speed, inside the band.
+
+Getting there: the landing flap is selected a mile before the instrument gate
+(`autoland::landing_flap_nm`, 3.98 nm on a 3 degree path, `LANDING_FLAP_LEAD_NM`), still only on
+the path. The enroute plan of a full-auto flight is handed autoland's clean approach speed
+(`procedure::set_next_arrival_handoff_kts`, `autoland::clean_approach_ias`: 210 for the 737) and
+slows for it by the end of the route like a STAR limit (`arrival_handoff_cap`: 0.5 kt/s plus the
+2 nm lead, held once begun), so the follower's own descent drag and speed-protected descent do the
+slowing; said "Slowing to 210 knots for the approach." An arrival that still cannot be stable is
+the gate's go-around at 1,000 ft, the reversal's pattern and a second approach, the second EGNX 09
+approach being exactly that.
+
+The missed approach flies a speed (`missed_approach_speed_kts`): the give-up's pattern speed for
+the flap out (210 clean for the 737), at least the approach speed plus 12 and the go-around flap's
+floor plus 5, under the placard of the flap out less 10, never over 250 below 10,000 ft, floored by
+the configuration flown. `missed_approach_throttle`: go-around thrust until ESTABLISHED (400 ft
+and 500 fpm up, `GA_THRUST_HOLD_AGL_FT`, `GA_CLIMB_ESTABLISHED_FPM`) and whenever 10 kt slow; 10
+kt fast, the climb floor at once (the approach thrust floor, else idle; the VS mode turns the
+excess into height); else the governor's step.
+
+Blackbox: `autoland` `stable_gate` once per approach at the first judged tick (`gate`, `gate_ft`,
+`height_aal`, `ias`, `target`, `gs`, `vvi`, `sink_limit`, `above_path_ft`, `path_tol_ft`, `gear`,
+`landing_flap`, `breaches`, `verdict`), `unstabilised` when it orders the go-around (the same and
+`why`), and `going_around` `why` `unstabilised_<breach>`; spoken "Not stabilised, too fast. Going
+around."; `procedure` `arrival_slowdown` (`kts`, `to_end_nm`, `ias`, `planned`).
+
+Tests: `stable_approach` (the EGNX 09 first final goes around at the gate with height in hand; the
+EGNX 09 second, EGBB 33 and SR22 circuit finals of today stay stable; a gust through the band is
+not a go-around; the speed allowance closes at 500; the sink and path limits);
+`the_landing_flap_is_selected_a_mile_before_the_gate`; `missed_approach_speed_tests` (210 not
+355, the replayed EGNX climb peaks under 285 and settles on 210); `arrival_handoff_tests`.
+
+Next flights: `stable_gate` `verdict` stable on every normal final (the 737's `ias` at the gate
+under 170 with `landing_flap` true); an `unstabilised` only where the final was; `arrival_slowdown`
+before a full-auto arrival and autoland's first tick near the clean approach speed; a go-around's
+`power` ticks leaving 1.0 by 400 ft radio and its IAS under 250. Offline only.
+
+## 2026-09-30: the King Air's flare on a model, its rollout damped on the yaw rate (#197)
+
+iMac, LEMG 13 from 4 nm, three King Air C90B autolands on fresh loads (no failures set):
+1790757702 crashed (off the runway 176 m right), 1790758429 came back at 19.7 m, 1790758604 went
+125.8 m off. Two faults, one feeding the other.
+
+The flare. The C90B had no `flare_elevator:`, so the jets' default tracker flew it: the arrest took
+the servos at 59 to 61 ft sinking 640 to 700 fpm at 110 to 114 KIAS, pulled 0.23 to 0.35 and
+ballooned (to 61 ft level, then from 17.5 to 39 ft on the balloon's approach thrust), let go to
+neutral, and the sink it rebuilt met the runway at 730 to 960 fpm on the gauge the tick before the
+wheels. The scorer's 256 / 518 / 357 were read from the 3 s `state` samples after the contact. Fitted
+to the three flares from the servos taken to the wheels (radio 1.9 to 2.1 ft rms, gauge 50 to 56 fpm):
+9,670 fpm of standing sink per unit of pull after 0.8 s of dead time, the path's 2.6 s, the gauge
+0.9 s behind it, 118 fpm per knot, the lever worth nothing but its speed; with the lever on a 4 s
+spool the fit takes 9,480, 2.3 s, 323 fpm of tail from 40 ft and 103 per knot instead (1.9 to 2.3 ft).
+The speed: -2.72 kt/s, 2.22 more per 1,000 fpm of climb, 1.93 per unit of lever. The profile now
+declares the model (the first fit's numbers, `touchdown_fpm` 150, `tau_s` 3, pull to 0.5, balloon
+eased at 0.15/s) and `flare_power` (off from 20 ft at 0.1/s). On the second fit and its neighbours
+(dead 0.1 s either way, path 10 %, gauge 20 %, a 150 fpm tail, a wing cushion) the tracker as flown
+meets the runway at 240 to 1,400 fpm from the recorded gates; the model from six 106 to 114 kt gates,
+calm and rough, touches every time under 135 fpm on the path and 125 on the gauge, at 86 kt or more,
+the hop after it under 1.8 ft on the SR22's gear, 951 m from the gate at most.
+
+The rollout. The nosewheel STEERS (`_gear_castors 0`, 48 degrees slow, 7 at speed, through the
+pedals), so the King Air is not a brake-steer airframe and the split was never the answer. Each
+contact yawed the nose 8 to 15 deg/s LEFT with the steer at zero, before any write (1790758429:
+131.7 at 1.6 ft, 128.7 on the wheels 0.4 s later): the hard contact's. The rollout ran the takeoff
+roll's DEFAULT law (`RollSteer::default()`, never the airframe's), whose authority is 0.35 at 80 kt
+on a heading differenced over the 0.45 s tick: it answered with its whole 0.35 right for a second
+and a half, and the nose swung 30 to 80 degrees right while the steer walked to full left at the
+trim's pace (0.03 a tick), recovering only below 45 kt. Fitted over the rollouts' first 3.5 to 4.5 s
+(heading and track, the steer as written, the contact's yaw as the first state): 43 to 62 deg/s per
+unit at 80 kt after 0.3 s, and a yaw the slip between nose and track feeds (1.5 to 2.3 deg/s per
+degree), which no heading error sees coming; a third fit without the slip term is a near integrator
+(219 through 3 s after 0.32 s). Slow, the nosewheel gives 12 to 40 deg/s per unit, and there the
+default law's full authority per 12 degrees sawed +/-10 to 15 degrees down to taxi pace. The sign is
+right everywhere (positive steer yaws right at every speed); `psi` is true heading.
+
+`autoland::RolloutSteer`, declared per airframe (`rollout_steer:`, `aircraft::RolloutSteerProfile`,
+the King Air only; every other airframe keeps the default law and reads nothing new): steer =
+per_deg(gs) x (error - 0.8 s x the MEASURED yaw rate, `sim/flightmodel/position/R`, read only for
+it), 0.025 per degree at 80 kt and over, rising as 80 / gs to 65 kt, at most 0.5 from 75 kt, the
+full 0.85 under 65, the takeoff roll's slew, nothing carried through a bounce. The rollout tick logs
+`yaw_r`. From the three recorded contacts on the three fits the default law swings the nose 24 to
+90 degrees (loses it past 45 from two of three on the best fit, as the sim did); the declared law
+holds it within 12.9 degrees and 12.9 m, and on the nosewheel settles within 3 degrees where the
+default sawed 20.
+
+Tests `lemg13_king_air::the_king_air_plant_replays_its_flares`,
+`the_king_air_flares_where_the_tracker_dropped_it_in`, and `lemg13_king_air_rollout_tests`
+(`the_king_air_yaw_plants_replay_the_rollouts`,
+`the_king_air_rollout_holds_the_runway_where_the_roll_law_lost_it`,
+`the_king_air_rollout_settles_on_the_nosewheel`, `rollout_steer_schedules_and_damps`), on
+`bench/landings/king_air_lemg13_landing_*.jsonl`.
+
+Next King Air autoland: `arrest_hands` then `flare_ask` / `flare_target` / `flare_elev` easing, never
+0.35 to 0 in a tick, no `power` `retard: balloon`, `vvi` under 250 at the last tick before the first
+`rollout`; the `rollout` ticks' `yaw_r` read (not null), `steer` within 0.5 above 75 kt, `psi` within
+10 degrees of 131.7 after the contact, `xtk_m` inside 10 m, and the landing's `sink_fpm` under 250.
+Offline only.
+
+## 2026-09-30: a tick is a PERIOD, and what counted ticks counts seconds
+
+Follow-up to the `xcopilot/state` entry above, merged over main at #199 (stable approach) and #197
+(the King Air's `RolloutSteer`, whose yaw-rate read now rides the tick's one read as `F::R`).
+
+Two rounds a tick still leaves the tick as long as the machine makes it: sleep plus work. The loops
+now pace to a fixed PERIOD from the tick's start (`sim::state::Pacer`), and the periods are the
+ticks the laws were tuned on, the MacBook's, read from the bench records made before the iMac
+(before 2026-09-29): autoland Flare and arrest 200 ms (`power` dt 0.20), Final 330 (0.333),
+Intercept 540 (the old 400 ms sleep plus seven 20 ms rounds, no MacBook record); the rollout 380
+(0.378); the takeoff roll 250 (0.25) and the hand-flown climb 230 (0.227); the taxi drive and the
+line-up alignment 210 (150 ms plus three 20 ms rounds, no record). Two rounds are about 100 ms at
+20 fps, so every period holds on the iMac; a tick that overruns starts the next at once.
+`tick_ms` is the period now; its test asks the flare for 15 commands (the MacBook's 0.20 s),
+not the 20 its 100 ms sleep promised and never delivered.
+
+Constants that counted ticks meant a time only on the machine that tuned them. Converted, each to
+its wall time at the MacBook's tick:
+
+- `WHEELS_ON_TICKS` 3 -> `WHEELS_ON_S` 0.4 (third wheels-on read at the 0.2 s flare tick; the
+  recorded 1790448340 contact latched 0.4 s after first contact). `wheels_on_time` is a clock
+  from the first wheels-on read, broken by a bounce.
+- `VS_DIVERGED_WARN_TICKS` 12 -> `VS_DIVERGED_WARN_S` 4.0 and `VS_DIVERGED_GIVE_UP_TICKS` 140 ->
+  `VS_DIVERGED_GIVE_UP_S` 46 (0.33 s Final); the watchdog accumulates the tick's `dt` (blackbox
+  `give_up` `diverged_s`, was `ticks`).
+- `VS_CONVERGING_FPM_PER_TICK` 15 -> `VS_CONVERGING_FPM_PER_S` 45; `vs_not_held` takes `dt_s`.
+- The approach's cross-track rate filter, half per tick -> a 0.476 s time constant (0.33 / ln 2);
+  the taxi drive's yaw-rate filter, half per tick -> 0.303 s (0.21 / ln 2).
+
+Kept as counts, being measurements, not times: `ENGAGE_CONFIRM_READS` (two servo reads confirm an
+engage), `FINAL_AIR_MIN_SAMPLES` (15 samples for an rms), the roll's median of three cross-track
+reads; paced, each spans the wall time it was tuned on again. The scorer and the sortie runner
+count no ticks.
+
+Tests: a paced tick is its period at 20, 50 and 80 ms frames and an overrun does not sleep; the
+wheels latch 0.4 s after contact on the recorded 0.2 s ticks and on 0.39 s ticks alike; the VS
+watchdog judges a closing rate per second on 0.33 and 0.56 s ticks. In flight: `power` dt at the
+periods (Flare 0.20, Final 0.33), `rollout` 0.38, `roll` 0.25, `climb_manual` 0.23. Offline only.

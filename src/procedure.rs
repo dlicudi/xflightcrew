@@ -1213,6 +1213,51 @@ pub fn star_speed_crossing(
     })
 }
 
+/// The speed the NEXT enroute plan hands its arrival over at, consumed at
+/// its arm (full auto's, before an arrival autoland).
+static NEXT_ARRIVAL_HANDOFF_KTS: std::sync::Mutex<Option<f64>> = std::sync::Mutex::new(None);
+
+/// Hand the next enroute plan the speed its arrival starts at (`None` clears
+/// one left by a plan that never started).
+pub fn set_next_arrival_handoff_kts(kts: Option<f64>) {
+    *NEXT_ARRIVAL_HANDOFF_KTS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = kts.filter(|k| k.is_finite() && *k > 0.0);
+}
+
+fn take_arrival_handoff_kts() -> Option<f64> {
+    NEXT_ARRIVAL_HANDOFF_KTS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .take()
+}
+
+/// The arrival's hand-over speed as a limit at the END of the route, slowed
+/// for in time the way a STAR limit is ([`arrival_speed_cap`]: at
+/// [`ARRIVAL_DECEL_KTS_S`] from `ias_kts` plus [`ARRIVAL_SPEED_LEAD_NM`]),
+/// and held once begun (`begun`). `to_end_nm` is the route still to fly.
+/// `None` while the slow-down is still ahead. Pure.
+///
+/// EGBB-EGNX (2026-09-30, sortie 1790761044-full_auto, #199): a 40 nm local
+/// plan cruised at 3,000 ft and 250 kt to its last fix, and autoland was
+/// handed a clean 737 at 252 kt on the path 8.4 nm out. It flew the final at
+/// 255 with the flaps held up by their placards. Autoland expects its clean
+/// approach speed (`autoland::clean_approach_ias`, 210 for the 737) there.
+pub fn arrival_handoff_cap(
+    to_end_nm: f64,
+    ias_kts: f64,
+    gs_kts: f64,
+    handoff_kts: f64,
+    begun: &mut bool,
+) -> Option<f64> {
+    if !*begun {
+        let slow_nm =
+            (ias_kts - handoff_kts).max(0.0) / ARRIVAL_DECEL_KTS_S * gs_kts.max(60.0) / 3600.0;
+        *begun = to_end_nm <= slow_nm + ARRIVAL_SPEED_LEAD_NM;
+    }
+    begun.then_some(handoff_kts)
+}
+
 /// The true great-circle bearing to a leg's fix, or `None` for a to-altitude
 /// leg (no fix to steer at). Pure — the lateral-steering decision, testable
 /// without a sim.
@@ -2979,6 +3024,12 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, plan: Pla
     // The STAR speed limits whose slow-down has begun: held from then on
     // (`arrival_speed_cap`).
     let mut star_speed_begun: std::collections::HashSet<usize> = std::collections::HashSet::new();
+    // The arrival's hand-over speed, an enroute plan's only (#199), whether
+    // its slow-down has begun (held from then on) and was said.
+    let arrival_handoff_kts =
+        take_arrival_handoff_kts().filter(|_| matches!(end, EndAction::Enroute));
+    let mut handoff_begun = false;
+    let mut said_handoff = false;
     // The speedbrake's last change and which changes are said (`descent_drag`,
     // `DragVoice`).
     let mut drag_changed: Option<std::time::Instant> = None;
@@ -3349,6 +3400,35 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, plan: Pla
                 }
                 _ => planned,
             };
+            // The speed the arrival hands to autoland at the end of the
+            // route, slowed for in time like a STAR limit (#199): EGBB-EGNX
+            // (2026-09-30) held its 250 to the last fix and gave autoland a
+            // clean 737 at 252 kt 8.4 nm out on the path.
+            let planned = match arrival_handoff_kts {
+                Some(kts) if kts < planned && !legs.is_empty() => {
+                    let to_end = distance_to_leg_nm(lat, lon, &legs, idx, legs.len() - 1);
+                    match arrival_handoff_cap(to_end, ias, gs * MS_TO_KTS, kts, &mut handoff_begun) {
+                        Some(cap) => {
+                            if !said_handoff {
+                                said_handoff = true;
+                                crate::blackbox::record(
+                                    "procedure",
+                                    serde_json::json!({"event": "arrival_slowdown", "kts": cap,
+                                        "to_end_nm": to_end, "ias": ias, "planned": planned}),
+                                );
+                                alert(
+                                    &voice,
+                                    Priority::Advisory,
+                                    &format!("Slowing to {cap:.0} knots for the approach."),
+                                );
+                            }
+                            cap
+                        }
+                        None => planned,
+                    }
+                }
+                _ => planned,
+            };
             // On the final to a MAP: landing speed and configuration, so the
             // visual segment is flown stabilised (a jet cannot slow down and
             // go down 4.7 degrees in two miles).
@@ -3362,7 +3442,7 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, plan: Pla
                     gear_set = xp.set_float(GEAR_HANDLE, 1.0).await.is_ok();
                 }
                 // A MAP ON the runway is an ordinary final: flap as the
-                // approach goes (half inside 6 nm, full inside 3 nm on the
+                // approach goes (half inside 6 nm, full a mile before the 1,000 ft gate on the
                 // path, `autoland::flap_schedule`), as a pilot flies an ILS.
                 // Full flap from the FAF flew LIPR's 9 nm final at 65 kt for
                 // eight minutes (2026-09-26). A MAP short of the runway keeps
@@ -7874,5 +7954,37 @@ mod departure_minimum_tests {
         assert_eq!(new.vs_writes_in_alt, 0);
         assert_eq!(new.unconfirmed, 0);
         assert!(new.final_alt > 7800.0, "on for LAM: {:.0}", new.final_alt);
+    }
+}
+
+/// #199: the arrival hands autoland its clean approach speed.
+#[cfg(test)]
+mod arrival_handoff_tests {
+    use super::*;
+
+    #[test]
+    fn the_egnx_arrival_slows_to_210_before_the_end_of_the_route() {
+        // EGBB-EGNX (2026-09-30): 250 kt at 3,000 ft, about 260 over the
+        // ground, the 737's clean approach speed 210. The slow-down needs
+        // 40 kt at 0.5 kt/s: 5.8 nm, plus the 2 nm lead.
+        let mut begun = false;
+        assert_eq!(arrival_handoff_cap(12.0, 250.0, 260.0, 210.0, &mut begun), None);
+        assert!(!begun);
+        assert_eq!(arrival_handoff_cap(7.7, 250.0, 260.0, 210.0, &mut begun), Some(210.0));
+        // Held once begun, whatever the speed and distance say next.
+        assert_eq!(arrival_handoff_cap(9.0, 215.0, 220.0, 210.0, &mut begun), Some(210.0));
+        // Already slow: only the lead before the end.
+        let mut slow = false;
+        assert_eq!(arrival_handoff_cap(3.0, 200.0, 200.0, 210.0, &mut slow), None);
+        assert_eq!(arrival_handoff_cap(1.9, 200.0, 200.0, 210.0, &mut slow), Some(210.0));
+    }
+
+    #[test]
+    fn the_handoff_speed_is_handed_down_once() {
+        set_next_arrival_handoff_kts(Some(210.25));
+        assert_eq!(take_arrival_handoff_kts(), Some(210.25));
+        assert_eq!(take_arrival_handoff_kts(), None);
+        set_next_arrival_handoff_kts(Some(f64::NAN));
+        assert_eq!(take_arrival_handoff_kts(), None);
     }
 }

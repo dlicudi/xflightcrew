@@ -1,0 +1,25 @@
+# iMac verify batch 9 (04a02a1): the King Air's rollout steer and flare
+# (#197), and the EGBB-EGNX hop that flew its final at 255 kt (#199: the
+# stabilised-approach gate, the arrival slow-down, the missed approach).
+after: stop
+cases:
+  - name: "King Air C90B LEMG 13, 4 nm final (#197)"
+    setup:
+      aircraft: "Aircraft/Laminar Research/Beechcraft King Air C90B/C90B.acf"
+      approach: { field: LEMG, runway: 13, final_nm: 4 }
+    traffic: off
+
+  - name: "King Air C90B LEMG 13, 4 nm final again (#197)"
+    setup:
+      aircraft: "Aircraft/Laminar Research/Beechcraft King Air C90B/C90B.acf"
+      approach: { field: LEMG, runway: 13, final_nm: 4 }
+    traffic: off
+
+  - name: "737 EGBB runway start, local plan to EGNX (#199)"
+    setup:
+      aircraft: "Aircraft/Laminar Research/Boeing 737-800/b738.acf"
+      runway_start: { field: EGBB, runway: 33, engines_running: true }
+    steps:
+      - { say: plan a flight to EGNX, when: start, tool: plan_flight }
+      - { say: fly the flight plan, when: { after_s: 15 }, tool: full_auto }
+    deadline_min: 60

@@ -772,6 +772,15 @@ everything blackboxes to `logs/blackbox.jsonl` (kinds: `atc`, `autotaxi`, `autot
   caution (`cruise_cap_kts`); the altimeter is set AT the transition, crossed in the direction flown
   (`transition_crossed`); icing reads the moisture at our own level (`dewpoint_at`); with the ILS
   tuned autoland's aim leans toward the glideslope (`aim_with_glideslope`; EGKK-EGBB 2026-09-28).
+- **One stabilised-approach rule for every final** (`src/stable_approach.rs`, #199): by the gate
+  (1,000 ft instrument, 500 ft circuit, `set_next_gate`) landing configuration, speed -7/+15 kt
+  of the landing target (+25 above 500 ft), sink under max(1,000, the path's at the target speed
+  + 400), within 0.7 deg of the path; a breach held 3 s goes around ("Not stabilised, ..."),
+  judged gate to 200 ft, never in the arrest. Landing flap a mile before the gate
+  (`landing_flap_nm`); the arrival slows to the clean approach speed before the handoff
+  (`arrival_handoff_cap`); the missed approach flies `missed_approach_speed_kts`, never full
+  power to overspeed (EGNX 737 flew the final at 255 kt clean, then 355 kt in the missed
+  approach, 2026-09-30).
 - **The arrival is re-picked in flight** (`RepickWatch`): the destination tower's runway at once, the
   METAR's wind runway on two readings in a row beyond 25 nm (never in calm, never against the tower),
   at most `MAX_ARRIVAL_REPICKS`; the new STAR is spliced from its entry (`plan_audit::star_splice`,

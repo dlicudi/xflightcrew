@@ -92,6 +92,12 @@ const YAW_RATE: &str = "sim/flightmodel/position/R";
 /// (`Q`, deg/s: what the rotation law damps on, measured, so it needs
 /// neither differencing nor a filter; see [`RotatePitch::step`]), engine
 /// 1's torque (`ENGN_TRQ`, N m) and the yaw rate.
+/// The roll's tick period, ms (`sim::state::Pacer`): its old 150 ms sleep
+/// plus the MacBook's rounds, the `roll` dt the laws were tuned on (bench
+/// takeoffs, median 0.25 s; the iMac ran 0.34, 2026-09-30).
+const ROLL_TICK_MS: u64 = 250;
+/// The hand-flown climb's, ms (bench `climb_manual` dt median 0.23 s).
+const CLIMB_MANUAL_TICK_MS: u64 = 230;
 const ROLL_WANT: &[sim::state::F] = &[
     sim::state::F::Ias,
     sim::state::F::OnGround,
@@ -3623,6 +3629,8 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, p: Params) {
     // The tick's writes, sent together (`sim::state::Writes`).
     let mut writes = sim::state::Writes::new();
     loop {
+        // The tick runs to its period, not sleep + work (`ROLL_TICK_MS`).
+        let pacer = sim::state::Pacer::start();
         if xp.cancelled() || !ACTIVE.load(Ordering::Relaxed) {
             RUN.record(sim::run::Outcome::PilotOverride);
             // Released externally ("my controls"): the release path already
@@ -4101,7 +4109,7 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, p: Params) {
                     serde_json::json!({"event": "liftoff", "ias": ias}),
                 );
             }
-            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+            pacer.wait(std::time::Duration::from_millis(ROLL_TICK_MS)).await;
             continue;
         }
 
@@ -4251,7 +4259,7 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, p: Params) {
                         "vs": vs_flown,
                     }),
                 );
-                tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+                pacer.wait(std::time::Duration::from_millis(CLIMB_MANUAL_TICK_MS)).await;
                 continue;
             }
             // Established in the climb: the AP takes it. Servos + HDG + VS,

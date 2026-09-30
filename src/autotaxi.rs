@@ -77,6 +77,14 @@ const TAXI_STEER: &str = "xcopilot/taxi_steer";
 /// so a dead app frees the pedals by silence.
 pub(crate) const LEFT_BRAKE: &str = "xcopilot/taxi_brake_l";
 pub(crate) const RIGHT_BRAKE: &str = "xcopilot/taxi_brake_r";
+/// The drive's and the line-up alignment's tick period, ms
+/// (`sim::state::Pacer`): the old 150 ms sleep plus the MacBook's three 20
+/// ms rounds (no MacBook record of the drive's dt; the iMac's drive ticked
+/// about 0.3 s, 2026-09-30).
+const DRIVE_TICK_MS: u64 = 210;
+/// The drive's yaw-rate filter, seconds: half the raw rate a tick at the
+/// MacBook's 0.21 s tick is a time constant of 0.21 / ln 2.
+const YAW_RATE_TAU_S: f64 = 0.303;
 /// What the drive's tick reads past the position (`sim::state`).
 const DRIVE_WANT: &[sim::state::F] = &[sim::state::F::SteerYield, sim::state::F::Tug];
 /// What the line-up alignment's tick reads past the position: the pedals
@@ -3113,6 +3121,8 @@ async fn align_on_the_runway(
     let mut last_err = 0.0_f64;
     let mut last_lat: Option<f64> = None;
     let end = loop {
+        // The tick runs to its period, not sleep + work (`DRIVE_TICK_MS`).
+        let pacer = sim::state::Pacer::start();
         if !ACTIVE.load(Ordering::Relaxed)
             || DRIVE_GEN.load(Ordering::SeqCst) != gen
             || !speedhold::taxi_hold_active()
@@ -3203,7 +3213,7 @@ async fn align_on_the_runway(
             xp.set_float(LEFT_BRAKE, bl),
             xp.set_float(RIGHT_BRAKE, br),
         );
-        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        pacer.wait(std::time::Duration::from_millis(DRIVE_TICK_MS)).await;
     };
     speedhold::set_taxi_target(0.0);
     let _ = tokio::join!(
@@ -3331,6 +3341,8 @@ async fn drive(xp: XPlaneClient, voice: Option<Voice>, mut route: Route, base_kt
     // ([`JoinTurn`]).
     let mut join_turn_judged = false;
     loop {
+        // The tick runs to its period, not sleep + work (`DRIVE_TICK_MS`).
+        let pacer = sim::state::Pacer::start();
         if !ACTIVE.load(Ordering::Relaxed) || DRIVE_GEN.load(Ordering::SeqCst) != gen {
             crate::blackbox::record(
                 "autotaxi",
@@ -3836,7 +3848,8 @@ async fn drive(xp: XPlaneClient, voice: Option<Voice>, mut route: Route, base_kt
             }
         });
         prev_psi = Some((psi, now));
-        yaw_rate = yaw_rate * 0.5 + raw_rate.clamp(-90.0, 90.0) * 0.5;
+        // Low-passed on TIME (`YAW_RATE_TAU_S`), not half per tick.
+        yaw_rate += (raw_rate.clamp(-90.0, 90.0) - yaw_rate) * (1.0 - (-dt / YAW_RATE_TAU_S).exp());
         let trim = straight_trim.step(
             offset,
             route_turn_dps,
@@ -3961,7 +3974,7 @@ async fn drive(xp: XPlaneClient, voice: Option<Voice>, mut route: Route, base_kt
                 last_sched = sched;
             }
         }
-        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        pacer.wait(std::time::Duration::from_millis(DRIVE_TICK_MS)).await;
     }
     // Politeness on the way out — expiry would do it within the second.
     let _ = xp.set_float(TAXI_STEER, 0.0).await;

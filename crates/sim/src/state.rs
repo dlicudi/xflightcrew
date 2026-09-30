@@ -389,6 +389,30 @@ pub async fn read_with<X: XPlane + ?Sized>(
     (s, out)
 }
 
+/// A control tick's clock: the tick runs to a fixed PERIOD from its start,
+/// not a sleep after its work. Slept after the work, a tick was the sleep
+/// plus a frame per round of requests, so it was as long as the machine's
+/// frame rate made it (the MacBook near 0.3 s, the iMac at 20 fps near
+/// 0.4 to 0.6, 2026-09-30) and every law saw a different `dt` on each.
+/// Paced, a tick is its period on any machine whose work fits inside it
+/// (two rounds, about 100 ms at 20 fps); a tick that overruns starts the
+/// next at once. The periods are the ticks the laws were tuned on.
+#[derive(Debug, Clone, Copy)]
+pub struct Pacer(tokio::time::Instant);
+
+impl Pacer {
+    /// The tick starts now.
+    pub fn start() -> Self {
+        Self(tokio::time::Instant::now())
+    }
+
+    /// Sleep out the rest of `period` from the tick's start (at once when
+    /// the tick already took longer).
+    pub async fn wait(&self, period: std::time::Duration) {
+        tokio::time::sleep_until(self.0 + period).await;
+    }
+}
+
 /// A tick's writes, sent together: ONE round, however many (the reads'
 /// rule for the other half of a tick). A dataref set twice keeps the last
 /// value, as two writes in a row would have left it. Writes that must land
@@ -651,6 +675,36 @@ mod tests {
         assert_eq!(done.ok("xcopilot/taxi_steer"), Some(true));
         assert_eq!(done.ok("xcopilot/pitch"), None);
         assert_eq!(xp.inner.writes_to("xcopilot/taxi_steer"), vec![0.3]);
+    }
+
+    /// A paced tick is its period whether its work took one frame or four,
+    /// and an overrun starts the next tick at once.
+    #[tokio::test(start_paused = true)]
+    async fn a_paced_tick_is_its_period_whatever_the_frame_rate() {
+        let period = std::time::Duration::from_millis(330);
+        for frame_ms in [20_u64, 50, 80] {
+            let xp = FramedXPlane::new(split_fake(), std::time::Duration::from_millis(frame_ms));
+            xp.inner.set_read_bytes(STATE, Some(&encode(&sample())));
+            let t0 = tokio::time::Instant::now();
+            for _ in 0..3 {
+                let pacer = Pacer::start();
+                let _ = read(&xp, WANT).await;
+                Writes::new().set("xcopilot/pitch", 0.1).flush(&xp).await;
+                pacer.wait(period).await;
+            }
+            let per_tick = t0.elapsed() / 3;
+            // Within one frame of the period (the first read waits for a
+            // frame boundary).
+            assert!(
+                per_tick >= period && per_tick <= period + std::time::Duration::from_millis(frame_ms),
+                "{frame_ms} ms frames: {per_tick:?}"
+            );
+        }
+        let pacer = Pacer::start();
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        let t = tokio::time::Instant::now();
+        pacer.wait(period).await;
+        assert_eq!(t.elapsed(), std::time::Duration::ZERO, "an overrun does not sleep");
     }
 
     /// The point of it all: one round a tick, the frame or the split.
