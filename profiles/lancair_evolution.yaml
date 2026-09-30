@@ -349,6 +349,31 @@ taxi:
   # 9.5 m past its stop at 9.9 kt (1790740292, #196): 10 kt instead.
   backtrack_kts: 10.0
 
+# The ground plant of the free castoring nose (ground_steer, the one law
+# for the taxi, the backtrack, the line-up's pivot, the roll's start and the
+# rollout): identified 2026-09-30 by output error, jointly, over 2.4 s
+# windows of all 5,373 drive ticks of the eight LILB 03 sorties on the iMac
+# (1790712974 to 1790762771) and its two rollouts' heading, checked against
+# the 453 alignment ticks' own R: 1.87 deg/s rms on the taxi, 1.28 degrees
+# on the rollouts. The wheel difference yaws the nose 88 deg/s^2 per unit at
+# 0.5 m/s falling to 36 at 6 and to a fifth of its scale by 5.2 (the
+# standstill fade, 0.19 m/s, from the alignments), the yaw dies at 0.19 per
+# second at 0.5 m/s to 0.55 at 6, the rudder 0.26 per (m/s)^2 at taxi power,
+# the tail weathervanes at 6.8 deg/s^2 per degree at 30 m/s, the PT6's pull
+# about -1.2 deg/s^2 at taxi power (learnt in flight), the brake's drag
+# 4 m/s^2 per unit. Two rollouts are few: RE-FLY a rollout's `gsteer`.
+ground_plant:
+  brake_dps2: 109.0
+  brake_from_ms: 0.2
+  brake_per_ms: -0.154
+  damp: 0.218
+  damp_per_ms: 0.043
+  rudder_per_ms2: 0.26
+  vane_dps2: 6.8
+  # The track follows the nose at this over v per second of slip (the two
+  # rollouts, 0.47 per second at 32 m/s).
+  side_ms2: 15.0
+
 # The takeoff roll's rudder (autotakeoff::RollSteer), refitted over the three
 # LILB 03 rolls (1790712974, 1790724857 on the default law; 1790736651 on the
 # first declaration, 2026-09-29/30, calm air): three-second heading
