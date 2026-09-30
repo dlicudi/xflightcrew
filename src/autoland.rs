@@ -2735,7 +2735,7 @@ pub fn run_autoland_scoped(
                     stable_watch.step(stable_clock.elapsed().as_secs_f64(), &now_breaches)
                 {
                     stable_watch.reset();
-                    if go_around.order(on_ground > 0.5) {
+                    if go_around.order_over_gate(on_ground > 0.5, gate.gate_ft()) {
                         stable_balk = Some(breach.word());
                         stable_said = Some(breach.spoken());
                         crate::blackbox::record(
@@ -2754,6 +2754,7 @@ pub fn run_autoland_scoped(
                     stable_watch.reset();
                     gate_recorded = false;
                 }
+                go_around.note_height_aal(alt - rwy.elev_ft);
                 let mut missed = go_around.update(
                     last_phase,
                     raw.phase,
@@ -7366,7 +7367,16 @@ pub struct GoAroundLatch {
     /// pattern's downwind passes abeam it, outbound, inside the old release
     /// test's half mile on a light single.
     hold: bool,
+    /// An unstabilised go-around climbs over the gate it failed before the
+    /// approach may be judged again: feet above the runway, and the last
+    /// height read (`note_height_aal`).
+    climb_floor_aal_ft: Option<f64>,
+    height_aal_ft: Option<f64>,
 }
+
+/// Over the gate a go-around failed, feet: the next approach crosses the
+/// gate descending, never from below it.
+pub const GATE_CLIMB_MARGIN_FT: f64 = 200.0;
 
 /// Give up (level off, hand to the pilot) after this many go-arounds on one
 /// approach rather than loop a missed approach until the fuel runs out.
@@ -7441,6 +7451,27 @@ impl GoAroundLatch {
         true
     }
 
+    /// An UNSTABILISED approach's go-around: [`Self::order`], and the climb
+    /// holds until the aircraft is [`GATE_CLIMB_MARGIN_FT`] over `gate_ft`
+    /// above the runway as well as clear of the ground. SR22 LEMG 13 (iMac
+    /// 2026-09-30, 1790792031): placed diving, it failed the 1,000 ft gate
+    /// at 4 nm below the path; over the hills the radio already read 800 ft,
+    /// so the climb ended the next tick, the reposition released at once (the
+    /// path's join point ahead of an aircraft under it), the gate judged the
+    /// same final again, and three go-arounds in 8 s gave it up airborne.
+    pub fn order_over_gate(&mut self, on_ground: bool, gate_ft: f64) -> bool {
+        let started = self.order(on_ground);
+        if started {
+            self.climb_floor_aal_ft = Some(gate_ft + GATE_CLIMB_MARGIN_FT);
+        }
+        started
+    }
+
+    /// The height above the runway this tick, for the gate's climb floor.
+    pub fn note_height_aal(&mut self, aal_ft: f64) {
+        self.height_aal_ft = aal_ft.is_finite().then_some(aal_ft);
+    }
+
     /// Advance the latch one tick: `prev`/`now` are the raw guidance phases,
     /// `radio_ft` the radio altitude, `dist_nm` the distance to the threshold,
     /// `along_nm` the signed along-track (positive = approach side),
@@ -7465,8 +7496,14 @@ impl GoAroundLatch {
             // back is the leg that crosses whatever the runway points away
             // from, and releasing at 500 put the LXGB go-around eastbound at
             // the Rock with no height in hand (2026-07-22).
-            Some(MissedStage::Climb) if radio_ft >= GO_AROUND_TURN_AGL_FT => {
+            Some(MissedStage::Climb)
+                if radio_ft >= GO_AROUND_TURN_AGL_FT
+                    && self
+                        .climb_floor_aal_ft
+                        .is_none_or(|f| self.height_aal_ft.is_some_and(|h| h >= f)) =>
+            {
                 self.stage = Some(MissedStage::Reposition);
+                self.climb_floor_aal_ft = None;
             }
             // Out at the join point on the approach side: that is where an
             // approach starts, so hand back. Releasing merely OUTSIDE the FAP
@@ -10312,6 +10349,27 @@ mod tests {
         assert!((retard_reference_kts(110.0, Some(91.0)) - 98.583).abs() < 0.01);
         assert_eq!(retard_reference_kts(75.0, Some(71.0)), 75.0);
         assert_eq!(retard_reference_kts(110.0, None), 110.0);
+    }
+
+    /// SR22 1790792031: an unstabilised go-around at 914 ft over the runway
+    /// and 800 ft radio over the hills climbs on to 1,200 ft over the runway
+    /// before the reposition, where it had released the next tick.
+    #[test]
+    fn an_unstabilised_go_around_climbs_over_its_gate() {
+        let mut latch = GoAroundLatch::new();
+        assert!(latch.order_over_gate(false, 1000.0));
+        latch.note_height_aal(914.0);
+        let s = latch.update(Some(ApproachPhase::Final), ApproachPhase::Final, 820.0, 4.1, 4.1, 3.3, 0.0);
+        assert_eq!(s, Some(MissedStage::Climb));
+        latch.note_height_aal(1210.0);
+        let s = latch.update(Some(ApproachPhase::Final), ApproachPhase::Final, 1110.0, 3.9, 3.9, 4.4, 0.0);
+        assert_eq!(s, Some(MissedStage::Reposition));
+        // A tower's order keeps the old test: 800 ft radio.
+        let mut latch = GoAroundLatch::new();
+        assert!(latch.order(false));
+        latch.note_height_aal(914.0);
+        let s = latch.update(Some(ApproachPhase::Final), ApproachPhase::Final, 820.0, 4.1, 4.1, 3.3, 0.0);
+        assert_eq!(s, Some(MissedStage::Reposition));
     }
 
     /// King Air 1790787298: the arrest's level-off at 36 ft on approach
