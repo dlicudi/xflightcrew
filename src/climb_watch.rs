@@ -467,6 +467,22 @@ impl AuthorityCheck {
             return Authority::Inconclusive("gap");
         }
         self.last_t = t;
+        // Under our own column the climb is ours too: the check starts again
+        // from the release, on every branch. The takeoff flew the Citation's
+        // climb on the column for the check's first 5.5 s and "vs away from
+        // the dial" (2,789 -> 3,825 against 1,677) handed a healthy autopilot
+        // to a hand-flown recovery (LEMG 1790734216, 2026-09-30).
+        if tele.is_some_and(|p| p.ours) {
+            self.t0 = t;
+            self.vs0 = vs;
+            self.vs = vs;
+            self.hist.clear();
+            self.hist.push((t, vs));
+            self.late = None;
+            self.dials = None;
+            self.note_telemetry(tele);
+            return Authority::Pending;
+        }
         self.vs += AUTH_ALPHA * (vs - self.vs);
         self.hist.push((t, vs));
         self.hist.retain(|(ht, _)| t - ht <= SLOPE_SPAN_S + 2.0);
@@ -1096,6 +1112,21 @@ mod tests {
             }
         }
         assert_ne!(out, Authority::NoAuthority("elevator_not_following_servo"));
+    }
+
+    /// The climb flown under our own column is not the autopilot's: a VS
+    /// running away from the dial while the takeoff holds the column is no
+    /// verdict, and the check starts again at the release (LEMG Citation
+    /// 1790734216: 2,789 -> 3,825 fpm against a 1,677 dial in 5.5 s).
+    #[test]
+    fn a_climb_under_our_own_column_is_no_verdict() {
+        let ours = Some(PitchTelemetry { servo: Some(-0.041), elev_deg: Some(-0.97), total: None, ours: true });
+        let mut c = AuthorityCheck::new(0.0, 2_789.0, ours);
+        for i in 1..=24 {
+            let t = i as f64 * 0.5;
+            let v = c.step(t, Some(2_789.0 + 90.0 * i as f64), Some(1_677.0), ours);
+            assert_eq!(v, Authority::Pending, "t {t}");
+        }
     }
 
     /// A gap in the feed (a pause, a loop that stopped) is no verdict; a
