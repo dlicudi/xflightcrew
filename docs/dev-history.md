@@ -12131,3 +12131,94 @@ Next flights: `stable_gate` `verdict` stable on every normal final (the 737's `i
 under 170 with `landing_flap` true); an `unstabilised` only where the final was; `arrival_slowdown`
 before a full-auto arrival and autoland's first tick near the clean approach speed; a go-around's
 `power` ticks leaving 1.0 by 400 ft radio and its IAS under 250. Offline only.
+
+## 2026-09-30: one ground law for a free castoring nose (#165, #196)
+
+Every free-nose failure had grown its own mechanism: the swing catch, the turn builder, the led
+rate ceiling and its span, the walking authority, the wrong-way pivot brake, the 12 m corner aim
+floor, the aligning PD, the rollout's declared split and trim. The flights still failed by about a
+metre (iMac 2026-09-30: the SR22's LEMG taxi 3.6 m in 1790764128, the Evolution's LILB backtrack
+4.0 m and rollout 8.3 m in 1790762771). They are replaced by one controller designed from an
+identified plant (`src/ground_steer.rs`), used by the taxi drive, the line-up's aligning pivot, the
+roll's start and the rollout wherever `aircraft::nose_free()` (SR22, Evolution, RV-10). Jets and
+every nose that steers (the SF50 castors but steers) are byte-identical.
+
+The plant, fitted jointly by output error on every drive tick of 2026-09-29/30 (SR22: 20 drives,
+25,403 ticks; Evolution: 16 drives, 5,373 ticks; 2.4 s windows, the yaw rate recovered from the
+logged EMA) and the rollouts' own heading (SR22 21, Evolution 2; 2.3 s windows):
+`rdot = Kb(v) u + Kr v^2 d - D(v) r - Kv(v) (psi - track) + w`, `trackdot = (side / v)(psi -
+track)`, `Kb = brake v/(v + from) max(1 + per v, 0.2)`, `D = damp + damp_per v`, `Kv = vane
+(v/30)^2`. SR22 122, 0.1, 0.015, 0.11, 0.127, rudder 0.03, vane 16.8, side 30; Evolution 109, 0.2,
+-0.154, 0.218, 0.043, 0.26, 6.8, 15 (profile `ground_plant:`, the RV-10 flies the SR22's). Per
+speed bin the SR22's brake is 112 to 118 deg/s^2 per unit from 0.35 to 4.5 m/s. The drive's delay
+is its tick and under 0.1 s more: the older "0.45 s transport delay" was the drive's own yaw EMA
+and its 0.4 s brake smoothing. The rollout's loop writes about 0.4 s after its read (1.19 degrees
+rms against 1.72 with none). A braked wheel drags 6.0 m/s^2 per unit (SR22), 4.0 (Evolution). The
+standing yaw is about -0.8 deg/s^2 (SR22) and -1.2 to -1.7 (Evolution) at taxi power, learnt in
+flight.
+
+The controller: the route's CHORD across the span the aim and the declared corner rate need
+(`chord_m`: a right angle swept inside `taxi.max_yaw_dps`) centred the inner loop's lag ahead is the
+reference heading, its turn per metre times the speed fed forward, the lateral closed at
+`atan(y / L)` (`L = 2 v / k`, floored 8 m); a heading loop `r = ff + k e`, `k = 1 / (2 (T_r + T /
+2))`, a braking curve and a slew at half the brake's authority, bounded by the declared corner rate
+or half the rate the wheels hold (to 38 deg/s, the most any drive on file turned); a yaw-rate loop
+that inverts the plant over the tick (zero-order hold, closure in `max(1.5 T, 0.6)` s) on a
+first-order model matched to the plant with its weathervane at that crossover; a Smith step over
+the loop's delay; a disturbance observer for `w` (3 s, halved once the vane's slow mode passes the
+wheels' damping). The rudder is allocated first on the taxi; the roll's and the rollout's rudder is
+theirs, left to the observer. Margins, loop broken at the wheel difference on the plant with its
+vane, brake 0.7 to 1.3, 0.3, 0.45 and 0.6 s ticks: taxi gain margin 2.39 and more, phase 39 and
+more (0 to 0.2 s of unmodelled delay); roll start 2.47, 48; rollout SR22 2.84, 50, Evolution 1.78,
+40.
+
+Two path layers were tried and dropped on the replay: fillets fitted to every vertex steered the
+paint's own scatter (10 to 40 m off), and a pursuit angle less half the span's turn read a corner at
+the far end of its span as a turn the OTHER way (a replayed LEMG corner asked +95 degrees against a
+fed-forward 70 deg/s left). A rate cap at the declared 20 deg/s alone flew corners entered fast
+wide (6 to 10 m); the wheels' headroom brings them back.
+
+The replay (`free_nose_replay`, ignored, over the blackbox): every recorded free-nose drive, line-up
+alignment, roll start and rollout, the law as on main at 776a820 against the new, on the identified
+plant with its brake at 0.7, 1.0 and 1.3, worst lateral on the scorer's scale. At LEMG a drive's route
+is also planned again on the install's network and flown where it fits the logged lateral better
+(two drives). At 1.0:
+- SR22 LEMG taxis (7): old 2.4 to 5.9, new 2.2 to 2.9 (worst over the neighbours old 8.5, new 3.3);
+  corners over 3 m, of 190 on every drive: flown 116, old 43, new 30.
+- SR22 line-up drives (7): old 1.2 to 1.4, new 0.5 to 0.7.
+- Evolution single-corner legs (6): old 2.7 to 3.4, new 1.5 to 1.8; line-up drives (9): old 4.2 to
+  16.2, new 0.9 to 4.5.
+- Evolution turn-round legs whose route doubles back (1790712974, 1790720549, 1790721973; flown 14.2
+  to 16.3): old 11.5, 16.9, 15.2, new 35.2, 11.4, 17.0. No law flies them; the new one's worst is
+  larger.
+- Alignments (13): as good; the Evolution's 1790762771 timed out at 18.4 degrees under the old PD
+  and aligns in 8 s.
+- Roll starts (22): as good or better (SR22 1790690995 2.9 to 0.5), the Evolution's 1790712974 4.0
+  to 5.5 (flown 6.9).
+- Rollouts (26): most within 0.2 m; better on the Evolution (1790740292 5.0 to 3.4, 1790762771 3.6
+  to 2.8, 1790781114 2.7 to 2.0), worse on SR22 1790694457 (6.5 to 7.6) and four SR22 rollouts by
+  0.5 to 1.0 m (under 2.1). On #166's wheel plant (`lemg13_sr22_rollout_split_tests`, the plant that
+  gives back both flown rollouts within 0.1 m) 1790689843 with the bounce held is 8.2 m against the
+  retired declared split's 4.8 (fitted on that replay) and the shared law's 7.3: the heading loop,
+  sized for the 0.4 s delay, follows the lateral's target 2 to 4 degrees behind for 6 s. The rollout
+  is the manoeuvre to watch.
+
+Retired: `FREE_NOSE_MIN_KTS`/`FULL_KTS` and `brake_steer_split_band`, `FREE_NOSE_RATE_*`,
+`led_yaw_dps`, `free_nose_rate_scale`, `SWING_CATCH_*`, `WALK_*`, `TURN_BUILD_*`,
+`PIVOT_WRONG_WAY_*`, `pivot_wrong_way_brake`, `FREE_NOSE_AIM_FLOOR_M`, `corner_aim_floor_m` (a
+nosewheel that steers keeps `steer_look_m`'s old answer), the free nose's aligning PD, profile
+`rollout_brakes:` (`RolloutBrakesProfile`, its gain schedule and 0.15 trim). Tests that pinned a
+retired mechanism or an older plant fit went with it (the SR22 brake plant, the refit plant, the
+swing catch, the walking turn builder, the inside-brake timing, the building swing, the shorter
+corner aim, the split's gain schedule, the steered-down walking nose); the corner tests fly the new
+law on the identified plant and its neighbours (`the_identified_plant_replays_the_recorded_corners`,
+the LEMG corners, the walking corner, the 12 vertex, the ramp corner), and `ground_steer`'s own
+(heading step on every plant, tick and delay; the walking reversal; the standing yaw; the mean rate;
+the stop; the right-angle corner).
+
+Blackbox: the drive's record gains `gsteer` (`r_ref`, `r_now`, `w_hat`, `diff`, `e_ref`, `ff`,
+`r`), the rollout's `gsteer` (`r_ref`, `r_now`, `w_hat`, `diff`). Next
+flights: the SR22 and Evolution taxis inside 3 m at every corner (`lat_m`, `gsteer` `r_now`
+following `r_ref` within a few deg/s, `w_hat` settling near -1); the line-up pivot aligned without a
+time give-up; the roll's `bl`/`br` quiet by 25 kt; every rollout's `xtk_m` against 1790689843's
+9.1 and 1790694457's 11.0. Offline only.

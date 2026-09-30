@@ -278,43 +278,33 @@ rotate_elevator:
   air_base: -0.06
   ground_effect_ft: 20.0
 
-# The rollout's brake split (autoland::RolloutBrakeSteer), fitted to LEMG 13
-# 2026-09-29 (sortie 1790689843-approach, calm, the iMac's 0.46 s loop): the
-# wheel difference turns the nose 15 to 30 deg/s per unit after 0.5 to
-# 0.6 s, the rudder at idle next to nothing, and above 40 kt the windmilling
-# propeller yaws it right at about 1.3 deg/s. The shared law (0.03 per
-# degree, no trim) held that off only 3 degrees right of its target: 0.08 of
-# difference for ten seconds from 75 kt and 1.2 m to 9.1 m right of the
-# centreline. More gain rings through the delay at this tick (0.06 per degree
-# swung +/-4 degrees in the replay), so the gain comes down a little, the
-# lead covers the delay plus half a tick, and a trim learns the standing
-# split: replayed through the record, 2.5 m at the fitted plant and 2.3 to
-# 3.4 m at 10 to 35 deg/s per unit and 0.4 to 0.8 s of delay, and the
-# 2026-09-28 rollout (#166) inside 2.9 m from 10 to 90.
-#
-# Flown so (LEMG 13 1790694457, 2026-09-29): 9.4 m, and below 35 kt the
-# split went wheel to wheel at 0.39 every tick, the nose +/-7 degrees. Both
-# rollouts had latched on a bounce (the latch now leaves the brakes off in
-# the air, autoland `BounceHold`), so the fit above was mostly air. On the
-# wheels alone (both sorties' ground ticks, two-tick predictions of heading
-# and track): 45 deg/s per unit after 0.4 to 0.5 s, the nose weathervaning
-# onto the track at 2 to 6 per second at 60 kt (as v^2), the track following
-# the nose at 2 to 3 per second. Nothing damps the heading at taxi speed but
-# the law, so the gain follows the speed (0.02 per degree at 40 kt, 0.4 of
-# it at 16 kt and under, 1.5 times at 60 and over) and the lead's rate is
-# smoothed over 0.25 s. Replayed (air phase flown by the arrest's wings, no
-# brake): 1790689843 4.5 m (4.2 to 5.0 over the fitted plants), 1790694457
-# 7.6 m (the bounce's own drift before the wheels), its ground heading span
-# 4.5 to 7.5 degrees where the old numbers swung 10 to 22.
-rollout_brakes:
-  per_deg: 0.02
-  lead_s: 0.8
-  rate_tau_s: 0.25
-  gain_ref_kts: 40.0
-  gain_min: 0.4
-  gain_max: 1.5
-  trim_per_s: 0.6
-  trim_max: 0.15
+# The ground plant of the free castoring nose (ground_steer, the one law
+# for the taxi, the line-up's pivot, the roll's start and the rollout):
+# identified 2026-09-30 by output error, jointly, over 2.4 s windows of all
+# 25,403 drive ticks of the six LEMG taxis on the iMac (1790690995 to
+# 1790764128; the yaw rate recovered from the drive's EMA) and 2.3 s windows
+# of the 21 rollouts' own heading (the rollout's loop writing 0.4 s after its
+# read): 0.72 deg/s rms on the taxi, 1.28 degrees on the rollouts (the taxi
+# alone 0.73 and 1.50). Per speed bin the wheel difference yaws the nose 112
+# to 118 deg/s^2 per unit from 0.35 to 4.5 m/s (half of it at 0.1 m/s), and
+# the yaw dies at 0.21 per second at 0.5 m/s to 0.64 at 6: a swing at a walk
+# lasts seconds. The tail weathervanes at 16.8 deg/s^2 per degree of slip at
+# 30 m/s, the rudder is small (0.03 per (m/s)^2), the propeller's pull about
+# -0.8 deg/s^2 (learnt in flight, never declared), the drive's delay past
+# its tick under 0.1 s, the brake's drag 6 m/s^2 per unit. Replaces
+# rollout_brakes: (the split's gain schedule, lead and trim, LEMG 13
+# 1790689843 and 1790694457, 2026-09-29).
+ground_plant:
+  brake_dps2: 122.0
+  brake_from_ms: 0.1
+  brake_per_ms: 0.015
+  damp: 0.11
+  damp_per_ms: 0.127
+  rudder_per_ms2: 0.03
+  vane_dps2: 16.8
+  # The track follows the nose at this over v per second of slip (the
+  # rollouts' trk against psi: 3.3 at 11 m/s, 1.6 at 20, 0.7 at 32).
+  side_ms2: 30.0
 
 checklist: checklists/cirrus_sr22.txt
 

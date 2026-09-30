@@ -354,96 +354,59 @@ impl ArrestRollProfile {
     }
 }
 
-/// The rollout's differential brake on a castoring nosewheel
-/// (`autoland::RolloutBrakeSteer`), when the shared law does not fit. Each
-/// number left out is the shared law's (0.03 per degree, 0.8 s of lead, no
-/// trim), so an airframe that declares nothing flies it unchanged.
+/// The yaw plant of a free castoring nose (`ground_steer::GroundPlant`),
+/// identified from the airframe's own ground ticks: the one ground law's
+/// model for the taxi, the line-up, the roll's start and the rollout
+/// (`ground_steer`). `rdot = Kb(v) u + rudder v^2 d - D(v) r - Kv(v) slip + w`,
+/// with `Kb(v) = brake_dps2 v / (v + brake_from_ms) max(1 + brake_per_ms v,
+/// 0.2)`, `D(v) = damp + damp_per_ms v` and `Kv(v) = vane_dps2 (v / 30)^2`,
+/// the track following the nose at `side_ms2 / v` per second (v in m/s,
+/// degrees). Undeclared, the SR22's.
 ///
-/// LEMG 13 (sortie 1790689843-approach, 2026-09-29, the SR22 on the iMac at
-/// a 0.46 s loop): fitted over the rollout, the split turns the nose 15 to
-/// 30 deg/s per unit of wheel difference after 0.5 to 0.6 s, and above 40 kt
-/// the idle, windmilling propeller (torque -110 to -20 ft-lb) yaws it right
-/// at about 1.3 deg/s that the rudder, at idle, does not answer. A split
-/// proportional to the heading error holds that off only at a standing
-/// error: the nose sat 3 degrees right of the target for ten seconds from
-/// 75 kt with 0.08 of difference, and the aircraft rolled from 1.2 m to
-/// 9.1 m right. The trim learns the standing split.
-///
-/// Flown so (LEMG 13 1790694457, 2026-09-29) and read again with the
-/// wheels: both rollouts had latched on a bounce, so the fit above was
-/// mostly air. On the wheels alone the difference turns the nose about
-/// 45 deg/s per unit after 0.4 to 0.5 s at every speed, the nose weathervanes
-/// onto the track at 2 to 6 deg/s per degree (as the square of the speed,
-/// quoted at 60 kt) and the track follows the nose at 2 to 3 per second. At
-/// 0.025 per degree with 1.2 s of lead on the raw error the split went wheel
-/// to wheel at 0.39 every tick below 35 kt, the nose +/-7 degrees: nothing
-/// damps the heading at taxi speed but the law. So the gain is scheduled on
-/// the speed (`gain_ref_kts`, `gain_min`, `gain_max`) and the lead's rate
-/// is smoothed (`rate_tau_s`).
+/// It replaces the SR22's `rollout_brakes:` (the split's gain schedule, lead
+/// and trim fitted to LEMG 13 1790689843 and 1790694457, 2026-09-29): the
+/// rollout's brake difference is now the plant inverted, the trim the
+/// disturbance observer.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
-pub struct RolloutBrakesProfile {
-    /// Wheel difference per degree of heading error.
-    #[serde(default)]
-    pub per_deg: Option<f64>,
-    /// Seconds of the error's rate led in (the channel's delay plus half a
-    /// tick).
-    #[serde(default)]
-    pub lead_s: Option<f64>,
-    /// The trim's corner, per second of the same gain: the trim moves
-    /// `per_deg * trim_per_s` of difference per degree-second of error.
-    #[serde(default)]
-    pub trim_per_s: Option<f64>,
-    /// The trim's limit, units of wheel difference.
-    #[serde(default)]
-    pub trim_max: Option<f64>,
-    /// The error's rate for the lead is smoothed over this, seconds (`None`
-    /// the raw tick-to-tick difference).
-    #[serde(default)]
-    pub rate_tau_s: Option<f64>,
-    /// The gain (and the trim's rate) is `per_deg` at this groundspeed and
-    /// scales with it, knots (`None` the same gain at every speed)...
-    #[serde(default)]
-    pub gain_ref_kts: Option<f64>,
-    /// ...never under this share of it...
-    #[serde(default)]
-    pub gain_min: Option<f64>,
-    /// ...nor over this.
-    #[serde(default)]
-    pub gain_max: Option<f64>,
+pub struct GroundPlantProfile {
+    /// Yaw acceleration per unit of wheel difference, deg/s^2.
+    pub brake_dps2: f64,
+    /// The brake's authority is half at this groundspeed, m/s.
+    pub brake_from_ms: f64,
+    /// ...and changes by this share per m/s above it (never under a fifth).
+    pub brake_per_ms: f64,
+    /// Yaw damping at a standstill, 1/s...
+    pub damp: f64,
+    /// ...plus this per m/s.
+    pub damp_per_ms: f64,
+    /// The rudder, deg/s^2 per unit per (m/s)^2.
+    pub rudder_per_ms2: f64,
+    /// The weathervane, deg/s^2 per degree of slip at 30 m/s.
+    pub vane_dps2: f64,
+    /// The side force the track follows the nose on, m/s^2 per radian.
+    pub side_ms2: f64,
 }
 
-impl RolloutBrakesProfile {
-    /// Each number kept only when it is a sane one.
-    pub fn valid(self) -> Self {
-        Self {
-            per_deg: self.per_deg.filter(|v| (0.005..=0.1).contains(v)),
-            lead_s: self.lead_s.filter(|v| (0.0..=3.0).contains(v)),
-            trim_per_s: self.trim_per_s.filter(|v| (0.05..=2.0).contains(v)),
-            trim_max: self.trim_max.filter(|v| (0.0..=0.3).contains(v)),
-            rate_tau_s: self.rate_tau_s.filter(|v| (0.0..=2.0).contains(v)),
-            gain_ref_kts: self.gain_ref_kts.filter(|v| (10.0..=150.0).contains(v)),
-            gain_min: self.gain_min.filter(|v| (0.1..=1.0).contains(v)),
-            gain_max: self.gain_max.filter(|v| (1.0..=3.0).contains(v)),
-        }
-    }
-
-    /// The share of `per_deg` flown at this groundspeed: 1 without a
-    /// declared `gain_ref_kts`.
-    pub fn gain_share(&self, gs_kts: f64) -> f64 {
-        match self.gain_ref_kts {
-            Some(r) if gs_kts.is_finite() => {
-                (gs_kts / r).clamp(self.gain_min.unwrap_or(1.0), self.gain_max.unwrap_or(1.0))
-            }
-            _ => 1.0,
-        }
+impl GroundPlantProfile {
+    /// Used only when every number is a sane one.
+    pub fn valid(self) -> Option<Self> {
+        ((10.0..=600.0).contains(&self.brake_dps2)
+            && (0.0..=2.0).contains(&self.brake_from_ms)
+            && (-0.5..=0.5).contains(&self.brake_per_ms)
+            && (0.0..=3.0).contains(&self.damp)
+            && (0.0..=1.0).contains(&self.damp_per_ms)
+            && (0.0..=5.0).contains(&self.rudder_per_ms2)
+            && (0.0..=100.0).contains(&self.vane_dps2)
+            && (1.0..=200.0).contains(&self.side_ms2))
+        .then_some(self)
     }
 }
 
-/// The live airframe's rollout brake law, when declared.
-pub fn rollout_brakes() -> Option<RolloutBrakesProfile> {
+/// The live airframe's ground plant, when declared and sane.
+pub fn ground_plant() -> Option<GroundPlantProfile> {
     live_profile()
-        .and_then(|p| p.rollout_brakes)
-        .map(RolloutBrakesProfile::valid)
+        .and_then(|p| p.ground_plant)
+        .and_then(GroundPlantProfile::valid)
 }
 
 /// How the speed governor leads this airframe's engines
@@ -756,9 +719,9 @@ pub struct AircraftProfile {
     /// The bank's answer to the roll channel in the arrest, when fitted.
     #[serde(default)]
     pub arrest_roll: Option<ArrestRollProfile>,
-    /// The rollout's differential brake on a castoring nosewheel, when fitted.
+    /// The yaw plant of a free castoring nose (`ground_steer`), when fitted.
     #[serde(default)]
-    pub rollout_brakes: Option<RolloutBrakesProfile>,
+    pub ground_plant: Option<GroundPlantProfile>,
     /// The speed governor's lead on this airframe's engines, when fitted.
     #[serde(default)]
     pub speed_governor: Option<SpeedGovernorProfile>,
@@ -3829,16 +3792,6 @@ mod tests {
                 "BETA_BITING_KTS_S",
                 "slowing this fast, a beta depth has bitten: hold it (any turboprop taxi)",
             ),
-            (
-                "autotaxi",
-                "FREE_NOSE_MIN_KTS",
-                "a nose with no steering of its own (from the .acf) is brake-steered from walking pace",
-            ),
-            (
-                "autotaxi",
-                "FREE_NOSE_FULL_KTS",
-                "...and fully by this",
-            ),
             // --- Handling conventions, flown the same in anything ---
             (
                 "autotakeoff",
@@ -5375,7 +5328,7 @@ fn cessna_172sp() -> AircraftProfile {
         roll_rudder: None,
         rotate_elevator: None,
         arrest_roll: None,
-        rollout_brakes: None,
+        ground_plant: None,
         speed_governor: None,
         cabin_air: None,
         pressurised: Some(false),
@@ -5705,7 +5658,7 @@ fn cirrus_sr22() -> AircraftProfile {
         roll_rudder: None,
         rotate_elevator: None,
         arrest_roll: None,
-        rollout_brakes: None,
+        ground_plant: None,
         speed_governor: None,
         cabin_air: None,
         pressurised: Some(false),

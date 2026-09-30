@@ -165,6 +165,8 @@ lights:
 # castor from the .acf anyway; declared here so the file says it (LILB
 # 2026-09-25: full rudder turned the Evolution 3.7 degrees a second at 6 kt
 # and it left the route three times).
+# No ground_plant: of its own yet (one rollout on file, 1790757896, too few
+# ticks to fit): the free nose flies the SR22's plant (ground_steer).
 taxi:
   steer_full_deg: 42.0
   steer_slew_per_s: 0.8

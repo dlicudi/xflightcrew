@@ -40,6 +40,10 @@ mod flightplan;
 mod flow;
 mod full_auto;
 mod go_around;
+mod ground_steer;
+// Test-only (the file's own `#![cfg(test)]`): an outer test attribute here
+// would end the source `sortie_runner::code_of` reads.
+mod free_nose_replay;
 mod grammar;
 mod health;
 mod heli_circuit;

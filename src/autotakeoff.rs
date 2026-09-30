@@ -1276,11 +1276,55 @@ fn squawk_altitude(base_url: String, v: Option<Voice>, audit: bool) {
 /// steering at all; the heading error grew from 8 to 27 degrees with the
 /// channel at full deflection until the pilot took the pedals at 21 kt.
 pub fn roll_brake_split(steer: f64, gs_kts: f64) -> (f64, f64) {
-    let fade = ((ROLL_BRAKE_OFF_KTS - gs_kts) / (ROLL_BRAKE_OFF_KTS - ROLL_BRAKE_FULL_KTS))
-        .clamp(0.0, 1.0);
+    let fade = roll_brake_fade(gs_kts);
     let (l, r) = crate::autotaxi::brake_steer_split(steer, gs_kts);
     (l * fade, r * fade)
 }
+
+/// The share of the roll's brake steering left at `gs_kts`: whole below
+/// [`ROLL_BRAKE_FULL_KTS`], none above [`ROLL_BRAKE_OFF_KTS`] (a brake on
+/// the roll costs the acceleration; the rudder steers there). Pure.
+pub fn roll_brake_fade(gs_kts: f64) -> f64 {
+    ((ROLL_BRAKE_OFF_KTS - gs_kts) / (ROLL_BRAKE_OFF_KTS - ROLL_BRAKE_FULL_KTS)).clamp(0.0, 1.0)
+}
+
+/// The roll's brakes on a FREE castoring nose (`aircraft::nose_free`): the
+/// one ground law (`ground_steer`) on the roll's heading target, the roll's
+/// rudder a known input, its wheel difference faded out with the speed
+/// ([`roll_brake_fade`]) and no faster a turn than the aligning pivot's
+/// while the power waits ([`RollAlign`]). It replaces the aligning PD and
+/// its trim ([`roll_brake_split_aligning`], [`RollAlign::trimmed`]) and the
+/// taxi split below 40 kt on these noses: the SR22 at LEMG 12 and the
+/// Evolution at LILB 03 (2026-09-29/30) pirouetted +/-12 degrees and held
+/// 4 to 5 degrees off on them. Pure.
+pub fn free_roll_brakes(
+    law: &mut crate::ground_steer::GroundSteer,
+    err_deg: f64,
+    yaw: crate::ground_steer::Yaw,
+    rudder: f64,
+    gs_kts: f64,
+    dt: f64,
+    holding: bool,
+) -> (f64, f64) {
+    let r_max = if holding {
+        crate::autotaxi::ALIGN_RATE_MAX_DPS
+    } else {
+        crate::ground_steer::DEFAULT_MAX_YAW_DPS
+    };
+    law.step(crate::ground_steer::heading_demand(
+        dt,
+        gs_kts / MS_TO_KTS,
+        yaw,
+        err_deg,
+        crate::ground_steer::Rudder::Given(rudder),
+        FREE_ROLL_DIFF_MAX * roll_brake_fade(gs_kts),
+        r_max,
+    ))
+    .wheels()
+}
+/// The most wheel difference the roll's brakes use on a free nose (the
+/// pivot's own).
+const FREE_ROLL_DIFF_MAX: f64 = 0.45;
 
 /// [`roll_brake_split`], plus the start of a roll that begins crooked: below
 /// [`ROLL_ALIGN_KTS`] a heading error past [`ROLL_ALIGN_ERR_DEG`], or a swing
@@ -3604,6 +3648,9 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, p: Params) {
     // The power waits for the nose on a brake-steered airframe
     // ([`RollAlign`]); held from the first tick until the first read says.
     let mut roll_align = RollAlign::default();
+    // A free castoring nose's roll brakes: the one ground law.
+    let mut roll_ground =
+        crate::aircraft::nose_free().then(crate::ground_steer::GroundSteer::for_airframe);
     let mut align_hold = brake_steer;
     let mut last_tick: Option<std::time::Instant> = None;
     let roll_start = std::time::Instant::now();
@@ -3920,7 +3967,19 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, p: Params) {
                     }
                 }
             }
-            let (bl, br) = if brake_steer && !rotated {
+            let (bl, br) = if brake_steer && !rotated && roll_ground.is_some() {
+                let law = roll_ground.as_mut().expect("checked");
+                let yaw = match yaw_dps {
+                    Some(r) => crate::ground_steer::Yaw::Now(r),
+                    None => crate::ground_steer::Yaw::Mean(align_yaw),
+                };
+                let split = free_roll_brakes(law, err, yaw, steer, gs_kts, dt, align_hold);
+                if align_hold {
+                    with_hold_brake(split, hold_brake)
+                } else {
+                    split
+                }
+            } else if brake_steer && !rotated {
                 let split = roll_brake_split_aligning(steer, gs_kts, err, align_yaw);
                 if align_hold {
                     let split = roll_align.trimmed(split, err, align_yaw, gs_kts, dt);
