@@ -11719,3 +11719,61 @@ Next SR22 taxi: at a corner flown under 2 kt, `autotaxi` `drive` `bl`/`br` on th
 to 0.12 while `err` is past 25 and `yaw_dps` is not yet toward it, the yaw coming round within 1 to
 2 s; `stage_result` taxi `max_lat_m` under 3; the Evolution's `drive` ticks likewise (its line-up
 turn-round is another agent's). Offline only.
+
+## 2026-09-30: a failed line-up never rolls; the turn-round keeps its wheels on the strip; the roll hold holds (#45)
+
+iMac 2026-09-30, sortie 1790732094-full_auto, Lancair Evolution, LILB ramp circuit (03, 601 m of
+15 m pavement). Three faults in one line-up:
+- **The backtrack's turn-round failed and full auto rolled anyway.** Leg one stopped 15.5 m down and
+  6.51 m right (the pocket 5.5 m off, `PIVOT_POCKET_EDGE_M` 2), the outer main wheel about 8.1 m out
+  against the 7.5 m edge. Leg two began at 0.1 kt with steer +0.35 to +0.44 and both brakes off
+  (the pivot's split has authority from 1 kt, `d28e8f4`'s swing catch from 1 kt and 8 deg/s): the
+  nose went LEFT at up to 6.8 deg/s for 8 s, 33 degrees the wrong way, stuck with gs 0 for 6 s while
+  the governor wound the lever 0.16 to 0.33 (trq 453), broke away, and the pivot ran at 9.5 kt to
+  8.8 m off the far edge. The drive ended `stopped_off_line` 5.6 m off, 12.4 degrees crooked ("Holding
+  here. Your steering."); 2 s later full auto logged `lined_up`, said "Lined up. Flying the circuit."
+  and rolled: the only gate was `runway_check`, whose fit takes 40 m and 20 degrees, and the drive's
+  own verdict was never asked. The flight before (1790724857) stopped leg one 5.1 m off, reached 1 kt
+  in 3 s and its pivot took the right brake at once. `d28e8f4`'s catch and instant release did not act
+  in the failing seconds; the pocket and the sub-knot start did.
+- **The roll hold let go on speed.** `RollAlign` held the lever at 0.3; the PT6 at 300 to 330 ft-lb
+  ran the aircraft 0.2 to 6.6 kt in 5 s while the pivot took the nose 16.6 to 4.4 degrees off its
+  target, and the 6 kt gate let the power up (`roll_aligned` held_s 5.06, err 4.4); the roll diverged
+  to 7.7 degrees and rejected at 68 kt, 9.4 m off.
+
+The fix:
+- **Full auto judges the line-up** (`full_auto::judge_lined_up`, `lined_up_check`, blackbox
+  `full_auto` `line_up_check`, `line_up_missed`): a drive we started that did not arrive
+  (`autotaxi::LAST_ARRIVED`, `drive_gen`), more than half the width less 4 m off the centreline (2 to
+  5 m), or 10 degrees off the runway is not lined up. Said ("Not lined up: 6 metres off the
+  centreline and 12 degrees off the runway. Lining up again."), once more from where it stopped, then
+  `line_up_failed` parked.
+- **A line-up from ON the strip pointing down it settles** (`autotaxi::on_strip_settle_path`, first
+  in `pick_line_up_plan`): a backtrack's leg two from there. From the failed stop it leaves the 500 m
+  fit where the hold-short geometry would not.
+- **The pocket's edge margin is 3.5 m** (half a GA track and the pocket leg's metre): 4 m off on
+  LILB's strip, the outer wheel 6.6 m out with the same error.
+- **A free nose's pivot that turns the wrong way is braked round at any pace**
+  (`PIVOT_WRONG_WAY_DPS` 1.5, to `PIVOT_WRONG_WAY_MAX` 0.3 over 4 deg/s more, the steer-side wheel).
+- **The roll hold holds the aircraft** (`RollAlign::creep`, `trimmed`): a 2 kt creep, over 3 kt the
+  lever idle and both brakes on (0.15 plus 0.1 per knot, to 0.45), the line-up's standing-yaw trim
+  (`autotaxi::align_trim_step`); speed never lets the power up (only a roll that starts past 6 kt is
+  the roll law's); held past 10 kt, or 20 s, a reject on the ground.
+
+Tests: `a_line_up_the_drive_did_not_finish_never_rolls`,
+`a_turn_round_that_swings_the_wrong_way_under_a_knot_is_braked_round` (the logged leg two),
+`a_turn_round_pocket_keeps_the_outer_wheel_on_the_pavement`,
+`a_line_up_from_on_the_strip_settles_onto_the_centreline`,
+`a_roll_hold_holds_the_aircraft_and_never_lets_go_on_speed` (the logged roll ticks),
+`a_roll_hold_creeps_the_nose_straight_before_the_power` (closed on the yaw plant with the flown
+speeds and a standing yaw; the flown law lets go at 6 kt still off).
+
+Not addressed: the governor's breakaway (the lever wound to 0.33 on a stuck wheel, then a 9.5 kt
+surge) and the pocket leg overrunning its pocket by 9.5 m at the backtrack's 13 kt.
+
+Next Evolution backtrack at LILB 03: `autotaxi` `backtrack_turn` `from_ct_m` near 4 to 5 (not 6.5);
+leg two `drive` `br` on while `yaw_dps` runs against a positive `steer` under 1 kt, no `gs` over about
+5 in the turn; `full_auto` `line_up_check` `verdict` Ok before `lined_up`, or `line_up_missed` then a
+second line-up; `autotakeoff` `roll` `hold_brake` over 0.15 whenever `gs` passes 3 with `align_hold`,
+`thr` 0 there, `gs` under about 3.5 until `roll_aligned` with `err` under 2 (no more `gs` 6.5), or
+`not_aligned` and a reject at walking pace. Offline only.

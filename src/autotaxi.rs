@@ -359,6 +359,12 @@ pub fn driving() -> bool {
     ACTIVE.load(Ordering::Relaxed) || BACKTRACKING.load(Ordering::Relaxed)
 }
 
+/// How many drives have started: a caller compares it across a tool call to
+/// know whether [`LAST_ARRIVED`] is about a drive it asked for.
+pub fn drive_gen() -> u64 {
+    DRIVE_GEN.load(Ordering::SeqCst)
+}
+
 /// Whether the LAST drive ended by ARRIVING at its stop (vs a handback,
 /// arrest, or off-route stand-down). The backtrack supervisor reads this to
 /// decide whether leg two may begin — any other ending already spoke and
@@ -1228,6 +1234,29 @@ pub fn turn_build_brake(err_deg: f64, yaw_dps: f64, gs_kts: f64) -> f64 {
     ((want - toward) / TURN_BUILD_FULL_DPS).clamp(0.0, 1.0) * TURN_BUILD_MAX * walk_authority(gs_kts)
 }
 
+/// A free nose's PIVOT that turns the wrong way (the yaw against the steer)
+/// gets the steer-side wheel at any pace: from past this yaw rate, growing
+/// to [`PIVOT_WRONG_WAY_MAX`] over [`PIVOT_WRONG_WAY_SPAN_DPS`] more. The
+/// pivot's own split has authority only from 1 kt and the swing catch from
+/// 1 kt and 8 deg/s, so a turn-round that starts under a knot is the
+/// propeller's. LILB 03 Evolution (1790732094, 2026-09-30): leg two began at
+/// 0.1 kt, steer +0.35 to +0.44 (the committed right turn toward the
+/// centreline) with both brakes off, and the nose went LEFT at up to 6.8
+/// deg/s for 8 s at 0.1 to 0.4 kt, 33 degrees the wrong way with the outer
+/// wheel carried into the grass; there it stuck, the governor wound the
+/// lever to 0.33 to break away, and the turn ran at 9.5 kt to 8.8 m off the
+/// far edge. The flight before (1790724857) reached 1 kt in 3 s and its
+/// pivot took the right brake at once.
+pub const PIVOT_WRONG_WAY_DPS: f64 = 1.5;
+pub const PIVOT_WRONG_WAY_SPAN_DPS: f64 = 4.0;
+pub const PIVOT_WRONG_WAY_MAX: f64 = 0.3;
+
+/// The brake [`PIVOT_WRONG_WAY_DPS`] puts on a wrong-way pivot. Pure.
+pub fn pivot_wrong_way_brake(yaw_dps: f64) -> f64 {
+    ((yaw_dps.abs() - PIVOT_WRONG_WAY_DPS) / PIVOT_WRONG_WAY_SPAN_DPS).clamp(0.0, 1.0)
+        * PIVOT_WRONG_WAY_MAX
+}
+
 /// The brake half of the taxi steering on a castoring nose, one tick: the
 /// taxi split on the smoothed steer, the pivot's split past
 /// [`PIVOT_MIN_ERR_DEG`] at walking pace, both under the turn-rate ceiling
@@ -1284,6 +1313,16 @@ impl BrakeSteer {
         };
         let k = pivot_rate_scale(if pivot { steer } else { self.smoothed }, yaw_dps);
         let (mut wl, mut wr) = (wl * k, wr * k);
+        // A PIVOT turning the wrong way at walking pace: the steer-side wheel,
+        // whatever the speed ([`PIVOT_WRONG_WAY_DPS`]).
+        if free_nose && pivot && steer * yaw_dps < 0.0 {
+            let b = pivot_wrong_way_brake(yaw_dps);
+            if steer > 0.0 {
+                (wl, wr) = (0.0, wr.max(b));
+            } else {
+                (wl, wr) = (wl.max(b), 0.0);
+            }
+        }
         if free_nose && steer * yaw_dps < 0.0 && yaw_dps.abs() > SWING_CATCH_DPS {
             let b = ((yaw_dps.abs() - SWING_CATCH_DPS) / SWING_CATCH_SPAN_DPS).clamp(0.0, 1.0)
                 * SWING_CATCH_MAX
@@ -1415,6 +1454,36 @@ pub fn align_roll_limit_m(spare_m: Option<f64>) -> f64 {
 pub fn align_spare_m(rwy: &crate::autoland::Runway, need_m: f64, lat: f64, lon: f64) -> f64 {
     let past_m = (-crate::autoland::along_track_nm(lat, lon, rwy) * M_PER_NM).max(0.0);
     rwy.length_m - past_m - need_m.max(crate::autotakeoff::MIN_REMAINING_M)
+}
+
+/// One step of the aligning pivot's standing-yaw trim (signed brake, +
+/// right): integrated while rolling, off the course and not already coming
+/// round, bounded. The line-up's ([`LineUpAlign`]) and the roll hold's
+/// (`autotakeoff::RollAlign`). Pure.
+pub fn align_trim_step(trim: f64, err_deg: f64, yaw_dps: f64, gs_kts: f64, dt: f64) -> f64 {
+    if gs_kts > ALIGN_TRIM_MIN_KTS
+        && err_deg.abs() > ALIGN_QUIET_DEG
+        && yaw_dps * err_deg.signum() < ALIGN_TRIM_TURNING_DPS
+    {
+        (trim + ALIGN_TRIM_PER_DEG_S * err_deg * dt.clamp(0.0, 1.0))
+            .clamp(-ALIGN_TRIM_MAX, ALIGN_TRIM_MAX)
+    } else {
+        trim
+    }
+}
+
+/// A (left, right) pivot pair with the trim added, bounded, never pushing
+/// a turn past [`ALIGN_RATE_MAX_DPS`]. Pure.
+pub fn with_align_trim((bl, br): (f64, f64), trim: f64, yaw_dps: f64) -> (f64, f64) {
+    let mut b = (br - bl + trim).clamp(-PIVOT_BRAKE_MAX, PIVOT_BRAKE_MAX);
+    if b * yaw_dps > 0.0 && yaw_dps.abs() > ALIGN_RATE_MAX_DPS {
+        b = 0.0;
+    }
+    if b >= 0.0 {
+        (0.0, b)
+    } else {
+        (-b, 0.0)
+    }
 }
 
 /// What the line-up's alignment wants this tick ([`LineUpAlign::step`]).
@@ -1559,20 +1628,10 @@ impl LineUpAlign {
         // The standing yaw (the propeller, a slope, a crosswind) is what a
         // soft law settles against: trimmed out while rolling and not
         // already coming round.
-        if want
-            && gs_kts > ALIGN_TRIM_MIN_KTS
-            && err.abs() > ALIGN_QUIET_DEG
-            && yaw_dps * err.signum() < ALIGN_TRIM_TURNING_DPS
-        {
-            self.trim = (self.trim + ALIGN_TRIM_PER_DEG_S * err * dt)
-                .clamp(-ALIGN_TRIM_MAX, ALIGN_TRIM_MAX);
+        if want {
+            self.trim = align_trim_step(self.trim, err, yaw_dps, gs_kts, dt);
         }
-        let (bl, br) = align_pivot_brakes(err, yaw_dps);
-        let mut b = (br - bl + self.trim).clamp(-PIVOT_BRAKE_MAX, PIVOT_BRAKE_MAX);
-        if b * yaw_dps > 0.0 && yaw_dps.abs() > ALIGN_RATE_MAX_DPS {
-            b = 0.0;
-        }
-        let (bl, br) = if b >= 0.0 { (0.0, b) } else { (-b, 0.0) };
+        let (bl, br) = with_align_trim(align_pivot_brakes(err, yaw_dps), self.trim, yaw_dps);
         AlignStep::Align { bl, br, creep }
     }
 }
@@ -2032,14 +2091,22 @@ impl TurnRound {
     }
 }
 /// A pivoting airframe's pocket: the turn begins this far down, the pocket
-/// this far down (the drive has been seen to run 5 m past it at the
+/// this far down (the drive has been seen to run 5 to 10 m past it at the
 /// backtrack's pace), this far off the centreline with no width known, and
 /// this far inside the pavement's edge with one, never nearer the
 /// centreline than the minimum.
+///
+/// The edge is the AIRCRAFT's centre: the outer main wheel sits half the
+/// track further out (about 1.6 m on a GA single), and the pocket leg stops
+/// a metre off its line. At 2 m the Evolution's pocket on LILB's 15 m strip
+/// was 5.5 m off; leg one stopped at 6.5 (1790732094, 2026-09-30), the
+/// outer wheel about 8.1 m out against the 7.5 m edge, and the turn-round
+/// swung the wrong way about it, stuck, and broke away at 9.5 kt. From 5.1 m
+/// (1790724857) the same turn worked. So 3.5 m: the minimum's 4 m there.
 const PIVOT_TURN_START_M: f64 = 50.0;
 const PIVOT_POCKET_ALONG_M: f64 = 25.0;
 const PIVOT_POCKET_OFFSET_M: f64 = 6.0;
-const PIVOT_POCKET_EDGE_M: f64 = 2.0;
+const PIVOT_POCKET_EDGE_M: f64 = 3.5;
 const PIVOT_POCKET_MIN_OFFSET_M: f64 = 4.0;
 
 /// Where a plain line-up from this position would enter and stop (meters
@@ -2390,6 +2457,19 @@ pub fn pick_line_up_plan(
                 continue;
             }
         }
+        // Already ON the strip and pointing down it (a turn-round or a
+        // line-up that stopped off the line): settle onto the centreline in
+        // the least runway, as a backtrack's leg two does.
+        if !force_backtrack {
+            if let Some((p, stop_m)) = on_strip_settle_path(r, lat, lon, heading_deg, turn) {
+                if r.length_m - stop_m >= needed_m {
+                    if best.as_ref().is_none_or(|(_, _, d)| r.dist_nm < *d) {
+                        best = Some((r.clone(), LineUpPlan::Plain(p), r.dist_nm));
+                    }
+                    continue;
+                }
+            }
+        }
         // The authored lead-on wins when it belongs to this runway and this
         // hold — the painted line IS the maneuver. Synthetic geometry is the
         // fallback (no published route, wrong stub, backtracks).
@@ -2442,6 +2522,44 @@ pub fn pick_line_up_plan(
     }
     best.map(|(r, p, _)| (r, p))
 }
+
+/// A line-up asked for from ON the strip, the nose within
+/// [`ON_STRIP_MAX_ERR_DEG`] of its course: the route of a backtrack's leg two
+/// from here ([`backtrack_leg_two_path`]) and where it stops, m past the
+/// threshold. `None` off the pavement (half the width, else
+/// [`ON_STRIP_HALF_WIDTH_M`]), short of the threshold or pointing elsewhere.
+/// LILB 03 Evolution (1790732094, 2026-09-30): the turn-round stopped 41 m
+/// down, 5.6 m off and 14 degrees crooked; the hold-short geometry from
+/// there enters 30 to 60 m further on and leaves less than the 500 m fit,
+/// so the one retry a failed line-up gets would have been hopeless. Pure.
+pub fn on_strip_settle_path(
+    rwy: &crate::autoland::Runway,
+    lat: f64,
+    lon: f64,
+    heading_deg: Option<f64>,
+    turn: TurnRound,
+) -> Option<(Vec<(f64, f64)>, f64)> {
+    use crate::autoland::{along_track_nm, cross_track_nm};
+    let hdg = heading_deg?;
+    let err = ((hdg - rwy.course_deg + 540.0).rem_euclid(360.0) - 180.0).abs();
+    if err > ON_STRIP_MAX_ERR_DEG {
+        return None;
+    }
+    let half = turn.width_m.map_or(ON_STRIP_HALF_WIDTH_M, |w| w / 2.0);
+    let ct = (cross_track_nm(lat, lon, rwy) * M_PER_NM).abs();
+    let a0 = -along_track_nm(lat, lon, rwy) * M_PER_NM;
+    if ct > half || a0 < 0.0 || a0 > rwy.length_m {
+        return None;
+    }
+    let path = backtrack_leg_two_path(rwy, lat, lon, turn)?;
+    let end = *path.last()?;
+    let stop_m = -along_track_nm(end.0, end.1, rwy) * M_PER_NM;
+    Some((path, stop_m))
+}
+/// Pointing down the strip, for [`on_strip_settle_path`].
+pub const ON_STRIP_MAX_ERR_DEG: f64 = 45.0;
+/// On it, with no width known.
+const ON_STRIP_HALF_WIDTH_M: f64 = 10.0;
 
 /// Pick the runway end to line up on: feasible geometry, matching the
 /// cleared runway when the tower named one (lining up on 09 with a 27
@@ -6020,6 +6138,122 @@ mod tests {
             lead_on: Vec::new(),
         };
         assert!(Route::build(&watch).is_some());
+    }
+
+    /// LILB 03 Evolution (1790732094, 2026-09-30), the backtrack's turn-round:
+    /// leg one stopped 15.5 m down and 6.51 m right of a 15 m strip (the
+    /// pocket 5.5 off), heading 192.4, so the outer (left) main wheel stood
+    /// about 8.1 m out against the 7.5 m edge. Leg two's first 8 s at 0.1 to
+    /// 0.4 kt: steer +0.35 to +0.44, both brakes 0, the nose LEFT to -6.8
+    /// deg/s, 33 degrees the wrong way. The flight before (1790724857)
+    /// turned from 5.1 m off and worked.
+    #[rustfmt::skip]
+    const LILB_TURN_ROUND: &[(f64, f64, f64, f64, f64)] = &[
+        // (s, steer, err, gs kt, yaw deg/s) as the drive logged them.
+        (0.2, 0.160, 165.15, 0.14, 0.00), (0.4, 0.350, 165.06, 0.04, 0.19), (0.8, 0.378, 165.08, 0.13, 0.09),
+        (1.0, 0.391, 165.18, 0.19, -0.15), (1.2, 0.386, 165.46, 0.16, -0.56), (1.5, 0.378, 165.88, 0.13, -1.05),
+        (1.8, 0.381, 166.50, 0.14, -1.66), (2.1, 0.388, 167.31, 0.18, -2.26), (2.4, 0.397, 168.28, 0.22, -2.80),
+        (2.7, 0.403, 169.32, 0.24, -3.24), (2.9, 0.407, 170.48, 0.26, -3.72), (3.2, 0.411, 171.69, 0.28, -4.11),
+        (3.5, 0.415, 173.03, 0.30, -4.46), (3.8, 0.419, 174.45, 0.32, -4.85), (4.1, 0.422, 175.96, 0.33, -5.13),
+        (4.4, 0.425, 177.59, 0.35, -5.36), (4.7, 0.428, 179.26, 0.36, -5.69), (4.9, 0.430, 179.26, 0.37, -5.93),
+        (5.2, 0.433, 177.57, 0.38, -6.17), (5.5, 0.435, 175.84, 0.39, -6.36), (5.8, 0.437, 173.80, 0.40, -6.53),
+        (6.1, 0.439, 171.99, 0.41, -6.69), (6.4, 0.437, 170.10, 0.40, -6.79),
+        (13.9, 0.585, 162.42, 1.09, -1.88), (14.2, 0.607, 161.86, 1.18, -2.31), (14.5, 0.594, 161.59, 1.13, -1.98),
+        (14.7, 0.599, 161.70, 1.15, -1.09), (15.0, 0.607, 162.11, 1.19, -0.17), (15.3, 0.606, 162.71, 1.18, 0.83),
+        (15.5, 0.608, 163.49, 1.19, 1.87), (15.7, 0.611, 164.49, 1.21, 2.88), (16.0, 0.616, 165.91, 1.23, 3.89),
+        (16.3, 0.558, 167.86, 0.96, 5.54), (16.6, 0.636, 170.27, 1.32, 6.88),
+    ];
+
+    /// The turn-round pivots as designed on a free nose: a pivot going the
+    /// wrong way under a knot gets the steer-side wheel. As flown the law
+    /// gave nothing for the first 13.6 s; neither d28e8f4's swing catch (1 kt,
+    /// 8 deg/s) nor its instant release acted there. Once rolling (13.9 s
+    /// on) the steer-side brake is the pivot's own, as flown.
+    #[test]
+    fn a_turn_round_that_swings_the_wrong_way_under_a_knot_is_braked_round() {
+        let mut law = super::BrakeSteer::default();
+        let mut prev_t = LILB_TURN_ROUND[0].0 - 0.3;
+        let mut first_right: Option<f64> = None;
+        for &(t, steer, err, gs, yaw) in LILB_TURN_ROUND {
+            let dt = if t - prev_t > 1.0 { 0.3 } else { t - prev_t };
+            prev_t = t;
+            let (bl, br) = law.step(steer, err, gs, yaw, true, true, dt);
+            assert_eq!(bl, 0.0, "{t}: never the outer wheel");
+            if br > 0.05 && first_right.is_none() {
+                first_right = Some(t);
+            }
+            // The old law, as flown: nothing under a knot.
+            if gs < 1.0 {
+                assert_eq!(super::pivot_brake_split(steer, gs), (0.0, 0.0));
+            }
+        }
+        let first = first_right.expect("the right brake came on");
+        assert!(first <= 3.0, "right brake by {first} s, the yaw at -3.7");
+        // Turning the right way, nothing extra; a swing past the old catch
+        // still catches.
+        assert_eq!(super::pivot_wrong_way_brake(1.0), 0.0);
+        assert!((super::pivot_wrong_way_brake(-6.8) - super::PIVOT_WRONG_WAY_MAX).abs() < 1e-9);
+        let mut law = super::BrakeSteer::default();
+        assert_eq!(law.step(0.4, 165.0, 0.3, 5.0, true, true, 0.3), (0.0, 0.0), "right way at 0.3 kt");
+        // A nose that steers itself is left as it was.
+        let mut law = super::BrakeSteer::default();
+        assert_eq!(law.step(0.4, 165.0, 0.3, -5.0, true, false, 0.3), (0.0, 0.0));
+    }
+
+    /// The pocket keeps the turn-round's outer wheel on the pavement. On
+    /// LILB's 15 m strip the old 5.5 m pocket plus the 1.0 m leg one stopped
+    /// past it (6.51, 1790732094) and half a GA single's track (about 1.6 m)
+    /// is 8.1 m, off the 7.5 m edge; the new pocket with the same error is
+    /// 6.6 m, and from the good flight's 5.1 m (1790724857) 6.7.
+    #[test]
+    fn a_turn_round_pocket_keeps_the_outer_wheel_on_the_pavement() {
+        use crate::autoland::cross_track_nm;
+        const HALF_TRACK_M: f64 = 1.6;
+        let rwy = lilb_03();
+        let pivot = super::TurnRound { pivots: true, width_m: Some(15.0) };
+        let (_, _, off) = pivot.pocket();
+        assert!((off - 4.0).abs() < 1e-9, "{off}");
+        let stood = cross_track_nm(45.767_260_9, 9.160_703_7, &rwy) * 1852.0;
+        assert!((stood - 6.51).abs() < 0.1, "{stood:.2}");
+        let overshoot = stood - (7.5 - 2.0);
+        assert!(stood + HALF_TRACK_M > 7.5, "as flown: in the grass");
+        assert!(off + overshoot + HALF_TRACK_M < 7.5 - 0.5, "now: {:.1}", off + overshoot + HALF_TRACK_M);
+        // Still off the centreline enough to turn toward it.
+        let on = crate::autoland::project_latlon(rwy.thr_lat, rwy.thr_lon, rwy.course_deg, 25.0 / 1852.0);
+        let (plat, plon) = crate::autoland::project_latlon(on.0, on.1, rwy.course_deg + 90.0, off / 1852.0);
+        assert_eq!(super::turn_round_hint(&rwy, plat, plon), Some(1.0));
+    }
+
+    /// Where the failed turn-round stopped (1790732094, 45.7675144
+    /// 9.1606940, 9.7 true on 024, 41 m down and 5.6 m left), "line us up"
+    /// settles onto the centreline as a backtrack's leg two, leaving the fit
+    /// its 500 m; the hold-short geometry would have left less. From LILB's
+    /// 21 hold, off the strip, the plan is unchanged.
+    #[test]
+    fn a_line_up_from_on_the_strip_settles_onto_the_centreline() {
+        use crate::autoland::{along_track_nm, cross_track_nm};
+        let rwy = lilb_03();
+        let pivot = super::TurnRound { pivots: true, width_m: Some(15.0) };
+        let (lat, lon, hdg) = (45.767_514_4, 9.160_694_0, 9.7);
+        let (path, stop_m) = super::on_strip_settle_path(&rwy, lat, lon, Some(hdg), pivot).expect("on the strip");
+        assert!(rwy.length_m - stop_m >= 500.0, "leaves {:.1}", rwy.length_m - stop_m);
+        let end = *path.last().unwrap();
+        assert!((cross_track_nm(end.0, end.1, &rwy) * 1852.0).abs() < 0.5);
+        let (_, old_stop) = line_up_stops_m(&rwy, lat, lon, Some(hdg)).expect("hold-short geometry");
+        assert!(rwy.length_m - old_stop < 500.0, "the old retry left {:.1}", rwy.length_m - old_stop);
+        let cands = vec![rwy.clone()];
+        let plan = pick_line_up_plan(&cands, lat, lon, Some("03"), 500.0, false, Some(hdg), None, pivot);
+        match plan {
+            Some((_, LineUpPlan::Plain(p))) => assert_eq!(p, path),
+            other => panic!("{:?}", other.map(|(r, _)| r.id)),
+        }
+        // Pointing across it, or beside it, is no settle.
+        assert!(super::on_strip_settle_path(&rwy, lat, lon, Some(hdg + 90.0), pivot).is_none());
+        let (blat, blon) = crate::autoland::project_latlon(lat, lon, rwy.course_deg - 90.0, 20.0 / 1852.0);
+        assert!(super::on_strip_settle_path(&rwy, blat, blon, Some(hdg), pivot).is_none());
+        assert!(-along_track_nm(lat, lon, &rwy) * 1852.0 > 40.0);
+        // LILB's 21 hold (node 1), heading across: not on the strip.
+        assert!(super::on_strip_settle_path(&rwy, 45.772005, 9.163885, Some(120.0), pivot).is_none());
     }
 
     #[test]
