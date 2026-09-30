@@ -4237,6 +4237,22 @@ pub fn run_autoland_scoped(
                     // aircraft climbed away from two feet at 155 kt
                     // (2026-09-19). The floor still stands underneath.
                     let adj = if g.arresting { adj.min(0.0) } else { adj };
+                    // A roundout that FLOATS takes the thrust off, as the
+                    // flare's float does: the arrest is ours, not yet the
+                    // Flare, and the speed law holds the approach's lever
+                    // into a level-off and a climb (`roundout_float_lever`).
+                    let float_lever = match (arrest_hands && g.arresting, thr_now, vvi) {
+                        (true, Some(throttle), Some(v)) => roundout_float_lever(
+                            throttle,
+                            v,
+                            vvi_trend,
+                            dt_s,
+                            cfg.flare_power.map_or(DEFAULT_ROUNDOUT_RETARD_PER_S, |p| {
+                                p.retard_max_per_s.unwrap_or(p.reduction_per_second)
+                            }),
+                        ),
+                        _ => None,
+                    };
                     let min_thr = approach_power_floor(
                         g.phase,
                         radio_ft,
@@ -4249,7 +4265,7 @@ pub fn run_autoland_scoped(
                         g.target_vs_fpm,
                         crate::aircraft::approach_thrust_min(),
                     ));
-                    thr_now.map(|throttle| (throttle + adj).clamp(min_thr, 1.0))
+                    float_lever.or_else(|| thr_now.map(|throttle| (throttle + adj).clamp(min_thr, 1.0)))
                 };
                 if g.phase != ApproachPhase::Flare && missed.is_none() {
                     if let Some(t) = thr {
@@ -5484,6 +5500,23 @@ const IDLE_THROTTLE: f64 = 0.1;
 /// pulled the throttle to idle for its 179 kt target and the aircraft
 /// settled into the fields with +800 fpm on the dial, same day). Everywhere
 /// else, idle.
+/// The roundout's retard where the airframe declares no `flare_power`.
+const DEFAULT_ROUNDOUT_RETARD_PER_S: f64 = 0.1;
+
+/// The lever in a roundout (the arrest holding the servos, not yet the
+/// Flare) that FLOATS: a sink under [`RETARD_FLOAT_FPM`], now or
+/// [`RETARD_FLOAT_LEAD_S`] ahead on its trend, walks the lever toward idle
+/// at `per_s`, under the approach's own floor; else `None` (the speed law's).
+/// King Air LEMG 13 (iMac 2026-09-30, 1790786159 and 1790787298): the
+/// column at neutral, the arrest took the sink from 557 fpm to level at 36 ft
+/// with the lever held at 0.61 (the speed law "slow" by a knot, only ever
+/// back in the roundout), climbed to 101 ft at 700 fpm and balked `balloon`.
+/// Pure.
+pub fn roundout_float_lever(throttle: f64, vvi_fpm: f64, trend_fpm_s: f64, dt_s: f64, per_s: f64) -> Option<f64> {
+    let floating = vvi_fpm + trend_fpm_s.max(0.0) * RETARD_FLOAT_LEAD_S > -RETARD_FLOAT_FPM;
+    floating.then(|| (throttle - per_s * dt_s.clamp(0.0, 1.0)).max(IDLE_THROTTLE))
+}
+
 pub fn approach_power_floor(
     phase: ApproachPhase,
     radio_alt_ft: f64,
@@ -10210,6 +10243,19 @@ mod tests {
                 "{name}: the logged servo cannot have arrested it, yet the plant landed at {td:.0} fpm"
             );
         }
+    }
+
+    /// King Air 1790787298: the arrest's level-off at 36 ft on approach
+    /// thrust. Sinking on the approach, the speed law keeps the lever; the
+    /// sink trending through level retards it, under the approach floor; a
+    /// climb walks it to idle and no further.
+    #[test]
+    fn a_floating_roundout_takes_the_thrust_off() {
+        assert_eq!(roundout_float_lever(0.612, -557.0, 40.0, 0.33, 0.1), None);
+        let lead = roundout_float_lever(0.612, -182.0, 140.0, 0.33, 0.1).expect("level on the trend");
+        assert!((lead - 0.579).abs() < 1e-9, "{lead}");
+        assert!(roundout_float_lever(0.612, 91.0, 130.0, 0.33, 0.1).is_some());
+        assert_eq!(roundout_float_lever(0.11, 300.0, 0.0, 0.5, 0.1), Some(IDLE_THROTTLE));
     }
 
     /// The decision itself: taken at the roundout gate, kept through the

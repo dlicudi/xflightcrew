@@ -2,10 +2,14 @@
 # laws fitted on the old 0.35 to 0.56 s ticks, now paced at 0.2 to 0.39 s.
 after: stop
 cases:
-  - name: "SR22 LEMG 13, 5 nm final"
+  # 6 nm: X-Plane places the SR22 diving (first tick -3,717 fpm at 1,274 ft
+  # against the King Air's -700 at 1,425); from 5 nm the level-off ended
+  # 385 ft under the path at 914 ft AAL and the 1,000 ft gate sent it round
+  # (1790779987-approach). The extra mile takes the drop above the gate.
+  - name: "SR22 LEMG 13, 6 nm final"
     setup:
       aircraft: "Aircraft/Laminar Research/Cirrus SR22/Cirrus SR22.acf"
-      approach: { field: LEMG, runway: 13, final_nm: 5 }
+      approach: { field: LEMG, runway: 13, final_nm: 6 }
     traffic: off
 
   - name: "King Air C90B LEMG 13, 5 nm final (#197)"
