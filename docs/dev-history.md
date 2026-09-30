@@ -11819,3 +11819,67 @@ Next Evolution takeoff: `roll` ticks from 40 kt with `steer` near 0.51 x `trq_ft
 few hundredths, `err` inside 3 degrees and not standing on one side, `trim` small (under 0.1),
 `xtk_m` inside 3 m to rotation; if the nose still stands to one side with `steer` under the cap,
 `power_steer_per_kftlb` is the number to move. Offline only.
+
+## 2026-09-30: the Evolution's backtrack paced, its line-up on the line, its flare on a model (#196)
+
+iMac 2026-09-30, LILB 03, sortie 1790740292-full_auto on 5fb2e1a, the first complete LILB circuit
+(earlier legs from 1790712974, 1790724857, 1790732094, 1790736651). Failed: the backtrack's leg one
+(3.6 m at up to 16 kt, and about 9.5 m past its stop) and the alignment (the roll began 2.3 m off
+against 2 m; 1.9 degrees). The landing passed at 392 fpm.
+
+- **Leg one ran at the idle's pace, not ours.** The line-up tool floors a backtrack at 14 kt. The
+  governor wound the lever to 0.28 (371 ft-lb) for the build, the PT6's torque yawed the nose left
+  and the idle in full beta (0.8) then held 15 to 16 kt: 3.2 to 4.4 degrees of standing error to a
+  70 m aim, 3.6 m left, the straight trim learning 0.1 over 30 s. The earlier legs, built on 0.19 of
+  lever, held 14.5 kt and 2.1 to 2.3 m. At 13 to 14 kt the idle in full beta is an equilibrium, so
+  the stop ramp (6.4 kt asked at 22 m) got no brake until the 8 kt emergency at 7 m to go, let go at
+  9.6 kt with 3.8 m left and rolled past at 9.9. The fix: `taxi.backtrack_kts` (10 on the
+  Evolution; absent keeps the straight pace floored at 14, `tools::taxi::backtrack_kts`), and **once
+  beta is spent the hold brakes** (`speedhold::beta_spent_brake`: the lever within a step of
+  `beta_max` and the speed over the pace, 0.04 plus 0.08 a knot past 0.5 kt, led 0.5 s on the
+  trend, to 0.22; the lever held at its deepest meanwhile, and a stop keeps its beta while rolling
+  instead of going to idle). Only the Evolution declares `beta_max`. On a plant fitted to the leg
+  (idle in beta settling at 13 kt; the brake 12 to 25 kt/s per unit, the flown 0.19 took 3.7 kt off
+  in 0.8 s) the law as flown overruns 19 to 27 m; now within 1 m, the 10 kt pace held within 0.5 kt.
+- **The alignment straightened the nose and left the lateral.** Leg two stopped 1.95 m left, 11.7
+  degrees off; the pivot crept 8 m and the roll began 2.3 m off with 61.9 m to spare.
+  `LineUpAlign::step_on_line` (fed the runway's cross-track by `align_on_the_runway`, blackbox
+  `line_up_align` `lat_m`, `closing`; `line_up_aligned` `lat_m`, `closed_lateral`): past
+  `ALIGN_LATERAL_M` 1.5 m it flies an intercept (`align_intercept_deg`: 6 degrees a metre past 0.3,
+  to 8) to 0.75 m and then straightens, keeping 10 m and 12 s back to straighten in, with 25 s more
+  time; out of that room it only aligns, as before; inside 1.5 m the law is the heading's alone. On
+  the yaw plant from the logged stop: the heading alone ends 2 m off or more; now 0.3 to 0.5 m in 22
+  to 24 m and 21 to 24 s, both governors, both plants, both ticks; with 16 m to spare it aligns as
+  before.
+- **The flare read a lagging gauge through a tracker that lets go.** The Evolution flew the jets'
+  default tracker. Its pilot VSI (`vvi_fpm_pilot`, what every law reads) lags the height by about a
+  second: at 9 ft the aircraft had been level for a second while the gauge read -386 to -82, the
+  tracker's balloon lead dropped the whole 0.35 of pull in one tick, and the height fell at 800 fpm
+  or more onto the runway (the scorer's 392 is the gauge). At 24 ft the same let-go, and the
+  balloon's approach thrust back on, had carried it to 32 ft. A plant fitted to the flare (servos
+  taken to contact: radio 0.66 ft, gauge 43 fpm rms): 6,450 fpm per unit through 0.29 s lags after
+  0.23 s, the path's own 1.5 s, the gauge 0.97 s behind it, 152 fpm per knot, the column's neutral
+  0.084 (the trim); the elevator 5 % either way or the speed's sink 30 % either way does not replay.
+  Declared: a model flare (`flare_elevator.model` 6,450 fpm, 1.3 s lags, 0.67 s dead, the path and
+  gauge folded into the lags; 150 fpm a knot; to 200 fpm on a 3 s exponential; pull to 0.5, the
+  balloon eased 0.15 a second) and `flare_power` (the lever off from 20 ft). NO hold-off: from the
+  POM's 90 kt final a float to the stall ran 800 to 940 m past the gate on the plant, on a 601 m
+  strip where the flown contact came 13.6 s and about 580 m past it. The SR22 plant grew the fields
+  the Evolution needed (gauge lag, the column's neutral, the lever and speed model, the stall), all
+  at their old values for the SR22, whose tests give the same numbers (124 fpm, 1.20 ft).
+
+Tests: `a_backtrack_runs_at_the_airframes_pace`, `spent_beta_brakes_the_stop_ramp_where_it_should`,
+`a_line_up_closes_the_lateral_as_well_as_the_heading`, `the_evolution_plant_replays_its_flare`,
+`the_evolution_flares_where_the_tracker_dropped_it_in` (the tracker as flown meets the runway at
+260 to 1,020 fpm on the kept plants; the declared flare from five 90 kt gates, calm and rough,
+touches at 130 fpm or less on the path and 124 on the gauge, 0.95 ft after it at most, within 575
+m); bench `bench/landings/evolution_lilb03_flare_1790740292.jsonl`.
+
+Next Evolution circuit at LILB 03: leg one `drive` `gs` near 10 and `lat_m` inside 3 m, speedhold
+`brake` lines with `lever` -0.8 and `out` under about 0.1 on the straight, the stop within 2 m
+(`remaining_m` not pinned at -5 with `gs` over 2); `line_up_align` `closing` true while `lat_m` is
+past 1.5, `line_up_aligned` `lat_m` inside 1.5, `line_up_check` `lateral_m` inside 1.5, stage
+`alignment` `xtk_m` under 2; the flare's `flare_elev` eased, never 0.3 to 0 in a tick, no
+`power` `retard` "balloon", landing `sink_fpm` under 250 and no `bounce` over 1.5 ft, the
+`committed_flare` `remaining_m` no smaller than 314. If it floats, `touchdown_fpm` is the knob.
+Offline only.

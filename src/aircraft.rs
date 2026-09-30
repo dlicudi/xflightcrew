@@ -2279,6 +2279,12 @@ pub struct TaxiProfile {
     /// 38 deg/s: it swung 5.8 m wide.
     #[serde(default)]
     pub max_yaw_dps: Option<f64>,
+    /// A full-length backtrack's pace down the strip, knots. `None` keeps the
+    /// straight pace floored at 14 (a GA backtrack at 6 kt timed full auto
+    /// out at LXGB). The Evolution's 14 ran it to 16 kt on LILB's 15 m strip,
+    /// 3.6 m off, and 9.5 m past its stop (2026-09-30, #196).
+    #[serde(default)]
+    pub backtrack_kts: Option<f64>,
 }
 
 /// A switch whose only control is a TOGGLE command, paired with the dataref
@@ -3724,6 +3730,7 @@ mod tests {
             ("autotakeoff", "CLIMB_PITCH_DOWN_DEG_S", "the climb hold's target walk down, a law rate below the rotation's own 2.5 deg/s; declared airframes only"),
             ("autotakeoff", "CLIMB_HOLD_FLOOR_FPM", "the positive floor climb_vs_fpm already keeps (airborne, it climbs); only airframes declaring a climb-out"),
             ("speedhold", "IDLE_FAST_KTS", "margin over the pilot's own target, not an airframe speed"),
+            ("speedhold", "BETA_SPENT_OVER_KTS", "margin over the taxi pace before the spent-beta brake; only airframes declaring beta_max"),
             // --- Properties of the SIM or the SENSORS, not the airframe ---
             (
                 "autotakeoff",

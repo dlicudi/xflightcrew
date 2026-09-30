@@ -633,9 +633,10 @@ pub fn taxi_control(
 
 /// The taxi law with a BETA range below idle ([`crate::aircraft::TaxiProfile::beta_max`]):
 /// `lever` is X-Plane's combined lever (-1..0 beta, 0..1 alpha). A rolling
-/// overspeed goes into beta, never the brakes; the brakes stay for a stop
-/// and for an overspeed past [`BETA_BRAKE_KTS`]. Out of beta, the lever
-/// comes back to idle quickly when the pace is wanted again. Pure.
+/// overspeed goes into beta, never the brakes; the brakes stay for a stop,
+/// for an overspeed past [`BETA_BRAKE_KTS`], and for one beta cannot take
+/// once it is spent ([`beta_spent_brake`]). Out of beta, the lever comes
+/// back to idle quickly when the pace is wanted again. Pure.
 pub fn taxi_control_beta(
     target_kts: f64,
     gs_kts: f64,
@@ -646,10 +647,32 @@ pub fn taxi_control_beta(
     let beta_max = beta_max.clamp(0.0, 0.9);
     let (thr, brake) = taxi_control(target_kts, gs_kts, lever.max(0.0), trend_kts_s);
     if target_kts < 1.0 {
-        // A stop: idle and the brakes, as ever (beta cannot hold it still).
+        // A stop: the brakes, as ever, and idle once nearly still (beta
+        // cannot hold it still). Still rolling, the beta already in stays
+        // in: out to idle at 7 kt the Evolution's PT6 pushed on against the
+        // stop's brakes (LILB 03, 1790740292, 2026-09-30).
+        if lever < 0.0 && gs_kts > 1.5 {
+            let brake = if beta_spent(lever, beta_max) {
+                brake.max(beta_spent_brake(-gs_kts))
+            } else {
+                brake
+            };
+            return (Some(lever), brake);
+        }
         return (thr.map(|t| t.max(0.0)).or(Some(0.0)), brake);
     }
-    let eff = (target_kts - gs_kts) - trend_kts_s * 2.5;
+    let raw = target_kts - gs_kts;
+    let eff = raw - trend_kts_s * 2.5;
+    if beta_spent(lever, beta_max) && raw < 0.0 {
+        // BETA SPENT and still over the pace: the lever stays at its
+        // deepest and the brakes take the rest, in proportion.
+        let brake = if -eff >= BETA_BRAKE_KTS {
+            brake
+        } else {
+            beta_spent_brake(raw - BETA_SPENT_LEAD_S * trend_kts_s)
+        };
+        return (Some(-beta_max), brake);
+    }
     if eff > 1.0 && lever < 0.0 {
         // Wanted the pace again: out of beta toward idle, briskly.
         return (Some((lever + BETA_STEP_OUT).min(0.0)), 0.0);
@@ -678,6 +701,35 @@ pub fn taxi_control_beta(
     }
     (thr, brake)
 }
+/// Beta is SPENT: the lever within one step out ([`BETA_STEP_OUT`]) of the
+/// profile's deepest, so the law's own ease out and back is still spent.
+fn beta_spent(lever: f64, beta_max: f64) -> bool {
+    beta_max > 0.0 && lever <= -beta_max + BETA_STEP_OUT + 1e-9
+}
+
+/// The brake once BETA IS SPENT, for a speed `under_kts` under the target
+/// (negative: over it) led by the trend: past [`BETA_SPENT_OVER_KTS`] over,
+/// from [`BETA_SPENT_MIN`] in proportion, never past a rolling trim's
+/// [`BETA_SPENT_MAX`]; 0 inside the band. The Evolution at idle in full beta
+/// (0.8) rolls on at 13 to 14 kt by itself (LILB 03, 2026-09-30), so every
+/// target below that was a target the hold could not fly: the backtrack's
+/// leg one (1790740292) held 13.2 kt into its stop ramp's 6.4 with no brake
+/// until 7 m to go, 9.6 kt at the end and about 9.5 m past it. Pure.
+pub fn beta_spent_brake(under_kts: f64) -> f64 {
+    let over = -under_kts - BETA_SPENT_OVER_KTS;
+    if over <= 0.0 {
+        0.0
+    } else {
+        (BETA_SPENT_MIN + over * BETA_SPENT_PER_KT).min(BETA_SPENT_MAX)
+    }
+}
+const BETA_SPENT_OVER_KTS: f64 = 0.5;
+const BETA_SPENT_MIN: f64 = 0.04;
+const BETA_SPENT_PER_KT: f64 = 0.08;
+const BETA_SPENT_MAX: f64 = 0.22;
+/// The spent brake's lead on the speed trend, s (the overspeed law's 2.5
+/// held the brake off a stop ramp it was 3 kt behind).
+const BETA_SPENT_LEAD_S: f64 = 0.5;
 /// Beta depth per knot of overspeed, and the shallowest worth commanding.
 const BETA_PER_KT: f64 = 0.06;
 const BETA_MIN: f64 = 0.08;
@@ -1989,6 +2041,127 @@ mod tests {
         assert_eq!(brake, 0.0);
         // In the groove at idle: the plain law's answer.
         assert_eq!(taxi_control_beta(10.0, 10.5, 0.15, 0.0, 0.5), (None, 0.0));
+    }
+
+    /// The beta law as flown on 2026-09-30 (b6c24d5), for the replays.
+    fn beta_law_as_flown(target_kts: f64, gs_kts: f64, lever: f64, trend_kts_s: f64, beta_max: f64) -> (Option<f64>, f64) {
+        let beta_max = beta_max.clamp(0.0, 0.9);
+        let (thr, brake) = taxi_control(target_kts, gs_kts, lever.max(0.0), trend_kts_s);
+        if target_kts < 1.0 {
+            return (thr.map(|t| t.max(0.0)).or(Some(0.0)), brake);
+        }
+        let eff = (target_kts - gs_kts) - trend_kts_s * 2.5;
+        if eff > 1.0 && lever < 0.0 {
+            return (Some((lever + BETA_STEP_OUT).min(0.0)), 0.0);
+        }
+        let fast_at_idle = thr.is_some_and(|t| t <= 0.0) && eff < -1.0;
+        if brake > 0.0 || fast_at_idle {
+            let floor = ((-eff - 1.0) * BETA_PER_KT).clamp(BETA_MIN, beta_max);
+            let falling = trend_kts_s < BETA_BITING_KTS_S;
+            let next = if lever > -floor {
+                (lever - BETA_STEP_IN).max(-floor)
+            } else if falling {
+                lever
+            } else {
+                lever - BETA_STEP_IN
+            };
+            let emergency = -eff >= BETA_BRAKE_KTS;
+            return (Some(next.max(-beta_max)), if emergency { brake } else { 0.0 });
+        }
+        if lever < 0.0 && eff >= -1.0 {
+            return (Some((lever + BETA_STEP_IN).min(0.0)), 0.0);
+        }
+        (thr, brake)
+    }
+
+    /// Beta spent, the brakes: the Evolution at idle in full beta rolls on
+    /// at 13 to 14 kt. The backtrack's leg one at LILB 03 (1790740292,
+    /// 2026-09-30) held 13.2 kt into its stop ramp (6.4 kt asked at 22 m to
+    /// go) with no brake, braked first at 7 m to go (the 8 kt emergency),
+    /// let go again at 9.6 kt with 3.8 m left, and was still at 9.9 kt past
+    /// the end: about 9.5 m past its stop. On a plant fitted to that leg
+    /// (idle in full beta settling at 13 kt, 0.04 per second; the brake 12 to
+    /// 25 kt/s per unit, the flown 0.19 took 3.7 kt off in 0.8 s) the law as
+    /// flown overruns (19 to 27 m on the plant, about 9.5 flown); spent beta
+    /// braking stops within 1.5 m of the end, and a 10 kt pace is held
+    /// within 1 kt.
+    #[test]
+    fn spent_beta_brakes_the_stop_ramp_where_it_should() {
+        // The logged ticks: 22 m to go, and the first brake at 8.5 m.
+        let (lever, brake) = taxi_control_beta(6.4, 13.2, -0.8, -0.05, 0.8);
+        assert_eq!(lever, Some(-0.8));
+        assert!(brake > 0.15, "{brake}");
+        let (_, brake) = taxi_control_beta(5.22, 13.26, -0.8, 0.0, 0.8);
+        assert!(brake > 0.15, "{brake}");
+        // Not spent (shallow beta): the propeller first, as before.
+        assert_eq!(taxi_control_beta(10.0, 14.0, -0.3, 0.0, 0.8).1, 0.0);
+        // Inside the band: no brake.
+        assert_eq!(taxi_control_beta(10.0, 10.4, -0.8, 0.0, 0.8).1, 0.0);
+        assert_eq!(beta_spent_brake(-0.4), 0.0);
+        assert!((beta_spent_brake(-20.0) - BETA_SPENT_MAX).abs() < 1e-12);
+
+        // The plant: idle in beta settling at 13 kt (18 out of beta), the
+        // lever's power on top; the brake through the governor's slew.
+        let run = |k_brake: f64, flown: bool, base: f64, from_m: f64, v0: f64| {
+            let beta = 0.8;
+            let (mut v, mut lever, mut trend, mut b_out) = (v0, -0.8_f64, 0.0_f64, 0.0_f64);
+            let (mut along, mut t, mut last_gov) = (0.0_f64, 0.0_f64, -1.0_f64);
+            let (mut worst_over, mut arrived) = (0.0_f64, false);
+            let mut prev_v = v;
+            let (mut want_lever, mut want_brake) = (lever, 0.0);
+            while t < 120.0 {
+                let rem = from_m - along;
+                if rem <= 1.0 && v < 1.5 {
+                    arrived = true;
+                }
+                let target = if arrived {
+                    0.0
+                } else {
+                    base.min(crate::autotaxi::stop_ramp_kts(rem))
+                };
+                if rem > 30.0 && t > 20.0 {
+                    worst_over = worst_over.max(v - base);
+                }
+                if t - last_gov >= 0.55 {
+                    let dt = if last_gov < 0.0 { 0.55 } else { t - last_gov };
+                    trend = trend * 0.7 + 0.3 * (v - prev_v) / dt;
+                    prev_v = v;
+                    last_gov = t;
+                    let (l, b) = if flown {
+                        beta_law_as_flown(target, v, lever, trend, beta)
+                    } else {
+                        taxi_control_beta(target, v, lever, trend, beta)
+                    };
+                    if let Some(l) = l {
+                        want_lever = l;
+                    }
+                    want_brake = b;
+                }
+                let dt = 0.05;
+                lever += (want_lever - lever).clamp(-dt / 0.2, dt / 0.2);
+                b_out = brake_slew(b_out, want_brake, dt);
+                let v_eq = if lever < 0.0 { 18.0 + 6.25 * lever } else { 18.0 + 40.0 * lever };
+                v = (v - (0.04 * (v - v_eq) + k_brake * b_out) * dt).max(0.0);
+                along += v / MS_TO_KTS * dt;
+                t += dt;
+                if arrived && v == 0.0 {
+                    break;
+                }
+            }
+            (along - from_m, worst_over)
+        };
+        for k in [12.0, 18.0, 25.0] {
+            // The leg's last 100 m from 13.9 kt, a 14 kt pace, as flown.
+            let (flown_past, _) = run(k, true, 14.0, 100.0, 13.9);
+            let (past, _) = run(k, false, 14.0, 100.0, 13.9);
+            // The Evolution's 10 kt backtrack, 520 m from 13.5 kt.
+            let (past10, over) = run(k, false, 10.0, 520.0, 13.5);
+            eprintln!("k {k}: as flown {flown_past:.1} m past; now {past:.1}, at 10 kt {past10:.1} ({over:.1} kt over)");
+            assert!(flown_past > 5.0, "k {k}: the law as flown stopped {flown_past:.1} m past");
+            assert!(past.abs() < 1.5, "k {k}: {past:.1} m past");
+            assert!(past10.abs() < 1.5, "k {k}: {past10:.1} m past");
+            assert!(over < 1.0, "k {k}: {over:.1} kt over the pace");
+        }
     }
 
     #[test]
