@@ -90,6 +90,11 @@ pub const TOUCHDOWN_MAX_DRIFT_DEG: f64 = 5.0;
 const CONTACT_RADIO_FT: f64 = 1.0;
 /// Back up past this after a contact is a bounce (rapport's own 2 ft).
 const BOUNCE_FT: f64 = 2.0;
+/// Or the wheels off again this long, however low: the King Air skipped
+/// twice at 104 and 94 kt, 0.8 ft up for 1.9 s and 1.1 s, and was scored at
+/// the flight model's touchdown 7 s later, +24 fpm climbing off the skip, as
+/// 0 fpm and no bounce (LEMG 13, iMac 2026-09-30, 1790784149-approach).
+const BOUNCE_AIR_S: f64 = 0.5;
 /// The autoland ticks' sink window at a contact: they run at 5 Hz, so the
 /// contact tick is within 0.2 s of the wheels. The state samples' 2.5 s
 /// reached back into an arresting flare: the A330's 198 fpm contact scored
@@ -322,6 +327,10 @@ struct Contact {
     /// Highest radio height since, above `radio0` (a bounce past
     /// [`BOUNCE_FT`]).
     up_ft: f64,
+    /// Longest spell the wheels were off again after it (autoland's
+    /// `bounce` records), and when the current one began.
+    air_s: f64,
+    off_at: Option<f64>,
 }
 
 #[derive(Debug, Default)]
@@ -491,6 +500,13 @@ impl Scorer {
                 }
             }
             ("autoland", "rollout") => {
+                // After the wheels the guidance ticks stop and the rollout's
+                // begin: its first tick is the contact when the flare's last
+                // one was still in the air.
+                let wheels = r.get("ground").and_then(Value::as_bool) == Some(true);
+                if wheels && self.contact.is_none() && self.landing.is_none() {
+                    self.open_contact(t, f(r, "radio").unwrap_or(0.0), CONTACT_SINK_WINDOW_S + 0.5);
+                }
                 if let Some(l) = self.landing.as_mut() {
                     if let Some(x) = f(r, "xtk_m") {
                         l.max_xtk = Some(l.max_xtk.unwrap_or(0.0).max(x.abs()));
@@ -508,6 +524,24 @@ impl Scorer {
                     self.crew_yoke_t = Some(t);
                 }
                 self.contact_tick(r, t);
+            }
+            // The rollout's `bounce` records: the wheels leaving the runway
+            // and meeting it again.
+            ("autoland", "bounce") => {
+                let off = r.get("off").and_then(Value::as_bool) == Some(true);
+                if self.contact.is_none() && !off {
+                    self.open_contact(t, f(r, "radio").unwrap_or(0.0), CONTACT_SINK_WINDOW_S + 0.5);
+                }
+                if let Some(c) = self.contact.as_mut() {
+                    if off {
+                        c.off_at.get_or_insert(t);
+                    } else if let Some(t0) = c.off_at.take() {
+                        c.air_s = c.air_s.max(t - t0);
+                    }
+                    if let Some(radio) = f(r, "radio") {
+                        c.up_ft = c.up_ft.max(radio - c.radio0);
+                    }
+                }
             }
             ("state", _) => self.state_tick(r, t, &mut out),
             // The circuit gave the aircraft back as no pattern (#160): far
@@ -867,23 +901,31 @@ impl Scorer {
             None => radio <= CONTACT_RADIO_FT,
         };
         match self.contact.as_mut() {
-            None if wheels => {
-                let recent: Vec<(f64, f64)> = self
-                    .flare_vvi
-                    .iter()
-                    .copied()
-                    .filter(|(tv, _)| t - tv <= CONTACT_SINK_WINDOW_S)
-                    .collect();
-                self.contact = Some(Contact {
-                    t,
-                    sink: crate::instructor::touchdown_sink_fpm(&recent, t, vvi).abs(),
-                    radio0: radio.max(0.0),
-                    up_ft: 0.0,
-                })
-            }
+            None if wheels => self.open_contact(t, radio, CONTACT_SINK_WINDOW_S),
             Some(c) => c.up_ft = c.up_ft.max(radio - c.radio0),
             None => {}
         }
+    }
+
+    /// The wheels met the runway at `t`: its sink is the flare ticks' in the
+    /// `window` before it (a rollout tick's contact reaches back one flare
+    /// tick further, the flare's last tick having been in the air).
+    fn open_contact(&mut self, t: f64, radio: f64, window: f64) {
+        let recent: Vec<(f64, f64)> = self
+            .flare_vvi
+            .iter()
+            .copied()
+            .filter(|(tv, _)| t - tv <= window)
+            .collect();
+        let last = recent.last().map_or(0.0, |(_, v)| *v);
+        self.contact = Some(Contact {
+            t,
+            sink: crate::instructor::touchdown_sink_fpm(&recent, t, last).abs(),
+            radio0: radio.max(0.0),
+            up_ft: 0.0,
+            air_s: 0.0,
+            off_at: None,
+        })
     }
 
     fn state_tick(&mut self, r: &Value, t: f64, out: &mut Vec<(String, Value)>) {
@@ -939,7 +981,7 @@ impl Scorer {
         // autoland window's. Never the max of two windows (#142: that max
         // was the stretched state window's 461 fpm on 1790585651).
         let (t_td, sink, bounce) = match first {
-            Some(c) if c.up_ft > BOUNCE_FT => {
+            Some(c) if c.up_ft > BOUNCE_FT || c.air_s >= BOUNCE_AIR_S => {
                 (c.t, c.sink, Some((c.up_ft, model.unwrap_or(sink))))
             }
             Some(c) => (c.t, model.unwrap_or(c.sink), None),
@@ -1666,6 +1708,31 @@ mod tests {
         let l = out.iter().find(|v| v["stage"] == "landing").unwrap();
         assert_eq!(l["sink_fpm"], 240.0, "{l}");
         assert!(l["bounce_ft"].is_null());
+    }
+
+    /// LEMG 13 King Air, 1790784149-approach (iMac 2026-09-30): the last
+    /// flare tick at 1.5 ft and -367 fpm, then the rollout's ticks and two
+    /// skips 0.8 ft up for 1.9 s and 1.1 s. Scored at the flight model's
+    /// touchdown 7 s later (+24 fpm off the skip) as 0 fpm and no bounce.
+    #[test]
+    fn a_low_skip_after_the_flare_is_a_bounce_scored_at_the_first_contact() {
+        let mut recs = vec![json!({"t": 100.0, "kind": "state", "ground": false, "vsi": -500.0})];
+        for (t, radio, vvi) in [(172.1, 4.37, -327.0), (172.3, 3.05, -346.0), (172.5, 1.51, -367.0)] {
+            recs.push(json!({"t": t, "kind": "autoland", "radio": radio, "vvi": vvi, "ground": false}));
+        }
+        recs.push(json!({"t": 172.9, "kind": "autoland", "event": "rollout", "ground": true, "radio": 0.1}));
+        recs.push(json!({"t": 173.1, "kind": "autoland", "event": "bounce", "off": true, "radio": 0.71}));
+        recs.push(json!({"t": 175.0, "kind": "autoland", "event": "bounce", "off": false, "radio": 0.04}));
+        recs.push(json!({"t": 175.4, "kind": "autoland", "event": "bounce", "off": true, "radio": 0.84}));
+        recs.push(json!({"t": 176.5, "kind": "autoland", "event": "bounce", "off": false, "radio": 0.13}));
+        recs.push(json!({"t": 180.3, "kind": "flight", "ev": "touchdown", "sink": 24.0}));
+        recs.push(json!({"t": 180.7, "kind": "state", "ground": true, "vsi": 0.0, "hdg": 131.0, "track": 131.0}));
+        recs.push(json!({"t": 190.0, "kind": "sortie", "event": "end", "outcome": "ended"}));
+        let out = score_all(recs.iter());
+        let l = out.iter().find(|v| v["stage"] == "landing").unwrap();
+        assert_eq!(l["t_touchdown"], 172.9, "{l}");
+        assert!(l["sink_fpm"].as_f64().unwrap() > 300.0, "{l}");
+        assert!(!l["bounce_ft"].is_null(), "{l}");
     }
 
     /// LEMG 13 A330, 1790670284 (#180): the tilted bogie met the runway at

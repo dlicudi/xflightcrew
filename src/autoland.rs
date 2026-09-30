@@ -6378,6 +6378,18 @@ impl FlareModel {
     /// The law for this airframe's model, pull cap, push cap (negative) and
     /// flare time constant.
     pub fn new(cfg: crate::aircraft::FlareModelProfile, max: f64, min: f64, tau_s: f64) -> Self {
+        // A STANDING plant never takes the column forward of neutral in the
+        // roundout or the flare: the arrest leaves the sink shallower than
+        // the exponential asks, the model pushed to catch it up, and the
+        // nose-down it stored arrived after its own lag, at the wheels.
+        // King Air LEMG 13 (iMac 2026-09-30): no push, 93 kt and 299 fpm
+        // (1790783744); pushed from 48 and 61 ft at -0.05, 103 and 109 kt,
+        // 349 and 367 fpm, both skipped (1790783945, 1790784149). The
+        // Evolution at LILB pushed from 52 ft at 361 fpm, the sink built to
+        // 576 and it landed at 570 (1790781114, #196). A float is the
+        // retard's (`FlarePower`) and the commit's, never the column's. Only
+        // a RATE plant, whose neutral HOLDS a sink, pushes (`step_rate`).
+        let min = if cfg.rate { min } else { min.max(0.0) };
         Self {
             cfg,
             max,
@@ -16611,7 +16623,9 @@ mod lemg13_sr22_flare_tests {
                 assert!(l.wheels_fpm > -300.0, "{fit:?} from {h} ft {v} fpm: {l:?}");
                 assert!(!l.pushed_climbing, "{fit:?} from {h} ft");
                 assert!(l.min_ias > VSO_KTS + 5.0, "{fit:?}: {l:?}");
-                assert!(l.secs < 12.0, "{fit:?}: floated {l:?}");
+                // No push on a standing plant: the model floats longer than
+                // flight (the King Air's 11.3 s flown against 18 modelled).
+                assert!(l.secs < 16.0, "{fit:?}: floated {l:?}");
                 let mut p = Plant::at(fit, h, v, trend, ias);
                 idle_worst =
                     idle_worst.min(land_with(&mut p, &mut Law::today(), false, None).wheels_fpm);
@@ -17530,7 +17544,8 @@ mod lemg13_sr22_bounce_tests {
                         assert!(l.first_fpm < 250.0 && gauge < 250.0, "{why}");
                         assert!(l.bounce_ft < 1.5, "{why}");
                         assert!(l.min_ias > fit.vso, "{why}");
-                        assert!(p.along_m < 620.0, "{why}");
+                        // No push: the model's float (the King Air's note).
+                        assert!(p.along_m < 700.0, "{why}");
                         worst = (worst.0.max(l.first_fpm), worst.1.max(gauge), worst.2.max(l.bounce_ft), worst.3.max(p.along_m));
                     }
                 }
@@ -17732,11 +17747,17 @@ mod lemg13_sr22_bounce_tests {
                         let l = land(&mut p, &mut m, power, approach, rough, 45.0);
                         let gauge = -p.first_gauge.unwrap_or(f64::NAN);
                         let why = format!("{}, {h} {v} {ias} rough {rough}: {l:?}, gauge {gauge:.0}, {:.0} m", tag(fit), p.along_m);
+// Without the push a standing plant FLOATS in these models (18 to 20 s
+                        // from 60 ft, to 1,075 m); flown, the King Air's no-push
+                        // flare took 11.3 s, no longer than the pushed ones (10.8,
+                        // 11.5 s, which skipped): LEMG 13 1790783744 vs 1790783945
+                        // and 1790784149, iMac 2026-09-30. The float is bounded
+                        // by the pavement (`commit_flare`), not by the model.
                         if !(l.first_fpm < 250.0
                             && gauge < 250.0
-                            && l.bounce_ft < 2.0
+                            && l.bounce_ft < 2.5
                             && l.min_ias > fit.vso
-                            && p.along_m < 1000.0)
+                            && p.along_m < 1100.0)
                         {
                             bad.push(why);
                         }
