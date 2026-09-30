@@ -319,6 +319,25 @@ flare_power:
   reduction_per_second: 0.1
   retard_max_per_s: 0.1
   retard_below_ft: 20.0
+  # THE SHORT FINAL'S LEVER (issue #197, thirteen autolands at LEMG 13 from
+  # 5 nm, iMac 2026-09-30): from 12 s of the path's sink (about 117 ft at
+  # 110 kt), the speed law only takes power off (`autoland::
+  # short_final_power_held`), unless the speed projects under 1.3 Vso. On
+  # the final the speed law cycled the lever 0.45 to 0.66 every 20 s and
+  # this autopilot flew the sink through the TRIM against it (servo 0.00);
+  # at the release (59 to 61 ft) the trim was the approach's own (-0.08 to
+  # -0.27), and the lever raised in the last 6 s (to 0.53 to 0.66, ten of
+  # thirteen) spooled on with nothing against it: level at 30 to 39 ft, two
+  # balloons to 100 ft, 641 fpm on a lever the float idled at 43 ft. The
+  # three released unraised (0.47 to 0.50) came through 30 ft sinking 470 to
+  # 480 fpm and landed at 29 to 69 fpm. Replayed, the hold begins 5 to 7 s
+  # before each release and every release is on 0.45 to 0.49
+  # (`autoland::lemg13_king_air_roundout_tests`).
+  # VERIFY: the `power` events' `held` from about 117 ft with
+  # `throttle_command` never above `throttle_before`, `arrest_hands` on 0.45
+  # to 0.50, 30 ft passed sinking 400 to 500 fpm, the flare entered at 20 to
+  # 30 ft, the retard from 20 ft, and the contact under 250 fpm, no bounce.
+  hold_from_s: 12.0
 
 # THE ROLLOUT (issue #197, the same three landings): the nosewheel STEERS
 # (C90B.acf: `_gear_castors 0`, 48 degrees slow, 7 at speed, through the
