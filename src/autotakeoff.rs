@@ -1316,8 +1316,21 @@ const ROLL_ALIGN_KTS: f64 = 15.0;
 const ROLL_ALIGN_ERR_DEG: f64 = crate::autotaxi::ALIGNED_DEG;
 
 /// The roll's power waits for the nose on a brake-steered airframe
-/// ([`RollAlign`]): below this groundspeed...
+/// ([`RollAlign`]): a roll that STARTS at this groundspeed or more is the
+/// roll law's from its first tick...
 const ROLL_ALIGN_HOLD_KTS: f64 = 6.0;
+/// ...a held one creeps at this, the line-up's own creep...
+const ROLL_ALIGN_CREEP_KTS: f64 = crate::autotaxi::ALIGN_CREEP_KTS;
+/// ...stopped on both brakes when this far over it, until back under it...
+const ROLL_ALIGN_OVER_KTS: f64 = crate::autotaxi::ALIGN_CREEP_OVER_KTS;
+/// ...at this much brake past the creep, and this more per knot over it...
+const ROLL_ALIGN_BRAKE_MIN: f64 = 0.15;
+const ROLL_ALIGN_BRAKE_PER_KT: f64 = 0.1;
+/// ...to at most this...
+const ROLL_ALIGN_BRAKE_MAX: f64 = 0.45;
+/// ...and held past this groundspeed all the same, it is a reject on the
+/// ground, never a roll.
+const ROLL_ALIGN_RUNAWAY_KTS: f64 = 10.0;
 /// ...while the nose is more than [`crate::autotaxi::ALIGNED_DEG`] off, or
 /// swinging faster than this, the lever stays at [`ROLL_PIVOT_THR`] and the
 /// ramp and the stagnation clock wait...
@@ -1334,12 +1347,26 @@ pub const ROLL_ALIGN_MAX_S: f64 = 20.0;
 /// coming round, and the power drove the pirouette (LEMG 12 SR22 and LILB 03
 /// Evolution, 2026-09-29: 10.8 and 24.6 degrees off at the first tick,
 /// swinging +/-12 and through 29 degrees at 0.41 to 0.59 of lever). Once
-/// straight (or rolling past [`ROLL_ALIGN_HOLD_KTS`]) it never holds again:
-/// a gust-yaw at speed is the roll law's. Pure.
+/// straight (or rolling past [`ROLL_ALIGN_HOLD_KTS`] at its first tick) it
+/// never holds again: a gust-yaw at speed is the roll law's.
+///
+/// A hold HOLDS the aircraft ([`RollAlign::creep`]): a creep over its speed
+/// is stopped on both brakes with the lever at idle, and speed never lets
+/// the power up. LILB 03 Evolution (1790732094, 2026-09-30): held at 0.3 of
+/// lever, the PT6 at 300 to 330 ft-lb ran the aircraft from 0.2 to 6.6 kt
+/// in 5 s while the pivot took the nose from 16.6 to 4.4 degrees off its
+/// target; the 6 kt gate then let the power up (`roll_aligned` held_s
+/// 5.06, err 4.4), the roll diverged to 7.7 degrees and rejected at 68 kt,
+/// 9.4 m off. Pure.
 #[derive(Debug, Default, Clone)]
 pub struct RollAlign {
     held_s: f64,
     done: bool,
+    /// Over the creep: stopped until back under it.
+    over: bool,
+    /// The standing-yaw trim, signed brake (+ right), the line-up's own
+    /// ([`crate::autotaxi::LineUpAlign`]).
+    trim: f64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -1357,17 +1384,54 @@ impl RollAlign {
         if self.done {
             return RollAlignState::Go;
         }
-        if gs_kts >= ROLL_ALIGN_HOLD_KTS
+        let rolling_start = self.held_s == 0.0 && gs_kts >= ROLL_ALIGN_HOLD_KTS;
+        if rolling_start
             || (err_deg.abs() <= crate::autotaxi::ALIGNED_DEG && yaw_dps.abs() <= ROLL_ALIGNED_DPS)
         {
             self.done = true;
             return RollAlignState::Go;
         }
         self.held_s += dt.max(0.0);
-        if self.held_s > ROLL_ALIGN_MAX_S {
+        if self.held_s > ROLL_ALIGN_MAX_S || gs_kts > ROLL_ALIGN_RUNAWAY_KTS {
             return RollAlignState::Failed;
         }
         RollAlignState::Hold
+    }
+
+    /// While it holds: the most lever the creep allows and the brake on
+    /// BOTH wheels (added to the pivot's split). Under the creep the pivot's
+    /// power and no brake; [`ROLL_ALIGN_OVER_KTS`] over it the lever at idle
+    /// and the brakes on in proportion, until back under the creep. Pure.
+    pub fn creep(&mut self, gs_kts: f64) -> (f64, f64) {
+        if gs_kts > ROLL_ALIGN_CREEP_KTS + ROLL_ALIGN_OVER_KTS {
+            self.over = true;
+        } else if gs_kts <= ROLL_ALIGN_CREEP_KTS {
+            self.over = false;
+        }
+        if !self.over {
+            return (ROLL_PIVOT_THR, 0.0);
+        }
+        let brake = (ROLL_ALIGN_BRAKE_MIN
+            + (gs_kts - ROLL_ALIGN_CREEP_KTS).max(0.0) * ROLL_ALIGN_BRAKE_PER_KT)
+            .min(ROLL_ALIGN_BRAKE_MAX);
+        (0.0, brake)
+    }
+
+    /// The pivot's split while it holds, with the standing yaw trimmed out
+    /// as the line-up's alignment does: a creep held 4 to 5 degrees off by
+    /// the propeller's pull against the pivot's 0.03 of brake (1790732094,
+    /// 2026-09-30, the err 6.1 to 4.4 with the yaw dying 1.5 to 0.4 deg/s)
+    /// is otherwise a creep that never straightens. Pure.
+    pub fn trimmed(
+        &mut self,
+        (l, r): (f64, f64),
+        err_deg: f64,
+        yaw_dps: f64,
+        gs_kts: f64,
+        dt: f64,
+    ) -> (f64, f64) {
+        self.trim = crate::autotaxi::align_trim_step(self.trim, err_deg, yaw_dps, gs_kts, dt);
+        crate::autotaxi::with_align_trim((l, r), self.trim, yaw_dps)
     }
 
     /// Seconds the power has waited for the nose.
@@ -1382,12 +1446,23 @@ impl RollAlign {
 }
 
 /// The lever while [`RollAlign`] holds: never over the pivot's.
+#[cfg(test)]
 pub fn aligning_throttle(want: f64, holding: bool) -> f64 {
+    aligning_throttle_capped(want, holding, ROLL_PIVOT_THR)
+}
+
+/// [`aligning_throttle`] under the creep's own cap ([`RollAlign::creep`]).
+pub fn aligning_throttle_capped(want: f64, holding: bool, cap: f64) -> f64 {
     if holding {
-        want.min(ROLL_PIVOT_THR)
+        want.min(ROLL_PIVOT_THR).min(cap)
     } else {
         want
     }
+}
+
+/// The pivot's split with the creep's brake on both wheels. Pure.
+pub fn with_hold_brake((l, r): (f64, f64), both: f64) -> (f64, f64) {
+    ((l + both).min(1.0), (r + both).min(1.0))
 }
 
 /// Full brake-steering authority on the roll below this groundspeed...
@@ -3664,7 +3739,13 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, p: Params) {
         // re-drives jitters; a hand keeps winning), then it's a pilot
         // reject — hands off everything.
         let elapsed = roll_start.elapsed().as_secs_f64() - frozen_secs - roll_align.held_s();
-        let thr_want = aligning_throttle(
+        // A hold holds the aircraft: the creep's lever and brake.
+        let (creep_cap, hold_brake) = if align_hold && !airborne {
+            roll_align.creep(gs_kts)
+        } else {
+            (1.0, 0.0)
+        };
+        let thr_want = aligning_throttle_capped(
             torque_limited(
                 tick_throttle_want(airborne, elapsed, last_err, gs_kts, ias, p.vne_kts),
                 last_thr_cmd,
@@ -3673,6 +3754,7 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, p: Params) {
                 power_limit.as_ref(),
             ),
             align_hold && !airborne,
+            creep_cap,
         );
         let (thr_want, reducing) = thrust_reduced(thr_want, airborne, agl_ft, reduction);
         let thr_cmd = throttle_slew(last_thr_cmd, thr_want, dt);
@@ -3821,7 +3903,13 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, p: Params) {
                 }
             }
             let (bl, br) = if brake_steer && !rotated {
-                roll_brake_split_aligning(steer, gs_kts, err, align_yaw)
+                let split = roll_brake_split_aligning(steer, gs_kts, err, align_yaw);
+                if align_hold {
+                    let split = roll_align.trimmed(split, err, align_yaw, gs_kts, dt);
+                    with_hold_brake(split, hold_brake)
+                } else {
+                    split
+                }
             } else {
                 (0.0, 0.0)
             };
@@ -3896,7 +3984,7 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, p: Params) {
                     "r": yaw_dps, "law": if steer_law.scheduled() { "rudder" } else { "default" },
                     "thr": thr_cmd, "remaining_m": remaining, "dt": dt, "trq_ftlb": torque_ftlb,
                     // The power waiting for the nose ([`RollAlign`]).
-                    "align_hold": align_hold,
+                    "align_hold": align_hold, "hold_brake": hold_brake,
                 }),
             );
             // Rotate: ELEVATOR, through the plugin's pitch channel — the AP
@@ -9272,6 +9360,108 @@ mod tests {
                 assert!(through <= 2.0, "{e0} at {tick}: {through:.1} through");
                 assert!(t < 12.0, "{e0} at {tick}: {t:.1} s");
             }
+        }
+    }
+
+    /// LILB 03 Evolution (1790732094, 2026-09-30), the roll's first 18 ticks:
+    /// (dt, err to the target, yaw deg/s, gs kt, lever, bl, br) as logged.
+    /// Held at 0.3 of lever the PT6 ran it from 0.2 to 6.6 kt; the 6 kt gate
+    /// let the power up at err 4.39 (`roll_aligned` held_s 5.06), and the
+    /// roll rejected at 68 kt, 9.4 m off.
+    #[rustfmt::skip]
+    const LILB_ROLL_HOLD: &[(f64, f64, f64, f64, f64, f64, f64)] = &[
+        (0.150, 16.59, -0.31, 0.16, 0.30, 0.000, 0.194), (0.329, 16.36, 1.64, 0.04, 0.30, 0.000, 0.147),
+        (0.433, 15.58, 1.87, 0.08, 0.30, 0.000, 0.133), (0.338, 14.83, 2.53, 0.16, 0.30, 0.000, 0.110),
+        (0.456, 13.40, 3.80, 0.29, 0.30, 0.000, 0.065), (0.323, 11.97, 4.99, 0.40, 0.30, 0.000, 0.022),
+        (0.427, 9.60, 5.89, 0.72, 0.30, 0.025, 0.000), (0.301, 8.02, 4.54, 1.11, 0.30, 0.012, 0.000),
+        (0.442, 6.59, 2.22, 1.86, 0.30, 0.000, 0.024), (0.327, 6.06, 1.47, 2.46, 0.30, 0.000, 0.035),
+        (0.411, 5.52, 1.32, 3.23, 0.30, 0.000, 0.032), (0.315, 5.16, 1.12, 3.85, 0.30, 0.000, 0.033),
+        (0.425, 4.78, 0.81, 4.74, 0.30, 0.000, 0.035), (0.383, 4.55, 0.52, 5.59, 0.30, 0.000, 0.039),
+        (0.429, 4.39, 0.36, 6.56, 0.30, 0.000, 0.041), (0.313, 4.32, 0.35, 7.28, 0.38, 0.000, 0.041),
+        (0.403, 4.18, 0.44, 8.24, 0.43, 0.000, 0.037), (0.326, 4.10, 0.20, 9.10, 0.47, 0.000, 0.042),
+    ];
+
+    /// The hold holds the aircraft: through the logged ticks it never lets
+    /// the power up on speed; over the creep the lever is idle and both
+    /// brakes on; held past a runaway it is a reject, never a roll.
+    #[test]
+    fn a_roll_hold_holds_the_aircraft_and_never_lets_go_on_speed() {
+        use super::{RollAlign, RollAlignState};
+        let mut a = RollAlign::default();
+        let mut braked_from = None;
+        for &(dt, err, yaw, gs, thr, _, _) in LILB_ROLL_HOLD {
+            let (cap, brake) = a.creep(gs);
+            let s = a.step(err, yaw, gs, dt);
+            assert_eq!(s, RollAlignState::Hold, "at {gs} kt, err {err}: the flown law said Go at 6.56");
+            if gs > 3.0 {
+                assert_eq!(cap, 0.0, "over the creep: idle, not {thr}");
+                assert!(brake >= super::ROLL_ALIGN_BRAKE_MIN, "{gs} kt: {brake}");
+                braked_from.get_or_insert(gs);
+            } else if gs <= 2.0 {
+                assert_eq!(brake, 0.0);
+            }
+        }
+        assert!(braked_from.unwrap() < 3.3, "{braked_from:?}");
+        // Back under the creep: the pivot's power, brakes off.
+        assert_eq!(a.creep(1.9), (super::ROLL_PIVOT_THR, 0.0));
+        // Held past a runaway all the same: a reject on the ground.
+        let mut r = RollAlign::default();
+        assert_eq!(r.step(10.0, 0.0, 1.0, 0.3), RollAlignState::Hold);
+        assert_eq!(r.step(10.0, 0.0, super::ROLL_ALIGN_RUNAWAY_KTS + 0.5, 0.3), RollAlignState::Failed);
+        // The brake rides on the pivot's split, both wheels.
+        let (l, rr) = super::with_hold_brake((0.0, 0.1), 0.2);
+        assert!((l - 0.2).abs() < 1e-9 && (rr - 0.3).abs() < 1e-9);
+        assert_eq!(super::aligning_throttle_capped(0.9, true, 0.0), 0.0);
+        assert_eq!(super::aligning_throttle_capped(0.9, false, 0.0), 0.9);
+    }
+
+    /// Closed on the yaw plant ([`crate::autotaxi::yaw_plant`]) from the
+    /// logged roll start (16.6 off, 0.16 kt), with the Evolution's speed as
+    /// flown (0.3 of lever built 1.2 kt/s, idle thrust 0.2 kt/s) and the
+    /// propeller's standing yaw (0.03 of brake left, what held the logged
+    /// creep 4 to 5 off): the hold creeps under 3.5 kt, trims the standing
+    /// yaw out and lets the power up straight inside the bound. The flown
+    /// law on the same plant let it up at 6 kt still off.
+    #[test]
+    fn a_roll_hold_creeps_the_nose_straight_before_the_power() {
+        use crate::autotaxi::yaw_plant::{signed, Plant};
+        use super::{RollAlign, RollAlignState};
+        const BIAS: f64 = -0.03;
+        let speed = |gs: f64, lever: f64, both: f64, dt: f64| {
+            (gs + (lever * 4.0 + 0.2 - both * 6.0) * dt).max(0.0)
+        };
+        for tick in [0.3, 0.42] {
+            let mut p = Plant::new(140.0, 3.0, 16.59, -0.31);
+            let mut a = RollAlign::default();
+            let (mut gs, mut lever, mut t, mut peak) = (0.16_f64, 0.3_f64, 0.0_f64, 0.0_f64);
+            let end = loop {
+                let (cap, both) = a.creep(gs);
+                match a.step(p.err, p.yaw, gs, tick) {
+                    RollAlignState::Hold => {}
+                    other => break other,
+                }
+                lever = super::throttle_slew(lever, cap.min(super::ROLL_PIVOT_THR), tick);
+                let split = super::roll_brake_split_aligning(0.1, gs, p.err, p.yaw);
+                let split = a.trimmed(split, p.err, p.yaw, gs, tick);
+                let (l, r) = super::with_hold_brake(split, both);
+                p.run(signed((l, r)) + BIAS, (gs / 2.0).clamp(0.3, 1.0), tick);
+                gs = speed(gs, lever, both, tick);
+                peak = peak.max(gs);
+                t += tick;
+            };
+            assert_eq!(end, RollAlignState::Go, "{tick}: {t:.1} s, err {:.1}", p.err);
+            assert!(p.err.abs() <= crate::autotaxi::ALIGNED_DEG, "{tick}: {:.1}", p.err);
+            assert!(peak < 3.5, "{tick}: crept to {peak:.1} kt");
+            // The flown law: 0.3 of lever to 6 kt, the pivot alone.
+            let mut p = Plant::new(140.0, 3.0, 16.59, -0.31);
+            let (mut gs, mut t) = (0.16_f64, 0.0_f64);
+            while gs < 6.0 && t < 20.0 {
+                let split = super::roll_brake_split_aligning(0.1, gs, p.err, p.yaw);
+                p.run(signed(split) + BIAS, (gs / 2.0).clamp(0.3, 1.0), tick);
+                gs = speed(gs, 0.3, 0.0, tick);
+                t += tick;
+            }
+            assert!(p.err.abs() > crate::autotaxi::ALIGNED_DEG, "{tick}: flown law {:.1}", p.err);
         }
     }
 

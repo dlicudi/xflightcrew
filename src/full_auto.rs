@@ -3043,6 +3043,7 @@ async fn fly(xp: XPlaneClient, config: Config, voice: Option<Voice>, tools: SubT
             // 2026-09-15.
             // The line-up tool's own reply names the runway; a "Taking the
             // runway" ahead of it said it twice.
+            let gen0 = crate::autotaxi::drive_gen();
             if let Ok(reply) = tools.line_up.execute(&json!({}), &ctx).await {
                 announce(&voice, Priority::Advisory, &reply);
             }
@@ -3067,8 +3068,33 @@ async fn fly(xp: XPlaneClient, config: Config, voice: Option<Voice>, tools: SubT
                 return;
             }
             bail_if_abort!();
-            let why = match runway_check(&xp, &tools).await {
-                Ok(()) => break,
+            // The drive's own verdict and where it left us, not the fit alone
+            // ([`judge_lined_up`]): a failed line-up never rolls. Once more
+            // from where it stopped (on the strip: a settle onto the line,
+            // `autotaxi::on_strip_settle_path`), then handed back parked.
+            let drove = crate::autotaxi::drive_gen() != gen0;
+            let why = match lined_up_check(&xp, &tools, drove).await {
+                Ok(Ok(())) => break,
+                Ok(Err(miss)) => {
+                    let words = line_up_miss_words(&miss);
+                    event(
+                        "line_up_missed",
+                        json!({ "attempt": attempt, "miss": format!("{miss:?}") }),
+                    );
+                    if attempt == 1 {
+                        give_up(
+                            &xp,
+                            tools.taxi.park_brake_valve_set,
+                            &voice,
+                            &format!("{words} I couldn't line us up. Your aircraft."),
+                            "line_up_failed",
+                        )
+                        .await;
+                        return;
+                    }
+                    announce(&voice, Priority::Caution, &format!("{words} Lining up again."));
+                    continue;
+                }
                 Err(why) => why,
             };
             // A runway that is too short stays too short: no second line-up.
@@ -6935,9 +6961,155 @@ async fn runway_check_id(
     }
 }
 
+/// Why a line-up that the fit accepts is still not ready to roll
+/// ([`judge_lined_up`]).
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum LineUpMiss {
+    /// The drive we asked for did not arrive (`stopped_off_line`, off the
+    /// route, stagnant, a stand-down): it already said so and let go.
+    NotArrived { lateral_m: f64, err_deg: f64 },
+    /// Arrived, but too far off the centreline to roll from.
+    OffCentreline { lateral_m: f64, max_m: f64 },
+    /// Arrived, but pointing too far off the runway.
+    Crooked { err_deg: f64 },
+}
+
+/// A line-up is ready to roll within this of the centreline: the aircraft's
+/// centre this far inside the pavement's edge (the outer wheel half the
+/// track out)...
+const LINED_UP_EDGE_M: f64 = 4.0;
+/// ...never asked tighter than this, nor looser than the drive's own
+/// arrival ([`crate::autotaxi::ARRIVED_ON_LINE_M`]).
+const LINED_UP_MIN_M: f64 = 2.0;
+/// ...and pointing within this of the runway: what the roll's own hold
+/// straightens ([`crate::autotakeoff::RollAlign`]) on the brakes.
+const LINED_UP_MAX_ERR_DEG: f64 = 10.0;
+
+/// Whether a line-up the runway fit accepts may go on to the takeoff. The
+/// fit takes 40 m off the centreline and 20 degrees, and a drive's failure
+/// was never asked: LILB 03 Evolution (1790732094, 2026-09-30) the
+/// backtrack's turn-round ended `stopped_off_line` 5.6 m off and 12.4
+/// degrees crooked on a 15 m strip, said "Holding here. Your steering.",
+/// and 2 s later full auto logged `lined_up`, said "Lined up. Flying the
+/// circuit." and rolled; it left the centreline and rejected at 68 kt,
+/// 9.4 m off. `drove`: a drive was started by the line-up we asked for, so
+/// `arrived` is about it. Pure.
+pub(crate) fn judge_lined_up(
+    drove: bool,
+    arrived: bool,
+    lateral_m: f64,
+    err_deg: f64,
+    width_m: Option<f64>,
+) -> Result<(), LineUpMiss> {
+    let lateral_m = lateral_m.abs();
+    let err_deg = err_deg.abs();
+    if drove && !arrived {
+        return Err(LineUpMiss::NotArrived { lateral_m, err_deg });
+    }
+    let max_m = width_m.map_or(crate::autotaxi::ARRIVED_ON_LINE_M, |w| {
+        (w / 2.0 - LINED_UP_EDGE_M).clamp(LINED_UP_MIN_M, crate::autotaxi::ARRIVED_ON_LINE_M)
+    });
+    if lateral_m > max_m {
+        return Err(LineUpMiss::OffCentreline { lateral_m, max_m });
+    }
+    if err_deg > LINED_UP_MAX_ERR_DEG {
+        return Err(LineUpMiss::Crooked { err_deg });
+    }
+    Ok(())
+}
+
+/// What is said of a [`LineUpMiss`], before the retry or the give-up.
+pub(crate) fn line_up_miss_words(miss: &LineUpMiss) -> String {
+    match miss {
+        LineUpMiss::NotArrived { lateral_m, err_deg } => format!(
+            "Not lined up: {:.0} metres off the centreline and {:.0} degrees off the runway.",
+            lateral_m, err_deg
+        ),
+        LineUpMiss::OffCentreline { lateral_m, .. } => {
+            format!("Not lined up: {:.0} metres off the centreline.", lateral_m)
+        }
+        LineUpMiss::Crooked { err_deg } => {
+            format!("Not lined up: {:.0} degrees off the runway.", err_deg)
+        }
+    }
+}
+
+/// [`judge_lined_up`] where the aircraft stands, on the runway the fit
+/// found: `Ok(Ok(()))` ready, `Ok(Err(miss))` on the strip but not ready,
+/// `Err(why)` the fit's own refusal ([`runway_check`]).
+async fn lined_up_check(
+    xp: &XPlaneClient,
+    tools: &SubTools,
+    drove: bool,
+) -> Result<Result<(), LineUpMiss>, Option<crate::autotakeoff::NoFit>> {
+    let id = runway_check_id(xp, tools).await?;
+    let (Ok(lat), Ok(lon), Ok(psi)) = (
+        xp.get_float("sim/flightmodel/position/latitude").await,
+        xp.get_float("sim/flightmodel/position/longitude").await,
+        xp.get_float("sim/flightmodel/position/psi").await,
+    ) else {
+        return Err(None);
+    };
+    let apt = crate::tools::autoland::apt_dat_path();
+    let cands = crate::autoland::nearby_runways(&apt, lat, lon, 3.0).unwrap_or_default();
+    let Some(rwy) = cands.iter().find(|r| r.id == id) else {
+        return Ok(Ok(()));
+    };
+    let lateral_m = crate::autoland::cross_track_nm(lat, lon, rwy) * 1852.0;
+    let err_deg = crate::autoland::heading_diff(psi, rwy.course_deg);
+    let arrived = crate::autotaxi::LAST_ARRIVED.load(SeqCst);
+    let verdict = judge_lined_up(
+        drove,
+        arrived,
+        lateral_m,
+        err_deg,
+        crate::autoland::runway_width_m(rwy),
+    );
+    event(
+        "line_up_check",
+        json!({ "runway": id, "drove": drove, "arrived": arrived, "lateral_m": lateral_m,
+                "err_deg": err_deg, "width_m": crate::autoland::runway_width_m(rwy),
+                "verdict": format!("{verdict:?}") }),
+    );
+    Ok(verdict)
+}
+
 #[cfg(test)]
 mod runway_start_tests {
     use super::*;
+
+    /// LILB 03 Evolution (1790732094, 2026-09-30): the turn-round's drive
+    /// ended `stopped_off_line` 5.6 m off and 12.4 degrees crooked on a 15 m
+    /// strip, and the fit (40 m, 20 degrees) passed it: full auto said
+    /// "Lined up. Flying the circuit." 2 s later and rolled. Now that is a
+    /// retry, then a give-up, said. The flight before (1790724857) aligned
+    /// 1.5 m off and 1.3 degrees and goes on.
+    #[test]
+    fn a_line_up_the_drive_did_not_finish_never_rolls() {
+        let miss = judge_lined_up(true, false, -5.6, 12.4, Some(15.0));
+        assert_eq!(miss, Err(LineUpMiss::NotArrived { lateral_m: 5.6, err_deg: 12.4 }));
+        assert_eq!(
+            line_up_miss_words(&miss.unwrap_err()),
+            "Not lined up: 6 metres off the centreline and 12 degrees off the runway."
+        );
+        assert_eq!(judge_lined_up(true, true, -1.52, 1.3, Some(15.0)), Ok(()));
+        // Arrived, but too near the edge of a narrow strip to roll from.
+        assert!(matches!(
+            judge_lined_up(true, true, 3.8, 1.0, Some(15.0)),
+            Err(LineUpMiss::OffCentreline { max_m, .. }) if (max_m - 3.5).abs() < 1e-9
+        ));
+        // A wide one keeps the drive's own 5 m arrival.
+        assert_eq!(judge_lined_up(true, true, 4.9, 1.0, Some(45.0)), Ok(()));
+        assert_eq!(judge_lined_up(true, true, 4.9, 1.0, None), Ok(()));
+        // Pointing off the runway past what the roll's hold straightens.
+        assert_eq!(
+            judge_lined_up(true, true, 0.5, 12.4, Some(15.0)),
+            Err(LineUpMiss::Crooked { err_deg: 12.4 })
+        );
+        // No drive of ours to judge (the tool refused, the aircraft already
+        // there): the position alone.
+        assert_eq!(judge_lined_up(false, false, 0.5, 1.0, Some(15.0)), Ok(()));
+    }
 
     /// EGKK's two strips, the rows as apt.dat has them.
     fn egkk() -> Vec<crate::autoland::Runway> {
