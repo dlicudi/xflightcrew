@@ -17032,8 +17032,10 @@ mod lemg13_sr22_bounce_tests {
         k: f64,
         lag: f64,
         dead: f64,
-        /// The tail's ground effect: sink at the runway (fpm), from 40 ft.
+        /// The tail's ground effect: sink at the runway (fpm), growing from
+        /// `tail_ft`.
         tail_fpm: f64,
+        tail_ft: f64,
         /// fpm of sink per knot lost from the gate.
         per_kt: f64,
         /// The vertical speed's own lag toward the standing sink (s).
@@ -17079,6 +17081,7 @@ mod lemg13_sr22_bounce_tests {
         lag: 1.42,
         dead: 1.19,
         tail_fpm: 380.0,
+        tail_ft: 40.0,
         per_kt: 122.0,
         path_s: 0.34,
         wing_fpm: 85.0,
@@ -17189,7 +17192,7 @@ mod lemg13_sr22_bounce_tests {
 
         fn ground(&self, h: f64) -> f64 {
             let h = h.max(0.0);
-            -self.fit.tail_fpm * (1.0 - h / 40.0).max(0.0)
+            -self.fit.tail_fpm * (1.0 - h / self.fit.tail_ft).max(0.0)
                 + self.fit.wing_fpm * (1.0 - h / self.fit.wing_ft).max(0.0)
         }
 
@@ -17563,30 +17566,117 @@ mod lemg13_sr22_bounce_tests {
         assert!(m.holds_off());
     }
 
-    /// The Lancair Evolution's flare at LILB 03 (iMac 2026-09-30, sortie
-    /// 1790740292-full_auto, `bench/landings/evolution_lilb03_flare_1790740292.jsonl`):
-    /// the only landing it has flown under the autoland, on the jets'
-    /// default tracker (no `flare_elevator:`). The gauge the laws read
-    /// (`vvi_fpm_pilot`) lags the flight path by about a second on this
-    /// airframe: at 9 ft the height had been level for a second while the
-    /// gauge still read -386 to -82, the tracker's balloon lead let the
-    /// whole 0.35 of pull go at once, and the aircraft dropped 9 ft onto the
-    /// runway (the gauge read 392 fpm at the contact, the height fell at
-    /// about 800). The same let-go at 24 ft had ballooned it to 32 ft on the
-    /// approach thrust the balloon rule gave back.
+    /// A recorded flare's column and lever, open loop, from its gate on a
+    /// plant: (t, radio, gauge) at every recorded tick before the wheels.
+    /// `pipe` is the column the autopilot left at the gate and `bias` a
+    /// standing sink the plant does not explain (the trim the autopilot
+    /// left, the phugoid it was in), both fitted with the plant.
+    fn replay_open(f: &Flown, fit: Fit, pipe: f64, bias: f64) -> Vec<(f64, f64, f64)> {
+        let (_, h, v, ias, _) = f.ticks[0];
+        let mut p = Plant::at(fit, h, v.unwrap(), ias, pipe);
+        p.base += bias;
+        p.ias_track = Some(f.ticks.iter().map(|x| (x.0, x.3)).collect());
+        p.thr0 = f.levers.first().map_or(p.thr0, |l| l.1);
+        p.thr = p.thr0;
+        p.thr_cmd = p.thr0;
+        let mut out = vec![];
+        let (mut wi, mut li) = (0, 0);
+        for &(t, _, _, _, rolling) in &f.ticks {
+            if rolling {
+                break;
+            }
+            while p.t < t - 1e-9 {
+                while wi < f.writes.len() && f.writes[wi].0 <= p.t + 1e-9 {
+                    let e = f.writes[wi].1;
+                    p.write(e);
+                    wi += 1;
+                }
+                while li < f.levers.len() && f.levers[li].0 <= p.t + 1e-9 {
+                    p.thr_cmd = f.levers[li].1;
+                    li += 1;
+                }
+                p.step(0.01);
+            }
+            out.push((t, p.radio(), p.vvi()));
+        }
+        out
+    }
+
+    /// How well a plant replays a recorded flare: the radio's rms (ft), the
+    /// gauge's rms (fpm), and the gauge's rms over the last 2 s before the
+    /// wheels (fpm), where the flare is won or lost.
+    fn replay_rms(f: &Flown, fit: Fit, pipe: f64, bias: f64) -> (f64, f64, f64) {
+        let rec: Vec<_> = f.ticks.iter().filter(|x| !x.4).collect();
+        let got = replay_open(f, fit, pipe, bias);
+        let n = got.len().min(rec.len());
+        let t_end = rec[n - 1].0;
+        let (mut dh, mut dv, mut dl, mut nl) = (0.0, 0.0, 0.0, 0.0_f64);
+        for (g, r) in got.iter().zip(&rec) {
+            let e = g.2 - r.2.unwrap();
+            dh += (g.1 - r.1).powi(2);
+            dv += e * e;
+            if g.0 > t_end - 2.0 {
+                dl += e * e;
+                nl += 1.0;
+            }
+        }
+        let n = n as f64;
+        ((dh / n).sqrt(), (dv / n).sqrt(), (dl / nl.max(1.0)).sqrt())
+    }
+
+    /// A model flare from a gate on a plant, calm or rough: the landing, the
+    /// gauge at the first contact (fpm, positive) and the ground covered
+    /// from the gate to it (m).
+    fn land_model(
+        fit: Fit,
+        gate: (f64, f64, f64, f64, f64),
+        fe: crate::aircraft::FlareElevatorProfile,
+        power: crate::aircraft::FlarePowerProfile,
+        approach_ias: f64,
+        rough: bool,
+    ) -> (Landing, f64, f64) {
+        let (h, v, ias, pipe, bias) = gate;
+        let mut p = Plant::at(fit, h, v, ias, pipe);
+        p.base += bias;
+        let mut m = FlareModel::from_profile(Some(fe)).expect("a model");
+        let l = land(&mut p, &mut m, power, approach_ias, rough, 45.0);
+        (l, -p.first_gauge.unwrap_or(f64::NAN), p.along_m)
+    }
+
+    /// The Lancair Evolution's flares at LILB 03 (iMac 2026-09-30). The first
+    /// (sortie 1790740292-full_auto,
+    /// `bench/landings/evolution_lilb03_flare_1790740292.jsonl`) on the jets'
+    /// default tracker (no `flare_elevator:`): the gauge the laws read
+    /// (`vvi_fpm_pilot`) lags the flight path, at 9 ft the height had been
+    /// level for a second while the gauge still read -386 to -82, the
+    /// tracker's balloon lead let the whole 0.35 of pull go at once, and the
+    /// aircraft dropped 9 ft onto the runway (392 fpm on the gauge). Then
+    /// two on the model flare (#196, `evolution_lilb_model_flare_*.jsonl`):
+    /// 1790781114-full_auto pushed from 52 ft at 361 fpm, the sink built to
+    /// 576 and it landed at 570; 1790793076-full_auto, with the push gone
+    /// (3974df3), came into the model at 339 fpm and 53 ft against a target
+    /// of 500, held the column at neutral to 28 ft while the sink built to
+    /// 454, pulled 0.14 to 0.18 from 24 ft, and the sink still grew to 595
+    /// at 13 ft: 584 at the wheels.
     mod lilb03_evolution {
         use super::*;
 
         const SRC: &str = include_str!("../bench/landings/evolution_lilb03_flare_1790740292.jsonl");
+        const MODEL_SRC: [&str; 2] = [
+            include_str!("../bench/landings/evolution_lilb_model_flare_1790793076.jsonl"),
+            include_str!("../bench/landings/evolution_lilb_model_flare_1790781114.jsonl"),
+        ];
 
-        /// Fitted to the recorded flare from the servos taken to the
-        /// contact (radio 0.66 ft rms, gauge 43 fpm rms): 6,450 fpm per unit
-        /// through 0.29 s lags after 0.23 s, the path's own 1.5 s, the
-        /// gauge 0.97 s behind it, 152 fpm per knot, a wing cushion of 350
-        /// fpm under 3.6 ft, no tail effect, the column's neutral 0.084 of
-        /// pull (the trim), the lever worth nothing but its speed. The gear
-        /// is the SR22's (one contact is no fit).
-        pub(super) const EVO: Fit = Fit {
+        /// The first fit, to the tracker's flare alone (radio 0.66 ft rms,
+        /// gauge 43 fpm rms): 6,450 fpm per unit through 0.29 s lags after
+        /// 0.23 s, the path's own 1.5 s, the gauge 0.97 s behind it, 152 fpm
+        /// per knot, a wing cushion of 350 fpm under 3.6 ft, NO sink near the
+        /// ground, the column's neutral 0.084 of pull (the trim), the lever
+        /// worth nothing but its speed. It does not replay the model flares:
+        /// it cannot follow 1790781114 at all (4.8 ft rms at any column), and
+        /// closed loop it lands the model flare as flown at under 100 fpm
+        /// where the sim landed it at 584 (`the_first_fit_passed_the_flare_the_sim_failed`).
+        pub(super) const EVO_FIRST: Fit = Fit {
             k: 6453.0,
             lag: 0.29,
             dead: 0.23,
@@ -17605,79 +17695,147 @@ mod lemg13_sr22_bounce_tests {
             vso: 61.0,
             ..FIT
         };
-        /// The column the autopilot held at the gate, less the neutral.
-        const PIPE: f64 = 0.071 - 0.084;
 
-        /// The fit and its neighbours that still replay the flare (2 ft,
-        /// 60 fpm): the gauge 20 % either way, the dead time 0.1 s either
-        /// way, the path 20 % either way, and without the wing's cushion,
-        /// which the flare as flown never reached and so does not fix. The
-        /// elevator 5 % either way (2.3, 2.8 ft) or the speed's sink 30 %
-        /// (3.2, 8.4 ft) do not replay it.
-        fn evo_plants() -> Vec<Fit> {
+        /// Refitted to all three flares from the servos taken to the wheels,
+        /// each with its own column and standing bias at the gate: 6,790 fpm
+        /// per unit through two 0.49 s lags after 0.35 s, the path 1.06 s
+        /// (held at the wing's own: 2 W/S over g rho V CL_alpha at 90 kt),
+        /// the gauge 0.61 s behind it, 105 fpm per knot, and a sink the
+        /// ground adds, 920 fpm at the wheels growing from 22 ft: radio 1.2 to
+        /// 1.9 ft rms, gauge 40 to 55 fpm rms. Without that sink the best
+        /// replay is 3.4 to 7.3 ft and 111 to 223 fpm; the path left free
+        /// fits as well from 0.7 to 1.9 s with 440 to 880 fpm of it, so the
+        /// path is held at the physics. The gear's kick is 2.5: past the
+        /// recorded contacts it hops 0.35 ft after 1790793076 (none flown) and
+        /// 3.2 ft after 1790781114 (3.9 flown); the SR22's 4.95 hops 8.5 and 24.
+        pub(super) const EVO: Fit = Fit {
+            k: 6794.0,
+            lag: 0.493,
+            dead: 0.352,
+            path_s: 1.06,
+            gauge_s: 0.612,
+            per_kt: 104.8,
+            tail_fpm: 920.0,
+            tail_ft: 21.9,
+            wing_fpm: 0.0,
+            kick: 2.5,
+            ..EVO_FIRST
+        };
+
+        /// Each recorded flare with the column (less the neutral) and the
+        /// standing bias the refit found at its gate.
+        fn flares() -> Vec<(Flown, f64, f64)> {
             vec![
-                EVO,
-                Fit { wing_fpm: 0.0, ..EVO },
-                Fit { gauge_s: EVO.gauge_s * 0.8, ..EVO },
-                Fit { gauge_s: EVO.gauge_s * 1.2, wing_fpm: 0.0, ..EVO },
-                Fit { dead: EVO.dead + 0.1, ..EVO },
-                Fit { dead: EVO.dead - 0.1, wing_fpm: 0.0, ..EVO },
-                Fit { path_s: EVO.path_s * 0.8, ..EVO },
-                Fit { path_s: EVO.path_s * 1.2, wing_fpm: 0.0, ..EVO },
+                (flown(SRC), -0.0148, -2.5),
+                (flown(MODEL_SRC[0]), 0.029, -84.4),
+                (flown(MODEL_SRC[1]), 0.0145, 1.7),
             ]
         }
 
-        /// The recorded column and lever, open loop: (t, radio, gauge) at
-        /// every recorded tick before the contact.
-        fn evo_replay(f: &Flown, fit: Fit) -> Vec<(f64, f64, f64)> {
-            let (_, h, v, ias, _) = f.ticks[0];
-            let mut p = Plant::at(fit, h, v.unwrap(), ias, PIPE);
-            p.ias_track = Some(f.ticks.iter().map(|x| (x.0, x.3)).collect());
-            p.thr0 = f.levers.first().map_or(p.thr0, |l| l.1);
-            p.thr = p.thr0;
-            p.thr_cmd = p.thr0;
-            let mut out = vec![];
-            let (mut wi, mut li) = (0, 0);
-            for &(t, _, _, _, rolling) in &f.ticks {
-                if rolling {
-                    break;
-                }
-                while p.t < t - 1e-9 {
-                    while wi < f.writes.len() && f.writes[wi].0 <= p.t + 1e-9 {
-                        let e = f.writes[wi].1;
-                        p.write(e);
-                        wi += 1;
-                    }
-                    while li < f.levers.len() && f.levers[li].0 <= p.t + 1e-9 {
-                        p.thr_cmd = f.levers[li].1;
-                        li += 1;
-                    }
-                    p.step(0.01);
-                }
-                out.push((t, p.radio(), p.vvi()));
-            }
-            out
+        /// The fit and its neighbours, every one of which still replays the
+        /// three flares (4 ft, 95 fpm): the dead time 0.1 s either way, the
+        /// path and the gauge 20 % either way, the ground's sink 15 % either
+        /// way (30 % off, the last two seconds replay 110 fpm rms and worse).
+        fn evo_plants() -> Vec<Fit> {
+            vec![
+                EVO,
+                Fit { dead: EVO.dead + 0.1, ..EVO },
+                Fit { dead: EVO.dead - 0.1, ..EVO },
+                Fit { path_s: EVO.path_s * 1.2, ..EVO },
+                Fit { path_s: EVO.path_s * 0.8, ..EVO },
+                Fit { gauge_s: EVO.gauge_s * 1.2, ..EVO },
+                Fit { gauge_s: EVO.gauge_s * 0.8, ..EVO },
+                Fit { tail_fpm: EVO.tail_fpm * 1.15, ..EVO },
+                Fit { tail_fpm: EVO.tail_fpm * 0.85, ..EVO },
+            ]
         }
 
-        /// The plant is the recording: the column and lever as written,
-        /// open loop, give back the radio and the gauge at every tick to
-        /// the contact on every plant kept.
+        /// The plant is the recording: each flare's column and lever as
+        /// written, open loop, give back its radio and gauge to the wheels on
+        /// every plant kept, and the fit follows 1790781114's pushed flare
+        /// that the first fit cannot.
         #[test]
-        fn the_evolution_plant_replays_its_flare() {
-            let f = flown(SRC);
-            let rec: Vec<_> = f.ticks.iter().filter(|x| !x.4).collect();
+        fn the_evolution_plant_replays_its_flares() {
             for fit in evo_plants() {
-                let got = evo_replay(&f, fit);
-                let n = got.len().min(rec.len()) as f64;
-                let (mut dh, mut dv) = (0.0, 0.0);
-                for (g, r) in got.iter().zip(&rec) {
-                    dh += (g.1 - r.1).powi(2);
-                    dv += (g.2 - r.2.unwrap()).powi(2);
+                for (f, pipe, bias) in flares() {
+                    let (dh, dv, _) = replay_rms(&f, fit, pipe, bias);
+                    eprintln!("replay dead {:.2} path {:.2} gauge {:.2} ground {:.0}: {dh:.2} ft, {dv:.0} fpm rms", fit.dead, fit.path_s, fit.gauge_s, fit.tail_fpm);
+                    assert!(dh < 4.0 && dv < 95.0, "{fit:?}: {dh:.2} ft, {dv:.0} fpm");
                 }
-                let (dh, dv) = ((dh / n).sqrt(), (dv / n).sqrt());
-                eprintln!("replay {:.0} fpm/unit gauge {:.2} s dead {:.2}: {dh:.2} ft, {dv:.0} fpm rms", fit.k, fit.gauge_s, fit.dead);
-                assert!(dh < 2.0 && dv < 60.0, "{fit:?}: {dh:.2} ft, {dv:.0} fpm");
             }
+            let pushed = flown(MODEL_SRC[1]);
+            let (fit_ft, ..) = replay_rms(&pushed, EVO, 0.0145, 1.7);
+            let first_ft = [-0.1, -0.05, 0.0, 0.05, 0.1, 0.2]
+                .iter()
+                .map(|&pipe| replay_rms(&pushed, EVO_FIRST, pipe, 0.0).0)
+                .fold(f64::INFINITY, f64::min);
+            assert!(fit_ft < 1.5 && first_ft > 4.0, "the pushed flare: {fit_ft:.2} ft against {first_ft:.2}");
+        }
+
+        /// The model flare as flown in 1790793076 (`flare_elevator` before
+        /// this fix: 6,450 fpm, 1.3 s lags, 0.67 s dead, no ground, 150 fpm
+        /// a knot, to 200 fpm on a 3 s constant).
+        fn flare_as_flown() -> crate::aircraft::FlareElevatorProfile {
+            let mut fe = evolution().flare_elevator.expect("the Evolution declares its flare");
+            fe.tau_s = Some(3.0);
+            let mut m = fe.model.expect("a model");
+            m.fpm_per_elevator = 6450.0;
+            m.lag_s = 1.3;
+            m.lag2_s = None;
+            m.dead_s = 0.67;
+            m.ground_fpm = 0.0;
+            m.ground_ft = 40.0;
+            m.touchdown_fpm = Some(200.0);
+            m.fpm_per_kt = Some(150.0);
+            fe.model = Some(m);
+            fe
+        }
+
+        /// The recorded gates of the model flares with their columns and
+        /// biases.
+        const MODEL_GATES: [(f64, f64, f64, f64, f64); 2] =
+            [(52.9, -339.0, 91.4, 0.029, -84.4), (52.6, -361.0, 90.3, 0.0145, 1.7)];
+
+        /// Closed loop from the recorded gates, the model flare as flown
+        /// meets the refit plants as it met the runway (584 fpm, the gauge
+        /// the tick before it 356), and the first fit landed it softly: the
+        /// tests passed the flare the sim failed.
+        #[test]
+        fn the_first_fit_passed_the_flare_the_sim_failed() {
+            let power = evolution().flare_power.expect("the Evolution declares its retard");
+            let mut refit_soft = f64::INFINITY;
+            for fit in evo_plants() {
+                for gate in MODEL_GATES {
+                    let (l, gauge, _) = land_model(fit, gate, flare_as_flown(), power, 90.0, true);
+                    refit_soft = refit_soft.min(l.first_fpm.min(gauge));
+                }
+            }
+            let (h, v, ias, _, _) = MODEL_GATES[0];
+            let (first, _, _) = land_model(EVO_FIRST, (h, v, ias, 0.071 - 0.084, 0.0), flare_as_flown(), power, 90.0, true);
+            eprintln!("as flown: refit plants no softer than {refit_soft:.0} fpm, the first fit {:.0}", first.first_fpm);
+            assert!(refit_soft > 400.0, "the refit plants: {refit_soft:.0}");
+            assert!(first.first_fpm < 150.0, "the first fit: {:.0}", first.first_fpm);
+        }
+
+        /// The time constant is not the fault: the model as flown on a 3, 5
+        /// or 8 s constant meets the refit plant hard from both recorded
+        /// model gates. What it lacks is the sink near the ground.
+        #[test]
+        fn a_flatter_exponential_alone_lands_as_hard() {
+            let power = evolution().flare_power.expect("the Evolution declares its retard");
+            let mut soft = f64::INFINITY;
+            for tau in [3.0, 5.0, 8.0] {
+                let mut fe = flare_as_flown();
+                fe.tau_s = Some(tau);
+                for gate in MODEL_GATES {
+                    for rough in [false, true] {
+                        let (l, _, _) = land_model(EVO, gate, fe, power, 90.0, rough);
+                        soft = soft.min(l.first_fpm);
+                    }
+                }
+            }
+            eprintln!("Evolution as flown on 3 to 8 s: no softer than {soft:.0} fpm");
+            assert!(soft > 400.0, "{soft:.0}");
         }
 
         /// The loop's default tracker as it flew the Evolution: the arrest's
@@ -17737,77 +17895,95 @@ mod lemg13_sr22_bounce_tests {
             crate::aircraft::load("lancair_evolution").expect("the Evolution profile loads")
         }
 
-        /// The gate as recorded (the servos taken at 50.2 ft, -404 fpm on
-        /// the gauge, 90.1 KIAS on the POM's 90 kt final) and its
-        /// neighbours: steeper and shallower, faster and slower, lower.
-        const GATES: [(f64, f64, f64); 5] = [
-            (50.2, -404.0, 90.1),
-            (50.0, -470.0, 90.0),
-            (50.0, -340.0, 90.0),
-            (50.0, -404.0, 94.0),
-            (46.0, -404.0, 87.0),
+        /// The three recorded gates with their columns and biases, and the
+        /// tracker's gate's neighbours: steeper and shallower, faster and
+        /// slower, lower.
+        const GATES: [(f64, f64, f64, f64, f64); 7] = [
+            (50.2, -404.0, 90.1, -0.0148, -2.5),
+            (52.9, -339.0, 91.4, 0.029, -84.4),
+            (52.6, -361.0, 90.3, 0.0145, 1.7),
+            (50.0, -470.0, 90.0, -0.0148, -2.5),
+            (50.0, -340.0, 90.0, -0.0148, -2.5),
+            (50.0, -404.0, 94.0, -0.0148, -2.5),
+            (46.0, -404.0, 87.0, -0.0148, -2.5),
         ];
 
-        /// The tracker as flown drops in on the plant from the recorded
+        /// The tracker as flown drops in on the plant from its recorded
         /// gate, as it did (the gauge's 392 at the wheels, the height
         /// falling at 800 or more); the declared model flare
         /// (`flare_elevator` model, `flare_power`) from every gate on every
-        /// plant that replays, calm and rough: one contact under 250 fpm on
-        /// the flight path and on the gauge, under 1.5 ft after it, and no
-        /// longer a float than the tracker's as flown (the flown contact came
-        /// 13.6 s and about 580 m past the gate on a 601 m strip, so a float
-        /// to the stall from the POM's 90 kt final is no answer: no hold-off).
+        /// plant that replays, calm and rough: one contact at 60 to 250 fpm
+        /// on the flight path and on the gauge, under 2 ft after it, never
+        /// slower than the stall, and no more than 700 m past the gate (the
+        /// tracker's contact came about 580 m past it on a 601 m strip, so a
+        /// float to the stall from the POM's 90 kt final is no answer). The
+        /// hop was held under the SR22's 1.5 ft; the refit's gear is the
+        /// Evolution's own (EVO's kick, from its two model contacts: 0.35 ft
+        /// replayed where none was flown, 3.2 where 3.9 was), and on the
+        /// ground's 15 % heavier neighbour it hops 1.5 to 1.7 ft off 231 to
+        /// 242 fpm, the size of the 0.35 ft it overstates plus the hop a
+        /// 240 fpm contact makes on it.
         #[test]
         fn the_evolution_flares_where_the_tracker_dropped_it_in() {
             let mut flown_worst = 0.0_f64;
             for fit in evo_plants() {
-                let (h, v, ias) = GATES[0];
-                let mut p = Plant::at(fit, h, v, ias, PIPE);
+                let (h, v, ias, pipe, bias) = GATES[0];
+                let mut p = Plant::at(fit, h, v, ias, pipe);
+                p.base += bias;
                 let l = land_tracker(&mut p, FlareGains::default(), 30.0);
-                eprintln!("tracker as flown, {:.0} fpm/unit gauge {:.2}: {l:?} {:.0} m", fit.k, fit.gauge_s, p.along_m);
                 flown_worst = flown_worst.max(l.first_fpm);
             }
             assert!(flown_worst > 400.0, "the tracker as flown: {flown_worst:.0} fpm");
             let prof = evolution();
+            let fe = prof.flare_elevator.expect("the Evolution declares its flare");
             let power = prof.flare_power.expect("the Evolution declares its retard");
-            let mut worst = (0.0_f64, 0.0_f64, 0.0_f64, 0.0_f64);
+            assert!(!FlareModel::from_profile(Some(fe)).expect("a model").holds_off());
+            let mut worst = (f64::INFINITY, 0.0_f64, 0.0_f64, 0.0_f64);
+            let mut bad: Vec<String> = vec![];
             for fit in evo_plants() {
-                for (h, v, ias) in GATES {
+                for gate in GATES {
                     for rough in [false, true] {
-                        let mut p = Plant::at(fit, h, v, ias, PIPE);
-                        let mut m = FlareModel::from_profile(prof.flare_elevator).expect("a model");
-                        assert!(!m.holds_off());
-                        let l = land(&mut p, &mut m, power, 90.0, rough, 40.0);
-                        let gauge = -p.first_gauge.unwrap_or(f64::NAN);
+                        let (l, gauge, along) = land_model(fit, gate, fe, power, 90.0, rough);
                         let why = format!(
-                            "{:.0} fpm/unit gauge {:.2} dead {:.2} path {:.1} wing {:.0}, {h} {v} {ias} rough {rough}: {l:?}, gauge {gauge:.0}, {:.0} m",
-                            fit.k, fit.gauge_s, fit.dead, fit.path_s, fit.wing_fpm, p.along_m
+                            "dead {:.2} path {:.2} gauge {:.2} ground {:.0}, {gate:?} rough {rough}: {l:?}, gauge {gauge:.0}, {along:.0} m",
+                            fit.dead, fit.path_s, fit.gauge_s, fit.tail_fpm
                         );
-                        assert!(l.first_fpm < 250.0 && gauge < 250.0, "{why}");
-                        assert!(l.bounce_ft < 1.5, "{why}");
-                        assert!(l.min_ias > fit.vso, "{why}");
-                        // No push: the model's float (the King Air's note).
-                        assert!(p.along_m < 700.0, "{why}");
-                        worst = (worst.0.max(l.first_fpm), worst.1.max(gauge), worst.2.max(l.bounce_ft), worst.3.max(p.along_m));
+                        if !((60.0..=250.0).contains(&l.first_fpm)
+                            && (60.0..=250.0).contains(&gauge)
+                            && l.bounce_ft < 2.0
+                            && l.min_ias > fit.vso
+                            && along < 700.0)
+                        {
+                            bad.push(why);
+                        }
+                        worst = (
+                            worst.0.min(l.first_fpm.min(gauge)),
+                            worst.1.max(l.first_fpm.max(gauge)),
+                            worst.2.max(l.bounce_ft),
+                            worst.3.max(along),
+                        );
                     }
                 }
             }
             eprintln!(
-                "Evolution flare: worst {:.0} fpm on the path, {:.0} on the gauge, {:.2} ft after, {:.0} m past the gate",
+                "Evolution flare: {:.0} to {:.0} fpm, {:.2} ft after, {:.0} m past the gate",
                 worst.0, worst.1, worst.2, worst.3
             );
+            assert!(bad.is_empty(), "{} landings out of limits:\n{}", bad.len(), bad.join("\n"));
         }
     }
 
-    /// The King Air C90B's flares at LEMG 13 (iMac 2026-09-30, issue #197,
-    /// sorties 1790757702, 1790758429 and 1790758604 from 4 nm,
-    /// `bench/landings/king_air_lemg13_landing_*.jsonl`), on the jets'
-    /// default tracker (no `flare_elevator:`). Each arrest took the servos at
+    /// The King Air C90B's flares at LEMG 13 (iMac 2026-09-30). The first
+    /// three (issue #197, sorties 1790757702, 1790758429 and 1790758604 from
+    /// 4 nm, `bench/landings/king_air_lemg13_landing_*.jsonl`) on the jets'
+    /// default tracker (no `flare_elevator:`): each arrest took the servos at
     /// 59 to 61 ft sinking 640 to 700 fpm at 110 to 114 KIAS; the tracker's
-    /// 0.23 to 0.35 of pull ballooned it (to 61 ft level, then 17.5 to 39 ft
-    /// on the balloon's approach thrust), let go to neutral, and the sink it
-    /// rebuilt met the runway at 730 to 960 fpm on the gauge the tick before
-    /// the wheels (the scorer's 256 to 518, read from 3 s samples after it).
+    /// 0.23 to 0.35 of pull ballooned it, let go to neutral, and the sink it
+    /// rebuilt met the runway at 730 to 960 fpm on the gauge. Then three on
+    /// the model flare (#202, d26a65d, sorties 1790798381, 1790798581 and
+    /// 1790798781, `king_air_lemg13_model_flare_*.jsonl`): the model took the
+    /// sink to 140 to 176 fpm by 15 ft, and it rebuilt to 322 to 371 on the
+    /// gauge at the wheels while the pull rose from 0.10 to 0.31.
     mod lemg13_king_air {
         use super::*;
 
@@ -17816,19 +17992,28 @@ mod lemg13_sr22_bounce_tests {
             include_str!("../bench/landings/king_air_lemg13_landing_1790758429.jsonl"),
             include_str!("../bench/landings/king_air_lemg13_landing_1790758604.jsonl"),
         ];
+        const MODEL_SRC: [&str; 3] = [
+            include_str!("../bench/landings/king_air_lemg13_model_flare_1790798381.jsonl"),
+            include_str!("../bench/landings/king_air_lemg13_model_flare_1790798581.jsonl"),
+            include_str!("../bench/landings/king_air_lemg13_model_flare_1790798781.jsonl"),
+        ];
 
-        /// The autopilot's column at each gate (fitted with the plant).
-        const PIPES: [f64; 3] = [-0.106, -0.049, -0.112];
+        /// The autopilot's column at each gate (fitted with the plant): the
+        /// tracker's three, then the model's three.
+        const PIPES: [f64; 3] = [-0.1062, -0.0496, -0.1121];
+        const MODEL_PIPES: [f64; 3] = [-0.0245, -0.038, -0.0466];
 
-        /// Fitted to the three flares from the servos taken to the contact
-        /// (radio 1.9 to 2.1 ft rms, gauge 50 to 56 fpm rms): 9,670 fpm per
-        /// unit after 0.8 s of dead time, the path's own 2.6 s, the gauge
-        /// 0.88 s behind it, 118 fpm of sink per knot; no tail effect and the
-        /// lever worth nothing but its speed (the fit puts both at zero); the
-        /// speed -2.72 kt/s, 2.22 more per 1,000 fpm of climb, 1.93 per unit
-        /// of lever (0.66 kt/s rms). The gear is the SR22's (a contact is no
-        /// fit), the stall the POM's 76 kt.
-        pub(super) const KA: Fit = Fit {
+        /// The first fit, to the tracker's three flares (radio 1.9 to 2.1 ft
+        /// rms, gauge 50 to 56 fpm rms): 9,670 fpm per unit after 0.8 s of
+        /// dead time, the path's own 2.6 s, the gauge 0.88 s behind it, 118
+        /// fpm of sink per knot, NO sink near the ground and the lever worth
+        /// nothing but its speed; the speed -2.72 kt/s, 2.22 more per 1,000
+        /// fpm of climb, 1.93 per unit of lever (0.66 kt/s rms); the gear the
+        /// SR22's, the stall the POM's 76 kt. Its last two seconds miss the
+        /// model flares by 79 to 88 fpm rms at any column, and closed loop it
+        /// lands the model flare as flown at 121 fpm or less on the gauge
+        /// where the sim read 322 to 371 (`the_first_fit_passed_the_flare_the_sim_failed`).
+        pub(super) const KA_FIRST: Fit = Fit {
             k: 9672.0,
             lag: 0.07,
             dead: 0.8,
@@ -17848,12 +18033,44 @@ mod lemg13_sr22_bounce_tests {
             ..FIT
         };
 
-        /// The fit and neighbours that still replay the flares (4.5 ft, 95
-        /// fpm): the dead time 0.1 s either way, the path 10 % and the gauge
-        /// 20 % either way, a tail effect of 150 fpm, a wing cushion the
-        /// flares never reached. The elevator 5 % either way (7 to 11 ft),
-        /// the speed's sink 20 % either way (14 to 23 ft) or the tail's 320
-        /// fpm (4 to 5 ft, 65 to 83 fpm) do not replay them.
+        /// Refitted to all six flares, each with its own column at the gate
+        /// (radio 1.3 to 2.3 ft rms, gauge 37 to 53 fpm rms): 9,670 fpm per
+        /// unit after 0.83 s, the path 2.56 s, the gauge 0.84 s, 117 fpm a
+        /// knot, and a sink the ground adds, 1,416 fpm at the wheels growing
+        /// from 9.3 ft. That sink is what the model flares show: with it the
+        /// last two seconds replay at 19 to 30 fpm rms, the first fit (none)
+        /// at 79 to 88 (a sink per unit of lever, or an elevator weaker with
+        /// the speed, fitted instead of it, leave them at 51 to 53). The gear's kick is 3.0,
+        /// the most that keeps the three recorded contacts (415 to 436 fpm on
+        /// the path, 89 to 91 kt) on the runway, as they stayed; the SR22's
+        /// 4.95 hops 0.9 to 1.5 ft off them.
+        pub(super) const KA: Fit = Fit {
+            k: 9667.0,
+            dead: 0.832,
+            path_s: 2.558,
+            gauge_s: 0.842,
+            per_kt: 117.2,
+            tail_fpm: 1416.0,
+            tail_ft: 9.3,
+            kick: 3.0,
+            ..KA_FIRST
+        };
+
+        /// Every recorded flare with the column at its gate.
+        fn flares() -> Vec<(Flown, f64)> {
+            SRC.iter()
+                .zip(PIPES)
+                .chain(MODEL_SRC.iter().zip(MODEL_PIPES))
+                .map(|(s, p)| (flown(s), p))
+                .collect()
+        }
+
+        /// The fit and neighbours that still replay the six flares (4.5 ft,
+        /// 95 fpm): the dead time 0.1 s either way, the path 10 % and the
+        /// gauge 20 % either way, the ground's sink 15 % either way (30 %
+        /// low, the model flares' last two seconds replay at 29 to 42 fpm
+        /// rms, half as bad again). The elevator 5 % either way (7 to 13 ft)
+        /// does not replay them.
         fn ka_plants() -> Vec<Fit> {
             vec![
                 KA,
@@ -17863,72 +18080,41 @@ mod lemg13_sr22_bounce_tests {
                 Fit { path_s: KA.path_s * 0.9, ..KA },
                 Fit { gauge_s: KA.gauge_s * 1.2, ..KA },
                 Fit { gauge_s: KA.gauge_s * 0.8, ..KA },
-                Fit { tail_fpm: 150.0, ..KA },
-                Fit { wing_fpm: 250.0, wing_ft: 6.0, ..KA },
+                Fit { tail_fpm: KA.tail_fpm * 1.15, ..KA },
+                Fit { tail_fpm: KA.tail_fpm * 0.85, ..KA },
             ]
-        }
-
-        /// The recorded column and lever, open loop, from the recorded
-        /// gate: (t, radio, gauge) at every recorded tick before the wheels.
-        fn ka_replay(f: &Flown, fit: Fit, pipe: f64) -> Vec<(f64, f64, f64)> {
-            let (_, h, v, ias, _) = f.ticks[0];
-            let mut p = Plant::at(fit, h, v.unwrap(), ias, pipe);
-            p.ias_track = Some(f.ticks.iter().map(|x| (x.0, x.3)).collect());
-            p.thr0 = f.levers.first().map_or(p.thr0, |l| l.1);
-            p.thr = p.thr0;
-            p.thr_cmd = p.thr0;
-            let mut out = vec![];
-            let (mut wi, mut li) = (0, 0);
-            for &(t, _, _, _, rolling) in &f.ticks {
-                if rolling {
-                    break;
-                }
-                while p.t < t - 1e-9 {
-                    while wi < f.writes.len() && f.writes[wi].0 <= p.t + 1e-9 {
-                        let e = f.writes[wi].1;
-                        p.write(e);
-                        wi += 1;
-                    }
-                    while li < f.levers.len() && f.levers[li].0 <= p.t + 1e-9 {
-                        p.thr_cmd = f.levers[li].1;
-                        li += 1;
-                    }
-                    p.step(0.01);
-                }
-                out.push((t, p.radio(), p.vvi()));
-            }
-            out
         }
 
         /// The plant is the recording: each flare's column and lever as
         /// written, open loop, give back its radio within 4.5 ft and its
-        /// gauge within 95 fpm rms on every plant kept (the fit: 1.9 to 2.1
-        /// ft, 50 to 56 fpm).
+        /// gauge within 95 fpm rms on every plant kept; over the model
+        /// flares' last two seconds the fit is within 35 fpm rms and the
+        /// first fit, with no sink near the ground, 60 or worse at any column.
         #[test]
         fn the_king_air_plant_replays_its_flares() {
             for fit in ka_plants() {
-                for (src, pipe) in SRC.iter().zip(PIPES) {
-                    let f = flown(src);
-                    let rec: Vec<_> = f.ticks.iter().filter(|x| !x.4).collect();
-                    let got = ka_replay(&f, fit, pipe);
-                    let n = got.len().min(rec.len()) as f64;
-                    let (mut dh, mut dv) = (0.0, 0.0);
-                    for (g, r) in got.iter().zip(&rec) {
-                        dh += (g.1 - r.1).powi(2);
-                        dv += (g.2 - r.2.unwrap()).powi(2);
-                    }
-                    let (dh, dv) = ((dh / n).sqrt(), (dv / n).sqrt());
+                for (f, pipe) in flares() {
+                    let (dh, dv, _) = replay_rms(&f, fit, pipe, 0.0);
                     eprintln!("replay {}: {dh:.2} ft, {dv:.0} fpm rms", tag(fit));
                     assert!(dh < 4.5 && dv < 95.0, "{}: {dh:.2} ft, {dv:.0} fpm", tag(fit));
                 }
+            }
+            for (src, pipe) in MODEL_SRC.iter().zip(MODEL_PIPES) {
+                let f = flown(src);
+                let (.., fit_last) = replay_rms(&f, KA, pipe, 0.0);
+                let first_last = (0..=20)
+                    .map(|i| replay_rms(&f, KA_FIRST, -0.1 + 0.01 * i as f64, 0.0).2)
+                    .fold(f64::INFINITY, f64::min);
+                eprintln!("the last two seconds: the fit {fit_last:.0} fpm rms, the first fit {first_last:.0}");
+                assert!(fit_last < 35.0 && first_last > 60.0, "{fit_last:.0} against {first_last:.0}");
             }
         }
 
         /// A plant's name for the record.
         fn tag(f: Fit) -> String {
             format!(
-                "k {:.0} dead {:.2} path {:.2} gauge {:.2} tail {:.0} wing {:.0}",
-                f.k, f.dead, f.path_s, f.gauge_s, f.tail_fpm, f.wing_fpm
+                "k {:.0} dead {:.2} path {:.2} gauge {:.2} ground {:.0} from {:.1}",
+                f.k, f.dead, f.path_s, f.gauge_s, f.tail_fpm, f.tail_ft
             )
         }
 
@@ -17936,85 +18122,143 @@ mod lemg13_sr22_bounce_tests {
             crate::aircraft::load("king_air_c90b").expect("the King Air profile loads")
         }
 
-        /// The three recorded gates and neighbours: steeper and shallower,
-        /// faster and slower, lower.
-        const GATES: [(f64, f64, f64); 6] = [
-            (58.9, -703.0, 111.9),
-            (61.3, -642.0, 113.5),
-            (59.0, -699.0, 110.5),
-            (60.0, -780.0, 110.0),
-            (60.0, -600.0, 114.0),
-            (52.0, -700.0, 106.0),
+        fn approach_kts() -> f64 {
+            king_air().reference.as_ref().and_then(|r| r.approach_kts).expect("an approach speed")
+        }
+
+        /// The model flare as flown in d26a65d (the model's ground 320 fpm
+        /// from 40 ft).
+        fn flare_as_flown() -> crate::aircraft::FlareElevatorProfile {
+            let mut fe = king_air().flare_elevator.expect("the King Air declares its flare");
+            let mut m = fe.model.expect("a model");
+            m.ground_fpm = 320.0;
+            m.ground_ft = 40.0;
+            fe.model = Some(m);
+            fe
+        }
+
+        /// The model flares' recorded gates with their columns.
+        const MODEL_GATES: [(f64, f64, f64, f64, f64); 3] = [
+            (59.6, -625.0, 107.0, -0.0245, 0.0),
+            (58.6, -663.0, 107.7, -0.038, 0.0),
+            (58.3, -672.0, 107.6, -0.0466, 0.0),
+        ];
+
+        /// Closed loop from the three recorded gates, the model flare as
+        /// flown meets the refit plant about as it met the runway (301 to 310
+        /// on the gauge, 322 to 371 flown the tick before the wheels), and the
+        /// first fit landed it at 121 at most: the tests passed the flare the
+        /// sim failed.
+        #[test]
+        fn the_first_fit_passed_the_flare_the_sim_failed() {
+            let power = king_air().flare_power.expect("the King Air declares its retard");
+            let (mut refit, mut first) = ((f64::INFINITY, 0.0_f64), 0.0_f64);
+            for gate in MODEL_GATES {
+                for rough in [false, true] {
+                    let (_, g, _) = land_model(KA, gate, flare_as_flown(), power, approach_kts(), rough);
+                    refit = (refit.0.min(g), refit.1.max(g));
+                    let (_, g, _) = land_model(KA_FIRST, gate, flare_as_flown(), power, approach_kts(), rough);
+                    first = first.max(g);
+                }
+            }
+            eprintln!("as flown on the gauge: the refit {:.0} to {:.0} fpm, the first fit {first:.0} at most", refit.0, refit.1);
+            assert!(refit.0 > 250.0, "the refit: {refit:?}");
+            assert!(first < 150.0, "the first fit: {first:.0}");
+        }
+
+        /// The time constant is not the fault: the model as flown on a 3, 5
+        /// or 8 s constant meets the refit plant hard from the three recorded
+        /// model gates. What it lacks is the sink near the ground.
+        #[test]
+        fn a_flatter_exponential_alone_lands_as_hard() {
+            let power = king_air().flare_power.expect("the King Air declares its retard");
+            let mut soft = f64::INFINITY;
+            for tau in [3.0, 5.0, 8.0] {
+                let mut fe = flare_as_flown();
+                fe.tau_s = Some(tau);
+                for gate in MODEL_GATES {
+                    for rough in [false, true] {
+                        let (l, _, _) = land_model(KA, gate, fe, power, approach_kts(), rough);
+                        soft = soft.min(l.first_fpm);
+                    }
+                }
+            }
+            eprintln!("King Air as flown on 3 to 8 s: no softer than {soft:.0} fpm");
+            assert!(soft > 350.0, "{soft:.0}");
+        }
+
+        /// The recorded gates (the tracker's three and the model's three,
+        /// each with its column) and neighbours of the first: steeper and
+        /// shallower, faster and slower, lower.
+        const GATES: [(f64, f64, f64, f64, f64); 9] = [
+            (58.9, -703.0, 111.9, -0.1062, 0.0),
+            (61.3, -642.0, 113.5, -0.0496, 0.0),
+            (59.0, -699.0, 110.5, -0.1121, 0.0),
+            (59.6, -625.0, 107.0, -0.0245, 0.0),
+            (58.6, -663.0, 107.7, -0.038, 0.0),
+            (58.3, -672.0, 107.6, -0.0466, 0.0),
+            (60.0, -780.0, 110.0, -0.1062, 0.0),
+            (60.0, -600.0, 114.0, -0.1062, 0.0),
+            (52.0, -700.0, 106.0, -0.1062, 0.0),
         ];
 
         /// The tracker as flown meets the runway hard on the plant from the
         /// recorded gates, as it did (730 to 960 fpm on the gauge a tick
         /// before the wheels); the declared model flare (`flare_elevator`
         /// model, `flare_power`) from every gate on every plant that
-        /// replays, calm and rough: one contact under 250 fpm on the flight
-        /// path and on the gauge, never slower than the stall, and no longer
-        /// a float than the tracker's as flown on the plant (700 to 1,000 m
-        /// from the gate to the wheels; the sim's three about 830). The hop
-        /// after it is held under 2 ft, not the SR22's 1.5: the gear is the
-        /// SR22's, whose nose-up kick grows as the square of the speed, and
-        /// at 90 to 97 kt it hops 1.6 to 1.8 ft off 115 to 135 fpm.
+        /// replays, calm and rough: one contact at 60 to 250 fpm on the
+        /// flight path and on the gauge, never slower than the stall, and no
+        /// more than 1,100 m from the gate to the wheels (the tracker's own
+        /// on the plant; LEMG 13 is 3,200 m). The hop after it is held under
+        /// 4 ft, not the SR22's 1.5 (and the first fit's 2.5): the gear's kick
+        /// is the MOST the recorded contacts allow (KA: 0 to 3.0 replay them
+        /// alike), grows as the square of the speed, and the King Air lands
+        /// at 89 to 103 kt, so this is the hop's upper bound (3.8 ft off 222
+        /// fpm at 93 kt, the path 10 % quicker); no King Air contact has yet
+        /// left the runway (the three model flares, 322 to 371 fpm on the
+        /// gauge, rolled at 0.07 to 0.15 ft of radio).
         #[test]
         fn the_king_air_flares_where_the_tracker_dropped_it_in() {
             let mut flown_worst = 0.0_f64;
             for fit in ka_plants() {
-                for ((h, v, ias), pipe) in GATES.iter().take(3).zip(PIPES) {
-                    let mut p = Plant::at(fit, *h, *v, *ias, pipe);
+                for (gate, pipe) in GATES.iter().take(3).zip(PIPES) {
+                    let mut p = Plant::at(fit, gate.0, gate.1, gate.2, pipe);
                     let l = super::lilb03_evolution::land_tracker(&mut p, FlareGains::default(), 40.0);
                     let gauge = -p.first_gauge.unwrap_or(f64::NAN);
-                    eprintln!("tracker as flown {}: {l:?}, gauge {gauge:.0}, {:.0} m", tag(fit), p.along_m);
                     flown_worst = flown_worst.max(l.first_fpm.max(gauge));
                 }
             }
             assert!(flown_worst > 400.0, "the tracker as flown: {flown_worst:.0} fpm");
             let prof = king_air();
+            let fe = prof.flare_elevator.expect("the King Air declares its flare");
             let power = prof.flare_power.expect("the King Air declares its retard");
-            let approach = prof
-                .reference
-                .as_ref()
-                .and_then(|r| r.approach_kts)
-                .expect("an approach speed");
-            let mut worst = (0.0_f64, 0.0_f64, 0.0_f64, 0.0_f64, f64::INFINITY);
+            let mut worst = (f64::INFINITY, 0.0_f64, 0.0_f64, 0.0_f64, f64::INFINITY);
             let mut bad: Vec<String> = vec![];
             for fit in ka_plants() {
-                for (h, v, ias) in GATES {
+                for gate in GATES {
                     for rough in [false, true] {
-                        let pipe = PIPES[0];
-                        let mut p = Plant::at(fit, h, v, ias, pipe);
-                        let mut m = FlareModel::from_profile(prof.flare_elevator).expect("a model");
-                        let l = land(&mut p, &mut m, power, approach, rough, 45.0);
-                        let gauge = -p.first_gauge.unwrap_or(f64::NAN);
-                        let why = format!("{}, {h} {v} {ias} rough {rough}: {l:?}, gauge {gauge:.0}, {:.0} m", tag(fit), p.along_m);
-// Without the push a standing plant FLOATS in these models (18 to 20 s
-                        // from 60 ft, to 1,075 m); flown, the King Air's no-push
-                        // flare took 11.3 s, no longer than the pushed ones (10.8,
-                        // 11.5 s, which skipped): LEMG 13 1790783744 vs 1790783945
-                        // and 1790784149, iMac 2026-09-30. The float is bounded
-                        // by the pavement (`commit_flare`), not by the model.
-                        if !(l.first_fpm < 250.0
-                            && gauge < 250.0
-                            && l.bounce_ft < 2.5
+                        let (l, gauge, along) = land_model(fit, gate, fe, power, approach_kts(), rough);
+                        let why = format!("{}, {gate:?} rough {rough}: {l:?}, gauge {gauge:.0}, {along:.0} m", tag(fit));
+                        if !((60.0..=250.0).contains(&l.first_fpm)
+                            && (60.0..=250.0).contains(&gauge)
+                            && l.bounce_ft < 4.0
                             && l.min_ias > fit.vso
-                            && p.along_m < 1100.0)
+                            && along < 1100.0)
                         {
                             bad.push(why);
                         }
                         worst = (
-                            worst.0.max(l.first_fpm),
-                            worst.1.max(gauge),
+                            worst.0.min(l.first_fpm.min(gauge)),
+                            worst.1.max(l.first_fpm.max(gauge)),
                             worst.2.max(l.bounce_ft),
-                            worst.3.max(p.along_m),
+                            worst.3.max(along),
                             worst.4.min(l.first_ias),
                         );
                     }
                 }
             }
             eprintln!(
-                "King Air flare: worst {:.0} fpm on the path, {:.0} on the gauge, {:.2} ft after, {:.0} m past the gate, slowest contact {:.1} kt",
+                "King Air flare: {:.0} to {:.0} fpm, {:.2} ft after, {:.0} m past the gate, slowest contact {:.1} kt",
                 worst.0, worst.1, worst.2, worst.3, worst.4
             );
             assert!(bad.is_empty(), "{} landings out of limits:\n{}", bad.len(), bad.join("\n"));
