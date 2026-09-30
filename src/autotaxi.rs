@@ -1185,17 +1185,62 @@ pub const SWING_CATCH_DPS: f64 = 8.0;
 pub const SWING_CATCH_SPAN_DPS: f64 = 30.0;
 pub const SWING_CATCH_MAX: f64 = 0.2;
 
+/// A free nose's catch and turn brakes come in from this groundspeed and
+/// are whole [`WALK_SPAN_KTS`] above it: a braked wheel turns the aircraft
+/// only while it rolls, but at a walk it is the only thing that does.
+pub const WALK_FROM_KTS: f64 = 0.5;
+pub const WALK_SPAN_KTS: f64 = 1.0;
+
+/// The share of a free nose's catch and turn brakes the rolling speed
+/// gives. Pure.
+pub fn walk_authority(gs_kts: f64) -> f64 {
+    ((gs_kts - WALK_FROM_KTS) / WALK_SPAN_KTS).clamp(0.0, 1.0)
+}
+
+/// Past this heading error a free nose's turn is BUILT on its inside brake
+/// ([`turn_build_brake`]).
+pub const TURN_BUILD_ERR_DEG: f64 = 25.0;
+/// The yaw rate the turn is built toward: the error over this, at most
+/// [`TURN_BUILD_MAX_DPS`] (the rate ceiling's start, [`PIVOT_RATE_DPS`]).
+pub const TURN_BUILD_S: f64 = 2.0;
+pub const TURN_BUILD_MAX_DPS: f64 = 15.0;
+/// The shortfall of the yaw under that rate at which the brake is whole,
+/// and the whole brake.
+pub const TURN_BUILD_FULL_DPS: f64 = 15.0;
+pub const TURN_BUILD_MAX: f64 = 0.12;
+
+/// The inside brake a free nose's TURN wants: past
+/// [`TURN_BUILD_ERR_DEG`] the nose should be coming round at err /
+/// [`TURN_BUILD_S`], at most [`TURN_BUILD_MAX_DPS`]; the brake builds with
+/// the shortfall of the yaw toward the error and lets go as the turn
+/// arrives, at any speed from a walk ([`walk_authority`]). LEMG, the SR22
+/// (iMac 2026-09-30, sortie 1790732424, 3,670 m to go): out of a right
+/// corner at 1.2 to 2 kt with the error 25 to 61 degrees the other way and
+/// the steer 0.6 to 0.78, the taxi split's fade (nothing under 1.5 kt,
+/// 0.04 at 1.6) gave the inside wheel 0.01 to 0.04 for 2 s, the nose never
+/// came round and it ran 5.1 m off. Pure.
+pub fn turn_build_brake(err_deg: f64, yaw_dps: f64, gs_kts: f64) -> f64 {
+    if err_deg.abs() < TURN_BUILD_ERR_DEG {
+        return 0.0;
+    }
+    let want = (err_deg.abs() / TURN_BUILD_S).min(TURN_BUILD_MAX_DPS);
+    let toward = yaw_dps * err_deg.signum();
+    ((want - toward) / TURN_BUILD_FULL_DPS).clamp(0.0, 1.0) * TURN_BUILD_MAX * walk_authority(gs_kts)
+}
+
 /// The brake half of the taxi steering on a castoring nose, one tick: the
 /// taxi split on the smoothed steer, the pivot's split past
 /// [`PIVOT_MIN_ERR_DEG`] at walking pace, both under the turn-rate ceiling
 /// ([`pivot_rate_scale`]), squeezed on at [`BRAKE_STEER_SLEW_PER_S`].
 ///
-/// On a nose with no steering of its own (`aircraft::nose_free`) two more
-/// things, because there the brakes are the only thing that stops a swing:
-/// a swing past [`SWING_CATCH_DPS`] against the steer is caught on the
-/// opposite wheel with authority from 1 kt (the taxi split's fades out
-/// under 4), and a brake the law no longer wants comes OFF at once, never
-/// eased off at the squeeze's rate. LEMG, the SR22 from the GA stand to 12
+/// On a nose with no steering of its own (`aircraft::nose_free`) three more
+/// things, because there the brakes are the only thing that turns it or
+/// stops a swing, both with authority from a walk ([`walk_authority`]; the
+/// taxi split's fades out under 4 kt and is nothing under 1.5): a swing past
+/// [`SWING_CATCH_DPS`] against the steer is caught on the opposite wheel; a
+/// large error with the nose not coming round is BUILT on the inside wheel
+/// ([`turn_build_brake`]); and a brake the law no longer wants comes OFF at
+/// once, never eased off at the squeeze's rate. LEMG, the SR22 from the GA stand to 12
 /// (iMac, 19 fps, 0.3 s ticks; sorties 1790690995, 1790718797 and
 /// 1790725168, 2026-09-29/30): every taxi failed 4.7 to 5.3 m off at one of
 /// two left corners of about 100 degrees, entered at 7 to 8.7 kt. The
@@ -1242,11 +1287,21 @@ impl BrakeSteer {
         if free_nose && steer * yaw_dps < 0.0 && yaw_dps.abs() > SWING_CATCH_DPS {
             let b = ((yaw_dps.abs() - SWING_CATCH_DPS) / SWING_CATCH_SPAN_DPS).clamp(0.0, 1.0)
                 * SWING_CATCH_MAX
-                * (gs_kts - 1.0).clamp(0.0, 1.0);
+                * walk_authority(gs_kts);
             if yaw_dps < 0.0 {
                 (wl, wr) = (0.0, wr.max(b));
             } else {
                 (wl, wr) = (wl.max(b), 0.0);
+            }
+        }
+        if free_nose {
+            let b = turn_build_brake(err_deg, yaw_dps, gs_kts);
+            if b > 0.0 {
+                if err_deg > 0.0 {
+                    (wl, wr) = (0.0, wr.max(b));
+                } else {
+                    (wl, wr) = (wl.max(b), 0.0);
+                }
             }
         }
         let ease = |prev: f64, want: f64| {
@@ -6235,6 +6290,28 @@ mod tests {
         }
     }
 
+    /// The law as d28e8f4 flew it (1790732424): the swing catch with its
+    /// authority from 1 kt, no turn builder, a brake let go at once.
+    fn d28e8f4_free_nose_brakes() -> impl FnMut(f64, f64, f64, f64, f64) -> (f64, f64) {
+        let (mut bs, mut prev) = (0.0_f64, (0.0_f64, 0.0_f64));
+        move |steer, err, gs, yaw, dt| {
+            bs = smooth_toward(bs, steer, BRAKE_STEER_TAU_S, dt);
+            let pivot = pivot_due(err, gs, false);
+            let (wl, wr) = if pivot { pivot_brake_split(steer, gs) } else { brake_steer_split_band(bs, gs, true) };
+            let k = pivot_rate_scale(if pivot { steer } else { bs }, yaw);
+            let (mut wl, mut wr) = (wl * k, wr * k);
+            if steer * yaw < 0.0 && yaw.abs() > SWING_CATCH_DPS {
+                let b = ((yaw.abs() - SWING_CATCH_DPS) / SWING_CATCH_SPAN_DPS).clamp(0.0, 1.0)
+                    * SWING_CATCH_MAX
+                    * (gs - 1.0).clamp(0.0, 1.0);
+                (wl, wr) = if yaw < 0.0 { (0.0, wr.max(b)) } else { (wl.max(b), 0.0) };
+            }
+            let ease = |p: f64, w: f64| if w < p { w } else { slew_steer(p, w, Some(BRAKE_STEER_SLEW_PER_S), dt) };
+            prev = (ease(prev.0, wl), ease(prev.1, wr));
+            prev
+        }
+    }
+
     /// The law `drive` flies on a free castoring nose.
     fn free_nose_brakes() -> impl FnMut(f64, f64, f64, f64, f64) -> (f64, f64) {
         let mut b = BrakeSteer::default();
@@ -6514,6 +6591,100 @@ mod tests {
         }
         eprintln!("as flown: worst {worst_old:?}, {fail_old}/{n} over; now: worst {worst_new:?}");
         assert!(worst_old.0 > 4.5 && fail_old * 6 >= n, "the plant must fail the old corner as flown: {worst_old:?}, {fail_old}/{n}");
+        assert!(worst_new.0 <= TAXI_MAX_LAT_M, "{worst_new:?}");
+    }
+
+    /// LEMG, the SR22 on d28e8f4 (iMac 2026-09-30, sortie 1790732424, ticks
+    /// 1080 on, 3,683 m to go): a right corner entered at 6.6 kt, the swing
+    /// out of it at 1.8 kt, then the error 25 to 61 degrees LEFT at 1.2 to
+    /// 2 kt with the steer at 0.6 to 0.78. (s, gs kt, err, steer, yaw_dps,
+    /// bl, br) as logged.
+    #[rustfmt::skip]
+    const LEMG_SLOW_CORNER: &[(f64, f64, f64, f64, f64, f64, f64)] = &[
+        (0.0, 6.63, -3.95, -0.014, -2.32, 0.0, 0.0), (0.3, 6.59, -3.25, -0.036, -2.45, 0.0, 0.0), (0.5, 6.55, -2.33, 0.068, -2.49, 0.0, 0.0), (0.8, 6.5, -1.34, 0.089, -2.46, 0.0, 0.0),
+        (1.1, 6.46, -0.4, 0.111, -2.44, 0.0, 0.008), (1.4, 6.39, 1.18, 0.143, -2.33, 0.0, 0.022), (1.6, 6.28, 1.89, 0.145, -2.04, 0.0, 0.031), (1.9, 6.16, 2.37, 0.129, -1.47, 0.0, 0.033),
+        (2.1, 5.99, 7.47, 0.223, -0.89, 0.0, 0.051), (2.4, 5.83, 11.31, 0.277, -0.12, 0.0, 0.069), (2.6, 5.61, 15.25, 0.365, 0.87, 0.0, 0.096), (2.9, 5.24, 19.79, 0.473, 2.31, 0.0, 0.136),
+        (3.1, 4.83, 22.96, 0.549, 4.41, 0.0, 0.169), (3.4, 4.1, 25.61, 0.611, 7.43, 0.0, 0.208), (3.6, 3.52, 25.79, 0.616, 11.14, 0.0, 0.182), (3.9, 2.89, 24.12, 0.408, 15.03, 0.0, 0.111),
+        (4.1, 1.93, 20.64, 0.233, 19.78, 0.0, 0.014), (4.3, 1.81, 15.49, 0.056, 24.17, 0.0, 0.001), (4.7, 1.82, 7.73, -0.211, 25.74, 0.097, 0.0), (4.9, 1.6, 2.31, -0.406, 25.4, 0.069, 0.0),
+        (5.2, 1.31, -4.51, -0.633, 23.55, 0.032, 0.0), (5.5, 1.21, -8.9, -0.61, 20.94, 0.018, 0.0), (5.8, 1.16, -14.3, -0.602, 19.13, 0.012, 0.0), (6.0, 1.16, -17.93, -0.601, 17.44, 0.01, 0.0),
+        (6.3, 1.18, -22.08, -0.605, 16.01, 0.01, 0.0), (6.5, 1.2, -25.41, -0.611, 14.8, 0.009, 0.0), (6.7, 1.24, -28.7, -0.618, 13.7, 0.009, 0.0), (7.1, 1.31, -33.28, -0.633, 12.68, 0.01, 0.0),
+        (7.3, 1.36, -36.29, -0.645, 11.58, 0.009, 0.0), (7.6, 1.47, -40.47, -0.667, 10.59, 0.008, 0.0), (7.9, 1.54, -43.15, -0.684, 9.59, 0.006, 0.0), (8.1, 1.66, -46.33, -0.709, 8.67, 0.016, 0.0),
+        (8.4, 1.75, -49.46, -0.73, 7.79, 0.025, 0.0), (8.7, 1.83, -52.5, -0.746, 6.69, 0.033, 0.0), (8.9, 1.89, -55.46, -0.76, 5.48, 0.039, 0.0), (9.2, 1.95, -58.18, -0.772, 4.03, 0.045, 0.0),
+        (9.5, 1.99, -60.48, -0.781, 2.39, 0.159, 0.0), (9.8, 1.35, -61.4, -0.643, -0.02, 0.159, 0.0), (10.0, 0.81, -34.83, -0.433, -6.72, 0.0, 0.0), (10.3, 0.94, -31.06, -0.222, -10.6, 0.0, 0.0),
+        (10.6, 1.17, -52.05, -0.391, -12.39, 0.0, 0.0), (10.8, 1.42, -48.85, -0.357, -13.03, 0.0, 0.0), (11.1, 1.7, -45.68, -0.334, -13.05, 0.012, 0.0),
+    ];
+
+    /// The logged ticks through d28e8f4's law give back the logged brakes;
+    /// through [`BrakeSteer`] the inside (left) wheel is braked from the
+    /// moment the error passes [`TURN_BUILD_ERR_DEG`] with the nose still
+    /// swinging the other way: 0.06 or more on every such tick where 0.006
+    /// to 0.045 flew.
+    #[test]
+    fn a_walking_turn_is_built_on_its_inside_brake() {
+        let (mut flown, mut ours) = (d28e8f4_free_nose_brakes(), free_nose_brakes());
+        let (mut n, mut flown_max) = (0, 0.0_f64);
+        for (i, &(t, gs, err, steer, yaw, bl, br)) in LEMG_SLOW_CORNER.iter().enumerate() {
+            let dt = if i == 0 { 0.2 } else { t - LEMG_SLOW_CORNER[i - 1].0 };
+            let (fl, fr) = flown(steer, err, gs, yaw, dt);
+            let (nl, nr) = ours(steer, err, gs, yaw, dt);
+            if i >= 6 {
+                assert!((fl - bl).abs() < 0.05 && (fr - br).abs() < 0.05, "t {t}: d28e8f4 {fl:.3} {fr:.3} vs flown {bl} {br}");
+            }
+            // The nose not yet coming round toward the error.
+            if err <= -TURN_BUILD_ERR_DEG && err > -60.0 && gs >= 1.2 && yaw > 0.0 {
+                n += 1;
+                flown_max = flown_max.max(bl);
+                assert!(nl >= 0.06 && nr == 0.0, "t {t}: err {err} at {gs} kt, yaw {yaw}: {nl:.3} (flown {bl})");
+            }
+        }
+        assert!(n >= 10 && flown_max < 0.05, "{n} ticks, flown at most {flown_max}");
+    }
+
+    /// Corners at a WALK (90 to 110 degrees either way, the governor on its
+    /// target or 1 kt over, creeping out of a swing at 0.05 to 0.2 m/s^2):
+    /// d28e8f4's law ran wide of some, up to 8.8 m, the nose left at 50 to
+    /// 60 degrees off at 1.6 kt with 0.01 of brake; the built turn flies
+    /// every one inside the line.
+    #[test]
+    fn a_free_nose_turns_a_walking_corner_on_the_line() {
+        use crate::scorecard::{TAXI_MAX_CUT_M, TAXI_MAX_LAT_M};
+        let (mut worst_prev, mut worst_new) = ((0.0_f64, String::new()), (0.0_f64, String::new()));
+        for side in [-1.0_f64, 1.0] {
+            for deg in [90.0_f64, 100.0, 110.0] {
+                let (jog, th) = ((-10.0 * side).to_radians(), (side * deg).to_radians());
+                let v = (30.0 * jog.sin(), 30.0 * jog.cos());
+                let path = [(0.0, -300.0), (0.0, 0.0), v, (v.0 + 250.0 * th.sin(), v.1 + 250.0 * th.cos())];
+                for dt in [0.3, 0.36, 0.42] {
+                    for over in [0.0, 1.0] {
+                        for pull in [0.05, 0.1, 0.2] {
+                            let fly = |brakes: &mut dyn FnMut(f64, f64, f64, f64, f64) -> (f64, f64)| {
+                                let run = CornerRun {
+                                    dt,
+                                    v0_kts: 6.0 + over,
+                                    imac: Some((over, pull)),
+                                    brakes,
+                                    judge_from_m: 280.0,
+                                    yaw_cap: true,
+                                };
+                                let ((cut, lat), _) = fly_sr22_corner_with(&path, (0.0, -150.0), true, run);
+                                lat.max(cut - (TAXI_MAX_CUT_M - TAXI_MAX_LAT_M))
+                            };
+                            let why = format!("{side} {deg} deg, {dt} s, {over} kt over, pull {pull}");
+                            let prev = fly(&mut d28e8f4_free_nose_brakes());
+                            let new = fly(&mut free_nose_brakes());
+                            if prev > worst_prev.0 {
+                                worst_prev = (prev, why.clone());
+                            }
+                            if new > worst_new.0 {
+                                worst_new = (new, why);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        eprintln!("d28e8f4: worst {worst_prev:?}; now: worst {worst_new:?}");
+        assert!(worst_prev.0 > 5.0, "the plant must run d28e8f4 wide: {worst_prev:?}");
         assert!(worst_new.0 <= TAXI_MAX_LAT_M, "{worst_new:?}");
     }
 

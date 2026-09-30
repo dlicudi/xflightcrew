@@ -11685,3 +11685,37 @@ Next SR22 taxi from the LEMG GA stand: the `speedhold` `brake` `target` near 3 t
 `yaw_dps` under 25, `br` (or `bl`) 0.1 to 0.2 while `steer` and `yaw_dps` disagree past 8, the
 inside brake 0 the tick `yaw_dps` passes 25 its way; `stage_result` taxi `max_lat_m` under 3 and the
 `secs` near 1,060 to 1,100 (the corners cost seconds, not minutes). Offline only.
+
+## 2026-09-30: a free nose builds its turn on the inside brake at a walk (#165)
+
+iMac 2026-09-30, the SR22 on d28e8f4 (build d8a8e38), sortie 1790732424, LEMG GA stand to 12: taxi
+FAIL 5.1 m (`brake_reversals` 3). The corner cap worked (the LEMG corners were taken slowly); the
+worst was an earlier corner at 3,683 m to go: a right corner entered at 6.6 kt, the swing out of it
+at 1.8 kt (yaw 25.7 deg/s), then 4 s with the error 25 to 61 degrees LEFT at 1.2 to 2 kt, the steer
+0.6 to 0.78 and the nose still swinging right at 15 to 4 deg/s: the left wheel got 0.006 to 0.045.
+The taxi split's free-nose fade gives nothing under 1.5 kt and 0.04 of its brake at 1.6, and the
+swing catch's authority started at 1 kt (0.16 of it at 1.16). The pivot came in at 60 degrees
+(0.16), the error read 35 the next tick and it let go; lat 2.45 to 5.12 m.
+
+The fix (`BrakeSteer`, free noses only):
+- **The turn is built** (`turn_build_brake`): past `TURN_BUILD_ERR_DEG` (25) the nose should be
+  coming round at err / 2 s, at most 15 deg/s; the inside brake builds with the shortfall of the yaw
+  toward the error, whole (`TURN_BUILD_MAX` 0.12) 15 deg/s short, and lets go as the turn arrives.
+  Replayed on the logged ticks: 0.06 to 0.12 on every tick the flown law gave under 0.05.
+- **At any speed from a walk** (`walk_authority`: from 0.5 kt, whole at 1.5), for the build and the
+  swing catch alike.
+Kept small on purpose: on the refitted plant a braked wheel at 1 m/s turns 350 deg/s per unit and
+drags the aircraft to a stop (0.16 took 2.0 kt to 0.8 in 0.6 s as flown); 0.3 stopped the harness
+aircraft in its corners.
+
+Tests: `a_walking_turn_is_built_on_its_inside_brake` (the logged ticks through d28e8f4's law give
+back the logged brakes; the new one brakes the inside wheel), `a_free_nose_turns_a_walking_corner_on_the_line`
+(walking-pace corners either way on the refitted plant: d28e8f4 worst 8.8 m, now 2.9);
+`a_free_nose_flies_the_lemg_corners_on_the_line` and the three earlier iMac corners unchanged.
+The harness still runs some 60 and 75 degree vertices 3 to 4 m inside (a cut the scorer judges as
+the line when the yaw stops before the projection jumps): not this law's, not flown so.
+
+Next SR22 taxi: at a corner flown under 2 kt, `autotaxi` `drive` `bl`/`br` on the error's side 0.05
+to 0.12 while `err` is past 25 and `yaw_dps` is not yet toward it, the yaw coming round within 1 to
+2 s; `stage_result` taxi `max_lat_m` under 3; the Evolution's `drive` ticks likewise (its line-up
+turn-round is another agent's). Offline only.
