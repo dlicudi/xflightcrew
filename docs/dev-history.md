@@ -12362,3 +12362,48 @@ now allows 16.6 kt at 200 m (the window opens earlier).
 Next Citation LEMG taxi: `drive` ticks near 690 m to go with `gs` down to about 6 kt BEFORE
 `turn_dps` passes -5, `steer` under full lock, `lat_m` inside 3 m; the stage's `max_lat_m` under 3.
 Every other taxi should be no faster into a corner and a little slower on drawn fillets. Offline only.
+
+## 2026-09-30: a missed approach is judged by the ground it makes, never a flat clock
+
+iMac 2026-09-30, sortie 1790775809-approach, SR22 on LEMG 13 from a 2 nm final: X-Plane placed it
+high and fast, and the stabilised gate correctly sent it round at 734 ft (t+12.7: flap, fast, sink,
+high). The reversal planned LEMG 13's terrain-raised right-hand pattern (t+29.5, `reversal`
+`judged_at_ft` 2,895, join point 10.3 nm, 104 kt), and the SR22 flew it as planned: 10 nm of
+downwind at 90 kt, base at 11 nm, inbound on the line from 11.4 nm. At t+613 it was at 9.04 nm, 40 m
+off, 2,884 ft, 90 ft under the path it was about to join (`path_joined` a few seconds on), when
+autoland gave up `missed_approach_timeout` and handed back level at 92 kt: safe, but nobody flying
+in an unattended run. The flat 600 s (`MAX_MISSED_APPROACH_SECS`, raised from 300 s when EGHI's
+Baron expired mid-leg, 2026-08-02) knows neither the speed nor the pattern: a slow single on a big
+terrain pattern cannot finish in it, and a jet could loiter in it uselessly for ten minutes.
+
+The taxi's principle (`autotaxi::ProgressWatch`, #165): `reversal::MissedWatch` judges each stage
+by its own measure, with an outer bound from the plan, and gives up only when progress stalls or
+the bound passes. Stages (`reversal::Progress`): the go-around's climb (feet to the 800 ft turn), a
+refused pattern's hold (feet to its altitude), waiting on the plan, and the pattern. A pattern's
+measure is its track to go (`reversal::to_go_nm`: the rest of the downwind to the base, back in to
+where the path meets the platform, `pattern_end_nm`, and the lateral legs out and back), sized at
+the speed it began at; an extended downwind's (`high`) is the height above its platform. Progress
+is a step off the measure (a quarter of what the pattern's speed flies in 120 s; 100 ft in 90 s for
+a height), a leg sequenced, or a new stage; flipping in and out of `high` is not. Outer bounds: a
+pattern's planned track at its speed plus its height at the pattern's descent, x 1.5, + 180 s
+(`pattern_budget_s`); a climb at 300 fpm, the same margin; the plan 150 s. A gap over 5 s between
+ticks is a frozen sim and holds both clocks. The watch runs while a missed approach, a pattern
+(missed or not) or a hold is flown; the give-up keeps the flyable hand-back (climb power, VS dial
+zero), now says "gear is down" only when it is, and records `reason` `missed_approach_stalled` or
+`missed_approach_over_budget` with `stage`, `to_go_nm`, `stalled_s`, `budget_left_s`, `leg`, `gs`.
+Each stage's start is blackboxed `missed_progress` (`stage`, `to_go_nm`, `leg`, `budget_s`,
+`pattern_gs`).
+
+On the record (replayed at 1 s): the pattern's plan is 15.3 nm, its bound 974 s; it stood at most
+58 s without a step (the turn onto the downwind) and had 390 s left at t+613. The same SR22 in an
+orbit is given up at 121 s. A 737 on the kinematic autopilot (160 kt, 24 degrees, EGTE 08 at 3,000
+ft): bound 969 s, flown in 577 s; in an orbit from 60 s, given up at 199 s. Tests
+`lemg_13_sr22_pattern_makes_its_ground_and_is_never_given_up`,
+`a_pattern_that_goes_nowhere_is_given_up_in_minutes`,
+`a_jet_pattern_is_judged_on_its_own_size_and_speed`,
+`an_extended_downwind_progresses_by_the_height_it_loses`,
+`a_climb_that_stops_or_a_plan_that_never_comes_is_given_up`.
+
+Next missed approach: `missed_progress` at `climb`, then `pattern` with `to_go_nm` and `budget_s`
+(an SR22 on LEMG 13's raised pattern near 15 nm and 970 s), `reversal_done` `path_joined` and no
+`give_up`; a real give-up names its `stage` and `stalled_s`. Offline only.
