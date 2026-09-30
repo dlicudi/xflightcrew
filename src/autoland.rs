@@ -458,6 +458,12 @@ const VVI_FPM: &str = crate::datarefs::VVI_FPM;
 // AP + controls (mirror of autopilot.rs / recover.rs).
 const CMD_SERVOS_ON: &str = "sim/autopilot/servos_on";
 const CMD_SERVOS_OFF: &str = "sim/autopilot/servos_off_any";
+/// Servos AND flight director off: the wheels' disconnect.
+const CMD_SERVOS_FDIR_OFF: &str = "sim/autopilot/servos_fdir_off";
+const CMD_YAW_DAMPER_OFF: &str = "sim/systems/yaw_damper_off";
+/// The autopilot master as the sim has it (power and failures included).
+const AP_MASTER_ON: &str = "sim/cockpit2/autopilot/autopilot_on";
+const YAW_DAMPER_ON: &str = "sim/cockpit2/switches/yaw_damper_on";
 const SERVOS_ON: &str = "sim/cockpit2/autopilot/servos_on";
 const CMD_HDG_MODE: &str = "sim/autopilot/heading";
 const CMD_VS_MODE: &str = "sim/autopilot/vertical_speed";
@@ -1179,14 +1185,39 @@ pub fn landed_runway() -> Option<String> {
 /// the bug a quarter of a degree off the nose). Read first, read back, and
 /// blackboxed `ap_disconnected`. `None` = it was already off, or no reading.
 async fn disconnect_autopilot(xp: &dyn crate::xplane::XPlane) -> Option<bool> {
-    if !xp.get_float(SERVOS_ON).await.is_ok_and(|v| v > 0.5) {
+    // The whole autopilot, not only the servos: the arrest takes the servos
+    // out at the roundout, so `servos_on` read 0 on the wheels while the
+    // master (`autopilot_on`) held HDG and VS lit and the yaw damper stayed
+    // on, and nothing came out (King Air LEMG 13, 1790780099-approach and
+    // 1790780311-approach, iMac 2026-09-30: `ap` true down to 32 kt; one
+    // swung 70 degrees right from 91 kt under full left steer, #197).
+    let on = |r: Result<f64, _>| r.is_ok_and(|v: f64| v > 0.5);
+    let (servos, master, damper) = tokio::join!(
+        xp.get_float(SERVOS_ON),
+        xp.get_float(AP_MASTER_ON),
+        xp.get_float(YAW_DAMPER_ON),
+    );
+    let (servos, master, damper) = (on(servos), on(master), on(damper));
+    if !servos && !master && !damper {
         return None;
     }
-    let ok = xp.run_command(CMD_SERVOS_OFF).await.is_ok()
-        && xp.get_float(SERVOS_ON).await.is_ok_and(|v| v < 0.5);
+    if servos || master {
+        let _ = xp.run_command(CMD_SERVOS_FDIR_OFF).await;
+    }
+    if damper {
+        let _ = xp.run_command(CMD_YAW_DAMPER_OFF).await;
+    }
+    let (s2, m2, d2) = tokio::join!(
+        xp.get_float(SERVOS_ON),
+        xp.get_float(AP_MASTER_ON),
+        xp.get_float(YAW_DAMPER_ON),
+    );
+    let off = |r: Result<f64, _>| r.is_ok_and(|v: f64| v < 0.5);
+    let ok = off(s2) && (!master || off(m2)) && (!damper || off(d2));
     crate::blackbox::record(
         "autoland",
-        serde_json::json!({"event": "ap_disconnected", "ok": ok}),
+        serde_json::json!({"event": "ap_disconnected", "ok": ok,
+            "servos": servos, "master": master, "yaw_damper": damper}),
     );
     Some(ok)
 }
@@ -12690,11 +12721,25 @@ mod approach_power_floor_tests {
         let xp = FakeXPlane::with_reads(&[(super::SERVOS_ON, 1.0)]);
         // The fake never moves, so the readback disagrees and it is SAID so.
         assert_eq!(super::disconnect_autopilot(&xp).await, Some(false));
-        assert!(xp.ran(super::CMD_SERVOS_OFF));
-        // Already off (a hand-flown landing under autoland's callouts): left.
-        let xp = FakeXPlane::with_reads(&[(super::SERVOS_ON, 0.0)]);
+        assert!(xp.ran(super::CMD_SERVOS_FDIR_OFF));
+        // Servos already out by the arrest, the master and yaw damper still
+        // on (King Air LEMG 13, #197): both come out.
+        let xp = FakeXPlane::with_reads(&[
+            (super::SERVOS_ON, 0.0),
+            (super::AP_MASTER_ON, 1.0),
+            (super::YAW_DAMPER_ON, 1.0),
+        ]);
+        assert!(super::disconnect_autopilot(&xp).await.is_some());
+        assert!(xp.ran(super::CMD_SERVOS_FDIR_OFF));
+        assert!(xp.ran(super::CMD_YAW_DAMPER_OFF));
+        // All off (a hand-flown landing under autoland's callouts): left.
+        let xp = FakeXPlane::with_reads(&[
+            (super::SERVOS_ON, 0.0),
+            (super::AP_MASTER_ON, 0.0),
+            (super::YAW_DAMPER_ON, 0.0),
+        ]);
         assert_eq!(super::disconnect_autopilot(&xp).await, None);
-        assert!(!xp.ran(super::CMD_SERVOS_OFF));
+        assert!(!xp.ran(super::CMD_SERVOS_FDIR_OFF));
     }
 
     /// EDLP 24 (2026-09-24): the SF50's 0.35 went to neutral in one tick at
