@@ -342,6 +342,33 @@ taxi:
   # hold slows in beta, at most half of the range, before any brake.
   beta_max: 0.8   # 0.5 held 17.7 kt at LIME with beta engaged (2026-09-25); 1.0 is the edge of reverse
 
+# The takeoff roll's rudder (autotakeoff::RollSteer), fitted to the two LILB
+# 03 rolls on the default law (1790712974 and 1790724857, 2026-09-29/30, calm
+# air): the sim's yaw rate against the steer from 12 kt, three-second heading
+# predictions through 0.3 s of dead time and the 0.47 s lag. In the PT6's wash
+# the rudder is nearly flat with the speed, 21 deg/s per unit at 60 kt as
+# v^0.5 or 40 as v (the brakes 43 to 49 per unit of split), and the STANDING
+# rudder at 1,500 to 1,700 ft-lb of torque is 0.8 to 0.95 of steer. Without
+# this block the default law gave 0.58 to 0.68 (its authority floor of 0.35
+# per 12 degrees from 50 kt, a trim of 0.15, a lead of 0.08; not the 0.85
+# cap) with the nose 10 to 18 degrees left, and both rolls were rejected 9 to
+# 10 m left at 49 and 60 kt. Declared at 30 between the fits, the standing
+# rudder at 0.6 of full lever (the most a profile may declare; the trim takes
+# the rest) believed to the 60 kt measured, closed at 1 per second with the
+# trim's corner at 0.3 (the SR22's 1.5 and 0.45 stray further here): replayed,
+# the aligned roll holds 1.1 m where it flew 8 and 2.5 m on either fit at half
+# to twice and 0.05 of need either way. The torque ran past the manual's
+# 1,250 (the limiter steps the lever back 0.02 a tick; the PT6 spooled on and
+# made more with the speed), and at that torque the law sits at its 0.85 cap
+# from about 45 kt: RE-FLY with the torque in the roll ticks (`trq_ftlb`).
+roll_rudder:
+  yaw_dps: 30.0
+  at_kts: 60.0
+  power_steer: 0.6
+  power_steer_to_kts: 60.0
+  close_per_s: 1.0
+  trim_per_s: 0.3
+
 # The takeoff power limit, from the manuals: "For take-off in N844X, you are
 # only allowed to use about HALF power, since more power would over-power the
 # rudders' and ailerons' ability to counter the engine torque. So, we take off
