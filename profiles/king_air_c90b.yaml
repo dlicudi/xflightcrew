@@ -271,6 +271,84 @@ reference:
 # degrees and flew 22.4 with the law pinned at its limit. VERIFY.
 pitch_authority_down: 0.25
 
+# THE FLARE (issue #197; LEMG 13 from 4 nm on the iMac, 2026-09-30,
+# sorties 1790757702, 1790758429, 1790758604): flown on the jets' default
+# tracker, each arrest took the servos at 59 to 61 ft sinking 640 to 700 fpm
+# at 110 to 114 KIAS, pulled 0.23 to 0.35 and ballooned (61 ft level; then
+# 17.5 to 39 ft on the balloon's approach thrust), was let go to neutral,
+# and the sink it rebuilt met the runway at 730 to 960 fpm on the gauge a
+# tick before the wheels (the scorer read 256 to 518 from its 3 s samples
+# after the contact). Fitted to the three flares with the servos out (radio
+# 1.9 to 2.3 ft rms, gauge 50 to 56 fpm rms): 9,500 to 9,700 fpm of standing
+# sink per unit of pull after 0.8 s of dead time, through the path's 2.3 to
+# 2.6 s and the gauge's 0.9 s, and 100 to 118 fpm of sink per knot the speed
+# loses; the tail's ground effect is 323 fpm from 40 ft with the lever on a
+# 4 s spool, none with it on 2 s (the lever's own sink is not in these
+# flares). The model below is the first fit; the plants it is flown against
+# are the second and its neighbours. So the flare is flown on the model (the
+# SF50's, SR22's and Evolution's law):
+#   * the exponential flare to `touchdown_fpm`, the pull up to 0.5, a
+#     balloon eased at 0.15 a second, never dropped;
+#   * the lever off from 20 ft at up to 0.1 a second.
+# On the plants that replay the flares (the tracker as flown meets the
+# runway at 240 to 1,400 fpm on them), from six 106 to 114 kt gates, calm and
+# rough: every contact under 135 fpm on the path and 125 on the gauge, 86 kt
+# or faster, no longer a float than the flares as flown
+# (`autoland::lemg13_sr22_bounce_tests::lemg13_king_air`).
+# VERIFY: blackbox `flare_ask`, `flare_target`, `flare_elev` and `vvi` from
+# `arrest_hands` to the wheels (no pull dropped from 0.3 to 0 in a tick), the
+# `power` events' `retard` from 20 ft and no `balloon`, and the landing's
+# `sink_fpm` (under 250) with the `rollout` ticks' first `psi` swing (the
+# contact's kick was the hard landing's).
+flare_elevator:
+  gain: 1.0
+  max: 0.5
+  max_push: 0.05
+  balloon_ease_per_s: 0.15
+  tau_s: 3.0
+  model:
+    fpm_per_elevator: 9500.0
+    lag_s: 2.3
+    lag2_s: 1.0
+    dead_s: 0.8
+    ground_fpm: 320.0
+    ground_ft: 40.0
+    touchdown_fpm: 150.0
+    fpm_per_kt: 100.0
+flare_power:
+  reduction_per_second: 0.1
+  retard_max_per_s: 0.1
+  retard_below_ft: 20.0
+
+# THE ROLLOUT (issue #197, the same three landings): the nosewheel STEERS
+# (C90B.acf: `_gear_castors 0`, 48 degrees slow, 7 at speed, through the
+# pedals), so this is no brake-steer airframe. Each contact yawed the nose
+# left at 8 to 15 deg/s with the steer at zero, the takeoff roll's default
+# law answered on a heading differenced over a 0.45 s tick with its whole
+# 0.35 at 80 kt for a second and a half, and the nose swung 30 to 80 degrees
+# right with the steer full left until 45 kt: 1790757702 went off the runway
+# 176 m right (crashed), 1790758604 125.8 m, 1790758429 came back at 19.7 m.
+# Fitted over the three rollouts: 45 to 65 deg/s of yaw per unit of steer at
+# 80 kt after 0.3 s, a yaw the slip between nose and track feeds, and the
+# nosewheel's 12 to 40 deg/s per unit under 40 kt. So the rollout damps on
+# the MEASURED yaw rate (`sim/flightmodel/position/R`, 0.8 s of it against
+# the error), 0.025 of steer per degree at 80 kt and over, rising as 80 / gs
+# to 65 kt, at most 0.5 from 75 kt (`autoland::RolloutSteer`). From the
+# three recorded contacts on the three fits the roll law as flown swings the
+# nose 24 to 90 degrees; this holds it within 13 degrees and 13 m, and on
+# the nosewheel settles within 3 degrees where the roll law sawed 20
+# (`autoland::lemg13_king_air_rollout_tests`).
+# VERIFY: the `rollout` ticks' `yaw_r` (read, not null), `steer` within 0.5
+# above 60 kt, the heading within 10 degrees of the runway after the
+# contact's kick, and `xtk_m` inside 10 m.
+rollout_steer:
+  per_deg: 0.025
+  ref_kts: 80.0
+  min_kts: 65.0
+  damp_s: 0.8
+  max_fast: 0.5
+  fast_kts: 75.0
+
 flaps:
   detents:
     - { label: up,       spoken: up,       ratio: 0.0 }

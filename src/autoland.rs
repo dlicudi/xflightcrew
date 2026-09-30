@@ -446,6 +446,8 @@ const PSI_TRUE: &str = "sim/flightmodel/position/psi";
 const HPATH_TRUE: &str = "sim/flightmodel/position/hpath";
 /// Bank, for the arrest's wings-level law once the servos are off.
 const PHI_TRUE: &str = "sim/flightmodel/position/true_phi";
+/// Yaw rate, deg/s nose right, for a declared rollout steer (`RolloutSteer`).
+const YAW_RATE: &str = "sim/flightmodel/position/R";
 /// The vertical speed actually flown (the pilot's VSI). The shared name, not a
 /// local spelling: `cockpit2/gauges/indicators/vvi_dial_fpm` does not exist
 /// in X-Plane 12, and from 2026-07 to 2026-09-14 every read of it failed and
@@ -882,6 +884,86 @@ impl RolloutBrakeSteer {
         } else {
             plain
         }
+    }
+}
+
+/// The rollout's steer on a STEERED nosewheel that declares its own law
+/// (`rollout_steer:`, [`crate::aircraft::RolloutSteerProfile`], issue #197);
+/// every other airframe keeps the takeoff roll's default law. Pure.
+///
+/// LEMG 13 (iMac 2026-09-30, the King Air C90B): every contact yawed the
+/// nose 8 to 15 deg/s left with nothing steering, and the default law, its
+/// whole authority 0.35 at 80 kt, answered on a heading DIFFERENCED over
+/// a 0.45 s tick: 0.35 of right steer for a second and a half, the nose
+/// swung 30 to 80 degrees right, and full left steer held none of it until
+/// 45 kt (1790757702 off the runway, 176 m right). Fitted over the three
+/// rollouts the steer is 45 to 65 deg/s per unit at 80 kt after 0.3 s and
+/// the slip between the nose and the track feeds its own yaw: the swing is
+/// seen first in the yaw RATE, so the law damps on the rate the sim
+/// measures (`sim/flightmodel/position/R`), holds its gain low at speed and
+/// raises it as `ref_kts / gs` toward the nosewheel's own steering.
+#[derive(Debug, Clone, Copy)]
+pub struct RolloutSteer {
+    prof: crate::aircraft::RolloutSteerProfile,
+    prev_err: Option<f64>,
+    out: f64,
+}
+
+/// The rollout steer's slew, units per second (the takeoff roll's).
+const ROLLOUT_STEER_SLEW_PER_S: f64 = 1.5;
+/// The rollout steer's authority under `min_kts` (the takeoff roll's).
+const ROLLOUT_STEER_MAX: f64 = 0.85;
+
+impl RolloutSteer {
+    pub fn new(prof: crate::aircraft::RolloutSteerProfile) -> Self {
+        Self {
+            prof,
+            prev_err: None,
+            out: 0.0,
+        }
+    }
+
+    /// The gain per degree at this groundspeed.
+    pub fn per_deg_at(&self, gs_kts: f64) -> f64 {
+        let p = self.prof;
+        let v = if gs_kts.is_finite() { gs_kts } else { p.ref_kts };
+        p.per_deg * p.ref_kts / v.clamp(p.min_kts, p.ref_kts)
+    }
+
+    /// The most steer at this groundspeed: the full authority at `min_kts`
+    /// and under, `max_fast` from `fast_kts`.
+    pub fn cap_at(&self, gs_kts: f64) -> f64 {
+        let p = self.prof;
+        let v = if gs_kts.is_finite() { gs_kts } else { p.fast_kts };
+        let share = ((v - p.min_kts) / (p.fast_kts - p.min_kts)).clamp(0.0, 1.0);
+        ROLLOUT_STEER_MAX + (p.max_fast - ROLLOUT_STEER_MAX) * share
+    }
+
+    /// Off the wheels (a bounce): nothing is written, so the next contact
+    /// slews from neutral.
+    pub fn in_air(&mut self) {
+        self.out = 0.0;
+        self.prev_err = None;
+    }
+
+    /// The heading error (degrees, target right of the nose positive), the
+    /// tick, groundspeed and the sim's yaw rate (deg/s, nose right
+    /// positive; `None` on a failed read, when the error's own rate stands
+    /// in).
+    pub fn step(&mut self, err_deg: f64, dt_s: f64, gs_kts: f64, yaw_dps: Option<f64>) -> f64 {
+        if !err_deg.is_finite() {
+            return self.out;
+        }
+        let dt = if dt_s.is_finite() { dt_s.clamp(0.05, 1.0) } else { 0.4 };
+        let differenced = self.prev_err.map_or(0.0, |p| -(err_deg - p) / dt);
+        self.prev_err = Some(err_deg);
+        let yaw = yaw_dps.filter(|y| y.is_finite()).unwrap_or(differenced);
+        let cap = self.cap_at(gs_kts);
+        let want =
+            (self.per_deg_at(gs_kts) * (err_deg - self.prof.damp_s * yaw)).clamp(-cap, cap);
+        let step = ROLLOUT_STEER_SLEW_PER_S * dt;
+        self.out += (want - self.out).clamp(-step, step);
+        self.out
     }
 }
 
@@ -1698,6 +1780,9 @@ pub fn run_autoland_scoped(
             // (`RolloutBrakeSteer`, issue #166).
             let rollout_brake_steer = rollout_brake_steers();
             let mut rollout_brakes = RolloutBrakeSteer::for_airframe();
+            // A steered nosewheel that declares its own rollout law
+            // (`RolloutSteer`, issue #197); else the takeoff roll's default.
+            let mut rollout_steer = crate::aircraft::rollout_steer().map(RolloutSteer::new);
             // The wheels off again after the rollout latched (a bounce).
             let mut bounce_hold = BounceHold::default();
             // A hold-off airframe held on from its first contact
@@ -2050,8 +2135,20 @@ pub fn run_autoland_scoped(
                         // from what it learnt steering the air.
                         rollout_brakes = RolloutBrakeSteer::for_airframe();
                     }
+                    // A declared rollout steer damps on the sim's yaw rate
+                    // (`RolloutSteer`, #197): read only for it, so every
+                    // other airframe's rollout asks the sim nothing new.
+                    let yaw_r = match rollout_steer.as_ref() {
+                        Some(_) if !airborne => xp.get_float(YAW_RATE).await.ok(),
+                        _ => None,
+                    };
                     let steer = if airborne {
+                        if let Some(law) = rollout_steer.as_mut() {
+                            law.in_air();
+                        }
                         0.0
+                    } else if let Some(law) = rollout_steer.as_mut() {
+                        law.step(err, roll_dt, gs_kts, yaw_r)
                     } else {
                         roll_law.step(err, roll_dt, gs_kts, 0.0)
                     };
@@ -2124,6 +2221,9 @@ pub fn run_autoland_scoped(
                             "touch_elev": touch_elev,
                             "xtk_rate": xtk_rate, "err": err, "steer": steer,
                             "trim": roll_law.trim(), "psi": psi, "dt": roll_dt,
+                            // The sim's yaw rate a declared rollout steer
+                            // damps on (#197); null when not read.
+                            "yaw_r": yaw_r,
                             "pos": pos_source,
                             // The brakes as written: the symmetric channel and
                             // each wheel's steering channel (issue #166).
@@ -16704,7 +16804,7 @@ mod lemg13_sr22_bounce_tests {
         /// target above the flare gate, the flare's below it, the ratchet in
         /// the flare, the lever idle there but the approach's own on a
         /// balloon, the channel let go on the wheels.
-        fn land_tracker(p: &mut Plant, gains: FlareGains, until: f64) -> Landing {
+        pub(super) fn land_tracker(p: &mut Plant, gains: FlareGains, until: f64) -> Landing {
             let mut law = FlarePitch::with_gains(gains);
             let (mut next, mut flaring, mut rolling, mut wheels_on) = (0.0, false, false, 0u32);
             let mut prev: Option<f64> = None;
@@ -16815,6 +16915,222 @@ mod lemg13_sr22_bounce_tests {
                 "Evolution flare: worst {:.0} fpm on the path, {:.0} on the gauge, {:.2} ft after, {:.0} m past the gate",
                 worst.0, worst.1, worst.2, worst.3
             );
+        }
+    }
+
+    /// The King Air C90B's flares at LEMG 13 (iMac 2026-09-30, issue #197,
+    /// sorties 1790757702, 1790758429 and 1790758604 from 4 nm,
+    /// `bench/landings/king_air_lemg13_landing_*.jsonl`), on the jets'
+    /// default tracker (no `flare_elevator:`). Each arrest took the servos at
+    /// 59 to 61 ft sinking 640 to 700 fpm at 110 to 114 KIAS; the tracker's
+    /// 0.23 to 0.35 of pull ballooned it (to 61 ft level, then 17.5 to 39 ft
+    /// on the balloon's approach thrust), let go to neutral, and the sink it
+    /// rebuilt met the runway at 730 to 960 fpm on the gauge the tick before
+    /// the wheels (the scorer's 256 to 518, read from 3 s samples after it).
+    mod lemg13_king_air {
+        use super::*;
+
+        const SRC: [&str; 3] = [
+            include_str!("../bench/landings/king_air_lemg13_landing_1790757702.jsonl"),
+            include_str!("../bench/landings/king_air_lemg13_landing_1790758429.jsonl"),
+            include_str!("../bench/landings/king_air_lemg13_landing_1790758604.jsonl"),
+        ];
+
+        /// The autopilot's column at each gate (fitted with the plant).
+        const PIPES: [f64; 3] = [-0.106, -0.049, -0.112];
+
+        /// Fitted to the three flares from the servos taken to the contact
+        /// (radio 1.9 to 2.1 ft rms, gauge 50 to 56 fpm rms): 9,670 fpm per
+        /// unit after 0.8 s of dead time, the path's own 2.6 s, the gauge
+        /// 0.88 s behind it, 118 fpm of sink per knot; no tail effect and the
+        /// lever worth nothing but its speed (the fit puts both at zero); the
+        /// speed -2.72 kt/s, 2.22 more per 1,000 fpm of climb, 1.93 per unit
+        /// of lever (0.66 kt/s rms). The gear is the SR22's (a contact is no
+        /// fit), the stall the POM's 76 kt.
+        pub(super) const KA: Fit = Fit {
+            k: 9672.0,
+            lag: 0.07,
+            dead: 0.8,
+            tail_fpm: 0.0,
+            per_kt: 118.0,
+            path_s: 2.58,
+            wing_fpm: 0.0,
+            wing_ft: 5.0,
+            gauge_s: 0.875,
+            off: 0.0,
+            thr_fpm: 0.0,
+            thr_lag: 2.0,
+            drag0: 2.72,
+            drag_w: 2.22,
+            thrust: 1.93,
+            vso: 76.0,
+            ..FIT
+        };
+
+        /// The fit and neighbours that still replay the flares (4.5 ft, 95
+        /// fpm): the dead time 0.1 s either way, the path 10 % and the gauge
+        /// 20 % either way, a tail effect of 150 fpm, a wing cushion the
+        /// flares never reached. The elevator 5 % either way (7 to 11 ft),
+        /// the speed's sink 20 % either way (14 to 23 ft) or the tail's 320
+        /// fpm (4 to 5 ft, 65 to 83 fpm) do not replay them.
+        fn ka_plants() -> Vec<Fit> {
+            vec![
+                KA,
+                Fit { dead: KA.dead + 0.1, ..KA },
+                Fit { dead: KA.dead - 0.1, ..KA },
+                Fit { path_s: KA.path_s * 1.1, ..KA },
+                Fit { path_s: KA.path_s * 0.9, ..KA },
+                Fit { gauge_s: KA.gauge_s * 1.2, ..KA },
+                Fit { gauge_s: KA.gauge_s * 0.8, ..KA },
+                Fit { tail_fpm: 150.0, ..KA },
+                Fit { wing_fpm: 250.0, wing_ft: 6.0, ..KA },
+            ]
+        }
+
+        /// The recorded column and lever, open loop, from the recorded
+        /// gate: (t, radio, gauge) at every recorded tick before the wheels.
+        fn ka_replay(f: &Flown, fit: Fit, pipe: f64) -> Vec<(f64, f64, f64)> {
+            let (_, h, v, ias, _) = f.ticks[0];
+            let mut p = Plant::at(fit, h, v.unwrap(), ias, pipe);
+            p.ias_track = Some(f.ticks.iter().map(|x| (x.0, x.3)).collect());
+            p.thr0 = f.levers.first().map_or(p.thr0, |l| l.1);
+            p.thr = p.thr0;
+            p.thr_cmd = p.thr0;
+            let mut out = vec![];
+            let (mut wi, mut li) = (0, 0);
+            for &(t, _, _, _, rolling) in &f.ticks {
+                if rolling {
+                    break;
+                }
+                while p.t < t - 1e-9 {
+                    while wi < f.writes.len() && f.writes[wi].0 <= p.t + 1e-9 {
+                        let e = f.writes[wi].1;
+                        p.write(e);
+                        wi += 1;
+                    }
+                    while li < f.levers.len() && f.levers[li].0 <= p.t + 1e-9 {
+                        p.thr_cmd = f.levers[li].1;
+                        li += 1;
+                    }
+                    p.step(0.01);
+                }
+                out.push((t, p.radio(), p.vvi()));
+            }
+            out
+        }
+
+        /// The plant is the recording: each flare's column and lever as
+        /// written, open loop, give back its radio within 4.5 ft and its
+        /// gauge within 95 fpm rms on every plant kept (the fit: 1.9 to 2.1
+        /// ft, 50 to 56 fpm).
+        #[test]
+        fn the_king_air_plant_replays_its_flares() {
+            for fit in ka_plants() {
+                for (src, pipe) in SRC.iter().zip(PIPES) {
+                    let f = flown(src);
+                    let rec: Vec<_> = f.ticks.iter().filter(|x| !x.4).collect();
+                    let got = ka_replay(&f, fit, pipe);
+                    let n = got.len().min(rec.len()) as f64;
+                    let (mut dh, mut dv) = (0.0, 0.0);
+                    for (g, r) in got.iter().zip(&rec) {
+                        dh += (g.1 - r.1).powi(2);
+                        dv += (g.2 - r.2.unwrap()).powi(2);
+                    }
+                    let (dh, dv) = ((dh / n).sqrt(), (dv / n).sqrt());
+                    eprintln!("replay {}: {dh:.2} ft, {dv:.0} fpm rms", tag(fit));
+                    assert!(dh < 4.5 && dv < 95.0, "{}: {dh:.2} ft, {dv:.0} fpm", tag(fit));
+                }
+            }
+        }
+
+        /// A plant's name for the record.
+        fn tag(f: Fit) -> String {
+            format!(
+                "k {:.0} dead {:.2} path {:.2} gauge {:.2} tail {:.0} wing {:.0}",
+                f.k, f.dead, f.path_s, f.gauge_s, f.tail_fpm, f.wing_fpm
+            )
+        }
+
+        fn king_air() -> crate::aircraft::AircraftProfile {
+            crate::aircraft::load("king_air_c90b").expect("the King Air profile loads")
+        }
+
+        /// The three recorded gates and neighbours: steeper and shallower,
+        /// faster and slower, lower.
+        const GATES: [(f64, f64, f64); 6] = [
+            (58.9, -703.0, 111.9),
+            (61.3, -642.0, 113.5),
+            (59.0, -699.0, 110.5),
+            (60.0, -780.0, 110.0),
+            (60.0, -600.0, 114.0),
+            (52.0, -700.0, 106.0),
+        ];
+
+        /// The tracker as flown meets the runway hard on the plant from the
+        /// recorded gates, as it did (730 to 960 fpm on the gauge a tick
+        /// before the wheels); the declared model flare (`flare_elevator`
+        /// model, `flare_power`) from every gate on every plant that
+        /// replays, calm and rough: one contact under 250 fpm on the flight
+        /// path and on the gauge, never slower than the stall, and no longer
+        /// a float than the tracker's as flown on the plant (700 to 1,000 m
+        /// from the gate to the wheels; the sim's three about 830). The hop
+        /// after it is held under 2 ft, not the SR22's 1.5: the gear is the
+        /// SR22's, whose nose-up kick grows as the square of the speed, and
+        /// at 90 to 97 kt it hops 1.6 to 1.8 ft off 115 to 135 fpm.
+        #[test]
+        fn the_king_air_flares_where_the_tracker_dropped_it_in() {
+            let mut flown_worst = 0.0_f64;
+            for fit in ka_plants() {
+                for ((h, v, ias), pipe) in GATES.iter().take(3).zip(PIPES) {
+                    let mut p = Plant::at(fit, *h, *v, *ias, pipe);
+                    let l = super::lilb03_evolution::land_tracker(&mut p, FlareGains::default(), 40.0);
+                    let gauge = -p.first_gauge.unwrap_or(f64::NAN);
+                    eprintln!("tracker as flown {}: {l:?}, gauge {gauge:.0}, {:.0} m", tag(fit), p.along_m);
+                    flown_worst = flown_worst.max(l.first_fpm.max(gauge));
+                }
+            }
+            assert!(flown_worst > 400.0, "the tracker as flown: {flown_worst:.0} fpm");
+            let prof = king_air();
+            let power = prof.flare_power.expect("the King Air declares its retard");
+            let approach = prof
+                .reference
+                .as_ref()
+                .and_then(|r| r.approach_kts)
+                .expect("an approach speed");
+            let mut worst = (0.0_f64, 0.0_f64, 0.0_f64, 0.0_f64, f64::INFINITY);
+            let mut bad: Vec<String> = vec![];
+            for fit in ka_plants() {
+                for (h, v, ias) in GATES {
+                    for rough in [false, true] {
+                        let pipe = PIPES[0];
+                        let mut p = Plant::at(fit, h, v, ias, pipe);
+                        let mut m = FlareModel::from_profile(prof.flare_elevator).expect("a model");
+                        let l = land(&mut p, &mut m, power, approach, rough, 45.0);
+                        let gauge = -p.first_gauge.unwrap_or(f64::NAN);
+                        let why = format!("{}, {h} {v} {ias} rough {rough}: {l:?}, gauge {gauge:.0}, {:.0} m", tag(fit), p.along_m);
+                        if !(l.first_fpm < 250.0
+                            && gauge < 250.0
+                            && l.bounce_ft < 2.0
+                            && l.min_ias > fit.vso
+                            && p.along_m < 1000.0)
+                        {
+                            bad.push(why);
+                        }
+                        worst = (
+                            worst.0.max(l.first_fpm),
+                            worst.1.max(gauge),
+                            worst.2.max(l.bounce_ft),
+                            worst.3.max(p.along_m),
+                            worst.4.min(l.first_ias),
+                        );
+                    }
+                }
+            }
+            eprintln!(
+                "King Air flare: worst {:.0} fpm on the path, {:.0} on the gauge, {:.2} ft after, {:.0} m past the gate, slowest contact {:.1} kt",
+                worst.0, worst.1, worst.2, worst.3, worst.4
+            );
+            assert!(bad.is_empty(), "{} landings out of limits:\n{}", bad.len(), bad.join("\n"));
         }
     }
 }
@@ -17910,5 +18226,314 @@ mod a330_lemg30_flare_tests {
             assert!(swing < 2.0, "tick {tick}: swings {swing:.1} degrees");
         }
         assert!(fast < 2.0, "the tuned tick is the one it was: {fast:.1}");
+    }
+}
+
+/// Issue #197, the rollout: LEMG 13, the King Air C90B (iMac 2026-09-30,
+/// sorties 1790757702, 1790758429 and 1790758604 from 4 nm), steered by the
+/// takeoff roll's default law through the rudder and nosewheel (7 degrees of
+/// nosewheel at speed, 48 slow; `_gear_castors 0`, so not a brake-steer
+/// airframe). Every contact yawed the nose 8 to 15 deg/s left with the steer
+/// at zero; the default law answered with its whole 0.35 at 80 kt for a
+/// second and a half, the nose swung 30 to 80 degrees right, and full left
+/// steer held none of it until 45 kt: 1790757702 left the runway 176 m right,
+/// 1790758604 125.8 m, 1790758429 swung 24 degrees and came back at 19.7 m.
+///
+/// The recorded heading and track ARE the plant here: three fits over the
+/// first three and a half to four and a half seconds on the wheels, each
+/// with the steer as written, the contact's own yaw as its first state, and a
+/// yaw the slip between nose and track feeds (A, over 4.5 s: 62 deg/s per
+/// unit at 80 kt, 1.5 per degree of slip, 0.41 s, 0.29 s dead; B, over 3.5
+/// s: 43, 2.3, 0.08 s, 0.30 s; C, over 3.5 s with no slip term: a near
+/// integrator of 219 through 3 s after 0.32 s; 1.2 to 2.4 degrees rms).
+/// Below 40 kt the nosewheel's own steering: 12 to 40 deg/s per unit after
+/// 0.3 to 0.5 s.
+#[cfg(test)]
+mod lemg13_king_air_rollout_tests {
+    use super::*;
+
+    const SRC: [&str; 3] = [
+        include_str!("../bench/landings/king_air_lemg13_landing_1790757702.jsonl"),
+        include_str!("../bench/landings/king_air_lemg13_landing_1790758429.jsonl"),
+        include_str!("../bench/landings/king_air_lemg13_landing_1790758604.jsonl"),
+    ];
+    /// The loop's tick on the iMac's rollouts.
+    const TICK_S: f64 = 0.45;
+    /// The rollout's braking on the recorded ticks, kt/s (86 to 60 kt in 4 s).
+    const DECEL_KTS_S: f64 = 6.0;
+
+    /// A rollout tick: (t from the first, gs, psi, track, steer written,
+    /// cross-track m, cross-track rate m/s, the error the law saw).
+    type Tick = (f64, f64, f64, f64, f64, f64, f64, f64);
+
+    fn ticks(src: &str) -> Vec<Tick> {
+        let mut out: Vec<Tick> = vec![];
+        let mut t0 = None;
+        for l in src.lines().filter(|l| !l.trim().is_empty()) {
+            let r: serde_json::Value = serde_json::from_str(l).expect("a record");
+            if r["event"] != "rollout" {
+                continue;
+            }
+            let t = r["t"].as_f64().unwrap();
+            let t0 = *t0.get_or_insert(t);
+            let f = |k: &str| r[k].as_f64().unwrap();
+            out.push((t - t0, f("gs"), f("psi"), f("trk"), f("steer"), f("xtk_m"), f("xtk_rate"), f("err")));
+        }
+        out
+    }
+
+    /// The course the rollout steered for: the recorded error on the first
+    /// tick plus the centreline cut it held (LEMG 13's true course).
+    fn course(t: &Tick) -> f64 {
+        let cut = -crate::autotakeoff::roll_target_heading(0.0, t.5, t.6, t.1);
+        let cut = (cut + 540.0).rem_euclid(360.0) - 180.0;
+        (t.2 + t.7 + cut).rem_euclid(360.0)
+    }
+
+    /// The yaw on the wheels: the yaw rate goes toward ks x (gs/80)^2 x the
+    /// steer `dead` s ago plus kb x the slip x (gs/80)^n, over `tau`; the
+    /// track follows the nose at `lam` per second of slip.
+    #[derive(Debug, Clone, Copy)]
+    struct Yaw {
+        ks: f64,
+        kb: f64,
+        n: f64,
+        tau: f64,
+        dead: f64,
+        lam: f64,
+        /// The contact's yaw rate, deg/s, per recorded rollout.
+        r0: [f64; 3],
+    }
+
+    const A: Yaw = Yaw { ks: 62.5, kb: 1.52, n: 0.52, tau: 0.41, dead: 0.29, lam: 0.61, r0: [-16.8, -16.7, -18.8] };
+    const B: Yaw = Yaw { ks: 42.6, kb: 2.26, n: 3.0, tau: 0.08, dead: 0.30, lam: 0.69, r0: [-40.0, -5.8, -24.8] };
+    const C: Yaw = Yaw { ks: 219.0, kb: 0.0, n: 1.0, tau: 3.0, dead: 0.32, lam: 0.71, r0: [-6.7, -10.6, -13.3] };
+
+    struct Sim {
+        y: Yaw,
+        psi: f64,
+        trk: f64,
+        r: f64,
+        gs: f64,
+        xtk: f64,
+        course: f64,
+        writes: Vec<(f64, f64)>,
+        t: f64,
+    }
+
+    impl Sim {
+        fn new(y: Yaw, first: &Tick, r0: f64, course: f64) -> Self {
+            Sim {
+                y,
+                psi: first.2,
+                trk: first.3,
+                r: r0,
+                gs: first.1,
+                xtk: first.5,
+                course,
+                writes: vec![(-9.0, 0.0)],
+                t: 0.0,
+            }
+        }
+
+        fn step(&mut self, dt: f64, decel: Option<f64>) {
+            let due = self.t - self.y.dead;
+            let u = self
+                .writes
+                .iter()
+                .take_while(|w| w.0 <= due + 1e-9)
+                .last()
+                .map_or(0.0, |w| w.1);
+            let q = self.gs / 80.0;
+            let slip = self.psi - self.trk;
+            self.r += (self.y.ks * q * q * u + self.y.kb * slip * q.powf(self.y.n) - self.r) / self.y.tau
+                * dt;
+            self.psi += self.r * dt;
+            self.trk += self.y.lam * slip * dt;
+            self.xtk += self.gs / MS_TO_KTS * (self.trk - self.course).to_radians().sin() * dt;
+            if let Some(a) = decel {
+                self.gs -= a * dt;
+            }
+            self.t += dt;
+        }
+    }
+
+    /// The plant is the recording: each rollout's steer as written, open
+    /// loop, gives back its heading over its first three and a half seconds
+    /// within 3.5 degrees rms on the slip fits and 5 on the one without
+    /// (1.4 to 3.2 and 2.2 to 4.6 as fitted).
+    #[test]
+    fn the_king_air_yaw_plants_replay_the_rollouts() {
+        for y in [A, B, C] {
+            for (i, src) in SRC.iter().enumerate() {
+                let tk = ticks(src);
+                let mut s = Sim::new(y, &tk[0], y.r0[i], course(&tk[0]));
+                let (mut se, mut n) = (0.0, 0.0);
+                for w in tk.iter().filter(|w| w.0 <= 3.5) {
+                    while s.t < w.0 - 1e-9 {
+                        s.step(0.01, None);
+                    }
+                    se += (s.psi - w.2).powi(2);
+                    n += 1.0;
+                    s.gs = w.1;
+                    s.writes.push((w.0, w.4));
+                }
+                let rms = (se / n).sqrt();
+                eprintln!("{y:?} rollout {i}: {rms:.2} deg rms");
+                let limit = if y.kb > 0.0 { 3.5 } else { 5.0 };
+                assert!(rms < limit, "{y:?} rollout {i}: {rms:.2} deg rms");
+            }
+        }
+    }
+
+    /// One closed-loop rollout from a recorded contact down to 40 kt: the
+    /// worst heading off the course and the worst cross-track.
+    fn roll(y: Yaw, i: usize, mut law: impl FnMut(f64, f64, f64, f64) -> f64) -> (f64, f64) {
+        let tk = ticks(SRC[i]);
+        let c = course(&tk[0]);
+        let mut s = Sim::new(y, &tk[0], y.r0[i], c);
+        let mut rate = crate::autotakeoff::XtkRate::default();
+        let mut prev = s.xtk;
+        let (mut worst_h, mut worst_x) = (0.0_f64, s.xtk.abs());
+        let mut next = 0.0;
+        while s.gs > 40.0 {
+            if s.t + 1e-9 >= next {
+                let xr = if next > 0.0 {
+                    rate.update((s.xtk - prev) / TICK_S, TICK_S)
+                } else {
+                    tk[0].6
+                };
+                prev = s.xtk;
+                next += TICK_S;
+                let target = crate::autotakeoff::roll_target_heading(c, s.xtk, xr, s.gs);
+                let err = ((target - s.psi + 540.0).rem_euclid(360.0)) - 180.0;
+                let u = law(err, TICK_S, s.gs, s.r);
+                s.writes.push((s.t, u));
+            }
+            s.step(0.01, Some(DECEL_KTS_S));
+            worst_h = worst_h.max((s.psi - c).abs());
+            worst_x = worst_x.max(s.xtk.abs());
+            if worst_h > 90.0 {
+                break;
+            }
+        }
+        (worst_h, worst_x)
+    }
+
+    fn king_air_law() -> RolloutSteer {
+        let p = crate::aircraft::load("king_air_c90b").expect("the King Air profile loads");
+        RolloutSteer::new(
+            p.rollout_steer
+                .and_then(crate::aircraft::RolloutSteerProfile::valid)
+                .expect("the King Air declares its rollout steer"),
+        )
+    }
+
+    /// The takeoff roll's default law as it flew the three rollouts swings
+    /// the nose past 20 degrees from every contact on every fit, and on the
+    /// best fit (A) loses it past 45 from two of the three, as the sim did;
+    /// the declared law from every contact on every fit holds the nose
+    /// within 15 degrees of the course and the wheels within 15 m of the
+    /// centreline (LEMG 13 is 45 m wide).
+    #[test]
+    fn the_king_air_rollout_holds_the_runway_where_the_roll_law_lost_it() {
+        let mut lost_on_a = 0;
+        let mut flown_least = f64::INFINITY;
+        let mut worst = (0.0_f64, 0.0_f64);
+        for (name, y) in [("A", A), ("B", B), ("C", C)] {
+            for i in 0..3 {
+                let mut flown = crate::autotakeoff::RollSteer::default();
+                let (fh, fx) = roll(y, i, |e, dt, gs, _| flown.step(e, dt, gs, 0.0));
+                flown_least = flown_least.min(fh);
+                if name == "A" && fh > 45.0 {
+                    lost_on_a += 1;
+                }
+                let mut law = king_air_law();
+                let (h, x) = roll(y, i, |e, dt, gs, r| law.step(e, dt, gs, Some(r)));
+                eprintln!("{name} {i}: as flown {fh:.1} deg, {fx:.1} m; declared {h:.1} deg, {x:.1} m");
+                assert!(h < 15.0 && x < 15.0, "{name} {i}: {h:.1} deg, {x:.1} m");
+                worst = (worst.0.max(h), worst.1.max(x));
+            }
+        }
+        assert!(flown_least > 20.0, "the roll law as flown held one within {flown_least:.1} degrees");
+        assert!(lost_on_a >= 2, "the roll law as flown lost {lost_on_a} of 3 on the best fit");
+        eprintln!(
+            "King Air rollout: as flown at least {flown_least:.1} deg; declared worst {:.1} deg, {:.1} m",
+            worst.0, worst.1
+        );
+    }
+
+    /// Slow, the nosewheel's own steering (12 to 40 deg/s per unit after 0.3
+    /// to 0.5 s): the default law's full authority per 12 degrees sawed
+    /// +/-10 to 15 degrees at 10 to 30 kt on the recorded ticks, and saws
+    /// past 10 on the 40 deg/s nosewheel here; the declared law settles
+    /// within 4 degrees after four seconds on every one.
+    #[test]
+    fn the_king_air_rollout_settles_on_the_nosewheel() {
+        fn fly(ks: f64, tau: f64, dead: f64, e0: f64, r0: f64, law: &mut dyn FnMut(f64, f64, f64, f64) -> f64) -> f64 {
+            let (mut psi, mut r, mut gs, mut t, mut next) = (-e0, r0, 40.0_f64, 0.0, 0.0);
+            let mut writes = vec![(-9.0, 0.0)];
+            let mut late = 0.0_f64;
+            while gs > 5.0 {
+                if t + 1e-9 >= next {
+                    next += TICK_S;
+                    writes.push((t, law(-psi, TICK_S, gs, r)));
+                }
+                let u = writes
+                    .iter()
+                    .take_while(|w: &&(f64, f64)| w.0 <= t - dead + 1e-9)
+                    .last()
+                    .map_or(0.0, |w| w.1);
+                r += (ks * u - r) / tau * 0.01;
+                psi += r * 0.01;
+                gs -= 3.0 * 0.01;
+                t += 0.01;
+                if t > 4.0 {
+                    late = late.max(psi.abs());
+                }
+            }
+            late
+        }
+        for (ks, tau, dead) in [(20.0, 0.2, 0.4), (40.0, 0.3, 0.5), (12.0, 0.15, 0.3)] {
+            for (e0, r0) in [(10.0, 0.0), (0.0, 15.0), (-8.0, -10.0)] {
+                let mut flown = crate::autotakeoff::RollSteer::default();
+                let as_flown = fly(ks, tau, dead, e0, r0, &mut |e, dt, gs, _| flown.step(e, dt, gs, 0.0));
+                let mut law = king_air_law();
+                let declared = fly(ks, tau, dead, e0, r0, &mut |e, dt, gs, r| law.step(e, dt, gs, Some(r)));
+                eprintln!("slow {ks} {tau} {dead} from {e0} {r0}: as flown {as_flown:.1}, declared {declared:.1}");
+                assert!(declared < 4.0, "{ks} {tau} {dead} {e0} {r0}: {declared:.1}");
+                if ks >= 40.0 {
+                    assert!(as_flown > 10.0, "as flown {ks} {e0} {r0}: {as_flown:.1}");
+                }
+            }
+        }
+    }
+
+    /// The law's shape: full authority slow, `max_fast` at speed, the gain
+    /// rising as the speed falls to `min_kts`, damped on the yaw rate
+    /// against the error, nothing carried through the air, and only the
+    /// King Air declares it.
+    #[test]
+    fn rollout_steer_schedules_and_damps() {
+        let mut law = king_air_law();
+        assert!((law.cap_at(85.0) - law.prof.max_fast).abs() < 1e-9);
+        assert!((law.cap_at(20.0) - ROLLOUT_STEER_MAX).abs() < 1e-9);
+        assert!(law.per_deg_at(40.0) > law.per_deg_at(80.0));
+        assert!((law.per_deg_at(120.0) - law.per_deg_at(80.0)).abs() < 1e-12);
+        // The nose swinging left at 17 deg/s with no error yet: right steer.
+        assert!(law.step(0.0, 0.45, 85.0, Some(-17.0)) > 0.0);
+        law.in_air();
+        assert_eq!(law.out, 0.0);
+        for id in [
+            "cirrus_sr22",
+            "boeing_737_800",
+            "cirrus_vision_sf50",
+            "lancair_evolution",
+            "beechcraft_baron_58",
+            "airbus_a330_300",
+        ] {
+            let p = crate::aircraft::load(id).expect("the profile loads");
+            assert!(p.rollout_steer.is_none(), "{id}");
+        }
     }
 }
