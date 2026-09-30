@@ -1,0 +1,10 @@
+# The Evolution at LILB (#45): the whole departure on today's fixes, the
+# torque-led rudder (006e0f4) the one still unflown.
+after: stop
+cases:
+  - name: "Lancair Evolution LILB circuit from the ramp (#45)"
+    setup:
+      aircraft: "Aircraft/Laminar Research/Lancair Evolution/N844X.acf"
+      ramp: { field: LILB }
+    command: fly a circuit
+    deadline_min: 35
