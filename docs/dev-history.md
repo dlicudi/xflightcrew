@@ -11548,3 +11548,55 @@ an `atc` ReportFinal answered "cleared to land runway zero niner", `landing_read
 `final_tick` `cleared` true before `over_pad`; no `compliance` "without clearance"; if held,
 `hold_short` then `landing_clearance_asked` (at most 3) and either a clearance or
 `uncleared_hold_given_up`; the `sortie_result` `ended_airborne` false. Offline only.
+
+## 2026-09-30: a painted lane facing away from the route is not pushed; a join behind the wing is a planned turn (#190)
+
+iMac 2026-09-29, sortie 1790712526-full_auto (Citation X, LEMG gate, "fly a circuit"): `push_lane`
+target_hdg 26.3, back_m 98.6 against `route_target_hdg` 222.2, nose 327.7. Since 3226e77 (LIBP) a
+painted lane always replaced the route's plan. This lane is the stand's lead-in read backwards:
+out on 146, curving right to end facing 26, the way arrivals on the taxiway come in; the cleared
+route leaves the other way, 222. 26.3 sat 58.6 off the nose, inside the 60 degree straight band, so
+the tug was asked "straight" (the same plan twice before at this stand, sorties 1790693535 and
+1790698894, both aborted). It hooked at 131 s, pushed 51.5 m straight and let go (`tug_finished`
+delivered false, err 58.5; `pushback_failed` tug_released). The taxi then drove the route cleared at
+the gate: its first leg IS the lane (155.3, 81.6 m to the taxiway node), the aircraft 56 m down it
+facing the stand. No leg ran within 90 degrees of the nose, so the facing projection fell back to
+the plain one and the pursuit aimed 16 m down the lane, 149 degrees left (`join` err -149, lateral
+6.9 m); it swung 188 degrees left, 27 m off, and joined at +47 s. The give-up at +93 s
+(`off_route` 25.1 m, taxi_incomplete) was a later corner: G4 onto A about 322 m along, an 84
+degree right turn behind a -50/+31 zigzag in the paint ride, entered at 12 kt; not fixed here.
+
+Replayed from the install, today's planner (83abc66's `join_first_edge_ahead` included) plans the
+same route from the gate and from where the tug let go (the start 81 m off the first taxiway
+edge is out of its reach): it does not change this case.
+
+- **A lane is pushed only when it ends facing the route's way out** (`pushback::choose_plan`):
+  within `BEHIND_DEG` (100) of the route's first leg, else the route's plan. LEMG: 164 apart, so
+  the route's plan, back 81.6 m to 222.2, 105.5 left of the nose: a swing pattern. LIBP stand 1
+  (lane 127, route 217, 90 apart) keeps its lane. `push_lane` logs `used`; the test card's
+  `push_lane` check skips an unused lane.
+- **A join the nose cannot point at is a planned turn, or refused and said** (`autotaxi::JoinTurn`,
+  `join_turn`, `join_turn_applies`, `Route::with_lead`): at the drive's first fix, more than 90
+  degrees to turn, an airframe that does not pivot (not `brake_steer`, not castoring) over 5,700 kg
+  (unread counts heavy), off a runway, not a line-up or turn-round: an arc of 15 m (25 m over
+  100 t; the Citation turned 8.7 m, the 737 about 9 m) then a straight meeting the route ahead
+  within 45 degrees, the shortest such turn, every 3 m sample on drawn pavement. The drive's route
+  becomes that turn and the route beyond it; blackbox `join_turn` (`dir`, `turn_deg`,
+  `radius_m`, `join_m`, `lead_m`, `intercept_deg`, `mtow_kg`). None fits: `join_refused`, "The
+  route runs behind us and there's no room to turn round onto it from here. Holding. Your
+  aircraft." LEMG from where the tug let go: left, 150 degrees of arc (the taxiway lies behind the
+  right wing and a left turn swings away from it), a 45 degree intercept 47 m past the node, 97 m
+  in all, on LEMG's pavement.
+
+Tests: `pushback::a_lane_that_ends_facing_away_from_the_route_is_not_flown` (the recorded lane and
+the replayed route), `autotaxi::a_join_behind_the_wing_line_is_a_planned_turn_onto_the_taxiway`
+(the recorded join replayed: 51 m down the lane, 6.9 m off, aim behind the wing),
+`a_join_turn_off_the_pavement_is_refused`, `a_planned_join_is_for_a_heavy_that_does_not_pivot`;
+real install `live_lemg_190_join_turn_stays_on_the_pavement`,
+`nav::live_lemg_190_route_from_the_gate_starts_down_the_lane`.
+
+Next Citation X (or any jet) at that LEMG gate: `push_lane` `used` false, `pushback` `engaged`
+pattern left or right with `err` near -105 and `target_hdg` 222.2, `stopped`/`tug_finished` err
+inside 20; the first `autotaxi` `drive` tick's `err` inside 45 (was -149). After a short push:
+`join_turn` with `dir` -1, `turn_deg` about 150, then `max_lat_m` of the drive small; or
+`join_refused` said. The 737's pushes (no painted lane at its stand) are unchanged. Offline only.

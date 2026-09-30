@@ -7763,4 +7763,37 @@ SID:030,5,BLN4L,RW30,BLN,LE,D, ,VE  , ,   ,TF, , , , , ,      ,    ,    ,    ,  
         assert!(routes > 0, "the sweep planned nothing");
         assert!(wrong.is_empty(), "{} routes end at the neighbour's entrance", wrong.len());
     }
+
+    /// #190, LEMG (iMac 2026-09-29, sortie 1790712526, a Citation X at the
+    /// gate): today's planner, the route-start join (`join_first_edge_ahead`)
+    /// included, still starts the cleared route down the stand's lane (155
+    /// behind the 327.7 nose) and then the taxiway on 222: the join ahead
+    /// does not reach a start 81 m off its first edge, from the gate or from
+    /// where the tug let go. The painted lane read backwards ends facing 26.
+    /// `cargo test -p atc --release -- --ignored live_lemg_190 --nocapture`
+    #[test]
+    #[ignore] // needs the real X-Plane install
+    fn live_lemg_190_route_from_the_gate_starts_down_the_lane() {
+        let apt = &crate::nav::test_xplane_path("Global Scenery/Global Airports/Earth nav data/apt.dat");
+        let Ok(Some(net)) = find_taxi_net(apt, "LEMG") else {
+            return;
+        };
+        let rws = find_runways(apt, "LEMG").unwrap();
+        let r = rws.iter().find(|r| r.ident_a == "12" || r.ident_b == "12").unwrap().clone();
+        let (tlat, tlon) = if r.ident_a == "12" { (r.lat_a, r.lon_a) } else { (r.lat_b, r.lon_b) };
+        let zone = [r.ident_a.clone(), r.ident_b.clone()];
+        for (lat, lon) in [(36.67335705897913, -4.489441674810065), (36.6729659291503, -4.489131668721906)] {
+            let plan = net.plan_to_runway(lat, lon, tlat, tlon, 100.0, &zone, Some(&r)).expect("a route");
+            let first = bearing_deg(lat, lon, plan.path[1].0, plan.path[1].1);
+            let then = bearing_deg(plan.path[1].0, plan.path[1].1, plan.path[2].0, plan.path[2].1);
+            println!("from {lat},{lon}: {first:.1} then {then:.1}");
+            assert!(((first - 327.7 + 540.0) % 360.0 - 180.0).abs() > 150.0, "the way out is behind: {first}");
+            assert!((then - 222.2).abs() < 1.0, "{then}");
+        }
+        let lane = net.push_lane(36.67335705897913, -4.489441674810065, 327.7).expect("a painted lane");
+        let n = lane.len();
+        let end = (bearing_deg(lane[n - 3].0, lane[n - 3].1, lane[n - 1].0, lane[n - 1].1) + 180.0) % 360.0;
+        println!("lane {n} pts, ends facing {end:.1}");
+        assert!((end - 26.0).abs() < 8.0, "{end}");
+    }
 }

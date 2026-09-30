@@ -497,6 +497,16 @@ fn progress_note(progress_m: f64) {
     }
 }
 
+/// The route was rebuilt under the drive ([`Route::with_lead`]): progress is
+/// measured afresh from here, the deadline kept.
+fn progress_rebase() {
+    if let Ok(mut w) = PROGRESS.lock() {
+        let t = clock_s();
+        w.best = Some((f64::NEG_INFINITY, t));
+        w.last_t = Some(t);
+    }
+}
+
 fn progress_hold() {
     if let Ok(mut w) = PROGRESS.lock() {
         w.hold(clock_s());
@@ -589,10 +599,83 @@ pub fn runway_spans(seg: &[(String, bool)], cum: &[f64]) -> Vec<(f64, f64)> {
     spans
 }
 
+/// (along-route m, |bend| degrees, radius m) per real corner of a digested
+/// polyline, for the slow-down.
+fn route_bends(pts: &[(f64, f64)], cum: &[f64]) -> Vec<(f64, f64, f64)> {
+    let mut bends: Vec<(f64, f64, f64)> = Vec::new();
+    for i in 1..pts.len().saturating_sub(1) {
+        let b_in = taxi_guide::bearing(taxi_guide::point_at(pts, cum, cum[i] - WINDOW_M), pts[i]);
+        let b_out = taxi_guide::bearing(pts[i], taxi_guide::point_at(pts, cum, cum[i] + WINDOW_M));
+        let delta = taxi_guide::angle_diff(b_out, b_in).abs();
+        if delta >= TURN_DEG {
+            let radius = circle_radius_m(
+                taxi_guide::point_at(pts, cum, cum[i] - BEND_RADIUS_SPAN_M),
+                pts[i],
+                taxi_guide::point_at(pts, cum, cum[i] + BEND_RADIUS_SPAN_M),
+            );
+            bends.push((cum[i], delta, radius));
+        }
+    }
+    bends
+}
+
 impl Route {
     /// The route's whole length, metres.
     pub fn total_m(&self) -> f64 {
         self.total
+    }
+
+    /// This route joined by a planned turn ([`join_turn`]): `lead` (lat/lon,
+    /// from the aircraft round the turn to the join point) then the route
+    /// beyond `join_m`. Pace, holding point and the rest are kept; the runway
+    /// spans move with the join. `None` if the result is too short to drive.
+    pub(crate) fn with_lead(&self, lead: &[(f64, f64)], join_m: f64) -> Option<Route> {
+        let mut path: Vec<(f64, f64)> = lead.to_vec();
+        path.extend(
+            self.path
+                .iter()
+                .zip(self.cum.iter())
+                .filter(|(_, &c)| c > join_m + 0.5)
+                .map(|(p, _)| *p),
+        );
+        if path.len() < 2 {
+            return None;
+        }
+        let geo = taxi_guide::Geo::new(path[0].0);
+        let pts: Vec<(f64, f64)> = path.iter().map(|&p| geo.to_m(path[0], p)).collect();
+        let mut cum = vec![0.0_f64];
+        for w in pts.windows(2) {
+            cum.push(cum.last().unwrap() + taxi_guide::dist(w[0], w[1]));
+        }
+        let total = *cum.last().unwrap();
+        if total < STOP_SHORT_M + 15.0 {
+            return None;
+        }
+        let lead_m: f64 = lead
+            .windows(2)
+            .map(|w| taxi_guide::dist(geo.to_m(path[0], w[0]), geo.to_m(path[0], w[1])))
+            .sum();
+        let shift = lead_m - join_m;
+        let runway_spans = self
+            .runway_spans
+            .iter()
+            .filter(|&&(_, b)| b > join_m)
+            .map(|&(a, b)| ((a.max(join_m) + shift).max(0.0), b + shift))
+            .collect();
+        Some(Route {
+            bends: route_bends(&pts, &cum),
+            path,
+            pts,
+            cum,
+            total,
+            holding_point: self.holding_point.clone(),
+            done_line: self.done_line.clone(),
+            pace: self.pace,
+            runway_spans,
+            align_course_deg: self.align_course_deg,
+            align_runway: self.align_runway.clone(),
+            turn_hint: self.turn_hint,
+        })
     }
 
     /// Digest a published route. `None` when it's too short to drive.
@@ -616,22 +699,7 @@ impl Route {
         if total < STOP_SHORT_M + 15.0 {
             return None;
         }
-        let mut bends: Vec<(f64, f64, f64)> = Vec::new();
-        for i in 1..pts.len() - 1 {
-            let b_in =
-                taxi_guide::bearing(taxi_guide::point_at(&pts, &cum, cum[i] - WINDOW_M), pts[i]);
-            let b_out =
-                taxi_guide::bearing(pts[i], taxi_guide::point_at(&pts, &cum, cum[i] + WINDOW_M));
-            let delta = taxi_guide::angle_diff(b_out, b_in).abs();
-            if delta >= TURN_DEG {
-                let radius = circle_radius_m(
-                    taxi_guide::point_at(&pts, &cum, cum[i] - BEND_RADIUS_SPAN_M),
-                    pts[i],
-                    taxi_guide::point_at(&pts, &cum, cum[i] + BEND_RADIUS_SPAN_M),
-                );
-                bends.push((cum[i], delta, radius));
-            }
-        }
+        let bends = route_bends(&pts, &cum);
         let runway_spans = runway_spans(&watch.seg, &cum);
         Some(Route {
             path: watch.path.clone(),
@@ -1444,6 +1512,217 @@ pub(crate) fn join_fix(
         }
         _ => (facing, false),
     }
+}
+
+/// A JOIN THE NOSE CANNOT POINT AT IS A PLANNED TURN, or no join at all.
+/// Pure pursuit joins a route by aiming a few metres down it, and with the
+/// route behind the wing line that aim is behind the aircraft: a jet pivots
+/// toward it on the apron. LEMG (iMac 2026-09-29, sortie 1790712526, a
+/// Citation X): the tug let go 51.5 m down the stand's lane with the nose
+/// still on the stand (327.8), the cleared route's first leg was that lane
+/// (155.3, the stand to the taxiway) and the taxiway beyond it left on 222.2.
+/// No leg ran within 90 degrees of the nose, so the join aimed 16 m down
+/// the lane at a point 149 degrees left (`join` err -149, lateral 6.9 m),
+/// swung 188 degrees left through the aim and 27 m off the route before it
+/// turned back (#190). A heavy airframe that does not pivot (neither
+/// brake-steered nor castoring, over [`JOIN_TURN_LIGHT_KG`]) joining with
+/// more than [`JOIN_TURN_MIN_DEG`] to turn, off a runway, flies a turn of
+/// [`join_turn_radius_m`] from where it stands onto the route AHEAD of it:
+/// the arc, then a straight meeting the route within [`JOIN_INTERCEPT_DEG`],
+/// the shortest such turn (never the longest cut across an apron), every
+/// sample on the drawn
+/// pavement (`None` from the field is no verdict). No such turn is a
+/// refusal, said. Pure.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct JoinTurn {
+    /// Lat/lon from the aircraft round the arc and down the straight to the
+    /// join point on the route.
+    pub lead: Vec<(f64, f64)>,
+    /// +1 a right turn, -1 left.
+    pub dir: f64,
+    /// The arc, degrees.
+    pub turn_deg: f64,
+    /// Along the route to the join point, m.
+    pub join_m: f64,
+    /// The arc plus the straight, m.
+    pub lead_m: f64,
+    /// The straight's angle onto the route, degrees.
+    pub intercept_deg: f64,
+}
+
+/// A join needing more than this in heading is planned ([`JoinTurn`]).
+pub(crate) const JOIN_TURN_MIN_DEG: f64 = 90.0;
+/// At or under this `acf_m_max` an airframe turns on its brakes and nose
+/// (the tug's line, `pushback::tug_for_weight`): the pursuit's own join.
+pub(crate) const JOIN_TURN_LIGHT_KG: f64 = 5_700.0;
+/// The straight meets the route at no more than this.
+const JOIN_INTERCEPT_DEG: f64 = 45.0;
+/// ...after at least this much straight to settle on.
+const JOIN_STRAIGHT_MIN_M: f64 = 8.0;
+/// The join point is sought this far along the route past the aircraft.
+const JOIN_TURN_REACH_M: f64 = 250.0;
+/// An arc past this is a loop, not a turn onto a route.
+const JOIN_TURN_MAX_ARC_DEG: f64 = 240.0;
+/// Pavement is sampled this often along the planned turn.
+const JOIN_SAMPLE_M: f64 = 3.0;
+/// No planned turn fits: said, and the drive stands down holding.
+const JOIN_REFUSED_LINE: &str = "The route runs behind us and there's no room to turn round \
+     onto it from here. Holding. Your aircraft.";
+
+/// The planned join's radius by `acf_m_max`, m: the Citation X turned 27
+/// deg/s at 8 kt in that LEMG join (8.7 m) and the 737 turns about 20 deg/s
+/// at full lock under 7 kt (about 9 m at 6 kt; the 737 profile's taxi note),
+/// so 15 m is a taxi turn with lock to spare; a widebody gets 25 m. Unread
+/// reads as the medium jet.
+pub(crate) fn join_turn_radius_m(mtow_kg: Option<f64>) -> f64 {
+    match mtow_kg {
+        Some(m) if m > 100_000.0 => 25.0,
+        _ => 15.0,
+    }
+}
+
+/// Does a join this far off the nose get a planned turn ([`JoinTurn`])?
+/// Heavy (or unread), not pivoting, off a runway, a drive that is not a
+/// line-up or turn-round (those plan their own geometry). Pure.
+pub(crate) fn join_turn_applies(
+    err_deg: f64,
+    pivots: bool,
+    mtow_kg: Option<f64>,
+    on_runway: Option<bool>,
+    own_geometry: bool,
+) -> bool {
+    err_deg.abs() > JOIN_TURN_MIN_DEG
+        && !pivots
+        && mtow_kg.is_none_or(|m| m > JOIN_TURN_LIGHT_KG)
+        && on_runway != Some(true)
+        && !own_geometry
+}
+
+pub(crate) fn join_turn(
+    route: &[(f64, f64)],
+    lat: f64,
+    lon: f64,
+    psi: f64,
+    radius_m: f64,
+    on_pavement: impl Fn(f64, f64) -> Option<bool>,
+) -> Option<JoinTurn> {
+    if route.len() < 2 || radius_m <= 0.0 {
+        return None;
+    }
+    let geo = taxi_guide::Geo::new(lat);
+    let here = (lat, lon);
+    let pts: Vec<(f64, f64)> = route.iter().map(|&p| geo.to_m(here, p)).collect();
+    let mut cum = vec![0.0_f64];
+    for w in pts.windows(2) {
+        cum.push(cum.last().unwrap() + taxi_guide::dist(w[0], w[1]));
+    }
+    let total = *cum.last().unwrap();
+    // Where the aircraft projects onto the route (the nearest paint).
+    let mut s0 = 0.0;
+    let mut best_d = f64::INFINITY;
+    for (i, w) in pts.windows(2).enumerate() {
+        let (a, b) = (w[0], w[1]);
+        let (dx, dy) = (b.0 - a.0, b.1 - a.1);
+        let len2 = dx * dx + dy * dy;
+        let t = if len2 < 1e-9 {
+            0.0
+        } else {
+            ((-a.0 * dx - a.1 * dy) / len2).clamp(0.0, 1.0)
+        };
+        let c = (a.0 + t * dx, a.1 + t * dy);
+        let d = (c.0 * c.0 + c.1 * c.1).sqrt();
+        if d < best_d {
+            best_d = d;
+            s0 = cum[i] + t * len2.sqrt();
+        }
+    }
+    let m_per_deg_lon = 111_320.0 * lat.to_radians().cos();
+    let to_ll = |p: (f64, f64)| (lat + p.1 / 111_320.0, lon + p.0 / m_per_deg_lon);
+    let (sin_p, cos_p) = (psi.to_radians().sin(), psi.to_radians().cos());
+    let r = radius_m;
+    let mut best: Option<(f64, JoinTurn)> = None;
+    let mut s = s0 + JOIN_STRAIGHT_MIN_M;
+    while s <= (s0 + JOIN_TURN_REACH_M).min(total - 1.0) {
+        let here_s = s;
+        s += 2.0;
+        let q = taxi_guide::point_at(&pts, &cum, here_s);
+        let i = (1..pts.len()).find(|&i| here_s <= cum[i]).unwrap_or(pts.len() - 1);
+        let (a, b) = (pts[i - 1], pts[i]);
+        if taxi_guide::dist(a, b) < 0.5 {
+            continue;
+        }
+        let leg = taxi_guide::bearing(a, b);
+        for dir in [-1.0_f64, 1.0] {
+            // The turn's centre, abeam the nose on the turning side.
+            let c = (dir * r * cos_p, -dir * r * sin_p);
+            let d = taxi_guide::dist(c, q);
+            if d < r * 1.2 {
+                continue;
+            }
+            let bq = taxi_guide::bearing(c, q);
+            let alpha = (r / d).acos().to_degrees();
+            let b0 = taxi_guide::bearing(c, (0.0, 0.0));
+            // Clockwise round the centre the heading is the bearing from it
+            // plus 90; anticlockwise, less 90.
+            let (arc, hs) = if dir > 0.0 {
+                let beta = bq - alpha;
+                ((beta - b0).rem_euclid(360.0), beta + 90.0)
+            } else {
+                let beta = bq + alpha;
+                ((b0 - beta).rem_euclid(360.0), beta - 90.0)
+            };
+            let arc = if arc > 359.0 { 0.0 } else { arc };
+            if arc > JOIN_TURN_MAX_ARC_DEG {
+                continue;
+            }
+            let straight = (d * d - r * r).max(0.0).sqrt();
+            if straight < JOIN_STRAIGHT_MIN_M {
+                continue;
+            }
+            let intercept = taxi_guide::angle_diff(hs.rem_euclid(360.0), leg).abs();
+            if intercept > JOIN_INTERCEPT_DEG {
+                continue;
+            }
+            let arc_m = r * arc.to_radians();
+            let cost = arc_m + straight;
+            if best.as_ref().is_some_and(|(c0, _)| *c0 <= cost) {
+                continue;
+            }
+            // The turn, sampled: round the arc, then down the straight.
+            let mut lead = vec![(0.0, 0.0)];
+            let n_arc = (arc_m / JOIN_SAMPLE_M).ceil().max(1.0) as usize;
+            for k in 1..=n_arc {
+                let th = (b0 + dir * arc * k as f64 / n_arc as f64).to_radians();
+                lead.push((c.0 + r * th.sin(), c.1 + r * th.cos()));
+            }
+            let t = *lead.last().unwrap();
+            let n_st = (straight / JOIN_SAMPLE_M).ceil().max(1.0) as usize;
+            for k in 1..=n_st {
+                let f = k as f64 / n_st as f64;
+                lead.push((t.0 + (q.0 - t.0) * f, t.1 + (q.1 - t.1) * f));
+            }
+            if lead.iter().any(|&p| {
+                let (plat, plon) = to_ll(p);
+                on_pavement(plat, plon) == Some(false)
+            }) {
+                continue;
+            }
+            let mut lead_ll: Vec<(f64, f64)> = lead.iter().map(|&p| to_ll(p)).collect();
+            lead_ll[0] = here;
+            best = Some((
+                cost,
+                JoinTurn {
+                    lead: lead_ll,
+                    dir,
+                    turn_deg: arc,
+                    join_m: here_s,
+                    lead_m: arc_m + straight,
+                    intercept_deg: intercept,
+                },
+            ));
+        }
+    }
+    best.map(|(_, j)| j)
 }
 
 /// Measurement noise a join's offset may grow by, beyond the distance
@@ -2564,7 +2843,7 @@ fn alert(voice: &Option<Voice>, priority: Priority, line: &str) {
 /// every exit path — including a panic or kill -9 — releases the override
 /// within a second by silence alone; the explicit zero write on the way out
 /// is just politeness.
-async fn drive(xp: XPlaneClient, voice: Option<Voice>, route: Route, base_kts: f64, gen: u64) {
+async fn drive(xp: XPlaneClient, voice: Option<Voice>, mut route: Route, base_kts: f64, gen: u64) {
     let _detail = crate::auto_status::DetailGuard::hold(&DETAIL);
     // The landing light over runway spans, decided once for the drive: none
     // when the airframe's landing lamp is already its taxi light tonight.
@@ -2622,6 +2901,9 @@ async fn drive(xp: XPlaneClient, voice: Option<Voice>, route: Route, base_kts: f
     // The last tick's lateral, for the join's jump test (`join_fix`).
     let mut last_lateral: Option<f64> = None;
     let mut last_jumped = false;
+    // A join the nose cannot point at is judged once, at the first fix
+    // ([`JoinTurn`]).
+    let mut join_turn_judged = false;
     loop {
         if !ACTIVE.load(Ordering::Relaxed) || DRIVE_GEN.load(Ordering::SeqCst) != gen {
             crate::blackbox::record(
@@ -2868,6 +3150,57 @@ async fn drive(xp: XPlaneClient, voice: Option<Voice>, route: Route, base_kts: f
         } else {
             route.heading_err_deg(lat, lon, psi, progress, look)
         };
+        // The first fix: a join the nose cannot point at is flown as a
+        // planned turn onto the route ahead, or refused and said (#190).
+        if !join_turn_judged {
+            join_turn_judged = true;
+            let pivots = route.pace.brake_steer || crate::aircraft::nose_castors();
+            let own_geometry = route.align_course_deg.is_some() || route.turn_hint.is_some();
+            let quick = err.abs() > JOIN_TURN_MIN_DEG && !pivots && !own_geometry;
+            let mtow_kg = if quick {
+                xp.get_float(crate::datarefs::ACF_M_MAX_KG).await.ok().map(f64::from)
+            } else {
+                None
+            };
+            let on_rwy = crate::party_line::on_runway(lat, lon);
+            if joining && join_turn_applies(err, pivots, mtow_kg, on_rwy, own_geometry) {
+                let radius_m = join_turn_radius_m(mtow_kg);
+                let turn = join_turn(&route.path, lat, lon, psi, radius_m, |a, b| {
+                    crate::party_line::on_pavement(a, b)
+                });
+                match turn.and_then(|t| route.with_lead(&t.lead, t.join_m).map(|r| (t, r))) {
+                    Some((t, rebuilt)) => {
+                        tracing::info!(err, turn = t.turn_deg, "auto taxi: planned turn onto the route");
+                        crate::blackbox::record(
+                            "autotaxi",
+                            serde_json::json!({"event": "join_turn", "err_deg": err, "lateral_m": offset,
+                                               "dir": t.dir, "turn_deg": t.turn_deg, "radius_m": radius_m,
+                                               "join_m": t.join_m, "lead_m": t.lead_m,
+                                               "intercept_deg": t.intercept_deg,
+                                               "total_m": rebuilt.total, "mtow_kg": mtow_kg}),
+                        );
+                        route = rebuilt;
+                        turn_dir = Some(t.dir);
+                        last_lateral = None;
+                        progress_rebase();
+                        continue;
+                    }
+                    None => {
+                        tracing::warn!(err, "auto taxi: no turn onto the route fits, refusing");
+                        crate::blackbox::record(
+                            "autotaxi",
+                            serde_json::json!({"event": "join_refused", "err_deg": err, "lateral_m": offset,
+                                               "radius_m": radius_m, "mtow_kg": mtow_kg}),
+                        );
+                        speedhold::set_taxi_target(0.0);
+                        let _ = xp.set_float(TAXI_STEER, 0.0).await;
+                        alert(&voice, Priority::Caution, JOIN_REFUSED_LINE);
+                        ACTIVE.store(false, Ordering::Relaxed);
+                        break;
+                    }
+                }
+            }
+        }
         let err = committed_err(err, &mut turn_dir);
         // The turn the route asks for over that same aim span, for the rate
         // lead to credit. Zero inside the stop zone: there the error is held
@@ -3364,6 +3697,111 @@ mod tests {
             holding_point: "N1".into(),
             lead_on: Vec::new(),
         }
+    }
+
+    /// #190's route as cleared from the LEMG gate (replayed from the install
+    /// with `nav::plan_to_runway`, today's planner): the stand, 81.6 m back
+    /// on 155.3 to the taxiway node, then the taxiway on 222.2 for 250 m.
+    fn lemg_190_route() -> Vec<(f64, f64)> {
+        let node: (f64, f64) = (36.6726900, -4.4890590);
+        let m_lon = 111_320.0 * node.0.to_radians().cos();
+        let (s, c) = (222.2_f64.to_radians().sin(), 222.2_f64.to_radians().cos());
+        let mut path = vec![(36.67335705897913, -4.489441674810065), node];
+        for k in 1..=50 {
+            let d = 5.0 * k as f64;
+            path.push((node.0 + d * c / 111_320.0, node.1 + d * s / m_lon));
+        }
+        path
+    }
+
+    /// #190, LEMG (iMac 2026-09-29, sortie 1790712526, a Citation X): the tug
+    /// let go 51.5 m down the lane, nose 327.8 (`state` at the engage), and
+    /// the join aimed down the stand's own lane 149 degrees left (`join`
+    /// err -149.05, lateral 6.94 m, remaining 3558.8 of 3614.9). The planned
+    /// turn goes left onto the taxiway ahead, meeting it within 45 degrees,
+    /// and the drive's first aim after it sits ahead of the nose.
+    #[test]
+    fn a_join_behind_the_wing_line_is_a_planned_turn_onto_the_taxiway() {
+        let (lat, lon, psi) = (36.6729659291503, -4.489131668721906, 327.8);
+        let path = lemg_190_route();
+        let w = TaxiWatch {
+            path: path.clone(),
+            via: String::new(),
+            seg: vec![(String::new(), false); path.len() - 1],
+            holding_point: "HW1".into(),
+            lead_on: Vec::new(),
+        };
+        let route = Route::build(&w).expect("a route");
+        // The recorded join, replayed: the plain projection onto the lane,
+        // the aim 16 m on, well behind the wing line.
+        let (progress, off) = route.fix_signed_facing(lat, lon, psi).expect("a fix");
+        let err = route.heading_err_deg(lat, lon, psi, progress, 16.0);
+        // 56 m down the route as flown (3558.8 of 3614.9), 51 m on
+        // today's replay: the lane either way.
+        assert!(progress > 45.0 && progress < 60.0, "{progress}");
+        assert!((off.abs() - 6.9).abs() < 1.0, "{off}");
+        assert!(err < -130.0, "{err}");
+        assert!(join_turn_applies(err, false, Some(16_000.0), Some(false), false));
+        let t = join_turn(&route.path, lat, lon, psi, join_turn_radius_m(Some(16_000.0)), |_, _| None)
+            .expect("a turn fits on an open apron");
+        assert_eq!(t.dir, -1.0, "left, the short way onto 222: {t:?}");
+        // The taxiway lies 25 m behind the right wing and a left turn swings
+        // away from it, so the turn goes past its heading and meets it at
+        // the intercept: 150 degrees of arc, 97 m in all.
+        assert!(t.turn_deg > 106.0 && t.turn_deg < 170.0, "{t:?}");
+        assert!(t.lead_m < 120.0, "{t:?}");
+        assert!(t.join_m > 81.6, "onto the taxiway, not down the lane: {t:?}");
+        assert!(t.intercept_deg <= JOIN_INTERCEPT_DEG, "{t:?}");
+        assert_eq!(t.lead[0], (lat, lon), "the turn starts where we stand");
+        let rebuilt = route.with_lead(&t.lead, t.join_m).expect("drivable");
+        let (p2, off2) = rebuilt.fix_signed(lat, lon).expect("a fix");
+        assert!(p2 < 1.0 && off2.abs() < 0.5, "{p2} {off2}");
+        let err2 = rebuilt.heading_err_deg(lat, lon, psi, p2, 16.0);
+        assert!(err2 < 0.0 && err2 > -60.0, "the aim is round the turn ahead: {err2}");
+        assert!(rebuilt.total < route.total, "the lane behind is not driven");
+    }
+
+    /// No planned turn stays on the pavement: none, and the drive refuses.
+    /// Only drawn pavement refuses (a field without it is no verdict).
+    #[test]
+    fn a_join_turn_off_the_pavement_is_refused() {
+        let (lat, lon, psi) = (36.6729659291503, -4.489131668721906, 327.8);
+        let path = lemg_190_route();
+        assert!(join_turn(&path, lat, lon, psi, 15.0, |_, _| Some(false)).is_none());
+        assert!(join_turn(&path, lat, lon, psi, 15.0, |_, _| Some(true)).is_some());
+        assert!(!JOIN_REFUSED_LINE.contains('\u{2014}') && !JOIN_REFUSED_LINE.contains('\u{2013}'));
+    }
+
+    /// Who gets a planned join: a heavy that does not pivot, off a runway,
+    /// with the route behind the wing line. The SR22 and the light singles
+    /// keep the pursuit's own turn; a line-up or turn-round plans its own.
+    #[test]
+    fn a_planned_join_is_for_a_heavy_that_does_not_pivot() {
+        assert!(join_turn_applies(-149.0, false, Some(16_000.0), Some(false), false));
+        assert!(join_turn_applies(149.0, false, None, None, false), "unread is heavy");
+        assert!(!join_turn_applies(-60.0, false, Some(16_000.0), None, false), "a taxi turn");
+        assert!(!join_turn_applies(-149.0, true, Some(16_000.0), None, false), "pivots");
+        assert!(!join_turn_applies(-149.0, false, Some(1_111.0), None, false), "light");
+        assert!(!join_turn_applies(-149.0, false, Some(79_000.0), Some(true), false), "runway");
+        assert!(!join_turn_applies(-149.0, false, Some(79_000.0), None, true), "own geometry");
+        assert_eq!(join_turn_radius_m(Some(79_000.0)), 15.0);
+        assert_eq!(join_turn_radius_m(Some(230_000.0)), 25.0);
+    }
+
+    /// The same join over LEMG's drawn pavement, read from the install.
+    /// `cargo test --release -- --ignored live_lemg_190_join_turn --nocapture`
+    #[test]
+    #[ignore] // needs the real X-Plane install
+    fn live_lemg_190_join_turn_stays_on_the_pavement() {
+        let apt = &crate::tools::autoland::xplane_path("Global Scenery/Global Airports/Earth nav data/apt.dat");
+        let Ok(Some(net)) = atc::nav::find_taxi_net(apt, "LEMG") else {
+            return;
+        };
+        let (lat, lon, psi) = (36.6729659291503, -4.489131668721906, 327.8);
+        let t = join_turn(&lemg_190_route(), lat, lon, psi, 15.0, |a, b| net.on_pavement(a, b))
+            .expect("the apron has room for the turn");
+        println!("{t:?}");
+        assert_eq!(t.dir, -1.0);
     }
 
     /// LSZS 03 (SR22, 2026-09-24): the second line-up drive joined 27.4 m
