@@ -106,6 +106,11 @@ const CONTACT_WITHIN_S: f64 = 30.0;
 /// saw the wheels is the same contact (it is recorded just before it, from
 /// the same monitor tick).
 const FLIGHT_TD_WITHIN_S: f64 = 2.0;
+/// The flight model's touchdown this close to an autoland contact is that
+/// contact (else the contact's own flare window scores it): the 737's at
+/// LEMG 31 came 1.5 and 1.8 s after (1790584715, 1790585651); the King
+/// Air's 3.2 s after, 18 kt slower, rolling (1790795346).
+const MODEL_AT_CONTACT_S: f64 = 2.0;
 /// Rollout: most off the centreline.
 pub const ROLLOUT_MAX_XTK_M: f64 = 5.0;
 /// A stream quiet this long has ended.
@@ -959,11 +964,11 @@ impl Scorer {
         let sink = crate::instructor::touchdown_sink_fpm(&recent, t, f(r, "vsi").unwrap_or(0.0))
             .min(0.0)
             .abs();
-        let model = self
+        let model_td = self
             .flight_td
             .take()
-            .filter(|(tf, _)| *tf >= since && (t - tf).abs() <= FLIGHT_TD_WITHIN_S)
-            .map(|(_, s)| s);
+            .filter(|(tf, _)| *tf >= since && (t - tf).abs() <= FLIGHT_TD_WITHIN_S);
+        let model = model_td.map(|(_, s)| s);
         let drift = self
             .air
             .last()
@@ -984,7 +989,15 @@ impl Scorer {
             Some(c) if c.up_ft > BOUNCE_FT || c.air_s >= BOUNCE_AIR_S => {
                 (c.t, c.sink, Some((c.up_ft, model.unwrap_or(sink))))
             }
-            Some(c) => (c.t, model.unwrap_or(c.sink), None),
+            // The model's touchdown is its SUSTAINED ground, logged up to
+            // seconds after the wheels: its sink is the contact's only when
+            // it is the contact's time. King Air LEMG 13 1790795346 (iMac
+            // 2026-09-30): the contact at 547 fpm on the gauge, the model's
+            // touchdown 3.2 s later at 73 kt read 51, scored a pass.
+            Some(c) => {
+                let near = model_td.filter(|(tf, _)| (tf - c.t).abs() <= MODEL_AT_CONTACT_S).map(|(_, s)| s);
+                (c.t, near.unwrap_or(c.sink), None)
+            }
             None => (t, model.unwrap_or(sink), None),
         };
         self.flare_vvi.clear();
