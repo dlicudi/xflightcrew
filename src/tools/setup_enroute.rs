@@ -1170,8 +1170,16 @@ mod tests {
             let p = place(&plan, &point, &b738()).unwrap();
             // Over flat England: the plan's altitude less a field's height.
             assert_eq!(resume_gate(false, false, p.alt_ft - 500.0, 0.0, p.ias_kts, 167.0), None);
-            let join =
-                resume_join(&legs, &plan.waypoints, &plan.destination, p.lat, p.lon, Some(-1.0));
+            let join = resume_join(
+                &legs,
+                &plan.waypoints,
+                &plan.destination,
+                p.lat,
+                p.lon,
+                Some(-1.0),
+                None,
+                None,
+            );
             let i = match join {
                 ResumeJoin::Leg(i) => i,
                 other => panic!("{point:?}: {other:?}"),

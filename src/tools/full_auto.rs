@@ -119,18 +119,83 @@ pub(crate) const ARRIVAL_REJOIN_NM: f64 = 25.0;
 pub(crate) enum ResumeJoin {
     /// The enroute leg ending at this index.
     Leg(usize),
-    /// Past the route, near the destination: fly its arrival.
-    Arrival { dist_nm: f64 },
+    /// Past the route, or on the plan's final, near the destination: fly
+    /// its arrival. `on_final`: how the final judged it, when it did.
+    Arrival { dist_nm: f64, on_final: Option<OnFinal> },
     /// No flyable join; the line says why, with its number.
     Refused(String),
 }
 
-/// The join for an airborne resume at (`lat`, `lon`): abeam a leg inside the
-/// corridor, else direct to the first fix near the origin (LILB
-/// 2026-09-25; the SR22's 8 nm refusal climbing out of Samedan, LSZS
-/// 2026-09-24, is this case), else the arrival past the route near the
-/// destination, else the refusal, naming the destination's distance when it
-/// has nothing better. Pure.
+/// The plan's landing runway as the resume judges a final against it: the
+/// threshold and the landing course, degrees true.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct FinalCourse {
+    pub thr_lat: f64,
+    pub thr_lon: f64,
+    pub course_true: f64,
+}
+
+/// Runway `rwy`'s end among `runways` as a [`FinalCourse`]. Pure.
+pub(crate) fn final_course(runways: &[crate::nav::Runway], rwy: &str) -> Option<FinalCourse> {
+    runways.iter().find_map(|r| {
+        if crate::nav::same_runway_end(&r.ident_a, rwy) {
+            Some(FinalCourse { thr_lat: r.lat_a, thr_lon: r.lon_a, course_true: r.heading_a_deg() })
+        } else if crate::nav::same_runway_end(&r.ident_b, rwy) {
+            Some(FinalCourse { thr_lat: r.lat_b, thr_lon: r.lon_b, course_true: r.heading_b_deg() })
+        } else {
+            None
+        }
+    })
+}
+
+/// Where the aircraft sits on the plan's final: miles to fly to the
+/// threshold along the course, miles off its extended centreline (right
+/// positive) and degrees between the track and the landing course.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct OnFinal {
+    pub along_nm: f64,
+    pub xtk_nm: f64,
+    pub track_off_deg: f64,
+}
+
+/// A track this near the landing course is flying the final, degrees: an
+/// intercept autoland turns onto, never a leg across it.
+pub(crate) const FINAL_ALIGN_DEG: f64 = 45.0;
+
+/// The aircraft on the plan's final: in front of the threshold inside
+/// [`ARRIVAL_REJOIN_NM`], within the rejoin corridor of the extended
+/// centreline, tracking within [`FINAL_ALIGN_DEG`] of the landing course.
+/// EGKK-EGBB (sortie 1790760672-approach, iMac 2026-09-30, t 1790760727.7):
+/// the 737 on a 12 nm final to 33 after "my controls" was refused as "4
+/// miles left of course on the PUFAX to HON leg", because the navlog's last
+/// fix GROVE is nearer EGBB than the final was, so the arrival rule never
+/// saw it past the route. Pure.
+pub(crate) fn on_final(fc: &FinalCourse, lat: f64, lon: f64, track_true: f64) -> Option<OnFinal> {
+    if ![lat, lon, track_true, fc.thr_lat, fc.thr_lon, fc.course_true]
+        .iter()
+        .all(|v| v.is_finite())
+    {
+        return None;
+    }
+    let (x_m, along_m) =
+        crate::nav::runway_frame_m(fc.thr_lat, fc.thr_lon, fc.course_true, lat, lon);
+    let (along_nm, xtk_nm) = (along_m / 1852.0, x_m / 1852.0);
+    let track_off_deg = ((track_true - fc.course_true + 540.0) % 360.0 - 180.0).abs();
+    (along_nm > 0.0
+        && along_nm <= ARRIVAL_REJOIN_NM
+        && xtk_nm.abs() <= crate::interaction::REJOIN_CORRIDOR_NM
+        && track_off_deg <= FINAL_ALIGN_DEG)
+        .then_some(OnFinal { along_nm, xtk_nm, track_off_deg })
+}
+
+/// The join for an airborne resume at (`lat`, `lon`): on the plan's final
+/// ([`on_final`], with the track `track_true` and the plan runway's
+/// `final_course`), the arrival; else abeam a leg inside the corridor, else
+/// direct to the first fix near the origin (LILB 2026-09-25; the SR22's 8 nm
+/// refusal climbing out of Samedan, LSZS 2026-09-24, is this case), else the
+/// arrival past the route near the destination, else the refusal, naming the
+/// destination's distance when it has nothing better. Pure.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn resume_join(
     legs: &[crate::nav::ProcLeg],
     waypoints: &[crate::simbrief::Waypoint],
@@ -138,7 +203,21 @@ pub(crate) fn resume_join(
     lat: f64,
     lon: f64,
     mag_var: Option<f64>,
+    final_course: Option<&FinalCourse>,
+    track_true: Option<f64>,
 ) -> ResumeJoin {
+    // The final first: an earlier STAR leg abeam it is behind the flight.
+    let dest = waypoints
+        .last()
+        .filter(|d| d.ident.eq_ignore_ascii_case(destination));
+    if let (Some(d), Some(fc), Some(trk)) = (dest, final_course, track_true) {
+        let to_dest = crate::nav::haversine_nm(lat, lon, d.lat, d.lon);
+        if to_dest <= ARRIVAL_REJOIN_NM {
+            if let Some(f) = on_final(fc, lat, lon, trk) {
+                return ResumeJoin::Arrival { dist_nm: to_dest, on_final: Some(f) };
+            }
+        }
+    }
     let why = match crate::interaction::rejoin_index(legs, lat, lon, mag_var) {
         Ok(i) => return ResumeJoin::Leg(i),
         Err(why) => why,
@@ -152,16 +231,13 @@ pub(crate) fn resume_join(
     {
         return ResumeJoin::Leg(0);
     }
-    let dest = waypoints
-        .last()
-        .filter(|d| d.ident.eq_ignore_ascii_case(destination));
     if let Some(d) = dest {
         let to_dest = crate::nav::haversine_nm(lat, lon, d.lat, d.lon);
         let last_fix = legs.iter().rev().find_map(|l| l.fix.as_ref());
         let past_route =
             last_fix.is_none_or(|f| to_dest < crate::nav::haversine_nm(f.lat, f.lon, d.lat, d.lon));
         if to_dest <= ARRIVAL_REJOIN_NM && past_route {
-            return ResumeJoin::Arrival { dist_nm: to_dest };
+            return ResumeJoin::Arrival { dist_nm: to_dest, on_final: None };
         }
         return ResumeJoin::Refused(format!("{why} {} is {:.0} miles away.", d.ident, to_dest));
     }
@@ -801,6 +877,27 @@ impl FullAuto {
             let msa = crate::nav::airport_msa_ft(&msa_path, icao)?;
             (altitude < msa).then_some(msa)
         });
+        // The plan runway's final, read only near the destination: the
+        // apt.dat scan takes a moment.
+        let near_dest = fp.waypoints.last().is_some_and(|d| {
+            d.ident.eq_ignore_ascii_case(&fp.destination)
+                && crate::nav::haversine_nm(lat, lon, d.lat, d.lon) <= ARRIVAL_REJOIN_NM
+        });
+        let final_fc = match (near_dest, fp.procedures.dest_rwy.clone()) {
+            (true, Some(rwy)) => {
+                let apt = ctx.config.apt_data_path.clone();
+                let dest = fp.destination.clone();
+                tokio::task::spawn_blocking(move || {
+                    let runways = crate::nav::find_runways(&apt, &dest).ok()?;
+                    final_course(&runways, &rwy)
+                })
+                .await
+                .ok()
+                .flatten()
+            }
+            _ => None,
+        };
+        let track_true = first_read.map(|r| r.track_true);
         let index = match resume_join(
             &legs,
             &fp.waypoints,
@@ -808,24 +905,41 @@ impl FullAuto {
             lat,
             lon,
             mag_var.ok().filter(|v| v.is_finite()),
+            final_fc.as_ref(),
+            track_true,
         ) {
             ResumeJoin::Leg(i) => i,
-            ResumeJoin::Arrival { dist_nm } => {
+            ResumeJoin::Arrival { dist_nm, on_final } => {
+                crate::full_auto::event(
+                    "resume_join_arrival",
+                    json!({
+                        "dist_nm": dist_nm,
+                        "on_final": on_final.is_some(),
+                        "along_nm": on_final.map(|f| f.along_nm),
+                        "xtk_nm": on_final.map(|f| f.xtk_nm),
+                        "track_off_deg": on_final.map(|f| f.track_off_deg),
+                        "track_true": track_true,
+                        "course_true": final_fc.map(|f| f.course_true),
+                    }),
+                );
                 let Some(rwy) = fp.procedures.dest_rwy.clone() else {
                     return Err(format!(
                         "We're past the route, {dist_nm:.0} miles from {}, and the plan names no runway. I haven't taken control; say land for me.",
                         fp.destination
                     ));
                 };
-                return Ok(ResumeArm::Arrival {
-                    ack: format!(
-                        "Past the route, {dist_nm:.0} miles from {}. Flying the approach to runway {}. Say my controls to take over.",
-                        fp.destination,
-                        atc::atis::spoken_runway(&rwy),
+                let spoken = atc::atis::spoken_runway(&rwy);
+                let ack = match on_final {
+                    Some(f) => format!(
+                        "On the final for runway {spoken}, {:.0} miles out. Flying the approach to {}. Say my controls to take over.",
+                        f.along_nm, fp.destination,
                     ),
-                    dest: fp.destination.clone(),
-                    rwy,
-                });
+                    None => format!(
+                        "Past the route, {dist_nm:.0} miles from {}. Flying the approach to runway {spoken}. Say my controls to take over.",
+                        fp.destination,
+                    ),
+                };
+                return Ok(ResumeArm::Arrival { ack, dest: fp.destination.clone(), rwy });
             }
             // Below the sector altitude a heading is never advice alone.
             ResumeJoin::Refused(why) => {
@@ -1848,7 +1962,7 @@ mod tests {
         assert!(crate::interaction::rejoin_index(&legs, lat, lon, None)
             .is_err_and(|w| w.contains("4634N01010E to 4626N01003E")));
         assert_eq!(
-            resume_join(&legs, &lszs, "LILO", lat, lon, None),
+            resume_join(&legs, &lszs, "LILO", lat, lon, None, None, None),
             ResumeJoin::Leg(0)
         );
 
@@ -1860,22 +1974,93 @@ mod tests {
         ]);
         let legs = crate::procedure::enroute_legs(&lipk, "LIPE", "LIPK", 5000.0);
         let (lat, lon) = (44.13632, 12.20075);
-        match resume_join(&legs, &lipk, "LIPK", lat, lon, None) {
-            ResumeJoin::Arrival { dist_nm } => assert!((6.0..7.0).contains(&dist_nm), "{dist_nm}"),
+        match resume_join(&legs, &lipk, "LIPK", lat, lon, None, None, None) {
+            ResumeJoin::Arrival { dist_nm, .. } => assert!((6.0..7.0).contains(&dist_nm), "{dist_nm}"),
             other => panic!("the arrival, not {other:?}"),
         }
         // Past the route but 30 nm out: refused, and the refusal names the
         // destination's distance.
-        match resume_join(&legs, &lipk, "LIPK", 43.75, 12.35, None) {
+        match resume_join(&legs, &lipk, "LIPK", 43.75, 12.35, None, None, None) {
             ResumeJoin::Refused(why) => assert!(why.contains("LIPK is 29 miles away"), "{why}"),
             other => panic!("refused, not {other:?}"),
         }
         // Back up the route, farther from the field than LUMAV is, is not
         // past it: the corridor refusal stands.
         assert!(matches!(
-            resume_join(&legs, &lipk, "LIPK", 44.95, 11.2, None),
+            resume_join(&legs, &lipk, "LIPK", 44.95, 11.2, None, None, None),
             ResumeJoin::Refused(_)
         ));
+    }
+
+    /// EGKK-EGBB, the pilot's real OFP (STAR HEME1B to 33: PUFAX, HON,
+    /// OSKOT, GROVE). Sortie 1790760672-approach (iMac 2026-09-30): the 737
+    /// on the 33 final, "my controls", then "resume flight plan" at t
+    /// 1790760727.7 from 52.2743 N 1.5492 W tracking 326 true, 13 nm from
+    /// EGBB, was refused "4 miles left of course on the PUFAX to HON leg":
+    /// GROVE, the navlog's last fix, is nearer EGBB than the final, so the
+    /// past-the-route arrival never applied. On the plan's final it is the
+    /// arrival.
+    #[test]
+    fn a_resume_on_the_plans_final_flies_the_arrival() {
+        let v: serde_json::Value =
+            serde_json::from_str(include_str!("../../bench/ofp/egkk-egbb-738.trimmed.json"))
+                .unwrap();
+        let fp = crate::simbrief::plan_from_ofp(&v).unwrap();
+        assert_eq!(fp.procedures.dest_rwy.as_deref(), Some("33"));
+        let legs =
+            crate::procedure::enroute_legs(&fp.waypoints, &fp.origin, &fp.destination, 18_000.0);
+        // EGBB's apt.dat 100 row: 15 at the north-west end, 33 the south-east.
+        let egbb = [crate::nav::Runway {
+            ident_a: "15".into(),
+            ident_b: "33".into(),
+            lat_a: 52.4656497,
+            lon_a: -1.7611282,
+            lat_b: 52.4428974,
+            lon_b: -1.7358498,
+            width_m: 46.02,
+            surface: 1,
+        }];
+        let fc = final_course(&egbb, "33").unwrap();
+        assert!((fc.course_true - 326.0).abs() < 2.0, "{fc:?}");
+        let (lat, lon, trk) = (52.274337015882715, -1.5492269078597638, 326.0);
+        let join = |lat, lon, fc: Option<&FinalCourse>, trk| {
+            resume_join(&legs, &fp.waypoints, &fp.destination, lat, lon, Some(-1.0), fc, trk)
+        };
+        // As flown: no final to judge against, the corridor refusal.
+        match join(lat, lon, None, Some(trk)) {
+            ResumeJoin::Refused(why) => assert!(why.contains("PUFAX to HON"), "{why}"),
+            other => panic!("the recorded refusal, not {other:?}"),
+        }
+        // With the plan runway's final: the arrival, 12 miles out on the line.
+        match join(lat, lon, Some(&fc), Some(trk)) {
+            ResumeJoin::Arrival { dist_nm, on_final: Some(f) } => {
+                assert!((12.0..14.0).contains(&dist_nm), "{dist_nm}");
+                assert!((11.0..13.0).contains(&f.along_nm), "{f:?}");
+                assert!(f.xtk_nm.abs() < 0.5, "{f:?}");
+                assert!(f.track_off_deg < 2.0, "{f:?}");
+            }
+            other => panic!("the arrival, not {other:?}"),
+        }
+        // Crossing the final, not flying it: the refusal stands.
+        assert!(matches!(join(lat, lon, Some(&fc), Some(240.0)), ResumeJoin::Refused(_)));
+        // No track read: never judged a final.
+        assert!(matches!(join(lat, lon, Some(&fc), None), ResumeJoin::Refused(_)));
+        // Aligned but 5 nm beside the centreline, outside the corridor.
+        let (olat, olon) = crate::nav::project_latlon(lat, lon, fc.course_true + 90.0, 5.0);
+        assert!(!matches!(
+            join(olat, olon, Some(&fc), Some(trk)),
+            ResumeJoin::Arrival { on_final: Some(_), .. }
+        ));
+        // Past the threshold on the runway's heading: behind the final.
+        let (plat, plon) = crate::nav::project_latlon(fc.thr_lat, fc.thr_lon, fc.course_true, 6.0);
+        assert!(!matches!(
+            join(plat, plon, Some(&fc), Some(trk)),
+            ResumeJoin::Arrival { on_final: Some(_), .. }
+        ));
+        // Too far out: 30 nm on the extended centreline is not the arrival.
+        let (flat, flon) =
+            crate::nav::project_latlon(fc.thr_lat, fc.thr_lon, fc.course_true + 180.0, 30.0);
+        assert!(!matches!(join(flat, flon, Some(&fc), Some(trk)), ResumeJoin::Arrival { .. }));
     }
 
     fn steady(t_s: f64, lat: f64, lon: f64, alt_ft: f64, vs: f64, gs: f64, trk: f64) -> Steady {

@@ -11983,3 +11983,33 @@ Next Citation LEMG taxi: `drive` ticks 640 to 720 m to go (the route is 69 m sho
 corner sits near 650 to 720) with `turn_dps` one sign (left) through the corner, no +17 then -13,
 `lat_m` inside 3 m, `remaining_m` without the 4 to 7 m jumps; the stage's `max_lat_m` under 3.
 Offline only.
+
+## 2026-09-30: a resume on the plan's final is the arrival (#67)
+
+iMac 2026-09-30, sortie 1790760672-approach: EGKK-EGBB on the SimBrief plan (HEME1B to 33 via
+PUFAX, HON, OSKOT, GROVE), the 737 set on a 15 nm final to EGBB 33 with autoland flying. "My
+controls" at +35 s, then "resume flight plan" at t 1790760727.7 from 52.2743 N 1.5492 W, tracking
+326 true on the 33 centreline 13 nm out, 3,580 ft: refused "4 miles left of course on the PUFAX to
+HON leg, outside the 3 mile rejoin corridor ... EGBB is 13 miles away". `resume_join` asked the
+corridor first (PUFAX-HON was the nearest abeam leg, 4 nm), then the arrival rule, which needs the
+aircraft within `ARRIVAL_REJOIN_NM` (25) AND nearer the destination than the navlog's last fix. The
+last fix is GROVE, about 5 nm from EGBB on the west side; a straight-in from the south-east at 13 nm
+is never "past the route" by that measure, so the one position the arrival was made for was
+refused.
+
+Change: `full_auto::on_final` judges the plan runway's final (`FinalCourse` from apt.dat by
+`final_course`, the threshold and landing course): in front of the threshold within 25 nm, inside
+the 3 nm rejoin corridor of the extended centreline, tracking within `FINAL_ALIGN_DEG` (45) of the
+course. `resume_join` asks it FIRST, near the destination, and returns `Arrival { on_final }`; a
+leg abeam behind it no longer wins. The resume reads the runway only within 25 nm of the
+destination (the apt.dat scan) and takes the track from its first steady read; no track, no final.
+The ack says "On the final for runway three three, 12 miles out"; blackbox `full_auto`
+`resume_join_arrival` (`on_final`, `along_nm`, `xtk_nm`, `track_off_deg`, `track_true`,
+`course_true`).
+
+Test: `a_resume_on_the_plans_final_flies_the_arrival` (the pilot's real OFP and EGBB's 100 row; the
+recorded position refused as flown without the final, the arrival with it, about 12 nm along and on
+the line; crossing at 240, no track, 5 nm beside, past the threshold and 30 nm out are not).
+
+Next resume on a final: `resume_join_arrival` `on_final` true with `xtk_nm` inside 3, then
+`resume_arrival` and autoland's arm on the plan runway. Offline only.
