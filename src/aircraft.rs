@@ -51,6 +51,15 @@ pub struct FlarePowerProfile {
     /// (kt): a fast flare floats, and the float is the speed.
     #[serde(default)]
     pub retard_fast_kts: Option<f64>,
+    /// The short final's power HOLD: from this many seconds of the path's
+    /// sink above the runway (at the groundspeed), the speed law only ever
+    /// takes power off, as the roundout's does, unless the airspeed projects
+    /// under the flare's protected speed (`autoland::short_final_power_held`).
+    /// A lever the speed law adds in the seconds before the servos are
+    /// released keeps spooling into the roundout with nothing trimming
+    /// against it. `None`: held only in the roundout.
+    #[serde(default)]
+    pub hold_from_s: Option<f64>,
 }
 
 /// How the landing arrest's vertical-speed dial leads THIS autopilot's lag
