@@ -212,9 +212,6 @@ const STEER_FULL_DEG: f64 = 30.0;
 /// schedule to the pace's turn cap; at/above `SHARP_DEG`, to its sharp cap.
 const TURN_DEG: f64 = 30.0;
 const SHARP_DEG: f64 = 100.0;
-/// A corner's radius is the circle through the route this far either side
-/// of its vertex.
-const BEND_RADIUS_SPAN_M: f64 = 8.0;
 /// The deceleration the bend caps are anticipated at: the stop ramp's own.
 const BEND_DECEL_MS2: f64 = STOP_DECEL_MS2;
 /// How far before a corner's own window its approach is shaped: enough for
@@ -224,7 +221,9 @@ const BEND_ENVELOPE_M: f64 = 160.0;
 const CORNER_MIN_KTS: f64 = 3.0;
 
 /// The radius of the circle through three points (metres), or infinity when
-/// they lie on a line.
+/// they lie on a line. The corner radius before #194, kept for the tests'
+/// comparison with it.
+#[cfg(test)]
 fn circle_radius_m(a: (f64, f64), b: (f64, f64), c: (f64, f64)) -> f64 {
     let (ab, bc, ca) = (taxi_guide::dist(a, b), taxi_guide::dist(b, c), taxi_guide::dist(c, a));
     let cross = ((b.0 - a.0) * (c.1 - a.1) - (b.1 - a.1) * (c.0 - a.0)).abs();
@@ -353,9 +352,6 @@ impl Pace {
         }
     }
 }
-/// Bearing smoothing window for bend detection, meters (the guide's value:
-/// densely-noded fillet arcs must not read as hairpins).
-const WINDOW_M: f64 = 15.0;
 
 /// True while the steering loop runs, mirroring `speedhold::ACTIVE` /
 /// `autoland::ACTIVE`. Cleared by the loop itself, the release path in
@@ -565,9 +561,8 @@ pub struct Route {
     /// Cumulative along-route distance per vertex.
     cum: Vec<f64>,
     total: f64,
-    /// (along-route m, |bend| degrees, radius m) per real corner, for the
-    /// slow-down.
-    bends: Vec<(f64, f64, f64)>,
+    /// The corners, for the slow-down ([`route_bends`]).
+    bends: Vec<Bend>,
     /// Spoken holding point ("November five Whiskey"), may be empty.
     pub holding_point: String,
     /// Overrides the arrival line when set — a LINE-UP drive ends with
@@ -621,22 +616,129 @@ pub fn runway_spans(seg: &[(String, bool)], cum: &[f64]) -> Vec<(f64, f64)> {
     spans
 }
 
-/// (along-route m, |bend| degrees, radius m) per real corner of a digested
-/// polyline, for the slow-down.
-fn route_bends(pts: &[(f64, f64)], cum: &[f64]) -> Vec<(f64, f64, f64)> {
-    let mut bends: Vec<(f64, f64, f64)> = Vec::new();
-    for i in 1..pts.len().saturating_sub(1) {
-        let b_in = taxi_guide::bearing(taxi_guide::point_at(pts, cum, cum[i] - WINDOW_M), pts[i]);
-        let b_out = taxi_guide::bearing(pts[i], taxi_guide::point_at(pts, cum, cum[i] + WINDOW_M));
-        let delta = taxi_guide::angle_diff(b_out, b_in).abs();
-        if delta >= TURN_DEG {
-            let radius = circle_radius_m(
-                taxi_guide::point_at(pts, cum, cum[i] - BEND_RADIUS_SPAN_M),
-                pts[i],
-                taxi_guide::point_at(pts, cum, cum[i] + BEND_RADIUS_SPAN_M),
-            );
-            bends.push((cum[i], delta, radius));
+/// One corner of a digested polyline, for the slow-down: where its turning
+/// starts and ends along the route (m), the heading it turns through
+/// (degrees, unsigned) and the tightest radius flown inside it (m).
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Bend {
+    start: f64,
+    end: f64,
+    deg: f64,
+    radius: f64,
+}
+
+/// The heading change a corner is found by, over [`BEND_FIND_SPAN_M`] of
+/// route. Smoothed like the guide's cues (densely-noded fillet arcs must not
+/// read as hairpins), and on an arc the same 30 degrees in 30 m whether it
+/// is drawn in one vertex or twelve: a 57 m radius or tighter.
+const BEND_FIND_SPAN_M: f64 = 30.0;
+/// The span a corner's radius is read over: the route's length over the
+/// heading it changes by across this much of it. On a drawn arc that IS its
+/// radius; at a lone vertex of D it is 8 / D (in radians), a little under
+/// the circle through the route 8 m either side (4 / sin(D/2)), which the
+/// cap read before #194.
+const BEND_RADIUS_SPAN_M: f64 = 8.0;
+/// Stations the route's turning is read at, m.
+const BEND_STEP_M: f64 = 1.0;
+/// A vertex turning less than this is no part of a corner's extent.
+const BEND_VERTEX_MIN_DEG: f64 = 0.5;
+
+/// The corners of a digested polyline, read from its CURVATURE, the heading
+/// it changes by per metre, so a corner is the same corner however finely
+/// it is drawn. Before #194 a corner was a VERTEX turning 30 degrees over
+/// the 15 m either side, and its radius the circle through the route 8 m
+/// either side of that vertex: a fillet drawn in 3 to 5 m segments never
+/// turns 30 degrees at one vertex, so LEMG's Quebec onto Delta, 104 degrees
+/// on about a 16 m radius once the ride took the fillet (e31f338), had no
+/// corner at all and the Citation X went in at 17.4 kt (sortie
+/// 1790765957, iMac 2026-09-30): full lock for 3 s, 7.3 m off the line.
+///
+/// A corner is the stretch of stations where the route turns [`TURN_DEG`]
+/// or more within [`BEND_FIND_SPAN_M`] centred on them, one way (so it opens
+/// up to 15 m before the turning starts, as the vertex reading's
+/// neighbouring vertices did); it turns through the sum of its turning
+/// vertices, and its radius is the tightest [`BEND_RADIUS_SPAN_M`] inside.
+fn route_bends(pts: &[(f64, f64)], cum: &[f64]) -> Vec<Bend> {
+    // Each vertex's signed turn, over segments of half a metre or more.
+    let mut vt: Vec<(f64, f64)> = Vec::new();
+    let mut last_brg: Option<f64> = None;
+    for i in 0..pts.len().saturating_sub(1) {
+        if cum[i + 1] - cum[i] < 0.5 {
+            continue;
         }
+        let b = taxi_guide::bearing(pts[i], pts[i + 1]);
+        if let Some(p) = last_brg {
+            let t = taxi_guide::angle_diff(b, p);
+            if t != 0.0 {
+                vt.push((cum[i], t));
+            }
+        }
+        last_brg = Some(b);
+    }
+    if vt.is_empty() {
+        return Vec::new();
+    }
+    // The heading turned from the start to `s`, and across (a, b].
+    let mut prefix = Vec::with_capacity(vt.len() + 1);
+    prefix.push(0.0);
+    for &(_, t) in &vt {
+        prefix.push(prefix.last().unwrap() + t);
+    }
+    let turned_to = |s: f64| prefix[vt.partition_point(|&(at, _)| at <= s)];
+    let turned = |a: f64, b: f64| turned_to(b) - turned_to(a);
+    let total = *cum.last().unwrap_or(&0.0);
+    let half = BEND_FIND_SPAN_M / 2.0;
+    let r_half = BEND_RADIUS_SPAN_M / 2.0;
+    let mut bends: Vec<Bend> = Vec::new();
+    let mut group: Option<(f64, f64, f64, f64)> = None; // (first, last, side, most)
+    let flush = |g: (f64, f64, f64, f64), bends: &mut Vec<Bend>| {
+        let (g0, g1, side, most) = g;
+        let turning: Vec<f64> = vt
+            .iter()
+            .filter(|&&(at, t)| at > g0 - half && at <= g1 + half && t * side >= BEND_VERTEX_MIN_DEG)
+            .map(|&(at, _)| at)
+            .collect();
+        let (Some(&first), Some(&last)) = (turning.first(), turning.last()) else {
+            return;
+        };
+        let through = turned(first - 1e-6, last).abs().max(most);
+        let (start, end) = (g0.min(first), g1.max(last));
+        let mut radius = f64::INFINITY;
+        let mut s = start - r_half;
+        while s <= end + r_half {
+            let d = turned(s - r_half, s + r_half).abs().to_radians();
+            if d > 1e-6 {
+                radius = radius.min(BEND_RADIUS_SPAN_M / d);
+            }
+            s += BEND_STEP_M / 2.0;
+        }
+        bends.push(Bend { start, end, deg: through, radius });
+    };
+    let mut s = 0.0;
+    while s <= total {
+        // Either a corner's worth of heading in the find span, or a turn
+        // that tight in the radius span (a jog: +27 then -47 degrees in 9 m
+        // turns the aircraft hard and nets little, LIRF).
+        let wide = turned(s - half, s + half);
+        let tight = turned(s - r_half, s + r_half);
+        let w = if tight.abs() >= TURN_DEG && tight.abs() > wide.abs() { tight } else { wide };
+        let side = w.signum();
+        if w.abs() >= TURN_DEG {
+            group = match group {
+                Some((g0, _, gs, most)) if gs == side => Some((g0, s, side, most.max(w.abs()))),
+                Some(g) => {
+                    flush(g, &mut bends);
+                    Some((s, s, side, w.abs()))
+                }
+                None => Some((s, s, side, w.abs())),
+            };
+        } else if let Some(g) = group.take() {
+            flush(g, &mut bends);
+        }
+        s += BEND_STEP_M;
+    }
+    if let Some(g) = group {
+        flush(g, &mut bends);
     }
     bends
 }
@@ -874,12 +976,16 @@ impl Route {
     /// no corner is taken faster than that rate times its radius: the same
     /// corner was drawn at 9 m and asked 38 deg/s of an aircraft that turns
     /// at 20, and it swung 5.8 m wide.
+    ///
+    /// A corner is read from the route's curvature ([`route_bends`]): the
+    /// window opens before its FIRST turning vertex and holds to 15 m past
+    /// its last, so a drawn arc is slowed for where it starts to turn.
     pub fn bend_cap_kts(&self, progress: f64, gs_kts: f64) -> Option<f64> {
         let lead = (gs_kts * 0.514 * 6.0).clamp(25.0, 90.0);
         self.bends
             .iter()
-            .filter(|(at, ..)| progress < at + 15.0 && at - progress < lead + BEND_ENVELOPE_M)
-            .map(|&(at, deg, radius)| {
+            .filter(|b| progress < b.end + 15.0 && b.start - progress < lead + BEND_ENVELOPE_M)
+            .map(|&Bend { start: at, deg, radius, .. }| {
                 let class = if deg >= SHARP_DEG {
                     self.pace.sharp
                 } else {
@@ -4426,7 +4532,9 @@ mod tests {
         let window = schedule_kts(18.0, &jet, 172.0, 5.0);
         assert!(window < 6.5, "30 m out: {window:.1} kt");
         let far = schedule_kts(18.0, &jet, 0.0, 18.0);
-        assert!(far > 17.0, "a corner 200 m on barely touches the pace: {far:.1} kt");
+        // 16.6 since #194: the corner's slow-down is planned to where its
+        // curvature begins, up to 15 m before the vertex.
+        assert!(far > 16.0, "a corner 200 m on barely touches the pace: {far:.1} kt");
     }
 
     #[test]
@@ -5412,6 +5520,133 @@ mod tests {
         assert!(worst_turn < 15.0, "a lead-on runs one way: {worst_turn:.0} degrees at one vertex");
     }
 
+    /// The corners as read before #194: a VERTEX turning [`TURN_DEG`] over
+    /// the 15 m either side, its radius the circle through the route 8 m
+    /// either side. Kept to compare the curvature reading against.
+    fn vertex_bends(pts: &[(f64, f64)], cum: &[f64]) -> Vec<Bend> {
+        let mut bends = Vec::new();
+        for i in 1..pts.len().saturating_sub(1) {
+            let b_in = taxi_guide::bearing(taxi_guide::point_at(pts, cum, cum[i] - 15.0), pts[i]);
+            let b_out = taxi_guide::bearing(pts[i], taxi_guide::point_at(pts, cum, cum[i] + 15.0));
+            let delta = taxi_guide::angle_diff(b_out, b_in).abs();
+            if delta >= TURN_DEG {
+                let radius = circle_radius_m(
+                    taxi_guide::point_at(pts, cum, cum[i] - 8.0),
+                    pts[i],
+                    taxi_guide::point_at(pts, cum, cum[i] + 8.0),
+                );
+                bends.push(Bend { start: cum[i], end: cum[i], deg: delta, radius });
+            }
+        }
+        bends
+    }
+
+    /// The fastest the schedule's corner caps let a route be entered at
+    /// `progress`, flown at `gs`: each corner's cap as `bend_cap_kts` makes it.
+    fn caps_along(route: &Route, step_m: f64) -> Vec<f64> {
+        let mut out = Vec::new();
+        let mut s = 0.0;
+        while s < route.total_m() {
+            let gs = route.pace.straight;
+            out.push(route.bend_cap_kts(s, gs).unwrap_or(f64::INFINITY).min(gs));
+            s += step_m;
+        }
+        out
+    }
+
+    /// #194 at scale: every route from a sample of stands to every runway
+    /// end at 24 fields, ridden as the tower rides them, for the Citation,
+    /// the 737, the A330, the SR22 and the Evolution: where the curvature
+    /// reading lets the schedule go faster than the vertex reading did, by
+    /// how much, and where the vertex reading missed a corner it now sees.
+    /// `cargo test --release -- --ignored real_install_corner_caps --nocapture`
+    #[test]
+    #[ignore] // needs the real X-Plane install
+    fn real_install_corner_caps_are_never_faster() {
+        let apt = &crate::tools::autoland::xplane_path("Global Scenery/Global Airports/Earth nav data/apt.dat");
+        if !std::path::Path::new(apt).exists() {
+            return;
+        }
+        let fields = std::env::var("CORNER_FIELDS").unwrap_or_else(|_| {
+            "LEMG EGKK EGBB EGLL EGPH LFPB LFPG EDDF EHAM LEBL LIRF LSZH EBLG LIPR LIME LILB LSZS EDLP LFBD EIDW KJFK KSFO LIEA LSGG".into()
+        });
+        let paces: Vec<(&str, Pace)> = ["citation_x", "boeing_737_800", "airbus_a330_300", "cirrus_sr22", "lancair_evolution"]
+            .iter()
+            .map(|id| (*id, Pace::from_profile(crate::aircraft::load(id).expect(id).taxi.as_ref())))
+            .collect();
+        let (mut routes, mut faster, mut slower, mut new_corners) = (0, 0usize, 0usize, 0usize);
+        let mut worst = (0.0_f64, String::new());
+        let mut time: std::collections::BTreeMap<&str, (f64, f64)> = Default::default();
+        for icao in fields.split_whitespace() {
+            let Ok(Some(net)) = atc::nav::find_taxi_net(apt, icao) else { continue };
+            let Ok(runways) = atc::nav::find_runways(apt, icao) else { continue };
+            let step = (net.stands.len() / 8).max(1);
+            // The sorties' own gates too: the Citation's LEMG gate (#194)
+            // and the 737's EGKK stand (1790713378, 1790726972).
+            let mut starts: Vec<(f64, f64, String)> =
+                net.stands.iter().step_by(step).map(|s| (s.lat, s.lon, s.name.clone())).collect();
+            match icao {
+                "LEMG" => starts.push((36.6733571, -4.4894417, "the #194 gate".into())),
+                "EGKK" => starts.push((51.1553957, -0.1653696, "the 737's stand".into())),
+                _ => {}
+            }
+            for st in &starts {
+                let (slat, slon, sname) = (st.0, st.1, &st.2);
+                for r in &runways {
+                    for (id, tlat, tlon) in [(&r.ident_a, r.lat_a, r.lon_a), (&r.ident_b, r.lat_b, r.lon_b)] {
+                        let zone = [r.ident_a.clone(), r.ident_b.clone()];
+                        let Some(plan) = net.plan_to_runway(slat, slon, tlat, tlon, 60.0, &zone, Some(r)) else {
+                            continue;
+                        };
+                        let w = TaxiWatch {
+                            path: plan.path.clone(),
+                            via: String::new(),
+                            seg: plan.seg.clone(),
+                            holding_point: String::new(),
+                            lead_on: Vec::new(),
+                        };
+                        let Some(mut route) = Route::build(&w) else { continue };
+                        routes += 1;
+                        let curv = route.bends.clone();
+                        let vert = vertex_bends(&route.pts, &route.cum);
+                        new_corners += curv
+                            .iter()
+                            .filter(|b| !vert.iter().any(|v| v.start >= b.start - 15.0 && v.start <= b.end + 15.0))
+                            .count();
+                        for (name, pace) in &paces {
+                            route.pace = *pace;
+                            route.bends = curv.clone();
+                            let new = caps_along(&route, 1.0);
+                            route.bends = vert.clone();
+                            let old = caps_along(&route, 1.0);
+                            *time.entry(*name).or_insert((0.0, 0.0)) = {
+                                let e = time.get(name).copied().unwrap_or((0.0, 0.0));
+                                (e.0 + old.iter().map(|c| 1.0 / c.max(0.1)).sum::<f64>(), e.1 + new.iter().map(|c| 1.0 / c.max(0.1)).sum::<f64>())
+                            };
+                            for (k, (n, o)) in new.iter().zip(&old).enumerate() {
+                                if n > &(o + 0.05) {
+                                    faster += 1;
+                                    if n - o > worst.0 {
+                                        worst = (n - o, format!("{icao} {} -> {id} {name} at {k} m: {o:.1} -> {n:.1} kt", sname));
+                                    }
+                                } else if n + 0.05 < *o {
+                                    slower += 1;
+                                }
+                            }
+                        }
+                        route.bends = curv;
+                    }
+                }
+            }
+        }
+        println!("{routes} routes; stations faster {faster}, slower {slower}; corners the vertex reading missed {new_corners}");
+        assert_eq!(faster, 0, "{}", worst.1);
+        println!("worst faster: {:.2} kt {}", worst.0, worst.1);
+        for (name, (o, n)) in &time {
+            println!("{name}: time at the corner caps {:.1}% of before", 100.0 * n / o);
+        }
+    }
+
     /// #194's corner, LEMG Quebec onto Delta, from the install: the network
     /// (the Quebec node before, the node on Delta's centreline, the Delta
     /// node after) and the drawn lines near it: the fillet right, the two
@@ -5445,20 +5680,38 @@ mod tests {
         (36.6875180, -4.5038245), (36.6875390, -4.5038743), (36.6875599, -4.5039240), (36.6875808, -4.5039738),
     ];
 
-    /// The Citation X's nosewheel, fitted to the drive ticks of both #194
-    /// sorties (iMac 2026-09-30): the yaw rate goes to 8.5 deg/s per m/s of
-    /// groundspeed per unit of steer, capped at 15 deg/s, through a 1.3 s
-    /// lag (1.14 deg/s rms against the logged, filtered rate; no transport
-    /// delay fitted better). At 3 kt full lock is 13 deg/s, a 6.8 m radius.
+    /// The Citation X's nosewheel, fitted to the drive ticks of the #194
+    /// sorties (iMac 2026-09-30): the yaw rate goes to `k` deg/s per m/s of
+    /// groundspeed per unit of steer, capped at 12 deg/s, through a 1.3 s
+    /// lag after `delay_s`. Over all three sorties k 8.5 and no delay fit
+    /// best (1.00 deg/s rms against the logged, filtered rate); over the
+    /// fast ticks of 1790765957's corner (over 10 kt) k 7.5 after 0.3 s
+    /// (0.48 rms, where the first fits 0.86). Full lock is 12 deg/s from 3
+    /// kt up: at 17 kt a 37 m radius, the Quebec-onto-Delta fillet's own.
     struct CitationNose {
         r: f64,
+        k: f64,
+        delay_s: f64,
+        sent: std::collections::VecDeque<(f64, f64)>,
     }
     impl CitationNose {
-        const K_DPS_PER_MS: f64 = 8.5;
-        const MAX_DPS: f64 = 15.0;
+        const MAX_DPS: f64 = 12.0;
         const TAU_S: f64 = 1.3;
-        fn step(&mut self, steer: f64, v_ms: f64, dt: f64) -> f64 {
-            let want = (Self::K_DPS_PER_MS * v_ms * steer).clamp(-Self::MAX_DPS, Self::MAX_DPS);
+        /// All three sorties' fit.
+        fn slow() -> Self {
+            CitationNose { r: 0.0, k: 8.5, delay_s: 0.0, sent: Default::default() }
+        }
+        /// The fast corner's fit.
+        fn fast() -> Self {
+            CitationNose { r: 0.0, k: 7.5, delay_s: 0.3, sent: Default::default() }
+        }
+        fn step(&mut self, t: f64, steer: f64, v_ms: f64, dt: f64) -> f64 {
+            self.sent.push_back((t, steer));
+            while self.sent.len() > 1 && self.sent[1].0 <= t - self.delay_s + 1e-9 {
+                self.sent.pop_front();
+            }
+            let s = self.sent[0].1;
+            let want = (self.k * v_ms * s).clamp(-Self::MAX_DPS, Self::MAX_DPS);
             self.r += (want - self.r) * (dt / Self::TAU_S).min(1.0);
             self.r
         }
@@ -5466,10 +5719,11 @@ mod tests {
 
     /// The drive's law, tick by tick as `drive` runs it on a linked nose
     /// (no brake steering), with the Citation's own pace, through
-    /// [`CitationNose`], from `start_kts` on the route's first point.
+    /// `plant`, from `start_kts` on the route's first point.
     /// Returns the scorer's verdict: (max cut inside a vertex, max off the
     /// line).
-    fn fly_citation(path: &[(f64, f64)], start_kts: f64) -> (f64, f64) {
+    /// The corners are read as before #194 when `vertex`.
+    fn fly_citation_with(path: &[(f64, f64)], start_kts: f64, vertex: bool, mut plant: CitationNose) -> (f64, f64) {
         use crate::scorecard::{LineJudge, CORNER_TURN_DPS};
         let pace = Pace::from_profile(crate::aircraft::load("citation_x").expect("citation").taxi.as_ref());
         assert!(!pace.brake_steer);
@@ -5482,11 +5736,13 @@ mod tests {
         };
         let mut route = Route::build(&watch).expect("route");
         route.pace = pace;
+        if vertex {
+            route.bends = vertex_bends(&route.pts, &route.cum);
+        }
         let dt = 0.25;
         let (mut x, mut y) = (0.0_f64, 0.0_f64);
         let mut psi = taxi_guide::bearing(route.pts[0], route.pts[1]);
         let mut v = start_kts / MS_TO_KTS;
-        let mut plant = CitationNose { r: 0.0 };
         let (mut yaw, mut prev_psi, mut prev_steer) = (0.0_f64, psi, 0.0_f64);
         let mut trim = StraightTrim::default();
         let mut turn_dir = None;
@@ -5522,8 +5778,19 @@ mod tests {
             let cutting = judge.corner(t, gs, offset, Some(remaining), asked, yaw);
             judge.judge(offset, cutting);
             let sched = schedule_kts(pace.straight, &route, progress, gs).min(pace.track_cap_kts(offset.abs(), err));
-            v = (v + (sched / MS_TO_KTS - v).clamp(-0.7 * dt, 0.5 * dt)).max(0.0);
-            let r = plant.step(steer, v, dt);
+            // The governor as it flies: power up to the schedule, a coast
+            // over it, the brakes only 3 kt over (1790765957 held 17.4 kt
+            // against the Citation's 15 down the whole of Quebec).
+            let over = gs - sched;
+            let accel = if over < 0.0 {
+                0.5
+            } else if over > 3.0 {
+                -0.7
+            } else {
+                -0.05
+            };
+            v = (v + accel * dt).max(0.0);
+            let r = plant.step(t, steer, v, dt);
             psi = (psi + r * dt).rem_euclid(360.0);
             x += v * psi.to_radians().sin() * dt;
             y += v * psi.to_radians().cos() * dt;
@@ -5532,33 +5799,126 @@ mod tests {
         (judge.max_cut, judge.max_lat)
     }
 
-    /// #194, LEMG (Citation X, sorties 1790734216 and 1790738786, iMac
-    /// 2026-09-30): the taxi failed 4.6 and 4.8 m off the line at Quebec
-    /// onto Delta, 700 to 740 m to go. The corner as ridden was a jog: the
-    /// drive chased it right at 17 deg/s of route turn, the route then asked
-    /// -13, and at 3 kt the aircraft swung 4.6 m outside the turn back (err
-    /// -12.6, steer -0.42, the P law's full answer). The fitted nose through
-    /// the drive's own law fails the flown route, and on the fillet the ride
-    /// now takes it stays inside the 3 m line and the 5 m cut.
+    /// #194, LEMG (Citation X, iMac 2026-09-30), the corner three times.
+    /// 1790734216 and 1790738786 drove the jagged ride (4.6 and 4.8 m off);
+    /// e31f338 rode the fillet, and 1790765957 (build db43c97) went into it
+    /// at 17.4 kt, because the vertex reading saw no corner in a fillet
+    /// drawn 3 to 5 m at a time: full lock 3 s, err -44, 7.3 m off. The
+    /// fast fit of the nose through the drive's own law and the governor as
+    /// it flies (brakes only 3 kt over) fails the fillet from 17.4 kt under
+    /// the vertex reading and holds it inside 3 m under the curvature
+    /// reading, from any entry speed and on either fit. The jagged ride, no
+    /// longer planned, replays 2.4 to 3.0 m either way (flown 4.6): the
+    /// curvature reading does it no harm.
     #[test]
     fn the_citation_turns_quebec_onto_delta_on_the_line() {
-        let (flown_cut, flown_lat) = fly_citation(&LEMG_QD_FLOWN, 10.0);
+        use crate::scorecard::{TAXI_MAX_CUT_M, TAXI_MAX_LAT_M};
         let paint: Vec<Vec<(f64, f64)>> = LEMG_QD_PAINT.iter().map(|l| l.to_vec()).collect();
         let seg = vec![("Q".to_string(), false), ("D".to_string(), false)];
         let (ridden, _) = atc::nav::ride_paint(&paint, &LEMG_QD_RAW, &seg);
         // From 150 m up Quebec to 150 m along Delta.
         let node = LEMG_QD_RAW[1];
         let geo = taxi_guide::Geo::new(node.0);
-        let near: Vec<(f64, f64)> =
+        let fillet: Vec<(f64, f64)> =
             ridden.iter().copied().filter(|&p| taxi_guide::dist(geo.to_m(node, p), (0.0, 0.0)) < 150.0).collect();
-        let (cut, lat) = fly_citation(&near, 10.0);
-        println!("flown {flown_lat:.2} m off, {flown_cut:.2} cut; fillet {lat:.2} off, {cut:.2} cut");
-        assert!(
-            flown_lat > crate::scorecard::TAXI_MAX_LAT_M || flown_cut > crate::scorecard::TAXI_MAX_CUT_M,
-            "the flown route fails as it did: {flown_lat:.1} m off, {flown_cut:.1} m cut"
-        );
-        assert!(lat <= crate::scorecard::TAXI_MAX_LAT_M, "{lat:.2} m off the line");
-        assert!(cut <= crate::scorecard::TAXI_MAX_CUT_M, "{cut:.2} m inside");
+        let (_, as_flown) = fly_citation_with(&fillet, 17.4, true, CitationNose::fast());
+        assert!(as_flown > TAXI_MAX_LAT_M, "1790765957 fails as it did: {as_flown:.2} m");
+        for v0 in [10.0, 15.0, 17.4] {
+            for plant in [CitationNose::slow as fn() -> CitationNose, CitationNose::fast] {
+                let (cut, lat) = fly_citation_with(&fillet, v0, false, plant());
+                assert!(lat <= TAXI_MAX_LAT_M && cut <= TAXI_MAX_CUT_M, "from {v0} kt: {lat:.2} off, {cut:.2} in");
+                let (vc, vl) = fly_citation_with(&LEMG_QD_FLOWN, v0, true, plant());
+                let (cc, cl) = fly_citation_with(&LEMG_QD_FLOWN, v0, false, plant());
+                assert!(cl <= vl + 0.25 && cc <= vc + 0.4, "jagged from {v0} kt: {vl:.2}/{vc:.2} to {cl:.2}/{cc:.2}");
+            }
+        }
+    }
+
+    /// A path in metres: `lead` m north, then a turn of `deg` right on
+    /// `radius` m sampled every `step` m (a single vertex when the radius is
+    /// zero), then 100 m on.
+    fn turn_route(deg: f64, radius: f64, step: f64) -> Route {
+        let mut pts = vec![(0.0, 0.0), (0.0, 100.0)];
+        let (cx, cy) = (radius, 100.0);
+        if radius > 0.0 {
+            let n = ((deg.to_radians() * radius) / step).ceil().max(1.0) as usize;
+            for k in 1..=n {
+                let a = (deg * k as f64 / n as f64).to_radians();
+                pts.push((cx - radius * a.cos(), cy + radius * a.sin()));
+            }
+        }
+        let last = *pts.last().unwrap();
+        let out = deg.to_radians();
+        pts.push((last.0 + 100.0 * out.sin(), last.1 + 100.0 * out.cos()));
+        let watch = TaxiWatch {
+            path: pts.iter().map(|&(x, y)| ll(x, y)).collect(),
+            via: String::new(),
+            seg: vec![(String::new(), false); pts.len() - 1],
+            holding_point: String::new(),
+            lead_on: Vec::new(),
+        };
+        Route::build(&watch).expect("a route")
+    }
+
+    /// #194 (sortie 1790765957, a Citation X at 17.4 kt into a fillet the
+    /// vertex reading never saw): a corner is its curvature, so the same arc
+    /// drawn every 1, 3 or 5 m is the same corner (its turn and radius), and
+    /// the vertex reading missed the finely drawn ones entirely.
+    #[test]
+    fn a_corner_reads_the_same_however_finely_it_is_drawn() {
+        for (deg, radius) in [(90.0, 15.0), (104.0, 20.0), (60.0, 35.0), (45.0, 50.0)] {
+            let reads: Vec<Bend> = [1.0, 3.0, 5.0]
+                .iter()
+                .map(|&step| {
+                    let r = turn_route(deg, radius, step);
+                    assert_eq!(r.bends.len(), 1, "{deg} on {radius} every {step}: {:?}", r.bends);
+                    r.bends[0]
+                })
+                .collect();
+            for b in &reads {
+                assert!((b.deg - deg).abs() < 3.0, "{deg} on {radius}: {b:?}");
+                assert!(b.radius > 0.75 * radius && b.radius < 1.1 * radius, "{deg} on {radius}: {b:?}");
+                // The slow-down is planned to the arc's start at the latest.
+                assert!(b.start <= 100.5, "{deg} on {radius}: {b:?}");
+            }
+            let fine = turn_route(deg, radius, 1.0);
+            // Chords of 15 m either side turn 30 degrees only inside 28 m.
+            assert!(radius < 30.0 || vertex_bends(&fine.pts, &fine.cum).is_empty(), "the vertex reading never saw it");
+        }
+        // A lone vertex reads as tight as it is: 8 m over its turn, under the
+        // circle the vertex reading drew through it.
+        let v = turn_route(90.0, 0.0, 5.0);
+        assert_eq!(v.bends.len(), 1);
+        let old = vertex_bends(&v.pts, &v.cum);
+        assert!((v.bends[0].radius - 8.0 / 90.0_f64.to_radians()).abs() < 0.1, "{:?}", v.bends);
+        assert!(v.bends[0].radius <= old[0].radius, "{:?} vs {old:?}", v.bends);
+    }
+
+    /// The Citation's corner speed at LEMG's Quebec onto Delta as ridden
+    /// since e31f338: under the vertex reading its 15 kt pace (it flew 17.4),
+    /// under the curvature reading its sharp pace, 6 kt, from before the
+    /// fillet begins.
+    #[test]
+    fn the_quebec_delta_fillet_is_a_corner() {
+        let paint: Vec<Vec<(f64, f64)>> = LEMG_QD_PAINT.iter().map(|l| l.to_vec()).collect();
+        let seg = vec![("Q".to_string(), false), ("D".to_string(), false)];
+        let (ridden, _) = atc::nav::ride_paint(&paint, &LEMG_QD_RAW, &seg);
+        let watch = TaxiWatch {
+            path: ridden.clone(),
+            via: String::new(),
+            seg: vec![(String::new(), false); ridden.len() - 1],
+            holding_point: String::new(),
+            lead_on: Vec::new(),
+        };
+        let mut route = Route::build(&watch).expect("route");
+        route.pace = Pace::from_profile(crate::aircraft::load("citation_x").expect("citation").taxi.as_ref());
+        assert!(vertex_bends(&route.pts, &route.cum).is_empty(), "the vertex reading sees nothing");
+        let corner = route.bends.iter().find(|b| b.deg > 90.0).copied().expect("a corner");
+        println!("{corner:?}");
+        assert!(corner.deg > 95.0 && corner.deg < 115.0, "{corner:?}");
+        assert!(corner.radius < 25.0, "{corner:?}");
+        let at_start = route.bend_cap_kts(corner.start, 15.0).expect("capped");
+        assert!(at_start <= route.pace.sharp + 0.01, "{at_start:.1} kt");
     }
 
     /// The whole #194 route from the install: the corners the planner cut
@@ -6988,6 +7348,9 @@ mod tests {
         /// The profile's corner yaw cap (`taxi.max_yaw_dps`), else none, as
         /// flown before #165.
         yaw_cap: bool,
+        /// Read the corners as before #194 (a vertex turning 30 degrees),
+        /// the geometry the replayed laws flew; else by curvature.
+        vertex: bool,
     }
 
     /// The brake-steer law on a free nose before the swing catch (#165):
@@ -7039,7 +7402,7 @@ mod tests {
     /// vertex, max off the line), from [`crate::scorecard::LineJudge`].
     fn fly_sr22_corner(path_m: &[(f64, f64)], start: (f64, f64), aim_floor_free: bool) -> (f64, f64) {
         let mut brakes = free_nose_brakes();
-        let run = CornerRun { dt: 0.2, v0_kts: 10.0, imac: None, brakes: &mut brakes, judge_from_m: 0.0, yaw_cap: true };
+        let run = CornerRun { dt: 0.2, v0_kts: 10.0, imac: None, brakes: &mut brakes, judge_from_m: 0.0, yaw_cap: true, vertex: false };
         fly_sr22_corner_with(path_m, start, aim_floor_free, run).0
     }
 
@@ -7064,6 +7427,9 @@ mod tests {
             lead_on: Vec::new(),
         };
         let mut route = Route::build(&watch).expect("route");
+        if run.vertex {
+            route.bends = vertex_bends(&route.pts, &route.cum);
+        }
         route.pace = pace;
         let dt = run.dt;
         let (mut x, mut y) = start;
@@ -7278,6 +7644,8 @@ mod tests {
                                 brakes,
                                 judge_from_m: 280.0,
                                 yaw_cap,
+                                // As flown: the corner read at its vertex.
+                                vertex: !yaw_cap,
                             };
                             let ((cut, lat), _) = fly_sr22_corner_with(&path, (0.0, -150.0), true, run);
                             // The scorer's verdict on one scale: off the
@@ -7367,7 +7735,7 @@ mod tests {
                 for dt in [0.3, 0.36, 0.42] {
                     for over in [0.0, 1.0] {
                         for pull in [0.05, 0.1, 0.2] {
-                            let fly = |brakes: &mut dyn FnMut(f64, f64, f64, f64, f64) -> (f64, f64)| {
+                            let fly = |brakes: &mut dyn FnMut(f64, f64, f64, f64, f64) -> (f64, f64), vertex: bool| {
                                 let run = CornerRun {
                                     dt,
                                     v0_kts: 6.0 + over,
@@ -7375,13 +7743,14 @@ mod tests {
                                     brakes,
                                     judge_from_m: 280.0,
                                     yaw_cap: true,
+                                    vertex,
                                 };
                                 let ((cut, lat), _) = fly_sr22_corner_with(&path, (0.0, -150.0), true, run);
                                 lat.max(cut - (TAXI_MAX_CUT_M - TAXI_MAX_LAT_M))
                             };
                             let why = format!("{side} {deg} deg, {dt} s, {over} kt over, pull {pull}");
-                            let prev = fly(&mut d28e8f4_free_nose_brakes());
-                            let new = fly(&mut free_nose_brakes());
+                            let prev = fly(&mut d28e8f4_free_nose_brakes(), true);
+                            let new = fly(&mut free_nose_brakes(), false);
                             if prev > worst_prev.0 {
                                 worst_prev = (prev, why.clone());
                             }
@@ -7508,14 +7877,14 @@ mod tests {
                 for dt in [0.3, 0.36, 0.42] {
                     for over in [0.0, 1.0, 2.0] {
                         for pull in [0.1, 0.2] {
-                            let fly = |brakes: &mut dyn FnMut(f64, f64, f64, f64, f64) -> (f64, f64)| {
-                                let run = CornerRun { dt, v0_kts: v0, imac: Some((over, pull)), brakes, judge_from_m: 280.0, yaw_cap: true };
+                            let fly = |brakes: &mut dyn FnMut(f64, f64, f64, f64, f64) -> (f64, f64), vertex: bool| {
+                                let run = CornerRun { dt, v0_kts: v0, imac: Some((over, pull)), brakes, judge_from_m: 280.0, yaw_cap: true, vertex };
                                 let ((cut, lat), _) = fly_sr22_corner_with(path, (108.1, 119.5), true, run);
                                 lat.max(cut - (TAXI_MAX_CUT_M - TAXI_MAX_LAT_M))
                             };
                             let why = format!("{name}, from {v0} kt, {dt} s, {over} kt over, pull {pull}");
-                            let prev = fly(&mut b6c24d5_free_nose_brakes());
-                            let new = fly(&mut free_nose_brakes());
+                            let prev = fly(&mut b6c24d5_free_nose_brakes(), true);
+                            let new = fly(&mut free_nose_brakes(), false);
                             if prev > worst_prev.0 {
                                 worst_prev = (prev, why.clone());
                             }
