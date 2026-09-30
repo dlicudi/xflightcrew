@@ -3714,6 +3714,9 @@ mod tests {
         // (module, NAME) -> why it may be a shared constant.
         const REVIEWED: &[(&str, &str, &str)] = &[
             ("procedure", "NOT_CLIMBING_FPM", "a rate that is not a climb, any airframe"),
+            ("autoland", "GA_CLIMB_ESTABLISHED_FPM", "a go-around's positive climb, the test for reducing thrust, not a commanded rate; any airframe (#199)"),
+            ("autoland", "GA_FAST_KTS", "a band about the airframe's own go-around speed, where the thrust comes back at once; any airframe (#199)"),
+            ("autoland", "GA_SLOW_KTS", "a band under the airframe's own go-around speed, where go-around thrust returns; any airframe (#199)"),
             ("circuit", "TERRAIN_HOLD_CREDIT_FPM", "a give-up clock's credit, not a commanded rate: the slowest climb any airframe is allowed before the guard hands back"),
             ("procedure", "ARRIVAL_DECEL_KTS_S", "planning slow-down for a STAR speed limit: a jet's descent rate, so a slower airframe only starts early"),
             ("autotakeoff", "ROLL_BRAKE_FULL_KTS", "brake-steer fade band, groundspeed; only brake_steer airframes"),

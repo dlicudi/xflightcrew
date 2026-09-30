@@ -1352,6 +1352,9 @@ pub fn run_autoland_scoped(
             // visual segment (LSZS), else 3. Taken now so no approach
             // inherits another's.
             let gp_deg = arm_glidepath();
+            // The stabilised gate this final is judged at (#199): a
+            // circuit's is visual, every other the instrument gate.
+            let gate = arm_gate();
             if (gp_deg - 3.0).abs() > 1e-9 {
                 crate::blackbox::record(
                     "autoland",
@@ -1599,6 +1602,15 @@ pub fn run_autoland_scoped(
             // The lever the approach was flown on, for a balloon to hold.
             let mut approach_thr: Option<f64> = None;
             let mut go_around = GoAroundLatch::new();
+            // The stabilised-approach rule (`stable_approach`, #199): the
+            // breaches held so far, the clock they are timed on, the balk
+            // word and spoken reason of a go-around it ordered, and whether
+            // this approach's gate crossing has been recorded.
+            let mut stable_watch = crate::stable_approach::StableWatch::default();
+            let stable_clock = std::time::Instant::now();
+            let mut stable_balk: Option<&'static str> = None;
+            let mut stable_said: Option<&'static str> = None;
+            let mut gate_recorded = false;
             // Watch the tower's go-around orders from here: an order shouted
             // at somebody else's approach half an hour ago must not balk this
             // one on its first tick. A WATCH, never the main loop's `take_*`
@@ -2393,6 +2405,73 @@ pub fn run_autoland_scoped(
                 if matches!(raw.balk, Some("unstabilised_at_gate" | "unstabilised_below_floor")) {
                     go_around.order(on_ground > 0.5);
                 }
+                // THE STABILISED APPROACH (`stable_approach`, #199): by the
+                // gate the landing configuration, on speed, not sinking hard
+                // and on the path, or a go-around THEN, with height in hand.
+                // The lateral half is the guidance's own gate above. EGNX 09
+                // (2026-09-30): 255 kt clean and 1,400 fpm down from 1,000 ft
+                // to 121 ft radio, on the centreline, so nothing balked.
+                let height_aal = alt - rwy.elev_ft;
+                let judging = raw.phase == ApproachPhase::Final
+                    && !raw.arresting
+                    && !go_around.active()
+                    && on_ground < 0.5
+                    && along_nm > STABILISED_MIN_ALONG_NM
+                    && crate::stable_approach::judged(gate, height_aal);
+                let flap_limits_now = crate::aircraft::flap_limits();
+                let stable_sample = crate::stable_approach::Sample {
+                    height_aal_ft: height_aal,
+                    dist_to_aim_nm: along_nm.max(0.0) + TOUCHDOWN_AIM_NM,
+                    ias_kts: ias,
+                    gs_kts,
+                    // What the governor holds in the landing configuration.
+                    target_kts: approach_target_kts(
+                        approach_ias,
+                        1.0,
+                        &flap_limits_now,
+                        crate::aircraft::config_floor_kts(1.0),
+                    ),
+                    vvi_fpm: prev_vvi.map(|(v, _)| v),
+                    above_path_ft: alt - raw.glidepath_alt_ft,
+                    path_ft_per_nm: gp_ft_per_nm(),
+                    gear_down,
+                    landing_flap: last_flap.is_some_and(|f| f >= LANDING_FLAP_RATIO),
+                };
+                let now_breaches = if judging {
+                    crate::stable_approach::breaches(gate, &stable_sample)
+                } else {
+                    Vec::new()
+                };
+                if judging && !gate_recorded {
+                    gate_recorded = true;
+                    crate::blackbox::record(
+                        "autoland",
+                        stable_record("stable_gate", gate, &stable_sample, &now_breaches, None),
+                    );
+                }
+                if let Some(breach) =
+                    stable_watch.step(stable_clock.elapsed().as_secs_f64(), &now_breaches)
+                {
+                    stable_watch.reset();
+                    if go_around.order(on_ground > 0.5) {
+                        stable_balk = Some(breach.word());
+                        stable_said = Some(breach.spoken());
+                        crate::blackbox::record(
+                            "autoland",
+                            stable_record(
+                                "unstabilised",
+                                gate,
+                                &stable_sample,
+                                &now_breaches,
+                                Some(breach),
+                            ),
+                        );
+                    }
+                }
+                if go_around.active() {
+                    stable_watch.reset();
+                    gate_recorded = false;
+                }
                 let mut missed = go_around.update(
                     last_phase,
                     raw.phase,
@@ -2770,7 +2849,8 @@ pub fn run_autoland_scoped(
                 if missed.is_none() {
                     balk_watch = None;
                 } else if balk_watch.is_none() {
-                    balk_watch = Some(BalkWatch::new(raw.balk, radio_ft));
+                    // The stabilised gate's word when it ordered this one.
+                    balk_watch = Some(BalkWatch::new(raw.balk.or(stable_balk.take()), radio_ft));
                 }
                 if let Some(w) = balk_watch.as_mut() {
                     w.note(radio_ft, on_ground > 0.5);
@@ -3751,7 +3831,33 @@ pub fn run_autoland_scoped(
                     // across the whole missed approach (the first flight of the
                     // sticky version, Luton 2026-07-28) the MD-82 accelerated to
                     // 284 KIAS on the outbound leg and was still gaining.
-                    Some(1.0)
+                    // ...and only until the climb is ESTABLISHED: then it
+                    // flies the go-around speed (`missed_approach_throttle`).
+                    // EGNX 09 (2026-09-30): firewalled from 150 ft to the
+                    // turn at 800 ft radio, the clean 737 went 250 to 309 kt,
+                    // and 355 before the lever came back (#199).
+                    let limits = crate::aircraft::flap_limits();
+                    let flap = last_flap.unwrap_or(0.0);
+                    let target = missed_approach_speed_kts(
+                        approach_ias,
+                        flap,
+                        &limits,
+                        crate::aircraft::config_floor_kts(GO_AROUND_FLAP),
+                        crate::aircraft::config_floor_kts(flap),
+                        alt,
+                    );
+                    Some(match thr_now {
+                        Some(t) => missed_approach_throttle(
+                            t,
+                            ias,
+                            trend_kts_s,
+                            target,
+                            radio_ft,
+                            vvi,
+                            crate::aircraft::approach_thrust_min(),
+                        ),
+                        None => 1.0,
+                    })
                 } else if touch_hold.touched() {
                     // A hold-off held on (`TouchHold`): the lever closed,
                     // never the balloon's approach thrust. Each iMac SR22
@@ -4073,8 +4179,15 @@ pub fn run_autoland_scoped(
                         ApproachPhase::Flare if cfg.flare_power.is_some() => "Over the threshold, flaring, easing the power back.",
                         ApproachPhase::Flare => "Over the threshold, flaring, power to idle.",
                     };
+                    // A go-around the stabilised gate ordered says why.
+                    let line = match stable_said.take() {
+                        Some(why) if ga && line.starts_with("Going around") => {
+                            format!("Not stabilised, {why}. Going around.")
+                        }
+                        _ => line.to_string(),
+                    };
                     if !line.is_empty() {
-                        announce(line.into(), Priority::Caution);
+                        announce(line, Priority::Caution);
                     }
                 }
 
@@ -4452,6 +4565,51 @@ pub const GLIDEPATH_FT_PER_NM: f64 = 318.0;
 /// at 805 ft to nobody).
 #[cfg(not(test))]
 static GLIDEPATH_DEG: std::sync::Mutex<(f64, bool)> = std::sync::Mutex::new((3.0, false));
+/// The stabilised gate's blackbox record (`stable_gate` at the crossing,
+/// `unstabilised` when it orders a go-around): every number the rule read.
+fn stable_record(
+    event: &str,
+    gate: crate::stable_approach::GateKind,
+    s: &crate::stable_approach::Sample,
+    now: &[crate::stable_approach::Breach],
+    tripped: Option<crate::stable_approach::Breach>,
+) -> serde_json::Value {
+    use crate::stable_approach as sa;
+    serde_json::json!({
+        "event": event, "gate": gate.word(), "gate_ft": gate.gate_ft(),
+        "height_aal": s.height_aal_ft, "dist_aim_nm": s.dist_to_aim_nm,
+        "ias": s.ias_kts, "target": s.target_kts, "gs": s.gs_kts,
+        "vvi": s.vvi_fpm,
+        "sink_limit": sa::sink_limit_fpm(s.target_kts, s.ias_kts, s.gs_kts, s.path_ft_per_nm),
+        "above_path_ft": s.above_path_ft,
+        "path_tol_ft": sa::path_tolerance_ft(s.dist_to_aim_nm),
+        "gear": s.gear_down, "landing_flap": s.landing_flap,
+        "breaches": now.iter().map(|b| b.word()).collect::<Vec<_>>(),
+        "why": tripped.map(|b| b.word()),
+        "verdict": if now.is_empty() { "stable" } else { "unstable" },
+    })
+}
+
+/// The stabilised gate the NEXT arm judges its final at, consumed there:
+/// the circuit hands down a visual one, every other caller flies the
+/// instrument gate (`stable_approach`, #199).
+static NEXT_GATE: std::sync::Mutex<Option<crate::stable_approach::GateKind>> =
+    std::sync::Mutex::new(None);
+
+/// Hand the next autoland arm a visual gate (a circuit's final).
+pub fn set_next_gate(kind: crate::stable_approach::GateKind) {
+    *NEXT_GATE.lock().unwrap_or_else(|e| e.into_inner()) = Some(kind);
+}
+
+/// Take the handed-down gate for this arm, the instrument gate without one.
+fn arm_gate() -> crate::stable_approach::GateKind {
+    NEXT_GATE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .take()
+        .unwrap_or_default()
+}
+
 /// The angle the NEXT arm takes, consumed there.
 #[cfg(not(test))]
 static NEXT_GLIDEPATH_DEG: std::sync::Mutex<Option<(f64, bool)>> = std::sync::Mutex::new(None);
@@ -6642,20 +6800,42 @@ pub fn late_go_around(along_nm: f64, track_off_deg: f64) -> bool {
     along_nm > 0.0 && along_nm < FAP_NM && track_off_deg.abs() < LATE_GO_AROUND_TRACK_DEG
 }
 
-/// Flap setting for the approach: half inside 6 nm, full inside 3 nm — but full
-/// only once established ON the glidepath. While holding level BELOW the path
-/// waiting to capture (`alt_err` well negative), full flaps are an energy trap:
-/// the LERL 172 approach dragged along at 50–57 kt against a 65-kt target with
-/// the throttle governor already at its ceiling, and arrived at the flare with
-/// nothing left. Half flaps keep the drag survivable until the path is captured.
+/// Flap setting for the approach: half inside 6 nm, full a mile before the
+/// stabilised gate ([`landing_flap_nm`], about 4 nm on a 3 degree path), but
+/// full only once established ON the glidepath. While holding level BELOW the
+/// path waiting to capture (`alt_err` well negative), full flaps are an energy
+/// trap: the LERL 172 approach dragged along at 50 to 57 kt against a 65-kt
+/// target with the throttle governor already at its ceiling, and arrived at
+/// the flare with nothing left. Half flaps keep the drag survivable until the
+/// path is captured.
+///
+/// Full used to wait for 3 nm, which on a 3 degree path IS the 1,000 ft gate:
+/// every final on file reached the gate with half flap out and the speed
+/// still on the half flap's floor (the 737 at 169 kt on EGBB 33, sortie
+/// 1790759458-full_auto, 2026-09-30), so no final could be configured by the
+/// gate (`stable_approach`, #199).
 pub fn flap_schedule(dist_nm: f64, alt_err_ft: f64) -> f64 {
-    if dist_nm < 3.0 && alt_err_ft > -150.0 {
+    if dist_nm < landing_flap_nm() && alt_err_ft > -150.0 {
         1.0
     } else if dist_nm < 6.0 {
         0.5
     } else {
         0.0
     }
+}
+
+/// The landing flap is selected this far ahead of the stabilised gate, nm:
+/// time for it to run and for the speed to come back to its target before
+/// the gate judges both.
+const LANDING_FLAP_LEAD_NM: f64 = 1.0;
+
+/// Where the approach selects its landing flap, nm from the threshold: a
+/// mile before the instrument gate on this approach's path (3.98 nm at 3
+/// degrees). Never beyond the half-flap point.
+pub fn landing_flap_nm() -> f64 {
+    let gate_nm = crate::stable_approach::GateKind::Instrument.gate_ft() / gp_ft_per_nm()
+        - TOUCHDOWN_AIM_NM;
+    (gate_nm + LANDING_FLAP_LEAD_NM).clamp(3.0, 5.5)
 }
 
 /// TRUE heading → MAGNETIC, using X-Plane's `magnetic_variation` dataref, whose
@@ -6962,6 +7142,80 @@ pub fn missed_approach_guidance(
         balk: None,
         arresting: false,
     }
+}
+
+/// The flap a go-around cleans up to (the loop's go-around flap).
+const GO_AROUND_FLAP: f64 = 0.5;
+/// The missed approach holds go-around thrust until this high above the
+/// ground ...
+const GA_THRUST_HOLD_AGL_FT: f64 = 400.0;
+/// ... and climbing at least this, fpm: then it is established.
+const GA_CLIMB_ESTABLISHED_FPM: f64 = 500.0;
+/// Established and this far over the go-around speed, the thrust comes back
+/// at once to the climb floor, not a governor step a tick: at 0.04 a tick the
+/// lever takes twenty seconds from 1.0, and the clean 737 gains 3 kt/s.
+const GA_FAST_KTS: f64 = 10.0;
+/// ...and this far under it, go-around thrust again.
+const GA_SLOW_KTS: f64 = 10.0;
+
+/// The speed a missed approach flies, kt: the give-up's pattern speed for the
+/// flap out (`hand_back_speed_kts`, the clean approach speed with the flaps
+/// up), at least the approach speed plus the climb margin and fast enough for
+/// the go-around flap to come up (`go_around_floor_kts`, the floor of
+/// [`GO_AROUND_FLAP`], plus 5), never within 10 kt of the placard of the flap
+/// out, never over 250 below 10,000 ft (`alt_ft`), never under the floor of
+/// the configuration flown (`config_floor_kts`, which wins). EGNX 09
+/// (2026-09-30, #199): the clean 737 flew its missed approach at full power
+/// from 250 to 355 kt below 1,700 ft; this is 210. Pure.
+pub fn missed_approach_speed_kts(
+    approach_ias: f64,
+    flap_ratio: f64,
+    flap_limits: &[(f64, Option<f64>)],
+    go_around_floor_kts: Option<f64>,
+    config_floor_kts: Option<f64>,
+    alt_ft: f64,
+) -> f64 {
+    let placard = flap_placard_kts(flap_ratio, flap_limits).unwrap_or(f64::INFINITY);
+    let mut t = hand_back_speed_kts(approach_ias, flap_ratio, flap_limits)
+        .max(approach_ias + CLIMB_ENERGY_BONUS_KTS)
+        .max(go_around_floor_kts.map_or(0.0, |f| f + 5.0))
+        .min(placard - PLACARD_TARGET_MARGIN_KTS);
+    if alt_ft < crate::tools::speedhold::SPEED_LIMIT_ALT_FT {
+        t = t.min(crate::tools::speedhold::BELOW_10K_LIMIT_KTS);
+    }
+    crate::aircraft::floored_target(t, config_floor_kts)
+}
+
+/// The lever a missed approach's climb flies. Go-around thrust until the
+/// climb is ESTABLISHED ([`GA_THRUST_HOLD_AGL_FT`] up and climbing at
+/// [`GA_CLIMB_ESTABLISHED_FPM`]; an unread climb is not established), and
+/// whenever [`GA_SLOW_KTS`] slow; then the speed: more than [`GA_FAST_KTS`]
+/// over `target_kts`, the airframe's climb floor at once (`climb_floor`, its
+/// approach thrust, else idle: the VS mode holds the climb and the excess
+/// becomes height), else the speed governor's step, inside the floor and
+/// full. A crew's go-around: TOGA, positive climb, gear and flap, then the
+/// thrust set for the go-around speed. Pure.
+pub fn missed_approach_throttle(
+    throttle_now: f64,
+    ias_kts: f64,
+    trend_kts_s: f64,
+    target_kts: f64,
+    radio_ft: f64,
+    vvi_fpm: Option<f64>,
+    climb_floor: Option<f64>,
+) -> f64 {
+    let established = radio_ft >= GA_THRUST_HOLD_AGL_FT
+        && vvi_fpm.is_some_and(|v| v >= GA_CLIMB_ESTABLISHED_FPM);
+    if !established || ias_kts < target_kts - GA_SLOW_KTS {
+        return 1.0;
+    }
+    let floor = climb_floor.unwrap_or(IDLE_THROTTLE).max(IDLE_THROTTLE);
+    if ias_kts > target_kts + GA_FAST_KTS {
+        return floor;
+    }
+    let trend = if trend_kts_s.is_finite() { trend_kts_s } else { 0.0 };
+    (throttle_now + crate::tools::speedhold::throttle_adjust_live(target_kts - ias_kts, trend))
+        .clamp(floor, 1.0)
 }
 
 /// A go-around judges the speed it is HEADING for: the airspeed this many
@@ -11313,6 +11567,20 @@ mod tests {
         // Approach segment and clean segment unchanged.
         assert_eq!(flap_schedule(4.5, -300.0), 0.5);
         assert_eq!(flap_schedule(8.0, 0.0), 0.0);
+    }
+
+    #[test]
+    fn the_landing_flap_is_selected_a_mile_before_the_gate() {
+        // #199: at 3 nm the landing flap went out AT the 1,000 ft gate, so
+        // the gate could never find the landing configuration. Now 3.98 nm
+        // on a 3 degree path: EGNX 09's second approach (2026-09-30) at
+        // 3.26 nm and 150 kt would have had it selected.
+        assert!((landing_flap_nm() - 3.98).abs() < 0.02, "{}", landing_flap_nm());
+        assert_eq!(flap_schedule(3.9, 0.0), 1.0);
+        assert_eq!(flap_schedule(3.26, -10.0), 1.0);
+        assert_eq!(flap_schedule(4.1, 0.0), 0.5);
+        let gate_nm = 1000.0 / GLIDEPATH_FT_PER_NM - TOUCHDOWN_AIM_NM;
+        assert!(landing_flap_nm() - gate_nm >= 1.0 - 1e-9);
     }
 
     #[test]
@@ -17910,5 +18178,120 @@ mod a330_lemg30_flare_tests {
             assert!(swing < 2.0, "tick {tick}: swings {swing:.1} degrees");
         }
         assert!(fast < 2.0, "the tuned tick is the one it was: {fast:.1}");
+    }
+}
+
+/// #199: the missed approach flies a speed.
+#[cfg(test)]
+mod missed_approach_speed_tests {
+    use super::*;
+
+    /// The stock 737's detents (`profiles/boeing_737_800.yaml`).
+    const B738: [(f64, Option<f64>); 9] = [
+        (0.0, None),
+        (0.125, Some(250.0)),
+        (0.25, Some(250.0)),
+        (0.375, Some(250.0)),
+        (0.5, Some(210.0)),
+        (0.625, Some(200.0)),
+        (0.75, Some(190.0)),
+        (0.875, Some(175.0)),
+        (1.0, Some(162.0)),
+    ];
+    /// The 737's floors: clean 1.2 x 139, landing 1.2 x 114, the half flap's
+    /// between them.
+    const CLEAN_FLOOR: f64 = 167.0;
+    const HALF_FLOOR: f64 = 152.0;
+    const LANDING_FLOOR: f64 = 137.0;
+
+    #[test]
+    fn the_clean_737s_missed_approach_flies_210_not_355() {
+        // EGNX 09 (2026-09-30): clean, 1,500 ft.
+        let clean = missed_approach_speed_kts(
+            145.0,
+            0.0,
+            &B738,
+            Some(HALF_FLOOR),
+            Some(CLEAN_FLOOR),
+            1500.0,
+        );
+        assert!((clean - 210.25).abs() < 0.01, "{clean}");
+        // Landing flap out: under its placard, fast enough to clean up to
+        // the go-around flap (the half flap's floor plus 5).
+        let full = missed_approach_speed_kts(
+            145.0,
+            1.0,
+            &B738,
+            Some(HALF_FLOOR),
+            Some(LANDING_FLOOR),
+            1500.0,
+        );
+        assert_eq!(full, 152.0);
+        assert!(go_around_flap_due(full, Some(HALF_FLOOR)));
+        // A faster airframe's clean speed is still 250 below 10,000 ft...
+        let fast = missed_approach_speed_kts(190.0, 0.0, &[], None, None, 3000.0);
+        assert_eq!(fast, 250.0);
+        // ...and not above it.
+        let high = missed_approach_speed_kts(190.0, 0.0, &[], None, None, 11_000.0);
+        assert!((high - 275.5).abs() < 0.01);
+        // The floor of the configuration flown wins everything.
+        assert_eq!(missed_approach_speed_kts(100.0, 0.0, &[], None, Some(180.0), 3000.0), 180.0);
+    }
+
+    #[test]
+    fn go_around_thrust_until_established_then_the_speed() {
+        let floor = Some(0.3);
+        // The balk at 150 ft, climbing 883 fpm at 248 kt: go-around thrust.
+        assert_eq!(missed_approach_throttle(0.1, 248.0, 2.0, 210.0, 150.0, Some(883.0), floor), 1.0);
+        // An unread climb is not established.
+        assert_eq!(missed_approach_throttle(1.0, 277.0, 3.0, 210.0, 600.0, None, floor), 1.0);
+        // 426 ft, 2,476 fpm up, 277 kt: established and 67 kt fast, the
+        // climb floor at once (the tick EGNX 09 was still at 1.0).
+        assert_eq!(missed_approach_throttle(1.0, 277.0, 3.0, 210.0, 426.0, Some(2476.0), floor), 0.3);
+        // Idle where no floor is declared.
+        assert_eq!(
+            missed_approach_throttle(1.0, 277.0, 3.0, 210.0, 426.0, Some(2476.0), None),
+            IDLE_THROTTLE
+        );
+        // Near the speed, the governor's step inside the floor and full.
+        let near = missed_approach_throttle(0.5, 214.0, -1.0, 210.0, 900.0, Some(1500.0), floor);
+        assert!((0.3..=1.0).contains(&near) && (near - 0.5).abs() <= 0.041, "{near}");
+        // Slow by more than 10: go-around thrust again.
+        assert_eq!(missed_approach_throttle(0.3, 198.0, -2.0, 210.0, 900.0, Some(1500.0), floor), 1.0);
+    }
+
+    /// A crude clean 737 in a go-around climb (kt/s = 5 thr - 1.5 - 0.5 x
+    /// climb per 1,000 fpm, the lever spooling at 2.5 s): TOGA gains the 3
+    /// kt/s the EGNX 09 miss did at 2,400 fpm. From the balk at 150 ft and
+    /// 250 kt the climb is held at the VS mode's 2,000 fpm.
+    #[test]
+    fn the_egnx_missed_approach_replayed_stays_under_250() {
+        let (mut v, mut h, mut vs, mut thr, mut lever) =
+            (250.0_f64, 150.0_f64, 0.0_f64, 1.0_f64, 1.0_f64);
+        let mut prev_v = v;
+        let dt = 0.5;
+        let mut peak = v;
+        let mut t = 0.0;
+        while t < 120.0 {
+            let trend = (v - prev_v) / dt;
+            prev_v = v;
+            let target = missed_approach_speed_kts(
+                145.0,
+                0.0,
+                &B738,
+                Some(HALF_FLOOR),
+                Some(CLEAN_FLOOR),
+                300.0 + h,
+            );
+            thr = missed_approach_throttle(thr, v, trend, target, h, Some(vs), Some(0.3));
+            lever += (thr - lever) * (dt / 2.5);
+            vs += (2000.0 - vs) * (dt / 4.0);
+            v += (5.0 * lever - 1.5 - 0.5 * vs / 1000.0) * dt;
+            h += vs / 60.0 * dt;
+            peak = peak.max(v);
+            t += dt;
+        }
+        assert!(peak < 285.0, "the peak {peak:.0} kt (355 flown)");
+        assert!((v - 210.0).abs() < 15.0, "settles on the go-around speed: {v:.0}");
     }
 }
