@@ -11983,3 +11983,31 @@ Next Citation LEMG taxi: `drive` ticks 640 to 720 m to go (the route is 69 m sho
 corner sits near 650 to 720) with `turn_dps` one sign (left) through the corner, no +17 then -13,
 `lat_m` inside 3 m, `remaining_m` without the 4 to 7 m jumps; the stage's `max_lat_m` under 3.
 Offline only.
+
+## 2026-09-30: OSKOT's 210 was met; the record read was the slow-down's start (#156)
+
+iMac 2026-09-30, sortie 1790759458-full_auto (737 EGKK-EGBB, the HEME1B from WELIN at FL180): the
+issue read `procedure` `star_speed` `fix OSKOT ias 247.97 kts 210` as the crossing, 38 kt fast. That
+record is written when the slow-down BEGINS, with the airspeed of that moment. The follower ticks
+say: the 210 began 7.86 nm along the route at 248.0 kt and 279 kt over the ground (38 kt at the
+planned 0.5 kt/s is 76 s, 5.9 nm, plus the 2 nm lead: `arrival_speed_cap` to the tick); the speed
+protection flew it level at idle and the 737 lost 1.15 kt/s (248.0 to 210.9 by 5.56 nm, 32 s);
+the descent resumed at 1,500 fpm holding 208.4, and OSKOT sequenced 2.1 nm out at 208.4 against the
+210 (target 207). PUFAX sequenced at 246.7 against 250 (its `star_speed` 249.9 was also the start),
+GROVE at 206.1 against 210. No limit was missed and nothing began late.
+
+Change: the crossing has its own record, `procedure` `star_speed_crossed` (fix, kts, target, ias,
+met, over_target_kts, dist_nm, alt_ft) as the leg to a limited fix sequences
+(`procedure::star_speed_crossing`); `star_speed` gains `at: slowing` and `dist_nm` (along the route
+to the fix). No law changed.
+
+What is left: the speed protection is proportional, so a descent held at idle sits over its target
+(OSKOT 1.4 kt; 202 to 209.6 on the fitted plant's sweep from the recorded placement), spending most
+of the 3 kt margin. Moving the protection's band under the target (from 0 to -1.5 kt) held the
+targets but broke the HEME1B's windows and the GROVE join tests, so it is not done.
+
+Tests `the_recorded_oskot_slow_down_begins_with_miles_to_spare`,
+`the_recorded_welin_arrival_meets_every_star_speed_at_its_fix`.
+
+Next EGKK-EGBB arrival: `star_speed_crossed` for PUFAX, OSKOT and GROVE with `met` true and `ias`
+under the limit; `star_speed` `dist_nm` for OSKOT near 7.9 at about 248 kt. Offline only.
