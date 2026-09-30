@@ -4254,7 +4254,10 @@ pub fn run_autoland_scoped(
                                 dt_s,
                                 radio_ft,
                                 Some(ias),
-                                Some(approach_ias),
+                                Some(retard_reference_kts(
+                                    approach_ias,
+                                    crate::aircraft::config_floor_kts(last_flap.unwrap_or(0.0)),
+                                )),
                             ),
                             _ => None, // No measurement: no guessed power and no ramp advance.
                         },
@@ -5544,6 +5547,19 @@ const IDLE_THROTTLE: f64 = 0.1;
 /// pulled the throttle to idle for its 179 kt target and the aircraft
 /// settled into the fields with +800 fpm on the dial, same day). Everywhere
 /// else, idle.
+/// The speed a flare's "slow" deferral protects: the approach speed, but
+/// never above 1.3 Vs in the configuration flown (`config_floor` is 1.2 Vs).
+/// A generous approach target is not a stall margin: the King Air's 110
+/// held the lever at 0.53 to the wheels at 103 kt, 1.36 Vso, "slow" for 30
+/// flare ticks, and it skipped at 101 kt (LEMG 13, iMac 2026-09-30,
+/// 1790790995). Pure.
+pub fn retard_reference_kts(approach_ias: f64, config_floor_kts: Option<f64>) -> f64 {
+    match config_floor_kts.filter(|f| f.is_finite() && *f > 0.0) {
+        Some(floor) => approach_ias.min(floor * 1.3 / crate::aircraft::SPEED_FLOOR_RATIO),
+        None => approach_ias,
+    }
+}
+
 /// The roundout's retard where the airframe declares no `flare_power`.
 const DEFAULT_ROUNDOUT_RETARD_PER_S: f64 = 0.1;
 
@@ -10287,6 +10303,15 @@ mod tests {
                 "{name}: the logged servo cannot have arrested it, yet the plant landed at {td:.0} fpm"
             );
         }
+    }
+
+    /// The King Air's 110 approach over a landing floor of 91 (1.2 x 76):
+    /// the retard's reference is 1.3 Vs, 99; an SR22-like 75 over 71 keeps 75.
+    #[test]
+    fn the_retard_protects_the_stall_margin_not_the_approach_target() {
+        assert!((retard_reference_kts(110.0, Some(91.0)) - 98.583).abs() < 0.01);
+        assert_eq!(retard_reference_kts(75.0, Some(71.0)), 75.0);
+        assert_eq!(retard_reference_kts(110.0, None), 110.0);
     }
 
     /// King Air 1790787298: the arrest's level-off at 36 ft on approach
