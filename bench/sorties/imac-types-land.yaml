@@ -1,0 +1,27 @@
+# iMac landings across the other airframes (2026-09-30): short finals, every
+# case ends on the ground. Light twins/singles from 2 nm, the jet from 5.
+after: stop
+cases:
+  - name: "Baron 58 LEMG 13, 2 nm final"
+    setup:
+      aircraft: "Aircraft/Laminar Research/Beechcraft Baron 58/Baron_58.acf"
+      approach: { field: LEMG, runway: 13, final_nm: 2 }
+    traffic: off
+
+  - name: "King Air C90B LEMG 13, 2 nm final"
+    setup:
+      aircraft: "Aircraft/Laminar Research/Beechcraft King Air C90B/C90B.acf"
+      approach: { field: LEMG, runway: 13, final_nm: 2 }
+    traffic: off
+
+  - name: "RV-10 LEMG 13, 2 nm final (80 kt declared)"
+    setup:
+      aircraft: "Aircraft/Laminar Research/Van's Aircraft RV-10/RV-10.acf"
+      approach: { field: LEMG, runway: 13, final_nm: 2 }
+    traffic: off
+
+  - name: "SF50 LEMG 13, 5 nm final"
+    setup:
+      aircraft: "Aircraft/Laminar Research/Cirrus Vision SF50/CirrusSF50.acf"
+      approach: { field: LEMG, runway: 13, final_nm: 5 }
+    traffic: off
