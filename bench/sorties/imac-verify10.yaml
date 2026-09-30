@@ -3,10 +3,10 @@
 # (#194), the SR22's taxi (#165).
 after: stop
 cases:
-  - name: "SR22 LEMG 13, 2 nm final (tick dt)"
+  - name: "SR22 LEMG 13, 5 nm final (tick dt)"
     setup:
       aircraft: "Aircraft/Laminar Research/Cirrus SR22/Cirrus SR22.acf"
-      approach: { field: LEMG, runway: 13, final_nm: 2 }
+      approach: { field: LEMG, runway: 13, final_nm: 5 }
     traffic: off
 
   - name: "Citation X LEMG cold gate circuit (#194)"

@@ -1,5 +1,5 @@
 # iMac landings across the other airframes (2026-09-30): short finals, every
-# case ends on the ground. SR22-class singles from 2 nm, anything faster from 4 to 5 (X-Plane places a 2 nm final ~480 ft high).
+# case ends on the ground. SR22-class singles from 2 nm, anything faster from 4 to 5 (X-Plane places a 5 nm final ~480 ft high).
 after: stop
 cases:
   - name: "King Air C90B LEMG 13, 4 nm final"
@@ -8,10 +8,10 @@ cases:
       approach: { field: LEMG, runway: 13, final_nm: 4 }
     traffic: off
 
-  - name: "RV-10 LEMG 13, 2 nm final (80 kt declared)"
+  - name: "RV-10 LEMG 13, 5 nm final (80 kt declared)"
     setup:
       aircraft: "Aircraft/Laminar Research/Van's Aircraft RV-10/RV-10.acf"
-      approach: { field: LEMG, runway: 13, final_nm: 2 }
+      approach: { field: LEMG, runway: 13, final_nm: 5 }
     traffic: off
 
   - name: "SF50 LEMG 13, 5 nm final"
