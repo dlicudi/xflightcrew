@@ -1,0 +1,26 @@
+# iMac verify batch 10 (26031ed on plugin 35b3486, the xcopilot/state frame
+# and paced ticks): tick dt per loop, the Citation's fillet corner speed
+# (#194), the SR22's taxi (#165).
+after: stop
+cases:
+  - name: "SR22 LEMG 13, 5 nm final (tick dt)"
+    setup:
+      aircraft: "Aircraft/Laminar Research/Cirrus SR22/Cirrus SR22.acf"
+      approach: { field: LEMG, runway: 13, final_nm: 5 }
+    traffic: off
+
+  - name: "Citation X LEMG cold gate circuit (#194)"
+    setup:
+      aircraft: "Aircraft/Laminar Research/Cessna Citation X/Cessna_CitationX.acf"
+      ramp: { field: LEMG }
+    command: fly a circuit
+    deadline_min: 40
+    traffic: off
+
+  - name: "SR22 LEMG ramp circuit (#165)"
+    setup:
+      aircraft: "Aircraft/Laminar Research/Cirrus SR22/Cirrus SR22.acf"
+      ramp: { field: LEMG }
+    command: fly a circuit
+    traffic: off
+    deadline_min: 40

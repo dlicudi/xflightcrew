@@ -1,0 +1,10 @@
+# #197: the King Air's rollout with the whole autopilot out at the wheels
+# (b08b602). Three landings from 5 nm; check `ap_disconnected` master and
+# yaw_damper, `ap` false in state after the contact, rollout xtk.
+after: stop
+cases:
+  - name: "King Air C90B LEMG 13, 5 nm final (#197)"
+    setup:
+      aircraft: "Aircraft/Laminar Research/Beechcraft King Air C90B/C90B.acf"
+      approach: { field: LEMG, runway: 13, final_nm: 5 }
+    traffic: off

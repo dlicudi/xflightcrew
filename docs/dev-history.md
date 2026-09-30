@@ -12042,6 +12042,91 @@ Tests `the_recorded_oskot_slow_down_begins_with_miles_to_spare`,
 Next EGKK-EGBB arrival: `star_speed_crossed` for PUFAX, OSKOT and GROVE with `met` true and `ias`
 under the limit; `star_speed` `dist_nm` for OSKOT near 7.9 at about 248 kt. Offline only.
 
+## 2026-09-30: a control tick is one read round and one write round (`xcopilot/state`)
+
+The iMac runs X-Plane near 20 fps (`fps_dip` medians 20.2 and 21.2), and every control loop there
+ticked slower than on the MacBook the laws were tuned on: from the blackbox, autoland's `power` dt
+median 0.56 s on Final (sleep 200 ms), 0.39 s in the Flare (100 ms), 0.77 s on the Intercept
+(400 ms); `rollout` 0.48 s (300 ms); `autotakeoff` `roll` 0.34 s and `climb_manual` 0.32 s
+(150 ms); the taxi `drive` records about 0.3 s apart (150 ms). The MacBook ran near 0.3 s. Today's
+fixes softened laws for the slow tick (`WingsLevel::step` by tick/0.3, #185; the castoring-nose
+brake patches) instead of asking why the tick was slow.
+
+The cause is the Web API's cost model, measured against the running sim on the iMac the same day
+(frame period 0.0503 s): one GET 46 ms (median), 2, 4, 6 and 8 CONCURRENT GETs 50, 47, 51 and
+44 ms, six SEQUENTIAL GETs 312 ms. A request is served in the sim's frame, and requests in flight
+together share that frame, so a tick costs its sleep plus one frame per ROUND of requests it waits
+on, however many requests a round holds. Counted from the code, the steady ticks waited on:
+
+- autoland Final: the freeze check (two sequential reads whenever their 500 ms cache ran out, about
+  every tick at 0.56 s), the read burst, the VSI/lever/servos read, the ILS read, the knob/VS dial/
+  channels join (itself up to three deep: the bug read, write and read back; the column write, then
+  its yield read), the lever write, the lever read back: 7 to 8 rounds, 200 + 8 x 50 = 600 ms
+  predicted against 0.56 s measured. Flare 6 to 7 (no lever read back): 100 + 300 = 0.40 against
+  0.39. Rollout about 3.5 (freeze, read, lever/rudder/column, brakes): 300 + 175 = 0.475 against
+  0.477. Takeoff roll 4 to 5 (freeze, read, lever, brakes, rudder, column): 0.35 against 0.34.
+  Taxi drive about 3 (freeze, read, writes): 0.30.
+
+At 50 fps the same rounds cost 20 ms each, which is the whole machine difference: 6 to 8 rounds x
+30 ms is 180 to 240 ms a tick on the autoland.
+
+Change, at the source:
+
+- **`xcopilot/state`** (plugin `drefs.cpp`, read by `crates/sim/src/state.rs`): one data dataref of
+  doubles holding the `xcopilot/position` prefix and 28 fields a tick reads (airspeed, track, bank,
+  pitch, Q, R, wheels, variation, VSI, pause and replay, servos, heading and VS mode, the bug, the
+  NAV1 needles and flags, approach and glideslope status, the four yield latches, the tug, engine 1
+  torque, `throttle_ratio_all`). Filled AT THE READ, in the accessor, so every field is one frame's
+  and a paused sim (which runs no flight loop) still reports its pause. A missing dataref is NaN,
+  that field unread. Listed in `health::PLUGIN_DATAREFS`; the app's field order is test-pinned to
+  the plugin's `kStateSources`.
+- **`sim::state::read` / `read_with`**: the frame in one request, joined with any dataref it does not
+  carry (a profile's own throttle or approach status) in the same round; an older plugin falls back
+  to separate reads of the wanted fields, the position (`position::read`, snapshot or split) and the
+  freeze flags, all in ONE join. `State::frozen` is `sim_frozen`'s rule (fail open).
+- **`sim::state::Writes`**: a tick's writes queued and sent in one round (`flush`), results per
+  dataref; ordered sequences (a mode engaged, then its dial) stay awaited where they are.
+- **`sim_frozen`** joins its two reads: one round for every loop that still calls it (circuit,
+  procedure, speedhold, hover, pushback, recover).
+- **autoland**: the tick reads once (frame, lever, approach status) and writes once (lever, VS dial,
+  column, ailerons, a fine bug correction). The every-tick bug steering of the short final and the
+  flare decides from the frame's bug (`tools::autopilot::bug_step_from`, the drive's own first
+  decision, test-pinned) and queues one write; a keyed setting and a press past 3 degrees still run
+  `drive_heading_bug_step` with its read back, beside the write round. A yield is read only on a tick
+  that writes its channel, as before, now from the tick's read (the plugin drops the override on its
+  own frame either way). The lever read back after the write (`throttle_after`) is gone: `lever_took`
+  compares this tick's read with the last command, no round. The rollout writes lever, rudder,
+  column, ailerons and brakes in one round.
+- **takeoff**: the roll reads once and writes lever, brakes, rudder and column in one round; a lost
+  rudder or column is judged on the flush's result, as before. The hand-flown climb sends the lever
+  with the column.
+- **taxi**: the drive and the line-up alignment read the freeze flags, the pedals, the tug or yaw
+  rate and the position in one request.
+
+Expected steady tick, iMac 20 fps (MacBook 50 fps), 2 rounds: Final 0.30 s (0.24), Flare 0.20
+(0.14), Intercept 0.50 (0.44), rollout 0.40 (0.34), roll and hand-flown climb 0.25 (0.19), taxi
+0.25 (0.19). The machine difference falls from 180 to 240 ms a tick to 60. Requests per autoland
+tick fall from about 24 to 6 to 8.
+
+Tick-count constants now span less wall time where the tick got faster: `VS_DIVERGED_WARN_TICKS` 12
+(about 6.7 s at 0.56 s, 3.6 s at 0.3), `VS_DIVERGED_GIVE_UP_TICKS` 140, `VS_CONVERGING_FPM_PER_TICK`
+15 (a faster closing rate asked per second), `WHEELS_ON_TICKS` 3 in the flare (about 0.8 s between
+the first and third read at 0.39 s, 0.4 s at 0.2). Not changed here; the MacBook's ticks were
+already that fast. `STIFF_TUNED_TICK_S` (#185) stops softening once the tick is under 0.3 s.
+
+Tests: the frame's parse, layout and plugin slot order; a broken frame and a missing field; the
+fallback with and without the position snapshot; extras on both paths; `sim_frozen` as one round
+over a mock server and the framed fake; the state frame as one request a tick over the real client;
+`Writes` as one round, last value standing; an autoland tick as one read round and one write round
+on the frame and the split (`FramedXPlane`: requests served at frame boundaries on a paused clock);
+`bug_step_from` against `drive_heading_bug_step`.
+
+Deploy: `make -C plugin install`, then reload plugins (or restart X-Plane); Health must show no
+stale plugin. In flight: autoland `power` `dt` (Final near 0.3, Flare near 0.2 at 20 fps),
+`rollout` `dt` near 0.4, `autotakeoff` `roll` `dt` near 0.25, `drive` records near 0.25 s apart,
+`pos: plugin`; `api_load` names `xcopilot/state` and no longer the stock position, VSI, freeze and
+status datarefs. Offline only.
+
 ## 2026-09-30: one stabilised-approach rule; the arrival slows for autoland; a missed approach flies a speed (#199)
 
 iMac 2026-09-30, sortie 1790761044-full_auto: the stock 737 from a runway start on EGBB 33 to EGNX
@@ -12131,6 +12216,197 @@ Next flights: `stable_gate` `verdict` stable on every normal final (the 737's `i
 under 170 with `landing_flap` true); an `unstabilised` only where the final was; `arrival_slowdown`
 before a full-auto arrival and autoland's first tick near the clean approach speed; a go-around's
 `power` ticks leaving 1.0 by 400 ft radio and its IAS under 250. Offline only.
+
+## 2026-09-30: the King Air's flare on a model, its rollout damped on the yaw rate (#197)
+
+iMac, LEMG 13 from 4 nm, three King Air C90B autolands on fresh loads (no failures set):
+1790757702 crashed (off the runway 176 m right), 1790758429 came back at 19.7 m, 1790758604 went
+125.8 m off. Two faults, one feeding the other.
+
+The flare. The C90B had no `flare_elevator:`, so the jets' default tracker flew it: the arrest took
+the servos at 59 to 61 ft sinking 640 to 700 fpm at 110 to 114 KIAS, pulled 0.23 to 0.35 and
+ballooned (to 61 ft level, then from 17.5 to 39 ft on the balloon's approach thrust), let go to
+neutral, and the sink it rebuilt met the runway at 730 to 960 fpm on the gauge the tick before the
+wheels. The scorer's 256 / 518 / 357 were read from the 3 s `state` samples after the contact. Fitted
+to the three flares from the servos taken to the wheels (radio 1.9 to 2.1 ft rms, gauge 50 to 56 fpm):
+9,670 fpm of standing sink per unit of pull after 0.8 s of dead time, the path's 2.6 s, the gauge
+0.9 s behind it, 118 fpm per knot, the lever worth nothing but its speed; with the lever on a 4 s
+spool the fit takes 9,480, 2.3 s, 323 fpm of tail from 40 ft and 103 per knot instead (1.9 to 2.3 ft).
+The speed: -2.72 kt/s, 2.22 more per 1,000 fpm of climb, 1.93 per unit of lever. The profile now
+declares the model (the first fit's numbers, `touchdown_fpm` 150, `tau_s` 3, pull to 0.5, balloon
+eased at 0.15/s) and `flare_power` (off from 20 ft at 0.1/s). On the second fit and its neighbours
+(dead 0.1 s either way, path 10 %, gauge 20 %, a 150 fpm tail, a wing cushion) the tracker as flown
+meets the runway at 240 to 1,400 fpm from the recorded gates; the model from six 106 to 114 kt gates,
+calm and rough, touches every time under 135 fpm on the path and 125 on the gauge, at 86 kt or more,
+the hop after it under 1.8 ft on the SR22's gear, 951 m from the gate at most.
+
+The rollout. The nosewheel STEERS (`_gear_castors 0`, 48 degrees slow, 7 at speed, through the
+pedals), so the King Air is not a brake-steer airframe and the split was never the answer. Each
+contact yawed the nose 8 to 15 deg/s LEFT with the steer at zero, before any write (1790758429:
+131.7 at 1.6 ft, 128.7 on the wheels 0.4 s later): the hard contact's. The rollout ran the takeoff
+roll's DEFAULT law (`RollSteer::default()`, never the airframe's), whose authority is 0.35 at 80 kt
+on a heading differenced over the 0.45 s tick: it answered with its whole 0.35 right for a second
+and a half, and the nose swung 30 to 80 degrees right while the steer walked to full left at the
+trim's pace (0.03 a tick), recovering only below 45 kt. Fitted over the rollouts' first 3.5 to 4.5 s
+(heading and track, the steer as written, the contact's yaw as the first state): 43 to 62 deg/s per
+unit at 80 kt after 0.3 s, and a yaw the slip between nose and track feeds (1.5 to 2.3 deg/s per
+degree), which no heading error sees coming; a third fit without the slip term is a near integrator
+(219 through 3 s after 0.32 s). Slow, the nosewheel gives 12 to 40 deg/s per unit, and there the
+default law's full authority per 12 degrees sawed +/-10 to 15 degrees down to taxi pace. The sign is
+right everywhere (positive steer yaws right at every speed); `psi` is true heading.
+
+`autoland::RolloutSteer`, declared per airframe (`rollout_steer:`, `aircraft::RolloutSteerProfile`,
+the King Air only; every other airframe keeps the default law and reads nothing new): steer =
+per_deg(gs) x (error - 0.8 s x the MEASURED yaw rate, `sim/flightmodel/position/R`, read only for
+it), 0.025 per degree at 80 kt and over, rising as 80 / gs to 65 kt, at most 0.5 from 75 kt, the
+full 0.85 under 65, the takeoff roll's slew, nothing carried through a bounce. The rollout tick logs
+`yaw_r`. From the three recorded contacts on the three fits the default law swings the nose 24 to
+90 degrees (loses it past 45 from two of three on the best fit, as the sim did); the declared law
+holds it within 12.9 degrees and 12.9 m, and on the nosewheel settles within 3 degrees where the
+default sawed 20.
+
+Tests `lemg13_king_air::the_king_air_plant_replays_its_flares`,
+`the_king_air_flares_where_the_tracker_dropped_it_in`, and `lemg13_king_air_rollout_tests`
+(`the_king_air_yaw_plants_replay_the_rollouts`,
+`the_king_air_rollout_holds_the_runway_where_the_roll_law_lost_it`,
+`the_king_air_rollout_settles_on_the_nosewheel`, `rollout_steer_schedules_and_damps`), on
+`bench/landings/king_air_lemg13_landing_*.jsonl`.
+
+Next King Air autoland: `arrest_hands` then `flare_ask` / `flare_target` / `flare_elev` easing, never
+0.35 to 0 in a tick, no `power` `retard: balloon`, `vvi` under 250 at the last tick before the first
+`rollout`; the `rollout` ticks' `yaw_r` read (not null), `steer` within 0.5 above 75 kt, `psi` within
+10 degrees of 131.7 after the contact, `xtk_m` inside 10 m, and the landing's `sink_fpm` under 250.
+Offline only.
+
+## 2026-09-30: a tick is a PERIOD, and what counted ticks counts seconds
+
+Follow-up to the `xcopilot/state` entry above, merged over main at #199 (stable approach) and #197
+(the King Air's `RolloutSteer`, whose yaw-rate read now rides the tick's one read as `F::R`).
+
+Two rounds a tick still leaves the tick as long as the machine makes it: sleep plus work. The loops
+now pace to a fixed PERIOD from the tick's start (`sim::state::Pacer`), and the periods are the
+ticks the laws were tuned on, the MacBook's, read from the bench records made before the iMac
+(before 2026-09-29): autoland Flare and arrest 200 ms (`power` dt 0.20), Final 330 (0.333),
+Intercept 540 (the old 400 ms sleep plus seven 20 ms rounds, no MacBook record); the rollout 380
+(0.378); the takeoff roll 250 (0.25) and the hand-flown climb 230 (0.227); the taxi drive and the
+line-up alignment 210 (150 ms plus three 20 ms rounds, no record). Two rounds are about 100 ms at
+20 fps, so every period holds on the iMac; a tick that overruns starts the next at once.
+`tick_ms` is the period now; its test asks the flare for 15 commands (the MacBook's 0.20 s),
+not the 20 its 100 ms sleep promised and never delivered.
+
+Constants that counted ticks meant a time only on the machine that tuned them. Converted, each to
+its wall time at the MacBook's tick:
+
+- `WHEELS_ON_TICKS` 3 -> `WHEELS_ON_S` 0.4 (third wheels-on read at the 0.2 s flare tick; the
+  recorded 1790448340 contact latched 0.4 s after first contact). `wheels_on_time` is a clock
+  from the first wheels-on read, broken by a bounce.
+- `VS_DIVERGED_WARN_TICKS` 12 -> `VS_DIVERGED_WARN_S` 4.0 and `VS_DIVERGED_GIVE_UP_TICKS` 140 ->
+  `VS_DIVERGED_GIVE_UP_S` 46 (0.33 s Final); the watchdog accumulates the tick's `dt` (blackbox
+  `give_up` `diverged_s`, was `ticks`).
+- `VS_CONVERGING_FPM_PER_TICK` 15 -> `VS_CONVERGING_FPM_PER_S` 45; `vs_not_held` takes `dt_s`.
+- The approach's cross-track rate filter, half per tick -> a 0.476 s time constant (0.33 / ln 2);
+  the taxi drive's yaw-rate filter, half per tick -> 0.303 s (0.21 / ln 2).
+
+Kept as counts, being measurements, not times: `ENGAGE_CONFIRM_READS` (two servo reads confirm an
+engage), `FINAL_AIR_MIN_SAMPLES` (15 samples for an rms), the roll's median of three cross-track
+reads; paced, each spans the wall time it was tuned on again. The scorer and the sortie runner
+count no ticks.
+
+Tests: a paced tick is its period at 20, 50 and 80 ms frames and an overrun does not sleep; the
+wheels latch 0.4 s after contact on the recorded 0.2 s ticks and on 0.39 s ticks alike; the VS
+watchdog judges a closing rate per second on 0.33 and 0.56 s ticks. In flight: `power` dt at the
+periods (Flare 0.20, Final 0.33), `rollout` 0.38, `roll` 0.25, `climb_manual` 0.23. Offline only.
+
+## 2026-09-30: a taxi corner is read from the route's curvature, not a vertex (#194)
+
+e31f338 (the fillet ride) flew on the iMac on db43c97: 1790765957-full_auto (Citation X, LEMG
+gate to HW1) failed the taxi 7.3 m off, worse than the 4.6 it fixed. At Quebec onto Delta (the
+route now 3,546 m) the drive went into the fillet at 17.4 kt (the governor held 17.4 against the
+Citation's 15 down Quebec, braking only 3 kt over): steer -1.00 for 3 s, err -44, `lat_m` 5.8 to
+7.3. The schedule never slowed for it. A corner was a VERTEX turning 30 degrees across chords of
+15 m either side, and its radius the circle through the route 8 m either side; a fillet drawn in 3
+to 5 m segments turns under 12 degrees at any vertex, and chords of 15 m turn 30 degrees only on
+arcs inside 28 m. The old jagged ride had been slowed to 3 kt by its own sawtooth.
+
+`autotaxi::route_bends` now reads the CURVATURE: the heading turned (the sum of signed vertex
+turns) over the 30 m centred on each metre of route; a corner is the stretch where that is 30
+degrees or more one way, or where any 8 m turns 30 degrees (a jog: LIRF's +27 then -47 in 9 m,
+which the vertex reading slowed for and a net-turn reading alone did not). It turns through the sum
+of its turning vertices, its radius is the tightest 8 m over the heading turned in it (on a drawn
+arc its radius; at a lone vertex of D, 8 / D, under the old circle's 4 / sin(D/2)), and its slow-down
+window runs from the stretch's start (up to 15 m before the turning, as a vertex's flagged
+neighbours did) to 15 m past its end. `Bend { start, end, deg, radius }`; `bend_cap_kts` plans the
+corner's pace to the start. The Quebec-onto-Delta fillet now reads 104 degrees on 21.3 m: the
+Citation's sharp pace, 6 kt (15 deg/s x 21.3 m would allow 10.8).
+
+The same arc drawn every 1, 3 or 5 m reads as the same corner (turn within 3 degrees, radius 0.75
+to 1.1 of the drawn one). Over 1,026 routes (stands and the two sorties' gates to every runway
+end at 24 fields) for the Citation, the 737, the A330, the SR22 and the Evolution: no station's
+corner cap is faster than the vertex reading's; 2,635 corners it missed are found; time spent at
+the corner caps 105.7 % (Evolution) to 115.6 % (737) of before. EGKK J to 08R and the LEMG gate are
+in the sweep.
+
+The Citation's nose refitted on all three sorties (8.5 deg/s per m/s per unit, capped at 12, not
+15, 1.3 s lag, 1.00 deg/s rms) and on 1790765957's corner over 10 kt (7.5 after 0.3 s, 0.48 rms),
+flown through the drive's law and the governor as it flies: the fillet from 17.4 kt under the
+vertex reading 5.9 m off (flown 7.3), under the curvature reading 1.7 to 2.0 m from 10, 15 or 17.4
+kt on either fit; the jagged ride (flown 4.6) 2.4 to 3.0 m either way. The SR22 corner replays
+(`CornerRun.vertex`) replay the old laws on the geometry they flew and the current law on the
+curvature reading, all inside the line.
+
+Tests `a_corner_reads_the_same_however_finely_it_is_drawn`, `the_quebec_delta_fillet_is_a_corner`,
+`the_citation_turns_quebec_onto_delta_on_the_line` (rewritten on both fits); ignored
+`real_install_corner_caps_are_never_faster`. `a_tight_corner_is_taken_at_the_yaw_rate_the_airframe_has`
+now allows 16.6 kt at 200 m (the window opens earlier).
+
+Next Citation LEMG taxi: `drive` ticks near 690 m to go with `gs` down to about 6 kt BEFORE
+`turn_dps` passes -5, `steer` under full lock, `lat_m` inside 3 m; the stage's `max_lat_m` under 3.
+Every other taxi should be no faster into a corner and a little slower on drawn fillets. Offline only.
+
+## 2026-09-30: a missed approach is judged by the ground it makes, never a flat clock
+
+iMac 2026-09-30, sortie 1790775809-approach, SR22 on LEMG 13 from a 2 nm final: X-Plane placed it
+high and fast, and the stabilised gate correctly sent it round at 734 ft (t+12.7: flap, fast, sink,
+high). The reversal planned LEMG 13's terrain-raised right-hand pattern (t+29.5, `reversal`
+`judged_at_ft` 2,895, join point 10.3 nm, 104 kt), and the SR22 flew it as planned: 10 nm of
+downwind at 90 kt, base at 11 nm, inbound on the line from 11.4 nm. At t+613 it was at 9.04 nm, 40 m
+off, 2,884 ft, 90 ft under the path it was about to join (`path_joined` a few seconds on), when
+autoland gave up `missed_approach_timeout` and handed back level at 92 kt: safe, but nobody flying
+in an unattended run. The flat 600 s (`MAX_MISSED_APPROACH_SECS`, raised from 300 s when EGHI's
+Baron expired mid-leg, 2026-08-02) knows neither the speed nor the pattern: a slow single on a big
+terrain pattern cannot finish in it, and a jet could loiter in it uselessly for ten minutes.
+
+The taxi's principle (`autotaxi::ProgressWatch`, #165): `reversal::MissedWatch` judges each stage
+by its own measure, with an outer bound from the plan, and gives up only when progress stalls or
+the bound passes. Stages (`reversal::Progress`): the go-around's climb (feet to the 800 ft turn), a
+refused pattern's hold (feet to its altitude), waiting on the plan, and the pattern. A pattern's
+measure is its track to go (`reversal::to_go_nm`: the rest of the downwind to the base, back in to
+where the path meets the platform, `pattern_end_nm`, and the lateral legs out and back), sized at
+the speed it began at; an extended downwind's (`high`) is the height above its platform. Progress
+is a step off the measure (a quarter of what the pattern's speed flies in 120 s; 100 ft in 90 s for
+a height), a leg sequenced, or a new stage; flipping in and out of `high` is not. Outer bounds: a
+pattern's planned track at its speed plus its height at the pattern's descent, x 1.5, + 180 s
+(`pattern_budget_s`); a climb at 300 fpm, the same margin; the plan 150 s. A gap over 5 s between
+ticks is a frozen sim and holds both clocks. The watch runs while a missed approach, a pattern
+(missed or not) or a hold is flown; the give-up keeps the flyable hand-back (climb power, VS dial
+zero), now says "gear is down" only when it is, and records `reason` `missed_approach_stalled` or
+`missed_approach_over_budget` with `stage`, `to_go_nm`, `stalled_s`, `budget_left_s`, `leg`, `gs`.
+Each stage's start is blackboxed `missed_progress` (`stage`, `to_go_nm`, `leg`, `budget_s`,
+`pattern_gs`).
+
+On the record (replayed at 1 s): the pattern's plan is 15.3 nm, its bound 974 s; it stood at most
+58 s without a step (the turn onto the downwind) and had 390 s left at t+613. The same SR22 in an
+orbit is given up at 121 s. A 737 on the kinematic autopilot (160 kt, 24 degrees, EGTE 08 at 3,000
+ft): bound 969 s, flown in 577 s; in an orbit from 60 s, given up at 199 s. Tests
+`lemg_13_sr22_pattern_makes_its_ground_and_is_never_given_up`,
+`a_pattern_that_goes_nowhere_is_given_up_in_minutes`,
+`a_jet_pattern_is_judged_on_its_own_size_and_speed`,
+`an_extended_downwind_progresses_by_the_height_it_loses`,
+`a_climb_that_stops_or_a_plan_that_never_comes_is_given_up`.
+
+Next missed approach: `missed_progress` at `climb`, then `pattern` with `to_go_nm` and `budget_s`
+(an SR22 on LEMG 13's raised pattern near 15 nm and 970 s), `reversal_done` `path_joined` and no
+`give_up`; a real give-up names its `stage` and `stalled_s`. Offline only.
 
 ## 2026-09-30: one ground law for a free castoring nose (#165, #196)
 

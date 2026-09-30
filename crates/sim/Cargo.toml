@@ -14,3 +14,9 @@ base64 = { workspace = true }
 async-trait = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }
+# `join_all` for a tick's reads of a variable set of fields: one round (state.rs).
+futures = "0.3"
+
+[dev-dependencies]
+# `start_paused`: the framed fake counts a tick's request ROUNDS on a paused clock.
+tokio = { version = "1", features = ["full", "test-util"] }

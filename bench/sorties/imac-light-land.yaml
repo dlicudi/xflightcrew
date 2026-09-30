@@ -8,8 +8,8 @@ cases:
       approach: { field: LEMG, runway: 13, final_nm: 4 }
     traffic: off
 
-  - name: "172 SP LEMG 13, 2 nm final"
+  - name: "172 SP LEMG 13, 5 nm final"
     setup:
       aircraft: "Aircraft/Laminar Research/Cessna 172 SP/Cessna_172SP.acf"
-      approach: { field: LEMG, runway: 13, final_nm: 2 }
+      approach: { field: LEMG, runway: 13, final_nm: 5 }
     traffic: off

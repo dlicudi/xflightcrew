@@ -1,0 +1,36 @@
+# iMac regression on the state-frame ticks (26031ed, plugin 35b3486): the
+# laws fitted on the old 0.35 to 0.56 s ticks, now paced at 0.2 to 0.39 s.
+after: stop
+cases:
+  - name: "SR22 LEMG 13, 5 nm final"
+    setup:
+      aircraft: "Aircraft/Laminar Research/Cirrus SR22/Cirrus SR22.acf"
+      approach: { field: LEMG, runway: 13, final_nm: 5 }
+    traffic: off
+
+  - name: "King Air C90B LEMG 13, 5 nm final (#197)"
+    setup:
+      aircraft: "Aircraft/Laminar Research/Beechcraft King Air C90B/C90B.acf"
+      approach: { field: LEMG, runway: 13, final_nm: 5 }
+    traffic: off
+
+  - name: "King Air C90B LEMG 13, 5 nm final again (#197)"
+    setup:
+      aircraft: "Aircraft/Laminar Research/Beechcraft King Air C90B/C90B.acf"
+      approach: { field: LEMG, runway: 13, final_nm: 5 }
+    traffic: off
+
+  - name: "737 LEMG runway start 30, circuit"
+    setup:
+      aircraft: "Aircraft/Laminar Research/Boeing 737-800/b738.acf"
+      runway_start: { field: LEMG, runway: 30, engines_running: true }
+    command: fly a circuit
+    traffic: off
+    deadline_min: 30
+
+  - name: "Lancair Evolution LILB circuit from the ramp (#196)"
+    setup:
+      aircraft: "Aircraft/Laminar Research/Lancair Evolution/N844X.acf"
+      ramp: { field: LILB }
+    command: fly a circuit
+    deadline_min: 35
