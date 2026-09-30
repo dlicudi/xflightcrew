@@ -1341,10 +1341,24 @@ const JOIN_AHEAD_MAX_LAT_M: f64 = 60.0;
 /// Runway legs are left alone. A crossing runs square across every taxi line
 /// near it, the strip's own markings are not 120 features anyway, and the
 /// runway geometry is authoritative where the taxi network is not.
+///
+/// The one place a point moves further: a network corner cut across a drawn
+/// fillet turns on that fillet ([`ride_corner_fillets`], #194).
 pub fn ride_paint(
     paint: &[Vec<(f64, f64)>],
     path: &[(f64, f64)],
     seg: &[(String, bool)],
+) -> RoutePolyline {
+    ride_paint_with(paint, path, seg, true)
+}
+
+/// [`ride_paint`], with the corners rounded on their fillets or not (the
+/// tests compare the two).
+fn ride_paint_with(
+    paint: &[Vec<(f64, f64)>],
+    path: &[(f64, f64)],
+    seg: &[(String, bool)],
+    fillets: bool,
 ) -> RoutePolyline {
     if paint.is_empty() || path.len() < 2 {
         return (path.to_vec(), seg.to_vec());
@@ -1358,6 +1372,9 @@ pub fn ride_paint(
     let mut out_seg: Vec<(String, bool)> = Vec::with_capacity(path.len() * 4);
     // Which line each output point sits on, and where along it.
     let mut out_snap: Vec<Option<(usize, f64)>> = Vec::with_capacity(path.len() * 4);
+    // Which network leg each output point was sampled from (the end point
+    // is the last node's), for the corners (`ride_corner_fillets`).
+    let mut out_leg: Vec<usize> = Vec::with_capacity(path.len() * 4);
     let mut prefer: Option<usize> = None;
     for i in 0..path.len() - 1 {
         let (a, b) = (path[i], path[i + 1]);
@@ -1373,6 +1390,7 @@ pub fn ride_paint(
             out_path.push(a);
             out_seg.push(s);
             out_snap.push(None);
+            out_leg.push(i);
             prefer = None;
             continue;
         }
@@ -1405,6 +1423,7 @@ pub fn ride_paint(
             out_path.push(if keeps_going { snapped } else { raw });
             out_seg.push(s.clone());
             out_snap.push(hit.filter(|_| keeps_going).map(|(idx, _, at)| (idx, at)));
+            out_leg.push(i);
         }
     }
     // The end point rides the last leg's bearing, so a route that finishes at
@@ -1423,11 +1442,403 @@ pub fn ride_paint(
         out_path.pop();
         out_seg.pop();
         out_snap.pop();
+        out_leg.pop();
     }
     out_path.push(end);
     out_snap.push(end_snap);
+    out_leg.push(path.len() - 1);
+    if fillets {
+        ride_corner_fillets(
+            paint,
+            path,
+            seg,
+            &mut out_path,
+            &mut out_seg,
+            &mut out_snap,
+            &mut out_leg,
+            m_per_deg_lon,
+        );
+    }
     fill_paint_gaps(paint, &mut out_path, &mut out_seg, &out_snap, m_per_deg_lon);
     (out_path, out_seg)
+}
+
+/// A network corner turning less than this is left to the sideways snap.
+const FILLET_MIN_TURN_DEG: f64 = 30.0;
+/// How far from the corner's node a fillet's ends are looked for, m.
+const FILLET_REACH_M: f64 = 80.0;
+/// Two drawn lines meet where an end of one is this close to the other, m.
+const PAINT_JOIN_M: f64 = 1.0;
+/// The most drawn lines one fillet is pieced from.
+const FILLET_MAX_LINES: usize = 4;
+/// A fillet turns one way: a vertex turning back against the corner by more
+/// than this is a different line, degrees.
+const FILLET_WOBBLE_DEG: f64 = 10.0;
+/// A fillet leaves along the leg in and arrives along the leg out, within
+/// this, degrees.
+const FILLET_END_DEG: f64 = 45.0;
+
+/// A drawn line's vertices with how far along it each sits, m.
+fn line_stations(line: &[(f64, f64)], m_per_deg_lon: f64) -> Vec<f64> {
+    let mut at = Vec::with_capacity(line.len());
+    let mut acc = 0.0;
+    for (i, &p) in line.iter().enumerate() {
+        if i > 0 {
+            let (dx, dy) = ((p.1 - line[i - 1].1) * m_per_deg_lon, (p.0 - line[i - 1].0) * 111_320.0);
+            acc += (dx * dx + dy * dy).sqrt();
+        }
+        at.push(acc);
+    }
+    at
+}
+
+/// The point `m` metres along a drawn line.
+fn line_point(line: &[(f64, f64)], at: &[f64], m: f64) -> (f64, f64) {
+    if line.len() < 2 {
+        return line[0];
+    }
+    let k = at.partition_point(|&a| a <= m).clamp(1, line.len() - 1);
+    let (a, b) = (line[k - 1], line[k]);
+    let span = at[k] - at[k - 1];
+    let t = if span > 1e-9 { ((m - at[k - 1]) / span).clamp(0.0, 1.0) } else { 0.0 };
+    (a.0 + (b.0 - a.0) * t, a.1 + (b.1 - a.1) * t)
+}
+
+/// Round a route's corners on the drawn fillet the network cut.
+///
+/// A taxiway meeting another at a T is drawn, in the network, as one node
+/// where the two CENTRELINES cross; the paint instead stops short of the
+/// junction and sweeps round a fillet onto the other line, one each way.
+/// The route out of the planner runs straight to the node and turns there,
+/// and the sideways snap (at most [`PAINT_SNAP_M`], within
+/// [`PAINT_PARALLEL_DEG`] of the leg) takes each sample near the junction
+/// onto whichever fillet leaves closest, left or right, sample by sample.
+/// LEMG's Quebec onto Delta (Citation X, sorties 1790734216 and 1790738786,
+/// 2026-09-30, #194): Quebec's paint ends 47 m short of Delta's centreline,
+/// and the ridden route ran 36, 21, 19, 69, 114, 2, 41 and 318 degrees in
+/// seven legs of 5 to 10 m; the drive chased the jog right, swung 4.6 and
+/// 4.8 m outside the turn back and failed the taxi both times.
+///
+/// So at each network corner of [`FILLET_MIN_TURN_DEG`] or more the samples
+/// between a sample on the paint before it and a sample on the paint after
+/// it are replaced by the drawn lines that JOIN those two, end to end: the
+/// shortest chain of at most [`FILLET_MAX_LINES`] lines that turns the
+/// corner's way the whole time (never back more than [`FILLET_WOBBLE_DEG`]),
+/// leaves and arrives along the legs, lies inside the corner (within
+/// [`PAINT_SNAP_M`] of the triangle its two ends make with the node) and is
+/// no longer than [`PAINT_FILL_DETOUR`] times the gap. That is the fillet
+/// the corner turns on and never the other one, which runs outside the
+/// node. No such chain, and the corner is left as the snap made it: runway
+/// legs, undrawn fields and junctions drawn square are untouched.
+#[allow(clippy::too_many_arguments)]
+fn ride_corner_fillets(
+    paint: &[Vec<(f64, f64)>],
+    path: &[(f64, f64)],
+    seg: &[(String, bool)],
+    out_path: &mut Vec<(f64, f64)>,
+    out_seg: &mut Vec<(String, bool)>,
+    out_snap: &mut Vec<Option<(usize, f64)>>,
+    out_leg: &mut Vec<usize>,
+    m_per_deg_lon: f64,
+) {
+    if paint.is_empty()
+        || path.len() < 3
+        || out_path.len() != out_snap.len()
+        || out_path.len() != out_leg.len()
+        || out_seg.len() + 1 != out_path.len()
+    {
+        return;
+    }
+    let dist = |a: (f64, f64), b: (f64, f64)| {
+        let (dx, dy) = ((a.1 - b.1) * m_per_deg_lon, (a.0 - b.0) * 111_320.0);
+        (dx * dx + dy * dy).sqrt()
+    };
+    let brg = |a: (f64, f64), b: (f64, f64)| bearing_deg(a.0, a.1, b.0, b.1);
+    let stations: Vec<Vec<f64>> = paint.iter().map(|l| line_stations(l, m_per_deg_lon)).collect();
+    for k in 1..path.len() - 1 {
+        let v = path[k];
+        if seg.get(k - 1).is_none_or(|s| s.1) || seg.get(k).is_none_or(|s| s.1) {
+            continue;
+        }
+        if dist(path[k - 1], v) < 0.5 || dist(v, path[k + 1]) < 0.5 {
+            continue;
+        }
+        let (b_in, b_out) = (brg(path[k - 1], v), brg(v, path[k + 1]));
+        let turn = angle_diff_deg(b_out, b_in);
+        if turn.abs() < FILLET_MIN_TURN_DEG {
+            continue;
+        }
+        let Some(first_out) = out_leg.iter().position(|&l| l >= k) else {
+            continue;
+        };
+        // Exits: samples after the node, on the paint, within reach.
+        let exits: Vec<(usize, usize, f64)> = (first_out..out_path.len())
+            .take_while(|&j| dist(out_path[j], v) <= FILLET_REACH_M || j == first_out)
+            .filter_map(|j| out_snap[j].map(|(l, at)| (j, l, at)))
+            .collect();
+        if exits.is_empty() {
+            continue;
+        }
+        // Entries: samples on the leg in, on the paint, furthest first, so
+        // every sample the snap threw between the two fillets is replaced.
+        let entries: Vec<usize> = (0..first_out)
+            .rev()
+            .take_while(|&i| out_leg[i] + 1 == k && dist(out_path[i], v) <= FILLET_REACH_M)
+            .filter(|&i| out_snap[i].is_some())
+            .collect();
+        let mut chosen: Option<(usize, usize, Vec<(f64, f64)>)> = None;
+        for &i in entries.iter().rev() {
+            let (li, at_i) = out_snap[i].expect("filtered");
+            let fits = |pts: &[(f64, f64)], j: usize| -> Option<f64> {
+                let len = fillet_fits(pts, out_path[i], v, out_path[j], b_in, b_out, turn, m_per_deg_lon)?;
+                // Spliced in, the fillet must meet the samples either side
+                // as smoothly as the route it replaces: no joint sharper
+                // than the sharper of [`FILLET_MAX_VERTEX_DEG`] and the old
+                // span's own, and none turning back against the corner.
+                let lo = i.saturating_sub(1);
+                let hi = (j + 1).min(out_path.len() - 1);
+                let old_max = vertex_turns(&out_path[lo..=hi], m_per_deg_lon)
+                    .iter()
+                    .fold(0.0_f64, |a, t| a.max(t.abs()));
+                let mut ext: Vec<(f64, f64)> = Vec::with_capacity(pts.len() + 2);
+                ext.extend_from_slice(&out_path[lo..i]);
+                ext.extend_from_slice(pts);
+                ext.extend_from_slice(&out_path[j + 1..=hi]);
+                let new = vertex_turns(&ext, m_per_deg_lon);
+                let smooth = new.iter().all(|t| {
+                    t.abs() <= old_max.max(FILLET_MAX_VERTEX_DEG) && t * turn.signum() >= -FILLET_WOBBLE_DEG
+                });
+                smooth.then_some(len)
+            };
+            let mut best: Option<(f64, usize, Vec<(f64, f64)>)> = None;
+            let dir_i = line_dir(&paint[li], &stations[li], at_i, b_in);
+            let mut stack: Vec<(usize, f64, f64, Vec<(usize, f64, f64)>)> = vec![(li, at_i, dir_i, Vec::new())];
+            while let Some((line, at, dir, pieces)) = stack.pop() {
+                let len = *stations[line].last().unwrap_or(&0.0);
+                let end_at = if dir > 0.0 { len } else { 0.0 };
+                let p = line_point(&paint[line], &stations[line], end_at);
+                let mut here = pieces.clone();
+                here.push((line, at, end_at));
+                let used = |l: usize| here.iter().any(|&(u, ..)| u == l);
+                // Onto an exit's line: the first exit ahead of where we meet it.
+                let mut tried: Vec<usize> = Vec::new();
+                for &(j, lj, at_j) in &exits {
+                    if used(lj) || tried.contains(&lj) {
+                        continue;
+                    }
+                    let Some(at_e) = project_on_line(&paint[lj], &stations[lj], p, m_per_deg_lon)
+                        .filter(|&(_, d)| d <= PAINT_JOIN_M)
+                        .map(|(a, _)| a)
+                    else {
+                        continue;
+                    };
+                    let dir_o = line_dir(&paint[lj], &stations[lj], at_e, b_out);
+                    if (at_j - at_e) * dir_o <= 0.5 {
+                        continue;
+                    }
+                    tried.push(lj);
+                    let mut chain = here.clone();
+                    chain.push((lj, at_e, at_j));
+                    let pts = chain_points(paint, &stations, &chain, m_per_deg_lon);
+                    let mut all = vec![out_path[i]];
+                    all.extend(pts.iter().copied());
+                    all.push(out_path[j]);
+                    if let Some(len) = fits(&all, j) {
+                        if best.as_ref().is_none_or(|b| len < b.0) {
+                            best = Some((len, j, pts));
+                        }
+                    }
+                }
+                if here.len() >= FILLET_MAX_LINES {
+                    continue;
+                }
+                for (l2, line2) in paint.iter().enumerate() {
+                    if used(l2) || line2.len() < 2 {
+                        continue;
+                    }
+                    let len2 = *stations[l2].last().unwrap_or(&0.0);
+                    if dist(p, line2[0]) <= PAINT_JOIN_M {
+                        stack.push((l2, 0.0, 1.0, here.clone()));
+                    } else if dist(p, line2[line2.len() - 1]) <= PAINT_JOIN_M {
+                        stack.push((l2, len2, -1.0, here.clone()));
+                    }
+                }
+            }
+            if let Some((_, j, pts)) = best {
+                chosen = Some((i, j, pts));
+                break;
+            }
+        }
+        let Some((i, j, pts)) = chosen else {
+            continue;
+        };
+        if out_seg[i..j].iter().any(|s| s.1) {
+            continue;
+        }
+        // Each new point takes the name and leg of the replaced sample
+        // nearest it, so a name change at the node lands where it was.
+        let nearest = |q: (f64, f64)| {
+            (i..j)
+                .min_by(|&a, &b| dist(out_path[a], q).total_cmp(&dist(out_path[b], q)))
+                .unwrap_or(i)
+        };
+        let new_seg: Vec<(String, bool)> = std::iter::once(out_seg[i].clone())
+            .chain(pts.iter().map(|&q| out_seg[nearest(q)].clone()))
+            .collect();
+        let new_leg: Vec<usize> = pts.iter().map(|&q| out_leg[nearest(q)]).collect();
+        let n = pts.len();
+        out_path.splice(i + 1..j, pts);
+        out_seg.splice(i..j, new_seg);
+        out_snap.splice(i + 1..j, std::iter::repeat_n(None, n));
+        out_leg.splice(i + 1..j, new_leg);
+    }
+}
+
+/// +1 when a drawn line runs the way `brg` goes at `at` metres along it,
+/// else -1 (a line may be drawn from either end).
+fn line_dir(line: &[(f64, f64)], at: &[f64], m: f64, brg: f64) -> f64 {
+    let len = *at.last().unwrap_or(&0.0);
+    let (a, b) = (
+        line_point(line, at, (m - 1.0).max(0.0)),
+        line_point(line, at, (m + 1.0).min(len)),
+    );
+    let tangent = bearing_deg(a.0, a.1, b.0, b.1);
+    if angle_diff_deg(tangent, brg).abs() <= 90.0 {
+        1.0
+    } else {
+        -1.0
+    }
+}
+
+/// The foot of `p` on a drawn line: (metres along it, distance off it).
+fn project_on_line(line: &[(f64, f64)], at: &[f64], p: (f64, f64), m_per_deg_lon: f64) -> Option<(f64, f64)> {
+    let mut best: Option<(f64, f64)> = None;
+    for (k, w) in line.windows(2).enumerate() {
+        let (ax, ay) = ((w[0].1 - p.1) * m_per_deg_lon, (w[0].0 - p.0) * 111_320.0);
+        let (bx, by) = ((w[1].1 - p.1) * m_per_deg_lon, (w[1].0 - p.0) * 111_320.0);
+        let (dx, dy) = (bx - ax, by - ay);
+        let len2 = dx * dx + dy * dy;
+        let t = if len2 < 1e-9 { 0.0 } else { (-(ax * dx + ay * dy) / len2).clamp(0.0, 1.0) };
+        let (fx, fy) = (ax + t * dx, ay + t * dy);
+        let d = (fx * fx + fy * fy).sqrt();
+        if best.is_none_or(|(_, bd)| d < bd) {
+            best = Some((at[k] + t * len2.sqrt(), d));
+        }
+    }
+    best
+}
+
+/// The points of a chain of line pieces `(line, from_m, to_m)`, exclusive
+/// of the chain's own two ends, each joint included once.
+fn chain_points(
+    paint: &[Vec<(f64, f64)>],
+    stations: &[Vec<f64>],
+    chain: &[(usize, f64, f64)],
+    m_per_deg_lon: f64,
+) -> Vec<(f64, f64)> {
+    let mut pts = Vec::new();
+    for (n, &(line, from, to)) in chain.iter().enumerate() {
+        if (to - from).abs() > 0.25 {
+            pts.extend(paint_between(&paint[line], from, to, m_per_deg_lon).0);
+        }
+        if n + 1 < chain.len() && (to - from).abs() > 0.25 {
+            pts.push(line_point(&paint[line], &stations[line], to));
+        }
+    }
+    pts
+}
+
+/// Whether the polyline `pts` (entry first, exit last) is the fillet of the
+/// corner at `v` turning `turn` degrees from `b_in` to `b_out`: its length
+/// if so. See [`ride_corner_fillets`].
+#[allow(clippy::too_many_arguments)]
+fn fillet_fits(
+    pts: &[(f64, f64)],
+    entry: (f64, f64),
+    v: (f64, f64),
+    exit: (f64, f64),
+    b_in: f64,
+    b_out: f64,
+    turn: f64,
+    m_per_deg_lon: f64,
+) -> Option<f64> {
+    let xy = |p: (f64, f64)| ((p.1 - v.1) * m_per_deg_lon, (p.0 - v.0) * 111_320.0);
+    let d = |a: (f64, f64), b: (f64, f64)| {
+        let (a, b) = (xy(a), xy(b));
+        ((a.0 - b.0).powi(2) + (a.1 - b.1).powi(2)).sqrt()
+    };
+    let mut len = 0.0;
+    let mut brgs: Vec<f64> = Vec::new();
+    let mut last = pts[0];
+    for &q in &pts[1..] {
+        let step = d(last, q);
+        len += step;
+        if step >= 0.5 {
+            brgs.push(bearing_deg(last.0, last.1, q.0, q.1));
+            last = q;
+        }
+    }
+    let (first, final_) = (*brgs.first()?, *brgs.last()?);
+    if len > PAINT_FILL_DETOUR * d(entry, exit) + 5.0 {
+        return None;
+    }
+    if angle_diff_deg(first, b_in).abs() > FILLET_END_DEG || angle_diff_deg(final_, b_out).abs() > FILLET_END_DEG {
+        return None;
+    }
+    let side = turn.signum();
+    if brgs.windows(2).any(|w| angle_diff_deg(w[1], w[0]) * side < -FILLET_WOBBLE_DEG) {
+        return None;
+    }
+    let tri = [xy(entry), (0.0, 0.0), xy(exit)];
+    if pts.iter().any(|&q| off_triangle_m(xy(q), tri) > PAINT_SNAP_M) {
+        return None;
+    }
+    Some(len)
+}
+
+/// The most one vertex of a spliced fillet may turn, unless the route it
+/// replaces already turned more, degrees. A drawn fillet sampled every
+/// [`PAINT_SAMPLE_M`] turns a few degrees per vertex.
+const FILLET_MAX_VERTEX_DEG: f64 = 30.0;
+
+/// The turn at each vertex of a polyline, degrees signed right, over steps
+/// of half a metre or more.
+fn vertex_turns(pts: &[(f64, f64)], m_per_deg_lon: f64) -> Vec<f64> {
+    let mut out = Vec::new();
+    let mut prev: Option<f64> = None;
+    let Some(&first) = pts.first() else {
+        return out;
+    };
+    let mut last = first;
+    for &q in &pts[1..] {
+        let (dx, dy) = ((q.1 - last.1) * m_per_deg_lon, (q.0 - last.0) * 111_320.0);
+        if (dx * dx + dy * dy).sqrt() < 0.5 {
+            continue;
+        }
+        let b = bearing_deg(last.0, last.1, q.0, q.1);
+        if let Some(p) = prev {
+            out.push(angle_diff_deg(b, p));
+        }
+        prev = Some(b);
+        last = q;
+    }
+    out
+}
+
+/// How far `p` lies outside the triangle `t` (0 inside), in its own units.
+fn off_triangle_m(p: (f64, f64), t: [(f64, f64); 3]) -> f64 {
+    let cross = |a: (f64, f64), b: (f64, f64), c: (f64, f64)| (b.0 - a.0) * (c.1 - a.1) - (b.1 - a.1) * (c.0 - a.0);
+    let (c1, c2, c3) = (cross(t[0], t[1], p), cross(t[1], t[2], p), cross(t[2], t[0], p));
+    if (c1 >= 0.0 && c2 >= 0.0 && c3 >= 0.0) || (c1 <= 0.0 && c2 <= 0.0 && c3 <= 0.0) {
+        return 0.0;
+    }
+    let to_seg = |a: (f64, f64), b: (f64, f64)| {
+        let (dx, dy) = (b.0 - a.0, b.1 - a.1);
+        let len2 = dx * dx + dy * dy;
+        let t = if len2 < 1e-9 { 0.0 } else { (((p.0 - a.0) * dx + (p.1 - a.1) * dy) / len2).clamp(0.0, 1.0) };
+        ((a.0 + t * dx - p.0).powi(2) + (a.1 + t * dy - p.1).powi(2)).sqrt()
+    };
+    to_seg(t[0], t[1]).min(to_seg(t[1], t[2])).min(to_seg(t[2], t[0]))
 }
 
 /// Close the gaps in a ridden route where the drawn line bulged out of reach.
@@ -7795,5 +8206,213 @@ SID:030,5,BLN4L,RW30,BLN,LE,D, ,VE  , ,   ,TF, , , , , ,      ,    ,    ,    ,  
         let end = (bearing_deg(lane[n - 3].0, lane[n - 3].1, lane[n - 1].0, lane[n - 1].1) + 180.0) % 360.0;
         println!("lane {n} pts, ends facing {end:.1}");
         assert!((end - 26.0).abs() < 8.0, "{end}");
+    }
+
+    /// A T-junction as the network and the paint each draw it: Quebec north
+    /// to a node ON Delta's east-west centreline 50 m up, Quebec's paint
+    /// stopping 30 m short, a 30 m fillet each way onto Delta.
+    fn t_junction(fillets: bool) -> Vec<Vec<(f64, f64)>> {
+        let arc = |sign: f64| -> Vec<(f64, f64)> {
+            (0..=12)
+                .map(|k| {
+                    let a = (90.0_f64 * k as f64 / 12.0).to_radians();
+                    ll(sign * (30.0 - 30.0 * a.cos()), 20.0 + 30.0 * a.sin())
+                })
+                .collect()
+        };
+        let mut paint = vec![
+            vec![ll(0.0, -150.0), ll(0.0, if fillets { 20.0 } else { 50.0 })],
+            vec![ll(-200.0, 50.0), ll(200.0, 50.0)],
+        ];
+        if fillets {
+            paint.push(arc(-1.0));
+            paint.push(arc(1.0));
+        }
+        paint
+    }
+
+    fn xy(p: (f64, f64)) -> (f64, f64) {
+        ((p.1 - LON0) * 111_320.0 * LAT0.to_radians().cos(), (p.0 - LAT0) * 111_320.0)
+    }
+
+    fn sharpest(path: &[(f64, f64)]) -> f64 {
+        vertex_turns(path, 111_320.0 * LAT0.to_radians().cos())
+            .iter()
+            .fold(0.0_f64, |a, t| a.max(t.abs()))
+    }
+
+    /// #194 (LEMG Quebec onto Delta, Citation X, 2026-09-30): a corner the
+    /// network cut across a drawn fillet turns on the fillet it turns AWAY
+    /// on, never on the one the other way, and the samples the snap threw
+    /// between the two go with it.
+    #[test]
+    fn a_corner_rides_the_fillet_it_turns_on() {
+        let paint = t_junction(true);
+        let seg = vec![("Q".to_string(), false), ("D".to_string(), false)];
+        for (sign, name) in [(-1.0, "left"), (1.0, "right")] {
+            let path = vec![ll(0.0, -150.0), ll(0.0, 50.0), ll(sign * 200.0, 50.0)];
+            let (old, _) = ride_paint_with(&paint, &path, &seg, false);
+            let (new, new_seg) = ride_paint(&paint, &path, &seg);
+            assert_eq!(new_seg.len() + 1, new.len(), "{name}");
+            assert_eq!(old.last(), new.last(), "{name}: the route ends where it did");
+            // The snap alone turns at the node or saws between the fillets.
+            assert!(sharpest(&old) > 40.0, "{name}: {:.0}", sharpest(&old));
+            assert!(sharpest(&new) <= 15.0, "{name}: {:.0}", sharpest(&new));
+            for p in new.iter().map(|&p| xy(p)) {
+                assert!(p.0 * sign >= -0.5, "{name}: never on the other fillet: {p:?}");
+                assert!(p.1 <= 50.5, "{name}: never past Delta: {p:?}");
+            }
+            // Through the fillet's middle, 30 (1 - cos 45) off each line.
+            let mid = (sign * (30.0 - 30.0 * 45.0_f64.to_radians().cos()), 20.0 + 30.0 * 45.0_f64.to_radians().sin());
+            let nearest = new.iter().map(|&p| {
+                let q = xy(p);
+                ((q.0 - mid.0).powi(2) + (q.1 - mid.1).powi(2)).sqrt()
+            });
+            assert!(nearest.fold(f64::INFINITY, f64::min) < 3.0, "{name}: on the fillet");
+            // The names change where the node was: Quebec then Delta.
+            assert_eq!(new_seg.first().map(|s| s.0.as_str()), Some("Q"));
+            assert_eq!(new_seg.last().map(|s| s.0.as_str()), Some("D"));
+        }
+    }
+
+    /// A junction drawn square has no fillet to ride, a runway leg is never
+    /// ridden, and a gentle bend is the snap's: all as the snap left them.
+    #[test]
+    fn a_corner_without_a_fillet_is_left_as_the_snap_made_it() {
+        let seg = vec![("Q".to_string(), false), ("D".to_string(), false)];
+        let path = vec![ll(0.0, -150.0), ll(0.0, 50.0), ll(-200.0, 50.0)];
+        let square = t_junction(false);
+        assert_eq!(ride_paint(&square, &path, &seg), ride_paint_with(&square, &path, &seg, false));
+        let filleted = t_junction(true);
+        let runway = vec![("Q".to_string(), false), ("12".to_string(), true)];
+        assert_eq!(ride_paint(&filleted, &path, &runway), ride_paint_with(&filleted, &path, &runway, false));
+        let gentle = vec![ll(0.0, -150.0), ll(0.0, 50.0), ll(-40.0, 200.0)];
+        assert_eq!(ride_paint(&filleted, &gentle, &seg), ride_paint_with(&filleted, &gentle, &seg, false));
+    }
+
+    /// #194 as drawn at LEMG (from the install): Quebec's paint ends 47 m
+    /// short of Delta's centreline and the node sits on it. Before, the ride
+    /// turned 49, 45, -112 and -83 degrees in 30 m; now it rides lines 158
+    /// and 157 (the fillet left, through their joint) and turns under 15
+    /// degrees at any vertex.
+    #[test]
+    fn lemg_quebec_onto_delta_rides_the_left_fillet() {
+        let raw: [(f64, f64); 3] = [(36.683599, -4.506806), (36.687126, -4.502939), (36.688841, -4.506956)];
+        #[rustfmt::skip]
+        let paint: Vec<Vec<(f64, f64)>> = vec![
+            vec![(36.68680750, -4.50327940), (36.68681270, -4.50327312), (36.68682681, -4.50325461), (36.68684765, -4.50322436), (36.68687299, -4.50318286), (36.68690063, -4.50313061), (36.68692837, -4.50306808), (36.68695399, -4.50299578), (36.68697530, -4.50291420), (36.68698764, -4.50282780), (36.68698962, -4.50274279), (36.68698394, -4.50266229), (36.68697326, -4.50258944), (36.68696029, -4.50252734), (36.68694770, -4.50247912), (36.68693817, -4.50244790), (36.68693440, -4.50243680)],
+            vec![(36.68734910, -4.50342280), (36.68734506, -4.50341464), (36.68733313, -4.50339276), (36.68731358, -4.50336104), (36.68728668, -4.50332335), (36.68725269, -4.50328358), (36.68721191, -4.50324561), (36.68716458, -4.50321332), (36.68711100, -4.50319060)],
+            vec![(36.68711100, -4.50319060), (36.68704602, -4.50318040), (36.68698726, -4.50318389), (36.68693547, -4.50319725), (36.68689141, -4.50321670), (36.68685583, -4.50323844), (36.68682948, -4.50325866), (36.68681312, -4.50327358), (36.68680750, -4.50327940)],
+            vec![(36.68332550, -4.50710330), (36.68386960, -4.50650580), (36.68680750, -4.50327940)],
+            vec![(36.68320300, -4.49356340), (36.68693440, -4.50243680), (36.68734910, -4.50342280), (36.68877120, -4.50680470), (36.68932580, -4.50812360), (36.68958210, -4.50873320)],
+        ];
+        let seg = vec![("Q".to_string(), false), ("D".to_string(), false)];
+        let m_lon = 111_320.0 * raw[1].0.to_radians().cos();
+        let (old, _) = ride_paint_with(&paint, &raw, &seg, false);
+        let (new, _) = ride_paint(&paint, &raw, &seg);
+        let worst = |p: &[(f64, f64)]| vertex_turns(p, m_lon).iter().fold(0.0_f64, |a, t| a.max(t.abs()));
+        assert!(worst(&old) > 100.0, "the recorded jog: {:.0}", worst(&old));
+        assert!(worst(&new) < 15.0, "{:.0}", worst(&new));
+        assert_eq!(old.last(), new.last());
+        let d = |a: (f64, f64), b: (f64, f64)| (((a.1 - b.1) * m_lon).powi(2) + ((a.0 - b.0) * 111_320.0).powi(2)).sqrt();
+        let joint = (36.68711100, -4.50319060);
+        assert!(new.iter().any(|&p| d(p, joint) < 1.0), "through the fillet's joint");
+        // Nothing east of the right fillet's start: the other fillet is not ridden.
+        let right_mid = (36.68697530, -4.50291420);
+        assert!(new.iter().all(|&p| d(p, right_mid) > 10.0));
+    }
+
+    /// #194: the fillet pass over real fields, old against new, stands to
+    /// every runway end. Prints what changed and fails on a new route that
+    /// is sharper than the old one or strays from it.
+    /// `cargo test --release -p atc -- --ignored real_install_fillet_sweep --nocapture`
+    #[test]
+    #[ignore] // needs the real X-Plane install; run with --ignored
+    fn real_install_fillet_sweep() {
+        let apt =
+            &crate::nav::test_xplane_path("Global Scenery/Global Airports/Earth nav data/apt.dat");
+        if !std::path::Path::new(apt).exists() {
+            return;
+        }
+        let fields = std::env::var("FILLET_FIELDS").unwrap_or_else(|_| {
+            "LEMG EGKK EGBB EGLL EGPH LFPB LFPG EDDF EHAM LEBL LIRF LSZH EBLG LIPR LIME LILB LSZS EDLP LFBD EIDW KJFK KSFO LIEA LSGG".into()
+        });
+        let turns = |pts: &[(f64, f64)]| -> Vec<f64> {
+            let mut out = Vec::new();
+            let mut prev: Option<f64> = None;
+            let mut last = pts[0];
+            for &q in &pts[1..] {
+                let m = 111_320.0 * last.0.to_radians().cos();
+                let d = (((q.1 - last.1) * m).powi(2) + ((q.0 - last.0) * 111_320.0).powi(2)).sqrt();
+                if d < 1.0 {
+                    continue;
+                }
+                let b = bearing_deg(last.0, last.1, q.0, q.1);
+                if let Some(p) = prev {
+                    out.push(angle_diff_deg(b, p));
+                }
+                prev = Some(b);
+                last = q;
+            }
+            out
+        };
+        let off = |q: (f64, f64), line: &[(f64, f64)]| -> f64 {
+            let m = 111_320.0 * q.0.to_radians().cos();
+            line.windows(2)
+                .map(|w| {
+                    let (ax, ay) = ((w[0].1 - q.1) * m, (w[0].0 - q.0) * 111_320.0);
+                    let (bx, by) = ((w[1].1 - q.1) * m, (w[1].0 - q.0) * 111_320.0);
+                    let (dx, dy) = (bx - ax, by - ay);
+                    let l2 = dx * dx + dy * dy;
+                    let t = if l2 < 1e-9 { 0.0 } else { (-(ax * dx + ay * dy) / l2).clamp(0.0, 1.0) };
+                    ((ax + t * dx).powi(2) + (ay + t * dy).powi(2)).sqrt()
+                })
+                .fold(f64::INFINITY, f64::min)
+        };
+        let (mut routes, mut changed, mut worse, mut smoother) = (0, 0, 0, 0);
+        let mut worst_off = 0.0_f64;
+        for icao in fields.split_whitespace() {
+            let Ok(Some(net)) = find_taxi_net(apt, icao) else { continue };
+            let Ok(runways) = find_runways(apt, icao) else { continue };
+            let mut bare = net.clone();
+            bare.paint.clear();
+            let step = (net.stands.len() / 12).max(1);
+            for st in net.stands.iter().step_by(step) {
+                for r in &runways {
+                    for (id, tlat, tlon) in [(&r.ident_a, r.lat_a, r.lon_a), (&r.ident_b, r.lat_b, r.lon_b)] {
+                        let zone = [r.ident_a.clone(), r.ident_b.clone()];
+                        let Some(raw) = bare.plan_to_runway(st.lat, st.lon, tlat, tlon, 60.0, &zone, Some(r)) else {
+                            continue;
+                        };
+                        if raw.path.len() < 2 {
+                            continue;
+                        }
+                        routes += 1;
+                        let (old, _) = ride_paint_with(&net.paint, &raw.path, &raw.seg, false);
+                        let (new, _) = ride_paint_with(&net.paint, &raw.path, &raw.seg, true);
+                        if old == new {
+                            continue;
+                        }
+                        changed += 1;
+                        let o = turns(&old).iter().fold(0.0_f64, |a, t| a.max(t.abs()));
+                        let n = turns(&new).iter().fold(0.0_f64, |a, t| a.max(t.abs()));
+                        let stray = new.iter().map(|&q| off(q, &old)).fold(0.0_f64, f64::max);
+                        worst_off = worst_off.max(stray);
+                        if n + 1.0 < o {
+                            smoother += 1;
+                        }
+                        assert_eq!(old.last(), new.last(), "{icao}: the route ends where it ended");
+                        if n > o + 1.0 || stray > 30.0 {
+                            worse += 1;
+                            println!("{icao} {} -> {id}: max vertex {o:.0} -> {n:.0}, strays {stray:.1} m", st.name);
+                        }
+                    }
+                }
+            }
+        }
+        println!(
+            "{routes} routes, {changed} changed, {smoother} smoother, {worse} sharper or astray, furthest {worst_off:.1} m from the old"
+        );
+        assert_eq!(worse, 0);
     }
 }
