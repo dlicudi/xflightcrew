@@ -250,6 +250,10 @@ pub struct Pace {
     /// The yaw rate a corner may ask, deg/s, when the profile declares one
     /// (`taxi.max_yaw_dps`); see [`Route::bend_cap_kts`].
     pub max_yaw_dps: Option<f64>,
+    /// A full-length backtrack's pace down the strip, knots, when the
+    /// profile declares one (`taxi.backtrack_kts`); else the straight pace
+    /// floored at the line-up tool's 14 kt.
+    pub backtrack: Option<f64>,
 }
 
 impl Default for Pace {
@@ -264,6 +268,7 @@ impl Default for Pace {
             brake_steer: false,
             lookahead_s: 5.0,
             max_yaw_dps: None,
+            backtrack: None,
         }
     }
 }
@@ -294,6 +299,7 @@ impl Pace {
             brake_steer: t.brake_steer,
             lookahead_s: t.lookahead_s.map_or(5.0, |v| v.clamp(3.0, 12.0)),
             max_yaw_dps: t.max_yaw_dps.map(|v| v.clamp(5.0, 60.0)),
+            backtrack: t.backtrack_kts.map(crate::tools::speedhold::clamp_taxi_target),
         }
     }
 
@@ -1436,6 +1442,34 @@ const ALIGN_TRIM_PER_DEG_S: f64 = 0.006;
 const ALIGN_TRIM_MAX: f64 = 0.12;
 const ALIGN_TRIM_TURNING_DPS: f64 = 0.5;
 const ALIGN_TRIM_MIN_KTS: f64 = 0.7;
+/// A line-up is on the centreline within this, m: past it the alignment
+/// closes the lateral too ([`LineUpAlign::step_on_line`]). The alignment
+/// stage judges the roll's first tick at 2 m (`scorecard::LINEUP_MAX_XTK_M`).
+pub const ALIGN_LATERAL_M: f64 = 1.5;
+/// ...and once closing, it closes to this before it straightens.
+const ALIGN_LATERAL_DONE_M: f64 = 0.75;
+/// The intercept onto the centreline: degrees per metre of offset past
+/// [`ALIGN_INTERCEPT_DEAD_M`], never more than [`ALIGN_INTERCEPT_MAX_DEG`].
+const ALIGN_INTERCEPT_PER_M: f64 = 6.0;
+const ALIGN_INTERCEPT_DEAD_M: f64 = 0.3;
+const ALIGN_INTERCEPT_MAX_DEG: f64 = 8.0;
+/// The runway and time kept back from a lateral closure to straighten in
+/// after it: past these it stops closing and only aligns.
+const ALIGN_LATERAL_RESERVE_M: f64 = 10.0;
+const ALIGN_LATERAL_RESERVE_S: f64 = 12.0;
+/// A closure may take the alignment this much longer than
+/// [`ALIGN_MAX_S`]: an S across 2 m at a creep is a minute's work, not forty
+/// seconds'.
+const ALIGN_LATERAL_EXTRA_S: f64 = 25.0;
+
+/// The heading offset toward the centreline for a lateral of `lat_m`
+/// (right of the centreline positive), degrees, right positive: the
+/// intercept a lateral closure flies. Pure.
+pub fn align_intercept_deg(lat_m: f64) -> f64 {
+    -lat_m.signum()
+        * ((lat_m.abs() - ALIGN_INTERCEPT_DEAD_M).max(0.0) * ALIGN_INTERCEPT_PER_M)
+            .min(ALIGN_INTERCEPT_MAX_DEG)
+}
 
 /// How far a line-up's alignment may roll, from the runway it can spare
 /// (the runway ahead less what the takeoff fit needs), never more than
@@ -1535,6 +1569,11 @@ pub struct LineUpAlign {
     pub trim: f64,
     over: bool,
     last_t: Option<f64>,
+    /// Closing a lateral past [`ALIGN_LATERAL_M`] ([`Self::step_on_line`]).
+    pub closing: bool,
+    /// Whether a lateral closure ever began (the time bound grows by
+    /// [`ALIGN_LATERAL_EXTRA_S`]).
+    pub closed_lateral: bool,
 }
 
 impl LineUpAlign {
@@ -1562,6 +1601,8 @@ impl LineUpAlign {
             trim: 0.0,
             over: false,
             last_t: None,
+            closing: false,
+            closed_lateral: false,
         }
     }
 
@@ -1578,20 +1619,70 @@ impl LineUpAlign {
         yaw_dps: f64,
         rolled_m: f64,
     ) -> AlignStep {
+        self.step_on_line(t_s, psi_true, gs_kts, yaw_dps, rolled_m, None)
+    }
+
+    /// [`Self::step`] knowing the lateral off the runway's centreline
+    /// (`lat_m`, right positive): past [`ALIGN_LATERAL_M`] the creep flies
+    /// an intercept back onto the line ([`align_intercept_deg`]) to
+    /// [`ALIGN_LATERAL_DONE_M`] and then straightens, while the runway it
+    /// may roll and the time keep [`ALIGN_LATERAL_RESERVE_M`] and
+    /// [`ALIGN_LATERAL_RESERVE_S`] back to straighten in; past them it only
+    /// aligns, as before. LILB 03 Evolution (1790740292, 2026-09-30): the
+    /// turn-round's leg two stopped 1.9 m left and 11.7 degrees off, the
+    /// alignment straightened the nose in 8 m and the roll began 2.3 m off
+    /// (the alignment stage FAIL at 2), 61.9 m of runway to spare. A
+    /// lateral inside [`ALIGN_LATERAL_M`] is left alone: the law is the
+    /// heading's alone, as before.
+    pub fn step_on_line(
+        &mut self,
+        t_s: f64,
+        psi_true: f64,
+        gs_kts: f64,
+        yaw_dps: f64,
+        rolled_m: f64,
+        lat_m: Option<f64>,
+    ) -> AlignStep {
         let t0 = *self.t0.get_or_insert(t_s);
         let dt = self.last_t.map_or(0.0, |l| (t_s - l).clamp(0.0, 1.0));
         self.last_t = Some(t_s);
-        let err = self.err_deg(psi_true);
-        let led = err - yaw_dps * ALIGN_LEAD_S;
-        let settled = gs_kts < ALIGN_SETTLED_KTS && yaw_dps.abs() < ALIGN_SETTLED_DPS;
-        if settled && err.abs() <= ALIGNED_DEG {
-            self.creeping = false;
-            return AlignStep::Done { err_deg: err };
-        }
+        let course_err = self.err_deg(psi_true);
         // The stop this speed still needs, counted against the runway.
         let v = gs_kts / MS_TO_KTS;
         let stop_m = v * ALIGN_STOP_LATENCY_S + v * v / (2.0 * ALIGN_STOP_DECEL_MS2);
-        let out_of_bounds = if t_s - t0 > ALIGN_MAX_S {
+        let max_s = if self.closed_lateral {
+            ALIGN_MAX_S + ALIGN_LATERAL_EXTRA_S
+        } else {
+            ALIGN_MAX_S
+        };
+        // A lateral closure while the runway and the time still leave room
+        // to straighten after it.
+        let room = rolled_m + stop_m + ALIGN_LATERAL_RESERVE_M < self.roll_limit_m
+            && t_s - t0 + ALIGN_LATERAL_RESERVE_S < ALIGN_MAX_S + ALIGN_LATERAL_EXTRA_S;
+        self.closing = match lat_m.filter(|l| l.is_finite()) {
+            Some(l) if room => {
+                if self.closing {
+                    l.abs() > ALIGN_LATERAL_DONE_M
+                } else {
+                    l.abs() > ALIGN_LATERAL_M
+                }
+            }
+            _ => false,
+        };
+        self.closed_lateral |= self.closing;
+        // Closing, the heading wanted is the intercept; else the course.
+        let err = if self.closing {
+            course_err + align_intercept_deg(lat_m.unwrap_or(0.0))
+        } else {
+            course_err
+        };
+        let led = err - yaw_dps * ALIGN_LEAD_S;
+        let settled = gs_kts < ALIGN_SETTLED_KTS && yaw_dps.abs() < ALIGN_SETTLED_DPS;
+        if settled && !self.closing && err.abs() <= ALIGNED_DEG {
+            self.creeping = false;
+            return AlignStep::Done { err_deg: err };
+        }
+        let out_of_bounds = if t_s - t0 > max_s {
             Some("time")
         } else if rolled_m + stop_m >= self.roll_limit_m {
             Some("rolled")
@@ -1613,7 +1704,7 @@ impl LineUpAlign {
         // close and not carried past (half the band, with hysteresis).
         let off = err.abs() > ALIGNED_DEG || led.abs() > ALIGNED_DEG;
         let close = err.abs() <= ALIGNED_DEG * 0.5 && led.abs() <= ALIGNED_DEG;
-        let want = if self.creeping { !close } else { off };
+        let want = self.closing || if self.creeping { !close } else { off };
         // ...never faster than the creep: over it, stopped until back under.
         if gs_kts > self.creep_kts + ALIGN_CREEP_OVER_KTS {
             self.over = true;
@@ -2952,6 +3043,7 @@ async fn align_on_the_runway(
     let mut start: Option<(f64, f64)> = None;
     let mut last_creep: Option<bool> = None;
     let mut last_err = 0.0_f64;
+    let mut last_lat: Option<f64> = None;
     let end = loop {
         if !ACTIVE.load(Ordering::Relaxed)
             || DRIVE_GEN.load(Ordering::SeqCst) != gen
@@ -3007,7 +3099,10 @@ async fn align_on_the_runway(
         let rolled_m = crate::autoland::haversine_nm(from.0, from.1, lat, lon) * M_PER_NM;
         let t_s = t0.elapsed().as_secs_f64() - frozen_s;
         last_err = judge.err_deg(psi);
-        let step = judge.step(t_s, psi, gs_kts, yaw, rolled_m);
+        // The lateral off the runway's centreline, when the runway is known.
+        let lat_m = fit.map(|(rwy, _)| crate::autoland::cross_track_nm(lat, lon, rwy) * M_PER_NM);
+        last_lat = lat_m;
+        let step = judge.step_on_line(t_s, psi, gs_kts, yaw, rolled_m, lat_m);
         let (bl, br, creep) = match step {
             AlignStep::Align { bl, br, creep } => (bl, br, creep),
             _ => (0.0, 0.0, false),
@@ -3016,7 +3111,8 @@ async fn align_on_the_runway(
             "autotaxi",
             serde_json::json!({"event": "line_up_align", "err": last_err, "yaw_dps": yaw,
                                "gs": gs_kts, "bl": bl, "br": br, "creep": creep,
-                               "trim": judge.trim, "rolled_m": rolled_m, "t_s": t_s}),
+                               "trim": judge.trim, "rolled_m": rolled_m, "t_s": t_s,
+                               "lat_m": lat_m, "closing": judge.closing}),
         );
         match step {
             AlignStep::Done { .. } => break AlignEnd::Aligned,
@@ -3063,6 +3159,8 @@ async fn align_on_the_runway(
         "autotaxi",
         serde_json::json!({"event": "line_up_aligned", "ok": ok, "err_deg": last_err,
                            "course": course, "creeps": creeps, "rolled_m": rolled,
+                           "lat_m": last_lat,
+                           "closed_lateral": judge.as_ref().is_some_and(|j| j.closed_lateral),
                            "secs": t0.elapsed().as_secs_f64() - frozen_s}),
     );
     end
@@ -6044,6 +6142,102 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// The alignment closes the lateral as well as the heading: the LILB 03
+    /// turn-round (1790740292, 2026-09-30) stopped its leg two 1.95 m left
+    /// of the centreline, 11.7 degrees off and swinging -2.1 deg/s at 0.84
+    /// kt with 61.9 m to spare, straightened the nose in 8 m and the roll
+    /// began 2.3 m off (alignment FAIL at 2). On the yaw plant (a standing
+    /// yaw, the Evolution's idle creep and the SR22's held one) the heading
+    /// alone ends as flown, 2 m off or more; now it ends inside 1.5 m and
+    /// within the aligned heading, inside the runway it may roll. With only
+    /// 16 m to spare there is no room to close, and it aligns as before.
+    #[test]
+    fn a_line_up_closes_the_lateral_as_well_as_the_heading() {
+        use super::yaw_plant::{signed, Plant};
+        use super::{AlignStep, LineUpAlign};
+        let course = 23.96;
+        let idle_push = |gs: f64, want: f64, tick: f64| {
+            if want > 0.0 {
+                gs + 0.2 * tick
+            } else {
+                (gs - 1.5 * tick).max(0.0)
+            }
+        };
+        let holds = |gs: f64, want: f64, tick: f64| {
+            if gs < want {
+                (gs + 0.7 * tick).min(want)
+            } else {
+                (gs - 1.5 * tick).max(want)
+            }
+        };
+        let pull = -0.025;
+        // One alignment from the logged stop; `on_line` hands it the lateral.
+        let fly = |spare: f64, gov: &dyn Fn(f64, f64, f64) -> f64, k: f64, d: f64, tick: f64, on_line: bool| {
+            let mut judge = LineUpAlign::with_spare(course, Some(spare));
+            let mut p = Plant::new(k, d, 11.68, -2.06);
+            let (mut gs, mut rolled, mut t, mut lat) = (0.84_f64, 0.0_f64, 0.0_f64, -1.95_f64);
+            let end = loop {
+                let step = judge.step_on_line(t, course - p.err, gs, p.yaw, rolled, on_line.then_some(lat));
+                match step {
+                    AlignStep::Align { bl, br, creep } => {
+                        gs = gov(gs, if creep { judge.creep_kts } else { 0.0 }, tick);
+                        let e0 = p.err;
+                        p.run(signed((bl, br)) + pull, (gs / 1.5).min(1.0), tick);
+                        let m = gs / 1.943_844 * tick;
+                        // Right of the course (a negative error) moves right.
+                        lat -= m * ((e0 + p.err) / 2.0).to_radians().sin();
+                        rolled += m;
+                    }
+                    other => break other,
+                }
+                t += tick;
+            };
+            // The caller stops it: the governor's brake from here.
+            while gs > 0.0 {
+                gs = gov(gs, 0.0, tick);
+                let m = gs / 1.943_844 * tick;
+                lat -= m * p.err.to_radians().sin();
+                rolled += m;
+            }
+            (end, lat, rolled, t, judge.closed_lateral)
+        };
+        for (name, gov) in [("Evolution", &idle_push as &dyn Fn(f64, f64, f64) -> f64), ("SR22", &holds)] {
+            for (k, d) in [(140.0, 3.0), (70.0, 1.5)] {
+                for tick in [0.3, 0.45] {
+                    let why = format!("{name} k {k} tick {tick}");
+                    let (_, lat, ..) = fly(61.9, gov, k, d, tick, false);
+                    assert!(lat.abs() > 2.0, "{why}: the heading alone, as flown: {lat:.2}");
+                    let (end, lat, rolled, t, closed) = fly(61.9, gov, k, d, tick, true);
+                    eprintln!("{why}: {end:?} lat {lat:.2} rolled {rolled:.1} m in {t:.1} s");
+                    assert!(closed, "{why}");
+                    match end {
+                        AlignStep::Done { err_deg } => {
+                            assert!(err_deg.abs() <= super::ALIGNED_DEG, "{why}: {err_deg}")
+                        }
+                        other => panic!("{why}: {other:?}"),
+                    }
+                    assert!(lat.abs() <= super::ALIGN_LATERAL_M, "{why}: {lat:.2} m off");
+                    assert!(rolled <= super::align_roll_limit_m(Some(61.9)), "{why}: {rolled:.1} m");
+                    // No room: aligned as before, never past the spare.
+                    let (end, _, rolled, ..) = fly(16.0, gov, k, d, tick, true);
+                    assert!(matches!(end, AlignStep::Done { .. }), "{why}: {end:?}");
+                    assert!(rolled <= 16.0, "{why}: rolled {rolled:.1} of 16");
+                }
+            }
+        }
+        // Inside 1.5 m the lateral is left alone: the heading's law alone.
+        let mut a = LineUpAlign::with_spare(course, Some(61.9));
+        let mut b = LineUpAlign::with_spare(course, Some(61.9));
+        for i in 0..20 {
+            let t = i as f64 * 0.4;
+            let psi = course - 8.0 + i as f64 * 0.3;
+            assert_eq!(a.step(t, psi, 1.5, 1.0, t), b.step_on_line(t, psi, 1.5, 1.0, t, Some(1.4)));
+        }
+        assert_eq!(super::align_intercept_deg(-2.3), 8.0);
+        assert!((super::align_intercept_deg(1.0) + 4.2).abs() < 1e-9);
+        assert_eq!(super::align_intercept_deg(0.2), 0.0);
     }
 
     /// With the fit already marginal the alignment pivots nearly in place:

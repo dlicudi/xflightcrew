@@ -281,6 +281,17 @@ pub struct LineUp {
 /// backtracks at its own (higher) straight-leg pace.
 const BACKTRACK_FLOOR_KTS: f64 = 14.0;
 
+/// A backtrack's pace down the strip: the airframe's declared
+/// `taxi.backtrack_kts`, else its straight-leg pace floored at
+/// [`BACKTRACK_FLOOR_KTS`]. The Evolution declares 10: at 14 its governor
+/// wound the lever to 0.28 (371 ft-lb) for the build, the PT6's torque yawed
+/// it left and the idle in full beta held 15 to 16 kt, 3.6 m off LILB's 15 m
+/// strip (1790740292, 2026-09-30, #196). Pure.
+pub fn backtrack_kts(pace: &autotaxi::Pace) -> f64 {
+    pace.backtrack
+        .unwrap_or_else(|| pace.straight.max(BACKTRACK_FLOOR_KTS))
+}
+
 #[async_trait]
 impl Tool for LineUp {
     fn name(&self) -> &str {
@@ -451,7 +462,7 @@ impl Tool for LineUp {
         });
         // A backtrack taxis briskly down the strip; a plain line-up creeps.
         let drive_kts = if backtracking {
-            self.pace.straight.max(BACKTRACK_FLOOR_KTS)
+            backtrack_kts(&self.pace)
         } else {
             self.pace.turn
         };
@@ -606,5 +617,22 @@ mod tests {
             sites(&registry).iter().all(|&b| !b),
             "the spoken tool stays forgiving"
         );
+    }
+
+    /// A backtrack's pace is the airframe's: the Evolution declares 10 kt
+    /// (LILB 03, 1790740292, 2026-09-30: 14 ran it to 16 kt, 3.6 m off the
+    /// 15 m strip), every other profile keeps its straight pace floored at
+    /// 14 (the SR22's 14, the 737's 18), as before.
+    #[test]
+    fn a_backtrack_runs_at_the_airframes_pace() {
+        let pace = |id: &str| {
+            let p = crate::aircraft::load(id).expect("the profile loads");
+            crate::autotaxi::Pace::from_profile(p.taxi.as_ref())
+        };
+        assert_eq!(super::backtrack_kts(&pace("lancair_evolution")), 10.0);
+        assert_eq!(super::backtrack_kts(&pace("cirrus_sr22")), 14.0);
+        assert_eq!(super::backtrack_kts(&pace("boeing_737_800")), 18.0);
+        assert_eq!(super::backtrack_kts(&pace("airbus_a330_300")), 18.0);
+        assert_eq!(super::backtrack_kts(&crate::autotaxi::Pace::default()), 14.0);
     }
 }
