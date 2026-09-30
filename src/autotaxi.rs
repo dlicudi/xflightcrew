@@ -5223,6 +5223,198 @@ mod tests {
         assert!(worst_turn < 15.0, "a lead-on runs one way: {worst_turn:.0} degrees at one vertex");
     }
 
+    /// #194's corner, LEMG Quebec onto Delta, from the install: the network
+    /// (the Quebec node before, the node on Delta's centreline, the Delta
+    /// node after) and the drawn lines near it: the fillet right, the two
+    /// halves of the fillet left, Quebec, Delta.
+    const LEMG_QD_RAW: [(f64, f64); 3] = [(36.683599, -4.506806), (36.687126, -4.502939), (36.688841, -4.506956)];
+    #[rustfmt::skip]
+    const LEMG_QD_PAINT: [&[(f64, f64)]; 5] = [
+        &[(36.68680750, -4.50327940), (36.68681270, -4.50327312), (36.68682681, -4.50325461), (36.68684765, -4.50322436), (36.68687299, -4.50318286), (36.68690063, -4.50313061), (36.68692837, -4.50306808), (36.68695399, -4.50299578), (36.68697530, -4.50291420), (36.68698764, -4.50282780), (36.68698962, -4.50274279), (36.68698394, -4.50266229), (36.68697326, -4.50258944), (36.68696029, -4.50252734), (36.68694770, -4.50247912), (36.68693817, -4.50244790), (36.68693440, -4.50243680)],
+        &[(36.68734910, -4.50342280), (36.68734506, -4.50341464), (36.68733313, -4.50339276), (36.68731358, -4.50336104), (36.68728668, -4.50332335), (36.68725269, -4.50328358), (36.68721191, -4.50324561), (36.68716458, -4.50321332), (36.68711100, -4.50319060)],
+        &[(36.68711100, -4.50319060), (36.68704602, -4.50318040), (36.68698726, -4.50318389), (36.68693547, -4.50319725), (36.68689141, -4.50321670), (36.68685583, -4.50323844), (36.68682948, -4.50325866), (36.68681312, -4.50327358), (36.68680750, -4.50327940)],
+        &[(36.68332550, -4.50710330), (36.68386960, -4.50650580), (36.68680750, -4.50327940)],
+        &[(36.68320300, -4.49356340), (36.68693440, -4.50243680), (36.68734910, -4.50342280), (36.68877120, -4.50680470), (36.68932580, -4.50812360), (36.68958210, -4.50873320)],
+    ];
+
+    /// The route both sorties drove through that corner (each planned the
+    /// same 3,614.9 m), as ridden before the fillets: 815.9 to 602.2 m to
+    /// go, Quebec 041.4, then 36, 21, 19, 69, 114, 2, 41 and 318 degrees in
+    /// seven legs, Delta 297.7.
+    #[rustfmt::skip]
+    const LEMG_QD_FLOWN: [(f64, f64); 44] = [
+        (36.6863838, -4.5037447), (36.6864174, -4.5037078), (36.6864509, -4.5036710), (36.6864845, -4.5036341),
+        (36.6865181, -4.5035972), (36.6865516, -4.5035604), (36.6865852, -4.5035235), (36.6866188, -4.5034867),
+        (36.6866523, -4.5034498), (36.6866859, -4.5034129), (36.6867195, -4.5033761), (36.6867530, -4.5033392),
+        (36.6867866, -4.5033023), (36.6868075, -4.5032794), (36.6868573, -4.5032336), (36.6868959, -4.5032147),
+        (36.6869351, -4.5031974), (36.6869580, -4.5031231), (36.6869333, -4.5030542), (36.6870252, -4.5030495),
+        (36.6870588, -4.5030127), (36.6870924, -4.5029758), (36.6871260, -4.5029390), (36.6871623, -4.5029787),
+        (36.6871832, -4.5030284), (36.6872042, -4.5030782), (36.6872251, -4.5031280), (36.6872460, -4.5031777),
+        (36.6872669, -4.5032275), (36.6872879, -4.5032772), (36.6873088, -4.5033270), (36.6873297, -4.5033767),
+        (36.6873506, -4.5034265), (36.6873716, -4.5034762), (36.6873925, -4.5035260), (36.6874134, -4.5035757),
+        (36.6874343, -4.5036255), (36.6874553, -4.5036753), (36.6874762, -4.5037250), (36.6874971, -4.5037748),
+        (36.6875180, -4.5038245), (36.6875390, -4.5038743), (36.6875599, -4.5039240), (36.6875808, -4.5039738),
+    ];
+
+    /// The Citation X's nosewheel, fitted to the drive ticks of both #194
+    /// sorties (iMac 2026-09-30): the yaw rate goes to 8.5 deg/s per m/s of
+    /// groundspeed per unit of steer, capped at 15 deg/s, through a 1.3 s
+    /// lag (1.14 deg/s rms against the logged, filtered rate; no transport
+    /// delay fitted better). At 3 kt full lock is 13 deg/s, a 6.8 m radius.
+    struct CitationNose {
+        r: f64,
+    }
+    impl CitationNose {
+        const K_DPS_PER_MS: f64 = 8.5;
+        const MAX_DPS: f64 = 15.0;
+        const TAU_S: f64 = 1.3;
+        fn step(&mut self, steer: f64, v_ms: f64, dt: f64) -> f64 {
+            let want = (Self::K_DPS_PER_MS * v_ms * steer).clamp(-Self::MAX_DPS, Self::MAX_DPS);
+            self.r += (want - self.r) * (dt / Self::TAU_S).min(1.0);
+            self.r
+        }
+    }
+
+    /// The drive's law, tick by tick as `drive` runs it on a linked nose
+    /// (no brake steering), with the Citation's own pace, through
+    /// [`CitationNose`], from `start_kts` on the route's first point.
+    /// Returns the scorer's verdict: (max cut inside a vertex, max off the
+    /// line).
+    fn fly_citation(path: &[(f64, f64)], start_kts: f64) -> (f64, f64) {
+        use crate::scorecard::{LineJudge, CORNER_TURN_DPS};
+        let pace = Pace::from_profile(crate::aircraft::load("citation_x").expect("citation").taxi.as_ref());
+        assert!(!pace.brake_steer);
+        let watch = TaxiWatch {
+            path: path.to_vec(),
+            via: String::new(),
+            seg: vec![(String::new(), false); path.len() - 1],
+            holding_point: String::new(),
+            lead_on: Vec::new(),
+        };
+        let mut route = Route::build(&watch).expect("route");
+        route.pace = pace;
+        let dt = 0.25;
+        let (mut x, mut y) = (0.0_f64, 0.0_f64);
+        let mut psi = taxi_guide::bearing(route.pts[0], route.pts[1]);
+        let mut v = start_kts / MS_TO_KTS;
+        let mut plant = CitationNose { r: 0.0 };
+        let (mut yaw, mut prev_psi, mut prev_steer) = (0.0_f64, psi, 0.0_f64);
+        let mut trim = StraightTrim::default();
+        let mut turn_dir = None;
+        let mut judge = LineJudge::default();
+        let end_m = route.total_m() - 40.0;
+        let m_lon = 111_320.0 * path[0].0.to_radians().cos();
+        for i in 0..(600.0 / dt) as usize {
+            let t = i as f64 * dt;
+            let gs = v * MS_TO_KTS;
+            let (lat, lon) = (path[0].0 + y / 111_320.0, path[0].1 + x / m_lon);
+            let (progress, offset) = route.fix_signed(lat, lon).expect("a fix");
+            if progress > end_m {
+                break;
+            }
+            let remaining = route.remaining(progress);
+            let look = steer_look_m(&pace, gs, route.route_turn_rate_dps(progress, BEND_PROBE_M, gs), remaining, false);
+            let err = committed_err(route.heading_err_deg(lat, lon, psi, progress, look), &mut turn_dir);
+            let route_turn = route.route_turn_rate_dps(progress, look, gs);
+            let raw = taxi_guide::angle_diff(psi, prev_psi) / dt;
+            prev_psi = psi;
+            yaw = yaw * 0.5 + raw.clamp(-90.0, 90.0) * 0.5;
+            let tr = trim.step(offset, route_turn, gs, false, remaining, dt);
+            let want = stop_straighten(
+                (steer_cmd_with(damped_err_deg(err, yaw, route_turn, pace.steer_lead_s), pace.steer_full_deg) + tr)
+                    .clamp(-1.0, 1.0)
+                    * steer_authority(gs),
+                remaining,
+                gs,
+            );
+            let steer = slew_steer(prev_steer, want, pace.steer_slew_per_s, dt);
+            prev_steer = steer;
+            let asked = (route_turn.abs() >= CORNER_TURN_DPS).then(|| route_turn.signum());
+            let cutting = judge.corner(t, gs, offset, Some(remaining), asked, yaw);
+            judge.judge(offset, cutting);
+            let sched = schedule_kts(pace.straight, &route, progress, gs).min(pace.track_cap_kts(offset.abs(), err));
+            v = (v + (sched / MS_TO_KTS - v).clamp(-0.7 * dt, 0.5 * dt)).max(0.0);
+            let r = plant.step(steer, v, dt);
+            psi = (psi + r * dt).rem_euclid(360.0);
+            x += v * psi.to_radians().sin() * dt;
+            y += v * psi.to_radians().cos() * dt;
+        }
+        judge.flush();
+        (judge.max_cut, judge.max_lat)
+    }
+
+    /// #194, LEMG (Citation X, sorties 1790734216 and 1790738786, iMac
+    /// 2026-09-30): the taxi failed 4.6 and 4.8 m off the line at Quebec
+    /// onto Delta, 700 to 740 m to go. The corner as ridden was a jog: the
+    /// drive chased it right at 17 deg/s of route turn, the route then asked
+    /// -13, and at 3 kt the aircraft swung 4.6 m outside the turn back (err
+    /// -12.6, steer -0.42, the P law's full answer). The fitted nose through
+    /// the drive's own law fails the flown route, and on the fillet the ride
+    /// now takes it stays inside the 3 m line and the 5 m cut.
+    #[test]
+    fn the_citation_turns_quebec_onto_delta_on_the_line() {
+        let (flown_cut, flown_lat) = fly_citation(&LEMG_QD_FLOWN, 10.0);
+        let paint: Vec<Vec<(f64, f64)>> = LEMG_QD_PAINT.iter().map(|l| l.to_vec()).collect();
+        let seg = vec![("Q".to_string(), false), ("D".to_string(), false)];
+        let (ridden, _) = atc::nav::ride_paint(&paint, &LEMG_QD_RAW, &seg);
+        // From 150 m up Quebec to 150 m along Delta.
+        let node = LEMG_QD_RAW[1];
+        let geo = taxi_guide::Geo::new(node.0);
+        let near: Vec<(f64, f64)> =
+            ridden.iter().copied().filter(|&p| taxi_guide::dist(geo.to_m(node, p), (0.0, 0.0)) < 150.0).collect();
+        let (cut, lat) = fly_citation(&near, 10.0);
+        println!("flown {flown_lat:.2} m off, {flown_cut:.2} cut; fillet {lat:.2} off, {cut:.2} cut");
+        assert!(
+            flown_lat > crate::scorecard::TAXI_MAX_LAT_M || flown_cut > crate::scorecard::TAXI_MAX_CUT_M,
+            "the flown route fails as it did: {flown_lat:.1} m off, {flown_cut:.1} m cut"
+        );
+        assert!(lat <= crate::scorecard::TAXI_MAX_LAT_M, "{lat:.2} m off the line");
+        assert!(cut <= crate::scorecard::TAXI_MAX_CUT_M, "{cut:.2} m inside");
+    }
+
+    /// The whole #194 route from the install: the corners the planner cut
+    /// across a drawn fillet (Golf 4 onto Alpha, Bravo onto Quebec, Quebec
+    /// onto Delta) are ridden round it. `cargo test -- --ignored live_lemg_194`
+    #[test]
+    #[ignore] // needs the real X-Plane install
+    fn live_lemg_194_route_rides_its_fillets() {
+        let apt = &crate::tools::autoland::xplane_path("Global Scenery/Global Airports/Earth nav data/apt.dat");
+        let Ok(Some(net)) = atc::nav::find_taxi_net(apt, "LEMG") else {
+            return;
+        };
+        let runways = atc::nav::find_runways(apt, "LEMG").unwrap();
+        let strip = runways.iter().find(|r| r.ident_a == "12" || r.ident_b == "12").expect("12/30");
+        let (tlat, tlon) = if strip.ident_a == "12" { (strip.lat_a, strip.lon_a) } else { (strip.lat_b, strip.lon_b) };
+        let standoff = (strip.width_m / 2.0 + 30.0).max(atc::nav::HOLD_SHORT_STANDOFF_M);
+        let zone = [strip.ident_a.clone(), strip.ident_b.clone()];
+        // The gate at the taxi request, both sorties.
+        let plan = net
+            .plan_to_runway(36.6733571, -4.4894417, tlat, tlon, standoff, &zone, Some(strip))
+            .expect("a route");
+        assert_eq!(plan.holding_point, "HW1");
+        let geo = taxi_guide::Geo::new(plan.path[0].0);
+        let pts: Vec<(f64, f64)> = plan.path.iter().map(|&p| geo.to_m(plan.path[0], p)).collect();
+        let mut prev: Option<f64> = None;
+        let mut sharp = 0;
+        for w in pts.windows(2) {
+            if taxi_guide::dist(w[0], w[1]) < 0.5 {
+                continue;
+            }
+            let b = taxi_guide::bearing(w[0], w[1]);
+            if prev.is_some_and(|p| taxi_guide::angle_diff(b, p).abs() > 40.0) {
+                sharp += 1;
+            }
+            prev = Some(b);
+        }
+        // Before: 12 vertices past 40 degrees (Golf 4 to Alpha -50, +84;
+        // Bravo to Quebec -42, +89; Quebec to Delta +49, +45, -112, +39 near
+        // enough, -83; the stand, Alpha to Golf 9, Golf 9 to Bravo). After:
+        // the stand, Alpha to Golf 9 and Golf 9 to Bravo, drawn without a
+        // fillet the corner turns on.
+        println!("{sharp} vertices past 40 degrees");
+        assert!(sharp <= 3, "{sharp}");
+    }
+
     /// #60, LEMG 31 (sorties 1790584715 and 1790585651, 2026-09-28): the taxi
     /// rolled 7.4 m through its holding stop, and the line-up path ran from
     /// the aircraft BACK to the hold node and forward again. At rest the

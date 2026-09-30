@@ -11819,3 +11819,47 @@ Next Evolution takeoff: `roll` ticks from 40 kt with `steer` near 0.51 x `trq_ft
 few hundredths, `err` inside 3 degrees and not standing on one side, `trim` small (under 0.1),
 `xtk_m` inside 3 m to rotation; if the nose still stands to one side with `steer` under the cap,
 `power_steer_per_kftlb` is the number to move. Offline only.
+
+## 2026-09-30: a taxi corner the network cut across a drawn fillet turns on the fillet (#194)
+
+1790734216-full_auto and 1790738786-full_auto (Citation X, LEMG gate to HW1 for 12, iMac
+2026-09-30) failed the taxi 4.6 and 4.8 m off the line at the same place, 700 to 740 m to go:
+Quebec onto Delta. Not a gentle curve and not a soft gain: the ROUTE jogged. LEMG's network puts
+the Quebec/Delta node on Delta's centreline, 47 m past the end of Quebec's paint, and the paint
+turns there on two fillets, one each way (lines 158 then 157 left, 156 right). The sideways snap
+(`ride_paint`, 8 m, 25 degrees) took the samples in those 47 m onto whichever fillet left closest,
+right, left, right, and the ridden route ran 36, 21, 19, 69, 114, 2, 41 and 318 degrees in seven
+legs of 5 to 10 m. The drive chased the jog right (`turn_dps` +17), the route then asked -13, and
+at 3 kt the aircraft swung outside the turn back: `err` -12.6 with `steer` -0.42 is the P law's
+whole answer (err / 30 at full authority, the rate lead crediting the route's own turn), `lat_m`
+3.06 to 4.61. Both sorties' ticks are the same to a tenth.
+
+`nav::ride_corner_fillets`, run inside `ride_paint` before `fill_paint_gaps`: at each network corner
+of 30 degrees or more, the samples between a sample on the paint before it and one on the paint
+after it are replaced by the drawn lines JOINING the two end to end (an end within 1 m of the next
+line), the shortest chain of at most four that turns the corner's way throughout (never back more
+than 10 degrees), leaves and arrives within 45 degrees of the legs, lies inside the corner
+(within 8 m of the triangle its ends make with the node), is no longer than 1.5 times the gap, and
+meets the samples either side no sharper than 30 degrees or the old span. The other fillet runs
+outside the node and fails the triangle. No chain, and the corner is as the snap made it; runway
+legs never. The whole #194 route: 12 vertices past 40 degrees before, 3 after (Golf 4 onto Alpha,
+Bravo onto Quebec and Quebec onto Delta all ride fillets now; the stand, Alpha onto Golf 9 and Golf
+9 onto Bravo have no fillet to ride); 3,614.9 m became 3,545.8.
+
+The Citation's nosewheel fitted to both sorties' drive ticks: 8.5 deg/s per m/s per unit of steer,
+capped at 15 deg/s, 1.3 s lag (1.14 deg/s rms). Through the drive's own law on the flown corner it
+fails (3.2 m off, 3.96 m cut; flown 4.6 and 4.1); on the fillet 2.07 m off, no vertex cut. Sweep
+over 24 fields (stands to every runway end, 1,504 routes): 491 changed, 115 with a smaller sharpest
+vertex, none sharper, none more than 16.7 m from the old route, every one ending where it did.
+EGKK J to 08R (the 737's 1790713378 and 1790726972, 2.9 and 3.0 m) plans the same route to the
+metre, so the 737 flies it unchanged; no A330 taxi is on file (its sorties are runway starts). The
+drive law itself is untouched.
+
+Tests `a_corner_rides_the_fillet_it_turns_on`, `a_corner_without_a_fillet_is_left_as_the_snap_made_it`,
+`lemg_quebec_onto_delta_rides_the_left_fillet` (atc), `the_citation_turns_quebec_onto_delta_on_the_line`;
+ignored `real_install_fillet_sweep`, `live_lemg_194_route_rides_its_fillets`.
+
+Next Citation LEMG taxi: `drive` ticks 640 to 720 m to go (the route is 69 m shorter now, so the
+corner sits near 650 to 720) with `turn_dps` one sign (left) through the corner, no +17 then -13,
+`lat_m` inside 3 m, `remaining_m` without the 4 to 7 m jumps; the stage's `max_lat_m` under 3.
+Offline only.
