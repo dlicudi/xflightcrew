@@ -1780,8 +1780,13 @@ pub fn run_autoland_scoped(
             // whether the intercom said "going around" for it.
             let mut balk_watch: Option<BalkWatch> = None;
             let mut spoke_going_around = false;
-            // When the current missed approach started, for the runaway guard.
-            let mut missed_since: Option<std::time::Instant> = None;
+            // The current missed approach's (or pattern's) progress, judged
+            // by the ground it makes (`reversal::MissedWatch`), on a clock of
+            // this loop's own; and the speed the pattern began at, which
+            // sizes its track to go.
+            let mut missed_watch: Option<crate::reversal::MissedWatch> = None;
+            let watch_epoch = std::time::Instant::now();
+            let mut pattern_gs_kts = 0.0_f64;
             let mut gear_down = false;
             let mut landing_config_done = false;
             // The flap the wing is flying on at the arm: the schedule's first
@@ -2922,6 +2927,7 @@ pub fn run_autoland_scoped(
                                     go_around.hold_reposition();
                                 }
                                 reversal_began = true;
+                                pattern_gs_kts = gs_kts;
                                 if matches!(
                                     plan.why,
                                     "switched_side_for_terrain" | "raised_for_terrain"
@@ -3119,21 +3125,89 @@ pub fn run_autoland_scoped(
                 if missed.is_none() {
                     said_going_around = false;
                     spoke_going_around = false;
-                    missed_since = None;
-                } else if missed_since.is_none() {
-                    missed_since = Some(std::time::Instant::now());
                 }
-                // A missed approach that never ends is its own emergency.
-                if missed_since
-                    .is_some_and(|t| t.elapsed().as_secs_f64() > MAX_MISSED_APPROACH_SECS)
-                {
+                // A missed approach (or a pattern) that stops getting anywhere
+                // is its own emergency, judged by the ground it makes, never a
+                // flat clock (`reversal::MissedWatch`): the stage's measure
+                // (feet to climb, the pattern's track to go, an extended
+                // downwind's height) stepping at a rate for the airframe's
+                // speed, legs sequenced, inside an outer bound from the plan.
+                // The flat 600 s gave up on an SR22 on the line, 90 ft under
+                // the path it was about to join, on LEMG 13's terrain-raised
+                // pattern (iMac 2026-09-30, sortie 1790775809-approach).
+                let watched = if reversal.is_some() || hold.is_some() || missed.is_some() {
+                    let progress = match (reversal.as_ref(), hold.as_ref()) {
+                        (Some(rev), _) => {
+                            let join = join_point_nm(rev.platform_ft, rwy.elev_ft);
+                            let end = crate::reversal::pattern_end_nm(
+                                rev.platform_ft,
+                                rwy.elev_ft,
+                                gp_ft_per_nm(),
+                                join,
+                            );
+                            let to_go = crate::reversal::to_go_nm(
+                                rev,
+                                along_nm,
+                                xtk_now,
+                                pattern_gs_kts,
+                                join,
+                                end,
+                            );
+                            let above = alt - rev.platform_ft;
+                            crate::reversal::Progress::Pattern {
+                                n: reversals_flown,
+                                leg: rev.leg,
+                                high: rev.high,
+                                to_go_nm: to_go,
+                                above_ft: above,
+                                budget_s: crate::reversal::pattern_budget_s(
+                                    to_go,
+                                    pattern_gs_kts,
+                                    above,
+                                    crate::procedure::descent_fpm(),
+                                ),
+                                gs_kts: pattern_gs_kts,
+                            }
+                        }
+                        (None, Some(h)) if h.refused => {
+                            crate::reversal::Progress::Hold { to_go_ft: h.alt_ft - alt }
+                        }
+                        _ if missed == Some(MissedStage::Climb) => crate::reversal::Progress::Climb {
+                            to_go_ft: GO_AROUND_TURN_AGL_FT - radio_ft,
+                        },
+                        _ => crate::reversal::Progress::Waiting,
+                    };
+                    let t = watch_epoch.elapsed().as_secs_f64();
+                    let w = missed_watch.get_or_insert_with(|| crate::reversal::MissedWatch::start(t));
+                    if let Some(stage) = w.note(t, progress) {
+                        let (to_go_nm, leg) = match progress {
+                            crate::reversal::Progress::Pattern { to_go_nm, leg, .. } => {
+                                (Some(to_go_nm), Some(leg.word()))
+                            }
+                            _ => (None, None),
+                        };
+                        crate::blackbox::record(
+                            "autoland",
+                            serde_json::json!({"event": "missed_progress", "stage": stage,
+                                "missed": missed.is_some(), "to_go_nm": to_go_nm, "leg": leg,
+                                "gs": gs_kts, "pattern_gs": pattern_gs_kts,
+                                "budget_s": w.budget_left_s(t), "alt": alt, "radio": radio_ft,
+                                "dist": raw.dist_nm}),
+                        );
+                    }
+                    w.verdict(t).map(|v| (v, progress, w.stalled_s(t), w.budget_left_s(t)))
+                } else {
+                    missed_watch = None;
+                    None
+                };
+                if let Some((verdict, progress, stalled_s, budget_left_s)) = watched {
                     // A give-up must hand back a FLYABLE aircraft. The balked
                     // landing left gear down and landing flap out, and a flat
                     // 0.5 throttle cannot hold level flight dirty: the Baron
                     // decayed 110 to 80 kt at -900 fpm in the thirty seconds
                     // after the old handback (EGHI, 2026-08-02). Climb power,
-                    // VS dial zeroed — the AP is already holding heading — and
-                    // the line says what is actually held.
+                    // the VS dial zeroed (the AP is already holding heading),
+                    // and the line says what is actually held.
                     gave_up = true;
                     let thr_dref = throttle_dref();
                     let _ = tokio::join!(
@@ -3141,14 +3215,24 @@ pub fn run_autoland_scoped(
                         xp.set_float(VS_DIAL, 0.0),
                     );
                     announce(
-                        "I can't get us back round for another approach. Your aircraft — \
-                         the autopilot is holding heading and altitude, gear is down."
-                            .into(),
+                        format!(
+                            "I can't get us back round for another approach. Your aircraft. \
+                             The autopilot is holding heading and altitude{}.",
+                            if gear_down { ", gear is down" } else { "" }
+                        ),
                         Priority::Warning,
                     );
+                    let to_go_nm = match progress {
+                        crate::reversal::Progress::Pattern { to_go_nm, .. } => Some(to_go_nm),
+                        _ => None,
+                    };
                     crate::blackbox::record(
                         "autoland",
-                        serde_json::json!({"event": "give_up", "reason": "missed_approach_timeout"}),
+                        serde_json::json!({"event": "give_up", "reason": verdict.reason(),
+                            "stage": progress.word(), "to_go_nm": to_go_nm,
+                            "stalled_s": stalled_s, "budget_left_s": budget_left_s,
+                            "missed": missed.is_some(), "leg": reversal.map(|r| r.leg.word()),
+                            "alt": alt, "radio": radio_ft, "dist": raw.dist_nm, "gs": gs_kts}),
                     );
                     break;
                 }
@@ -7151,17 +7235,13 @@ pub struct GoAroundLatch {
 /// Give up (level off, hand to the pilot) after this many go-arounds on one
 /// approach rather than loop a missed approach until the fuel runs out.
 pub const MAX_GO_AROUNDS: u32 = 2;
-/// ...and give up on a single missed approach that has run this long. The
-/// counter above cannot catch a lost reposition because a second go-around
-/// needs another approach to fail first. But the bound must be LONGER than
-/// the flight the reposition itself commands: climb straight ahead to 800 ft,
-/// turn back, overfly the field, and fly out to a join point ~6 nm on the
-/// approach side — at a piston twin's 110 kt that is comfortably over five
-/// minutes, and the old 300 s expired with the aircraft mid-leg at 3.8 nm,
-/// compliant, pointing away from the field, which the give-up then handed to
-/// the pilot as-is (EGHI, 2026-08-02). Ten minutes still bounds a genuinely
-/// lost missed approach well inside fuel margins.
-pub const MAX_MISSED_APPROACH_SECS: f64 = 600.0;
+// The counter above cannot catch a lost reposition, because a second
+// go-around needs another approach to fail first. A single missed approach
+// is given up when it stops making progress (`reversal::MissedWatch`,
+// 2026-09-30), never on a flat clock: 300 s expired with EGHI's Baron
+// compliant mid-leg (2026-08-02), and the 600 s that replaced it gave up an
+// SR22 on LEMG 13's terrain-raised pattern with the path a few seconds ahead
+// (iMac 2026-09-30).
 
 impl GoAroundLatch {
     pub fn new() -> Self {

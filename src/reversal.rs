@@ -847,6 +847,317 @@ pub async fn plan(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Progress (2026-09-30): a missed approach and its pattern are judged by the
+// ground they make, never a flat clock, as the taxi is
+// (`autotaxi::ProgressWatch`).
+//
+// LEMG 13, iMac 2026-09-30 (sortie 1790775809-approach, SR22): the
+// stabilised gate sent it round at 734 ft, the reversal planned the
+// terrain-raised right-hand pattern at 2,895 ft (join point 10.3 nm), and the
+// SR22 flew it as planned: 10 nm of downwind at 90 kt, base, inbound on the
+// line at 9.2 nm, 90 ft under the path it was about to join. The flat 600 s
+// (`MAX_MISSED_APPROACH_SECS`) expired there, "missed_approach_timeout", and
+// handed a level aircraft to nobody in an unattended run. A slow single on a
+// big pattern cannot finish inside a flat clock; a jet could loiter
+// uselessly in it for ten minutes.
+// ---------------------------------------------------------------------------
+
+/// A pattern is stuck when its track to go has not shrunk by a step in this
+/// long, s. Two minutes: the 180 degree turn onto the downwind trades along
+/// track for lateral and nets little (the SR22's first step took 60 s).
+pub const PATTERN_STALL_S: f64 = 120.0;
+/// ...a step being this fraction of what the pattern's speed flies in that
+/// time: a quarter, so a 40 kt headwind on a 90 kt downwind still progresses.
+pub const PATTERN_PROGRESS_FRAC: f64 = 0.25;
+/// A climb (the go-around's, or a refused pattern's hold) or an extended
+/// downwind's descent is stuck with no 100 ft gained or lost in 90 s.
+pub const HEIGHT_STEP_FT: f64 = 100.0;
+pub const HEIGHT_STALL_S: f64 = 90.0;
+/// Waiting for the pattern's plan (the probe answers in seconds; a stale
+/// one is asked again after a minute): two tries.
+pub const PLAN_WAIT_S: f64 = 150.0;
+/// A pattern's outer bound: its planned track at the speed it began at, plus
+/// the height above its platform at the pattern's descent, this many times
+/// over, plus [`PATTERN_BUDGET_SLACK_S`].
+pub const PATTERN_BUDGET_MARGIN: f64 = 1.5;
+pub const PATTERN_BUDGET_SLACK_S: f64 = 180.0;
+/// A climb's outer bound is its height at this rate, the margin and slack.
+pub const CLIMB_BUDGET_FPM: f64 = 300.0;
+/// A gap this long between two notes is a frozen sim (pause, replay: the
+/// loop skips its tick): the clocks stand still through it.
+pub const FROZEN_GAP_S: f64 = 5.0;
+
+/// Where the pattern ends along the centreline, nm: where the glidepath
+/// comes down to the platform ([`path_joined`]'s lower edge), never beyond
+/// the join point. Pure.
+pub fn pattern_end_nm(platform_ft: f64, elev_ft: f64, gp_ft_per_nm: f64, join_nm: f64) -> f64 {
+    ((platform_ft + PATH_JOIN_BELOW_FT - elev_ft) / gp_ft_per_nm.max(1.0))
+        .min(join_nm)
+        .max(0.0)
+}
+
+/// The track still to fly round the pattern to its end, nm: the rest of the
+/// downwind out to the base and back in along the final to `end_nm`, and the
+/// lateral legs out to the downwind line and back to the centreline. Sized
+/// at `sized_gs_kts`, the speed the pattern began at (the live speed moves
+/// the radius a little every tick; the pattern's size does not). An
+/// extended downwind grows this by what it flies, so its progress is the
+/// height it loses instead ([`Progress::Pattern`] `high`). Pure.
+pub fn to_go_nm(
+    rev: &Reversal,
+    along_nm: f64,
+    xtk_nm: f64,
+    sized_gs_kts: f64,
+    join_nm: f64,
+    end_nm: f64,
+) -> f64 {
+    let r = sizing_radius_nm(sized_gs_kts);
+    let offset = OFFSET_RADII * r;
+    let base_along = join_nm + BASE_BEYOND_JOIN_NM + r;
+    let own = xtk_nm * rev.side;
+    match rev.leg {
+        Leg::Outbound => {
+            (base_along - along_nm).max(0.0)
+                + (base_along.max(along_nm) - end_nm).max(0.0)
+                + (offset - own).abs()
+                + offset
+        }
+        Leg::Base => own.max(0.0) + (along_nm - end_nm).max(0.0),
+        // Not clamped at the end: an inbound leg flown on past where the
+        // path should have met it (flown high) still closes on the runway,
+        // and that is still progress.
+        Leg::Inbound => xtk_nm.abs() + (along_nm.max(0.0) - end_nm),
+    }
+}
+
+/// A pattern's outer bound, s: `to_go_nm` at `gs_kts` (floored at 60 kt)
+/// plus the height above the platform at the pattern's descent (an extended
+/// downwind), times [`PATTERN_BUDGET_MARGIN`], plus the slack. Pure.
+pub fn pattern_budget_s(
+    to_go_nm: f64,
+    gs_kts: f64,
+    above_platform_ft: f64,
+    enroute_descent_fpm: f64,
+) -> f64 {
+    let track_s = to_go_nm.max(0.0) / gs_kts.max(60.0) * 3600.0;
+    let above = above_platform_ft.max(0.0);
+    let height_s = above / pattern_descent_fpm(above, enroute_descent_fpm) * 60.0;
+    (track_s + height_s) * PATTERN_BUDGET_MARGIN + PATTERN_BUDGET_SLACK_S
+}
+
+/// A climb's outer bound, s. Pure.
+pub fn climb_budget_s(to_go_ft: f64) -> f64 {
+    to_go_ft.max(0.0) / CLIMB_BUDGET_FPM * 60.0 * PATTERN_BUDGET_MARGIN + PATTERN_BUDGET_SLACK_S
+}
+
+/// What the missed approach is doing this tick, and the measure of how far
+/// it still has to go.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Progress {
+    /// The go-around's straight-ahead climb: feet still to climb before the
+    /// turn.
+    Climb { to_go_ft: f64 },
+    /// A refused pattern's hold: feet still to climb to it.
+    Hold { to_go_ft: f64 },
+    /// Straight ahead while the pattern is planned.
+    Waiting,
+    /// Pattern `n` (the loop's count) on `leg`: the track to go, or while
+    /// `high` (an extended downwind) the height above its platform. Its
+    /// budget and the speed it began at are read on its first tick.
+    Pattern {
+        n: u32,
+        leg: Leg,
+        high: bool,
+        to_go_nm: f64,
+        above_ft: f64,
+        budget_s: f64,
+        gs_kts: f64,
+    },
+}
+
+impl Progress {
+    pub fn word(&self) -> &'static str {
+        match self {
+            Progress::Climb { .. } => "climb",
+            Progress::Hold { .. } => "hold",
+            Progress::Waiting => "waiting",
+            Progress::Pattern { .. } => "pattern",
+        }
+    }
+}
+
+fn leg_rank(leg: Leg) -> u8 {
+    match leg {
+        Leg::Outbound => 0,
+        Leg::Base => 1,
+        Leg::Inbound => 2,
+    }
+}
+
+/// Why a missed approach was given up.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Verdict {
+    /// No progress for its stage's stall time.
+    Stalled,
+    /// Past its stage's outer bound.
+    OverBudget,
+}
+
+impl Verdict {
+    pub fn reason(self) -> &'static str {
+        match self {
+            Verdict::Stalled => "missed_approach_stalled",
+            Verdict::OverBudget => "missed_approach_over_budget",
+        }
+    }
+}
+
+/// The missed approach's (and a pattern's) progress watch. Progress is a
+/// step off the stage's measure (feet to climb, track to go, height above an
+/// extended downwind's platform), a leg sequenced, or a new stage; each
+/// stage sets its own outer bound as it begins. Clock injected, seconds.
+#[derive(Debug, Clone)]
+pub struct MissedWatch {
+    stage: Option<&'static str>,
+    pattern_n: Option<u32>,
+    leg: Option<Leg>,
+    high: bool,
+    /// The best measure in the current stage (feet or nm).
+    best: Option<f64>,
+    step_nm: f64,
+    last_progress_s: f64,
+    deadline_s: f64,
+    last_t: f64,
+}
+
+impl MissedWatch {
+    pub fn start(t_s: f64) -> Self {
+        MissedWatch {
+            stage: None,
+            pattern_n: None,
+            leg: None,
+            high: false,
+            best: None,
+            step_nm: 0.0,
+            last_progress_s: t_s,
+            deadline_s: t_s + PLAN_WAIT_S,
+            last_t: t_s,
+        }
+    }
+
+    /// One tick. Returns the stage's word on the tick a stage begins (a new
+    /// pattern included), for the record.
+    pub fn note(&mut self, t_s: f64, p: Progress) -> Option<&'static str> {
+        let gap = t_s - self.last_t;
+        if gap > FROZEN_GAP_S {
+            self.last_progress_s += gap;
+            self.deadline_s += gap;
+        }
+        self.last_t = t_s;
+        let word = p.word();
+        let new_pattern = matches!(p, Progress::Pattern { n, .. } if self.pattern_n != Some(n));
+        let began = self.stage != Some(word) || new_pattern;
+        if began {
+            self.stage = Some(word);
+            self.best = None;
+            self.leg = None;
+            self.last_progress_s = t_s;
+            self.deadline_s = t_s
+                + match p {
+                    Progress::Climb { to_go_ft } | Progress::Hold { to_go_ft } => {
+                        climb_budget_s(to_go_ft)
+                    }
+                    Progress::Waiting => PLAN_WAIT_S,
+                    Progress::Pattern { budget_s, .. } => budget_s,
+                };
+        }
+        match p {
+            Progress::Climb { to_go_ft } | Progress::Hold { to_go_ft } => {
+                if to_go_ft <= HEIGHT_STEP_FT {
+                    // There: nothing left to gain.
+                    self.last_progress_s = t_s;
+                } else if self.best.is_none_or(|b| to_go_ft < b - HEIGHT_STEP_FT) {
+                    if self.best.is_some() {
+                        self.last_progress_s = t_s;
+                    }
+                    self.best = Some(to_go_ft);
+                }
+            }
+            Progress::Waiting => {}
+            Progress::Pattern {
+                n,
+                leg,
+                high,
+                to_go_nm,
+                above_ft,
+                gs_kts,
+                ..
+            } => {
+                if new_pattern {
+                    self.pattern_n = Some(n);
+                    self.step_nm =
+                        PATTERN_PROGRESS_FRAC * gs_kts.max(60.0) * PATTERN_STALL_S / 3600.0;
+                    self.high = high;
+                }
+                if self.leg.is_some_and(|l| leg_rank(leg) > leg_rank(l)) {
+                    self.last_progress_s = t_s;
+                }
+                self.leg = Some(leg);
+                // Into or out of an extended downwind the measure changes
+                // (height, track), so its best starts afresh; the flip itself
+                // is not progress (a flip every tick never makes a step).
+                if high != self.high {
+                    self.high = high;
+                    self.best = None;
+                }
+                let (value, step) = if high {
+                    (above_ft, HEIGHT_STEP_FT)
+                } else {
+                    (to_go_nm, self.step_nm)
+                };
+                if self.best.is_none_or(|b| value < b - step) {
+                    if self.best.is_some() {
+                        self.last_progress_s = t_s;
+                    }
+                    self.best = Some(value);
+                }
+            }
+        }
+        began.then_some(word)
+    }
+
+    /// Seconds since the last progress.
+    pub fn stalled_s(&self, t_s: f64) -> f64 {
+        (t_s - self.last_progress_s).max(0.0)
+    }
+
+    /// Seconds left of the stage's outer bound.
+    pub fn budget_left_s(&self, t_s: f64) -> f64 {
+        self.deadline_s - t_s
+    }
+
+    fn stall_limit_s(&self) -> f64 {
+        match self.stage {
+            Some("waiting") => PLAN_WAIT_S,
+            Some("pattern") => PATTERN_STALL_S,
+            _ => HEIGHT_STALL_S,
+        }
+    }
+
+    /// Give up? Past the stage's outer bound, or no progress for its stall
+    /// time.
+    pub fn verdict(&self, t_s: f64) -> Option<Verdict> {
+        if t_s > self.deadline_s {
+            Some(Verdict::OverBudget)
+        } else if self.stalled_s(t_s) > self.stall_limit_s() {
+            Some(Verdict::Stalled)
+        } else {
+            None
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1519,5 +1830,324 @@ mod tests {
         assert_eq!(hold_altitude_ft(Some(100.0), None, 2500.0, 1638.0), 2500.0);
         assert_eq!(hold_altitude_ft(None, Some(2200.0), 800.0, 1638.0), 3200.0);
         assert_eq!(hold_altitude_ft(None, None, 800.0, 1638.0), 1700.0);
+    }
+
+    // --- Progress (2026-09-30) -------------------------------------------
+
+    /// LEMG 13, iMac 2026-09-30 (sortie 1790775809-approach, SR22): the
+    /// pattern as recorded, every 15 s from the `reversal` record (t+29.5,
+    /// 104 kt, right-hand, platform 2,895 ft, field 48 ft) to the flat
+    /// clock's give-up at t+613: (t, leg, along nm, xtk m, alt ft).
+    const LEMG13_SR22: &[(f64, char, f64, f64, f64)] = &[
+        (29.5, 'O', 1.06, 7.0, 915.0),
+        (44.6, 'O', 0.73, 171.0, 998.0),
+        (59.7, 'O', 0.57, 716.0, 1225.0),
+        (75.0, 'O', 0.68, 1388.0, 1453.0),
+        (90.2, 'O', 1.01, 1840.0, 1656.0),
+        (105.3, 'O', 1.38, 2047.0, 1833.0),
+        (120.5, 'O', 1.76, 2095.0, 2041.0),
+        (135.7, 'O', 2.15, 2161.0, 2243.0),
+        (150.8, 'O', 2.53, 2209.0, 2428.0),
+        (166.0, 'O', 2.90, 2211.0, 2617.0),
+        (181.2, 'O', 3.29, 2216.0, 2803.0),
+        (196.3, 'O', 3.68, 2280.0, 2852.0),
+        (211.7, 'O', 4.05, 2325.0, 2847.0),
+        (226.8, 'O', 4.42, 2280.0, 2854.0),
+        (242.0, 'O', 4.80, 2285.0, 2859.0),
+        (257.3, 'O', 5.19, 2301.0, 2851.0),
+        (272.5, 'O', 5.57, 2274.0, 2850.0),
+        (287.7, 'O', 5.95, 2250.0, 2855.0),
+        (302.9, 'O', 6.38, 2264.0, 2860.0),
+        (318.0, 'O', 6.78, 2293.0, 2854.0),
+        (333.2, 'O', 7.17, 2285.0, 2849.0),
+        (348.3, 'O', 7.57, 2250.0, 2851.0),
+        (363.5, 'O', 7.97, 2238.0, 2856.0),
+        (378.7, 'O', 8.37, 2254.0, 2860.0),
+        (393.9, 'O', 8.75, 2284.0, 2855.0),
+        (409.0, 'O', 9.13, 2286.0, 2852.0),
+        (424.2, 'O', 9.50, 2264.0, 2849.0),
+        (439.3, 'O', 9.88, 2232.0, 2853.0),
+        (454.5, 'O', 10.25, 2228.0, 2857.0),
+        (469.7, 'O', 10.65, 2243.0, 2860.0),
+        (484.9, 'B', 11.06, 2207.0, 2850.0),
+        (500.1, 'B', 11.33, 1755.0, 2847.0),
+        (515.4, 'B', 11.40, 1055.0, 2857.0),
+        (530.8, 'I', 11.36, 308.0, 2870.0),
+        (545.8, 'I', 11.06, -270.0, 2901.0),
+        (560.9, 'I', 10.59, -344.0, 2895.0),
+        (576.1, 'I', 10.13, -202.0, 2893.0),
+        (591.3, 'I', 9.66, -98.0, 2898.0),
+        (606.6, 'I', 9.21, -45.0, 2888.0),
+        (613.1, 'I', 9.04, -40.0, 2884.0),
+    ];
+    const LEMG13_PLATFORM_FT: f64 = 2895.1;
+    const LEMG13_ELEV_FT: f64 = 48.0;
+    const LEMG13_GS_KTS: f64 = 104.1;
+
+    fn leg_of(c: char) -> Leg {
+        match c {
+            'O' => Leg::Outbound,
+            'B' => Leg::Base,
+            _ => Leg::Inbound,
+        }
+    }
+
+    /// The loop's `Progress::Pattern` for one position.
+    fn pattern_progress(
+        rev: &Reversal,
+        along: f64,
+        xtk_nm: f64,
+        alt: f64,
+        gs: f64,
+        elev: f64,
+        n: u32,
+    ) -> Progress {
+        let join = crate::autoland::join_point_nm(rev.platform_ft, elev);
+        let end = pattern_end_nm(rev.platform_ft, elev, crate::autoland::gp_ft_per_nm(), join);
+        let to_go = to_go_nm(rev, along, xtk_nm, gs, join, end);
+        let above = alt - rev.platform_ft;
+        Progress::Pattern {
+            n,
+            leg: rev.leg,
+            high: rev.high,
+            to_go_nm: to_go,
+            above_ft: above,
+            budget_s: pattern_budget_s(to_go, gs, above, 1500.0),
+            gs_kts: gs,
+        }
+    }
+
+    /// The record replayed at 1 s ticks (interpolated between its samples),
+    /// after the go-around's climb from 734 ft: the pattern made its ground
+    /// all the way and is never given up; its budget from the plan covers
+    /// the 584 s it flew and then some. The flat 600 s gave it up at t+613.
+    #[test]
+    fn lemg_13_sr22_pattern_makes_its_ground_and_is_never_given_up() {
+        let mut w = MissedWatch::start(12.7);
+        // The go-around's climb, 734 ft radio to the turn at 800.
+        for (i, t) in (13..29).enumerate() {
+            let radio = 734.0 + i as f64 * 10.0;
+            w.note(t as f64, Progress::Climb { to_go_ft: 800.0 - radio });
+            assert_eq!(w.verdict(t as f64), None);
+        }
+        let mut rev = Reversal {
+            side: 1.0,
+            leg: Leg::Outbound,
+            platform_ft: LEMG13_PLATFORM_FT,
+            high: false,
+        };
+        let first = LEMG13_SR22[0];
+        let p0 = pattern_progress(
+            &rev,
+            first.2,
+            first.3 / M_PER_NM,
+            first.4,
+            LEMG13_GS_KTS,
+            LEMG13_ELEV_FT,
+            1,
+        );
+        let Progress::Pattern { to_go_nm, budget_s, .. } = p0 else { unreachable!() };
+        // Planned: 10.2 nm of downwind to the base, back in to the path at
+        // 9.1 nm, 1.5 nm out and back across: about 15 nm.
+        assert!((14.0..16.5).contains(&to_go_nm), "to go {to_go_nm:.1} nm");
+        assert!(budget_s > 613.1 - 29.5 + 120.0, "budget {budget_s:.0} s");
+        assert!(budget_s < 1500.0, "budget {budget_s:.0} s");
+        assert_eq!(w.note(29.5, p0), Some("pattern"));
+        let mut worst_stall: f64 = 0.0;
+        for pair in LEMG13_SR22.windows(2) {
+            let (a, b) = (pair[0], pair[1]);
+            let mut t = a.0.ceil();
+            while t < b.0 {
+                let f = (t - a.0) / (b.0 - a.0);
+                let lerp = |x: f64, y: f64| x + (y - x) * f;
+                rev.leg = leg_of(a.1);
+                let p = pattern_progress(
+                    &rev,
+                    lerp(a.2, b.2),
+                    lerp(a.3, b.3) / M_PER_NM,
+                    lerp(a.4, b.4),
+                    LEMG13_GS_KTS,
+                    LEMG13_ELEV_FT,
+                    1,
+                );
+                w.note(t, p);
+                assert_eq!(w.verdict(t), None, "given up at t+{t:.0}");
+                worst_stall = worst_stall.max(w.stalled_s(t));
+                t += 1.0;
+            }
+        }
+        assert!(worst_stall < PATTERN_STALL_S * 0.75, "stood {worst_stall:.0} s");
+        assert!(w.budget_left_s(613.1) > 120.0);
+    }
+
+    /// The same SR22 circling where the downwind began (a lost pattern): its
+    /// track to go swings with the orbit and never steps, so it is given up
+    /// about two minutes after the last ground it made, not at ten.
+    #[test]
+    fn a_pattern_that_goes_nowhere_is_given_up_in_minutes() {
+        let rev = Reversal {
+            side: 1.0,
+            leg: Leg::Outbound,
+            platform_ft: LEMG13_PLATFORM_FT,
+            high: false,
+        };
+        let mut w = MissedWatch::start(0.0);
+        let mut gave_up = None;
+        for i in 0..900 {
+            let t = i as f64;
+            // A 0.4 nm orbit round 2 nm out, 1.2 nm right, every 100 s.
+            let a = t / 100.0 * std::f64::consts::TAU;
+            let p = pattern_progress(
+                &rev,
+                2.0 + 0.4 * a.cos(),
+                1.2 + 0.4 * a.sin(),
+                2890.0,
+                LEMG13_GS_KTS,
+                LEMG13_ELEV_FT,
+                1,
+            );
+            w.note(t, p);
+            if let Some(v) = w.verdict(t) {
+                gave_up = Some((t, v));
+                break;
+            }
+        }
+        let (t, v) = gave_up.expect("an orbit is never progress");
+        assert_eq!(v, Verdict::Stalled);
+        assert!(t < 250.0, "given up at {t:.0} s");
+    }
+
+    /// A jet flies its pattern on the kinematic autopilot (737, 160 kt,
+    /// 24 degrees, EGTE 08 at 3,000 ft from a go-around 1.5 nm past the far
+    /// end): never stalled, done inside its own budget. The same jet in an
+    /// orbit is given up within minutes: a fast aircraft is not given ten of
+    /// them to loiter in.
+    #[test]
+    fn a_jet_pattern_is_judged_on_its_own_size_and_speed() {
+        let rwy = egte_08();
+        let (lat, lon) = project_latlon(rwy.thr_lat, rwy.thr_lon, rwy.course_deg, 1.5);
+        let gs = 160.0;
+        let platform = 3000.0;
+        let join = crate::autoland::join_point_nm(platform, rwy.elev_ft);
+        for orbit in [false, true] {
+            let mut p = Plant {
+                lat,
+                lon,
+                hdg: rwy.course_deg,
+                bank: 0.0,
+                gs_kts: gs,
+                max_bank: 24.0,
+            };
+            let mut rev = Reversal {
+                side: -1.0,
+                leg: Leg::Outbound,
+                platform_ft: platform,
+                high: false,
+            };
+            let mut w = MissedWatch::start(0.0);
+            let mut t = 0.0;
+            let mut first_budget = None;
+            let outcome = loop {
+                let along = along_track_nm(p.lat, p.lon, &rwy);
+                let xtk = cross_track_nm(p.lat, p.lon, &rwy);
+                let final_called = along < 5.5 && crate::autoland::stabilised_xtk(xtk, along);
+                let bug = step(
+                    &mut rev, &rwy, p.lat, p.lon, along, xtk, p.hdg, gs, join, final_called,
+                );
+                let Some(bug) = bug else { break Ok(t) };
+                let prog = pattern_progress(&rev, along, xtk, platform, gs, rwy.elev_ft, 1);
+                if let Progress::Pattern { budget_s, .. } = prog {
+                    first_budget.get_or_insert(budget_s);
+                }
+                w.note(t, prog);
+                if let Some(v) = w.verdict(t) {
+                    break Err((t, v));
+                }
+                // A lost pattern: the heading bug always 90 degrees round.
+                let bug = if orbit && t > 60.0 { p.hdg + 90.0 } else { bug };
+                p.fly(bug, 0.5);
+                t += 0.5;
+                assert!(t < 3000.0, "never ended");
+            };
+            let budget = first_budget.unwrap();
+            if orbit {
+                let (at, v) = outcome.expect_err("an orbit is given up");
+                assert_eq!(v, Verdict::Stalled);
+                assert!(at < 400.0, "given up at {at:.0} s");
+            } else {
+                let done = outcome.unwrap_or_else(|(at, v)| panic!("{v:?} at {at:.0} s"));
+                assert!(done < budget, "flown in {done:.0} s against {budget:.0}");
+                // Sized by the plan: a jet's bigger pattern at twice the
+                // speed still earns a bound of its own, not a flat ten minutes.
+                assert!((300.0..1200.0).contains(&budget), "budget {budget:.0} s");
+            }
+        }
+    }
+
+    /// An extended downwind makes its progress in height: descending, it is
+    /// never stalled though its track to go grows; held level above the
+    /// platform, it is. Flipping in and out of it every tick is not progress.
+    #[test]
+    fn an_extended_downwind_progresses_by_the_height_it_loses() {
+        let pat = |high: bool, to_go: f64, above: f64| Progress::Pattern {
+            n: 1,
+            leg: Leg::Outbound,
+            high,
+            to_go_nm: to_go,
+            above_ft: above,
+            budget_s: 3000.0,
+            gs_kts: 200.0,
+        };
+        let mut w = MissedWatch::start(0.0);
+        for i in 0..600 {
+            let t = i as f64;
+            // 1,200 fpm down from 8,000 ft above, the track growing.
+            w.note(t, pat(true, 20.0 + t * 0.05, 8000.0 - 20.0 * t));
+            assert_eq!(w.verdict(t), None, "stalled descending at {t} s");
+        }
+        let mut w = MissedWatch::start(0.0);
+        let stalled = (0..600).map(|i| i as f64).find(|&t| {
+            w.note(t, pat(true, 20.0 + t * 0.05, 8000.0));
+            w.verdict(t).is_some()
+        });
+        assert!(stalled.is_some_and(|t| t <= PATTERN_STALL_S + 1.0), "{stalled:?}");
+        let mut w = MissedWatch::start(0.0);
+        let flipping = (0..600).map(|i| i as f64).find(|&t| {
+            let high = (t as u32) % 2 == 0;
+            w.note(t, pat(high, 20.0 - t * 0.001, 8000.0 - t));
+            w.verdict(t).is_some()
+        });
+        assert!(flipping.is_some_and(|t| t <= PATTERN_STALL_S + 1.0), "{flipping:?}");
+    }
+
+    /// A climb that stops (the go-around's, or a refused pattern's hold) is
+    /// given up at 90 s; a pause is not a stall; the plan not coming is.
+    #[test]
+    fn a_climb_that_stops_or_a_plan_that_never_comes_is_given_up() {
+        let mut w = MissedWatch::start(0.0);
+        w.note(0.0, Progress::Hold { to_go_ft: 2000.0 });
+        for t in 1..=90 {
+            w.note(t as f64, Progress::Hold { to_go_ft: 2000.0 - 10.0 * t as f64 });
+            assert_eq!(w.verdict(t as f64), None);
+        }
+        // Stopped 1,100 ft short.
+        let stop = (91..400).map(|t| t as f64).find(|&t| {
+            w.note(t, Progress::Hold { to_go_ft: 1100.0 });
+            w.verdict(t).is_some()
+        });
+        assert!(stop.is_some_and(|t| t > 150.0 && t < 200.0), "{stop:?}");
+        // A pause of five minutes mid-climb holds the clocks.
+        let mut w = MissedWatch::start(0.0);
+        w.note(0.0, Progress::Climb { to_go_ft: 500.0 });
+        w.note(10.0, Progress::Climb { to_go_ft: 300.0 });
+        w.note(310.0, Progress::Climb { to_go_ft: 300.0 });
+        assert_eq!(w.verdict(310.0), None);
+        // The plan never answering.
+        let mut w = MissedWatch::start(0.0);
+        let waited = (0..400).map(|t| t as f64).find(|&t| {
+            w.note(t, Progress::Waiting);
+            w.verdict(t).is_some()
+        });
+        assert!(waited.is_some_and(|t| t > PLAN_WAIT_S && t < PLAN_WAIT_S + 2.0), "{waited:?}");
     }
 }
