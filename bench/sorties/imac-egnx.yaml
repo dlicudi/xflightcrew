@@ -1,0 +1,12 @@
+# 737 EGBB 33 to EGNX on a local plan (iMac): the departure check-in with
+# Approach (#118).
+after: stop
+cases:
+  - name: "737 EGBB runway start, local plan to EGNX (#118)"
+    setup:
+      aircraft: "Aircraft/Laminar Research/Boeing 737-800/b738.acf"
+      runway_start: { field: EGBB, runway: 33, engines_running: true }
+    steps:
+      - { say: plan a flight to EGNX, when: start, tool: plan_flight }
+      - { say: fly the flight plan, when: { after_s: 15 }, tool: full_auto }
+    deadline_min: 60
