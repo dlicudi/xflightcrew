@@ -11600,3 +11600,41 @@ pattern left or right with `err` near -105 and `target_hdg` 222.2, `stopped`/`tu
 inside 20; the first `autotaxi` `drive` tick's `err` inside 45 (was -149). After a short push:
 `join_turn` with `dir` -1, `turn_deg` about 150, then `max_lat_m` of the drive small; or
 `join_refused` said. The 737's pushes (no painted lane at its stand) are unchanged. Offline only.
+
+## 2026-09-30: the Evolution declares its rudder; its roll was the default law's (#45)
+
+iMac 2026-09-30, LILB 03, sortie 1790724857-full_auto (and 1790712974 of the evening before, the
+crooked start): the profile declared no `roll_rudder:`, so the DEFAULT law flew. Aligned at 1.9
+degrees, the nose went left under power: 18.4 degrees at 60 kt over the ground with the steer at
+0.58 to 0.68, a +/-8 to 11 deg/s swing at 17 to 28 kt, `lateral_excursion` 10 m left at 49 KIAS.
+The steer was the default law's authority floor (0.35 per 12 degrees from 50 kt) plus a trim of
+0.15 and a lead of 0.08; the 0.85 cap never bound.
+
+- **The fit** (both rolls, calm air, from 12 kt; three-second heading predictions from `r` through
+  0.3 s of dead time and the 0.47 s lag, with the brake split as a yaw input): in the PT6's wash the
+  rudder is nearly flat with the speed, 21 deg/s per unit at 60 kt as v^0.5 (1.6 degrees rms) or
+  40 as v (1.8); the differential brake 43 to 49 deg/s per unit; the standing rudder 0.83 to 0.96
+  at the 1,500 to 1,700 ft-lb flown (a need proportional to torque fits as well).
+- **Declared** (`profiles/lancair_evolution.yaml` `roll_rudder:`): 30 deg/s at 60 kt, `power_steer`
+  0.6 (the valid maximum; the trim takes the rest) to 60 kt, `close_per_s` 1.0, `trim_per_s` 0.3.
+  The SR22's 1.5 and 0.45 replay worse here.
+- **The throttle fell 0.98 to 0.82** because of the manual's torque limit (`takeoff_power:` 1,250
+  ft-lb, `torque_limited`): the ramp had the lever at 1.0 by 19 kt while the PT6 was still at 813,
+  the torque passed 1,312 (5 % over) at 31 kt and the limiter stepped the lever back 0.02 a tick,
+  but at a fixed lever the engine made more torque as it spooled and the speed built: 1,735 at
+  60 kt, 39 % over. At that torque the replayed law sits at its 0.85 cap from about 45 kt; a cap of
+  1.0 replays only 0.1 m better. Not changed here (no engine model to replay a lever against).
+
+Replayed (`replay_roll_braked`: the brake split's difference yaws the aircraft too): the aligned
+roll holds 1.0 m to the reject speed where it flew 8.0 (median of five reads; 10 read), 2.0 m at
+worst on either fit at half to twice and 0.05 of need either way, the steer reversing at most
+twice; on the generic lead in place of `power_steer`, 3.8 m. The crooked start is already 2.7 m left
+by 30 kt and ends 3.5 to 3.8 m left on the fits (8.4 flown), 5.2 at worst, pinned at the cap.
+Neither roll reached 61 kt, so nothing past it is replayed. Tests
+`the_evolution_roll_replays_as_flown`, `the_evolution_roll_holds_the_centreline_on_its_fitted_rudder`;
+bench `bench/takeoffs/evolution_roll_lilb03_1790724857.jsonl`, `..._1790712974.jsonl`.
+
+Next Evolution takeoff: `roll` ticks `law` "rudder", `steer` over 0.7 from 40 kt with `err` under
+3 and `xtk_m` inside 3 m to rotation; `trim` building to 0.2 to 0.35; `trq_ftlb` against 1,250 (if
+it runs to 1,700 again and `steer` pins at 0.85 with `err` growing, the torque limiter is the next
+fix); no `excursion`. Offline only.

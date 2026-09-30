@@ -5833,9 +5833,24 @@ mod tests {
     /// largest difference between the replayed steer and the recorded one.
     fn replay_roll(
         ticks: &[serde_json::Value],
+        law: RollSteer,
+        cut: RollCut,
+        rudder: &dyn Fn(f64) -> f64,
+    ) -> (Vec<(f64, f64, f64, f64)>, f64) {
+        replay_roll_braked(ticks, law, cut, rudder, None)
+    }
+
+    /// [`replay_roll`] on an airframe that brake-steers its roll
+    /// ([`roll_brake_split_aligning`]): the replayed split less the split of
+    /// the recorded steer yaws the aircraft through `brake` (deg/s per unit
+    /// of right brake less left), on the same dead time and lag as the
+    /// rudder. `None` is the rudder alone, as every earlier replay flew.
+    fn replay_roll_braked(
+        ticks: &[serde_json::Value],
         mut law: RollSteer,
         mut cut: RollCut,
         rudder: &dyn Fn(f64) -> f64,
+        brake: Option<&dyn Fn(f64) -> f64>,
     ) -> (Vec<(f64, f64, f64, f64)>, f64) {
         const DEAD_S: f64 = 0.3;
         const LAG_S: f64 = 0.47;
@@ -5879,8 +5894,9 @@ mod tests {
             + g(r5, "drift")
             + roll_cut_deg(g(r5, "xtk_m"), g(r5, "xtk_rate"), g(r5, "gs"));
         let (mut dyaw, mut dpsi, mut dx) = (0.0_f64, 0.0_f64, 0.0_f64);
-        let mut queue: std::collections::VecDeque<(f64, f64)> = Default::default();
+        let mut queue: std::collections::VecDeque<(f64, f64, f64)> = Default::default();
         let mut applied = 0.0_f64;
+        let mut applied_brake = 0.0_f64;
         let mut t = 0.0_f64;
         let mut out = Vec::with_capacity(n);
         let mut dev = 0.0_f64;
@@ -5891,11 +5907,15 @@ mod tests {
                 let (gs0, gs1) = (g(&ticks[k - 1], "gs"), g(r, "gs"));
                 let end = ts[k];
                 while t < end - 1e-9 {
-                    while queue.front().is_some_and(|(at, _)| *at <= t) {
-                        applied = queue.pop_front().map_or(applied, |(_, s)| s);
+                    while queue.front().is_some_and(|(at, _, _)| *at <= t) {
+                        if let Some((_, s, b)) = queue.pop_front() {
+                            applied = s;
+                            applied_brake = b;
+                        }
                     }
                     let gs = gs0 + (gs1 - gs0) * (1.0 - (end - t) / dt);
-                    dyaw += (rudder(gs) * applied - dyaw) * H / LAG_S;
+                    let braked = brake.map_or(0.0, |b| b(gs) * applied_brake);
+                    dyaw += (rudder(gs) * applied + braked - dyaw) * H / LAG_S;
                     dpsi += dyaw * H;
                     dx += gs / MS_TO_KTS * dpsi.to_radians() * H;
                     t += H;
@@ -5909,9 +5929,18 @@ mod tests {
             // The throttle as recorded (a propeller's power lead rides it);
             // the 737's ticks carry none and a jet takes no lead.
             let thr = r["thr"].as_f64().unwrap_or(1.0);
-            let steer = law.step_with_yaw(err, dt, gs, thr, Some(yaw_rec[k] + dyaw));
+            let yaw = yaw_rec[k] + dyaw;
+            let steer = law.step_with_yaw(err, dt, gs, thr, Some(yaw));
             dev = dev.max((steer - g(r, "steer")).abs());
-            queue.push_back((t + DEAD_S, steer - g(r, "steer")));
+            let dbrake = if brake.is_some() {
+                let (bl, br) = roll_brake_split_aligning(steer, gs, err, yaw);
+                let (bl0, br0) =
+                    roll_brake_split_aligning(g(r, "steer"), gs, g(r, "err"), yaw_rec[k]);
+                (br - bl) - (br0 - bl0)
+            } else {
+                0.0
+            };
+            queue.push_back((t + DEAD_S, steer - g(r, "steer"), dbrake));
             out.push((gs, c.xtk_m, truth[k] + dx, steer));
         }
         (out, dev)
@@ -6328,6 +6357,213 @@ mod tests {
             println!("{why}: {worst:.2} m");
             assert!(worst > 3.5, "{why}: {worst:.2} m");
         }
+    }
+
+    /// The Evolution's LILB 03 rolls, every `roll` tick from brake release
+    /// to the reject: 1790724857-full_auto (2026-09-30, aligned at 1.9
+    /// degrees by [`RollAlign`], rejected 10 m left at 60 kt over the
+    /// ground) and the earlier 1790712974-full_auto (started 24.6 degrees
+    /// off before the aligning pivot was fixed, rejected 9 m left at 49 kt).
+    /// Both on the default law, the profile declaring no rudder.
+    fn evolution_roll_0930() -> Vec<serde_json::Value> {
+        const TEXT: &str =
+            include_str!("../bench/takeoffs/evolution_roll_lilb03_1790724857.jsonl");
+        TEXT.lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .collect()
+    }
+
+    fn evolution_roll_crooked() -> Vec<serde_json::Value> {
+        const TEXT: &str =
+            include_str!("../bench/takeoffs/evolution_roll_lilb03_1790712974.jsonl");
+        TEXT.lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .collect()
+    }
+
+    /// The Evolution's rudder fitted to both rolls (three-second heading
+    /// predictions from the sim's `r` through 0.3 s of dead time and the
+    /// 0.47 s lag, from 12 kt, calm air): nearly flat with the speed in the
+    /// PT6's wash, 21 deg/s per unit at 60 kt as v^0.5 (1.6 degrees rms),
+    /// or 40 as v (1.8); and a differential brake worth 49 (43) deg/s per
+    /// unit of right brake less left. The standing need that fits with them
+    /// is 0.96 (0.83) of steer at the 1,500 to 1,700 ft-lb flown.
+    fn rudder_evolution_sqrt(gs: f64) -> f64 {
+        21.0 * (gs.max(0.0) / 60.0).sqrt()
+    }
+    fn rudder_evolution_linear(gs: f64) -> f64 {
+        40.0 * gs.max(0.0) / 60.0
+    }
+    const BRAKE_EVOLUTION_SQRT: f64 = 49.0;
+    const BRAKE_EVOLUTION_LINEAR: f64 = 43.0;
+
+    /// The Evolution's rudder as the profile declares it (`roll_rudder:`).
+    fn rudder_evolution() -> crate::aircraft::RollRudderProfile {
+        let text = std::fs::read_to_string("profiles/lancair_evolution.yaml").unwrap();
+        let p: crate::aircraft::AircraftProfile = serde_yaml::from_str(&text).unwrap();
+        p.roll_rudder
+            .and_then(|r| r.valid())
+            .expect("the Evolution declares its rudder")
+    }
+
+    /// Reversals of the steer from 30 kt: a jump past 0.08 against the last
+    /// such jump. A steer walking up to its cap is not a weave.
+    fn steer_reversals(out: &[(f64, f64, f64, f64)]) -> usize {
+        let mut last = 0.0_f64;
+        let mut n = 0;
+        for w in out.windows(2).filter(|w| w[0].0 >= 30.0) {
+            let d = w[1].3 - w[0].3;
+            if d.abs() > 0.08 {
+                if d * last < 0.0 {
+                    n += 1;
+                }
+                last = d;
+            }
+        }
+        n
+    }
+
+    /// One Evolution roll replayed under a law on a fitted plant (rudder
+    /// scaled by `scale`, and its brake).
+    fn fly_evolution(
+        ticks: &[serde_json::Value],
+        law: RollSteer,
+        cut: RollCut,
+        rudder: fn(f64) -> f64,
+        brake: f64,
+        scale: f64,
+    ) -> (Vec<(f64, f64, f64, f64)>, f64) {
+        let plant = move |gs: f64| scale * rudder(gs);
+        let braked = move |_gs: f64| brake;
+        replay_roll_braked(ticks, law, cut, &plant, Some(&braked))
+    }
+
+    /// The Evolution's rolls as flown: the default law replayed through them
+    /// writes the recorded steer (within 0.02: the first tick's slew is
+    /// replayed on the harness's 0.2 s, not the logged 0.15), and the
+    /// offsets are the failures being fixed: 8 m left (the median of five
+    /// reads; 10 m read) at 60 kt and at 49 kt. The steer there was 0.58 to
+    /// 0.68 with the nose 10 to 18 degrees left: the default law's authority
+    /// floor (0.35 of steer per 12 degrees from 50 kt) plus a trim of 0.15
+    /// and a power lead of 0.08, not the 0.85 cap.
+    #[test]
+    fn the_evolution_roll_replays_as_flown() {
+        for (name, ticks, len) in [
+            ("1790724857", evolution_roll_0930(), 29),
+            ("1790712974", evolution_roll_crooked(), 32),
+        ] {
+            assert_eq!(ticks.len(), len, "{name}");
+            let (out, dev) = fly_evolution(
+                &ticks,
+                RollSteer::default(),
+                RollCut::new(None),
+                rudder_evolution_sqrt,
+                BRAKE_EVOLUTION_SQRT,
+                1.0,
+            );
+            assert!(dev < 0.025, "{name}: the replayed law strays {dev:.4}");
+            let (worst, end, _) = roll_verdict(&out);
+            println!(
+                "{name} as flown: {worst:.2} m, {end:+.2} m at the reject, {} reversals",
+                steer_reversals(&out)
+            );
+            assert!(worst > 7.5 && end < -7.5, "{name}: {worst:.2} {end:+.2}");
+        }
+        // The default law at the reject: the authority floor, not the cap.
+        let last = evolution_roll_0930().last().cloned().unwrap();
+        let steer = last["steer"].as_f64().unwrap();
+        assert!(last["err"].as_f64().unwrap() > 18.0 && steer < 0.6, "{steer}");
+    }
+
+    /// The fix: the Evolution declares its rudder (`roll_rudder:`), 30 deg/s
+    /// per unit at 60 kt between the two fits, its PT6's standing rudder at
+    /// 0.6 of steer at full lever believed to the 60 kt measured, closed at
+    /// 1 per second with the trim's corner at 0.3. Replayed through the
+    /// aligned roll (1790724857) on either fit of the rudder at half to
+    /// twice, and on an aircraft needing 0.05 of steer less or more, it never
+    /// strays 2.5 m to the reject speed and reverses its steer at most
+    /// twice; on the fits, 1.1 m where it flew 8. The crooked start
+    /// (1790712974), already 2.7 m left by 30 kt on the replay, stays within
+    /// 4 m on the fits and 5.5 on the neighbours, where it flew 8.4, pinned
+    /// at the 0.85 cap from 38 kt: at the torque flown (1,500 to 1,700 ft-lb
+    /// against the manual's 1,250) the rudder has little more to give (a cap
+    /// of 1.0 replays 0.1 m better). Without the propeller's standing rudder
+    /// (the generic lead) the aligned roll strays 3.8 m.
+    #[test]
+    fn the_evolution_roll_holds_the_centreline_on_its_fitted_rudder() {
+        let declared = rudder_evolution();
+        assert_eq!(declared.power_steer, Some(0.6));
+        assert_eq!(declared.power_steer_to_kts, Some(60.0));
+        let fits: [(&str, fn(f64) -> f64, f64); 2] = [
+            ("21 v^0.5", rudder_evolution_sqrt, BRAKE_EVOLUTION_SQRT),
+            ("40 v", rudder_evolution_linear, BRAKE_EVOLUTION_LINEAR),
+        ];
+        let fly = |ticks: &[serde_json::Value],
+                   rd: crate::aircraft::RollRudderProfile,
+                   (rudder, brake): (fn(f64) -> f64, f64),
+                   scale: f64| {
+            let law = RollSteer::with_rudder(false, rd);
+            let cut = RollCut::for_law(&law);
+            fly_evolution(ticks, law, cut, rudder, brake, scale).0
+        };
+        for (name, ticks, worst_all, worst_fit) in [
+            ("1790724857", evolution_roll_0930(), 2.5, 1.1),
+            ("1790712974", evolution_roll_crooked(), 5.5, 4.0),
+        ] {
+            let flown = roll_verdict(
+                &fly_evolution(
+                    &ticks,
+                    RollSteer::default(),
+                    RollCut::new(None),
+                    rudder_evolution_sqrt,
+                    BRAKE_EVOLUTION_SQRT,
+                    1.0,
+                )
+                .0,
+            );
+            for need in [-0.05, 0.0, 0.05] {
+                let shifted = needing(&ticks, need);
+                for (plant_name, rudder, brake) in fits {
+                    for scale in [0.5, 1.0, 2.0] {
+                        let out = fly(&shifted, declared, (rudder, brake), scale);
+                        let (worst, end, _) = roll_verdict(&out);
+                        let rev = steer_reversals(&out);
+                        println!(
+                            "{name} need {need:+} {plant_name} x{scale}: worst {worst:.2} m, {end:+.2} m at the end, {rev} reversals"
+                        );
+                        assert!(
+                            worst <= worst_all,
+                            "{name}, need {need:+}, {plant_name} x{scale}: {worst:.2} m"
+                        );
+                        assert!(
+                            worst < flown.0 - 2.5,
+                            "{name}: {worst:.2} m against {:.2} flown",
+                            flown.0
+                        );
+                        assert!(
+                            rev <= 2,
+                            "{name}, need {need:+}, {plant_name} x{scale}: the steer weaves"
+                        );
+                        if need == 0.0 && scale == 1.0 {
+                            assert!(worst <= worst_fit, "{name} on {plant_name}: {worst:.2} m");
+                        }
+                    }
+                }
+            }
+        }
+        // The generic lead in place of the PT6's standing rudder.
+        let generic = crate::aircraft::RollRudderProfile {
+            power_steer: None,
+            ..declared
+        };
+        let worst = |rd| {
+            fits.iter()
+                .map(|(_, r, b)| roll_verdict(&fly(&evolution_roll_0930(), rd, (*r, *b), 1.0)).0)
+                .fold(0.0, f64::max)
+        };
+        let (with, without) = (worst(declared), worst(generic));
+        println!("the aligned roll: {with:.2} m declared, {without:.2} m on the generic lead");
+        assert!(without > with + 0.3, "{without:.2} against {with:.2}");
     }
 
     /// The cross-track read pairs two frames now and then (latitude and
