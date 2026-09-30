@@ -1177,6 +1177,48 @@ pub fn pivot_rate_scale(steer: f64, yaw_dps: f64) -> f64 {
     (1.0 - (yaw_dps.abs() - PIVOT_RATE_DPS) / PIVOT_RATE_SPAN_DPS).clamp(0.0, 1.0)
 }
 
+/// On a free castoring nose the turn-rate ceiling is judged on the yaw
+/// rate [`FREE_NOSE_RATE_LEAD_S`] AHEAD (the tick's yaw acceleration, while
+/// it builds), and lets go over [`FREE_NOSE_RATE_SPAN_DPS`]: at a walk the
+/// swing outlasts the brake by seconds (the refitted plant's lag is 1.5 +
+/// 2 / v s), so a brake taken off when the rate ARRIVES has already bought
+/// the swing. LEMG, the SR22 from the GA stand to 12, the 86 degree right
+/// vertex at 3,670 m to go (iMac 2026-09-30, 1790732424 and 1790736973, the
+/// same corner both times): entered at 6.2 to 6.4 kt against its 4 kt cap,
+/// the inside brake 0.21 to 0.22 at 4.1 to 4.2 kt with the yaw at 5 to 7
+/// deg/s; the ceiling still left 0.15 to 0.18 on at 11 to 14 deg/s, the yaw
+/// built to 24 to 26 deg/s at 1.8 to 1.9 kt with the brake already off, and
+/// the nose came round inside the vertex and swung on 25 to 40 degrees past
+/// the new taxiway at 1 kt: 5.1 and 4.4 m off.
+pub const FREE_NOSE_RATE_LEAD_S: f64 = 1.2;
+pub const FREE_NOSE_RATE_SPAN_DPS: f64 = 15.0;
+
+/// The yaw rate [`FREE_NOSE_RATE_LEAD_S`] ahead: the rate now plus its
+/// growth over the tick, only while it grows (a dying swing is the rate
+/// now). The first tick, and a tick under 0.1 s, differentiate over 0.1 s
+/// at most. Pure.
+pub fn led_yaw_dps(yaw_dps: f64, prev_yaw_dps: Option<f64>, dt: f64) -> f64 {
+    let Some(prev) = prev_yaw_dps else {
+        return yaw_dps;
+    };
+    let acc = (yaw_dps - prev) / dt.max(0.1);
+    if acc * yaw_dps > 0.0 {
+        yaw_dps + acc * FREE_NOSE_RATE_LEAD_S
+    } else {
+        yaw_dps
+    }
+}
+
+/// [`pivot_rate_scale`] for a free nose: on the LED rate
+/// ([`led_yaw_dps`]), from [`PIVOT_RATE_DPS`] over
+/// [`FREE_NOSE_RATE_SPAN_DPS`]. Pure.
+pub fn free_nose_rate_scale(steer: f64, led_yaw_dps: f64) -> f64 {
+    if steer * led_yaw_dps <= 0.0 {
+        return 1.0;
+    }
+    (1.0 - (led_yaw_dps.abs() - PIVOT_RATE_DPS) / FREE_NOSE_RATE_SPAN_DPS).clamp(0.0, 1.0)
+}
+
 /// Whether a castoring nosewheel's turn is a PIVOT: a join past
 /// [`PIVOT_MIN_ERR_DEG`], or ANY error that big at a pace under the taxi
 /// split's full authority. The pace cap slows the aircraft exactly when the
@@ -1284,13 +1326,17 @@ pub fn pivot_wrong_way_brake(yaw_dps: f64) -> f64 {
 /// and the squeeze took a second to let it go (0.41, 0.29, 0.17, 0.05); the
 /// steer then sat reversed at 0.75 to 0.84 for 3 s while the walking-pace
 /// fade gave the opposite wheel 0.04 to 0.07, and the nose swung 40 to 65
-/// degrees past the new taxiway and crept on across the inside. Pure.
+/// degrees past the new taxiway and crept on across the inside. And on a
+/// free nose the rate ceiling reads the yaw where it is GOING
+/// ([`free_nose_rate_scale`]): the swing outlasts the brake. Pure.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct BrakeSteer {
     /// The steer the brakes follow ([`BRAKE_STEER_TAU_S`]).
     smoothed: f64,
     /// The last (left, right) pair written.
     prev: (f64, f64),
+    /// The last tick's yaw rate, for the free nose's led ceiling.
+    prev_yaw: Option<f64>,
 }
 
 impl BrakeSteer {
@@ -1317,7 +1363,13 @@ impl BrakeSteer {
         } else {
             brake_steer_split_band(self.smoothed, gs_kts, free_nose)
         };
-        let k = pivot_rate_scale(if pivot { steer } else { self.smoothed }, yaw_dps);
+        let turning = if pivot { steer } else { self.smoothed };
+        let k = if free_nose {
+            free_nose_rate_scale(turning, led_yaw_dps(yaw_dps, self.prev_yaw, dt))
+        } else {
+            pivot_rate_scale(turning, yaw_dps)
+        };
+        self.prev_yaw = Some(yaw_dps);
         let (mut wl, mut wr) = (wl * k, wr * k);
         // A PIVOT turning the wrong way at walking pace: the steer-side wheel,
         // whatever the speed ([`PIVOT_WRONG_WAY_DPS`]).
@@ -2722,14 +2774,28 @@ pub fn bend_lookahead_cap_m(gs_kts: f64, turn_dps: f64) -> f64 {
 
 /// [`bend_lookahead_cap_m`] with the corner's own floor: see
 /// [`corner_aim_floor_m`].
+///
+/// The corner is its radius, v over the route's turn rate, and that is the
+/// same at any speed the rate was read at: under 0.5 m/s the "straight"
+/// threshold scales with the speed (the same 143 m radius) instead of the
+/// cap vanishing. It vanished under a knot, and a free nose recovering from
+/// a swing at 0.8 to 1.1 kt aimed 12 m and 16 m on alternate ticks: the
+/// error read -29 to -38 degrees, then -15 to -20, and the turn builder's
+/// brake went 0.06 to 0.07, nothing, 0.07 (LEMG, 1790736973, 2026-09-30).
+/// Only a free nose notices: every other nose's crawl aim is its 16 m floor
+/// either way.
 pub fn bend_lookahead_cap_floor_m(gs_kts: f64, turn_dps: f64, floor_m: f64) -> f64 {
     let v = gs_kts * 0.514_444;
-    if v < 0.5 || turn_dps.abs() < 0.2 {
+    if v <= 0.0 || turn_dps.abs() < BEND_STRAIGHT_DPS * (v / BEND_STRAIGHT_FROM_MS).min(1.0) {
         return f64::INFINITY;
     }
     let radius_m = v / turn_dps.abs().to_radians();
     (2.0 * radius_m * BEND_MAX_CUT_M).sqrt().max(floor_m)
 }
+/// Under this turn rate the route is straight, from this speed up; below
+/// it the rate that is the same radius.
+const BEND_STRAIGHT_DPS: f64 = 0.2;
+const BEND_STRAIGHT_FROM_MS: f64 = 0.5;
 /// The most a gentle bend may be cut, m.
 pub const BEND_MAX_CUT_M: f64 = 1.5;
 /// The shortest aim a corner is flown on: a shorter one asks for a turn
@@ -5908,10 +5974,15 @@ mod tests {
         // The cut the capped aim leaves: under the limit.
         let r = 12.0 * 0.514_444 / 3.3_f64.to_radians();
         assert!(cap * cap / (2.0 * r) <= BEND_MAX_CUT_M + 1e-9);
-        // Straight, or crawling: no cap. A sharp corner: never under 16.
+        // Straight, or stopped: no cap. A sharp corner: never under 16,
+        // crawling too (a corner is a radius, whatever speed reads it; #165).
         assert!(bend_lookahead_cap_m(12.0, 0.1).is_infinite());
-        assert!(bend_lookahead_cap_m(0.5, 10.0).is_infinite());
+        assert!(bend_lookahead_cap_m(0.0, 10.0).is_infinite());
+        assert_eq!(bend_lookahead_cap_m(0.5, 10.0), 16.0);
         assert_eq!(bend_lookahead_cap_m(8.0, 30.0), 16.0);
+        // Straight at a crawl is the same radius as straight at 0.5 m/s.
+        assert!(bend_lookahead_cap_m(0.5, 0.05).is_infinite());
+        assert!(bend_lookahead_cap_floor_m(0.9, 0.9, FREE_NOSE_AIM_FLOOR_M) == FREE_NOSE_AIM_FLOOR_M);
     }
 
     /// The aligning pivot on the fitted plant ([`super::yaw_plant`]): from
@@ -6798,13 +6869,7 @@ mod tests {
             }
             let remaining = route.remaining(progress);
             // The floor under test; the brakes are the free nose's either way.
-            let look = lookahead_m_with(gs, pace.lookahead_s)
-                .min(bend_lookahead_cap_floor_m(
-                    gs,
-                    route.route_turn_rate_dps(progress, BEND_PROBE_M, gs),
-                    corner_aim_floor_m(aim_floor_free),
-                ))
-                .min((remaining * 0.6).max(6.0));
+            let look = steer_look_m(&pace, gs, route.route_turn_rate_dps(progress, BEND_PROBE_M, gs), remaining, aim_floor_free);
             let err = committed_err(route.heading_err_deg(lat, lon, psi, progress, look), &mut turn_dir);
             let route_turn = route.route_turn_rate_dps(progress, look, gs);
             let raw = taxi_guide::angle_diff(psi, prev_psi) / dt;
@@ -7114,6 +7179,167 @@ mod tests {
         eprintln!("d28e8f4: worst {worst_prev:?}; now: worst {worst_new:?}");
         assert!(worst_prev.0 > 5.0, "the plant must run d28e8f4 wide: {worst_prev:?}");
         assert!(worst_new.0 <= TAXI_MAX_LAT_M, "{worst_new:?}");
+    }
+
+    /// The law as b6c24d5 flew it (1790736973): [`BrakeSteer`] with the
+    /// turn-rate ceiling on the yaw rate as read, not led.
+    fn b6c24d5_free_nose_brakes() -> impl FnMut(f64, f64, f64, f64, f64) -> (f64, f64) {
+        let (mut bs, mut prev) = (0.0_f64, (0.0_f64, 0.0_f64));
+        move |steer, err, gs, yaw, dt| {
+            bs = smooth_toward(bs, steer, BRAKE_STEER_TAU_S, dt);
+            let pivot = pivot_due(err, gs, false);
+            let (wl, wr) = if pivot { pivot_brake_split(steer, gs) } else { brake_steer_split_band(bs, gs, true) };
+            let k = pivot_rate_scale(if pivot { steer } else { bs }, yaw);
+            let (mut wl, mut wr) = (wl * k, wr * k);
+            if pivot && steer * yaw < 0.0 {
+                let b = pivot_wrong_way_brake(yaw);
+                (wl, wr) = if steer > 0.0 { (0.0, wr.max(b)) } else { (wl.max(b), 0.0) };
+            }
+            if steer * yaw < 0.0 && yaw.abs() > SWING_CATCH_DPS {
+                let b = ((yaw.abs() - SWING_CATCH_DPS) / SWING_CATCH_SPAN_DPS).clamp(0.0, 1.0)
+                    * SWING_CATCH_MAX
+                    * walk_authority(gs);
+                (wl, wr) = if yaw < 0.0 { (0.0, wr.max(b)) } else { (wl.max(b), 0.0) };
+            }
+            let b = turn_build_brake(err, yaw, gs);
+            if b > 0.0 {
+                (wl, wr) = if err > 0.0 { (0.0, wr.max(b)) } else { (wl.max(b), 0.0) };
+            }
+            let ease = |p: f64, w: f64| if w < p { w } else { slew_steer(p, w, Some(BRAKE_STEER_SLEW_PER_S), dt) };
+            prev = (ease(prev.0, wl), ease(prev.1, wr));
+            prev
+        }
+    }
+
+    /// LEMG, the SR22 on b6c24d5 (iMac 2026-09-30, sortie 1790736973, from
+    /// 3,678 m to go): the 86 degree right vertex at 3,670 m entered at 6.2
+    /// kt, the swing to 24 deg/s at 1.9 kt, the nose 25 degrees past the new
+    /// taxiway and the walk back. (s, gs kt, err, steer, yaw_dps, bl, br) as
+    /// logged.
+    #[rustfmt::skip]
+    const LEMG_12_VERTEX: &[(f64, f64, f64, f64, f64, f64, f64)] = &[
+        (0.0, 6.22, 1.80, 0.119, -1.51, 0.000, 0.021), (0.3, 6.08, 6.46, 0.226, -1.45, 0.000, 0.046), (0.6, 5.92, 11.03, 0.308, -0.89, 0.000, 0.074), (0.8, 5.66, 15.68, 0.376, 0.11, 0.000, 0.102),
+        (1.1, 5.24, 20.82, 0.499, 1.71, 0.000, 0.146), (1.4, 4.77, 24.25, 0.580, 3.93, 0.000, 0.184), (1.8, 4.16, 26.32, 0.629, 5.36, 0.000, 0.223), (2.0, 3.20, 26.15, 0.532, 13.63, 0.000, 0.150),
+        (2.3, 2.11, 22.55, 0.273, 17.18, 0.000, 0.032), (2.6, 1.88, 17.02, 0.073, 22.67, 0.000, 0.004), (3.0, 1.86, 9.03, -0.223, 24.24, 0.108, 0.000), (3.2, 1.60, 3.56, -0.427, 24.40, 0.109, 0.000),
+        (3.5, 1.20, -2.09, -0.545, 22.14, 0.066, 0.000), (3.8, 0.97, 8.48, -0.330, 18.78, 0.034, 0.000), (4.1, 0.84, 4.32, -0.298, 16.23, 0.019, 0.000), (4.3, 0.80, 1.79, -0.280, 14.32, 0.013, 0.000),
+        (4.7, 0.76, -2.28, -0.293, 12.91, 0.008, 0.000), (4.9, 0.77, -5.00, -0.306, 12.04, 0.007, 0.000), (5.2, 0.83, -8.56, -0.333, 11.21, 0.007, 0.000), (5.5, 0.90, -10.96, -0.341, 10.16, 0.006, 0.000),
+        (5.8, 0.99, -29.37, -0.547, 9.31, 0.059, 0.000), (6.0, 0.96, -15.35, -0.371, 8.11, 0.000, 0.000), (6.4, 1.10, -33.93, -0.562, 7.12, 0.072, 0.000), (6.7, 1.03, -35.90, -0.546, 5.82, 0.064, 0.000),
+        (7.0, 0.96, -20.16, -0.297, 3.73, 0.000, 0.000), (7.3, 1.08, -37.47, -0.495, 1.80, 0.070, 0.000), (7.6, 1.06, -37.59, -0.519, 0.21, 0.068, 0.000), (7.8, 1.04, -37.16, -0.462, -1.72, 0.058, 0.000),
+        (8.1, 1.05, -36.39, -0.425, -2.74, 0.054, 0.000), (8.4, 1.09, -34.71, -0.339, -5.24, 0.046, 0.000), (8.7, 1.17, -32.89, -0.293, -6.23, 0.047, 0.000), (9.0, 1.27, -30.25, -0.227, -7.52, 0.046, 0.000),
+        (9.3, 1.39, -27.11, -0.139, -9.08, 0.032, 0.000), (9.6, 1.58, -23.51, -0.053, -10.15, 0.001, 0.000), (9.9, 1.87, -19.66, 0.029, -10.62, 0.000, 0.017), (10.2, 2.15, -15.70, 0.107, -10.61, 0.000, 0.017),
+        (10.5, 2.41, 21.39, 0.336, -10.14, 0.000, 0.015), (10.7, 2.64, 24.17, 0.540, -9.19, 0.000, 0.051), (11.0, 2.80, 27.08, 0.763, -8.20, 0.000, 0.120),
+    ];
+
+    /// The same vertex both times (1790732424 as [`LEMG_SLOW_CORNER`],
+    /// 1790736973 as [`LEMG_12_VERTEX`]): the logged ticks through the law
+    /// that flew each give back the logged brakes, and through
+    /// [`BrakeSteer`] the inside brake is off by the tick the swing passes
+    /// 11 deg/s while still building, where 0.11 to 0.18 flew.
+    #[test]
+    fn the_inside_brake_is_off_before_the_swing_arrives() {
+        let flights: [(&str, &[(f64, f64, f64, f64, f64, f64, f64)], bool); 2] =
+            [("1790732424", LEMG_SLOW_CORNER, false), ("1790736973", LEMG_12_VERTEX, true)];
+        for (id, ticks, b6c24d5) in flights {
+            let mut flown: Box<dyn FnMut(f64, f64, f64, f64, f64) -> (f64, f64)> =
+                if b6c24d5 { Box::new(b6c24d5_free_nose_brakes()) } else { Box::new(d28e8f4_free_nose_brakes()) };
+            let mut ours = free_nose_brakes();
+            let (mut n, mut flown_max, mut ours_max) = (0, 0.0_f64, 0.0_f64);
+            for (i, &(t, gs, err, steer, yaw, bl, br)) in ticks.iter().enumerate() {
+                let dt = if i == 0 { 0.2 } else { t - ticks[i - 1].0 };
+                let (fl, fr) = flown(steer, err, gs, yaw, dt);
+                let (nl, nr) = ours(steer, err, gs, yaw, dt);
+                if i >= 6 {
+                    assert!((fl - bl).abs() < 0.05 && (fr - br).abs() < 0.05, "{id} t {t}: as flown {fl:.3} {fr:.3} vs {bl} {br}");
+                }
+                // A right swing past 11 deg/s, still building, on the steer.
+                let building = i > 0 && yaw > ticks[i - 1].4 + 1.0;
+                if steer > 0.0 && yaw >= 11.0 && building {
+                    n += 1;
+                    flown_max = flown_max.max(br);
+                    ours_max = ours_max.max(nr);
+                    assert!(nl == 0.0, "{id} t {t}: no outside brake {nl}");
+                }
+            }
+            eprintln!("{id}: {n} ticks building past 11 deg/s: flown up to {flown_max:.3}, now {ours_max:.3}");
+            assert!(n >= 1 && flown_max >= 0.11, "{id}: {n} ticks, flown {flown_max}");
+            assert!(ours_max <= 0.02, "{id}: {ours_max:.3}");
+        }
+    }
+
+    /// The route full auto flew from the GA stand to 12 at LEMG (4,782 m,
+    /// `plan_to_runway` over the install's apt.dat, the drive's own
+    /// `total_m`), local metres at the vertex: 222 degrees, a 2 m kink the
+    /// paint left 15 m short of the vertex, then 86 degrees right onto 312.
+    const LEMG_12_VERTEX_PATH: [(f64, f64); 8] =
+        [(209.0, 230.4), (7.1, 8.5), (4.2, 5.7), (2.8, 5.0), (3.5, 3.1), (-5.5, -5.4), (-9.2, -2.1), (-195.8, 164.2)];
+
+    /// That vertex flown on the refitted plant over the iMac's ticks (0.3 to
+    /// 0.42 s) and governor (on its 4 kt cap to 2 kt over, as both flights
+    /// entered at 6.2 to 6.4 kt, creeping out at 0.1 to 0.2 m/s^2), with and
+    /// without the kink: as b6c24d5 flew it, up to 3.9 m off, the nose round
+    /// inside the vertex and the aircraft rolling on across the inside at a
+    /// walk; with the led ceiling ([`FREE_NOSE_RATE_LEAD_S`]) every one is
+    /// inside the line.
+    #[test]
+    fn a_free_nose_turns_the_lemg_12_vertex_on_the_line() {
+        use crate::scorecard::{TAXI_MAX_CUT_M, TAXI_MAX_LAT_M};
+        let kinked: &[(f64, f64)] = &LEMG_12_VERTEX_PATH;
+        let plain: &[(f64, f64)] = &[LEMG_12_VERTEX_PATH[0], LEMG_12_VERTEX_PATH[1], LEMG_12_VERTEX_PATH[5], LEMG_12_VERTEX_PATH[6], LEMG_12_VERTEX_PATH[7]];
+        let (mut worst_prev, mut worst_new) = ((0.0_f64, String::new()), (0.0_f64, String::new()));
+        for (name, path) in [("kinked", kinked), ("plain", plain)] {
+            for v0 in [8.0, 10.0] {
+                for dt in [0.3, 0.36, 0.42] {
+                    for over in [0.0, 1.0, 2.0] {
+                        for pull in [0.1, 0.2] {
+                            let fly = |brakes: &mut dyn FnMut(f64, f64, f64, f64, f64) -> (f64, f64)| {
+                                let run = CornerRun { dt, v0_kts: v0, imac: Some((over, pull)), brakes, judge_from_m: 280.0, yaw_cap: true };
+                                let ((cut, lat), _) = fly_sr22_corner_with(path, (108.1, 119.5), true, run);
+                                lat.max(cut - (TAXI_MAX_CUT_M - TAXI_MAX_LAT_M))
+                            };
+                            let why = format!("{name}, from {v0} kt, {dt} s, {over} kt over, pull {pull}");
+                            let prev = fly(&mut b6c24d5_free_nose_brakes());
+                            let new = fly(&mut free_nose_brakes());
+                            if prev > worst_prev.0 {
+                                worst_prev = (prev, why.clone());
+                            }
+                            if new > worst_new.0 {
+                                worst_new = (new, why);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        eprintln!("b6c24d5: worst {worst_prev:?}; now: worst {worst_new:?}");
+        assert!(worst_prev.0 > 3.5, "the plant must run b6c24d5 off the line: {worst_prev:?}");
+        assert!(worst_new.0 <= TAXI_MAX_LAT_M, "{worst_new:?}");
+    }
+
+    /// The led ceiling: a swing still building is judged where it is going,
+    /// a steady or dying one where it is, and only a free nose has it.
+    #[test]
+    fn a_building_swing_is_judged_where_it_is_going() {
+        // 1790736973: 5.4 to 13.6 deg/s in a 0.25 s tick.
+        let led = led_yaw_dps(13.63, Some(5.36), 0.25);
+        assert!(led > PIVOT_RATE_DPS + FREE_NOSE_RATE_SPAN_DPS, "{led}");
+        assert_eq!(free_nose_rate_scale(0.53, led), 0.0);
+        assert_eq!(pivot_rate_scale(0.53, 13.63), 1.0, "as read, the ceiling had not begun");
+        // Dying, steady, or the first tick: the rate as read.
+        assert_eq!(led_yaw_dps(20.0, Some(24.0), 0.3), 20.0);
+        assert_eq!(led_yaw_dps(20.0, Some(20.0), 0.3), 20.0);
+        assert_eq!(led_yaw_dps(20.0, None, 0.3), 20.0);
+        // A short tick differentiates over 0.1 s at most.
+        assert!((led_yaw_dps(3.0, Some(2.0), 0.01) - (3.0 + 10.0 * FREE_NOSE_RATE_LEAD_S)).abs() < 1e-9);
+        // A swing against the steer is never the ceiling's.
+        assert_eq!(free_nose_rate_scale(0.5, -40.0), 1.0);
+        // Every other nose keeps the ceiling as read.
+        let mut b = BrakeSteer::default();
+        let _ = b.step(0.6, 26.0, 4.2, 5.36, false, false, 0.3);
+        let (_, r) = b.step(0.6, 26.0, 4.2, 13.63, false, false, 0.25);
+        let mut f = BrakeSteer::default();
+        let _ = f.step(0.6, 26.0, 4.2, 5.36, false, true, 0.3);
+        let (_, rf) = f.step(0.6, 26.0, 4.2, 13.63, false, true, 0.25);
+        assert!(r > 0.0 && rf == 0.0, "linked {r}, free {rf}");
     }
 
     /// The corner cap is the SR22's (`taxi.max_yaw_dps`) and only a corner's:

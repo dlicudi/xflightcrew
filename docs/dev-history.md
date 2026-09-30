@@ -11883,3 +11883,59 @@ past 1.5, `line_up_aligned` `lat_m` inside 1.5, `line_up_check` `lateral_m` insi
 `power` `retard` "balloon", landing `sink_fpm` under 250 and no `bounce` over 1.5 ft, the
 `committed_flare` `remaining_m` no smaller than 314. If it floats, `touchdown_fpm` is the knob.
 Offline only.
+
+## 2026-09-30: a free nose takes its turn brake off before the swing arrives (#165)
+
+iMac 2026-09-30, the SR22 from LEMG's GA stand to 12: 1790732424 (d28e8f4) 5.1 m and 1790736973
+(b6c24d5, after 34c57c5's turn builder) 4.4 m, both at the same place, ~3,670 m to go. The "early
+left corner" is the walk BACK from a right vertex. The route (rebuilt with `plan_to_runway` over the
+install's apt.dat: 4,782.0 m, the drive's own `total_m`) runs 222 degrees, has a 2 m kink the paint
+left 15 m short, then turns 86 degrees right onto 312 at one vertex (cap 4.0 kt: 20 deg/s on its
+5.9 m radius). Both flights entered at 6.2 to 6.4 kt. The inside brake reached 0.21 to 0.22 at 4.1
+to 4.2 kt with the yaw at 5 to 7 deg/s; the rate ceiling (judged on the yaw as read) still left
+0.15 to 0.18 at 11 to 14 deg/s. The swing then built to 24 to 26 deg/s at 1.8 to 1.9 kt with the
+brake already off, and the speed fell to 0.8 to 1.2 kt. The nose came round inside the vertex and
+swung on 25 (1790736973) to 40 (1790732424) degrees past the new taxiway (heading from `err`, `lat`
+and the 12 m aim), and the aircraft crept on across the inside. The walk back left at up to 10.6
+deg/s came too late. The turn builder at 0.05 to 0.07 (walk authority 0.5 to 0.6 at 1 kt) was the
+end of it, not the cause. At 0.8 to 1.1 kt the aim also flipped 12 m / 16 m on alternate ticks
+(`bend_lookahead_cap_floor_m` returned no cap under 0.5 m/s), so `err` read -29 to -38, then -15 to
+-20, and the builder's brake went 0.06, 0, 0.07.
+
+Flown on the refitted plant over the iMac's ticks, the vertex (with and without the kink, from 8
+and 10 kt, 0 to 2 kt over the governor's target) runs b6c24d5's law up to 3.9 m off.
+
+Tried and dropped: a shorter corner aim at a walk (v x 3 to 6 s, 4 to 8 m floor) fixed this vertex
+(2.2 to 2.6 m) but ran the 110 degree LEMG corners wide (3.3 to 4.0 m): the aim shrank as the
+brakes slowed the aircraft mid-turn, the turn relaxed and swung out. A lower corner yaw cap (12 or
+15 deg/s) changed nothing (`CORNER_MIN_KTS` holds 3 kt) and broke the ramp corner. Walk authority
+whole by 1 kt (catch or builder) changed nothing on the plant. A lower ceiling start (8 deg/s)
+starved the 110 degree corners (4.6 to 6.5 m).
+
+The fix (free noses only; every other nose unchanged):
+- **The ceiling is judged on the yaw 1.2 s ahead** (`led_yaw_dps`, `free_nose_rate_scale`,
+  `FREE_NOSE_RATE_LEAD_S`, `FREE_NOSE_RATE_SPAN_DPS` 15). That is the rate plus its growth over the
+  tick while it builds, from 15 deg/s over 15. On the logged ticks the inside brake is 0 to 0.014
+  where 0.11 to 0.18 flew once the swing passes 11 deg/s and is still building.
+- **At a crawl a corner keeps its aim**: under 0.5 m/s the "straight" threshold scales with the
+  speed (the same 143 m radius) instead of the cap vanishing. Every other nose's crawl aim is its
+  16 m floor either way.
+
+Harness (all passing): the vertex, b6c24d5 worst 3.92 m, now 2.30. The LEMG corners grid 2.87 before,
+2.47 now. The walking corners 2.87, unchanged. The ramp corner's cut 2.93 before, 2.53 now (its
+right angle 2.86, now 2.44). The
+passing band is a lead of 1.0 to 1.4 s at span 15; 0.8 s and 1.6 s each fail one grid. Still open,
+not covered by any grid: a wider sweep (80 to 110 degrees, jogs -10/0/+10, up to 2.7 kt over) still
+runs 3.0 to 4.1 m on the plant, most of it in the approach at 8.7 kt or the no-jog vertices at 2 to
+2.7 kt over.
+
+Tests: `the_inside_brake_is_off_before_the_swing_arrives` (both flights' logged ticks, the law as
+flown reproduces the logged brakes), `a_free_nose_turns_the_lemg_12_vertex_on_the_line`,
+`a_building_swing_is_judged_where_it_is_going`, `a_gentle_bend_shortens_the_aim_and_a_straight_does_not`
+(the crawl case now keeps the floor).
+
+Next SR22 taxi, at that vertex (~3,670 m to go): `autotaxi` `drive` `br` falling to 0 by the tick
+`yaw_dps` passes about 11 and still rising (it flew 0.15 to 0.18 there). Then the peak `yaw_dps`
+under 20 and the speed staying over 1.5 kt through it, `err` not swinging past -20 after the vertex,
+and `look_m` steady at 12 under 1 kt. `stage_result` taxi `max_lat_m` under 3. The Evolution's corners
+likewise (the same law). Offline only.
