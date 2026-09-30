@@ -43,10 +43,12 @@ const LON: &str = "sim/flightmodel/position/longitude";
 const PSI_TRUE: &str = "sim/flightmodel/position/psi";
 #[cfg(test)]
 const GS_MS: &str = "sim/flightmodel/position/groundspeed";
+#[cfg(test)]
 const IAS: &str = "sim/flightmodel/position/indicated_airspeed";
 #[cfg(test)]
 const AGL_M: &str = "sim/flightmodel/position/y_agl";
 const MAG_VAR: &str = "sim/flightmodel/position/magnetic_variation";
+#[cfg(test)]
 const ON_GROUND: &str = "sim/flightmodel/failures/onground_any";
 /// The thrust lever THIS airframe obeys — not always the stock one (the
 /// Citation X tracks `throttle_jet_rev_ratio`, so every write to
@@ -75,23 +77,33 @@ const ELEV_TRIM: &str = "sim/cockpit2/controls/elevator_trim";
 const ALT_DIAL: &str = "sim/cockpit2/autopilot/altitude_dial_ft";
 const ALT_IND_FT: &str = sim::datarefs::ALTITUDE_FT;
 const TAXI_STEER: &str = "xcopilot/taxi_steer";
-const STEER_YIELD: &str = "xcopilot/steer_yield";
 const TAKEOFF_PITCH: &str = "xcopilot/pitch";
-const PITCH_YIELD: &str = "xcopilot/pitch_yield";
 const TAKEOFF_ROLL: &str = "xcopilot/roll";
-const ROLL_YIELD: &str = "xcopilot/roll_yield";
-/// Engine torque, N m per engine.
-const ENGN_TRQ: &str = "sim/flightmodel/engine/ENGN_TRQ";
 /// N1 per engine, percent: recorded at the thrust reduction, the evidence
 /// for the declared climb lever.
 const ENGN_N1: &str = "sim/flightmodel/engine/ENGN_N1_";
+#[cfg(test)]
 const THETA: &str = "sim/flightmodel/position/true_theta";
-const PHI: &str = "sim/flightmodel/position/true_phi";
-/// The sim's own pitch rate, deg/s — what the rotation law damps on. Measured,
-/// so it needs neither differencing nor a filter; see [`RotatePitch::step`].
-const PITCH_RATE: &str = "sim/flightmodel/position/Q";
 /// Yaw rate, deg/s, nose right positive: the roll law's damping.
 const YAW_RATE: &str = "sim/flightmodel/position/R";
+/// What the roll's tick reads past the position (`sim::state`, which names
+/// each dataref): airspeed, the wheels (`onground_any`), the plugin's
+/// pedal and yoke yields, true pitch and bank, the sim's own pitch rate
+/// (`Q`, deg/s: what the rotation law damps on, measured, so it needs
+/// neither differencing nor a filter; see [`RotatePitch::step`]), engine
+/// 1's torque (`ENGN_TRQ`, N m) and the yaw rate.
+const ROLL_WANT: &[sim::state::F] = &[
+    sim::state::F::Ias,
+    sim::state::F::OnGround,
+    sim::state::F::SteerYield,
+    sim::state::F::Theta,
+    sim::state::F::Phi,
+    sim::state::F::Q,
+    sim::state::F::PitchYield,
+    sim::state::F::RollYield,
+    sim::state::F::Trq0,
+    sim::state::F::R,
+];
 
 const M_TO_FT: f64 = 3.280_84;
 const MS_TO_KTS: f64 = 1.943_844;
@@ -2639,7 +2651,7 @@ fn takeoff_power() -> Option<crate::aircraft::TakeoffPowerProfile> {
     TAKEOFF_POWER.lock().unwrap_or_else(|e| e.into_inner()).clone()
 }
 
-/// Newton-metres to foot-pounds (`ENGN_TRQ` is in N m).
+/// Newton-metres to foot-pounds (`ENGN_TRQ`, `sim::state::F::Trq0`, is in N m).
 const NM_TO_FTLB: f64 = 0.737_562;
 /// From this share of the limit the lever stops advancing: a turboprop
 /// spooling up and gathering ram air keeps adding torque at a fixed lever.
@@ -3608,6 +3620,8 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, p: Params) {
     let mut last_tick: Option<std::time::Instant> = None;
     let roll_start = std::time::Instant::now();
     let mut frozen_secs = 0.0_f64;
+    // The tick's writes, sent together (`sim::state::Writes`).
+    let mut writes = sim::state::Writes::new();
     loop {
         if xp.cancelled() || !ACTIVE.load(Ordering::Relaxed) {
             RUN.record(sim::run::Outcome::PilotOverride);
@@ -3646,50 +3660,44 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, p: Params) {
             }
             return;
         }
+        // ONE read a tick (`sim::state`): the freeze flags, position,
+        // heading, groundspeed, height and vertical speed as ONE frame saw
+        // them (#157: read separately, latitude and longitude paired two
+        // frames, up to 2.9 m of cross-track for a tick on LEMG 13), and the
+        // speeds, attitude, rates, yields and torque with them, the
+        // profile's throttle beside it in the same round. Every round of
+        // requests is a sim frame: the freeze check, the read and four
+        // rounds of writes made the roll tick 0.34 s (dt median, iMac at 20
+        // fps, 2026-09-30) against its 150 ms sleep. An older plugin falls
+        // back to the separate reads, still one round, and the tick says
+        // which (`pos`).
+        let thr_dref = throttle_dref();
+        let (st, extra) =
+            sim::state::read_with(&xp, sim::state::Want(ROLL_WANT), &[thr_dref.as_str()]).await;
         // Pause or replay: freeze — no writes, and the stagnation clock
         // slides instead of burning (the recover watcher's rule).
-        if crate::xplane::sim_frozen(&xp).await {
+        if st.frozen() {
             tokio::time::sleep(std::time::Duration::from_millis(400)).await;
             frozen_secs += 0.4;
             continue;
         }
-        // One concurrent read burst: sequentially these eleven round trips
-        // took ~350 ms and dragged the control tick to half a second — the
-        // lag behind the fourth sortie's weave. Joined, the tick runs at
-        // the sleep rate.
-        let thr_dref = throttle_dref();
-        let (
-            pos,
-            ias,
-            on_ground,
-            steer_yield,
-            thr_read,
-            theta,
-            phi,
-            pitch_q,
-            pitch_yield,
-            roll_yield,
-            torque_nm,
-            yaw_r,
-        ) = tokio::join!(
-            // Position, heading, groundspeed, height and vertical speed as
-            // ONE frame saw them (#157): read separately, latitude and
-            // longitude paired two frames, up to 2.9 m of cross-track for a
-            // tick on LEMG 13. An older plugin falls back to the separate
-            // reads, and the tick says which (`pos`).
-            sim::position::read(&xp),
-            xp.get_float(IAS),
-            xp.get_float(ON_GROUND),
-            xp.get_float(STEER_YIELD),
-            xp.get_float(&thr_dref),
-            xp.get_float(THETA),
-            xp.get_float(PHI),
-            xp.get_float(PITCH_RATE),
-            xp.get_float(PITCH_YIELD),
-            xp.get_float(ROLL_YIELD),
-            xp.get_float_array(ENGN_TRQ),
-            xp.get_float(YAW_RATE),
+        use sim::state::F;
+        let pos = st.position();
+        let (ias, on_ground, steer_yield, theta, phi, pitch_q) = (
+            st.get(F::Ias),
+            st.get(F::OnGround),
+            st.get(F::SteerYield),
+            st.get(F::Theta),
+            st.get(F::Phi),
+            st.get(F::Q),
         );
+        let (pitch_yield, roll_yield, torque_nm, yaw_r) = (
+            st.get(F::PitchYield),
+            st.get(F::RollYield),
+            st.get(F::Trq0),
+            st.get(F::R),
+        );
+        let thr_read = extra.into_iter().next().unwrap_or_else(|| Err(anyhow::anyhow!("unread")));
         let (lat, lon) = sim::position::lat_lon(&pos);
         let psi = sim::position::field(&pos, |p| p.psi_true_deg);
         let gs_ms = sim::position::field(&pos, |p| p.gs_ms);
@@ -3702,7 +3710,6 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, p: Params) {
         let vs_flown = vs_read.ok().filter(|v| v.is_finite());
         let torque_ftlb = torque_nm
             .ok()
-            .and_then(|v| v.first().copied())
             .filter(|v| v.is_finite())
             .map(|v| v * NM_TO_FTLB);
         let Some([lat, lon, psi, gs_ms, ias, agl_m, on_ground, theta_deg, phi_deg, q]) =
@@ -3810,7 +3817,8 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, p: Params) {
         } else {
             thr_challenged = false;
         }
-        let _ = xp.set_float(&throttle_dref(), thr_cmd).await;
+        // Queued, and sent with the tick's other writes in ONE round.
+        writes.set(&thr_dref, thr_cmd);
         last_thr_cmd = thr_cmd;
 
         if !airborne {
@@ -3932,10 +3940,9 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, p: Params) {
                 (0.0, 0.0)
             };
             if brake_steer {
-                let _ = tokio::join!(
-                    xp.set_float(crate::autotaxi::LEFT_BRAKE, bl),
-                    xp.set_float(crate::autotaxi::RIGHT_BRAKE, br),
-                );
+                writes
+                    .set(crate::autotaxi::LEFT_BRAKE, bl)
+                    .set(crate::autotaxi::RIGHT_BRAKE, br);
             }
             // Rotated with the wheels off (under the 8 ft liftoff): the
             // rudder lets go, as it does at the liftoff, and the track is the
@@ -3946,19 +3953,7 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, p: Params) {
             // off while the cross-track ran 2.7 to 7.1 m.
             let floating = rotated && on_ground < 0.5;
             let rudder = if floating { 0.0 } else { steer };
-            if xp.set_float(TAXI_STEER, rudder).await.is_err() {
-                reject_rolling(
-                    &xp,
-                    &voice,
-                    "I've lost the steering. Rejecting takeoff.",
-                    "steer_lost",
-                    &rwy,
-                    &mut steer_law,
-                    p.park_brake_valve_set,
-                )
-                .await;
-                return;
-            }
+            writes.set(TAXI_STEER, rudder);
             if !rotated {
                 DETAIL.set(format!(
                     "rolling, {} kt, rotate at {} kt",
@@ -4050,28 +4045,42 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, p: Params) {
                 };
                 let ail = wings.step(phi_deg, bank, dt);
                 crate::monitor::note_crew_yoke();
-                let (wp, wr) = tokio::join!(
-                    xp.set_float(TAKEOFF_PITCH, pitch),
-                    xp.set_float(TAKEOFF_ROLL, ail)
-                );
-                if wp.is_err() || wr.is_err() {
-                    reject_rolling(
-                        &xp,
-                        &voice,
-                        "I've lost the elevator. Rejecting takeoff.",
-                        "pitch_lost",
-                        &rwy,
-                        &mut steer_law,
-                        p.park_brake_valve_set,
-                    )
-                    .await;
-                    return;
-                }
+                writes.set(TAKEOFF_PITCH, pitch).set(TAKEOFF_ROLL, ail);
             }
             // Airborne only once clearly clear of the surface: a ground-
             // effect bounce (on_ground false at 2 ft, back down a tick
             // later — second sortie) must not stop the steering while the
             // wheels are about to touch again at speed.
+            // The roll's writes, all at once: the lever, the brakes, the
+            // rudder and the column in ONE round (they were four, one after
+            // another, 2026-09-30). A lost channel is judged on the result.
+            let done = writes.flush(&xp).await;
+            if done.ok(TAXI_STEER) == Some(false) {
+                reject_rolling(
+                    &xp,
+                    &voice,
+                    "I've lost the steering. Rejecting takeoff.",
+                    "steer_lost",
+                    &rwy,
+                    &mut steer_law,
+                    p.park_brake_valve_set,
+                )
+                .await;
+                return;
+            }
+            if done.ok(TAKEOFF_PITCH) == Some(false) || done.ok(TAKEOFF_ROLL) == Some(false) {
+                reject_rolling(
+                    &xp,
+                    &voice,
+                    "I've lost the elevator. Rejecting takeoff.",
+                    "pitch_lost",
+                    &rwy,
+                    &mut steer_law,
+                    p.park_brake_valve_set,
+                )
+                .await;
+                return;
+            }
             if on_ground < 0.5 && ias > p.vr_kts * 0.8 && agl_ft > 8.0 {
                 airborne = true;
                 let _ = xp.set_float(TAXI_STEER, 0.0).await;
@@ -4096,6 +4105,11 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, p: Params) {
             continue;
         }
 
+        // Airborne: the lever goes now, as it always has, except on the
+        // hand-flown climb, where it rides the column's round.
+        if ap_engaged || agl_ft >= AP_ENGAGE_AGL_FT {
+            writes.flush(&xp).await;
+        }
         // Airborne: pitch attitude by hand until established, then the AP.
         if !positive_called && agl_ft > 50.0 {
             positive_called = true;
@@ -4201,11 +4215,9 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, p: Params) {
                 let pitch = pitch_law.step_climb(theta_deg, pitch_rate, dt, Some((ias, agl_ft)));
                 let ail = wings.step(phi_deg, climb_bank_target(hdg_err), dt);
                 crate::monitor::note_crew_yoke();
-                let (wp, wr) = tokio::join!(
-                    xp.set_float(TAKEOFF_PITCH, pitch),
-                    xp.set_float(TAKEOFF_ROLL, ail)
-                );
-                if wp.is_err() || wr.is_err() {
+                writes.set(TAKEOFF_PITCH, pitch).set(TAKEOFF_ROLL, ail);
+                let done = writes.flush(&xp).await;
+                if done.ok(TAKEOFF_PITCH) == Some(false) || done.ok(TAKEOFF_ROLL) == Some(false) {
                     alert(
                         &voice,
                         Priority::Warning,

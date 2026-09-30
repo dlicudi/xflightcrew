@@ -97,7 +97,7 @@ const SLOW_DATAREF_TTL: std::time::Duration = std::time::Duration::from_millis(5
 /// name that is not there (a request of frame time each), so a miss is
 /// remembered for [`ABSENT_RECHECK`] and asked again after, which also
 /// finds the dataref once a newer plugin is reloaded.
-const OPTIONAL_DATAREFS: &[&str] = &["xcopilot/position", SIM_LOADING];
+const OPTIONAL_DATAREFS: &[&str] = &["xcopilot/position", crate::state::STATE, SIM_LOADING];
 /// How long a missing [`OPTIONAL_DATAREFS`] name is taken as missing.
 const ABSENT_RECHECK: std::time::Duration = std::time::Duration::from_secs(10);
 
@@ -519,13 +519,17 @@ pub trait XPlane: Send + Sync {
 /// (a P+D throttle law ticking against a frozen airspeed walks the lever to
 /// its clamp and surges on unpause), no blackbox — and the monitor skips its
 /// reactive tick. Fail open: a failed read means live.
+///
+/// Both flags in ONE round: asked one after the other they were two frames
+/// of a tick whenever their half-second cache had run out, about every
+/// other tick of a loop ticking at 0.4 s (iMac 2026-09-30: a request is a
+/// frame, 50 ms at 20 fps, and concurrent requests share it).
 pub async fn sim_frozen(xp: &dyn XPlane) -> bool {
-    for dref in [crate::datarefs::IS_IN_REPLAY, crate::datarefs::PAUSED] {
-        if xp.get_float(dref).await.is_ok_and(|v| v > 0.5) {
-            return true;
-        }
-    }
-    false
+    let (replay, paused) = tokio::join!(
+        xp.get_float(crate::datarefs::IS_IN_REPLAY),
+        xp.get_float(crate::datarefs::PAUSED),
+    );
+    replay.is_ok_and(|v| v > 0.5) || paused.is_ok_and(|v| v > 0.5)
 }
 
 /// HTTP client for one running X-Plane instance.
@@ -1637,6 +1641,105 @@ impl XPlane for FakeXPlane {
     }
 }
 
+/// A fake that answers like X-Plane's Web API in TIME: every request is
+/// served at the next frame boundary, and requests in flight together share
+/// that frame. Measured on the iMac at 20 fps on 2026-09-30: one GET 46 ms,
+/// two to eight concurrent GETs 44 to 51 ms, six sequential GETs 312 ms.
+/// On a paused tokio clock [`FramedXPlane::rounds`] counts the frames a
+/// piece of code waits on, the number a control tick's period is made of.
+/// A data read with no preset (a plugin dataref an older `.xpl` lacks)
+/// fails at once, as the client's absent memory answers it.
+pub struct FramedXPlane<X: XPlane> {
+    pub inner: X,
+    frame: std::time::Duration,
+    t0: tokio::time::Instant,
+    requests: std::sync::atomic::AtomicUsize,
+}
+
+impl<X: XPlane> FramedXPlane<X> {
+    pub fn new(inner: X, frame: std::time::Duration) -> Self {
+        Self {
+            inner,
+            frame,
+            t0: tokio::time::Instant::now(),
+            requests: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    /// Requests served so far.
+    pub fn requests(&self) -> usize {
+        self.requests.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn frame_no(&self, t: tokio::time::Instant) -> u128 {
+        t.duration_since(self.t0).as_nanos() / self.frame.as_nanos()
+    }
+
+    async fn serve(&self) {
+        self.requests
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let next = self.frame_no(tokio::time::Instant::now()) + 1;
+        let at = self.t0 + self.frame * next as u32;
+        tokio::time::sleep_until(at).await;
+    }
+
+    /// The frames and requests `f` waits on: `(rounds, requests)`.
+    pub async fn rounds<F, Fut>(&self, f: F) -> (usize, usize)
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = ()>,
+    {
+        let (start, n0) = (tokio::time::Instant::now(), self.requests());
+        f().await;
+        let frames = self.frame_no(tokio::time::Instant::now()) - self.frame_no(start);
+        (frames as usize, self.requests() - n0)
+    }
+}
+
+#[async_trait]
+impl<X: XPlane> XPlane for FramedXPlane<X> {
+    async fn get_float(&self, name: &str) -> Result<f64> {
+        self.serve().await;
+        self.inner.get_float(name).await
+    }
+    async fn set_float(&self, name: &str, value: f64) -> Result<()> {
+        self.serve().await;
+        self.inner.set_float(name, value).await
+    }
+    async fn set_int(&self, name: &str, value: i64) -> Result<()> {
+        self.serve().await;
+        self.inner.set_int(name, value).await
+    }
+    async fn run_command(&self, name: &str) -> Result<()> {
+        self.serve().await;
+        self.inner.run_command(name).await
+    }
+    async fn run_command_for(&self, name: &str, duration: f64) -> Result<()> {
+        self.serve().await;
+        self.inner.run_command_for(name, duration).await
+    }
+    async fn get_float_array(&self, name: &str) -> Result<Vec<f64>> {
+        self.serve().await;
+        self.inner.get_float_array(name).await
+    }
+    async fn set_int_array_elem(&self, name: &str, index: usize, value: i64) -> Result<()> {
+        self.serve().await;
+        self.inner.set_int_array_elem(name, index, value).await
+    }
+    async fn set_float_array_elem(&self, name: &str, index: usize, value: f64) -> Result<()> {
+        self.serve().await;
+        self.inner.set_float_array_elem(name, index, value).await
+    }
+    async fn get_bytes(&self, name: &str) -> Result<Vec<u8>> {
+        // Absent: the client's memory answers, no request.
+        let r = self.inner.get_bytes(name).await;
+        if r.is_ok() {
+            self.serve().await;
+        }
+        r
+    }
+}
+
 #[cfg(test)]
 mod load_tests {
     /// The cache window has to be short enough that no control law can tell.
@@ -1837,6 +1940,53 @@ mod failure_sequences {
         server.join().unwrap();
     }
 
+    /// A control tick's whole reading over the real client: the id once,
+    /// then ONE request a tick (the server answers exactly these three; a
+    /// split read would ask for a dozen names and fail here).
+    #[tokio::test]
+    async fn the_state_frame_is_one_request_a_tick() {
+        use crate::state::{self, Want, F};
+        let p = crate::position::Position {
+            lat: 51.1537,
+            lon: -0.1821,
+            elev_m: 62.0,
+            psi_true_deg: 77.0,
+            gs_ms: 70.0,
+            vs_fpm: -700.0,
+            agl_m: 150.0,
+            frame: Some(4242),
+            sim_time_s: Some(99.5),
+            source: crate::position::Source::Plugin,
+        };
+        let s = state::State::from_parts(
+            Ok(p),
+            &[(F::Ias, 140.0), (F::Paused, 0.0), (F::Replay, 0.0), (F::Phi, -2.0)],
+            state::Source::Plugin,
+        );
+        let b64 = base64::engine::general_purpose::STANDARD.encode(state::encode(&s));
+        let body: &'static str = Box::leak(format!(r#"{{"data":"{b64}"}}"#).into_boxed_str());
+        let (base, server) = server(vec![
+            reply(
+                "GET /api/v1/datarefs?",
+                200,
+                r#"{"data":[{"id":8,"name":"xcopilot/state"}]}"#,
+            ),
+            reply("GET /api/v1/datarefs/8/value", 200, body),
+            reply("GET /api/v1/datarefs/8/value", 200, body),
+        ]);
+        let xp = XPlaneClient::new(base.clone());
+        let want = Want(&[F::Ias, F::Phi, F::OnGround]);
+        let first = state::read(&xp, want).await;
+        assert_eq!(first.source, state::Source::Plugin);
+        assert_eq!(first.position().unwrap(), p);
+        assert_eq!(first.get(F::Ias).unwrap(), 140.0);
+        assert!(first.get(F::OnGround).is_err(), "NaN in the frame: unread");
+        assert!(!first.frozen());
+        VALUE_CACHE.lock().await.remove(&base); // the next tick
+        assert_eq!(state::read(&xp, want).await, first);
+        server.join().unwrap();
+    }
+
     #[tokio::test]
     async fn cancellation_during_resolution_prevents_the_later_patch() {
         let cancel = Arc::new(AtomicBool::new(false));
@@ -1887,6 +2037,8 @@ mod failure_sequences {
 
     #[tokio::test]
     async fn pause_defers_handoff_until_live_measurements_resume() {
+        // The two flags go out together (one round), in either order: the
+        // ids are resolved first, then each value phase answers both alike.
         let (base, server) = server(vec![
             reply(
                 "GET /api/v1/datarefs?",
@@ -1899,15 +2051,42 @@ mod failure_sequences {
                 200,
                 r#"{"data":[{"id":2,"name":"sim/time/paused"}]}"#,
             ),
-            reply("GET /api/v1/datarefs/2/value", 200, r#"{"data":1}"#),
-            reply("GET /api/v1/datarefs/1/value", 200, r#"{"data":0}"#),
             reply("GET /api/v1/datarefs/2/value", 200, r#"{"data":0}"#),
+            reply("GET /api/v1/datarefs/", 200, r#"{"data":1}"#),
+            reply("GET /api/v1/datarefs/", 200, r#"{"data":1}"#),
+            reply("GET /api/v1/datarefs/", 200, r#"{"data":0}"#),
+            reply("GET /api/v1/datarefs/", 200, r#"{"data":0}"#),
         ]);
         let xp = XPlaneClient::new(base.clone());
+        xp.get_float(crate::datarefs::IS_IN_REPLAY).await.unwrap();
+        xp.get_float(crate::datarefs::PAUSED).await.unwrap();
+        VALUE_CACHE.lock().await.remove(&base);
         assert!(sim_frozen(&xp).await);
         VALUE_CACHE.lock().await.remove(&base); // next sample after cache expiry
         assert!(!sim_frozen(&xp).await);
         server.join().unwrap();
+    }
+
+    /// Either flag freezes; an unread one is live (fail open).
+    #[tokio::test]
+    async fn either_flag_freezes_and_an_unread_one_is_live() {
+        use crate::datarefs::{IS_IN_REPLAY, PAUSED};
+        assert!(sim_frozen(&FakeXPlane::with_reads(&[(PAUSED, 1.0), (IS_IN_REPLAY, 0.0)])).await);
+        assert!(sim_frozen(&FakeXPlane::with_reads(&[(PAUSED, 0.0), (IS_IN_REPLAY, 1.0)])).await);
+        assert!(!sim_frozen(&FakeXPlane::with_reads(&[(PAUSED, 0.0), (IS_IN_REPLAY, 0.0)])).await);
+        assert!(!sim_frozen(&FakeXPlane::new()).await);
+    }
+
+    /// One round, not two.
+    #[tokio::test(start_paused = true)]
+    async fn the_freeze_check_is_one_round() {
+        use crate::datarefs::{IS_IN_REPLAY, PAUSED};
+        let xp = FramedXPlane::new(
+            FakeXPlane::with_reads(&[(PAUSED, 0.0), (IS_IN_REPLAY, 0.0)]),
+            std::time::Duration::from_millis(50),
+        );
+        let (rounds, requests) = xp.rounds(|| async { assert!(!sim_frozen(&xp).await) }).await;
+        assert_eq!((rounds, requests), (1, 2));
     }
 
     /// The load gate's one-flag-read-at-a-time lock is process-wide (one

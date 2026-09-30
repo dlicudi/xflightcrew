@@ -8,6 +8,7 @@
 pub mod blackbox;
 pub mod datarefs;
 pub mod position;
+pub mod state;
 pub mod xplane;
 
 pub mod run;

@@ -478,6 +478,48 @@ const FLAP_RATIO: &str = "sim/cockpit2/controls/flap_ratio";
 // same channels the taxi governor drives.
 const TAXI_STEER: &str = "xcopilot/taxi_steer";
 const TAXI_BRAKE: &str = "xcopilot/taxi_brake";
+use sim::state::F;
+/// What a tick reads past the position (`sim::state`; each field names its
+/// dataref): the constants above (`MAG_VAR`, `IAS`, `HPATH_TRUE`,
+/// `ON_GROUND`, `PHI_TRUE`, `VVI_FPM`, `SERVOS_ON`, `HDG_STATUS`,
+/// `VS_STATUS`, `HDG_BUG`) and the plugin's yields.
+const AUTOLAND_WANT: &[F] = &[
+    F::MagVar,
+    F::Ias,
+    F::Hpath,
+    F::OnGround,
+    F::Phi,
+    F::Vvi,
+    F::Servos,
+    F::HdgStatus,
+    F::VsStatus,
+    F::Bug,
+    F::PitchYield,
+    F::RollYield,
+];
+/// ...and with the ILS tuned, its needles and modes (`crate::ils`).
+const AUTOLAND_WANT_ILS: &[F] = &[
+    F::MagVar,
+    F::Ias,
+    F::Hpath,
+    F::OnGround,
+    F::Phi,
+    F::Vvi,
+    F::Servos,
+    F::HdgStatus,
+    F::VsStatus,
+    F::Bug,
+    F::PitchYield,
+    F::RollYield,
+    F::Hdef,
+    F::Vdef,
+    F::LocValid,
+    F::GsValid,
+    F::GsStatus,
+    F::ApprStatus,
+];
+/// A lever read this close to the last command took it (`lever_took`).
+const LEVER_TOOK_TOL: f64 = 0.01;
 /// The gentler brake hold once stopped.
 const ROLLOUT_BRAKE_HOLD: f64 = 0.5;
 
@@ -1747,6 +1789,10 @@ pub fn run_autoland_scoped(
             // next tick with a climb read (#181).
             let mut authority_owed = false;
             let mut ils_xcheck = crate::ils::XCheck::default();
+            // The tick's writes, sent in one round (`sim::state::Writes`),
+            // and the lever last written, for `lever_took`.
+            let mut writes = sim::state::Writes::new();
+            let mut last_thr_written: Option<f64> = None;
             let mut coupling = crate::ils::Coupling::Off;
             let mut coupling_armed_s = 0.0_f64;
             loop {
@@ -1758,19 +1804,48 @@ pub fn run_autoland_scoped(
                 // and ticking the throttle governor against a frozen airspeed
                 // walks the lever to its clamp for a surge on unpause. Freeze
                 // (no writes, no state, no blackbox) and resume when it's live.
-                if crate::xplane::sim_frozen(&xp).await {
+                //
+                // ONE read a tick (`sim::state`): the freeze flags, position,
+                // height, groundspeed and heading as ONE frame saw them (#157:
+                // read separately, latitude and longitude paired two frames,
+                // metres of cross-track for a tick at speed), and with them
+                // everything the tick used to ask for later: the VSI, the
+                // lever (the profile's own beside the frame), the servos, the
+                // mode lights, the bug, the ILS needles and the yields. Every
+                // round of requests is a sim frame: the freeze check, this
+                // read, the VSI and lever, the ILS, the knob and yields, the
+                // lever write and its read back made Final 0.56 s (`power` dt
+                // median) against a 200 ms sleep and the Flare 0.39 s against
+                // 100 ms on the iMac at 20 fps (2026-09-30), where a MacBook
+                // ran near 0.3. An older plugin falls back to separate reads,
+                // still one round.
+                let thr_name = throttle_dref();
+                let appr_name = crate::ils::approach_status_dref();
+                let (st, extra) = if ils.is_some() {
+                    sim::state::read_with(
+                        &xp,
+                        sim::state::Want(AUTOLAND_WANT_ILS),
+                        &[thr_name.as_str(), appr_name.as_str()],
+                    )
+                    .await
+                } else {
+                    sim::state::read_with(&xp, sim::state::Want(AUTOLAND_WANT), &[thr_name.as_str()])
+                        .await
+                };
+                if st.frozen() {
                     tokio::time::sleep(std::time::Duration::from_millis(400)).await;
                     continue;
                 }
-                // One read burst — nine sequential HTTP awaits is the slow-tick
-                // disease that gave the takeoff its slew weave (sortie four).
-                // Position, height, groundspeed and heading as ONE frame saw
-                // them (#157): read separately, latitude and longitude paired
-                // two frames, metres of cross-track for a tick at speed.
-                let (pos, var_r, ias_r, hpath_r, ground_r, phi_r) = tokio::join!(
-                    sim::position::read(&xp), xp.get_float(MAG_VAR),
-                    xp.get_float(IAS), xp.get_float(HPATH_TRUE),
-                    xp.get_float(ON_GROUND), xp.get_float(PHI_TRUE),
+                let mut extra = extra.into_iter();
+                let mut throttle_read = Some(extra.next().unwrap_or_else(|| Err(anyhow::anyhow!("unread"))));
+                let mut appr_read = extra.next();
+                let pos = st.position();
+                let (var_r, ias_r, hpath_r, ground_r, phi_r) = (
+                    st.get(F::MagVar),
+                    st.get(F::Ias),
+                    st.get(F::Hpath),
+                    st.get(F::OnGround),
+                    st.get(F::Phi),
                 );
                 let (lat_r, lon_r) = sim::position::lat_lon(&pos);
                 let elev_r = sim::position::field(&pos, |p| p.elev_m);
@@ -2066,15 +2141,16 @@ pub fn run_autoland_scoped(
                         (true, Some(phi), Some(tgt)) => Some(wings.step(phi, tgt, roll_dt)),
                         _ => None,
                     };
+                    // Queued: the rollout's writes go out in one round below.
                     if let Some(a) = air_ail {
                         // Ours, not a hand: unmarked, the scorer read this
                         // bounce's bank as a pilot's yoke (LEMG 13 SR22
                         // 1790697159, yoke_under_ap yr -0.18, 2026-09-29).
                         crate::monitor::note_crew_yoke();
-                        let _ = xp.set_float(FLARE_ROLL, a).await;
+                        writes.set(FLARE_ROLL, a);
                     } else if bounce == BounceTick::Landed && arrest_hands {
                         // The rollout entry's centring, again at the wheels.
-                        let _ = xp.set_float(FLARE_ROLL, 0.0).await;
+                        writes.set(FLARE_ROLL, 0.0);
                     }
                     // Brake by wanted deceleration, not a fixed clamp: a
                     // comfortable rate when the runway allows it, harder
@@ -2139,18 +2215,12 @@ pub fn run_autoland_scoped(
                             "bank_tgt": airborne.then_some(air_bank_tgt).flatten(),
                         }),
                     );
-                    let thr_dref = throttle_dref();
-                    let (_, _, _) = tokio::join!(
-                        xp.set_float(&thr_dref, 0.0),
-                        xp.set_float(TAXI_STEER, steer),
-                        async {
-                            if let Some(e) = touch_elev {
-                                // Ours, not a hand (the scorer's yoke check).
-                                crate::monitor::note_crew_yoke();
-                                let _ = xp.set_float(FLARE_PITCH, e).await;
-                            }
-                        },
-                    );
+                    writes.set(&thr_name, 0.0).set(TAXI_STEER, steer);
+                    if let Some(e) = touch_elev {
+                        // Ours, not a hand (the scorer's yoke check).
+                        crate::monitor::note_crew_yoke();
+                        writes.set(FLARE_PITCH, e);
+                    }
                     // A vacate follows: hand off ROLLING at taxi pace — the
                     // completion of a landing is clearing the runway, and a
                     // dead stop on the strip followed by a re-acceleration was
@@ -2158,6 +2228,7 @@ pub fn run_autoland_scoped(
                     // The vacate drive arms the governor from the current
                     // position, which takes a rolling aircraft like any join.
                     if vacate_follows && gs_kts <= VACATE_HANDOFF_KTS {
+                        writes.flush(&xp).await;
                         let _ = xp.set_float(TAXI_BRAKE, 0.0).await;
                         let _ = xp.set_float(TAXI_STEER, 0.0).await;
                         if rollout_brake_steer {
@@ -2175,15 +2246,16 @@ pub fn run_autoland_scoped(
                     if gs_kts > 2.0 {
                         // The steering pair every tick with the stop: the
                         // plugin's channels are one-second heartbeats.
+                        // With the lever, the rudder and the column: the
+                        // rollout's ONE write round (it was two or three,
+                        // 0.48 s a tick against a 300 ms sleep, 2026-09-30).
+                        writes.set(TAXI_BRAKE, brakes.sym);
                         if rollout_brake_steer {
-                            let _ = tokio::join!(
-                                xp.set_float(TAXI_BRAKE, brakes.sym),
-                                xp.set_float(crate::autotaxi::LEFT_BRAKE, brakes.left),
-                                xp.set_float(crate::autotaxi::RIGHT_BRAKE, brakes.right),
-                            );
-                        } else {
-                            let _ = xp.set_float(TAXI_BRAKE, brakes.sym).await;
+                            writes
+                                .set(crate::autotaxi::LEFT_BRAKE, brakes.left)
+                                .set(crate::autotaxi::RIGHT_BRAKE, brakes.right);
                         }
+                        writes.flush(&xp).await;
                         set_panel(&format!("AUTOLAND {} {} ROLLOUT", rwy.icao, rwy.id));
                         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
                         continue;
@@ -2195,6 +2267,7 @@ pub fn run_autoland_scoped(
                     // it let go the moment this loop ended, and at EGSS the
                     // 737 sat on the runway after "Brakes on" with
                     // `parking_brake_ratio` at 0.03 (2026-09-22).
+                    writes.flush(&xp).await;
                     let _ = xp.set_float(TAXI_BRAKE, ROLLOUT_BRAKE_HOLD).await;
                     let _ = xp.set_float(TAXI_STEER, 0.0).await;
                     if rollout_brake_steer {
@@ -3114,13 +3187,12 @@ pub fn run_autoland_scoped(
                 // disguise: the dial gets the bare target that tick, the
                 // watchdog does not count it, and the blackbox keeps `null`
                 // so the debrief can see the gauge was missing.
-                let throttle_name = throttle_dref();
-                let (vvi_read, throttle_read, servos_read) = tokio::join!(
-                    xp.get_float(VVI_FPM), xp.get_float(&throttle_name),
-                    async {
-                        if engage.confirmed() { None } else { xp.get_float(SERVOS_ON).await.ok() }
-                    },
-                );
+                // From the tick's one read (`st`), no round of its own.
+                let vvi_read = st.get(F::Vvi);
+                let throttle_read = throttle_read
+                    .take()
+                    .unwrap_or_else(|| Err(anyhow::anyhow!("unread")));
+                let servos_read = if engage.confirmed() { None } else { st.opt(F::Servos) };
                 // The engage watch (see `ApEngage`): re-press until the
                 // servos read on with the sim live, each try on the tape.
                 let engage_now = engage_t0.elapsed().as_secs_f64();
@@ -3508,16 +3580,19 @@ pub fn run_autoland_scoped(
                 // approach where the airframe allows it.
                 let on_final = g.phase == ApproachPhase::Final && pattern.is_none() && !ga;
                 let needles = if ils.is_some() {
-                    let appr_dref = crate::ils::approach_status_dref();
-                    let (h, v, lv, gv, ap, gs, stock_ap) = tokio::join!(
-                        xp.get_float(crate::ils::HDEF),
-                        xp.get_float(crate::ils::VDEF),
-                        xp.get_float(crate::ils::LOC_VALID),
-                        xp.get_float(crate::ils::GS_VALID),
-                        xp.get_float(&appr_dref),
-                        xp.get_float(crate::ils::GS_STATUS),
-                        xp.get_float(crate::ils::APPR_STATUS),
+                    // From the tick's one read; the airframe's own
+                    // approach status rode beside the frame.
+                    let (h, v, lv, gv, gs, stock_ap) = (
+                        st.get(F::Hdef),
+                        st.get(F::Vdef),
+                        st.get(F::LocValid),
+                        st.get(F::GsValid),
+                        st.get(F::GsStatus),
+                        st.get(F::ApprStatus),
                     );
+                    let ap = appr_read
+                        .take()
+                        .unwrap_or_else(|| Err(anyhow::anyhow!("unread")));
                     // Both readings, while an airframe's own status is being
                     // learned (the 737's app_status, 2026-09-26).
                     LAST_APPR_READS
@@ -3622,54 +3697,55 @@ pub fn run_autoland_scoped(
                         Some(mag_hdg)
                     }
                 };
-                let (knob_read, hdg_st, vs_st, _, yield_r, roll_yield_r) = tokio::join!(
-                    async {
-                        match knob_set {
-                            Some(h) => {
-                                Some(crate::tools::autopilot::drive_heading_bug_step(&xp, h, 30.0).await)
-                            }
-                            None => None,
-                        }
-                    },
-                    xp.get_float(HDG_STATUS),
-                    xp.get_float(VS_STATUS),
-                    async {
-                        if cpl.own_vertical {
-                            xp.set_float(VS_DIAL, vs_dial).await
-                        } else {
-                            Ok(())
-                        }
-                    },
-                    async {
-                        match flare_elev {
-                            Some(e) => {
-                                crate::monitor::note_crew_yoke();
-                                let _ = xp.set_float(FLARE_PITCH, e).await;
-                                xp.get_float(FLARE_PITCH_YIELD).await
-                            }
-                            None => Ok(0.0),
-                        }
-                    },
-                    async {
-                        match flare_ail {
-                            Some(a) => {
-                                crate::monitor::note_crew_yoke();
-                                let _ = xp.set_float(FLARE_ROLL, a).await;
-                                xp.get_float(FLARE_ROLL_YIELD).await
-                            }
-                            None => Ok(0.0),
-                        }
-                    },
-                );
-                if let (Some((key, _)), Some(h)) = (knob, knob_set) {
-                    bug_hold.took(knob_read);
-                    crate::blackbox::record(
-                        "autoland",
-                        serde_json::json!({"event": "heading_set", "key": key, "hdg": h,
-                            "read": knob_read, "phase": format!("{:?}", g.phase),
-                            "radio": radio_ft}),
-                    );
+                // The mode lights and the yields come from the tick's one
+                // read; the VS dial, the column, the ailerons and a fine bug
+                // correction are QUEUED and go out with the lever in the
+                // tick's one write round below. A yield is read as it always
+                // was, only on a tick that writes its channel; the latch now
+                // comes from the tick's read, a frame before this tick's
+                // write, and the plugin drops the override on its own frame
+                // either way (the write that follows a yield is ignored).
+                let hdg_st = st.get(F::HdgStatus);
+                let vs_st = st.get(F::VsStatus);
+                if cpl.own_vertical {
+                    writes.set(VS_DIAL, vs_dial);
                 }
+                let yield_r = match flare_elev {
+                    Some(e) => {
+                        crate::monitor::note_crew_yoke();
+                        writes.set(FLARE_PITCH, e);
+                        st.get(F::PitchYield)
+                    }
+                    None => Ok(0.0),
+                };
+                let roll_yield_r = match flare_ail {
+                    Some(a) => {
+                        crate::monitor::note_crew_yoke();
+                        writes.set(FLARE_ROLL, a);
+                        st.get(F::RollYield)
+                    }
+                    None => Ok(0.0),
+                };
+                // A keyed setting (once per phase or leg) is driven and READ
+                // BACK as before, beside the write round; the every-tick
+                // steering of the short final and the flare is one queued
+                // write from the bug the tick read (`bug_step_from`), pressed
+                // only past three degrees.
+                let bug_drive = match (knob, knob_set) {
+                    (Some(_), Some(h)) => Some(h),
+                    (None, Some(h)) => {
+                        use crate::tools::autopilot::{bug_step_from, BugStep};
+                        match bug_step_from(st.opt(F::Bug), h) {
+                            BugStep::Leave => None,
+                            BugStep::Set(v) => {
+                                writes.set(HDG_BUG, v);
+                                None
+                            }
+                            BugStep::Drive => Some(h),
+                        }
+                    }
+                    (_, None) => None,
+                };
                 // The pilot pulled or pushed: the plugin has already dropped
                 // the override this frame. Stop commanding and let the dial
                 // fly what is left — the VS path is still running underneath.
@@ -3833,33 +3909,46 @@ pub fn run_autoland_scoped(
                 if thr.is_some() {
                     last_lever = thr;
                 }
-                let throttle_written = match thr {
-                    Some(throttle) => Some(xp.set_float(&throttle_dref(), throttle).await.is_ok()),
-                    None => None,
-                };
-                // A second round trip purely for the blackbox — whether the
-                // lever TOOK the write, which is how an add-on re-driving it
-                // gets caught. Worth it for the whole approach and not worth
-                // it in the flare, where the tick budget is the landing: the
-                // next tick's `throttle_before` says the same thing anyway,
-                // one tick later.
-                let throttle_after = if throttle_written == Some(true)
-                    && g.phase != ApproachPhase::Flare
-                {
-                    xp.get_float(&throttle_dref())
-                        .await
-                        .ok()
-                        .filter(|v| v.is_finite())
-                } else {
-                    None
-                };
+                // The tick's ONE write round: the lever, the VS dial, the
+                // column, the ailerons and the bug, together (they were up to
+                // four rounds, 2026-09-30), a keyed bug drive beside it.
+                if let Some(throttle) = thr {
+                    writes.set(&thr_name, throttle);
+                }
+                let (done, knob_read) = tokio::join!(writes.flush(&xp), async {
+                    match bug_drive {
+                        Some(h) => {
+                            Some(crate::tools::autopilot::drive_heading_bug_step(&xp, h, 30.0).await)
+                        }
+                        None => None,
+                    }
+                });
+                if let (Some((key, _)), Some(h)) = (knob, knob_set) {
+                    bug_hold.took(knob_read);
+                    crate::blackbox::record(
+                        "autoland",
+                        serde_json::json!({"event": "heading_set", "key": key, "hdg": h,
+                            "read": knob_read, "phase": format!("{:?}", g.phase),
+                            "radio": radio_ft}),
+                    );
+                }
+                let throttle_written = thr.map(|_| done.ok(&thr_name) == Some(true));
+                // Whether the lever TOOK the last tick's write (an add-on
+                // re-driving it is caught this way): this tick's read against
+                // that command. It was a second round trip after the write
+                // (`throttle_after`), skipped in the flare; the next tick's
+                // read says the same thing a tick later, for no round.
+                let lever_took = last_thr_written
+                    .zip(thr_now)
+                    .map(|(c, r)| (c - r).abs() < LEVER_TOOK_TOL);
+                last_thr_written = if throttle_written == Some(true) { thr } else { None };
                 if throttle_written == Some(false) {
                     flare_power.reset();
                 }
                 crate::blackbox::record("autoland", serde_json::json!({
                     "event": "power", "phase": format!("{:?}", g.phase),
                     "throttle_before": thr_now, "throttle_command": thr,
-                    "throttle_after": throttle_after, "write_ok": throttle_written,
+                    "lever_took": lever_took, "write_ok": throttle_written,
                     "progressive_flare": cfg.flare_power.is_some(), "dt": dt_s,
                     // Which key moved the flare's lever this tick (issue
                     // #76): entry, height, time, slow, float or timed; a
@@ -8278,6 +8367,81 @@ mod tests {
                     <= tick_ms(Some(ApproachPhase::Intercept), false),
             "the tick rate must rise monotonically toward the ground"
         );
+    }
+
+    /// The tick's I/O budget: ONE read round and ONE write round, on the
+    /// plugin's frame and on an older plugin's split reads alike. Every round
+    /// is a sim frame (iMac 2026-09-30: one GET 46 ms at 20 fps, eight
+    /// concurrent 44 to 51, six sequential 312), and the Final tick waited
+    /// on about seven (`power` dt median 0.56 s against its 200 ms sleep).
+    /// At 20 fps two rounds make the Flare 0.2 s and Final 0.3 s; at 50 fps
+    /// 0.14 and 0.24.
+    #[tokio::test(start_paused = true)]
+    async fn a_tick_reads_in_one_round_and_writes_in_one() {
+        use sim::state::{self, Want, Writes};
+        use sim::xplane::{FakeXPlane, FramedXPlane};
+        let pos = sim::position::Position {
+            lat: 36.66,
+            lon: -4.48,
+            elev_m: 80.0,
+            psi_true_deg: 131.0,
+            gs_ms: 70.0,
+            vs_fpm: -700.0,
+            agl_m: 60.0,
+            frame: Some(7),
+            sim_time_s: Some(1.0),
+            source: sim::position::Source::Plugin,
+        };
+        let fake = FakeXPlane::new();
+        let frame = state::State::from_parts(
+            Ok(pos),
+            &[(F::Paused, 0.0), (F::Replay, 0.0), (F::Ias, 130.0), (F::Bug, 131.0)],
+            state::Source::Plugin,
+        );
+        fake.set_read_bytes(state::STATE, Some(&state::encode(&frame)));
+        // The profile's own lever and approach status ride beside the frame.
+        fake.set_read("test/lever", 0.45);
+        fake.set_read("test/appr", 0.0);
+        // The split: every field the tick wants, and the position.
+        for f in AUTOLAND_WANT_ILS {
+            fake.set_read(f.name(), 0.0);
+        }
+        for (k, v) in [
+            (crate::datarefs::LATITUDE, 36.66),
+            (crate::datarefs::LONGITUDE, -4.48),
+            (crate::datarefs::ELEVATION_M, 80.0),
+            (PSI_TRUE, 131.0),
+            (GS_MS, 70.0),
+            ("sim/flightmodel/position/vh_ind_fpm", -700.0),
+            (crate::datarefs::AGL_METERS, 18.0),
+            (crate::datarefs::PAUSED, 0.0),
+            (crate::datarefs::IS_IN_REPLAY, 0.0),
+        ] {
+            fake.set_read(k, v);
+        }
+        let xp = FramedXPlane::new(fake, std::time::Duration::from_millis(50));
+        for plugin in [true, false] {
+            if !plugin {
+                xp.inner.set_read_bytes(state::STATE, None);
+            }
+            let (rounds, _) = xp
+                .rounds(|| async {
+                    let (st, extra) =
+                        state::read_with(&xp, Want(AUTOLAND_WANT_ILS), &["test/lever", "test/appr"])
+                            .await;
+                    assert!(!st.frozen());
+                    assert!(st.position().is_ok() && extra.iter().all(|r| r.is_ok()));
+                    let mut w = Writes::new();
+                    w.set(VS_DIAL, -650.0)
+                        .set(FLARE_PITCH, 0.12)
+                        .set(FLARE_ROLL, -0.02)
+                        .set(HDG_BUG, 131.2)
+                        .set("test/lever", 0.4);
+                    assert_eq!(w.flush(&xp).await.ok("test/lever"), Some(true));
+                })
+                .await;
+            assert_eq!(rounds, 2, "plugin frame: {plugin}");
+        }
     }
     // LEMG 13, 2026-09-12: the raw heading-minus-track fed straight back to
     // the heading bug hunted the final (crab sd 0.5° on the intercept, 4.0°

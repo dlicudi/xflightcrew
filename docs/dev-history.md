@@ -12041,3 +12041,88 @@ Tests `the_recorded_oskot_slow_down_begins_with_miles_to_spare`,
 
 Next EGKK-EGBB arrival: `star_speed_crossed` for PUFAX, OSKOT and GROVE with `met` true and `ias`
 under the limit; `star_speed` `dist_nm` for OSKOT near 7.9 at about 248 kt. Offline only.
+
+## 2026-09-30: a control tick is one read round and one write round (`xcopilot/state`)
+
+The iMac runs X-Plane near 20 fps (`fps_dip` medians 20.2 and 21.2), and every control loop there
+ticked slower than on the MacBook the laws were tuned on: from the blackbox, autoland's `power` dt
+median 0.56 s on Final (sleep 200 ms), 0.39 s in the Flare (100 ms), 0.77 s on the Intercept
+(400 ms); `rollout` 0.48 s (300 ms); `autotakeoff` `roll` 0.34 s and `climb_manual` 0.32 s
+(150 ms); the taxi `drive` records about 0.3 s apart (150 ms). The MacBook ran near 0.3 s. Today's
+fixes softened laws for the slow tick (`WingsLevel::step` by tick/0.3, #185; the castoring-nose
+brake patches) instead of asking why the tick was slow.
+
+The cause is the Web API's cost model, measured against the running sim on the iMac the same day
+(frame period 0.0503 s): one GET 46 ms (median), 2, 4, 6 and 8 CONCURRENT GETs 50, 47, 51 and
+44 ms, six SEQUENTIAL GETs 312 ms. A request is served in the sim's frame, and requests in flight
+together share that frame, so a tick costs its sleep plus one frame per ROUND of requests it waits
+on, however many requests a round holds. Counted from the code, the steady ticks waited on:
+
+- autoland Final: the freeze check (two sequential reads whenever their 500 ms cache ran out, about
+  every tick at 0.56 s), the read burst, the VSI/lever/servos read, the ILS read, the knob/VS dial/
+  channels join (itself up to three deep: the bug read, write and read back; the column write, then
+  its yield read), the lever write, the lever read back: 7 to 8 rounds, 200 + 8 x 50 = 600 ms
+  predicted against 0.56 s measured. Flare 6 to 7 (no lever read back): 100 + 300 = 0.40 against
+  0.39. Rollout about 3.5 (freeze, read, lever/rudder/column, brakes): 300 + 175 = 0.475 against
+  0.477. Takeoff roll 4 to 5 (freeze, read, lever, brakes, rudder, column): 0.35 against 0.34.
+  Taxi drive about 3 (freeze, read, writes): 0.30.
+
+At 50 fps the same rounds cost 20 ms each, which is the whole machine difference: 6 to 8 rounds x
+30 ms is 180 to 240 ms a tick on the autoland.
+
+Change, at the source:
+
+- **`xcopilot/state`** (plugin `drefs.cpp`, read by `crates/sim/src/state.rs`): one data dataref of
+  doubles holding the `xcopilot/position` prefix and 28 fields a tick reads (airspeed, track, bank,
+  pitch, Q, R, wheels, variation, VSI, pause and replay, servos, heading and VS mode, the bug, the
+  NAV1 needles and flags, approach and glideslope status, the four yield latches, the tug, engine 1
+  torque, `throttle_ratio_all`). Filled AT THE READ, in the accessor, so every field is one frame's
+  and a paused sim (which runs no flight loop) still reports its pause. A missing dataref is NaN,
+  that field unread. Listed in `health::PLUGIN_DATAREFS`; the app's field order is test-pinned to
+  the plugin's `kStateSources`.
+- **`sim::state::read` / `read_with`**: the frame in one request, joined with any dataref it does not
+  carry (a profile's own throttle or approach status) in the same round; an older plugin falls back
+  to separate reads of the wanted fields, the position (`position::read`, snapshot or split) and the
+  freeze flags, all in ONE join. `State::frozen` is `sim_frozen`'s rule (fail open).
+- **`sim::state::Writes`**: a tick's writes queued and sent in one round (`flush`), results per
+  dataref; ordered sequences (a mode engaged, then its dial) stay awaited where they are.
+- **`sim_frozen`** joins its two reads: one round for every loop that still calls it (circuit,
+  procedure, speedhold, hover, pushback, recover).
+- **autoland**: the tick reads once (frame, lever, approach status) and writes once (lever, VS dial,
+  column, ailerons, a fine bug correction). The every-tick bug steering of the short final and the
+  flare decides from the frame's bug (`tools::autopilot::bug_step_from`, the drive's own first
+  decision, test-pinned) and queues one write; a keyed setting and a press past 3 degrees still run
+  `drive_heading_bug_step` with its read back, beside the write round. A yield is read only on a tick
+  that writes its channel, as before, now from the tick's read (the plugin drops the override on its
+  own frame either way). The lever read back after the write (`throttle_after`) is gone: `lever_took`
+  compares this tick's read with the last command, no round. The rollout writes lever, rudder,
+  column, ailerons and brakes in one round.
+- **takeoff**: the roll reads once and writes lever, brakes, rudder and column in one round; a lost
+  rudder or column is judged on the flush's result, as before. The hand-flown climb sends the lever
+  with the column.
+- **taxi**: the drive and the line-up alignment read the freeze flags, the pedals, the tug or yaw
+  rate and the position in one request.
+
+Expected steady tick, iMac 20 fps (MacBook 50 fps), 2 rounds: Final 0.30 s (0.24), Flare 0.20
+(0.14), Intercept 0.50 (0.44), rollout 0.40 (0.34), roll and hand-flown climb 0.25 (0.19), taxi
+0.25 (0.19). The machine difference falls from 180 to 240 ms a tick to 60. Requests per autoland
+tick fall from about 24 to 6 to 8.
+
+Tick-count constants now span less wall time where the tick got faster: `VS_DIVERGED_WARN_TICKS` 12
+(about 6.7 s at 0.56 s, 3.6 s at 0.3), `VS_DIVERGED_GIVE_UP_TICKS` 140, `VS_CONVERGING_FPM_PER_TICK`
+15 (a faster closing rate asked per second), `WHEELS_ON_TICKS` 3 in the flare (about 0.8 s between
+the first and third read at 0.39 s, 0.4 s at 0.2). Not changed here; the MacBook's ticks were
+already that fast. `STIFF_TUNED_TICK_S` (#185) stops softening once the tick is under 0.3 s.
+
+Tests: the frame's parse, layout and plugin slot order; a broken frame and a missing field; the
+fallback with and without the position snapshot; extras on both paths; `sim_frozen` as one round
+over a mock server and the framed fake; the state frame as one request a tick over the real client;
+`Writes` as one round, last value standing; an autoland tick as one read round and one write round
+on the frame and the split (`FramedXPlane`: requests served at frame boundaries on a paused clock);
+`bug_step_from` against `drive_heading_bug_step`.
+
+Deploy: `make -C plugin install`, then reload plugins (or restart X-Plane); Health must show no
+stale plugin. In flight: autoland `power` `dt` (Final near 0.3, Flare near 0.2 at 20 fps),
+`rollout` `dt` near 0.4, `autotakeoff` `roll` `dt` near 0.25, `drive` records near 0.25 s apart,
+`pos: plugin`; `api_load` names `xcopilot/state` and no longer the stock position, VSI, freeze and
+status datarefs. Offline only.

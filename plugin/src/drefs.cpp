@@ -1069,6 +1069,133 @@ static void StopPosition() {
     g_position[0] = 0.0;
 }
 
+// ---- state frame (plugin -> app) ---------------------------------------------
+
+// xcopilot/state: everything a control tick reads, as ONE frame saw it, in
+// ONE request. Every Web API request is served inside the sim's frame, so a
+// tick costs a frame per ROUND of requests it waits on: measured on the iMac
+// at 20 fps (2026-09-30) one GET took 46 ms, eight concurrent GETs 44 to 51,
+// six sequential 312. The loops waited on six to eight rounds a tick
+// (autoland's Final 0.56 s against a 200 ms sleep). The app reads this
+// buffer, and any dataref it cannot carry, in one round (crates/sim/src/
+// state.rs), falling back to separate reads without it.
+//
+// Filled AT THE READ, not per frame: the Web API calls the accessor on the
+// sim's own thread, so every field is the same frame's, and a paused sim
+// (which runs no flight loop) still reports its pause flag.
+// Native little-endian doubles:
+//   [0] layout version (1)   [1] frame (XPLMGetCycleNumber)   [2] sim time, s
+//   [3..9] as xcopilot/position: lat, lon, elevation m, psi, groundspeed
+//          m/s, vh_ind_fpm, y_agl m
+//   [10..] kStateSources, in order (the app's `state::FIELDS`, test-pinned)
+// A field whose dataref is missing is NaN: the app reads that field as no
+// measurement, the rest of the frame stands.
+static const char* const kStateSources[] = {
+    "sim/flightmodel/position/indicated_airspeed",
+    "sim/flightmodel/position/hpath",
+    "sim/flightmodel/position/true_phi",
+    "sim/flightmodel/position/true_theta",
+    "sim/flightmodel/position/Q",
+    "sim/flightmodel/position/R",
+    "sim/flightmodel/failures/onground_any",
+    "sim/flightmodel/position/magnetic_variation",
+    "sim/cockpit2/gauges/indicators/vvi_fpm_pilot",
+    "sim/time/paused",
+    "sim/time/is_in_replay",
+    "sim/cockpit2/autopilot/servos_on",
+    "sim/cockpit2/autopilot/heading_status",
+    "sim/cockpit2/autopilot/vvi_status",
+    "sim/cockpit2/autopilot/heading_dial_deg_mag_pilot",
+    "sim/cockpit2/radios/indicators/nav1_hdef_dots_pilot",
+    "sim/cockpit2/radios/indicators/nav1_vdef_dots_pilot",
+    "sim/cockpit2/radios/indicators/nav1_display_horizontal",
+    "sim/cockpit2/radios/indicators/nav1_display_vertical",
+    "sim/cockpit2/autopilot/approach_status",
+    "sim/cockpit2/autopilot/glideslope_status",
+    "xcopilot/steer_yield",
+    "xcopilot/pitch_yield",
+    "xcopilot/roll_yield",
+    "xcopilot/brake_yield",
+    "sim/aircraft/overflow/pushback_attached",
+    "sim/flightmodel/engine/ENGN_TRQ",
+    "sim/cockpit2/engine/actuators/throttle_ratio_all",
+};
+static const int kStateSourceCount =
+    static_cast<int>(sizeof kStateSources / sizeof kStateSources[0]);
+static const int kStateFields = kPositionFields + kStateSourceCount;
+static double g_frame[kStateFields] = {0};
+static XPLMDataRef g_frame_dref = nullptr;
+static XPLMDataRef g_frame_refs[kStateSourceCount] = {nullptr};
+static XPLMDataTypeID g_frame_types[kStateSourceCount] = {0};
+
+// Any dataref as a number: a double, float or int scalar, else element 0
+// of an array (ENGN_TRQ is engine 1's).
+static double StateNum(XPLMDataRef r, XPLMDataTypeID t) {
+    if (!r) return std::nan("");
+    if (t & xplmType_Double) return XPLMGetDatad(r);
+    if (t & xplmType_Float) return static_cast<double>(XPLMGetDataf(r));
+    if (t & xplmType_Int) return static_cast<double>(XPLMGetDatai(r));
+    if (t & xplmType_FloatArray) {
+        float v = 0.0f;
+        return XPLMGetDatavf(r, &v, 0, 1) == 1 ? static_cast<double>(v) : std::nan("");
+    }
+    if (t & xplmType_IntArray) {
+        int v = 0;
+        return XPLMGetDatavi(r, &v, 0, 1) == 1 ? static_cast<double>(v) : std::nan("");
+    }
+    return std::nan("");
+}
+
+static void FillState() {
+    g_frame[1] = static_cast<double>(XPLMGetCycleNumber());
+    g_frame[2] = PosF(g_pos_time);
+    g_frame[3] = PosD(g_pos_lat);
+    g_frame[4] = PosD(g_pos_lon);
+    g_frame[5] = PosD(g_pos_elev);
+    g_frame[6] = PosF(g_pos_psi);
+    g_frame[7] = PosF(g_pos_gs);
+    g_frame[8] = PosF(g_pos_vs);
+    g_frame[9] = PosF(g_pos_agl);
+    for (int i = 0; i < kStateSourceCount; ++i) {
+        // Found late: an add-on's or our own dataref registered after start.
+        if (!g_frame_refs[i]) {
+            g_frame_refs[i] = XPLMFindDataRef(kStateSources[i]);
+            if (g_frame_refs[i]) g_frame_types[i] = XPLMGetDataRefTypes(g_frame_refs[i]);
+        }
+        g_frame[kPositionFields + i] = StateNum(g_frame_refs[i], g_frame_types[i]);
+    }
+    g_frame[0] = 1.0;
+}
+
+static int ReadState(void*, void* out, int offset, int max) {
+    const int size = static_cast<int>(sizeof g_frame);
+    if (!out) return size;
+    if (offset < 0 || offset >= size || max <= 0) return 0;
+    // One fill per read: a chunked read's later pieces are the same frame.
+    if (offset == 0) FillState();
+    int n = size - offset;
+    if (n > max) n = max;
+    std::memcpy(out, reinterpret_cast<const char*>(g_frame) + offset,
+                static_cast<size_t>(n));
+    return n;
+}
+
+static void StartState() {
+    for (int i = 0; i < kStateSourceCount; ++i) {
+        g_frame_refs[i] = XPLMFindDataRef(kStateSources[i]);
+        g_frame_types[i] = g_frame_refs[i] ? XPLMGetDataRefTypes(g_frame_refs[i]) : 0;
+    }
+    g_frame_dref = XPLMRegisterDataAccessor(
+        "xcopilot/state", xplmType_Data, 0,
+        nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
+        nullptr, nullptr, nullptr, nullptr, ReadState, nullptr, nullptr, nullptr);
+}
+
+static void StopState() {
+    if (g_frame_dref) { XPLMUnregisterDataAccessor(g_frame_dref); g_frame_dref = nullptr; }
+    g_frame[0] = 0.0;
+}
+
 // ---- registration and accessors ----------------------------------------------
 
 namespace drefs {
@@ -1292,9 +1419,11 @@ void start() {
     g_joy_axis_assignments = XPLMFindDataRef("sim/joystick/joystick_axis_assignments");
     XPLMRegisterFlightLoopCallback(TaxiAssistLoop, -1.0f, nullptr);
     StartPosition();
+    StartState();
 }
 
 void stop_first() {
+    StopState();
     StopPosition();
     XPLMUnregisterFlightLoopCallback(TaxiAssistLoop, nullptr);
     // Leave no brake behind: if the loop was mid-apply, release the ratios

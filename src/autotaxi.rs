@@ -61,9 +61,6 @@ fn throttle_dref() -> String {
     crate::aircraft::throttle_dataref()
 }
 const ON_GROUND: &str = "sim/flightmodel/failures/onground_any";
-/// The sim's body yaw rate, deg/s, nose right positive: the aligning pivot's
-/// derivative ([`align_pivot_brakes`]).
-const YAW_RATE: &str = "sim/flightmodel/position/R";
 /// The plugin's proportional steering channel (-1..1, right positive).
 const TAXI_STEER: &str = "xcopilot/taxi_steer";
 /// The sim's own toe-brake inputs, for the differential-brake steering assist
@@ -80,8 +77,13 @@ const TAXI_STEER: &str = "xcopilot/taxi_steer";
 /// so a dead app frees the pedals by silence.
 pub(crate) const LEFT_BRAKE: &str = "xcopilot/taxi_brake_l";
 pub(crate) const RIGHT_BRAKE: &str = "xcopilot/taxi_brake_r";
-/// The plugin's pilot-feet latch: 1 = the yaw axis moved, override dropped.
-const STEER_YIELD: &str = "xcopilot/steer_yield";
+/// What the drive's tick reads past the position (`sim::state`).
+const DRIVE_WANT: &[sim::state::F] = &[sim::state::F::SteerYield, sim::state::F::Tug];
+/// What the line-up alignment's tick reads past the position: the pedals
+/// (`xcopilot/steer_yield`, 1 = the yaw axis moved, override dropped) and
+/// the body yaw rate (`position/R`, nose right positive, the aligning
+/// pivot's derivative, [`align_pivot_brakes`]).
+const ALIGN_WANT: &[sim::state::F] = &[sim::state::F::SteerYield, sim::state::F::R];
 /// The tug on the bar, blackboxed per tick as EVIDENCE only: the taxi that
 /// followed an early tug release could not turn right for fifteen seconds
 /// and the record could not say whether a re-summoned tug had hooked back
@@ -3117,16 +3119,20 @@ async fn align_on_the_runway(
         {
             break AlignEnd::Interrupted;
         }
-        if crate::xplane::sim_frozen(xp).await {
+        // The freeze flags, the pedals, the position and the yaw rate in
+        // ONE read (`sim::state`): a round of requests is a sim frame, and
+        // the freeze check alone was one or two more (iMac 2026-09-30).
+        let st = sim::state::read(xp, sim::state::Want(ALIGN_WANT)).await;
+        if st.frozen() {
             progress_hold();
             frozen_s += 0.5;
             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
             continue;
         }
-        let (yield_r, pos, yaw_r) = tokio::join!(
-            xp.get_float(STEER_YIELD),
-            sim::position::read(xp),
-            xp.get_float(YAW_RATE),
+        let (yield_r, pos, yaw_r) = (
+            st.get(sim::state::F::SteerYield),
+            st.position(),
+            st.get(sim::state::F::R),
         );
         if yield_r.is_ok_and(|v| v > 0.5) {
             crate::blackbox::record("autotaxi", serde_json::json!({"event": "pedal_yield"}));
@@ -3379,20 +3385,26 @@ async fn drive(xp: XPlaneClient, voice: Option<Voice>, mut route: Route, base_kt
         }
         // Paused or replay: stop writing — the steer channel expires and the
         // pedals are the pilot's until the sim is live again.
-        if crate::xplane::sim_frozen(&xp).await {
+        //
+        // One read, not a chain: sequential HTTP awaits stretched the
+        // takeoff tick to half a second and bought a slew-limit weave
+        // (sortie four); the same medicine here keeps the steer tick honest.
+        // Position, heading and groundspeed as ONE frame saw them (#157),
+        // and since 2026-09-30 the freeze flags, the pedals and the tug in
+        // the same request (`sim::state`): every round of requests is a sim
+        // frame (50 ms on the iMac at 20 fps), and the freeze check was one
+        // or two rounds of its own ahead of the read.
+        let st = sim::state::read(&xp, sim::state::Want(DRIVE_WANT)).await;
+        if st.frozen() {
             stalled_since = None; // a pause is not a stall
             progress_hold();
             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
             continue;
         }
-        // One read burst, not a chain: sequential HTTP awaits stretched the
-        // takeoff tick to half a second and bought a slew-limit weave
-        // (sortie four) — the same medicine here keeps the steer tick honest.
-        // Position, heading and groundspeed as ONE frame saw them (#157).
-        let (yield_r, pos, tug_r) = tokio::join!(
-            xp.get_float(STEER_YIELD),
-            sim::position::read(&xp),
-            xp.get_float(TUG_ATTACHED),
+        let (yield_r, pos, tug_r) = (
+            st.get(sim::state::F::SteerYield),
+            st.position(),
+            st.get(sim::state::F::Tug),
         );
         let (lat_r, lon_r) = sim::position::lat_lon(&pos);
         let psi_r = sim::position::field(&pos, |p| p.psi_true_deg);

@@ -150,6 +150,41 @@ const FINE_BUG_DEG: f64 = 3.0;
 /// ...and below this it is left alone.
 const FINE_BUG_MIN_DEG: f64 = 0.2;
 
+/// What [`drive_heading_bug_step`] would do from a bug already read.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum BugStep {
+    /// Within a fifth of a degree: the knob is left alone.
+    Leave,
+    /// Set to this value (a fine correction, or the target when the bug
+    /// was unread): one write, which can ride the tick's write round.
+    Set(f64),
+    /// A change past [`FINE_BUG_DEG`]: pressed, through
+    /// [`drive_heading_bug_step`] itself.
+    Drive,
+}
+
+/// [`drive_heading_bug_step`]'s first decision from the bug a tick has
+/// ALREADY read (`sim::state` carries it), so a loop that steers the knob
+/// every tick pays no read of its own and its fine correction goes out with
+/// the tick's other writes: the short final and the flare set the bug every
+/// tick, three rounds of requests (read, write, read back) where one write
+/// does (iMac 2026-09-30, a round is a frame, 50 ms at 20 fps). Pure.
+pub fn bug_step_from(start: Option<f64>, target: f64) -> BugStep {
+    let target = target.rem_euclid(360.0);
+    let Some(start) = start.filter(|v| v.is_finite()) else {
+        return BugStep::Set(target);
+    };
+    let full = ((target - start) % 360.0 + 540.0) % 360.0 - 180.0;
+    if full.abs() < FINE_BUG_DEG {
+        if full.abs() >= FINE_BUG_MIN_DEG {
+            let fine = ((start + full) * 10.0).round() / 10.0;
+            return BugStep::Set(fine.rem_euclid(360.0));
+        }
+        return BugStep::Leave;
+    }
+    BugStep::Drive
+}
+
 pub async fn drive_heading_bug_step(
     xp: &dyn crate::xplane::XPlane,
     target: f64,
@@ -1521,6 +1556,36 @@ mod tests {
             status: None,
             reminders: None,
         }
+    }
+
+    /// The decision from a bug already read is the drive's own: a fine
+    /// correction writes the same value, a small one writes nothing, a big
+    /// one is left to the drive (presses), an unread bug is set outright.
+    #[tokio::test]
+    async fn a_bug_step_from_the_ticks_read_is_the_drives_own_decision() {
+        for (start, target) in [
+            (131.0, 131.5),
+            (131.0, 131.1),
+            (359.8, 1.2),
+            (10.0, 358.5),
+            (90.0, 96.0),
+            (90.0, 84.0),
+            (200.0, 200.0),
+        ] {
+            let fake = FakeXPlane::with_reads(&[(HEADING_BUG, start)]);
+            let _ = drive_heading_bug_step(&fake, target, 30.0).await;
+            let first_write = fake.writes_to(HEADING_BUG).first().copied();
+            match bug_step_from(Some(start), target) {
+                BugStep::Leave => assert_eq!(first_write, None, "{start} -> {target}"),
+                BugStep::Set(v) => assert_eq!(first_write, Some(v), "{start} -> {target}"),
+                BugStep::Drive => assert!(
+                    fake.ran(CMD_HDG_UP) || fake.ran(CMD_HDG_DN),
+                    "{start} -> {target}: pressed"
+                ),
+            }
+        }
+        assert_eq!(bug_step_from(None, 370.0), BugStep::Set(10.0));
+        assert_eq!(bug_step_from(Some(f64::NAN), 45.0), BugStep::Set(45.0));
     }
 
     #[tokio::test]
