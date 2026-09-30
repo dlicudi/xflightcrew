@@ -4230,6 +4230,8 @@ async fn fly_authored_route(
         "circuit",
         serde_json::json!({"event": "handoff_autoland_authored", "rwy": rwy_id}),
     );
+    // A circuit final is judged at the visual gate, 500 ft (#199).
+    crate::autoland::set_next_gate(crate::stable_approach::GateKind::Visual);
     crate::autoland::ABORT.store(false, Ordering::SeqCst);
     // FORCE the pattern's own runway. Bare `None` sends autoland to its
     // EMERGENCY behaviour — search the whole apt.dat for the best end by track
@@ -5207,6 +5209,8 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, p: Params
             if descent_shape.steep() {
                 crate::autoland::set_next_circuit_glidepath_deg(Some(descent_shape.glidepath_deg()));
             }
+            // A circuit final is judged at the visual gate, 500 ft (#199).
+            crate::autoland::set_next_gate(crate::stable_approach::GateKind::Visual);
             crate::autoland::ABORT.store(false, Ordering::SeqCst);
             crate::autoland::run_autoland(
                 base_url.clone(),

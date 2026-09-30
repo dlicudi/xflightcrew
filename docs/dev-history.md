@@ -12013,3 +12013,93 @@ the line; crossing at 240, no track, 5 nm beside, past the threshold and 30 nm o
 
 Next resume on a final: `resume_join_arrival` `on_final` true with `xtk_nm` inside 3, then
 `resume_arrival` and autoland's arm on the plan runway. Offline only.
+
+## 2026-09-30: one stabilised-approach rule; the arrival slows for autoland; a missed approach flies a speed (#199)
+
+iMac 2026-09-30, sortie 1790761044-full_auto: the stock 737 from a runway start on EGBB 33 to EGNX
+on a 40 nm local plan (3,000 ft cruise). The first approach flew the EGNX 09 final at 254 to 255
+KIAS with the flaps up and the throttle at idle, 1,362 to 1,419 fpm down from 1,000 ft above the
+runway to 121 ft radio; the approach speed was 145. The arrest pulled at 144 ft radio, ballooned
+(+1,224 fpm) and went around `balloon` at 150 ft, 0.06 nm out. The missed approach held the lever
+at 1.0 to the turn at 800 ft radio and the clean 737 went 250 to 309 kt there, 355 at 1,587 ft
+(1,460 ft radio) before the governor's 0.04-a-tick steps brought the lever back; the reversal then
+bled it off level at 1,880 ft, and the second approach landed (230 fpm, 1.0 m).
+
+Causes, from the records:
+- The arrival. `procedure` held cruise (255, capped at 250 by the 10,000 ft rule) to the last fix
+  of the local plan; the only arrival slow-down it had was a STAR's speed limits, and a local plan
+  has none. `enroute_complete` handed autoland a clean 737 at 252 kt, ON the path at 3,000 ft 8.4
+  nm out. The height was right; the speed was cruise.
+- Autoland could not slow on the path. At idle on a 3 degree path a clean 737 holds its speed
+  (g sin 3 degrees is about 1 kt/s, its idle drag no more); the flaps and gear wait for their
+  placards (`flap_within_limits`, `gear_may_extend`: 250 and 235 against 255), so the drag that
+  would have slowed it never came; the path law flew the path's own sink at 255 kt over the
+  ground, 1,350 fpm (`nominal_vs`).
+- Nothing judged it. The 1,000 ft gate (`unstabilised_at_gate`) was lateral only, and the 737 was
+  on the centreline; the speed, the configuration and the sink were never a question.
+- The go-around was firewalled for the whole straight-ahead climb (`MissedStage::Climb`), which
+  is 150 ft to 800 ft radio, with the VS mode holding 2,000 fpm: every knot of excess thrust went
+  into speed.
+- Every final on file also reached 1,000 ft with only half flap out: `flap_schedule` put the
+  landing flap out inside 3 nm, which on a 3 degree path IS the 1,000 ft gate (737 EGBB 33, sortie
+  1790759458-full_auto: 169 kt at 1,008 ft with flap 10, 151 by 500).
+
+The rule (`src/stable_approach.rs`, ONE rule, judged by autoland for every final it flies,
+straight-in and circuit): by the GATE, 1,000 ft above the runway on an instrument or straight-in
+final (`GateKind::Instrument`, the default) and 500 ft on a circuit's (`GateKind::Visual`,
+handed down by `circuit` through `autoland::set_next_gate`): gear down and the landing flap
+SELECTED; the speed no more than 7 under the landing target (`SLOW_KTS`, the margin speed
+protection acts at) and no more than 15 over from 500 ft down (`FAST_KTS`; between an instrument
+gate and 500 ft, configured, up to 25 over, `FAST_ABOVE_STABLE_KTS`: configured by 1,000, stable
+by 500); the sink no more than 1,000 fpm or the path's own sink at the TARGET speed over the
+ground plus 400 (`sink_limit_fpm`: a steep path or a tailwind demands more, a fast aircraft does
+not); within 0.7 degrees of the path (`PATH_TOL_DEG`, two dots, never under 50 ft); the lateral
+gate as it was. The target is the governor's own in the landing configuration
+(`approach_target_kts` at flap 1.0). A breach that holds 3 s (`StableWatch`, `PERSIST_S`) orders
+the go-around then (`GoAroundLatch::order`), judged from the gate to 200 ft above the runway in the
+Final phase, never in the arrest. Calibrated on the 57 finals in the blackbox (2026-09-29 and 30,
+each against its profile's approach speed, the flap left out since the records carry the old
+schedule): today's 737 finals (EGBB 33 twice, EGNX 09 second, the circuit), SR22 circuits and
+straight-ins, a Citation, the Baron, King Air, SF50 and Evolution stay stable; the EGNX 09 first
+approach is `fast` and `sink` from the gate (and `flap`, the placards never let it out); the
+2,200 to 5,400 fpm dives of the high approach setups (SR22, 172, RV-10, King Air, Baron) are
+`sink` or `high` at 800 to 950 ft. Two finals of 2026-09-29 that landed would have gone around: the
+A330 at 184 kt (target 154) at 941 ft with CONF 2 out (1790695800-approach) and a 737 dive 280 ft
+over the path at 1,000 ft, 4.2 degrees (1790700986-full_auto); a Citation 26 kt fast at 954 ft
+(1790740040) went around anyway, lateral. The SR22's 91 kt finals before 2026-09-29 19:30 were
+flown to its old 80 kt approach speed, inside the band.
+
+Getting there: the landing flap is selected a mile before the instrument gate
+(`autoland::landing_flap_nm`, 3.98 nm on a 3 degree path, `LANDING_FLAP_LEAD_NM`), still only on
+the path. The enroute plan of a full-auto flight is handed autoland's clean approach speed
+(`procedure::set_next_arrival_handoff_kts`, `autoland::clean_approach_ias`: 210 for the 737) and
+slows for it by the end of the route like a STAR limit (`arrival_handoff_cap`: 0.5 kt/s plus the
+2 nm lead, held once begun), so the follower's own descent drag and speed-protected descent do the
+slowing; said "Slowing to 210 knots for the approach." An arrival that still cannot be stable is
+the gate's go-around at 1,000 ft, the reversal's pattern and a second approach, the second EGNX 09
+approach being exactly that.
+
+The missed approach flies a speed (`missed_approach_speed_kts`): the give-up's pattern speed for
+the flap out (210 clean for the 737), at least the approach speed plus 12 and the go-around flap's
+floor plus 5, under the placard of the flap out less 10, never over 250 below 10,000 ft, floored by
+the configuration flown. `missed_approach_throttle`: go-around thrust until ESTABLISHED (400 ft
+and 500 fpm up, `GA_THRUST_HOLD_AGL_FT`, `GA_CLIMB_ESTABLISHED_FPM`) and whenever 10 kt slow; 10
+kt fast, the climb floor at once (the approach thrust floor, else idle; the VS mode turns the
+excess into height); else the governor's step.
+
+Blackbox: `autoland` `stable_gate` once per approach at the first judged tick (`gate`, `gate_ft`,
+`height_aal`, `ias`, `target`, `gs`, `vvi`, `sink_limit`, `above_path_ft`, `path_tol_ft`, `gear`,
+`landing_flap`, `breaches`, `verdict`), `unstabilised` when it orders the go-around (the same and
+`why`), and `going_around` `why` `unstabilised_<breach>`; spoken "Not stabilised, too fast. Going
+around."; `procedure` `arrival_slowdown` (`kts`, `to_end_nm`, `ias`, `planned`).
+
+Tests: `stable_approach` (the EGNX 09 first final goes around at the gate with height in hand; the
+EGNX 09 second, EGBB 33 and SR22 circuit finals of today stay stable; a gust through the band is
+not a go-around; the speed allowance closes at 500; the sink and path limits);
+`the_landing_flap_is_selected_a_mile_before_the_gate`; `missed_approach_speed_tests` (210 not
+355, the replayed EGNX climb peaks under 285 and settles on 210); `arrival_handoff_tests`.
+
+Next flights: `stable_gate` `verdict` stable on every normal final (the 737's `ias` at the gate
+under 170 with `landing_flap` true); an `unstabilised` only where the final was; `arrival_slowdown`
+before a full-auto arrival and autoland's first tick near the clean approach speed; a go-around's
+`power` ticks leaving 1.0 by 400 ft radio and its IAS under 250. Offline only.

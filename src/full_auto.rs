@@ -3499,6 +3499,11 @@ async fn fly_route(
         .filter(|_| !checked_in)
         .map(|c| c.initial_alt_ft as f64);
     crate::procedure::hold_at_cleared(ceiling, "ifr_clearance");
+    // The arrival starts at autoland's clean approach speed, slowed for by
+    // the end of the route (#199: EGNX 09 was handed a clean 737 at 252 kt).
+    crate::procedure::set_next_arrival_handoff_kts(Some(crate::autoland::clean_approach_ias(
+        tools.circuit.approach_ias,
+    )));
     if !crate::procedure::start_scoped(
         config.xplane_base_url.clone(),
         voice.clone(),
@@ -3520,6 +3525,7 @@ async fn fly_route(
         xp.cancellation(),
     ) {
         crate::procedure::hold_at_cleared(None, "procedure_busy");
+        crate::procedure::set_next_arrival_handoff_kts(None);
         give_up(
             xp,
             tools.taxi.park_brake_valve_set,
