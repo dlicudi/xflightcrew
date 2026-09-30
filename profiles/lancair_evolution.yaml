@@ -342,32 +342,41 @@ taxi:
   # hold slows in beta, at most half of the range, before any brake.
   beta_max: 0.8   # 0.5 held 17.7 kt at LIME with beta engaged (2026-09-25); 1.0 is the edge of reverse
 
-# The takeoff roll's rudder (autotakeoff::RollSteer), fitted to the two LILB
-# 03 rolls on the default law (1790712974 and 1790724857, 2026-09-29/30, calm
-# air): the sim's yaw rate against the steer from 12 kt, three-second heading
-# predictions through 0.3 s of dead time and the 0.47 s lag. In the PT6's wash
-# the rudder is nearly flat with the speed, 21 deg/s per unit at 60 kt as
-# v^0.5 or 40 as v (the brakes 43 to 49 per unit of split), and the STANDING
-# rudder at 1,500 to 1,700 ft-lb of torque is 0.8 to 0.95 of steer. Without
-# this block the default law gave 0.58 to 0.68 (its authority floor of 0.35
-# per 12 degrees from 50 kt, a trim of 0.15, a lead of 0.08; not the 0.85
-# cap) with the nose 10 to 18 degrees left, and both rolls were rejected 9 to
-# 10 m left at 49 and 60 kt. Declared at 30 between the fits, the standing
-# rudder at 0.6 of full lever (the most a profile may declare; the trim takes
-# the rest) believed to the 60 kt measured, closed at 1 per second with the
-# trim's corner at 0.3 (the SR22's 1.5 and 0.45 stray further here): replayed,
-# the aligned roll holds 1.1 m where it flew 8 and 2.5 m on either fit at half
-# to twice and 0.05 of need either way. The torque ran past the manual's
-# 1,250 (the limiter steps the lever back 0.02 a tick; the PT6 spooled on and
-# made more with the speed), and at that torque the law sits at its 0.85 cap
-# from about 45 kt: RE-FLY with the torque in the roll ticks (`trq_ftlb`).
+# The takeoff roll's rudder (autotakeoff::RollSteer), refitted over the three
+# LILB 03 rolls (1790712974, 1790724857 on the default law; 1790736651 on the
+# first declaration, 2026-09-29/30, calm air): three-second heading
+# predictions from the sim's yaw rate through 0.3 s of dead time and the
+# 0.47 s lag, from 12 kt, the brake split an input. In the PT6's wash the
+# rudder is nearly flat with the speed, 30 deg/s per unit at 60 kt as v^0.35
+# or 33 as v^0.5 (v^2 fits worst), and the STANDING rudder follows the
+# TORQUE, 0.51 of steer per 1,000 ft-lb from 12 to 78 kt (a constant need
+# fits more than twice as badly).
+#
+# The first declaration (30 deg/s at 60 kt as v^2, 0.6 of LEVER to 60 kt,
+# closure 1, corner 0.3) flew 1790736651 (b6c24d5, with the torque limiter
+# holding 1,093 to 1,513 ft-lb): within 0.2 m to 50 kt, then the nose sat
+# 4.4 to 7.9 degrees left with the steer at 0.63 to 0.71 and the yaw rate
+# near zero, a standing error: the limiter cycled the lever 0.55 to 0.76, and
+# the lever lead, faded as v^2 past 60 kt, gave 0.21 at 78 kt against 0.65
+# needed, the trim learning 0.04 to 0.22 too slowly; 9.5 m left at 78 kt.
+#
+# Now the lead rides the torque read (`power_steer_per_kftlb`, 0.51, believed
+# to 80 kt; `power_steer` stays the lever lead for a failed torque read), the
+# rudder is scheduled as it grows (`yaw_power` 0.5, 32 deg/s at 80 kt), the
+# heading closes at 1.5 per second and the trim's corner is 0.1. Replayed to
+# the reject on either fit at two thirds to one and a half times and 0.05 of
+# need either way: 1790736651 3.0 m on the fits (3.9 at worst) where it flew
+# 8.6, the other two 3.6 to 3.8 (4.9) where they flew 8.0 and 8.4. RE-FLY:
+# `roll` ticks' `steer` against 0.51 x `trq_ftlb` / 1000 from 40 kt.
 roll_rudder:
-  yaw_dps: 30.0
-  at_kts: 60.0
+  yaw_dps: 32.0
+  at_kts: 80.0
+  yaw_power: 0.5
   power_steer: 0.6
-  power_steer_to_kts: 60.0
-  close_per_s: 1.0
-  trim_per_s: 0.3
+  power_steer_per_kftlb: 0.51
+  power_steer_to_kts: 80.0
+  close_per_s: 1.5
+  trim_per_s: 0.1
 
 # The takeoff power limit, from the manuals: "For take-off in N844X, you are
 # only allowed to use about HALF power, since more power would over-power the

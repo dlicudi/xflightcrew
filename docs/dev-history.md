@@ -11777,3 +11777,45 @@ leg two `drive` `br` on while `yaw_dps` runs against a positive `steer` under 1 
 second line-up; `autotakeoff` `roll` `hold_brake` over 0.15 whenever `gs` passes 3 with `align_hold`,
 `thr` 0 there, `gs` under about 3.5 until `roll_aligned` with `err` under 2 (no more `gs` 6.5), or
 `not_aligned` and a reject at walking pace. Offline only.
+
+## 2026-09-30: the Evolution leads its rudder on the torque (#45)
+
+iMac 2026-09-30, LILB 03, sortie 1790736651-full_auto on b6c24d5 (the first `roll_rudder:` and the
+torque limiter that holds from 95 % and backs off in proportion): the rudder law flew, the torque
+peaked at 1,513 ft-lb (1,735 before) and the roll held within 0.2 m to 50 kt. From there the nose
+sat LEFT, 4.4 to 7.9 degrees, with the steer at 0.63 to 0.71, the yaw rate near zero and the trim
+learning 0.04 to 0.22: a standing error. The limiter cycled the lever 0.55 to 0.76 (torque 1,093 to
+1,402), and the standing rudder had been led on the LEVER (0.6 x lever) and faded as v^2 past
+60 kt: 0.21 at 78 kt against about 0.65 needed. `lateral_excursion` 9.5 m left at 70.5 KIAS
+(78 kt over the ground).
+
+- **The refit over all three LILB rolls** (1790712974, 1790724857, 1790736651; from 12 kt, calm,
+  three-second heading predictions through 0.3 s dead time and the 0.47 s lag, brake split as an
+  input): the standing need follows the TORQUE, 0.51 of steer per 1,000 ft-lb from 12 to 78 kt
+  (1.47 degrees rms; a constant need 3.54); the rudder 30 deg/s per unit at 60 kt as v^0.35 (33 as
+  v^0.5 fits 1.52, 45 as v 2.19, 59 as v^2 3.72), flat in the PT6's wash; the brake 12 per unit.
+- **Two optional `roll_rudder:` fields**, both absent on every other profile:
+  `power_steer_per_kftlb` (the lead on the torque read each tick, `RollSteer::set_torque`, the
+  roll loop feeding `trq_ftlb`; a failed read leads on the lever as `power_steer` does), and
+  `yaw_power` (the rudder's growth below `at_kts`, 2 when absent; a v^2 schedule under 80 kt read a
+  third of this rudder at 45 kt and tripled the gain there).
+- **Declared**: 32 deg/s at 80 kt, `yaw_power` 0.5, `power_steer_per_kftlb` 0.51 to 80 kt,
+  `power_steer` 0.6 (the failed-read fallback), `close_per_s` 1.5, `trim_per_s` 0.1 (the torque
+  lead carries what the trim learnt too slowly; 0.3 to 0.6 wound up through the lateral swings).
+
+Replayed to the reject on either fit, the rudder at two thirds to one and a half times and 0.05 of
+need either way (the three-roll fit bounds the rudder tighter than the SR22's one roll did):
+1790736651 3.0 m on the fits, 1.9 to 3.9 on the neighbours, ending within 0.9 m of the line, where
+it flew 8.6; 1790724857 3.7 to 3.8 (4.7 worst) where it flew 8.0, at torques the limiter now holds
+off; 1790712974 3.6 to 3.7 (4.9) where it flew 8.4, already 2.7 m left by 30 kt from its crooked
+start. The torque lead on eb511f4's v^2 schedule and closure replays 1790736651 at 3.8 m. Not the 3 m
+asked for: the lead's error of 0.05 to 0.1 between rolls is held off at err = need / kp, and a
+stiffer heading loop rings on the 0.8 s of delay and lag with a rudder half again as strong. Tests
+`the_evolution_roll_replays_as_flown` (all three, each on its own law),
+`the_evolution_leads_its_rudder_on_the_torque`, `the_evolution_roll_holds_the_line_on_its_torque`;
+bench `bench/takeoffs/evolution_roll_lilb03_1790736651.jsonl`.
+
+Next Evolution takeoff: `roll` ticks from 40 kt with `steer` near 0.51 x `trq_ftlb` / 1000 plus a
+few hundredths, `err` inside 3 degrees and not standing on one side, `trim` small (under 0.1),
+`xtk_m` inside 3 m to rotation; if the nose still stands to one side with `steer` under the cap,
+`power_steer_per_kftlb` is the number to move. Offline only.

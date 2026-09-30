@@ -540,7 +540,8 @@ impl RotateElevatorProfile {
 
 /// How hard this airframe's rudder yaws it on the takeoff roll
 /// (`autotakeoff::RollSteer`): the yaw rate, deg/s, that a whole unit of the
-/// steer channel holds at `at_kts`, growing with the square of the speed.
+/// steer channel holds at `at_kts`, growing with the square of the speed (or
+/// as `yaw_power` declares).
 /// Declared, the roll law's gains are scheduled on it and its trim takes a
 /// crosswind in seconds; `None` is the default law. The default's gain per
 /// degree at 50 to 80 kt was a quarter of what the 737 needs to hold an 8 kt
@@ -552,6 +553,13 @@ pub struct RollRudderProfile {
     pub yaw_dps: f64,
     /// The groundspeed that figure was measured at, knots.
     pub at_kts: f64,
+    /// How the rudder grows with the speed below `at_kts`: yaw per unit as
+    /// (v / at_kts) to this power (2 when `None`, the free stream's v^2). A
+    /// rudder in a propeller's wash is nearly flat: the Evolution's fits as
+    /// v^0.35 to v^0.5 (LILB 03, 2026-09-29/30), and a v^2 schedule below
+    /// 80 kt read a third of it at 45 kt and tripled the gain there.
+    #[serde(default)]
+    pub yaw_power: Option<f64>,
     /// A propeller's standing rudder at full power, units of steer: led in
     /// with the throttle for the whole roll in place of the generic power
     /// lead (0.25 at a standstill, fading to 0.1 by 40 kt). The SR22 holds
@@ -566,6 +574,16 @@ pub struct RollRudderProfile {
     /// (LEMG 13 1790682305, 2026-09-29).
     #[serde(default)]
     pub power_steer_to_kts: Option<f64>,
+    /// A turboprop's standing rudder per 1,000 ft-lb of MEASURED torque,
+    /// units of steer: led in on the torque read each tick in place of
+    /// `power_steer` times the lever, wherever a torque is read (with
+    /// [`Self::power_steer_share`] past `power_steer_to_kts`). A torque
+    /// limiter moves the lever, and a PT6 at a held lever keeps making
+    /// torque: the Evolution needs 0.51 per 1,000 ft-lb from 12 to 78 kt
+    /// (LILB 03, three rolls, 2026-09-29/30), while its lever cycled 0.55 to
+    /// 0.76 under the limiter at 1,093 to 1,402 ft-lb (1790736651).
+    #[serde(default)]
+    pub power_steer_per_kftlb: Option<f64>,
     /// The heading closure the roll law's gain is sized for, per second
     /// (`autotakeoff::RUDDER_CLOSE_PER_S` when `None`, the 737's). A standing
     /// need the lead and trim did not predict is held off at `need / gain`
@@ -584,12 +602,16 @@ impl RollRudderProfile {
     pub fn valid(self) -> Option<Self> {
         let power_steer = self.power_steer.filter(|s| (0.0..=0.6).contains(s));
         let power_steer_to_kts = self.power_steer_to_kts.filter(|k| (20.0..=250.0).contains(k));
+        let power_steer_per_kftlb = self.power_steer_per_kftlb.filter(|s| (0.0..=1.0).contains(s));
+        let yaw_power = self.yaw_power.filter(|p| (0.0..=3.0).contains(p));
         let close_per_s = self.close_per_s.filter(|c| (0.3..=3.0).contains(c));
         let trim_per_s = self.trim_per_s.filter(|c| (0.05..=1.0).contains(c));
         ((0.5..=100.0).contains(&self.yaw_dps) && (20.0..=200.0).contains(&self.at_kts))
             .then_some(Self {
                 power_steer,
                 power_steer_to_kts,
+                power_steer_per_kftlb,
+                yaw_power,
                 close_per_s,
                 trim_per_s,
                 ..self
@@ -615,7 +637,10 @@ impl RollRudderProfile {
         } else {
             0.0
         };
-        self.yaw_dps * (v / self.at_kts).powi(2)
+        match self.yaw_power {
+            Some(p) => self.yaw_dps * (v / self.at_kts).powf(p),
+            None => self.yaw_dps * (v / self.at_kts).powi(2),
+        }
     }
 }
 

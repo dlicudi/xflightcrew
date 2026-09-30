@@ -1498,6 +1498,9 @@ pub struct RollSteer {
     /// The airframe's measured rudder, when its profile declares one: the
     /// law is then scheduled on it (see [`RollSteer::step_with_yaw`]).
     rudder: Option<crate::aircraft::RollRudderProfile>,
+    /// The engine torque last read, ft-lb, for a lead declared on it
+    /// (`roll_rudder:` `power_steer_per_kftlb`); `None` leads on the lever.
+    torque_ftlb: Option<f64>,
     /// The schedule as flown on 2026-09-28, for the replays that pin the change.
     #[cfg(test)]
     as_flown: bool,
@@ -1537,6 +1540,13 @@ impl RollSteer {
             rudder: rudder.valid(),
             ..Self::default()
         }
+    }
+
+    /// The torque read this tick (ft-lb; `None` on a failed read), for the
+    /// standing rudder a turboprop declares on it. A failed read leads on
+    /// the lever, as `power_steer` does.
+    pub fn set_torque(&mut self, torque_ftlb: Option<f64>) {
+        self.torque_ftlb = torque_ftlb.filter(|t| t.is_finite());
     }
 
     /// Whether this law is scheduled on a declared rudder.
@@ -1693,6 +1703,13 @@ impl RollSteer {
                 * (gs_kts / LOW_SPEED_FULL_KTS).clamp(0.0, 1.0);
         let lead = if self.jet {
             0.0
+        } else if let (Some(per), Some(tq)) = (rudder.power_steer_per_kftlb, self.torque_ftlb) {
+            // On the torque, not the lever: the Evolution's torque limiter
+            // cycled the lever 0.55 to 0.76 while the need followed the
+            // torque, 0.51 per 1,000 ft-lb, flat to 78 kt; led on the lever
+            // and faded past 60 kt it gave 0.21 at 78 kt against 0.65 needed
+            // and the nose sat 5 to 8 degrees left (LILB 03 1790736651).
+            (per * tq.max(0.0) / 1000.0 * rudder.power_steer_share(gs_kts)).min(MAX_ROLL_STEER)
         } else if let Some(ps) = rudder.power_steer {
             // Believed to the speed it was measured at, then falling as v^2:
             // held flat, 0.35 met a need of 0.2 at 88 kt.
@@ -3858,6 +3875,7 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, p: Params) {
             }
             // A failed read is no measurement: logged null, the law falls back.
             let yaw_dps = yaw_r.ok().filter(|v| v.is_finite());
+            steer_law.set_torque(torque_ftlb);
             let steer = steer_law.step_with_yaw(err, dt, gs_kts, thr_cmd, yaw_dps);
             // The brake half, on an airframe that has no other low-speed
             // steering; zero once rotated (the channel expires anyway).
@@ -5864,6 +5882,8 @@ mod tests {
             at_kts: 80.0,
             power_steer: None,
             power_steer_to_kts: None,
+            power_steer_per_kftlb: None,
+            yaw_power: None,
             close_per_s: None,
             trim_per_s: None,
         };
@@ -6028,6 +6048,9 @@ mod tests {
             // the 737's ticks carry none and a jet takes no lead.
             let thr = r["thr"].as_f64().unwrap_or(1.0);
             let yaw = yaw_rec[k] + dyaw;
+            // The torque as recorded, for a lead declared on it (the
+            // Evolution's); a law without one ignores it.
+            law.set_torque(r["trq_ftlb"].as_f64());
             let steer = law.step_with_yaw(err, dt, gs, thr, Some(yaw));
             dev = dev.max((steer - g(r, "steer")).abs());
             let dbrake = if brake.is_some() {
@@ -6458,42 +6481,51 @@ mod tests {
     }
 
     /// The Evolution's LILB 03 rolls, every `roll` tick from brake release
-    /// to the reject: 1790724857-full_auto (2026-09-30, aligned at 1.9
-    /// degrees by [`RollAlign`], rejected 10 m left at 60 kt over the
-    /// ground) and the earlier 1790712974-full_auto (started 24.6 degrees
-    /// off before the aligning pivot was fixed, rejected 9 m left at 49 kt).
-    /// Both on the default law, the profile declaring no rudder.
-    fn evolution_roll_0930() -> Vec<serde_json::Value> {
-        const TEXT: &str =
-            include_str!("../bench/takeoffs/evolution_roll_lilb03_1790724857.jsonl");
-        TEXT.lines()
-            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
-            .collect()
+    /// to the reject, each with the law it flew:
+    /// - 1790712974 (2026-09-29): started 24.6 degrees off before the
+    ///   aligning pivot was fixed; the default law; 9 m left at 49 kt.
+    /// - 1790724857 (2026-09-30): aligned at 1.9 degrees; the default law;
+    ///   the torque ran to 1,735 ft-lb; 10 m left at 60 kt.
+    /// - 1790736651 (2026-09-30, b6c24d5): the declared rudder of eb511f4 and
+    ///   the torque limiter holding 1,093 to 1,513 ft-lb with the lever
+    ///   cycling 0.55 to 0.76; from 50 kt the nose sat 4.4 to 7.9 degrees
+    ///   left with the steer at 0.63 to 0.71; 9.5 m left at 78 kt.
+    fn evolution_rolls() -> Vec<(&'static str, Vec<serde_json::Value>)> {
+        let ld = |t: &str| -> Vec<serde_json::Value> {
+            t.lines()
+                .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+                .collect()
+        };
+        vec![
+            (
+                "1790712974",
+                ld(include_str!("../bench/takeoffs/evolution_roll_lilb03_1790712974.jsonl")),
+            ),
+            (
+                "1790724857",
+                ld(include_str!("../bench/takeoffs/evolution_roll_lilb03_1790724857.jsonl")),
+            ),
+            (
+                "1790736651",
+                ld(include_str!("../bench/takeoffs/evolution_roll_lilb03_1790736651.jsonl")),
+            ),
+        ]
     }
 
-    fn evolution_roll_crooked() -> Vec<serde_json::Value> {
-        const TEXT: &str =
-            include_str!("../bench/takeoffs/evolution_roll_lilb03_1790712974.jsonl");
-        TEXT.lines()
-            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
-            .collect()
+    /// The Evolution's rudder refitted over all three rolls (three-second
+    /// heading predictions from the sim's `r` through 0.3 s of dead time and
+    /// the 0.47 s lag, from 12 kt, calm air, the brake split an input):
+    /// 30 deg/s per unit at 60 kt as v^0.35 (1.47 degrees rms), or 33 as
+    /// v^0.5 (1.52; 45 as v fits 2.19, 59 as v^2 3.72), the brake 12 deg/s
+    /// per unit of split, and the standing need 0.51 of steer per 1,000
+    /// ft-lb of torque (a constant need fits 3.54).
+    fn rudder_evolution_flat(gs: f64) -> f64 {
+        30.0 * (gs.max(0.0) / 60.0).powf(0.35)
     }
-
-    /// The Evolution's rudder fitted to both rolls (three-second heading
-    /// predictions from the sim's `r` through 0.3 s of dead time and the
-    /// 0.47 s lag, from 12 kt, calm air): nearly flat with the speed in the
-    /// PT6's wash, 21 deg/s per unit at 60 kt as v^0.5 (1.6 degrees rms),
-    /// or 40 as v (1.8); and a differential brake worth 49 (43) deg/s per
-    /// unit of right brake less left. The standing need that fits with them
-    /// is 0.96 (0.83) of steer at the 1,500 to 1,700 ft-lb flown.
     fn rudder_evolution_sqrt(gs: f64) -> f64 {
-        21.0 * (gs.max(0.0) / 60.0).sqrt()
+        33.0 * (gs.max(0.0) / 60.0).sqrt()
     }
-    fn rudder_evolution_linear(gs: f64) -> f64 {
-        40.0 * gs.max(0.0) / 60.0
-    }
-    const BRAKE_EVOLUTION_SQRT: f64 = 49.0;
-    const BRAKE_EVOLUTION_LINEAR: f64 = 43.0;
+    const BRAKE_EVOLUTION: f64 = 12.0;
 
     /// The Evolution's rudder as the profile declares it (`roll_rudder:`).
     fn rudder_evolution() -> crate::aircraft::RollRudderProfile {
@@ -6502,6 +6534,20 @@ mod tests {
         p.roll_rudder
             .and_then(|r| r.valid())
             .expect("the Evolution declares its rudder")
+    }
+
+    /// The Evolution's rudder as declared by eb511f4 (1790736651's law).
+    fn rudder_evolution_eb511f4() -> crate::aircraft::RollRudderProfile {
+        crate::aircraft::RollRudderProfile {
+            yaw_dps: 30.0,
+            at_kts: 60.0,
+            yaw_power: None,
+            power_steer: Some(0.6),
+            power_steer_to_kts: Some(60.0),
+            power_steer_per_kftlb: None,
+            close_per_s: Some(1.0),
+            trim_per_s: Some(0.3),
+        }
     }
 
     /// Reversals of the steer from 30 kt: a jump past 0.08 against the last
@@ -6521,44 +6567,45 @@ mod tests {
         n
     }
 
-    /// One Evolution roll replayed under a law on a fitted plant (rudder
-    /// scaled by `scale`, and its brake).
+    /// One Evolution roll replayed under a law on a fitted rudder (scaled by
+    /// `scale`) and brake.
     fn fly_evolution(
         ticks: &[serde_json::Value],
         law: RollSteer,
         cut: RollCut,
         rudder: fn(f64) -> f64,
-        brake: f64,
         scale: f64,
     ) -> (Vec<(f64, f64, f64, f64)>, f64) {
         let plant = move |gs: f64| scale * rudder(gs);
-        let braked = move |_gs: f64| brake;
+        let braked = |_gs: f64| BRAKE_EVOLUTION;
         replay_roll_braked(ticks, law, cut, &plant, Some(&braked))
     }
 
-    /// The Evolution's rolls as flown: the default law replayed through them
+    /// The law each roll flew.
+    fn evolution_law_as_flown(name: &str) -> (RollSteer, RollCut) {
+        if name == "1790736651" {
+            let law = RollSteer::with_rudder(false, rudder_evolution_eb511f4());
+            let cut = RollCut::for_law(&law);
+            (law, cut)
+        } else {
+            (RollSteer::default(), RollCut::new(None))
+        }
+    }
+
+    /// The Evolution's rolls as flown: each law replayed through its roll
     /// writes the recorded steer (within 0.02: the first tick's slew is
     /// replayed on the harness's 0.2 s, not the logged 0.15), and the
-    /// offsets are the failures being fixed: 8 m left (the median of five
-    /// reads; 10 m read) at 60 kt and at 49 kt. The steer there was 0.58 to
-    /// 0.68 with the nose 10 to 18 degrees left: the default law's authority
-    /// floor (0.35 of steer per 12 degrees from 50 kt) plus a trim of 0.15
-    /// and a power lead of 0.08, not the 0.85 cap.
+    /// offsets are the failures being fixed, 8.0 to 8.6 m left (the median
+    /// of five reads). On the default law the steer at the reject was the
+    /// authority floor, not the cap; on eb511f4's law it was 0.65 with the
+    /// nose 7.6 degrees left, the lead on the LEVER faded past 60 kt.
     #[test]
     fn the_evolution_roll_replays_as_flown() {
-        for (name, ticks, len) in [
-            ("1790724857", evolution_roll_0930(), 29),
-            ("1790712974", evolution_roll_crooked(), 32),
-        ] {
+        let lens = [32, 29, 38];
+        for ((name, ticks), len) in evolution_rolls().into_iter().zip(lens) {
             assert_eq!(ticks.len(), len, "{name}");
-            let (out, dev) = fly_evolution(
-                &ticks,
-                RollSteer::default(),
-                RollCut::new(None),
-                rudder_evolution_sqrt,
-                BRAKE_EVOLUTION_SQRT,
-                1.0,
-            );
+            let (law, cut) = evolution_law_as_flown(name);
+            let (out, dev) = fly_evolution(&ticks, law, cut, rudder_evolution_flat, 1.0);
             assert!(dev < 0.025, "{name}: the replayed law strays {dev:.4}");
             let (worst, end, _) = roll_verdict(&out);
             println!(
@@ -6566,102 +6613,132 @@ mod tests {
                 steer_reversals(&out)
             );
             assert!(worst > 7.5 && end < -7.5, "{name}: {worst:.2} {end:+.2}");
+            let last = ticks.last().unwrap();
+            let steer = last["steer"].as_f64().unwrap();
+            assert!(last["err"].as_f64().unwrap() > 7.0 && steer < 0.7, "{name}: {steer}");
         }
-        // The default law at the reject: the authority floor, not the cap.
-        let last = evolution_roll_0930().last().cloned().unwrap();
-        let steer = last["steer"].as_f64().unwrap();
-        assert!(last["err"].as_f64().unwrap() > 18.0 && steer < 0.6, "{steer}");
     }
 
-    /// The fix: the Evolution declares its rudder (`roll_rudder:`), 30 deg/s
-    /// per unit at 60 kt between the two fits, its PT6's standing rudder at
-    /// 0.6 of steer at full lever believed to the 60 kt measured, closed at
-    /// 1 per second with the trim's corner at 0.3. Replayed through the
-    /// aligned roll (1790724857) on either fit of the rudder at half to
-    /// twice, and on an aircraft needing 0.05 of steer less or more, it never
-    /// strays 2.5 m to the reject speed and reverses its steer at most
-    /// twice; on the fits, 1.1 m where it flew 8. The crooked start
-    /// (1790712974), already 2.7 m left by 30 kt on the replay, stays within
-    /// 4 m on the fits and 5.5 on the neighbours, where it flew 8.4, pinned
-    /// at the 0.85 cap from 38 kt: at the torque flown (1,500 to 1,700 ft-lb
-    /// against the manual's 1,250) the rudder has little more to give (a cap
-    /// of 1.0 replays 0.1 m better). Without the propeller's standing rudder
-    /// (the generic lead) the aligned roll strays 3.8 m.
+    /// The torque lead: on the torque read, 0.51 per 1,000 ft-lb believed to
+    /// 80 kt, where the lever lead gave 0.21 at 78 kt against 0.65 needed.
     #[test]
-    fn the_evolution_roll_holds_the_centreline_on_its_fitted_rudder() {
+    fn the_evolution_leads_its_rudder_on_the_torque() {
         let declared = rudder_evolution();
-        assert_eq!(declared.power_steer, Some(0.6));
-        assert_eq!(declared.power_steer_to_kts, Some(60.0));
-        let fits: [(&str, fn(f64) -> f64, f64); 2] = [
-            ("21 v^0.5", rudder_evolution_sqrt, BRAKE_EVOLUTION_SQRT),
-            ("40 v", rudder_evolution_linear, BRAKE_EVOLUTION_LINEAR),
+        assert_eq!(declared.power_steer_per_kftlb, Some(0.51));
+        let lead = |tq: Option<f64>, thr: f64, gs: f64| {
+            let mut law = RollSteer::with_rudder(false, declared);
+            law.set_torque(tq);
+            // No error, no yaw: the first tick's want is the lead, slewed.
+            let mut out = 0.0;
+            for _ in 0..20 {
+                out = law.step_with_yaw(0.0, 0.25, gs, thr, Some(0.0));
+            }
+            out
+        };
+        // 1,250 ft-lb at 78 kt: 0.64 whatever the lever.
+        let a = lead(Some(1250.0), 0.55, 78.0);
+        let b = lead(Some(1250.0), 0.76, 78.0);
+        assert!((a - b).abs() < 1e-9, "{a} {b}");
+        assert!((0.62..=0.66).contains(&a), "{a}");
+        // A failed torque read leads on the lever, as power_steer does.
+        let c = lead(None, 0.55, 50.0);
+        assert!((c - 0.6 * 0.55).abs() < 0.02, "{c}");
+        // Other airframes: no torque field, the torque is ignored.
+        let mut sr22 = RollSteer::with_rudder(false, rudder_sr22());
+        let mut sr22b = RollSteer::with_rudder(false, rudder_sr22());
+        sr22.set_torque(Some(1500.0));
+        for (err, gs) in [(2.0, 20.0), (1.0, 50.0), (-1.0, 80.0)] {
+            assert_eq!(
+                sr22.step_with_yaw(err, 0.25, gs, 1.0, Some(0.3)),
+                sr22b.step_with_yaw(err, 0.25, gs, 1.0, Some(0.3))
+            );
+        }
+        // The declared rudder grows as v^0.5, not v^2.
+        let y = |gs| declared.yaw_dps_at(gs);
+        assert!((y(20.0) / y(80.0) - 0.5).abs() < 1e-9);
+    }
+
+    /// The refit, replayed through all three rolls to the reject: the rudder
+    /// declared at 32 deg/s at 80 kt growing as v^0.5 (`yaw_power`), the
+    /// PT6's standing rudder led on the measured torque (0.51 per 1,000
+    /// ft-lb, `power_steer_per_kftlb`) believed to 80 kt, closed at 1.5 per
+    /// second with the trim's corner at 0.1 (the torque lead carries what
+    /// the trim learnt slowly). On either fit, the rudder at two thirds to
+    /// one and a half times (the three-roll fit bounds it tighter than the
+    /// SR22's one roll did) and 0.05 of need either way:
+    /// - 1790736651: 3.0 m on the fits (1.9 to 3.9 m on the neighbours),
+    ///   ending within 0.9 m of the line, where it flew 8.6;
+    /// - 1790724857: 3.7 to 3.8 m (4.8), where it flew 8.0, at torques the
+    ///   limiter now holds off;
+    /// - 1790712974: 3.6 to 3.7 m (4.9), already 2.7 m left by 30 kt from
+    ///   its crooked start, where it flew 8.4.
+    /// The steer reverses at most three times. eb511f4's law (the lever
+    /// lead) replays 1790736651 as flown, and the torque lead on its v^2
+    /// schedule and closure strays further on the fits.
+    #[test]
+    fn the_evolution_roll_holds_the_line_on_its_torque() {
+        let declared = rudder_evolution();
+        assert_eq!(declared.yaw_power, Some(0.5));
+        assert_eq!(declared.power_steer_to_kts, Some(80.0));
+        let fits: [(&str, fn(f64) -> f64); 2] = [
+            ("30 v^0.35", rudder_evolution_flat),
+            ("33 v^0.5", rudder_evolution_sqrt),
         ];
         let fly = |ticks: &[serde_json::Value],
                    rd: crate::aircraft::RollRudderProfile,
-                   (rudder, brake): (fn(f64) -> f64, f64),
+                   rudder: fn(f64) -> f64,
                    scale: f64| {
             let law = RollSteer::with_rudder(false, rd);
             let cut = RollCut::for_law(&law);
-            fly_evolution(ticks, law, cut, rudder, brake, scale).0
+            fly_evolution(ticks, law, cut, rudder, scale).0
         };
-        for (name, ticks, worst_all, worst_fit) in [
-            ("1790724857", evolution_roll_0930(), 2.5, 1.1),
-            ("1790712974", evolution_roll_crooked(), 5.5, 4.0),
-        ] {
-            let flown = roll_verdict(
-                &fly_evolution(
-                    &ticks,
-                    RollSteer::default(),
-                    RollCut::new(None),
-                    rudder_evolution_sqrt,
-                    BRAKE_EVOLUTION_SQRT,
-                    1.0,
-                )
-                .0,
-            );
+        for ((name, ticks), (fit_max, all_max)) in
+            evolution_rolls().into_iter().zip([(3.8, 5.0), (3.9, 4.9), (3.1, 4.0)])
+        {
+            let (law, cut) = evolution_law_as_flown(name);
+            let flown = roll_verdict(&fly_evolution(&ticks, law, cut, rudder_evolution_flat, 1.0).0);
             for need in [-0.05, 0.0, 0.05] {
                 let shifted = needing(&ticks, need);
-                for (plant_name, rudder, brake) in fits {
-                    for scale in [0.5, 1.0, 2.0] {
-                        let out = fly(&shifted, declared, (rudder, brake), scale);
+                for (plant_name, rudder) in fits {
+                    for scale in [0.67, 1.0, 1.5] {
+                        let out = fly(&shifted, declared, rudder, scale);
                         let (worst, end, _) = roll_verdict(&out);
                         let rev = steer_reversals(&out);
                         println!(
                             "{name} need {need:+} {plant_name} x{scale}: worst {worst:.2} m, {end:+.2} m at the end, {rev} reversals"
                         );
                         assert!(
-                            worst <= worst_all,
+                            worst <= all_max,
                             "{name}, need {need:+}, {plant_name} x{scale}: {worst:.2} m"
                         );
                         assert!(
-                            worst < flown.0 - 2.5,
+                            worst < flown.0 - 3.0,
                             "{name}: {worst:.2} m against {:.2} flown",
                             flown.0
                         );
-                        assert!(
-                            rev <= 2,
-                            "{name}, need {need:+}, {plant_name} x{scale}: the steer weaves"
-                        );
+                        assert!(rev <= 3, "{name}, {plant_name} x{scale}: the steer weaves");
                         if need == 0.0 && scale == 1.0 {
-                            assert!(worst <= worst_fit, "{name} on {plant_name}: {worst:.2} m");
+                            assert!(worst <= fit_max, "{name} on {plant_name}: {worst:.2} m");
                         }
                     }
                 }
             }
         }
-        // The generic lead in place of the PT6's standing rudder.
-        let generic = crate::aircraft::RollRudderProfile {
-            power_steer: None,
-            ..declared
+        // The torque lead alone, on eb511f4's schedule and closure.
+        let torque_only = crate::aircraft::RollRudderProfile {
+            power_steer_per_kftlb: Some(0.51),
+            power_steer_to_kts: Some(80.0),
+            ..rudder_evolution_eb511f4()
         };
+        let today = &evolution_rolls()[2].1;
         let worst = |rd| {
             fits.iter()
-                .map(|(_, r, b)| roll_verdict(&fly(&evolution_roll_0930(), rd, (*r, *b), 1.0)).0)
+                .map(|(_, r)| roll_verdict(&fly(today, rd, *r, 1.0)).0)
                 .fold(0.0, f64::max)
         };
-        let (with, without) = (worst(declared), worst(generic));
-        println!("the aligned roll: {with:.2} m declared, {without:.2} m on the generic lead");
-        assert!(without > with + 0.3, "{without:.2} against {with:.2}");
+        let (with, without) = (worst(declared), worst(torque_only));
+        println!("1790736651: {with:.2} m declared, {without:.2} m on eb511f4's schedule");
+        assert!(without > with + 0.5, "{without:.2} against {with:.2}");
     }
 
     /// The cross-track read pairs two frames now and then (latitude and
