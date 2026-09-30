@@ -1,0 +1,9 @@
+# King Air C90B landings from 4 nm (iMac 2026-09-30): the rollout ground
+# loop of 1790757702 (80 deg right against full left steer) on a fresh load.
+after: stop
+cases:
+  - name: "King Air C90B LEMG 13, 4 nm final (rollout)"
+    setup:
+      aircraft: "Aircraft/Laminar Research/Beechcraft King Air C90B/C90B.acf"
+      approach: { field: LEMG, runway: 13, final_nm: 4 }
+    traffic: off

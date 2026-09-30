@@ -1,0 +1,15 @@
+# Light-aircraft landings (iMac 2026-09-30): the Baron from 4 nm (its 2 nm
+# final was placed ~480 ft high), the 172 from 2 nm.
+after: stop
+cases:
+  - name: "Baron 58 LEMG 13, 4 nm final"
+    setup:
+      aircraft: "Aircraft/Laminar Research/Beechcraft Baron 58/Baron_58.acf"
+      approach: { field: LEMG, runway: 13, final_nm: 4 }
+    traffic: off
+
+  - name: "172 SP LEMG 13, 2 nm final"
+    setup:
+      aircraft: "Aircraft/Laminar Research/Cessna 172 SP/Cessna_172SP.acf"
+      approach: { field: LEMG, runway: 13, final_nm: 2 }
+    traffic: off
