@@ -2549,14 +2549,23 @@ fn takeoff_power() -> Option<crate::aircraft::TakeoffPowerProfile> {
 
 /// Newton-metres to foot-pounds (`ENGN_TRQ` is in N m).
 const NM_TO_FTLB: f64 = 0.737_562;
-/// Over the limit by this share, the lever comes back a step per tick.
-const TORQUE_OVER_FRAC: f64 = 0.05;
+/// From this share of the limit the lever stops advancing: a turboprop
+/// spooling up and gathering ram air keeps adding torque at a fixed lever.
+const TORQUE_HOLD_FRAC: f64 = 0.95;
+/// Past the limit the lever comes back at least this much per tick, and in
+/// proportion to the excess (torque is near proportional to the lever at a
+/// given speed), aiming this share under the limit.
 const TORQUE_BACKOFF_STEP: f64 = 0.02;
+const TORQUE_AIM_FRAC: f64 = 0.98;
 
-/// The lever under the manual's torque limit: below the limit the law's own
-/// want; at it the lever holds; past it by [`TORQUE_OVER_FRAC`] it comes
-/// back a step. Past `until_kias`, or with no torque read or no limit, the
-/// want as asked. Pure.
+/// The lever under the manual's torque limit: below [`TORQUE_HOLD_FRAC`] of
+/// it the law's own want; from there to the limit the lever holds; past the
+/// limit it comes back in proportion to the excess. Past `until_kias`, or
+/// with no torque read or no limit, the want as asked. Pure.
+///
+/// It stepped back 0.02 a tick only once 5% over, and a PT6 at a held lever
+/// kept climbing: LILB 03 Evolution (1790724857, 2026-09-30) ran 1,735
+/// ft-lb against the manual's 1,250, 39% over, by 60 kt.
 pub fn torque_limited(
     want: f64,
     last: f64,
@@ -2570,9 +2579,10 @@ pub fn torque_limited(
     if ias_kts >= l.until_kias || !tq.is_finite() {
         return want;
     }
-    if tq > l.torque_ftlb * (1.0 + TORQUE_OVER_FRAC) {
-        (last - TORQUE_BACKOFF_STEP).max(0.0).min(want)
-    } else if tq >= l.torque_ftlb {
+    if tq > l.torque_ftlb {
+        let proportional = last * l.torque_ftlb / tq * TORQUE_AIM_FRAC;
+        proportional.min(last - TORQUE_BACKOFF_STEP).max(0.0).min(want)
+    } else if tq >= l.torque_ftlb * TORQUE_HOLD_FRAC {
         want.min(last)
     } else {
         want
@@ -8564,8 +8574,10 @@ mod tests {
         // holds, past it the lever comes back; past 150 kt, the ramp again.
         let evo = crate::aircraft::TakeoffPowerProfile { torque_ftlb: 1250.0, until_kias: 150.0 };
         assert_eq!(torque_limited(0.8, 0.5, Some(900.0), 40.0, Some(&evo)), 0.8);
-        assert_eq!(torque_limited(0.8, 0.5, Some(1260.0), 40.0, Some(&evo)), 0.5);
-        assert!((torque_limited(0.8, 0.5, Some(1400.0), 40.0, Some(&evo)) - 0.48).abs() < 1e-9);
+        assert_eq!(torque_limited(0.8, 0.5, Some(1200.0), 40.0, Some(&evo)), 0.5, "held from 95%");
+        assert!((torque_limited(0.8, 0.5, Some(1260.0), 40.0, Some(&evo)) - 0.48).abs() < 1e-9);
+        let back = torque_limited(0.8, 0.5, Some(1735.0), 40.0, Some(&evo));
+        assert!((back - 0.5 * 1250.0 / 1735.0 * 0.98).abs() < 1e-9, "in proportion: {back}");
         assert_eq!(torque_limited(1.0, 0.5, Some(1400.0), 155.0, Some(&evo)), 1.0);
         assert_eq!(torque_limited(1.0, 0.5, None, 40.0, Some(&evo)), 1.0, "no read: the ramp");
         assert_eq!(torque_limited(1.0, 0.5, Some(2000.0), 40.0, None), 1.0, "no limit declared");
