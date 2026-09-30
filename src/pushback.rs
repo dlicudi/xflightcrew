@@ -339,6 +339,25 @@ pub fn lane_plan(lane: &[(f64, f64)]) -> Option<Plan> {
     })
 }
 
+/// The push flown: the painted lane's, but only when the heading it ends on
+/// leaves the cleared route's first leg AHEAD of the wing line (within
+/// [`BEHIND_DEG`]); else the route's own plan, which swings the nose onto
+/// that leg. A lead-in is painted for the traffic that arrives by it, so
+/// read backwards it can end facing the way the arrivals came from. LEMG
+/// (iMac 2026-09-29, sortie 1790712526, a Citation X): the lane ended on
+/// 26.3 while the route left on 222.2, 164 degrees apart; 26.3 was inside
+/// the straight band of the 327.7 nose, the tug pushed 51.5 m straight and
+/// let go, and the taxi was left facing the stand with the way out behind
+/// (#190). At LIBP stand 1 the two were 90 degrees apart (127 against 217)
+/// and the lane was right (2026-09-26): a quarter turn is a taxi's. Returns
+/// the plan and whether the lane was taken. Pure.
+pub fn choose_plan(route: Plan, lane: Option<Plan>) -> (Plan, bool) {
+    match lane {
+        Some(l) if angle_diff_deg(l.target_hdg, route.target_hdg).abs() <= BEHIND_DEG => (l, true),
+        _ => (route, false),
+    }
+}
+
 /// The tug command for a heading error, given which way `Right` actually
 /// swings the nose under tow (`sense >= 0` = clockwise).
 pub fn steer_for(err_deg: f64, sense: i8) -> Steer {
@@ -1759,6 +1778,70 @@ mod tests {
         assert!((p.target_hdg - 127.4).abs() < 1.5, "{}", p.target_hdg);
         assert!((p.back_m - 26.3).abs() < 1.0, "{}", p.back_m);
         assert_eq!(super::steer_for(super::angle_diff_deg(p.target_hdg, 171.8), 1), super::Steer::Straight);
+    }
+
+    /// #190, LEMG (iMac 2026-09-29, sortie 1790712526, a Citation X at the
+    /// gate, nose 327.7): the painted lane read from the install ends on
+    /// 26.3 (`push_lane` target_hdg 26.3, back_m 98.6) while the cleared
+    /// route leaves on 222.2 (`route_target_hdg`). The lane was flown: 58.6
+    /// degrees, inside the straight band, and the tug pushed 51.5 m straight.
+    /// Now the route's plan is flown, a swing onto 222; the LIBP lane, a
+    /// quarter turn from its route, is still the lane's.
+    #[test]
+    fn a_lane_that_ends_facing_away_from_the_route_is_not_flown() {
+        let lane = super::lane_plan(&[
+            (36.67335699385795, -4.489441801082622),
+            (36.672821, -4.4890121),
+            (36.67281772148437, -4.4890096037109375),
+            (36.672808571875, -4.489002910937501),
+            (36.67279458007812, -4.4889932158203125),
+            (36.672776775, -4.4889817125),
+            (36.672756185546874, -4.4889695951171875),
+            (36.672733840625, -4.4889580578125),
+            (36.67271076914062, -4.488948294726563),
+            (36.672688, -4.4889415),
+            (36.67266665742188, -4.488938740039062),
+            (36.672647346875, -4.4889396140625),
+            (36.67263031914063, -4.488943115429687),
+            (36.672615825, -4.4889482375),
+            (36.67260411523438, -4.488953973632812),
+            (36.672595440625, -4.4889593171875),
+            (36.67259005195312, -4.488963261523438),
+            (36.6725882, -4.4889648),
+        ])
+        .expect("the LEMG lane");
+        assert!((lane.target_hdg - 26.3).abs() < 1.0, "{}", lane.target_hdg);
+        let psi = 327.7;
+        assert_eq!(super::steer_for(super::angle_diff_deg(lane.target_hdg, psi), 1), super::Steer::Straight);
+        // The route as planned from the stand (replayed from the install):
+        // the stand, 81.6 m back on 155.3 to the taxiway, then 222.2.
+        let path = [
+            (36.67335705897913, -4.489441674810065),
+            (36.6726900, -4.4890590),
+            (36.6726569, -4.4890964),
+            (36.6726238, -4.4891338),
+            (36.6725907, -4.4891712),
+            (36.6725576, -4.4892086),
+        ];
+        let route = super::plan(36.67335705897913, -4.489441674810065, psi, &path).expect("nose in");
+        assert!((route.target_hdg - 222.2).abs() < 0.5, "{}", route.target_hdg);
+        let (p, used) = super::choose_plan(route.clone(), Some(lane));
+        assert!(!used, "a lane ending 164 degrees from the route is not the way out");
+        assert_eq!(p, route);
+        assert!((p.back_m - 81.6).abs() < 1.0, "{}", p.back_m);
+        let err = super::angle_diff_deg(p.target_hdg, psi);
+        assert!((err + 105.5).abs() < 1.0, "{err}");
+        assert_ne!(super::steer_for(err, 1), super::Steer::Straight, "the tug swings the nose");
+        // LIBP stand 1: lane 127.4, route 217, the lane stands.
+        let libp = super::lane_plan(&[(42.431840, 14.188786), (42.431840, 14.188786), (42.431984, 14.188531)])
+            .expect("the LIBP lane");
+        let libp_route = super::Plan { target_hdg: 217.0, ..libp.clone() };
+        let libp_route = super::Plan { lane: false, ..libp_route };
+        let (p, used) = super::choose_plan(libp_route, Some(libp.clone()));
+        assert!(used);
+        assert_eq!(p, libp);
+        // No lane painted: the route's plan, as before.
+        assert_eq!(super::choose_plan(route.clone(), None), (route, false));
     }
 
     #[test]

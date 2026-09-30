@@ -1138,6 +1138,10 @@ fn c_tug_unhook(log: &Log) -> Verdict {
 fn c_push_lane(log: &Log) -> Verdict {
     let (mut fails, mut oks) = (Vec::new(), Vec::new());
     for lane in log.of("full_auto", "push_lane") {
+        // A lane refused for facing away from the route was not flown (#190).
+        if flag(lane.v, "used") == Some(false) {
+            continue;
+        }
         let want = num(lane.v, "back_m").unwrap_or(f64::NAN);
         let Some(stop) = log.next(lane.t, "pushback", "stopped", 600.0) else {
             continue;

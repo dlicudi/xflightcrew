@@ -2582,18 +2582,19 @@ async fn fly(xp: XPlaneClient, config: Config, voice: Option<Voice>, tools: SubT
                 .unwrap_or_default();
             if let (Ok(lat), Ok(lon), Ok(psi)) = (lat_r, lon_r, psi_r) {
                 // A push is owed by the route; where the stand's lane is
-                // PAINTED, the push is planned off the paint.
+                // PAINTED, the push is planned off the paint, unless the
+                // paint ends facing away from the route (`choose_plan`, #190).
                 let plan = crate::pushback::plan(lat, lon, psi, &path).map(|route_plan| {
-                    match crate::party_line::push_lane(lat, lon, psi)
-                        .and_then(|l| crate::pushback::lane_plan(&l))
-                    {
-                        Some(lp) => {
-                            event("push_lane", json!({ "back_m": lp.back_m, "target_hdg": lp.target_hdg,
-                                                        "route_target_hdg": route_plan.target_hdg }));
-                            lp
-                        }
-                        None => route_plan,
+                    let lane = crate::party_line::push_lane(lat, lon, psi)
+                        .and_then(|l| crate::pushback::lane_plan(&l));
+                    let lane_seen = lane.clone();
+                    let route_hdg = route_plan.target_hdg;
+                    let (chosen, used) = crate::pushback::choose_plan(route_plan, lane);
+                    if let Some(lp) = lane_seen {
+                        event("push_lane", json!({ "back_m": lp.back_m, "target_hdg": lp.target_hdg,
+                                                    "route_target_hdg": route_hdg, "used": used }));
                     }
+                    chosen
                 });
                 let stand = crate::party_line::nearest_stand(lat, lon);
                 let at_stand = crate::pushback::on_a_stand(
