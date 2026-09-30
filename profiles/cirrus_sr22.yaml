@@ -214,6 +214,17 @@ taxi:
   steer_lead_s: 2.0
   lookahead_s: 9.0
   brake_steer: true
+  # The corner a braked wheel can fly: 20 deg/s times its radius. LEMG, GA
+  # stand to 12 (iMac, 2026-09-29/30, sorties 1790690995, 1790718797,
+  # 1790725168): the two left corners of about 100 degrees took the 6 kt turn
+  # cap (the governor's target read 6.0 at the first); the governor ran
+  # 1 to 2.7 kt over it out of the jog before each, the taxi split turned the
+  # nose at 5 to 10 deg/s at 8 kt against the 39 the corner asked, and the
+  # pivot that followed swung it 40 to 65 degrees past (4.7 to 5.3 m off).
+  # The SR22 turned LEMG's ramp corners at 14 deg/s at 3 kt on the line
+  # (2026-09-28). Only corners under about 9 m of radius slow; straights and
+  # bends keep the GA pace.
+  max_yaw_dps: 20.0
 
 # The takeoff roll's rudder (autotakeoff::RollSteer), fitted to LEMG 13
 # 2026-09-29 (sortie 1790677606): the sim's yaw rate against the steer, 15 kt

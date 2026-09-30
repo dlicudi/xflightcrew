@@ -1109,6 +1109,91 @@ pub fn pivot_due(err_deg: f64, gs_kts: f64, joining: bool) -> bool {
 }
 const PIVOT_BRAKE_MAX: f64 = 0.45;
 
+/// A free castoring nose swinging faster than this AGAINST the steer is
+/// caught on the opposite brake ([`BrakeSteer::step`]), the brake growing
+/// with the swing to [`SWING_CATCH_MAX`] at [`SWING_CATCH_SPAN_DPS`] more:
+/// a damper, so it lets go as the swing dies and never drives one back.
+pub const SWING_CATCH_DPS: f64 = 8.0;
+pub const SWING_CATCH_SPAN_DPS: f64 = 30.0;
+pub const SWING_CATCH_MAX: f64 = 0.2;
+
+/// The brake half of the taxi steering on a castoring nose, one tick: the
+/// taxi split on the smoothed steer, the pivot's split past
+/// [`PIVOT_MIN_ERR_DEG`] at walking pace, both under the turn-rate ceiling
+/// ([`pivot_rate_scale`]), squeezed on at [`BRAKE_STEER_SLEW_PER_S`].
+///
+/// On a nose with no steering of its own (`aircraft::nose_free`) two more
+/// things, because there the brakes are the only thing that stops a swing:
+/// a swing past [`SWING_CATCH_DPS`] against the steer is caught on the
+/// opposite wheel with authority from 1 kt (the taxi split's fades out
+/// under 4), and a brake the law no longer wants comes OFF at once, never
+/// eased off at the squeeze's rate. LEMG, the SR22 from the GA stand to 12
+/// (iMac, 19 fps, 0.3 s ticks; sorties 1790690995, 1790718797 and
+/// 1790725168, 2026-09-29/30): every taxi failed 4.7 to 5.3 m off at one of
+/// two left corners of about 100 degrees, entered at 7 to 8.7 kt. The
+/// inside brake (0.25, then the pivot's 0.41) slowed it to 2 kt and the yaw
+/// built to 30 to 37 deg/s; the rate ceiling asked for the brake off at 25
+/// and the squeeze took a second to let it go (0.41, 0.29, 0.17, 0.05); the
+/// steer then sat reversed at 0.75 to 0.84 for 3 s while the walking-pace
+/// fade gave the opposite wheel 0.04 to 0.07, and the nose swung 40 to 65
+/// degrees past the new taxiway and crept on across the inside. Pure.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct BrakeSteer {
+    /// The steer the brakes follow ([`BRAKE_STEER_TAU_S`]).
+    smoothed: f64,
+    /// The last (left, right) pair written.
+    prev: (f64, f64),
+}
+
+impl BrakeSteer {
+    /// `steer` right positive, `yaw_dps` the drive's smoothed yaw rate, nose
+    /// right positive; returns (left, right) brake.
+    #[allow(clippy::too_many_arguments)]
+    pub fn step(
+        &mut self,
+        steer: f64,
+        err_deg: f64,
+        gs_kts: f64,
+        yaw_dps: f64,
+        joining: bool,
+        free_nose: bool,
+        dt: f64,
+    ) -> (f64, f64) {
+        let pivot = pivot_due(err_deg, gs_kts, joining);
+        self.smoothed = smooth_toward(self.smoothed, steer, BRAKE_STEER_TAU_S, dt);
+        // The turn-rate ceiling holds for every brake turn, not only a
+        // pivot: out of a LIME corner at 8 to 12 kt the brake spun the
+        // Evolution at 35 deg/s where the bend asked 14 (2026-09-25).
+        let (wl, wr) = if pivot {
+            pivot_brake_split(steer, gs_kts)
+        } else {
+            brake_steer_split_band(self.smoothed, gs_kts, free_nose)
+        };
+        let k = pivot_rate_scale(if pivot { steer } else { self.smoothed }, yaw_dps);
+        let (mut wl, mut wr) = (wl * k, wr * k);
+        if free_nose && steer * yaw_dps < 0.0 && yaw_dps.abs() > SWING_CATCH_DPS {
+            let b = ((yaw_dps.abs() - SWING_CATCH_DPS) / SWING_CATCH_SPAN_DPS).clamp(0.0, 1.0)
+                * SWING_CATCH_MAX
+                * (gs_kts - 1.0).clamp(0.0, 1.0);
+            if yaw_dps < 0.0 {
+                (wl, wr) = (0.0, wr.max(b));
+            } else {
+                (wl, wr) = (wl.max(b), 0.0);
+            }
+        }
+        let ease = |prev: f64, want: f64| {
+            if free_nose && want < prev {
+                want
+            } else {
+                slew_steer(prev, want, Some(BRAKE_STEER_SLEW_PER_S), dt)
+            }
+        };
+        let pair = (ease(self.prev.0, wl), ease(self.prev.1, wr));
+        self.prev = pair;
+        pair
+    }
+}
+
 /// The brakes of an ALIGNING pivot, a castoring nose turned onto a heading
 /// on its brakes at walking pace: a PD on the heading error, the derivative
 /// the sim's own yaw rate (`R`, positive nose right) led by
@@ -2610,9 +2695,7 @@ async fn drive(xp: XPlaneClient, voice: Option<Voice>, route: Route, base_kts: f
     // exit path can release it exactly once — and the last commanded pair,
     // so the assist's own slew has something to move from.
     let mut bs_on = false;
-    let mut bs_prev = (0.0f64, 0.0f64);
-    // The steer the BRAKES follow ([`BRAKE_STEER_TAU_S`]).
-    let mut bs_steer = 0.0f64;
+    let mut brakes = BrakeSteer::default();
     // Stagnation watch: commanding motion but not moving (see below).
     let mut stalled_since: Option<std::time::Instant> = None;
     // Over the taxi pace since (see [`taxi_overspeed`]).
@@ -3109,21 +3192,15 @@ async fn drive(xp: XPlaneClient, voice: Option<Voice>, route: Route, base_kts: f
         // three. The 2026-07-28 lesson was about sequential awaits dragging
         // the loop to a second, not about the number of writes.)
         let (bl, br) = if route.pace.brake_steer || crate::aircraft::nose_castors() {
-            let pivot = pivot_due(err, gs_kts, join_allow.unwrap_or(0.0) > 0.0);
-            bs_steer = smooth_toward(bs_steer, steer, BRAKE_STEER_TAU_S, dt);
-            // The turn-rate ceiling holds for every brake turn, not only a
-            // pivot: out of a LIME corner at 8 to 12 kt the brake spun the
-            // Evolution at 35 deg/s where the bend asked 14 (2026-09-25).
-            let (wl, wr) = if pivot {
-                pivot_brake_split(steer, gs_kts)
-            } else {
-                brake_steer_split_band(bs_steer, gs_kts, crate::aircraft::nose_free())
-            };
-            let k = pivot_rate_scale(if pivot { steer } else { bs_steer }, yaw_rate);
-            let (wl, wr) = (wl * k, wr * k);
-            let bl = slew_steer(bs_prev.0, wl, Some(BRAKE_STEER_SLEW_PER_S), dt);
-            let br = slew_steer(bs_prev.1, wr, Some(BRAKE_STEER_SLEW_PER_S), dt);
-            bs_prev = (bl, br);
+            let (bl, br) = brakes.step(
+                steer,
+                err,
+                gs_kts,
+                yaw_rate,
+                join_allow.unwrap_or(0.0) > 0.0,
+                crate::aircraft::nose_free(),
+                dt,
+            );
             bs_on = bl > 0.0 || br > 0.0;
             (bl, br)
         } else {
@@ -5559,30 +5636,69 @@ mod tests {
         r: f64,
         /// (time, brake difference, groundspeed m/s) commanded.
         sent: std::collections::VecDeque<(f64, f64, f64)>,
+        /// Gain `k0 - k1 v` per unit of brake, lag `tau_a + tau_b / v`.
+        k0: f64,
+        k1: f64,
+        tau_a: f64,
+        tau_b: f64,
+        /// Integrated in 0.02 s steps within a tick (the refit), else once.
+        fine: bool,
     }
 
     impl Sr22Plant {
         const DELAY_S: f64 = 0.45;
         const TAU_S: f64 = 2.17;
         const PULL_DPS: f64 = -1.7;
+        /// The refit's pivot: the nose swings about a braked main wheel,
+        /// the aircraft's centre this far from it, m.
+        const PIVOT_ARM_M: f64 = 1.5;
         fn gain(v_ms: f64) -> f64 {
             (299.0 - 35.8 * v_ms).max(10.0)
         }
         fn new(r: f64) -> Self {
-            Sr22Plant { r, sent: std::collections::VecDeque::new() }
+            Sr22Plant {
+                r,
+                sent: std::collections::VecDeque::new(),
+                k0: 299.0,
+                k1: 35.8,
+                tau_a: Self::TAU_S,
+                tau_b: 0.0,
+                fine: false,
+            }
+        }
+        /// Refitted over the three iMac corners (1790690995 ticks 3380 to
+        /// 3445, 1790725168 3255 to 3310, 1790718797 1940 to 2000,
+        /// 2026-09-29/30) and [`LEMG_CORNER`] together, the worst window's
+        /// rms least (2.9 to 4.1 deg/s; the first fit's 3.8 to 6.8 on the
+        /// iMac's): at a walk a braked wheel swings the aircraft harder AND
+        /// the swing outlasts the brake, 400 - 50 v deg/s per unit and a lag
+        /// of 1.5 + 2 / v s (3.5 s at 1 m/s, 2 s at 4).
+        fn refit(r: f64) -> Self {
+            Sr22Plant { k0: 400.0, k1: 50.0, tau_a: 1.5, tau_b: 2.0, fine: true, ..Self::new(r) }
         }
         /// Command at `t`, then advance `dt`: the yaw rate, deg/s.
         fn step(&mut self, t: f64, brake_diff: f64, v_ms: f64, dt: f64) -> f64 {
             self.sent.push_back((t, brake_diff, v_ms));
-            // Sample and hold: the newest command at least DELAY_S old.
-            while self.sent.len() > 1 && self.sent[1].0 <= t - Self::DELAY_S + 1e-9 {
-                self.sent.pop_front();
-            }
-            let (t0, b, v) = self.sent[0];
-            let (b, v) = if t0 <= t - Self::DELAY_S + 1e-9 { (b, v) } else { (0.0, v_ms) };
+            let tau = self.tau_a + self.tau_b / v_ms.max(0.3);
             let pull = if v_ms > 0.5 { Self::PULL_DPS } else { 0.0 };
-            let want = b * Self::gain(v) + pull;
-            self.r += (want - self.r) * (dt / Self::TAU_S).min(1.0);
+            let (steps, h) = if self.fine { ((dt / 0.02).round().max(1.0) as usize, dt / (dt / 0.02).round().max(1.0)) } else { (1, dt) };
+            for k in 0..steps {
+                let now = t + k as f64 * h;
+                // Sample and hold: the newest command at least DELAY_S old.
+                while self.sent.len() > 1 && self.sent[1].0 <= now - Self::DELAY_S + 1e-9 {
+                    self.sent.pop_front();
+                }
+                let (t0, b, v) = self.sent[0];
+                let (b, v) = if t0 <= now - Self::DELAY_S + 1e-9 { (b, v) } else { (0.0, v_ms) };
+                let want = b * (self.k0 - self.k1 * v).max(10.0) + pull;
+                self.r += (want - self.r) * (h / tau).min(1.0);
+                if self.fine {
+                    // Pivoting on a braked main wheel is the tightest it
+                    // turns: 37.7 deg/s at 2.0 kt as flown.
+                    let most = (v_ms / Self::PIVOT_ARM_M).to_degrees();
+                    self.r = self.r.clamp(-most, most);
+                }
+            }
             self.r
         }
     }
@@ -5642,12 +5758,72 @@ mod tests {
         assert!(fast > 2.5 * rms && fast_peak > 20.0, "no lag is not this aircraft: {fast:.1} rms, {fast_peak:.1} peak");
     }
 
+    /// How a corner run is flown: the tick, the speed it starts at and the
+    /// governor that holds it, the brake law under test and the corner cap.
+    struct CornerRun<'a> {
+        dt: f64,
+        /// Groundspeed at the start, kt.
+        v0_kts: f64,
+        /// The iMac's governor and the refitted plant ([`Sr22Plant::refit`]):
+        /// (knots over its target, m/s^2 it pulls with under that). The SR22
+        /// went into both corners 1 to 2.7 kt over the 6 and crept out of
+        /// the swing at 0.1 to 0.4 m/s^2. Over it the governor brakes at
+        /// 0.9 m/s^2, and the steering brakes drag the aircraft at 4 per
+        /// unit. `None` is the ideal governor and the first plant, the ramp
+        /// corner test's.
+        imac: Option<(f64, f64)>,
+        /// (steer, err, gs, yaw, dt) to (left, right) brake.
+        brakes: &'a mut dyn FnMut(f64, f64, f64, f64, f64) -> (f64, f64),
+        /// The scorer judges from this far along the route, m.
+        judge_from_m: f64,
+        /// The profile's corner yaw cap (`taxi.max_yaw_dps`), else none, as
+        /// flown before #165.
+        yaw_cap: bool,
+    }
+
+    /// The brake-steer law on a free nose before the swing catch (#165):
+    /// the taxi split or the pivot's, the rate ceiling, squeezed both ways.
+    fn old_free_nose_brakes() -> impl FnMut(f64, f64, f64, f64, f64) -> (f64, f64) {
+        let (mut bs, mut prev) = (0.0_f64, (0.0_f64, 0.0_f64));
+        move |steer, err, gs, yaw, dt| {
+            bs = smooth_toward(bs, steer, BRAKE_STEER_TAU_S, dt);
+            let pivot = pivot_due(err, gs, false);
+            let (wl, wr) = if pivot { pivot_brake_split(steer, gs) } else { brake_steer_split_band(bs, gs, true) };
+            let k = pivot_rate_scale(if pivot { steer } else { bs }, yaw);
+            let bl = slew_steer(prev.0, wl * k, Some(BRAKE_STEER_SLEW_PER_S), dt);
+            let br = slew_steer(prev.1, wr * k, Some(BRAKE_STEER_SLEW_PER_S), dt);
+            prev = (bl, br);
+            prev
+        }
+    }
+
+    /// The law `drive` flies on a free castoring nose.
+    fn free_nose_brakes() -> impl FnMut(f64, f64, f64, f64, f64) -> (f64, f64) {
+        let mut b = BrakeSteer::default();
+        move |steer, err, gs, yaw, dt| b.step(steer, err, gs, yaw, false, true, dt)
+    }
+
     /// One drive tick of the law, as `drive` runs it, through the SR22 plant.
     /// Returns the scorer's own verdict on the line: (max cut inside a
     /// vertex, max off the line), from [`crate::scorecard::LineJudge`].
     fn fly_sr22_corner(path_m: &[(f64, f64)], start: (f64, f64), aim_floor_free: bool) -> (f64, f64) {
+        let mut brakes = free_nose_brakes();
+        let run = CornerRun { dt: 0.2, v0_kts: 10.0, imac: None, brakes: &mut brakes, judge_from_m: 0.0, yaw_cap: true };
+        fly_sr22_corner_with(path_m, start, aim_floor_free, run).0
+    }
+
+    /// [`fly_sr22_corner`] as `run` says; also the peak yaw rate, deg/s.
+    fn fly_sr22_corner_with(
+        path_m: &[(f64, f64)],
+        start: (f64, f64),
+        aim_floor_free: bool,
+        run: CornerRun,
+    ) -> ((f64, f64), f64) {
         use crate::scorecard::{LineJudge, CORNER_TURN_DPS};
-        let pace = Pace::from_profile(crate::aircraft::load("cirrus_sr22").expect("sr22").taxi.as_ref());
+        let mut pace = Pace::from_profile(crate::aircraft::load("cirrus_sr22").expect("sr22").taxi.as_ref());
+        if !run.yaw_cap {
+            pace.max_yaw_dps = None;
+        }
         assert!(pace.brake_steer);
         let watch = TaxiWatch {
             path: path_m.iter().map(|&(x, y)| ll(x, y)).collect(),
@@ -5656,18 +5832,20 @@ mod tests {
             holding_point: String::new(),
             lead_on: Vec::new(),
         };
-        let route = Route::build(&watch).expect("route");
-        let dt = 0.2;
+        let mut route = Route::build(&watch).expect("route");
+        route.pace = pace;
+        let dt = run.dt;
         let (mut x, mut y) = start;
         let mut psi = taxi_guide::bearing(path_m[0], path_m[1]);
-        let mut v = 10.0 / MS_TO_KTS;
-        let mut plant = Sr22Plant::new(0.0);
-        let (mut yaw, mut prev_psi, mut prev_steer, mut bs, mut bs_prev) = (0.0_f64, psi, 0.0_f64, 0.0_f64, (0.0_f64, 0.0_f64));
+        let mut v = run.v0_kts / MS_TO_KTS;
+        let mut plant = if run.imac.is_some() { Sr22Plant::refit(0.0) } else { Sr22Plant::new(0.0) };
+        let (mut yaw, mut prev_psi, mut prev_steer) = (0.0_f64, psi, 0.0_f64);
         let mut trim = StraightTrim::default();
         let mut turn_dir = None;
         let mut judge = LineJudge::default();
+        let mut peak_yaw = 0.0_f64;
         let end_m = route.total_m() - 100.0;
-        for i in 0..3000 {
+        for i in 0..(600.0 / dt) as usize {
             let t = i as f64 * dt;
             let gs = v * MS_TO_KTS;
             let (lat, lon) = ll(x, y);
@@ -5689,6 +5867,7 @@ mod tests {
             let raw = taxi_guide::angle_diff(psi, prev_psi) / dt;
             prev_psi = psi;
             yaw = yaw * 0.5 + raw.clamp(-90.0, 90.0) * 0.5;
+            peak_yaw = peak_yaw.max(yaw.abs());
             let tr = trim.step(offset, route_turn, gs, false, remaining, dt);
             let want = stop_straighten(
                 (steer_cmd_with(damped_err_deg(err, yaw, route_turn, pace.steer_lead_s), pace.steer_full_deg) + tr)
@@ -5699,27 +5878,244 @@ mod tests {
             );
             let steer = slew_steer(prev_steer, want, pace.steer_slew_per_s, dt);
             prev_steer = steer;
-            bs = smooth_toward(bs, steer, BRAKE_STEER_TAU_S, dt);
-            let pivot = pivot_due(err, gs, false);
-            let (wl, wr) = if pivot { pivot_brake_split(steer, gs) } else { brake_steer_split_band(bs, gs, true) };
-            let k = pivot_rate_scale(if pivot { steer } else { bs }, yaw);
-            let bl = slew_steer(bs_prev.0, wl * k, Some(BRAKE_STEER_SLEW_PER_S), dt);
-            let br = slew_steer(bs_prev.1, wr * k, Some(BRAKE_STEER_SLEW_PER_S), dt);
-            bs_prev = (bl, br);
+            let (bl, br) = (run.brakes)(steer, err, gs, yaw, dt);
             // What the blackbox would log, judged as the scorer judges it.
             let asked = (route_turn.abs() >= CORNER_TURN_DPS).then(|| route_turn.signum());
             let cutting = judge.corner(t, gs, offset, Some(remaining), asked, yaw);
-            judge.judge(offset, cutting);
-            // The governor holds the schedule at the SR22's measured pace.
+            if progress >= run.judge_from_m {
+                judge.judge(offset, cutting);
+            }
             let sched = schedule_kts(pace.straight, &route, progress, gs).min(pace.track_cap_kts(offset.abs(), err));
-            v = (v + (sched / MS_TO_KTS - v).clamp(-0.7 * dt, 0.5 * dt)).max(0.0);
+            if let Some((over_kts, pull)) = run.imac {
+                let over = gs - sched - over_kts;
+                let gov = if over > 0.5 {
+                    -0.9
+                } else if over < 0.0 {
+                    pull
+                } else {
+                    0.0
+                };
+                v = (v + (gov - 4.0 * (bl + br)) * dt).max(0.0);
+            } else {
+                // The governor holds the schedule at the SR22's measured pace.
+                v = (v + (sched / MS_TO_KTS - v).clamp(-0.7 * dt, 0.5 * dt)).max(0.0);
+            }
             let r = plant.step(t, br - bl, v, dt);
             psi = (psi + r * dt).rem_euclid(360.0);
             x += v * psi.to_radians().sin() * dt;
             y += v * psi.to_radians().cos() * dt;
         }
         judge.flush();
-        (judge.max_cut, judge.max_lat)
+        ((judge.max_cut, judge.max_lat), peak_yaw)
+    }
+
+    /// The three recorded corners, each from about 6 s before its pivot
+    /// (sortie ticks 3370 on of 1790690995, 1935 on of 1790718797, 3250 on
+    /// of 1790725168; iMac, 2026-09-29/30): (s, gs kt, err, steer, yaw_dps,
+    /// bl, br) as the drive logged them.
+    #[rustfmt::skip]
+    const IMAC_CORNERS: [&[(f64, f64, f64, f64, f64, f64, f64)]; 3] = [&[
+        (0.0, 3.84, 2.4, -0.348, 14.92, 0.049, 0.0), (0.3, 4.12, -0.86, -0.363, 13.44, 0.09, 0.0), (0.6, 4.3, -3.8, -0.359, 11.25, 0.112, 0.0), (0.9, 4.39, -5.4, -0.287, 8.08, 0.11, 0.0),
+        (1.2, 4.48, -5.59, -0.146, 4.1, 0.082, 0.0), (1.5, 4.63, -4.83, -0.115, 0.39, 0.061, 0.0), (1.8, 4.85, -3.47, 0.033, -2.43, 0.022, 0.0), (2.0, 5.19, -1.74, 0.141, -4.25, 0.0, 0.0),
+        (2.3, 5.6, 0.4, 0.009, -5.28, 0.0, 0.0), (2.6, 6.03, 2.29, 0.054, -5.53, 0.0, 0.0), (2.9, 6.54, 4.62, 0.11, -5.71, 0.0, 0.005), (3.1, 7.01, 4.12, 0.098, -5.64, 0.0, 0.012),
+        (3.4, 7.45, 0.22, 0.005, -5.21, 0.0, 0.0), (3.7, 7.84, -3.95, -0.094, -4.62, 0.0, 0.0), (3.9, 8.22, -8.99, -0.214, -4.28, 0.018, 0.0), (4.3, 8.47, -13.62, -0.324, -3.53, 0.064, 0.0),
+        (4.5, 8.77, -23.45, -0.533, -5.22, 0.125, 0.0), (4.8, 8.72, -33.43, -0.762, -6.92, 0.208, 0.0), (5.1, 7.4, -42.3, -0.988, -8.73, 0.25, 0.0), (5.4, 5.95, -48.48, -1.0, -9.46, 0.25, 0.0),
+        (5.7, 4.95, -63.06, -1.0, -10.92, 0.366, 0.0), (6.0, 3.78, -60.02, -0.764, -15.89, 0.41, 0.0), (6.3, 2.79, -52.47, -0.524, -22.97, 0.29, 0.0), (6.6, 2.09, -42.1, -0.279, -30.09, 0.167, 0.0),
+        (6.8, 1.99, -31.25, -0.053, -35.25, 0.054, 0.0), (7.1, 2.03, -20.6, 0.171, -37.33, 0.0, 0.0), (7.4, 2.15, -9.74, 0.404, -37.72, 0.0, 0.006), (7.7, 2.25, 0.58, 0.639, -36.46, 0.0, 0.038),
+        (8.0, 2.24, 10.64, 0.835, -34.84, 0.0, 0.067), (8.3, 2.11, 19.92, 0.808, -31.92, 0.0, 0.061), (8.6, 2.0, 26.88, 0.784, -28.82, 0.0, 0.05), (8.9, 1.92, 33.93, 0.765, -25.85, 0.0, 0.042),
+        (9.2, 1.87, 40.31, 0.755, -23.09, 0.0, 0.037), (9.4, 1.85, 46.01, 0.752, -20.47, 0.0, 0.035), (9.7, 1.86, 51.2, 0.752, -18.03, 0.0, 0.036), (10.0, 1.87, 55.21, 0.754, -15.78, 0.0, 0.037),
+        (10.2, 1.88, 58.18, 0.757, -12.46, 0.0, 0.038), (10.5, 1.91, 62.74, 0.763, -12.15, 0.0, 0.16), (10.8, 1.58, 65.19, 0.693, -9.44, 0.0, 0.262), (11.1, 0.61, 64.97, 0.482, -3.67, 0.0, 0.145),
+        (11.5, 0.42, 62.92, 0.44, 1.39, 0.0, 0.008), (11.7, 0.61, 59.94, 0.481, 6.03, 0.0, 0.0),
+    ], &[
+        (0.0, 7.88, 2.75, 0.082, -0.23, 0.0, 0.009), (0.2, 7.87, 2.66, 0.077, -0.17, 0.0, 0.01), (0.6, 7.85, 2.49, 0.067, -0.06, 0.0, 0.009), (0.8, 7.83, 2.31, 0.06, 0.08, 0.0, 0.007),
+        (1.2, 7.81, 2.02, 0.052, 0.21, 0.0, 0.004), (1.4, 7.8, 2.42, 0.062, 0.39, 0.0, 0.005), (1.7, 7.79, 4.46, 0.11, 0.41, 0.0, 0.014), (1.9, 7.76, 5.97, 0.131, 0.45, 0.0, 0.023),
+        (2.3, 7.66, 8.25, 0.165, 0.72, 0.0, 0.037), (2.5, 7.57, 9.44, 0.169, 1.24, 0.0, 0.043), (2.8, 7.44, 7.75, 0.098, 1.87, 0.0, 0.035), (3.0, 7.32, 1.91, -0.077, 2.63, 0.0, 0.0),
+        (3.3, 7.3, -4.8, -0.256, 3.02, 0.01, 0.0), (3.5, 7.28, -12.59, -0.436, 2.9, 0.076, 0.0), (3.8, 7.06, -21.19, -0.602, 2.08, 0.145, 0.0), (4.1, 6.59, -29.98, -0.712, -0.03, 0.209, 0.0),
+        (4.4, 5.74, -38.78, -0.922, -3.99, 0.25, 0.0), (4.7, 4.89, -42.82, -0.999, -9.29, 0.25, 0.0), (5.0, 4.0, -43.01, -0.999, -15.5, 0.237, 0.0), (5.2, 3.23, -39.98, -0.787, -21.4, 0.132, 0.0),
+        (5.5, 2.26, -33.75, -0.579, -27.59, 0.027, 0.0), (5.8, 2.19, -25.34, -0.369, -32.42, 0.0, 0.0), (6.0, 2.25, -16.4, -0.148, -34.08, 0.0, 0.0), (6.3, 2.33, -6.95, 0.082, -34.2, 0.0, 0.0),
+        (6.6, 2.41, 2.93, 0.315, -33.67, 0.0, 0.0), (6.9, 2.49, -5.63, 0.549, -32.24, 0.0, 0.034), (7.2, 2.48, 2.08, 0.761, -30.94, 0.0, 0.071), (7.4, 2.35, 8.96, 0.859, -28.41, 0.0, 0.085),
+        (7.7, 2.16, 14.97, 0.818, -25.29, 0.0, 0.066), (8.0, 2.02, 20.2, 0.788, -21.9, 0.0, 0.052), (8.3, 1.94, 24.8, 0.771, -18.74, 0.0, 0.044), (8.6, 1.91, 29.02, 0.764, -15.85, 0.0, 0.041),
+        (8.8, 1.91, 32.52, 0.764, -13.31, 0.0, 0.041), (9.1, 1.93, 35.5, 0.768, -11.07, 0.0, 0.043), (9.4, 1.96, 37.77, 0.774, -8.97, 0.0, 0.046), (9.7, 1.99, 39.56, 0.782, -6.98, 0.0, 0.049),
+        (9.9, 2.04, 40.89, 0.792, -5.08, 0.0, 0.054), (10.2, 2.09, 41.74, 0.802, -3.19, 0.0, 0.059), (10.5, 2.14, 42.04, 0.814, -1.25, 0.0, 0.064), (10.8, 2.19, 41.76, 0.791, 0.74, 0.0, 0.069),
+    ], &[
+        (0.0, 3.86, 3.17, -0.304, 13.77, 0.039, 0.0), (0.3, 4.19, 0.35, -0.33, 12.67, 0.075, 0.0), (0.7, 4.48, -2.5, -0.325, 10.35, 0.098, 0.0), (0.9, 4.61, -3.55, -0.24, 7.33, 0.094, 0.0),
+        (1.2, 4.78, -3.75, -0.132, 3.84, 0.068, 0.0), (1.5, 4.98, -3.11, -0.074, 0.52, 0.047, 0.0), (1.8, 5.35, -1.46, -0.035, -2.07, 0.022, 0.0), (2.0, 5.7, 0.31, 0.008, -3.97, 0.004, 0.0),
+        (2.4, 6.28, 2.84, 0.068, -4.87, 0.0, 0.0), (2.7, 6.69, 4.71, 0.112, -5.33, 0.0, 0.0), (3.0, 7.26, 2.05, 0.049, -5.27, 0.0, 0.0), (3.2, 7.64, -1.31, -0.031, -5.06, 0.0, 0.0),
+        (3.6, 8.16, -7.26, -0.173, -4.83, 0.008, 0.0), (3.8, 8.49, -12.51, -0.298, -4.68, 0.047, 0.0), (4.2, 7.61, -21.08, -0.502, -4.79, 0.121, 0.0), (4.4, 6.78, -26.53, -0.632, -4.4, 0.177, 0.0),
+        (4.8, 5.17, -35.8, -0.852, -5.17, 0.25, 0.0), (5.0, 4.57, -39.4, -0.938, -7.3, 0.25, 0.0), (5.4, 3.64, -40.17, -0.956, -12.19, 0.214, 0.0), (5.6, 3.06, -37.85, -0.763, -18.01, 0.117, 0.0),
+        (5.9, 2.0, -30.31, -0.495, -24.5, 0.002, 0.0), (6.2, 2.04, -22.99, -0.295, -29.08, 0.0, 0.0), (6.5, 2.17, -30.46, -0.042, -30.15, 0.0, 0.0), (6.7, 2.26, -23.22, 0.157, -30.79, 0.0, 0.0),
+        (7.1, 2.37, -14.86, 0.406, -29.7, 0.0, 0.009), (7.3, 2.43, -8.3, 0.604, -28.8, 0.0, 0.041), (7.7, 2.38, 0.3, 0.866, -27.13, 0.0, 0.082), (7.9, 2.23, 5.79, 0.833, -24.54, 0.0, 0.073),
+        (8.2, 2.05, 11.4, 0.793, -21.0, 0.0, 0.055), (8.5, 1.95, 15.31, 0.773, -17.86, 0.0, 0.045), (8.8, 1.88, 19.08, 0.758, -15.08, 0.0, 0.038), (9.0, 1.87, 21.29, 0.755, -12.54, 0.0, 0.037),
+        (9.3, 1.87, 24.07, 0.755, -10.61, 0.0, 0.037), (9.6, 1.89, 26.37, 0.759, -8.74, 0.0, 0.039), (9.9, 1.91, 28.13, 0.764, -6.93, 0.0, 0.041), (10.2, 1.94, 29.41, 0.729, -5.14, 0.0, 0.044),
+        (10.5, 1.99, 30.24, 0.689, -3.41, 0.0, 0.049), (10.7, 2.01, 30.51, 0.64, -1.83, 0.0, 0.051), (11.0, 2.05, 30.52, 0.592, -0.39, 0.0, 0.055), (11.3, 2.1, 30.03, 0.534, 1.09, 0.0, 0.06),
+    ]];
+
+    /// The logged steer, error, speed and yaw of the three corners through
+    /// the law as it stood gives back the logged brakes (so the replay is
+    /// the law that flew them); through [`BrakeSteer`] on a free nose the
+    /// inside brake is off the moment the rate ceiling wants it off (0.29
+    /// and 0.17 were still on at 23 and 30 deg/s in the first), and once the
+    /// steer reverses against the 27 to 38 deg/s swing the opposite wheel
+    /// gets 0.145 to 0.2 where the walking-pace fade gave it 0.07 to 0.085.
+    #[test]
+    fn the_recorded_swings_are_caught_by_the_opposite_brake() {
+        for (k, ticks) in IMAC_CORNERS.iter().enumerate() {
+            let mut old = old_free_nose_brakes();
+            let mut new = free_nose_brakes();
+            let (mut flown_catch, mut new_catch, mut late_inside) = (0.0_f64, 0.0_f64, 0.0_f64);
+            for (i, &(t, gs, err, steer, yaw, bl, br)) in ticks.iter().enumerate() {
+                let dt = if i == 0 { 0.2 } else { t - ticks[i - 1].0 };
+                let (ol, or) = old(steer, err, gs, yaw, dt);
+                let (nl, nr) = new(steer, err, gs, yaw, dt);
+                if i >= 6 {
+                    assert!((ol - bl).abs() < 0.05 && (or - br).abs() < 0.05, "corner {k} t {t}: the old law {ol:.3} {or:.3} vs flown {bl} {br}");
+                }
+                // The inside brake with the swing past the ceiling's end.
+                let inside = if yaw < 0.0 { (bl, nl) } else { (br, nr) };
+                if steer * yaw > 0.0 && yaw.abs() >= PIVOT_RATE_DPS + PIVOT_RATE_SPAN_DPS {
+                    late_inside = late_inside.max(inside.0);
+                    assert_eq!(inside.1, 0.0, "corner {k} t {t}: the ceiling's brake is off at once");
+                }
+                // The opposite brake with the steer reversed against the swing.
+                if steer * yaw < 0.0 && yaw.abs() >= 25.0 && gs >= 1.9 {
+                    let (flown, ours) = if yaw < 0.0 { (br, nr) } else { (bl, nl) };
+                    flown_catch = flown_catch.max(flown);
+                    new_catch = new_catch.max(ours);
+                }
+            }
+            assert!(flown_catch <= 0.09, "corner {k}: as flown the fade starved it: {flown_catch:.3}");
+            assert!(new_catch >= 0.14 && new_catch >= 1.6 * flown_catch, "corner {k}: caught: {new_catch:.3} vs {flown_catch:.3}");
+            if k == 0 {
+                assert!(late_inside > 0.15, "the first corner held its inside brake into the swing: {late_inside}");
+            }
+        }
+    }
+
+    /// The refitted plant ([`Sr22Plant::refit`]) replays the three corners'
+    /// logged brakes as their logged yaw, and better than the first fit on
+    /// every one: the corner test below flies the aircraft that flew them.
+    #[test]
+    fn the_refit_plant_replays_the_imac_corners() {
+        let replay = |ticks: &[(f64, f64, f64, f64, f64, f64, f64)], mut p: Sr22Plant| -> (f64, f64) {
+            let mut ema = ticks[0].4;
+            let (mut se, mut peak) = (0.0_f64, 0.0_f64);
+            for w in ticks.windows(2) {
+                let ((t, gs, _, _, _, bl, br), (t1, _, _, _, logged, _, _)) = (w[0], w[1]);
+                let r = p.step(t, br - bl, gs * 0.514_444, t1 - t);
+                ema = 0.5 * ema + 0.5 * r;
+                se += (ema - logged).powi(2);
+                peak = peak.max(ema.abs());
+            }
+            ((se / (ticks.len() - 1) as f64).sqrt(), peak)
+        };
+        for (k, ticks) in IMAC_CORNERS.iter().enumerate() {
+            let (rms, peak) = replay(ticks, Sr22Plant::refit(ticks[0].4));
+            let (first, _) = replay(ticks, Sr22Plant::new(ticks[0].4));
+            let logged_peak = ticks.iter().map(|x| x.4.abs()).fold(0.0, f64::max);
+            eprintln!("corner {k}: refit {rms:.2} deg/s rms, peak {peak:.1} vs {logged_peak:.1}; first fit {first:.2}");
+            assert!(rms < 5.5 && rms < 0.75 * first, "corner {k}: {rms:.2} vs the first fit's {first:.2}");
+            assert!(peak > 0.7 * logged_peak, "corner {k}: the swing, {peak:.1} vs {logged_peak:.1}");
+        }
+    }
+
+    /// LEMG, the SR22 from the GA stand to 12 (iMac, 0.3 s ticks; sorties
+    /// 1790690995, 1790718797 and 1790725168, 2026-09-29/30): 5.0, 4.7 and
+    /// 5.3 m off, each at a left corner of about 100 degrees (onto Delta at
+    /// 690 m to go, and at 2,490 m) entered at 7 to 8.7 kt against a 6 kt
+    /// target, the nose swung 40 to 65 degrees past the new taxiway. Flown
+    /// on the refitted plant over the iMac's ticks (0.3 to 0.42 s), the
+    /// corner (90 to 110 degrees, with the jog both had before it) and the
+    /// governor as it ran (1 to 2.7 kt over its target, creeping out of a
+    /// swing at 0.1 to 0.2 m/s^2): as flown a sixth of them fail, up to 5 m
+    /// off, and with the corner capped at 20 deg/s times its radius
+    /// (`taxi.max_yaw_dps`) and the swing caught ([`BrakeSteer`]) every one
+    /// is inside the 3 m line. Neither alone was: the cap alone left 1 of
+    /// the 90 over, a catch alone 6 (swept while tuning, 2026-09-30).
+    #[test]
+    fn a_free_nose_flies_the_lemg_corners_on_the_line() {
+        use crate::scorecard::{TAXI_MAX_CUT_M, TAXI_MAX_LAT_M};
+        let (mut worst_old, mut worst_new, mut n, mut fail_old) = ((0.0_f64, String::new()), (0.0_f64, String::new()), 0, 0);
+        for deg in [90.0_f64, 95.0, 100.0, 105.0, 110.0] {
+            // North, a 10 degree jog right 30 m before the vertex (both
+            // corners had one: `turn_dps` +5 and +7.9 as they came up), then
+            // left onto `deg` west of north.
+            let (jog, th) = (10.0_f64.to_radians(), (-deg).to_radians());
+            let v = (30.0 * jog.sin(), 30.0 * jog.cos());
+            let path = [(0.0, -300.0), (0.0, 0.0), v, (v.0 + 250.0 * th.sin(), v.1 + 250.0 * th.cos())];
+            for dt in [0.3, 0.36, 0.42] {
+                for over in [1.0, 2.0, 2.7] {
+                    for pull in [0.1, 0.2] {
+                        let fly = |brakes: &mut dyn FnMut(f64, f64, f64, f64, f64) -> (f64, f64), yaw_cap: bool| {
+                            let run = CornerRun {
+                                dt,
+                                v0_kts: 6.0 + over,
+                                imac: Some((over, pull)),
+                                brakes,
+                                judge_from_m: 280.0,
+                                yaw_cap,
+                            };
+                            let ((cut, lat), _) = fly_sr22_corner_with(&path, (0.0, -150.0), true, run);
+                            // The scorer's verdict on one scale: off the
+                            // line, or a vertex cut over its own limit.
+                            lat.max(cut - (TAXI_MAX_CUT_M - TAXI_MAX_LAT_M))
+                        };
+                        let old = fly(&mut old_free_nose_brakes(), false);
+                        let new = fly(&mut free_nose_brakes(), true);
+                        let why = format!("{deg} deg, {dt} s ticks, {over} kt over, pull {pull}");
+                        n += 1;
+                        fail_old += usize::from(old > TAXI_MAX_LAT_M);
+                        if old > worst_old.0 {
+                            worst_old = (old, why.clone());
+                        }
+                        if new > worst_new.0 {
+                            worst_new = (new, why);
+                        }
+                    }
+                }
+            }
+        }
+        eprintln!("as flown: worst {worst_old:?}, {fail_old}/{n} over; now: worst {worst_new:?}");
+        assert!(worst_old.0 > 4.5 && fail_old * 6 >= n, "the plant must fail the old corner as flown: {worst_old:?}, {fail_old}/{n}");
+        assert!(worst_new.0 <= TAXI_MAX_LAT_M, "{worst_new:?}");
+    }
+
+    /// The corner cap is the SR22's (`taxi.max_yaw_dps`) and only a corner's:
+    /// a 100 degree vertex is capped near walking pace, the straight and a
+    /// gentle bend keep the GA pace.
+    #[test]
+    fn the_sr22_takes_a_sharp_corner_slowly_and_nothing_else() {
+        let pace = Pace::from_profile(crate::aircraft::load("cirrus_sr22").expect("sr22").taxi.as_ref());
+        assert_eq!(pace.max_yaw_dps, Some(20.0));
+        assert_eq!((pace.straight, pace.turn, pace.sharp), (STRAIGHT_KTS, TURN_KTS, SHARP_KTS));
+        let th = (-100.0_f64).to_radians();
+        let path = [(0.0, -300.0), (0.0, 0.0), (250.0 * th.sin(), 250.0 * th.cos())];
+        let watch = |p: &[(f64, f64)]| TaxiWatch {
+            path: p.iter().map(|&(x, y)| ll(x, y)).collect(),
+            via: String::new(),
+            seg: vec![(String::new(), false); p.len() - 1],
+            holding_point: String::new(),
+            lead_on: Vec::new(),
+        };
+        let mut route = Route::build(&watch(&path)).expect("route");
+        let uncapped = route.bend_cap_kts(295.0, 4.0).expect("the corner");
+        route.pace = pace;
+        let capped = route.bend_cap_kts(295.0, 4.0).expect("the corner");
+        assert!((TURN_KTS - 0.01..=TURN_KTS + 0.01).contains(&uncapped), "as flown: {uncapped:.2}");
+        assert!((CORNER_MIN_KTS..4.0).contains(&capped), "{capped:.2}");
+        // Far down the straight, nothing.
+        assert!(route.bend_cap_kts(20.0, 10.0).is_none());
+        // A 60 degree bend drawn round a 60 m radius keeps the turn pace.
+        let arc: Vec<(f64, f64)> = (0..=12)
+            .map(|i| {
+                let a = (i as f64 * 5.0).to_radians();
+                (-(60.0 - 60.0 * a.cos()), 60.0 * a.sin())
+            })
+            .collect();
+        let mut gentle = vec![(0.0, -300.0)];
+        gentle.extend(arc);
+        let mut r2 = Route::build(&watch(&gentle)).expect("route");
+        r2.pace = pace;
+        assert!(r2.bend_cap_kts(300.0, 6.0).is_none_or(|c| c >= TURN_KTS - 0.01), "{:?}", r2.bend_cap_kts(300.0, 6.0));
     }
 
     /// LEMG, the SR22 from the ramp (sorties 1790605551 and 1790618416,
