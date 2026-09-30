@@ -732,12 +732,12 @@ pub fn climb_conflict(field_ft: f64, ground: &[(f64, f64)], fast: bool) -> Optio
         .min_by(|x, y| (x.2 - x.1).total_cmp(&(y.2 - y.1)))
 }
 
-/// Where a helicopter lands at a field with no helipad: on the hard runway
-/// end nearest the arrival, [`RUNWAY_SPOT_M`] in from the threshold (never
-/// the reference point, which at LILB is 120 m off the strip in whatever is
-/// there). (lat, lon, name).
-pub fn runway_spot(apt: &crate::nav::AirportInfo, inbound: (f64, f64)) -> Option<(f64, f64, String)> {
-    let mut best: Option<(f64, (f64, f64, String))> = None;
+/// Every hard runway end's landing spot, [`RUNWAY_SPOT_M`] in from its
+/// threshold: (ident, threshold, spot). The spot a tower's runway names
+/// ([`spot_for_runway`]) and the one nearest the arrival ([`runway_spot`])
+/// come from the same list.
+fn runway_ends(apt: &crate::nav::AirportInfo) -> Vec<(String, (f64, f64), (f64, f64))> {
+    let mut out = Vec::new();
     for r in apt.runways.iter().filter(|r| r.is_hard()) {
         let len_nm = crate::nav::haversine_nm(r.lat_a, r.lon_a, r.lat_b, r.lon_b);
         let into = (RUNWAY_SPOT_M / 1852.0).min(len_nm / 2.0);
@@ -745,15 +745,179 @@ pub fn runway_spot(apt: &crate::nav::AirportInfo, inbound: (f64, f64)) -> Option
             ((r.lat_a, r.lon_a), (r.lat_b, r.lon_b), &r.ident_a),
             ((r.lat_b, r.lon_b), (r.lat_a, r.lon_a), &r.ident_b),
         ] {
-            let d = crate::nav::haversine_nm(inbound.0, inbound.1, thr.0, thr.1);
-            if best.as_ref().is_none_or(|b| d < b.0) {
-                let brg = crate::nav::bearing_deg(thr.0, thr.1, far.0, far.1);
-                let (la, lo) = crate::nav::project_latlon(thr.0, thr.1, brg, into);
-                best = Some((d, (la, lo, format!("runway {id}"))));
-            }
+            let brg = crate::nav::bearing_deg(thr.0, thr.1, far.0, far.1);
+            let spot = crate::nav::project_latlon(thr.0, thr.1, brg, into);
+            out.push((id.trim().to_string(), thr, spot));
         }
     }
-    best.map(|b| b.1)
+    out
+}
+
+/// Where a helicopter lands at a field with no helipad: on the hard runway
+/// end nearest the arrival, [`RUNWAY_SPOT_M`] in from the threshold (never
+/// the reference point, which at LILB is 120 m off the strip in whatever is
+/// there). (lat, lon, name). A tower that names its runway moves it
+/// ([`spot_for_runway`]).
+pub fn runway_spot(apt: &crate::nav::AirportInfo, inbound: (f64, f64)) -> Option<(f64, f64, String)> {
+    runway_ends(apt)
+        .into_iter()
+        .map(|(id, thr, spot)| (crate::nav::haversine_nm(inbound.0, inbound.1, thr.0, thr.1), id, spot))
+        .min_by(|a, b| a.0.total_cmp(&b.0))
+        .map(|(_, id, (la, lo))| (la, lo, format!("runway {id}")))
+}
+
+/// Every runway end's spot as (ident, lat, lon), for the route to move its
+/// landing onto the runway the tower gives ([`spot_for_runway`]).
+pub fn runway_spots(apt: &crate::nav::AirportInfo) -> Vec<(String, f64, f64)> {
+    runway_ends(apt)
+        .into_iter()
+        .map(|(id, _, (la, lo))| (id, la, lo))
+        .collect()
+}
+
+/// The spot of the runway END the tower named ("09"), when it is not the
+/// one the route already lands on (`current`). Idents compare trimmed and
+/// case-blind. `None`: no runway named, the same end, or an end the field
+/// does not have. Pure.
+///
+/// LXGB (iMac 2026-09-30, sortie 1790722408-heli_route): the inbound call
+/// earned "join final runway zero niner ... Report final", the route flew
+/// on to its spot on 27 (the end nearest the arrival) and set down there,
+/// and the tower called "you are on runway two seven without clearance".
+pub fn spot_for_runway(
+    spots: &[(String, f64, f64)],
+    current: Option<&str>,
+    named: Option<&str>,
+) -> Option<(String, f64, f64)> {
+    let named = named.map(str::trim).filter(|n| !n.is_empty())?;
+    if current.is_some_and(|c| c.trim().eq_ignore_ascii_case(named)) {
+        return None;
+    }
+    spots
+        .iter()
+        .find(|(id, ..)| id.eq_ignore_ascii_case(named))
+        .cloned()
+}
+
+/// The runway end a spot's name lands on ("LXGB runway 27" is "27").
+pub fn spot_runway(name: &str) -> Option<String> {
+    name.rsplit_once("runway ")
+        .map(|(_, id)| id.trim().to_string())
+        .filter(|id| !id.is_empty())
+}
+
+/// How far short of the pad the final holds in the hover while a towered
+/// field has not cleared the landing. The runway spot is 150 m in from its
+/// threshold, so this is 250 m short of the pavement flown along the
+/// runway, and further across it.
+pub const HOLD_SHORT_M: f64 = 400.0;
+/// Held: inside this much of the hold point and slower than
+/// [`HELD_GS_MPS`] over the ground.
+pub const HOLD_SLACK_M: f64 = 60.0;
+pub const HELD_GS_MPS: f64 = 3.0;
+/// Held without a clearance, the landing clearance is asked for again this
+/// often, at most [`CLEARANCE_ASKS_MAX`] times.
+pub const CLEARANCE_ASK_EVERY_S: f64 = 30.0;
+pub const CLEARANCE_ASKS_MAX: u32 = 3;
+/// Held this long without a clearance, the hover is handed to the pilot
+/// where it is (the hover loop keeps holding it).
+pub const CLEARANCE_HOLD_MAX_S: f64 = 120.0;
+
+/// The final's command while the landing is not cleared: the speed of a
+/// final that stops [`HOLD_SHORT_M`] short of the pad, at the height the
+/// final's path has where we are, led for that speed (stopped, the path
+/// itself: 168 ft at the hold point). Inside the hold point it is a hover
+/// where we are. Pure.
+pub fn hold_command(d_m: f64, from_ft: f64, from_mps: f64) -> (f64, f64) {
+    let (speed, _) = final_command((d_m - HOLD_SHORT_M).max(0.0), from_ft, from_mps);
+    let (_, height) = final_command(d_m, from_ft, speed);
+    (speed, height)
+}
+
+/// What the route owes the destination's tower on its final.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClearanceStep {
+    /// The final report ("final runway zero niner"), once.
+    ReportFinal,
+    /// Held short without a clearance: "final ..., request landing
+    /// clearance" again.
+    Ask,
+    /// Held too long without one: the hover is the pilot's.
+    GiveUp,
+}
+
+/// The helicopter's landing clearance at a towered field: the aeroplanes'
+/// rule (`autoland::UnclearedWatch`), a crew never lands uncleared, flown
+/// the helicopter's way: the final reports, and a final not cleared holds
+/// in the hover short of the pad and asks again, bounded. `needs`: the
+/// destination has a tower and we called it; `tower_ready`: our inbound
+/// call went out and the station is that tower; `cleared`: its book says
+/// cleared to land; `held`: stopped at the hold point. Pure (time passed in).
+#[derive(Debug, Default)]
+pub struct ClearanceWatch {
+    reported: bool,
+    asks: u32,
+    last_call_s: Option<f64>,
+    held_since_s: Option<f64>,
+    gave_up: bool,
+}
+
+impl ClearanceWatch {
+    pub fn step(
+        &mut self,
+        now_s: f64,
+        needs: bool,
+        tower_ready: bool,
+        cleared: bool,
+        held: bool,
+    ) -> Option<ClearanceStep> {
+        if !needs || cleared || self.gave_up {
+            return None;
+        }
+        if tower_ready && !self.reported {
+            self.reported = true;
+            self.last_call_s = Some(now_s);
+            return Some(ClearanceStep::ReportFinal);
+        }
+        if !held {
+            return None;
+        }
+        let since = *self.held_since_s.get_or_insert(now_s);
+        if tower_ready
+            && self.asks < CLEARANCE_ASKS_MAX
+            && self.last_call_s.is_none_or(|c| now_s - c >= CLEARANCE_ASK_EVERY_S)
+        {
+            self.asks += 1;
+            self.last_call_s = Some(now_s);
+            return Some(ClearanceStep::Ask);
+        }
+        if now_s - since >= CLEARANCE_HOLD_MAX_S {
+            self.gave_up = true;
+            return Some(ClearanceStep::GiveUp);
+        }
+        None
+    }
+
+    pub fn held_since_s(&self) -> Option<f64> {
+        self.held_since_s
+    }
+
+    pub fn asks(&self) -> u32 {
+        self.asks
+    }
+}
+
+/// The final report's words: the runway the spot lands on, else plain.
+pub fn final_words(rwy: Option<&str>, asking: bool) -> String {
+    let base = match rwy {
+        Some(r) => format!("final runway {}", crate::circuit::spell_runway(r)),
+        None => "final".to_string(),
+    };
+    if asking {
+        format!("{base}, request landing clearance")
+    } else {
+        base
+    }
 }
 const RUNWAY_SPOT_M: f64 = 150.0;
 
@@ -1026,7 +1190,16 @@ pub struct Route {
     /// pilot's "not here, land at the airport" at LIME had nothing to call
     /// (2026-09-25).
     pub arrive_only: bool,
+    /// The destination's runway spots (ident, lat, lon, [`runway_spots`]),
+    /// when the flight lands on a runway: the tower's runway moves the
+    /// landing onto its own end ([`spot_for_runway`]). Empty on a helipad.
+    pub runway_spots: Vec<(String, f64, f64)>,
 }
+
+/// Our inbound call to the destination's tower has gone out (set by
+/// [`call_inbound`] once transmitted, cleared at each route's start): the
+/// final report waits for it, so the tower hears "inbound" before "final".
+static INBOUND_SENT: AtomicBool = AtomicBool::new(false);
 
 /// An arrival-only route starts this close to the pad, or not at all.
 pub const ARRIVE_ONLY_MAX_M: f64 = 5_000.0;
@@ -1270,6 +1443,7 @@ fn call_inbound(base_url: &str, khz: i64) {
         }
         let callsign = crate::circuit::crew_callsign(&xp).await;
         crate::circuit::transmit(crate::circuit::radio_call(&callsign, "inbound for landing"));
+        INBOUND_SENT.store(true, Ordering::SeqCst);
         crate::blackbox::record(
             "heli_route",
             serde_json::json!({ "event": "inbound_call", "khz": khz, "station_swapped": swapped }),
@@ -1574,7 +1748,7 @@ async fn fly(
     voice: Option<Voice>,
     base_url: String,
     collective: String,
-    route: Route,
+    mut route: Route,
 ) -> bool {
     let _detail = crate::auto_status::DetailGuard::hold(&DETAIL);
     let _sortie = crate::full_auto::SortieGuard::begin(
@@ -1591,12 +1765,12 @@ async fn fly(
     };
     let origin = (s0.lat, s0.lon);
     let geo = Geo::new(s0.lat);
-    let pts: Vec<(String, (f64, f64))> = route
+    let mut pts: Vec<(String, (f64, f64))> = route
         .points
         .iter()
         .map(|(id, la, lo)| (id.clone(), geo.to_m(origin, (*la, *lo))))
         .collect();
-    let Some(pad) = pts.last().map(|p| p.1) else {
+    let Some(mut pad) = pts.last().map(|p| p.1) else {
         return false;
     };
     // The departure ground's height sets the cruise level, in the
@@ -1687,9 +1861,28 @@ async fn fly(
     let mut inbound_made = false;
     // Answers given each station's zone challenge, by frequency.
     let mut answered: std::collections::HashMap<i64, u32> = std::collections::HashMap::new();
+    // The landing at a towered field (#192): the runway the spot lands on
+    // (moved to the tower's), the final report and clearance watch, the
+    // landing readback made.
+    INBOUND_SENT.store(false, Ordering::SeqCst);
+    let mut pad_rwy: Option<String> = if route.on_pad {
+        None
+    } else {
+        route.points.last().and_then(|p| spot_runway(&p.0))
+    };
+    let mut clearance = ClearanceWatch::default();
+    let mut readback_sent: Option<String> = None;
+    let mut hold_said = false;
+    let t0 = std::time::Instant::now();
     let mut last = std::time::Instant::now();
     let mut tick_n = 0u64;
     if route.arrive_only {
+        // The tower is called first (it arms the station and tunes COM1),
+        // so the final report below has someone to clear it.
+        if let Some(khz) = route.dest_tower_khz {
+            inbound_made = true;
+            call_inbound(&base_url, khz);
+        }
         // Straight to the final, from where the aircraft is: the hover loop
         // takes (or keeps) it at its height and speed, aimed at the pad.
         let goal = Goal::Fly {
@@ -1722,6 +1915,50 @@ async fn fly(
         last = std::time::Instant::now();
         tick_n += 1;
         let here = geo.to_m(origin, (s.lat, s.lon));
+        // The destination's tower, once it is the station and working us
+        // (the inbound call answered, or the landing cleared), names the
+        // runway: a runway landing moves to that end's spot (#192).
+        let tower_is_dest = crate::mode::atc_enabled()
+            && route.dest_tower_khz.is_some()
+            && crate::party_line::home_tower_khz() == route.dest_tower_khz;
+        let book = crate::party_line::clearance_state();
+        if tower_is_dest
+            && !route.on_pad
+            && matches!(book, Some(crate::tower::State::Inbound | crate::tower::State::ClearedToLand))
+        {
+            let named = crate::party_line::clearance_runway();
+            if let Some((id, la, lo)) =
+                spot_for_runway(&route.runway_spots, pad_rwy.as_deref(), named.as_deref())
+            {
+                let from = pts.last().map(|p| p.0.clone());
+                let name = format!("{} runway {id}", route.destination);
+                let to_m = geo.to_m(origin, (la, lo));
+                if let Some(last) = pts.last_mut() {
+                    *last = (name.clone(), to_m);
+                }
+                if let Some(last) = route.points.last_mut() {
+                    *last = (name.clone(), la, lo);
+                }
+                pad = to_m;
+                crate::blackbox::record(
+                    "heli_route",
+                    serde_json::json!({
+                        "event": "pad_to_tower_runway", "from": from, "to": name, "rwy": id,
+                        "was_rwy": pad_rwy, "phase": format!("{phase:?}"),
+                        "to_pad_m": dist(here, pad), "book": format!("{book:?}"),
+                    }),
+                );
+                say(
+                    &voice,
+                    Priority::Readback,
+                    format!(
+                        "Tower wants runway {}. Landing on it.",
+                        crate::circuit::spell_runway(&id)
+                    ),
+                );
+                pad_rwy = Some(id);
+            }
+        }
         // Sequence: the fix is passed when inside the turn's lead, or when
         // it is behind us (a wide turn that never got close).
         while leg + 1 < pts.len() {
@@ -2348,7 +2585,102 @@ async fn fly(
                     _ => None,
                 };
                 let cap = final_cap_mps(from_mps, wind);
-                let (speed, height) = final_command(to_pad, from_ft, cap);
+                // The landing at a towered field is the aeroplanes' (#192):
+                // the final reported, the clearance read back, and never a
+                // landing without one; a final not cleared holds in the
+                // hover short of the pad and asks again, bounded (LXGB,
+                // iMac 2026-09-30, 1790722408-heli_route: "Report final"
+                // never answered, set down on 27 without a clearance).
+                let needs = crate::mode::atc_enabled() && route.dest_tower_khz.is_some() && inbound_made;
+                let tower_ready = tower_is_dest && INBOUND_SENT.load(Ordering::SeqCst);
+                let cleared = tower_ready && book == Some(crate::tower::State::ClearedToLand);
+                let landing_ok = !needs || cleared;
+                if needs && tower_ready {
+                    match crate::party_line::readback_owed() {
+                        None => readback_sent = None,
+                        Some(owed)
+                            if crate::autoland::landing_readback(&owed)
+                                && readback_sent.as_deref() != Some(owed.as_str()) =>
+                        {
+                            readback_sent = Some(owed.clone());
+                            let cs = crate::circuit::crew_callsign(&xp).await;
+                            let rwy = crate::party_line::clearance_runway();
+                            let words = match rwy.as_deref() {
+                                Some(r) if !route.on_pad => {
+                                    format!("cleared to land runway {}", crate::circuit::spell_runway(r))
+                                }
+                                _ => "cleared to land".to_string(),
+                            };
+                            crate::circuit::transmit_readback(crate::circuit::radio_call(&cs, &words), false);
+                            crate::blackbox::record(
+                                "heli_route",
+                                serde_json::json!({ "event": "landing_readback", "rwy": rwy, "to_pad_m": to_pad }),
+                            );
+                        }
+                        Some(_) => {}
+                    }
+                }
+                let held = !landing_ok && to_pad <= HOLD_SHORT_M + HOLD_SLACK_M && s.gs < HELD_GS_MPS;
+                match clearance.step(t0.elapsed().as_secs_f64(), needs, tower_ready, cleared, held) {
+                    Some(step @ (ClearanceStep::ReportFinal | ClearanceStep::Ask)) => {
+                        let asking = step == ClearanceStep::Ask;
+                        let cs = crate::circuit::crew_callsign(&xp).await;
+                        crate::circuit::transmit(crate::circuit::radio_call(
+                            &cs,
+                            &final_words(pad_rwy.as_deref(), asking),
+                        ));
+                        crate::blackbox::record(
+                            "heli_route",
+                            serde_json::json!({
+                                "event": if asking { "landing_clearance_asked" } else { "final_report" },
+                                "rwy": pad_rwy, "to_pad_m": to_pad, "agl": s.agl_ft, "gs": s.gs,
+                                "asks": clearance.asks(), "book": format!("{book:?}"),
+                            }),
+                        );
+                    }
+                    Some(ClearanceStep::GiveUp) => {
+                        hover::retarget(Goal::Hover {
+                            height_ft: s.agl_ft.max(FINAL_HOVER_FT),
+                        });
+                        crate::blackbox::record(
+                            "heli_route",
+                            serde_json::json!({
+                                "event": "uncleared_hold_given_up", "to_pad_m": to_pad, "agl": s.agl_ft,
+                                "asks": clearance.asks(), "tower_ready": tower_ready,
+                                "held_s": clearance.held_since_s().map(|h| t0.elapsed().as_secs_f64() - h),
+                                "book": format!("{book:?}"),
+                            }),
+                        );
+                        record_end(&voice, "uncleared", "arrive");
+                        say(
+                            &voice,
+                            Priority::Caution,
+                            "No landing clearance from the tower. Holding in the hover short of the pad, your controls.",
+                        );
+                        return false;
+                    }
+                    None => {}
+                }
+                if held && !hold_said {
+                    hold_said = true;
+                    crate::blackbox::record(
+                        "heli_route",
+                        serde_json::json!({
+                            "event": "hold_short", "to_pad_m": to_pad, "agl": s.agl_ft,
+                            "tower_ready": tower_ready, "book": format!("{book:?}"),
+                        }),
+                    );
+                    say(
+                        &voice,
+                        Priority::Readback,
+                        "No landing clearance yet. Holding short of the pad.",
+                    );
+                }
+                let (speed, height) = if landing_ok {
+                    final_command(to_pad, from_ft, cap)
+                } else {
+                    hold_command(to_pad, from_ft, cap)
+                };
                 if tick_n % 4 == 0 {
                     crate::blackbox::record(
                         "heli_route",
@@ -2356,11 +2688,11 @@ async fn fly(
                             "event": "final_tick", "to_pad_m": to_pad, "cmd_mps": speed,
                             "cap_mps": cap, "from_mps": from_mps, "height_ft": height,
                             "agl": s.agl_ft, "ias": s.ias, "gs": s.gs,
-                            "head_mps": wind.map(|w| w.0), "cross_mps": wind.map(|w| w.1),
+                            "head_mps": wind.map(|w| w.0), "cross_mps": wind.map(|w| w.1), "cleared": landing_ok,
                         }),
                     );
                 }
-                if to_pad < ARRIVED_M || speed < 1.0 {
+                if landing_ok && (to_pad < ARRIVED_M || speed < 1.0) {
                     hover::retarget(Goal::Land);
                     crate::blackbox::record(
                         "heli_route",
@@ -3300,5 +3632,168 @@ mod tests {
             "ETHC",
         );
         assert!(pads.len() >= 18, "{}", pads.len());
+    }
+
+    /// LXGB as apt.dat has it (one strip, 09/27).
+    fn lxgb() -> crate::nav::AirportInfo {
+        crate::nav::AirportInfo {
+            transition_level_ft: None,
+            allows_circuits: None,
+            pattern_sides: Vec::new(),
+            name: "Gibraltar".into(),
+            elev_ft: 15.0,
+            runways: vec![crate::nav::Runway {
+                ident_a: "09".into(),
+                ident_b: "27".into(),
+                lat_a: 36.1508156,
+                lon_a: -5.3596312,
+                lat_b: 36.1514944,
+                lon_b: -5.3400082,
+                width_m: 45.11,
+                surface: 1,
+            }],
+            freqs: Vec::new(),
+        }
+    }
+
+    /// LXGB (iMac 2026-09-30, 1790722408-heli_route): arriving from LEMG,
+    /// the nearest end is 27, and the inbound call earned "join final runway
+    /// zero niner". The tower's runway moves the landing to 09's spot, 150 m
+    /// in from ITS threshold; the same end, an unnamed runway or an end the
+    /// field lacks moves nothing.
+    #[test]
+    fn the_towers_runway_moves_the_landing_to_its_end() {
+        let apt = lxgb();
+        let inbound = (36.20, -5.28);
+        let (_, _, name) = runway_spot(&apt, inbound).expect("a spot");
+        assert_eq!(name, "runway 27");
+        let current = spot_runway(&format!("LXGB {name}"));
+        assert_eq!(current.as_deref(), Some("27"));
+        let spots = runway_spots(&apt);
+        assert_eq!(spots.len(), 2);
+        let (id, la, lo) = spot_for_runway(&spots, current.as_deref(), Some("09")).expect("09's spot");
+        assert_eq!(id, "09");
+        let from_09 = crate::nav::haversine_nm(36.1508156, -5.3596312, la, lo) * 1852.0;
+        assert!((from_09 - 150.0).abs() < 5.0, "{from_09}");
+        assert!(lo < -5.355, "on the west end: {lo}");
+        assert!(spot_for_runway(&spots, current.as_deref(), Some("27")).is_none(), "already there");
+        assert!(spot_for_runway(&spots, Some("27 "), Some(" 27")).is_none(), "trimmed");
+        assert!(spot_for_runway(&spots, current.as_deref(), None).is_none());
+        assert!(spot_for_runway(&spots, current.as_deref(), Some("")).is_none());
+        assert!(spot_for_runway(&spots, current.as_deref(), Some("15")).is_none(), "no such end");
+        // Once moved, the same runway named again is no move.
+        assert!(spot_for_runway(&spots, Some("09"), Some("09")).is_none());
+    }
+
+    /// A towered landing: the final reported once the inbound call is out
+    /// and the tower is the station; cleared, nothing more is owed.
+    #[test]
+    fn a_towered_final_reports_and_lands_once_cleared() {
+        let mut w = ClearanceWatch::default();
+        // Not yet the tower's (the swap still pending): nothing to say.
+        assert_eq!(w.step(0.0, true, false, false, false), None);
+        assert_eq!(w.step(1.0, true, true, false, false), Some(ClearanceStep::ReportFinal));
+        assert_eq!(w.step(2.0, true, true, false, false), None, "reported once");
+        assert_eq!(w.step(3.0, true, true, true, false), None, "cleared");
+        assert_eq!(w.step(200.0, true, true, true, true), None, "cleared never holds");
+        // No tower (or copilot mode): the watch is silent throughout.
+        let mut none = ClearanceWatch::default();
+        for t in 0..300 {
+            assert_eq!(none.step(t as f64, false, false, false, true), None);
+        }
+    }
+
+    /// Never land uncleared: held short, the clearance is asked again
+    /// every 30 s, three times, and 120 s held without it hands the hover
+    /// to the pilot, once.
+    #[test]
+    fn an_uncleared_final_holds_asks_again_and_hands_over_bounded() {
+        let mut w = ClearanceWatch::default();
+        assert_eq!(w.step(0.0, true, true, false, false), Some(ClearanceStep::ReportFinal));
+        let mut asks = Vec::new();
+        let mut gave_up = None;
+        let mut t = 40.0;
+        while t < 400.0 {
+            match w.step(t, true, true, false, true) {
+                Some(ClearanceStep::Ask) => asks.push(t),
+                Some(ClearanceStep::GiveUp) => {
+                    gave_up = Some(t);
+                    break;
+                }
+                Some(ClearanceStep::ReportFinal) => panic!("reported twice"),
+                None => {}
+            }
+            t += 0.5;
+        }
+        assert_eq!(asks, vec![40.0, 70.0, 100.0]);
+        assert_eq!(gave_up, Some(40.0 + CLEARANCE_HOLD_MAX_S));
+        assert_eq!(w.step(t + 1.0, true, true, false, true), None, "given up once");
+        // A tower that never became the station: no calls to nobody, and
+        // still bounded.
+        let mut deaf = ClearanceWatch::default();
+        let mut end = None;
+        for i in 0..400 {
+            let t = i as f64;
+            match deaf.step(t, true, false, false, true) {
+                Some(ClearanceStep::GiveUp) => {
+                    end = Some(t);
+                    break;
+                }
+                Some(s) => panic!("{s:?} with no tower"),
+                None => {}
+            }
+        }
+        assert_eq!(end, Some(CLEARANCE_HOLD_MAX_S));
+        // Cleared while held: it goes on to land.
+        let mut late = ClearanceWatch::default();
+        late.step(0.0, true, true, false, false);
+        assert_eq!(late.step(10.0, true, true, false, true), None, "too soon to ask");
+        assert_eq!(late.step(30.0, true, true, false, true), Some(ClearanceStep::Ask));
+        assert_eq!(late.step(500.0, true, true, true, true), None);
+    }
+
+    /// The hold is a hover short of the pad: its speed runs out at the
+    /// hold point, its height is the final's where we are, and inside the
+    /// hold point it is a hover where we are. Cleared, the final's own
+    /// command lands on the pad as before.
+    #[test]
+    fn the_uncleared_final_stops_short_of_the_pad() {
+        let (from_ft, from_mps) = (470.0, 19.5);
+        let (s_far, h_far) = hold_command(1300.0, from_ft, from_mps);
+        assert!(s_far > 15.0, "still flying the final: {s_far}");
+        assert_eq!(h_far, final_command(1300.0, from_ft, s_far).1);
+        assert!(h_far <= from_ft);
+        let (s_at, h_at) = hold_command(HOLD_SHORT_M, from_ft, from_mps);
+        assert!(s_at < 1e-9, "{s_at}");
+        assert!(h_at > 160.0, "held on the path, clear of the ground: {h_at}");
+        let (s_in, _) = hold_command(100.0, from_ft, from_mps);
+        assert!(s_in < 1e-9);
+        // The landing gate (`speed < 1.0`) is the final's, never the hold's.
+        assert!(final_command(HOLD_SHORT_M, from_ft, from_mps).0 > 1.0);
+    }
+
+    /// The calls are the aeroplanes' words, and the tower hears a final
+    /// report in each (never a landing request).
+    #[test]
+    fn the_final_report_and_the_ask_are_final_reports_to_the_tower() {
+        assert_eq!(final_words(Some("09"), false), "final runway zero nine");
+        assert_eq!(
+            final_words(Some("09"), true),
+            "final runway zero nine, request landing clearance"
+        );
+        assert_eq!(final_words(None, false), "final");
+        for w in [
+            final_words(Some("09"), false),
+            final_words(Some("09"), true),
+            final_words(None, false),
+            final_words(None, true),
+        ] {
+            let call = crate::circuit::radio_call(&Some("November five seven six X-ray Papa".into()), &w);
+            assert_eq!(
+                crate::tower::parse_intent(&call.to_ascii_lowercase()),
+                crate::tower::Intent::ReportFinal,
+                "{call}"
+            );
+        }
     }
 }

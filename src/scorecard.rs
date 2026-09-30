@@ -366,6 +366,16 @@ pub struct Scorer {
     /// The flight model's last `touchdown` (t, sink): the landing's sink
     /// when it belongs to the state record's touchdown (#142).
     flight_td: Option<(f64, f64)>,
+    /// The helicopter's own word that it is down (`hover` `landed`, or
+    /// `heli_route` `arrived` with `on_ground`): the sortie ends on it, and
+    /// the next `state` sample (the ground flag a tick late) never comes.
+    set_down_t: Option<f64>,
+}
+
+/// A sortie ended in the air: airborne since the last ground sample, and
+/// no helicopter's own set-down after it took off. Pure.
+fn ended_airborne(airborne_since: Option<f64>, set_down_t: Option<f64>) -> bool {
+    airborne_since.is_some_and(|a| set_down_t.is_none_or(|d| d < a))
 }
 
 /// The taxi events that mean the drive STOPPED short, not arrived. Each used
@@ -581,6 +591,14 @@ impl Scorer {
             ("flight", _) if s(r, "ev") == "touchdown" => {
                 self.flight_td = f(r, "sink").map(|sink| (t, sink.min(0.0).abs()))
             }
+            // A helicopter that says it is down is down: the route's sortie
+            // ends on the landing, before a `state` sample reads the ground
+            // (LXGB, iMac 2026-09-30, 1790722408-heli_route: the last state
+            // read 3.3 ft and ground false, `ended_airborne: true`, #192).
+            ("hover", "landed") => self.set_down_t = Some(t),
+            ("heli_route", "arrived") if r.get("on_ground").and_then(Value::as_bool) == Some(true) => {
+                self.set_down_t = Some(t)
+            }
             ("rapport", _) if r.get("impact").and_then(Value::as_bool) == Some(true) => {
                 self.crashed = true
             }
@@ -614,7 +632,7 @@ impl Scorer {
                 // PASS on its alignment and takeoff (#160). Every mission
                 // this scores (full auto, the approach, the helicopter route)
                 // ends on the ground.
-                let ended_airborne = self.airborne_since.is_some();
+                let ended_airborne = ended_airborne(self.airborne_since, self.set_down_t);
                 let pass = failed.is_empty()
                     && unattended
                     && s(r, "outcome") != "gave_up"
@@ -649,6 +667,7 @@ impl Scorer {
     fn new_flight(&mut self, out: &mut Vec<(String, Value)>) {
         self.close_landing(out);
         self.airborne_since = None;
+        self.set_down_t = None;
         self.air.clear();
         self.contact = None;
         self.flare_vvi.clear();
@@ -1938,5 +1957,51 @@ mod tests {
             score_all(landed.iter()).last().unwrap()["ended_airborne"],
             false
         );
+    }
+
+    /// A helicopter route's sortie ends on its own set-down: LXGB (iMac
+    /// 2026-09-30, 1790722408-heli_route) wrote `hover` `landed` at
+    /// 1790724452.9 and `heli_route` `arrived` `on_ground: true` a tenth
+    /// later, the sortie ended with them, and the last `state` sample
+    /// (3.3 ft, ground false) read `ended_airborne: true` (#192).
+    #[test]
+    fn a_helicopter_down_by_its_own_word_did_not_end_airborne() {
+        let id = "1790722408-heli_route";
+        let mut recs = vec![json!({"t": 1790722408.0, "kind": "sortie", "event": "begin",
+                                   "label": "heli_route", "sortie": id})];
+        for i in 0..20 {
+            recs.push(json!({"t": 1790722500.0 + 100.0 * i as f64, "kind": "state",
+                             "ground": false, "agl": 500.0, "vsi": 0.0, "hdg": 234.0,
+                             "track": 234.0, "crashed": false, "sortie": id}));
+        }
+        recs.push(json!({"t": 1790724451.1, "kind": "state", "ground": false, "agl": 3.3,
+                         "vsi": -40.0, "hdg": 234.6, "track": 234.6, "crashed": false,
+                         "sortie": id}));
+        let end = json!({"t": 1790724453.0, "kind": "sortie", "event": "end",
+                         "outcome": "ended", "sortie": id});
+        let mut unsaid = recs.clone();
+        unsaid.push(end.clone());
+        assert_eq!(score_all(unsaid.iter()).last().unwrap()["ended_airborne"], true);
+        for down in [
+            json!({"t": 1790724452.9, "kind": "hover", "event": "landed", "sortie": id}),
+            json!({"t": 1790724453.0, "kind": "heli_route", "event": "arrived",
+                   "on_ground": true, "sortie": id}),
+        ] {
+            let mut landed = recs.clone();
+            landed.push(down);
+            landed.push(end.clone());
+            assert_eq!(score_all(landed.iter()).last().unwrap()["ended_airborne"], false);
+        }
+        // "Arrived" still in the air is no set-down; nor is one before a
+        // lift that ends the sortie in the air.
+        let mut hovering = recs.clone();
+        hovering.push(json!({"t": 1790724453.0, "kind": "heli_route", "event": "arrived",
+                             "on_ground": false, "sortie": id}));
+        hovering.push(end.clone());
+        assert_eq!(score_all(hovering.iter()).last().unwrap()["ended_airborne"], true);
+        let mut lifted = recs.clone();
+        lifted.insert(1, json!({"t": 1790722450.0, "kind": "hover", "event": "landed", "sortie": id}));
+        lifted.push(end);
+        assert_eq!(score_all(lifted.iter()).last().unwrap()["ended_airborne"], true);
     }
 }

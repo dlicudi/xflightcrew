@@ -11501,3 +11501,50 @@ passing through west (not east) in `state`; the line-up drive's end under 50 m d
 `roll_limit_m`, no `line_up_align` tick with `gs` much over 3; `runway_check` passing, no
 `line_up_no_fit`. The SR22's LEMG taxi (4.7 to 5.0 m, #165) is a long corner, not this start.
 Offline only.
+
+## 2026-09-30: the S-76 lands on the tower's runway, cleared (#192)
+
+iMac 2026-09-30, sortie 1790722408-heli_route (S-76 LEMG to LXGB). The inbound call (t
+1790723929.4) earned "join final runway zero niner, QNH one zero one three. Report final." (book
+Parked to Inbound). The route kept its pad `LXGB runway 27` (`runway_spot`: the end nearest the
+arrival, fixed at the arm), said "Final for the pad." on the intercom only (1790724341.5, 1.3 km
+out, 470 ft), never reported final nor read a clearance back, and set down on 27's spot; the
+incursion watch called "you are on runway two seven without clearance. Exit the runway
+immediately." at 1790724422.6 (44 m out, 46 ft). The sortie ended on `hover` `landed`
+(1790724452.9) and `heli_route` `arrived` `on_ground: true`; the last `state` sample read 3.3 ft,
+ground false, and the scorer wrote `ended_airborne: true`.
+
+- **The tower's runway moves the landing** (`runway_spots`, `spot_for_runway`, `spot_runway`,
+  `Route.runway_spots`): with the destination's tower the station and its book Inbound or
+  ClearedToLand, a runway landing moves to the named end's spot, 150 m in from ITS threshold (the
+  route's last leg, `pad`, re-made in flight), said "Tower wants runway zero nine. Landing on it."
+  A helipad stays a helipad. Blackbox `heli_route` `pad_to_tower_runway` (`from`, `to`, `rwy`,
+  `was_rwy`, `phase`, `to_pad_m`).
+- **The final is reported and the landing never uncleared** (`ClearanceWatch`, `hold_command`,
+  `final_words`; the aeroplanes' words and `autoland::landing_readback`): at a towered
+  destination we called, once our inbound call is out (`INBOUND_SENT`) and the station is that
+  tower, the hover final transmits "final runway zero nine"; "cleared to land" is read back once
+  (`transmit_readback`). Not cleared, the final flies to a hover `HOLD_SHORT_M` (400 m) short of
+  the pad at the path's height (168 ft), says "No landing clearance yet. Holding short of the pad.",
+  asks "final runway ..., request landing clearance" every 30 s, three times, and after 120 s held
+  hands the hover to the pilot where it is ("No landing clearance from the tower. Holding in the
+  hover short of the pad, your controls.", the hover loop still holding). The `Land` gate is
+  cleared-only. An arrival-only route calls the tower inbound first. Copilot mode and untowered
+  fields are unchanged.
+- **The scorer believes the helicopter's own set-down** (`scorecard::ended_airborne`,
+  `set_down_t`): `hover` `landed` or `heli_route` `arrived` with `on_ground` after the last lift is
+  on the ground, the ground flag a tick late notwithstanding.
+
+Tests: `the_towers_runway_moves_the_landing_to_its_end` (LXGB's 09/27 from apt.dat),
+`a_towered_final_reports_and_lands_once_cleared`,
+`an_uncleared_final_holds_asks_again_and_hands_over_bounded`,
+`the_uncleared_final_stops_short_of_the_pad`,
+`the_final_report_and_the_ask_are_final_reports_to_the_tower` (the tower parses each as
+ReportFinal), `a_helicopter_down_by_its_own_word_did_not_end_airborne`.
+
+Next S-76 into LXGB: `heli_route` `pad_to_tower_runway` `rwy` "09" soon after the tower's "join
+final", the `fix` field in ticks then `LXGB runway 09`; `final_report` near `handover_hover`,
+an `atc` ReportFinal answered "cleared to land runway zero niner", `landing_readback`, the
+`final_tick` `cleared` true before `over_pad`; no `compliance` "without clearance"; if held,
+`hold_short` then `landing_clearance_asked` (at most 3) and either a clearance or
+`uncleared_hold_given_up`; the `sortie_result` `ended_airborne` false. Offline only.

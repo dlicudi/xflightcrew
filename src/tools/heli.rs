@@ -528,6 +528,10 @@ async fn arrival(tool: &Hover, ctx: &ToolCtx<'_>) -> Result<std::result::Result<
             destination: dest.clone(),
             dest_tower_khz: apt.as_ref().and_then(|a| a.staffed_tower().map(|f| f.khz)),
             arrive_only: true,
+            runway_spots: match apt.as_ref() {
+                Some(a) if !on_pad => crate::heli_route::runway_spots(a),
+                _ => Vec::new(),
+            },
         },
         crate::heli_route::Ends {
             start: None,
@@ -682,19 +686,22 @@ async fn route(tool: &Hover, ctx: &ToolCtx<'_>) -> Result<String> {
         (p.1, p.2)
     };
     let pads = crate::heli_route::helipads(&ctx.config.apt_data_path, &dest);
-    let dest_tower_khz = crate::nav::find_airport(&ctx.config.apt_data_path, &dest)
+    let dest_apt = crate::nav::find_airport(&ctx.config.apt_data_path, &dest)
         .ok()
-        .flatten()
+        .flatten();
+    let dest_tower_khz = dest_apt
+        .as_ref()
         .and_then(|a| a.staffed_tower().map(|f| f.khz));
     // No helipad: the runway end nearest the arrival, never the reference
-    // point (LILB's is 120 m off its strip).
+    // point (LILB's is 120 m off its strip); a tower's runway moves it to
+    // that end in flight (`runway_spots`, #192).
     let on_pad = !pads.is_empty();
-    let spot = crate::heli_route::pick_pad(&pads, inbound).or_else(|| {
-        crate::nav::find_airport(&ctx.config.apt_data_path, &dest)
-            .ok()
-            .flatten()
-            .and_then(|a| crate::heli_route::runway_spot(&a, inbound))
-    });
+    let spot = crate::heli_route::pick_pad(&pads, inbound)
+        .or_else(|| dest_apt.as_ref().and_then(|a| crate::heli_route::runway_spot(a, inbound)));
+    let runway_spots = match dest_apt.as_ref() {
+        Some(a) if !on_pad => crate::heli_route::runway_spots(a),
+        _ => Vec::new(),
+    };
     let pad_name = match spot {
         Some((lat, lon, name)) => {
             if let Some(last) = points.last_mut() {
@@ -784,6 +791,7 @@ async fn route(tool: &Hover, ctx: &ToolCtx<'_>) -> Result<String> {
             destination: dest.clone(),
             dest_tower_khz,
             arrive_only: false,
+            runway_spots,
         },
         crate::heli_route::Ends {
             start: (on_ground && from_cold).then(|| tool.start.clone()),
