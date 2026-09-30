@@ -1211,6 +1211,7 @@ pub fn star_speed_crossing(
         met: ias_kts <= kts,
         over_target_kts: ias_kts - target_kts,
     })
+}
 
 /// The speed the NEXT enroute plan hands its arrival over at, consumed at
 /// its arm (full auto's, before an arrival autoland).
