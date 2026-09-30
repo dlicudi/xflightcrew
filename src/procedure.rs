@@ -1172,6 +1172,47 @@ pub fn arrival_speed_cap(
     cap
 }
 
+/// A STAR speed limit judged where it is FLOWN: the airspeed as the leg to
+/// its fix sequences, against the limit and the target under it
+/// ([`STAR_SPEED_MARGIN_KTS`]). Blackboxed `star_speed_crossed`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct StarSpeedCrossing {
+    pub fix: String,
+    pub kts: f64,
+    pub target_kts: f64,
+    pub ias: f64,
+    /// At or under the limit.
+    pub met: bool,
+    /// Knots over the target (negative: under it).
+    pub over_target_kts: f64,
+}
+
+/// The crossing of `leg`'s speed limit at `ias_kts`, or `None` when the fix
+/// has none.
+///
+/// `star_speed` is logged when the slow-down BEGINS, with the airspeed of
+/// that moment, and was read as the crossing: iMac 2026-09-30 (sortie
+/// 1790759458-full_auto, #156) "OSKOT 248 against 210" was the slow-down
+/// starting 7.86 nm out at 248 kt; OSKOT sequenced 2.1 nm out at 208.4, the
+/// fix itself inside the limit, as were PUFAX (246.7 against 250) and GROVE
+/// (206.1 against 210). The crossing now has its own record.
+pub fn star_speed_crossing(
+    cons: &[crate::nav::StarConstraint],
+    leg: &ProcLeg,
+    ias_kts: f64,
+) -> Option<StarSpeedCrossing> {
+    let kts = restriction_at(cons, leg)?.max_kts?;
+    let target_kts = kts - STAR_SPEED_MARGIN_KTS;
+    Some(StarSpeedCrossing {
+        fix: leg.fix_ident.clone(),
+        kts,
+        target_kts,
+        ias: ias_kts,
+        met: ias_kts <= kts,
+        over_target_kts: ias_kts - target_kts,
+    })
+}
+
 /// The true great-circle bearing to a leg's fix, or `None` for a to-altitude
 /// leg (no fix to steer at). Pure — the lateral-steering decision, testable
 /// without a sim.
@@ -3287,9 +3328,16 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, plan: Pla
             let planned = match &star_cap {
                 Some((kts, fix)) if *kts - STAR_SPEED_MARGIN_KTS < planned => {
                     if said_star_speed.insert(fix.clone()) {
+                        // The slow-down BEGINS here (`ias` is now, not at the
+                        // fix; `star_speed_crossed` is the crossing), miles
+                        // along the route to the fix.
+                        let dist_nm = (idx..legs.len())
+                            .find(|&k| legs[k].fix_ident == *fix)
+                            .map(|k| distance_to_leg_nm(lat, lon, &legs, idx, k));
                         crate::blackbox::record(
                             "procedure",
-                            serde_json::json!({"event": "star_speed", "fix": fix, "kts": kts, "ias": ias}),
+                            serde_json::json!({"event": "star_speed", "fix": fix, "kts": kts, "ias": ias,
+                                "at": "slowing", "dist_nm": dist_nm}),
                         );
                         alert(
                             &voice,
@@ -4376,6 +4424,14 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, plan: Pla
         }
 
         if done {
+            if let Some(c) = star_speed_crossing(&arrival_constraints, leg, ias) {
+                crate::blackbox::record(
+                    "procedure",
+                    serde_json::json!({"event": "star_speed_crossed", "fix": c.fix, "kts": c.kts,
+                        "target": c.target_kts, "ias": c.ias, "met": c.met,
+                        "over_target_kts": c.over_target_kts, "dist_nm": dist_nm, "alt_ft": alt_ft}),
+                );
+            }
             idx += 1;
             if idx < legs.len() {
                 let next = &legs[idx];
@@ -5734,6 +5790,83 @@ mod tests {
         }
         assert!(worst.0 <= 3.0, "{:.1} over at {}", worst.0, worst.1);
         assert!(outs <= 4, "{outs} extensions");
+    }
+
+    /// iMac 2026-09-30, sortie 1790759458-full_auto (#156): the `star_speed`
+    /// record read as "OSKOT 248 against 210" is the slow-down BEGINNING,
+    /// 7.86 nm along the route at 248.0 kt and 279 kt over the ground: 38 kt
+    /// at the planned 0.5 kt/s is 76 s, 5.9 nm, plus the 2 nm lead. Level at
+    /// idle the 737 lost it at 1.15 kt/s (248.0 to 210.9 from 7.86 to 5.56
+    /// nm, 32 s), so the lead left 3.3 nm to spare before OSKOT sequenced
+    /// (2.1 nm out, 208.4 kt). The planned rate stays under the measured.
+    #[test]
+    fn the_recorded_oskot_slow_down_begins_with_miles_to_spare() {
+        let (legs, cons) = egbb_heme1b();
+        let k = legs.iter().position(|l| l.fix_ident == "OSKOT").unwrap();
+        let hon = legs[k - 1].fix.clone().unwrap();
+        let oskot = legs[k].fix.clone().unwrap();
+        let back = crate::nav::bearing_deg(oskot.lat, oskot.lon, hon.lat, hon.lon);
+        let at = |nm: f64| crate::nav::project_latlon(oskot.lat, oskot.lon, back, nm);
+        let cap = |nm: f64| {
+            let (lat, lon) = at(nm);
+            arrival_speed_cap(&legs, &cons, k, lat, lon, 248.0, 279.0, &mut Default::default())
+        };
+        // Short of the start only PUFAX's 250, passed, holds.
+        assert_eq!(cap(8.3), Some((250.0, "PUFAX".to_string())));
+        assert_eq!(cap(7.86), Some((210.0, "OSKOT".to_string())));
+        // The recorded level deceleration and the miles it took.
+        let (measured_kts_s, used_nm, sequenced_nm) = ((248.0 - 210.9) / 32.2, 7.86 - 5.56, 2.1);
+        assert!(ARRIVAL_DECEL_KTS_S < measured_kts_s, "{measured_kts_s:.2} kt/s");
+        let lead = (248.0 - 210.0) / ARRIVAL_DECEL_KTS_S * 279.0 / 3600.0 + ARRIVAL_SPEED_LEAD_NM;
+        assert!(lead - used_nm - sequenced_nm > 3.0, "lead {lead:.2} nm");
+        // Judged where it is flown: the crossing record, not the start's.
+        let c = star_speed_crossing(&cons, &legs[k], 208.4).unwrap();
+        assert!(c.met && (c.over_target_kts - 1.4).abs() < 1e-9, "{c:?}");
+        assert!(!star_speed_crossing(&cons, &legs[k], 248.0).unwrap().met, "the start's airspeed is no crossing");
+        assert!(star_speed_crossing(&cons, &legs[k - 2], 246.7).unwrap().met, "PUFAX 246.7 against 250");
+        assert_eq!(star_speed_crossing(&cons, &legs[k - 1], 245.0), None, "HON has no speed");
+    }
+
+    /// The same sortie flown closed loop from its placement at WELIN (FL180,
+    /// 293.7 kt, the profile's 255 after, 19 kt of headwind: 381.9 kt over
+    /// the ground at 295), sequenced 0.8 nm out (PUFAX and HON as recorded)
+    /// on the fitted plant's sweep: every limit met at its fix. The speed
+    /// protection is proportional, so a descent held at idle sits over its
+    /// target (OSKOT 208.4 flown against 207; 202 to 209.6 on the sweep): the
+    /// 3 kt margin is what absorbs it. Moving the protection's band under the
+    /// target (from 0 to -1.5 kt) held the targets but broke the HEME1B's
+    /// windows and the GROVE join, so it is not done here.
+    #[test]
+    fn the_recorded_welin_arrival_meets_every_star_speed_at_its_fix() {
+        let (mut legs, cons) = egbb_heme1b();
+        apply_arrival_constraints(&mut legs, &cons);
+        let welin = legs.iter().position(|l| l.fix_ident == "WELIN").unwrap();
+        let start = legs[welin].fix.clone().unwrap();
+        for gamma_scale in [0.75, 1.0, 1.25] {
+            for drag_kts_s in [-0.15, 0.0, 0.15] {
+                let plant = Plant { gamma_scale, drag_kts_s, dead_ticks: 4 };
+                let run = fly_arrival(
+                    &legs,
+                    &cons,
+                    welin + 1,
+                    (start.lat, start.lon),
+                    18_077.0,
+                    293.7,
+                    |_| 255.0,
+                    |_, _, tas| tas - 19.0,
+                    0.8,
+                    ArrivalLaw::Protected,
+                    plant,
+                );
+                for (fix, kts) in [("PUFAX", 250.0), ("OSKOT", 210.0), ("GROVE", 210.0)] {
+                    let ias = run.crossings.iter().find(|c| c.0 == fix).map(|c| c.2).unwrap();
+                    let leg = legs.iter().find(|l| l.fix_ident == fix).unwrap();
+                    let c = star_speed_crossing(&cons, leg, ias).unwrap();
+                    assert!(c.met && c.kts == kts, "{fix} at {ias:.1} ({plant:?}): {run:?}");
+                }
+                assert!(run.climb_back_ft < 100.0, "{run:?}");
+            }
+        }
     }
 
     /// FOFUS on UNTO2A is 7,000 to 10,000 ft and the 737 crossed it at 10,386
