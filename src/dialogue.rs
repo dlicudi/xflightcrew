@@ -228,6 +228,9 @@ impl Dialogue {
         if tokens.is_empty() || tokens.len() > 6 {
             return None;
         }
+        if let Some(r) = self.resolve_runway_reply(&tokens, registry) {
+            return Some(r);
+        }
         // Order matters: "one more time" is a repeat, not a "more" delta.
         if let Some(r) = self.resolve_repeat(&tokens, registry) {
             return Some(r);
@@ -244,6 +247,51 @@ impl Dialogue {
             .iter()
             .rev()
             .find(|r| r.at.elapsed() < ANCHOR_TTL && pick(r))
+    }
+
+    /// "No, it's runway 26" after `prepare_ils` asked which runway. This is
+    /// deliberately narrower than a general runway back-reference: without a
+    /// fresh ILS call whose runway was empty, runway talk may be ATC, a weather
+    /// question or chatter and must not configure anything.
+    fn resolve_runway_reply(&self, tokens: &[String], registry: &Registry) -> Option<Resolution> {
+        const WORDS: &[&str] = &[
+            "no", "it", "its", "s", "is", "the", "runway", "please", "left", "right", "center",
+            "centre",
+        ];
+        if !tokens.iter().any(|w| w == "runway")
+            || tokens.iter().any(|w| {
+                !WORDS.contains(&w.as_str()) && w.parse::<i64>().is_err() && word_value(w).is_none()
+            })
+        {
+            return None;
+        }
+        let normalized = crate::phrase::normalize_numbers(&tokens.join(" "));
+        let n = normalized
+            .split(|c: char| !c.is_ascii_alphanumeric())
+            .find_map(|w| w.parse::<i64>().ok())
+            .filter(|n| (1..=36).contains(n))?;
+        let side = if tokens.iter().any(|w| w == "left") {
+            "L"
+        } else if tokens.iter().any(|w| w == "right") {
+            "R"
+        } else if tokens.iter().any(|w| w == "center" || w == "centre") {
+            "C"
+        } else {
+            ""
+        };
+        let last = self.newest(|r| r.name == "prepare_ils")?;
+        if last.args.get("runway").and_then(Value::as_str) != Some("") {
+            return None;
+        }
+        if registry.get(&last.name).is_none() {
+            return None;
+        }
+        let mut args = last.args.clone();
+        args["runway"] = Value::String(format!("{n:02}{side}"));
+        Some(Resolution::Calls(vec![ToolCall {
+            name: last.name.clone(),
+            arguments: args,
+        }]))
     }
 
     /// "Do that again" / "same again" / "once more" / "one more time".
@@ -596,6 +644,28 @@ mod tests {
         let empty = Dialogue::new();
         let line = say(empty.resolve("turn it off", &reg));
         assert!(line.contains("Turn what"), "{line}");
+    }
+
+    #[test]
+    fn a_runway_reply_completes_only_a_fresh_incomplete_ils_setup() {
+        let reg = registry();
+        let mut d = Dialogue::new();
+        assert!(d.resolve("no, it's runway 26", &reg).is_none());
+        d.record("prepare_ils", &json!({"runway": "", "couple": true}));
+        let (name, args) = calls(d.resolve("no, it's runway 26", &reg));
+        assert_eq!(name, "prepare_ils");
+        assert_eq!(args["runway"], "26");
+        assert_eq!(args["couple"], true, "the original choice survives");
+
+        let (name, args) = calls(d.resolve("the runway is two six left", &reg));
+        assert_eq!(name, "prepare_ils");
+        assert_eq!(args["runway"], "26L");
+
+        d.record("prepare_ils", &json!({"runway": "08", "couple": false}));
+        assert!(
+            d.resolve("runway 27", &reg).is_none(),
+            "a complete call is not pending"
+        );
     }
 
     #[test]

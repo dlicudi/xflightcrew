@@ -1001,6 +1001,11 @@ pub(crate) fn correction_value(text: &str) -> Option<String> {
         &["i", "meant"],
         &["make", "it"],
         &["make", "that"],
+        // "Set it to 55" after the 50-knot floor was refused (EGBS,
+        // 2026-10-01, #213). The remainder still has to be a bare value and
+        // a fresh command subject still has to exist at the caller.
+        &["set", "it", "to"],
+        &["set", "that", "to"],
         // "How about eighty percent?" — the pilot renegotiating the value
         // (heard live 2026-07-09 after "Power 8 percent" executed a mishear).
         &["how", "about"],

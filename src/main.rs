@@ -5994,6 +5994,11 @@ mod tests {
             correction_value("make it sixty percent"),
             Some("sixty percent".into())
         );
+        assert_eq!(correction_value("set it to 55"), Some("55".into()));
+        assert_eq!(
+            correction_value("set that to two six"),
+            Some("two six".into())
+        );
         assert_eq!(
             correction_value("correction, one thousand five hundred"),
             Some("one thousand five hundred".into())
@@ -6016,6 +6021,7 @@ mod tests {
         assert_eq!(correction_value("no, flaps up"), None);
         assert_eq!(correction_value("no"), None);
         assert_eq!(correction_value("I said start the engines"), None);
+        assert_eq!(correction_value("set it to idle"), None);
         assert_eq!(correction_value("north"), None, "no prefix, no correction");
         assert_eq!(correction_value("flaps ten"), None);
     }

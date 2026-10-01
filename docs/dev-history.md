@@ -12551,3 +12551,26 @@ publishes its own route to a stand from the destination's taxi network, then use
 taxi and securing path. The state clears on arrival release, station install/uninstall and every
 new flight. `uncontrolled_arrival_retires_the_previous_controller` pins the service boundary; all
 260 active ATC tests pass. Live EGFH confirmation is still owed.
+
+## 2026-10-01: a manual untowered arrival asked for a nonexistent tower (#212)
+
+C172 EGFH-EGBS, pilot-flown after loading the plan airborne. After touchdown the pilot asked
+"taxi to parking". Taxi-in safely arrested the aircraft at 16 kt and set the parking brake, then
+said "Call the tower for your taxi-in". EGBS had no reachable simulated tower, but the self-taxi
+path added for #210 required `uncontrolled_arrival`, a fact only full auto's enroute/arrival seam
+published. The pilot taxied with the speed governor instead.
+
+**Taxi-in now decides from the active world mode.** When built-in ATC is enabled and no station
+reaches the aircraft, there is no external controller to ask: taxi-in resolves the field under the
+wheels and publishes the ordinary self-taxi route to a stand, whether full auto marked the arrival
+or the pilot flew it. Copilot-only mode still means real/external ATC and leaves the clearance with
+the pilot. Blackbox `taxi_in` `self_taxi` records whether the earlier marker existed. Test
+`a_manual_untowered_arrival_self_taxis_only_with_built_in_atc` pins both authorities. Live EGBS
+confirmation is owed.
+
+The same approach exposed two numeric follow-up holes (#213). After "Can you set up ILS?" asked
+for a runway, "No, it's runway 26" was silent; after 50 kt was refused below the stall margin,
+"Set it to 55" was silent until the pilot repeated the full speed command. A closed runway reply
+now completes only a fresh `prepare_ils` call with an empty runway and preserves its coupling
+choice. `set it to <bare value>` and `set that to <bare value>` join the existing recent-subject
+correction path. Tests pin both live phrases, the parallel-runway side, and the unanchored cases.

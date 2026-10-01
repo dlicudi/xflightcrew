@@ -15,11 +15,12 @@
 //! Phase two is the original: the world (tower) provides the stand route (see
 //! `crates/atc`'s `RequestTaxiIn`), this asks for it over the crew radio and
 //! hands the drive to `AutoTaxi` — which phrases the destination as "stand ..."
-//! off [`crate::party_line::taxi_to_stand`]. With real/external ATC (no
-//! simulated tower) the pilot owns the request; we only drive what's already
-//! cleared. Note that a copilot-only boot has no station and therefore no taxi
-//! network either, so the vacate degrades to nothing there — the pilot is
-//! flying with real ATC and owns the rollout.
+//! off [`crate::party_line::taxi_to_stand`]. With built-in ATC enabled but no
+//! tower at the field, the crew plans its own route from the apt.dat taxi
+//! network. With real/external ATC (copilot-only mode), the pilot owns the
+//! request; we only drive what's already cleared. Note that a copilot-only boot
+//! has no station and therefore no taxi network either, so the vacate degrades
+//! to nothing there — the pilot is flying with real ATC and owns the rollout.
 
 use serde_json::json;
 
@@ -246,6 +247,18 @@ pub fn vacate_runway() -> Option<String> {
 /// A stand (arrival) route is already published — the drive can start now.
 fn stand_route_ready() -> bool {
     crate::party_line::taxi_to_stand() && crate::party_line::with_taxi_route(|r| r.is_some())
+}
+
+/// Who owns a taxi-in when no simulated tower reaches the aircraft.
+///
+/// The world mode is the authority, not an arrival marker published by one
+/// orchestrator. A pilot-flown arrival never passes full auto's
+/// `begin_uncontrolled_arrival` seam, but with built-in ATC running the absence
+/// of a reachable tower still means there is nobody to ask and the crew must
+/// plan the uncontrolled-field route itself. In copilot-only mode the absent
+/// station means real/external ATC, so the pilot owns the clearance.
+fn crew_owns_taxi_without_tower(atc_enabled: bool) -> bool {
+    atc_enabled
 }
 
 /// How long to give the drive off the runway before pressing on regardless:
@@ -631,10 +644,13 @@ async fn fly(
                 return;
             }
         } else {
-            if crate::party_line::uncontrolled_arrival() {
+            if crew_owns_taxi_without_tower(crate::mode::atc_enabled()) {
                 // No controller exists here: plan the same stand route the
                 // tower would have published, but mark it as the crew's own.
+                // Do not require `uncontrolled_arrival`: full auto publishes
+                // it before approach, but a manual arrival has no such seam.
                 // The apt.dat scan is blocking and stays off this runtime.
+                let marked_uncontrolled = crate::party_line::uncontrolled_arrival();
                 let (lat, lon, psi) = match (
                     xp.get_float(crate::autotaxi::LAT).await,
                     xp.get_float(crate::autotaxi::LON).await,
@@ -665,7 +681,8 @@ async fn fly(
                         crate::blackbox::record(
                             "taxi_in",
                             json!({ "event": "self_taxi", "field": route.field,
-                                    "stand": route.stand, "via": route.via }),
+                                    "stand": route.stand, "via": route.via,
+                                    "marked_uncontrolled": marked_uncontrolled }),
                         );
                     }
                     None => {
@@ -998,7 +1015,20 @@ fn shutdown_line(electrics: Option<&str>) -> String {
 
 #[cfg(test)]
 mod shutdown_tests {
-    use super::{engines_stopped, shutdown_line, vacate_budget_secs, VACATE_MAX_SECS};
+    use super::{
+        crew_owns_taxi_without_tower, engines_stopped, shutdown_line, vacate_budget_secs,
+        VACATE_MAX_SECS,
+    };
+
+    /// EGBS (2026-10-01, issue #212): the pilot flew the arrival, so full
+    /// auto never marked it uncontrolled. Built-in ATC still owns the world
+    /// and the crew must self-taxi; only external ATC keeps that with the
+    /// pilot.
+    #[test]
+    fn a_manual_untowered_arrival_self_taxis_only_with_built_in_atc() {
+        assert!(crew_owns_taxi_without_tower(true));
+        assert!(!crew_owns_taxi_without_tower(false));
+    }
 
     #[test]
     fn a_long_vacate_gets_the_time_its_route_needs() {
