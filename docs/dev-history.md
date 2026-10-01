@@ -12498,3 +12498,38 @@ flights: the SR22 and Evolution taxis inside 3 m at every corner (`lat_m`, `gste
 following `r_ref` within a few deg/s, `w_hat` settling near -1); the line-up pivot aligned without a
 time give-up; the roll's `bl`/`br` quiet by 25 kt; every rollout's `xtk_m` against 1790689843's
 9.1 and 1790694457's 11.0. Offline only.
+
+## 2026-10-01: the enroute follower catches a wrong-way heading-mode turn (#70)
+
+C172 EGBB-EGTF, sortie 1790844668-full_auto. At TOBID the follower jumped the heading bug from
+about 190 to 160 for WOD. From nearly level flight X-Plane's HDG mode banked RIGHT, carried on
+through north, and the distance opened 51.0 to 53.8 nm. Two rejoin writes repeated the orbit; the
+third `leg_stalled` correctly stood the mission down. “Resume flight plan” restarted it, circled
+past TOBID once more, then captured WOD. The plan and its five-point FMS load were sound.
+
+`procedure::HeadingHold` now stages every turn over 10 degrees: at most 25 degrees of entry lead,
+then the final heading only after the measured bank commits the right way. A bank the other way
+puts the bug on the nose once, waits to one degree of bank, and retries the short way. This is the
+enroute version of the circuit's `bug_toward` door, with rollout hysteresis rather than a twitching
+per-tick nose command. The recorded 190-to-160 transition and #70's exact wrong-way 25-degree step
+are pinned in `a_wrong_way_enroute_entry_is_neutralised_then_retried_short_way`; all 83 active
+procedure tests pass. Live confirmation is still owed.
+
+## 2026-10-01: the restored C172's idle flare ran out of column at EGTF 24
+
+C172 EGBB-EGTF, restored after the X-Plane crash, sortie 1790847778-full_auto. The final was stable
+near 64 kt and 300 fpm. At 22 ft the legacy flare put the lever straight to idle; the elevator
+arrested -230 to -69 fpm by 12 ft, but speed then fell 58 to 53 kt. Sink rebuilt through -161,
+-225, -304 and -392 fpm while the column reached its 0.35 cap. The last airborne tick was 0.5 ft;
+the touchdown scorer's slower sample saw about 351 fpm. This was not restore state: a fresh
+autoland flew the whole approach. It was the default idle flare assuming elevator would remain
+enough after the first arrest.
+
+The legacy (no `flare_power`) path now has a narrow last-feet sink rescue. Below 15 ft, only when
+the one-second projected sink is at least 250 fpm, the measured sink is already at least 120 fpm,
+and the column has used 45% of its declared authority, it restores 40% of approach power bounded
+to 0.12..0.22. An explicit per-approach latch holds that floor while sink exceeds 75 fpm, then
+releases so neither a lagging pre-idle readback nor the rescue can manufacture a float. Missing
+measurements, a good initial arrest, higher flight and
+every airframe with its own progressive flare power stay on their existing paths. Blackbox
+`power.retard` says `sink`. The recorded -161/-132 fpm/s/0.163 elevator tick is the regression.

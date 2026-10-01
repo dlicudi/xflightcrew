@@ -2835,11 +2835,20 @@ fn stand_down(voice: &Option<Voice>, line: &str, reason: &str) {
 /// waits for the wings to come level (the autopilot turns the short way
 /// from where the nose is, and a bug set against the bank went round the
 /// long way, LXGB 2026-09-14).
+#[derive(Debug, Default, Clone, Copy, PartialEq)]
+enum HeadingTurn {
+    #[default]
+    Direct,
+    Entry { sign: f64 },
+    Rollout { sign: f64 },
+}
+
 #[derive(Debug, Default)]
 pub struct HeadingHold {
     leg: Option<usize>,
     set: Option<f64>,
     last_write_s: f64,
+    turn: HeadingTurn,
 }
 
 /// A correction smaller than this is not worth reaching for the knob.
@@ -2848,8 +2857,16 @@ const BUG_CORRECT_DEG: f64 = 5.0;
 const BUG_CORRECT_EVERY_S: f64 = 30.0;
 /// Wings this level count as level for a correction.
 const BUG_LEVEL_BANK_DEG: f64 = 5.0;
-/// Banked past this the other way, a new heading waits for the roll-out.
-const BUG_WAIT_BANK_DEG: f64 = 10.0;
+/// Start a large turn with a small bug displacement. X-Plane's HDG mode can
+/// choose the long way when the final heading is selected in one jump, even
+/// from nearly level flight (C172 EGBB-EGTF, 2026-10-01).
+const BUG_ENTRY_LEAD_DEG: f64 = 25.0;
+/// A bank past this has committed to a direction (or exposed a wrong-way
+/// entry). This is deliberately below the heading mode's 11-17 degree turn.
+const BUG_TURN_BANK_DEG: f64 = 3.0;
+/// Once neutralised, keep the bug on the captured heading until the wings are
+/// genuinely level before asking for the wanted direction again.
+const BUG_ROLLOUT_LEVEL_DEG: f64 = 1.0;
 
 impl HeadingHold {
     /// The heading to set now, or `None` to leave the knob alone. Pure.
@@ -2857,30 +2874,80 @@ impl HeadingHold {
         let want = want_mag.round().rem_euclid(360.0);
         let diff = |a: f64, b: f64| ((a - b + 540.0).rem_euclid(360.0)) - 180.0;
         let turn = diff(want, heading_mag);
-        let against_bank = bank_deg.abs() > BUG_WAIT_BANK_DEG
-            && turn.abs() > 10.0
-            && (turn > 0.0) != (bank_deg > 0.0);
-        let write = if self.leg != Some(leg) || self.set.is_none() {
-            !against_bank
+        let new_leg = self.leg != Some(leg) || self.set.is_none();
+        let command = if new_leg {
+            let sign = turn.signum();
+            let against_bank = bank_deg.abs() > BUG_TURN_BANK_DEG
+                && turn.abs() > 10.0
+                && sign != bank_deg.signum();
+            if against_bank {
+                self.turn = HeadingTurn::Rollout { sign };
+                Some(heading_mag.round().rem_euclid(360.0))
+            } else if turn.abs() > 10.0 {
+                self.turn = HeadingTurn::Entry { sign };
+                Some(
+                    (heading_mag + sign * turn.abs().min(BUG_ENTRY_LEAD_DEG))
+                        .round()
+                        .rem_euclid(360.0),
+                )
+            } else {
+                self.turn = HeadingTurn::Direct;
+                Some(want)
+            }
         } else {
-            let off = diff(want, self.set.unwrap_or(want)).abs();
-            off >= BUG_CORRECT_DEG
-                && bank_deg.abs() < BUG_LEVEL_BANK_DEG
-                && now_s - self.last_write_s >= BUG_CORRECT_EVERY_S
+            match self.turn {
+                HeadingTurn::Rollout { sign } => {
+                    if bank_deg.abs() <= BUG_ROLLOUT_LEVEL_DEG {
+                        let sign = if turn.abs() > 10.0 {
+                            turn.signum()
+                        } else {
+                            sign
+                        };
+                        if turn.abs() <= 10.0 {
+                            self.turn = HeadingTurn::Direct;
+                            Some(want)
+                        } else {
+                            self.turn = HeadingTurn::Entry { sign };
+                            Some(
+                                (heading_mag + sign * turn.abs().min(BUG_ENTRY_LEAD_DEG))
+                                    .round()
+                                    .rem_euclid(360.0),
+                            )
+                        }
+                    } else {
+                        None
+                    }
+                }
+                HeadingTurn::Entry { sign } => {
+                    if bank_deg.abs() > BUG_TURN_BANK_DEG && bank_deg.signum() != sign {
+                        self.turn = HeadingTurn::Rollout { sign };
+                        Some(heading_mag.round().rem_euclid(360.0))
+                    } else if bank_deg.abs() > BUG_TURN_BANK_DEG && bank_deg.signum() == sign {
+                        self.turn = HeadingTurn::Direct;
+                        Some(want)
+                    } else {
+                        None
+                    }
+                }
+                HeadingTurn::Direct => {
+                    let off = diff(want, self.set.unwrap_or(want)).abs();
+                    (off >= BUG_CORRECT_DEG
+                        && bank_deg.abs() < BUG_LEVEL_BANK_DEG
+                        && now_s - self.last_write_s >= BUG_CORRECT_EVERY_S)
+                        .then_some(want)
+                }
+            }
         };
-        if !write {
-            return None;
-        }
+        let command = command?;
         self.leg = Some(leg);
-        self.set = Some(want);
+        self.set = Some(command);
         self.last_write_s = now_s;
-        Some(want)
+        Some(command)
     }
 
     /// Forget the leg, so the next tick sets its heading afresh (a rejoin).
     pub fn reset(&mut self) {
-        self.leg = None;
-        self.set = None;
+        *self = Self::default();
     }
 }
 
@@ -5225,19 +5292,41 @@ mod tests {
         assert_eq!(h.decide(0, 134.0, 127.0, 8.0, 70.0), None, "a correction waits for level wings");
         assert_eq!(h.decide(0, 134.0, 127.0, 1.0, 71.0), Some(134.0), "drifted 7, level: correct");
         assert_eq!(h.decide(0, 141.0, 134.0, 1.0, 80.0), None, "not twice inside 30 s");
-        assert_eq!(h.decide(1, 250.0, 130.0, 0.0, 81.0), Some(250.0), "the next leg: set at once");
+        assert_eq!(h.decide(1, 250.0, 130.0, 0.0, 81.0), Some(155.0), "a large next leg starts with a 25 degree lead");
     }
 
     #[test]
     fn a_new_heading_against_the_bank_waits_for_the_roll_out() {
         let mut h = HeadingHold::default();
         // Banked 20 right, the new leg is 60 left: setting it now would send
-        // the autopilot round the long way.
-        assert_eq!(h.decide(3, 240.0, 300.0, 20.0, 0.0), None);
-        assert_eq!(h.decide(3, 240.0, 305.0, 2.0, 5.0), Some(240.0), "level: set");
+        // the autopilot round the long way. Capture the present heading, wait
+        // for level wings, then use a 25 degree left entry.
+        assert_eq!(h.decide(3, 240.0, 300.0, 20.0, 0.0), Some(300.0));
+        assert_eq!(h.decide(3, 240.0, 305.0, 2.0, 5.0), None, "not level yet");
+        assert_eq!(h.decide(3, 240.0, 305.0, 0.5, 6.0), Some(280.0), "level: lead left");
+        assert_eq!(h.decide(3, 240.0, 303.0, -4.0, 7.0), Some(240.0), "committed left: set the leg");
         // With the bank, it goes in at once.
         let mut h = HeadingHold::default();
-        assert_eq!(h.decide(3, 340.0, 300.0, 20.0, 0.0), Some(340.0));
+        assert_eq!(h.decide(3, 340.0, 300.0, 20.0, 0.0), Some(325.0));
+    }
+
+    /// EGBB-EGTF 2026-10-01, sortie 1790844668: at TOBID the follower
+    /// jumped the bug from about 190 to 160. The C172 banked right, flew the
+    /// long way through north, and stood down after three `leg_stalled`s.
+    #[test]
+    fn a_wrong_way_enroute_entry_is_neutralised_then_retried_short_way() {
+        let mut h = HeadingHold::default();
+        assert_eq!(h.decide(2, 160.0, 190.0, 0.5, 0.0), Some(165.0), "start 25 left, not at the final bug");
+        assert_eq!(h.decide(2, 160.0, 195.0, 10.0, 1.0), Some(195.0), "wrong-way right bank: capture the nose");
+        assert_eq!(h.decide(2, 160.0, 198.0, 2.0, 2.0), None, "hold the capture until genuinely level");
+        assert_eq!(h.decide(2, 160.0, 198.0, 0.5, 3.0), Some(173.0), "retry with a left lead");
+        assert_eq!(h.decide(2, 160.0, 196.0, -4.0, 4.0), Some(160.0), "only after a left bank, select WOD's heading");
+
+        // Issue #70 was an exact 25-degree right step that banked left. It
+        // gets the same response detection even though no smaller lead exists.
+        let mut h = HeadingHold::default();
+        assert_eq!(h.decide(3, 125.0, 100.0, 0.0, 0.0), Some(125.0));
+        assert_eq!(h.decide(3, 125.0, 97.0, -4.0, 1.0), Some(97.0));
     }
 
     #[tokio::test]

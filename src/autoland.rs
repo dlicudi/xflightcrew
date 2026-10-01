@@ -1808,6 +1808,7 @@ pub fn run_autoland_scoped(
             *TRACKING_ERROR.lock().unwrap_or_else(|e| e.into_inner()) = None;
             let mut last_phase: Option<ApproachPhase> = None;
             let mut flare_power = FlarePower::default();
+            let mut flare_sink_rescue_active = false;
             // The heading knob, set as a pilot sets it (`bug_knob`, issue #93).
             let mut bug_hold = crate::circuit::BugHold::default();
             let knob_t0 = std::time::Instant::now();
@@ -4189,9 +4190,11 @@ pub fn run_autoland_scoped(
                 prev_ias_t = now;
                 if g.phase != ApproachPhase::Flare || missed.is_some() {
                     flare_power.reset();
+                    flare_sink_rescue_active = false;
                 }
                 let mut ballooned = false;
                 let mut power_held = false;
+                let mut sink_rescued = false;
                 let thr = if missed == Some(MissedStage::Climb) {
                     // The balked landing itself is firewall, not a governor
                     // holding approach speed — the LXGB miss flew its last 20
@@ -4268,7 +4271,28 @@ pub fn run_autoland_scoped(
                             ),
                             _ => None, // No measurement: no guessed power and no ramp advance.
                         },
-                        None => Some(0.0),
+                        None => {
+                            // An idle flare can run out of column after it has
+                            // already arrested the approach sink. EGTF 24 in
+                            // the stock 172 (2026-10-01): -69 fpm at 12 ft,
+                            // then 58 -> 53 kt, full elevator and -392 fpm at
+                            // the wheels. Put back only enough power to stop
+                            // that late collapse; never make this a second
+                            // speed governor or a float.
+                            let rescue = flare_sink_rescue_power(
+                                flare_sink_rescue_active,
+                                thr_now,
+                                approach_thr,
+                                vvi,
+                                vvi_trend,
+                                flare_elev,
+                                FlareGains::from_profile(crate::aircraft::flare_elevator()).max,
+                                radio_ft,
+                            );
+                            flare_sink_rescue_active = rescue.is_some();
+                            sink_rescued = rescue.is_some();
+                            rescue.or(Some(0.0))
+                        }
                     }
                 } else {
                     // The target is only as safe as the flaps actually out
@@ -4394,6 +4418,8 @@ pub fn run_autoland_scoped(
                             Some("touched")
                         } else if ballooned {
                             Some("balloon")
+                        } else if sink_rescued {
+                            Some("sink")
                         } else {
                             flare_power.last_key.map(RetardKey::word)
                         })
@@ -6200,6 +6226,57 @@ pub fn balloon_power(
             Some(t.clamp(0.0, 1.0))
         }
         _ => None,
+    }
+}
+
+/// A last-feet safety net for an airframe with the legacy idle flare.
+///
+/// It fires only when the measured sink is already worsening toward a hard
+/// contact and the elevator law is using much of its available pull. Once the
+/// commanded floor is visible on the next tick, it stays while the aircraft
+/// is still sinking, then releases below 75 fpm so it cannot sustain a float.
+/// A declared progressive [`FlarePower`] never comes through this path.
+fn flare_sink_rescue_power(
+    active: bool,
+    measured: Option<f64>,
+    approach: Option<f64>,
+    vvi: Option<f64>,
+    trend_fpm_s: f64,
+    elevator: Option<f64>,
+    elevator_max: f64,
+    radio_ft: f64,
+) -> Option<f64> {
+    const MAX_HEIGHT_FT: f64 = 15.0;
+    const PROJECT_S: f64 = 1.0;
+    const HARD_PROJECTED_FPM: f64 = -250.0;
+    const MIN_SINK_FPM: f64 = -120.0;
+    const RELEASE_SINK_FPM: f64 = -75.0;
+    const MIN_COLUMN_FRACTION: f64 = 0.45;
+    const MIN_POWER: f64 = 0.12;
+    const MAX_POWER: f64 = 0.22;
+
+    let (measured, approach, vvi, elevator) = (measured?, approach?, vvi?, elevator?);
+    if !measured.is_finite()
+        || !approach.is_finite()
+        || !vvi.is_finite()
+        || !trend_fpm_s.is_finite()
+        || !elevator.is_finite()
+        || !elevator_max.is_finite()
+        || elevator_max <= 0.0
+        || !radio_ft.is_finite()
+        || !(0.0..=MAX_HEIGHT_FT).contains(&radio_ft)
+    {
+        return None;
+    }
+    let floor = (approach.clamp(0.0, 1.0) * 0.4).clamp(MIN_POWER, MAX_POWER);
+    let already_on = active && measured >= floor * 0.5;
+    let collapsing = vvi <= MIN_SINK_FPM
+        && vvi + trend_fpm_s * PROJECT_S <= HARD_PROJECTED_FPM
+        && elevator >= elevator_max * MIN_COLUMN_FRACTION;
+    if (collapsing || already_on) && vvi < RELEASE_SINK_FPM {
+        Some(measured.max(floor).min(MAX_POWER))
+    } else {
+        None
     }
 }
 
@@ -8869,6 +8946,98 @@ mod tests {
         let balked = hold_flare(at(high), true, high, 140.0, 25.0);
         assert_eq!(balked.phase, ApproachPhase::Intercept);
         assert_eq!(balked.balk, Some("balloon"));
+    }
+
+    /// EGTF 24, 2026-10-01, stock C172: idle at 22 ft, the flare first
+    /// arrested -230 to -69 fpm, then speed fell 58 -> 53 kt and the sink
+    /// rebuilt to -392 with the elevator at its 0.35 cap.
+    #[test]
+    fn an_idle_c172_flare_gets_bounded_power_before_the_column_runs_out() {
+        let rescue = flare_sink_rescue_power(
+            false,
+            Some(0.0),
+            Some(0.51),
+            Some(-161.0),
+            -132.0,
+            Some(0.163),
+            0.35,
+            8.9,
+        );
+        assert!((rescue.expect("sink rescue") - 0.204).abs() < 1e-9);
+        let rescue = Some(0.204);
+        assert!(
+            (flare_sink_rescue_power(
+                true,
+                rescue,
+                Some(0.51),
+                Some(-180.0),
+                30.0,
+                Some(0.20),
+                0.35,
+                6.0,
+            )
+            .expect("held rescue")
+                - 0.204)
+                .abs()
+                < 1e-9,
+            "a read-back rescue stays while still sinking",
+        );
+        assert_eq!(
+            flare_sink_rescue_power(
+                true,
+                rescue,
+                Some(0.51),
+                Some(-60.0),
+                80.0,
+                Some(0.20),
+                0.35,
+                4.0,
+            ),
+            None,
+            "an arrested sink releases rather than floating"
+        );
+        assert_eq!(
+            flare_sink_rescue_power(
+                false,
+                Some(0.0),
+                Some(0.51),
+                Some(-68.0),
+                -22.0,
+                Some(0.159),
+                0.35,
+                12.2,
+            ),
+            None,
+            "the successful first arrest is left alone"
+        );
+        assert_eq!(
+            flare_sink_rescue_power(
+                false,
+                Some(0.51),
+                Some(0.51),
+                Some(-150.0),
+                20.0,
+                Some(0.16),
+                0.35,
+                10.0,
+            ),
+            None,
+            "a lagging pre-idle readback cannot arm the rescue"
+        );
+        assert_eq!(
+            flare_sink_rescue_power(
+                false,
+                Some(0.0),
+                Some(0.51),
+                Some(-300.0),
+                -100.0,
+                Some(0.30),
+                0.35,
+                16.0,
+            ),
+            None,
+            "not a general approach power law"
+        );
     }
 
     /// ETND 26, 2026-09-23: 1,244 m of runway, the SF50 flaring at 32 ft and
