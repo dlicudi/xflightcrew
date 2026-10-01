@@ -572,79 +572,124 @@ async fn fly(
     // --- Phase two: the taxi-in proper, from wherever phase one left us. ---
     // Ask the tower for the taxi-in unless we already hold a stand clearance.
     if !stand_route_ready() {
-        let Some(khz) = crate::party_line::home_tower_khz() else {
-            // No simulated tower: real/external ATC owns the clearance.
-            announce(
-                &voice,
-                Priority::Advisory,
-                "Call the tower for your taxi-in, then say taxi to parking.",
-            );
-            arrest_release();
-            return;
-        };
-        // The crew radio only reaches the tuned station — tune the tower first.
-        let _ = xp.set_float(COM1_FREQ_KHZ, khz as f64).await;
-        let callsign = crate::circuit::crew_callsign(&xp).await;
-        crate::circuit::transmit(crate::circuit::radio_call(&callsign, "taxi to parking"));
-        crate::blackbox::record("taxi_in", json!({ "event": "request", "khz": khz }));
-        // Wait for the tower to plan and publish the stand route (~60 s, to
-        // outlast a busy frequency working other traffic). Watching where we
-        // are meanwhile: a route the tower plans for an aircraft that was
-        // moved while it waited is not ours to drive.
-        let mut got = false;
-        let mut last = position(&xp).await.map(|p| (p, std::time::Instant::now()));
-        for _ in 0..120 {
-            if cancelled(gen) && end_cancelled(&xp, &voice, valve, "request").await {
+        if let Some(khz) = crate::party_line::home_tower_khz() {
+            // The crew radio only reaches the tuned station — tune the tower first.
+            let _ = xp.set_float(COM1_FREQ_KHZ, khz as f64).await;
+            let callsign = crate::circuit::crew_callsign(&xp).await;
+            crate::circuit::transmit(crate::circuit::radio_call(&callsign, "taxi to parking"));
+            crate::blackbox::record("taxi_in", json!({ "event": "request", "khz": khz }));
+            // Wait for the tower to plan and publish the stand route (~60 s, to
+            // outlast a busy frequency working other traffic). Watching where we
+            // are meanwhile: a route the tower plans for an aircraft that was
+            // moved while it waited is not ours to drive.
+            let mut got = false;
+            let mut last = position(&xp).await.map(|p| (p, std::time::Instant::now()));
+            for _ in 0..120 {
+                if cancelled(gen) && end_cancelled(&xp, &voice, valve, "request").await {
+                    return;
+                }
+                if stand_route_ready() {
+                    got = true;
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                if let Some(now) = position(&xp).await {
+                    let t = std::time::Instant::now();
+                    if let Some((from, t0)) = last {
+                        if let Some(jump_m) = crate::autotaxi::relocation_jump_m(
+                            from,
+                            now,
+                            t.duration_since(t0).as_secs_f64(),
+                        ) {
+                            crate::blackbox::record(
+                                "taxi_in",
+                                json!({ "event": "request_relocated", "jump_m": jump_m }),
+                            );
+                            stand_down_relocated(&voice, "request", false);
+                            return;
+                        }
+                    }
+                    last = Some((now, t));
+                }
+            }
+            if !got {
+                let cleared = crate::party_line::taxi_to_stand();
+                let (line, why) = if cleared {
+                    (
+                        "The tower cleared us to parking but sent no route. Your aircraft.",
+                        "no_route",
+                    )
+                } else {
+                    (
+                        "No taxi-in clearance came back. Your aircraft.",
+                        "no_clearance",
+                    )
+                };
+                announce(&voice, Priority::Caution, line);
+                crate::blackbox::record("taxi_in", json!({ "event": why, "cleared": cleared }));
+                arrest_release();
                 return;
             }
-            if stand_route_ready() {
-                got = true;
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-            if let Some(now) = position(&xp).await {
-                let t = std::time::Instant::now();
-                if let Some((from, t0)) = last {
-                    if let Some(jump_m) = crate::autotaxi::relocation_jump_m(
-                        from,
-                        now,
-                        t.duration_since(t0).as_secs_f64(),
-                    ) {
+        } else {
+            if crate::party_line::uncontrolled_arrival() {
+                // No controller exists here: plan the same stand route the
+                // tower would have published, but mark it as the crew's own.
+                // The apt.dat scan is blocking and stays off this runtime.
+                let (lat, lon, psi) = match (
+                    xp.get_float(crate::autotaxi::LAT).await,
+                    xp.get_float(crate::autotaxi::LON).await,
+                    xp.get_float(PSI_TRUE).await,
+                ) {
+                    (Ok(lat), Ok(lon), Ok(psi)) => (lat, lon, Some(psi)),
+                    (Ok(lat), Ok(lon), Err(_)) => (lat, lon, None),
+                    _ => {
+                        announce(&voice, Priority::Caution, "I can't place us on the field, so the taxi is yours.");
+                        arrest_release();
+                        return;
+                    }
+                };
+                let apt = config.apt_data_path.clone();
+                match tokio::task::spawn_blocking(move || {
+                    crate::party_line::plan_self_taxi_to_stand(&apt, lat, lon, psi)
+                })
+                .await
+                .ok()
+                .and_then(Result::ok)
+                {
+                    Some(route) => {
+                        announce(
+                            &voice,
+                            Priority::Advisory,
+                            &format!("Uncontrolled field. Taxiing ourselves to {}.", route.stand),
+                        );
                         crate::blackbox::record(
                             "taxi_in",
-                            json!({ "event": "request_relocated", "jump_m": jump_m }),
+                            json!({ "event": "self_taxi", "field": route.field,
+                                    "stand": route.stand, "via": route.via }),
                         );
-                        stand_down_relocated(&voice, "request", false);
+                    }
+                    None => {
+                        announce(&voice, Priority::Caution, "I can't find a route to parking, so the taxi is yours.");
+                        arrest_release();
                         return;
                     }
                 }
-                last = Some((now, t));
-            }
-        }
-        if !got {
-            // Say WHICH of the two failed. The tower sets `taxi_to_stand` on
-            // its reply and publishes the route separately, so a cleared
-            // aircraft with no route is a different fault from a silent
-            // frequency — and announcing "no clearance came back" when the
-            // clearance plainly did came out as a flat contradiction of what
-            // the pilot had just heard (EGHI 2026-07-30: "taxi to parking,
-            // this frequency", then sixty seconds of nothing, then that).
-            let cleared = crate::party_line::taxi_to_stand();
-            let (line, why) = if cleared {
-                (
-                    "The tower cleared us to parking but sent no route. Your aircraft.",
-                    "no_route",
-                )
             } else {
-                (
-                    "No taxi-in clearance came back. Your aircraft.",
-                    "no_clearance",
-                )
-            };
-            announce(&voice, Priority::Caution, line);
-            crate::blackbox::record("taxi_in", json!({ "event": why, "cleared": cleared }));
-            arrest_release();
-            return;
+                // No simulated tower: real/external ATC owns the clearance.
+                announce(
+                    &voice,
+                    Priority::Advisory,
+                    "Call the tower for your taxi-in, then say taxi to parking.",
+                );
+                arrest_release();
+                return;
+            }
+            // The uncontrolled branch published a stand route; continue to
+            // the ordinary drive below without a radio request.
+            if !stand_route_ready() {
+                arrest_release();
+                return;
+            }
         }
     }
 

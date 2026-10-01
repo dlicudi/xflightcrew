@@ -3561,7 +3561,7 @@ async fn fly_route(
             .flatten()
             .and_then(|a| {
                 let (lat, lon) = a.position()?;
-                let khz = a.freq(crate::nav::FREQ_TOWER)?.khz;
+                let khz = a.staffed_tower()?.khz;
                 Some((lat, lon, khz))
             });
     let mut arrival = ArrivalRepick::of(route, &crate::tools::autoland::apt_dat_path());
@@ -3599,6 +3599,26 @@ async fn fly_route(
         return;
     }
     event("enroute_complete", json!({}));
+    // The installed airport data has no staffed tower at the destination.
+    // End the last radar service HERE, at the enroute/arrival seam: leaving
+    // its station live made Cardiff answer Swansea's inbound call, assign its
+    // own runway 30, and block taxi-in waiting for a clearance that could not
+    // exist (EGTF-EGFH, 2026-10-01, #210).
+    if dest_tower.is_none() && crate::mode::atc_enabled() {
+        crate::station::begin_uncontrolled_arrival(&route.dest_icao);
+        event(
+            "uncontrolled_arrival",
+            json!({ "destination": route.dest_icao, "why": "no_staffed_tower" }),
+        );
+        announce(
+            voice,
+            Priority::Advisory,
+            &format!(
+                "{} has no tower in the scenery data. Radar service terminated; continuing as an uncontrolled arrival.",
+                route.dest_icao
+            ),
+        );
+    }
     // Whatever the cruise did with them, the signs are on for the arrival (a
     // short sector never crossed ten thousand; nothing pressed when already on).
     let _ = crate::tools::signs::set(xp, true).await;
@@ -3722,7 +3742,7 @@ async fn fly_route(
     // with COM1 already on the destination's frequency the handoff finds us
     // listening.
     let mut inbound_owed: Option<i64> = None;
-    if let Some(khz) = built.tower_khz.or_else(crate::party_line::home_tower_khz) {
+    if let Some(khz) = built.tower_khz {
         let _ = xp.set_float(COM1_FREQ_KHZ, khz as f64).await;
         // You call it, you get it - for the crew's own retune as much as the
         // pilot's. The enroute region weighs a field by its published
@@ -4713,6 +4733,7 @@ pub fn inbound_on_frequency(com1_khz: Option<i64>, tower_khz: i64) -> bool {
 /// region's ordinary nearest-field handoffs resume for the next flight.
 pub fn release_arrival_station() {
     crate::station::pin_arrival_station(None);
+    crate::station::end_arrival();
 }
 
 /// The wind the arrival picks its runway by, and where it came from: the
@@ -4760,7 +4781,7 @@ fn build_arrival(
             overruled: None,
         };
     };
-    let tower_khz = airport.freq(crate::nav::FREQ_TOWER).map(|f| f.khz);
+    let tower_khz = airport.staffed_tower().map(|f| f.khz);
     let mountain_msa_ft = crate::nav::airport_msa_ft(&msa_path_for(fixp), dest)
         .filter(|m| mountain_field(Some(*m), airport.elev_ft));
     // The tower's runway when it has named one (no fallback to another end:
@@ -9316,6 +9337,8 @@ mod tests {
         let mut f = std::fs::File::create(&apt).unwrap();
         writeln!(f, "1 11 0 0 LXGB Gibraltar").unwrap();
         writeln!(f, "100 46 0 0 0 0 0 0 09 36.1509000 -5.3581000 0 0 0 0 0 0 27 36.1515000 -5.3412000 0 0 0 0 0 0").unwrap();
+        // A nominal/unnamed tower row does not make this a staffed field.
+        writeln!(f, "1054 130125 unnamed entity").unwrap();
         f.flush().unwrap();
         let fix = dir.join("earth_fix.dat");
         let mut f = std::fs::File::create(&fix).unwrap();
@@ -9336,6 +9359,7 @@ mod tests {
         let a = build(Some((90.0, 8.0)), Some("27"));
         assert_eq!((a.rwy_id.as_deref(), a.overruled), (Some("27"), None));
         assert!(a.plan.is_some(), "the straight-in to 27");
+        assert_eq!(a.tower_khz, None, "no invented controller");
         // Fifteen knots of it is past an approach's limit: overruled, said.
         let a = build(Some((90.0, 15.0)), Some("27"));
         assert_eq!((a.rwy_id.as_deref(), a.overruled), (Some("09"), Some("tailwind")));

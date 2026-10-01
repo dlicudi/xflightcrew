@@ -12533,3 +12533,21 @@ releases so neither a lagging pre-idle readback nor the rescue can manufacture a
 measurements, a good initial arrest, higher flight and
 every airframe with its own progressive flare power stay on their existing paths. Blackbox
 `power.retard` says `sink`. The recorded -161/-132 fpm/s/0.163 elevator tick is the regression.
+
+## 2026-10-01: an untowered EGFH arrival kept Cardiff's controller (#210)
+
+C172 EGTF-EGFH, parked and shut down after the sortie. The installed EGFH airport block has no
+staffed comm rows, but full auto's arrival used `home_tower_khz` when its destination lookup found
+no tower. Cardiff therefore answered the EGFH inbound call, assigned Cardiff runway 30 while the
+aircraft landed EGFH 22, and taxi-in waited for a tower clearance that could never exist. Cardiff
+only fell out of ground range after landing; later calls went to the void.
+
+The enroute/arrival seam now explicitly terminates simulated radar service when the destination has
+no `staffed_tower`: it clears the previous controller's clearance, code, handoffs, vectors and
+landing watches, suppresses region switching and every reactive station surface for that arrival,
+and never falls back to the previous field's tower frequency. Arrival construction uses
+`staffed_tower`, not merely a nominal tower-frequency row. After landing, taxi-in plans and
+publishes its own route to a stand from the destination's taxi network, then uses the ordinary
+taxi and securing path. The state clears on arrival release, station install/uninstall and every
+new flight. `uncontrolled_arrival_retires_the_previous_controller` pins the service boundary; all
+260 active ATC tests pass. Live EGFH confirmation is still owed.

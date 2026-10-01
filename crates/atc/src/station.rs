@@ -9,6 +9,7 @@
 //! Compiler-enforced: the sim handle here is `SimView`, a read-only view
 //! with no `set_*`/`run_command` on it at all.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use std::time::Instant;
 
@@ -344,6 +345,7 @@ impl Station {
     pub fn install(&self) {
         // A new station starts in reach; the next monitor tick judges it.
         OUT_OF_REACH.store(false, std::sync::atomic::Ordering::Relaxed);
+        UNCONTROLLED_ARRIVAL.store(false, Ordering::SeqCst);
         // ...and is the new flight's station: its replies publish again.
         NEW_FLIGHT_PENDING.store(false, std::sync::atomic::Ordering::SeqCst);
         *ACTIVE_FIELD.lock().unwrap_or_else(|e| e.into_inner()) = self
@@ -442,6 +444,7 @@ impl Station {
         *ACTIVE_FIELD.lock().unwrap_or_else(|e| e.into_inner()) = None;
         *CONTROLLER_FREQS.lock().unwrap_or_else(|e| e.into_inner()) = Vec::new();
         OUT_OF_REACH.store(false, std::sync::atomic::Ordering::Relaxed);
+        UNCONTROLLED_ARRIVAL.store(false, Ordering::SeqCst);
         *SELF_TAXI.lock().unwrap_or_else(|e| e.into_inner()) = None;
         *ACTIVE_PANEL.lock().unwrap_or_else(|e| e.into_inner()) = None;
         *ACTIVE_RUNWAYS.lock().unwrap_or_else(|e| e.into_inner()) = Vec::new();
@@ -767,7 +770,7 @@ impl Station {
         // A field beyond reach hears nothing, whatever is tuned: Gibraltar
         // cleared a 172 parked at LILB, 1,000 nm away, and handed it a taxi
         // route to its own runway 09 (2026-09-25).
-        if out_of_reach() {
+        if station_unavailable() {
             return None;
         }
         let com1 = xp.get_float(datarefs::COM1_FREQ_KHZ).await.ok()?.round() as i64;
@@ -3009,7 +3012,7 @@ pub fn compliance_tick_facing(
     now: Instant,
     heading_true: Option<f64>,
 ) -> Option<ComplianceCall> {
-    if out_of_reach() {
+    if station_unavailable() {
         return None;
     }
     let (field_lat, field_lon) = {
@@ -3480,7 +3483,7 @@ pub fn atis_retune(com1_khz: i64, lat: f64, lon: f64, alt_msl_ft: f64) {
 /// Cuts a new edition — advancing the letter — when the weather has genuinely
 /// moved (see `atis::new_edition`).
 pub fn atis_tick(com1_khz: i64, wx: &AtisWx, now: Instant) -> Option<String> {
-    if out_of_reach() {
+    if station_unavailable() {
         return None;
     }
     let mut guard = ATIS.lock().unwrap_or_else(|e| e.into_inner());
@@ -3669,6 +3672,9 @@ fn region_services(apt: &nav::AirportInfo) -> usize {
 const SERVICE_BIAS_NM: f64 = 3.0;
 
 pub fn region_tick(lat: f64, lon: f64, on_ground: bool, now: Instant) -> Option<RegionSwitch> {
+    if uncontrolled_arrival() {
+        return None;
+    }
     if PENDING_STATION
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -4009,6 +4015,59 @@ pub fn pin_arrival_station(tower_khz: Option<i64>) {
     *ARRIVAL_PIN.lock().unwrap_or_else(|e| e.into_inner()) = tower_khz;
 }
 
+/// The filed destination has no staffed tower in the installed airport data.
+/// The last radar unit remains installed for the region, but it no longer
+/// works this flight: it must not answer the destination's inbound/final calls
+/// or make its clearances look applicable at another field.
+static UNCONTROLLED_ARRIVAL: AtomicBool = AtomicBool::new(false);
+
+/// End radar service for an arrival to a field with no staffed tower.
+/// Idempotent: the enroute/arrival seam may be retried, but the retirement is
+/// one transition and never an invented station for the destination.
+pub fn begin_uncontrolled_arrival(destination: &str) {
+    if UNCONTROLLED_ARRIVAL.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    *ARRIVAL_PIN.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    *PENDING_STATION.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    *REGION_HANDOFF.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    *DEPARTURE_HANDOFF.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    *CLEARANCE.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    *ASSIGNED_SQUAWK.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    *IFR_CLEARANCE.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    *IFR_FLIGHT.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    *SQUAWK_WATCH.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    *SQUAWK_NUDGE.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    *VECTORS.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    *LANDING_HANDOFF.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    *LANDING_HOLD.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    *PENDING_LANDING_RELEASE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = None;
+    *TAXI_ROUTE.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    *TAXI_TO_STAND.lock().unwrap_or_else(|e| e.into_inner()) = false;
+    *SELF_TAXI.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    tracing::info!(%destination, "radar service ended for uncontrolled arrival");
+    sim::blackbox::record(
+        "atc",
+        serde_json::json!({
+            "event": "uncontrolled_arrival",
+            "destination": destination,
+            "why": "no_staffed_tower",
+        }),
+    );
+}
+
+pub(crate) fn uncontrolled_arrival() -> bool {
+    UNCONTROLLED_ARRIVAL.load(Ordering::SeqCst)
+}
+
+/// Release the arrival-only service suppression. The next region tick may use
+/// the installed station normally again; a new station install also clears it.
+pub fn end_arrival() {
+    UNCONTROLLED_ARRIVAL.store(false, Ordering::SeqCst);
+}
+
 /// The pinned arrival field's tower frequency, if the crew has committed to
 /// one. Crate-internal: the crew sets the pin, the region reads it.
 fn arrival_pin_khz() -> Option<i64> {
@@ -4083,6 +4142,7 @@ fn publish_clearance(snap: ClearanceSnap) {
 /// old station, still answering, publishes nothing.
 pub fn retire_for_new_flight() {
     NEW_FLIGHT_PENDING.store(true, std::sync::atomic::Ordering::SeqCst);
+    UNCONTROLLED_ARRIVAL.store(false, Ordering::SeqCst);
     *CLEARANCE.lock().unwrap_or_else(|e| e.into_inner()) = None;
     *LANDING_HANDOFF.lock().unwrap_or_else(|e| e.into_inner()) = None;
     *VECTORS.lock().unwrap_or_else(|e| e.into_inner()) = None;
@@ -4364,6 +4424,10 @@ pub(crate) fn out_of_reach() -> bool {
     OUT_OF_REACH.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+pub(crate) fn station_unavailable() -> bool {
+    out_of_reach() || uncontrolled_arrival()
+}
+
 /// The world's view of where the aircraft is, once per monitor tick. On the
 /// ground beyond [`GROUND_REACH_NM`] of the station's field the station goes
 /// silent, and what it had issued is retired: a clearance from a field we
@@ -4474,6 +4538,61 @@ pub struct SelfTaxi {
     pub via: String,
     /// Runways crossed on the way, spoken idents.
     pub crossings: Vec<String>,
+}
+
+/// The crew's own route to parking at an uncontrolled arrival field.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SelfTaxiStand {
+    pub field: String,
+    pub stand: String,
+    pub via: String,
+}
+
+/// Plan and publish a stand route without a controller. This is the arrival
+/// mirror of [`plan_self_taxi`]: the field is resolved from the pavement under
+/// the aircraft, and the route is published as taxi-to-stand so the ordinary
+/// taxi-in drive and securing checks consume it unchanged.
+pub fn plan_self_taxi_to_stand(
+    apt_path: &str,
+    lat: f64,
+    lon: f64,
+    psi_true: Option<f64>,
+) -> Result<SelfTaxiStand, String> {
+    let (icao, apt) = field_at(apt_path, lat, lon).ok_or_else(|| {
+        "I can't tell which field we're at, so the taxi is yours.".to_string()
+    })?;
+    let net = nav::find_taxi_net(apt_path, &icao)
+        .ok()
+        .flatten()
+        .ok_or_else(|| format!("{icao} has no taxiways drawn, so the taxi is yours."))?;
+    let mut plan = stand_route_on(&net, &apt.runways, lat, lon, psi_true)
+        .filter(|p| p.path.len() >= 2)
+        .ok_or_else(|| format!("I can't find a taxi route to parking at {icao}."))?;
+    let stand = plan.holding_point.clone();
+    let raw_via = plan.via.join(", ");
+    let named: Vec<String> = plan.via.iter().filter(|n| designator(n)).cloned().collect();
+    let via = spoken_via(&named).join(", ");
+    plan.seg = plan
+        .seg
+        .into_iter()
+        .map(|(n, rwy)| (if rwy || designator(&n) { n } else { String::new() }, rwy))
+        .collect();
+    *TAXI_ROUTE.lock().unwrap_or_else(|e| e.into_inner()) = Some(TaxiWatch {
+        path: plan.path,
+        via: via.clone(),
+        seg: plan.seg,
+        holding_point: stand.clone(),
+        lead_on: plan.lead_on,
+    });
+    *TAXI_TO_STAND.lock().unwrap_or_else(|e| e.into_inner()) = true;
+    *SELF_TAXI.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    sim::blackbox::record(
+        "atc",
+        serde_json::json!({
+            "route": "self_taxi_in", "field": icao, "stand": stand, "via": raw_via,
+        }),
+    );
+    Ok(SelfTaxiStand { field: apt.name, stand, via })
 }
 
 /// Plan the crew's own taxi at an uncontrolled field (no tower, or none in
@@ -5678,7 +5797,7 @@ pub fn chatter_tick(
     blocked_ident: Option<&str>,
     now: Instant,
 ) -> Option<PartyExchange> {
-    if out_of_reach() {
+    if station_unavailable() {
         return None;
     }
     // Read before the ghost memory's lock: our own clearance's claim.
@@ -6750,7 +6869,7 @@ pub struct LandingHold {
 pub fn landing_hold_tick(targets: &[TcasTarget], on_ground: bool, now: Instant) -> Option<String> {
     let mut guard = LANDING_HOLD.lock().unwrap_or_else(|e| e.into_inner());
     let hold = guard.as_ref()?;
-    if on_ground || out_of_reach() {
+    if on_ground || station_unavailable() {
         *guard = None;
         return None;
     }
@@ -7086,7 +7205,7 @@ pub fn takeoff_hold_tick_from(
     own: Option<(f64, f64)>,
     now: Instant,
 ) -> Option<String> {
-    if out_of_reach() {
+    if station_unavailable() {
         return None;
     }
     // The standing clocks the stale-ghost rule reads (idempotent per tick).
@@ -13055,6 +13174,37 @@ mod tests {
             }],
         };
         assert!(apt.staffed_tower().is_some());
+    }
+
+    /// EGFH 2026-10-01: Cardiff remained the active regional station and
+    /// answered an inbound call for an untowered destination, clearing its
+    /// own runway 30 while the aircraft landed EGFH 22. The destination seam
+    /// must retire that authority before any arrival call can be routed.
+    #[test]
+    fn uncontrolled_arrival_retires_the_previous_controller() {
+        let _guard = SIDE_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        *CONTROLLER_FREQS.lock().unwrap() = vec![(133100, StationSpeaker::Tower)];
+        *CLEARANCE.lock().unwrap() = Some(ClearanceSnap {
+            state: tower::State::Inbound,
+            callsign: "N172SP".into(),
+            runway_ident: "30".into(),
+            pending_readback: None,
+            holds_runway: false,
+        });
+        *ASSIGNED_SQUAWK.lock().unwrap() = Some(4503);
+        OUT_OF_REACH.store(false, std::sync::atomic::Ordering::Relaxed);
+
+        assert!(crate::party_line::station_reaches());
+        begin_uncontrolled_arrival("EGFH");
+        assert!(uncontrolled_arrival());
+        assert!(!crate::party_line::station_reaches());
+        assert_eq!(crate::party_line::home_tower_khz(), None);
+        assert!(CLEARANCE.lock().unwrap().is_none());
+        assert!(ASSIGNED_SQUAWK.lock().unwrap().is_none());
+
+        end_arrival();
+        assert!(crate::party_line::station_reaches());
+        *CONTROLLER_FREQS.lock().unwrap() = Vec::new();
     }
 
     /// LILB 2026-09-25: parked in Italy with the Gibraltar station active,

@@ -276,7 +276,7 @@ fn lock<T>(m: &'static Mutex<T>) -> MutexGuard<'static, T> {
 /// calling — the full-auto orchestrator does this before requesting taxi.
 pub fn home_tower_khz() -> Option<i64> {
     // A tower out of reach is no tower to tune (`station::note_aircraft`).
-    if crate::station::out_of_reach() {
+    if crate::station::station_unavailable() {
         return None;
     }
     crate::station::active_tower_khz()
@@ -286,7 +286,23 @@ pub fn home_tower_khz() -> Option<i64> {
 /// reach on the ground. False = the crew departs as from an uncontrolled
 /// field ([`plan_self_taxi`]).
 pub fn station_reaches() -> bool {
-    !crate::station::out_of_reach() && crate::station::active_tower_khz().is_some()
+    !crate::station::station_unavailable() && crate::station::active_tower_khz().is_some()
+}
+
+/// The current destination is explicitly uncontrolled, rather than merely
+/// being beyond the last station's ground range.
+pub fn uncontrolled_arrival() -> bool {
+    crate::station::uncontrolled_arrival()
+}
+
+/// Publish a crew-owned taxi route to a stand at an uncontrolled arrival.
+pub fn plan_self_taxi_to_stand(
+    apt_path: &str,
+    lat: f64,
+    lon: f64,
+    psi_true: Option<f64>,
+) -> Result<crate::station::SelfTaxiStand, String> {
+    crate::station::plan_self_taxi_to_stand(apt_path, lat, lon, psi_true)
 }
 
 /// The crew's own taxi at an uncontrolled field, planned from the field's
