@@ -339,7 +339,17 @@ const PHRASE_MISHEARS: &[(&str, &str)] = &[
     ("load slide plug", "load the flight plan"),
     ("load flag turn", "load the flight plan"),
     ("load the flag can", "load the flight plan"),
+    ("note 5 plan", "load the flight plan"),
     ("low aircraft", "load the aircraft"),
+    ("a little aircraft", "load the aircraft"),
+    ("loaded aircrafts", "load aircraft"),
+    ("loaded aircraft", "load aircraft"),
+    ("loads the aircraft", "load aircraft"),
+    ("low there", "load aircraft"),
+    ("resume flight line", "resume flight plan"),
+    ("engines down", "engines off"),
+    ("engines open", "engines off"),
+    ("engine's open", "engines off"),
     // The ground and the landing.
     ("faxing to parking", "taxi to parking"),
     ("put the aircraft down", "land the aircraft"),
@@ -617,6 +627,14 @@ mod tests {
             ("Low slide plan.", "load the flight plan."),
             ("Load flag turn.", "load the flight plan."),
             ("Low aircraft.", "load the aircraft."),
+            ("A little aircraft.", "load the aircraft."),
+            ("Loaded aircrafts.", "load aircraft."),
+            ("Loads the aircraft.", "load aircraft."),
+            ("Low there, correct?", "load aircraft, correct?"),
+            ("Note 5 plan.", "load the flight plan."),
+            ("Resume flight line.", "resume flight plan."),
+            ("Engines down.", "engines off."),
+            ("Engine's open.", "engines off."),
             ("Faxing to parking.", "taxi to parking."),
             ("Put the aircraft down.", "land the aircraft."),
             ("Retract flaps.", "flaps up."),
@@ -835,7 +853,7 @@ mod tests {
 }
 
 /// A line with the copilot's own coaching of what to SAY cut out, for the
-/// echo memory. "We're already flying, so full auto can't start. Say navigate
+/// echo memory. "We're already airborne, so I can't start the flight from cold. Say navigate
 /// to follow the plan, fly the ILS for the arrival, or land for me." coached
 /// exactly the words the pilot then spoke, and the echo gate rejected
 /// "Navigate to follow the plan" as the copilot's voice bleeding back through
@@ -875,9 +893,9 @@ mod coached_tests {
 
     #[test]
     fn a_coached_phrase_leaves_the_echo_memory() {
-        let line = "We're already flying, so full auto can't start. Say navigate to follow the plan, fly the ILS for the arrival, or land for me.";
+        let line = "We're already airborne, so I can't start the flight from cold. Say navigate to follow the plan, fly the ILS for the arrival, or land for me.";
         let kept = without_coached_phrase(line);
-        assert!(kept.contains("already flying"));
+        assert!(kept.contains("already airborne"));
         assert!(!kept.to_lowercase().contains("navigate"), "{kept}");
         // A plain readback is untouched.
         assert_eq!(without_coached_phrase("Flaps ten, set."), "Flaps ten, set.");

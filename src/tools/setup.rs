@@ -432,7 +432,7 @@ impl Tool for SetUpFlight {
             return Ok("Only when we're stopped on the ground: setting up a flight ends this one.".into());
         }
         if crate::full_auto::ACTIVE.load(std::sync::atomic::Ordering::Relaxed) {
-            return Ok("Full auto is flying. Say my controls first.".into());
+            return Ok("I'm flying. Say my controls first.".into());
         }
         let fp = match super::loading::plan_for_loading(&ctx.config.simbrief_id).await {
             Ok(fp) => fp,
@@ -754,13 +754,13 @@ pub fn pick_runway(
 pub(crate) fn flying_now() -> Option<&'static str> {
     use std::sync::atomic::Ordering::Relaxed;
     [
-        (crate::full_auto::ACTIVE.load(Relaxed), "Full auto"),
-        (crate::autoland::ACTIVE.load(Relaxed), "Autoland"),
-        (crate::circuit::ACTIVE.load(Relaxed), "The circuit"),
-        (crate::procedure::ACTIVE.load(Relaxed), "The route"),
-        (crate::autotakeoff::ACTIVE.load(Relaxed), "The takeoff"),
-        (crate::heli_route::ACTIVE.load(Relaxed), "The helicopter route"),
-        (crate::hover::ACTIVE.load(Relaxed), "The hover"),
+        (crate::autoland::ACTIVE.load(Relaxed), "I'm landing"),
+        (crate::full_auto::ACTIVE.load(Relaxed), "I'm flying"),
+        (crate::circuit::ACTIVE.load(Relaxed), "I'm flying the circuit"),
+        (crate::procedure::ACTIVE.load(Relaxed), "I'm flying the route"),
+        (crate::autotakeoff::ACTIVE.load(Relaxed), "I'm taking off"),
+        (crate::heli_route::ACTIVE.load(Relaxed), "I'm flying the helicopter route"),
+        (crate::hover::ACTIVE.load(Relaxed), "I'm holding the hover"),
     ]
     .into_iter()
     .find_map(|(on, name)| on.then_some(name))
@@ -863,7 +863,7 @@ impl Tool for SetUpApproach {
             return Ok("We're in replay. Go back to live and ask again.".into());
         }
         if let Some(who) = flying_now() {
-            return Ok(format!("{who} is flying. Say my controls first, then ask again."));
+            return Ok(format!("{who}. Say my controls first, then ask again."));
         }
         // The string read is the concrete client's (the tool trait reads numbers).
         let strings = crate::xplane::XPlaneClient::new(ctx.config.xplane_base_url.clone());

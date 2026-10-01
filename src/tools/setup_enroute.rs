@@ -545,7 +545,7 @@ impl Tool for SetUpEnroute {
             return refused("We're in replay. Go back to live and ask again.".into());
         }
         if let Some(who) = super::setup::flying_now() {
-            return refused(format!("{who} is flying. Say my controls first, then ask again."));
+            return refused(format!("{who}. Say my controls first, then ask again."));
         }
         let Some(ap) = self.ap.clone() else {
             return refused("I have no autopilot to hold a start in the air with.".into());

@@ -2779,6 +2779,7 @@ fn parse_one(t: &str) -> Option<ToolCall> {
         return Some(call("autoland", json!({ "cancel": true })));
     }
     if t.contains("land the aircraft")
+        || t == "land aircraft"
         || t.contains("land the plane")
         || t.contains("land us")
         // The bare ask, which is what a pilot actually says: "Let's land."
@@ -3099,6 +3100,7 @@ mod tests {
         );
         // 737 2026-09-17 and A330 2026-09-20.
         assert_eq!(one("Let's land.").unwrap(), ("autoland".into(), json!({})));
+        assert_eq!(one("Land aircraft.").unwrap(), ("autoland".into(), json!({})));
         assert_eq!(
             one("Let's land right now.").unwrap(),
             ("autoland".into(), json!({}))

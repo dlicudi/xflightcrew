@@ -77,9 +77,9 @@ impl Tool for Autoland {
         let a: Args = serde_json::from_value(args.clone()).unwrap_or_default();
         if a.cancel {
             return Ok(if crate::autoland::abort() {
-                "Autoland cancelled. You have the aircraft.".to_string()
+                "Landing cancelled. You have the aircraft.".to_string()
             } else {
-                "No autoland running.".to_string()
+                "I'm not landing the aircraft.".to_string()
             });
         }
         // A replay can't be flown: the position it would arm against is a
@@ -102,8 +102,7 @@ impl Tool for Autoland {
         // An autoland already flying keeps flying.
         if crate::autoland::ACTIVE.load(std::sync::atomic::Ordering::SeqCst) {
             return Ok(
-                "Autoland is already flying the approach. Say 'cancel autoland' \
-                       first if you want me to start over."
+                "I'm already landing. Say 'my controls' first if you want me to start over."
                     .to_string(),
             );
         }
@@ -117,10 +116,8 @@ impl Tool for Autoland {
             ctx.status.cloned(),
             None,
         );
-        Ok(
-            "Roger, autoland. Searching for the nearest runway, then flying \
-            the approach. Say 'my controls' to take it back."
-                .to_string(),
-        )
+        Ok("I will land. Searching for the nearest runway, then I'll fly the approach. \
+            Say 'my controls' to take it back."
+            .to_string())
     }
 }

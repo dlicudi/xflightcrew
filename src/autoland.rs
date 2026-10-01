@@ -1680,7 +1680,7 @@ pub fn run_autoland_scoped(
                 armed_runway_why(forced_rwy.as_ref().map(|p| p.id.as_str()), &rwy.id, from_clearance),
             );
             announce(
-                format!("Autoland to {} runway {}, {:.0} miles. Flying the approach.", rwy.icao, rwy.id, rwy.dist_nm),
+                format!("I'll land at {} runway {}, {:.0} miles. I have the approach.", rwy.icao, rwy.id, rwy.dist_nm),
                 Priority::Warning,
             );
             // The runway's ILS on NAV1 for every landing that has one: the

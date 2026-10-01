@@ -2003,7 +2003,7 @@ async fn fly(xp: XPlaneClient, config: Config, voice: Option<Voice>, tools: SubT
             &xp,
             tools.taxi.park_brake_valve_set,
             &voice,
-            "Full auto needs confirmed ground contact. Say navigate to follow the plan, fly the ILS, or land for me when airborne.",
+            "I need confirmed ground contact to start the whole flight. Say navigate to follow the plan, fly the ILS, or land for me when airborne.",
             "ground_unconfirmed",
         )
         .await;
@@ -2053,7 +2053,7 @@ async fn fly(xp: XPlaneClient, config: Config, voice: Option<Voice>, tools: SubT
                 &xp,
                 tools.taxi.park_brake_valve_set,
                 &voice,
-                "I don't have an engine start for this aircraft. Get the engines running and say full auto again.",
+                "I don't have an engine start for this aircraft. Get the engines running, then ask me to fly again.",
                 "no_start_sequence",
             )
             .await;
@@ -2169,7 +2169,7 @@ async fn fly(xp: XPlaneClient, config: Config, voice: Option<Voice>, tools: SubT
                 &xp,
                 tools.taxi.park_brake_valve_set,
                 &voice,
-                "The engine didn't catch. Full auto is off, your aircraft.",
+                "The engine didn't catch. I've stopped. Your aircraft.",
                 "no_engine",
             )
             .await;
@@ -2539,7 +2539,7 @@ async fn fly(xp: XPlaneClient, config: Config, voice: Option<Voice>, tools: SubT
                     &xp,
                     tools.taxi.park_brake_valve_set,
                     &voice,
-                    "No taxi clearance came back. Tune the tower and request taxi, then say full auto again.",
+                    "No taxi clearance came back. Tune the tower and request taxi, then ask me to continue the flight.",
                     "no_taxi_clearance",
                 )
                 .await;
@@ -3284,9 +3284,9 @@ async fn fly(xp: XPlaneClient, config: Config, voice: Option<Voice>, tools: SubT
                 // A recovery holding the aircraft is never "your aircraft"
                 // (#181: the autopilot with no pitch).
                 let line = if crate::tools::recover::ACTIVE.load(SeqCst) {
-                    "Full auto is off. I have the aircraft until you say my controls."
+                    "The flight is cancelled. I have the aircraft until you say my controls."
                 } else {
-                    "Full auto is off. Your aircraft."
+                    "The flight is cancelled. Your aircraft."
                 };
                 let reason = match crate::circuit::stood_down() {
                     Some(crate::circuit::TERRAIN_REFUSED) => crate::circuit::TERRAIN_REFUSED,
@@ -4348,7 +4348,7 @@ async fn hold_airborne_end(xp: &XPlaneClient, base_url: &str, voice: &Option<Voi
         announce(
             voice,
             Priority::Warning,
-            "Full auto is off. I have the aircraft until you say my controls.",
+            "The flight is cancelled. I have the aircraft until you say my controls.",
         );
     };
     if crate::tools::recover::ACTIVE.load(SeqCst) {
@@ -4356,7 +4356,7 @@ async fn hold_airborne_end(xp: &XPlaneClient, base_url: &str, voice: &Option<Voi
         announce(
             voice,
             Priority::Warning,
-            "Full auto is off. I have the aircraft until you say my controls.",
+            "The flight is cancelled. I have the aircraft until you say my controls.",
         );
         return;
     }
@@ -4424,7 +4424,7 @@ pub(crate) fn airborne_end_line(hdg_mag: Option<f64>, alt_ft: Option<f64>) -> St
     });
     let alt = alt_ft.map(|a| format!(" at {:.0} feet", (a / 100.0).round() * 100.0));
     format!(
-        "Full auto is off. The autopilot is holding{}{}, level. Your aircraft.",
+        "I've stopped flying. The autopilot is holding{}{}, level. Your aircraft.",
         hdg.unwrap_or_default(),
         alt.unwrap_or_default()
     )
@@ -8121,7 +8121,7 @@ mod tests {
         let l = super::airborne_end_line(Some(131.6), Some(2_048.0));
         assert_eq!(
             l,
-            "Full auto is off. The autopilot is holding heading 132 at 2000 feet, level. \
+            "I've stopped flying. The autopilot is holding heading 132 at 2000 feet, level. \
              Your aircraft."
         );
         assert!(super::airborne_end_line(Some(0.2), None).contains("heading 360,"));

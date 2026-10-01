@@ -124,7 +124,7 @@ impl Landing {
             ));
         }
         if self.automated {
-            line.push_str(" Autoland flew the final.");
+            line.push_str(" I flew the final.");
         }
         if self.interrupted {
             line.push_str(" Flight automation was interrupted earlier.");

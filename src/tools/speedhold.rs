@@ -890,7 +890,7 @@ impl Tool for HoldSpeed {
             }
             if crate::autoland::ACTIVE.load(Ordering::Relaxed) {
                 return Ok(
-                    "The autoland has the throttle. Say cancel autoland if you want the speed."
+                    "I'm landing and have the throttle. Say my controls if you want the speed."
                         .to_string(),
                 );
             }

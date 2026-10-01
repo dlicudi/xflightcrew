@@ -97,9 +97,7 @@ fn arm_plan(
     verdict: ArmVerdict,
 ) -> ArmPlan {
     if let Some(who) = automation {
-        return ArmPlan::Not(format!(
-            "{who} is flying the approach, tuned for the cross-check."
-        ));
+        return ArmPlan::Not(format!("{who}. The ILS is tuned for the cross-check."));
     }
     if on_ground {
         return ArmPlan::Not("Approach mode stays off on the ground.".to_string());
@@ -127,10 +125,10 @@ fn arm_plan(
 fn automation_flying() -> Option<&'static str> {
     use std::sync::atomic::Ordering::Relaxed;
     [
-        (crate::autoland::ACTIVE.load(Relaxed), "Autoland"),
-        (crate::procedure::ACTIVE.load(Relaxed), "The follower"),
-        (crate::circuit::ACTIVE.load(Relaxed), "The circuit"),
-        (crate::full_auto::ACTIVE.load(Relaxed), "Full auto"),
+        (crate::autoland::ACTIVE.load(Relaxed), "I'm landing"),
+        (crate::procedure::ACTIVE.load(Relaxed), "I'm flying the approach"),
+        (crate::circuit::ACTIVE.load(Relaxed), "I'm flying the circuit"),
+        (crate::full_auto::ACTIVE.load(Relaxed), "I'm flying"),
     ]
     .into_iter()
     .find_map(|(on, who)| on.then_some(who))

@@ -537,9 +537,9 @@ impl Tool for FullAuto {
         crate::full_auto::RUNWAY_WAIVER_PENDING.store(false, std::sync::atomic::Ordering::SeqCst);
         if a.off {
             return Ok(if crate::full_auto::abort() {
-                "Full auto cancelled. You have the aircraft.".to_string()
+                "I've stopped flying. You have the aircraft.".to_string()
             } else {
-                "Full auto isn't running.".to_string()
+                "I'm not flying the aircraft.".to_string()
             });
         }
         // A new flight still loading is no place to start one: every read
@@ -591,7 +591,7 @@ impl Tool for FullAuto {
                     // The arrival is autoland's, as a planned arrival hands it
                     // down: the plan's runway, never a self-pick.
                     if crate::autoland::ACTIVE.load(std::sync::atomic::Ordering::SeqCst) {
-                        return Ok("Autoland is already flying the approach.".to_string());
+                        return Ok("I'm already landing.".to_string());
                     }
                     crate::autoland::ABORT.store(false, std::sync::atomic::Ordering::SeqCst);
                     crate::autoland::run_autoland(
@@ -1127,8 +1127,8 @@ impl FullAuto {
             .is_ok_and(|og| og < 0.5)
         {
             return Err(
-                "We're already flying, so full auto can't start. Say navigate to follow \
-                 the plan, fly the ILS for the arrival, or land for me."
+                "We're already airborne, so I can't start the flight from cold. Say navigate \
+                 to follow the plan, fly the ILS for the arrival, or land for me."
                     .to_string(),
             );
         }
@@ -1805,7 +1805,7 @@ pub fn spoken_arm_line(
     panel: bool,
 ) -> String {
     let mut line = format!(
-        "Full auto, {origin} to {dest}, cruise {}. ",
+        "I'll fly from {origin} to {dest}, cruise {}. ",
         crate::flightplan::spoken_feet(cruise_ft)
     );
     line.push_str(waived.trim());
@@ -1845,9 +1845,9 @@ mod tests {
         // The first arm of a session says how to take it back; the next
         // does not. No caution, no pointer to a brief with nothing in it.
         let l = spoken_arm_line("LIME", "LIPE", 19000.0, "", None, true);
-        assert_eq!(l, "Full auto, LIME to LIPE, cruise 19,000 feet. Cancel or my controls any time.");
+        assert_eq!(l, "I'll fly from LIME to LIPE, cruise 19,000 feet. Cancel or my controls any time.");
         let again = spoken_arm_line("LIME", "LIPE", 19000.0, "", None, true);
-        assert_eq!(again, "Full auto, LIME to LIPE, cruise 19,000 feet.");
+        assert_eq!(again, "I'll fly from LIME to LIPE, cruise 19,000 feet.");
         let w = spoken_arm_line(
             "LILB",
             "LIPK",
