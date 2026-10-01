@@ -7,6 +7,9 @@
 //! Two capture modes (config `listen_mode`): `continuous` (always listening,
 //! VAD-segmented) or `ptt` (push-to-talk).
 
+// The autoland tick's blackbox record is one `json!` past the default 128.
+#![recursion_limit = "256"]
+
 mod aircraft;
 mod answers;
 mod approach_guide;

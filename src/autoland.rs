@@ -2046,6 +2046,11 @@ pub fn run_autoland_scoped(
                 let agl_r = sim::position::field(&pos, |p| p.agl_m);
                 let gs_r = sim::position::field(&pos, |p| p.gs_ms);
                 let psi_r = sim::position::field(&pos, |p| p.psi_true_deg);
+                // The flight model's vertical speed, from the frame the height
+                // came from: the gauge (`vvi`) lags it by about a second, so
+                // the touchdown is scored on this one (#198). Logged only
+                // until each airframe's flare is refitted to it.
+                let vs_fm = sim::position::field(&pos, |p| p.vs_fpm).ok();
                 let pos_source = sim::position::source_word(&pos);
                 let (Ok(lat), Ok(lon), Ok(elev_m), Ok(agl_m), Ok(gs_ms), Ok(var), Ok(ias), Ok(on_ground)) =
                     (lat_r, lon_r, elev_r, agl_r, gs_r, var_r, ias_r, ground_r)
@@ -3878,7 +3883,7 @@ pub fn run_autoland_scoped(
                 crate::blackbox::record("autoland", serde_json::json!({
                     "rwy": format!("{} {}", rwy.icao, rwy.id), "dist": g.dist_nm,
                     "alt": alt, "gp_alt": g.glidepath_alt_ft, "cmd_vs": g.target_vs_fpm,
-                    "vs_dial": vs_dial, "vvi": vvi, "vvi_trend": vvi_trend, "arresting": g.arresting,
+                    "vs_dial": vs_dial, "vvi": vvi, "vs_fm": vs_fm, "vvi_trend": vvi_trend, "arresting": g.arresting,
                     "cmd_hdg": g.target_heading_deg, "ias": ias, "radio": radio_ft,
                     // The wheels, so a first contact the rollout latch never
                     // saw (a bounce) is on the tape: the scorecard judges it.

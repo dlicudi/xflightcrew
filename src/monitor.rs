@@ -139,7 +139,11 @@ pub struct Snapshot {
     /// callout's threshold scales with it.
     pub flap_ratio: f64,
     pub agl_ft: f64,
+    /// The pilot's VSI (`vvi_fpm_pilot`): what the pilot sees, a second late.
     pub vsi_fpm: f64,
+    /// The flight model's vertical speed (`vh_ind_fpm`), `None` when the read
+    /// failed: what the flight model and the touchdown are judged on (#198).
+    pub vs_fpm: Option<f64>,
     /// Elevator/stabilizer trim, -1 (full nose down) .. +1 (full nose up). Used to
     /// catch trim pinned at a limit (out of authority / possible runaway).
     pub elevator_trim: f64,
@@ -325,6 +329,7 @@ impl Snapshot {
             .get_float("sim/cockpit2/gauges/indicators/vvi_fpm_pilot")
             .await
             .ok()?;
+        let vs_fpm = xp.get_float(sim::datarefs::VS_FPM_FLIGHT_MODEL).await.ok();
         // Best-effort (a missing read must not kill the snapshot): the altitude
         // picture for the bust/sink-rate guards.
         let alt_ft = xp
@@ -580,6 +585,7 @@ impl Snapshot {
             flap_ratio,
             agl_ft,
             vsi_fpm,
+            vs_fpm,
             elevator_trim,
             seatbelt_sign,
             tug_attached,
@@ -756,7 +762,7 @@ fn flight_sample(s: &Snapshot, t: f64, crashed: bool) -> crate::flight::Sample {
         on_ground: s.on_ground,
         gs_kts: s.groundspeed_kts,
         ias_kts: s.ias_kts,
-        vsi_fpm: s.vsi_fpm,
+        vsi_fpm: s.vs_fpm.unwrap_or(s.vsi_fpm),
         agl_ft: s.agl_ft,
         alt_ft: s.alt_ft,
         engine_running: s.engine_running,
@@ -4798,7 +4804,7 @@ pub async fn run(
                     "pos": snap.pos_source.map(|s| s.as_str()),
                     "bank": r1(snap.bank_deg), "track": snap.track_deg.map(r1),
                     "ias": r1(snap.ias_kts), "gs": r1(snap.groundspeed_kts),
-                    "vsi": r1(snap.vsi_fpm), "agl": r1(snap.agl_ft),
+                    "vsi": r1(snap.vsi_fpm), "vs": snap.vs_fpm.map(r1), "agl": r1(snap.agl_ft),
                     "ground": snap.on_ground, "flap": snap.flap_ratio,
                     "park": r1(snap.park_brake), "cabin": r1(snap.cabin_altitude_ft),
                     "fuel_kg": snap.fuel_kg, "eng": snap.engine_running,
@@ -5894,6 +5900,7 @@ mod tests {
             flap_ratio: 0.0,
             agl_ft: 0.0,
             vsi_fpm: 0.0,
+            vs_fpm: None,
             elevator_trim: 0.0,
             seatbelt_sign: None,
             tug_attached: false,

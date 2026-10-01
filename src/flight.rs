@@ -316,7 +316,9 @@ impl Sample {
             on_ground: v.get("ground")?.as_bool()?,
             gs_kts: f("gs").unwrap_or(0.0),
             ias_kts: f("ias").unwrap_or(0.0),
-            vsi_fpm: f("vsi").unwrap_or(0.0),
+            // The flight model's vertical speed where the record has it,
+            // the lagging gauge in records from before #198.
+            vsi_fpm: f("vs").or(f("vsi")).unwrap_or(0.0),
             agl_ft: f("agl").unwrap_or(0.0),
             alt_ft: f("alt").unwrap_or(0.0),
             engine_running: v.get("eng").and_then(|x| x.as_bool()).unwrap_or(true),

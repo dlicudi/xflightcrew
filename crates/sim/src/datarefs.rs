@@ -10,6 +10,10 @@
 pub const ALTITUDE_FT: &str = "sim/cockpit2/gauges/indicators/altitude_ft_pilot";
 pub const AIRSPEED_KTS: &str = "sim/cockpit2/gauges/indicators/airspeed_kts_pilot";
 pub const VVI_FPM: &str = "sim/cockpit2/gauges/indicators/vvi_fpm_pilot";
+/// The flight model's own vertical speed, fpm: the gauge above lags it by
+/// about a second (0.6 to 1.0 s measured in flares, #198), so a touchdown's
+/// sink is judged from this one.
+pub const VS_FPM_FLIGHT_MODEL: &str = "sim/flightmodel/position/vh_ind_fpm";
 pub const COMPASS_HEADING_DEG: &str = "sim/cockpit2/gauges/indicators/compass_heading_deg_mag";
 pub const BANK_DEG: &str = "sim/flightmodel/position/true_phi";
 pub const PITCH_DEG: &str = "sim/flightmodel/position/true_theta";

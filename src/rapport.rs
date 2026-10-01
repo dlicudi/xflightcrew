@@ -1356,7 +1356,7 @@ mod tests {
                 on_ground: v["ground"].as_bool().unwrap_or(false),
                 groundspeed_kts: f("gs"),
                 agl_ft: f("agl"),
-                vsi_fpm: f("vsi"),
+                vsi_fpm: if v["vs"].is_number() { f("vs") } else { f("vsi") },
                 ias_kts: f("ias"),
                 lat: f("lat"),
                 lon: f("lon"),

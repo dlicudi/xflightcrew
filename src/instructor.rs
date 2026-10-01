@@ -3309,7 +3309,8 @@ pub fn grade_flight(
                 hdg_deg: f(e, "hdg")?,
                 ias_kts: f(e, "ias")?,
                 bank_deg: f(e, "bank").unwrap_or(0.0),
-                vsi_fpm: f(e, "vsi")?,
+                // The flight model's vertical speed, else the gauge (#198).
+                vsi_fpm: f(e, "vs").or(f(e, "vsi"))?,
                 on_ground: e.get("ground").and_then(Value::as_bool).unwrap_or(true),
                 track_deg: f(e, "track"),
                 gs_kts: f(e, "gs").unwrap_or(0.0),

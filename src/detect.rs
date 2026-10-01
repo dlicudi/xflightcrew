@@ -729,18 +729,18 @@ mod probe_cache_tests {
     #[tokio::test]
     async fn the_probe_fetches_the_indexes_once_per_session() {
         let sim = Sim {
-            datarefs: vec!["sim/a", "sim/b", "xvl/own"],
-            commands: vec!["sim/cmd"],
+            datarefs: vec!["sim/flightmodel/position/latitude", "sim/flightmodel/position/longitude", "xvl/own"],
+            commands: vec!["sim/operation/pause_toggle"],
             ..Default::default()
         };
         let t = Instant::now();
         let mut cache = None;
-        let first = names(&["sim/a", "sim/cmd"]);
+        let first = names(&["sim/flightmodel/position/latitude", "sim/operation/pause_toggle"]);
         assert!(missing_with_cache(&sim, &mut cache, &first, t).await.unwrap().is_empty());
         assert_eq!((sim.dref_dumps.load(SeqCst), sim.cmd_dumps.load(SeqCst)), (1, 1));
 
         // The next airframe: known names cost nothing.
-        let known = names(&["sim/b", "sim/cmd"]);
+        let known = names(&["sim/flightmodel/position/longitude", "sim/operation/pause_toggle"]);
         assert!(missing_with_cache(&sim, &mut cache, &known, t).await.unwrap().is_empty());
         assert_eq!((sim.dref_dumps.load(SeqCst), sim.cmd_dumps.load(SeqCst)), (1, 1));
         assert_eq!(sim.lookups.load(SeqCst), 0);

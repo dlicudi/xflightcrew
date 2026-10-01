@@ -894,7 +894,10 @@ impl Scorer {
 
     /// One autoland guidance tick: the first contact and any bounce after it.
     fn contact_tick(&mut self, r: &Value, t: f64) {
-        let (Some(radio), Some(vvi)) = (f(r, "radio"), f(r, "vvi")) else { return };
+        // The flight model's vertical speed where the tick has it: the gauge
+        // (`vvi`) lags it by about a second, and at the wheels the Evolution's
+        // true sink was about twice the gauge's 392 (#198).
+        let (Some(radio), Some(vvi)) = (f(r, "radio"), f(r, "vs_fm").or(f(r, "vvi"))) else { return };
         let window = crate::instructor::TOUCHDOWN_WINDOW_S;
         self.flare_vvi.push((t, vvi));
         self.flare_vvi.retain(|(tv, _)| t - tv <= window);
@@ -943,7 +946,7 @@ impl Scorer {
             self.airborne_since.get_or_insert(t);
             self.air.push((
                 t,
-                f(r, "vsi").unwrap_or(0.0),
+                f(r, "vs").or(f(r, "vsi")).unwrap_or(0.0),
                 f(r, "hdg").unwrap_or(0.0),
                 f(r, "track"),
             ));
@@ -961,7 +964,7 @@ impl Scorer {
         // kept behind the last AIRBORNE sample reached ~4.4 s back and
         // scored the pre-flare descent, 1790585651: 461 fpm on a 130).
         let recent: Vec<(f64, f64)> = self.air.iter().map(|(ta, v, ..)| (*ta, *v)).collect();
-        let sink = crate::instructor::touchdown_sink_fpm(&recent, t, f(r, "vsi").unwrap_or(0.0))
+        let sink = crate::instructor::touchdown_sink_fpm(&recent, t, f(r, "vs").or(f(r, "vsi")).unwrap_or(0.0))
             .min(0.0)
             .abs();
         let model_td = self

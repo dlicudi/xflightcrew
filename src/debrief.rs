@@ -137,7 +137,7 @@ fn summarise(flight: &[&Value]) -> String {
         let mut recent: Vec<(f64, f64)> = Vec::new();
         for e in &states {
             let g = b(e, "ground").unwrap_or(true);
-            let vsi = f(e, "vsi").unwrap_or(0.0);
+            let vsi = f(e, "vs").or(f(e, "vsi")).unwrap_or(0.0);
             let t = f(e, "t").unwrap_or(0.0);
             if prev_ground == Some(false) && g {
                 out.push_str(&format!(
