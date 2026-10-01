@@ -4461,8 +4461,9 @@ pub fn run_autoland_scoped(
                 }
                 // Go-around flap: half, whatever the schedule says — full flap
                 // won't climb, and clean this low gives the sink away.
-                // A downwind is flown at half flap too: the distance schedule
-                // put full flap out abeam the numbers at 1,900 ft.
+                // A CLOSE downwind is flown at half flap too. `outbound` also
+                // names a distant reversal/reposition, which stays clean until
+                // it enters the normal six-mile configuration area (#211).
                 // ...once the speed flies it (`go_around_flap_due`): the
                 // half flap's floor, not the full flap's.
                 let wanted = if ga
@@ -4470,10 +4471,14 @@ pub fn run_autoland_scoped(
                     && !go_around_flap_due(ias, crate::aircraft::config_floor_kts(0.5))
                 {
                     last_flap.unwrap_or(0.5)
-                } else if ga || outbound {
+                } else if ga {
                     0.5
                 } else {
-                    let sched = flap_schedule(g.dist_nm, alt - g.glidepath_alt_ft);
+                    let sched = approach_leg_flap_schedule(
+                        g.dist_nm,
+                        alt - g.glidepath_alt_ft,
+                        outbound,
+                    );
                     approach_flap_wanted(sched, last_flap)
                 };
                 let limits = crate::aircraft::flap_limits();
@@ -7410,6 +7415,21 @@ pub fn flap_schedule(dist_nm: f64, alt_err_ft: f64) -> f64 {
         0.5
     } else {
         0.0
+    }
+}
+
+/// Flap schedule for the leg being flown. A normal downwind inside the
+/// configuration area uses half flap, but a distant outbound reversal is a
+/// reposition rather than a traffic-pattern leg and remains clean (#211).
+pub fn approach_leg_flap_schedule(dist_nm: f64, alt_err_ft: f64, outbound: bool) -> f64 {
+    if outbound {
+        if dist_nm < 6.0 {
+            0.5
+        } else {
+            0.0
+        }
+    } else {
+        flap_schedule(dist_nm, alt_err_ft)
     }
 }
 
@@ -12429,6 +12449,20 @@ mod tests {
         // Approach segment and clean segment unchanged.
         assert_eq!(flap_schedule(4.5, -300.0), 0.5);
         assert_eq!(flap_schedule(8.0, 0.0), 0.0);
+    }
+
+    #[test]
+    fn a_distant_outbound_reposition_stays_clean() {
+        // #211: `outbound` described a long visual reversal as well as a
+        // close downwind, putting the 172's first notch out many miles early.
+        assert_eq!(approach_leg_flap_schedule(34.5, -6_000.0, true), 0.0);
+        assert_eq!(approach_leg_flap_schedule(23.0, -5_000.0, true), 0.0);
+        // A real close downwind keeps the existing half-flap configuration.
+        assert_eq!(approach_leg_flap_schedule(5.9, 400.0, true), 0.5);
+        // Inbound legs still use the ordinary distance/vertical schedule.
+        assert_eq!(approach_leg_flap_schedule(8.0, 0.0, false), 0.0);
+        assert_eq!(approach_leg_flap_schedule(4.5, -300.0, false), 0.5);
+        assert_eq!(approach_leg_flap_schedule(2.0, 0.0, false), 1.0);
     }
 
     #[test]
