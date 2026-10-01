@@ -815,6 +815,15 @@ created. Corollary for the workflow: an untested plugin build must not be
 installed into the live folder while a flight is running, because any
 reload, the pilot's included, loads it.
 
+The next X-Plane update removed `XPLMDrawCalls`' hidden window origin: its
+vertices and scissors became ordinary panel coordinates under the current
+transform. The whole ImGui surface consequently appeared upside down and at
+the bottom of the screen while the native window chrome stayed put. The draw
+callback now applies `translate(window left, window top)` then `scale(1, -1)`
+inside a balanced transform scope, the exact inverse already used by mouse
+input. Keep the per-command scissors window-local; the panel transform carries
+both mesh and scissors into place.
+
 The same session's taxi from Anchorage's GA ramp went 1.4 km on a beeline
 across the aprons before the drawn route began, and the tower was Lake Hood
 Strip's. `region_tick` picked the ground field by raw distance to

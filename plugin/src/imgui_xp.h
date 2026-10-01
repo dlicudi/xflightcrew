@@ -3,9 +3,10 @@
 // ImGui context. A per-frame flight loop runs the ImGui frame (input, the
 // interface, Render) and answers the atlas's texture requests with
 // XPLMCreateTexture/XPLMDestroyTexture; the window's draw callback then does
-// ONE thing, hand the retained draw data to XPLMDrawCalls. No OpenGL, no
-// GL-on-Metal bridge, no hand-rolled renderer: the sim draws the panel with
-// the same machinery as its own avionics.
+// ONE thing, establish the window's top-left ImGui transform and hand the
+// retained draw data to XPLMDrawCalls. No OpenGL, no GL-on-Metal bridge, no
+// hand-rolled renderer: the sim draws the panel with the same machinery as
+// its own avionics.
 //
 // The split is a rule of the sim, not a style choice: panel graphics
 // FORBIDS creating or destroying a draw-call texture from inside a draw

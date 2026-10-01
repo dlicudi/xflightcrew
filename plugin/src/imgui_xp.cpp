@@ -282,6 +282,14 @@ void XpImguiWindow::render() {
     ImDrawData* dd = ImGui::GetDrawData();
     if (dd == nullptr || !dd->Valid) return;
     const float w = dd->DisplaySize.x, h = dd->DisplaySize.y;
+
+    // X-Plane no longer gives XPLMDrawCalls a hidden window-local, top-left
+    // coordinate system.  Like the mouse path in toLocal(), explicitly move
+    // the panel origin to the window's top-left and turn its Y axis down for
+    // ImGui.  Keep this scope around both vertices and their scissors.
+    XPLMTransformPush();
+    XPLMTransformTranslate(static_cast<float>(mLeft), static_cast<float>(mTop));
+    XPLMTransformScale(1.0f, -1.0f);
     for (ImDrawList* list : dd->CmdLists) {
         if (list->VtxBuffer.Size == 0 || list->IdxBuffer.Size == 0) continue;
         XPLMMesh_t mesh;
@@ -320,6 +328,7 @@ void XpImguiWindow::render() {
         }
         if (!mCalls.empty()) XPLMDrawCalls(&mesh, static_cast<int>(mCalls.size()), mCalls.data());
     }
+    XPLMTransformPop();
 }
 
 // ---- callbacks --------------------------------------------------------------
