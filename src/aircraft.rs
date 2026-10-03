@@ -3149,7 +3149,7 @@ const STEP_CLIMB_MAX_GAP_FT: f64 = 3.0 * STEP_CLIMB_FT;
 pub fn step_climb_ft(cruise_ft: f64, optimum_ft: f64) -> Option<f64> {
     (STEP_CLIMB_FT..=STEP_CLIMB_MAX_GAP_FT)
         .contains(&(optimum_ft - cruise_ft))
-        .then(|| cruise_ft + STEP_CLIMB_FT)
+        .then_some(cruise_ft + STEP_CLIMB_FT)
 }
 
 /// The floor for the LANDING configuration: 1.2 x Vso when the profile

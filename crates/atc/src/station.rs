@@ -3569,7 +3569,8 @@ static REGION: Mutex<Vec<RegionApt>> = Mutex::new(Vec::new());
 /// tower-less field (or one whose tower row is a Gateway placeholder) was
 /// "say again destination". Built by the same scan as [`REGION`]; codes
 /// only (a name across forty thousand fields is a guess).
-static FIELD_DIR: Mutex<Vec<(String, String, (f64, f64))>> = Mutex::new(Vec::new());
+type FieldDirectoryEntry = (String, String, (f64, f64));
+static FIELD_DIR: Mutex<Vec<FieldDirectoryEntry>> = Mutex::new(Vec::new());
 
 /// The active station's identity + position, for the switch decision. Set by
 /// [`Station::from_airport`].
@@ -6753,7 +6754,7 @@ pub(crate) fn resequence_runway(
             if same_strip && !oncoming {
                 continue;
             }
-            if !same_strip && occupied.iter().any(|o| *o == r.ident_a) {
+            if !same_strip && occupied.contains(&r.ident_a) {
                 continue;
             }
             if len(r) < RESEQUENCE_MIN_LENGTH_RATIO * blocked_len {
@@ -18439,7 +18440,7 @@ mod tests {
         let behind = lemg_ghost("VY3", lemg_point(&rw[1], true, 700.0, 0.0), elev, true);
         let ahead = lemg_ghost("VY4", lemg_point(&rw[1], true, 1100.0, 0.0), elev, true);
         let now = t0 + sec(300);
-        assert!(!departure_strip_picture(&rw[1], "13", &[behind.clone()], mid, None, now).blocked);
+        assert!(!departure_strip_picture(&rw[1], "13", std::slice::from_ref(&behind), mid, None, now).blocked);
         assert!(departure_strip_picture(&rw[1], "13", &[ahead], mid, None, now).blocked);
         assert!(
             departure_strip_picture(&rw[1], "13", &[behind], None, None, now).blocked,

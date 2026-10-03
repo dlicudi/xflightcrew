@@ -1586,7 +1586,10 @@ fn ride_corner_fillets(
             .take_while(|&i| out_leg[i] + 1 == k && dist(out_path[i], v) <= FILLET_REACH_M)
             .filter(|&i| out_snap[i].is_some())
             .collect();
-        let mut chosen: Option<(usize, usize, Vec<(f64, f64)>)> = None;
+        type FilletPath = Vec<(f64, f64)>;
+        type ChosenFillet = (usize, usize, FilletPath);
+        type PaintWalk = (usize, f64, f64, Vec<(usize, f64, f64)>);
+        let mut chosen: Option<ChosenFillet> = None;
         for &i in entries.iter().rev() {
             let (li, at_i) = out_snap[i].expect("filtered");
             let fits = |pts: &[(f64, f64)], j: usize| -> Option<f64> {
@@ -1610,9 +1613,9 @@ fn ride_corner_fillets(
                 });
                 smooth.then_some(len)
             };
-            let mut best: Option<(f64, usize, Vec<(f64, f64)>)> = None;
+            let mut best: Option<(f64, usize, FilletPath)> = None;
             let dir_i = line_dir(&paint[li], &stations[li], at_i, b_in);
-            let mut stack: Vec<(usize, f64, f64, Vec<(usize, f64, f64)>)> = vec![(li, at_i, dir_i, Vec::new())];
+            let mut stack: Vec<PaintWalk> = vec![(li, at_i, dir_i, Vec::new())];
             while let Some((line, at, dir, pieces)) = stack.pop() {
                 let len = *stations[line].last().unwrap_or(&0.0);
                 let end_at = if dir > 0.0 { len } else { 0.0 };
@@ -2032,7 +2035,7 @@ pub fn find_taxi_net(path: &str, icao: &str) -> Result<Option<TaxiNet>> {
                 };
                 let attrs: Vec<&str> = f.collect();
                 let centre = attrs.iter().any(|a| PAINT_CENTRELINE_TYPES.contains(a));
-                let lead = attrs.iter().any(|a| *a == LEADIN_TYPE);
+                let lead = attrs.contains(&LEADIN_TYPE);
                 feature.push(PaintNode {
                     p: (lat, lon),
                     ctrl,
@@ -2624,7 +2627,8 @@ impl TaxiNet {
                 // away from the parking is a longer taxi at best and, where
                 // the pavement between two parallels is the thing it leads
                 // onto, a drive that cannot be completed at all.
-                let toward = |c: &(i64, (f64, f64), (i64, (f64, f64), String, u8))| -> bool {
+                type TurnOffCandidate = (i64, (f64, f64), (i64, (f64, f64), String, u8));
+                let toward = |c: &TurnOffCandidate| -> bool {
                     apron_side.is_none_or(|a| side_of(c.2 .1) * a >= 0.0)
                 };
                 toward(y)

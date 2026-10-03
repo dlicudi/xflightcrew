@@ -107,7 +107,8 @@ pub(crate) static CALLSIGN_TELEPHONY: Mutex<Option<fn() -> String>> = Mutex::new
 /// idents, read when an IFR clearance is made up, so the tower clears the
 /// SID that joins it (`nav::sid_for_filed_route`, the crew's own rule). A
 /// function for the same reason as [`CALLSIGN_INPUTS`].
-pub(crate) static FILED_ROUTE: Mutex<Option<fn() -> Option<FiledRoute>>> = Mutex::new(None);
+type FiledRouteProvider = fn() -> Option<FiledRoute>;
+pub(crate) static FILED_ROUTE: Mutex<Option<FiledRouteProvider>> = Mutex::new(None);
 
 /// A flight plan as filed, what a controller's strip would show: where from,
 /// where to, and the fixes between (SID fixes included, as the navlog lists

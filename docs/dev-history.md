@@ -12577,6 +12577,21 @@ the pilot. Blackbox `taxi_in` `self_taxi` records whether the earlier marker exi
 `a_manual_untowered_arrival_self_taxis_only_with_built_in_atc` pins both authorities. Live EGBS
 confirmation is owed.
 
+## 2026-10-03: first size-debt tranche — launch ownership, no flight-law change
+
+A structural review found that the risk is concentrated in a few multi-thousand-line runtime
+state machines, not in the profiles or the large regression corpus. As a first behavior-preserving
+seam, autoland's seven worker-owned launch facts now travel as one `AutolandLaunch` value from the
+public compatibility entry point into the worker. The public calls and the runway-change re-arm
+stay byte-for-byte in shape; no guidance, gate or timing number moved. This is the boundary for
+extracting approach phases later without growing parallel argument lists.
+
+The shared `sim::run::Slot` now implements `Default`, and anonymous ATC tuple types reported by
+the current Clippy were named locally; the remaining ATC edits are mechanical lint equivalents.
+`cargo check --workspace`, all three worker-slot tests and 110 runnable autoland tests pass (one
+real-install test ignored). Strict all-target Clippy exposes a larger pre-existing backlog in test
+and production targets, so it is not yet a clean repository-wide gate.
+
 ## 2026-10-02: Shobdon C172 taxi candidate correction — live confirmation owed
 
 Sortie 1790942917-full_auto, EGBS runway 08 via Bravo: 706.9 m planned,

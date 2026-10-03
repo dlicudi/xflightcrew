@@ -1410,7 +1410,7 @@ fn heard_sid(transcript: &str, ident: &str) -> bool {
     let toks = number_tokens(&transcript.to_lowercase());
     let Some(at) = ident.find(|c: char| c.is_ascii_digit()) else {
         let want = ident.to_lowercase();
-        return toks.iter().any(|w| *w == want);
+        return toks.contains(&want);
     };
     let (name, rest) = ident.split_at(at);
     let name = name.to_lowercase();
@@ -2635,7 +2635,7 @@ impl Tower {
                 // from LinedUp.
                 _ if ctx.own_on_runway && ctx.on_ground => {
                     self.state = State::LinedUp;
-                    return self.handle(Intent::RequestTakeoff, ctx);
+                    self.handle(Intent::RequestTakeoff, ctx)
                 }
                 // A takeoff request from anywhere else gets the taxi first —
                 // the tower never clears a takeoff from a parking stand.
@@ -4615,8 +4615,7 @@ mod tests {
     #[test]
     fn a_final_report_on_the_wrong_runway_is_corrected_aloud() {
         let c = ctx();
-        let mut t = Tower::default();
-        t.state = State::Inbound;
+        let mut t = Tower { state: State::Inbound, ..Default::default() };
         let reply = t.handle(Intent::ReportFinal, &c);
         let fixed = Tower::correct_final_runway(
             "november one seven two sierra papa, final runway one three",

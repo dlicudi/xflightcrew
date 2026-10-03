@@ -439,7 +439,7 @@ fn undot_acronyms(text: &str) -> String {
     let toks: Vec<&str> = text.split(' ').collect();
     let mut out: Vec<String> = Vec::with_capacity(toks.len());
     for (i, tok) in toks.iter().enumerate() {
-        let core = tok.trim_end_matches(|c: char| matches!(c, ',' | ';' | ':' | '!' | '?'));
+        let core = tok.trim_end_matches([',', ';', ':', '!', '?']);
         let b = core.as_bytes();
         let dotted = b.len() >= 3
             && b.iter().enumerate().all(|(j, c)| {
@@ -463,7 +463,7 @@ fn undot_acronyms(text: &str) -> String {
         let ends_sentence = toks[i + 1..]
             .iter()
             .find(|t| !t.is_empty())
-            .map_or(true, |next| next.starts_with(|c: char| c.is_uppercase()));
+            .is_none_or(|next| next.starts_with(|c: char| c.is_uppercase()));
         if core.ends_with('.') && tail.is_empty() && ends_sentence {
             spoken.push('.');
         }

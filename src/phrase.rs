@@ -866,11 +866,7 @@ pub fn without_coached_phrase(text: &str) -> String {
     let bytes = text.as_bytes();
     for (i, b) in bytes.iter().enumerate() {
         if matches!(b, b'.' | b'!' | b'?') || i + 1 == bytes.len() {
-            let end = if matches!(b, b'.' | b'!' | b'?') {
-                i + 1
-            } else {
-                i + 1
-            };
+            let end = i + 1;
             let sentence = &text[start..end];
             let lead = sentence
                 .trim_start_matches(|c: char| !c.is_alphanumeric())

@@ -86,6 +86,12 @@ impl Slot {
     }
 }
 
+impl Default for Slot {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 pub struct Lease<'a> {
     slot: &'a Slot,
     pub id: u64,

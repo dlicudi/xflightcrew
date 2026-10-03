@@ -1519,6 +1519,40 @@ pub fn run_autoland_scoped(
     forced_rwy: Option<PlannedRunway>,
     parents: Vec<std::sync::Arc<AtomicBool>>,
 ) {
+    spawn_autoland(AutolandLaunch {
+        base,
+        apt_dat,
+        cfg,
+        approach_ias,
+        voice,
+        forced_rwy,
+        parents,
+    });
+}
+
+/// Everything an autoland worker owns from arm until hand-back. Keeping the
+/// launch facts together prevents the approach thread and its runway re-arm
+/// from acquiring parallel argument lists as new per-approach state is added.
+struct AutolandLaunch {
+    base: String,
+    apt_dat: String,
+    cfg: ApConfig,
+    approach_ias: f64,
+    voice: Option<Voice>,
+    forced_rwy: Option<PlannedRunway>,
+    parents: Vec<std::sync::Arc<AtomicBool>>,
+}
+
+fn spawn_autoland(launch: AutolandLaunch) {
+    let AutolandLaunch {
+        base,
+        apt_dat,
+        cfg,
+        approach_ias,
+        voice,
+        forced_rwy,
+        parents,
+    } = launch;
     let my_gen = GEN.fetch_add(1, Ordering::SeqCst) + 1;
     std::thread::spawn(move || {
         let Ok(rt) = tokio::runtime::Builder::new_current_thread()
