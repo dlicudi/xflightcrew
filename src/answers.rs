@@ -1727,6 +1727,7 @@ pub(crate) async fn answer_state_query(
         || t.contains("system status")
         || t.contains("systems status")
         || t.contains("status check")
+        || t.contains("status update")
         || t.contains("all systems")
         || t.contains("everything ok");
     if asks_failures {

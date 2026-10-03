@@ -3839,7 +3839,8 @@ fn analyze_commands() -> Result<()> {
         let profile = aircraft::load("cessna_172sp").ok_or_else(|| anyhow::anyhow!("no 172 profile"))?;
         let registry = Registry::for_aircraft(&profile);
         let checklists = flow::install(&profile);
-        let (mut still, mut questions, mut fixed) = (Vec::new(), Vec::new(), 0u32);
+        let (mut still, mut questions, mut contextual, mut fixed) =
+            (Vec::new(), Vec::new(), Vec::new(), 0u32);
         for (t, n) in &tail {
             // The live chain: STT's own repairs, then the grammar's.
             let m = grammar::normalize(&phrase::normalize_numbers(&phrase::fix_mishears(t)));
@@ -3851,12 +3852,28 @@ fn analyze_commands() -> Result<()> {
                 fixed += n;
             } else if looks_like_question(&m) {
                 questions.push((t.clone(), *n));
+            } else if pre_grammar_capture(&m, &registry, &profile).is_some()
+                || state_capture_note(&m).is_some()
+                || grammar::load_aircraft_request(&m)
+                || grammar::waiver_request(&m)
+            {
+                // These are deterministic command-loop branches that run
+                // before the grammar. They used to remain in the miss tail
+                // even though the live app handled them (`load flight plan`
+                // and every repaired STT variant were the loudest example).
+                fixed += n;
+            } else if correction_value(&m).is_some() || looks_like_followup(&m) {
+                // A replay has no dialogue stack or last numeric subject.
+                // Report these separately instead of teaching a bare reply
+                // to actuate without the context that makes it safe.
+                contextual.push((t.clone(), *n));
             } else {
                 still.push((t.clone(), *n));
             }
         }
         still.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
         questions.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+        contextual.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
         println!("\nreplayed through today's grammar: {fixed} of {miss} now handled");
         println!("\nstill missed, commands ({}):", still.len());
         for (t, n) in &still {
@@ -3864,6 +3881,10 @@ fn analyze_commands() -> Result<()> {
         }
         println!("\nquestions (answered from the live sim, not checked here) ({}):", questions.len());
         for (t, n) in &questions {
+            println!("  {n:>3}  {t}");
+        }
+        println!("\ncontext-dependent follow-ups (need live dialogue state) ({}):", contextual.len());
+        for (t, n) in &contextual {
             println!("  {n:>3}  {t}");
         }
         return Ok(());
@@ -4416,6 +4437,7 @@ pub(crate) fn question_shortcut(
         "safe parameter",
         "in the green",
         "status check",
+        "status update",
     ])
         // "Anything to check?" / "anything I should check?"
         || (has("anything") && has("check"))
@@ -6706,6 +6728,7 @@ mod shortcut_tests {
             ("how far to the next waypoint", Some(Shortcut::NavProgress)),
             ("cancel the reminders", Some(Shortcut::ReminderCancel)),
             ("do we have a reminder", Some(Shortcut::ReminderList)),
+            ("could you give me a status update", Some(Shortcut::SystemsCheck)),
             ("plan a flight to LEZL", Some(Shortcut::PlanFlight)),
             ("load the flight plan", Some(Shortcut::LoadRoute)),
             ("load the aircraft", None),

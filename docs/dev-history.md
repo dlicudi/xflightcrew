@@ -12606,6 +12606,21 @@ reset contract existed only in their initialisers and scattered assignments insi
 loop. `ApproachRuntime::arm` is now the reset boundary for a new approach. Guidance filters,
 control laws and their clocks remain outside it. All 110 runnable autoland tests pass unchanged.
 
+## 2026-10-03: `analyze --now` stops calling live shortcuts grammar misses
+
+The 2026-09-20-onward report counted 200 historical misses and said only 65 were handled today,
+but its replay stopped at router/grammar/checklists. The running loop has deterministic doors before
+and after that seam: `load flight plan` and six repaired Whisper variants were already the
+`LoadRoute` shortcut; runway and numeric corrections need the dialogue stack; control releases,
+waivers and load-sheet requests have their own gates. Adding more grammar rules for those lines
+would have made context-free speech actuate.
+
+The replay now checks the command-loop shortcuts and state-only gates, and lists corrections and
+back-references separately as context-dependent instead of misses. On the same 1,073 commands it
+finds 81 of the 200 historical misses handled and separates 26 follow-ups, leaving 52 command
+candidates. One real gap in that tail, “could you give me a status update”, now routes to the live
+systems/failure check and is test-pinned. The rest remain evidence to judge, not rules to ingest.
+
 ## 2026-10-02: Shobdon C172 taxi candidate correction — live confirmation owed
 
 Sortie 1790942917-full_auto, EGBS runway 08 via Bravo: 706.9 m planned,
