@@ -927,8 +927,21 @@ impl PowerFeed {
             law.shift_trim(hover_need(h_ft, l) - hover_need(prev, l));
         }
         self.prev_h = hovering.then_some(h_ft);
-        let level = (!on_ground && law.airborne())
-            .then(|| level_collective_at(cmd_speed.max(speed_h.unwrap_or(0.0)), l));
+        // The band must surround the same equilibrium that feeds the trim.
+        // Over the spot that is the ground-effect curve, not the OGE end of
+        // the forward-flight curve.  Keeping the band on OGE while shifting
+        // the trim down the cushion made the two protections fight: a heavy
+        // S-76 reached 2.8 ft with -100 fpm commanded, but the OGE floor held
+        // enough collective to hover there indefinitely (EGBJ, 2026-10-01).
+        // In forward flight the translational-lift curve remains the level
+        // reference, including while the aircraft is still decelerating.
+        let level = (!on_ground && law.airborne()).then(|| {
+            if hovering {
+                hover_need(h_ft, l)
+            } else {
+                level_collective_at(cmd_speed.max(speed_h.unwrap_or(0.0)), l)
+            }
+        });
         law.set_level(level);
         level
     }
@@ -2876,6 +2889,47 @@ mod tests {
         );
         assert!(peak < 14.5, "peak {peak:.1} ft");
         assert!(worst < 1.0, "held to {worst:.1} ft");
+    }
+
+    /// EGBJ, 2026-10-01: at 5,155 kg the S-76 descended to 2.8 ft, then
+    /// hovered for 50 s although the landing still asked for -100 fpm.  The
+    /// trim followed the ground-effect feed-forward, but its safety band was
+    /// anchored to the OGE collective and would not let the lever follow it.
+    /// One physical equilibrium must drive both feed-forward and the band.
+    #[test]
+    fn a_heavy_landing_follows_the_ground_cushion_to_contact() {
+        let dt = 0.37;
+        let loading = 1.205;
+        let lift = LIFTOFF_REF / IGE_REF_LOADING * loading;
+        let oge = level_collective(0.0) * loading;
+        let mut p = Rotor::new(lift, oge, oge);
+        p.h_ft = GE_FADE_FT;
+        let mut law = CollectiveLaw::from(oge);
+        law.airborne = true;
+        law.trim = oge;
+        let estimate = LoadingEstimate {
+            predicted: Some(loading),
+            lifted: None,
+        };
+        let mut feed = PowerFeed::new(estimate, &law);
+        let mut touchdown = None;
+        for i in 0..((90.0 / dt) as usize) {
+            let on_ground = p.on_ground();
+            feed.before(&mut law, 0.0, Some(0.0), p.h_ft, on_ground);
+            let before = p.vs;
+            let c = law.step(target_vs_fpm(Goal::Land, p.h_ft, 0.0), p.vs, on_ground, dt);
+            p.step(c, dt);
+            if p.on_ground() {
+                touchdown = Some((i as f64 * dt, before));
+                break;
+            }
+        }
+        let (seconds, sink_fpm) = touchdown.expect("the landing reached the ground");
+        assert!(seconds < 60.0, "touchdown took {seconds:.1} s");
+        assert!(
+            sink_fpm > -300.0,
+            "touchdown remained controlled at {sink_fpm:.0} fpm"
+        );
     }
 
     /// Across loadings and predictions that are wrong both ways (a payload

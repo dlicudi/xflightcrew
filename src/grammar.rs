@@ -322,10 +322,11 @@ pub fn try_parse(
         // is withheld there. Stopping it is a hold.
         if registry.get("hover").is_some() && registry.get(&c.name).is_none() {
             let off = c.arguments.get("off").and_then(|v| v.as_bool()) == Some(true);
+            let resume = c.arguments.get("resume").and_then(|v| v.as_bool()) == Some(true);
             return Some(vec![if off {
                 call("hover", json!({ "action": "hold" }))
             } else {
-                call("hover", json!({ "action": "route" }))
+                call("hover", json!({ "action": "route", "resume": resume }))
             }]);
         }
         return Some(vec![c]);
@@ -3169,7 +3170,7 @@ mod tests {
                 "the brief must not catch {words}"
             );
             let h = try_parse(words, &hreg, &heli).expect(words);
-            assert_eq!(h[0].arguments, json!({ "action": "route" }), "{words}");
+            assert_eq!(h[0].arguments, json!({ "action": "route", "resume": false }), "{words}");
         }
         // Not the plan: other things flown, and the plan's brief.
         for words in [
@@ -3270,6 +3271,8 @@ mod tests {
             let c = first(w).unwrap_or_else(|| panic!("{w}"));
             assert_eq!(c.arguments["action"].as_str(), Some("route"), "{w}");
         }
+        let c = first("resume flight plan").expect("helicopter resume");
+        assert_eq!(c.arguments, json!({ "action": "route", "resume": true }));
         // Parking is the aeroplanes' own tool on a helicopter too.
         for w in ["taxi to parking", "park us", "take us to the stand"] {
             let c = first(w).unwrap_or_else(|| panic!("{w}"));

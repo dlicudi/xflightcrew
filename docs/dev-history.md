@@ -12577,9 +12577,50 @@ the pilot. Blackbox `taxi_in` `self_taxi` records whether the earlier marker exi
 `a_manual_untowered_arrival_self_taxis_only_with_built_in_atc` pins both authorities. Live EGBS
 confirmation is owed.
 
+## 2026-10-02: Shobdon C172 taxi candidate correction — live confirmation owed
+
+Sortie 1790942917-full_auto, EGBS runway 08 via Bravo: 706.9 m planned,
+496.5 m remaining at `taxi_stalled` after 318.5 s. The scorer recorded
+7.6 m inside-corner cut and 19.9 m maximum lateral deviation. Groundspeed
+repeatedly fell below a knot with brakes released and throttle reaching 0.55.
+The screenshots show the aircraft on grass. These establish deviation and
+poor progress, not whether the authored route, pursuit geometry or ground
+response first caused it.
+
+Candidate change: linked-nose pursuit may shorten its curvature-limited aim
+to 8 m instead of 16 m; straight aims and free/brake-steered noses retain
+their earlier behavior. The C172 declares a provisional 10 deg/s corner
+rate, based on the full-steering samples near 4 kt. Throttle limits are
+unchanged. Unit tests cover the aim distinction and profile loading; an
+exact EGBS route replay and a successful live taxi are still required before
+calling the root cause fixed. The release executable has not been deployed.
+
 The same approach exposed two numeric follow-up holes (#213). After "Can you set up ILS?" asked
 for a runway, "No, it's runway 26" was silent; after 50 kt was refused below the stall margin,
 "Set it to 55" was silent until the pilot repeated the full speed command. A closed runway reply
 now completes only a fresh `prepare_ils` call with an empty runway and preserves its coupling
 choice. `set it to <bare value>` and `set that to <bare value>` join the existing recent-subject
 correction path. Tests pin both live phrases, the parallel-runway side, and the unanchored cases.
+
+## 2026-10-01: the heavy S-76 hovered above the pad instead of touching down
+
+S-76 EGBS-EGBJ, sortie 1790880540-heli_route. The route received and read back its runway 22
+landing clearance, reached `over_pad`, and selected `Goal::Land`. It descended from 38 ft to 2.8
+ft, then stayed there for about 50 s: every tick still asked for -100 fpm, but vertical speed
+settled near zero and collective near 0.615. The later X-Plane disconnect and engine-out crash
+were fallout after the failed arrival, not its cause; `heli_route arrived` correctly recorded
+`on_ground: false`.
+
+The collective controller carried two incompatible versions of the same equilibrium. `PowerFeed`
+moved the trim down `hover_need(height, loading)` as ground effect grew, but set the protective
+trim band around the out-of-ground-effect forward-flight curve. At the recorded 5,155 kg loading,
+that OGE band would not let the lever follow the ground-effect trim far enough down, so the law
+manufactured a stable hover above contact while commanding a descent.
+
+The band's level is now the same `hover_need` equilibrium while slow over the spot; in forward
+flight it remains the translational-lift power curve. This is not a landing override: feed-forward,
+integrator bounds and proportional command now agree on one physical model. The hard-climb guard
+still bounds a landing requested in a 1,700 fpm climb. A deliberately different exponential-cushion
+plant at the recorded heavy loading pins contact within 60 s and below 300 fpm
+(`a_heavy_landing_follows_the_ground_cushion_to_contact`); all 22 hover tests pass. Live EGBJ
+confirmation is owed.

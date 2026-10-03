@@ -378,6 +378,7 @@ impl Tool for Hover {
             "properties": {
                 "action": { "type": "string", "enum": ["up", "down", "land", "pad", "move", "hold", "depart", "circuit", "speed", "route"] },
                 "right": { "type": "boolean" },
+                "resume": { "type": "boolean" },
                 "height_ft": { "type": "number" },
                 "direction": { "type": "string", "enum": ["forward", "back", "left", "right"] },
                 "speed_kts": { "type": "number" }
@@ -400,7 +401,7 @@ impl Tool for Hover {
             }));
         }
         if action == Some("route") {
-            return route(self, ctx).await;
+            return route(self, args, ctx).await;
         }
         if action == Some("circuit") {
             return circuit(args, ctx).await;
@@ -528,6 +529,7 @@ async fn arrival(tool: &Hover, ctx: &ToolCtx<'_>) -> Result<std::result::Result<
             destination: dest.clone(),
             dest_tower_khz: apt.as_ref().and_then(|a| a.staffed_tower().map(|f| f.khz)),
             arrive_only: true,
+            resume: false,
             runway_spots: match apt.as_ref() {
                 Some(a) if !on_pad => crate::heli_route::runway_spots(a),
                 _ => Vec::new(),
@@ -618,16 +620,17 @@ const PLAN_ORIGIN_MAX_M: f64 = 5_000.0;
 
 /// The SimBrief plan from the hover the loop is holding, to a helipad at the
 /// destination ([`crate::heli_route`]).
-async fn route(tool: &Hover, ctx: &ToolCtx<'_>) -> Result<String> {
+async fn route(tool: &Hover, args: &Value, ctx: &ToolCtx<'_>) -> Result<String> {
     use crate::hover;
     let collective = tool.collective.as_str();
+    let resume = args.get("resume").and_then(Value::as_bool) == Some(true);
     // The whole flight, like full auto for the aeroplanes: from the ground
     // (engines started first when they are not running) or from a hover the
     // loop holds; never from a flight someone else is flying.
     let hovering = hover::ACTIVE.load(std::sync::atomic::Ordering::SeqCst)
         && matches!(hover::goal(), Some(hover::Goal::Hover { .. }));
     let on_ground = ctx.xplane.get_float(ONGROUND).await? > 0.5;
-    if !hovering && !on_ground {
+    if !resume && !hovering && !on_ground {
         return Ok(
             "You're flying it. I fly the plan from the ground or a hover I'm holding.".to_string(),
         );
@@ -645,6 +648,10 @@ async fn route(tool: &Hover, ctx: &ToolCtx<'_>) -> Result<String> {
     // the pilot's latest SimBrief plan.
     let plan = match crate::simbrief::local_plan() {
         Some(p) => p,
+        None if resume => match crate::simbrief::loaded_plan() {
+            Some(p) => p,
+            None => return Ok("No flight plan is loaded. Load it first, then say resume.".into()),
+        },
         None => match crate::simbrief::fetch(&ctx.config.simbrief_id).await {
             Ok(p) => p,
             Err(e) => return Ok(format!("I couldn't get the flight plan: {e}.")),
@@ -656,10 +663,11 @@ async fn route(tool: &Hover, ctx: &ToolCtx<'_>) -> Result<String> {
         ctx.xplane.get_float(crate::datarefs::LATITUDE),
         ctx.xplane.get_float(crate::datarefs::LONGITUDE)
     );
-    if let (Ok(lat), Ok(lon), Some(first)) = (lat, lon, plan.waypoints.first()) {
+    let position = lat.as_ref().ok().copied().zip(lon.as_ref().ok().copied());
+    if let (Some((lat, lon)), Some(first)) = (position, plan.waypoints.first()) {
         let geo = crate::taxi_guide::Geo::new(lat);
         let d = crate::taxi_guide::dist((0.0, 0.0), geo.to_m((lat, lon), (first.lat, first.lon)));
-        if d > PLAN_ORIGIN_MAX_M && plan.origin != plan.destination {
+        if !resume && d > PLAN_ORIGIN_MAX_M && plan.origin != plan.destination {
             return Ok(format!(
                 "That plan departs from {}, {:.0} miles from here. Plan a flight from here first.",
                 plan.origin,
@@ -711,7 +719,16 @@ async fn route(tool: &Hover, ctx: &ToolCtx<'_>) -> Result<String> {
         }
         None => None,
     };
-    let points = crate::heli_route::drop_terminal_fixes(points);
+    let mut points = crate::heli_route::drop_terminal_fixes(points);
+    if resume && !on_ground {
+        let Some((lat, lon)) = position else {
+            return Ok("I can't read our position. I haven't taken control.".into());
+        };
+        match crate::heli_route::resume_index(&points, lat, lon) {
+            Ok(join) => { points.drain(..join); }
+            Err(why) => return Ok(why),
+        }
+    }
     let names: Vec<String> = points
         .iter()
         .take(points.len() - 1)
@@ -791,6 +808,7 @@ async fn route(tool: &Hover, ctx: &ToolCtx<'_>) -> Result<String> {
             destination: dest.clone(),
             dest_tower_khz,
             arrive_only: false,
+            resume: resume && !on_ground,
             runway_spots,
         },
         crate::heli_route::Ends {
@@ -803,7 +821,8 @@ async fn route(tool: &Hover, ctx: &ToolCtx<'_>) -> Result<String> {
     // were a paragraph (LSZS-LILO, 2026-09-24). The cruise level is said by
     // the route once the ground has been probed, since only then is it known.
     Ok(format!(
-        "Flying the plan to {dest}{}, {} {}, {:.0} knots.{climb_note}",
+        "{} the plan to {dest}{}, {} {}, {:.0} knots.{climb_note}",
+        if resume && !on_ground { "Resuming" } else { "Flying" },
         pad_name
             .map(|n| if on_pad { format!(", pad {n}") } else { format!(", {n}") })
             .unwrap_or_default(),

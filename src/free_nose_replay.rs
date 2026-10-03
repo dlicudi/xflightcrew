@@ -743,7 +743,13 @@ fn fly_drive(ticks: &[DriveTick], k0: usize, rb: &Rebuilt, plant: GroundPlant, l
         if remaining < 0.0 {
             break;
         }
-        let look = steer_look_m(&pace, gs, route.route_turn_rate_dps(progress, BEND_PROBE_M, gs), remaining);
+        let look = steer_look_m(
+            &pace,
+            gs,
+            route.route_turn_rate_dps(progress, BEND_PROBE_M, gs),
+            remaining,
+            true,
+        );
         let err = if remaining <= 8.0 {
             route.stop_heading_err_deg(lat, lon, psi, progress, look)
         } else {

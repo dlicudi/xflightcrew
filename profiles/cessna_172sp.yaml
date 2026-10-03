@@ -96,6 +96,13 @@ vs_clean_kts: 48.0
 # caution as you approach redline, an urgent prompt at or above it.
 vne_kts: 163.0
 
+# EGBS Bravo, 2026-10-02: full linked-nosewheel steering produced about
+# 10 deg/s near 4 kt. Candidate limit for the corner-speed schedule following
+# a 7.6 m scored corner cut and a grass stall. Exact-route and live validation
+# are still owed; this is not a verified physical limit across all speeds.
+taxi:
+  max_yaw_dps: 10.0
+
 # Static reference figures recited on request ("what's best glide?", "Va?",
 # "performance limits"). From the X-Plane C172 Pilot's Operating Manual. Vne and
 # clean stall live above (the monitor uses them) and aren't repeated here.

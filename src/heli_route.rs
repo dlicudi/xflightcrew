@@ -26,7 +26,7 @@
 //! - **Arrive** on the hover loop: a final at 6 degrees to the helipad nearest
 //!   the inbound fix, the speed tapering to stop over it, then down.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use crate::hover::{self, Goal};
@@ -35,8 +35,10 @@ use crate::voice::{Priority, Voice};
 use crate::xplane::XPlaneClient;
 
 pub static ACTIVE: AtomicBool = AtomicBool::new(false);
+static GENERATION: AtomicU64 = AtomicU64::new(0);
 
 pub fn abort() {
+    GENERATION.fetch_add(1, Ordering::SeqCst);
     ACTIVE.store(false, Ordering::SeqCst);
 }
 
@@ -1040,15 +1042,18 @@ const LIFT_WARNING_S: f64 = 5.0;
 pub const ROUTE_TAXI_FT: f64 = 12.0;
 
 pub fn park(voice: Option<Voice>, base_url: String, collective: String, target: ParkTarget) {
-    if ACTIVE.swap(true, Ordering::SeqCst) {
+    if ACTIVE.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst).is_err() {
         return;
     }
+    let generation = GENERATION.fetch_add(1, Ordering::SeqCst) + 1;
     std::thread::spawn(move || {
         let Ok(rt) = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
         else {
-            ACTIVE.store(false, Ordering::SeqCst);
+            if GENERATION.load(Ordering::SeqCst) == generation {
+                ACTIVE.store(false, Ordering::SeqCst);
+            }
             return;
         };
         rt.block_on(fly_park(
@@ -1057,8 +1062,11 @@ pub fn park(voice: Option<Voice>, base_url: String, collective: String, target: 
             base_url,
             collective,
             target,
+            generation,
         ));
-        ACTIVE.store(false, Ordering::SeqCst);
+        if GENERATION.load(Ordering::SeqCst) == generation {
+            ACTIVE.store(false, Ordering::SeqCst);
+        }
     });
 }
 
@@ -1068,6 +1076,7 @@ async fn fly_park(
     base_url: String,
     collective: String,
     target: ParkTarget,
+    generation: u64,
 ) {
     let _detail = crate::auto_status::DetailGuard::hold(&DETAIL);
     let (path_ll, name, height) = match &target {
@@ -1093,7 +1102,7 @@ async fn fly_park(
     let wait = std::time::Instant::now();
     while wait.elapsed().as_secs_f64() < LIFT_WARNING_S {
         tokio::time::sleep(TICK).await;
-        if !ACTIVE.load(Ordering::SeqCst) {
+        if !ACTIVE.load(Ordering::SeqCst) || GENERATION.load(Ordering::SeqCst) != generation {
             crate::blackbox::record("heli_route", serde_json::json!({ "event": "park_declined" }));
             return;
         }
@@ -1115,7 +1124,7 @@ async fn fly_park(
     }
     let mut ready = false;
     let mut moving = false;
-    while ACTIVE.load(Ordering::SeqCst) {
+    while ACTIVE.load(Ordering::SeqCst) && GENERATION.load(Ordering::SeqCst) == generation {
         tokio::time::sleep(TICK).await;
         if crate::xplane::sim_frozen(&xp).await {
             continue;
@@ -1190,10 +1199,40 @@ pub struct Route {
     /// pilot's "not here, land at the airport" at LIME had nothing to call
     /// (2026-09-25).
     pub arrive_only: bool,
+    /// An airborne rejoin starts in cruise modes at the present state.
+    pub resume: bool,
     /// The destination's runway spots (ident, lat, lon, [`runway_spots`]),
     /// when the flight lands on a runway: the tower's runway moves the
     /// landing onto its own end ([`spot_for_runway`]). Empty on a helipad.
     pub runway_spots: Vec<(String, f64, f64)>,
+}
+
+/// Forward endpoint of the route segment the aircraft is abeam of.
+pub fn resume_index(points: &[(String, f64, f64)], lat: f64, lon: f64) -> Result<usize, String> {
+    if points.len() < 2 || !lat.is_finite() || !lon.is_finite() {
+        return Err("The loaded route has no segment I can rejoin.".into());
+    }
+    let scale = lat.to_radians().cos();
+    let mut best: Option<(f64, usize)> = None;
+    for (i, pair) in points.windows(2).enumerate() {
+        let (ax, ay) = ((pair[0].2 - lon) * 60.0 * scale, (pair[0].1 - lat) * 60.0);
+        let (bx, by) = ((pair[1].2 - lon) * 60.0 * scale, (pair[1].1 - lat) * 60.0);
+        let (dx, dy) = (bx - ax, by - ay);
+        let len2 = dx * dx + dy * dy;
+        if len2 < 0.0001 { continue; }
+        let u = -(ax * dx + ay * dy) / len2;
+        if !(0.0..=1.0).contains(&u) { continue; }
+        let d = (ax + u * dx).hypot(ay + u * dy);
+        if best.is_none_or(|b| d < b.0) { best = Some((d, i + 1)); }
+    }
+    match best {
+        Some((d, i)) if d <= crate::interaction::REJOIN_CORRIDOR_NM => Ok(i),
+        Some((d, _)) => Err(format!(
+            "We're {:.0} miles from the route, outside the {:.0} mile rejoin corridor. I haven't taken control.",
+            d, crate::interaction::REJOIN_CORRIDOR_NM
+        )),
+        None => Err("I can't find a forward route segment here. I haven't taken control.".into()),
+    }
 }
 
 /// Our inbound call to the destination's tower has gone out (set by
@@ -1539,16 +1578,19 @@ pub fn start(
     route: Route,
     ends: Ends,
 ) {
-    if ACTIVE.swap(true, Ordering::SeqCst) {
+    if ACTIVE.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst).is_err() {
         return;
     }
+    let generation = GENERATION.fetch_add(1, Ordering::SeqCst) + 1;
     let base_url = config.xplane_base_url.clone();
     std::thread::spawn(move || {
         let Ok(rt) = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
         else {
-            ACTIVE.store(false, Ordering::SeqCst);
+            if GENERATION.load(Ordering::SeqCst) == generation {
+                ACTIVE.store(false, Ordering::SeqCst);
+            }
             return;
         };
         let xp = XPlaneClient::new(base_url.clone());
@@ -1563,10 +1605,16 @@ pub fn start(
                 base_url.clone(),
                 collective,
                 route,
+                generation,
             )
             .await
         });
-        ACTIVE.store(false, Ordering::SeqCst);
+        // A retired run must not clear a newer route's flag. That race ran
+        // two copies through the hover-to-cruise handoff, where one treated
+        // the other's expected hover release as an external handover.
+        if GENERATION.load(Ordering::SeqCst) == generation {
+            ACTIVE.store(false, Ordering::SeqCst);
+        }
         // Down on a helipad: that is where the flight ends, shut down. A
         // pad landing is never lifted again to taxi: at LILO the helicopter
         // rose off H1 unannounced for a stand and the pilot stopped it
@@ -1749,6 +1797,7 @@ async fn fly(
     base_url: String,
     collective: String,
     mut route: Route,
+    generation: u64,
 ) -> bool {
     let _detail = crate::auto_status::DetailGuard::hold(&DETAIL);
     let _sortie = crate::full_auto::SortieGuard::begin(
@@ -1844,7 +1893,7 @@ async fn fly(
         },
     );
     }
-    let mut phase = Phase::Depart;
+    let mut phase = if route.resume { Phase::Cruise } else { Phase::Depart };
     let mut climbing = false;
     let mut cruise_speed = cruise_kts();
     let mut capped_since: Option<std::time::Instant> = None;
@@ -1856,6 +1905,20 @@ async fn fly(
     let mut bug_set: Option<f64> = None;
     let mut unheld_since: Option<std::time::Instant> = None;
     let mut slow_tail_said = false;
+    if route.resume {
+        let c = xp.get_float_array(&collective).await.ok()
+            .and_then(|v| v.first().copied()).unwrap_or(0.45);
+        if !hover::cruise_modes(&xp).await {
+            say(&voice, Priority::Warning, "The autopilot won't take heading and altitude. You still have control.");
+            return false;
+        }
+        law = Some(SpeedLaw::from(c, s0.ias));
+        level_ft = alt0;
+        crate::blackbox::record("heli_route", serde_json::json!({
+            "event": "resume", "ias": s0.ias, "agl": s0.agl_ft,
+            "points": route.points.len()
+        }));
+    }
     // The inbound call went out (at the approach, or as the answer to the
     // destination's challenge): the approach does not make it twice.
     let mut inbound_made = false;
@@ -1904,7 +1967,7 @@ async fn fly(
         say(&voice, Priority::Readback, "Final for the pad.");
         tokio::time::sleep(Duration::from_millis(1500)).await;
     }
-    while ACTIVE.load(Ordering::SeqCst) {
+    while ACTIVE.load(Ordering::SeqCst) && GENERATION.load(Ordering::SeqCst) == generation {
         tokio::time::sleep(TICK).await;
         if crate::xplane::sim_frozen(&xp).await {
             last = std::time::Instant::now();
@@ -2747,6 +2810,19 @@ fn record_end(_voice: &Option<Voice>, why: &str, phase: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_airborne_resume_joins_the_forward_end_of_the_leg() {
+        let p = vec![
+            ("A".into(), 50.0, 0.0),
+            ("B".into(), 50.0, 1.0),
+            ("C".into(), 50.0, 2.0),
+        ];
+        assert_eq!(resume_index(&p, 50.01, 0.6), Ok(1));
+        assert_eq!(resume_index(&p, 50.01, 1.6), Ok(2));
+        assert!(resume_index(&p, 50.2, 0.6).unwrap_err()
+            .contains("outside the 3 mile rejoin corridor"));
+    }
 
     /// The S-76 in the cruise modes, fitted to 1790715215-heli_route (LEMG-
     /// LXGB, iMac 2026-09-29): the autopilot holds the vertical speed on the

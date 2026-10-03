@@ -2779,6 +2779,10 @@ pub const BEND_MAX_CUT_M: f64 = 1.5;
 /// The shortest aim a corner is flown on: a shorter one asks for a turn
 /// tighter than a nosewheel's lock can fly, and the aircraft runs wide.
 pub const BEND_AIM_FLOOR_M: f64 = 16.0;
+/// Candidate shorter aim for linked noses through tight bends. EGBS Bravo
+/// recorded a 7.6 m inside-corner cut; the fixed 16 m floor is a suspected
+/// contributor. Exact-route replay and live confirmation remain necessary.
+pub const LINKED_BEND_AIM_FLOOR_M: f64 = 8.0;
 /// The pure-pursuit aim for one tick, metres: the airframe's aim time,
 /// capped in a bend ([`bend_lookahead_cap_floor_m`] over
 /// [`BEND_PROBE_M`]) and by what is left of the route. `turn_probe_dps` is
@@ -2794,9 +2798,20 @@ pub const BEND_AIM_FLOOR_M: f64 = 16.0;
 /// A free castoring nose no longer steers on this aim (`ground_steer`
 /// flies its filleted path); the aim still gives its drive the error the
 /// join and the guards read, and the route's turn rate the scorer reads.
-pub fn steer_look_m(pace: &Pace, gs_kts: f64, turn_probe_dps: f64, remaining_m: f64) -> f64 {
+pub fn steer_look_m(
+    pace: &Pace,
+    gs_kts: f64,
+    turn_probe_dps: f64,
+    remaining_m: f64,
+    free_nose: bool,
+) -> f64 {
+    let bend_floor = if free_nose || pace.brake_steer {
+        BEND_AIM_FLOOR_M
+    } else {
+        LINKED_BEND_AIM_FLOOR_M
+    };
     lookahead_m_with(gs_kts, pace.lookahead_s)
-        .min(bend_lookahead_cap_floor_m(gs_kts, turn_probe_dps, BEND_AIM_FLOOR_M))
+        .min(bend_lookahead_cap_floor_m(gs_kts, turn_probe_dps, bend_floor))
         .min((remaining_m * 0.6).max(6.0))
 }
 /// The route span the bend's curvature is read over, m.
@@ -3548,6 +3563,7 @@ async fn drive(xp: XPlaneClient, voice: Option<Voice>, mut route: Route, base_kt
             gs_kts,
             route.route_turn_rate_dps(progress, BEND_PROBE_M, gs_kts),
             remaining,
+            free_nose,
         );
         // Inside the stop zone, fly the route's FINAL BEARING instead of
         // pursuing an aim point that has stopped moving. See
@@ -4437,6 +4453,20 @@ mod tests {
         // 16.6 since #194: the corner's slow-down is planned to where its
         // curvature begins, up to 15 m before the vertex.
         assert!(far > 16.0, "a corner 200 m on barely touches the pace: {far:.1} kt");
+    }
+
+    #[test]
+    fn a_linked_nose_aims_nearer_through_a_tight_bend() {
+        let pace = Pace::default();
+        let linked = steer_look_m(&pace, 6.0, 10.0, 100.0, false);
+        let free = steer_look_m(&pace, 6.0, 10.0, 100.0, true);
+        assert_eq!(linked, LINKED_BEND_AIM_FLOOR_M);
+        assert_eq!(free, BEND_AIM_FLOOR_M);
+        // No curvature: both retain the ordinary speed-scaled aim.
+        assert_eq!(
+            steer_look_m(&pace, 6.0, 0.0, 100.0, false),
+            steer_look_m(&pace, 6.0, 0.0, 100.0, true)
+        );
     }
 
     #[test]
@@ -5660,7 +5690,13 @@ mod tests {
                 break;
             }
             let remaining = route.remaining(progress);
-            let look = steer_look_m(&pace, gs, route.route_turn_rate_dps(progress, BEND_PROBE_M, gs), remaining);
+            let look = steer_look_m(
+                &pace,
+                gs,
+                route.route_turn_rate_dps(progress, BEND_PROBE_M, gs),
+                remaining,
+                false,
+            );
             let err = committed_err(route.heading_err_deg(lat, lon, psi, progress, look), &mut turn_dir);
             let route_turn = route.route_turn_rate_dps(progress, look, gs);
             let raw = taxi_guide::angle_diff(psi, prev_psi) / dt;
@@ -7300,7 +7336,13 @@ mod tests {
                 break;
             }
             let remaining = route.remaining(progress);
-            let look = steer_look_m(&pace, gs, route.route_turn_rate_dps(progress, BEND_PROBE_M, gs), remaining);
+            let look = steer_look_m(
+                &pace,
+                gs,
+                route.route_turn_rate_dps(progress, BEND_PROBE_M, gs),
+                remaining,
+                true,
+            );
             let err = route.heading_err_deg(lat, lon, psi, progress, look);
             let route_turn = route.route_turn_rate_dps(progress, look, gs);
             yaw_ema = 0.5 * yaw_ema + 0.5 * taxi_guide::angle_diff(psi, prev_psi) / run.dt;

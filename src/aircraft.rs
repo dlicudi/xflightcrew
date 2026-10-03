@@ -4637,6 +4637,7 @@ mod tests {
         assert!(p.autopilot && p.engine && p.barometer && p.com_radio);
         assert!(!p.retractable_gear);
         assert_eq!(p.lights.len(), 5);
+        assert_eq!(p.taxi.as_ref().and_then(|t| t.max_yaw_dps), Some(10.0));
         // SOP advisor rows: taxi light on the ground, strobes airborne, landing
         // light for takeoff/arrival.
         assert_eq!(p.advisor.len(), 3);
