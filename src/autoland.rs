@@ -1549,6 +1549,46 @@ struct ArmedRunway {
     coupled_ok: bool,
 }
 
+/// Mutable facts that describe this approach as an operation rather than a
+/// flight law: clearances, stability judgment and go-around communication.
+/// Keeping them under one owner makes reset-at-new-approach explicit and
+/// prevents another free-standing latch being added to the control loop.
+struct ApproachRuntime {
+    go_around: GoAroundLatch,
+    stable_watch: crate::stable_approach::StableWatch,
+    stable_clock: std::time::Instant,
+    stable_balk: Option<&'static str>,
+    stable_said: Option<&'static str>,
+    gate_recorded: bool,
+    orders: crate::go_around::GoAroundWatch,
+    uncleared: UnclearedWatch,
+    owe_final_report: bool,
+    said_going_around: bool,
+    going_around_callsign: Option<Option<String>>,
+    balk_watch: Option<BalkWatch>,
+    spoke_going_around: bool,
+}
+
+impl ApproachRuntime {
+    fn arm() -> Self {
+        Self {
+            go_around: GoAroundLatch::new(),
+            stable_watch: crate::stable_approach::StableWatch::default(),
+            stable_clock: std::time::Instant::now(),
+            stable_balk: None,
+            stable_said: None,
+            gate_recorded: false,
+            orders: crate::go_around::GoAroundWatch::arm(),
+            uncleared: UnclearedWatch::default(),
+            owe_final_report: false,
+            said_going_around: false,
+            going_around_callsign: None,
+            balk_watch: None,
+            spoke_going_around: false,
+        }
+    }
+}
+
 fn announce_autoland(voice: &Option<Voice>, line: String, sev: Priority) {
     tracing::info!(target: "xvoicelayer::autoland", spoke = %line, "copilot");
     if let Some(v) = voice {
@@ -1874,42 +1914,30 @@ fn spawn_autoland(launch: AutolandLaunch) {
             let knob_t0 = std::time::Instant::now();
             // The lever the approach was flown on, for a balloon to hold.
             let mut approach_thr: Option<f64> = None;
-            let mut go_around = GoAroundLatch::new();
             // The stabilised-approach rule (`stable_approach`, #199): the
             // breaches held so far, the clock they are timed on, the balk
             // word and spoken reason of a go-around it ordered, and whether
             // this approach's gate crossing has been recorded.
-            let mut stable_watch = crate::stable_approach::StableWatch::default();
-            let stable_clock = std::time::Instant::now();
-            let mut stable_balk: Option<&'static str> = None;
-            let mut stable_said: Option<&'static str> = None;
-            let mut gate_recorded = false;
             // Watch the tower's go-around orders from here: an order shouted
             // at somebody else's approach half an hour ago must not balk this
             // one on its first tick. A WATCH, never the main loop's `take_*`
             // flag: sharing that flag, the main loop's FSM sync consumed every
             // order before this loop's tick saw it (LEMG 31, 2026-09-28).
             // The pilot's order rides the same watch (`go_around`, #77).
-            let mut orders = crate::go_around::GoAroundWatch::arm();
             // The crew's own watch on the landing clearance (#155).
-            let mut uncleared = UnclearedWatch::default();
             // The final report owed on a SECOND approach. The circuit or the
             // arrival makes the first one, which is what earns the landing
             // clearance; a missed approach then flies away, and until this
             // existed nothing called again — eleven minutes of missed
             // approach at Malaga with the tower waiting on "report downwind",
             // then a landing without a clearance (2026-08-05).
-            let mut owe_final_report = false;
             // The "going around" transmission: said once per balked landing,
             // with the callsign read from the aircraft the first time it's
             // needed (an HTTP read, so not on every tick).
-            let mut said_going_around = false;
-            let mut going_around_callsign: Option<Option<String>> = None;
             // The balk being flown until it climbs (then the call) or the
             // wheels take it (then no call: see [`go_around_call_due`]), and
             // whether the intercom said "going around" for it.
-            let mut balk_watch: Option<BalkWatch> = None;
-            let mut spoke_going_around = false;
+            let mut runtime = ApproachRuntime::arm();
             // The current missed approach's (or pattern's) progress, judged
             // by the ground it makes (`reversal::MissedWatch`), on a clock of
             // this loop's own; and the speed the pattern began at, which
@@ -2139,10 +2167,10 @@ fn spawn_autoland(launch: AutolandLaunch) {
                         None => readback_sent = None,
                         Some(owed) if landing_readback(&owed) && readback_sent.as_deref() != Some(&owed) => {
                             readback_sent = Some(owed.clone());
-                            if going_around_callsign.is_none() {
-                                going_around_callsign = Some(crate::circuit::crew_callsign(&xp).await);
+                            if runtime.going_around_callsign.is_none() {
+                                runtime.going_around_callsign = Some(crate::circuit::crew_callsign(&xp).await);
                             }
-                            let cs = going_around_callsign.clone().flatten();
+                            let cs = runtime.going_around_callsign.clone().flatten();
                             let rwy_words = cleared
                                 .as_deref()
                                 .map(|r| format!(" runway {}", crate::circuit::spell_runway(r)))
@@ -2160,21 +2188,21 @@ fn spawn_autoland(launch: AutolandLaunch) {
                     }
                     // A re-sequence the go-around order named is taken once
                     // the climb away is flown (#182).
-                    let expected = if go_around.climbing() {
+                    let expected = if runtime.go_around.climbing() {
                         None
                     } else {
-                        orders.expected_runway()
+                        runtime.orders.expected_runway()
                     };
                     if let Some(c) = clearance_switch(
                         &rwy.id,
                         crate::party_line::clearance_state(),
                         cleared.as_deref(),
                         clearance_checked.as_deref(),
-                        go_around.active(),
+                        runtime.go_around.active(),
                         expected.as_deref(),
                     ) {
                         clearance_checked = Some(c.clone());
-                        let resequenced = go_around.active();
+                        let resequenced = runtime.go_around.active();
                         match runway_by_id(&apt_dat, lat, lon, &c, 40.0, Some(rwy.icao.as_str())) {
                             Ok(Some(r)) if r.icao == rwy.icao => {
                                 crate::blackbox::record(
@@ -2311,18 +2339,18 @@ fn spawn_autoland(launch: AutolandLaunch) {
                         // never came, so the tower still holds our landing
                         // clearance; the intercom's "going around" is
                         // corrected.
-                        if go_around.active() {
+                        if runtime.go_around.active() {
                             let along_m = along_track_nm(lat, lon, &rwy) * M_PER_NM;
                             crate::blackbox::record(
                                 "autoland",
                                 serde_json::json!({"event": "balk_landed",
-                                    "why": balk_watch.and_then(|w| w.why),
-                                    "balk_radio": balk_watch.map(|w| w.balk_radio_ft),
+                                    "why": runtime.balk_watch.and_then(|w| w.why),
+                                    "balk_radio": runtime.balk_watch.map(|w| w.balk_radio_ft),
                                     "radio": radio_ft, "gs": gs_kts,
                                     "remaining_m": (rwy.length_m + along_m).max(0.0),
-                                    "called": said_going_around}),
+                                    "called": runtime.said_going_around}),
                             );
-                            if spoke_going_around {
+                            if runtime.spoke_going_around {
                                 announce(
                                     "Correction, we're down. Landing, not going around.".into(),
                                     Priority::Caution,
@@ -2677,9 +2705,9 @@ fn spawn_autoland(launch: AutolandLaunch) {
                 // an order given during this approach can trip it.
                 // The pilot's order is flown the same way and answered, so
                 // the `go_around` tool reads back what the aircraft does.
-                if let Some(by) = orders.take() {
-                    let already = go_around.active();
-                    let flown = go_around.order(on_ground > 0.5);
+                if let Some(by) = runtime.orders.take() {
+                    let already = runtime.go_around.active();
+                    let flown = runtime.go_around.order(on_ground > 0.5);
                     if flown {
                         crate::blackbox::record(
                             "autoland",
@@ -2702,17 +2730,17 @@ fn spawn_autoland(launch: AutolandLaunch) {
                 // again at 1,000 ft, go around at 300 (`UnclearedWatch`).
                 // The tower's hold is judged by the monitor on its own; this
                 // is the crew never landing uncleared (#155).
-                match uncleared.step(
+                match runtime.uncleared.step(
                     crate::party_line::clearance_state() == Some(crate::tower::State::Inbound),
                     radio_ft,
                     on_ground > 0.5,
-                    go_around.active(),
+                    runtime.go_around.active(),
                 ) {
                     Some(UnclearedStep::Ask) => {
-                        if going_around_callsign.is_none() {
-                            going_around_callsign = Some(crate::circuit::crew_callsign(&xp).await);
+                        if runtime.going_around_callsign.is_none() {
+                            runtime.going_around_callsign = Some(crate::circuit::crew_callsign(&xp).await);
                         }
-                        let cs = going_around_callsign.clone().flatten();
+                        let cs = runtime.going_around_callsign.clone().flatten();
                         crate::circuit::transmit(crate::circuit::radio_call(
                             &cs,
                             &format!(
@@ -2728,7 +2756,7 @@ fn spawn_autoland(launch: AutolandLaunch) {
                         );
                     }
                     Some(UnclearedStep::GoAround) => {
-                        if go_around.order(on_ground > 0.5) {
+                        if runtime.go_around.order(on_ground > 0.5) {
                             crate::blackbox::record(
                                 "autoland",
                                 serde_json::json!({"event": "uncleared_go_around", "rwy": rwy.id,
@@ -2751,7 +2779,7 @@ fn spawn_autoland(launch: AutolandLaunch) {
                 // with no final before it, the latch's own transition never
                 // sees it.
                 if matches!(raw.balk, Some("unstabilised_at_gate" | "unstabilised_below_floor")) {
-                    go_around.order(on_ground > 0.5);
+                    runtime.go_around.order(on_ground > 0.5);
                 }
                 // THE STABILISED APPROACH (`stable_approach`, #199): by the
                 // gate the landing configuration, on speed, not sinking hard
@@ -2762,7 +2790,7 @@ fn spawn_autoland(launch: AutolandLaunch) {
                 let height_aal = alt - rwy.elev_ft;
                 let judging = raw.phase == ApproachPhase::Final
                     && !raw.arresting
-                    && !go_around.active()
+                    && !runtime.go_around.active()
                     && on_ground < 0.5
                     && along_nm > STABILISED_MIN_ALONG_NM
                     && crate::stable_approach::judged(gate, height_aal);
@@ -2790,20 +2818,20 @@ fn spawn_autoland(launch: AutolandLaunch) {
                 } else {
                     Vec::new()
                 };
-                if judging && !gate_recorded {
-                    gate_recorded = true;
+                if judging && !runtime.gate_recorded {
+                    runtime.gate_recorded = true;
                     crate::blackbox::record(
                         "autoland",
                         stable_record("stable_gate", gate, &stable_sample, &now_breaches, None),
                     );
                 }
                 if let Some(breach) =
-                    stable_watch.step(stable_clock.elapsed().as_secs_f64(), &now_breaches)
+                    runtime.stable_watch.step(runtime.stable_clock.elapsed().as_secs_f64(), &now_breaches)
                 {
-                    stable_watch.reset();
-                    if go_around.order_over_gate(on_ground > 0.5, gate.gate_ft()) {
-                        stable_balk = Some(breach.word());
-                        stable_said = Some(breach.spoken());
+                    runtime.stable_watch.reset();
+                    if runtime.go_around.order_over_gate(on_ground > 0.5, gate.gate_ft()) {
+                        runtime.stable_balk = Some(breach.word());
+                        runtime.stable_said = Some(breach.spoken());
                         crate::blackbox::record(
                             "autoland",
                             stable_record(
@@ -2816,12 +2844,12 @@ fn spawn_autoland(launch: AutolandLaunch) {
                         );
                     }
                 }
-                if go_around.active() {
-                    stable_watch.reset();
-                    gate_recorded = false;
+                if runtime.go_around.active() {
+                    runtime.stable_watch.reset();
+                    runtime.gate_recorded = false;
                 }
-                go_around.note_height_aal(alt - rwy.elev_ft);
-                let mut missed = go_around.update(
+                runtime.go_around.note_height_aal(alt - rwy.elev_ft);
+                let mut missed = runtime.go_around.update(
                     last_phase,
                     raw.phase,
                     radio_ft,
@@ -2892,7 +2920,7 @@ fn spawn_autoland(launch: AutolandLaunch) {
                             // downwind from 1,600 ft at LEMG 13 (2026-09-26).
                             if needed
                                 && late_go_around(along_nm, heading_diff(track_true, rwy.course_deg))
-                                && go_around.order(on_ground > 0.5)
+                                && runtime.go_around.order(on_ground > 0.5)
                             {
                                 crate::blackbox::record(
                                     "autoland",
@@ -3066,7 +3094,7 @@ fn spawn_autoland(launch: AutolandLaunch) {
                                     high: false,
                                 });
                                 if missed == Some(MissedStage::Reposition) {
-                                    go_around.hold_reposition();
+                                    runtime.go_around.hold_reposition();
                                 }
                                 reversal_began = true;
                                 pattern_gs_kts = gs_kts;
@@ -3125,7 +3153,7 @@ fn spawn_autoland(launch: AutolandLaunch) {
                     )
                 }) {
                     reversal = None;
-                    go_around.finish_reposition();
+                    runtime.go_around.finish_reposition();
                     missed = None;
                     crate::blackbox::record(
                         "autoland",
@@ -3176,7 +3204,7 @@ fn spawn_autoland(launch: AutolandLaunch) {
                         Some(h) => pattern = Some((h, rev.leg, rev.platform_ft)),
                         None => {
                             reversal = None;
-                            go_around.finish_reposition();
+                            runtime.go_around.finish_reposition();
                             missed = None;
                             crate::blackbox::record(
                                 "autoland",
@@ -3197,36 +3225,36 @@ fn spawn_autoland(launch: AutolandLaunch) {
                 // 2026-09-27), and then it is a landing, cleared, and nothing
                 // goes out (see [`go_around_call_due`], `balk_landed`).
                 if missed.is_none() {
-                    balk_watch = None;
-                } else if balk_watch.is_none() {
+                    runtime.balk_watch = None;
+                } else if runtime.balk_watch.is_none() {
                     // The stabilised gate's word when it ordered this one.
-                    balk_watch = Some(BalkWatch::new(raw.balk.or(stable_balk.take()), radio_ft));
+                    runtime.balk_watch = Some(BalkWatch::new(raw.balk.or(runtime.stable_balk.take()), radio_ft));
                 }
-                if let Some(w) = balk_watch.as_mut() {
+                if let Some(w) = runtime.balk_watch.as_mut() {
                     w.note(radio_ft, on_ground > 0.5);
                 }
                 if go_around_call_due(
                     missed.is_some(),
-                    said_going_around,
+                    runtime.said_going_around,
                     on_ground > 0.5,
-                    balk_watch.as_ref(),
+                    runtime.balk_watch.as_ref(),
                     radio_ft,
                     prev_vvi.map(|(v, _)| v),
                 ) {
-                    said_going_around = true;
+                    runtime.said_going_around = true;
                     // The go-around VOIDS the landing clearance, so this
                     // approach owes the tower a fresh final report before it
                     // can be cleared again — the call that earns it.
-                    owe_final_report = true;
-                    if going_around_callsign.is_none() {
-                        going_around_callsign = Some(crate::circuit::crew_callsign(&xp).await);
+                    runtime.owe_final_report = true;
+                    if runtime.going_around_callsign.is_none() {
+                        runtime.going_around_callsign = Some(crate::circuit::crew_callsign(&xp).await);
                     }
-                    let cs = going_around_callsign.clone().flatten();
+                    let cs = runtime.going_around_callsign.clone().flatten();
                     crate::circuit::transmit(crate::circuit::radio_call(&cs, "going around"));
                     // `radio` and `why` are the BALK's (the debrief's
                     // "GO-AROUND at N ft radio: why"); `called_radio` is
                     // where the climb made it real.
-                    let w = balk_watch.unwrap_or(BalkWatch::new(raw.balk, radio_ft));
+                    let w = runtime.balk_watch.unwrap_or(BalkWatch::new(raw.balk, radio_ft));
                     crate::blackbox::record(
                         "autoland",
                         serde_json::json!({"event": "going_around", "radio": w.balk_radio_ft,
@@ -3243,16 +3271,16 @@ fn spawn_autoland(launch: AutolandLaunch) {
                 // hears from us again holds nothing to clear us with. Said on
                 // the way IN — established on final, inside the FAP — because
                 // "final" is a position report and it has to be true.
-                if owe_final_report
+                if runtime.owe_final_report
                     && missed.is_none()
                     && raw.phase == ApproachPhase::Final
                     && raw.dist_nm <= FAP_NM
                 {
-                    owe_final_report = false;
-                    if going_around_callsign.is_none() {
-                        going_around_callsign = Some(crate::circuit::crew_callsign(&xp).await);
+                    runtime.owe_final_report = false;
+                    if runtime.going_around_callsign.is_none() {
+                        runtime.going_around_callsign = Some(crate::circuit::crew_callsign(&xp).await);
                     }
-                    let cs = going_around_callsign.clone().flatten();
+                    let cs = runtime.going_around_callsign.clone().flatten();
                     crate::circuit::transmit(crate::circuit::radio_call(
                         &cs,
                         &format!("final runway {}", crate::circuit::spell_runway(&rwy.id)),
@@ -3265,8 +3293,8 @@ fn spawn_autoland(launch: AutolandLaunch) {
                 }
                 // Cleared to try again: the next balked landing is a new call.
                 if missed.is_none() {
-                    said_going_around = false;
-                    spoke_going_around = false;
+                    runtime.said_going_around = false;
+                    runtime.spoke_going_around = false;
                 }
                 // A missed approach (or a pattern) that stops getting anywhere
                 // is its own emergency, judged by the ground it makes, never a
@@ -3391,7 +3419,7 @@ fn spawn_autoland(launch: AutolandLaunch) {
                 // (2026-09-17). The latch's Climb stage runs to
                 // GO_AROUND_TURN_AGL_FT under full power with the go-around
                 // flap; the handback happens there, flaps retracted.
-                if go_around.attempts() > MAX_GO_AROUNDS && missed != Some(MissedStage::Climb) {
+                if runtime.go_around.attempts() > MAX_GO_AROUNDS && missed != Some(MissedStage::Climb) {
                     gave_up = true;
                     let thr_dref = throttle_dref();
                     let _ = tokio::join!(
@@ -3410,7 +3438,7 @@ fn spawn_autoland(launch: AutolandLaunch) {
                     );
                     crate::blackbox::record(
                         "autoland",
-                        serde_json::json!({"event": "give_up", "reason": "max_go_arounds", "attempts": go_around.attempts()}),
+                        serde_json::json!({"event": "give_up", "reason": "max_go_arounds", "attempts": runtime.go_around.attempts()}),
                     );
                     break;
                 }
@@ -4675,7 +4703,7 @@ fn spawn_autoland(launch: AutolandLaunch) {
                                 // Said at once: the power is coming and the
                                 // pilot must know why. Corrected if the
                                 // wheels take it (`balk_landed`).
-                                spoke_going_around = true;
+                                runtime.spoke_going_around = true;
                                 "Going around. Full power, climbing straight ahead."
                             } else {
                                 dropped_final_line(
@@ -4692,7 +4720,7 @@ fn spawn_autoland(launch: AutolandLaunch) {
                         ApproachPhase::Flare => "Over the threshold, flaring, power to idle.",
                     };
                     // A go-around the stabilised gate ordered says why.
-                    let line = match stable_said.take() {
+                    let line = match runtime.stable_said.take() {
                         Some(why) if ga && line.starts_with("Going around") => {
                             format!("Not stabilised, {why}. Going around.")
                         }

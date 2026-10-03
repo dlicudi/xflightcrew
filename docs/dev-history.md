@@ -12599,6 +12599,13 @@ is spoken and logged before the worker releases control. The approach, flare and
 unchanged. This removes roughly 240 lines of setup from the long-lived worker body; all 110
 runnable autoland tests still pass (one real-install test ignored), and the workspace checks.
 
+The approach's operational latches now have one owner, `ApproachRuntime`: the go-around state,
+stabilised-approach watch and verdict, controller and landing-clearance watches, balk call state,
+cached callsign and the second-approach final report. These were thirteen independent locals whose
+reset contract existed only in their initialisers and scattered assignments inside the control
+loop. `ApproachRuntime::arm` is now the reset boundary for a new approach. Guidance filters,
+control laws and their clocks remain outside it. All 110 runnable autoland tests pass unchanged.
+
 ## 2026-10-02: Shobdon C172 taxi candidate correction — live confirmation owed
 
 Sortie 1790942917-full_auto, EGBS runway 08 via Bravo: 706.9 m planned,
