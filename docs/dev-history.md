@@ -12592,6 +12592,13 @@ the current Clippy were named locally; the remaining ATC edits are mechanical li
 real-install test ignored). Strict all-target Clippy exposes a larger pre-existing backlog in test
 and production targets, so it is not yet a clean repository-wide gate.
 
+The next tranche extracts autoland's runway arm from its control loop. `arm_runway` now owns the
+initial position reads, forced/cleared/self-picked runway resolution, mission retarget, ILS tune,
+terrain probes and glideslope-adjusted threshold elevation. It returns one `ArmedRunway`; failure
+is spoken and logged before the worker releases control. The approach, flare and rollout laws are
+unchanged. This removes roughly 240 lines of setup from the long-lived worker body; all 110
+runnable autoland tests still pass (one real-install test ignored), and the workspace checks.
+
 ## 2026-10-02: Shobdon C172 taxi candidate correction — live confirmation owed
 
 Sortie 1790942917-full_auto, EGBS runway 08 via Bravo: 706.9 m planned,

@@ -1543,6 +1543,211 @@ struct AutolandLaunch {
     parents: Vec<std::sync::Arc<AtomicBool>>,
 }
 
+struct ArmedRunway {
+    runway: Runway,
+    ils: Option<crate::nav::Ils>,
+    coupled_ok: bool,
+}
+
+fn announce_autoland(voice: &Option<Voice>, line: String, sev: Priority) {
+    tracing::info!(target: "xvoicelayer::autoland", spoke = %line, "copilot");
+    if let Some(v) = voice {
+        v.alert(sev, line);
+    }
+}
+
+/// Resolve, announce, tune and terrain-correct the one runway this worker
+/// will fly. Failure has already been spoken and logged when this returns
+/// `None`; the caller only has to release the active worker.
+async fn arm_runway(
+    xp: &XPlaneClient,
+    apt_dat: &str,
+    forced_rwy: Option<&PlannedRunway>,
+    gp_deg: f64,
+    voice: &Option<Voice>,
+) -> Option<ArmedRunway> {
+    let (Ok(lat0), Ok(lon0), Ok(_mag_var)) = (
+        xp.get_float(LAT).await,
+        xp.get_float(LON).await,
+        xp.get_float(MAG_VAR).await,
+    ) else {
+        return None;
+    };
+    let hdg0 = xp
+        .get_float("sim/flightmodel/position/psi")
+        .await
+        .unwrap_or(0.0);
+    let cleared = crate::party_line::clearance_runway();
+    let mut from_clearance = false;
+    let picked = match forced_rwy {
+        Some(planned_rwy) => match runway_by_id(
+            apt_dat,
+            lat0,
+            lon0,
+            &planned_rwy.id,
+            40.0,
+            planned_rwy.icao.as_deref(),
+        ) {
+            Ok(None) => {
+                crate::blackbox::record(
+                    "autoland",
+                    serde_json::json!({"event": "forced_runway_missing",
+                        "id": planned_rwy.id, "icao": planned_rwy.icao}),
+                );
+                self_pick(apt_dat, lat0, lon0, hdg0)
+            }
+            Ok(Some(planned)) => {
+                let switch_to = clearance_switch(
+                    &planned.id,
+                    crate::party_line::clearance_state(),
+                    cleared.as_deref(),
+                    None,
+                    false,
+                    None,
+                );
+                match switch_to.as_deref() {
+                    Some(c) => match runway_by_id(
+                        apt_dat,
+                        lat0,
+                        lon0,
+                        c,
+                        40.0,
+                        Some(planned.icao.as_str()),
+                    ) {
+                        Ok(Some(r)) if r.icao == planned.icao => {
+                            crate::blackbox::record(
+                                "autoland",
+                                serde_json::json!({"event": "runway_from_clearance",
+                                    "planned": planned.id, "cleared": r.id}),
+                            );
+                            announce_autoland(
+                                voice,
+                                format!(
+                                    "Tower cleared us for runway {}, not the planned {}. Landing runway {}.",
+                                    crate::circuit::spell_runway(&r.id),
+                                    crate::circuit::spell_runway(&planned.id),
+                                    crate::circuit::spell_runway(&r.id)
+                                ),
+                                Priority::Caution,
+                            );
+                            from_clearance = true;
+                            Ok(Some(r))
+                        }
+                        _ => Ok(Some(planned)),
+                    },
+                    None => Ok(Some(planned)),
+                }
+            }
+            err => err,
+        },
+        None => self_pick(apt_dat, lat0, lon0, hdg0),
+    };
+    let mut runway = match picked {
+        Ok(Some(r)) => r,
+        other => {
+            tracing::warn!(target: "xvoicelayer::autoland", ?other, from=?(lat0, lon0), "no runway found");
+            announce_autoland(
+                voice,
+                "No suitable runway within range. You have the aircraft.".into(),
+                Priority::Warning,
+            );
+            return None;
+        }
+    };
+    tracing::info!(
+        target: "xvoicelayer::autoland",
+        icao = %runway.icao, id = %runway.id, dist_nm = runway.dist_nm,
+        len_m = runway.length_m, course = runway.course_deg, elev = runway.elev_ft,
+        "runway selected"
+    );
+    crate::full_auto::retarget_arrival_runway(
+        &runway.id,
+        armed_runway_why(forced_rwy.map(|p| p.id.as_str()), &runway.id, from_clearance),
+    );
+    announce_autoland(
+        voice,
+        format!(
+            "I'll land at {} runway {}, {:.0} miles. I have the approach.",
+            runway.icao, runway.id, runway.dist_nm
+        ),
+        Priority::Warning,
+    );
+    let ils = crate::ils::tune(xp, &runway.icao, &runway.id, lat0, lon0).await;
+    let coupled_ok = ils.is_some() && crate::ils::coupled_allowed();
+
+    let (aim_lat, aim_lon) = project_latlon(
+        runway.thr_lat,
+        runway.thr_lon,
+        runway.course_deg,
+        TOUCHDOWN_AIM_NM,
+    );
+    let probed = crate::terrain::sample_ft(
+        xp,
+        &[(runway.thr_lat, runway.thr_lon), (aim_lat, aim_lon)],
+    )
+    .await;
+    let (pavement_aim, seen) = aim_elevation_ft(runway.elev_ft, probed.as_deref());
+    let gs_aim = if ils.is_some() {
+        let (nav, icao, id) = (
+            crate::settings::live().nav_data_path.clone(),
+            runway.icao.clone(),
+            runway.id.clone(),
+        );
+        tokio::task::spawn_blocking(move || crate::ils::find_glideslope(&nav, &icao, &id))
+            .await
+            .ok()
+            .flatten()
+            .and_then(|gs| {
+                crate::ils::glideslope_aim_ft(
+                    &gs,
+                    runway.thr_lat,
+                    runway.thr_lon,
+                    runway.course_deg,
+                    TOUCHDOWN_AIM_NM,
+                    gp_deg,
+                )
+            })
+    } else {
+        None
+    };
+    let aim = aim_with_glideslope(pavement_aim, gs_aim);
+    crate::blackbox::record("autoland", serde_json::json!({
+        "event": "threshold_elev", "rwy": format!("{} {}", runway.icao, runway.id),
+        "header_ft": runway.elev_ft, "probed_ft": seen, "aim_ft": aim,
+        "pavement_aim_ft": pavement_aim, "gs_aim_ft": gs_aim,
+        "width_m": runway_width_m(&runway),
+        "xtk_limit_m": landing_xtk_limit_m(runway_width_m(&runway)),
+        "flare_xtk_limit_m": flare_xtk_limit_m(runway_width_m(&runway)),
+    }));
+    if (aim - runway.elev_ft).abs() > THRESHOLD_ELEV_TRUST_FT {
+        let diff = aim - runway.elev_ft;
+        let line = if gs_aim.is_some() {
+            format!(
+                "Runway {} on the glideslope, aiming at {:.0} feet.",
+                crate::circuit::spell_runway(&runway.id),
+                aim
+            )
+        } else {
+            format!(
+                "Runway {} threshold is {:.0} feet {} the field elevation. Aiming at {:.0} feet.",
+                crate::circuit::spell_runway(&runway.id),
+                diff.abs(),
+                if diff < 0.0 { "below" } else { "above" },
+                aim
+            )
+        };
+        announce_autoland(voice, line, Priority::Advisory);
+        runway.elev_ft = aim;
+    } else if (aim - pavement_aim).abs() > 0.5 {
+        runway.elev_ft = aim;
+    }
+    Some(ArmedRunway {
+        runway,
+        ils,
+        coupled_ok,
+    })
+}
+
 fn spawn_autoland(launch: AutolandLaunch) {
     let AutolandLaunch {
         base,
@@ -1607,196 +1812,17 @@ fn spawn_autoland(launch: AutolandLaunch) {
                     serde_json::json!({"event": "glidepath", "deg": gp_deg}),
                 );
             }
-            // Find the runway (a full apt.dat pass, a few seconds — that's why the
-            // tool says "searching"). Needs a valid position first.
-            let (Ok(lat0), Ok(lon0), Ok(track0)) = (
-                xp.get_float(LAT).await, xp.get_float(LON).await, xp.get_float(MAG_VAR).await,
-            ) else { ACTIVE.store(false, Ordering::SeqCst); return };
-            let _ = track0;
-            let hdg0 = xp.get_float("sim/flightmodel/position/psi").await.unwrap_or(0.0);
-            // A forced end (arrival chose by wind) is honoured when it's at the
-            // field; a stale/unfound id falls back to the track-based search
-            // rather than bailing on the landing. The self-pick is the
-            // EMERGENCY path: at a field with parallels it picks whichever
-            // threshold is nearer, which at LEMG put the ILS 12 arrival on 13
-            // against a "cleared to land runway one two" (2026-09-12) — every
-            // planned arrival must hand its runway down (see `EndAction`).
-            let cleared = crate::party_line::clearance_runway();
-            let mut from_clearance = false;
-            let picked = match forced_rwy.as_ref() {
-                Some(planned_rwy) => match runway_by_id(
-                    &apt_dat,
-                    lat0,
-                    lon0,
-                    &planned_rwy.id,
-                    40.0,
-                    planned_rwy.icao.as_deref(),
-                ) {
-                    Ok(None) => {
-                        crate::blackbox::record(
-                            "autoland",
-                            serde_json::json!({"event": "forced_runway_missing",
-                                "id": planned_rwy.id, "icao": planned_rwy.icao}),
-                        );
-                        self_pick(&apt_dat, lat0, lon0, hdg0)
-                    }
-                    Ok(Some(planned)) => {
-                        // The tower's clearance outranks the plan, but only for
-                        // an end at the SAME field — a stale departure clearance
-                        // must never send us to a "09" forty miles away.
-                        // An ARRIVAL's clearance only (`clearance_switch`):
-                        // the ident on the party line is also a departure's
-                        // runway, or merely the runway in use.
-                        let switch_to = clearance_switch(
-                            &planned.id,
-                            crate::party_line::clearance_state(),
-                            cleared.as_deref(),
-                            None,
-                            false,
-                            None,
-                        );
-                        match switch_to.as_deref() {
-                            Some(c) => match runway_by_id(
-                                &apt_dat,
-                                lat0,
-                                lon0,
-                                c,
-                                40.0,
-                                Some(planned.icao.as_str()),
-                            ) {
-                                Ok(Some(r)) if r.icao == planned.icao => {
-                                    crate::blackbox::record(
-                                        "autoland",
-                                        serde_json::json!({"event": "runway_from_clearance",
-                                            "planned": planned.id, "cleared": r.id}),
-                                    );
-                                    announce(
-                                        format!(
-                                            "Tower cleared us for runway {}, not the planned {}. Landing runway {}.",
-                                            crate::circuit::spell_runway(&r.id),
-                                            crate::circuit::spell_runway(&planned.id),
-                                            crate::circuit::spell_runway(&r.id)
-                                        ),
-                                        Priority::Caution,
-                                    );
-                                    from_clearance = true;
-                                    Ok(Some(r))
-                                }
-                                _ => Ok(Some(planned)),
-                            },
-                            None => Ok(Some(planned)),
-                        }
-                    }
-                    err => err,
-                },
-                None => self_pick(&apt_dat, lat0, lon0, hdg0),
-            };
-            let mut rwy = match picked {
-                Ok(Some(r)) => r,
-                other => {
-                    tracing::warn!(target: "xvoicelayer::autoland", ?other, from=?(lat0, lon0), "no runway found");
-                    announce("No suitable runway within range. You have the aircraft.".into(), Priority::Warning);
+            let ArmedRunway {
+                runway: rwy,
+                ils,
+                coupled_ok,
+            } = match arm_runway(&xp, &apt_dat, forced_rwy.as_ref(), gp_deg, &voice).await {
+                Some(armed) => armed,
+                None => {
                     ACTIVE.store(false, Ordering::SeqCst);
                     return;
                 }
             };
-            tracing::info!(
-                target: "xvoicelayer::autoland",
-                icao = %rwy.icao, id = %rwy.id, dist_nm = rwy.dist_nm,
-                len_m = rwy.length_m, course = rwy.course_deg, elev = rwy.elev_ft,
-                "runway selected"
-            );
-            // The runway flown IS the mission's arrival runway, from here to
-            // the vacate: a tower switch at the arm moves it, and a re-arm
-            // on the approach arrives here with it already moved (#64).
-            crate::full_auto::retarget_arrival_runway(
-                &rwy.id,
-                armed_runway_why(forced_rwy.as_ref().map(|p| p.id.as_str()), &rwy.id, from_clearance),
-            );
-            announce(
-                format!("I'll land at {} runway {}, {:.0} miles. I have the approach.", rwy.icao, rwy.id, rwy.dist_nm),
-                Priority::Warning,
-            );
-            // The runway's ILS on NAV1 for every landing that has one: the
-            // raw data cross-checks our path, and flies it where the
-            // airframe allows (`ils`).
-            let ils = crate::ils::tune(&xp, &rwy.icao, &rwy.id, lat0, lon0).await;
-            let coupled_ok = ils.is_some() && crate::ils::coupled_allowed();
-
-            // The pavement's OWN elevation, not the field's. apt.dat carries one
-            // elevation per airport and the glidepath aimed at it: LEAX's
-            // header says 160 ft, its runway 30 threshold lies at ~117, and the
-            // 172 crossed the numbers 99 ft up on a path that was "on" in MSL
-            // terms, never reached the roundout band, and balked "overflew the
-            // runway" 300 m in (2026-09-15). Two probes of the sim's own mesh,
-            // the threshold and the touchdown aim; the higher wins (the aim
-            // must clear both), the header stays when they agree or the probe
-            // is absent or absurd. Said aloud when it moves the aim.
-            {
-                let (aim_lat, aim_lon) =
-                    project_latlon(rwy.thr_lat, rwy.thr_lon, rwy.course_deg, TOUCHDOWN_AIM_NM);
-                let probed = crate::terrain::sample_ft(
-                    &xp,
-                    &[(rwy.thr_lat, rwy.thr_lon), (aim_lat, aim_lon)],
-                )
-                .await;
-                let (pavement_aim, seen) = aim_elevation_ft(rwy.elev_ft, probed.as_deref());
-                // With the ILS tuned, the path lies on its glideslope as far
-                // as the threshold crossing allows (`aim_with_glideslope`).
-                let gs_aim = if ils.is_some() {
-                    let (nav, icao, id) = (
-                        crate::settings::live().nav_data_path.clone(),
-                        rwy.icao.clone(),
-                        rwy.id.clone(),
-                    );
-                    tokio::task::spawn_blocking(move || crate::ils::find_glideslope(&nav, &icao, &id))
-                        .await
-                        .ok()
-                        .flatten()
-                        .and_then(|gs| {
-                            crate::ils::glideslope_aim_ft(
-                                &gs, rwy.thr_lat, rwy.thr_lon, rwy.course_deg, TOUCHDOWN_AIM_NM, gp_deg,
-                            )
-                        })
-                } else {
-                    None
-                };
-                let aim = aim_with_glideslope(pavement_aim, gs_aim);
-                crate::blackbox::record("autoland", serde_json::json!({
-                    "event": "threshold_elev", "rwy": format!("{} {}", rwy.icao, rwy.id),
-                    "header_ft": rwy.elev_ft, "probed_ft": seen, "aim_ft": aim,
-                    "pavement_aim_ft": pavement_aim, "gs_aim_ft": gs_aim,
-                    // The pavement the lateral gates judge against.
-                    "width_m": runway_width_m(&rwy),
-                    "xtk_limit_m": landing_xtk_limit_m(runway_width_m(&rwy)),
-                    "flare_xtk_limit_m": flare_xtk_limit_m(runway_width_m(&rwy)),
-                }));
-                if (aim - rwy.elev_ft).abs() > THRESHOLD_ELEV_TRUST_FT {
-                    let diff = aim - rwy.elev_ft;
-                    let line = if gs_aim.is_some() {
-                        format!(
-                            "Runway {} on the glideslope, aiming at {:.0} feet.",
-                            crate::circuit::spell_runway(&rwy.id),
-                            aim
-                        )
-                    } else {
-                        format!(
-                            "Runway {} threshold is {:.0} feet {} the field elevation. Aiming at {:.0} feet.",
-                            crate::circuit::spell_runway(&rwy.id),
-                            diff.abs(),
-                            if diff < 0.0 { "below" } else { "above" },
-                            aim
-                        )
-                    };
-                    announce(line, Priority::Advisory);
-                    rwy.elev_ft = aim;
-                } else if (aim - pavement_aim).abs() > 0.5 {
-                    // The glideslope put the aim back near the header: the
-                    // header's number, said nothing (a correct aim earns no
-                    // chatter).
-                    rwy.elev_ft = aim;
-                }
-            }
 
             // Engage the AP (FD up first for airframes that need it), and
             // CONFIRM it: the tick re-presses until the servos read on
