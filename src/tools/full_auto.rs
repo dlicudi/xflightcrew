@@ -862,6 +862,15 @@ impl FullAuto {
             &fp.destination,
             fp.cruise_alt_ft,
         );
+        if matches!(fp.source, crate::simbrief::PlanSource::SimBrief) {
+            if let Some(dest) = fp
+                .waypoints
+                .last()
+                .filter(|w| w.ident.eq_ignore_ascii_case(&fp.destination))
+            {
+                crate::procedure::extend_to_arrival_gateway(&mut legs, dest);
+            }
+        }
         // The OFP's planned steps, flown where it planned them (#101).
         record_step_climbs(&mut legs, &fp.schedule);
         // Below the sector altitude of either field, a rejoin heading is
@@ -1355,6 +1364,15 @@ impl FullAuto {
         let star_rechosen = star_line.is_some();
         let (arrival_constraints, arrival_line) =
             crate::plan_audit::arrival_restrictions(&ctx.config.cifp_dir, &fp, &mut legs);
+        if matches!(fp.source, crate::simbrief::PlanSource::SimBrief) {
+            if let Some(dest) = fp
+                .waypoints
+                .last()
+                .filter(|w| w.ident.eq_ignore_ascii_case(&fp.destination))
+            {
+                crate::procedure::extend_to_arrival_gateway(&mut legs, dest);
+            }
+        }
         let arrival_line = match (star_line, arrival_line) {
             (Some(a), Some(b)) => Some(format!("{a} {b}")),
             (a, b) => a.or(b),

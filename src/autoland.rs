@@ -359,11 +359,11 @@ impl PlannedRunway {
     }
 }
 
-/// The specific hard runway END matching `id` within `max_nm`, AT `icao` when
-/// one is given — used when the arrival has ALREADY chosen the runway (by
-/// wind) and autoland must honour that end instead of re-picking by track.
-/// `None` if no such end is in range (the caller falls back to
-/// [`best_landing_runway`]).
+/// The specific runway END matching `id` within `max_nm`, AT `icao` when one
+/// is given — used when the arrival has ALREADY chosen the runway (by wind)
+/// and autoland must honour that end instead of re-picking by track. A named
+/// field may deliberately be turf (LFOS 06); the unnamed/emergency lookup
+/// remains hard-surface-only.
 ///
 /// With `icao: None` this is the old nearest-ident behaviour, which is right
 /// for a self-pick and wrong for anything that knows its destination.
@@ -380,7 +380,9 @@ pub fn runway_by_id(
     // nearby_runways is already nearest-threshold-first.
     let cands = nearby_runways(apt_dat, lat, lon, max_nm)?;
     Ok(cands.into_iter().find(|r| {
-        r.hard() && r.id.trim() == want && at.is_none_or(|a| r.icao.trim().eq_ignore_ascii_case(a))
+        (at.is_some() || r.hard())
+            && r.id.trim() == want
+            && at.is_none_or(|a| r.icao.trim().eq_ignore_ascii_case(a))
     }))
 }
 
@@ -1634,7 +1636,9 @@ async fn arm_runway(
                     serde_json::json!({"event": "forced_runway_missing",
                         "id": planned_rwy.id, "icao": planned_rwy.icao}),
                 );
-                self_pick(apt_dat, lat0, lon0, hdg0)
+                // A named arrival is not an emergency "land anywhere" arm.
+                // Losing its exact end must never silently change airports.
+                Ok(None)
             }
             Ok(Some(planned)) => {
                 let switch_to = clearance_switch(
@@ -4795,8 +4799,8 @@ pub fn clearance_switch(
 /// Why the runway autoland arms on is (or is not) a change of the mission's
 /// arrival runway, for `full_auto::retarget_arrival_runway`: the tower's
 /// clearance moved it at the arm ("clearance"), the forced end was flown as
-/// handed down ("arm", no change), or nothing forced it or the forced end
-/// was missing and the track picked ("self_pick"). Pure.
+/// handed down ("arm", no change), or nothing forced it and the track picked
+/// ("self_pick"). Pure. A missing forced end fails the arm before this runs.
 pub fn armed_runway_why(forced: Option<&str>, flying: &str, from_clearance: bool) -> &'static str {
     if from_clearance {
         "clearance"
@@ -12518,9 +12522,8 @@ mod tests {
         assert!(best.dist_nm < 5.0, "should be right at the field");
     }
 
-    // runway_by_id honours the arrival's already-chosen end: matches by ident,
-    // skips soft surfaces, and returns None for an ident not at the field (the
-    // caller then falls back to the track-based pick).
+    // runway_by_id honours the arrival's already-chosen end: a bare ident is
+    // paved-only, while an exact field may deliberately name its turf runway.
     #[test]
     fn runway_by_id_matches_the_named_hard_end() {
         let dir = std::env::temp_dir().join(format!("xcopilot_rwyid_{}", std::process::id()));
@@ -12549,13 +12552,18 @@ mod tests {
                 .id,
             "09"
         );
-        // The grass end is filtered out (not a landing runway for autoland).
+        // A bare grass end is filtered out of emergency/autoland self-picks.
         assert!(
             runway_by_id(p, 36.15, -5.34, "05", 40.0, None)
                 .unwrap()
                 .is_none(),
             "grass is skipped"
         );
+        // A plan explicitly naming this airport and end owns that choice.
+        let grass = runway_by_id(p, 36.15, -5.34, "05", 40.0, Some("TEST"))
+            .unwrap()
+            .expect("the named turf runway resolves");
+        assert_eq!((grass.icao.as_str(), grass.id.as_str(), grass.surface), ("TEST", "05", 3));
         // An ident that isn't here → None (caller falls back to track pick).
         assert!(
             runway_by_id(p, 36.15, -5.34, "18", 40.0, None)

@@ -2715,6 +2715,63 @@ pub fn enroute_legs(
         .collect()
 }
 
+/// Extend a filed route whose last real fix is remote from its destination to
+/// an arrival handoff point. The destination airport itself stays out of the
+/// enroute legs: flying over it before arming an approach would be too late.
+///
+/// SimBrief EGLF-LFOS ended at WAFFU, 46 nm from LFOS. The follower treated
+/// WAFFU as the end of the flight, slowed for the approach there, and handed
+/// autoland an airport outside its 40 nm runway search (#214). A STAR or local
+/// route that already reaches the arrival area is left byte-for-byte alone.
+pub const ARRIVAL_GATEWAY_NM: f64 = 12.0;
+
+pub fn extend_to_arrival_gateway(
+    legs: &mut Vec<ProcLeg>,
+    destination: &crate::simbrief::Waypoint,
+) -> bool {
+    let Some(last) = legs.last().and_then(|l| l.fix.as_ref()) else {
+        return false;
+    };
+    let dist_nm = crate::nav::haversine_nm(last.lat, last.lon, destination.lat, destination.lon);
+    if !dist_nm.is_finite() || dist_nm <= ARRIVAL_GATEWAY_NM + 3.0 {
+        return false;
+    }
+    let bearing = crate::nav::bearing_deg(destination.lat, destination.lon, last.lat, last.lon);
+    let (lat, lon) = crate::nav::project_latlon(
+        destination.lat,
+        destination.lon,
+        bearing,
+        ARRIVAL_GATEWAY_NM,
+    );
+    let alt = legs.last().and_then(|l| l.alt1_ft);
+    legs.push(ProcLeg {
+        seq: legs.len() as u32,
+        transition: String::new(),
+        leg_type: "TF".to_string(),
+        fix_ident: format!("{} arrival", destination.ident),
+        fix_region: String::new(),
+        fix: Some(crate::nav::Fix {
+            ident: destination.ident.clone(),
+            lat,
+            lon,
+        }),
+        course_mag: None,
+        dist_nm: None,
+        turn: None,
+        alt_desc: ' ',
+        alt1_ft: alt,
+        alt2_ft: None,
+        is_faf: false,
+        is_map: false,
+        vpa_deg: None,
+        navaid_ident: String::new(),
+        navaid_region: String::new(),
+        navaid: None,
+        path: Default::default(),
+    });
+    true
+}
+
 /// Whether the aircraft is positioned to actually FLY this approach — outside
 /// the final approach fix and at/above its crossing altitude. A tight circuit at
 /// pattern height INSIDE the FAF is not (arming there would command a climb back
@@ -7430,6 +7487,38 @@ mod tests {
             wp("LXGB", 36.15, -5.35, 2500.0),
         ];
         assert!(enroute_legs(&wps, "LEJR", "LXGB", 5000.0).is_empty());
+    }
+
+    /// EGLF-LFOS, 2026-10-03 (#214): WAFFU was the final filed fix, 46 nm
+    /// from LFOS. Arrival speed and completion must be measured at an arrival
+    /// gateway, not at WAFFU; a STAR already inside the arrival area is kept.
+    #[test]
+    fn a_remote_last_fix_is_extended_to_the_arrival_gate() {
+        let destination = wp("LFOS", 49.8335278, 0.6500255, 0.0);
+        let mut legs = enroute_legs(
+            &[
+                wp("EGLF", 51.275, -0.776, 0.0),
+                wp("WAFFU", 50.5759, 0.3317, 3000.0),
+                destination.clone(),
+            ],
+            "EGLF",
+            "LFOS",
+            3000.0,
+        );
+        assert!(extend_to_arrival_gateway(&mut legs, &destination));
+        let gate = legs.last().and_then(|l| l.fix.as_ref()).unwrap();
+        assert!(
+            (crate::nav::haversine_nm(gate.lat, gate.lon, destination.lat, destination.lon)
+                - ARRIVAL_GATEWAY_NM)
+                .abs()
+                < 0.05
+        );
+        assert_eq!(legs.last().unwrap().alt1_ft, Some(3000.0));
+        assert_eq!(legs.last().unwrap().fix_ident, "LFOS arrival");
+
+        let n = legs.len();
+        assert!(!extend_to_arrival_gateway(&mut legs, &destination));
+        assert_eq!(legs.len(), n, "an arrival already at the gate is unchanged");
     }
 
     #[test]
