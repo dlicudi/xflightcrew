@@ -12543,6 +12543,23 @@ measurements, a good initial arrest, higher flight and
 every airframe with its own progressive flare power stay on their existing paths. Blackbox
 `power.retard` says `sink`. The recorded -161/-132 fpm/s/0.163 elevator tick is the regression.
 
+## 2026-10-03: the C172's reactive sink rescue was the wrong abstraction
+
+C172 EGLF circuit, sortie 1791029430-full_auto. The final crossed the flare stable near 66 kt and
+on the centreline. The elevator arrested the sink from -156 to -3 fpm at about 21 ft, then the
+default balloon branch dropped 0.183 of pull to neutral in one tick while the legacy flare cut a
+0.497 approach lever to idle. Sink rebuilt through -125, -255 and -402 fpm; the column reached its
+0.35 cap and the Oct 1 rescue restored 0.199 power only at 13.5 ft. Touchdown was 436 fpm at 50 kt,
+about half a metre left of centreline. The rescue detected an energy deficit after there was no
+height left to exchange.
+
+The rescue and its thresholds are removed. The stock C172 now declares the same continuous laws
+used by airframes whose flare dynamics have been measured: power reduces at no more than 0.10 lever
+per second through the flare, and a pull predicting a climb eases at no more than 0.15 elevator per
+second rather than disappearing. The builtin carries the same values when the YAML is unavailable.
+`the_c172_flare_does_not_drop_its_energy_or_column` pins both rates against the EGLF entry state.
+Live confirmation is owed.
+
 ## 2026-10-01: an untowered EGFH arrival kept Cardiff's controller (#210)
 
 C172 EGTF-EGFH, parked and shut down after the sortie. The installed EGFH airport block has no

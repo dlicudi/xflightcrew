@@ -96,6 +96,21 @@ vs_clean_kts: 48.0
 # caution as you approach redline, an urgent prompt at or above it.
 vne_kts: 163.0
 
+# EGLF 24, 2026-10-03, sortie 1791029430: cutting a 0.50 approach lever to
+# idle at 22 ft let the elevator arrest the sink to almost zero, but spent the
+# airspeed holding the aeroplane up. The sink then rebuilt to 436 fpm at the
+# wheels. Fly the energy out continuously instead: walk the lever back through
+# the flare, and ease a pull that predicts a climb instead of dropping the
+# column to neutral in one tick. These are rates, not event-triggered rescues.
+flare_power:
+  reduction_per_second: 0.10
+  retard_max_per_s: 0.10
+flare_elevator:
+  gain: 1.0
+  max: 0.35
+  max_push: 0.10
+  balloon_ease_per_s: 0.15
+
 # EGBS Bravo, 2026-10-02: full linked-nosewheel steering produced about
 # 10 deg/s near 4 kt. Candidate limit for the corner-speed schedule following
 # a 7.6 m scored corner cut and a grass stall. Exact-route and live validation
