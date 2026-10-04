@@ -4335,6 +4335,7 @@ fn spawn_autoland(launch: AutolandLaunch) {
                             vvi,
                             approach_thr,
                             radio_ft > arrest_gates_ft(25.0, gs_kts).1,
+                            cfg.flare_power.is_some(),
                         )
                     })
                     .flatten()
@@ -6294,7 +6295,16 @@ pub fn balloon_power(
     vvi_fpm: Option<f64>,
     approach_thr: Option<f64>,
     above_band: bool,
+    progressive_flare: bool,
 ) -> Option<f64> {
+    // An airframe with a measured progressive retard owns its energy through
+    // the whole flare. Its FlarePower law is monotonic even in a balloon;
+    // restoring approach thrust here bypassed that guarantee and floated the
+    // C172 at LFOS 06 from 23 to 26 ft (2026-10-03). The legacy/no-profile
+    // path still uses approach thrust to bring a committed high balloon back.
+    if progressive_flare {
+        return None;
+    }
     match (vvi_fpm, approach_thr) {
         (Some(v), Some(t)) if (v > BALLOON_CLIMB_FPM || above_band) && t.is_finite() => {
             Some(t.clamp(0.0, 1.0))
@@ -9091,18 +9101,23 @@ mod tests {
 
     #[test]
     fn a_balloon_holds_the_approach_thrust_and_the_ratchet_lets_go_ahead_of_it() {
-        assert_eq!(balloon_power(Some(300.0), Some(0.32), false), Some(0.32));
+        assert_eq!(balloon_power(Some(300.0), Some(0.32), false, false), Some(0.32));
         assert_eq!(
-            balloon_power(Some(-200.0), Some(0.32), false),
+            balloon_power(Some(157.0), Some(0.52), false, true),
+            None,
+            "LFOS: a progressive retard never restores approach power"
+        );
+        assert_eq!(
+            balloon_power(Some(-200.0), Some(0.32), false, false),
             None,
             "sinking in the band: the flare's law"
         );
         assert_eq!(
-            balloon_power(Some(-200.0), Some(0.32), true),
+            balloon_power(Some(-200.0), Some(0.32), true, false),
             Some(0.32),
             "coming back down to the band on power"
         );
-        assert_eq!(balloon_power(Some(300.0), None, false), None, "nothing measured");
+        assert_eq!(balloon_power(Some(300.0), None, false, false), None, "nothing measured");
         // EDLP 24: 0.3 held, vvi -192 easing at +480 fpm/s is a balloon in
         // 0.4 s. The ratchet lets go now instead of at the climb.
         let mut p = FlarePitch::default();
@@ -14341,10 +14356,10 @@ mod lemg_737_flare_tests {
         assert_eq!(h.step(cfg, 0.30, -300.0, 0.3, 25.0, app, app), Some(0.30));
         assert_eq!(h.last_key, Some(RetardKey::Height));
         // A near-level float is not a balloon: no approach thrust back.
-        assert_eq!(super::balloon_power(Some(1.0), Some(0.30), false), None);
-        assert_eq!(super::balloon_power(Some(2.0), Some(0.30), false), None);
+        assert_eq!(super::balloon_power(Some(1.0), Some(0.30), false, false), None);
+        assert_eq!(super::balloon_power(Some(2.0), Some(0.30), false, false), None);
         assert_eq!(
-            super::balloon_power(Some(60.0), Some(0.30), false),
+            super::balloon_power(Some(60.0), Some(0.30), false, false),
             Some(0.30)
         );
     }
@@ -16974,7 +16989,12 @@ mod lemg13_sr22_flare_tests {
                 p.thr_cmd = if !flaring {
                     power.reset();
                     APPROACH_THR.min(p.thr_cmd.max(0.0))
-                } else if let Some(t) = balloon_power(Some(p.v), Some(APPROACH_THR), p.h > band_ft)
+                } else if let Some(t) = balloon_power(
+                    Some(p.v),
+                    Some(APPROACH_THR),
+                    p.h > band_ft,
+                    cfg.is_some(),
+                )
                 {
                     t
                 } else {
@@ -17610,7 +17630,7 @@ mod lemg13_sr22_bounce_tests {
                         power.reset();
                         approach_thr
                     } else if let Some(t) =
-                        balloon_power(Some(p.vvi()), Some(approach_thr), radio > band_ft)
+                        balloon_power(Some(p.vvi()), Some(approach_thr), radio > band_ft, true)
                     {
                         t
                     } else {
@@ -18041,7 +18061,8 @@ mod lemg13_sr22_bounce_tests {
                         p.thr_cmd = if !flaring {
                             approach_thr
                         } else {
-                            balloon_power(Some(vvi), Some(approach_thr), radio > band_ft).unwrap_or(0.0)
+                            balloon_power(Some(vvi), Some(approach_thr), radio > band_ft, false)
+                                .unwrap_or(0.0)
                         };
                     }
                 }
