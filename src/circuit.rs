@@ -47,7 +47,6 @@ const MAG_VAR: &str = "sim/flightmodel/position/magnetic_variation";
 // steer; `sim/autopilot/altitude_hold` is deliberately absent: it holds the
 // CURRENT altitude, not the dial, and locked every pattern at handoff height
 // (2026-07-24)).
-const CMD_SERVOS_ON: &str = "sim/autopilot/servos_on";
 const CMD_HDG_MODE: &str = "sim/autopilot/heading";
 const CMD_VS_MODE: &str = "sim/autopilot/vertical_speed";
 const VS_DIAL: &str = "sim/cockpit/autopilot/vertical_velocity";
@@ -2446,6 +2445,33 @@ impl PatternGuard {
 /// the speed to the governor at `hold_kts`; a pilot's disconnect is left
 /// alone. Only what reads back is claimed.
 #[allow(clippy::too_many_arguments)]
+/// The circuit's lateral re-engage, one tick: the servos pressed through
+/// [`crate::ap_engage::ServoWatch`] (flight director first, re-pressed until
+/// they read in, `ap_engage` / `ap_engaged` on the tape under `site`) while
+/// the heading mode reads off (`wanted`). It used to press `servos_on` alone,
+/// every tick, blind: on an FD airframe a press that cannot hold (refactor
+/// audit 2026-10-04 #5). The servos read OUT with the mode on is the
+/// `PatternGuard`'s, never re-pressed here.
+#[allow(clippy::too_many_arguments)]
+async fn reengage_lateral(
+    xp: &dyn crate::xplane::XPlane,
+    watch: &mut crate::ap_engage::ServoWatch,
+    fd: &[String],
+    now_s: f64,
+    wanted: bool,
+    servos: Option<f64>,
+    ias_kts: f64,
+    site: &str,
+) {
+    let st = watch.step(now_s, wanted, servos, ias_kts);
+    if st.fire {
+        crate::ap_engage::press_logged(xp, fd, "circuit", site, st.try_n).await;
+    }
+    if st.confirmed_now {
+        crate::ap_engage::record_engaged("circuit", site, st.try_n);
+    }
+}
+
 async fn give_up_pattern(
     xp: &XPlaneClient,
     base_url: &str,
@@ -2513,7 +2539,12 @@ async fn give_up_pattern(
     if ours {
         let servos = xp.get_float(SERVOS_ON).await.ok();
         if servos.is_some_and(|v| v < 0.5) {
-            let _ = xp.run_command(CMD_SERVOS_ON).await;
+            // FD first, on the tape (`ap_engage`); the read-back below
+            // judges whether it is holding.
+            crate::ap_engage::press_logged(
+                xp, &crate::ap_engage::fd_commands(), "circuit", "pattern_guard", 1,
+            )
+            .await;
         }
         if let Some(h) = hdg_mag {
             write_bug(xp, h).await;
@@ -2654,7 +2685,12 @@ async fn hold_clear_of_terrain(
     // The autopilot's own capture holds the level: the dial on the hold.
     let bug_mag = true_to_mag(hdg_true, mag_var).rem_euclid(360.0);
     if xp.get_float(SERVOS_ON).await.is_ok_and(|v| v < 0.5) {
-        let _ = xp.run_command(CMD_SERVOS_ON).await;
+        // FD first, on the tape (`ap_engage`); the hold's own guard watches
+        // the servos from here.
+        crate::ap_engage::press_logged(
+            xp, &crate::ap_engage::fd_commands(), "circuit", "terrain_hold", 1,
+        )
+        .await;
     }
     let _ = xp.set_float(ALT_DIAL, hold_ft).await;
     write_bug(xp, bug_mag).await;
@@ -3960,6 +3996,8 @@ async fn fly_authored_route(
     let mut ias_trend = 0.0_f64;
     let t_start = std::time::Instant::now();
     let mut bug_hold = BugHold::default();
+    // The lateral re-engage (`ap_engage::ServoWatch`): FD first, confirmed.
+    let mut servo_watch = crate::ap_engage::ServoWatch::default();
     // Picked from the first good position read, not assumed to be 0.
     let mut wpt_idx: Option<usize> = None;
     let mut closure: Option<Closure> = None;
@@ -3985,7 +4023,7 @@ async fn fly_authored_route(
         }
         let thr_dref = throttle_dref();
         // Position, elevation and heading as ONE frame saw them (#157).
-        let (pos, hp_r, phi_r, hdg_st, vs_st, ias_r, thr_r) = tokio::join!(
+        let (pos, hp_r, phi_r, hdg_st, vs_st, ias_r, thr_r, servos_r) = tokio::join!(
             sim::position::read(&xp),
             xp.get_float(HPATH),
             xp.get_float(PHI),
@@ -3993,6 +4031,7 @@ async fn fly_authored_route(
             xp.get_float(VS_STATUS),
             xp.get_float(IAS),
             xp.get_float(&thr_dref),
+            xp.get_float(SERVOS_ON),
         );
         let (lat_r, lon_r) = sim::position::lat_lon(&pos);
         let elev_r = sim::position::field(&pos, |p| p.elev_m);
@@ -4063,8 +4102,18 @@ async fn fly_authored_route(
             CIRCUIT_LEG_DEADBAND,
         )
         .await;
+        reengage_lateral(
+            &xp,
+            &mut servo_watch,
+            &cfg.fd_commands,
+            t_start.elapsed().as_secs_f64(),
+            !hdg_on,
+            servos_r.as_ref().ok().copied(),
+            ias_r.as_ref().ok().copied().unwrap_or(f64::NAN),
+            "authored",
+        )
+        .await;
         if !hdg_on {
-            let _ = xp.run_command(CMD_SERVOS_ON).await;
             let _ = xp.run_command(CMD_HDG_MODE).await;
         }
 
@@ -4918,6 +4967,8 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, p: Params
     // The pattern's knob from here on (`BugHold`, issue #93).
     let mut bug_hold = BugHold::default();
     let loop_t0 = std::time::Instant::now();
+    // The lateral re-engage (`ap_engage::ServoWatch`): FD first, confirmed.
+    let mut servo_watch = crate::ap_engage::ServoWatch::default();
     // The pattern's own give-up (#160).
     let mut pattern_guard = PatternGuard::default();
     // The autopilot's answer to the dial (#181).
@@ -5303,9 +5354,21 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, p: Params
         )
         .await;
         // The lateral mode must actually be ON for the bug to mean anything —
-        // re-engage like the takeoff's VS guard, never press blind.
+        // re-engage like the takeoff's VS guard, never press blind: the
+        // servos through the one engage (`ap_engage::ServoWatch`, FD first,
+        // confirmed), the mode pressed while it reads off.
+        reengage_lateral(
+            &xp,
+            &mut servo_watch,
+            &p.cfg.fd_commands,
+            loop_t0.elapsed().as_secs_f64(),
+            !hdg_on,
+            servos_r.as_ref().ok().copied(),
+            ias_r.as_ref().ok().copied().unwrap_or(f64::NAN),
+            "rectangle",
+        )
+        .await;
         if !hdg_on {
-            let _ = xp.run_command(CMD_SERVOS_ON).await;
             let _ = xp.run_command(CMD_HDG_MODE).await;
         }
 

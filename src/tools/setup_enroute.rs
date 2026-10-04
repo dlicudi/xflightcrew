@@ -670,7 +670,6 @@ struct EnrouteJob {
     transition_ft: f64,
 }
 
-const CMD_SERVOS_ON: &str = "sim/autopilot/servos_on";
 const CMD_HDG_MODE: &str = "sim/autopilot/heading";
 const CMD_VS_MODE: &str = "sim/autopilot/vertical_speed";
 const VS_STATUS: &str = "sim/cockpit2/autopilot/vvi_status";
@@ -695,7 +694,7 @@ struct Engaged {
 /// engages after its setup), then heading and VS toward the dial, each read
 /// back. At most `ENGAGE_GIVE_UP_S` of live flight.
 async fn engage(xp: &crate::xplane::XPlaneClient, job: &EnrouteJob) -> Engaged {
-    use crate::autoland::ApEngage;
+    use crate::ap_engage::ApEngage;
     let p = &job.placement;
     let var = xp.get_float(MAG_VAR).await.ok().filter(|v| v.is_finite()).unwrap_or(0.0);
     // X-Plane's variation is positive-west: magnetic = true + variation.
@@ -709,10 +708,7 @@ async fn engage(xp: &crate::xplane::XPlaneClient, job: &EnrouteJob) -> Engaged {
         if step.fire {
             let _ = xp.set_float(HDG_BUG, bug).await;
             let _ = xp.set_float(ALT_DIAL, p.alt_ft).await;
-            for c in &job.ap.fd_commands {
-                let _ = xp.run_command(c).await;
-            }
-            let sent = xp.run_command(CMD_SERVOS_ON).await.is_ok();
+            let sent = crate::ap_engage::press(xp, &job.ap.fd_commands).await;
             crate::blackbox::record(
                 "setup",
                 json!({ "event": "enroute_ap_engage", "try": step.try_n, "sent": sent }),

@@ -452,7 +452,6 @@ const PHI_TRUE: &str = "sim/flightmodel/position/true_phi";
 /// of the LXGB 09 arrival it was written for (339 fpm at the wheels).
 const VVI_FPM: &str = crate::datarefs::VVI_FPM;
 // AP + controls (mirror of autopilot.rs / recover.rs).
-const CMD_SERVOS_ON: &str = "sim/autopilot/servos_on";
 const CMD_SERVOS_OFF: &str = "sim/autopilot/servos_off_any";
 /// Servos AND flight director off: the wheels' disconnect.
 const CMD_SERVOS_FDIR_OFF: &str = "sim/autopilot/servos_fdir_off";
@@ -589,146 +588,10 @@ pub fn vs_not_held_line(target_vs_fpm: f64) -> &'static str {
 }
 const VS_DIVERGED_GIVE_UP_S: f64 = 46.0;
 
-/// THE AUTOPILOT IS ENGAGED AND CONFIRMED, never assumed. The arm used to
-/// fire `servos_on` once and never read it back. After `setup_approach` the
-/// sim is still starting the new flight when autoland arms (IAS reads 0 to
-/// 12 kt for the first second), and that one press was lost: LEMG 13
-/// (sortie 1790587073-approach, 2026-09-28) flew with `ap_state` 132 and the
-/// servos off from the arm until the VS watchdog's re-press at +9.5 s, the
-/// aircraft flown by nobody while autoland commanded a climb: -900 fpm at
-/// the start growing to -3,450, 2,318 to 1,697 ft MSL, 405 ft AGL over the
-/// rising ground. Two of six runs lost the press the same way (1790583434,
-/// 1790583663 reached 200 and 145 ft AGL); the re-arms that engaged did so
-/// on the re-arm's own press.
-///
-/// So the press is re-fired every [`ENGAGE_RETRY_S`] until the servos READ
-/// on for [`ENGAGE_CONFIRM_READS`] ticks running with the sim live (an
-/// airspeed that is a flight's, [`ENGAGE_LIVE_IAS_KTS`]: the flight start
-/// can drop an engage made before it), each try blackboxed `ap_engage`. A
-/// failed read is no measurement: it neither confirms nor breaks the run.
-/// Until confirmed, with the servos read OFF, the loop holds the aircraft
-/// level itself on the elevator channel ([`engage_hold_gains`]). No
-/// confirmation within [`ENGAGE_GIVE_UP_S`] of live flight is said and the
-/// approach handed over.
-#[derive(Debug, Clone, Default)]
-pub struct ApEngage {
-    tries: u32,
-    last_fire_s: Option<f64>,
-    live_since_s: Option<f64>,
-    on_reads: u32,
-    /// The last GOOD servo read (true = on); `None` = never read.
-    last_read: Option<bool>,
-    confirmed: bool,
-}
-
-/// Seconds between presses while the servos do not read on: every tick at
-/// the loop's 0.6 s (`servos_on` is not a toggle).
-pub const ENGAGE_RETRY_S: f64 = 0.5;
-/// Consecutive live ticks the servos must read on to be confirmed.
-pub const ENGAGE_CONFIRM_READS: u32 = 2;
-/// An airspeed that is a flight's, not a flight still being started.
-pub const ENGAGE_LIVE_IAS_KTS: f64 = 30.0;
-/// Seconds of live flight without a confirmed engage before the approach is
-/// handed over.
-pub const ENGAGE_GIVE_UP_S: f64 = 10.0;
-
-/// What the engage watch wants this tick.
-#[derive(Debug, Clone, Copy, PartialEq, Default)]
-pub struct EngageStep {
-    /// Press the flight director and `servos_on` now (try number `try_n`).
-    pub fire: bool,
-    pub try_n: u32,
-    /// Hold the aircraft on the elevator channel this tick: not confirmed,
-    /// and the servos last READ off.
-    pub hold: bool,
-    /// Confirmed on this tick (the record is written once).
-    pub confirmed_now: bool,
-    /// No engage within the bound: say it and hand over.
-    pub give_up: bool,
-}
-
-impl ApEngage {
-    /// The press at the arm (try 1): the arm fires before the first tick.
-    pub fn arm(&mut self, now_s: f64) -> EngageStep {
-        self.tries = 1;
-        self.last_fire_s = Some(now_s);
-        EngageStep {
-            fire: true,
-            try_n: 1,
-            hold: false,
-            ..Default::default()
-        }
-    }
-
-    pub fn confirmed(&self) -> bool {
-        self.confirmed
-    }
-
-    pub fn tries(&self) -> u32 {
-        self.tries
-    }
-
-    /// One tick. `servos` is the `servos_on` read (`None` = failed read),
-    /// `ias_kts` the airspeed read this tick.
-    pub fn step(&mut self, now_s: f64, servos: Option<f64>, ias_kts: f64) -> EngageStep {
-        if self.confirmed {
-            return EngageStep::default();
-        }
-        let live = ias_kts.is_finite() && ias_kts >= ENGAGE_LIVE_IAS_KTS;
-        if live && self.live_since_s.is_none() {
-            self.live_since_s = Some(now_s);
-        }
-        match servos {
-            Some(v) if v > 0.5 => {
-                self.last_read = Some(true);
-                if live {
-                    self.on_reads += 1;
-                } else {
-                    self.on_reads = 0;
-                }
-            }
-            Some(_) => {
-                self.last_read = Some(false);
-                self.on_reads = 0;
-            }
-            None => {}
-        }
-        if self.on_reads >= ENGAGE_CONFIRM_READS {
-            self.confirmed = true;
-            return EngageStep {
-                confirmed_now: true,
-                try_n: self.tries,
-                ..Default::default()
-            };
-        }
-        if self
-            .live_since_s
-            .is_some_and(|t0| now_s - t0 >= ENGAGE_GIVE_UP_S)
-        {
-            return EngageStep {
-                give_up: true,
-                try_n: self.tries,
-                ..Default::default()
-            };
-        }
-        let due = self
-            .last_fire_s
-            .is_none_or(|t| now_s - t >= ENGAGE_RETRY_S - 1e-9);
-        // Pressed while the servos last READ off, or were never read; a
-        // failed read after an "on" waits for the next measurement.
-        let fire = due && self.last_read != Some(true);
-        if fire {
-            self.tries += 1;
-            self.last_fire_s = Some(now_s);
-        }
-        EngageStep {
-            fire,
-            try_n: self.tries,
-            hold: self.last_read == Some(false),
-            ..Default::default()
-        }
-    }
-}
+/// The confirmed engager lives in [`crate::ap_engage`] (refactor audit
+/// 2026-10-04 #5: one engage for every loop); re-exported for the arm and
+/// the tests here.
+pub use crate::ap_engage::{ApEngage, EngageStep, ENGAGE_GIVE_UP_S};
 
 /// The elevator law that holds the aircraft LEVEL until the autopilot is
 /// confirmed: the flare's free tracker ([`FlarePitch`] outside the
@@ -1889,8 +1752,7 @@ fn spawn_autoland(launch: AutolandLaunch) {
             let mut engage_held = false;
             {
                 let e = engage.arm(0.0);
-                for c in &cfg.fd_commands { let _ = xp.run_command(c).await; }
-                let ok = xp.run_command(CMD_SERVOS_ON).await.is_ok();
+                let ok = crate::ap_engage::press(&xp, &cfg.fd_commands).await;
                 crate::blackbox::record(
                     "autoland",
                     serde_json::json!({"event": "ap_engage", "try": e.try_n, "sent": ok,
@@ -3682,8 +3544,7 @@ fn spawn_autoland(launch: AutolandLaunch) {
                     EngageStep::default()
                 };
                 if es.fire {
-                    for c in &cfg.fd_commands { let _ = xp.run_command(c).await; }
-                    let ok = xp.run_command(CMD_SERVOS_ON).await.is_ok();
+                    let ok = crate::ap_engage::press(&xp, &cfg.fd_commands).await;
                     crate::blackbox::record(
                         "autoland",
                         serde_json::json!({"event": "ap_engage", "try": es.try_n, "sent": ok,
@@ -3944,7 +3805,15 @@ fn spawn_autoland(launch: AutolandLaunch) {
                         );
                     }
                     ArrestHands::Return => {
-                        let ok = xp.run_command(CMD_SERVOS_ON).await.is_ok();
+                        // The servos back through the one engage door (FD
+                        // first, `ap_engage` on the tape). Not a fresh
+                        // `ApEngage` watch: its level hold would fight the
+                        // balk's climb and its give-up would hand a go-around
+                        // over; the VS watchdog below judges what comes back.
+                        let ok = crate::ap_engage::press_logged(
+                            &xp, &cfg.fd_commands, "autoland", "arrest_return", 1,
+                        )
+                        .await;
                         let _ = xp.run_command(CMD_HDG_MODE).await;
                         let _ = xp.run_command(CMD_VS_MODE).await;
                         let _ = xp.set_float(VS_DIAL, vs_dial).await;
@@ -4601,7 +4470,12 @@ fn spawn_autoland(launch: AutolandLaunch) {
                         // airframe's own protection (the A330's high-speed
                         // law at Vmo) answers to neither a dial nor a mode
                         // command until the servos are back on.
-                        let _ = xp.run_command(CMD_SERVOS_ON).await;
+                        // FD first (`ap_engage`): the watchdog's own clock
+                        // judges whether it held.
+                        crate::ap_engage::press_logged(
+                            &xp, &cfg.fd_commands, "autoland", "vs_watchdog", 1,
+                        )
+                        .await;
                         let _ = xp.run_command(CMD_VS_MODE).await;
                         announce(vs_not_held_line(g.target_vs_fpm).into(), Priority::Warning);
                     }

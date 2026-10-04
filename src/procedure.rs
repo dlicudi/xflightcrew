@@ -52,7 +52,6 @@ const IAS: &str = "sim/flightmodel/position/indicated_airspeed";
 const GS_MS: &str = "sim/flightmodel/position/groundspeed";
 const MS_TO_KTS: f64 = 1.943_84;
 // AP surface (mirror of autopilot.rs / autoland.rs / circuit.rs).
-const CMD_SERVOS_ON: &str = "sim/autopilot/servos_on";
 const CMD_HDG_MODE: &str = "sim/autopilot/heading";
 const CMD_VS_MODE: &str = "sim/autopilot/vertical_speed";
 const VS_DIAL: &str = "sim/cockpit/autopilot/vertical_velocity";
@@ -3079,10 +3078,15 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, plan: Pla
         );
         return;
     }
-    let _ = xp.run_command(CMD_SERVOS_ON).await;
+    // The servos in through the one engage door (`ap_engage`: FD first, on
+    // the tape); the tick's lateral watch below confirms them.
+    // The follower carries no `ApConfig`: the live airframe's FD list.
+    let ap_fd = crate::ap_engage::fd_commands();
+    crate::ap_engage::press_logged(&xp, &ap_fd, "procedure", "seed", 1).await;
     if xp.get_float(HDG_STATUS).await.is_ok_and(|v| v <= 0.5) {
         let _ = xp.run_command(CMD_HDG_MODE).await;
     }
+    let mut servo_watch = crate::ap_engage::ServoWatch::default();
     // What we COMMANDED last tick, a different thing from the leg constraint
     // carried across unconstrained fixes, and the pacing `descent_target_ft`
     // actually needs. They were one variable until 2026-09-13, and since
@@ -3300,6 +3304,7 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, plan: Pla
             gs_r,
             phi_r,
             var_r,
+            servos_r,
         ) = tokio::join!(
             xp.get_float(LAT),
             xp.get_float(LON),
@@ -3314,6 +3319,7 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, plan: Pla
             xp.get_float(GS_MS),
             xp.get_float(crate::datarefs::BANK_DEG),
             xp.get_float(MAG_VAR),
+            xp.get_float(crate::datarefs::SERVOS_ON),
         );
         let now = std::time::Instant::now();
         let dt = now.duration_since(tick_clock).as_secs_f64();
@@ -3915,8 +3921,22 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, plan: Pla
         // mid-climb left the servos off with only the VS re-engage watching,
         // and the aircraft spiralled at 20°/s while the loop slewed a bug
         // nobody was following (LEJR enroute, 2026-07-24).
+        // The servos through the one engage (`ap_engage::ServoWatch`: FD
+        // first, re-pressed until they read in, `ap_engage` / `ap_engaged`).
+        let st = servo_watch.step(
+            started.elapsed().as_secs_f64(),
+            hdg_st <= 0.5,
+            servos_r.as_ref().ok().copied(),
+            ias,
+        );
+        if st.fire {
+            crate::ap_engage::press_logged(&xp, &ap_fd, "procedure", "lateral", st.try_n)
+                .await;
+        }
+        if st.confirmed_now {
+            crate::ap_engage::record_engaged("procedure", "lateral", st.try_n);
+        }
         if hdg_st <= 0.5 {
-            let _ = xp.run_command(CMD_SERVOS_ON).await;
             let _ = xp.run_command(CMD_HDG_MODE).await;
             crate::blackbox::record(
                 "procedure",

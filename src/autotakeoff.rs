@@ -3365,7 +3365,19 @@ async fn no_pitch_take_over(xp: &XPlaneClient, p: &Params, voice: &Option<Voice>
 
 /// A mode command is only a request; handoff needs live mode and dial readbacks.
 /// The SERVOS are read too: lit modes are not an autopilot flying (#160).
-async fn engage_climb(xp: &dyn crate::xplane::XPlane, vs: f64, last: &mut Option<f64>) -> bool {
+/// The servos go in through the one engage door (`ap_engage::press_logged`:
+/// the flight director first, which this press skipped until the refactor
+/// audit's #5, each press `ap_engage` on the tape, `tries` counting them);
+/// the caller re-calls this every tick until everything reads back, so the
+/// confirmation is this function's own read-back, and the VS dial is still
+/// written AFTER the modes (an engage syncs it away).
+async fn engage_climb(
+    xp: &dyn crate::xplane::XPlane,
+    fd: &[String],
+    tries: &mut u32,
+    vs: f64,
+    last: &mut Option<f64>,
+) -> bool {
     if crate::xplane::sim_frozen(xp).await {
         return false;
     }
@@ -3379,10 +3391,11 @@ async fn engage_climb(xp: &dyn crate::xplane::XPlane, vs: f64, last: &mut Option
     else {
         return false;
     };
-    if (heading <= 0.5 || vertical <= 0.5 || servos <= 0.5)
-        && xp.run_command(CMD_SERVOS_ON).await.is_err()
-    {
-        return false;
+    if heading <= 0.5 || vertical <= 0.5 || servos <= 0.5 {
+        *tries += 1;
+        if !crate::ap_engage::press_logged(xp, fd, "autotakeoff", "climb", *tries).await {
+            return false;
+        }
     }
     if heading <= 0.5 && xp.run_command(CMD_HDG_MODE).await.is_err() {
         return false;
@@ -3639,6 +3652,8 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, p: Params) {
     let mut reduced = false;
     let mut wings = WingsLevel::default();
     let mut last_vs_cmd: Option<f64> = None;
+    // The servo presses of the 300 ft engage (`engage_climb`).
+    let mut engage_tries: u32 = 0;
     // The autopilot's climb from the engage on: the climb flown, carried
     // into the law without a step (#150).
     let mut climb_vs = ClimbVs::default();
@@ -4352,7 +4367,7 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, p: Params) {
             vs_flown,
             dt,
         );
-        if !engage_climb(&xp, vs, &mut last_vs_cmd).await {
+        if !engage_climb(&xp, &p.cfg.fd_commands, &mut engage_tries, vs, &mut last_vs_cmd).await {
             continue;
         }
         if !ap_engaged {
@@ -5134,23 +5149,23 @@ mod tests {
             (super::VS_DIAL, 700.0),
         ]);
         let mut last = None;
-        assert!(!super::engage_climb(&xp, 700.0, &mut last).await);
+        assert!(!super::engage_climb(&xp, &[], &mut 0, 700.0, &mut last).await);
         assert!(!xp.ran(super::CMD_SERVOS_ON));
         assert!(!xp.wrote(super::VS_DIAL));
         xp.set_read(crate::datarefs::PAUSED, 0.0);
-        assert!(!super::engage_climb(&xp, 700.0, &mut last).await); // commands ignored
+        assert!(!super::engage_climb(&xp, &[], &mut 0, 700.0, &mut last).await); // commands ignored
         assert!(xp.ran(super::CMD_VS_MODE));
         xp.set_read(super::HDG_STATUS, 1.0);
         xp.set_read(super::VS_STATUS, 1.0);
         // Lit modes with the servos out are not an autopilot flying (#160).
-        assert!(!super::engage_climb(&xp, 700.0, &mut last).await);
+        assert!(!super::engage_climb(&xp, &[], &mut 0, 700.0, &mut last).await);
         xp.set_read(super::SERVOS_ON, 1.0);
-        assert!(super::engage_climb(&xp, 700.0, &mut last).await);
+        assert!(super::engage_climb(&xp, &[], &mut 0, 700.0, &mut last).await);
         xp.set_read(super::VS_STATUS, f64::NAN);
-        assert!(!super::engage_climb(&xp, 700.0, &mut last).await);
+        assert!(!super::engage_climb(&xp, &[], &mut 0, 700.0, &mut last).await);
         xp.set_read(super::VS_STATUS, 1.0);
         xp.set_read(super::SERVOS_ON, f64::NAN);
-        assert!(!super::engage_climb(&xp, 700.0, &mut last).await);
+        assert!(!super::engage_climb(&xp, &[], &mut 0, 700.0, &mut last).await);
     }
 
     /// LEMG 13 SF50 (1790607325, #160): the roll began with HDG and VS lit
@@ -5170,7 +5185,7 @@ mod tests {
             (super::VS_DIAL, 1500.0),
         ]);
         let mut last = None;
-        let _ = super::engage_climb(&xp, 1500.0, &mut last).await;
+        let _ = super::engage_climb(&xp, &[], &mut 0, 1500.0, &mut last).await;
         assert!(xp.ran(super::CMD_SERVOS_ON), "the servos are pressed in");
         // A clean start (every other recorded takeoff: HDG and VS off) is
         // left alone on the ground.

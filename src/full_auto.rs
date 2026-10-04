@@ -4392,7 +4392,11 @@ async fn hold_airborne_end(xp: &XPlaneClient, base_url: &str, voice: &Option<Voi
     // only in VS mode.
     let look = read_airborne_look(xp).await;
     if look.servos.is_some_and(|v| v < 0.5) {
-        let _ = xp.run_command("sim/autopilot/servos_on").await;
+        // FD first, on the tape (`ap_engage`); the watch below judges it.
+        crate::ap_engage::press_logged(
+            xp, &crate::ap_engage::fd_commands(), "full_auto", "airborne_end", 1,
+        )
+        .await;
     }
     if look.hdg_status.is_some_and(|v| v < 0.5) {
         let _ = xp.run_command("sim/autopilot/heading").await;
