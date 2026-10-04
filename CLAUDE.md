@@ -84,7 +84,12 @@ Datarefs and commands stay in the Rust tools; YAML is per-airframe config.
 - **"Enough runway" is ONE rule** (`aircraft::takeoff_needed_m` / `takeoff_needed_now_m`: the roll
   scaled to the weight on the wheels x 1.4, the caller's floor) behind takeoff, circuit, line-up,
   `runway_check` and the preflight: as five copies, a fix reached one (EGPH 2026-09-20). A failed
-  fit is SPOKEN by its gate (`autotakeoff::no_fit_line`), never "not on the runway".
+  fit is SPOKEN by its gate (`autotakeoff::no_fit_line`), never "not on the runway". Its landing
+  twin is `aircraft::landing_needed_m` (the BOOK figure, already a factored field length on the
+  jets; the self-pick adds only its 1,200 m floor). Other one-home rules (refactor 2026-10-04):
+  who flies is `flight_state::Owner` / `crew_has_aircraft`; stopped is `sim::ground`; angles are
+  `sim::angles`; AP engage is `ap_engage::ApEngage`; the speed ceiling is `ceiling_from_vne`
+  (0.9 Vne less 10, under the overspeed caution; `vmo_high:` for an altitude Vmo).
 - Multi-engine tools take `engines`, act per engine, and read back the LAST element written;
   singles stay byte-identical (element 0, starter 1). `vyse_kts`, `vmca_kts` stay `None` on
   singles: say nothing rather than invent.
@@ -92,7 +97,7 @@ Datarefs and commands stay in the Rust tools; YAML is per-airframe config.
   A `match:` hit loads the profile; else `aircraft::generic_from_acf` reads speeds, flaps, gear and weights
   from the `.acf` (`acf_relative_path` under `xplane_root()`) and the pilot hears "no profile for
   this airframe"; only an unreadable file gets the 172, said aloud. Approach = max(1.3 Vso,
-  1.2 Vs). `bus_volts_nominal` scales the start gate.
+  1.2 Vs) (`aircraft::fallback_approach_kts`, Vr `fallback_vr_kts`). `bus_volts_nominal` scales the start gate.
 - **A slatted wing's stall is per notch** (`FlapDetent.vs_kts`, `aircraft::stall_speed_in_config`,
   from the .acf's slat schedule by `detent_stall_from_acf`): the monitor, `config_floor_kts` and
   `speed_verdict` read the same table; with nothing declared it is the straight line (EGPF A330).
@@ -390,7 +395,7 @@ everything blackboxes to `logs/blackbox.jsonl` (kinds: `atc`, `autotaxi`, `autot
 
 ### Holding, writers, reads
 - **A stage not moving the aircraft is holding it**: brakes for every wait, abort and give-up. **A
-  mission that ENDS on the ground stops and parks** (`full_auto::hand_back_hold`, governor or not, a
+  mission that ENDS on the ground stops and parks** (`tools::controls::hand_back_hold`, every stop-and-park, governor or not, a
   pilot's "my controls" included): wheel brakes to a stop, from ANY speed (`brakes_max` above
   `HAND_BACK_BRAKE_MAX_KTS`: a fast skip left a rejected 737 rolling at 70 kt with nobody braking,
   LEMG 13 #112), then `set_park_brake_confirmed` once the held brake command's ride on the ratio
@@ -571,7 +576,7 @@ everything blackboxes to `logs/blackbox.jsonl` (kinds: `atc`, `autotaxi`, `autot
 ### Circuit, procedure, full auto
 (`src/circuit.rs`, `src/procedure.rs`, `src/full_auto.rs`)
 - The pattern is sized to the AP's real turn radius, side and height by terrain and airspace,
-  `pattern_speed_kts` >= 1.3 Vs clean. `climb_limit_fpm` fades climb toward blue line / 1.15 Vs (a
+  `pattern_speed_kts` >= 1.3 Vs clean. `climb_limit_fpm` fades climb toward blue line / 1.2 Vs (a
   climb is never worth more than the airspeed left). Throttle laws watch a speed PROJECTION, led
   and stepped per airframe where the engines lag (`speed_governor:`, `throttle_adjust_live`; the
   A330's level-off ran 265 kt and its downwind 3 km wide over unsampled terrain, #169).
@@ -590,7 +595,7 @@ everything blackboxes to `logs/blackbox.jsonl` (kinds: `atc`, `autotaxi`, `autot
   flew** (`BankWatch`, `final_capture_on_bank`; the 737 banks 25, not the Baron's 15.5). The glidepath feeds forward
   `path_descent_fpm` (a P controller cannot track a ramp).
 - **The sim's heading mode never reverses a turn in progress** (a bug outside a bank goes the long
-  way): every steer goes through `circuit::bug_toward` (on the nose until wings level), leading from
+  way): every steer goes through `heading_bug::bug_toward` (on the nose until wings level), leading from
   level by at most `TURN_ENTRY_LEAD_DEG`. Authored routes have a watchdog (`authored_stalled`).
 - **The AP's own capture holds level legs where declared** (`ap_altitude_capture`,
   `circuit::circuit_dial_ft`, `ap_holds_level`); an AP that refuses VS is said once (`vs_refused`).
@@ -881,7 +886,7 @@ everything blackboxes to `logs/blackbox.jsonl` (kinds: `atc`, `autotaxi`, `autot
 - **A slow, low go-around pitches for speed** (`go_around_vs_fpm`: level over the configuration's
   floor, below it a descent no steeper than the ground 10 s away; `go_around_flap_due`): 0 fpm held
   into a stall (EDLP 24 SF50, 2026-09-24).
-- **The heading knob is set, not rewritten** (`circuit::BugHold`, `autoland::bug_knob`,
+- **The heading knob is set, not rewritten** (`heading_bug::BugHold`, `autoland::bug_knob`,
   `heading_set`): once per leg or phase, steering of 5 degrees or more at once, corrections past a
   deadband; the short final and the flare still steer every tick.
 - **In the flare the column only comes BACK** (`FlarePitch::step` `ratchet`, `FLARE_PITCH_MAX`):
