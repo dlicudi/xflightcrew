@@ -529,7 +529,7 @@ pub fn gear_up_due(
 
 /// True while the takeoff loop runs. Cleared by the loop, the release path
 /// in main ("my controls" — silent stand-down), or the tool's off switch.
-static RUN: sim::run::Slot = sim::run::Slot::new();
+pub(crate) static RUN: sim::run::Slot = sim::run::Slot::new();
 pub fn running() -> bool {
     RUN.running()
 }

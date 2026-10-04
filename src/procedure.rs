@@ -89,7 +89,7 @@ const ENROUTE_BANK_DEG: f64 = 20.0;
 const ALT_MARGIN_FT: f64 = 150.0;
 
 /// True while the procedure follower runs.
-static RUN: sim::run::Slot = sim::run::Slot::new();
+pub(crate) static RUN: sim::run::Slot = sim::run::Slot::new();
 pub fn running() -> bool {
     RUN.running()
 }

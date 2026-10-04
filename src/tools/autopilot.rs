@@ -714,15 +714,11 @@ fn capture_action(dial: f64, target: f64, current_alt: f64, climb: bool) -> Capt
 /// at its next look, so at most one is ever live no matter how many altitude
 /// changes are commanded in quick succession (the `ALT_DIAL` stand-down only
 /// catches a *different* target; two commands to the same altitude, or a
-/// re-command, would otherwise stack independent watchers).
+/// re-command, would otherwise stack independent watchers). It writes the
+/// altitude dial, fires ALT hold and sets the throttle for up to 20 minutes,
+/// so a swap, a new flight or instructor entry cancels it
+/// (`flight_state::LOOPS`).
 pub(crate) static CAPTURE: sim::run::Slot = sim::run::Slot::new();
-
-/// Stand down any live capture watcher: it writes the altitude dial, fires ALT
-/// hold and sets the throttle for up to 20 minutes, so a swap, a new flight or
-/// instructor entry must stop it (`flight_state::stand_down`).
-pub(crate) fn stop_capture_watcher() {
-    CAPTURE.cancel();
-}
 
 /// Fly the AP to a selected altitude in VS mode, then **level off** there.
 ///

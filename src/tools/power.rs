@@ -46,11 +46,6 @@ const STEP_PAUSE_MS: u64 = 400;
 /// the thread missed a stand-down landing before it ran).
 pub(crate) static POWER_UP: sim::run::Slot = sim::run::Slot::new();
 
-/// Stop a running power-up at its next step.
-pub(crate) fn stop_sequences() {
-    POWER_UP.cancel();
-}
-
 pub struct PowerUp;
 
 #[async_trait]

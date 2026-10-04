@@ -39,7 +39,7 @@ const GIVE_UP_THROTTLE: f64 = 0.75;
 const COM1_FREQ_KHZ: &str = crate::datarefs::COM1_FREQ_KHZ;
 
 /// True while the full-auto orchestrator runs.
-static RUN: sim::run::Slot = sim::run::Slot::new();
+pub(crate) static RUN: sim::run::Slot = sim::run::Slot::new();
 pub fn running() -> bool {
     RUN.running()
 }

@@ -14,9 +14,10 @@
 //! - [`stand_down`]: every loop that can hold the aircraft, stopped. Called
 //!   on a swap (a loop cannot fly a different aircraft), on entering
 //!   instructor mode (hands off), and when the sim connection is lost.
-//!   `stand_down_pins_every_active_loop` keeps this list equal to every
-//!   loop flag in the tree (`ACTIVE`, `ABORT`, `RUN`, a `_HELD` hold, a
-//!   watcher's `GEN`), so a new loop cannot be forgotten here.
+//!   It cancels every run in [`LOOPS`], and `stand_down_cancels_every_run`
+//!   keeps that registry equal to every `sim::run::Slot` in the tree (and
+//!   names the door of any loop flag not yet on a run), so a new loop
+//!   cannot be forgotten here.
 //! - [`flight_begins`]: THE new-flight door (ramp, approach and enroute
 //!   setups, a foreign start, the model's reposition): stand-down, the
 //!   crew's flight facts forgotten (`forget_flight`), the old checklist
@@ -259,9 +260,36 @@ fn forget_flight() {
     crate::monitor::forget_destination();
 }
 
-/// Every loop that can hold the aircraft, stopped. Aborts go through each
-/// loop's own door where it has one (the door frees the brakes, ends the
-/// mission, hands back a flyable aircraft); the plain flags are cleared here.
+/// Every loop run in the tree (`sim::run::Slot`), by its path: THE registry
+/// [`stand_down`] cancels. `stand_down_cancels_every_run` keeps it equal to
+/// every `Slot` declared under `src`, so a new loop cannot outlive a swap by
+/// being forgotten here (the old check matched names, and `BRAKES_HELD`, the
+/// capture watcher and the start sequences slipped through it).
+pub(crate) static LOOPS: [(&str, &sim::run::Slot); 18] = [
+    ("full_auto::RUN", &crate::full_auto::RUN),
+    ("procedure::RUN", &crate::procedure::RUN),
+    ("autotakeoff::RUN", &crate::autotakeoff::RUN),
+    ("autoland::RUN", &crate::autoland::RUN),
+    ("circuit::RUN", &crate::circuit::RUN),
+    ("tools::recover::RUN", &crate::tools::recover::RUN),
+    ("taxi_in::RUN", &crate::taxi_in::RUN),
+    ("autotaxi::RUN", &crate::autotaxi::RUN),
+    ("pushback::PUSH", &crate::pushback::PUSH),
+    ("hover::RUN", &crate::hover::RUN),
+    ("heli_circuit::RUN", &crate::heli_circuit::RUN),
+    ("heli_route::RUN", &crate::heli_route::RUN),
+    ("tools::speedhold::GOVERNOR", &crate::tools::speedhold::GOVERNOR),
+    ("tools::reverse::WATCH", &crate::tools::reverse::WATCH),
+    ("tools::controls::BRAKE_HOLD", &crate::tools::controls::BRAKE_HOLD),
+    ("tools::autopilot::CAPTURE", &crate::tools::autopilot::CAPTURE),
+    ("tools::power::POWER_UP", &crate::tools::power::POWER_UP),
+    ("tools::jet_start::JET_START", &crate::tools::jet_start::JET_START),
+];
+
+/// Every loop that can hold the aircraft, stopped. First the doors that do
+/// more than cancel (end the mission and its children, free the brakes,
+/// hand back a flyable aircraft, clear a backtrack or a hand-down), then
+/// every run in [`LOOPS`] cancelled, then the loops not yet on a run.
 pub(crate) fn stand_down() {
     use std::sync::atomic::Ordering::SeqCst;
 
@@ -269,31 +297,26 @@ pub(crate) fn stand_down() {
     crate::circuit::abort();
     crate::procedure::abort();
     crate::autoland::abort();
-    crate::tools::recover::abort();
     // The pitch-authority check was about the flight that ended (#181).
     crate::climb_watch::disarm_authority();
-    crate::approach_guide::cancel();
-    crate::ils::stop_setup_watch();
     crate::autotakeoff::cancel();
-    crate::flow::abort();
-    crate::heli_circuit::abort();
-    crate::heli_route::abort();
-    crate::hover::abort();
     crate::autotaxi::halt();
-    crate::tools::speedhold::release();
-    crate::tools::reverse::stow();
-    crate::tools::engine::MIX_MANAGED.store(false, SeqCst);
-    crate::tools::engine::LEAN_SEEKING.store(false, SeqCst);
     crate::pushback::clear();
-    // The crew's brake hold renews the held command; dropped, it expires.
-    crate::tools::controls::release_held_brakes();
-    // The altitude capture watcher writes the dial, ALT hold and throttle.
-    crate::tools::autopilot::stop_capture_watcher();
-    // A power-up or jet start on its own thread stops at its next step.
-    crate::tools::power::stop_sequences();
-    crate::tools::jet_start::stop();
     // A new flight's setup owns the aircraft: the taxi-in only lets go.
     crate::taxi_in::abort(false);
+    // Every run, whoever holds it: the recovery, the helicopter loops, the
+    // governor, reverse, the brake hold (its held command expires), the
+    // capture watcher (it writes the dial, ALT hold and throttle), a
+    // power-up or jet start (stopped at its next step).
+    for (_, run) in &LOOPS {
+        run.cancel();
+    }
+    // Loops not on a run yet: each its own door.
+    crate::approach_guide::cancel();
+    crate::ils::stop_setup_watch();
+    crate::flow::abort();
+    crate::tools::engine::MIX_MANAGED.store(false, SeqCst);
+    crate::tools::engine::LEAN_SEEKING.store(false, SeqCst);
     // The arrival's hold on the station is a fact about a flight, not about
     // the world: nothing is flying to that destination any more, so the
     // region's ordinary nearest-field handoffs resume.
@@ -492,47 +515,57 @@ fn innermost(active: impl Fn(Owner) -> bool, keep: impl Fn(Owner) -> bool) -> Op
 
 #[cfg(test)]
 mod tests {
-    /// Every module in the tree that declares a loop flag is named in
-    /// [`super::stand_down`], so a new loop cannot outlive a swap by being
-    /// forgotten here. The list is read from the source, like the plugin
-    /// contract's. A loop flag is any static named `ACTIVE`, `ABORT`, `RUN`,
-    /// `GENERATION`, or ending `_HELD` / `GEN` (the brake hold, the capture
-    /// watcher, the start sequences), or typed `sim::run::Slot`, at any
-    /// visibility: matching only `static ACTIVE:` let `BRAKES_HELD`, the
-    /// capture watcher and the jet start through.
+    /// Every loop run in the tree is in the registry [`super::stand_down`]
+    /// cancels, read from the source like the plugin contract's: every
+    /// `sim::run::Slot` declared under `src` is in [`super::LOOPS`] by its
+    /// path, once, and the stand-down sweeps the list. A loop flag NOT on a
+    /// run (an `ABORT`, a `GEN`, a `_HELD`) must be named below with the door
+    /// stand_down calls for it.
     #[test]
-    fn stand_down_pins_every_active_loop() {
-        // Generation counters that are not loops holding the aircraft: the
-        // copilot's speech turn, the barge-in cut per audio channel.
-        const NOT_LOOPS: &[&str] = &["tempo", "tts"];
+    fn stand_down_cancels_every_run() {
+        // Loop flags not (yet) on a run, each with the door that stops it,
+        // and the generation counters that are no loop at all.
+        const NOT_ON_A_RUN: &[(&str, &str, &str)] = &[
+            // The mission's and the follower's own stop latches, read by
+            // their loops beside their runs.
+            ("full_auto", "ABORT", "crate::full_auto::abort()"),
+            ("procedure", "ABORT", "crate::procedure::abort()"),
+            ("autoland", "ABORT", "crate::autoland::abort()"),
+            // Flags beside an unflagged run (one run at a time, `begin`),
+            // cleared by their doors and the run's cleanup.
+            ("full_auto", "ACTIVE", "crate::full_auto::abort()"),
+            ("procedure", "ACTIVE", "crate::procedure::abort()"),
+            ("autotakeoff", "ACTIVE", "crate::autotakeoff::cancel()"),
+            ("flow", "ACTIVE", "crate::flow::abort()"),
+            // The pilot's stop word for the steered push (a mailbox).
+            ("pushback", "ABORT", "crate::pushback::clear()"),
+            // The checklist runner and the ILS setup watch: not yet on runs.
+            ("flow", "ABORT", "crate::flow::abort()"),
+            ("ils", "SETUP_GEN", "crate::ils::stop_setup_watch()"),
+            // The copilot's speech turn and the barge-in cut per channel.
+            ("tempo", "TURN_GEN", ""),
+            ("tts", "CUT_GEN", ""),
+        ];
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
         let this = crate::test_support::module_source("flight_state").to_string();
         let body = this.split("pub(crate) fn stand_down()").nth(1).unwrap();
-        // The function alone: the owner list below it names every loop too.
         let body = body.split("\n}\n").next().unwrap();
-        let mut files = Vec::new();
-        fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
-            for e in std::fs::read_dir(dir).unwrap().flatten() {
-                let p = e.path();
-                if p.is_dir() {
-                    walk(&p, out);
-                } else if p.extension().is_some_and(|x| x == "rs") {
-                    out.push(p);
-                }
-            }
-        }
-        walk(&root, &mut files);
-        let mut missing = Vec::new();
-        let mut checked = 0;
-        for f in files {
-            if crate::test_support::is_test_file(&f) {
+        assert!(
+            body.contains("for (_, run) in &LOOPS {\n        run.cancel();"),
+            "stand_down sweeps the registry"
+        );
+        let names: Vec<&str> = super::LOOPS.iter().map(|(n, _)| *n).collect();
+        let mut sorted = names.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), names.len(), "each run once: {names:?}");
+        let mut slots = Vec::new();
+        let mut stray = Vec::new();
+        for f in crate::test_support::rust_files(&root) {
+            if crate::test_support::is_test_file(&f) || f.ends_with("flight_state.rs") {
                 continue;
             }
             let text = std::fs::read_to_string(&f).unwrap();
-            let declares = text.lines().any(is_loop_flag);
-            if !declares {
-                continue;
-            }
             let rel = f.strip_prefix(&root).unwrap().with_extension("");
             let module = rel
                 .components()
@@ -540,69 +573,80 @@ mod tests {
                 .filter(|c| c != "mod")
                 .collect::<Vec<_>>()
                 .join("::");
-            if NOT_LOOPS.contains(&module.as_str()) {
-                continue;
-            }
-            checked += 1;
-            if !body.contains(&format!("crate::{module}::")) {
-                missing.push(module);
+            let production = text.split("#[cfg(test)]\nmod ").next().unwrap();
+            let flags: Vec<&str> = production
+                .lines()
+                .filter_map(|l| {
+                    let at = l.find("sim::run::Slot::flagged(&")?;
+                    let rest = &l[at + "sim::run::Slot::flagged(&".len()..];
+                    Some(&rest[..rest.find(')')?])
+                })
+                .collect();
+            for line in production.lines() {
+                let Some((name, ty)) = static_decl(line) else {
+                    continue;
+                };
+                if ty.starts_with("sim::run::Slot") {
+                    slots.push(format!("{module}::{name}"));
+                } else if is_loop_flag_name(name) && !flags.contains(&name) {
+                    match NOT_ON_A_RUN.iter().find(|(m, n, _)| *m == module && *n == name) {
+                        Some((_, _, door)) => assert!(
+                            door.is_empty() || body.contains(door),
+                            "stand_down must call {door} for {module}::{name}"
+                        ),
+                        None => stray.push(format!("{module}::{name}")),
+                    }
+                }
             }
         }
-        assert!(checked >= 10, "expected the loop modules, found {checked}");
+        slots.sort();
+        assert_eq!(slots, sorted, "every run in the registry, and only runs");
         assert!(
-            missing.is_empty(),
-            "loops with a loop flag not in stand_down: {missing:?}"
+            stray.is_empty(),
+            "loop flags on no run and not named with their door: {stray:?}"
         );
     }
 
-    /// A process-wide `static` declaring a loop flag, at any visibility.
-    fn is_loop_flag(line: &str) -> bool {
+    /// A process-wide `static` declaration: its name and type, at any
+    /// visibility.
+    fn static_decl(line: &str) -> Option<(&str, &str)> {
         let l = line.trim_start();
         let l = l
             .strip_prefix("pub(crate) ")
             .or_else(|| l.strip_prefix("pub "))
             .unwrap_or(l);
-        let Some(decl) = l.strip_prefix("static ") else {
-            return false;
-        };
-        let Some((name, ty)) = decl.split_once(':') else {
-            return false;
-        };
+        let decl = l.strip_prefix("static ")?;
+        let (name, ty) = decl.split_once(':')?;
         let name = name.trim();
-        if name.is_empty()
-            || !name
+        let upper = !name.is_empty()
+            && name
                 .chars()
-                .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
-        {
-            return false;
-        }
+                .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_');
+        upper.then_some((name, ty.trim_start()))
+    }
+
+    /// The names a loop flag goes by when it is not on a run.
+    fn is_loop_flag_name(name: &str) -> bool {
         matches!(name, "ACTIVE" | "ABORT" | "RUN" | "GENERATION")
             || name.ends_with("_HELD")
             || name.ends_with("GEN")
-            || ty.trim_start().starts_with("sim::run::Slot")
     }
 
     #[test]
     fn loop_flags_beyond_active_are_caught() {
-        assert!(is_loop_flag(
-            "pub static ACTIVE: AtomicBool = AtomicBool::new(false);"
-        ));
-        assert!(is_loop_flag(
-            "static BRAKES_HELD: AtomicBool = AtomicBool::new(false);"
-        ));
-        assert!(is_loop_flag(
-            "static CLIMB_WATCHER_GEN: AtomicU64 = AtomicU64::new(0);"
-        ));
-        assert!(is_loop_flag(
-            "    pub(crate) static RUN: sim::run::Slot = sim::run::Slot::new();"
-        ));
-        assert!(is_loop_flag(
-            "static OWNER: sim::run::Slot = sim::run::Slot::new();"
-        ));
-        assert!(!is_loop_flag(
-            "static LEGEND: AtomicBool = AtomicBool::new(false);"
-        ));
-        assert!(!is_loop_flag("let ACTIVE: bool = true;"));
+        let decl = |l| static_decl(l).map(|(n, _)| n);
+        assert_eq!(
+            decl("pub static ACTIVE: AtomicBool = AtomicBool::new(false);"),
+            Some("ACTIVE")
+        );
+        assert!(is_loop_flag_name("BRAKES_HELD"));
+        assert!(is_loop_flag_name("CLIMB_WATCHER_GEN"));
+        assert_eq!(
+            static_decl("    pub(crate) static RUN: sim::run::Slot = sim::run::Slot::new();"),
+            Some(("RUN", "sim::run::Slot = sim::run::Slot::new();"))
+        );
+        assert!(!is_loop_flag_name("LEGEND"));
+        assert_eq!(decl("let ACTIVE: bool = true;"), None);
     }
 
     /// The rotor facts follow the profile: the S-76 has them, an aeroplane
@@ -875,7 +919,9 @@ mod tests {
             spawn.find("POWER_UP.take_over()").unwrap() < spawn.find("std::thread::spawn").unwrap(),
             "the run is taken on the caller's thread"
         );
-        assert!(body_of(power, "pub(crate) fn stop_sequences()").contains("POWER_UP.cancel()"));
+        let names: Vec<&str> = super::LOOPS.iter().map(|(n, _)| *n).collect();
+        assert!(names.contains(&"tools::power::POWER_UP"));
+        assert!(names.contains(&"tools::jet_start::JET_START"));
         let prep = body_of(
             crate::test_support::module_source("tools/power"),
             "pub(crate) async fn run_prep(",

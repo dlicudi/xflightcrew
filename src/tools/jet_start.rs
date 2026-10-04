@@ -91,11 +91,6 @@ fn say(voice: &Option<Voice>, status: &Option<StatusSink>, line: &str) {
 /// next step, where two used to fire the same switches side by side.
 pub(crate) static JET_START: sim::run::Slot = sim::run::Slot::new();
 
-/// Stop a running jet start at its next step.
-pub(crate) fn stop() {
-    JET_START.cancel();
-}
-
 fn spawn(base: String, voice: Option<Voice>, status: Option<StatusSink>) {
     // Taken on the caller's thread, so a stand-down landing before the thread
     // runs still stops it.
