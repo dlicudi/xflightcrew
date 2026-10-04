@@ -55,10 +55,6 @@ const FIX_MARGIN_NM: f64 = 0.8;
 /// straight-in area allows 90 at most.
 const IF_MAX_TURN_DEG: f64 = 90.0;
 
-fn heading_diff(a: f64, b: f64) -> f64 {
-    (a - b + 540.0).rem_euclid(360.0) - 180.0
-}
-
 /// A published course through a fix, flown toward the fix.
 #[derive(Debug, Clone)]
 pub struct CourseLine(Runway);
@@ -183,7 +179,7 @@ fn roll_lag_lead_nm(gs_kts: f64) -> f64 {
 /// way: the miles it runs along the course and the miles it closes on the
 /// line (either negative: back, or away). Pure.
 fn turn_run_close_nm(from_deg: f64, to_deg: f64, r_nm: f64) -> (f64, f64) {
-    let d = heading_diff(from_deg, to_deg);
+    let d = crate::angles::signed_diff_deg(from_deg, to_deg);
     let (a, b) = ((to_deg + d).to_radians(), to_deg.to_radians());
     if d >= 0.0 {
         (r_nm * (a.sin() - b.sin()), r_nm * (b.cos() - a.cos()))
@@ -201,7 +197,7 @@ fn turn_run_close_nm(from_deg: f64, to_deg: f64, r_nm: f64) -> (f64, f64) {
 /// charged 1.9 radii it never used: at EGBB 15 (#161) the join skipped the IF
 /// at 8.4 nm before the FAF and was established at 6.7, where 2 was asked.
 pub fn intercept_room_nm(xtk_nm: f64, track_true: f64, course_true: f64, r_nm: f64) -> f64 {
-    let toward = heading_diff(track_true, course_true) * -xtk_nm.signum();
+    let toward = crate::angles::signed_diff_deg(track_true, course_true) * -xtk_nm.signum();
     room_from_nm(toward, xtk_nm.abs(), r_nm)
 }
 
@@ -245,7 +241,7 @@ pub fn intercept_room_as_flown_nm(
     r_nm: f64,
 ) -> f64 {
     let heading = course_true - xtk_nm.signum() * INTERCEPT_DEG;
-    let turn = heading_diff(heading, track_true).abs().min(90.0);
+    let turn = crate::angles::abs_diff_deg(heading, track_true).min(90.0);
     let lead = roll_out_lead_nm(r_nm);
     r_nm * turn.to_radians().sin()
         + (xtk_nm.abs() - lead).max(0.0) / INTERCEPT_DEG.to_radians().tan()
@@ -278,7 +274,7 @@ pub fn course_track(
         // flown: from a 30 degree intercept that is the course itself. The
         // bare pursuit set 14 degrees at the roll-out and crossed the line
         // 340 m before the next correction (the #161 join at EGKK).
-        let toward = (heading_diff(track_true, c) * -xtk.signum()).clamp(0.0, 90.0);
+        let toward = (crate::angles::signed_diff_deg(track_true, c) * -xtk.signum()).clamp(0.0, 90.0);
         let closing = r * (1.0 - toward.to_radians().cos())
             + gs_kts.max(60.0) / 3600.0 * ROLL_LAG_S * toward.to_radians().sin();
         let cut = ((xtk.abs() - closing).max(0.0) / TRACK_AIM_NM)
@@ -498,7 +494,7 @@ impl FinalJoin {
         let r = crate::procedure::enroute_turn_radius_nm(gs_kts);
         if self.rev.is_none() {
             let to_if = crate::nav::bearing_deg(lat, lon, at_if.lat, at_if.lon);
-            if heading_diff(c, to_if).abs() <= IF_MAX_TURN_DEG {
+            if crate::angles::abs_diff_deg(c, to_if) <= IF_MAX_TURN_DEG {
                 return Some(Join::Direct);
             }
         }
@@ -564,7 +560,8 @@ impl FinalJoin {
 mod tests {
     use super::*;
     use crate::nav::{project_latlon, Fix};
-    use crate::procedure::{capture_radius_nm, leg_done, leg_turn_deg, HeadingHold};
+    use crate::heading_bug::HeadingHold;
+    use crate::procedure::{capture_radius_nm, leg_done, leg_turn_deg};
 
     /// EGKK I26L as the CIFP codes it (the rows of
     /// `procedure::a_runway_map_hands_autoland_the_approach_at_the_faf`),
@@ -609,7 +606,7 @@ mod tests {
 
     impl Plant {
         fn fly(&mut self, bug_true: f64, dt: f64) {
-            let err = heading_diff(bug_true, self.hdg);
+            let err = crate::angles::signed_diff_deg(bug_true, self.hdg);
             let want = (err * 1.5).clamp(-self.max_bank, self.max_bank);
             self.bank += (want - self.bank).clamp(-5.0 * dt, 5.0 * dt);
             let v = self.gs_kts * 0.514_444;
@@ -694,7 +691,7 @@ mod tests {
             }
             let along = faf.along_nm(p.lat, p.lon);
             let xtk_m = faf.xtk_nm(p.lat, p.lon) * 1852.0;
-            let off = heading_diff(p.hdg, faf.course_true());
+            let off = crate::angles::signed_diff_deg(p.hdg, faf.course_true());
             if out.established_nm.is_none()
                 && xtk_m.abs() < 300.0
                 && off.abs() < 10.0
@@ -858,13 +855,13 @@ mod tests {
         let (t, s) = course_track(&line, lat, lon, c, 210.0, false).unwrap();
         assert_eq!(s, Steer::Intercept);
         assert!(
-            (heading_diff(t, c) - 30.0).abs() < 0.01,
+            (crate::angles::signed_diff_deg(t, c) - 30.0).abs() < 0.01,
             "from the left: course + 30, got {t:.1}"
         );
         let (lat, lon) = at(10.0, 2.0);
         let (t, _) = course_track(&line, lat, lon, c, 210.0, false).unwrap();
         assert!(
-            (heading_diff(t, c) + 30.0).abs() < 0.01,
+            (crate::angles::signed_diff_deg(t, c) + 30.0).abs() < 0.01,
             "from the right: course - 30"
         );
         // Inside the lead (0.24 nm at 210 kt, and 0.15 for the roll-in):
@@ -873,7 +870,7 @@ mod tests {
         let (t, s) = course_track(&line, lat, lon, c, 210.0, false).unwrap();
         assert_eq!(s, Steer::Track);
         assert!(
-            heading_diff(t, c) > 0.0 && heading_diff(t, c) < 5.0,
+            crate::angles::signed_diff_deg(t, c) > 0.0 && crate::angles::signed_diff_deg(t, c) < 5.0,
             "a gentle correction right"
         );
         // Rolling out of the 30 degree cut at the lead: the course itself,
@@ -881,7 +878,7 @@ mod tests {
         let (lat, lon) = at(6.0, -0.35);
         let (t, s) = course_track(&line, lat, lon, c + 30.0, 210.0, false).unwrap();
         assert_eq!(s, Steer::Track);
-        assert!(heading_diff(t, c).abs() < 0.01, "the course, got {:.1}", heading_diff(t, c));
+        assert!(crate::angles::abs_diff_deg(t, c) < 0.01, "the course, got {:.1}", crate::angles::signed_diff_deg(t, c));
         // Tracking holds to twice the geometric lead.
         let (lat, lon) = at(6.0, -0.45);
         assert_eq!(
@@ -1094,10 +1091,10 @@ impl HoldFlight {
                 }
             }
             HoldPhase::TurnOut => {
-                if !self.half && heading_diff(abeam_out, track_true).abs() <= HOLD_HALF_TURN_DONE_DEG {
+                if !self.half && crate::angles::abs_diff_deg(abeam_out, track_true) <= HOLD_HALF_TURN_DONE_DEG {
                     self.half = true;
                 }
-                if self.half && heading_diff(outbound, track_true).abs() <= HOLD_OUTBOUND_BAND_DEG {
+                if self.half && crate::angles::abs_diff_deg(outbound, track_true) <= HOLD_OUTBOUND_BAND_DEG {
                     self.phase = HoldPhase::Outbound;
                     self.outbound_from = Some((lat, lon, now_s));
                 }
@@ -1117,7 +1114,7 @@ impl HoldFlight {
                 }
             }
             HoldPhase::TurnIn => {
-                if heading_diff(abeam_in, track_true).abs() <= HOLD_HALF_TURN_DONE_DEG {
+                if crate::angles::abs_diff_deg(abeam_in, track_true) <= HOLD_HALF_TURN_DONE_DEG {
                     self.phase = HoldPhase::Inbound;
                 }
             }
@@ -1168,13 +1165,13 @@ mod arc_hold_tests {
     fn an_rf_leg_is_flown_round_its_arc_not_across_its_chord() {
         let a = arc();
         let (lat, lon) = project_latlon(47.0, 11.0, 0.0, 3.0);
-        assert!(heading_diff(arc_track(&a, lat, lon), 90.0).abs() < 1.0, "north of the centre, clockwise: east");
+        assert!(crate::angles::abs_diff_deg(arc_track(&a, lat, lon), 90.0) < 1.0, "north of the centre, clockwise: east");
         assert!((arc_remaining_deg(&a, lat, lon) - 90.0).abs() < 1.0);
         assert!(!arc_done(&a, lat, lon, 0.5));
         let (lat, lon) = project_latlon(47.0, 11.0, 0.0, 3.5);
-        assert!(heading_diff(arc_track(&a, lat, lon), 90.0) > 10.0, "outside: toward the centre");
+        assert!(crate::angles::signed_diff_deg(arc_track(&a, lat, lon), 90.0) > 10.0, "outside: toward the centre");
         let (lat, lon) = project_latlon(47.0, 11.0, 0.0, 2.5);
-        let cut = heading_diff(arc_track(&a, lat, lon), 90.0);
+        let cut = crate::angles::signed_diff_deg(arc_track(&a, lat, lon), 90.0);
         assert!(cut < -10.0 && cut >= -INTERCEPT_DEG - 0.01, "inside: outward, {cut}");
         let (lat, lon) = project_latlon(47.0, 11.0, 85.0, 3.0);
         assert!(arc_done(&a, lat, lon, 0.5), "within the capture of the end");
@@ -1183,7 +1180,7 @@ mod arc_hold_tests {
         // Anticlockwise mirrors it.
         let l = Arc { right: false, ..a };
         let (lat, lon) = project_latlon(47.0, 11.0, 180.0, 3.0);
-        assert!(heading_diff(arc_track(&l, lat, lon), 90.0).abs() < 1.0, "south, anticlockwise: east");
+        assert!(crate::angles::abs_diff_deg(arc_track(&l, lat, lon), 90.0) < 1.0, "south, anticlockwise: east");
     }
 
     #[test]
@@ -1230,7 +1227,7 @@ mod arc_hold_tests {
             if let Some(e) = s.end {
                 return (e, h.circuits, crate::nav::haversine_nm(lat, lon, 47.0, 11.0), phases);
             }
-            trk = (trk + heading_diff(s.track_true, trk).clamp(-3.0, 3.0)).rem_euclid(360.0);
+            trk = (trk + crate::angles::signed_diff_deg(s.track_true, trk).clamp(-3.0, 3.0)).rem_euclid(360.0);
             (lat, lon) = project_latlon(lat, lon, trk, gs / 3600.0);
             alt += climb_fpm / 60.0;
         }

@@ -350,6 +350,9 @@ pub fn status() -> Option<String> {
 /// anti-stall reflex ("the needle's unwinding, power NOW" — not "we are now
 /// 10 knots slow"). The slow side gets extra authority: overspeed is a
 /// comfort problem, stall is not.
+/// Test-only since the refactor audit (#11): every live law takes the
+/// airframe's governor through [`throttle_adjust_live`].
+#[cfg(test)]
 pub fn throttle_adjust(err_kts: f64, trend_kts_s: f64) -> f64 {
     throttle_adjust_with(err_kts, trend_kts_s, None)
 }

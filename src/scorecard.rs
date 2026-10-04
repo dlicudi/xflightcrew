@@ -418,10 +418,6 @@ const ROLL_FAILURES: &[&str] = &[
     "released",
 ];
 
-fn angle(a: f64) -> f64 {
-    (a + 540.0).rem_euclid(360.0) - 180.0
-}
-
 impl Scorer {
     pub fn new() -> Self {
         Self::default()
@@ -975,7 +971,7 @@ impl Scorer {
         let drift = self
             .air
             .last()
-            .and_then(|(_, _, h, tr)| tr.map(|tr| angle(h - tr).abs()))
+            .and_then(|(_, _, h, tr)| tr.map(|tr| crate::angles::wrap180(h - tr).abs()))
             .unwrap_or(0.0);
         self.air.clear();
         self.close_landing(out);

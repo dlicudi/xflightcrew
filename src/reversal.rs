@@ -34,12 +34,6 @@
 use crate::autoland::Runway;
 use crate::nav::{bearing_deg, project_latlon};
 
-/// Signed smallest turn from heading `b` to heading `a`, degrees (-180..180,
-/// positive clockwise).
-fn heading_diff(a: f64, b: f64) -> f64 {
-    (a - b + 540.0).rem_euclid(360.0) - 180.0
-}
-
 const M_PER_NM: f64 = 1852.0;
 /// The bank the pattern is SIZED for. Shallower than any autopilot flies
 /// (the 737's heading mode measured about 24 degrees on the EGTE overshoot, a
@@ -206,12 +200,12 @@ pub fn needed(
     final_called: bool,
 ) -> bool {
     if final_called {
-        return heading_diff(track_deg, rwy.course_deg).abs() > FINAL_MAX_TRACK_OFF_DEG;
+        return crate::angles::abs_diff_deg(track_deg, rwy.course_deg) > FINAL_MAX_TRACK_OFF_DEG;
     }
     let recip = (rwy.course_deg + 180.0) % 360.0;
     let (alat, alon) = project_latlon(rwy.thr_lat, rwy.thr_lon, recip, aim_along_nm);
     let arrival = bearing_deg(lat, lon, alat, alon);
-    heading_diff(arrival, rwy.course_deg).abs() > ARRIVAL_MAX_OFF_DEG
+    crate::angles::abs_diff_deg(arrival, rwy.course_deg) > ARRIVAL_MAX_OFF_DEG
 }
 
 /// Inside this of the centreline an inbound leg is ON it.
@@ -245,7 +239,7 @@ pub fn path_joined(
     rev.leg == Leg::Inbound
         && along_nm > 0.0
         && xtk_nm.abs() <= PATH_JOIN_XTK_NM
-        && heading_diff(track_deg, course_deg).abs() <= PATH_JOIN_TRACK_DEG
+        && crate::angles::abs_diff_deg(track_deg, course_deg) <= PATH_JOIN_TRACK_DEG
         && (-PATH_JOIN_BELOW_FT..=PATH_JOIN_ABOVE_FT).contains(&above_path_ft)
 }
 
@@ -307,13 +301,13 @@ pub fn step(
             let brg = bearing_deg(lat, lon, plat, plon);
             // Never steeper across the downwind line than 45 degrees, and
             // never back toward the field.
-            let off = heading_diff(brg, recip).clamp(-45.0, 45.0);
+            let off = crate::angles::signed_diff_deg(brg, recip).clamp(-45.0, 45.0);
             Some((recip + off).rem_euclid(360.0))
         }
         Leg::Base => Some(toward_line),
         Leg::Inbound => {
             if final_called
-                && heading_diff(track_deg, rwy.course_deg).abs() <= FINAL_MAX_TRACK_OFF_DEG
+                && crate::angles::abs_diff_deg(track_deg, rwy.course_deg) <= FINAL_MAX_TRACK_OFF_DEG
             {
                 return None;
             }
@@ -322,7 +316,7 @@ pub fn step(
             let aim = crate::autoland::pursuit_aim_nm(along_nm, gs_kts, rwy.length_m);
             let (alat, alon) = project_latlon(rwy.thr_lat, rwy.thr_lon, recip, aim);
             let brg = bearing_deg(lat, lon, alat, alon);
-            let cut = heading_diff(brg, rwy.course_deg).clamp(-35.0, 35.0);
+            let cut = crate::angles::signed_diff_deg(brg, rwy.course_deg).clamp(-35.0, 35.0);
             Some((rwy.course_deg + cut).rem_euclid(360.0))
         }
     }
@@ -1218,7 +1212,7 @@ mod tests {
 
     impl Plant {
         fn fly(&mut self, bug: f64, dt: f64) {
-            let err = heading_diff(bug, self.hdg);
+            let err = crate::angles::signed_diff_deg(bug, self.hdg);
             let want = (err * 1.5).clamp(-self.max_bank, self.max_bank);
             let roll = (want - self.bank).clamp(-5.0 * dt, 5.0 * dt);
             self.bank += roll;
@@ -1243,7 +1237,7 @@ mod tests {
     /// `held`; the third answer is how often the knob moved (0.2 degrees).
     fn fly_pattern_knob(mut p: Plant, rwy: &Runway, side: f64, held: bool) -> (f64, Vec<Leg>, u32) {
         let join = 5.75;
-        let mut hold = crate::circuit::BugHold::default();
+        let mut hold = crate::heading_bug::BugHold::default();
         let (mut t, mut moves, mut knob_at) = (0.0, 0u32, None::<f64>);
         let mut rev = Some(Reversal {
             side,
@@ -1286,7 +1280,7 @@ mod tests {
                     let recip = (rwy.course_deg + 180.0) % 360.0;
                     let aim = crate::autoland::pursuit_aim_nm(along, p.gs_kts, rwy.length_m);
                     let (alat, alon) = project_latlon(rwy.thr_lat, rwy.thr_lon, recip, aim);
-                    let cut = heading_diff(bearing_deg(p.lat, p.lon, alat, alon), rwy.course_deg)
+                    let cut = crate::angles::signed_diff_deg(bearing_deg(p.lat, p.lon, alat, alon), rwy.course_deg)
                         .clamp(-35.0, 35.0);
                     (rwy.course_deg + cut).rem_euclid(360.0)
                 }
@@ -1312,7 +1306,7 @@ mod tests {
                     None => hold.reset(),
                 }
             }
-            if knob_at.is_none_or(|a| heading_diff(bug, a).abs() >= 0.2) {
+            if knob_at.is_none_or(|a| crate::angles::abs_diff_deg(bug, a) >= 0.2) {
                 moves += 1;
                 knob_at = Some(bug);
             }
@@ -1436,7 +1430,7 @@ mod tests {
         )
         .unwrap();
         assert!(
-            heading_diff(h, 259.0).abs() < 2.0,
+            crate::angles::abs_diff_deg(h, 259.0) < 2.0,
             "downwind heading {h:.0}"
         );
     }

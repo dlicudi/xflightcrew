@@ -870,7 +870,7 @@ fn stand_lead_in(end: (f64, f64), stand: &Stand, m_per_deg_lon: f64) -> Vec<(f64
         return vec![end, spot];
     }
     let straight = bearing_deg(end.0, end.1, spot.0, spot.1);
-    if angle_diff_deg(straight, stand.heading).abs() <= STAND_ALIGN_OK_DEG {
+    if sim::angles::abs_diff_deg(straight, stand.heading) <= STAND_ALIGN_OK_DEG {
         return vec![end, spot];
     }
     let h = stand.heading.to_radians();
@@ -883,7 +883,7 @@ fn stand_lead_in(end: (f64, f64), stand: &Stand, m_per_deg_lon: f64) -> Vec<(f64
     // BEHIND the route's end, the drive needed a 140-170 degree reversal at
     // walking pace, circled, and stopped "off the cleared route" 25 m out.
     let to_back = bearing_deg(end.0, end.1, back.0, back.1);
-    if angle_diff_deg(to_back, stand.heading).abs() > STAND_ALIGN_MAX_TURN_DEG {
+    if sim::angles::abs_diff_deg(to_back, stand.heading) > STAND_ALIGN_MAX_TURN_DEG {
         return vec![end, spot];
     }
     vec![end, back, spot]
@@ -1564,7 +1564,7 @@ fn ride_corner_fillets(
             continue;
         }
         let (b_in, b_out) = (brg(path[k - 1], v), brg(v, path[k + 1]));
-        let turn = angle_diff_deg(b_out, b_in);
+        let turn = sim::angles::signed_diff_deg(b_out, b_in);
         if turn.abs() < FILLET_MIN_TURN_DEG {
             continue;
         }
@@ -1706,7 +1706,7 @@ fn line_dir(line: &[(f64, f64)], at: &[f64], m: f64, brg: f64) -> f64 {
         line_point(line, at, (m + 1.0).min(len)),
     );
     let tangent = bearing_deg(a.0, a.1, b.0, b.1);
-    if angle_diff_deg(tangent, brg).abs() <= 90.0 {
+    if sim::angles::abs_diff_deg(tangent, brg) <= 90.0 {
         1.0
     } else {
         -1.0
@@ -1785,11 +1785,11 @@ fn fillet_fits(
     if len > PAINT_FILL_DETOUR * d(entry, exit) + 5.0 {
         return None;
     }
-    if angle_diff_deg(first, b_in).abs() > FILLET_END_DEG || angle_diff_deg(final_, b_out).abs() > FILLET_END_DEG {
+    if sim::angles::abs_diff_deg(first, b_in) > FILLET_END_DEG || sim::angles::abs_diff_deg(final_, b_out) > FILLET_END_DEG {
         return None;
     }
     let side = turn.signum();
-    if brgs.windows(2).any(|w| angle_diff_deg(w[1], w[0]) * side < -FILLET_WOBBLE_DEG) {
+    if brgs.windows(2).any(|w| sim::angles::signed_diff_deg(w[1], w[0]) * side < -FILLET_WOBBLE_DEG) {
         return None;
     }
     let tri = [xy(entry), (0.0, 0.0), xy(exit)];
@@ -1820,7 +1820,7 @@ fn vertex_turns(pts: &[(f64, f64)], m_per_deg_lon: f64) -> Vec<f64> {
         }
         let b = bearing_deg(last.0, last.1, q.0, q.1);
         if let Some(p) = prev {
-            out.push(angle_diff_deg(b, p));
+            out.push(sim::angles::signed_diff_deg(b, p));
         }
         prev = Some(b);
         last = q;
@@ -2205,7 +2205,7 @@ impl TaxiNet {
     pub fn push_lane(&self, lat: f64, lon: f64, psi_deg: f64) -> Option<Vec<(f64, f64)>> {
         let m_per_deg_lon = 111_320.0 * lat.to_radians().cos();
         let xy = |p: (f64, f64)| ((p.1 - lon) * m_per_deg_lon, (p.0 - lat) * 111_320.0);
-        let diff = |a: f64, b: f64| ((a - b + 540.0).rem_euclid(360.0) - 180.0).abs();
+        let diff = |a: f64, b: f64| sim::angles::abs_diff_deg(a, b);
         let mut best: Option<(f64, Vec<(f64, f64)>)> = None;
         for line in self.stand_lines.iter().chain(self.paint.iter()) {
             let lead = self.stand_lines.contains(line);
@@ -2459,7 +2459,7 @@ impl TaxiNet {
         // that would send us back down the strip.
         let ahead = |p: (f64, f64)| -> bool {
             let brg = bearing_deg(lat, lon, p.0, p.1);
-            angle_diff_deg(brg, psi_true).abs() <= AHEAD_OF_ABEAM_DEG
+            sim::angles::abs_diff_deg(brg, psi_true) <= AHEAD_OF_ABEAM_DEG
         };
         // Which side of the rollout a point lies on, metres, right-positive.
         // The rollout heading IS the runway direction to within a few degrees,
@@ -2589,7 +2589,7 @@ impl TaxiNet {
                     };
                     let np = *self.nodes.get(&nxt)?;
                     let brg = bearing_deg(p.0, p.1, np.0, np.1);
-                    if angle_diff_deg(brg, psi_true).abs() > VACATE_TURN_MAX_DEG {
+                    if sim::angles::abs_diff_deg(brg, psi_true) > VACATE_TURN_MAX_DEG {
                         return None;
                     }
                     // Never onto ANOTHER runway's protected pavement. Ranking
@@ -3149,7 +3149,7 @@ impl TaxiNet {
             let on_strip = |(plat, plon): (f64, f64)| {
                 let d = haversine_nm(r.lat_a, r.lon_a, plat, plon) * 1852.0;
                 let brg = bearing_deg(r.lat_a, r.lon_a, plat, plon);
-                let ang = angle_diff_deg(brg, course).to_radians();
+                let ang = sim::angles::signed_diff_deg(brg, course).to_radians();
                 let along = d * ang.cos();
                 (d * ang.sin()).abs() <= half
                     && along >= -STRIP_NODE_SHOULDER_M
@@ -3172,7 +3172,7 @@ impl TaxiNet {
                     else {
                         return false;
                     };
-                    let off = angle_diff_deg(bearing_deg(pa.0, pa.1, pb.0, pb.1), course).abs();
+                    let off = sim::angles::abs_diff_deg(bearing_deg(pa.0, pa.1, pb.0, pb.1), course);
                     off.min(180.0 - off) <= STRIP_EDGE_ALIGN_DEG
                         && on_strip(((pa.0 + pb.0) / 2.0, (pa.1 + pb.1) / 2.0))
                 })
@@ -3272,7 +3272,7 @@ pub fn best_runway_for_wind(
             (&r.ident_a, r.heading_a_deg()),
             (&r.ident_b, r.heading_b_deg()),
         ] {
-            let diff = angle_diff_deg(wind_from_deg, hdg);
+            let diff = sim::angles::signed_diff_deg(wind_from_deg, hdg);
             let headwind = wind_kts * diff.to_radians().cos();
             if best.as_ref().is_none_or(|(_, _, hw)| headwind > *hw) {
                 best = Some((ident.clone(), hdg, headwind));
@@ -3294,14 +3294,14 @@ pub fn best_runway_for_wind(
                 (&r.ident_b, r.heading_b_deg(), r.length_m()),
             ]
         })
-        .filter(|(_, hdg, _)| angle_diff_deg(*hdg, best_hdg).abs() <= PARALLEL_DEG)
+        .filter(|(_, hdg, _)| sim::angles::abs_diff_deg(*hdg, best_hdg) <= PARALLEL_DEG)
         .fold(None::<(&String, f64, f64)>, |acc, e| match acc {
             Some(a) if a.2 >= e.2 => Some(a),
             _ => Some(e),
         });
     match main {
         Some((id, hdg, _)) if *id != best_id => {
-            let headwind = wind_kts * angle_diff_deg(wind_from_deg, hdg).to_radians().cos();
+            let headwind = wind_kts * sim::angles::signed_diff_deg(wind_from_deg, hdg).to_radians().cos();
             Some((id.clone(), hdg, headwind))
         }
         _ => best,
@@ -3344,9 +3344,9 @@ pub fn close_parallel_main(runways: &[Runway], ident: &str) -> String {
         if std::ptr::eq(r, own) {
             continue;
         }
-        let (end, hdg) = if angle_diff_deg(r.heading_a_deg(), own_hdg).abs() <= PARALLEL_DEG {
+        let (end, hdg) = if sim::angles::abs_diff_deg(r.heading_a_deg(), own_hdg) <= PARALLEL_DEG {
             (&r.ident_a, r.heading_a_deg())
-        } else if angle_diff_deg(r.heading_b_deg(), own_hdg).abs() <= PARALLEL_DEG {
+        } else if sim::angles::abs_diff_deg(r.heading_b_deg(), own_hdg) <= PARALLEL_DEG {
             (&r.ident_b, r.heading_b_deg())
         } else {
             continue;
@@ -3356,7 +3356,7 @@ pub fn close_parallel_main(runways: &[Runway], ident: &str) -> String {
         let (olat, olon) = mid(own);
         let d_nm = haversine_nm(olat, olon, mlat, mlon);
         let brg = bearing_deg(olat, olon, mlat, mlon);
-        let lateral_m = (d_nm * 1852.0 * angle_diff_deg(brg, hdg).to_radians().sin()).abs();
+        let lateral_m = (d_nm * 1852.0 * sim::angles::signed_diff_deg(brg, hdg).to_radians().sin()).abs();
         if lateral_m < CLOSE_PARALLEL_M && r.length_m() > out.1 {
             out = (end.clone(), r.length_m());
         }
@@ -3398,16 +3398,11 @@ pub fn headwind_for(
             (&r.ident_b, r.heading_b_deg()),
         ] {
             if id == ident {
-                return Some(wind_kts * angle_diff_deg(wind_from_deg, hdg).to_radians().cos());
+                return Some(wind_kts * sim::angles::signed_diff_deg(wind_from_deg, hdg).to_radians().cos());
             }
         }
     }
     None
-}
-
-/// Smallest signed angle a−b, degrees, in −180..180.
-pub(crate) fn angle_diff_deg(a: f64, b: f64) -> f64 {
-    (a - b + 540.0).rem_euclid(360.0) - 180.0
 }
 
 /// Initial great-circle bearing from point 1 to point 2, degrees true 0..360.
@@ -3900,13 +3895,13 @@ pub fn visual_segment(
     // Position relative to the runway: the MAP lies BEFORE the threshold on
     // the approach side, so from the threshold it bears the reciprocal.
     let from_thr = bearing_deg(thr.0, thr.1, mf.lat, mf.lon);
-    let off = angle_diff_deg(from_thr, (course_deg + 180.0).rem_euclid(360.0));
+    let off = sim::angles::signed_diff_deg(from_thr, (course_deg + 180.0).rem_euclid(360.0));
     let lateral_nm = dist_nm * off.to_radians().sin().abs();
     let height_ft = map_ft - thr_ft;
     Some(VisualSegment {
         dist_nm,
         lateral_nm,
-        course_diff_deg: angle_diff_deg(final_course, course_deg).abs(),
+        course_diff_deg: sim::angles::abs_diff_deg(final_course, course_deg),
         angle_deg: (height_ft / (dist_nm * 6076.12)).atan().to_degrees(),
     })
 }
@@ -4866,7 +4861,7 @@ pub fn reconstruct_approach(
     let inbound_from = (course + 180.0).rem_euclid(360.0);
     dfix.retain(|(_, ident, lat, lon)| {
         let brg = bearing_deg(thr_lat, thr_lon, *lat, *lon);
-        let off = ((brg - inbound_from + 540.0).rem_euclid(360.0) - 180.0).abs();
+        let off = sim::angles::abs_diff_deg(brg, inbound_from);
         let aligned = off <= RECON_ALIGN_DEG;
         if !aligned {
             tracing::info!(
@@ -5266,7 +5261,7 @@ SID:070,5,LEGL1W,RW10,LEGLO,LI,E,A,EE  ,R,010,TF, , , , , ,      ,    ,    ,    
         let pts = stand_lead_in(at(70.0, 60.0), &stand, mpl);
         assert_eq!(pts.len(), 3, "via the parking line");
         let last = bearing_deg(pts[1].0, pts[1].1, pts[2].0, pts[2].1);
-        assert!(angle_diff_deg(last, 237.5).abs() < 1.0, "arrives on 237.5: {last:.1}");
+        assert!(sim::angles::abs_diff_deg(last, 237.5) < 1.0, "arrives on 237.5: {last:.1}");
         let back = haversine_nm(pts[1].0, pts[1].1, pts[2].0, pts[2].1) * 1852.0;
         assert!((back - STAND_ALIGN_M).abs() < 0.5, "{back:.1} m back");
         // EDLP 7C (2026-09-24): the route ends WEST of the stand, so the back
@@ -6074,7 +6069,7 @@ STAR:030,6,ALWYS3,RW28B,ARRTU,K2,P,C,E   , ,   ,TF, , , , , ,      ,    ,    ,  
             }
             let brg = dx.atan2(dy).to_degrees().rem_euclid(360.0);
             if let Some(p) = prev {
-                let turn = angle_diff_deg(brg, p);
+                let turn = sim::angles::signed_diff_deg(brg, p);
                 assert!(turn.abs() < 12.0, "a {turn:.0} degree vertex at {w:?}");
             }
             prev = Some(brg);
@@ -6594,7 +6589,7 @@ STAR:030,6,ALWYS3,RW28B,ARRTU,K2,P,C,E   , ,   ,TF, , , , , ,      ,    ,    ,  
                     let end = bearing_deg(l[n - 2].0, l[n - 2].1, l[n - 1].0, l[n - 1].1);
                     let nose = (end + 180.0).rem_euclid(360.0);
                     lens.push(len as i64);
-                    turns.push((((nose - st.heading + 540.0).rem_euclid(360.0)) - 180.0) as i64);
+                    turns.push(sim::angles::signed_diff_deg(nose, st.heading) as i64);
                 }
             }
             lens.sort();
@@ -6822,7 +6817,7 @@ STAR:030,6,ALWYS3,RW28B,ARRTU,K2,P,C,E   , ,   ,TF, , , , , ,      ,    ,    ,  
         let ct = |p: (f64, f64)| {
             let d = haversine_nm(thr.0, thr.1, p.0, p.1) * 1852.0;
             let b = bearing_deg(thr.0, thr.1, p.0, p.1);
-            d * angle_diff_deg(b, course).to_radians().sin()
+            d * sim::angles::signed_diff_deg(b, course).to_radians().sin()
         };
         let zone = vec!["04R".to_string(), "22L".to_string()];
         let plan = net
@@ -6874,7 +6869,7 @@ STAR:030,6,ALWYS3,RW28B,ARRTU,K2,P,C,E   , ,   ,TF, , , , , ,      ,    ,    ,  
         let ct = |p: (f64, f64)| {
             let d = haversine_nm(tlat, tlon, p.0, p.1) * 1852.0;
             let b = bearing_deg(tlat, tlon, p.0, p.1);
-            d * angle_diff_deg(b, course).to_radians().sin()
+            d * sim::angles::signed_diff_deg(b, course).to_radians().sin()
         };
         let last = *plan.lead_on.last().expect("a lead-on to drive");
         println!(
@@ -6964,7 +6959,7 @@ STAR:030,6,ALWYS3,RW28B,ARRTU,K2,P,C,E   , ,   ,TF, , , , , ,      ,    ,    ,  
         let ct = |p: (f64, f64)| {
             let d = haversine_nm(tlat, tlon, p.0, p.1) * 1852.0;
             let b = bearing_deg(tlat, tlon, p.0, p.1);
-            d * angle_diff_deg(b, course).to_radians().sin()
+            d * sim::angles::signed_diff_deg(b, course).to_radians().sin()
         };
         for hold in [40.0, 60.0, 100.0] {
             let plan = net
@@ -7632,7 +7627,7 @@ SID:030,5,BLN4L,RW30,BLN,LE,D, ,VE  , ,   ,TF, , , , , ,      ,    ,    ,    ,  
             .expect("a route to 03");
         let turn = |a: (f64, f64), b: (f64, f64), c: (f64, f64)| {
             let d = bearing_deg(b.0, b.1, c.0, c.1) - bearing_deg(a.0, a.1, b.0, b.1);
-            ((d + 540.0).rem_euclid(360.0) - 180.0).abs()
+            sim::angles::wrap180(d).abs()
         };
         // As planned before: out to node 5 and back up the taxiway.
         let node5 = net.nodes[&5];
@@ -7642,7 +7637,7 @@ SID:030,5,BLN4L,RW30,BLN,LE,D, ,VE  , ,   ,TF, , , , , ,      ,    ,    ,    ,  
         assert!(!plan.path.contains(&node5), "node 5 is behind us: {:?}", plan.path);
         assert_eq!(plan.seg.len(), plan.path.len() - 1);
         let first = bearing_deg(lat, lon, plan.path[1].0, plan.path[1].1);
-        let off_nose = ((first - psi + 540.0).rem_euclid(360.0) - 180.0).abs();
+        let off_nose = sim::angles::abs_diff_deg(first, psi);
         assert!(off_nose < 30.0, "first leg {first:.0} vs nose {psi}");
         for w in plan.path.windows(3) {
             let t = turn(w[0], w[1], w[2]);
@@ -8027,7 +8022,7 @@ SID:030,5,BLN4L,RW30,BLN,LE,D, ,VE  , ,   ,TF, , , , , ,      ,    ,    ,    ,  
                             .iter()
                             .any(|&(la, lo, h)| {
                                 haversine_nm(lat, lon, la, lo) * 1852.0 <= 300.0
-                                    && angle_diff_deg(h, hdg).abs() >= 10.0
+                                    && sim::angles::abs_diff_deg(h, hdg) >= 10.0
                             })
                     });
                     if let Some((j, _)) = other {
@@ -8052,7 +8047,7 @@ SID:030,5,BLN4L,RW30,BLN,LE,D, ,VE  , ,   ,TF, , , , , ,      ,    ,    ,    ,  
         // Cross- and along-track of `p` from strip `r`'s centreline, from end A.
         let track = |r: &Runway, p: (f64, f64)| {
             let d = haversine_nm(r.lat_a, r.lon_a, p.0, p.1) * 1852.0;
-            let ang = angle_diff_deg(bearing_deg(r.lat_a, r.lon_a, p.0, p.1), r.heading_a_deg())
+            let ang = sim::angles::signed_diff_deg(bearing_deg(r.lat_a, r.lon_a, p.0, p.1), r.heading_a_deg())
                 .to_radians();
             ((d * ang.sin()).abs(), d * ang.cos())
         };
@@ -8122,7 +8117,7 @@ SID:030,5,BLN4L,RW30,BLN,LE,D, ,VE  , ,   ,TF, , , , , ,      ,    ,    ,    ,  
                         else {
                             return false;
                         };
-                        let off = angle_diff_deg(bearing_deg(pa.0, pa.1, pb.0, pb.1), s.heading_a_deg())
+                        let off = sim::angles::signed_diff_deg(bearing_deg(pa.0, pa.1, pb.0, pb.1), s.heading_a_deg())
                             .abs();
                         off.min(180.0 - off) <= STRIP_EDGE_ALIGN_DEG
                     };
@@ -8202,7 +8197,7 @@ SID:030,5,BLN4L,RW30,BLN,LE,D, ,VE  , ,   ,TF, , , , , ,      ,    ,    ,    ,  
             let first = bearing_deg(lat, lon, plan.path[1].0, plan.path[1].1);
             let then = bearing_deg(plan.path[1].0, plan.path[1].1, plan.path[2].0, plan.path[2].1);
             println!("from {lat},{lon}: {first:.1} then {then:.1}");
-            assert!(((first - 327.7 + 540.0) % 360.0 - 180.0).abs() > 150.0, "the way out is behind: {first}");
+            assert!(sim::angles::abs_diff_deg(first, 327.7) > 150.0, "the way out is behind: {first}");
             assert!((then - 222.2).abs() < 1.0, "{then}");
         }
         let lane = net.push_lane(36.67335705897913, -4.489441674810065, 327.7).expect("a painted lane");
@@ -8353,7 +8348,7 @@ SID:030,5,BLN4L,RW30,BLN,LE,D, ,VE  , ,   ,TF, , , , , ,      ,    ,    ,    ,  
                 }
                 let b = bearing_deg(last.0, last.1, q.0, q.1);
                 if let Some(p) = prev {
-                    out.push(angle_diff_deg(b, p));
+                    out.push(sim::angles::signed_diff_deg(b, p));
                 }
                 prev = Some(b);
                 last = q;

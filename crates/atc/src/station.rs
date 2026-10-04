@@ -4767,8 +4767,8 @@ pub fn on_active_runway_facing(lat: f64, lon: f64, heading_true: Option<f64>) ->
         let nearer = on_runway(r, lat, lon)?;
         Some(match heading_true.filter(|h| h.is_finite()) {
             Some(h) => {
-                let off_a = crate::nav::angle_diff_deg(h, r.heading_a_deg()).abs();
-                let off_b = crate::nav::angle_diff_deg(h, r.heading_b_deg()).abs();
+                let off_a = sim::angles::abs_diff_deg(h, r.heading_a_deg());
+                let off_b = sim::angles::abs_diff_deg(h, r.heading_b_deg());
                 if off_a <= off_b { r.ident_a.clone() } else { r.ident_b.clone() }
             }
             None => nearer,
@@ -4905,7 +4905,7 @@ fn end_heading(runways: &[nav::Runway], ident: &str) -> Option<f64> {
 /// degrees apart; a crossing strip is not opposed. Unknown ends never are.
 fn ends_oppose(runways: &[nav::Runway], a: &str, b: &str) -> bool {
     match (end_heading(runways, a), end_heading(runways, b)) {
-        (Some(ha), Some(hb)) => angle_diff_deg(ha, hb).abs() > 120.0,
+        (Some(ha), Some(hb)) => sim::angles::abs_diff_deg(ha, hb) > 120.0,
         _ => false,
     }
 }
@@ -5286,8 +5286,8 @@ fn departure_runway_ident(lat: f64, lon: f64, prev_lat: f64, prev_lon: f64) -> O
             .min(crate::nav::haversine_nm(lat, lon, b.lat_b, b.lon_b));
         da.total_cmp(&db)
     })?;
-    let da = angle_diff_deg(track, r.heading_a_deg()).abs();
-    let db = angle_diff_deg(track, r.heading_b_deg()).abs();
+    let da = sim::angles::abs_diff_deg(track, r.heading_a_deg());
+    let db = sim::angles::abs_diff_deg(track, r.heading_b_deg());
     Some(if da <= db {
         r.ident_a.clone()
     } else {
@@ -6784,7 +6784,7 @@ pub(crate) fn resequence_runway(
             let stream_rank = u8::from(!streams.iter().any(|s| s == end));
             picks.push((
                 stream_rank,
-                angle_diff_deg(landing_hdg, hdg).abs(),
+                sim::angles::abs_diff_deg(landing_hdg, hdg),
                 -hw.unwrap_or(0.0),
                 end.clone(),
             ));
@@ -7019,7 +7019,7 @@ fn runway_stands_within(
         return true;
     }
     let crosswind =
-        |hdg: f64| (wind_kts * nav::angle_diff_deg(wind_from, hdg).to_radians().sin()).abs();
+        |hdg: f64| (wind_kts * sim::angles::signed_diff_deg(wind_from, hdg).to_radians().sin()).abs();
     let stated_hdg = runways.iter().find_map(|r| {
         if r.ident_a == ident {
             Some(r.heading_a_deg())
@@ -8288,8 +8288,8 @@ pub fn vector_tick(
     // join distance, AND actually flying the final course — the position wedge
     // alone would clear an aircraft crossing final at ninety degrees. A failed
     // track read doesn't block the clearance (best-effort, like every read).
-    let off_course = angle_diff_deg(brg_thr, plan.course_deg).abs();
-    let aligned = track_deg.is_none_or(|t| angle_diff_deg(t, plan.course_deg).abs() <= 30.0);
+    let off_course = sim::angles::abs_diff_deg(brg_thr, plan.course_deg);
+    let aligned = track_deg.is_none_or(|t| sim::angles::abs_diff_deg(t, plan.course_deg) <= 30.0);
     // Established, two regimes. Beyond a mile: the position wedge — on the
     // approach side, near the extended centerline, inside the join, flying
     // the course. Inside a mile the threshold bearing is too twitchy for a
@@ -8364,7 +8364,7 @@ pub fn vector_tick(
     // Jerez 2026-07-12. Controllers give a cut, not a curve. Anywhere else:
     // direct to the join point, which is the downwind/base leg for free.
     let along_nm = dist_thr * off_course.to_radians().cos(); // + = approach side
-    let xtk_nm = dist_thr * angle_diff_deg(brg_thr, plan.course_deg).to_radians().sin();
+    let xtk_nm = dist_thr * sim::angles::signed_diff_deg(brg_thr, plan.course_deg).to_radians().sin();
     let capturing = along_nm >= 1.0 && xtk_nm.abs() <= 2.5;
     // On the intercept after the ILS clearance, TRACKING the course: the
     // frequency goes quiet. Capturing the localizer is the pilot's job now;
@@ -8417,7 +8417,7 @@ pub fn vector_tick(
         .unwrap_or(f64::MAX);
     let moved = plan
         .last_heading
-        .map(|h| angle_diff_deg(h as f64, heading10 as f64).abs())
+        .map(|h| sim::angles::abs_diff_deg(h as f64, heading10 as f64))
         .unwrap_or(360.0);
     let due = plan.last_tx.is_none()
         || (elapsed >= 25.0 && moved >= 20.0)
@@ -8636,11 +8636,6 @@ pub fn near_miss_line(f: &TrafficFactor, crew: bool) -> String {
             vert_phrase(f.ft)
         )
     }
-}
-
-/// Smallest signed angle a−b, degrees, in −180..180.
-fn angle_diff_deg(a: f64, b: f64) -> f64 {
-    (a - b + 540.0).rem_euclid(360.0) - 180.0
 }
 
 /// An altitude spoken controller-style: 2000 → "two thousand", 1500 → "one
@@ -13357,7 +13352,7 @@ mod tests {
         let strip = st.apt.runways.iter().find(|r| r.ident_b == "25").expect("07/25");
         let last = *route.lead_on.last().or(route.path.last()).unwrap();
         let d = nav::haversine_nm(strip.lat_a, strip.lon_a, last.0, last.1) * 1852.0;
-        let off = nav::angle_diff_deg(
+        let off = sim::angles::signed_diff_deg(
             nav::bearing_deg(strip.lat_a, strip.lon_a, last.0, last.1),
             strip.heading_a_deg(),
         );
@@ -13398,7 +13393,7 @@ mod tests {
         for w in path.windows(3) {
             let brg = |a: (f64, f64), b: (f64, f64)| crate::nav::bearing_deg(a.0, a.1, b.0, b.1);
             let d = brg(w[1], w[2]) - brg(w[0], w[1]);
-            let t = ((d + 540.0).rem_euclid(360.0) - 180.0).abs();
+            let t = sim::angles::wrap180(d).abs();
             assert!(t <= 90.0, "a {t:.0} degree turn at {:?}", w[1]);
         }
         // No ICAO: the field found by the scan is the same one.
@@ -17857,7 +17852,7 @@ mod tests {
             {
                 if let Some(p) = prev_cmd {
                     assert!(
-                        angle_diff_deg(h as f64, p as f64).abs() <= 120.0,
+                        sim::angles::abs_diff_deg(h as f64, p as f64) <= 120.0,
                         "orbit: vector {p} then {h}"
                     );
                 }
@@ -17927,7 +17922,7 @@ mod tests {
             {
                 if let Some(p) = prev_cmd {
                     assert!(
-                        angle_diff_deg(h as f64, p as f64).abs() <= 120.0,
+                        sim::angles::abs_diff_deg(h as f64, p as f64) <= 120.0,
                         "close-in orbit: vector {p} then {h}"
                     );
                 }
@@ -18177,7 +18172,7 @@ mod tests {
         // The rollout direction: the end heading within 30 degrees of 236.
         let psi = [strip.heading_a_deg(), strip.heading_b_deg()]
             .into_iter()
-            .find(|h| nav::angle_diff_deg(*h, 236.0).abs() < 30.0)
+            .find(|h| sim::angles::abs_diff_deg(*h, 236.0) < 30.0)
             .expect("the landing end");
         let full = format!("{}/{}", strip.ident_a, strip.ident_b);
         // Which way the route first goes: the bearing to its point 40 m on.
@@ -18208,7 +18203,7 @@ mod tests {
         );
         assert_eq!(new.seg.len() + 1, new.path.len(), "seg stays aligned");
         assert!(
-            nav::angle_diff_deg(first_brg(&new), psi).abs() < 45.0,
+            sim::angles::abs_diff_deg(first_brg(&new), psi) < 45.0,
             "the stand route leaves the runway forward: {:.0} against {psi:.0}",
             first_brg(&new)
         );
@@ -18288,7 +18283,7 @@ mod tests {
             }
             let brg = ahead.expect("a vacate longer than 40 m");
             assert!(
-                nav::angle_diff_deg(brg, psi).abs() < 90.0,
+                sim::angles::abs_diff_deg(brg, psi) < 90.0,
                 "the vacate runs forward: {brg:.0} against {psi:.0}"
             );
             // Ends OFF 13/31 (and off every strip).

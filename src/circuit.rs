@@ -30,6 +30,7 @@ use std::sync::Mutex;
 
 use crate::autoland::{along_track_nm, cross_track_nm, nearby_runways, true_to_mag};
 use crate::autotakeoff;
+use crate::heading_bug::{bug_toward, slew_bug, BugDeadband, BugHold};
 use crate::tools::autopilot::ApConfig;
 use crate::voice::{Priority, Voice};
 use crate::xplane::XPlaneClient;
@@ -47,7 +48,6 @@ const MAG_VAR: &str = "sim/flightmodel/position/magnetic_variation";
 // steer; `sim/autopilot/altitude_hold` is deliberately absent: it holds the
 // CURRENT altitude, not the dial, and locked every pattern at handoff height
 // (2026-07-24)).
-const CMD_SERVOS_ON: &str = "sim/autopilot/servos_on";
 const CMD_HDG_MODE: &str = "sim/autopilot/heading";
 const CMD_VS_MODE: &str = "sim/autopilot/vertical_speed";
 const VS_DIAL: &str = "sim/cockpit/autopilot/vertical_velocity";
@@ -182,7 +182,7 @@ pub struct BankWatch {
 impl BankWatch {
     /// One tick on base: the bank read and the heading error to the leg.
     pub fn note(&mut self, phi_deg: f64, hdg_err_deg: f64) {
-        let err = ((hdg_err_deg + 540.0).rem_euclid(360.0)) - 180.0;
+        let err = crate::angles::wrap180(hdg_err_deg);
         if phi_deg.is_finite() && err.abs() > BANK_SAMPLE_ERR_DEG && phi_deg.abs() > 5.0 {
             self.samples.push(phi_deg.abs());
         }
@@ -510,7 +510,7 @@ pub fn final_led_xtk_m(
     if !(speed_kts.is_finite() && speed_kts > 0.0 && lead_s > 0.0) {
         return xtk_m;
     }
-    let off = ((trk - course_deg + 540.0).rem_euclid(360.0) - 180.0).to_radians();
+    let off = crate::angles::signed_diff_deg(trk, course_deg).to_radians();
     xtk_m + lead_s * speed_kts * 0.514_444 * off.sin()
 }
 
@@ -1950,54 +1950,6 @@ pub fn leg_heading(rwy_course_deg: f64, leg: Leg, left: bool) -> f64 {
     (rwy_course_deg + turn * n).rem_euclid(360.0)
 }
 
-/// Move the heading bug toward `target` by at most `max_step` degrees, the
-/// SHORT way around, returning the new dial value. A single 90-degree write
-/// across the 0/360 seam (271 -> 2 for the right pattern's crosswind) reads
-/// to the sim's AP as a 270-degree counterclockwise dial spin, and it turned
-/// the LONG way — the 1.8 km loop south over the bay with an AGL dip to
-/// 126 ft (LXGB, 2026-07-24). Stepping the dial keeps every write's turn
-/// direction unambiguous; at 40 degrees per 500 ms tick a 90-degree leg
-/// change completes in ~1.5 s, faster than the AP banks anyway.
-pub fn slew_bug(current: f64, target: f64, max_step: f64) -> f64 {
-    let d = (target - current + 540.0).rem_euclid(360.0) - 180.0;
-    (current + d.clamp(-max_step, max_step)).rem_euclid(360.0)
-}
-
-/// Bank beyond which the AP is judged to be IN a turn. X-Plane's heading
-/// mode sits at 11-13 degrees for a standard-rate turn; the orbit at LXGB
-/// started from 4.3 degrees, so the threshold sits under that, above the
-/// one or two degrees of wings-level jitter.
-const TURN_IN_PROGRESS_BANK_DEG: f64 = 3.0;
-/// A wanted turn smaller than this against the bank in progress is left to
-/// the AP: it is finishing a capture, not going the long way round.
-const REVERSAL_MIN_DEG: f64 = 10.0;
-/// Until the autopilot is banked INTO the wanted turn, the bug leads the
-/// nose by no more than this: a small bug on the right side starts the turn
-/// the right way, and once the turn is in progress the sim's refusal to
-/// reverse it works for us. The rectangle circuit slewed the bug 90 degrees
-/// off the nose from wings level, and the SF50 went round the long way on 13
-/// of its 30 circuit turns (the A330 on 2 of 4), each a 270 right for a 90
-/// left (ETND, 2026-09-23).
-const TURN_ENTRY_LEAD_DEG: f64 = 25.0;
-/// Wings level, for [`bug_toward`]'s roll-out hysteresis.
-const LEVEL_BANK_DEG: f64 = 1.0;
-/// A bug this close to the heading is "on the nose".
-const ON_NOSE_DEG: f64 = 5.0;
-
-/// Step the bug toward `want_mag` (as [`slew_bug`]) unless the aircraft is
-/// banked INTO a turn the other way, in which case hold the bug ON THE NOSE
-/// so the AP rolls out first.
-///
-/// The sim's heading mode does not reverse a turn in progress. At LXGB
-/// (2026-09-14) the authored follower captured waypoint 2 while banked four
-/// degrees right for it and stepped the bug 25 degrees LEFT for waypoint 3;
-/// the AP rolled on to 12 degrees right and went round the long way, 340
-/// degrees, and because pure pursuit keeps the bug moving in the direction
-/// of the turn it never caught up: five minutes of standard-rate orbits
-/// drifting downwind across the bay, waypoints caught only when a circle
-/// happened to pass within the capture radius. A bug on the nose is a
-/// capture, and a capture is the one thing that rolls that AP level; from
-/// level the next slew starts the turn the right way.
 /// Put the bug on a WHOLE degree, and only when that degree changes. The
 /// laws above keep their fine value for their own arithmetic; the knob a
 /// pilot sees moves in the steps a pilot's hand makes, not a tenth of a
@@ -2015,89 +1967,11 @@ async fn write_bug(xp: &dyn crate::xplane::XPlane, bug_mag: f64) {
     }
 }
 
-/// How a loop's heading bug is SET, the way a pilot sets it (issue #93):
-/// once per leg or phase (`key`), a turn led through at once (a move of
-/// [`BUG_STEER_DEG`] or more is steering: the lead through a turn, a new
-/// intercept), and otherwise a correction only when it has grown past the
-/// loop's `deadband_deg` and not more often than every `every_s`. The laws
-/// keep computing their fine bug every tick; the KNOB moves only when this
-/// says so. `procedure::HeadingHold` is the follower's version (a whole
-/// degree per leg, 5 degrees, 30 s); these loops fly patterns and finals, so
-/// each passes its own deadband. LIPR 2026-09-26: "a human pilot would never
-/// use the heading bug like that"; LEMG 2026-09-28: the circuit's downwind
-/// knob stepped 10 to 24 times in two minutes on a one-degree crab, and
-/// autoland's final 40 to 80 times in 100 s in tenths. Pure.
-#[derive(Debug, Default, Clone, Copy)]
-pub struct BugHold {
-    key: Option<u32>,
-    set: Option<f64>,
-    last_write_s: f64,
-}
-
-/// A bug move this big is steering, not a correction: written at once.
-pub const BUG_STEER_DEG: f64 = 5.0;
-
-/// A loop's correction deadband: the smallest correction worth a hand on
-/// the knob, and how often.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct BugDeadband {
-    pub deg: f64,
-    pub every_s: f64,
-}
-
 /// The circuit's legs: a two-degree correction at most every ten seconds.
 pub const CIRCUIT_LEG_DEADBAND: BugDeadband = BugDeadband { deg: 2.0, every_s: 10.0 };
 /// The circuit's final, closing the centreline for the handover: a degree
 /// at most every three seconds.
 pub const CIRCUIT_FINAL_DEADBAND: BugDeadband = BugDeadband { deg: 1.0, every_s: 3.0 };
-
-impl BugHold {
-    /// The bug to set now (magnetic), or `None` to leave the knob alone.
-    pub fn decide(&mut self, key: u32, want_mag: f64, now_s: f64, db: BugDeadband) -> Option<f64> {
-        if !want_mag.is_finite() {
-            return None;
-        }
-        let want = want_mag.rem_euclid(360.0);
-        let write = match (self.key == Some(key), self.set) {
-            (true, Some(set)) => {
-                let off = (((want - set) + 540.0).rem_euclid(360.0) - 180.0).abs();
-                off >= BUG_STEER_DEG
-                    || (off >= db.deg && now_s - self.last_write_s >= db.every_s)
-            }
-            _ => true,
-        };
-        if !write {
-            return None;
-        }
-        self.key = Some(key);
-        self.set = Some(want);
-        self.last_write_s = now_s;
-        Some(want)
-    }
-
-    /// What the knob was last set to (the laws' `current_bug`), if anything.
-    pub fn set(&self) -> Option<f64> {
-        self.set
-    }
-
-    /// The knob read back after a write (a knob that only stepped part of
-    /// the way, or a failed write: `None` forgets it so the next tick sets
-    /// it afresh).
-    pub fn took(&mut self, read_mag: Option<f64>) {
-        match read_mag.filter(|v| v.is_finite()) {
-            Some(v) => self.set = Some(v.rem_euclid(360.0)),
-            None => {
-                self.key = None;
-                self.set = None;
-            }
-        }
-    }
-
-    /// Forget everything: the next decision writes.
-    pub fn reset(&mut self) {
-        *self = Self::default();
-    }
-}
 
 /// The laws' bug through the [`BugHold`]: the knob is set only when the hold
 /// says so, and the laws carry on from what the knob holds.
@@ -2119,43 +1993,6 @@ async fn hold_bug(
 
 /// The last whole degree written, as f64 bits (`u64::MAX`: none).
 static LAST_BUG: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
-
-pub fn bug_toward(
-    current_bug: f64,
-    want_mag: f64,
-    heading_mag: f64,
-    phi_deg: f64,
-    max_step: f64,
-) -> f64 {
-    let turn = (want_mag - heading_mag + 540.0).rem_euclid(360.0) - 180.0;
-    // Hysteresis for a big turn: once the bug is on the nose to roll the
-    // wrong-way bank out, it stays there until the wings are LEVEL, not merely
-    // under the in-turn threshold. LIPK (2026-09-25): at 2 to 3 degrees of
-    // left bank the 25 degree right lead went back on, the autopilot kept
-    // turning left, the bank passed 3, the bug went back to the nose, and the
-    // two alternated tick by tick for 50 s while the 172 turned 35 degrees
-    // the wrong way.
-    let on_nose =
-        ((current_bug - heading_mag + 540.0).rem_euclid(360.0) - 180.0).abs() < ON_NOSE_DEG;
-    let reversal_bank = if on_nose && turn.abs() > TURN_ENTRY_LEAD_DEG {
-        LEVEL_BANK_DEG
-    } else {
-        TURN_IN_PROGRESS_BANK_DEG
-    };
-    let banked_other_way = phi_deg.abs() > reversal_bank
-        && turn.abs() > REVERSAL_MIN_DEG
-        && (turn > 0.0) != (phi_deg > 0.0);
-    if banked_other_way {
-        return slew_bug(current_bug, heading_mag, max_step);
-    }
-    let committed =
-        phi_deg.abs() > TURN_IN_PROGRESS_BANK_DEG && (turn > 0.0) == (phi_deg > 0.0);
-    if !committed && turn.abs() > TURN_ENTRY_LEAD_DEG {
-        let entry = (heading_mag + turn.signum() * TURN_ENTRY_LEAD_DEG).rem_euclid(360.0);
-        return slew_bug(current_bug, entry, max_step);
-    }
-    slew_bug(current_bug, want_mag, max_step)
-}
 
 /// The authored follower's progress watchdog fires when the distance to the
 /// current waypoint has set no new low for this long: the loop is orbiting or
@@ -2446,6 +2283,33 @@ impl PatternGuard {
 /// the speed to the governor at `hold_kts`; a pilot's disconnect is left
 /// alone. Only what reads back is claimed.
 #[allow(clippy::too_many_arguments)]
+/// The circuit's lateral re-engage, one tick: the servos pressed through
+/// [`crate::ap_engage::ServoWatch`] (flight director first, re-pressed until
+/// they read in, `ap_engage` / `ap_engaged` on the tape under `site`) while
+/// the heading mode reads off (`wanted`). It used to press `servos_on` alone,
+/// every tick, blind: on an FD airframe a press that cannot hold (refactor
+/// audit 2026-10-04 #5). The servos read OUT with the mode on is the
+/// `PatternGuard`'s, never re-pressed here.
+#[allow(clippy::too_many_arguments)]
+async fn reengage_lateral(
+    xp: &dyn crate::xplane::XPlane,
+    watch: &mut crate::ap_engage::ServoWatch,
+    fd: &[String],
+    now_s: f64,
+    wanted: bool,
+    servos: Option<f64>,
+    ias_kts: f64,
+    site: &str,
+) {
+    let st = watch.step(now_s, wanted, servos, ias_kts);
+    if st.fire {
+        crate::ap_engage::press_logged(xp, fd, "circuit", site, st.try_n).await;
+    }
+    if st.confirmed_now {
+        crate::ap_engage::record_engaged("circuit", site, st.try_n);
+    }
+}
+
 async fn give_up_pattern(
     xp: &XPlaneClient,
     base_url: &str,
@@ -2513,7 +2377,12 @@ async fn give_up_pattern(
     if ours {
         let servos = xp.get_float(SERVOS_ON).await.ok();
         if servos.is_some_and(|v| v < 0.5) {
-            let _ = xp.run_command(CMD_SERVOS_ON).await;
+            // FD first, on the tape (`ap_engage`); the read-back below
+            // judges whether it is holding.
+            crate::ap_engage::press_logged(
+                xp, &crate::ap_engage::fd_commands(), "circuit", "pattern_guard", 1,
+            )
+            .await;
         }
         if let Some(h) = hdg_mag {
             write_bug(xp, h).await;
@@ -2654,7 +2523,12 @@ async fn hold_clear_of_terrain(
     // The autopilot's own capture holds the level: the dial on the hold.
     let bug_mag = true_to_mag(hdg_true, mag_var).rem_euclid(360.0);
     if xp.get_float(SERVOS_ON).await.is_ok_and(|v| v < 0.5) {
-        let _ = xp.run_command(CMD_SERVOS_ON).await;
+        // FD first, on the tape (`ap_engage`); the hold's own guard watches
+        // the servos from here.
+        crate::ap_engage::press_logged(
+            xp, &crate::ap_engage::fd_commands(), "circuit", "terrain_hold", 1,
+        )
+        .await;
     }
     let _ = xp.set_float(ALT_DIAL, hold_ft).await;
     write_bug(xp, bug_mag).await;
@@ -3960,6 +3834,8 @@ async fn fly_authored_route(
     let mut ias_trend = 0.0_f64;
     let t_start = std::time::Instant::now();
     let mut bug_hold = BugHold::default();
+    // The lateral re-engage (`ap_engage::ServoWatch`): FD first, confirmed.
+    let mut servo_watch = crate::ap_engage::ServoWatch::default();
     // Picked from the first good position read, not assumed to be 0.
     let mut wpt_idx: Option<usize> = None;
     let mut closure: Option<Closure> = None;
@@ -3985,7 +3861,7 @@ async fn fly_authored_route(
         }
         let thr_dref = throttle_dref();
         // Position, elevation and heading as ONE frame saw them (#157).
-        let (pos, hp_r, phi_r, hdg_st, vs_st, ias_r, thr_r) = tokio::join!(
+        let (pos, hp_r, phi_r, hdg_st, vs_st, ias_r, thr_r, servos_r) = tokio::join!(
             sim::position::read(&xp),
             xp.get_float(HPATH),
             xp.get_float(PHI),
@@ -3993,6 +3869,7 @@ async fn fly_authored_route(
             xp.get_float(VS_STATUS),
             xp.get_float(IAS),
             xp.get_float(&thr_dref),
+            xp.get_float(SERVOS_ON),
         );
         let (lat_r, lon_r) = sim::position::lat_lon(&pos);
         let elev_r = sim::position::field(&pos, |p| p.elev_m);
@@ -4033,7 +3910,7 @@ async fn fly_authored_route(
         let psi_r = psi_r.ok();
         let crab = match (psi_r, hp_r) {
             (Some(psi), Ok(hp)) => {
-                (((psi - hp + 540.0).rem_euclid(360.0)) - 180.0).clamp(-25.0, 25.0)
+                crate::angles::signed_diff_deg(psi, hp).clamp(-25.0, 25.0)
             }
             _ => 0.0,
         };
@@ -4063,8 +3940,18 @@ async fn fly_authored_route(
             CIRCUIT_LEG_DEADBAND,
         )
         .await;
+        reengage_lateral(
+            &xp,
+            &mut servo_watch,
+            &cfg.fd_commands,
+            t_start.elapsed().as_secs_f64(),
+            !hdg_on,
+            servos_r.as_ref().ok().copied(),
+            ias_r.as_ref().ok().copied().unwrap_or(f64::NAN),
+            "authored",
+        )
+        .await;
         if !hdg_on {
-            let _ = xp.run_command(CMD_SERVOS_ON).await;
             let _ = xp.run_command(CMD_HDG_MODE).await;
         }
 
@@ -4918,6 +4805,8 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, p: Params
     // The pattern's knob from here on (`BugHold`, issue #93).
     let mut bug_hold = BugHold::default();
     let loop_t0 = std::time::Instant::now();
+    // The lateral re-engage (`ap_engage::ServoWatch`): FD first, confirmed.
+    let mut servo_watch = crate::ap_engage::ServoWatch::default();
     // The pattern's own give-up (#160).
     let mut pattern_guard = PatternGuard::default();
     // The autopilot's answer to the dial (#181).
@@ -5137,7 +5026,7 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, p: Params
         let hdg_err = hpath_r
             .as_ref()
             .ok()
-            .map(|hp| ((hp - rwy_course + 540.0).rem_euclid(360.0)) - 180.0)
+            .map(|hp| crate::angles::signed_diff_deg(*hp, rwy_course))
             .unwrap_or(180.0);
         // Established by autoland's own measure: its pursuit's residual at
         // the threshold inside the runway's landing limit. The IAS stands in
@@ -5243,7 +5132,7 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, p: Params
         let (psi_v, hp_v) = (psi_r.ok(), hpath_r.ok());
         let crab = match (psi_v, hp_v) {
             (Some(psi), Some(hp)) => {
-                (((psi - hp + 540.0).rem_euclid(360.0)) - 180.0).clamp(-25.0, 25.0)
+                crate::angles::signed_diff_deg(psi, hp).clamp(-25.0, 25.0)
             }
             _ => 0.0,
         };
@@ -5303,9 +5192,21 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, p: Params
         )
         .await;
         // The lateral mode must actually be ON for the bug to mean anything —
-        // re-engage like the takeoff's VS guard, never press blind.
+        // re-engage like the takeoff's VS guard, never press blind: the
+        // servos through the one engage (`ap_engage::ServoWatch`, FD first,
+        // confirmed), the mode pressed while it reads off.
+        reengage_lateral(
+            &xp,
+            &mut servo_watch,
+            &p.cfg.fd_commands,
+            loop_t0.elapsed().as_secs_f64(),
+            !hdg_on,
+            servos_r.as_ref().ok().copied(),
+            ias_r.as_ref().ok().copied().unwrap_or(f64::NAN),
+            "rectangle",
+        )
+        .await;
         if !hdg_on {
-            let _ = xp.run_command(CMD_SERVOS_ON).await;
             let _ = xp.run_command(CMD_HDG_MODE).await;
         }
 
@@ -6121,6 +6022,7 @@ mod tests {
         assert!(!vs_stuck(3.0) && vs_stuck(VS_REFUSED_SECS));
     }
     use super::*;
+    use crate::heading_bug::{TURN_ENTRY_LEAD_DEG, TURN_IN_PROGRESS_BANK_DEG};
 
     /// The Baron's approach speed the older handover tests were flown at, and
     /// the landing limit of a runway of unknown width (the old 37 m).
@@ -6587,7 +6489,7 @@ mod tests {
         let mut steps = 0;
         while (slew_bug(bug, 2.6, 40.0) - 2.6).abs() > 1e-9 || (bug - 2.6).abs() > 1e-9 {
             let next = slew_bug(bug, 2.6, 40.0);
-            let d = (next - bug + 540.0).rem_euclid(360.0) - 180.0;
+            let d = crate::angles::signed_diff_deg(next, bug);
             assert!(d > 0.0, "always clockwise: {bug} -> {next}");
             assert!(d <= 40.0 + 1e-9, "never more than a step");
             bug = next;
@@ -7432,7 +7334,7 @@ mod tests {
         // base at 290 true, runway 02 (course 20), 1,813 m off the centreline
         // with 4,092 m to run. The geometry is a 28 degree cut, so
         // `interceptable` is happy...
-        let hdg_err_on_base = ((290.0 - 20.0 + 540.0_f64).rem_euclid(360.0)) - 180.0;
+        let hdg_err_on_base = crate::angles::signed_diff_deg(290.0, 20.0);
         assert!(
             interceptable(1813.0, 4092.0),
             "a 28 degree cut is closeable"
@@ -7531,7 +7433,7 @@ mod tests {
     fn the_final_leg_flies_an_intercept_not_a_parallel() {
         let course = 19.4;
         let cut =
-            |x: f64| ((final_intercept_hdg(course, x) - course + 540.0).rem_euclid(360.0)) - 180.0;
+            |x: f64| crate::angles::signed_diff_deg(final_intercept_hdg(course, x), course);
 
         // On the line, fly the line.
         assert!(cut(0.0).abs() < 0.01);
@@ -7620,7 +7522,7 @@ mod tests {
             if (bug - 173.7).abs() < 0.01 {
                 break; // committed and handed to the leg: the capture is the AP's
             }
-            let lead = ((bug - heading + 540.0).rem_euclid(360.0)) - 180.0;
+            let lead = crate::angles::signed_diff_deg(bug, heading);
             assert!(lead <= 0.5, "never right of the nose: {lead:.1}");
             if phi > -TURN_IN_PROGRESS_BANK_DEG {
                 max_lead = max_lead.max(-lead);
@@ -8164,7 +8066,7 @@ mod issue_147_circuit_tests {
             let a_m = -along_track_nm(jet.lat, jet.lon, &rwy) * M_PER_NM;
             let x_m = cross_track_nm(jet.lat, jet.lon, &rwy) * M_PER_NM;
             let trk = jet.track();
-            let trk_err = ((trk - rwy.course_deg + 540.0).rem_euclid(360.0)) - 180.0;
+            let trk_err = crate::angles::signed_diff_deg(trk, rwy.course_deg);
             if leg == Leg::Final && ready_for_autoland(x_m, a_m.abs(), trk_err, ias, limit, None) {
                 return (
                     Handoff {
@@ -8178,7 +8080,7 @@ mod issue_147_circuit_tests {
                     moves,
                 );
             }
-            let crab = ((jet.psi - trk + 540.0).rem_euclid(360.0)) - 180.0;
+            let crab = crate::angles::signed_diff_deg(jet.psi, trk);
             let leg_hdg = match leg {
                 Leg::Final => final_intercept_hdg(rwy.course_deg, x_m),
                 _ => leg_heading(rwy.course_deg, leg, true),
@@ -8489,7 +8391,7 @@ mod issue_189_tests {
                 through = through.max(-x_m);
             }
             let trk = jet.track();
-            let trk_err = ((trk - rwy.course_deg + 540.0).rem_euclid(360.0)) - 180.0;
+            let trk_err = crate::angles::signed_diff_deg(trk, rwy.course_deg);
             if ready_for_autoland(x_m, a_m.abs(), trk_err, ias, Some(limit), None) {
                 return (Final { x_m, a_m, trk_err, through_m: through }, jet);
             }
@@ -9219,7 +9121,7 @@ mod pattern_guard_tests {
                 self.x1 += (self.dial - self.x1) * dt / LAG1_S;
                 self.vs += (self.x1 - self.vs) * dt / LAG2_S;
                 self.alt += self.vs / 60.0 * dt;
-                let err = (bug - self.psi + 540.0).rem_euclid(360.0) - 180.0;
+                let err = crate::angles::signed_diff_deg(bug, self.psi);
                 let want = (err * 1.5).clamp(-MAX_BANK, MAX_BANK);
                 self.bank += (want - self.bank).clamp(-5.0 * dt, 5.0 * dt);
                 self.ias += (want_kts - self.ias) * dt / 10.0;
@@ -9305,7 +9207,7 @@ mod pattern_guard_tests {
         let mut psi_was = p.psi;
         while p.t - t0 < 900.0 {
             let now = p.t - t0;
-            let trk_err = (p.psi - COURSE + 540.0).rem_euclid(360.0) - 180.0;
+            let trk_err = crate::angles::signed_diff_deg(p.psi, COURSE);
             if turning_final && ready_for_autoland(p.x_m, p.a_m.abs(), trk_err, p.ias, None, None) {
                 out.handed_over = Some(now);
                 break;
@@ -9392,7 +9294,7 @@ mod pattern_guard_tests {
             p.advance(knob, want_kts, tick);
             out.max_alt = out.max_alt.max(p.alt);
             out.max_bank = out.max_bank.max(p.bank.abs());
-            out.turned_deg += ((p.psi - psi_was + 540.0).rem_euclid(360.0) - 180.0).abs();
+            out.turned_deg += crate::angles::abs_diff_deg(p.psi, psi_was);
             psi_was = p.psi;
         }
         out
@@ -9915,7 +9817,7 @@ mod issue_188_on_the_path_tests {
                 self.x1 += (self.dial - self.x1) * dt / 1.5;
                 self.vs += (self.x1 - self.vs) * dt / 1.5;
                 self.alt += self.vs / 60.0 * dt;
-                let err = (hdg - self.psi + 540.0).rem_euclid(360.0) - 180.0;
+                let err = crate::angles::signed_diff_deg(hdg, self.psi);
                 let want = (err * 1.5).clamp(-17.0, 17.0);
                 self.bank += (want - self.bank).clamp(-5.0 * dt, 5.0 * dt);
                 self.ias += (want_kts - self.ias) * dt / 10.0;
@@ -9981,7 +9883,7 @@ mod issue_188_on_the_path_tests {
                 out.went_around = Some(p.a_m);
                 break;
             }
-            let trk_err = (p.psi - COURSE + 540.0).rem_euclid(360.0) - 180.0;
+            let trk_err = crate::angles::signed_diff_deg(p.psi, COURSE);
             let judged = if fixed { None } else { above };
             if turning_final && ready_for_autoland(p.x_m, p.a_m.abs(), trk_err, p.ias, None, judged)
             {

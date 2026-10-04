@@ -6,7 +6,7 @@
 //! anymore — the workspace crates build once and everyone links them.
 
 pub use ::atc::{atis, callsign, nav, tower};
-pub use sim::{datarefs, xplane};
+pub use sim::{angles, datarefs, xplane};
 
 pub mod aircraft;
 pub mod config;

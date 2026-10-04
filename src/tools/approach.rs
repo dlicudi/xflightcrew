@@ -23,7 +23,10 @@ use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-use super::{Tool, ToolCtx, CMD_SERVOS_ON};
+use super::{Tool, ToolCtx};
+
+/// The tool's wait for the servos to read in after its press.
+const APPROACH_ENGAGE_MAX_S: f64 = 3.0;
 use crate::ils::{self, ArmVerdict};
 use crate::nav;
 
@@ -319,9 +322,18 @@ impl Tool for PrepareIls {
             && tracks_loc != Some(false)
             && !servos.as_ref().is_ok_and(|v| *v > 0.5)
         {
-            let _ = ctx.xplane.run_command(CMD_SERVOS_ON).await;
+            // Pressed and CONFIRMED (`ap_engage::engage_confirmed`: FD
+            // first, read until in, at most 3 s): one read straight after
+            // the press could not yet see the servos come in.
+            engaged = crate::ap_engage::engage_confirmed(
+                ctx.xplane,
+                &crate::ap_engage::fd_commands(),
+                "ils",
+                "setup_couple",
+                APPROACH_ENGAGE_MAX_S,
+            )
+            .await;
             servos = ctx.xplane.get_float(ils::SERVOS).await;
-            engaged = servos.as_ref().is_ok_and(|v| *v > 0.5);
             line.push_str(if engaged {
                 " Autopilot on."
             } else {
@@ -546,8 +558,8 @@ impl Tool for VisualApproach {
                     .unwrap_or(0.0);
                 let field = cands.first().map(|r| r.icao.clone()).unwrap_or_default();
                 cands.iter().filter(|r| r.icao == field).min_by(|a, b| {
-                    let da = ((a.course_deg - track + 540.0).rem_euclid(360.0) - 180.0).abs();
-                    let db = ((b.course_deg - track + 540.0).rem_euclid(360.0) - 180.0).abs();
+                    let da = crate::angles::abs_diff_deg(a.course_deg, track);
+                    let db = crate::angles::abs_diff_deg(b.course_deg, track);
                     da.total_cmp(&db)
                 })
             }

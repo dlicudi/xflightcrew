@@ -30,6 +30,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::autoland::true_to_mag;
 use crate::control::{measurements, set_confirmed};
+use crate::heading_bug::HeadingHold;
 use crate::nav::ProcLeg;
 use crate::tools::autopilot::ApConfig;
 use crate::voice::{Priority, Voice};
@@ -52,7 +53,6 @@ const IAS: &str = "sim/flightmodel/position/indicated_airspeed";
 const GS_MS: &str = "sim/flightmodel/position/groundspeed";
 const MS_TO_KTS: f64 = 1.943_84;
 // AP surface (mirror of autopilot.rs / autoland.rs / circuit.rs).
-const CMD_SERVOS_ON: &str = "sim/autopilot/servos_on";
 const CMD_HDG_MODE: &str = "sim/autopilot/heading";
 const CMD_VS_MODE: &str = "sim/autopilot/vertical_speed";
 const VS_DIAL: &str = "sim/cockpit/autopilot/vertical_velocity";
@@ -1318,7 +1318,7 @@ pub fn leg_turn_deg(lat: f64, lon: f64, leg: &ProcLeg, next: Option<&ProcLeg>) -
     let there = next?.fix.as_ref()?;
     let inbound = crate::nav::bearing_deg(lat, lon, here.lat, here.lon);
     let outbound = crate::nav::bearing_deg(here.lat, here.lon, there.lat, there.lon);
-    Some(((outbound - inbound + 540.0).rem_euclid(360.0)) - 180.0)
+    Some(crate::angles::signed_diff_deg(outbound, inbound))
 }
 
 /// Has the current leg been flown? A fix leg completes inside `capture_nm`
@@ -2868,133 +2868,6 @@ fn stand_down(voice: &Option<Voice>, line: &str, reason: &str) {
     alert(voice, Priority::Caution, line);
 }
 
-/// How the follower handles the heading bug: the way a pilot does. It was
-/// rewritten every tick (bearing to the fix plus a live crab, stepped 25
-/// degrees ahead of the nose through every turn), and the pilot watched it
-/// twitch for the whole flight (LIPR 2026-09-26): "if we want to go a certain
-/// heading, just set the heading". So: a leg's heading is SET once, a whole
-/// degree, wind correction included; it is touched again only when the
-/// track has drifted enough to need it, wings level, not more than twice a
-/// minute; and a new heading on the far side of a turn still in progress
-/// waits for the wings to come level (the autopilot turns the short way
-/// from where the nose is, and a bug set against the bank went round the
-/// long way, LXGB 2026-09-14).
-#[derive(Debug, Default, Clone, Copy, PartialEq)]
-enum HeadingTurn {
-    #[default]
-    Direct,
-    Entry { sign: f64 },
-    Rollout { sign: f64 },
-}
-
-#[derive(Debug, Default)]
-pub struct HeadingHold {
-    leg: Option<usize>,
-    set: Option<f64>,
-    last_write_s: f64,
-    turn: HeadingTurn,
-}
-
-/// A correction smaller than this is not worth reaching for the knob.
-const BUG_CORRECT_DEG: f64 = 5.0;
-/// And not more often than this.
-const BUG_CORRECT_EVERY_S: f64 = 30.0;
-/// Wings this level count as level for a correction.
-const BUG_LEVEL_BANK_DEG: f64 = 5.0;
-/// Start a large turn with a small bug displacement. X-Plane's HDG mode can
-/// choose the long way when the final heading is selected in one jump, even
-/// from nearly level flight (C172 EGBB-EGTF, 2026-10-01).
-const BUG_ENTRY_LEAD_DEG: f64 = 25.0;
-/// A bank past this has committed to a direction (or exposed a wrong-way
-/// entry). This is deliberately below the heading mode's 11-17 degree turn.
-const BUG_TURN_BANK_DEG: f64 = 3.0;
-/// Once neutralised, keep the bug on the captured heading until the wings are
-/// genuinely level before asking for the wanted direction again.
-const BUG_ROLLOUT_LEVEL_DEG: f64 = 1.0;
-
-impl HeadingHold {
-    /// The heading to set now, or `None` to leave the knob alone. Pure.
-    pub fn decide(&mut self, leg: usize, want_mag: f64, heading_mag: f64, bank_deg: f64, now_s: f64) -> Option<f64> {
-        let want = want_mag.round().rem_euclid(360.0);
-        let diff = |a: f64, b: f64| ((a - b + 540.0).rem_euclid(360.0)) - 180.0;
-        let turn = diff(want, heading_mag);
-        let new_leg = self.leg != Some(leg) || self.set.is_none();
-        let command = if new_leg {
-            let sign = turn.signum();
-            let against_bank = bank_deg.abs() > BUG_TURN_BANK_DEG
-                && turn.abs() > 10.0
-                && sign != bank_deg.signum();
-            if against_bank {
-                self.turn = HeadingTurn::Rollout { sign };
-                Some(heading_mag.round().rem_euclid(360.0))
-            } else if turn.abs() > 10.0 {
-                self.turn = HeadingTurn::Entry { sign };
-                Some(
-                    (heading_mag + sign * turn.abs().min(BUG_ENTRY_LEAD_DEG))
-                        .round()
-                        .rem_euclid(360.0),
-                )
-            } else {
-                self.turn = HeadingTurn::Direct;
-                Some(want)
-            }
-        } else {
-            match self.turn {
-                HeadingTurn::Rollout { sign } => {
-                    if bank_deg.abs() <= BUG_ROLLOUT_LEVEL_DEG {
-                        let sign = if turn.abs() > 10.0 {
-                            turn.signum()
-                        } else {
-                            sign
-                        };
-                        if turn.abs() <= 10.0 {
-                            self.turn = HeadingTurn::Direct;
-                            Some(want)
-                        } else {
-                            self.turn = HeadingTurn::Entry { sign };
-                            Some(
-                                (heading_mag + sign * turn.abs().min(BUG_ENTRY_LEAD_DEG))
-                                    .round()
-                                    .rem_euclid(360.0),
-                            )
-                        }
-                    } else {
-                        None
-                    }
-                }
-                HeadingTurn::Entry { sign } => {
-                    if bank_deg.abs() > BUG_TURN_BANK_DEG && bank_deg.signum() != sign {
-                        self.turn = HeadingTurn::Rollout { sign };
-                        Some(heading_mag.round().rem_euclid(360.0))
-                    } else if bank_deg.abs() > BUG_TURN_BANK_DEG && bank_deg.signum() == sign {
-                        self.turn = HeadingTurn::Direct;
-                        Some(want)
-                    } else {
-                        None
-                    }
-                }
-                HeadingTurn::Direct => {
-                    let off = diff(want, self.set.unwrap_or(want)).abs();
-                    (off >= BUG_CORRECT_DEG
-                        && bank_deg.abs() < BUG_LEVEL_BANK_DEG
-                        && now_s - self.last_write_s >= BUG_CORRECT_EVERY_S)
-                        .then_some(want)
-                }
-            }
-        };
-        let command = command?;
-        self.leg = Some(leg);
-        self.set = Some(command);
-        self.last_write_s = now_s;
-        Some(command)
-    }
-
-    /// Forget the leg, so the next tick sets its heading afresh (a rejoin).
-    pub fn reset(&mut self) {
-        *self = Self::default();
-    }
-}
-
 async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, plan: Plan) {
     let Plan {
         name,
@@ -3079,10 +2952,15 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, plan: Pla
         );
         return;
     }
-    let _ = xp.run_command(CMD_SERVOS_ON).await;
+    // The servos in through the one engage door (`ap_engage`: FD first, on
+    // the tape); the tick's lateral watch below confirms them.
+    // The follower carries no `ApConfig`: the live airframe's FD list.
+    let ap_fd = crate::ap_engage::fd_commands();
+    crate::ap_engage::press_logged(&xp, &ap_fd, "procedure", "seed", 1).await;
     if xp.get_float(HDG_STATUS).await.is_ok_and(|v| v <= 0.5) {
         let _ = xp.run_command(CMD_HDG_MODE).await;
     }
+    let mut servo_watch = crate::ap_engage::ServoWatch::default();
     // What we COMMANDED last tick, a different thing from the leg constraint
     // carried across unconstrained fixes, and the pacing `descent_target_ft`
     // actually needs. They were one variable until 2026-09-13, and since
@@ -3300,6 +3178,7 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, plan: Pla
             gs_r,
             phi_r,
             var_r,
+            servos_r,
         ) = tokio::join!(
             xp.get_float(LAT),
             xp.get_float(LON),
@@ -3314,6 +3193,7 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, plan: Pla
             xp.get_float(GS_MS),
             xp.get_float(crate::datarefs::BANK_DEG),
             xp.get_float(MAG_VAR),
+            xp.get_float(crate::datarefs::SERVOS_ON),
         );
         let now = std::time::Instant::now();
         let dt = now.duration_since(tick_clock).as_secs_f64();
@@ -3666,7 +3546,7 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, plan: Pla
         let psi_v = Some(psi);
         let crab = match (psi_v, hpath_r.as_ref().ok().copied().filter(|v| v.is_finite())) {
             (Some(psi), Some(hp)) => {
-                (((psi - hp + 540.0).rem_euclid(360.0)) - 180.0).clamp(-25.0, 25.0)
+                crate::angles::signed_diff_deg(psi, hp).clamp(-25.0, 25.0)
             }
             _ => 0.0,
         };
@@ -3855,7 +3735,7 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, plan: Pla
                     stalls = 0;
                 }
                 let turn = bearing_to_fix(lat, lon, leg)
-                    .map(|b| ((b - psi + 540.0).rem_euclid(360.0) - 180.0).abs())
+                    .map(|b| crate::angles::abs_diff_deg(b, psi))
                     .unwrap_or(0.0);
                 let grace = leg_turn_grace_s(turn);
                 closure = Some((
@@ -3915,8 +3795,22 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, plan: Pla
         // mid-climb left the servos off with only the VS re-engage watching,
         // and the aircraft spiralled at 20°/s while the loop slewed a bug
         // nobody was following (LEJR enroute, 2026-07-24).
+        // The servos through the one engage (`ap_engage::ServoWatch`: FD
+        // first, re-pressed until they read in, `ap_engage` / `ap_engaged`).
+        let st = servo_watch.step(
+            started.elapsed().as_secs_f64(),
+            hdg_st <= 0.5,
+            servos_r.as_ref().ok().copied(),
+            ias,
+        );
+        if st.fire {
+            crate::ap_engage::press_logged(&xp, &ap_fd, "procedure", "lateral", st.try_n)
+                .await;
+        }
+        if st.confirmed_now {
+            crate::ap_engage::record_engaged("procedure", "lateral", st.try_n);
+        }
         if hdg_st <= 0.5 {
-            let _ = xp.run_command(CMD_SERVOS_ON).await;
             let _ = xp.run_command(CMD_HDG_MODE).await;
             crate::blackbox::record(
                 "procedure",
@@ -6291,7 +6185,7 @@ mod tests {
             if run.established_nm.is_none() {
                 let faf = CourseLine::of_leg(&legs[1], VAR).unwrap();
                 let (along, xtk_m) = (faf.along_nm(lat, lon), faf.xtk_nm(lat, lon) * 1852.0);
-                let off = ((hdg - faf.course_true() + 540.0).rem_euclid(360.0) - 180.0).abs();
+                let off = crate::angles::abs_diff_deg(hdg, faf.course_true());
                 if along > 0.0 && xtk_m.abs() < 300.0 && off < 10.0 {
                     run.established_nm = Some(along);
                 }
@@ -6373,7 +6267,7 @@ mod tests {
                 run.max_descent_ias = run.max_descent_ias.max(ias);
             }
             // The heading mode: a rate-limited roll to 25 degrees, the short way.
-            let err = ((bug_true - hdg + 540.0).rem_euclid(360.0)) - 180.0;
+            let err = crate::angles::signed_diff_deg(bug_true, hdg);
             let want_bank = (err * 1.5).clamp(-25.0, 25.0);
             bank += (want_bank - bank).clamp(-5.0 * dt, 5.0 * dt);
             let v_ms = gs * 0.514_444;
@@ -7082,7 +6976,7 @@ mod tests {
         let (psi_true, here) = (142.2, 0.78);
         let correct = true_to_mag(psi_true, here);
         assert!(
-            (crate::circuit::bug_toward(correct, 122.2, correct, 25.0, 40.0) - correct).abs()
+            (crate::heading_bug::bug_toward(correct, 122.2, correct, 25.0, 40.0) - correct).abs()
                 < 0.01,
             "on the nose is a capture"
         );
@@ -7091,8 +6985,8 @@ mod tests {
         // degrees of standing right turn, the same way the aircraft is
         // already banked. Which is exactly what it flew.
         let stale = true_to_mag(psi_true, here + 11.4);
-        let commanded = crate::circuit::bug_toward(stale, 122.2, stale, 25.0, 40.0);
-        let error = ((commanded - correct + 540.0).rem_euclid(360.0)) - 180.0;
+        let commanded = crate::heading_bug::bug_toward(stale, 122.2, stale, 25.0, 40.0);
+        let error = crate::angles::signed_diff_deg(commanded, correct);
         assert!(
             (error - 11.4).abs() < 0.1,
             "a standing turn command, not a capture: {error:.1} degrees"

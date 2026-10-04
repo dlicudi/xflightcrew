@@ -12,6 +12,7 @@
 
 mod aircraft;
 mod answers;
+mod ap_engage;
 mod approach_guide;
 mod audio;
 mod auto_status;
@@ -29,6 +30,7 @@ mod crew_pace;
 mod conversation;
 mod course_leg;
 mod debrief;
+mod heading_bug;
 mod sortie_runner;
 mod test_card;
 mod detect;
@@ -100,14 +102,14 @@ mod weather;
 // crates; these shims keep every existing `crate::station::...` /
 // `crate::xplane::...` path in the module tree resolving unchanged.
 pub(crate) use ::atc::{airspace, atis, callsign, nav, party_line, speaker, station, tower};
-pub(crate) use sim::{blackbox, datarefs, xplane};
+pub(crate) use sim::{angles, blackbox, datarefs, xplane};
 
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Result};
 
 use answers::{
-    aircraft_info, angle_delta_deg, answer_state_query, config_advice, conversation_read,
+    aircraft_info, answer_state_query, config_advice, conversation_read,
     fuel_report, is_endurance_query, is_fuel_query, is_power_loss_query, is_taxi_query,
     landing_readiness, lerp_angle_deg, location_answer, nav_progress, on_course_report,
     power_loss_diagnosis, reference_limits, remote_weather_target, runway_advice, systems_check,
@@ -3523,7 +3525,7 @@ async fn run_session(
                     let _ = xplane.set_float(dref, val).await;
                 }
                 // + psi remainder = the control is right of centre; + the = above.
-                callout_off = Some((angle_delta_deg(applied[3], saved[3]), saved[4] - applied[4]));
+                callout_off = Some((crate::angles::turn_deg(applied[3], saved[3]), saved[4] - applied[4]));
                 tokio::time::sleep(std::time::Duration::from_millis(500)).await;
                 have_cur.then_some(cur)
             } else {

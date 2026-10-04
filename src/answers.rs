@@ -82,13 +82,7 @@ pub(crate) fn location_answer(
 
 /// Interpolate between two headings/angles along the shortest arc, degrees.
 pub(crate) fn lerp_angle_deg(a: f64, b: f64, t: f64) -> f64 {
-    let d = ((b - a) % 360.0 + 540.0) % 360.0 - 180.0;
-    (a + d * t).rem_euclid(360.0)
-}
-
-/// Signed shortest difference b − a in degrees (−180..180).
-pub(crate) fn angle_delta_deg(a: f64, b: f64) -> f64 {
-    ((b - a) % 360.0 + 540.0) % 360.0 - 180.0
+    (a + crate::angles::turn_deg(a, b) * t).rem_euclid(360.0)
 }
 
 /// Read a dataref preferring the live-state cache (instant, no round-trip), with a

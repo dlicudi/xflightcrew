@@ -74,12 +74,6 @@ impl Runway {
     }
 }
 
-/// Smallest absolute difference between two headings, degrees (0-180).
-pub fn heading_diff(a: f64, b: f64) -> f64 {
-    let d = ((a - b) % 360.0 + 540.0) % 360.0 - 180.0;
-    d.abs()
-}
-
 /// Parse a type-`100` apt.dat line into its two landing ends (threshold lat/lon,
 /// id, and the course to fly landing on that end). `None` if the line is malformed.
 /// Pure — the streaming pass adds ICAO + distance. Returns (end1, end2) as
@@ -272,7 +266,7 @@ pub fn best_landing_runway_in_wind(
         let brg = bearing_deg(lat, lon, r.thr_lat, r.thr_lon);
         landing_score(
             r.dist_nm,
-            heading_diff(track_deg, brg),
+            crate::angles::abs_diff_deg(track_deg, brg),
             r.course_deg,
             winds.get(&r.icao).copied().flatten(),
             r.length_m,
@@ -455,7 +449,6 @@ const PHI_TRUE: &str = "sim/flightmodel/position/true_phi";
 /// of the LXGB 09 arrival it was written for (339 fpm at the wheels).
 const VVI_FPM: &str = crate::datarefs::VVI_FPM;
 // AP + controls (mirror of autopilot.rs / recover.rs).
-const CMD_SERVOS_ON: &str = "sim/autopilot/servos_on";
 const CMD_SERVOS_OFF: &str = "sim/autopilot/servos_off_any";
 /// Servos AND flight director off: the wheels' disconnect.
 const CMD_SERVOS_FDIR_OFF: &str = "sim/autopilot/servos_fdir_off";
@@ -592,146 +585,12 @@ pub fn vs_not_held_line(target_vs_fpm: f64) -> &'static str {
 }
 const VS_DIVERGED_GIVE_UP_S: f64 = 46.0;
 
-/// THE AUTOPILOT IS ENGAGED AND CONFIRMED, never assumed. The arm used to
-/// fire `servos_on` once and never read it back. After `setup_approach` the
-/// sim is still starting the new flight when autoland arms (IAS reads 0 to
-/// 12 kt for the first second), and that one press was lost: LEMG 13
-/// (sortie 1790587073-approach, 2026-09-28) flew with `ap_state` 132 and the
-/// servos off from the arm until the VS watchdog's re-press at +9.5 s, the
-/// aircraft flown by nobody while autoland commanded a climb: -900 fpm at
-/// the start growing to -3,450, 2,318 to 1,697 ft MSL, 405 ft AGL over the
-/// rising ground. Two of six runs lost the press the same way (1790583434,
-/// 1790583663 reached 200 and 145 ft AGL); the re-arms that engaged did so
-/// on the re-arm's own press.
-///
-/// So the press is re-fired every [`ENGAGE_RETRY_S`] until the servos READ
-/// on for [`ENGAGE_CONFIRM_READS`] ticks running with the sim live (an
-/// airspeed that is a flight's, [`ENGAGE_LIVE_IAS_KTS`]: the flight start
-/// can drop an engage made before it), each try blackboxed `ap_engage`. A
-/// failed read is no measurement: it neither confirms nor breaks the run.
-/// Until confirmed, with the servos read OFF, the loop holds the aircraft
-/// level itself on the elevator channel ([`engage_hold_gains`]). No
-/// confirmation within [`ENGAGE_GIVE_UP_S`] of live flight is said and the
-/// approach handed over.
-#[derive(Debug, Clone, Default)]
-pub struct ApEngage {
-    tries: u32,
-    last_fire_s: Option<f64>,
-    live_since_s: Option<f64>,
-    on_reads: u32,
-    /// The last GOOD servo read (true = on); `None` = never read.
-    last_read: Option<bool>,
-    confirmed: bool,
-}
-
-/// Seconds between presses while the servos do not read on: every tick at
-/// the loop's 0.6 s (`servos_on` is not a toggle).
-pub const ENGAGE_RETRY_S: f64 = 0.5;
-/// Consecutive live ticks the servos must read on to be confirmed.
-pub const ENGAGE_CONFIRM_READS: u32 = 2;
-/// An airspeed that is a flight's, not a flight still being started.
-pub const ENGAGE_LIVE_IAS_KTS: f64 = 30.0;
-/// Seconds of live flight without a confirmed engage before the approach is
-/// handed over.
-pub const ENGAGE_GIVE_UP_S: f64 = 10.0;
-
-/// What the engage watch wants this tick.
-#[derive(Debug, Clone, Copy, PartialEq, Default)]
-pub struct EngageStep {
-    /// Press the flight director and `servos_on` now (try number `try_n`).
-    pub fire: bool,
-    pub try_n: u32,
-    /// Hold the aircraft on the elevator channel this tick: not confirmed,
-    /// and the servos last READ off.
-    pub hold: bool,
-    /// Confirmed on this tick (the record is written once).
-    pub confirmed_now: bool,
-    /// No engage within the bound: say it and hand over.
-    pub give_up: bool,
-}
-
-impl ApEngage {
-    /// The press at the arm (try 1): the arm fires before the first tick.
-    pub fn arm(&mut self, now_s: f64) -> EngageStep {
-        self.tries = 1;
-        self.last_fire_s = Some(now_s);
-        EngageStep {
-            fire: true,
-            try_n: 1,
-            hold: false,
-            ..Default::default()
-        }
-    }
-
-    pub fn confirmed(&self) -> bool {
-        self.confirmed
-    }
-
-    pub fn tries(&self) -> u32 {
-        self.tries
-    }
-
-    /// One tick. `servos` is the `servos_on` read (`None` = failed read),
-    /// `ias_kts` the airspeed read this tick.
-    pub fn step(&mut self, now_s: f64, servos: Option<f64>, ias_kts: f64) -> EngageStep {
-        if self.confirmed {
-            return EngageStep::default();
-        }
-        let live = ias_kts.is_finite() && ias_kts >= ENGAGE_LIVE_IAS_KTS;
-        if live && self.live_since_s.is_none() {
-            self.live_since_s = Some(now_s);
-        }
-        match servos {
-            Some(v) if v > 0.5 => {
-                self.last_read = Some(true);
-                if live {
-                    self.on_reads += 1;
-                } else {
-                    self.on_reads = 0;
-                }
-            }
-            Some(_) => {
-                self.last_read = Some(false);
-                self.on_reads = 0;
-            }
-            None => {}
-        }
-        if self.on_reads >= ENGAGE_CONFIRM_READS {
-            self.confirmed = true;
-            return EngageStep {
-                confirmed_now: true,
-                try_n: self.tries,
-                ..Default::default()
-            };
-        }
-        if self
-            .live_since_s
-            .is_some_and(|t0| now_s - t0 >= ENGAGE_GIVE_UP_S)
-        {
-            return EngageStep {
-                give_up: true,
-                try_n: self.tries,
-                ..Default::default()
-            };
-        }
-        let due = self
-            .last_fire_s
-            .is_none_or(|t| now_s - t >= ENGAGE_RETRY_S - 1e-9);
-        // Pressed while the servos last READ off, or were never read; a
-        // failed read after an "on" waits for the next measurement.
-        let fire = due && self.last_read != Some(true);
-        if fire {
-            self.tries += 1;
-            self.last_fire_s = Some(now_s);
-        }
-        EngageStep {
-            fire,
-            try_n: self.tries,
-            hold: self.last_read == Some(false),
-            ..Default::default()
-        }
-    }
-}
+/// The confirmed engager lives in [`crate::ap_engage`] (refactor audit
+/// 2026-10-04 #5: one engage for every loop); re-exported for the arm and
+/// the tests here.
+pub use crate::ap_engage::{ApEngage, EngageStep};
+#[cfg(test)]
+pub use crate::ap_engage::ENGAGE_GIVE_UP_S;
 
 /// The elevator law that holds the aircraft LEVEL until the autopilot is
 /// confirmed: the flare's free tracker ([`FlarePitch`] outside the
@@ -924,7 +783,7 @@ impl RolloutBrakeSteer {
         }
         if let Some((law, prev_psi)) = self.free.as_mut() {
             let mean = match (psi_deg, *prev_psi) {
-                (Some(p), Some(q)) => ((p - q + 540.0).rem_euclid(360.0) - 180.0) / dt_s.clamp(0.05, 3.0),
+                (Some(p), Some(q)) => crate::angles::signed_diff_deg(p, q) / dt_s.clamp(0.05, 3.0),
                 _ => 0.0,
             };
             *prev_psi = psi_deg;
@@ -1892,8 +1751,7 @@ fn spawn_autoland(launch: AutolandLaunch) {
             let mut engage_held = false;
             {
                 let e = engage.arm(0.0);
-                for c in &cfg.fd_commands { let _ = xp.run_command(c).await; }
-                let ok = xp.run_command(CMD_SERVOS_ON).await.is_ok();
+                let ok = crate::ap_engage::press(&xp, &cfg.fd_commands).await;
                 crate::blackbox::record(
                     "autoland",
                     serde_json::json!({"event": "ap_engage", "try": e.try_n, "sent": ok,
@@ -1928,7 +1786,7 @@ fn spawn_autoland(launch: AutolandLaunch) {
             let mut last_phase: Option<ApproachPhase> = None;
             let mut flare_power = FlarePower::default();
             // The heading knob, set as a pilot sets it (`bug_knob`, issue #93).
-            let mut bug_hold = crate::circuit::BugHold::default();
+            let mut bug_hold = crate::heading_bug::BugHold::default();
             let knob_t0 = std::time::Instant::now();
             // The lever the approach was flown on, for a balloon to hold.
             let mut approach_thr: Option<f64> = None;
@@ -2405,7 +2263,7 @@ fn spawn_autoland(launch: AutolandLaunch) {
                         gs_kts,
                     );
                     let psi = psi_r.as_ref().copied().unwrap_or(rwy.course_deg);
-                    let err = ((target - psi + 540.0).rem_euclid(360.0)) - 180.0;
+                    let err = crate::angles::signed_diff_deg(target, psi);
                     // OFF THE WHEELS after the latch: a bounce (`BounceHold`).
                     // The latch takes the first tick the wheels read on, and
                     // at LEMG 13 (the SR22, 2026-09-29) that tick was a
@@ -2937,7 +2795,7 @@ fn spawn_autoland(launch: AutolandLaunch) {
                             // 800 ft high, the 737 turned straight onto a
                             // downwind from 1,600 ft at LEMG 13 (2026-09-26).
                             if needed
-                                && late_go_around(along_nm, heading_diff(track_true, rwy.course_deg))
+                                && late_go_around(along_nm, crate::angles::abs_diff_deg(track_true, rwy.course_deg))
                                 && runtime.go_around.order(on_ground > 0.5)
                             {
                                 crate::blackbox::record(
@@ -3685,8 +3543,7 @@ fn spawn_autoland(launch: AutolandLaunch) {
                     EngageStep::default()
                 };
                 if es.fire {
-                    for c in &cfg.fd_commands { let _ = xp.run_command(c).await; }
-                    let ok = xp.run_command(CMD_SERVOS_ON).await.is_ok();
+                    let ok = crate::ap_engage::press(&xp, &cfg.fd_commands).await;
                     crate::blackbox::record(
                         "autoland",
                         serde_json::json!({"event": "ap_engage", "try": es.try_n, "sent": ok,
@@ -3909,7 +3766,7 @@ fn spawn_autoland(launch: AutolandLaunch) {
                 // seconds, damped on the drift over the ground (see
                 // `short_final_cut_deg`), where the old 80 deg/nm let 1 degree
                 // of track build 9 m from 170 ft to the gate.
-                let off_course = |a: f64| ((a - rwy.course_deg + 540.0).rem_euclid(360.0)) - 180.0;
+                let off_course = |a: f64| crate::angles::signed_diff_deg(a, rwy.course_deg);
                 let track_off = hpath_r.as_ref().ok().copied().map(off_course);
                 let in_short_final = g.phase == ApproachPhase::Final
                     && g.dist_nm <= SHORT_FINAL_NM
@@ -3947,7 +3804,15 @@ fn spawn_autoland(launch: AutolandLaunch) {
                         );
                     }
                     ArrestHands::Return => {
-                        let ok = xp.run_command(CMD_SERVOS_ON).await.is_ok();
+                        // The servos back through the one engage door (FD
+                        // first, `ap_engage` on the tape). Not a fresh
+                        // `ApEngage` watch: its level hold would fight the
+                        // balk's climb and its give-up would hand a go-around
+                        // over; the VS watchdog below judges what comes back.
+                        let ok = crate::ap_engage::press_logged(
+                            &xp, &cfg.fd_commands, "autoland", "arrest_return", 1,
+                        )
+                        .await;
                         let _ = xp.run_command(CMD_HDG_MODE).await;
                         let _ = xp.run_command(CMD_VS_MODE).await;
                         let _ = xp.set_float(VS_DIAL, vs_dial).await;
@@ -4171,7 +4036,32 @@ fn spawn_autoland(launch: AutolandLaunch) {
                         None
                     }
                     (true, Some((key, db))) => {
-                        bug_hold.decide(key, mag_hdg, knob_t0.elapsed().as_secs_f64(), db)
+                        // The pattern's, the reversal's, the join's and the
+                        // missed approach's turns go through the one
+                        // turn-safe steer (`heading_bug::bug_toward`, audit
+                        // #6): never a bug on the far side of a turn in
+                        // progress, a big turn led from level by at most
+                        // 25 degrees. They had no reversal guard. The knob
+                        // drive below does the stepping (30 a tick), so the
+                        // steer's own slew is not used.
+                        let want = match psi_r.as_ref().ok().copied() {
+                            Some(psi)
+                                if g.phase == ApproachPhase::Intercept
+                                    || pattern.is_some()
+                                    || missed.is_some() =>
+                            {
+                                let hdg_mag = true_to_mag(psi, var);
+                                crate::heading_bug::bug_toward(
+                                    bug_hold.set().unwrap_or(hdg_mag),
+                                    mag_hdg,
+                                    hdg_mag,
+                                    phi_r.as_ref().ok().copied().unwrap_or(0.0),
+                                    360.0,
+                                )
+                            }
+                            _ => mag_hdg,
+                        };
+                        bug_hold.decide(key, want, knob_t0.elapsed().as_secs_f64(), db)
                     }
                     (true, None) => {
                         bug_hold.reset();
@@ -4393,7 +4283,7 @@ fn spawn_autoland(launch: AutolandLaunch) {
                         &crate::aircraft::flap_limits(),
                         floor,
                     );
-                    let adj = crate::tools::speedhold::throttle_adjust(target - ias, trend_kts_s);
+                    let adj = crate::tools::speedhold::throttle_adjust_live(target - ias, trend_kts_s);
                     // In the roundout the lever only ever comes back. The
                     // speed law read the roundout's own deceleration as
                     // "five knots slow" and walked the 737's lever from 0.32
@@ -4604,7 +4494,12 @@ fn spawn_autoland(launch: AutolandLaunch) {
                         // airframe's own protection (the A330's high-speed
                         // law at Vmo) answers to neither a dial nor a mode
                         // command until the servos are back on.
-                        let _ = xp.run_command(CMD_SERVOS_ON).await;
+                        // FD first (`ap_engage`): the watchdog's own clock
+                        // judges whether it held.
+                        crate::ap_engage::press_logged(
+                            &xp, &cfg.fd_commands, "autoland", "vs_watchdog", 1,
+                        )
+                        .await;
                         let _ = xp.run_command(CMD_VS_MODE).await;
                         announce(vs_not_held_line(g.target_vs_fpm).into(), Priority::Warning);
                     }
@@ -4876,7 +4771,7 @@ impl CrabFilter {
     /// is a turn or a slip, not a wind angle.
     pub fn raw(psi_true: Option<f64>, hpath_true: Option<f64>) -> Option<f64> {
         let (psi, hpath) = (psi_true?, hpath_true?);
-        Some((((psi - hpath + 540.0).rem_euclid(360.0)) - 180.0).clamp(-15.0, 15.0))
+        Some(crate::angles::signed_diff_deg(psi, hpath).clamp(-15.0, 15.0))
     }
 
     /// Advance by one tick of `dt_s` seconds and return the crab to command.
@@ -4989,7 +4884,7 @@ impl TrackTrim {
             self.steady_s = 0.0;
             return false;
         };
-        let raw = ((h - p + 540.0).rem_euclid(360.0) - 180.0) / dt_s;
+        let raw = crate::angles::signed_diff_deg(h, p) / dt_s;
         let r = match self.rate_dps {
             Some(r) => r + (dt_s / TRACK_TRIM_RATE_TAU_S).clamp(0.0, 1.0) * (raw - r),
             None => raw,
@@ -5056,7 +4951,7 @@ impl TrackTrim {
         match phase {
             ApproachPhase::Final => {
                 if let Some(h) = hpath_true {
-                    let err = (wanted_track_deg - h + 540.0).rem_euclid(360.0) - 180.0;
+                    let err = crate::angles::signed_diff_deg(wanted_track_deg, h);
                     let steady = match steady_dps {
                         Some(r) => self.settled(h, dt_s, r),
                         None => true,
@@ -7302,7 +7197,7 @@ pub fn side_velocity_m_s(track_true: Option<f64>, course_true: f64, gs_kts: f64)
     if !gs_kts.is_finite() {
         return None;
     }
-    let off = (((trk - course_true + 540.0).rem_euclid(360.0)) - 180.0).to_radians();
+    let off = crate::angles::signed_diff_deg(trk, course_true).to_radians();
     Some(gs_kts * 0.514_444 * off.sin())
 }
 
@@ -7512,7 +7407,7 @@ pub fn along_track_nm(lat: f64, lon: f64, rwy: &Runway) -> f64 {
     // Project threshold→aircraft onto the INBOUND (recip) direction: on the
     // approach side the aircraft bears ~recip from the threshold (cos ≈ +1),
     // past it the aircraft bears ~course_deg (cos ≈ -1).
-    let ang = ((brg_from_thr - recip + 540.0) % 360.0 - 180.0).to_radians();
+    let ang = crate::angles::signed_diff_deg(brg_from_thr, recip).to_radians();
     dist * ang.cos()
 }
 
@@ -7523,7 +7418,7 @@ pub fn cross_track_nm(lat: f64, lon: f64, rwy: &Runway) -> f64 {
     let dist = haversine_nm(rwy.thr_lat, rwy.thr_lon, lat, lon);
     // Perpendicular offset from the extended centreline, signed right-positive
     // relative to the INBOUND landing course (the direction of flight on final).
-    let ang = ((brg_from_thr - rwy.course_deg + 540.0) % 360.0 - 180.0).to_radians();
+    let ang = crate::angles::signed_diff_deg(brg_from_thr, rwy.course_deg).to_radians();
     dist * ang.sin()
 }
 
@@ -7962,16 +7857,16 @@ pub fn go_around_flap_due(ias_kts: f64, floor_kts: Option<f64>) -> bool {
 
 /// Autoland's intercepts, patterns and missed approach: a two-degree
 /// correction at most every five seconds.
-pub const AUTOLAND_INTERCEPT_DEADBAND: crate::circuit::BugDeadband =
-    crate::circuit::BugDeadband { deg: 2.0, every_s: 5.0 };
+pub const AUTOLAND_INTERCEPT_DEADBAND: crate::heading_bug::BugDeadband =
+    crate::heading_bug::BugDeadband { deg: 2.0, every_s: 5.0 };
 /// The final outside [`SHORT_FINAL_NM`]: half a degree at most every two
 /// seconds (a degree every three left the fitted 737 9.8 m off at the
 /// roundout gate from a 30 m LEMG 13 handover, against 3.9 every tick).
-pub const AUTOLAND_FINAL_DEADBAND: crate::circuit::BugDeadband =
-    crate::circuit::BugDeadband { deg: 0.5, every_s: 2.0 };
+pub const AUTOLAND_FINAL_DEADBAND: crate::heading_bug::BugDeadband =
+    crate::heading_bug::BugDeadband { deg: 0.5, every_s: 2.0 };
 
 /// How autoland's heading knob is set this tick (issue #93): the key and
-/// deadband for [`crate::circuit::BugHold`], or `None` to steer it every
+/// deadband for [`crate::heading_bug::BugHold`], or `None` to steer it every
 /// tick as before (the short final and the flare, where the last 0.3 nm
 /// closes the centreline in seconds). A pattern's legs and each missed
 /// approach stage are their own keys, so a new leg is set at once. Pure.
@@ -7980,7 +7875,7 @@ pub fn bug_knob(
     short_final: bool,
     pattern_leg: Option<crate::reversal::Leg>,
     missed: Option<MissedStage>,
-) -> Option<(u32, crate::circuit::BugDeadband)> {
+) -> Option<(u32, crate::heading_bug::BugDeadband)> {
     match (phase, short_final, pattern_leg, missed) {
         (ApproachPhase::Flare, ..) | (_, true, ..) => None,
         (_, _, Some(leg), _) => Some((10 + leg as u32, AUTOLAND_INTERCEPT_DEADBAND)),
@@ -8520,7 +8415,7 @@ pub fn guidance_on(
             let aim_nm = pursuit_aim_nm(along, gs_kts, rwy.length_m);
             let (alat, alon) = project_latlon(rwy.thr_lat, rwy.thr_lon, recip, aim_nm);
             let brg = bearing_deg(cur_lat, cur_lon, alat, alon);
-            ((brg - rwy.course_deg + 540.0).rem_euclid(360.0) - 180.0).clamp(-35.0, 35.0)
+            crate::angles::signed_diff_deg(brg, rwy.course_deg).clamp(-35.0, 35.0)
         } else {
             (-xtk * 80.0).clamp(-8.0, 8.0)
         };
@@ -9370,7 +9265,7 @@ mod tests {
             };
             bug = (g.target_heading_deg + c + trim_deg).rem_euclid(360.0);
             // The autopilot: second-order toward (bug + bias), ωn 0.5 rad/s, ζ 0.8.
-            let err = (bug + bias_deg - psi + 540.0).rem_euclid(360.0) - 180.0;
+            let err = crate::angles::signed_diff_deg(bug + bias_deg, psi);
             psi_dot += (0.25 * err - 2.0 * 0.8 * 0.5 * psi_dot) * dt;
             psi = (psi + psi_dot * dt).rem_euclid(360.0);
             let (nlat, nlon) = project_latlon(lat, lon, track, gs_kts * dt / 3600.0);
@@ -9740,7 +9635,7 @@ mod tests {
             let dt = if i == 0 { 0.45 } else { s - prev };
             prev = *s;
             let v = t.update(ApproachPhase::Final, *want, Some(*trk), dt);
-            let err = ((want - trk + 540.0_f64).rem_euclid(360.0)) - 180.0;
+            let err = crate::angles::signed_diff_deg(*want, *trk);
             if err.abs() <= super::TRACK_TRIM_ERR_CAP_DEG {
                 old += err * dt / super::TRACK_TRIM_TAU_S;
             }
@@ -10682,7 +10577,7 @@ mod tests {
                     arrest_bank_target(x, side, phi, radio)
                 } else {
                     let hdg = roll_target_heading(0.0, x, rate_now, gs_kts);
-                    let err = ((hdg - track_deg + 540.0).rem_euclid(360.0)) - 180.0;
+                    let err = crate::angles::signed_diff_deg(hdg, track_deg);
                     climb_bank_target(err)
                 };
                 let ail = wings.step(phi, bank_tgt, dt);
@@ -11291,7 +11186,7 @@ mod tests {
             let g = guidance(lat, lon, alt, radio, gs, ias, &rwy, 145.0, 25.0, 0.0);
             let above = alt - g.glidepath_alt_ft;
             assert!(!aims_at_join_point(above, along, lateral, gs), "{dist} nm {above:.0} ft over");
-            let toward = super::heading_diff(g.target_heading_deg, rwy.course_deg);
+            let toward = crate::angles::abs_diff_deg(g.target_heading_deg, rwy.course_deg);
             assert!(toward.abs() < 45.0, "{dist} nm: steering {toward:.0} off the course");
             let aim = FAP_NM;
             assert!(!crate::reversal::needed(&rwy, lat, lon, track, aim, false), "{dist} nm");
@@ -11410,7 +11305,7 @@ mod tests {
         assert_eq!(g.phase, ApproachPhase::Intercept);
         // FAP is 5 nm SOUTH of the threshold; from 8 nm north that's ~due south.
         assert!(
-            heading_diff(g.target_heading_deg, 180.0) < 20.0,
+            crate::angles::abs_diff_deg(g.target_heading_deg, 180.0) < 20.0,
             "must steer toward the FAP/field, got hdg {}",
             g.target_heading_deg
         );
@@ -11527,7 +11422,7 @@ mod tests {
             "past the threshold → go around"
         );
         assert!(
-            heading_diff(g.target_heading_deg, 180.0) < 25.0,
+            crate::angles::abs_diff_deg(g.target_heading_deg, 180.0) < 25.0,
             "must turn back toward the FAP, got hdg {}",
             g.target_heading_deg
         );
@@ -11753,7 +11648,7 @@ mod tests {
             0.0,
         );
         assert_eq!(g_ok.phase, ApproachPhase::Flare);
-        let cut = ((rwy_north().course_deg - g_ok.target_heading_deg + 540.0) % 360.0) - 180.0;
+        let cut = crate::angles::signed_diff_deg(rwy_north().course_deg, g_ok.target_heading_deg);
         assert!(
             cut > 0.1 && cut <= 8.0,
             "flare keeps a bounded correction, got {cut}"
@@ -11991,7 +11886,7 @@ mod tests {
         let g = climb(92.0);
         assert_eq!(g.phase, ApproachPhase::Intercept);
         assert!(
-            heading_diff(g.target_heading_deg, rwy.course_deg) < 0.1,
+            crate::angles::abs_diff_deg(g.target_heading_deg, rwy.course_deg) < 0.1,
             "straight ahead"
         );
         assert!(g.target_vs_fpm > 0.0 && g.target_vs_fpm <= MAX_CLIMB_FPM);
@@ -11999,7 +11894,7 @@ mod tests {
         // climbing slow at full flap is how a go-around stalls.
         let g_slow = climb(75.0);
         assert_eq!(g_slow.target_vs_fpm, 0.0, "build speed before climbing");
-        assert!(heading_diff(g_slow.target_heading_deg, rwy.course_deg) < 0.1);
+        assert!(crate::angles::abs_diff_deg(g_slow.target_heading_deg, rwy.course_deg) < 0.1);
     }
 
     /// The tower is owed the call, so the words have to be words it knows: the
@@ -12088,7 +11983,7 @@ mod tests {
             Some(70.0),
         );
         assert!(
-            heading_diff(g.target_heading_deg, 180.0) < 20.0,
+            crate::angles::abs_diff_deg(g.target_heading_deg, 180.0) < 20.0,
             "outbound to the join point, got {}",
             g.target_heading_deg
         );
@@ -12124,12 +12019,12 @@ mod tests {
         let g = guidance(lat, east, 900.0, 900.0, 90.0, 90.0, &rwy, 90.0, 20.0, 0.0);
         assert_eq!(g.phase, ApproachPhase::Final);
         // Right of course → cut LEFT (west of north): 0.45 × 40 clamps to 30.
-        let cut = ((rwy.course_deg - g.target_heading_deg + 540.0) % 360.0) - 180.0;
+        let cut = crate::angles::signed_diff_deg(rwy.course_deg, g.target_heading_deg);
         assert!(cut > 15.0, "0.45 nm off must earn a real cut, got {cut}");
         // Nearly on the centreline: gentle.
         let near = lon + 0.03 / 60.0;
         let g2 = guidance(lat, near, 900.0, 900.0, 90.0, 90.0, &rwy, 90.0, 20.0, 0.0);
-        let cut2 = ((rwy.course_deg - g2.target_heading_deg + 540.0) % 360.0) - 180.0;
+        let cut2 = crate::angles::signed_diff_deg(rwy.course_deg, g2.target_heading_deg);
         assert!(cut2.abs() < 5.0, "small offset stays gentle, got {cut2}");
     }
 
@@ -12159,7 +12054,7 @@ mod tests {
         );
         // Roughly on the centreline → heading close to the runway course (north).
         assert!(
-            heading_diff(g.target_heading_deg, 0.0) < 10.0,
+            crate::angles::abs_diff_deg(g.target_heading_deg, 0.0) < 10.0,
             "hdg {}",
             g.target_heading_deg
         );
@@ -12188,7 +12083,7 @@ mod tests {
         // Runway is north (bearing ~0); the join point is further SOUTH — so the
         // commanded heading must be southbound, not at the runway.
         assert!(
-            heading_diff(g.target_heading_deg, 180.0) < 30.0,
+            crate::angles::abs_diff_deg(g.target_heading_deg, 180.0) < 30.0,
             "should fly outbound, got hdg {}",
             g.target_heading_deg
         );
@@ -12220,7 +12115,7 @@ mod tests {
             g.target_vs_fpm
         );
         assert!(
-            heading_diff(g.target_heading_deg, 0.0) < 1.0,
+            crate::angles::abs_diff_deg(g.target_heading_deg, 0.0) < 1.0,
             "flare tracks the runway"
         );
     }
@@ -12287,7 +12182,7 @@ mod tests {
             let g = guidance(
                 lat, lon_off, on_path, on_path, gs_kts, 100.0, &rwy, 90.0, 25.0, 0.0,
             );
-            let cut = ((g.target_heading_deg + 540.0).rem_euclid(360.0)) - 180.0;
+            let cut = crate::angles::wrap180(g.target_heading_deg);
             if established_at.is_none() && cut.abs() < 3.0 && off_nm.abs() < 0.05 {
                 established_at = Some(d_nm);
             }
@@ -12311,7 +12206,7 @@ mod tests {
         // DISTANCE-aware: modest 3 nm out, aggressive at 0.8 nm — the fixed
         // per-nm gain commanded 7° at 150 ft with 145 m to close and the
         // aircraft crossed short final diagonal (2026-07-24).
-        let cut = |g: &Guidance| ((g.target_heading_deg - 0.0 + 540.0).rem_euclid(360.0)) - 180.0;
+        let cut = |g: &Guidance| crate::angles::signed_diff_deg(g.target_heading_deg, 0.0);
         let at = |d_nm: f64| {
             let (lat, lon) = project_latlon(0.0, 0.0, 180.0, d_nm);
             let east = (lat, lon + 0.2 / 60.0);
@@ -12502,10 +12397,10 @@ mod tests {
 
     #[test]
     fn heading_diff_wraps() {
-        assert_eq!(heading_diff(10.0, 350.0), 20.0);
-        assert_eq!(heading_diff(350.0, 10.0), 20.0);
-        assert!((heading_diff(90.0, 270.0) - 180.0).abs() < 1e-9);
-        assert_eq!(heading_diff(45.0, 45.0), 0.0);
+        assert_eq!(crate::angles::abs_diff_deg(10.0, 350.0), 20.0);
+        assert_eq!(crate::angles::abs_diff_deg(350.0, 10.0), 20.0);
+        assert!((crate::angles::abs_diff_deg(90.0, 270.0) - 180.0).abs() < 1e-9);
+        assert_eq!(crate::angles::abs_diff_deg(45.0, 45.0), 0.0);
     }
 
     #[test]
@@ -12517,7 +12412,7 @@ mod tests {
         assert_eq!(e2.id, "32");
         assert_eq!(surface, 3);
         // The two ends are the same runway → reciprocal courses (~180 apart).
-        assert!((heading_diff(e1.course, e2.course) - 180.0).abs() < 2.0);
+        assert!((crate::angles::abs_diff_deg(e1.course, e2.course) - 180.0).abs() < 2.0);
         // ~510 m strip; sanity-bound the length.
         assert!(
             length_m > 300.0 && length_m < 800.0,
@@ -14702,7 +14597,7 @@ mod lemg_737_flare_tests {
     #[test]
     fn the_recorded_finals_move_the_knob_less() {
         let moved = |a: Option<f64>, b: f64| {
-            a.is_none_or(|a| (((b - a) + 540.0).rem_euclid(360.0) - 180.0).abs() >= 0.2)
+            a.is_none_or(|a| crate::angles::abs_diff_deg(b, a) >= 0.2)
         };
         let mut by_sortie: Vec<(String, Vec<serde_json::Value>)> = Vec::new();
         for line in LEMG_13_FINAL_KNOBS.lines() {
@@ -14716,7 +14611,7 @@ mod lemg_737_flare_tests {
         assert_eq!(by_sortie.len(), 4);
         let (mut free_all, mut held_all) = (0u32, 0u32);
         for (s, ticks) in &by_sortie {
-            let mut hold = crate::circuit::BugHold::default();
+            let mut hold = crate::heading_bug::BugHold::default();
             let (mut free, mut held) = (0u32, 0u32);
             let (mut free_at, mut held_at) = (None::<f64>, None::<f64>);
             let t0 = ticks[0]["t"].as_f64().unwrap();
@@ -14738,9 +14633,9 @@ mod lemg_737_flare_tests {
                     Some((key, db)) => {
                         hold.decide(key, b, k["t"].as_f64().unwrap() - t0, db);
                         let h = hold.set().unwrap_or(b);
-                        let off = (((h - b) + 540.0).rem_euclid(360.0) - 180.0).abs();
+                        let off = crate::angles::abs_diff_deg(h, b);
                         assert!(
-                            off < crate::circuit::BUG_STEER_DEG,
+                            off < crate::heading_bug::BUG_STEER_DEG,
                             "{s}: the knob {h:.1} against the law's {b:.1}"
                         );
                         h
@@ -15400,7 +15295,7 @@ pub(crate) mod lemg_replay {
             let n = 20;
             let h = dt / n as f64;
             for _ in 0..n {
-                let err = ((applied - self.psi + 540.0).rem_euclid(360.0)) - 180.0;
+                let err = crate::angles::signed_diff_deg(applied, self.psi);
                 let want = (f.gain * err).clamp(-f.bank_max_deg, f.bank_max_deg);
                 self.phi += ((want - self.phi) / f.lag_s).clamp(-f.roll_dps, f.roll_dps) * h;
                 let rate = (9.81 * self.phi.to_radians().tan() / self.tas_mps).to_degrees();
@@ -15433,10 +15328,10 @@ pub(crate) mod lemg_replay {
         /// The knob as the loop sets it (`bug_knob`), when held; the knob
         /// the aircraft flies, how many times it moved (0.2 degrees, the
         /// least `drive_heading_bug_step` writes) and the loop's clock.
-        pub knob: Option<crate::circuit::BugHold>,
+        pub knob: Option<crate::heading_bug::BugHold>,
         pub knob_at: Option<f64>,
         /// A deadband over the loop's own (`bug_knob`), for comparisons.
-        pub knob_db: Option<crate::circuit::BugDeadband>,
+        pub knob_db: Option<crate::heading_bug::BugDeadband>,
         pub moves: u32,
         pub t: f64,
     }
@@ -15460,7 +15355,7 @@ pub(crate) mod lemg_replay {
 
         /// ...with the knob set as today's loop sets it.
         pub fn held(mut self) -> Self {
-            self.knob = Some(crate::circuit::BugHold::default());
+            self.knob = Some(crate::heading_bug::BugHold::default());
             self
         }
 
@@ -15491,7 +15386,7 @@ pub(crate) mod lemg_replay {
                 self.trim_cap_deg,
                 self.trim_steady_dps,
             );
-            let off = |a: f64| ((a - rwy.course_deg + 540.0).rem_euclid(360.0)) - 180.0;
+            let off = |a: f64| crate::angles::signed_diff_deg(a, rwy.course_deg);
             let in_short =
                 g.phase == ApproachPhase::Final && g.dist_nm <= SHORT_FINAL_NM && !g.arresting;
             let bug = match g.phase {
@@ -15526,7 +15421,7 @@ pub(crate) mod lemg_replay {
             }
             if self
                 .knob_at
-                .is_none_or(|a| (((bug - a) + 540.0).rem_euclid(360.0) - 180.0).abs() >= 0.2)
+                .is_none_or(|a| crate::angles::abs_diff_deg(bug, a) >= 0.2)
             {
                 self.moves += 1;
                 self.knob_at = Some(bug);
@@ -15706,7 +15601,7 @@ mod issue_147_tests {
     #[test]
     fn the_short_final_learns_no_bias_from_its_own_turn() {
         let rwy = lemg("13");
-        let off = |a: f64| ((a - rwy.course_deg + 540.0).rem_euclid(360.0)) - 180.0;
+        let off = |a: f64| crate::angles::signed_diff_deg(a, rwy.course_deg);
         let fly = |old: bool| -> (f64, f64, f64) {
             let (lat, lon) = at(&rwy, 0.29 * M_PER_NM, -31.8);
             let mut jet = Jet::new(lat, lon, 129.4, 146.0);
@@ -18624,7 +18519,7 @@ mod lemg13_sr22_rollout_tests {
                 prev = Some(x);
                 let target = crate::autotakeoff::roll_target_heading(COURSE, x, r, gs);
                 let psi = at(t, 2) + dpsi;
-                let err = ((target - psi + 540.0).rem_euclid(360.0)) - 180.0;
+                let err = crate::angles::signed_diff_deg(target, psi);
                 let brake = rollout_brake_ratio(gs, 0.0, 2500.0);
                 let b = if split {
                     law.step_with(err, Some(psi), None, 0.0, TICK_S, gs, brake)
@@ -18936,7 +18831,7 @@ mod lemg13_sr22_rollout_split_tests {
                         on_wheels_seen = true;
                     }
                     let target = crate::autotakeoff::roll_target_heading(COURSE, x, r, gs);
-                    let err = ((target - (psi + dpsi) + 540.0).rem_euclid(360.0)) - 180.0;
+                    let err = crate::angles::signed_diff_deg(target, psi + dpsi);
                     // The track as the `hpath` read gives it: the recorded one
                     // (the course and the sideways speed) and the plant's own
                     // departure from it.
@@ -19830,7 +19725,7 @@ mod lemg13_king_air_rollout_tests {
     /// tick plus the centreline cut it held (LEMG 13's true course).
     fn course(t: &Tick) -> f64 {
         let cut = -crate::autotakeoff::roll_target_heading(0.0, t.5, t.6, t.1);
-        let cut = (cut + 540.0).rem_euclid(360.0) - 180.0;
+        let cut = crate::angles::wrap180(cut);
         (t.2 + t.7 + cut).rem_euclid(360.0)
     }
 
@@ -19950,7 +19845,7 @@ mod lemg13_king_air_rollout_tests {
                 prev = s.xtk;
                 next += TICK_S;
                 let target = crate::autotakeoff::roll_target_heading(c, s.xtk, xr, s.gs);
-                let err = ((target - s.psi + 540.0).rem_euclid(360.0)) - 180.0;
+                let err = crate::angles::signed_diff_deg(target, s.psi);
                 let u = law(err, TICK_S, s.gs, s.r);
                 s.writes.push((s.t, u));
             }

@@ -293,7 +293,7 @@ pub fn bug_step_from(start: Option<f64>, target: f64) -> BugStep {
     let Some(start) = start.filter(|v| v.is_finite()) else {
         return BugStep::Set(target);
     };
-    let full = ((target - start) % 360.0 + 540.0) % 360.0 - 180.0;
+    let full = crate::angles::signed_diff_deg(target, start);
     if full.abs() < FINE_BUG_DEG {
         if full.abs() >= FINE_BUG_MIN_DEG {
             let fine = ((start + full) * 10.0).round() / 10.0;
@@ -314,7 +314,7 @@ pub async fn drive_heading_bug_step(
         let _ = xp.set_float(HEADING_BUG, target).await;
         return target;
     };
-    let full = ((target - start) % 360.0 + 540.0) % 360.0 - 180.0;
+    let full = crate::angles::signed_diff_deg(target, start);
     // A small correction is set to a tenth of a degree, not pressed: a press
     // is a whole degree and a change under half of one is no press at all,
     // so autoland's final command hovering at 131.5 flipped the bug between
@@ -346,7 +346,7 @@ pub async fn drive_heading_bug_step(
         }
     }
     let now = xp.get_float(HEADING_BUG).await.unwrap_or(start);
-    let err = (((leg - now) % 360.0 + 540.0) % 360.0 - 180.0).abs();
+    let err = crate::angles::abs_diff_deg(leg, now);
     if err > 1.5 {
         // Knob path didn't get there — direct write as the fallback (straight
         // to the FULL target: a dataref write is one round trip, no cap needed).
