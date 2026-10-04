@@ -398,6 +398,8 @@ pub enum AltOwner {
 pub fn abort() -> bool {
     RUN.cancel();
     ABORT.store(true, Ordering::SeqCst);
+    // The stashed missed approach was this procedure's landing's.
+    take_missed_legs();
     crate::autoland::abort();
     ACTIVE.swap(false, Ordering::SeqCst)
 }
@@ -2800,6 +2802,9 @@ pub fn start_scoped(
         return false;
     }
     ABORT.store(false, Ordering::SeqCst);
+    // A new procedure never inherits the last one's missed approach: a
+    // normal landing leaves it stashed for the next steep go-around.
+    take_missed_legs();
     std::thread::spawn(move || {
         let _lease = lease.with_cleanup(&ACTIVE, || {
             publish_leg(None);

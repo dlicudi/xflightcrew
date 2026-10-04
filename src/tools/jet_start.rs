@@ -87,6 +87,9 @@ fn say(voice: &Option<Voice>, status: &Option<StatusSink>, line: &str) {
 }
 
 fn spawn(base: String, voice: Option<Voice>, status: Option<StatusSink>) {
+    // Taken on the caller's thread, so a stand-down landing before the thread
+    // runs still stops it.
+    let epoch = crate::tools::power::sequence_epoch();
     std::thread::spawn(move || {
         let Ok(rt) = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -96,7 +99,7 @@ fn spawn(base: String, voice: Option<Voice>, status: Option<StatusSink>) {
         };
         rt.block_on(async move {
             let xp = XPlaneClient::new(base);
-            run_sequence(&xp, &voice, &status).await;
+            run_sequence(&xp, epoch, &voice, &status).await;
         });
     });
 }
@@ -109,10 +112,11 @@ async fn n2(xp: &XPlaneClient, idx: usize) -> f64 {
         .unwrap_or(0.0)
 }
 
-/// Poll engine `idx`'s N2 until it passes `pct`, or give up after `secs`.
-async fn wait_n2(xp: &XPlaneClient, idx: usize, pct: f64, secs: u64) -> bool {
+/// Poll engine `idx`'s N2 until it passes `pct`, or give up after `secs` or at
+/// a stand-down since `epoch`.
+async fn wait_n2(xp: &XPlaneClient, epoch: u64, idx: usize, pct: f64, secs: u64) -> bool {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(secs);
-    while std::time::Instant::now() < deadline {
+    while std::time::Instant::now() < deadline && !stood_down(epoch) {
         if n2(xp, idx).await > pct {
             return true;
         }
@@ -121,12 +125,33 @@ async fn wait_n2(xp: &XPlaneClient, idx: usize, pct: f64, secs: u64) -> bool {
     false
 }
 
-async fn run_sequence(xp: &XPlaneClient, voice: &Option<Voice>, status: &Option<StatusSink>) {
+/// A stand-down (swap, new flight, instructor) since the start began: the
+/// sequence stops before its next step (`flight_state::stand_down`).
+fn stood_down(epoch: u64) -> bool {
+    let gone = crate::tools::power::sequence_stood_down(epoch);
+    if gone {
+        tracing::info!("jet start: stood down mid-sequence");
+    }
+    gone
+}
+
+async fn run_sequence(
+    xp: &XPlaneClient,
+    epoch: u64,
+    voice: &Option<Voice>,
+    status: &Option<StatusSink>,
+) {
+    if stood_down(epoch) {
+        return;
+    }
     // Electrical/APU/bleed must be up first (the autostart runs the boarding prep
     // if it isn't). Reuse the same procedural power-up.
     if xp.get_float(APU_N1).await.unwrap_or(0.0) < 95.0 {
         say(voice, status, "Electrical isn't up. Powering up first.");
         crate::tools::power::run_prep(xp, voice, status).await;
+        if stood_down(epoch) {
+            return;
+        }
         if xp.get_float(APU_N1).await.unwrap_or(0.0) < 95.0 {
             say(voice, status, "No A P U bleed, can't start the engines.");
             return;
@@ -149,6 +174,9 @@ async fn run_sequence(xp: &XPlaneClient, voice: &Option<Voice>, status: &Option<
             break;
         }
         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    }
+    if stood_down(epoch) {
+        return;
     }
     tracing::info!(
         apu_n1 = xp.get_float(APU_N1).await.unwrap_or(0.0),
@@ -182,6 +210,9 @@ async fn run_sequence(xp: &XPlaneClient, voice: &Option<Voice>, status: &Option<
             "left",
         ),
     ] {
+        if stood_down(epoch) {
+            return;
+        }
         // Generator on for this engine; route start air to it (open its cross-feed,
         // close the other).
         xp.set_int_array_elem(GEN_ON, idx, 1).await.ok();
@@ -190,7 +221,10 @@ async fn run_sequence(xp: &XPlaneClient, voice: &Option<Voice>, status: &Option<
 
         say(voice, status, &format!("Cranking the {side} engine."));
         xp.run_command_for(starter, STARTER_HOLD_SECS).await.ok();
-        if !wait_n2(xp, idx, N2_LIGHT, 30).await {
+        if !wait_n2(xp, epoch, idx, N2_LIGHT, 30).await {
+            if stood_down(epoch) {
+                return;
+            }
             tracing::warn!(
                 side,
                 n2 = n2(xp, idx).await,
@@ -204,10 +238,16 @@ async fn run_sequence(xp: &XPlaneClient, voice: &Option<Voice>, status: &Option<
             );
             return;
         }
+        if stood_down(epoch) {
+            return;
+        }
         // 20% N2 — introduce fuel (the fuel handle), then wait for idle.
         say(voice, status, &format!("{} fuel on.", cap(side)));
         xp.set_float_array_elem(MIXTURE, idx, 1.0).await.ok();
-        if !wait_n2(xp, idx, N2_IDLE, 60).await {
+        if !wait_n2(xp, epoch, idx, N2_IDLE, 60).await {
+            if stood_down(epoch) {
+                return;
+            }
             say(
                 voice,
                 status,
@@ -218,6 +258,9 @@ async fn run_sequence(xp: &XPlaneClient, voice: &Option<Voice>, status: &Option<
         say(voice, status, &format!("The {side} engine is running."));
     }
 
+    if stood_down(epoch) {
+        return;
+    }
     // Both cross-feeds open for normal ops.
     xp.set_float(XFEED_L, 1.0).await.ok();
     xp.set_float(XFEED_R, 1.0).await.ok();
