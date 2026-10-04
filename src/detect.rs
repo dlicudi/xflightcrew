@@ -16,7 +16,7 @@ pub(crate) struct LiveProfile {
 
 impl LiveProfile {
     pub(crate) fn new(p: aircraft::AircraftProfile) -> std::sync::Arc<Self> {
-        crate::flight_state::publish_airframe(&p);
+        crate::flight_state::airframe_begins(&p, "boot");
         std::sync::Arc::new(Self {
             inner: std::sync::RwLock::new(p),
             generation: std::sync::atomic::AtomicU64::new(0),
@@ -34,16 +34,15 @@ impl LiveProfile {
         self.generation.load(std::sync::atomic::Ordering::Acquire)
     }
     pub(crate) fn swap(&self, p: aircraft::AircraftProfile) {
-        // A spawned controller owns parameters from the profile that armed it.
-        // Stop every owner before changing the global actuator selectors;
-        // otherwise an old takeoff/autoland loop can start driving the newly
-        // loaded aircraft with the previous airframe's speeds and limits.
-        crate::flight_state::stand_down();
-        // Republished on EVERY swap, including to None: a selector that
+        // A spawned controller owns parameters from the profile that armed it:
+        // the door stops every owner BEFORE changing the global actuator
+        // selectors (else an old takeoff/autoland loop drives the newly loaded
+        // aircraft with the previous airframe's speeds and limits), then
+        // republishes every selector, including to None (a selector that
         // outlives its airframe aims the next aircraft's mode writes at a knob
-        // it doesn't have (the same shape as the radio-power flag that latched
-        // across a 172 -> Twin Otter change, 2026-07-27).
-        crate::flight_state::publish_airframe(&p);
+        // it doesn't have, the radio-power flag that latched across a 172 ->
+        // Twin Otter change, 2026-07-27), then forgets the old flight.
+        crate::flight_state::airframe_begins(&p, "swap");
         *self.inner.write().unwrap() = p;
         self.generation
             .fetch_add(1, std::sync::atomic::Ordering::Release);

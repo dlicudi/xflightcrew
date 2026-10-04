@@ -38,7 +38,16 @@ pub const STOW_KTS: f64 = 25.0;
 const MIN_ENGAGE_KTS: f64 = 5.0;
 
 /// True while reverse is in and the watcher runs. Mirrors `speedhold::ACTIVE`.
+/// Written only by the watcher's run ([`WATCH`]).
 pub static ACTIVE: AtomicBool = AtomicBool::new(false);
+/// The rollout watcher's run: claimed by the tool, cancelled by [`stow`].
+pub(crate) static WATCH: sim::run::Slot = sim::run::Slot::flagged(&ACTIVE);
+
+/// Stow reverse: the watcher sees its run end and glides the levers to idle.
+/// Returns whether reverse was in.
+pub fn stow() -> bool {
+    WATCH.cancel()
+}
 
 /// One-line status for the dashboard's "managing" panel.
 pub fn status() -> Option<String> {
@@ -95,7 +104,7 @@ impl Tool for ReverseThrust {
     async fn execute(&self, args: &Value, ctx: &ToolCtx<'_>) -> Result<String> {
         let a: Args = serde_json::from_value(args.clone())?;
         if !a.on {
-            return Ok(if ACTIVE.swap(false, Ordering::Relaxed) {
+            return Ok(if stow() {
                 // The watcher sees the flag drop and glides the levers to idle.
                 "Stowing reverse.".to_string()
             } else {
@@ -121,24 +130,23 @@ impl Tool for ReverseThrust {
             return Ok("We're stopped — no call for reverse.".to_string());
         }
         // Reverse owns the power levers: the speed governor lets go first.
-        if super::speedhold::ACTIVE.swap(false, Ordering::Relaxed) {
+        if super::speedhold::release() {
             tracing::info!("reverse thrust: released the speed governor");
         }
         let engines = self.engines.max(1);
         glide_levers(ctx.xplane, engines, FULL_REVERSE, 400).await;
         // Watcher on its own thread + runtime (the main runtime blocks on the
         // mic between commands — same reasoning as the speed governor).
-        if !ACTIVE.swap(true, Ordering::Relaxed) {
+        if let Some(run) = WATCH.claim() {
             let base = ctx.config.xplane_base_url.clone();
             std::thread::spawn(move || {
                 let Ok(rt) = tokio::runtime::Builder::new_current_thread()
                     .enable_all()
                     .build()
                 else {
-                    ACTIVE.store(false, Ordering::Relaxed);
                     return;
                 };
-                rt.block_on(watcher(XPlaneClient::new(base), engines));
+                rt.block_on(watcher(XPlaneClient::new(base), engines, &run));
             });
         }
         Ok(format!(
@@ -168,12 +176,12 @@ async fn glide_levers(xp: &dyn XPlane, engines: usize, to: f64, over_ms: u64) {
 
 /// The rollout watcher: stow at taxi speed or on liftoff, yield to the pilot's
 /// hand, glide to idle on any exit except a pilot override.
-async fn watcher(xp: XPlaneClient, engines: usize) {
+async fn watcher(xp: XPlaneClient, engines: usize, run: &sim::run::Lease<'_>) {
     tracing::info!("reverse thrust in, watcher started");
     let mut pilot_has_levers = false;
     loop {
         // Released by voice ("cancel reverse" / "my throttle") — stow and go.
-        if !ACTIVE.load(Ordering::Relaxed) {
+        if !run.live() {
             break;
         }
         let lever = xp
@@ -187,19 +195,20 @@ async fn watcher(xp: XPlaneClient, engines: usize) {
         if lever > -0.8 {
             tracing::info!("reverse thrust: pilot has the levers, yielding");
             pilot_has_levers = true;
-            ACTIVE.store(false, Ordering::Relaxed);
+            run.lower_flag();
             break;
         }
         let gs_kts = xp.get_float(GS_MS).await.unwrap_or(0.0) * MS_TO_KTS;
         let on_ground = xp.get_float(crate::datarefs::ON_GROUND_ANY).await.unwrap_or(1.0) > 0.5;
         if should_stow(gs_kts, on_ground) {
             tracing::info!(gs_kts, on_ground, "reverse thrust: stowing");
-            ACTIVE.store(false, Ordering::Relaxed);
+            run.lower_flag();
             break;
         }
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
     }
-    if !pilot_has_levers {
+    // A watcher superseded by a newer reverse leaves the levers to it.
+    if !pilot_has_levers && run.current() {
         glide_levers(&xp, engines, 0.0, 400).await;
     }
     tracing::info!("reverse thrust stowed, watcher stopped");

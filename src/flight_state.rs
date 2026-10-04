@@ -8,17 +8,23 @@
 //! true at 1,475 ft (EGHI, 2026-08-02). The cure the party line already uses
 //! for the world's side is one page with the writes on it. This is the crew's.
 //!
-//! Three doors:
+//! The doors:
 //! - [`publish_airframe`]: every selector the tools read per airframe, from
 //!   the profile, including to `None`. Called at boot and on every swap.
 //! - [`stand_down`]: every loop that can hold the aircraft, stopped. Called
 //!   on a swap (a loop cannot fly a different aircraft), on entering
 //!   instructor mode (hands off), and when the sim connection is lost.
-//!   `stand_down_pins_every_active_loop` keeps this list equal to every
-//!   loop flag in the tree (`ACTIVE`, `ABORT`, `RUN`, a `_HELD` hold, a
-//!   watcher's `GEN`), so a new loop cannot be forgotten here.
-//! - [`forget_flight`]: the crew's facts about the flight that ended, at the
-//!   setups' new flight and a new flight someone else started.
+//!   It cancels every run in [`LOOPS`], and `stand_down_cancels_every_run`
+//!   keeps that registry equal to every `sim::run::Slot` in the tree (and
+//!   names the door of any loop flag not yet on a run), so a new loop
+//!   cannot be forgotten here.
+//! - [`flight_begins`]: THE new-flight door (ramp, approach and enroute
+//!   setups, a foreign start, the model's reposition): stand-down, the
+//!   crew's flight facts forgotten (`forget_flight`), the old checklist
+//!   dropped, the party line retired; blackbox `flight_state`
+//!   `flight_begins` with `why`.
+//! - [`airframe_begins`]: boot and every swap: stand-down, then
+//!   `publish_airframe`, then the flight forgotten (`airframe_begins`).
 //!
 //! Inventory of what is NOT yet cleared here and lives in its own module,
 //! per FLIGHT rather than per airframe (each reset on its own path today):
@@ -88,11 +94,162 @@ pub(crate) fn publish_airframe(p: &AircraftProfile) {
     crate::tools::anti_ice::clear_claims();
 }
 
+/// What began a new flight: the cause [`flight_begins`] records and the
+/// checklist's stand-down names.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum NewFlight {
+    /// "Set up the flight": the plan's origin, cold and dark.
+    Ramp,
+    /// "Put us on a ten mile final".
+    Approach,
+    /// The sortie runner's airborne start on the plan.
+    Enroute,
+    /// A mailbox run the app did not post (`setup::foreign_new_flight`).
+    Foreign,
+    /// The flight model saw the aircraft jump (`flight::Event::Reposition`)
+    /// with no setup of ours or anyone's accounting for it.
+    Reposition,
+}
+
+impl NewFlight {
+    /// Its name in the blackbox (`flight_state` `flight_begins` `why`).
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            NewFlight::Ramp => "ramp",
+            NewFlight::Approach => "approach",
+            NewFlight::Enroute => "enroute",
+            NewFlight::Foreign => "foreign",
+            NewFlight::Reposition => "reposition",
+        }
+    }
+
+    /// The cause the checklist's `stood_down` record names (the strings it
+    /// wrote before the door: the setups said "setup", the model's jump
+    /// "reposition").
+    fn list_cause(self) -> &'static str {
+        match self {
+            NewFlight::Ramp | NewFlight::Approach | NewFlight::Enroute => "setup",
+            NewFlight::Foreign => "foreign",
+            NewFlight::Reposition => "reposition",
+        }
+    }
+}
+
+/// Bumped once per flight begun (and per airframe, which is a new flight
+/// too): the generation a flight-scoped fact can be stamped with.
+static FLIGHTS_BEGUN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// When the last full door ran ([`flight_begins`] other than a reposition,
+/// or [`airframe_begins`]): the flight model's jump that follows our own
+/// setup is the same new flight, not another.
+static LAST_BEGUN: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
+/// A reposition seen this soon after a door is that door's flight: the
+/// setups run theirs as the init returns, and the model sees the jump on its
+/// first live tick after the load gate opens (a few seconds).
+const REPOSITION_SAME_FLIGHT_S: u64 = 60;
+
+/// The current flight's generation.
+#[allow(dead_code)]
+pub(crate) fn flight_gen() -> u64 {
+    FLIGHTS_BEGUN.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// What a reposition's door does: `None` runs it, else the reason it is the
+/// flight a door already began. Pure, so the idempotency is a plain test.
+fn reposition_skip(
+    loading: bool,
+    since_begun: Option<std::time::Duration>,
+) -> Option<&'static str> {
+    if loading {
+        // A setup of ours (or the runner's start) is loading: its own door
+        // runs when the init returns.
+        return Some("loading");
+    }
+    if since_begun.is_some_and(|d| d.as_secs() < REPOSITION_SAME_FLIGHT_S) {
+        return Some("begun");
+    }
+    None
+}
+
+/// THE NEW-FLIGHT DOOR. Every path that begins a new flight comes through
+/// here, so the steps cannot drift apart again (the ramp setup forgot the
+/// stand-down, the foreign start the checklist, the approach retired the
+/// party line on its own; refactor audit 2026-10-04, phase 3).
+///
+/// A setup's flight (ramp, approach, enroute) and a foreign start: every
+/// loop stood down (nothing keeps flying the flight that ended), the crew's
+/// flight facts forgotten, the checklist of the old flight dropped, and with
+/// ATC on the party line retired (its clearances were the old flight's).
+/// Called once the new flight EXISTS (the init returned), before anything
+/// arms on it. The approach and enroute setups also stand down before their
+/// init, so nothing flies through the jump.
+///
+/// A reposition the model saw is deliberately lighter: only the checklist
+/// (its behaviour before the door). The model's jump is also a replay's
+/// rewind and its return, where standing the loops down or retiring a
+/// landing clearance mid-final would be wrong; and a jump this app or the
+/// runner made already ran its own door ([`reposition_skip`]).
+pub(crate) fn flight_begins(why: NewFlight) {
+    use std::sync::atomic::Ordering::SeqCst;
+    if why == NewFlight::Reposition {
+        let since = LAST_BEGUN
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .map(|t| t.elapsed());
+        if let Some(skip) = reposition_skip(crate::tools::setup::new_flight_loading(), since) {
+            crate::blackbox::record(
+                "flight_state",
+                serde_json::json!({ "event": "flight_begins", "why": why.name(), "skipped": skip }),
+            );
+            return;
+        }
+        let list = crate::flow::stand_down(crate::flow::StandDown::NewFlight(why.list_cause()));
+        crate::blackbox::record(
+            "flight_state",
+            serde_json::json!({ "event": "flight_begins", "why": why.name(),
+                                "list_stood_down": list }),
+        );
+        return;
+    }
+    stand_down();
+    forget_flight();
+    let list = crate::flow::stand_down(crate::flow::StandDown::NewFlight(why.list_cause()));
+    let atc = crate::mode::atc_enabled();
+    if atc {
+        crate::party_line::retire_for_new_flight();
+    }
+    let flight = FLIGHTS_BEGUN.fetch_add(1, SeqCst) + 1;
+    *LAST_BEGUN.lock().unwrap_or_else(|e| e.into_inner()) = Some(std::time::Instant::now());
+    crate::blackbox::record(
+        "flight_state",
+        serde_json::json!({ "event": "flight_begins", "why": why.name(), "flight": flight,
+                            "list_stood_down": list, "party_line_retired": atc }),
+    );
+}
+
+/// THE NEW-AIRFRAME DOOR: at boot and on every swap. In order: every loop
+/// stood down first (a loop armed on the old airframe must not fly the new
+/// one with its speeds and limits), then every selector republished from the
+/// new profile, then the old flight's facts forgotten (a swap reloads the
+/// aircraft: the last landing's runway and the plan's destination were the
+/// old airframe's flight).
+pub(crate) fn airframe_begins(p: &AircraftProfile, why: &'static str) {
+    use std::sync::atomic::Ordering::SeqCst;
+    stand_down();
+    publish_airframe(p);
+    forget_flight();
+    let flight = FLIGHTS_BEGUN.fetch_add(1, SeqCst) + 1;
+    *LAST_BEGUN.lock().unwrap_or_else(|e| e.into_inner()) = Some(std::time::Instant::now());
+    crate::blackbox::record(
+        "flight_state",
+        serde_json::json!({ "event": "airframe_begins", "why": why, "profile": p.id,
+                            "flight": flight }),
+    );
+}
+
 /// The crew's facts about the flight that ended, forgotten when a new one
-/// begins: the ramp and approach setups and a new flight someone else
-/// started (`setup::foreign_new_flight`). The world's side is
-/// `party_line::retire_for_new_flight`, called beside it.
-pub(crate) fn forget_flight() {
+/// begins. Only the doors call it ([`flight_begins`], [`airframe_begins`]);
+/// the world's side is `party_line::retire_for_new_flight`, beside it there.
+fn forget_flight() {
     // The plan's transition was the old flight's: the monitor's altimeter
     // check WRITES the setting with an automation flying.
     crate::tools::instruments::publish_flight_transition(None);
@@ -103,9 +260,36 @@ pub(crate) fn forget_flight() {
     crate::monitor::forget_destination();
 }
 
-/// Every loop that can hold the aircraft, stopped. Aborts go through each
-/// loop's own door where it has one (the door frees the brakes, ends the
-/// mission, hands back a flyable aircraft); the plain flags are cleared here.
+/// Every loop run in the tree (`sim::run::Slot`), by its path: THE registry
+/// [`stand_down`] cancels. `stand_down_cancels_every_run` keeps it equal to
+/// every `Slot` declared under `src`, so a new loop cannot outlive a swap by
+/// being forgotten here (the old check matched names, and `BRAKES_HELD`, the
+/// capture watcher and the start sequences slipped through it).
+pub(crate) static LOOPS: [(&str, &sim::run::Slot); 18] = [
+    ("full_auto::RUN", &crate::full_auto::RUN),
+    ("procedure::RUN", &crate::procedure::RUN),
+    ("autotakeoff::RUN", &crate::autotakeoff::RUN),
+    ("autoland::RUN", &crate::autoland::RUN),
+    ("circuit::RUN", &crate::circuit::RUN),
+    ("tools::recover::RUN", &crate::tools::recover::RUN),
+    ("taxi_in::RUN", &crate::taxi_in::RUN),
+    ("autotaxi::RUN", &crate::autotaxi::RUN),
+    ("pushback::PUSH", &crate::pushback::PUSH),
+    ("hover::RUN", &crate::hover::RUN),
+    ("heli_circuit::RUN", &crate::heli_circuit::RUN),
+    ("heli_route::RUN", &crate::heli_route::RUN),
+    ("tools::speedhold::GOVERNOR", &crate::tools::speedhold::GOVERNOR),
+    ("tools::reverse::WATCH", &crate::tools::reverse::WATCH),
+    ("tools::controls::BRAKE_HOLD", &crate::tools::controls::BRAKE_HOLD),
+    ("tools::autopilot::CAPTURE", &crate::tools::autopilot::CAPTURE),
+    ("tools::power::POWER_UP", &crate::tools::power::POWER_UP),
+    ("tools::jet_start::JET_START", &crate::tools::jet_start::JET_START),
+];
+
+/// Every loop that can hold the aircraft, stopped. First the doors that do
+/// more than cancel (end the mission and its children, free the brakes,
+/// hand back a flyable aircraft, clear a backtrack or a hand-down), then
+/// every run in [`LOOPS`] cancelled, then the loops not yet on a run.
 pub(crate) fn stand_down() {
     use std::sync::atomic::Ordering::SeqCst;
 
@@ -113,31 +297,26 @@ pub(crate) fn stand_down() {
     crate::circuit::abort();
     crate::procedure::abort();
     crate::autoland::abort();
-    crate::tools::recover::abort();
     // The pitch-authority check was about the flight that ended (#181).
     crate::climb_watch::disarm_authority();
-    crate::approach_guide::cancel();
-    crate::ils::stop_setup_watch();
     crate::autotakeoff::cancel();
-    crate::flow::abort();
-    crate::heli_circuit::abort();
-    crate::heli_route::abort();
-    crate::hover::abort();
-    crate::autotaxi::ACTIVE.store(false, SeqCst);
-    crate::autotaxi::BACKTRACKING.store(false, SeqCst);
-    crate::tools::speedhold::ACTIVE.store(false, SeqCst);
-    crate::tools::reverse::ACTIVE.store(false, SeqCst);
-    crate::tools::engine::MIX_MANAGED.store(false, SeqCst);
-    crate::tools::engine::LEAN_SEEKING.store(false, SeqCst);
-    crate::pushback::ACTIVE.store(false, SeqCst);
-    // The crew's brake hold renews the held command; dropped, it expires.
-    crate::tools::controls::release_held_brakes();
-    // The altitude capture watcher writes the dial, ALT hold and throttle.
-    crate::tools::autopilot::stop_capture_watcher();
-    // A power-up or jet start on its own thread stops at its next step.
-    crate::tools::power::stop_sequences();
+    crate::autotaxi::halt();
+    crate::pushback::clear();
     // A new flight's setup owns the aircraft: the taxi-in only lets go.
     crate::taxi_in::abort(false);
+    // Every run, whoever holds it: the recovery, the helicopter loops, the
+    // governor, reverse, the brake hold (its held command expires), the
+    // capture watcher (it writes the dial, ALT hold and throttle), a
+    // power-up or jet start (stopped at its next step).
+    for (_, run) in &LOOPS {
+        run.cancel();
+    }
+    // Loops not on a run yet: each its own door.
+    crate::approach_guide::cancel();
+    crate::ils::stop_setup_watch();
+    crate::flow::abort();
+    crate::tools::engine::MIX_MANAGED.store(false, SeqCst);
+    crate::tools::engine::LEAN_SEEKING.store(false, SeqCst);
     // The arrival's hold on the station is a fact about a flight, not about
     // the world: nothing is flying to that destination any more, so the
     // region's ordinary nearest-field handoffs resume.
@@ -336,47 +515,56 @@ fn innermost(active: impl Fn(Owner) -> bool, keep: impl Fn(Owner) -> bool) -> Op
 
 #[cfg(test)]
 mod tests {
-    /// Every module in the tree that declares a loop flag is named in
-    /// [`super::stand_down`], so a new loop cannot outlive a swap by being
-    /// forgotten here. The list is read from the source, like the plugin
-    /// contract's. A loop flag is any static named `ACTIVE`, `ABORT`, `RUN`,
-    /// `GENERATION`, or ending `_HELD` / `GEN` (the brake hold, the capture
-    /// watcher, the start sequences), or typed `sim::run::Slot`, at any
-    /// visibility: matching only `static ACTIVE:` let `BRAKES_HELD`, the
-    /// capture watcher and the jet start through.
+    /// Every loop run in the tree is in the registry [`super::stand_down`]
+    /// cancels, read from the source like the plugin contract's: every
+    /// `sim::run::Slot` declared under `src` is in [`super::LOOPS`] by its
+    /// path, once, and the stand-down sweeps the list. A loop flag NOT on a
+    /// run (an `ABORT`, a `GEN`, a `_HELD`) must be named below with the door
+    /// stand_down calls for it.
     #[test]
-    fn stand_down_pins_every_active_loop() {
-        // Generation counters that are not loops holding the aircraft: the
-        // copilot's speech turn, the barge-in cut per audio channel.
-        const NOT_LOOPS: &[&str] = &["tempo", "tts"];
+    fn stand_down_cancels_every_run() {
+        // Loop flags not (yet) on a run, each with the door that stops it,
+        // and the generation counters that are no loop at all.
+        const NOT_ON_A_RUN: &[(&str, &str, &str)] = &[
+            // The mission's and the follower's own stop latches, read by
+            // their loops beside their runs.
+            ("full_auto", "ABORT", "crate::full_auto::abort()"),
+            ("procedure", "ABORT", "crate::procedure::abort()"),
+            // Flags beside an unflagged run (one run at a time, `begin`),
+            // cleared by their doors and the run's cleanup.
+            ("full_auto", "ACTIVE", "crate::full_auto::abort()"),
+            ("procedure", "ACTIVE", "crate::procedure::abort()"),
+            ("autotakeoff", "ACTIVE", "crate::autotakeoff::cancel()"),
+            ("flow", "ACTIVE", "crate::flow::abort()"),
+            // The pilot's stop word for the steered push (a mailbox).
+            ("pushback", "ABORT", "crate::pushback::clear()"),
+            // The checklist runner and the ILS setup watch: not yet on runs.
+            ("flow", "ABORT", "crate::flow::abort()"),
+            ("ils", "SETUP_GEN", "crate::ils::stop_setup_watch()"),
+            // The copilot's speech turn and the barge-in cut per channel.
+            ("tempo", "TURN_GEN", ""),
+            ("tts", "CUT_GEN", ""),
+        ];
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
         let this = crate::test_support::module_source("flight_state").to_string();
         let body = this.split("pub(crate) fn stand_down()").nth(1).unwrap();
-        // The function alone: the owner list below it names every loop too.
         let body = body.split("\n}\n").next().unwrap();
-        let mut files = Vec::new();
-        fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
-            for e in std::fs::read_dir(dir).unwrap().flatten() {
-                let p = e.path();
-                if p.is_dir() {
-                    walk(&p, out);
-                } else if p.extension().is_some_and(|x| x == "rs") {
-                    out.push(p);
-                }
-            }
-        }
-        walk(&root, &mut files);
-        let mut missing = Vec::new();
-        let mut checked = 0;
-        for f in files {
-            if crate::test_support::is_test_file(&f) {
+        assert!(
+            body.contains("for (_, run) in &LOOPS {\n        run.cancel();"),
+            "stand_down sweeps the registry"
+        );
+        let names: Vec<&str> = super::LOOPS.iter().map(|(n, _)| *n).collect();
+        let mut sorted = names.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), names.len(), "each run once: {names:?}");
+        let mut slots = Vec::new();
+        let mut stray = Vec::new();
+        for f in crate::test_support::rust_files(&root) {
+            if crate::test_support::is_test_file(&f) || f.ends_with("flight_state.rs") {
                 continue;
             }
             let text = std::fs::read_to_string(&f).unwrap();
-            let declares = text.lines().any(is_loop_flag);
-            if !declares {
-                continue;
-            }
             let rel = f.strip_prefix(&root).unwrap().with_extension("");
             let module = rel
                 .components()
@@ -384,69 +572,80 @@ mod tests {
                 .filter(|c| c != "mod")
                 .collect::<Vec<_>>()
                 .join("::");
-            if NOT_LOOPS.contains(&module.as_str()) {
-                continue;
-            }
-            checked += 1;
-            if !body.contains(&format!("crate::{module}::")) {
-                missing.push(module);
+            let production = text.split("#[cfg(test)]\nmod ").next().unwrap();
+            let flags: Vec<&str> = production
+                .lines()
+                .filter_map(|l| {
+                    let at = l.find("sim::run::Slot::flagged(&")?;
+                    let rest = &l[at + "sim::run::Slot::flagged(&".len()..];
+                    Some(&rest[..rest.find(')')?])
+                })
+                .collect();
+            for line in production.lines() {
+                let Some((name, ty)) = static_decl(line) else {
+                    continue;
+                };
+                if ty.starts_with("sim::run::Slot") {
+                    slots.push(format!("{module}::{name}"));
+                } else if is_loop_flag_name(name) && !flags.contains(&name) {
+                    match NOT_ON_A_RUN.iter().find(|(m, n, _)| *m == module && *n == name) {
+                        Some((_, _, door)) => assert!(
+                            door.is_empty() || body.contains(door),
+                            "stand_down must call {door} for {module}::{name}"
+                        ),
+                        None => stray.push(format!("{module}::{name}")),
+                    }
+                }
             }
         }
-        assert!(checked >= 10, "expected the loop modules, found {checked}");
+        slots.sort();
+        assert_eq!(slots, sorted, "every run in the registry, and only runs");
         assert!(
-            missing.is_empty(),
-            "loops with a loop flag not in stand_down: {missing:?}"
+            stray.is_empty(),
+            "loop flags on no run and not named with their door: {stray:?}"
         );
     }
 
-    /// A process-wide `static` declaring a loop flag, at any visibility.
-    fn is_loop_flag(line: &str) -> bool {
+    /// A process-wide `static` declaration: its name and type, at any
+    /// visibility.
+    fn static_decl(line: &str) -> Option<(&str, &str)> {
         let l = line.trim_start();
         let l = l
             .strip_prefix("pub(crate) ")
             .or_else(|| l.strip_prefix("pub "))
             .unwrap_or(l);
-        let Some(decl) = l.strip_prefix("static ") else {
-            return false;
-        };
-        let Some((name, ty)) = decl.split_once(':') else {
-            return false;
-        };
+        let decl = l.strip_prefix("static ")?;
+        let (name, ty) = decl.split_once(':')?;
         let name = name.trim();
-        if name.is_empty()
-            || !name
+        let upper = !name.is_empty()
+            && name
                 .chars()
-                .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
-        {
-            return false;
-        }
+                .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_');
+        upper.then_some((name, ty.trim_start()))
+    }
+
+    /// The names a loop flag goes by when it is not on a run.
+    fn is_loop_flag_name(name: &str) -> bool {
         matches!(name, "ACTIVE" | "ABORT" | "RUN" | "GENERATION")
             || name.ends_with("_HELD")
             || name.ends_with("GEN")
-            || ty.trim_start().starts_with("sim::run::Slot")
     }
 
     #[test]
     fn loop_flags_beyond_active_are_caught() {
-        assert!(is_loop_flag(
-            "pub static ACTIVE: AtomicBool = AtomicBool::new(false);"
-        ));
-        assert!(is_loop_flag(
-            "static BRAKES_HELD: AtomicBool = AtomicBool::new(false);"
-        ));
-        assert!(is_loop_flag(
-            "static CLIMB_WATCHER_GEN: AtomicU64 = AtomicU64::new(0);"
-        ));
-        assert!(is_loop_flag(
-            "    pub(crate) static RUN: sim::run::Slot = sim::run::Slot::new();"
-        ));
-        assert!(is_loop_flag(
-            "static OWNER: sim::run::Slot = sim::run::Slot::new();"
-        ));
-        assert!(!is_loop_flag(
-            "static LEGEND: AtomicBool = AtomicBool::new(false);"
-        ));
-        assert!(!is_loop_flag("let ACTIVE: bool = true;"));
+        let decl = |l| static_decl(l).map(|(n, _)| n);
+        assert_eq!(
+            decl("pub static ACTIVE: AtomicBool = AtomicBool::new(false);"),
+            Some("ACTIVE")
+        );
+        assert!(is_loop_flag_name("BRAKES_HELD"));
+        assert!(is_loop_flag_name("CLIMB_WATCHER_GEN"));
+        assert_eq!(
+            static_decl("    pub(crate) static RUN: sim::run::Slot = sim::run::Slot::new();"),
+            Some(("RUN", "sim::run::Slot = sim::run::Slot::new();"))
+        );
+        assert!(!is_loop_flag_name("LEGEND"));
+        assert_eq!(decl("let ACTIVE: bool = true;"), None);
     }
 
     /// The rotor facts follow the profile: the S-76 has them, an aeroplane
@@ -476,19 +675,24 @@ mod tests {
         let rest = &src[at..];
         let end = rest[1..].find("\nfn ").map_or(rest.len(), |e| e + 1);
         let end = end.min(rest[1..].find("\npub ").map_or(rest.len(), |e| e + 1));
+        let end = end.min(
+            rest[1..]
+                .find("\npub(crate) ")
+                .map_or(rest.len(), |e| e + 1),
+        );
         &rest[..end]
     }
 
     /// A plan's transition, the last landing's runway and tracking, and the
     /// plan's destination outlived the flight: a "put us on a ten mile final"
     /// after LIEA-LEBL was judged against TA 6,000, and the altimeter check
-    /// WRITES the setting with an automation flying. Every crew-side new
-    /// flight forgets them, and the transition dies with the mission too.
+    /// WRITES the setting with an automation flying. The forgetting is the
+    /// doors' and the transition dies with the mission too.
     #[test]
     fn every_new_flight_and_mission_end_forgets_the_flight() {
         let door = body_of(
             crate::test_support::module_source("flight_state"),
-            "pub(crate) fn forget_flight()",
+            "fn forget_flight()",
         );
         for clear in [
             "publish_flight_transition(None)",
@@ -497,52 +701,241 @@ mod tests {
         ] {
             assert!(door.contains(clear), "forget_flight must call {clear}");
         }
-        let setup = crate::test_support::module_source("tools/setup");
-        let foreign = body_of(setup, "async fn foreign_new_flight(");
-        assert!(foreign.contains("crate::flight_state::forget_flight();"));
-        // The ramp and approach setups: once per new flight begun.
-        let calls = setup
-            .matches("crate::flight_state::forget_flight();")
-            .count();
-        assert!(
-            calls >= 3,
-            "ramp, approach and foreign new flights: {calls}"
+        let mission_end = body_of(
+            crate::test_support::module_source("full_auto"),
+            "fn stop_active()",
         );
-        let mission_end = body_of(crate::test_support::module_source("full_auto"), "fn stop_active()");
         assert!(mission_end.contains("publish_flight_transition(None)"));
+    }
+
+    /// The doors do every step, in order: the loops stop before the
+    /// selectors change under them, and the flight's facts go after.
+    #[test]
+    fn the_doors_do_every_step_in_order() {
+        let src = crate::test_support::module_source("flight_state");
+        let flight = body_of(src, "pub(crate) fn flight_begins(");
+        let full = flight
+            .split("    stand_down();\n")
+            .nth(1)
+            .expect("a full door stands down");
+        for step in [
+            "forget_flight();",
+            "crate::flow::stand_down(crate::flow::StandDown::NewFlight(",
+            "crate::party_line::retire_for_new_flight();",
+            "\"flight_begins\"",
+        ] {
+            assert!(full.contains(step), "flight_begins must do {step}");
+        }
+        let air = body_of(src, "pub(crate) fn airframe_begins(");
+        let at = |s: &str| {
+            air.find(s)
+                .unwrap_or_else(|| panic!("airframe_begins: {s}"))
+        };
+        assert!(at("stand_down();") < at("publish_airframe(p);"));
+        assert!(at("publish_airframe(p);") < at("forget_flight();"));
+        assert!(air.contains("\"airframe_begins\""));
+    }
+
+    /// Every path that begins a flight goes through a door, and the steps a
+    /// door does are called nowhere else: the five new-flight sites had
+    /// drifted (the ramp never stood down, the foreign start never dropped
+    /// the checklist).
+    #[test]
+    fn new_flight_steps_live_only_in_the_doors() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut stray = Vec::new();
+        for f in crate::test_support::rust_files(&root) {
+            if crate::test_support::is_test_file(&f) || f.ends_with("flight_state.rs") {
+                continue;
+            }
+            let rel = f.strip_prefix(&root).unwrap().display().to_string();
+            let text = std::fs::read_to_string(&f).unwrap();
+            for (n, line) in text.lines().enumerate() {
+                let code = line.trim_start();
+                if code.starts_with("//") {
+                    continue;
+                }
+                let mut steps = vec![
+                    "retire_for_new_flight(",
+                    "flight_state::forget_flight(",
+                    "flight_state::publish_airframe(",
+                ];
+                // The list's own watch on the mailbox is the list's.
+                if rel != "flow.rs" {
+                    steps.push("StandDown::NewFlight(");
+                }
+                for step in steps {
+                    if code.contains(step) {
+                        stray.push(format!("{rel}:{} {step}", n + 1));
+                    }
+                }
+            }
+        }
+        assert!(
+            stray.is_empty(),
+            "new-flight steps outside the doors: {stray:?}"
+        );
+        for (module, door) in [
+            (
+                "tools/setup",
+                "flight_begins(crate::flight_state::NewFlight::Foreign)",
+            ),
+            (
+                "tools/setup",
+                "flight_begins(crate::flight_state::NewFlight::Ramp)",
+            ),
+            (
+                "tools/setup",
+                "flight_begins(crate::flight_state::NewFlight::Approach)",
+            ),
+            (
+                "tools/setup_enroute",
+                "flight_begins(crate::flight_state::NewFlight::Enroute)",
+            ),
+            (
+                "monitor",
+                "flight_begins(crate::flight_state::NewFlight::Reposition)",
+            ),
+            ("detect", "airframe_begins(&p, \"boot\")"),
+            ("detect", "airframe_begins(&p, \"swap\")"),
+        ] {
+            assert!(
+                crate::test_support::module_source(module).contains(door),
+                "{module} must call {door}"
+            );
+        }
+    }
+
+    /// A jump our own setup (or the runner's start) made is that setup's
+    /// flight: its door runs as the init returns. Only an unaccounted jump
+    /// runs the reposition's door.
+    #[test]
+    fn a_reposition_after_our_own_door_is_the_same_flight() {
+        use std::time::Duration;
+        assert_eq!(super::reposition_skip(true, None), Some("loading"));
+        assert_eq!(
+            super::reposition_skip(false, Some(Duration::from_secs(5))),
+            Some("begun")
+        );
+        assert_eq!(
+            super::reposition_skip(false, Some(Duration::from_secs(600))),
+            None
+        );
+        assert_eq!(super::reposition_skip(false, None), None);
+        assert_eq!(super::NewFlight::Reposition.list_cause(), "reposition");
+        assert_eq!(super::NewFlight::Approach.list_cause(), "setup");
+    }
+
+    /// A loop's flying flag has one writer: its run (`sim::run::Slot`,
+    /// flagged). Ten modules stored `speedhold::ACTIVE` and seven
+    /// `autotaxi::ACTIVE` (bypassing `halt`), and a late store from a
+    /// superseded run flipped the new run's (refactor audit 2026-10-04,
+    /// phase 3). So: no module writes a flag its slot owns, and no module
+    /// writes another module's `ACTIVE` at all (the owner's door does).
+    #[test]
+    fn a_loop_flag_has_one_writer() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        // The production text of a file: up to its first inline test module.
+        fn production(text: &str) -> &str {
+            text.split("#[cfg(test)]\nmod ").next().unwrap()
+        }
+        let mut flagged = Vec::new();
+        let mut files = Vec::new();
+        for f in crate::test_support::rust_files(&root) {
+            if crate::test_support::is_test_file(&f) {
+                continue;
+            }
+            let text = std::fs::read_to_string(&f).unwrap();
+            let rel = f.strip_prefix(&root).unwrap().display().to_string();
+            for line in production(&text).lines() {
+                if let Some(at) = line.find("sim::run::Slot::flagged(&") {
+                    let rest = &line[at + "sim::run::Slot::flagged(&".len()..];
+                    flagged.push((rel.clone(), rest[..rest.find(')').unwrap()].to_string()));
+                }
+            }
+            files.push((rel, text));
+        }
+        assert!(flagged.len() >= 12, "the flagged runs: {flagged:?}");
+        let mut writes = Vec::new();
+        for (rel, text) in &files {
+            for (n, line) in production(text).lines().enumerate() {
+                let code = line.trim_start();
+                if code.starts_with("//") {
+                    continue;
+                }
+                for op in [".store(", ".swap(", ".compare_exchange(", ".fetch_"] {
+                    // Another module's flag, by path.
+                    if code.contains(&format!("::ACTIVE{op}")) {
+                        writes.push(format!("{rel}:{} {code}", n + 1));
+                    }
+                    // A flag this module's own slot owns.
+                    for (owner, flag) in &flagged {
+                        let bare = format!("{flag}{op}");
+                        if owner == rel
+                            && code.contains(&bare)
+                            && !code.contains(&format!("_{bare}"))
+                        {
+                            writes.push(format!("{rel}:{} {code}", n + 1));
+                        }
+                    }
+                }
+            }
+        }
+        assert!(writes.is_empty(), "loop flags written outside their run: {writes:#?}");
     }
 
     /// The circuit awaited the published-arrival lookup, then cleared
     /// autoland's ABORT and launched it: a stand-down landing inside that
-    /// await armed an autoland no parent could cancel. Its own ABORT is
-    /// read again between the await and the launch.
+    /// await armed an autoland no parent could cancel. Its own cancel is
+    /// read again between the await and the launch, the launch takes the
+    /// circuit's token as its parent, and nobody clears another loop's
+    /// latch: autoland has none (its run is cancelled, never a latch the
+    /// next launch inherits), and every launch names its parents.
     #[test]
     fn the_circuit_rechecks_its_abort_before_launching_autoland() {
         let src = crate::test_support::module_source("circuit");
         let at = src.find("if try_published_arrival(").unwrap();
         let rest = &src[at..];
-        let launch = rest.find("crate::autoland::ABORT.store(false").unwrap();
-        let recheck = rest.find("if ABORT.load(Ordering::SeqCst)").unwrap();
-        assert!(
-            recheck < launch,
-            "ABORT re-read before autoland's latch is cleared"
-        );
+        let launch = rest.find("crate::autoland::run_autoland_scoped(").unwrap();
+        let recheck = rest.find("if xp.cancelled()").unwrap();
+        assert!(recheck < launch, "the circuit's cancel re-read before the launch");
+        let call = &rest[launch..launch + rest[launch..].find(");").unwrap()];
+        assert!(call.contains("xp.cancellation()"), "scoped to the circuit");
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        for f in crate::test_support::rust_files(&root) {
+            if f.ends_with("flight_state.rs") {
+                continue;
+            }
+            let text = std::fs::read_to_string(&f).unwrap();
+            for banned in ["autoland::ABORT", "autoland::run_autoland("] {
+                assert!(!text.contains(banned), "{}: {banned}", f.display());
+            }
+        }
+        let autoland = crate::test_support::module_source("autoland");
+        assert!(!autoland.contains("static ABORT"), "autoland has no latch");
+        assert!(!autoland.contains("pub fn run_autoland("), "no unscoped launch");
     }
 
     /// A power-up or jet start on its own thread kept firing switches through
-    /// a swap or instructor entry: it had no cancel at all. The epoch it
-    /// began in is stale once a stand-down has landed.
+    /// a swap or instructor entry: it had no cancel at all. Each now owns a
+    /// run taken on the caller's thread, and stand_down cancels it.
     #[test]
     fn a_stand_down_stops_a_running_start_sequence() {
-        let epoch = crate::tools::power::sequence_epoch();
-        crate::tools::power::stop_sequences();
-        assert!(crate::tools::power::sequence_stood_down(epoch));
         let src = crate::test_support::module_source("tools/jet_start");
         let steps = body_of(src, "async fn run_sequence(");
         assert!(
-            steps.matches("if stood_down(epoch)").count() >= 5,
+            steps.matches("if stood_down(xp)").count() >= 5,
             "checked between steps"
         );
+        let power = crate::test_support::module_source("tools/power");
+        let spawn = body_of(power, "fn spawn(");
+        assert!(
+            spawn.find("POWER_UP.take_over()").unwrap() < spawn.find("std::thread::spawn").unwrap(),
+            "the run is taken on the caller's thread"
+        );
+        let names: Vec<&str> = super::LOOPS.iter().map(|(n, _)| *n).collect();
+        assert!(names.contains(&"tools::power::POWER_UP"));
+        assert!(names.contains(&"tools::jet_start::JET_START"));
         let prep = body_of(
             crate::test_support::module_source("tools/power"),
             "pub(crate) async fn run_prep(",

@@ -357,9 +357,17 @@ impl Pace {
 }
 
 /// True while the steering loop runs, mirroring `speedhold::ACTIVE` /
-/// `autoland::ACTIVE`. Cleared by the loop itself, the release path in
-/// main, or the `auto_taxi` tool's off switch.
+/// `autoland::ACTIVE`. Written only by the drive's run ([`RUN`]): the loop
+/// lowers it, [`halt`] (the release path in main, the `auto_taxi` tool's off
+/// switch, a stand-down) cancels it.
 pub static ACTIVE: AtomicBool = AtomicBool::new(false);
+/// The drive's run. A drive that is finishing lowers its flag and can no
+/// longer clear the flag of the drive after it: a backtrack's leg one
+/// finished its exit AFTER the supervisor had started leg two, its late
+/// clear cancelled leg two 40 ms into the turn, and full auto then lined up
+/// from the wrong heading and 136 m down a 600 m strip (LILB 03,
+/// 2026-09-25).
+pub(crate) static RUN: sim::run::Slot = sim::run::Slot::flagged(&ACTIVE);
 /// True while a BACKTRACK is in progress, including the gap between its two
 /// legs. `ACTIVE` alone drops false in that gap — leg one ends, the supervisor
 /// builds leg two, and a caller polling `ACTIVE` sees "the drive is finished"
@@ -377,7 +385,7 @@ pub fn driving() -> bool {
 /// How many drives have started: a caller compares it across a tool call to
 /// know whether [`LAST_ARRIVED`] is about a drive it asked for.
 pub fn drive_gen() -> u64 {
-    DRIVE_GEN.load(Ordering::SeqCst)
+    DRIVES_STARTED.load(Ordering::SeqCst)
 }
 
 /// Whether the LAST drive ended by ARRIVING at its stop (vs a handback,
@@ -424,9 +432,20 @@ pub fn relocation_jump_m(from: (f64, f64), to: (f64, f64), dt_s: f64) -> Option<
 /// This stops the loop; it does not stop the AIRCRAFT. The caller holds the
 /// sim client and owes the brakes — a stage that is not moving the aircraft
 /// is holding it.
-pub fn halt() {
-    ACTIVE.store(false, Ordering::Relaxed);
+///
+/// Returns whether a drive was running. Every stop from outside comes
+/// through here (it was seven bare stores of the flag, each forgetting the
+/// backtrack and the arrival latch).
+pub fn halt() -> bool {
+    let was = RUN.cancel();
     BACKTRACKING.store(false, Ordering::Relaxed);
+    LAST_ARRIVED.store(false, Ordering::Relaxed);
+    was
+}
+
+/// A caller about to start a drive of its own forgets the last one's
+/// arrival (the taxi-in, before its stand drive).
+pub fn forget_arrival() {
     LAST_ARRIVED.store(false, Ordering::Relaxed);
 }
 
@@ -2897,10 +2916,10 @@ pub async fn steer_channel_ok(xp: &dyn crate::xplane::XPlane) -> bool {
 /// validated the route, armed the taxi governor, and proved the plugin's
 /// steer channel writable.
 pub fn start(base_url: String, voice: Option<Voice>, route: Route, base_kts: f64) {
-    if ACTIVE.swap(true, Ordering::Relaxed) {
+    let Some(gen) = RUN.claim() else {
         return; // already driving — the tool retargets instead
-    }
-    let gen = DRIVE_GEN.fetch_add(1, Ordering::SeqCst) + 1;
+    };
+    DRIVES_STARTED.fetch_add(1, Ordering::SeqCst);
     LAST_ARRIVED.store(false, Ordering::Relaxed);
     RELOCATED.store(false, Ordering::Relaxed);
     if let Ok(mut w) = PROGRESS.lock() {
@@ -2911,10 +2930,9 @@ pub fn start(base_url: String, voice: Option<Voice>, route: Route, base_kts: f64
             .enable_all()
             .build()
         else {
-            ACTIVE.store(false, Ordering::Relaxed);
             return;
         };
-        rt.block_on(drive(XPlaneClient::new(base_url), voice, route, base_kts, gen));
+        rt.block_on(drive(XPlaneClient::new(base_url), voice, route, base_kts, &gen));
     });
 }
 
@@ -2937,13 +2955,9 @@ pub fn taxi_overspeed(gs_kts: f64, target_kts: f64) -> Option<&'static str> {
     }
 }
 
-/// Which drive owns [`ACTIVE`]: bumped by every [`start`]. A drive that is
-/// finishing clears the flag only while it is still the newest: a
-/// backtrack's leg one finished its exit AFTER the supervisor had started
-/// leg two, its late clear cancelled leg two 40 ms into the turn, and full
-/// auto then lined up from the wrong heading and 136 m down a 600 m strip
-/// (LILB 03, 2026-09-25).
-static DRIVE_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// How many drives have started ([`drive_gen`]); ownership of the flag is
+/// the run's ([`RUN`]).
+static DRIVES_STARTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Drive a backtrack: leg one (down the strip to the turn pocket) now, and
 /// when it ARRIVES, leg two — a plain line-up from wherever the aircraft
@@ -3075,7 +3089,7 @@ async fn align_on_the_runway(
     voice: &Option<Voice>,
     course: f64,
     fit: Option<&(crate::autoland::Runway, f64)>,
-    gen: u64,
+    gen: &sim::run::Lease<'_>,
 ) -> AlignEnd {
     // The runway it may roll is judged from where the drive stopped.
     let mut judge: Option<LineUpAlign> = None;
@@ -3088,8 +3102,7 @@ async fn align_on_the_runway(
     let end = loop {
         // The tick runs to its period, not sleep + work (`DRIVE_TICK_MS`).
         let pacer = sim::state::Pacer::start();
-        if !ACTIVE.load(Ordering::Relaxed)
-            || DRIVE_GEN.load(Ordering::SeqCst) != gen
+        if !gen.live()
             || !speedhold::taxi_hold_active()
         {
             break AlignEnd::Interrupted;
@@ -3117,7 +3130,7 @@ async fn align_on_the_runway(
                 Priority::Advisory,
                 "Your steering. I still have the throttle and brakes.",
             );
-            ACTIVE.store(false, Ordering::Relaxed);
+            gen.lower_flag();
             break AlignEnd::Interrupted;
         }
         let (lat_r, lon_r) = sim::position::lat_lon(&pos);
@@ -3256,7 +3269,13 @@ fn alert(voice: &Option<Voice>, priority: Priority, line: &str) {
 /// every exit path — including a panic or kill -9 — releases the override
 /// within a second by silence alone; the explicit zero write on the way out
 /// is just politeness.
-async fn drive(xp: XPlaneClient, voice: Option<Voice>, mut route: Route, base_kts: f64, gen: u64) {
+async fn drive(
+    xp: XPlaneClient,
+    voice: Option<Voice>,
+    mut route: Route,
+    base_kts: f64,
+    gen: &sim::run::Lease<'_>,
+) {
     let _detail = crate::auto_status::DetailGuard::hold(&DETAIL);
     // The landing light over runway spans, decided once for the drive: none
     // when the airframe's landing lamp is already its taxi light tonight.
@@ -3325,10 +3344,10 @@ async fn drive(xp: XPlaneClient, voice: Option<Voice>, mut route: Route, base_kt
     loop {
         // The tick runs to its period, not sleep + work (`DRIVE_TICK_MS`).
         let pacer = sim::state::Pacer::start();
-        if !ACTIVE.load(Ordering::Relaxed) || DRIVE_GEN.load(Ordering::SeqCst) != gen {
+        if !gen.live() {
             crate::blackbox::record(
                 "autotaxi",
-                serde_json::json!({"event": "stopped_from_outside", "superseded": DRIVE_GEN.load(Ordering::SeqCst) != gen}),
+                serde_json::json!({"event": "stopped_from_outside", "superseded": !gen.current()}),
             );
             break;
         }
@@ -3434,7 +3453,7 @@ async fn drive(xp: XPlaneClient, voice: Option<Voice>, mut route: Route, base_kt
                     Priority::Caution,
                     "The tug hasn't let go. Standing down, brakes set. Your aircraft.",
                 );
-                ACTIVE.store(false, Ordering::Relaxed);
+                gen.lower_flag();
                 break;
             }
             // No steer heartbeat: the nosewheel is the tug's, and the
@@ -3463,7 +3482,7 @@ async fn drive(xp: XPlaneClient, voice: Option<Voice>, mut route: Route, base_kt
                 Priority::Advisory,
                 "Your steering. I still have the throttle and brakes.",
             );
-            ACTIVE.store(false, Ordering::Relaxed);
+            gen.lower_flag();
             break;
         }
         let (Ok(lat), Ok(lon), Ok(psi), Ok(gs_ms)) = (lat_r, lon_r, psi_r, gs_r) else {
@@ -3494,7 +3513,7 @@ async fn drive(xp: XPlaneClient, voice: Option<Voice>, mut route: Route, base_kt
                     Priority::Caution,
                     "We've been moved. Taxi stopped. Your aircraft.",
                 );
-                ACTIVE.store(false, Ordering::Relaxed);
+                gen.lower_flag();
                 break;
             }
         }
@@ -3625,7 +3644,7 @@ async fn drive(xp: XPlaneClient, voice: Option<Voice>, mut route: Route, base_kt
                         speedhold::set_taxi_target(0.0);
                         let _ = xp.set_float(TAXI_STEER, 0.0).await;
                         alert(&voice, Priority::Caution, JOIN_REFUSED_LINE);
-                        ACTIVE.store(false, Ordering::Relaxed);
+                        gen.lower_flag();
                         break;
                     }
                 }
@@ -3674,7 +3693,7 @@ async fn drive(xp: XPlaneClient, voice: Option<Voice>, mut route: Route, base_kt
                 Priority::Caution,
                 "We're off the cleared route. Stopping here. Your steering.",
             );
-            ACTIVE.store(false, Ordering::Relaxed);
+            gen.lower_flag();
             break;
         }
         // Stopped at the end of the route but NOT on it: that is no arrival.
@@ -3694,7 +3713,7 @@ async fn drive(xp: XPlaneClient, voice: Option<Voice>, mut route: Route, base_kt
             speedhold::set_taxi_target(0.0);
             let _ = xp.set_float(TAXI_STEER, 0.0).await;
             alert(&voice, Priority::Caution, &off_line_stop_line(lateral));
-            ACTIVE.store(false, Ordering::Relaxed);
+            gen.lower_flag();
             break;
         }
         // Arrived: stopped at the hold-short line, ON it. The governor stays,
@@ -3733,7 +3752,7 @@ async fn drive(xp: XPlaneClient, voice: Option<Voice>, mut route: Route, base_kt
                 )
             };
             alert(&voice, Priority::Advisory, &line);
-            ACTIVE.store(false, Ordering::Relaxed);
+            gen.lower_flag();
             break;
         }
         // A drive that commands motion but never MOVES is stuck. A backwards
@@ -3769,7 +3788,7 @@ async fn drive(xp: XPlaneClient, voice: Option<Voice>, mut route: Route, base_kt
                 let _ = xp.set_float(TAXI_STEER, 0.0).await;
                 let line = stagnant_line(off_pavement, err.abs() > JOIN_ERR_SLOW_DEG);
                 alert(&voice, Priority::Caution, line);
-                ACTIVE.store(false, Ordering::Relaxed);
+                gen.lower_flag();
                 break;
             }
         } else {
@@ -3810,7 +3829,7 @@ async fn drive(xp: XPlaneClient, voice: Option<Voice>, mut route: Route, base_kt
                 Priority::Warning,
                 &format!("Too fast for the taxi, {gs_kts:.0} knots. Stopping. Your aircraft."),
             );
-            ACTIVE.store(false, Ordering::Relaxed);
+            gen.lower_flag();
             break;
         }
         // Steering: aim at the route ahead, command the error down — led by
@@ -3967,7 +3986,7 @@ async fn drive(xp: XPlaneClient, voice: Option<Voice>, mut route: Route, base_kt
                 Priority::Caution,
                 "I've lost the steering. Stopping. Your aircraft.",
             );
-            ACTIVE.store(false, Ordering::Relaxed);
+            gen.lower_flag();
             break;
         }
         // Speed: fold in any external retarget, then write the schedule.
@@ -4012,11 +4031,9 @@ async fn drive(xp: XPlaneClient, voice: Option<Voice>, mut route: Route, base_kt
         let _ = xp.set_float(LEFT_BRAKE, 0.0).await;
         let _ = xp.set_float(RIGHT_BRAKE, 0.0).await;
     }
-    // Only the newest drive may clear the flag (see [`DRIVE_GEN`]).
-    if DRIVE_GEN.load(Ordering::SeqCst) == gen {
-        ACTIVE.store(false, Ordering::Relaxed);
-    }
-    tracing::info!(gen, "auto taxi stopped");
+    // Only the newest drive may clear the flag (the run's rule, [`RUN`]).
+    gen.lower_flag();
+    tracing::info!(gen = gen.id, "auto taxi stopped");
 }
 
 /// A castoring nose's yaw on its brakes, for the aligning pivot's tests: the

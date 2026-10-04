@@ -8,8 +8,6 @@
 //! pump the API can't spin); the bleed valve is the `APU_dwn` command; bus
 //! cross-ties are toggle commands; array datarefs are set whole-array.
 
-use std::sync::atomic::{AtomicU64, Ordering};
-
 use anyhow::Result;
 use async_trait::async_trait;
 use serde_json::{json, Value};
@@ -40,27 +38,13 @@ const CMD_XTIE_R: &str = "laminar/md82cmd/electrical/cross_tie_APU_R"; // toggle
 const POLL_SECS: u64 = 2;
 const STEP_PAUSE_MS: u64 = 400;
 
-/// Bumped by [`stop_sequences`] (`flight_state::stand_down`). A power-up or
-/// jet start runs on its own thread for a minute or more; each takes the
-/// epoch when it begins and checks it between steps, so a swap, a new flight
-/// or instructor entry mid-sequence stops it firing switches on whatever is
-/// loaded next.
-static SEQUENCE_GEN: AtomicU64 = AtomicU64::new(0);
-
-/// The epoch a sequence starts in.
-pub(crate) fn sequence_epoch() -> u64 {
-    SEQUENCE_GEN.load(Ordering::SeqCst)
-}
-
-/// Stop every running power-up and jet start at its next step.
-pub(crate) fn stop_sequences() {
-    SEQUENCE_GEN.fetch_add(1, Ordering::SeqCst);
-}
-
-/// True once a stand-down has landed since `epoch`.
-pub(crate) fn sequence_stood_down(epoch: u64) -> bool {
-    SEQUENCE_GEN.load(Ordering::SeqCst) != epoch
-}
+/// The power-up's run (`flight_state::stand_down` cancels it). A power-up
+/// or jet start runs on its own thread for a minute or more; each checks its
+/// client's cancellation between steps, so a swap, a new flight or
+/// instructor entry mid-sequence stops it firing switches on whatever is
+/// loaded next. The run is taken on the CALLER's thread (an epoch read inside
+/// the thread missed a stand-down landing before it ran).
+pub(crate) static POWER_UP: sim::run::Slot = sim::run::Slot::new();
 
 pub struct PowerUp;
 
@@ -97,6 +81,9 @@ fn say(voice: &Option<Voice>, status: &Option<StatusSink>, line: &str) {
 }
 
 fn spawn(base: String, voice: Option<Voice>, status: Option<StatusSink>) {
+    // A second "power up" takes the run over; the first stops at its next
+    // step instead of firing the same switches beside it.
+    let lease = POWER_UP.take_over();
     std::thread::spawn(move || {
         let Ok(rt) = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -105,8 +92,9 @@ fn spawn(base: String, voice: Option<Voice>, status: Option<StatusSink>) {
             return;
         };
         rt.block_on(async move {
-            let xp = XPlaneClient::new(base);
+            let xp = XPlaneClient::new(base).with_cancel(lease.cancel.clone());
             run_prep(&xp, &voice, &status).await;
+            drop(lease);
         });
     });
 }
@@ -116,16 +104,10 @@ async fn pause() {
 }
 
 /// Poll `dr` until `ok(value)` is true, or give up after `secs` or at a
-/// stand-down since `epoch`. Returns whether it met it.
-async fn wait_until(
-    xp: &XPlaneClient,
-    epoch: u64,
-    dr: &str,
-    secs: u64,
-    ok: impl Fn(f64) -> bool,
-) -> bool {
+/// stand-down (the client's run cancelled). Returns whether it met it.
+async fn wait_until(xp: &XPlaneClient, dr: &str, secs: u64, ok: impl Fn(f64) -> bool) -> bool {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(secs);
-    while std::time::Instant::now() < deadline && !sequence_stood_down(epoch) {
+    while std::time::Instant::now() < deadline && !xp.cancelled() {
         if ok(xp.get_float(dr).await.unwrap_or(0.0)) {
             return true;
         }
@@ -136,15 +118,15 @@ async fn wait_until(
 
 /// The electrical bring-up, step by step. `pub(crate)` so the engine start can run
 /// it first when the APU/bleed isn't up yet (mirrors the aircraft's autostart,
-/// which runs autoboard first).
+/// which runs autoboard first). Its stand-down is the client's cancellation:
+/// the power-up's own run, the jet start's, or full auto's mission inline.
 pub(crate) async fn run_prep(
     xp: &XPlaneClient,
     voice: &Option<Voice>,
     status: &Option<StatusSink>,
 ) {
-    let epoch = sequence_epoch();
     let stood_down = || {
-        let gone = sequence_stood_down(epoch);
+        let gone = xp.cancelled();
         if gone {
             tracing::info!("power up: stood down mid-sequence");
         }
@@ -169,7 +151,7 @@ pub(crate) async fn run_prep(
         say(voice, status, "Starting the A P U.");
         xp.set_int_array_elem(START_PUMP, 0, 1).await.ok(); // aux electric fuel pump
         xp.set_int(APU_STARTER, 2).await.ok(); // engage starter
-        if !wait_until(xp, epoch, APU_N1, 75, |v| v > 95.0).await {
+        if !wait_until(xp, APU_N1, 75, |v| v > 95.0).await {
             if stood_down() {
                 return;
             }
@@ -207,7 +189,7 @@ pub(crate) async fn run_prep(
         xp.run_command(CMD_APU_BLEED_ON).await.ok();
     }
     say(voice, status, "Bleed air on.");
-    wait_until(xp, epoch, BLEED_NEEDLE, 30, |v| v > 2.0).await;
+    wait_until(xp, BLEED_NEEDLE, 30, |v| v > 2.0).await;
     pause().await;
     if stood_down() {
         return;

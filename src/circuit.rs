@@ -1414,10 +1414,33 @@ pub const PATTERN_TERRAIN_CLEAR_FT: f64 = 1000.0;
 /// Rock circuit on a figure no sortie has tested (#182).
 const AUTHORED_TERRAIN_CLEAR_FT: f64 = 600.0;
 
-/// True while the circuit orchestrator runs.
+/// True while the circuit orchestrator runs. Written only by the run
+/// ([`RUN`]).
 pub static ACTIVE: AtomicBool = AtomicBool::new(false);
-/// Set true to cancel ("cancel circuit" / "my controls").
-pub static ABORT: AtomicBool = AtomicBool::new(false);
+/// The circuit's run: claimed by [`start`], cancelled by [`abort`] ("cancel
+/// circuit" / "my controls", a stand-down). The circuit's client carries the
+/// run's token, so a cancel is seen by every loop through
+/// `xp.cancelled()` (the old shared ABORT latch was cleared by the next
+/// circuit's start, under a circuit still winding down) and refuses its
+/// writes; the sub-loops it launches take the token as their parent.
+pub(crate) static RUN: sim::run::Slot = sim::run::Slot::flagged(&ACTIVE);
+
+/// The circuit run that owns `xp` is over: its flag drops now (the rest of
+/// the run, a give-up's hand-back, still to come). Never a newer run's.
+fn lower_flag(xp: &XPlaneClient) {
+    for t in xp.cancellation() {
+        RUN.lower_flag_for(&t);
+    }
+}
+
+/// The circuit run that owns `xp` handed the aircraft to a loop it launched
+/// with its token as the parent (autoland, the published arrival): its exit
+/// must not cancel that loop.
+fn handed_off(xp: &XPlaneClient) {
+    for t in xp.cancellation() {
+        RUN.record_for(&t, sim::run::Outcome::HandedOff);
+    }
+}
 
 /// One-line status for the dashboard's "managing" panel.
 /// The circuit's live line for the panel: the leg, the runway, the altitude
@@ -1452,13 +1475,13 @@ pub use crate::crew_radio::*;
 /// Cancel an active circuit and stand down whichever sub-loop is flying;
 /// returns whether one was running.
 pub fn abort() -> bool {
-    ABORT.store(true, Ordering::SeqCst);
+    let was = RUN.cancel();
     // Stand down whatever phase is live. The takeoff hands off silently (power
     // stays set); the procedure/autoland arrival aborts to the pilot.
     autotakeoff::cancel();
     crate::procedure::abort();
     crate::autoland::abort();
-    ACTIVE.swap(false, Ordering::SeqCst)
+    was
 }
 
 /// Everything the orchestrator needs, resolved by the arming tool.
@@ -1942,7 +1965,7 @@ async fn give_up_pattern(
     hold_kts: f64,
     floor_kts: Option<f64>,
 ) {
-    ACTIVE.store(false, Ordering::SeqCst);
+    lower_flag(xp);
     // Never "your aircraft" to an aircraft that is slow, stalling or upset,
     // nor to one whose autopilot would not hold the climb (#181: handed
     // back at 73 kt, the 737 rolled past 160 degrees with nobody flying).
@@ -2160,8 +2183,8 @@ async fn hold_clear_of_terrain(
     let mut tick: u32 = 0;
     loop {
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-        if ABORT.load(Ordering::SeqCst) {
-            stand_down(voice, "Circuit cancelled. Your aircraft.", "abort_terrain_hold");
+        if xp.cancelled() {
+            stand_down(&xp, voice, "Circuit cancelled. Your aircraft.", "abort_terrain_hold");
             return;
         }
         if crate::xplane::sim_frozen(xp).await {
@@ -2190,7 +2213,7 @@ async fn hold_clear_of_terrain(
                 serde_json::json!({"event": "terrain_hold_level", "hold_ft": hold.alt_ft,
                                    "alt": alt, "secs": t0.elapsed().as_secs_f64()}),
             );
-            stand_down(voice, &terrain_hold_level_line(hold.alt_ft), TERRAIN_REFUSED);
+            stand_down(&xp, voice, &terrain_hold_level_line(hold.alt_ft), TERRAIN_REFUSED);
             return;
         }
         let servos = servos_r
@@ -3468,8 +3491,9 @@ async fn fly_authored_route(
     let mut vs_refused_said = false;
     loop {
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-        if ABORT.load(Ordering::SeqCst) {
+        if xp.cancelled() {
             stand_down(
+                &xp,
                 &voice,
                 "Circuit cancelled. Your aircraft.",
                 "abort_authored",
@@ -3700,6 +3724,7 @@ async fn fly_authored_route(
             if stalls >= MAX_STALLS {
                 let _ = xp.set_float(VS_DIAL, 0.0).await;
                 stand_down(
+                    &xp,
                     &voice,
                     "I can't make the circuit's next point. Holding heading and altitude. Your aircraft.",
                     "authored_stalled_out",
@@ -3739,13 +3764,15 @@ async fn fly_authored_route(
     );
     // A circuit final is judged at the visual gate, 500 ft (#199).
     crate::autoland::set_next_gate(crate::stable_approach::GateKind::Visual);
-    crate::autoland::ABORT.store(false, Ordering::SeqCst);
     // FORCE the pattern's own runway. Bare `None` sends autoland to its
     // EMERGENCY behaviour — search the whole apt.dat for the best end by track
     // — which is right for an engine failure and catastrophically wrong here:
     // we are on short final to a runway we just took off from and flew a
     // pattern around, and the search does not know that.
-    crate::autoland::run_autoland(
+    // The circuit's own token is the autoland's parent: a stand-down landing
+    // around the launch cancels both (`handed_off` keeps the circuit's
+    // normal exit from doing it).
+    crate::autoland::run_autoland_scoped(
         base_url,
         apt_dat,
         cfg,
@@ -3757,29 +3784,31 @@ async fn fly_authored_route(
         // answer here — unlike an arrival, which knows its destination and
         // must say so (see `PlannedRunway`).
         Some(crate::autoland::PlannedRunway::anywhere(&rwy_id)),
+        xp.cancellation(),
     );
-    ACTIVE.store(false, Ordering::SeqCst);
+    handed_off(&xp);
 }
 
 /// Spawn the circuit orchestrator on its own thread + runtime + client, the
 /// same shape as the takeoff and autoland loops.
 pub fn start(base_url: String, voice: Option<Voice>, p: Params) {
-    if ACTIVE.swap(true, Ordering::SeqCst) {
+    let Some(run) = RUN.claim() else {
         return;
-    }
-    ABORT.store(false, Ordering::SeqCst);
+    };
     *STOOD_DOWN.lock().unwrap_or_else(|e| e.into_inner()) = None;
     std::thread::spawn(move || {
         let Ok(rt) = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
         else {
-            ACTIVE.store(false, Ordering::SeqCst);
             return;
         };
-        rt.block_on(fly(XPlaneClient::new(base_url.clone()), base_url, voice, p));
-        ACTIVE.store(false, Ordering::SeqCst);
+        // The run's token scopes the circuit's client: its cancel test, its
+        // writes, and the parent of every loop it launches.
+        let xp = XPlaneClient::new(base_url.clone()).with_cancel(run.cancel.clone());
+        rt.block_on(fly(xp, base_url, voice, p));
         // (base_url is cloned into the client and passed on for the sub-loops.)
+        drop(run);
     });
 }
 
@@ -3868,9 +3897,9 @@ pub fn field_circuit_line(
 
 /// Bail out cleanly: clear our flag and let whatever sub-loop is flying stand
 /// down. Never leaves the aircraft with nobody watching the loop.
-fn stand_down(voice: &Option<Voice>, line: &str, reason: &'static str) {
+fn stand_down(xp: &XPlaneClient, voice: &Option<Voice>, line: &str, reason: &'static str) {
     *STOOD_DOWN.lock().unwrap_or_else(|e| e.into_inner()) = Some(reason);
-    ACTIVE.store(false, Ordering::SeqCst);
+    lower_flag(xp);
     crate::blackbox::record(
         "circuit",
         serde_json::json!({"event": "stand_down", "reason": reason}),
@@ -3890,6 +3919,7 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, p: Params
         xp.get_float(PSI_TRUE).await,
     ) else {
         stand_down(
+            &xp,
             &voice,
             "I can't read our position. The circuit is off, your aircraft.",
             "no_position",
@@ -3899,6 +3929,7 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, p: Params
     let cands = nearby_runways(&p.apt_dat, lat, lon, 3.0).unwrap_or_default();
     let Some((rwy, _)) = autotakeoff::runway_fit(&cands, lat, lon, psi, p.takeoff.needed_m) else {
         stand_down(
+            &xp,
             &voice,
             "We're not on a runway yet. I can only fly the circuit from the runway itself. \
              Taxi us over and line us up first, then say do a circuit.",
@@ -4079,7 +4110,7 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, p: Params
     // numbers. The Rock's authored route is checked after the takeoff, and
     // its own refusal hands back there.
     if let (Some(line), false) = (refused.as_deref(), lxgb) {
-        stand_down(&voice, &format!("{line} Your aircraft."), TERRAIN_REFUSED);
+        stand_down(&xp, &voice, &format!("{line} Your aircraft."), TERRAIN_REFUSED);
         return;
     }
     // ...and at the Rock, where the rectangle is refused, the authored route
@@ -4104,6 +4135,7 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, p: Params
                 serde_json::json!({"event": "authored_route_unsafe", "why": why, "on": "runway"}),
             );
             stand_down(
+                &xp,
                 &voice,
                 &format!("{} Your aircraft.", rock_refused_line(line)),
                 TERRAIN_REFUSED,
@@ -4214,6 +4246,7 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, p: Params
     }
     if !autotakeoff::start_scoped(base_url.clone(), voice.clone(), takeoff, xp.cancellation()) {
         stand_down(
+            &xp,
             &voice,
             "The previous takeoff is still stopping. Your aircraft.",
             "takeoff_busy",
@@ -4222,8 +4255,9 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, p: Params
     }
     loop {
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-        if ABORT.load(Ordering::SeqCst) {
+        if xp.cancelled() {
             stand_down(
+                &xp,
                 &voice,
                 "Circuit cancelled. Your aircraft.",
                 "abort_takeoff_phase",
@@ -4247,12 +4281,13 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, p: Params
             }
             _ => "The takeoff handed control back. Your aircraft.",
         };
-        stand_down(&voice, line, TAKEOFF_NOT_COMPLETED);
+        stand_down(&xp, &voice, line, TAKEOFF_NOT_COMPLETED);
         return;
     }
     let agl_ft = xp.get_float(AGL_M).await.unwrap_or(0.0) * M_TO_FT;
     if agl_ft < AIRBORNE_MIN_AGL_FT {
         stand_down(
+            &xp,
             &voice,
             "The takeoff didn't get us airborne, so the circuit is off.",
             "takeoff_rejected",
@@ -4507,8 +4542,9 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, p: Params
 
     loop {
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-        if ABORT.load(Ordering::SeqCst) {
+        if xp.cancelled() {
             stand_down(
+                &xp,
                 &voice,
                 "Circuit cancelled. Your aircraft.",
                 "abort_pattern_phase",
@@ -4687,7 +4723,8 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, p: Params
             )
             .await
             {
-                ACTIVE.store(false, Ordering::SeqCst);
+                // The procedure flies the arrival, its parent our token.
+                handed_off(&xp);
                 return;
             }
             // The arrival lookup takes a while off the reactor: an order
@@ -4699,8 +4736,9 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, p: Params
             // A stand-down (swap, instructor, a new flight) that landed during
             // that await set our ABORT and autoland's: clearing autoland's
             // latch below would launch an autoland nobody can cancel.
-            if ABORT.load(Ordering::SeqCst) {
+            if xp.cancelled() {
                 stand_down(
+                    &xp,
                     &voice,
                     "Circuit cancelled. Your aircraft.",
                     "abort_pattern_phase",
@@ -4731,8 +4769,9 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, p: Params
             }
             // A circuit final is judged at the visual gate, 500 ft (#199).
             crate::autoland::set_next_gate(crate::stable_approach::GateKind::Visual);
-            crate::autoland::ABORT.store(false, Ordering::SeqCst);
-            crate::autoland::run_autoland(
+            // The circuit's token is its parent: a stand-down that lands
+            // after the recheck above still cancels this autoland.
+            crate::autoland::run_autoland_scoped(
                 base_url.clone(),
                 p.apt_dat.clone(),
                 p.cfg.clone(),
@@ -4740,8 +4779,9 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, p: Params
                 voice.clone(),
                 None,
                 Some(crate::autoland::PlannedRunway::anywhere(&rwy_id)),
+                xp.cancellation(),
             );
-            ACTIVE.store(false, Ordering::SeqCst);
+            handed_off(&xp);
             return;
         }
 

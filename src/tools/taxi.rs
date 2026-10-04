@@ -98,8 +98,8 @@ impl Tool for AutoTaxi {
         use std::sync::atomic::Ordering::Relaxed;
         let a: Args = serde_json::from_value(args.clone()).unwrap_or_default();
         if a.off {
-            let was_driving = autotaxi::ACTIVE.swap(false, Relaxed);
-            let had_speed = speedhold::ACTIVE.swap(false, Relaxed);
+            let was_driving = autotaxi::halt();
+            let had_speed = speedhold::release();
             return Ok(if was_driving || had_speed {
                 "Auto taxi off. You have the aircraft.".to_string()
             } else {

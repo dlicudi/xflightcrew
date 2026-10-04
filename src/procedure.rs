@@ -89,7 +89,7 @@ const ENROUTE_BANK_DEG: f64 = 20.0;
 const ALT_MARGIN_FT: f64 = 150.0;
 
 /// True while the procedure follower runs.
-static RUN: sim::run::Slot = sim::run::Slot::new();
+pub(crate) static RUN: sim::run::Slot = sim::run::Slot::new();
 pub fn running() -> bool {
     RUN.running()
 }
@@ -4489,7 +4489,6 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, plan: Pla
                 // The governor lets go BEFORE autoland's throttle law starts,
                 // so no tick has two writers on the lever.
                 crate::tools::speedhold::release();
-                crate::autoland::ABORT.store(false, Ordering::SeqCst);
                 crate::autoland::run_autoland_scoped(
                     base_url.clone(),
                     apt_dat.clone(),

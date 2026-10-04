@@ -135,12 +135,8 @@ pub fn spawn_new_flight_watch(base: String) {
 /// The arm waits while this runs (`new_flight_loading`).
 async fn foreign_new_flight(xp: &crate::xplane::XPlaneClient, seq: i64) {
     let _loading = Loading::begin();
-    crate::flight_state::stand_down();
-    crate::flight_state::forget_flight();
+    crate::flight_state::flight_begins(crate::flight_state::NewFlight::Foreign);
     let atc = crate::mode::atc_enabled();
-    if atc {
-        crate::party_line::retire_for_new_flight();
-    }
     let t0 = std::time::Instant::now();
     let fix = if atc { settled_position(xp, SettleTiming::LIVE).await } else { None };
     let station = match fix {
@@ -516,14 +512,11 @@ async fn follow_up(base: String, voice: Option<Voice>, body: String, origin: Str
     };
     crate::blackbox::record("setup", json!({ "event": "result", "result": result }));
     match result {
-        // A checklist of the flight that ended ends with it, and so do its
-        // clearances.
+        // The flight that ended ends here: its loops, its facts, its
+        // checklist and its clearances (the door; the stand-down is new to
+        // the ramp, which only ever refused a mission in flight).
         Some(0) => {
-            crate::flow::stand_down(crate::flow::StandDown::NewFlight("setup"));
-            crate::flight_state::forget_flight();
-            if crate::mode::atc_enabled() {
-                crate::party_line::retire_for_new_flight();
-            }
+            crate::flight_state::flight_begins(crate::flight_state::NewFlight::Ramp);
         }
         Some(code) => {
             let why = match code {
@@ -1246,13 +1239,13 @@ async fn approach_follow_up(job: ApproachJob, loading: Loading) {
     // with the retirement so the main loop installs it while autoland arms.
     let mut tower = None;
     if new_flight_began(&run.outcome) {
-        crate::party_line::retire_for_new_flight();
-        crate::flight_state::forget_flight();
+        // The door: loops, facts, the old checklist and (ATC on) the party
+        // line; with ATC off the station is uninstalled, its party line
+        // already retired.
+        crate::flight_state::flight_begins(crate::flight_state::NewFlight::Approach);
         if !matches!(next, AfterInit::Failed { .. }) && crate::mode::atc_enabled() {
             tower = crate::station::arm_new_flight(&job.icao, std::time::Instant::now());
         }
-        // A checklist of the flight that ended ends with it.
-        crate::flow::stand_down(crate::flow::StandDown::NewFlight("setup"));
     }
     // The arm first, the record and the words after: the aircraft is
     // already flying.
@@ -1265,8 +1258,9 @@ async fn approach_follow_up(job: ApproachJob, loading: Loading) {
                 json!({ "airport": job.icao, "runway": job.runway, "final_nm": job.final_nm }),
             );
             hold_sortie_while(&crate::autoland::ACTIVE, sortie, SortieHold::LIVE);
-            crate::autoland::ABORT.store(false, std::sync::atomic::Ordering::SeqCst);
-            crate::autoland::run_autoland(
+            // The new flight's landing, launched by the setup alone: no
+            // parent (a stand-down takes it through autoland's own run).
+            crate::autoland::run_autoland_scoped(
                 job.base.clone(),
                 job.apt.clone(),
                 cfg,
@@ -1274,6 +1268,7 @@ async fn approach_follow_up(job: ApproachJob, loading: Loading) {
                 job.voice.clone(),
                 None,
                 Some(runway.clone()),
+                Vec::new(),
             );
             crate::flight::note_crew_takeover("setup_approach");
         }
@@ -1732,7 +1727,7 @@ mod tests {
         assert!(refusal < running, "asked before anything arms");
         // The approach follow-up holds the flag until it has armed.
         let this = crate::test_support::module_source("tools/setup");
-        let arm = this.find("crate::autoland::run_autoland(").unwrap();
+        let arm = this.find("crate::autoland::run_autoland_scoped(").unwrap();
         let drop_at = this.find("drop(loading);").unwrap();
         assert!(arm < drop_at, "the flag drops after the arm");
     }

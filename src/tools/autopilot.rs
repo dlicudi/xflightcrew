@@ -8,7 +8,6 @@
 //! profiles), so the tool owns them; the aircraft profile only declares that an
 //! autopilot exists.
 
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -710,19 +709,16 @@ fn capture_action(dial: f64, target: f64, current_alt: f64, climb: bool) -> Capt
     }
 }
 
-/// Generation stamp for capture watchers. Each climb/descent bumps this; a watcher
-/// stands down as soon as it sees a newer generation, so at most one is ever live
-/// no matter how many altitude changes are commanded in quick succession (the
-/// `ALT_DIAL` stand-down only catches a *different* target — two commands to the
-/// same altitude, or a re-command, would otherwise stack independent watchers).
-static CLIMB_WATCHER_GEN: AtomicU64 = AtomicU64::new(0);
-
-/// Stand down any live capture watcher: it writes the altitude dial, fires ALT
-/// hold and sets the throttle for up to 20 minutes, so a swap, a new flight or
-/// instructor entry must stop it (`flight_state::stand_down`).
-pub(crate) fn stop_capture_watcher() {
-    CLIMB_WATCHER_GEN.fetch_add(1, Ordering::SeqCst);
-}
+/// The capture watcher's run. Each climb/descent takes it over: the watcher
+/// it replaces is cancelled (its client refuses every write) and stands down
+/// at its next look, so at most one is ever live no matter how many altitude
+/// changes are commanded in quick succession (the `ALT_DIAL` stand-down only
+/// catches a *different* target; two commands to the same altitude, or a
+/// re-command, would otherwise stack independent watchers). It writes the
+/// altitude dial, fires ALT hold and sets the throttle for up to 20 minutes,
+/// so a swap, a new flight or instructor entry cancels it
+/// (`flight_state::LOOPS`).
+pub(crate) static CAPTURE: sim::run::Slot = sim::run::Slot::new();
 
 /// Fly the AP to a selected altitude in VS mode, then **level off** there.
 ///
@@ -749,7 +745,9 @@ fn capture_at_altitude(
     status: Option<crate::plugin_status::StatusSink>,
     perf: ClimbPerf,
 ) {
-    let my_gen = CLIMB_WATCHER_GEN.fetch_add(1, Ordering::SeqCst) + 1;
+    // Taken on the caller's thread: a stand-down landing before the thread
+    // starts cancels THIS watcher, not a predecessor.
+    let lease = CAPTURE.take_over();
     std::thread::spawn(move || {
         let Ok(rt) = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -758,7 +756,9 @@ fn capture_at_altitude(
             return;
         };
         rt.block_on(async move {
-            let xp = XPlaneClient::new(base.clone());
+            // Every write is scoped to this watcher's run: once superseded or
+            // stood down, a write still in flight is refused.
+            let xp = XPlaneClient::new(base.clone()).with_cancel(lease.cancel.clone());
             let mut last_ias: Option<(std::time::Instant, f64)> = None;
             let mut ias_trend = 0.0_f64;
             // Wall-clock budget: even a long, slow change finishes inside 20 min; if
@@ -769,8 +769,9 @@ fn capture_at_altitude(
             let initial_vs = xp.get_float(VS_DIAL).await.unwrap_or(0.0);
             let mut eased_for_speed = false;
             while std::time::Instant::now() < deadline {
-                // A newer command was issued — it owns the level-off now.
-                if CLIMB_WATCHER_GEN.load(Ordering::SeqCst) != my_gen {
+                // A newer command was issued (it owns the level-off now), or a
+                // stand-down landed.
+                if !lease.live() {
                     return;
                 }
                 // Need both the selected dial (did the pilot re-command?) and the
@@ -783,6 +784,11 @@ fn capture_at_altitude(
                     tokio::time::sleep(std::time::Duration::from_secs(3)).await;
                     continue;
                 };
+                // The reads awaited: a command or a stand-down may have
+                // landed meanwhile, and the level-off writes are not ours.
+                if !lease.live() {
+                    return;
+                }
                 match capture_action(dial, target, alt, was_climb) {
                     Capture::StandDown => return,
                     Capture::LevelOff => {

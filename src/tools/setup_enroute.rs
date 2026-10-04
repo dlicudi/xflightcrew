@@ -624,20 +624,18 @@ impl Tool for SetUpEnroute {
                     "speed_from": p.speed_from, "leg_from": p.leg_from, "next_fix": p.next_fix,
                     "to_dest_nm": p.to_dest_nm, "to_tod_nm": p.to_tod_nm, "json": body }),
         );
-        // The new flight ends this one: nothing may keep flying it.
+        // The new flight ends this one: nothing may keep flying it through
+        // the jump. The crew forgets it at the door, once the init returns.
         crate::flight_state::stand_down();
-        // And the crew forgets it (last landing, tracking, destination)
-        // before the new flight's transition is published below.
-        crate::flight_state::forget_flight();
         // The flight's transition, as the resume publishes it: the altimeter
         // is set to it at the settle and the monitor checks against it.
-        crate::tools::instruments::publish_flight_transition(Some(
-            crate::tools::instruments::FlightTransition {
-                altitude_ft: plan.transition_altitude_ft,
-                level_ft: plan.transition_level_ft,
-                descending: false,
-            },
-        ));
+        // Published after the door (which forgets the old flight's), and
+        // only for a flight that began.
+        let transition = crate::tools::instruments::FlightTransition {
+            altitude_ft: plan.transition_altitude_ft,
+            level_ft: plan.transition_level_ft,
+            descending: false,
+        };
         let job = EnrouteJob {
             base: ctx.config.xplane_base_url.clone(),
             voice: ctx.voice.cloned(),
@@ -646,6 +644,7 @@ impl Tool for SetUpEnroute {
             words: words.clone(),
             ap,
             transition_ft: self.transition_altitude_ft,
+            transition,
         };
         let loading = super::setup::Loading::begin();
         super::setup::spawn_off_loop(enroute_follow_up(job, loading));
@@ -666,6 +665,8 @@ struct EnrouteJob {
     ap: crate::tools::autopilot::ApConfig,
     /// The airframe's transition altitude, where the plan gives none.
     transition_ft: f64,
+    /// The plan's transition, published once the new flight has begun.
+    transition: crate::tools::instruments::FlightTransition,
 }
 
 const CMD_HDG_MODE: &str = "sim/autopilot/heading";
@@ -814,7 +815,7 @@ async fn settle(
             {
                 // Hand flown to the placement's level, never given back to
                 // an autopilot with no pitch.
-                crate::tools::speedhold::ACTIVE.store(false, std::sync::atomic::Ordering::SeqCst);
+                crate::tools::speedhold::release();
                 let started = crate::tools::recover::take_over(
                     base.to_string(),
                     None,
@@ -917,8 +918,8 @@ async fn enroute_follow_up(job: EnrouteJob, loading: super::setup::Loading) {
     // The flight that ended takes its clearances with it before anything
     // arms (the approach setup's order).
     if super::setup::new_flight_began(&run.outcome) {
-        crate::party_line::retire_for_new_flight();
-        crate::flow::stand_down(crate::flow::StandDown::NewFlight("setup"));
+        crate::flight_state::flight_begins(crate::flight_state::NewFlight::Enroute);
+        crate::tools::instruments::publish_flight_transition(Some(job.transition));
     }
     let p = &job.placement;
     let result = match run.outcome {

@@ -39,7 +39,7 @@ const GIVE_UP_THROTTLE: f64 = 0.75;
 const COM1_FREQ_KHZ: &str = crate::datarefs::COM1_FREQ_KHZ;
 
 /// True while the full-auto orchestrator runs.
-static RUN: sim::run::Slot = sim::run::Slot::new();
+pub(crate) static RUN: sim::run::Slot = sim::run::Slot::new();
 pub fn running() -> bool {
     RUN.running()
 }
@@ -154,7 +154,7 @@ pub fn abort() -> bool {
     RUN.cancel();
     ABORT.store(true, SeqCst);
     clear_stage();
-    crate::autotaxi::ACTIVE.store(false, SeqCst);
+    crate::autotaxi::halt();
     crate::autotakeoff::cancel();
     crate::circuit::abort();
     crate::procedure::abort();
@@ -3752,7 +3752,6 @@ async fn fly_route(
                     "No published approach lines up from here, so I'll land us visually."
                 },
             );
-            crate::autoland::ABORT.store(false, SeqCst);
             crate::autoland::run_autoland_scoped(
                 config.xplane_base_url.clone(),
                 crate::tools::autoland::apt_dat_path(),

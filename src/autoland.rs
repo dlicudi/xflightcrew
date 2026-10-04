@@ -56,16 +56,24 @@ fn self_pick(apt_dat: &str, lat: f64, lon: f64, track_deg: f64) -> std::io::Resu
 
 // ---- Stage 3: the control loop (AP-first, like the reference plugin) ----------
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::tools::autopilot::ApConfig;
 use crate::voice::{Priority, Voice};
 use crate::xplane::XPlaneClient;
 
-/// Set true to cancel an active autoland ("cancel autoland" / "my controls").
-pub static ABORT: AtomicBool = AtomicBool::new(false);
-/// True while an autoland is flying (so cancel can acknowledge it).
+/// True while an autoland is flying (so cancel can acknowledge it). Written
+/// only by the run ([`RUN`]).
 pub static ACTIVE: AtomicBool = AtomicBool::new(false);
+/// The autoland's run. Every arm takes it over (a re-arm on the cleared
+/// runway owns the aircraft from its first tick, the loop it replaces is
+/// cancelled and exits on its own), and nothing a superseded loop does on
+/// its way out touches the flag, the panel or the landing configuration of
+/// the loop that replaced it. A cancel ("cancel autoland", "my controls", a
+/// stand-down) is [`abort`]: it cancels the run flying, never a latch the
+/// next launch inherits, so no caller clears anything before a launch, and
+/// a launcher's own cancel reaches the autoland through `parents`.
+pub(crate) static RUN: sim::run::Slot = sim::run::Slot::flagged(&ACTIVE);
 /// This approach's landing configuration (spoilers, autobrake) is set: the
 /// `landing_config` event. Cleared when an approach starts and ends.
 static LANDING_CONFIGURED: AtomicBool = AtomicBool::new(false);
@@ -78,7 +86,6 @@ static LANDING_CONFIGURED: AtomicBool = AtomicBool::new(false);
 pub fn landing_configured() -> bool {
     LANDING_CONFIGURED.load(Ordering::SeqCst)
 }
-static GEN: AtomicU64 = AtomicU64::new(0);
 
 /// One-line emergency status for the panel's live strip ("AUTOLAND LELC 23R
 /// 12.4nm FINAL"); empty when nothing is flying. Written by the autoland and
@@ -997,9 +1004,8 @@ impl UnclearedWatch {
 
 /// Cancel an active autoland; returns whether one was flying.
 pub fn abort() -> bool {
-    ABORT.store(true, Ordering::SeqCst);
     VACATE_FOLLOWS.store(false, Ordering::SeqCst);
-    ACTIVE.swap(false, Ordering::SeqCst)
+    RUN.cancel()
 }
 
 /// Fly a full emergency autoland to the nearest suitable runway. AP-first: HDG bug
@@ -1007,28 +1013,6 @@ pub fn abort() -> bool {
 /// approach speed, gear/flaps come down on final, and it eases to idle in the
 /// flare. EXPERIMENTAL — untuned; test high, over an airport, with a hand ready.
 /// Own thread/runtime/client (like the recover watcher).
-#[allow(clippy::too_many_arguments)]
-pub fn run_autoland(
-    base: String,
-    apt_dat: String,
-    cfg: ApConfig,
-    approach_ias: f64,
-    voice: Option<Voice>,
-    status: Option<crate::plugin_status::StatusSink>,
-    forced_rwy: Option<PlannedRunway>,
-) {
-    run_autoland_scoped(
-        base,
-        apt_dat,
-        cfg,
-        approach_ias,
-        voice,
-        status,
-        forced_rwy,
-        Vec::new(),
-    );
-}
-
 #[allow(clippy::too_many_arguments)]
 pub fn run_autoland_scoped(
     base: String,
@@ -1043,6 +1027,9 @@ pub fn run_autoland_scoped(
     // `Some` forces that end; `None` self-picks by track — the emergency and
     // manual path, unchanged.
     forced_rwy: Option<PlannedRunway>,
+    // The launcher's cancel tokens: a cancel of the loop that handed the
+    // landing down (a stand-down landing before or after the launch) is the
+    // autoland's too. Empty only for the pilot's own request.
     parents: Vec<std::sync::Arc<AtomicBool>>,
 ) {
     spawn_autoland(AutolandLaunch {
@@ -1326,7 +1313,13 @@ fn spawn_autoland(launch: AutolandLaunch) {
         forced_rwy,
         parents,
     } = launch;
-    let my_gen = GEN.fetch_add(1, Ordering::SeqCst) + 1;
+    // The last approach's tracking goes before the flag rises (it is
+    // unreadable once ACTIVE is set again, not at the first tick).
+    *TRACKING_ERROR.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    // Taken on the caller's thread: a stand-down landing before the thread
+    // runs cancels THIS run. The run's end clears the panel line and the
+    // landing configuration, only while it still owns the slot.
+    let lease = RUN.take_over().with_cleanup(&LANDING_CONFIGURED, || set_panel(""));
     std::thread::spawn(move || {
         let Ok(rt) = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -1334,11 +1327,15 @@ fn spawn_autoland(launch: AutolandLaunch) {
         else {
             return;
         };
+        let lease = &lease;
         rt.block_on(async move {
             // Kept for a re-arm on a different runway (see the clearance
-            // watch in the tick).
+            // watch in the tick): the PARENTS only, never this run's own
+            // token, which the re-arm's take-over cancels.
             let base_url = base.clone();
-            let xp = XPlaneClient::new(base).with_parents(parents);
+            let xp = XPlaneClient::new(base)
+                .with_parents(parents.clone())
+                .with_cancel(lease.cancel.clone());
             if xp.cancelled() {
                 // A cancelled launch takes what was handed down for it with
                 // it: the next arm, perhaps another flight's instrument
@@ -1346,10 +1343,6 @@ fn spawn_autoland(launch: AutolandLaunch) {
                 drop_handed_down();
                 return;
             }
-            // The last approach's tracking is unreadable once ACTIVE is set
-            // again, so it goes before the flag, not at the first tick.
-            *TRACKING_ERROR.lock().unwrap_or_else(|e| e.into_inner()) = None;
-            ACTIVE.store(true, Ordering::SeqCst);
             LANDING_CONFIGURED.store(false, Ordering::SeqCst);
             let announce = |line: String, sev: Priority| {
                 tracing::info!(target: "xvoicelayer::autoland", spoke = %line, "copilot");
@@ -1395,10 +1388,8 @@ fn spawn_autoland(launch: AutolandLaunch) {
                 coupled_ok,
             } = match arm_runway(&xp, &apt_dat, forced_rwy.as_ref(), gp_deg, &voice).await {
                 Some(armed) => armed,
-                None => {
-                    ACTIVE.store(false, Ordering::SeqCst);
-                    return;
-                }
+                // The run ends with the thread (the lease drops the flag).
+                None => return,
             };
 
             // Engage the AP (FD up first for airframes that need it), and
@@ -1612,7 +1603,7 @@ fn spawn_autoland(launch: AutolandLaunch) {
             let mut coupling = crate::ils::Coupling::Off;
             let mut coupling_armed_s = 0.0_f64;
             loop {
-                if xp.cancelled() || GEN.load(Ordering::SeqCst) != my_gen || ABORT.load(Ordering::SeqCst) {
+                if xp.cancelled() || !lease.current() {
                     break;
                 }
                 // The tick runs to its period (`tick_ms`), not sleep + work.
@@ -1773,8 +1764,9 @@ fn spawn_autoland(launch: AutolandLaunch) {
                                     if resequenced { "resequenced" } else { "clearance" },
                                 );
                                 // A new loop owns the aircraft from its first
-                                // tick; this one exits on the generation bump
-                                // and leaves ACTIVE to it.
+                                // tick; this one is taken over (cancelled)
+                                // and leaves ACTIVE to it. Our parents are
+                                // its parents.
                                 run_autoland_scoped(
                                     base_url.clone(),
                                     apt_dat.clone(),
@@ -1783,7 +1775,7 @@ fn spawn_autoland(launch: AutolandLaunch) {
                                     voice.clone(),
                                     None,
                                     Some(PlannedRunway::at(&r.icao, &r.id)),
-                                    xp.cancellation(),
+                                    parents.clone(),
                                 );
                                 break;
                             }
@@ -4307,7 +4299,7 @@ fn spawn_autoland(launch: AutolandLaunch) {
             // 2026-09-21). The lever write stays as the first second's power;
             // the governor then holds a speed the configuration allows, and
             // "my controls" or a spoken speed takes it from there.
-            if gave_up && GEN.load(Ordering::SeqCst) == my_gen && !xp.cancelled() {
+            if gave_up && lease.current() && !xp.cancelled() {
                 let hold = hand_back_speed_kts(
                     approach_ias,
                     last_flap.unwrap_or(0.0),
@@ -4320,11 +4312,8 @@ fn spawn_autoland(launch: AutolandLaunch) {
                 announce(format!("I'm holding {hold:.0} knots for you."), Priority::Advisory);
                 crate::tools::speedhold::arm_flight(base_url.clone(), voice.clone(), hold);
             }
-            if GEN.load(Ordering::SeqCst) == my_gen {
-                set_panel("");
-                ACTIVE.store(false, Ordering::SeqCst);
-                LANDING_CONFIGURED.store(false, Ordering::SeqCst);
-            }
+            // The flag, the panel and the landing configuration go with the
+            // run's lease when the thread ends (a newer loop's are its own).
         });
     });
 }

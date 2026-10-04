@@ -37,7 +37,12 @@ use std::time::{Duration, Instant};
 use crate::voice::{Priority, Voice};
 use crate::xplane::XPlaneClient;
 
+/// The hover loop is flying. Written only by the run ([`RUN`]).
 pub static ACTIVE: AtomicBool = AtomicBool::new(false);
+/// The hover loop's run: claimed by the first [`request`] (later ones only
+/// retarget), cancelled by [`abort`] and [`release`]. A loop winding down
+/// cannot clear the flag, or the goal, of one started after it.
+pub(crate) static RUN: sim::run::Slot = sim::run::Slot::flagged(&ACTIVE);
 
 /// What the loop is flying towards. Changed live by a new request.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -470,14 +475,14 @@ static RELEASED: AtomicBool = AtomicBool::new(false);
 /// End the loop and leave the autopilot and the collective as they are (the
 /// route's hand-over to the cruise modes).
 pub fn release() {
-    if ACTIVE.load(Ordering::SeqCst) {
+    if RUN.live() {
         RELEASED.store(true, Ordering::SeqCst);
-        ACTIVE.store(false, Ordering::SeqCst);
+        RUN.cancel();
     }
 }
 
 pub fn abort() {
-    ACTIVE.store(false, Ordering::SeqCst);
+    RUN.cancel();
 }
 
 /// The autopilot tools that select a MODE, and so would replace the hover
@@ -1228,20 +1233,22 @@ const LANDED_SECS: f64 = 2.0;
 /// caller has checked the airframe and the ground), else retargets it.
 pub fn request(base_url: String, voice: Option<Voice>, collective: String, g: Goal) {
     *lock_goal() = Some(g);
-    if ACTIVE.swap(true, Ordering::SeqCst) {
+    let Some(run) = RUN.claim() else {
         return; // running: the next tick flies the new goal
-    }
+    };
     std::thread::spawn(move || {
         let Ok(rt) = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
         else {
-            ACTIVE.store(false, Ordering::SeqCst);
             return;
         };
-        rt.block_on(fly(XPlaneClient::new(base_url), voice, collective));
-        ACTIVE.store(false, Ordering::SeqCst);
-        *lock_goal() = None;
+        rt.block_on(fly(XPlaneClient::new(base_url), voice, collective, &run));
+        // The goal is this loop's to drop only while it owns the run: a
+        // loop started after a cancel flies its own.
+        if run.current() {
+            *lock_goal() = None;
+        }
     });
 }
 
@@ -1451,7 +1458,12 @@ async fn read_air(xp: &XPlaneClient) -> Option<Air> {
     .filter(Air::valid)
 }
 
-async fn fly(xp: XPlaneClient, voice: Option<Voice>, collective: String) {
+async fn fly(
+    xp: XPlaneClient,
+    voice: Option<Voice>,
+    collective: String,
+    run: &sim::run::Lease<'_>,
+) {
     // The power budget first, before the autopilot takes anything: a hover
     // the lever cannot give is refused on the ground with its numbers.
     let mut air = read_air(&xp).await;
@@ -1572,7 +1584,7 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, collective: String) {
     // takeover in the air is already holding its height, and the droop guard
     // judges what it really has.
     let lifted_here = !law.airborne();
-    while ACTIVE.load(Ordering::SeqCst) {
+    while run.live() {
         tokio::time::sleep(TICK).await;
         if crate::xplane::sim_frozen(&xp).await {
             last = Instant::now();
@@ -2219,10 +2231,10 @@ mod tests {
     #[test]
     fn the_hover_keeps_the_autopilot_modes() {
         assert!(blocks("set_heading").is_none(), "no hover running");
-        ACTIVE.store(true, Ordering::SeqCst);
+        let run = RUN.take_over();
         let heading = blocks("set_heading");
         let lights = blocks("set_lights");
-        ACTIVE.store(false, Ordering::SeqCst);
+        drop(run);
         assert!(heading.is_some_and(|l| l.contains("set it down")));
         assert!(lights.is_none(), "a switch is not a mode");
     }

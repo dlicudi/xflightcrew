@@ -593,8 +593,7 @@ impl Tool for FullAuto {
                     if crate::autoland::ACTIVE.load(std::sync::atomic::Ordering::SeqCst) {
                         return Ok("I'm already landing.".to_string());
                     }
-                    crate::autoland::ABORT.store(false, std::sync::atomic::Ordering::SeqCst);
-                    crate::autoland::run_autoland(
+                    crate::autoland::run_autoland_scoped(
                         ctx.config.xplane_base_url.clone(),
                         crate::tools::autoland::apt_dat_path(),
                         self.cfg.clone(),
@@ -602,6 +601,7 @@ impl Tool for FullAuto {
                         ctx.voice.cloned(),
                         ctx.status.cloned(),
                         Some(crate::autoland::PlannedRunway::at(&dest, &rwy)),
+                        ctx.xplane.cancellation(),
                     );
                     crate::flight::note_crew_takeover("resume_arrival");
                     return Ok(ack);

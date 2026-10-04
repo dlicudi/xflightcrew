@@ -86,10 +86,15 @@ fn say(voice: &Option<Voice>, status: &Option<StatusSink>, line: &str) {
     }
 }
 
+/// The jet start's run (`flight_state::stand_down` cancels it). A second
+/// "start the engines" takes it over: the sequence it replaces stops at its
+/// next step, where two used to fire the same switches side by side.
+pub(crate) static JET_START: sim::run::Slot = sim::run::Slot::new();
+
 fn spawn(base: String, voice: Option<Voice>, status: Option<StatusSink>) {
     // Taken on the caller's thread, so a stand-down landing before the thread
     // runs still stops it.
-    let epoch = crate::tools::power::sequence_epoch();
+    let lease = JET_START.take_over();
     std::thread::spawn(move || {
         let Ok(rt) = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -98,8 +103,11 @@ fn spawn(base: String, voice: Option<Voice>, status: Option<StatusSink>) {
             return;
         };
         rt.block_on(async move {
-            let xp = XPlaneClient::new(base);
-            run_sequence(&xp, epoch, &voice, &status).await;
+            // The run's token scopes every write and is the sequence's
+            // stand-down test.
+            let xp = XPlaneClient::new(base).with_cancel(lease.cancel.clone());
+            run_sequence(&xp, &voice, &status).await;
+            drop(lease);
         });
     });
 }
@@ -113,10 +121,10 @@ async fn n2(xp: &XPlaneClient, idx: usize) -> f64 {
 }
 
 /// Poll engine `idx`'s N2 until it passes `pct`, or give up after `secs` or at
-/// a stand-down since `epoch`.
-async fn wait_n2(xp: &XPlaneClient, epoch: u64, idx: usize, pct: f64, secs: u64) -> bool {
+/// at a stand-down.
+async fn wait_n2(xp: &XPlaneClient, idx: usize, pct: f64, secs: u64) -> bool {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(secs);
-    while std::time::Instant::now() < deadline && !stood_down(epoch) {
+    while std::time::Instant::now() < deadline && !stood_down(xp) {
         if n2(xp, idx).await > pct {
             return true;
         }
@@ -125,23 +133,19 @@ async fn wait_n2(xp: &XPlaneClient, epoch: u64, idx: usize, pct: f64, secs: u64)
     false
 }
 
-/// A stand-down (swap, new flight, instructor) since the start began: the
-/// sequence stops before its next step (`flight_state::stand_down`).
-fn stood_down(epoch: u64) -> bool {
-    let gone = crate::tools::power::sequence_stood_down(epoch);
+/// A stand-down (swap, new flight, instructor) or a newer start since this
+/// one began: the sequence stops before its next step (its client's run was
+/// cancelled, `flight_state::stand_down`).
+fn stood_down(xp: &XPlaneClient) -> bool {
+    let gone = xp.cancelled();
     if gone {
         tracing::info!("jet start: stood down mid-sequence");
     }
     gone
 }
 
-async fn run_sequence(
-    xp: &XPlaneClient,
-    epoch: u64,
-    voice: &Option<Voice>,
-    status: &Option<StatusSink>,
-) {
-    if stood_down(epoch) {
+async fn run_sequence(xp: &XPlaneClient, voice: &Option<Voice>, status: &Option<StatusSink>) {
+    if stood_down(xp) {
         return;
     }
     // Electrical/APU/bleed must be up first (the autostart runs the boarding prep
@@ -149,7 +153,7 @@ async fn run_sequence(
     if xp.get_float(APU_N1).await.unwrap_or(0.0) < 95.0 {
         say(voice, status, "Electrical isn't up. Powering up first.");
         crate::tools::power::run_prep(xp, voice, status).await;
-        if stood_down(epoch) {
+        if stood_down(xp) {
             return;
         }
         if xp.get_float(APU_N1).await.unwrap_or(0.0) < 95.0 {
@@ -175,7 +179,7 @@ async fn run_sequence(
         }
         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
     }
-    if stood_down(epoch) {
+    if stood_down(xp) {
         return;
     }
     tracing::info!(
@@ -210,7 +214,7 @@ async fn run_sequence(
             "left",
         ),
     ] {
-        if stood_down(epoch) {
+        if stood_down(xp) {
             return;
         }
         // Generator on for this engine; route start air to it (open its cross-feed,
@@ -221,8 +225,8 @@ async fn run_sequence(
 
         say(voice, status, &format!("Cranking the {side} engine."));
         xp.run_command_for(starter, STARTER_HOLD_SECS).await.ok();
-        if !wait_n2(xp, epoch, idx, N2_LIGHT, 30).await {
-            if stood_down(epoch) {
+        if !wait_n2(xp, idx, N2_LIGHT, 30).await {
+            if stood_down(xp) {
                 return;
             }
             tracing::warn!(
@@ -238,14 +242,14 @@ async fn run_sequence(
             );
             return;
         }
-        if stood_down(epoch) {
+        if stood_down(xp) {
             return;
         }
         // 20% N2 — introduce fuel (the fuel handle), then wait for idle.
         say(voice, status, &format!("{} fuel on.", cap(side)));
         xp.set_float_array_elem(MIXTURE, idx, 1.0).await.ok();
-        if !wait_n2(xp, epoch, idx, N2_IDLE, 60).await {
-            if stood_down(epoch) {
+        if !wait_n2(xp, idx, N2_IDLE, 60).await {
+            if stood_down(xp) {
                 return;
             }
             say(
@@ -258,7 +262,7 @@ async fn run_sequence(
         say(voice, status, &format!("The {side} engine is running."));
     }
 
-    if stood_down(epoch) {
+    if stood_down(xp) {
         return;
     }
     // Both cross-feeds open for normal ops.
@@ -374,7 +378,13 @@ impl Tool for StopEngines {
     async fn execute(&self, _args: &Value, ctx: &ToolCtx<'_>) -> Result<String> {
         // Safety gate: never shut the engines down airborne. Default to airborne if
         // the read fails, so an unknown state errs safe.
-        if ctx.xplane.get_float(crate::datarefs::ON_GROUND_ANY).await.unwrap_or(0.0) <= 0.5 {
+        if ctx
+            .xplane
+            .get_float(crate::datarefs::ON_GROUND_ANY)
+            .await
+            .unwrap_or(0.0)
+            <= 0.5
+        {
             return Ok(
                 "Negative, we're airborne. I will not shut the engines down in flight.".to_string(),
             );

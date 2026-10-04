@@ -616,6 +616,20 @@ struct Armed {
     check: AuthorityCheck,
 }
 
+/// ONE check, on purpose (refactor audit 2026-10-04 asked whether five
+/// arming loops should each own one): the check is about the ONE
+/// autopilot's elevator after its latest vertical engage, not about a loop.
+/// The loops that arm it fly the dial one after another, never side by side
+/// (the takeoff hands the climb to the circuit or the follower, either hands
+/// the final to autoland, the enroute setup's settle ends before any of
+/// them), and the check is HANDED DOWN with the dial: the takeoff's engage
+/// is judged by whoever takes its climb (`circuit`, `procedure` feed a check
+/// `autotakeoff` armed). A per-arm token would cut exactly that hand-down. A
+/// newer engage replacing the older check is the right reading of the
+/// autopilot (its newest mode is the one flying), and every loop that arms
+/// it ends before the next one's engage, or is stood down with the check
+/// (`flight_state::stand_down` disarms it). Pinned by
+/// `one_authority_check_for_the_one_autopilot`.
 static ARMED: std::sync::Mutex<Option<Armed>> = std::sync::Mutex::new(None);
 
 /// A vertical mode was engaged by `source` on the climb `vs`: the check
@@ -1163,5 +1177,42 @@ mod tests {
         assert_eq!(takeover_hold_ft(Some(37_000.0), Some(700.0)), Some(1_700.0));
         assert_eq!(takeover_hold_ft(None, Some(740.0)), Some(1_700.0));
         assert_eq!(takeover_hold_ft(Some(3_000.0), None), None);
+    }
+}
+
+#[cfg(test)]
+mod one_check_tests {
+    /// The authority check is one slot for the one autopilot: the loops that
+    /// arm it are the known five, flying the dial in turn, and only a
+    /// stand-down and autoland's arrest disarm it. A new arming loop must be
+    /// argued for here (see `ARMED`).
+    #[test]
+    fn one_authority_check_for_the_one_autopilot() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut sources = Vec::new();
+        let mut disarms = Vec::new();
+        let arm = "climb_watch::arm_authority(\"";
+        for f in crate::test_support::rust_files(&root) {
+            if crate::test_support::is_test_file(&f) || f.ends_with("climb_watch.rs") {
+                continue;
+            }
+            let text = std::fs::read_to_string(&f).unwrap();
+            let rel = f.strip_prefix(&root).unwrap().display().to_string();
+            for (i, _) in text.match_indices(arm) {
+                let rest = &text[i + arm.len()..];
+                sources.push(rest[..rest.find('"').unwrap()].to_string());
+            }
+            if text.contains("climb_watch::disarm_authority()") {
+                disarms.push(rel);
+            }
+        }
+        sources.sort();
+        sources.dedup();
+        assert_eq!(
+            sources,
+            ["autoland", "autotakeoff", "circuit", "procedure", "setup_enroute"]
+        );
+        disarms.sort();
+        assert_eq!(disarms, ["autoland.rs", "flight_state.rs"]);
     }
 }

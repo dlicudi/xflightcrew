@@ -529,7 +529,7 @@ pub fn gear_up_due(
 
 /// True while the takeoff loop runs. Cleared by the loop, the release path
 /// in main ("my controls" — silent stand-down), or the tool's off switch.
-static RUN: sim::run::Slot = sim::run::Slot::new();
+pub(crate) static RUN: sim::run::Slot = sim::run::Slot::new();
 pub fn running() -> bool {
     RUN.running()
 }
@@ -2857,7 +2857,7 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, p: Params) {
         360.0,
     )
     .await;
-    crate::tools::speedhold::ACTIVE.store(false, Ordering::Relaxed);
+    crate::tools::speedhold::release();
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     // The line-up ends "brakes set" — the parking-brake ratio latched. It
     // is OURS to release: sortie five's first engage sat at full power,
