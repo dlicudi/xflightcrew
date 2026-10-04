@@ -9446,10 +9446,12 @@ mod issue_169_tests {
             let p = crate::aircraft::load(id)?;
             let r = p.reference.as_ref();
             let vs = p.vs_clean_kts.unwrap_or(50.0);
-            let approach_ias = r
-                .and_then(|r| r.approach_kts)
-                .unwrap_or((vs * 1.3).max(70.0));
-            let vr = r.and_then(|r| r.vr_kts).unwrap_or((vs * 1.15).max(55.0));
+            let approach_ias = r.and_then(|r| r.approach_kts).unwrap_or_else(|| {
+                crate::aircraft::fallback_approach_kts(r.and_then(|r| r.vs0_kts), vs)
+            });
+            let vr = r
+                .and_then(|r| r.vr_kts)
+                .unwrap_or_else(|| crate::aircraft::fallback_vr_kts(vs));
             let vy = r.and_then(|r| r.vy_kts).unwrap_or(vr + 15.0);
             let pattern_kts = pattern_speed_kts(vy, approach_ias, p.vs_clean_kts);
             Some(Airframe {

@@ -2958,6 +2958,106 @@ pub fn speed_floor_kts() -> Option<f64> {
     *SPEED_FLOOR_KTS.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+// The "too slow" ratios over the clean stall, in one place so a change to
+// one is made against the others (refactor audit 2026-10-04, finding #13:
+// the climb limiter's floor was moved at 1.15 by the #169 fix and sat under
+// the 1.2 automation floor with the 1.13 caution between them). Their order
+// is pinned by `slow_ratios_are_ordered`.
+
+/// The monitor's stall WARNING, x the stall in the configuration flown.
+pub const STALL_WARNING_RATIO: f64 = 1.10;
+
+/// The monitor's low-speed caution with a PILOT flying, x the stall in the
+/// configuration flown: the band a hand-flown approach should stay over.
+pub const CAUTION_HAND_RATIO: f64 = 1.20;
+
+/// The monitor's low-speed caution with an automation flying, x the stall in
+/// the configuration flown:
+/// under [`SPEED_FLOOR_RATIO`], so an automation holding its floor in a
+/// gust is not called slow, and well over the stall.
+pub const CAUTION_AUTO_RATIO: f64 = 1.13;
+
+/// The climb limiter's floor, x the stall in the configuration flown
+/// (`circuit::climb_floor_kts`): the speed a climb bleeds to before the
+/// limiter has taken all of it away. It IS the automation floor: it was
+/// 1.15, under [`SPEED_FLOOR_RATIO`], so a climb could bleed to a speed no
+/// automation may target (CLAUDE.md "No automation target below the speed
+/// floor"; refactor audit 2026-10-04, finding #13).
+pub const CLIMB_FLOOR_RATIO: f64 = SPEED_FLOOR_RATIO;
+
+/// The least pattern speed, x clean Vs (`circuit::PATTERN_MIN_STALL_MULT`),
+/// and the speed an upset recovery holds ([`recovery_hold_kts`]).
+pub const PATTERN_MIN_RATIO: f64 = 1.3;
+
+/// The approach speed an airframe that declares none flies, x Vso.
+pub const APPROACH_VSO_RATIO: f64 = 1.3;
+
+/// The same, x clean Vs: the automation floor, so the fallback approach is
+/// never under it.
+pub const APPROACH_VS_RATIO: f64 = SPEED_FLOOR_RATIO;
+
+/// The approach speed an airframe that declares none flies: max(1.3 Vso,
+/// 1.2 Vs). ONE rule for the tool registry (autoland), `generic_from_acf`,
+/// the instructor's brief and scorer, and the tests that build airframes
+/// (refactor audit 2026-10-04, finding #2: the instructor still briefed 1.3
+/// x the CLEAN stall, the rule the registry dropped after the SR22 floated
+/// and bounced at 90 kt, LEMG 13 2026-09-29).
+///
+/// No flat 70 kt floor, deliberately. The registry had one and
+/// `generic_from_acf` did not, so the two paths disagreed; every shipped
+/// profile declares `approach_kts` and a generic airframe always carried the
+/// unfloored figure, so the floor only ever reached an airframe with a
+/// declared stall and no approach speed, and there it is the SR22 float by
+/// another door (a 40 kt-stall wing flown at 70). The 1.2 Vs term already
+/// keeps it over the automation floor. Pure.
+pub fn fallback_approach_kts(vs0_kts: Option<f64>, vs_clean_kts: f64) -> f64 {
+    let by_vso = vs0_kts
+        .filter(|v| v.is_finite() && *v > 0.0)
+        .map_or(0.0, |v| v * APPROACH_VSO_RATIO);
+    by_vso.max(vs_clean_kts * APPROACH_VS_RATIO).round()
+}
+
+/// The profile's approach speed, else [`fallback_approach_kts`] from its
+/// stalls; `None` when it declares neither an approach speed nor a clean
+/// stall.
+pub fn approach_kts(p: &AircraftProfile) -> Option<f64> {
+    let r = p.reference.as_ref();
+    r.and_then(|r| r.approach_kts).or_else(|| {
+        p.vs_clean_kts
+            .filter(|v| v.is_finite() && *v > 0.0)
+            .map(|vs| fallback_approach_kts(r.and_then(|r| r.vs0_kts), vs))
+    })
+}
+
+/// Rotation speed for an airframe that declares none, x clean Vs.
+///
+/// 1.1, not the registry's old 1.15 (min 55). The shipped profiles that
+/// declare a Vr sit at 0.85 to 1.15 of their clean stall (SR22 1.04, 737
+/// 1.04, SF50 1.13, 172 1.15, A330 0.85): takeoff flap lowers the stall, so
+/// 1.1 x the clean figure is still over 1.2 x the takeoff stall on every one
+/// of them, and 1.15 rotated late and long. A generic airframe already
+/// rotated at 1.1 (`generic_from_acf`, whose figure the registry reads);
+/// now an airframe with a profile and no Vr agrees with it (refactor audit
+/// 2026-10-04, finding #2).
+pub const VR_STALL_RATIO: f64 = 1.1;
+
+/// [`VR_STALL_RATIO`] x the clean stall, rounded. Pure.
+pub fn fallback_vr_kts(vs_clean_kts: f64) -> f64 {
+    (vs_clean_kts * VR_STALL_RATIO).round()
+}
+
+/// The speed an upset recovery holds: [`PATTERN_MIN_RATIO`] x the clean
+/// stall, never under 70 kt. The floor stays here though not on the
+/// approach: a recovery wants margin over an unknown or optimistic stall
+/// and has no runway to float down, and slow is the one way it can still
+/// go wrong. Pure.
+pub fn recovery_hold_kts(vs_clean_kts: f64) -> f64 {
+    (vs_clean_kts * PATTERN_MIN_RATIO).max(RECOVERY_HOLD_MIN_KTS)
+}
+
+/// The least speed [`recovery_hold_kts`] asks for.
+pub const RECOVERY_HOLD_MIN_KTS: f64 = 70.0;
+
 /// The highest speed the flight governor may be asked to hold, from the
 /// airframe's Vne/Vmo. `None` = the profile declares no Vne.
 ///
@@ -3525,9 +3625,8 @@ pub fn generic_from_acf(icao: &str, acf_text: &str) -> AircraftProfile {
     r.best_glide_kts = kts("acf/_Vbg_kts").or(r.best_glide_kts);
     r.vs0_kts = vso.or(r.vs0_kts);
     if let Some(vs) = vs {
-        r.vr_kts = Some((vs * 1.1).round());
-        let by_vso = vso.map(|v| v * 1.3).unwrap_or(0.0);
-        r.approach_kts = Some(by_vso.max(vs * 1.2).round());
+        r.vr_kts = Some(fallback_vr_kts(vs));
+        r.approach_kts = Some(fallback_approach_kts(vso, vs));
     }
     if let Some(vno) = r.vno_kts {
         r.cruise_ias_kts = Some((vno * 0.85).round());
