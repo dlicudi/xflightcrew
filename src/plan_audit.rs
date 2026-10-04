@@ -674,7 +674,7 @@ pub async fn gather_suitability(
         origin_longest_ft: origin.map(crate::flightplan::longest_runway_ft),
         dest_longest_ft: dest.map(crate::flightplan::longest_runway_ft),
         takeoff_needed_ft,
-        landing_needed_ft: crate::flightplan::runway_needed_ft(landing_ft, takeoff_ft),
+        landing_needed_ft: crate::aircraft::planned_landing_needed_ft(landing_ft, takeoff_ft),
         dest_wind: wind,
         dest_runway_hdgs: hdgs,
         max_crosswind_kts: r.and_then(|r| r.max_crosswind_kts),

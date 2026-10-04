@@ -6666,7 +6666,7 @@ pub fn preflight_gated(
     }
     // The far end first: a field we cannot land at is not a destination.
     if let Some(need) =
-        crate::flightplan::runway_needed_ft(f.landing_distance_ft, f.takeoff_distance_ft)
+        crate::aircraft::planned_landing_needed_ft(f.landing_distance_ft, f.takeoff_distance_ft)
     {
         if f.dest_longest_ft > 0.0 && f.dest_longest_ft < need {
             return Err((
@@ -9175,7 +9175,9 @@ mod tests {
         let why = super::preflight(&plan(true), &short_dest).expect_err("refused");
         assert_eq!(
             why,
-            "Negative. LEAX's longest runway is 1,200 feet, and we need 1,335 feet to land. Not flying that."
+            // The book 1,335 ft x 1.3 (`aircraft::landing_needed_m`, the
+            // self-pick's margin too; refactor audit #10).
+            "Negative. LEAX's longest runway is 1,200 feet, and we need 1,736 feet to land. Not flying that."
         );
         // The takeoff needs the roll x 1.4 (1,630 ft -> 2,282 ft at max
         // gross), scaled to the 1,100 kg on the wheels against 1,160: 2,163.

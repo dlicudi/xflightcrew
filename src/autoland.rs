@@ -210,17 +210,14 @@ pub fn best_landing_runway(
 pub const DESTINATION_BONUS_NM: f64 = 8.0;
 
 /// The shortest strip the self-pick will take, metres: the airframe's landing
-/// distance with a 1.3 margin, never under the 1,200 m every airframe was
-/// held to. The flat 1,200 offered an A330 (1,448 m before any margin) strips
-/// it cannot stop on; the planned path has checked the distance at the arm
-/// since 2026-09-15 and the emergency path never did.
+/// distance with the one landing margin ([`crate::aircraft::landing_needed_m`],
+/// the planner's and the preflight's rule too), never under the 1,200 m every
+/// airframe was held to. The flat 1,200 offered an A330 (1,448 m before any
+/// margin) strips it cannot stop on; the planned path has checked the
+/// distance at the arm since 2026-09-15 and the emergency path never did.
 pub const SELF_PICK_MIN_LENGTH_M: f64 = 1200.0;
 pub fn self_pick_min_length_m(landing_distance_m: Option<f64>) -> f64 {
-    landing_distance_m
-        .filter(|d| d.is_finite() && *d > 0.0)
-        .map_or(SELF_PICK_MIN_LENGTH_M, |d| {
-            (d * 1.3).max(SELF_PICK_MIN_LENGTH_M)
-        })
+    crate::aircraft::landing_needed_m(landing_distance_m, None, SELF_PICK_MIN_LENGTH_M)
 }
 
 /// Nautical miles of detour one knot of TAILWIND is worth: ten knots on the

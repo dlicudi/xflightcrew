@@ -3215,6 +3215,45 @@ pub async fn takeoff_needed_now_m(
     takeoff_needed_m(roll_at_mtow_m, weight_now, mtow_kg, floor_m)
 }
 
+/// The margin on the book LANDING distance every landing-runway gate
+/// applies (see [`landing_needed_m`]).
+pub const LANDING_FACTOR: f64 = 1.3;
+
+/// Pavement a landing needs, metres: the book landing distance, else the
+/// book takeoff distance (what every GA POH gives, and the longer of the
+/// two there), times [`LANDING_FACTOR`], never under `floor_m`. No figure on
+/// file = the floor.
+///
+/// ONE rule beside [`takeoff_needed_m`], for the planner's destination
+/// refusal, full auto's preflight, the plan audit and autoland's self-pick
+/// (refactor audit 2026-10-04, finding #10). They disagreed: the planned
+/// path took a runway equal to the bare book figure while the emergency
+/// path demanded 1.3 times it, so a destination the preflight passed could
+/// be one the self-pick would refuse on a go-around. The factored figure is
+/// the one kept, deliberately: the book number is a test pilot's on a dry
+/// runway at the threshold speed (the same reasoning as the takeoff's 1.4),
+/// and dispatch rules ask more still (1 / 0.6 for a jet), so 1.3 is the
+/// least a plan should count on. The floor is the caller's: the self-pick
+/// keeps its 1,200 m (it chooses among strips nobody planned), a plan has
+/// none (a 172's 530 m grass field is a destination). Pure.
+pub fn landing_needed_m(landing_m: Option<f64>, takeoff_m: Option<f64>, floor_m: f64) -> f64 {
+    let book = landing_m
+        .filter(|d| d.is_finite() && *d > 0.0)
+        .or_else(|| takeoff_m.filter(|d| d.is_finite() && *d > 0.0));
+    book.map_or(floor_m, |d| (d * LANDING_FACTOR).max(floor_m))
+}
+
+/// [`landing_needed_m`] for a PLAN, in feet from the profile's feet: no
+/// floor, and `None` (no check) when the profile recites neither figure.
+pub fn planned_landing_needed_ft(landing_ft: Option<f64>, takeoff_ft: Option<f64>) -> Option<f64> {
+    let need_m = landing_needed_m(
+        landing_ft.map(|f| f * 0.3048),
+        takeoff_ft.map(|f| f * 0.3048),
+        0.0,
+    );
+    (need_m > 0.0).then(|| (need_m / 0.3048).round())
+}
+
 /// The altitude this airframe cruises best at, at `weight_kg`.
 ///
 /// A straight line through the profile's one reference point, because that is
