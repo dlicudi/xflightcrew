@@ -51,9 +51,6 @@ pub const MAX_POINT_NM: f64 = 1_000.0;
 /// The plan's altitude at the point must be at least this: the resume needs
 /// a thousand feet above the ground, and the plan knows nothing of it.
 pub const MIN_START_FT: f64 = 3_000.0;
-/// Below this the 250 kt airspace limit is the most a start is given.
-const BELOW_10K_FT: f64 = 10_000.0;
-const BELOW_10K_KTS: f64 = 250.0;
 /// A schedule entry is the fix's when within this, nm (an ident is not
 /// unique across the world, a position is).
 const SCHEDULE_MATCH_NM: f64 = 2.0;
@@ -210,9 +207,10 @@ fn start_speed(
         (None, Some(k)) => (k, "profile"),
         (None, None) => return None,
     };
-    if alt_ft < BELOW_10K_FT {
-        kts = kts.min(BELOW_10K_KTS);
-    }
+    // Below 10,000 ft the 250 kt airspace limit is the most a start is given:
+    // the governor's own rule (`speedhold::airspace_limited`), not a copy
+    // (refactor audit 2026-10-04, finding #20).
+    kts = crate::tools::speedhold::airspace_limited(alt_ft, kts);
     if let Some(c) = speeds.ceiling_kts {
         kts = kts.min(c);
     }

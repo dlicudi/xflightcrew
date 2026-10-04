@@ -3948,6 +3948,7 @@ mod tests {
             ("autotakeoff", "CLIMB_HOLD_FLOOR_FPM", "the positive floor climb_vs_fpm already keeps (airborne, it climbs); only airframes declaring a climb-out"),
             ("speedhold", "IDLE_FAST_KTS", "margin over the pilot's own target, not an airframe speed"),
             ("speedhold", "BETA_SPENT_OVER_KTS", "margin over the taxi pace before the spent-beta brake; only airframes declaring beta_max"),
+            ("speedhold", "UNKNOWN_CEILING_KTS", "FALLBACK only for an airframe declaring no Vne; with one the ceiling is speed_ceiling_kts"),
             // --- Properties of the SIM or the SENSORS, not the airframe ---
             (
                 "autotakeoff",
