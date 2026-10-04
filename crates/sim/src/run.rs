@@ -163,6 +163,28 @@ impl Slot {
             .as_ref()
             .is_some_and(|s| !s.ending && !s.cancel.load(Ordering::SeqCst))
     }
+    /// [`Lease::lower_flag`] for the run whose cancel token is `token` (a
+    /// client's `cancellation()`), for code deep in a loop that holds the
+    /// run's client rather than its lease. A no-op for any other run.
+    pub fn lower_flag_for(&self, token: &Arc<AtomicBool>) {
+        let mut state = self.lock();
+        if let Some(s) = state.as_mut().filter(|s| Arc::ptr_eq(&s.cancel, token)) {
+            s.ending = true;
+            self.set_flag(false);
+        }
+    }
+    /// [`Lease::record`] for the run whose cancel token is `token`.
+    pub fn record_for(&self, token: &Arc<AtomicBool>, outcome: Outcome) {
+        if let Some(s) = self
+            .lock()
+            .as_mut()
+            .filter(|s| Arc::ptr_eq(&s.cancel, token))
+        {
+            if !s.cancel.load(Ordering::SeqCst) {
+                s.outcome = outcome;
+            }
+        }
+    }
     pub fn record(&self, outcome: Outcome) {
         if let Some(s) = self.lock().as_mut() {
             if !s.cancel.load(Ordering::SeqCst) {
@@ -322,6 +344,31 @@ mod tests {
         assert_eq!(SLOT.outcome(), Some(Outcome::Running));
         drop(new);
         assert!(!FLAG.load(Ordering::SeqCst));
+    }
+
+    /// A loop that holds only its run's client (its token) lowers and
+    /// records for that run alone.
+    #[test]
+    fn a_token_reaches_only_its_own_run() {
+        static FLAG: AtomicBool = AtomicBool::new(false);
+        static SLOT: Slot = Slot::flagged(&FLAG);
+        let old = SLOT.take_over();
+        let old_token = old.cancel.clone();
+        let new = SLOT.take_over();
+        SLOT.lower_flag_for(&old_token);
+        SLOT.record_for(&old_token, Outcome::HandedOff);
+        assert!(FLAG.load(Ordering::SeqCst), "the old token reaches nothing");
+        SLOT.record_for(&new.cancel, Outcome::HandedOff);
+        SLOT.lower_flag_for(&new.cancel);
+        assert!(!FLAG.load(Ordering::SeqCst));
+        let token = new.cancel.clone();
+        drop(new);
+        assert!(
+            !token.load(Ordering::SeqCst),
+            "a handed-off run leaves its children"
+        );
+        assert_eq!(SLOT.outcome(), Some(Outcome::HandedOff));
+        drop(old);
     }
 
     /// A claim refuses a live run and supersedes one winding down.

@@ -73,16 +73,16 @@ fn arrest_release() {
 
 /// A taxi-in is running: from [`start`] to the end of its thread, vacate,
 /// request and drive alike (the request's wait drives nothing, so the auto
-/// taxi's flag alone does not say it).
+/// taxi's flag alone does not say it). Written only by the run ([`RUN`]).
 pub(crate) static ACTIVE: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
-/// The running taxi-in's generation: a newer [`start`] supersedes it.
-static GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-/// Set by [`abort`]: the taxi-in ends where it is.
-static CANCEL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-/// With [`CANCEL`]: whether the end stops and parks the aircraft (the
+/// The taxi-in's run: a newer [`start`] takes it over, [`abort`] cancels it,
+/// and the run that ends (or was superseded) can never clear a newer one's
+/// flag.
+pub(crate) static RUN: sim::run::Slot = sim::run::Slot::flagged(&ACTIVE);
+/// With an [`abort`]: whether the end stops and parks the aircraft (the
 /// pilot's "my controls") or only lets go (a stand-down for a swap or a new
-/// flight, whose setup owns the aircraft).
+/// flight, whose setup owns the aircraft). Reset by every new run.
 static CANCEL_HOLD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Whether a taxi-in is running.
@@ -98,41 +98,25 @@ pub fn running() -> bool {
 /// vacated, called for taxi and drove to the stand 7 s later.
 pub fn abort(hold: bool) {
     use std::sync::atomic::Ordering::SeqCst;
-    if !ACTIVE.load(SeqCst) {
+    if !RUN.live() {
         return;
     }
     CANCEL_HOLD.store(hold, SeqCst);
-    CANCEL.store(true, SeqCst);
+    RUN.cancel();
     crate::autotaxi::halt();
     crate::tools::speedhold::ACTIVE.store(false, SeqCst);
 }
 
-/// A new taxi-in is running from now: its generation.
-fn begin() -> u64 {
-    use std::sync::atomic::Ordering::SeqCst;
-    let gen = GEN.fetch_add(1, SeqCst) + 1;
-    CANCEL.store(false, SeqCst);
-    ACTIVE.store(true, SeqCst);
-    gen
+/// A new taxi-in is running from now: its run (the flag drops with it,
+/// however the taxi-in ends, unless a newer one has taken over).
+fn begin() -> sim::run::Lease<'static> {
+    CANCEL_HOLD.store(false, std::sync::atomic::Ordering::SeqCst);
+    RUN.take_over()
 }
 
-/// This taxi-in (`gen`) is to end: aborted, or superseded by a newer one.
-fn cancelled(gen: u64) -> bool {
-    use std::sync::atomic::Ordering::SeqCst;
-    CANCEL.load(SeqCst) || GEN.load(SeqCst) != gen
-}
-
-/// Clears [`ACTIVE`] when its taxi-in ends, however it ends, unless a newer
-/// one has started.
-struct Running(u64);
-
-impl Drop for Running {
-    fn drop(&mut self) {
-        use std::sync::atomic::Ordering::SeqCst;
-        if GEN.load(SeqCst) == self.0 {
-            ACTIVE.store(false, SeqCst);
-        }
-    }
+/// This taxi-in is to end: aborted, or superseded by a newer one.
+fn cancelled(run: &sim::run::Lease<'_>) -> bool {
+    !run.live()
 }
 
 /// The taxi-in was told to end at `at`: blackboxed, and on the pilot's
@@ -145,7 +129,7 @@ async fn end_cancelled(
     at: &str,
 ) -> bool {
     use std::sync::atomic::Ordering::SeqCst;
-    let hold = CANCEL_HOLD.load(SeqCst) && CANCEL.load(SeqCst);
+    let hold = CANCEL_HOLD.load(SeqCst);
     let held = match hold {
         true => {
             crate::tools::controls::hand_back_hold(xp, park_brake_valve_set, RELEASE_HOLD).await
@@ -190,7 +174,6 @@ pub fn start(
     // typed the moment the landing's verdict is in must find it.
     let gen = begin();
     std::thread::spawn(move || {
-        let _running = Running(gen);
         let Ok(rt) = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -206,7 +189,7 @@ pub fn start(
             pace,
             vacate_from,
             shut_down,
-            gen,
+            &gen,
         ));
     });
 }
@@ -536,7 +519,7 @@ async fn fly(
     pace: crate::autotaxi::Pace,
     vacate_from: Option<String>,
     shut_down: bool,
-    gen: u64,
+    gen: &sim::run::Lease<'_>,
 ) {
     // --- Phase one: get off the runway. No clearance, no request, no wait. ---
     if let Some(rwy) = vacate_from {
@@ -1155,32 +1138,33 @@ mod abort_tests {
     #[test]
     fn my_controls_ends_the_taxi_in_between_its_drives() {
         let _g = crate::mode::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        ACTIVE.store(false, SeqCst);
-        CANCEL.store(false, SeqCst);
+        RUN.cancel();
+        CANCEL_HOLD.store(false, SeqCst);
         // Nothing running: nothing to end.
         abort(true);
-        assert!(!CANCEL.load(SeqCst));
+        assert!(!CANCEL_HOLD.load(SeqCst));
         // Running (the request's wait: no auto taxi), the pilot's release.
         let gen = begin();
-        assert!(running() && !cancelled(gen));
+        assert!(running() && !cancelled(&gen));
         crate::autotaxi::ACTIVE.store(true, SeqCst);
         abort(true);
-        assert!(cancelled(gen), "the taxi-in ends");
+        assert!(cancelled(&gen), "the taxi-in ends");
         assert!(CANCEL_HOLD.load(SeqCst), "and stops and parks the aircraft");
         assert!(!crate::autotaxi::driving(), "its drive halted");
         assert!(!crate::tools::speedhold::ACTIVE.load(SeqCst), "its governor off");
         // A stand-down (swap, new flight) lets go without the hold.
         let gen = begin();
         abort(false);
-        assert!(cancelled(gen) && !CANCEL_HOLD.load(SeqCst));
+        assert!(cancelled(&gen) && !CANCEL_HOLD.load(SeqCst));
+        drop(gen);
         // A newer taxi-in supersedes an older one, and the older one's end
         // leaves the newer running.
         let old = begin();
         let newer = begin();
-        assert!(cancelled(old) && !cancelled(newer));
-        drop(Running(old));
+        assert!(cancelled(&old) && !cancelled(&newer));
+        drop(old);
         assert!(running());
-        drop(Running(newer));
+        drop(newer);
         assert!(!running());
     }
 }

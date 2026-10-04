@@ -26,7 +26,7 @@
 //! - **Arrive** on the hover loop: a final at 6 degrees to the helipad nearest
 //!   the inbound fix, the speed tapering to stop over it, then down.
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use crate::hover::{self, Goal};
@@ -34,12 +34,16 @@ use crate::taxi_guide::{bearing, dist, Geo};
 use crate::voice::{Priority, Voice};
 use crate::xplane::XPlaneClient;
 
+/// A route (or a park) is flying. Written only by the run ([`RUN`]).
 pub static ACTIVE: AtomicBool = AtomicBool::new(false);
-static GENERATION: AtomicU64 = AtomicU64::new(0);
+/// The route's run: claimed by a route or a park (refused while one flies),
+/// cancelled by [`abort`]. A retired run can no longer clear a newer route's
+/// flag (that race ran two copies through the hover-to-cruise handoff, where
+/// one treated the other's expected hover release as an external handover).
+pub(crate) static RUN: sim::run::Slot = sim::run::Slot::flagged(&ACTIVE);
 
 pub fn abort() {
-    GENERATION.fetch_add(1, Ordering::SeqCst);
-    ACTIVE.store(false, Ordering::SeqCst);
+    RUN.cancel();
 }
 
 static DETAIL: crate::auto_status::Detail = crate::auto_status::Detail::new();
@@ -1042,18 +1046,14 @@ const LIFT_WARNING_S: f64 = 5.0;
 pub const ROUTE_TAXI_FT: f64 = 12.0;
 
 pub fn park(voice: Option<Voice>, base_url: String, collective: String, target: ParkTarget) {
-    if ACTIVE.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst).is_err() {
+    let Some(generation) = RUN.claim() else {
         return;
-    }
-    let generation = GENERATION.fetch_add(1, Ordering::SeqCst) + 1;
+    };
     std::thread::spawn(move || {
         let Ok(rt) = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
         else {
-            if GENERATION.load(Ordering::SeqCst) == generation {
-                ACTIVE.store(false, Ordering::SeqCst);
-            }
             return;
         };
         rt.block_on(fly_park(
@@ -1062,11 +1062,8 @@ pub fn park(voice: Option<Voice>, base_url: String, collective: String, target: 
             base_url,
             collective,
             target,
-            generation,
+            &generation,
         ));
-        if GENERATION.load(Ordering::SeqCst) == generation {
-            ACTIVE.store(false, Ordering::SeqCst);
-        }
     });
 }
 
@@ -1076,7 +1073,7 @@ async fn fly_park(
     base_url: String,
     collective: String,
     target: ParkTarget,
-    generation: u64,
+    generation: &sim::run::Lease<'_>,
 ) {
     let _detail = crate::auto_status::DetailGuard::hold(&DETAIL);
     let (path_ll, name, height) = match &target {
@@ -1102,7 +1099,7 @@ async fn fly_park(
     let wait = std::time::Instant::now();
     while wait.elapsed().as_secs_f64() < LIFT_WARNING_S {
         tokio::time::sleep(TICK).await;
-        if !ACTIVE.load(Ordering::SeqCst) || GENERATION.load(Ordering::SeqCst) != generation {
+        if !generation.live() {
             crate::blackbox::record("heli_route", serde_json::json!({ "event": "park_declined" }));
             return;
         }
@@ -1124,7 +1121,7 @@ async fn fly_park(
     }
     let mut ready = false;
     let mut moving = false;
-    while ACTIVE.load(Ordering::SeqCst) && GENERATION.load(Ordering::SeqCst) == generation {
+    while generation.live() {
         tokio::time::sleep(TICK).await;
         if crate::xplane::sim_frozen(&xp).await {
             continue;
@@ -1578,25 +1575,21 @@ pub fn start(
     route: Route,
     ends: Ends,
 ) {
-    if ACTIVE.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst).is_err() {
+    let Some(generation) = RUN.claim() else {
         return;
-    }
-    let generation = GENERATION.fetch_add(1, Ordering::SeqCst) + 1;
+    };
     let base_url = config.xplane_base_url.clone();
     std::thread::spawn(move || {
         let Ok(rt) = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
         else {
-            if GENERATION.load(Ordering::SeqCst) == generation {
-                ACTIVE.store(false, Ordering::SeqCst);
-            }
             return;
         };
         let xp = XPlaneClient::new(base_url.clone());
         let on_pad = route.on_pad;
         let landed = rt.block_on(async {
-            if !before_route(&xp, &voice, &config, &base_url, &collective, &ends).await {
+            if !before_route(&xp, &voice, &config, &base_url, &collective, &ends, &generation).await {
                 return false;
             }
             fly(
@@ -1605,16 +1598,13 @@ pub fn start(
                 base_url.clone(),
                 collective,
                 route,
-                generation,
+                &generation,
             )
             .await
         });
-        // A retired run must not clear a newer route's flag. That race ran
-        // two copies through the hover-to-cruise handoff, where one treated
-        // the other's expected hover release as an external handover.
-        if GENERATION.load(Ordering::SeqCst) == generation {
-            ACTIVE.store(false, Ordering::SeqCst);
-        }
+        // The route is over: its flag drops now (the slot's rule keeps a
+        // retired run off a newer route's), the taxi-in below still to run.
+        generation.lower_flag();
         // Down on a helipad: that is where the flight ends, shut down. A
         // pad landing is never lifted again to taxi: at LILO the helicopter
         // rose off H1 unannounced for a stand and the pilot stopped it
@@ -1724,6 +1714,7 @@ async fn before_route(
     base_url: &str,
     collective: &str,
     ends: &Ends,
+    run: &sim::run::Lease<'_>,
 ) -> bool {
     use crate::tools::Tool;
     if let Some(start) = &ends.start {
@@ -1772,7 +1763,7 @@ async fn before_route(
         // Hovering at the height and still: the route starts from there.
         for _ in 0..240 {
             tokio::time::sleep(TICK).await;
-            if !ACTIVE.load(Ordering::SeqCst) || !hover::ACTIVE.load(Ordering::SeqCst) {
+            if !run.live() || !hover::ACTIVE.load(Ordering::SeqCst) {
                 return false;
             }
             if let Some(s) = read(xp).await {
@@ -1797,7 +1788,7 @@ async fn fly(
     base_url: String,
     collective: String,
     mut route: Route,
-    generation: u64,
+    generation: &sim::run::Lease<'_>,
 ) -> bool {
     let _detail = crate::auto_status::DetailGuard::hold(&DETAIL);
     let _sortie = crate::full_auto::SortieGuard::begin(
@@ -1967,7 +1958,7 @@ async fn fly(
         say(&voice, Priority::Readback, "Final for the pad.");
         tokio::time::sleep(Duration::from_millis(1500)).await;
     }
-    while ACTIVE.load(Ordering::SeqCst) && GENERATION.load(Ordering::SeqCst) == generation {
+    while generation.live() {
         tokio::time::sleep(TICK).await;
         if crate::xplane::sim_frozen(&xp).await {
             last = std::time::Instant::now();

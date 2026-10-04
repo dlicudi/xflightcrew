@@ -9,9 +9,9 @@
 //!
 //! SAFETY: the control law is deliberately gentle (low gains, rate-damped, hard
 //! clamped) — it needs in-sim tuning and should be tested with altitude to spare.
-//! The pilot takes it back instantly with "my controls" (sets [`ABORT`]).
+//! The pilot takes it back instantly with "my controls" (cancels its run, [`RUN`]).
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -64,13 +64,15 @@ const RECOVERY_THROTTLE: f64 = 0.95;
 /// Above this stall-warning ratio, treat it as stalling and unstall first.
 const STALL_TRIP: f64 = 0.15;
 
-/// Set true by "my controls" to hand the aircraft straight back to the pilot.
-pub static ABORT: AtomicBool = AtomicBool::new(false);
 /// True while a recovery is actively flying — so "my controls" can acknowledge it
 /// ("you have the aircraft") rather than fall through to the AP-off readback.
+/// Written only by the run ([`RUN`]).
 pub static ACTIVE: AtomicBool = AtomicBool::new(false);
-/// Bumped each recovery so a superseding one (or an abort) stands the old down.
-static GEN: AtomicU64 = AtomicU64::new(0);
+/// The recovery's run: claimed by the tool and by a crew loop's take-over
+/// (refused while one flies), cancelled by "my controls" and a stand-down.
+/// A recovery started while a cancelled one still winds down supersedes it,
+/// and the old one can no longer write or clear the new one's flag.
+pub(crate) static RUN: sim::run::Slot = sim::run::Slot::flagged(&ACTIVE);
 
 /// The live state the control law reacts to.
 #[derive(Clone, Copy, Debug)]
@@ -223,15 +225,15 @@ impl Tool for Recover {
         // ~100 ms in, leaving the live recovery writing yoke ratios the sim
         // re-drove from the pilot's hardware every frame: an inert recovery
         // in an actual upset, reported as flown.
-        if ACTIVE.load(Ordering::SeqCst) {
+        let Some(lease) = RUN.claim() else {
             return Ok(
                 "I'm already recovering — I have the aircraft. Say my controls to take it back."
                     .to_string(),
             );
-        }
-        ABORT.store(false, Ordering::SeqCst);
+        };
         // Hold ~1.3 x Vs during the recovery; a sane floor if Vs is unknown.
         run_recovery(
+            lease,
             ctx.config.xplane_base_url.clone(),
             self.cfg.fd_commands.clone(),
             self.prop.clone(),
@@ -299,10 +301,9 @@ pub struct TakeOver {
 /// hand flown level until "my controls". `false` when a recovery is already
 /// flying (it keeps the aircraft).
 pub fn take_over(base: String, voice: Option<Voice>, t: TakeOver) -> bool {
-    if ACTIVE.load(Ordering::SeqCst) {
+    let Some(lease) = RUN.claim() else {
         return false;
-    }
-    ABORT.store(false, Ordering::SeqCst);
+    };
     let min_safe_ias = t
         .min_safe_ias
         .or_else(crate::aircraft::speed_floor_kts)
@@ -314,6 +315,7 @@ pub fn take_over(base: String, voice: Option<Voice>, t: TakeOver) -> bool {
                "hold_kts": t.hold_kts, "ap_no_pitch": t.ap_no_pitch, "hold_ft": t.hold_ft}),
     );
     run_recovery(
+        lease,
         base,
         Vec::new(),
         None,
@@ -617,9 +619,11 @@ fn say(voice: &Option<Voice>, status: &Option<crate::plugin_status::StatusSink>,
 /// Own thread + runtime + client (like the AP capture watcher): drive the controls
 /// in a tight loop until stable, then hand to the autopilot and WATCH that it
 /// holds; one that does not is taken back and the aircraft hand flown level
-/// until "my controls". Releases immediately on [`ABORT`] ("my controls").
+/// until "my controls". Releases immediately when its run is cancelled ("my
+/// controls", a stand-down) or superseded.
 /// No deadline lets go of an unrecovered aircraft (#181).
 fn run_recovery(
+    lease: sim::run::Lease<'static>,
     base: String,
     fd_commands: Vec<String>,
     prop: Option<crate::aircraft::PropProfile>,
@@ -628,16 +632,14 @@ fn run_recovery(
     status: Option<crate::plugin_status::StatusSink>,
     handback: Handback,
 ) {
-    let my_gen = GEN.fetch_add(1, Ordering::SeqCst) + 1;
-    ACTIVE.store(true, Ordering::SeqCst);
     std::thread::spawn(move || {
         let Ok(rt) = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
         else {
-            ACTIVE.store(false, Ordering::SeqCst);
             return;
         };
+        let lease = &lease;
         rt.block_on(async move {
             let base_url = base.clone();
             let xp = XPlaneClient::new(base);
@@ -645,7 +647,7 @@ fn run_recovery(
             // the sim's load gate returns into the next flight (#181: a
             // tick in flight when the setup began wrote the column 6 s into
             // the new approach, t 1790651450).
-            let live = || may_write(my_gen);
+            let live = || may_write(lease);
             // The servos out FIRST: an engaged servo writes the column back
             // over ours, and the autopilot holds the nose up into a stall.
             let servos_after = servos_out(&xp).await;
@@ -768,10 +770,10 @@ fn run_recovery(
                 // If the pilot took it back, let go and don't grab it again
                 // via the AP.
                 if !live() {
-                    stood_down(my_gen);
+                    stood_down(lease);
                     release_controls(&xp, plugin).await;
                     crate::autoland::set_panel("");
-                    finish(my_gen);
+                    finish(lease);
                     return;
                 }
 
@@ -783,9 +785,9 @@ fn run_recovery(
                 // let go first: the servo takes the elevator.
                 release_controls(&xp, plugin).await;
                 if !live() {
-                    stood_down(my_gen);
+                    stood_down(lease);
                     crate::autoland::set_panel("");
-                    finish(my_gen);
+                    finish(lease);
                     return;
                 }
                 for c in &fd_commands {
@@ -843,15 +845,15 @@ fn run_recovery(
                     }
                 }
                 if !live() {
-                    stood_down(my_gen);
+                    stood_down(lease);
                     crate::autoland::set_panel("");
-                    finish(my_gen);
+                    finish(lease);
                     return;
                 }
 
                 if holding {
                     crate::autoland::set_panel("");
-                    finish(my_gen);
+                    finish(lease);
                     if let Some(kts) = handback.hold_kts {
                         crate::tools::speedhold::arm_flight(base_url.clone(), voice.clone(), kts);
                     }
@@ -925,37 +927,36 @@ fn run_recovery(
                     let _ = xp.set_float(&throttle_dref(), t).await;
                 }
             }
-            stood_down(my_gen);
+            stood_down(lease);
             release_controls(&xp, plugin).await;
             crate::autoland::set_panel("");
-            finish(my_gen);
+            finish(lease);
         });
     });
 }
 
-/// May the recovery of generation `my_gen` still write? Not after "my
-/// controls" or a stand-down ([`ABORT`]), a newer recovery, or while the sim
+/// May this recovery still write? Not after "my controls" or a stand-down
+/// (its run cancelled), once a newer recovery took the run, or while the sim
 /// loads a new flight (`xplane::sim_loading`): a new flight is never this
 /// recovery's.
-fn may_write(my_gen: u64) -> bool {
+fn may_write(lease: &sim::run::Lease<'_>) -> bool {
     recovery_live(
-        GEN.load(Ordering::SeqCst),
-        my_gen,
-        ABORT.load(Ordering::SeqCst),
+        lease.current(),
+        lease.cancel.load(Ordering::SeqCst),
         crate::xplane::sim_loading(),
     )
 }
 
 /// [`may_write`]'s rule. Pure.
-pub fn recovery_live(gen: u64, my_gen: u64, aborted: bool, loading: bool) -> bool {
-    gen == my_gen && !aborted && !loading
+pub fn recovery_live(current: bool, aborted: bool, loading: bool) -> bool {
+    current && !aborted && !loading
 }
 
 /// Why a recovery let go, on the tape (blackbox `recover` `stood_down`).
-fn stood_down(my_gen: u64) {
-    let why = if GEN.load(Ordering::SeqCst) != my_gen {
+fn stood_down(lease: &sim::run::Lease<'_>) {
+    let why = if !lease.current() {
         "superseded"
-    } else if ABORT.load(Ordering::SeqCst) {
+    } else if lease.cancel.load(Ordering::SeqCst) {
         "abort"
     } else if crate::xplane::sim_loading() {
         "new_flight"
@@ -965,12 +966,10 @@ fn stood_down(my_gen: u64) {
     crate::blackbox::record("recover", json!({"event": "stood_down", "why": why}));
 }
 
-/// The flag is this recovery's to drop only while it is the live one: a
-/// superseded run must not clear its successor's.
-fn finish(my_gen: u64) {
-    if GEN.load(Ordering::SeqCst) == my_gen {
-        ACTIVE.store(false, Ordering::SeqCst);
-    }
+/// The recovery is over (its lease drops the rest with the thread): the
+/// flag goes now, and only while this is the live run (the slot's rule).
+fn finish(lease: &sim::run::Lease<'_>) {
+    lease.lower_flag();
 }
 
 /// Signal an active recovery to release the controls immediately ("my controls").
@@ -978,8 +977,7 @@ fn finish(my_gen: u64) {
 /// ("you have the aircraft") instead of the plain AP-off readback. Safe to call
 /// when none is running.
 pub fn abort() -> bool {
-    ABORT.store(true, Ordering::SeqCst);
-    ACTIVE.swap(false, Ordering::SeqCst)
+    RUN.cancel()
 }
 
 #[cfg(test)]
@@ -1157,10 +1155,10 @@ mod tests {
     /// stand-down, not once superseded, never while a new flight loads.
     #[test]
     fn a_recovery_never_writes_into_the_next_flight() {
-        assert!(recovery_live(3, 3, false, false));
-        assert!(!recovery_live(3, 3, true, false), "aborted");
-        assert!(!recovery_live(4, 3, false, false), "superseded");
-        assert!(!recovery_live(3, 3, false, true), "a new flight loading");
+        assert!(recovery_live(true, false, false));
+        assert!(!recovery_live(true, true, false), "aborted");
+        assert!(!recovery_live(false, false, false), "superseded");
+        assert!(!recovery_live(true, false, true), "a new flight loading");
     }
 
     /// Every streaming write in the recovery's loops asks first, on the line

@@ -222,11 +222,13 @@
             .unwrap();
         let cancel = body.find("if xp.cancelled() {").unwrap();
         let dropped = body.find("drop_handed_down();").unwrap();
-        let active = body.find("ACTIVE.store(true").unwrap();
+        let armed = body.find("arm_gate()").unwrap();
         assert!(
-            cancel < dropped && dropped < active,
+            cancel < dropped && dropped < armed,
             "dropped on the cancelled return"
         );
+        // The flag rises when the run is taken over (`RUN`, flagged).
+        let active = body.find("RUN.take_over()").unwrap();
         let cleared = body.find("*TRACKING_ERROR.lock()").unwrap();
         assert!(
             cleared < active,

@@ -794,7 +794,7 @@ mod tests {
         let at = src.find("if try_published_arrival(").unwrap();
         let rest = &src[at..];
         let launch = rest.find("crate::autoland::ABORT.store(false").unwrap();
-        let recheck = rest.find("if ABORT.load(Ordering::SeqCst)").unwrap();
+        let recheck = rest.find("if xp.cancelled()").unwrap();
         assert!(
             recheck < launch,
             "ABORT re-read before autoland's latch is cleared"

@@ -23,7 +23,11 @@ use crate::taxi_guide::{bearing, dist, Geo};
 use crate::voice::{Priority, Voice};
 use crate::xplane::XPlaneClient;
 
+/// The circuit is flying. Written only by the run ([`RUN`]).
 pub static ACTIVE: AtomicBool = AtomicBool::new(false);
+/// The circuit's run: claimed by [`start`], cancelled by [`abort`]; a
+/// circuit winding down cannot clear the flag of one started after it.
+pub(crate) static RUN: sim::run::Slot = sim::run::Slot::flagged(&ACTIVE);
 
 /// The panel's line: the leg and the metres to its corner.
 static DETAIL: crate::auto_status::Detail = crate::auto_status::Detail::new();
@@ -37,7 +41,7 @@ pub fn status() -> Option<String> {
 /// Stand the circuit down; the hover loop keeps whatever it was last given
 /// until its own door is used (the caller's).
 pub fn abort() {
-    ACTIVE.store(false, Ordering::SeqCst);
+    RUN.cancel();
 }
 
 /// The circuit's numbers. Speeds and heights the hover mode has been flown
@@ -135,19 +139,17 @@ pub fn final_command(d_m: f64) -> (f64, f64) {
 
 /// Start a circuit from the hover the loop is holding.
 pub fn start(voice: Option<Voice>, base_url: String, right: bool) {
-    if ACTIVE.swap(true, Ordering::SeqCst) {
+    let Some(run) = RUN.claim() else {
         return;
-    }
+    };
     std::thread::spawn(move || {
         let Ok(rt) = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
         else {
-            ACTIVE.store(false, Ordering::SeqCst);
             return;
         };
-        rt.block_on(fly(XPlaneClient::new(base_url), voice, right));
-        ACTIVE.store(false, Ordering::SeqCst);
+        rt.block_on(fly(XPlaneClient::new(base_url), voice, right, &run));
     });
 }
 
@@ -157,7 +159,7 @@ fn say(voice: &Option<Voice>, p: Priority, text: impl Into<String>) {
     }
 }
 
-async fn fly(xp: XPlaneClient, voice: Option<Voice>, right: bool) {
+async fn fly(xp: XPlaneClient, voice: Option<Voice>, right: bool, run: &sim::run::Lease<'_>) {
     use crate::datarefs::{LATITUDE, LONGITUDE};
     let (lat, lon, psi) = tokio::join!(
         xp.get_float(LATITUDE),
@@ -182,7 +184,7 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, right: bool) {
     let _detail = crate::auto_status::DetailGuard::hold(&DETAIL);
     let mut leg = 0usize;
     let mut tick_n = 0u64;
-    while ACTIVE.load(Ordering::SeqCst) {
+    while run.live() {
         tokio::time::sleep(TICK).await;
         if crate::xplane::sim_frozen(&xp).await {
             continue;
