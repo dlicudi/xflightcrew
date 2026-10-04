@@ -1209,6 +1209,15 @@ pub static VACATE_FOLLOWS: AtomicBool = AtomicBool::new(false);
 /// clearing the runway more urgent, not less.
 static LANDED_RUNWAY: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
 
+/// A new flight forgets the last one's landing: the runway it rolled out on
+/// (a hand-landed 31 after a reposition onto the same strip vacated as the
+/// old 13) and its tracking (`flight_state::forget_flight`).
+pub(crate) fn forget_flight() {
+    *LANDED_RUNWAY.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    *TRACKING_ERROR.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    drop_handed_down();
+}
+
 /// The runway the last autoland rolled out on, if it has not been consumed.
 pub fn landed_runway() -> Option<String> {
     LANDED_RUNWAY
@@ -1815,7 +1824,16 @@ fn spawn_autoland(launch: AutolandLaunch) {
             // watch in the tick).
             let base_url = base.clone();
             let xp = XPlaneClient::new(base).with_parents(parents);
-            if xp.cancelled() { return; }
+            if xp.cancelled() {
+                // A cancelled launch takes what was handed down for it with
+                // it: the next arm, perhaps another flight's instrument
+                // approach, must not fly a circuit's visual gate or path.
+                drop_handed_down();
+                return;
+            }
+            // The last approach's tracking is unreadable once ACTIVE is set
+            // again, so it goes before the flag, not at the first tick.
+            *TRACKING_ERROR.lock().unwrap_or_else(|e| e.into_inner()) = None;
             ACTIVE.store(true, Ordering::SeqCst);
             LANDING_CONFIGURED.store(false, Ordering::SeqCst);
             let announce = |line: String, sev: Priority| {
@@ -5192,6 +5210,12 @@ pub fn set_next_glidepath_deg(deg: Option<f64>) {
 /// (#182): flown at its angle, but not a valley ([`published_steep`]).
 pub fn set_next_circuit_glidepath_deg(deg: Option<f64>) {
     next_glidepath(Some(deg.map(|d| (d, false))));
+}
+
+/// Drop the gate and angle handed down for an arm that never flew.
+fn drop_handed_down() {
+    let _ = arm_gate();
+    let _ = next_glidepath(None);
 }
 
 /// Take the handed-down angle for this arm (3 without one), clamped.
@@ -13295,6 +13319,44 @@ mod approach_power_floor_tests {
         assert!(!super::published_steep());
         assert_eq!(super::arm_glidepath(), 3.0);
         assert!(!super::published_steep());
+    }
+
+    /// A circuit hands down its visual gate and steepened path, then the
+    /// launch is cancelled (a stand-down during the handoff): the spawn
+    /// returned before taking them, and the next arm, another flight's
+    /// instrument approach, flew a 500 ft gate on a circuit's angle. A
+    /// cancelled launch and a new flight drop them (source-pinned for the
+    /// spawn: the loop is not a plain test).
+    #[test]
+    fn a_launch_that_never_flew_hands_nothing_down() {
+        use crate::stable_approach::GateKind;
+        super::set_next_gate(GateKind::Visual);
+        super::set_next_circuit_glidepath_deg(Some(4.0));
+        super::drop_handed_down();
+        assert_eq!(super::arm_gate(), GateKind::Instrument);
+        assert_eq!(super::arm_glidepath(), 3.0);
+        super::set_next_gate(GateKind::Visual);
+        super::forget_flight();
+        assert_eq!(super::arm_gate(), GateKind::Instrument);
+        assert_eq!(super::landed_runway(), None);
+
+        let src = include_str!("autoland.rs");
+        let body = src
+            .split("fn spawn_autoland(launch: AutolandLaunch)")
+            .nth(1)
+            .unwrap();
+        let cancel = body.find("if xp.cancelled() {").unwrap();
+        let dropped = body.find("drop_handed_down();").unwrap();
+        let active = body.find("ACTIVE.store(true").unwrap();
+        assert!(
+            cancel < dropped && dropped < active,
+            "dropped on the cancelled return"
+        );
+        let cleared = body.find("*TRACKING_ERROR.lock()").unwrap();
+        assert!(
+            cleared < active,
+            "the last tracking goes before ACTIVE is set"
+        );
     }
 
     /// The same sortie's other half: the steep branch's missed approach that
