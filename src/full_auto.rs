@@ -446,19 +446,6 @@ async fn light(tools: &SubTools, ctx: &ToolCtx<'_>, key: &str, on: bool) -> bool
         .is_ok()
 }
 
-/// Above this a hand-back stops the aircraft on MAXIMUM braking (a rollout, a
-/// takeoff roll), below it on the regular effort (taxi speeds). It used to be
-/// the fastest a hand-back braked at all, "the loop that owns the speed does
-/// the stopping": at LEMG 13 (2026-09-28, sortie 1790627884-full_auto) no
-/// loop owned it after the pilot's reject, and the 737 rolled 70 to 52 kt for
-/// two minutes with nobody braking.
-const HAND_BACK_BRAKE_MAX_KTS: f64 = 25.0;
-/// A pilot's own toe brake past this (either pedal) owns a fast stop: the
-/// held brake commands ride the parking-brake ratio, never the toe ratios.
-const PILOT_TOE_BRAKE: f64 = 0.3;
-const TOE_BRAKE_L: &str = "sim/cockpit2/controls/left_brake_ratio";
-const TOE_BRAKE_R: &str = "sim/cockpit2/controls/right_brake_ratio";
-
 /// A mission's sortie in the blackbox: begun at the mission's start, ended
 /// by `give_up` ("gave_up") or, on any other exit, when this drops ("ended").
 pub struct SortieGuard;
@@ -533,177 +520,24 @@ fn hand_back_line(line: &str, held: Option<bool>) -> String {
     }
 }
 
-/// Stopped, for the hand-back: under this the parking brake goes on.
-const HAND_BACK_STOPPED_KTS: f64 = sim::ground::STOPPED_KTS;
-/// The longest the hand-back brakes toward a stop before the parking brake
-/// goes on anyway (the governor's taxi speeds stop in a few seconds).
-const HAND_BACK_STOP_S: f64 = 15.0;
-/// One wheel-brake pulse per this long while stopping, inside the held
-/// command's own expiry so the squeeze is continuous.
-const HAND_BACK_TICK_MS: u64 = 400;
-/// From the last held-brake pulse to a parking brake that can stick: the
-/// hold itself plus the ratio's measured decay (~0.8 s) and slack, the same
-/// margin as `tools::brake_cmd_quiet`.
-const HAND_BACK_BRAKE_TAIL_S: f64 = crate::tools::BRAKE_HOLD_SECS + 1.0;
-
 /// ...and on the ground it means the aircraft is STOPPED and the PARKING
-/// BRAKE holds it, not a control loop of ours and not nothing.
-///
-/// A taxi that reaches its holding point stops there with the governor still
-/// running, target zero, squeezing the wheel brakes. That is deliberate, so
-/// the next "go" is instant, and the line it says is "holding position, brakes
-/// set" - but nothing ever turned it into a real parking brake when the
-/// MISSION ended. At Le Bourget the line-up refused, full auto said "your
-/// aircraft", and the governor went on holding the 737 for twenty-seven
-/// minutes: 3,736 more ticks of Web API load the sim did not get, `park` still
-/// 0.0 in every state record, and a proportional brake squeeze the pilot
-/// cannot find or release (the governor's own exit path says exactly that).
-///
-/// It used to act only while the TAXI governor was holding us, and that is
-/// the gate LEMG went through (2026-09-28, sortie 1790586620): the pilot's
-/// "my controls" stopped the governor, the give-up came 0.6 s later with
-/// nothing of ours holding the 737, and it was left rolling at 4.9 kt, then
-/// 5.8 kt and rising, `parking_brake_ratio` 0.0, with "your aircraft" said
-/// over it. Now any end of the mission on the ground brakes to a stop on the
-/// wheel brakes (the pilot's own held brake key, which expires by itself;
-/// maximum effort above [`HAND_BACK_BRAKE_MAX_KTS`]) and then sets the
-/// parking brake, read back. Airborne, a pilot already on the toe brakes at
-/// speed, a tug on the bar, or a speed we could not read: nothing, and the
-/// reason is blackboxed.
+/// BRAKE holds it, not a control loop of ours and not nothing: the one
+/// stop-and-park, [`crate::tools::controls::hand_back_hold`].
 async fn hand_back_brakes(xp: &XPlaneClient, valve_set: Option<f64>) -> Option<bool> {
     // Unscoped: the give-up has already cancelled this mission's client.
     let free = xp.unscoped();
-    hand_back_hold(&free, valve_set).await
+    hand_back_hold(&free, valve_set, HAND_BACK).await
 }
 
-/// A pilot is standing on the toe brakes: either read past
-/// [`PILOT_TOE_BRAKE`]. An unread pedal is no foot. Pure.
-fn pilot_on_the_brakes(left: Option<f64>, right: Option<f64>) -> bool {
-    [left, right]
-        .iter()
-        .any(|v| v.is_some_and(|x| x.is_finite() && x > PILOT_TOE_BRAKE))
-}
-
-/// How long the hand-back brakes toward a stop from `from_kts`: the taxi
-/// budget, or longer from a rollout's speed (maximum braking stops a 737
-/// from 90 kt in about 8 s; the rest is margin). Pure.
-fn hand_back_stop_s(from_kts: f64) -> f64 {
-    HAND_BACK_STOP_S.max(from_kts * 0.6)
-}
-
-/// [`hand_back_brakes`] against any sim, so the gates and the stop are a
-/// plain `cargo test`. `Some(held)` when it was a ground hand-back.
-pub(crate) async fn hand_back_hold(
-    xp: &dyn crate::xplane::XPlane,
-    valve_set: Option<f64>,
-) -> Option<bool> {
-    let skipped = |why: &str, kts: Option<f64>| {
-        crate::blackbox::record(
-            "full_auto",
-            json!({ "stage": "hand_back_skipped", "detail": { "why": why, "gs_kts": kts } }),
-        );
-        None
-    };
-    let (ground, gs, tug) = tokio::join!(
-        xp.get_float(crate::datarefs::ON_GROUND_ANY),
-        xp.get_float(crate::autotaxi::GS_MS),
-        xp.get_float(crate::autotaxi::TUG_ATTACHED),
-    );
-    if !matches!(ground, Ok(g) if g > 0.5) {
-        return skipped("not_on_ground", None);
-    }
-    // A failed read is no measurement, and a parking brake is not a brake to
-    // set at a speed we could not confirm.
-    let Some(from_kts) = gs
-        .ok()
-        .filter(|v| v.is_finite())
-        .map(|v| v.abs() * MS_TO_KTS)
-    else {
-        return skipped("no_groundspeed", None);
-    };
-    // Fast is no longer a reason to let go: nobody else is stopping it. A
-    // pilot already standing on the toe brakes is; only then is it theirs.
-    if from_kts >= HAND_BACK_BRAKE_MAX_KTS {
-        let (l, r) = tokio::join!(xp.get_float(TOE_BRAKE_L), xp.get_float(TOE_BRAKE_R));
-        if pilot_on_the_brakes(l.ok(), r.ok()) {
-            return skipped("pilot_braking", Some(from_kts));
-        }
-    }
-    // A tug on the bar owns the aircraft: brakes against it are a fight.
-    if tug.is_ok_and(|t| t > 0.5) {
-        return skipped("tug_attached", Some(from_kts));
-    }
-    // Stop on the wheel brakes first: a parking brake is a chock.
-    let t0 = tokio::time::Instant::now();
-    let mut kts = from_kts;
-    let mut pulses = 0u32;
-    // A brake command another loop issued just before us (the governor's
-    // stop channel) rides the same ratio: counted as a pulse at the start.
-    let mut last_pulse = (!crate::tools::brake_cmd_quiet()).then_some(t0);
-    let stop_s = hand_back_stop_s(from_kts);
-    while kts >= HAND_BACK_STOPPED_KTS && t0.elapsed().as_secs_f64() < stop_s {
-        // Maximum effort from a rollout's speed, the regular one at a taxi's.
-        let effort = if kts >= HAND_BACK_BRAKE_MAX_KTS {
-            crate::autotakeoff::BRAKES_MAX
-        } else {
-            crate::tools::BRAKES_REGULAR
-        };
-        crate::tools::note_brake_cmd();
-        if xp
-            .run_command_for(effort, crate::tools::BRAKE_HOLD_SECS)
-            .await
-            .is_ok()
-        {
-            crate::tools::note_brake_cmd();
-            pulses += 1;
-            last_pulse = Some(tokio::time::Instant::now());
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(HAND_BACK_TICK_MS)).await;
-        match xp.get_float(crate::autotaxi::GS_MS).await {
-            Ok(v) if v.is_finite() => kts = v.abs() * MS_TO_KTS,
-            // Unread: the parking brake below is still owed, not skipped.
-            _ => break,
-        }
-    }
-    let stopped = kts < HAND_BACK_STOPPED_KTS;
-    // The held brake command RIDES `parking_brake_ratio` while it is active
-    // and the sim decays it for ~0.8 s after expiry (`tools::brake_cmd_quiet`),
-    // so a parking brake set inside that window is written over. LEMG
-    // 2026-09-28 (sortie 1790605551, SR22): three pulses from 4.2 kt, then all
-    // three tries inside 1.6 s of the last one, `park` read back 0.294 (the
-    // regular effort decaying) and "the parking brake didn't set"; the 737
-    // and the later SR22 held only on their SECOND try, the one that landed
-    // after the tail. Stopped, the aircraft waits out the tail first.
-    if let Some(at) = last_pulse {
-        let quiet_at = at + std::time::Duration::from_secs_f64(HAND_BACK_BRAKE_TAIL_S);
-        tokio::time::sleep_until(quiet_at).await;
-    }
-    // Tried three times, and the failure KEPT: at LIPK (2026-09-26) one
-    // attempt read back unset with its error swallowed, and the governor
-    // went on squeezing a 172 on its wheel brakes for fifteen minutes (the
-    // pilot has no toe-brake axis to release them). The same command, sent
-    // by hand afterwards, set at once.
-    let crate::tools::controls::ParkBrakeSet {
-        held,
-        tries,
-        err,
-        park,
-    } = crate::tools::controls::set_park_brake_confirmed(xp, valve_set, 3).await;
-    if !held {
-        tracing::warn!(?err, "full auto: the parking brake did not set at the hand-back");
-    }
-    // Recorded, not `event`: the mission is over, so this must not reappear as
-    // a stage on the panel the moment `clear_stage` has run.
-    crate::blackbox::record(
-        "full_auto",
-        json!({ "stage": "hand_back_brakes",
-                "detail": { "held": held, "tries": tries, "err": err, "park": park,
-                            "from_kts": (from_kts * 10.0).round() / 10.0,
-                            "stopped": stopped, "brake_pulses": pulses,
-                            "secs": (t0.elapsed().as_secs_f64() * 10.0).round() / 10.0 } }),
-    );
-    Some(held)
-}
+/// The one stop-and-park lives beside the parking brake's seam now; the
+/// mission's name for it stays.
+pub(crate) use crate::tools::controls::{hand_back_hold, HoldFor};
+/// The mission's hand-back: a tug or an unread speed lets go.
+const HAND_BACK: HoldFor = HoldFor::by("full_auto");
+#[cfg(test)]
+use crate::tools::controls::{
+    pilot_on_the_brakes, HAND_BACK_STOPPED_KTS, TOE_BRAKE_L, TOE_BRAKE_R,
+};
 
 /// The squawk still to dial: the tower's assigned code when the transponder
 /// does not already show it. `None` when nothing was assigned or it is set.
@@ -8052,7 +7886,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_give_up_rolling_on_the_taxiway_stops_and_parks_the_aircraft() {
         let jet = TaxiingJet::rolling_at_kts(4.9);
-        let held = super::hand_back_hold(&jet, Some(1.0)).await;
+        let held = super::hand_back_hold(&jet, Some(1.0), super::HAND_BACK).await;
         assert_eq!(held, Some(true), "the parking brake reads set");
         assert!(
             jet.sim.ran(crate::tools::BRAKES_REGULAR),
@@ -8080,7 +7914,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_fast_hand_back_on_the_ground_is_braked_to_a_stop() {
         let jet = TaxiingJet::rolling_at_kts(70.0);
-        let held = super::hand_back_hold(&jet, Some(1.0)).await;
+        let held = super::hand_back_hold(&jet, Some(1.0), super::HAND_BACK).await;
         assert_eq!(held, Some(true), "the parking brake reads set");
         assert!(jet.sim.ran(crate::autotakeoff::BRAKES_MAX), "maximum effort while fast");
         assert!(jet.sim.ran(crate::tools::BRAKES_REGULAR), "the regular effort once slow");
@@ -8223,7 +8057,7 @@ mod tests {
             (PARK, 0.0),
         ]);
         xp.step_on_command(SET, PARK, 1.0);
-        assert_eq!(hand_back_hold(&xp, Some(1.0)).await, Some(true));
+        assert_eq!(hand_back_hold(&xp, Some(1.0), super::HAND_BACK).await, Some(true));
         assert!(xp.ran(SET), "the parking brake is set");
         assert!(!xp.ran(crate::tools::BRAKES_REGULAR), "already stopped");
 
@@ -8234,7 +8068,7 @@ mod tests {
             (crate::autotaxi::GS_MS, 90.0),
             (PARK, 0.0),
         ]);
-        assert_eq!(hand_back_hold(&air, Some(1.0)).await, None);
+        assert_eq!(hand_back_hold(&air, Some(1.0), super::HAND_BACK).await, None);
         assert!(!air.ran(SET), "no park brake in the air");
         assert!(!air.ran(crate::tools::BRAKES_REGULAR), "no brakes in the air");
 
@@ -8246,7 +8080,7 @@ mod tests {
             (super::TOE_BRAKE_R, 0.8),
             (PARK, 0.0),
         ]);
-        assert_eq!(hand_back_hold(&braking, Some(1.0)).await, None);
+        assert_eq!(hand_back_hold(&braking, Some(1.0), super::HAND_BACK).await, None);
         assert!(!braking.ran(SET), "the pilot is stopping it");
         assert!(!braking.ran(crate::autotakeoff::BRAKES_MAX), "no fight on the pedals");
 
@@ -8257,12 +8091,12 @@ mod tests {
             (crate::autotaxi::TUG_ATTACHED, 1.0),
             (PARK, 0.0),
         ]);
-        assert_eq!(hand_back_hold(&tug, Some(1.0)).await, None);
+        assert_eq!(hand_back_hold(&tug, Some(1.0), super::HAND_BACK).await, None);
         assert!(!tug.ran(SET) && !tug.ran(crate::tools::BRAKES_REGULAR));
 
         // A failed groundspeed read is NO measurement, never an assumed zero.
         let blind = FakeXPlane::with_reads(&[(crate::datarefs::ON_GROUND_ANY, 1.0), (PARK, 0.0)]);
-        assert_eq!(hand_back_hold(&blind, Some(1.0)).await, None);
+        assert_eq!(hand_back_hold(&blind, Some(1.0), super::HAND_BACK).await, None);
         assert!(!blind.ran(SET), "a speed we could not read is not a stop");
 
         // A brake that never reads set is said, never claimed.
@@ -8271,7 +8105,51 @@ mod tests {
             (crate::autotaxi::GS_MS, 0.0),
             (PARK, 0.0),
         ]);
-        assert_eq!(hand_back_hold(&stuck, Some(1.0)).await, Some(false));
+        assert_eq!(hand_back_hold(&stuck, Some(1.0), super::HAND_BACK).await, Some(false));
+    }
+
+    /// The callers that know more (refactor audit 2026-10-04, duplicates
+    /// #8): the push's stop brakes with the tug on the bar it has just told
+    /// to stop, and the taxi-in, the rollout and the push fail closed on an
+    /// unread speed or ground flag, braking at maximum effort and parking,
+    /// where a hand-back lets go. Airborne is never a park, for anyone.
+    #[tokio::test(start_paused = true)]
+    async fn a_caller_that_knows_it_is_on_the_ground_fails_closed() {
+        use super::{hand_back_hold, HoldFor};
+        use crate::xplane::FakeXPlane;
+        const SET: &str = TaxiingJet::SET;
+        const PARK: &str = TaxiingJet::PARK;
+        let push = HoldFor::by("pushback").on_the_bar().fail_closed();
+        let taxi_in = HoldFor::by("taxi_in").fail_closed();
+
+        let tug = FakeXPlane::with_reads(&[
+            (crate::datarefs::ON_GROUND_ANY, 1.0),
+            (crate::datarefs::GROUNDSPEED_MS, 0.0),
+            (crate::autotaxi::TUG_ATTACHED, 1.0),
+            (PARK, 0.0),
+        ]);
+        tug.step_on_command(SET, PARK, 1.0);
+        assert_eq!(hand_back_hold(&tug, None, push).await, Some(true), "the push's stop");
+
+        let blind = FakeXPlane::with_reads(&[(crate::datarefs::ON_GROUND_ANY, 1.0), (PARK, 0.0)]);
+        blind.step_on_command(SET, PARK, 1.0);
+        assert_eq!(hand_back_hold(&blind, None, taxi_in).await, Some(true));
+        assert!(blind.ran(crate::autotakeoff::BRAKES_MAX), "an unread speed is braked hard");
+        assert!(blind.ran(SET), "and parked");
+
+        let no_ground =
+            FakeXPlane::with_reads(&[(crate::datarefs::GROUNDSPEED_MS, 0.0), (PARK, 0.0)]);
+        no_ground.step_on_command(SET, PARK, 1.0);
+        assert_eq!(hand_back_hold(&no_ground, None, taxi_in).await, Some(true));
+        assert_eq!(hand_back_hold(&no_ground, None, super::HAND_BACK).await, None);
+
+        let air = FakeXPlane::with_reads(&[
+            (crate::datarefs::ON_GROUND_ANY, 0.0),
+            (crate::datarefs::GROUNDSPEED_MS, 60.0),
+            (PARK, 0.0),
+        ]);
+        assert_eq!(hand_back_hold(&air, None, push).await, None);
+        assert!(!air.ran(SET), "never a parking brake in the air");
     }
 
     /// The SR22 at LEMG as the sim behaves: the held regular-brake command
@@ -8390,7 +8268,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn the_hand_back_parks_after_the_brake_command_lets_go_of_the_ratio() {
         let sr22 = RidingBrake::rolling_at_kts(4.2);
-        let held = super::hand_back_hold(&sr22, Some(1.0)).await;
+        let held = super::hand_back_hold(&sr22, Some(1.0), super::HAND_BACK).await;
         let pulses = sr22.sim.ran_count(crate::tools::BRAKES_REGULAR);
         assert_eq!(pulses, 3, "the record's three pulses");
         assert_eq!(held, Some(true), "the parking brake reads set");

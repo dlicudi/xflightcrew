@@ -2609,16 +2609,26 @@ fn spawn_autoland(launch: AutolandLaunch) {
                             xp.set_float(crate::autotaxi::RIGHT_BRAKE, 0.0),
                         );
                     }
+                    // The one stop-and-park (`hand_back_hold`): to under a
+                    // knot on the wheel brakes, the held command's tail, then
+                    // the parking brake read back. It set the parking brake
+                    // at 2 kt with no tail wait (refactor audit 2026-10-04,
+                    // duplicates #8). Fail closed: we are on the runway.
                     let valve = crate::aircraft::live_profile().and_then(|p| p.park_brake_valve_set);
-                    let set = crate::tools::controls::set_park_brake_confirmed(&xp, valve, 3).await;
+                    let held = crate::tools::controls::hand_back_hold(
+                        &xp,
+                        valve,
+                        crate::tools::controls::HoldFor::by("autoland").fail_closed(),
+                    )
+                    .await
+                    .unwrap_or(false);
                     crate::blackbox::record(
                         "autoland",
                         serde_json::json!({
-                            "event": "stopped_brakes", "held": set.held, "tries": set.tries,
-                            "park": set.park, "err": set.err, "valve_set": valve,
+                            "event": "stopped_brakes", "held": held, "valve_set": valve,
                         }),
                     );
-                    announce(stopped_line(set.held).into(), Priority::Warning);
+                    announce(stopped_line(held).into(), Priority::Warning);
                     break;
                 }
                 // Cross-track closure rate (nm/min, positive = drifting right),

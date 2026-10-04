@@ -1939,15 +1939,8 @@ async fn run_session(
                     tracing::info!("native pushback stop, pre-gate");
                     conversation.clear();
                     let _ = xplane.run_command(tools::ground::CMD_PUSH_STOP).await;
-                    let held = matches!(
-                        tools::controls::drive_park_brake(
-                            &xplane,
-                            true,
-                            profile.park_brake_valve_set,
-                        )
-                        .await,
-                        Ok(true)
-                    );
+                    let held =
+                        pushback::park_after_stop(&xplane, profile.park_brake_valve_set).await;
                     pushback::ACTIVE.store(false, std::sync::atomic::Ordering::SeqCst);
                     // The line from the read-back, never the attempt (#65).
                     say(

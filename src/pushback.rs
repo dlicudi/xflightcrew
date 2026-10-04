@@ -1642,13 +1642,28 @@ async fn answer_stop(
     stage: &str,
     pilot: bool,
 ) -> (bool, Option<&'static str>) {
-    let r = crate::tools::controls::set_park_brake_confirmed(xp, valve_set, 3).await;
-    event(
-        json!({ "event": "abort_brakes", "stage": stage, "held": r.held,
-                  "tries": r.tries, "park": r.park.map(|p| (p * 100.0).round() / 100.0),
-                  "err": r.err, "pilot_stop": pilot }),
-    );
-    (r.held, pilot.then(|| stop_line(r.held)))
+    let held = park_after_stop(xp, valve_set).await;
+    event(json!({ "event": "abort_brakes", "stage": stage, "held": held, "pilot_stop": pilot }));
+    (held, pilot.then(|| stop_line(held)))
+}
+
+/// A stopped push held: the one stop-and-park (`hand_back_hold`), so a push
+/// still rolling is braked to a stop before the parking brake, the held
+/// command's tail waited out, the brake read back. Both stops, the steered
+/// push's and the native one's in `main.rs`, set the parking brake at once
+/// at any speed (refactor audit 2026-10-04, duplicates #8). The tug has been
+/// told to stop, so the brakes go on with it on the bar; and we are on the
+/// ground, so an unread speed still parks (fail closed). `true` = it reads set.
+pub(crate) async fn park_after_stop(
+    xp: &dyn crate::xplane::XPlane,
+    valve_set: Option<f64>,
+) -> bool {
+    let hold = crate::tools::controls::HoldFor::by("pushback")
+        .on_the_bar()
+        .fail_closed();
+    crate::tools::controls::hand_back_hold(xp, valve_set, hold)
+        .await
+        .unwrap_or(false)
 }
 
 /// Every tug instruction goes through the SAME `pushback` tool the pilot's
