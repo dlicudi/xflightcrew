@@ -5,7 +5,7 @@
 # flights, kept verbatim including whisper's mangling), plus hand-written
 # paraphrases and corruptions in whisper's real failure modes (homophones,
 # dropped words, merged words). Run by `transcript_corpus_parses_safely` in
-# src/station.rs on every `cargo test`.
+# src/station/tests.rs on every `cargo test`.
 #
 # Fields per case:
 #   text      what whisper handed the router (case-insensitive)
