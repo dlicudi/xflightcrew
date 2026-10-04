@@ -109,6 +109,8 @@ pub struct ApConfig {
     /// airframe's reference figures; falls back to the GA default.
     pub service_ceiling_ft: f64,
     pub flare_power: Option<crate::aircraft::FlarePowerProfile>,
+    /// The airframe's climb numbers for a pilot's "climb to X".
+    pub climb: ClimbPerf,
 }
 
 impl Default for ApConfig {
@@ -118,7 +120,124 @@ impl Default for ApConfig {
             ac_powered: false,
             service_ceiling_ft: DEFAULT_SERVICE_CEILING_FT,
             flare_power: None,
+            climb: ClimbPerf::default(),
         }
+    }
+}
+
+/// The airframe's own numbers for a pilot-commanded climb (refactor audit
+/// 2026-10-04, finding #3). The tool flew a Cessna's climb on every
+/// airframe: 700 fpm, eased only under a flat 60 kt and handed back to a
+/// flat 0.65 lever, so on a 737 or an A330 (clean stall 139 to 175 kt) the
+/// protection never fired, which is the #181 failure (166 kt to 73 at 9,600
+/// fpm) by another door. The defaults are the old GA figures, for an
+/// airframe that declares nothing.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ClimbPerf {
+    /// The most an auto-scaled climb asks, fpm: the profile's
+    /// `enroute_climb_fpm` (the follower's rate), else the GA 700.
+    pub max_climb_fpm: f64,
+    /// The speed the climb is flown at and gets its full rate at, kt: Vy.
+    pub vy_kts: Option<f64>,
+    /// The speed the climb fades to nothing at, kt: the circuit's climb
+    /// floor (`tools::circuit::climb_floor`: blue line, else the 1.2 Vs
+    /// automation floor). 0 = undeclared.
+    pub floor_kts: f64,
+    /// The speed a level-off hands the governor, kt: the profile's cruise.
+    pub cruise_ias_kts: Option<f64>,
+}
+
+impl Default for ClimbPerf {
+    fn default() -> Self {
+        Self {
+            max_climb_fpm: MAX_CLIMB_FPM,
+            vy_kts: None,
+            floor_kts: 0.0,
+            cruise_ias_kts: None,
+        }
+    }
+}
+
+impl ClimbPerf {
+    /// From the profile: the same numbers the circuit and the follower fly.
+    pub fn from_profile(p: &crate::aircraft::AircraftProfile) -> Self {
+        let r = p.reference.as_ref();
+        Self {
+            max_climb_fpm: r
+                .and_then(|r| r.enroute_climb_fpm)
+                .filter(|f| f.is_finite() && *f > 0.0)
+                .unwrap_or(MAX_CLIMB_FPM),
+            vy_kts: r.and_then(|r| r.vy_kts).filter(|v| v.is_finite() && *v > 0.0),
+            floor_kts: crate::tools::circuit::climb_floor(p),
+            cruise_ias_kts: r
+                .and_then(|r| r.cruise_ias_kts)
+                .filter(|v| v.is_finite() && *v > 0.0),
+        }
+    }
+
+    /// The floor the climb protection fades to: this airframe's, the live
+    /// automation floor (`aircraft::speed_floor_kts`) when it is higher,
+    /// and only with neither known the old GA 60 kt.
+    fn floor(&self, live_floor: Option<f64>) -> f64 {
+        let f = self.floor_kts.max(live_floor.unwrap_or(0.0));
+        if f > 0.0 {
+            f
+        } else {
+            CLIMB_MIN_KTS
+        }
+    }
+}
+
+/// The vertical speed a pilot's climb is flown at this tick: the circuit's
+/// own climb limiter (`circuit::climb_limit_fpm`, a projected airspeed
+/// fading the rate from the climb speed to the floor) over the commanded
+/// rate, rounded to the 100 fpm a VS wheel steps in. The full-rate speed is
+/// Vy, capped by the governor's target when one holds the speed
+/// (`circuit::climb_full_rate_kts`); with no Vy it is the floor plus the old
+/// 8 kt restore band. A 172 (floor 58, Vy 74) climbs at full rate down to
+/// Vy and at none at 58; it used to hold the rate to 60. Pure.
+fn protected_climb_fpm(
+    commanded_fpm: f64,
+    ias_kts: f64,
+    ias_trend_kts_s: f64,
+    perf: &ClimbPerf,
+    live_floor: Option<f64>,
+    governor_kts: Option<f64>,
+) -> f64 {
+    if commanded_fpm <= 0.0 {
+        return commanded_fpm;
+    }
+    let floor = perf.floor(live_floor);
+    let vy = perf.vy_kts.unwrap_or(floor + CLIMB_RESTORE_BAND_KTS);
+    let full =
+        crate::circuit::climb_full_rate_kts(governor_kts.unwrap_or(f64::INFINITY), vy, floor);
+    let fpm = crate::circuit::climb_limit_fpm(commanded_fpm, ias_kts, ias_trend_kts_s, full, floor);
+    ((fpm / VS_TRIM_FPM).round() * VS_TRIM_FPM).clamp(0.0, commanded_fpm)
+}
+
+/// What a level-off does with the power. Pure; the watcher and the level-off
+/// tool act on it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum LevelPower {
+    /// The governor already holds the speed: it owns the throttle.
+    Governor,
+    /// Hand the speed to the governor at the airframe's cruise speed (the
+    /// follower's and the takeoff handoff's way of settling).
+    ArmCruise(f64),
+    /// An airframe declaring no cruise speed: the old GA lever.
+    Lever(f64),
+}
+
+/// The level-off's power: never a flat 172 lever on an airframe that
+/// declares its cruise. The cruise speed is held under 250 kt below 10,000
+/// and over the automation floor (`speedhold::arm_flight` floors it). Pure.
+fn level_power(governor_kts: Option<f64>, cruise_ias_kts: Option<f64>, alt_ft: f64) -> LevelPower {
+    if governor_kts.is_some() {
+        return LevelPower::Governor;
+    }
+    match cruise_ias_kts {
+        Some(kts) => LevelPower::ArmCruise(crate::tools::speedhold::airspace_limited(alt_ft, kts)),
+        None => LevelPower::Lever(CRUISE_THROTTLE),
     }
 }
 
@@ -292,17 +411,20 @@ async fn engage_mode(ctx: &ToolCtx<'_>, status: &str, command: &str) -> Result<(
 /// both climb and descent; say an explicit rate ("climb to X at 700") for more.
 const DEFAULT_VS_FPM: f64 = 300.0;
 /// Max climb rate (fpm) the 172 sustains at full power without bleeding airspeed —
-/// the cap when auto-scaling the rate to the altitude change. (Per-airframe later.)
+/// the cap when auto-scaling the rate to the altitude change, for an airframe
+/// that declares no `enroute_climb_fpm` ([`ClimbPerf::max_climb_fpm`]).
 const MAX_CLIMB_FPM: f64 = 700.0;
 /// Max auto descent rate (fpm) commanded for an altitude change — gentle enough
 /// not to build speed toward Vne without active power management. (Per-airframe.)
 const MAX_DESCENT_FPM: f64 = 1000.0;
-/// During a climb the watcher protects airspeed: if IAS bleeds below this (kt),
-/// it reduces the commanded vertical speed (pitch down) so a too-steep climb can't
-/// stall — power's already at the firewall, so climb rate is the lever to trade.
-/// ~12 kt above the 172's clean stall; normal full-power climbs sit well above it.
+/// The climb protection's floor (kt) for an airframe that declares neither a
+/// clean stall nor a blue line ([`ClimbPerf::floor`]): ~12 kt above the 172's
+/// clean stall, the figure every airframe was held to before.
 const CLIMB_MIN_KTS: f64 = 60.0;
-/// How much to ease (or restore) the climb rate per check, fpm.
+/// With no Vy declared, the climb gets its full rate this far over the floor
+/// (the old restore threshold, 60 + 8).
+const CLIMB_RESTORE_BAND_KTS: f64 = 8.0;
+/// The step the climb protection's VS command moves in, fpm.
 const VS_TRIM_FPM: f64 = 100.0;
 /// Default service ceiling (ft MSL) when the airframe declares none — the 172's.
 /// Real airframes override it via their reference `service_ceiling_ft` (the C90B is
@@ -330,9 +452,9 @@ const CAPTURE_APPROACH_FT: f64 = 400.0;
 /// any change captures in roughly three minutes, floored at the gentle default so
 /// small steps aren't sluggish, and capped at the airframe's sustainable rate for
 /// the direction so a commanded climb never outruns the available power.
-fn auto_vs_fpm(delta_ft: f64, climb: bool) -> f64 {
+fn auto_vs_fpm(delta_ft: f64, climb: bool, max_climb_fpm: f64) -> f64 {
     let cap = if climb {
-        MAX_CLIMB_FPM
+        max_climb_fpm.max(DEFAULT_VS_FPM)
     } else {
         MAX_DESCENT_FPM
     };
@@ -442,7 +564,7 @@ async fn fly_to(
         // asked for; and the governor owns the throttle, so nothing firewalls.
         let fpm = rate
             .map(f64::abs)
-            .unwrap_or_else(|| auto_vs_fpm(diff, diff > 0.0))
+            .unwrap_or_else(|| auto_vs_fpm(diff, diff > 0.0, cfg.climb.max_climb_fpm))
             .min(crate::procedure::vs_clamp_fpm());
         tracing::info!(
             target: "xvoicelayer::autopilot",
@@ -457,10 +579,12 @@ async fn fly_to(
     for c in &cfg.fd_commands {
         ctx.xplane.run_command(c).await?;
     }
-    let (movement, signed, capture) = arm_altitude(ctx, altitude, rate).await?;
-    // A climb/descent needs the watcher to level us off (and ease a climb throttle);
-    // a hold is already done. The watcher calls out the level-off when it reaches
-    // the target, so hand it a voice clone.
+    let governor = crate::tools::speedhold::flight_target();
+    let (movement, signed, capture, firewalled) =
+        arm_altitude(ctx, altitude, rate, cfg.climb.max_climb_fpm, governor).await?;
+    // A climb/descent needs the watcher to level us off (and settle a climb's
+    // power); a hold is already done. The watcher calls out the level-off when
+    // it reaches the target, so hand it a voice clone.
     if let Some(was_climb) = capture {
         capture_at_altitude(
             ctx.config.xplane_base_url.clone(),
@@ -468,6 +592,7 @@ async fn fly_to(
             was_climb,
             ctx.voice.cloned(),
             ctx.status.cloned(),
+            cfg.climb.clone(),
         );
     }
 
@@ -486,25 +611,24 @@ async fn fly_to(
         target_alt = altitude,
         "fly_to latched"
     );
-    Ok((
-        movement,
-        signed.abs(),
-        servos_engaged(ctx).await?,
-        movement.starts_with("Climbing"),
-    ))
+    Ok((movement, signed.abs(), servos_engaged(ctx).await?, firewalled))
 }
 
 /// The synchronous part of [`fly_to`]: read the current altitude, infer the
 /// direction, and arm the autopilot (altitude window + VS mode + rate, plus the
 /// climb power firewall). Returns the movement phrase, the *signed* commanded fpm,
-/// and `Some(was_climb)` if a capture watcher should be spawned (climb/descent) or
-/// `None` for a hold. Split out from the threaded watcher so the trust-critical
-/// writes are unit-testable against a fake sim.
+/// `Some(was_climb)` if a capture watcher should be spawned (climb/descent) or
+/// `None` for a hold, and whether the throttle was firewalled. Split out from the
+/// threaded watcher so the trust-critical writes are unit-testable against a fake
+/// sim. `governor` is the speed governor's target when it holds the speed: it
+/// owns the throttle, so the climb leaves it alone (one writer per dataref).
 async fn arm_altitude(
     ctx: &ToolCtx<'_>,
     altitude: f64,
     rate: Option<f64>,
-) -> Result<(&'static str, f64, Option<bool>)> {
+    max_climb_fpm: f64,
+    governor: Option<f64>,
+) -> Result<(&'static str, f64, Option<bool>, bool)> {
     let current = ctx.xplane.get_float(CURRENT_ALT).await.unwrap_or(altitude);
     let diff = altitude - current;
     ctx.xplane.run_command(CMD_SERVOS_ON).await?;
@@ -515,7 +639,7 @@ async fn arm_altitude(
         let hold = (current / 100.0).round() * 100.0;
         engage_mode(ctx, ALT_HOLD_STATUS, CMD_ALT_HOLD).await?;
         ctx.xplane.set_float(ALT_DIAL, hold).await?;
-        return Ok(("Holding at", 0.0, None));
+        return Ok(("Holding at", 0.0, None, false));
     }
 
     // CLIMB or DESCENT. Arm the target in the altitude window and fly to it in VS
@@ -529,15 +653,17 @@ async fn arm_altitude(
     // scales to the change so a big climb isn't a 30-minute crawl at 300 fpm.
     let mag = rate
         .map(f64::abs)
-        .unwrap_or_else(|| auto_vs_fpm(diff, climb));
+        .unwrap_or_else(|| auto_vs_fpm(diff, climb, max_climb_fpm));
     let signed = if climb { mag } else { -mag };
     ctx.xplane.set_float(ALT_DIAL, altitude).await?;
     engage_mode(ctx, VS_STATUS, CMD_VS_MODE).await?;
     ctx.xplane.set_float(VS_DIAL, signed).await?;
     // A climb needs power — the AP pitches up to hold VS, and on cruise power a 172
-    // just bleeds airspeed. Full throttle for the climb; the watcher eases it back
-    // to cruise at capture. (Autothrottle will replace this later.)
-    if climb {
+    // just bleeds airspeed. Full throttle for the climb; the watcher settles it at
+    // capture. A running speed governor already owns the throttle and adds the
+    // power the climb asks for, so it is left to it.
+    let firewall = climb && governor.is_none();
+    if firewall {
         let _ = ctx.xplane.set_float(&throttle_dref(), 1.0).await;
     }
     Ok((
@@ -548,6 +674,7 @@ async fn arm_altitude(
         },
         signed,
         Some(climb),
+        firewall,
     ))
 }
 
@@ -603,7 +730,9 @@ pub(crate) fn stop_capture_watcher() {
 /// mode on its own, so the copilot does it: a one-shot watcher polls until the
 /// aircraft reaches `target`, then engages ALT hold (idempotently — a no-op if the
 /// AP already captured) so it holds instead of flying straight through. For a
-/// `was_climb` it also eases the firewalled throttle back to cruise.
+/// `was_climb` it also settles the firewalled throttle ([`level_power`]) and,
+/// on the way up, protects the airspeed with the airframe's climb limiter
+/// ([`protected_climb_fpm`], `perf`).
 ///
 /// Own thread + runtime + client (like the dashboard poller): the session runs a
 /// current-thread runtime blocked on the audio listener between commands, so a
@@ -618,6 +747,7 @@ fn capture_at_altitude(
     was_climb: bool,
     voice: Option<Voice>,
     status: Option<crate::plugin_status::StatusSink>,
+    perf: ClimbPerf,
 ) {
     let my_gen = CLIMB_WATCHER_GEN.fetch_add(1, Ordering::SeqCst) + 1;
     std::thread::spawn(move || {
@@ -628,7 +758,9 @@ fn capture_at_altitude(
             return;
         };
         rt.block_on(async move {
-            let xp = XPlaneClient::new(base);
+            let xp = XPlaneClient::new(base.clone());
+            let mut last_ias: Option<(std::time::Instant, f64)> = None;
+            let mut ias_trend = 0.0_f64;
             // Wall-clock budget: even a long, slow change finishes inside 20 min; if
             // it somehow doesn't, we stop watching.
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20 * 60);
@@ -677,31 +809,60 @@ fn capture_at_altitude(
                         if !held {
                             let _ = xp.run_command(CMD_ALT_HOLD).await;
                         }
-                        // Ease a firewalled climb back to cruise — but only if the
+                        // Settle a firewalled climb's power, but only if the
                         // throttle is still where we left it (full). If the pilot took
                         // manual throttle mid-climb (which doesn't move the alt dial,
                         // so the stand-down never fired), it now reads below the floor —
-                        // leave it rather than overriding their setting.
-                        let mut eased = false;
+                        // leave it rather than overriding their setting. A running
+                        // governor owns the throttle; else the airframe's cruise speed
+                        // is handed to it, and only an airframe declaring none gets
+                        // the old GA lever (`level_power`).
+                        let mut settled = None;
                         if was_climb {
-                            match xp.get_float(&throttle_dref()).await {
-                                Ok(thr) if thr >= FIREWALL_HANDBACK_FLOOR => {
-                                    let _ = xp.set_float(&throttle_dref(), CRUISE_THROTTLE).await;
-                                    eased = true;
-                                }
-                                _ => {} // pilot took manual throttle — don't touch it
+                            let governor = crate::tools::speedhold::flight_target();
+                            match level_power(governor, perf.cruise_ias_kts, alt) {
+                                LevelPower::Governor => {}
+                                power => match xp.get_float(&throttle_dref()).await {
+                                    Ok(thr) if thr >= FIREWALL_HANDBACK_FLOOR => {
+                                        match power {
+                                            LevelPower::ArmCruise(kts) => {
+                                                crate::tools::speedhold::arm_flight(
+                                                    base.clone(),
+                                                    voice.clone(),
+                                                    kts,
+                                                );
+                                            }
+                                            LevelPower::Lever(ratio) => {
+                                                let _ =
+                                                    xp.set_float(&throttle_dref(), ratio).await;
+                                            }
+                                            LevelPower::Governor => {}
+                                        }
+                                        settled = Some(power);
+                                    }
+                                    _ => {} // pilot took manual throttle: don't touch it
+                                },
                             }
+                            crate::blackbox::record(
+                                "autopilot",
+                                serde_json::json!({"event": "climb_level_power",
+                                    "target": target, "alt_ft": alt,
+                                    "governor": governor,
+                                    "settled": format!("{settled:?}")}),
+                            );
                         }
                         // Call out the capture. This lands minutes after the command,
                         // so it's the copilot telling you it actually levelled off.
                         // Spoken via Voice and mirrored to the panel (which the
                         // Reporter never sees for this background announcement).
-                        let line = if eased {
-                            format!(
+                        let line = match settled {
+                            Some(LevelPower::ArmCruise(kts)) => format!(
+                                "Reached {target:.0} feet, levelling off, holding {kts:.0} knots."
+                            ),
+                            Some(LevelPower::Lever(_)) => format!(
                                 "Reached {target:.0} feet, easing the power back, levelling off."
-                            )
-                        } else {
-                            format!("Reached {target:.0} feet, levelling off.")
+                            ),
+                            _ => format!("Reached {target:.0} feet, levelling off."),
                         };
                         if let Some(s) = &status {
                             s.action(&line);
@@ -712,35 +873,56 @@ fn capture_at_altitude(
                         return;
                     }
                     Capture::Wait => {
-                        // Airspeed-protected climb: hold the fastest climb that keeps
-                        // IAS above the floor. Below it, ease the vertical speed down
-                        // (pitch down for speed); once speed's healthy again, restore
-                        // the climb toward what was commanded. Power stays firewalled.
+                        // Airspeed-protected climb: the circuit's climb limiter
+                        // over the airframe's own climb speed and floor
+                        // (`protected_climb_fpm`), never above what was
+                        // commanded. The dial is written only when the command
+                        // moves (a knob is set, not rewritten).
                         if was_climb && initial_vs > 0.0 {
                             if let Ok(ias) = xp.get_float(crate::datarefs::AIRSPEED_KTS).await {
+                                let now = std::time::Instant::now();
+                                if let Some((t0, ias0)) = last_ias {
+                                    let dt = now.duration_since(t0).as_secs_f64();
+                                    if dt > 0.2 {
+                                        let raw = (ias - ias0) / dt;
+                                        ias_trend += (raw - ias_trend) * 0.5;
+                                    }
+                                }
+                                last_ias = Some((now, ias));
+                                let want = protected_climb_fpm(
+                                    initial_vs,
+                                    ias,
+                                    ias_trend,
+                                    &perf,
+                                    crate::aircraft::speed_floor_kts(),
+                                    crate::tools::speedhold::flight_target(),
+                                );
                                 let cur = xp.get_float(VS_DIAL).await.unwrap_or(initial_vs);
-                                if ias < CLIMB_MIN_KTS {
-                                    let new = (cur - VS_TRIM_FPM).max(0.0);
-                                    if new < cur {
-                                        let _ = xp.set_float(VS_DIAL, new).await;
-                                        if !eased_for_speed {
-                                            eased_for_speed = true;
-                                            let line =
-                                                "Easing the climb to hold airspeed.".to_string();
-                                            if let Some(s) = &status {
-                                                s.alert(
-                                                    crate::plugin_status::AlertLevel::Caution,
-                                                    &line,
-                                                );
-                                            }
-                                            if let Some(v) = &voice {
-                                                v.alert(Priority::Caution, line);
-                                            }
+                                if (want - cur).abs() >= VS_TRIM_FPM - 1.0 {
+                                    let _ = xp.set_float(VS_DIAL, want).await;
+                                    crate::blackbox::record(
+                                        "autopilot",
+                                        serde_json::json!({"event": "climb_protect",
+                                            "ias": ias, "trend": ias_trend,
+                                            "was_fpm": cur, "fpm": want,
+                                            "commanded_fpm": initial_vs,
+                                            "floor": perf.floor(crate::aircraft::speed_floor_kts()),
+                                            "vy": perf.vy_kts}),
+                                    );
+                                    if want < cur && !eased_for_speed {
+                                        eased_for_speed = true;
+                                        let line =
+                                            "Easing the climb to hold airspeed.".to_string();
+                                        if let Some(s) = &status {
+                                            s.alert(
+                                                crate::plugin_status::AlertLevel::Caution,
+                                                &line,
+                                            );
+                                        }
+                                        if let Some(v) = &voice {
+                                            v.alert(Priority::Caution, line);
                                         }
                                     }
-                                } else if ias > CLIMB_MIN_KTS + 8.0 && cur < initial_vs {
-                                    let new = (cur + VS_TRIM_FPM).min(initial_vs);
-                                    let _ = xp.set_float(VS_DIAL, new).await;
                                 }
                             }
                         }
@@ -1075,14 +1257,32 @@ impl Tool for LevelOff {
         // Converging to cruise from either direction is the safe default until
         // airspeed-aware power management lands — making it conditional (leave the
         // pilot's setting) would risk that decay when levelling from a descent.
-        let _ = ctx
-            .xplane
-            .set_float(&throttle_dref(), CRUISE_THROTTLE)
-            .await;
+        // "Cruise" is the airframe's (`level_power`): a running governor keeps
+        // the throttle, a declared cruise speed is handed to it, and only an
+        // airframe declaring none gets the old GA lever.
+        let power = match level_power(
+            crate::tools::speedhold::flight_target(),
+            self.cfg.climb.cruise_ias_kts,
+            current,
+        ) {
+            LevelPower::Governor => String::new(),
+            LevelPower::ArmCruise(kts) => {
+                crate::tools::speedhold::arm_flight(
+                    ctx.config.xplane_base_url.clone(),
+                    ctx.voice.cloned(),
+                    kts,
+                );
+                format!("{kts:.0} knots, ")
+            }
+            LevelPower::Lever(ratio) => {
+                let _ = ctx.xplane.set_float(&throttle_dref(), ratio).await;
+                "cruise power, ".to_string()
+            }
+        };
 
         if servos_engaged(ctx).await? {
             Ok(format!(
-                "Roger, wings level, cruise power, holding {target:.0} feet."
+                "Roger, wings level, {power}holding {target:.0} feet."
             ))
         } else {
             Ok(format!(
@@ -1489,16 +1689,91 @@ mod tests {
     #[test]
     fn auto_rate_scales_with_the_change_and_is_bounded() {
         // Small step → the gentle default floor, not sluggish.
-        assert_eq!(auto_vs_fpm(300.0, true), DEFAULT_VS_FPM);
+        assert_eq!(auto_vs_fpm(300.0, true, MAX_CLIMB_FPM), DEFAULT_VS_FPM);
         // Mid change → scaled (≈ delta / 3).
-        assert_eq!(auto_vs_fpm(1500.0, true), 500.0);
+        assert_eq!(auto_vs_fpm(1500.0, true, MAX_CLIMB_FPM), 500.0);
         // Big climb → capped at the airframe's sustainable climb rate, so it can't
         // outrun the available power.
-        assert_eq!(auto_vs_fpm(9000.0, true), MAX_CLIMB_FPM);
+        assert_eq!(auto_vs_fpm(9000.0, true, MAX_CLIMB_FPM), MAX_CLIMB_FPM);
         // Descents get their own (higher) cap.
-        assert_eq!(auto_vs_fpm(9000.0, false), MAX_DESCENT_FPM);
+        assert_eq!(auto_vs_fpm(9000.0, false, MAX_CLIMB_FPM), MAX_DESCENT_FPM);
         // Direction is by magnitude — sign of the delta doesn't matter here.
-        assert_eq!(auto_vs_fpm(-1500.0, false), 500.0);
+        assert_eq!(auto_vs_fpm(-1500.0, false, MAX_CLIMB_FPM), 500.0);
+        // A jet's cap is its own enroute climb (refactor audit #3).
+        assert_eq!(auto_vs_fpm(9000.0, true, 2000.0), 2000.0);
+    }
+
+    fn perf(id: &str) -> ClimbPerf {
+        ClimbPerf::from_profile(&crate::aircraft::load(id).expect(id))
+    }
+
+    /// The climb numbers are the airframe's: the 172 keeps the GA figures
+    /// it always flew (700 fpm, its cruise 108), the jets get their own.
+    #[test]
+    fn a_pilot_climb_flies_the_airframes_numbers() {
+        let c172 = perf("cessna_172sp");
+        assert_eq!(c172.max_climb_fpm, 700.0);
+        assert_eq!(c172.vy_kts, Some(74.0));
+        assert!((c172.floor_kts - 57.6).abs() < 0.01, "{}", c172.floor_kts);
+        assert_eq!(c172.cruise_ias_kts, Some(108.0));
+        let sr22 = perf("cirrus_sr22");
+        assert_eq!(sr22.max_climb_fpm, 700.0);
+        assert_eq!(sr22.cruise_ias_kts, None, "no cruise declared: the GA lever");
+        let b738 = perf("boeing_737_800");
+        assert_eq!(b738.max_climb_fpm, 2000.0);
+        assert!((b738.floor_kts - 166.8).abs() < 0.01, "{}", b738.floor_kts);
+        let a330 = perf("airbus_a330_300");
+        assert_eq!(a330.max_climb_fpm, 2000.0);
+        assert!((a330.floor_kts - 210.0).abs() < 0.01, "{}", a330.floor_kts);
+        // Nothing declared: the old 60 kt floor and 700 fpm.
+        let none = ClimbPerf::default();
+        assert_eq!(none.floor(None), CLIMB_MIN_KTS);
+        assert_eq!(none.max_climb_fpm, MAX_CLIMB_FPM);
+    }
+
+    /// The #181 door: a 737 climbing on a pilot's command at 166 kt and
+    /// falling. The old 60 kt protection never fired; the airframe's floor
+    /// takes the whole climb away.
+    #[test]
+    fn a_jet_climb_bleeding_toward_its_floor_is_eased() {
+        let b738 = perf("boeing_737_800");
+        let floor = Some(167.0);
+        assert_eq!(protected_climb_fpm(2000.0, 230.0, 0.0, &b738, floor, None), 2000.0);
+        assert_eq!(protected_climb_fpm(2000.0, 166.0, -1.0, &b738, floor, None), 0.0);
+        let mid = protected_climb_fpm(2000.0, 190.0, 0.0, &b738, floor, None);
+        assert!(mid > 0.0 && mid < 2000.0, "{mid}");
+        assert_eq!(mid % VS_TRIM_FPM, 0.0, "steps a VS wheel can take");
+        // A governor holding under Vy lowers the full-rate speed with it.
+        let held = protected_climb_fpm(2000.0, 195.0, 0.0, &b738, floor, Some(195.0));
+        assert_eq!(held, 2000.0);
+    }
+
+    /// The 172 stays close to what it flew: full rate at Vy and above,
+    /// eased below it, nothing left at its floor (it used to keep the whole
+    /// rate to 60 kt, two knots over this floor).
+    #[test]
+    fn a_172_climb_keeps_its_rate_at_vy() {
+        let c172 = perf("cessna_172sp");
+        let floor = Some(58.0);
+        assert_eq!(protected_climb_fpm(700.0, 80.0, 0.0, &c172, floor, None), 700.0);
+        assert_eq!(protected_climb_fpm(700.0, 74.0, 0.0, &c172, floor, None), 700.0);
+        assert_eq!(protected_climb_fpm(700.0, 58.0, 0.0, &c172, floor, None), 0.0);
+        let eased = protected_climb_fpm(700.0, 66.0, 0.0, &c172, floor, None);
+        assert!(eased > 0.0 && eased < 700.0, "{eased}");
+        // A descent is never touched.
+        assert_eq!(protected_climb_fpm(-500.0, 50.0, 0.0, &c172, floor, None), -500.0);
+    }
+
+    /// The level-off's power is the airframe's: a governor keeps it, a
+    /// declared cruise is handed to the governor (250 below 10,000), and
+    /// only an airframe declaring none gets the GA lever.
+    #[test]
+    fn a_level_off_settles_on_the_airframes_cruise() {
+        assert_eq!(level_power(Some(200.0), Some(255.0), 5000.0), LevelPower::Governor);
+        assert_eq!(level_power(None, Some(255.0), 5000.0), LevelPower::ArmCruise(250.0));
+        assert_eq!(level_power(None, Some(285.0), 24_000.0), LevelPower::ArmCruise(285.0));
+        assert_eq!(level_power(None, Some(108.0), 5000.0), LevelPower::ArmCruise(108.0));
+        assert_eq!(level_power(None, None, 5000.0), LevelPower::Lever(CRUISE_THROTTLE));
     }
 
     #[test]
@@ -1632,8 +1907,10 @@ mod tests {
     async fn arm_altitude_climb_arms_target_vs_and_firewalls_power() {
         let fake = FakeXPlane::with_reads(&[(CURRENT_ALT, 2000.0)]);
         let cfg = crate::config::Config::default();
-        let (movement, signed, capture) =
-            arm_altitude(&ctx(&fake, &cfg), 7000.0, None).await.unwrap();
+        let (movement, signed, capture, firewalled) =
+            arm_altitude(&ctx(&fake, &cfg), 7000.0, None, MAX_CLIMB_FPM, None)
+                .await
+                .unwrap();
 
         assert_eq!(movement, "Climbing to");
         assert!(signed > 0.0, "climb VS should be positive, was {signed}");
@@ -1658,16 +1935,36 @@ mod tests {
             Some(1.0),
             "firewalls the throttle for the climb"
         );
+        assert!(firewalled, "and says so");
+    }
+
+    /// A running speed governor owns the throttle: the pilot's climb leaves
+    /// it to it (one writer per dataref) and promises no full power.
+    #[tokio::test]
+    async fn arm_altitude_climb_under_a_governor_leaves_the_throttle() {
+        let fake = FakeXPlane::with_reads(&[(CURRENT_ALT, 2000.0)]);
+        let cfg = crate::config::Config::default();
+        let (movement, signed, _, firewalled) =
+            arm_altitude(&ctx(&fake, &cfg), 12_000.0, None, 2000.0, Some(250.0))
+                .await
+                .unwrap();
+        assert_eq!(movement, "Climbing to");
+        assert_eq!(signed, 2000.0, "the jet's own climb cap");
+        assert!(!firewalled);
+        assert!(!fake.wrote(&throttle_dref()), "the governor's throttle");
     }
 
     #[tokio::test]
     async fn arm_altitude_descent_does_not_touch_the_throttle() {
         let fake = FakeXPlane::with_reads(&[(CURRENT_ALT, 9000.0)]);
         let cfg = crate::config::Config::default();
-        let (movement, signed, capture) =
-            arm_altitude(&ctx(&fake, &cfg), 3000.0, None).await.unwrap();
+        let (movement, signed, capture, firewalled) =
+            arm_altitude(&ctx(&fake, &cfg), 3000.0, None, MAX_CLIMB_FPM, None)
+                .await
+                .unwrap();
 
         assert_eq!(movement, "Descending to");
+        assert!(!firewalled, "a descent never firewalls");
         assert!(signed < 0.0, "descent VS should be negative, was {signed}");
         assert_eq!(
             capture,
@@ -1686,11 +1983,14 @@ mod tests {
         // Within the capture band of the current altitude → hold, no climb/descent.
         let fake = FakeXPlane::with_reads(&[(CURRENT_ALT, 5020.0)]);
         let cfg = crate::config::Config::default();
-        let (movement, signed, capture) =
-            arm_altitude(&ctx(&fake, &cfg), 5000.0, None).await.unwrap();
+        let (movement, signed, capture, firewalled) =
+            arm_altitude(&ctx(&fake, &cfg), 5000.0, None, MAX_CLIMB_FPM, None)
+                .await
+                .unwrap();
 
         assert_eq!(movement, "Holding at");
         assert_eq!(signed, 0.0);
+        assert!(!firewalled);
         assert_eq!(capture, None, "a hold needs no capture watcher");
         assert!(fake.ran(CMD_ALT_HOLD), "engages altitude hold");
         assert!(
