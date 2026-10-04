@@ -2394,22 +2394,9 @@ pub fn power_hold_target(end: &EndAction, cruise_ias_kts: Option<f64>) -> Option
     }
 }
 
-/// Calibrated airspeed, kt, of `mach` at a pressure altitude (ISA,
-/// troposphere and the isothermal layer above 36,089 ft). The governor holds
-/// INDICATED speed, so a planned Mach is held as the airspeed it is at the
-/// level flown: M0.628 at FL180 is 300 kt, M0.78 at FL360 is 260. Pure.
-pub fn cas_for_mach(mach: f64, pressure_alt_ft: f64) -> f64 {
-    const A0_KTS: f64 = 661.4786;
-    let h = pressure_alt_ft.clamp(-2_000.0, 65_000.0);
-    let delta = if h <= 36_089.0 {
-        (1.0 - 6.875_59e-6 * h).powf(5.255_88)
-    } else {
-        0.223_36 * (-4.806_34e-5 * (h - 36_089.0)).exp()
-    };
-    let qc_over_p = (1.0 + 0.2 * mach * mach).powf(3.5) - 1.0;
-    let qc_over_p0 = qc_over_p * delta;
-    A0_KTS * (5.0 * ((qc_over_p0 + 1.0).powf(2.0 / 7.0) - 1.0)).sqrt()
-}
+// The Mach rule lives beside the airframe limits it also serves
+// (`aircraft::VmoHigh`'s Mmo).
+pub use crate::aircraft::cas_for_mach;
 
 /// A leg's planned cruise speed from the OFP: the airspeed and Mach the cost
 /// index gave its fix, and what the governor should hold at `alt_ft`.
@@ -3244,6 +3231,11 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, plan: Pla
     let mut minimums_state = DepartureMinimums::default();
     // The 250 below 10,000 cap, once begun held through a level near the line.
     let mut airspace = crate::tools::speedhold::AirspaceLimit::default();
+    // The ceiling where we fly on an airframe whose Vmo rises with altitude
+    // (`vmo_high:`), with the vertical speed it projects from: the
+    // altimeter's change across ticks.
+    let mut vmo = crate::aircraft::VmoCeiling::default();
+    let mut vmo_prev_alt: Option<f64> = None;
     let mut said_min_capped: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut cap_holding: Option<f64> = None;
     // The VS wheel's last action logged (`vs_action`), so a change is one record.
@@ -3338,6 +3330,16 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, plan: Pla
         };
         progress_s += dt;
         let true_alt_ft = elev_m * M_TO_FT;
+        // The ceiling this tick: the speed owed and the governor's target
+        // are held under it, so the Citation X slows for its 270 below
+        // 8,000 ft before the descent gets there. Without a `vmo_high:` it
+        // is the published ceiling.
+        let vmo_vs = match vmo_prev_alt {
+            Some(prev) if (0.2..=5.0).contains(&dt) => (alt_ft - prev) / dt * 60.0,
+            _ => 0.0,
+        };
+        vmo_prev_alt = Some(alt_ft);
+        let speed_ceiling = vmo.ceiling(alt_ft, vmo_vs);
         let agl_ft = agl_m * M_TO_FT;
         // The magnetic variation HERE, not at the departure airport. It is a
         // fact of the PLACE, and this loop crosses enough of the world to
@@ -3461,7 +3463,7 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, plan: Pla
             // whichever is lower at the level flown (#101).
             let planned = if matches!(end, EndAction::Enroute) {
                 let sched = scheduled_cruise_kts(&cruise_schedule, &legs[idx], alt_ft);
-                let ceiling = crate::aircraft::speed_ceiling_kts();
+                let ceiling = speed_ceiling;
                 let pick = cruise_pick(
                     planned,
                     sched.as_ref(),
@@ -3613,7 +3615,10 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, plan: Pla
             };
             // With memory (`AirspaceLimit`): a level at or near 10,000 ft
             // must not flip the cap on the altimeter's wander (#154).
-            let want = crate::aircraft::floored_target(airspace.limit(alt_ft, planned), floor);
+            // And under the airframe's ceiling where we fly.
+            let limited = airspace.limit(alt_ft, planned);
+            let limited = speed_ceiling.map_or(limited, |c| limited.min(c));
+            let want = crate::aircraft::floored_target(limited, floor);
             speed_owed = Some(want);
             // In a descent the governor sits under the speed owed and the
             // pitch holds it (`IdleDescent`); on a MAP's final the speed is

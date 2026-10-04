@@ -60,7 +60,7 @@ pub(crate) fn publish_airframe(p: &AircraftProfile) {
     crate::aircraft::publish_config_limits(p.vlo_kts, p.flaps.as_ref());
     crate::aircraft::publish_bus_volts(p.bus_volts_nominal);
     crate::aircraft::publish_speed_floor(p.vs_clean_kts);
-    crate::aircraft::publish_speed_ceiling(p.vne_kts);
+    crate::aircraft::publish_speed_ceiling(p.vne_kts, p.vmo_high);
     crate::aircraft::publish_approach_floor(
         p.reference.as_ref().and_then(|r| r.vs0_kts),
         p.vs_clean_kts,

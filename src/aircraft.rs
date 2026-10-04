@@ -742,6 +742,15 @@ pub struct AircraftProfile {
     /// `None` means no overspeed caution.
     #[serde(default)]
     pub vne_kts: Option<f64>,
+    /// A HIGHER Vmo above an altitude (`vmo_high: { above_ft: 8000, kts:
+    /// 350 }`), for an airframe whose limit rises with height: `vne_kts` is
+    /// then the LOW limit, the one below `above_ft` and the one a caller
+    /// without an altitude gets. The Citation X is 270 KIAS below 8,000 ft
+    /// and 350 above; one number capped its cruise at 233 and would have
+    /// nagged "overspeed" over 243 at FL350. `None` = one Vne at every
+    /// altitude ([`vne_at`]).
+    #[serde(default)]
+    pub vmo_high: Option<VmoHigh>,
     /// Landing-gear operating/extended limit speed (VLO/VLE), KIAS — the `gear`
     /// tool refuses cycling the gear above it. `None` = no gear speed gate.
     #[serde(default)]
@@ -2967,7 +2976,15 @@ pub fn speed_floor_kts() -> Option<f64> {
 /// (found on the profile review, 2026-09-20). The cap is now the airframe's
 /// own, [`ceiling_from_vne`], republished per swap like the floor. Below 10,000 ft the 250 kt rule still applies on top of it
 /// (`speedhold::BELOW_10K_LIMIT_KTS`); that is airspace, not airframe.
-static SPEED_CEILING_KTS: std::sync::Mutex<Option<f64>> = std::sync::Mutex::new(None);
+static SPEED_LIMITS: std::sync::Mutex<SpeedLimits> =
+    std::sync::Mutex::new(SpeedLimits { vne_kts: None, vmo_high: None });
+
+/// The live airframe's declared speed limits, the ceilings' one source.
+#[derive(Debug, Clone, Copy)]
+struct SpeedLimits {
+    vne_kts: Option<f64>,
+    vmo_high: Option<VmoHigh>,
+}
 /// The monitor's overspeed caution floor, a fraction of Vne (the monitor's
 /// `OVERSPEED_CAUTION_FACTOR` is this one).
 pub const OVERSPEED_CAUTION_FACTOR: f64 = 0.90;
@@ -2987,15 +3004,190 @@ pub fn ceiling_from_vne(vne_kts: f64) -> f64 {
     (vne_kts * OVERSPEED_CAUTION_FACTOR - SPEED_CEILING_MARGIN_KTS).floor()
 }
 
-/// Publish the airframe's speed ceiling from its Vne. Called on EVERY profile swap.
-pub fn publish_speed_ceiling(vne_kts: Option<f64>) {
-    *SPEED_CEILING_KTS.lock().unwrap_or_else(|e| e.into_inner()) =
-        vne_kts.filter(|v| *v > 0.0).map(ceiling_from_vne);
+/// Publish the airframe's speed ceiling from its Vne and its high-altitude
+/// Vmo, if any. Called on EVERY profile swap, `None` included.
+pub fn publish_speed_ceiling(vne_kts: Option<f64>, vmo_high: Option<VmoHigh>) {
+    *SPEED_LIMITS.lock().unwrap_or_else(|e| e.into_inner()) = SpeedLimits {
+        vne_kts: vne_kts.filter(|v| *v > 0.0),
+        vmo_high: vmo_high.and_then(VmoHigh::valid),
+    };
 }
 
-/// The live airframe's speed ceiling, kts, if its profile declares a Vne.
+/// The live airframe's speed ceiling, kts, if its profile declares a Vne:
+/// the LOW one on an airframe with a `vmo_high:`, for a caller without an
+/// altitude (conservative). With one in hand, [`speed_ceiling_kts_at`] or
+/// [`VmoCeiling`].
 pub fn speed_ceiling_kts() -> Option<f64> {
-    *SPEED_CEILING_KTS.lock().unwrap_or_else(|e| e.into_inner())
+    SPEED_LIMITS.lock().unwrap_or_else(|e| e.into_inner()).vne_kts.map(ceiling_from_vne)
+}
+
+/// A Vmo that applies at and above an INDICATED altitude (the profile's
+/// `vmo_high:`); below it the profile's `vne_kts` is the limit.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct VmoHigh {
+    /// Indicated altitude, feet, at and above which `kts` is the limit.
+    pub above_ft: f64,
+    /// The limit up there, KIAS.
+    pub kts: f64,
+    /// Mmo, when declared: up high the limit is the LOWER of `kts` and the
+    /// airspeed this Mach is at the altitude ([`cas_for_mach`]).
+    /// The Citation X's 350 is M0.935 by FL290 and M0.94 is 271 KIAS at its
+    /// FL430 optimum: a raised Vmo without its Mmo would cruise past Mach.
+    #[serde(default)]
+    pub mmo: Option<f64>,
+}
+
+impl VmoHigh {
+    /// Used only when the numbers are sane ones (an insane Mmo is dropped).
+    pub fn valid(self) -> Option<Self> {
+        (self.above_ft.is_finite() && self.above_ft > 0.0 && self.kts.is_finite() && self.kts > 0.0)
+            .then_some(VmoHigh {
+                mmo: self.mmo.filter(|m| m.is_finite() && (0.3..1.5).contains(m)),
+                ..self
+            })
+    }
+
+    /// The limit at an indicated altitude in the high band, KIAS: `kts`,
+    /// or the Mmo's airspeed there when that is lower.
+    fn kts_at(self, alt_ft: f64) -> f64 {
+        self.mmo
+            .map_or(self.kts, |m| self.kts.min(cas_for_mach(m, alt_ft)))
+    }
+}
+
+/// Calibrated airspeed, kt, of `mach` at a pressure altitude (ISA,
+/// troposphere and the isothermal layer above 36,089 ft). The governor holds
+/// INDICATED speed, so a planned Mach is held as the airspeed it is at the
+/// level flown: M0.628 at FL180 is 300 kt, M0.78 at FL360 is 260. Pure.
+pub fn cas_for_mach(mach: f64, pressure_alt_ft: f64) -> f64 {
+    const A0_KTS: f64 = 661.4786;
+    let h = pressure_alt_ft.clamp(-2_000.0, 65_000.0);
+    let delta = if h <= 36_089.0 {
+        (1.0 - 6.875_59e-6 * h).powf(5.255_88)
+    } else {
+        0.223_36 * (-4.806_34e-5 * (h - 36_089.0)).exp()
+    };
+    let qc_over_p = (1.0 + 0.2 * mach * mach).powf(3.5) - 1.0;
+    let qc_over_p0 = qc_over_p * delta;
+    A0_KTS * (5.0 * ((qc_over_p0 + 1.0).powf(2.0 / 7.0) - 1.0)).sqrt()
+}
+
+/// The airframe's Vne/Vmo at an INDICATED altitude: `vmo_high`'s figure at
+/// and above its altitude (its Mmo's airspeed where lower), `vne_kts` below
+/// it, and `vne_kts` too for an altitude not read (the low limit is the
+/// conservative one). `None` = no limit declared there. Pure.
+pub fn vne_at(vne_kts: Option<f64>, vmo_high: Option<VmoHigh>, alt_ft: f64) -> Option<f64> {
+    match vmo_high.and_then(VmoHigh::valid) {
+        Some(h) if alt_ft.is_finite() && alt_ft >= h.above_ft => Some(h.kts_at(alt_ft)),
+        _ => vne_kts.filter(|v| *v > 0.0),
+    }
+}
+
+impl AircraftProfile {
+    /// This airframe's Vne/Vmo at an indicated altitude ([`vne_at`]).
+    pub fn vne_at(&self, alt_ft: f64) -> Option<f64> {
+        vne_at(self.vne_kts, self.vmo_high, alt_ft)
+    }
+}
+
+/// The live airframe's Vne/Vmo at an indicated altitude ([`vne_at`] over
+/// the published limits).
+pub fn published_vne_at(alt_ft: f64) -> Option<f64> {
+    let l = *SPEED_LIMITS.lock().unwrap_or_else(|e| e.into_inner());
+    vne_at(l.vne_kts, l.vmo_high, alt_ft)
+}
+
+/// The live airframe's high-altitude Vmo, when its profile declares a sane one.
+pub fn published_vmo_high() -> Option<VmoHigh> {
+    SPEED_LIMITS.lock().unwrap_or_else(|e| e.into_inner()).vmo_high.and_then(VmoHigh::valid)
+}
+
+/// The live airframe's speed ceiling at an indicated altitude: the clean
+/// threshold, for a judgement made once (a spoken number). A loop that
+/// holds a speed through a descent takes [`VmoCeiling`], which slows
+/// BEFORE the limit drops.
+pub fn speed_ceiling_kts_at(alt_ft: f64) -> Option<f64> {
+    published_vne_at(alt_ft).map(ceiling_from_vne)
+}
+
+/// The highest speed ceiling the live airframe has at ANY altitude: the
+/// sanity bound on a target armed without an altitude, which the governor
+/// then holds under the ceiling where it flies. Equal to
+/// [`speed_ceiling_kts`] without a `vmo_high:`.
+pub fn speed_ceiling_kts_max() -> Option<f64> {
+    let high = published_vmo_high().map(|h| ceiling_from_vne(h.kts));
+    match (speed_ceiling_kts(), high) {
+        (Some(a), Some(b)) => Some(a.max(b)),
+        (a, b) => a.or(b),
+    }
+}
+
+/// How far ahead a descent is projected, seconds, for the ceiling it will
+/// meet: the low Vmo is flown BEFORE crossing its altitude, not after. A
+/// descent at idle bleeds about a knot a second with the pitch shallowed to
+/// slow, and 305 to 233 is 72 kt.
+pub const VMO_DESCENT_LEAD_S: f64 = 90.0;
+
+/// The climb, fpm, that lifts a held low ceiling once over the altitude.
+pub const VMO_RELEASE_CLIMB_FPM: f64 = 300.0;
+
+/// The speed ceiling with memory, for a loop that holds a speed every tick
+/// on an airframe with a `vmo_high:`. Low while the descent projected
+/// [`VMO_DESCENT_LEAD_S`] ahead is under the altitude; once low it HOLDS
+/// (the pitch shallowing to slow would otherwise lift the projection, the
+/// ceiling and the speed again, round and round) until the aircraft climbs
+/// over the altitude. A level held over it after a descent stays slow,
+/// which is legal. Without a `vmo_high:` it is [`speed_ceiling_kts`]
+/// exactly, and with nothing measured the low ceiling stands.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct VmoCeiling {
+    /// `None` until the first finite altitude.
+    low: Option<bool>,
+    /// The last finite altitude, for the Mmo's airspeed on a lost read.
+    alt_ft: Option<f64>,
+}
+
+impl VmoCeiling {
+    /// Advance on the live airframe's published limits.
+    pub fn ceiling(&mut self, alt_ft: f64, vs_fpm: f64) -> Option<f64> {
+        let l = *SPEED_LIMITS.lock().unwrap_or_else(|e| e.into_inner());
+        self.ceiling_for(l.vne_kts, l.vmo_high, alt_ft, vs_fpm)
+    }
+
+    /// Advance on indicated `alt_ft` and `vs_fpm` (a vertical speed not read
+    /// is level) and return the ceiling this tick. A failed altitude read
+    /// keeps what was known. Pure.
+    pub fn ceiling_for(
+        &mut self,
+        vne_kts: Option<f64>,
+        vmo_high: Option<VmoHigh>,
+        alt_ft: f64,
+        vs_fpm: f64,
+    ) -> Option<f64> {
+        let low_ceiling = vne_kts.filter(|v| *v > 0.0).map(ceiling_from_vne);
+        let Some(h) = vmo_high.and_then(VmoHigh::valid) else {
+            return low_ceiling;
+        };
+        if alt_ft.is_finite() {
+            let vs = if vs_fpm.is_finite() { vs_fpm } else { 0.0 };
+            let ahead = alt_ft + vs.min(0.0) * VMO_DESCENT_LEAD_S / 60.0;
+            let low = match self.low {
+                Some(true) => !(alt_ft >= h.above_ft && vs > VMO_RELEASE_CLIMB_FPM),
+                _ => ahead < h.above_ft,
+            };
+            self.low = Some(low);
+            self.alt_ft = Some(alt_ft);
+        }
+        match (self.low, self.alt_ft) {
+            (Some(false), Some(alt)) => Some(ceiling_from_vne(h.kts_at(alt.max(h.above_ft)))),
+            _ => low_ceiling,
+        }
+    }
+
+    /// Whether the low ceiling holds (`None` before any measurement).
+    pub fn low(&self) -> Option<bool> {
+        self.low
+    }
 }
 
 /// The ground roll to check a runway against, scaled by ACTUAL weight.
@@ -5536,6 +5728,7 @@ fn cessna_172sp() -> AircraftProfile {
         vs_clean_kts: Some(48.0),
         // 172SP Vne (never-exceed) 163 KIAS.
         vne_kts: Some(163.0),
+        vmo_high: None,
         vlo_kts: None,
         gear_warning: None,
         // The GA pace is the built-in default — nothing to declare.
@@ -5927,6 +6120,7 @@ fn cirrus_sr22() -> AircraftProfile {
         vs_clean_kts: Some(70.0),
         // SR22 Vne (never-exceed) 204 KIAS.
         vne_kts: Some(204.0),
+        vmo_high: None,
         vlo_kts: None,
         gear_warning: None,
         taxi: None,
@@ -6648,5 +6842,101 @@ mod real_install_writes {
             "silent writes:\n  {}",
             findings.join("\n  ")
         );
+    }
+
+}
+
+#[cfg(test)]
+mod vmo_tests {
+    use super::*;
+
+    const CITX_HIGH: VmoHigh = VmoHigh { above_ft: 8_000.0, kts: 350.0, mmo: Some(0.935) };
+
+    #[test]
+    fn a_high_vmo_applies_at_and_above_its_altitude() {
+        let low = Some(270.0);
+        let high = Some(VmoHigh { mmo: None, ..CITX_HIGH });
+        assert_eq!(vne_at(low, high, 5_000.0), Some(270.0));
+        assert_eq!(vne_at(low, high, 7_999.0), Some(270.0));
+        assert_eq!(vne_at(low, high, 8_000.0), Some(350.0), "a clean threshold");
+        assert_eq!(vne_at(low, high, 20_000.0), Some(350.0));
+        // An altitude not read is the low limit: conservative.
+        assert_eq!(vne_at(low, high, f64::NAN), Some(270.0));
+        // The governor's ceilings: 233 low, 305 high.
+        assert_eq!(vne_at(low, high, 5_000.0).map(ceiling_from_vne), Some(233.0));
+        assert_eq!(vne_at(low, high, 20_000.0).map(ceiling_from_vne), Some(305.0));
+        // A nonsense declaration is no declaration.
+        let bad = Some(VmoHigh { kts: -1.0, ..CITX_HIGH });
+        assert_eq!(vne_at(low, bad, 20_000.0), Some(270.0));
+    }
+
+    #[test]
+    fn a_high_vmo_gives_way_to_its_mmo_up_high() {
+        let low = Some(270.0);
+        let high = Some(CITX_HIGH);
+        // M0.935 is 442 KIAS at FL200: the 350 holds.
+        assert_eq!(vne_at(low, high, 20_000.0), Some(350.0));
+        // At FL430 the Mmo is the limit, about 268 KIAS.
+        let fl430 = vne_at(low, high, 43_000.0).unwrap();
+        assert!((260.0..275.0).contains(&fl430), "{fl430}");
+        // An insane Mmo is dropped, the Vmo kept.
+        let silly = Some(VmoHigh { mmo: Some(9.0), ..CITX_HIGH });
+        assert_eq!(vne_at(low, silly, 43_000.0), Some(350.0));
+    }
+
+    #[test]
+    fn without_a_high_vmo_the_limit_is_one_number() {
+        for alt in [0.0, 5_000.0, 8_000.0, 35_000.0, f64::NAN] {
+            assert_eq!(vne_at(Some(340.0), None, alt), Some(340.0));
+            assert_eq!(vne_at(None, None, alt), None);
+        }
+        // Every shipped profile but the Citation X declares none, and its
+        // limit is its `vne_kts` at every altitude.
+        let b738 = load("boeing_737_800").unwrap();
+        assert!(b738.vmo_high.is_none());
+        assert_eq!(b738.vne_at(37_000.0), b738.vne_kts);
+        let mut c = VmoCeiling::default();
+        for (alt, vs) in [(5_000.0, 2_000.0), (20_000.0, -3_000.0), (9_000.0, 0.0)] {
+            assert_eq!(c.ceiling_for(Some(340.0), None, alt, vs), Some(ceiling_from_vne(340.0)));
+        }
+    }
+
+    #[test]
+    fn the_citation_x_declares_its_high_vmo() {
+        let p = load("citation_x").unwrap();
+        assert_eq!(p.vne_kts, Some(270.0), "the low limit");
+        assert_eq!(p.vmo_high, Some(CITX_HIGH));
+        assert_eq!(p.vne_at(5_000.0), Some(270.0));
+        assert_eq!(p.vne_at(20_000.0), Some(350.0));
+        // The profile's cruise sits under the high ceiling.
+        let cruise = p.reference.as_ref().and_then(|r| r.cruise_ias_kts).unwrap();
+        assert!(cruise <= ceiling_from_vne(350.0), "{cruise}");
+    }
+
+    #[test]
+    fn a_descent_slows_for_the_low_vmo_before_it_gets_there() {
+        let (low, high) = (Some(270.0), Some(CITX_HIGH));
+        let mut c = VmoCeiling::default();
+        // Cruise at FL250: the high ceiling.
+        assert_eq!(c.ceiling_for(low, high, 25_000.0, 0.0), Some(305.0));
+        // Descending at 2,500 fpm: 90 s ahead is 3,750 ft lower, so the low
+        // ceiling comes at 11,750 ft, well before 8,000.
+        assert_eq!(c.ceiling_for(low, high, 12_000.0, -2_500.0), Some(305.0));
+        assert_eq!(c.ceiling_for(low, high, 11_700.0, -2_500.0), Some(233.0));
+        // The pitch shallows to bleed the speed: the ceiling HOLDS low, so
+        // the speed is not given straight back.
+        assert_eq!(c.ceiling_for(low, high, 11_000.0, 0.0), Some(233.0));
+        assert_eq!(c.ceiling_for(low, high, 11_000.0, f64::NAN), Some(233.0));
+        assert_eq!(c.ceiling_for(low, high, f64::NAN, 0.0), Some(233.0), "a lost read keeps it");
+        assert_eq!(c.low(), Some(true));
+        // A climb back over the altitude lifts it.
+        assert_eq!(c.ceiling_for(low, high, 7_500.0, 2_000.0), Some(233.0));
+        assert_eq!(c.ceiling_for(low, high, 8_100.0, 2_000.0), Some(305.0));
+        // Nothing measured yet: the low ceiling stands.
+        let mut fresh = VmoCeiling::default();
+        assert_eq!(fresh.ceiling_for(low, high, f64::NAN, 0.0), Some(233.0));
+        // Up high the Mmo's airspeed is the ceiling.
+        let fl430 = fresh.ceiling_for(low, high, 43_000.0, 0.0).unwrap();
+        assert!(fl430 < 240.0, "{fl430}");
     }
 }

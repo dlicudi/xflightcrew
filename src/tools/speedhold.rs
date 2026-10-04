@@ -426,12 +426,14 @@ const THROTTLE_LEAD_S: f64 = 5.0;
 
 /// Sanity bounds for a spoken flight target — outside this it's a mishear.
 ///
-/// The top is the AIRFRAME's (`aircraft::speed_ceiling_kts`, Vne less a
+/// The top is the AIRFRAME's (`aircraft::speed_ceiling_kts_max`, Vne less a
 /// margin, republished per swap); 250 only when the profile declares no Vne.
 /// The flat 250 was a GA number that silently held an A330's cruise governor
-/// forty knots under its profile's 290 (2026-09-20).
+/// forty knots under its profile's 290 (2026-09-20). On an airframe with a
+/// `vmo_high:` it is the HIGH ceiling, and the governor holds the target
+/// under the ceiling where it flies, every tick (`aircraft::VmoCeiling`).
 pub fn clamp_target(kts: f64) -> f64 {
-    let ceiling = crate::aircraft::speed_ceiling_kts()
+    let ceiling = crate::aircraft::speed_ceiling_kts_max()
         .unwrap_or(250.0)
         .max(55.0);
     kts.clamp(55.0, ceiling)
@@ -911,7 +913,7 @@ impl Tool for HoldSpeed {
                             .unwrap_or(0.0);
                         let floor = crate::aircraft::config_floor_kts(flaps)
                             .or(crate::aircraft::speed_floor_kts());
-                        let ceiling = crate::aircraft::speed_ceiling_kts();
+                        let ceiling = ceiling_now(ctx.xplane).await;
                         let want = crate::aircraft::floored_target(k, floor);
                         let want = ceiling.map_or(want, |c| want.min(c));
                         crate::procedure::take_speed(want);
@@ -993,7 +995,7 @@ impl Tool for HoldSpeed {
                 .unwrap_or(0.0);
             match spoken_flight_target(
                 k,
-                crate::aircraft::speed_ceiling_kts().unwrap_or(250.0),
+                ceiling_now(ctx.xplane).await.unwrap_or(250.0),
                 crate::aircraft::config_floor_kts(flaps),
                 crate::aircraft::approach_floor_kts().or(crate::aircraft::speed_floor_kts()),
             ) {
@@ -1071,6 +1073,19 @@ impl Tool for HoldSpeed {
             )
         })
     }
+}
+
+/// The live airframe's speed ceiling where the aircraft is NOW, for a spoken
+/// number judged once: at the indicated altitude on an airframe with a
+/// `vmo_high:` (the Citation X's 233 below 8,000 ft is 305 above), the
+/// plain ceiling otherwise, with no read at all. A failed altitude read is
+/// the low (conservative) ceiling.
+async fn ceiling_now(xp: &dyn crate::xplane::XPlane) -> Option<f64> {
+    if crate::aircraft::published_vmo_high().is_none() {
+        return crate::aircraft::speed_ceiling_kts();
+    }
+    let alt = xp.get_float(crate::datarefs::ALTITUDE_FT).await.unwrap_or(f64::NAN);
+    crate::aircraft::speed_ceiling_kts_at(alt)
 }
 
 /// Glide a lever dataref from wherever it is to `to` in 50 ms micro-steps —
@@ -1166,6 +1181,11 @@ async fn governor(xp: XPlaneClient, voice: Option<crate::voice::Voice>) {
     let mut ground_since: Option<std::time::Instant> = None;
     let clock = std::time::Instant::now();
     let mut gs_trend = 0.0_f64;
+    // The ceiling where the aircraft flies, on an airframe whose Vmo rises
+    // with altitude: a target armed at FL300 is held under the low Vmo
+    // BEFORE a descent crosses its altitude.
+    let mut vmo = crate::aircraft::VmoCeiling::default();
+    let mut vmo_capped = false;
     loop {
         if !ACTIVE.load(Ordering::Relaxed) {
             break;
@@ -1186,8 +1206,31 @@ async fn governor(xp: XPlaneClient, voice: Option<crate::voice::Voice>) {
             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
             continue;
         }
-        let target = *TARGET_KTS.lock().unwrap_or_else(|e| e.into_inner());
+        let mut target = *TARGET_KTS.lock().unwrap_or_else(|e| e.into_inner());
         let mode = *MODE.lock().unwrap_or_else(|e| e.into_inner());
+        // Read only on an airframe that declares a `vmo_high:`: every other
+        // governor makes the requests it always made.
+        if mode == Mode::Flight && crate::aircraft::published_vmo_high().is_some() {
+            let (alt, vs) = tokio::join!(
+                xp.get_float(crate::datarefs::ALTITUDE_FT),
+                xp.get_float(crate::datarefs::VVI_FPM),
+            );
+            let alt = alt.unwrap_or(f64::NAN);
+            let vs = vs.unwrap_or(f64::NAN);
+            if let Some(c) = vmo.ceiling(alt, vs) {
+                let capped = target > c;
+                if capped != vmo_capped {
+                    vmo_capped = capped;
+                    crate::blackbox::record(
+                        "speedhold",
+                        serde_json::json!({"event": "vmo_ceiling", "capped": capped,
+                                           "target": target, "ceiling": c,
+                                           "alt_ft": alt, "vs_fpm": vs}),
+                    );
+                }
+                target = target.min(c);
+            }
+        }
         // Three-valued on purpose: a FAILED read is a sim hiccup, not an
         // answer — it must never impersonate "airborne" (the Web API blinked
         // during a plugin reload and the taxi governor dropped a braking
@@ -1948,7 +1991,7 @@ mod tests {
         // A jet's cap is under its overspeed caution (0.9 Vne less the
         // margin), and the airspace rule below 10,000 ft is applied separately
         // by `flight_target_for_alt`.
-        crate::aircraft::publish_speed_ceiling(Some(330.0));
+        crate::aircraft::publish_speed_ceiling(Some(330.0), None);
         assert_eq!(
             clamp_target(270.0),
             270.0,
@@ -1956,9 +1999,9 @@ mod tests {
         );
         assert_eq!(clamp_target(700.0), 287.0);
         // The 737: Vne 340, caution from 306. Vne less 15 (325) was inside it.
-        crate::aircraft::publish_speed_ceiling(Some(340.0));
+        crate::aircraft::publish_speed_ceiling(Some(340.0), None);
         assert!(clamp_target(320.0) < 340.0 * crate::monitor::OVERSPEED_CAUTION_FACTOR);
-        crate::aircraft::publish_speed_ceiling(None);
+        crate::aircraft::publish_speed_ceiling(None, None);
         assert_eq!(clamp_target(290.0), 250.0);
         assert_eq!(clamp_taxi_target(10.0), 10.0);
         assert_eq!(clamp_taxi_target(60.0), 25.0, "no takeoff-roll 'taxi'");

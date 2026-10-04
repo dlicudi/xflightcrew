@@ -188,10 +188,14 @@ lights:
 throttle_dataref: sim/cockpit2/engine/actuators/throttle_jet_rev_ratio_all
 
 # Vmo is ALTITUDE-DEPENDENT on this aircraft: 270 KIAS below 8,000 ft, 350
-# above (Mmo 0.935). The monitor carries one number and everything the
-# automation flies happens low, so the LOW-altitude limit is the one declared —
-# conservative where it matters, and it will nag in a high-speed cruise.
+# above, and Mmo 0.935 (which is the lower limit from about FL290 up).
+# `vne_kts` is the LOW limit, the one a caller without an altitude gets;
+# `vmo_high` is the limit at and above `above_ft` (indicated), for the
+# governor's ceiling and the monitor's overspeed bands alike. With the low
+# number alone the cruise was capped at 233 KIAS everywhere and a high-speed
+# cruise would have nagged "overspeed" over 243.
 vne_kts: 270.0
+vmo_high: { above_ft: 8000.0, kts: 350.0, mmo: 0.935 }
 # Clean stall (Vs1). Full-flap stall is 115; minimum controllable speed is 140.
 vs_clean_kts: 136.0
 # Gear operating/extended limit.
@@ -232,7 +236,7 @@ reference:
   vy_kts: 200.0               # initial climb-out / pattern speed (POM Vy 300 is cruise climb)
   vx_kts: 270.0                # POM best angle (again a cruise figure)
   best_climb_fpm: 3650.0       # POM: rate of climb; the climb law takes 80%
-  cruise_ias_kts: 270.0        # KIAS held in cruise (Mmo 0.935 up high)
+  cruise_ias_kts: 300.0        # KIAS in cruise, under the high ceiling (305); Mmo caps it up high
   approach_kts: 132.0          # POM: Vref
   vs0_kts: 115.0               # POM: stall, landing configuration
   cruise_kts: 527.0            # M0.92 at altitude, KTAS

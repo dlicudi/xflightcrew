@@ -5464,7 +5464,7 @@ mod tests {
         assert!(p.autopilot && p.throttle && p.retractable_gear);
         assert!(!p.engine, "a jet declares no piston engine group");
         // POM p.80: Vr 145, Vref 132, Vs1 clean 136, Vle 210. Vmo is altitude
-        // dependent (270 low / 350 high) and the low figure is the one flown.
+        // dependent (270 low / 350 high), the low figure its `vne_kts`.
         let r = p.reference.as_ref().expect("reference figures");
         assert_eq!(r.vr_kts, Some(145.0));
         assert_eq!(r.approach_kts, Some(132.0));

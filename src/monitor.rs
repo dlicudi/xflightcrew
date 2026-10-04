@@ -1109,8 +1109,13 @@ impl Check for StallSpeed {
 struct Overspeed {
     id: &'static str,
     severity: Severity,
-    /// Never-exceed speed (kts) the bands scale off.
+    /// Never-exceed speed (kts) the bands scale off: the LOW one on an
+    /// airframe with a `vmo_high:`.
     vne_kts: f64,
+    /// The higher Vmo above an altitude (the Citation X's 350 over 8,000
+    /// ft): the bands scale off the limit at the indicated altitude
+    /// (`aircraft::vne_at`). `None` = `vne_kts` everywhere.
+    vmo_high: Option<crate::aircraft::VmoHigh>,
     /// Fires when IAS ≥ this × Vne …
     at_or_above_factor: f64,
     /// … and (if set) still below this × Vne — the more urgent band owns above.
@@ -1144,10 +1149,10 @@ impl Check for Overspeed {
         // band trips with margin before redline. A decaying trend never raises the
         // projected speed, so it can't mask a falling-back-to-safe reading.
         let projected = s.ias_kts + s.ias_trend_kts_per_s.max(0.0) * OVERSPEED_LOOKAHEAD_S;
-        let in_band = projected >= self.at_or_above_factor * self.vne_kts
-            && self
-                .below_factor
-                .is_none_or(|b| projected < b * self.vne_kts);
+        let vne = crate::aircraft::vne_at(Some(self.vne_kts), self.vmo_high, s.alt_ft)
+            .unwrap_or(self.vne_kts);
+        let in_band = projected >= self.at_or_above_factor * vne
+            && self.below_factor.is_none_or(|b| projected < b * vne);
         if !in_band {
             return None;
         }
@@ -2502,6 +2507,7 @@ fn build_checks(profile: &AircraftProfile) -> Vec<Box<dyn Check>> {
             id: "overspeed_caution",
             severity: Severity::Caution,
             vne_kts: vne,
+            vmo_high: profile.vmo_high,
             at_or_above_factor: OVERSPEED_CAUTION_FACTOR,
             below_factor: Some(1.0),
         }));
@@ -2509,6 +2515,7 @@ fn build_checks(profile: &AircraftProfile) -> Vec<Box<dyn Check>> {
             id: "overspeed_warning",
             severity: Severity::Warning,
             vne_kts: vne,
+            vmo_high: profile.vmo_high,
             at_or_above_factor: 1.0,
             below_factor: None,
         }));
@@ -6219,6 +6226,48 @@ mod tests {
         let mut s = b738_dry_centre(true);
         s.engine_running = false;
         assert!(c.eval(&s).is_none());
+    }
+
+    /// The overspeed checks' verdicts for a profile at an IAS and altitude:
+    /// (caution, warning) fired.
+    fn overspeed_at(p: &crate::aircraft::AircraftProfile, ias: f64, alt_ft: f64) -> (bool, bool) {
+        let mut s = snap(true, true);
+        s.on_ground = false;
+        s.ias_kts = ias;
+        s.ias_trend_kts_per_s = 0.0;
+        s.alt_ft = alt_ft;
+        let checks = build_checks(p);
+        let fired = |id: &str| checks.iter().any(|c| c.id() == id && c.eval(&s).is_some());
+        (fired("overspeed_caution"), fired("overspeed_warning"))
+    }
+
+    #[test]
+    fn the_citation_x_overspeed_is_judged_at_its_altitude() {
+        let p = crate::aircraft::load("citation_x").expect("citation_x profile");
+        // Low: Vmo 270, the caution from 243.
+        assert_eq!(overspeed_at(&p, 250.0, 5_000.0), (true, false));
+        assert_eq!(overspeed_at(&p, 275.0, 5_000.0), (false, true));
+        // At FL200 the limit is 350 (the Mmo's airspeed there is 442): 300
+        // is a cruise, not an overspeed; the caution from 315.
+        assert_eq!(overspeed_at(&p, 300.0, 20_000.0), (false, false));
+        assert_eq!(overspeed_at(&p, 320.0, 20_000.0), (true, false));
+        assert_eq!(overspeed_at(&p, 355.0, 20_000.0), (false, true));
+        // At FL430 the Mmo is the limit: M0.935 is about 268 KIAS there.
+        assert_eq!(overspeed_at(&p, 275.0, 43_000.0), (false, true));
+        // An altitude not read is the low (conservative) limit.
+        assert_eq!(overspeed_at(&p, 250.0, f64::NAN), (true, false));
+    }
+
+    #[test]
+    fn an_overspeed_without_a_high_vmo_is_one_vne_at_every_altitude() {
+        let p = crate::aircraft::load("boeing_737_800").expect("737 profile");
+        assert!(p.vmo_high.is_none());
+        let vne = p.vne_kts.expect("737 Vne");
+        for alt in [2_000.0, 20_000.0, 37_000.0] {
+            assert_eq!(overspeed_at(&p, vne * 0.95, alt), (true, false), "{alt}");
+            assert_eq!(overspeed_at(&p, vne + 1.0, alt), (false, true), "{alt}");
+            assert_eq!(overspeed_at(&p, vne * 0.85, alt), (false, false), "{alt}");
+        }
     }
 
     #[test]

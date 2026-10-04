@@ -70,6 +70,9 @@ pub struct Speeds {
     /// less 15 and the cruise cap under the overspeed caution).
     pub floor_kts: Option<f64>,
     pub ceiling_kts: Option<f64>,
+    /// The higher Vmo above an altitude (`aircraft::VmoHigh`): placed at or
+    /// over it, the ceiling is that limit's, not `ceiling_kts` (the low one).
+    pub vmo_high: Option<crate::aircraft::VmoHigh>,
 }
 
 /// Where and how the new flight starts.
@@ -213,7 +216,10 @@ fn start_speed(
     if alt_ft < BELOW_10K_FT {
         kts = kts.min(BELOW_10K_KTS);
     }
-    if let Some(c) = speeds.ceiling_kts {
+    let ceiling = crate::aircraft::vne_at(None, speeds.vmo_high, alt_ft)
+        .map(crate::aircraft::ceiling_from_vne)
+        .or(speeds.ceiling_kts);
+    if let Some(c) = ceiling {
         kts = kts.min(c);
     }
     if let Some(f) = speeds.floor_kts {
@@ -603,6 +609,7 @@ impl Tool for SetUpEnroute {
             profile_kts: self.cruise_ias_kts,
             floor_kts: crate::aircraft::speed_floor_kts(),
             ceiling_kts: ceiling,
+            vmo_high: crate::aircraft::published_vmo_high(),
         };
         let p = match place(&plan, &point, &speeds) {
             Ok(p) => p,
@@ -1048,7 +1055,34 @@ mod tests {
     /// The 737's numbers: 255 cruise, floor about 167, ceiling the cruise
     /// cap under the overspeed caution (Vne 340: 296).
     fn b738() -> Speeds {
-        Speeds { profile_kts: Some(255.0), floor_kts: Some(167.0), ceiling_kts: Some(296.0) }
+        Speeds {
+            profile_kts: Some(255.0),
+            floor_kts: Some(167.0),
+            ceiling_kts: Some(296.0),
+            vmo_high: None,
+        }
+    }
+
+    /// A start over a `vmo_high:` altitude takes the HIGH ceiling: with the
+    /// low one alone (the Citation X's 233) the OFP's 299 at FL180 would
+    /// have been cut to it.
+    #[test]
+    fn a_start_up_high_takes_the_high_vmo_ceiling() {
+        let plan = egkk_egbb();
+        let low_only = Speeds { ceiling_kts: Some(233.0), ..b738() };
+        let p = place(&plan, &EnroutePoint::BeforeTod(30.0), &low_only).unwrap();
+        assert_eq!(p.ias_kts, 233.0);
+        let high = Speeds {
+            vmo_high: Some(crate::aircraft::VmoHigh {
+                above_ft: 8_000.0,
+                kts: 350.0,
+                mmo: Some(0.935),
+            }),
+            ..low_only
+        };
+        let q = place(&plan, &EnroutePoint::BeforeTod(30.0), &high).unwrap();
+        assert_eq!(q.alt_ft, 18_000.0);
+        assert_eq!(q.ias_kts, 299.0, "under the high ceiling, 305");
     }
 
     /// The navlog's top of descent (52.3054 N 1.2774 W) sits 16 nm past
