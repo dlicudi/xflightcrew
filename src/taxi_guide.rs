@@ -199,7 +199,7 @@ impl Guide {
             }
             let bearing_in = bearing(point_at(&pts, &cum, cum[i] - WINDOW_M), pts[i]);
             let bearing_out = bearing(pts[i], point_at(&pts, &cum, cum[i] + WINDOW_M));
-            let delta = angle_diff(bearing_out, bearing_in);
+            let delta = crate::angles::signed_diff_deg(bearing_out, bearing_in);
             let prev_name = named_before(i - 1);
             let new_name = !leg_name.is_empty() && prev_name != Some(leg_name.as_str());
             let spoken = spoken_taxiway(&leg_name);
@@ -719,12 +719,6 @@ pub(crate) fn bearing(a: (f64, f64), b: (f64, f64)) -> f64 {
     (b.0 - a.0).atan2(b.1 - a.1).to_degrees().rem_euclid(360.0)
 }
 
-/// Smallest signed angle a−b, degrees, in −180..180. Positive = `a` is
-/// clockwise of `b` (a right turn when in/out bearings are compared).
-pub(crate) fn angle_diff(a: f64, b: f64) -> f64 {
-    (a - b + 540.0).rem_euclid(360.0) - 180.0
-}
-
 /// The point `s` meters along the polyline (clamped to its ends).
 pub(crate) fn point_at(pts: &[(f64, f64)], cum: &[f64], s: f64) -> (f64, f64) {
     let s = s.clamp(0.0, *cum.last().unwrap());
@@ -859,7 +853,7 @@ fn project_signed_with(
         let (dx, dy) = (b.0 - a.0, b.1 - a.1);
         let len2 = dx * dx + dy * dy;
         if let Some(hdg) = facing {
-            if len2 >= 1.0 && angle_diff(bearing(a, b), hdg).abs() > 90.0 {
+            if len2 >= 1.0 && crate::angles::abs_diff_deg(bearing(a, b), hdg) > 90.0 {
                 cum += len2.sqrt();
                 continue;
             }

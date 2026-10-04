@@ -653,7 +653,7 @@ pub fn local_route(
                 .filter(|(_, k)| *k >= 4.0)
                 .map(|(d, _)| d)
                 .unwrap_or_else(|| nav::bearing_deg(from.0, from.1, lat, lon));
-            let score = ((heading - target + 540.0).rem_euclid(360.0) - 180.0).abs();
+            let score = crate::angles::abs_diff_deg(heading, target);
             ends.push((score, id.clone(), lat, lon, heading));
         }
     }

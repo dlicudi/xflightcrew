@@ -5,6 +5,7 @@
 //! flight recorder. Nothing in here knows about the copilot loop or the ATC
 //! station; both depend on this crate, never the other way around.
 
+pub mod angles;
 pub mod blackbox;
 pub mod datarefs;
 pub mod position;

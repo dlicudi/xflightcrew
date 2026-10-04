@@ -49,7 +49,7 @@ pub fn new_edition(edition: &Snapshot, cur: &Snapshot) -> bool {
     }
     // Direction only matters when there's enough wind for it to mean anything.
     if cur.wind_kts.max(edition.wind_kts) >= VARIABLE_WIND_KTS {
-        let d = (cur.wind_from_deg - edition.wind_from_deg + 540.0).rem_euclid(360.0) - 180.0;
+        let d = sim::angles::signed_diff_deg(cur.wind_from_deg, edition.wind_from_deg);
         if d.abs() >= 30.0 {
             return true;
         }

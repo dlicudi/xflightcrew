@@ -19,7 +19,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use crate::hover::{self, Goal};
-use crate::taxi_guide::{angle_diff, bearing, dist, Geo};
+use crate::taxi_guide::{bearing, dist, Geo};
 use crate::voice::{Priority, Voice};
 use crate::xplane::XPlaneClient;
 
@@ -247,7 +247,7 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, right: bool) {
         } else {
             // Turn onto the next leg before the corner, by the turn's size.
             let next = pattern[leg + 1].1;
-            let turn = angle_diff(bearing(to, next), bearing(here, to));
+            let turn = crate::angles::signed_diff_deg(bearing(to, next), bearing(here, to));
             if d < lead_m(turn).max(40.0) {
                 leg += 1;
                 let name = pattern[leg].0.name();

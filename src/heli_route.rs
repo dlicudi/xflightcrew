@@ -30,7 +30,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use crate::hover::{self, Goal};
-use crate::taxi_guide::{angle_diff, bearing, dist, Geo};
+use crate::taxi_guide::{bearing, dist, Geo};
 use crate::voice::{Priority, Voice};
 use crate::xplane::XPlaneClient;
 
@@ -1030,7 +1030,7 @@ pub fn corner_factor(pts: &[(f64, f64)], here: (f64, f64)) -> f64 {
     let Some((mid, _)) = pursue(pts, here, ROUTE_AHEAD_M / 2.0) else {
         return 1.0;
     };
-    let turn = angle_diff(bearing(mid, far), bearing(near, mid)).abs();
+    let turn = crate::angles::abs_diff_deg(bearing(mid, far), bearing(near, mid));
     (1.0 - turn / 90.0 * 0.7).clamp(0.3, 1.0)
 }
 
@@ -2027,12 +2027,12 @@ async fn fly(
         while leg + 1 < pts.len() {
             let to = pts[leg].1;
             let next = pts[leg + 1].1;
-            let turn = angle_diff(bearing(to, next), bearing(here, to));
+            let turn = crate::angles::signed_diff_deg(bearing(to, next), bearing(here, to));
             let lead = (turn_radius_m(s.gs.max(10.0))
                 * (turn.abs().min(120.0) / 2.0).to_radians().tan())
             .max(300.0);
             let behind =
-                angle_diff(bearing(here, to), s.psi).abs() > 100.0 && dist(here, to) < 3000.0;
+                crate::angles::abs_diff_deg(bearing(here, to), s.psi) > 100.0 && dist(here, to) < 3000.0;
             if dist(here, to) < lead || behind {
                 leg += 1;
                 crate::blackbox::record(
@@ -2047,7 +2047,7 @@ async fn fly(
         let (ident, to) = (&pts[leg].0, pts[leg].1);
         let track = bearing(here, to);
         let to_pad = dist(here, pad);
-        let variation = angle_diff(s.psi, s.mag);
+        let variation = crate::angles::signed_diff_deg(s.psi, s.mag);
 
         // The radio is worked whatever the phase: the handoffs arrive in the
         // climb (the tower's) and anywhere enroute (the region's).
@@ -2209,7 +2209,7 @@ async fn fly(
                 let want_bug = (track - variation).rem_euclid(360.0);
                 let bug = match bug_set {
                     _ if around.is_some() => around.as_ref().map_or(0.0, |a| a.bug),
-                    Some(b) if angle_diff(want_bug, b).abs() < BUG_HYSTERESIS_DEG => b,
+                    Some(b) if crate::angles::abs_diff_deg(want_bug, b) < BUG_HYSTERESIS_DEG => b,
                     _ => {
                         let b = want_bug.round().rem_euclid(360.0);
                         let _ = xp
@@ -2344,7 +2344,7 @@ async fn fly(
                     let final_m = gate.map_or(final_len_m(depart_agl_ft), |(_, g)| final_len_m(g));
                     let behind = leg + 1 == pts.len()
                         && to_pad < 3000.0
-                        && angle_diff(bearing(here, pad), s.psi).abs() > 90.0;
+                        && crate::angles::abs_diff_deg(bearing(here, pad), s.psi) > 90.0;
                     let check = slow_check(gs_kts, s.ias, remaining, final_m, behind);
                     if check != SlowCheck::OnTrack {
                         let course = s.psi;

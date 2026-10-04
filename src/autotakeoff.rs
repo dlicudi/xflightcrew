@@ -33,7 +33,7 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use crate::autoland::{along_track_nm, cross_track_nm, heading_diff, true_to_mag, Runway};
+use crate::autoland::{along_track_nm, cross_track_nm, true_to_mag, Runway};
 use crate::tools::autopilot::ApConfig;
 use crate::voice::{Priority, Voice};
 use crate::xplane::{XPlane, XPlaneClient};
@@ -648,7 +648,7 @@ pub fn runway_fit(
 ) -> Option<(Runway, f64)> {
     let mut best: Option<(Runway, f64, f64)> = None;
     for r in cands {
-        let err = heading_diff(psi_true, r.course_deg);
+        let err = crate::angles::abs_diff_deg(psi_true, r.course_deg);
         if err > ALIGN_MAX_DEG {
             continue;
         }
@@ -840,11 +840,11 @@ pub fn why_no_fit(cands: &[Runway], lat: f64, lon: f64, psi_true: f64, needed_m:
     let lateral = |r: &Runway| (cross_track_nm(lat, lon, r) * M_PER_NM).abs();
     let aligned = cands
         .iter()
-        .filter(|r| heading_diff(psi_true, r.course_deg) <= ALIGN_MAX_DEG)
+        .filter(|r| crate::angles::abs_diff_deg(psi_true, r.course_deg) <= ALIGN_MAX_DEG)
         .min_by(|a, b| lateral(a).total_cmp(&lateral(b)));
     let best = aligned.or_else(|| {
         cands.iter().min_by(|a, b| {
-            heading_diff(psi_true, a.course_deg).total_cmp(&heading_diff(psi_true, b.course_deg))
+            crate::angles::abs_diff_deg(psi_true, a.course_deg).total_cmp(&crate::angles::abs_diff_deg(psi_true, b.course_deg))
         })
     });
     let Some(r) =
@@ -858,7 +858,7 @@ pub fn why_no_fit(cands: &[Runway], lat: f64, lon: f64, psi_true: f64, needed_m:
         };
     };
     let id = r.id.clone();
-    let err = heading_diff(psi_true, r.course_deg);
+    let err = crate::angles::abs_diff_deg(psi_true, r.course_deg);
     if err > ALIGN_MAX_DEG {
         return NoFit::NotAligned { id, err_deg: err };
     }
@@ -908,7 +908,7 @@ pub fn cleared_fits_here(
 ) -> bool {
     cands.iter().any(|r| {
         runway_matches(&r.id, cleared)
-            && heading_diff(psi_true, r.course_deg) <= ALIGN_MAX_DEG
+            && crate::angles::abs_diff_deg(psi_true, r.course_deg) <= ALIGN_MAX_DEG
             && (cross_track_nm(lat, lon, r) * M_PER_NM).abs() <= LATERAL_MAX_M
             && along_track_nm(lat, lon, r) * M_PER_NM <= BEFORE_THRESHOLD_MAX_M
     })
@@ -3139,7 +3139,7 @@ pub(crate) async fn stop_on_centreline(
             let rate = rate_filter.update(prev_xtk.map_or(0.0, |p| (xtk_m - p) / dt), dt);
             prev_xtk = Some(xtk_m);
             let target = roll_target_heading(rwy.course_deg, xtk_m, rate, gs_kts);
-            let err = ((target - psi + 540.0).rem_euclid(360.0)) - 180.0;
+            let err = crate::angles::signed_diff_deg(target, psi);
             let yaw_dps = yaw_r.ok().filter(|v| v.is_finite());
             let steer = if gs_kts >= REJECT_STEER_MIN_KTS {
                 law.step_with_yaw(err, dt, gs_kts, 0.0, yaw_dps)
@@ -3909,14 +3909,14 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, p: Params) {
             // Steer the centreline: PD plus the learned P-factor trim,
             // slew-limited (no tick slams the wheel).
             let xtk_m = cross_track_nm(lat, lon, &rwy) * M_PER_NM;
-            let psi_off = ((psi - rwy.course_deg + 540.0).rem_euclid(360.0)) - 180.0;
+            let psi_off = crate::angles::signed_diff_deg(psi, rwy.course_deg);
             let cut = roll_cut.update(xtk_m, psi_off, gs_kts, dt);
             let (xtk_rate, drift) = (cut.rate_m_s, cut.drift_deg);
             let target = (rwy.course_deg + cut.target_off_deg).rem_euclid(360.0);
-            let err = ((target - psi + 540.0).rem_euclid(360.0)) - 180.0;
+            let err = crate::angles::signed_diff_deg(target, psi);
             last_err = err;
             if !rotated {
-                let off_course = ((psi - rwy.course_deg + 540.0).rem_euclid(360.0)) - 180.0;
+                let off_course = crate::angles::signed_diff_deg(psi, rwy.course_deg);
                 if let Some(why) = lateral_excursion(xtk_m, off_course, gs_kts) {
                     crate::blackbox::record(
                         "autotakeoff",
@@ -4276,7 +4276,7 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, p: Params) {
                 // builds, and the wings against full-power torque — banked
                 // gently toward runway heading, since the rudder steering
                 // ended at liftoff.
-                let hdg_err = ((rwy.course_deg - psi + 540.0).rem_euclid(360.0)) - 180.0;
+                let hdg_err = crate::angles::signed_diff_deg(rwy.course_deg, psi);
                 pitch_law.on_wheels(false);
                 pitch_law.climb_fpm(vs_flown);
                 let pitch = pitch_law.step_climb(theta_deg, pitch_rate, dt, Some((ias, agl_ft)));
@@ -5443,7 +5443,7 @@ mod tests {
             let rate = prev.map_or(0.0, |p| (xtk - p) / TICK);
             prev = Some(xtk);
             let target = roll_target_heading(COURSE, xtk, rate, gs);
-            let err = ((target - psi + 540.0).rem_euclid(360.0)) - 180.0;
+            let err = crate::angles::signed_diff_deg(target, psi);
             pipe.push_back(law.step(err, TICK, gs, 1.0));
             let steer = pipe.pop_front().unwrap_or(0.0);
             for _ in 0..10 {
@@ -5562,7 +5562,7 @@ mod tests {
                 0.0
             };
             let target = roll_target_heading(COURSE, xtk, rate, gs) - drift;
-            let err = ((target - psi + 540.0).rem_euclid(360.0)) - 180.0;
+            let err = crate::angles::signed_diff_deg(target, psi);
             let steer = law.step_with_yaw(err, TICK, gs, 1.0, Some(yaw));
             queue.push_back((t + DEAD_S, steer));
             ticks.push(RollTick {
@@ -5930,7 +5930,7 @@ mod tests {
             let g = |k: &str| r[k].as_f64().unwrap_or(0.0);
             let (gs, xtk, rate) = (g("gs"), g("xtk_m"), g("xtk_rate"));
             let course = g("tgt") - roll_target_heading(0.0, xtk, rate, gs);
-            let psi_off = ((g("psi") - course + 540.0).rem_euclid(360.0)) - 180.0;
+            let psi_off = crate::angles::signed_diff_deg(g("psi"), course);
             let d = filter.update(psi_off, rate, gs, g("dt"));
             worst = worst.max(d.abs());
             if at_vr.is_none() && g("ias") >= 145.0 {
@@ -6069,7 +6069,7 @@ mod tests {
                     return r;
                 }
                 let (a, b) = (k.saturating_sub(1), (k + 1).min(n - 1));
-                let d = ((psi[b] - psi[a] + 540.0).rem_euclid(360.0)) - 180.0;
+                let d = crate::angles::signed_diff_deg(psi[b], psi[a]);
                 if ts[b] > ts[a] {
                     d / (ts[b] - ts[a])
                 } else {
@@ -6120,7 +6120,7 @@ mod tests {
                 t = end;
             }
             let gs = g(r, "gs");
-            let psi_off = ((psi[k] + dpsi - course + 540.0).rem_euclid(360.0)) - 180.0;
+            let psi_off = crate::angles::signed_diff_deg(psi[k] + dpsi, course);
             let c = cut.update(xtk_rec[k] + dx, psi_off, gs, dt);
             let err = c.target_off_deg - psi_off;
             // The throttle as recorded (a propeller's power lead rides it);
@@ -6936,7 +6936,7 @@ mod tests {
                     let corr = (xtk * XTK_GAIN_DEG_PER_M).clamp(-XTK_MAX_DEG, XTK_MAX_DEG);
                     (COURSE - corr).rem_euclid(360.0)
                 };
-                let err = ((target - psi + 540.0).rem_euclid(360.0)) - 180.0;
+                let err = crate::angles::signed_diff_deg(target, psi);
                 pipe.push_back(law.step(err, TICK, gs, 0.0));
                 let steer = pipe.pop_front().unwrap_or(0.0);
                 // Sub-steps: the airframe does not tick at the loop's rate.
@@ -9000,7 +9000,7 @@ mod tests {
             let xtk_rate = sortie_prev_xtk.map_or(0.0, |p: f64| (af.xtk_m - p) / dt);
             sortie_prev_xtk = Some(af.xtk_m);
             let target = roll_target_heading(course_deg, af.xtk_m, xtk_rate, gs_kts);
-            let err = ((target - psi + 540.0).rem_euclid(360.0)) - 180.0;
+            let err = crate::angles::signed_diff_deg(target, psi);
             last_err = err;
             let steer = steer_law.step(err, dt, gs_kts, thr_cmd);
             assert!(

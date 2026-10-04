@@ -180,7 +180,7 @@ pub(crate) fn on_final(fc: &FinalCourse, lat: f64, lon: f64, track_true: f64) ->
     let (x_m, along_m) =
         crate::nav::runway_frame_m(fc.thr_lat, fc.thr_lon, fc.course_true, lat, lon);
     let (along_nm, xtk_nm) = (along_m / 1852.0, x_m / 1852.0);
-    let track_off_deg = ((track_true - fc.course_true + 540.0) % 360.0 - 180.0).abs();
+    let track_off_deg = crate::angles::abs_diff_deg(track_true, fc.course_true);
     (along_nm > 0.0
         && along_nm <= ARRIVAL_REJOIN_NM
         && xtk_nm.abs() <= crate::interaction::REJOIN_CORRIDOR_NM

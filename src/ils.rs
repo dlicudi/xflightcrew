@@ -85,7 +85,7 @@ pub async fn tune_from(
     .filter(|i| i.airport.eq_ignore_ascii_case(&want_icao) && i.runway.eq_ignore_ascii_case(rwy))?;
     let (freq, obs) = tokio::join!(xp.get_float(NAV1_FREQ), xp.get_float(NAV1_OBS));
     let tuned = freq.is_ok_and(|f| f.round() as i64 == ils.freq_10khz);
-    let on_course = obs.is_ok_and(|o| ((o - ils.course_mag + 540.0).rem_euclid(360.0) - 180.0).abs() < 1.0);
+    let on_course = obs.is_ok_and(|o| crate::angles::abs_diff_deg(o, ils.course_mag) < 1.0);
     if !tuned {
         let _ = xp.set_int(NAV1_FREQ, ils.freq_10khz).await;
     }
@@ -94,7 +94,7 @@ pub async fn tune_from(
     }
     let (freq, obs) = tokio::join!(xp.get_float(NAV1_FREQ), xp.get_float(NAV1_OBS));
     let ok = freq.is_ok_and(|f| f.round() as i64 == ils.freq_10khz)
-        && obs.is_ok_and(|o| ((o - ils.course_mag + 540.0).rem_euclid(360.0) - 180.0).abs() < 1.0);
+        && obs.is_ok_and(|o| crate::angles::abs_diff_deg(o, ils.course_mag) < 1.0);
     crate::blackbox::record(
         "ils",
         json!({ "event": "tuned", "icao": icao, "rwy": rwy, "freq_mhz": ils.freq_mhz(),
@@ -415,10 +415,6 @@ const ALIVE_DOTS: f64 = 2.4;
 /// The whole watch, however slow the arrival.
 pub const WATCH_MAX_S: f64 = 25.0 * 60.0;
 
-fn wrap180(a: f64) -> f64 {
-    (a + 540.0).rem_euclid(360.0) - 180.0
-}
-
 /// May the approach mode be armed from here?
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum ArmVerdict {
@@ -436,7 +432,7 @@ pub fn arm_verdict(lat: f64, lon: f64, heading_mag: f64, ils: &crate::nav::Ils) 
     // The approach side lies along the reciprocal of the course from the
     // antenna (which stands past the far end of the runway).
     let from_loc = crate::nav::bearing_deg(ils.lat, ils.lon, lat, lon);
-    let off = wrap180(from_loc - (ils.course_true + 180.0)).abs();
+    let off = crate::angles::wrap180(from_loc - (ils.course_true + 180.0)).abs();
     if off > 90.0 && d > 1.0 {
         return ArmVerdict::Never("we're past the localiser, on the wrong side of the runway");
     }
@@ -444,7 +440,7 @@ pub fn arm_verdict(lat: f64, lon: f64, heading_mag: f64, ils: &crate::nav::Ils) 
     if !covered {
         return ArmVerdict::Wait("we're outside the localiser's coverage");
     }
-    if wrap180(heading_mag - ils.course_mag).abs() > MAX_INTERCEPT_DEG {
+    if crate::angles::wrap180(heading_mag - ils.course_mag).abs() > MAX_INTERCEPT_DEG {
         return ArmVerdict::Wait("we're not heading for the localiser");
     }
     ArmVerdict::Now

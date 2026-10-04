@@ -653,10 +653,6 @@ fn bearing(a: (f64, f64), b: (f64, f64)) -> f64 {
     (b.0 - a.0).atan2(b.1 - a.1).to_degrees().rem_euclid(360.0)
 }
 
-fn angle_diff(a: f64, b: f64) -> f64 {
-    (a - b + 540.0).rem_euclid(360.0) - 180.0
-}
-
 /// A taxi route in metres (x east, y north) with its cumulative lengths.
 #[derive(Debug, Clone)]
 pub struct RefPath {
@@ -778,9 +774,9 @@ pub fn path_demand(
     let ahead = s + v * lead_s(tick);
     let psi_ref = path.chord_deg(ahead, c);
     let d = c / 4.0;
-    let ff = v * angle_diff(path.chord_deg(ahead + d, c), path.chord_deg(ahead - d, c)) / (2.0 * d);
+    let ff = v * crate::angles::signed_diff_deg(path.chord_deg(ahead + d, c), path.chord_deg(ahead - d, c)) / (2.0 * d);
     let lat = path.lateral_m(s, here, c);
-    let err = angle_diff(psi_ref - (lat / l).atan().to_degrees(), psi_true);
+    let err = crate::angles::signed_diff_deg(psi_ref - (lat / l).atan().to_degrees(), psi_true);
     (err, ff)
 }
 #[cfg(test)]
@@ -827,7 +823,7 @@ pub(crate) mod sim {
                     .find(|(t, ..)| *t <= self.t - self.delay_s + 1e-9)
                     .unwrap_or(&(0.0, 0.0, 0.0));
                 let p = &self.plant;
-                let slip = (self.psi - self.trk + 540.0).rem_euclid(360.0) - 180.0;
+                let slip = crate::angles::signed_diff_deg(self.psi, self.trk);
                 let rd = p.kb(v) * u + p.kr(v) * d - p.d(v) * self.r - p.kv(v) * slip + if v > 0.3 { self.w } else { 0.0 };
                 let r1 = self.r + rd * h;
                 self.psi += (self.r + r1) / 2.0 * h;

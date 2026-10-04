@@ -1318,7 +1318,7 @@ pub fn leg_turn_deg(lat: f64, lon: f64, leg: &ProcLeg, next: Option<&ProcLeg>) -
     let there = next?.fix.as_ref()?;
     let inbound = crate::nav::bearing_deg(lat, lon, here.lat, here.lon);
     let outbound = crate::nav::bearing_deg(here.lat, here.lon, there.lat, there.lon);
-    Some(((outbound - inbound + 540.0).rem_euclid(360.0)) - 180.0)
+    Some(crate::angles::signed_diff_deg(outbound, inbound))
 }
 
 /// Has the current leg been flown? A fix leg completes inside `capture_nm`
@@ -2916,7 +2916,7 @@ impl HeadingHold {
     /// The heading to set now, or `None` to leave the knob alone. Pure.
     pub fn decide(&mut self, leg: usize, want_mag: f64, heading_mag: f64, bank_deg: f64, now_s: f64) -> Option<f64> {
         let want = want_mag.round().rem_euclid(360.0);
-        let diff = |a: f64, b: f64| ((a - b + 540.0).rem_euclid(360.0)) - 180.0;
+        let diff = |a: f64, b: f64| crate::angles::signed_diff_deg(a, b);
         let turn = diff(want, heading_mag);
         let new_leg = self.leg != Some(leg) || self.set.is_none();
         let command = if new_leg {
@@ -3666,7 +3666,7 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, plan: Pla
         let psi_v = Some(psi);
         let crab = match (psi_v, hpath_r.as_ref().ok().copied().filter(|v| v.is_finite())) {
             (Some(psi), Some(hp)) => {
-                (((psi - hp + 540.0).rem_euclid(360.0)) - 180.0).clamp(-25.0, 25.0)
+                crate::angles::signed_diff_deg(psi, hp).clamp(-25.0, 25.0)
             }
             _ => 0.0,
         };
@@ -3855,7 +3855,7 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, plan: Pla
                     stalls = 0;
                 }
                 let turn = bearing_to_fix(lat, lon, leg)
-                    .map(|b| ((b - psi + 540.0).rem_euclid(360.0) - 180.0).abs())
+                    .map(|b| crate::angles::abs_diff_deg(b, psi))
                     .unwrap_or(0.0);
                 let grace = leg_turn_grace_s(turn);
                 closure = Some((
@@ -6291,7 +6291,7 @@ mod tests {
             if run.established_nm.is_none() {
                 let faf = CourseLine::of_leg(&legs[1], VAR).unwrap();
                 let (along, xtk_m) = (faf.along_nm(lat, lon), faf.xtk_nm(lat, lon) * 1852.0);
-                let off = ((hdg - faf.course_true() + 540.0).rem_euclid(360.0) - 180.0).abs();
+                let off = crate::angles::abs_diff_deg(hdg, faf.course_true());
                 if along > 0.0 && xtk_m.abs() < 300.0 && off < 10.0 {
                     run.established_nm = Some(along);
                 }
@@ -6373,7 +6373,7 @@ mod tests {
                 run.max_descent_ias = run.max_descent_ias.max(ias);
             }
             // The heading mode: a rate-limited roll to 25 degrees, the short way.
-            let err = ((bug_true - hdg + 540.0).rem_euclid(360.0)) - 180.0;
+            let err = crate::angles::signed_diff_deg(bug_true, hdg);
             let want_bank = (err * 1.5).clamp(-25.0, 25.0);
             bank += (want_bank - bank).clamp(-5.0 * dt, 5.0 * dt);
             let v_ms = gs * 0.514_444;
@@ -7092,7 +7092,7 @@ mod tests {
         // already banked. Which is exactly what it flew.
         let stale = true_to_mag(psi_true, here + 11.4);
         let commanded = crate::circuit::bug_toward(stale, 122.2, stale, 25.0, 40.0);
-        let error = ((commanded - correct + 540.0).rem_euclid(360.0)) - 180.0;
+        let error = crate::angles::signed_diff_deg(commanded, correct);
         assert!(
             (error - 11.4).abs() < 0.1,
             "a standing turn command, not a capture: {error:.1} degrees"

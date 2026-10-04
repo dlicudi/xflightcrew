@@ -68,7 +68,7 @@ pub fn deviations(path: &ApproachPath, lat: f64, lon: f64, alt_ft: f64) -> Devia
     // they're equal; if the threshold bears RIGHT of course the aircraft sits
     // LEFT of the extended centerline.
     let brg = bearing_deg(lat, lon, path.thr_lat, path.thr_lon);
-    let dev = angle_diff_deg(brg, path.course_deg);
+    let dev = crate::angles::signed_diff_deg(brg, path.course_deg);
     let xtk_nm = dist_nm * dev.to_radians().sin();
     let along_nm = dist_nm * dev.to_radians().cos();
     let ideal = path.elev_ft + THRESHOLD_CROSSING_FT + along_nm.max(0.0) * path.ft_per_nm;
@@ -130,11 +130,6 @@ pub fn cadence_secs(dist_nm: f64) -> f64 {
     } else {
         6.0
     }
-}
-
-/// Smallest signed angle a−b, degrees, in −180..180.
-fn angle_diff_deg(a: f64, b: f64) -> f64 {
-    (a - b + 540.0).rem_euclid(360.0) - 180.0
 }
 
 /// Initial great-circle bearing from point 1 to point 2, degrees true 0..360.

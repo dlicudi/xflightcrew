@@ -4824,7 +4824,7 @@ fn build_arrival(
         .map(|(id, _, _)| id);
     // ...otherwise the end most aligned with our arrival bearing.
     let rwy_id = planned.or(by_wind).or_else(|| {
-        let diff = |a: f64, b: f64| ((a - b + 540.0).rem_euclid(360.0) - 180.0).abs();
+        let diff = |a: f64, b: f64| crate::angles::abs_diff_deg(a, b);
         let (mut best_id, mut best_score) = (None::<String>, f64::MAX);
         // Hard runways only: LOWI's alignment pick was the grass "26R".
         for r in crate::nav::assignable_runways(&airport.runways) {
@@ -7086,7 +7086,7 @@ async fn lined_up_check(
         return Ok(Ok(()));
     };
     let lateral_m = crate::autoland::cross_track_nm(lat, lon, rwy) * 1852.0;
-    let err_deg = crate::autoland::heading_diff(psi, rwy.course_deg);
+    let err_deg = crate::angles::abs_diff_deg(psi, rwy.course_deg);
     let arrived = crate::autotaxi::LAST_ARRIVED.load(SeqCst);
     let verdict = judge_lined_up(
         drove,
@@ -7167,8 +7167,8 @@ mod runway_start_tests {
         let best_aligned = cands
             .iter()
             .min_by(|a, b| {
-                crate::autoland::heading_diff(psi, a.course_deg)
-                    .total_cmp(&crate::autoland::heading_diff(psi, b.course_deg))
+                crate::angles::abs_diff_deg(psi, a.course_deg)
+                    .total_cmp(&crate::angles::abs_diff_deg(psi, b.course_deg))
             })
             .unwrap();
         assert_eq!(best_aligned.id, "26R");

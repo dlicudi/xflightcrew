@@ -180,10 +180,6 @@ fn hm(t: f64) -> String {
     format!("{:02}:{:02}", s / 3600, (s / 60) % 60)
 }
 
-fn wrap180(d: f64) -> f64 {
-    (d + 540.0).rem_euclid(360.0) - 180.0
-}
-
 /// Consecutive ticks of one stream, split on a gap.
 fn runs<'s, 'a>(log: &'s Log<'a>, kind: &'s str, name: &'s str, gap: f64) -> Vec<Vec<&'s Rec<'a>>> {
     let mut out: Vec<Vec<&Rec>> = Vec::new();
@@ -1195,8 +1191,8 @@ fn c_heading_once(log: &Log) -> Verdict {
     for w in sets.windows(3) {
         let same_leg = num(w[0].v, "idx") == num(w[2].v, "idx");
         let quick = w[2].t - w[0].t <= 30.0;
-        let d1 = wrap180(num(w[1].v, "hdg").unwrap_or(0.0) - num(w[0].v, "hdg").unwrap_or(0.0));
-        let d2 = wrap180(num(w[2].v, "hdg").unwrap_or(0.0) - num(w[1].v, "hdg").unwrap_or(0.0));
+        let d1 = crate::angles::wrap180(num(w[1].v, "hdg").unwrap_or(0.0) - num(w[0].v, "hdg").unwrap_or(0.0));
+        let d2 = crate::angles::wrap180(num(w[2].v, "hdg").unwrap_or(0.0) - num(w[1].v, "hdg").unwrap_or(0.0));
         if same_leg && quick && d1 * d2 < 0.0 && d1.abs() >= 2.0 && d2.abs() >= 2.0 {
             flips.push(hm(w[1].t));
         }
@@ -1313,7 +1309,7 @@ fn c_circuit_short_way(log: &Log) -> Verdict {
         let same = cur.is_some_and(|c| c.0 == leg && r.t - c.1 < 900.0);
         if same {
             if let Some(c) = cur.as_mut() {
-                c.3 += wrap180(psi - c.2);
+                c.3 += crate::angles::wrap180(psi - c.2);
                 c.2 = psi;
             }
         } else {

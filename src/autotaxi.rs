@@ -671,7 +671,7 @@ fn route_bends(pts: &[(f64, f64)], cum: &[f64]) -> Vec<Bend> {
         }
         let b = taxi_guide::bearing(pts[i], pts[i + 1]);
         if let Some(p) = last_brg {
-            let t = taxi_guide::angle_diff(b, p);
+            let t = crate::angles::signed_diff_deg(b, p);
             if t != 0.0 {
                 vt.push((cum[i], t));
             }
@@ -880,7 +880,7 @@ impl Route {
         let geo = taxi_guide::Geo::new(self.path[0].0);
         let here = geo.to_m(self.path[0], (lat, lon));
         let aim = taxi_guide::point_at(&self.pts, &self.cum, progress + lookahead);
-        taxi_guide::angle_diff(taxi_guide::bearing(here, aim), heading_true)
+        crate::angles::signed_diff_deg(taxi_guide::bearing(here, aim), heading_true)
     }
 
     /// The yaw rate the ROUTE ITSELF asks for across the aim span, degrees
@@ -909,7 +909,7 @@ impl Route {
                 taxi_guide::point_at(&self.pts, &self.cum, s + STEP_M),
             )
         };
-        let turn = taxi_guide::angle_diff(dir(progress + lookahead), dir(progress));
+        let turn = crate::angles::signed_diff_deg(dir(progress + lookahead), dir(progress));
         turn * (gs_kts * 0.514) / lookahead
     }
 
@@ -956,7 +956,7 @@ impl Route {
         lookahead: f64,
     ) -> f64 {
         match self.final_bearing_deg() {
-            Some(b) => taxi_guide::angle_diff(b, heading_true),
+            Some(b) => crate::angles::signed_diff_deg(b, heading_true),
             None => self.heading_err_deg(lat, lon, heading_true, progress, lookahead),
         }
     }
@@ -1622,7 +1622,7 @@ impl LineUpAlign {
 
     /// Signed error, positive = the runway is right of the nose.
     pub fn err_deg(&self, psi_true: f64) -> f64 {
-        ((self.course_deg - psi_true + 540.0).rem_euclid(360.0)) - 180.0
+        crate::angles::signed_diff_deg(self.course_deg, psi_true)
     }
 
     pub fn step(
@@ -2000,7 +2000,7 @@ pub(crate) fn join_turn(
             if straight < JOIN_STRAIGHT_MIN_M {
                 continue;
             }
-            let intercept = taxi_guide::angle_diff(hs.rem_euclid(360.0), leg).abs();
+            let intercept = crate::angles::abs_diff_deg(hs.rem_euclid(360.0), leg);
             if intercept > JOIN_INTERCEPT_DEG {
                 continue;
             }
@@ -2274,7 +2274,7 @@ fn roll_forward_entry_m(
     heading_deg: Option<f64>,
 ) -> Option<f64> {
     let psi = heading_deg?;
-    let rel = ((psi - course_deg + 540.0).rem_euclid(360.0) - 180.0).to_radians();
+    let rel = crate::angles::signed_diff_deg(psi, course_deg).to_radians();
     let s = rel.sin();
     if s.abs() < 0.26 {
         return None; // within ~15 degrees of the runway: no clean forward crossing
@@ -2663,7 +2663,7 @@ pub fn on_strip_settle_path(
 ) -> Option<(Vec<(f64, f64)>, f64)> {
     use crate::autoland::{along_track_nm, cross_track_nm};
     let hdg = heading_deg?;
-    let err = ((hdg - rwy.course_deg + 540.0).rem_euclid(360.0) - 180.0).abs();
+    let err = crate::angles::abs_diff_deg(hdg, rwy.course_deg);
     if err > ON_STRIP_MAX_ERR_DEG {
         return None;
     }
@@ -3826,7 +3826,7 @@ async fn drive(xp: XPlaneClient, voice: Option<Voice>, mut route: Route, base_kt
         let raw_rate = prev_psi.map_or(0.0, |(p, t0)| {
             let dt = now.duration_since(t0).as_secs_f64();
             if (0.05..=1.0).contains(&dt) {
-                (((psi - p + 540.0).rem_euclid(360.0)) - 180.0) / dt
+                crate::angles::signed_diff_deg(psi, p) / dt
             } else {
                 0.0
             }
@@ -5250,7 +5250,7 @@ mod tests {
         // ~45 degree diagonal ahead. Bearing of leg one ≈ 270.
         let path = line_up_path(&rwy, hlat, hlon, Some(270.0)).expect("feasible");
         let brg = bearing_deg(path[0].0, path[0].1, path[1].0, path[1].1);
-        let off = ((brg - 270.0 + 540.0).rem_euclid(360.0) - 180.0).abs();
+        let off = crate::angles::abs_diff_deg(brg, 270.0);
         assert!(off < 12.0, "leg one follows the nose (270), got {brg}");
         assert!(
             (cross_track_nm(path[1].0, path[1].1, &rwy) * 1852.0).abs() < 3.0,
@@ -5262,7 +5262,7 @@ mod tests {
         // near-aligned heading.
         let path2 = line_up_path(&rwy, hlat, hlon, Some(5.0)).expect("feasible");
         let brg2 = bearing_deg(path2[0].0, path2[0].1, path2[1].0, path2[1].1);
-        let off2 = ((brg2 - 5.0 + 540.0).rem_euclid(360.0) - 180.0).abs();
+        let off2 = crate::angles::abs_diff_deg(brg2, 5.0);
         assert!(
             off2 > 20.0,
             "near-aligned nose falls back to the diagonal, got {brg2}"
@@ -5437,7 +5437,7 @@ mod tests {
         for w in pts.windows(2) {
             let d = taxi_guide::dist(w[0], w[1]);
             let b = taxi_guide::bearing(w[0], w[1]);
-            let turn = prev_brg.map_or(0.0, |p| taxi_guide::angle_diff(b, p));
+            let turn = prev_brg.map_or(0.0, |p| crate::angles::signed_diff_deg(b, p));
             println!("  {:7.1} {:7.1}  len {:5.1}  brg {:6.1}  turn {:+6.1}", w[1].0, w[1].1, d, b, turn);
             if d > 0.5 {
                 worst_turn = worst_turn.max(turn.abs());
@@ -5460,7 +5460,7 @@ mod tests {
         for i in 1..pts.len().saturating_sub(1) {
             let b_in = taxi_guide::bearing(taxi_guide::point_at(pts, cum, cum[i] - 15.0), pts[i]);
             let b_out = taxi_guide::bearing(pts[i], taxi_guide::point_at(pts, cum, cum[i] + 15.0));
-            let delta = taxi_guide::angle_diff(b_out, b_in).abs();
+            let delta = crate::angles::abs_diff_deg(b_out, b_in);
             if delta >= TURN_DEG {
                 let radius = circle_radius_m(
                     taxi_guide::point_at(pts, cum, cum[i] - 8.0),
@@ -5699,7 +5699,7 @@ mod tests {
             );
             let err = committed_err(route.heading_err_deg(lat, lon, psi, progress, look), &mut turn_dir);
             let route_turn = route.route_turn_rate_dps(progress, look, gs);
-            let raw = taxi_guide::angle_diff(psi, prev_psi) / dt;
+            let raw = crate::angles::signed_diff_deg(psi, prev_psi) / dt;
             prev_psi = psi;
             yaw = yaw * 0.5 + raw.clamp(-90.0, 90.0) * 0.5;
             let tr = trim.step(offset, route_turn, gs, false, remaining, dt);
@@ -5888,7 +5888,7 @@ mod tests {
                 continue;
             }
             let b = taxi_guide::bearing(w[0], w[1]);
-            if prev.is_some_and(|p| taxi_guide::angle_diff(b, p).abs() > 40.0) {
+            if prev.is_some_and(|p| crate::angles::abs_diff_deg(b, p) > 40.0) {
                 sharp += 1;
             }
             prev = Some(b);
@@ -7345,7 +7345,7 @@ mod tests {
             );
             let err = route.heading_err_deg(lat, lon, psi, progress, look);
             let route_turn = route.route_turn_rate_dps(progress, look, gs);
-            yaw_ema = 0.5 * yaw_ema + 0.5 * taxi_guide::angle_diff(psi, prev_psi) / run.dt;
+            yaw_ema = 0.5 * yaw_ema + 0.5 * crate::angles::signed_diff_deg(psi, prev_psi) / run.dt;
             prev_psi = psi;
             let (e, ff) = path_demand(&ref_path, progress, route.local_m(lat, lon), psi, v, &law, max_yaw);
             let e = committed_err(e, &mut dir);

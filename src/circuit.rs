@@ -182,7 +182,7 @@ pub struct BankWatch {
 impl BankWatch {
     /// One tick on base: the bank read and the heading error to the leg.
     pub fn note(&mut self, phi_deg: f64, hdg_err_deg: f64) {
-        let err = ((hdg_err_deg + 540.0).rem_euclid(360.0)) - 180.0;
+        let err = crate::angles::wrap180(hdg_err_deg);
         if phi_deg.is_finite() && err.abs() > BANK_SAMPLE_ERR_DEG && phi_deg.abs() > 5.0 {
             self.samples.push(phi_deg.abs());
         }
@@ -510,7 +510,7 @@ pub fn final_led_xtk_m(
     if !(speed_kts.is_finite() && speed_kts > 0.0 && lead_s > 0.0) {
         return xtk_m;
     }
-    let off = ((trk - course_deg + 540.0).rem_euclid(360.0) - 180.0).to_radians();
+    let off = crate::angles::signed_diff_deg(trk, course_deg).to_radians();
     xtk_m + lead_s * speed_kts * 0.514_444 * off.sin()
 }
 
@@ -1959,7 +1959,7 @@ pub fn leg_heading(rwy_course_deg: f64, leg: Leg, left: bool) -> f64 {
 /// direction unambiguous; at 40 degrees per 500 ms tick a 90-degree leg
 /// change completes in ~1.5 s, faster than the AP banks anyway.
 pub fn slew_bug(current: f64, target: f64, max_step: f64) -> f64 {
-    let d = (target - current + 540.0).rem_euclid(360.0) - 180.0;
+    let d = crate::angles::signed_diff_deg(target, current);
     (current + d.clamp(-max_step, max_step)).rem_euclid(360.0)
 }
 
@@ -2060,7 +2060,7 @@ impl BugHold {
         let want = want_mag.rem_euclid(360.0);
         let write = match (self.key == Some(key), self.set) {
             (true, Some(set)) => {
-                let off = (((want - set) + 540.0).rem_euclid(360.0) - 180.0).abs();
+                let off = crate::angles::abs_diff_deg(want, set);
                 off >= BUG_STEER_DEG
                     || (off >= db.deg && now_s - self.last_write_s >= db.every_s)
             }
@@ -2127,7 +2127,7 @@ pub fn bug_toward(
     phi_deg: f64,
     max_step: f64,
 ) -> f64 {
-    let turn = (want_mag - heading_mag + 540.0).rem_euclid(360.0) - 180.0;
+    let turn = crate::angles::signed_diff_deg(want_mag, heading_mag);
     // Hysteresis for a big turn: once the bug is on the nose to roll the
     // wrong-way bank out, it stays there until the wings are LEVEL, not merely
     // under the in-turn threshold. LIPK (2026-09-25): at 2 to 3 degrees of
@@ -2136,7 +2136,7 @@ pub fn bug_toward(
     // two alternated tick by tick for 50 s while the 172 turned 35 degrees
     // the wrong way.
     let on_nose =
-        ((current_bug - heading_mag + 540.0).rem_euclid(360.0) - 180.0).abs() < ON_NOSE_DEG;
+        crate::angles::abs_diff_deg(current_bug, heading_mag) < ON_NOSE_DEG;
     let reversal_bank = if on_nose && turn.abs() > TURN_ENTRY_LEAD_DEG {
         LEVEL_BANK_DEG
     } else {
@@ -4033,7 +4033,7 @@ async fn fly_authored_route(
         let psi_r = psi_r.ok();
         let crab = match (psi_r, hp_r) {
             (Some(psi), Ok(hp)) => {
-                (((psi - hp + 540.0).rem_euclid(360.0)) - 180.0).clamp(-25.0, 25.0)
+                crate::angles::signed_diff_deg(psi, hp).clamp(-25.0, 25.0)
             }
             _ => 0.0,
         };
@@ -5137,7 +5137,7 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, p: Params
         let hdg_err = hpath_r
             .as_ref()
             .ok()
-            .map(|hp| ((hp - rwy_course + 540.0).rem_euclid(360.0)) - 180.0)
+            .map(|hp| crate::angles::signed_diff_deg(*hp, rwy_course))
             .unwrap_or(180.0);
         // Established by autoland's own measure: its pursuit's residual at
         // the threshold inside the runway's landing limit. The IAS stands in
@@ -5243,7 +5243,7 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, p: Params
         let (psi_v, hp_v) = (psi_r.ok(), hpath_r.ok());
         let crab = match (psi_v, hp_v) {
             (Some(psi), Some(hp)) => {
-                (((psi - hp + 540.0).rem_euclid(360.0)) - 180.0).clamp(-25.0, 25.0)
+                crate::angles::signed_diff_deg(psi, hp).clamp(-25.0, 25.0)
             }
             _ => 0.0,
         };
@@ -6579,7 +6579,7 @@ mod tests {
         let mut steps = 0;
         while (slew_bug(bug, 2.6, 40.0) - 2.6).abs() > 1e-9 || (bug - 2.6).abs() > 1e-9 {
             let next = slew_bug(bug, 2.6, 40.0);
-            let d = (next - bug + 540.0).rem_euclid(360.0) - 180.0;
+            let d = crate::angles::signed_diff_deg(next, bug);
             assert!(d > 0.0, "always clockwise: {bug} -> {next}");
             assert!(d <= 40.0 + 1e-9, "never more than a step");
             bug = next;
@@ -7424,7 +7424,7 @@ mod tests {
         // base at 290 true, runway 02 (course 20), 1,813 m off the centreline
         // with 4,092 m to run. The geometry is a 28 degree cut, so
         // `interceptable` is happy...
-        let hdg_err_on_base = ((290.0 - 20.0 + 540.0_f64).rem_euclid(360.0)) - 180.0;
+        let hdg_err_on_base = crate::angles::signed_diff_deg(290.0, 20.0);
         assert!(
             interceptable(1813.0, 4092.0),
             "a 28 degree cut is closeable"
@@ -7523,7 +7523,7 @@ mod tests {
     fn the_final_leg_flies_an_intercept_not_a_parallel() {
         let course = 19.4;
         let cut =
-            |x: f64| ((final_intercept_hdg(course, x) - course + 540.0).rem_euclid(360.0)) - 180.0;
+            |x: f64| crate::angles::signed_diff_deg(final_intercept_hdg(course, x), course);
 
         // On the line, fly the line.
         assert!(cut(0.0).abs() < 0.01);
@@ -7612,7 +7612,7 @@ mod tests {
             if (bug - 173.7).abs() < 0.01 {
                 break; // committed and handed to the leg: the capture is the AP's
             }
-            let lead = ((bug - heading + 540.0).rem_euclid(360.0)) - 180.0;
+            let lead = crate::angles::signed_diff_deg(bug, heading);
             assert!(lead <= 0.5, "never right of the nose: {lead:.1}");
             if phi > -TURN_IN_PROGRESS_BANK_DEG {
                 max_lead = max_lead.max(-lead);
@@ -8156,7 +8156,7 @@ mod issue_147_circuit_tests {
             let a_m = -along_track_nm(jet.lat, jet.lon, &rwy) * M_PER_NM;
             let x_m = cross_track_nm(jet.lat, jet.lon, &rwy) * M_PER_NM;
             let trk = jet.track();
-            let trk_err = ((trk - rwy.course_deg + 540.0).rem_euclid(360.0)) - 180.0;
+            let trk_err = crate::angles::signed_diff_deg(trk, rwy.course_deg);
             if leg == Leg::Final && ready_for_autoland(x_m, a_m.abs(), trk_err, ias, limit, None) {
                 return (
                     Handoff {
@@ -8170,7 +8170,7 @@ mod issue_147_circuit_tests {
                     moves,
                 );
             }
-            let crab = ((jet.psi - trk + 540.0).rem_euclid(360.0)) - 180.0;
+            let crab = crate::angles::signed_diff_deg(jet.psi, trk);
             let leg_hdg = match leg {
                 Leg::Final => final_intercept_hdg(rwy.course_deg, x_m),
                 _ => leg_heading(rwy.course_deg, leg, true),
@@ -8481,7 +8481,7 @@ mod issue_189_tests {
                 through = through.max(-x_m);
             }
             let trk = jet.track();
-            let trk_err = ((trk - rwy.course_deg + 540.0).rem_euclid(360.0)) - 180.0;
+            let trk_err = crate::angles::signed_diff_deg(trk, rwy.course_deg);
             if ready_for_autoland(x_m, a_m.abs(), trk_err, ias, Some(limit), None) {
                 return (Final { x_m, a_m, trk_err, through_m: through }, jet);
             }
@@ -9194,7 +9194,7 @@ mod pattern_guard_tests {
                 self.x1 += (self.dial - self.x1) * dt / LAG1_S;
                 self.vs += (self.x1 - self.vs) * dt / LAG2_S;
                 self.alt += self.vs / 60.0 * dt;
-                let err = (bug - self.psi + 540.0).rem_euclid(360.0) - 180.0;
+                let err = crate::angles::signed_diff_deg(bug, self.psi);
                 let want = (err * 1.5).clamp(-MAX_BANK, MAX_BANK);
                 self.bank += (want - self.bank).clamp(-5.0 * dt, 5.0 * dt);
                 self.ias += (want_kts - self.ias) * dt / 10.0;
@@ -9280,7 +9280,7 @@ mod pattern_guard_tests {
         let mut psi_was = p.psi;
         while p.t - t0 < 900.0 {
             let now = p.t - t0;
-            let trk_err = (p.psi - COURSE + 540.0).rem_euclid(360.0) - 180.0;
+            let trk_err = crate::angles::signed_diff_deg(p.psi, COURSE);
             if turning_final && ready_for_autoland(p.x_m, p.a_m.abs(), trk_err, p.ias, None, None) {
                 out.handed_over = Some(now);
                 break;
@@ -9367,7 +9367,7 @@ mod pattern_guard_tests {
             p.advance(knob, want_kts, tick);
             out.max_alt = out.max_alt.max(p.alt);
             out.max_bank = out.max_bank.max(p.bank.abs());
-            out.turned_deg += ((p.psi - psi_was + 540.0).rem_euclid(360.0) - 180.0).abs();
+            out.turned_deg += crate::angles::abs_diff_deg(p.psi, psi_was);
             psi_was = p.psi;
         }
         out
@@ -9887,7 +9887,7 @@ mod issue_188_on_the_path_tests {
                 self.x1 += (self.dial - self.x1) * dt / 1.5;
                 self.vs += (self.x1 - self.vs) * dt / 1.5;
                 self.alt += self.vs / 60.0 * dt;
-                let err = (hdg - self.psi + 540.0).rem_euclid(360.0) - 180.0;
+                let err = crate::angles::signed_diff_deg(hdg, self.psi);
                 let want = (err * 1.5).clamp(-17.0, 17.0);
                 self.bank += (want - self.bank).clamp(-5.0 * dt, 5.0 * dt);
                 self.ias += (want_kts - self.ias) * dt / 10.0;
@@ -9953,7 +9953,7 @@ mod issue_188_on_the_path_tests {
                 out.went_around = Some(p.a_m);
                 break;
             }
-            let trk_err = (p.psi - COURSE + 540.0).rem_euclid(360.0) - 180.0;
+            let trk_err = crate::angles::signed_diff_deg(p.psi, COURSE);
             let judged = if fixed { None } else { above };
             if turning_final && ready_for_autoland(p.x_m, p.a_m.abs(), trk_err, p.ias, None, judged)
             {

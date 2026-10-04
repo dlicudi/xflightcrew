@@ -223,7 +223,7 @@ pub fn slew_track(now_deg: f64, want_deg: f64, speed_mps: f64, dt_s: f64) -> f64
     let dt = dt_s.clamp(0.02, 0.5);
     let _ = speed_mps;
     let rate = TURN_RATE_DPS;
-    let err = crate::taxi_guide::angle_diff(want_deg, now_deg);
+    let err = crate::angles::signed_diff_deg(want_deg, now_deg);
     (now_deg + err.clamp(-rate * dt, rate * dt)).rem_euclid(360.0)
 }
 
@@ -280,7 +280,7 @@ impl HeadingHold {
     }
     pub fn step(&mut self, target_deg: f64, heading_deg: f64, dt_s: f64) -> f64 {
         let dt = dt_s.clamp(0.02, 0.5);
-        let err = crate::taxi_guide::angle_diff(target_deg, heading_deg);
+        let err = crate::angles::signed_diff_deg(target_deg, heading_deg);
         if err.abs() < 10.0 {
             self.trim =
                 (self.trim + err * PEDAL_KI_PER_DEG_S * dt).clamp(-PEDAL_TRIM_MAX, PEDAL_TRIM_MAX);
@@ -1636,12 +1636,12 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, collective: String) {
                 g = Goal::Depart {
                     height_ft,
                     speed_mps,
-                    track_deg: (h + crate::taxi_guide::angle_diff(*t, *m)).rem_euclid(360.0),
+                    track_deg: (h + crate::angles::signed_diff_deg(*t, *m)).rem_euclid(360.0),
                 };
                 retarget(g);
                 crate::blackbox::record(
                     "hover",
-                    serde_json::json!({ "event": "turn", "heading_mag": h, "track_true": (h + crate::taxi_guide::angle_diff(*t, *m)).rem_euclid(360.0) }),
+                    serde_json::json!({ "event": "turn", "heading_mag": h, "track_true": (h + crate::angles::signed_diff_deg(*t, *m)).rem_euclid(360.0) }),
                 );
             }
         }
@@ -2349,11 +2349,11 @@ mod tests {
     fn a_turn_slews_the_track_the_short_way() {
         let mut t = 350.0;
         let mut secs = 0.0;
-        while crate::taxi_guide::angle_diff(20.0, t).abs() > 0.01 {
+        while crate::angles::abs_diff_deg(20.0, t) > 0.01 {
             let before = t;
             t = slew_track(t, 20.0, 15.0, 0.1);
             assert!(
-                crate::taxi_guide::angle_diff(t, before) > 0.0,
+                crate::angles::signed_diff_deg(t, before) > 0.0,
                 "turns right"
             );
             secs += 0.1;
@@ -2391,7 +2391,7 @@ mod tests {
                         let p = queue.pop_front().unwrap();
                         r += (gain * p + vane - r) * (dt / tau).min(1.0);
                         hdg = (hdg + r * dt).rem_euclid(360.0);
-                        let err = crate::taxi_guide::angle_diff(hdg, track);
+                        let err = crate::angles::signed_diff_deg(hdg, track);
                         if i < 200 {
                             over = over.min(err);
                         }

@@ -148,7 +148,7 @@ pub fn course_change_at(ahead: &[Sample], ref_hdg: f64) -> bool {
     let Some(first) = ahead.first() else {
         return false;
     };
-    if wrap180(first.hdg_deg - ref_hdg).abs() <= OFFLINE_COURSE_CHANGE_DEG {
+    if crate::angles::wrap180(first.hdg_deg - ref_hdg).abs() <= OFFLINE_COURSE_CHANGE_DEG {
         return false;
     }
     let window: Vec<&Sample> = ahead
@@ -161,7 +161,7 @@ pub fn course_change_at(ahead: &[Sample], ref_hdg: f64) -> bool {
     spans
         && window
             .iter()
-            .all(|s| wrap180(s.hdg_deg - first.hdg_deg).abs() <= OFFLINE_SETTLED_DEG)
+            .all(|s| crate::angles::wrap180(s.hdg_deg - first.hdg_deg).abs() <= OFFLINE_SETTLED_DEG)
 }
 
 /// The certificate whose standards apply.
@@ -503,20 +503,12 @@ fn round_to(v: f64, step: f64) -> f64 {
     (v / step).round() * step
 }
 
-fn wrap180(d: f64) -> f64 {
-    ((d + 540.0) % 360.0) - 180.0
-}
-
-fn norm360(d: f64) -> f64 {
-    ((d % 360.0) + 360.0) % 360.0
-}
-
 impl Task {
     /// The instructor's assignment at the brief: numbers the pilot can hear
     /// and fly, from the airframe's book where the task has a book figure
     /// and from the aircraft's own state, rounded, where it does not.
     pub fn assign(self, entry: &Sample, refs: &Refs, level: Level) -> Targets {
-        let hdg = Some(round_to(norm360(entry.hdg_deg), 10.0) % 360.0);
+        let hdg = Some(round_to(crate::angles::wrap360(entry.hdg_deg), 10.0) % 360.0);
         let here = round_to(entry.alt_ft, 100.0);
         match self {
             Task::Taxi => Targets {
@@ -708,7 +700,7 @@ fn feet(v: f64) -> String {
 }
 
 fn hdg(v: f64) -> String {
-    let n = norm360(v).round() as i64;
+    let n = crate::angles::wrap360(v).round() as i64;
     format!("{:03}", if n == 0 { 360 } else { n })
 }
 
@@ -1245,7 +1237,7 @@ impl Scorer {
                 }
             }
         };
-        let hdg_dev = |target: Option<f64>| target.map(|h| wrap180(s.hdg_deg - h)).unwrap_or(0.0);
+        let hdg_dev = |target: Option<f64>| target.map(|h| crate::angles::wrap180(s.hdg_deg - h)).unwrap_or(0.0);
         match self.task {
             Task::Taxi => {
                 let gs = s.gs_kts.abs();
@@ -1284,7 +1276,7 @@ impl Scorer {
                 if !self.roll_started {
                     if s.on_ground && gs > ROLL_KTS {
                         self.roll_started = true;
-                        self.retarget(Axis::Heading, norm360(s.hdg_deg));
+                        self.retarget(Axis::Heading, crate::angles::wrap360(s.hdg_deg));
                         lines.push("Rolling.".into());
                     }
                     return lines;
@@ -1503,7 +1495,7 @@ impl Scorer {
         }
         if s.on_ground && !prev.on_ground {
             let sink = touchdown_sink_fpm(&self.sink_window, s.t_s, s.vsi_fpm).abs();
-            let drift = s.track_deg.map(|tr| wrap180(s.hdg_deg - tr).abs());
+            let drift = s.track_deg.map(|tr| crate::angles::wrap180(s.hdg_deg - tr).abs());
             let mut note = format!(
                 "Touchdown at {:.0} feet per minute, {:.0} knots",
                 sink.round(),
@@ -1575,7 +1567,7 @@ impl Scorer {
         let axis = self.line.as_mut()?;
         let gs = s.gs_kts.abs();
         let yaw = if dt > 0.0 {
-            wrap180(s.hdg_deg - prev.hdg_deg) / dt
+            crate::angles::wrap180(s.hdg_deg - prev.hdg_deg) / dt
         } else {
             0.0
         };
@@ -2875,7 +2867,7 @@ pub fn take_target(tool: &str, args: &Value) -> Option<String> {
     let (axis, value, said) = match tool {
         "set_heading" => {
             let h = args.get("heading")?.as_f64()?;
-            (Axis::Heading, norm360(h), format!("Heading {}.", hdg(h)))
+            (Axis::Heading, crate::angles::wrap360(h), format!("Heading {}.", hdg(h)))
         }
         "set_altitude" | "fly_to" => {
             let a = args.get("altitude")?.as_f64()?;
@@ -3381,7 +3373,7 @@ pub fn grade_flight(
         let mut i = start + 1;
         while i < b {
             let settled_turn = course_change_at(&samples[i..b], ref_hdg);
-            if wrap180(samples[i].hdg_deg - ref_hdg).abs() > OFFLINE_TURN_DEG || settled_turn {
+            if crate::angles::wrap180(samples[i].hdg_deg - ref_hdg).abs() > OFFLINE_TURN_DEG || settled_turn {
                 // A turn is recognised partway round it (twenty degrees in,
                 // or after it has settled), so the straight run ends where
                 // the heading last sat on the old one: the first twenty
@@ -3389,14 +3381,14 @@ pub fn grade_flight(
                 // heading error, "20 degrees left (FAIL)" on a followed plan.
                 let end = (start..i)
                     .rev()
-                    .find(|&k| wrap180(samples[k].hdg_deg - ref_hdg).abs() <= OFFLINE_SETTLED_DEG)
+                    .find(|&k| crate::angles::wrap180(samples[k].hdg_deg - ref_hdg).abs() <= OFFLINE_SETTLED_DEG)
                     .map_or(i, |k| k + 1);
                 straight.push((seg, start, end));
                 // Skip the turn: consecutive samples still swinging.
                 let mut j = i;
                 while j + 1 < b {
                     let dt = (samples[j + 1].t_s - samples[j].t_s).max(0.1);
-                    if wrap180(samples[j + 1].hdg_deg - samples[j].hdg_deg).abs() / dt
+                    if crate::angles::wrap180(samples[j + 1].hdg_deg - samples[j].hdg_deg).abs() / dt
                         < OFFLINE_TURN_RATE_DPS
                     {
                         break;
@@ -3593,7 +3585,7 @@ impl Scorer {
                         &mut self.hdg,
                         self.targets
                             .hdg_deg
-                            .map(|h| wrap180(s.hdg_deg - h))
+                            .map(|h| crate::angles::wrap180(s.hdg_deg - h))
                             .unwrap_or(0.0),
                     );
                 } else {
@@ -3608,7 +3600,7 @@ impl Scorer {
                     &mut self.hdg,
                     self.targets
                         .hdg_deg
-                        .map(|h| wrap180(s.hdg_deg - h))
+                        .map(|h| crate::angles::wrap180(s.hdg_deg - h))
                         .unwrap_or(0.0),
                 );
                 judge(
@@ -3646,7 +3638,7 @@ fn circular_mean_deg(it: impl Iterator<Item = f64>) -> f64 {
     if n == 0 {
         return 0.0;
     }
-    norm360(y.atan2(x).to_degrees())
+    crate::angles::wrap360(y.atan2(x).to_degrees())
 }
 
 fn median(it: impl Iterator<Item = f64>) -> f64 {

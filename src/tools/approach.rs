@@ -546,8 +546,8 @@ impl Tool for VisualApproach {
                     .unwrap_or(0.0);
                 let field = cands.first().map(|r| r.icao.clone()).unwrap_or_default();
                 cands.iter().filter(|r| r.icao == field).min_by(|a, b| {
-                    let da = ((a.course_deg - track + 540.0).rem_euclid(360.0) - 180.0).abs();
-                    let db = ((b.course_deg - track + 540.0).rem_euclid(360.0) - 180.0).abs();
+                    let da = crate::angles::abs_diff_deg(a.course_deg, track);
+                    let db = crate::angles::abs_diff_deg(b.course_deg, track);
                     da.total_cmp(&db)
                 })
             }

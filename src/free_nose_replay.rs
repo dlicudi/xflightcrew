@@ -40,10 +40,6 @@ fn f(v: &Value, k: &str) -> Option<f64> {
     v.get(k).and_then(Value::as_f64)
 }
 
-fn wrap(a: f64) -> f64 {
-    (a + 540.0).rem_euclid(360.0) - 180.0
-}
-
 /// The plant with its weathervane and track, the command reaching it
 /// `io` s after it is written.
 #[derive(Clone)]
@@ -75,7 +71,7 @@ impl Sim {
         for _ in 0..n {
             let (_, u_d, r_d) = *self.sent.iter().rev().find(|s| s.0 <= self.t - self.io + 1e-9).unwrap_or(&(0.0, 0.0, 0.0));
             let w = if v > 0.3 { self.w } else { 0.0 };
-            let slip = wrap(self.psi - self.trk);
+            let slip = crate::angles::wrap180(self.psi - self.trk);
             let rd = kb * u_d + kr * r_d - d * self.r - kv * slip + w;
             let r1 = self.r + rd * h;
             self.psi += (self.r + r1) / 2.0 * h;
@@ -112,7 +108,7 @@ fn fit_w(p: GroundPlant, io: f64, ticks: &[(f64, f64, f64, f64, f64, f64)]) -> f
             while j + 1 < ticks.len() && ticks[j + 1].0 - t0 <= 3.0 {
                 let dt = (ticks[j + 1].0 - ticks[j].0).max(0.05);
                 sim.run(ticks[j].2, ticks[j].3, ticks[j].1, dt);
-                se += wrap(sim.psi - ticks[j + 1].4).powi(2);
+                se += crate::angles::wrap180(sim.psi - ticks[j + 1].4).powi(2);
                 n += 1;
                 j += 1;
             }
@@ -434,7 +430,7 @@ fn rebuild(ticks: &[DriveTick], states: &[(f64, f64, f64, f64)], pace: crate::au
     let mut prev: Option<f64> = None;
     for s in states {
         let h = match prev {
-            Some(p) => p + wrap(s.3 - p),
+            Some(p) => p + crate::angles::wrap180(s.3 - p),
             None => s.3,
         };
         hdg.push(h);
@@ -548,7 +544,7 @@ fn rebuild(ticks: &[DriveTick], states: &[(f64, f64, f64, f64)], pace: crate::au
         cum += ((w[1].0 - w[0].0).powi(2) + (w[1].1 - w[0].1).powi(2)).sqrt();
         let b1 = (w[1].0 - w[0].0).atan2(w[1].1 - w[0].1).to_degrees();
         let b2 = (w[2].0 - w[1].0).atan2(w[2].1 - w[1].1).to_degrees();
-        if wrap(b2 - b1).abs() >= 30.0 {
+        if crate::angles::wrap180(b2 - b1).abs() >= 30.0 {
             corners.push(cum);
         }
     }
@@ -617,7 +613,7 @@ fn corners_of(pts: &[(f64, f64)]) -> Vec<f64> {
         let mut j = i + 1;
         while j + 1 < pts.len() && cum[j] - cum[i + 1] <= 15.0 {
             if cum[j + 1] - cum[j] >= 0.3 {
-                turn = turn.max(wrap(brg(j) - brg(i)).abs());
+                turn = turn.max(crate::angles::wrap180(brg(j) - brg(i)).abs());
             }
             j += 1;
         }
@@ -756,7 +752,7 @@ fn fly_drive(ticks: &[DriveTick], k0: usize, rb: &Rebuilt, plant: GroundPlant, l
             route.heading_err_deg(lat, lon, psi, progress, look)
         };
         let route_turn = if remaining <= 8.0 { 0.0 } else { route.route_turn_rate_dps(progress, look, gs) };
-        let raw = wrap(psi - prev_psi) / dt.max(0.05);
+        let raw = crate::angles::wrap180(psi - prev_psi) / dt.max(0.05);
         ema = 0.5 * ema + 0.5 * raw.clamp(-90.0, 90.0);
         let (u, rud) = match law {
             TaxiLaw::Old => {
@@ -1007,7 +1003,7 @@ fn free_nose_replay() {
                 let dt = 0.35;
                 let target = if creep { judge.creep_kts / KT } else { 0.0 };
                 sim.run(br - bl, 0.0, v, dt);
-                let brg = wrap(sim.psi - course).to_radians();
+                let brg = crate::angles::wrap180(sim.psi - course).to_radians();
                 y += v * brg.sin() * dt;
                 rolled += v * dt;
                 // The governor: a creep's pull, its brake over the creep.
@@ -1071,7 +1067,7 @@ fn free_nose_replay() {
                     let r = rate.update(prev_x.map_or(0.0, |q| (x - q) / dt), dt);
                     prev_x = Some(x);
                     let tgt = crate::autotakeoff::roll_target_heading(course, x, r, gs);
-                    let err = wrap(tgt - sim.psi);
+                    let err = crate::angles::wrap180(tgt - sim.psi);
                     if hold {
                         hold = matches!(align.step(err, sim.r, gs, dt), crate::autotakeoff::RollAlignState::Hold);
                     }
@@ -1087,7 +1083,7 @@ fn free_nose_replay() {
                         TaxiLaw::New => crate::autotakeoff::free_roll_brakes(&mut law_g, err, Yaw::Now(sim.r), steer, gs, dt, hold),
                     };
                     sim.run(br - bl, steer, gs / KT, dt);
-                    let brg = wrap(sim.trk - course).to_radians();
+                    let brg = crate::angles::wrap180(sim.trk - course).to_radians();
                     x += gs / KT * brg.sin() * dt;
                     worst = worst.max(x.abs());
                 }
@@ -1142,7 +1138,7 @@ fn free_nose_replay() {
         let io_ticks: Vec<(f64, f64, f64, f64, f64, f64)> = {
             let mut out = Vec::new();
             for (k, v) in ticks.iter().enumerate() {
-                let r = if k == 0 { 0.0 } else { wrap(f(v, "psi").unwrap() - f(ticks[k - 1], "psi").unwrap()) / f(v, "dt").unwrap_or(0.4).max(0.05) };
+                let r = if k == 0 { 0.0 } else { crate::angles::wrap180(f(v, "psi").unwrap() - f(ticks[k - 1], "psi").unwrap()) / f(v, "dt").unwrap_or(0.4).max(0.05) };
                 out.push((f(v, "t").unwrap_or(0.0), f(v, "gs").unwrap_or(0.0) / KT, applied(v), 0.0, f(v, "psi").unwrap(), r));
             }
             out
@@ -1172,7 +1168,7 @@ fn free_nose_replay() {
                     let r = rate.update(prev_x.map_or(0.0, |q| (x - q) / dt), dt);
                     prev_x = Some(x);
                     let tgt = crate::autotakeoff::roll_target_heading(course, x, r, gs);
-                    let err = wrap(tgt - sim.psi);
+                    let err = crate::angles::wrap180(tgt - sim.psi);
                     let steer = roll_law.step(err, dt, gs, 0.0);
                     let brake = stop(v);
                     let diff = match law {
@@ -1191,7 +1187,7 @@ fn free_nose_replay() {
                         }
                     };
                     sim.run(diff, steer, gs / KT, dt);
-                    let brg = wrap(sim.trk - course).to_radians();
+                    let brg = crate::angles::wrap180(sim.trk - course).to_radians();
                     x += gs / KT * brg.sin() * dt;
                     worst = worst.max(x.abs());
                 }

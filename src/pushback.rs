@@ -292,7 +292,7 @@ pub fn plan(lat: f64, lon: f64, psi: f64, path: &[(f64, f64)]) -> Option<Plan> {
         return None; // the route doesn't start here — see MAX_NODE_M
     }
     let out_bearing = nav::bearing_deg(lat, lon, node.0, node.1);
-    if angle_diff_deg(out_bearing, psi).abs() < BEHIND_DEG {
+    if crate::angles::abs_diff_deg(out_bearing, psi) < BEHIND_DEG {
         return None;
     }
     // Where we point when the tug lets go: down the lane. With no node beyond
@@ -353,7 +353,7 @@ pub fn lane_plan(lane: &[(f64, f64)]) -> Option<Plan> {
 /// the plan and whether the lane was taken. Pure.
 pub fn choose_plan(route: Plan, lane: Option<Plan>) -> (Plan, bool) {
     match lane {
-        Some(l) if angle_diff_deg(l.target_hdg, route.target_hdg).abs() <= BEHIND_DEG => (l, true),
+        Some(l) if crate::angles::abs_diff_deg(l.target_hdg, route.target_hdg) <= BEHIND_DEG => (l, true),
         _ => (route, false),
     }
 }
@@ -432,7 +432,7 @@ impl SwingWatch {
             .iter()
             .rev()
             .find(|(ts, _)| t - ts >= span)
-            .map(|(_, e)| angle_diff_deg(err, *e).abs())
+            .map(|(_, e)| crate::angles::abs_diff_deg(err, *e))
     }
 
     pub fn step(&mut self, t: f64, err: f64, attached: bool) -> bool {
@@ -443,7 +443,7 @@ impl SwingWatch {
             .iter()
             .rev()
             .find(|(ts, _)| t - ts >= SWING_WINDOW_S)
-            .map_or(0.0, |(ts, e)| angle_diff_deg(err, *e) / (t - ts));
+            .map_or(0.0, |(ts, e)| crate::angles::signed_diff_deg(err, *e) / (t - ts));
         self.hist.push_back((t, err));
         // Keep one sample at or beyond the longest span.
         while self.hist.len() > 2 && t - self.hist[1].0 >= SWING_SETTLE_S {
@@ -525,7 +525,7 @@ impl AfterStop {
     /// `t` seconds since the stop; a failed read is no measurement.
     pub fn step(&mut self, t: f64, hdg: Option<f64>) {
         if let (Some(a), Some(h)) = (self.at, hdg) {
-            let d = angle_diff_deg(h, a);
+            let d = crate::angles::signed_diff_deg(h, a);
             if d.abs() > self.travel.abs() {
                 self.travel = d;
                 self.moved_s = t;
@@ -750,7 +750,7 @@ pub fn on_a_stand(stand: Option<(f64, f64)>, psi: f64, known: bool) -> bool {
     }
     match stand {
         Some((dist_m, heading)) => {
-            dist_m <= STAND_M && angle_diff_deg(heading, psi).abs() <= STAND_ALIGN_DEG
+            dist_m <= STAND_M && crate::angles::abs_diff_deg(heading, psi) <= STAND_ALIGN_DEG
         }
         None => false,
     }
@@ -821,7 +821,7 @@ impl TugClearWatch {
     pub fn swinging(&self) -> bool {
         match (self.hdg_hist.front(), self.hdg_hist.back()) {
             (Some(&(t0, h0)), Some(&(t1, h1))) if t1 - t0 >= 0.5 * SWING_WINDOW_S => {
-                angle_diff_deg(h1, h0).abs() / (t1 - t0) >= SWING_DEG / SWING_SETTLE_S
+                crate::angles::abs_diff_deg(h1, h0) / (t1 - t0) >= SWING_DEG / SWING_SETTLE_S
             }
             _ => false,
         }
@@ -856,11 +856,6 @@ impl TugClearWatch {
     }
 }
 
-/// Smallest signed angle a−b, degrees, in −180..180.
-fn angle_diff_deg(a: f64, b: f64) -> f64 {
-    (a - b + 540.0).rem_euclid(360.0) - 180.0
-}
-
 /// How far BACK we have come: displacement from the stand projected onto the
 /// reverse of the heading we started on. Signed — negative means we have
 /// rolled FORWARD off the stand.
@@ -887,7 +882,7 @@ pub fn back_along(start_lat: f64, start_lon: f64, start_psi: f64, lat: f64, lon:
     }
     let brg = nav::bearing_deg(start_lat, start_lon, lat, lon);
     // Angle between where we went and straight back up the original tail.
-    let off = angle_diff_deg(brg, start_psi + 180.0).to_radians();
+    let off = crate::angles::signed_diff_deg(brg, start_psi + 180.0).to_radians();
     d_m * off.cos()
 }
 
@@ -1085,7 +1080,7 @@ async fn run_inner(
     // dead straight with its heading unchanged to a tenth of a degree, 115°
     // off the lane, and the taxi join had to turn a Gatwick MD-82 round on the
     // apron (2026-07-27).
-    let err0 = angle_diff_deg(plan.target_hdg, start_psi);
+    let err0 = crate::angles::signed_diff_deg(plan.target_hdg, start_psi);
     // Start from what this session has already OBSERVED — and when nothing
     // has been observed yet, from what the BUILD has been measured to do:
     // three pushes on 2026-07-28 (two at Luton, one at Stansted), three
@@ -1359,7 +1354,7 @@ async fn run_inner(
         // "stopped after moving is completion" needs no flag to say so.
         if towed && !towing && !attached && saw_attached {
             let err_now =
-                angle_diff_deg(plan.target_hdg, xp.get_float(PSI_TRUE).await.unwrap_or(0.0));
+                crate::angles::signed_diff_deg(plan.target_hdg, xp.get_float(PSI_TRUE).await.unwrap_or(0.0));
             let delivered = push_delivered(back_m, err_now, plan);
             event(json!({ "event": "tug_finished", "back_m": r1(back_m),
                           "err": r1(err_now), "delivered": delivered }));
@@ -1402,7 +1397,7 @@ async fn run_inner(
             event(json!({ "event": "nudge", "pattern": cmd.action() }));
             send(ctx, cmd.action()).await;
         }
-        let err = angle_diff_deg(plan.target_hdg, psi);
+        let err = crate::angles::signed_diff_deg(plan.target_hdg, psi);
         last_psi = Some(psi);
         last_err = Some(err);
         // The ending rule, one judgement for the finish and the stall
@@ -1777,7 +1772,7 @@ mod tests {
         assert!(p.lane);
         assert!((p.target_hdg - 127.4).abs() < 1.5, "{}", p.target_hdg);
         assert!((p.back_m - 26.3).abs() < 1.0, "{}", p.back_m);
-        assert_eq!(super::steer_for(super::angle_diff_deg(p.target_hdg, 171.8), 1), super::Steer::Straight);
+        assert_eq!(super::steer_for(crate::angles::signed_diff_deg(p.target_hdg, 171.8), 1), super::Steer::Straight);
     }
 
     /// #190, LEMG (iMac 2026-09-29, sortie 1790712526, a Citation X at the
@@ -1812,7 +1807,7 @@ mod tests {
         .expect("the LEMG lane");
         assert!((lane.target_hdg - 26.3).abs() < 1.0, "{}", lane.target_hdg);
         let psi = 327.7;
-        assert_eq!(super::steer_for(super::angle_diff_deg(lane.target_hdg, psi), 1), super::Steer::Straight);
+        assert_eq!(super::steer_for(crate::angles::signed_diff_deg(lane.target_hdg, psi), 1), super::Steer::Straight);
         // The route as planned from the stand (replayed from the install):
         // the stand, 81.6 m back on 155.3 to the taxiway, then 222.2.
         let path = [
@@ -1829,7 +1824,7 @@ mod tests {
         assert!(!used, "a lane ending 164 degrees from the route is not the way out");
         assert_eq!(p, route);
         assert!((p.back_m - 81.6).abs() < 1.0, "{}", p.back_m);
-        let err = super::angle_diff_deg(p.target_hdg, psi);
+        let err = crate::angles::signed_diff_deg(p.target_hdg, psi);
         assert!((err + 105.5).abs() < 1.0, "{err}");
         assert_ne!(super::steer_for(err, 1), super::Steer::Straight, "the tug swings the nose");
         // LIBP stand 1: lane 127.4, route 217, the lane stands.
@@ -1912,7 +1907,7 @@ mod tests {
         let p = plan(me.0, me.1, 90.0, &path).expect("nose-in: a push is owed");
         assert!((p.back_m - 40.0).abs() < 2.0, "back {}", p.back_m);
         assert!(
-            angle_diff_deg(p.target_hdg, 0.0).abs() < 3.0,
+            crate::angles::abs_diff_deg(p.target_hdg, 0.0) < 3.0,
             "finish pointing north up the lane, not 270: {}",
             p.target_hdg
         );
@@ -2326,11 +2321,11 @@ mod tests {
         let ticks_for = |target: f64| {
             let mut ticks: Vec<(f64, f64, f64)> = LIBP_PUSH
                 .iter()
-                .map(|&(t, b, e)| (t, b, angle_diff_deg(target, plan.target_hdg - e)))
+                .map(|&(t, b, e)| (t, b, crate::angles::signed_diff_deg(target, plan.target_hdg - e)))
                 .collect();
             let mut t = 0.55;
             while t <= 50.0 {
-                ticks.push((t, 60.9, angle_diff_deg(target, heading_at(t))));
+                ticks.push((t, 60.9, crate::angles::signed_diff_deg(target, heading_at(t))));
                 t += 0.55;
             }
             ticks
@@ -2581,7 +2576,7 @@ mod tests {
                 .iter()
                 .rev()
                 .find(|(ts, _, _)| t - ts >= SWING_WINDOW_S)
-                .is_some_and(|(_, _, e)| angle_diff_deg(err, *e).abs() >= SWING_DEG)
+                .is_some_and(|(_, _, e)| crate::angles::abs_diff_deg(err, *e) >= SWING_DEG)
         };
         let last = EGBB_PUSH.len() - 1;
         assert!(!old_swinging(last), "the recorded failure");
