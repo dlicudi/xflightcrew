@@ -1167,7 +1167,7 @@ mod tests {
     /// before it: a tick's reads can return into the next flight.
     #[test]
     fn every_streaming_write_asks_if_it_is_still_live() {
-        let src = include_str!("recover.rs");
+        let src = crate::test_support::module_source("tools/recover");
         let body = src.split("fn run_recovery(").nth(1).unwrap();
         let body = body.split("fn may_write(").next().unwrap();
         let lines: Vec<&str> = body.lines().collect();

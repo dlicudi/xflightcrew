@@ -604,7 +604,7 @@ mod tests {
                 })
                 .collect()
         };
-        let taxi_in = std::fs::read_to_string(root.join("taxi_in.rs")).unwrap();
+        let taxi_in = crate::test_support::module_source("taxi_in").to_string();
         let built = sites(&taxi_in);
         assert!(!built.is_empty(), "taxi_in builds the tool");
         assert!(

@@ -350,7 +350,7 @@ mod tests {
         // copilot's speech turn, the barge-in cut per audio channel.
         const NOT_LOOPS: &[&str] = &["tempo", "tts"];
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-        let this = std::fs::read_to_string(root.join("flight_state.rs")).unwrap();
+        let this = crate::test_support::module_source("flight_state").to_string();
         let body = this.split("pub(crate) fn stand_down()").nth(1).unwrap();
         // The function alone: the owner list below it names every loop too.
         let body = body.split("\n}\n").next().unwrap();
@@ -369,6 +369,9 @@ mod tests {
         let mut missing = Vec::new();
         let mut checked = 0;
         for f in files {
+            if crate::test_support::is_test_file(&f) {
+                continue;
+            }
             let text = std::fs::read_to_string(&f).unwrap();
             let declares = text.lines().any(is_loop_flag);
             if !declares {
@@ -378,6 +381,7 @@ mod tests {
             let module = rel
                 .components()
                 .map(|c| c.as_os_str().to_string_lossy().to_string())
+                .filter(|c| c != "mod")
                 .collect::<Vec<_>>()
                 .join("::");
             if NOT_LOOPS.contains(&module.as_str()) {
@@ -454,7 +458,7 @@ mod tests {
         assert!(crate::hover::rotor_facts(&heli).is_some());
         let plane = crate::aircraft::load("cessna_172sp").expect("172 profile loads");
         assert!(crate::hover::rotor_facts(&plane).is_none());
-        let this = include_str!("flight_state.rs");
+        let this = crate::test_support::module_source("flight_state");
         let body = this
             .split("pub(crate) fn publish_airframe(")
             .nth(1)
@@ -483,7 +487,7 @@ mod tests {
     #[test]
     fn every_new_flight_and_mission_end_forgets_the_flight() {
         let door = body_of(
-            include_str!("flight_state.rs"),
+            crate::test_support::module_source("flight_state"),
             "pub(crate) fn forget_flight()",
         );
         for clear in [
@@ -493,7 +497,7 @@ mod tests {
         ] {
             assert!(door.contains(clear), "forget_flight must call {clear}");
         }
-        let setup = include_str!("tools/setup.rs");
+        let setup = crate::test_support::module_source("tools/setup");
         let foreign = body_of(setup, "async fn foreign_new_flight(");
         assert!(foreign.contains("crate::flight_state::forget_flight();"));
         // The ramp and approach setups: once per new flight begun.
@@ -504,7 +508,7 @@ mod tests {
             calls >= 3,
             "ramp, approach and foreign new flights: {calls}"
         );
-        let mission_end = body_of(include_str!("full_auto.rs"), "fn stop_active()");
+        let mission_end = body_of(crate::test_support::module_source("full_auto"), "fn stop_active()");
         assert!(mission_end.contains("publish_flight_transition(None)"));
     }
 
@@ -514,7 +518,7 @@ mod tests {
     /// read again between the await and the launch.
     #[test]
     fn the_circuit_rechecks_its_abort_before_launching_autoland() {
-        let src = include_str!("circuit.rs");
+        let src = crate::test_support::module_source("circuit");
         let at = src.find("if try_published_arrival(").unwrap();
         let rest = &src[at..];
         let launch = rest.find("crate::autoland::ABORT.store(false").unwrap();
@@ -533,14 +537,14 @@ mod tests {
         let epoch = crate::tools::power::sequence_epoch();
         crate::tools::power::stop_sequences();
         assert!(crate::tools::power::sequence_stood_down(epoch));
-        let src = include_str!("tools/jet_start.rs");
+        let src = crate::test_support::module_source("tools/jet_start");
         let steps = body_of(src, "async fn run_sequence(");
         assert!(
             steps.matches("if stood_down(epoch)").count() >= 5,
             "checked between steps"
         );
         let prep = body_of(
-            include_str!("tools/power.rs"),
+            crate::test_support::module_source("tools/power"),
             "pub(crate) async fn run_prep(",
         );
         assert!(
@@ -553,7 +557,7 @@ mod tests {
     /// procedure and an abort drop it.
     #[test]
     fn a_missed_approach_stash_dies_with_its_procedure() {
-        let src = include_str!("procedure.rs");
+        let src = crate::test_support::module_source("procedure");
         assert!(body_of(src, "pub fn abort() -> bool").contains("take_missed_legs();"));
         assert!(body_of(src, "pub fn start_scoped(").contains("take_missed_legs();"));
     }

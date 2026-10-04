@@ -2021,7 +2021,7 @@ mod tests {
     #[test]
     fn a_resume_on_the_plans_final_flies_the_arrival() {
         let v: serde_json::Value =
-            serde_json::from_str(include_str!("../../bench/ofp/egkk-egbb-738.trimmed.json"))
+            serde_json::from_str(include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/bench/ofp/egkk-egbb-738.trimmed.json")))
                 .unwrap();
         let fp = crate::simbrief::plan_from_ofp(&v).unwrap();
         assert_eq!(fp.procedures.dest_rwy.as_deref(), Some("33"));

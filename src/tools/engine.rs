@@ -11,11 +11,6 @@ use serde_json::{json, Value};
 use super::{Tool, ToolCtx};
 use crate::aircraft::FuelSelectorProfile;
 
-/// The stock lever, which the tests read. Live code goes through
-/// `aircraft::throttle_dataref()` (refactor audit 2026-10-04 #11: the
-/// Citation X ignores `throttle_ratio_all`).
-#[cfg(test)]
-const THROTTLE: &str = "sim/cockpit2/engine/actuators/throttle_ratio_all";
 const MIXTURE: &str = "sim/cockpit2/engine/actuators/mixture_ratio_all";
 const BATTERY: &str = "sim/cockpit/electrical/battery_on";
 const BUS_VOLTS: &str = "sim/cockpit2/electrical/bus_volts";

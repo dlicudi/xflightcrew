@@ -84,21 +84,6 @@ impl Phase {
         )
     }
 
-    /// Before the takeoff: the ground phases a departure passes through.
-    pub fn departing(self) -> bool {
-        matches!(
-            self,
-            Phase::Ready
-                | Phase::EngineStart
-                | Phase::Pushback
-                | Phase::TaxiOut
-                | Phase::Holding
-                | Phase::LinedUp
-                | Phase::TakeoffRoll
-                | Phase::RejectedTakeoff
-        )
-    }
-
     /// The words a crew uses for it.
     pub fn spoken(self) -> &'static str {
         match self {
@@ -338,6 +323,7 @@ pub struct Memory {
     pub flight_no: u32,
     /// The flight was joined in the air (app started or repositioned
     /// airborne): its departure is unknown, not "none".
+    #[allow(dead_code)] // the flight's record: read by the tests, no live consumer yet
     pub joined_airborne: bool,
     pub origin: Option<(f64, f64)>,
     pub takeoff_t: Option<f64>,
@@ -345,6 +331,7 @@ pub struct Memory {
     /// the takeoff, a touch and go, or the join. The time aloft a landing
     /// ends (rapport's "an hour in the air").
     pub aloft_t: Option<f64>,
+    #[allow(dead_code)] // the flight's record: no consumer yet
     pub fuel_at_takeoff_kg: Option<f64>,
     pub peak_alt_ft: f64,
     pub peak_agl_ft: f64,
@@ -627,6 +614,7 @@ impl Flight {
         &self.memory
     }
     /// The crew's side as last known.
+    #[cfg(test)]
     pub fn situation(&self) -> &Situation {
         &self.situation
     }
@@ -2227,7 +2215,7 @@ mod tests {
     /// +1748.9. The height lost over the window is the descent.
     #[test]
     fn a_sawtooth_descent_from_the_top_is_a_descent() {
-        const TOD: &str = include_str!("../bench/flight/egkk_egbb_top_of_descent.jsonl");
+        const TOD: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/bench/flight/egkk_egbb_top_of_descent.jsonl"));
         let t0 = 1790624015.0;
         let mut r = Replay::default();
         let mut went_down: Option<(f64, f64)> = None;

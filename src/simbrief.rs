@@ -789,7 +789,7 @@ mod tests {
     #[test]
     fn the_ofp_cruise_schedule_is_read_from_the_navlog() {
         let v: Value =
-            serde_json::from_str(include_str!("../bench/ofp/egkk-egbb-738.trimmed.json")).unwrap();
+            serde_json::from_str(include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/bench/ofp/egkk-egbb-738.trimmed.json"))).unwrap();
         let s = parse_schedule(&v);
         assert_eq!(s.cost_index, Some(77.0));
         assert_eq!(s.profile.as_deref(), Some("CI 77"));
@@ -958,7 +958,9 @@ mod tests {
         walk(&root, &mut files);
         let mut offenders = Vec::new();
         for f in &files {
-            if f.file_name().is_some_and(|n| n == "simbrief.rs") {
+            if f.file_name().is_some_and(|n| n == "simbrief.rs")
+                || f.components().any(|c| c.as_os_str() == "simbrief")
+            {
                 continue;
             }
             let text = std::fs::read_to_string(f).unwrap();

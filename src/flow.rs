@@ -1921,7 +1921,7 @@ mod tests {
     /// false). The list waits for the pavement.
     #[test]
     fn the_after_landing_list_waits_for_the_vacate() {
-        const ROLL: &str = include_str!("../bench/flight/egbb15_rollout_to_vacate.jsonl");
+        const ROLL: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/bench/flight/egbb15_rollout_to_vacate.jsonl"));
         let blind = replay_tracker(ROLL, false, |_| None);
         let at = blind.iter().find(|(_, n)| *n == "after landing").map(|(t, _)| *t);
         assert!(at.is_some_and(|t| t < 2850.0), "the recorded failure: {blind:?}");
@@ -1936,7 +1936,7 @@ mod tests {
     /// 12,700 inside it earns no cruise list.
     #[test]
     fn the_descent_list_runs_near_the_top_of_a_sawtooth_descent() {
-        const TOD: &str = include_str!("../bench/flight/egkk_egbb_top_of_descent.jsonl");
+        const TOD: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/bench/flight/egkk_egbb_top_of_descent.jsonl"));
         let fired = replay_tracker(TOD, true, |_| None);
         let at = fired.iter().find(|(_, n)| *n == "descent").map(|(t, _)| *t);
         assert!(at.is_some_and(|t| t < 1630.0), "{fired:?}");

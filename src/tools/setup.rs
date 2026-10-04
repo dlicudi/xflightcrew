@@ -1722,7 +1722,7 @@ mod tests {
             let line = new_flight_loading_refusal().expect("refused while loading");
             assert!(line.contains("still loading"), "{line}");
         }
-        let src = include_str!("full_auto.rs");
+        let src = crate::test_support::module_source("tools/full_auto");
         let refusal = src
             .find("new_flight_loading_refusal()")
             .expect("the full-auto tool asks");
@@ -1731,7 +1731,7 @@ mod tests {
             .expect("the running check");
         assert!(refusal < running, "asked before anything arms");
         // The approach follow-up holds the flag until it has armed.
-        let this = include_str!("setup.rs");
+        let this = crate::test_support::module_source("tools/setup");
         let arm = this.find("crate::autoland::run_autoland(").unwrap();
         let drop_at = this.find("drop(loading);").unwrap();
         assert!(arm < drop_at, "the flag drops after the arm");
@@ -1799,7 +1799,7 @@ mod tests {
     /// ramp setup rebuilds it before its flag drops (#151).
     #[test]
     fn a_new_flight_takes_its_station_from_its_new_position() {
-        let src = include_str!("setup.rs");
+        let src = crate::test_support::module_source("tools/setup");
         let body = |name: &str| {
             let a = src.find(name).unwrap();
             let b = a + src[a..].find("\n}\n").unwrap();
@@ -1844,9 +1844,8 @@ mod tests {
         // modules may spawn (a test runtime is theirs); comments may name it.
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/tools");
         let mut offenders = Vec::new();
-        for e in std::fs::read_dir(&dir).unwrap().flatten() {
-            let p = e.path();
-            if p.extension().is_none_or(|x| x != "rs") {
+        for p in crate::test_support::rust_files(&dir) {
+            if crate::test_support::is_test_file(&p) {
                 continue;
             }
             let text = std::fs::read_to_string(&p).unwrap();

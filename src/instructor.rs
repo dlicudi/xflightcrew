@@ -4587,7 +4587,7 @@ mod tests {
         };
         let mut t_s = 0.0;
         let mut said: Vec<String> = Vec::new();
-        let mut run = |s: Sample, io: &mut FakeIo, said: &mut Vec<String>| {
+        let run = |s: Sample, io: &mut FakeIo, said: &mut Vec<String>| {
             said.extend(tick_with(s, io));
             io.tick();
         };

@@ -2785,7 +2785,7 @@ mod tests {
         // The command loop no longer claims the brake for a steered push:
         // its stop lines are the native push's, chosen from its own
         // read-back through the same `stop_line`.
-        let main = include_str!("main.rs");
+        let main = crate::test_support::module_source("main");
         assert!(
             !main.contains(r#""Stopping the push."#),
             "a literal stop line in main.rs"

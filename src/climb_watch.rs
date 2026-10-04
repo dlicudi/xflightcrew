@@ -721,8 +721,8 @@ mod tests {
         (first, seen)
     }
 
-    const STALL: &str = include_str!("../bench/sorties/1790649043-full_auto.trimmed.jsonl");
-    const FLOWN: &str = include_str!("../bench/sorties/1790631752-full_auto.trimmed.jsonl");
+    const STALL: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/bench/sorties/1790649043-full_auto.trimmed.jsonl"));
+    const FLOWN: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/bench/sorties/1790631752-full_auto.trimmed.jsonl"));
 
     /// #181: the 737 whose autopilot did not follow the dial. As flown the
     /// circuit rode it from 166 kt to 73 and 2,643 ft AGL; the watch takes it
@@ -878,10 +878,10 @@ mod tests {
 
     // ---- the authority check, replayed ------------------------------------
 
-    const A330_CLIMB: &str = include_str!("../bench/sorties/1790651279-full_auto.trimmed.jsonl");
-    const A330_FLOWN: &str = include_str!("../bench/sorties/1790621184-full_auto.trimmed.jsonl");
-    const A330_FINAL: &str = include_str!("../bench/sorties/1790651449-approach.trimmed.jsonl");
-    const FINAL_FLOWN: &str = include_str!("../bench/sorties/1790646179-approach.trimmed.jsonl");
+    const A330_CLIMB: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/bench/sorties/1790651279-full_auto.trimmed.jsonl"));
+    const A330_FLOWN: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/bench/sorties/1790621184-full_auto.trimmed.jsonl"));
+    const A330_FINAL: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/bench/sorties/1790651449-approach.trimmed.jsonl"));
+    const FINAL_FLOWN: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/bench/sorties/1790646179-approach.trimmed.jsonl"));
 
     /// Replays a sortie's engages the way the loops feed the check: armed at
     /// the takeoff's `ap_engaged` on the climb flown, fed its `climb` ticks

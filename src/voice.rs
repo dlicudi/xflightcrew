@@ -57,7 +57,6 @@ const ECHO_SIMILARITY: f64 = 0.55;
 /// `Advisory`/`Caution`/`Warning` are the monitor's tiers (wired up in the
 /// monitoring milestone); the command loop uses `Readback`.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
-#[allow(dead_code)] // Advisory/Caution/Warning are used by the monitor (next milestone)
 pub enum Priority {
     Advisory,
     Readback,
@@ -1446,7 +1445,6 @@ impl Voice {
     /// the one door they all walk through, so no watch can forget the gate.
     /// Deliberate blocking replies (`say`) are NOT gated: the main loop
     /// mode-routes those itself, and the "copilot is off" note must speak.
-    #[allow(dead_code)] // used by the monitor (next milestone)
     pub fn alert(&self, priority: Priority, text: impl Into<String>) {
         if !crate::mode::copilot_enabled() {
             return;
