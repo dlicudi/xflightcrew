@@ -5187,6 +5187,17 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, p: Params
                 order_owed = Some(by);
                 continue;
             }
+            // A stand-down (swap, instructor, a new flight) that landed during
+            // that await set our ABORT and autoland's: clearing autoland's
+            // latch below would launch an autoland nobody can cancel.
+            if ABORT.load(Ordering::SeqCst) {
+                stand_down(
+                    &voice,
+                    "Circuit cancelled. Your aircraft.",
+                    "abort_pattern_phase",
+                );
+                return;
+            }
             crate::blackbox::record(
                 "circuit",
                 serde_json::json!({

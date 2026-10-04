@@ -2965,17 +2965,32 @@ pub fn speed_floor_kts() -> Option<f64> {
 /// A330's cruise governor was armed at its profile's 290 and held 250 with
 /// nothing said, and a spoken "hold two eighty" in any jet was quietly 250
 /// (found on the profile review, 2026-09-20). The cap is now the airframe's
-/// own, `SPEED_CEILING_MARGIN_KTS` under Vne, republished per swap like the
-/// floor. Below 10,000 ft the 250 kt rule still applies on top of it
+/// own, [`ceiling_from_vne`], republished per swap like the floor. Below 10,000 ft the 250 kt rule still applies on top of it
 /// (`speedhold::BELOW_10K_LIMIT_KTS`); that is airspace, not airframe.
 static SPEED_CEILING_KTS: std::sync::Mutex<Option<f64>> = std::sync::Mutex::new(None);
-pub const SPEED_CEILING_MARGIN_KTS: f64 = 15.0;
+/// The monitor's overspeed caution floor, a fraction of Vne (the monitor's
+/// `OVERSPEED_CAUTION_FACTOR` is this one).
+pub const OVERSPEED_CAUTION_FACTOR: f64 = 0.90;
+
+/// Knots under the monitor's overspeed caution the ceiling sits: the
+/// governor's own wander (296 to 303 kt around a 299 target at FL180) and a
+/// descent's first seconds must not reach the caution band.
+pub const SPEED_CEILING_MARGIN_KTS: f64 = 10.0;
+
+/// The speed ceiling for a Vne: the overspeed caution's floor
+/// ([`OVERSPEED_CAUTION_FACTOR`] of Vne) less [`SPEED_CEILING_MARGIN_KTS`]. It was Vne less 15, which sits INSIDE the
+/// caution band for any Vne over 150 kt: a 737 (Vne 340, caution from 306)
+/// accepted "hold three twenty" and then called "Overspeed!" on it (refactor
+/// audit, 2026-10-04). One rule for the governor and the follower's cruise
+/// (`procedure::cruise_cap_kts`). Pure.
+pub fn ceiling_from_vne(vne_kts: f64) -> f64 {
+    (vne_kts * OVERSPEED_CAUTION_FACTOR - SPEED_CEILING_MARGIN_KTS).floor()
+}
 
 /// Publish the airframe's speed ceiling from its Vne. Called on EVERY profile swap.
 pub fn publish_speed_ceiling(vne_kts: Option<f64>) {
-    *SPEED_CEILING_KTS.lock().unwrap_or_else(|e| e.into_inner()) = vne_kts
-        .filter(|v| *v > 0.0)
-        .map(|v| (v - SPEED_CEILING_MARGIN_KTS).round());
+    *SPEED_CEILING_KTS.lock().unwrap_or_else(|e| e.into_inner()) =
+        vne_kts.filter(|v| *v > 0.0).map(ceiling_from_vne);
 }
 
 /// The live airframe's speed ceiling, kts, if its profile declares a Vne.

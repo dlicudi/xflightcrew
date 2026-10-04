@@ -112,6 +112,12 @@ pub fn route_remaining_nm(route: &[(f64, f64)], lat: f64, lon: f64) -> Option<f6
 
 pub static DESTINATION: std::sync::Mutex<Option<Destination>> = std::sync::Mutex::new(None);
 
+/// A new flight: the last plan's destination no longer drives the TOD ring
+/// or the answers until a plan read publishes it again (`plan::ensure_plan`).
+pub(crate) fn forget_destination() {
+    *DESTINATION.lock().unwrap_or_else(|e| e.into_inner()) = None;
+}
+
 /// Coarse flight phase, estimated from motion and height. Used to arm/disarm
 /// checks (e.g. "flaps up on final" only matters on Approach).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -988,7 +994,7 @@ const STALL_LOOKAHEAD_S: f64 = 4.0;
 const OVERSPEED_LOOKAHEAD_S: f64 = 4.0;
 /// The overspeed caution's floor, a fraction of Vne; the follower schedules
 /// its cruise under it (`procedure::cruise_cap_kts`).
-pub(crate) const OVERSPEED_CAUTION_FACTOR: f64 = 0.90;
+pub(crate) const OVERSPEED_CAUTION_FACTOR: f64 = crate::aircraft::OVERSPEED_CAUTION_FACTOR;
 
 struct StallSpeed {
     id: &'static str,

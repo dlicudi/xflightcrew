@@ -53,9 +53,9 @@ pub const CRUISE_AGL_FT: f64 = 1000.0;
 /// The cruise speed when the airframe declares none (see [`cruise_kts`]).
 pub const CRUISE_KTS: f64 = 120.0;
 
-/// The cruise speed: the airframe's own (`reference.cruise_ias_kts`, 140 kt
-/// on the S-76, whose Vno is 139.5), never past its speed ceiling (Vne less
-/// 15), [`CRUISE_KTS`] when it declares none. A flat 120 flew the S-76 20 kt
+/// The cruise speed: the airframe's own (`reference.cruise_ias_kts`, 128 kt
+/// on the S-76, under its 139.5 kt overspeed caution), never past its speed
+/// ceiling (`aircraft::ceiling_from_vne`), [`CRUISE_KTS`] when it declares none. A flat 120 flew the S-76 20 kt
 /// under its book cruise with the collective at 0.72 of a 0.85 cap
 /// (LILO-LILB, 2026-09-24). Where the power is not there the cruise settles
 /// at what it makes ([`power_limited_kts`]).

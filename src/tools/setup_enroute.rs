@@ -621,6 +621,9 @@ impl Tool for SetUpEnroute {
         );
         // The new flight ends this one: nothing may keep flying it.
         crate::flight_state::stand_down();
+        // And the crew forgets it (last landing, tracking, destination)
+        // before the new flight's transition is published below.
+        crate::flight_state::forget_flight();
         // The flight's transition, as the resume publishes it: the altimeter
         // is set to it at the settle and the monitor checks against it.
         crate::tools::instruments::publish_flight_transition(Some(
@@ -688,7 +691,8 @@ async fn engage(xp: &crate::xplane::XPlaneClient, job: &EnrouteJob) -> Engaged {
     use crate::autoland::ApEngage;
     let p = &job.placement;
     let var = xp.get_float(MAG_VAR).await.ok().filter(|v| v.is_finite()).unwrap_or(0.0);
-    let bug = (p.track_true - var).rem_euclid(360.0);
+    // X-Plane's variation is positive-west: magnetic = true + variation.
+    let bug = crate::autoland::true_to_mag(p.track_true, var);
     let mut out = Engaged::default();
     let mut e = ApEngage::default();
     let t0 = std::time::Instant::now();

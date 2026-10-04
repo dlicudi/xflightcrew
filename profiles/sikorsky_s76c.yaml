@@ -164,7 +164,7 @@ reference:
   kind: twin-engine helicopter
   vno_kts: 139.0               # acf
   cruise_kts: 140.0            # KTAS, typical
-  cruise_ias_kts: 140.0
+  cruise_ias_kts: 128.0        # under the overspeed caution (0.9 Vne 139.5) less 10 kt
   max_gross_lb: 11700.0        # acf MTOW
   empty_weight_lb: 7574.0      # acf empty
   useful_load_lb: 4126.0

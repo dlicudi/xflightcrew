@@ -399,6 +399,10 @@ impl Station {
         *DEPARTURE_STREAM.lock().unwrap_or_else(|e| e.into_inner()) = None;
         *ARRIVAL_STREAM.lock().unwrap_or_else(|e| e.into_inner()) = None;
         *TAXI_ROUTE.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        // The last field's wind is not this field's (a re-sequence fell back
+        // to it), and a challenge nobody answered is not kept for this tower.
+        *TOWER_WIND.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        *ZONE_CHALLENGE.lock().unwrap_or_else(|e| e.into_inner()) = false;
         // The previous field's worksheets die with it: a region handoff calls
         // install() WITHOUT uninstall(), and anything left armed here keeps
         // acting for a station that no longer exists. An armed vector plan
@@ -492,6 +496,7 @@ impl Station {
         *PENDING_RESEQUENCE.lock().unwrap_or_else(|e| e.into_inner()) = None;
         *RESEQUENCED_ORDER.lock().unwrap_or_else(|e| e.into_inner()) = None;
         *ZONE_CHALLENGE.lock().unwrap_or_else(|e| e.into_inner()) = false;
+        *TOWER_WIND.lock().unwrap_or_else(|e| e.into_inner()) = None;
     }
 
     /// Content routing (shared PTT): if the utterance is a radio call AND COM1
@@ -4171,6 +4176,12 @@ pub fn retire_for_new_flight() {
     *PENDING_LANDING_RELEASE
         .lock()
         .unwrap_or_else(|e| e.into_inner()) = None;
+    // A challenge raised for the old flight, the wind the tower worked it
+    // with, and our track before the jump: a groundspeed derived across a
+    // reposition judged the new final's go-around.
+    *ZONE_CHALLENGE.lock().unwrap_or_else(|e| e.into_inner()) = false;
+    *TOWER_WIND.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    OWN_FIXES.lock().unwrap_or_else(|e| e.into_inner()).clear();
 }
 
 /// A NEW FLIGHT at `icao` (the crew's "put us on a ten mile final", which
@@ -13035,6 +13046,39 @@ mod tests {
             Some(tower::State::ClearedToLand)
         );
         Station::uninstall();
+    }
+
+    /// The tower's wind, a zone challenge nobody answered and our track
+    /// before a jump outlived the flight and the field they belonged to: a
+    /// re-sequence fell back to the last field's wind, the next mission's
+    /// first enroute pass drained a challenge raised on the last flight, and
+    /// a groundspeed was derived across a reposition. Retired with the
+    /// flight; the wind and the challenge with the field too.
+    #[test]
+    fn a_new_flight_or_field_forgets_wind_challenge_and_track() {
+        let _guard = SIDE_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let arm = || {
+            *TOWER_WIND.lock().unwrap() = Some((130.0, 12.0));
+            *ZONE_CHALLENGE.lock().unwrap() = true;
+            note_own_fix(36.67, -4.49, false, Instant::now());
+        };
+        arm();
+        retire_for_new_flight();
+        assert_eq!(*TOWER_WIND.lock().unwrap(), None);
+        assert!(!crate::party_line::take_zone_challenge());
+        assert!(OWN_FIXES.lock().unwrap().is_empty());
+        NEW_FLIGHT_PENDING.store(false, std::sync::atomic::Ordering::SeqCst);
+
+        arm();
+        lxgb().install();
+        assert_eq!(*TOWER_WIND.lock().unwrap(), None);
+        assert!(!crate::party_line::take_zone_challenge());
+
+        arm();
+        Station::uninstall();
+        assert_eq!(*TOWER_WIND.lock().unwrap(), None);
+        assert!(!crate::party_line::take_zone_challenge());
+        OWN_FIXES.lock().unwrap().clear();
     }
 
     /// LFLL-EGLL, 2026-09-17. Inbound to Heathrow with the inbound call made

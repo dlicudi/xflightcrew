@@ -234,8 +234,8 @@ lights:
   - { key: taxi,    spoken: taxi light,        dataref: "sim/cockpit2/switches/landing_lights_switch[1]", command_on: laminar/A333/switch/lighting/taxi_light_taxi, command_off: laminar/A333/switch/lighting/taxi_light_off }
 
 # Vmo 330 KIAS (Mmo 0.89 per the POM); the acf's Vne. The flight governor's
-# ceiling is derived from it (Vne less a margin), so a cruise target of 290
-# is no longer clamped to a GA 250.
+# ceiling is derived from it (under the 0.9 Vne overspeed caution, 287), so
+# a cruise target of 285 is no longer clamped to a GA 250.
 vne_kts: 330.0
 
 # The parking brake is a VALVE here: the aircraft's own auto-board writes
@@ -455,7 +455,7 @@ reference:
   # in the air: blackbox `autotakeoff` `climb`, `ias` near the hold to 1,000 ft.
   acceleration_height_agl_ft: 1000.0
   best_climb_fpm: 2500.0       # initial climb, light; the climb law takes 80%
-  cruise_ias_kts: 290.0        # KIAS the cruise governor holds (~M0.82 up high)
+  cruise_ias_kts: 285.0        # KIAS the cruise governor holds (~M0.82 up high), under the ceiling (287)
   # POM 140-160 CONF FULL; the MCDU's own example is VLS 149 / VAPP 154.
   # 145 sat under the 1.2 x Vso floor (150) and was raised, aloud, on every
   # arm, and 150 is exactly the monitor's caution line; 154 is the box's own
