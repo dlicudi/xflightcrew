@@ -2471,15 +2471,10 @@ pub struct CruisePick {
     pub capped_from: Option<f64>,
 }
 
-/// Knots under the monitor's overspeed caution a cruise is scheduled at:
-/// the governor's own wander (296 to 303 kt around a 299 target at FL180)
-/// and a descent's first seconds must not reach the caution band.
-pub const CRUISE_CAUTION_MARGIN_KTS: f64 = 10.0;
-
 /// The highest cruise the follower schedules: the overspeed caution's
-/// floor ([`crate::monitor::OVERSPEED_CAUTION_FACTOR`] of Vne) less
-/// [`CRUISE_CAUTION_MARGIN_KTS`]. `vne_kts` is the airframe's; `None`
-/// without one.
+/// floor less its margin, the governor's own ceiling
+/// ([`crate::aircraft::ceiling_from_vne`]). `vne_kts` is the airframe's;
+/// `None` without one.
 ///
 /// EGKK-EGBB, 2026-09-28 (sortie 1790601822-full_auto, #156): the OFP's
 /// 299 and 300 KIAS at FL180 against the 737's 340 kt Vne (caution from
@@ -2489,7 +2484,7 @@ pub const CRUISE_CAUTION_MARGIN_KTS: f64 = 10.0;
 pub fn cruise_cap_kts(vne_kts: Option<f64>) -> Option<f64> {
     vne_kts
         .filter(|v| *v > 0.0)
-        .map(|v| (v * crate::monitor::OVERSPEED_CAUTION_FACTOR - CRUISE_CAUTION_MARGIN_KTS).floor())
+        .map(crate::aircraft::ceiling_from_vne)
 }
 
 /// The OFP's speed where the leg has one and it is inside the airframe's
@@ -3467,8 +3462,8 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, plan: Pla
                     sched.as_ref(),
                     crate::aircraft::speed_floor_kts(),
                     ceiling,
-                    // Vne from the published ceiling (Vne less its margin).
-                    cruise_cap_kts(ceiling.map(|c| c + crate::aircraft::SPEED_CEILING_MARGIN_KTS)),
+                    // The published ceiling IS the cruise cap (one rule).
+                    ceiling,
                 );
                 let key = (idx, pick.source, pick.rejected);
                 if sched.is_some() && schedule_logged != Some(key) {
@@ -3941,7 +3936,7 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, plan: Pla
             // a field the answer should be about the field, not the hills past it.
             let brg = bearing_to_fix(lat, lon, leg)
                 .or(psi_v)
-                .unwrap_or_else(|| bug_mag + mag_var);
+                .unwrap_or_else(|| (bug_mag - mag_var).rem_euclid(360.0));
             let look = dist_nm
                 .map(|d| (d + 2.0).min(TERRAIN_LOOK_NM))
                 .unwrap_or(TERRAIN_LOOK_NM);

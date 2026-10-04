@@ -988,7 +988,7 @@ const STALL_LOOKAHEAD_S: f64 = 4.0;
 const OVERSPEED_LOOKAHEAD_S: f64 = 4.0;
 /// The overspeed caution's floor, a fraction of Vne; the follower schedules
 /// its cruise under it (`procedure::cruise_cap_kts`).
-pub(crate) const OVERSPEED_CAUTION_FACTOR: f64 = 0.90;
+pub(crate) const OVERSPEED_CAUTION_FACTOR: f64 = crate::aircraft::OVERSPEED_CAUTION_FACTOR;
 
 struct StallSpeed {
     id: &'static str,

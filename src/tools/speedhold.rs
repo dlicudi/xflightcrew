@@ -1945,15 +1945,19 @@ mod tests {
             "mishear can't idle us into a stall"
         );
         assert_eq!(clamp_target(700.0), 250.0, "no Vne on file: the GA cap");
-        // A jet's cap is its own Vne less the margin, and the airspace rule
-        // below 10,000 ft is applied separately by `flight_target_for_alt`.
+        // A jet's cap is under its overspeed caution (0.9 Vne less the
+        // margin), and the airspace rule below 10,000 ft is applied separately
+        // by `flight_target_for_alt`.
         crate::aircraft::publish_speed_ceiling(Some(330.0));
         assert_eq!(
-            clamp_target(290.0),
-            290.0,
+            clamp_target(270.0),
+            270.0,
             "an A330's cruise target survives"
         );
-        assert_eq!(clamp_target(700.0), 315.0);
+        assert_eq!(clamp_target(700.0), 287.0);
+        // The 737: Vne 340, caution from 306. Vne less 15 (325) was inside it.
+        crate::aircraft::publish_speed_ceiling(Some(340.0));
+        assert!(clamp_target(320.0) < 340.0 * crate::monitor::OVERSPEED_CAUTION_FACTOR);
         crate::aircraft::publish_speed_ceiling(None);
         assert_eq!(clamp_target(290.0), 250.0);
         assert_eq!(clamp_taxi_target(10.0), 10.0);

@@ -688,7 +688,8 @@ async fn engage(xp: &crate::xplane::XPlaneClient, job: &EnrouteJob) -> Engaged {
     use crate::autoland::ApEngage;
     let p = &job.placement;
     let var = xp.get_float(MAG_VAR).await.ok().filter(|v| v.is_finite()).unwrap_or(0.0);
-    let bug = (p.track_true - var).rem_euclid(360.0);
+    // X-Plane's variation is positive-west: magnetic = true + variation.
+    let bug = crate::autoland::true_to_mag(p.track_true, var);
     let mut out = Engaged::default();
     let mut e = ApEngage::default();
     let t0 = std::time::Instant::now();
