@@ -455,7 +455,11 @@
                 // helper's own fixture and binds no aircraft. (Truncating at
                 // `#[cfg(test)]` instead cut several real laws out of the
                 // scan, because these files gate items throughout.)
-                let Some(rest) = line.strip_prefix("const ") else {
+                // Widened only so a moved law can read it (`roll_steer`).
+                let Some(rest) = line
+                    .strip_prefix("const ")
+                    .or_else(|| line.strip_prefix("pub(crate) const "))
+                else {
                     continue;
                 };
                 let Some((name, _)) = rest.split_once(": f64 = ") else {

@@ -73,6 +73,7 @@ mod procedure;
 mod pushback;
 mod radiofx;
 mod rapport;
+mod roll_steer;
 mod readback;
 mod reversal;
 mod route_finder;
