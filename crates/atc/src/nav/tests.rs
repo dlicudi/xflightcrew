@@ -110,7 +110,7 @@ fn egkk_egbb_route() -> Vec<String> {
 /// the filed LAM6M stands.
 #[test]
 fn the_sid_for_the_filed_route_at_egkk_is_the_one_that_reaches_lam() {
-    let text = include_str!("../bench/cifp/EGKK_sids.dat");
+    let text = include_str!("../../bench/cifp/EGKK_sids.dat");
     let route = egkk_egbb_route();
     let serving: Vec<String> =
         sid_transitions_in(text.lines(), "08R").into_iter().map(|(i, _)| i).collect();
