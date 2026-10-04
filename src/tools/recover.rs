@@ -235,7 +235,7 @@ impl Tool for Recover {
             ctx.config.xplane_base_url.clone(),
             self.cfg.fd_commands.clone(),
             self.prop.clone(),
-            (self.stall_speed_kts * 1.3).max(70.0),
+            crate::aircraft::recovery_hold_kts(self.stall_speed_kts),
             ctx.voice.cloned(),
             ctx.status.cloned(),
             Handback {

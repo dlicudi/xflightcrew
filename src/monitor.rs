@@ -1029,7 +1029,7 @@ pub fn follower_flying(procedure: bool, heli_route: bool) -> bool {
 
 /// With an automation flying, the caution band's top: the margin under its
 /// own target, not the hand-flown 1.2 Vs.
-const AUTO_CAUTION_FACTOR: f64 = 1.13;
+const AUTO_CAUTION_FACTOR: f64 = crate::aircraft::CAUTION_AUTO_RATIO;
 
 /// The stall speed at this flap setting: a straight line from the clean
 /// stall to the landing-configuration stall when the profile declares one,
@@ -2486,8 +2486,8 @@ fn build_checks(profile: &AircraftProfile) -> Vec<Box<dyn Check>> {
             vs_clean_kts: vs,
             vs0_kts: vs0,
             detent_stall: detent_stall.clone(),
-            at_or_below_factor: 1.20,
-            above_factor: Some(1.10),
+            at_or_below_factor: crate::aircraft::CAUTION_HAND_RATIO,
+            above_factor: Some(crate::aircraft::STALL_WARNING_RATIO),
         }));
         checks.push(Box::new(StallSpeed {
             id: "airspeed_warning",
@@ -2495,7 +2495,7 @@ fn build_checks(profile: &AircraftProfile) -> Vec<Box<dyn Check>> {
             vs_clean_kts: vs,
             vs0_kts: vs0,
             detent_stall,
-            at_or_below_factor: 1.10,
+            at_or_below_factor: crate::aircraft::STALL_WARNING_RATIO,
             above_factor: None,
         }));
     }
@@ -2555,10 +2555,11 @@ fn build_checks(profile: &AircraftProfile) -> Vec<Box<dyn Check>> {
         checks.push(Box::new(StabTrim));
     }
     if let Some(flaps) = &profile.flaps {
-        let limits: Vec<(f64, f64)> = flaps
+        let limits: Vec<(f64, Option<f64>)> = flaps
             .detents
             .iter()
-            .filter_map(|d| d.vfe_kts.map(|v| (d.ratio, v)))
+            .filter(|d| d.vfe_kts.is_some())
+            .map(|d| (d.ratio, d.vfe_kts))
             .collect();
         if !limits.is_empty() {
             checks.push(Box::new(FlapOverspeed { limits }));
@@ -5313,8 +5314,11 @@ impl GyroSync {
 /// current flap position (Vfe drops as the flaps extend further). Airborne only.
 struct FlapOverspeed {
     /// (detent ratio, Vfe knots) for detents that carry a limit.
-    limits: Vec<(f64, f64)>,
+    limits: Vec<(f64, Option<f64>)>,
 }
+
+/// The flap overspeed caution speaks this far over the placard.
+const FLAP_OVERSPEED_MARGIN_KTS: f64 = 5.0;
 impl Check for FlapOverspeed {
     fn id(&self) -> &'static str {
         "flap_overspeed"
@@ -5326,14 +5330,10 @@ impl Check for FlapOverspeed {
         if s.on_ground || s.flap_ratio < 0.02 {
             return None;
         }
-        // Lowest Vfe among detents we've reached (ratio <= current, small tolerance).
-        let vfe = self
-            .limits
-            .iter()
-            .filter(|(r, _)| *r <= s.flap_ratio + 0.05)
-            .map(|(_, v)| *v)
-            .fold(f64::INFINITY, f64::min);
-        if vfe.is_finite() && s.ias_kts > vfe + 5.0 {
+        // Lowest Vfe among detents we've reached: the one placard lookup.
+        let vfe = crate::aircraft::flap_placard_kts(s.flap_ratio, &self.limits)
+            .unwrap_or(f64::INFINITY);
+        if vfe.is_finite() && s.ias_kts > vfe + FLAP_OVERSPEED_MARGIN_KTS {
             Some(format!("Flap overspeed, {:.0} knots over the {vfe:.0} flap limit. Slow down or bring the flaps up.", s.ias_kts))
         } else {
             None

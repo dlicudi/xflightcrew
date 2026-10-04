@@ -564,12 +564,6 @@ pub fn longest_runway_ft(a: &nav::AirportInfo) -> f64 {
         .fold(0.0, f64::max)
 }
 
-/// The runway the destination must offer, feet: the profile's landing
-/// distance, else its takeoff distance (what every GA POH gives), else no check.
-pub fn runway_needed_ft(landing_ft: Option<f64>, takeoff_ft: Option<f64>) -> Option<f64> {
-    landing_ft.or(takeoff_ft).filter(|f| *f > 0.0)
-}
-
 /// The least climb a local route is credited from its first mile: under a
 /// SID's 200 ft/nm minimum gradient, far under any airframe's real climb.
 const LOCAL_CLIMB_FT_PER_NM: f64 = 150.0;
@@ -1474,8 +1468,13 @@ mod tests {
         assert!(r.starts_with("Negative."), "{r}");
         assert!(r.contains("900 feet") && r.contains("1,335 feet"), "{r}");
         assert!(runway_refusal(&strip, None).is_none(), "no figure, no gate");
-        assert_eq!(runway_needed_ft(None, Some(1630.0)), Some(1630.0));
-        assert_eq!(runway_needed_ft(Some(1335.0), Some(1630.0)), Some(1335.0));
+        // The planner's figure is the one landing rule
+        // (`aircraft::landing_needed_m`): the landing distance, else the
+        // takeoff distance, as booked.
+        let need = |l, t| crate::aircraft::planned_landing_needed_ft(l, t).unwrap();
+        assert!((need(None, Some(1630.0)) - 1630.0).abs() <= 1.0);
+        assert!((need(Some(1335.0), Some(1630.0)) - 1335.0).abs() <= 1.0);
+        assert_eq!(crate::aircraft::planned_landing_needed_ft(None, None), None);
     }
 
     fn field(name: &str, elev: f64, rwy: (&str, &str, f64, f64, f64, f64)) -> nav::AirportInfo {

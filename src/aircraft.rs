@@ -2967,6 +2967,106 @@ pub fn speed_floor_kts() -> Option<f64> {
     *SPEED_FLOOR_KTS.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+// The "too slow" ratios over the clean stall, in one place so a change to
+// one is made against the others (refactor audit 2026-10-04, finding #13:
+// the climb limiter's floor was moved at 1.15 by the #169 fix and sat under
+// the 1.2 automation floor with the 1.13 caution between them). Their order
+// is pinned by `slow_ratios_are_ordered`.
+
+/// The monitor's stall WARNING, x the stall in the configuration flown.
+pub const STALL_WARNING_RATIO: f64 = 1.10;
+
+/// The monitor's low-speed caution with a PILOT flying, x the stall in the
+/// configuration flown: the band a hand-flown approach should stay over.
+pub const CAUTION_HAND_RATIO: f64 = 1.20;
+
+/// The monitor's low-speed caution with an automation flying, x the stall in
+/// the configuration flown:
+/// under [`SPEED_FLOOR_RATIO`], so an automation holding its floor in a
+/// gust is not called slow, and well over the stall.
+pub const CAUTION_AUTO_RATIO: f64 = 1.13;
+
+/// The climb limiter's floor, x the stall in the configuration flown
+/// (`circuit::climb_floor_kts`): the speed a climb bleeds to before the
+/// limiter has taken all of it away. It IS the automation floor: it was
+/// 1.15, under [`SPEED_FLOOR_RATIO`], so a climb could bleed to a speed no
+/// automation may target (CLAUDE.md "No automation target below the speed
+/// floor"; refactor audit 2026-10-04, finding #13).
+pub const CLIMB_FLOOR_RATIO: f64 = SPEED_FLOOR_RATIO;
+
+/// The least pattern speed, x clean Vs (`circuit::PATTERN_MIN_STALL_MULT`),
+/// and the speed an upset recovery holds ([`recovery_hold_kts`]).
+pub const PATTERN_MIN_RATIO: f64 = 1.3;
+
+/// The approach speed an airframe that declares none flies, x Vso.
+pub const APPROACH_VSO_RATIO: f64 = 1.3;
+
+/// The same, x clean Vs: the automation floor, so the fallback approach is
+/// never under it.
+pub const APPROACH_VS_RATIO: f64 = SPEED_FLOOR_RATIO;
+
+/// The approach speed an airframe that declares none flies: max(1.3 Vso,
+/// 1.2 Vs). ONE rule for the tool registry (autoland), `generic_from_acf`,
+/// the instructor's brief and scorer, and the tests that build airframes
+/// (refactor audit 2026-10-04, finding #2: the instructor still briefed 1.3
+/// x the CLEAN stall, the rule the registry dropped after the SR22 floated
+/// and bounced at 90 kt, LEMG 13 2026-09-29).
+///
+/// No flat 70 kt floor, deliberately. The registry had one and
+/// `generic_from_acf` did not, so the two paths disagreed; every shipped
+/// profile declares `approach_kts` and a generic airframe always carried the
+/// unfloored figure, so the floor only ever reached an airframe with a
+/// declared stall and no approach speed, and there it is the SR22 float by
+/// another door (a 40 kt-stall wing flown at 70). The 1.2 Vs term already
+/// keeps it over the automation floor. Pure.
+pub fn fallback_approach_kts(vs0_kts: Option<f64>, vs_clean_kts: f64) -> f64 {
+    let by_vso = vs0_kts
+        .filter(|v| v.is_finite() && *v > 0.0)
+        .map_or(0.0, |v| v * APPROACH_VSO_RATIO);
+    by_vso.max(vs_clean_kts * APPROACH_VS_RATIO).round()
+}
+
+/// The profile's approach speed, else [`fallback_approach_kts`] from its
+/// stalls; `None` when it declares neither an approach speed nor a clean
+/// stall.
+pub fn approach_kts(p: &AircraftProfile) -> Option<f64> {
+    let r = p.reference.as_ref();
+    r.and_then(|r| r.approach_kts).or_else(|| {
+        p.vs_clean_kts
+            .filter(|v| v.is_finite() && *v > 0.0)
+            .map(|vs| fallback_approach_kts(r.and_then(|r| r.vs0_kts), vs))
+    })
+}
+
+/// Rotation speed for an airframe that declares none, x clean Vs.
+///
+/// 1.1, not the registry's old 1.15 (min 55). The shipped profiles that
+/// declare a Vr sit at 0.85 to 1.15 of their clean stall (SR22 1.04, 737
+/// 1.04, SF50 1.13, 172 1.15, A330 0.85): takeoff flap lowers the stall, so
+/// 1.1 x the clean figure is still over 1.2 x the takeoff stall on every one
+/// of them, and 1.15 rotated late and long. A generic airframe already
+/// rotated at 1.1 (`generic_from_acf`, whose figure the registry reads);
+/// now an airframe with a profile and no Vr agrees with it (refactor audit
+/// 2026-10-04, finding #2).
+pub const VR_STALL_RATIO: f64 = 1.1;
+
+/// [`VR_STALL_RATIO`] x the clean stall, rounded. Pure.
+pub fn fallback_vr_kts(vs_clean_kts: f64) -> f64 {
+    (vs_clean_kts * VR_STALL_RATIO).round()
+}
+
+/// The speed an upset recovery holds: [`PATTERN_MIN_RATIO`] x the clean
+/// stall, never under 70 kt. The floor stays here though not on the
+/// approach: a recovery wants margin over an unknown or optimistic stall
+/// and has no runway to float down, and slow is the one way it can still
+/// go wrong. Pure.
+pub fn recovery_hold_kts(vs_clean_kts: f64) -> f64 {
+    (vs_clean_kts * PATTERN_MIN_RATIO).max(RECOVERY_HOLD_MIN_KTS)
+}
+
+/// The least speed [`recovery_hold_kts`] asks for.
+pub const RECOVERY_HOLD_MIN_KTS: f64 = 70.0;
+
 /// The highest speed the flight governor may be asked to hold, from the
 /// airframe's Vne/Vmo. `None` = the profile declares no Vne.
 ///
@@ -3307,6 +3407,45 @@ pub async fn takeoff_needed_now_m(
     takeoff_needed_m(roll_at_mtow_m, weight_now, mtow_kg, floor_m)
 }
 
+/// The margin on the book LANDING distance every landing-runway gate
+/// applies (see [`landing_needed_m`]): none.
+pub const LANDING_FACTOR: f64 = 1.0;
+
+/// Pavement a landing needs, metres: the book landing distance, else the
+/// book takeoff distance (what every GA POH gives, and the longer of the
+/// two there), times [`LANDING_FACTOR`], never under `floor_m`. No figure on
+/// file = the floor.
+///
+/// ONE rule beside [`takeoff_needed_m`], for the planner's destination
+/// refusal, full auto's preflight, the plan audit and autoland's self-pick
+/// (refactor audit 2026-10-04, finding #10). They disagreed: the planned
+/// path took a runway equal to the bare book figure while the emergency
+/// path demanded 1.3 times it, so a destination the preflight passed could
+/// be one the self-pick would refuse on a go-around. The BOOK figure is the
+/// one kept: the jets' POM landing distances are already factored field
+/// lengths (the 737's 5,360 ft), so another 1.3 refused a 737 into LXGB's
+/// 5,449 ft, which it serves daily, and an emergency pick must never ask
+/// more of a runway than the plan did. The floor is the caller's: the
+/// self-pick keeps its 1,200 m (it chooses among strips nobody planned), a
+/// plan has none (a 172's 530 m grass field is a destination). Pure.
+pub fn landing_needed_m(landing_m: Option<f64>, takeoff_m: Option<f64>, floor_m: f64) -> f64 {
+    let book = landing_m
+        .filter(|d| d.is_finite() && *d > 0.0)
+        .or_else(|| takeoff_m.filter(|d| d.is_finite() && *d > 0.0));
+    book.map_or(floor_m, |d| (d * LANDING_FACTOR).max(floor_m))
+}
+
+/// [`landing_needed_m`] for a PLAN, in feet from the profile's feet: no
+/// floor, and `None` (no check) when the profile recites neither figure.
+pub fn planned_landing_needed_ft(landing_ft: Option<f64>, takeoff_ft: Option<f64>) -> Option<f64> {
+    let need_m = landing_needed_m(
+        landing_ft.map(|f| f * 0.3048),
+        takeoff_ft.map(|f| f * 0.3048),
+        0.0,
+    );
+    (need_m > 0.0).then(|| (need_m / 0.3048).round())
+}
+
 /// The altitude this airframe cruises best at, at `weight_kg`.
 ///
 /// A straight line through the profile's one reference point, because that is
@@ -3568,6 +3707,38 @@ pub fn gear_limit_kts() -> Option<f64> {
     *GEAR_LIMIT_KTS.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// How far a flap reading may sit from a detent and still be AT it: the
+/// flaps tool's "already there" test, under the closest detent spacing any
+/// profile declares (the 737's eighths, 0.125).
+pub const FLAP_DETENT_TOLERANCE: f64 = 0.02;
+
+/// The placard of the flap that is out: the lowest Vfe of every detent at or
+/// inside `flap_ratio` (within [`FLAP_DETENT_TOLERANCE`]). `None` clean, or
+/// with no Vfe declared. `limits` is `(ratio, Vfe)` as [`flap_limits`] gives.
+///
+/// ONE lookup for the circuit's clean-up, autoland's target and missed
+/// approach, the monitor's overspeed and the flaps tool (refactor audit
+/// 2026-10-04, finding #12). They disagreed on two things, decided here:
+/// - an entry at ratio 0 never carries a placard. Clean is limited by Vne,
+///   not a Vfe, and a generic `.acf` read can put a Vfe on the retracted
+///   row; the circuit counted it and capped a clean pattern with it while
+///   autoland did not.
+/// - the detent tolerance is 0.02. The circuit and autoland used 1e-6
+///   (their ratios are commanded, exact); the monitor used 0.05 on a READ
+///   position, which would take the next detent's limit on any profile with
+///   detents closer than that. 0.02 counts a reading at its detent and no
+///   other. Pure.
+pub fn flap_placard_kts(flap_ratio: f64, limits: &[(f64, Option<f64>)]) -> Option<f64> {
+    if !flap_ratio.is_finite() {
+        return None;
+    }
+    limits
+        .iter()
+        .filter(|(ratio, _)| *ratio > 1e-6 && *ratio <= flap_ratio + FLAP_DETENT_TOLERANCE)
+        .filter_map(|(_, vfe)| *vfe)
+        .reduce(f64::min)
+}
+
 /// The live airframe's flap detents as `(ratio, Vfe)`, retracted first.
 pub fn flap_limits() -> Vec<(f64, Option<f64>)> {
     FLAP_LIMITS
@@ -3717,9 +3888,8 @@ pub fn generic_from_acf(icao: &str, acf_text: &str) -> AircraftProfile {
     r.best_glide_kts = kts("acf/_Vbg_kts").or(r.best_glide_kts);
     r.vs0_kts = vso.or(r.vs0_kts);
     if let Some(vs) = vs {
-        r.vr_kts = Some((vs * 1.1).round());
-        let by_vso = vso.map(|v| v * 1.3).unwrap_or(0.0);
-        r.approach_kts = Some(by_vso.max(vs * 1.2).round());
+        r.vr_kts = Some(fallback_vr_kts(vs));
+        r.approach_kts = Some(fallback_approach_kts(vso, vs));
     }
     if let Some(vno) = r.vno_kts {
         r.cruise_ias_kts = Some((vno * 0.85).round());
@@ -3970,6 +4140,7 @@ mod tests {
             ("autotakeoff", "CLIMB_HOLD_FLOOR_FPM", "the positive floor climb_vs_fpm already keeps (airborne, it climbs); only airframes declaring a climb-out"),
             ("speedhold", "IDLE_FAST_KTS", "margin over the pilot's own target, not an airframe speed"),
             ("speedhold", "BETA_SPENT_OVER_KTS", "margin over the taxi pace before the spent-beta brake; only airframes declaring beta_max"),
+            ("speedhold", "UNKNOWN_CEILING_KTS", "FALLBACK only for an airframe declaring no Vne; with one the ceiling is speed_ceiling_kts"),
             // --- Properties of the SIM or the SENSORS, not the airframe ---
             (
                 "autotakeoff",
@@ -6938,5 +7109,151 @@ mod vmo_tests {
         // Up high the Mmo's airspeed is the ceiling.
         let fl430 = fresh.ceiling_for(low, high, 43_000.0, 0.0).unwrap();
         assert!(fl430 < 240.0, "{fl430}");
+    }
+}
+
+/// The rules unified by the refactor audit (2026-10-04, findings #2, #10,
+/// #12, #13): one home each, pinned here.
+#[cfg(test)]
+mod one_rule_tests {
+    use super::*;
+
+    /// Every shipped profile's id.
+    fn profile_ids() -> Vec<String> {
+        std::fs::read_dir("profiles")
+            .expect("profiles dir")
+            .filter_map(|e| e.ok())
+            .filter_map(|e| {
+                let name = e.file_name().to_string_lossy().to_string();
+                name.strip_suffix(".yaml").map(str::to_string)
+            })
+            .collect()
+    }
+
+    /// max(1.3 Vso, 1.2 Vs), and no flat 70: the SR22's 84, the 737's 167,
+    /// a 172 declaring no Vso its 58 (the registry's old floor gave 70).
+    #[test]
+    fn the_fallback_approach_is_the_landing_stalls_without_a_flat_floor() {
+        assert_eq!(fallback_approach_kts(Some(60.0), 70.0), 84.0);
+        assert_eq!(fallback_approach_kts(Some(114.0), 139.0), 167.0);
+        assert_eq!(fallback_approach_kts(None, 48.0), 58.0);
+        assert_eq!(fallback_approach_kts(Some(f64::NAN), 48.0), 58.0);
+        // Never under the automation floor.
+        for (vso, vs) in [(Some(40.0), 48.0), (Some(125.0), 175.0), (None, 90.0)] {
+            assert!(fallback_approach_kts(vso, vs) >= (vs * SPEED_FLOOR_RATIO).round());
+        }
+    }
+
+    /// A declared approach speed wins; else the fallback from the stalls;
+    /// with neither, nothing. The instructor reads this, so its brief
+    /// agrees with autoland (it briefed 1.3 x the clean stall).
+    #[test]
+    fn a_profile_approach_is_declared_else_the_one_fallback() {
+        let mut p = load("cessna_172sp").unwrap();
+        assert_eq!(approach_kts(&p), Some(65.0));
+        p.reference.as_mut().unwrap().approach_kts = None;
+        // 172: Vso 40, Vs 48: max(52, 57.6) = 58 (1.3 x clean was 70).
+        assert_eq!(approach_kts(&p), Some(58.0));
+        p.vs_clean_kts = None;
+        assert_eq!(approach_kts(&p), None);
+        for id in ["cessna_172sp", "cirrus_sr22", "boeing_737_800", "airbus_a330_300"] {
+            let p = load(id).unwrap();
+            assert_eq!(approach_kts(&p), p.reference.as_ref().unwrap().approach_kts, "{id}");
+        }
+    }
+
+    /// One Vr fallback, 1.1 x the clean stall (the registry's 1.15 is gone).
+    #[test]
+    fn the_fallback_rotation_is_one_point_one_vs() {
+        assert_eq!(fallback_vr_kts(48.0), 53.0);
+        assert_eq!(fallback_vr_kts(65.0), 72.0);
+        assert_eq!(fallback_vr_kts(139.0), 153.0);
+    }
+
+    /// The recovery holds 1.3 Vs with its 70 kt floor.
+    #[test]
+    fn a_recovery_holds_its_margin() {
+        assert_eq!(recovery_hold_kts(48.0), 70.0);
+        assert!((recovery_hold_kts(139.0) - 180.7).abs() < 1e-9);
+    }
+
+    /// The landing rule: the book landing distance, else the takeoff
+    /// distance, x 1.3, never under the caller's floor. The self-pick's
+    /// 1,200 m and the planner's none are both this function.
+    #[test]
+    fn a_landing_needs_the_book_distance() {
+        let ft = 0.3048;
+        // 737: the POM's 5,360 ft is already a factored field length, so a
+        // plan needs 5,360 and LXGB's 5,449 ft is a destination.
+        let need = landing_needed_m(Some(5360.0 * ft), None, 0.0) / ft;
+        assert!((need - 5360.0).abs() < 1.0, "{need}");
+        assert!(need < 5449.0, "a 737 into LXGB");
+        // Self-pick: the floor rules a light aircraft.
+        assert_eq!(landing_needed_m(Some(407.0), None, 1200.0), 1200.0);
+        assert_eq!(landing_needed_m(None, None, 1200.0), 1200.0);
+        assert_eq!(landing_needed_m(Some(f64::NAN), None, 1200.0), 1200.0);
+        // The takeoff figure stands in only when no landing figure is on file.
+        assert!((landing_needed_m(None, Some(500.0), 0.0) - 500.0).abs() < 1e-9);
+        assert!((landing_needed_m(Some(400.0), Some(500.0), 0.0) - 400.0).abs() < 1e-9);
+        // The plan's form: feet, no floor, None with nothing on file.
+        assert_eq!(planned_landing_needed_ft(None, None), None);
+        let c172 = planned_landing_needed_ft(Some(1335.0), None).unwrap();
+        assert!((c172 - 1335.0).abs() <= 1.0, "{c172}");
+        // A destination the plan passes, the self-pick would take too (for
+        // any runway past the self-pick's floor).
+        for book_ft in [1335.0, 1721.0, 4750.0, 5360.0] {
+            let plan_m = planned_landing_needed_ft(Some(book_ft), None).unwrap() * ft;
+            let pick_m = landing_needed_m(Some(book_ft * ft), None, 1200.0);
+            assert!(plan_m.max(1200.0) + 1.0 >= pick_m, "{book_ft}");
+        }
+    }
+
+    /// One placard lookup: the lowest Vfe at or inside the flap, no ratio-0
+    /// placard, a reading within 0.02 of a detent at it, and no further.
+    #[test]
+    fn the_flap_placard_is_one_lookup() {
+        let limits = [
+            (0.0, Some(250.0)), // a generic .acf's retracted row with a Vfe
+            (0.125, Some(250.0)),
+            (0.375, Some(250.0)),
+            (0.5, Some(210.0)),
+            (1.0, Some(162.0)),
+        ];
+        assert_eq!(flap_placard_kts(0.0, &limits), None, "clean has no flap placard");
+        assert_eq!(flap_placard_kts(0.125, &limits), Some(250.0));
+        assert_eq!(flap_placard_kts(0.49, &limits), Some(210.0), "a reading at its detent");
+        assert_eq!(flap_placard_kts(0.46, &limits), Some(250.0), "not the next detent's");
+        assert_eq!(flap_placard_kts(1.0, &limits), Some(162.0));
+        assert_eq!(flap_placard_kts(f64::NAN, &limits), None);
+        assert_eq!(flap_placard_kts(0.5, &[(0.5, None)]), None);
+        // Under the closest detent spacing of every shipped profile.
+        for id in profile_ids() {
+            let Some(f) = load(&id).and_then(|p| p.flaps) else {
+                continue;
+            };
+            for w in f.detents.windows(2) {
+                assert!(
+                    w[1].ratio - w[0].ratio > 2.0 * FLAP_DETENT_TOLERANCE,
+                    "{id}: detents {} and {} closer than the tolerance",
+                    w[0].ratio,
+                    w[1].ratio
+                );
+            }
+        }
+    }
+
+    /// The "too slow" ratios keep their order: warning under the automation
+    /// caution, under the automation floor (which the climb floor now IS),
+    /// at or under the hand-flown caution, under the pattern minimum; the
+    /// fallback approach never under the floor.
+    #[test]
+    fn slow_ratios_are_ordered() {
+        assert!(STALL_WARNING_RATIO < CAUTION_AUTO_RATIO);
+        assert!(CAUTION_AUTO_RATIO < SPEED_FLOOR_RATIO);
+        assert!(CLIMB_FLOOR_RATIO >= SPEED_FLOOR_RATIO, "no climb bleeds under the floor");
+        assert!(SPEED_FLOOR_RATIO <= CAUTION_HAND_RATIO);
+        assert!(CAUTION_HAND_RATIO < PATTERN_MIN_RATIO);
+        assert!(APPROACH_VS_RATIO >= SPEED_FLOOR_RATIO);
+        assert!(APPROACH_VSO_RATIO > SPEED_FLOOR_RATIO);
     }
 }

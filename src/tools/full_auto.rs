@@ -1247,7 +1247,7 @@ impl FullAuto {
                 dest,
                 speed,
                 self.climb_fpm,
-                crate::flightplan::runway_needed_ft(
+                crate::aircraft::planned_landing_needed_ft(
                     self.landing_distance_ft,
                     self.takeoff_distance_ft,
                 )

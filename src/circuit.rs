@@ -974,7 +974,7 @@ pub fn pattern_speed_kts(vy_kts: f64, approach_ias: f64, vs_clean_kts: Option<f6
 /// here because the circuit never lowers flap before the handoff. Only bites on
 /// an airframe whose Vy sits close to its clean stall — a 172 (Vy 74, stall 48)
 /// and an MD-82 (Vy 200, stall 100) are both untouched.
-const PATTERN_MIN_STALL_MULT: f64 = 1.3;
+const PATTERN_MIN_STALL_MULT: f64 = crate::aircraft::PATTERN_MIN_RATIO;
 
 /// The speed the base and final legs are flown at. Vy is a CLIMB speed: an
 /// MD-82 arrived on base at 226 KIAS against a 140 kt approach speed and handed
@@ -1069,14 +1069,10 @@ const GO_AROUND_RETRACT_MARGIN_KTS: f64 = 5.0;
 /// left, the step is taken this far under the placard less its margin.
 const CLEANUP_STEP_UNDER_CAP_KTS: f64 = 3.0;
 
-/// The placard of the flap `flap` out: the lowest Vfe declared at or under
-/// it. Infinite when none is. Pure.
+/// The placard of the flap `flap` out ([`crate::aircraft::flap_placard_kts`],
+/// the one lookup). Infinite when none is. Pure.
 fn placard_of(flap: f64, limits: &[(f64, Option<f64>)]) -> f64 {
-    limits
-        .iter()
-        .filter(|(ratio, _)| *ratio <= flap + 1e-6)
-        .filter_map(|(_, vfe)| *vfe)
-        .fold(f64::INFINITY, f64::min)
+    crate::aircraft::flap_placard_kts(flap, limits).unwrap_or(f64::INFINITY)
 }
 
 /// The retraction schedule a clean-up walks from `from` out (#169): the
@@ -1204,13 +1200,17 @@ const CLIMB_SPEED_LEAD_S: f64 = 5.0;
 
 /// The slowest the pattern will climb toward: a floor under the speed
 /// protection below. Blue line where the airframe has one, else a margin over
-/// the clean stall.
+/// the clean stall: [`crate::aircraft::CLIMB_FLOOR_RATIO`], the automation
+/// floor itself. It was 1.15 Vs, under the 1.2 Vs no automation target may
+/// go below, so a climb could bleed to a speed the governor would have
+/// refused as a target (refactor audit 2026-10-04, finding #13; the follower
+/// already faded to `speed_floor_kts`).
 ///
 /// A twin's Vyse is the honest number here and it is not a comfort figure —
 /// below blue line a light twin cannot climb on one engine at all, and the
 /// margin to Vmca is what is left of the pilot's options.
 pub fn climb_floor_kts(vyse_kts: Option<f64>, vs_clean_kts: Option<f64>) -> f64 {
-    let from_stall = vs_clean_kts.map(|v| v * 1.15);
+    let from_stall = vs_clean_kts.map(|v| v * crate::aircraft::CLIMB_FLOOR_RATIO);
     match (vyse_kts, from_stall) {
         (Some(a), Some(b)) => a.max(b),
         (Some(a), None) => a,
@@ -1237,13 +1237,13 @@ pub fn climb_floor_in_config(
     let (Some(vs), Some(cfg)) = (vs_clean_kts, config_floor) else {
         return clean_floor;
     };
-    let from_stall = vs * 1.15;
+    let from_stall = vs * crate::aircraft::CLIMB_FLOOR_RATIO;
     if clean_floor > from_stall + 1e-6 {
         // Blue line, not the stall: it does not move with the flaps.
         return clean_floor;
     }
     let vs_config = cfg / crate::aircraft::SPEED_FLOOR_RATIO;
-    clean_floor.min(vs_config * 1.15)
+    clean_floor.min(vs_config * crate::aircraft::CLIMB_FLOOR_RATIO)
 }
 
 /// The climb floor a pattern leg is judged against: the clean-up's
@@ -6290,8 +6290,15 @@ mod tests {
     #[test]
     fn a_climb_is_never_worth_more_than_the_airspeed_left() {
         // Baron 58: Vy 105, blue line 100, clean stall 84.
+        // The floor is the higher of blue line and the 1.2 Vs automation
+        // floor (refactor audit #13): 100.8 here, a hair over blue line.
         let floor = climb_floor_kts(Some(100.0), Some(84.0));
-        assert_eq!(floor, 100.0, "blue line outranks the stall margin");
+        assert!((floor - 100.8).abs() < 1e-9, "{floor}");
+        assert_eq!(
+            climb_floor_kts(Some(110.0), Some(84.0)),
+            110.0,
+            "blue line outranks the stall margin"
+        );
         let want = 105.0;
 
         // At the pattern speed, the commanded rate is untouched.
@@ -6344,10 +6351,11 @@ mod tests {
         // Steady on target is untouched either way.
         assert_eq!(climb_limit_fpm(700.0, 110.0, 0.0, want, floor), 700.0);
 
-        // A 172 (Vy 74, stall 48) gets a floor of 55 — so a normally flown
+        // A 172 (Vy 74, stall 48) gets a floor of 57.6 (1.2 Vs, the
+        // automation floor; it was 55.2 at 1.15), so a normally flown
         // trainer pattern never meets the limiter at all.
         let c172 = climb_floor_kts(None, Some(48.0));
-        assert!((c172 - 55.2).abs() < 0.01, "{c172}");
+        assert!((c172 - 57.6).abs() < 0.01, "{c172}");
         assert_eq!(climb_limit_fpm(700.0, 74.0, 0.0, 74.0, c172), 700.0);
     }
 
@@ -8781,6 +8789,20 @@ mod issue_150_climb_out_tests {
                         }
                     }
                 } else {
+                    // The live loop's floor: the kept flap's while cleaning
+                    // up (`leg_climb_floor_kts`, #169), on the 737's straight
+                    // line from the clean 1.2 Vs (167) to the landing 1.2
+                    // Vso (137). With the climb floor at the automation
+                    // floor (1.2 Vs, refactor audit #13), the clean one sits
+                    // over the 165 kt engage and would let the carry go.
+                    let (floor, full) = if new {
+                        let f = leg_climb_floor_kts(Leg::Upwind, floor, Some(139.0), cleaning, |r| {
+                            Some((167.0 + (137.0 - 167.0) * r).round())
+                        });
+                        (f, climb_full_rate_kts(210.0, 210.0, f))
+                    } else {
+                        (floor, full)
+                    };
                     let law = climb_limit_fpm(
                         alt_capture_vs(1500.0, 0.0, agl, vs_est),
                         ias,
@@ -8894,8 +8916,11 @@ mod issue_150_climb_out_tests {
                 "overshot the pattern: {:.0} ({tag})",
                 new.max_agl
             );
+            // Never slower than the clean floor, or than the engage when that
+            // was already under it with the flaps out (#78's 165 kt sits under
+            // the 1.2 Vs clean floor of 166.8: the speed was never bled).
             assert!(
-                new.min_ias > climb_floor_kts(None, Some(139.0)),
+                new.min_ias >= ias0.min(climb_floor_kts(None, Some(139.0))) - 1e-9,
                 "{:.1} ({tag})",
                 new.min_ias
             );
@@ -9446,10 +9471,12 @@ mod issue_169_tests {
             let p = crate::aircraft::load(id)?;
             let r = p.reference.as_ref();
             let vs = p.vs_clean_kts.unwrap_or(50.0);
-            let approach_ias = r
-                .and_then(|r| r.approach_kts)
-                .unwrap_or((vs * 1.3).max(70.0));
-            let vr = r.and_then(|r| r.vr_kts).unwrap_or((vs * 1.15).max(55.0));
+            let approach_ias = r.and_then(|r| r.approach_kts).unwrap_or_else(|| {
+                crate::aircraft::fallback_approach_kts(r.and_then(|r| r.vs0_kts), vs)
+            });
+            let vr = r
+                .and_then(|r| r.vr_kts)
+                .unwrap_or_else(|| crate::aircraft::fallback_vr_kts(vs));
             let vy = r.and_then(|r| r.vy_kts).unwrap_or(vr + 15.0);
             let pattern_kts = pattern_speed_kts(vy, approach_ias, p.vs_clean_kts);
             Some(Airframe {
@@ -9618,7 +9645,8 @@ mod issue_169_tests {
     #[test]
     fn the_a330s_conf_2_upwind_is_not_below_its_climb_floor() {
         let a = Airframe::load("airbus_a330_300").expect("the A330 profile");
-        assert!((a.climb_floor - 201.25).abs() < 1e-9);
+        // 1.2 x the 175 kt clean stall (it was 1.15, 201.25: refactor audit #13).
+        assert!((a.climb_floor - 210.0).abs() < 1e-9);
         let want = a.want(Leg::Upwind, Some(0.5), Some(0.5));
         let floor = a.climb_floor(Leg::Upwind, Some(0.5));
         assert!(floor < 170.0 && want <= 196.0, "floor {floor}, want {want}");

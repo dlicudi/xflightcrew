@@ -210,17 +210,14 @@ pub fn best_landing_runway(
 pub const DESTINATION_BONUS_NM: f64 = 8.0;
 
 /// The shortest strip the self-pick will take, metres: the airframe's landing
-/// distance with a 1.3 margin, never under the 1,200 m every airframe was
-/// held to. The flat 1,200 offered an A330 (1,448 m before any margin) strips
-/// it cannot stop on; the planned path has checked the distance at the arm
-/// since 2026-09-15 and the emergency path never did.
+/// distance by the one landing rule ([`crate::aircraft::landing_needed_m`],
+/// the planner's and the preflight's rule too), never under the 1,200 m every
+/// airframe was held to. The flat 1,200 offered an A330 (1,448 m before any
+/// margin) strips it cannot stop on; the planned path has checked the
+/// distance at the arm since 2026-09-15 and the emergency path never did.
 pub const SELF_PICK_MIN_LENGTH_M: f64 = 1200.0;
 pub fn self_pick_min_length_m(landing_distance_m: Option<f64>) -> f64 {
-    landing_distance_m
-        .filter(|d| d.is_finite() && *d > 0.0)
-        .map_or(SELF_PICK_MIN_LENGTH_M, |d| {
-            (d * 1.3).max(SELF_PICK_MIN_LENGTH_M)
-        })
+    crate::aircraft::landing_needed_m(landing_distance_m, None, SELF_PICK_MIN_LENGTH_M)
 }
 
 /// Nautical miles of detour one knot of TAILWIND is worth: ten knots on the
@@ -5549,14 +5546,10 @@ pub fn path_descent_cap_fpm(nominal_vs_fpm: f64) -> f64 {
     (nominal_vs_fpm - PATH_CATCH_UP_FPM).min(-1200.0)
 }
 
-/// The placard of the flap that is out: the lowest Vfe of every detent at or
-/// inside `flap_ratio`. `None` clean, or with no Vfe declared. Pure.
+/// The placard of the flap that is out: the one lookup,
+/// [`crate::aircraft::flap_placard_kts`]. Pure.
 pub fn flap_placard_kts(flap_ratio: f64, flap_limits: &[(f64, Option<f64>)]) -> Option<f64> {
-    flap_limits
-        .iter()
-        .filter(|(ratio, _)| *ratio > 1e-6 && *ratio <= flap_ratio + 1e-6)
-        .filter_map(|(_, vfe)| *vfe)
-        .reduce(f64::min)
+    crate::aircraft::flap_placard_kts(flap_ratio, flap_limits)
 }
 
 /// The approach's speed target sits this far under the placard of the flap out.
@@ -12954,9 +12947,9 @@ mod tests {
     }
     #[test]
     fn the_self_pick_knows_the_airframe_the_wind_and_the_longer_parallel() {
-        // The A330 lands in 4,750 ft (1,448 m): nothing under 1,882 m. A 172,
-        // or no figure on file, keeps the old 1,200.
-        assert!((self_pick_min_length_m(Some(4750.0 * 0.3048)) - 1882.0).abs() < 1.0);
+        // The A330 lands in 4,750 ft (1,448 m, a factored field length):
+        // nothing under it. A 172, or no figure on file, keeps the old 1,200.
+        assert!((self_pick_min_length_m(Some(4750.0 * 0.3048)) - 1447.8).abs() < 1.0);
         assert_eq!(self_pick_min_length_m(Some(407.0)), 1200.0);
         assert_eq!(self_pick_min_length_m(None), 1200.0);
         assert_eq!(self_pick_min_length_m(Some(f64::NAN)), 1200.0);

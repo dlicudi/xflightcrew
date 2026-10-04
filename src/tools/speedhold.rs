@@ -424,6 +424,12 @@ const DEEP_PULL_MAX: f64 = 2.0;
 /// climb limiter's and altitude capture's leads.
 const THROTTLE_LEAD_S: f64 = 5.0;
 
+/// The governor's ceiling for an airframe that declares no Vne. The same
+/// number as [`BELOW_10K_LIMIT_KTS`] by history, not by meaning: that one is
+/// airspace, this one is an unknown airframe (refactor audit 2026-10-04,
+/// finding #20).
+const UNKNOWN_CEILING_KTS: f64 = 250.0;
+
 /// Sanity bounds for a spoken flight target — outside this it's a mishear.
 ///
 /// The top is the AIRFRAME's (`aircraft::speed_ceiling_kts_max`, Vne less a
@@ -434,7 +440,7 @@ const THROTTLE_LEAD_S: f64 = 5.0;
 /// under the ceiling where it flies, every tick (`aircraft::VmoCeiling`).
 pub fn clamp_target(kts: f64) -> f64 {
     let ceiling = crate::aircraft::speed_ceiling_kts_max()
-        .unwrap_or(250.0)
+        .unwrap_or(UNKNOWN_CEILING_KTS)
         .max(55.0);
     kts.clamp(55.0, ceiling)
 }
@@ -995,7 +1001,7 @@ impl Tool for HoldSpeed {
                 .unwrap_or(0.0);
             match spoken_flight_target(
                 k,
-                ceiling_now(ctx.xplane).await.unwrap_or(250.0),
+                ceiling_now(ctx.xplane).await.unwrap_or(UNKNOWN_CEILING_KTS),
                 crate::aircraft::config_floor_kts(flaps),
                 crate::aircraft::approach_floor_kts().or(crate::aircraft::speed_floor_kts()),
             ) {

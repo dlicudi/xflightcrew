@@ -382,13 +382,17 @@ impl Refs {
     pub fn from_profile(p: &AircraftProfile) -> Refs {
         let r = p.reference.as_ref();
         let vs = p.vs_clean_kts;
-        let approach = r
-            .and_then(|r| r.approach_kts)
-            .or_else(|| vs.map(|v| (v * 1.3).max(70.0)));
+        // The approach autoland and the circuit fly: one rule
+        // (`aircraft::approach_kts`), so the brief, the scorer and the
+        // pattern size agree with the aircraft.
+        let approach = crate::aircraft::approach_kts(p);
         let vy = r.and_then(|r| r.vy_kts);
         let slow = vs
             .map(|v| (v * crate::aircraft::SPEED_FLOOR_RATIO).round())
-            .or_else(|| r.and_then(|r| r.vs0_kts).map(|v| (v * 1.3).round()));
+            .or_else(|| {
+                r.and_then(|r| r.vs0_kts)
+                    .map(|v| (v * crate::aircraft::APPROACH_VSO_RATIO).round())
+            });
         let pattern_agl = crate::tools::circuit::pattern_alt_agl_ft(approach.unwrap_or(65.0));
         let pattern_kts = match (vy, approach) {
             (Some(vy), Some(app)) => Some(crate::circuit::pattern_speed_kts(vy, app, vs)),
@@ -3692,6 +3696,19 @@ mod tests {
             pattern_agl_ft: 1000.0,
             pattern_kts: Some(74.0),
         }
+    }
+
+    /// The instructor briefs and scores the approach autoland and the
+    /// circuit fly (`aircraft::approach_kts`): an airframe declaring none is
+    /// max(1.3 Vso, 1.2 Vs), not the 1.3 x CLEAN stall it still briefed
+    /// (refactor audit 2026-10-04, finding #2).
+    #[test]
+    fn the_brief_approach_is_the_aircrafts_rule() {
+        let mut p = crate::aircraft::load("cirrus_sr22").unwrap();
+        assert_eq!(Refs::from_profile(&p).approach_kts, Some(75.0), "declared wins");
+        p.reference.as_mut().unwrap().approach_kts = None;
+        // SR22: Vso 60, Vs 70: max(78, 84) = 84, not 1.3 x 70 = 91.
+        assert_eq!(Refs::from_profile(&p).approach_kts, Some(84.0));
     }
 
     fn air(t: f64, alt: f64, hdg: f64, ias: f64) -> Sample {

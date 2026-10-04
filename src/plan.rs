@@ -555,7 +555,7 @@ pub(crate) async fn plan_flight(
         );
     }
     let r = profile.reference.as_ref();
-    let needed = flightplan::runway_needed_ft(
+    let needed = crate::aircraft::planned_landing_needed_ft(
         r.and_then(|r| r.landing_distance_ft),
         r.and_then(|r| r.takeoff_distance_ft),
     );
