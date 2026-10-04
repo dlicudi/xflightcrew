@@ -1069,14 +1069,10 @@ const GO_AROUND_RETRACT_MARGIN_KTS: f64 = 5.0;
 /// left, the step is taken this far under the placard less its margin.
 const CLEANUP_STEP_UNDER_CAP_KTS: f64 = 3.0;
 
-/// The placard of the flap `flap` out: the lowest Vfe declared at or under
-/// it. Infinite when none is. Pure.
+/// The placard of the flap `flap` out ([`crate::aircraft::flap_placard_kts`],
+/// the one lookup). Infinite when none is. Pure.
 fn placard_of(flap: f64, limits: &[(f64, Option<f64>)]) -> f64 {
-    limits
-        .iter()
-        .filter(|(ratio, _)| *ratio <= flap + 1e-6)
-        .filter_map(|(_, vfe)| *vfe)
-        .fold(f64::INFINITY, f64::min)
+    crate::aircraft::flap_placard_kts(flap, limits).unwrap_or(f64::INFINITY)
 }
 
 /// The retraction schedule a clean-up walks from `from` out (#169): the

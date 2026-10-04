@@ -5546,14 +5546,10 @@ pub fn path_descent_cap_fpm(nominal_vs_fpm: f64) -> f64 {
     (nominal_vs_fpm - PATH_CATCH_UP_FPM).min(-1200.0)
 }
 
-/// The placard of the flap that is out: the lowest Vfe of every detent at or
-/// inside `flap_ratio`. `None` clean, or with no Vfe declared. Pure.
+/// The placard of the flap that is out: the one lookup,
+/// [`crate::aircraft::flap_placard_kts`]. Pure.
 pub fn flap_placard_kts(flap_ratio: f64, flap_limits: &[(f64, Option<f64>)]) -> Option<f64> {
-    flap_limits
-        .iter()
-        .filter(|(ratio, _)| *ratio > 1e-6 && *ratio <= flap_ratio + 1e-6)
-        .filter_map(|(_, vfe)| *vfe)
-        .reduce(f64::min)
+    crate::aircraft::flap_placard_kts(flap_ratio, flap_limits)
 }
 
 /// The approach's speed target sits this far under the placard of the flap out.

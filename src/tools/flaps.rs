@@ -99,14 +99,18 @@ impl Tool for SetFlaps {
         let current_ratio = ctx.xplane.get_float(FLAP_HANDLE).await?;
 
         // Already at the commanded detent? Say so instead of re-commanding.
-        if (target.ratio - current_ratio).abs() <= 0.02 {
+        if (target.ratio - current_ratio).abs() <= crate::aircraft::FLAP_DETENT_TOLERANCE {
             return Ok(format!("Flaps already {}.", target.spoken));
         }
 
-        // Safety gate: refuse *extending* above the target detent's Vfe.
+        // Safety gate: refuse *extending* above the target's placard (the
+        // one lookup, `aircraft::flap_placard_kts`: the lowest Vfe at or
+        // inside the target detent).
         let extending = target.ratio > current_ratio + 0.01;
         if extending {
-            if let Some(vfe) = target.vfe_kts {
+            let limits: Vec<(f64, Option<f64>)> =
+                self.flaps.detents.iter().map(|d| (d.ratio, d.vfe_kts)).collect();
+            if let Some(vfe) = crate::aircraft::flap_placard_kts(target.ratio, &limits) {
                 let ias = ctx.xplane.get_float(IAS_KTS).await?;
                 if ias > vfe {
                     return Ok(format!(
