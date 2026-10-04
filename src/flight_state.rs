@@ -292,6 +292,7 @@ pub(crate) fn stand_down() {
     crate::tools::autopilot::stop_capture_watcher();
     // A power-up or jet start on its own thread stops at its next step.
     crate::tools::power::stop_sequences();
+    crate::tools::jet_start::stop();
     // A new flight's setup owns the aircraft: the taxi-in only lets go.
     crate::taxi_in::abort(false);
     // The arrival's hold on the station is a fact about a flight, not about
@@ -801,19 +802,23 @@ mod tests {
     }
 
     /// A power-up or jet start on its own thread kept firing switches through
-    /// a swap or instructor entry: it had no cancel at all. The epoch it
-    /// began in is stale once a stand-down has landed.
+    /// a swap or instructor entry: it had no cancel at all. Each now owns a
+    /// run taken on the caller's thread, and stand_down cancels it.
     #[test]
     fn a_stand_down_stops_a_running_start_sequence() {
-        let epoch = crate::tools::power::sequence_epoch();
-        crate::tools::power::stop_sequences();
-        assert!(crate::tools::power::sequence_stood_down(epoch));
         let src = crate::test_support::module_source("tools/jet_start");
         let steps = body_of(src, "async fn run_sequence(");
         assert!(
-            steps.matches("if stood_down(epoch)").count() >= 5,
+            steps.matches("if stood_down(xp)").count() >= 5,
             "checked between steps"
         );
+        let power = crate::test_support::module_source("tools/power");
+        let spawn = body_of(power, "fn spawn(");
+        assert!(
+            spawn.find("POWER_UP.take_over()").unwrap() < spawn.find("std::thread::spawn").unwrap(),
+            "the run is taken on the caller's thread"
+        );
+        assert!(body_of(power, "pub(crate) fn stop_sequences()").contains("POWER_UP.cancel()"));
         let prep = body_of(
             crate::test_support::module_source("tools/power"),
             "pub(crate) async fn run_prep(",

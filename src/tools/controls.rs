@@ -570,8 +570,13 @@ const THROTTLE: &str = "sim/cockpit2/engine/actuators/throttle_ratio_all";
 /// 0.35 power cap, comfortably under any takeoff or run-up setting.
 const HOLD_MAX_THROTTLE: f64 = 0.4;
 
-/// True while the crew-held brake loop runs.
+/// True while the crew-held brake loop runs. Written only by its run
+/// ([`BRAKE_HOLD`]).
 static BRAKES_HELD: AtomicBool = AtomicBool::new(false);
+/// The crew brake hold's run: `flight_state::stand_down` cancels it, and a
+/// holder still winding down after "brakes off" cannot clear the flag of the
+/// hold a quick "brakes on" started.
+pub(crate) static BRAKE_HOLD: sim::run::Slot = sim::run::Slot::flagged(&BRAKES_HELD);
 
 /// For the dashboard's "managing" panel.
 pub fn brakes_held() -> bool {
@@ -583,7 +588,7 @@ pub fn brakes_held() -> bool {
 /// supersedes the hold: a commanded taxi (`hold_speed`), or the parking
 /// brake taking over.
 pub(crate) fn release_held_brakes() -> bool {
-    BRAKES_HELD.swap(false, Ordering::Relaxed)
+    BRAKE_HOLD.cancel()
 }
 
 /// The holder loop: renew the held-brake command until released. Renewal
@@ -595,16 +600,20 @@ pub(crate) fn release_held_brakes() -> bool {
 /// holding brakes at power is a real technique (the run-up, a short-field
 /// takeoff), so the pilot decides.
 #[cfg(not(test))]
-async fn brake_holder(xp: XPlaneClient, voice: Option<crate::voice::Voice>) {
+async fn brake_holder(
+    xp: XPlaneClient,
+    voice: Option<crate::voice::Voice>,
+    lease: &sim::run::Lease<'_>,
+) {
     tracing::info!("brake hold started");
     let mut power_warned = false;
-    while BRAKES_HELD.load(Ordering::Relaxed) {
+    while lease.live() {
         if xp
             .get_float(crate::datarefs::ON_GROUND_ANY)
             .await
             .is_ok_and(|v| v < 0.5)
         {
-            BRAKES_HELD.store(false, Ordering::Relaxed);
+            lease.lower_flag();
             if let Some(v) = &voice {
                 v.say(
                     crate::voice::Priority::Advisory,
@@ -745,11 +754,12 @@ impl Tool for HoldBrakes {
             tokio::time::sleep(std::time::Duration::from_millis(350)).await;
             let _ = ctx.xplane.set_float(&crate::aircraft::throttle_dataref(), 0.0).await;
         }
-        if !BRAKES_HELD.swap(true, Ordering::Relaxed) {
+        if let Some(lease) = BRAKE_HOLD.claim() {
             // The holder drives the REAL sim, so it's compiled out under
             // test: `cargo test` mid-flight must never pulse the live brakes.
             // Its own thread with its own runtime, like the speed governor:
-            // the main runtime blocks on the mic between commands.
+            // the main runtime blocks on the mic between commands. The run
+            // is held by the thread and dropped (the flag with it) on exit.
             #[cfg(not(test))]
             {
                 let base = ctx.config.xplane_base_url.clone();
@@ -759,12 +769,19 @@ impl Tool for HoldBrakes {
                         .enable_all()
                         .build()
                     else {
-                        BRAKES_HELD.store(false, Ordering::Relaxed);
                         return;
                     };
-                    rt.block_on(brake_holder(XPlaneClient::new(base), voice));
+                    let xp = XPlaneClient::new(base).with_cancel(lease.cancel.clone());
+                    rt.block_on(brake_holder(xp, voice, &lease));
                 });
             }
+            // Under test the run is only held, until released.
+            #[cfg(test)]
+            std::thread::spawn(move || {
+                while lease.live() {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+            });
         }
         // Readback off the pedals, not the intent. A beat for the first
         // command to land in the sim.
