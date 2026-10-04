@@ -280,7 +280,7 @@ impl Cabin {
             }
             // Parked with the engines stopped after a landing: the leg is
             // over back there.
-            if self.landed && !v.engine_running && v.groundspeed_kts < 1.0 {
+            if self.landed && !v.engine_running && sim::ground::stopped_kts(v.groundspeed_kts) {
                 self.end_flight();
                 return Some(Initiative {
                     event: "deplaning",

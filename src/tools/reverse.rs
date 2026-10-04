@@ -28,7 +28,6 @@ use crate::xplane::{XPlane, XPlaneClient};
 const BETA_REV: &str = "sim/cockpit2/engine/actuators/throttle_beta_rev_ratio";
 const ENGN_RUNNING: &str = "sim/flightmodel/engine/ENGN_running";
 const GS_MS: &str = "sim/flightmodel/position/groundspeed";
-const ON_GROUND: &str = "sim/flightmodel/failures/onground_any";
 const MS_TO_KTS: f64 = 1.943_844;
 
 /// Full reverse on the lever scale (see module docs).
@@ -104,7 +103,7 @@ impl Tool for ReverseThrust {
             });
         }
         // The gates, in the order a refusal is most useful.
-        if ctx.xplane.get_float(ON_GROUND).await.unwrap_or(0.0) < 0.5 {
+        if ctx.xplane.get_float(crate::datarefs::ON_GROUND_ANY).await.unwrap_or(0.0) < 0.5 {
             return Ok(
                 "Negative — reverse stays stowed in the air. Ask again on the rollout.".to_string(),
             );
@@ -192,7 +191,7 @@ async fn watcher(xp: XPlaneClient, engines: usize) {
             break;
         }
         let gs_kts = xp.get_float(GS_MS).await.unwrap_or(0.0) * MS_TO_KTS;
-        let on_ground = xp.get_float(ON_GROUND).await.unwrap_or(1.0) > 0.5;
+        let on_ground = xp.get_float(crate::datarefs::ON_GROUND_ANY).await.unwrap_or(1.0) > 0.5;
         if should_stow(gs_kts, on_ground) {
             tracing::info!(gs_kts, on_ground, "reverse thrust: stowing");
             ACTIVE.store(false, Ordering::Relaxed);

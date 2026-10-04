@@ -442,39 +442,26 @@ impl Tracker {
 }
 
 /// Is an automation flying the aircraft (so the copilot is the pilot flying
-/// and the list is its own cross-check)?
+/// and the list is its own cross-check)? [`crate::flight_state::crew_flying`]:
+/// the takeoff, the helicopter's loops and a recovery count too (they were
+/// missing here, so a stand-alone takeoff's climb list was PROPOSED to a
+/// pilot who was not flying; refactor audit 2026-10-04, duplicates #1).
 pub fn automation_flying() -> bool {
-    use std::sync::atomic::Ordering::Relaxed;
-    crate::full_auto::ACTIVE.load(Relaxed)
-        || crate::procedure::ACTIVE.load(Relaxed)
-        || crate::circuit::ACTIVE.load(Relaxed)
-        || crate::autoland::ACTIVE.load(Relaxed)
+    crate::flight_state::crew_flying().is_some()
 }
 
-/// The automation that has TAKEN the aircraft, if any: a mission or a loop
-/// that flies it (full auto from its first stage, the takeoff, the circuit,
-/// the follower, autoland, the helicopter's loops). The ground drives
-/// (the taxi, the tug) are not on it: they share the cockpit with an
-/// after-landing clean-up, which is where that list runs.
+/// The automation that has TAKEN the aircraft, if any, outermost first: a
+/// mission or a loop that flies it (full auto from its first stage, the
+/// takeoff, the circuit, the follower, autoland, the helicopter's loops, a
+/// recovery). The ground drives (the taxi, the tug) are not on it: they
+/// share the cockpit with an after-landing clean-up, which is where that
+/// list runs. Spoken ("held by the circuit").
 pub fn mission_owner() -> Option<&'static str> {
-    use std::sync::atomic::Ordering::Relaxed;
-    if crate::full_auto::ACTIVE.load(Relaxed) {
-        Some("full auto")
-    } else if crate::heli_route::ACTIVE.load(Relaxed) {
-        Some("the route")
-    } else if crate::autoland::ACTIVE.load(Relaxed) {
-        Some("autoland")
-    } else if crate::circuit::ACTIVE.load(Relaxed) || crate::heli_circuit::ACTIVE.load(Relaxed) {
-        Some("the circuit")
-    } else if crate::procedure::ACTIVE.load(Relaxed) {
-        Some("the follower")
-    } else if crate::autotakeoff::ACTIVE.load(Relaxed) {
-        Some("the takeoff")
-    } else if crate::hover::ACTIVE.load(Relaxed) {
-        Some("the hover")
-    } else {
-        None
-    }
+    use crate::flight_state::Owner;
+    Owner::OUTERMOST_FIRST
+        .into_iter()
+        .find(|o| o.flies() && o.active())
+        .map(Owner::spoken)
 }
 
 /// Why a Crew flow stopped before its end.
@@ -1049,9 +1036,11 @@ pub enum Step {
 /// pilot to fight one either.
 pub fn held_by_automation(dataref: &str) -> Option<&'static str> {
     use std::sync::atomic::Ordering::Relaxed;
-    let flying = crate::autoland::ACTIVE.load(Relaxed)
-        || crate::circuit::ACTIVE.load(Relaxed)
-        || crate::procedure::ACTIVE.load(Relaxed);
+    // The loop flying the aircraft holds its autopilot
+    // (`flight_state::crew_flying`): the takeoff, full auto, the helicopter's
+    // loops and a recovery too, each by its own name (a circuit was named
+    // "the follower"; refactor audit 2026-10-04, duplicates #1).
+    let flying = crate::flight_state::crew_flying();
     if dataref.contains("throttle") && crate::tools::speedhold::ACTIVE.load(Relaxed) {
         return Some("the speed hold");
     }
@@ -1063,12 +1052,10 @@ pub fn held_by_automation(dataref: &str) -> Option<&'static str> {
     if dataref.contains("mixture") && crate::tools::engine::MIX_MANAGED.load(Relaxed) {
         return Some("the mixture manager");
     }
-    if dataref.contains("autopilot") && flying {
-        return Some(if crate::autoland::ACTIVE.load(Relaxed) {
-            "autoland"
-        } else {
-            "the follower"
-        });
+    if dataref.contains("autopilot") {
+        if let Some(owner) = flying {
+            return Some(owner.spoken());
+        }
     }
     if dataref.contains("flap") && crate::autoland::ACTIVE.load(Relaxed) {
         return Some("autoland");

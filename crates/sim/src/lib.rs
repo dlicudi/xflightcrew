@@ -8,6 +8,7 @@
 pub mod angles;
 pub mod blackbox;
 pub mod datarefs;
+pub mod ground;
 pub mod position;
 pub mod state;
 pub mod xplane;

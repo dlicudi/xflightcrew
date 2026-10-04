@@ -425,11 +425,9 @@ impl Tool for SetUpFlight {
     }
     async fn execute(&self, _args: &Value, ctx: &ToolCtx<'_>) -> Result<String> {
         // Starting a flight ENDS this one: only parked, and nothing flying it.
-        let (ground, gs) = tokio::join!(
-            ctx.xplane.get_float(crate::datarefs::ON_GROUND_ANY),
-            ctx.xplane.get_float("sim/flightmodel/position/groundspeed"),
-        );
-        if !ground.is_ok_and(|g| g > 0.5) || !gs.is_ok_and(|v| v.abs() < 1.0) {
+        // The load sheet's "stopped" (it refused at 1 kt while this ended
+        // the flight at 2 kt; refactor audit 2026-10-04, duplicates #9).
+        if !sim::ground::read_stopped_on_ground(ctx.xplane).await {
             return Ok("Only when we're stopped on the ground: setting up a flight ends this one.".into());
         }
         if crate::full_auto::ACTIVE.load(std::sync::atomic::Ordering::Relaxed) {
@@ -552,11 +550,10 @@ async fn follow_up(base: String, voice: Option<Voice>, body: String, origin: Str
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         let (g, gs, agl) = tokio::join!(
             xp.get_float(crate::datarefs::ON_GROUND_ANY),
-            xp.get_float("sim/flightmodel/position/groundspeed"),
+            xp.get_float(crate::datarefs::GROUNDSPEED_MS),
             xp.get_float(crate::datarefs::AGL_METERS),
         );
-        still = if g.is_ok_and(|g| g > 0.5)
-            && gs.is_ok_and(|v| v.abs() < 0.5)
+        still = if sim::ground::stopped_on_ground(g.ok(), gs.ok())
             && agl.is_ok_and(|m| (m * 3.28084).abs() <= SETTLE_GROUND_AGL_FT)
         {
             still + 1
@@ -753,19 +750,12 @@ pub fn pick_runway(
 /// The automation that holds the aircraft now, by name, if any: a new flight
 /// ends it, so the pilot takes it back first (a misheard ask must not pull
 /// the aircraft out from under a landing).
+///
+/// [`crate::flight_state::crew_flying`], innermost: the helicopter circuit
+/// and a recovery count too (they were missing, so a setup could pull the
+/// aircraft out from under either).
 pub(crate) fn flying_now() -> Option<&'static str> {
-    use std::sync::atomic::Ordering::Relaxed;
-    [
-        (crate::autoland::ACTIVE.load(Relaxed), "I'm landing"),
-        (crate::full_auto::ACTIVE.load(Relaxed), "I'm flying"),
-        (crate::circuit::ACTIVE.load(Relaxed), "I'm flying the circuit"),
-        (crate::procedure::ACTIVE.load(Relaxed), "I'm flying the route"),
-        (crate::autotakeoff::ACTIVE.load(Relaxed), "I'm taking off"),
-        (crate::heli_route::ACTIVE.load(Relaxed), "I'm flying the helicopter route"),
-        (crate::hover::ACTIVE.load(Relaxed), "I'm holding the hover"),
-    ]
-    .into_iter()
-    .find_map(|(on, name)| on.then_some(name))
+    crate::flight_state::crew_flying().map(crate::flight_state::Owner::doing)
 }
 
 #[derive(serde::Deserialize, Default, Clone)]

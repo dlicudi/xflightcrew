@@ -48,8 +48,6 @@ const IAS: &str = "sim/flightmodel/position/indicated_airspeed";
 #[cfg(test)]
 const AGL_M: &str = "sim/flightmodel/position/y_agl";
 const MAG_VAR: &str = "sim/flightmodel/position/magnetic_variation";
-#[cfg(test)]
-const ON_GROUND: &str = "sim/flightmodel/failures/onground_any";
 /// The thrust lever THIS airframe obeys — not always the stock one (the
 /// Citation X tracks `throttle_jet_rev_ratio`, so every write to
 /// `throttle_ratio_all` went nowhere and it flew a whole pattern at takeoff
@@ -3036,7 +3034,10 @@ fn alert(voice: &Option<Voice>, priority: Priority, line: &str) {
 pub(crate) const BRAKES_MAX: &str = "sim/flight_controls/brakes_max";
 /// Under this a rejected roll has STOPPED and the parking brake goes on; the
 /// hand-back's own stopped line (`full_auto::hand_back_hold`).
-const REJECT_STOPPED_KTS: f64 = 1.0;
+const REJECT_STOPPED_KTS: f64 = sim::ground::STOPPED_KTS;
+/// The reject's park: a hand-back's own gates (a pilot on the toe brakes
+/// keeps a fast stop).
+const REJECT_HOLD: crate::full_auto::HoldFor = crate::full_auto::HoldFor::by("autotakeoff");
 /// Below this the stop lets go of the steering: a walk on the centreline.
 const REJECT_STEER_MIN_KTS: f64 = 3.0;
 /// The longest the stop is flown, in live seconds (a pause slides it).
@@ -3197,7 +3198,7 @@ async fn reject_rolling(
     let xp = &xp.unscoped();
     reject(xp, voice, line, reason).await;
     let stop = stop_on_centreline(xp, rwy, law).await;
-    let held = crate::full_auto::hand_back_hold(xp, valve_set).await;
+    let held = crate::full_auto::hand_back_hold(xp, valve_set, REJECT_HOLD).await;
     let end = reject_end_line(&stop, held);
     alert(voice, Priority::Warning, &end);
     crate::blackbox::record(
@@ -8977,7 +8978,7 @@ mod tests {
             sim.set_read(AGL_M, af.agl_ft / M_TO_FT);
             sim.set_read(PSI_TRUE, af.psi_deg.rem_euclid(360.0));
             sim.set_read(THETA, af.theta_deg);
-            sim.set_read(ON_GROUND, if af.on_ground() { 1.0 } else { 0.0 });
+            sim.set_read(crate::datarefs::ON_GROUND_ANY, if af.on_ground() { 1.0 } else { 0.0 });
             let (gs_ms, ias, agl_m, psi) = tokio::join!(
                 sim.get_float(GS_MS),
                 sim.get_float(IAS),
@@ -10070,7 +10071,7 @@ mod reject_stop_tests {
         assert_eq!(at_off, Some(true), "the engaged autothrottle is out, read back");
         let mut law = RollSteer::for_airframe();
         let stop = stop_on_centreline(&jet, &rwy_north(), &mut law).await;
-        let held = crate::full_auto::hand_back_hold(&jet, Some(1.0)).await;
+        let held = crate::full_auto::hand_back_hold(&jet, Some(1.0), super::REJECT_HOLD).await;
         let s = jet.st.lock().unwrap();
         assert!(stop.stopped, "{stop:?}");
         assert!(!s.thrust_back, "the levers never came back up");

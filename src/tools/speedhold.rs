@@ -20,6 +20,7 @@
 //! the brakes", 2026-07-14). The full stops stay explicit — the park handle
 //! (ratio past 0.5) or a throttle push releases the hold entirely.
 
+use crate::datarefs::ON_GROUND_ANY;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 
@@ -53,7 +54,6 @@ fn taxi_lever() -> String {
     }
 }
 const GS_MS: &str = "sim/flightmodel/position/groundspeed";
-const ON_GROUND: &str = "sim/flightmodel/failures/onground_any";
 const LEFT_BRAKE: &str = "sim/cockpit2/controls/left_brake_ratio";
 const RIGHT_BRAKE: &str = "sim/cockpit2/controls/right_brake_ratio";
 // The held-brake command and its expiry (`BRAKES_REGULAR`/`BRAKE_HOLD_SECS`)
@@ -863,7 +863,7 @@ impl Tool for HoldSpeed {
                 "I wasn't holding the speed.".to_string()
             });
         }
-        let on_ground = ctx.xplane.get_float(ON_GROUND).await.unwrap_or(0.0) > 0.5;
+        let on_ground = ctx.xplane.get_float(ON_GROUND_ANY).await.unwrap_or(0.0) > 0.5;
         // "Go" — resume the pace we were taxiing at before the stop.
         if a.resume {
             if !on_ground {
@@ -1200,9 +1200,7 @@ async fn governor(xp: XPlaneClient, voice: Option<crate::voice::Voice>) {
             break;
         }
         // Yield instantly to anything that takes the whole aircraft.
-        if super::recover::ACTIVE.load(Ordering::Relaxed)
-            || crate::autoland::ACTIVE.load(Ordering::Relaxed)
-        {
+        if crate::flight_state::crew_landing_or_recovering() {
             ACTIVE.store(false, Ordering::Relaxed);
             break;
         }
@@ -1244,7 +1242,7 @@ async fn governor(xp: XPlaneClient, voice: Option<crate::voice::Voice>) {
         // answer — it must never impersonate "airborne" (the Web API blinked
         // during a plugin reload and the taxi governor dropped a braking
         // stop as 'airborne, released' at 10 knots, 2026-07-13).
-        let on_ground = xp.get_float(ON_GROUND).await.ok().map(|v| v > 0.5);
+        let on_ground = xp.get_float(ON_GROUND_ANY).await.ok().map(|v| v > 0.5);
         match mode {
             Mode::Flight => {
                 if let (Ok(ias), Ok(thr)) = (

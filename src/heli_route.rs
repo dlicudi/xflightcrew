@@ -2785,7 +2785,7 @@ async fn fly(
                         }
                     }
                     let down = xp
-                        .get_float("sim/flightmodel/failures/onground_any")
+                        .get_float(crate::datarefs::ON_GROUND_ANY)
                         .await
                         .is_ok_and(|g| g > 0.5);
                     crate::blackbox::record(

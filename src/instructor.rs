@@ -1263,7 +1263,7 @@ impl Scorer {
                     self.notes
                         .push("Rolled without stopping at the hold line.".into());
                     lines.push("You never stopped at the hold line.".into());
-                } else if self.moved_m >= TAXI_MIN_M && gs < 0.5 {
+                } else if self.moved_m >= TAXI_MIN_M && sim::ground::stopped_kts(gs) {
                     self.stopped_s += dt;
                     if self.stopped_s >= TAXI_STOP_S {
                         self.complete = true;
@@ -2283,6 +2283,7 @@ impl Demo {
 /// Is the demonstrated task's automation flying?
 #[cfg(not(test))]
 fn demo_loop_running(task: Task) -> bool {
+    // owners-by-name: each task demonstrates its own loop.
     use std::sync::atomic::Ordering::Relaxed;
     match task {
         Task::Taxi => crate::autotaxi::ACTIVE.load(Relaxed),
@@ -3266,7 +3267,7 @@ impl Syllabus {
                 }
             }
             Step::WaitStopped => {
-                if s.on_ground && s.gs_kts.abs() < 0.5 {
+                if s.on_ground && sim::ground::stopped_kts(s.gs_kts) {
                     self.wait_s += dt;
                     if self.wait_s >= SYLLABUS_STOP_S {
                         self.advance();

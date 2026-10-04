@@ -1941,15 +1941,8 @@ async fn run_session(
                     tracing::info!("native pushback stop, pre-gate");
                     conversation.clear();
                     let _ = xplane.run_command(tools::ground::CMD_PUSH_STOP).await;
-                    let held = matches!(
-                        tools::controls::drive_park_brake(
-                            &xplane,
-                            true,
-                            profile.park_brake_valve_set,
-                        )
-                        .await,
-                        Ok(true)
-                    );
+                    let held =
+                        pushback::park_after_stop(&xplane, profile.park_brake_valve_set).await;
                     pushback::ACTIVE.store(false, std::sync::atomic::Ordering::SeqCst);
                     // The line from the read-back, never the attempt (#65).
                     say(
@@ -2400,6 +2393,7 @@ async fn run_session(
             // giving it back. Naming a lever releases just that one; a generic
             // "my controls" / "let go" releases everything held.
             {
+                // owners-by-name: each lever is released by its own loop.
                 use std::sync::atomic::Ordering::Relaxed;
                 let speed_held = tools::speedhold::ACTIVE.load(Relaxed);
                 // Holding the mixture is the continuous manager OR a lean
@@ -3376,8 +3370,12 @@ async fn run_session(
                     );
                     break 'confirm false;
                 };
+                // Stopped on the ground: a shutdown here is the end of a
+                // flight, not a hazard, so it is not confirmed (the pilot
+                // asked, 2026-09-22: "Confirm, shut both engines down?" at
+                // every stand). A failed read is not stopped.
                 let parked_shutdown = call.name == "stop_engines"
-                    && tools::jet_start::stopped_on_ground(&xplane).await;
+                    && sim::ground::read_stopped_on_ground(&xplane).await;
                 // An all-off asks only with an engine turning on the ground:
                 // cold it is the normal shutdown, airborne the tool refuses
                 // (issue #66).

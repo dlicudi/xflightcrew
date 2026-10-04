@@ -25,6 +25,7 @@
 use serde_json::json;
 
 use crate::config::Config;
+use crate::tools::controls::HoldFor;
 use crate::tools::{taxi::AutoTaxi, Tool, ToolCtx};
 use crate::voice::{Priority, Voice};
 use crate::xplane::XPlaneClient;
@@ -33,6 +34,22 @@ const COM1_FREQ_KHZ: &str = crate::datarefs::COM1_FREQ_KHZ;
 /// True heading — the rollout direction, so a vacate never picks an exit
 /// behind us (reaching one means taxiing back down the runway).
 const PSI_TRUE: &str = "sim/flightmodel/position/psi";
+
+/// The pilot's release: a hand-back's own gates (a tug, an unread speed).
+const RELEASE_HOLD: HoldFor = HoldFor::by("taxi_in");
+/// The taxi-in's own holds (the arrest, a halted drive): it knows the
+/// aircraft is on the ground, so an unread speed still brakes and parks.
+const TAXI_IN_HOLD: HoldFor = HoldFor::by("taxi_in").fail_closed();
+
+/// A drive this taxi-in halted is still on the governor's throttle: hold it
+/// at zero (idle and its brakes) and stop and park on the one seam
+/// ([`crate::tools::controls::hand_back_hold`]), read back. It used to set
+/// the parking brake unconfirmed on a rolling aircraft (refactor audit
+/// 2026-10-04, duplicates #8).
+async fn stop_and_park(xp: &XPlaneClient, valve_set: Option<f64>) -> Option<bool> {
+    crate::tools::speedhold::set_taxi_target(0.0);
+    crate::tools::controls::hand_back_hold(xp, valve_set, TAXI_IN_HOLD).await
+}
 
 /// The taxi-in has ARRESTED a rolling handoff with the parking brake and is
 /// holding on it while the clearance is worked. The monitor's rolling-park-
@@ -130,7 +147,9 @@ async fn end_cancelled(
     use std::sync::atomic::Ordering::SeqCst;
     let hold = CANCEL_HOLD.load(SeqCst) && CANCEL.load(SeqCst);
     let held = match hold {
-        true => crate::full_auto::hand_back_hold(xp, park_brake_valve_set).await,
+        true => {
+            crate::tools::controls::hand_back_hold(xp, park_brake_valve_set, RELEASE_HOLD).await
+        }
         false => None,
     };
     crate::blackbox::record(
@@ -447,9 +466,12 @@ async fn vacate(
             // (2026-09-20) this vacate ran 179 s past here with 1,082 m to
             // go, outlived the overrun guard below, and its eventual arrival
             // was taken for the stand's.
-            crate::blackbox::record("taxi_in", json!({ "event": "vacate_timeout" }));
             crate::autotaxi::halt();
-            let _ = crate::tools::controls::drive_park_brake(xp, true, park_brake_valve_set).await;
+            let held = stop_and_park(xp, park_brake_valve_set).await;
+            crate::blackbox::record(
+                "taxi_in",
+                json!({ "event": "vacate_timeout", "held": held }),
+            );
             break;
         }
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
@@ -543,43 +565,48 @@ async fn fly(
     // brakes — the same rule as pushback: a stage that is not moving the
     // aircraft is holding it.
     if !crate::autotaxi::driving() {
-        // Fail CLOSED on the speed read: the likeliest reason it fails is the
+        // Stopped and parked on the one seam (`hand_back_hold`): the wheel
+        // brakes to a stop, the held command's tail, then the valve-aware
+        // parking brake, read back. It used to set the PARKING brake on the
+        // rolling aircraft above 3 kt and leave one under 3 kt to roll
+        // (refactor audit 2026-10-04, duplicates #8). Fail CLOSED on the
+        // speed read (`TAXI_IN_HOLD`): the likeliest reason it fails is the
         // same faltering client that just bailed the vacate at
-        // `vacate_no_position` — exactly the path most likely to have
-        // inherited a rolling handoff — and a redundant brake on a stopped
-        // aircraft costs nothing, where a coasting one on a runway is the
-        // thing this line exists to stop. And valve-aware like every other
-        // brake owner: on a valve airframe the bare ratio write is the
-        // fallback `drive_park_brake` only reaches AFTER the valve, and can
-        // be a no-op on its own (audit, 2026-08-02).
+        // `vacate_no_position`, exactly the path most likely to have
+        // inherited a rolling handoff (audit, 2026-08-02). Flagged first: the
+        // held brake commands ride the parking-brake ratio, and the monitor's
+        // rolling-park-brake caution must not nag about our own stop.
         let gs_kts = xp
-            .get_float("sim/flightmodel/position/groundspeed")
+            .get_float(crate::datarefs::GROUNDSPEED_MS)
             .await
-            .map(|v| v * 1.943_84);
-        if gs_kts.as_ref().map_or(true, |gs| *gs > 3.0) {
-            ARREST_HOLD.store(true, std::sync::atomic::Ordering::Relaxed);
-            let set =
-                crate::tools::controls::set_park_brake_confirmed(&xp, park_brake_valve_set, 3)
-                    .await;
-            // Say so: a brake the pilot did not set, on a roll they may still
-            // think is theirs, is announced, not discovered. And say what the
-            // read-back says: "Brakes on" over a brake that did not take was
-            // the EGSS rollout's untrue line (2026-09-22, issue #65).
-            announce(
+            .ok()
+            .map(|v| v * sim::ground::MS_TO_KTS);
+        ARREST_HOLD.store(true, std::sync::atomic::Ordering::Relaxed);
+        let held = crate::tools::controls::hand_back_hold(&xp, park_brake_valve_set, TAXI_IN_HOLD)
+            .await;
+        // Say so: a brake the pilot did not set, on a roll they may still
+        // think is theirs, is announced, not discovered. And say what the
+        // read-back says: "Brakes on" over a brake that did not take was
+        // the EGSS rollout's untrue line (2026-09-22, issue #65).
+        match held {
+            Some(true) => announce(
                 &voice,
                 Priority::Caution,
-                if set.held {
-                    "Brakes on, holding for the taxi clearance."
-                } else {
-                    "The parking brake did not set. Hold the brakes, we may still be rolling."
-                },
-            );
-            crate::blackbox::record(
-                "taxi_in",
-                json!({ "event": "arrest_rolling", "gs": gs_kts.unwrap_or(-1.0),
-                        "held": set.held, "tries": set.tries, "park": set.park }),
-            );
+                "Brakes on, holding for the taxi clearance.",
+            ),
+            Some(false) => announce(
+                &voice,
+                Priority::Caution,
+                "The parking brake did not set. Hold the brakes, we may still be rolling.",
+            ),
+            // Skipped (airborne, a tug on the bar, a pilot on the toe brakes
+            // at speed): nothing of ours holds it.
+            None => arrest_release(),
         }
+        crate::blackbox::record(
+            "taxi_in",
+            json!({ "event": "arrest_rolling", "gs": gs_kts.unwrap_or(-1.0), "held": held }),
+        );
     }
 
     // --- Phase two: the taxi-in proper, from wherever phase one left us. ---
@@ -776,9 +803,9 @@ async fn fly(
     // driving at this point is stopped outright, which also clears the
     // arrival latch the guard below depends on.
     if crate::autotaxi::driving() {
-        crate::blackbox::record("taxi_in", json!({ "event": "overrun_halt" }));
         crate::autotaxi::halt();
-        let _ = crate::tools::controls::drive_park_brake(&xp, true, park_brake_valve_set).await;
+        let held = stop_and_park(&xp, park_brake_valve_set).await;
+        crate::blackbox::record("taxi_in", json!({ "event": "overrun_halt", "held": held }));
         // Give the loop its tick to see the flag and let go of the channels.
         tokio::time::sleep(std::time::Duration::from_millis(600)).await;
     }

@@ -293,21 +293,6 @@ fn cap(s: &str) -> String {
         .unwrap_or_default()
 }
 
-const ON_GROUND: &str = "sim/flightmodel/failures/onground_any";
-const GROUNDSPEED: &str = "sim/flightmodel/position/groundspeed"; // m/s
-
-/// Stopped on the ground: a shutdown here is the end of a flight, not a
-/// hazard, so it is not confirmed (the pilot asked, 2026-09-22: "Confirm,
-/// shut both engines down?" at every stand) and the tool sets the parking
-/// brake itself. Rolling, the confirm stands. A failed read is not stopped.
-pub async fn stopped_on_ground(xp: &XPlaneClient) -> bool {
-    let (g, gs) = tokio::join!(xp.get_float(ON_GROUND), xp.get_float(GROUNDSPEED));
-    matches!((g, gs), (Ok(g), Ok(gs)) if g > 0.5 && gs.abs() < STOPPED_MPS)
-}
-
-/// Under this groundspeed (m/s, about a knot) the aircraft is stopped.
-const STOPPED_MPS: f64 = 0.5;
-
 /// Shut the jet engines down — cut the fuel levers. Gated hard against doing it
 /// in flight: an airborne "engines off" is a refusal, not an action.
 ///
@@ -389,7 +374,7 @@ impl Tool for StopEngines {
     async fn execute(&self, _args: &Value, ctx: &ToolCtx<'_>) -> Result<String> {
         // Safety gate: never shut the engines down airborne. Default to airborne if
         // the read fails, so an unknown state errs safe.
-        if ctx.xplane.get_float(ON_GROUND).await.unwrap_or(0.0) <= 0.5 {
+        if ctx.xplane.get_float(crate::datarefs::ON_GROUND_ANY).await.unwrap_or(0.0) <= 0.5 {
             return Ok(
                 "Negative, we're airborne. I will not shut the engines down in flight.".to_string(),
             );
@@ -403,9 +388,9 @@ impl Tool for StopEngines {
         // confirmed shutdown on the move) it is left to the pilot.
         let stopped = ctx
             .xplane
-            .get_float(GROUNDSPEED)
+            .get_float(crate::datarefs::GROUNDSPEED_MS)
             .await
-            .is_ok_and(|gs| gs.abs() < STOPPED_MPS);
+            .is_ok_and(sim::ground::stopped_mps);
         let parked = if stopped {
             match super::controls::park_for_shutdown(ctx.xplane, self.park_brake_valve_set).await {
                 Ok(p) => p.unwrap_or(""),

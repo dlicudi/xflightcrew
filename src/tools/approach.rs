@@ -125,16 +125,14 @@ fn arm_plan(
     }
 }
 
+/// What the loop flying the aircraft is doing, if one is
+/// ([`crate::flight_state::crew_flying`]; the follower says "I'm flying the
+/// approach" here, where the route it flies ends).
 fn automation_flying() -> Option<&'static str> {
-    use std::sync::atomic::Ordering::Relaxed;
-    [
-        (crate::autoland::ACTIVE.load(Relaxed), "I'm landing"),
-        (crate::procedure::ACTIVE.load(Relaxed), "I'm flying the approach"),
-        (crate::circuit::ACTIVE.load(Relaxed), "I'm flying the circuit"),
-        (crate::full_auto::ACTIVE.load(Relaxed), "I'm flying"),
-    ]
-    .into_iter()
-    .find_map(|(on, who)| on.then_some(who))
+    crate::flight_state::crew_flying().map(|o| match o {
+        crate::flight_state::Owner::Procedure => "I'm flying the approach",
+        o => o.doing(),
+    })
 }
 
 #[async_trait]

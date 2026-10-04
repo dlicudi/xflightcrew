@@ -113,7 +113,7 @@ pub(crate) async fn landing_readiness(
     profile: &aircraft::AircraftProfile,
 ) -> String {
     let airborne = xp
-        .get_float("sim/flightmodel/failures/onground_any")
+        .get_float(crate::datarefs::ON_GROUND_ANY)
         .await
         .map(|v| v < 0.5)
         .unwrap_or(true);
@@ -201,7 +201,7 @@ pub(crate) async fn config_advice(
         return "No configuration table for this airframe yet.".to_string();
     }
     let airborne = xp
-        .get_float("sim/flightmodel/failures/onground_any")
+        .get_float(crate::datarefs::ON_GROUND_ANY)
         .await
         .map(|v| v < 0.5)
         .unwrap_or(false);
@@ -334,7 +334,7 @@ pub(crate) async fn on_course_report(xp: &XPlaneClient, live: Option<&LiveState>
     // Parked, the question has no meaning — and the naive answer was nonsense
     // ("On course. 0 miles, 0 minutes." spoken live on the ramp).
     let on_ground = xp
-        .get_float("sim/flightmodel/failures/onground_any")
+        .get_float(crate::datarefs::ON_GROUND_ANY)
         .await
         .unwrap_or(0.0)
         > 0.5;
@@ -560,7 +560,7 @@ pub(crate) async fn runway_advice(
         return "Couldn't fetch your SimBrief plan.".to_string();
     };
     let on_ground = xp
-        .get_float("sim/flightmodel/failures/onground_any")
+        .get_float(crate::datarefs::ON_GROUND_ANY)
         .await
         .unwrap_or(1.0)
         > 0.5;

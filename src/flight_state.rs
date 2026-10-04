@@ -144,6 +144,196 @@ pub(crate) fn stand_down() {
     crate::full_auto::release_arrival_station();
 }
 
+/// A loop of ours that can hold the aircraft. The ONE list of them: every
+/// "is an automation flying?" question in the tree is a filter over it
+/// ([`crew_has_aircraft`], [`crew_flying`], [`crew_mission`] and the named
+/// narrower sets below). Nine inline copies with different members used to
+/// answer it: the recovery was in none of the four "automation flying" ones,
+/// and with the helicopter route or a stand-alone takeoff flying the monitor
+/// treated a pilot as flying, advising where it should have reset the
+/// altimeter (refactor audit 2026-10-04, duplicates #1).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Owner {
+    FullAuto,
+    HeliRoute,
+    Circuit,
+    HeliCircuit,
+    Procedure,
+    Autoland,
+    Autotakeoff,
+    Autotaxi,
+    Pushback,
+    Hover,
+    Recover,
+}
+
+impl Owner {
+    /// Innermost first: the loop with its hands on the controls now (full
+    /// auto flies through autoland, the takeoff and the taxi; a recovery
+    /// takes the aircraft from whatever was flying it).
+    pub(crate) const INNERMOST_FIRST: [Owner; 11] = [
+        Owner::Recover,
+        Owner::Autoland,
+        Owner::Autotakeoff,
+        Owner::Pushback,
+        Owner::Autotaxi,
+        Owner::Hover,
+        Owner::Procedure,
+        Owner::Circuit,
+        Owner::HeliCircuit,
+        Owner::HeliRoute,
+        Owner::FullAuto,
+    ];
+
+    /// Outermost first: what the flight is FOR (the missions own every loop
+    /// under them).
+    pub(crate) const OUTERMOST_FIRST: [Owner; 11] = [
+        Owner::FullAuto,
+        Owner::HeliRoute,
+        Owner::Circuit,
+        Owner::HeliCircuit,
+        Owner::Procedure,
+        Owner::Autoland,
+        Owner::Autotakeoff,
+        Owner::Autotaxi,
+        Owner::Pushback,
+        Owner::Hover,
+        Owner::Recover,
+    ];
+
+    /// Its loop flag reads set.
+    pub(crate) fn active(self) -> bool {
+        use std::sync::atomic::Ordering::Relaxed;
+        match self {
+            Owner::FullAuto => crate::full_auto::ACTIVE.load(Relaxed),
+            Owner::HeliRoute => crate::heli_route::ACTIVE.load(Relaxed),
+            Owner::Circuit => crate::circuit::ACTIVE.load(Relaxed),
+            Owner::HeliCircuit => crate::heli_circuit::ACTIVE.load(Relaxed),
+            Owner::Procedure => crate::procedure::ACTIVE.load(Relaxed),
+            Owner::Autoland => crate::autoland::ACTIVE.load(Relaxed),
+            Owner::Autotakeoff => crate::autotakeoff::ACTIVE.load(Relaxed),
+            Owner::Autotaxi => crate::autotaxi::ACTIVE.load(Relaxed),
+            Owner::Pushback => crate::pushback::ACTIVE.load(Relaxed),
+            Owner::Hover => crate::hover::ACTIVE.load(Relaxed),
+            Owner::Recover => crate::tools::recover::ACTIVE.load(Relaxed),
+        }
+    }
+
+    /// Its name in the blackbox, the flight model's `Control::Automation`
+    /// and the duty engine (`monitor::flying_loop`'s names, kept).
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            Owner::FullAuto => "full auto",
+            Owner::HeliRoute => "helicopter route",
+            Owner::Circuit => "circuit",
+            Owner::HeliCircuit => "helicopter circuit",
+            Owner::Procedure => "follower",
+            Owner::Autoland => "autoland",
+            Owner::Autotakeoff => "takeoff",
+            Owner::Autotaxi => "taxi",
+            Owner::Pushback => "pushback",
+            Owner::Hover => "hover",
+            Owner::Recover => "recovery",
+        }
+    }
+
+    /// Its name in a spoken sentence ("held by the circuit").
+    pub(crate) fn spoken(self) -> &'static str {
+        match self {
+            Owner::FullAuto => "full auto",
+            Owner::HeliRoute => "the route",
+            Owner::Circuit | Owner::HeliCircuit => "the circuit",
+            Owner::Procedure => "the follower",
+            Owner::Autoland => "autoland",
+            Owner::Autotakeoff => "the takeoff",
+            Owner::Autotaxi => "the taxi",
+            Owner::Pushback => "the pushback",
+            Owner::Hover => "the hover",
+            Owner::Recover => "the recovery",
+        }
+    }
+
+    /// What the crew says it is doing, refusing a request that would take
+    /// the aircraft from it ("I'm landing").
+    pub(crate) fn doing(self) -> &'static str {
+        match self {
+            Owner::Autoland => "I'm landing",
+            Owner::Circuit | Owner::HeliCircuit => "I'm flying the circuit",
+            Owner::Procedure => "I'm flying the route",
+            Owner::Autotakeoff => "I'm taking off",
+            Owner::HeliRoute => "I'm flying the helicopter route",
+            Owner::Hover => "I'm holding the hover",
+            Owner::Recover => "I'm recovering the aircraft",
+            Owner::Autotaxi => "I'm taxiing",
+            Owner::Pushback => "We're pushing back",
+            Owner::FullAuto => "I'm flying",
+        }
+    }
+
+    /// It FLIES the aircraft, as opposed to driving it on the ground (the
+    /// taxi and the tug share the cockpit with a pilot's after-landing
+    /// clean-up and leave the monitor's advice to the pilot).
+    pub(crate) fn flies(self) -> bool {
+        !matches!(self, Owner::Autotaxi | Owner::Pushback)
+    }
+
+    /// The critical phases a loop flies: the takeoff, the landing, an upset
+    /// recovery. The copilot's workload (`tempo`) is high under them.
+    pub(crate) fn critical(self) -> bool {
+        matches!(self, Owner::Recover | Owner::Autoland | Owner::Autotakeoff)
+    }
+
+    /// It takes every lever: a landing or an upset recovery
+    /// ([`crew_landing_or_recovering`]).
+    pub(crate) fn takes_every_lever(self) -> bool {
+        matches!(self, Owner::Recover | Owner::Autoland)
+    }
+}
+
+/// The innermost loop of ours holding the aircraft, in the air or on the
+/// ground. `None` = the pilot's own aircraft.
+pub(crate) fn crew_has_aircraft() -> Option<Owner> {
+    innermost(Owner::active, |_| true)
+}
+
+/// The innermost loop of ours FLYING the aircraft ([`Owner::flies`]): the
+/// copilot is the pilot flying, so a checklist is its own cross-check, the
+/// monitor's checks fix rather than advise, praise goes to nobody, and an
+/// ILS setup or a coupling is the loop's.
+pub(crate) fn crew_flying() -> Option<Owner> {
+    innermost(Owner::active, Owner::flies)
+}
+
+/// The outermost loop of ours armed: what the flight is FOR.
+pub(crate) fn crew_mission() -> Option<Owner> {
+    Owner::OUTERMOST_FIRST.into_iter().find(|o| o.active())
+}
+
+/// A loop in a critical phase ([`Owner::critical`]) is flying, at any depth.
+pub(crate) fn crew_in_critical_phase() -> bool {
+    innermost(Owner::active, Owner::critical).is_some()
+}
+
+/// A landing or an upset recovery has the whole aircraft: the loops that
+/// take every lever (the mixture manager, the speed hold and the lean seek
+/// yield to them), and the moments the monitor's pilot-directed callouts
+/// stay quiet ("lower the nose, add power" is backwards when the copilot is
+/// the one doing it). Narrower than [`crew_flying`] on purpose: under a
+/// circuit or the follower the monitor's callouts still speak, and its fixes
+/// (the altimeter reset) ride the spoken edge. Four inline copies of this
+/// pair, now one.
+pub(crate) fn crew_landing_or_recovering() -> bool {
+    innermost(Owner::active, Owner::takes_every_lever).is_some()
+}
+
+/// The innermost owner `active` says is set among those `keep` admits. Pure
+/// over `active`, so the orders are a plain test.
+fn innermost(active: impl Fn(Owner) -> bool, keep: impl Fn(Owner) -> bool) -> Option<Owner> {
+    Owner::INNERMOST_FIRST
+        .into_iter()
+        .find(|&o| keep(o) && active(o))
+}
+
 #[cfg(test)]
 mod tests {
     /// Every module in the tree that declares a loop flag is named in
@@ -162,7 +352,8 @@ mod tests {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
         let this = std::fs::read_to_string(root.join("flight_state.rs")).unwrap();
         let body = this.split("pub(crate) fn stand_down()").nth(1).unwrap();
-        let body = body.split("#[cfg(test)]").next().unwrap();
+        // The function alone: the owner list below it names every loop too.
+        let body = body.split("\n}\n").next().unwrap();
         let mut files = Vec::new();
         fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
             for e in std::fs::read_dir(dir).unwrap().flatten() {
@@ -365,5 +556,237 @@ mod tests {
         let src = include_str!("procedure.rs");
         assert!(body_of(src, "pub fn abort() -> bool").contains("take_missed_legs();"));
         assert!(body_of(src, "pub fn start_scoped(").contains("take_missed_legs();"));
+    }
+
+    use super::{innermost, Owner};
+
+    fn set(on: &'static [Owner]) -> impl Fn(Owner) -> bool {
+        move |o| on.contains(&o)
+    }
+
+    /// Both orders hold every owner exactly once.
+    #[test]
+    fn the_owner_orders_name_every_loop_once() {
+        for order in [Owner::INNERMOST_FIRST, Owner::OUTERMOST_FIRST] {
+            for o in Owner::INNERMOST_FIRST {
+                assert_eq!(order.iter().filter(|x| **x == o).count(), 1, "{o:?}");
+            }
+        }
+    }
+
+    /// The innermost loop answers "who has it": autoland inside full auto,
+    /// a recovery over the circuit it took from, the taxi inside full auto.
+    #[test]
+    fn the_innermost_owner_has_the_aircraft() {
+        let any = |_| true;
+        assert_eq!(
+            innermost(set(&[Owner::FullAuto, Owner::Autoland]), any),
+            Some(Owner::Autoland)
+        );
+        assert_eq!(
+            innermost(set(&[Owner::Circuit, Owner::Recover]), any),
+            Some(Owner::Recover)
+        );
+        assert_eq!(
+            innermost(set(&[Owner::FullAuto, Owner::Autotaxi]), any),
+            Some(Owner::Autotaxi)
+        );
+        assert_eq!(innermost(set(&[]), any), None);
+    }
+
+    /// Flying leaves the ground drives out: full auto taxiing is full auto
+    /// flying, a stand-alone taxi is nobody flying.
+    #[test]
+    fn the_ground_drives_do_not_fly() {
+        assert_eq!(
+            innermost(set(&[Owner::FullAuto, Owner::Autotaxi]), Owner::flies),
+            Some(Owner::FullAuto)
+        );
+        assert_eq!(innermost(set(&[Owner::Pushback]), Owner::flies), None);
+        // The loops the four old "automation flying" copies forgot.
+        for o in [
+            Owner::Autotakeoff,
+            Owner::HeliRoute,
+            Owner::HeliCircuit,
+            Owner::Hover,
+            Owner::Recover,
+        ] {
+            assert_eq!(
+                innermost(move |x| x == o, Owner::flies),
+                Some(o),
+                "{o:?} flies"
+            );
+        }
+    }
+
+    /// The narrower sets: critical is the takeoff, the landing and a
+    /// recovery; every lever is the landing and a recovery only.
+    #[test]
+    fn the_narrow_sets_are_named() {
+        let critical: Vec<Owner> = Owner::INNERMOST_FIRST
+            .into_iter()
+            .filter(|o| o.critical())
+            .collect();
+        assert_eq!(
+            critical,
+            [Owner::Recover, Owner::Autoland, Owner::Autotakeoff]
+        );
+        let levers: Vec<Owner> = Owner::INNERMOST_FIRST
+            .into_iter()
+            .filter(|o| o.takes_every_lever())
+            .collect();
+        assert_eq!(levers, [Owner::Recover, Owner::Autoland]);
+        assert_eq!(
+            innermost(
+                set(&[Owner::FullAuto, Owner::Autotakeoff]),
+                Owner::takes_every_lever
+            ),
+            None
+        );
+    }
+
+    /// The names the blackbox, the flight model and the duty engine read
+    /// are `monitor::flying_loop`'s old ones, plus the recovery.
+    #[test]
+    fn owner_names_are_the_recorded_ones() {
+        let names: Vec<&str> = Owner::INNERMOST_FIRST
+            .into_iter()
+            .map(Owner::name)
+            .collect();
+        assert_eq!(
+            names,
+            [
+                "recovery",
+                "autoland",
+                "takeoff",
+                "pushback",
+                "taxi",
+                "hover",
+                "follower",
+                "circuit",
+                "helicopter circuit",
+                "helicopter route",
+                "full auto"
+            ]
+        );
+    }
+
+    /// The on-ground dataref is named once, `datarefs::ON_GROUND_ANY`: it
+    /// was redeclared in fifteen files (refactor audit 2026-10-04, #9).
+    #[test]
+    fn the_on_ground_dataref_is_named_once() {
+        let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut files = Vec::new();
+        fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            for e in std::fs::read_dir(dir).unwrap().flatten() {
+                let p = e.path();
+                if p.is_dir() {
+                    walk(&p, out);
+                } else if p.extension().is_some_and(|x| x == "rs") {
+                    out.push(p);
+                }
+            }
+        }
+        for dir in ["src", "crates/atc/src", "crates/sim/src"] {
+            walk(&manifest.join(dir), &mut files);
+        }
+        let literal = concat!("\"sim/flightmodel/failures/", "onground_any\"");
+        let named: Vec<_> = files
+            .iter()
+            .filter(|f| std::fs::read_to_string(f).unwrap().contains(literal))
+            .map(|f| f.strip_prefix(manifest).unwrap().display().to_string())
+            .collect();
+        assert_eq!(named, ["crates/sim/src/datarefs.rs"]);
+    }
+
+    /// "Is an automation flying?" has one home: no file outside this one
+    /// lists the loops' flags inline again. Three or more different owners'
+    /// `ACTIVE.load` within a few lines is the pattern that grew nine copies
+    /// with different members (refactor audit 2026-10-04, duplicates #1).
+    /// A site that really needs each loop by name (the release gate lets go
+    /// of each lever separately) says so with `owners-by-name:` in the window.
+    #[test]
+    fn no_inline_automation_flying_lists() {
+        const MODULES: &[&str] = &[
+            "full_auto::",
+            "heli_route::",
+            "circuit::",
+            "heli_circuit::",
+            "procedure::",
+            "autoland::",
+            "autotakeoff::",
+            "autotaxi::",
+            "pushback::",
+            "hover::",
+            "recover::",
+        ];
+        const WINDOW: usize = 8;
+        const MARKER_REACH: usize = 40;
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut files = Vec::new();
+        fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            for e in std::fs::read_dir(dir).unwrap().flatten() {
+                let p = e.path();
+                if p.is_dir() {
+                    walk(&p, out);
+                } else if p.extension().is_some_and(|x| x == "rs") {
+                    out.push(p);
+                }
+            }
+        }
+        walk(&root, &mut files);
+        // Which owner, if any, a line loads the flag of. A module name
+        // inside another (`circuit::` in `heli_circuit::`) matches the
+        // longer name.
+        fn owner_of(l: &str) -> Option<&'static str> {
+            let at = l.find("::ACTIVE.load")?;
+            let head = &l[..at + 2];
+            MODULES
+                .iter()
+                .filter(|m| head.ends_with(*m))
+                .max_by_key(|m| m.len())
+                .copied()
+        }
+        let mut found = Vec::new();
+        for f in files {
+            if f.ends_with("flight_state.rs") {
+                continue;
+            }
+            let text = std::fs::read_to_string(&f).unwrap();
+            // A marker excuses the block under it.
+            let mut excused = 0usize;
+            let owners_of: Vec<Option<&str>> = text
+                .lines()
+                .map(|l| {
+                    if l.contains("owners-by-name:") {
+                        excused = MARKER_REACH;
+                    }
+                    excused = excused.saturating_sub(1);
+                    if excused > 0 {
+                        None
+                    } else {
+                        owner_of(l)
+                    }
+                })
+                .collect();
+            for start in 0..owners_of.len() {
+                let window = &owners_of[start..(start + WINDOW).min(owners_of.len())];
+                let mut owners: Vec<&str> = window.iter().flatten().copied().collect();
+                owners.sort_unstable();
+                owners.dedup();
+                if owners.len() >= 3 {
+                    found.push(format!(
+                        "{}:{} {owners:?}",
+                        f.strip_prefix(&root).unwrap().display(),
+                        start + 1
+                    ));
+                    break;
+                }
+            }
+        }
+        assert!(
+            found.is_empty(),
+            "inline automation-flying lists, use flight_state: {found:?}"
+        );
     }
 }

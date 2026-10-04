@@ -2771,7 +2771,7 @@ pub async fn preflight(sim: &dyn RunnerSim) -> Result<()> {
 }
 
 /// Below this the last case's aircraft is stopped.
-pub const STOPPED_KTS: f64 = 1.0;
+pub const STOPPED_KTS: f64 = sim::ground::STOPPED_KTS;
 /// `sim/flightmodel/position/groundspeed` is metres per second.
 const MPS_TO_KTS: f64 = 1.943_844;
 /// At rest this long before a setup: a taxi-in stops between its vacate and
@@ -3128,7 +3128,7 @@ async fn set_up_start(
             sim.read(crate::datarefs::ON_GROUND_ANY).await,
             sim.read(GROUNDSPEED).await,
         );
-        let still = if g.is_ok_and(|g| g > 0.5) && gs.is_ok_and(|v| v.abs() < 0.5) {
+        let still = if sim::ground::stopped_on_ground(g.ok(), gs.ok()) {
             let s = *still_since.get_or_insert(now_s());
             now_s() - s >= pace.still_s
         } else {

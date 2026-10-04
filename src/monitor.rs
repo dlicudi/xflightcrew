@@ -313,7 +313,7 @@ impl Snapshot {
     /// profile's phase-expectation switches, read best-effort per tick.
     async fn read(xp: &XPlaneClient, advisor_drefs: &[String]) -> Option<Snapshot> {
         let on_ground = xp
-            .get_float("sim/flightmodel/failures/onground_any")
+            .get_float(crate::datarefs::ON_GROUND_ANY)
             .await
             .ok()?
             > 0.5;
@@ -353,13 +353,11 @@ impl Snapshot {
             .await
             .ok()
             .map(|m| m * M_TO_FT);
-        let automation_flying = {
-            use std::sync::atomic::Ordering::Relaxed;
-            crate::procedure::ACTIVE.load(Relaxed)
-                || crate::full_auto::ACTIVE.load(Relaxed)
-                || crate::circuit::ACTIVE.load(Relaxed)
-                || crate::autoland::ACTIVE.load(Relaxed)
-        };
+        // The one "an automation is flying" (`flight_state::crew_flying`):
+        // the takeoff, the helicopter's loops and a recovery count too, so
+        // under them the checks fix rather than advise (refactor audit
+        // 2026-10-04, duplicates #1).
+        let automation_flying = crate::flight_state::crew_flying().is_some();
         let ap_servos_on = xp
             .get_float("sim/cockpit2/autopilot/servos_on")
             .await
@@ -685,44 +683,27 @@ pub fn coarse_phase(p: crate::flight::Phase, agl_ft: f64) -> Phase {
 /// (full auto flies through autoland, the takeoff, the taxi; it is named
 /// itself only between them, an engine start). A checklist flow is not
 /// flying anything.
+/// A recovery is on it too ("recovery"): it was missing, so "you have
+/// control" during one was answered by taking the aircraft a second time.
 pub(crate) fn flying_loop() -> Option<&'static str> {
-    use std::sync::atomic::Ordering::Relaxed;
-    [
-        (crate::autoland::ACTIVE.load(Relaxed), "autoland"),
-        (crate::autotakeoff::ACTIVE.load(Relaxed), "takeoff"),
-        (crate::pushback::ACTIVE.load(Relaxed), "pushback"),
-        (crate::autotaxi::ACTIVE.load(Relaxed), "taxi"),
-        (crate::hover::ACTIVE.load(Relaxed), "hover"),
-        (crate::procedure::ACTIVE.load(Relaxed), "follower"),
-        (crate::circuit::ACTIVE.load(Relaxed), "circuit"),
-        (crate::heli_circuit::ACTIVE.load(Relaxed), "helicopter circuit"),
-        (crate::heli_route::ACTIVE.load(Relaxed), "helicopter route"),
-        (crate::full_auto::ACTIVE.load(Relaxed), "full auto"),
-    ]
-    .into_iter()
-    .find_map(|(on, name)| on.then_some(name))
+    crate::flight_state::crew_has_aircraft().map(crate::flight_state::Owner::name)
 }
 
 /// The outermost mission armed: what the flight is FOR, the missions first
 /// (they own every loop under them). A lesson is a mission with its hands
 /// off. `None` = the pilot's own flight.
+/// A recovery is not a mission (it is a hand, not a purpose): with only a
+/// recovery flying the flight is still the pilot's.
 fn mission() -> Option<&'static str> {
-    use std::sync::atomic::Ordering::Relaxed;
-    [
-        (crate::full_auto::ACTIVE.load(Relaxed), "full auto"),
-        (crate::heli_route::ACTIVE.load(Relaxed), "helicopter route"),
-        (crate::circuit::ACTIVE.load(Relaxed), "circuit"),
-        (crate::heli_circuit::ACTIVE.load(Relaxed), "helicopter circuit"),
-        (crate::instructor::active(), "lesson"),
-        (crate::procedure::ACTIVE.load(Relaxed), "follower"),
-        (crate::autoland::ACTIVE.load(Relaxed), "autoland"),
-        (crate::autotakeoff::ACTIVE.load(Relaxed), "takeoff"),
-        (crate::autotaxi::ACTIVE.load(Relaxed), "taxi"),
-        (crate::pushback::ACTIVE.load(Relaxed), "pushback"),
-        (crate::hover::ACTIVE.load(Relaxed), "hover"),
-    ]
-    .into_iter()
-    .find_map(|(on, name)| on.then_some(name))
+    use crate::flight_state::Owner;
+    let outer = crate::flight_state::crew_mission().filter(|o| *o != Owner::Recover);
+    match outer {
+        Some(o @ (Owner::FullAuto | Owner::HeliRoute | Owner::Circuit | Owner::HeliCircuit)) => {
+            Some(o.name())
+        }
+        _ if crate::instructor::active() => Some("lesson"),
+        o => o.map(Owner::name),
+    }
 }
 
 /// The crew's side of the situation, from the process-wide facts that
@@ -922,8 +903,7 @@ impl FireState {
         // stay quiet: it announces its own actions, and pilot-directed advice
         // ("lower the nose, add power") is backwards when the copilot is the one
         // doing it. The panel's "mute monitor" setting silences callouts too.
-        let flying = crate::tools::recover::ACTIVE.load(std::sync::atomic::Ordering::Relaxed)
-            || crate::autoland::ACTIVE.load(std::sync::atomic::Ordering::Relaxed)
+        let flying = crate::flight_state::crew_landing_or_recovering()
             || PANEL_MUTE.load(std::sync::atomic::Ordering::Relaxed);
         if !flying
             && self.sustained(min_duration, now)
@@ -3409,7 +3389,16 @@ pub async fn run(
                     vsi_fpm: snap.vsi_fpm,
                     automation: crate::flow::automation_flying(),
                     landing_config: crate::flow::landing_config_for(
-                        crate::flow::automation_flying(),
+                        // The helicopter's loops land without autoland, so
+                        // its landing items are not theirs to wait for.
+                        crate::flight_state::crew_flying().is_some_and(|o| {
+                            !matches!(
+                                o,
+                                crate::flight_state::Owner::HeliRoute
+                                    | crate::flight_state::Owner::HeliCircuit
+                                    | crate::flight_state::Owner::Hover
+                            )
+                        }),
                         snap.gear_down,
                         snap.flap_ratio,
                         !crate::aircraft::flap_limits().is_empty(),
@@ -3625,8 +3614,8 @@ pub async fn run(
             // airframe silences the whole world block: no controller works a
             // wreck, and the frozen flight model reads as garbage anyway.
             let gates = world_gates(
-                crate::tools::recover::ACTIVE.load(std::sync::atomic::Ordering::Relaxed),
-                crate::autoland::ACTIVE.load(std::sync::atomic::Ordering::Relaxed),
+                crate::flight_state::Owner::Recover.active(),
+                crate::flight_state::Owner::Autoland.active(),
                 PANEL_MUTE.load(std::sync::atomic::Ordering::Relaxed),
                 voice.crashed(),
             );
@@ -4907,9 +4896,7 @@ pub async fn run(
                 on_ground: snap.on_ground,
                 groundspeed_kts: snap.groundspeed_kts,
                 agl_ft: snap.agl_ft,
-                critical_loop: crate::autoland::ACTIVE.load(std::sync::atomic::Ordering::Relaxed)
-                    || crate::autotakeoff::ACTIVE.load(std::sync::atomic::Ordering::Relaxed)
-                    || crate::tools::recover::ACTIVE.load(std::sync::atomic::Ordering::Relaxed),
+                critical_loop: crate::flight_state::crew_in_critical_phase(),
                 crew_busy: crate::flow::ACTIVE.load(std::sync::atomic::Ordering::Relaxed)
                     || crate::instructor::active(),
             });
@@ -4930,8 +4917,7 @@ pub async fn run(
                     lon: snap.lon,
                     flap_ratio: snap.flap_ratio,
                     gear_down: snap.gear_down,
-                    automation_flying: snap.automation_flying
-                        || crate::autotakeoff::ACTIVE.load(std::sync::atomic::Ordering::Relaxed),
+                    automation_flying: snap.automation_flying,
                     dest_dist_nm: snap.dest_dist_nm,
                     crashed: voice.crashed(),
                     instructing: crate::mode::instructing(),
@@ -4956,9 +4942,7 @@ pub async fn run(
             // ended. They stand down until the flight resets. And with no
             // crew aboard (ATC-only mode) there is nobody to speak them.
             if crew_on && !voice.crashed() {
-                let flying = snap.automation_flying
-                    || crate::autotakeoff::ACTIVE.load(std::sync::atomic::Ordering::Relaxed)
-                    || crate::tools::recover::ACTIVE.load(std::sync::atomic::Ordering::Relaxed);
+                let flying = snap.automation_flying;
                 if flying {
                     had_flying_control = true;
                     control_idle_since = None;

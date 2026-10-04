@@ -177,10 +177,10 @@ pub async fn load_from_plan(xp: &dyn XPlane, fp: &FlightPlan, what: What) -> Res
         xp.get_float(crate::datarefs::ON_GROUND_ANY),
         xp.get_float(GROUNDSPEED_MS),
     );
-    if !on_ground.is_ok_and(|v| v > 0.5) {
+    if !on_ground.is_ok_and(sim::ground::on_ground) {
         return Ok("Negative. The aircraft is loaded on the ground, not in the air.".to_string());
     }
-    if !gs.is_ok_and(|v| v.abs() < 0.5) {
+    if !gs.is_ok_and(sim::ground::stopped_mps) {
         return Ok("Negative. Stop the aircraft first and I'll load it.".to_string());
     }
 

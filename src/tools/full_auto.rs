@@ -1478,7 +1478,7 @@ impl FullAuto {
             ctx.xplane.get_float(crate::datarefs::FUEL_TOTAL_KG),
             ctx.xplane.get_float(crate::datarefs::PAYLOAD_KG),
         );
-        let stopped = og.is_ok_and(|v| v > 0.5) && gs.is_ok_and(|v| v.abs() < 0.5);
+        let stopped = sim::ground::stopped_on_ground(og.ok(), gs.ok());
         let decision = crate::full_auto::arm_load(
             &fp,
             stopped,

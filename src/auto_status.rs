@@ -201,14 +201,14 @@ pub fn active_managers() -> Vec<String> {
 /// spoken line. Never in [`active_managers`] (they are not tasks, and a
 /// spoken status must not read a heading bug aloud).
 pub fn panel_extras() -> Vec<String> {
-    let flying = procedure::ACTIVE.load(Relaxed)
-        || circuit::ACTIVE.load(Relaxed)
-        || autoland::ACTIVE.load(Relaxed)
-        || autotakeoff::ACTIVE.load(Relaxed)
-        || tools::recover::ACTIVE.load(Relaxed);
-    let mut v = vec![if flying {
+    // The innermost loop flying (`flight_state::crew_flying`): full auto on
+    // its own (between its stages: a start, a taxi) is the mission line. The
+    // helicopter's loops were missing and read "pilot".
+    use crate::flight_state::Owner;
+    let flying = crate::flight_state::crew_flying();
+    let mut v = vec![if flying.is_some_and(|o| o != Owner::FullAuto) {
         "control: copilot flying".to_string()
-    } else if full_auto::ACTIVE.load(Relaxed) {
+    } else if flying == Some(Owner::FullAuto) {
         "control: full auto mission active".to_string()
     } else {
         "control: pilot; check autopilot".to_string()
@@ -280,6 +280,7 @@ pub fn compose() -> String {
 /// things have gone wrong is worse than none; "stop everything, give it to
 /// me" must always be available, and covers the bare speed hold too.
 pub fn cancel_phrase() -> Option<&'static str> {
+    // owners-by-name: each loop has its own cancel words.
     if full_auto::ACTIVE.load(Relaxed) {
         return Some("cancel full auto");
     }
