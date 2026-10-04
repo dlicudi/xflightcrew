@@ -1044,7 +1044,7 @@ mod tests {
 
     /// The pilot's real OFP (EGKK-EGBB, B738, CI 77, FL180), trimmed.
     pub(crate) fn egkk_egbb() -> crate::simbrief::FlightPlan {
-        let ofp = include_str!("../../bench/ofp/egkk-egbb-738.trimmed.json");
+        let ofp = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/bench/ofp/egkk-egbb-738.trimmed.json"));
         let v: Value = serde_json::from_str(ofp).unwrap();
         crate::simbrief::plan_from_ofp(&v).unwrap()
     }

@@ -1285,7 +1285,7 @@ mod tests {
     /// writes before each intervention). Pinned so any change to a verdict is
     /// a changed line here; `xvl debrief` prints the same block from the same
     /// file (asserted below), so the two agree by construction.
-    const LEMG_737: &str = include_str!("../bench/sorties/1790441293-full_auto.trimmed.jsonl");
+    const LEMG_737: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/bench/sorties/1790441293-full_auto.trimmed.jsonl"));
 
     fn records(text: &str) -> Vec<Value> {
         text.lines().filter_map(|l| serde_json::from_str(l).ok()).collect()
@@ -1303,13 +1303,13 @@ mod tests {
     /// 130 (#142).
     const LEMG_31_LANDINGS: [(&str, f64, f64, f64); 2] = [
         (
-            include_str!("../bench/sorties/1790584715-landing.trimmed.jsonl"),
+            include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/bench/sorties/1790584715-landing.trimmed.jsonl")),
             105.0,
             5.9,
             1790585602.0,
         ),
         (
-            include_str!("../bench/sorties/1790585651-landing.trimmed.jsonl"),
+            include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/bench/sorties/1790585651-landing.trimmed.jsonl")),
             130.0,
             9.7,
             1790586567.9,
@@ -1394,7 +1394,7 @@ mod tests {
     /// `brake_yield` 0.5 s later on the crew's own brake command, logged as
     /// an intervention: the takeoff still fails, the sortie has no hand in it.
     const EGKK_737_REJECT: &str =
-        include_str!("../bench/sorties/1790524628-full_auto.trimmed.jsonl");
+        include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/bench/sorties/1790524628-full_auto.trimmed.jsonl"));
 
     #[test]
     fn the_recorded_egkk_reject_scores_as_pinned() {
@@ -1446,7 +1446,7 @@ mod tests {
     /// The takeoff is a real failure: the heading held within 0.3 degrees
     /// of its target while a 0.65 degree drift carried the wheels 5.7 m
     /// right by liftoff (`autotakeoff::DriftFilter`).
-    const EGBB_737: &str = include_str!("../bench/sorties/1790534902-full_auto.trimmed.jsonl");
+    const EGBB_737: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/bench/sorties/1790534902-full_auto.trimmed.jsonl"));
 
     #[test]
     fn the_recorded_egbb_sortie_scores_as_pinned() {
@@ -1963,7 +1963,7 @@ mod tests {
     /// in circles to 21,882 ft and the deadline ended the sortie there. Live
     /// it was written PASS on its alignment and takeoff.
     const LEMG_SF50_CIRCUIT: &str =
-        include_str!("../bench/sorties/1790607325-full_auto.trimmed.jsonl");
+        include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/bench/sorties/1790607325-full_auto.trimmed.jsonl"));
 
     #[test]
     fn a_mission_that_ends_in_the_air_never_passes() {

@@ -1326,7 +1326,7 @@ mod tests {
     /// Five recorded landings (bench/landings, slim `state` records): a
     /// pilot's, two full-auto circuits (one with a go-around), a hard one on
     /// a flight joined in the air, and a contact the vario read climbing.
-    const LANDINGS: &str = include_str!("../bench/landings/rapport_landings.jsonl");
+    const LANDINGS: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/bench/landings/rapport_landings.jsonl"));
 
     /// Replay the recorded landings through the rapport, chatty, and write
     /// down every touchdown it booked and every line it said. Each window

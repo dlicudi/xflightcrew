@@ -2215,7 +2215,7 @@ mod tests {
     /// +1748.9. The height lost over the window is the descent.
     #[test]
     fn a_sawtooth_descent_from_the_top_is_a_descent() {
-        const TOD: &str = include_str!("../bench/flight/egkk_egbb_top_of_descent.jsonl");
+        const TOD: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/bench/flight/egkk_egbb_top_of_descent.jsonl"));
         let t0 = 1790624015.0;
         let mut r = Replay::default();
         let mut went_down: Option<(f64, f64)> = None;

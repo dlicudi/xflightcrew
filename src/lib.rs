@@ -15,6 +15,8 @@ pub mod phrase;
 pub mod prefs;
 pub mod radiofx;
 pub mod stt;
+// Test-only (the file's own `#![cfg(test)]`).
+mod test_support;
 pub mod tts;
 #[cfg(feature = "onnx-tts")]
 pub mod tts_onnx;

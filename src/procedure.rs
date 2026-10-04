@@ -6395,7 +6395,7 @@ mod tests {
     #[test]
     fn a_star_window_is_judged_on_the_climb_flown() {
         let recs: Vec<serde_json::Value> =
-            include_str!("../bench/follower/egkk_lam5p_held_6000.jsonl")
+            include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/bench/follower/egkk_lam5p_held_6000.jsonl"))
                 .lines()
                 .filter_map(|l| serde_json::from_str(l).ok())
                 .collect();
@@ -7468,7 +7468,7 @@ mod tests {
     /// 2026-09-28), its navlog as the fetcher builds the waypoints.
     fn egkk_egbb() -> (Vec<crate::simbrief::Waypoint>, crate::simbrief::CruiseSchedule) {
         let v: serde_json::Value =
-            serde_json::from_str(include_str!("../bench/ofp/egkk-egbb-738.trimmed.json")).unwrap();
+            serde_json::from_str(include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/bench/ofp/egkk-egbb-738.trimmed.json"))).unwrap();
         let n = |f: &serde_json::Value, k: &str| f[k].as_str().unwrap().parse::<f64>().unwrap();
         let mut wps: Vec<_> = v["navlog"]["fix"]
             .as_array()
@@ -7649,7 +7649,7 @@ mod departure_minimum_tests {
     use super::*;
     use crate::nav::ClimbMinimum;
 
-    const HUNT: &str = include_str!("../bench/follower/egkk_lam5p_minimum_hunt.jsonl");
+    const HUNT: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/bench/follower/egkk_lam5p_minimum_hunt.jsonl"));
 
     fn records() -> Vec<serde_json::Value> {
         HUNT.lines().filter_map(|l| serde_json::from_str(l).ok()).collect()

@@ -4600,7 +4600,7 @@ pub fn spoken_height_ft(agl_ft: f64) -> String {
 /// this module's tests and the circuit's (#150).
 #[cfg(test)]
 pub(crate) mod climb_out_bench {
-    const LEMG13: &str = include_str!("../bench/takeoffs/lemg13_circuit_climb_outs.jsonl");
+    const LEMG13: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/bench/takeoffs/lemg13_circuit_climb_outs.jsonl"));
 
     /// One climb-out as the blackbox drew it: `autotakeoff` `climb_manual`
     /// (t, agl, ias), the `ap_engaged` tick (t, agl, ias, cmd_vs), every VS
@@ -5937,7 +5937,7 @@ mod tests {
     /// 50 kt) never throw it past a degree.
     #[test]
     fn the_drift_is_read_off_the_recorded_egbb_roll() {
-        const EGBB: &str = include_str!("../bench/sorties/1790534902-full_auto.trimmed.jsonl");
+        const EGBB: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/bench/sorties/1790534902-full_auto.trimmed.jsonl"));
         let ticks: Vec<serde_json::Value> = EGBB
             .lines()
             .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
@@ -5992,7 +5992,7 @@ mod tests {
     /// The 737 rolls of 2026-09-28 (bench/takeoffs, every `roll` tick of
     /// EGKK 08R 1790601822 and the seven LEMG 13 circuits), one Vec per roll.
     fn rolls_0928() -> Vec<(String, Vec<serde_json::Value>)> {
-        const TEXT: &str = include_str!("../bench/takeoffs/b738_rolls_2026-09-28.jsonl");
+        const TEXT: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/bench/takeoffs/b738_rolls_2026-09-28.jsonl"));
         let mut rolls: Vec<(String, Vec<serde_json::Value>)> = Vec::new();
         for r in TEXT
             .lines()
@@ -6302,7 +6302,7 @@ mod tests {
     /// The SR22's LEMG 13 roll of 2026-09-29 (sortie 1790677606-full_auto),
     /// every `roll` tick from brake release to the reject.
     fn sr22_roll_0929() -> Vec<serde_json::Value> {
-        const TEXT: &str = include_str!("../bench/takeoffs/sr22_roll_lemg13_2026-09-29.jsonl");
+        const TEXT: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/bench/takeoffs/sr22_roll_lemg13_2026-09-29.jsonl"));
         TEXT.lines()
             .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
             .collect()
@@ -6411,7 +6411,7 @@ mod tests {
     /// them.
     fn sr22_rudder_roll_0929() -> Vec<serde_json::Value> {
         const TEXT: &str =
-            include_str!("../bench/takeoffs/sr22_roll_lemg13_rudder_2026-09-29.jsonl");
+            include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/bench/takeoffs/sr22_roll_lemg13_rudder_2026-09-29.jsonl"));
         TEXT.lines()
             .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
             .filter(|r| r["t"].as_f64().is_some_and(|t| t <= SR22_RUDDER_WHEELS_OFF_T))
@@ -6598,15 +6598,15 @@ mod tests {
         vec![
             (
                 "1790712974",
-                ld(include_str!("../bench/takeoffs/evolution_roll_lilb03_1790712974.jsonl")),
+                ld(include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/bench/takeoffs/evolution_roll_lilb03_1790712974.jsonl"))),
             ),
             (
                 "1790724857",
-                ld(include_str!("../bench/takeoffs/evolution_roll_lilb03_1790724857.jsonl")),
+                ld(include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/bench/takeoffs/evolution_roll_lilb03_1790724857.jsonl"))),
             ),
             (
                 "1790736651",
-                ld(include_str!("../bench/takeoffs/evolution_roll_lilb03_1790736651.jsonl")),
+                ld(include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/bench/takeoffs/evolution_roll_lilb03_1790736651.jsonl"))),
             ),
         ]
     }
@@ -7396,7 +7396,7 @@ mod tests {
     /// and 1790690995 at the airline 2.5, 1790694884 at the declared 5.
     fn sr22_rotations() -> Vec<(&'static str, Option<f64>, Vec<RotTick>)> {
         let recs: Vec<serde_json::Value> =
-            include_str!("../bench/takeoffs/sr22_rotation_lemg_2026-09-29.jsonl")
+            include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/bench/takeoffs/sr22_rotation_lemg_2026-09-29.jsonl"))
                 .lines()
                 .filter_map(|l| serde_json::from_str(l).ok())
                 .collect();
@@ -7841,7 +7841,7 @@ mod tests {
     /// The rotation records of 1790699819 (`rotate_tick`: the column and the
     /// model's share, the wheels).
     fn sr22_float_ticks() -> Vec<serde_json::Value> {
-        include_str!("../bench/takeoffs/sr22_float_lemg13_1790699819.jsonl")
+        include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/bench/takeoffs/sr22_float_lemg13_1790699819.jsonl"))
             .lines()
             .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
             .filter(|r| r["event"] == "rotate_tick")
@@ -8388,7 +8388,7 @@ mod tests {
 
     fn egkk_ticks() -> (ClimbHold, Vec<EgkkTick>) {
         let recs: Vec<serde_json::Value> =
-            include_str!("../bench/takeoffs/egkk08r_climb_hold.jsonl")
+            include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/bench/takeoffs/egkk08r_climb_hold.jsonl"))
                 .lines()
                 .filter_map(|l| serde_json::from_str(l).ok())
                 .collect();

@@ -4483,20 +4483,19 @@ mod tests {
             ),
         ];
 
-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
         let files = [
-            ("autotakeoff", root.join("autotakeoff.rs")),
-            ("autotaxi", root.join("autotaxi.rs")),
-            ("autoland", root.join("autoland.rs")),
-            ("circuit", root.join("circuit.rs")),
-            ("procedure", root.join("procedure.rs")),
-            ("pushback", root.join("pushback.rs")),
-            ("taxi_in", root.join("taxi_in.rs")),
-            ("speedhold", root.join("tools").join("speedhold.rs")),
+            ("autotakeoff", "autotakeoff"),
+            ("autotaxi", "autotaxi"),
+            ("autoland", "autoland"),
+            ("circuit", "circuit"),
+            ("procedure", "procedure"),
+            ("pushback", "pushback"),
+            ("taxi_in", "taxi_in"),
+            ("speedhold", "tools/speedhold"),
         ];
         let mut found = Vec::new();
         for (module, path) in &files {
-            let text = std::fs::read_to_string(path).unwrap();
+            let text = crate::test_support::module_source(path);
             for line in text.lines() {
                 // Laws only, and a law is declared at the top level. A
                 // constant indented inside a function is that test's or that

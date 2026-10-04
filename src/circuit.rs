@@ -8845,7 +8845,7 @@ mod pattern_guard_tests {
     /// handed to nobody: the give-up finds it unflyable and recovers.
     #[test]
     fn the_servos_out_give_up_at_73_kt_is_a_recovery() {
-        let src = include_str!("../bench/sorties/1790649043-full_auto.trimmed.jsonl");
+        let src = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/bench/sorties/1790649043-full_auto.trimmed.jsonl"));
         let rows: Vec<Value> = src.lines().filter_map(|l| serde_json::from_str(l).ok()).collect();
         let guard = rows
             .iter()
@@ -8876,7 +8876,7 @@ mod pattern_guard_tests {
         assert!(!trip.words().contains('\u{2014}'));
     }
 
-    const SORTIE: &str = include_str!("../bench/sorties/1790607325-full_auto.trimmed.jsonl");
+    const SORTIE: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/bench/sorties/1790607325-full_auto.trimmed.jsonl"));
     /// The sortie's begin.
     const T0: f64 = 1790607325.1;
     /// As armed: LEMG 13, left hand, raised for terrain.

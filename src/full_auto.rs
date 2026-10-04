@@ -7101,7 +7101,7 @@ mod runway_start_tests {
         assert!(strip_clearance_held("13", Some("13"), Some(4501)));
         // The zone request from the strip goes before the under-clearance
         // judgement; an IFR flight keeps its own clearance path.
-        let src = include_str!("full_auto.rs");
+        let src = crate::test_support::module_source("full_auto");
         let strip = src
             .find("zone_clearance_from_the_strip(&xp, &ctx")
             .expect("the runway start asks from the strip");
@@ -7156,7 +7156,7 @@ mod runway_start_tests {
         );
         // The ready call's answer for the reciprocal is flown the same way,
         // once, before the taxi fallback.
-        let src = include_str!("full_auto.rs");
+        let src = crate::test_support::module_source("full_auto");
         let ready = src.find("ClearanceWait::OtherRunway(cleared) => {").unwrap();
         let bt = src[ready..].find("backtrack_from_runway_start(").unwrap();
         let taxi = src[ready..].find("other_runway_line(&on, &cleared)").unwrap();
@@ -7214,7 +7214,7 @@ mod runway_start_tests {
     /// Read from the source: the wait itself needs a live party line.
     #[test]
     fn the_runway_start_waits_with_its_own_runway() {
-        let src = include_str!("full_auto.rs");
+        let src = crate::test_support::module_source("full_auto");
         let wait = src
             .find("async fn ensure_takeoff_cleared(")
             .expect("the wait");
@@ -7235,7 +7235,7 @@ mod runway_start_tests {
     /// the orchestration is async over the live sim.
     #[test]
     fn the_arm_asks_for_a_backtrack_before_a_taxi() {
-        let src = include_str!("full_auto.rs");
+        let src = crate::test_support::module_source("full_auto");
         let start = src.find("let mut start = runway_start(").expect("the arm classifies");
         let backtrack = src.find("backtrack_from_runway_start(&xp").expect("a short start backtracks");
         let taxi = src.find("event(\"request_taxi\"").expect("the taxi request");
@@ -7440,7 +7440,7 @@ mod tests {
     /// clearance's ceiling is not put back over a check-in made inside it.
     #[test]
     fn the_takeoff_wait_takes_the_departure_handoff() {
-        let src = include_str!("full_auto.rs");
+        let src = crate::test_support::module_source("full_auto");
         let body = src.split("async fn fly_route(").nth(1).expect("fly_route");
         let takeoff = body.split("event(\"airborne\"").next().unwrap();
         assert!(takeoff.contains("wait_takeoff_working_the_radio("));
@@ -7502,7 +7502,7 @@ mod tests {
         assert!(line.contains("EGKK") && line.contains("LEMG"), "{line}");
         assert!(!line.contains('\u{2014}') && !line.contains('\u{2013}'));
         // The check comes before the mission asks the tower for anything.
-        let src = include_str!("full_auto.rs");
+        let src = crate::test_support::module_source("full_auto");
         let check = src.find("if let Err(line) = departure_station(&xp).await").unwrap();
         let towered = src.find("let towered = crate::mode::atc_enabled()").unwrap();
         let callsign = src.find("let callsign = crate::circuit::crew_callsign(&xp).await;\n\n    // On a Flight").unwrap();
@@ -7989,7 +7989,7 @@ mod tests {
     /// (source-pinned: the wait is not a plain test).
     #[test]
     fn an_airborne_autoland_end_is_held_not_ended() {
-        let src = include_str!("full_auto.rs");
+        let src = crate::test_support::module_source("full_auto");
         let body = src
             .split("async fn taxi_in_after_landing(")
             .nth(1)
@@ -8467,7 +8467,7 @@ mod tests {
     #[test]
     fn the_filed_route_clears_the_sid_the_crew_flies_at_egkk() {
         let v: serde_json::Value =
-            serde_json::from_str(include_str!("../bench/ofp/egkk-egbb-738.trimmed.json")).unwrap();
+            serde_json::from_str(include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/bench/ofp/egkk-egbb-738.trimmed.json"))).unwrap();
         let mut p = plan(false);
         p.origin = "EGKK".into();
         p.destination = "EGBB".into();
@@ -8479,7 +8479,7 @@ mod tests {
         let filed = super::filed_route_of(Some(&p)).unwrap();
         assert_eq!(filed.fixes.first().map(String::as_str), Some("D257B"));
         assert_eq!(filed.fixes.last().map(String::as_str), Some("GROVE"), "the fields left out");
-        let cifp = include_str!("../crates/atc/bench/cifp/EGKK_sids.dat");
+        let cifp = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/crates/atc/bench/cifp/EGKK_sids.dat"));
         let tower = crate::nav::sid_for_filed_route_in(cifp.lines(), "08R", &filed.fixes, filed.sid.as_deref())
             .unwrap();
         assert_eq!(tower.ident, "LAM5P");
@@ -8520,7 +8520,7 @@ mod tests {
     #[test]
     fn a_rechosen_sid_is_flown_at_the_plans_levels() {
         let ofp: serde_json::Value =
-            serde_json::from_str(include_str!("../bench/ofp/egkk-egbb-738.trimmed.json")).unwrap();
+            serde_json::from_str(include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/bench/ofp/egkk-egbb-738.trimmed.json"))).unwrap();
         let num = |f: &serde_json::Value, k: &str| f[k].as_str().unwrap().parse::<f64>().unwrap();
         let wps: Vec<crate::simbrief::Waypoint> = ofp["navlog"]["fix"]
             .as_array()
@@ -8535,7 +8535,7 @@ mod tests {
             })
             .collect();
         let plan = crate::procedure::enroute_legs(&wps, "EGKK", "EGBB", 18_000.0);
-        let cifp = include_str!("../crates/atc/bench/cifp/EGKK_sids.dat");
+        let cifp = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/crates/atc/bench/cifp/EGKK_sids.dat"));
         let mut chart = crate::nav::parse_proc_legs(
             cifp.lines(),
             crate::nav::ProcKind::Sid,
@@ -8552,7 +8552,7 @@ mod tests {
         let ids: Vec<&str> = raw.iter().map(|l| l.fix_ident.as_str()).collect();
         assert_eq!(ids[1..], ["D258T", "ACORN", "D156O", "D156J", "LAM"]);
         let recs: Vec<serde_json::Value> =
-            include_str!("../bench/follower/egkk_lam5p_held_6000.jsonl")
+            include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/bench/follower/egkk_lam5p_held_6000.jsonl"))
                 .lines()
                 .filter_map(|l| serde_json::from_str(l).ok())
                 .collect();

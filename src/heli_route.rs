@@ -3670,9 +3670,7 @@ mod tests {
         // One radio crew, not two: the aeroplane and the helicopter get the
         // zone clearance and take both handoffs through the same functions.
         // The S-76 once flew EDVW-ETND on a takeoff clearance alone.
-        let src = |f: &str| {
-            std::fs::read_to_string(format!("{}/src/{f}", env!("CARGO_MANIFEST_DIR"))).unwrap()
-        };
+        let src = |f: &str| crate::test_support::module_source(f.trim_end_matches(".rs")).to_string();
         for (file, calls) in [
             (
                 "full_auto.rs",

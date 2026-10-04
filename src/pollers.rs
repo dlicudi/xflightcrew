@@ -735,7 +735,7 @@ mod tests {
         assert!(!queue_command(&tx, "stop".into()));
         assert!(!command_waiting());
 
-        let main = include_str!("main.rs");
+        let main = crate::test_support::module_source("main");
         // #167: and to an armed station swap (`loop_owed`), which only the
         // loop installs.
         assert!(main.contains("say_or(voice, reporter, kind, line, || loop_owed(false))"));

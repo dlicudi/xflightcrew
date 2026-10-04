@@ -87,6 +87,8 @@ mod taxi_guide;
 mod taxi_in;
 mod tempo;
 mod terrain;
+// Test-only (the file's own `#![cfg(test)]`), as `free_nose_replay` above.
+mod test_support;
 mod tools;
 mod tts;
 #[cfg(feature = "onnx-tts")]
@@ -6678,7 +6680,7 @@ mod shortcut_tests {
     /// cannot see.
     #[test]
     fn the_loop_asks_every_shortcut_in_order() {
-        let src = include_str!("main.rs");
+        let src = crate::test_support::module_source("main");
         let start = src.find("async fn run_session(").expect("the command loop");
         let end = start + src[start..].find("\n}\n").expect("its end");
         let body = &src[start..end];

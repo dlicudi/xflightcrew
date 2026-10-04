@@ -3857,6 +3857,50 @@ pub fn shape_problems(read: &dyn Fn(&str) -> Option<String>) -> Vec<String> {
     out
 }
 
+/// A test-only source file by its path: `tests.rs`, `*_tests.rs` or under
+/// a `tests/` directory. A test module moved to its own file carries no
+/// `#[cfg(test)]` of its own, so its words are not the app's.
+fn is_test_source(path: &str) -> bool {
+    path.ends_with("/tests.rs") || path.ends_with("_tests.rs") || path.contains("/tests/")
+}
+
+/// A file's text before its first test module (where [`code_of`] cuts).
+fn live_part(text: &str) -> &str {
+    let mut from = 0;
+    while let Some(i) = text[from..].find("#[cfg(test)]") {
+        let at = from + i;
+        let rest = text[at + "#[cfg(test)]".len()..].trim_start();
+        if rest.starts_with("mod") {
+            return &text[..at];
+        }
+        from = at + 1;
+    }
+    text
+}
+
+/// A module's live text by its file's path (`src/full_auto.rs`): the file
+/// itself, or, once the module is a directory too, the live part of the
+/// file and of each non-test file under `src/full_auto/`, so a producer
+/// that moved to a submodule is still found. `sources`: (path, text).
+fn module_text(path: &str, sources: &[(String, String)]) -> Option<String> {
+    let own = sources.iter().find(|(p, _)| p == path).map(|(_, t)| t)?;
+    let dir = format!("{}/", path.trim_end_matches(".rs"));
+    let mut subs: Vec<&(String, String)> = sources
+        .iter()
+        .filter(|(p, _)| p.starts_with(&dir) && !is_test_source(p))
+        .collect();
+    if subs.is_empty() {
+        return Some(own.clone());
+    }
+    subs.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut text = live_part(own).to_string();
+    for (_, t) in subs {
+        text.push('\n');
+        text.push_str(live_part(t));
+    }
+    Some(text)
+}
+
 /// Every `.rs` file under the checkout's `src/` and `crates/`, by its path
 /// from the root (`None`: not run from a checkout).
 fn checkout_sources() -> Option<Vec<(String, String)>> {
@@ -3869,8 +3913,12 @@ fn checkout_sources() -> Option<Vec<(String, String)>> {
             if p.is_dir() && p.file_name().is_some_and(|n| n != "target") {
                 walk(&p, out);
             } else if p.extension().is_some_and(|x| x == "rs") {
+                let path = p.to_string_lossy().replace('\\', "/");
+                if is_test_source(&path) {
+                    continue;
+                }
                 if let Ok(t) = std::fs::read_to_string(&p) {
-                    out.push((p.to_string_lossy().replace('\\', "/"), t));
+                    out.push((path, t));
                 }
             }
         }
@@ -3945,11 +3993,7 @@ async fn check_cmd(spec_path: &str) -> Result<bool> {
     }
     match checkout_sources() {
         Some(src) => {
-            let read = |p: &str| {
-                src.iter()
-                    .find(|(path, _)| path == p)
-                    .map(|(_, t)| t.clone())
-            };
+            let read = |p: &str| module_text(p, &src);
             let problems: Vec<String> = shape_problems(&read)
                 .into_iter()
                 .chain(spec_word_problems(&spec, &src))
@@ -4143,7 +4187,7 @@ fn chrono_stamp() -> String {
 mod tests {
     use super::*;
 
-    const LEMG: &str = include_str!("../bench/sorties/lemg-737.yaml");
+    const LEMG: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/bench/sorties/lemg-737.yaml"));
 
     /// Every shipped spec, parsed against the install when there is one
     /// (a machine without X-Plane checks the shapes, not the paths).
@@ -4345,8 +4389,11 @@ cases:
         assert!(table.ends_with("3 problems in 13 lines.\n"), "{table}");
     }
 
+    /// A producer's text as `--check` reads it (the module, a directory
+    /// included), the checkout walked once.
     fn source(path: &str) -> Option<String> {
-        std::fs::read_to_string(path).ok()
+        static SOURCES: std::sync::OnceLock<Vec<(String, String)>> = std::sync::OnceLock::new();
+        module_text(path, SOURCES.get_or_init(|| checkout_sources().unwrap()))
     }
 
     /// Every record shape the runner matches on is one the app writes, at
@@ -6100,7 +6147,7 @@ cases:
     #[test]
     fn an_enroute_point_is_checked_on_the_plan() {
         let v: Value =
-            serde_json::from_str(include_str!("../bench/ofp/egkk-egbb-738.trimmed.json")).unwrap();
+            serde_json::from_str(include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/bench/ofp/egkk-egbb-738.trimmed.json"))).unwrap();
         let fp = crate::simbrief::plan_from_ofp(&v).unwrap();
         let facts = PlanFacts::of(&fp);
         assert!(facts.has_tod && facts.fixes.contains(&"WELIN".to_string()));

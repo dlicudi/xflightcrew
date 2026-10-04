@@ -9260,7 +9260,7 @@ mod tests {
 
     fn baron_flare_power() -> crate::aircraft::FlarePowerProfile {
         let profile: crate::aircraft::AircraftProfile =
-            serde_yaml::from_str(include_str!("../profiles/beechcraft_baron_58.yaml")).unwrap();
+            serde_yaml::from_str(include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/profiles/beechcraft_baron_58.yaml"))).unwrap();
         profile.flare_power.unwrap()
     }
 
@@ -13210,7 +13210,7 @@ mod approach_power_floor_tests {
         assert_eq!(super::arm_gate(), GateKind::Instrument);
         assert_eq!(super::landed_runway(), None);
 
-        let src = include_str!("autoland.rs");
+        let src = crate::test_support::module_source("autoland");
         let body = src
             .split("fn spawn_autoland(launch: AutolandLaunch)")
             .nth(1)
@@ -13234,7 +13234,7 @@ mod approach_power_floor_tests {
     /// "Your aircraft" (source-pinned: the loop is not a plain test).
     #[test]
     fn an_unflyable_missed_procedure_is_never_your_aircraft() {
-        let src = include_str!("autoland.rs");
+        let src = crate::test_support::module_source("autoland");
         let body = src
             .split("if wanted && steep {")
             .nth(1)
@@ -13245,7 +13245,7 @@ mod approach_power_floor_tests {
         assert!(!body.contains("Your aircraft"), "no hand-back to nobody");
         assert!(body.contains("missed_procedure_tried = true"), "asked once");
         assert!(src.contains("let steep = published_steep() && !missed_procedure_tried;"));
-        let circuit = include_str!("circuit.rs");
+        let circuit = crate::test_support::module_source("circuit");
         assert!(circuit.contains("set_next_circuit_glidepath_deg(Some(descent_shape"));
         assert!(!circuit.contains("autoland::set_next_glidepath_deg("));
     }
@@ -14093,10 +14093,10 @@ mod lemg_737_flare_tests {
     /// Three recorded LEMG 13 finals (the autoland ticks from 400 ft to the
     /// wheels, and the flight model's touchdown): 1790589309 (422 fpm) and
     /// 1790589773 (335) in gusts, 1790588609 (236) in calm air.
-    const LEMG_13_FLARES: &str = include_str!("../bench/landings/lemg13_gusty_flares.jsonl");
+    const LEMG_13_FLARES: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/bench/landings/lemg13_gusty_flares.jsonl"));
     /// The other thirteen LEMG 13 approaches of that night's build (sorties
     /// 1790586843 to 1790590296, 225 to 315 fpm), the same fields.
-    const LEMG_13_CALM_FLARES: &str = include_str!("../bench/landings/lemg13_calm_flares.jsonl");
+    const LEMG_13_CALM_FLARES: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/bench/landings/lemg13_calm_flares.jsonl"));
     /// Every one of the sixteen, in order.
     const LEMG_13_SORTIES: [&str; 16] = [
         "1790586843",
@@ -14122,7 +14122,7 @@ mod lemg_737_flare_tests {
     /// touchdown (288 fpm). Rough air (41 fpm rms); the column held 0.28
     /// through a float at 22.7 ft, eased to 0.20 at +1 fpm; the lever stayed
     /// 0.30 from the flare to 2.3 ft (retard keys height, time, slow).
-    const EGBB_15_FLOAT: &str = include_str!("../bench/landings/egbb15_rough_float.jsonl");
+    const EGBB_15_FLOAT: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/bench/landings/egbb15_rough_float.jsonl"));
 
     /// EGBB 15's own flare, fitted open loop to the recorded elevator, lever
     /// and speed from the arrest gate to the wheels (36 fpm rms): a strong
@@ -14570,7 +14570,7 @@ mod lemg_737_flare_tests {
     /// Every autoland tick's bug (true) from four LEMG 13 approaches of
     /// 2026-09-28, the arm to the wheels (two 5 nm finals, one with an
     /// intercept, and a full-auto circuit's final).
-    const LEMG_13_FINAL_KNOBS: &str = include_str!("../bench/landings/lemg13_final_knobs.jsonl");
+    const LEMG_13_FINAL_KNOBS: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/bench/landings/lemg13_final_knobs.jsonl"));
 
     /// Issue #93: those approaches' bugs replayed through the knob autoland
     /// now sets (`bug_knob`): the knob moved (0.2 degrees or more, the least
@@ -17065,9 +17065,9 @@ mod lemg13_sr22_bounce_tests {
     use super::*;
 
     const FLOWN: [&str; 3] = [
-        include_str!("../bench/landings/sr22_lemg13_flare_1790701546.jsonl"),
-        include_str!("../bench/landings/sr22_lemg13_flare_1790702352.jsonl"),
-        include_str!("../bench/landings/sr22_lemg13_flare_1790702623.jsonl"),
+        include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/bench/landings/sr22_lemg13_flare_1790701546.jsonl")),
+        include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/bench/landings/sr22_lemg13_flare_1790702352.jsonl")),
+        include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/bench/landings/sr22_lemg13_flare_1790702623.jsonl")),
     ];
     /// The recorded first hops over the runway (ft): the peak between the
     /// first contact and the second, and between the second and the third.
@@ -17786,10 +17786,10 @@ mod lemg13_sr22_bounce_tests {
     mod lilb03_evolution {
         use super::*;
 
-        const SRC: &str = include_str!("../bench/landings/evolution_lilb03_flare_1790740292.jsonl");
+        const SRC: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/bench/landings/evolution_lilb03_flare_1790740292.jsonl"));
         const MODEL_SRC: [&str; 2] = [
-            include_str!("../bench/landings/evolution_lilb_model_flare_1790793076.jsonl"),
-            include_str!("../bench/landings/evolution_lilb_model_flare_1790781114.jsonl"),
+            include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/bench/landings/evolution_lilb_model_flare_1790793076.jsonl")),
+            include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/bench/landings/evolution_lilb_model_flare_1790781114.jsonl")),
         ];
 
         /// The first fit, to the tracker's flare alone (radio 0.66 ft rms,
@@ -18114,14 +18114,14 @@ mod lemg13_sr22_bounce_tests {
         use super::*;
 
         const SRC: [&str; 3] = [
-            include_str!("../bench/landings/king_air_lemg13_landing_1790757702.jsonl"),
-            include_str!("../bench/landings/king_air_lemg13_landing_1790758429.jsonl"),
-            include_str!("../bench/landings/king_air_lemg13_landing_1790758604.jsonl"),
+            include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/bench/landings/king_air_lemg13_landing_1790757702.jsonl")),
+            include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/bench/landings/king_air_lemg13_landing_1790758429.jsonl")),
+            include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/bench/landings/king_air_lemg13_landing_1790758604.jsonl")),
         ];
         const MODEL_SRC: [&str; 3] = [
-            include_str!("../bench/landings/king_air_lemg13_model_flare_1790798381.jsonl"),
-            include_str!("../bench/landings/king_air_lemg13_model_flare_1790798581.jsonl"),
-            include_str!("../bench/landings/king_air_lemg13_model_flare_1790798781.jsonl"),
+            include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/bench/landings/king_air_lemg13_model_flare_1790798381.jsonl")),
+            include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/bench/landings/king_air_lemg13_model_flare_1790798581.jsonl")),
+            include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/bench/landings/king_air_lemg13_model_flare_1790798781.jsonl")),
         ];
 
         /// The autopilot's column at each gate (fitted with the plant): the
@@ -18685,8 +18685,8 @@ mod lemg13_sr22_rollout_split_tests {
         }
     }
 
-    const FLOWN_1: &str = include_str!("../bench/landings/sr22_lemg13_rollout_1790689843.jsonl");
-    const FLOWN_2: &str = include_str!("../bench/landings/sr22_lemg13_rollout_1790694457.jsonl");
+    const FLOWN_1: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/bench/landings/sr22_lemg13_rollout_1790689843.jsonl"));
+    const FLOWN_2: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/bench/landings/sr22_lemg13_rollout_1790694457.jsonl"));
     /// LEMG 13's true course, as in the 2026-09-28 record.
     const COURSE: f64 = 131.69;
 
@@ -19677,9 +19677,9 @@ mod lemg13_king_air_rollout_tests {
     use super::*;
 
     const SRC: [&str; 3] = [
-        include_str!("../bench/landings/king_air_lemg13_landing_1790757702.jsonl"),
-        include_str!("../bench/landings/king_air_lemg13_landing_1790758429.jsonl"),
-        include_str!("../bench/landings/king_air_lemg13_landing_1790758604.jsonl"),
+        include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/bench/landings/king_air_lemg13_landing_1790757702.jsonl")),
+        include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/bench/landings/king_air_lemg13_landing_1790758429.jsonl")),
+        include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/bench/landings/king_air_lemg13_landing_1790758604.jsonl")),
     ];
     /// The loop's tick on the iMac's rollouts.
     const TICK_S: f64 = 0.45;
@@ -19971,7 +19971,7 @@ mod lemg13_king_air_rollout_tests {
 mod lemg13_king_air_roundout_tests {
     use super::*;
 
-    const SRC: &str = include_str!("../bench/landings/king_air_lemg13_roundouts.jsonl");
+    const SRC: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/bench/landings/king_air_lemg13_roundouts.jsonl"));
 
     struct Tick {
         t: f64,

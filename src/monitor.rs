@@ -5699,7 +5699,7 @@ mod tests {
     /// refactor that moves it back in brings issue #63 back.
     #[test]
     fn the_compliance_tick_is_not_under_the_quiet_gate() {
-        let src = include_str!("monitor.rs");
+        let src = crate::test_support::module_source("monitor");
         let tick = src
             .find("crate::station::compliance_tick_facing(")
             .expect("call site");
@@ -5723,7 +5723,7 @@ mod tests {
     /// sites sit ahead of that block, under the compliance gate.
     #[test]
     fn the_landing_runway_watch_is_not_under_the_quiet_gate() {
-        let all = include_str!("monitor.rs");
+        let all = crate::test_support::module_source("monitor");
         let src = &all[..all.find("\nmod tests {").expect("tests")];
         let quiet_block = src.find("            if !quiet {\n").expect("world block");
         for call in [
@@ -7014,7 +7014,7 @@ mod tests {
     #[test]
     fn a_real_plans_ring_is_reached_at_its_own_top_of_descent() {
         let v: serde_json::Value =
-            serde_json::from_str(include_str!("../bench/ofp/egkk-egbb-738.trimmed.json")).unwrap();
+            serde_json::from_str(include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/bench/ofp/egkk-egbb-738.trimmed.json"))).unwrap();
         let fp = crate::simbrief::plan_from_ofp(&v).unwrap();
         let route: Vec<(f64, f64)> = fp.waypoints.iter().map(|w| (w.lat, w.lon)).collect();
         assert!((fp.tod_to_dest_nm - 61.0).abs() < 0.5, "{}", fp.tod_to_dest_nm);
