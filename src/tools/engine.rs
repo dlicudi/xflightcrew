@@ -355,9 +355,7 @@ pub static LEAN_SEEKING: std::sync::atomic::AtomicBool = std::sync::atomic::Atom
 /// mixture back, or a recovery/autoland owns the levers now.
 fn lean_seek_cancelled() -> bool {
     use std::sync::atomic::Ordering;
-    !LEAN_SEEKING.load(Ordering::Relaxed)
-        || super::recover::ACTIVE.load(Ordering::Relaxed)
-        || crate::autoland::ACTIVE.load(Ordering::Relaxed)
+    !LEAN_SEEKING.load(Ordering::Relaxed) || crate::flight_state::crew_landing_or_recovering()
 }
 
 /// One-line status for the dashboard's "managing" panel, when a lean seek is
@@ -432,9 +430,7 @@ async fn mixture_manager(xp: crate::xplane::XPlaneClient) {
         if !MIX_MANAGED.load(Ordering::Relaxed) {
             break;
         }
-        if super::recover::ACTIVE.load(Ordering::Relaxed)
-            || crate::autoland::ACTIVE.load(Ordering::Relaxed)
-        {
+        if crate::flight_state::crew_landing_or_recovering() {
             // Whoever owns the levers now wants them rich (a recovery, a
             // landing): a lever the manager leaned is pushed back up on the
             // way out, never left lean under an approach.

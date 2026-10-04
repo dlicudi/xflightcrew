@@ -639,6 +639,7 @@ async fn route(tool: &Hover, args: &Value, ctx: &ToolCtx<'_>) -> Result<String> 
         return Ok("I'm already flying. Say hold position first.".to_string());
     }
     let from_cold = on_ground && !running_all(ctx).await;
+    // owners-by-name: a hover it holds is the route's to take, the others refuse.
     if crate::heli_route::ACTIVE.load(std::sync::atomic::Ordering::SeqCst)
         || crate::heli_circuit::ACTIVE.load(std::sync::atomic::Ordering::SeqCst)
     {

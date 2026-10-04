@@ -2398,6 +2398,7 @@ async fn run_session(
             // giving it back. Naming a lever releases just that one; a generic
             // "my controls" / "let go" releases everything held.
             {
+                // owners-by-name: each lever is released by its own loop.
                 use std::sync::atomic::Ordering::Relaxed;
                 let speed_held = tools::speedhold::ACTIVE.load(Relaxed);
                 // Holding the mixture is the continuous manager OR a lean

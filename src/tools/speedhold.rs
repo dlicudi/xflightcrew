@@ -1171,9 +1171,7 @@ async fn governor(xp: XPlaneClient, voice: Option<crate::voice::Voice>) {
             break;
         }
         // Yield instantly to anything that takes the whole aircraft.
-        if super::recover::ACTIVE.load(Ordering::Relaxed)
-            || crate::autoland::ACTIVE.load(Ordering::Relaxed)
-        {
+        if crate::flight_state::crew_landing_or_recovering() {
             ACTIVE.store(false, Ordering::Relaxed);
             break;
         }

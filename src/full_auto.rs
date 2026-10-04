@@ -326,11 +326,11 @@ pub struct SubTools {
 
 /// Spawn the orchestrator on its own thread + runtime + client.
 pub fn start(base_url: String, config: Config, voice: Option<Voice>, tools: SubTools) -> bool {
-    if crate::tools::recover::ACTIVE.load(SeqCst)
+    // Never over a loop already flying (`flight_state::crew_flying`, the
+    // helicopter's loops included), nor one still winding down (`running`).
+    if crate::flight_state::crew_flying().is_some()
         || crate::procedure::running()
         || crate::autotakeoff::running()
-        || crate::circuit::ACTIVE.load(SeqCst)
-        || crate::autoland::ACTIVE.load(SeqCst)
     {
         return false;
     }

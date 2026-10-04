@@ -458,8 +458,8 @@ pub struct SetupIn {
     pub nav: Option<f64>,
     pub gs: Option<f64>,
     pub servos: bool,
-    /// An automation is flying (autoland, the follower, a circuit, full
-    /// auto): the approach is its to fly, and [`Coupling`] owns APPR.
+    /// An automation is flying ([`crate::flight_state::crew_flying`]): the
+    /// approach is its to fly, and [`Coupling`] owns APPR.
     pub automation: bool,
     pub verdict: ArmVerdict,
     pub agl_ft: f64,
@@ -593,14 +593,6 @@ pub fn stop_setup_watch() {
     SETUP_GEN.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 }
 
-fn automation_flying() -> bool {
-    use std::sync::atomic::Ordering::Relaxed;
-    crate::full_auto::ACTIVE.load(Relaxed)
-        || crate::procedure::ACTIVE.load(Relaxed)
-        || crate::circuit::ACTIVE.load(Relaxed)
-        || crate::autoland::ACTIVE.load(Relaxed)
-}
-
 /// Run a [`SetupWatch`] on its own thread and runtime (the command loop's
 /// runtime is blocked on the listener between commands, as for the altitude
 /// capture watcher). Its writes are the APPR press, only from off, and the
@@ -654,7 +646,7 @@ pub fn spawn_setup_watch(base: String, ils: crate::nav::Ils, mut watch: SetupWat
                     nav: nav.ok(),
                     gs: gs.ok(),
                     servos: servos.is_ok_and(|v| v > 0.5),
-                    automation: automation_flying(),
+                    automation: crate::flight_state::crew_flying().is_some(),
                     verdict: arm_verdict(lat, lon, hdg, &ils),
                     agl_ft: agl * 3.28084,
                 };

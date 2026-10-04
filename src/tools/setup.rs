@@ -753,19 +753,12 @@ pub fn pick_runway(
 /// The automation that holds the aircraft now, by name, if any: a new flight
 /// ends it, so the pilot takes it back first (a misheard ask must not pull
 /// the aircraft out from under a landing).
+///
+/// [`crate::flight_state::crew_flying`], innermost: the helicopter circuit
+/// and a recovery count too (they were missing, so a setup could pull the
+/// aircraft out from under either).
 pub(crate) fn flying_now() -> Option<&'static str> {
-    use std::sync::atomic::Ordering::Relaxed;
-    [
-        (crate::autoland::ACTIVE.load(Relaxed), "I'm landing"),
-        (crate::full_auto::ACTIVE.load(Relaxed), "I'm flying"),
-        (crate::circuit::ACTIVE.load(Relaxed), "I'm flying the circuit"),
-        (crate::procedure::ACTIVE.load(Relaxed), "I'm flying the route"),
-        (crate::autotakeoff::ACTIVE.load(Relaxed), "I'm taking off"),
-        (crate::heli_route::ACTIVE.load(Relaxed), "I'm flying the helicopter route"),
-        (crate::hover::ACTIVE.load(Relaxed), "I'm holding the hover"),
-    ]
-    .into_iter()
-    .find_map(|(on, name)| on.then_some(name))
+    crate::flight_state::crew_flying().map(crate::flight_state::Owner::doing)
 }
 
 #[derive(serde::Deserialize, Default, Clone)]

@@ -2287,6 +2287,7 @@ impl Demo {
 /// Is the demonstrated task's automation flying?
 #[cfg(not(test))]
 fn demo_loop_running(task: Task) -> bool {
+    // owners-by-name: each task demonstrates its own loop.
     use std::sync::atomic::Ordering::Relaxed;
     match task {
         Task::Taxi => crate::autotaxi::ACTIVE.load(Relaxed),
