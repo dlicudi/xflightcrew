@@ -1029,7 +1029,7 @@ pub fn follower_flying(procedure: bool, heli_route: bool) -> bool {
 
 /// With an automation flying, the caution band's top: the margin under its
 /// own target, not the hand-flown 1.2 Vs.
-const AUTO_CAUTION_FACTOR: f64 = 1.13;
+const AUTO_CAUTION_FACTOR: f64 = crate::aircraft::CAUTION_AUTO_RATIO;
 
 /// The stall speed at this flap setting: a straight line from the clean
 /// stall to the landing-configuration stall when the profile declares one,
@@ -2481,8 +2481,8 @@ fn build_checks(profile: &AircraftProfile) -> Vec<Box<dyn Check>> {
             vs_clean_kts: vs,
             vs0_kts: vs0,
             detent_stall: detent_stall.clone(),
-            at_or_below_factor: 1.20,
-            above_factor: Some(1.10),
+            at_or_below_factor: crate::aircraft::CAUTION_HAND_RATIO,
+            above_factor: Some(crate::aircraft::STALL_WARNING_RATIO),
         }));
         checks.push(Box::new(StallSpeed {
             id: "airspeed_warning",
@@ -2490,7 +2490,7 @@ fn build_checks(profile: &AircraftProfile) -> Vec<Box<dyn Check>> {
             vs_clean_kts: vs,
             vs0_kts: vs0,
             detent_stall,
-            at_or_below_factor: 1.10,
+            at_or_below_factor: crate::aircraft::STALL_WARNING_RATIO,
             above_factor: None,
         }));
     }
