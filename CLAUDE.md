@@ -143,8 +143,13 @@ Datarefs and commands stay in the Rust tools; YAML is per-airframe config.
   OUTPUT (`TransponderModeKnob.also`, `radio::stock_transmits`), not from the knob turned.
 - **Selectors are republished on EVERY swap, including to `None`**: facts must never outlive their
   airframe. `src/flight_state.rs` is the one page: `publish_airframe` sets every selector,
-  `stand_down` stops every loop that can hold the aircraft (swap, instructor entry, connection
-  lost); a source scan pins it to every `static ACTIVE`. New ones go there, never in a caller.
+  `stand_down` cancels every run in `flight_state::LOOPS` (swap, instructor entry, connection
+  lost; `stand_down_cancels_every_run` pins every `sim::run::Slot`). A new flight or airframe goes
+  through ONE door, `flight_begins` / `airframe_begins` (source-scan pinned), never its steps in a
+  caller. A loop OWNS its flag through its `Slot` lease (`claim`, `take_over`): a superseded run
+  never writes its successor's state, and nobody clears another loop's latch (autoland launches
+  are all `run_autoland_scoped`). The world side resets by lifetime group
+  (`crates/atc/src/station/state.rs`, `every_atc_static_has_a_lifetime`).
 - **Anti-ice** (`src/tools/anti_ice.rs` `set_anti_ice`, profile `anti_ice:`, else the `.acf`'s
   loads, `systems::IceKit`): read first, read back, an undeclared wing left alone and said; the
   monitor's `icing` switches probes, windows, engines and props in visible moisture at +10 C or
