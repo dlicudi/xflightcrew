@@ -698,6 +698,9 @@ async fn engage(xp: &crate::xplane::XPlaneClient, job: &EnrouteJob) -> Engaged {
     let p = &job.placement;
     let var = xp.get_float(MAG_VAR).await.ok().filter(|v| v.is_finite()).unwrap_or(0.0);
     // X-Plane's variation is positive-west: magnetic = true + variation.
+    // A direct write, not `heading_bug::bug_toward`: the placement puts the
+    // nose on this track wings level, and the heading read during the air
+    // start's load is the last flight's, no measurement of this one.
     let bug = crate::autoland::true_to_mag(p.track_true, var);
     let mut out = Engaged::default();
     let mut e = ApEngage::default();

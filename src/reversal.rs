@@ -1237,7 +1237,7 @@ mod tests {
     /// `held`; the third answer is how often the knob moved (0.2 degrees).
     fn fly_pattern_knob(mut p: Plant, rwy: &Runway, side: f64, held: bool) -> (f64, Vec<Leg>, u32) {
         let join = 5.75;
-        let mut hold = crate::circuit::BugHold::default();
+        let mut hold = crate::heading_bug::BugHold::default();
         let (mut t, mut moves, mut knob_at) = (0.0, 0u32, None::<f64>);
         let mut rev = Some(Reversal {
             side,

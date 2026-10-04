@@ -2206,7 +2206,18 @@ async fn fly(
                 // and the pilot saw the yaw jitter (EDDV-ETHC, 2026-09-23).
                 // A go-around holds the course it began on (written once at
                 // its start): chasing the pad's bearing at speed is the orbit.
-                let want_bug = (track - variation).rem_euclid(360.0);
+                // Through the one turn-safe steer (`heading_bug::bug_toward`,
+                // audit #6): a new leg's course on the far side of a turn in
+                // progress waits on the nose, a big one is led from level by
+                // at most 25 degrees; the 2 degree hysteresis below still
+                // decides when the knob moves.
+                let want_bug = crate::heading_bug::bug_toward(
+                    bug_set.unwrap_or(s.mag),
+                    (track - variation).rem_euclid(360.0),
+                    s.mag,
+                    s.phi,
+                    360.0,
+                );
                 let bug = match bug_set {
                     _ if around.is_some() => around.as_ref().map_or(0.0, |a| a.bug),
                     Some(b) if crate::angles::abs_diff_deg(want_bug, b) < BUG_HYSTERESIS_DEG => b,

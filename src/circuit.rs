@@ -30,6 +30,7 @@ use std::sync::Mutex;
 
 use crate::autoland::{along_track_nm, cross_track_nm, nearby_runways, true_to_mag};
 use crate::autotakeoff;
+use crate::heading_bug::{bug_toward, slew_bug, BugDeadband, BugHold};
 use crate::tools::autopilot::ApConfig;
 use crate::voice::{Priority, Voice};
 use crate::xplane::XPlaneClient;
@@ -1949,54 +1950,6 @@ pub fn leg_heading(rwy_course_deg: f64, leg: Leg, left: bool) -> f64 {
     (rwy_course_deg + turn * n).rem_euclid(360.0)
 }
 
-/// Move the heading bug toward `target` by at most `max_step` degrees, the
-/// SHORT way around, returning the new dial value. A single 90-degree write
-/// across the 0/360 seam (271 -> 2 for the right pattern's crosswind) reads
-/// to the sim's AP as a 270-degree counterclockwise dial spin, and it turned
-/// the LONG way — the 1.8 km loop south over the bay with an AGL dip to
-/// 126 ft (LXGB, 2026-07-24). Stepping the dial keeps every write's turn
-/// direction unambiguous; at 40 degrees per 500 ms tick a 90-degree leg
-/// change completes in ~1.5 s, faster than the AP banks anyway.
-pub fn slew_bug(current: f64, target: f64, max_step: f64) -> f64 {
-    let d = crate::angles::signed_diff_deg(target, current);
-    (current + d.clamp(-max_step, max_step)).rem_euclid(360.0)
-}
-
-/// Bank beyond which the AP is judged to be IN a turn. X-Plane's heading
-/// mode sits at 11-13 degrees for a standard-rate turn; the orbit at LXGB
-/// started from 4.3 degrees, so the threshold sits under that, above the
-/// one or two degrees of wings-level jitter.
-const TURN_IN_PROGRESS_BANK_DEG: f64 = 3.0;
-/// A wanted turn smaller than this against the bank in progress is left to
-/// the AP: it is finishing a capture, not going the long way round.
-const REVERSAL_MIN_DEG: f64 = 10.0;
-/// Until the autopilot is banked INTO the wanted turn, the bug leads the
-/// nose by no more than this: a small bug on the right side starts the turn
-/// the right way, and once the turn is in progress the sim's refusal to
-/// reverse it works for us. The rectangle circuit slewed the bug 90 degrees
-/// off the nose from wings level, and the SF50 went round the long way on 13
-/// of its 30 circuit turns (the A330 on 2 of 4), each a 270 right for a 90
-/// left (ETND, 2026-09-23).
-const TURN_ENTRY_LEAD_DEG: f64 = 25.0;
-/// Wings level, for [`bug_toward`]'s roll-out hysteresis.
-const LEVEL_BANK_DEG: f64 = 1.0;
-/// A bug this close to the heading is "on the nose".
-const ON_NOSE_DEG: f64 = 5.0;
-
-/// Step the bug toward `want_mag` (as [`slew_bug`]) unless the aircraft is
-/// banked INTO a turn the other way, in which case hold the bug ON THE NOSE
-/// so the AP rolls out first.
-///
-/// The sim's heading mode does not reverse a turn in progress. At LXGB
-/// (2026-09-14) the authored follower captured waypoint 2 while banked four
-/// degrees right for it and stepped the bug 25 degrees LEFT for waypoint 3;
-/// the AP rolled on to 12 degrees right and went round the long way, 340
-/// degrees, and because pure pursuit keeps the bug moving in the direction
-/// of the turn it never caught up: five minutes of standard-rate orbits
-/// drifting downwind across the bay, waypoints caught only when a circle
-/// happened to pass within the capture radius. A bug on the nose is a
-/// capture, and a capture is the one thing that rolls that AP level; from
-/// level the next slew starts the turn the right way.
 /// Put the bug on a WHOLE degree, and only when that degree changes. The
 /// laws above keep their fine value for their own arithmetic; the knob a
 /// pilot sees moves in the steps a pilot's hand makes, not a tenth of a
@@ -2014,89 +1967,11 @@ async fn write_bug(xp: &dyn crate::xplane::XPlane, bug_mag: f64) {
     }
 }
 
-/// How a loop's heading bug is SET, the way a pilot sets it (issue #93):
-/// once per leg or phase (`key`), a turn led through at once (a move of
-/// [`BUG_STEER_DEG`] or more is steering: the lead through a turn, a new
-/// intercept), and otherwise a correction only when it has grown past the
-/// loop's `deadband_deg` and not more often than every `every_s`. The laws
-/// keep computing their fine bug every tick; the KNOB moves only when this
-/// says so. `procedure::HeadingHold` is the follower's version (a whole
-/// degree per leg, 5 degrees, 30 s); these loops fly patterns and finals, so
-/// each passes its own deadband. LIPR 2026-09-26: "a human pilot would never
-/// use the heading bug like that"; LEMG 2026-09-28: the circuit's downwind
-/// knob stepped 10 to 24 times in two minutes on a one-degree crab, and
-/// autoland's final 40 to 80 times in 100 s in tenths. Pure.
-#[derive(Debug, Default, Clone, Copy)]
-pub struct BugHold {
-    key: Option<u32>,
-    set: Option<f64>,
-    last_write_s: f64,
-}
-
-/// A bug move this big is steering, not a correction: written at once.
-pub const BUG_STEER_DEG: f64 = 5.0;
-
-/// A loop's correction deadband: the smallest correction worth a hand on
-/// the knob, and how often.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct BugDeadband {
-    pub deg: f64,
-    pub every_s: f64,
-}
-
 /// The circuit's legs: a two-degree correction at most every ten seconds.
 pub const CIRCUIT_LEG_DEADBAND: BugDeadband = BugDeadband { deg: 2.0, every_s: 10.0 };
 /// The circuit's final, closing the centreline for the handover: a degree
 /// at most every three seconds.
 pub const CIRCUIT_FINAL_DEADBAND: BugDeadband = BugDeadband { deg: 1.0, every_s: 3.0 };
-
-impl BugHold {
-    /// The bug to set now (magnetic), or `None` to leave the knob alone.
-    pub fn decide(&mut self, key: u32, want_mag: f64, now_s: f64, db: BugDeadband) -> Option<f64> {
-        if !want_mag.is_finite() {
-            return None;
-        }
-        let want = want_mag.rem_euclid(360.0);
-        let write = match (self.key == Some(key), self.set) {
-            (true, Some(set)) => {
-                let off = crate::angles::abs_diff_deg(want, set);
-                off >= BUG_STEER_DEG
-                    || (off >= db.deg && now_s - self.last_write_s >= db.every_s)
-            }
-            _ => true,
-        };
-        if !write {
-            return None;
-        }
-        self.key = Some(key);
-        self.set = Some(want);
-        self.last_write_s = now_s;
-        Some(want)
-    }
-
-    /// What the knob was last set to (the laws' `current_bug`), if anything.
-    pub fn set(&self) -> Option<f64> {
-        self.set
-    }
-
-    /// The knob read back after a write (a knob that only stepped part of
-    /// the way, or a failed write: `None` forgets it so the next tick sets
-    /// it afresh).
-    pub fn took(&mut self, read_mag: Option<f64>) {
-        match read_mag.filter(|v| v.is_finite()) {
-            Some(v) => self.set = Some(v.rem_euclid(360.0)),
-            None => {
-                self.key = None;
-                self.set = None;
-            }
-        }
-    }
-
-    /// Forget everything: the next decision writes.
-    pub fn reset(&mut self) {
-        *self = Self::default();
-    }
-}
 
 /// The laws' bug through the [`BugHold`]: the knob is set only when the hold
 /// says so, and the laws carry on from what the knob holds.
@@ -2118,43 +1993,6 @@ async fn hold_bug(
 
 /// The last whole degree written, as f64 bits (`u64::MAX`: none).
 static LAST_BUG: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
-
-pub fn bug_toward(
-    current_bug: f64,
-    want_mag: f64,
-    heading_mag: f64,
-    phi_deg: f64,
-    max_step: f64,
-) -> f64 {
-    let turn = crate::angles::signed_diff_deg(want_mag, heading_mag);
-    // Hysteresis for a big turn: once the bug is on the nose to roll the
-    // wrong-way bank out, it stays there until the wings are LEVEL, not merely
-    // under the in-turn threshold. LIPK (2026-09-25): at 2 to 3 degrees of
-    // left bank the 25 degree right lead went back on, the autopilot kept
-    // turning left, the bank passed 3, the bug went back to the nose, and the
-    // two alternated tick by tick for 50 s while the 172 turned 35 degrees
-    // the wrong way.
-    let on_nose =
-        crate::angles::abs_diff_deg(current_bug, heading_mag) < ON_NOSE_DEG;
-    let reversal_bank = if on_nose && turn.abs() > TURN_ENTRY_LEAD_DEG {
-        LEVEL_BANK_DEG
-    } else {
-        TURN_IN_PROGRESS_BANK_DEG
-    };
-    let banked_other_way = phi_deg.abs() > reversal_bank
-        && turn.abs() > REVERSAL_MIN_DEG
-        && (turn > 0.0) != (phi_deg > 0.0);
-    if banked_other_way {
-        return slew_bug(current_bug, heading_mag, max_step);
-    }
-    let committed =
-        phi_deg.abs() > TURN_IN_PROGRESS_BANK_DEG && (turn > 0.0) == (phi_deg > 0.0);
-    if !committed && turn.abs() > TURN_ENTRY_LEAD_DEG {
-        let entry = (heading_mag + turn.signum() * TURN_ENTRY_LEAD_DEG).rem_euclid(360.0);
-        return slew_bug(current_bug, entry, max_step);
-    }
-    slew_bug(current_bug, want_mag, max_step)
-}
 
 /// The authored follower's progress watchdog fires when the distance to the
 /// current waypoint has set no new low for this long: the loop is orbiting or
@@ -6184,6 +6022,7 @@ mod tests {
         assert!(!vs_stuck(3.0) && vs_stuck(VS_REFUSED_SECS));
     }
     use super::*;
+    use crate::heading_bug::{TURN_ENTRY_LEAD_DEG, TURN_IN_PROGRESS_BANK_DEG};
 
     /// The Baron's approach speed the older handover tests were flown at, and
     /// the landing limit of a runway of unknown width (the old 37 m).

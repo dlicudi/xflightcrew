@@ -1787,7 +1787,7 @@ fn spawn_autoland(launch: AutolandLaunch) {
             let mut last_phase: Option<ApproachPhase> = None;
             let mut flare_power = FlarePower::default();
             // The heading knob, set as a pilot sets it (`bug_knob`, issue #93).
-            let mut bug_hold = crate::circuit::BugHold::default();
+            let mut bug_hold = crate::heading_bug::BugHold::default();
             let knob_t0 = std::time::Instant::now();
             // The lever the approach was flown on, for a balloon to hold.
             let mut approach_thr: Option<f64> = None;
@@ -4037,7 +4037,32 @@ fn spawn_autoland(launch: AutolandLaunch) {
                         None
                     }
                     (true, Some((key, db))) => {
-                        bug_hold.decide(key, mag_hdg, knob_t0.elapsed().as_secs_f64(), db)
+                        // The pattern's, the reversal's, the join's and the
+                        // missed approach's turns go through the one
+                        // turn-safe steer (`heading_bug::bug_toward`, audit
+                        // #6): never a bug on the far side of a turn in
+                        // progress, a big turn led from level by at most
+                        // 25 degrees. They had no reversal guard. The knob
+                        // drive below does the stepping (30 a tick), so the
+                        // steer's own slew is not used.
+                        let want = match psi_r.as_ref().ok().copied() {
+                            Some(psi)
+                                if g.phase == ApproachPhase::Intercept
+                                    || pattern.is_some()
+                                    || missed.is_some() =>
+                            {
+                                let hdg_mag = true_to_mag(psi, var);
+                                crate::heading_bug::bug_toward(
+                                    bug_hold.set().unwrap_or(hdg_mag),
+                                    mag_hdg,
+                                    hdg_mag,
+                                    phi_r.as_ref().ok().copied().unwrap_or(0.0),
+                                    360.0,
+                                )
+                            }
+                            _ => mag_hdg,
+                        };
+                        bug_hold.decide(key, want, knob_t0.elapsed().as_secs_f64(), db)
                     }
                     (true, None) => {
                         bug_hold.reset();
@@ -7837,16 +7862,16 @@ pub fn go_around_flap_due(ias_kts: f64, floor_kts: Option<f64>) -> bool {
 
 /// Autoland's intercepts, patterns and missed approach: a two-degree
 /// correction at most every five seconds.
-pub const AUTOLAND_INTERCEPT_DEADBAND: crate::circuit::BugDeadband =
-    crate::circuit::BugDeadband { deg: 2.0, every_s: 5.0 };
+pub const AUTOLAND_INTERCEPT_DEADBAND: crate::heading_bug::BugDeadband =
+    crate::heading_bug::BugDeadband { deg: 2.0, every_s: 5.0 };
 /// The final outside [`SHORT_FINAL_NM`]: half a degree at most every two
 /// seconds (a degree every three left the fitted 737 9.8 m off at the
 /// roundout gate from a 30 m LEMG 13 handover, against 3.9 every tick).
-pub const AUTOLAND_FINAL_DEADBAND: crate::circuit::BugDeadband =
-    crate::circuit::BugDeadband { deg: 0.5, every_s: 2.0 };
+pub const AUTOLAND_FINAL_DEADBAND: crate::heading_bug::BugDeadband =
+    crate::heading_bug::BugDeadband { deg: 0.5, every_s: 2.0 };
 
 /// How autoland's heading knob is set this tick (issue #93): the key and
-/// deadband for [`crate::circuit::BugHold`], or `None` to steer it every
+/// deadband for [`crate::heading_bug::BugHold`], or `None` to steer it every
 /// tick as before (the short final and the flare, where the last 0.3 nm
 /// closes the centreline in seconds). A pattern's legs and each missed
 /// approach stage are their own keys, so a new leg is set at once. Pure.
@@ -7855,7 +7880,7 @@ pub fn bug_knob(
     short_final: bool,
     pattern_leg: Option<crate::reversal::Leg>,
     missed: Option<MissedStage>,
-) -> Option<(u32, crate::circuit::BugDeadband)> {
+) -> Option<(u32, crate::heading_bug::BugDeadband)> {
     match (phase, short_final, pattern_leg, missed) {
         (ApproachPhase::Flare, ..) | (_, true, ..) => None,
         (_, _, Some(leg), _) => Some((10 + leg as u32, AUTOLAND_INTERCEPT_DEADBAND)),
@@ -14591,7 +14616,7 @@ mod lemg_737_flare_tests {
         assert_eq!(by_sortie.len(), 4);
         let (mut free_all, mut held_all) = (0u32, 0u32);
         for (s, ticks) in &by_sortie {
-            let mut hold = crate::circuit::BugHold::default();
+            let mut hold = crate::heading_bug::BugHold::default();
             let (mut free, mut held) = (0u32, 0u32);
             let (mut free_at, mut held_at) = (None::<f64>, None::<f64>);
             let t0 = ticks[0]["t"].as_f64().unwrap();
@@ -14615,7 +14640,7 @@ mod lemg_737_flare_tests {
                         let h = hold.set().unwrap_or(b);
                         let off = crate::angles::abs_diff_deg(h, b);
                         assert!(
-                            off < crate::circuit::BUG_STEER_DEG,
+                            off < crate::heading_bug::BUG_STEER_DEG,
                             "{s}: the knob {h:.1} against the law's {b:.1}"
                         );
                         h
@@ -15308,10 +15333,10 @@ pub(crate) mod lemg_replay {
         /// The knob as the loop sets it (`bug_knob`), when held; the knob
         /// the aircraft flies, how many times it moved (0.2 degrees, the
         /// least `drive_heading_bug_step` writes) and the loop's clock.
-        pub knob: Option<crate::circuit::BugHold>,
+        pub knob: Option<crate::heading_bug::BugHold>,
         pub knob_at: Option<f64>,
         /// A deadband over the loop's own (`bug_knob`), for comparisons.
-        pub knob_db: Option<crate::circuit::BugDeadband>,
+        pub knob_db: Option<crate::heading_bug::BugDeadband>,
         pub moves: u32,
         pub t: f64,
     }
@@ -15335,7 +15360,7 @@ pub(crate) mod lemg_replay {
 
         /// ...with the knob set as today's loop sets it.
         pub fn held(mut self) -> Self {
-            self.knob = Some(crate::circuit::BugHold::default());
+            self.knob = Some(crate::heading_bug::BugHold::default());
             self
         }
 

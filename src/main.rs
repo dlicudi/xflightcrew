@@ -30,6 +30,7 @@ mod crew_pace;
 mod conversation;
 mod course_leg;
 mod debrief;
+mod heading_bug;
 mod sortie_runner;
 mod test_card;
 mod detect;

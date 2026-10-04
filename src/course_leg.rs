@@ -560,7 +560,8 @@ impl FinalJoin {
 mod tests {
     use super::*;
     use crate::nav::{project_latlon, Fix};
-    use crate::procedure::{capture_radius_nm, leg_done, leg_turn_deg, HeadingHold};
+    use crate::heading_bug::HeadingHold;
+    use crate::procedure::{capture_radius_nm, leg_done, leg_turn_deg};
 
     /// EGKK I26L as the CIFP codes it (the rows of
     /// `procedure::a_runway_map_hands_autoland_the_approach_at_the_faf`),
