@@ -343,6 +343,19 @@ pub fn publish_rotor(r: Option<(String, f64, String)>) {
     *ROTOR.lock().unwrap_or_else(|e| e.into_inner()) = r;
 }
 
+/// The rotor facts [`publish_rotor`] takes, from a profile: `None` on
+/// anything that is not a helicopter, so a swap to an aeroplane clears them
+/// (`flight_state::publish_airframe`).
+pub fn rotor_facts(p: &crate::aircraft::AircraftProfile) -> Option<(String, f64, String)> {
+    p.heli_start.as_ref().map(|h| {
+        (
+            h.rotor_rpm.clone(),
+            h.rotor_rpm_governed,
+            h.collective.clone(),
+        )
+    })
+}
+
 fn rotor() -> Option<(String, f64)> {
     ROTOR
         .lock()

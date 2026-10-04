@@ -136,6 +136,7 @@ pub fn spawn_new_flight_watch(base: String) {
 async fn foreign_new_flight(xp: &crate::xplane::XPlaneClient, seq: i64) {
     let _loading = Loading::begin();
     crate::flight_state::stand_down();
+    crate::flight_state::forget_flight();
     let atc = crate::mode::atc_enabled();
     if atc {
         crate::party_line::retire_for_new_flight();
@@ -521,6 +522,7 @@ async fn follow_up(base: String, voice: Option<Voice>, body: String, origin: Str
         // clearances.
         Some(0) => {
             crate::flow::stand_down(crate::flow::StandDown::NewFlight("setup"));
+            crate::flight_state::forget_flight();
             if crate::mode::atc_enabled() {
                 crate::party_line::retire_for_new_flight();
             }
@@ -1255,6 +1257,7 @@ async fn approach_follow_up(job: ApproachJob, loading: Loading) {
     let mut tower = None;
     if new_flight_began(&run.outcome) {
         crate::party_line::retire_for_new_flight();
+        crate::flight_state::forget_flight();
         if !matches!(next, AfterInit::Failed { .. }) && crate::mode::atc_enabled() {
             tower = crate::station::arm_new_flight(&job.icao, std::time::Instant::now());
         }

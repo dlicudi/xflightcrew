@@ -590,6 +590,13 @@ fn capture_action(dial: f64, target: f64, current_alt: f64, climb: bool) -> Capt
 /// same altitude, or a re-command, would otherwise stack independent watchers).
 static CLIMB_WATCHER_GEN: AtomicU64 = AtomicU64::new(0);
 
+/// Stand down any live capture watcher: it writes the altitude dial, fires ALT
+/// hold and sets the throttle for up to 20 minutes, so a swap, a new flight or
+/// instructor entry must stop it (`flight_state::stand_down`).
+pub(crate) fn stop_capture_watcher() {
+    CLIMB_WATCHER_GEN.fetch_add(1, Ordering::SeqCst);
+}
+
 /// Fly the AP to a selected altitude in VS mode, then **level off** there.
 ///
 /// The stock 172 AP does not reliably capture the preselected altitude from VS

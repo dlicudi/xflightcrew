@@ -168,6 +168,9 @@ pub fn abort() -> bool {
 fn stop_active() {
     crate::aircraft::TAKEOFF_MARGIN_WAIVED.store(false, SeqCst);
     set_arrival_runway(None, "mission_ended");
+    // The plan's transition was armed for this mission; the monitor's
+    // altimeter check must not judge the next flight against it.
+    crate::tools::instruments::publish_flight_transition(None);
     ACTIVE.store(false, SeqCst);
 }
 

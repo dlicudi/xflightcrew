@@ -8,6 +8,8 @@
 //! pump the API can't spin); the bleed valve is the `APU_dwn` command; bus
 //! cross-ties are toggle commands; array datarefs are set whole-array.
 
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use anyhow::Result;
 use async_trait::async_trait;
 use serde_json::{json, Value};
@@ -37,6 +39,28 @@ const CMD_XTIE_R: &str = "laminar/md82cmd/electrical/cross_tie_APU_R"; // toggle
 
 const POLL_SECS: u64 = 2;
 const STEP_PAUSE_MS: u64 = 400;
+
+/// Bumped by [`stop_sequences`] (`flight_state::stand_down`). A power-up or
+/// jet start runs on its own thread for a minute or more; each takes the
+/// epoch when it begins and checks it between steps, so a swap, a new flight
+/// or instructor entry mid-sequence stops it firing switches on whatever is
+/// loaded next.
+static SEQUENCE_GEN: AtomicU64 = AtomicU64::new(0);
+
+/// The epoch a sequence starts in.
+pub(crate) fn sequence_epoch() -> u64 {
+    SEQUENCE_GEN.load(Ordering::SeqCst)
+}
+
+/// Stop every running power-up and jet start at its next step.
+pub(crate) fn stop_sequences() {
+    SEQUENCE_GEN.fetch_add(1, Ordering::SeqCst);
+}
+
+/// True once a stand-down has landed since `epoch`.
+pub(crate) fn sequence_stood_down(epoch: u64) -> bool {
+    SEQUENCE_GEN.load(Ordering::SeqCst) != epoch
+}
 
 pub struct PowerUp;
 
@@ -91,10 +115,17 @@ async fn pause() {
     tokio::time::sleep(std::time::Duration::from_millis(STEP_PAUSE_MS)).await;
 }
 
-/// Poll `dr` until `ok(value)` is true, or give up after `secs`. Returns whether it met it.
-async fn wait_until(xp: &XPlaneClient, dr: &str, secs: u64, ok: impl Fn(f64) -> bool) -> bool {
+/// Poll `dr` until `ok(value)` is true, or give up after `secs` or at a
+/// stand-down since `epoch`. Returns whether it met it.
+async fn wait_until(
+    xp: &XPlaneClient,
+    epoch: u64,
+    dr: &str,
+    secs: u64,
+    ok: impl Fn(f64) -> bool,
+) -> bool {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(secs);
-    while std::time::Instant::now() < deadline {
+    while std::time::Instant::now() < deadline && !sequence_stood_down(epoch) {
         if ok(xp.get_float(dr).await.unwrap_or(0.0)) {
             return true;
         }
@@ -111,6 +142,14 @@ pub(crate) async fn run_prep(
     voice: &Option<Voice>,
     status: &Option<StatusSink>,
 ) {
+    let epoch = sequence_epoch();
+    let stood_down = || {
+        let gone = sequence_stood_down(epoch);
+        if gone {
+            tracing::info!("power up: stood down mid-sequence");
+        }
+        gone
+    };
     // 1. Battery on (and locked).
     if xp.get_float(BATTERY_ON).await.unwrap_or(0.0) < 0.5 {
         xp.run_command(CMD_BATTERY).await.ok();
@@ -120,6 +159,9 @@ pub(crate) async fn run_prep(
     }
     say(voice, status, "Battery on and locked.");
     pause().await;
+    if stood_down() {
+        return;
+    }
 
     // 2. Start the APU: aux fuel pump on, then engage the starter (set the switch
     //    to start directly — the APU_start command is gated on a spinning pump).
@@ -127,7 +169,10 @@ pub(crate) async fn run_prep(
         say(voice, status, "Starting the A P U.");
         xp.set_int_array_elem(START_PUMP, 0, 1).await.ok(); // aux electric fuel pump
         xp.set_int(APU_STARTER, 2).await.ok(); // engage starter
-        if !wait_until(xp, APU_N1, 75, |v| v > 95.0).await {
+        if !wait_until(xp, epoch, APU_N1, 75, |v| v > 95.0).await {
+            if stood_down() {
+                return;
+            }
             say(
                 voice,
                 status,
@@ -139,6 +184,9 @@ pub(crate) async fn run_prep(
     xp.set_int(APU_STARTER, 1).await.ok(); // starter to run
     say(voice, status, "A P U running, power available.");
     pause().await;
+    if stood_down() {
+        return;
+    }
 
     // 3. APU buses (toggle cross-ties only if not already tied), aux pump off.
     if xp.get_float(XTIE_L).await.unwrap_or(0.0) < 0.5 {
@@ -150,14 +198,20 @@ pub(crate) async fn run_prep(
     xp.set_int_array_elem(START_PUMP, 0, 0).await.ok(); // aux pump no longer needed
     say(voice, status, "A P U on the buses.");
     pause().await;
+    if stood_down() {
+        return;
+    }
 
     // 4. APU bleed air on, then wait for pressure to build.
     if xp.get_float(APU_BLEED).await.unwrap_or(0.0) < 0.5 {
         xp.run_command(CMD_APU_BLEED_ON).await.ok();
     }
     say(voice, status, "Bleed air on.");
-    wait_until(xp, BLEED_NEEDLE, 30, |v| v > 2.0).await;
+    wait_until(xp, epoch, BLEED_NEEDLE, 30, |v| v > 2.0).await;
     pause().await;
+    if stood_down() {
+        return;
+    }
 
     // 5. Boost pumps on (centre, left, right tanks), through the one writer
     // of the tank pump array (the monitor switches an empty centre off there
