@@ -32,7 +32,6 @@ use crate::voice::{Priority, Voice};
 use crate::xplane::XPlaneClient;
 
 const ENGN_RUNNING: &str = "sim/flightmodel/engine/ENGN_running";
-const ON_GROUND: &str = "sim/flightmodel/failures/onground_any";
 const VS_DIAL: &str = "sim/cockpit/autopilot/vertical_velocity";
 /// Throttle a mission give-up hands the aircraft back with — autoland's own
 /// number, for the same reason: enough to hold level flight dirty.
@@ -535,7 +534,7 @@ fn hand_back_line(line: &str, held: Option<bool>) -> String {
 }
 
 /// Stopped, for the hand-back: under this the parking brake goes on.
-const HAND_BACK_STOPPED_KTS: f64 = 1.0;
+const HAND_BACK_STOPPED_KTS: f64 = sim::ground::STOPPED_KTS;
 /// The longest the hand-back brakes toward a stop before the parking brake
 /// goes on anyway (the governor's taxi speeds stop in a few seconds).
 const HAND_BACK_STOP_S: f64 = 15.0;
@@ -1723,12 +1722,6 @@ async fn wait_for_drive() -> bool {
     ended && !still
 }
 
-/// Both instruments must affirm the ground gate; an API failure is no clearance.
-fn confirmed_ground(agl_m: anyhow::Result<f64>, on_ground: anyhow::Result<f64>) -> bool {
-    matches!((agl_m, on_ground), (Ok(agl), Ok(ground))
-        if agl.is_finite() && ground.is_finite() && agl * M_TO_FT <= 50.0 && ground > 0.5)
-}
-
 /// Is the published taxi route one WE can drive from where we are standing?
 ///
 /// A departure route (not a taxi-in to a stand) whose path passes within
@@ -2001,7 +1994,9 @@ async fn fly(xp: XPlaneClient, config: Config, voice: Option<Voice>, tools: SubT
         xp.get_float(AGL_M),
         xp.get_float(crate::datarefs::ON_GROUND_ANY),
     );
-    if !confirmed_ground(agl, ground) {
+    // Both instruments must affirm the ground gate; an API failure is no
+    // clearance (`sim::ground::on_ground_confirmed`, the one definition).
+    if !sim::ground::on_ground_confirmed(agl.ok(), ground.ok()) {
         give_up(
             &xp,
             tools.taxi.park_brake_valve_set,
@@ -6959,7 +6954,7 @@ async fn runway_check_id(
     tools: &SubTools,
 ) -> Result<String, Option<crate::autotakeoff::NoFit>> {
     // Airborne is not "lined up"; and a fit needs a valid position.
-    if xp.get_float(ON_GROUND).await.unwrap_or(1.0) < 0.5 {
+    if xp.get_float(crate::datarefs::ON_GROUND_ANY).await.unwrap_or(1.0) < 0.5 {
         return Err(None);
     }
     let (Ok(lat), Ok(lon), Ok(psi)) = (
@@ -8424,26 +8419,17 @@ mod tests {
 
     #[test]
     fn full_auto_requires_both_instruments_to_confirm_ground_contact() {
-        use super::confirmed_ground;
-        assert!(confirmed_ground(Ok(0.0), Ok(1.0)));
-        assert!(!confirmed_ground(Ok(500.0), Ok(0.0)));
-        assert!(!confirmed_ground(Ok(0.0), Ok(0.0))); // just lifted off
-        assert!(!confirmed_ground(Ok(500.0), Ok(1.0))); // conflicting readings
-        assert!(!confirmed_ground(
-            Err(anyhow::anyhow!("AGL failed")),
-            Ok(1.0)
-        ));
-        assert!(!confirmed_ground(
-            Ok(0.0),
-            Err(anyhow::anyhow!("contact failed"))
-        ));
-        assert!(!confirmed_ground(
-            Err(anyhow::anyhow!("AGL failed")),
-            Err(anyhow::anyhow!("contact failed"))
-        ));
+        use sim::ground::on_ground_confirmed as confirmed_ground;
+        assert!(confirmed_ground(Some(0.0), Some(1.0)));
+        assert!(!confirmed_ground(Some(500.0), Some(0.0)));
+        assert!(!confirmed_ground(Some(0.0), Some(0.0))); // just lifted off
+        assert!(!confirmed_ground(Some(500.0), Some(1.0))); // conflicting readings
+        assert!(!confirmed_ground(None, Some(1.0)));
+        assert!(!confirmed_ground(Some(0.0), None));
+        assert!(!confirmed_ground(None, None));
         for invalid in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
-            assert!(!confirmed_ground(Ok(invalid), Ok(1.0)));
-            assert!(!confirmed_ground(Ok(0.0), Ok(invalid)));
+            assert!(!confirmed_ground(Some(invalid), Some(1.0)));
+            assert!(!confirmed_ground(Some(0.0), Some(invalid)));
         }
     }
 

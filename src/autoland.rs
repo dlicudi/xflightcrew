@@ -439,7 +439,6 @@ const GS_MS: &str = "sim/flightmodel/position/groundspeed";
 /// Weight-on-wheels for the player aircraft. Radio altitude and airspeed are
 /// not touchdown evidence: a normal flare can be below five feet and a knot
 /// below target while the wheels are still airborne.
-const ON_GROUND: &str = "sim/flightmodel/failures/onground_any";
 const MAG_VAR: &str = "sim/flightmodel/position/magnetic_variation";
 const IAS: &str = "sim/flightmodel/position/indicated_airspeed";
 /// TRUE heading and TRUE ground track: their difference is the wind crab the
@@ -491,7 +490,7 @@ const TAXI_BRAKE: &str = "xcopilot/taxi_brake";
 use sim::state::F;
 /// What a tick reads past the position (`sim::state`; each field names its
 /// dataref): the constants above (`MAG_VAR`, `IAS`, `HPATH_TRUE`,
-/// `ON_GROUND`, `PHI_TRUE`, `VVI_FPM`, `SERVOS_ON`, `HDG_STATUS`,
+/// `crate::datarefs::ON_GROUND_ANY`, `PHI_TRUE`, `VVI_FPM`, `SERVOS_ON`, `HDG_STATUS`,
 /// `VS_STATUS`, `HDG_BUG`) and the plugin's yields.
 const AUTOLAND_WANT: &[F] = &[
     F::MagVar,

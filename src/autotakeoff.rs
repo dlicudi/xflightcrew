@@ -48,8 +48,6 @@ const IAS: &str = "sim/flightmodel/position/indicated_airspeed";
 #[cfg(test)]
 const AGL_M: &str = "sim/flightmodel/position/y_agl";
 const MAG_VAR: &str = "sim/flightmodel/position/magnetic_variation";
-#[cfg(test)]
-const ON_GROUND: &str = "sim/flightmodel/failures/onground_any";
 /// The thrust lever THIS airframe obeys — not always the stock one (the
 /// Citation X tracks `throttle_jet_rev_ratio`, so every write to
 /// `throttle_ratio_all` went nowhere and it flew a whole pattern at takeoff
@@ -3035,7 +3033,7 @@ fn alert(voice: &Option<Voice>, priority: Priority, line: &str) {
 pub(crate) const BRAKES_MAX: &str = "sim/flight_controls/brakes_max";
 /// Under this a rejected roll has STOPPED and the parking brake goes on; the
 /// hand-back's own stopped line (`full_auto::hand_back_hold`).
-const REJECT_STOPPED_KTS: f64 = 1.0;
+const REJECT_STOPPED_KTS: f64 = sim::ground::STOPPED_KTS;
 /// Below this the stop lets go of the steering: a walk on the centreline.
 const REJECT_STEER_MIN_KTS: f64 = 3.0;
 /// The longest the stop is flown, in live seconds (a pause slides it).
@@ -8961,7 +8959,7 @@ mod tests {
             sim.set_read(AGL_M, af.agl_ft / M_TO_FT);
             sim.set_read(PSI_TRUE, af.psi_deg.rem_euclid(360.0));
             sim.set_read(THETA, af.theta_deg);
-            sim.set_read(ON_GROUND, if af.on_ground() { 1.0 } else { 0.0 });
+            sim.set_read(crate::datarefs::ON_GROUND_ANY, if af.on_ground() { 1.0 } else { 0.0 });
             let (gs_ms, ias, agl_m, psi) = tokio::join!(
                 sim.get_float(GS_MS),
                 sim.get_float(IAS),

@@ -1267,7 +1267,7 @@ impl Scorer {
                     self.notes
                         .push("Rolled without stopping at the hold line.".into());
                     lines.push("You never stopped at the hold line.".into());
-                } else if self.moved_m >= TAXI_MIN_M && gs < 0.5 {
+                } else if self.moved_m >= TAXI_MIN_M && sim::ground::stopped_kts(gs) {
                     self.stopped_s += dt;
                     if self.stopped_s >= TAXI_STOP_S {
                         self.complete = true;
@@ -3271,7 +3271,7 @@ impl Syllabus {
                 }
             }
             Step::WaitStopped => {
-                if s.on_ground && s.gs_kts.abs() < 0.5 {
+                if s.on_ground && sim::ground::stopped_kts(s.gs_kts) {
                     self.wait_s += dt;
                     if self.wait_s >= SYLLABUS_STOP_S {
                         self.advance();

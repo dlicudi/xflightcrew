@@ -3375,8 +3375,12 @@ async fn run_session(
                     );
                     break 'confirm false;
                 };
+                // Stopped on the ground: a shutdown here is the end of a
+                // flight, not a hazard, so it is not confirmed (the pilot
+                // asked, 2026-09-22: "Confirm, shut both engines down?" at
+                // every stand). A failed read is not stopped.
                 let parked_shutdown = call.name == "stop_engines"
-                    && tools::jet_start::stopped_on_ground(&xplane).await;
+                    && sim::ground::read_stopped_on_ground(&xplane).await;
                 // An all-off asks only with an engine turning on the ground:
                 // cold it is the normal shutdown, airborne the tool refuses
                 // (issue #66).

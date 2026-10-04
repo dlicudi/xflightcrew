@@ -2,6 +2,7 @@
 //! (the profile's `retractable_gear` flag); the 172 has fixed gear, so it never
 //! gets this tool. Owns the gear handle and a ground safety gate.
 
+use crate::datarefs::ON_GROUND_ANY;
 use anyhow::Result;
 use async_trait::async_trait;
 use serde::Deserialize;
@@ -12,7 +13,6 @@ use super::{Tool, ToolCtx};
 /// Gear handle position: 1 = down, 0 = up. Writable.
 const GEAR_HANDLE: &str = "sim/cockpit2/controls/gear_handle_down";
 /// 1 while any wheel is on the ground — the gate against retracting on the runway.
-const ON_GROUND: &str = "sim/flightmodel/failures/onground_any";
 const IAS_KTS: &str = "sim/cockpit2/gauges/indicators/airspeed_kts_pilot";
 
 const CMD_GEAR_UP: &str = "sim/flight_controls/landing_gear_up";
@@ -69,7 +69,7 @@ impl Tool for Gear {
         // rather than folding the gear on the ramp (every sibling gate errs
         // the safe way; this one used to default to airborne and fail open).
         if up {
-            let on_ground = ctx.xplane.get_float(ON_GROUND).await.unwrap_or(1.0) > 0.5;
+            let on_ground = ctx.xplane.get_float(ON_GROUND_ANY).await.unwrap_or(1.0) > 0.5;
             if on_ground {
                 return Ok("Negative, we're on the ground. I won't raise the gear.".to_string());
             }
@@ -132,7 +132,7 @@ mod tests {
     async fn gear_up_refuses_on_the_ground_and_when_the_ground_read_fails() {
         let cfg = crate::config::Config::default();
         // On the ground: refused, and the handle is never touched.
-        let grounded = FakeXPlane::with_reads(&[(ON_GROUND, 1.0)]);
+        let grounded = FakeXPlane::with_reads(&[(ON_GROUND_ANY, 1.0)]);
         let out = Gear {
             vlo_kts: None,
             by_command: false,
@@ -164,7 +164,7 @@ mod tests {
 
         // Airborne and under the gear speed: the handle moves.
         let flying =
-            FakeXPlane::with_reads(&[(ON_GROUND, 0.0), (IAS_KTS, 100.0), (GEAR_HANDLE, 0.0)]);
+            FakeXPlane::with_reads(&[(ON_GROUND_ANY, 0.0), (IAS_KTS, 100.0), (GEAR_HANDLE, 0.0)]);
         let out = Gear {
             vlo_kts: Some(150.0),
             by_command: false,

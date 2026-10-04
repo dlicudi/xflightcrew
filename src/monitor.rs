@@ -313,7 +313,7 @@ impl Snapshot {
     /// profile's phase-expectation switches, read best-effort per tick.
     async fn read(xp: &XPlaneClient, advisor_drefs: &[String]) -> Option<Snapshot> {
         let on_ground = xp
-            .get_float("sim/flightmodel/failures/onground_any")
+            .get_float(crate::datarefs::ON_GROUND_ANY)
             .await
             .ok()?
             > 0.5;

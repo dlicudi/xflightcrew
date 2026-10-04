@@ -8,6 +8,7 @@
 //! and the rotor read back at its governed 313 rpm. Nothing here writes the
 //! collective: a lever the pilot's hand may be on is refused, not moved.
 
+use crate::datarefs::ON_GROUND_ANY;
 use anyhow::Result;
 use async_trait::async_trait;
 use serde_json::{json, Value};
@@ -19,7 +20,6 @@ use crate::aircraft::HeliStartProfile;
 const ENGN_RUNNING: &str = "sim/flightmodel/engine/ENGN_running";
 const N1_PERCENT: &str = "sim/cockpit2/engine/indicators/N1_percent";
 const BUS_VOLTS: &str = "sim/cockpit2/electrical/bus_volts";
-const ONGROUND: &str = "sim/flightmodel/failures/onground_any";
 const Y_AGL: &str = "sim/flightmodel/position/y_agl";
 const GROUNDSPEED: &str = "sim/flightmodel/position/groundspeed";
 const PSI: &str = "sim/flightmodel/position/psi";
@@ -128,7 +128,7 @@ impl Tool for StartHelicopter {
     }
     async fn execute(&self, _args: &Value, ctx: &ToolCtx<'_>) -> Result<String> {
         let p = &self.p;
-        if ctx.xplane.get_float(ONGROUND).await? < 0.5 {
+        if ctx.xplane.get_float(ON_GROUND_ANY).await? < 0.5 {
             return Ok("Negative, we're airborne. I won't run a start in flight.".to_string());
         }
         // The collective is the pilot's lever, and a start with it up is a
@@ -294,7 +294,7 @@ impl Tool for StopHelicopter {
         json!({ "type": "object", "properties": {}, "additionalProperties": false })
     }
     async fn execute(&self, _args: &Value, ctx: &ToolCtx<'_>) -> Result<String> {
-        if ctx.xplane.get_float(ONGROUND).await? < 0.5 {
+        if ctx.xplane.get_float(ON_GROUND_ANY).await? < 0.5 {
             return Ok(
                 "Negative, we're airborne. I won't shut an engine down in flight.".to_string(),
             );
@@ -424,7 +424,7 @@ impl Tool for Hover {
         let down = matches!(action, Some("down") | Some("land"));
         if down {
             if !crate::hover::ACTIVE.load(std::sync::atomic::Ordering::SeqCst)
-                && ctx.xplane.get_float(ONGROUND).await? > 0.5
+                && ctx.xplane.get_float(ON_GROUND_ANY).await? > 0.5
             {
                 return Ok("We're already on the ground.".to_string());
             }
@@ -452,7 +452,7 @@ impl Tool for Hover {
             ));
         }
         let running = crate::hover::ACTIVE.load(std::sync::atomic::Ordering::SeqCst);
-        let airborne = !running && ctx.xplane.get_float(ONGROUND).await? < 0.5;
+        let airborne = !running && ctx.xplane.get_float(ON_GROUND_ANY).await? < 0.5;
         if !running {
             if airborne {
                 if let Some(no) = takeover_refusal(ctx).await {
@@ -482,7 +482,7 @@ impl Tool for Hover {
 /// ([`crate::heli_route::Route::arrive_only`]). `Err` says why not, for the
 /// pilot who asked for the pad by name.
 async fn arrival(tool: &Hover, ctx: &ToolCtx<'_>) -> Result<std::result::Result<String, String>> {
-    if ctx.xplane.get_float(ONGROUND).await? > 0.5 {
+    if ctx.xplane.get_float(ON_GROUND_ANY).await? > 0.5 {
         return Ok(Err("We're on the ground. Say fly the flight plan for the whole flight.".into()));
     }
     if !crate::hover::ACTIVE.load(std::sync::atomic::Ordering::SeqCst) {
@@ -556,7 +556,7 @@ async fn air_taxi(args: &Value, hold: bool, collective: &str, ctx: &ToolCtx<'_>)
     let departing = hover::goal().is_some_and(|g| g.vector().is_some());
     let flying = hover::ACTIVE.load(std::sync::atomic::Ordering::SeqCst)
         && (departing || matches!(hover::goal(), Some(hover::Goal::Hover { .. })));
-    let on_ground = ctx.xplane.get_float(ONGROUND).await? > 0.5;
+    let on_ground = ctx.xplane.get_float(ON_GROUND_ANY).await? > 0.5;
     if hold && !flying && !on_ground {
         // Flown by the pilot (or the autopilot's cruise modes): take it at
         // the velocity it has and stop into a hover at this height.
@@ -629,7 +629,7 @@ async fn route(tool: &Hover, args: &Value, ctx: &ToolCtx<'_>) -> Result<String> 
     // loop holds; never from a flight someone else is flying.
     let hovering = hover::ACTIVE.load(std::sync::atomic::Ordering::SeqCst)
         && matches!(hover::goal(), Some(hover::Goal::Hover { .. }));
-    let on_ground = ctx.xplane.get_float(ONGROUND).await? > 0.5;
+    let on_ground = ctx.xplane.get_float(ON_GROUND_ANY).await? > 0.5;
     if !resume && !hovering && !on_ground {
         return Ok(
             "You're flying it. I fly the plan from the ground or a hover I'm holding.".to_string(),
@@ -839,7 +839,7 @@ async fn circuit(args: &Value, ctx: &ToolCtx<'_>) -> Result<String> {
     use crate::hover;
     let hovering = hover::ACTIVE.load(std::sync::atomic::Ordering::SeqCst)
         && matches!(hover::goal(), Some(hover::Goal::Hover { .. }));
-    if !hovering || ctx.xplane.get_float(ONGROUND).await? > 0.5 {
+    if !hovering || ctx.xplane.get_float(ON_GROUND_ANY).await? > 0.5 {
         return Ok(
             "I fly the circuit from a hover I'm holding. Ask for a hover first.".to_string(),
         );
@@ -868,7 +868,7 @@ async fn depart(args: &Value, ctx: &ToolCtx<'_>) -> Result<String> {
     use crate::hover;
     let hovering = hover::ACTIVE.load(std::sync::atomic::Ordering::SeqCst)
         && matches!(hover::goal(), Some(hover::Goal::Hover { .. }));
-    if !hovering || ctx.xplane.get_float(ONGROUND).await? > 0.5 {
+    if !hovering || ctx.xplane.get_float(ON_GROUND_ANY).await? > 0.5 {
         return Ok("I depart from a hover I'm holding. Ask for a hover first.".to_string());
     }
     let h = args

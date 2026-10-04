@@ -25,6 +25,8 @@ pub const FLAP_RATIO: &str = "sim/cockpit2/controls/flap_ratio";
 // --- Airframe state ---
 pub const GEAR_HANDLE_DOWN: &str = "sim/cockpit2/controls/gear_handle_down";
 pub const ON_GROUND_ANY: &str = "sim/flightmodel/failures/onground_any";
+/// Groundspeed, METRES PER SECOND (a magnitude).
+pub const GROUNDSPEED_MS: &str = "sim/flightmodel/position/groundspeed";
 /// 1 while X-Plane considers the airframe crashed (the crash screen); a
 /// flight reset drops it back to 0.
 pub const HAS_CRASHED: &str = "sim/flightmodel2/misc/has_crashed";

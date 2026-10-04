@@ -29,6 +29,7 @@
 //! drop), the autopilot is disengaged with the command that actually does it
 //! on this aircraft (`servos_fdir_off`; plain `servos_off` left it engaged).
 
+use crate::datarefs::ON_GROUND_ANY;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -528,6 +529,9 @@ const STEADY_BAND: f64 = 0.08;
 /// The ramp that finds lift-off from a flat pitch.
 const LIFT_RAMP: f64 = 0.04;
 /// Groundspeed under which a landing's parking brake is set, m/s (2 kt).
+/// Not `sim::ground::STOPPED_KTS` on purpose: a rotor still carrying weight
+/// creeps on its wheels (a knot and a half at LILO, see [`LOWER_RATE`]), and
+/// the brake is what stops that creep.
 const TOUCHDOWN_BRAKE_MAX_MPS: f64 = 1.0;
 
 /// Whether a landing on the ground at `gs` m/s may set the parking brake.
@@ -1167,7 +1171,6 @@ const PRESSURE_ALT: &str = "sim/flightmodel2/position/pressure_altitude";
 const AIR_REFRESH_S: f64 = 10.0;
 const Y_AGL: &str = "sim/flightmodel/position/y_agl";
 const VS_FPM: &str = "sim/flightmodel/position/vh_ind_fpm";
-const ONGROUND: &str = "sim/flightmodel/failures/onground_any";
 const GROUNDSPEED: &str = "sim/flightmodel/position/groundspeed";
 const THETA: &str = "sim/flightmodel/position/theta";
 const PHI: &str = "sim/flightmodel/position/phi";
@@ -1459,7 +1462,7 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, collective: String) {
     let mut rec = budget0.record(air, "power_budget");
     rec["known"] = serde_json::json!(loading.predicted().is_some());
     crate::blackbox::record("hover", rec);
-    let on_ground0 = xp.get_float(ONGROUND).await.is_ok_and(|g| g > 0.5);
+    let on_ground0 = xp.get_float(ON_GROUND_ANY).await.is_ok_and(|g| g > 0.5);
     if loading.predicted().is_some() && budget0.verdict() == PowerVerdict::NoHover {
         if on_ground0 {
             crate::blackbox::record(
@@ -1489,7 +1492,11 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, collective: String) {
     // A takeover in flight: the mode captured the velocity it was engaged
     // at, and the loop ramps from there, never from a zero that would ask
     // the cyclic for a stop in one step.
-    let (gnd0, vx0, vz0) = tokio::join!(xp.get_float(ONGROUND), xp.get_float(VX), xp.get_float(VZ));
+    let (gnd0, vx0, vz0) = tokio::join!(
+        xp.get_float(ON_GROUND_ANY),
+        xp.get_float(VX),
+        xp.get_float(VZ)
+    );
     let v0 = match (gnd0, vx0, vz0) {
         (Ok(g), Ok(x), Ok(z)) if g < 0.5 => [x, z],
         _ => drift0.target(),
@@ -1648,7 +1655,7 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, collective: String) {
         let (agl, vs, gnd, gs, th, ph, ap, hs, hv) = tokio::join!(
             xp.get_float(Y_AGL),
             xp.get_float(VS_FPM),
-            xp.get_float(ONGROUND),
+            xp.get_float(ON_GROUND_ANY),
             xp.get_float(GROUNDSPEED),
             xp.get_float(THETA),
             xp.get_float(PHI),

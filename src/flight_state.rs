@@ -671,6 +671,34 @@ mod tests {
         );
     }
 
+    /// The on-ground dataref is named once, `datarefs::ON_GROUND_ANY`: it
+    /// was redeclared in fifteen files (refactor audit 2026-10-04, #9).
+    #[test]
+    fn the_on_ground_dataref_is_named_once() {
+        let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut files = Vec::new();
+        fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            for e in std::fs::read_dir(dir).unwrap().flatten() {
+                let p = e.path();
+                if p.is_dir() {
+                    walk(&p, out);
+                } else if p.extension().is_some_and(|x| x == "rs") {
+                    out.push(p);
+                }
+            }
+        }
+        for dir in ["src", "crates/atc/src", "crates/sim/src"] {
+            walk(&manifest.join(dir), &mut files);
+        }
+        let literal = concat!("\"sim/flightmodel/failures/", "onground_any\"");
+        let named: Vec<_> = files
+            .iter()
+            .filter(|f| std::fs::read_to_string(f).unwrap().contains(literal))
+            .map(|f| f.strip_prefix(manifest).unwrap().display().to_string())
+            .collect();
+        assert_eq!(named, ["crates/sim/src/datarefs.rs"]);
+    }
+
     /// "Is an automation flying?" has one home: no file outside this one
     /// lists the loops' flags inline again. Three or more different owners'
     /// `ACTIVE.load` within a few lines is the pattern that grew nine copies

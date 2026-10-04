@@ -8,6 +8,7 @@
 //! profile, [`crate::aircraft`]); the sequencing logic here is shared. Universal
 //! datarefs (throttle, engine-running, bus volts) stay as consts.
 
+use crate::datarefs::ON_GROUND_ANY;
 use anyhow::Result;
 use async_trait::async_trait;
 use serde::Deserialize;
@@ -42,7 +43,6 @@ const BUS_VOLTS: &str = "sim/cockpit2/electrical/bus_volts";
 /// catch a battery that's actually off/flat (which reads ~0V), so it sits well
 /// below the live range rather than at the nominal bus voltage.
 const MIN_START_VOLTS: f64 = 12.0;
-const ONGROUND: &str = "sim/flightmodel/failures/onground_any";
 const GROUNDSPEED: &str = "sim/flightmodel/position/groundspeed"; // m/s
 const N1_PERCENT: &str = "sim/cockpit2/engine/indicators/N1_percent"; // per-engine, turbine spool
 /// Per-engine N2 — the high-pressure spool a TURBOFAN's start is flown
@@ -467,7 +467,7 @@ impl Tool for StartEngines {
         ctx.xplane
             .set_float(&self.start.mixture_lever, self.start.mixture_start_notch)
             .await?;
-        let on_ground = ctx.xplane.get_float(ONGROUND).await.unwrap_or(1.0) > 0.5;
+        let on_ground = ctx.xplane.get_float(ON_GROUND_ANY).await.unwrap_or(1.0) > 0.5;
         if on_ground {
             ctx.xplane
                 .set_float(&throttle_dref(), self.start.throttle_crack)
@@ -543,7 +543,7 @@ impl Tool for StopEngines {
     }
     async fn execute(&self, _args: &Value, ctx: &ToolCtx<'_>) -> Result<String> {
         // Don't shut engines down in flight or while still rolling.
-        if ctx.xplane.get_float(ONGROUND).await? < 0.5 {
+        if ctx.xplane.get_float(ON_GROUND_ANY).await? < 0.5 {
             return Ok(
                 "Negative — we're airborne. I won't shut the engines down in flight.".to_string(),
             );
@@ -1057,7 +1057,7 @@ impl Tool for StopTurbines {
         json!({ "type": "object", "properties": {}, "additionalProperties": false })
     }
     async fn execute(&self, _args: &Value, ctx: &ToolCtx<'_>) -> Result<String> {
-        if ctx.xplane.get_float(ONGROUND).await? < 0.5 {
+        if ctx.xplane.get_float(ON_GROUND_ANY).await? < 0.5 {
             return Ok(
                 "Negative — we're airborne. I won't shut the engines down in flight.".to_string(),
             );

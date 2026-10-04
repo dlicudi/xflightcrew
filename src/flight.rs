@@ -439,7 +439,7 @@ const REJECT_SECS: f64 = 2.0;
 /// Moving on the ground.
 const TAXI_KTS: f64 = 3.0;
 const TAXI_SECS: f64 = 3.0;
-const STOPPED_KTS: f64 = 1.0;
+const STOPPED_KTS: f64 = sim::ground::STOPPED_KTS;
 const HOLDING_SECS: f64 = 5.0;
 /// Airborne once the wheels have been off this long, or this high.
 const AIRBORNE_SECS: f64 = 1.5;

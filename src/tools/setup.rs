@@ -425,11 +425,9 @@ impl Tool for SetUpFlight {
     }
     async fn execute(&self, _args: &Value, ctx: &ToolCtx<'_>) -> Result<String> {
         // Starting a flight ENDS this one: only parked, and nothing flying it.
-        let (ground, gs) = tokio::join!(
-            ctx.xplane.get_float(crate::datarefs::ON_GROUND_ANY),
-            ctx.xplane.get_float("sim/flightmodel/position/groundspeed"),
-        );
-        if !ground.is_ok_and(|g| g > 0.5) || !gs.is_ok_and(|v| v.abs() < 1.0) {
+        // The load sheet's "stopped" (it refused at 1 kt while this ended
+        // the flight at 2 kt; refactor audit 2026-10-04, duplicates #9).
+        if !sim::ground::read_stopped_on_ground(ctx.xplane).await {
             return Ok("Only when we're stopped on the ground: setting up a flight ends this one.".into());
         }
         if crate::full_auto::ACTIVE.load(std::sync::atomic::Ordering::Relaxed) {
@@ -552,11 +550,10 @@ async fn follow_up(base: String, voice: Option<Voice>, body: String, origin: Str
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         let (g, gs, agl) = tokio::join!(
             xp.get_float(crate::datarefs::ON_GROUND_ANY),
-            xp.get_float("sim/flightmodel/position/groundspeed"),
+            xp.get_float(crate::datarefs::GROUNDSPEED_MS),
             xp.get_float(crate::datarefs::AGL_METERS),
         );
-        still = if g.is_ok_and(|g| g > 0.5)
-            && gs.is_ok_and(|v| v.abs() < 0.5)
+        still = if sim::ground::stopped_on_ground(g.ok(), gs.ok())
             && agl.is_ok_and(|m| (m * 3.28084).abs() <= SETTLE_GROUND_AGL_FT)
         {
             still + 1

@@ -60,7 +60,6 @@ pub(crate) const GS_MS: &str = "sim/flightmodel/position/groundspeed";
 fn throttle_dref() -> String {
     crate::aircraft::throttle_dataref()
 }
-const ON_GROUND: &str = "sim/flightmodel/failures/onground_any";
 /// The plugin's proportional steering channel (-1..1, right positive).
 const TAXI_STEER: &str = "xcopilot/taxi_steer";
 /// The sim's own toe-brake inputs, for the differential-brake steering assist
@@ -3343,7 +3342,7 @@ async fn drive(xp: XPlaneClient, voice: Option<Voice>, mut route: Route, base_kt
         // pushes again with everything already released. Airborne (a
         // runaway that got that far), touch nothing.
         if !speedhold::taxi_hold_active() {
-            let on_ground = xp.get_float(ON_GROUND).await.unwrap_or(0.0) > 0.5;
+            let on_ground = xp.get_float(crate::datarefs::ON_GROUND_ANY).await.unwrap_or(0.0) > 0.5;
             tracing::info!(
                 on_ground,
                 "auto taxi: taxi hold gone, arresting and releasing"

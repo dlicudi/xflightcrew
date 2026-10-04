@@ -15,7 +15,6 @@ const THROTTLE: &str = "sim/cockpit2/engine/actuators/throttle_ratio_all";
 const MIXTURE: &str = "sim/cockpit2/engine/actuators/mixture_ratio_all";
 const BATTERY: &str = "sim/cockpit/electrical/battery_on";
 const BUS_VOLTS: &str = "sim/cockpit2/electrical/bus_volts";
-const ONGROUND: &str = "sim/flightmodel/failures/onground_any";
 const GROUNDSPEED: &str = "sim/flightmodel/position/groundspeed"; // m/s
 const ENGN_RUNNING: &str = "sim/flightmodel/engine/ENGN_running";
 const CMD_MAGS_BOTH: &str = "sim/magnetos/magnetos_both";
@@ -235,7 +234,7 @@ impl Tool for SetMixture {
         if p.percent <= 0.0
             && ctx
                 .xplane
-                .get_float("sim/flightmodel/failures/onground_any")
+                .get_float(crate::datarefs::ON_GROUND_ANY)
                 .await
                 .unwrap_or(0.0)
                 <= 0.5
@@ -1457,7 +1456,7 @@ impl Tool for StopEngine {
         // Shutting the engine down in flight is an engine failure. Rather than
         // ask for confirmation, refuse unless it's actually safe: on the ground
         // and stopped. The parking brake the shutdown sets itself.
-        if ctx.xplane.get_float(ONGROUND).await? < 0.5 {
+        if ctx.xplane.get_float(crate::datarefs::ON_GROUND_ANY).await? < 0.5 {
             return Ok(
                 "Negative — we're airborne. I won't shut the engine down in flight.".to_string(),
             );
@@ -1531,7 +1530,7 @@ mod tests {
         // three-second-per-engine give-up and the test costs six seconds.
         let fake = std::sync::Arc::new(crate::xplane::FakeXPlane::with_reads(&[
             (BATTERY, 1.0),
-            (ONGROUND, 1.0),
+            (crate::datarefs::ON_GROUND_ANY, 1.0),
             ("laminar/b58/fuel_selector_L", 1.0),
             ("laminar/b58/fuel_selector_R", 1.0),
         ]));
@@ -1568,7 +1567,7 @@ mod tests {
         // rather than cranking a dry engine to no effect.
         let stuck = crate::xplane::FakeXPlane::with_reads(&[
             (BATTERY, 1.0),
-            (ONGROUND, 1.0),
+            (crate::datarefs::ON_GROUND_ANY, 1.0),
             ("laminar/b58/fuel_selector_L", 0.0),
             ("laminar/b58/fuel_selector_R", 0.0),
         ]);
@@ -1615,7 +1614,7 @@ mod tests {
         // Left running, right cold: crank starter 2 and never starter 1.
         let fake = std::sync::Arc::new(crate::xplane::FakeXPlane::with_reads(&[
             (BATTERY, 1.0),
-            (ONGROUND, 1.0),
+            (crate::datarefs::ON_GROUND_ANY, 1.0),
             ("laminar/b58/fuel_selector_L", 1.0),
             ("laminar/b58/fuel_selector_R", 1.0),
         ]));
@@ -1644,7 +1643,7 @@ mod tests {
         // Mirror case: left cold, right running.
         let fake = std::sync::Arc::new(crate::xplane::FakeXPlane::with_reads(&[
             (BATTERY, 1.0),
-            (ONGROUND, 1.0),
+            (crate::datarefs::ON_GROUND_ANY, 1.0),
             ("laminar/b58/fuel_selector_L", 1.0),
             ("laminar/b58/fuel_selector_R", 1.0),
         ]));
