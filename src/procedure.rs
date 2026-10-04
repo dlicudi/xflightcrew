@@ -4489,7 +4489,6 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, plan: Pla
                 // The governor lets go BEFORE autoland's throttle law starts,
                 // so no tick has two writers on the lever.
                 crate::tools::speedhold::release();
-                crate::autoland::ABORT.store(false, Ordering::SeqCst);
                 crate::autoland::run_autoland_scoped(
                     base_url.clone(),
                     apt_dat.clone(),

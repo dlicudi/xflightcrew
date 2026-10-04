@@ -530,7 +530,6 @@ mod tests {
             // their loops beside their runs.
             ("full_auto", "ABORT", "crate::full_auto::abort()"),
             ("procedure", "ABORT", "crate::procedure::abort()"),
-            ("autoland", "ABORT", "crate::autoland::abort()"),
             // Flags beside an unflagged run (one run at a time, `begin`),
             // cleared by their doors and the run's cleanup.
             ("full_auto", "ACTIVE", "crate::full_auto::abort()"),
@@ -887,19 +886,34 @@ mod tests {
 
     /// The circuit awaited the published-arrival lookup, then cleared
     /// autoland's ABORT and launched it: a stand-down landing inside that
-    /// await armed an autoland no parent could cancel. Its own ABORT is
-    /// read again between the await and the launch.
+    /// await armed an autoland no parent could cancel. Its own cancel is
+    /// read again between the await and the launch, the launch takes the
+    /// circuit's token as its parent, and nobody clears another loop's
+    /// latch: autoland has none (its run is cancelled, never a latch the
+    /// next launch inherits), and every launch names its parents.
     #[test]
     fn the_circuit_rechecks_its_abort_before_launching_autoland() {
         let src = crate::test_support::module_source("circuit");
         let at = src.find("if try_published_arrival(").unwrap();
         let rest = &src[at..];
-        let launch = rest.find("crate::autoland::ABORT.store(false").unwrap();
+        let launch = rest.find("crate::autoland::run_autoland_scoped(").unwrap();
         let recheck = rest.find("if xp.cancelled()").unwrap();
-        assert!(
-            recheck < launch,
-            "ABORT re-read before autoland's latch is cleared"
-        );
+        assert!(recheck < launch, "the circuit's cancel re-read before the launch");
+        let call = &rest[launch..launch + rest[launch..].find(");").unwrap()];
+        assert!(call.contains("xp.cancellation()"), "scoped to the circuit");
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        for f in crate::test_support::rust_files(&root) {
+            if f.ends_with("flight_state.rs") {
+                continue;
+            }
+            let text = std::fs::read_to_string(&f).unwrap();
+            for banned in ["autoland::ABORT", "autoland::run_autoland("] {
+                assert!(!text.contains(banned), "{}: {banned}", f.display());
+            }
+        }
+        let autoland = crate::test_support::module_source("autoland");
+        assert!(!autoland.contains("static ABORT"), "autoland has no latch");
+        assert!(!autoland.contains("pub fn run_autoland("), "no unscoped launch");
     }
 
     /// A power-up or jet start on its own thread kept firing switches through

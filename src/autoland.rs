@@ -62,8 +62,6 @@ use crate::tools::autopilot::ApConfig;
 use crate::voice::{Priority, Voice};
 use crate::xplane::XPlaneClient;
 
-/// Set true to cancel an active autoland ("cancel autoland" / "my controls").
-pub static ABORT: AtomicBool = AtomicBool::new(false);
 /// True while an autoland is flying (so cancel can acknowledge it). Written
 /// only by the run ([`RUN`]).
 pub static ACTIVE: AtomicBool = AtomicBool::new(false);
@@ -71,7 +69,10 @@ pub static ACTIVE: AtomicBool = AtomicBool::new(false);
 /// runway owns the aircraft from its first tick, the loop it replaces is
 /// cancelled and exits on its own), and nothing a superseded loop does on
 /// its way out touches the flag, the panel or the landing configuration of
-/// the loop that replaced it.
+/// the loop that replaced it. A cancel ("cancel autoland", "my controls", a
+/// stand-down) is [`abort`]: it cancels the run flying, never a latch the
+/// next launch inherits, so no caller clears anything before a launch, and
+/// a launcher's own cancel reaches the autoland through `parents`.
 pub(crate) static RUN: sim::run::Slot = sim::run::Slot::flagged(&ACTIVE);
 /// This approach's landing configuration (spoilers, autobrake) is set: the
 /// `landing_config` event. Cleared when an approach starts and ends.
@@ -1003,7 +1004,6 @@ impl UnclearedWatch {
 
 /// Cancel an active autoland; returns whether one was flying.
 pub fn abort() -> bool {
-    ABORT.store(true, Ordering::SeqCst);
     VACATE_FOLLOWS.store(false, Ordering::SeqCst);
     RUN.cancel()
 }
@@ -1013,28 +1013,6 @@ pub fn abort() -> bool {
 /// approach speed, gear/flaps come down on final, and it eases to idle in the
 /// flare. EXPERIMENTAL — untuned; test high, over an airport, with a hand ready.
 /// Own thread/runtime/client (like the recover watcher).
-#[allow(clippy::too_many_arguments)]
-pub fn run_autoland(
-    base: String,
-    apt_dat: String,
-    cfg: ApConfig,
-    approach_ias: f64,
-    voice: Option<Voice>,
-    status: Option<crate::plugin_status::StatusSink>,
-    forced_rwy: Option<PlannedRunway>,
-) {
-    run_autoland_scoped(
-        base,
-        apt_dat,
-        cfg,
-        approach_ias,
-        voice,
-        status,
-        forced_rwy,
-        Vec::new(),
-    );
-}
-
 #[allow(clippy::too_many_arguments)]
 pub fn run_autoland_scoped(
     base: String,
@@ -1049,6 +1027,9 @@ pub fn run_autoland_scoped(
     // `Some` forces that end; `None` self-picks by track — the emergency and
     // manual path, unchanged.
     forced_rwy: Option<PlannedRunway>,
+    // The launcher's cancel tokens: a cancel of the loop that handed the
+    // landing down (a stand-down landing before or after the launch) is the
+    // autoland's too. Empty only for the pilot's own request.
     parents: Vec<std::sync::Arc<AtomicBool>>,
 ) {
     spawn_autoland(AutolandLaunch {
@@ -1622,7 +1603,7 @@ fn spawn_autoland(launch: AutolandLaunch) {
             let mut coupling = crate::ils::Coupling::Off;
             let mut coupling_armed_s = 0.0_f64;
             loop {
-                if xp.cancelled() || !lease.current() || ABORT.load(Ordering::SeqCst) {
+                if xp.cancelled() || !lease.current() {
                     break;
                 }
                 // The tick runs to its period (`tick_ms`), not sleep + work.

@@ -1258,8 +1258,9 @@ async fn approach_follow_up(job: ApproachJob, loading: Loading) {
                 json!({ "airport": job.icao, "runway": job.runway, "final_nm": job.final_nm }),
             );
             hold_sortie_while(&crate::autoland::ACTIVE, sortie, SortieHold::LIVE);
-            crate::autoland::ABORT.store(false, std::sync::atomic::Ordering::SeqCst);
-            crate::autoland::run_autoland(
+            // The new flight's landing, launched by the setup alone: no
+            // parent (a stand-down takes it through autoland's own run).
+            crate::autoland::run_autoland_scoped(
                 job.base.clone(),
                 job.apt.clone(),
                 cfg,
@@ -1267,6 +1268,7 @@ async fn approach_follow_up(job: ApproachJob, loading: Loading) {
                 job.voice.clone(),
                 None,
                 Some(runway.clone()),
+                Vec::new(),
             );
             crate::flight::note_crew_takeover("setup_approach");
         }
@@ -1725,7 +1727,7 @@ mod tests {
         assert!(refusal < running, "asked before anything arms");
         // The approach follow-up holds the flag until it has armed.
         let this = crate::test_support::module_source("tools/setup");
-        let arm = this.find("crate::autoland::run_autoland(").unwrap();
+        let arm = this.find("crate::autoland::run_autoland_scoped(").unwrap();
         let drop_at = this.find("drop(loading);").unwrap();
         assert!(arm < drop_at, "the flag drops after the arm");
     }

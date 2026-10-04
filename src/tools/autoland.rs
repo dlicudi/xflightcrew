@@ -106,8 +106,7 @@ impl Tool for Autoland {
                     .to_string(),
             );
         }
-        crate::autoland::ABORT.store(false, std::sync::atomic::Ordering::SeqCst);
-        crate::autoland::run_autoland(
+        crate::autoland::run_autoland_scoped(
             ctx.config.xplane_base_url.clone(),
             apt_dat_path(),
             self.cfg.clone(),
@@ -115,6 +114,7 @@ impl Tool for Autoland {
             ctx.voice.cloned(),
             ctx.status.cloned(),
             None,
+            ctx.xplane.cancellation(),
         );
         Ok("I will land. Searching for the nearest runway, then I'll fly the approach. \
             Say 'my controls' to take it back."

@@ -3764,13 +3764,15 @@ async fn fly_authored_route(
     );
     // A circuit final is judged at the visual gate, 500 ft (#199).
     crate::autoland::set_next_gate(crate::stable_approach::GateKind::Visual);
-    crate::autoland::ABORT.store(false, Ordering::SeqCst);
     // FORCE the pattern's own runway. Bare `None` sends autoland to its
     // EMERGENCY behaviour — search the whole apt.dat for the best end by track
     // — which is right for an engine failure and catastrophically wrong here:
     // we are on short final to a runway we just took off from and flew a
     // pattern around, and the search does not know that.
-    crate::autoland::run_autoland(
+    // The circuit's own token is the autoland's parent: a stand-down landing
+    // around the launch cancels both (`handed_off` keeps the circuit's
+    // normal exit from doing it).
+    crate::autoland::run_autoland_scoped(
         base_url,
         apt_dat,
         cfg,
@@ -3782,6 +3784,7 @@ async fn fly_authored_route(
         // answer here — unlike an arrival, which knows its destination and
         // must say so (see `PlannedRunway`).
         Some(crate::autoland::PlannedRunway::anywhere(&rwy_id)),
+        xp.cancellation(),
     );
     handed_off(&xp);
 }
@@ -4766,8 +4769,9 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, p: Params
             }
             // A circuit final is judged at the visual gate, 500 ft (#199).
             crate::autoland::set_next_gate(crate::stable_approach::GateKind::Visual);
-            crate::autoland::ABORT.store(false, Ordering::SeqCst);
-            crate::autoland::run_autoland(
+            // The circuit's token is its parent: a stand-down that lands
+            // after the recheck above still cancels this autoland.
+            crate::autoland::run_autoland_scoped(
                 base_url.clone(),
                 p.apt_dat.clone(),
                 p.cfg.clone(),
@@ -4775,6 +4779,7 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, p: Params
                 voice.clone(),
                 None,
                 Some(crate::autoland::PlannedRunway::anywhere(&rwy_id)),
+                xp.cancellation(),
             );
             handed_off(&xp);
             return;
