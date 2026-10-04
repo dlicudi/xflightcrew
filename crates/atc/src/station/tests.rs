@@ -4208,6 +4208,84 @@ fn a_new_flight_or_field_forgets_wind_challenge_and_track() {
     OWN_FIXES.lock().unwrap().clear();
 }
 
+/// The crew's own runway at an uncontrolled field stands in for a cleared
+/// one (`party_line::clearance_runway`), but outlived the route it came
+/// with: `retire_for_new_flight` and `install` dropped `TAXI_ROUTE` and
+/// kept `SELF_TAXI`, so the next flight's line-up and takeoff cross-check
+/// read the last flight's runway end. It dies with the route now.
+#[test]
+fn a_new_flight_or_field_forgets_the_crews_own_runway() {
+    let _guard = SIDE_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    Station::uninstall();
+    let arm = || {
+        *SELF_TAXI.lock().unwrap() = Some("21".into());
+        assert_eq!(crate::party_line::clearance_runway().as_deref(), Some("21"));
+    };
+    arm();
+    retire_for_new_flight();
+    assert_eq!(crate::party_line::clearance_runway(), None, "a new flight");
+    arm();
+    lxgb().install();
+    assert_eq!(crate::party_line::clearance_runway(), None, "a new field");
+    arm();
+    Station::uninstall();
+    assert_eq!(crate::party_line::clearance_runway(), None, "ATC off");
+}
+
+/// `arm_new_flight` drops the old flight's region handoff and arrival pin,
+/// but only for a field with a tower (it returns before it clears them):
+/// a new flight at an untowered field kept a handoff the crew's first
+/// enroute pass would read back and retune for. A new flight drops them
+/// itself now; a region handoff's `install` still carries them (the main
+/// loop installs the next station before the crew consumes the handoff).
+#[test]
+fn a_new_flight_drops_the_old_handoff_and_pin_and_an_install_carries_them() {
+    let _guard = SIDE_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let arm = || {
+        *REGION_HANDOFF.lock().unwrap() = Some(RegionHandoff {
+            to: "Malaga Tower".into(),
+            khz: 118_150,
+            squawk_vfr: true,
+            ifr_code: None,
+        });
+        *ARRIVAL_PIN.lock().unwrap() = Some(118_150);
+    };
+    arm();
+    lxgb().install();
+    assert!(REGION_HANDOFF.lock().unwrap().is_some(), "install carries the handoff");
+    assert_eq!(*ARRIVAL_PIN.lock().unwrap(), Some(118_150), "and the pin");
+    retire_for_new_flight();
+    assert_eq!(crate::party_line::take_region_handoff(), None);
+    assert_eq!(*ARRIVAL_PIN.lock().unwrap(), None);
+    arm();
+    Station::uninstall();
+    assert_eq!(crate::party_line::take_region_handoff(), None);
+    assert_eq!(*ARRIVAL_PIN.lock().unwrap(), None);
+}
+
+/// The doors' order: a new flight's flag goes up with the clearances gone,
+/// and only a whole install takes it down, with the station's own facts
+/// published (never an empty field in between for the region watch).
+#[test]
+fn install_ends_the_new_flight_with_the_field_published() {
+    let _guard = SIDE_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    retire_for_new_flight();
+    assert!(new_flight_pending());
+    let st = lxgb();
+    st.install();
+    assert!(!new_flight_pending());
+    let panel = ACTIVE_PANEL.lock().unwrap().as_ref().map(|p| p.0.clone());
+    let freqs = !CONTROLLER_FREQS.lock().unwrap().is_empty();
+    let grace = COMPLIANCE.lock().unwrap().zone_last.is_some();
+    Station::uninstall();
+    assert_eq!(panel, Some(st.airport_name().to_string()));
+    assert!(freqs);
+    assert!(grace, "zone-watch grace");
+    assert!(ACTIVE_PANEL.lock().unwrap().is_none());
+    assert!(CONTROLLER_FREQS.lock().unwrap().is_empty());
+    assert!(COMPLIANCE.lock().unwrap().zone_last.is_none());
+}
+
 /// LFLL-EGLL, 2026-09-17. Inbound to Heathrow with the inbound call made
 /// and answered, the region's tick found London City eight miles off the
 /// nose against Heathrow's fifteen — nearer AND service-weighted — and

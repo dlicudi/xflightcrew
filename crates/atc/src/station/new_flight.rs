@@ -18,56 +18,6 @@ pub(super) fn publish_clearance(snap: ClearanceSnap) {
     *CLEARANCE.lock().unwrap_or_else(|e| e.into_inner()) = Some(snap);
 }
 
-/// THE FLIGHT THAT ENDED TAKES ITS CLEARANCES WITH IT. Called by the crew the
-/// moment a new flight exists (the sim has repositioned us for "put us on a
-/// ten mile final"), BEFORE anything flies it: the landing clearance, the
-/// approach handoff, the vectors, the held release, the taxi route, the IFR
-/// clearance and code and every pending flag on the party line belonged to the
-/// last flight. LEMG, 2026-09-28 (sortie 1790584266-approach): the previous
-/// case had been cleared to land on 12; the reposition to a 10 nm final for
-/// 13 armed autoland 1.3 s later, it read "cleared to land 12" off the party
-/// line before the crew's new final call went out, and turned the 737 toward
-/// a centreline 3.6 km away. The station for the field is rebuilt by
-/// [`arm_new_flight`] a few seconds later; until the main loop installs it the
-/// old station, still answering, publishes nothing.
-pub fn retire_for_new_flight() {
-    NEW_FLIGHT_PENDING.store(true, std::sync::atomic::Ordering::SeqCst);
-    UNCONTROLLED_ARRIVAL.store(false, Ordering::SeqCst);
-    *CLEARANCE.lock().unwrap_or_else(|e| e.into_inner()) = None;
-    *LANDING_HANDOFF.lock().unwrap_or_else(|e| e.into_inner()) = None;
-    *VECTORS.lock().unwrap_or_else(|e| e.into_inner()) = None;
-    *TAKEOFF_HOLD.lock().unwrap_or_else(|e| e.into_inner()) = None;
-    *TAXI_ROUTE.lock().unwrap_or_else(|e| e.into_inner()) = None;
-    *TAXI_TO_STAND.lock().unwrap_or_else(|e| e.into_inner()) = false;
-    *LINE_UP_CONDITION.lock().unwrap_or_else(|e| e.into_inner()) = None;
-    *DEPARTURE_HANDOFF.lock().unwrap_or_else(|e| e.into_inner()) = None;
-    *ASSIGNED_SQUAWK.lock().unwrap_or_else(|e| e.into_inner()) = None;
-    // The radar watch on that code, and its nudge, were the old flight's
-    // too: a watch left armed says "radar contact" at the next liftoff.
-    *SQUAWK_WATCH.lock().unwrap_or_else(|e| e.into_inner()) = None;
-    *SQUAWK_NUDGE.lock().unwrap_or_else(|e| e.into_inner()) = None;
-    *HANDOFF.lock().unwrap_or_else(|e| e.into_inner()) = None;
-    *IFR_CLEARANCE.lock().unwrap_or_else(|e| e.into_inner()) = None;
-    *IFR_FLIGHT.lock().unwrap_or_else(|e| e.into_inner()) = None;
-    *PENDING_TAKEOFF_CLEARANCE
-        .lock()
-        .unwrap_or_else(|e| e.into_inner()) = false;
-    *PENDING_LINE_UP.lock().unwrap_or_else(|e| e.into_inner()) = false;
-    *PENDING_GO_AROUND.lock().unwrap_or_else(|e| e.into_inner()) = false;
-    *PENDING_RESEQUENCE.lock().unwrap_or_else(|e| e.into_inner()) = None;
-    *RESEQUENCED_ORDER.lock().unwrap_or_else(|e| e.into_inner()) = None;
-    *LANDING_HOLD.lock().unwrap_or_else(|e| e.into_inner()) = None;
-    *PENDING_LANDING_RELEASE
-        .lock()
-        .unwrap_or_else(|e| e.into_inner()) = None;
-    // A challenge raised for the old flight, the wind the tower worked it
-    // with, and our track before the jump: a groundspeed derived across a
-    // reposition judged the new final's go-around.
-    *ZONE_CHALLENGE.lock().unwrap_or_else(|e| e.into_inner()) = false;
-    *TOWER_WIND.lock().unwrap_or_else(|e| e.into_inner()) = None;
-    OWN_FIXES.lock().unwrap_or_else(|e| e.into_inner()).clear();
-}
-
 /// A NEW FLIGHT at `icao` (the crew's "put us on a ten mile final", which
 /// starts a flight through the sim's own initialisation): the station for that
 /// field is rebuilt from nothing on the main loop's next pass, even when it is

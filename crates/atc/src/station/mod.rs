@@ -336,168 +336,6 @@ impl Station {
     pub fn airport_name(&self) -> &str {
         &self.apt.name
     }
-
-    /// Publish this station's process-wide side state — the ATIS broadcast
-    /// and the enroute switch identity the monitor's ticks read. Called by
-    /// the OWNER once a station goes live (startup and each region handoff),
-    /// never by `from_airport` itself, so offline sweeps and tests stay
-    /// side-effect free.
-    pub fn install(&self) {
-        // A new station starts in reach; the next monitor tick judges it.
-        OUT_OF_REACH.store(false, std::sync::atomic::Ordering::Relaxed);
-        UNCONTROLLED_ARRIVAL.store(false, Ordering::SeqCst);
-        // ...and is the new flight's station: its replies publish again.
-        NEW_FLIGHT_PENDING.store(false, std::sync::atomic::Ordering::SeqCst);
-        *ACTIVE_FIELD.lock().unwrap_or_else(|e| e.into_inner()) = self
-            .apt
-            .position()
-            .map(|(lat, lon)| (self.apt.name.clone(), lat, lon));
-        // Controller frequencies, for the monitor's traffic advisories: a
-        // controller narrates traffic whenever the pilot is on frequency,
-        // not only while being vectored.
-        let mut freqs = vec![(self.tower_khz, StationSpeaker::Tower)];
-        if let Some(k) = self.approach_khz {
-            freqs.push((k, StationSpeaker::Approach));
-        }
-        if let Some(k) = self.departure_khz {
-            freqs.push((k, StationSpeaker::Departure));
-        }
-        *CONTROLLER_FREQS.lock().unwrap_or_else(|e| e.into_inner()) = freqs;
-        // A new station means the old radar service (and its code) is void,
-        // and the new tower has never talked to you — or to its ghosts.
-        *SQUAWK_WATCH.lock().unwrap_or_else(|e| e.into_inner()) = None;
-        *SQUAWK_NUDGE.lock().unwrap_or_else(|e| e.into_inner()) = None;
-        *ASSIGNED_SQUAWK.lock().unwrap_or_else(|e| e.into_inner()) = None;
-        *IFR_CLEARANCE.lock().unwrap_or_else(|e| e.into_inner()) = None;
-        *CLEARANCE.lock().unwrap_or_else(|e| e.into_inner()) = None;
-        // Zone-watch grace on a fresh station: a region handoff says
-        // "contact <name> Tower" and the pilot deserves the cooldown window
-        // to actually call — being challenged as an intruder two seconds
-        // after the handoff (2026-07-10 tape) reads as a tower at war with
-        // its own radar room.
-        *COMPLIANCE.lock().unwrap_or_else(|e| e.into_inner()) = ComplianceState {
-            zone_last: Some(Instant::now()),
-            ..ComplianceState::NEW
-        };
-        *TAKEOFF_HOLD.lock().unwrap_or_else(|e| e.into_inner()) = None;
-        *PENDING_TAKEOFF_CLEARANCE
-            .lock()
-            .unwrap_or_else(|e| e.into_inner()) = false;
-        *PENDING_LINE_UP.lock().unwrap_or_else(|e| e.into_inner()) = false;
-        *PENDING_GO_AROUND.lock().unwrap_or_else(|e| e.into_inner()) = false;
-        *PENDING_RESEQUENCE.lock().unwrap_or_else(|e| e.into_inner()) = None;
-        *RESEQUENCED_ORDER.lock().unwrap_or_else(|e| e.into_inner()) = None;
-        *GO_AROUND_LAST.lock().unwrap_or_else(|e| e.into_inner()) = None;
-        *LANDING_HOLD.lock().unwrap_or_else(|e| e.into_inner()) = None;
-        *PENDING_LANDING_RELEASE
-            .lock()
-            .unwrap_or_else(|e| e.into_inner()) = None;
-        *STRIP_SEEN.lock().unwrap_or_else(|e| e.into_inner()) = None;
-        *GHOSTS.lock().unwrap_or_else(|e| e.into_inner()) = None;
-        *WAKE.lock().unwrap_or_else(|e| e.into_inner()) = None;
-        *WAKE_PREV.lock().unwrap_or_else(|e| e.into_inner()) = None;
-        *DEPARTURE_STREAM.lock().unwrap_or_else(|e| e.into_inner()) = None;
-        *ARRIVAL_STREAM.lock().unwrap_or_else(|e| e.into_inner()) = None;
-        *TAXI_ROUTE.lock().unwrap_or_else(|e| e.into_inner()) = None;
-        // The last field's wind is not this field's (a re-sequence fell back
-        // to it), and a challenge nobody answered is not kept for this tower.
-        *TOWER_WIND.lock().unwrap_or_else(|e| e.into_inner()) = None;
-        *ZONE_CHALLENGE.lock().unwrap_or_else(|e| e.into_inner()) = false;
-        // The previous field's worksheets die with it: a region handoff calls
-        // install() WITHOUT uninstall(), and anything left armed here keeps
-        // acting for a station that no longer exists. An armed vector plan
-        // kept steering toward the old field's threshold; a takeoff handoff
-        // ("contact <old field> Departure on ...") could fire on a later
-        // climb at the new field; a stale arrival taxi-in flag exempted
-        // runway occupancy from the incursion watch. Same trap family as the
-        // radio-power latch: a process-wide fact must not outlive its field.
-        *TAXI_TO_STAND.lock().unwrap_or_else(|e| e.into_inner()) = false;
-        *VECTORS.lock().unwrap_or_else(|e| e.into_inner()) = None;
-        *LANDING_HANDOFF.lock().unwrap_or_else(|e| e.into_inner()) = None;
-        *HANDOFF.lock().unwrap_or_else(|e| e.into_inner()) = None;
-        *LINE_UP_CONDITION.lock().unwrap_or_else(|e| e.into_inner()) = None;
-        *DEPARTURE_HANDOFF.lock().unwrap_or_else(|e| e.into_inner()) = None;
-        *ACTIVE_PANEL.lock().unwrap_or_else(|e| e.into_inner()) =
-            Some((self.apt.name.clone(), self.apt.elev_ft, services(&self.apt)));
-        *ACTIVE_RUNWAYS.lock().unwrap_or_else(|e| e.into_inner()) = self.apt.runways.clone();
-        *ATIS.lock().unwrap_or_else(|e| e.into_inner()) = self.apt.freq(nav::FREQ_ATIS).map(|f| {
-            tracing::info!(
-                mhz = f.khz as f64 / 1000.0,
-                "ATIS broadcasting on frequency"
-            );
-            AtisState {
-                khz: f.khz,
-                airport: spoken_airport(&self.apt.name).to_string(),
-                runways: self.apt.runways.clone(),
-                letter: 'A',
-                edition: None,
-                last_spoken: None,
-            }
-        });
-    }
-
-    /// The inverse of [`Station::install`]: retire the world entirely. Clears
-    /// every published static — the party line AND the monitor-tick side
-    /// state — so the crew's coaches, panel, and watches see "no ATC" the
-    /// same instant the owner drops the station. Called by the OWNER when
-    /// the app leaves an ATC-capable mode; the region index and background
-    /// caches (taxi net, ILS facts) survive so re-enabling is cheap.
-    pub fn uninstall() {
-        NEW_FLIGHT_PENDING.store(false, std::sync::atomic::Ordering::SeqCst);
-        *SURFACE_WIND.lock().unwrap_or_else(|e| e.into_inner()) = None;
-        *ACTIVE_FIELD.lock().unwrap_or_else(|e| e.into_inner()) = None;
-        *CONTROLLER_FREQS.lock().unwrap_or_else(|e| e.into_inner()) = Vec::new();
-        OUT_OF_REACH.store(false, std::sync::atomic::Ordering::Relaxed);
-        UNCONTROLLED_ARRIVAL.store(false, Ordering::SeqCst);
-        *SELF_TAXI.lock().unwrap_or_else(|e| e.into_inner()) = None;
-        *ACTIVE_PANEL.lock().unwrap_or_else(|e| e.into_inner()) = None;
-        *ACTIVE_RUNWAYS.lock().unwrap_or_else(|e| e.into_inner()) = Vec::new();
-        *ATIS.lock().unwrap_or_else(|e| e.into_inner()) = None;
-        *SQUAWK_WATCH.lock().unwrap_or_else(|e| e.into_inner()) = None;
-        *SQUAWK_NUDGE.lock().unwrap_or_else(|e| e.into_inner()) = None;
-        *COMPLIANCE.lock().unwrap_or_else(|e| e.into_inner()) = ComplianceState::NEW;
-        *HANDOFF.lock().unwrap_or_else(|e| e.into_inner()) = None;
-        *GHOSTS.lock().unwrap_or_else(|e| e.into_inner()) = None;
-        *WAKE.lock().unwrap_or_else(|e| e.into_inner()) = None;
-        *WAKE_PREV.lock().unwrap_or_else(|e| e.into_inner()) = None;
-        *DEPARTURE_STREAM.lock().unwrap_or_else(|e| e.into_inner()) = None;
-        *ARRIVAL_STREAM.lock().unwrap_or_else(|e| e.into_inner()) = None;
-        *GO_AROUND_LAST.lock().unwrap_or_else(|e| e.into_inner()) = None;
-        *LANDING_HOLD.lock().unwrap_or_else(|e| e.into_inner()) = None;
-        *PENDING_LANDING_RELEASE
-            .lock()
-            .unwrap_or_else(|e| e.into_inner()) = None;
-        *STRIP_SEEN.lock().unwrap_or_else(|e| e.into_inner()) = None;
-        // The party line: no clearance, no route, no vectors, no pending
-        // anything — a re-enable starts from a cold contact, like a fresh
-        // boot.
-        *CLEARANCE.lock().unwrap_or_else(|e| e.into_inner()) = None;
-        *TAXI_ROUTE.lock().unwrap_or_else(|e| e.into_inner()) = None;
-        *TAXI_TO_STAND.lock().unwrap_or_else(|e| e.into_inner()) = false;
-        *TAKEOFF_HOLD.lock().unwrap_or_else(|e| e.into_inner()) = None;
-        *LINE_UP_CONDITION.lock().unwrap_or_else(|e| e.into_inner()) = None;
-        *DEPARTURE_HANDOFF.lock().unwrap_or_else(|e| e.into_inner()) = None;
-        *VECTORS.lock().unwrap_or_else(|e| e.into_inner()) = None;
-        *LANDING_HANDOFF.lock().unwrap_or_else(|e| e.into_inner()) = None;
-        // The doc on the party line promises this one dies here.
-        *ASSIGNED_SQUAWK.lock().unwrap_or_else(|e| e.into_inner()) = None;
-        *IFR_CLEARANCE.lock().unwrap_or_else(|e| e.into_inner()) = None;
-        *IFR_FLIGHT.lock().unwrap_or_else(|e| e.into_inner()) = None;
-        *PENDING_STATION.lock().unwrap_or_else(|e| e.into_inner()) = None;
-        *ARRIVAL_PIN.lock().unwrap_or_else(|e| e.into_inner()) = None;
-        // NOT cleared by install(): the new station is installed on the main
-        // loop's next pass, before the crew has consumed the handoff.
-        *REGION_HANDOFF.lock().unwrap_or_else(|e| e.into_inner()) = None;
-        *PENDING_TAKEOFF_CLEARANCE
-            .lock()
-            .unwrap_or_else(|e| e.into_inner()) = false;
-        *PENDING_LINE_UP.lock().unwrap_or_else(|e| e.into_inner()) = false;
-        *PENDING_GO_AROUND.lock().unwrap_or_else(|e| e.into_inner()) = false;
-        *PENDING_RESEQUENCE.lock().unwrap_or_else(|e| e.into_inner()) = None;
-        *RESEQUENCED_ORDER.lock().unwrap_or_else(|e| e.into_inner()) = None;
-        *ZONE_CHALLENGE.lock().unwrap_or_else(|e| e.into_inner()) = false;
-        *TOWER_WIND.lock().unwrap_or_else(|e| e.into_inner()) = None;
-    }
 }
 
 mod atis_watch;
@@ -515,6 +353,7 @@ mod routing;
 mod runway_pick;
 mod runways;
 mod self_taxi;
+mod state;
 mod strip;
 mod takeoff_hold;
 mod taxi;
@@ -534,6 +373,7 @@ pub use region::*;
 pub use routing::*;
 pub use runways::*;
 pub use self_taxi::*;
+pub use state::*;
 pub use strip::*;
 pub use takeoff_hold::*;
 pub use taxi::*;

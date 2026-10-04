@@ -17,6 +17,12 @@
 //! copilot see of ATC?" stays answerable on one page. Until the sides live
 //! in separate crates this is convention, not compiler-checked; keep the
 //! surface small enough to audit by eye.
+//!
+//! Every static here has a LIFETIME, classified with the station's in
+//! `station/state.rs` (`PartyLineFacts`, `FlightCarried`, `WorldOnly`,
+//! `SESSION`): the groups are what `Station::install`, `Station::uninstall`
+//! and [`retire_for_new_flight`] reset, and a source scan fails the tests
+//! on a static nobody classified.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard};
@@ -84,7 +90,8 @@ pub(crate) static PENDING_STATION: Mutex<Option<(String, nav::AirportInfo)>> = M
 /// While it is set the enroute region may hand the station TO that field and
 /// never away from it: a controller we are already talking to, inbound, is
 /// not a controller a nearer strip may take from us. Set by the crew at the
-/// inbound call, cleared when the arrival is over.
+/// inbound call, cleared when the arrival is over, by a new flight and by
+/// `uninstall`; it survives `install`.
 pub(crate) static ARRIVAL_PIN: Mutex<Option<i64>> = Mutex::new(None);
 
 /// The crew's provider of what the sim cannot say about our callsign: the
@@ -193,7 +200,8 @@ pub(crate) static DEPARTURE_HANDOFF: Mutex<Option<(String, i64)>> = Mutex::new(N
 /// back, dials 7000 and retunes; with the pilot flying the monitor coaches
 /// once). It survives `Station::install` on purpose: the main loop installs
 /// the NEW station on its very next pass, before the crew's loop has polled,
-/// and an install that wiped it would lose every handoff. `uninstall` ends it.
+/// and an install that wiped it would lose every handoff. `uninstall` and a
+/// new flight end it.
 pub(crate) static REGION_HANDOFF: Mutex<Option<RegionHandoff>> = Mutex::new(None);
 
 /// The zone watch challenged us on the frequency ("aircraft in the Granada

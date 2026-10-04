@@ -23,9 +23,10 @@ pub(super) fn field_at(apt_path: &str, lat: f64, lon: f64) -> Option<(String, na
 
 /// The published [`TAXI_ROUTE`] is the crew's own (an uncontrolled field),
 /// not a controller's, to this runway end. Cleared by any controller's
-/// route. It stands where a controller's cleared runway would for the
-/// line-up: with none, the line-up took the nearest end and lined the
-/// Evolution up on LILB 21 for a route planned to 03 (2026-09-25).
+/// route, and with the flight and the field (`StationFlight`). It stands
+/// where a controller's cleared runway would for the line-up: with none,
+/// the line-up took the nearest end and lined the Evolution up on LILB 21
+/// for a route planned to 03 (2026-09-25).
 pub(super) static SELF_TAXI: Mutex<Option<String>> = Mutex::new(None);
 
 /// The runway of the crew's own route, when there is one.
