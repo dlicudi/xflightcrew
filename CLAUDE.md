@@ -15,8 +15,7 @@ its one-line why. Each section's pre-diet text is in the history under "2026-09-
 
 ## Wire contracts (never rename)
 
-Named 2026-07-30 (repo `dlicudi/xvoicelayer`, dir `~/GitHub/xvoicelayer`). Three names survived the
-rename because they are wire contracts:
+Named 2026-07-30. Three names survived the rename because they are wire contracts:
 
 - the `xcopilot/*` dataref namespace (app and plugin agree on the strings),
 - the `XCOPILOT_*` env vars (the pilot's own `.env` and `prefs.json`),
@@ -26,13 +25,6 @@ Package `xvoicelayer`, binary `xvl`. The tracing filter names every crate AND bo
 `xvoicelayer=info,xvl=info,atc=info,sim=info` (`src/main.rs`). A line's default target is the BIN
 name in the binary and the PACKAGE name in the lib: drop either and half the log goes silently while
 explicit-target lines make it look healthy.
-
-## Neighbours
-
-- **Horizon** (`~/GitHub/horizon`): ABANDONED 2026-09-11. The instructor is the third persona here
-  (`mode::Instructor`, `src/instructor.rs`).
-- **rustdecks** (`~/GitHub/rustdecks`): sibling Loupedeck controller. Hunting a dataref or command
-  name, check its `examples/*.yaml` (verified on real panels) before DataRefs.txt. It mirrors this.
 
 ## Stack (decided)
 
@@ -46,7 +38,7 @@ Rust: a latency- and audio-sensitive real-time loop.
 | X-Plane write | `reqwest` PATCH to the Web API (`PATCH /api/v1/datarefs/{id}/value`) |
 | TTS readback | in-process piper VITS via the `ort` crate |
 
-- **No LLM, local or cloud**: the Ollama fallback was measured useless and a frame-rate cost.
+- **No LLM, local or cloud**: runtime intent selection is deterministic.
   `xvl analyze` lists the top missed phrasings; each becomes a rule, matcher or profile entry with
   the live transcript as its test. `xvl analyze --now --since 2026-09-20` replays misses through
   TODAY's STT repairs and grammar (the 172's registry); waiver, plan-load and ATC branches live

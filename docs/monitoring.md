@@ -10,8 +10,7 @@ bust an altitude and says nothing isn't a copilot.
   *judgment* over the panel's own alarms.
 - **Non-goals:**
   - echoing the aircraft's built-in alarms (stall horn, gear horn, master caution);
-  - grading technique after the fact — that's Horizon, deliberately a separate
-    product (see `CLAUDE.md`). Monitoring stays operational and in the moment;
+  - grading technique after the fact. Monitoring stays operational and in the moment;
   - touching the controls. Alerting is voice-only: it tells, it never seizes. It
     is the **proactive sibling of the tool safety gates** (e.g. "gear up on the
     ground → refuse") — the same safety logic, running continuously and speaking

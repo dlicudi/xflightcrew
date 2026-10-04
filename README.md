@@ -221,7 +221,6 @@ live installs for nothing.
 cargo test --workspace                        # everything deterministic, no sim needed
 cargo test --release -p atc -- --ignored atc_world_sweep   # cross-airport sweep (needs apt.dat)
 cargo run -- stt-eval bench/atc_stt_cases.yaml             # spoken-call accuracy
-scripts/llm_bench.sh qwen3:8b                             # tool-pick battery (needs Ollama)
 ```
 
 Every flight writes `logs/blackbox.jsonl`; `xvl analyze` mines the logs for
@@ -230,8 +229,7 @@ phrasings the deterministic grammar missed.
 ## Licensing
 
 **GPL-3.0-or-later** ([LICENSE](LICENSE)). Free software, never commercial, and
-X-Plane only. Copyleft is the point: the flight-sim ecosystem's payware norm
-shouldn't be able to absorb this work without giving it back.
+X-Plane only. Contributions and derivative works are governed by the license.
 
 Third-party components keep their own, all permissive and all GPL-compatible:
 the X-Plane SDK is MIT/BSD, Dear ImGui is MIT, ImgWindow is BSD-3-Clause, and

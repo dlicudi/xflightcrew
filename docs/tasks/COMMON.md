@@ -28,9 +28,7 @@ docs/dev-history.md before reworking any subsystem it names.
   profile with the old default when silent.
 - Commit on your worktree branch as you go, small commits, each message a
   sentence in the repo's style (what changed and the evidence that made it
-  change). End every commit message with:
-  `Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>`
-  Do not push. Do not merge into main.
+  change). Do not push. Do not merge into main.
 - Your final message is the only thing that reaches the pilot. Report: what
   you found (numbers), what you changed (files, functions), the tests you
   added, what is still unflown and which blackbox event proves it on the

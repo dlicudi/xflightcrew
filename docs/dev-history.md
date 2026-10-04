@@ -329,22 +329,12 @@ floor is still refused, with the number that would work.
 
 ## The LLM retired, and a night of rules — 2026-09-13
 
-"Is the LLM not worth having?" The answer-only Ollama fallback (qwen3:8b,
-thinking off, off by default since July) was switched on from the panel and
-tested live on the LEMG sortie the evening before: four utterances reached
-it in about a second each, three were correctly refused by its own prompt
-("Say again?" for a statement, chatter and an opinion question), the one
-real question came back as a three-word fragment, the cold load took 96 s,
-and Ollama generating on Metal is the one measured cause of the sim dropping
-to 20 to 30 fps. Everything worth answering that night had been answered
-before the model was consulted. Decision, the pilot's: "the better approach
-is to augment our deterministic code", and "wipe out LLM config etc".
+The answer fallback was tested live and then removed. Runtime intent and
+answers moved to deterministic code so behavior could be tested and replayed.
 
-Removed: `llm.rs` and `rag.rs` (the RAG index's only consumer was the answer
-path, and its embeddings came from Ollama), the `index` and `ask`
-subcommands, the config knobs (`XCOPILOT_LLM`, `XCOPILOT_MODEL`,
-`OLLAMA_BASE_URL`, keepalive, GPU layers), the settings-registry knob, the
-Health screen's Ollama probe and LLM line, the plugin's `xcopilot/llm_enabled`
+Removed: `llm.rs` and `rag.rs`, the `index` and `ask` subcommands, the model
+config knobs, the settings-registry knob, the Health screen's model probe and
+LLM line, the plugin's `xcopilot/llm_enabled`
 dataref and its Settings checkbox, the warmup on the mode edge, the
 `ToolSpec` plumbing and each checklist's model-facing description. The
 `ToolCall` type moved to `tools`. The correction path ("negative, 500") now
@@ -987,45 +977,9 @@ branding, and changing them breaks live installs for nothing: the `xcopilot/*`
 DATAREF namespace (the app and the plugin agree on these strings), the
 `XCOPILOT_*` ENV VARS (the pilot's own `.env` and `prefs.json`), and the plugin
 binary `xcopilot.xpl` (rename it and X-Plane happily loads BOTH copies, which
-double-registers every dataref). Everything else DID move on 2026-07-30: the
-GitHub repo (`dlicudi/xvoicelayer`, old URL redirects, so stale clones keep
-working) and the local directory (`~/GitHub/xvoicelayer`). The directory move
-was the fiddly one, because three things key on the absolute path and none of
-them announce it when they break: the agent's per-project memory directory
-(keyed on the path; 25 memories and 55 session transcripts, silently orphaned by a plain `mv` of
-the repo alone), the absolute paths in `.claude/settings*.json`, and the
-cross-reference at `~/GitHub/rustdecks/CLAUDE.md:34`. The Rust crate
-identifier DID change, to `xvoicelayer` — see the tracing-filter warning in the
-battle-test section, since a stale filter silently drops every crew-side log
-line.
-
-## Relationship to Horizon
-
-This is a **separate product** from Horizon (`~/GitHub/horizon`), not an extension —
-and the distinction is the whole point:
-
-- **Horizon = instructor.** One-way, grades you, and *deliberately never touches
-  the controls*. That's what teaching is.
-- **XVoiceLayer = crew.** Two-way, *acts on the aircraft* by writing datarefs.
-  Different trust model, failure modes, and UX. Merging them would muddy both.
-
-Horizon is Python; XVoiceLayer is Rust, so code isn't lifted directly — but two
-patterns port over conceptually: its X-Plane Web API client (~30 lines of HTTP)
-and its "shell out to the `piper` binary" TTS trick.
-
-## Sibling reference: rustdecks
-
-`~/GitHub/rustdecks` (a Loupedeck Live controller for X-Plane) is the other
-half of a two-way dataref/command exchange — when hunting a dataref or command
-name, check there before the sim's DataRefs.txt. Its `src/sim.rs` is the
-proven Web API client [src/livestate.rs](src/livestate.rs) was ported from;
-its `examples/*.yaml` profiles (and the `~/GitHub/cockpitdecks` /
-`~/GitHub/cockpitdecks-configs` clones it references) carry per-airframe
-dataref/command names verified against real panels (SR22 AP, radios,
-transponder, engine gauges). The flow runs both ways: datarefs/commands
-proven here (datarefs.rs, the tool layer, aircraft profiles, xlua
-study-level tricks) are worth mining for rustdecks pages, and vice versa —
-its CLAUDE.md carries the mirror of this note.
+double-registers every dataref). The Rust crate identifier changed to
+`xvoicelayer`; see the tracing-filter warning in the battle-test section,
+since a stale filter silently drops every crew-side log line.
 
 ## Stack (decided)
 
@@ -1036,20 +990,20 @@ earns its keep over a Python runtime + GIL.
 |---|---|
 | Mic capture | `cpal` |
 | STT | `whisper-rs` (whisper.cpp bindings) — push-to-talk for v1 |
-| LLM tool-use | **Local** — `reqwest` → Ollama (`/api/chat`), backend-neutral tool schema |
+| LLM tool-use | **Local** — backend-neutral tool schema |
 | X-Plane write | `reqwest` PATCH to the Web API (`PATCH /api/v1/datarefs/{id}/value`) |
 | TTS readback | in-process piper VITS via the `ort` crate (ONE engine, see below) |
 
 **LLM runs locally — cloud is ruled out** because per-call API metering doesn't
 fit a real-time copilot you'd use for a whole flight. The whole loop is offline:
 whisper (ears) and piper (mouth) were always local, and the tool-picker (brain)
-is a local model served by Ollama. The tool schema is kept backend-neutral (just
+was a local model. The tool schema is kept backend-neutral (just
 `name` + `description` + JSON-schema `parameters`) so the *local* backend can be
-swapped (Ollama → llama.cpp server, a different model) without touching the tool
+swapped without touching the tool
 layer — not as a hook for a cloud option.
 
 **X-Plane access: REST + a native companion plugin.** The app talks to the sim
-over the Web API (separate process, same API Horizon polls) — every stock
+over the Web API — every stock
 dataref read/write goes that way. But some things only a plugin can do, so a
 small C++ plugin ([plugin/src/](plugin/src/) — since the 2026-07-15 tidy-up,
 `xcopilot.cpp` is a thin lifecycle entry over `drefs.cpp` (dataref/command
@@ -3146,13 +3100,11 @@ against the handoff (the station stays silent to any readback shape).
 
 ## App modes: Both / Copilot only / ATC only (runtime-toggleable)
 
-The two halves sell separately (2026-07-14): `mode.rs` holds one process-wide
-mode, **both** (default), **copilot** (no simulated ATC: no station ever
+`mode.rs` holds one process-wide mode: **both** (default), **copilot** (no simulated ATC: no station ever
 loads, radio-keyed speech is IGNORED because real/external ATC owns the
 frequency, no void briefing talking over a VATSIM controller), and **atc**
 (the world without the crew: deterministic tower/ATIS answer the radio, no
-intercom persona, no tools, and the LLM is never touched, an ATC-only boot
-needs no Ollama at all). Chosen from the plugin's Settings tab
+intercom persona, no tools, and no model runtime). Chosen from the plugin's Settings tab
 (`xcopilot/opt/mode`, radio buttons; `spawn_mode_poller` syncs it), persisted
 via prefs.json; `XCOPILOT_MODE` env sets only the BOOT value (env > saved pref
 > both), a panel flip wins from that moment and applies live within ~2 s (the
@@ -3160,8 +3112,8 @@ main loop's idle tick reconciles). Live transitions: ATC off =
 `Station::uninstall()` (retires ALL published world state, party line + side
 state, the same page install() writes) + radio-channel cut; ATC on = the same
 `install_home_station` path boot uses (background scans guard against paying
-boot costs twice, `region_loaded()`); copilot off = intercom cut + Ollama
-evict (`Llm::evict`, keep_alive 0, reclaims the GPU frames); copilot on =
+boot costs twice, `region_loaded()`); copilot off = intercom cut + model
+eviction (`Llm::evict`, keep_alive 0); copilot on =
 re-warmup off the critical path. Monitor watches split along the same seam:
 crew watches (callouts, debrief speech, taxi guide, landing coach, talk-down)
 gate on `mode::copilot_enabled()`; world ticks are inert once uninstall clears
@@ -3510,14 +3462,9 @@ is just more tools. Don't over-build the framework before that loop works.
 and not open questions: this is **open source, never commercial**, and it is
 **X-Plane only**, no MSFS port. Only the product NAME stays parked.
 
-Copyleft over the dual `MIT OR Apache-2.0` the Rust convention would suggest,
-because the flight-sim ecosystem is payware-dominated: under a permissive
-license the tower FSM, the taxi planner, the wake-separation logic and the
-ground-drive laws could be lifted straight into closed payware. The usual
-argument FOR permissive is commercial adoption, which is a LIBRARY concern ,
-this is an end-user application, so it costs us nothing to refuse. It is also
-the reversible direction: a sole author can always relicense GPL code as
-permissive later, but MIT grants already handed out can never be clawed back.
+GPL-3.0-or-later was selected for the application. A sole author can relicense
+code later, while grants already made under a permissive license cannot be
+withdrawn.
 Two bonuses: `3.0` specifically because several deps are Apache-2.0 (compatible
 with GPLv3, NOT GPLv2), and GPL-3.0 keeps the project compatible with other GPL
 flight-sim projects.
@@ -3917,8 +3864,7 @@ Rules from it:
 
 ## 2026-09-16: the stock airliners get profiles (B738, A333)
 
-Decided: stock airliners before the add-ons (Zibo, ToLiss), because the risk
-is the product shape, not the datarefs. Every flying law here is GA-shaped
+Decided: stock airliners first, because every flying law here was GA-shaped
 (rotation through the pitch channel, the flare through the VS dial, speed
 through a throttle governor); an airliner is flown through the MCP/FCU and
 the box, and "full auto" there becomes program-the-box, set-the-modes,
@@ -6067,8 +6013,7 @@ the standing rules and contracts.
 
 ## 2026-09-26 trim: Wire contracts (never rename)
 
-Named 2026-07-30 (repo `dlicudi/xvoicelayer`, dir `~/GitHub/xvoicelayer`, after
-XEarthLayer: it layers what you SEE, this layers what you HEAR). Three names
+Named 2026-07-30. Three names
 deliberately survived the rename because they are wire contracts, not branding:
 
 - the `xcopilot/*` dataref namespace (app and plugin agree on these strings),
@@ -6083,20 +6028,6 @@ a line's default target is the BIN name for code in the binary and the PACKAGE
 name for code in the lib, so dropping either silently loses half the log while
 explicit-target lines keep arriving and make it look healthy.
 
-## 2026-09-26 trim: Neighbours
-
-- **Horizon** (`~/GitHub/horizon`): ABANDONED (2026-09-11; it had become a
-  charter logbook, never an instructor). Nothing lives there. The flight
-  instructor IS the third persona here (2026-09-13, `mode::Instructor`,
-  [src/instructor.rs](src/instructor.rs); see "App modes"): mode-gated so
-  it never actuates, with the ACS scorer, the lesson state machine and the
-  narration Horizon never got.
-- **rustdecks** (`~/GitHub/rustdecks`): sibling Loupedeck controller. When
-  hunting a dataref/command name, check its `examples/*.yaml` (and the
-  cockpitdecks clones it references) before the sim's DataRefs.txt - names
-  there are verified against real panels. The flow runs both ways; its
-  CLAUDE.md mirrors this note.
-
 ## 2026-09-26 trim: Stack (decided)
 
 Rust, because this is a latency- and audio-sensitive real-time loop.
@@ -6109,10 +6040,9 @@ Rust, because this is a latency- and audio-sensitive real-time loop.
 | X-Plane write | `reqwest` PATCH to the Web API (`PATCH /api/v1/datarefs/{id}/value`) |
 | TTS readback | in-process piper VITS via the `ort` crate |
 
-**No LLM, local or cloud.** The answer-only Ollama fallback was measured live
-on 2026-09-12 (qwen3:8b: four calls, no useful answer, sim frame rate cost)
-and removed the next day with its RAG index code, config, panel switch and
-health probe. The work goes into the deterministic layers instead: `xvl
+**No LLM, local or cloud.** An experimental answer fallback was removed with
+its index code, config, panel switch and health probe. The work goes into the
+deterministic layers instead: `xvl
 analyze` lists the most frequent missed phrasings in the logs, and each one
 is a grammar rule, a matcher or a profile entry with the live transcript as
 its test. `xvl analyze --now --since 2026-09-20` replays every miss through
@@ -7685,9 +7615,8 @@ assert the numbers the blackbox reports.
 
 **GPL-3.0-or-later** (root `LICENSE`, inherited via `[workspace.package]`).
 Settled: open source, never commercial, X-Plane only. Copyleft on purpose
-(the ecosystem is payware-dominated and this exact product shape sells for
-$49). SDK and Dear ImGui are MIT/BSD; B612 is OFL - all
-GPL-compatible. Sole-author relicensing stays free only until outside
+(see `LICENSE`). SDK and Dear ImGui are MIT/BSD; B612 is OFL - all
+GPL-compatible. Sole-author relicensing remains possible only until outside
 contributions merge: settle any change of heart BEFORE accepting a PR.
 `crates/atc` could become LGPL-3.0 if it should ever be broadly embeddable -
 deliberately not done now.
@@ -8503,9 +8432,8 @@ through the telephony tables, moved out of station.rs into callsign.rs with
 `spoken_ghost` ("BAW306" is "Speedbird three zero six", an unknown airline
 spelled NATO), a registration as before; words ("Speedbird 306") stay words.
 
-- The OFP field was checked against the pilot's live OFP (LFBD-EGKK):
-  `atc.callsign` "WAT2516", beside `general.icao_airline` "WAT" and
-  `general.flight_number` "2516" (both also in simbrief_hub's parser).
+- The OFP callsign field was checked against a live plan and its airline and
+  flight-number fallback fields.
   `simbrief::plan_callsign` takes `atc/callsign`, else airline + number;
   SimBrief's empty `{}` reads as absent. `FlightPlan.callsign`, `None` on a
   local plan.
@@ -8570,12 +8498,11 @@ rest}, `stopped` {err, hdg, swinging}, the `state` heading after it (within
 a few degrees of `rest`), `stop_ignored` if not; `push` ticks now carry
 `rate`. Offline only.
 
-## 2026-09-27: text settings, the callsign on the panel, the pilot's airline telephony
+## 2026-09-27: text settings, the callsign on the panel, custom airline telephony
 
-The pilot flies a virtual airline, Walker Air (SimBrief callsign WAT2516,
-telephony "Walker"). WAT is in no built-in table, so the resolver spelled it
-"Whiskey Alpha Tango two five one six"; and the callsign override was
-env/prefs only, because the Settings registry had no text fields.
+A custom airline telephony entry was absent from the built-in table, so the
+resolver spelled its code phonetically; the callsign override was env/prefs
+only, because the Settings registry had no text fields.
 
 - **A text kind in the registry** (`settings::Kind::Text { max_len }`,
   `Value::Text`): one line, no control characters, a pasted em or en dash made
@@ -8597,9 +8524,8 @@ env/prefs only, because the Settings registry had no text fields.
   a second crew provider on the party line (`party_line::CALLSIGN_TELEPHONY`,
   registered by `callsign::provide_telephony(settings::airline_telephony)`; the
   `atc` binary registers one over the env var). Read when a callsign is spoken,
-  so an edit applies to the next transmission, ghosts included. "WAT2516" is
-  "Walker two five one six", the digits grouped as the built-ins group them; a
-  pilot's entry overrides a built-in ("BAW=Shuttle").
+  so an edit applies to the next transmission, ghosts included. Digits use the
+  same grouping as built-in entries, and a pilot entry overrides a built-in.
 - **Panel** (Settings tab, "Radio", shown in every mode): one field per text
   knob from `xcopilot/opt/text` (app to plugin, rows
   `key|label|pinned_env|value|notice|help`, on change and every 5 s:

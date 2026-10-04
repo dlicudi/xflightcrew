@@ -25,8 +25,7 @@ actually ask wins.
 - Per-aircraft POM indexes (`cirrus_sr22`, `king_air_c90b`,
   `lancair_evolution`), same format.
 - The code that built and read them (`rag.rs`, `llm.rs`, `xvl index/ask`)
-  was removed with the LLM on 2026-09-13 (dev-history "The LLM retired, and
-  a night of rules"). The embeddings came from Ollama: a QUERY must be
+  was removed with the LLM on 2026-09-13. A QUERY must be
   embedded by the same model to use them, so the stored vectors are only
   usable with an embedding model at runtime.
 
@@ -35,7 +34,7 @@ actually ask wins.
 Sampled `sim/operation/misc/frame_rate_period` over the Web API with each
 load in isolation (memory "fps drops = GPU tenants, not TTS"):
 
-- **Ollama generation on Metal (qwen3:8b)**: median 60 fps fell to 30, with
+- **Local generation on the GPU**: median 60 fps fell to 30, with
   sustained 20 fps pins for the whole generation. First answer of a flight
   about 10 s (cold prefill of a 3k-token prompt), warm answers 1.5 to 2.7 s.
   CPU-only (`GPU_LAYERS=0`) spares the frames but the cold prefill is slow.
@@ -84,8 +83,7 @@ Handbook says: ...").
   sentence selection is the real work; a lexical hit can be the wrong
   sense of a word ("stall" the aerodynamic event vs "stall" in a turn
   discussion). Hit rate is UNMEASURED; it needs a question bench first.
-- Needs a small ingest path back (the chunks can be read from the existing
-  JSON; nothing needs Ollama).
+- Needs a small ingest path back; the chunks can be read from the existing JSON.
 
 ### C. Semantic retrieval with the existing embeddings, still extractive
 
@@ -95,7 +93,7 @@ stored vectors by cosine; answer extractively as in B.
 - It IS a model at runtime (the embedder), though not a generator. Run as
   ONNX on the CPU through the `ort` crate the TTS already links, it should
   cost no frames (the TTS measurement), but that is a new measurement to
-  make, and via Ollama on Metal it is a GPU tenant again.
+  make, and GPU execution would consume simulator resources again.
 - Better recall than B on paraphrases ("why does the nose swing left" to
   the left-turning tendencies section). Same extraction problem as B.
 
@@ -106,10 +104,8 @@ C plus a local LLM composing the answer from the retrieved chunks.
 - Frame cost: the measured one, median 60 to 30 fps with 20 fps pins, on
   Metal; on the CPU a slow cold prefill (seconds to tens of seconds).
   Warm answers 1.5 to 2.7 s on Metal.
-- Non-deterministic, untestable as a plain `cargo test`, able to say
-  something the handbook does not; the one thing an instructor must never
-  do. It is the path the pilot removed on 2026-09-13 ("measured useless and
-  a frame-rate cost").
+- Non-deterministic, untestable as a plain `cargo test`, and able to say
+  something the handbook does not.
 
 ## Recommendation
 
