@@ -621,6 +621,9 @@ impl Tool for SetUpEnroute {
         );
         // The new flight ends this one: nothing may keep flying it.
         crate::flight_state::stand_down();
+        // And the crew forgets it (last landing, tracking, destination)
+        // before the new flight's transition is published below.
+        crate::flight_state::forget_flight();
         // The flight's transition, as the resume publishes it: the altimeter
         // is set to it at the settle and the monitor checks against it.
         crate::tools::instruments::publish_flight_transition(Some(
