@@ -2315,11 +2315,10 @@ fn demo_loop_running(_: Task) -> bool {
 /// circuit or a landing gives back a flyable aircraft.
 #[cfg(not(test))]
 fn stop_demo_loop(task: Task) {
-    use std::sync::atomic::Ordering::SeqCst;
     match task {
         Task::Taxi => {
-            crate::autotaxi::ACTIVE.store(false, SeqCst);
-            crate::tools::speedhold::ACTIVE.store(false, SeqCst);
+            crate::autotaxi::halt();
+            crate::tools::speedhold::release();
         }
         Task::Takeoff => crate::autotakeoff::cancel(),
         Task::Pattern => {

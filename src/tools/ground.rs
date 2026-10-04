@@ -266,7 +266,7 @@ impl Tool for Pushback {
         // "stop" word is routed earlier and aborts the whole mission; this is
         // the pilot naming the push, not the flight.
         if !pushback_continues(&a.action) && crate::pushback::steered() {
-            crate::pushback::SKIP.store(true, std::sync::atomic::Ordering::SeqCst);
+            crate::pushback::skip();
             return Ok("Roger, skipping the push.".to_string());
         }
         let (cmd, say) = match a.action.as_str() {
@@ -284,10 +284,7 @@ impl Tool for Pushback {
         // Native pushback commands start a manoeuvre that continues after this
         // one-shot tool returns. Publish that ownership so the Flight tab keeps
         // CANCEL visible; STOP clears it after the command has landed.
-        crate::pushback::ACTIVE.store(
-            pushback_continues(&a.action),
-            std::sync::atomic::Ordering::SeqCst,
-        );
+        crate::pushback::native_push(pushback_continues(&a.action));
         Ok(say.to_string())
     }
 }

@@ -121,8 +121,15 @@ fn pilot_took_the_brakes(left: f64, right: f64, parkbrake: f64, governor_braking
 }
 
 /// True while the governor loop runs. Public so other control loops could
-/// check it, mirroring `recover::ACTIVE` / `autoland::ACTIVE`.
+/// check it, mirroring `recover::ACTIVE` / `autoland::ACTIVE`. Written only
+/// by the governor's run ([`GOVERNOR`]): armed by [`arm_flight`] and the
+/// `hold_speed` tool, stopped by [`release`] (ten modules used to store it).
 pub static ACTIVE: AtomicBool = AtomicBool::new(false);
+/// The governor's run. A governor stopped and re-armed at once (autoland's
+/// give-up handing the speed back, a taxi stop then go) used to leave the old
+/// loop reading the NEW arm's flag and driving the lever beside it; now the
+/// old one sees its own run gone and stops.
+pub(crate) static GOVERNOR: sim::run::Slot = sim::run::Slot::flagged(&ACTIVE);
 
 /// True while the governor is actively TAXIING (not a flight hold) — the
 /// parking-brake tool uses this to tell the pilot the throttle is coming to
@@ -283,25 +290,26 @@ pub fn arm_flight_with_floor(
     }
     *TARGET_KTS.lock().unwrap_or_else(|e| e.into_inner()) = target;
     *MODE.lock().unwrap_or_else(|e| e.into_inner()) = Mode::Flight;
-    if !ACTIVE.swap(true, Ordering::Relaxed) {
+    if let Some(run) = GOVERNOR.claim() {
         std::thread::spawn(move || {
             let Ok(rt) = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
             else {
-                ACTIVE.store(false, Ordering::Relaxed);
                 return;
             };
-            rt.block_on(governor(XPlaneClient::new(base_url), voice));
+            rt.block_on(governor(XPlaneClient::new(base_url), voice, &run));
         });
     }
 }
 
 /// Stand the governor down (no-op if idle) — the follower calls this before
 /// handing off to autoland, which runs its own speed law and must own the
-/// throttle alone.
-pub fn release() {
-    ACTIVE.store(false, Ordering::Relaxed);
+/// throttle alone. Returns whether one was running. THE door every stop goes
+/// through: a takeoff, reverse, the brake hold, a taxi-in's end, the
+/// pilot's release.
+pub fn release() -> bool {
+    GOVERNOR.cancel()
 }
 /// Target knots — updated live by a new `hold_speed` call, no restart.
 static TARGET_KTS: Mutex<f64> = Mutex::new(0.0);
@@ -857,7 +865,7 @@ impl Tool for HoldSpeed {
     async fn execute(&self, args: &Value, ctx: &ToolCtx<'_>) -> Result<String> {
         let mut a: Args = serde_json::from_value(args.clone())?;
         if a.off {
-            return Ok(if ACTIVE.swap(false, Ordering::Relaxed) {
+            return Ok(if release() {
                 "Speed hold off — your throttle.".to_string()
             } else {
                 "I wasn't holding the speed.".to_string()
@@ -1045,7 +1053,7 @@ impl Tool for HoldSpeed {
         // monitor. The main runtime is current-thread and blocks on the mic
         // between commands, so a tokio::spawn there starves: the first live
         // governor sat unpolled for 23 seconds until the next voice command.
-        if !ACTIVE.swap(true, Ordering::Relaxed) {
+        if let Some(run) = GOVERNOR.claim() {
             let base = ctx.config.xplane_base_url.clone();
             let voice = ctx.voice.cloned();
             std::thread::spawn(move || {
@@ -1053,10 +1061,9 @@ impl Tool for HoldSpeed {
                     .enable_all()
                     .build()
                 else {
-                    ACTIVE.store(false, Ordering::Relaxed);
                     return;
                 };
-                rt.block_on(governor(XPlaneClient::new(base), voice));
+                rt.block_on(governor(XPlaneClient::new(base), voice, &run));
             });
         }
         Ok(if taxi {
@@ -1119,7 +1126,11 @@ async fn glide(xp: &XPlaneClient, dataref: &str, to: f64, over_ms: u64) {
 /// Flight mode chases IAS with throttle only; taxi mode chases groundspeed with
 /// throttle and brakes on a faster cadence. Brakes are always released on the
 /// way out — never hand the pilot an aircraft with a hidden boot on the pedals.
-async fn governor(xp: XPlaneClient, voice: Option<crate::voice::Voice>) {
+async fn governor(
+    xp: XPlaneClient,
+    voice: Option<crate::voice::Voice>,
+    run: &sim::run::Lease<'_>,
+) {
     tracing::info!("speed governor started");
     // On file both ends: whether a governor held the speed after the
     // enroute air start could only be inferred from the throttle trace
@@ -1196,12 +1207,12 @@ async fn governor(xp: XPlaneClient, voice: Option<crate::voice::Voice>) {
     let mut vmo = crate::aircraft::VmoCeiling::default();
     let mut vmo_capped = false;
     loop {
-        if !ACTIVE.load(Ordering::Relaxed) {
+        if !run.live() {
             break;
         }
         // Yield instantly to anything that takes the whole aircraft.
         if crate::flight_state::crew_landing_or_recovering() {
-            ACTIVE.store(false, Ordering::Relaxed);
+            run.lower_flag();
             break;
         }
         // Frozen sim (paused or replay): both laws are P+D against a state
@@ -1252,7 +1263,7 @@ async fn governor(xp: XPlaneClient, voice: Option<crate::voice::Voice>) {
                     if let Some(lc) = last_cmd.filter(|lc| (thr - lc).abs() > 0.15) {
                         if override_pending {
                             tracing::info!(thr, lc, "speed governor: pilot override, releasing");
-                            ACTIVE.store(false, Ordering::Relaxed);
+                            run.lower_flag();
                             break;
                         }
                         override_pending = true;
@@ -1271,7 +1282,7 @@ async fn governor(xp: XPlaneClient, voice: Option<crate::voice::Voice>) {
                     // exact path once ate three arm requests invisibly.)
                     if on_ground == Some(true) && xp.get_float(GS_MS).await.unwrap_or(0.0) < 5.0 {
                         tracing::info!("speed governor: parked, standing down");
-                        ACTIVE.store(false, Ordering::Relaxed);
+                        run.lower_flag();
                         break;
                     }
                     // A flight hold on the runway is a landing: idle and hand
@@ -1297,7 +1308,7 @@ async fn governor(xp: XPlaneClient, voice: Option<crate::voice::Voice>) {
                                 "Touchdown. Throttle idle, speed hold off.",
                             );
                         }
-                        ACTIVE.store(false, Ordering::Relaxed);
+                        run.lower_flag();
                         break;
                     }
                     // IAS trend across ticks feeds the anticipation term.
@@ -1355,7 +1366,7 @@ async fn governor(xp: XPlaneClient, voice: Option<crate::voice::Voice>) {
                 // Airborne means the taxi is over — release everything, done.
                 if on_ground == Some(false) {
                     tracing::info!("speed governor: airborne, taxi hold released");
-                    ACTIVE.store(false, Ordering::Relaxed);
+                    run.lower_flag();
                     break;
                 }
                 // The parking-brake ratio, read every tick: the park HANDLE
@@ -1370,7 +1381,7 @@ async fn governor(xp: XPlaneClient, voice: Option<crate::voice::Voice>) {
                         "speed governor: parking brake set, closing throttle, standing down"
                     );
                     glide(&xp, &taxi_lever(), 0.0, 400).await;
-                    ACTIVE.store(false, Ordering::Relaxed);
+                    run.lower_flag();
                     break;
                 }
                 // Brake-paused: idle throttle, hands off, waiting on the
@@ -1386,7 +1397,7 @@ async fn governor(xp: XPlaneClient, voice: Option<crate::voice::Voice>) {
                             tracing::info!(
                                 "speed governor: throttle advanced while brake-paused, releasing"
                             );
-                            ACTIVE.store(false, Ordering::Relaxed);
+                            run.lower_flag();
                             break;
                         }
                         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
@@ -1439,7 +1450,7 @@ async fn governor(xp: XPlaneClient, voice: Option<crate::voice::Voice>) {
                     if let Some(lc) = last_cmd.filter(|lc| (thr - lc).abs() > 0.15) {
                         if override_pending {
                             tracing::info!(thr, lc, "speed governor: pilot override, releasing");
-                            ACTIVE.store(false, Ordering::Relaxed);
+                            run.lower_flag();
                             break;
                         }
                         override_pending = true;

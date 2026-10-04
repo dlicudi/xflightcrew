@@ -815,7 +815,7 @@ async fn settle(
             {
                 // Hand flown to the placement's level, never given back to
                 // an autopilot with no pitch.
-                crate::tools::speedhold::ACTIVE.store(false, std::sync::atomic::Ordering::SeqCst);
+                crate::tools::speedhold::release();
                 let started = crate::tools::recover::take_over(
                     base.to_string(),
                     None,

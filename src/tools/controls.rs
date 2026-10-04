@@ -750,7 +750,7 @@ impl Tool for HoldBrakes {
         // an in-flight glide land before the close sticks.
         let taxi_hold = super::speedhold::taxi_hold_active();
         if taxi_hold {
-            super::speedhold::ACTIVE.store(false, Ordering::Relaxed);
+            super::speedhold::release();
             tokio::time::sleep(std::time::Duration::from_millis(350)).await;
             let _ = ctx.xplane.set_float(&crate::aircraft::throttle_dataref(), 0.0).await;
         }

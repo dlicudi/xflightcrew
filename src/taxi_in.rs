@@ -104,7 +104,7 @@ pub fn abort(hold: bool) {
     CANCEL_HOLD.store(hold, SeqCst);
     RUN.cancel();
     crate::autotaxi::halt();
-    crate::tools::speedhold::ACTIVE.store(false, SeqCst);
+    crate::tools::speedhold::release();
 }
 
 /// A new taxi-in is running from now: its run (the flag drops with it,
@@ -795,7 +795,7 @@ async fn fly(
     if cancelled(gen) && end_cancelled(&xp, &voice, valve, "before_drive").await {
         return;
     }
-    crate::autotaxi::LAST_ARRIVED.store(false, std::sync::atomic::Ordering::Relaxed);
+    crate::autotaxi::forget_arrival();
     match auto_taxi.execute(&json!({}), &ctx).await {
         Ok(line) => announce(&voice, Priority::Advisory, &line),
         Err(_) => {

@@ -279,13 +279,12 @@ pub(crate) fn stand_down() {
     crate::heli_circuit::abort();
     crate::heli_route::abort();
     crate::hover::abort();
-    crate::autotaxi::ACTIVE.store(false, SeqCst);
-    crate::autotaxi::BACKTRACKING.store(false, SeqCst);
-    crate::tools::speedhold::ACTIVE.store(false, SeqCst);
-    crate::tools::reverse::ACTIVE.store(false, SeqCst);
+    crate::autotaxi::halt();
+    crate::tools::speedhold::release();
+    crate::tools::reverse::stow();
     crate::tools::engine::MIX_MANAGED.store(false, SeqCst);
     crate::tools::engine::LEAN_SEEKING.store(false, SeqCst);
-    crate::pushback::ACTIVE.store(false, SeqCst);
+    crate::pushback::clear();
     // The crew's brake hold renews the held command; dropped, it expires.
     crate::tools::controls::release_held_brakes();
     // The altitude capture watcher writes the dial, ALT hold and throttle.
@@ -782,6 +781,64 @@ mod tests {
         assert_eq!(super::reposition_skip(false, None), None);
         assert_eq!(super::NewFlight::Reposition.list_cause(), "reposition");
         assert_eq!(super::NewFlight::Approach.list_cause(), "setup");
+    }
+
+    /// A loop's flying flag has one writer: its run (`sim::run::Slot`,
+    /// flagged). Ten modules stored `speedhold::ACTIVE` and seven
+    /// `autotaxi::ACTIVE` (bypassing `halt`), and a late store from a
+    /// superseded run flipped the new run's (refactor audit 2026-10-04,
+    /// phase 3). So: no module writes a flag its slot owns, and no module
+    /// writes another module's `ACTIVE` at all (the owner's door does).
+    #[test]
+    fn a_loop_flag_has_one_writer() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        // The production text of a file: up to its first inline test module.
+        fn production(text: &str) -> &str {
+            text.split("#[cfg(test)]\nmod ").next().unwrap()
+        }
+        let mut flagged = Vec::new();
+        let mut files = Vec::new();
+        for f in crate::test_support::rust_files(&root) {
+            if crate::test_support::is_test_file(&f) {
+                continue;
+            }
+            let text = std::fs::read_to_string(&f).unwrap();
+            let rel = f.strip_prefix(&root).unwrap().display().to_string();
+            for line in production(&text).lines() {
+                if let Some(at) = line.find("sim::run::Slot::flagged(&") {
+                    let rest = &line[at + "sim::run::Slot::flagged(&".len()..];
+                    flagged.push((rel.clone(), rest[..rest.find(')').unwrap()].to_string()));
+                }
+            }
+            files.push((rel, text));
+        }
+        assert!(flagged.len() >= 12, "the flagged runs: {flagged:?}");
+        let mut writes = Vec::new();
+        for (rel, text) in &files {
+            for (n, line) in production(text).lines().enumerate() {
+                let code = line.trim_start();
+                if code.starts_with("//") {
+                    continue;
+                }
+                for op in [".store(", ".swap(", ".compare_exchange(", ".fetch_"] {
+                    // Another module's flag, by path.
+                    if code.contains(&format!("::ACTIVE{op}")) {
+                        writes.push(format!("{rel}:{} {code}", n + 1));
+                    }
+                    // A flag this module's own slot owns.
+                    for (owner, flag) in &flagged {
+                        let bare = format!("{flag}{op}");
+                        if owner == rel
+                            && code.contains(&bare)
+                            && !code.contains(&format!("_{bare}"))
+                        {
+                            writes.push(format!("{rel}:{} {code}", n + 1));
+                        }
+                    }
+                }
+            }
+        }
+        assert!(writes.is_empty(), "loop flags written outside their run: {writes:#?}");
     }
 
     /// The circuit awaited the published-arrival lookup, then cleared

@@ -970,8 +970,53 @@ static LEARNED_SENSE: AtomicI8 = AtomicI8::new(0);
 /// like taxiing forward at four, and the stand is the cleared route's first
 /// point — so the guide happily called the turns of a route we were being
 /// pushed away from ("Rolling again. Sharp left next, onto Bravo", Luton
-/// 2026-07-28, with the tug still connected).
+/// 2026-07-28, with the tug still connected). Written only by the push's
+/// run ([`PUSH`]).
 pub static ACTIVE: AtomicBool = AtomicBool::new(false);
+/// The push's run: the steered loop's for its duration ([`run`]), or the
+/// spoken tool's one-shot manoeuvre ([`native_push`]), held in [`NATIVE`]
+/// until a stop or a stand-down ([`clear`]). A steered push that ends cannot
+/// clear the flag of a push begun after it.
+pub(crate) static PUSH: sim::run::Slot = sim::run::Slot::flagged(&ACTIVE);
+/// The native push's run: no loop holds it, the tug runs the manoeuvre.
+static NATIVE: std::sync::Mutex<Option<sim::run::Lease<'static>>> = std::sync::Mutex::new(None);
+
+/// The spoken tool's native push: `continues` (a push started or steered)
+/// holds the flag until a stop; a stop drops it. Its one writer from outside.
+pub fn native_push(continues: bool) {
+    // A steered push owns the flag for its duration; a tug command beside
+    // it does not take the run from it.
+    if continues && steered() {
+        return;
+    }
+    if continues {
+        let run = PUSH.take_over();
+        *NATIVE.lock().unwrap_or_else(|e| e.into_inner()) = Some(run);
+    } else {
+        clear();
+    }
+}
+
+/// The push is over, whoever holds it: a native push stopped (or its flag
+/// found stale airborne), a stand-down. A steered loop keeps running to its
+/// own stop (its caller's abort, [`stop_word`]); only the flag drops.
+/// Returns whether a push was flagged.
+pub fn clear() -> bool {
+    let was = PUSH.cancel();
+    drop(NATIVE.lock().unwrap_or_else(|e| e.into_inner()).take());
+    was
+}
+
+/// The pilot's stop word for the steered push ([`ABORT`], consumed by the
+/// loop, which stops the tug and sets the brakes).
+pub fn stop_word() {
+    ABORT.store(true, SeqCst);
+}
+
+/// "Skip the push" for the steered push ([`SKIP`]).
+pub fn skip() {
+    SKIP.store(true, SeqCst);
+}
 
 /// True while the STEERED push loop ([`run`]) is working the manoeuvre — the
 /// one consumer of [`ABORT`]. The spoken tool's native one-shot sets only
@@ -1020,7 +1065,10 @@ pub async fn run(
     abort: &AtomicBool,
     valve_set: Option<f64>,
 ) -> Result<f64, String> {
-    ACTIVE.store(true, SeqCst);
+    // The steered push owns the flag from here (a native one before it is
+    // replaced), dropped with the run however this returns.
+    let push = PUSH.take_over();
+    drop(NATIVE.lock().unwrap_or_else(|e| e.into_inner()).take());
     STEERED.store(true, SeqCst);
     ABORT.store(false, SeqCst);
     SKIP.store(false, SeqCst);
@@ -1042,7 +1090,7 @@ pub async fn run(
     // by hand over the Web API (2026-07-29). Idempotent when already stopped.
     send(ctx, "stop").await;
     STEERED.store(false, SeqCst);
-    ACTIVE.store(false, SeqCst);
+    drop(push);
     out
 }
 

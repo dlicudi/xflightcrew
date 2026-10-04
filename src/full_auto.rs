@@ -154,7 +154,7 @@ pub fn abort() -> bool {
     RUN.cancel();
     ABORT.store(true, SeqCst);
     clear_stage();
-    crate::autotaxi::ACTIVE.store(false, SeqCst);
+    crate::autotaxi::halt();
     crate::autotakeoff::cancel();
     crate::circuit::abort();
     crate::procedure::abort();

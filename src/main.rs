@@ -1918,13 +1918,13 @@ async fn run_session(
                     .is_ok_and(|og| og < 0.5);
                 if airborne {
                     tracing::info!("pushback flag stale airborne; cleared, not consumed");
-                    pushback::ACTIVE.store(false, std::sync::atomic::Ordering::SeqCst);
+                    pushback::clear();
                 } else if pushback::steered() {
                     conversation.clear();
                     // Full auto's steered push: its loop consumes ABORT, stops
                     // the tug and sets the brakes itself.
                     tracing::info!("pushback stop word, pre-gate");
-                    pushback::ABORT.store(true, std::sync::atomic::Ordering::SeqCst);
+                    pushback::stop_word();
                     // And the sequence that armed it. "Stop" during a push
                     // means stop, not "skip the push and start taxiing" —
                     // which is what aborting only the push would have full
@@ -1948,7 +1948,7 @@ async fn run_session(
                     let _ = xplane.run_command(tools::ground::CMD_PUSH_STOP).await;
                     let held =
                         pushback::park_after_stop(&xplane, profile.park_brake_valve_set).await;
-                    pushback::ACTIVE.store(false, std::sync::atomic::Ordering::SeqCst);
+                    pushback::clear();
                     // The line from the read-back, never the attempt (#65).
                     say(
                         &voice,
@@ -2531,15 +2531,15 @@ async fn run_session(
                         && taxi_driving
                         && (names_speed || names_steer || generic)
                     {
-                        autotaxi::ACTIVE.store(false, Relaxed);
+                        autotaxi::halt();
                         if names_steer && !names_speed && !generic {
                             released.push("steering's yours, I still have the speed");
                         } else {
-                            tools::speedhold::ACTIVE.store(false, Relaxed);
+                            tools::speedhold::release();
                             released.push("auto taxi off, your aircraft");
                         }
                     } else if speed_held && !taxi_in_ended && (names_speed || generic) {
-                        tools::speedhold::ACTIVE.store(false, Relaxed);
+                        tools::speedhold::release();
                         released.push("speed hold off, your throttle");
                     }
                     if mix_held && (names_mix || generic) {
@@ -2551,7 +2551,7 @@ async fn run_session(
                     // lever-shaped release stows it (the watcher glides the
                     // levers back to idle on its way out).
                     if reverse_in && (names_reverse || names_speed || generic) {
-                        tools::reverse::ACTIVE.store(false, Relaxed);
+                        tools::reverse::stow();
                         released.push("stowing reverse");
                     }
                     if !released.is_empty() {
