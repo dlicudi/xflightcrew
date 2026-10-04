@@ -1118,6 +1118,7 @@ impl Case {
         self.after.unwrap_or_default()
     }
 
+    #[cfg(test)]
     pub fn deadline_s(&self) -> f64 {
         self.deadline_s_for(None)
     }

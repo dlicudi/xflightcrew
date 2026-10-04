@@ -3185,6 +3185,7 @@ pub fn vne_at(vne_kts: Option<f64>, vmo_high: Option<VmoHigh>, alt_ft: f64) -> O
 
 impl AircraftProfile {
     /// This airframe's Vne/Vmo at an indicated altitude ([`vne_at`]).
+    #[cfg(test)]
     pub fn vne_at(&self, alt_ft: f64) -> Option<f64> {
         vne_at(self.vne_kts, self.vmo_high, alt_ft)
     }
@@ -3285,6 +3286,7 @@ impl VmoCeiling {
     }
 
     /// Whether the low ceiling holds (`None` before any measurement).
+    #[cfg(test)]
     pub fn low(&self) -> Option<bool> {
         self.low
     }

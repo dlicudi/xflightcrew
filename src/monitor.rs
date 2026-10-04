@@ -121,7 +121,6 @@ pub(crate) fn forget_destination() {
 /// Coarse flight phase, estimated from motion and height. Used to arm/disarm
 /// checks (e.g. "flaps up on final" only matters on Approach).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-#[allow(dead_code)] // not every phase is consumed yet (more checks land in M3)
 pub enum Phase {
     Ground,
     Takeoff,
@@ -773,7 +772,6 @@ fn flight_sample(s: &Snapshot, t: f64, crashed: bool) -> crate::flight::Sample {
 
 /// Severity of a callout. Maps onto the speech arbiter's priority.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-#[allow(dead_code)] // Advisory/Caution arrive with the M3 check set
 pub enum Severity {
     Advisory,
     Caution,
@@ -1014,6 +1012,7 @@ const AUTO_CAUTION_FACTOR: f64 = crate::aircraft::CAUTION_AUTO_RATIO;
 /// The stall speed at this flap setting: a straight line from the clean
 /// stall to the landing-configuration stall when the profile declares one,
 /// else the trainer's fixed reduction. Never above clean, never below Vso.
+#[cfg(test)]
 pub fn stall_speed_at_flap(vs_clean_kts: f64, vs0_kts: Option<f64>, flap_ratio: f64) -> f64 {
     crate::aircraft::stall_speed_in_config(vs_clean_kts, vs0_kts, &[], flap_ratio)
 }

@@ -875,7 +875,7 @@ mod tests {
         let a = c172();
         let mut said = Vec::new();
         let mut t = 0.0;
-        let mut step = |r: &mut Rig, v: View, said: &mut Vec<(f64, Line)>| {
+        let step = |r: &mut Rig, v: View, said: &mut Vec<(f64, Line)>| {
             for l in r.tick(&v, &a, p) {
                 said.push((v.t_s, l));
             }

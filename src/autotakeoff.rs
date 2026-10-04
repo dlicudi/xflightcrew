@@ -1501,6 +1501,7 @@ impl RollAlign {
     }
 
     /// Whether it has let the power come up.
+    #[cfg(test)]
     pub fn done(&self) -> bool {
         self.done
     }
@@ -1595,6 +1596,7 @@ impl RollSteer {
     }
 
     /// The law scheduled on a measured rudder (tests and replays).
+    #[cfg(test)]
     pub fn with_rudder(jet: bool, rudder: crate::aircraft::RollRudderProfile) -> Self {
         Self {
             jet,
@@ -2154,6 +2156,7 @@ impl RotatePitch {
     /// Q is the BODY-axis rate where the law wants the Euler pitch rate; they
     /// differ by cos(bank), and this climb holds the wings inside
     /// `CLIMB_BANK_MAX_DEG`, so the error is under 1%.
+    #[cfg(test)]
     pub fn step(&mut self, theta_deg: f64, rate_deg_s: Option<f64>, dt_s: f64) -> f64 {
         self.step_climb(theta_deg, rate_deg_s, dt_s, None)
     }

@@ -98,6 +98,7 @@ const ALIGN_WANT: &[sim::state::F] = &[sim::state::F::SteerYield, sim::state::F:
 /// followed an early tug release could not turn right for fifteen seconds
 /// and the record could not say whether a re-summoned tug had hooked back
 /// on (LEMG, 2026-09-12). A slow dataref, so the read is nearly free.
+#[cfg(test)]
 pub(crate) const TUG_ATTACHED: &str = "sim/aircraft/overflow/pushback_attached";
 /// A tug on the bar owns the aircraft: the drive holds (target zero, no
 /// steer heartbeat, the stagnation clock parked) until the bar comes off,
@@ -1624,6 +1625,7 @@ impl LineUpAlign {
         crate::angles::signed_diff_deg(self.course_deg, psi_true)
     }
 
+    #[cfg(test)]
     pub fn step(
         &mut self,
         t_s: f64,
@@ -2189,6 +2191,7 @@ pub struct TurnRound {
 
 impl TurnRound {
     /// The teardrop every airframe flew before: room for a steered nose.
+    #[cfg(test)]
     pub const TEARDROP: TurnRound = TurnRound { pivots: false, width_m: None };
 
     /// Where the turn begins down the strip, where the pocket sits down it

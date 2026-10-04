@@ -1424,7 +1424,7 @@ pub(crate) async fn obey_region_handoff(
 /// it as a check-in (a readback with "passing"/"climbing") and answers "radar
 /// contact". With no planned altitude the climb clause is left off rather
 /// than invented.
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 pub fn departure_check_in(
     callsign: &Option<String>,
     to: &str,

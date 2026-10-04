@@ -36,7 +36,6 @@ mod test_card;
 mod detect;
 mod dialogue;
 mod failures;
-#[allow(dead_code)] // shadow run: the consumers move over next
 mod flight;
 mod duty;
 mod handover;

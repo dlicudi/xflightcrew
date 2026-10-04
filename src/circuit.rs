@@ -582,6 +582,7 @@ pub fn path_descent_fpm_on(closure_kts: f64, gp_ft_per_nm: f64) -> f64 {
 /// aircraft could not have stayed on the path even with zero error and
 /// perfect control. It is now the target's rate plus a fixed correction
 /// budget, which leaves a standing target's authority exactly where it was.
+#[cfg(test)]
 pub fn alt_capture_vs(target_ft: f64, target_rate_fpm: f64, alt_ft: f64, vs_fpm: f64) -> f64 {
     alt_capture_vs_on(
         target_ft,

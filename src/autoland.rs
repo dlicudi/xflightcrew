@@ -1,8 +1,3 @@
-// Stage-1 scaffolding: the runway finder is built and tested but not yet called
-// from the running app (Stage 3's control loop consumes it). Allow dead_code until
-// then, so the WIP module doesn't spam the build — removed once it's wired in.
-#![allow(dead_code)]
-
 //! Native autoland — **Stage 1: runway data**.
 //!
 //! Finds the nearest suitable landing runway, parsed straight from X-Plane's
@@ -419,34 +414,18 @@ pub fn set_panel(text: &str) {
 // State reads.
 const LAT: &str = "sim/flightmodel/position/latitude";
 const LON: &str = "sim/flightmodel/position/longitude";
-/// TRUE altitude (meters MSL), not the baro-indicated `h_ind`: the glidepath
-/// aims at the runway's TRUE elevation from apt.dat, so a misset altimeter
-/// displaces the whole path by the baro error. Seen live 2026-07-14 (LXGB 09):
-/// h_ind read 0.5 ft with 47 ft of radio altitude over the bay — the vertical
-/// law flew the final against an altitude ~46 ft low.
-const ELEV_M: &str = "sim/flightmodel/position/elevation";
-const AGL_M: &str = "sim/flightmodel/position/y_agl";
+#[cfg(test)]
 const GS_MS: &str = "sim/flightmodel/position/groundspeed";
 /// Weight-on-wheels for the player aircraft. Radio altitude and airspeed are
 /// not touchdown evidence: a normal flare can be below five feet and a knot
 /// below target while the wheels are still airborne.
 const MAG_VAR: &str = "sim/flightmodel/position/magnetic_variation";
-const IAS: &str = "sim/flightmodel/position/indicated_airspeed";
 /// TRUE heading and TRUE ground track: their difference is the wind crab the
 /// lateral law feeds forward on final (heading vs track, the reference recipe).
+#[cfg(test)]
 const PSI_TRUE: &str = "sim/flightmodel/position/psi";
-const HPATH_TRUE: &str = "sim/flightmodel/position/hpath";
-/// Bank, for the arrest's wings-level law once the servos are off.
-const PHI_TRUE: &str = "sim/flightmodel/position/true_phi";
 /// Yaw rate, deg/s nose right, for a declared rollout steer (`RolloutSteer`):
 /// read through the state frame, `sim::state::F::R` (`position/R`).
-/// The vertical speed actually flown (the pilot's VSI). The shared name, not a
-/// local spelling: `cockpit2/gauges/indicators/vvi_dial_fpm` does not exist
-/// in X-Plane 12, and from 2026-07 to 2026-09-14 every read of it failed and
-/// fell back to the COMMANDED rate, so the VS watchdog below could never fire
-/// and the landing arrest's lead (`vs_dial_fpm`) saw zero error on every tick
-/// of the LXGB 09 arrival it was written for (339 fpm at the wheels).
-const VVI_FPM: &str = crate::datarefs::VVI_FPM;
 // AP + controls (mirror of autopilot.rs / recover.rs).
 const CMD_SERVOS_OFF: &str = "sim/autopilot/servos_off_any";
 /// Servos AND flight director off: the wheels' disconnect.
@@ -460,8 +439,6 @@ const CMD_HDG_MODE: &str = "sim/autopilot/heading";
 const CMD_VS_MODE: &str = "sim/autopilot/vertical_speed";
 const HDG_BUG: &str = "sim/cockpit2/autopilot/heading_dial_deg_mag_pilot";
 const VS_DIAL: &str = "sim/cockpit/autopilot/vertical_velocity";
-const HDG_STATUS: &str = "sim/cockpit2/autopilot/heading_status";
-const VS_STATUS: &str = "sim/cockpit2/autopilot/vvi_status";
 const ALT_DIAL: &str = "sim/cockpit2/autopilot/altitude_dial_ft";
 const ALT_IND_FT: &str = crate::datarefs::ALTITUDE_FT;
 /// The thrust lever THIS airframe obeys — not always the stock one (the
@@ -748,6 +725,7 @@ impl RolloutBrakeSteer {
 
     /// The heading error (degrees, target right of the nose positive), the
     /// tick, groundspeed and the stopping brake the rollout wants.
+    #[cfg(test)]
     pub fn step(&mut self, err_deg: f64, dt_s: f64, gs_kts: f64, brake: f64) -> RolloutBrakes {
         self.step_with(err_deg, None, None, 0.0, dt_s, gs_kts, brake)
     }
@@ -4799,11 +4777,6 @@ impl CrabFilter {
             (None, e) => e.unwrap_or(0.0),
         }
     }
-
-    /// The current estimate without advancing.
-    pub fn value(&self) -> f64 {
-        self.est.unwrap_or(0.0)
-    }
 }
 
 /// Time constant (s) of the final's track-error trim: how long a steady
@@ -6240,7 +6213,6 @@ pub fn balloon_power(
 /// the autopilot's pitch servo while leaving it the roll, so the flare can be
 /// flown on the elevator with the AP still holding the bug.
 const FLARE_PITCH: &str = "xcopilot/pitch";
-const FLARE_PITCH_YIELD: &str = "xcopilot/pitch_yield";
 /// The roll channel the takeoff's climb-out flies, and its take-back latch:
 /// with the servos off for the arrest, the runway track is held here.
 /// The airframe's own approach status and the stock one, last read (while
@@ -6248,7 +6220,6 @@ const FLARE_PITCH_YIELD: &str = "xcopilot/pitch_yield";
 static LAST_APPR_READS: std::sync::Mutex<(Option<f64>, Option<f64>)> = std::sync::Mutex::new((None, None));
 
 const FLARE_ROLL: &str = "xcopilot/roll";
-const FLARE_ROLL_YIELD: &str = "xcopilot/roll_yield";
 
 /// Elevator for a wanted sink rate, flown DIRECTLY instead of asked of the
 /// autopilot's vertical-speed mode.
@@ -8112,6 +8083,7 @@ pub fn flare_pavement_need_m(radio_ft: f64, landing_m: Option<f64>) -> f64 {
 /// [`flare_pavement_need_m`]: the recited distance less the air segment
 /// already flown (LFBD 11). Pure.
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 pub fn commit_flare(
     g: Guidance,
     was_flaring: bool,
@@ -8242,6 +8214,7 @@ pub fn hold_roundout(
 /// the autopilot. `flare_radio_ft` is the height above the runway to start the flare.
 /// `xtk_rate_nm_min` is the cross-track closure rate (positive = drifting right),
 /// 0.0 when unknown — the damping term on the final's centreline correction.
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub fn guidance(
     cur_lat: f64,
@@ -13309,6 +13282,7 @@ mod lemg_737_flare_tests {
         /// (fitted; LEMG 12 arrived at -774 on a trim that held -496).
         trimmed_sink_fpm: f64,
         /// The sink at the wheels, as flown.
+        #[allow(dead_code)] // the record's, read only through Debug
         flown_fpm: f64,
     }
 
@@ -17505,9 +17479,11 @@ mod lemg13_sr22_bounce_tests {
     struct Landing {
         first_fpm: f64,
         first_ias: f64,
+        #[allow(dead_code)] // the record's, read only through Debug
         contacts: usize,
         bounce_ft: f64,
         min_ias: f64,
+        #[allow(dead_code)] // the record's, read only through Debug
         secs_to_wheels: f64,
     }
 

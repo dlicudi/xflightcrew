@@ -161,6 +161,7 @@ pub fn close_demonstration() {
 }
 
 /// The tool a demonstration stands open for, if any.
+#[cfg(test)]
 pub fn demonstration_tool() -> Option<&'static str> {
     demonstration().as_ref().map(|d| d.tool)
 }
