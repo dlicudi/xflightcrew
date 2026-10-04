@@ -319,6 +319,10 @@ const LEFT_BRAKE: &str = "sim/cockpit2/controls/left_brake_ratio";
 /// Thrust lever, for the two power guards: engaging refuses with power up (a
 /// misheard "brakes on" mid-takeoff-roll must never latch the wheels), and
 /// the holder warns once if power comes up while the boot is on.
+/// The stock lever, which the tests read. Live code goes through
+/// `aircraft::throttle_dataref()` (refactor audit 2026-10-04 #11: the
+/// Citation X ignores `throttle_ratio_all`).
+#[cfg(test)]
 const THROTTLE: &str = "sim/cockpit2/engine/actuators/throttle_ratio_all";
 /// Engage refuses above this throttle. Comfortably over the taxi governor's
 /// 0.35 power cap, comfortably under any takeoff or run-up setting.
@@ -375,7 +379,7 @@ async fn brake_holder(xp: XPlaneClient, voice: Option<crate::voice::Voice>) {
         } else {
             super::note_brake_cmd();
         }
-        if !power_warned && xp.get_float(THROTTLE).await.is_ok_and(|t| t > 0.7) {
+        if !power_warned && xp.get_float(&crate::aircraft::throttle_dataref()).await.is_ok_and(|t| t > 0.7) {
             power_warned = true;
             if let Some(v) = &voice {
                 v.say(
@@ -476,7 +480,7 @@ impl Tool for HoldBrakes {
         // already running). Latched brakes at takeoff power is the one
         // dangerous thing a misheard 'brakes on' could buy, so it's refused,
         // never guessed.
-        if ctx.xplane.get_float(THROTTLE).await.unwrap_or(0.0) > HOLD_MAX_THROTTLE {
+        if ctx.xplane.get_float(&crate::aircraft::throttle_dataref()).await.unwrap_or(0.0) > HOLD_MAX_THROTTLE {
             return Ok(
                 "Negative, power's up, I'm not grabbing the brakes. Close the \
                  throttle first."
@@ -497,7 +501,7 @@ impl Tool for HoldBrakes {
         if taxi_hold {
             super::speedhold::ACTIVE.store(false, Ordering::Relaxed);
             tokio::time::sleep(std::time::Duration::from_millis(350)).await;
-            let _ = ctx.xplane.set_float(THROTTLE, 0.0).await;
+            let _ = ctx.xplane.set_float(&crate::aircraft::throttle_dataref(), 0.0).await;
         }
         if !BRAKES_HELD.swap(true, Ordering::Relaxed) {
             // The holder drives the REAL sim, so it's compiled out under

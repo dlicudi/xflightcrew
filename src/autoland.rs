@@ -591,7 +591,9 @@ const VS_DIVERGED_GIVE_UP_S: f64 = 46.0;
 /// The confirmed engager lives in [`crate::ap_engage`] (refactor audit
 /// 2026-10-04 #5: one engage for every loop); re-exported for the arm and
 /// the tests here.
-pub use crate::ap_engage::{ApEngage, EngageStep, ENGAGE_GIVE_UP_S};
+pub use crate::ap_engage::{ApEngage, EngageStep};
+#[cfg(test)]
+pub use crate::ap_engage::ENGAGE_GIVE_UP_S;
 
 /// The elevator law that holds the aircraft LEVEL until the autopilot is
 /// confirmed: the flare's free tracker ([`FlarePitch`] outside the
@@ -4284,7 +4286,7 @@ fn spawn_autoland(launch: AutolandLaunch) {
                         &crate::aircraft::flap_limits(),
                         floor,
                     );
-                    let adj = crate::tools::speedhold::throttle_adjust(target - ias, trend_kts_s);
+                    let adj = crate::tools::speedhold::throttle_adjust_live(target - ias, trend_kts_s);
                     // In the roundout the lever only ever comes back. The
                     // speed law read the roundout's own deceleration as
                     // "five knots slow" and walked the 737's lever from 0.32

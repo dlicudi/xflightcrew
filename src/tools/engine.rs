@@ -11,6 +11,10 @@ use serde_json::{json, Value};
 use super::{Tool, ToolCtx};
 use crate::aircraft::FuelSelectorProfile;
 
+/// The stock lever, which the tests read. Live code goes through
+/// `aircraft::throttle_dataref()` (refactor audit 2026-10-04 #11: the
+/// Citation X ignores `throttle_ratio_all`).
+#[cfg(test)]
 const THROTTLE: &str = "sim/cockpit2/engine/actuators/throttle_ratio_all";
 const MIXTURE: &str = "sim/cockpit2/engine/actuators/mixture_ratio_all";
 const BATTERY: &str = "sim/cockpit/electrical/battery_on";
@@ -172,7 +176,7 @@ impl Tool for SetThrottle {
         // A relative request adjusts the CURRENT lever — "reduce by ten" from 45%
         // goes to 35%, never to an absolute 10% (a power chop, seen live).
         let target_pct = if let Some(d) = a.delta {
-            ctx.xplane.get_float(THROTTLE).await? * 100.0 + d
+            ctx.xplane.get_float(&crate::aircraft::throttle_dataref()).await? * 100.0 + d
         } else if let Some(p) = a.percent {
             p
         } else {
@@ -183,8 +187,8 @@ impl Tool for SetThrottle {
         let ratio = (target_pct / 100.0).clamp(0.0, 1.0);
         // Ease the lever to the target instead of snapping it — feels like a real
         // hand on the throttle.
-        ramp_actuator(ctx, THROTTLE, ratio).await?;
-        let actual = ctx.xplane.get_float(THROTTLE).await? * 100.0;
+        ramp_actuator(ctx, &crate::aircraft::throttle_dataref(), ratio).await?;
+        let actual = ctx.xplane.get_float(&crate::aircraft::throttle_dataref()).await? * 100.0;
         Ok(format!("Roger, throttle {actual:.0} percent."))
     }
 }
@@ -447,7 +451,7 @@ async fn mixture_manager(xp: crate::xplane::XPlaneClient) {
         }
         let (Ok(alt), Ok(thr), Ok(mix)) = (
             xp.get_float(ALT_FT).await,
-            xp.get_float(THROTTLE).await,
+            xp.get_float(&crate::aircraft::throttle_dataref()).await,
             xp.get_float(MIXTURE).await,
         ) else {
             tokio::time::sleep(std::time::Duration::from_millis(2000)).await;
@@ -631,7 +635,7 @@ impl Tool for LeanMixture {
                 // Don't lean hard at high power down low (detonation risk). Up high,
                 // full throttle is still under 75% power, so leaning is correct.
                 if alt < LEAN_FLOOR_ALT_FT
-                    && ctx.xplane.get_float(THROTTLE).await.unwrap_or(0.0) > 0.80
+                    && ctx.xplane.get_float(&crate::aircraft::throttle_dataref()).await.unwrap_or(0.0) > 0.80
                 {
                     return Ok(
                         "We're at high power down low, I'll hold off leaning; \
@@ -937,7 +941,7 @@ impl Tool for StartEngine {
         if !fuel_note.is_empty() {
             crate::crew_pace::item(voice, &format!("Fuel, {}.", fuel_note.trim_end_matches(", "))).await;
         }
-        ctx.xplane.set_float(THROTTLE, 0.1).await?; // crack the throttle
+        ctx.xplane.set_float(&crate::aircraft::throttle_dataref(), 0.1).await?; // crack the throttle
         crate::crew_pace::item(voice, "Throttle, cracked.").await;
         ctx.xplane.set_float(MIXTURE, 1.0).await?; // full rich
         crate::crew_pace::item(voice, "Mixture, full rich.").await;

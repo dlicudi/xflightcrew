@@ -255,6 +255,7 @@ impl ServoWatch {
     }
 
     /// An engage in progress.
+    #[cfg(test)]
     pub fn engaging(&self) -> bool {
         self.engage.is_some()
     }

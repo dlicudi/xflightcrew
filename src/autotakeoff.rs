@@ -62,6 +62,7 @@ const FLAP_HANDLE: &str = "sim/cockpit2/controls/flap_ratio";
 /// Clean up the takeoff flaps this high AGL, once safely above Vy — a
 /// conservative "positive climb, gear up, then flaps" point.
 const FLAP_RETRACT_AGL_FT: f64 = 400.0;
+#[cfg(test)]
 const CMD_SERVOS_ON: &str = "sim/autopilot/servos_on";
 /// Servos and flight director off: an autopilot left on by the last flight.
 const CMD_AP_OFF: &str = "sim/autopilot/servos_fdir_off";
