@@ -29,6 +29,7 @@ mod control;
 mod crew_pace;
 mod conversation;
 mod course_leg;
+mod crew_radio;
 mod debrief;
 mod heading_bug;
 mod sortie_runner;
