@@ -8,7 +8,7 @@
 //! true at 1,475 ft (EGHI, 2026-08-02). The cure the party line already uses
 //! for the world's side is one page with the writes on it. This is the crew's.
 //!
-//! Three doors:
+//! The doors:
 //! - [`publish_airframe`]: every selector the tools read per airframe, from
 //!   the profile, including to `None`. Called at boot and on every swap.
 //! - [`stand_down`]: every loop that can hold the aircraft, stopped. Called
@@ -17,8 +17,13 @@
 //!   `stand_down_pins_every_active_loop` keeps this list equal to every
 //!   loop flag in the tree (`ACTIVE`, `ABORT`, `RUN`, a `_HELD` hold, a
 //!   watcher's `GEN`), so a new loop cannot be forgotten here.
-//! - [`forget_flight`]: the crew's facts about the flight that ended, at the
-//!   setups' new flight and a new flight someone else started.
+//! - [`flight_begins`]: THE new-flight door (ramp, approach and enroute
+//!   setups, a foreign start, the model's reposition): stand-down, the
+//!   crew's flight facts forgotten (`forget_flight`), the old checklist
+//!   dropped, the party line retired; blackbox `flight_state`
+//!   `flight_begins` with `why`.
+//! - [`airframe_begins`]: boot and every swap: stand-down, then
+//!   `publish_airframe`, then the flight forgotten (`airframe_begins`).
 //!
 //! Inventory of what is NOT yet cleared here and lives in its own module,
 //! per FLIGHT rather than per airframe (each reset on its own path today):
@@ -88,11 +93,162 @@ pub(crate) fn publish_airframe(p: &AircraftProfile) {
     crate::tools::anti_ice::clear_claims();
 }
 
+/// What began a new flight: the cause [`flight_begins`] records and the
+/// checklist's stand-down names.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum NewFlight {
+    /// "Set up the flight": the plan's origin, cold and dark.
+    Ramp,
+    /// "Put us on a ten mile final".
+    Approach,
+    /// The sortie runner's airborne start on the plan.
+    Enroute,
+    /// A mailbox run the app did not post (`setup::foreign_new_flight`).
+    Foreign,
+    /// The flight model saw the aircraft jump (`flight::Event::Reposition`)
+    /// with no setup of ours or anyone's accounting for it.
+    Reposition,
+}
+
+impl NewFlight {
+    /// Its name in the blackbox (`flight_state` `flight_begins` `why`).
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            NewFlight::Ramp => "ramp",
+            NewFlight::Approach => "approach",
+            NewFlight::Enroute => "enroute",
+            NewFlight::Foreign => "foreign",
+            NewFlight::Reposition => "reposition",
+        }
+    }
+
+    /// The cause the checklist's `stood_down` record names (the strings it
+    /// wrote before the door: the setups said "setup", the model's jump
+    /// "reposition").
+    fn list_cause(self) -> &'static str {
+        match self {
+            NewFlight::Ramp | NewFlight::Approach | NewFlight::Enroute => "setup",
+            NewFlight::Foreign => "foreign",
+            NewFlight::Reposition => "reposition",
+        }
+    }
+}
+
+/// Bumped once per flight begun (and per airframe, which is a new flight
+/// too): the generation a flight-scoped fact can be stamped with.
+static FLIGHTS_BEGUN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// When the last full door ran ([`flight_begins`] other than a reposition,
+/// or [`airframe_begins`]): the flight model's jump that follows our own
+/// setup is the same new flight, not another.
+static LAST_BEGUN: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
+/// A reposition seen this soon after a door is that door's flight: the
+/// setups run theirs as the init returns, and the model sees the jump on its
+/// first live tick after the load gate opens (a few seconds).
+const REPOSITION_SAME_FLIGHT_S: u64 = 60;
+
+/// The current flight's generation.
+#[allow(dead_code)]
+pub(crate) fn flight_gen() -> u64 {
+    FLIGHTS_BEGUN.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// What a reposition's door does: `None` runs it, else the reason it is the
+/// flight a door already began. Pure, so the idempotency is a plain test.
+fn reposition_skip(
+    loading: bool,
+    since_begun: Option<std::time::Duration>,
+) -> Option<&'static str> {
+    if loading {
+        // A setup of ours (or the runner's start) is loading: its own door
+        // runs when the init returns.
+        return Some("loading");
+    }
+    if since_begun.is_some_and(|d| d.as_secs() < REPOSITION_SAME_FLIGHT_S) {
+        return Some("begun");
+    }
+    None
+}
+
+/// THE NEW-FLIGHT DOOR. Every path that begins a new flight comes through
+/// here, so the steps cannot drift apart again (the ramp setup forgot the
+/// stand-down, the foreign start the checklist, the approach retired the
+/// party line on its own; refactor audit 2026-10-04, phase 3).
+///
+/// A setup's flight (ramp, approach, enroute) and a foreign start: every
+/// loop stood down (nothing keeps flying the flight that ended), the crew's
+/// flight facts forgotten, the checklist of the old flight dropped, and with
+/// ATC on the party line retired (its clearances were the old flight's).
+/// Called once the new flight EXISTS (the init returned), before anything
+/// arms on it. The approach and enroute setups also stand down before their
+/// init, so nothing flies through the jump.
+///
+/// A reposition the model saw is deliberately lighter: only the checklist
+/// (its behaviour before the door). The model's jump is also a replay's
+/// rewind and its return, where standing the loops down or retiring a
+/// landing clearance mid-final would be wrong; and a jump this app or the
+/// runner made already ran its own door ([`reposition_skip`]).
+pub(crate) fn flight_begins(why: NewFlight) {
+    use std::sync::atomic::Ordering::SeqCst;
+    if why == NewFlight::Reposition {
+        let since = LAST_BEGUN
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .map(|t| t.elapsed());
+        if let Some(skip) = reposition_skip(crate::tools::setup::new_flight_loading(), since) {
+            crate::blackbox::record(
+                "flight_state",
+                serde_json::json!({ "event": "flight_begins", "why": why.name(), "skipped": skip }),
+            );
+            return;
+        }
+        let list = crate::flow::stand_down(crate::flow::StandDown::NewFlight(why.list_cause()));
+        crate::blackbox::record(
+            "flight_state",
+            serde_json::json!({ "event": "flight_begins", "why": why.name(),
+                                "list_stood_down": list }),
+        );
+        return;
+    }
+    stand_down();
+    forget_flight();
+    let list = crate::flow::stand_down(crate::flow::StandDown::NewFlight(why.list_cause()));
+    let atc = crate::mode::atc_enabled();
+    if atc {
+        crate::party_line::retire_for_new_flight();
+    }
+    let flight = FLIGHTS_BEGUN.fetch_add(1, SeqCst) + 1;
+    *LAST_BEGUN.lock().unwrap_or_else(|e| e.into_inner()) = Some(std::time::Instant::now());
+    crate::blackbox::record(
+        "flight_state",
+        serde_json::json!({ "event": "flight_begins", "why": why.name(), "flight": flight,
+                            "list_stood_down": list, "party_line_retired": atc }),
+    );
+}
+
+/// THE NEW-AIRFRAME DOOR: at boot and on every swap. In order: every loop
+/// stood down first (a loop armed on the old airframe must not fly the new
+/// one with its speeds and limits), then every selector republished from the
+/// new profile, then the old flight's facts forgotten (a swap reloads the
+/// aircraft: the last landing's runway and the plan's destination were the
+/// old airframe's flight).
+pub(crate) fn airframe_begins(p: &AircraftProfile, why: &'static str) {
+    use std::sync::atomic::Ordering::SeqCst;
+    stand_down();
+    publish_airframe(p);
+    forget_flight();
+    let flight = FLIGHTS_BEGUN.fetch_add(1, SeqCst) + 1;
+    *LAST_BEGUN.lock().unwrap_or_else(|e| e.into_inner()) = Some(std::time::Instant::now());
+    crate::blackbox::record(
+        "flight_state",
+        serde_json::json!({ "event": "airframe_begins", "why": why, "profile": p.id,
+                            "flight": flight }),
+    );
+}
+
 /// The crew's facts about the flight that ended, forgotten when a new one
-/// begins: the ramp and approach setups and a new flight someone else
-/// started (`setup::foreign_new_flight`). The world's side is
-/// `party_line::retire_for_new_flight`, called beside it.
-pub(crate) fn forget_flight() {
+/// begins. Only the doors call it ([`flight_begins`], [`airframe_begins`]);
+/// the world's side is `party_line::retire_for_new_flight`, beside it there.
+fn forget_flight() {
     // The plan's transition was the old flight's: the monitor's altimeter
     // check WRITES the setting with an automation flying.
     crate::tools::instruments::publish_flight_transition(None);
@@ -476,19 +632,24 @@ mod tests {
         let rest = &src[at..];
         let end = rest[1..].find("\nfn ").map_or(rest.len(), |e| e + 1);
         let end = end.min(rest[1..].find("\npub ").map_or(rest.len(), |e| e + 1));
+        let end = end.min(
+            rest[1..]
+                .find("\npub(crate) ")
+                .map_or(rest.len(), |e| e + 1),
+        );
         &rest[..end]
     }
 
     /// A plan's transition, the last landing's runway and tracking, and the
     /// plan's destination outlived the flight: a "put us on a ten mile final"
     /// after LIEA-LEBL was judged against TA 6,000, and the altimeter check
-    /// WRITES the setting with an automation flying. Every crew-side new
-    /// flight forgets them, and the transition dies with the mission too.
+    /// WRITES the setting with an automation flying. The forgetting is the
+    /// doors' and the transition dies with the mission too.
     #[test]
     fn every_new_flight_and_mission_end_forgets_the_flight() {
         let door = body_of(
             crate::test_support::module_source("flight_state"),
-            "pub(crate) fn forget_flight()",
+            "fn forget_flight()",
         );
         for clear in [
             "publish_flight_transition(None)",
@@ -497,19 +658,129 @@ mod tests {
         ] {
             assert!(door.contains(clear), "forget_flight must call {clear}");
         }
-        let setup = crate::test_support::module_source("tools/setup");
-        let foreign = body_of(setup, "async fn foreign_new_flight(");
-        assert!(foreign.contains("crate::flight_state::forget_flight();"));
-        // The ramp and approach setups: once per new flight begun.
-        let calls = setup
-            .matches("crate::flight_state::forget_flight();")
-            .count();
-        assert!(
-            calls >= 3,
-            "ramp, approach and foreign new flights: {calls}"
+        let mission_end = body_of(
+            crate::test_support::module_source("full_auto"),
+            "fn stop_active()",
         );
-        let mission_end = body_of(crate::test_support::module_source("full_auto"), "fn stop_active()");
         assert!(mission_end.contains("publish_flight_transition(None)"));
+    }
+
+    /// The doors do every step, in order: the loops stop before the
+    /// selectors change under them, and the flight's facts go after.
+    #[test]
+    fn the_doors_do_every_step_in_order() {
+        let src = crate::test_support::module_source("flight_state");
+        let flight = body_of(src, "pub(crate) fn flight_begins(");
+        let full = flight
+            .split("    stand_down();\n")
+            .nth(1)
+            .expect("a full door stands down");
+        for step in [
+            "forget_flight();",
+            "crate::flow::stand_down(crate::flow::StandDown::NewFlight(",
+            "crate::party_line::retire_for_new_flight();",
+            "\"flight_begins\"",
+        ] {
+            assert!(full.contains(step), "flight_begins must do {step}");
+        }
+        let air = body_of(src, "pub(crate) fn airframe_begins(");
+        let at = |s: &str| {
+            air.find(s)
+                .unwrap_or_else(|| panic!("airframe_begins: {s}"))
+        };
+        assert!(at("stand_down();") < at("publish_airframe(p);"));
+        assert!(at("publish_airframe(p);") < at("forget_flight();"));
+        assert!(air.contains("\"airframe_begins\""));
+    }
+
+    /// Every path that begins a flight goes through a door, and the steps a
+    /// door does are called nowhere else: the five new-flight sites had
+    /// drifted (the ramp never stood down, the foreign start never dropped
+    /// the checklist).
+    #[test]
+    fn new_flight_steps_live_only_in_the_doors() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut stray = Vec::new();
+        for f in crate::test_support::rust_files(&root) {
+            if crate::test_support::is_test_file(&f) || f.ends_with("flight_state.rs") {
+                continue;
+            }
+            let rel = f.strip_prefix(&root).unwrap().display().to_string();
+            let text = std::fs::read_to_string(&f).unwrap();
+            for (n, line) in text.lines().enumerate() {
+                let code = line.trim_start();
+                if code.starts_with("//") {
+                    continue;
+                }
+                let mut steps = vec![
+                    "retire_for_new_flight(",
+                    "flight_state::forget_flight(",
+                    "flight_state::publish_airframe(",
+                ];
+                // The list's own watch on the mailbox is the list's.
+                if rel != "flow.rs" {
+                    steps.push("StandDown::NewFlight(");
+                }
+                for step in steps {
+                    if code.contains(step) {
+                        stray.push(format!("{rel}:{} {step}", n + 1));
+                    }
+                }
+            }
+        }
+        assert!(
+            stray.is_empty(),
+            "new-flight steps outside the doors: {stray:?}"
+        );
+        for (module, door) in [
+            (
+                "tools/setup",
+                "flight_begins(crate::flight_state::NewFlight::Foreign)",
+            ),
+            (
+                "tools/setup",
+                "flight_begins(crate::flight_state::NewFlight::Ramp)",
+            ),
+            (
+                "tools/setup",
+                "flight_begins(crate::flight_state::NewFlight::Approach)",
+            ),
+            (
+                "tools/setup_enroute",
+                "flight_begins(crate::flight_state::NewFlight::Enroute)",
+            ),
+            (
+                "monitor",
+                "flight_begins(crate::flight_state::NewFlight::Reposition)",
+            ),
+            ("detect", "airframe_begins(&p, \"boot\")"),
+            ("detect", "airframe_begins(&p, \"swap\")"),
+        ] {
+            assert!(
+                crate::test_support::module_source(module).contains(door),
+                "{module} must call {door}"
+            );
+        }
+    }
+
+    /// A jump our own setup (or the runner's start) made is that setup's
+    /// flight: its door runs as the init returns. Only an unaccounted jump
+    /// runs the reposition's door.
+    #[test]
+    fn a_reposition_after_our_own_door_is_the_same_flight() {
+        use std::time::Duration;
+        assert_eq!(super::reposition_skip(true, None), Some("loading"));
+        assert_eq!(
+            super::reposition_skip(false, Some(Duration::from_secs(5))),
+            Some("begun")
+        );
+        assert_eq!(
+            super::reposition_skip(false, Some(Duration::from_secs(600))),
+            None
+        );
+        assert_eq!(super::reposition_skip(false, None), None);
+        assert_eq!(super::NewFlight::Reposition.list_cause(), "reposition");
+        assert_eq!(super::NewFlight::Approach.list_cause(), "setup");
     }
 
     /// The circuit awaited the published-arrival lookup, then cleared

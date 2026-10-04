@@ -3369,12 +3369,14 @@ pub async fn run(
             let crew_on = crate::mode::copilot_enabled();
 
             // The sim moved the aircraft (a new flight loaded, a reposition):
-            // a list of the flight that was ends with it.
+            // a list of the flight that was ends with it. Through the door,
+            // which knows a jump our own setup or the runner's start made
+            // (their doors already ran) and keeps a replay's jump light.
             if flight_events
                 .iter()
                 .any(|e| matches!(e, crate::flight::Event::Reposition { .. }))
             {
-                crate::flow::stand_down(crate::flow::StandDown::NewFlight("reposition"));
+                crate::flight_state::flight_begins(crate::flight_state::NewFlight::Reposition);
             }
             // The checklist at its phase: crossing a boundary runs the
             // matching list as the flying copilot's cross-check when an
