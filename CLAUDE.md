@@ -262,12 +262,9 @@ Config: `XCOPILOT_ATC_AIRPORT` / `_VOICE` / `_RATE` / `_REGION`.
 ## Ground & flight automation
 
 Orchestrators compose proven loops; no new flight laws in them. Laws test as plain `cargo test`;
-everything blackboxes to `logs/blackbox.jsonl` (kinds: `atc`, `autotaxi`, `autotakeoff`,
-`pushback`, `checklist`, `taxi_guide`, `cockpit_auto`, `full_auto`, `circuit`, `procedure`,
-`cabin`, `instructor`, `loading`, `turbine_start`, `heli_start`, `hover`, `heli_circuit`,
-`heli_route`, `rapport`, `cabin_air`, `api_load`, `plan_audit`, `handover`, `start_item`,
-`sim_radio`, `fuel_pumps`, `electrical`, `typed`, `crew_radio`, `go_around`, `recover`,
-`ap_pitch_authority`, `autoflight`, `safe_hold`).
+everything blackboxes to `logs/blackbox.jsonl`. A record's kind is the first argument of
+`blackbox::record` (about 90), listed by
+`rg -oNU --no-filename 'record\(\s*"(\w+)"' -r '$1' src crates | sort -u`; a name like `ap_engage` or `recovery_plan` is usually an `event` field inside a kind.
 
 ### Holding, writers, reads
 - **An airborne aircraft NOBODY flies is held safe** (`src/safe_hold.rs`, its own thread, never

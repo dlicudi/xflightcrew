@@ -29,6 +29,7 @@ pub fn radioize_variant(samples: &mut Vec<f32>, sample_rate: u32, variant: u32) 
 /// station reads weak and hissy, the way VHF actually dies with range. AGC is
 /// deliberately modeled (the level stays normalized, only the SNR drops):
 /// a real receiver holds volume while readability goes.
+#[cfg_attr(not(feature = "onnx-tts"), allow(dead_code))] // the onnx voice's only
 pub fn radioize_variant_q(samples: &mut Vec<f32>, sample_rate: u32, variant: u32, quality: f32) {
     radioize_core(samples, sample_rate, variant, true, quality);
 }
@@ -78,6 +79,7 @@ pub fn radioize_with_tail_q(
 /// Applied BEFORE [`radioize_variant`] so the key click, noise floor, and
 /// squelch tail stay at their natural pitch — they're the receiver's sound,
 /// not the speaker's.
+#[cfg_attr(not(feature = "onnx-tts"), allow(dead_code))] // the onnx voice's only
 pub fn voice_shift(samples: &mut Vec<f32>, sample_rate: u32, factor: f32) {
     // Unity or out-of-band factors are a no-op: never degrade the audio for
     // an effect nobody would hear (or a corrupt factor nobody wants).
@@ -93,6 +95,7 @@ pub fn voice_shift(samples: &mut Vec<f32>, sample_rate: u32, factor: f32) {
 /// offset — unity is deliberately not in the table, because "no shift" is the
 /// copilot's signature. Small enough that intelligibility through the
 /// 300-3 kHz bandpass never suffers.
+#[cfg_attr(not(feature = "onnx-tts"), allow(dead_code))] // the onnx voice's only
 pub fn shift_factor(person: u64) -> f32 {
     const BINS: [f32; 6] = [0.92, 0.95, 0.97, 1.03, 1.06, 1.09];
     BINS[(person % BINS.len() as u64) as usize]
@@ -101,6 +104,7 @@ pub fn shift_factor(person: u64) -> f32 {
 /// Read a squelch recording for [`radioize_with_tail`]: any WAV (float or
 /// int samples), downmixed to mono, resampled to `target_rate`, peak
 /// normalized so the per-transmission gain lands predictably.
+#[cfg_attr(not(feature = "onnx-tts"), allow(dead_code))] // the onnx voice's only
 pub fn load_tail_wav(path: &str, target_rate: u32) -> anyhow::Result<Vec<f32>> {
     use anyhow::Context as _;
     let mut reader = hound::WavReader::open(path).with_context(|| format!("open {path}"))?;

@@ -114,6 +114,7 @@ fn local_accents_for(icao: &str) -> &'static [&'static str] {
 /// accent, and 1.15 for the VCTK speakers, who read fast by nature - picked
 /// by ear from 0.8 to 1.2 on 2026-09-22 ("1.1 or 1.2"), 0.8 and 1.0 both
 /// "too fast".
+#[cfg_attr(not(feature = "onnx-tts"), allow(dead_code))] // the onnx voice's only
 fn station_pace(model: &str) -> f32 {
     if is_accent_model(model) {
         1.1
@@ -132,6 +133,7 @@ fn station_pace(model: &str) -> f32 {
 /// scaled so every one of them speaks at the rate picked by ear for p239 at
 /// 1.15 (2026-09-22). Every entry passed the same day's audition, except
 /// VCTK #58, #80 and #96, pool members from before it that were not rated.
+#[cfg_attr(not(feature = "onnx-tts"), allow(dead_code))] // the onnx voice's only
 const MEASURED_PACE: &[(&str, f32)] = &[
     ("models/en_GB-vctk-medium.onnx#0", 1.15),
     ("models/en_GB-vctk-medium.onnx#1", 0.99),
@@ -175,6 +177,7 @@ const MEASURED_PACE: &[(&str, f32)] = &[
 
 /// A non-English model reading English: an accent, voiced at the measured
 /// pace (see `StationVoice::build`), and never in the neutral pool.
+#[cfg_attr(not(feature = "onnx-tts"), allow(dead_code))] // the onnx voice's only
 fn is_accent_model(spec: &str) -> bool {
     let file = spec.rsplit('/').next().unwrap_or(spec);
     !file.starts_with("en_")
@@ -1747,6 +1750,8 @@ enum StationVoice {
 
 impl StationVoice {
     fn build(config: &Config, model: &str, person: u64) -> Self {
+        #[cfg(not(feature = "onnx-tts"))]
+        let _ = (model, person); // the onnx voice's only
         if config.tts_backend == "off" {
             return StationVoice::Say(Box::new(Config {
                 tts_backend: "off".into(),

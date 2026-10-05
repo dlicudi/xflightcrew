@@ -230,11 +230,13 @@ pub struct Config {
     /// a station never plays a TTS model at its native pitch, so the copilot
     /// can share a model with any controller without sounding like the same
     /// person. `XCOPILOT_ATC_VOICE_SHIFT=false` disables.
+    #[cfg_attr(not(feature = "onnx-tts"), allow(dead_code))] // the onnx voice's only
     pub atc_voice_shift: bool,
     /// Recorded squelch transient spliced onto the end of every station
     /// transmission (VATSIM-style; the default is AFV-Native's click, BSD-3,
     /// see assets/afv/). Empty falls back to the synthesized burst.
     /// `XCOPILOT_SQUELCH_WAV`.
+    #[cfg_attr(not(feature = "onnx-tts"), allow(dead_code))] // the onnx voice's only
     pub atc_squelch_wav: String,
     /// macOS `say` voice for the ATC station, used when the ONNX station voice
     /// is empty or fails to load. `XCOPILOT_ATC_VOICE`.
