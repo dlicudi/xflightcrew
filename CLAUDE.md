@@ -90,6 +90,19 @@ Datarefs and commands stay in the Rust tools; YAML is per-airframe config.
   who flies is `flight_state::Owner` / `crew_has_aircraft`; stopped is `sim::ground`; angles are
   `sim::angles`; AP engage is `ap_engage::ApEngage`; the speed ceiling is `ceiling_from_vne`
   (0.9 Vne less 10, under the overspeed caution; `vmo_high:` for an altitude Vmo).
+- **The autopilot panel has ONE owner** (`src/autoflight.rs`; `every_mcp_write_goes_through_the_owner`
+  scans the source): every press and dial write goes through it, never a literal elsewhere. The
+  modes' truth is the `autopilot_state` bitfield (`Modes`): the 737's `app_status` and the stock
+  `approach_status` read 0 through captures. The panel is the airframe's (`Panel`, the profile's
+  `autoflight:` buttons; CMD B never). A loop states INTENT (`Want`: its heading or the airframe's
+  localiser, its VS or the glideslope) and `reconcile` presses on a difference only, never over a
+  capture the intent hands over, nothing on a failed read: its HDG and V/S presses dropped 34 of
+  46 737 captures (#81). **The thrust has one owner**: a loop that flies the levers (autoland, the
+  governor, the takeoff; the recovery without the settle) takes an ENGAGED autothrottle out to
+  ARM (`ThrustWatch`, bounded, said once): the A/T in SPEED 230 held LEMG 13's levers 7 min
+  (2026-10-05). The window is parked where no capture takes the wheel (`WindowRule`: above, or at
+  the field on a V/S-toward-window MCP, `vs_toward_window`). Primitives for other loops:
+  `engage_confirmed`, `hold_level`, `hold_heading`, `take_thrust`, `arm_approach`.
 - Multi-engine tools take `engines`, act per engine, and read back the LAST element written;
   singles stay byte-identical (element 0, starter 1). `vyse_kts`, `vmca_kts` stay `None` on
   singles: say nothing rather than invent.
@@ -396,7 +409,7 @@ everything blackboxes to `logs/blackbox.jsonl` (kinds: `atc`, `autotaxi`, `autot
 `cabin`, `instructor`, `loading`, `turbine_start`, `heli_start`, `hover`, `heli_circuit`,
 `heli_route`, `rapport`, `cabin_air`, `api_load`, `plan_audit`, `handover`, `start_item`,
 `sim_radio`, `fuel_pumps`, `electrical`, `typed`, `crew_radio`, `go_around`, `recover`,
-`ap_pitch_authority`).
+`ap_pitch_authority`, `autoflight`).
 
 ### Holding, writers, reads
 - **A stage not moving the aircraft is holding it**: brakes for every wait, abort and give-up. **A
@@ -763,6 +776,17 @@ everything blackboxes to `logs/blackbox.jsonl` (kinds: `atc`, `autotaxi`, `autot
 - **The autopilot's own modes are tools, not yet the follower's** (`tools::autoflight` `ap_mode`:
   autothrust, level change, GPSS; `systems::ap_modes`: proved > `autoflight:` > type): toggles read
   before firing, refused where the map says No; the follower adopts `engage` later (probes owed).
+- **A final asks for descent OR deceleration, planned back from the gate** (`src/approach_energy.rs`,
+  per detent `idle_decel_kts_s`, fitted from the airframe's own idle ticks): from the landing
+  speed `GATE_MARGIN_S` early, back up the path, the fastest speed idle and the configuration that
+  speed allows still make (3 degrees of path is 1.0 kt/s of gravity: a 737 at flaps 5 cannot slow
+  on it). Level legs slow to the join speed and configure 30 s before the join; on the path no
+  faster than its curve; a planned final never accelerates (`energy_cap`); a pattern's inbound
+  never flies faster than the pattern (LEMG 13 2026-10-05: 177 to 222 kt level, joined at 208 with
+  flaps 5, around high at 3.8 nm). Ticks carry `tgt_ias`, `e_kts`, `e_flap`, `e_join`, `e_gate`. An
+  airframe declaring none keeps the distance schedule. **Established on the final path beyond the
+  FAP the descent is the final's** (`established_on_final_path`): the reposition's soft floor keyed
+  on radio over hills cut the path to a dial no VS mode follows (511 ft high in 60 s).
 - **A STAR window over the plan's cruise is flown at the cruise and said once**
   (`windows_above_cruise`); one the airframe cannot make is said with the number (`star_window_miss`),
   an "at or above" judged on the climb being FLOWN, not while a clearance holds us (`window_climb_fpm`).
@@ -779,7 +803,8 @@ everything blackboxes to `logs/blackbox.jsonl` (kinds: `atc`, `autotaxi`, `autot
   of the landing target (+25 above 500 ft), sink under max(1,000, the path's at the target speed
   + 400), within 0.7 deg of the path; a breach held 3 s goes around ("Not stabilised, ..."),
   judged gate to 200 ft, never in the arrest. Landing flap a mile before the gate
-  (`landing_flap_nm`); the arrival slows to the clean approach speed before the handoff
+  (`landing_flap_nm`; where the energy plan flies, where its speed allows); the arrival slows to
+  the clean approach speed before the handoff
   (`arrival_handoff_cap`); the missed approach flies `missed_approach_speed_kts`, never full
   power to overspeed (EGNX 737 flew the final at 255 kt clean, then 355 kt in the missed
   approach, 2026-09-30).
@@ -809,7 +834,9 @@ everything blackboxes to `logs/blackbox.jsonl` (kinds: `atc`, `autotaxi`, `autot
   landing** (`map_short_of_runway`), handed over at the FAF (`handoff_index`; EGKK 26L 2026-09-27).
 - **The ILS is tuned, watched and, per airframe, flown** (`src/ils.rs`): `ils::tune` at every arm
   (read back, `ils` `tuned`); `XCheck` calls a needle held off on final; `Coupling` only with the
-  profile's `ils_coupled`, never writing what a capture owns. **A positive `vdef` is ABOVE the
+  profile's `ils_coupled` (the 737's since 2026-10-05), armed on an intercept from below the beam,
+  read on the bitfield, never writing or pressing over what a capture owns; a decouple presses APP
+  once more to take out what is still in. **A positive `vdef` is ABOVE the
   beam** (`ils::above_glideslope`, checked on earth_nav.dat's antennas; #175 had it inverted), and
   no glideslope call under 200 ft radio (`XCHECK_GS_FLOOR_AGL_FT`).
 - **The copilot knows the systems before reaching for one** (`src/systems.rs`: the `.acf` and
@@ -845,8 +872,9 @@ everything blackboxes to `logs/blackbox.jsonl` (kinds: `atc`, `autotaxi`, `autot
 - **Autoland core**: the pursuit aim keeps full lead (`pursuit_aim_nm`); a roundout band
   (`ROUNDOUT_MULT`, `ROUNDOUT_VS_FPM`) before the flare (level-hold over the runway is the bug); a
   rolling handoff at `VACATE_HANDOFF_KTS` (`autoland::VACATE_FOLLOWS`); a sticky `MissedStage`;
-  give-ups hand back a FLYABLE aircraft. The dial is parked at the arm (`parked_altitude_dial_ft`),
-  else its capture ignores the VS dial; the glidepath aims at the pavement (`aim_elevation_ft`,
+  give-ups hand back a FLYABLE aircraft. The dial is parked at the arm by the airframe's
+  `WindowRule` (`parked_window_ft`), else its capture ignores the VS dial; the glidepath aims at
+  the pavement (`aim_elevation_ft`,
   `threshold_elev`), not the apt.dat header.
 - **The crab is LOW-PASSED** (`CrabFilter`, `CRAB_TAU_S`; `crab`, `crab_raw`) and cancels wind only;
   a bias is `TrackTrim`'s, **learnt only from a settled track** (the trim inside 3 degrees,
@@ -929,7 +957,7 @@ itself** (`taxi_in::abort`, `running`, between its drives too), braked to a stop
 was driven again to the stand 7 s later (LEMG 2026-09-28).
 
 ### Still owed
-Issues labelled `owed` + `area:approach-landing` / `area:takeoff` / `area:full-auto` (`ils_coupled` #81).
+Issues labelled `owed` + `area:approach-landing` / `area:takeoff` / `area:full-auto` (`ils_coupled` on the 737 is unflown through the owner, #81).
 
 ## Helicopters: the hover loop
 

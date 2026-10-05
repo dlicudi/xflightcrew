@@ -12611,3 +12611,46 @@ still bounds a landing requested in a 1,700 fpm climb. A deliberately different 
 plant at the recorded heavy loading pins contact within 60 s and below 300 fpm
 (`a_heavy_landing_follows_the_ground_cushion_to_contact`); all 22 hover tests pass. Live EGBJ
 confirmation is owed.
+
+## 2026-10-05: the 737's autoflight has one owner, and its final is planned back from the gate
+
+Stock 737-800, LFRG-LEMG, sortie 1791187965-full_auto (task doc
+`docs/tasks/2026-10-05-lemg-737-core-fixes.md`, root causes 3 and 4). Fixture:
+`bench/approach/lemg13_737_2026-10-05.jsonl`.
+
+**Ownership.** Eleven files pressed `sim/autopilot/*` themselves. Re-read on the
+`autopilot_state` bitfield (the state record's `in.ap_state`), the 46 coupled-ILS arms of
+2026-09-26 to 09-28 (#81) were not "APP never read back": 34 showed the approach armed or
+captured within 4 s of the press (50 to 1330, 1584 or 2560), and each was dropped at the next
+tick by autoland's own housekeeping, which pressed HDG and V/S because `heading_status` and
+`vvi_status` read off under the captures while `app_status`/`approach_status` still said 0; 7
+showed nothing in the 1 s samples, 4 had the servos out. `src/autoflight.rs` now owns every press
+and dial write (source-scanned): the bitfield is the modes' truth, the panel is the airframe's
+(the 737's own CMD A, HDG SEL, V/S, ALT HLD, APP; CMD B never: pressed with CMD A in, outside APP,
+it dropped CMD A on 10-05), loops state intent and `reconcile` presses on a difference only and
+never over a capture. The A/T: autoland armed at 13:02:39 with SPEED 230 engaged (left by the
+manual recovery, `ap_state` 51) and nothing took it; the lever read off autoland's command on 194
+of 415 ticks to 13:09:34 while the speed sat on 230 to 240. `ThrustWatch` takes an engaged A/T to
+ARM on the first tick of every loop that flies the levers. The window: parked above at 5,600 over
+a 3,400 ft inbound the 737 held level on a -570 dial (12:25); `vs_toward_window` parks it at the
+field (was 89fe7a6's `alt_dial_park_field`).
+
+**Energy.** 13:13:07, the pattern's inbound read 210 kt off the distance schedule at 14.5 nm and
+the governor took the 737 from 177 to 222 kt level. The path was joined at 10.7 nm at 208 kt with
+flaps 5: idle level-equivalent deceleration fitted from every idle window of the 737 since
+2026-09-25 is about 1.1 kt/s clean, 1.0 at flaps 5, 1.6 at 10 and 2.3 at 40 (medians), and 3 degrees
+of path is 1.0 kt/s of gravity, so it could not slow on the path. On the centreline but phase
+Intercept (steering for the FAP), the reposition's soft floor keyed on radio height over the
+hills cut the path's -1,100 fpm to a dial jumping -210 to -1,400 (13:14:21 to 13:15:21); the
+737's VS mode (two 1.5 s lags after 2 s) followed none of it and the aircraft went from on the
+path to 511 ft high, 570 at 3.9 nm, around. `src/approach_energy.rs` plans back from the gate on
+the declared per-detent deceleration (the lower quartile); flown closed-loop from 13:13:00
+through the VS plant, the old schedule reaches the gate at 233 kt with flaps 5, the plan at
+145 kt with flaps 40 out 31 s and the gear down, and still with 0.9x and 1.3x the drag. The model
+is conservative against the recorded final (187 predicted against 176 flown at 13:16:21: the gear
+was down from 5.9 nm and flaps 15 and 25 slowed 1.67 and 1.42 against the declared 1.2 and 1.3).
+`established_on_final_path` gives the final's floors to the path beyond the FAP.
+
+**Coupled.** `ils_coupled: true` on the 737: APP armed on an intercept from below the beam, read
+on the bitfield, never pressed over; the 10-05 hand-flown APP replays through it untouched
+(localizer 13:24:37, glideslope 13:25:45). Unflown through the owner.
