@@ -2552,6 +2552,7 @@ fn spawn_autoland(launch: AutolandLaunch) {
                                     visual_deg: None,
                                     missed_legs: Vec::new(),
                                     cruise_schedule: Default::default(),
+                                    arrival_handoff_kts: None,
                                 },
                                 Vec::new(),
                             ),

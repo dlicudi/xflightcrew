@@ -166,7 +166,6 @@ pub(crate) const LIFETIMES: &[(&str, char)] = &[
     ("procedure::FIX_DIST", 'L'),
     ("procedure::LEG", 'L'),
     ("procedure::MISSED_LEGS", 'L'),
-    ("procedure::NEXT_ARRIVAL_HANDOFF_KTS", 'L'),
     ("procedure::PILOT_ALT", 'L'),
     ("procedure::PILOT_SPEED", 'L'),
     ("procedure::ROUTE_AHEAD", 'L'),
