@@ -13,7 +13,6 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use super::{Tool, ToolCtx};
-use crate::aircraft::PropProfile;
 use crate::tools::autopilot::ApConfig;
 
 /// Where the Global Airports apt.dat lives — `XCOPILOT_APT_DAT` overrides the
@@ -42,8 +41,6 @@ pub struct Autoland {
     pub cfg: ApConfig,
     /// Approach speed (KIAS) — the loop holds this on final. From ~1.3×Vs.
     pub approach_ias: f64,
-    #[allow(dead_code)]
-    pub prop: Option<PropProfile>,
     /// Full auto's recovery planner: a landing request goes to the plan's
     /// destination from anywhere (`FullAuto::arm_landing`). `None` on an
     /// airframe full auto cannot fly: the nearest runway, as before.

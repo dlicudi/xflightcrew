@@ -132,17 +132,6 @@ pub fn is_flight_level(ft: f64, transition_level_ft: Option<f64>) -> bool {
     transition_level_ft.is_some_and(|tl| tl > 0.0 && ft >= tl)
 }
 
-/// A level the way it is assigned or reported: "flight level one two zero"
-/// at or above the transition level, else "five thousand" (the caller adds
-/// "feet" where its dialect says it).
-pub fn spoken_level(ft: f64, transition_level_ft: Option<f64>) -> String {
-    if is_flight_level(ft, transition_level_ft) {
-        spoken_flight_level(ft)
-    } else {
-        spoken_alt(ft)
-    }
-}
-
 pub fn spoken_mhz(khz: i64) -> String {
     let mhz = khz / 1000;
     let frac = (khz % 1000).abs();

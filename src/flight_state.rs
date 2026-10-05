@@ -146,12 +146,6 @@ static LAST_BEGUN: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mut
 /// first live tick after the load gate opens (a few seconds).
 const REPOSITION_SAME_FLIGHT_S: u64 = 60;
 
-/// The current flight's generation.
-#[allow(dead_code)]
-pub(crate) fn flight_gen() -> u64 {
-    FLIGHTS_BEGUN.load(std::sync::atomic::Ordering::SeqCst)
-}
-
 /// What a reposition's door does: `None` runs it, else the reason it is the
 /// flight a door already began. Pure, so the idempotency is a plain test.
 fn reposition_skip(

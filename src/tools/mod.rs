@@ -496,7 +496,6 @@ impl Registry {
             tools.push(Box::new(autoland::Autoland {
                 cfg: ap.clone(),
                 approach_ias,
-                prop: profile.prop.clone(),
                 planner: full_auto.clone(),
             }));
             if let Some(fa) = full_auto {
