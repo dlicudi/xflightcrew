@@ -3263,6 +3263,10 @@ fn spawn_autoland(launch: AutolandLaunch) {
                 // over the schedule (`CLIMB_ENERGY_BONUS_KTS`): never capped.
                 let floor_bonus =
                     pattern.is_none() && g.target_ias_kts > scheduled_ias(g.dist_nm, approach_ias) + 0.5;
+                // A new pattern is a new final: planned afresh.
+                if reversal_began {
+                    energy_cap = None;
+                }
                 match energy.filter(|_| !floor_bonus) {
                     Some((ask, ..)) => {
                         let kts = g.target_ias_kts.min(ask.kts).max(approach_ias);
