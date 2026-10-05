@@ -2025,8 +2025,8 @@ impl Tower {
         self.touch_and_go = touch_and_go;
     }
 
-    /// The clearance still awaiting its readback, if any. Consumed by the
-    /// battle tests; the binary reads it via [`Tower::suggested_readback`].
+    /// The clearance still awaiting its readback, if any (the station's
+    /// routing and replies read it).
     pub fn pending(&self) -> Option<&PendingReadback> {
         self.pending.as_ref()
     }
