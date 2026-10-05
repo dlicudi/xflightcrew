@@ -159,13 +159,33 @@ pub fn abort() -> bool {
     crate::circuit::abort();
     crate::procedure::abort();
     crate::autoland::abort();
-    crate::aircraft::TAKEOFF_MARGIN_WAIVED.store(false, SeqCst);
+    forget_mission();
     ACTIVE.swap(false, SeqCst)
 }
 
-/// Full auto stops: the flag, and the runway waiver that lived only for it.
+/// The mission has a departure's minimum altitudes ahead: its takeoff climbs
+/// at best rate (`autotakeoff`'s climb-out). Set for its takeoff, cleared
+/// once airborne and with the waiver.
+static DEPARTURE_MINIMUMS: AtomicBool = AtomicBool::new(false);
+
+/// Whether the mission's takeoff has departure minimums ahead.
+pub fn departure_minimums() -> bool {
+    DEPARTURE_MINIMUMS.load(SeqCst)
+}
+
+/// The mission's own facts die with it: at its start, every stop, a new
+/// flight (`flight_state::forget_flight`) and a new airframe. The runway
+/// waiver the pilot gave at this mission's arm (`Gate::OriginRunway`) is
+/// the mission's too (`aircraft::set_takeoff_margin_waived`, stored in the
+/// lib for its runway rule): no other takeoff ever inherits it.
+pub(crate) fn forget_mission() {
+    crate::aircraft::set_takeoff_margin_waived(false);
+    DEPARTURE_MINIMUMS.store(false, SeqCst);
+}
+
+/// Full auto stops: the flag, and the mission facts that lived only for it.
 fn stop_active() {
-    crate::aircraft::TAKEOFF_MARGIN_WAIVED.store(false, SeqCst);
+    forget_mission();
     set_arrival_runway(None, "mission_ended");
     // The plan's transition was armed for this mission; the monitor's
     // altimeter check must not judge the next flight against it.
@@ -341,7 +361,8 @@ pub fn start(base_url: String, config: Config, voice: Option<Voice>, tools: SubT
     }
     // The runway margin the pilot waived at THIS arm's preflight, if any,
     // lives exactly as long as the mission (`stop_active`).
-    crate::aircraft::TAKEOFF_MARGIN_WAIVED.store(RUNWAY_WAIVER_PENDING.swap(false, SeqCst), SeqCst);
+    forget_mission();
+    crate::aircraft::set_takeoff_margin_waived(RUNWAY_WAIVER_PENDING.swap(false, SeqCst));
     ABORT.store(false, SeqCst);
     INBOUND_MADE.store(false, SeqCst);
     set_arrival_runway(
@@ -2971,7 +2992,7 @@ async fn fly(xp: XPlaneClient, config: Config, voice: Option<Voice>, tools: SubT
                     ) => margin_only_short(
                         *remaining_m,
                         *needed_m,
-                        crate::aircraft::TAKEOFF_MARGIN_WAIVED.load(SeqCst),
+                        crate::aircraft::takeoff_margin_waived(),
                     )
                     .map(|bare| (bare, r.origin_icao.clone(), r.dest_icao.clone())),
                     _ => None,
@@ -3006,7 +3027,7 @@ async fn fly(xp: XPlaneClient, config: Config, voice: Option<Voice>, tools: SubT
         }
         event("lined_up", json!({}));
         // A SID with minimums: the takeoff's own climb-out at best rate.
-        crate::autotakeoff::DEPARTURE_MINIMUMS.store(
+        DEPARTURE_MINIMUMS.store(
             matches!(&tools.mission, Mission::Flight(r) if !r.climb_minimums.is_empty()),
             SeqCst,
         );
@@ -3050,7 +3071,7 @@ async fn fly(xp: XPlaneClient, config: Config, voice: Option<Voice>, tools: SubT
         // clearance for THIS runway gets here (`cleared_elsewhere`, #178).
         // A SID with minimums: the takeoff's own climb-out at best rate, as
         // from a taxied line-up.
-        crate::autotakeoff::DEPARTURE_MINIMUMS.store(
+        DEPARTURE_MINIMUMS.store(
             matches!(&tools.mission, Mission::Flight(r) if !r.climb_minimums.is_empty()),
             SeqCst,
         );
@@ -3295,7 +3316,7 @@ async fn fly_route(
             return;
         }
         event("airborne", json!({ "agl_ft": agl_ft }));
-        crate::autotakeoff::DEPARTURE_MINIMUMS.store(false, SeqCst);
+        DEPARTURE_MINIMUMS.store(false, SeqCst);
     } else {
         let (ground, agl) = tokio::join!(
             xp.get_float(crate::datarefs::ON_GROUND_ANY),
@@ -3338,11 +3359,6 @@ async fn fly_route(
         .filter(|_| !checked_in)
         .map(|c| c.initial_alt_ft as f64);
     crate::procedure::hold_at_cleared(ceiling, "ifr_clearance");
-    // The arrival starts at autoland's clean approach speed, slowed for by
-    // the end of the route (#199: EGNX 09 was handed a clean 737 at 252 kt).
-    crate::procedure::set_next_arrival_handoff_kts(Some(crate::autoland::clean_approach_ias(
-        tools.circuit.approach_ias,
-    )));
     if !crate::procedure::start_scoped(
         config.xplane_base_url.clone(),
         voice.clone(),
@@ -3360,11 +3376,16 @@ async fn fly_route(
             visual_deg: None,
             missed_legs: Vec::new(),
             cruise_schedule: route.cruise_schedule.clone(),
+            // The arrival starts at autoland's clean approach speed, slowed
+            // for by the end of the route (#199: EGNX 09 was handed a clean
+            // 737 at 252 kt).
+            arrival_handoff_kts: Some(crate::autoland::clean_approach_ias(
+                tools.circuit.approach_ias,
+            )),
         },
         xp.cancellation(),
     ) {
         crate::procedure::hold_at_cleared(None, "procedure_busy");
-        crate::procedure::set_next_arrival_handoff_kts(None);
         give_up(
             xp,
             tools.taxi.park_brake_valve_set,
@@ -3768,6 +3789,7 @@ async fn fly_route(
                 None,
                 landing_rwy.clone(),
                 xp.cancellation(),
+                crate::autoland::HandDown::default(),
             );
         }
     };
@@ -6390,7 +6412,7 @@ static WAIVER: std::sync::Mutex<Option<Waiver>> = std::sync::Mutex::new(None);
 static REFUSED: std::sync::Mutex<Option<(Gate, String, String, Instant)>> =
     std::sync::Mutex::new(None);
 /// The arm's preflight passed on a waived runway margin; `start` hands it
-/// to the mission (`aircraft::TAKEOFF_MARGIN_WAIVED`) or it dies here.
+/// to the mission (`forget_mission`) or it dies here.
 pub static RUNWAY_WAIVER_PENDING: AtomicBool = AtomicBool::new(false);
 /// How long after a refusal "fly it anyway" still means that refusal.
 pub const WAIVE_WINDOW: Duration = Duration::from_secs(120);

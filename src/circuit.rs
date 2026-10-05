@@ -26,6 +26,7 @@
 
 // The tests reach these through `use super::*` (the queue that used them
 // moved to `crew_radio.rs`).
+use crate::aircraft::throttle_dataref;
 use crate::autoflight::{self, Button, Dial};
 #[cfg_attr(not(test), allow(unused_imports))]
 use std::collections::VecDeque;
@@ -66,14 +67,6 @@ const FLAP_RATIO: &str = "sim/cockpit2/controls/flap_ratio";
 /// The flap the base leg configures toward (the handle ratio): about half
 /// travel, the approach setting on every airframe here; final goes to full.
 const BASE_FLAP_RATIO: f64 = 0.5;
-/// The thrust lever THIS airframe obeys — not always the stock one (the
-/// Citation X tracks `throttle_jet_rev_ratio`, so every write to
-/// `throttle_ratio_all` went nowhere and it flew a whole pattern at takeoff
-/// thrust). Resolved per call, so a profile swap takes effect immediately.
-fn throttle_dref() -> String {
-    crate::aircraft::throttle_dataref()
-}
-
 const M_TO_FT: f64 = 3.280_84;
 const M_PER_NM: f64 = 1852.0;
 
@@ -2364,7 +2357,7 @@ const DESCENT_FLOOR_FULL_NM: f64 = 2.0;
 /// The steepest path the circuit will fly to clear the ground on its base and
 /// final: PANS-OPS's upper limit for a procedure that is not a steep approach
 /// (anything past it needs an approval no profile declares). Autoland is
-/// handed the same angle (`autoland::set_next_circuit_glidepath_deg`).
+/// handed the same angle (`autoland::HandDown::circuit`).
 pub const STEEP_PATH_MAX_DEG: f64 = 3.5;
 /// A raise smaller than this is carried out but not said: with 1,000 ft of
 /// clearance a 1,000 ft pattern lifts over any ground above the field, and
@@ -3502,7 +3495,7 @@ async fn fly_authored_route(
         if crate::xplane::sim_frozen(&xp).await {
             continue;
         }
-        let thr_dref = throttle_dref();
+        let thr_dref = throttle_dataref();
         // Position, elevation and heading as ONE frame saw them (#157).
         let (pos, hp_r, phi_r, hdg_st, vs_st, ias_r, thr_r, servos_r) = tokio::join!(
             sim::position::read(&xp),
@@ -3674,7 +3667,7 @@ async fn fly_authored_route(
             let delta = crate::tools::speedhold::throttle_adjust_live(pattern_kts - ias, ias_trend);
             if delta != 0.0 {
                 let _ = xp
-                    .set_float(&throttle_dref(), (thr + delta).clamp(0.0, 1.0))
+                    .set_float(&throttle_dataref(), (thr + delta).clamp(0.0, 1.0))
                     .await;
             }
         }
@@ -3763,8 +3756,6 @@ async fn fly_authored_route(
         "circuit",
         serde_json::json!({"event": "handoff_autoland_authored", "rwy": rwy_id}),
     );
-    // A circuit final is judged at the visual gate, 500 ft (#199).
-    crate::autoland::set_next_gate(crate::stable_approach::GateKind::Visual);
     // FORCE the pattern's own runway. Bare `None` sends autoland to its
     // EMERGENCY behaviour — search the whole apt.dat for the best end by track
     // — which is right for an engine failure and catastrophically wrong here:
@@ -3786,6 +3777,8 @@ async fn fly_authored_route(
         // must say so (see `PlannedRunway`).
         Some(crate::autoland::PlannedRunway::anywhere(&rwy_id)),
         xp.cancellation(),
+        // A circuit final is judged at the visual gate, 500 ft (#199).
+        crate::autoland::HandDown::circuit(None),
     );
     handed_off(&xp);
 }
@@ -4568,7 +4561,7 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, p: Params
         let agl_m = sim::position::field(&pos, |p| p.agl_m);
         let elev_m = sim::position::field(&pos, |p| p.elev_m);
         let psi_r = sim::position::field(&pos, |p| p.psi_true_deg);
-        let thr_dref = throttle_dref();
+        let thr_dref = throttle_dataref();
         let (ias_r, thr_r, dial_r, alt_hold_r, phi_r, servos_r) = tokio::join!(
             xp.get_float(IAS),
             xp.get_float(&thr_dref),
@@ -4766,11 +4759,10 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, p: Params
             );
             // A path steepened over the ground is autoland's path too (#182),
             // else it would take the aircraft handed over and dive for 3 degrees.
-            if descent_shape.steep() {
-                crate::autoland::set_next_circuit_glidepath_deg(Some(descent_shape.glidepath_deg()));
-            }
             // A circuit final is judged at the visual gate, 500 ft (#199).
-            crate::autoland::set_next_gate(crate::stable_approach::GateKind::Visual);
+            let hand_down = crate::autoland::HandDown::circuit(
+                descent_shape.steep().then(|| descent_shape.glidepath_deg()),
+            );
             // The circuit's token is its parent: a stand-down that lands
             // after the recheck above still cancels this autoland.
             crate::autoland::run_autoland_scoped(
@@ -4782,6 +4774,7 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, p: Params
                 None,
                 Some(crate::autoland::PlannedRunway::anywhere(&rwy_id)),
                 xp.cancellation(),
+                hand_down,
             );
             handed_off(&xp);
             return;
@@ -5353,7 +5346,7 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, p: Params
             let delta = crate::tools::speedhold::throttle_adjust_live(want_kts - ias, ias_trend);
             if delta != 0.0 {
                 let _ = xp
-                    .set_float(&throttle_dref(), (thr + delta).clamp(0.0, 1.0))
+                    .set_float(&throttle_dataref(), (thr + delta).clamp(0.0, 1.0))
                     .await;
             }
         }

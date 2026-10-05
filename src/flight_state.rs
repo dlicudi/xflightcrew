@@ -51,7 +51,7 @@ pub(crate) fn publish_airframe(p: &AircraftProfile) {
     // The rotor is the helicopter's: an aeroplane after the S-76 must not
     // hover taxi in, be "on the ground" to the tower aloft, or skip a vacate.
     crate::hover::publish_rotor(crate::hover::rotor_facts(p));
-    crate::autotakeoff::DEPARTURE_MINIMUMS.store(false, std::sync::atomic::Ordering::SeqCst);
+    crate::full_auto::forget_mission();
     crate::tools::cabin_air::publish(p.cabin_air.clone());
     crate::tools::radio::publish_mode_knob(p.transponder_mode_knob.clone());
     crate::takeoff_config::publish(p.takeoff_config.clone());
@@ -252,9 +252,10 @@ fn forget_flight() {
     // The plan's transition was the old flight's: the monitor's altimeter
     // check WRITES the setting with an automation flying.
     crate::tools::instruments::publish_flight_transition(None);
-    // The runway the last autoland rolled out on, its tracking, and any gate
-    // or path handed down to an arm that never flew.
+    // The runway the last autoland rolled out on and its tracking.
     crate::autoland::forget_flight();
+    // A runway waiver or departure minimums were the old mission's.
+    crate::full_auto::forget_mission();
     // The plan's destination is published again by the next plan read.
     crate::monitor::forget_destination();
     // "The pilot has it" was about the flight that ended.

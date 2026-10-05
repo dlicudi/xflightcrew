@@ -4263,7 +4263,7 @@
                 throttle_cmd(elapsed, last_err, gs_kts)
             };
             let thr_cmd = throttle_slew(last_thr_cmd, thr_want, dt);
-            sim.set_float(&throttle_dref(), thr_cmd).await.unwrap();
+            sim.set_float(&throttle_dataref(), thr_cmd).await.unwrap();
             last_thr_cmd = thr_cmd;
             hit_full_throttle |= thr_cmd >= 0.99;
 
@@ -4317,7 +4317,7 @@
 
             // Advance the world from what we actually wrote to the channels.
             let steer_a = sim.last_write(TAXI_STEER).unwrap();
-            let thr_a = sim.last_write(&throttle_dref()).unwrap();
+            let thr_a = sim.last_write(&throttle_dataref()).unwrap();
             let pitch_a = if rotated {
                 sim.last_write(TAKEOFF_PITCH).unwrap()
             } else {

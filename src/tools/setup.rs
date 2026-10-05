@@ -1269,6 +1269,7 @@ async fn approach_follow_up(job: ApproachJob, loading: Loading) {
                 None,
                 Some(runway.clone()),
                 Vec::new(),
+                crate::autoland::HandDown::default(),
             );
             crate::flight::note_crew_takeover("setup_approach");
         }

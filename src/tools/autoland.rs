@@ -199,6 +199,7 @@ impl Tool for Autoland {
             ctx.status.cloned(),
             forced.map(|(p, _)| p),
             ctx.xplane.cancellation(),
+            crate::autoland::HandDown::default(),
         );
         Ok(line)
     }

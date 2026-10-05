@@ -18,10 +18,15 @@
     }
 
     #[test]
-    fn the_handoff_speed_is_handed_down_once() {
-        set_next_arrival_handoff_kts(Some(210.25));
-        assert_eq!(take_arrival_handoff_kts(), Some(210.25));
-        assert_eq!(take_arrival_handoff_kts(), None);
-        set_next_arrival_handoff_kts(Some(f64::NAN));
-        assert_eq!(take_arrival_handoff_kts(), None);
+    fn the_handoff_speed_rides_an_enroute_plan_only() {
+        assert_eq!(arrival_handoff_for(Some(210.25), &EndAction::Enroute), Some(210.25));
+        assert_eq!(arrival_handoff_for(Some(f64::NAN), &EndAction::Enroute), None);
+        assert_eq!(arrival_handoff_for(Some(0.0), &EndAction::Enroute), None);
+        // A plan launched without one (every caller but full auto's
+        // enroute) gets none.
+        assert_eq!(arrival_handoff_for(None, &EndAction::Enroute), None);
+        assert_eq!(
+            arrival_handoff_for(Some(210.0), &EndAction::Level),
+            None
+        );
     }

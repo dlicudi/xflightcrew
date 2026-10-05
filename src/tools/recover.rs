@@ -11,6 +11,7 @@
 //! clamped) — it needs in-sim tuning and should be tested with altitude to spare.
 //! The pilot takes it back instantly with "my controls" (cancels its run, [`RUN`]).
 
+use crate::aircraft::throttle_dataref;
 use crate::autoflight::{self, Button, Dial};
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -28,14 +29,6 @@ const OVR_PITCH: &str = "sim/operation/override/override_joystick_pitch";
 const OVR_ROLL: &str = "sim/operation/override/override_joystick_roll";
 const YOKE_PITCH: &str = "sim/joystick/yoke_pitch_ratio"; // +1 nose up, -1 nose down
 const YOKE_ROLL: &str = "sim/joystick/yoke_roll_ratio"; // +1 right, -1 left
-/// The thrust lever THIS airframe obeys — not always the stock one (the
-/// Citation X tracks `throttle_jet_rev_ratio`, so every write to
-/// `throttle_ratio_all` went nowhere and it flew a whole pattern at takeoff
-/// thrust). Resolved per call, so a profile swap takes effect immediately.
-fn throttle_dref() -> String {
-    crate::aircraft::throttle_dataref()
-}
-
 // --- state reads ---
 const BANK: &str = "sim/flightmodel/position/phi"; // roll, deg (+ = right wing down)
 const PITCH: &str = "sim/flightmodel/position/theta"; // pitch, deg (+ = nose up)
@@ -720,7 +713,7 @@ fn run_recovery(
                     }
                     write_controls(&xp, plugin, cmd.pitch, cmd.roll).await;
                     if let Some(t) = cmd.throttle.filter(|_| live()) {
-                        let _ = xp.set_float(&throttle_dref(), t).await;
+                        let _ = xp.set_float(&throttle_dataref(), t).await;
                     }
                     // Re-trim to RELIEVE the yoke: a nose-up trim (from slowing
                     // toward a stall) fights a nose-down push, so when we're
@@ -814,7 +807,7 @@ fn run_recovery(
                 let (hdg, hold_ft) = hold_heading_and_altitude(&xp).await;
                 let hold = hold_ft.unwrap_or(f64::NAN);
                 if handback.hold_kts.is_none() {
-                    let _ = xp.set_float(&throttle_dref(), CRUISE_THROTTLE).await;
+                    let _ = xp.set_float(&throttle_dataref(), CRUISE_THROTTLE).await;
                 }
 
                 // The autopilot is WATCHED before it is believed (#181): the
@@ -932,7 +925,7 @@ fn run_recovery(
                     hold_throttle(s.ias_kts, min_safe_ias)
                 };
                 if let Some(t) = thr.filter(|_| live()) {
-                    let _ = xp.set_float(&throttle_dref(), t).await;
+                    let _ = xp.set_float(&throttle_dataref(), t).await;
                 }
             }
             stood_down(lease);
@@ -1268,7 +1261,7 @@ mod tests {
         let mut seen = 0;
         for (i, l) in lines.iter().enumerate() {
             let streaming = l.contains("write_controls(&xp, plugin, cmd.")
-                || l.contains("set_float(&throttle_dref(), t)")
+                || l.contains("set_float(&throttle_dataref(), t)")
                 || l.contains("set_float(ELEV_TRIM, (trim");
             if !streaming {
                 continue;

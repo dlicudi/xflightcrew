@@ -158,8 +158,8 @@
         // 300 m past it: what the follower hands down.
         let aim = super::TOUCHDOWN_AIM_NM;
         let deg = (996.0_f64 / ((1.98 + aim) * 6076.12)).atan().to_degrees();
-        super::set_next_glidepath_deg(Some(deg));
-        assert!((super::arm_glidepath() - deg).abs() < 1e-9);
+        let hand = super::HandDown::visual_segment(Some(deg));
+        assert!((super::arm_glidepath(hand.glidepath) - deg).abs() < 1e-9);
         assert!(deg > 4.2 && deg < 4.6, "{deg}");
         let g = super::guidance(map_lat, map_lon, 6598.0, 996.0, 80.0, 90.0, &rwy, 87.0, 25.0, 0.0);
         let above = 6598.0 - g.glidepath_alt_ft;
@@ -168,7 +168,7 @@
         assert_eq!(g.phase, super::ApproachPhase::Final);
         assert!(g.target_vs_fpm < -450.0 && g.target_vs_fpm > -1000.0, "{}", g.target_vs_fpm);
         // The next arm without a handed angle is 3 degrees again.
-        assert_eq!(super::arm_glidepath(), 3.0);
+        assert_eq!(super::arm_glidepath(None), 3.0);
         assert_eq!(super::gp_ft_per_nm(), super::GLIDEPATH_FT_PER_NM);
         let g3 = super::guidance(map_lat, map_lon, 6598.0, 996.0, 80.0, 90.0, &rwy, 87.0, 25.0, 0.0);
         assert!(6598.0 - g3.glidepath_alt_ft > 250.0, "a 3 degree path calls it high");
@@ -182,37 +182,39 @@
     /// circuit's angle is flown but is not a published visual segment.
     #[test]
     fn a_circuit_path_is_steep_but_not_a_valley() {
-        super::set_next_circuit_glidepath_deg(Some(3.2576));
-        assert!((super::arm_glidepath() - 3.2576).abs() < 1e-9, "the angle is flown");
+        use super::HandDown;
+        let circuit = HandDown::circuit(Some(3.2576));
+        assert!((super::arm_glidepath(circuit.glidepath) - 3.2576).abs() < 1e-9, "the angle is flown");
         assert!(!super::published_steep(), "a circuit's path is not a valley");
-        super::set_next_glidepath_deg(Some(4.5));
-        assert!((super::arm_glidepath() - 4.5).abs() < 1e-9);
+        let map = HandDown::visual_segment(Some(4.5));
+        assert!((super::arm_glidepath(map.glidepath) - 4.5).abs() < 1e-9);
         assert!(super::published_steep(), "the follower's MAP path is");
         // A handed 3 degrees (or none) is never steep, whoever handed it.
-        super::set_next_glidepath_deg(Some(3.0));
-        assert_eq!(super::arm_glidepath(), 3.0);
+        let three = HandDown::visual_segment(Some(3.0));
+        assert_eq!(super::arm_glidepath(three.glidepath), 3.0);
         assert!(!super::published_steep());
-        assert_eq!(super::arm_glidepath(), 3.0);
+        assert_eq!(super::arm_glidepath(None), 3.0);
         assert!(!super::published_steep());
     }
 
-    /// A circuit hands down its visual gate and steepened path, then the
-    /// launch is cancelled (a stand-down during the handoff): the spawn
-    /// returned before taking them, and the next arm, another flight's
-    /// instrument approach, flew a 500 ft gate on a circuit's angle. A
-    /// cancelled launch and a new flight drop them (source-pinned for the
-    /// spawn: the loop is not a plain test).
+    /// The gate and angle ride the launch, so an arm handed nothing flies
+    /// the instrument gate on 3 degrees: a circuit's visual gate or path can
+    /// never reach the next arm, perhaps another flight's instrument
+    /// approach (a stand-down during the circuit's handoff once left them
+    /// in a static for it).
     #[test]
-    fn a_launch_that_never_flew_hands_nothing_down() {
+    fn a_launch_handed_nothing_flies_the_defaults() {
         use crate::stable_approach::GateKind;
-        super::set_next_gate(GateKind::Visual);
-        super::set_next_circuit_glidepath_deg(Some(4.0));
-        super::drop_handed_down();
-        assert_eq!(super::arm_gate(), GateKind::Instrument);
-        assert_eq!(super::arm_glidepath(), 3.0);
-        super::set_next_gate(GateKind::Visual);
+        let none = super::HandDown::default();
+        assert_eq!(none.gate, GateKind::Instrument);
+        assert_eq!(none.glidepath, None);
+        assert_eq!(super::arm_glidepath(none.glidepath), 3.0);
+        assert!(!super::published_steep());
+        let circuit = super::HandDown::circuit(None);
+        assert_eq!(circuit.gate, GateKind::Visual);
+        assert_eq!(super::arm_glidepath(circuit.glidepath), 3.0);
+        assert_eq!(super::HandDown::visual_segment(Some(4.5)).gate, GateKind::Instrument);
         super::forget_flight();
-        assert_eq!(super::arm_gate(), GateKind::Instrument);
         assert_eq!(super::landed_runway(), None);
 
         let src = crate::test_support::module_source("autoland");
@@ -220,13 +222,8 @@
             .split("fn spawn_autoland(launch: AutolandLaunch)")
             .nth(1)
             .unwrap();
-        let cancel = body.find("if xp.cancelled() {").unwrap();
-        let dropped = body.find("drop_handed_down();").unwrap();
-        let armed = body.find("arm_gate()").unwrap();
-        assert!(
-            cancel < dropped && dropped < armed,
-            "dropped on the cancelled return"
-        );
+        assert!(body.contains("let gate = hand_down.gate;"));
+        assert!(body.contains("arm_glidepath(hand_down.glidepath)"));
         // The flag rises when the run is taken over (`RUN`, flagged).
         let active = body.find("RUN.take_over()").unwrap();
         let cleared = body.find("*TRACKING_ERROR.lock()").unwrap();
@@ -253,6 +250,6 @@
         assert!(body.contains("missed_procedure_tried = true"), "asked once");
         assert!(src.contains("let steep = published_steep() && !missed_procedure_tried;"));
         let circuit = crate::test_support::module_source("circuit");
-        assert!(circuit.contains("set_next_circuit_glidepath_deg(Some(descent_shape"));
-        assert!(!circuit.contains("autoland::set_next_glidepath_deg("));
+        assert!(circuit.contains("descent_shape.steep().then(|| descent_shape.glidepath_deg())"));
+        assert!(!circuit.contains("HandDown::visual_segment("));
     }

@@ -2630,6 +2630,18 @@
     }
 
     #[test]
+    fn mag_to_true_undoes_true_to_mag() {
+        assert!((mag_to_true(196.95, 5.65) - 191.3).abs() < 0.01);
+        assert!((mag_to_true(357.0, -5.0) - 2.0).abs() < 0.01);
+        for var in [-20.0, -5.65, 0.0, 5.65, 20.0] {
+            for t in [0.0, 1.0, 90.0, 179.5, 359.0] {
+                let back = mag_to_true(true_to_mag(t, var), var);
+                assert!((back - t).abs() < 1e-9, "{t} at {var}: {back}");
+            }
+        }
+    }
+
+    #[test]
     fn intercept_steers_to_the_fap_not_away_from_the_field() {
         // The live flee (XLE000N): outside the FAP the old law tracked the bare
         // runway course, which flies AWAY when the aircraft is past the threshold.

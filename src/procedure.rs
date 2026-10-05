@@ -29,7 +29,7 @@
 use crate::autoflight::{self, Button, Dial};
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use crate::autoland::true_to_mag;
+use crate::autoland::{mag_to_true, true_to_mag};
 use crate::control::measurements;
 #[cfg(test)]
 use crate::control::set_confirmed;
@@ -478,6 +478,10 @@ pub struct Plan {
     /// ([`step_climb_at`]; the levels themselves are already in `legs`,
     /// [`apply_step_climbs`]). Empty: the profile's `cruise_ias_kts`.
     pub cruise_schedule: crate::simbrief::CruiseSchedule,
+    /// The speed an enroute plan hands its arrival over at (#199: full
+    /// auto's, autoland's clean approach speed), slowed for by the end of
+    /// the route ([`arrival_handoff_cap`]); `None` on every other plan.
+    pub arrival_handoff_kts: Option<f64>,
 }
 
 /// The published missed approach of the approach being landed, stashed at the
@@ -1217,23 +1221,11 @@ pub fn star_speed_crossing(
     })
 }
 
-/// The speed the NEXT enroute plan hands its arrival over at, consumed at
-/// its arm (full auto's, before an arrival autoland).
-static NEXT_ARRIVAL_HANDOFF_KTS: std::sync::Mutex<Option<f64>> = std::sync::Mutex::new(None);
-
-/// Hand the next enroute plan the speed its arrival starts at (`None` clears
-/// one left by a plan that never started).
-pub fn set_next_arrival_handoff_kts(kts: Option<f64>) {
-    *NEXT_ARRIVAL_HANDOFF_KTS
-        .lock()
-        .unwrap_or_else(|e| e.into_inner()) = kts.filter(|k| k.is_finite() && *k > 0.0);
-}
-
-fn take_arrival_handoff_kts() -> Option<f64> {
-    NEXT_ARRIVAL_HANDOFF_KTS
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .take()
+/// The arrival's hand-over speed a plan carries: an enroute plan's only,
+/// and only a real speed.
+fn arrival_handoff_for(kts: Option<f64>, end: &EndAction) -> Option<f64> {
+    kts.filter(|k| k.is_finite() && *k > 0.0)
+        .filter(|_| matches!(end, EndAction::Enroute))
 }
 
 /// The arrival's hand-over speed as a limit at the END of the route, slowed
@@ -2283,6 +2275,7 @@ pub fn approach_plan_for(
         visual_deg,
         missed_legs,
         cruise_schedule: Default::default(),
+        arrival_handoff_kts: None,
     })
 }
 
@@ -2883,6 +2876,7 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, plan: Pla
         visual_deg,
         missed_legs,
         cruise_schedule,
+        arrival_handoff_kts,
     } = plan;
     // Never judge the aircraft against a minimum above the level it is
     // flying to (`minimums_within_cruise`); the arm says so, and this
@@ -3016,8 +3010,7 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, plan: Pla
     let mut star_speed_begun: std::collections::HashSet<usize> = std::collections::HashSet::new();
     // The arrival's hand-over speed, an enroute plan's only (#199), whether
     // its slow-down has begun (held from then on) and was said.
-    let arrival_handoff_kts =
-        take_arrival_handoff_kts().filter(|_| matches!(end, EndAction::Enroute));
+    let arrival_handoff_kts = arrival_handoff_for(arrival_handoff_kts, &end);
     let mut handoff_begun = false;
     let mut said_handoff = false;
     // The speedbrake's last change and which changes are said (`descent_drag`,
@@ -3843,7 +3836,7 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, plan: Pla
             // a field the answer should be about the field, not the hills past it.
             let brg = bearing_to_fix(lat, lon, leg)
                 .or(psi_v)
-                .unwrap_or_else(|| (bug_mag - mag_var).rem_euclid(360.0));
+                .unwrap_or_else(|| mag_to_true(bug_mag, mag_var));
             let look = dist_nm
                 .map(|d| (d + 2.0).min(TERRAIN_LOOK_NM))
                 .unwrap_or(TERRAIN_LOOK_NM);
@@ -4485,10 +4478,11 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, plan: Pla
                     stand_down(&voice, &line, "map_handover");
                     return;
                 }
+                let mut hand_down = crate::autoland::HandDown::default();
                 if map_short_of_runway(leg) {
                     // The visual segment: its own angle to the landing, and
                     // the published missed approach for its go-around.
-                    crate::autoland::set_next_glidepath_deg(visual_deg);
+                    hand_down = crate::autoland::HandDown::visual_segment(visual_deg);
                     stash_missed_legs(missed_legs.clone());
                     alert(&voice, Priority::Advisory, "Missed approach point. Runway ahead, landing us.");
                 } else {
@@ -4506,6 +4500,7 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, plan: Pla
                     None,
                     rwy_id.clone(),
                     xp.cancellation(),
+                    hand_down,
                 );
                 clear_pilot_altitude();
                 publish_terrain_floor(None);

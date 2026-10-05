@@ -31,6 +31,7 @@
 //! frozen (pause/replay) freezes the loop with it. The laws are pure
 //! functions and battle-test as plain `cargo test`.
 
+use crate::aircraft::throttle_dataref;
 use crate::autoflight::{self, Button, Dial};
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -49,13 +50,6 @@ const IAS: &str = "sim/flightmodel/position/indicated_airspeed";
 #[cfg(test)]
 const AGL_M: &str = "sim/flightmodel/position/y_agl";
 const MAG_VAR: &str = "sim/flightmodel/position/magnetic_variation";
-/// The thrust lever THIS airframe obeys — not always the stock one (the
-/// Citation X tracks `throttle_jet_rev_ratio`, so every write to
-/// `throttle_ratio_all` went nowhere and it flew a whole pattern at takeoff
-/// thrust). Resolved per call, so a profile swap takes effect immediately.
-fn throttle_dref() -> String {
-    crate::aircraft::throttle_dataref()
-}
 const GEAR_HANDLE: &str = "sim/cockpit2/controls/gear_handle_down";
 const FLAP_HANDLE: &str = "sim/cockpit2/controls/flap_ratio";
 /// Clean up the takeoff flaps this high AGL, once safely above Vy — a
@@ -1982,11 +1976,6 @@ pub fn climb_throttle(ias_kts: f64, vne_kts: Option<f64>) -> f64 {
 /// the flaps running up on speed alone at 400, 500 and 740 ft, 240 kt through
 /// 1,000 ft. A crew holds V2 + 20 to the acceleration height by PITCH, then
 /// lowers the nose and cleans up on the schedule.
-/// Full auto has a departure's minimum altitudes ahead: the takeoff climbs at
-/// best rate. Set by full auto for its takeoff, cleared after.
-pub static DEPARTURE_MINIMUMS: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
-
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ClimbOut {
     pub accel_agl_ft: f64,
@@ -2403,7 +2392,7 @@ pub(crate) async fn stop_on_centreline(
     law: &mut RollSteer,
 ) -> RejectStop {
     let mut out = RejectStop::default();
-    let thr = throttle_dref();
+    let thr = throttle_dataref();
     let mut live_s = 0.0_f64;
     let mut last = tokio::time::Instant::now();
     let mut last_brake: Option<f64> = None;
@@ -2536,7 +2525,7 @@ async fn reject_rolling(
 /// The reject's hands in its first second: throttles idle, an engaged
 /// autothrottle out (read back, `Some` when there was one), maximum braking.
 pub(crate) async fn reject_hands(xp: &dyn XPlane) -> Option<bool> {
-    let _ = xp.set_float(&throttle_dref(), 0.0).await;
+    let _ = xp.set_float(&throttle_dataref(), 0.0).await;
     let at_off = crate::takeoff_config::autothrottle_off(xp).await;
     // Noted before as well as after: see `stop_on_centreline`.
     crate::tools::note_brake_cmd();
@@ -3070,7 +3059,7 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, p: Params) {
         // fps, 2026-09-30) against its 150 ms sleep. An older plugin falls
         // back to the separate reads, still one round, and the tick says
         // which (`pos`).
-        let thr_dref = throttle_dref();
+        let thr_dref = throttle_dataref();
         let (st, extra) = sim::state::read_with(
             &xp,
             sim::state::Want(ROLL_WANT),
@@ -3695,7 +3684,7 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, p: Params) {
         // flown at the airframe's BEST rate, holding its initial climb speed
         // by climbing harder: capped at the enroute 1,500 fpm the SF50 made
         // 750 ft a mile where MOGT3H's WI505 wanted 816 (LOWI, 2026-09-24).
-        let (base_fpm, climb_out) = if DEPARTURE_MINIMUMS.load(Ordering::Relaxed) {
+        let (base_fpm, climb_out) = if crate::full_auto::departure_minimums() {
             let best = crate::procedure::best_climb_fpm().max(p.climb_fpm);
             (best, Some(ClimbOut { accel_agl_ft: f64::INFINITY, max_fpm: best }))
         } else {

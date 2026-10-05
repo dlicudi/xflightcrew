@@ -2827,6 +2827,7 @@
             visual_deg: None,
             missed_legs: Vec::new(),
             cruise_schedule: Default::default(),
+            arrival_handoff_kts: None,
         };
         // Tight circuit: 0.3 nm from the FAF at 700 ft — NOT flyable (autoland).
         let (near_lat, near_lon) = crate::nav::project_latlon(36.0, -5.0, 0.0, 0.3);

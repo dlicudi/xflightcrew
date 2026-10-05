@@ -369,7 +369,7 @@ pub fn runway_width_m(rwy: &Runway) -> Option<f64> {
 /// TRUE heading → MAGNETIC, using X-Plane's `magnetic_variation` dataref, whose
 /// sign is positive-WEST: `magpsi = psi + variation`. Verified live at KPDK
 /// (2026-07-14): psi 191.3 true, magpsi 196.8, variation +5.65. Subtracting
-/// instead flew every autoland heading 2*var off (11 degrees at Atlanta) — the
+/// instead flew every autoland heading 2*var off (11 degrees at Atlanta): the
 /// whole cross-track cut vanished and the final tracked 0.4 nm left, parallel.
 pub fn true_to_mag(true_deg: f64, xp_variation_deg: f64) -> f64 {
     (true_deg + xp_variation_deg).rem_euclid(360.0)
@@ -377,8 +377,8 @@ pub fn true_to_mag(true_deg: f64, xp_variation_deg: f64) -> f64 {
 
 /// MAGNETIC -> TRUE, the inverse of [`true_to_mag`] with the same X-Plane
 /// variation (positive-west): `true = mag - variation`.
-pub fn mag_to_true(true_or_mag_deg: f64, var: f64) -> f64 {
-    (true_or_mag_deg - var).rem_euclid(360.0)
+pub fn mag_to_true(mag_deg: f64, xp_variation_deg: f64) -> f64 {
+    (mag_deg - xp_variation_deg).rem_euclid(360.0)
 }
 
 /// Signed distance (nm) along the runway centreline: positive = on the approach
