@@ -857,9 +857,9 @@ mod tests {
     /// ONE owner: outside this file no production code names an autopilot
     /// command or dataref, presses the owner's stock commands itself, or
     /// writes a dial (a dial alias is any const bound to `read_name()`). The
-    /// one named exemption is `aircraft.rs`'s takeoff-configuration probe
-    /// list (the lib crate cannot see this module); those names are pressed
-    /// and written only here.
+    /// one named exemption is `aircraft.rs`'s probe lists (the takeoff
+    /// configuration's and `AutoflightProfile::STOCK`: the lib crate cannot
+    /// see this module); outside it they are never used to act.
     #[test]
     fn every_mcp_write_goes_through_the_owner() {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
@@ -906,9 +906,7 @@ mod tests {
                 ]
                 .iter()
                 .any(|p| code.contains(p));
-                let probe_list =
-                    rel == "aircraft.rs" && code.trim_start().starts_with("pub const ");
-                if lit && !probe_list {
+                if lit && rel != "aircraft.rs" {
                     bad.push(format!("{rel}:{}: literal: {}", i + 1, l.trim()));
                 }
                 if code.contains("autoflight::cmd::") {
@@ -922,6 +920,7 @@ mod tests {
                     && [
                         "TakeoffConfigProfile::CMD_",
                         "TakeoffConfigProfile::SPEED_WINDOW",
+                        "AutoflightProfile::STOCK",
                     ]
                     .iter()
                     .any(|p| code.contains(p))
@@ -979,6 +978,16 @@ mod tests {
             "stock: the 737's own engages the A/T"
         );
         let names = crate::aircraft::profile_references(&p);
+        // The owner's stock names ride the probe of a declared panel, the
+        // lib's copy kept equal to this module's.
+        let mut stock: Vec<&str> = stock_references().to_vec();
+        let mut lib: Vec<&str> = crate::aircraft::AutoflightProfile::STOCK.to_vec();
+        stock.sort_unstable();
+        lib.sort_unstable();
+        assert_eq!(stock, lib);
+        for n in stock_references() {
+            assert!(names.iter().any(|x| x == n), "{n} not probed");
+        }
         for n in [
             &panel.engage,
             &panel.heading,

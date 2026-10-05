@@ -2596,6 +2596,26 @@ pub struct TakeoffConfigProfile {
     pub climb_thrust_ratio: Option<f64>,
 }
 
+impl AutoflightProfile {
+    /// The stock reads and commands the panel's owner (`autoflight`) flies a
+    /// declared panel through beside its own buttons, for the profile probe
+    /// ([`profile_references`]). Kept equal to `autoflight::stock_references`
+    /// by its test (this crate's lib cannot see that module).
+    pub const STOCK: [&'static str; 11] = [
+        "sim/cockpit/autopilot/autopilot_state",
+        "sim/cockpit2/autopilot/autothrottle_on",
+        "sim/cockpit2/autopilot/autothrottle_enabled",
+        "sim/cockpit2/autopilot/servos_on",
+        "sim/cockpit2/autopilot/heading_status",
+        "sim/cockpit2/autopilot/vvi_status",
+        "sim/cockpit2/autopilot/altitude_hold_status",
+        "sim/autopilot/autothrottle_off",
+        "sim/cockpit2/autopilot/altitude_dial_ft",
+        "sim/cockpit/autopilot/vertical_velocity",
+        "sim/cockpit2/autopilot/heading_dial_deg_mag_pilot",
+    ];
+}
+
 impl TakeoffConfigProfile {
     pub const SPEEDBRAKE: &'static str = "sim/cockpit2/controls/speedbrake_ratio";
     /// 0 RTO, 1 off, 2..5 the landing levels.
@@ -4003,6 +4023,14 @@ pub fn profile_references(p: &AircraftProfile) -> Vec<String> {
     let mut out = Vec::new();
     if let Ok(v) = serde_yaml::to_value(p) {
         walk(&v, "", &mut out);
+    }
+    // A declared panel is flown through the owner's stock names too.
+    if p.autoflight.is_some() {
+        for name in AutoflightProfile::STOCK {
+            if !out.iter().any(|o| o == name) {
+                out.push(name.to_string());
+            }
+        }
     }
     // The takeoff configuration's declarations carry no names either: the
     // stock ones behind each ([`TakeoffConfigProfile::references`]).
