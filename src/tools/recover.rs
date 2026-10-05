@@ -329,6 +329,25 @@ pub fn take_over(base: String, voice: Option<Voice>, t: TakeOver) -> bool {
     true
 }
 
+/// The speed under which [`unflyable`] calls it slow, with `flap` out: the
+/// configuration's floor, else the clean floor, less 5 % (a floor is a
+/// target's margin, not the stall). One rule for the safe hold and the
+/// resume gate.
+pub fn unflyable_floor_kts(flap: f64) -> Option<f64> {
+    unflyable_floor_from(
+        crate::aircraft::config_floor_kts(flap),
+        crate::aircraft::speed_floor_kts,
+    )
+}
+
+/// [`unflyable_floor_kts`] over its two readings. Pure.
+fn unflyable_floor_from(config: Option<f64>, clean: impl FnOnce() -> Option<f64>) -> Option<f64> {
+    config.or_else(clean).map(|f| f * UNFLYABLE_FLOOR_FRACTION)
+}
+
+/// [`unflyable_floor_kts`]'s fraction of the floor.
+const UNFLYABLE_FLOOR_FRACTION: f64 = 0.95;
+
 /// What the aircraft is doing that no one may be handed: a stall warning, a
 /// speed under the floor, a bank past 45 degrees, the nose far up or down.
 /// `None` = flyable. A missing reading is no evidence either way. Pure.
@@ -994,6 +1013,15 @@ mod tests {
             agl_ft: None,
             vs_fpm: None,
         }
+    }
+
+    /// The slow floor is the configuration's, else the clean one, less 5 %;
+    /// none known, no floor (a missing reading is no evidence).
+    #[test]
+    fn the_unflyable_floor_is_the_configurations_less_five_percent() {
+        assert_eq!(unflyable_floor_from(Some(120.0), || Some(140.0)), Some(114.0));
+        assert_eq!(unflyable_floor_from(None, || Some(140.0)), Some(133.0));
+        assert_eq!(unflyable_floor_from(None, || None), None);
     }
 
     #[test]

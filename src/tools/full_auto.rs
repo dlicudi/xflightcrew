@@ -879,9 +879,7 @@ impl FullAuto {
         let first_read = steady_read(&xp, clock).await;
         let ok = |r: &anyhow::Result<f64>| r.as_ref().ok().copied().filter(|v| v.is_finite());
         let flap = ok(&flap).unwrap_or(0.0);
-        let floor_kts = crate::aircraft::config_floor_kts(flap)
-            .or_else(crate::aircraft::speed_floor_kts)
-            .map(|f| f * 0.95);
+        let floor_kts = crate::tools::recover::unflyable_floor_kts(flap);
         let unflyable =
             crate::tools::recover::unflyable(Some(ias), floor_kts, ok(&pitch), Some(bank), ok(&stall));
         if let Some(why) = resume_gate(frozen, sim::ground::on_ground(ground), unflyable) {

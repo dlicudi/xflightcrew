@@ -1442,9 +1442,7 @@ async fn watch(
                 ends = Some((la, lo, found));
             }
             let profile = live.get();
-            let floor_kts = crate::aircraft::config_floor_kts(air.flap)
-                .or_else(crate::aircraft::speed_floor_kts)
-                .map(|f| f * 0.95);
+            let floor_kts = crate::tools::recover::unflyable_floor_kts(air.flap);
             tick.unflyable = crate::tools::recover::unflyable(
                 Some(air.ias_kts),
                 floor_kts,
