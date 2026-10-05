@@ -15,6 +15,7 @@
 //!
 //! The placement is pure ([`place`]): tested on the pilot's real OFP.
 
+use crate::autoflight::{self, Button, Dial};
 use anyhow::Result;
 use async_trait::async_trait;
 use serde_json::{json, Value};
@@ -669,13 +670,8 @@ struct EnrouteJob {
     transition: crate::tools::instruments::FlightTransition,
 }
 
-const CMD_HDG_MODE: &str = "sim/autopilot/heading";
-const CMD_VS_MODE: &str = "sim/autopilot/vertical_speed";
-const VS_STATUS: &str = "sim/cockpit2/autopilot/vvi_status";
-const VS_DIAL: &str = "sim/cockpit/autopilot/vertical_velocity";
-const HDG_BUG: &str = "sim/cockpit2/autopilot/heading_dial_deg_mag_pilot";
-const ALT_DIAL: &str = "sim/cockpit2/autopilot/altitude_dial_ft";
-const ALT_HOLD_STATUS: &str = "sim/cockpit2/autopilot/altitude_hold_status";
+const VS_STATUS: &str = autoflight::names::VS_STATUS;
+const ALT_HOLD_STATUS: &str = autoflight::names::ALT_HOLD_STATUS;
 const MAG_VAR: &str = "sim/flightmodel/position/magnetic_variation";
 
 /// How the autopilot came up on the new flight.
@@ -708,8 +704,8 @@ async fn engage(xp: &crate::xplane::XPlaneClient, job: &EnrouteJob) -> Engaged {
     // The wait before live flight is bounded too: a sim that never flies.
     while t0.elapsed().as_secs() < 60 {
         if step.fire {
-            let _ = xp.set_float(HDG_BUG, bug).await;
-            let _ = xp.set_float(ALT_DIAL, p.alt_ft).await;
+            let _ = autoflight::set_dial(xp, Dial::HeadingBug, bug).await;
+            let _ = autoflight::set_dial(xp, Dial::Altitude, p.alt_ft).await;
             let sent = crate::ap_engage::press(xp, &job.ap.fd_commands).await;
             crate::blackbox::record(
                 "setup",
@@ -735,19 +731,19 @@ async fn engage(xp: &crate::xplane::XPlaneClient, job: &EnrouteJob) -> Engaged {
     if !out.servos {
         return out;
     }
-    let _ = xp.set_float(HDG_BUG, bug).await;
+    let _ = autoflight::set_dial(xp, Dial::HeadingBug, bug).await;
     if xp.get_float(crate::datarefs::HEADING_STATUS).await.is_ok_and(|v| v <= 0.5) {
-        let _ = xp.run_command(CMD_HDG_MODE).await;
+        let _ = autoflight::press(xp, Button::Heading).await;
     }
-    let _ = xp.set_float(ALT_DIAL, p.alt_ft).await;
+    let _ = autoflight::set_dial(xp, Dial::Altitude, p.alt_ft).await;
     // The vertical by VS toward the dial, never ALT HOLD off the zoom
     // (`vertical_toward_dial`); the settle keeps the wheel on it.
     let alt = xp.get_float(crate::datarefs::ALTITUDE_FT).await.unwrap_or(p.alt_ft);
     if let Vertical::Vs(rate) = vertical_toward_dial(alt, p.alt_ft, 0.0, false) {
         if xp.get_float(VS_STATUS).await.is_ok_and(|v| v <= 0.5) {
-            let _ = xp.run_command(CMD_VS_MODE).await;
+            let _ = autoflight::press(xp, Button::VerticalSpeed).await;
         }
-        let _ = xp.set_float(VS_DIAL, rate).await;
+        let _ = autoflight::set_dial(xp, Dial::Vs, rate).await;
     }
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     let (hdg, vs, alt) = tokio::join!(
@@ -795,10 +791,10 @@ async fn settle(
             if let Vertical::Vs(rate) = want {
                 let vs_off = vs_st.is_ok_and(|v| v <= 0.5);
                 if vs_off {
-                    let _ = xp.run_command(CMD_VS_MODE).await;
+                    let _ = autoflight::press(xp, Button::VerticalSpeed).await;
                 }
                 if last != Some(want) || vs_off {
-                    let _ = xp.set_float(VS_DIAL, rate).await;
+                    let _ = autoflight::set_dial(xp, Dial::Vs, rate).await;
                 }
             }
             let dial_fpm = match want {

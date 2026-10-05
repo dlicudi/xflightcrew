@@ -31,6 +31,7 @@
 //! frozen (pause/replay) freezes the loop with it. The laws are pure
 //! functions and battle-test as plain `cargo test`.
 
+use crate::autoflight::{self, Button, Dial};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::autoland::{along_track_nm, cross_track_nm, true_to_mag, Runway};
@@ -61,19 +62,20 @@ const FLAP_HANDLE: &str = "sim/cockpit2/controls/flap_ratio";
 /// conservative "positive climb, gear up, then flaps" point.
 const FLAP_RETRACT_AGL_FT: f64 = 400.0;
 #[cfg(test)]
-const CMD_SERVOS_ON: &str = "sim/autopilot/servos_on";
+const CMD_SERVOS_ON: &str = autoflight::cmd::SERVOS_ON;
 /// Servos and flight director off: an autopilot left on by the last flight.
-const CMD_AP_OFF: &str = "sim/autopilot/servos_fdir_off";
+#[cfg(test)]
+const CMD_AP_OFF: &str = autoflight::cmd::SERVOS_FDIR_OFF;
 const SERVOS_ON: &str = sim::datarefs::SERVOS_ON;
-const CMD_HDG_MODE: &str = "sim/autopilot/heading";
-const CMD_VS_MODE: &str = "sim/autopilot/vertical_speed";
-const VS_DIAL: &str = "sim/cockpit/autopilot/vertical_velocity";
-const HDG_STATUS: &str = "sim/cockpit2/autopilot/heading_status";
-const VS_STATUS: &str = "sim/cockpit2/autopilot/vvi_status";
+#[cfg(test)]
+const CMD_VS_MODE: &str = autoflight::cmd::VERTICAL_SPEED;
+#[cfg(test)]
+const VS_DIAL: &str = Dial::Vs.read_name();
+const HDG_STATUS: &str = autoflight::names::HDG_STATUS;
+const VS_STATUS: &str = autoflight::names::VS_STATUS;
 /// Elevator trim, -1 (nose down) .. +1, recorded at the AP engage: the one
 /// number that says whether the climb the servo is handed is flyable.
 const ELEV_TRIM: &str = "sim/cockpit2/controls/elevator_trim";
-const ALT_DIAL: &str = "sim/cockpit2/autopilot/altitude_dial_ft";
 const ALT_IND_FT: &str = sim::datarefs::ALTITUDE_FT;
 const TAXI_STEER: &str = "xcopilot/taxi_steer";
 const TAKEOFF_PITCH: &str = "xcopilot/pitch";
@@ -2260,10 +2262,9 @@ pub fn clean_up_speed_kts(schedule: &[(f64, f64)], vy_kts: f64) -> f64 {
 /// (within a knot). Only an airframe whose window the takeoff set to V2
 /// (`takeoff_config: v2_kts`) is touched; the caller gates on that.
 pub async fn speed_window_after_acceleration(xp: &dyn crate::xplane::XPlane, kts: f64) -> bool {
-    const WINDOW: &str = crate::aircraft::TakeoffConfigProfile::SPEED_WINDOW;
-    xp.set_float(WINDOW, kts).await.is_ok()
-        && xp
-            .get_float(WINDOW)
+    use autoflight::Dial;
+    autoflight::set_dial(xp, Dial::Airspeed, kts).await.is_ok()
+        && autoflight::read_dial(xp, Dial::Airspeed)
             .await
             .is_ok_and(|v| (v - kts).abs() <= 1.0)
 }
@@ -2642,7 +2643,7 @@ async fn clear_inherited_autopilot(xp: &dyn crate::xplane::XPlane) -> Option<boo
     if !ap_inherited(servos, heading, vertical) {
         return None;
     }
-    let fired = xp.run_command(CMD_AP_OFF).await.is_ok();
+    let fired = autoflight::press(xp, Button::DisconnectFd).await.is_ok();
     let after = xp.get_float(SERVOS_ON).await.ok();
     let cleared = fired && after.is_some_and(|v| v < 0.5);
     crate::blackbox::record(
@@ -2664,7 +2665,7 @@ pub const AP_NO_PITCH: &str = "ap_no_pitch";
 /// still ahead) and never gives it back to the autopilot; the run ends
 /// [`AP_NO_PITCH`] for the caller.
 async fn no_pitch_take_over(xp: &XPlaneClient, p: &Params, voice: &Option<Voice>, why: &str) {
-    let (dial, alt) = tokio::join!(xp.get_float(ALT_DIAL), xp.get_float(ALT_IND_FT));
+    let (dial, alt) = tokio::join!(autoflight::read_dial(xp, Dial::Altitude), xp.get_float(ALT_IND_FT));
     let hold_ft = crate::climb_watch::takeover_hold_ft(dial.ok(), alt.ok());
     let started = crate::tools::recover::take_over(
         p.base_url.clone(),
@@ -2719,16 +2720,16 @@ async fn engage_climb(
             return false;
         }
     }
-    if heading <= 0.5 && xp.run_command(CMD_HDG_MODE).await.is_err() {
+    if heading <= 0.5 && autoflight::press(xp, Button::Heading).await.is_err() {
         return false;
     }
     if vertical <= 0.5 {
         *last = None; // a mode change synchronises the dial
-        if xp.run_command(CMD_VS_MODE).await.is_err() {
+        if autoflight::press(xp, Button::VerticalSpeed).await.is_err() {
             return false;
         }
     }
-    if !crate::control::set_confirmed("autotakeoff", xp, VS_DIAL, vs, last, 40.0).await {
+    if !autoflight::set_dial_confirmed("autotakeoff", xp, Dial::Vs, vs, last, 40.0).await {
         return false;
     }
     let (heading, vertical, servos) = tokio::join!(
@@ -3815,11 +3816,12 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, p: Params) {
             // by 10,000 ft with the dial still at 100 (EGPH, 2026-09-20).
             let mut held = String::new();
             if !p.handoff_to_caller {
-                let (dial, alt) = tokio::join!(xp.get_float(ALT_DIAL), xp.get_float(ALT_IND_FT));
+                let (dial, alt) =
+                    tokio::join!(autoflight::read_dial(&xp, Dial::Altitude), xp.get_float(ALT_IND_FT));
                 if let (Ok(dial), Ok(alt)) = (dial, alt) {
                     let level = match handoff_altitude_dial_ft(dial, alt) {
                         Some(set) => {
-                            let ok = xp.set_float(ALT_DIAL, set).await.is_ok();
+                            let ok = autoflight::set_dial(&xp, Dial::Altitude, set).await.is_ok();
                             crate::blackbox::record(
                                 "autotakeoff",
                                 serde_json::json!({"event": "handoff_alt_dial", "was": dial,

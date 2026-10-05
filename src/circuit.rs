@@ -27,6 +27,7 @@
 // The tests reach these through `use super::*` (the queue that used them
 // moved to `crew_radio.rs`).
 #[cfg_attr(not(test), allow(unused_imports))]
+use crate::autoflight::{self, Button, Dial};
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
 #[cfg_attr(not(test), allow(unused_imports))]
@@ -52,13 +53,9 @@ const MAG_VAR: &str = "sim/flightmodel/position/magnetic_variation";
 // steer; `sim/autopilot/altitude_hold` is deliberately absent: it holds the
 // CURRENT altitude, not the dial, and locked every pattern at handoff height
 // (2026-07-24)).
-const CMD_HDG_MODE: &str = "sim/autopilot/heading";
-const CMD_VS_MODE: &str = "sim/autopilot/vertical_speed";
-const VS_DIAL: &str = "sim/cockpit/autopilot/vertical_velocity";
-const HDG_BUG: &str = "sim/cockpit2/autopilot/heading_dial_deg_mag_pilot";
-const HDG_STATUS: &str = "sim/cockpit2/autopilot/heading_status";
+const HDG_STATUS: &str = autoflight::names::HDG_STATUS;
 const SERVOS_ON: &str = sim::datarefs::SERVOS_ON;
-const VS_STATUS: &str = "sim/cockpit2/autopilot/vvi_status";
+const VS_STATUS: &str = autoflight::names::VS_STATUS;
 const IAS: &str = "sim/flightmodel/position/indicated_airspeed";
 /// Gear handle — the circuit lowers it turning base (autoland's own
 /// extension only fires inside 6 nm, which this hands over well inside of).
@@ -1525,8 +1522,7 @@ pub fn publish_ap_altitude_capture(on: bool) {
     AP_ALTITUDE_CAPTURE.store(on, Ordering::SeqCst);
 }
 
-const ALT_DIAL: &str = "sim/cockpit2/autopilot/altitude_dial_ft";
-const ALT_HOLD_STATUS: &str = "sim/cockpit2/autopilot/altitude_hold_status";
+const ALT_HOLD_STATUS: &str = autoflight::names::ALT_HOLD_STATUS;
 
 /// The altitude the dial should read for this tick's vertical target. A LEVEL
 /// target (pattern altitude, the base leg's height) is selected to the hundred
@@ -1605,7 +1601,7 @@ async fn write_bug(xp: &dyn crate::xplane::XPlane, bug_mag: f64) {
     if LAST_BUG.swap(bits, std::sync::atomic::Ordering::Relaxed) == bits {
         return;
     }
-    if xp.set_float(HDG_BUG, whole).await.is_err() {
+    if autoflight::set_dial(xp, Dial::HeadingBug, whole).await.is_err() {
         LAST_BUG.store(u64::MAX, std::sync::atomic::Ordering::Relaxed);
     }
 }
@@ -2031,9 +2027,9 @@ async fn give_up_pattern(
             write_bug(xp, h).await;
         }
         if xp.get_float(VS_STATUS).await.is_ok_and(|v| v <= 0.5) {
-            let _ = xp.run_command(CMD_VS_MODE).await;
+            let _ = autoflight::press(xp, Button::VerticalSpeed).await;
         }
-        let _ = xp.set_float(VS_DIAL, 0.0).await;
+        let _ = autoflight::set_dial(xp, Dial::Vs, 0.0).await;
     }
     let (servos_after, hdg_st, vs_st) = tokio::join!(
         xp.get_float(SERVOS_ON),
@@ -2173,7 +2169,7 @@ async fn hold_clear_of_terrain(
         )
         .await;
     }
-    let _ = xp.set_float(ALT_DIAL, hold_ft).await;
+    let _ = autoflight::set_dial(xp, Dial::Altitude, hold_ft).await;
     write_bug(xp, bug_mag).await;
     crate::tools::speedhold::arm_flight(base_url.to_string(), voice.clone(), hold_kts);
     let limit_s = terrain_hold_limit_s(alt_ft, hold_ft);
@@ -2207,7 +2203,7 @@ async fn hold_clear_of_terrain(
         };
         tick += 1;
         if hold.level_now(alt) {
-            let _ = xp.set_float(VS_DIAL, 0.0).await;
+            let _ = autoflight::set_dial(xp, Dial::Vs, 0.0).await;
             crate::blackbox::record(
                 "circuit",
                 serde_json::json!({"event": "terrain_hold_level", "hold_ft": hold.alt_ft,
@@ -2254,11 +2250,11 @@ async fn hold_clear_of_terrain(
         // rewritten after (an engage syncs it away). The capture at the
         // hold is ALT HOLD, not a dropped VS mode.
         if hdg_st.is_ok_and(|v| v <= 0.5) {
-            let _ = xp.run_command(CMD_HDG_MODE).await;
+            let _ = autoflight::press(xp, Button::Heading).await;
             write_bug(xp, bug_mag).await;
         }
         if vs_st.is_ok_and(|v| v <= 0.5) && hold.alt_ft - alt > crate::reversal::HOLD_LEVEL_FT {
-            let _ = xp.run_command(CMD_VS_MODE).await;
+            let _ = autoflight::press(xp, Button::VerticalSpeed).await;
             last_vs = None;
         }
         let ias = ias_r.ok().filter(|v| v.is_finite());
@@ -2271,7 +2267,7 @@ async fn hold_clear_of_terrain(
             crate::procedure::descent_fpm(),
         );
         if last_vs.is_none_or(|v| (v - vs).abs() >= 10.0) {
-            let _ = xp.set_float(VS_DIAL, vs).await;
+            let _ = autoflight::set_dial(xp, Dial::Vs, vs).await;
             last_vs = Some(vs);
         }
         if tick % 10 == 1 {
@@ -3469,7 +3465,7 @@ async fn fly_authored_route(
     approach_ias: f64,
 ) {
     let rwy_id = rwy.id.clone();
-    let mut bug_mag = xp.get_float(HDG_BUG).await.unwrap_or(rwy.course_deg);
+    let mut bug_mag = autoflight::read_dial(&xp, Dial::HeadingBug).await.unwrap_or(rwy.course_deg);
     // A new flight of the laws: whatever the knob holds now is unknown.
     LAST_BUG.store(u64::MAX, std::sync::atomic::Ordering::Relaxed);
     let mut last_vs_cmd: Option<f64> = None;
@@ -3520,7 +3516,8 @@ async fn fly_authored_route(
         let psi_r = sim::position::field(&pos, |p| p.psi_true_deg);
         // Read only where the capture is declared: nothing else uses them.
         let (dial_r, alt_hold_r) = if ap_capture {
-            let (d, h) = tokio::join!(xp.get_float(ALT_DIAL), xp.get_float(ALT_HOLD_STATUS));
+            let (d, h) =
+                tokio::join!(autoflight::read_dial(&xp, Dial::Altitude), xp.get_float(ALT_HOLD_STATUS));
             (d.ok(), h.ok())
         } else {
             (None, None)
@@ -3596,7 +3593,7 @@ async fn fly_authored_route(
         )
         .await;
         if !hdg_on {
-            let _ = xp.run_command(CMD_HDG_MODE).await;
+            let _ = autoflight::press(&xp, Button::Heading).await;
         }
 
         // Airspeed trend first: both the climb limiter and the throttle law
@@ -3626,7 +3623,7 @@ async fn fly_authored_route(
         // leg while the VS law stands off (`authored_vertical`).
         let vert = authored_vertical(ap_capture, wp.alt_msl_ft, alt_msl_ft, dial_r, alt_hold_r);
         if let Some(want) = vert.dial_ft {
-            let ok = xp.set_float(ALT_DIAL, want).await.is_ok();
+            let ok = autoflight::set_dial(&xp, Dial::Altitude, want).await.is_ok();
             crate::blackbox::record(
                 "circuit",
                 serde_json::json!({"event": "alt_dial", "was": dial_r, "now": want,
@@ -3639,11 +3636,11 @@ async fn fly_authored_route(
             vs_refused = None;
         } else {
             if !vs_on {
-                let _ = xp.run_command(CMD_VS_MODE).await;
+                let _ = autoflight::press(&xp, Button::VerticalSpeed).await;
                 last_vs_cmd = None;
             }
             if last_vs_cmd.is_none_or(|v| (v - vs_cmd).abs() > 40.0) {
-                let _ = xp.set_float(VS_DIAL, vs_cmd).await;
+                let _ = autoflight::set_dial(&xp, Dial::Vs, vs_cmd).await;
                 last_vs_cmd = Some(vs_cmd);
             }
             // The capture rests on VS taking the aircraft back OUT of the
@@ -3722,7 +3719,7 @@ async fn fly_authored_route(
                 }),
             );
             if stalls >= MAX_STALLS {
-                let _ = xp.set_float(VS_DIAL, 0.0).await;
+                let _ = autoflight::set_dial(&xp, Dial::Vs, 0.0).await;
                 stand_down(
                     &xp,
                     &voice,
@@ -4447,7 +4444,7 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, p: Params
     // The dial's CURRENT value seeds the slew (the takeoff left it near the
     // runway heading); every subsequent write moves it the short way only.
     LAST_BUG.store(u64::MAX, std::sync::atomic::Ordering::Relaxed);
-    let mut bug_mag = match xp.get_float(HDG_BUG).await {
+    let mut bug_mag = match autoflight::read_dial(&xp, Dial::HeadingBug).await {
         Ok(v) => v,
         Err(_) => true_to_mag(rwy_course, mag_var),
     };
@@ -4571,7 +4568,7 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, p: Params
         let (ias_r, thr_r, dial_r, alt_hold_r, phi_r, servos_r) = tokio::join!(
             xp.get_float(IAS),
             xp.get_float(&thr_dref),
-            xp.get_float(ALT_DIAL),
+            autoflight::read_dial(&xp, Dial::Altitude),
             xp.get_float(ALT_HOLD_STATUS),
             xp.get_float(PHI),
             xp.get_float(SERVOS_ON),
@@ -4867,7 +4864,7 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, p: Params
         )
         .await;
         if !hdg_on {
-            let _ = xp.run_command(CMD_HDG_MODE).await;
+            let _ = autoflight::press(&xp, Button::Heading).await;
         }
 
         // Forward terrain floor, every ~2 s: the ground under us and along
@@ -5108,7 +5105,7 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, p: Params
             if let (Ok(dial), Ok(hold)) = (&dial_r, &alt_hold_r) {
                 match circuit_dial_ft(target_rate, target_alt, *dial, alt_msl_ft) {
                     Some(want) => {
-                        let ok = xp.set_float(ALT_DIAL, want).await.is_ok();
+                        let ok = autoflight::set_dial(&xp, Dial::Altitude, want).await.is_ok();
                         crate::blackbox::record(
                             "circuit",
                             serde_json::json!({"event": "alt_dial", "was": dial, "now": want,
@@ -5196,7 +5193,7 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, p: Params
             vs_refused = None;
         } else {
             if !vs_on {
-                let _ = xp.run_command(CMD_VS_MODE).await;
+                let _ = autoflight::press(&xp, Button::VerticalSpeed).await;
                 last_vs_cmd = None; // engage synced the dial; force a rewrite
                 // A vertical mode engaged: its authority is checked afresh.
                 if let Some(vs) = climb_watch.vs_fpm() {
@@ -5204,7 +5201,7 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, p: Params
                 }
             }
             if last_vs_cmd.is_none_or(|v| (v - vs_cmd).abs() > 40.0) {
-                let _ = xp.set_float(VS_DIAL, vs_cmd).await;
+                let _ = autoflight::set_dial(&xp, Dial::Vs, vs_cmd).await;
                 last_vs_cmd = Some(vs_cmd);
             }
             // The one thing the capture rests on: VS taking the aircraft back

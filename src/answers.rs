@@ -1744,7 +1744,7 @@ pub(crate) async fn answer_state_query(
     let autothrottle_q =
         t.contains("autothrottle") || t.contains("auto throttle") || t.contains("auto-throttle");
     if autothrottle_q {
-        if let Ok(v) = read1(live, xp, "sim/cockpit2/autopilot/autothrottle_enabled").await {
+        if let Ok(v) = read1(live, xp, crate::autoflight::names::AT_MODE).await {
             parts.push(match v {
                 v if v >= 1.5 => "autothrottle engaged".to_string(),
                 v if v >= 0.5 => "autothrottle armed".to_string(),

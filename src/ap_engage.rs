@@ -25,9 +25,9 @@
 
 use crate::xplane::XPlane;
 
-/// The servo master. Not a toggle: pressing it with the servos in is
-/// harmless.
-pub const CMD_SERVOS_ON: &str = "sim/autopilot/servos_on";
+// The servo master is the panel's `Engage` (`autoflight::Panel`): the
+// stock `servos_on`, or the airframe's own CMD A. Not a toggle either way:
+// pressing it with the servos in is harmless.
 
 /// THE AUTOPILOT IS ENGAGED AND CONFIRMED, never assumed. The arm used to
 /// fire `servos_on` once and never read it back. After `setup_approach` the
@@ -185,7 +185,7 @@ pub async fn press(xp: &dyn XPlane, fd: &[String]) -> bool {
     for c in fd {
         let _ = xp.run_command(c).await;
     }
-    xp.run_command(CMD_SERVOS_ON).await.is_ok()
+    crate::autoflight::press(xp, crate::autoflight::Button::Engage).await.is_ok()
 }
 
 /// [`press`], on the tape: blackbox `kind` `ap_engage` with the `site` and
@@ -360,7 +360,7 @@ mod tests {
         let fd = vec!["laminar/c90/avionics/switch/fd_up".to_string()];
         assert!(press(&xp, &fd).await);
         let fd_at = xp.command_index(&fd[0]).expect("FD pressed");
-        let servos_at = xp.command_index(CMD_SERVOS_ON).expect("servos pressed");
+        let servos_at = xp.command_index(crate::autoflight::cmd::SERVOS_ON).expect("servos pressed");
         assert!(fd_at < servos_at, "FD before the servos");
     }
 
@@ -371,7 +371,7 @@ mod tests {
             (crate::datarefs::AIRSPEED_KTS, 120.0),
         ]);
         assert!(engage_confirmed(&xp, &[], "test", "unit", 3.0).await);
-        assert!(xp.ran(CMD_SERVOS_ON));
+        assert!(xp.ran(crate::autoflight::cmd::SERVOS_ON));
         let dead = crate::xplane::FakeXPlane::with_reads(&[
             (crate::datarefs::SERVOS_ON, 0.0),
             (crate::datarefs::AIRSPEED_KTS, 120.0),

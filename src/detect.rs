@@ -641,7 +641,18 @@ pub(crate) fn spawn_aircraft_detector(
                                     );
                                 }
                             }
-                            let mut names = aircraft::profile_references(&live.get());
+                            let profile = live.get();
+                            let mut names = aircraft::profile_references(&profile);
+                            // A declared panel is flown through the owner's
+                            // stock reads and commands as well as its own
+                            // buttons (`autoflight::stock_references`).
+                            if profile.autoflight.is_some() {
+                                for n in crate::autoflight::stock_references() {
+                                    if !names.iter().any(|x| x == n) {
+                                        names.push(n.to_string());
+                                    }
+                                }
+                            }
                             let profile_total = names.len();
                             // The plugin's side of the wire contract rides
                             // the same index fetch: a stale .xpl is said

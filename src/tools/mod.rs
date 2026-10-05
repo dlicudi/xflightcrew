@@ -77,7 +77,8 @@ pub(crate) const BRAKES_REGULAR: &str = "sim/flight_controls/brakes_regular";
 pub(crate) const BRAKE_HOLD_SECS: f64 = 1.0;
 /// Command: engage the autopilot servos. Pressed by the AP-mode tools
 /// (`set_heading`/`set_altitude`/…) and by the ILS setup in `approach`.
-pub(crate) const CMD_SERVOS_ON: &str = "sim/autopilot/servos_on";
+#[cfg(test)]
+const CMD_SERVOS_ON: &str = crate::autoflight::cmd::SERVOS_ON;
 
 /// When [`BRAKES_REGULAR`] was last (re)issued, by ANY crew loop - the
 /// `hold_brakes` holder or the taxi governor's stop channel. One clock for

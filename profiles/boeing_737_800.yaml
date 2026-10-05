@@ -179,14 +179,25 @@ com2_radio: true
 nav_radio: true
 transponder: true
 ils: true
-# Autoland parks the altitude window at the field: this MCP will not fly a
-# V/S descent away from a window above it (LEMG 13, 2026-10-05: parked at
-# 5,600 the -570 dial held level; at 0 descent and go-around both followed).
-alt_dial_park_field: true
-# Landing flap 2.5 nm before the 1,000 ft gate (about 5.5 nm): full flap
-# pitches the 737 up and its V/S stalled at -100 to -400 fpm against -1,200
-# for 12 s at 3.5 nm, 215 ft high at the gate (LEMG 13, 2026-10-05).
-landing_flap_lead_nm: 2.5
+# The MCP, owned by src/autoflight.rs. Its own buttons (B738.glareshield.lua:
+# each press handler fires the stock mode command after its power check and
+# sets the MCP lamps; cmd_a_press engages only while the captain's FD mode is
+# not already servos, so it is not a toggle). CMD B is never named: pressed
+# with CMD A in, outside APP, it dropped CMD A (LEMG, 2026-10-05). LVL CHG
+# stays stock on purpose: the 737's own press also fires autothrottle_on, and
+# a loop that flies the levers would then fight it. VERIFY: blackbox
+# `autoflight` `press` with these commands, and `ap_state` following.
+# The window: this MCP flies a V/S only toward its altitude window (parked at
+# 5,600 over a 3,400 ft inbound the -570 dial held level, LEMG 13
+# 2026-10-05 12:25; with it at 0 the descents and the go-around climbs
+# followed), so autoland parks it at the field, toward every descent of the
+# approach (`autoflight::WindowRule::AtField`, was `alt_dial_park_field`).
+autoflight:
+  engage_command: laminar/B738/autopilot/cmd_a_press
+  heading_command: laminar/B738/autopilot/hdg_sel_press
+  vs_command: laminar/B738/autopilot/vs_press
+  altitude_hold_command: laminar/B738/autopilot/alt_hld_press
+  vs_toward_window: true
 parking_brake: true
 retractable_gear: true
 cabin_crew: true       # 189 seats and an interphone

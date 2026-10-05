@@ -56,6 +56,7 @@ fn self_pick(apt_dat: &str, lat: f64, lon: f64, track_deg: f64) -> std::io::Resu
 
 // ---- Stage 3: the control loop (AP-first, like the reference plugin) ----------
 
+use crate::autoflight::{self, Button, Dial};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::tools::autopilot::ApConfig;
@@ -115,20 +116,19 @@ const MAG_VAR: &str = "sim/flightmodel/position/magnetic_variation";
 const PSI_TRUE: &str = "sim/flightmodel/position/psi";
 /// Yaw rate, deg/s nose right, for a declared rollout steer (`RolloutSteer`):
 /// read through the state frame, `sim::state::F::R` (`position/R`).
-// AP + controls (mirror of autopilot.rs / recover.rs).
-const CMD_SERVOS_OFF: &str = "sim/autopilot/servos_off_any";
-/// Servos AND flight director off: the wheels' disconnect.
-const CMD_SERVOS_FDIR_OFF: &str = "sim/autopilot/servos_fdir_off";
+// The autopilot panel is `crate::autoflight`'s: every button and dial below
+// goes through it (the airframe's own buttons, the window rule, the thrust).
 const CMD_YAW_DAMPER_OFF: &str = "sim/systems/yaw_damper_off";
 /// The autopilot master as the sim has it (power and failures included).
-const AP_MASTER_ON: &str = "sim/cockpit2/autopilot/autopilot_on";
+const AP_MASTER_ON: &str = autoflight::names::AP_ON;
 const YAW_DAMPER_ON: &str = "sim/cockpit2/switches/yaw_damper_on";
-const SERVOS_ON: &str = "sim/cockpit2/autopilot/servos_on";
-const CMD_HDG_MODE: &str = "sim/autopilot/heading";
-const CMD_VS_MODE: &str = "sim/autopilot/vertical_speed";
-const HDG_BUG: &str = "sim/cockpit2/autopilot/heading_dial_deg_mag_pilot";
-const VS_DIAL: &str = "sim/cockpit/autopilot/vertical_velocity";
-const ALT_DIAL: &str = "sim/cockpit2/autopilot/altitude_dial_ft";
+const SERVOS_ON: &str = autoflight::names::SERVOS_ON;
+#[cfg(test)]
+const CMD_SERVOS_FDIR_OFF: &str = autoflight::cmd::SERVOS_FDIR_OFF;
+#[cfg(test)]
+const HDG_BUG: &str = Dial::HeadingBug.read_name();
+#[cfg(test)]
+const VS_DIAL: &str = Dial::Vs.read_name();
 const ALT_IND_FT: &str = crate::datarefs::ALTITUDE_FT;
 /// The thrust lever THIS airframe obeys — not always the stock one (the
 /// Citation X tracks `throttle_jet_rev_ratio`, so every write to
@@ -773,7 +773,7 @@ async fn disconnect_autopilot(xp: &dyn crate::xplane::XPlane) -> Option<bool> {
         return None;
     }
     if servos || master {
-        let _ = xp.run_command(CMD_SERVOS_FDIR_OFF).await;
+        let _ = autoflight::press(xp, Button::DisconnectFd).await;
     }
     if damper {
         let _ = xp.run_command(CMD_YAW_DAMPER_OFF).await;
@@ -1419,14 +1419,22 @@ fn spawn_autoland(launch: AutolandLaunch) {
             // 2026-09-15). Parked well above and VS re-selected so no capture
             // can start; a go-around levels there at the latest, which the
             // per-tick VS re-select then takes down again.
+            // The airframe's window rule (`autoflight::WindowRule`): above
+            // (the LEAX rule), or on an MCP that flies a V/S only toward its
+            // window (the 737) at the field, since an approach descends.
+            let window_rule = autoflight::panel().window;
             {
-                let (dial_r, alt_r) = tokio::join!(xp.get_float(ALT_DIAL), xp.get_float(ALT_IND_FT));
+                let (dial_r, alt_r) = tokio::join!(
+                    autoflight::read_dial(&xp, Dial::Altitude),
+                    xp.get_float(ALT_IND_FT)
+                );
                 if let (Ok(dial), Ok(alt_ind)) = (dial_r, alt_r) {
-                    if let Some(parked) = parked_altitude_dial_ft(dial, alt_ind) {
-                        let _ = xp.set_float(ALT_DIAL, parked).await;
-                        let _ = xp.run_command(CMD_VS_MODE).await;
+                    if let Some(parked) = parked_window_ft(window_rule, dial, alt_ind, rwy.elev_ft) {
+                        let _ = autoflight::set_dial(&xp, Dial::Altitude, parked).await;
+                        autoflight::press_logged(&xp, Button::VerticalSpeed, "autoland_arm").await;
                         crate::blackbox::record("autoland", serde_json::json!({
                             "event": "alt_dial_parked", "was": dial, "now": parked, "alt_ft": alt_ind,
+                            "rule": window_rule,
                         }));
                     }
                 }
@@ -1630,23 +1638,43 @@ fn spawn_autoland(launch: AutolandLaunch) {
                 // still one round.
                 let thr_name = throttle_dref();
                 let appr_name = crate::ils::approach_status_dref();
+                // Beside the frame, in its round: the lever, the autopilot's
+                // mode bitfield and the autothrottle (`crate::autoflight`:
+                // the modes' one truth, and a thrust this loop owns).
+                use autoflight::names as afn;
                 let (st, extra) = if ils.is_some() {
                     sim::state::read_with(
                         &xp,
                         sim::state::Want(AUTOLAND_WANT_ILS),
-                        &[thr_name.as_str(), appr_name.as_str()],
+                        &[thr_name.as_str(), afn::AP_STATE, afn::AT_ON, afn::AT_MODE, appr_name.as_str()],
                     )
                     .await
                 } else {
-                    sim::state::read_with(&xp, sim::state::Want(AUTOLAND_WANT), &[thr_name.as_str()])
-                        .await
+                    sim::state::read_with(
+                        &xp,
+                        sim::state::Want(AUTOLAND_WANT),
+                        &[thr_name.as_str(), afn::AP_STATE, afn::AT_ON, afn::AT_MODE],
+                    )
+                    .await
                 };
                 if st.frozen() {
                     tokio::time::sleep(std::time::Duration::from_millis(400)).await;
                     continue;
                 }
                 let mut extra = extra.into_iter();
-                let mut throttle_read = Some(extra.next().unwrap_or_else(|| Err(anyhow::anyhow!("unread"))));
+                let mut unread = || Err(anyhow::anyhow!("unread"));
+                let mut throttle_read = Some(extra.next().unwrap_or_else(&mut unread));
+                let ap_modes = extra
+                    .next()
+                    .and_then(|r| r.ok())
+                    .and_then(autoflight::Modes::from_read);
+                let at_engaged = {
+                    let (on, mode) = (extra.next(), extra.next());
+                    autoflight::autothrottle_engaged(
+                        on.and_then(|r| r.ok()),
+                        mode.and_then(|r| r.ok()),
+                    )
+                };
                 let mut appr_read = extra.next();
                 let pos = st.position();
                 let (var_r, ias_r, hpath_r, ground_r, phi_r) = (
@@ -2526,7 +2554,7 @@ fn spawn_autoland(launch: AutolandLaunch) {
                         let thr_dref = throttle_dref();
                         let _ = tokio::join!(
                             xp.set_float(&thr_dref, GIVE_UP_THROTTLE),
-                            xp.set_float(VS_DIAL, 0.0),
+                            autoflight::set_dial(&xp, Dial::Vs, 0.0),
                         );
                         announce(
                             format!(
@@ -2919,7 +2947,7 @@ fn spawn_autoland(launch: AutolandLaunch) {
                     let thr_dref = throttle_dref();
                     let _ = tokio::join!(
                         xp.set_float(&thr_dref, GIVE_UP_THROTTLE),
-                        xp.set_float(VS_DIAL, 0.0),
+                        autoflight::set_dial(&xp, Dial::Vs, 0.0),
                     );
                     announce(
                         format!(
@@ -2961,7 +2989,7 @@ fn spawn_autoland(launch: AutolandLaunch) {
                     let thr_dref = throttle_dref();
                     let _ = tokio::join!(
                         xp.set_float(&thr_dref, GIVE_UP_THROTTLE),
-                        xp.set_float(VS_DIAL, 0.0),
+                        autoflight::set_dial(&xp, Dial::Vs, 0.0),
                         xp.set_float(FLAP_RATIO, 0.0),
                     );
                     announce(
@@ -3040,7 +3068,7 @@ fn spawn_autoland(launch: AutolandLaunch) {
                 if hold_done {
                     let h = hold.take().expect("a hold that is done exists");
                     gave_up = true;
-                    let _ = xp.set_float(VS_DIAL, 0.0).await;
+                    let _ = autoflight::set_dial(&xp, Dial::Vs, 0.0).await;
                     crate::blackbox::record(
                         "autoland",
                         serde_json::json!({"event": "give_up", "reason": "terrain_refused",
@@ -3452,7 +3480,7 @@ fn spawn_autoland(launch: AutolandLaunch) {
                 };
                 match arrest_hands_step(arrest_hands, g.arresting) {
                     ArrestHands::Take => {
-                        let ok = xp.run_command(CMD_SERVOS_OFF).await.is_ok();
+                        let ok = autoflight::press(&xp, Button::Disconnect).await.is_ok();
                         arrest_hands = true;
                         wings = arrest_wings();
                         crate::blackbox::record(
@@ -3474,9 +3502,13 @@ fn spawn_autoland(launch: AutolandLaunch) {
                             &xp, &cfg.fd_commands, "autoland", "arrest_return", 1,
                         )
                         .await;
-                        let _ = xp.run_command(CMD_HDG_MODE).await;
-                        let _ = xp.run_command(CMD_VS_MODE).await;
-                        let _ = xp.set_float(VS_DIAL, vs_dial).await;
+                        autoflight::apply(
+                            &xp,
+                            &[Button::Heading, Button::VerticalSpeed],
+                            "autoland_arrest_return",
+                        )
+                        .await;
+                        let _ = autoflight::set_dial(&xp, Dial::Vs, vs_dial).await;
                         arrest_hands = false;
                         crate::blackbox::record(
                             "autoland",
@@ -3645,13 +3677,11 @@ fn spawn_autoland(launch: AutolandLaunch) {
                             tick_dt,
                         );
                         if out.press_appr {
-                            let _ = xp.run_command(&crate::ils::approach_command()).await;
+                            autoflight::press_logged(&xp, Button::Approach, "autoland_coupling").await;
                         }
-                        if out.decouple {
-                            let _ = xp.run_command(CMD_HDG_MODE).await;
-                            let _ = xp.run_command(CMD_VS_MODE).await;
-                            let _ = xp.set_float(VS_DIAL, vs_dial).await;
-                        }
+                        // A decouple is an INTENT: the mode housekeeping
+                        // below presses HDG and V/S back once, from the
+                        // tick's read (pressed here too, a toggle went twice).
                         if coupling != before {
                             crate::blackbox::record(
                                 "ils",
@@ -3740,7 +3770,7 @@ fn spawn_autoland(launch: AutolandLaunch) {
                 let hdg_st = st.get(F::HdgStatus);
                 let vs_st = st.get(F::VsStatus);
                 if cpl.own_vertical {
-                    writes.set(VS_DIAL, vs_dial);
+                    autoflight::stage_dial(&mut writes, Dial::Vs, vs_dial);
                 }
                 let yield_r = match flare_elev {
                     Some(e) => {
@@ -3770,7 +3800,7 @@ fn spawn_autoland(launch: AutolandLaunch) {
                         match bug_step_from(st.opt(F::Bug), h) {
                             BugStep::Leave => None,
                             BugStep::Set(v) => {
-                                writes.set(HDG_BUG, v);
+                                autoflight::stage_dial(&mut writes, Dial::HeadingBug, v);
                                 None
                             }
                             BugStep::Drive => Some(h),
@@ -3819,16 +3849,36 @@ fn spawn_autoland(launch: AutolandLaunch) {
                 // A coupled ILS's captured modes are the autopilot's:
                 // re-engaging HDG or VS would drop the localizer or the
                 // glideslope it just captured.
+                // The owner turns the intent into presses (`autoflight::
+                // reconcile`): HDG and V/S on a difference only, nothing on a
+                // failed read, and never over what a coupled ILS hands the
+                // airframe (#81: the old presses here dropped the 737's
+                // captured localiser and glideslope at the next tick).
                 if !arrest_hands {
-                    if cpl.own_lateral && hdg_st.unwrap_or(0.0) <= 0.5 {
-                        let _ = xp.run_command(CMD_HDG_MODE).await;
-                    }
-                    // Vertical: VS mode to the glidepath rate.
-                    if cpl.own_vertical && vs_st.unwrap_or(0.0) <= 0.5 {
-                        let _ = xp.run_command(CMD_VS_MODE).await;
+                    use autoflight::{Lateral, ModeRead, Vertical, Want};
+                    let coupled = matches!(
+                        coupling,
+                        crate::ils::Coupling::Armed
+                            | crate::ils::Coupling::LocCaptured
+                            | crate::ils::Coupling::Coupled
+                    );
+                    let want = Want {
+                        lateral: Some(if coupled { Lateral::Coupled } else { Lateral::Heading }),
+                        vertical: Some(if coupled { Vertical::Coupled } else { Vertical::Vs }),
+                    };
+                    let presses = autoflight::reconcile(
+                        want,
+                        ModeRead {
+                            hdg_status: hdg_st.as_ref().ok().copied(),
+                            vs_status: vs_st.as_ref().ok().copied(),
+                            modes: ap_modes,
+                        },
+                    );
+                    autoflight::apply(&xp, &presses, "autoland").await;
+                    if presses.contains(&Button::VerticalSpeed) {
                         // The engage syncs the dial to the CURRENT rate, so the
                         // rate we want has to be written again after it.
-                        let _ = xp.set_float(VS_DIAL, vs_dial).await;
+                        let _ = autoflight::set_dial(&xp, Dial::Vs, vs_dial).await;
                     }
                 }
 
@@ -4161,7 +4211,7 @@ fn spawn_autoland(launch: AutolandLaunch) {
                             &xp, &cfg.fd_commands, "autoland", "vs_watchdog", 1,
                         )
                         .await;
-                        let _ = xp.run_command(CMD_VS_MODE).await;
+                        autoflight::press_logged(&xp, Button::VerticalSpeed, "autoland_vs_watchdog").await;
                         announce(vs_not_held_line(g.target_vs_fpm).into(), Priority::Warning);
                     }
                     // Said once and then flown for twenty-two minutes: the
@@ -4175,7 +4225,7 @@ fn spawn_autoland(launch: AutolandLaunch) {
                         let thr_dref = throttle_dref();
                         let _ = tokio::join!(
                             xp.set_float(&thr_dref, GIVE_UP_THROTTLE),
-                            xp.set_float(VS_DIAL, 0.0),
+                            autoflight::set_dial(&xp, Dial::Vs, 0.0),
                         );
                         announce(
                             "Autopilot is still not holding the descent. Abandoning the approach. \
@@ -4212,7 +4262,7 @@ fn spawn_autoland(launch: AutolandLaunch) {
                     let thr_dref = throttle_dref();
                     let _ = tokio::join!(
                         xp.set_float(&thr_dref, GIVE_UP_THROTTLE),
-                        xp.set_float(VS_DIAL, 0.0),
+                        autoflight::set_dial(&xp, Dial::Vs, 0.0),
                     );
                     announce(
                         format!(
@@ -5538,37 +5588,24 @@ const VS_LEAD_MAX_CLIMB_FPM: f64 = 300.0;
 
 /// The altitude dial must never be within reach BELOW the aircraft while
 /// autoland flies: an armed capture takes the vertical away from the VS dial
-/// (see the arm sequence in [`run_autoland`]). `None` = already clear.
-pub const ALT_DIAL_CLEAR_FT: f64 = 500.0;
-/// Where the dial is parked: this far above the arm altitude, rounded UP to
-/// the hundred, so a go-around's climb captures a sensible level at worst.
-pub const ALT_DIAL_PARK_ABOVE_FT: f64 = 1000.0;
+/// (see the arm sequence in [`run_autoland`]). The LEAX rule
+/// ([`autoflight::WindowRule::ParkAbove`]: 1,000 ft above, rounded up to the
+/// hundred, unless already 500 ft clear). Pure.
 pub fn parked_altitude_dial_ft(dial_ft: f64, alt_ft: f64) -> Option<f64> {
-    parked_altitude_dial_for(dial_ft, alt_ft, ALT_DIAL_PARK_FIELD.load(std::sync::atomic::Ordering::SeqCst))
+    autoflight::window_for(autoflight::WindowRule::ParkAbove, dial_ft, alt_ft, 0.0)
 }
 
-/// [`parked_altitude_dial_ft`] for an airframe that parks at the field
-/// (`alt_dial_park_field`): 0 ft, nothing to capture before the wheels.
+/// The window the arm parks for the airframe's rule
+/// ([`autoflight::window_for`]): above, or at the field on an MCP
+/// that flies a V/S only toward its window (the 737, LEMG 13 2026-10-05).
 /// Pure.
-pub fn parked_altitude_dial_for(dial_ft: f64, alt_ft: f64, at_field: bool) -> Option<f64> {
-    if at_field {
-        return (dial_ft.abs() > 1.0).then_some(0.0);
-    }
-    if dial_ft >= alt_ft + ALT_DIAL_CLEAR_FT {
-        return None;
-    }
-    Some(((alt_ft + ALT_DIAL_PARK_ABOVE_FT) / 100.0).ceil() * 100.0)
-}
-
-/// The profile's `alt_dial_park_field` and `landing_flap_lead_nm`,
-/// republished on every swap ([`crate::flight_state::publish_airframe`]).
-static ALT_DIAL_PARK_FIELD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-static LANDING_FLAP_LEAD: std::sync::Mutex<Option<f64>> = std::sync::Mutex::new(None);
-
-pub fn publish_approach_config(park_at_field: bool, landing_flap_lead_nm: Option<f64>) {
-    ALT_DIAL_PARK_FIELD.store(park_at_field, std::sync::atomic::Ordering::SeqCst);
-    *LANDING_FLAP_LEAD.lock().unwrap_or_else(|e| e.into_inner()) =
-        landing_flap_lead_nm.filter(|n| n.is_finite() && *n > 0.0);
+pub fn parked_window_ft(
+    rule: autoflight::WindowRule,
+    dial_ft: f64,
+    alt_ft: f64,
+    field_ft: f64,
+) -> Option<f64> {
+    autoflight::window_for(rule, dial_ft, alt_ft, field_ft)
 }
 
 /// A probed threshold elevation within this of the header is the header (the
@@ -6973,11 +7010,7 @@ const LANDING_FLAP_LEAD_NM: f64 = 1.0;
 pub fn landing_flap_nm() -> f64 {
     let gate_nm = crate::stable_approach::GateKind::Instrument.gate_ft() / gp_ft_per_nm()
         - TOUCHDOWN_AIM_NM;
-    let lead = LANDING_FLAP_LEAD
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .unwrap_or(LANDING_FLAP_LEAD_NM);
-    (gate_nm + lead).clamp(3.0, 5.5)
+    (gate_nm + LANDING_FLAP_LEAD_NM).clamp(3.0, 5.5)
 }
 
 /// Latched low go-around: a missed approach called BELOW the terrain floor is

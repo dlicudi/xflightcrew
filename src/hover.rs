@@ -29,6 +29,7 @@
 //! drop), the autopilot is disengaged with the command that actually does it
 //! on this aircraft (`servos_fdir_off`; plain `servos_off` left it engaged).
 
+use crate::autoflight::{self, Button, Dial};
 use crate::datarefs::ON_GROUND_ANY;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
@@ -1179,9 +1180,8 @@ const VS_FPM: &str = "sim/flightmodel/position/vh_ind_fpm";
 const GROUNDSPEED: &str = "sim/flightmodel/position/groundspeed";
 const THETA: &str = "sim/flightmodel/position/theta";
 const PHI: &str = "sim/flightmodel/position/phi";
-const AP_ON: &str = "sim/cockpit2/autopilot/autopilot_on";
-const HOVER_STATUS: &str = "sim/cockpit2/autopilot/hover_status";
-const HOVER_VECTOR: &str = "sim/cockpit2/autopilot/hover_vector";
+const AP_ON: &str = autoflight::names::AP_ON;
+const HOVER_STATUS: &str = autoflight::names::HOVER_STATUS;
 const VX: &str = "sim/flightmodel/position/local_vx";
 const VZ: &str = "sim/flightmodel/position/local_vz";
 const PSI: &str = "sim/flightmodel/position/psi";
@@ -1190,14 +1190,9 @@ const YAW_RATE: &str = "sim/flightmodel/position/R";
 /// written every tick, dropped the frame the pilot's yaw axis moves.
 const PEDALS: &str = "xcopilot/taxi_steer";
 const PEDAL_YIELD: &str = "xcopilot/steer_yield";
-const CMD_SERVOS_ON: &str = "sim/autopilot/servos_on";
-const CMD_HOVER: &str = "sim/autopilot/hover";
-const CMD_HEADING: &str = "sim/autopilot/heading";
-const CMD_ALT_HOLD: &str = "sim/autopilot/altitude_hold";
-const HEADING_STATUS: &str = "sim/cockpit2/autopilot/heading_status";
-const ALT_STATUS: &str = "sim/cockpit2/autopilot/altitude_hold_status";
+const HEADING_STATUS: &str = autoflight::names::HDG_STATUS;
+const ALT_STATUS: &str = autoflight::names::ALT_HOLD_STATUS;
 /// The disconnect that works on the S-76 (plain `servos_off` did not).
-const CMD_AP_OFF: &str = "sim/autopilot/servos_fdir_off";
 const M_TO_FT: f64 = 3.28084;
 /// The radio height the gear reads at rest (0.027 m on the S-76).
 const REST_AGL_FT: f64 = 0.1;
@@ -1335,8 +1330,8 @@ fn vector_moved(v: &[f64], want: [f64; 2]) -> bool {
 }
 
 async fn set_vector(xp: &XPlaneClient, v: [f64; 2]) {
-    let _ = xp.set_float_index(HOVER_VECTOR, 0, v[0]).await;
-    let _ = xp.set_float_index(HOVER_VECTOR, 1, v[1]).await;
+    let _ = autoflight::set_dial_elem(xp, Dial::HoverVector, 0, v[0]).await;
+    let _ = autoflight::set_dial_elem(xp, Dial::HoverVector, 1, v[1]).await;
 }
 
 /// Hand the aircraft back STEADY. In the air the collective goes to the
@@ -1372,7 +1367,7 @@ async fn hand_back(
     let cruise = moving && cruise_modes(xp).await;
     let hovering = airborne && !cruise && hover_mode(xp).await;
     if !cruise && !hovering {
-        let _ = xp.run_command(CMD_AP_OFF).await;
+        let _ = autoflight::press(xp, Button::DisconnectFd).await;
     }
     crate::blackbox::record(
         "hover",
@@ -1391,10 +1386,10 @@ async fn hand_back(
 /// The autopilot on and in its hover mode, asked for zero groundspeed. True
 /// when the mode reads captured.
 async fn hover_mode(xp: &XPlaneClient) -> bool {
-    let _ = xp.run_command(CMD_SERVOS_ON).await;
+    let _ = autoflight::press(xp, Button::Engage).await;
     tokio::time::sleep(Duration::from_millis(300)).await;
     if xp.get_float(HOVER_STATUS).await.is_ok_and(|v| v < 1.5) {
-        let _ = xp.run_command(CMD_HOVER).await;
+        let _ = autoflight::press(xp, Button::Hover).await;
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
     set_vector(xp, [0.0, 0.0]).await;
@@ -1417,25 +1412,15 @@ pub(crate) async fn cruise_modes(xp: &XPlaneClient) -> bool {
     let (Ok(hdg), Ok(alt)) = (hdg, alt) else {
         return false;
     };
-    let _ = xp
-        .set_float(
-            "sim/cockpit2/autopilot/heading_dial_deg_mag_pilot",
-            hdg.round(),
-        )
-        .await;
-    let _ = xp
-        .set_float(
-            "sim/cockpit2/autopilot/altitude_dial_ft",
-            (alt / 10.0).round() * 10.0,
-        )
-        .await;
-    let _ = xp.run_command(CMD_SERVOS_ON).await;
+    let _ = autoflight::set_dial(xp, Dial::HeadingBug, hdg.round()).await;
+    let _ = autoflight::set_dial(xp, Dial::Altitude, (alt / 10.0).round() * 10.0).await;
+    let _ = autoflight::press(xp, Button::Engage).await;
     tokio::time::sleep(Duration::from_millis(300)).await;
     if xp.get_float(HEADING_STATUS).await.is_ok_and(|v| v < 0.5) {
-        let _ = xp.run_command(CMD_HEADING).await;
+        let _ = autoflight::press(xp, Button::Heading).await;
     }
     if xp.get_float(ALT_STATUS).await.is_ok_and(|v| v < 0.5) {
-        let _ = xp.run_command(CMD_ALT_HOLD).await;
+        let _ = autoflight::press(xp, Button::AltitudeHold).await;
     }
     tokio::time::sleep(Duration::from_millis(500)).await;
     let (h, a) = tokio::join!(xp.get_float(HEADING_STATUS), xp.get_float(ALT_STATUS));
@@ -1495,10 +1480,10 @@ async fn fly(
     // The autopilot holds the position; its hover mode captured on the ground
     // in the live test, so it is engaged before anything lifts. It captures
     // the groundspeed of the moment, so the target is zeroed AFTER it.
-    let _ = xp.run_command(CMD_SERVOS_ON).await;
+    let _ = autoflight::press(&xp, Button::Engage).await;
     tokio::time::sleep(Duration::from_millis(500)).await;
     if xp.get_float(HOVER_STATUS).await.is_ok_and(|v| v < 1.5) {
-        let _ = xp.run_command(CMD_HOVER).await;
+        let _ = autoflight::press(&xp, Button::Hover).await;
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
     // A takeover in flight: the mode captured the velocity it was engaged
@@ -1521,7 +1506,7 @@ async fn fly(
             "hover",
             serde_json::json!({ "event": "refused", "ap": ap, "hover_status": hs }),
         );
-        let _ = xp.run_command(CMD_AP_OFF).await;
+        let _ = autoflight::press(&xp, Button::DisconnectFd).await;
         say(
             &voice,
             Priority::Caution,
@@ -1673,7 +1658,7 @@ async fn fly(
             xp.get_float(PHI),
             xp.get_float(AP_ON),
             xp.get_float(HOVER_STATUS),
-            xp.get_float_array(HOVER_VECTOR),
+            autoflight::read_dial_array(&xp, Dial::HoverVector),
         );
         let (gs, th, ph, ap, hs, hv) = (gs.ok(), th.ok(), ph.ok(), ap.ok(), hs.ok(), hv.ok());
         // A failed read is no measurement: skip the tick, never guess.
@@ -1715,7 +1700,7 @@ async fn fly(
         if hs.is_some_and(|v| v < 1.5)
             && last_recapture.is_none_or(|t: Instant| t.elapsed().as_secs_f64() > RECAPTURE_EVERY_S)
         {
-            let _ = xp.run_command(CMD_HOVER).await;
+            let _ = autoflight::press(&xp, Button::Hover).await;
             let (c, t) = (ramp.now(), drift.target());
             set_vector(&xp, [c[0] + t[0], c[1] + t[1]]).await;
             last_recapture = Some(Instant::now());
@@ -2054,7 +2039,7 @@ async fn fly(
                     }
                     let since = *grounded_since.get_or_insert(now);
                     if (now - since).as_secs_f64() >= LANDED_SECS && cmd <= 0.001 {
-                        let _ = xp.run_command(CMD_AP_OFF).await;
+                        let _ = autoflight::press(&xp, Button::DisconnectFd).await;
                         crate::blackbox::record("hover", serde_json::json!({ "event": "landed" }));
                         say(&voice, Priority::Readback, "We're down. Collective's down.");
                         return;
@@ -2074,7 +2059,7 @@ async fn fly(
     // Stood down from outside (a cancel, "my controls", a swap): the
     // collective stays where it is and the autopilot comes off. The caller
     // said the hand-back; saying it again here doubles the line.
-    let _ = xp.run_command(CMD_AP_OFF).await;
+    let _ = autoflight::press(&xp, Button::DisconnectFd).await;
     crate::blackbox::record("hover", serde_json::json!({ "event": "stood_down" }));
 }
 

@@ -9,51 +9,50 @@
 //! autopilot exists.
 
 
+use crate::autoflight::{self, Button, Dial};
 use anyhow::Result;
 use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-use super::{Tool, ToolCtx, CMD_SERVOS_ON};
+use super::{Tool, ToolCtx};
+#[cfg(test)]
+use super::CMD_SERVOS_ON;
 use crate::voice::{Priority, Voice};
 use crate::xplane::XPlaneClient;
 
 /// Pilot-side heading bug, degrees magnetic (writable).
-const HEADING_BUG: &str = "sim/cockpit2/autopilot/heading_dial_deg_mag_pilot";
+#[cfg(test)]
+const HEADING_BUG: &str = Dial::HeadingBug.read_name();
 /// Selected altitude, feet (writable).
-const ALT_DIAL: &str = "sim/cockpit2/autopilot/altitude_dial_ft";
+#[cfg(test)]
+const ALT_DIAL: &str = Dial::Altitude.read_name();
 /// Selected vertical speed, feet per minute (writable). Use the classic
 /// `vertical_velocity` dial, not cockpit2's `vvi_dial_fpm`: on the SR22's
 /// G1000/Perspective AP the latter isn't the dataref the autopilot follows —
 /// verified against the rustdecks SR22 deck, which reads/writes VS here.
-const VS_DIAL: &str = "sim/cockpit/autopilot/vertical_velocity";
+#[cfg(test)]
+const VS_DIAL: &str = Dial::Vs.read_name();
 /// Servo engagement status (read-only; 1 = autopilot flying).
-const SERVOS_ON: &str = crate::datarefs::SERVOS_ON;
+const SERVOS_ON: &str = autoflight::names::SERVOS_ON;
 /// Command: disconnect the autopilot. The stock 172's S-TEC-style AP has no
 /// master switch and does not register `sim/autopilot/servos_off`. X-Plane
 /// exposes `servos_off_any` ("disco servos, whichever side is active") and the
 /// yoke red button `ap_disc_trim_interrupt`. We use `servos_off_any` — a clean
 /// servos disconnect — rather than the yoke button, which also interrupts the
 /// pitch-trim servo (an unwanted side effect for a voice "autopilot off").
-const CMD_SERVOS_OFF: &str = "sim/autopilot/servos_off_any";
 /// Command: engage heading-select (HDG) mode.
-const CMD_HEADING_MODE: &str = "sim/autopilot/heading";
-/// Command: engage NAV mode (follow the active nav source).
-const CMD_NAV_MODE: &str = "sim/autopilot/NAV";
-/// Command: engage GPSS (lateral nav / LNAV) — fly the *GPS flight plan*. This is
-/// the correct "track the magenta line" mode; `NAV` arms VOR/LOC capture instead.
-/// Study airliners like the MD-82 fly the FMS route only under GPSS, not NAV.
-const CMD_GPSS: &str = "sim/autopilot/gpss";
+#[cfg(test)]
+const CMD_HEADING_MODE: &str = autoflight::cmd::HEADING;
 /// GPSS (LNAV) engaged status.
-const GPSS_STATUS: &str = "sim/cockpit2/autopilot/gpss_status";
+const GPSS_STATUS: &str = autoflight::names::GPSS_STATUS;
 /// Command: select GPS as the CDI/HSI source (so NAV follows the GPS flight plan).
-const CMD_HSI_GPS: &str = "sim/autopilot/hsi_select_gps";
 /// NAV-mode status (> 0 = armed/engaged).
-const NAV_STATUS: &str = crate::datarefs::NAV_STATUS;
+const NAV_STATUS: &str = autoflight::names::NAV_STATUS;
 /// Command: engage altitude select/hold (ALT) mode.
-const CMD_ALT_HOLD: &str = "sim/autopilot/altitude_hold";
+#[cfg(test)]
+const CMD_ALT_HOLD: &str = autoflight::cmd::ALTITUDE_HOLD;
 /// Command: wings-level / roll hold — for "auto level" / "straight and level".
-const CMD_WING_LEVELER: &str = "sim/autopilot/wing_leveler";
 /// Current indicated altitude (feet), read to capture "hold this altitude".
 const CURRENT_ALT: &str = crate::datarefs::ALTITUDE_FT;
 /// Autopilot altitude targets below this (feet MSL) are refused — a 172's AP is
@@ -62,7 +61,8 @@ const CURRENT_ALT: &str = crate::datarefs::ALTITUDE_FT;
 /// the aircraft into the ground.
 const MIN_AP_ALTITUDE_FT: f64 = 500.0;
 /// Command: engage vertical-speed (VS) mode.
-const CMD_VS_MODE: &str = "sim/autopilot/vertical_speed";
+#[cfg(test)]
+const CMD_VS_MODE: &str = autoflight::cmd::VERTICAL_SPEED;
 /// Throttle (all engines), 0..1. A commanded climb sets this to full — the AP
 /// only controls pitch, so without power a 172 trades airspeed for altitude.
 /// The thrust lever THIS airframe obeys — not always the stock one (the
@@ -85,9 +85,9 @@ const FIREWALL_HANDBACK_FLOOR: f64 = 0.9;
 /// Mode status datarefs (0 = off, >0 = armed/engaged). Read before pressing a
 /// mode command, because the `sim/autopilot/*` mode commands are TOGGLES: firing
 /// one while its mode is already active switches it back OFF.
-const HEADING_STATUS: &str = crate::datarefs::HEADING_STATUS;
-const ALT_HOLD_STATUS: &str = "sim/cockpit2/autopilot/altitude_hold_status";
-const VS_STATUS: &str = "sim/cockpit2/autopilot/vvi_status";
+const HEADING_STATUS: &str = autoflight::names::HDG_STATUS;
+const ALT_HOLD_STATUS: &str = autoflight::names::ALT_HOLD_STATUS;
+const VS_STATUS: &str = autoflight::names::VS_STATUS;
 /// Descents steeper than this (fpm) are confirmed — anything shallower, and all
 /// climbs, execute immediately. A 172 descends ~500–1000 fpm routinely.
 const VS_CONFIRM_DESCENT_FPM: f64 = -1500.0;
@@ -244,8 +244,10 @@ fn level_power(governor_kts: Option<f64>, cruise_ias_kts: Option<f64>, alt_ft: f
 const INVERTER_ON: &str = "sim/cockpit2/electrical/inverter_on";
 
 /// Command: turn the heading bug one degree (knob presses).
-const CMD_HDG_UP: &str = "sim/autopilot/heading_up";
-const CMD_HDG_DN: &str = "sim/autopilot/heading_down";
+#[cfg(test)]
+const CMD_HDG_UP: &str = autoflight::cmd::HEADING_UP;
+#[cfg(test)]
+const CMD_HDG_DN: &str = autoflight::cmd::HEADING_DOWN;
 
 /// Drive the heading BUG to `target` the way a human does — by turning the knob
 /// (`heading_up`/`heading_down` presses). Glass avionics that ignore raw dataref
@@ -309,8 +311,8 @@ pub async fn drive_heading_bug_step(
     max_step_deg: f64,
 ) -> f64 {
     let target = target.rem_euclid(360.0);
-    let Ok(start) = xp.get_float(HEADING_BUG).await else {
-        let _ = xp.set_float(HEADING_BUG, target).await;
+    let Ok(start) = autoflight::read_dial(xp, Dial::HeadingBug).await else {
+        let _ = autoflight::set_dial(xp, Dial::HeadingBug, target).await;
         return target;
     };
     let full = crate::angles::signed_diff_deg(target, start);
@@ -323,35 +325,35 @@ pub async fn drive_heading_bug_step(
     if full.abs() < FINE_BUG_DEG {
         if full.abs() >= FINE_BUG_MIN_DEG {
             let fine = ((start + full) * 10.0).round() / 10.0;
-            let _ = xp.set_float(HEADING_BUG, fine.rem_euclid(360.0)).await;
-            return xp.get_float(HEADING_BUG).await.unwrap_or(fine);
+            let _ = autoflight::set_dial(xp, Dial::HeadingBug, fine.rem_euclid(360.0)).await;
+            return autoflight::read_dial(xp, Dial::HeadingBug).await.unwrap_or(fine);
         }
         return start;
     }
     let delta = full.clamp(-max_step_deg.abs(), max_step_deg.abs());
     let leg = (start + delta).rem_euclid(360.0);
     let presses = delta.round().abs() as i64;
-    let cmd = if delta >= 0.0 { CMD_HDG_UP } else { CMD_HDG_DN };
+    let knob = if delta >= 0.0 { Button::HeadingUp } else { Button::HeadingDown };
     for i in 0..presses {
-        if xp.run_command(cmd).await.is_err() {
+        if autoflight::press(xp, knob).await.is_err() {
             break;
         }
         // A few presses in, confirm the knob is actually bound on this airframe.
         if i == 4 {
-            let now = xp.get_float(HEADING_BUG).await.unwrap_or(start);
+            let now = autoflight::read_dial(xp, Dial::HeadingBug).await.unwrap_or(start);
             if (now - start).abs() < 0.5 {
                 break;
             }
         }
     }
-    let now = xp.get_float(HEADING_BUG).await.unwrap_or(start);
+    let now = autoflight::read_dial(xp, Dial::HeadingBug).await.unwrap_or(start);
     let err = crate::angles::abs_diff_deg(leg, now);
     if err > 1.5 {
         // Knob path didn't get there — direct write as the fallback (straight
         // to the FULL target: a dataref write is one round trip, no cap needed).
-        let _ = xp.set_float(HEADING_BUG, target).await;
+        let _ = autoflight::set_dial(xp, Dial::HeadingBug, target).await;
     }
-    xp.get_float(HEADING_BUG).await.unwrap_or(target)
+    autoflight::read_dial(xp, Dial::HeadingBug).await.unwrap_or(target)
 }
 
 /// Read the servo status as a bool ("is the autopilot actually flying").
@@ -366,7 +368,7 @@ async fn engage_ap(ctx: &ToolCtx<'_>, cfg: &ApConfig) -> Result<()> {
     for c in &cfg.fd_commands {
         ctx.xplane.run_command(c).await?;
     }
-    ctx.xplane.run_command(CMD_SERVOS_ON).await?;
+    autoflight::press(ctx.xplane, Button::Engage).await?;
     Ok(())
 }
 
@@ -397,9 +399,9 @@ async fn mode_engaged(ctx: &ToolCtx<'_>, status: &str) -> bool {
 /// are toggles, so pressing one whose mode is already active turns it back OFF —
 /// which is why a second "set vertical speed" (or heading, or altitude) in a row
 /// would silently drop the mode. Check the status first; only press when off.
-async fn engage_mode(ctx: &ToolCtx<'_>, status: &str, command: &str) -> Result<()> {
+async fn engage_mode(ctx: &ToolCtx<'_>, status: &str, button: Button) -> Result<()> {
     if !mode_engaged(ctx, status).await {
-        ctx.xplane.run_command(command).await?;
+        autoflight::press(ctx.xplane, button).await?;
     }
     Ok(())
 }
@@ -597,7 +599,7 @@ async fn fly_to(
 
     // Diagnostic: dump what the AP actually latched so a flight test shows the
     // truth (did VS engage? is the dial holding our rate? did ALT hold sneak on?).
-    let vs_dial = ctx.xplane.get_float(VS_DIAL).await.unwrap_or(f64::NAN);
+    let vs_dial = autoflight::read_dial(ctx.xplane, Dial::Vs).await.unwrap_or(f64::NAN);
     let vs_mode = mode_engaged(ctx, VS_STATUS).await;
     let alt_hold_mode = mode_engaged(ctx, ALT_HOLD_STATUS).await;
     tracing::info!(
@@ -630,14 +632,14 @@ async fn arm_altitude(
 ) -> Result<(&'static str, f64, Option<bool>, bool)> {
     let current = ctx.xplane.get_float(CURRENT_ALT).await.unwrap_or(altitude);
     let diff = altitude - current;
-    ctx.xplane.run_command(CMD_SERVOS_ON).await?;
+    autoflight::press(ctx.xplane, Button::Engage).await?;
 
     if diff.abs() <= ALT_CAPTURE_BAND_FT {
         // HOLD: we're already at it. Capture the current altitude now — this is the
         // one case where `altitude_hold` is right (hold where you are).
         let hold = (current / 100.0).round() * 100.0;
-        engage_mode(ctx, ALT_HOLD_STATUS, CMD_ALT_HOLD).await?;
-        ctx.xplane.set_float(ALT_DIAL, hold).await?;
+        engage_mode(ctx, ALT_HOLD_STATUS, Button::AltitudeHold).await?;
+        autoflight::set_dial(ctx.xplane, Dial::Altitude, hold).await?;
         return Ok(("Holding at", 0.0, None, false));
     }
 
@@ -654,9 +656,9 @@ async fn arm_altitude(
         .map(f64::abs)
         .unwrap_or_else(|| auto_vs_fpm(diff, climb, max_climb_fpm));
     let signed = if climb { mag } else { -mag };
-    ctx.xplane.set_float(ALT_DIAL, altitude).await?;
-    engage_mode(ctx, VS_STATUS, CMD_VS_MODE).await?;
-    ctx.xplane.set_float(VS_DIAL, signed).await?;
+    autoflight::set_dial(ctx.xplane, Dial::Altitude, altitude).await?;
+    engage_mode(ctx, VS_STATUS, Button::VerticalSpeed).await?;
+    autoflight::set_dial(ctx.xplane, Dial::Vs, signed).await?;
     // A climb needs power — the AP pitches up to hold VS, and on cruise power a 172
     // just bleeds airspeed. Full throttle for the climb; the watcher settles it at
     // capture. A running speed governor already owns the throttle and adds the
@@ -766,7 +768,7 @@ fn capture_at_altitude(
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20 * 60);
             // The commanded climb rate — the ceiling the airspeed protection won't
             // exceed when it restores the climb after backing off.
-            let initial_vs = xp.get_float(VS_DIAL).await.unwrap_or(0.0);
+            let initial_vs = autoflight::read_dial(&xp, Dial::Vs).await.unwrap_or(0.0);
             let mut eased_for_speed = false;
             while std::time::Instant::now() < deadline {
                 // A newer command was issued (it owns the level-off now), or a
@@ -778,7 +780,7 @@ fn capture_at_altitude(
                 // current altitude (are we there yet?) to decide; a dropped read just
                 // retries next tick.
                 let (Ok(dial), Ok(alt)) = (
-                    xp.get_float(ALT_DIAL).await,
+                    autoflight::read_dial(&xp, Dial::Altitude).await,
                     xp.get_float(CURRENT_ALT).await,
                 ) else {
                     tokio::time::sleep(std::time::Duration::from_secs(3)).await;
@@ -806,14 +808,14 @@ fn capture_at_altitude(
                         // hold so the AP holds here instead of flying through in VS.
                         // Idempotent (the command is a toggle): if the AP already
                         // captured on its own, leave it engaged.
-                        let _ = xp.set_float(ALT_DIAL, target).await;
+                        let _ = autoflight::set_dial(&xp, Dial::Altitude, target).await;
                         let held = xp
                             .get_float(ALT_HOLD_STATUS)
                             .await
                             .map(|v| v > 0.5)
                             .unwrap_or(false);
                         if !held {
-                            let _ = xp.run_command(CMD_ALT_HOLD).await;
+                            let _ = autoflight::press(&xp, Button::AltitudeHold).await;
                         }
                         // Settle a firewalled climb's power, but only if the
                         // throttle is still where we left it (full). If the pilot took
@@ -903,9 +905,9 @@ fn capture_at_altitude(
                                     crate::aircraft::speed_floor_kts(),
                                     crate::tools::speedhold::flight_target(),
                                 );
-                                let cur = xp.get_float(VS_DIAL).await.unwrap_or(initial_vs);
+                                let cur = autoflight::read_dial(&xp, Dial::Vs).await.unwrap_or(initial_vs);
                                 if (want - cur).abs() >= VS_TRIM_FPM - 1.0 {
-                                    let _ = xp.set_float(VS_DIAL, want).await;
+                                    let _ = autoflight::set_dial(&xp, Dial::Vs, want).await;
                                     crate::blackbox::record(
                                         "autopilot",
                                         serde_json::json!({"event": "climb_protect",
@@ -1036,9 +1038,9 @@ impl Tool for SetHeading {
         for c in &self.cfg.fd_commands {
             ctx.xplane.run_command(c).await?;
         }
-        engage_mode(ctx, HEADING_STATUS, CMD_HEADING_MODE).await?;
+        engage_mode(ctx, HEADING_STATUS, Button::Heading).await?;
         let actual = drive_heading_bug(ctx.xplane, heading).await;
-        ctx.xplane.run_command(CMD_SERVOS_ON).await?;
+        autoflight::press(ctx.xplane, Button::Engage).await?;
         if servos_engaged(ctx).await? {
             Ok(format!(
                 "Roger — autopilot engaged, heading mode, bug to {}.",
@@ -1089,12 +1091,12 @@ impl Tool for Navigate {
         // The MD-82 (and other study FMS aircraft) only fly the loaded route under
         // GPSS. Engage GPSS first; fall back to NAV for any AP that tracks the GPS
         // under NAV instead (keeps the simpler GA setups working).
-        ctx.xplane.run_command(CMD_HSI_GPS).await?;
+        autoflight::press(ctx.xplane, Button::HsiGps).await?;
         engage_ap(ctx, &self.cfg).await?;
-        engage_mode(ctx, GPSS_STATUS, CMD_GPSS).await?;
+        engage_mode(ctx, GPSS_STATUS, Button::Gpss).await?;
         let mut lnav = mode_engaged(ctx, GPSS_STATUS).await;
         if !lnav {
-            engage_mode(ctx, NAV_STATUS, CMD_NAV_MODE).await?;
+            engage_mode(ctx, NAV_STATUS, Button::Nav).await?;
             lnav = mode_engaged(ctx, NAV_STATUS).await;
         }
 
@@ -1253,9 +1255,9 @@ impl Tool for LevelOff {
         }
 
         engage_ap(ctx, &self.cfg).await?;
-        ctx.xplane.run_command(CMD_WING_LEVELER).await?;
-        engage_mode(ctx, ALT_HOLD_STATUS, CMD_ALT_HOLD).await?;
-        ctx.xplane.set_float(ALT_DIAL, target).await?;
+        autoflight::press(ctx.xplane, Button::WingLeveler).await?;
+        engage_mode(ctx, ALT_HOLD_STATUS, Button::AltitudeHold).await?;
+        autoflight::set_dial(ctx.xplane, Dial::Altitude, target).await?;
         // Settle to cruise power. Intentional even though it overrides the pilot's
         // throttle: the only power that *holds* an altitude on a 172 is ~cruise, and
         // the pre-level-off setting is by definition not a hold power (full from a
@@ -1362,12 +1364,12 @@ impl Tool for SetVerticalSpeed {
         // toggle, so guard it: a repeat VS command must not switch the mode back
         // off (which would leave the dial holding a value the AP isn't flying).
         engage_ap(ctx, &self.cfg).await?;
-        engage_mode(ctx, VS_STATUS, CMD_VS_MODE).await?;
-        ctx.xplane.set_float(VS_DIAL, fpm).await?;
+        engage_mode(ctx, VS_STATUS, Button::VerticalSpeed).await?;
+        autoflight::set_dial(ctx.xplane, Dial::Vs, fpm).await?;
 
         // Confirm the actual state, not the intent: both that the servos are
         // flying and that VS mode actually latched.
-        let actual = ctx.xplane.get_float(VS_DIAL).await?;
+        let actual = autoflight::read_dial(ctx.xplane, Dial::Vs).await?;
         let phrase = describe_vs(actual);
         match (
             servos_engaged(ctx).await?,
@@ -1529,7 +1531,7 @@ impl Tool for AutopilotOff {
         if !servos_engaged(ctx).await? {
             return Ok("Autopilot's already off.".to_string());
         }
-        ctx.xplane.run_command(CMD_SERVOS_OFF).await?;
+        autoflight::press(ctx.xplane, Button::Disconnect).await?;
         if servos_engaged(ctx).await? {
             Ok("The autopilot didn't disengage — disconnect it manually.".to_string())
         } else {
@@ -1553,12 +1555,11 @@ fn describe_vs(fpm: f64) -> String {
 // ---- airliner autoflight (jets): speed select + autothrottle -----------------
 
 /// The AP airspeed select (standard X-Plane AP dataref).
-const AIRSPEED_DIAL: &str = "sim/cockpit2/autopilot/airspeed_dial_kts";
 /// MD-82 autothrottle: a custom on/off switch (arm) driven by a toggle command;
 /// engaging into the detent needs an EPR thrust rating selected then EPR_lim, which
 /// clamps autothrottle_enabled to a holding mode (needs the flight director on).
 const AT_SWITCH: &str = "laminar/md82/autopilot/autothrottle_switch";
-const AT_ENABLED: &str = "sim/cockpit2/autopilot/autothrottle_enabled"; // 0 arm, 1 speed, 2 EPR
+const AT_ENABLED: &str = autoflight::names::AT_MODE; // 0 arm, 1 speed, 2 EPR
 const CMD_AT_TOGGLE: &str = "laminar/md82cmd/autopilot/autothrottle_switch";
 const CMD_EPR_CLIMB: &str = "laminar/md82cmd/autopilot/EPR_CL"; // select climb thrust rating
 const CMD_EPR_ENGAGE: &str = "laminar/md82cmd/autopilot/EPR_lim"; // engage EPR mode (clamp)
@@ -1624,14 +1625,14 @@ impl Tool for SetSpeed {
                 }
             }
         } else if let Some(d) = a.delta {
-            let current = ctx.xplane.get_float(AIRSPEED_DIAL).await?;
+            let current = autoflight::read_dial(ctx.xplane, Dial::AirspeedKts).await?;
             (current + d, String::new())
         } else {
             return Ok("Say a speed in knots, or 'speed for landing'.".to_string());
         };
         let kts = kts.clamp(80.0, 400.0);
-        ctx.xplane.set_float(AIRSPEED_DIAL, kts).await?;
-        let actual = ctx.xplane.get_float(AIRSPEED_DIAL).await.unwrap_or(kts);
+        autoflight::set_dial(ctx.xplane, Dial::AirspeedKts, kts).await?;
+        let actual = autoflight::read_dial(ctx.xplane, Dial::AirspeedKts).await.unwrap_or(kts);
         Ok(format!("Speed bug {actual:.0} knots{why}."))
     }
 }

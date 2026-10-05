@@ -21,6 +21,7 @@
 //! `"kind":"full_auto"`. EXPERIMENTAL: eight subsystems in a chain — fly it
 //! VMC, hand ready, and mine the blackbox after.
 
+use crate::autoflight::{self, Button, Dial};
 use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
 use std::time::{Duration, Instant};
 
@@ -32,7 +33,6 @@ use crate::voice::{Priority, Voice};
 use crate::xplane::XPlaneClient;
 
 const ENGN_RUNNING: &str = "sim/flightmodel/engine/ENGN_running";
-const VS_DIAL: &str = "sim/cockpit/autopilot/vertical_velocity";
 /// Throttle a mission give-up hands the aircraft back with — autoland's own
 /// number, for the same reason: enough to hold level flight dirty.
 const GIVE_UP_THROTTLE: f64 = 0.75;
@@ -3720,8 +3720,8 @@ async fn fly_route(
             let hold_ft = (alt_msl_ft.max(msa + 500.0) / 500.0).ceil() * 500.0;
             let thr = crate::aircraft::throttle_dataref();
             let _ = tokio::join!(
-                xp.set_float("sim/cockpit2/autopilot/altitude_dial_ft", hold_ft),
-                xp.set_float(VS_DIAL, if alt_msl_ft < hold_ft { 1000.0 } else { 0.0 }),
+                autoflight::set_dial(xp, Dial::Altitude, hold_ft),
+                autoflight::set_dial(xp, Dial::Vs, if alt_msl_ft < hold_ft { 1000.0 } else { 0.0 }),
                 xp.set_float(&thr, GIVE_UP_THROTTLE),
             );
             event(
@@ -3822,7 +3822,7 @@ async fn fly_route(
         let thr = crate::aircraft::throttle_dataref();
         let _ = tokio::join!(
             xp.set_float(&thr, GIVE_UP_THROTTLE),
-            xp.set_float(VS_DIAL, 0.0),
+            autoflight::set_dial(xp, Dial::Vs, 0.0),
         );
         give_up(
             xp,
@@ -4130,8 +4130,8 @@ async fn read_airborne_look(xp: &XPlaneClient) -> AirborneLook {
     let (servos, hdg, vs, alt, vvi, pitch, bank, ias) = tokio::join!(
         xp.get_float(crate::datarefs::SERVOS_ON),
         xp.get_float(crate::datarefs::HEADING_STATUS),
-        xp.get_float("sim/cockpit2/autopilot/vvi_status"),
-        xp.get_float("sim/cockpit2/autopilot/altitude_hold_status"),
+        xp.get_float(autoflight::names::VS_STATUS),
+        xp.get_float(autoflight::names::ALT_HOLD_STATUS),
         xp.get_float("sim/flightmodel/position/vh_ind_fpm"),
         xp.get_float("sim/flightmodel/position/theta"),
         xp.get_float("sim/flightmodel/position/phi"),
@@ -4227,14 +4227,14 @@ async fn hold_airborne_end(xp: &XPlaneClient, base_url: &str, voice: &Option<Voi
         .await;
     }
     if look.hdg_status.is_some_and(|v| v < 0.5) {
-        let _ = xp.run_command("sim/autopilot/heading").await;
+        let _ = autoflight::press(xp, Button::Heading).await;
     }
     let alt_held = look.alt_hold_status.is_some_and(|v| v > 0.5);
     if !alt_held {
         if look.vs_status.is_some_and(|v| v < 0.5) {
-            let _ = xp.run_command("sim/autopilot/vertical_speed").await;
+            let _ = autoflight::press(xp, Button::VerticalSpeed).await;
         }
-        let _ = xp.set_float(VS_DIAL, 0.0).await;
+        let _ = autoflight::set_dial(xp, Dial::Vs, 0.0).await;
     }
     let t0 = Instant::now();
     let mut look = read_airborne_look(xp).await;

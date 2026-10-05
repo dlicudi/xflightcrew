@@ -11,6 +11,7 @@
 //! clamped) — it needs in-sim tuning and should be tested with altitude to spare.
 //! The pilot takes it back instantly with "my controls" (cancels its run, [`RUN`]).
 
+use crate::autoflight::{self, Button, Dial};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::Result;
@@ -46,17 +47,13 @@ const STALL_RATIO: &str = "sim/cockpit2/annunciators/stall_warning_ratio"; // 0.
 const ELEV_TRIM: &str = "sim/cockpit2/controls/elevator_trim"; // -1 nose down .. +1 nose up
 
 // --- AP handoff (mirror of autopilot.rs constants) ---
-const CMD_SERVOS_ON: &str = "sim/autopilot/servos_on";
-const CMD_HEADING_MODE: &str = "sim/autopilot/heading";
-const CMD_ALT_HOLD: &str = "sim/autopilot/altitude_hold";
-const ALT_DIAL: &str = "sim/cockpit2/autopilot/altitude_dial_ft";
 const CURRENT_ALT: &str = "sim/cockpit2/gauges/indicators/altitude_ft_pilot";
 /// The shared gauge name: the local spelling `compass_heading_deg_magnetic`
 /// does not exist in X-Plane 12, so every read failed and the bug after a
 /// recovery went to ZERO (the `unwrap_or`), turning the aircraft north.
 const CURRENT_HDG: &str = crate::datarefs::COMPASS_HEADING_DEG;
-const HEADING_STATUS: &str = "sim/cockpit2/autopilot/heading_status";
-const ALT_HOLD_STATUS: &str = "sim/cockpit2/autopilot/altitude_hold_status";
+const HEADING_STATUS: &str = autoflight::names::HDG_STATUS;
+const ALT_HOLD_STATUS: &str = autoflight::names::ALT_HOLD_STATUS;
 
 /// Cruise power to settle at after recovery; firewall power while unstalling.
 const CRUISE_THROTTLE: f64 = 0.6;
@@ -385,7 +382,7 @@ const PITCH_FAILURES: [&str; 5] = [
 ];
 const OVR_AUTOPILOT: &str = "sim/operation/override/override_autopilot";
 /// The autopilot's vertical mode as X-Plane flies it (4 = vertical speed).
-const ALT_MODE: &str = "sim/cockpit2/autopilot/altitude_mode";
+const ALT_MODE: &str = autoflight::names::ALT_MODE;
 const CG_MAC: &str = "sim/flightmodel2/misc/cg_offset_z_mac";
 const WEIGHT: &str = "sim/flightmodel/weight/m_total";
 /// A failure dataref's "failed now".
@@ -548,9 +545,7 @@ const LEVEL_PITCH_DEG: f64 = 2.0;
 /// tick; the pilot's deflection yields them, `xcopilot/pitch_yield`).
 const CH_PITCH: &str = "xcopilot/pitch";
 const CH_ROLL: &str = "xcopilot/roll";
-const CMD_SERVOS_OFF: &str = "sim/autopilot/servos_off_any";
-const CMD_AP_OFF: &str = "sim/autopilot/servos_fdir_off";
-const SERVOS_ON: &str = crate::datarefs::SERVOS_ON;
+const SERVOS_ON: &str = autoflight::names::SERVOS_ON;
 const VVI: &str = "sim/cockpit2/gauges/indicators/vvi_fpm_pilot";
 
 /// What the recovery does once stable.
@@ -567,9 +562,9 @@ struct Handback {
 /// ours. `servos_off_any` first, the FD-off disconnect if it did not take.
 async fn servos_out(xp: &XPlaneClient) -> Option<f64> {
     if xp.get_float(SERVOS_ON).await.is_ok_and(|v| v > 0.5) {
-        let _ = xp.run_command(CMD_SERVOS_OFF).await;
+        let _ = autoflight::press(xp, Button::Disconnect).await;
         if xp.get_float(SERVOS_ON).await.is_ok_and(|v| v > 0.5) {
-            let _ = xp.run_command(CMD_AP_OFF).await;
+            let _ = autoflight::press(xp, Button::DisconnectFd).await;
         }
     }
     xp.get_float(SERVOS_ON).await.ok()
@@ -793,9 +788,9 @@ fn run_recovery(
                 for c in &fd_commands {
                     let _ = xp.run_command(c).await;
                 }
-                let _ = xp.run_command(CMD_SERVOS_ON).await;
+                let _ = autoflight::press(&xp, Button::Engage).await;
                 if xp.get_float(HEADING_STATUS).await.unwrap_or(0.0) <= 0.5 {
-                    let _ = xp.run_command(CMD_HEADING_MODE).await;
+                    let _ = autoflight::press(&xp, Button::Heading).await;
                 }
                 // No compass read, no bug write: a heading of "zero" is a turn
                 // north, not a hold, and heading mode keeps whatever is dialled.
@@ -805,9 +800,9 @@ fn run_recovery(
                 }
                 let alt = xp.get_float(CURRENT_ALT).await.unwrap_or(0.0);
                 let hold = (alt / 100.0).round() * 100.0;
-                let _ = xp.set_float(ALT_DIAL, hold).await;
+                let _ = autoflight::set_dial(&xp, Dial::Altitude, hold).await;
                 if xp.get_float(ALT_HOLD_STATUS).await.unwrap_or(0.0) <= 0.5 {
-                    let _ = xp.run_command(CMD_ALT_HOLD).await;
+                    let _ = autoflight::press(&xp, Button::AltitudeHold).await;
                 }
                 if handback.hold_kts.is_none() {
                     let _ = xp.set_float(&throttle_dref(), CRUISE_THROTTLE).await;

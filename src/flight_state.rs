@@ -61,7 +61,6 @@ pub(crate) fn publish_airframe(p: &AircraftProfile) {
     crate::autotakeoff::publish_gear_warning(p.gear_warning);
     crate::tools::signs::publish(p.seat_belt_signs.clone(), p.cabin_crew);
     crate::circuit::publish_ap_altitude_capture(p.ap_altitude_capture);
-    crate::autoland::publish_approach_config(p.alt_dial_park_field, p.landing_flap_lead_nm);
     crate::tools::lights::publish_exterior(&p.lights);
     crate::aircraft::publish_throttle_dataref(p.throttle_dataref.clone());
     crate::aircraft::publish_config_limits(p.vlo_kts, p.flaps.as_ref());

@@ -44,6 +44,12 @@ pub(crate) const I: bool = true; // integer dataref
 /// than set values (engine start, pushback, gyro align) have no entry; engine
 /// shutdown is undone by an inverse command instead (see the capture loop). Kept
 /// here, next to the undo logic, rather than in each tool: undo is a loop-level
+// The autopilot dials a revert restores, by name: the revert itself goes
+// back through the panel's owner (`autoflight::dial_named`, main's undo).
+const UNDO_HDG_BUG: &str = crate::autoflight::Dial::HeadingBug.read_name();
+const UNDO_ALT_DIAL: &str = crate::autoflight::Dial::Altitude.read_name();
+const UNDO_VS_DIAL: &str = crate::autoflight::Dial::Vs.read_name();
+
 /// concern and this keeps it in one place.
 pub(crate) fn undoable_drefs(tool: &str) -> &'static [Undoable] {
     match tool {
@@ -75,21 +81,9 @@ pub(crate) fn undoable_drefs(tool: &str) -> &'static [Undoable] {
             "the parking brake",
             F,
         )],
-        "set_heading" => &[(
-            "sim/cockpit2/autopilot/heading_dial_deg_mag_pilot",
-            "the heading bug",
-            F,
-        )],
-        "set_altitude" => &[(
-            "sim/cockpit2/autopilot/altitude_dial_ft",
-            "the altitude select",
-            F,
-        )],
-        "set_vertical_speed" | "set_climb" => &[(
-            "sim/cockpit/autopilot/vertical_velocity",
-            "vertical speed",
-            F,
-        )],
+        "set_heading" => &[(UNDO_HDG_BUG, "the heading bug", F)],
+        "set_altitude" => &[(UNDO_ALT_DIAL, "the altitude select", F)],
+        "set_vertical_speed" | "set_climb" => &[(UNDO_VS_DIAL, "vertical speed", F)],
         "set_transponder" => &[(
             "sim/cockpit2/radios/actuators/transponder_code",
             "the squawk",

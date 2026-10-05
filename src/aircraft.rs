@@ -192,6 +192,30 @@ pub struct AutoflightProfile {
     /// GPS steering / LNAV (`sim/autopilot/gpss`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lnav: Option<bool>,
+    /// The panel's own buttons, where the airframe has them
+    /// (`autoflight::Panel`): CMD A, HDG SEL, V/S and ALT HLD. `None` is the
+    /// stock command. The 737's xlua buttons fire the stock modes and keep
+    /// its MCP lamps and FMA honest; CMD B is never named (it dropped CMD A
+    /// live, LEMG 2026-10-05).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub engage_command: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub heading_command: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vs_command: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub altitude_hold_command: Option<String>,
+    /// What takes an ENGAGED autothrottle out to ARM when a loop flies the
+    /// levers; `None` is the stock `autothrottle_off` ("all modes off,
+    /// remain armed").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub autothrottle_off_command: Option<String>,
+    /// This MCP flies a V/S only TOWARD its altitude window (Boeing logic):
+    /// autoland parks the window at the field (`autoflight::WindowRule::
+    /// AtField`), toward every descent of the approach. Off: parked above
+    /// (the LEAX rule). Replaces `alt_dial_park_field` (89fe7a6).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub vs_toward_window: bool,
 }
 
 /// The flare's ELEVATOR law for this airframe (`autoland::FlareGains`): the
@@ -982,21 +1006,6 @@ pub struct AircraftProfile {
     /// hold, which is still unproven on the 737's MCP (history, 2026-09-19).
     #[serde(default)]
     pub ap_altitude_capture: bool,
-    /// Autoland parks the altitude dial at the FIELD (0 ft) instead of above
-    /// the aircraft. The stock 737's MCP will not fly a V/S descent away from
-    /// a window above it: parked at 5,600 over a 3,400 ft inbound, the VS
-    /// dial's -570 held level and both LEMG 13 finals arrived high
-    /// (2026-10-05); with the window at 0 the descent and the go-around
-    /// climb both followed the dial. Off: parked above (the LEAX rule).
-    #[serde(default)]
-    pub alt_dial_park_field: bool,
-    /// How far ahead of the stabilised gate the landing flap is selected,
-    /// nm (`autoland::landing_flap_nm`); `None` = the 1 nm default. The 737's
-    /// full flap pitched it up and its V/S gave -100 to -400 fpm against
-    /// -1,200 for 12 s at 3.5 nm (LEMG 13, 2026-10-05): the flap must be out
-    /// before the path is held.
-    #[serde(default)]
-    pub landing_flap_lead_nm: Option<f64>,
     /// ILS approach setup (`prepare_ils`) — needs a NAV radio + approach mode.
     #[serde(default)]
     pub ils: bool,
@@ -4143,8 +4152,6 @@ fn cessna_172sp() -> AircraftProfile {
         takeoff_power: None,
         seat_belt_signs: None,
         ap_altitude_capture: false,
-        alt_dial_park_field: false,
-        landing_flap_lead_nm: None,
         ils: true,
         parking_brake: true,
         cabin_crew: false,
@@ -4495,8 +4502,6 @@ fn cirrus_sr22() -> AircraftProfile {
         takeoff_power: None,
         seat_belt_signs: None,
         ap_altitude_capture: false,
-        alt_dial_park_field: false,
-        landing_flap_lead_nm: None,
         ils: true,
         parking_brake: true,
         cabin_crew: false,

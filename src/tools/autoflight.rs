@@ -15,7 +15,9 @@
 //!
 //! Level change and GPSS are TOGGLE commands: the status is read first and
 //! the command fired only when it differs (a toggle fired on a mode already
-//! in state turns it off). The autothrottle has real on/off commands.
+//! in state turns it off). The autothrottle has real on/off commands. Every
+//! button is the panel owner's ([`crate::autoflight::Button`]): this tool
+//! decides, the owner presses.
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -25,27 +27,33 @@ use serde_json::{json, Value};
 use super::{Tool, ToolCtx};
 use crate::systems::{ApMode, ModeCap};
 
+use crate::autoflight::{names, Button};
+
 /// Reads 1 while the stock autothrottle is actually driving the levers.
-const AT_ON: &str = "sim/cockpit2/autopilot/autothrottle_on";
-const CMD_AT_ON: &str = "sim/autopilot/autothrottle_on";
-const CMD_AT_OFF: &str = "sim/autopilot/autothrottle_off";
+const AT_ON: &str = names::AT_ON;
 /// Speed on the elevator: 0 off, 1 armed, 2 captured. Level change engages
 /// it (pitch for speed toward the altitude dial).
-const SPEED_STATUS: &str = "sim/cockpit2/autopilot/speed_status";
-const CMD_LEVEL_CHANGE: &str = "sim/autopilot/level_change";
+const SPEED_STATUS: &str = names::SPEED_STATUS;
 /// GPS steering: 0 off, 1 armed, 2 captured.
-const GPSS_STATUS: &str = "sim/cockpit2/autopilot/gpss_status";
-const CMD_GPSS: &str = "sim/autopilot/gpss";
+const GPSS_STATUS: &str = names::GPSS_STATUS;
 /// The servos: a pitch or roll mode needs the autopilot flying to mean
 /// anything, and a failed readback without them proves nothing.
-const SERVOS_ON: &str = "sim/cockpit2/autopilot/servos_on";
+const SERVOS_ON: &str = names::SERVOS_ON;
+#[cfg(test)]
+const CMD_AT_ON: &str = crate::autoflight::cmd::AT_ON;
+#[cfg(test)]
+const CMD_AT_OFF: &str = crate::autoflight::cmd::AT_OFF;
+#[cfg(test)]
+const CMD_LEVEL_CHANGE: &str = crate::autoflight::cmd::LEVEL_CHANGE;
+#[cfg(test)]
+const CMD_GPSS: &str = crate::autoflight::cmd::GPSS;
 
-/// One mode's switch: how it is read and fired.
+/// One mode's switch: how it is read and pressed.
 struct Switch {
     status: &'static str,
-    on: &'static str,
+    on: Button,
     /// `None`: `on` is a toggle.
-    off: Option<&'static str>,
+    off: Option<Button>,
     /// Needs the autopilot's servos in.
     needs_servos: bool,
 }
@@ -54,19 +62,19 @@ fn switch(mode: ApMode) -> Switch {
     match mode {
         ApMode::Autothrust => Switch {
             status: AT_ON,
-            on: CMD_AT_ON,
-            off: Some(CMD_AT_OFF),
+            on: Button::AutothrottleOn,
+            off: Some(Button::AutothrottleOff),
             needs_servos: false,
         },
         ApMode::LevelChange => Switch {
             status: SPEED_STATUS,
-            on: CMD_LEVEL_CHANGE,
+            on: Button::LevelChange,
             off: None,
             needs_servos: true,
         },
         ApMode::Lnav => Switch {
             status: GPSS_STATUS,
-            on: CMD_GPSS,
+            on: Button::Gpss,
             off: None,
             needs_servos: true,
         },
@@ -126,8 +134,9 @@ pub async fn engage(xp: &dyn crate::xplane::XPlane, mode: ApMode, on: bool) -> E
             Err(_) => return Engaged::Unread,
         }
     }
-    let cmd = if on { sw.on } else { sw.off.unwrap_or(sw.on) };
-    if xp.run_command(cmd).await.is_err() {
+    let button = if on { sw.on } else { sw.off.unwrap_or(sw.on) };
+    let cmd = crate::autoflight::panel().command(button).to_string();
+    if crate::autoflight::press(xp, button).await.is_err() {
         return Engaged::Unread;
     }
     tokio::time::sleep(std::time::Duration::from_millis(SETTLE_MS)).await;

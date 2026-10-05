@@ -13,6 +13,7 @@
 mod aircraft;
 mod answers;
 mod ap_engage;
+mod autoflight;
 mod approach_guide;
 mod audio;
 mod auto_status;
@@ -1552,8 +1553,7 @@ async fn run_session(
                     // Disengage the autopilot before resetting its dials — stop the
                     // aircraft flying the wrong thing first. servos_off_any is clean.
                     if snap.disengage_ap
-                        && xplane
-                            .run_command("sim/autopilot/servos_off_any")
+                        && autoflight::press(&xplane, autoflight::Button::Disconnect)
                             .await
                             .is_ok()
                     {
@@ -1574,6 +1574,9 @@ async fn run_session(
                                 .await,
                                 Ok(true)
                             )
+                        } else if let Some(d) = autoflight::dial_named(dr) {
+                            // An autopilot dial goes back through its owner.
+                            autoflight::set_dial(&xplane, d, *old).await.is_ok()
                         } else if *is_int {
                             xplane.set_int(dr, old.round() as i64).await.is_ok()
                         } else {

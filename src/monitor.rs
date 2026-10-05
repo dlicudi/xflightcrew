@@ -13,6 +13,7 @@
 //! running continuously and *speaking* instead of refusing. It never touches the
 //! controls. See `docs/monitoring.md`.
 
+use crate::autoflight::{self, Dial};
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
@@ -341,8 +342,7 @@ impl Snapshot {
             .get_float("sim/flightmodel/misc/h_ind")
             .await
             .unwrap_or(0.0);
-        let ap_alt_dial_ft = xp
-            .get_float("sim/cockpit2/autopilot/altitude_dial_ft")
+        let ap_alt_dial_ft = autoflight::read_dial(xp, Dial::Altitude)
             .await
             .ok();
         let baro_inhg = xp.get_float(BARO_KNOB).await.ok();
@@ -358,7 +358,7 @@ impl Snapshot {
         // 2026-10-04, duplicates #1).
         let automation_flying = crate::flight_state::crew_flying().is_some();
         let ap_servos_on = xp
-            .get_float("sim/cockpit2/autopilot/servos_on")
+            .get_float(autoflight::names::SERVOS_ON)
             .await
             .unwrap_or(0.0)
             > 0.5;
@@ -2685,7 +2685,7 @@ async fn read_inputs(xp: &crate::xplane::XPlaneClient, pitch_due: bool) -> Input
         xp.get_float("sim/joystick/yoke_pitch_ratio"),
         xp.get_float("sim/joystick/yoke_roll_ratio"),
         xp.get_float("sim/joystick/yoke_heading_ratio"),
-        xp.get_float("sim/cockpit2/autopilot/autopilot_on"),
+        xp.get_float(autoflight::names::AP_ON),
     );
     // The pitch channel rides alongside the second batch, never after it.
     let (
@@ -2694,7 +2694,7 @@ async fn read_inputs(xp: &crate::xplane::XPlaneClient, pitch_due: bool) -> Input
     ) = tokio::join!(
         async {
             tokio::join!(
-                xp.get_float("sim/cockpit/autopilot/autopilot_state"),
+                xp.get_float(autoflight::names::AP_STATE),
                 xp.get_float(crate::datarefs::WIND_DIR_DEG_TRUE),
                 xp.get_float(crate::datarefs::WIND_SPEED_MSC),
                 xp.get_float("sim/time/sim_speed"),

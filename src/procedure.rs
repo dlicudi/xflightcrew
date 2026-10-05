@@ -26,6 +26,7 @@
 //! EXPERIMENTAL and coarse (fix flyby, not RF arcs or holds); fly it VMC with a
 //! hand ready and mine `logs/blackbox.jsonl` (`"kind":"procedure"`) to tune.
 
+use crate::autoflight::{self, Button, Dial};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::autoland::true_to_mag;
@@ -53,17 +54,16 @@ const IAS: &str = "sim/flightmodel/position/indicated_airspeed";
 const GS_MS: &str = "sim/flightmodel/position/groundspeed";
 const MS_TO_KTS: f64 = 1.943_84;
 // AP surface (mirror of autopilot.rs / autoland.rs / circuit.rs).
-const CMD_HDG_MODE: &str = "sim/autopilot/heading";
-const CMD_VS_MODE: &str = "sim/autopilot/vertical_speed";
-const VS_DIAL: &str = "sim/cockpit/autopilot/vertical_velocity";
+#[cfg(test)]
+const VS_DIAL: &str = Dial::Vs.read_name();
 const GEAR_HANDLE: &str = "sim/cockpit2/controls/gear_handle_down";
 const FLAP_RATIO: &str = "sim/cockpit2/controls/flap_ratio";
-const VS_STATUS: &str = "sim/cockpit2/autopilot/vvi_status";
+const VS_STATUS: &str = autoflight::names::VS_STATUS;
 /// 0 off, 1 armed, 2 holding (the capture included).
-const ALT_HOLD_STATUS: &str = "sim/cockpit2/autopilot/altitude_hold_status";
-const ALT_DIAL: &str = "sim/cockpit2/autopilot/altitude_dial_ft";
-const HDG_BUG: &str = "sim/cockpit2/autopilot/heading_dial_deg_mag_pilot";
-const HDG_STATUS: &str = "sim/cockpit2/autopilot/heading_status";
+const ALT_HOLD_STATUS: &str = autoflight::names::ALT_HOLD_STATUS;
+#[cfg(test)]
+const ALT_DIAL: &str = Dial::Altitude.read_name();
+const HDG_STATUS: &str = autoflight::names::HDG_STATUS;
 
 const M_TO_FT: f64 = 3.280_84;
 
@@ -2944,7 +2944,7 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, plan: Pla
     let mut bug_mag = true_to_mag(psi_seed, mag_var);
     let mut heading_hold = HeadingHold::default();
     let started = std::time::Instant::now();
-    if !set_confirmed("procedure", &xp, HDG_BUG, bug_mag, &mut None, 0.0).await {
+    if !autoflight::set_dial_confirmed("procedure", &xp, Dial::HeadingBug, bug_mag, &mut None, 0.0).await {
         stand_down(
             &voice,
             "Heading selection failed. Your aircraft.",
@@ -2958,7 +2958,7 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, plan: Pla
     let ap_fd = crate::ap_engage::fd_commands();
     crate::ap_engage::press_logged(&xp, &ap_fd, "procedure", "seed", 1).await;
     if xp.get_float(HDG_STATUS).await.is_ok_and(|v| v <= 0.5) {
-        let _ = xp.run_command(CMD_HDG_MODE).await;
+        let _ = autoflight::press(&xp, Button::Heading).await;
     }
     let mut servo_watch = crate::ap_engage::ServoWatch::default();
     // What we COMMANDED last tick, a different thing from the leg constraint
@@ -3753,7 +3753,7 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, plan: Pla
                     }),
                 );
                 let heading = true_to_mag(psi, mag_var);
-                if xp.set_float(HDG_BUG, heading).await.is_ok() {
+                if autoflight::set_dial(&xp, Dial::HeadingBug, heading).await.is_ok() {
                     bug_mag = heading;
                 }
                 heading_hold.reset();
@@ -3765,7 +3765,7 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, plan: Pla
                     );
                     continue;
                 }
-                let _ = xp.set_float(VS_DIAL, 0.0).await;
+                let _ = autoflight::set_dial(&xp, Dial::Vs, 0.0).await;
                 stand_down(
                     &voice,
                     "Not closing on the next fix. Your aircraft.",
@@ -3779,7 +3779,7 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, plan: Pla
             // Keyed by the phase too: a new intercept, course or pattern leg
             // is set at once, corrections inside one wait (`HeadingHold`).
             if let Some(h) = heading_hold.decide(steer.key(idx), t, true_to_mag(psi, mag_var), phi, now_s) {
-                if xp.set_float(HDG_BUG, h).await.is_ok() {
+                if autoflight::set_dial(&xp, Dial::HeadingBug, h).await.is_ok() {
                     bug_mag = h;
                     crate::blackbox::record(
                         "procedure",
@@ -3811,7 +3811,7 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, plan: Pla
             crate::ap_engage::record_engaged("procedure", "lateral", st.try_n);
         }
         if hdg_st <= 0.5 {
-            let _ = xp.run_command(CMD_HDG_MODE).await;
+            let _ = autoflight::press(&xp, Button::Heading).await;
             crate::blackbox::record(
                 "procedure",
                 serde_json::json!({"event": "reengage_lateral", "idx": idx}),
@@ -4097,10 +4097,10 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, plan: Pla
             held,
             path.and(leg.alt1_ft),
         );
-        if !set_confirmed(
+        if !autoflight::set_dial_confirmed(
             "procedure",
             &xp,
-            ALT_DIAL,
+            Dial::Altitude,
             dial,
             &mut last_alt_dial,
             50.0,
@@ -4281,7 +4281,7 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, plan: Pla
         };
         if action == VsAction::Engage {
             last_vs_cmd = None; // engage can sync the dial even if the response is lost
-            if xp.run_command(CMD_VS_MODE).await.is_err() {
+            if autoflight::press(&xp, Button::VerticalSpeed).await.is_err() {
                 continue;
             }
             if xp.get_float(VS_STATUS).await.is_ok_and(|v| v > 0.5) {
@@ -4376,7 +4376,9 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, plan: Pla
         // same twitching the heading bug did (2026-09-26).
         let vs_cmd = vs_dial_fpm(vs_cmd);
         if action == VsAction::Write {
-            if !set_confirmed("procedure", &xp, VS_DIAL, vs_cmd, &mut last_vs_cmd, 50.0).await {
+            if !autoflight::set_dial_confirmed("procedure", &xp, Dial::Vs, vs_cmd, &mut last_vs_cmd, 50.0)
+                .await
+            {
                 continue;
             }
         } else {

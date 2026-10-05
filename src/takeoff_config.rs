@@ -15,6 +15,7 @@
 //! gear. Each item is read first and left alone when it is already in state,
 //! read back after the write, and named when it did not take.
 
+use crate::autoflight::{self, Button, Dial};
 use crate::aircraft::TakeoffConfigProfile;
 use crate::xplane::XPlane;
 use std::sync::Mutex;
@@ -26,16 +27,24 @@ pub(crate) const FLAP_DEPLOY: &str = "sim/cockpit2/controls/flap_handle_deploy_r
 const SPEEDBRAKE: &str = TakeoffConfigProfile::SPEEDBRAKE;
 /// 0 RTO, 1 off, 2..5 the landing levels.
 const AUTOBRAKE: &str = TakeoffConfigProfile::AUTOBRAKE;
-const ALT_DIAL: &str = "sim/cockpit2/autopilot/altitude_dial_ft";
+#[cfg(test)]
+const ALT_DIAL: &str = Dial::Altitude.read_name();
 const GROUNDSPEED_MS: &str = "sim/flightmodel/position/groundspeed";
 /// The stock autoflight names: one list, the profile probe's
 /// ([`TakeoffConfigProfile::references`]).
-const FD_MODE: &str = TakeoffConfigProfile::FD_MODE;
-const CMD_FD_ON: &str = TakeoffConfigProfile::CMD_FD_ON;
-const AT_MODE: &str = TakeoffConfigProfile::AT_MODE;
-const CMD_AT_ARM: &str = TakeoffConfigProfile::CMD_AT_ARM;
-const CMD_AT_OFF: &str = TakeoffConfigProfile::CMD_AT_OFF;
-const SPEED_WINDOW: &str = TakeoffConfigProfile::SPEED_WINDOW;
+// The autoflight half is the panel owner's (`crate::autoflight`): read
+// through its names, pressed and written through it. `TakeoffConfigProfile`
+// keeps the same names for the profile probe.
+const FD_MODE: &str = autoflight::names::FD_MODE;
+const AT_MODE: &str = autoflight::names::AT_MODE;
+#[cfg(test)]
+const CMD_FD_ON: &str = autoflight::cmd::FD_ON;
+#[cfg(test)]
+const CMD_AT_ARM: &str = autoflight::cmd::AT_ARM;
+#[cfg(test)]
+const CMD_AT_OFF: &str = autoflight::cmd::AT_OFF;
+#[cfg(test)]
+const SPEED_WINDOW: &str = Dial::Airspeed.read_name();
 /// A speed window this close to V2 already shows it.
 const V2_TOLERANCE_KTS: f64 = 1.0;
 
@@ -218,11 +227,10 @@ pub async fn set_for_takeoff(
         .await
         .ok()
         .map(|m| m * 3.280_84);
-    if let (Ok(dial), Some(elev)) = (xp.get_float(ALT_DIAL).await, elev_ft) {
+    if let (Ok(dial), Some(elev)) = (autoflight::read_dial(xp, Dial::Altitude).await, elev_ft) {
         if let Some(want) = initial_altitude_ft(dial, elev, level_ft) {
-            let ok = xp.set_float(ALT_DIAL, want).await.is_ok()
-                && xp
-                    .get_float(ALT_DIAL)
+            let ok = autoflight::set_dial(xp, Dial::Altitude, want).await.is_ok()
+                && autoflight::read_dial(xp, Dial::Altitude)
                     .await
                     .is_ok_and(|v| (v - want).abs() <= 50.0);
             if ok {
@@ -377,7 +385,7 @@ pub async fn set_for_landing(xp: &dyn XPlane) -> Outcome {
 async fn flight_directors_on(xp: &dyn XPlane, out: &mut Outcome) {
     match xp.get_float(FD_MODE).await {
         Ok(at) if at < 0.5 => {
-            let ok = xp.run_command(CMD_FD_ON).await.is_ok()
+            let ok = autoflight::press(xp, Button::FlightDirectorOn).await.is_ok()
                 && xp.get_float(FD_MODE).await.is_ok_and(|v| v >= 0.5);
             if ok {
                 out.set.push("flight directors on".into());
@@ -391,17 +399,17 @@ async fn flight_directors_on(xp: &dyn XPlane, out: &mut Outcome) {
 }
 
 /// What the autothrottle arm owes: `None` in state (armed, no mode),
-/// `Some(command)` to fire. An ENGAGED mode is taken out to armed, since the
+/// `Some(button)` to press. An ENGAGED mode is taken out to armed, since the
 /// takeoff owns the thrust levers (one writer per dataref); hard off is
 /// armed. Pure.
-pub fn autothrottle_step(mode: f64) -> Option<&'static str> {
+pub fn autothrottle_step(mode: f64) -> Option<Button> {
     if !mode.is_finite() {
         return None;
     }
     match mode.round() as i64 {
         0 => None,
-        m if m < 0 => Some(CMD_AT_ARM),
-        _ => Some(CMD_AT_OFF),
+        m if m < 0 => Some(Button::AutothrottleArm),
+        _ => Some(Button::AutothrottleOff),
     }
 }
 
@@ -419,7 +427,7 @@ pub async fn autothrottle_off(xp: &dyn XPlane) -> Option<bool> {
     if !autothrottle_engaged(mode) {
         return None;
     }
-    let _ = xp.run_command(CMD_AT_OFF).await;
+    let _ = autoflight::press(xp, Button::AutothrottleOff).await;
     let out = xp
         .get_float(AT_MODE)
         .await
@@ -434,8 +442,8 @@ pub async fn autothrottle_off(xp: &dyn XPlane) -> Option<bool> {
 async fn autothrottle_armed(xp: &dyn XPlane, out: &mut Outcome) {
     match xp.get_float(AT_MODE).await {
         Ok(at) => {
-            if let Some(cmd) = autothrottle_step(at) {
-                let ok = xp.run_command(cmd).await.is_ok()
+            if let Some(button) = autothrottle_step(at) {
+                let ok = autoflight::press(xp, button).await.is_ok()
                     && xp
                         .get_float(AT_MODE)
                         .await
@@ -454,11 +462,10 @@ async fn autothrottle_armed(xp: &dyn XPlane, out: &mut Outcome) {
 /// V2 in the MCP speed window: read, written only when it shows something
 /// else, read back against V2.
 async fn speed_window_v2(xp: &dyn XPlane, v2: f64, out: &mut Outcome) {
-    match xp.get_float(SPEED_WINDOW).await {
+    match autoflight::read_dial(xp, Dial::Airspeed).await {
         Ok(at) if (at - v2).abs() > V2_TOLERANCE_KTS => {
-            let ok = xp.set_float(SPEED_WINDOW, v2).await.is_ok()
-                && xp
-                    .get_float(SPEED_WINDOW)
+            let ok = autoflight::set_dial(xp, Dial::Airspeed, v2).await.is_ok()
+                && autoflight::read_dial(xp, Dial::Airspeed)
                     .await
                     .is_ok_and(|v| (v - v2).abs() <= V2_TOLERANCE_KTS);
             if ok {
@@ -841,9 +848,9 @@ mod tests {
     #[test]
     fn the_autothrottle_is_armed_never_engaged() {
         assert_eq!(autothrottle_step(0.0), None);
-        assert_eq!(autothrottle_step(-1.0), Some(CMD_AT_ARM));
-        assert_eq!(autothrottle_step(1.0), Some(CMD_AT_OFF));
-        assert_eq!(autothrottle_step(2.0), Some(CMD_AT_OFF));
+        assert_eq!(autothrottle_step(-1.0), Some(Button::AutothrottleArm));
+        assert_eq!(autothrottle_step(1.0), Some(Button::AutothrottleOff));
+        assert_eq!(autothrottle_step(2.0), Some(Button::AutothrottleOff));
         assert_eq!(autothrottle_step(f64::NAN), None);
     }
 

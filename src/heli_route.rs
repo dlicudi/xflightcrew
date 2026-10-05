@@ -26,6 +26,7 @@
 //! - **Arrive** on the hover loop: a final at 6 degrees to the helipad nearest
 //!   the inbound fix, the speed tapering to stop over it, then down.
 
+use crate::autoflight::{self, Button, Dial};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
@@ -1390,8 +1391,8 @@ fn obey_handoffs(base_url: &str, voice: &Option<Voice>, climb_to_ft: f64) {
     });
 }
 
-const ALT_HOLD_STATUS: &str = "sim/cockpit2/autopilot/altitude_hold_status";
-const VVI_STATUS: &str = "sim/cockpit2/autopilot/vvi_status";
+const ALT_HOLD_STATUS: &str = autoflight::names::ALT_HOLD_STATUS;
+const VVI_STATUS: &str = autoflight::names::VS_STATUS;
 
 /// The vertical-speed rate back to `level_ft` from `alt_ft`: 700 fpm each
 /// way, less inside 700 ft so the capture is gentle.
@@ -1403,19 +1404,16 @@ pub fn recovery_vs_fpm(alt_ft: f64, level_ft: f64) -> f64 {
 /// altitude hold arming itself to capture (what caught the 4,200 ft climb
 /// by hand, 2026-09-23).
 async fn recover_level(xp: &XPlaneClient, alt_ft: f64, level_ft: f64) {
-    let _ = xp
-        .set_float("sim/cockpit2/autopilot/altitude_dial_ft", level_ft)
+    let _ = autoflight::set_dial(xp, Dial::Altitude, level_ft)
         .await;
     let vs = recovery_vs_fpm(alt_ft, level_ft);
-    let _ = xp
-        .set_float("sim/cockpit2/autopilot/vvi_dial_fpm", vs)
+    let _ = autoflight::set_dial(xp, Dial::VviFpm, vs)
         .await;
     if xp.get_float(VVI_STATUS).await.is_ok_and(|v| v < 0.5) {
-        let _ = xp.run_command("sim/autopilot/vertical_speed").await;
+        let _ = autoflight::press(xp, Button::VerticalSpeed).await;
         tokio::time::sleep(Duration::from_millis(500)).await;
         // Engaging the mode syncs the dial to the rate of the moment.
-        let _ = xp
-            .set_float("sim/cockpit2/autopilot/vvi_dial_fpm", vs)
+        let _ = autoflight::set_dial(xp, Dial::VviFpm, vs)
             .await;
     }
 }
@@ -1424,17 +1422,14 @@ async fn recover_level(xp: &XPlaneClient, alt_ft: f64, level_ft: f64) {
 /// rate, the mode if it is not on, the rate again (engaging the mode syncs
 /// the dial to the rate of the moment). `recover_level`'s sequence.
 async fn descend_on_vs(xp: &XPlaneClient, dial_ft: f64, vs_fpm: f64) {
-    let _ = xp
-        .set_float("sim/cockpit2/autopilot/altitude_dial_ft", dial_ft.round())
+    let _ = autoflight::set_dial(xp, Dial::Altitude, dial_ft.round())
         .await;
-    let _ = xp
-        .set_float("sim/cockpit2/autopilot/vvi_dial_fpm", vs_fpm)
+    let _ = autoflight::set_dial(xp, Dial::VviFpm, vs_fpm)
         .await;
     if xp.get_float(VVI_STATUS).await.is_ok_and(|v| v < 0.5) {
-        let _ = xp.run_command("sim/autopilot/vertical_speed").await;
+        let _ = autoflight::press(xp, Button::VerticalSpeed).await;
         tokio::time::sleep(Duration::from_millis(500)).await;
-        let _ = xp
-            .set_float("sim/cockpit2/autopilot/vvi_dial_fpm", vs_fpm)
+        let _ = autoflight::set_dial(xp, Dial::VviFpm, vs_fpm)
             .await;
     }
 }
@@ -1688,7 +1683,7 @@ async fn read(xp: &XPlaneClient) -> Option<Sample> {
         xp.get_float("sim/flightmodel/position/local_vz"),
         xp.get_float("sim/flightmodel/position/theta"),
         xp.get_float("sim/flightmodel/position/phi"),
-        xp.get_float("sim/cockpit2/autopilot/autopilot_on"),
+        xp.get_float(autoflight::names::AP_ON),
     );
     let (vx, vz) = (vx.ok()?, vz.ok()?);
     Some(Sample {
@@ -2111,12 +2106,8 @@ async fn fly(
                         .ok()
                         .and_then(|v| v.first().copied())
                         .unwrap_or(0.45);
-                    let _ = xp
-                        .set_float(
-                            "sim/cockpit2/autopilot/heading_dial_deg_mag_pilot",
-                            (track - variation).rem_euclid(360.0).round(),
-                        )
-                        .await;
+                    let bug = (track - variation).rem_euclid(360.0).round();
+                    let _ = autoflight::set_dial(&xp, Dial::HeadingBug, bug).await;
                     // Altitude hold engages at the level the climb reached (the
                     // departure climbed to the cruise level for exactly this);
                     // the dial is NOT moved afterwards: moving it turned the
@@ -2214,8 +2205,7 @@ async fn fly(
                     Some(b) if crate::angles::abs_diff_deg(want_bug, b) < BUG_HYSTERESIS_DEG => b,
                     _ => {
                         let b = want_bug.round().rem_euclid(360.0);
-                        let _ = xp
-                            .set_float("sim/cockpit2/autopilot/heading_dial_deg_mag_pilot", b)
+                        let _ = autoflight::set_dial(&xp, Dial::HeadingBug, b)
                             .await;
                         bug_set = Some(b);
                         b
@@ -2362,8 +2352,7 @@ async fn fly(
                             level_ft = level_ft.max(((f + APPROACH_CLEAR_FT) / 100.0).ceil() * 100.0);
                         }
                         let b = (course - variation).rem_euclid(360.0).round().rem_euclid(360.0);
-                        let _ = xp
-                            .set_float("sim/cockpit2/autopilot/heading_dial_deg_mag_pilot", b)
+                        let _ = autoflight::set_dial(&xp, Dial::HeadingBug, b)
                             .await;
                         bug_set = Some(b);
                         around = Some(Around {
@@ -2450,8 +2439,7 @@ async fn fly(
                             serde_json::json!({ "event": "descent_vs", "alt": alt, "target": target, "vs": vs, "dial": dial.round() }),
                         );
                     } else if engaged && vs_written.is_none_or(|w| (w - vs).abs() >= 50.0) {
-                        let _ = xp
-                            .set_float("sim/cockpit2/autopilot/vvi_dial_fpm", vs)
+                        let _ = autoflight::set_dial(&xp, Dial::VviFpm, vs)
                             .await;
                         vs_written = Some(vs);
                     }
@@ -2472,8 +2460,7 @@ async fn fly(
                         );
                     } else if !climb_eased && s.ias < CLIMB_MIN_KTS && s.ias > 1.0 {
                         climb_eased = true;
-                        let _ = xp
-                            .set_float("sim/cockpit2/autopilot/vvi_dial_fpm", CLIMB_EASED_FPM)
+                        let _ = autoflight::set_dial(&xp, Dial::VviFpm, CLIMB_EASED_FPM)
                             .await;
                         crate::blackbox::record(
                             "heli_route",

@@ -21,6 +21,7 @@
 //!   default: each autopilot captures differently, and a profile turns it on
 //!   only after a flown capture.
 
+use crate::autoflight::{self, Button, Dial};
 use serde_json::json;
 
 pub const NAV1_FREQ: &str = "sim/cockpit2/radios/actuators/nav1_frequency_hz";
@@ -29,22 +30,13 @@ pub const HDEF: &str = "sim/cockpit2/radios/indicators/nav1_hdef_dots_pilot";
 pub const VDEF: &str = "sim/cockpit2/radios/indicators/nav1_vdef_dots_pilot";
 pub const LOC_VALID: &str = "sim/cockpit2/radios/indicators/nav1_display_horizontal";
 pub const GS_VALID: &str = "sim/cockpit2/radios/indicators/nav1_display_vertical";
-pub const APPR_STATUS: &str = "sim/cockpit2/autopilot/approach_status";
-pub const GS_STATUS: &str = "sim/cockpit2/autopilot/glideslope_status";
-pub const CMD_APPROACH: &str = "sim/autopilot/approach";
+pub const APPR_STATUS: &str = autoflight::names::APPR_STATUS;
+pub const GS_STATUS: &str = autoflight::names::GS_STATUS;
 
-/// The live airframe's approach button (its own where it has one).
-pub fn approach_command() -> String {
-    crate::aircraft::live_profile()
-        .and_then(|p| p.approach_command.clone())
-        .unwrap_or_else(|| CMD_APPROACH.to_string())
-}
-
-/// The live airframe's approach status dataref (its own where it has one).
+/// The live airframe's approach status dataref (its own where it has one):
+/// the panel's (`autoflight::Panel::approach_status`).
 pub fn approach_status_dref() -> String {
-    crate::aircraft::live_profile()
-        .and_then(|p| p.approach_status.clone())
-        .unwrap_or_else(|| APPR_STATUS.to_string())
+    autoflight::panel().approach_status
 }
 
 /// How far an ILS may be from the runway's field and still be its own.
@@ -394,13 +386,11 @@ pub fn coupled_allowed() -> bool {
 // altitude at glideslope capture.
 // ---------------------------------------------------------------------------
 
-pub const NAV_STATUS: &str = "sim/cockpit2/autopilot/nav_status";
-pub const SERVOS: &str = "sim/cockpit2/autopilot/servos_on";
-pub const AP_POWER: &str = "sim/cockpit2/autopilot/autopilot_has_power";
+pub const NAV_STATUS: &str = autoflight::names::NAV_STATUS;
+pub const SERVOS: &str = autoflight::names::SERVOS_ON;
+pub const AP_POWER: &str = autoflight::names::AP_POWER;
 pub const HSI_SOURCE: &str = "sim/cockpit2/radios/actuators/HSI_source_select_pilot";
-pub const CMD_HSI_NAV1: &str = "sim/autopilot/hsi_select_nav_1";
 pub const RA_DH: &str = "sim/cockpit2/gauges/actuators/radio_altimeter_bug_ft_pilot";
-pub const ALT_DIAL: &str = "sim/cockpit2/autopilot/altitude_dial_ft";
 
 /// A localizer's coverage: 35 degrees either side to 17 nm, 10 degrees to
 /// 25 nm (ICAO Annex 10). Outside it the needle means nothing.
@@ -648,11 +638,11 @@ pub fn spawn_setup_watch(base: String, ils: crate::nav::Ils, mut watch: SetupWat
                 };
                 let out = watch.step(i, dt);
                 if out.press_appr {
-                    let _ = xp.run_command(&approach_command()).await;
+                    autoflight::press_logged(&xp, Button::Approach, "ils_setup").await;
                     crate::blackbox::record("ils", json!({ "event": "appr_pressed", "rwy": ils.runway, "icao": ils.airport }));
                 }
                 if let Some(m) = out.set_dial {
-                    let _ = xp.set_float(ALT_DIAL, m).await;
+                    let _ = autoflight::set_dial(&xp, Dial::Altitude, m).await;
                     crate::blackbox::record("ils", json!({ "event": "missed_alt_set", "alt": m }));
                 }
                 if let Some(line) = out.say {

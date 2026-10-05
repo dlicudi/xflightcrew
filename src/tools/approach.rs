@@ -258,7 +258,7 @@ impl Tool for PrepareIls {
         let mut source_fixed = None;
         if let Ok(src) = ctx.xplane.get_float(ils::HSI_SOURCE).await {
             if src.round() as i64 != 0 {
-                let _ = ctx.xplane.run_command(ils::CMD_HSI_NAV1).await;
+                let _ = crate::autoflight::press(ctx.xplane, crate::autoflight::Button::HsiNav1).await;
                 let now = ctx.xplane.get_float(ils::HSI_SOURCE).await;
                 let ok = now.is_ok_and(|v| v.round() as i64 == 0);
                 source_fixed = Some(ok);
