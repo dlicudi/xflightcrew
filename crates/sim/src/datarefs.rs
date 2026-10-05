@@ -91,13 +91,11 @@ pub const QNH_PASCALS: &str = "sim/weather/aircraft/qnh_pas";
 
 // --- Time ---
 /// Sim UTC, seconds since midnight zulu.
-#[allow(dead_code)] // consumed by the atc binary's tree, not the copilot's (yet)
 pub const ZULU_TIME_SEC: &str = "sim/time/zulu_time_sec";
 
 // --- Radios ---
 /// COM1 active frequency. Despite the `hz` in the name, the value is in kHz
 /// (118325 = 118.325 MHz); supports 8.33 kHz channel spacing.
-#[allow(dead_code)] // consumed by the atc binary's tree, not the copilot's (yet)
 pub const COM1_FREQ_KHZ: &str = "sim/cockpit2/radios/actuators/com1_frequency_hz_833";
 /// Transponder code as squawked (e.g. 4521) — read by the radar watch to
 /// verify an assigned code is actually set (the write side stays in the
@@ -150,12 +148,10 @@ pub fn elevator_surface_deg(per_wing: &[f64]) -> Option<f64> {
 
 /// Audio panel: COM1 monitor selected (nonzero = COM1 is audible in the
 /// cockpit). The ATC broadcast respects this so it can be muted like a radio.
-#[allow(dead_code)] // consumed by the atc binary's tree, not the copilot's (yet)
 pub const AUDIO_SELECTION_COM1: &str = "sim/cockpit2/radios/actuators/audio_selection_com1";
 
 // --- Identity ---
 /// Tail number string ("N172SP") — the spoken callsign.
-#[allow(dead_code)] // consumed by the atc binary's tree, not the copilot's (yet)
 pub const TAILNUM: &str = "sim/aircraft/view/acf_tailnum";
 /// The loaded model's .acf, relative to the install
 /// ("Aircraft/Laminar Research/Boeing 737-800/b738.acf"): with the ICAO, the

@@ -60,28 +60,18 @@ pub struct AtcFreq {
     pub name: String,
 }
 
-// The comm-frequency surface is consumed by the atc binary's tree; the copilot
-// binary compiles this module too but doesn't reach it (yet), hence the allows.
-#[allow(dead_code)]
 pub const FREQ_ATIS: u32 = 50;
-#[allow(dead_code)]
 pub const FREQ_UNICOM: u32 = 51;
-#[allow(dead_code)]
 pub const FREQ_CLEARANCE: u32 = 52;
-#[allow(dead_code)]
 pub const FREQ_GROUND: u32 = 53;
-#[allow(dead_code)]
 pub const FREQ_TOWER: u32 = 54;
-#[allow(dead_code)]
 pub const FREQ_APPROACH: u32 = 55;
-#[allow(dead_code)]
 pub const FREQ_DEPARTURE: u32 = 56;
 
 /// An airport as apt.dat knows it: the header's field elevation plus runways.
 #[derive(Debug, Clone)]
 pub struct AirportInfo {
     /// Name from the header row (e.g. "Gibraltar") — the spoken station name.
-    #[allow(dead_code)] // atc-binary tree only (yet)
     pub name: String,
     /// Field elevation, feet MSL — the authoritative figure (a flight plan's
     /// destination-waypoint altitude is a *crossing* altitude, seen live 2,500 ft
@@ -89,7 +79,6 @@ pub struct AirportInfo {
     pub elev_ft: f64,
     pub runways: Vec<Runway>,
     /// Communication frequencies, in file order (empty for untowered fields).
-    #[allow(dead_code)] // atc-binary tree only (yet)
     pub freqs: Vec<AtcFreq>,
     /// The field's transition LEVEL in feet (apt.dat `1302 transition_level`,
     /// "7000" at EGKK, "18000" at KJFK; a written "FL070" or a bare "070"
@@ -218,7 +207,6 @@ impl AirportInfo {
 
 impl AirportInfo {
     /// The first frequency of the given service `kind` (`FREQ_TOWER`, ...).
-    #[allow(dead_code)] // atc-binary tree only (yet)
     pub fn freq(&self, kind: u32) -> Option<&AtcFreq> {
         self.freqs.iter().find(|f| f.kind == kind)
     }
@@ -228,7 +216,6 @@ impl AirportInfo {
     /// an ultralight strip whose air-to-air frequency is typed as TWR — and a
     /// row like that is a frequency, not a controller. Nobody should be
     /// handed off to it or told it's the nearest station.
-    #[allow(dead_code)] // atc-binary tree only (yet)
     pub fn staffed_tower(&self) -> Option<&AtcFreq> {
         self.freq(FREQ_TOWER)
             .filter(|f| !f.name.trim().eq_ignore_ascii_case("unnamed entity"))

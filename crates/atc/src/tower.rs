@@ -2027,7 +2027,6 @@ impl Tower {
 
     /// The clearance still awaiting its readback, if any. Consumed by the
     /// battle tests; the binary reads it via [`Tower::suggested_readback`].
-    #[allow(dead_code)]
     pub fn pending(&self) -> Option<&PendingReadback> {
         self.pending.as_ref()
     }
