@@ -64,3 +64,23 @@ Note: BSD grep drops `pub static` lines; use `rg` or perl for source scans.
 `spawn_autoland` (2,957 lines), `run_session` (2,784), `monitor::run` (2,201),
 `procedure::fly`, `circuit::fly`, `full_auto::fly`, `autotakeoff::fly`: locals into a state
 struct with per-phase methods. Gate: bench replays, `xvl sortie --check`, real sorties.
+
+## Progress 2026-10-05 (evening, merged to main d36cd4a, offline only)
+- P0.8 crew side: `src/lifetimes.rs` (`every_crew_static_has_a_lifetime`, stale entries fail too).
+- P3.1 stage 2: `forget_flight` also forgets the pilot takeover, crew radio queue and readbacks,
+  `main::LAST_READBACK`, the GPU cart, the pilot-moved-lights flag, rapport's offer
+  (masks and anti-ice claims deliberately kept: they need a flight).
+- P3.4: the ILS setup watch (`ils::SETUP`) and the checklist runner (`flow::RUN`) are Slots in LOOPS.
+- P3.5: `NEXT_GATE` / `NEXT_GLIDEPATH_DEG` are `autoland::HandDown` launch arguments;
+  `NEXT_ARRIVAL_HANDOFF_KTS` is `procedure::Plan.arrival_handoff_kts`. Left: `VACATE_FOLLOWS`
+  (set after another loop launched the landing), `CLIMB_HANDOVER` (an output, not an argument).
+- P3.7 slice: `full_auto::forget_mission` owns `DEPARTURE_MINIMUMS` and the runway waiver
+  (stored in aircraft.rs privately, since the lib cannot see full_auto).
+- Autoflight: loop mode presses through `autoflight::bring` (pinned); four owed a flight remain.
+- Duplicates closed: #11 (throttle lever everywhere, answers and undo on the airframe's lever),
+  #15 partly (approach_guide, rapport), #16 (`nav::strip_frame`), #18 (arrival brief = crew's
+  `wind_runway`), magnetic/true via `runway::true_to_mag` / `mag_to_true`, ~200 dataref literals
+  onto `datarefs::*`, `voice::say_opt`, safe hold / recovery onto `sim::position`, `Modes`,
+  `safe_hold::floor`, one MORA loader, `flap_within_limits`, `recover::unflyable_floor_kts`.
+- Next: P3.2 `Scoped<T>`, P3.3 airframe facts snapshot, P2.6 `world_tick.rs`, phase 4 moves;
+  sortie-gated items unchanged (see the 2026-10-04 audit lists).
