@@ -310,6 +310,12 @@ pub struct CouplingIn {
     /// The autopilot's modes (`autoflight::Modes`, the bitfield): the one
     /// truth. `approach_status` read 0 through captures on the 737 (#81).
     pub modes: Option<crate::autoflight::Modes>,
+    /// Radio height, feet (0 when unread).
+    pub radio_ft: f64,
+    /// The airframe's `ils_decouple_agl_ft`: below it the coupling hands the
+    /// final back to autoland's own VS law, so the arrest and flare start from
+    /// the path it was tuned on, never from a trimmed coupled autopilot.
+    pub decouple_below_ft: Option<f64>,
 }
 
 impl Coupling {
@@ -332,6 +338,18 @@ impl Coupling {
         // Leaving the final (a go-around, an outbound leg) hands HDG/VS back
         // at once. The arrest is not a leaving: it takes the servos itself.
         if engaged && i.leaving && !i.arresting {
+            abandon(self, &mut out);
+            return out;
+        }
+        // The declared hand-back height: LEMD 18L 2026-10-05 16:57, the
+        // arrest took the servos at 80 ft out of the 737's glideslope mode,
+        // trimmed for the path, and ballooned from 43 ft to 100 ft (-975 to
+        // +980 fpm) into a balk. Below this the final is ours again.
+        if engaged
+            && !i.arresting
+            && i.radio_ft > 0.0
+            && i.decouple_below_ft.is_some_and(|h| i.radio_ft < h)
+        {
             abandon(self, &mut out);
             return out;
         }
@@ -907,6 +925,31 @@ mod tests {
             (0..40).filter_map(|_| x.step(needles(1.6, -1.5), true, 142.0, 0.3)).collect();
         assert_eq!(loc.len(), 1);
         assert!(loc[0].starts_with("Localizer"), "{}", loc[0]);
+    }
+
+    /// Below the airframe's declared height the coupling hands the final
+    /// back (decouple, APP pressed once more to clear it); above it, and
+    /// with no height declared, it stays coupled (LEMD 18L 2026-10-05).
+    #[test]
+    fn a_coupled_final_is_handed_back_at_the_declared_height() {
+        let mut t = 0.0;
+        let coupled = || {
+            let mut c = Coupling::Coupled;
+            let _ = &mut c;
+            c
+        };
+        let mut c = coupled();
+        let o = c.step(CouplingIn { radio_ft: 650.0, decouple_below_ft: Some(500.0), ..inp(2560) }, &mut t, 0.3);
+        assert!(!o.decouple && c == Coupling::Coupled);
+        let o = c.step(CouplingIn { radio_ft: 480.0, decouple_below_ft: Some(500.0), ..inp(2560) }, &mut t, 0.3);
+        assert!(o.decouple && o.disarm && c == Coupling::Abandoned);
+        assert!(o.own_vertical && o.own_lateral);
+        let mut d = coupled();
+        let o = d.step(CouplingIn { radio_ft: 80.0, decouple_below_ft: None, ..inp(2560) }, &mut t, 0.3);
+        assert!(!o.decouple, "no height declared: coupled to the arrest");
+        let mut e = coupled();
+        let o = e.step(CouplingIn { radio_ft: 0.0, decouple_below_ft: Some(500.0), ..inp(2560) }, &mut t, 0.3);
+        assert!(!o.decouple, "an unread radio height decides nothing");
     }
 
     fn inp(modes: u32) -> CouplingIn {

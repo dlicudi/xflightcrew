@@ -1031,6 +1031,11 @@ pub struct AircraftProfile {
     /// otherwise.
     #[serde(default)]
     pub ils_coupled: bool,
+    /// Radio height, feet, below which a coupled ILS is handed back to
+    /// autoland's own VS final (`ils::CouplingIn::decouple_below_ft`).
+    /// `None`: coupled to the arrest.
+    #[serde(default)]
+    pub ils_decouple_agl_ft: Option<f64>,
     /// The autopilot's own approach button, where the add-on has its own
     /// (the Laminar 737's APP is `laminar/B738/autopilot/app_press`: its lamp
     /// lights). `None`: the stock command. The modes it arms are read on
@@ -4197,6 +4202,7 @@ fn cessna_172sp() -> AircraftProfile {
         cabin_crew: false,
         load_sheet: LoadSheet::Stock,
         ils_coupled: false,
+        ils_decouple_agl_ft: None,
         approach_command: None,
         bus_volts_nominal: None,
         // The stock profile carries the same continuous flare laws. Keep the
@@ -4547,6 +4553,7 @@ fn cirrus_sr22() -> AircraftProfile {
         cabin_crew: false,
         load_sheet: LoadSheet::Stock,
         ils_coupled: false,
+        ils_decouple_agl_ft: None,
         approach_command: None,
         bus_volts_nominal: None,
         flare_power: None,

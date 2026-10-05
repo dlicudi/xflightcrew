@@ -564,6 +564,24 @@ pub fn hold_cmd(
     }
 }
 
+/// The escape's command: never a descent. Above the floor the plain hold
+/// bounds a descent AT the floor (window at the floor, the descent rate
+/// kept), which on a path that meets the ground is still a descent: LEMD
+/// 2026-10-05 17:07, diving at 4,000 fpm through 4,015 ft, the escape set
+/// 3,100 at -1,000 fpm. An escape levels at once, at the floor or where the
+/// aircraft is, whichever is higher, climbing to it. Pure.
+pub fn escape_cmd(mut cmd: HoldCmd, alt_ft: f64) -> HoldCmd {
+    if !cmd.climb {
+        cmd.alt_ft = up_100(cmd.alt_ft.max(alt_ft));
+        cmd.climb = true;
+        cmd.fpm = ESCAPE_LEVEL_FPM;
+    }
+    cmd
+}
+
+/// The rate an escape that is already above its floor levels off at, fpm.
+pub const ESCAPE_LEVEL_FPM: f64 = 500.0;
+
 /// Who flies.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Who {
@@ -941,7 +959,7 @@ impl SafeHold {
                 .as_ref()
                 .is_some_and(|h| h.cmd.climb && t.now_s - h.at_s < VERIFY_S);
             if t.actuate && !recent_climb {
-                let cmd = cmd_for(unsafe_now.unwrap_or(Why::HoldsBelow));
+                let cmd = escape_cmd(cmd_for(unsafe_now.unwrap_or(Why::HoldsBelow)), t.air.alt_ft);
                 recs.push(
                     json!({ "event": "escape", "who": who.word(), "cmd": cmd.json(),
                                   "air": t.air.json(), "ap": t.ap.json() }),

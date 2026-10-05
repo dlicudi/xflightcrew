@@ -3760,6 +3760,9 @@ fn spawn_autoland(launch: AutolandLaunch) {
                                 dist_nm: g.dist_nm,
                                 needles: n,
                                 modes: ap_modes,
+                                radio_ft,
+                                decouple_below_ft: crate::aircraft::live_profile()
+                                    .and_then(|p| p.ils_decouple_agl_ft),
                             },
                             &mut coupling_armed_s,
                             tick_dt,

@@ -716,3 +716,25 @@ fn a_reading_no_flight_has_is_not_judged() {
         (Act::Nothing, vec![])
     );
 }
+
+/// An escape never continues a descent: above its floor it levels at once
+/// where it is (LEMD 2026-10-05 17:07: diving through 4,015 ft, floor 3,132,
+/// the old escape set 3,100 at -1,000 fpm).
+#[test]
+fn an_escape_above_its_floor_levels_where_it_is() {
+    let descent = HoldCmd {
+        alt_ft: 3_100.0,
+        fpm: 1_000.0,
+        heading_mag: None,
+        climb: false,
+        why: Why::HoldsBelow,
+        floor: Floor { true_ft: 3_132.0, source: "terrain" },
+    };
+    let e = escape_cmd(descent, 4_015.0);
+    assert!(e.climb, "an escape climbs or levels, never descends");
+    assert_eq!(e.alt_ft, 4_100.0);
+    assert_eq!(e.fpm, ESCAPE_LEVEL_FPM);
+    // Below the floor the plain hold already climbs: unchanged.
+    let climb = HoldCmd { climb: true, alt_ft: 3_200.0, fpm: 2_000.0, ..descent };
+    assert_eq!(escape_cmd(climb, 2_500.0), climb);
+}

@@ -524,6 +524,10 @@ advisor:
 # APP once, no HDG or V/S press between the arm and the roundout, and the
 # stable gate's record at 1,000 ft.
 ils_coupled: true
+# Coupled down to 500 ft radio, then autoland's own VS final and flare: the
+# arrest taken out of the coupled glideslope at 80 ft ballooned 43 to 100 ft
+# into a balk (LEMD 18L, 2026-10-05 16:57).
+ils_decouple_agl_ft: 500.0
 # Its own APP button (the press handler fires the stock approach command
 # after its power check and lights the lamp).
 approach_command: laminar/B738/autopilot/app_press
