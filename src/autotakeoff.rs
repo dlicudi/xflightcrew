@@ -3009,6 +3009,8 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, p: Params) {
         crate::aircraft::nose_free().then(crate::ground_steer::GroundSteer::for_airframe);
     let mut align_hold = brake_steer;
     let mut last_tick: Option<std::time::Instant> = None;
+    let mut thrust_watch = autoflight::ThrustWatch::default();
+    let thrust_t0 = std::time::Instant::now();
     let roll_start = std::time::Instant::now();
     let mut frozen_secs = 0.0_f64;
     // The tick's writes, sent together (`sim::state::Writes`).
@@ -3065,8 +3067,12 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, p: Params) {
         // back to the separate reads, still one round, and the tick says
         // which (`pos`).
         let thr_dref = throttle_dref();
-        let (st, extra) =
-            sim::state::read_with(&xp, sim::state::Want(ROLL_WANT), &[thr_dref.as_str()]).await;
+        let (st, extra) = sim::state::read_with(
+            &xp,
+            sim::state::Want(ROLL_WANT),
+            &[thr_dref.as_str(), autoflight::names::AT_ON, autoflight::names::AT_MODE],
+        )
+        .await;
         // Pause or replay: freeze — no writes, and the stagnation clock
         // slides instead of burning (the recover watcher's rule).
         if st.frozen() {
@@ -3090,7 +3096,21 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, p: Params) {
             st.get(F::Trq0),
             st.get(F::R),
         );
-        let thr_read = extra.into_iter().next().unwrap_or_else(|| Err(anyhow::anyhow!("unread")));
+        let mut extra = extra.into_iter();
+        let thr_read = extra.next().unwrap_or_else(|| Err(anyhow::anyhow!("unread")));
+        // The levers are the takeoff's: an ENGAGED autothrottle (armed is
+        // the configuration's, never touched) is taken out and said once.
+        {
+            let (on, mode) = (extra.next(), extra.next());
+            let engaged = autoflight::autothrottle_engaged(
+                on.and_then(|r| r.ok()),
+                mode.and_then(|r| r.ok()),
+            );
+            let step = thrust_watch.step(thrust_t0.elapsed().as_secs_f64(), engaged);
+            if let Some(line) = autoflight::act_thrust(&xp, step, "autotakeoff").await {
+                alert(&voice, Priority::Caution, line);
+            }
+        }
         let (lat, lon) = sim::position::lat_lon(&pos);
         let psi = sim::position::field(&pos, |p| p.psi_true_deg);
         let gs_ms = sim::position::field(&pos, |p| p.gs_ms);

@@ -1610,6 +1610,12 @@ fn spawn_autoland(launch: AutolandLaunch) {
             let mut last_thr_written: Option<f64> = None;
             let mut coupling = crate::ils::Coupling::Off;
             let mut coupling_armed_s = 0.0_f64;
+            // The thrust is this loop's (`autoflight::ThrustWatch`): an
+            // ENGAGED autothrottle is taken out to ARM, said once. The A/T
+            // in SPEED 230 from a manual recovery overrode every lever
+            // written from 13:02 to 13:09 (LEMG 13, 2026-10-05).
+            let mut thrust_watch = autoflight::ThrustWatch::default();
+            let thrust_t0 = std::time::Instant::now();
             loop {
                 if xp.cancelled() || !lease.current() {
                     break;
@@ -1676,6 +1682,13 @@ fn spawn_autoland(launch: AutolandLaunch) {
                     )
                 };
                 let mut appr_read = extra.next();
+                // Before the lever is written: an engaged autothrottle fights it.
+                {
+                    let step = thrust_watch.step(thrust_t0.elapsed().as_secs_f64(), at_engaged);
+                    if let Some(line) = autoflight::act_thrust(&xp, step, "autoland").await {
+                        announce(line.to_string(), Priority::Caution);
+                    }
+                }
                 let pos = st.position();
                 let (var_r, ias_r, hpath_r, ground_r, phi_r) = (
                     st.get(F::MagVar),

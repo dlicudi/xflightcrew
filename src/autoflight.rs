@@ -89,8 +89,6 @@ pub mod names {
     pub const AT_MODE: &str = "sim/cockpit2/autopilot/autothrottle_enabled";
     pub const FD_MODE: &str = "sim/cockpit2/autopilot/flight_director_mode";
     pub const HOVER_STATUS: &str = "sim/cockpit2/autopilot/hover_status";
-    /// The altitude the hold is holding (not the window).
-    pub const ALTITUDE_HOLD_FT: &str = crate::datarefs::ALTITUDE_HOLD_FT;
 }
 
 /// The stock commands, the panel's defaults. Crate-visible for the tests
@@ -287,9 +285,6 @@ impl Modes {
     }
     pub fn vs(self) -> bool {
         self.has(Self::VS)
-    }
-    pub fn alt_hold(self) -> bool {
-        self.has(Self::ALT_HOLD)
     }
     pub fn loc_armed(self) -> bool {
         self.has(Self::LOC_ARMED)
@@ -662,10 +657,6 @@ impl ThrustWatch {
             }
         }
     }
-
-    pub fn gave_up(&self) -> bool {
-        self.gave_up
-    }
 }
 
 /// The words when a loop takes the thrust.
@@ -728,6 +719,24 @@ pub async fn take_thrust(xp: &dyn XPlane, owner: &str) -> Option<bool> {
         }
     }
     Some(false)
+}
+
+/// The take without the wait, for a loop that cannot spare the settle (the
+/// upset recovery: its first writes are the controls): read, press the
+/// airframe's autothrottle-off only when engaged, on the tape. `Some(true)`
+/// pressed, `None` not engaged or unread.
+pub async fn drop_thrust_now(xp: &dyn XPlane, owner: &str) -> Option<bool> {
+    let (on, mode) = tokio::join!(xp.get_float(names::AT_ON), xp.get_float(names::AT_MODE));
+    if autothrottle_engaged(on.ok(), mode.ok()) != Some(true) {
+        return None;
+    }
+    let p = panel();
+    let sent = xp.run_command(&p.autothrottle_off).await.is_ok();
+    crate::blackbox::record(
+        "autoflight",
+        json!({"event": "thrust_taken", "owner": owner, "try": 1, "cmd": p.autothrottle_off, "sent": sent}),
+    );
+    Some(sent)
 }
 
 // ---------------------------------------------------------------------------
@@ -1252,6 +1261,104 @@ mod tests {
         assert_eq!(autothrottle_engaged(Some(1.0), Some(1.0)), Some(true));
         assert_eq!(autothrottle_engaged(Some(0.0), Some(1.0)), Some(false));
         assert_eq!(autothrottle_engaged(None, Some(1.0)), None);
+    }
+
+    /// The 2026-10-05 LEMG 13 approach, replayed from its own record
+    /// (`bench/approach/lemg13_737_2026-10-05.jsonl`): autoland armed at
+    /// 13:02:39 with the A/T in SPEED 230 (the bitfield's 1 bit, left by the
+    /// manual recovery) and it stayed engaged to 13:09:34, the lever read
+    /// off autoland's command on nearly half those ticks while the speed sat
+    /// on 230 to 240 through a descent that wanted it lower. The watch on
+    /// the same ticks takes it on the FIRST one, says it once, and with a
+    /// take that holds presses nothing more.
+    #[test]
+    fn the_lemg_737_arm_takes_the_autothrottle_on_its_first_tick() {
+        let src = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/bench/approach/lemg13_737_2026-10-05.jsonl"
+        ));
+        let ticks: Vec<serde_json::Value> = src
+            .lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .filter(|r| r.get("ias").is_some() && r["ph"] != "pilot_app")
+            .collect();
+        let engaged = |r: &serde_json::Value| {
+            r["ap"]
+                .as_f64()
+                .and_then(Modes::from_read)
+                .map(Modes::autothrottle)
+        };
+        let arm_t = ticks[0]["t"].as_f64().unwrap();
+        let held: Vec<&serde_json::Value> =
+            ticks.iter().filter(|r| engaged(r) == Some(true)).collect();
+        let last_held = held.last().unwrap()["t"].as_f64().unwrap();
+        assert!(
+            last_held - arm_t > 400.0,
+            "engaged {:.0} s after the arm",
+            last_held - arm_t
+        );
+        let fought = held
+            .iter()
+            .filter(|r| match (r["lever"].as_f64(), r["thr"].as_f64()) {
+                (Some(cmd), Some(read)) => (cmd - read).abs() > 0.04,
+                _ => false,
+            })
+            .count();
+        assert!(
+            fought * 3 > held.len(),
+            "the lever fought on {fought} of {} ticks",
+            held.len()
+        );
+        // The watch on the recorded ticks: the first take at the first tick.
+        let mut w = ThrustWatch::default();
+        let first = ticks
+            .iter()
+            .find_map(|r| {
+                let t = r["t"].as_f64().unwrap() - arm_t;
+                matches!(w.step(t, engaged(r)), ThrustStep::Take { n: 1, say: true }).then_some(t)
+            })
+            .expect("taken");
+        assert!(first < 1.0, "taken {first:.1} s after the arm");
+        // A take that holds (the A/T reads armed from the next tick): nothing
+        // more is pressed for the rest of the approach.
+        let presses = ticks
+            .iter()
+            .skip(1)
+            .filter(|r| {
+                let t = r["t"].as_f64().unwrap() - arm_t;
+                matches!(
+                    w.step(t, Some(false).filter(|_| engaged(r).is_some())),
+                    ThrustStep::Take { .. }
+                )
+            })
+            .count();
+        assert_eq!(presses, 0);
+    }
+
+    #[tokio::test]
+    async fn a_take_presses_the_panels_autothrottle_off_and_says_it_once() {
+        let fake = FakeXPlane::new();
+        assert_eq!(
+            act_thrust(&fake, ThrustStep::Take { n: 1, say: true }, "test").await,
+            Some(THRUST_TAKEN_LINE)
+        );
+        assert_eq!(
+            act_thrust(&fake, ThrustStep::Take { n: 2, say: false }, "test").await,
+            None
+        );
+        assert_eq!(fake.ran_count(cmd::AT_OFF), 2);
+        assert_eq!(
+            act_thrust(&fake, ThrustStep::GiveUp, "test").await,
+            Some(THRUST_STUCK_LINE)
+        );
+        assert_eq!(act_thrust(&fake, ThrustStep::Nothing, "test").await, None);
+        assert_eq!(fake.ran_count(cmd::AT_OFF), 2);
+        // The no-wait take: only when engaged.
+        let fake = FakeXPlane::with_reads(&[(names::AT_ON, 1.0), (names::AT_MODE, 2.0)]);
+        assert_eq!(drop_thrust_now(&fake, "test").await, Some(true));
+        let fake = FakeXPlane::with_reads(&[(names::AT_ON, 0.0), (names::AT_MODE, 0.0)]);
+        assert_eq!(drop_thrust_now(&fake, "test").await, None);
+        assert!(!fake.ran(cmd::AT_OFF));
     }
 
     #[tokio::test]

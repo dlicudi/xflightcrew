@@ -646,6 +646,8 @@ fn run_recovery(
             // The servos out FIRST: an engaged servo writes the column back
             // over ours, and the autopilot holds the nose up into a stall.
             let servos_after = servos_out(&xp).await;
+            // ...and the levers ours: an engaged autothrottle fights them.
+            let _ = autoflight::drop_thrust_now(&xp, "recover").await;
             // The plugin's channels where it has them (the pilot's hands
             // yield them), else the raw joystick override.
             let plugin = xp.set_float(CH_PITCH, 0.0).await.is_ok()

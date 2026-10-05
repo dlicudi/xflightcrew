@@ -1206,6 +1206,10 @@ async fn governor(
     // BEFORE a descent crosses its altitude.
     let mut vmo = crate::aircraft::VmoCeiling::default();
     let mut vmo_capped = false;
+    // The levers are this governor's (`autoflight::ThrustWatch`): an
+    // ENGAGED autothrottle moves them, which the override check below would
+    // read as the pilot's hand and stand down on.
+    let mut thrust_watch = crate::autoflight::ThrustWatch::default();
     loop {
         if !run.live() {
             break;
@@ -1256,10 +1260,28 @@ async fn governor(
         let on_ground = xp.get_float(ON_GROUND_ANY).await.ok().map(|v| v > 0.5);
         match mode {
             Mode::Flight => {
-                if let (Ok(ias), Ok(thr)) = (
-                    xp.get_float(IAS).await,
-                    xp.get_float(&throttle_dref()).await,
-                ) {
+                let thr_name = throttle_dref();
+                let (ias_r, thr_r, at_on, at_mode) = tokio::join!(
+                    xp.get_float(IAS),
+                    xp.get_float(&thr_name),
+                    xp.get_float(crate::autoflight::names::AT_ON),
+                    xp.get_float(crate::autoflight::names::AT_MODE),
+                );
+                let engaged = crate::autoflight::autothrottle_engaged(at_on.ok(), at_mode.ok());
+                let step = thrust_watch.step(clock.elapsed().as_secs_f64(), engaged);
+                let took = matches!(step, crate::autoflight::ThrustStep::Take { .. });
+                if let Some(line) = crate::autoflight::act_thrust(&xp, step, "speed_governor").await {
+                    if let Some(v) = &voice {
+                        v.alert(crate::voice::Priority::Caution, line);
+                    }
+                }
+                if took {
+                    // The lever the autothrottle moved is not the pilot's:
+                    // no override is read off it.
+                    last_cmd = None;
+                    override_pending = false;
+                }
+                if let (Ok(ias), Ok(thr)) = (ias_r, thr_r) {
                     if let Some(lc) = last_cmd.filter(|lc| (thr - lc).abs() > 0.15) {
                         if override_pending {
                             tracing::info!(thr, lc, "speed governor: pilot override, releasing");
