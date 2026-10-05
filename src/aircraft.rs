@@ -1344,17 +1344,12 @@ pub enum FuelSpoken {
     Pounds,
 }
 
-/// The live airframe's fuel density and spoken unit, republished on every
-/// profile swap — a process-wide fact must never outlive its airframe.
-static FUEL_UNIT: std::sync::Mutex<(f64, FuelSpoken)> =
-    std::sync::Mutex::new((AVGAS_KG_PER_GAL, FuelSpoken::Gallons));
-
 /// 100LL, the default for anything that declares nothing.
 pub const AVGAS_KG_PER_GAL: f64 = 2.72;
 const LB_PER_KG: f64 = 2.204_62;
 
-/// Publish the airframe's fuel density and spoken unit. Called on EVERY swap.
-pub fn publish_fuel_unit(f: Option<&FuelProfile>) {
+/// An airframe's fuel density and spoken unit, from its profile. Pure.
+pub fn fuel_unit_for(f: Option<&FuelProfile>) -> (f64, FuelSpoken) {
     let density = f
         .and_then(|f| f.kg_per_gal)
         .filter(|d| d.is_finite() && *d > 0.0)
@@ -1370,12 +1365,20 @@ pub fn publish_fuel_unit(f: Option<&FuelProfile>) {
         "lb" | "lbs" | "pounds" => FuelSpoken::Pounds,
         _ => FuelSpoken::Gallons,
     };
-    *FUEL_UNIT.lock().unwrap_or_else(|e| e.into_inner()) = (density, unit);
+    (density, unit)
 }
 
-/// The live airframe's (kg per gallon, spoken unit).
+/// Publish the airframe's fuel density and spoken unit alone.
+#[cfg(test)]
+pub fn publish_fuel_unit(f: Option<&FuelProfile>) {
+    let u = fuel_unit_for(f);
+    update_airframe_facts(|a| a.fuel_unit = u);
+}
+
+/// The live airframe's (kg per gallon, spoken unit), republished on every
+/// profile swap: a process-wide fact must never outlive its airframe.
 pub fn fuel_unit() -> (f64, FuelSpoken) {
-    *FUEL_UNIT.lock().unwrap_or_else(|e| e.into_inner())
+    airframe_facts().fuel_unit
 }
 
 /// Thousands separators. A local copy on purpose: this module compiles into
@@ -2833,26 +2836,255 @@ pub fn profile_for_type(icao: &str) -> Option<AircraftProfile> {
 /// didn't.
 pub const STOCK_THROTTLE: &str = "sim/cockpit2/engine/actuators/throttle_ratio_all";
 
-/// The thrust lever THIS airframe actually obeys, republished on every profile
-/// swap (including back to `None`) — a stale override would aim the next
-/// aircraft's power at a dataref it doesn't use, the same shape as the
-/// transponder knob and the radio-power latch.
-/// One per process is the app's truth; one per test THREAD is the tests'
-/// (a test publishing the Citation's lever must not move another test's).
-#[cfg(not(test))]
-static THROTTLE_DREF: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+/// Everything the crew reads per AIRFRAME, as one immutable snapshot
+/// (refactor audit 2026-10-04, phase 3 item 3). Each field was a static of
+/// its own, set piecemeal on a swap, so a reader between two of those writes
+/// saw half of each airframe, and a field a swap forgot to write outlived its
+/// airframe (`hover::ROTOR`, the S-76's rotor read on the next aeroplane).
+/// Now `flight_state::publish_airframe` builds the whole struct from the
+/// profile with a literal naming EVERY field (one forgotten does not
+/// compile) and [`install_airframe_facts`] swaps it in at once. The `.acf`
+/// facts the detector reads later (the castoring nose, the gear warning)
+/// are copy-on-write updates of the same snapshot ([`update_airframe_facts`]).
+///
+/// Every accessor keeps its name and reads its field here (`speed_floor_kts`,
+/// `flap_limits`, `procedure::climb_fpm`, `hover::collective_dref`...), so
+/// callers did not change. The fields' types live in this module because it
+/// compiles into the lib as well as the bin.
+#[derive(Debug, Clone)]
+pub struct AirframeFacts {
+    /// The whole profile, for the consumers that need the tool surface.
+    pub profile: Option<std::sync::Arc<AircraftProfile>>,
+    /// (kg per gallon, spoken unit) ([`fuel_unit_for`]).
+    pub fuel_unit: (f64, FuelSpoken),
+    /// The thrust lever THIS airframe obeys, `None` the stock one: a stale
+    /// override would aim the next aircraft's power at a dataref it does
+    /// not use, the same shape as the transponder knob and the radio-power
+    /// latch.
+    pub throttle_dref: Option<String>,
+    /// The `.acf`'s castoring nose (the detector's), false until read.
+    pub nose_castors: bool,
+    /// The `.acf`'s free castoring nose (the detector's), false until read.
+    pub nose_free: bool,
+    /// Vlo.
+    pub gear_limit_kts: Option<f64>,
+    /// Each flap detent's `(ratio, Vfe)` ([`flap_limits_for`]).
+    pub flap_limits: Vec<(f64, Option<f64>)>,
+    /// Nominal bus volts, `None` the 24 volt default.
+    pub bus_volts_nominal: Option<f64>,
+    /// 1.2 Vs clean ([`speed_floor_for`]).
+    pub speed_floor_kts: Option<f64>,
+    /// Vne and the high Vmo ([`SpeedLimits::new`]).
+    pub speed_limits: SpeedLimits,
+    /// 1.2 Vso, else the clean floor ([`approach_floor_for`]).
+    pub approach_floor_kts: Option<f64>,
+    /// The per-notch stall table ([`stall_curve_for`]).
+    pub stall_curve: Option<StallCurve>,
+    /// The approach thrust floor ([`approach_thrust_min_for`]).
+    pub approach_thrust_min: Option<f64>,
+    /// The landing arrest's lead, the default when absent or malformed.
+    pub arrest_lead: ArrestLeadProfile,
+    /// The flare's elevator law, `None` the default law.
+    pub flare_elevator: Option<FlareElevatorProfile>,
+    /// The roll's rudder authority, `None` the default roll law.
+    pub roll_rudder: Option<RollRudderProfile>,
+    /// The book landing distance, metres ([`landing_distance_m_for`]).
+    pub landing_distance_m: Option<f64>,
+    /// The enroute vertical rates (`procedure::vs_limits_for`); `None` is
+    /// the GA figure, for a profile that declares none.
+    pub vs_limits: Option<VsLimits>,
+    /// The gear-warning envelope, the profile's or the `.acf`'s (the
+    /// detector's, over a silent profile).
+    pub gear_warning: Option<GearWarning>,
+    /// A jet's declared climb-out ([`ClimbOut::from_profile`]).
+    pub climb_out: Option<ClimbOut>,
+    /// The manual takeoff power limit.
+    pub takeoff_power: Option<TakeoffPowerProfile>,
+    /// `takeoff_config:`.
+    pub takeoff_config: Option<TakeoffConfigProfile>,
+    /// `ap_altitude_capture`.
+    pub ap_altitude_capture: bool,
+    /// A helicopter's rotor: (rpm dataref, governed rpm, collective
+    /// dataref) (`hover::rotor_facts`); `None` on anything else.
+    pub rotor: Option<(String, f64, String)>,
+    /// The seat belt switch ([`SignsSwitch::for_profile`]).
+    pub signs: Option<SignsSwitch>,
+    /// `cabin_air:`.
+    pub cabin_air: Option<CabinAirProfile>,
+    /// The transponder's add-on mode knob: never merely set when an
+    /// airframe happens to have one (a published-once flag that outlived an
+    /// airframe change is how a cold-and-dark 172 silently killed a Twin
+    /// Otter's radio for a whole session, 2026-07-27).
+    pub mode_knob: Option<TransponderModeKnob>,
+    /// The landing and taxi lights ([`Exterior::from_lights`]).
+    pub exterior: Exterior,
+    /// The altimeter fast paths, `None` the stock knob alone.
+    pub altimeter: Option<AltimeterProfile>,
+}
+
+impl Default for AirframeFacts {
+    /// Before any airframe: every field what a silent profile gives.
+    fn default() -> Self {
+        AirframeFacts {
+            profile: None,
+            fuel_unit: (AVGAS_KG_PER_GAL, FuelSpoken::Gallons),
+            throttle_dref: None,
+            nose_castors: false,
+            nose_free: false,
+            gear_limit_kts: None,
+            flap_limits: Vec::new(),
+            bus_volts_nominal: None,
+            speed_floor_kts: None,
+            speed_limits: SpeedLimits::new(None, None),
+            approach_floor_kts: None,
+            stall_curve: None,
+            approach_thrust_min: None,
+            arrest_lead: ArrestLeadProfile::default(),
+            flare_elevator: None,
+            roll_rudder: None,
+            landing_distance_m: None,
+            vs_limits: None,
+            gear_warning: None,
+            climb_out: None,
+            takeoff_power: None,
+            takeoff_config: None,
+            ap_altitude_capture: false,
+            rotor: None,
+            signs: None,
+            cabin_air: None,
+            mode_knob: None,
+            exterior: Exterior::default(),
+            altimeter: None,
+        }
+    }
+}
+
+/// The live airframe's facts: replaced whole on a swap, copied on write for
+/// a late `.acf` fact. Readers clone the `Arc` and drop the lock.
+static AIRFRAME_FACTS: std::sync::LazyLock<std::sync::RwLock<std::sync::Arc<AirframeFacts>>> =
+    std::sync::LazyLock::new(|| {
+        std::sync::RwLock::new(std::sync::Arc::new(AirframeFacts::default()))
+    });
+
+/// The live airframe's facts.
+pub fn airframe_facts() -> std::sync::Arc<AirframeFacts> {
+    AIRFRAME_FACTS
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+}
+
+/// Install a new airframe's facts, all at once (`flight_state::publish_airframe`).
+pub fn install_airframe_facts(f: AirframeFacts) {
+    #[cfg(test)]
+    THROTTLE_DREF_T.with(|t| *t.borrow_mut() = f.throttle_dref.clone());
+    *AIRFRAME_FACTS.write().unwrap_or_else(|e| e.into_inner()) = std::sync::Arc::new(f);
+}
+
+/// Change some of the live airframe's facts: the detector's `.acf` reads,
+/// and the tests' single-field publishes. Copy on write under the lock, so
+/// two updates of different fields never lose one another.
+pub fn update_airframe_facts(change: impl FnOnce(&mut AirframeFacts)) {
+    let mut g = AIRFRAME_FACTS.write().unwrap_or_else(|e| e.into_inner());
+    change(std::sync::Arc::make_mut(&mut g));
+}
+
+/// An airframe's enroute vertical rates, fpm (`procedure::vs_limits_for`
+/// derives them; `procedure::climb_fpm` and the rest read them).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct VsLimits {
+    pub climb_fpm: f64,
+    pub descent_fpm: f64,
+    pub best_climb_fpm: Option<f64>,
+}
+
+/// A jet's climb-out, declared by the profile (`acceleration_height_agl_ft`
+/// and `best_climb_fpm`) and republished on every swap; flown by
+/// `autotakeoff`.
+///
+/// EGPH 24, 2026-09-21, the 737: every airframe climbed out on one capped
+/// 1,500 fpm dial at takeoff thrust. That is a 172's whole climb and a fifth
+/// of a 737's excess power, so the rest went into speed: 185 kt at 340 ft,
+/// the flaps running up on speed alone at 400, 500 and 740 ft, 240 kt through
+/// 1,000 ft. A crew holds V2 + 20 to the acceleration height by PITCH, then
+/// lowers the nose and cleans up on the schedule.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ClimbOut {
+    pub accel_agl_ft: f64,
+    /// The hardest the speed hold may climb, fpm.
+    pub max_fpm: f64,
+}
+
+impl ClimbOut {
+    pub fn from_profile(p: &AircraftProfile) -> Option<Self> {
+        let r = p.reference.as_ref()?;
+        let accel_agl_ft = r
+            .acceleration_height_agl_ft
+            .filter(|h| h.is_finite() && *h > 0.0)?;
+        Some(ClimbOut {
+            accel_agl_ft,
+            max_fpm: r.best_climb_fpm.filter(|f| f.is_finite()).unwrap_or(0.0),
+        })
+    }
+}
+
+/// How the live airframe's seat belt signs are worked (`tools::signs`): the
+/// stock switch, or an add-on's own declared one.
+#[derive(Debug, Clone)]
+pub enum SignsSwitch {
+    Stock,
+    Own(SeatBeltSigns),
+}
+
+impl SignsSwitch {
+    /// The profile's declared switch, else the stock one on an airframe
+    /// with a cabin, else none. Pure.
+    pub fn for_profile(own: Option<SeatBeltSigns>, has_cabin: bool) -> Option<Self> {
+        match own {
+            Some(s) => Some(SignsSwitch::Own(s)),
+            None if has_cabin => Some(SignsSwitch::Stock),
+            None => None,
+        }
+    }
+}
+
+/// The active airframe's landing and taxi lights, the two the ground and
+/// climb stages switch (`tools::lights`). Republished on EVERY profile swap,
+/// including to an empty set, never merely set when an airframe happens to
+/// have them (the transponder knob's lesson, 2026-07-27).
+#[derive(Clone, Debug, Default)]
+pub struct Exterior {
+    pub landing: Option<LightProfile>,
+    pub taxi: Option<LightProfile>,
+}
+
+impl Exterior {
+    /// The landing and taxi lights from a profile's light list. Pure.
+    pub fn from_lights(lights: &[LightProfile]) -> Self {
+        let pick = |key: &str| {
+            lights
+                .iter()
+                .find(|l| l.key.eq_ignore_ascii_case(key))
+                .cloned()
+        };
+        Exterior {
+            landing: pick("landing"),
+            taxi: pick("taxi"),
+        }
+    }
+}
+
+// The tests' thrust lever: one per test THREAD (a test publishing the
+// Citation's lever must not move another test's); the app's is the
+// snapshot's `throttle_dref`.
 #[cfg(test)]
 thread_local! {
     static THROTTLE_DREF_T: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
 }
 
-/// Publish the airframe's thrust-lever dataref. Called on EVERY profile swap.
+/// Publish the airframe's thrust-lever dataref alone.
+#[cfg(test)]
 pub fn publish_throttle_dataref(dref: Option<String>) {
-    #[cfg(not(test))]
-    {
-        *THROTTLE_DREF.lock().unwrap_or_else(|e| e.into_inner()) = dref;
-    }
-    #[cfg(test)]
     THROTTLE_DREF_T.with(|t| *t.borrow_mut() = dref);
 }
 
@@ -2894,27 +3126,23 @@ impl GearWarning {
 /// Evolution's profile never said `brake_steer`, and full rudder at 6 kt
 /// turned it 3.7 degrees a second, off LILB's route three times
 /// (2026-09-25); the RV-10's never did either.
-static NOSE_CASTORS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-
 pub fn publish_nose_castors(on: bool) {
-    NOSE_CASTORS.store(on, std::sync::atomic::Ordering::Relaxed);
+    update_airframe_facts(|a| a.nose_castors = on);
 }
 
 pub fn nose_castors() -> bool {
-    NOSE_CASTORS.load(std::sync::atomic::Ordering::Relaxed)
+    airframe_facts().nose_castors
 }
 
 /// The castoring nose has NO steering of its own either (`_steerdeg_lospeed`
 /// 0: the Evolution, the SR22, the RV-10; the SF50's castors with 40 degrees
 /// of it): at walking pace the brakes are the only thing that turns it.
-static NOSE_FREE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-
 pub fn publish_nose_free(on: bool) {
-    NOSE_FREE.store(on, std::sync::atomic::Ordering::Relaxed);
+    update_airframe_facts(|a| a.nose_free = on);
 }
 
 pub fn nose_free() -> bool {
-    NOSE_FREE.load(std::sync::atomic::Ordering::Relaxed)
+    airframe_facts().nose_free
 }
 
 /// The live airframe's taxi beta depth (`taxi.beta_max`), when it taxis in
@@ -2979,25 +3207,21 @@ pub fn gear_warning_from_acf(acf_text: &str) -> Option<GearWarning> {
 /// The configuration placards autoland extends the gear and flaps against:
 /// VLO/VLE, and each flap detent's `(ratio, Vfe)`. Republished on every
 /// profile swap like the thrust lever, so a fast handoff on the next airframe
-/// is judged by ITS limits. Empty/`None` = the profile is silent, no gate.
-static GEAR_LIMIT_KTS: std::sync::Mutex<Option<f64>> = std::sync::Mutex::new(None);
-static FLAP_LIMITS: std::sync::Mutex<Vec<(f64, Option<f64>)>> = std::sync::Mutex::new(Vec::new());
-
-/// Publish the airframe's gear and flap speed limits. Called on EVERY profile swap.
-pub fn publish_config_limits(vlo_kts: Option<f64>, flaps: Option<&FlapProfile>) {
-    *GEAR_LIMIT_KTS.lock().unwrap_or_else(|e| e.into_inner()) = vlo_kts;
-    *FLAP_LIMITS.lock().unwrap_or_else(|e| e.into_inner()) = flaps
+/// is judged by ITS limits (the snapshot's `gear_limit_kts` and
+/// `flap_limits`). Empty/`None` = the profile is silent, no gate.
+///
+/// Each flap detent's `(ratio, Vfe)` from a profile. Pure.
+pub fn flap_limits_for(flaps: Option<&FlapProfile>) -> Vec<(f64, Option<f64>)> {
+    flaps
         .map(|f| f.detents.iter().map(|d| (d.ratio, d.vfe_kts)).collect())
-        .unwrap_or_default();
+        .unwrap_or_default()
 }
 
-/// The live airframe's nominal bus voltage, published per swap like the
-/// other selectors. `None` = the 24 volt default.
-static BUS_VOLTS_NOMINAL: std::sync::Mutex<Option<f64>> = std::sync::Mutex::new(None);
-
-/// Publish the airframe's nominal bus voltage. Called on EVERY profile swap.
+/// Publish the airframe's nominal bus voltage alone (the snapshot's
+/// `bus_volts_nominal`, `None` the 24 volt default).
+#[cfg(test)]
 pub fn publish_bus_volts(nominal: Option<f64>) {
-    *BUS_VOLTS_NOMINAL.lock().unwrap_or_else(|e| e.into_inner()) = nominal;
+    update_airframe_facts(|a| a.bus_volts_nominal = nominal);
 }
 
 /// Below this bus voltage the battery is too flat to reliably crank: 23 on a
@@ -3005,10 +3229,7 @@ pub fn publish_bus_volts(nominal: Option<f64>) {
 /// accessories with the engine off), and the same 4% margin under whatever
 /// the live airframe's profile says its system is.
 pub fn min_start_volts() -> f64 {
-    let nominal = BUS_VOLTS_NOMINAL
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .unwrap_or(24.0);
+    let nominal = airframe_facts().bus_volts_nominal.unwrap_or(24.0);
     nominal * 23.0 / 24.0
 }
 
@@ -3018,22 +3239,28 @@ pub fn min_start_volts() -> f64 {
 /// was flown to 63 kt by an autoland whose approach speed was a Cessna's 65,
 /// its own clean stall (2026-09-11): the target was wrong and nothing below
 /// it asked whether it could be. `None` = the profile declares no Vs.
-static SPEED_FLOOR_KTS: std::sync::Mutex<Option<f64>> = std::sync::Mutex::new(None);
+/// The snapshot's `speed_floor_kts`.
 /// 1.2 Vs: below the 1.3 an approach is flown at, above anything a wing can
 /// hold level with a bank on. A target under this is a wrong number.
 pub const SPEED_FLOOR_RATIO: f64 = 1.2;
 
-/// Publish the airframe's speed floor from its clean stall speed. Called on
-/// EVERY profile swap.
-pub fn publish_speed_floor(vs_clean_kts: Option<f64>) {
-    *SPEED_FLOOR_KTS.lock().unwrap_or_else(|e| e.into_inner()) = vs_clean_kts
+/// The speed floor for a clean stall speed. Pure.
+pub fn speed_floor_for(vs_clean_kts: Option<f64>) -> Option<f64> {
+    vs_clean_kts
         .filter(|v| *v > 0.0)
-        .map(|v| (v * SPEED_FLOOR_RATIO).round());
+        .map(|v| (v * SPEED_FLOOR_RATIO).round())
+}
+
+/// Publish the airframe's speed floor alone.
+#[cfg(test)]
+pub fn publish_speed_floor(vs_clean_kts: Option<f64>) {
+    let f = speed_floor_for(vs_clean_kts);
+    update_airframe_facts(|a| a.speed_floor_kts = f);
 }
 
 /// The live airframe's speed floor, kts, if its profile declares a clean stall.
 pub fn speed_floor_kts() -> Option<f64> {
-    *SPEED_FLOOR_KTS.lock().unwrap_or_else(|e| e.into_inner())
+    airframe_facts().speed_floor_kts
 }
 
 // The "too slow" ratios over the clean stall, in one place so a change to
@@ -3145,14 +3372,24 @@ pub const RECOVERY_HOLD_MIN_KTS: f64 = 70.0;
 /// (found on the profile review, 2026-09-20). The cap is now the airframe's
 /// own, [`ceiling_from_vne`], republished per swap like the floor. Below 10,000 ft the 250 kt rule still applies on top of it
 /// (`speedhold::BELOW_10K_LIMIT_KTS`); that is airspace, not airframe.
-static SPEED_LIMITS: std::sync::Mutex<SpeedLimits> =
-    std::sync::Mutex::new(SpeedLimits { vne_kts: None, vmo_high: None });
-
-/// The live airframe's declared speed limits, the ceilings' one source.
+///
+/// The live airframe's declared speed limits (the snapshot's
+/// `speed_limits`), the ceilings' one source.
 #[derive(Debug, Clone, Copy)]
-struct SpeedLimits {
+pub struct SpeedLimits {
     vne_kts: Option<f64>,
     vmo_high: Option<VmoHigh>,
+}
+
+impl SpeedLimits {
+    /// From a profile's Vne and high-altitude Vmo, the insane ones dropped.
+    /// Pure.
+    pub fn new(vne_kts: Option<f64>, vmo_high: Option<VmoHigh>) -> Self {
+        SpeedLimits {
+            vne_kts: vne_kts.filter(|v| *v > 0.0),
+            vmo_high: vmo_high.and_then(VmoHigh::valid),
+        }
+    }
 }
 /// The monitor's overspeed caution floor, a fraction of Vne (the monitor's
 /// `OVERSPEED_CAUTION_FACTOR` is this one).
@@ -3174,12 +3411,11 @@ pub fn ceiling_from_vne(vne_kts: f64) -> f64 {
 }
 
 /// Publish the airframe's speed ceiling from its Vne and its high-altitude
-/// Vmo, if any. Called on EVERY profile swap, `None` included.
+/// Vmo alone.
+#[cfg(test)]
 pub fn publish_speed_ceiling(vne_kts: Option<f64>, vmo_high: Option<VmoHigh>) {
-    *SPEED_LIMITS.lock().unwrap_or_else(|e| e.into_inner()) = SpeedLimits {
-        vne_kts: vne_kts.filter(|v| *v > 0.0),
-        vmo_high: vmo_high.and_then(VmoHigh::valid),
-    };
+    let l = SpeedLimits::new(vne_kts, vmo_high);
+    update_airframe_facts(|a| a.speed_limits = l);
 }
 
 /// The live airframe's speed ceiling, kts, if its profile declares a Vne:
@@ -3187,7 +3423,7 @@ pub fn publish_speed_ceiling(vne_kts: Option<f64>, vmo_high: Option<VmoHigh>) {
 /// altitude (conservative). With one in hand, [`speed_ceiling_kts_at`] or
 /// [`VmoCeiling`].
 pub fn speed_ceiling_kts() -> Option<f64> {
-    SPEED_LIMITS.lock().unwrap_or_else(|e| e.into_inner()).vne_kts.map(ceiling_from_vne)
+    airframe_facts().speed_limits.vne_kts.map(ceiling_from_vne)
 }
 
 /// A Vmo that applies at and above an INDICATED altitude (the profile's
@@ -3263,13 +3499,13 @@ impl AircraftProfile {
 /// The live airframe's Vne/Vmo at an indicated altitude ([`vne_at`] over
 /// the published limits).
 pub fn published_vne_at(alt_ft: f64) -> Option<f64> {
-    let l = *SPEED_LIMITS.lock().unwrap_or_else(|e| e.into_inner());
+    let l = airframe_facts().speed_limits;
     vne_at(l.vne_kts, l.vmo_high, alt_ft)
 }
 
 /// The live airframe's high-altitude Vmo, when its profile declares a sane one.
 pub fn published_vmo_high() -> Option<VmoHigh> {
-    SPEED_LIMITS.lock().unwrap_or_else(|e| e.into_inner()).vmo_high.and_then(VmoHigh::valid)
+    airframe_facts().speed_limits.vmo_high.and_then(VmoHigh::valid)
 }
 
 /// The live airframe's speed ceiling at an indicated altitude: the clean
@@ -3320,7 +3556,7 @@ pub struct VmoCeiling {
 impl VmoCeiling {
     /// Advance on the live airframe's published limits.
     pub fn ceiling(&mut self, alt_ft: f64, vs_fpm: f64) -> Option<f64> {
-        let l = *SPEED_LIMITS.lock().unwrap_or_else(|e| e.into_inner());
+        let l = airframe_facts().speed_limits;
         self.ceiling_for(l.vne_kts, l.vmo_high, alt_ft, vs_fpm)
     }
 
@@ -3585,19 +3821,23 @@ pub fn step_climb_ft(cruise_ft: f64, optimum_ft: f64) -> Option<f64> {
 /// approach at 167 flew it to the threshold 22 kt fast, over a flap gate
 /// (Vfe40 162) the schedule could never pass, and into two go-arounds
 /// (LFLL 35L, 2026-09-17). On a 172 (Vso 40, Vs 48) the two floors are
-/// 48 and 58 under a 65 kt approach: nothing changes.
-static APPROACH_FLOOR_KTS: std::sync::Mutex<Option<f64>> = std::sync::Mutex::new(None);
-
-/// Publish the landing-configuration floor. Called on EVERY profile swap,
-/// after [`publish_speed_floor`].
-pub fn publish_approach_floor(vs0_kts: Option<f64>, vs_clean_kts: Option<f64>) {
+/// 48 and 58 under a 65 kt approach: nothing changes. The snapshot's
+/// `approach_floor_kts`. Pure.
+pub fn approach_floor_for(vs0_kts: Option<f64>, vs_clean_kts: Option<f64>) -> Option<f64> {
     let by_vso = vs0_kts
         .filter(|v| *v > 0.0)
         .map(|v| (v * SPEED_FLOOR_RATIO).round());
     let clean = vs_clean_kts
         .filter(|v| *v > 0.0)
         .map(|v| (v * SPEED_FLOOR_RATIO).round());
-    *APPROACH_FLOOR_KTS.lock().unwrap_or_else(|e| e.into_inner()) = by_vso.or(clean);
+    by_vso.or(clean)
+}
+
+/// Publish the landing-configuration floor alone.
+#[cfg(test)]
+pub fn publish_approach_floor(vs0_kts: Option<f64>, vs_clean_kts: Option<f64>) {
+    let f = approach_floor_for(vs0_kts, vs_clean_kts);
+    update_airframe_facts(|a| a.approach_floor_kts = f);
 }
 
 /// The live airframe's stall table: its clean and landing stall and the
@@ -3609,36 +3849,43 @@ pub struct StallCurve {
     pub points: Vec<(f64, f64)>,
 }
 
-static STALL_CURVE: std::sync::Mutex<Option<StallCurve>> = std::sync::Mutex::new(None);
-
-/// Publish the stall table. Called on EVERY profile swap; `None` (the
-/// straight line) unless the profile has a clean stall AND a detent that
-/// declares its own.
-pub fn publish_stall_curve(
+/// The stall table: `None` (the straight line) unless the profile has a
+/// clean stall AND a detent that declares its own. Pure.
+pub fn stall_curve_for(
     vs_clean_kts: Option<f64>,
     vs0_kts: Option<f64>,
     flaps: Option<&FlapProfile>,
-) {
+) -> Option<StallCurve> {
     let points = detent_stall_points(flaps);
-    let curve = vs_clean_kts
+    vs_clean_kts
         .filter(|v| v.is_finite() && *v > 0.0)
         .filter(|_| !points.is_empty())
         .map(|vs| StallCurve {
             vs_clean_kts: vs,
             vs0_kts,
             points,
-        });
-    *STALL_CURVE.lock().unwrap_or_else(|e| e.into_inner()) = curve;
+        })
+}
+
+/// Publish the stall table alone.
+#[cfg(test)]
+pub fn publish_stall_curve(
+    vs_clean_kts: Option<f64>,
+    vs0_kts: Option<f64>,
+    flaps: Option<&FlapProfile>,
+) {
+    let c = stall_curve_for(vs_clean_kts, vs0_kts, flaps);
+    update_airframe_facts(|a| a.stall_curve = c);
 }
 
 /// The live airframe's stall table, when its profile declares one.
 pub fn stall_curve() -> Option<StallCurve> {
-    STALL_CURVE.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    airframe_facts().stall_curve.clone()
 }
 
 /// The live airframe's landing-configuration floor, kts.
 pub fn approach_floor_kts() -> Option<f64> {
-    *APPROACH_FLOOR_KTS.lock().unwrap_or_else(|e| e.into_inner())
+    airframe_facts().approach_floor_kts
 }
 
 /// The floor for the configuration the aircraft is IN: the clean floor with
@@ -3675,102 +3922,62 @@ pub fn config_floor_kts(flap_ratio: f64) -> Option<f64> {
 /// ratio (`None` = idle is allowed). A jet's approach is flown ON thrust:
 /// the 737 idled for the last mile to lose the circuit's excess and arrived
 /// over the numbers 4 kt under Vref still spooling up (LFLL, 2026-09-17).
-static APPROACH_THRUST_MIN: std::sync::Mutex<Option<f64>> = std::sync::Mutex::new(None);
+/// The snapshot's `approach_thrust_min`, a sane lever ratio or none. Pure.
+pub fn approach_thrust_min_for(min: Option<f64>) -> Option<f64> {
+    min.filter(|v| v.is_finite() && (0.0..=1.0).contains(v))
+}
 
-/// Publish the airframe's approach thrust floor. Called on EVERY profile swap.
+/// Publish the airframe's approach thrust floor alone.
+#[cfg(test)]
 pub fn publish_approach_thrust_min(min: Option<f64>) {
-    *APPROACH_THRUST_MIN
-        .lock()
-        .unwrap_or_else(|e| e.into_inner()) =
-        min.filter(|v| v.is_finite() && (0.0..=1.0).contains(v));
+    let m = approach_thrust_min_for(min);
+    update_airframe_facts(|a| a.approach_thrust_min = m);
 }
 
 /// The live airframe's approach thrust floor, if its profile declares one.
 pub fn approach_thrust_min() -> Option<f64> {
-    *APPROACH_THRUST_MIN
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
+    airframe_facts().approach_thrust_min
 }
 
-/// The landing arrest's lead for the live airframe (see [`ArrestLeadProfile`]).
-static ARREST_LEAD: std::sync::Mutex<ArrestLeadProfile> =
-    std::sync::Mutex::new(ArrestLeadProfile {
-        gain: 2.0,
-        max_climb_fpm: 300.0,
-        trend_seconds: 0.0,
-    });
-
-/// Publish the airframe's arrest lead. Called on EVERY profile swap; an
-/// absent or malformed block is the default, never the previous airframe's.
-pub fn publish_arrest_lead(lead: Option<ArrestLeadProfile>) {
-    *ARREST_LEAD.lock().unwrap_or_else(|e| e.into_inner()) =
-        lead.and_then(ArrestLeadProfile::valid).unwrap_or_default();
-}
-
-/// The live airframe's arrest lead.
+/// The live airframe's arrest lead (see [`ArrestLeadProfile`]): an absent
+/// or malformed block is the default, never the previous airframe's.
 pub fn arrest_lead() -> ArrestLeadProfile {
-    *ARREST_LEAD.lock().unwrap_or_else(|e| e.into_inner())
+    airframe_facts().arrest_lead
 }
 
 /// The live airframe's whole profile, for the few consumers that need the
 /// tool surface itself away from the command loop (the stand shutdown builds
 /// the registry from it). Republished on EVERY swap by `publish_airframe`.
-static LIVE_PROFILE: std::sync::Mutex<Option<std::sync::Arc<AircraftProfile>>> =
-    std::sync::Mutex::new(None);
-
-pub fn publish_live_profile(p: &AircraftProfile) {
-    *LIVE_PROFILE.lock().unwrap_or_else(|e| e.into_inner()) = Some(std::sync::Arc::new(p.clone()));
-}
-
 pub fn live_profile() -> Option<std::sync::Arc<AircraftProfile>> {
-    LIVE_PROFILE.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    airframe_facts().profile.clone()
 }
 
 /// The flare's elevator law for the live airframe (see
-/// [`FlareElevatorProfile`]); `None` is the default law.
-static FLARE_ELEVATOR: std::sync::Mutex<Option<FlareElevatorProfile>> =
-    std::sync::Mutex::new(None);
-
-/// Publish it. Called on EVERY profile swap; absent is the default law,
-/// never the previous airframe's.
-pub fn publish_flare_elevator(p: Option<FlareElevatorProfile>) {
-    *FLARE_ELEVATOR.lock().unwrap_or_else(|e| e.into_inner()) =
-        p.and_then(FlareElevatorProfile::valid);
-}
-
+/// [`FlareElevatorProfile`]); `None` is the default law, never the previous
+/// airframe's.
 pub fn flare_elevator() -> Option<FlareElevatorProfile> {
-    *FLARE_ELEVATOR.lock().unwrap_or_else(|e| e.into_inner())
+    airframe_facts().flare_elevator
 }
 
 /// The live airframe's rudder authority on the roll (see
-/// [`RollRudderProfile`]); `None` is the default roll law.
-static ROLL_RUDDER: std::sync::Mutex<Option<RollRudderProfile>> = std::sync::Mutex::new(None);
-
-/// Publish it. Called on EVERY profile swap; absent is the default law,
-/// never the previous airframe's.
-pub fn publish_roll_rudder(p: Option<RollRudderProfile>) {
-    *ROLL_RUDDER.lock().unwrap_or_else(|e| e.into_inner()) = p.and_then(RollRudderProfile::valid);
-}
-
+/// [`RollRudderProfile`]); `None` is the default roll law, never the
+/// previous airframe's.
 pub fn roll_rudder() -> Option<RollRudderProfile> {
-    *ROLL_RUDDER.lock().unwrap_or_else(|e| e.into_inner())
+    airframe_facts().roll_rudder
 }
 
-/// The live airframe's landing distance in metres, if its profile recites
-/// one. The autoland's float rule asks it how much pavement a landing from
-/// here still needs; `None` is the old GA figure.
-static LANDING_DISTANCE_M: std::sync::Mutex<Option<f64>> = std::sync::Mutex::new(None);
-
-/// Publish the airframe's landing distance. Called on EVERY profile swap.
-pub fn publish_landing_distance(feet: Option<f64>) {
-    *LANDING_DISTANCE_M.lock().unwrap_or_else(|e| e.into_inner()) = feet
-        .filter(|v| v.is_finite() && *v > 0.0)
-        .map(|v| v * 0.3048);
+/// An airframe's landing distance in metres from the profile's feet, if it
+/// recites one. Pure.
+pub fn landing_distance_m_for(feet: Option<f64>) -> Option<f64> {
+    feet.filter(|v| v.is_finite() && *v > 0.0)
+        .map(|v| v * 0.3048)
 }
 
-/// The live airframe's landing distance, metres.
+/// The live airframe's landing distance, metres. The autoland's float rule
+/// asks it how much pavement a landing from here still needs; `None` is the
+/// old GA figure.
 pub fn landing_distance_m() -> Option<f64> {
-    *LANDING_DISTANCE_M.lock().unwrap_or_else(|e| e.into_inner())
+    airframe_facts().landing_distance_m
 }
 
 /// `asked`, raised to the floor when it is under it. Pure; the callers say so
@@ -3784,7 +3991,7 @@ pub fn floored_target(asked: f64, floor: Option<f64>) -> f64 {
 
 /// The live airframe's VLO/VLE, if its profile declares one.
 pub fn gear_limit_kts() -> Option<f64> {
-    *GEAR_LIMIT_KTS.lock().unwrap_or_else(|e| e.into_inner())
+    airframe_facts().gear_limit_kts
 }
 
 /// How far a flap reading may sit from a detent and still be AT it: the
@@ -3821,10 +4028,7 @@ pub fn flap_placard_kts(flap_ratio: f64, limits: &[(f64, Option<f64>)]) -> Optio
 
 /// The live airframe's flap detents as `(ratio, Vfe)`, retracted first.
 pub fn flap_limits() -> Vec<(f64, Option<f64>)> {
-    FLAP_LIMITS
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .clone()
+    airframe_facts().flap_limits.clone()
 }
 
 /// The dataref every throttle write and read should use.
@@ -3839,10 +4043,7 @@ pub fn flap_limits() -> Vec<(f64, Option<f64>)> {
 /// and had no way to know.
 pub fn throttle_dataref() -> String {
     #[cfg(not(test))]
-    let published = THROTTLE_DREF
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .clone();
+    let published = airframe_facts().throttle_dref.clone();
     #[cfg(test)]
     let published = THROTTLE_DREF_T.with(|t| t.borrow().clone());
     published.unwrap_or_else(|| STOCK_THROTTLE.to_string())

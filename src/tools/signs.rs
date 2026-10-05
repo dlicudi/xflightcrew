@@ -14,8 +14,8 @@
 //! every step. Any other airframe with a cabin gets the stock switch written.
 //! An airframe with neither has no signs and nothing is touched.
 
+use crate::aircraft::SignsSwitch as Signs;
 use crate::xplane::XPlane;
-use std::sync::Mutex;
 
 /// 0 off, 1 auto, 2 on.
 const STOCK_SWITCH: &str = "sim/cockpit2/switches/fasten_seat_belts";
@@ -25,28 +25,23 @@ const STOCK_SWITCH: &str = "sim/cockpit2/switches/fasten_seat_belts";
 pub const SIGNS_ALT_FT: f64 = 10_000.0;
 const SIGNS_BAND_FT: f64 = 300.0;
 
-#[derive(Clone)]
-enum Signs {
-    Stock,
-    Own(crate::aircraft::SeatBeltSigns),
+/// Publish the signs alone (the snapshot's `signs`, republished on every
+/// swap, including to nothing, by [`crate::flight_state::publish_airframe`]).
+#[cfg(test)]
+pub fn publish(own: Option<crate::aircraft::SeatBeltSigns>, has_cabin: bool) {
+    let s = Signs::for_profile(own, has_cabin);
+    crate::aircraft::update_airframe_facts(|a| a.signs = s);
 }
 
-static SIGNS: Mutex<Option<Signs>> = Mutex::new(None);
-
-/// Republished on every swap, including to nothing
-/// ([`crate::flight_state::publish_airframe`]).
-pub fn publish(own: Option<crate::aircraft::SeatBeltSigns>, has_cabin: bool) {
-    *SIGNS.lock().unwrap_or_else(|e| e.into_inner()) = match own {
-        Some(s) => Some(Signs::Own(s)),
-        None if has_cabin => Some(Signs::Stock),
-        None => None,
-    };
+/// The live airframe's seat belt switch, `None` with no signs.
+fn signs() -> Option<Signs> {
+    crate::aircraft::airframe_facts().signs.clone()
 }
 
 /// Is `dataref` the seat belt switch this airframe's signs are worked by?
 /// The stock switch, or the add-on's declared position dataref.
 pub fn is_signs_dataref(dataref: &str) -> bool {
-    match SIGNS.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+    match signs().as_ref() {
         Some(Signs::Own(own)) => dataref == own.position || dataref == STOCK_SWITCH,
         Some(Signs::Stock) => dataref == STOCK_SWITCH,
         None => false,
@@ -56,7 +51,7 @@ pub fn is_signs_dataref(dataref: &str) -> bool {
 /// Switch the signs. `None` on an airframe with none; otherwise whether the
 /// switch READ BACK where it was asked.
 pub async fn set(xp: &dyn XPlane, on: bool) -> Option<bool> {
-    let signs = SIGNS.lock().unwrap_or_else(|e| e.into_inner()).clone()?;
+    let signs = signs()?;
     let ok = match signs {
         Signs::Stock => {
             let want = if on { 2 } else { 0 };
@@ -109,7 +104,7 @@ mod tests {
     use super::*;
     use crate::xplane::FakeXPlane;
 
-    static LOCK: Mutex<()> = Mutex::new(());
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
     fn the_signs_change_once_per_crossing() {

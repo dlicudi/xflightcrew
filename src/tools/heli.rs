@@ -348,11 +348,8 @@ impl Hover {
         start: StartHelicopter,
         taxi: crate::heli_route::TaxiIn,
     ) -> Self {
-        crate::hover::publish_rotor(Some((
-            p.rotor_rpm.clone(),
-            p.rotor_rpm_governed,
-            p.collective.clone(),
-        )));
+        // The rotor facts are the airframe snapshot's (`publish_airframe`):
+        // building a registry for a profile never writes the live airframe.
         Self {
             collective: p.collective.clone(),
             start,

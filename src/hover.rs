@@ -341,19 +341,12 @@ pub fn status() -> Option<String> {
     })
 }
 
-/// Stand the hover down: the loop's next tick hands back the aircraft.
 /// The rotor's rpm dataref (element 0) and governed speed, from the airframe
 /// profile, for the droop guard, and the collective's dataref for callers
-/// outside the hover tool (the taxi-in). `None` off a helicopter.
-static ROTOR: Mutex<Option<(String, f64, String)>> = Mutex::new(None);
-
-pub fn publish_rotor(r: Option<(String, f64, String)>) {
-    *ROTOR.lock().unwrap_or_else(|e| e.into_inner()) = r;
-}
-
-/// The rotor facts [`publish_rotor`] takes, from a profile: `None` on
-/// anything that is not a helicopter, so a swap to an aeroplane clears them
-/// (`flight_state::publish_airframe`).
+/// outside the hover tool (the taxi-in). `None` on anything that is not a
+/// helicopter, so a swap to an aeroplane clears them: the airframe
+/// snapshot's `rotor`, whose one writer is `flight_state::publish_airframe`
+/// (building a tool registry for a profile never writes it).
 pub fn rotor_facts(p: &crate::aircraft::AircraftProfile) -> Option<(String, f64, String)> {
     p.heli_start.as_ref().map(|h| {
         (
@@ -365,18 +358,16 @@ pub fn rotor_facts(p: &crate::aircraft::AircraftProfile) -> Option<(String, f64,
 }
 
 fn rotor() -> Option<(String, f64)> {
-    ROTOR
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
+    crate::aircraft::airframe_facts()
+        .rotor
         .as_ref()
         .map(|(d, g, _)| (d.clone(), *g))
 }
 
 /// The collective dataref of the helicopter loaded, `None` on anything else.
 pub fn collective_dref() -> Option<String> {
-    ROTOR
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
+    crate::aircraft::airframe_facts()
+        .rotor
         .as_ref()
         .map(|(_, _, c)| c.clone())
 }

@@ -1508,11 +1508,10 @@ pub struct Params {
 /// altitude dial and the autopilot's own capture holds the level legs (see
 /// [`ap_holds_level`]). Off, the VS law flies altitude as it always has and
 /// the dial is only lifted out of the way. Republished on every swap
-/// ([`crate::flight_state::publish_airframe`]).
-static AP_ALTITUDE_CAPTURE: AtomicBool = AtomicBool::new(false);
-
-pub fn publish_ap_altitude_capture(on: bool) {
-    AP_ALTITUDE_CAPTURE.store(on, Ordering::SeqCst);
+/// ([`crate::flight_state::publish_airframe`]), the snapshot's
+/// `ap_altitude_capture`.
+fn ap_altitude_capture() -> bool {
+    crate::aircraft::airframe_facts().ap_altitude_capture
 }
 
 const ALT_HOLD_STATUS: &str = autoflight::names::ALT_HOLD_STATUS;
@@ -3478,7 +3477,7 @@ async fn fly_authored_route(
     let mut lights_done = false;
     // The autopilot's own capture on the level legs, where the airframe
     // declares it (`ap_altitude_capture`), as the rectangle does (#80).
-    let ap_capture = AP_ALTITUDE_CAPTURE.load(Ordering::SeqCst);
+    let ap_capture = ap_altitude_capture();
     let mut vs_refused: Option<std::time::Instant> = None;
     let mut vs_refused_said = false;
     loop {
@@ -4228,7 +4227,7 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, p: Params
     // altitude dial before the roll and the autopilot's own capture holds it
     // (see `ap_holds_level`). Otherwise the takeoff only lifts a dial the
     // climb would bust through, well clear of the pattern.
-    let p_ap_capture = AP_ALTITUDE_CAPTURE.load(Ordering::SeqCst);
+    let p_ap_capture = ap_altitude_capture();
     let mut takeoff = p.takeoff;
     if p_ap_capture {
         takeoff.level_ft = Some(tpa_msl_ft);

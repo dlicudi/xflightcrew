@@ -26,24 +26,8 @@
 /// Every production static under `src/`, as `module::path::NAME` and its
 /// lifetime code (see the module table).
 pub(crate) const LIFETIMES: &[(&str, char)] = &[
-    ("aircraft::APPROACH_FLOOR_KTS", 'A'),
-    ("aircraft::APPROACH_THRUST_MIN", 'A'),
-    ("aircraft::ARREST_LEAD", 'A'),
-    ("aircraft::BUS_VOLTS_NOMINAL", 'A'),
-    ("aircraft::FLAP_LIMITS", 'A'),
-    ("aircraft::FLARE_ELEVATOR", 'A'),
-    ("aircraft::FUEL_UNIT", 'A'),
-    ("aircraft::GEAR_LIMIT_KTS", 'A'),
-    ("aircraft::LANDING_DISTANCE_M", 'A'),
-    ("aircraft::LIVE_PROFILE", 'A'),
-    ("aircraft::NOSE_CASTORS", 'A'),
-    ("aircraft::NOSE_FREE", 'A'),
-    ("aircraft::ROLL_RUDDER", 'A'),
-    ("aircraft::SPEED_FLOOR_KTS", 'A'),
-    ("aircraft::SPEED_LIMITS", 'A'),
-    ("aircraft::STALL_CURVE", 'A'),
+    ("aircraft::AIRFRAME_FACTS", 'A'),
     ("aircraft::TAKEOFF_MARGIN_WAIVED", 'M'),
-    ("aircraft::THROTTLE_DREF", 'A'),
     ("answers::NEXT", 'C'),
     ("approach_guide::GUIDE", 'L'),
     ("auto_status::AP_TARGETS", 'L'),
@@ -59,12 +43,9 @@ pub(crate) const LIFETIMES: &[(&str, char)] = &[
     ("autoland::VACATE_FOLLOWS", 'F'),
     ("autotakeoff::ACTIVE", 'L'),
     ("autotakeoff::CLIMB_HANDOVER", 'L'),
-    ("autotakeoff::CLIMB_OUT", 'A'),
     ("autotakeoff::DETAIL", 'L'),
-    ("autotakeoff::GEAR_WARNING", 'A'),
     ("autotakeoff::REJECT", 'L'),
     ("autotakeoff::RUN", 'L'),
-    ("autotakeoff::TAKEOFF_POWER", 'A'),
     ("autotaxi::ACTIVE", 'L'),
     ("autotaxi::BACKTRACKING", 'L'),
     ("autotaxi::DETAIL", 'L'),
@@ -76,7 +57,6 @@ pub(crate) const LIFETIMES: &[(&str, char)] = &[
     ("autotaxi::RUN", 'L'),
     ("cabin::STAFFING", 'P'),
     ("circuit::ACTIVE", 'L'),
-    ("circuit::AP_ALTITUDE_CAPTURE", 'A'),
     ("circuit::DETAIL", 'L'),
     ("circuit::LAST_BUG", 'L'),
     ("circuit::RUN", 'L'),
@@ -132,7 +112,6 @@ pub(crate) const LIFETIMES: &[(&str, char)] = &[
     ("hover::GOAL", 'L'),
     ("hover::MOTION", 'L'),
     ("hover::RELEASED", 'L'),
-    ("hover::ROTOR", 'A'),
     ("hover::RUN", 'L'),
     ("hover::TURN_MAG", 'L'),
     ("ils::SETUP", 'L'),
@@ -157,10 +136,7 @@ pub(crate) const LIFETIMES: &[(&str, char)] = &[
     ("pollers::UI_SCALE", 'P'),
     ("procedure::ABORT", 'L'),
     ("procedure::ACTIVE", 'L'),
-    ("procedure::BEST_CLIMB_FPM", 'A'),
     ("procedure::CLEARED_CEILING", 'F'),
-    ("procedure::CLIMB_FPM", 'A'),
-    ("procedure::DESCENT_FPM", 'A'),
     ("procedure::DETAIL", 'L'),
     ("procedure::DRAG_OURS", 'L'),
     ("procedure::FIX_DIST", 'L'),
@@ -190,7 +166,6 @@ pub(crate) const LIFETIMES: &[(&str, char)] = &[
     ("settings::LIVE", 'P'),
     ("simbrief::SHELF", 'S'),
     ("systems::CURRENT", 'A'),
-    ("takeoff_config::AIRFRAME", 'A'),
     ("taxi_in::ACTIVE", 'L'),
     ("taxi_in::ARREST_HOLD", 'F'),
     ("taxi_in::CANCEL_HOLD", 'L'),
@@ -203,7 +178,6 @@ pub(crate) const LIFETIMES: &[(&str, char)] = &[
     ("test_card::ITEMS", 'C'),
     ("tools::anti_ice::CLAIMED", 'A'),
     ("tools::autopilot::CAPTURE", 'L'),
-    ("tools::cabin_air::CABIN_AIR", 'A'),
     ("tools::cabin_air::MASKS", 'S'),
     ("tools::controls::BRAKES_HELD", 'L'),
     ("tools::controls::BRAKE_HOLD", 'L'),
@@ -211,14 +185,11 @@ pub(crate) const LIFETIMES: &[(&str, char)] = &[
     ("tools::engine::MIX_MANAGED", 'L'),
     ("tools::full_auto::SAID", 'S'),
     ("tools::ground::CART_REQUESTED", 'F'),
-    ("tools::instruments::ALTIMETER", 'A'),
     ("tools::instruments::ALTIMETER_TRUTH", 'A'),
     ("tools::instruments::FLIGHT_TRANSITION", 'F'),
     ("tools::jet_start::JET_START", 'L'),
-    ("tools::lights::EXTERIOR", 'A'),
     ("tools::mod::LAST_BRAKE_CMD", 'S'),
     ("tools::power::POWER_UP", 'L'),
-    ("tools::radio::MODE_KNOB", 'A'),
     ("tools::recover::ACTIVE", 'L'),
     ("tools::recover::RUN", 'L'),
     ("tools::reverse::ACTIVE", 'L'),
@@ -227,7 +198,6 @@ pub(crate) const LIFETIMES: &[(&str, char)] = &[
     ("tools::setup::LIB", 'C'),
     ("tools::setup::NEW_FLIGHT_LOADING", 'S'),
     ("tools::setup::OWN_INITS", 'S'),
-    ("tools::signs::SIGNS", 'A'),
     ("tools::speedhold::ACTIVE", 'L'),
     ("tools::speedhold::ACTUAL", 'L'),
     ("tools::speedhold::GOVERNOR", 'L'),
@@ -408,6 +378,39 @@ mod tests {
             stale.is_empty(),
             "LIFETIMES names statics no longer declared: {stale:?}"
         );
+    }
+
+    /// A `Scoped::flight()` cell dies with its flight, so its manifest code
+    /// says no longer: `F`, or `L` for a loop's hand-down. A cell declared
+    /// flight-scoped but listed as living longer is one of the two wrong.
+    #[test]
+    fn a_flight_scoped_cell_is_listed_as_living_one_flight() {
+        let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let table: BTreeMap<&str, char> = LIFETIMES.iter().copied().collect();
+        let mut scoped = Vec::new();
+        for f in crate::test_support::rust_files(&src) {
+            if crate::test_support::is_test_file(&f) {
+                continue;
+            }
+            let module = module_path(f.strip_prefix(&src).unwrap());
+            let text = std::fs::read_to_string(&f).expect("read source");
+            let lines: Vec<&str> = text.lines().collect();
+            for (i, line) in lines.iter().enumerate() {
+                let Some(name) = static_name(line) else { continue };
+                let decl = format!("{line}{}", lines.get(i + 1).copied().unwrap_or(""));
+                if decl.contains("Scoped::flight()") {
+                    scoped.push(format!("{module}::{name}"));
+                }
+            }
+        }
+        assert!(scoped.len() >= 3, "the scoped cells: {scoped:?}");
+        for k in &scoped {
+            let code = table.get(k.as_str()).copied();
+            assert!(
+                matches!(code, Some('F') | Some('L')),
+                "{k} is Scoped::flight() but listed as {code:?}"
+            );
+        }
     }
 
     #[test]

@@ -15,38 +15,12 @@ use sim::xplane::XPlane;
 use super::{Tool, ToolCtx};
 use crate::aircraft::LightProfile;
 
-/// The active airframe's landing and taxi lights, the two the ground and
-/// climb stages switch. Process-wide, so it is republished on EVERY profile
-/// swap, including to an empty set, never merely set when an airframe
-/// happens to have them (the transponder knob's lesson, 2026-07-27).
-#[derive(Clone, Debug, Default)]
-pub struct Exterior {
-    pub landing: Option<LightProfile>,
-    pub taxi: Option<LightProfile>,
-}
-
-static EXTERIOR: std::sync::Mutex<Exterior> = std::sync::Mutex::new(Exterior {
-    landing: None,
-    taxi: None,
-});
-
-/// Publish the active airframe's exterior set. Called from the one place
-/// the live profile changes.
-pub fn publish_exterior(lights: &[LightProfile]) {
-    let pick = |key: &str| {
-        lights
-            .iter()
-            .find(|l| l.key.eq_ignore_ascii_case(key))
-            .cloned()
-    };
-    *EXTERIOR.lock().unwrap_or_else(|e| e.into_inner()) = Exterior {
-        landing: pick("landing"),
-        taxi: pick("taxi"),
-    };
-}
+/// The active airframe's landing and taxi lights (the airframe snapshot's
+/// type, republished on EVERY profile swap, including to an empty set).
+pub use crate::aircraft::Exterior;
 
 fn exterior() -> Exterior {
-    EXTERIOR.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    crate::aircraft::airframe_facts().exterior.clone()
 }
 
 /// The sun's elevation; a slow dataref (see the sim crate's list).

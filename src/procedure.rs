@@ -485,16 +485,22 @@ pub struct Plan {
 }
 
 /// The published missed approach of the approach being landed, stashed at the
-/// MAP handoff for the landing's go-around (`take_missed_legs`).
-static MISSED_LEGS: std::sync::Mutex<Option<Vec<ProcLeg>>> = std::sync::Mutex::new(None);
+/// MAP handoff for the landing's go-around (`take_missed_legs`). This
+/// flight's only (`Scoped`): a stash the abort missed never flies another
+/// flight's go-around.
+static MISSED_LEGS: crate::scoped::Scoped<Vec<ProcLeg>> = crate::scoped::Scoped::flight();
 
 /// Take the stashed missed approach (autoland, at a go-around).
 pub fn take_missed_legs() -> Option<Vec<ProcLeg>> {
-    MISSED_LEGS.lock().unwrap_or_else(|e| e.into_inner()).take()
+    MISSED_LEGS.take()
 }
 
 fn stash_missed_legs(legs: Vec<ProcLeg>) {
-    *MISSED_LEGS.lock().unwrap_or_else(|e| e.into_inner()) = (!legs.is_empty()).then_some(legs);
+    if legs.is_empty() {
+        MISSED_LEGS.clear();
+    } else {
+        MISSED_LEGS.set(legs);
+    }
 }
 
 /// Autoland flies the visual segment from a MAP. Off until it is proven: at
@@ -1550,46 +1556,52 @@ pub fn look_ahead_points(
 /// 2026-09-20.
 const GA_VS_FPM: f64 = 700.0;
 
-/// The enroute climb and descent rates for the LIVE airframe, republished on
-/// every profile swap by [`crate::flight_state::publish_airframe`] — a
-/// process-wide fact must never outlive its airframe.
-static CLIMB_FPM: std::sync::Mutex<f64> = std::sync::Mutex::new(GA_VS_FPM);
-static DESCENT_FPM: std::sync::Mutex<f64> = std::sync::Mutex::new(GA_VS_FPM);
-static BEST_CLIMB_FPM: std::sync::Mutex<Option<f64>> = std::sync::Mutex::new(None);
-
-/// Publish the airframe's enroute vertical rates. Called on EVERY swap, with
-/// the GA figure when the profile is silent, so the last aircraft's rates can
-/// never be pointed at the next one.
-pub fn publish_vs_limits(r: Option<&crate::aircraft::ReferenceProfile>) {
+/// The enroute climb and descent rates of an airframe, the GA figure where
+/// the profile is silent, so the last aircraft's rates can never be pointed
+/// at the next one. The LIVE airframe's are the snapshot's `vs_limits`,
+/// republished on every profile swap by
+/// [`crate::flight_state::publish_airframe`]. Pure.
+pub fn vs_limits_for(r: Option<&crate::aircraft::ReferenceProfile>) -> crate::aircraft::VsLimits {
     let pick = |v: Option<f64>| v.filter(|f| f.is_finite() && *f > 0.0).unwrap_or(GA_VS_FPM);
-    *CLIMB_FPM.lock().unwrap_or_else(|e| e.into_inner()) =
-        pick(r.and_then(|r| r.enroute_climb_fpm));
-    *DESCENT_FPM.lock().unwrap_or_else(|e| e.into_inner()) =
-        pick(r.and_then(|r| r.enroute_descent_fpm));
-    *BEST_CLIMB_FPM.lock().unwrap_or_else(|e| e.into_inner()) =
-        r.and_then(|r| r.best_climb_fpm).filter(|f| f.is_finite() && *f > 0.0);
+    crate::aircraft::VsLimits {
+        climb_fpm: pick(r.and_then(|r| r.enroute_climb_fpm)),
+        descent_fpm: pick(r.and_then(|r| r.enroute_descent_fpm)),
+        best_climb_fpm: r
+            .and_then(|r| r.best_climb_fpm)
+            .filter(|f| f.is_finite() && *f > 0.0),
+    }
+}
+
+/// Publish the airframe's enroute vertical rates alone.
+#[cfg(test)]
+pub fn publish_vs_limits(r: Option<&crate::aircraft::ReferenceProfile>) {
+    let l = vs_limits_for(r);
+    crate::aircraft::update_airframe_facts(|a| a.vs_limits = Some(l));
+}
+
+/// The live airframe's vertical rates, the GA figure before any airframe.
+fn vs_limits() -> crate::aircraft::VsLimits {
+    crate::aircraft::airframe_facts()
+        .vs_limits
+        .unwrap_or_else(|| vs_limits_for(None))
 }
 
 /// The rate a climb to a departure minimum is flown at: the airframe's best
 /// climb where it declares one, never less than the enroute rate.
 pub fn best_climb_fpm() -> f64 {
-    BEST_CLIMB_FPM
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .unwrap_or(0.0)
-        .max(climb_fpm())
+    vs_limits().best_climb_fpm.unwrap_or(0.0).max(climb_fpm())
 }
 
 /// The live airframe's enroute climb rate, fpm.
 pub fn climb_fpm() -> f64 {
-    *CLIMB_FPM.lock().unwrap_or_else(|e| e.into_inner())
+    vs_limits().climb_fpm
 }
 
 /// The live airframe's enroute descent rate, fpm (magnitude). This both caps
 /// the commanded rate and places the top of descent, so the two can never
 /// disagree: the TOD is put exactly where this rate makes the constraint.
 pub fn descent_fpm() -> f64 {
-    *DESCENT_FPM.lock().unwrap_or_else(|e| e.into_inner())
+    vs_limits().descent_fpm
 }
 
 /// The rate the follower's vertical law will actually fly, fpm (magnitude):

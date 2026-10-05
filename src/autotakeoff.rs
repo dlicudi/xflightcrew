@@ -480,19 +480,16 @@ const GEAR_WARN_MARGIN_KTS: f64 = 3.0;
 /// Knots under the gear placard at which the gear comes up regardless.
 const GEAR_VLO_MARGIN_KTS: f64 = 10.0;
 
-/// The airframe's gear-warning envelope, from its profile or its `.acf`.
-static GEAR_WARNING: std::sync::Mutex<Option<crate::aircraft::GearWarning>> =
-    std::sync::Mutex::new(None);
-
-/// Republished on every swap, including to `None`
+/// The airframe's gear-warning envelope, from its profile or its `.acf`:
+/// republished on every swap, including to `None`
 /// ([`crate::flight_state::publish_airframe`]); the detector publishes the
 /// `.acf`'s envelope over a silent profile once per airframe.
 pub fn publish_gear_warning(w: Option<crate::aircraft::GearWarning>) {
-    *GEAR_WARNING.lock().unwrap_or_else(|e| e.into_inner()) = w;
+    crate::aircraft::update_airframe_facts(|a| a.gear_warning = w);
 }
 
 pub(crate) fn gear_warning() -> Option<crate::aircraft::GearWarning> {
-    *GEAR_WARNING.lock().unwrap_or_else(|e| e.into_inner())
+    crate::aircraft::airframe_facts().gear_warning
 }
 
 /// Is it time to raise the gear after takeoff? Above [`GEAR_UP_AGL_FT`]
@@ -1967,48 +1964,13 @@ pub fn climb_throttle(ias_kts: f64, vne_kts: Option<f64>) -> f64 {
     (1.0 - over * OVERSPEED_THR_PER_KT).max(CLIMB_THROTTLE_MIN)
 }
 
-/// A jet's climb-out, declared by the profile (`acceleration_height_agl_ft`
-/// and `best_climb_fpm`) and republished on every swap.
-///
-/// EGPH 24, 2026-09-21, the 737: every airframe climbed out on one capped
-/// 1,500 fpm dial at takeoff thrust. That is a 172's whole climb and a fifth
-/// of a 737's excess power, so the rest went into speed: 185 kt at 340 ft,
-/// the flaps running up on speed alone at 400, 500 and 740 ft, 240 kt through
-/// 1,000 ft. A crew holds V2 + 20 to the acceleration height by PITCH, then
-/// lowers the nose and cleans up on the schedule.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct ClimbOut {
-    pub accel_agl_ft: f64,
-    /// The hardest the speed hold may climb, fpm.
-    pub max_fpm: f64,
-}
-
-impl ClimbOut {
-    pub fn from_profile(p: &crate::aircraft::AircraftProfile) -> Option<Self> {
-        let r = p.reference.as_ref()?;
-        let accel_agl_ft = r
-            .acceleration_height_agl_ft
-            .filter(|h| h.is_finite() && *h > 0.0)?;
-        Some(ClimbOut {
-            accel_agl_ft,
-            max_fpm: r.best_climb_fpm.filter(|f| f.is_finite()).unwrap_or(0.0),
-        })
-    }
-}
-
-static CLIMB_OUT: std::sync::Mutex<Option<ClimbOut>> = std::sync::Mutex::new(None);
+/// A jet's climb-out (the type is the airframe snapshot's, in `aircraft`).
+pub use crate::aircraft::ClimbOut;
 
 /// The live airframe's manual takeoff power limit
 /// ([`crate::aircraft::TakeoffPowerProfile`]), republished on every swap.
-static TAKEOFF_POWER: std::sync::Mutex<Option<crate::aircraft::TakeoffPowerProfile>> =
-    std::sync::Mutex::new(None);
-
-pub fn publish_takeoff_power(p: Option<crate::aircraft::TakeoffPowerProfile>) {
-    *TAKEOFF_POWER.lock().unwrap_or_else(|e| e.into_inner()) = p;
-}
-
 fn takeoff_power() -> Option<crate::aircraft::TakeoffPowerProfile> {
-    TAKEOFF_POWER.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    crate::aircraft::airframe_facts().takeoff_power.clone()
 }
 
 /// Newton-metres to foot-pounds (`ENGN_TRQ`, `sim::state::F::Trq0`, is in N m).
@@ -2053,19 +2015,19 @@ pub fn torque_limited(
     }
 }
 
-/// Republished on every swap, including to `None`
-/// ([`crate::flight_state::publish_airframe`]).
+/// Publish the climb-out alone (the snapshot's `climb_out`, republished on
+/// every swap by [`crate::flight_state::publish_airframe`]).
+#[cfg(test)]
 pub fn publish_climb_out(c: Option<ClimbOut>) {
-    *CLIMB_OUT.lock().unwrap_or_else(|e| e.into_inner()) = c;
+    crate::aircraft::update_airframe_facts(|a| a.climb_out = c);
 }
 
 /// The declaration, for a takeoff that hands off at or above its height. A
 /// circuit hands off at 500 ft into its own climb law and keeps the old
 /// climb-out whole: half a profile is worse than either.
 fn climb_out_for(handoff_agl_ft: f64) -> Option<ClimbOut> {
-    CLIMB_OUT
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
+    crate::aircraft::airframe_facts()
+        .climb_out
         .filter(|c| handoff_agl_ft >= c.accel_agl_ft)
 }
 

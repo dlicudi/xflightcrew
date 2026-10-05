@@ -341,14 +341,12 @@ impl XpdrMode {
 /// published-once flag that outlives an airframe change is how a cold-and-dark
 /// 172 silently killed a Twin Otter's radio for a whole session (2026-07-27);
 /// the same trap here would aim every mode write at a knob the new aircraft
-/// doesn't have.
-static MODE_KNOB: std::sync::Mutex<Option<crate::aircraft::TransponderModeKnob>> =
-    std::sync::Mutex::new(None);
-
-/// Publish (or clear) the active airframe's transponder selector. Called from
-/// the one place the live profile changes.
+/// doesn't have. The snapshot's `mode_knob`.
+///
+/// Publish (or clear) the active airframe's transponder selector alone.
+#[cfg(test)]
 pub fn publish_mode_knob(knob: Option<crate::aircraft::TransponderModeKnob>) {
-    *MODE_KNOB.lock().unwrap_or_else(|e| e.into_inner()) = knob;
+    crate::aircraft::update_airframe_facts(|a| a.mode_knob = knob);
 }
 
 /// Set the transponder mode on THIS airframe, and confirm it from what the
@@ -363,7 +361,7 @@ pub fn publish_mode_knob(knob: Option<crate::aircraft::TransponderModeKnob>) {
 ///
 /// Returns whether the box now reads what we asked for.
 pub async fn set_mode(xp: &dyn crate::xplane::XPlane, mode: XpdrMode) -> bool {
-    let knob = MODE_KNOB.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let knob = crate::aircraft::airframe_facts().mode_knob.clone();
     let stock_ok = xp.set_int(XPDR_MODE, mode.stock()).await.is_ok();
     let Some(k) = knob else {
         return stock_ok

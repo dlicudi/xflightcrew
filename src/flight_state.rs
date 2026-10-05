@@ -39,58 +39,76 @@ use crate::aircraft::AircraftProfile;
 /// Publish the per-airframe selectors the tools read. Every one is set from
 /// the profile, including to `None`: a process-wide fact must never outlive
 /// its airframe, and a selector that is only set when present is the bug.
+/// The facts are one snapshot ([`airframe_facts`]) installed at once; what
+/// stays beside it are the claims and survey this airframe's flying earns
+/// (systems, masks, the altimeter truth, anti-ice claims) and the mission.
 pub(crate) fn publish_airframe(p: &AircraftProfile) {
-    crate::aircraft::publish_live_profile(p);
+    crate::aircraft::install_airframe_facts(airframe_facts(p));
     // The systems survey is the detector's, from the sim; a new airframe
     // starts knowing nothing about its avionics.
     crate::systems::publish(None);
-    // The .acf's castoring nose is read at detection; a new airframe starts
-    // from its profile alone.
-    crate::aircraft::publish_nose_castors(false);
-    crate::aircraft::publish_nose_free(false);
-    // The rotor is the helicopter's: an aeroplane after the S-76 must not
-    // hover taxi in, be "on the ground" to the tower aloft, or skip a vacate.
-    crate::hover::publish_rotor(crate::hover::rotor_facts(p));
     crate::full_auto::forget_mission();
-    crate::tools::cabin_air::publish(p.cabin_air.clone());
-    crate::tools::radio::publish_mode_knob(p.transponder_mode_knob.clone());
-    crate::takeoff_config::publish(p.takeoff_config.clone());
-    crate::autotakeoff::publish_climb_out(crate::autotakeoff::ClimbOut::from_profile(p));
-    crate::autotakeoff::publish_takeoff_power(p.takeoff_power.clone());
-    crate::autotakeoff::publish_gear_warning(p.gear_warning);
-    crate::tools::signs::publish(p.seat_belt_signs.clone(), p.cabin_crew);
-    crate::circuit::publish_ap_altitude_capture(p.ap_altitude_capture);
-    crate::tools::lights::publish_exterior(&p.lights);
-    crate::aircraft::publish_throttle_dataref(p.throttle_dataref.clone());
-    crate::aircraft::publish_config_limits(p.vlo_kts, p.flaps.as_ref());
-    crate::aircraft::publish_bus_volts(p.bus_volts_nominal);
-    crate::aircraft::publish_speed_floor(p.vs_clean_kts);
-    crate::aircraft::publish_speed_ceiling(p.vne_kts, p.vmo_high);
-    crate::aircraft::publish_approach_floor(
-        p.reference.as_ref().and_then(|r| r.vs0_kts),
-        p.vs_clean_kts,
-    );
-    crate::aircraft::publish_stall_curve(
-        p.vs_clean_kts,
-        p.reference.as_ref().and_then(|r| r.vs0_kts),
-        p.flaps.as_ref(),
-    );
-    crate::aircraft::publish_approach_thrust_min(p.approach_thrust_min);
-    crate::aircraft::publish_arrest_lead(p.arrest_lead);
-    crate::aircraft::publish_flare_elevator(p.flare_elevator);
-    crate::aircraft::publish_roll_rudder(p.roll_rudder);
-    crate::aircraft::publish_landing_distance(
-        p.reference.as_ref().and_then(|r| r.landing_distance_ft),
-    );
-    crate::procedure::publish_vs_limits(p.reference.as_ref());
-    crate::aircraft::publish_fuel_unit(p.fuel.as_ref());
+    // A claim on the masks never outlives its airframe.
+    crate::tools::cabin_air::forget_masks();
     // A plan's transition belongs to the flight it was armed for.
     crate::tools::instruments::publish_flight_transition(None);
-    crate::tools::instruments::publish_altimeter(p.altimeter.clone());
     // The altimeter cross-check was about the last airframe's instruments.
     crate::tools::instruments::publish_altimeter_truth(None);
     // What the crew switched on was the last airframe's anti-ice.
     crate::tools::anti_ice::clear_claims();
+}
+
+/// Every per-airframe fact the tools read, from the profile, as one
+/// snapshot (`aircraft::AirframeFacts`). A literal naming every field, so a
+/// fact added to the struct and forgotten here does not compile: the
+/// "selector only set when present" bug cannot be written. The `.acf`
+/// facts start unread (the detector updates them once it has the file).
+pub(crate) fn airframe_facts(p: &AircraftProfile) -> crate::aircraft::AirframeFacts {
+    use crate::aircraft as a;
+    let vs0 = p.reference.as_ref().and_then(|r| r.vs0_kts);
+    a::AirframeFacts {
+        profile: Some(std::sync::Arc::new(p.clone())),
+        fuel_unit: a::fuel_unit_for(p.fuel.as_ref()),
+        throttle_dref: p.throttle_dataref.clone(),
+        // The .acf's castoring nose is read at detection; a new airframe
+        // starts from its profile alone.
+        nose_castors: false,
+        nose_free: false,
+        gear_limit_kts: p.vlo_kts,
+        flap_limits: a::flap_limits_for(p.flaps.as_ref()),
+        bus_volts_nominal: p.bus_volts_nominal,
+        speed_floor_kts: a::speed_floor_for(p.vs_clean_kts),
+        speed_limits: a::SpeedLimits::new(p.vne_kts, p.vmo_high),
+        approach_floor_kts: a::approach_floor_for(vs0, p.vs_clean_kts),
+        stall_curve: a::stall_curve_for(p.vs_clean_kts, vs0, p.flaps.as_ref()),
+        approach_thrust_min: a::approach_thrust_min_for(p.approach_thrust_min),
+        arrest_lead: p
+            .arrest_lead
+            .and_then(a::ArrestLeadProfile::valid)
+            .unwrap_or_default(),
+        flare_elevator: p.flare_elevator.and_then(a::FlareElevatorProfile::valid),
+        roll_rudder: p.roll_rudder.and_then(a::RollRudderProfile::valid),
+        landing_distance_m: a::landing_distance_m_for(
+            p.reference.as_ref().and_then(|r| r.landing_distance_ft),
+        ),
+        vs_limits: Some(crate::procedure::vs_limits_for(p.reference.as_ref())),
+        // The profile's envelope; the detector reads the .acf's over a
+        // silent profile.
+        gear_warning: p.gear_warning,
+        climb_out: a::ClimbOut::from_profile(p),
+        takeoff_power: p.takeoff_power.clone(),
+        takeoff_config: p.takeoff_config.clone(),
+        ap_altitude_capture: p.ap_altitude_capture,
+        // The rotor is the helicopter's: an aeroplane after the S-76 must
+        // not hover taxi in, be "on the ground" to the tower aloft, or skip
+        // a vacate.
+        rotor: crate::hover::rotor_facts(p),
+        signs: a::SignsSwitch::for_profile(p.seat_belt_signs.clone(), p.cabin_crew),
+        cabin_air: p.cabin_air.clone(),
+        mode_knob: p.transponder_mode_knob.clone(),
+        exterior: a::Exterior::from_lights(&p.lights),
+        altimeter: p.altimeter.clone(),
+    }
 }
 
 /// What began a new flight: the cause [`flight_begins`] records and the
@@ -137,6 +155,12 @@ impl NewFlight {
 /// Bumped once per flight begun (and per airframe, which is a new flight
 /// too): the generation a flight-scoped fact can be stamped with.
 static FLIGHTS_BEGUN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The current flight's generation: what a `scoped::Scoped::flight()` cell
+/// is stamped with. A value stamped before the last door reads as gone.
+pub(crate) fn flight_gen() -> u64 {
+    FLIGHTS_BEGUN.load(std::sync::atomic::Ordering::SeqCst)
+}
 /// When the last full door ran ([`flight_begins`] other than a reposition,
 /// or [`airframe_begins`]): the flight model's jump that follows our own
 /// setup is the same new flight, not another.
@@ -665,15 +689,22 @@ mod tests {
         assert!(crate::hover::rotor_facts(&heli).is_some());
         let plane = crate::aircraft::load("cessna_172sp").expect("172 profile loads");
         assert!(crate::hover::rotor_facts(&plane).is_none());
+        // The snapshot publish_airframe installs carries them, and none off
+        // a helicopter.
+        assert!(super::airframe_facts(&heli).rotor.is_some());
+        assert!(
+            super::airframe_facts(&plane).rotor.is_none(),
+            "publish_airframe must republish the rotor, None off a helicopter"
+        );
         let this = crate::test_support::module_source("flight_state");
         let body = this
             .split("pub(crate) fn publish_airframe(")
             .nth(1)
             .unwrap();
-        let body = body.split("pub(crate) fn stand_down()").next().unwrap();
+        let body = body.split("\n}\n").next().unwrap();
         assert!(
-            body.contains("crate::hover::publish_rotor(crate::hover::rotor_facts(p))"),
-            "publish_airframe must republish the rotor, None off a helicopter"
+            body.contains("crate::aircraft::install_airframe_facts(airframe_facts(p));"),
+            "publish_airframe installs the whole snapshot"
         );
     }
 
@@ -1233,5 +1264,123 @@ mod tests {
             found.is_empty(),
             "inline automation-flying lists, use flight_state: {found:?}"
         );
+    }
+
+    /// Every airframe's facts come whole from its own profile: what one
+    /// airframe declares or the detector read from its `.acf` is never in
+    /// the next one's snapshot (the S-76's rotor on a 172 was the bug,
+    /// refactor audit 2026-10-04). Each field against the profile it was
+    /// built from, over every profile shipped.
+    #[test]
+    fn airframe_facts_come_whole_from_each_profile() {
+        let mut checked = 0;
+        for entry in std::fs::read_dir("profiles").unwrap() {
+            let path = entry.unwrap().path();
+            if path.extension().and_then(|e| e.to_str()) != Some("yaml") {
+                continue;
+            }
+            let id = path.file_stem().unwrap().to_str().unwrap().to_string();
+            let Some(p) = crate::aircraft::load(&id) else { continue };
+            let f = super::airframe_facts(&p);
+            checked += 1;
+            assert_eq!(f.profile.as_ref().map(|q| q.id.as_str()), Some(p.id.as_str()));
+            assert!(!f.nose_castors && !f.nose_free, "{id}: the .acf is unread");
+            assert_eq!(f.rotor.is_some(), p.heli_start.is_some(), "{id}: rotor");
+            assert_eq!(f.mode_knob.is_some(), p.transponder_mode_knob.is_some(), "{id}");
+            assert_eq!(f.takeoff_config.is_some(), p.takeoff_config.is_some(), "{id}");
+            assert_eq!(f.cabin_air.is_some(), p.cabin_air.is_some(), "{id}");
+            assert_eq!(f.altimeter.is_some(), p.altimeter.is_some(), "{id}");
+            assert_eq!(f.gear_warning, p.gear_warning, "{id}");
+            assert_eq!(f.throttle_dref, p.throttle_dataref, "{id}");
+            assert_eq!(f.gear_limit_kts, p.vlo_kts, "{id}");
+            assert_eq!(f.ap_altitude_capture, p.ap_altitude_capture, "{id}");
+            assert_eq!(
+                f.signs.is_some(),
+                p.seat_belt_signs.is_some() || p.cabin_crew,
+                "{id}: signs"
+            );
+            assert_eq!(
+                f.speed_floor_kts,
+                crate::aircraft::speed_floor_for(p.vs_clean_kts),
+                "{id}"
+            );
+            assert_eq!(
+                f.vs_limits,
+                Some(crate::procedure::vs_limits_for(p.reference.as_ref())),
+                "{id}"
+            );
+            assert_eq!(
+                f.exterior.landing.is_some(),
+                p.lights.iter().any(|l| l.key.eq_ignore_ascii_case("landing")),
+                "{id}"
+            );
+        }
+        assert!(checked >= 10, "only {checked} profiles");
+    }
+
+    /// The live snapshot has ONE whole writer, the door's
+    /// `install_airframe_facts`, and the few copy-on-write updates are the
+    /// detector's `.acf` facts; anything else is a test's setter. A new
+    /// production writer of a per-airframe fact is a fact that can outlive
+    /// its airframe again, so it fails here.
+    #[test]
+    fn the_airframe_snapshot_has_one_door() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        fn production(text: &str) -> &str {
+            text.split("#[cfg(test)]\nmod ").next().unwrap()
+        }
+        // The .acf's facts, read by the detector once it has the file.
+        const ACF_WRITERS: [&str; 3] = [
+            "pub fn publish_nose_castors(",
+            "pub fn publish_nose_free(",
+            "pub fn publish_gear_warning(",
+        ];
+        let mut found = Vec::new();
+        for f in crate::test_support::rust_files(&root) {
+            if crate::test_support::is_test_file(&f) {
+                continue;
+            }
+            let text = std::fs::read_to_string(&f).unwrap();
+            let rel = f.strip_prefix(&root).unwrap().display().to_string();
+            let lines: Vec<&str> = production(&text).lines().collect();
+            for (n, line) in lines.iter().enumerate() {
+                let code = line.trim_start();
+                if code.starts_with("//") {
+                    continue;
+                }
+                let install = code.contains("install_airframe_facts(")
+                    && !code.starts_with("pub fn install_airframe_facts(");
+                let update = code.contains("update_airframe_facts(")
+                    && !code.starts_with("pub fn update_airframe_facts(");
+                if install && !(rel == "flight_state.rs" && code.contains("airframe_facts(p)")) {
+                    found.push(format!("{rel}:{} {code}", n + 1));
+                }
+                if update {
+                    // The enclosing fn and whether it is test-only.
+                    let at = (0..n).rev().find(|i| {
+                        let t = lines[*i].trim_start();
+                        t.starts_with("pub fn ") || t.starts_with("fn ")
+                            || t.starts_with("pub(crate) fn ")
+                    });
+                    let Some(at) = at else {
+                        found.push(format!("{rel}:{} {code}", n + 1));
+                        continue;
+                    };
+                    let header = lines[at].trim_start();
+                    let test_only = at > 0 && lines[at - 1].trim() == "#[cfg(test)]";
+                    if !test_only && !ACF_WRITERS.iter().any(|w| header.starts_with(w)) {
+                        found.push(format!("{rel}:{} in `{header}`", n + 1));
+                    }
+                }
+                // The .acf writers are the detector's alone.
+                for w in ACF_WRITERS {
+                    let name = &w["pub fn ".len()..];
+                    if code.contains(name) && !code.starts_with(w) && rel != "detect.rs" {
+                        found.push(format!("{rel}:{} {code}", n + 1));
+                    }
+                }
+            }
+        }
+        assert!(found.is_empty(), "airframe facts written outside the door: {found:#?}");
     }
 }

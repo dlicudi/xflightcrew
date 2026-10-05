@@ -87,3 +87,12 @@ struct with per-phase methods. Gate: bench replays, `xvl sortie --check`, real s
 - 2026-10-06: P2.3 grammar and instructor tests to `src/grammar/tests.rs`, `src/instructor/tests.rs`;
   P2.6 `src/world_tick.rs` (`WorldTick`: runway watch ahead of `quiet`, incursion, radio
   services, traffic, unheard vectors), five calls at the old points since crew work interleaves.
+- 2026-10-06: P3.3 `aircraft::AirframeFacts`, one `Arc` snapshot built by `flight_state::airframe_facts(p)`
+  (a literal naming every field) and installed whole by `publish_airframe`; 31 airframe statics
+  folded behind unchanged accessors, `.acf` facts by copy-on-write from the detector only
+  (`the_airframe_snapshot_has_one_door`); the heli tool no longer writes the rotor on registry
+  build. Left beside it: `systems::CURRENT` (learns modes in flight), `flow::LISTS`/`OVERRIDES`
+  (`flow::install`'s door), the claims (`anti_ice::CLAIMED`, `cabin_air::MASKS`,
+  `ALTIMETER_TRUTH`). P3.2 `scoped::Scoped<T>` (flight generation) on `autoland::LANDED_RUNWAY`,
+  `TRACKING_ERROR` (written with the launch's flight) and `procedure::MISSED_LEGS`; owed:
+  `monitor::DESTINATION` and the atc-side leaks.
