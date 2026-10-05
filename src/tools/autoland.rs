@@ -44,6 +44,10 @@ pub struct Autoland {
     pub approach_ias: f64,
     #[allow(dead_code)]
     pub prop: Option<PropProfile>,
+    /// Full auto's recovery planner: a landing request goes to the plan's
+    /// destination from anywhere (`FullAuto::arm_landing`). `None` on an
+    /// airframe full auto cannot fly: the nearest runway, as before.
+    pub planner: Option<std::sync::Arc<crate::tools::full_auto::FullAuto>>,
 }
 
 #[derive(Deserialize, Default)]
@@ -51,6 +55,43 @@ struct Args {
     /// true = stop/disarm the autoland; false/absent = arm it.
     #[serde(default)]
     cancel: bool,
+    /// true = the nearest suitable runway, whatever the plan ("land at the
+    /// nearest", "emergency landing").
+    #[serde(default)]
+    nearest: bool,
+}
+
+/// The nearest suitable runway, by the self-pick's own rules and with no
+/// destination to prefer: the airframe's minimum length, the METAR wind at
+/// each field. Blackboxed `autoland` `self_pick` with `nearest` and why.
+async fn nearest_runway(ctx: &ToolCtx<'_>, why: &str) -> Option<crate::autoland::Runway> {
+    let (lat, lon, trk) = tokio::join!(
+        ctx.xplane.get_float(crate::datarefs::LATITUDE),
+        ctx.xplane.get_float(crate::datarefs::LONGITUDE),
+        ctx.xplane.get_float("sim/flightmodel/position/hpath"),
+    );
+    let (lat, lon, trk) = (lat.ok()?, lon.ok()?, trk.unwrap_or(0.0));
+    let apt = apt_dat_path();
+    let picked = tokio::task::spawn_blocking(move || {
+        let min = crate::runway::self_pick_min_length_m(crate::aircraft::landing_distance_m());
+        let root = xplane_root();
+        let wind_at = |icao: &str| crate::weather::surface_wind(&root, icao);
+        let r = crate::runway::best_landing_runway_in_wind(&apt, lat, lon, trk, 40.0, min, &wind_at, None)
+            .ok()
+            .flatten();
+        (r, min)
+    })
+    .await
+    .ok()?;
+    let (picked, min) = picked;
+    crate::blackbox::record(
+        "autoland",
+        json!({ "event": "self_pick", "nearest": true, "why": why, "min_length_m": min,
+                "destination": serde_json::Value::Null,
+                "rwy": picked.as_ref().map(|r| format!("{} {}", r.icao.trim(), r.id)),
+                "length_m": picked.as_ref().map(|r| r.length_m) }),
+    );
+    picked
 }
 
 #[async_trait]
@@ -59,8 +100,9 @@ impl Tool for Autoland {
         "autoland"
     }
     fn description(&self) -> &str {
-        "Autoland: fly a full approach and land at the nearest suitable runway \
-         (the Garmin-style nearest-runway mode; the planned arrival is full auto's). \
+        "Autoland: fly a full approach and land, at the flight plan's destination \
+         from anywhere (full auto's recovery planner), else the nearest suitable \
+         runway (nearest=true asks for it). \
          Use for 'land the aircraft', 'get us down', 'emergency landing', \
          'autoland', 'land us'. Pass cancel=true for 'cancel autoland' / 'stop the \
          autoland'. The pilot takes back control with 'my controls'."
@@ -69,7 +111,8 @@ impl Tool for Autoland {
         json!({
             "type": "object",
             "properties": {
-                "cancel": {"type": "boolean", "description": "true = disarm/stop the autoland."}
+                "cancel": {"type": "boolean", "description": "true = disarm/stop the autoland."},
+                "nearest": {"type": "boolean", "description": "true = the nearest suitable runway, not the plan's destination."}
             }
         })
     }
@@ -106,6 +149,47 @@ impl Tool for Autoland {
                     .to_string(),
             );
         }
+        // A mission flying the plan owns the aircraft: a second loop armed
+        // under it would fight it for the autopilot.
+        if crate::full_auto::running() {
+            return Ok(
+                "I'm flying the plan. Say my controls first, then land, or land at the nearest."
+                    .to_string(),
+            );
+        }
+        // The plan's destination first, from wherever we are: the climb to
+        // the way's floor, the join, its approach. The nearest runway only
+        // when asked, or when the planner says why not the destination.
+        let mut why_nearest = a.nearest.then(|| "You asked for the nearest.".to_string());
+        if why_nearest.is_none() {
+            if let Some(planner) = &self.planner {
+                match planner.arm_landing(ctx).await {
+                    Ok(crate::tools::full_auto::LandArm::Armed(line)) => return Ok(line),
+                    Ok(crate::tools::full_auto::LandArm::Nearest(why)) => why_nearest = Some(why),
+                    Err(line) => return Ok(line),
+                }
+            }
+        }
+        let forced = match why_nearest.as_deref() {
+            Some(why) => nearest_runway(ctx, why)
+                .await
+                .map(|r| (crate::autoland::PlannedRunway::at(r.icao.trim(), &r.id), r)),
+            None => None,
+        };
+        let line = match (&why_nearest, &forced) {
+            (Some(why), Some((_, r))) => format!(
+                "{why} Landing at the nearest, {} runway {}, {:.0} miles. Say 'my controls' to take it back.",
+                r.icao.trim(),
+                atc::atis::spoken_runway(&r.id),
+                r.dist_nm
+            ),
+            (Some(why), None) => format!(
+                "{why} Searching for the nearest runway, then I'll fly the approach. Say 'my controls' to take it back."
+            ),
+            (None, _) => "I will land. Searching for the nearest runway, then I'll fly the approach. \
+                Say 'my controls' to take it back."
+                .to_string(),
+        };
         crate::autoland::run_autoland_scoped(
             ctx.config.xplane_base_url.clone(),
             apt_dat_path(),
@@ -113,11 +197,9 @@ impl Tool for Autoland {
             self.approach_ias,
             ctx.voice.cloned(),
             ctx.status.cloned(),
-            None,
+            forced.map(|(p, _)| p),
             ctx.xplane.cancellation(),
         );
-        Ok("I will land. Searching for the nearest runway, then I'll fly the approach. \
-            Say 'my controls' to take it back."
-            .to_string())
+        Ok(line)
     }
 }

@@ -75,6 +75,7 @@ mod radiofx;
 mod rapport;
 mod roll_steer;
 mod readback;
+mod recovery_plan;
 mod reversal;
 mod route_finder;
 mod router;

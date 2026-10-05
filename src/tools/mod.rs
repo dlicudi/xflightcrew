@@ -192,6 +192,29 @@ pub const ROTORCRAFT_WITHHELD: &[&str] = &[
     "go_around",
 ];
 
+/// A tool another tool arms through (the autoland's landing planner is full
+/// auto's): one instance, registered once, reachable from both.
+pub(crate) struct Shared<T>(pub std::sync::Arc<T>);
+
+#[async_trait]
+impl<T: Tool> Tool for Shared<T> {
+    fn name(&self) -> &str {
+        self.0.name()
+    }
+    fn description(&self) -> &str {
+        self.0.description()
+    }
+    fn parameters(&self) -> Value {
+        self.0.parameters()
+    }
+    fn confirm_prompt(&self, args: &Value) -> Option<String> {
+        self.0.confirm_prompt(args)
+    }
+    async fn execute(&self, args: &Value, ctx: &ToolCtx<'_>) -> Result<String> {
+        self.0.execute(args, ctx).await
+    }
+}
+
 /// The autopilot's engagement prerequisites and limits for an airframe:
 /// `None` without an autopilot. The ONE builder: the registry's tools and
 /// the safe hold (`safe_hold`) set the autopilot with the same numbers.
@@ -318,11 +341,6 @@ impl Registry {
             // flew its finals at 90 to 92 KIAS against the POH's 80, floated and
             // bounced three times, LEMG 13 2026-09-29).
             let approach_ias = approach_ias(profile);
-            tools.push(Box::new(autoland::Autoland {
-                cfg: ap.clone(),
-                approach_ias,
-                prop: profile.prop.clone(),
-            }));
             approach_land = Some((ap.clone(), approach_ias));
             enroute_ap = Some(ap.clone());
             // Auto takeoff — the departure sibling: the roll steers through
@@ -407,8 +425,8 @@ impl Registry {
             // request taxi, drive to the runway, line up, and fly the circuit.
             // Only where the airframe can do all of it (an autopilot airframe
             // with an engine to start).
-            if profile.engine || profile.throttle {
-                tools.push(Box::new(full_auto::FullAuto {
+            let full_auto = (profile.engine || profile.throttle).then(|| {
+                std::sync::Arc::new(full_auto::FullAuto {
                     engines: profile.engines,
                     cycle_selectors: profile.fuel_selectors.clone(),
                     fuel_selector: profile.fuel_selector.clone(),
@@ -451,7 +469,7 @@ impl Registry {
                     airliner_start: profile.airliner_start.clone(),
                     all_electrical_on_cmds: all_electrical_on_cmds(&profile.electrical),
                     all_electrical_toggles: all_electrical_toggles(&profile.electrical),
-                    cfg: ap,
+                    cfg: ap.clone(),
                     vr_kts: vr,
                     vy_kts: vy,
                     initial_climb_kts: initial_climb,
@@ -468,7 +486,21 @@ impl Registry {
                     power_up_first: profile.turbine_start,
                     jet_start: profile.turbine_start,
                     scripted_auto_start: profile.scripted_auto_start,
-                }));
+                })
+            });
+            // Native emergency autoland, needing the AP for approach
+            // guidance. A landing request goes through full auto's recovery
+            // planner first: the plan's destination from anywhere, the
+            // nearest runway only when asked or when the destination is
+            // impossible (LEMG 2026-10-05: Gibraltar self-picked over Malaga).
+            tools.push(Box::new(autoland::Autoland {
+                cfg: ap.clone(),
+                approach_ias,
+                prop: profile.prop.clone(),
+                planner: full_auto.clone(),
+            }));
+            if let Some(fa) = full_auto {
+                tools.push(Box::new(Shared(fa)));
             }
         }
 
