@@ -3768,6 +3768,7 @@ async fn fly_route(
                 None,
                 landing_rwy.clone(),
                 xp.cancellation(),
+                crate::autoland::HandDown::default(),
             );
         }
     };

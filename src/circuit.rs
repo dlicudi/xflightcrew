@@ -2364,7 +2364,7 @@ const DESCENT_FLOOR_FULL_NM: f64 = 2.0;
 /// The steepest path the circuit will fly to clear the ground on its base and
 /// final: PANS-OPS's upper limit for a procedure that is not a steep approach
 /// (anything past it needs an approval no profile declares). Autoland is
-/// handed the same angle (`autoland::set_next_circuit_glidepath_deg`).
+/// handed the same angle (`autoland::HandDown::circuit`).
 pub const STEEP_PATH_MAX_DEG: f64 = 3.5;
 /// A raise smaller than this is carried out but not said: with 1,000 ft of
 /// clearance a 1,000 ft pattern lifts over any ground above the field, and
@@ -3763,8 +3763,6 @@ async fn fly_authored_route(
         "circuit",
         serde_json::json!({"event": "handoff_autoland_authored", "rwy": rwy_id}),
     );
-    // A circuit final is judged at the visual gate, 500 ft (#199).
-    crate::autoland::set_next_gate(crate::stable_approach::GateKind::Visual);
     // FORCE the pattern's own runway. Bare `None` sends autoland to its
     // EMERGENCY behaviour — search the whole apt.dat for the best end by track
     // — which is right for an engine failure and catastrophically wrong here:
@@ -3786,6 +3784,8 @@ async fn fly_authored_route(
         // must say so (see `PlannedRunway`).
         Some(crate::autoland::PlannedRunway::anywhere(&rwy_id)),
         xp.cancellation(),
+        // A circuit final is judged at the visual gate, 500 ft (#199).
+        crate::autoland::HandDown::circuit(None),
     );
     handed_off(&xp);
 }
@@ -4766,11 +4766,10 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, p: Params
             );
             // A path steepened over the ground is autoland's path too (#182),
             // else it would take the aircraft handed over and dive for 3 degrees.
-            if descent_shape.steep() {
-                crate::autoland::set_next_circuit_glidepath_deg(Some(descent_shape.glidepath_deg()));
-            }
             // A circuit final is judged at the visual gate, 500 ft (#199).
-            crate::autoland::set_next_gate(crate::stable_approach::GateKind::Visual);
+            let hand_down = crate::autoland::HandDown::circuit(
+                descent_shape.steep().then(|| descent_shape.glidepath_deg()),
+            );
             // The circuit's token is its parent: a stand-down that lands
             // after the recheck above still cancels this autoland.
             crate::autoland::run_autoland_scoped(
@@ -4782,6 +4781,7 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, p: Params
                 None,
                 Some(crate::autoland::PlannedRunway::anywhere(&rwy_id)),
                 xp.cancellation(),
+                hand_down,
             );
             handed_off(&xp);
             return;

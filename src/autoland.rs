@@ -730,7 +730,6 @@ static LANDED_RUNWAY: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(N
 pub(crate) fn forget_flight() {
     *LANDED_RUNWAY.lock().unwrap_or_else(|e| e.into_inner()) = None;
     *TRACKING_ERROR.lock().unwrap_or_else(|e| e.into_inner()) = None;
-    drop_handed_down();
 }
 
 /// The runway the last autoland rolled out on, if it has not been consumed.
@@ -1024,6 +1023,9 @@ pub fn run_autoland_scoped(
     // landing down (a stand-down landing before or after the launch) is the
     // autoland's too. Empty only for the pilot's own request.
     parents: Vec<std::sync::Arc<AtomicBool>>,
+    // This arm's gate and path angle (`HandDown::default()`: the
+    // instrument gate on 3 degrees).
+    hand_down: HandDown,
 ) {
     spawn_autoland(AutolandLaunch {
         base,
@@ -1033,6 +1035,7 @@ pub fn run_autoland_scoped(
         voice,
         forced_rwy,
         parents,
+        hand_down,
     });
 }
 
@@ -1047,6 +1050,7 @@ struct AutolandLaunch {
     voice: Option<Voice>,
     forced_rwy: Option<PlannedRunway>,
     parents: Vec<std::sync::Arc<AtomicBool>>,
+    hand_down: HandDown,
 }
 
 struct ArmedRunway {
@@ -1305,6 +1309,7 @@ fn spawn_autoland(launch: AutolandLaunch) {
         voice,
         forced_rwy,
         parents,
+        hand_down,
     } = launch;
     // The last approach's tracking goes before the flag rises (it is
     // unreadable once ACTIVE is set again, not at the first tick).
@@ -1330,10 +1335,6 @@ fn spawn_autoland(launch: AutolandLaunch) {
                 .with_parents(parents.clone())
                 .with_cancel(lease.cancel.clone());
             if xp.cancelled() {
-                // A cancelled launch takes what was handed down for it with
-                // it: the next arm, perhaps another flight's instrument
-                // approach, must not fly a circuit's visual gate or path.
-                drop_handed_down();
                 return;
             }
             LANDING_CONFIGURED.store(false, Ordering::SeqCst);
@@ -1363,12 +1364,11 @@ fn spawn_autoland(launch: AutolandLaunch) {
             };
 
             // This approach's path angle: a steeper one handed down for a
-            // visual segment (LSZS), else 3. Taken now so no approach
-            // inherits another's.
-            let gp_deg = arm_glidepath();
+            // visual segment (LSZS), else 3.
+            let gp_deg = arm_glidepath(hand_down.glidepath);
             // The stabilised gate this final is judged at (#199): a
             // circuit's is visual, every other the instrument gate.
-            let gate = arm_gate();
+            let gate = hand_down.gate;
             if (gp_deg - 3.0).abs() > 1e-9 {
                 crate::blackbox::record(
                     "autoland",
@@ -1831,6 +1831,7 @@ fn spawn_autoland(launch: AutolandLaunch) {
                                     None,
                                     Some(PlannedRunway::at(&r.icao, &r.id)),
                                     parents.clone(),
+                                    HandDown::default(),
                                 );
                                 break;
                             }
@@ -4785,10 +4786,10 @@ impl TrackTrim {
 pub const GLIDEPATH_FT_PER_NM: f64 = 318.0;
 
 /// This approach's glidepath angle, degrees: 3 unless an approach handed a
-/// steeper one down for its visual segment (`set_next_glidepath_deg`; LSZS
+/// steeper one down for its visual segment (`HandDown::visual_segment`; LSZS
 /// RNAV 03's MAP is 996 ft above the threshold two miles out, 4.7 degrees).
 /// Set at every arm, so no approach inherits another's.
-/// In a test build both live per THREAD: the LSZS visual-segment test arms a
+/// In a test build it lives per THREAD: the LSZS visual-segment test arms a
 /// 4.5 degree path, and every other test landing at the same moment flew it
 /// (the balloon test failed one run in three, 2026-09-24). One landing per
 /// process is the app's truth; one per test is the tests'.
@@ -4827,58 +4828,44 @@ fn stable_record(
     })
 }
 
-/// The stabilised gate the NEXT arm judges its final at, consumed there:
-/// the circuit hands down a visual one, every other caller flies the
-/// instrument gate (`stable_approach`, #199).
-static NEXT_GATE: std::sync::Mutex<Option<crate::stable_approach::GateKind>> =
-    std::sync::Mutex::new(None);
-
-/// Hand the next autoland arm a visual gate (a circuit's final).
-pub fn set_next_gate(kind: crate::stable_approach::GateKind) {
-    *NEXT_GATE.lock().unwrap_or_else(|e| e.into_inner()) = Some(kind);
+/// What a launcher hands its autoland for this arm, carried in the launch
+/// itself so no arm inherits another's: the stabilised gate its final is
+/// judged at (a circuit's is visual, every other the instrument gate, #199)
+/// and a path angle, `None` for 3 degrees.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct HandDown {
+    pub gate: crate::stable_approach::GateKind,
+    /// The angle and whether it is a PUBLISHED visual segment
+    /// ([`published_steep`]).
+    pub glidepath: Option<(f64, bool)>,
 }
 
-/// Take the handed-down gate for this arm, the instrument gate without one.
-fn arm_gate() -> crate::stable_approach::GateKind {
-    NEXT_GATE
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .take()
-        .unwrap_or_default()
+impl HandDown {
+    /// A circuit's final: the visual gate, and its path steepened over the
+    /// ground (#182) flown at its angle, but not a valley.
+    pub fn circuit(steep_deg: Option<f64>) -> Self {
+        Self {
+            gate: crate::stable_approach::GateKind::Visual,
+            glidepath: steep_deg.map(|d| (d, false)),
+        }
+    }
+
+    /// A PUBLISHED visual segment's angle (the follower, at a MAP).
+    pub fn visual_segment(deg: Option<f64>) -> Self {
+        Self {
+            glidepath: deg.map(|d| (d, true)),
+            ..Self::default()
+        }
+    }
 }
 
-/// The angle the NEXT arm takes, consumed there.
-#[cfg(not(test))]
-static NEXT_GLIDEPATH_DEG: std::sync::Mutex<Option<(f64, bool)>> = std::sync::Mutex::new(None);
 #[cfg(test)]
 thread_local! {
     static GLIDEPATH_DEG_T: std::cell::Cell<(f64, bool)> = const { std::cell::Cell::new((3.0, false)) };
-    static NEXT_GLIDEPATH_DEG_T: std::cell::Cell<Option<(f64, bool)>> = const { std::cell::Cell::new(None) };
 }
 /// The steepest path the landing will fly.
 pub const MAX_GLIDEPATH_DEG: f64 = 5.5;
 
-#[cfg(not(test))]
-fn next_glidepath(set: Option<Option<(f64, bool)>>) -> Option<(f64, bool)> {
-    let mut g = NEXT_GLIDEPATH_DEG.lock().unwrap_or_else(|e| e.into_inner());
-    match set {
-        Some(v) => {
-            *g = v;
-            v
-        }
-        None => g.take(),
-    }
-}
-#[cfg(test)]
-fn next_glidepath(set: Option<Option<(f64, bool)>>) -> Option<(f64, bool)> {
-    NEXT_GLIDEPATH_DEG_T.with(|c| match set {
-        Some(v) => {
-            c.set(v);
-            v
-        }
-        None => c.take(),
-    })
-}
 #[cfg(not(test))]
 fn live_glidepath(set: Option<(f64, bool)>) -> (f64, bool) {
     let mut g = GLIDEPATH_DEG.lock().unwrap_or_else(|e| e.into_inner());
@@ -4897,27 +4884,9 @@ fn live_glidepath(set: Option<(f64, bool)>) -> (f64, bool) {
     })
 }
 
-/// Hand the next autoland arm a glidepath angle for a PUBLISHED visual
-/// segment (the follower does, at a MAP).
-pub fn set_next_glidepath_deg(deg: Option<f64>) {
-    next_glidepath(Some(deg.map(|d| (d, true))));
-}
-
-/// Hand the next autoland arm a circuit's path steepened over the ground
-/// (#182): flown at its angle, but not a valley ([`published_steep`]).
-pub fn set_next_circuit_glidepath_deg(deg: Option<f64>) {
-    next_glidepath(Some(deg.map(|d| (d, false))));
-}
-
-/// Drop the gate and angle handed down for an arm that never flew.
-fn drop_handed_down() {
-    let _ = arm_gate();
-    let _ = next_glidepath(None);
-}
-
-/// Take the handed-down angle for this arm (3 without one), clamped.
-fn arm_glidepath() -> f64 {
-    let (deg, published) = next_glidepath(None)
+/// Arm this approach's angle from its hand-down (3 without one), clamped.
+fn arm_glidepath(handed: Option<(f64, bool)>) -> f64 {
+    let (deg, published) = handed
         .filter(|(d, _)| d.is_finite())
         .map_or((3.0, false), |(d, p)| (d.clamp(3.0, MAX_GLIDEPATH_DEG), p));
     live_glidepath(Some((deg, published && deg > 3.0 + 1e-9))).0

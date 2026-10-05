@@ -730,6 +730,7 @@ impl FullAuto {
             ctx.status.cloned(),
             rwy.map(|r| crate::autoland::PlannedRunway::at(dest, r)),
             ctx.xplane.cancellation(),
+            crate::autoland::HandDown::default(),
         );
         crate::flight::note_crew_takeover(why);
         ack

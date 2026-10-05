@@ -4485,10 +4485,11 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, plan: Pla
                     stand_down(&voice, &line, "map_handover");
                     return;
                 }
+                let mut hand_down = crate::autoland::HandDown::default();
                 if map_short_of_runway(leg) {
                     // The visual segment: its own angle to the landing, and
                     // the published missed approach for its go-around.
-                    crate::autoland::set_next_glidepath_deg(visual_deg);
+                    hand_down = crate::autoland::HandDown::visual_segment(visual_deg);
                     stash_missed_legs(missed_legs.clone());
                     alert(&voice, Priority::Advisory, "Missed approach point. Runway ahead, landing us.");
                 } else {
@@ -4506,6 +4507,7 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, plan: Pla
                     None,
                     rwy_id.clone(),
                     xp.cancellation(),
+                    hand_down,
                 );
                 clear_pilot_altitude();
                 publish_terrain_floor(None);
