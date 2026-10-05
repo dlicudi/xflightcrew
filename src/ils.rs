@@ -13,13 +13,18 @@
 //!   past [`XCHECK_DOTS`] held [`XCHECK_HOLD_S`] is said once per episode:
 //!   the copilot's path and the ILS disagree, and the pilot should know.
 //! - [`Coupling`]: pure. With the profile's `ils_coupled`, the approach mode
-//!   is armed on final, and once the localizer (then the glideslope) is
-//!   CAPTURED the copilot stops writing the heading bug (then the VS dial)
-//!   and stops re-engaging HDG/VS (re-engaging VS mode drops a captured
-//!   glideslope). The roundout gate's arrest takes the servos as always; a
-//!   go-around or any leaving of the final decouples back to HDG/VS. Off by
-//!   default: each autopilot captures differently, and a profile turns it on
-//!   only after a flown capture.
+//!   is armed on an intercept to the localizer (the final, a straight-in or
+//!   a pattern's inbound heading for it inside its coverage) from below the
+//!   beam, pressed only when neither half reads in; once the localizer
+//!   (then the glideslope) is CAPTURED the copilot stops writing the heading
+//!   bug (then the VS dial), and the panel's owner never presses HDG or V/S
+//!   over them (`autoflight::reconcile`: those presses dropped 34 captures
+//!   on the 737, #81). The modes are the `autopilot_state` bitfield's: the
+//!   status datarefs read 0 through captures. The roundout gate's arrest
+//!   takes the servos as always; a go-around or any leaving of the final
+//!   decouples back to HDG/VS and presses APP once more to take out what is
+//!   still in. Off by default: a profile turns it on on the evidence of
+//!   captures flown on the type.
 
 use crate::autoflight::{self, Button, Dial};
 use serde_json::json;
@@ -30,14 +35,6 @@ pub const HDEF: &str = "sim/cockpit2/radios/indicators/nav1_hdef_dots_pilot";
 pub const VDEF: &str = "sim/cockpit2/radios/indicators/nav1_vdef_dots_pilot";
 pub const LOC_VALID: &str = "sim/cockpit2/radios/indicators/nav1_display_horizontal";
 pub const GS_VALID: &str = "sim/cockpit2/radios/indicators/nav1_display_vertical";
-pub const APPR_STATUS: &str = autoflight::names::APPR_STATUS;
-pub const GS_STATUS: &str = autoflight::names::GS_STATUS;
-
-/// The live airframe's approach status dataref (its own where it has one):
-/// the panel's (`autoflight::Panel::approach_status`).
-pub fn approach_status_dref() -> String {
-    autoflight::panel().approach_status
-}
 
 /// How far an ILS may be from the runway's field and still be its own.
 const FIND_MAX_NM: f64 = 40.0;
@@ -262,105 +259,127 @@ impl XCheck {
 pub enum Coupling {
     #[default]
     Off,
-    /// APPR pressed, waiting for the localizer to capture.
+    /// APP pressed (or found armed), waiting for the localizer to capture.
     Armed,
     /// The localizer is the autopilot's; the glideslope maybe not yet.
     LocCaptured,
     /// Both captured: the autopilot flies the ILS until the roundout gate.
     Coupled,
-    /// Given up for this approach (decoupled, or APPR would not arm).
+    /// Given up for this approach (decoupled, or APP would not arm).
     Abandoned,
 }
 
 /// What the tick does about it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CouplingOut {
-    /// Press the approach button this tick.
+    /// Press the approach button this tick (only ever from off: a toggle).
     pub press_appr: bool,
-    /// Put HDG and VS back this tick (decoupling).
+    /// Hand the lateral and the vertical back this tick.
     pub decouple: bool,
+    /// ...and press APP once more to take out what is still armed or
+    /// captured, so nothing captures behind our own heading and VS.
+    pub disarm: bool,
     /// The copilot still writes the heading bug and keeps HDG engaged.
     pub own_lateral: bool,
     /// The copilot still writes the VS dial and keeps VS engaged.
     pub own_vertical: bool,
 }
 
-/// The localizer must be this close to arm (dots)...
-pub const ARM_MAX_DOTS: f64 = 2.0;
+/// The aircraft may be at most this far ABOVE the glideslope to arm
+/// (dots): the capture is flown from below, as the airframe's own capture
+/// was on 2026-10-05 (ALT HOLD at 4,000 under the beam, captured 13:25:45).
+pub const ARM_MAX_ABOVE_GS_DOTS: f64 = 0.5;
 /// ...and the runway this close (nm).
 pub const ARM_MAX_NM: f64 = 15.0;
-/// APPR pressed and still off after this long: abandoned.
+/// APP pressed and neither half reads armed after this long: abandoned.
 pub const ARM_TIMEOUT_S: f64 = 6.0;
 
 /// Inputs to one coupling step.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct CouplingIn {
     pub allowed: bool,
-    pub on_final: bool,
+    /// On an intercept to this localizer: the final, or a straight-in's or a
+    /// pattern's inbound heading for it inside its coverage
+    /// ([`arm_verdict`] `Now`).
+    pub inbound: bool,
     pub arresting: bool,
-    pub go_around: bool,
+    /// Leaving the approach: a go-around, a pattern's outbound legs.
+    pub leaving: bool,
     pub dist_nm: f64,
     pub needles: Needles,
-    /// `approach_status`: 0 off, 1 armed, 2 captured.
-    pub appr: Option<f64>,
-    /// `glideslope_status`: 0 off, 1 armed, 2 captured.
-    pub gs: Option<f64>,
+    /// The autopilot's modes (`autoflight::Modes`, the bitfield): the one
+    /// truth. `approach_status` read 0 through captures on the 737 (#81).
+    pub modes: Option<crate::autoflight::Modes>,
 }
 
 impl Coupling {
     /// One tick. `armed_s` counts the time in `Armed` (the caller's clock).
     pub fn step(&mut self, i: CouplingIn, armed_s: &mut f64, dt: f64) -> CouplingOut {
-        let mut out = CouplingOut { press_appr: false, decouple: false, own_lateral: true, own_vertical: true };
+        let mut out = CouplingOut {
+            press_appr: false,
+            decouple: false,
+            disarm: false,
+            own_lateral: true,
+            own_vertical: true,
+        };
         let engaged = matches!(self, Coupling::Armed | Coupling::LocCaptured | Coupling::Coupled);
-        // Leaving the final (a pattern, a go-around) hands HDG/VS back at
-        // once. The arrest is not a leaving: it takes the servos itself.
-        if engaged && (i.go_around || (!i.on_final && !i.arresting)) {
-            *self = Coupling::Abandoned;
+        let any = i.modes.is_some_and(|m| m.approach_any());
+        let abandon = |s: &mut Coupling, out: &mut CouplingOut| {
+            *s = Coupling::Abandoned;
             out.decouple = true;
+            out.disarm = any;
+        };
+        // Leaving the final (a go-around, an outbound leg) hands HDG/VS back
+        // at once. The arrest is not a leaving: it takes the servos itself.
+        if engaged && i.leaving && !i.arresting {
+            abandon(self, &mut out);
             return out;
         }
-        let appr = i.appr.unwrap_or(0.0);
-        let gs = i.gs.unwrap_or(0.0);
         match *self {
             Coupling::Off => {
-                let h = i.needles.hdef.unwrap_or(f64::MAX).abs();
+                let below_gs = !i.needles.gs_valid
+                    || i.needles.vdef.is_some_and(|v| v <= ARM_MAX_ABOVE_GS_DOTS);
                 if i.allowed
-                    && i.on_final
+                    && i.inbound
                     && !i.arresting
-                    && !i.go_around
+                    && !i.leaving
                     && i.needles.loc_valid
-                    && h < ARM_MAX_DOTS
+                    && below_gs
                     && i.dist_nm < ARM_MAX_NM
+                    && i.modes.is_some()
                 {
-                    // A button that toggles: pressed only when it reads off.
-                    out.press_appr = appr < 0.5;
+                    // A button that toggles: pressed only when neither half
+                    // reads armed or captured.
+                    out.press_appr = !any;
                     *self = Coupling::Armed;
                     *armed_s = 0.0;
                 }
             }
             Coupling::Armed => {
                 *armed_s += dt;
-                if appr > 1.5 {
-                    *self = Coupling::LocCaptured;
-                } else if appr < 0.5 && *armed_s > ARM_TIMEOUT_S {
-                    *self = Coupling::Abandoned;
+                match i.modes {
+                    Some(m) if m.loc() && m.gs() => *self = Coupling::Coupled,
+                    Some(m) if m.loc() => *self = Coupling::LocCaptured,
+                    Some(m) if !m.approach_any() && *armed_s > ARM_TIMEOUT_S => {
+                        abandon(self, &mut out);
+                        return out;
+                    }
+                    _ => {}
                 }
             }
-            Coupling::LocCaptured => {
-                if appr < 0.5 {
-                    *self = Coupling::Abandoned;
-                    out.decouple = true;
+            Coupling::LocCaptured => match i.modes {
+                Some(m) if !(m.loc() || m.loc_armed()) && !i.arresting => {
+                    abandon(self, &mut out);
                     return out;
                 }
-                if gs > 1.5 {
-                    *self = Coupling::Coupled;
-                }
-            }
+                Some(m) if m.gs() => *self = Coupling::Coupled,
+                _ => {}
+            },
             Coupling::Coupled => {
-                // The glideslope dropped out: the vertical comes back to us.
-                if gs < 1.5 || appr < 0.5 {
-                    *self = Coupling::Abandoned;
-                    out.decouple = true;
+                // The glideslope or the localizer dropped out: back to us.
+                // The arrest takes the servos and the modes with them.
+                if !i.arresting && i.modes.is_some_and(|m| !m.gs() || !m.loc()) {
+                    abandon(self, &mut out);
                     return out;
                 }
             }
@@ -369,6 +388,17 @@ impl Coupling {
         out.own_lateral = !matches!(self, Coupling::LocCaptured | Coupling::Coupled);
         out.own_vertical = !matches!(self, Coupling::Coupled);
         out
+    }
+}
+
+/// A mode as the old status datarefs encoded it: 2 captured, 1 armed, 0 off.
+fn status_of(captured: bool, armed: bool) -> f64 {
+    if captured {
+        2.0
+    } else if armed {
+        1.0
+    } else {
+        0.0
     }
 }
 
@@ -386,7 +416,6 @@ pub fn coupled_allowed() -> bool {
 // altitude at glideslope capture.
 // ---------------------------------------------------------------------------
 
-pub const NAV_STATUS: &str = autoflight::names::NAV_STATUS;
 pub const SERVOS: &str = autoflight::names::SERVOS_ON;
 pub const AP_POWER: &str = autoflight::names::AP_POWER;
 pub const HSI_SOURCE: &str = "sim/cockpit2/radios/actuators/HSI_source_select_pilot";
@@ -601,21 +630,21 @@ pub fn spawn_setup_watch(base: String, ils: crate::nav::Ils, mut watch: SetupWat
                     tokio::time::sleep(std::time::Duration::from_secs_f64(dt)).await;
                     continue;
                 }
-                let appr_dref = approach_status_dref();
-                let (hdef, vdef, locv, gsv, appr, nav, gs, servos, lat, lon, hdg, agl) = tokio::join!(
+                // The modes from the bitfield (`autoflight::Modes`): the
+                // 737's approach_status read 0 through captures (#81).
+                let (hdef, vdef, locv, gsv, ap_state, servos, lat, lon, hdg, agl) = tokio::join!(
                     xp.get_float(HDEF),
                     xp.get_float(VDEF),
                     xp.get_float(LOC_VALID),
                     xp.get_float(GS_VALID),
-                    xp.get_float(&appr_dref),
-                    xp.get_float(NAV_STATUS),
-                    xp.get_float(GS_STATUS),
+                    xp.get_float(autoflight::names::AP_STATE),
                     xp.get_float(SERVOS),
                     xp.get_float(crate::datarefs::LATITUDE),
                     xp.get_float(crate::datarefs::LONGITUDE),
                     xp.get_float(crate::datarefs::COMPASS_HEADING_DEG),
                     xp.get_float(crate::datarefs::AGL_METERS),
                 );
+                let modes = ap_state.ok().and_then(autoflight::Modes::from_read);
                 // A failed position read is no measurement: skip the tick.
                 let (Ok(lat), Ok(lon), Ok(hdg), Ok(agl)) = (lat, lon, hdg, agl) else {
                     tokio::time::sleep(std::time::Duration::from_secs_f64(dt)).await;
@@ -628,9 +657,9 @@ pub fn spawn_setup_watch(base: String, ils: crate::nav::Ils, mut watch: SetupWat
                         loc_valid: locv.is_ok_and(|v| v > 0.5),
                         gs_valid: gsv.is_ok_and(|v| v > 0.5),
                     },
-                    appr: appr.ok(),
-                    nav: nav.ok(),
-                    gs: gs.ok(),
+                    appr: modes.map(|m| status_of(m.loc() || m.gs(), m.approach_any())),
+                    nav: modes.map(|m| status_of(m.loc(), m.loc_armed())),
+                    gs: modes.map(|m| status_of(m.gs(), m.gs_armed())),
                     servos: servos.is_ok_and(|v| v > 0.5),
                     automation: crate::flight_state::crew_flying().is_some(),
                     verdict: arm_verdict(lat, lon, hdg, &ils),
@@ -880,62 +909,153 @@ mod tests {
         assert!(loc[0].starts_with("Localizer"), "{}", loc[0]);
     }
 
-    fn inp(appr: f64, gs: f64) -> CouplingIn {
+    fn inp(modes: u32) -> CouplingIn {
         CouplingIn {
             allowed: true,
-            on_final: true,
+            inbound: true,
             dist_nm: 9.0,
-            needles: needles(0.3, 0.5),
-            appr: Some(appr),
-            gs: Some(gs),
+            needles: needles(0.3, -0.5),
+            modes: Some(crate::autoflight::Modes(modes)),
             ..CouplingIn::default()
         }
     }
 
+    /// The 737's own sequence on 2026-10-05 (13:22:39 to 13:25:45): 50
+    /// (HDG, VS, ALT arm) when pressed, 1330 armed, 1586 the localizer
+    /// captured with the glideslope armed, 2560 both captured.
     #[test]
     fn a_coupled_ils_hands_over_lateral_then_vertical() {
         let (mut c, mut t) = (Coupling::Off, 0.0);
-        let o = c.step(inp(0.0, 0.0), &mut t, 0.3);
+        let o = c.step(inp(50), &mut t, 0.3);
         assert!(o.press_appr && o.own_lateral && o.own_vertical);
-        let o = c.step(inp(1.0, 1.0), &mut t, 0.3);
+        let o = c.step(inp(1330), &mut t, 0.3);
         assert!(!o.press_appr && o.own_lateral, "armed: still ours");
-        let o = c.step(inp(2.0, 1.0), &mut t, 0.3);
+        let o = c.step(inp(1586), &mut t, 0.3);
         assert_eq!(c, Coupling::LocCaptured);
         assert!(!o.own_lateral && o.own_vertical, "the localizer is the AP's, the vertical ours");
-        let o = c.step(inp(2.0, 2.0), &mut t, 0.3);
+        let o = c.step(inp(2560), &mut t, 0.3);
         assert_eq!(c, Coupling::Coupled);
         assert!(!o.own_lateral && !o.own_vertical);
-        // The roundout gate: the arrest takes the servos; no decouple.
-        let o = c.step(CouplingIn { on_final: false, arresting: true, ..inp(2.0, 2.0) }, &mut t, 0.3);
+        // The roundout gate: the arrest takes the servos; no decouple, even
+        // as the modes go with them.
+        let o = c.step(CouplingIn { arresting: true, leaving: true, ..inp(132) }, &mut t, 0.3);
         assert!(!o.decouple);
     }
 
+    /// Found armed (the pilot pressed it, or a capture already in): never
+    /// pressed again.
     #[test]
-    fn a_go_around_or_a_lost_capture_decouples_and_never_rearms() {
-        let (mut c, mut t) = (Coupling::Coupled, 0.0);
-        let o = c.step(CouplingIn { go_around: true, ..inp(2.0, 2.0) }, &mut t, 0.3);
-        assert!(o.decouple && o.own_lateral && o.own_vertical);
-        assert_eq!(c, Coupling::Abandoned);
-        assert!(!c.step(inp(0.0, 0.0), &mut t, 0.3).press_appr, "abandoned stays abandoned");
-        let mut c = Coupling::Coupled;
-        assert!(c.step(inp(2.0, 0.0), &mut t, 0.3).decouple, "glideslope lost");
-        // APPR that never arms is abandoned without a fight.
+    fn an_approach_already_armed_is_never_pressed() {
         let (mut c, mut t) = (Coupling::Off, 0.0);
-        c.step(inp(0.0, 0.0), &mut t, 0.3);
-        for _ in 0..30 {
-            c.step(inp(0.0, 0.0), &mut t, 0.3);
-        }
-        assert_eq!(c, Coupling::Abandoned);
+        let o = c.step(inp(1330), &mut t, 0.3);
+        assert!(!o.press_appr && c == Coupling::Armed);
+        let o = c.step(inp(2560), &mut t, 0.3);
+        assert_eq!(c, Coupling::Coupled, "captured both at once: {o:?}");
     }
 
     #[test]
-    fn nothing_couples_unless_the_airframe_allows_it_and_the_needle_is_close() {
+    fn a_go_around_or_a_lost_capture_decouples_disarms_and_never_rearms() {
+        let (mut c, mut t) = (Coupling::Coupled, 0.0);
+        let o = c.step(CouplingIn { leaving: true, ..inp(2560) }, &mut t, 0.3);
+        assert!(o.decouple && o.disarm && o.own_lateral && o.own_vertical);
+        assert_eq!(c, Coupling::Abandoned);
+        assert!(!c.step(inp(50), &mut t, 0.3).press_appr, "abandoned stays abandoned");
+        let mut c = Coupling::Coupled;
+        let o = c.step(inp(512), &mut t, 0.3);
+        assert!(o.decouple && o.disarm, "glideslope lost: {o:?}");
+        // APP that never arms is abandoned without a fight, nothing left to
+        // disarm.
         let (mut c, mut t) = (Coupling::Off, 0.0);
-        let o = c.step(CouplingIn { allowed: false, ..inp(0.0, 0.0) }, &mut t, 0.3);
+        c.step(inp(50), &mut t, 0.3);
+        let mut last = None;
+        for _ in 0..30 {
+            last = Some(c.step(inp(50), &mut t, 0.3));
+        }
+        assert_eq!(c, Coupling::Abandoned);
+        assert!(!last.unwrap().press_appr);
+    }
+
+    #[test]
+    fn nothing_couples_unless_allowed_inbound_below_the_beam_and_read() {
+        let (mut c, mut t) = (Coupling::Off, 0.0);
+        let o = c.step(CouplingIn { allowed: false, ..inp(50) }, &mut t, 0.3);
         assert!(!o.press_appr && c == Coupling::Off);
-        let o = c.step(CouplingIn { needles: needles(2.5, 0.0), ..inp(0.0, 0.0) }, &mut t, 0.3);
-        assert!(!o.press_appr, "full-scale localizer: not yet");
-        let o = c.step(CouplingIn { dist_nm: 20.0, ..inp(0.0, 0.0) }, &mut t, 0.3);
+        let o = c.step(CouplingIn { inbound: false, ..inp(50) }, &mut t, 0.3);
+        assert!(!o.press_appr, "not on an intercept");
+        let o = c.step(CouplingIn { dist_nm: 20.0, ..inp(50) }, &mut t, 0.3);
         assert!(!o.press_appr, "too far");
+        let o = c.step(CouplingIn { needles: needles(0.3, 1.2), ..inp(50) }, &mut t, 0.3);
+        assert!(!o.press_appr, "above the glideslope: the capture is from below");
+        let o = c.step(CouplingIn { modes: None, ..inp(50) }, &mut t, 0.3);
+        assert!(!o.press_appr && c == Coupling::Off, "an unread bitfield is no measurement");
+        // A localizer far off is still armed on an intercept (the 10-05
+        // press was two minutes before the capture).
+        let o = c.step(CouplingIn { needles: needles(2.5, -2.5), ..inp(50) }, &mut t, 0.3);
+        assert!(o.press_appr);
+    }
+
+    /// The 737's own APP on 2026-10-05 (13:22:39 to 13:29:49, the fixture's
+    /// `pilot_app` half), replayed through the coupling and the owner: found
+    /// armed and never pressed again; the localizer handed over at 13:24:37,
+    /// the glideslope at 13:25:45; nothing pressed over either to the
+    /// roundout; the landing's servos-out is the arrest's, no decouple.
+    #[test]
+    fn the_737s_own_app_of_2026_10_05_couples_and_is_left_alone() {
+        use crate::autoflight::{reconcile, Lateral, ModeRead, Modes, Vertical, Want};
+        let src = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/bench/approach/lemg13_737_2026-10-05.jsonl"));
+        let ticks: Vec<serde_json::Value> = src
+            .lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .filter(|r| r["ph"] == "pilot_app" && r["t"].as_f64().unwrap() >= 1_791_199_359.0)
+            .collect();
+        let (mut c, mut t) = (Coupling::Off, 0.0);
+        let mut loc_at = None;
+        let mut gs_at = None;
+        for r in &ticks {
+            let m = Modes(r["ap"].as_u64().unwrap() as u32);
+            let radio = r["radio"].as_f64().unwrap();
+            let o = c.step(
+                CouplingIn {
+                    allowed: true,
+                    inbound: true,
+                    arresting: radio < 60.0,
+                    dist_nm: 9.0,
+                    needles: Needles { hdef: Some(0.0), vdef: None, loc_valid: true, gs_valid: false },
+                    modes: Some(m),
+                    ..CouplingIn::default()
+                },
+                &mut t,
+                2.0,
+            );
+            assert!(!o.press_appr, "found armed: never pressed ({:?})", m.words());
+            assert!(!o.decouple, "decoupled at {} on {:?}", r["t"], m.words());
+            if !o.own_lateral && loc_at.is_none() {
+                loc_at = r["t"].as_f64();
+            }
+            if !o.own_vertical && gs_at.is_none() {
+                gs_at = r["t"].as_f64();
+            }
+            // The owner's housekeeping under the coupled intent, from the
+            // statuses those bits show: nothing pressed while either half
+            // of the approach is in.
+            let read = ModeRead {
+                hdg_status: Some(if m.heading() { 2.0 } else { 0.0 }),
+                vs_status: Some(if m.vs() { 2.0 } else { 0.0 }),
+                modes: Some(m),
+            };
+            let want = Want { lateral: Some(Lateral::Coupled), vertical: Some(Vertical::Coupled) };
+            if m.approach_any() {
+                let p = reconcile(want, read);
+                assert!(
+                    p.iter().all(|b| *b == crate::autoflight::Button::VerticalSpeed) && !(m.gs() && !p.is_empty()),
+                    "{p:?} over {:?}",
+                    m.words()
+                );
+            }
+        }
+        assert_eq!(c, Coupling::Coupled);
+        let (loc, gs) = (loc_at.unwrap(), gs_at.unwrap());
+        assert!((loc - 1_791_199_477.0).abs() < 3.0, "localizer at {loc}");
+        assert!((gs - 1_791_199_545.0).abs() < 3.0, "glideslope at {gs}");
     }
 }

@@ -1025,19 +1025,20 @@ pub struct AircraftProfile {
     #[serde(default)]
     pub load_sheet: LoadSheet,
     /// Fly an ILS COUPLED on this airframe's own approach mode (see
-    /// `ils::Coupling`): armed on final, the bug and VS dial handed over as
-    /// the localizer and glideslope capture. Off until a capture has been
-    /// flown on the type; the copilot's own path otherwise.
+    /// `ils::Coupling`): armed on an intercept from below the beam, the bug
+    /// and VS dial handed over as the localizer and glideslope capture. Off
+    /// until a capture has been flown on the type; the copilot's own path
+    /// otherwise.
     #[serde(default)]
     pub ils_coupled: bool,
-    /// The autopilot's own approach button and its status, where the add-on
-    /// has its own (the Laminar 737's APP is `laminar/B738/autopilot/app_press`;
-    /// the stock command armed nothing and the coupling was abandoned after
-    /// six seconds, LEMG 13 2026-09-26). `None`: the stock command/dataref.
+    /// The autopilot's own approach button, where the add-on has its own
+    /// (the Laminar 737's APP is `laminar/B738/autopilot/app_press`: its lamp
+    /// lights). `None`: the stock command. The modes it arms are read on
+    /// the `autopilot_state` bitfield (`autoflight::Modes`): the 737's
+    /// `app_status` and the stock `approach_status` read 0 through captures
+    /// (#81).
     #[serde(default)]
     pub approach_command: Option<String>,
-    #[serde(default)]
-    pub approach_status: Option<String>,
     /// The `park_brake_valve` value that means SET on this airframe, where the
     /// valve is modeled. The sense is PER-AIRCRAFT (C90B: 0 = set, verified live;
     /// SR22: 1 = set — the opposite, seen as an "inverted" handle). `None` = don't
@@ -4169,7 +4170,6 @@ fn cessna_172sp() -> AircraftProfile {
         load_sheet: LoadSheet::Stock,
         ils_coupled: false,
         approach_command: None,
-        approach_status: None,
         bus_volts_nominal: None,
         // The stock profile carries the same continuous flare laws. Keep the
         // builtin sound when profiles/ is unavailable.
@@ -4520,7 +4520,6 @@ fn cirrus_sr22() -> AircraftProfile {
         load_sheet: LoadSheet::Stock,
         ils_coupled: false,
         approach_command: None,
-        approach_status: None,
         bus_volts_nominal: None,
         flare_power: None,
         approach_thrust_min: None,

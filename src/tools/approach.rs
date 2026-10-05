@@ -301,7 +301,7 @@ impl Tool for PrepareIls {
             ctx.xplane.get_float(crate::datarefs::ON_GROUND_ANY),
             ctx.xplane.get_float(ils::AP_POWER),
             ctx.xplane.get_float(ils::SERVOS),
-            ctx.xplane.get_float(ils::APPR_STATUS),
+            ctx.xplane.get_float(crate::autoflight::names::AP_STATE),
             ctx.xplane.get_float(ils::VDEF),
             ctx.xplane.get_float(ils::GS_VALID),
             ctx.xplane.get_float(crate::datarefs::COMPASS_HEADING_DEG),
@@ -348,7 +348,12 @@ impl Tool for PrepareIls {
             automation,
             ap_power,
             servos,
-            appr.as_ref().ok().copied(),
+            // Armed or captured, either half, on the bitfield (the 737's
+            // approach_status read 0 through captures, #81).
+            appr.as_ref()
+                .ok()
+                .and_then(|v| crate::autoflight::Modes::from_read(*v))
+                .map(|m| if m.approach_any() { 1.0 } else { 0.0 }),
             tracks_loc,
             verdict,
         );

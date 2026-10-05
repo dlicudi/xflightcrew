@@ -163,7 +163,8 @@ const AUTOLAND_WANT: &[F] = &[
     F::RollYield,
     F::R,
 ];
-/// ...and with the ILS tuned, its needles and modes (`crate::ils`).
+/// ...and with the ILS tuned, its needles (`crate::ils`; the modes are the
+/// bitfield's, `autoflight::Modes`, read beside the frame).
 const AUTOLAND_WANT_ILS: &[F] = &[
     F::MagVar,
     F::Ias,
@@ -182,8 +183,6 @@ const AUTOLAND_WANT_ILS: &[F] = &[
     F::Vdef,
     F::LocValid,
     F::GsValid,
-    F::GsStatus,
-    F::ApprStatus,
 ];
 /// A lever read this close to the last command took it (`lever_took`).
 const LEVER_TOOK_TOL: f64 = 0.01;
@@ -1666,7 +1665,6 @@ fn spawn_autoland(launch: AutolandLaunch) {
                 // ran near 0.3. An older plugin falls back to separate reads,
                 // still one round.
                 let thr_name = throttle_dref();
-                let appr_name = crate::ils::approach_status_dref();
                 // Beside the frame, in its round: the lever, the autopilot's
                 // mode bitfield and the autothrottle (`crate::autoflight`:
                 // the modes' one truth, and a thrust this loop owns).
@@ -1675,7 +1673,7 @@ fn spawn_autoland(launch: AutolandLaunch) {
                     sim::state::read_with(
                         &xp,
                         sim::state::Want(AUTOLAND_WANT_ILS),
-                        &[thr_name.as_str(), afn::AP_STATE, afn::AT_ON, afn::AT_MODE, appr_name.as_str()],
+                        &[thr_name.as_str(), afn::AP_STATE, afn::AT_ON, afn::AT_MODE],
                     )
                     .await
                 } else {
@@ -1704,7 +1702,6 @@ fn spawn_autoland(launch: AutolandLaunch) {
                         mode.and_then(|r| r.ok()),
                     )
                 };
-                let mut appr_read = extra.next();
                 // Before the lever is written: an engaged autothrottle fights it.
                 {
                     let step = thrust_watch.step(thrust_t0.elapsed().as_secs_f64(), at_engaged);
@@ -3721,41 +3718,18 @@ fn spawn_autoland(launch: AutolandLaunch) {
                 // The ILS: its needles against our path, and the coupled
                 // approach where the airframe allows it.
                 let on_final = g.phase == ApproachPhase::Final && pattern.is_none() && !ga;
-                let needles = if ils.is_some() {
-                    // From the tick's one read; the airframe's own
-                    // approach status rode beside the frame.
-                    let (h, v, lv, gv, gs, stock_ap) = (
-                        st.get(F::Hdef),
-                        st.get(F::Vdef),
-                        st.get(F::LocValid),
-                        st.get(F::GsValid),
-                        st.get(F::GsStatus),
-                        st.get(F::ApprStatus),
-                    );
-                    let ap = appr_read
-                        .take()
-                        .unwrap_or_else(|| Err(anyhow::anyhow!("unread")));
-                    // Both readings, while an airframe's own status is being
-                    // learned (the 737's app_status, 2026-09-26).
-                    LAST_APPR_READS
-                        .lock()
-                        .map(|mut l| *l = (ap.as_ref().ok().copied(), stock_ap.ok()))
-                        .ok();
-                    Some((
-                        crate::ils::Needles {
-                            hdef: h.ok(),
-                            vdef: v.ok(),
-                            loc_valid: lv.is_ok_and(|x| x > 0.5),
-                            gs_valid: gv.is_ok_and(|x| x > 0.5),
-                        },
-                        ap.ok(),
-                        gs.ok(),
-                    ))
-                } else {
-                    None
-                };
+                let needles = ils.as_ref().map(|_| {
+                    // From the tick's one read.
+                    let (h, v, lv, gv) = (st.get(F::Hdef), st.get(F::Vdef), st.get(F::LocValid), st.get(F::GsValid));
+                    crate::ils::Needles {
+                        hdef: h.ok(),
+                        vdef: v.ok(),
+                        loc_valid: lv.is_ok_and(|x| x > 0.5),
+                        gs_valid: gv.is_ok_and(|x| x > 0.5),
+                    }
+                });
                 let cpl = match needles {
-                    Some((n, ap, gs)) => {
+                    Some(n) => {
                         if let Some(line) = ils_xcheck.step(n, on_final, radio_ft, tick_dt) {
                             crate::blackbox::record(
                                 "ils",
@@ -3764,23 +3738,35 @@ fn spawn_autoland(launch: AutolandLaunch) {
                             );
                             announce(line, Priority::Caution);
                         }
+                        // The airframe's own capture, armed on an intercept
+                        // to the localizer from below the beam: the final, a
+                        // straight-in heading for it, or a pattern's inbound.
+                        let inbound_leg = pattern.is_none_or(|(_, leg, _)| leg == crate::reversal::Leg::Inbound);
+                        let toward_loc = ils.as_ref().zip(psi_r.as_ref().ok()).is_some_and(|(i, psi)| {
+                            crate::ils::arm_verdict(lat, lon, true_to_mag(*psi, var), i)
+                                == crate::ils::ArmVerdict::Now
+                        });
                         let before = coupling;
                         let out = coupling.step(
                             crate::ils::CouplingIn {
                                 allowed: coupled_ok,
-                                on_final,
+                                inbound: !ga && hold.is_none() && inbound_leg && (on_final || toward_loc),
                                 arresting: g.arresting,
-                                go_around: ga,
+                                leaving: ga || hold.is_some() || !inbound_leg,
                                 dist_nm: g.dist_nm,
                                 needles: n,
-                                appr: ap,
-                                gs,
+                                modes: ap_modes,
                             },
                             &mut coupling_armed_s,
                             tick_dt,
                         );
-                        if out.press_appr {
-                            autoflight::press_logged(&xp, Button::Approach, "autoland_coupling").await;
+                        if out.press_appr || out.disarm {
+                            autoflight::press_logged(
+                                &xp,
+                                Button::Approach,
+                                if out.disarm { "autoland_decouple" } else { "autoland_coupling" },
+                            )
+                            .await;
                         }
                         // A decouple is an INTENT: the mode housekeeping
                         // below presses HDG and V/S back once, from the
@@ -3789,7 +3775,7 @@ fn spawn_autoland(launch: AutolandLaunch) {
                             crate::blackbox::record(
                                 "ils",
                                 serde_json::json!({"event": "coupling",
-                                    "appr_reads": *LAST_APPR_READS.lock().unwrap_or_else(|e| e.into_inner()),
+                                    "modes": ap_modes.map(|m| m.words()),
                                     "from": format!("{before:?}"),
                                     "to": format!("{coupling:?}"), "hdef": n.hdef, "vdef": n.vdef,
                                     "radio": radio_ft, "dist": g.dist_nm}),
@@ -3811,6 +3797,7 @@ fn spawn_autoland(launch: AutolandLaunch) {
                     None => crate::ils::CouplingOut {
                         press_appr: false,
                         decouple: false,
+                        disarm: false,
                         own_lateral: true,
                         own_vertical: true,
                     },
@@ -4307,6 +4294,8 @@ fn spawn_autoland(launch: AutolandLaunch) {
                 let not_held = g.phase != ApproachPhase::Flare
                     && !g.arresting
                     && engage.confirmed()
+                    // A captured glideslope is the airframe's vertical, not our dial.
+                    && cpl.own_vertical
                     && vs_err.is_some_and(|e| vs_not_held(e, prev_vs_err, tick_dt));
                 prev_vs_err = vs_err;
                 if not_held {
@@ -6008,9 +5997,6 @@ pub fn balloon_power(
 const FLARE_PITCH: &str = "xcopilot/pitch";
 /// The roll channel the takeoff's climb-out flies, and its take-back latch:
 /// with the servos off for the arrest, the runway track is held here.
-/// The airframe's own approach status and the stock one, last read (while
-/// an add-on's encoding is being learned).
-static LAST_APPR_READS: std::sync::Mutex<(Option<f64>, Option<f64>)> = std::sync::Mutex::new((None, None));
 
 const FLARE_ROLL: &str = "xcopilot/roll";
 

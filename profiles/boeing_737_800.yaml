@@ -506,14 +506,24 @@ advisor:
     phases: [takeoff, approach, landing]
     say: Seat belt signs are off.
 
-# The ILS is flown on the autopilot's own approach mode: localiser and
-# glideslope captured, the heading and VS dials left alone after capture.
-# On the heading knob the 737 wove 10 to 15 m either side of LEMG 13's
-# centreline all the way down (2026-09-26). First flown on this type then.
-# Off until proven (#81): 43 of 46 arms (2026-09-26 to 09-28) went Armed to
-# Abandoned with the APP press never read back (appr_reads [0,0]); 2 coupled, then abandoned.
-ils_coupled: false
-# Its own APP button: the stock sim/autopilot/approach armed nothing and the
-# coupling gave up after six seconds (LEMG 13, 2026-09-26).
+# The ILS is flown on the autopilot's own approach mode (#81): APP armed on
+# an intercept from below the beam, the localiser and then the glideslope
+# the airframe's once captured, our speed, configuration, gate, arrest and
+# rollout. On the heading knob the 737 wove 10 to 15 m either side of LEMG
+# 13's centreline all the way down (2026-09-26).
+# The evidence, re-read on the autopilot_state bitfield: of 46 autoland arms
+# 2026-09-26 to 09-28, 34 showed the APP armed or captured within 4 s (50 to
+# 1330, 1584 or 2560), and every one was dropped by autoland's own HDG and
+# V/S presses at the next tick, while app_status, the read it trusted, said
+# 0 (the owner, src/autoflight.rs, never presses over a capture now). 7 more
+# showed nothing in the 1 s state samples and 4 had the servos out. On
+# 2026-10-05 the APP flown by hand from ALT HOLD under the beam armed at
+# 13:22:39, captured the localiser 13:24:37 and the glideslope 13:25:45, and
+# tracked both to the flare. VERIFY (unflown through the owner): blackbox
+# `ils` `coupling` from Off to Coupled with `modes`, `autoflight` `press`
+# APP once, no HDG or V/S press between the arm and the roundout, and the
+# stable gate's record at 1,000 ft.
+ils_coupled: true
+# Its own APP button (the press handler fires the stock approach command
+# after its power check and lights the lamp).
 approach_command: laminar/B738/autopilot/app_press
-approach_status: laminar/B738/autopilot/app_status

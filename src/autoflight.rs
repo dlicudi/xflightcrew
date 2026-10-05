@@ -375,8 +375,6 @@ pub struct Panel {
     pub vertical_speed: String,
     pub altitude_hold: String,
     pub approach: String,
-    /// The approach status the airframe shows (its own where it has one).
-    pub approach_status: String,
     pub autothrottle_off: String,
     pub window: WindowRule,
     /// The profile's `ils_coupled`: autoland flies the airframe's APP.
@@ -391,7 +389,6 @@ impl Default for Panel {
             vertical_speed: cmd::VERTICAL_SPEED.into(),
             altitude_hold: cmd::ALTITUDE_HOLD.into(),
             approach: cmd::APPROACH.into(),
-            approach_status: names::APPR_STATUS.into(),
             autothrottle_off: cmd::AT_OFF.into(),
             window: WindowRule::ParkAbove,
             coupled_ils: false,
@@ -414,7 +411,6 @@ impl Panel {
                 d.altitude_hold,
             ),
             approach: pick(p.approach_command.as_ref(), d.approach),
-            approach_status: pick(p.approach_status.as_ref(), d.approach_status),
             autothrottle_off: pick(
                 a.and_then(|a| a.autothrottle_off_command.as_ref()),
                 d.autothrottle_off,
