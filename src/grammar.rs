@@ -2779,6 +2779,18 @@ fn parse_one(t: &str) -> Option<ToolCall> {
     {
         return Some(call("autoland", json!({ "cancel": true })));
     }
+    // The NEAREST field, whatever the plan: asked for by name, or the
+    // emergency words. A plain "land the aircraft" is the plan's
+    // destination (the recovery planner; LEMG 2026-10-05).
+    if (has(t, "land") || has(t, "landing") || t.contains("divert"))
+        && (t.contains("nearest") || t.contains("closest"))
+        || t.contains("emergency landing")
+        || t == "land here"
+        || t == "land right"
+        || t == "land right now"
+    {
+        return Some(call("autoland", json!({ "nearest": true })));
+    }
     if t.contains("land the aircraft")
         || t == "land aircraft"
         || t.contains("land the plane")
@@ -3102,9 +3114,10 @@ mod tests {
         // 737 2026-09-17 and A330 2026-09-20.
         assert_eq!(one("Let's land.").unwrap(), ("autoland".into(), json!({})));
         assert_eq!(one("Land aircraft.").unwrap(), ("autoland".into(), json!({})));
+        // "Right now" is the nearest runway, not the plan's destination.
         assert_eq!(
             one("Let's land right now.").unwrap(),
-            ("autoland".into(), json!({}))
+            ("autoland".into(), json!({ "nearest": true }))
         );
         // A named field is a diversion, not the autoland tool.
         assert!(one("let's land at jerez").is_none_or(|(tool, _)| tool != "autoland"));
@@ -5029,8 +5042,22 @@ mod tests {
         assert_eq!(one("get us down").unwrap(), ("autoland".into(), json!({})));
         assert_eq!(
             one("emergency landing").unwrap(),
-            ("autoland".into(), json!({}))
+            ("autoland".into(), json!({ "nearest": true }))
         );
+        // The nearest field by name; a plain landing is the destination's.
+        for nearest in [
+            "land at the nearest airport",
+            "land at the closest airport",
+            "divert to the nearest field",
+            "let's land at the nearest",
+        ] {
+            assert_eq!(
+                one(nearest).unwrap(),
+                ("autoland".into(), json!({ "nearest": true })),
+                "{nearest}"
+            );
+        }
+        assert!(one("taxi to the nearest stand").is_none_or(|(tool, _)| tool != "autoland"));
         assert_eq!(one("autoland").unwrap(), ("autoland".into(), json!({})));
         assert_eq!(
             one("cancel the autoland").unwrap(),
