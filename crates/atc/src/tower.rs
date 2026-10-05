@@ -238,7 +238,7 @@ pub struct Ctx {
     pub runway_refusal: Option<(String, String)>,
     /// The field's transition LEVEL, feet (apt.dat `1302 transition_level`):
     /// an assigned level at or above it is spoken as a flight level
-    /// ([`crate::atis::spoken_level`]). `None` = unknown, everything in feet.
+    /// ([`crate::atis::is_flight_level`]). `None` = unknown, everything in feet.
     pub transition_level_ft: Option<f64>,
     /// The flight has said it stays in the pattern (the station's
     /// `circuits`, noted from THIS call's words before the reply): a zone
@@ -2027,7 +2027,6 @@ impl Tower {
 
     /// The clearance still awaiting its readback, if any. Consumed by the
     /// battle tests; the binary reads it via [`Tower::suggested_readback`].
-    #[allow(dead_code)]
     pub fn pending(&self) -> Option<&PendingReadback> {
         self.pending.as_ref()
     }

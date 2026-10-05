@@ -113,7 +113,6 @@ pub struct ToolCtx<'a> {
     pub xplane: &'a dyn XPlane,
     // Available to tools that need global config; unused by `set_flaps` (its
     // limits come from the aircraft profile).
-    #[allow(dead_code)]
     pub config: &'a Config,
     /// The speech arbiter, for the rare action that announces *later* than its
     /// readback: the autopilot capture watcher calls out the level-off when it
@@ -497,7 +496,6 @@ impl Registry {
             tools.push(Box::new(autoland::Autoland {
                 cfg: ap.clone(),
                 approach_ias,
-                prop: profile.prop.clone(),
                 planner: full_auto.clone(),
             }));
             if let Some(fa) = full_auto {

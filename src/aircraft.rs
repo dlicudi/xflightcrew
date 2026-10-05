@@ -1182,7 +1182,6 @@ pub struct AircraftProfile {
     pub com2_radio: bool,
     /// Whether the gear retracts. `false` (e.g. the 172) means no `gear` tool.
     #[serde(default)]
-    #[allow(dead_code)]
     pub retractable_gear: bool,
     /// A helicopter. Every flying and ground law here is fixed-wing (a
     /// rotation through the pitch channel, a flare through the VS dial, a

@@ -178,15 +178,6 @@ pub(super) fn arinc_dist_or_time(s: &str) -> (Option<f64>, Option<f64>) {
     }
 }
 
-impl ProcLeg {
-    /// Does this leg terminate at a fixed point (vs. climb/descend to an
-    /// altitude on a heading)? Fix legs are the ones the follower can sequence
-    /// laterally; to-altitude legs (CA/VA/FA) it flies as heading-holds.
-    pub fn has_fix_target(&self) -> bool {
-        self.fix.is_some()
-    }
-}
-
 pub(super) fn cifp_field<'a>(f: &[&'a str], i: usize) -> &'a str {
     f.get(i).map(|s| s.trim()).unwrap_or("")
 }

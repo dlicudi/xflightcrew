@@ -165,9 +165,7 @@ pub struct AirportIls {
     /// Frequency and course ride along for the copilot's "set up the ILS"
     /// composition (auto-tuning NAV1 off the clearance) — the approach
     /// controller itself only needs to know the ILS exists.
-    #[allow(dead_code)]
     pub freq_10khz: i64,
-    #[allow(dead_code)]
     pub course_mag: f64,
     /// Glideslope angle, degrees — sets how far out the vectors join final
     /// (the platform must sit under the slope there).
