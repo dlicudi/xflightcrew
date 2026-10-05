@@ -46,7 +46,7 @@ fn air_of(r: &Value) -> Air {
         ias_kts: f(r, "ias"),
         gs_kts: f(r, "gs"),
         track_true: f(r, "track"),
-        mag_var: -1.0,
+        mag_var: Some(-1.0),
         bank_deg: f(r, "bank"),
         pitch_deg: 0.0,
         flap: f(r, "flap"),

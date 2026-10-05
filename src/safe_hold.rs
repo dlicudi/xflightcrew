@@ -160,8 +160,9 @@ pub struct Air {
     pub ias_kts: f64,
     pub gs_kts: f64,
     pub track_true: f64,
-    /// X-Plane's `magnetic_variation` (positive WEST: mag = true + var).
-    pub mag_var: f64,
+    /// X-Plane's `magnetic_variation` (positive WEST: mag = true + var);
+    /// `None` on a failed read: no variation, no heading to turn to.
+    pub mag_var: Option<f64>,
     pub bank_deg: f64,
     pub pitch_deg: f64,
     pub flap: f64,
@@ -524,10 +525,18 @@ pub fn hold_cmd(
             .is_none_or(|r| climb_clears(r, air.alt_true_ft, grad, false));
         if !ahead_clears {
             if let Some((brg, need)) = clear_heading(&t.fan, air, target_true, grad) {
-                if crate::angles::abs_diff_deg(brg, air.track_true) > 5.0 {
-                    heading_mag = Some(crate::runway::true_to_mag(brg, air.mag_var).round());
+                // A turn is dialled in magnetic: on a failed variation read a
+                // "0" would set the bug off the clear bearing by the whole
+                // variation, so no turn is chosen and the climb stays ahead.
+                let turn = crate::angles::abs_diff_deg(brg, air.track_true) > 5.0;
+                match (turn, air.mag_var) {
+                    (true, Some(var)) => {
+                        heading_mag = Some(crate::runway::true_to_mag(brg, var).round());
+                        target_true = target_true.max(need);
+                    }
+                    (true, None) => {}
+                    (false, _) => target_true = target_true.max(need),
                 }
-                target_true = target_true.max(need);
             }
         }
     }
@@ -1267,7 +1276,7 @@ async fn read_air(xp: &dyn crate::xplane::XPlane) -> Option<(Air, bool, Option<f
         ias_kts: ias,
         gs_kts: gs * sim::ground::MS_TO_KTS,
         track_true: hpath.rem_euclid(360.0),
-        mag_var: ok(mag_var).unwrap_or(0.0),
+        mag_var: ok(mag_var),
         bank_deg: ok(bank).unwrap_or(0.0),
         pitch_deg: ok(pitch).unwrap_or(0.0),
         flap: ok(flap).unwrap_or(0.0),

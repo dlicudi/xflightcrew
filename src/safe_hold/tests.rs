@@ -14,7 +14,7 @@ fn air() -> Air {
         ias_kts: 176.0,
         gs_kts: 190.0,
         track_true: 306.0,
-        mag_var: -1.0,
+        mag_var: Some(-1.0),
         bank_deg: 0.0,
         pitch_deg: 1.0,
         flap: 0.5,
@@ -788,4 +788,22 @@ async fn the_air_is_read_from_one_frame() {
     assert!((air.gs_kts - 194.4).abs() < 0.1);
     assert_eq!(air.track_true, 306.0);
     assert!(!hands);
+}
+
+/// No variation read, no turn: the bug is magnetic, and a "0" variation set
+/// it off the clear bearing by the whole variation. The climb stays ahead.
+#[test]
+fn a_failed_variation_read_turns_nothing() {
+    let mut a = air();
+    a.mag_var = None;
+    let wall = ray(306.0, &[(2.0, 2_000.0), (3.0, 6_000.0)]);
+    let t = Terrain {
+        ahead: Some(wall.clone()),
+        fan: vec![wall, ray(246.0, &[(2.0, 300.0), (6.0, 900.0)])],
+        ..Default::default()
+    };
+    let fl = floor(&a, &t);
+    let c = hold_cmd(Why::HoldsBelow, &a, &ap_vs_down(), fl, &t, 700.0);
+    assert_eq!(c.heading_mag, None);
+    assert!(c.climb);
 }

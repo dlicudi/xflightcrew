@@ -256,6 +256,11 @@ pub(crate) fn rejoin_unsteady(a: &Steady, b: &Steady) -> Option<String> {
     None
 }
 
+/// The resume's refusal when a climb first needs a heading and the magnetic
+/// variation did not read.
+pub const NO_VARIATION: &str = "I can't read the magnetic variation, so I can't set a heading for \
+     the climb to the safe altitude. I haven't taken control.";
+
 /// A [`Steady`] read now, seconds since `clock`; `None` for a failed read.
 async fn steady_read(
     xp: &crate::xplane::XPlaneClient,
@@ -1063,6 +1068,11 @@ impl FullAuto {
         let climb_leg = match climb {
             None => None,
             Some(alt) => {
+                // The climb leg is a magnetic course: no variation read, no
+                // course (a "0" flew the bug off by the whole variation).
+                let Some(var) = mag_var else {
+                    return Err(NO_VARIATION.into());
+                };
                 let grad = crate::safe_hold::gradient_ft_nm(self.cfg.climb.max_climb_fpm, gs_kts);
                 let path_ray = heights.as_ref().map(|h| crate::safe_hold::Ray {
                     bearing_true: brg,
@@ -1086,7 +1096,7 @@ impl FullAuto {
                         agl_ft,
                         gs_kts,
                         track_true: brg,
-                        mag_var: mag_var.unwrap_or(0.0),
+                        mag_var: Some(var),
                         ..Default::default()
                     };
                     let fan = crate::safe_hold::probe_fan(&xp, &air).await;
@@ -1095,7 +1105,7 @@ impl FullAuto {
                         alt = alt.max(crate::safe_hold::up_100(need + (altitude - true_ft)));
                     }
                 }
-                let course_mag = crate::runway::true_to_mag(course_true, mag_var.unwrap_or(0.0)).round();
+                let course_mag = crate::runway::true_to_mag(course_true, var).round();
                 climb_heading_mag = Some(course_mag);
                 Some(rp::climb_leg(course_mag, alt))
             }
