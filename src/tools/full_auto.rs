@@ -256,6 +256,14 @@ pub(crate) fn rejoin_unsteady(a: &Steady, b: &Steady) -> Option<String> {
     None
 }
 
+/// The destination runway the recovery planner asks for, metres: the arm's
+/// own rule ([`crate::aircraft::planned_landing_needed_ft`], the book landing
+/// distance else the takeoff distance), never a second reading of it; `None`
+/// when the profile recites neither (no check).
+fn plan_landing_need_m(landing_ft: Option<f64>, takeoff_ft: Option<f64>) -> Option<f64> {
+    crate::aircraft::planned_landing_needed_ft(landing_ft, takeoff_ft).map(|ft| ft * 0.3048)
+}
+
 /// The resume's refusal when a climb first needs a heading and the magnetic
 /// variation did not read.
 pub const NO_VARIATION: &str = "I can't read the magnetic variation, so I can't set a heading for \
@@ -1052,9 +1060,8 @@ impl FullAuto {
             let r = dest_runways.iter().find(|r| {
                 crate::nav::same_runway_end(&r.ident_a, rwy) || crate::nav::same_runway_end(&r.ident_b, rwy)
             })?;
-            let have = crate::nav::haversine_nm(r.lat_a, r.lon_a, r.lat_b, r.lon_b) * 1852.0;
-            let need = crate::aircraft::landing_needed_m(crate::aircraft::landing_distance_m(), None, 0.0);
-            (need > 0.0).then_some((rwy, have, need))
+            let need = plan_landing_need_m(self.landing_distance_ft, self.takeoff_distance_ft)?;
+            Some((rwy, r.length_m(), need))
         });
         crate::full_auto::event(
             "recovery_plan",
@@ -2023,6 +2030,20 @@ pub fn spoken_arm_line(
 mod tests {
     use super::*;
     use crate::recovery_plan::Join;
+
+    /// The planner's runway need is the arm's: an airframe that recites only
+    /// a takeoff distance is still checked (the live landing figure alone
+    /// left it unchecked), and one reciting neither is not.
+    #[test]
+    fn the_recovery_runway_need_is_the_arms() {
+        let only_takeoff = plan_landing_need_m(None, Some(3_000.0)).expect("checked");
+        let arm = crate::aircraft::planned_landing_needed_ft(None, Some(3_000.0)).unwrap();
+        assert!((only_takeoff - arm * 0.3048).abs() < 1e-9);
+        assert!(only_takeoff > 0.0);
+        assert_eq!(plan_landing_need_m(None, None), None);
+        let both = plan_landing_need_m(Some(2_000.0), Some(3_000.0)).unwrap();
+        assert!(both < only_takeoff, "the landing figure first");
+    }
 
     #[test]
     fn take_us_to_is_checked_against_the_plan() {
