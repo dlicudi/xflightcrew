@@ -18,7 +18,6 @@
 use crate::autoflight::{self, Button, Dial};
 use crate::aircraft::TakeoffConfigProfile;
 use crate::xplane::XPlane;
-use std::sync::Mutex;
 
 const FLAP_HANDLE: &str = crate::datarefs::FLAP_RATIO;
 /// Where the flaps ARE, following the handle at the airframe's own rate.
@@ -69,14 +68,11 @@ pub fn flaps_arrived(deployed: f64, commanded: f64) -> bool {
 /// A dial this far above the field is the pilot's own and is left alone.
 const DIAL_CLEAR_FT: f64 = 500.0;
 
-/// What the airframe's profile declares (`takeoff_config:`). Silent profiles
-/// get flaps, trim and the dial only: a 172 has no spoilers to arm.
-static AIRFRAME: Mutex<Option<crate::aircraft::TakeoffConfigProfile>> = Mutex::new(None);
-
-/// Republished on every swap, including to `None`
-/// ([`crate::flight_state::publish_airframe`]).
+/// Publish the `takeoff_config:` alone (the snapshot's, republished on every
+/// swap, including to `None`, by [`crate::flight_state::publish_airframe`]).
+#[cfg(test)]
 pub fn publish(p: Option<crate::aircraft::TakeoffConfigProfile>) {
-    *AIRFRAME.lock().unwrap_or_else(|e| e.into_inner()) = p;
+    crate::aircraft::update_airframe_facts(|a| a.takeoff_config = p);
 }
 
 /// Does this airframe have a speedbrake lever the crew may use in flight?
@@ -85,8 +81,10 @@ pub fn has_speedbrake() -> bool {
     airframe().is_some_and(|af| af.arm_spoilers)
 }
 
+/// What the airframe's profile declares (`takeoff_config:`). Silent profiles
+/// get flaps, trim and the dial only: a 172 has no spoilers to arm.
 fn airframe() -> Option<crate::aircraft::TakeoffConfigProfile> {
-    AIRFRAME.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    crate::aircraft::airframe_facts().takeoff_config.clone()
 }
 
 /// Thrust reduction, declared: pull the levers back to climb thrust above
@@ -569,7 +567,7 @@ mod tests {
     use crate::xplane::FakeXPlane;
 
     /// The published airframe is process-wide; these tests take turns.
-    static LOCK: Mutex<()> = Mutex::new(());
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     fn a330() -> crate::aircraft::TakeoffConfigProfile {
         crate::aircraft::load("airbus_a330_300")

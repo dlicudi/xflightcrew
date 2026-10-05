@@ -2890,6 +2890,23 @@ pub struct AirframeFacts {
     pub roll_rudder: Option<RollRudderProfile>,
     /// The book landing distance, metres ([`landing_distance_m_for`]).
     pub landing_distance_m: Option<f64>,
+    /// The enroute vertical rates (`procedure::vs_limits_for`); `None` is
+    /// the GA figure, for a profile that declares none.
+    pub vs_limits: Option<VsLimits>,
+    /// The gear-warning envelope, the profile's or the `.acf`'s (the
+    /// detector's, over a silent profile).
+    pub gear_warning: Option<GearWarning>,
+    /// A jet's declared climb-out ([`ClimbOut::from_profile`]).
+    pub climb_out: Option<ClimbOut>,
+    /// The manual takeoff power limit.
+    pub takeoff_power: Option<TakeoffPowerProfile>,
+    /// `takeoff_config:`.
+    pub takeoff_config: Option<TakeoffConfigProfile>,
+    /// `ap_altitude_capture`.
+    pub ap_altitude_capture: bool,
+    /// A helicopter's rotor: (rpm dataref, governed rpm, collective
+    /// dataref) (`hover::rotor_facts`); `None` on anything else.
+    pub rotor: Option<(String, f64, String)>,
 }
 
 impl Default for AirframeFacts {
@@ -2913,6 +2930,13 @@ impl Default for AirframeFacts {
             flare_elevator: None,
             roll_rudder: None,
             landing_distance_m: None,
+            vs_limits: None,
+            gear_warning: None,
+            climb_out: None,
+            takeoff_power: None,
+            takeoff_config: None,
+            ap_altitude_capture: false,
+            rotor: None,
         }
     }
 }
@@ -2945,6 +2969,45 @@ pub fn install_airframe_facts(f: AirframeFacts) {
 pub fn update_airframe_facts(change: impl FnOnce(&mut AirframeFacts)) {
     let mut g = AIRFRAME_FACTS.write().unwrap_or_else(|e| e.into_inner());
     change(std::sync::Arc::make_mut(&mut g));
+}
+
+/// An airframe's enroute vertical rates, fpm (`procedure::vs_limits_for`
+/// derives them; `procedure::climb_fpm` and the rest read them).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct VsLimits {
+    pub climb_fpm: f64,
+    pub descent_fpm: f64,
+    pub best_climb_fpm: Option<f64>,
+}
+
+/// A jet's climb-out, declared by the profile (`acceleration_height_agl_ft`
+/// and `best_climb_fpm`) and republished on every swap; flown by
+/// `autotakeoff`.
+///
+/// EGPH 24, 2026-09-21, the 737: every airframe climbed out on one capped
+/// 1,500 fpm dial at takeoff thrust. That is a 172's whole climb and a fifth
+/// of a 737's excess power, so the rest went into speed: 185 kt at 340 ft,
+/// the flaps running up on speed alone at 400, 500 and 740 ft, 240 kt through
+/// 1,000 ft. A crew holds V2 + 20 to the acceleration height by PITCH, then
+/// lowers the nose and cleans up on the schedule.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ClimbOut {
+    pub accel_agl_ft: f64,
+    /// The hardest the speed hold may climb, fpm.
+    pub max_fpm: f64,
+}
+
+impl ClimbOut {
+    pub fn from_profile(p: &AircraftProfile) -> Option<Self> {
+        let r = p.reference.as_ref()?;
+        let accel_agl_ft = r
+            .acceleration_height_agl_ft
+            .filter(|h| h.is_finite() && *h > 0.0)?;
+        Some(ClimbOut {
+            accel_agl_ft,
+            max_fpm: r.best_climb_fpm.filter(|f| f.is_finite()).unwrap_or(0.0),
+        })
+    }
 }
 
 // The tests' thrust lever: one per test THREAD (a test publishing the

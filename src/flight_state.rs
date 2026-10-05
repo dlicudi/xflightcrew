@@ -44,20 +44,11 @@ pub(crate) fn publish_airframe(p: &AircraftProfile) {
     // The systems survey is the detector's, from the sim; a new airframe
     // starts knowing nothing about its avionics.
     crate::systems::publish(None);
-    // The rotor is the helicopter's: an aeroplane after the S-76 must not
-    // hover taxi in, be "on the ground" to the tower aloft, or skip a vacate.
-    crate::hover::publish_rotor(crate::hover::rotor_facts(p));
     crate::full_auto::forget_mission();
     crate::tools::cabin_air::publish(p.cabin_air.clone());
     crate::tools::radio::publish_mode_knob(p.transponder_mode_knob.clone());
-    crate::takeoff_config::publish(p.takeoff_config.clone());
-    crate::autotakeoff::publish_climb_out(crate::autotakeoff::ClimbOut::from_profile(p));
-    crate::autotakeoff::publish_takeoff_power(p.takeoff_power.clone());
-    crate::autotakeoff::publish_gear_warning(p.gear_warning);
     crate::tools::signs::publish(p.seat_belt_signs.clone(), p.cabin_crew);
-    crate::circuit::publish_ap_altitude_capture(p.ap_altitude_capture);
     crate::tools::lights::publish_exterior(&p.lights);
-    crate::procedure::publish_vs_limits(p.reference.as_ref());
     // A plan's transition belongs to the flight it was armed for.
     crate::tools::instruments::publish_flight_transition(None);
     crate::tools::instruments::publish_altimeter(p.altimeter.clone());
@@ -100,6 +91,18 @@ pub(crate) fn airframe_facts(p: &AircraftProfile) -> crate::aircraft::AirframeFa
         landing_distance_m: a::landing_distance_m_for(
             p.reference.as_ref().and_then(|r| r.landing_distance_ft),
         ),
+        vs_limits: Some(crate::procedure::vs_limits_for(p.reference.as_ref())),
+        // The profile's envelope; the detector reads the .acf's over a
+        // silent profile.
+        gear_warning: p.gear_warning,
+        climb_out: a::ClimbOut::from_profile(p),
+        takeoff_power: p.takeoff_power.clone(),
+        takeoff_config: p.takeoff_config.clone(),
+        ap_altitude_capture: p.ap_altitude_capture,
+        // The rotor is the helicopter's: an aeroplane after the S-76 must
+        // not hover taxi in, be "on the ground" to the tower aloft, or skip
+        // a vacate.
+        rotor: crate::hover::rotor_facts(p),
     }
 }
 
@@ -675,15 +678,22 @@ mod tests {
         assert!(crate::hover::rotor_facts(&heli).is_some());
         let plane = crate::aircraft::load("cessna_172sp").expect("172 profile loads");
         assert!(crate::hover::rotor_facts(&plane).is_none());
+        // The snapshot publish_airframe installs carries them, and none off
+        // a helicopter.
+        assert!(super::airframe_facts(&heli).rotor.is_some());
+        assert!(
+            super::airframe_facts(&plane).rotor.is_none(),
+            "publish_airframe must republish the rotor, None off a helicopter"
+        );
         let this = crate::test_support::module_source("flight_state");
         let body = this
             .split("pub(crate) fn publish_airframe(")
             .nth(1)
             .unwrap();
-        let body = body.split("pub(crate) fn stand_down()").next().unwrap();
+        let body = body.split("\n}\n").next().unwrap();
         assert!(
-            body.contains("crate::hover::publish_rotor(crate::hover::rotor_facts(p))"),
-            "publish_airframe must republish the rotor, None off a helicopter"
+            body.contains("crate::aircraft::install_airframe_facts(airframe_facts(p));"),
+            "publish_airframe installs the whole snapshot"
         );
     }
 
