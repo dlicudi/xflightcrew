@@ -730,20 +730,6 @@ pub fn arrival_brief_request(text: &str) -> bool {
     brief && what && words.len() <= 9 && words.iter().all(|w| OK.contains(w))
 }
 
-/// The runway end most into `wind` (from, true degrees; knots), from the
-/// field's ends `(ident, heading true)`. `None` for a calm or unknown wind,
-/// where any end will do and naming one would be a guess. Pure.
-pub fn into_wind_end(ends: &[(String, f64)], wind: Option<(f64, f64)>) -> Option<String> {
-    let (from, kts) = wind?;
-    if kts < 3.0 {
-        return None;
-    }
-    ends.iter()
-        .map(|(id, hdg)| (id, kts * (from - hdg).to_radians().cos()))
-        .max_by(|a, b| a.1.total_cmp(&b.1))
-        .map(|(id, _)| id.clone())
-}
-
 /// The arrival brief for the loaded plan's destination: the weather on file,
 /// the runway into the wind, what approaches the field offers, the field's
 /// elevation. Blocking (an apt.dat pass): run it off the command loop's
@@ -762,17 +748,10 @@ pub fn arrival_brief(apt_dat: &str, cifp: &str, fixes: &str, xplane_root: &str) 
     match crate::weather::briefing(xplane_root, &dest, &name) {
         Ok(w) | Err(w) => parts.push(w),
     }
-    let ends: Vec<(String, f64)> = airport
-        .runways
-        .iter()
-        .flat_map(|r| {
-            [
-                (r.ident_a.clone(), r.heading_a_deg()),
-                (r.ident_b.clone(), r.heading_b_deg()),
-            ]
-        })
-        .collect();
-    if let Some(end) = into_wind_end(&ends, crate::weather::surface_wind(xplane_root, &dest)) {
+    // The crew's own pick (`full_auto::wind_runway`): its calm, and only a
+    // runway the field would assign (never the grass beside the main strip).
+    let wind = crate::weather::surface_wind(xplane_root, &dest);
+    if let Some(end) = crate::full_auto::wind_runway(&airport.runways, wind) {
         parts.push(format!(
             "Expect runway {}, into the wind.",
             crate::circuit::spell_runway(&end)
@@ -1289,17 +1268,43 @@ mod tests {
         assert!(!arrival_brief_request(
             "brief the approach and set flaps ten"
         ));
-        let ends = vec![("09".to_string(), 90.0), ("27".to_string(), 270.0)];
+    }
+
+    /// The brief names the runway the crew will fly (`full_auto::wind_runway`),
+    /// not a pick of its own: 3.5 kt is the crew's calm (its own 3 kt line
+    /// named an end the arrival would not take), and a grass strip beside a
+    /// hard one is never the field's runway however the wind lies.
+    #[test]
+    fn the_brief_names_the_crews_runway() {
+        let rwy = |a: &str, b: &str, lat_a: f64, lon_a: f64, lat_b: f64, lon_b: f64, surface| {
+            crate::nav::Runway {
+                ident_a: a.into(),
+                ident_b: b.into(),
+                lat_a,
+                lon_a,
+                lat_b,
+                lon_b,
+                width_m: 30.0,
+                surface,
+            }
+        };
+        let field = vec![
+            rwy("09", "27", 50.0, -1.02, 50.0, -0.98, 1),
+            rwy("18", "36", 50.01, -1.0, 49.99, -1.0, 3),
+        ];
+        let pick = |w| crate::full_auto::wind_runway(&field, Some(w));
+        assert_eq!(pick((250.0, 12.0)).as_deref(), Some("27"));
+        assert_eq!(pick((100.0, 8.0)).as_deref(), Some("09"));
+        assert_eq!(pick((250.0, 3.5)), None, "under the crew's calm");
         assert_eq!(
-            into_wind_end(&ends, Some((250.0, 12.0))).as_deref(),
-            Some("27")
+            pick((200.0, 12.0)).as_deref(),
+            Some("27"),
+            "the grass 18 is not assignable"
         );
-        assert_eq!(
-            into_wind_end(&ends, Some((100.0, 8.0))).as_deref(),
-            Some("09")
-        );
-        assert_eq!(into_wind_end(&ends, Some((100.0, 1.0))), None, "calm");
-        assert_eq!(into_wind_end(&ends, None), None);
+        assert_eq!(crate::full_auto::wind_runway(&field, None), None);
+        let src = crate::test_support::module_source("rapport");
+        let brief = &src[src.find("pub fn arrival_brief(").unwrap()..];
+        assert!(brief.contains("crate::full_auto::wind_runway("));
     }
 
     #[test]
