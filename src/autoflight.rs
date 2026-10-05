@@ -252,7 +252,7 @@ pub fn stage_dial(writes: &mut sim::state::Writes, d: Dial, v: f64) {
 // The heading knob.
 // ---------------------------------------------------------------------------
 
-/// Drive the heading BUG to `target` the way a human does — by turning the knob
+/// Drive the heading BUG to `target` the way a human does: by turning the knob
 /// (`heading_up`/`heading_down` presses). Glass avionics that ignore raw dataref
 /// writes (the SR22's G1000) register the commands, and the knob animates. Falls
 /// back to a direct dataref write when the commands don't move the bug (checked a
@@ -262,7 +262,7 @@ pub async fn drive_heading_bug(xp: &dyn crate::xplane::XPlane, target: f64) -> f
 }
 
 /// Like [`drive_heading_bug`] but turns the knob at most `max_step_deg` toward
-/// the target per call — for control loops that drive the bug every tick. Each
+/// the target per call, for control loops that drive the bug every tick. Each
 /// press is an HTTP round trip, so an unbounded slew stalls the caller: the
 /// LXGB go-around's 178° reversal froze the autoland loop ~5 s per tick with
 /// no VS or throttle updates the whole time (2026-07-14). A capped call gets
@@ -356,7 +356,7 @@ pub async fn drive_heading_bug_step(
     let now = read_dial(xp, Dial::HeadingBug).await.unwrap_or(start);
     let err = crate::angles::abs_diff_deg(leg, now);
     if err > 1.5 {
-        // Knob path didn't get there — direct write as the fallback (straight
+        // Knob path did not get there: direct write as the fallback (straight
         // to the FULL target: a dataref write is one round trip, no cap needed).
         let _ = set_dial(xp, Dial::HeadingBug, target).await;
     }
