@@ -958,6 +958,11 @@ was driven again to the stand 7 s later (LEMG 2026-09-28).
 
 ### Still owed
 Issues labelled `owed` + `area:approach-landing` / `area:takeoff` / `area:full-auto` (`ils_coupled` on the 737 is unflown through the owner, #81).
+Also owed from 2026-10-05: the circuit's, follower's, takeoff's and enroute setup's mode presses
+onto `autoflight::reconcile` (they go through the owner's buttons on their own reads today);
+`idle_decel_kts_s` fitted for the other airframes; the speedbrake in the energy plan (a 737 on a
+long 3 degree straight-in is asked for flaps 10 and the gear, the only idle configuration that
+does not gain speed on it); `e_gate` over the gate's limit acted on before the gate.
 
 ## Helicopters: the hover loop
 
