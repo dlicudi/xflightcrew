@@ -1,6 +1,6 @@
     use super::{
         classify_confidence, is_affirmative, is_undo, join_and, plan_change_line, plan_fetch_for,
-        progress_line, radio_panel_line, undoable_drefs, wrong_plan_complaint, ConfidenceAction,
+        progress_line, radio_panel_line, undo_targets, wrong_plan_complaint, ConfidenceAction,
         PlanFetch, Ptt,
     };
 
@@ -308,10 +308,44 @@
 
     #[test]
     fn value_tools_are_undoable_command_tools_are_not() {
-        assert!(!undoable_drefs("set_heading").is_empty());
-        assert!(!undoable_drefs("set_throttle").is_empty());
-        assert!(undoable_drefs("start_engine").is_empty());
-        assert!(undoable_drefs("pushback").is_empty());
+        assert!(!undo_targets("set_heading").is_empty());
+        assert!(!undo_targets("set_throttle").is_empty());
+        assert!(undo_targets("start_engine").is_empty());
+        assert!(undo_targets("pushback").is_empty());
+    }
+
+    const CITATION_LEVER: &str = "sim/cockpit2/engine/actuators/throttle_jet_rev_ratio_all";
+
+    /// The Citation X obeys `throttle_jet_rev_ratio_all` (its Lua re-drives
+    /// the levers from it): "belay the throttle" snapshots and restores the
+    /// lever `set_throttle` wrote, never the stock one it ignores.
+    #[test]
+    fn throttle_undo_restores_the_airframes_lever() {
+        crate::aircraft::publish_throttle_dataref(Some(CITATION_LEVER.into()));
+        let t = undo_targets("set_throttle");
+        crate::aircraft::publish_throttle_dataref(None);
+        assert_eq!(t, vec![(CITATION_LEVER.to_string(), "throttle", false)]);
+        assert_eq!(
+            undo_targets("set_throttle")[0].0,
+            crate::aircraft::STOCK_THROTTLE
+        );
+    }
+
+    /// "What's the throttle set to?" reads the same lever.
+    #[tokio::test]
+    async fn the_throttle_answer_reads_the_airframes_lever() {
+        crate::aircraft::publish_throttle_dataref(Some(CITATION_LEVER.into()));
+        let live = crate::livestate::LiveState::from_pairs(&[
+            (CITATION_LEVER, 0.62),
+            (crate::aircraft::STOCK_THROTTLE, 0.0),
+        ]);
+        let xp = crate::xplane::XPlaneClient::new("http://127.0.0.1:9".into());
+        let p = crate::aircraft::load("citation_x").expect("profile");
+        let q = "what's the throttle set to";
+        let a = crate::answers::answer_state_query(q, &xp, Some(&live), &p).await;
+        crate::aircraft::publish_throttle_dataref(None);
+        let a = a.expect("an answer");
+        assert!(a.contains("throttle 62 percent"), "{a}");
     }
 
     #[test]

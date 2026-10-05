@@ -155,7 +155,7 @@ use stt::Stt;
 use tools::{Registry, ToolCtx};
 use ui::Reporter;
 use undo::{
-    engages_autopilot, is_undo, join_and, recovery_label, undoable_drefs, UndoSnapshot,
+    engages_autopilot, is_undo, join_and, recovery_label, undo_targets, UndoSnapshot,
     UNDO_STACK_MAX,
 };
 use voice::{Priority, Voice};
@@ -3490,9 +3490,9 @@ async fn run_session(
             // succeeds. Tools with no reversible dataref (engine start, pushback)
             // contribute nothing and simply can't be undone.
             let mut pre: Vec<(String, String, f64, bool)> = Vec::new();
-            for (dr, label, is_int) in undoable_drefs(&call.name) {
-                if let Ok(v) = xplane.get_float(dr).await {
-                    pre.push((dr.to_string(), label.to_string(), v, *is_int));
+            for (dr, label, is_int) in undo_targets(&call.name) {
+                if let Ok(v) = xplane.get_float(&dr).await {
+                    pre.push((dr, label.to_string(), v, is_int));
                 }
             }
             // If this command can switch the autopilot on and it's off right now,
