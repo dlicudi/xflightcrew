@@ -1038,10 +1038,31 @@ pub fn live_airframe(ceiling_ft: Option<f64>) -> Airframe {
     }
 }
 
+/// The grid MORA, loaded once per process and shared by every reader (the
+/// audit, the safe hold, the recovery planner, the local planner's terrain):
+/// `earth_mora.dat` beside the fix file (Custom Data when the fixes are
+/// there), else the default data's. The safe hold and the planners each
+/// loaded their own copy, two of them never the Custom Data one.
+pub fn mora_grid(fix_data_path: &str) -> Option<&'static MoraGrid> {
+    static GRID: std::sync::OnceLock<Option<MoraGrid>> = std::sync::OnceLock::new();
+    GRID.get_or_init(|| {
+        let beside = std::path::Path::new(fix_data_path)
+            .with_file_name("earth_mora.dat")
+            .to_string_lossy()
+            .into_owned();
+        MoraGrid::load(&beside).or_else(|| {
+            MoraGrid::load(&format!(
+                "{}/Resources/default data/earth_mora.dat",
+                crate::tools::autoland::xplane_root()
+            ))
+        })
+    })
+    .as_ref()
+}
+
 /// Gather what the sim and the data files know and run the audit: the grid
-/// from `earth_mora.dat` beside the fix file (else the default data), the
-/// departure probed only when `probe` (on the ground at the origin: the
-/// scenery loaded is the scenery around the aircraft).
+/// from [`mora_grid`], the departure probed only when `probe` (on the ground
+/// at the origin: the scenery loaded is the scenery around the aircraft).
 pub async fn check(
     xp: &crate::xplane::XPlaneClient,
     fix_data_path: &str,
@@ -1056,21 +1077,11 @@ pub async fn check(
     let (Some(o), Some(d)) = (fp.waypoints.first(), fp.waypoints.last()) else {
         return Audit::default();
     };
-    let mora_path = std::path::Path::new(fix_data_path)
-        .with_file_name("earth_mora.dat")
-        .to_string_lossy()
-        .into_owned();
-    let mora = tokio::task::spawn_blocking(move || {
-        MoraGrid::load(&mora_path).or_else(|| {
-            MoraGrid::load(&format!(
-                "{}/Resources/default data/earth_mora.dat",
-                crate::tools::autoland::xplane_root()
-            ))
-        })
-    })
-    .await
-    .ok()
-    .flatten();
+    let fix = fix_data_path.to_string();
+    let mora = tokio::task::spawn_blocking(move || mora_grid(&fix))
+        .await
+        .ok()
+        .flatten();
     let mut ground: Vec<(f64, f64)> = Vec::new();
     if probe {
         let stations = departure_stations(
@@ -1102,7 +1113,7 @@ pub async fn check(
         legs,
         cruise_alt_ft: fp.cruise_alt_ft,
         stars,
-        mora: mora.as_ref(),
+        mora,
         departure_ground: (!ground.is_empty()).then_some(ground.as_slice()),
         airframe,
         suitability,

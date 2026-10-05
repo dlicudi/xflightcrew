@@ -1177,21 +1177,9 @@ pub fn split_fan(rays: &[(f64, Vec<(f64, f64, f64)>)], ground: &[f64]) -> Vec<Ra
     out
 }
 
-/// The grid MORA, loaded once per process.
-pub fn mora_grid() -> Option<&'static crate::nav::MoraGrid> {
-    static GRID: std::sync::OnceLock<Option<crate::nav::MoraGrid>> = std::sync::OnceLock::new();
-    GRID.get_or_init(|| {
-        crate::nav::MoraGrid::load(&format!(
-            "{}/Resources/default data/earth_mora.dat",
-            crate::tools::autoland::xplane_root()
-        ))
-    })
-    .as_ref()
-}
-
 /// The MORA here and [`LOOK_NM`] ahead, the higher.
-pub fn mora_ahead(air: &Air) -> Option<f64> {
-    let g = mora_grid()?;
+pub fn mora_ahead(air: &Air, fix_data_path: &str) -> Option<f64> {
+    let g = crate::plan_audit::mora_grid(fix_data_path)?;
     let (la, lo) = crate::nav::project_latlon(air.lat, air.lon, air.track_true, LOOK_NM);
     [g.at(air.lat, air.lon), g.at(la, lo)]
         .into_iter()
@@ -1463,7 +1451,7 @@ async fn watch(
             tick.terrain = Terrain {
                 ahead: ahead.as_ref().and_then(|a| a.4.clone()),
                 fan: fan.clone(),
-                mora_ft: mora_ahead(&air),
+                mora_ft: mora_ahead(&air, &config.fix_data_path),
             };
             // A climb that the ground ahead may outrun asks the fan first.
             if tick.actuate && fan.is_empty() && hold.held().is_none() {

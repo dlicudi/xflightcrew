@@ -992,7 +992,7 @@ impl FullAuto {
         let (floor_true, source) = match heights.as_ref().and_then(|h| h.iter().copied().reduce(f64::max)) {
             Some(high) => (high.max(under) + crate::procedure::TERRAIN_CLEARANCE_FT, "terrain"),
             None => {
-                let mora = crate::safe_hold::mora_grid().and_then(|g| {
+                let mora = crate::plan_audit::mora_grid(&ctx.config.fix_data_path).and_then(|g| {
                     std::iter::once((lat, lon))
                         .chain(pts.iter().copied())
                         .filter_map(|(a, b)| g.at(a, b))
@@ -1425,15 +1425,11 @@ impl FullAuto {
             // round the aircraft): a chunk beyond it is judged on the grid
             // MORA's highest ground, which errs high. LEMG-LEBL, 413 nm, was
             // refused outright on 2026-09-28.
-            let root = super::autoland::xplane_root();
-            let mora = tokio::task::spawn_blocking(move || {
-                crate::nav::MoraGrid::load(&format!(
-                    "{root}/Resources/default data/earth_mora.dat"
-                ))
-            })
-            .await
-            .ok()
-            .flatten();
+            let fix = ctx.config.fix_data_path.clone();
+            let mora = tokio::task::spawn_blocking(move || crate::plan_audit::mora_grid(&fix))
+                .await
+                .ok()
+                .flatten();
             let mut heights = Vec::new();
             let mut from_grid = 0usize;
             let mut grid_cautions = 0usize;
