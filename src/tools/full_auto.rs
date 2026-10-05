@@ -273,7 +273,8 @@ async fn steady_read(
     let t_s = clock.elapsed().as_secs_f64();
     let [lat, lon, alt_ft, vs_fpm, gs_ms, track_true] =
         crate::control::measurements("resume_recheck", [lat, lon, alt, vs, gs, track])?;
-    Some(Steady { t_s, lat, lon, alt_ft, vs_fpm, gs_kts: gs_ms * 1.943_844, track_true })
+    let gs_kts = gs_ms * sim::ground::MS_TO_KTS;
+    Some(Steady { t_s, lat, lon, alt_ft, vs_fpm, gs_kts, track_true })
 }
 
 /// What the recovery planner arms (`recovery_plan`): the follower over the
@@ -503,7 +504,7 @@ impl Tool for FullAuto {
             .xplane
             .get_float(crate::datarefs::ON_GROUND_ANY)
             .await
-            .is_ok_and(|g| g > 0.5);
+            .is_ok_and(sim::ground::on_ground);
         // "Fly the flight plan" in the air is the checked RESUME of the plan
         // on the shelf: it used to be refused ("we're already flying, say
         // navigate"), so a pilot handing over mid-route, and the sortie
@@ -878,7 +879,7 @@ impl FullAuto {
             .map(|f| f * 0.95);
         let unflyable =
             crate::tools::recover::unflyable(Some(ias), floor_kts, ok(&pitch), Some(bank), ok(&stall));
-        if let Some(why) = resume_gate(frozen, ground > 0.5, unflyable) {
+        if let Some(why) = resume_gate(frozen, sim::ground::on_ground(ground), unflyable) {
             return Err(why);
         }
         let running = engines.as_ref().ok().map(|v| {

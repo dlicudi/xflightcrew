@@ -1265,7 +1265,7 @@ async fn read_air(xp: &dyn crate::xplane::XPlane) -> Option<(Air, bool, Option<f
         agl_ft: agl * 3.280_84,
         vs_fpm: vs,
         ias_kts: ias,
-        gs_kts: gs * 1.943_844,
+        gs_kts: gs * sim::ground::MS_TO_KTS,
         track_true: hpath.rem_euclid(360.0),
         mag_var: ok(mag_var).unwrap_or(0.0),
         bank_deg: ok(bank).unwrap_or(0.0),
@@ -1363,7 +1363,9 @@ async fn watch(
             continue;
         }
         let ground = xp.get_float(crate::datarefs::ON_GROUND_ANY).await.ok();
-        let airborne = ground.is_some_and(|g| g < 0.5);
+        let airborne = ground
+            .filter(|g| g.is_finite())
+            .is_some_and(|g| !sim::ground::on_ground(g));
         let frozen = airborne
             && (loading
                 || xp
