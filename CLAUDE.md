@@ -80,7 +80,7 @@ Rust tools; YAML is per-airframe config.
   copies a fix reached one); a failed fit is SPOKEN by its gate (`autotakeoff::no_fit_line`). Its
   landing twin is `aircraft::landing_needed_m` (the BOOK figure).
 - **One home each**: who flies `flight_state::Owner` / `crew_has_aircraft`; stopped `sim::ground`;
-  angles `sim::angles`; AP engage `ap_engage::ApEngage`; speed ceiling `ceiling_from_vne`.
+  angles `sim::angles`; AP engage `ap_engage::ApEngage`; speed ceiling `ceiling_from_vne` (0.9 Vne less 10).
 - **The autopilot panel has ONE owner** (`src/autoflight.rs`, pinned by
   `every_mcp_write_goes_through_the_owner`). Modes' truth is the `autopilot_state` bitfield
   (`Modes`), the panel the airframe's (`Panel`, `autoflight:`). A loop states INTENT (`Want`);
@@ -525,7 +525,7 @@ physical drive.
 Still owed: issues labelled `area:helicopter` (`owed`: none;
 `unflown`: approach and gate #47, fast climb #48).
 
-## The flight model: one state, read by everyone (in SHADOW)
+## The flight model: one state, read by everyone
 
 `src/flight.rs`: the ONE answer to "where are we and what do we hold". Pure, fed per monitor tick,
 time from the sample so recorded flights replay (`flight::Replay`). Tracks `Phase` (sustained,
