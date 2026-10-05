@@ -72,7 +72,7 @@ impl CourseLine {
         Some(Self::through(
             fix.lat,
             fix.lon,
-            (course - mag_var).rem_euclid(360.0),
+            crate::runway::mag_to_true(course, mag_var),
         ))
     }
 
@@ -1026,7 +1026,7 @@ impl HoldFlight {
         Some(HoldFlight {
             phase: HoldPhase::ToFix,
             circuits: 0,
-            inbound_true: (course - mag_var).rem_euclid(360.0),
+            inbound_true: crate::runway::mag_to_true(course, mag_var),
             right: leg.turn != Some('L'),
             fix: (f.lat, f.lon),
             leg_min: leg.path.hold_leg_min.filter(|m| *m > 0.0),

@@ -375,6 +375,12 @@ pub fn true_to_mag(true_deg: f64, xp_variation_deg: f64) -> f64 {
     (true_deg + xp_variation_deg).rem_euclid(360.0)
 }
 
+/// MAGNETIC -> TRUE, the inverse of [`true_to_mag`] with the same X-Plane
+/// variation (positive-west): `true = mag - variation`.
+pub fn mag_to_true(true_or_mag_deg: f64, var: f64) -> f64 {
+    (true_or_mag_deg - var).rem_euclid(360.0)
+}
+
 /// Signed distance (nm) along the runway centreline: positive = on the approach
 /// side (short of the threshold, still to fly), negative = past the threshold
 /// (departure side). Detects an overflight so the guidance goes around instead of
@@ -399,4 +405,21 @@ pub fn cross_track_nm(lat: f64, lon: f64, rwy: &Runway) -> f64 {
     // relative to the INBOUND landing course (the direction of flight on final).
     let ang = crate::angles::signed_diff_deg(brg_from_thr, rwy.course_deg).to_radians();
     dist * ang.sin()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The two directions undo each other, wrapping either way round north.
+    #[test]
+    fn mag_to_true_undoes_true_to_mag() {
+        for (t, var) in [(191.3, 5.65), (2.0, -5.0), (358.0, 4.0), (0.0, 0.0)] {
+            let back = mag_to_true(true_to_mag(t, var), var);
+            let err = crate::angles::signed_diff_deg(back, t).abs();
+            assert!(err < 1e-9, "{t} {var}: {back}");
+        }
+        // KPDK: 196.95 magnetic is 191.3 true.
+        assert!((mag_to_true(196.95, 5.65) - 191.3).abs() < 1e-9);
+    }
 }

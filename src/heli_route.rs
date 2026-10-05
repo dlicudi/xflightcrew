@@ -2028,7 +2028,8 @@ async fn fly(
         let (ident, to) = (&pts[leg].0, pts[leg].1);
         let track = bearing(here, to);
         let to_pad = dist(here, pad);
-        let variation = crate::angles::signed_diff_deg(s.psi, s.mag);
+        // In X-Plane's sense (`runway::true_to_mag`: magpsi = psi + var).
+        let xp_var = crate::angles::signed_diff_deg(s.mag, s.psi);
 
         // The radio is worked whatever the phase: the handoffs arrive in the
         // climb (the tower's) and anywhere enroute (the region's).
@@ -2101,7 +2102,7 @@ async fn fly(
                         .ok()
                         .and_then(|v| v.first().copied())
                         .unwrap_or(0.45);
-                    let bug = (track - variation).rem_euclid(360.0).round();
+                    let bug = crate::runway::true_to_mag(track, xp_var).round();
                     let _ = autoflight::set_dial(&xp, Dial::HeadingBug, bug).await;
                     // Altitude hold engages at the level the climb reached (the
                     // departure climbed to the cruise level for exactly this);
@@ -2190,7 +2191,7 @@ async fn fly(
                 // decides when the knob moves.
                 let want_bug = crate::heading_bug::bug_toward(
                     bug_set.unwrap_or(s.mag),
-                    (track - variation).rem_euclid(360.0),
+                    crate::runway::true_to_mag(track, xp_var),
                     s.mag,
                     s.phi,
                     360.0,
@@ -2346,7 +2347,7 @@ async fn fly(
                         if let Some(f) = floor {
                             level_ft = level_ft.max(((f + APPROACH_CLEAR_FT) / 100.0).ceil() * 100.0);
                         }
-                        let b = (course - variation).rem_euclid(360.0).round().rem_euclid(360.0);
+                        let b = crate::runway::true_to_mag(course, xp_var).round().rem_euclid(360.0);
                         let _ = autoflight::set_dial(&xp, Dial::HeadingBug, b)
                             .await;
                         bug_set = Some(b);
