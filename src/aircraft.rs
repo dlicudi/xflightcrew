@@ -982,6 +982,21 @@ pub struct AircraftProfile {
     /// hold, which is still unproven on the 737's MCP (history, 2026-09-19).
     #[serde(default)]
     pub ap_altitude_capture: bool,
+    /// Autoland parks the altitude dial at the FIELD (0 ft) instead of above
+    /// the aircraft. The stock 737's MCP will not fly a V/S descent away from
+    /// a window above it: parked at 5,600 over a 3,400 ft inbound, the VS
+    /// dial's -570 held level and both LEMG 13 finals arrived high
+    /// (2026-10-05); with the window at 0 the descent and the go-around
+    /// climb both followed the dial. Off: parked above (the LEAX rule).
+    #[serde(default)]
+    pub alt_dial_park_field: bool,
+    /// How far ahead of the stabilised gate the landing flap is selected,
+    /// nm (`autoland::landing_flap_nm`); `None` = the 1 nm default. The 737's
+    /// full flap pitched it up and its V/S gave -100 to -400 fpm against
+    /// -1,200 for 12 s at 3.5 nm (LEMG 13, 2026-10-05): the flap must be out
+    /// before the path is held.
+    #[serde(default)]
+    pub landing_flap_lead_nm: Option<f64>,
     /// ILS approach setup (`prepare_ils`) — needs a NAV radio + approach mode.
     #[serde(default)]
     pub ils: bool,
@@ -4128,6 +4143,8 @@ fn cessna_172sp() -> AircraftProfile {
         takeoff_power: None,
         seat_belt_signs: None,
         ap_altitude_capture: false,
+        alt_dial_park_field: false,
+        landing_flap_lead_nm: None,
         ils: true,
         parking_brake: true,
         cabin_crew: false,
@@ -4478,6 +4495,8 @@ fn cirrus_sr22() -> AircraftProfile {
         takeoff_power: None,
         seat_belt_signs: None,
         ap_altitude_capture: false,
+        alt_dial_park_field: false,
+        landing_flap_lead_nm: None,
         ils: true,
         parking_brake: true,
         cabin_crew: false,

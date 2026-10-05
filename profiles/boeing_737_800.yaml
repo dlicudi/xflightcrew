@@ -179,6 +179,14 @@ com2_radio: true
 nav_radio: true
 transponder: true
 ils: true
+# Autoland parks the altitude window at the field: this MCP will not fly a
+# V/S descent away from a window above it (LEMG 13, 2026-10-05: parked at
+# 5,600 the -570 dial held level; at 0 descent and go-around both followed).
+alt_dial_park_field: true
+# Landing flap 2.5 nm before the 1,000 ft gate (about 5.5 nm): full flap
+# pitches the 737 up and its V/S stalled at -100 to -400 fpm against -1,200
+# for 12 s at 3.5 nm, 215 ft high at the gate (LEMG 13, 2026-10-05).
+landing_flap_lead_nm: 2.5
 parking_brake: true
 retractable_gear: true
 cabin_crew: true       # 189 seats and an interphone

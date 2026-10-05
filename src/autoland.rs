@@ -5544,10 +5544,31 @@ pub const ALT_DIAL_CLEAR_FT: f64 = 500.0;
 /// the hundred, so a go-around's climb captures a sensible level at worst.
 pub const ALT_DIAL_PARK_ABOVE_FT: f64 = 1000.0;
 pub fn parked_altitude_dial_ft(dial_ft: f64, alt_ft: f64) -> Option<f64> {
+    parked_altitude_dial_for(dial_ft, alt_ft, ALT_DIAL_PARK_FIELD.load(std::sync::atomic::Ordering::SeqCst))
+}
+
+/// [`parked_altitude_dial_ft`] for an airframe that parks at the field
+/// (`alt_dial_park_field`): 0 ft, nothing to capture before the wheels.
+/// Pure.
+pub fn parked_altitude_dial_for(dial_ft: f64, alt_ft: f64, at_field: bool) -> Option<f64> {
+    if at_field {
+        return (dial_ft.abs() > 1.0).then_some(0.0);
+    }
     if dial_ft >= alt_ft + ALT_DIAL_CLEAR_FT {
         return None;
     }
     Some(((alt_ft + ALT_DIAL_PARK_ABOVE_FT) / 100.0).ceil() * 100.0)
+}
+
+/// The profile's `alt_dial_park_field` and `landing_flap_lead_nm`,
+/// republished on every swap ([`crate::flight_state::publish_airframe`]).
+static ALT_DIAL_PARK_FIELD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static LANDING_FLAP_LEAD: std::sync::Mutex<Option<f64>> = std::sync::Mutex::new(None);
+
+pub fn publish_approach_config(park_at_field: bool, landing_flap_lead_nm: Option<f64>) {
+    ALT_DIAL_PARK_FIELD.store(park_at_field, std::sync::atomic::Ordering::SeqCst);
+    *LANDING_FLAP_LEAD.lock().unwrap_or_else(|e| e.into_inner()) =
+        landing_flap_lead_nm.filter(|n| n.is_finite() && *n > 0.0);
 }
 
 /// A probed threshold elevation within this of the header is the header (the
@@ -6952,7 +6973,11 @@ const LANDING_FLAP_LEAD_NM: f64 = 1.0;
 pub fn landing_flap_nm() -> f64 {
     let gate_nm = crate::stable_approach::GateKind::Instrument.gate_ft() / gp_ft_per_nm()
         - TOUCHDOWN_AIM_NM;
-    (gate_nm + LANDING_FLAP_LEAD_NM).clamp(3.0, 5.5)
+    let lead = LANDING_FLAP_LEAD
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .unwrap_or(LANDING_FLAP_LEAD_NM);
+    (gate_nm + lead).clamp(3.0, 5.5)
 }
 
 /// Latched low go-around: a missed approach called BELOW the terrain floor is
