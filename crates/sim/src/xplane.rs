@@ -1152,6 +1152,35 @@ impl XPlaneClient {
         Ok(true)
     }
 
+    /// Whether the running sim has a command of this exact name: one small
+    /// lookup, for the probe (an airframe's own commands exist only once its
+    /// plugin has loaded, after the session's command index was fetched).
+    pub async fn command_exists(&self, name: &str) -> Result<bool> {
+        self.hold_for_load(None).await;
+        let url = format!("{}/api/v2/commands", self.base);
+        let index: Result<Option<CommandIndex>> = with_retry(|| async {
+            let resp = self
+                .http
+                .get(&url)
+                .query(&[("filter[name]", name)])
+                .send()
+                .await
+                .with_context(|| format!("GET {url}"))?;
+            // An unknown name is a 400 `invalid_command_name`: an answer,
+            // never a failure to retry.
+            if resp.status() == reqwest::StatusCode::BAD_REQUEST {
+                return Ok(None);
+            }
+            Ok(Some(resp.error_for_status()?.json().await.context("decoding command index")?))
+        })
+        .await;
+        let index = match index {
+            Err(e) if is_not_found(&e) => return Ok(false),
+            other => other?,
+        };
+        Ok(index.is_some_and(|i| i.data.iter().any(|c| c.name == name)))
+    }
+
     /// Every command the running sim has: one request, for the probe.
     pub async fn command_index(&self) -> Result<Vec<String>> {
         self.hold_for_load(None).await;

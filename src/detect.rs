@@ -352,6 +352,7 @@ pub(crate) trait IndexSource: Send + Sync {
     async fn dataref_names(&self) -> Result<Vec<String>>;
     async fn command_names(&self) -> Result<Vec<String>>;
     async fn dataref_exists(&self, name: &str) -> Result<bool>;
+    async fn command_exists(&self, name: &str) -> Result<bool>;
 }
 
 #[async_trait::async_trait]
@@ -364,6 +365,9 @@ impl IndexSource for XPlaneClient {
     }
     async fn dataref_exists(&self, name: &str) -> Result<bool> {
         XPlaneClient::dataref_exists(self, name).await
+    }
+    async fn command_exists(&self, name: &str) -> Result<bool> {
+        XPlaneClient::command_exists(self, name).await
     }
 }
 
@@ -392,6 +396,19 @@ pub(crate) async fn missing_with_cache(
         for n in &unknown {
             if src.dataref_exists(n).await? {
                 idx.datarefs.insert(n.clone());
+            }
+        }
+    }
+    let still = aircraft::missing_references(names, &idx.datarefs, &idx.commands);
+    // A name that is no dataref may be a command the new airframe's plugin
+    // registered after the session's index was fetched: asked by name, as
+    // the datarefs are. The stock 737 at LFRG (2026-10-05) reported its own
+    // app_press, guard_cover00 and both std_press missing, swapped to a few
+    // minutes after boot, inside the index's refresh window.
+    if !still.is_empty() && still.len() <= PER_NAME_MAX {
+        for n in &still {
+            if src.command_exists(n).await? {
+                idx.commands.insert(n.clone());
             }
         }
     }
@@ -698,6 +715,9 @@ mod probe_cache_tests {
         dref_dumps: AtomicUsize,
         cmd_dumps: AtomicUsize,
         lookups: AtomicUsize,
+        cmd_lookups: AtomicUsize,
+        /// Registered by an airframe's plugin after the index was fetched.
+        late_commands: Vec<&'static str>,
     }
 
     #[async_trait::async_trait]
@@ -713,6 +733,10 @@ mod probe_cache_tests {
         async fn dataref_exists(&self, name: &str) -> Result<bool> {
             self.lookups.fetch_add(1, SeqCst);
             Ok(self.datarefs.contains(&name))
+        }
+        async fn command_exists(&self, name: &str) -> Result<bool> {
+            self.cmd_lookups.fetch_add(1, SeqCst);
+            Ok(self.commands.contains(&name) || self.late_commands.contains(&name))
         }
     }
 
@@ -762,6 +786,32 @@ mod probe_cache_tests {
         assert_eq!(missing_with_cache(&sim, &mut cache, &gone, much_later).await.unwrap(), gone);
         assert_eq!(sim.cmd_dumps.load(SeqCst), 2);
         assert_eq!(sim.dref_dumps.load(SeqCst), 1, "never the whole dataref index again");
+    }
+
+    /// An airframe's own command, registered by its plugin after the
+    /// session's index was fetched, is found by name inside the refresh
+    /// window (the stock 737's app_press at LFRG, 2026-10-05).
+    #[tokio::test]
+    async fn a_command_registered_after_the_index_is_asked_by_name() {
+        let sim = Sim {
+            commands: vec!["sim/operation/pause_toggle"],
+            late_commands: vec!["laminar/B738/autopilot/app_press"],
+            ..Default::default()
+        };
+        let t = Instant::now();
+        let mut cache = Some(ProbeIndex {
+            commands: ["sim/operation/pause_toggle".to_string()].into(),
+            commands_at: Some(t),
+            ..Default::default()
+        });
+        let own = names(&["laminar/B738/autopilot/app_press"]);
+        let soon = t + Duration::from_secs(60);
+        assert!(missing_with_cache(&sim, &mut cache, &own, soon).await.unwrap().is_empty());
+        assert_eq!(sim.cmd_lookups.load(SeqCst), 1);
+        assert_eq!(sim.cmd_dumps.load(SeqCst), 0, "no whole index inside the window");
+        // Known now: the next probe asks nothing.
+        assert!(missing_with_cache(&sim, &mut cache, &own, soon).await.unwrap().is_empty());
+        assert_eq!(sim.cmd_lookups.load(SeqCst), 1);
     }
 
     #[test]
