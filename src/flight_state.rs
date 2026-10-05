@@ -155,6 +155,12 @@ impl NewFlight {
 /// Bumped once per flight begun (and per airframe, which is a new flight
 /// too): the generation a flight-scoped fact can be stamped with.
 static FLIGHTS_BEGUN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The current flight's generation: what a `scoped::Scoped::flight()` cell
+/// is stamped with. A value stamped before the last door reads as gone.
+pub(crate) fn flight_gen() -> u64 {
+    FLIGHTS_BEGUN.load(std::sync::atomic::Ordering::SeqCst)
+}
 /// When the last full door ran ([`flight_begins`] other than a reposition,
 /// or [`airframe_begins`]): the flight model's jump that follows our own
 /// setup is the same new flight, not another.

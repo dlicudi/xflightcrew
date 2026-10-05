@@ -43,6 +43,7 @@ mod flight;
 mod duty;
 mod handover;
 mod flight_state;
+mod scoped;
 mod lifetimes;
 mod flightplan;
 mod flow;

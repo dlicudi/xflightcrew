@@ -380,6 +380,39 @@ mod tests {
         );
     }
 
+    /// A `Scoped::flight()` cell dies with its flight, so its manifest code
+    /// says no longer: `F`, or `L` for a loop's hand-down. A cell declared
+    /// flight-scoped but listed as living longer is one of the two wrong.
+    #[test]
+    fn a_flight_scoped_cell_is_listed_as_living_one_flight() {
+        let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let table: BTreeMap<&str, char> = LIFETIMES.iter().copied().collect();
+        let mut scoped = Vec::new();
+        for f in crate::test_support::rust_files(&src) {
+            if crate::test_support::is_test_file(&f) {
+                continue;
+            }
+            let module = module_path(f.strip_prefix(&src).unwrap());
+            let text = std::fs::read_to_string(&f).expect("read source");
+            let lines: Vec<&str> = text.lines().collect();
+            for (i, line) in lines.iter().enumerate() {
+                let Some(name) = static_name(line) else { continue };
+                let decl = format!("{line}{}", lines.get(i + 1).copied().unwrap_or(""));
+                if decl.contains("Scoped::flight()") {
+                    scoped.push(format!("{module}::{name}"));
+                }
+            }
+        }
+        assert!(scoped.len() >= 3, "the scoped cells: {scoped:?}");
+        for k in &scoped {
+            let code = table.get(k.as_str()).copied();
+            assert!(
+                matches!(code, Some('F') | Some('L')),
+                "{k} is Scoped::flight() but listed as {code:?}"
+            );
+        }
+    }
+
     #[test]
     fn the_scan_reads_every_declaration_shape_and_skips_test_items() {
         let src = "\

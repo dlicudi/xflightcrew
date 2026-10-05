@@ -485,16 +485,22 @@ pub struct Plan {
 }
 
 /// The published missed approach of the approach being landed, stashed at the
-/// MAP handoff for the landing's go-around (`take_missed_legs`).
-static MISSED_LEGS: std::sync::Mutex<Option<Vec<ProcLeg>>> = std::sync::Mutex::new(None);
+/// MAP handoff for the landing's go-around (`take_missed_legs`). This
+/// flight's only (`Scoped`): a stash the abort missed never flies another
+/// flight's go-around.
+static MISSED_LEGS: crate::scoped::Scoped<Vec<ProcLeg>> = crate::scoped::Scoped::flight();
 
 /// Take the stashed missed approach (autoland, at a go-around).
 pub fn take_missed_legs() -> Option<Vec<ProcLeg>> {
-    MISSED_LEGS.lock().unwrap_or_else(|e| e.into_inner()).take()
+    MISSED_LEGS.take()
 }
 
 fn stash_missed_legs(legs: Vec<ProcLeg>) {
-    *MISSED_LEGS.lock().unwrap_or_else(|e| e.into_inner()) = (!legs.is_empty()).then_some(legs);
+    if legs.is_empty() {
+        MISSED_LEGS.clear();
+    } else {
+        MISSED_LEGS.set(legs);
+    }
 }
 
 /// Autoland flies the visual segment from a MAP. Off until it is proven: at

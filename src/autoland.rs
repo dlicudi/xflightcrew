@@ -8,12 +8,14 @@
 
 pub(crate) use crate::nav::{bearing_deg, haversine_nm, project_latlon};
 
-static TRACKING_ERROR: std::sync::Mutex<Option<f64>> = std::sync::Mutex::new(None);
+/// The landing's cross-track, metres, per tick: this flight's only
+/// (`Scoped`), written with the generation the run was launched in.
+static TRACKING_ERROR: crate::scoped::Scoped<f64> = crate::scoped::Scoped::flight();
 pub fn last_tracking_error() -> Option<f64> {
     if !ACTIVE.load(std::sync::atomic::Ordering::Relaxed) {
         return None;
     }
-    *TRACKING_ERROR.lock().unwrap_or_else(|e| e.into_inner())
+    TRACKING_ERROR.get()
 }
 
 pub(crate) const M_PER_NM: f64 = 1852.0;
@@ -721,23 +723,22 @@ pub static VACATE_FOLLOWS: AtomicBool = AtomicBool::new(false);
 /// vacate — gated on a STANDING clearance — refused. The aircraft braked to
 /// a stop on runway 13 and sat there through four incursion warnings with an
 /// arrival closing to 1.3 nm (2026-08-05). Landing without a clearance makes
-/// clearing the runway more urgent, not less.
-static LANDED_RUNWAY: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+/// clearing the runway more urgent, not less. This flight's only
+/// (`Scoped`): a stood-down run's late wheels-on write, landing after the
+/// door forgot the last one, is born dead.
+static LANDED_RUNWAY: crate::scoped::Scoped<String> = crate::scoped::Scoped::flight();
 
 /// A new flight forgets the last one's landing: the runway it rolled out on
 /// (a hand-landed 31 after a reposition onto the same strip vacated as the
 /// old 13) and its tracking (`flight_state::forget_flight`).
 pub(crate) fn forget_flight() {
-    *LANDED_RUNWAY.lock().unwrap_or_else(|e| e.into_inner()) = None;
-    *TRACKING_ERROR.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    LANDED_RUNWAY.clear();
+    TRACKING_ERROR.clear();
 }
 
 /// The runway the last autoland rolled out on, if it has not been consumed.
 pub fn landed_runway() -> Option<String> {
-    LANDED_RUNWAY
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .clone()
+    LANDED_RUNWAY.get()
 }
 
 /// Wheels on: the autopilot's approach is over and its servos come off. It
@@ -1313,7 +1314,11 @@ fn spawn_autoland(launch: AutolandLaunch) {
     } = launch;
     // The last approach's tracking goes before the flag rises (it is
     // unreadable once ACTIVE is set again, not at the first tick).
-    *TRACKING_ERROR.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    TRACKING_ERROR.clear();
+    // The flight this run lands: its writes to the flight's facts are
+    // stamped with it, so a run stood down by a new flight writes nothing
+    // that flight reads.
+    let flight = crate::flight_state::flight_gen();
     // Taken on the caller's thread: a stand-down landing before the thread
     // runs cancels THIS run. The run's end clears the panel line and the
     // landing configuration, only while it still owns the slot.
@@ -1456,7 +1461,7 @@ fn spawn_autoland(launch: AutolandLaunch) {
                 }
             }
 
-            *TRACKING_ERROR.lock().unwrap_or_else(|e| e.into_inner()) = None;
+            TRACKING_ERROR.clear();
             let mut last_phase: Option<ApproachPhase> = None;
             let mut flare_power = FlarePower::default();
             // The heading knob, set as a pilot sets it (`bug_knob`, issue #93).
@@ -1915,8 +1920,7 @@ fn spawn_autoland(launch: AutolandLaunch) {
                         disconnect_autopilot(&xp).await;
                         vacate_follows = VACATE_FOLLOWS.swap(false, Ordering::SeqCst);
                         // Wheels on this runway: the fact the vacate needs.
-                        *LANDED_RUNWAY.lock().unwrap_or_else(|e| e.into_inner()) =
-                            Some(rwy.id.clone());
+                        LANDED_RUNWAY.set_in(flight, rwy.id.clone());
                         // A balk the wheels took is a LANDING (LFBD 11,
                         // 2026-09-27): the call waited for a climb that
                         // never came, so the tower still holds our landing
@@ -3636,7 +3640,7 @@ fn spawn_autoland(launch: AutolandLaunch) {
                     (true, Some(phi), false) => Some(wings.step(phi, bank_tgt, tick_dt)),
                     _ => None,
                 };
-                *TRACKING_ERROR.lock().unwrap_or_else(|e| e.into_inner()) = Some(xtk_now * M_PER_NM);
+                TRACKING_ERROR.set_in(flight, xtk_now * M_PER_NM);
                 crate::blackbox::record("autoland", serde_json::json!({
                     "rwy": format!("{} {}", rwy.icao, rwy.id), "dist": g.dist_nm,
                     "alt": alt, "gp_alt": g.glidepath_alt_ft, "cmd_vs": g.target_vs_fpm,

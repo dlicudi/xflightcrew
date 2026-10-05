@@ -226,7 +226,7 @@
         assert!(body.contains("arm_glidepath(hand_down.glidepath)"));
         // The flag rises when the run is taken over (`RUN`, flagged).
         let active = body.find("RUN.take_over()").unwrap();
-        let cleared = body.find("*TRACKING_ERROR.lock()").unwrap();
+        let cleared = body.find("TRACKING_ERROR.clear();").unwrap();
         assert!(
             cleared < active,
             "the last tracking goes before ACTIVE is set"
