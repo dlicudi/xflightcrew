@@ -375,6 +375,11 @@ pub fn true_to_mag(true_deg: f64, xp_variation_deg: f64) -> f64 {
     (true_deg + xp_variation_deg).rem_euclid(360.0)
 }
 
+/// MAGNETIC heading → TRUE, the inverse of [`true_to_mag`] (same sign).
+pub fn mag_to_true(mag_deg: f64, xp_variation_deg: f64) -> f64 {
+    (mag_deg - xp_variation_deg).rem_euclid(360.0)
+}
+
 /// Signed distance (nm) along the runway centreline: positive = on the approach
 /// side (short of the threshold, still to fly), negative = past the threshold
 /// (departure side). Detects an overflight so the guidance goes around instead of

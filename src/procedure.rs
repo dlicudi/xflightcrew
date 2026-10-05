@@ -29,7 +29,7 @@
 use crate::autoflight::{self, Button, Dial};
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use crate::autoland::true_to_mag;
+use crate::autoland::{mag_to_true, true_to_mag};
 use crate::control::measurements;
 #[cfg(test)]
 use crate::control::set_confirmed;
@@ -3836,7 +3836,7 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, plan: Pla
             // a field the answer should be about the field, not the hills past it.
             let brg = bearing_to_fix(lat, lon, leg)
                 .or(psi_v)
-                .unwrap_or_else(|| (bug_mag - mag_var).rem_euclid(360.0));
+                .unwrap_or_else(|| mag_to_true(bug_mag, mag_var));
             let look = dist_nm
                 .map(|d| (d + 2.0).min(TERRAIN_LOOK_NM))
                 .unwrap_or(TERRAIN_LOOK_NM);
