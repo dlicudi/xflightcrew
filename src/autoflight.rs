@@ -590,7 +590,8 @@ pub fn window_for(rule: WindowRule, dial_ft: f64, alt_ft: f64, field_ft: f64) ->
 
 /// The airframe's panel: which command each button is, and how its MCP
 /// behaves. From the live profile at each call (published per swap by
-/// `aircraft::publish_live_profile`, so it never outlives its airframe).
+/// `flight_state::publish_airframe` in `aircraft::AirframeFacts`, so it never
+/// outlives its airframe).
 #[derive(Debug, Clone, PartialEq)]
 pub struct Panel {
     pub engage: String,

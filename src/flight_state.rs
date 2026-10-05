@@ -40,14 +40,10 @@ use crate::aircraft::AircraftProfile;
 /// the profile, including to `None`: a process-wide fact must never outlive
 /// its airframe, and a selector that is only set when present is the bug.
 pub(crate) fn publish_airframe(p: &AircraftProfile) {
-    crate::aircraft::publish_live_profile(p);
+    crate::aircraft::install_airframe_facts(airframe_facts(p));
     // The systems survey is the detector's, from the sim; a new airframe
     // starts knowing nothing about its avionics.
     crate::systems::publish(None);
-    // The .acf's castoring nose is read at detection; a new airframe starts
-    // from its profile alone.
-    crate::aircraft::publish_nose_castors(false);
-    crate::aircraft::publish_nose_free(false);
     // The rotor is the helicopter's: an aeroplane after the S-76 must not
     // hover taxi in, be "on the ground" to the tower aloft, or skip a vacate.
     crate::hover::publish_rotor(crate::hover::rotor_facts(p));
@@ -61,29 +57,7 @@ pub(crate) fn publish_airframe(p: &AircraftProfile) {
     crate::tools::signs::publish(p.seat_belt_signs.clone(), p.cabin_crew);
     crate::circuit::publish_ap_altitude_capture(p.ap_altitude_capture);
     crate::tools::lights::publish_exterior(&p.lights);
-    crate::aircraft::publish_throttle_dataref(p.throttle_dataref.clone());
-    crate::aircraft::publish_config_limits(p.vlo_kts, p.flaps.as_ref());
-    crate::aircraft::publish_bus_volts(p.bus_volts_nominal);
-    crate::aircraft::publish_speed_floor(p.vs_clean_kts);
-    crate::aircraft::publish_speed_ceiling(p.vne_kts, p.vmo_high);
-    crate::aircraft::publish_approach_floor(
-        p.reference.as_ref().and_then(|r| r.vs0_kts),
-        p.vs_clean_kts,
-    );
-    crate::aircraft::publish_stall_curve(
-        p.vs_clean_kts,
-        p.reference.as_ref().and_then(|r| r.vs0_kts),
-        p.flaps.as_ref(),
-    );
-    crate::aircraft::publish_approach_thrust_min(p.approach_thrust_min);
-    crate::aircraft::publish_arrest_lead(p.arrest_lead);
-    crate::aircraft::publish_flare_elevator(p.flare_elevator);
-    crate::aircraft::publish_roll_rudder(p.roll_rudder);
-    crate::aircraft::publish_landing_distance(
-        p.reference.as_ref().and_then(|r| r.landing_distance_ft),
-    );
     crate::procedure::publish_vs_limits(p.reference.as_ref());
-    crate::aircraft::publish_fuel_unit(p.fuel.as_ref());
     // A plan's transition belongs to the flight it was armed for.
     crate::tools::instruments::publish_flight_transition(None);
     crate::tools::instruments::publish_altimeter(p.altimeter.clone());
@@ -91,6 +65,42 @@ pub(crate) fn publish_airframe(p: &AircraftProfile) {
     crate::tools::instruments::publish_altimeter_truth(None);
     // What the crew switched on was the last airframe's anti-ice.
     crate::tools::anti_ice::clear_claims();
+}
+
+/// Every per-airframe fact the tools read, from the profile, as one
+/// snapshot (`aircraft::AirframeFacts`). A literal naming every field, so a
+/// fact added to the struct and forgotten here does not compile: the
+/// "selector only set when present" bug cannot be written. The `.acf`
+/// facts start unread (the detector updates them once it has the file).
+pub(crate) fn airframe_facts(p: &AircraftProfile) -> crate::aircraft::AirframeFacts {
+    use crate::aircraft as a;
+    let vs0 = p.reference.as_ref().and_then(|r| r.vs0_kts);
+    a::AirframeFacts {
+        profile: Some(std::sync::Arc::new(p.clone())),
+        fuel_unit: a::fuel_unit_for(p.fuel.as_ref()),
+        throttle_dref: p.throttle_dataref.clone(),
+        // The .acf's castoring nose is read at detection; a new airframe
+        // starts from its profile alone.
+        nose_castors: false,
+        nose_free: false,
+        gear_limit_kts: p.vlo_kts,
+        flap_limits: a::flap_limits_for(p.flaps.as_ref()),
+        bus_volts_nominal: p.bus_volts_nominal,
+        speed_floor_kts: a::speed_floor_for(p.vs_clean_kts),
+        speed_limits: a::SpeedLimits::new(p.vne_kts, p.vmo_high),
+        approach_floor_kts: a::approach_floor_for(vs0, p.vs_clean_kts),
+        stall_curve: a::stall_curve_for(p.vs_clean_kts, vs0, p.flaps.as_ref()),
+        approach_thrust_min: a::approach_thrust_min_for(p.approach_thrust_min),
+        arrest_lead: p
+            .arrest_lead
+            .and_then(a::ArrestLeadProfile::valid)
+            .unwrap_or_default(),
+        flare_elevator: p.flare_elevator.and_then(a::FlareElevatorProfile::valid),
+        roll_rudder: p.roll_rudder.and_then(a::RollRudderProfile::valid),
+        landing_distance_m: a::landing_distance_m_for(
+            p.reference.as_ref().and_then(|r| r.landing_distance_ft),
+        ),
+    }
 }
 
 /// What began a new flight: the cause [`flight_begins`] records and the

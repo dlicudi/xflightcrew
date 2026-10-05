@@ -1,6 +1,6 @@
     use super::*;
 
-    /// Every test that publishes the fuel unit holds this. `FUEL_UNIT` is
+    /// Every test that publishes the fuel unit holds this. The fuel unit is
     /// process-wide, cargo runs these threads in parallel, and without it
     /// they overwrite each other's airframe mid-assertion — the same trap
     /// the station's `SIDE_STATE_LOCK` exists for.
