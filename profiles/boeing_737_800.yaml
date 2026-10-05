@@ -441,15 +441,29 @@ flaps:
     # this airframe actually walks is 5 -> 1 -> up (detent 2 declared a speed
     # too and added a step, Alghero 2026-09-27). VERIFY against the FCOM
     # flap manoeuvring speed card for the operating weight.
-    - { label: up,   spoken: up,          ratio: 0.0,   retract_above_kts: 210.0 }
-    - { label: "1",  spoken: one,         ratio: 0.125, vfe_kts: 250.0, retract_above_kts: 190.0 }
-    - { label: "2",  spoken: two,         ratio: 0.25,  vfe_kts: 250.0 }
-    - { label: "5",  spoken: five,        ratio: 0.375, vfe_kts: 250.0 }
-    - { label: "10", spoken: ten,         ratio: 0.5,   vfe_kts: 210.0 } # VERIFY
-    - { label: "15", spoken: fifteen,     ratio: 0.625, vfe_kts: 200.0 } # VERIFY
-    - { label: "25", spoken: twenty five, ratio: 0.75,  vfe_kts: 190.0 } # VERIFY
-    - { label: "30", spoken: thirty,      ratio: 0.875, vfe_kts: 175.0 } # VERIFY
-    - { label: "40", spoken: forty,       ratio: 1.0,   vfe_kts: 162.0 } # acf Vfe
+    #
+    # `idle_decel_kts_s`: how fast each configuration slows at idle in level
+    # flight, the plan behind every final (`approach_energy`, backward from
+    # the 1,000 ft gate). Fitted from every 10 s idle window (lever 0.12 or
+    # less, under 10,000 ft, wings level) of this airframe in the blackbox,
+    # 2026-09-25 to 2026-10-05, made level by the climb or descent flown;
+    # the lower quartile, rounded down (the 10-05 LEMG 13 final alone: 1.0
+    # level at flaps 5, 0.5 on a 2.8 degree descent at 10 to 25). Clean
+    # 1.14 median (n 341), flaps 5 1.05 (11), 10 1.59 (150), 30 1.49 (16),
+    # 40 2.32 (4); 15 and 25 have two and three windows, held to 10's.
+    # On the 3 degree path gravity takes 1.0 kt/s back: flaps 5 and cleaner
+    # cannot slow on the path at all, so the path is joined at flaps 15 with
+    # the gear (`join_kts`). VERIFY: autoland ticks carry `e_kts`, `e_flap`,
+    # `e_gate`.
+    - { label: up,   spoken: up,          ratio: 0.0,   retract_above_kts: 210.0, idle_decel_kts_s: 0.9 }
+    - { label: "1",  spoken: one,         ratio: 0.125, vfe_kts: 250.0, retract_above_kts: 190.0, idle_decel_kts_s: 0.8 }
+    - { label: "2",  spoken: two,         ratio: 0.25,  vfe_kts: 250.0, idle_decel_kts_s: 0.8 }
+    - { label: "5",  spoken: five,        ratio: 0.375, vfe_kts: 250.0, idle_decel_kts_s: 0.8 }
+    - { label: "10", spoken: ten,         ratio: 0.5,   vfe_kts: 210.0, idle_decel_kts_s: 1.2 } # VERIFY
+    - { label: "15", spoken: fifteen,     ratio: 0.625, vfe_kts: 200.0, idle_decel_kts_s: 1.2 } # VERIFY
+    - { label: "25", spoken: twenty five, ratio: 0.75,  vfe_kts: 190.0, idle_decel_kts_s: 1.3 } # VERIFY
+    - { label: "30", spoken: thirty,      ratio: 0.875, vfe_kts: 175.0, idle_decel_kts_s: 1.4 } # VERIFY
+    - { label: "40", spoken: forty,       ratio: 1.0,   vfe_kts: 162.0, idle_decel_kts_s: 2.2 } # acf Vfe
 
 # The normal checklist (checklists/boeing_737_800.txt, written 2026-09-17 on
 # datarefs verified to exist on this aircraft). Section titles are the phase

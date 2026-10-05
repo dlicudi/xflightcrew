@@ -1983,6 +1983,14 @@ pub struct FlapDetent {
     /// and the monitor called "getting slow" at 175 kt (EGPF 2026-09-21).
     #[serde(default)]
     pub vs_kts: Option<f64>,
+    /// How fast this configuration slows at idle in LEVEL flight, kt/s (the
+    /// gear as the approach flies it: down from half flap), fitted from the
+    /// airframe's own idle ticks (`approach_energy`, the plan backward from
+    /// the stabilised gate). On a 3 degree path gravity gives back about
+    /// 1.0 kt/s of it. `None` on every detent: the plan is off for the
+    /// airframe and the distance schedule flies.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idle_decel_kts_s: Option<f64>,
 }
 
 /// Flaps lower the stall speed by up to this fraction at full extension
@@ -3872,6 +3880,7 @@ pub fn generic_from_acf(icao: &str, acf_text: &str) -> AircraftProfile {
             // the one-step clean-up on `initial_climb_kts`.
             retract_above_kts: None,
             vs_kts: None,
+            idle_decel_kts_s: None,
         }];
         // A slatted wing's per-detent stall, from the same file; only when
         // every notch maps one to one (a slats-only notch at 0 degrees is
@@ -3898,6 +3907,7 @@ pub fn generic_from_acf(icao: &str, acf_text: &str) -> AircraftProfile {
                 vfe_kts: vfe.map(f64::round),
                 retract_above_kts: None,
                 vs_kts: acf_stall.as_ref().and_then(|v| v.get(i).copied()),
+                idle_decel_kts_s: None,
             });
         }
         p.flaps = Some(FlapProfile {
@@ -4078,6 +4088,7 @@ fn cessna_172sp() -> AircraftProfile {
     let detent = |label: &str, spoken: &str, ratio: f64, vfe: Option<f64>| FlapDetent {
         retract_above_kts: None,
         vs_kts: None,
+        idle_decel_kts_s: None,
         label: label.into(),
         spoken: spoken.into(),
         ratio,
@@ -4436,6 +4447,7 @@ fn cirrus_sr22() -> AircraftProfile {
     let detent = |label: &str, spoken: &str, ratio: f64, vfe: Option<f64>| FlapDetent {
         retract_above_kts: None,
         vs_kts: None,
+        idle_decel_kts_s: None,
         label: label.into(),
         spoken: spoken.into(),
         ratio,

@@ -14,6 +14,7 @@ mod aircraft;
 mod answers;
 mod ap_engage;
 mod autoflight;
+mod approach_energy;
 mod approach_guide;
 mod audio;
 mod auto_status;

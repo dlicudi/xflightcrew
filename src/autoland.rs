@@ -1391,6 +1391,29 @@ fn spawn_autoland(launch: AutolandLaunch) {
                 // The run ends with the thread (the lease drops the flag).
                 None => return,
             };
+            // THE ENERGY PLAN (`approach_energy`): the airframe's own idle
+            // deceleration, planned back from this final's gate. `None` on an
+            // airframe that declares none: the distance schedule flies.
+            let energy_model = crate::aircraft::live_profile()
+                .and_then(|p| crate::approach_energy::EnergyModel::from_profile(&p, gp_deg));
+            // What the gate judges the speed against (the stable sample's).
+            let energy_vapp = approach_target_kts(
+                approach_ias,
+                1.0,
+                &crate::aircraft::flap_limits(),
+                crate::aircraft::config_floor_kts(1.0),
+            );
+            // A planned final never accelerates: the speed it asked for is a
+            // ceiling for the rest of it (the curve is a MAXIMUM, and a
+            // governor handed a maximum flies it as a target).
+            let mut energy_cap: Option<f64> = None;
+            if let Some(m) = &energy_model {
+                crate::blackbox::record(
+                    "autoland",
+                    serde_json::json!({"event": "energy_model", "vapp": energy_vapp, "gp_deg": gp_deg,
+                        "path_decel": m.detents.iter().map(|d| (d.ratio, m.path_decel(d.ratio))).collect::<Vec<_>>()}),
+                );
+            }
 
             // Engage the AP (FD up first for airframes that need it), and
             // CONFIRM it: the tick re-presses until the servos read on
@@ -3055,8 +3078,13 @@ fn spawn_autoland(launch: AutolandLaunch) {
                                 max_climb_fpm(),
                                 crate::procedure::descent_fpm(),
                             ),
+                            // The inbound never accelerates back past the
+                            // pattern's own speed: at 14.5 nm the schedule
+                            // read "clean" and took the 737 from 177 to 222 kt
+                            // level before the path (LEMG 13, 2026-10-05).
                             target_ias_kts: if inbound {
                                 scheduled_ias(g.dist_nm, approach_ias)
+                                    .min(pattern_ias(approach_ias, &crate::aircraft::flap_limits()))
                             } else {
                                 pattern_ias(approach_ias, &crate::aircraft::flap_limits())
                             },
@@ -3194,6 +3222,60 @@ fn spawn_autoland(launch: AutolandLaunch) {
                         max_climb_fpm(),
                         crate::procedure::descent_fpm(),
                     ));
+                }
+                // The plan's ask (`approach_energy::ask`): level, slow to the
+                // speed the path is joined at; on the path, no faster than
+                // its own curve. Descent first: the vertical law is not
+                // touched. Not in a go-around, a hold or the flare.
+                let gate_nm = gate.gate_ft() / gp_ft_per_nm() - TOUCHDOWN_AIM_NM;
+                let energy = energy_model
+                    .as_ref()
+                    .filter(|_| missed.is_none() && hold.is_none() && g.phase != ApproachPhase::Flare)
+                    .map(|m| {
+                        let (s_nm, path_nm) = energy_geometry(
+                            reversal.as_ref().filter(|_| pattern.is_some()).map(|rev| {
+                                let join = join_point_nm(rev.platform_ft, rwy.elev_ft);
+                                let end = crate::reversal::pattern_end_nm(
+                                    rev.platform_ft,
+                                    rwy.elev_ft,
+                                    gp_ft_per_nm(),
+                                    join,
+                                );
+                                let to_go = crate::reversal::to_go_nm(
+                                    rev,
+                                    along_nm,
+                                    xtk_now,
+                                    pattern_gs_kts,
+                                    join,
+                                    end,
+                                );
+                                (to_go, end)
+                            }),
+                            g.dist_nm,
+                            alt - g.glidepath_alt_ft,
+                            gp_ft_per_nm(),
+                            gate_nm,
+                        );
+                        let ask = crate::approach_energy::ask(m, energy_vapp, s_nm, path_nm, gs_kts);
+                        let gate_kts =
+                            crate::approach_energy::predicted_gate_kts(m, energy_vapp, ias, s_nm, path_nm);
+                        (ask, s_nm, path_nm, gate_kts)
+                    });
+                let mut g = g;
+                // Below the terrain floor the guidance asks for climb energy
+                // over the schedule (`CLIMB_ENERGY_BONUS_KTS`): never capped.
+                let floor_bonus =
+                    pattern.is_none() && g.target_ias_kts > scheduled_ias(g.dist_nm, approach_ias) + 0.5;
+                match energy.filter(|_| !floor_bonus) {
+                    Some((ask, ..)) => {
+                        let kts = g.target_ias_kts.min(ask.kts).max(approach_ias);
+                        let kts = energy_cap.map_or(kts, |c| kts.min(c));
+                        energy_cap = Some(kts);
+                        g.target_ias_kts = kts;
+                    }
+                    // A go-around, a hold, the flare: the next final plans
+                    // afresh.
+                    None => energy_cap = None,
                 }
                 let g = g;
                 let outbound = hold.is_some()
@@ -3561,6 +3643,14 @@ fn spawn_autoland(launch: AutolandLaunch) {
                 crate::blackbox::record("autoland", serde_json::json!({
                     "rwy": format!("{} {}", rwy.icao, rwy.id), "dist": g.dist_nm,
                     "alt": alt, "gp_alt": g.glidepath_alt_ft, "cmd_vs": g.target_vs_fpm,
+                    // The energy plan (`approach_energy`): its speed, its
+                    // flap, the join speed, the speed it predicts at the
+                    // gate from here at idle, the route to the gate and the
+                    // path's share of it.
+                    "tgt_ias": g.target_ias_kts,
+                    "e_kts": energy.map(|(a, ..)| a.kts), "e_flap": energy.and_then(|(a, ..)| a.flap),
+                    "e_join": energy.map(|(a, ..)| a.join_kts), "e_gate": energy.map(|(.., k)| k),
+                    "e_s": energy.map(|(_, s, ..)| s), "e_path": energy.map(|(_, _, p, _)| p),
                     "vs_dial": vs_dial, "vvi": vvi, "vs_fm": vs_fm, "vvi_trend": vvi_trend, "arresting": g.arresting,
                     "cmd_hdg": g.target_heading_deg, "ias": ias, "radio": radio_ft,
                     // The wheels, so a first contact the rollout latch never
@@ -4135,9 +4225,12 @@ fn spawn_autoland(launch: AutolandLaunch) {
                 // configures as the limits open up. Written only when the
                 // target changes, so the setting isn't re-asserted against the
                 // pilot every tick.
+                // ...or with the plan's half flap: its deceleration was fitted
+                // with the gear down from there (`approach_energy`).
+                let plan_flap = energy.and_then(|(a, ..)| a.flap);
                 if !gear_down
                     && !outbound
-                    && g.dist_nm < 6.0
+                    && (g.dist_nm < 6.0 || plan_flap.is_some_and(|f| f >= 0.5 - 1e-6))
                     && gear_may_extend(ias, crate::aircraft::gear_limit_kts())
                 {
                     let _ = xp.set_float(GEAR_HANDLE, 1.0).await;
@@ -4178,6 +4271,12 @@ fn spawn_autoland(launch: AutolandLaunch) {
                         alt - g.glidepath_alt_ft,
                         outbound,
                     );
+                    // The plan's configuration for its speed, never less
+                    // than the schedule's; the landing flap only on or above
+                    // the path (the LERL energy trap, `flap_schedule`).
+                    let sched = plan_flap.map_or(sched, |f| {
+                        plan_flap_wanted(f, alt - g.glidepath_alt_ft).max(sched)
+                    });
                     approach_flap_wanted(sched, last_flap)
                 };
                 let limits = crate::aircraft::flap_limits();
@@ -7026,6 +7125,73 @@ pub fn landing_flap_nm() -> f64 {
     (gate_nm + LANDING_FLAP_LEAD_NM).clamp(3.0, 5.5)
 }
 
+/// Inside this of the centreline, nm...
+pub const ESTABLISHED_PATH_XTK_NM: f64 = 0.25;
+/// ...closing or opening it no faster than this, nm/min (10 degrees at
+/// 200 kt): established on the final path.
+pub const ESTABLISHED_PATH_XTK_RATE_NM_MIN: f64 = 0.6;
+
+/// Established on the final's path beyond the FAP (see `guidance_on`):
+/// Intercept by phase only because the lateral still steers for the FAP,
+/// on the approach side, on the centreline and tracking it, on or above the
+/// path. Pure.
+pub fn established_on_final_path(
+    phase: ApproachPhase,
+    balk: Option<&'static str>,
+    along_nm: f64,
+    xtk_nm: f64,
+    xtk_rate_nm_min: f64,
+    alt_err_ft: f64,
+) -> bool {
+    phase == ApproachPhase::Intercept
+        && balk.is_none()
+        && along_nm > FAP_NM
+        && xtk_nm.abs() <= ESTABLISHED_PATH_XTK_NM
+        && xtk_rate_nm_min.abs() <= ESTABLISHED_PATH_XTK_RATE_NM_MIN
+        && alt_err_ft > FLOOR_BELOW_PATH_FT
+}
+
+/// The energy plan's geometry for one tick: the route to the gate, nm, and
+/// the path's share of it. A pattern (`pattern`: its track to go and the
+/// distance from the threshold it ends at) flies level to its end and the
+/// path from there; a straight-in on or above the path is on it; one below
+/// it flies level until the path comes down to it. Pure.
+pub fn energy_geometry(
+    pattern: Option<(f64, f64)>,
+    dist_nm: f64,
+    above_path_ft: f64,
+    path_ft_per_nm: f64,
+    gate_nm: f64,
+) -> (f64, f64) {
+    match pattern {
+        Some((to_go_nm, end_nm)) => {
+            let path = (end_nm - gate_nm).max(0.0);
+            (to_go_nm.max(0.0) + path, path)
+        }
+        None => {
+            let s = (dist_nm - gate_nm).max(0.0);
+            if above_path_ft < -50.0 {
+                // The path reaches our height (-above) / slope further in.
+                let meet_nm = dist_nm - (-above_path_ft) / path_ft_per_nm.max(1.0);
+                (s, (meet_nm - gate_nm).clamp(0.0, s))
+            } else {
+                (s, s)
+            }
+        }
+    }
+}
+
+/// The flap the plan's configuration asks for: its own, except the landing
+/// flap below the path (full flap held level under the path is the LERL
+/// energy trap: [`flap_schedule`]). Pure.
+pub fn plan_flap_wanted(plan_flap: f64, alt_err_ft: f64) -> f64 {
+    if plan_flap >= LANDING_FLAP_RATIO - 1e-6 && alt_err_ft <= -150.0 {
+        0.5f64.min(plan_flap)
+    } else {
+        plan_flap
+    }
+}
+
 /// Latched low go-around: a missed approach called BELOW the terrain floor is
 /// flown wings-level STRAIGHT AHEAD at full power until clear of the ground —
 /// never the immediate turn-back the intercept guidance commands. Seen live
@@ -8105,8 +8271,21 @@ pub fn guidance_on(
     // (why this loop was descent-only). Low + slow falls through to speed
     // protection / level hold, and the raised throttle target below rebuilds the
     // surplus so the climb can engage on a later tick.
+    // ESTABLISHED on the extended centreline beyond the FAP, inbound and on
+    // or above the path: the descent is the final's, under the final's
+    // floors, not the reposition's soft floor at circuit height. LEMG 13
+    // (2026-10-05, 13:14:20 to 13:15:21): the pattern joined the path at
+    // 10.7 nm, phase still Intercept (steering for the FAP), and the fade
+    // keyed on radio height over the hills under the final cut the path's
+    // -1,100 fpm to a dial jumping -210 to -1,400 that no VS mode follows:
+    // on the path to 511 ft high in 60 s. The path itself was the pattern's
+    // to clear (`reversal::plan`, 500 ft over its corridor).
+    let established_path = established_on_final_path(phase, balk, along_nm, xtk, xtk_rate_nm_min, alt_err);
     let below_terrain_floor = match phase {
         ApproachPhase::Flare => false,
+        _ if established_path => {
+            radio_alt_ft < TERRAIN_FLOOR_AGL_FT && alt_err < FLOOR_BELOW_PATH_FT
+        }
         // Final owns the descent to the runway — the floor stands down inside
         // short-final range where low radio altitude IS the approach, and it
         // never captures an aircraft ON the path (FLOOR_BELOW_PATH_FT: the
@@ -8134,7 +8313,7 @@ pub fn guidance_on(
     // and 4.1 nm from the field. Fading the permitted descent to zero AT the
     // floor lands the aircraft on it instead of through it.
     let descent_cap_fpm = path_descent_cap_fpm(nominal_vs);
-    let descent_limit_fpm = if phase == ApproachPhase::Intercept {
+    let descent_limit_fpm = if phase == ApproachPhase::Intercept && !established_path {
         -((radio_alt_ft - REPOSITION_MIN_AGL_FT) * 2.0).clamp(0.0, -descent_cap_fpm)
     } else {
         descent_cap_fpm
@@ -8495,3 +8674,7 @@ mod lemg13_king_air_rollout_tests;
 /// the `state` samples' groundspeed and pitch trim).
 #[cfg(test)]
 mod lemg13_king_air_roundout_tests;
+
+/// The LEMG 13 737 final of 2026-10-05 through the energy plan.
+#[cfg(test)]
+mod lemg13_737_energy_tests;
