@@ -39,7 +39,7 @@ const GPU_VOLTS: &str = "sim/cockpit2/electrical/GPU_generator_volts";
 const GPU_ON: &str = "sim/cockpit/electrical/gpu_on";
 /// Main bus volts — what the aircraft actually has to start with, and the only
 /// honest readback for "is there power".
-const BUS_VOLTS: &str = "sim/cockpit2/electrical/bus_volts";
+const BUS_VOLTS: &str = crate::datarefs::BUS_VOLTS;
 // --- pushback ---
 const CMD_PUSH_STRAIGHT: &str = "sim/ground_ops/pushback_straight";
 const CMD_PUSH_LEFT: &str = "sim/ground_ops/pushback_left";

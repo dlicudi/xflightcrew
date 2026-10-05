@@ -25,9 +25,9 @@ use crate::tools::setup::{InitMailbox, InitOutcome, InitTiming};
 const TYPED: &str = "xcopilot/typed";
 const STATUS_AUTO: &str = "xcopilot/status/auto";
 const SIM_SPEED: &str = "sim/time/sim_speed";
-const ACF_PATH: &str = "sim/aircraft/view/acf_relative_path";
-const ACF_ICAO: &str = "sim/aircraft/view/acf_ICAO";
-const GROUNDSPEED: &str = "sim/flightmodel/position/groundspeed";
+const ACF_PATH: &str = crate::datarefs::ACF_RELATIVE_PATH;
+const ACF_ICAO: &str = crate::datarefs::ACF_ICAO;
+const GROUNDSPEED: &str = crate::datarefs::GROUNDSPEED_MS;
 const PAUSE_ON: &str = "sim/operation/pause_on";
 const PAUSE_TOGGLE: &str = "sim/operation/pause_toggle";
 const PAUSED: &str = "sim/time/paused";
@@ -3239,7 +3239,7 @@ fn pick_stand(apt_dat: &str, field: &str, icao: &str) -> Result<String> {
 }
 
 /// Indicated airspeed, knots.
-const IAS_KTS: &str = "sim/flightmodel/position/indicated_airspeed";
+const IAS_KTS: &str = crate::datarefs::INDICATED_AIRSPEED_KTS;
 const M_TO_FT: f64 = 3.280_84;
 
 /// Fly one case to its verdict. Setup failures are verdicts too.
@@ -3498,7 +3498,7 @@ pub async fn secure_at_end(sim: &dyn RunnerSim) -> bool {
     while now_s() - t0 < PAUSE_WAIT_LOW_S {
         let (agl, vs) = tokio::join!(
             sim.read(crate::datarefs::AGL_METERS),
-            sim.read("sim/flightmodel/position/vh_ind_fpm")
+            sim.read(crate::datarefs::VS_FPM_FLIGHT_MODEL)
         );
         let (Ok(agl), Ok(vs)) = (agl, vs) else { break };
         if pause_safe(agl * 3.28084, vs) {

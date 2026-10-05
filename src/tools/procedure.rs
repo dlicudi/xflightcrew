@@ -99,17 +99,17 @@ impl Tool for FlyProcedure {
 
         let (Ok(lat), Ok(lon)) = (
             ctx.xplane
-                .get_float("sim/flightmodel/position/latitude")
+                .get_float(crate::datarefs::LATITUDE)
                 .await,
             ctx.xplane
-                .get_float("sim/flightmodel/position/longitude")
+                .get_float(crate::datarefs::LONGITUDE)
                 .await,
         ) else {
             return Ok("I can't read our position, so I can't set up a procedure.".to_string());
         };
         let track = ctx
             .xplane
-            .get_float("sim/flightmodel/position/psi")
+            .get_float(crate::datarefs::TRUE_HEADING_DEG)
             .await
             .unwrap_or(0.0);
 

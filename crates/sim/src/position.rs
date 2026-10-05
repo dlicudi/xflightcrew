@@ -30,9 +30,9 @@ const FIELDS: usize = 10;
 const LAT: &str = crate::datarefs::LATITUDE;
 const LON: &str = crate::datarefs::LONGITUDE;
 const ELEV_M: &str = crate::datarefs::ELEVATION_M;
-const PSI_TRUE: &str = "sim/flightmodel/position/psi";
-const GS_MS: &str = "sim/flightmodel/position/groundspeed";
-const VS_FPM: &str = "sim/flightmodel/position/vh_ind_fpm";
+const PSI_TRUE: &str = crate::datarefs::TRUE_HEADING_DEG;
+const GS_MS: &str = crate::datarefs::GROUNDSPEED_MS;
+const VS_FPM: &str = crate::datarefs::VS_FPM_FLIGHT_MODEL;
 const AGL_M: &str = crate::datarefs::AGL_METERS;
 
 /// Which read a [`Position`] came from.

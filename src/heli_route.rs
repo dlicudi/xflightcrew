@@ -1459,7 +1459,7 @@ fn call_inbound(base_url: &str, khz: i64) {
         let (lat, lon, alt) = tokio::join!(
             xp.get_float(crate::datarefs::LATITUDE),
             xp.get_float(crate::datarefs::LONGITUDE),
-            xp.get_float("sim/cockpit2/gauges/indicators/altitude_ft_pilot"),
+            xp.get_float(crate::datarefs::ALTITUDE_FT),
         );
         if let (Ok(lat), Ok(lon), Ok(alt)) = (lat, lon, alt) {
             crate::station::arm_station_for_freq(khz, lat, lon, alt, std::time::Instant::now());
@@ -1530,7 +1530,7 @@ fn call_transit(base_url: &str, level_ft: f64) {
         let xp = XPlaneClient::new(base);
         let callsign = crate::circuit::crew_callsign(&xp).await;
         let alt = xp
-            .get_float("sim/cockpit2/gauges/indicators/altitude_ft_pilot")
+            .get_float(crate::datarefs::ALTITUDE_FT)
             .await
             .unwrap_or(level_ft);
         crate::circuit::transmit(crate::circuit::radio_call(&callsign, &transit_words(alt)));
@@ -1670,14 +1670,14 @@ async fn read(xp: &XPlaneClient) -> Option<Sample> {
     let (lat, lon, psi, mag, ias, agl, vx, vz, th, ph, ap) = tokio::join!(
         xp.get_float(LATITUDE),
         xp.get_float(LONGITUDE),
-        xp.get_float("sim/flightmodel/position/psi"),
+        xp.get_float(crate::datarefs::TRUE_HEADING_DEG),
         xp.get_float(MAG_PSI),
-        xp.get_float("sim/flightmodel/position/indicated_airspeed"),
-        xp.get_float("sim/flightmodel/position/y_agl"),
-        xp.get_float("sim/flightmodel/position/local_vx"),
-        xp.get_float("sim/flightmodel/position/local_vz"),
-        xp.get_float("sim/flightmodel/position/theta"),
-        xp.get_float("sim/flightmodel/position/phi"),
+        xp.get_float(crate::datarefs::INDICATED_AIRSPEED_KTS),
+        xp.get_float(crate::datarefs::AGL_METERS),
+        xp.get_float(crate::datarefs::LOCAL_VX_MS),
+        xp.get_float(crate::datarefs::LOCAL_VZ_MS),
+        xp.get_float(crate::datarefs::THETA_DEG),
+        xp.get_float(crate::datarefs::PHI_DEG),
         xp.get_float(autoflight::names::AP_ON),
     );
     let (vx, vz) = (vx.ok()?, vz.ok()?);
@@ -1726,7 +1726,7 @@ async fn before_route(
             serde_json::json!({ "event": "started", "line": line }),
         );
         let running = xp
-            .get_float_array("sim/flightmodel/engine/ENGN_running")
+            .get_float_array(crate::datarefs::ENGINE_RUNNING)
             .await
             .map(|v| v.iter().take(2).all(|r| *r > 0.5))
             .unwrap_or(false);
@@ -1806,7 +1806,7 @@ async fn fly(
     // The departure ground's height sets the cruise level, in the
     // altimeter's feet (the dial's), measured once.
     let alt0 = xp
-        .get_float("sim/cockpit2/gauges/indicators/altitude_ft_pilot")
+        .get_float(crate::datarefs::ALTITUDE_FT)
         .await
         .unwrap_or(0.0);
     let ground_ft = alt0 - s0.agl_ft;
@@ -1835,7 +1835,7 @@ async fn fly(
                 None => None,
             }
         },
-        xp.get_float("sim/flightmodel/position/elevation"),
+        xp.get_float(crate::datarefs::ELEVATION_M),
     );
     let ind_offset_ft = elev_m.ok().map(|m| alt0 - m * 3.28084);
     let pad_ft = match (pad_true, ind_offset_ft, terrain_ft) {
@@ -2128,7 +2128,7 @@ async fn fly(
                     // cruise dial, vertical speed, altitude hold armed to
                     // capture it (`recover_level`'s sequence, flown).
                     let alt_now = xp
-                        .get_float("sim/cockpit2/gauges/indicators/altitude_ft_pilot")
+                        .get_float(crate::datarefs::ALTITUDE_FT)
                         .await
                         .ok();
                     if route.fast_climb && alt_now.is_some_and(|a| a < cruise_alt_ft - 300.0) {
@@ -2386,7 +2386,7 @@ async fn fly(
                 let (ah, vm, alt_now) = tokio::join!(
                     xp.get_float(ALT_HOLD_STATUS),
                     xp.get_float(VVI_STATUS),
-                    xp.get_float("sim/cockpit2/gauges/indicators/altitude_ft_pilot"),
+                    xp.get_float(crate::datarefs::ALTITUDE_FT),
                 );
                 let (alt_hold, vvi_mode) = (ah.ok(), vm.ok());
                 let unheld = alt_hold.is_some_and(|a| a < 1.5) && vvi_mode.is_some_and(|v| v < 1.5);

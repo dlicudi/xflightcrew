@@ -23,24 +23,24 @@ use crate::aircraft::{
 
 /// Universal throttle (all engines), 0..1.
 /// Per-engine "is running" flags.
-const ENGN_RUNNING: &str = "sim/flightmodel/engine/ENGN_running";
+const ENGN_RUNNING: &str = crate::datarefs::ENGINE_RUNNING;
 /// N1 at which the condition lever introduces fuel during a PT6 start (POM: crank
 /// first, fuel at 12% — fuel-before-crank gives no light-off, verified live).
 const FUEL_INTRO_N1: f64 = 12.0;
 /// Universal per-engine boost/aux pump switch array.
 const FUEL_PUMP_ON: &str = "sim/cockpit2/engine/actuators/fuel_pump_on";
 /// Electrical bus volts (any element) — enough to crank?
-const BUS_VOLTS: &str = "sim/cockpit2/electrical/bus_volts";
+const BUS_VOLTS: &str = crate::datarefs::BUS_VOLTS;
 /// The DC-3 is a 24V system whose healthy battery bus reads ~21.7–24V (it varies
 /// run to run), and it cranks fine across that range. The gate only needs to
 /// catch a battery that's actually off/flat (which reads ~0V), so it sits well
 /// below the live range rather than at the nominal bus voltage.
 const MIN_START_VOLTS: f64 = 12.0;
-const GROUNDSPEED: &str = "sim/flightmodel/position/groundspeed"; // m/s
-const N1_PERCENT: &str = "sim/cockpit2/engine/indicators/N1_percent"; // per-engine, turbine spool
+const GROUNDSPEED: &str = crate::datarefs::GROUNDSPEED_MS; // m/s
+const N1_PERCENT: &str = crate::datarefs::N1_PERCENT; // per-engine, turbine spool
 /// Per-engine N2 — the high-pressure spool a TURBOFAN's start is flown
 /// against (see [`crate::aircraft::TurbineStartProfile::fuel_intro_n2`]).
-const N2_PERCENT: &str = "sim/cockpit2/engine/indicators/N2_percent";
+const N2_PERCENT: &str = crate::datarefs::N2_PERCENT;
 /// Bleed duct pressure, left / centre / right: the air a turbofan's starter
 /// turns the engine with.
 const BLEED_AVAILABLE: [&str; 3] = [

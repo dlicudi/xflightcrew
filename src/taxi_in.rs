@@ -34,7 +34,7 @@ use crate::xplane::XPlaneClient;
 const COM1_FREQ_KHZ: &str = crate::datarefs::COM1_FREQ_KHZ;
 /// True heading — the rollout direction, so a vacate never picks an exit
 /// behind us (reaching one means taxiing back down the runway).
-const PSI_TRUE: &str = "sim/flightmodel/position/psi";
+const PSI_TRUE: &str = crate::datarefs::TRUE_HEADING_DEG;
 
 /// The pilot's release: a hand-back's own gates (a tug, an unread speed).
 const RELEASE_HOLD: HoldFor = HoldFor::by("taxi_in");
@@ -976,7 +976,7 @@ pub(crate) async fn shut_down_at_stand(xp: &XPlaneClient, config: &Config, voice
         std::time::Instant::now() + std::time::Duration::from_secs_f64(SHUTDOWN_CONFIRM_SECS);
     let stopped = loop {
         // A failed read is no measurement: keep asking until the deadline.
-        if let Ok(r) = xp.get_float_array("sim/flightmodel/engine/ENGN_running").await {
+        if let Ok(r) = xp.get_float_array(crate::datarefs::ENGINE_RUNNING).await {
             if engines_stopped(&r, engines) {
                 break true;
             }

@@ -38,15 +38,15 @@ use crate::tools::{Tool, ToolCtx};
 use crate::voice::{Priority, Voice};
 use crate::xplane::XPlaneClient;
 
-const LAT: &str = "sim/flightmodel/position/latitude";
-const LON: &str = "sim/flightmodel/position/longitude";
+const LAT: &str = crate::datarefs::LATITUDE;
+const LON: &str = crate::datarefs::LONGITUDE;
 /// The tug on the bar. This is the ONE dataref a pushback actually moves:
 /// probed live at a stand while the aircraft was rolling backwards under a
 /// tug, `pushback_attached` was 1 and `tow_in_progress` stayed 0 the whole
 /// time (2026-07-27). Whatever "tow operation" the latter reports, it is not
 /// this one, so nothing here may be gated on it — treating it as the
 /// under-tow signal meant the push never believed it was moving.
-const PUSH_ATTACHED: &str = "sim/aircraft/overflow/pushback_attached";
+const PUSH_ATTACHED: &str = crate::datarefs::PUSHBACK_ATTACHED;
 /// Read alongside, never relied on: if some airframe or a future build does
 /// raise it, it only ever ADDS evidence (and the per-tick events carry both,
 /// so the next sortie can settle it again).

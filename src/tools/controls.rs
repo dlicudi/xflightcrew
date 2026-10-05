@@ -13,7 +13,7 @@ use super::{Tool, ToolCtx, BRAKE_HOLD_SECS, PARK_BRAKE};
 use crate::xplane::XPlaneClient;
 
 /// Elevator trim, -1.0 (full nose down) .. +1.0 (full nose up), 0 = neutral.
-const ELEV_TRIM: &str = "sim/cockpit2/controls/elevator_trim";
+const ELEV_TRIM: &str = crate::datarefs::ELEVATOR_TRIM;
 /// How much one "trim nose up/down" nudge moves the trim wheel.
 const TRIM_STEP: f64 = 0.10;
 /// Takeoff trim setting for the 172 — roughly neutral (the takeoff band).
@@ -237,7 +237,7 @@ const PILOT_TOE_BRAKE: f64 = 0.3;
 pub(crate) const TOE_BRAKE_L: &str = "sim/cockpit2/controls/left_brake_ratio";
 pub(crate) const TOE_BRAKE_R: &str = "sim/cockpit2/controls/right_brake_ratio";
 /// A tug on the bar.
-const TUG_ATTACHED: &str = "sim/aircraft/overflow/pushback_attached";
+const TUG_ATTACHED: &str = crate::datarefs::PUSHBACK_ATTACHED;
 
 /// Stopped, for the hand-back: under this the parking brake goes on.
 pub(crate) const HAND_BACK_STOPPED_KTS: f64 = sim::ground::STOPPED_KTS;
@@ -854,7 +854,7 @@ impl Tool for SetPitchTrim {
 /// deploy on touchdown). The MD-82 uses this standard, writable dataref.
 const SPEEDBRAKE: &str = "sim/cockpit2/controls/speedbrake_ratio";
 /// Gear handle (1 = down). Read by the speedbrake-on-final guard.
-const GEAR_HANDLE_DOWN: &str = "sim/cockpit2/controls/gear_handle_down";
+const GEAR_HANDLE_DOWN: &str = crate::datarefs::GEAR_HANDLE_DOWN;
 
 pub struct SetSpeedbrake;
 

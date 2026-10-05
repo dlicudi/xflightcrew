@@ -30,8 +30,8 @@ const APPROACH_ENGAGE_MAX_S: f64 = 3.0;
 use crate::ils::{self, ArmVerdict};
 use crate::nav;
 
-const LAT: &str = "sim/flightmodel/position/latitude";
-const LON: &str = "sim/flightmodel/position/longitude";
+const LAT: &str = crate::datarefs::LATITUDE;
+const LON: &str = crate::datarefs::LONGITUDE;
 /// Only consider ILS records within this distance. An ILS approach is briefed
 /// from at most ~30nm out, so a farther "match" is really a different airport —
 /// e.g. parked at Gibraltar (no runway 13), "runway 13" should NOT reach 50nm to
@@ -556,7 +556,7 @@ impl Tool for VisualApproach {
             None => {
                 let track = ctx
                     .xplane
-                    .get_float("sim/flightmodel/position/hpath")
+                    .get_float(crate::datarefs::TRACK_DEG_TRUE)
                     .await
                     .unwrap_or(0.0);
                 let field = cands.first().map(|r| r.icao.clone()).unwrap_or_default();

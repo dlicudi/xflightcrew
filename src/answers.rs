@@ -152,7 +152,7 @@ pub(crate) async fn landing_readiness(
         }
     }
     let ias = xp
-        .get_float("sim/cockpit2/gauges/indicators/airspeed_kts_pilot")
+        .get_float(crate::datarefs::AIRSPEED_KTS)
         .await
         .unwrap_or(0.0);
     if let Some(app) = profile.reference.as_ref().and_then(|r| r.approach_kts) {
@@ -339,7 +339,7 @@ pub(crate) async fn on_course_report(xp: &XPlaneClient, live: Option<&LiveState>
         .unwrap_or(0.0)
         > 0.5;
     let gs = xp
-        .get_float("sim/flightmodel/position/groundspeed")
+        .get_float(crate::datarefs::GROUNDSPEED_MS)
         .await
         .unwrap_or(0.0);
     if on_ground && gs < 15.0 {
@@ -379,9 +379,9 @@ pub(crate) async fn nav_progress(xp: &XPlaneClient, live: Option<&LiveState>) ->
     // the plan's first entry and would name a fix passed half an hour ago.
     if let Some(leg) = procedure::active_leg() {
         let (lat, lon, gs) = tokio::join!(
-            read1(live, xp, "sim/flightmodel/position/latitude"),
-            read1(live, xp, "sim/flightmodel/position/longitude"),
-            read1(live, xp, "sim/flightmodel/position/groundspeed"),
+            read1(live, xp, crate::datarefs::LATITUDE),
+            read1(live, xp, crate::datarefs::LONGITUDE),
+            read1(live, xp, crate::datarefs::GROUNDSPEED_MS),
         );
         if let (Ok(lat), Ok(lon)) = (lat, lon) {
             let gs_kts = gs.unwrap_or(0.0) * MS_TO_KTS;
@@ -390,7 +390,7 @@ pub(crate) async fn nav_progress(xp: &XPlaneClient, live: Option<&LiveState>) ->
         }
     }
     let wp = xp
-        .get_string("sim/cockpit2/radios/indicators/gps_nav_id")
+        .get_string(crate::datarefs::GPS_NAV_ID)
         .await
         .unwrap_or_default();
     let dist = read1(
@@ -671,9 +671,9 @@ pub(crate) async fn takeoff_runway_answer(
     let (roll_m, mtow_kg) = aircraft::profile_takeoff_roll(profile);
     let needed_m = aircraft::takeoff_needed_now_m(xp, roll_m, mtow_kg, 500.0).await;
     let (lat, lon, psi) = tokio::join!(
-        xp.get_float("sim/flightmodel/position/latitude"),
-        xp.get_float("sim/flightmodel/position/longitude"),
-        xp.get_float("sim/flightmodel/position/psi"),
+        xp.get_float(crate::datarefs::LATITUDE),
+        xp.get_float(crate::datarefs::LONGITUDE),
+        xp.get_float(crate::datarefs::TRUE_HEADING_DEG),
     );
     let (Ok(lat), Ok(lon), Ok(psi)) = (lat, lon, psi) else {
         return "I can't read our position.".to_string();
@@ -711,7 +711,7 @@ pub(crate) async fn systems_check(
     xp: &XPlaneClient,
     profile: &aircraft::AircraftProfile,
 ) -> String {
-    let running = read_engine0(xp, "sim/flightmodel/engine/ENGN_running")
+    let running = read_engine0(xp, crate::datarefs::ENGINE_RUNNING)
         .await
         .is_some_and(|v| v > 0.5);
     if !running {
@@ -838,7 +838,7 @@ pub(crate) async fn power_loss_diagnosis(
     xp: &XPlaneClient,
     profile: &aircraft::AircraftProfile,
 ) -> String {
-    let running = read_engine0(xp, "sim/flightmodel/engine/ENGN_running")
+    let running = read_engine0(xp, crate::datarefs::ENGINE_RUNNING)
         .await
         .is_some_and(|v| v > 0.5);
     let piston = profile.turboprop_start.is_none() && !profile.turbine_start;
@@ -914,7 +914,7 @@ pub(crate) async fn power_loss_diagnosis(
         return format!("{state}. Likely cause: {}.", causes.join("; also "));
     }
     // Nothing conclusive: give the raw picture so the pilot can work the problem.
-    let rpm = read_engine0(xp, "sim/cockpit2/engine/indicators/prop_speed_rpm")
+    let rpm = read_engine0(xp, crate::datarefs::PROP_SPEED_RPM)
         .await
         .unwrap_or(0.0);
     let burn = crate::aircraft::say_fuel_flow_kg_hr(flow_kg_s * 3600.0);
@@ -1399,13 +1399,13 @@ pub(crate) async fn fuel_report(
     if let Some(d) = dest {
         if live_burn_kg_hr > 1.0 {
             let (lat, lon, gs_ms) = (
-                xp.get_float("sim/flightmodel/position/latitude")
+                xp.get_float(crate::datarefs::LATITUDE)
                     .await
                     .unwrap_or(0.0),
-                xp.get_float("sim/flightmodel/position/longitude")
+                xp.get_float(crate::datarefs::LONGITUDE)
                     .await
                     .unwrap_or(0.0),
-                xp.get_float("sim/flightmodel/position/groundspeed")
+                xp.get_float(crate::datarefs::GROUNDSPEED_MS)
                     .await
                     .unwrap_or(0.0),
             );
@@ -1587,7 +1587,7 @@ pub(crate) async fn answer_state_query(
     // airframe's relocated switch never makes this a lie). These only run on
     // question-shaped input, so "gear down" stays a command.
     if t.contains("flap") {
-        if let Ok(v) = read1(live, xp, "sim/cockpit2/controls/flap_ratio").await {
+        if let Ok(v) = read1(live, xp, crate::datarefs::FLAP_RATIO).await {
             parts.push(if v <= 0.01 {
                 "flaps up".to_string()
             } else if v >= 0.99 {
@@ -1598,7 +1598,7 @@ pub(crate) async fn answer_state_query(
         }
     }
     if t.contains("gear") {
-        if let Ok(v) = read1(live, xp, "sim/cockpit2/controls/gear_handle_down").await {
+        if let Ok(v) = read1(live, xp, crate::datarefs::GEAR_HANDLE_DOWN).await {
             parts.push(if v > 0.5 {
                 "gear down".to_string()
             } else {
@@ -1630,7 +1630,7 @@ pub(crate) async fn answer_state_query(
     if t.contains("squawk") || t.contains("transponder") {
         if let Ok(c) = read1(live, xp, datarefs::TRANSPONDER_CODE).await {
             let code = atis::spoken_digits(&format!("{:04}", c.round() as i64));
-            let mode = match read1(live, xp, "sim/cockpit2/radios/actuators/transponder_mode")
+            let mode = match read1(live, xp, crate::datarefs::TRANSPONDER_MODE)
                 .await
                 .map(|m| m.round() as i64)
             {
@@ -1661,7 +1661,7 @@ pub(crate) async fn answer_state_query(
         let (alt, hdg, gs, on_ground, lat, lon) = tokio::join!(
             read1(live, xp, datarefs::ALTITUDE_FT),
             read1(live, xp, datarefs::COMPASS_HEADING_DEG),
-            read1(live, xp, "sim/flightmodel/position/groundspeed"),
+            read1(live, xp, crate::datarefs::GROUNDSPEED_MS),
             read1(live, xp, datarefs::ON_GROUND_ANY),
             read1(live, xp, datarefs::LATITUDE),
             read1(live, xp, datarefs::LONGITUDE),
@@ -1777,7 +1777,7 @@ pub(crate) async fn answer_state_query(
     }
     let groundspeed_q = t.contains("groundspeed") || t.contains("ground speed");
     if groundspeed_q {
-        if let Ok(v) = xp.get_float("sim/flightmodel/position/groundspeed").await {
+        if let Ok(v) = xp.get_float(crate::datarefs::GROUNDSPEED_MS).await {
             parts.push(format!("groundspeed {:.0} knots", v * MS_TO_KTS));
         }
     }
@@ -1886,7 +1886,7 @@ pub(crate) async fn answer_state_query(
         .iter()
         .any(|k| t.contains(k))
     {
-        let running = read_engine0(xp, "sim/flightmodel/engine/ENGN_running")
+        let running = read_engine0(xp, crate::datarefs::ENGINE_RUNNING)
             .await
             .is_some_and(|v| v > 0.5);
         if !running {
@@ -1894,10 +1894,10 @@ pub(crate) async fn answer_state_query(
         } else if turbine {
             // Turbine summary: spool speeds (N1/N2), turbine temp (ITT), oil, burn.
             let mut bits = vec!["engines running".to_string()];
-            if let Some(v) = read_engine0(xp, "sim/cockpit2/engine/indicators/N1_percent").await {
+            if let Some(v) = read_engine0(xp, crate::datarefs::N1_PERCENT).await {
                 bits.push(format!("N 1 {v:.0} percent"));
             }
-            if let Some(v) = read_engine0(xp, "sim/cockpit2/engine/indicators/N2_percent").await {
+            if let Some(v) = read_engine0(xp, crate::datarefs::N2_PERCENT).await {
                 bits.push(format!("N 2 {v:.0} percent"));
             }
             if let Some(v) = read_engine0(xp, "sim/cockpit2/engine/indicators/ITT_deg_C").await {
@@ -1909,7 +1909,7 @@ pub(crate) async fn answer_state_query(
                 bits.push(format!("oil pressure {v:.0} pounds"));
             }
             if let Some(v) =
-                read_engine0(xp, "sim/cockpit2/engine/indicators/fuel_flow_kg_sec").await
+                read_engine0(xp, crate::datarefs::FUEL_FLOW_KG_SEC).await
             {
                 bits.push(format!(
                     "fuel flow {:.0} pounds an hour",
@@ -1919,7 +1919,7 @@ pub(crate) async fn answer_state_query(
             parts.push(bits.join(", "));
         } else {
             let mut bits = vec!["engine running".to_string()];
-            if let Some(v) = read_engine0(xp, "sim/cockpit2/engine/indicators/prop_speed_rpm").await
+            if let Some(v) = read_engine0(xp, crate::datarefs::PROP_SPEED_RPM).await
             {
                 bits.push(format!("{v:.0} R P M"));
             }
@@ -1938,7 +1938,7 @@ pub(crate) async fn answer_state_query(
                 bits.push(format!("C H T {v:.0}"));
             }
             if let Some(v) =
-                read_engine0(xp, "sim/cockpit2/engine/indicators/fuel_flow_kg_sec").await
+                read_engine0(xp, crate::datarefs::FUEL_FLOW_KG_SEC).await
             {
                 bits.push(format!(
                     "fuel flow {}",
@@ -1951,12 +1951,12 @@ pub(crate) async fn answer_state_query(
 
     // Turbine spool speeds, asked directly ("what's the N1?").
     if turbine && (t.contains("n1") || t.contains("n 1")) {
-        if let Some(v) = read_engine0(xp, "sim/cockpit2/engine/indicators/N1_percent").await {
+        if let Some(v) = read_engine0(xp, crate::datarefs::N1_PERCENT).await {
             parts.push(format!("N 1 {v:.0} percent"));
         }
     }
     if turbine && (t.contains("n2") || t.contains("n 2")) {
-        if let Some(v) = read_engine0(xp, "sim/cockpit2/engine/indicators/N2_percent").await {
+        if let Some(v) = read_engine0(xp, crate::datarefs::N2_PERCENT).await {
             parts.push(format!("N 2 {v:.0} percent"));
         }
     }
@@ -2007,20 +2007,20 @@ pub(crate) async fn answer_state_query(
     if t.contains("rpm") || t.contains("r p m") || t.contains("engine speed") {
         if turbine {
             // A jet's "engine speed" is the spool speeds, not prop RPM.
-            if let Some(v) = read_engine0(xp, "sim/cockpit2/engine/indicators/N1_percent").await {
+            if let Some(v) = read_engine0(xp, crate::datarefs::N1_PERCENT).await {
                 parts.push(format!("N 1 {v:.0} percent"));
             }
-            if let Some(v) = read_engine0(xp, "sim/cockpit2/engine/indicators/N2_percent").await {
+            if let Some(v) = read_engine0(xp, crate::datarefs::N2_PERCENT).await {
                 parts.push(format!("N 2 {v:.0} percent"));
             }
         } else if let Some(v) =
-            read_engine0(xp, "sim/cockpit2/engine/indicators/prop_speed_rpm").await
+            read_engine0(xp, crate::datarefs::PROP_SPEED_RPM).await
         {
             parts.push(format!("{v:.0} R P M"));
         }
     }
     if t.contains("fuel flow") || t.contains("flow") || t.contains("burning") {
-        if let Some(v) = read_engine0(xp, "sim/cockpit2/engine/indicators/fuel_flow_kg_sec").await {
+        if let Some(v) = read_engine0(xp, crate::datarefs::FUEL_FLOW_KG_SEC).await {
             if turbine {
                 parts.push(format!(
                     "fuel flow {:.0} pounds an hour",
@@ -2052,7 +2052,7 @@ pub(crate) async fn answer_state_query(
             let health = if battery_low(v) { " (low)" } else { "" };
             parts.push(format!("battery {v:.1} volts{health}"));
         }
-        if let Some(v) = read_engine0(xp, "sim/cockpit2/electrical/bus_volts").await {
+        if let Some(v) = read_engine0(xp, crate::datarefs::BUS_VOLTS).await {
             parts.push(format!("bus {v:.1} volts"));
         }
         if let Some(v) = read_engine0(xp, "sim/cockpit2/electrical/battery_amps").await {

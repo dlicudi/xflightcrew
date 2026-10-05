@@ -50,7 +50,7 @@ fn exterior() -> Exterior {
 }
 
 /// The sun's elevation; a slow dataref (see the sim crate's list).
-pub const SUN_PITCH: &str = "sim/graphics/scenery/sun_pitch_degrees";
+pub const SUN_PITCH: &str = crate::datarefs::SUN_PITCH_DEG;
 
 /// Dusk or dark right now, for the light stages. A failed read is DARK:
 /// lights on is the side to err on when the answer is unknown.

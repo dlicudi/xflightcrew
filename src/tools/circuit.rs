@@ -165,7 +165,7 @@ impl Tool for Circuit {
         }
         let gs_kts = ctx
             .xplane
-            .get_float("sim/flightmodel/position/groundspeed")
+            .get_float(crate::datarefs::GROUNDSPEED_MS)
             .await
             .unwrap_or(0.0)
             * 1.943_844;

@@ -1194,13 +1194,13 @@ pub fn mora_ahead(air: &Air, fix_data_path: &str) -> Option<f64> {
         .reduce(f64::max)
 }
 
-const HPATH: &str = "sim/flightmodel/position/hpath";
-const MAG_VAR: &str = "sim/flightmodel/position/magnetic_variation";
-const YOKE_PITCH: &str = "sim/joystick/yoke_pitch_ratio";
-const YOKE_ROLL: &str = "sim/joystick/yoke_roll_ratio";
+const HPATH: &str = crate::datarefs::TRACK_DEG_TRUE;
+const MAG_VAR: &str = crate::datarefs::MAGNETIC_VARIATION_DEG;
+const YOKE_PITCH: &str = crate::datarefs::YOKE_PITCH_RATIO;
+const YOKE_ROLL: &str = crate::datarefs::YOKE_ROLL_RATIO;
 const PITCH_YIELD: &str = "xcopilot/pitch_yield";
 const STEER_YIELD: &str = "xcopilot/steer_yield";
-const STALL_RATIO: &str = "sim/cockpit2/annunciators/stall_warning_ratio";
+const STALL_RATIO: &str = crate::datarefs::STALL_WARNING_RATIO;
 
 async fn read_ap(xp: &crate::xplane::XPlaneClient) -> ApRead {
     use crate::datarefs as d;

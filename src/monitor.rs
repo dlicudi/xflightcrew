@@ -318,19 +318,19 @@ impl Snapshot {
             .ok()?
             > 0.5;
         let groundspeed_kts = xp
-            .get_float("sim/flightmodel/position/groundspeed")
+            .get_float(crate::datarefs::GROUNDSPEED_MS)
             .await
             .ok()?
             * MS_TO_KTS;
         let ias_kts = xp
-            .get_float("sim/cockpit2/gauges/indicators/airspeed_kts_pilot")
+            .get_float(crate::datarefs::AIRSPEED_KTS)
             .await
             .ok()?;
         let flap_ratio = xp
-            .get_float("sim/cockpit2/controls/flap_ratio")
+            .get_float(crate::datarefs::FLAP_RATIO)
             .await
             .unwrap_or(0.0);
-        let agl_ft = xp.get_float("sim/flightmodel/position/y_agl").await.ok()? * M_TO_FT;
+        let agl_ft = xp.get_float(crate::datarefs::AGL_METERS).await.ok()? * M_TO_FT;
         let vsi_fpm = xp
             .get_float("sim/cockpit2/gauges/indicators/vvi_fpm_pilot")
             .await
@@ -379,13 +379,13 @@ impl Snapshot {
             Ok((lat, lon, src)) => (lat, lon, Some(src)),
             Err(_) => (0.0, 0.0, None),
         };
-        let track_deg = xp.get_float("sim/flightmodel/position/hpath").await.ok();
+        let track_deg = xp.get_float(crate::datarefs::TRACK_DEG_TRUE).await.ok();
         let heading_deg = xp
-            .get_float("sim/flightmodel/position/psi")
+            .get_float(crate::datarefs::TRUE_HEADING_DEG)
             .await
             .unwrap_or(0.0);
         let bank_deg = xp
-            .get_float("sim/flightmodel/position/phi")
+            .get_float(crate::datarefs::PHI_DEG)
             .await
             .unwrap_or(0.0);
         let fps = xp
@@ -416,7 +416,7 @@ impl Snapshot {
             .map(|v| v > 0.5);
         // Best-effort (a missing read must not kill the snapshot): pushback state.
         let tug_attached = xp
-            .get_float("sim/aircraft/overflow/pushback_attached")
+            .get_float(crate::datarefs::PUSHBACK_ATTACHED)
             .await
             .unwrap_or(0.0)
             > 0.5;
@@ -433,7 +433,7 @@ impl Snapshot {
             > 0.5;
         let pushing_back = towing || (tug_attached && groundspeed_kts > 0.3);
         let engine_running = xp
-            .get_float_array("sim/flightmodel/engine/ENGN_running")
+            .get_float_array(crate::datarefs::ENGINE_RUNNING)
             .await
             .ok()?
             .first()
@@ -482,7 +482,7 @@ impl Snapshot {
         // Cached inside the reader on its own slow clock — see `winds_aloft`.
         let winds_aloft = crate::weather::winds_aloft(xp).await;
         let fuel_flow_kg_sec = xp
-            .get_float_array("sim/cockpit2/engine/indicators/fuel_flow_kg_sec")
+            .get_float_array(crate::datarefs::FUEL_FLOW_KG_SEC)
             .await
             .ok()
             .map(|v| v.iter().sum::<f64>());
@@ -542,13 +542,13 @@ impl Snapshot {
             .unwrap_or(0.0)
             > 0.5;
         let rpm = xp
-            .get_float_array("sim/cockpit2/engine/indicators/prop_speed_rpm")
+            .get_float_array(crate::datarefs::PROP_SPEED_RPM)
             .await
             .ok()
             .and_then(engine0)
             .unwrap_or(0.0);
         let elevator_trim = xp
-            .get_float("sim/cockpit2/controls/elevator_trim")
+            .get_float(crate::datarefs::ELEVATOR_TRIM)
             .await
             .unwrap_or(0.0);
         let low_vacuum = xp
@@ -2682,8 +2682,8 @@ async fn read_inputs(xp: &crate::xplane::XPlaneClient, pitch_due: bool) -> Input
         xp.get_float("sim/cockpit2/engine/actuators/throttle_beta_rev_ratio_all"),
         xp.get_float("sim/cockpit2/controls/left_brake_ratio"),
         xp.get_float("sim/cockpit2/controls/right_brake_ratio"),
-        xp.get_float("sim/joystick/yoke_pitch_ratio"),
-        xp.get_float("sim/joystick/yoke_roll_ratio"),
+        xp.get_float(crate::datarefs::YOKE_PITCH_RATIO),
+        xp.get_float(crate::datarefs::YOKE_ROLL_RATIO),
         xp.get_float("sim/joystick/yoke_heading_ratio"),
         xp.get_float(autoflight::names::AP_ON),
     );
@@ -3541,9 +3541,9 @@ pub async fn run(
                 // either way would be a guess with a switch on the end of
                 // it — a missing sun angle reading as night would light the
                 // cockpit at noon.
-                let sun = xp.get_float("sim/graphics/scenery/sun_pitch_degrees").await;
+                let sun = xp.get_float(crate::datarefs::SUN_PITCH_DEG).await;
                 let volts = xp
-                    .get_float_array("sim/cockpit2/electrical/bus_volts")
+                    .get_float_array(crate::datarefs::BUS_VOLTS)
                     .await
                     .ok()
                     .and_then(|v| v.first().copied());

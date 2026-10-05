@@ -13,7 +13,7 @@ use super::{Tool, ToolCtx};
 const COM1: &str = "sim/cockpit2/radios/actuators/com1_frequency_hz_833";
 const COM2: &str = "sim/cockpit2/radios/actuators/com2_frequency_hz_833";
 const XPDR_CODE: &str = "sim/cockpit2/radios/actuators/transponder_code";
-const XPDR_MODE: &str = "sim/cockpit2/radios/actuators/transponder_mode";
+const XPDR_MODE: &str = crate::datarefs::TRANSPONDER_MODE;
 /// NAV1 active frequency, integer in units of 10 kHz (10950 = 109.50 MHz).
 const NAV1: &str = "sim/cockpit2/radios/actuators/nav1_frequency_hz";
 const NAV1_OBS: &str = "sim/cockpit2/radios/actuators/nav1_obs_deg_mag_pilot";

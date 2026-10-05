@@ -2135,7 +2135,7 @@ mod tests {
         // A verify item that is observe-only never becomes an Act.
         let v = Item::Verify {
             say: "Brakes, minimum possible.".into(),
-            dataref: "sim/cockpit2/gauges/indicators/airspeed_kts_pilot".into(),
+            dataref: crate::datarefs::AIRSPEED_KTS.into(),
             index: None,
             cond: Cond::Lt(50.0),
             settable: false,

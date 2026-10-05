@@ -71,8 +71,8 @@ pub(crate) fn undo_targets(tool: &str) -> Vec<(String, &'static str, bool)> {
 
 fn undoable_drefs(tool: &str) -> &'static [Undoable] {
     match tool {
-        "set_flaps" => &[("sim/cockpit2/controls/flap_ratio", "flaps", F)],
-        "gear" => &[("sim/cockpit2/controls/gear_handle_down", "the gear", F)],
+        "set_flaps" => &[(crate::datarefs::FLAP_RATIO, "flaps", F)],
+        "gear" => &[(crate::datarefs::GEAR_HANDLE_DOWN, "the gear", F)],
         "speedbrake" => &[(
             "sim/cockpit2/controls/speedbrake_ratio",
             "the speedbrakes",
@@ -85,7 +85,7 @@ fn undoable_drefs(tool: &str) -> &'static [Undoable] {
             "mixture",
             F,
         )],
-        "set_pitch_trim" => &[("sim/cockpit2/controls/elevator_trim", "pitch trim", F)],
+        "set_pitch_trim" => &[(crate::datarefs::ELEVATOR_TRIM, "pitch trim", F)],
         "set_barometer" | "set_altimeter_current" => &[(
             "sim/cockpit2/gauges/actuators/barometer_setting_in_hg_pilot",
             "the altimeter",
@@ -105,7 +105,7 @@ fn undoable_drefs(tool: &str) -> &'static [Undoable] {
             I,
         )],
         "set_transponder_mode" => &[(
-            "sim/cockpit2/radios/actuators/transponder_mode",
+            crate::datarefs::TRANSPONDER_MODE,
             "the transponder mode",
             I,
         )],

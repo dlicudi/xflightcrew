@@ -122,7 +122,7 @@ pub(super) fn plan_taxi_route_to_stand(
 }
 
 /// True heading, for which way is forward off a runway.
-pub(super) const TRUE_PSI: &str = "sim/flightmodel/position/psi";
+pub(super) const TRUE_PSI: &str = sim::datarefs::TRUE_HEADING_DEG;
 
 /// [`plan_taxi_route_to_stand`] on a given network, so the real apt.dat can
 /// test it. ON a runway with a heading, the route starts with the drive off

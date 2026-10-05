@@ -1026,7 +1026,7 @@ mod tests {
                     cache_hits: 20,
                     failures: 1,
                     slowest_ms: 1400,
-                    top: vec![("sim/flightmodel/position/latitude".into(), 300)],
+                    top: vec![(crate::datarefs::LATITUDE.into(), 300)],
                 }),
                 profile: "Cessna 172SP (cessna_172sp)".into(),
                 mode: "both".into(),

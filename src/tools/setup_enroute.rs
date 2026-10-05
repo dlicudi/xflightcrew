@@ -583,8 +583,8 @@ impl Tool for SetUpEnroute {
         };
         let strings = crate::xplane::XPlaneClient::new(ctx.config.xplane_base_url.clone());
         let (acf, icao) = tokio::join!(
-            strings.get_string("sim/aircraft/view/acf_relative_path"),
-            strings.get_string("sim/aircraft/view/acf_ICAO"),
+            strings.get_string(crate::datarefs::ACF_RELATIVE_PATH),
+            strings.get_string(crate::datarefs::ACF_ICAO),
         );
         let Some(acf) = acf.ok().filter(|p| !p.trim().is_empty()) else {
             return refused("I can't read which aircraft is loaded.".into());
@@ -672,7 +672,7 @@ struct EnrouteJob {
 
 const VS_STATUS: &str = autoflight::names::VS_STATUS;
 const ALT_HOLD_STATUS: &str = autoflight::names::ALT_HOLD_STATUS;
-const MAG_VAR: &str = "sim/flightmodel/position/magnetic_variation";
+const MAG_VAR: &str = crate::datarefs::MAGNETIC_VARIATION_DEG;
 
 /// How the autopilot came up on the new flight.
 #[derive(Debug, Clone, Copy, Default)]

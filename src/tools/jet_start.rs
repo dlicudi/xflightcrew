@@ -18,10 +18,10 @@ use crate::voice::{Priority, Voice};
 use crate::xplane::XPlaneClient;
 
 const APU_N1: &str = "sim/cockpit2/electrical/APU_N1_percent";
-const N2: &str = "sim/cockpit2/engine/indicators/N2_percent";
+const N2: &str = crate::datarefs::N2_PERCENT;
 const MIXTURE: &str = "sim/cockpit2/engine/actuators/mixture_ratio"; // the fuel handle
 const GEN_ON: &str = "sim/cockpit2/electrical/generator_on";
-const ENGN_RUNNING: &str = "sim/flightmodel/engine/ENGN_running";
+const ENGN_RUNNING: &str = crate::datarefs::ENGINE_RUNNING;
 const XFEED_L: &str = "laminar/md82/bleedair/engineL_xfeed_lever";
 const XFEED_R: &str = "laminar/md82/bleedair/engineR_xfeed_lever";
 // Post-start: transfer to engine generators and shut the APU down (start-only).
