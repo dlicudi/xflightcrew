@@ -164,7 +164,8 @@ Datarefs and commands stay in the Rust tools; YAML is per-airframe config.
   caller. A loop OWNS its flag through its `Slot` lease (`claim`, `take_over`): a superseded run
   never writes its successor's state, and nobody clears another loop's latch (autoland launches
   are all `run_autoland_scoped`). The world side resets by lifetime group
-  (`crates/atc/src/station/state.rs`, `every_atc_static_has_a_lifetime`).
+  (`crates/atc/src/station/state.rs`, `every_atc_static_has_a_lifetime`); every crew static names its
+  lifetime in `src/lifetimes.rs` (`every_crew_static_has_a_lifetime`).
 - **Anti-ice** (`src/tools/anti_ice.rs` `set_anti_ice`, profile `anti_ice:`, else the `.acf`'s
   loads, `systems::IceKit`): read first, read back, an undeclared wing left alone and said; the
   monitor's `icing` switches probes, windows, engines and props in visible moisture at +10 C or
@@ -991,8 +992,9 @@ was driven again to the stand 7 s later (LEMG 2026-09-28).
 
 ### Still owed
 Issues labelled `owed` + `area:approach-landing` / `area:takeoff` / `area:full-auto` (`ils_coupled` on the 737 is unflown through the owner, #81).
-Also owed from 2026-10-05: the circuit's, follower's, takeoff's and enroute setup's mode presses
-onto `autoflight::reconcile` (they go through the owner's buttons on their own reads today);
+Also owed from 2026-10-05: the loops' mode presses go through `autoflight::bring` (reconcile,
+then apply; `loop_mode_presses_go_through_reconcile`) except four that need a flight: the pattern
+guard's hand-back VS, autoland's arrest return, window-park and VS-watchdog presses;
 `idle_decel_kts_s` fitted for the other airframes; the speedbrake in the energy plan (a 737 on a
 long 3 degree straight-in is asked for flaps 10 and the gear, the only idle configuration that
 does not gain speed on it); `e_gate` over the gate's limit acted on before the gate.
