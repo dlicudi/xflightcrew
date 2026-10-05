@@ -1517,7 +1517,7 @@ async fn watch(
             Act::Hold(cmd) | Act::Escape(cmd) => {
                 let escape = matches!(act, Act::Escape(_));
                 let cause = hold.ep.as_ref().map(|e| e.cause).unwrap_or("release");
-                let set = set_hold(&xp, &config, &live, &voice, &status, &tick, &cmd).await;
+                let set = set_hold(&xp, &config, &live, &tick, &cmd).await;
                 let ap_after = read_ap(&xp).await;
                 let took = ap_after.servos == Some(true)
                     && ap_after
@@ -1604,8 +1604,6 @@ async fn set_hold(
     xp: &crate::xplane::XPlaneClient,
     config: &crate::config::Config,
     live: &crate::detect::LiveProfile,
-    _voice: &crate::voice::Voice,
-    _status: &Option<crate::plugin_status::StatusSink>,
     tick: &Tick,
     cmd: &HoldCmd,
 ) -> Vec<String> {
