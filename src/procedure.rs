@@ -30,7 +30,9 @@ use crate::autoflight::{self, Button, Dial};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::autoland::true_to_mag;
-use crate::control::{measurements, set_confirmed};
+use crate::control::measurements;
+#[cfg(test)]
+use crate::control::set_confirmed;
 use crate::heading_bug::HeadingHold;
 use crate::nav::ProcLeg;
 use crate::tools::autopilot::ApConfig;

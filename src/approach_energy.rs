@@ -136,6 +136,7 @@ impl EnergyModel {
     }
 
     /// The landing flap: the deepest detent.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn landing_flap(&self) -> f64 {
         self.detents.last().map_or(1.0, |d| d.ratio)
     }

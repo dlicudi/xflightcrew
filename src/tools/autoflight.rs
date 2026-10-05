@@ -159,6 +159,12 @@ pub async fn engage(xp: &dyn crate::xplane::XPlane, mode: ApMode, on: bool) -> E
     verdict
 }
 
+/// The autothrottle refused while one of our loops flies the levers (it
+/// would take it straight back out, `autoflight::ThrustWatch`). Pure.
+pub fn autothrust_refused_line(owner: &str) -> String {
+    format!("The {owner} is flying the thrust, so no autothrottle. Say my controls first.")
+}
+
 /// The spoken readback for one engage. Pure.
 pub fn line(mode: ApMode, on: bool, verdict: Engaged) -> String {
     let name = spoken(mode);
@@ -247,7 +253,21 @@ impl Tool for ApModeTool {
             ApMode::LevelChange => modes.level_change,
             ApMode::Lnav => modes.lnav,
         };
-        Ok(run(ctx.xplane, mode, a.on, cap).await)
+        // The thrust has one owner (`autoflight::ThrustWatch`): while one of
+        // our loops flies the levers it would take this straight back out.
+        if a.on && mode == ApMode::Autothrust {
+            if let Some(owner) = crate::flight_state::crew_flying() {
+                return Ok(autothrust_refused_line(owner.name()));
+            }
+        }
+        let out = run(ctx.xplane, mode, a.on, cap).await;
+        // Given to the autothrottle, the speed governor stands down: two
+        // owners of one lever fight, and the governor would read the A/T's
+        // lever as the pilot's hand.
+        if a.on && mode == ApMode::Autothrust && out.ends_with(" on.") && crate::tools::speedhold::release() {
+            crate::blackbox::record("autoflight", json!({"event": "governor_released", "for": "autothrottle"}));
+        }
+        Ok(out)
     }
 }
 

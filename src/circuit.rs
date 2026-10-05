@@ -26,8 +26,8 @@
 
 // The tests reach these through `use super::*` (the queue that used them
 // moved to `crew_radio.rs`).
-#[cfg_attr(not(test), allow(unused_imports))]
 use crate::autoflight::{self, Button, Dial};
+#[cfg_attr(not(test), allow(unused_imports))]
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
 #[cfg_attr(not(test), allow(unused_imports))]

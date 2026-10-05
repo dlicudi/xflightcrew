@@ -76,8 +76,6 @@ pub mod names {
     pub const HDG_STATUS: &str = crate::datarefs::HEADING_STATUS;
     pub const VS_STATUS: &str = "sim/cockpit2/autopilot/vvi_status";
     pub const ALT_HOLD_STATUS: &str = "sim/cockpit2/autopilot/altitude_hold_status";
-    pub const APPR_STATUS: &str = crate::datarefs::APPROACH_STATUS;
-    pub const GS_STATUS: &str = "sim/cockpit2/autopilot/glideslope_status";
     pub const NAV_STATUS: &str = crate::datarefs::NAV_STATUS;
     pub const GPSS_STATUS: &str = "sim/cockpit2/autopilot/gpss_status";
     /// Speed on the elevator: 0 off, 1 armed, 2 captured.
@@ -277,12 +275,15 @@ impl Modes {
     fn has(self, bit: u32) -> bool {
         self.0 & bit != 0
     }
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn autothrottle(self) -> bool {
         self.has(Self::AUTOTHROTTLE)
     }
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn heading(self) -> bool {
         self.has(Self::HEADING)
     }
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn vs(self) -> bool {
         self.has(Self::VS)
     }
@@ -685,10 +686,12 @@ pub async fn act_thrust(xp: &dyn XPlane, step: ThrustStep, owner: &str) -> Optio
     }
 }
 
+#[cfg_attr(not(test), allow(dead_code))] // a primitive for the safe-hold and recovery loops
 /// How long a mode takes to show after its command (a frame or two, an
 /// add-on's mirror a frame behind).
 pub const SETTLE_MS: u64 = 400;
 
+#[cfg_attr(not(test), allow(dead_code))] // a primitive for the safe-hold and recovery loops
 /// The one-shot take at a loop's arm: read, press only if engaged, read back,
 /// up to [`THRUST_TRIES`]. `Some(true)` taken, `Some(false)` it would not
 /// come out, `None` it was not engaged (or unread: no measurement). Taped.
@@ -739,6 +742,7 @@ pub async fn drop_thrust_now(xp: &dyn XPlane, owner: &str) -> Option<bool> {
 // The approach mode.
 // ---------------------------------------------------------------------------
 
+#[cfg_attr(not(test), allow(dead_code))] // a primitive for the safe-hold and recovery loops
 /// Arm the airframe's APP: pressed only when neither half reads armed or
 /// captured (a toggle), read back on the bitfield. `Some(true)` armed (or
 /// already), `Some(false)` pressed and not armed, `None` unread. Taped.
@@ -766,6 +770,7 @@ pub async fn arm_approach(xp: &dyn XPlane, site: &str) -> Option<bool> {
 // Primitives: engage, hold level, hold heading.
 // ---------------------------------------------------------------------------
 
+#[cfg_attr(not(test), allow(dead_code))] // a primitive for the safe-hold and recovery loops
 /// The servos in and READ in ([`crate::ap_engage::engage_confirmed`]: the
 /// flight director commands first, then the panel's engage, pressed until
 /// the servos read in on two live reads), at most `max_s`.
@@ -774,6 +779,7 @@ pub async fn engage_confirmed(xp: &dyn XPlane, site: &str, max_s: f64) -> bool {
     crate::ap_engage::engage_confirmed(xp, &fd, "autoflight", site, max_s).await
 }
 
+#[cfg_attr(not(test), allow(dead_code))] // a primitive for the safe-hold and recovery loops
 /// Make sure a toggled mode reads on: read its status first, press only
 /// when off, read back, up to `tries`. `true` when it reads on.
 pub async fn ensure_on(xp: &dyn XPlane, b: Button, status: &str, site: &str, tries: u32) -> bool {
@@ -790,6 +796,7 @@ pub async fn ensure_on(xp: &dyn XPlane, b: Button, status: &str, site: &str, tri
     xp.get_float(status).await.is_ok_and(|v| v >= 0.5)
 }
 
+#[cfg_attr(not(test), allow(dead_code))] // a primitive for the safe-hold and recovery loops
 /// Hold this level: servos in, the window AT the level (rounded to the
 /// hundred), ALT HOLD on and read back. A primitive for the safe-hold and
 /// recovery loops. `true` when the hold reads on.
@@ -807,6 +814,7 @@ pub async fn hold_level(xp: &dyn XPlane, alt_ft: f64, site: &str) -> bool {
     ok
 }
 
+#[cfg_attr(not(test), allow(dead_code))] // a primitive for the safe-hold and recovery loops
 /// Hold this heading: servos in, the bug set, HDG SEL on and read back. A
 /// primitive for the safe-hold and recovery loops.
 pub async fn hold_heading(xp: &dyn XPlane, hdg_mag: f64, site: &str) -> bool {
@@ -1019,8 +1027,6 @@ mod tests {
             [
                 names::AP_ON,
                 names::AP_POWER,
-                names::APPR_STATUS,
-                names::GS_STATUS,
                 names::NAV_STATUS,
                 names::GPSS_STATUS,
                 names::SPEED_STATUS,
