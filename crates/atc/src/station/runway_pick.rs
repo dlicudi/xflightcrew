@@ -351,9 +351,13 @@ impl Station {
             }
         }
         if wind_kts >= CALM_WIND_KTS || self.runway_in_use.is_none() {
-            if let Some((id, _, hw)) =
-                nav::best_runway_for_wind(&self.apt.runways, wind_from, wind_kts)
-            {
+            let best = nav::best_runway_for_wind(&self.apt.runways, wind_from, wind_kts);
+            let best = if self.departing {
+                self.departure_wind_pick(best, wind_from, wind_kts)
+            } else {
+                best
+            };
+            if let Some((id, _, hw)) = best {
                 // Hysteresis: the runway in use keeps its job unless another
                 // beats it by a REAL margin. The >= 5 kt guard was meant to
                 // stop the flip-flop, but between two parallels the headwinds
@@ -366,9 +370,12 @@ impl Station {
                 // never has a 15 s gap: held at November one for the full
                 // eight minutes and handed back, "traffic on short final" for
                 // a departure runway that was empty (2026-07-27).
+                // A departure's current end with no way on at its numbers
+                // holds nothing against the pick (LEMD 18R, 2026-10-05).
                 let current = self
                     .runway_in_use
                     .as_deref()
+                    .filter(|cur| !self.departing || self.departs_from(cur))
                     .and_then(|cur| nav::headwind_for(&self.apt.runways, cur, wind_from, wind_kts));
                 if current.is_none_or(|cur_hw| hw > cur_hw + RUNWAY_SWAP_MARGIN_KTS) {
                     self.runway_in_use = Some(id);
@@ -381,11 +388,67 @@ impl Station {
         // before the fix, or by a calm-wind stream, would stand for good.
         if let Some(cur) = self.runway_in_use.as_deref() {
             let main = nav::close_parallel_main(&self.apt.runways, cur);
-            if main != cur {
+            if main != cur && (!self.departing || self.departs_from(&main)) {
                 tracing::info!(from = %cur, to = %main, "runway in use moved to the main runway");
                 self.runway_in_use = Some(main);
             }
         }
         self.runway_in_use.clone().unwrap_or_default()
+    }
+
+    /// A departure from `ident` gets onto the strip on its threshold's half
+    /// (`TaxiNet::departure_end_enterable`); `true` without a network.
+    fn departs_from(&self, ident: &str) -> bool {
+        let Some(net) = taxi_net() else {
+            return true;
+        };
+        strip(&self.apt.runways, ident).is_none_or(|r| net.departure_end_enterable(r, ident))
+    }
+
+    /// The wind's pick for a DEPARTURE: an end with no way on at its
+    /// threshold's half gives way to one that has, of the ends the wind
+    /// allows (`runway_stands_within`, a 5 kt tailwind), a parallel of the
+    /// wind's pick first. None allowed: the wind's pick stands, backtrack
+    /// and all (a single strip). LEMD 18R (2026-10-05): its only ways on
+    /// are at the 36L end, and the 737 was sent 4 km down the wrong end.
+    fn departure_wind_pick(
+        &self,
+        best: Option<(String, f64, f64)>,
+        wind_from: f64,
+        wind_kts: f64,
+    ) -> Option<(String, f64, f64)> {
+        let (id, hdg, _) = best.clone()?;
+        if self.departs_from(&id) {
+            return best;
+        }
+        let runways = &self.apt.runways;
+        nav::assignable_runways(runways)
+            .flat_map(|r| {
+                [
+                    (r.ident_a.clone(), r.heading_a_deg()),
+                    (r.ident_b.clone(), r.heading_b_deg()),
+                ]
+            })
+            .filter(|(e, _)| self.departs_from(e))
+            .filter_map(|(e, h)| {
+                let hw = nav::headwind_for(runways, &e, wind_from, wind_kts)?;
+                runway_stands_within(
+                    runways,
+                    &e,
+                    Some(hw),
+                    best.clone(),
+                    wind_from,
+                    wind_kts,
+                    STATED_RUNWAY_TAILWIND_KTS,
+                )
+                .then_some((e, h, hw))
+            })
+            .max_by(|a, b| {
+                let par = |h: f64| sim::angles::abs_diff_deg(h, hdg) <= nav::PARALLEL_DEG;
+                (par(a.1), a.2)
+                    .partial_cmp(&(par(b.1), b.2))
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .or(best)
     }
 }

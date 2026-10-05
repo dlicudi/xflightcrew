@@ -3414,3 +3414,118 @@ fn real_install_fillet_sweep() {
     );
     assert_eq!(worse, 0);
 }
+
+/// A strip whose only ways on at the 18 end are authored oneway OFF it
+/// (exits), and a twoway stub at the 36 end: the LEMD 18R shape
+/// (2026-10-05). The route to 18 used to ride the runway from the 36 end
+/// to the numbers, the zone trim left the hold at the 36 end with that ride
+/// as its lead-on, and the ride's runway edges were read as a crossing of
+/// our own strip. Now the 36 end's stub is a BACKTRACK entrance: the hold
+/// is there, the lead-on only joins the strip, nothing is crossed, and the
+/// end is reported as having no way on at its threshold's half.
+#[test]
+fn an_exit_only_threshold_is_a_backtrack_never_a_runway_ride() {
+    let mut net = TaxiNet::default();
+    for (id, lat, lon) in [
+        (1, 51.0300, -1.0000),
+        (2, 51.0200, -1.0000),
+        (3, 51.0100, -1.0000),
+        (4, 51.0000, -1.0000),
+        (11, 51.0290, -0.9980),
+        (14, 51.0010, -0.9980),
+        (21, 51.0290, -0.9960),
+        (22, 51.0010, -0.9960),
+        (23, 51.0150, -0.9960),
+    ] {
+        net.nodes.insert(id, (lat, lon));
+    }
+    let e = |a: i64, b: i64, name: &str, runway: bool, oneway: bool, z: &[&str]| TaxiEdge {
+        a,
+        b,
+        name: name.into(),
+        runway,
+        oneway,
+        zone_of: z.iter().map(|s| s.to_string()).collect(),
+    };
+    let zone = ["18", "36"];
+    net.edges.push(e(1, 2, "18/36", true, false, &zone));
+    net.edges.push(e(2, 3, "18/36", true, false, &zone));
+    net.edges.push(e(3, 4, "18/36", true, false, &zone));
+    // The 18 end's stub: an exit, oneway off the runway.
+    net.edges.push(e(1, 11, "N", false, true, &zone));
+    net.edges.push(e(11, 21, "N", false, false, &[]));
+    net.edges.push(e(21, 23, "P", false, false, &[]));
+    net.edges.push(e(23, 22, "P", false, false, &[]));
+    net.edges.push(e(22, 14, "S", false, false, &[]));
+    net.edges.push(e(14, 4, "S", false, false, &zone));
+    let r = Runway {
+        ident_a: "18".into(),
+        ident_b: "36".into(),
+        lat_a: 51.0300,
+        lon_a: -1.0000,
+        lat_b: 51.0000,
+        lon_b: -1.0000,
+        width_m: 45.0,
+        surface: 1,
+    };
+    assert!(!net.departure_end_enterable(&r, "18"));
+    assert!(net.departure_end_enterable(&r, "36"));
+    let zone = ["18".to_string(), "36".to_string()];
+    let p = net
+        .plan_to_runway(51.0150, -0.9950, r.lat_a, r.lon_a, 60.0, &zone, Some(&r))
+        .expect("the backtrack's route");
+    assert_eq!(p.holding_point, "S", "{p:?}");
+    assert!(p.crossings.is_empty(), "our own strip read as a crossing: {p:?}");
+    let ride: f64 = p
+        .lead_on
+        .windows(2)
+        .map(|w| haversine_nm(w[0].0, w[0].1, w[1].0, w[1].1) * 1852.0)
+        .sum();
+    assert!(ride < 300.0, "a {ride:.0} m lead-on rides the runway: {p:?}");
+}
+
+/// LEMD from the 737's stand on 2026-10-05: 18R, 32L and 32R have no way on
+/// at their threshold's half (their stubs there are authored oneway off
+/// the runway), so none gets a hold at its far end with a runway ride for a
+/// lead-on; the other ends keep the holds they always had.
+/// `cargo test --release -p atc -- --ignored real_install_lemd_18r_departure --nocapture`
+#[test]
+#[ignore] // needs the real X-Plane install; run with --ignored
+fn real_install_lemd_18r_departure() {
+    let apt =
+        &crate::nav::test_xplane_path("Global Scenery/Global Airports/Earth nav data/apt.dat");
+    if !std::path::Path::new(apt).exists() {
+        return;
+    }
+    let a = find_airport(apt, "LEMD").unwrap().expect("LEMD");
+    let net = find_taxi_net(apt, "LEMD").unwrap().expect("LEMD's network");
+    for (id, hold, enterable) in [
+        ("18R", "Z6", false),
+        ("32L", "LF", false),
+        ("32R", "K3", false),
+        ("36L", "Z1", true),
+        ("36R", "Y1", true),
+        ("14L", "K1", true),
+        ("14R", "LC", true),
+        ("18L", "Y7", true),
+    ] {
+        let r = a.runways.iter().find(|r| r.ident_a == id || r.ident_b == id).unwrap();
+        let (lat, lon) = if r.ident_a == id { (r.lat_a, r.lon_a) } else { (r.lat_b, r.lon_b) };
+        let zone = [r.ident_a.clone(), r.ident_b.clone()];
+        let p = net
+            .plan_to_runway(40.49909, -3.56863, lat, lon, 100.0, &zone, Some(r))
+            .expect("a route");
+        let ride: f64 = p
+            .lead_on
+            .windows(2)
+            .map(|w| haversine_nm(w[0].0, w[0].1, w[1].0, w[1].1) * 1852.0)
+            .sum();
+        println!("{id}: hold {} crossings {:?} lead-on {ride:.0} m", p.holding_point, p.crossings);
+        assert_eq!(p.holding_point, hold, "{id}");
+        assert_eq!(net.departure_end_enterable(r, id), enterable, "{id}");
+        assert!(ride < 500.0, "{id}: a {ride:.0} m lead-on rides the runway");
+        let own = format!("{}/{}", r.ident_a, r.ident_b);
+        // 18L's route crosses 18L/36R near its end today, unchanged.
+        assert!(enterable || !p.crossings.contains(&own), "{id}: crosses its own strip");
+    }
+}

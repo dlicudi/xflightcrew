@@ -3746,6 +3746,7 @@ fn lxgb() -> Station {
         stated_runway: None,
         stated_on_strip: false,
         start_strip: None,
+        departing: false,
         told_runway: None,
         runway_request: None,
         requested_ident: None,
@@ -9772,4 +9773,33 @@ fn a_held_runway_start_arms_the_release_and_takes_the_hold_readback() {
     *TAKEOFF_HOLD.lock().unwrap() = None;
     *CLEARANCE.lock().unwrap() = None;
     *HANDOFF.lock().unwrap_or_else(|e| e.into_inner()) = None;
+}
+
+/// LEMD at 240/5 (2026-10-05): the wind faces the 18s, the longest is 18R,
+/// and 18R's only ways on are at the 36L end. A departure on the ground is
+/// given a runway it can enter at its numbers; an arrival keeps the wind's
+/// pick.
+/// `cargo test --release -p atc -- --ignored real_install_lemd_departure_pick --nocapture`
+#[test]
+#[ignore] // needs the real X-Plane install; run with --ignored
+fn real_install_lemd_departure_pick_skips_an_exit_only_end() {
+    let _guard = SIDE_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let apt = crate::nav::test_xplane_path("Global Scenery/Global Airports/Earth nav data/apt.dat");
+    if !std::path::Path::new(&apt).exists() {
+        return;
+    }
+    let net = nav::find_taxi_net(&apt, "LEMD").unwrap().expect("LEMD's network");
+    *TAXI_NET.lock().unwrap() = Some(std::sync::Arc::new(net));
+    let mut arr = Station::load(&apt, "LEMD").expect("LEMD has a tower");
+    assert_eq!(arr.pick_runway(240.0, 5.0), "18R", "an arrival keeps the wind's pick");
+    let mut dep = Station::load(&apt, "LEMD").expect("LEMD has a tower");
+    dep.departing = true;
+    let id = dep.pick_runway(240.0, 5.0);
+    println!("departure runway {id}");
+    assert!(!["18R", "32L", "32R"].contains(&id.as_str()), "{id}");
+    // A departure already given 18R is moved off it too.
+    arr.departing = true;
+    let id = arr.pick_runway(240.0, 5.0);
+    assert!(!["18R", "32L", "32R"].contains(&id.as_str()), "{id}");
+    *TAXI_NET.lock().unwrap() = None;
 }

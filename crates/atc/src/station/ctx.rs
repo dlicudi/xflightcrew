@@ -69,6 +69,9 @@ impl Station {
                 self.note_caller_on_strip(on_ground, lat, lon);
             }
         }
+        self.departing = on_ground
+            && !matches!(intent, tower::Intent::RequestTaxiIn)
+            && self.twr.state != tower::State::ClearedToLand;
         let ident = self.pick_runway_with(
             wx.wind_from_deg,
             wx.wind_kts,

@@ -99,6 +99,10 @@ pub struct Station {
     /// tailwind stays within [`ON_STRIP_TAILWIND_KTS`], where the wind pick's
     /// hysteresis would otherwise turn it round on the next call (#178).
     start_strip: Option<String>,
+    /// The caller being answered is a DEPARTURE on the ground (`build_ctx`):
+    /// the wind pick then skips an end with no way on at its threshold's
+    /// half when another end fits the wind (LEMD 18R, 2026-10-05).
+    departing: bool,
     /// The runway the tower last named to this flight on the ground (its
     /// zone, circuit or IFR clearance, a taxi, a line-up): a later reply on
     /// another runway states the change (`state_runway_change`, #178).
@@ -266,6 +270,7 @@ impl Station {
             stated_runway: None,
             stated_on_strip: false,
             start_strip: None,
+            departing: false,
             told_runway: None,
             runway_request: None,
             requested_ident: None,

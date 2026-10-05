@@ -792,6 +792,28 @@ impl TaxiNet {
         )
     }
 
+    /// Whether a departure from `ident` (an end of `strip`) can get onto
+    /// the strip on its threshold's half. `true` when the network cannot
+    /// say (no runway nodes of its own): thin data never vetoes a runway.
+    /// LEMD 18R (2026-10-05): its only ways on are at the 36L end.
+    pub fn departure_end_enterable(&self, strip: &Runway, ident: &str) -> bool {
+        let (lat, lon) = if strip.ident_a == ident {
+            (strip.lat_a, strip.lon_a)
+        } else {
+            (strip.lat_b, strip.lon_b)
+        };
+        let taxiway_nodes: std::collections::HashSet<i64> = self
+            .edges
+            .iter()
+            .filter(|e| !e.runway)
+            .flat_map(|e| [e.a, e.b])
+            .collect();
+        !matches!(
+            self.runway_entrance_near(lat, lon, &taxiway_nodes, Some(strip)),
+            Entrance::Backtrack(_)
+        )
+    }
+
     /// Plan the drive OFF the runway we have just landed on.
     ///
     /// The arrival mirror of `plan_to_runway`, and it reuses that work rather
@@ -1202,10 +1224,13 @@ impl TaxiNet {
         // drawn lead-on exists to close. Across the whole apt.dat this is a
         // class, not a field: 3,498 of 21,656 runway ends snap to a
         // non-entrance, 551 of them badly (EFHK 04R, ENBO 07, ESNN 34).
-        let goal = to_runway
+        let goal = match to_runway
             .then(|| self.runway_entrance_near(to_lat, to_lon, &taxiway_nodes, strip))
-            .flatten()
-            .or_else(|| snap_within(to_lat, to_lon, &taxiway_nodes))?;
+        {
+            Some(Entrance::Node(n) | Entrance::Backtrack(n)) => Some(n),
+            _ => None,
+        }
+        .or_else(|| snap_within(to_lat, to_lon, &taxiway_nodes))?;
         if start == goal {
             // For a RUNWAY destination this is genuinely nothing to do: we are
             // already at the entrance the clearance would send us to.
@@ -1503,7 +1528,7 @@ impl TaxiNet {
         lon: f64,
         taxiway_nodes: &std::collections::HashSet<i64>,
         strip: Option<&Runway>,
-    ) -> Option<i64> {
+    ) -> Entrance {
         let m_per_deg_lat = 111_320.0;
         let m_per_deg_lon = 111_320.0 * lat.to_radians().cos();
         let mut runway_nodes: std::collections::HashSet<i64> = std::collections::HashSet::new();
@@ -1512,7 +1537,7 @@ impl TaxiNet {
             runway_nodes.insert(e.b);
         }
         if runway_nodes.is_empty() {
-            return None;
+            return Entrance::Unknown;
         }
         // How far from the threshold an entrance may be. With the strip
         // known, anywhere along it: its own entrance, however far up, beats
@@ -1520,6 +1545,7 @@ impl TaxiNet {
         // 8.9 km of lakebed with no entrance within 3 km of the end, and the
         // plain snap sent the route to 07C/25C).
         let mut reach_m: f64 = 3000.0;
+        let mut departure_half: Option<std::collections::HashSet<i64>> = None;
         // Ours, by geometry. The margin is the pavement's own half-width plus
         // a shoulder for an author whose node sits off the painted edge; the
         // along-track window is the strip's length plus the same, so a node
@@ -1561,6 +1587,24 @@ impl TaxiNet {
                 .flat_map(|e| [e.a, e.b])
                 .collect();
             if !ours.is_empty() {
+                // The threshold's half: a node no further along the strip
+                // from the threshold than its midpoint.
+                let along = |p: (f64, f64)| {
+                    let d = haversine_nm(r.lat_a, r.lon_a, p.0, p.1) * 1852.0;
+                    let brg = bearing_deg(r.lat_a, r.lon_a, p.0, p.1);
+                    d * sim::angles::signed_diff_deg(brg, course).to_radians().cos()
+                };
+                let thr = along((lat, lon));
+                departure_half = Some(
+                    ours.iter()
+                        .copied()
+                        .filter(|id| {
+                            self.nodes
+                                .get(id)
+                                .is_some_and(|&p| (along(p) - thr).abs() <= length / 2.0)
+                        })
+                        .collect(),
+                );
                 runway_nodes = ours;
                 reach_m = reach_m.max(length + STRIP_NODE_SHOULDER_M);
             }
@@ -1572,15 +1616,6 @@ impl TaxiNet {
         // where 04/22's edge 38-66 runs onto it, node 38 on 04/22's
         // centreline won as "one hop from runway 29", the route was planned
         // to 04/22's entrance and its lead-on ended 122 m off 11/29.
-        let mut adjacent: std::collections::HashSet<i64> = std::collections::HashSet::new();
-        for e in self.edges.iter().filter(|e| !e.runway) {
-            if runway_nodes.contains(&e.a) {
-                adjacent.insert(e.b);
-            }
-            if runway_nodes.contains(&e.b) {
-                adjacent.insert(e.a);
-            }
-        }
         let dist_to = |id: &i64| {
             self.nodes.get(id).map(|&p| {
                 let dx = (p.1 - lon) * m_per_deg_lon;
@@ -1588,46 +1623,88 @@ impl TaxiNet {
                 dx.hypot(dy)
             })
         };
-        let entrance = taxiway_nodes
-            .iter()
-            .filter(|id| runway_nodes.contains(id) || adjacent.contains(id))
-            .filter_map(|id| dist_to(id).map(|d| (*id, d)))
-            .min_by(|x, y| x.1.total_cmp(&y.1))
-            .filter(|(_, d)| *d < reach_m)
-            .map(|(id, _)| id)?;
-        // A node one hop OFF the strip is where the stub starts, not where it
-        // meets the runway: the route goes on to the runway node it joins, so
-        // the hold-short trim finds the runway and the lead-on it leaves
-        // behind reaches the centreline. Ending at the hop, the lead-on
-        // stopped where the stub began. LIBP 04 (2026-09-26): taxiway D's
-        // first node beside the threshold (68 m off the centreline, 92 m from
-        // the numbers) beat the node where D meets the runway (on the
-        // centreline, 101 m up it), the lead-on ran from the hold to 68 m
-        // off, the line-up refused it as `junction_off_the_runway`, and two
-        // 737s drove the synthetic 135-degree corner instead, 6.7 and 7.5 m
-        // past the centreline.
-        if runway_nodes.contains(&entrance) {
-            return Some(entrance);
-        }
-        let joins = self
-            .edges
-            .iter()
-            .filter(|e| !e.runway)
-            .filter_map(|e| {
-                if e.a == entrance {
-                    Some(e.b)
-                } else if e.b == entrance {
-                    Some(e.a)
-                } else {
-                    None
+        // The entrance among `entry` (runway nodes) nearest the threshold.
+        // Only a way ON counts: a oneway taxiway edge leading off the strip
+        // is an exit, and a node reached only by one is reached only along
+        // the runway. LEMD 18R (2026-10-05): every stub at the 18R end is
+        // oneway outbound, the threshold node won, the route rode 3.7 km of
+        // runway from Z6 and the zone trim left the hold at the 36L end.
+        let pick = |entry: &std::collections::HashSet<i64>| -> Option<i64> {
+            let mut onto: std::collections::HashSet<i64> = std::collections::HashSet::new();
+            let mut adjacent: std::collections::HashSet<i64> = std::collections::HashSet::new();
+            for e in self.edges.iter().filter(|e| !e.runway) {
+                if entry.contains(&e.b) {
+                    onto.insert(e.b);
+                    adjacent.insert(e.a);
                 }
-            })
-            .filter(|n| runway_nodes.contains(n))
-            .filter_map(|n| dist_to(&n).map(|d| (n, d)))
-            .min_by(|x, y| x.1.total_cmp(&y.1))
-            .map(|(n, _)| n);
-        Some(joins.unwrap_or(entrance))
+                if entry.contains(&e.a) && !e.oneway {
+                    onto.insert(e.a);
+                    adjacent.insert(e.b);
+                }
+            }
+            let entrance = taxiway_nodes
+                .iter()
+                .filter(|id| onto.contains(id) || adjacent.contains(id))
+                .filter_map(|id| dist_to(id).map(|d| (*id, d)))
+                .min_by(|x, y| x.1.total_cmp(&y.1))
+                .filter(|(_, d)| *d < reach_m)
+                .map(|(id, _)| id)?;
+            // A node one hop OFF the strip is where the stub starts, not
+            // where it meets the runway: the route goes on to the runway node
+            // it joins, so the hold-short trim finds the runway and the
+            // lead-on it leaves behind reaches the centreline. Ending at the
+            // hop, the lead-on stopped where the stub began. LIBP 04
+            // (2026-09-26): taxiway D's first node beside the threshold (68 m
+            // off the centreline, 92 m from the numbers) beat the node where
+            // D meets the runway (on the centreline, 101 m up it), the
+            // lead-on ran from the hold to 68 m off, the line-up refused it
+            // as `junction_off_the_runway`, and two 737s drove the synthetic
+            // 135-degree corner instead, 6.7 and 7.5 m past the centreline.
+            if runway_nodes.contains(&entrance) {
+                return Some(entrance);
+            }
+            let joins = self
+                .edges
+                .iter()
+                .filter(|e| !e.runway)
+                .filter_map(|e| {
+                    if e.a == entrance {
+                        Some(e.b)
+                    } else if e.b == entrance && !e.oneway {
+                        Some(e.a)
+                    } else {
+                        None
+                    }
+                })
+                .filter(|n| entry.contains(n))
+                .filter_map(|n| dist_to(&n).map(|d| (n, d)))
+                .min_by(|x, y| x.1.total_cmp(&y.1))
+                .map(|(n, _)| n);
+            Some(joins.unwrap_or(entrance))
+        };
+        // A departure enters on its threshold's half of the strip; with no
+        // way on there, the nearest way on anywhere is a BACKTRACK from it,
+        // never a ride along the runway to the numbers.
+        match departure_half {
+            Some(half) => match pick(&half) {
+                Some(n) => Entrance::Node(n),
+                None => pick(&runway_nodes).map_or(Entrance::Unknown, Entrance::Backtrack),
+            },
+            None => pick(&runway_nodes).map_or(Entrance::Unknown, Entrance::Node),
+        }
     }
+}
+
+/// What [`TaxiNet::runway_entrance_near`] found for a runway destination.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Entrance {
+    /// A way on at the threshold's half of the strip (or anywhere, with the
+    /// strip unknown).
+    Node(i64),
+    /// The only way on is on the far half: the departure backtracks from it.
+    Backtrack(i64),
+    /// No way on modelled: the plain nearest-node snap.
+    Unknown,
 }
 
 /// How far off a strip's pavement a 1201 node may sit and still be read as a
