@@ -5106,7 +5106,7 @@ pub fn flap_within_limits(wanted: f64, ias_kts: f64, limits: &[(f64, Option<f64>
 }
 
 /// A detent goes out only with this much room under its placard...
-const FLAP_EXTEND_MARGIN_KTS: f64 = 5.0;
+pub(crate) const FLAP_EXTEND_MARGIN_KTS: f64 = 5.0;
 /// ...and one already out comes back in only this far over it.
 const FLAP_RETRACT_MARGIN_KTS: f64 = 8.0;
 
