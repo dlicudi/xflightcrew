@@ -264,6 +264,16 @@ fn plan_landing_need_m(landing_ft: Option<f64>, takeoff_ft: Option<f64>) -> Opti
     crate::aircraft::planned_landing_needed_ft(landing_ft, takeoff_ft).map(|ft| ft * 0.3048)
 }
 
+/// The resume's climb before the join, said: north is "360", never "000"
+/// (`autopilot::spoken_heading`, the bug's own words).
+fn climb_first_words(alt_ft: f64, heading_mag: f64) -> String {
+    format!(
+        "Climbing to {} first, heading {}, the safe altitude on the way. ",
+        crate::flightplan::spoken_feet(alt_ft),
+        crate::tools::autopilot::spoken_heading(heading_mag)
+    )
+}
+
 /// The resume's refusal when a climb first needs a heading and the magnetic
 /// variation did not read.
 pub const NO_VARIATION: &str = "I can't read the magnetic variation, so I can't set a heading for \
@@ -1129,11 +1139,7 @@ impl FullAuto {
             }
         };
         let climb_words = match (&climb_leg, climb_heading_mag) {
-            (Some(l), Some(h)) => format!(
-                "Climbing to {} first, heading {:03}, the safe altitude on the way. ",
-                crate::flightplan::spoken_feet(l.alt1_ft.unwrap_or(0.0)),
-                (h.round() as i64).rem_euclid(360)
-            ),
+            (Some(l), Some(h)) => climb_first_words(l.alt1_ft.unwrap_or(0.0), h),
             _ => String::new(),
         };
         let lead = if fetched {
@@ -2034,6 +2040,13 @@ mod tests {
     /// The planner's runway need is the arm's: an airframe that recites only
     /// a takeoff distance is still checked (the live landing figure alone
     /// left it unchecked), and one reciting neither is not.
+    #[test]
+    fn the_climb_first_says_north_as_three_six_zero() {
+        assert!(climb_first_words(6_000.0, 0.4).contains("heading 360,"));
+        assert!(climb_first_words(6_000.0, 359.6).contains("heading 360,"));
+        assert!(climb_first_words(6_000.0, 45.0).contains("heading 045,"));
+    }
+
     #[test]
     fn the_recovery_runway_need_is_the_arms() {
         let only_takeoff = plan_landing_need_m(None, Some(3_000.0)).expect("checked");

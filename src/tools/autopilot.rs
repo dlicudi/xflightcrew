@@ -955,7 +955,7 @@ impl Tool for SetHeading {
 /// Format a heading for readback: rounded to the degree, three digits, and
 /// NORTH spoken as 360 — a heading bug reads "three six zero", never
 /// "zero zero zero" ("turn heading north" read back "bug to 000", 2026-07-12).
-fn spoken_heading(deg: f64) -> String {
+pub(crate) fn spoken_heading(deg: f64) -> String {
     let d = (deg.round() as i64).rem_euclid(360);
     format!("{:03}", if d == 0 { 360 } else { d })
 }

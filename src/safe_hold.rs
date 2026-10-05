@@ -1076,7 +1076,7 @@ pub fn hold_line(cmd: &HoldCmd, escape: bool, cause: &str) -> String {
     let feet = crate::flightplan::spoken_feet(cmd.alt_ft);
     let heading = cmd
         .heading_mag
-        .map(|h| format!(", heading {}", spoken_heading(h)))
+        .map(|h| format!(", heading {}", crate::tools::autopilot::spoken_heading(h)))
         .unwrap_or_default();
     let lead = match (escape, cmd.climb, cause) {
         (true, _, _) => "Terrain!".to_string(),
@@ -1090,11 +1090,6 @@ pub fn hold_line(cmd: &HoldCmd, escape: bool, cause: &str) -> String {
         format!("Levelling at {feet}, the safe altitude here{heading}")
     };
     format!("{lead} {what}. Say fly the flight plan, or my controls.")
-}
-
-fn spoken_heading(deg: f64) -> String {
-    let d = (deg.round() as i64).rem_euclid(360);
-    format!("{:03}", if d == 0 { 360 } else { d })
 }
 
 fn r0(v: f64) -> f64 {
