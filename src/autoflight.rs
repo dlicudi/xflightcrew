@@ -759,7 +759,8 @@ pub fn reconcile(want: Want, read: ModeRead) -> Vec<Button> {
         }
         Some(Lateral::Coupled) => {
             // The localiser armed or captured owns the lateral; with neither
-            // (unread bitfield included) HDG is what flies until it arms.
+            // HDG is what flies until it arms. An unread bitfield is no
+            // measurement: nothing is pressed on it.
             let loc_owned = m.is_some_and(|m| m.loc_armed() || m.loc());
             if !loc_owned && m.is_some() && read.hdg_status.is_some_and(|s| s <= 0.5) {
                 out.push(Button::Heading);
@@ -786,11 +787,64 @@ pub fn reconcile(want: Want, read: ModeRead) -> Vec<Button> {
     out
 }
 
-/// Press what [`reconcile`] asks, each on the tape.
-pub async fn apply(xp: &dyn XPlane, presses: &[Button], site: &str) {
+/// Press what [`reconcile`] asks, in order, each on the tape. `false` when
+/// any press did not go out (every one is still tried).
+pub async fn apply(xp: &dyn XPlane, presses: &[Button], site: &str) -> bool {
+    let mut all = true;
     for b in presses {
-        press_logged(xp, *b, site).await;
+        all &= press_logged(xp, *b, site).await;
     }
+    all
+}
+
+/// What [`bring`] pressed, and whether every press went out.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Applied {
+    pub presses: Vec<Button>,
+    pub sent: bool,
+}
+
+impl Applied {
+    /// `b` was pressed (sent or not).
+    pub fn pressed(&self, b: Button) -> bool {
+        self.presses.contains(&b)
+    }
+}
+
+/// [`reconcile`] the intent against the modes read, then [`apply`] it: the
+/// one door a loop's mode presses go through.
+pub async fn bring(xp: &dyn XPlane, want: Want, read: ModeRead, site: &str) -> Applied {
+    let presses = reconcile(want, read);
+    let sent = apply(xp, &presses, site).await;
+    Applied { presses, sent }
+}
+
+/// [`bring`] HDG SEL alone, from its status read (`None`: unread, nothing
+/// pressed).
+pub async fn bring_heading(xp: &dyn XPlane, hdg_status: Option<f64>, site: &str) -> Applied {
+    let want = Want {
+        lateral: Some(Lateral::Heading),
+        vertical: None,
+    };
+    let read = ModeRead {
+        hdg_status,
+        ..Default::default()
+    };
+    bring(xp, want, read, site).await
+}
+
+/// [`bring`] V/S alone, from its status read (`None`: unread, nothing
+/// pressed).
+pub async fn bring_vs(xp: &dyn XPlane, vs_status: Option<f64>, site: &str) -> Applied {
+    let want = Want {
+        lateral: None,
+        vertical: Some(Vertical::Vs),
+    };
+    let read = ModeRead {
+        vs_status,
+        ..Default::default()
+    };
+    bring(xp, want, read, site).await
 }
 
 // ---------------------------------------------------------------------------
@@ -1241,6 +1295,79 @@ mod tests {
         assert!(
             bad.is_empty(),
             "MCP access outside crate::autoflight:\n{}",
+            bad.join("\n")
+        );
+    }
+
+    /// The circuit, the follower, the takeoff, full auto and the enroute
+    /// setup press their MODES only through the intent (`bring`,
+    /// `reconcile` and `apply`), never a mode button of their own: a mode
+    /// press that reads nothing, or reads it its own way, is how autoland's
+    /// housekeeping pressed over the 737's captures (#81). The one exception
+    /// left is the pattern guard's hand-back, owed a flight.
+    #[test]
+    fn loop_mode_presses_go_through_reconcile() {
+        const FILES: [&str; 5] = [
+            "circuit.rs",
+            "procedure.rs",
+            "autotakeoff.rs",
+            "full_auto.rs",
+            "tools/setup_enroute.rs",
+        ];
+        const MODES: [&str; 7] = [
+            "Button::Heading)",
+            "Button::Heading,",
+            "Button::VerticalSpeed",
+            "Button::AltitudeHold",
+            "Button::LevelChange",
+            "Button::Approach",
+            "Button::Gpss",
+        ];
+        const CALLS: [&str; 3] = [
+            "autoflight::press(",
+            "autoflight::press_logged(",
+            "autoflight::ensure_on(",
+        ];
+        // (file, call, how many): presses not yet on the intent, each with
+        // its reason. `circuit::give_up_pattern`'s VS: a hand-back, owed a
+        // flight before it moves.
+        const LEFT: [(&str, &str, usize); 1] = [(
+            "circuit.rs",
+            "autoflight::press(xp, Button::VerticalSpeed)",
+            1,
+        )];
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut bad = Vec::new();
+        for rel in FILES {
+            let text = std::fs::read_to_string(root.join(rel)).unwrap();
+            let production = text.split("#[cfg(test)]\nmod ").next().unwrap();
+            let lines: Vec<&str> = production
+                .lines()
+                .map(|l| l.split("//").next().unwrap_or(""))
+                .collect();
+            let mut found: Vec<String> = Vec::new();
+            for (i, l) in lines.iter().enumerate() {
+                if !CALLS.iter().any(|c| l.contains(c)) {
+                    continue;
+                }
+                // The call's statement: a press split over lines included.
+                let stmt = lines[i..(i + 4).min(lines.len())].join(" ");
+                let stmt = stmt.split(';').next().unwrap_or("");
+                if MODES.iter().any(|m| stmt.contains(m)) {
+                    found.push(l.trim().to_string());
+                    if !LEFT.iter().any(|(f, c, _)| *f == rel && l.contains(c)) {
+                        bad.push(format!("{rel}:{}: {}", i + 1, l.trim()));
+                    }
+                }
+            }
+            for (f, c, n) in LEFT.iter().filter(|(f, _, _)| *f == rel) {
+                let got = found.iter().filter(|l| l.contains(c)).count();
+                assert_eq!(got, *n, "{f}: `{c}` left {got} times, expected {n}");
+            }
+        }
+        assert!(
+            bad.is_empty(),
+            "a loop's mode press outside the intent:\n{}",
             bad.join("\n")
         );
     }

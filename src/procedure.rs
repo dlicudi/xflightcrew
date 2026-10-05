@@ -2959,9 +2959,8 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, plan: Pla
     // The follower carries no `ApConfig`: the live airframe's FD list.
     let ap_fd = crate::ap_engage::fd_commands();
     crate::ap_engage::press_logged(&xp, &ap_fd, "procedure", "seed", 1).await;
-    if xp.get_float(HDG_STATUS).await.is_ok_and(|v| v <= 0.5) {
-        let _ = autoflight::press(&xp, Button::Heading).await;
-    }
+    let hdg_seed = xp.get_float(HDG_STATUS).await.ok();
+    autoflight::bring_heading(&xp, hdg_seed, "procedure_seed").await;
     let mut servo_watch = crate::ap_engage::ServoWatch::default();
     // What we COMMANDED last tick, a different thing from the leg constraint
     // carried across unconstrained fixes, and the pacing `descent_target_ft`
@@ -3812,8 +3811,10 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, plan: Pla
         if st.confirmed_now {
             crate::ap_engage::record_engaged("procedure", "lateral", st.try_n);
         }
-        if hdg_st <= 0.5 {
-            let _ = autoflight::press(&xp, Button::Heading).await;
+        if autoflight::bring_heading(&xp, Some(hdg_st), "procedure_lateral")
+            .await
+            .pressed(Button::Heading)
+        {
             crate::blackbox::record(
                 "procedure",
                 serde_json::json!({"event": "reengage_lateral", "idx": idx}),
@@ -4283,7 +4284,10 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, plan: Pla
         };
         if action == VsAction::Engage {
             last_vs_cmd = None; // engage can sync the dial even if the response is lost
-            if autoflight::press(&xp, Button::VerticalSpeed).await.is_err() {
+            if !autoflight::bring_vs(&xp, Some(vs_st), "procedure_vs")
+                .await
+                .sent
+            {
                 continue;
             }
             if xp.get_float(VS_STATUS).await.is_ok_and(|v| v > 0.5) {

@@ -2249,12 +2249,15 @@ async fn hold_clear_of_terrain(
         // Modes re-engaged only when their status reads off, the dial
         // rewritten after (an engage syncs it away). The capture at the
         // hold is ALT HOLD, not a dropped VS mode.
-        if hdg_st.is_ok_and(|v| v <= 0.5) {
-            let _ = autoflight::press(xp, Button::Heading).await;
+        let hdg = autoflight::bring_heading(xp, hdg_st.ok(), "circuit_terrain_hold").await;
+        if hdg.pressed(Button::Heading) {
             write_bug(xp, bug_mag).await;
         }
-        if vs_st.is_ok_and(|v| v <= 0.5) && hold.alt_ft - alt > crate::reversal::HOLD_LEVEL_FT {
-            let _ = autoflight::press(xp, Button::VerticalSpeed).await;
+        if hold.alt_ft - alt > crate::reversal::HOLD_LEVEL_FT
+            && autoflight::bring_vs(xp, vs_st.ok(), "circuit_terrain_hold")
+                .await
+                .pressed(Button::VerticalSpeed)
+        {
             last_vs = None;
         }
         let ias = ias_r.ok().filter(|v| v.is_finite());
@@ -3526,7 +3529,8 @@ async fn fly_authored_route(
             continue;
         };
         let alt_msl_ft = elev_r.map(|m| m * M_TO_FT).unwrap_or(f64::NAN);
-        let (hdg_on, vs_on) = (hdg_st.unwrap_or(1.0) > 0.5, vs_st.unwrap_or(1.0) > 0.5);
+        let (hdg_read, vs_read) = (hdg_st.ok(), vs_st.ok());
+        let (hdg_on, vs_on) = (hdg_read.unwrap_or(1.0) > 0.5, vs_read.unwrap_or(1.0) > 0.5);
         // Position in the departure-runway frame (along the takeoff course
         // from the threshold, right positive) — the authored waypoints' frame.
         let a_m = -along_track_nm(lat, lon, &rwy) * M_PER_NM;
@@ -3592,9 +3596,7 @@ async fn fly_authored_route(
             "authored",
         )
         .await;
-        if !hdg_on {
-            let _ = autoflight::press(&xp, Button::Heading).await;
-        }
+        autoflight::bring_heading(&xp, hdg_read, "circuit_authored").await;
 
         // Airspeed trend first: both the climb limiter and the throttle law
         // judge the speed they are heading for.
@@ -3635,8 +3637,10 @@ async fn fly_authored_route(
             last_vs_cmd = None;
             vs_refused = None;
         } else {
-            if !vs_on {
-                let _ = autoflight::press(&xp, Button::VerticalSpeed).await;
+            if autoflight::bring_vs(&xp, vs_read, "circuit_authored")
+                .await
+                .pressed(Button::VerticalSpeed)
+            {
                 last_vs_cmd = None;
             }
             if last_vs_cmd.is_none_or(|v| (v - vs_cmd).abs() > 40.0) {
@@ -4578,7 +4582,8 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, p: Params
         };
         let agl_ft = agl_m.unwrap_or(0.0) * M_TO_FT;
         let alt_msl_ft = elev_m.map(|m| m * M_TO_FT).unwrap_or(f64::NAN);
-        let (hdg_on, vs_on) = (hdg_st.unwrap_or(1.0) > 0.5, vs_st.unwrap_or(1.0) > 0.5);
+        let (hdg_read, vs_read) = (hdg_st.ok(), vs_st.ok());
+        let (hdg_on, vs_on) = (hdg_read.unwrap_or(1.0) > 0.5, vs_read.unwrap_or(1.0) > 0.5);
         // Position in the departure-runway frame: along the takeoff direction
         // (negative on the approach side) and cross-track (right positive).
         let a_m = -along_track_nm(lat, lon, &rwy) * M_PER_NM;
@@ -4863,9 +4868,7 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, p: Params
             "rectangle",
         )
         .await;
-        if !hdg_on {
-            let _ = autoflight::press(&xp, Button::Heading).await;
-        }
+        autoflight::bring_heading(&xp, hdg_read, "circuit_rectangle").await;
 
         // Forward terrain floor, every ~2 s: the ground under us and along
         // the ground track ahead (the follower's own probe geometry,
@@ -5192,9 +5195,12 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, p: Params
             last_vs_cmd = None;
             vs_refused = None;
         } else {
-            if !vs_on {
-                let _ = autoflight::press(&xp, Button::VerticalSpeed).await;
-                last_vs_cmd = None; // engage synced the dial; force a rewrite
+            if autoflight::bring_vs(&xp, vs_read, "circuit_rectangle")
+                .await
+                .pressed(Button::VerticalSpeed)
+            {
+                // The engage synced the dial: a rewrite is forced.
+                last_vs_cmd = None;
                 // A vertical mode engaged: its authority is checked afresh.
                 if let Some(vs) = climb_watch.vs_fpm() {
                     crate::climb_watch::arm_authority("circuit", vs, vs_cmd);

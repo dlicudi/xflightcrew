@@ -2720,12 +2720,16 @@ async fn engage_climb(
             return false;
         }
     }
-    if heading <= 0.5 && autoflight::press(xp, Button::Heading).await.is_err() {
+    if !autoflight::bring_heading(xp, Some(heading), "autotakeoff_climb")
+        .await
+        .sent
+    {
         return false;
     }
-    if vertical <= 0.5 {
+    let vs_mode = autoflight::bring_vs(xp, Some(vertical), "autotakeoff_climb").await;
+    if vs_mode.pressed(Button::VerticalSpeed) {
         *last = None; // a mode change synchronises the dial
-        if autoflight::press(xp, Button::VerticalSpeed).await.is_err() {
+        if !vs_mode.sent {
             return false;
         }
     }
