@@ -3536,3 +3536,40 @@
         assert!(!d.stuck(149.0) && !d.stuck(150.0), "50 s held, 50 s more");
         assert!(d.stuck(151.0));
     }
+
+    /// A route that doubles back (LFRG 12, 2026-10-05: down the strip, a
+    /// turn-round, back up it) jumps its projection ahead at the turn and
+    /// back: neither is ground, and the drive back up the strip IS.
+    #[test]
+    fn a_projection_jump_is_neither_progress_nor_a_stall() {
+        let mut w = ProgressWatch::start(0.0, 5000.0);
+        let mut t = 0.0;
+        let mut p = 1340.0;
+        // Rolling at 5 m/s, a reading every quarter second.
+        while p < 1386.0 {
+            w.note(p, t);
+            p += 1.25;
+            t += 0.25;
+        }
+        // The turn-round: 300 m ahead for 24 s, then back to the return leg.
+        for _ in 0..96 {
+            w.note(1688.0, t);
+            t += 0.25;
+        }
+        let mut p = 1414.0;
+        // Back up the strip at 2.5 m/s for 130 s: well past the 120 s window.
+        for _ in 0..520 {
+            w.note(p, t);
+            assert!(!w.stuck(t), "t {t}: {:.0} s", w.stalled_s(t));
+            p += 0.625;
+            t += 0.25;
+        }
+        // Standing still after a jump is still a stall.
+        let mut s = ProgressWatch::start(0.0, 5000.0);
+        s.note(100.0, 0.0);
+        s.note(400.0, 0.25);
+        for k in 0..600 {
+            s.note(400.0, 0.5 + 0.25 * k as f64);
+        }
+        assert!(s.stuck(150.0));
+    }

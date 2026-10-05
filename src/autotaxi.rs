@@ -463,6 +463,12 @@ pub fn forget_arrival() {
 pub const DRIVE_NO_PROGRESS_S: f64 = 120.0;
 /// What counts as ground gained along the route, m.
 pub const PROGRESS_STEP_M: f64 = 20.0;
+/// A change of along-route progress past this, plus [`PROJECTION_JUMP_MPS`]
+/// for the time between the two readings, is a re-projection (a route that
+/// doubles back on itself, a facing pick), never ground made or lost.
+pub const PROJECTION_JUMP_M: f64 = 40.0;
+/// No taxi makes ground faster than this, m/s (about 58 kt).
+pub const PROJECTION_JUMP_MPS: f64 = 30.0;
 /// The route's own deadline: the whole length at half the pace, plus two
 /// minutes, with every excused hold added on. 4,661 m at 10 kt: 1,932 s.
 pub fn route_deadline_s(total_m: f64, base_kts: f64) -> f64 {
@@ -479,6 +485,9 @@ pub struct ProgressWatch {
     /// When the route's deadline falls, and the last time seen.
     deadline: Option<f64>,
     last_t: Option<f64>,
+    /// The last progress noted and when, to tell a re-projection from a
+    /// movement.
+    last_p: Option<(f64, f64)>,
 }
 
 impl ProgressWatch {
@@ -488,10 +497,27 @@ impl ProgressWatch {
             best: Some((f64::NEG_INFINITY, t_s)),
             deadline: Some(t_s + deadline_s),
             last_t: Some(t_s),
+            last_p: None,
         }
     }
     pub fn note(&mut self, progress_m: f64, t_s: f64) {
         self.last_t = Some(t_s);
+        let jumped = self.last_p.is_some_and(|(p, t)| {
+            (progress_m - p).abs() > PROJECTION_JUMP_M + PROJECTION_JUMP_MPS * (t_s - t).max(0.0)
+        });
+        self.last_p = Some((progress_m, t_s));
+        if jumped {
+            // The projection moved, not the aircraft: measure on from the
+            // new answer, the clock NOT restarted (it is no ground made).
+            // LFRG 12 (2026-10-05): the line-up's turn-round at the end of
+            // a down-and-back route jumped 300 m ahead and back, the best
+            // stayed 300 m ahead, and the drive back up the strip at 10 kt
+            // read "no progress" until full auto gave it up 25 m short.
+            if let Some((b, _)) = self.best.as_mut() {
+                *b = progress_m;
+            }
+            return;
+        }
         match self.best {
             Some((b, _)) if progress_m < b + PROGRESS_STEP_M => {}
             _ => self.best = Some((progress_m, t_s)),
@@ -524,6 +550,7 @@ static PROGRESS: std::sync::Mutex<ProgressWatch> = std::sync::Mutex::new(Progres
     best: None,
     deadline: None,
     last_t: None,
+    last_p: None,
 });
 static EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
 
@@ -544,6 +571,7 @@ fn progress_rebase() {
         let t = clock_s();
         w.best = Some((f64::NEG_INFINITY, t));
         w.last_t = Some(t);
+        w.last_p = None;
     }
 }
 
