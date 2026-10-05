@@ -191,3 +191,59 @@ pub fn runway_frame_m(
     let rel = (brg - (course_deg + 180.0)).to_radians();
     (d_m * rel.sin(), d_m * rel.cos())
 }
+
+/// A position against a strip's own centreline, flat earth from end A at
+/// 111,320 m a degree, the longitude scaled at `ref_lat` (each caller keeps
+/// its own: the position's or end A's). Raw products, so every caller's
+/// arithmetic stays as it was: `dot` is the position along A to B times the
+/// strip's length, `cross` the distance off the line times it (unsigned),
+/// `len2` the length squared.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct StripFrame {
+    pub dot: f64,
+    pub cross: f64,
+    pub len2: f64,
+}
+
+impl StripFrame {
+    /// The strip's length, metres.
+    pub fn len_m(&self) -> f64 {
+        self.len2.sqrt()
+    }
+    /// Metres from end A along the centreline (negative short of it).
+    pub fn along_m(&self) -> f64 {
+        self.dot / self.len_m()
+    }
+    /// Metres off the centreline, either side.
+    pub fn cross_m(&self) -> f64 {
+        self.cross / self.len_m()
+    }
+    /// The fraction of the way from end A to end B.
+    pub fn t(&self) -> f64 {
+        self.dot / self.len2
+    }
+}
+
+/// `(lat, lon)` in `r`'s [`StripFrame`], `None` for a degenerate row (under
+/// a metre long). Pure.
+pub fn strip_frame(r: &Runway, lat: f64, lon: f64, ref_lat: f64) -> Option<StripFrame> {
+    let m_per_deg_lat = 111_320.0;
+    let m_per_deg_lon = 111_320.0 * ref_lat.to_radians().cos();
+    let (px, py) = (
+        (lon - r.lon_a) * m_per_deg_lon,
+        (lat - r.lat_a) * m_per_deg_lat,
+    );
+    let (bx, by) = (
+        (r.lon_b - r.lon_a) * m_per_deg_lon,
+        (r.lat_b - r.lat_a) * m_per_deg_lat,
+    );
+    let len2 = bx * bx + by * by;
+    if len2 < 1.0 {
+        return None;
+    }
+    Some(StripFrame {
+        dot: px * bx + py * by,
+        cross: (px * by - py * bx).abs(),
+        len2,
+    })
+}

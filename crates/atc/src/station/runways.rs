@@ -129,22 +129,10 @@ pub(crate) fn runway_occupancy_authorised(lat: f64, lon: f64, gs_kts: f64) -> bo
 /// [`on_active_runway`] and the per-runway traffic watches. Returns the
 /// spoken-able ident of the nearer end.
 pub(super) fn on_runway(r: &nav::Runway, lat: f64, lon: f64) -> Option<String> {
-    let m_per_deg_lat = 111_320.0;
-    let m_per_deg_lon = 111_320.0 * lat.to_radians().cos();
-    let (px, py) = (
-        (lon - r.lon_a) * m_per_deg_lon,
-        (lat - r.lat_a) * m_per_deg_lat,
-    );
-    let (bx, by) = (
-        (r.lon_b - r.lon_a) * m_per_deg_lon,
-        (r.lat_b - r.lat_a) * m_per_deg_lat,
-    );
-    let len2 = bx * bx + by * by;
-    if len2 < 1.0 {
-        return None; // degenerate row
-    }
-    let t = (px * bx + py * by) / len2;
-    let cross_m = (px * by - py * bx).abs() / len2.sqrt();
+    // Scaled at the position's latitude; a degenerate row is nowhere.
+    let f = nav::strip_frame(r, lat, lon, lat)?;
+    let t = f.t();
+    let cross_m = f.cross_m();
     let half_width = if r.width_m > 1.0 {
         r.width_m / 2.0 + RUNWAY_EDGE_SLACK_M
     } else {

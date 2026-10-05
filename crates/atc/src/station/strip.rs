@@ -143,16 +143,9 @@ pub(super) fn strip_half_width_m(r: &nav::Runway) -> f64 {
 /// the `ident_a` end, metres off the centreline). Issue #162: "on the
 /// runway" is the pavement, never the strip's area or its hold line.
 pub(crate) fn on_runway_pavement(r: &nav::Runway, lat: f64, lon: f64) -> Option<(f64, f64)> {
-    let m_lat = 111_320.0;
-    let m_lon = 111_320.0 * r.lat_a.to_radians().cos();
-    let (px, py) = ((lon - r.lon_a) * m_lon, (lat - r.lat_a) * m_lat);
-    let (bx, by) = ((r.lon_b - r.lon_a) * m_lon, (r.lat_b - r.lat_a) * m_lat);
-    let len = (bx * bx + by * by).sqrt();
-    if len < 1.0 {
-        return None;
-    }
-    let along = (px * bx + py * by) / len;
-    let cross = (px * by - py * bx).abs() / len;
+    // Scaled at end A's latitude.
+    let f = nav::strip_frame(r, lat, lon, r.lat_a)?;
+    let (len, along, cross) = (f.len_m(), f.along_m(), f.cross_m());
     ((-OCCUPANT_END_M..=len + OCCUPANT_END_M).contains(&along) && cross <= strip_half_width_m(r))
         .then_some((along, cross))
 }
@@ -891,4 +884,103 @@ pub fn landing_hold_tick(targets: &[TcasTarget], on_ground: bool, now: Instant) 
         .lock()
         .unwrap_or_else(|e| e.into_inner()) = Some((hold.runway.clone(), hold.line.clone()));
     Some(hold.line)
+}
+
+#[cfg(test)]
+mod strip_frame_tests {
+    use super::*;
+
+    /// The two strip tests before they shared `nav::strip_frame`, verbatim:
+    /// the shared frame must give each the same answer to the bit.
+    fn old_on_runway(r: &nav::Runway, lat: f64, lon: f64) -> Option<String> {
+        let m_per_deg_lat = 111_320.0;
+        let m_per_deg_lon = 111_320.0 * lat.to_radians().cos();
+        let (px, py) = (
+            (lon - r.lon_a) * m_per_deg_lon,
+            (lat - r.lat_a) * m_per_deg_lat,
+        );
+        let (bx, by) = (
+            (r.lon_b - r.lon_a) * m_per_deg_lon,
+            (r.lat_b - r.lat_a) * m_per_deg_lat,
+        );
+        let len2 = bx * bx + by * by;
+        if len2 < 1.0 {
+            return None;
+        }
+        let t = (px * bx + py * by) / len2;
+        let cross_m = (px * by - py * bx).abs() / len2.sqrt();
+        let half_width = if r.width_m > 1.0 {
+            r.width_m / 2.0 + RUNWAY_EDGE_SLACK_M
+        } else {
+            RUNWAY_HALF_WIDTH_M
+        };
+        if (-0.02..=1.02).contains(&t) && cross_m <= half_width {
+            let ident = if t < 0.5 { &r.ident_a } else { &r.ident_b };
+            return Some(ident.clone());
+        }
+        None
+    }
+
+    fn old_on_pavement(r: &nav::Runway, lat: f64, lon: f64) -> Option<(f64, f64)> {
+        let m_lat = 111_320.0;
+        let m_lon = 111_320.0 * r.lat_a.to_radians().cos();
+        let (px, py) = ((lon - r.lon_a) * m_lon, (lat - r.lat_a) * m_lat);
+        let (bx, by) = ((r.lon_b - r.lon_a) * m_lon, (r.lat_b - r.lat_a) * m_lat);
+        let len = (bx * bx + by * by).sqrt();
+        if len < 1.0 {
+            return None;
+        }
+        let along = (px * bx + py * by) / len;
+        let cross = (px * by - py * bx).abs() / len;
+        ((-OCCUPANT_END_M..=len + OCCUPANT_END_M).contains(&along)
+            && cross <= strip_half_width_m(r))
+        .then_some((along, cross))
+    }
+
+    fn rwy(a: &str, b: &str, la: (f64, f64), lb: (f64, f64), width_m: f64) -> nav::Runway {
+        nav::Runway {
+            ident_a: a.into(),
+            ident_b: b.into(),
+            lat_a: la.0,
+            lon_a: la.1,
+            lat_b: lb.0,
+            lon_b: lb.1,
+            width_m,
+            surface: 1,
+        }
+    }
+
+    #[test]
+    fn the_shared_strip_frame_answers_both_tests_to_the_bit() {
+        let strips = [
+            // LEMG 13/31, 12/30 (no width: the blanket capture), EGKK 08R/26L,
+            // a row one end on the other (degenerate).
+            rwy("13", "31", (36.6878, -4.5124), (36.6649, -4.4794), 45.0),
+            rwy("12", "30", (36.6905, -4.5063), (36.6683, -4.4747), 0.0),
+            rwy("08R", "26L", (51.1505, -0.2011), (51.1440, -0.1527), 45.0),
+            rwy("09", "27", (60.0, 10.0), (60.0, 10.0), 30.0),
+        ];
+        let mut on = 0;
+        for r in &strips {
+            let (la, lo) = ((r.lat_a + r.lat_b) / 2.0, (r.lon_a + r.lon_b) / 2.0);
+            for i in -12..=12 {
+                for j in -12..=12 {
+                    let lat = la + i as f64 * 0.0011;
+                    let lon = lo + j as f64 * 0.0013;
+                    let new = on_runway(r, lat, lon);
+                    assert_eq!(new, old_on_runway(r, lat, lon), "{} {lat} {lon}", r.ident_a);
+                    let p = on_runway_pavement(r, lat, lon);
+                    let q = old_on_pavement(r, lat, lon);
+                    assert_eq!(
+                        p.map(|(a, c)| (a.to_bits(), c.to_bits())),
+                        q.map(|(a, c)| (a.to_bits(), c.to_bits())),
+                        "{} {lat} {lon}",
+                        r.ident_a
+                    );
+                    on += usize::from(new.is_some()) + usize::from(p.is_some());
+                }
+            }
+        }
+        assert!(on > 20, "the grid must cross the strips ({on} hits)");
+    }
 }
