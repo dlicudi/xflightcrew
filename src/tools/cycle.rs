@@ -17,18 +17,11 @@ use std::time::Duration;
 
 use super::{Tool, ToolCtx};
 use crate::aircraft::{
-    CycleSelectorProfile, CycleSwitch, MixtureNotchProfile, PistonStartProfile, PowerSwitchProfile,
-    TurbineStartProfile,
+    throttle_dataref, CycleSelectorProfile, CycleSwitch, MixtureNotchProfile, PistonStartProfile,
+    PowerSwitchProfile, TurbineStartProfile,
 };
 
 /// Universal throttle (all engines), 0..1.
-/// The thrust lever THIS airframe obeys — not always the stock one (the
-/// Citation X tracks `throttle_jet_rev_ratio`, so every write to
-/// `throttle_ratio_all` went nowhere and it flew a whole pattern at takeoff
-/// thrust). Resolved per call, so a profile swap takes effect immediately.
-fn throttle_dref() -> String {
-    crate::aircraft::throttle_dataref()
-}
 /// Per-engine "is running" flags.
 const ENGN_RUNNING: &str = "sim/flightmodel/engine/ENGN_running";
 /// N1 at which the condition lever introduces fuel during a PT6 start (POM: crank
@@ -470,7 +463,7 @@ impl Tool for StartEngines {
         let on_ground = ctx.xplane.get_float(ON_GROUND_ANY).await.unwrap_or(1.0) > 0.5;
         if on_ground {
             ctx.xplane
-                .set_float(&throttle_dref(), self.start.throttle_crack)
+                .set_float(&throttle_dataref(), self.start.throttle_crack)
                 .await?;
         }
         ctx.xplane.run_command(&self.start.mags_both).await?;
