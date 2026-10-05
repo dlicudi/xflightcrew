@@ -189,7 +189,7 @@
     #[tokio::test(start_paused = true)]
     async fn the_plant_reproduces_the_lemg_reject() {
         let jet = RejectPlant::rolling_at_kts(69.2, 0.0);
-        jet.set_float(&throttle_dref(), 0.0).await.unwrap();
+        jet.set_float(&throttle_dataref(), 0.0).await.unwrap();
         jet.run_command_for(crate::tools::BRAKES_REGULAR, 1.0).await.unwrap();
         tokio::time::sleep(std::time::Duration::from_secs(6)).await;
         jet.gs_kts();
@@ -217,9 +217,9 @@
         assert!(stop.stopped, "{stop:?}");
         assert!(!s.thrust_back, "the levers never came back up");
         assert!(
-            jet.sim.writes_to(&throttle_dref()).iter().all(|v| *v == 0.0),
+            jet.sim.writes_to(&throttle_dataref()).iter().all(|v| *v == 0.0),
             "idle held: {:?}",
-            jet.sim.writes_to(&throttle_dref())
+            jet.sim.writes_to(&throttle_dataref())
         );
         assert!(s.max_kts < 71.0, "peak {:.1} kt, never the sortie's 73.3", s.max_kts);
         assert!(stop.secs < 12.0, "stopped in {:.1} s", stop.secs);

@@ -26,6 +26,7 @@
 
 // The tests reach these through `use super::*` (the queue that used them
 // moved to `crew_radio.rs`).
+use crate::aircraft::throttle_dataref;
 use crate::autoflight::{self, Button, Dial};
 #[cfg_attr(not(test), allow(unused_imports))]
 use std::collections::VecDeque;
@@ -66,14 +67,6 @@ const FLAP_RATIO: &str = "sim/cockpit2/controls/flap_ratio";
 /// The flap the base leg configures toward (the handle ratio): about half
 /// travel, the approach setting on every airframe here; final goes to full.
 const BASE_FLAP_RATIO: f64 = 0.5;
-/// The thrust lever THIS airframe obeys — not always the stock one (the
-/// Citation X tracks `throttle_jet_rev_ratio`, so every write to
-/// `throttle_ratio_all` went nowhere and it flew a whole pattern at takeoff
-/// thrust). Resolved per call, so a profile swap takes effect immediately.
-fn throttle_dref() -> String {
-    crate::aircraft::throttle_dataref()
-}
-
 const M_TO_FT: f64 = 3.280_84;
 const M_PER_NM: f64 = 1852.0;
 
@@ -3502,7 +3495,7 @@ async fn fly_authored_route(
         if crate::xplane::sim_frozen(&xp).await {
             continue;
         }
-        let thr_dref = throttle_dref();
+        let thr_dref = throttle_dataref();
         // Position, elevation and heading as ONE frame saw them (#157).
         let (pos, hp_r, phi_r, hdg_st, vs_st, ias_r, thr_r, servos_r) = tokio::join!(
             sim::position::read(&xp),
@@ -3674,7 +3667,7 @@ async fn fly_authored_route(
             let delta = crate::tools::speedhold::throttle_adjust_live(pattern_kts - ias, ias_trend);
             if delta != 0.0 {
                 let _ = xp
-                    .set_float(&throttle_dref(), (thr + delta).clamp(0.0, 1.0))
+                    .set_float(&throttle_dataref(), (thr + delta).clamp(0.0, 1.0))
                     .await;
             }
         }
@@ -4568,7 +4561,7 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, p: Params
         let agl_m = sim::position::field(&pos, |p| p.agl_m);
         let elev_m = sim::position::field(&pos, |p| p.elev_m);
         let psi_r = sim::position::field(&pos, |p| p.psi_true_deg);
-        let thr_dref = throttle_dref();
+        let thr_dref = throttle_dataref();
         let (ias_r, thr_r, dial_r, alt_hold_r, phi_r, servos_r) = tokio::join!(
             xp.get_float(IAS),
             xp.get_float(&thr_dref),
@@ -5353,7 +5346,7 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, p: Params
             let delta = crate::tools::speedhold::throttle_adjust_live(want_kts - ias, ias_trend);
             if delta != 0.0 {
                 let _ = xp
-                    .set_float(&throttle_dref(), (thr + delta).clamp(0.0, 1.0))
+                    .set_float(&throttle_dataref(), (thr + delta).clamp(0.0, 1.0))
                     .await;
             }
         }

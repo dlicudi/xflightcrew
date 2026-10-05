@@ -31,6 +31,7 @@
 //! frozen (pause/replay) freezes the loop with it. The laws are pure
 //! functions and battle-test as plain `cargo test`.
 
+use crate::aircraft::throttle_dataref;
 use crate::autoflight::{self, Button, Dial};
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -49,13 +50,6 @@ const IAS: &str = "sim/flightmodel/position/indicated_airspeed";
 #[cfg(test)]
 const AGL_M: &str = "sim/flightmodel/position/y_agl";
 const MAG_VAR: &str = "sim/flightmodel/position/magnetic_variation";
-/// The thrust lever THIS airframe obeys — not always the stock one (the
-/// Citation X tracks `throttle_jet_rev_ratio`, so every write to
-/// `throttle_ratio_all` went nowhere and it flew a whole pattern at takeoff
-/// thrust). Resolved per call, so a profile swap takes effect immediately.
-fn throttle_dref() -> String {
-    crate::aircraft::throttle_dataref()
-}
 const GEAR_HANDLE: &str = "sim/cockpit2/controls/gear_handle_down";
 const FLAP_HANDLE: &str = "sim/cockpit2/controls/flap_ratio";
 /// Clean up the takeoff flaps this high AGL, once safely above Vy — a
@@ -2398,7 +2392,7 @@ pub(crate) async fn stop_on_centreline(
     law: &mut RollSteer,
 ) -> RejectStop {
     let mut out = RejectStop::default();
-    let thr = throttle_dref();
+    let thr = throttle_dataref();
     let mut live_s = 0.0_f64;
     let mut last = tokio::time::Instant::now();
     let mut last_brake: Option<f64> = None;
@@ -2531,7 +2525,7 @@ async fn reject_rolling(
 /// The reject's hands in its first second: throttles idle, an engaged
 /// autothrottle out (read back, `Some` when there was one), maximum braking.
 pub(crate) async fn reject_hands(xp: &dyn XPlane) -> Option<bool> {
-    let _ = xp.set_float(&throttle_dref(), 0.0).await;
+    let _ = xp.set_float(&throttle_dataref(), 0.0).await;
     let at_off = crate::takeoff_config::autothrottle_off(xp).await;
     // Noted before as well as after: see `stop_on_centreline`.
     crate::tools::note_brake_cmd();
@@ -3065,7 +3059,7 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, p: Params) {
         // fps, 2026-09-30) against its 150 ms sleep. An older plugin falls
         // back to the separate reads, still one round, and the tick says
         // which (`pos`).
-        let thr_dref = throttle_dref();
+        let thr_dref = throttle_dataref();
         let (st, extra) = sim::state::read_with(
             &xp,
             sim::state::Want(ROLL_WANT),
