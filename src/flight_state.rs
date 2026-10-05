@@ -287,7 +287,10 @@ pub(crate) static LOOPS: [(&str, &sim::run::Slot); 18] = [
     ("tools::jet_start::JET_START", &crate::tools::jet_start::JET_START),
 ];
 
-/// Every loop that can hold the aircraft, stopped. First the doors that do
+/// Every loop that can hold the aircraft, stopped. What a stand-down leaves
+/// in the air is the safe hold's (`safe_hold`, never stood down): nobody
+/// flying is held clear of the ground, never left on a loop's last command.
+/// First the doors that do
 /// more than cancel (end the mission and its children, free the brakes,
 /// hand back a flyable aircraft, clear a backtrack or a hand-down), then
 /// every run in [`LOOPS`] cancelled, then the loops not yet on a run.

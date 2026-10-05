@@ -192,6 +192,50 @@ pub const ROTORCRAFT_WITHHELD: &[&str] = &[
     "go_around",
 ];
 
+/// The autopilot's engagement prerequisites and limits for an airframe:
+/// `None` without an autopilot. The ONE builder: the registry's tools and
+/// the safe hold (`safe_hold`) set the autopilot with the same numbers.
+pub(crate) fn ap_config(profile: &AircraftProfile) -> Option<autopilot::ApConfig> {
+    if !profile.autopilot {
+        return None;
+    }
+    // Per-airframe engagement prerequisites (FD switch, AC power) - the C90
+    // needs them; the GA singles leave this default (plain servos-on).
+    let prep = profile.autopilot_prep.clone().unwrap_or_default();
+    // Altitude gate uses the airframe's real service ceiling (the C90B is
+    // 28,100 ft) rather than the GA default, so a valid high climb isn't refused.
+    let ceiling = profile
+        .reference
+        .as_ref()
+        .and_then(|r| r.service_ceiling_ft)
+        .unwrap_or(autopilot::ApConfig::default().service_ceiling_ft);
+    Some(autopilot::ApConfig {
+        fd_commands: prep.flight_director,
+        ac_powered: prep.ac_powered,
+        service_ceiling_ft: ceiling,
+        flare_power: profile.flare_power,
+        climb: autopilot::ClimbPerf::from_profile(profile),
+    })
+}
+
+/// The airframe's approach speed: the declared one, else the rule the
+/// generic profile uses, max(1.3 Vso, 1.2 Vs): the LANDING configuration's
+/// stall, not 1.3 times the clean one (the SR22, declaring none, flew its
+/// finals at 90 to 92 KIAS against the POH's 80, floated and bounced three
+/// times, LEMG 13 2026-09-29).
+pub(crate) fn approach_ias(profile: &AircraftProfile) -> f64 {
+    profile
+        .reference
+        .as_ref()
+        .and_then(|r| r.approach_kts)
+        .unwrap_or_else(|| {
+            crate::aircraft::fallback_approach_kts(
+                profile.reference.as_ref().and_then(|r| r.vs0_kts),
+                profile.vs_clean_kts.unwrap_or(60.0),
+            )
+        })
+}
+
 impl Registry {
     /// Build the tool set for an aircraft. The profile shapes the surface: the
     /// 172 has no retractable gear, so no `gear` tool is added for it. Each
@@ -247,23 +291,7 @@ impl Registry {
         // The autopilot a new flight in the air is held on (`setup_enroute`).
         let mut enroute_ap: Option<autopilot::ApConfig> = None;
         if profile.autopilot {
-            // Per-airframe engagement prerequisites (FD switch, AC power) — the C90
-            // needs them; the GA singles leave this default (plain servos-on).
-            let prep = profile.autopilot_prep.clone().unwrap_or_default();
-            // Altitude gate uses the airframe's real service ceiling (the C90B is
-            // 28,100 ft) rather than the GA default, so a valid high climb isn't refused.
-            let ceiling = profile
-                .reference
-                .as_ref()
-                .and_then(|r| r.service_ceiling_ft)
-                .unwrap_or(autopilot::ApConfig::default().service_ceiling_ft);
-            let ap = autopilot::ApConfig {
-                fd_commands: prep.flight_director,
-                ac_powered: prep.ac_powered,
-                service_ceiling_ft: ceiling,
-                flare_power: profile.flare_power,
-                climb: autopilot::ClimbPerf::from_profile(profile),
-            };
+            let ap = ap_config(profile).expect("the profile declares an autopilot");
             tools.push(Box::new(autopilot::SetHeading { cfg: ap.clone() }));
             tools.push(Box::new(autopilot::Navigate { cfg: ap.clone() }));
             tools.push(Box::new(autopilot::SetAltitude { cfg: ap.clone() }));
@@ -289,16 +317,7 @@ impl Registry {
             // stall, not 1.3 times the clean one (the SR22, declaring none,
             // flew its finals at 90 to 92 KIAS against the POH's 80, floated and
             // bounced three times, LEMG 13 2026-09-29).
-            let approach_ias = profile
-                .reference
-                .as_ref()
-                .and_then(|r| r.approach_kts)
-                .unwrap_or_else(|| {
-                    crate::aircraft::fallback_approach_kts(
-                        profile.reference.as_ref().and_then(|r| r.vs0_kts),
-                        vs,
-                    )
-                });
+            let approach_ias = approach_ias(profile);
             tools.push(Box::new(autoland::Autoland {
                 cfg: ap.clone(),
                 approach_ias,
