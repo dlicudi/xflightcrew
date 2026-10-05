@@ -1290,7 +1290,6 @@ mod tests {
     #[test]
     fn the_phugoid_air_start_is_never_called_ready() {
         let mut j = SettleJudge::default();
-        let mut end = Settle::Settling;
         for (t_s, alt_ft, ias_kts, _) in PHUGOID {
             let s = SettleSample {
                 t_s,
@@ -1299,7 +1298,7 @@ mod tests {
                 governed_kts: Some(296.0),
                 altimeter_ok: Some(false),
             };
-            end = j.step(18_000.0, &s);
+            let end = j.step(18_000.0, &s);
             if t_s < SETTLE_MAX_S {
                 assert_eq!(end, Settle::Settling, "{t_s}");
             }
@@ -1313,7 +1312,7 @@ mod tests {
             governed_kts: Some(296.0),
             altimeter_ok: Some(false),
         };
-        end = j.step(18_000.0, &last);
+        let end = j.step(18_000.0, &last);
         let Settle::Unsettled(why) = end else { panic!("{end:?}") };
         assert_eq!(
             why,
