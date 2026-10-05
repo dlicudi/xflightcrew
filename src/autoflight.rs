@@ -1299,6 +1299,79 @@ mod tests {
         );
     }
 
+    /// The circuit, the follower, the takeoff, full auto and the enroute
+    /// setup press their MODES only through the intent (`bring`,
+    /// `reconcile` and `apply`), never a mode button of their own: a mode
+    /// press that reads nothing, or reads it its own way, is how autoland's
+    /// housekeeping pressed over the 737's captures (#81). The one exception
+    /// left is the pattern guard's hand-back, owed a flight.
+    #[test]
+    fn loop_mode_presses_go_through_reconcile() {
+        const FILES: [&str; 5] = [
+            "circuit.rs",
+            "procedure.rs",
+            "autotakeoff.rs",
+            "full_auto.rs",
+            "tools/setup_enroute.rs",
+        ];
+        const MODES: [&str; 7] = [
+            "Button::Heading)",
+            "Button::Heading,",
+            "Button::VerticalSpeed",
+            "Button::AltitudeHold",
+            "Button::LevelChange",
+            "Button::Approach",
+            "Button::Gpss",
+        ];
+        const CALLS: [&str; 3] = [
+            "autoflight::press(",
+            "autoflight::press_logged(",
+            "autoflight::ensure_on(",
+        ];
+        // (file, call, how many): presses not yet on the intent, each with
+        // its reason. `circuit::give_up_pattern`'s VS: a hand-back, owed a
+        // flight before it moves.
+        const LEFT: [(&str, &str, usize); 1] = [(
+            "circuit.rs",
+            "autoflight::press(xp, Button::VerticalSpeed)",
+            1,
+        )];
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut bad = Vec::new();
+        for rel in FILES {
+            let text = std::fs::read_to_string(root.join(rel)).unwrap();
+            let production = text.split("#[cfg(test)]\nmod ").next().unwrap();
+            let lines: Vec<&str> = production
+                .lines()
+                .map(|l| l.split("//").next().unwrap_or(""))
+                .collect();
+            let mut found: Vec<String> = Vec::new();
+            for (i, l) in lines.iter().enumerate() {
+                if !CALLS.iter().any(|c| l.contains(c)) {
+                    continue;
+                }
+                // The call's statement: a press split over lines included.
+                let stmt = lines[i..(i + 4).min(lines.len())].join(" ");
+                let stmt = stmt.split(';').next().unwrap_or("");
+                if MODES.iter().any(|m| stmt.contains(m)) {
+                    found.push(l.trim().to_string());
+                    if !LEFT.iter().any(|(f, c, _)| *f == rel && l.contains(c)) {
+                        bad.push(format!("{rel}:{}: {}", i + 1, l.trim()));
+                    }
+                }
+            }
+            for (f, c, n) in LEFT.iter().filter(|(f, _, _)| *f == rel) {
+                let got = found.iter().filter(|l| l.contains(c)).count();
+                assert_eq!(got, *n, "{f}: `{c}` left {got} times, expected {n}");
+            }
+        }
+        assert!(
+            bad.is_empty(),
+            "a loop's mode press outside the intent:\n{}",
+            bad.join("\n")
+        );
+    }
+
     /// The 737's panel is its own buttons, probed by the swap's profile
     /// check; CMD B is never one of them.
     #[test]
