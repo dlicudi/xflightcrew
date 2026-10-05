@@ -104,18 +104,11 @@ impl<'a> Side<'a> {
 }
 
 /// The airframe's altimeter fast paths, published per swap
-/// (`flight_state::publish_airframe`), `None` the stock knob alone.
-static ALTIMETER: std::sync::Mutex<Option<crate::aircraft::AltimeterProfile>> =
-    std::sync::Mutex::new(None);
-
-pub fn publish_altimeter(p: Option<crate::aircraft::AltimeterProfile>) {
-    *ALTIMETER.lock().unwrap_or_else(|e| e.into_inner()) = p;
-}
-
+/// (`flight_state::publish_airframe`, the snapshot's `altimeter`), `None`
+/// the stock knob alone.
 fn altimeter_profile() -> crate::aircraft::AltimeterProfile {
-    ALTIMETER
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
+    crate::aircraft::airframe_facts()
+        .altimeter
         .clone()
         .unwrap_or_default()
 }

@@ -2907,6 +2907,19 @@ pub struct AirframeFacts {
     /// A helicopter's rotor: (rpm dataref, governed rpm, collective
     /// dataref) (`hover::rotor_facts`); `None` on anything else.
     pub rotor: Option<(String, f64, String)>,
+    /// The seat belt switch ([`SignsSwitch::for_profile`]).
+    pub signs: Option<SignsSwitch>,
+    /// `cabin_air:`.
+    pub cabin_air: Option<CabinAirProfile>,
+    /// The transponder's add-on mode knob: never merely set when an
+    /// airframe happens to have one (a published-once flag that outlived an
+    /// airframe change is how a cold-and-dark 172 silently killed a Twin
+    /// Otter's radio for a whole session, 2026-07-27).
+    pub mode_knob: Option<TransponderModeKnob>,
+    /// The landing and taxi lights ([`Exterior::from_lights`]).
+    pub exterior: Exterior,
+    /// The altimeter fast paths, `None` the stock knob alone.
+    pub altimeter: Option<AltimeterProfile>,
 }
 
 impl Default for AirframeFacts {
@@ -2937,6 +2950,11 @@ impl Default for AirframeFacts {
             takeoff_config: None,
             ap_altitude_capture: false,
             rotor: None,
+            signs: None,
+            cabin_air: None,
+            mode_knob: None,
+            exterior: Exterior::default(),
+            altimeter: None,
         }
     }
 }
@@ -3007,6 +3025,52 @@ impl ClimbOut {
             accel_agl_ft,
             max_fpm: r.best_climb_fpm.filter(|f| f.is_finite()).unwrap_or(0.0),
         })
+    }
+}
+
+/// How the live airframe's seat belt signs are worked (`tools::signs`): the
+/// stock switch, or an add-on's own declared one.
+#[derive(Debug, Clone)]
+pub enum SignsSwitch {
+    Stock,
+    Own(SeatBeltSigns),
+}
+
+impl SignsSwitch {
+    /// The profile's declared switch, else the stock one on an airframe
+    /// with a cabin, else none. Pure.
+    pub fn for_profile(own: Option<SeatBeltSigns>, has_cabin: bool) -> Option<Self> {
+        match own {
+            Some(s) => Some(SignsSwitch::Own(s)),
+            None if has_cabin => Some(SignsSwitch::Stock),
+            None => None,
+        }
+    }
+}
+
+/// The active airframe's landing and taxi lights, the two the ground and
+/// climb stages switch (`tools::lights`). Republished on EVERY profile swap,
+/// including to an empty set, never merely set when an airframe happens to
+/// have them (the transponder knob's lesson, 2026-07-27).
+#[derive(Clone, Debug, Default)]
+pub struct Exterior {
+    pub landing: Option<LightProfile>,
+    pub taxi: Option<LightProfile>,
+}
+
+impl Exterior {
+    /// The landing and taxi lights from a profile's light list. Pure.
+    pub fn from_lights(lights: &[LightProfile]) -> Self {
+        let pick = |key: &str| {
+            lights
+                .iter()
+                .find(|l| l.key.eq_ignore_ascii_case(key))
+                .cloned()
+        };
+        Exterior {
+            landing: pick("landing"),
+            taxi: pick("taxi"),
+        }
     }
 }
 

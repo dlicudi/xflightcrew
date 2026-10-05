@@ -15,18 +15,24 @@
 use crate::aircraft::CabinAirProfile;
 use crate::xplane::XPlane;
 
-static CABIN_AIR: std::sync::Mutex<Option<CabinAirProfile>> = std::sync::Mutex::new(None);
-
-/// Publish the airframe's cabin air. Called on EVERY profile swap; `None`
-/// retires the previous airframe's.
+/// Publish the airframe's cabin air alone (the snapshot's `cabin_air`,
+/// republished on every swap by `flight_state::publish_airframe`), and
+/// forget the masks as a swap does.
+#[cfg(test)]
 pub fn publish(p: Option<CabinAirProfile>) {
-    *CABIN_AIR.lock().unwrap_or_else(|e| e.into_inner()) = p;
-    // A claim on the masks never outlives its airframe.
+    crate::aircraft::update_airframe_facts(|a| a.cabin_air = p);
+    forget_masks();
+}
+
+/// A claim on the masks never outlives its airframe: called on EVERY
+/// profile swap.
+pub fn forget_masks() {
     *MASKS.lock().unwrap_or_else(|e| e.into_inner()) = (MaskWatch::default(), None);
 }
 
+/// The live airframe's cabin air; `None` retires the previous airframe's.
 fn declared() -> Option<CabinAirProfile> {
-    CABIN_AIR.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    crate::aircraft::airframe_facts().cabin_air.clone()
 }
 
 /// What one control ended up as: `None` not declared (or unreadable before
