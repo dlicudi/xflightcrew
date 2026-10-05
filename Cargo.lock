@@ -3226,8 +3226,6 @@ dependencies = [
  "serde_json",
  "serde_yaml",
  "sim",
- "tempfile",
- "thiserror 1.0.69",
  "tokio",
  "tracing",
  "tracing-appender",
