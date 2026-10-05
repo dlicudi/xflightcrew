@@ -810,21 +810,9 @@ fn run_recovery(
                     let _ = xp.run_command(c).await;
                 }
                 let _ = autoflight::press(&xp, Button::Engage).await;
-                if xp.get_float(HEADING_STATUS).await.unwrap_or(0.0) <= 0.5 {
-                    let _ = autoflight::press(&xp, Button::Heading).await;
-                }
-                // No compass read, no bug write: a heading of "zero" is a turn
-                // north, not a hold, and heading mode keeps whatever is dialled.
-                let hdg = xp.get_float(CURRENT_HDG).await.ok();
-                if let Some(h) = hdg {
-                    let _ = crate::tools::autopilot::drive_heading_bug(&xp, h).await;
-                }
-                let alt = xp.get_float(CURRENT_ALT).await.unwrap_or(0.0);
-                let hold = (alt / 100.0).round() * 100.0;
-                let _ = autoflight::set_dial(&xp, Dial::Altitude, hold).await;
-                if xp.get_float(ALT_HOLD_STATUS).await.unwrap_or(0.0) <= 0.5 {
-                    let _ = autoflight::press(&xp, Button::AltitudeHold).await;
-                }
+                // NaN: no window was set (the hand-flown branch says wings level).
+                let (hdg, hold_ft) = hold_heading_and_altitude(&xp).await;
+                let hold = hold_ft.unwrap_or(f64::NAN);
                 if handback.hold_kts.is_none() {
                     let _ = xp.set_float(&throttle_dref(), CRUISE_THROTTLE).await;
                 }
@@ -875,17 +863,21 @@ fn run_recovery(
                     }
                     crate::blackbox::record(
                         "recover",
-                        json!({"event": "handed_to_autopilot", "hold_ft": hold, "hdg": hdg,
+                        json!({"event": "handed_to_autopilot", "hold_ft": hold_ft, "hdg": hdg,
                                "hold_kts": handback.hold_kts}),
                     );
                     // The line says what is actually held: no compass read,
-                    // no heading claimed.
+                    // no heading claimed; no altimeter read, no level claimed.
+                    let level = match hold_ft {
+                        Some(h) => format!("{h:.0} feet"),
+                        None => "the dialled altitude".to_string(),
+                    };
                     let line = match hdg {
                         Some(h) => format!(
-                            "Recovered. Autopilot holding heading {h:.0} and {hold:.0} feet. You have control when ready."
+                            "Recovered. Autopilot holding heading {h:.0} and {level}. You have control when ready."
                         ),
                         None => format!(
-                            "Recovered. Autopilot holding the dialled heading and {hold:.0} feet. You have control when ready."
+                            "Recovered. Autopilot holding the dialled heading and {level}. You have control when ready."
                         ),
                     };
                     if let Some(s) = &status {
@@ -982,6 +974,55 @@ fn stood_down(lease: &sim::run::Lease<'_>) {
     crate::blackbox::record("recover", json!({"event": "stood_down", "why": why}));
 }
 
+/// Hand the level to the autopilot: HDG and ALT HOLD (toggles, pressed only
+/// when they READ off), the bug on the compass heading, the window at the
+/// altimeter's round hundred. A failed read is NO measurement: a status that
+/// did not read is not pressed (pressing a toggle already on turns it off),
+/// and an altimeter that did not read writes no window (it wrote 0 ft, and
+/// ALT HOLD then flew the aircraft at the ground). Each skip is blackboxed.
+/// Returns the compass heading the bug went to and the window set.
+async fn hold_heading_and_altitude(
+    xp: &dyn crate::xplane::XPlane,
+) -> (Option<f64>, Option<f64>) {
+    let ok = |r: Result<f64>| r.ok().filter(|v| v.is_finite());
+    let skipped = |what: &str| {
+        crate::blackbox::record(
+            "recover",
+            json!({"event": "missing_measurement", "what": what, "value": null}),
+        )
+    };
+    match ok(xp.get_float(HEADING_STATUS).await) {
+        Some(s) if s <= 0.5 => {
+            let _ = autoflight::press(xp, Button::Heading).await;
+        }
+        Some(_) => {}
+        None => skipped("hdg_status"),
+    }
+    // No compass read, no bug write: a heading of "zero" is a turn north,
+    // not a hold, and heading mode keeps whatever is dialled.
+    let hdg = ok(xp.get_float(CURRENT_HDG).await);
+    match hdg {
+        Some(h) => {
+            let _ = crate::tools::autopilot::drive_heading_bug(xp, h).await;
+        }
+        None => skipped("heading"),
+    }
+    let Some(alt) = ok(xp.get_float(CURRENT_ALT).await) else {
+        skipped("altitude");
+        return (hdg, None);
+    };
+    let hold = (alt / 100.0).round() * 100.0;
+    let _ = autoflight::set_dial(xp, Dial::Altitude, hold).await;
+    match ok(xp.get_float(ALT_HOLD_STATUS).await) {
+        Some(s) if s <= 0.5 => {
+            let _ = autoflight::press(xp, Button::AltitudeHold).await;
+        }
+        Some(_) => {}
+        None => skipped("alt_hold_status"),
+    }
+    (hdg, Some(hold))
+}
+
 /// The recovery is over (its lease drops the rest with the thread): the
 /// flag goes now, and only while this is the live run (the slot's rule).
 fn finish(lease: &sim::run::Lease<'_>) {
@@ -1013,6 +1054,36 @@ mod tests {
             agl_ft: None,
             vs_fpm: None,
         }
+    }
+
+    /// A failed read is no measurement: an altimeter that does not read
+    /// writes no window (it wrote 0 ft), and a mode status that does not
+    /// read presses nothing (a toggle already on would go off).
+    #[tokio::test]
+    async fn the_hand_to_the_autopilot_writes_nothing_on_a_failed_read() {
+        let hdg = autoflight::panel().command(Button::Heading).to_string();
+        let alt_hold = autoflight::panel().command(Button::AltitudeHold).to_string();
+        let fake = crate::xplane::FakeXPlane::new();
+        assert_eq!(hold_heading_and_altitude(&fake).await, (None, None));
+        assert!(!fake.ran(&hdg) && !fake.ran(&alt_hold));
+        assert!(!fake.wrote(Dial::Altitude.read_name()));
+        // Read, off: pressed and set.
+        let fake = crate::xplane::FakeXPlane::with_reads(&[
+            (HEADING_STATUS, 0.0),
+            (ALT_HOLD_STATUS, 0.0),
+            (CURRENT_ALT, 4_960.0),
+        ]);
+        assert_eq!(hold_heading_and_altitude(&fake).await, (None, Some(5_000.0)));
+        assert!(fake.ran(&hdg) && fake.ran(&alt_hold));
+        assert_eq!(fake.last_write(Dial::Altitude.read_name()), Some(5_000.0));
+        // Read, already on: left alone.
+        let fake = crate::xplane::FakeXPlane::with_reads(&[
+            (HEADING_STATUS, 2.0),
+            (ALT_HOLD_STATUS, 2.0),
+            (CURRENT_ALT, 4_960.0),
+        ]);
+        hold_heading_and_altitude(&fake).await;
+        assert!(!fake.ran(&hdg) && !fake.ran(&alt_hold));
     }
 
     /// The slow floor is the configuration's, else the clean one, less 5 %;
