@@ -134,6 +134,7 @@ fn tick_of(states: &[Value], i: usize, t0: f64, actuate: bool, pilot_words: bool
             ahead: ahead_of(states, i),
             fan: vec![],
             mora_ft: None,
+            msa_ft: None,
         },
         approach: None,
         terminal: None,

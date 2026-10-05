@@ -125,6 +125,7 @@ fn the_floor_is_the_ground_ahead_then_the_grid_then_the_ground_under() {
         ahead: None,
         fan: vec![],
         mora_ft: Some(6_100.0),
+        msa_ft: None,
     };
     assert_eq!(
         floor(&a, &t),
@@ -304,6 +305,7 @@ fn the_hold_climbs_to_the_floor_or_bounds_the_descent_there() {
         ahead: Some(wall.clone()),
         fan: vec![wall, ray(246.0, &[(2.0, 300.0), (6.0, 900.0)])],
         mora_ft: None,
+        msa_ft: None,
     };
     let fl = floor(&a, &t);
     let c = hold_cmd(Why::HoldsBelow, &a, &ap_vs_down(), fl, &t, 700.0);
@@ -806,4 +808,31 @@ fn a_failed_variation_read_turns_nothing() {
     let c = hold_cmd(Why::HoldsBelow, &a, &ap_vs_down(), fl, &t, 700.0);
     assert_eq!(c.heading_mag, None);
     assert!(c.climb);
+}
+
+/// The sector altitude is the field's: over higher ground away from it the
+/// floor is still the ground under plus the clearance, as with the MORA
+/// (the recovery planner's MSA branch took it bare). MORA first.
+#[test]
+fn a_sector_altitude_below_the_ground_under_is_floored_like_the_mora() {
+    let mut a = air();
+    a.alt_true_ft = 3_000.0;
+    a.agl_ft = 100.0;
+    let t = Terrain {
+        msa_ft: Some(3_500.0),
+        ..Default::default()
+    };
+    assert_eq!(
+        floor(&a, &t),
+        Floor {
+            true_ft: 3_900.0,
+            source: "msa"
+        }
+    );
+    let t = Terrain {
+        mora_ft: Some(4_500.0),
+        msa_ft: Some(3_500.0),
+        ..Default::default()
+    };
+    assert_eq!(floor(&a, &t).source, "mora");
 }

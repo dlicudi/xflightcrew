@@ -207,6 +207,9 @@ pub struct Terrain {
     pub fan: Vec<Ray>,
     /// The grid MORA here and ahead (already the ground plus its margin).
     pub mora_ft: Option<f64>,
+    /// The fields' sector altitude (`earth_msa.dat`, already the ground plus
+    /// its margin), the last resort before the ground under.
+    pub msa_ft: Option<f64>,
 }
 
 /// The safe floor, true feet, and where it came from.
@@ -217,8 +220,11 @@ pub struct Floor {
 }
 
 /// The floor: the highest ground ahead (and under) plus [`CLEARANCE_FT`]; the
-/// grid MORA without a probe; the ground under us plus the clearance with
-/// neither (the sim always knows the height above the ground). Pure.
+/// grid MORA without a probe, else the sector altitude, either never under
+/// the ground below us plus the clearance (a sector altitude is the field's,
+/// and the aircraft may be over higher ground away from it); the ground under
+/// us plus the clearance with none (the sim always knows the height above the
+/// ground). Pure.
 pub fn floor(air: &Air, t: &Terrain) -> Floor {
     let under = air.ground_under_ft();
     if let Some(m) = t.ahead.as_ref().and_then(Ray::max_ft) {
@@ -231,6 +237,12 @@ pub fn floor(air: &Air, t: &Terrain) -> Floor {
         return Floor {
             true_ft: m.max(under + CLEARANCE_FT),
             source: "mora",
+        };
+    }
+    if let Some(m) = t.msa_ft.filter(|m| m.is_finite()) {
+        return Floor {
+            true_ft: m.max(under + CLEARANCE_FT),
+            source: "msa",
         };
     }
     Floor {
@@ -1452,6 +1464,7 @@ async fn watch(
                 ahead: ahead.as_ref().and_then(|a| a.4.clone()),
                 fan: fan.clone(),
                 mora_ft: mora_ahead(&air, &config.fix_data_path),
+                msa_ft: None,
             };
             // A climb that the ground ahead may outrun asks the fan first.
             if tick.actuate && fan.is_empty() && hold.held().is_none() {

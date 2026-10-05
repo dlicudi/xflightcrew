@@ -988,33 +988,55 @@ impl FullAuto {
                 _ => heights = None,
             }
         }
-        let under = true_ft - agl_ft;
-        let (floor_true, source) = match heights.as_ref().and_then(|h| h.iter().copied().reduce(f64::max)) {
-            Some(high) => (high.max(under) + crate::procedure::TERRAIN_CLEARANCE_FT, "terrain"),
-            None => {
-                let mora = crate::plan_audit::mora_grid(&ctx.config.fix_data_path).and_then(|g| {
-                    std::iter::once((lat, lon))
-                        .chain(pts.iter().copied())
-                        .filter_map(|(a, b)| g.at(a, b))
-                        .reduce(f64::max)
-                });
-                let msa_path = std::path::Path::new(&ctx.config.fix_data_path)
-                    .with_file_name("earth_msa.dat")
-                    .to_string_lossy()
-                    .into_owned();
-                let msa = [&fp.origin, &fp.destination]
-                    .into_iter()
-                    .filter_map(|icao| crate::nav::airport_msa_ft(&msa_path, icao))
-                    .reduce(f64::max);
-                match (mora, msa) {
-                    (Some(m), _) => (m.max(under + crate::procedure::TERRAIN_CLEARANCE_FT), "mora"),
-                    (None, Some(m)) => (m, "msa"),
-                    (None, None) => return Err(
-                        "The terrain probe isn't answering and I have no grid MORA, so I can't check the way. Check the plugin build on the Health screen.".into(),
-                    ),
-                }
-            }
+        // The probed path as a ray, for the floor and the climb's check.
+        let brg = crate::nav::bearing_deg(lat, lon, to_lat, to_lon);
+        let path_ray = heights.as_ref().map(|h| crate::safe_hold::Ray {
+            bearing_true: brg,
+            ground_ft: pts
+                .iter()
+                .map(|&(a, b)| crate::nav::haversine_nm(lat, lon, a, b))
+                .zip(h.iter().copied())
+                .collect(),
+        });
+        let probed = path_ray.as_ref().and_then(crate::safe_hold::Ray::max_ft).is_some();
+        let (mora_ft, msa_ft) = if probed {
+            (None, None)
+        } else {
+            let mora = crate::plan_audit::mora_grid(&ctx.config.fix_data_path).and_then(|g| {
+                std::iter::once((lat, lon))
+                    .chain(pts.iter().copied())
+                    .filter_map(|(a, b)| g.at(a, b))
+                    .reduce(f64::max)
+            });
+            let msa_path = crate::full_auto::msa_path_for(&ctx.config.fix_data_path);
+            let msa = [&fp.origin, &fp.destination]
+                .into_iter()
+                .filter_map(|icao| crate::nav::airport_msa_ft(&msa_path, icao))
+                .reduce(f64::max);
+            (mora, msa)
         };
+        // The safe hold's own floor rule: the probe, else MORA, else MSA,
+        // each never under the ground below plus the clearance.
+        let here = crate::safe_hold::Air {
+            alt_true_ft: true_ft,
+            agl_ft,
+            ..Default::default()
+        };
+        let terrain = crate::safe_hold::Terrain {
+            ahead: path_ray.clone(),
+            mora_ft,
+            msa_ft,
+            ..Default::default()
+        };
+        let crate::safe_hold::Floor {
+            true_ft: floor_true,
+            source,
+        } = crate::safe_hold::floor(&here, &terrain);
+        if source == "under" {
+            return Err(
+                "The terrain probe isn't answering and I have no grid MORA, so I can't check the way. Check the plugin build on the Health screen.".into(),
+            );
+        }
         let floor_ind = floor_true + (altitude - true_ft);
         let climb = rp::climb_first(altitude, floor_ind);
         // Only the physically impossible is refused.
@@ -1063,7 +1085,6 @@ impl FullAuto {
         }
         // The climb first, on the way's own bearing when the climb clears
         // its ground, else on the clear heading nearest it.
-        let brg = crate::nav::bearing_deg(lat, lon, to_lat, to_lon);
         let mut climb_heading_mag: Option<f64> = None;
         let climb_leg = match climb {
             None => None,
@@ -1074,14 +1095,6 @@ impl FullAuto {
                     return Err(NO_VARIATION.into());
                 };
                 let grad = crate::safe_hold::gradient_ft_nm(self.cfg.climb.max_climb_fpm, gs_kts);
-                let path_ray = heights.as_ref().map(|h| crate::safe_hold::Ray {
-                    bearing_true: brg,
-                    ground_ft: pts
-                        .iter()
-                        .map(|&(a, b)| crate::nav::haversine_nm(lat, lon, a, b))
-                        .zip(h.iter().copied())
-                        .collect(),
-                });
                 let clears = path_ray
                     .as_ref()
                     .is_none_or(|r| crate::safe_hold::climb_clears(r, true_ft, grad, true));
