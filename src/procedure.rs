@@ -300,7 +300,7 @@ pub const FMS_GOTO: &str = "xcopilot/fms/goto";
 pub fn fms_goto_payload(ident: &str, lat: f64, lon: f64) -> String {
     format!(
         "{},{:.6},{:.6}",
-        ident.trim().to_ascii_uppercase(),
+        crate::simbrief::fms_ident(ident),
         lat,
         lon
     )

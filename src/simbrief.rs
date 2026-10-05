@@ -671,7 +671,8 @@ fn parse_waypoints(v: &Value) -> Vec<Waypoint> {
 /// loaded plan does hold — an ident it lacks changes nothing on the plugin side.
 pub fn fms_route_payload(waypoints: &[Waypoint]) -> String {
     const FMS_ROUTE_MAX_BYTES: usize = 511;
-    let entry = |w: &Waypoint| format!("{},{:.4},{:.4},{}", w.ident, w.lat, w.lon, w.alt as i64);
+    let entry =
+        |w: &Waypoint| format!("{},{:.4},{:.4},{}", fms_ident(&w.ident), w.lat, w.lon, w.alt as i64);
     let join = |ws: &[&Waypoint]| ws.iter().map(|w| entry(w)).collect::<Vec<_>>().join("|");
     let mut kept: Vec<&Waypoint> = waypoints.iter().collect();
     while kept.len() > 2 && join(&kept).len() > FMS_ROUTE_MAX_BYTES {
@@ -690,6 +691,25 @@ pub fn fms_route_payload(waypoints: &[Waypoint]) -> String {
             .unwrap_or_default();
     }
     payload
+}
+
+/// An ident as the FMS plan file can carry it: uppercase letters and digits
+/// only. The plan line is space-separated, so the follower's synthetic
+/// "LEMG arrival" leg shifted every field and X-Plane read the altitude as
+/// the latitude ("Latitude must be between -Pi/2 and Pi/2", the whole plan
+/// refused, LFRG-LEMG 2026-10-05); a comma or pipe would break our own
+/// payload the same way. `WPT` when nothing is left. Pure.
+pub fn fms_ident(ident: &str) -> String {
+    let s: String = ident
+        .chars()
+        .filter(char::is_ascii_alphanumeric)
+        .map(|c| c.to_ascii_uppercase())
+        .collect();
+    if s.is_empty() {
+        "WPT".to_string()
+    } else {
+        s
+    }
 }
 
 /// Distance (nm) from the top-of-descent fix to the destination: the sum of the
@@ -731,6 +751,30 @@ fn num_of(v: &Value) -> Option<f64> {
 
 #[cfg(test)]
 mod tests {
+    /// Every ident reaches the plan file as one token: the follower's
+    /// "LEMG arrival" leg made X-Plane refuse the LFRG-LEMG plan
+    /// (2026-10-05), its altitude read as the latitude.
+    #[test]
+    fn an_fms_ident_is_one_plan_file_token() {
+        use super::*;
+        assert_eq!(fms_ident("LEMG arrival"), "LEMGARRIVAL");
+        assert_eq!(fms_ident("mg529"), "MG529");
+        assert_eq!(fms_ident("A,B|C"), "ABC");
+        assert_eq!(fms_ident("  "), "WPT");
+        let w = |ident: &str, lat, lon, alt| Waypoint { ident: ident.into(), lat, lon, alt };
+        let p = fms_route_payload(&[
+            w("LFRG", 49.3633, 0.16, 0.0),
+            w("LEMG arrival", 36.8453, -4.6299, 9600.0),
+            w("LEMG", 36.675, -4.4992, 2600.0),
+        ]);
+        assert_eq!(p, "LFRG,49.3633,0.1600,0|LEMGARRIVAL,36.8453,-4.6299,9600|LEMG,36.6750,-4.4992,2600");
+        for e in p.split('|') {
+            assert!(!e.contains(' '), "{e}");
+            let lat: f64 = e.split(',').nth(1).unwrap().parse().unwrap();
+            assert!(lat.abs() <= 90.0, "{e}");
+        }
+    }
+
     /// The OFP's ATC callsign, from the shape of the pilot's live OFP
     /// (LFBD-EGKK, 2026-09-27: `atc.callsign` "WAT2516", `general`
     /// "WAT" + "2516"); airline + flight number when the ATC box is empty,
