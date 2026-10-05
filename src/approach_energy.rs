@@ -49,9 +49,6 @@ use crate::aircraft::{AircraftProfile, FlapDetent};
 pub const G_KTS_PER_S: f64 = 9.806_65 * 3600.0 / 1852.0;
 /// The landing speed is planned this early before the gate.
 pub const GATE_MARGIN_S: f64 = 20.0;
-/// A detent counts as available this far under its placard (autoland's own
-/// extension margin).
-pub const EXTEND_MARGIN_KTS: f64 = 5.0;
 /// The backward integration's step, nm.
 const STEP_NM: f64 = 0.02;
 /// Below this a configuration does not slow on the path.
@@ -125,18 +122,21 @@ impl EnergyModel {
         self.level_decel(flap) - G_KTS_PER_S * self.gp_deg.to_radians().sin()
     }
 
-    /// The deepest flap available at `kts`: its placard clears the speed by
-    /// [`EXTEND_MARGIN_KTS`].
+    /// The deepest flap available at `kts`: autoland's own extension rule
+    /// ([`crate::autoland::flap_within_limits`] with its
+    /// [`crate::autoland::FLAP_EXTEND_MARGIN_KTS`] under the placard), so the
+    /// plan asks for the configuration the approach will actually put out.
     pub fn flap_for(&self, kts: f64) -> f64 {
-        self.detents
-            .iter()
-            .filter(|d| d.vfe_kts.is_none_or(|v| kts <= v - EXTEND_MARGIN_KTS))
-            .map(|d| d.ratio)
-            .fold(0.0, f64::max)
+        let limits: Vec<(f64, Option<f64>)> =
+            self.detents.iter().map(|d| (d.ratio, d.vfe_kts)).collect();
+        crate::autoland::flap_within_limits(
+            self.landing_flap(),
+            kts + crate::autoland::FLAP_EXTEND_MARGIN_KTS,
+            &limits,
+        )
     }
 
     /// The landing flap: the deepest detent.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub fn landing_flap(&self) -> f64 {
         self.detents.last().map_or(1.0, |d| d.ratio)
     }
@@ -257,6 +257,59 @@ mod tests {
         assert_eq!(m.flap_for(157.0), 1.0);
         assert_eq!(m.flap_for(206.0), 0.375);
         assert_eq!(m.landing_flap(), 1.0);
+    }
+
+    /// The plan's configuration is the one autoland extends: over every
+    /// profile's flap table, at every speed, `flap_for` is what the held rule
+    /// puts out from clean (one margin, one rule; the two were written
+    /// twice, 2026-10-05).
+    #[test]
+    fn the_plans_flap_is_the_one_autoland_extends_on_every_profile() {
+        let mut checked = 0;
+        for entry in std::fs::read_dir("profiles").expect("profiles dir") {
+            let path = entry.unwrap().path();
+            if path.extension().and_then(|e| e.to_str()) != Some("yaml") {
+                continue;
+            }
+            let id = path.file_stem().unwrap().to_str().unwrap().to_string();
+            let Some(p) = crate::aircraft::load(&id) else {
+                continue;
+            };
+            let Some(flaps) = p.flaps.as_ref() else {
+                continue;
+            };
+            let mut detents: Vec<Detent> = flaps
+                .detents
+                .iter()
+                .map(|d| Detent {
+                    ratio: d.ratio,
+                    decel_kts_s: 1.0,
+                    vfe_kts: d.vfe_kts,
+                })
+                .collect();
+            if detents.is_empty() {
+                continue;
+            }
+            detents.sort_by(|a, b| a.ratio.total_cmp(&b.ratio));
+            let limits: Vec<(f64, Option<f64>)> =
+                detents.iter().map(|d| (d.ratio, d.vfe_kts)).collect();
+            let m = EnergyModel {
+                detents,
+                gp_deg: 3.0,
+            };
+            for i in 0..=700 {
+                let kts = 50.0 + i as f64 * 0.5;
+                let held = crate::autoland::flap_held_within_limits(
+                    m.landing_flap(),
+                    kts,
+                    &limits,
+                    Some(0.0),
+                );
+                assert_eq!(m.flap_for(kts), held, "{id} at {kts} kt");
+            }
+            checked += 1;
+        }
+        assert!(checked >= 5, "profiles checked: {checked}");
     }
 
     /// From the gate back: 145 kt at the gate, the landing flap out from

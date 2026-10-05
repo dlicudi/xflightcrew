@@ -4426,7 +4426,7 @@ fn mountain_field(msa_ft: Option<f64>, elev_ft: f64) -> bool {
 
 /// `earth_msa.dat` beside the fix file (both in Custom Data, or both in the
 /// default data).
-fn msa_path_for(fix_path: &str) -> String {
+pub(crate) fn msa_path_for(fix_path: &str) -> String {
     std::path::Path::new(fix_path)
         .with_file_name("earth_msa.dat")
         .to_string_lossy()

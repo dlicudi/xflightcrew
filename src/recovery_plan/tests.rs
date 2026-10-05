@@ -238,6 +238,17 @@ fn only_the_physically_impossible_is_refused_and_it_names_its_number() {
     }
 }
 
+/// A slow aircraft's time to go is its own groundspeed down to the planners'
+/// 60 kt floor: 30 nm at 70 kt is 26 minutes, so 30 minutes of fuel is short
+/// of it plus the approach's 10 (at the old 100 kt floor it was 18 and flew).
+#[test]
+fn a_slow_aircraft_is_timed_at_its_own_groundspeed() {
+    let f = impossible("LEMG", 3_000.0, 14_000.0, Some(30.0), 30.0, 70.0, None).unwrap();
+    assert!(f.contains("26 minutes away"), "{f}");
+    let crawl = impossible("LEMG", 3_000.0, 14_000.0, Some(30.0), 30.0, 20.0, None).unwrap();
+    assert!(crawl.contains("30 minutes away"), "floored at 60 kt: {crawl}");
+}
+
 #[test]
 fn the_path_is_probed_every_quarter_mile_to_forty() {
     let p = path_points(36.0, -5.0, 36.0, -4.0);

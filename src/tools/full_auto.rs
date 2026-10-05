@@ -256,23 +256,48 @@ pub(crate) fn rejoin_unsteady(a: &Steady, b: &Steady) -> Option<String> {
     None
 }
 
+/// The destination runway the recovery planner asks for, metres: the arm's
+/// own rule ([`crate::aircraft::planned_landing_needed_ft`], the book landing
+/// distance else the takeoff distance), never a second reading of it; `None`
+/// when the profile recites neither (no check).
+fn plan_landing_need_m(landing_ft: Option<f64>, takeoff_ft: Option<f64>) -> Option<f64> {
+    crate::aircraft::planned_landing_needed_ft(landing_ft, takeoff_ft).map(|ft| ft * 0.3048)
+}
+
+/// The resume's climb before the join, said: north is "360", never "000"
+/// (`autopilot::spoken_heading`, the bug's own words).
+fn climb_first_words(alt_ft: f64, heading_mag: f64) -> String {
+    format!(
+        "Climbing to {} first, heading {}, the safe altitude on the way. ",
+        crate::flightplan::spoken_feet(alt_ft),
+        crate::tools::autopilot::spoken_heading(heading_mag)
+    )
+}
+
+/// The resume's refusal when a climb first needs a heading and the magnetic
+/// variation did not read.
+pub const NO_VARIATION: &str = "I can't read the magnetic variation, so I can't set a heading for \
+     the climb to the safe altitude. I haven't taken control.";
+
 /// A [`Steady`] read now, seconds since `clock`; `None` for a failed read.
 async fn steady_read(
     xp: &crate::xplane::XPlaneClient,
     clock: std::time::Instant,
 ) -> Option<Steady> {
-    let (lat, lon, alt, vs, gs, track) = tokio::join!(
-        xp.get_float(crate::datarefs::LATITUDE),
-        xp.get_float(crate::datarefs::LONGITUDE),
+    // Position and groundspeed are one frame (`sim::position`, #157).
+    let (pos, alt, vs, track) = tokio::join!(
+        sim::position::read(xp),
         xp.get_float(crate::datarefs::ALTITUDE_FT),
         xp.get_float(crate::datarefs::VVI_FPM),
-        xp.get_float("sim/flightmodel/position/groundspeed"),
         xp.get_float("sim/flightmodel/position/hpath"),
     );
+    let (lat, lon) = sim::position::lat_lon(&pos);
+    let gs = sim::position::field(&pos, |p| p.gs_ms);
     let t_s = clock.elapsed().as_secs_f64();
     let [lat, lon, alt_ft, vs_fpm, gs_ms, track_true] =
         crate::control::measurements("resume_recheck", [lat, lon, alt, vs, gs, track])?;
-    Some(Steady { t_s, lat, lon, alt_ft, vs_fpm, gs_kts: gs_ms * 1.943_844, track_true })
+    let gs_kts = gs_ms * sim::ground::MS_TO_KTS;
+    Some(Steady { t_s, lat, lon, alt_ft, vs_fpm, gs_kts, track_true })
 }
 
 /// What the recovery planner arms (`recovery_plan`): the follower over the
@@ -502,7 +527,7 @@ impl Tool for FullAuto {
             .xplane
             .get_float(crate::datarefs::ON_GROUND_ANY)
             .await
-            .is_ok_and(|g| g > 0.5);
+            .is_ok_and(sim::ground::on_ground);
         // "Fly the flight plan" in the air is the checked RESUME of the plan
         // on the shelf: it used to be refused ("we're already flying, say
         // navigate"), so a pilot handing over mid-route, and the sortie
@@ -831,11 +856,10 @@ impl FullAuto {
             },
         };
         let xp = crate::xplane::XPlaneClient::new(ctx.config.xplane_base_url.clone());
-        let (ground, agl, lat, lon, altitude, bank, ias, frozen, engines, aircraft, mag_var) = tokio::join!(
+        // Position and heights are one frame (`sim::position`, #157).
+        let (ground, pos, altitude, bank, ias, frozen, engines, aircraft, mag_var) = tokio::join!(
             ctx.xplane.get_float(crate::datarefs::ON_GROUND_ANY),
-            ctx.xplane.get_float(crate::datarefs::AGL_METERS),
-            ctx.xplane.get_float(crate::datarefs::LATITUDE),
-            ctx.xplane.get_float(crate::datarefs::LONGITUDE),
+            sim::position::read(&xp),
             ctx.xplane.get_float(crate::datarefs::ALTITUDE_FT),
             ctx.xplane.get_float(crate::datarefs::BANK_DEG),
             ctx.xplane.get_float(crate::datarefs::AIRSPEED_KTS),
@@ -852,8 +876,10 @@ impl FullAuto {
             ctx.xplane
                 .get_float("sim/flightmodel/position/magnetic_variation"),
         );
-        let (elevation, pitch, flap, stall, fuel_kg, flow) = tokio::join!(
-            ctx.xplane.get_float(crate::datarefs::ELEVATION_M),
+        let (lat, lon) = sim::position::lat_lon(&pos);
+        let agl = sim::position::field(&pos, |p| p.agl_m);
+        let elevation = sim::position::field(&pos, |p| p.elev_m);
+        let (pitch, flap, stall, fuel_kg, flow) = tokio::join!(
             ctx.xplane.get_float(crate::datarefs::PITCH_DEG),
             ctx.xplane.get_float(crate::datarefs::FLAP_RATIO),
             ctx.xplane.get_float("sim/cockpit2/annunciators/stall_warning_ratio"),
@@ -871,12 +897,10 @@ impl FullAuto {
         let first_read = steady_read(&xp, clock).await;
         let ok = |r: &anyhow::Result<f64>| r.as_ref().ok().copied().filter(|v| v.is_finite());
         let flap = ok(&flap).unwrap_or(0.0);
-        let floor_kts = crate::aircraft::config_floor_kts(flap)
-            .or_else(crate::aircraft::speed_floor_kts)
-            .map(|f| f * 0.95);
+        let floor_kts = crate::tools::recover::unflyable_floor_kts(flap);
         let unflyable =
             crate::tools::recover::unflyable(Some(ias), floor_kts, ok(&pitch), Some(bank), ok(&stall));
-        if let Some(why) = resume_gate(frozen, ground > 0.5, unflyable) {
+        if let Some(why) = resume_gate(frozen, sim::ground::on_ground(ground), unflyable) {
             return Err(why);
         }
         let running = engines.as_ref().ok().map(|v| {
@@ -980,33 +1004,55 @@ impl FullAuto {
                 _ => heights = None,
             }
         }
-        let under = true_ft - agl_ft;
-        let (floor_true, source) = match heights.as_ref().and_then(|h| h.iter().copied().reduce(f64::max)) {
-            Some(high) => (high.max(under) + crate::procedure::TERRAIN_CLEARANCE_FT, "terrain"),
-            None => {
-                let mora = crate::safe_hold::mora_grid().and_then(|g| {
-                    std::iter::once((lat, lon))
-                        .chain(pts.iter().copied())
-                        .filter_map(|(a, b)| g.at(a, b))
-                        .reduce(f64::max)
-                });
-                let msa_path = std::path::Path::new(&ctx.config.fix_data_path)
-                    .with_file_name("earth_msa.dat")
-                    .to_string_lossy()
-                    .into_owned();
-                let msa = [&fp.origin, &fp.destination]
-                    .into_iter()
-                    .filter_map(|icao| crate::nav::airport_msa_ft(&msa_path, icao))
-                    .reduce(f64::max);
-                match (mora, msa) {
-                    (Some(m), _) => (m.max(under + crate::procedure::TERRAIN_CLEARANCE_FT), "mora"),
-                    (None, Some(m)) => (m, "msa"),
-                    (None, None) => return Err(
-                        "The terrain probe isn't answering and I have no grid MORA, so I can't check the way. Check the plugin build on the Health screen.".into(),
-                    ),
-                }
-            }
+        // The probed path as a ray, for the floor and the climb's check.
+        let brg = crate::nav::bearing_deg(lat, lon, to_lat, to_lon);
+        let path_ray = heights.as_ref().map(|h| crate::safe_hold::Ray {
+            bearing_true: brg,
+            ground_ft: pts
+                .iter()
+                .map(|&(a, b)| crate::nav::haversine_nm(lat, lon, a, b))
+                .zip(h.iter().copied())
+                .collect(),
+        });
+        let probed = path_ray.as_ref().and_then(crate::safe_hold::Ray::max_ft).is_some();
+        let (mora_ft, msa_ft) = if probed {
+            (None, None)
+        } else {
+            let mora = crate::plan_audit::mora_grid(&ctx.config.fix_data_path).and_then(|g| {
+                std::iter::once((lat, lon))
+                    .chain(pts.iter().copied())
+                    .filter_map(|(a, b)| g.at(a, b))
+                    .reduce(f64::max)
+            });
+            let msa_path = crate::full_auto::msa_path_for(&ctx.config.fix_data_path);
+            let msa = [&fp.origin, &fp.destination]
+                .into_iter()
+                .filter_map(|icao| crate::nav::airport_msa_ft(&msa_path, icao))
+                .reduce(f64::max);
+            (mora, msa)
         };
+        // The safe hold's own floor rule: the probe, else MORA, else MSA,
+        // each never under the ground below plus the clearance.
+        let here = crate::safe_hold::Air {
+            alt_true_ft: true_ft,
+            agl_ft,
+            ..Default::default()
+        };
+        let terrain = crate::safe_hold::Terrain {
+            ahead: path_ray.clone(),
+            mora_ft,
+            msa_ft,
+            ..Default::default()
+        };
+        let crate::safe_hold::Floor {
+            true_ft: floor_true,
+            source,
+        } = crate::safe_hold::floor(&here, &terrain);
+        if source == "under" {
+            return Err(
+                "The terrain probe isn't answering and I have no grid MORA, so I can't check the way. Check the plugin build on the Health screen.".into(),
+            );
+        }
         let floor_ind = floor_true + (altitude - true_ft);
         let climb = rp::climb_first(altitude, floor_ind);
         // Only the physically impossible is refused.
@@ -1024,9 +1070,8 @@ impl FullAuto {
             let r = dest_runways.iter().find(|r| {
                 crate::nav::same_runway_end(&r.ident_a, rwy) || crate::nav::same_runway_end(&r.ident_b, rwy)
             })?;
-            let have = crate::nav::haversine_nm(r.lat_a, r.lon_a, r.lat_b, r.lon_b) * 1852.0;
-            let need = crate::aircraft::landing_needed_m(crate::aircraft::landing_distance_m(), None, 0.0);
-            (need > 0.0).then_some((rwy, have, need))
+            let need = plan_landing_need_m(self.landing_distance_ft, self.takeoff_distance_ft)?;
+            Some((rwy, r.length_m(), need))
         });
         crate::full_auto::event(
             "recovery_plan",
@@ -1055,20 +1100,16 @@ impl FullAuto {
         }
         // The climb first, on the way's own bearing when the climb clears
         // its ground, else on the clear heading nearest it.
-        let brg = crate::nav::bearing_deg(lat, lon, to_lat, to_lon);
         let mut climb_heading_mag: Option<f64> = None;
         let climb_leg = match climb {
             None => None,
             Some(alt) => {
+                // The climb leg is a magnetic course: no variation read, no
+                // course (a "0" flew the bug off by the whole variation).
+                let Some(var) = mag_var else {
+                    return Err(NO_VARIATION.into());
+                };
                 let grad = crate::safe_hold::gradient_ft_nm(self.cfg.climb.max_climb_fpm, gs_kts);
-                let path_ray = heights.as_ref().map(|h| crate::safe_hold::Ray {
-                    bearing_true: brg,
-                    ground_ft: pts
-                        .iter()
-                        .map(|&(a, b)| crate::nav::haversine_nm(lat, lon, a, b))
-                        .zip(h.iter().copied())
-                        .collect(),
-                });
                 let clears = path_ray
                     .as_ref()
                     .is_none_or(|r| crate::safe_hold::climb_clears(r, true_ft, grad, true));
@@ -1083,7 +1124,7 @@ impl FullAuto {
                         agl_ft,
                         gs_kts,
                         track_true: brg,
-                        mag_var: mag_var.unwrap_or(0.0),
+                        mag_var: Some(var),
                         ..Default::default()
                     };
                     let fan = crate::safe_hold::probe_fan(&xp, &air).await;
@@ -1092,17 +1133,13 @@ impl FullAuto {
                         alt = alt.max(crate::safe_hold::up_100(need + (altitude - true_ft)));
                     }
                 }
-                let course_mag = crate::runway::true_to_mag(course_true, mag_var.unwrap_or(0.0)).round();
+                let course_mag = crate::runway::true_to_mag(course_true, var).round();
                 climb_heading_mag = Some(course_mag);
                 Some(rp::climb_leg(course_mag, alt))
             }
         };
         let climb_words = match (&climb_leg, climb_heading_mag) {
-            (Some(l), Some(h)) => format!(
-                "Climbing to {} first, heading {:03}, the safe altitude on the way. ",
-                crate::flightplan::spoken_feet(l.alt1_ft.unwrap_or(0.0)),
-                (h.round() as i64).rem_euclid(360)
-            ),
+            (Some(l), Some(h)) => climb_first_words(l.alt1_ft.unwrap_or(0.0), h),
             _ => String::new(),
         };
         let lead = if fetched {
@@ -1412,15 +1449,11 @@ impl FullAuto {
             // round the aircraft): a chunk beyond it is judged on the grid
             // MORA's highest ground, which errs high. LEMG-LEBL, 413 nm, was
             // refused outright on 2026-09-28.
-            let root = super::autoland::xplane_root();
-            let mora = tokio::task::spawn_blocking(move || {
-                crate::nav::MoraGrid::load(&format!(
-                    "{root}/Resources/default data/earth_mora.dat"
-                ))
-            })
-            .await
-            .ok()
-            .flatten();
+            let fix = ctx.config.fix_data_path.clone();
+            let mora = tokio::task::spawn_blocking(move || crate::plan_audit::mora_grid(&fix))
+                .await
+                .ok()
+                .flatten();
             let mut heights = Vec::new();
             let mut from_grid = 0usize;
             let mut grid_cautions = 0usize;
@@ -2003,6 +2036,27 @@ pub fn spoken_arm_line(
 mod tests {
     use super::*;
     use crate::recovery_plan::Join;
+
+    /// The planner's runway need is the arm's: an airframe that recites only
+    /// a takeoff distance is still checked (the live landing figure alone
+    /// left it unchecked), and one reciting neither is not.
+    #[test]
+    fn the_climb_first_says_north_as_three_six_zero() {
+        assert!(climb_first_words(6_000.0, 0.4).contains("heading 360,"));
+        assert!(climb_first_words(6_000.0, 359.6).contains("heading 360,"));
+        assert!(climb_first_words(6_000.0, 45.0).contains("heading 045,"));
+    }
+
+    #[test]
+    fn the_recovery_runway_need_is_the_arms() {
+        let only_takeoff = plan_landing_need_m(None, Some(3_000.0)).expect("checked");
+        let arm = crate::aircraft::planned_landing_needed_ft(None, Some(3_000.0)).unwrap();
+        assert!((only_takeoff - arm * 0.3048).abs() < 1e-9);
+        assert!(only_takeoff > 0.0);
+        assert_eq!(plan_landing_need_m(None, None), None);
+        let both = plan_landing_need_m(Some(2_000.0), Some(3_000.0)).unwrap();
+        assert!(both < only_takeoff, "the landing figure first");
+    }
 
     #[test]
     fn take_us_to_is_checked_against_the_plan() {

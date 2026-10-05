@@ -115,21 +115,6 @@ pub const UNFLYABLE_S: f64 = 2.0;
 // `autopilot_state` bitfield; 4 wing leveler, 512 HNAV and 8192 FMS engaged
 // are the autopilot's own, never read here).
 use crate::autoflight::{Modes, OurChange, Ours};
-pub const AP_AUTOTHROTTLE: i64 = Modes::AUTOTHROTTLE as i64;
-pub const AP_HDG: i64 = Modes::HEADING as i64;
-pub const AP_SPEED_PITCH: i64 = Modes::SPEED_ON_PITCH as i64;
-pub const AP_VS: i64 = Modes::VS as i64;
-pub const AP_ALT_ARMED: i64 = Modes::ALT_ARMED as i64;
-pub const AP_FLCH: i64 = Modes::LEVEL_CHANGE as i64;
-pub const AP_HNAV_ARMED: i64 = Modes::LOC_ARMED as i64;
-pub const AP_GS_ARMED: i64 = Modes::GS_ARMED as i64;
-pub const AP_GS: i64 = Modes::GS as i64;
-pub const AP_FMS_ARMED: i64 = Modes::FMS_ARMED as i64;
-pub const AP_ALT_HOLD: i64 = Modes::ALT_HOLD as i64;
-pub const AP_TOGA_LAT: i64 = Modes::TOGA_LATERAL as i64;
-pub const AP_TOGA_VERT: i64 = Modes::TOGA_VERTICAL as i64;
-pub const AP_VNAV_ARMED: i64 = Modes::VNAV_ARMED as i64;
-pub const AP_VNAV: i64 = Modes::VNAV as i64;
 
 // ------------------------------------------------------------- the readings
 
@@ -137,24 +122,26 @@ pub const AP_VNAV: i64 = Modes::VNAV as i64;
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct ApRead {
     pub servos: Option<bool>,
-    /// `sim/cockpit/autopilot/autopilot_state`.
-    pub state: Option<i64>,
+    /// `sim/cockpit/autopilot/autopilot_state`, decoded by the panel owner
+    /// ([`Modes::from_read`]: a negative or broken read is no state).
+    pub state: Option<Modes>,
     pub alt_dial_ft: Option<f64>,
     pub vs_dial_fpm: Option<f64>,
     pub hdg_bug_mag: Option<f64>,
 }
 
 impl ApRead {
-    fn has(&self, bit: i64) -> bool {
-        self.state.is_some_and(|s| s & bit != 0)
+    fn has(&self, bit: u32) -> bool {
+        self.state.is_some_and(|s| s.0 & bit != 0)
     }
     /// The autothrottle holds the speed (the pilot's or the aircraft's):
     /// our governor would fight it.
     pub fn autothrottle(&self) -> bool {
-        self.has(AP_AUTOTHROTTLE)
+        self.has(Modes::AUTOTHROTTLE)
     }
     pub fn json(&self) -> Value {
-        json!({ "servos": self.servos, "state": self.state, "alt_dial": self.alt_dial_ft.map(r0),
+        json!({ "servos": self.servos, "state": self.state.map(|m| m.0),
+                "alt_dial": self.alt_dial_ft.map(r0),
                 "vs_dial": self.vs_dial_fpm.map(r0), "hdg_bug": self.hdg_bug_mag.map(r0) })
     }
 }
@@ -173,8 +160,9 @@ pub struct Air {
     pub ias_kts: f64,
     pub gs_kts: f64,
     pub track_true: f64,
-    /// X-Plane's `magnetic_variation` (positive WEST: mag = true + var).
-    pub mag_var: f64,
+    /// X-Plane's `magnetic_variation` (positive WEST: mag = true + var);
+    /// `None` on a failed read: no variation, no heading to turn to.
+    pub mag_var: Option<f64>,
     pub bank_deg: f64,
     pub pitch_deg: f64,
     pub flap: f64,
@@ -219,6 +207,9 @@ pub struct Terrain {
     pub fan: Vec<Ray>,
     /// The grid MORA here and ahead (already the ground plus its margin).
     pub mora_ft: Option<f64>,
+    /// The fields' sector altitude (`earth_msa.dat`, already the ground plus
+    /// its margin), the last resort before the ground under.
+    pub msa_ft: Option<f64>,
 }
 
 /// The safe floor, true feet, and where it came from.
@@ -229,8 +220,11 @@ pub struct Floor {
 }
 
 /// The floor: the highest ground ahead (and under) plus [`CLEARANCE_FT`]; the
-/// grid MORA without a probe; the ground under us plus the clearance with
-/// neither (the sim always knows the height above the ground). Pure.
+/// grid MORA without a probe, else the sector altitude, either never under
+/// the ground below us plus the clearance (a sector altitude is the field's,
+/// and the aircraft may be over higher ground away from it); the ground under
+/// us plus the clearance with none (the sim always knows the height above the
+/// ground). Pure.
 pub fn floor(air: &Air, t: &Terrain) -> Floor {
     let under = air.ground_under_ft();
     if let Some(m) = t.ahead.as_ref().and_then(Ray::max_ft) {
@@ -243,6 +237,12 @@ pub fn floor(air: &Air, t: &Terrain) -> Floor {
         return Floor {
             true_ft: m.max(under + CLEARANCE_FT),
             source: "mora",
+        };
+    }
+    if let Some(m) = t.msa_ft.filter(|m| m.is_finite()) {
+        return Floor {
+            true_ft: m.max(under + CLEARANCE_FT),
+            source: "msa",
         };
     }
     Floor {
@@ -269,25 +269,25 @@ pub enum Vertical {
 /// The vertical path the autopilot is on. A failed dial read is no window.
 /// Pure.
 pub fn vertical(ap: &ApRead, air: &Air) -> Vertical {
-    if ap.has(AP_GS) {
+    if ap.has(Modes::GS) {
         return Vertical::Glideslope;
     }
     let alt = air.alt_ft;
-    if ap.has(AP_ALT_HOLD) {
+    if ap.has(Modes::ALT_HOLD) {
         return Vertical::Holds(alt);
     }
     let window = ap.alt_dial_ft.filter(|w| w.is_finite());
-    let mode_descends = if ap.has(AP_VS) {
+    let mode_descends = if ap.has(Modes::VS) {
         ap.vs_dial_fpm.map(|v| v < -50.0)
-    } else if ap.has(AP_FLCH) || ap.has(AP_VNAV) {
+    } else if ap.has(Modes::LEVEL_CHANGE) || ap.has(Modes::VNAV) {
         window.map(|w| w < alt - FLOOR_TOL_FT)
     } else {
         None
     };
     let descending = mode_descends.unwrap_or(air.vs_fpm < -300.0);
-    let climbing = if ap.has(AP_VS) {
+    let climbing = if ap.has(Modes::VS) {
         ap.vs_dial_fpm.is_some_and(|v| v > 50.0)
-    } else if ap.has(AP_FLCH) || ap.has(AP_VNAV) {
+    } else if ap.has(Modes::LEVEL_CHANGE) || ap.has(Modes::VNAV) {
         window.is_some_and(|w| w > alt + FLOOR_TOL_FT)
     } else {
         air.vs_fpm > 300.0
@@ -295,7 +295,7 @@ pub fn vertical(ap: &ApRead, air: &Air) -> Vertical {
     if descending {
         // A window below in the direction of travel is captured where the
         // mode arms it: FLCH and VNAV always, VS with the altitude armed.
-        let armed = ap.has(AP_ALT_ARMED) || ap.has(AP_FLCH) || ap.has(AP_VNAV);
+        let armed = ap.has(Modes::ALT_ARMED) || ap.has(Modes::LEVEL_CHANGE) || ap.has(Modes::VNAV);
         return match window {
             Some(w) if w < alt - FLOOR_TOL_FT && armed => Vertical::Captures(w),
             _ => Vertical::Unbounded,
@@ -537,10 +537,18 @@ pub fn hold_cmd(
             .is_none_or(|r| climb_clears(r, air.alt_true_ft, grad, false));
         if !ahead_clears {
             if let Some((brg, need)) = clear_heading(&t.fan, air, target_true, grad) {
-                if crate::angles::abs_diff_deg(brg, air.track_true) > 5.0 {
-                    heading_mag = Some(crate::runway::true_to_mag(brg, air.mag_var).round());
+                // A turn is dialled in magnetic: on a failed variation read a
+                // "0" would set the bug off the clear bearing by the whole
+                // variation, so no turn is chosen and the climb stays ahead.
+                let turn = crate::angles::abs_diff_deg(brg, air.track_true) > 5.0;
+                match (turn, air.mag_var) {
+                    (true, Some(var)) => {
+                        heading_mag = Some(crate::runway::true_to_mag(brg, var).round());
+                        target_true = target_true.max(need);
+                    }
+                    (true, None) => {}
+                    (false, _) => target_true = target_true.max(need),
                 }
-                target_true = target_true.max(need);
             }
         }
     }
@@ -609,15 +617,15 @@ pub const OURS_SLACK_S: f64 = 10.0;
 /// The bits a pilot presses and the autopilot never sets by itself.
 /// (An armed mode going engaged, a capture, the wing leveler the servos
 /// default to: the autopilot's own, never counted.)
-const PILOT_MODE_BITS: i64 = AP_AUTOTHROTTLE
-    | AP_SPEED_PITCH
-    | AP_FLCH
-    | AP_HNAV_ARMED
-    | AP_FMS_ARMED
-    | AP_GS_ARMED
-    | AP_TOGA_LAT
-    | AP_TOGA_VERT
-    | AP_VNAV_ARMED;
+const PILOT_MODE_BITS: u32 = Modes::AUTOTHROTTLE
+    | Modes::SPEED_ON_PITCH
+    | Modes::LEVEL_CHANGE
+    | Modes::LOC_ARMED
+    | Modes::FMS_ARMED
+    | Modes::GS_ARMED
+    | Modes::TOGA_LATERAL
+    | Modes::TOGA_VERTICAL
+    | Modes::VNAV_ARMED;
 
 /// Did someone move the autopilot since `reference` (the episode's first
 /// read, or our own hold read back)? The servos coming in or out, the window
@@ -649,17 +657,17 @@ pub fn mcp_moved(
     if let (Some(a), Some(b), true) = (
         reference.hdg_bug_mag,
         now.hdg_bug_mag,
-        reference.has(AP_HDG) && now.has(AP_HDG),
+        reference.has(Modes::HEADING) && now.has(Modes::HEADING),
     ) {
         if crate::angles::abs_diff_deg(a, b) > 3.0 && !ours.wrote(Dial::HeadingBug, b, 3.0) {
             return Some("heading");
         }
     }
-    let (Some(s0), Some(s1)) = (reference.state, now.state) else {
+    let (Some(Modes(s0)), Some(Modes(s1))) = (reference.state, now.state) else {
         return None;
     };
     // A mode our own press brought in is ours.
-    let new = s1 & !s0 & !(ours.mode_bits() as i64);
+    let new = s1 & !s0 & !ours.mode_bits();
     if new & PILOT_MODE_BITS != 0 {
         return Some("mode");
     }
@@ -669,17 +677,17 @@ pub fn mcp_moved(
     if let (Some(a), Some(b), true) = (
         reference.vs_dial_fpm,
         now.vs_dial_fpm,
-        s0 & AP_VS != 0 && s1 & AP_VS != 0,
+        s0 & Modes::VS != 0 && s1 & Modes::VS != 0,
     ) {
         if (a - b).abs() > FLOOR_TOL_FT && !ours.wrote(Dial::Vs, b, FLOOR_TOL_FT) {
             return Some("vs_wheel");
         }
     }
-    if new & (AP_VS | AP_HDG) != 0 {
+    if new & (Modes::VS | Modes::HEADING) != 0 {
         return Some("mode");
     }
     // ALT HOLD appearing away from the window is a press, not a capture.
-    if new & AP_ALT_HOLD != 0 && now.alt_dial_ft.is_some_and(|w| (w - alt_ft).abs() > 300.0) {
+    if new & Modes::ALT_HOLD != 0 && now.alt_dial_ft.is_some_and(|w| (w - alt_ft).abs() > 300.0) {
         return Some("alt_hold");
     }
     None
@@ -1068,7 +1076,7 @@ pub fn hold_line(cmd: &HoldCmd, escape: bool, cause: &str) -> String {
     let feet = crate::flightplan::spoken_feet(cmd.alt_ft);
     let heading = cmd
         .heading_mag
-        .map(|h| format!(", heading {}", spoken_heading(h)))
+        .map(|h| format!(", heading {}", crate::tools::autopilot::spoken_heading(h)))
         .unwrap_or_default();
     let lead = match (escape, cmd.climb, cause) {
         (true, _, _) => "Terrain!".to_string(),
@@ -1082,11 +1090,6 @@ pub fn hold_line(cmd: &HoldCmd, escape: bool, cause: &str) -> String {
         format!("Levelling at {feet}, the safe altitude here{heading}")
     };
     format!("{lead} {what}. Say fly the flight plan, or my controls.")
-}
-
-fn spoken_heading(deg: f64) -> String {
-    let d = (deg.round() as i64).rem_euclid(360);
-    format!("{:03}", if d == 0 { 360 } else { d })
 }
 
 fn r0(v: f64) -> f64 {
@@ -1181,21 +1184,9 @@ pub fn split_fan(rays: &[(f64, Vec<(f64, f64, f64)>)], ground: &[f64]) -> Vec<Ra
     out
 }
 
-/// The grid MORA, loaded once per process.
-pub fn mora_grid() -> Option<&'static crate::nav::MoraGrid> {
-    static GRID: std::sync::OnceLock<Option<crate::nav::MoraGrid>> = std::sync::OnceLock::new();
-    GRID.get_or_init(|| {
-        crate::nav::MoraGrid::load(&format!(
-            "{}/Resources/default data/earth_mora.dat",
-            crate::tools::autoland::xplane_root()
-        ))
-    })
-    .as_ref()
-}
-
 /// The MORA here and [`LOOK_NM`] ahead, the higher.
-pub fn mora_ahead(air: &Air) -> Option<f64> {
-    let g = mora_grid()?;
+pub fn mora_ahead(air: &Air, fix_data_path: &str) -> Option<f64> {
+    let g = crate::plan_audit::mora_grid(fix_data_path)?;
     let (la, lo) = crate::nav::project_latlon(air.lat, air.lon, air.track_true, LOOK_NM);
     [g.at(air.lat, air.lon), g.at(la, lo)]
         .into_iter()
@@ -1218,12 +1209,12 @@ async fn read_ap(xp: &crate::xplane::XPlaneClient) -> ApRead {
         xp.get_float(d::SERVOS_ON),
         xp.get_float(crate::autoflight::names::AP_STATE),
         crate::autoflight::read_dial(xp, crate::autoflight::Dial::Altitude),
-        xp.get_float(d::VVI_DIAL_FPM),
+        crate::autoflight::read_dial(xp, crate::autoflight::Dial::Vs),
         crate::autoflight::read_dial(xp, crate::autoflight::Dial::HeadingBug),
     );
     ApRead {
         servos: ok(servos).map(|v| v > 0.5),
-        state: ok(state).map(|v| v as i64),
+        state: ok(state).and_then(Modes::from_read),
         alt_dial_ft: ok(alt),
         vs_dial_fpm: ok(vs),
         hdg_bug_mag: ok(hdg),
@@ -1232,20 +1223,22 @@ async fn read_ap(xp: &crate::xplane::XPlaneClient) -> ApRead {
 
 /// The aircraft, the hands and the stall warning; `None` on a failed read of
 /// anything the decision rests on (no measurement, no verdict).
-async fn read_air(xp: &crate::xplane::XPlaneClient) -> Option<(Air, bool, Option<f64>)> {
+async fn read_air(xp: &dyn crate::xplane::XPlane) -> Option<(Air, bool, Option<f64>)> {
     use crate::datarefs as d;
-    let (lat, lon, alt, elev, agl, vs, ias, gs, hpath, mag_var) = tokio::join!(
-        xp.get_float(d::LATITUDE),
-        xp.get_float(d::LONGITUDE),
+    // Position, height, groundspeed and vertical speed are ONE frame
+    // (`sim::position`, #157); the track and the rest ride beside it.
+    let (pos, alt, ias, hpath, mag_var) = tokio::join!(
+        sim::position::read(xp),
         xp.get_float(d::ALTITUDE_FT),
-        xp.get_float(d::ELEVATION_M),
-        xp.get_float(d::AGL_METERS),
-        xp.get_float(d::VS_FPM_FLIGHT_MODEL),
         xp.get_float(d::AIRSPEED_KTS),
-        xp.get_float(d::GROUNDSPEED_MS),
         xp.get_float(HPATH),
         xp.get_float(MAG_VAR),
     );
+    let (lat, lon) = sim::position::lat_lon(&pos);
+    let elev = sim::position::field(&pos, |p| p.elev_m);
+    let agl = sim::position::field(&pos, |p| p.agl_m);
+    let vs = sim::position::field(&pos, |p| p.vs_fpm);
+    let gs = sim::position::field(&pos, |p| p.gs_ms);
     let (bank, pitch, flap, yp, yr, pyield, syield, stall) = tokio::join!(
         xp.get_float(d::BANK_DEG),
         xp.get_float(d::PITCH_DEG),
@@ -1276,9 +1269,9 @@ async fn read_air(xp: &crate::xplane::XPlaneClient) -> Option<(Air, bool, Option
         agl_ft: agl * 3.280_84,
         vs_fpm: vs,
         ias_kts: ias,
-        gs_kts: gs * 1.943_844,
+        gs_kts: gs * sim::ground::MS_TO_KTS,
         track_true: hpath.rem_euclid(360.0),
-        mag_var: ok(mag_var).unwrap_or(0.0),
+        mag_var: ok(mag_var),
         bank_deg: ok(bank).unwrap_or(0.0),
         pitch_deg: ok(pitch).unwrap_or(0.0),
         flap: ok(flap).unwrap_or(0.0),
@@ -1374,7 +1367,9 @@ async fn watch(
             continue;
         }
         let ground = xp.get_float(crate::datarefs::ON_GROUND_ANY).await.ok();
-        let airborne = ground.is_some_and(|g| g < 0.5);
+        let airborne = ground
+            .filter(|g| g.is_finite())
+            .is_some_and(|g| !sim::ground::on_ground(g));
         let frozen = airborne
             && (loading
                 || xp
@@ -1442,9 +1437,7 @@ async fn watch(
                 ends = Some((la, lo, found));
             }
             let profile = live.get();
-            let floor_kts = crate::aircraft::config_floor_kts(air.flap)
-                .or_else(crate::aircraft::speed_floor_kts)
-                .map(|f| f * 0.95);
+            let floor_kts = crate::tools::recover::unflyable_floor_kts(air.flap);
             tick.unflyable = crate::tools::recover::unflyable(
                 Some(air.ias_kts),
                 floor_kts,
@@ -1463,7 +1456,8 @@ async fn watch(
             tick.terrain = Terrain {
                 ahead: ahead.as_ref().and_then(|a| a.4.clone()),
                 fan: fan.clone(),
-                mora_ft: mora_ahead(&air),
+                mora_ft: mora_ahead(&air, &config.fix_data_path),
+                msa_ft: None,
             };
             // A climb that the ground ahead may outrun asks the fan first.
             if tick.actuate && fan.is_empty() && hold.held().is_none() {
@@ -1523,7 +1517,7 @@ async fn watch(
             Act::Hold(cmd) | Act::Escape(cmd) => {
                 let escape = matches!(act, Act::Escape(_));
                 let cause = hold.ep.as_ref().map(|e| e.cause).unwrap_or("release");
-                let set = set_hold(&xp, &config, &live, &voice, &status, &tick, &cmd).await;
+                let set = set_hold(&xp, &config, &live, &tick, &cmd).await;
                 let ap_after = read_ap(&xp).await;
                 let took = ap_after.servos == Some(true)
                     && ap_after
@@ -1610,8 +1604,6 @@ async fn set_hold(
     xp: &crate::xplane::XPlaneClient,
     config: &crate::config::Config,
     live: &crate::detect::LiveProfile,
-    _voice: &crate::voice::Voice,
-    _status: &Option<crate::plugin_status::StatusSink>,
     tick: &Tick,
     cmd: &HoldCmd,
 ) -> Vec<String> {

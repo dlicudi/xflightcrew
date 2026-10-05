@@ -46,7 +46,7 @@ fn air_of(r: &Value) -> Air {
         ias_kts: f(r, "ias"),
         gs_kts: f(r, "gs"),
         track_true: f(r, "track"),
-        mag_var: -1.0,
+        mag_var: Some(-1.0),
         bank_deg: f(r, "bank"),
         pitch_deg: 0.0,
         flap: f(r, "flap"),
@@ -67,7 +67,7 @@ fn ap_of(r: &Value) -> ApRead {
     };
     ApRead {
         servos,
-        state: r["in"]["ap_state"].as_i64(),
+        state: r["in"]["ap_state"].as_f64().and_then(Modes::from_read),
         alt_dial_ft: Some(0.0),
         vs_dial_fpm: r["in"]["vs_dial"].as_f64(),
         hdg_bug_mag: None,
@@ -134,6 +134,7 @@ fn tick_of(states: &[Value], i: usize, t0: f64, actuate: bool, pilot_words: bool
             ahead: ahead_of(states, i),
             fan: vec![],
             mora_ft: None,
+            msa_ft: None,
         },
         approach: None,
         terminal: None,

@@ -14,7 +14,7 @@ fn air() -> Air {
         ias_kts: 176.0,
         gs_kts: 190.0,
         track_true: 306.0,
-        mag_var: -1.0,
+        mag_var: Some(-1.0),
         bank_deg: 0.0,
         pitch_deg: 1.0,
         flap: 0.5,
@@ -26,7 +26,7 @@ fn air() -> Air {
 fn ap_vs_down() -> ApRead {
     ApRead {
         servos: Some(true),
-        state: Some(AP_HDG | AP_VS | AP_ALT_ARMED),
+        state: Some(Modes(Modes::HEADING | Modes::VS | Modes::ALT_ARMED)),
         alt_dial_ft: Some(0.0),
         vs_dial_fpm: Some(-330.0),
         hdg_bug_mag: Some(305.0),
@@ -65,17 +65,17 @@ fn the_autopilot_s_vertical_path_is_read_from_its_modes() {
     assert_eq!(vertical(&ap, &a), Vertical::Unbounded);
     // VS without the altitude armed never captures.
     let mut ap = ap_vs_down();
-    ap.state = Some(AP_HDG | AP_VS);
+    ap.state = Some(Modes(Modes::HEADING | Modes::VS));
     assert_eq!(vertical(&ap, &a), Vertical::Unbounded);
     // ALT HOLD holds here; a glideslope is an approach.
     let mut ap = ap_vs_down();
-    ap.state = Some(AP_HDG | AP_ALT_HOLD);
+    ap.state = Some(Modes(Modes::HEADING | Modes::ALT_HOLD));
     assert_eq!(vertical(&ap, &a), Vertical::Holds(2_930.0));
-    ap.state = Some(AP_HNAV_ARMED | AP_GS);
+    ap.state = Some(Modes(Modes::LOC_ARMED | Modes::GS));
     assert_eq!(vertical(&ap, &a), Vertical::Glideslope);
     // Level change to a window below captures it; a VS climb climbs.
     let mut ap = ap_vs_down();
-    ap.state = Some(AP_FLCH);
+    ap.state = Some(Modes(Modes::LEVEL_CHANGE));
     ap.alt_dial_ft = Some(2_000.0);
     assert_eq!(vertical(&ap, &a), Vertical::Captures(2_000.0));
     let mut ap = ap_vs_down();
@@ -83,13 +83,28 @@ fn the_autopilot_s_vertical_path_is_read_from_its_modes() {
     assert_eq!(vertical(&ap, &a), Vertical::Climbs);
     // No vertical mode: the aircraft's own vertical speed decides.
     let mut ap = ap_vs_down();
-    ap.state = Some(AP_HDG);
+    ap.state = Some(Modes(Modes::HEADING));
     let mut fast_down = a;
     fast_down.vs_fpm = -900.0;
     assert_eq!(vertical(&ap, &fast_down), Vertical::Unbounded);
     let mut level = a;
     level.vs_fpm = -100.0;
     assert_eq!(vertical(&ap, &level), Vertical::Holds(2_930.0));
+}
+
+/// The bitfield is the panel owner's decoding: a -1 read (a sim with no
+/// autopilot) is no state, never every mode at once (a glideslope "coupled"
+/// would excuse any descent), and a float a hair under a bit rounds to it.
+#[test]
+fn a_negative_mode_read_is_no_state_never_every_bit() {
+    let mut ap = ap_vs_down();
+    ap.state = Modes::from_read(-1.0);
+    assert_eq!(ap.state, None);
+    let mut fast_down = air();
+    fast_down.vs_fpm = -900.0;
+    assert_eq!(vertical(&ap, &fast_down), Vertical::Unbounded);
+    ap.state = Modes::from_read(2_047.999);
+    assert_eq!(vertical(&ap, &air()), Vertical::Glideslope);
 }
 
 #[test]
@@ -110,6 +125,7 @@ fn the_floor_is_the_ground_ahead_then_the_grid_then_the_ground_under() {
         ahead: None,
         fan: vec![],
         mora_ft: Some(6_100.0),
+        msa_ft: None,
     };
     assert_eq!(
         floor(&a, &t),
@@ -289,6 +305,7 @@ fn the_hold_climbs_to_the_floor_or_bounds_the_descent_there() {
         ahead: Some(wall.clone()),
         fan: vec![wall, ray(246.0, &[(2.0, 300.0), (6.0, 900.0)])],
         mora_ft: None,
+        msa_ft: None,
     };
     let fl = floor(&a, &t);
     let c = hold_cmd(Why::HoldsBelow, &a, &ap_vs_down(), fl, &t, 700.0);
@@ -321,18 +338,18 @@ fn only_a_hand_on_the_autopilot_is_the_pilot_never_its_own_capture() {
     let mut cap = base;
     cap.alt_dial_ft = Some(2_900.0);
     let mut held = cap;
-    held.state = Some(AP_HDG | AP_ALT_HOLD);
+    held.state = Some(Modes(Modes::HEADING | Modes::ALT_HOLD));
     assert_eq!(mcp_moved(&cap, &held, false, 2_910.0, &Ours::default()), None);
     // ALT HOLD pressed a mile from the window: a hand.
     let mut pressed = base;
-    pressed.state = Some(AP_HDG | AP_ALT_HOLD);
+    pressed.state = Some(Modes(Modes::HEADING | Modes::ALT_HOLD));
     assert_eq!(mcp_moved(&base, &pressed, false, alt, &Ours::default()), Some("alt_hold"));
     // LVL CHG, or the autothrottle: a hand, even under our hold.
     let mut flch = base;
-    flch.state = Some(AP_HDG | AP_FLCH);
+    flch.state = Some(Modes(Modes::HEADING | Modes::LEVEL_CHANGE));
     assert_eq!(mcp_moved(&base, &flch, true, alt, &Ours::default()), Some("mode"));
     let mut at = base;
-    at.state = Some(AP_HDG | AP_VS | AP_ALT_ARMED | AP_AUTOTHROTTLE);
+    at.state = Some(Modes(Modes::HEADING | Modes::VS | Modes::ALT_ARMED | Modes::AUTOTHROTTLE));
     assert_eq!(mcp_moved(&base, &at, true, alt, &Ours::default()), Some("mode"));
     // The heading bug in HDG mode.
     let mut hdg = base;
@@ -369,10 +386,10 @@ fn our_own_presses_and_writes_are_never_the_pilot() {
     assert_eq!(mcp_moved(&base, &now, false, alt, &ours(vec![OurChange::Press(Button::Disconnect)])), None);
     // Our ALT HOLD press away from the window: ours. LVL CHG: never ours.
     let mut now = base;
-    now.state = Some(AP_HDG | AP_ALT_HOLD);
+    now.state = Some(Modes(Modes::HEADING | Modes::ALT_HOLD));
     assert_eq!(mcp_moved(&base, &now, false, alt, &ours(vec![OurChange::Press(Button::AltitudeHold)])), None);
     let mut now = base;
-    now.state = Some(AP_HDG | AP_FLCH);
+    now.state = Some(Modes(Modes::HEADING | Modes::LEVEL_CHANGE));
     assert_eq!(
         mcp_moved(&base, &now, true, alt, &ours(vec![OurChange::Press(Button::AltitudeHold)])),
         Some("mode")
@@ -694,7 +711,7 @@ fn a_coupled_glideslope_is_an_approach_without_runway_data() {
     low.agl_ft = 300.0;
     low.vs_fpm = -800.0;
     let mut gs = ap_vs_down();
-    gs.state = Some(AP_AUTOTHROTTLE | AP_GS | 512);
+    gs.state = Some(Modes(Modes::AUTOTHROTTLE | Modes::GS | 512));
     let mut h = SafeHold::default();
     for s in 0..6 {
         let (a, r) = h.step(&tick(s as f64, low, gs));
@@ -737,4 +754,85 @@ fn an_escape_above_its_floor_levels_where_it_is() {
     // Below the floor the plain hold already climbs: unchanged.
     let climb = HoldCmd { climb: true, alt_ft: 3_200.0, fpm: 2_000.0, ..descent };
     assert_eq!(escape_cmd(climb, 2_500.0), climb);
+}
+
+/// The aircraft is read as ONE frame (#157): position, heights, groundspeed
+/// and vertical speed come from the plugin's snapshot, never stock reads
+/// that may straddle two frames; the track rides beside it.
+#[tokio::test]
+async fn the_air_is_read_from_one_frame() {
+    use crate::datarefs as d;
+    let fake = crate::xplane::FakeXPlane::with_reads(&[
+        (d::LATITUDE, 10.0),
+        (d::LONGITUDE, 10.0),
+        (d::ALTITUDE_FT, 2_930.0),
+        (d::AIRSPEED_KTS, 176.0),
+        (HPATH, 306.0),
+        (MAG_VAR, -1.0),
+    ]);
+    let frame = sim::position::Position {
+        lat: 36.735,
+        lon: -4.727,
+        elev_m: 914.4,
+        psi_true_deg: 300.0,
+        gs_ms: 100.0,
+        vs_fpm: -330.0,
+        agl_m: 893.0,
+        frame: Some(7),
+        sim_time_s: Some(1.0),
+        source: sim::position::Source::Plugin,
+    };
+    fake.set_read_bytes(sim::position::POSITION, Some(&sim::position::encode(&frame)));
+    let (air, hands, _) = read_air(&fake).await.expect("a whole reading");
+    assert_eq!((air.lat, air.lon), (36.735, -4.727));
+    assert!((air.alt_true_ft - 3_000.0).abs() < 0.1);
+    assert_eq!(air.vs_fpm, -330.0);
+    assert!((air.gs_kts - 194.4).abs() < 0.1);
+    assert_eq!(air.track_true, 306.0);
+    assert!(!hands);
+}
+
+/// No variation read, no turn: the bug is magnetic, and a "0" variation set
+/// it off the clear bearing by the whole variation. The climb stays ahead.
+#[test]
+fn a_failed_variation_read_turns_nothing() {
+    let mut a = air();
+    a.mag_var = None;
+    let wall = ray(306.0, &[(2.0, 2_000.0), (3.0, 6_000.0)]);
+    let t = Terrain {
+        ahead: Some(wall.clone()),
+        fan: vec![wall, ray(246.0, &[(2.0, 300.0), (6.0, 900.0)])],
+        ..Default::default()
+    };
+    let fl = floor(&a, &t);
+    let c = hold_cmd(Why::HoldsBelow, &a, &ap_vs_down(), fl, &t, 700.0);
+    assert_eq!(c.heading_mag, None);
+    assert!(c.climb);
+}
+
+/// The sector altitude is the field's: over higher ground away from it the
+/// floor is still the ground under plus the clearance, as with the MORA
+/// (the recovery planner's MSA branch took it bare). MORA first.
+#[test]
+fn a_sector_altitude_below_the_ground_under_is_floored_like_the_mora() {
+    let mut a = air();
+    a.alt_true_ft = 3_000.0;
+    a.agl_ft = 100.0;
+    let t = Terrain {
+        msa_ft: Some(3_500.0),
+        ..Default::default()
+    };
+    assert_eq!(
+        floor(&a, &t),
+        Floor {
+            true_ft: 3_900.0,
+            source: "msa"
+        }
+    );
+    let t = Terrain {
+        mora_ft: Some(4_500.0),
+        msa_ft: Some(3_500.0),
+        ..Default::default()
+    };
+    assert_eq!(floor(&a, &t).source, "mora");
 }

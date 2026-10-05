@@ -270,8 +270,9 @@ pub fn path_points(lat: f64, lon: f64, to_lat: f64, to_lon: f64) -> Vec<(f64, f6
     let dist = crate::nav::haversine_nm(lat, lon, to_lat, to_lon).min(PATH_PROBE_NM);
     let brg = crate::nav::bearing_deg(lat, lon, to_lat, to_lon);
     let n = ((dist / PATH_SPACING_NM).ceil() as usize).max(1);
-    (1..=n)
-        .map(|i| crate::nav::project_latlon(lat, lon, brg, dist * i as f64 / n as f64))
+    crate::safe_hold::ray_points(lat, lon, brg, dist, n)
+        .into_iter()
+        .map(|(_, la, lo)| (la, lo))
         .collect()
 }
 
@@ -317,7 +318,9 @@ pub fn impossible(
         ));
     }
     if let Some(e) = endurance_min.filter(|e| e.is_finite()) {
-        let need = to_go_nm / gs_kts.max(100.0) * 60.0;
+        // The planners' groundspeed floor (`procedure`'s 60 kt): a slow
+        // aircraft at 100 kt was promised a third more range than it has.
+        let need = to_go_nm / gs_kts.max(60.0) * 60.0;
         if e < need + FUEL_MARGIN_MIN {
             return Some(format!(
                 "We have about {e:.0} minutes of fuel, and {destination} is {need:.0} minutes away with {FUEL_MARGIN_MIN:.0} for the approach."
