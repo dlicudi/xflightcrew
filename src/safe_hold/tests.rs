@@ -753,3 +753,39 @@ fn an_escape_above_its_floor_levels_where_it_is() {
     let climb = HoldCmd { climb: true, alt_ft: 3_200.0, fpm: 2_000.0, ..descent };
     assert_eq!(escape_cmd(climb, 2_500.0), climb);
 }
+
+/// The aircraft is read as ONE frame (#157): position, heights, groundspeed
+/// and vertical speed come from the plugin's snapshot, never stock reads
+/// that may straddle two frames; the track rides beside it.
+#[tokio::test]
+async fn the_air_is_read_from_one_frame() {
+    use crate::datarefs as d;
+    let fake = crate::xplane::FakeXPlane::with_reads(&[
+        (d::LATITUDE, 10.0),
+        (d::LONGITUDE, 10.0),
+        (d::ALTITUDE_FT, 2_930.0),
+        (d::AIRSPEED_KTS, 176.0),
+        (HPATH, 306.0),
+        (MAG_VAR, -1.0),
+    ]);
+    let frame = sim::position::Position {
+        lat: 36.735,
+        lon: -4.727,
+        elev_m: 914.4,
+        psi_true_deg: 300.0,
+        gs_ms: 100.0,
+        vs_fpm: -330.0,
+        agl_m: 893.0,
+        frame: Some(7),
+        sim_time_s: Some(1.0),
+        source: sim::position::Source::Plugin,
+    };
+    fake.set_read_bytes(sim::position::POSITION, Some(&sim::position::encode(&frame)));
+    let (air, hands, _) = read_air(&fake).await.expect("a whole reading");
+    assert_eq!((air.lat, air.lon), (36.735, -4.727));
+    assert!((air.alt_true_ft - 3_000.0).abs() < 0.1);
+    assert_eq!(air.vs_fpm, -330.0);
+    assert!((air.gs_kts - 194.4).abs() < 0.1);
+    assert_eq!(air.track_true, 306.0);
+    assert!(!hands);
+}

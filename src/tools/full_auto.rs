@@ -261,14 +261,15 @@ async fn steady_read(
     xp: &crate::xplane::XPlaneClient,
     clock: std::time::Instant,
 ) -> Option<Steady> {
-    let (lat, lon, alt, vs, gs, track) = tokio::join!(
-        xp.get_float(crate::datarefs::LATITUDE),
-        xp.get_float(crate::datarefs::LONGITUDE),
+    // Position and groundspeed are one frame (`sim::position`, #157).
+    let (pos, alt, vs, track) = tokio::join!(
+        sim::position::read(xp),
         xp.get_float(crate::datarefs::ALTITUDE_FT),
         xp.get_float(crate::datarefs::VVI_FPM),
-        xp.get_float("sim/flightmodel/position/groundspeed"),
         xp.get_float("sim/flightmodel/position/hpath"),
     );
+    let (lat, lon) = sim::position::lat_lon(&pos);
+    let gs = sim::position::field(&pos, |p| p.gs_ms);
     let t_s = clock.elapsed().as_secs_f64();
     let [lat, lon, alt_ft, vs_fpm, gs_ms, track_true] =
         crate::control::measurements("resume_recheck", [lat, lon, alt, vs, gs, track])?;
@@ -831,11 +832,10 @@ impl FullAuto {
             },
         };
         let xp = crate::xplane::XPlaneClient::new(ctx.config.xplane_base_url.clone());
-        let (ground, agl, lat, lon, altitude, bank, ias, frozen, engines, aircraft, mag_var) = tokio::join!(
+        // Position and heights are one frame (`sim::position`, #157).
+        let (ground, pos, altitude, bank, ias, frozen, engines, aircraft, mag_var) = tokio::join!(
             ctx.xplane.get_float(crate::datarefs::ON_GROUND_ANY),
-            ctx.xplane.get_float(crate::datarefs::AGL_METERS),
-            ctx.xplane.get_float(crate::datarefs::LATITUDE),
-            ctx.xplane.get_float(crate::datarefs::LONGITUDE),
+            sim::position::read(&xp),
             ctx.xplane.get_float(crate::datarefs::ALTITUDE_FT),
             ctx.xplane.get_float(crate::datarefs::BANK_DEG),
             ctx.xplane.get_float(crate::datarefs::AIRSPEED_KTS),
@@ -852,8 +852,10 @@ impl FullAuto {
             ctx.xplane
                 .get_float("sim/flightmodel/position/magnetic_variation"),
         );
-        let (elevation, pitch, flap, stall, fuel_kg, flow) = tokio::join!(
-            ctx.xplane.get_float(crate::datarefs::ELEVATION_M),
+        let (lat, lon) = sim::position::lat_lon(&pos);
+        let agl = sim::position::field(&pos, |p| p.agl_m);
+        let elevation = sim::position::field(&pos, |p| p.elev_m);
+        let (pitch, flap, stall, fuel_kg, flow) = tokio::join!(
             ctx.xplane.get_float(crate::datarefs::PITCH_DEG),
             ctx.xplane.get_float(crate::datarefs::FLAP_RATIO),
             ctx.xplane.get_float("sim/cockpit2/annunciators/stall_warning_ratio"),

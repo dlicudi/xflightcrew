@@ -1219,20 +1219,22 @@ async fn read_ap(xp: &crate::xplane::XPlaneClient) -> ApRead {
 
 /// The aircraft, the hands and the stall warning; `None` on a failed read of
 /// anything the decision rests on (no measurement, no verdict).
-async fn read_air(xp: &crate::xplane::XPlaneClient) -> Option<(Air, bool, Option<f64>)> {
+async fn read_air(xp: &dyn crate::xplane::XPlane) -> Option<(Air, bool, Option<f64>)> {
     use crate::datarefs as d;
-    let (lat, lon, alt, elev, agl, vs, ias, gs, hpath, mag_var) = tokio::join!(
-        xp.get_float(d::LATITUDE),
-        xp.get_float(d::LONGITUDE),
+    // Position, height, groundspeed and vertical speed are ONE frame
+    // (`sim::position`, #157); the track and the rest ride beside it.
+    let (pos, alt, ias, hpath, mag_var) = tokio::join!(
+        sim::position::read(xp),
         xp.get_float(d::ALTITUDE_FT),
-        xp.get_float(d::ELEVATION_M),
-        xp.get_float(d::AGL_METERS),
-        xp.get_float(d::VS_FPM_FLIGHT_MODEL),
         xp.get_float(d::AIRSPEED_KTS),
-        xp.get_float(d::GROUNDSPEED_MS),
         xp.get_float(HPATH),
         xp.get_float(MAG_VAR),
     );
+    let (lat, lon) = sim::position::lat_lon(&pos);
+    let elev = sim::position::field(&pos, |p| p.elev_m);
+    let agl = sim::position::field(&pos, |p| p.agl_m);
+    let vs = sim::position::field(&pos, |p| p.vs_fpm);
+    let gs = sim::position::field(&pos, |p| p.gs_ms);
     let (bank, pitch, flap, yp, yr, pyield, syield, stall) = tokio::join!(
         xp.get_float(d::BANK_DEG),
         xp.get_float(d::PITCH_DEG),
