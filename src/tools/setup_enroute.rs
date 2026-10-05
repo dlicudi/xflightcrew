@@ -732,17 +732,15 @@ async fn engage(xp: &crate::xplane::XPlaneClient, job: &EnrouteJob) -> Engaged {
         return out;
     }
     let _ = autoflight::set_dial(xp, Dial::HeadingBug, bug).await;
-    if xp.get_float(crate::datarefs::HEADING_STATUS).await.is_ok_and(|v| v <= 0.5) {
-        let _ = autoflight::press(xp, Button::Heading).await;
-    }
+    let hdg_st = xp.get_float(crate::datarefs::HEADING_STATUS).await.ok();
+    autoflight::bring_heading(xp, hdg_st, "setup_enroute").await;
     let _ = autoflight::set_dial(xp, Dial::Altitude, p.alt_ft).await;
     // The vertical by VS toward the dial, never ALT HOLD off the zoom
     // (`vertical_toward_dial`); the settle keeps the wheel on it.
     let alt = xp.get_float(crate::datarefs::ALTITUDE_FT).await.unwrap_or(p.alt_ft);
     if let Vertical::Vs(rate) = vertical_toward_dial(alt, p.alt_ft, 0.0, false) {
-        if xp.get_float(VS_STATUS).await.is_ok_and(|v| v <= 0.5) {
-            let _ = autoflight::press(xp, Button::VerticalSpeed).await;
-        }
+        let vs_st = xp.get_float(VS_STATUS).await.ok();
+        autoflight::bring_vs(xp, vs_st, "setup_enroute").await;
         let _ = autoflight::set_dial(xp, Dial::Vs, rate).await;
     }
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
@@ -789,10 +787,10 @@ async fn settle(
             let hold_on = hold_st.is_ok_and(|v| v > 1.5);
             let want = vertical_toward_dial(alt, dial_ft, vvi, hold_on);
             if let Vertical::Vs(rate) = want {
-                let vs_off = vs_st.is_ok_and(|v| v <= 0.5);
-                if vs_off {
-                    let _ = autoflight::press(xp, Button::VerticalSpeed).await;
-                }
+                let vs_off =
+                    autoflight::bring_vs(xp, vs_st.as_ref().ok().copied(), "setup_enroute_settle")
+                        .await
+                        .pressed(Button::VerticalSpeed);
                 if last != Some(want) || vs_off {
                     let _ = autoflight::set_dial(xp, Dial::Vs, rate).await;
                 }

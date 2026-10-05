@@ -759,7 +759,8 @@ pub fn reconcile(want: Want, read: ModeRead) -> Vec<Button> {
         }
         Some(Lateral::Coupled) => {
             // The localiser armed or captured owns the lateral; with neither
-            // (unread bitfield included) HDG is what flies until it arms.
+            // HDG is what flies until it arms. An unread bitfield is no
+            // measurement: nothing is pressed on it.
             let loc_owned = m.is_some_and(|m| m.loc_armed() || m.loc());
             if !loc_owned && m.is_some() && read.hdg_status.is_some_and(|s| s <= 0.5) {
                 out.push(Button::Heading);
@@ -786,11 +787,64 @@ pub fn reconcile(want: Want, read: ModeRead) -> Vec<Button> {
     out
 }
 
-/// Press what [`reconcile`] asks, each on the tape.
-pub async fn apply(xp: &dyn XPlane, presses: &[Button], site: &str) {
+/// Press what [`reconcile`] asks, in order, each on the tape. `false` when
+/// any press did not go out (every one is still tried).
+pub async fn apply(xp: &dyn XPlane, presses: &[Button], site: &str) -> bool {
+    let mut all = true;
     for b in presses {
-        press_logged(xp, *b, site).await;
+        all &= press_logged(xp, *b, site).await;
     }
+    all
+}
+
+/// What [`bring`] pressed, and whether every press went out.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Applied {
+    pub presses: Vec<Button>,
+    pub sent: bool,
+}
+
+impl Applied {
+    /// `b` was pressed (sent or not).
+    pub fn pressed(&self, b: Button) -> bool {
+        self.presses.contains(&b)
+    }
+}
+
+/// [`reconcile`] the intent against the modes read, then [`apply`] it: the
+/// one door a loop's mode presses go through.
+pub async fn bring(xp: &dyn XPlane, want: Want, read: ModeRead, site: &str) -> Applied {
+    let presses = reconcile(want, read);
+    let sent = apply(xp, &presses, site).await;
+    Applied { presses, sent }
+}
+
+/// [`bring`] HDG SEL alone, from its status read (`None`: unread, nothing
+/// pressed).
+pub async fn bring_heading(xp: &dyn XPlane, hdg_status: Option<f64>, site: &str) -> Applied {
+    let want = Want {
+        lateral: Some(Lateral::Heading),
+        vertical: None,
+    };
+    let read = ModeRead {
+        hdg_status,
+        ..Default::default()
+    };
+    bring(xp, want, read, site).await
+}
+
+/// [`bring`] V/S alone, from its status read (`None`: unread, nothing
+/// pressed).
+pub async fn bring_vs(xp: &dyn XPlane, vs_status: Option<f64>, site: &str) -> Applied {
+    let want = Want {
+        lateral: None,
+        vertical: Some(Vertical::Vs),
+    };
+    let read = ModeRead {
+        vs_status,
+        ..Default::default()
+    };
+    bring(xp, want, read, site).await
 }
 
 // ---------------------------------------------------------------------------

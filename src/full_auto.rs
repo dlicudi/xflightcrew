@@ -21,7 +21,7 @@
 //! `"kind":"full_auto"`. EXPERIMENTAL: eight subsystems in a chain — fly it
 //! VMC, hand ready, and mine the blackbox after.
 
-use crate::autoflight::{self, Button, Dial};
+use crate::autoflight::{self, Dial};
 use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
 use std::time::{Duration, Instant};
 
@@ -4233,14 +4233,18 @@ async fn hold_airborne_end(xp: &XPlaneClient, base_url: &str, voice: &Option<Voi
         )
         .await;
     }
-    if look.hdg_status.is_some_and(|v| v < 0.5) {
-        let _ = autoflight::press(xp, Button::Heading).await;
-    }
     let alt_held = look.alt_hold_status.is_some_and(|v| v > 0.5);
+    let want = autoflight::Want {
+        lateral: Some(autoflight::Lateral::Heading),
+        vertical: (!alt_held).then_some(autoflight::Vertical::Vs),
+    };
+    let read = autoflight::ModeRead {
+        hdg_status: look.hdg_status,
+        vs_status: look.vs_status,
+        modes: None,
+    };
+    autoflight::bring(xp, want, read, "full_auto_airborne_end").await;
     if !alt_held {
-        if look.vs_status.is_some_and(|v| v < 0.5) {
-            let _ = autoflight::press(xp, Button::VerticalSpeed).await;
-        }
         let _ = autoflight::set_dial(xp, Dial::Vs, 0.0).await;
     }
     let t0 = Instant::now();
