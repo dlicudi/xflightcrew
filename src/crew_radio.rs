@@ -257,6 +257,19 @@ pub fn call_words(call: &CrewCall) -> String {
     }
 }
 
+/// The crew radio queue is process-wide: its tests take turns.
+#[cfg(test)]
+pub(crate) static QUEUE_LOCK: Mutex<()> = Mutex::new(());
+
+/// The ended flight's calls, forgotten at the new-flight door
+/// (`flight_state::forget_flight`): a report or readback queued for the
+/// last flight is said to nobody on this one, and its readback record must
+/// not hold back the same words owed again.
+pub fn forget_flight_calls() {
+    CREW_RADIO.lock().unwrap_or_else(|e| e.into_inner()).clear();
+    *LAST_READBACK.lock().unwrap_or_else(|e| e.into_inner()) = None;
+}
+
 /// Drain the pending crew radio calls (main loop only).
 pub fn take_crew_radio() -> Vec<Queued> {
     let mut q = CREW_RADIO.lock().unwrap_or_else(|e| e.into_inner());

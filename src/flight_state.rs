@@ -30,8 +30,7 @@
 //! per FLIGHT rather than per airframe (each reset on its own path today):
 //! `autotaxi::LAST_ARRIVED`, `autoland::VACATE_FOLLOWS`,
 //! `full_auto::INBOUND_MADE` / `STAGE` / `MISSION`, `procedure::TOD` /
-//! `TERRAIN_FLOOR` / `PILOT_ALT` / `LEG`, `tools::ground::CART_REQUESTED`,
-//! `taxi_in::ARREST_HOLD`, `cockpit_auto::PILOT_MOVED_LIGHTS`,
+//! `TERRAIN_FLOOR` / `PILOT_ALT` / `LEG`, `taxi_in::ARREST_HOLD`,
 //! `instructor::LESSON`, `flow::*`. `pushback::LEARNED_SENSE` is per SESSION
 //! by design (the sim build's tug sense, learnt once), never per flight.
 
@@ -258,6 +257,17 @@ fn forget_flight() {
     crate::autoland::forget_flight();
     // The plan's destination is published again by the next plan read.
     crate::monitor::forget_destination();
+    // "The pilot has it" was about the flight that ended.
+    crate::flight::forget_pilot_takeover();
+    // Calls and readbacks queued for the old flight go to nobody.
+    crate::crew_radio::forget_flight_calls();
+    // "Say again" never repeats the last flight's readback.
+    crate::forget_last_readback();
+    // A cart summoned on the old ramp, a light the pilot moved, an offer
+    // the copilot made: the last flight's.
+    crate::tools::ground::forget_cart_request();
+    crate::cockpit_auto::forget_pilot_moved_lights();
+    crate::rapport::clear_offer();
 }
 
 /// Every loop run in the tree (`sim::run::Slot`), by its path: THE registry
@@ -691,6 +701,46 @@ mod tests {
     /// after LIEA-LEBL was judged against TA 6,000, and the altimeter check
     /// WRITES the setting with an automation flying. The forgetting is the
     /// doors' and the transition dies with the mission too.
+    /// The crew's per-flight facts die at the door: a pilot takeover, a
+    /// queued call and its readback record, the copilot's "say again", a
+    /// summoned cart, the pilot's light flag and an open offer were each
+    /// cleared only on their own path, if at all. The masks and the anti-ice
+    /// claims are the switches' truth, not the flight's: never cleared here.
+    #[test]
+    fn forget_flight_clears_the_crews_flight_facts() {
+        let _q = crate::crew_radio::QUEUE_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _g = crate::tools::ground::GPU_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::flight::note_pilot_takeover("my controls");
+        crate::crew_radio::transmit_readback("Cleared to land runway one three".into(), false);
+        *crate::LAST_READBACK.lock().unwrap() =
+            Some(("Gear down.".into(), std::time::Instant::now()));
+        crate::tools::ground::note_cart_requested_for_test();
+        crate::cockpit_auto::note_pilot_moved_lights();
+        crate::rapport::set_offer_for_test();
+        assert!(crate::flight::pilot_takeover().is_some());
+        assert!(crate::crew_radio::crew_radio_pending());
+
+        super::forget_flight();
+
+        assert_eq!(crate::flight::pilot_takeover(), None);
+        assert!(!crate::crew_radio::crew_radio_pending());
+        assert_eq!(crate::crew_radio::last_readback(), None);
+        assert!(crate::LAST_READBACK.lock().unwrap().is_none());
+        assert!(!crate::tools::ground::cart_pending_for_test());
+        assert!(!crate::cockpit_auto::take_pilot_moved_lights());
+        assert_eq!(crate::rapport::offer(), None);
+        let door = body_of(
+            crate::test_support::module_source("flight_state"),
+            "fn forget_flight()",
+        );
+        assert!(!door.contains("cabin_air"), "the masks are not the flight's");
+        assert!(!door.contains("anti_ice"), "the anti-ice claims are not the flight's");
+    }
+
     #[test]
     fn every_new_flight_and_mission_end_forgets_the_flight() {
         let door = body_of(

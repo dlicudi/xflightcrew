@@ -462,6 +462,11 @@ pub fn clear_offer() {
     *lock(&OFFER) = None;
 }
 
+#[cfg(test)]
+pub fn set_offer_for_test() {
+    *lock(&OFFER) = Some((Offer::ArrivalBrief, Instant::now()));
+}
+
 /// Several held asides as one line. Pure.
 pub fn join_asides(held: &[(String, f64)], now: f64) -> String {
     let joined = held

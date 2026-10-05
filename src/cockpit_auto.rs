@@ -155,6 +155,12 @@ pub fn note_pilot_moved_lights() {
     PILOT_MOVED_LIGHTS.store(true, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// The ended flight's flag, forgotten at the new-flight door
+/// (`flight_state::forget_flight`).
+pub fn forget_pilot_moved_lights() {
+    PILOT_MOVED_LIGHTS.store(false, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// Take the flag, clearing it.
 pub fn take_pilot_moved_lights() -> bool {
     PILOT_MOVED_LIGHTS.swap(false, std::sync::atomic::Ordering::Relaxed)

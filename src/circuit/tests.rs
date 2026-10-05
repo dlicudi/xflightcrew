@@ -1066,8 +1066,9 @@
         assert_eq!(spell_runway("13C"), "one three center");
     }
 
-    /// The crew radio queue is process-wide: its tests take turns.
-    static QUEUE_LOCK: Mutex<()> = Mutex::new(());
+    /// The crew radio queue is process-wide: its tests take turns
+    /// (`crew_radio::QUEUE_LOCK`, shared with the new-flight door's test).
+    static QUEUE_LOCK: &Mutex<()> = &crate::crew_radio::QUEUE_LOCK;
 
     #[test]
     fn crew_radio_queue_is_fifo_and_drains_once() {

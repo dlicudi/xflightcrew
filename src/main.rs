@@ -1522,9 +1522,7 @@ async fn run_session(
             conversation.clear();
             history.clear();
             last_subject = None;
-            if let Ok(mut last) = LAST_READBACK.lock() {
-                *last = None;
-            }
+            forget_last_readback();
             voice.forget_speech();
             tracing::info!(aircraft = %profile.display_name, "reconfigured for new aircraft");
         }
@@ -4046,6 +4044,12 @@ fn next_input(
 /// real readbacks are stored (not warnings like "Say again?"), single-threaded
 /// session so a plain Mutex is fine.
 static LAST_READBACK: std::sync::Mutex<Option<(String, Instant)>> = std::sync::Mutex::new(None);
+
+/// The ended flight's or airframe's readback: "say again" never repeats
+/// it into the next (the swap and `flight_state::forget_flight`).
+fn forget_last_readback() {
+    *LAST_READBACK.lock().unwrap_or_else(|e| e.into_inner()) = None;
+}
 
 fn say(voice: &Voice, reporter: &Reporter, kind: ui::LogKind, line: &str) {
     say_or(voice, reporter, kind, line, || loop_owed(false));

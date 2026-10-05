@@ -246,6 +246,12 @@ pub fn note_crew_takeover(why: &'static str) {
     sim::blackbox::record("handover", serde_json::json!({ "to": "crew", "why": why }));
 }
 
+/// The ended flight's takeover, forgotten at the new-flight door
+/// (`flight_state::forget_flight`): "the pilot has it" was about that flight.
+pub fn forget_pilot_takeover() {
+    *PILOT_TAKEOVER.lock().unwrap_or_else(|e| e.into_inner()) = None;
+}
+
 pub fn pilot_takeover() -> Option<(f64, &'static str)> {
     *PILOT_TAKEOVER.lock().unwrap_or_else(|e| e.into_inner())
 }
