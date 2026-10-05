@@ -177,14 +177,6 @@ pub struct Rapport {
     calm_since: Option<f64>,
 }
 
-fn dist_m(a: (f64, f64), b: (f64, f64)) -> f64 {
-    let (la1, lo1) = (a.0.to_radians(), a.1.to_radians());
-    let (la2, lo2) = (b.0.to_radians(), b.1.to_radians());
-    let x = (lo2 - lo1) * ((la1 + la2) / 2.0).cos();
-    let y = la2 - la1;
-    (x * x + y * y).sqrt() * 6_371_000.0
-}
-
 impl Rapport {
     pub fn new() -> Self {
         Self::default()
@@ -317,10 +309,13 @@ impl Rapport {
     ) {
         let sink = (-td.sink_fpm).max(0.0);
         let here = td.lat.zip(td.lon).unwrap_or((v.lat, v.lon));
-        let same_field = m.origin.is_some_and(|o| dist_m(o, here) < SAME_FIELD_M);
+        let near = |(lat, lon): (f64, f64)| {
+            crate::nav::haversine_nm(lat, lon, here.0, here.1) * 1852.0 < SAME_FIELD_M
+        };
+        let same_field = m.origin.is_some_and(near);
         if !impact {
             match self.field {
-                Some(f) if dist_m(f, here) < SAME_FIELD_M => self.landings_here += 1,
+                Some(f) if near(f) => self.landings_here += 1,
                 _ => {
                     self.field = Some(here);
                     self.landings_here = 1;
@@ -1268,6 +1263,33 @@ mod tests {
         assert!(!arrival_brief_request(
             "brief the approach and set flaps ten"
         ));
+    }
+
+    /// The same-field test reads the shared great circle (`nav::haversine_nm`)
+    /// where it had its own flat-earth copy: at a field's scale they agree to
+    /// a metre, so no landing changes field.
+    #[test]
+    fn the_same_field_distance_is_the_shared_great_circle() {
+        let old = |a: (f64, f64), b: (f64, f64)| {
+            let (la1, lo1) = (a.0.to_radians(), a.1.to_radians());
+            let (la2, lo2) = (b.0.to_radians(), b.1.to_radians());
+            let x = (lo2 - lo1) * ((la1 + la2) / 2.0).cos();
+            let y = la2 - la1;
+            (x * x + y * y).sqrt() * 6_371_000.0
+        };
+        for (a, b) in [
+            ((36.675, -4.499), (36.675, -4.437)),
+            ((36.675, -4.499), (36.724, -4.499)),
+            ((51.148, -0.190), (51.180, -0.150)),
+            ((-33.94, 151.17), (-33.97, 151.21)),
+        ] {
+            let new = crate::nav::haversine_nm(a.0, a.1, b.0, b.1) * 1852.0;
+            assert!(
+                (new - old(a, b)).abs() < 1.0,
+                "{a:?} {b:?}: {new} vs {}",
+                old(a, b)
+            );
+        }
     }
 
     /// The brief names the runway the crew will fly (`full_auto::wind_runway`),
