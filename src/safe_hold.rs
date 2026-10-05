@@ -115,21 +115,6 @@ pub const UNFLYABLE_S: f64 = 2.0;
 // `autopilot_state` bitfield; 4 wing leveler, 512 HNAV and 8192 FMS engaged
 // are the autopilot's own, never read here).
 use crate::autoflight::{Modes, OurChange, Ours};
-pub const AP_AUTOTHROTTLE: i64 = Modes::AUTOTHROTTLE as i64;
-pub const AP_HDG: i64 = Modes::HEADING as i64;
-pub const AP_SPEED_PITCH: i64 = Modes::SPEED_ON_PITCH as i64;
-pub const AP_VS: i64 = Modes::VS as i64;
-pub const AP_ALT_ARMED: i64 = Modes::ALT_ARMED as i64;
-pub const AP_FLCH: i64 = Modes::LEVEL_CHANGE as i64;
-pub const AP_HNAV_ARMED: i64 = Modes::LOC_ARMED as i64;
-pub const AP_GS_ARMED: i64 = Modes::GS_ARMED as i64;
-pub const AP_GS: i64 = Modes::GS as i64;
-pub const AP_FMS_ARMED: i64 = Modes::FMS_ARMED as i64;
-pub const AP_ALT_HOLD: i64 = Modes::ALT_HOLD as i64;
-pub const AP_TOGA_LAT: i64 = Modes::TOGA_LATERAL as i64;
-pub const AP_TOGA_VERT: i64 = Modes::TOGA_VERTICAL as i64;
-pub const AP_VNAV_ARMED: i64 = Modes::VNAV_ARMED as i64;
-pub const AP_VNAV: i64 = Modes::VNAV as i64;
 
 // ------------------------------------------------------------- the readings
 
@@ -137,24 +122,26 @@ pub const AP_VNAV: i64 = Modes::VNAV as i64;
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct ApRead {
     pub servos: Option<bool>,
-    /// `sim/cockpit/autopilot/autopilot_state`.
-    pub state: Option<i64>,
+    /// `sim/cockpit/autopilot/autopilot_state`, decoded by the panel owner
+    /// ([`Modes::from_read`]: a negative or broken read is no state).
+    pub state: Option<Modes>,
     pub alt_dial_ft: Option<f64>,
     pub vs_dial_fpm: Option<f64>,
     pub hdg_bug_mag: Option<f64>,
 }
 
 impl ApRead {
-    fn has(&self, bit: i64) -> bool {
-        self.state.is_some_and(|s| s & bit != 0)
+    fn has(&self, bit: u32) -> bool {
+        self.state.is_some_and(|s| s.0 & bit != 0)
     }
     /// The autothrottle holds the speed (the pilot's or the aircraft's):
     /// our governor would fight it.
     pub fn autothrottle(&self) -> bool {
-        self.has(AP_AUTOTHROTTLE)
+        self.has(Modes::AUTOTHROTTLE)
     }
     pub fn json(&self) -> Value {
-        json!({ "servos": self.servos, "state": self.state, "alt_dial": self.alt_dial_ft.map(r0),
+        json!({ "servos": self.servos, "state": self.state.map(|m| m.0),
+                "alt_dial": self.alt_dial_ft.map(r0),
                 "vs_dial": self.vs_dial_fpm.map(r0), "hdg_bug": self.hdg_bug_mag.map(r0) })
     }
 }
@@ -269,25 +256,25 @@ pub enum Vertical {
 /// The vertical path the autopilot is on. A failed dial read is no window.
 /// Pure.
 pub fn vertical(ap: &ApRead, air: &Air) -> Vertical {
-    if ap.has(AP_GS) {
+    if ap.has(Modes::GS) {
         return Vertical::Glideslope;
     }
     let alt = air.alt_ft;
-    if ap.has(AP_ALT_HOLD) {
+    if ap.has(Modes::ALT_HOLD) {
         return Vertical::Holds(alt);
     }
     let window = ap.alt_dial_ft.filter(|w| w.is_finite());
-    let mode_descends = if ap.has(AP_VS) {
+    let mode_descends = if ap.has(Modes::VS) {
         ap.vs_dial_fpm.map(|v| v < -50.0)
-    } else if ap.has(AP_FLCH) || ap.has(AP_VNAV) {
+    } else if ap.has(Modes::LEVEL_CHANGE) || ap.has(Modes::VNAV) {
         window.map(|w| w < alt - FLOOR_TOL_FT)
     } else {
         None
     };
     let descending = mode_descends.unwrap_or(air.vs_fpm < -300.0);
-    let climbing = if ap.has(AP_VS) {
+    let climbing = if ap.has(Modes::VS) {
         ap.vs_dial_fpm.is_some_and(|v| v > 50.0)
-    } else if ap.has(AP_FLCH) || ap.has(AP_VNAV) {
+    } else if ap.has(Modes::LEVEL_CHANGE) || ap.has(Modes::VNAV) {
         window.is_some_and(|w| w > alt + FLOOR_TOL_FT)
     } else {
         air.vs_fpm > 300.0
@@ -295,7 +282,7 @@ pub fn vertical(ap: &ApRead, air: &Air) -> Vertical {
     if descending {
         // A window below in the direction of travel is captured where the
         // mode arms it: FLCH and VNAV always, VS with the altitude armed.
-        let armed = ap.has(AP_ALT_ARMED) || ap.has(AP_FLCH) || ap.has(AP_VNAV);
+        let armed = ap.has(Modes::ALT_ARMED) || ap.has(Modes::LEVEL_CHANGE) || ap.has(Modes::VNAV);
         return match window {
             Some(w) if w < alt - FLOOR_TOL_FT && armed => Vertical::Captures(w),
             _ => Vertical::Unbounded,
@@ -609,15 +596,15 @@ pub const OURS_SLACK_S: f64 = 10.0;
 /// The bits a pilot presses and the autopilot never sets by itself.
 /// (An armed mode going engaged, a capture, the wing leveler the servos
 /// default to: the autopilot's own, never counted.)
-const PILOT_MODE_BITS: i64 = AP_AUTOTHROTTLE
-    | AP_SPEED_PITCH
-    | AP_FLCH
-    | AP_HNAV_ARMED
-    | AP_FMS_ARMED
-    | AP_GS_ARMED
-    | AP_TOGA_LAT
-    | AP_TOGA_VERT
-    | AP_VNAV_ARMED;
+const PILOT_MODE_BITS: u32 = Modes::AUTOTHROTTLE
+    | Modes::SPEED_ON_PITCH
+    | Modes::LEVEL_CHANGE
+    | Modes::LOC_ARMED
+    | Modes::FMS_ARMED
+    | Modes::GS_ARMED
+    | Modes::TOGA_LATERAL
+    | Modes::TOGA_VERTICAL
+    | Modes::VNAV_ARMED;
 
 /// Did someone move the autopilot since `reference` (the episode's first
 /// read, or our own hold read back)? The servos coming in or out, the window
@@ -649,17 +636,17 @@ pub fn mcp_moved(
     if let (Some(a), Some(b), true) = (
         reference.hdg_bug_mag,
         now.hdg_bug_mag,
-        reference.has(AP_HDG) && now.has(AP_HDG),
+        reference.has(Modes::HEADING) && now.has(Modes::HEADING),
     ) {
         if crate::angles::abs_diff_deg(a, b) > 3.0 && !ours.wrote(Dial::HeadingBug, b, 3.0) {
             return Some("heading");
         }
     }
-    let (Some(s0), Some(s1)) = (reference.state, now.state) else {
+    let (Some(Modes(s0)), Some(Modes(s1))) = (reference.state, now.state) else {
         return None;
     };
     // A mode our own press brought in is ours.
-    let new = s1 & !s0 & !(ours.mode_bits() as i64);
+    let new = s1 & !s0 & !ours.mode_bits();
     if new & PILOT_MODE_BITS != 0 {
         return Some("mode");
     }
@@ -669,17 +656,17 @@ pub fn mcp_moved(
     if let (Some(a), Some(b), true) = (
         reference.vs_dial_fpm,
         now.vs_dial_fpm,
-        s0 & AP_VS != 0 && s1 & AP_VS != 0,
+        s0 & Modes::VS != 0 && s1 & Modes::VS != 0,
     ) {
         if (a - b).abs() > FLOOR_TOL_FT && !ours.wrote(Dial::Vs, b, FLOOR_TOL_FT) {
             return Some("vs_wheel");
         }
     }
-    if new & (AP_VS | AP_HDG) != 0 {
+    if new & (Modes::VS | Modes::HEADING) != 0 {
         return Some("mode");
     }
     // ALT HOLD appearing away from the window is a press, not a capture.
-    if new & AP_ALT_HOLD != 0 && now.alt_dial_ft.is_some_and(|w| (w - alt_ft).abs() > 300.0) {
+    if new & Modes::ALT_HOLD != 0 && now.alt_dial_ft.is_some_and(|w| (w - alt_ft).abs() > 300.0) {
         return Some("alt_hold");
     }
     None
@@ -1218,12 +1205,12 @@ async fn read_ap(xp: &crate::xplane::XPlaneClient) -> ApRead {
         xp.get_float(d::SERVOS_ON),
         xp.get_float(crate::autoflight::names::AP_STATE),
         crate::autoflight::read_dial(xp, crate::autoflight::Dial::Altitude),
-        xp.get_float(d::VVI_DIAL_FPM),
+        crate::autoflight::read_dial(xp, crate::autoflight::Dial::Vs),
         crate::autoflight::read_dial(xp, crate::autoflight::Dial::HeadingBug),
     );
     ApRead {
         servos: ok(servos).map(|v| v > 0.5),
-        state: ok(state).map(|v| v as i64),
+        state: ok(state).and_then(Modes::from_read),
         alt_dial_ft: ok(alt),
         vs_dial_fpm: ok(vs),
         hdg_bug_mag: ok(hdg),

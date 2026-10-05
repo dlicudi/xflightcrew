@@ -26,7 +26,7 @@ fn air() -> Air {
 fn ap_vs_down() -> ApRead {
     ApRead {
         servos: Some(true),
-        state: Some(AP_HDG | AP_VS | AP_ALT_ARMED),
+        state: Some(Modes(Modes::HEADING | Modes::VS | Modes::ALT_ARMED)),
         alt_dial_ft: Some(0.0),
         vs_dial_fpm: Some(-330.0),
         hdg_bug_mag: Some(305.0),
@@ -65,17 +65,17 @@ fn the_autopilot_s_vertical_path_is_read_from_its_modes() {
     assert_eq!(vertical(&ap, &a), Vertical::Unbounded);
     // VS without the altitude armed never captures.
     let mut ap = ap_vs_down();
-    ap.state = Some(AP_HDG | AP_VS);
+    ap.state = Some(Modes(Modes::HEADING | Modes::VS));
     assert_eq!(vertical(&ap, &a), Vertical::Unbounded);
     // ALT HOLD holds here; a glideslope is an approach.
     let mut ap = ap_vs_down();
-    ap.state = Some(AP_HDG | AP_ALT_HOLD);
+    ap.state = Some(Modes(Modes::HEADING | Modes::ALT_HOLD));
     assert_eq!(vertical(&ap, &a), Vertical::Holds(2_930.0));
-    ap.state = Some(AP_HNAV_ARMED | AP_GS);
+    ap.state = Some(Modes(Modes::LOC_ARMED | Modes::GS));
     assert_eq!(vertical(&ap, &a), Vertical::Glideslope);
     // Level change to a window below captures it; a VS climb climbs.
     let mut ap = ap_vs_down();
-    ap.state = Some(AP_FLCH);
+    ap.state = Some(Modes(Modes::LEVEL_CHANGE));
     ap.alt_dial_ft = Some(2_000.0);
     assert_eq!(vertical(&ap, &a), Vertical::Captures(2_000.0));
     let mut ap = ap_vs_down();
@@ -83,13 +83,28 @@ fn the_autopilot_s_vertical_path_is_read_from_its_modes() {
     assert_eq!(vertical(&ap, &a), Vertical::Climbs);
     // No vertical mode: the aircraft's own vertical speed decides.
     let mut ap = ap_vs_down();
-    ap.state = Some(AP_HDG);
+    ap.state = Some(Modes(Modes::HEADING));
     let mut fast_down = a;
     fast_down.vs_fpm = -900.0;
     assert_eq!(vertical(&ap, &fast_down), Vertical::Unbounded);
     let mut level = a;
     level.vs_fpm = -100.0;
     assert_eq!(vertical(&ap, &level), Vertical::Holds(2_930.0));
+}
+
+/// The bitfield is the panel owner's decoding: a -1 read (a sim with no
+/// autopilot) is no state, never every mode at once (a glideslope "coupled"
+/// would excuse any descent), and a float a hair under a bit rounds to it.
+#[test]
+fn a_negative_mode_read_is_no_state_never_every_bit() {
+    let mut ap = ap_vs_down();
+    ap.state = Modes::from_read(-1.0);
+    assert_eq!(ap.state, None);
+    let mut fast_down = air();
+    fast_down.vs_fpm = -900.0;
+    assert_eq!(vertical(&ap, &fast_down), Vertical::Unbounded);
+    ap.state = Modes::from_read(2_047.999);
+    assert_eq!(vertical(&ap, &air()), Vertical::Glideslope);
 }
 
 #[test]
@@ -321,18 +336,18 @@ fn only_a_hand_on_the_autopilot_is_the_pilot_never_its_own_capture() {
     let mut cap = base;
     cap.alt_dial_ft = Some(2_900.0);
     let mut held = cap;
-    held.state = Some(AP_HDG | AP_ALT_HOLD);
+    held.state = Some(Modes(Modes::HEADING | Modes::ALT_HOLD));
     assert_eq!(mcp_moved(&cap, &held, false, 2_910.0, &Ours::default()), None);
     // ALT HOLD pressed a mile from the window: a hand.
     let mut pressed = base;
-    pressed.state = Some(AP_HDG | AP_ALT_HOLD);
+    pressed.state = Some(Modes(Modes::HEADING | Modes::ALT_HOLD));
     assert_eq!(mcp_moved(&base, &pressed, false, alt, &Ours::default()), Some("alt_hold"));
     // LVL CHG, or the autothrottle: a hand, even under our hold.
     let mut flch = base;
-    flch.state = Some(AP_HDG | AP_FLCH);
+    flch.state = Some(Modes(Modes::HEADING | Modes::LEVEL_CHANGE));
     assert_eq!(mcp_moved(&base, &flch, true, alt, &Ours::default()), Some("mode"));
     let mut at = base;
-    at.state = Some(AP_HDG | AP_VS | AP_ALT_ARMED | AP_AUTOTHROTTLE);
+    at.state = Some(Modes(Modes::HEADING | Modes::VS | Modes::ALT_ARMED | Modes::AUTOTHROTTLE));
     assert_eq!(mcp_moved(&base, &at, true, alt, &Ours::default()), Some("mode"));
     // The heading bug in HDG mode.
     let mut hdg = base;
@@ -369,10 +384,10 @@ fn our_own_presses_and_writes_are_never_the_pilot() {
     assert_eq!(mcp_moved(&base, &now, false, alt, &ours(vec![OurChange::Press(Button::Disconnect)])), None);
     // Our ALT HOLD press away from the window: ours. LVL CHG: never ours.
     let mut now = base;
-    now.state = Some(AP_HDG | AP_ALT_HOLD);
+    now.state = Some(Modes(Modes::HEADING | Modes::ALT_HOLD));
     assert_eq!(mcp_moved(&base, &now, false, alt, &ours(vec![OurChange::Press(Button::AltitudeHold)])), None);
     let mut now = base;
-    now.state = Some(AP_HDG | AP_FLCH);
+    now.state = Some(Modes(Modes::HEADING | Modes::LEVEL_CHANGE));
     assert_eq!(
         mcp_moved(&base, &now, true, alt, &ours(vec![OurChange::Press(Button::AltitudeHold)])),
         Some("mode")
@@ -694,7 +709,7 @@ fn a_coupled_glideslope_is_an_approach_without_runway_data() {
     low.agl_ft = 300.0;
     low.vs_fpm = -800.0;
     let mut gs = ap_vs_down();
-    gs.state = Some(AP_AUTOTHROTTLE | AP_GS | 512);
+    gs.state = Some(Modes(Modes::AUTOTHROTTLE | Modes::GS | 512));
     let mut h = SafeHold::default();
     for s in 0..6 {
         let (a, r) = h.step(&tick(s as f64, low, gs));

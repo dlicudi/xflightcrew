@@ -67,7 +67,7 @@ fn ap_of(r: &Value) -> ApRead {
     };
     ApRead {
         servos,
-        state: r["in"]["ap_state"].as_i64(),
+        state: r["in"]["ap_state"].as_f64().and_then(Modes::from_read),
         alt_dial_ft: Some(0.0),
         vs_dial_fpm: r["in"]["vs_dial"].as_f64(),
         hdg_bug_mag: None,
