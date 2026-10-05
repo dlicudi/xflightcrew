@@ -27,6 +27,7 @@ use serde_json::json;
 use crate::config::Config;
 use crate::tools::controls::HoldFor;
 use crate::tools::{taxi::AutoTaxi, Tool, ToolCtx};
+use crate::voice::say_opt as announce;
 use crate::voice::{Priority, Voice};
 use crate::xplane::XPlaneClient;
 
@@ -209,12 +210,6 @@ fn stand_down_relocated(voice: &Option<Voice>, at: &str, said: bool) {
         );
     }
     arrest_release();
-}
-
-fn announce(voice: &Option<Voice>, priority: Priority, line: &str) {
-    if let Some(v) = voice {
-        v.alert(priority, line.to_string());
-    }
 }
 
 /// The runway to vacate, or `None` when there is nothing to vacate.

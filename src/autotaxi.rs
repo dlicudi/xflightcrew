@@ -45,6 +45,7 @@ use crate::aircraft::throttle_dataref;
 use crate::station::TaxiWatch;
 use crate::taxi_guide;
 use crate::tools::speedhold;
+use crate::voice::say_opt as alert;
 use crate::voice::{Priority, Voice};
 use crate::xplane::XPlaneClient;
 
@@ -3278,12 +3279,6 @@ fn stagnant_line(off_pavement: bool, facing_away: bool) -> &'static str {
              Turn us toward the taxiway, then ask me to taxi again."
         }
         (false, false) => "I can't get us moving. Standing down. Your aircraft.",
-    }
-}
-
-fn alert(voice: &Option<Voice>, priority: Priority, line: &str) {
-    if let Some(v) = voice {
-        v.alert(priority, line);
     }
 }
 

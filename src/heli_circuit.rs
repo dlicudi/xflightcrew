@@ -20,6 +20,7 @@ use std::time::Duration;
 
 use crate::hover::{self, Goal};
 use crate::taxi_guide::{bearing, dist, Geo};
+use crate::voice::say_opt as say;
 use crate::voice::{Priority, Voice};
 use crate::xplane::XPlaneClient;
 
@@ -151,12 +152,6 @@ pub fn start(voice: Option<Voice>, base_url: String, right: bool) {
         };
         rt.block_on(fly(XPlaneClient::new(base_url), voice, right, &run));
     });
-}
-
-fn say(voice: &Option<Voice>, p: Priority, text: impl Into<String>) {
-    if let Some(v) = voice {
-        v.alert(p, text);
-    }
 }
 
 async fn fly(xp: XPlaneClient, voice: Option<Voice>, right: bool, run: &sim::run::Lease<'_>) {

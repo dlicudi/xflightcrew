@@ -508,6 +508,14 @@ fn radio_interrupts(priority: Priority) -> bool {
     priority < Priority::Warning
 }
 
+/// [`Voice::alert`] when there is a voice: a loop run headless (a test, a
+/// sortie check) carries `None`. The one copy of the helper every loop kept.
+pub fn say_opt(voice: &Option<Voice>, priority: Priority, text: impl Into<String>) {
+    if let Some(v) = voice {
+        v.alert(priority, text);
+    }
+}
+
 /// Push onto the intercom queue from anywhere that holds the arbiter.
 /// Every line ever queued, either channel: the standby filler's evidence that
 /// SOMETHING answered the pilot's turn (`tempo::Turn`).

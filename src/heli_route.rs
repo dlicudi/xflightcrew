@@ -32,6 +32,7 @@ use std::time::Duration;
 
 use crate::hover::{self, Goal};
 use crate::taxi_guide::{bearing, dist, Geo};
+use crate::voice::say_opt as say;
 use crate::voice::{Priority, Voice};
 use crate::xplane::XPlaneClient;
 
@@ -1625,12 +1626,6 @@ pub fn start(
             );
         }
     });
-}
-
-fn say(voice: &Option<Voice>, p: Priority, text: impl Into<String>) {
-    if let Some(v) = voice {
-        v.alert(p, text);
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
