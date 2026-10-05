@@ -24,23 +24,43 @@
         assert!(w.quiet && !w.compliance_ticks && !w.compliance_speaks);
     }
 
+    /// The monitor calls the world's runway watch (`world_tick`) once,
+    /// ahead of its `if !quiet` block, and the runway watch itself never
+    /// reads `quiet`. Returns the world_tick source and the span of
+    /// `runway_watch` in it.
+    fn runway_watch_span() -> (&'static str, std::ops::Range<usize>) {
+        let all = crate::test_support::module_source("monitor");
+        let mon = &all[..all.find("\nmod tests;").expect("tests")];
+        let quiet_block = mon.find("            if !quiet {\n").expect("world block");
+        let calls: Vec<usize> = mon.match_indices("world.runway_watch(").map(|(i, _)| i).collect();
+        assert_eq!(calls.len(), 1, "one runway watch call site");
+        assert!(calls[0] < quiet_block, "the runway watch is back under `quiet`");
+        let world = crate::test_support::module_source("world_tick");
+        let start = world.find("async fn runway_watch(").expect("the runway watch");
+        let end = start + world[start..].find("\n    }\n").expect("the runway watch's end");
+        for q in ["!quiet", "gates.quiet"] {
+            assert!(!world[start..end].contains(q), "the runway watch reads `{q}`");
+        }
+        (world, start..end)
+    }
+
     /// The watch's call site sits outside the `if !quiet` world block: a
     /// refactor that moves it back in brings issue #63 back.
     #[test]
     fn the_compliance_tick_is_not_under_the_quiet_gate() {
-        let src = crate::test_support::module_source("monitor");
+        let (src, watch) = runway_watch_span();
         let tick = src
             .find("crate::station::compliance_tick_facing(")
             .expect("call site");
+        assert!(watch.contains(&tick), "the compliance tick left the runway watch");
         let gate = src[..tick]
             .rfind("if gates.compliance_ticks {")
             .expect("its own gate");
+        assert!(gate >= watch.start, "its gate is the runway watch's");
         assert!(
             !src[gate..tick].contains("if !quiet"),
             "the compliance watch is back under `quiet`"
         );
-        let quiet_block = src.find("            if !quiet {\n").expect("world block");
-        assert!(tick < quiet_block, "compliance tick inside the quiet block");
     }
 
     /// Sortie 1790601822-full_auto (EGKK-EGBB 15, 2026-09-28, #155): the
@@ -52,19 +72,18 @@
     /// sites sit ahead of that block, under the compliance gate.
     #[test]
     fn the_landing_runway_watch_is_not_under_the_quiet_gate() {
-        let all = crate::test_support::module_source("monitor");
-        let src = &all[..all.find("\nmod tests;").expect("tests")];
-        let quiet_block = src.find("            if !quiet {\n").expect("world block");
+        let (src, watch) = runway_watch_span();
         for call in [
             "crate::station::go_around_tick(",
             "crate::station::landing_hold_tick(",
         ] {
             let at: Vec<usize> = src.match_indices(call).map(|(i, _)| i).collect();
             assert_eq!(at.len(), 1, "{call}: one call site");
-            assert!(at[0] < quiet_block, "{call} is back under `quiet`");
+            assert!(watch.contains(&at[0]), "{call} left the runway watch");
             let gate = src[..at[0]]
                 .rfind("if gates.compliance_ticks\n")
                 .expect("the runway watch's gate");
+            assert!(gate >= watch.start, "{call}: its gate is the runway watch's");
             assert!(!src[gate..at[0]].contains("if !quiet"), "{call}");
         }
     }

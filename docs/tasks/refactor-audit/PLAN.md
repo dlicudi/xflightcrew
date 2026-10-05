@@ -84,3 +84,6 @@ struct with per-phase methods. Gate: bench replays, `xvl sortie --check`, real s
   `safe_hold::floor`, one MORA loader, `flap_within_limits`, `recover::unflyable_floor_kts`.
 - Next: P3.2 `Scoped<T>`, P3.3 airframe facts snapshot, P2.6 `world_tick.rs`, phase 4 moves;
   sortie-gated items unchanged (see the 2026-10-04 audit lists).
+- 2026-10-06: P2.3 grammar and instructor tests to `src/grammar/tests.rs`, `src/instructor/tests.rs`;
+  P2.6 `src/world_tick.rs` (`WorldTick`: runway watch ahead of `quiet`, incursion, radio
+  services, traffic, unheard vectors), five calls at the old points since crew work interleaves.

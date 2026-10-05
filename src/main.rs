@@ -107,6 +107,7 @@ mod undo;
 mod vad;
 mod voice;
 mod weather;
+mod world_tick;
 
 // The world side (ATC) and the simulator plumbing now live in their own
 // crates; these shims keep every existing `crate::station::...` /
