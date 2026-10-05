@@ -2067,3 +2067,33 @@
         let level = departure_check_in(&None, "Malaga Departure", 3980.0, 4000.0);
         assert_eq!(level, "Malaga Departure, passing four thousand");
     }
+
+    /// The runway waiver and the departure minimums are the mission's: set
+    /// only by its arm and takeoff, cleared at its start, every stop, a new
+    /// flight and a new airframe (never set true here: the runway gates of
+    /// other tests read the waiver).
+    #[test]
+    fn the_mission_facts_die_with_the_mission() {
+        super::forget_mission();
+        assert!(!crate::aircraft::takeoff_margin_waived());
+        assert!(!super::departure_minimums());
+        let src = crate::test_support::module_source("full_auto");
+        let body = |head: &str| {
+            let rest = src.split(head).nth(1).expect(head);
+            rest[..rest.find("\n}\n").unwrap()].to_string()
+        };
+        assert!(body("pub fn abort() -> bool {").contains("forget_mission();"));
+        assert!(body("fn stop_active() {").contains("forget_mission();"));
+        let state = crate::test_support::module_source("flight_state");
+        assert_eq!(state.matches("crate::full_auto::forget_mission();").count(), 2);
+        // The waiver's one writer is the mission.
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        for f in crate::test_support::rust_files(&root) {
+            let rel = f.strip_prefix(&root).unwrap().display().to_string();
+            if crate::test_support::is_test_file(&f) || rel == "full_auto.rs" || rel == "aircraft.rs" {
+                continue;
+            }
+            let text = std::fs::read_to_string(&f).unwrap();
+            assert!(!text.contains("set_takeoff_margin_waived("), "{rel} writes the waiver");
+        }
+    }

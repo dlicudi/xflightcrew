@@ -1982,11 +1982,6 @@ pub fn climb_throttle(ias_kts: f64, vne_kts: Option<f64>) -> f64 {
 /// the flaps running up on speed alone at 400, 500 and 740 ft, 240 kt through
 /// 1,000 ft. A crew holds V2 + 20 to the acceleration height by PITCH, then
 /// lowers the nose and cleans up on the schedule.
-/// Full auto has a departure's minimum altitudes ahead: the takeoff climbs at
-/// best rate. Set by full auto for its takeoff, cleared after.
-pub static DEPARTURE_MINIMUMS: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
-
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ClimbOut {
     pub accel_agl_ft: f64,
@@ -3695,7 +3690,7 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, p: Params) {
         // flown at the airframe's BEST rate, holding its initial climb speed
         // by climbing harder: capped at the enroute 1,500 fpm the SF50 made
         // 750 ft a mile where MOGT3H's WI505 wanted 816 (LOWI, 2026-09-24).
-        let (base_fpm, climb_out) = if DEPARTURE_MINIMUMS.load(Ordering::Relaxed) {
+        let (base_fpm, climb_out) = if crate::full_auto::departure_minimums() {
             let best = crate::procedure::best_climb_fpm().max(p.climb_fpm);
             (best, Some(ClimbOut { accel_agl_ft: f64::INFINITY, max_fpm: best }))
         } else {

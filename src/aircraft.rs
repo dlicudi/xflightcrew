@@ -3433,16 +3433,25 @@ pub fn takeoff_needed_m(
 pub const TAKEOFF_FACTOR: f64 = 1.4;
 
 /// The pilot waived the runway margin for the full-auto mission flying the
-/// plan it was waived for (`full_auto::Gate::OriginRunway`): set at that
-/// arm, cleared at every other arm, wherever full auto stops, and by the
-/// airframe swap, so no other takeoff ever inherits it.
-pub static TAKEOFF_MARGIN_WAIVED: std::sync::atomic::AtomicBool =
+/// plan it was waived for. The mission owns it (`full_auto::forget_mission`
+/// and its arm are the only writers); it lives here only because the lib's
+/// runway rule reads it.
+static TAKEOFF_MARGIN_WAIVED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
+
+/// Full auto's writer for its runway waiver; nobody else sets it.
+pub fn set_takeoff_margin_waived(on: bool) {
+    TAKEOFF_MARGIN_WAIVED.store(on, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// Whether a waived full-auto mission is flying.
+pub fn takeoff_margin_waived() -> bool {
+    TAKEOFF_MARGIN_WAIVED.load(std::sync::atomic::Ordering::SeqCst)
+}
 
 /// [`TAKEOFF_FACTOR`], or none while a waived full-auto mission flies.
 fn takeoff_factor() -> f64 {
-    use std::sync::atomic::Ordering::Relaxed;
-    if TAKEOFF_MARGIN_WAIVED.load(Relaxed) {
+    if takeoff_margin_waived() {
         1.0
     } else {
         TAKEOFF_FACTOR
