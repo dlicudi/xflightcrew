@@ -17,12 +17,12 @@ use std::time::Duration;
 use super::{Tool, ToolCtx};
 use crate::aircraft::HeliStartProfile;
 
-const ENGN_RUNNING: &str = "sim/flightmodel/engine/ENGN_running";
-const N1_PERCENT: &str = "sim/cockpit2/engine/indicators/N1_percent";
-const BUS_VOLTS: &str = "sim/cockpit2/electrical/bus_volts";
-const Y_AGL: &str = "sim/flightmodel/position/y_agl";
-const GROUNDSPEED: &str = "sim/flightmodel/position/groundspeed";
-const PSI: &str = "sim/flightmodel/position/psi";
+const ENGN_RUNNING: &str = crate::datarefs::ENGINE_RUNNING;
+const N1_PERCENT: &str = crate::datarefs::N1_PERCENT;
+const BUS_VOLTS: &str = crate::datarefs::BUS_VOLTS;
+const Y_AGL: &str = crate::datarefs::AGL_METERS;
+const GROUNDSPEED: &str = crate::datarefs::GROUNDSPEED_MS;
+const PSI: &str = crate::datarefs::TRUE_HEADING_DEG;
 /// Collective above this is "up": a start with it there is refused.
 const COLLECTIVE_DOWN_MAX: f64 = 0.05;
 /// The bus a starter needs (the S-76 read 24 V on batteries alone).
@@ -745,7 +745,7 @@ async fn route(tool: &Hover, args: &Value, ctx: &ToolCtx<'_>) -> Result<String> 
         let (here_lat, here_lon, elev) = tokio::join!(
             ctx.xplane.get_float(crate::datarefs::LATITUDE),
             ctx.xplane.get_float(crate::datarefs::LONGITUDE),
-            ctx.xplane.get_float("sim/flightmodel/position/elevation"),
+            ctx.xplane.get_float(crate::datarefs::ELEVATION_M),
         );
         if let (Ok(la), Ok(lo), Ok(el)) = (here_lat, here_lon, elev) {
             let mut line = vec![(la, lo)];

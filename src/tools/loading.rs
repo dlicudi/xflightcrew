@@ -28,7 +28,7 @@ const TANK_RATIO: &str = "sim/aircraft/overflow/acf_tank_rat";
 const TANK_LATERAL_M: &str = "sim/aircraft/overflow/acf_tank_X";
 const EMPTY_WEIGHT_KG: &str = "sim/aircraft/weight/acf_m_empty";
 const MAX_WEIGHT_KG: &str = "sim/aircraft/weight/acf_m_max";
-pub(crate) const GROUNDSPEED_MS: &str = "sim/flightmodel/position/groundspeed";
+pub(crate) const GROUNDSPEED_MS: &str = crate::datarefs::GROUNDSPEED_MS;
 
 /// A tank or a cabin within this of the plan is loaded: one percent, and
 /// never tighter than two kilos.

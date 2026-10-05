@@ -11,9 +11,9 @@ use serde_json::{json, Value};
 use super::{Tool, ToolCtx};
 
 /// Gear handle position: 1 = down, 0 = up. Writable.
-const GEAR_HANDLE: &str = "sim/cockpit2/controls/gear_handle_down";
+const GEAR_HANDLE: &str = crate::datarefs::GEAR_HANDLE_DOWN;
 /// 1 while any wheel is on the ground — the gate against retracting on the runway.
-const IAS_KTS: &str = "sim/cockpit2/gauges/indicators/airspeed_kts_pilot";
+const IAS_KTS: &str = crate::datarefs::AIRSPEED_KTS;
 
 const CMD_GEAR_UP: &str = "sim/flight_controls/landing_gear_up";
 const CMD_GEAR_DOWN: &str = "sim/flight_controls/landing_gear_down";

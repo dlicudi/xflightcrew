@@ -275,7 +275,7 @@ fn forget_flight() {
 /// every `Slot` declared under `src`, so a new loop cannot outlive a swap by
 /// being forgotten here (the old check matched names, and `BRAKES_HELD`, the
 /// capture watcher and the start sequences slipped through it).
-pub(crate) static LOOPS: [(&str, &sim::run::Slot); 18] = [
+pub(crate) static LOOPS: [(&str, &sim::run::Slot); 20] = [
     ("full_auto::RUN", &crate::full_auto::RUN),
     ("procedure::RUN", &crate::procedure::RUN),
     ("autotakeoff::RUN", &crate::autotakeoff::RUN),
@@ -294,6 +294,8 @@ pub(crate) static LOOPS: [(&str, &sim::run::Slot); 18] = [
     ("tools::autopilot::CAPTURE", &crate::tools::autopilot::CAPTURE),
     ("tools::power::POWER_UP", &crate::tools::power::POWER_UP),
     ("tools::jet_start::JET_START", &crate::tools::jet_start::JET_START),
+    ("ils::SETUP", &crate::ils::SETUP),
+    ("flow::RUN", &crate::flow::RUN),
 ];
 
 /// Every loop that can hold the aircraft, stopped. What a stand-down leaves
@@ -320,14 +322,13 @@ pub(crate) fn stand_down() {
     // Every run, whoever holds it: the recovery, the helicopter loops, the
     // governor, reverse, the brake hold (its held command expires), the
     // capture watcher (it writes the dial, ALT hold and throttle), a
-    // power-up or jet start (stopped at its next step).
+    // power-up or jet start (stopped at its next step), the ILS setup watch
+    // and a checklist (stopped where it is, its summary says so).
     for (_, run) in &LOOPS {
         run.cancel();
     }
     // Loops not on a run yet: each its own door.
     crate::approach_guide::cancel();
-    crate::ils::stop_setup_watch();
-    crate::flow::abort();
     crate::tools::engine::MIX_MANAGED.store(false, SeqCst);
     crate::tools::engine::LEAN_SEEKING.store(false, SeqCst);
     // The arrival's hold on the station is a fact about a flight, not about
@@ -548,12 +549,11 @@ mod tests {
             ("full_auto", "ACTIVE", "crate::full_auto::abort()"),
             ("procedure", "ACTIVE", "crate::procedure::abort()"),
             ("autotakeoff", "ACTIVE", "crate::autotakeoff::cancel()"),
-            ("flow", "ACTIVE", "crate::flow::abort()"),
             // The pilot's stop word for the steered push (a mailbox).
             ("pushback", "ABORT", "crate::pushback::clear()"),
-            // The checklist runner and the ILS setup watch: not yet on runs.
-            ("flow", "ABORT", "crate::flow::abort()"),
-            ("ils", "SETUP_GEN", "crate::ils::stop_setup_watch()"),
+            // The checklist runner's flag beside its unflagged run: its
+            // thread clears it on the way out once the sweep cancels the run.
+            ("flow", "ACTIVE", ""),
             // The copilot's speech turn and the barge-in cut per channel.
             ("tempo", "TURN_GEN", ""),
             ("tts", "CUT_GEN", ""),

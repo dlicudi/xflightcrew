@@ -257,7 +257,7 @@ pub async fn settled_position(xp: &crate::xplane::XPlaneClient, t: SettleTiming)
             xp.get_float(crate::datarefs::LONGITUDE),
             xp.get_float(crate::datarefs::AGL_METERS),
             xp.get_float(crate::datarefs::ON_GROUND_ANY),
-            xp.get_float("sim/flightmodel/position/groundspeed"),
+            xp.get_float(crate::datarefs::GROUNDSPEED_MS),
         );
         if let (Ok(lat), Ok(lon), Ok(agl), Ok(g), Ok(gs)) = (lat, lon, agl, g, gs) {
             let s = PosSample {
@@ -854,9 +854,9 @@ impl Tool for SetUpApproach {
         let strings = crate::xplane::XPlaneClient::new(ctx.config.xplane_base_url.clone());
         let (ground, lat, lon, acf) = tokio::join!(
             ctx.xplane.get_float(crate::datarefs::ON_GROUND_ANY),
-            ctx.xplane.get_float("sim/flightmodel/position/latitude"),
-            ctx.xplane.get_float("sim/flightmodel/position/longitude"),
-            strings.get_string("sim/aircraft/view/acf_relative_path"),
+            ctx.xplane.get_float(crate::datarefs::LATITUDE),
+            ctx.xplane.get_float(crate::datarefs::LONGITUDE),
+            strings.get_string(crate::datarefs::ACF_RELATIVE_PATH),
         );
         // In the air a bare "put us on final" could be words about the
         // circuit being flown; a new flight there needs a distance, a runway

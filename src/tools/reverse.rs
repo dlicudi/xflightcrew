@@ -26,8 +26,8 @@ use super::{Tool, ToolCtx};
 use crate::xplane::{XPlane, XPlaneClient};
 
 const BETA_REV: &str = "sim/cockpit2/engine/actuators/throttle_beta_rev_ratio";
-const ENGN_RUNNING: &str = "sim/flightmodel/engine/ENGN_running";
-const GS_MS: &str = "sim/flightmodel/position/groundspeed";
+const ENGN_RUNNING: &str = crate::datarefs::ENGINE_RUNNING;
+const GS_MS: &str = crate::datarefs::GROUNDSPEED_MS;
 const MS_TO_KTS: f64 = 1.943_844;
 
 /// Full reverse on the lever scale (see module docs).

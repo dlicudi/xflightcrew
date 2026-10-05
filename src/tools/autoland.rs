@@ -68,7 +68,7 @@ async fn nearest_runway(ctx: &ToolCtx<'_>, why: &str) -> Option<crate::autoland:
     let (lat, lon, trk) = tokio::join!(
         ctx.xplane.get_float(crate::datarefs::LATITUDE),
         ctx.xplane.get_float(crate::datarefs::LONGITUDE),
-        ctx.xplane.get_float("sim/flightmodel/position/hpath"),
+        ctx.xplane.get_float(crate::datarefs::TRACK_DEG_TRUE),
     );
     let (lat, lon, trk) = (lat.ok()?, lon.ok()?, trk.unwrap_or(0.0));
     let apt = apt_dat_path();

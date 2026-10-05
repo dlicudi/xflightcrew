@@ -29,7 +29,7 @@ const SPEEDBRAKE: &str = TakeoffConfigProfile::SPEEDBRAKE;
 const AUTOBRAKE: &str = TakeoffConfigProfile::AUTOBRAKE;
 #[cfg(test)]
 const ALT_DIAL: &str = Dial::Altitude.read_name();
-const GROUNDSPEED_MS: &str = "sim/flightmodel/position/groundspeed";
+const GROUNDSPEED_MS: &str = crate::datarefs::GROUNDSPEED_MS;
 /// The stock autoflight names: one list, the profile probe's
 /// ([`TakeoffConfigProfile::references`]).
 // The autoflight half is the panel owner's (`crate::autoflight`): read
@@ -607,7 +607,7 @@ mod tests {
             (AUTOBRAKE, 1.0),
             (ALT_DIAL, 100.0),
             (crate::datarefs::ELEVATION_M, 6.0),
-            ("sim/cockpit2/controls/elevator_trim", 0.0),
+            (crate::datarefs::ELEVATOR_TRIM, 0.0),
             (FD_MODE, 0.0),
             (SPEED_WINDOW, 100.0),
         ]);
@@ -650,7 +650,7 @@ mod tests {
                 (AUTOBRAKE, 0.0),
                 (ALT_DIAL, 25000.0),
                 (crate::datarefs::ELEVATION_M, 41.0),
-                ("sim/cockpit2/controls/elevator_trim", 0.0),
+                (crate::datarefs::ELEVATOR_TRIM, 0.0),
             ])
         };
         let xp = reads(0.0);
@@ -748,7 +748,7 @@ mod tests {
             (AUTOBRAKE, 0.0),
             (ALT_DIAL, 1800.0),
             (crate::datarefs::ELEVATION_M, 6.0),
-            ("sim/cockpit2/controls/elevator_trim", 0.0),
+            (crate::datarefs::ELEVATOR_TRIM, 0.0),
             (FD_MODE, 1.0),
             (SPEED_WINDOW, 153.0),
         ]);
@@ -770,7 +770,7 @@ mod tests {
             (FLAP_DEPLOY, 0.1),
             (ALT_DIAL, 5000.0),
             (crate::datarefs::ELEVATION_M, 6.0),
-            ("sim/cockpit2/controls/elevator_trim", 0.0),
+            (crate::datarefs::ELEVATOR_TRIM, 0.0),
         ]);
         let t = tokio::time::Instant::now();
         let o = set_for_takeoff(&xp, Some(0.5), None, true).await;
@@ -794,7 +794,7 @@ mod tests {
             (AUTOBRAKE, 0.0),
             (ALT_DIAL, 25000.0),
             (crate::datarefs::ELEVATION_M, 41.0),
-            ("sim/cockpit2/controls/elevator_trim", 0.0),
+            (crate::datarefs::ELEVATOR_TRIM, 0.0),
             (FD_MODE, 0.0),
             (AT_MODE, -1.0),
             (SPEED_WINDOW, 125.0),
@@ -824,7 +824,7 @@ mod tests {
             (AUTOBRAKE, 0.0),
             (ALT_DIAL, 25000.0),
             (crate::datarefs::ELEVATION_M, 41.0),
-            ("sim/cockpit2/controls/elevator_trim", 0.0),
+            (crate::datarefs::ELEVATOR_TRIM, 0.0),
             (FD_MODE, 1.0),
             (AT_MODE, 0.0),
             (SPEED_WINDOW, 150.4),

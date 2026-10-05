@@ -171,6 +171,40 @@ pub const ACF_ICAO: &str = "sim/aircraft/view/acf_ICAO";
 /// Maximum gross mass, kg. The wake turbulence category is read off it.
 pub const ACF_M_MAX_KG: &str = "sim/aircraft/weight/acf_m_max";
 
+// --- Flight model, engines, inputs: read by several loops ---
+/// True heading of the nose, degrees.
+pub const TRUE_HEADING_DEG: &str = "sim/flightmodel/position/psi";
+/// The flight path's true track, degrees (meaningless when stopped).
+pub const TRACK_DEG_TRUE: &str = "sim/flightmodel/position/hpath";
+/// Magnetic variation here, degrees (magnetic = true - variation).
+pub const MAGNETIC_VARIATION_DEG: &str = "sim/flightmodel/position/magnetic_variation";
+/// The flight model's indicated airspeed, knots (no gauge lag).
+pub const INDICATED_AIRSPEED_KTS: &str = "sim/flightmodel/position/indicated_airspeed";
+/// Flight-model bank and pitch, degrees (not the `true_` attitude above).
+pub const PHI_DEG: &str = "sim/flightmodel/position/phi";
+pub const THETA_DEG: &str = "sim/flightmodel/position/theta";
+/// Body yaw rate, degrees per second.
+pub const YAW_RATE_DEG_S: &str = "sim/flightmodel/position/R";
+/// Velocity in the local frame, m/s: east (x) and south (z).
+pub const LOCAL_VX_MS: &str = "sim/flightmodel/position/local_vx";
+pub const LOCAL_VZ_MS: &str = "sim/flightmodel/position/local_vz";
+/// Per engine, 1 while running.
+pub const ENGINE_RUNNING: &str = "sim/flightmodel/engine/ENGN_running";
+pub const N1_PERCENT: &str = "sim/cockpit2/engine/indicators/N1_percent";
+pub const N2_PERCENT: &str = "sim/cockpit2/engine/indicators/N2_percent";
+pub const PROP_SPEED_RPM: &str = "sim/cockpit2/engine/indicators/prop_speed_rpm";
+/// Per bus, volts.
+pub const BUS_VOLTS: &str = "sim/cockpit2/electrical/bus_volts";
+pub const STALL_WARNING_RATIO: &str = "sim/cockpit2/annunciators/stall_warning_ratio";
+/// 1 while a tug is on the bar.
+pub const PUSHBACK_ATTACHED: &str = "sim/aircraft/overflow/pushback_attached";
+/// The GPS's active waypoint ident.
+pub const GPS_NAV_ID: &str = "sim/cockpit2/radios/indicators/gps_nav_id";
+pub const SUN_PITCH_DEG: &str = "sim/graphics/scenery/sun_pitch_degrees";
+/// The pilot's yoke, -1..1: hands on the controls.
+pub const YOKE_PITCH_RATIO: &str = "sim/joystick/yoke_pitch_ratio";
+pub const YOKE_ROLL_RATIO: &str = "sim/joystick/yoke_roll_ratio";
+
 // --- Autopilot status (read-only; > 0 = engaged/armed) ---
 pub const SERVOS_ON: &str = "sim/cockpit2/autopilot/servos_on";
 pub const APPROACH_STATUS: &str = "sim/cockpit2/autopilot/approach_status";

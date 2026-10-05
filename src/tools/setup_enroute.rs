@@ -583,8 +583,8 @@ impl Tool for SetUpEnroute {
         };
         let strings = crate::xplane::XPlaneClient::new(ctx.config.xplane_base_url.clone());
         let (acf, icao) = tokio::join!(
-            strings.get_string("sim/aircraft/view/acf_relative_path"),
-            strings.get_string("sim/aircraft/view/acf_ICAO"),
+            strings.get_string(crate::datarefs::ACF_RELATIVE_PATH),
+            strings.get_string(crate::datarefs::ACF_ICAO),
         );
         let Some(acf) = acf.ok().filter(|p| !p.trim().is_empty()) else {
             return refused("I can't read which aircraft is loaded.".into());
@@ -672,7 +672,7 @@ struct EnrouteJob {
 
 const VS_STATUS: &str = autoflight::names::VS_STATUS;
 const ALT_HOLD_STATUS: &str = autoflight::names::ALT_HOLD_STATUS;
-const MAG_VAR: &str = "sim/flightmodel/position/magnetic_variation";
+const MAG_VAR: &str = crate::datarefs::MAGNETIC_VARIATION_DEG;
 
 /// How the autopilot came up on the new flight.
 #[derive(Debug, Clone, Copy, Default)]
@@ -1290,7 +1290,6 @@ mod tests {
     #[test]
     fn the_phugoid_air_start_is_never_called_ready() {
         let mut j = SettleJudge::default();
-        let mut end = Settle::Settling;
         for (t_s, alt_ft, ias_kts, _) in PHUGOID {
             let s = SettleSample {
                 t_s,
@@ -1299,7 +1298,7 @@ mod tests {
                 governed_kts: Some(296.0),
                 altimeter_ok: Some(false),
             };
-            end = j.step(18_000.0, &s);
+            let end = j.step(18_000.0, &s);
             if t_s < SETTLE_MAX_S {
                 assert_eq!(end, Settle::Settling, "{t_s}");
             }
@@ -1313,7 +1312,7 @@ mod tests {
             governed_kts: Some(296.0),
             altimeter_ok: Some(false),
         };
-        end = j.step(18_000.0, &last);
+        let end = j.step(18_000.0, &last);
         let Settle::Unsettled(why) = end else { panic!("{end:?}") };
         assert_eq!(
             why,

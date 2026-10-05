@@ -17,9 +17,9 @@ use crate::aircraft::{FlapDetent, FlapProfile};
 
 /// X-Plane flap handle position, 0.0 (up) .. 1.0 (full). Writable; the actual
 /// surfaces animate toward it. Reading it back gives the commanded notch.
-const FLAP_HANDLE: &str = "sim/cockpit2/controls/flap_ratio";
+const FLAP_HANDLE: &str = crate::datarefs::FLAP_RATIO;
 /// Indicated airspeed at the pilot's ASI, in knots — used by the safety gate.
-const IAS_KTS: &str = "sim/cockpit2/gauges/indicators/airspeed_kts_pilot";
+const IAS_KTS: &str = crate::datarefs::AIRSPEED_KTS;
 
 pub struct SetFlaps {
     flaps: FlapProfile,

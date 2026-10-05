@@ -161,12 +161,12 @@ pub(crate) async fn fix_answer(q: &FixQuery, xp: &XPlaneClient) -> String {
     };
     let dist = nav::haversine_nm(lat, lon, q.lat, q.lon);
     let gs_kts = xp
-        .get_float("sim/flightmodel/position/groundspeed")
+        .get_float(crate::datarefs::GROUNDSPEED_MS)
         .await
         .unwrap_or(0.0)
         * MS_TO_KTS;
     let active = xp
-        .get_string("sim/cockpit2/radios/indicators/gps_nav_id")
+        .get_string(crate::datarefs::GPS_NAV_ID)
         .await
         .unwrap_or_default()
         .trim()
@@ -251,8 +251,8 @@ pub(crate) async fn time_to_tod(
     let route: Vec<(f64, f64)> = fp.waypoints.iter().map(|w| (w.lat, w.lon)).collect();
     let ring_nm = tod_ring_nm(fp, &route);
     let (lat, lon) = match (
-        xp.get_float("sim/flightmodel/position/latitude").await,
-        xp.get_float("sim/flightmodel/position/longitude").await,
+        xp.get_float(crate::datarefs::LATITUDE).await,
+        xp.get_float(crate::datarefs::LONGITUDE).await,
     ) {
         (Ok(a), Ok(b)) => (a, b),
         _ => return "I can't read our position right now.".to_string(),
@@ -293,7 +293,7 @@ pub(crate) async fn tod_phrase(dist_nm: f64, xp: &XPlaneClient) -> String {
         return "We're at top of descent, time to start down.".to_string();
     }
     let gs_kts = xp
-        .get_float("sim/flightmodel/position/groundspeed")
+        .get_float(crate::datarefs::GROUNDSPEED_MS)
         .await
         .unwrap_or(0.0)
         * MS_TO_KTS;
@@ -337,9 +337,9 @@ pub(crate) async fn eta_to_destination(
         fp.destination.clone()
     };
     let (lat, lon, gs_ms) = match (
-        xp.get_float("sim/flightmodel/position/latitude").await,
-        xp.get_float("sim/flightmodel/position/longitude").await,
-        xp.get_float("sim/flightmodel/position/groundspeed").await,
+        xp.get_float(crate::datarefs::LATITUDE).await,
+        xp.get_float(crate::datarefs::LONGITUDE).await,
+        xp.get_float(crate::datarefs::GROUNDSPEED_MS).await,
     ) {
         (Ok(a), Ok(b), Ok(c)) => (a, b, c),
         _ => return "I can't read our position right now.".to_string(),
@@ -888,8 +888,8 @@ pub(crate) async fn plan_check_report(
     .unwrap_or((None, None));
     let (ground, lat, lon) = tokio::join!(
         xp.get_float(datarefs::ON_GROUND_ANY),
-        xp.get_float("sim/flightmodel/position/latitude"),
-        xp.get_float("sim/flightmodel/position/longitude"),
+        xp.get_float(crate::datarefs::LATITUDE),
+        xp.get_float(crate::datarefs::LONGITUDE),
     );
     let at_origin = ground.is_ok_and(|g| g > 0.5)
         && match (lat, lon, fp.waypoints.first()) {

@@ -1176,17 +1176,17 @@ const PRESSURE_ALT: &str = "sim/flightmodel2/position/pressure_altitude";
 /// How often the air and the weight are read again in flight (fuel burns, a
 /// departure climbs).
 const AIR_REFRESH_S: f64 = 10.0;
-const Y_AGL: &str = "sim/flightmodel/position/y_agl";
-const VS_FPM: &str = "sim/flightmodel/position/vh_ind_fpm";
-const GROUNDSPEED: &str = "sim/flightmodel/position/groundspeed";
-const THETA: &str = "sim/flightmodel/position/theta";
-const PHI: &str = "sim/flightmodel/position/phi";
+const Y_AGL: &str = crate::datarefs::AGL_METERS;
+const VS_FPM: &str = crate::datarefs::VS_FPM_FLIGHT_MODEL;
+const GROUNDSPEED: &str = crate::datarefs::GROUNDSPEED_MS;
+const THETA: &str = crate::datarefs::THETA_DEG;
+const PHI: &str = crate::datarefs::PHI_DEG;
 const AP_ON: &str = autoflight::names::AP_ON;
 const HOVER_STATUS: &str = autoflight::names::HOVER_STATUS;
-const VX: &str = "sim/flightmodel/position/local_vx";
-const VZ: &str = "sim/flightmodel/position/local_vz";
-const PSI: &str = "sim/flightmodel/position/psi";
-const YAW_RATE: &str = "sim/flightmodel/position/R";
+const VX: &str = crate::datarefs::LOCAL_VX_MS;
+const VZ: &str = crate::datarefs::LOCAL_VZ_MS;
+const PSI: &str = crate::datarefs::TRUE_HEADING_DEG;
+const YAW_RATE: &str = crate::datarefs::YAW_RATE_DEG_S;
 /// The plugin's rudder channel (the taxi's steering): an expiring heartbeat
 /// written every tick, dropped the frame the pilot's yaw axis moves.
 const PEDALS: &str = "xcopilot/taxi_steer";
@@ -1402,7 +1402,7 @@ const CRUISE_HANDBACK_MPS: f64 = 22.0;
 pub(crate) async fn cruise_modes(xp: &XPlaneClient) -> bool {
     let (hdg, alt) = tokio::join!(
         xp.get_float(crate::datarefs::MAG_PSI),
-        xp.get_float("sim/cockpit2/gauges/indicators/altitude_ft_pilot"),
+        xp.get_float(crate::datarefs::ALTITUDE_FT),
     );
     let (Ok(hdg), Ok(alt)) = (hdg, alt) else {
         return false;

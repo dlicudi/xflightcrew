@@ -13,9 +13,9 @@ use crate::aircraft::FuelSelectorProfile;
 
 const MIXTURE: &str = "sim/cockpit2/engine/actuators/mixture_ratio_all";
 const BATTERY: &str = "sim/cockpit/electrical/battery_on";
-const BUS_VOLTS: &str = "sim/cockpit2/electrical/bus_volts";
-const GROUNDSPEED: &str = "sim/flightmodel/position/groundspeed"; // m/s
-const ENGN_RUNNING: &str = "sim/flightmodel/engine/ENGN_running";
+const BUS_VOLTS: &str = crate::datarefs::BUS_VOLTS;
+const GROUNDSPEED: &str = crate::datarefs::GROUNDSPEED_MS; // m/s
+const ENGN_RUNNING: &str = crate::datarefs::ENGINE_RUNNING;
 const CMD_MAGS_BOTH: &str = "sim/magnetos/magnetos_both";
 const CMD_MAGS_OFF: &str = "sim/magnetos/magnetos_off";
 // Alternator (generator #1): the ALT half of the master switch. Brought online
@@ -48,9 +48,9 @@ async fn set_each_engine(
 // Engine indicators (per-engine arrays; element 0). Names verified against the
 // stock 172's cockpitdecks mapping.
 const EGT_CEL: &str = "sim/cockpit2/engine/indicators/EGT_deg_cel";
-const PROP_RPM: &str = "sim/cockpit2/engine/indicators/prop_speed_rpm";
-const FUEL_FLOW_KG_S: &str = "sim/cockpit2/engine/indicators/fuel_flow_kg_sec";
-const ALT_FT: &str = "sim/cockpit2/gauges/indicators/altitude_ft_pilot";
+const PROP_RPM: &str = crate::datarefs::PROP_SPEED_RPM;
+const FUEL_FLOW_KG_S: &str = crate::datarefs::FUEL_FLOW_KG_SEC;
+const ALT_FT: &str = crate::datarefs::ALTITUDE_FT;
 // Above this altitude (ft MSL) a normally-aspirated engine makes well under 75%
 // power even at full throttle, so leaning to peak EGT is safe and called for;
 // below it we keep the mixture rich (the takeoff/climb/pattern regime). Mirrors

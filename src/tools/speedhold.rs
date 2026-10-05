@@ -33,7 +33,7 @@ use super::{Tool, ToolCtx, BRAKES_REGULAR, BRAKE_HOLD_SECS};
 use crate::aircraft::throttle_dataref;
 use crate::xplane::XPlaneClient;
 
-const IAS: &str = "sim/cockpit2/gauges/indicators/airspeed_kts_pilot";
+const IAS: &str = crate::datarefs::AIRSPEED_KTS;
 /// The combined lever, -1..0 beta and 0..1 alpha: the taxi hold's lever on
 /// an airframe that taxis in beta, read and written as one, so our own beta
 /// can never read as the pilot's hand on the throttle.
@@ -47,7 +47,7 @@ fn taxi_lever() -> String {
         throttle_dataref()
     }
 }
-const GS_MS: &str = "sim/flightmodel/position/groundspeed";
+const GS_MS: &str = crate::datarefs::GROUNDSPEED_MS;
 const LEFT_BRAKE: &str = "sim/cockpit2/controls/left_brake_ratio";
 const RIGHT_BRAKE: &str = "sim/cockpit2/controls/right_brake_ratio";
 // The held-brake command and its expiry (`BRAKES_REGULAR`/`BRAKE_HOLD_SECS`)

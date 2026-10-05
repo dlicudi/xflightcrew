@@ -561,7 +561,7 @@ fn confirm_for(tool: &str, args: &Value) -> Option<&'static str> {
 /// Is engine 1 running? Used to suppress the mixture-cutoff confirm pre-start.
 /// On a read error, assume running (fail safe — keep the confirm).
 pub async fn engine_running(xp: &XPlaneClient) -> bool {
-    xp.get_float_array("sim/flightmodel/engine/ENGN_running")
+    xp.get_float_array(crate::datarefs::ENGINE_RUNNING)
         .await
         .ok()
         .and_then(|v| v.first().copied())

@@ -22,9 +22,9 @@ use crate::xplane::XPlaneClient;
 
 const ALT_FT: &str = crate::datarefs::ALTITUDE_FT;
 const TOD_DIST: &str = "sim/cockpit2/radios/indicators/fms_distance_to_tod_pilot";
-const LAT: &str = "sim/flightmodel/position/latitude";
-const LON: &str = "sim/flightmodel/position/longitude";
-const GPS_NAV_ID: &str = "sim/cockpit2/radios/indicators/gps_nav_id";
+const LAT: &str = crate::datarefs::LATITUDE;
+const LON: &str = crate::datarefs::LONGITUDE;
+const GPS_NAV_ID: &str = crate::datarefs::GPS_NAV_ID;
 /// Reminders give up after this long if their condition never arrives.
 const REMINDER_DEADLINE_SECS: u64 = 4 * 60 * 60;
 const POLL_SECS: u64 = 5;

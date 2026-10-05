@@ -49,12 +49,12 @@ use crate::voice::say_opt as alert;
 use crate::voice::{Priority, Voice};
 use crate::xplane::XPlaneClient;
 
-pub(crate) const LAT: &str = "sim/flightmodel/position/latitude";
-pub(crate) const LON: &str = "sim/flightmodel/position/longitude";
+pub(crate) const LAT: &str = crate::datarefs::LATITUDE;
+pub(crate) const LON: &str = crate::datarefs::LONGITUDE;
 /// TRUE heading, matching the route bearings computed in the local
 /// east/north frame — never the magnetic compass.
-pub(crate) const PSI_TRUE: &str = "sim/flightmodel/position/psi";
-pub(crate) const GS_MS: &str = "sim/flightmodel/position/groundspeed";
+pub(crate) const PSI_TRUE: &str = crate::datarefs::TRUE_HEADING_DEG;
+pub(crate) const GS_MS: &str = crate::datarefs::GROUNDSPEED_MS;
 /// The plugin's proportional steering channel (-1..1, right positive).
 const TAXI_STEER: &str = "xcopilot/taxi_steer";
 /// The sim's own toe-brake inputs, for the differential-brake steering assist
@@ -94,7 +94,7 @@ const ALIGN_WANT: &[sim::state::F] = &[sim::state::F::SteerYield, sim::state::F:
 /// and the record could not say whether a re-summoned tug had hooked back
 /// on (LEMG, 2026-09-12). A slow dataref, so the read is nearly free.
 #[cfg(test)]
-pub(crate) const TUG_ATTACHED: &str = "sim/aircraft/overflow/pushback_attached";
+pub(crate) const TUG_ATTACHED: &str = crate::datarefs::PUSHBACK_ATTACHED;
 /// A tug on the bar owns the aircraft: the drive holds (target zero, no
 /// steer heartbeat, the stagnation clock parked) until the bar comes off,
 /// and stands down after this long if it never does. The taxi that engaged

@@ -159,7 +159,7 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, right: bool, run: &sim::run
     let (lat, lon, psi) = tokio::join!(
         xp.get_float(LATITUDE),
         xp.get_float(LONGITUDE),
-        xp.get_float("sim/flightmodel/position/psi"),
+        xp.get_float(crate::datarefs::TRUE_HEADING_DEG),
     );
     let (Ok(lat), Ok(lon), Ok(psi)) = (lat, lon, psi) else {
         say(
@@ -198,9 +198,9 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, right: bool, run: &sim::run
         let (la, lo, agl, vx, vz) = tokio::join!(
             xp.get_float(LATITUDE),
             xp.get_float(LONGITUDE),
-            xp.get_float("sim/flightmodel/position/y_agl"),
-            xp.get_float("sim/flightmodel/position/local_vx"),
-            xp.get_float("sim/flightmodel/position/local_vz"),
+            xp.get_float(crate::datarefs::AGL_METERS),
+            xp.get_float(crate::datarefs::LOCAL_VX_MS),
+            xp.get_float(crate::datarefs::LOCAL_VZ_MS),
         );
         let (Ok(la), Ok(lo)) = (la, lo) else { continue };
         let slow = match (vx, vz) {

@@ -214,7 +214,7 @@ pub enum AllOffGate {
 /// The on-ground flag every airborne gate reads (`set_mixture`, `stop_engines`).
 const ON_GROUND: &str = crate::datarefs::ON_GROUND_ANY;
 /// Per-engine running flag (the shutdown's own confirmation, `taxi_in`).
-const ENGN_RUNNING: &str = "sim/flightmodel/engine/ENGN_running";
+const ENGN_RUNNING: &str = crate::datarefs::ENGINE_RUNNING;
 
 /// The request is every system off.
 pub fn is_all_off(args: &Value) -> bool {

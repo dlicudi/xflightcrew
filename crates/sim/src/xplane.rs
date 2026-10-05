@@ -74,13 +74,13 @@ fn value_cache_ttl() -> std::time::Duration {
 const SLOW_DATAREFS: &[&str] = &[
     "sim/time/is_in_replay",
     "sim/time/paused",
-    "sim/aircraft/view/acf_ICAO",
+    crate::datarefs::ACF_ICAO,
     "sim/aircraft/view/acf_tailnum",
     // The tug on the bar: a fact that changes over minutes, read by the
     // taxi tick as evidence (a re-hooked tug owns the nosewheel).
-    "sim/aircraft/overflow/pushback_attached",
+    crate::datarefs::PUSHBACK_ATTACHED,
     // The sun moves over minutes; the light stages ask it once per decision.
-    "sim/graphics/scenery/sun_pitch_degrees",
+    crate::datarefs::SUN_PITCH_DEG,
     // The local QNH and the altimeter knob: the monitor's cross-check reads
     // both every tick, and neither moves faster than a weather edition.
     "sim/weather/aircraft/qnh_pas",
@@ -1202,7 +1202,7 @@ impl XPlaneClient {
 
     /// The loaded aircraft's ICAO type code (e.g. `C172`), for auto-detection.
     pub async fn aircraft_icao(&self) -> Result<String> {
-        self.get_string("sim/aircraft/view/acf_ICAO").await
+        self.get_string(crate::datarefs::ACF_ICAO).await
     }
 
     /// Activate (momentarily press) a command by name.
@@ -1804,8 +1804,8 @@ mod load_tests {
         }
         // Everything a control law reads keeps the short window.
         for live in [
-            "sim/flightmodel/position/latitude",
-            "sim/flightmodel/position/indicated_airspeed",
+            crate::datarefs::LATITUDE,
+            crate::datarefs::INDICATED_AIRSPEED_KTS,
             "sim/cockpit2/controls/parking_brake_ratio",
         ] {
             assert_eq!(super::ttl_for(live), base, "{live} must stay live");

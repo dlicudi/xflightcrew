@@ -147,7 +147,7 @@ impl Tool for AutoTakeoff {
         // the second sortie left the pavement.
         let gs_kts = ctx
             .xplane
-            .get_float("sim/flightmodel/position/groundspeed")
+            .get_float(crate::datarefs::GROUNDSPEED_MS)
             .await
             .unwrap_or(0.0)
             * 1.943_844;
