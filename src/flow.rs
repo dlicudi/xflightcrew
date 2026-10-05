@@ -74,7 +74,14 @@ impl Flavour {
 
 /// A flow is running (its thread is alive).
 pub static ACTIVE: AtomicBool = AtomicBool::new(false);
-static ABORT: AtomicBool = AtomicBool::new(false);
+/// The running flow's run: a cancel stops it where it is (the pilot's
+/// abort, a stand-down, `flight_state::LOOPS`); its summary says so.
+pub(crate) static RUN: sim::run::Slot = sim::run::Slot::new();
+
+/// The running flow was stopped where it is.
+fn stopped() -> bool {
+    RUN.running() && !RUN.live()
+}
 
 /// What the runner is waiting on from the pilot, if anything.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -552,7 +559,7 @@ pub fn stand_down(why: StandDown) -> bool {
         return false;
     }
     lock(&STOOD_DOWN).get_or_insert(why);
-    ABORT.store(true, SeqCst);
+    RUN.cancel();
     true
 }
 
@@ -948,7 +955,7 @@ pub fn take_reply(text: &str) -> Option<Reply> {
 /// Stop the running flow where it is (its summary says so).
 pub fn abort() {
     if ACTIVE.load(SeqCst) {
-        ABORT.store(true, SeqCst);
+        RUN.cancel();
     }
 }
 
@@ -978,7 +985,11 @@ pub fn start(idx: usize, flavour: Flavour, config: Config, voice: Voice) -> bool
     if ACTIVE.swap(true, SeqCst) {
         return false;
     }
-    ABORT.store(false, SeqCst);
+    // ACTIVE drops only after the last run's lease: the slot is free.
+    let Some(lease) = RUN.begin() else {
+        ACTIVE.store(false, SeqCst);
+        return false;
+    };
     *lock(&REPLY) = None;
     *lock(&WAITING) = None;
     *lock(&PROPOSAL) = None;
@@ -994,6 +1005,8 @@ pub fn start(idx: usize, flavour: Flavour, config: Config, voice: Voice) -> bool
                 let xp = XPlaneClient::new(config.xplane_base_url.clone());
                 rt.block_on(run(&lists[idx], flavour, &xp, &config, &voice));
             }
+            lease.record(sim::run::Outcome::Completed);
+            drop(lease);
             DETAIL.clear();
             *lock(&WAITING) = None;
             *lock(&RUNNING) = None;
@@ -1168,7 +1181,7 @@ async fn wait_for(
     *lock(&WAITING) = Some(Waiting::Advance);
     let mut deadline = Instant::now() + Duration::from_secs_f64(secs);
     let out = loop {
-        if ABORT.load(SeqCst) {
+        if stopped() {
             break Waited::Aborted;
         }
         match take_pending_reply() {
@@ -1201,7 +1214,7 @@ async fn confirm(voice: &Voice, hazard: &str) -> Waited {
     *lock(&WAITING) = Some(Waiting::Confirm);
     let deadline = Instant::now() + Duration::from_secs_f64(CONFIRM_WAIT_SECS);
     let out = loop {
-        if ABORT.load(SeqCst) {
+        if stopped() {
             break Waited::Aborted;
         }
         match take_pending_reply() {
@@ -1298,7 +1311,7 @@ async fn run(cl: &Checklist, flavour: Flavour, xp: &XPlaneClient, config: &Confi
         if init.step(init_seq().await) {
             stand_down(StandDown::NewFlight("setup"));
         }
-        if ABORT.load(SeqCst) {
+        if stopped() {
             aborted = true;
             break;
         }
@@ -2177,13 +2190,14 @@ mod tests {
         ACTIVE.store(false, SeqCst);
         assert_eq!(take_reply("yes"), None);
         ACTIVE.store(true, SeqCst);
+        let lease = RUN.begin().unwrap();
         *lock(&WAITING) = None;
         *lock(&REPLY) = None;
         // Running, waiting on nothing: a stray "yes" is not consumed, "stop" is.
         assert_eq!(take_reply("yes"), None);
         assert_eq!(take_reply("stop the checklist"), Some(Reply::Abort));
-        assert!(ABORT.load(SeqCst));
-        ABORT.store(false, SeqCst);
+        assert!(stopped());
+        drop(lease);
         // At a confirm: yes/no taken, "next" is not an answer.
         *lock(&WAITING) = Some(Waiting::Confirm);
         assert_eq!(take_reply("next"), None);
@@ -2318,14 +2332,15 @@ mod tests {
         assert!(!stand_down(StandDown::Mission("full auto")));
         // A Monitor list is the mission's own audit: it goes on...
         ACTIVE.store(true, SeqCst);
+        let lease = RUN.begin().unwrap();
         *lock(&RUNNING) = Some(Flavour::Monitor);
         *lock(&STOOD_DOWN) = None;
         assert!(!stand_down(StandDown::Mission("full auto")));
-        assert!(!ABORT.load(SeqCst));
+        assert!(!stopped());
         // ...but not into a new flight.
         assert!(stand_down(StandDown::NewFlight("setup")));
-        assert!(ABORT.load(SeqCst));
-        ABORT.store(false, SeqCst);
+        assert!(stopped());
+        drop(lease);
         *lock(&STOOD_DOWN) = None;
         // A Crew list stops for the mission, and the first cause is kept.
         *lock(&RUNNING) = Some(Flavour::Crew);
@@ -2337,7 +2352,6 @@ mod tests {
             "After landing checklist stopped, full auto has the aircraft."
         );
         ACTIVE.store(false, SeqCst);
-        ABORT.store(false, SeqCst);
         *lock(&RUNNING) = None;
         *lock(&STOOD_DOWN) = None;
     }

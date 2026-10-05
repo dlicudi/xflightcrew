@@ -617,31 +617,29 @@ impl SetupWatch {
     }
 }
 
-/// Generation of the running setup watch: a new "set up the ILS" or a stand
-/// down retires the old one.
-pub static SETUP_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-/// Retire any running setup watch (airframe swap, instructor entry).
-pub fn stop_setup_watch() {
-    SETUP_GEN.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-}
+/// The running setup watch: a new "set up the ILS" takes it over, a stand
+/// down (`flight_state::LOOPS`: swap, instructor entry) cancels it.
+pub(crate) static SETUP: sim::run::Slot = sim::run::Slot::new();
 
 /// Run a [`SetupWatch`] on its own thread and runtime (the command loop's
 /// runtime is blocked on the listener between commands, as for the altitude
 /// capture watcher). Its writes are the APPR press, only from off, and the
 /// missed approach altitude at capture.
 pub fn spawn_setup_watch(base: String, ils: crate::nav::Ils, mut watch: SetupWatch, voice: Option<crate::voice::Voice>) {
-    use std::sync::atomic::Ordering::SeqCst;
-    let my_gen = SETUP_GEN.fetch_add(1, SeqCst) + 1;
+    // Taken on the caller's thread: a stand-down landing before the thread
+    // starts cancels THIS watch, not a predecessor.
+    let lease = SETUP.take_over();
     std::thread::spawn(move || {
         let Ok(rt) = tokio::runtime::Builder::new_current_thread().enable_all().build() else {
             return;
         };
         rt.block_on(async move {
-            let xp = crate::xplane::XPlaneClient::new(base);
+            // Writes scoped to this run: once superseded or stood down, a
+            // write still in flight is refused.
+            let xp = crate::xplane::XPlaneClient::new(base).with_cancel(lease.cancel.clone());
             let dt = 0.5;
             loop {
-                if SETUP_GEN.load(SeqCst) != my_gen {
+                if !lease.live() {
                     return;
                 }
                 if crate::xplane::sim_frozen(&xp).await {
@@ -700,6 +698,7 @@ pub fn spawn_setup_watch(base: String, ils: crate::nav::Ils, mut watch: SetupWat
                 }
                 if out.done {
                     crate::blackbox::record("ils", json!({ "event": "watch_done", "rwy": ils.runway }));
+                    lease.record(sim::run::Outcome::Completed);
                     return;
                 }
                 tokio::time::sleep(std::time::Duration::from_secs_f64(dt)).await;
