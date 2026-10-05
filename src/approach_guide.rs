@@ -67,7 +67,7 @@ pub fn deviations(path: &ApproachPath, lat: f64, lon: f64, alt_ft: f64) -> Devia
     // Bearing aircraft → threshold vs the final-approach course. On centerline
     // they're equal; if the threshold bears RIGHT of course the aircraft sits
     // LEFT of the extended centerline.
-    let brg = bearing_deg(lat, lon, path.thr_lat, path.thr_lon);
+    let brg = crate::nav::bearing_deg(lat, lon, path.thr_lat, path.thr_lon);
     let dev = crate::angles::signed_diff_deg(brg, path.course_deg);
     let xtk_nm = dist_nm * dev.to_radians().sin();
     let along_nm = dist_nm * dev.to_radians().cos();
@@ -130,15 +130,6 @@ pub fn cadence_secs(dist_nm: f64) -> f64 {
     } else {
         6.0
     }
-}
-
-/// Initial great-circle bearing from point 1 to point 2, degrees true 0..360.
-fn bearing_deg(lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> f64 {
-    let (p1, p2) = (lat1.to_radians(), lat2.to_radians());
-    let dl = (lon2 - lon1).to_radians();
-    let y = dl.sin() * p2.cos();
-    let x = p1.cos() * p2.sin() - p1.sin() * p2.cos() * dl.cos();
-    y.atan2(x).to_degrees().rem_euclid(360.0)
 }
 
 #[cfg(test)]

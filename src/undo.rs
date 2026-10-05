@@ -51,7 +51,25 @@ const UNDO_ALT_DIAL: &str = crate::autoflight::Dial::Altitude.read_name();
 const UNDO_VS_DIAL: &str = crate::autoflight::Dial::Vs.read_name();
 
 /// concern and this keeps it in one place.
-pub(crate) fn undoable_drefs(tool: &str) -> &'static [Undoable] {
+/// What to snapshot for `tool` on THIS airframe: [`undoable_drefs`] with the
+/// stock thrust lever read as the lever the airframe obeys
+/// (`aircraft::throttle_dataref`), which is the one `set_throttle` wrote: the
+/// Citation's undo restored a lever its Lua never reads.
+pub(crate) fn undo_targets(tool: &str) -> Vec<(String, &'static str, bool)> {
+    undoable_drefs(tool)
+        .iter()
+        .map(|(dr, label, is_int)| {
+            let dr = if *dr == crate::aircraft::STOCK_THROTTLE {
+                crate::aircraft::throttle_dataref()
+            } else {
+                dr.to_string()
+            };
+            (dr, *label, *is_int)
+        })
+        .collect()
+}
+
+fn undoable_drefs(tool: &str) -> &'static [Undoable] {
     match tool {
         "set_flaps" => &[("sim/cockpit2/controls/flap_ratio", "flaps", F)],
         "gear" => &[("sim/cockpit2/controls/gear_handle_down", "the gear", F)],
@@ -60,11 +78,8 @@ pub(crate) fn undoable_drefs(tool: &str) -> &'static [Undoable] {
             "the speedbrakes",
             F,
         )],
-        "set_throttle" => &[(
-            "sim/cockpit2/engine/actuators/throttle_ratio_all",
-            "throttle",
-            F,
-        )],
+        // The stock name stands for the airframe's lever ([`undo_targets`]).
+        "set_throttle" => &[(crate::aircraft::STOCK_THROTTLE, "throttle", F)],
         "set_mixture" | "lean_mixture" => &[(
             "sim/cockpit2/engine/actuators/mixture_ratio_all",
             "mixture",

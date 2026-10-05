@@ -143,6 +143,26 @@ static CART_REQUESTED: std::sync::Mutex<Option<std::time::Instant>> = std::sync:
 /// stale. Generous against the sim's actual drive-up time.
 const CART_REQUEST_TTL_SECS: u64 = 180;
 
+/// The pending-cart latch is process-wide, so its tests take turns.
+#[cfg(test)]
+pub(crate) static GPU_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// A cart summoned for the ended flight is not this flight's (the
+/// new-flight door, `flight_state::forget_flight`).
+pub(crate) fn forget_cart_request() {
+    *CART_REQUESTED.lock().unwrap_or_else(|e| e.into_inner()) = None;
+}
+
+#[cfg(test)]
+pub(crate) fn note_cart_requested_for_test() {
+    *CART_REQUESTED.lock().unwrap_or_else(|e| e.into_inner()) = Some(std::time::Instant::now());
+}
+
+#[cfg(test)]
+pub(crate) fn cart_pending_for_test() -> bool {
+    cart_pending()
+}
+
 fn cart_pending() -> bool {
     CART_REQUESTED
         .lock()
@@ -325,8 +345,6 @@ mod tests {
         }
     }
 
-    /// The pending-cart latch is process-wide, so the GPU tests take turns.
-    static GPU_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     /// No cart yet: summon one AND close the contactor. Closing it is the half
     /// that was missing — the cart generated 28 volts into a bus that stayed on

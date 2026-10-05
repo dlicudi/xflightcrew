@@ -30,16 +30,10 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use super::{Tool, ToolCtx, BRAKES_REGULAR, BRAKE_HOLD_SECS};
+use crate::aircraft::throttle_dataref;
 use crate::xplane::XPlaneClient;
 
 const IAS: &str = "sim/cockpit2/gauges/indicators/airspeed_kts_pilot";
-/// The thrust lever THIS airframe obeys — not always the stock one (the
-/// Citation X tracks `throttle_jet_rev_ratio`, so every write to
-/// `throttle_ratio_all` went nowhere and it flew a whole pattern at takeoff
-/// thrust). Resolved per call, so a profile swap takes effect immediately.
-fn throttle_dref() -> String {
-    crate::aircraft::throttle_dataref()
-}
 /// The combined lever, -1..0 beta and 0..1 alpha: the taxi hold's lever on
 /// an airframe that taxis in beta, read and written as one, so our own beta
 /// can never read as the pilot's hand on the throttle.
@@ -50,7 +44,7 @@ fn taxi_lever() -> String {
     if crate::aircraft::taxi_beta_max().is_some() {
         BETA_LEVER.to_string()
     } else {
-        throttle_dref()
+        throttle_dataref()
     }
 }
 const GS_MS: &str = "sim/flightmodel/position/groundspeed";
@@ -1260,7 +1254,7 @@ async fn governor(
         let on_ground = xp.get_float(ON_GROUND_ANY).await.ok().map(|v| v > 0.5);
         match mode {
             Mode::Flight => {
-                let thr_name = throttle_dref();
+                let thr_name = throttle_dataref();
                 let (ias_r, thr_r, at_on, at_mode) = tokio::join!(
                     xp.get_float(IAS),
                     xp.get_float(&thr_name),
@@ -1294,7 +1288,7 @@ async fn governor(
                             lc,
                             "speed governor: throttle deviated, challenging once"
                         );
-                        let _ = xp.set_float(&throttle_dref(), lc).await;
+                        let _ = xp.set_float(&throttle_dataref(), lc).await;
                         tokio::time::sleep(std::time::Duration::from_millis(250)).await;
                         continue;
                     }
@@ -1318,7 +1312,7 @@ async fn governor(
                         None => ground_since,
                     };
                     if ground_since.is_some_and(|t| t.elapsed().as_secs_f64() >= TOUCHDOWN_HOLD_S) {
-                        let _ = xp.set_float(&throttle_dref(), 0.0).await;
+                        let _ = xp.set_float(&throttle_dataref(), 0.0).await;
                         tracing::info!(ias, "speed governor: touchdown, idle and standing down");
                         crate::blackbox::record(
                             "speedhold",
@@ -1362,7 +1356,7 @@ async fn governor(
                     let adj = throttle_adjust_live(target - ias, trend);
                     if adj != 0.0 {
                         let cmd = (thr + adj).clamp(0.0, 1.0);
-                        glide(&xp, &throttle_dref(), cmd, 200).await; // ~most of the tick
+                        glide(&xp, &throttle_dataref(), cmd, 200).await; // ~most of the tick
                         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
                     } else {
                         // In the groove: don't spin the API at 20 Hz doing nothing.

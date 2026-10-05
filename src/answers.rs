@@ -1753,7 +1753,8 @@ pub(crate) async fn answer_state_query(
         }
     }
     if t.contains("throttle") && !autothrottle_q {
-        if let Ok(v) = read1(live, xp, "sim/cockpit2/engine/actuators/throttle_ratio_all").await {
+        // The lever THIS airframe obeys (the Citation's is not the stock one).
+        if let Ok(v) = read1(live, xp, &crate::aircraft::throttle_dataref()).await {
             parts.push(format!("throttle {:.0} percent", v * 100.0));
         }
     }

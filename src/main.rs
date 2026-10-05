@@ -43,6 +43,7 @@ mod flight;
 mod duty;
 mod handover;
 mod flight_state;
+mod lifetimes;
 mod flightplan;
 mod flow;
 mod full_auto;
@@ -154,7 +155,7 @@ use stt::Stt;
 use tools::{Registry, ToolCtx};
 use ui::Reporter;
 use undo::{
-    engages_autopilot, is_undo, join_and, recovery_label, undoable_drefs, UndoSnapshot,
+    engages_autopilot, is_undo, join_and, recovery_label, undo_targets, UndoSnapshot,
     UNDO_STACK_MAX,
 };
 use voice::{Priority, Voice};
@@ -1521,9 +1522,7 @@ async fn run_session(
             conversation.clear();
             history.clear();
             last_subject = None;
-            if let Ok(mut last) = LAST_READBACK.lock() {
-                *last = None;
-            }
+            forget_last_readback();
             voice.forget_speech();
             tracing::info!(aircraft = %profile.display_name, "reconfigured for new aircraft");
         }
@@ -3491,9 +3490,9 @@ async fn run_session(
             // succeeds. Tools with no reversible dataref (engine start, pushback)
             // contribute nothing and simply can't be undone.
             let mut pre: Vec<(String, String, f64, bool)> = Vec::new();
-            for (dr, label, is_int) in undoable_drefs(&call.name) {
-                if let Ok(v) = xplane.get_float(dr).await {
-                    pre.push((dr.to_string(), label.to_string(), v, *is_int));
+            for (dr, label, is_int) in undo_targets(&call.name) {
+                if let Ok(v) = xplane.get_float(&dr).await {
+                    pre.push((dr, label.to_string(), v, is_int));
                 }
             }
             // If this command can switch the autopilot on and it's off right now,
@@ -4045,6 +4044,12 @@ fn next_input(
 /// real readbacks are stored (not warnings like "Say again?"), single-threaded
 /// session so a plain Mutex is fine.
 static LAST_READBACK: std::sync::Mutex<Option<(String, Instant)>> = std::sync::Mutex::new(None);
+
+/// The ended flight's or airframe's readback: "say again" never repeats
+/// it into the next (the swap and `flight_state::forget_flight`).
+fn forget_last_readback() {
+    *LAST_READBACK.lock().unwrap_or_else(|e| e.into_inner()) = None;
+}
 
 fn say(voice: &Voice, reporter: &Reporter, kind: ui::LogKind, line: &str) {
     say_or(voice, reporter, kind, line, || loop_owed(false));

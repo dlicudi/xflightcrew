@@ -35,6 +35,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
+use crate::voice::say_opt as say;
 use crate::voice::{Priority, Voice};
 use crate::xplane::XPlaneClient;
 
@@ -1245,12 +1246,6 @@ pub fn request(base_url: String, voice: Option<Voice>, collective: String, g: Go
             *lock_goal() = None;
         }
     });
-}
-
-fn say(voice: &Option<Voice>, p: Priority, text: impl Into<String>) {
-    if let Some(v) = voice {
-        v.alert(p, text);
-    }
 }
 
 /// What a drift earns. The hover mode is a groundspeed HOLD

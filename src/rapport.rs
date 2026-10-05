@@ -177,14 +177,6 @@ pub struct Rapport {
     calm_since: Option<f64>,
 }
 
-fn dist_m(a: (f64, f64), b: (f64, f64)) -> f64 {
-    let (la1, lo1) = (a.0.to_radians(), a.1.to_radians());
-    let (la2, lo2) = (b.0.to_radians(), b.1.to_radians());
-    let x = (lo2 - lo1) * ((la1 + la2) / 2.0).cos();
-    let y = la2 - la1;
-    (x * x + y * y).sqrt() * 6_371_000.0
-}
-
 impl Rapport {
     pub fn new() -> Self {
         Self::default()
@@ -317,10 +309,13 @@ impl Rapport {
     ) {
         let sink = (-td.sink_fpm).max(0.0);
         let here = td.lat.zip(td.lon).unwrap_or((v.lat, v.lon));
-        let same_field = m.origin.is_some_and(|o| dist_m(o, here) < SAME_FIELD_M);
+        let near = |(lat, lon): (f64, f64)| {
+            crate::nav::haversine_nm(lat, lon, here.0, here.1) * 1852.0 < SAME_FIELD_M
+        };
+        let same_field = m.origin.is_some_and(near);
         if !impact {
             match self.field {
-                Some(f) if dist_m(f, here) < SAME_FIELD_M => self.landings_here += 1,
+                Some(f) if near(f) => self.landings_here += 1,
                 _ => {
                     self.field = Some(here);
                     self.landings_here = 1;
@@ -460,6 +455,11 @@ pub fn offer() -> Option<Offer> {
 
 pub fn clear_offer() {
     *lock(&OFFER) = None;
+}
+
+#[cfg(test)]
+pub fn set_offer_for_test() {
+    *lock(&OFFER) = Some((Offer::ArrivalBrief, Instant::now()));
 }
 
 /// Several held asides as one line. Pure.
@@ -725,20 +725,6 @@ pub fn arrival_brief_request(text: &str) -> bool {
     brief && what && words.len() <= 9 && words.iter().all(|w| OK.contains(w))
 }
 
-/// The runway end most into `wind` (from, true degrees; knots), from the
-/// field's ends `(ident, heading true)`. `None` for a calm or unknown wind,
-/// where any end will do and naming one would be a guess. Pure.
-pub fn into_wind_end(ends: &[(String, f64)], wind: Option<(f64, f64)>) -> Option<String> {
-    let (from, kts) = wind?;
-    if kts < 3.0 {
-        return None;
-    }
-    ends.iter()
-        .map(|(id, hdg)| (id, kts * (from - hdg).to_radians().cos()))
-        .max_by(|a, b| a.1.total_cmp(&b.1))
-        .map(|(id, _)| id.clone())
-}
-
 /// The arrival brief for the loaded plan's destination: the weather on file,
 /// the runway into the wind, what approaches the field offers, the field's
 /// elevation. Blocking (an apt.dat pass): run it off the command loop's
@@ -757,17 +743,10 @@ pub fn arrival_brief(apt_dat: &str, cifp: &str, fixes: &str, xplane_root: &str) 
     match crate::weather::briefing(xplane_root, &dest, &name) {
         Ok(w) | Err(w) => parts.push(w),
     }
-    let ends: Vec<(String, f64)> = airport
-        .runways
-        .iter()
-        .flat_map(|r| {
-            [
-                (r.ident_a.clone(), r.heading_a_deg()),
-                (r.ident_b.clone(), r.heading_b_deg()),
-            ]
-        })
-        .collect();
-    if let Some(end) = into_wind_end(&ends, crate::weather::surface_wind(xplane_root, &dest)) {
+    // The crew's own pick (`full_auto::wind_runway`): its calm, and only a
+    // runway the field would assign (never the grass beside the main strip).
+    let wind = crate::weather::surface_wind(xplane_root, &dest);
+    if let Some(end) = crate::full_auto::wind_runway(&airport.runways, wind) {
         parts.push(format!(
             "Expect runway {}, into the wind.",
             crate::circuit::spell_runway(&end)
@@ -1284,17 +1263,70 @@ mod tests {
         assert!(!arrival_brief_request(
             "brief the approach and set flaps ten"
         ));
-        let ends = vec![("09".to_string(), 90.0), ("27".to_string(), 270.0)];
+    }
+
+    /// The same-field test reads the shared great circle (`nav::haversine_nm`)
+    /// where it had its own flat-earth copy: at a field's scale they agree to
+    /// a metre, so no landing changes field.
+    #[test]
+    fn the_same_field_distance_is_the_shared_great_circle() {
+        let old = |a: (f64, f64), b: (f64, f64)| {
+            let (la1, lo1) = (a.0.to_radians(), a.1.to_radians());
+            let (la2, lo2) = (b.0.to_radians(), b.1.to_radians());
+            let x = (lo2 - lo1) * ((la1 + la2) / 2.0).cos();
+            let y = la2 - la1;
+            (x * x + y * y).sqrt() * 6_371_000.0
+        };
+        for (a, b) in [
+            ((36.675, -4.499), (36.675, -4.437)),
+            ((36.675, -4.499), (36.724, -4.499)),
+            ((51.148, -0.190), (51.180, -0.150)),
+            ((-33.94, 151.17), (-33.97, 151.21)),
+        ] {
+            let new = crate::nav::haversine_nm(a.0, a.1, b.0, b.1) * 1852.0;
+            assert!(
+                (new - old(a, b)).abs() < 1.0,
+                "{a:?} {b:?}: {new} vs {}",
+                old(a, b)
+            );
+        }
+    }
+
+    /// The brief names the runway the crew will fly (`full_auto::wind_runway`),
+    /// not a pick of its own: 3.5 kt is the crew's calm (its own 3 kt line
+    /// named an end the arrival would not take), and a grass strip beside a
+    /// hard one is never the field's runway however the wind lies.
+    #[test]
+    fn the_brief_names_the_crews_runway() {
+        let rwy = |a: &str, b: &str, lat_a: f64, lon_a: f64, lat_b: f64, lon_b: f64, surface| {
+            crate::nav::Runway {
+                ident_a: a.into(),
+                ident_b: b.into(),
+                lat_a,
+                lon_a,
+                lat_b,
+                lon_b,
+                width_m: 30.0,
+                surface,
+            }
+        };
+        let field = vec![
+            rwy("09", "27", 50.0, -1.02, 50.0, -0.98, 1),
+            rwy("18", "36", 50.01, -1.0, 49.99, -1.0, 3),
+        ];
+        let pick = |w| crate::full_auto::wind_runway(&field, Some(w));
+        assert_eq!(pick((250.0, 12.0)).as_deref(), Some("27"));
+        assert_eq!(pick((100.0, 8.0)).as_deref(), Some("09"));
+        assert_eq!(pick((250.0, 3.5)), None, "under the crew's calm");
         assert_eq!(
-            into_wind_end(&ends, Some((250.0, 12.0))).as_deref(),
-            Some("27")
+            pick((200.0, 12.0)).as_deref(),
+            Some("27"),
+            "the grass 18 is not assignable"
         );
-        assert_eq!(
-            into_wind_end(&ends, Some((100.0, 8.0))).as_deref(),
-            Some("09")
-        );
-        assert_eq!(into_wind_end(&ends, Some((100.0, 1.0))), None, "calm");
-        assert_eq!(into_wind_end(&ends, None), None);
+        assert_eq!(crate::full_auto::wind_runway(&field, None), None);
+        let src = crate::test_support::module_source("rapport");
+        let brief = &src[src.find("pub fn arrival_brief(").unwrap()..];
+        assert!(brief.contains("crate::full_auto::wind_runway("));
     }
 
     #[test]

@@ -2838,11 +2838,23 @@ pub const STOCK_THROTTLE: &str = "sim/cockpit2/engine/actuators/throttle_ratio_a
 /// swap (including back to `None`) — a stale override would aim the next
 /// aircraft's power at a dataref it doesn't use, the same shape as the
 /// transponder knob and the radio-power latch.
+/// One per process is the app's truth; one per test THREAD is the tests'
+/// (a test publishing the Citation's lever must not move another test's).
+#[cfg(not(test))]
 static THROTTLE_DREF: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+#[cfg(test)]
+thread_local! {
+    static THROTTLE_DREF_T: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+}
 
 /// Publish the airframe's thrust-lever dataref. Called on EVERY profile swap.
 pub fn publish_throttle_dataref(dref: Option<String>) {
-    *THROTTLE_DREF.lock().unwrap_or_else(|e| e.into_inner()) = dref;
+    #[cfg(not(test))]
+    {
+        *THROTTLE_DREF.lock().unwrap_or_else(|e| e.into_inner()) = dref;
+    }
+    #[cfg(test)]
+    THROTTLE_DREF_T.with(|t| *t.borrow_mut() = dref);
 }
 
 /// X-Plane's landing-gear warning, as Plane Maker models it: with the gear
@@ -3818,11 +3830,14 @@ pub fn flap_limits() -> Vec<(f64, Option<f64>)> {
 /// still climbing with a descent commanded. The copilot could not slow it down
 /// and had no way to know.
 pub fn throttle_dataref() -> String {
-    THROTTLE_DREF
+    #[cfg(not(test))]
+    let published = THROTTLE_DREF
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .clone()
-        .unwrap_or_else(|| STOCK_THROTTLE.to_string())
+        .clone();
+    #[cfg(test)]
+    let published = THROTTLE_DREF_T.with(|t| t.borrow().clone());
+    published.unwrap_or_else(|| STOCK_THROTTLE.to_string())
 }
 
 /// A profile for an airframe nobody has written one for, built from the

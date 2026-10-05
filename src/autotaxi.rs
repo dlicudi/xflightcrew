@@ -41,9 +41,11 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use crate::aircraft::throttle_dataref;
 use crate::station::TaxiWatch;
 use crate::taxi_guide;
 use crate::tools::speedhold;
+use crate::voice::say_opt as alert;
 use crate::voice::{Priority, Voice};
 use crate::xplane::XPlaneClient;
 
@@ -53,13 +55,6 @@ pub(crate) const LON: &str = "sim/flightmodel/position/longitude";
 /// east/north frame — never the magnetic compass.
 pub(crate) const PSI_TRUE: &str = "sim/flightmodel/position/psi";
 pub(crate) const GS_MS: &str = "sim/flightmodel/position/groundspeed";
-/// The thrust lever THIS airframe obeys — not always the stock one (the
-/// Citation X tracks `throttle_jet_rev_ratio`, so every write to
-/// `throttle_ratio_all` went nowhere and it flew a whole pattern at takeoff
-/// thrust). Resolved per call, so a profile swap takes effect immediately.
-fn throttle_dref() -> String {
-    crate::aircraft::throttle_dataref()
-}
 /// The plugin's proportional steering channel (-1..1, right positive).
 const TAXI_STEER: &str = "xcopilot/taxi_steer";
 /// The sim's own toe-brake inputs, for the differential-brake steering assist
@@ -3287,12 +3282,6 @@ fn stagnant_line(off_pavement: bool, facing_away: bool) -> &'static str {
     }
 }
 
-fn alert(voice: &Option<Voice>, priority: Priority, line: &str) {
-    if let Some(v) = voice {
-        v.alert(priority, line);
-    }
-}
-
 /// The steering loop. Steering writes ride the plugin's expiring channel, so
 /// every exit path — including a panic or kill -9 — releases the override
 /// within a second by silence alone; the explicit zero write on the way out
@@ -3398,7 +3387,7 @@ async fn drive(
                 "auto taxi: taxi hold gone, arresting and releasing"
             );
             if on_ground {
-                let _ = xp.set_float(&throttle_dref(), 0.0).await;
+                let _ = xp.set_float(&throttle_dataref(), 0.0).await;
                 if xp
                     .run_command_for(crate::tools::BRAKES_REGULAR, crate::tools::BRAKE_HOLD_SECS)
                     .await
@@ -3796,7 +3785,7 @@ async fn drive(
         if !ext_stopped && gs_kts < 0.7 {
             let t0 = *stalled_since.get_or_insert_with(std::time::Instant::now);
             if t0.elapsed().as_secs_f64() > STAGNANT_SECS {
-                let thr_dref = throttle_dref();
+                let thr_dref = throttle_dataref();
                 let (thr, la, lo) = tokio::join!(
                     xp.get_float(&thr_dref),
                     xp.get_float(LAT),

@@ -19,6 +19,7 @@ use super::{Tool, ToolCtx};
 #[cfg(test)]
 use super::CMD_SERVOS_ON;
 use crate::voice::{Priority, Voice};
+use crate::aircraft::throttle_dataref;
 use crate::xplane::XPlaneClient;
 
 /// Pilot-side heading bug, degrees magnetic (writable).
@@ -65,13 +66,6 @@ const MIN_AP_ALTITUDE_FT: f64 = 500.0;
 const CMD_VS_MODE: &str = autoflight::cmd::VERTICAL_SPEED;
 /// Throttle (all engines), 0..1. A commanded climb sets this to full — the AP
 /// only controls pitch, so without power a 172 trades airspeed for altitude.
-/// The thrust lever THIS airframe obeys — not always the stock one (the
-/// Citation X tracks `throttle_jet_rev_ratio`, so every write to
-/// `throttle_ratio_all` went nowhere and it flew a whole pattern at takeoff
-/// thrust). Resolved per call, so a profile swap takes effect immediately.
-fn throttle_dref() -> String {
-    crate::aircraft::throttle_dataref()
-}
 /// Throttle restored once a climb captures its target / on level-off (~cruise
 /// power for a 172). Not a precise %, just "off the climb stop" so the aircraft
 /// settles at the altitude instead of accelerating at full power.
@@ -561,7 +555,7 @@ async fn arm_altitude(
     // power the climb asks for, so it is left to it.
     let firewall = climb && governor.is_none();
     if firewall {
-        let _ = ctx.xplane.set_float(&throttle_dref(), 1.0).await;
+        let _ = ctx.xplane.set_float(&throttle_dataref(), 1.0).await;
     }
     Ok((
         if climb {
@@ -726,7 +720,7 @@ fn capture_at_altitude(
                             let governor = crate::tools::speedhold::flight_target();
                             match level_power(governor, perf.cruise_ias_kts, alt) {
                                 LevelPower::Governor => {}
-                                power => match xp.get_float(&throttle_dref()).await {
+                                power => match xp.get_float(&throttle_dataref()).await {
                                     Ok(thr) if thr >= FIREWALL_HANDBACK_FLOOR => {
                                         match power {
                                             LevelPower::ArmCruise(kts) => {
@@ -738,7 +732,7 @@ fn capture_at_altitude(
                                             }
                                             LevelPower::Lever(ratio) => {
                                                 let _ =
-                                                    xp.set_float(&throttle_dref(), ratio).await;
+                                                    xp.set_float(&throttle_dataref(), ratio).await;
                                             }
                                             LevelPower::Governor => {}
                                         }
@@ -1179,7 +1173,7 @@ impl Tool for LevelOff {
                 format!("{kts:.0} knots, ")
             }
             LevelPower::Lever(ratio) => {
-                let _ = ctx.xplane.set_float(&throttle_dref(), ratio).await;
+                let _ = ctx.xplane.set_float(&throttle_dataref(), ratio).await;
                 "cruise power, ".to_string()
             }
         };
@@ -1834,7 +1828,7 @@ mod tests {
             "dials the commanded VS"
         );
         assert_eq!(
-            fake.last_write(&throttle_dref()),
+            fake.last_write(&throttle_dataref()),
             Some(1.0),
             "firewalls the throttle for the climb"
         );
@@ -1854,7 +1848,7 @@ mod tests {
         assert_eq!(movement, "Climbing to");
         assert_eq!(signed, 2000.0, "the jet's own climb cap");
         assert!(!firewalled);
-        assert!(!fake.wrote(&throttle_dref()), "the governor's throttle");
+        assert!(!fake.wrote(&throttle_dataref()), "the governor's throttle");
     }
 
     #[tokio::test]
@@ -1876,7 +1870,7 @@ mod tests {
         );
         assert_eq!(fake.last_write(VS_DIAL), Some(signed));
         assert!(
-            !fake.wrote(&throttle_dref()),
+            !fake.wrote(&throttle_dataref()),
             "descent must not firewall (or touch) the throttle"
         );
     }

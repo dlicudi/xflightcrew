@@ -59,6 +59,7 @@ fn self_pick(apt_dat: &str, lat: f64, lon: f64, track_deg: f64) -> std::io::Resu
 use crate::autoflight::{self, Button, Dial};
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use crate::aircraft::throttle_dataref;
 use crate::tools::autopilot::ApConfig;
 use crate::voice::{Priority, Voice};
 use crate::xplane::XPlaneClient;
@@ -130,13 +131,6 @@ const HDG_BUG: &str = Dial::HeadingBug.read_name();
 #[cfg(test)]
 const VS_DIAL: &str = Dial::Vs.read_name();
 const ALT_IND_FT: &str = crate::datarefs::ALTITUDE_FT;
-/// The thrust lever THIS airframe obeys — not always the stock one (the
-/// Citation X tracks `throttle_jet_rev_ratio`, so every write to
-/// `throttle_ratio_all` went nowhere and it flew a whole pattern at takeoff
-/// thrust). Resolved per call, so a profile swap takes effect immediately.
-fn throttle_dref() -> String {
-    crate::aircraft::throttle_dataref()
-}
 const GEAR_HANDLE: &str = "sim/cockpit2/controls/gear_handle_down";
 const FLAP_RATIO: &str = "sim/cockpit2/controls/flap_ratio";
 // Rollout: nose steering + proportional wheel brakes through the plugin, the
@@ -1664,7 +1658,7 @@ fn spawn_autoland(launch: AutolandLaunch) {
                 // 100 ms on the iMac at 20 fps (2026-09-30), where a MacBook
                 // ran near 0.3. An older plugin falls back to separate reads,
                 // still one round.
-                let thr_name = throttle_dref();
+                let thr_name = throttle_dataref();
                 // Beside the frame, in its round: the lever, the autopilot's
                 // mode bitfield and the autothrottle (`crate::autoflight`:
                 // the modes' one truth, and a thrust this loop owns).
@@ -2584,7 +2578,7 @@ fn spawn_autoland(launch: AutolandLaunch) {
                     }
                     if wanted && reversals_flown >= crate::reversal::MAX_REVERSALS {
                         gave_up = true;
-                        let thr_dref = throttle_dref();
+                        let thr_dref = throttle_dataref();
                         let _ = tokio::join!(
                             xp.set_float(&thr_dref, GIVE_UP_THROTTLE),
                             autoflight::set_dial(&xp, Dial::Vs, 0.0),
@@ -2977,7 +2971,7 @@ fn spawn_autoland(launch: AutolandLaunch) {
                     // the VS dial zeroed (the AP is already holding heading),
                     // and the line says what is actually held.
                     gave_up = true;
-                    let thr_dref = throttle_dref();
+                    let thr_dref = throttle_dataref();
                     let _ = tokio::join!(
                         xp.set_float(&thr_dref, GIVE_UP_THROTTLE),
                         autoflight::set_dial(&xp, Dial::Vs, 0.0),
@@ -3019,7 +3013,7 @@ fn spawn_autoland(launch: AutolandLaunch) {
                 // flap; the handback happens there, flaps retracted.
                 if runtime.go_around.attempts() > MAX_GO_AROUNDS && missed != Some(MissedStage::Climb) {
                     gave_up = true;
-                    let thr_dref = throttle_dref();
+                    let thr_dref = throttle_dataref();
                     let _ = tokio::join!(
                         xp.set_float(&thr_dref, GIVE_UP_THROTTLE),
                         autoflight::set_dial(&xp, Dial::Vs, 0.0),
@@ -3346,7 +3340,7 @@ fn spawn_autoland(launch: AutolandLaunch) {
                 }
                 if es.give_up {
                     gave_up = true;
-                    let _ = xp.set_float(&throttle_dref(), GIVE_UP_THROTTLE).await;
+                    let _ = xp.set_float(&throttle_dataref(), GIVE_UP_THROTTLE).await;
                     announce(ENGAGE_GIVE_UP_LINE.into(), Priority::Warning);
                     crate::blackbox::record(
                         "autoland",
@@ -4330,7 +4324,7 @@ fn spawn_autoland(launch: AutolandLaunch) {
                     // flyable aircraft and say what is held.
                     if vs_diverged_s >= VS_DIVERGED_GIVE_UP_S {
                         gave_up = true;
-                        let thr_dref = throttle_dref();
+                        let thr_dref = throttle_dataref();
                         let _ = tokio::join!(
                             xp.set_float(&thr_dref, GIVE_UP_THROTTLE),
                             autoflight::set_dial(&xp, Dial::Vs, 0.0),
@@ -4367,7 +4361,7 @@ fn spawn_autoland(launch: AutolandLaunch) {
                     && g.dist_nm > recede_ref_nm + RECEDING_GIVE_UP_NM
                 {
                     gave_up = true;
-                    let thr_dref = throttle_dref();
+                    let thr_dref = throttle_dataref();
                     let _ = tokio::join!(
                         xp.set_float(&thr_dref, GIVE_UP_THROTTLE),
                         autoflight::set_dial(&xp, Dial::Vs, 0.0),

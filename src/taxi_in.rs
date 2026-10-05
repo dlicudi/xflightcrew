@@ -27,6 +27,7 @@ use serde_json::json;
 use crate::config::Config;
 use crate::tools::controls::HoldFor;
 use crate::tools::{taxi::AutoTaxi, Tool, ToolCtx};
+use crate::voice::say_opt as announce;
 use crate::voice::{Priority, Voice};
 use crate::xplane::XPlaneClient;
 
@@ -209,12 +210,6 @@ fn stand_down_relocated(voice: &Option<Voice>, at: &str, said: bool) {
         );
     }
     arrest_release();
-}
-
-fn announce(voice: &Option<Voice>, priority: Priority, line: &str) {
-    if let Some(v) = voice {
-        v.alert(priority, line.to_string());
-    }
 }
 
 /// The runway to vacate, or `None` when there is nothing to vacate.
@@ -828,6 +823,19 @@ async fn fly(
     }
 }
 
+/// What the crew says stopped short of the stand, from the parking brake's
+/// READ-BACK (`set_park_brake_confirmed`): "Brakes set" only when it reads
+/// set. Pure.
+fn short_of_stand_line(held: bool) -> &'static str {
+    if held {
+        "We've stopped short of the stand. Brakes set, but we're not parked \
+         and I've left the lights and transponder alone. Your aircraft."
+    } else {
+        "We've stopped short of the stand. The parking brake did not set, hold \
+         the brakes. I've left the lights and transponder alone. Your aircraft."
+    }
+}
+
 /// Arrival securing at the stand. STOCK-safe items only — they work on every
 /// airframe with no profile: park brake set, transponder to standby, and the
 /// exterior lights you don't want on at the gate (strobes, taxi and landing).
@@ -871,13 +879,16 @@ async fn secure(
     if !at_stand {
         // Hold it where it is and hand back. Securing here is what put an
         // aircraft on a taxiway with its transponder in standby.
-        let _ = crate::tools::controls::drive_park_brake(xp, true, park_brake_valve_set).await;
-        announce(
-            voice,
-            Priority::Caution,
-            "We've stopped short of the stand. Brakes set, but we're not parked \
-             and I've left the lights and transponder alone. Your aircraft.",
+        // "Brakes set" only from the read-back: an unconfirmed drive said it
+        // over a brake that never took.
+        let set =
+            crate::tools::controls::set_park_brake_confirmed(xp, park_brake_valve_set, 3).await;
+        crate::blackbox::record(
+            "taxi_in",
+            json!({ "event": "short_of_stand", "held": set.held, "tries": set.tries,
+                    "park": set.park, "err": set.err }),
         );
+        announce(voice, Priority::Caution, short_of_stand_line(set.held));
         crate::full_auto::release_arrival_station();
         return false;
     }
@@ -1087,6 +1098,37 @@ mod shutdown_tests {
             );
         }
         assert!(checked > 3, "only {checked} full-auto airframes found");
+    }
+}
+
+#[cfg(test)]
+mod short_of_stand_tests {
+    use super::short_of_stand_line;
+    use crate::xplane::FakeXPlane;
+
+    const PARK: &str = "sim/cockpit2/controls/parking_brake_ratio";
+    const SET: &str = "sim/flight_controls/park_brake_set";
+
+    /// Stopped short of the stand, "Brakes set" was said from a drive whose
+    /// read-back was thrown away. It is said only when the brake reads set.
+    #[tokio::test]
+    async fn short_of_the_stand_says_brakes_set_only_from_the_read_back() {
+        let stuck = FakeXPlane::with_reads(&[(PARK, 0.03)]);
+        let r = crate::tools::controls::set_park_brake_confirmed(&stuck, None, 3).await;
+        let line = short_of_stand_line(r.held);
+        assert!(!line.contains("Brakes set"), "{line}");
+        assert!(line.contains("did not set"), "{line}");
+
+        let takes = FakeXPlane::with_reads(&[(PARK, 0.03)]);
+        takes.step_on_command(SET, PARK, 0.97);
+        let r = crate::tools::controls::set_park_brake_confirmed(&takes, None, 3).await;
+        assert!(short_of_stand_line(r.held).contains("Brakes set"));
+
+        let src = crate::test_support::module_source("taxi_in");
+        let secure = &src[src.find("async fn secure(").unwrap()..];
+        let short = &secure[..secure.find("return false;").unwrap()];
+        assert!(short.contains("set_park_brake_confirmed("), "{short}");
+        assert!(!short.contains("drive_park_brake("));
     }
 }
 
