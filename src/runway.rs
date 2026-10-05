@@ -180,13 +180,13 @@ pub fn best_landing_runway(
     )
 }
 
-/// What landing at the plan's DESTINATION is worth, nm. "Land the aircraft"
-/// with a plan to LIPK on the shelf picked Cervia's 11 over Forli's 30 at the
-/// same six miles (2026-09-25): the self-pick knew nothing of where the
-/// flight was going. A diversion field still wins when the destination is
-/// much further, behind, or downwind.
-pub const DESTINATION_BONUS_NM: f64 = 8.0;
-
+/// The plan's DESTINATION is not a bonus, it is the answer: with a suitable
+/// runway there inside the search, the self-pick chooses among the
+/// destination's runways only. "Land the aircraft" with a plan to LIPK picked
+/// Cervia's 11 over Forli's 30 at the same six miles (2026-09-25); an 8 nm
+/// bonus still let Gibraltar's 09 beat Malaga, the destination, from 26 nm
+/// (LEMG 2026-10-05). A nearer field is the emergency path (`nearest`, the
+/// planner's `Nearest`), never a tiebreak.
 /// The shortest strip the self-pick will take, metres: the airframe's landing
 /// distance by the one landing rule ([`crate::aircraft::landing_needed_m`],
 /// the planner's and the preflight's rule too), never under the 1,200 m every
@@ -239,6 +239,11 @@ pub fn best_landing_runway_in_wind(
     let mut cands = nearby_runways(apt_dat, lat, lon, max_nm)?;
     // Suitability: hard surface and long enough.
     cands.retain(|r| r.hard() && r.length_m >= min_length_m);
+    // The destination's runways, when it has a suitable one in range.
+    let at_dest = |r: &Runway| destination.is_some_and(|d| d.eq_ignore_ascii_case(r.icao.trim()));
+    if cands.iter().any(at_dest) {
+        cands.retain(at_dest);
+    }
     // One wind lookup per field, not per end.
     let mut winds: std::collections::HashMap<String, Option<(f64, f64)>> = Default::default();
     for r in &cands {
@@ -255,11 +260,7 @@ pub fn best_landing_runway_in_wind(
             winds.get(&r.icao).copied().flatten(),
             r.length_m,
             min_length_m,
-        ) - if destination.is_some_and(|d| d.eq_ignore_ascii_case(r.icao.trim())) {
-            DESTINATION_BONUS_NM
-        } else {
-            0.0
-        }
+        )
     };
     let best = cands.iter().min_by(|a, b| {
         score(a)

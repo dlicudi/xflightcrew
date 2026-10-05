@@ -3154,6 +3154,10 @@ pub(crate) const WIND_DECISIVE_KTS: f64 = 4.0;
 /// (never flew) — same reading the circuit uses.
 const AIRBORNE_MIN_AGL_FT: f64 = 300.0;
 
+/// A resume starts only this far off the ground: a lower aircraft is
+/// landing or has landed, never one the planner flies from.
+const RESUME_MIN_AGL_FT: f64 = 100.0;
+
 /// How long the circuit's taxi-in stage waits for autoland to ARM before
 /// concluding the pattern never got that far. Generous: a takeoff, a climb to
 /// pattern altitude, a full rectangle and a base leg, at trainer speeds, with
@@ -3297,7 +3301,10 @@ async fn fly_route(
             xp.get_float(crate::datarefs::ON_GROUND_ANY),
             xp.get_float(AGL_M)
         );
-        if !matches!((ground,agl), (Ok(g),Ok(h)) if g.is_finite() && h.is_finite() && g < 0.5 && h*M_TO_FT >= 1000.0)
+        // Still in the air, the state the planner judged: low is no reason
+        // (its first leg climbs to the way's floor, LEMG 2026-10-05); on the
+        // wheels or an unread flag is.
+        if !matches!((ground,agl), (Ok(g),Ok(h)) if g.is_finite() && h.is_finite() && g < 0.5 && h*M_TO_FT >= RESUME_MIN_AGL_FT)
         {
             give_up(
                 xp,

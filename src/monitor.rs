@@ -2760,7 +2760,7 @@ pub fn note_crew_yoke() {
     CREW_YOKE_MS.store(ms, std::sync::atomic::Ordering::Relaxed);
 }
 
-fn crew_yoke_fresh() -> bool {
+pub(crate) fn crew_yoke_fresh() -> bool {
     let ms = CREW_YOKE_MS.load(std::sync::atomic::Ordering::Relaxed);
     ms > 0 && process_secs() - (ms - 1) as f64 / 1000.0 <= CREW_YOKE_FRESH_S
 }
@@ -2779,7 +2779,7 @@ pub fn note_pilot_release() {
     PILOT_RELEASE_MS.store(ms, std::sync::atomic::Ordering::Relaxed);
 }
 
-fn pilot_released_recently() -> bool {
+pub(crate) fn pilot_released_recently() -> bool {
     let ms = PILOT_RELEASE_MS.load(std::sync::atomic::Ordering::Relaxed);
     ms > 0 && process_secs() - (ms - 1) as f64 / 1000.0 <= PILOT_RELEASE_QUIET_S
 }

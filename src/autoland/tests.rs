@@ -4229,7 +4229,7 @@
 
     /// LIPK (2026-09-25): "land the aircraft" 6.4 nm from both Forli 30 and
     /// Cervia 11, with LIPE-LIPK on the shelf, went to Cervia. The plan's
-    /// destination is now worth [`DESTINATION_BONUS_NM`].
+    /// destination is the pick whenever it has a suitable runway in range.
     #[test]
     fn the_self_pick_prefers_the_plans_destination() {
         let apt = std::env::temp_dir().join(format!("xvl_selfpick_{}.dat", std::process::id()));
@@ -4252,6 +4252,39 @@
         assert_eq!(pick(Some("lipk")).as_deref(), Some("LIPK 30"));
         // A destination out of range changes nothing.
         assert_eq!(pick(Some("EGLL")).as_deref(), Some("LIPC 11"));
+        let _ = std::fs::remove_file(&apt);
+    }
+
+    /// LEMG 737, 2026-10-05 12:52:22: "land the aircraft" at 8,000 ft, 25 nm
+    /// south-west of Malaga and 26 nm from Gibraltar, tracking 178. The 8 nm
+    /// bonus lost to the turn: Gibraltar 09 was picked, twice that day. The
+    /// destination is now the answer whenever it has a runway in reach.
+    #[test]
+    fn the_self_pick_keeps_to_the_destination_over_a_nearer_field() {
+        let apt = std::env::temp_dir().join(format!("xvl_selfpick_lemg_{}.dat", std::process::id()));
+        std::fs::write(
+            &apt,
+            "1     11 0 0 LXGB Gibraltar\n\
+             100 45.11 1 0 0.20 0 3 0  09 36.1508156 -5.3596312 136 0 5 1 0 3 27 36.1514944 -5.3400082 98 0 5 7 0 3\n\
+             1     48 0 0 LEMG Malaga\n\
+             100 45.11 1 1 0.00 1 3 0  12 36.6910753 -4.5078270 0 190 3 1 1 1 30 36.6795648 -4.4805125 0 489 3 0 0 1\n\
+             100 45.11 27 27 0.00 1 3 0  13 36.6845573 -4.5126253 0 75 3 1 0 2 31 36.6654027 -4.4858140 0 75 3 1 0 3\n",
+        )
+        .unwrap();
+        let path = apt.to_str().unwrap();
+        let wind = |icao: &str| match icao {
+            "LXGB" => Some((90.0, 5.0)),
+            _ => Some((130.0, 8.0)),
+        };
+        let pick = |dest: Option<&str>| {
+            best_landing_runway_in_wind(path, 36.3438, -4.8796, 178.5, 40.0, 1633.7, &wind, dest)
+                .unwrap()
+                .map(|r| format!("{} {}", r.icao.trim(), r.id))
+        };
+        assert_eq!(pick(None).as_deref(), Some("LXGB 09"), "the day's pick, no destination");
+        let at_malaga = pick(Some("LEMG")).unwrap();
+        assert!(at_malaga.starts_with("LEMG "), "{at_malaga}");
+        assert_eq!(at_malaga, "LEMG 13", "into the 8 kt from 130");
         let _ = std::fs::remove_file(&apt);
     }
 

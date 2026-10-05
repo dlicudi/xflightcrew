@@ -102,7 +102,9 @@ Datarefs and commands stay in the Rust tools; YAML is per-airframe config.
   ARM (`ThrustWatch`, bounded, said once): the A/T in SPEED 230 held LEMG 13's levers 7 min
   (2026-10-05). The window is parked where no capture takes the wheel (`WindowRule`: above, or at
   the field on a V/S-toward-window MCP, `vs_toward_window`). Primitives for other loops:
-  `engage_confirmed`, `hold_level`, `hold_heading`, `take_thrust`, `arm_approach`.
+  `engage_confirmed`, `hold_level`, `hold_heading`, `climb_to`, `take_thrust`, `drop_thrust_now`,
+  `arm_approach`. **It keeps a ledger of OUR presses and writes** (`ours_since`, `Ours`): the one
+  answer to "was this change ours?" (the safe hold's pilot detection).
 - Multi-engine tools take `engines`, act per engine, and read back the LAST element written;
   singles stay byte-identical (element 0, starter 1). `vyse_kts`, `vmca_kts` stay `None` on
   singles: say nothing rather than invent.
@@ -409,9 +411,29 @@ everything blackboxes to `logs/blackbox.jsonl` (kinds: `atc`, `autotaxi`, `autot
 `cabin`, `instructor`, `loading`, `turbine_start`, `heli_start`, `hover`, `heli_circuit`,
 `heli_route`, `rapport`, `cabin_air`, `api_load`, `plan_audit`, `handover`, `start_item`,
 `sim_radio`, `fuel_pumps`, `electrical`, `typed`, `crew_radio`, `go_around`, `recover`,
-`ap_pitch_authority`, `autoflight`).
+`ap_pitch_authority`, `autoflight`, `safe_hold`).
 
 ### Holding, writers, reads
+- **An airborne aircraft NOBODY flies is held safe** (`src/safe_hold.rs`, its own thread from
+  boot, never stood down; blackbox `safe_hold`). Nobody: no crew loop owns it and no pilot flies
+  it (hands on the yoke or a yield latch, the servos out, or a dial or mode moved since it became
+  nobody's: `mcp_moved`, the autopilot's own captures excluded, and OUR presses and dial writes
+  told apart by the panel owner's ledger, `autoflight::ours_since`, never guessed from bits). Then the autopilot's vertical
+  path (`vertical`: a hold, a capture of the window, a climb, no floor) must end at or above the
+  FLOOR: the ground along the track to 15 nm (the plugin's probe; else grid MORA; else the ground
+  under) plus 1,000 ft. Unsafe for 3 s: a climb to it (a heading off the track only when the climb
+  cannot clear the ground ahead, `clear_heading`) or the descent bounded there, through the panel
+  owner (`autoflight::hold_heading`, `climb_to`: the window at the level, captured by the
+  autopilot; a writer only while no loop has the aircraft, `writer_may_act`), the governor at
+  `hand_back_speed_kts` unless an autothrottle holds
+  the speed; read back, said once, never re-asserted; the answer watched (`VERIFY_S`), else
+  `recover::take_over`. The ESCAPE (`escape_due`: the ground plus 500 ft inside 60 s on the path
+  flown) acts at once, over a pilot flying the autopilot too; a pilot hand flying only hears
+  "Terrain! Pull up." An aligned final or a coupled glideslope is never judged (`on_approach`);
+  in a field's circuit only a collision course is (`in_terminal`). Unflyable and unattended for
+  2 s: the recovery. Rotorcraft are the hover loop's. LEMG 2026-10-05: a restart left
+  autoland's VS -330 to a window at 0 flying a 737 toward the hills, 72 ft over a ridge; the
+  replay (`bench/replay/`) holds it 6 s after the boot.
 - **A stage not moving the aircraft is holding it**: brakes for every wait, abort and give-up. **A
   mission that ENDS on the ground stops and parks** (`tools::controls::hand_back_hold`, every stop-and-park, governor or not, a
   pilot's "my controls" included): wheel brakes to a stop, from ANY speed (`brakes_max` above
@@ -622,12 +644,21 @@ everything blackboxes to `logs/blackbox.jsonl` (kinds: `atc`, `autotaxi`, `autot
   pattern (`raise_for_terrain`, said), a descending leg refuses. Downwind fixed
   (`LXGB_ROCK_CLEAR_M`).
 - Full auto: engine start per class (`StartKind`); power-up INLINE (racing bring-ups shut a
-  cross-tie); waits on `driving()`, not `ACTIVE`; airborne, "fly the flight plan" is the checked
-  RESUME of the plan on the shelf (`resume_gate`, `resume_join`; #67), its recheck judged against
-  the first read's own track and level, never raw movement (`rejoin_unsteady`; #177); ends with
-  `taxi_in_after_landing`. **A resume past the route near the destination is the
-  arrival** (`resume_join`, `ARRIVAL_REJOIN_NM`, autoland on the plan's runway); every refusal names
-  its number. Cruise is a SPEED: the OFP's on its cruise legs
+  cross-tie); waits on `driving()`, not `ACTIVE`; ends with `taxi_in_after_landing`.
+- **Airborne, "fly the flight plan" and "land the aircraft" are ONE planner, from ANY state**
+  (`src/recovery_plan.rs`, `FullAuto::recovery`; blackbox `full_auto` `recovery_plan`): the plan
+  on the shelf, else FETCHED (the SimBrief plan is the destination); the join (`choose_join`: on
+  the final, abeam a leg, the departure, the arrival inside 25 nm (40 to land), else direct to the
+  fix with the shortest way in, `best_direct`, unless that is a 10 nm detour inside autoland's
+  reach); under the way's floor (probed to 40 nm, else MORA, else MSA) the first leg CLIMBS
+  (`climb_leg`, a VA the follower flies) on a heading the climb clears; refused only for the
+  physically impossible, with the number (`impossible`: ceiling, fuel plus 10 min, the
+  destination runway), or an unflyable aircraft (`resume_gate`); its recheck judged against the
+  first read's own track and level (`rejoin_unsteady`; #177). A landing goes to the nearest
+  runway only when asked (`autoland {nearest}`: "nearest", "closest", "emergency landing", "land
+  right now"), an engine out, no plan to be had, or the destination impossible (LEMG 2026-10-05:
+  three refusals while the 737 descended toward the hills, Gibraltar self-picked over Malaga).
+  Cruise is a SPEED: the OFP's on its cruise legs
   (`procedure::scheduled_cruise_kts`: the lower of planned IAS and planned Mach at the level,
   `cas_for_mach`; `cruise_pick` only inside floor and ceiling), else `reference.cruise_ias_kts`. **A
   planned step is flown at its fix** (`apply_step_climbs` at the arm, all or nothing; `step_climb_at`).
@@ -743,7 +774,9 @@ everything blackboxes to `logs/blackbox.jsonl` (kinds: `atc`, `autotaxi`, `autot
 ### Approach and autoland
 - **Every planned arrival hands its runway down** (`EndAction::Approach { rwy_id }` to
   `run_autoland`); the self-pick (`autoland::self_pick`, `landing_score`, `self_pick_min_length_m`,
-  METAR tailwind, `DESTINATION_BONUS_NM`) is the emergency path.
+  METAR tailwind) keeps to the plan's destination whenever it has a suitable runway in reach
+  (`best_landing_runway_in_wind`); "land at the nearest" picks with none
+  (`tools::autoland::nearest_runway`, `self_pick` `nearest`).
 - **A new flight takes its clearances with it** (`party_line::retire_for_new_flight`, called by
   `setup_approach` before the arm; the old station publishes nothing until the new one is installed,
   `NEW_FLIGHT_PENDING`, and its radar watch; whoever starts it: a mailbox run the app did not post
@@ -1199,7 +1232,9 @@ confirms it closes it (`fixes #N` in the commit). Known gaps are `owed` issues.
   windows (461 fpm on a 130, LEMG 31 2026-09-28); a bounce is recorded (`bounce_ft`). **A blackbox
   record is one write** (`blackbox::append_line`, one `write_all` under a file lock: the runner is a
   second process on the same file; 70 corrupt lines 2026-09-28).
-  `bench/sorties/` holds trimmed real sorties whose verdicts `cargo test` pins.
+  `bench/sorties/` holds trimmed real sorties whose verdicts `cargo test` pins; `bench/replay/`
+  trimmed real flights replayed through a pure decision (`safe_hold::lemg_replay_tests`; a whole
+  log through it: `XVL_SAFE_HOLD_LOG=logs/blackbox.jsonl cargo test -- --ignored safe_hold_sweep`).
 - **A night of landings is one command** (`xvl sortie bench/sorties/<spec>.yaml --repeat N`,
   `src/sortie_runner.rs`): set up, type the mission, the `sortie_result` is the row
   (`logs/sorties/run-<stamp>.md`); an approach setup is its own sortie (`setup::hold_sortie_while`).

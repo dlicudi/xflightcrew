@@ -12612,6 +12612,62 @@ plant at the recorded heavy loading pins contact within 60 s and below 300 fpm
 (`a_heavy_landing_follows_the_ground_cushion_to_contact`); all 22 hover tests pass. Live EGBJ
 confirmation is owed.
 
+## 2026-10-05: nobody flying after a restart, and one planner to the destination (LEMG 737)
+
+Stock 737, LFRG-LEMG, sortie 1791187965-full_auto and the minutes after (12:42 to 12:56 CEST).
+xvl was restarted at 12:42:27 to load 89fe7a6 with the autopilot still flying autoland's last
+command: `ap_state` 50 (HDG, VS, ALT armed), VS -330, the window at 0 (set by hand at 12:30),
+heading 306 toward the hills west of Malaga at 2,930 ft. Nothing of ours owned the aircraft after
+the boot. "Fly the flight plan" was refused three times: "No plan is loaded" (12:42:59), "Climb
+to 9,000 feet first, the sector altitude ... 27 miles left of course on the MG541 to MG437 leg,
+outside the 3 mile rejoin corridor. I haven't taken control" (12:43:09), the same from the LENHI
+leg 9 miles right (12:43:54). The pilot wound the VS wheel to 0 (12:43:41) and +1,400 (12:44:21)
+at idle, slowed to 133 kt into the stall warning, took the servos out (12:44:36) and pulled up:
+the state records put the 737 72 ft over a ridge of 2,616 ft at 12:44:58. At 12:52:22 "land the
+aircraft" self-picked Gibraltar 09 (26 nm) over Malaga with the plan not loaded since the restart;
+"my controls" at 12:53:03 left autoland's VS -1,500 with the window parked at 0; at 12:55:56 "fly
+the flight plan" was refused "not abeam any leg ... LEMG is 41 miles away".
+
+Two root causes. The crew could leave an airborne aircraft in a state that flies into the ground
+(a refusal, a cancel, a give-up, a stand-down, a boot all left whatever the autopilot was last
+told), and getting to the destination was a set of narrow gates, each a reason to do nothing.
+
+- **The safe hold** (`src/safe_hold.rs`): airborne, no crew loop owning it, no pilot flying it
+  (hands or a yield latch, the servos out, or the autopilot moved since it became nobody's),
+  the autopilot's vertical path must end at or above the ground along the track to 15 nm plus
+  1,000 ft. Unsafe 3 s: climb to it or bound the descent there through the pilot's own
+  `set_heading` / `set_climb`, the governor holding the configuration's hand-back speed without an
+  autothrottle; the answer watched, else the recovery. The escape (the ground plus 500 ft inside
+  60 s on the path flown) acts at once, over a pilot on the autopilot too; a pilot hand flying
+  hears "Terrain! Pull up.". Aligned finals and coupled glideslopes are approaches; a field's
+  circuit asks for a collision course. Replayed on the real records
+  (`bench/replay/2026-10-05-lemg-737.jsonl`): held 6.0 s after the boot, climbing to 3,700 ft at
+  2,000 fpm on its own heading (the climb clears the ridge); judged as flown with nothing allowed
+  to move, unsafe from the boot, the pilot's VS wheel at 12:43:41 is the pilot's, "Terrain! Pull
+  up." from 12:43:30, a minute and a half before the ridge, repeated through the plunge; at 12:53:03
+  the leftover VS -1,500 is bounded at 1,000 ft over the sea 4.8 s after "my controls". The whole
+  blackbox through the decision with the installed apt.dat (`safe_hold_sweep`): holds only where
+  a loop's leftover or the boot was flying (autoland cancelled at 2,700 ft descending 800 fpm,
+  2026-10-03; "Flight automation has stopped" at 916 ft above the ground, 2026-10-01; the S-76's
+  climb-out, which the live watch leaves to the hover loop), 2 advisories to a pilot on the
+  autopilot, and no escape and no warning on any approach once runways are known (without them,
+  19 "Pull up"s fell on finals, the 737's coupled APP among them: the glideslope is now an
+  approach whatever the data).
+- **The recovery planner** (`src/recovery_plan.rs`, `FullAuto::recovery`): "fly the flight plan"
+  in the air and "land the aircraft" from any state. The plan on the shelf, else fetched; the
+  join on the final, abeam a leg, near the origin, the arrival inside 25 nm (40 to land), else
+  direct to the fix with the shortest way in; a climb first (a VA leg the follower flies) under
+  the way's probed floor; refused only for ceiling, fuel and runway, with the numbers, which for
+  a landing are the emergency: the nearest runway, said why. The day's requests on the real
+  fixes (VULP1G): 12:43:09 and 12:43:54 are the arrival (13 and 16 nm); 12:52:22 lands at Malaga;
+  12:55:56 is direct to the arrival gateway, 46 nm, 58 to go. The self-pick keeps to the
+  destination whenever it has a runway in reach (the 8 nm bonus lost to the turn: from 12:52:22
+  it is now LEMG 13, into the 8 kt from 130).
+
+Owed: a flight test (the blackbox `safe_hold` `episode`, `verdict`, `hold`, `set` `took`,
+`take_over`, `pilot`; `full_auto` `recovery_plan` `join`, `floor_ft`, `climb_ft`); the safe hold
+does not judge rotorcraft (the hover loop's own hand-back).
+
 ## 2026-10-05: the 737's autoflight has one owner, and its final is planned back from the gate
 
 Stock 737-800, LFRG-LEMG, sortie 1791187965-full_auto (task doc

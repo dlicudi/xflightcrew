@@ -1183,7 +1183,8 @@ mod tests {
     /// the rejoin checks the terrain over, at the plan's level there.
     #[test]
     fn the_resume_joins_the_leg_the_placement_is_on() {
-        use crate::tools::full_auto::{resume_gate, resume_join, ResumeJoin};
+        use crate::recovery_plan::{choose_join, Join, Purpose};
+        use crate::tools::full_auto::resume_gate;
         let plan = egkk_egbb();
         let legs = crate::procedure::enroute_legs(
             &plan.waypoints,
@@ -1201,8 +1202,8 @@ mod tests {
         ] {
             let p = place(&plan, &point, &b738()).unwrap();
             // Over flat England: the plan's altitude less a field's height.
-            assert_eq!(resume_gate(false, false, p.alt_ft - 500.0, 0.0, p.ias_kts, 167.0), None);
-            let join = resume_join(
+            assert_eq!(resume_gate(false, false, None), None);
+            let join = choose_join(
                 &legs,
                 &plan.waypoints,
                 &plan.destination,
@@ -1211,9 +1212,10 @@ mod tests {
                 Some(-1.0),
                 None,
                 None,
+                Purpose::Resume,
             );
             let i = match join {
-                ResumeJoin::Leg(i) => i,
+                Some(Join::Abeam(i)) => i,
                 other => panic!("{point:?}: {other:?}"),
             };
             assert_eq!(legs[i].fix_ident, p.next_fix, "{point:?}");
@@ -1221,9 +1223,12 @@ mod tests {
             assert!(crate::nav::haversine_nm(p.lat, p.lon, fix.lat, fix.lon) <= 30.0, "{point:?}");
             assert!(legs[i].alt1_ft.unwrap() <= p.alt_ft + 1.0, "{point:?}: never a climb back");
         }
-        // The gates still refuse what they refused: slow, banked, low.
-        assert!(resume_gate(false, false, 18_000.0, 0.0, 150.0, 167.0).unwrap().contains("slow"));
-        assert!(resume_gate(false, false, 800.0, 0.0, 250.0, 167.0).unwrap().contains("thousand"));
+        // The gates refuse only what no plan can fly from: a stall, slow for
+        // the configuration, an upset. Low, banked, off the route are the
+        // planner's (LEMG 2026-10-05).
+        assert!(resume_gate(false, false, Some("slow")).unwrap().contains("slow"));
+        assert!(resume_gate(false, false, Some("stall")).unwrap().contains("stalling"));
+        assert!(resume_gate(true, false, None).unwrap().contains("paused"));
     }
 
     #[test]

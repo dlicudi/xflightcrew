@@ -207,11 +207,13 @@ pub fn dial_named(name: &str) -> Option<Dial> {
 
 /// Write a dial.
 pub async fn set_dial(xp: &dyn XPlane, d: Dial, v: f64) -> anyhow::Result<()> {
+    note(OurChange::Dial(d, v));
     xp.set_float(d.name(), v).await
 }
 
 /// Write one element of an array dial (the hover vector).
 pub async fn set_dial_elem(xp: &dyn XPlane, d: Dial, index: usize, v: f64) -> anyhow::Result<()> {
+    note(OurChange::Dial(d, v));
     xp.set_float_array_elem(d.name(), index, v).await
 }
 
@@ -231,6 +233,7 @@ pub async fn set_dial_confirmed(
     last: &mut Option<f64>,
     change: f64,
 ) -> bool {
+    note(OurChange::Dial(d, want));
     crate::control::set_confirmed(kind, xp, d.name(), want, last, change).await
 }
 
@@ -241,7 +244,224 @@ pub async fn read_dial_array(xp: &dyn XPlane, d: Dial) -> anyhow::Result<Vec<f64
 
 /// Put a dial write in a tick's write round (`sim::state::Writes`).
 pub fn stage_dial(writes: &mut sim::state::Writes, d: Dial, v: f64) {
+    note(OurChange::Dial(d, v));
     writes.set(d.name(), v);
+}
+
+// ---------------------------------------------------------------------------
+// The heading knob.
+// ---------------------------------------------------------------------------
+
+/// Drive the heading BUG to `target` the way a human does — by turning the knob
+/// (`heading_up`/`heading_down` presses). Glass avionics that ignore raw dataref
+/// writes (the SR22's G1000) register the commands, and the knob animates. Falls
+/// back to a direct dataref write when the commands don't move the bug (checked a
+/// few presses in). Returns the bug's actual value afterwards.
+pub async fn drive_heading_bug(xp: &dyn crate::xplane::XPlane, target: f64) -> f64 {
+    drive_heading_bug_step(xp, target, 360.0).await
+}
+
+/// Like [`drive_heading_bug`] but turns the knob at most `max_step_deg` toward
+/// the target per call — for control loops that drive the bug every tick. Each
+/// press is an HTTP round trip, so an unbounded slew stalls the caller: the
+/// LXGB go-around's 178° reversal froze the autoland loop ~5 s per tick with
+/// no VS or throttle updates the whole time (2026-07-14). A capped call gets
+/// there over successive ticks; the direct-write fallback (knob unbound) still
+/// jumps straight to the full target.
+/// Below this a heading change is SET, to a tenth of a degree, not pressed.
+const FINE_BUG_DEG: f64 = 3.0;
+/// ...and below this it is left alone.
+const FINE_BUG_MIN_DEG: f64 = 0.2;
+
+/// What [`drive_heading_bug_step`] would do from a bug already read.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum BugStep {
+    /// Within a fifth of a degree: the knob is left alone.
+    Leave,
+    /// Set to this value (a fine correction, or the target when the bug
+    /// was unread): one write, which can ride the tick's write round.
+    Set(f64),
+    /// A change past [`FINE_BUG_DEG`]: pressed, through
+    /// [`drive_heading_bug_step`] itself.
+    Drive,
+}
+
+/// [`drive_heading_bug_step`]'s first decision from the bug a tick has
+/// ALREADY read (`sim::state` carries it), so a loop that steers the knob
+/// every tick pays no read of its own and its fine correction goes out with
+/// the tick's other writes: the short final and the flare set the bug every
+/// tick, three rounds of requests (read, write, read back) where one write
+/// does (iMac 2026-09-30, a round is a frame, 50 ms at 20 fps). Pure.
+pub fn bug_step_from(start: Option<f64>, target: f64) -> BugStep {
+    let target = target.rem_euclid(360.0);
+    let Some(start) = start.filter(|v| v.is_finite()) else {
+        return BugStep::Set(target);
+    };
+    let full = crate::angles::signed_diff_deg(target, start);
+    if full.abs() < FINE_BUG_DEG {
+        if full.abs() >= FINE_BUG_MIN_DEG {
+            let fine = ((start + full) * 10.0).round() / 10.0;
+            return BugStep::Set(fine.rem_euclid(360.0));
+        }
+        return BugStep::Leave;
+    }
+    BugStep::Drive
+}
+
+pub async fn drive_heading_bug_step(
+    xp: &dyn crate::xplane::XPlane,
+    target: f64,
+    max_step_deg: f64,
+) -> f64 {
+    let target = target.rem_euclid(360.0);
+    let Ok(start) = read_dial(xp, Dial::HeadingBug).await else {
+        let _ = set_dial(xp, Dial::HeadingBug, target).await;
+        return target;
+    };
+    let full = crate::angles::signed_diff_deg(target, start);
+    // A small correction is set to a tenth of a degree, not pressed: a press
+    // is a whole degree and a change under half of one is no press at all,
+    // so autoland's final command hovering at 131.5 flipped the bug between
+    // 131 and 132 and the 737 wove 10 to 15 m either side of the centreline
+    // all the way down (LEMG 13, 2026-09-26). Under a fifth of a degree the
+    // knob is left alone.
+    if full.abs() < FINE_BUG_DEG {
+        if full.abs() >= FINE_BUG_MIN_DEG {
+            let fine = ((start + full) * 10.0).round() / 10.0;
+            let _ = set_dial(xp, Dial::HeadingBug, fine.rem_euclid(360.0)).await;
+            return read_dial(xp, Dial::HeadingBug).await.unwrap_or(fine);
+        }
+        return start;
+    }
+    let delta = full.clamp(-max_step_deg.abs(), max_step_deg.abs());
+    let leg = (start + delta).rem_euclid(360.0);
+    let presses = delta.round().abs() as i64;
+    let knob = if delta >= 0.0 {
+        Button::HeadingUp
+    } else {
+        Button::HeadingDown
+    };
+    for i in 0..presses {
+        if press(xp, knob).await.is_err() {
+            break;
+        }
+        // A few presses in, confirm the knob is actually bound on this airframe.
+        if i == 4 {
+            let now = read_dial(xp, Dial::HeadingBug).await.unwrap_or(start);
+            if (now - start).abs() < 0.5 {
+                break;
+            }
+        }
+    }
+    let now = read_dial(xp, Dial::HeadingBug).await.unwrap_or(start);
+    let err = crate::angles::abs_diff_deg(leg, now);
+    if err > 1.5 {
+        // Knob path didn't get there — direct write as the fallback (straight
+        // to the FULL target: a dataref write is one round trip, no cap needed).
+        let _ = set_dial(xp, Dial::HeadingBug, target).await;
+    }
+    read_dial(xp, Dial::HeadingBug).await.unwrap_or(target)
+}
+
+// ---------------------------------------------------------------------------
+// The ledger: what WE pressed and wrote, for whoever must tell a pilot's
+// hand from ours (the safe hold's `mcp_moved`).
+// ---------------------------------------------------------------------------
+
+/// One change of ours to the panel.
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OurChange {
+    Press(Button),
+    Dial(Dial, f64),
+}
+
+/// How long the ledger remembers, s.
+pub const LEDGER_S: f64 = 300.0;
+
+static LEDGER: std::sync::Mutex<std::collections::VecDeque<(std::time::Instant, OurChange)>> =
+    std::sync::Mutex::new(std::collections::VecDeque::new());
+
+fn note(c: OurChange) {
+    let now = std::time::Instant::now();
+    let mut l = LEDGER.lock().unwrap_or_else(|e| e.into_inner());
+    while l
+        .front()
+        .is_some_and(|(t, _)| now.duration_since(*t).as_secs_f64() > LEDGER_S)
+    {
+        l.pop_front();
+    }
+    l.push_back((now, c));
+}
+
+/// Every change of ours since `since` (oldest first). The one question a
+/// watcher of the panel asks: was this move ours? Every press and dial write
+/// in the tree goes through this module (`every_mcp_write_goes_through_the_owner`),
+/// so a change this ledger does not hold was someone else's.
+pub fn ours_since(since: std::time::Instant) -> Vec<(std::time::Instant, OurChange)> {
+    LEDGER
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .filter(|(t, _)| *t >= since)
+        .copied()
+        .collect()
+}
+
+/// What a set of our changes can explain. Pure.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Ours(pub Vec<OurChange>);
+
+impl Ours {
+    /// We pressed `b`.
+    pub fn pressed(&self, b: Button) -> bool {
+        self.0.contains(&OurChange::Press(b))
+    }
+    /// We moved the servos in or out.
+    pub fn servos(&self) -> bool {
+        [Button::Engage, Button::Disconnect, Button::DisconnectFd]
+            .iter()
+            .any(|b| self.pressed(*b))
+    }
+    /// We wrote `d` to within `tol` of `value`.
+    pub fn wrote(&self, d: Dial, value: f64, tol: f64) -> bool {
+        let same = |x: Dial| {
+            x == d || matches!((x, d), (Dial::Vs, Dial::VviFpm) | (Dial::VviFpm, Dial::Vs))
+        };
+        self.0
+            .iter()
+            .any(|c| matches!(c, OurChange::Dial(x, v) if same(*x) && (v - value).abs() <= tol))
+    }
+    /// The `autopilot_state` bits our presses can have brought in.
+    pub fn mode_bits(&self) -> u32 {
+        self.0
+            .iter()
+            .map(|c| match c {
+                OurChange::Press(b) => button_bits(*b),
+                OurChange::Dial(..) => 0,
+            })
+            .fold(0, |a, b| a | b)
+    }
+}
+
+/// The modes a button can bring in (an engage brings the airframe's
+/// default modes with it). Pure.
+pub fn button_bits(b: Button) -> u32 {
+    match b {
+        Button::Engage => {
+            Modes::HEADING | Modes::VS | Modes::ALT_HOLD | Modes::WING_LEVELER | Modes::PITCH_SYNC
+        }
+        Button::Heading => Modes::HEADING,
+        Button::VerticalSpeed => Modes::VS | Modes::ALT_ARMED,
+        Button::AltitudeHold => Modes::ALT_HOLD,
+        Button::LevelChange => Modes::LEVEL_CHANGE | Modes::SPEED_ON_PITCH,
+        Button::Approach => Modes::LOC_ARMED | Modes::LOC | Modes::GS_ARMED | Modes::GS,
+        Button::Nav => Modes::LOC_ARMED | Modes::LOC,
+        Button::Gpss => Modes::FMS_ARMED | Modes::FMS | Modes::LOC_ARMED | Modes::LOC,
+        Button::WingLeveler => Modes::WING_LEVELER,
+        Button::AutothrottleOn => Modes::AUTOTHROTTLE,
+        _ => 0,
+    }
 }
 
 /// X-Plane's `autopilot_state` flags: the modes as the autopilot has them.
@@ -267,6 +487,8 @@ impl Modes {
     pub const ALT_HOLD: u32 = 16384;
     pub const TOGA_LATERAL: u32 = 32768;
     pub const TOGA_VERTICAL: u32 = 65536;
+    pub const VNAV_ARMED: u32 = 131072;
+    pub const VNAV: u32 = 262144;
 
     /// From a read (a float on the wire).
     pub fn from_read(v: f64) -> Option<Self> {
@@ -464,6 +686,7 @@ pub fn panel() -> Panel {
 /// sites tape their own decisions, and the mode presses below are taped by
 /// [`press_logged`].
 pub async fn press(xp: &dyn XPlane, b: Button) -> anyhow::Result<()> {
+    note(OurChange::Press(b));
     let p = panel();
     xp.run_command(p.command(b)).await
 }
@@ -471,6 +694,7 @@ pub async fn press(xp: &dyn XPlane, b: Button) -> anyhow::Result<()> {
 /// [`press`], on the tape: blackbox `autoflight` `press` with the site and
 /// the command the panel resolved.
 pub async fn press_logged(xp: &dyn XPlane, b: Button, site: &str) -> bool {
+    note(OurChange::Press(b));
     let p = panel();
     let c = p.command(b).to_string();
     let sent = xp.run_command(&c).await.is_ok();
@@ -669,7 +893,11 @@ pub async fn act_thrust(xp: &dyn XPlane, step: ThrustStep, owner: &str) -> Optio
         ThrustStep::Nothing => None,
         ThrustStep::Take { n, say } => {
             let p = panel();
-            let sent = xp.run_command(&p.autothrottle_off).await.is_ok();
+            let sent = {
+                note(OurChange::Press(Button::AutothrottleOff));
+                xp.run_command(&p.autothrottle_off).await
+            }
+            .is_ok();
             crate::blackbox::record(
                 "autoflight",
                 json!({"event": "thrust_taken", "owner": owner, "try": n, "cmd": p.autothrottle_off, "sent": sent}),
@@ -686,15 +914,14 @@ pub async fn act_thrust(xp: &dyn XPlane, step: ThrustStep, owner: &str) -> Optio
     }
 }
 
-#[cfg_attr(not(test), allow(dead_code))] // a primitive for the safe-hold and recovery loops
 /// How long a mode takes to show after its command (a frame or two, an
 /// add-on's mirror a frame behind).
 pub const SETTLE_MS: u64 = 400;
 
-#[cfg_attr(not(test), allow(dead_code))] // a primitive for the safe-hold and recovery loops
 /// The one-shot take at a loop's arm: read, press only if engaged, read back,
 /// up to [`THRUST_TRIES`]. `Some(true)` taken, `Some(false)` it would not
 /// come out, `None` it was not engaged (or unread: no measurement). Taped.
+#[cfg_attr(not(test), allow(dead_code))] // offered to the other loops
 pub async fn take_thrust(xp: &dyn XPlane, owner: &str) -> Option<bool> {
     let read = || async {
         let (on, mode) = tokio::join!(xp.get_float(names::AT_ON), xp.get_float(names::AT_MODE));
@@ -705,7 +932,10 @@ pub async fn take_thrust(xp: &dyn XPlane, owner: &str) -> Option<bool> {
     }
     let p = panel();
     for n in 1..=THRUST_TRIES {
-        let _ = xp.run_command(&p.autothrottle_off).await;
+        let _ = {
+            note(OurChange::Press(Button::AutothrottleOff));
+            xp.run_command(&p.autothrottle_off).await
+        };
         tokio::time::sleep(Duration::from_millis(SETTLE_MS)).await;
         let after = read().await;
         crate::blackbox::record(
@@ -730,7 +960,11 @@ pub async fn drop_thrust_now(xp: &dyn XPlane, owner: &str) -> Option<bool> {
         return None;
     }
     let p = panel();
-    let sent = xp.run_command(&p.autothrottle_off).await.is_ok();
+    let sent = {
+        note(OurChange::Press(Button::AutothrottleOff));
+        xp.run_command(&p.autothrottle_off).await
+    }
+    .is_ok();
     crate::blackbox::record(
         "autoflight",
         json!({"event": "thrust_taken", "owner": owner, "try": 1, "cmd": p.autothrottle_off, "sent": sent}),
@@ -742,10 +976,10 @@ pub async fn drop_thrust_now(xp: &dyn XPlane, owner: &str) -> Option<bool> {
 // The approach mode.
 // ---------------------------------------------------------------------------
 
-#[cfg_attr(not(test), allow(dead_code))] // a primitive for the safe-hold and recovery loops
 /// Arm the airframe's APP: pressed only when neither half reads armed or
 /// captured (a toggle), read back on the bitfield. `Some(true)` armed (or
 /// already), `Some(false)` pressed and not armed, `None` unread. Taped.
+#[cfg_attr(not(test), allow(dead_code))] // offered to the other loops
 pub async fn arm_approach(xp: &dyn XPlane, site: &str) -> Option<bool> {
     let before = Modes::from_read(xp.get_float(names::AP_STATE).await.ok()?)?;
     if before.approach_any() {
@@ -770,7 +1004,6 @@ pub async fn arm_approach(xp: &dyn XPlane, site: &str) -> Option<bool> {
 // Primitives: engage, hold level, hold heading.
 // ---------------------------------------------------------------------------
 
-#[cfg_attr(not(test), allow(dead_code))] // a primitive for the safe-hold and recovery loops
 /// The servos in and READ in ([`crate::ap_engage::engage_confirmed`]: the
 /// flight director commands first, then the panel's engage, pressed until
 /// the servos read in on two live reads), at most `max_s`.
@@ -779,7 +1012,6 @@ pub async fn engage_confirmed(xp: &dyn XPlane, site: &str, max_s: f64) -> bool {
     crate::ap_engage::engage_confirmed(xp, &fd, "autoflight", site, max_s).await
 }
 
-#[cfg_attr(not(test), allow(dead_code))] // a primitive for the safe-hold and recovery loops
 /// Make sure a toggled mode reads on: read its status first, press only
 /// when off, read back, up to `tries`. `true` when it reads on.
 pub async fn ensure_on(xp: &dyn XPlane, b: Button, status: &str, site: &str, tries: u32) -> bool {
@@ -796,12 +1028,12 @@ pub async fn ensure_on(xp: &dyn XPlane, b: Button, status: &str, site: &str, tri
     xp.get_float(status).await.is_ok_and(|v| v >= 0.5)
 }
 
-#[cfg_attr(not(test), allow(dead_code))] // a primitive for the safe-hold and recovery loops
 /// Hold this level: servos in, the window AT the level (rounded to the
 /// hundred), ALT HOLD on and read back. A primitive for the safe-hold and
 /// recovery loops. `true` when the hold reads on.
+#[cfg_attr(not(test), allow(dead_code))] // offered to the other loops
 pub async fn hold_level(xp: &dyn XPlane, alt_ft: f64, site: &str) -> bool {
-    if !engage_confirmed(xp, site, 6.0).await {
+    if !writer_may_act(site) || !engage_confirmed(xp, site, 6.0).await {
         return false;
     }
     let level = (alt_ft / 100.0).round() * 100.0;
@@ -814,14 +1046,14 @@ pub async fn hold_level(xp: &dyn XPlane, alt_ft: f64, site: &str) -> bool {
     ok
 }
 
-#[cfg_attr(not(test), allow(dead_code))] // a primitive for the safe-hold and recovery loops
-/// Hold this heading: servos in, the bug set, HDG SEL on and read back. A
+/// Hold this heading: servos in, the bug turned to it (the knob, which glass
+/// that ignores a dial write registers), HDG SEL on and read back. A
 /// primitive for the safe-hold and recovery loops.
 pub async fn hold_heading(xp: &dyn XPlane, hdg_mag: f64, site: &str) -> bool {
-    if !engage_confirmed(xp, site, 6.0).await {
+    if !writer_may_act(site) || !engage_confirmed(xp, site, 6.0).await {
         return false;
     }
-    let _ = set_dial(xp, Dial::HeadingBug, hdg_mag.rem_euclid(360.0)).await;
+    drive_heading_bug(xp, hdg_mag.rem_euclid(360.0)).await;
     let ok = ensure_on(xp, Button::Heading, names::HDG_STATUS, site, 3).await;
     crate::blackbox::record(
         "autoflight",
@@ -830,9 +1062,57 @@ pub async fn hold_heading(xp: &dyn XPlane, hdg_mag: f64, site: &str) -> bool {
     ok
 }
 
+/// The safe hold's site: a legitimate writer only while no loop of ours has
+/// the aircraft (a loop owns its panel; the hold is for an aircraft nobody
+/// flies).
+pub const SAFE_HOLD: &str = "safe_hold";
+
+/// May `site` act on the panel now? The safe hold only while no loop of
+/// ours has the aircraft; every other site is its loop's own. A refusal is
+/// on the tape.
+pub fn writer_may_act(site: &str) -> bool {
+    if site != SAFE_HOLD {
+        return true;
+    }
+    match crate::flight_state::crew_has_aircraft() {
+        None => true,
+        Some(owner) => {
+            crate::blackbox::record(
+                "autoflight",
+                json!({"event": "refused", "site": site, "owner": owner.name()}),
+            );
+            false
+        }
+    }
+}
+
+/// Climb or descend to `alt_ft` (the altimeter) at `fpm` and capture it:
+/// servos in, the window AT the level (the capture's, and toward the VS on
+/// an MCP that flies one only toward its window), V/S on, the wheel set
+/// after the engage (an engage syncs it away), the window read back. A
+/// primitive for the safe hold. `true` when the window and V/S read back.
+pub async fn climb_to(xp: &dyn XPlane, alt_ft: f64, fpm: f64, site: &str) -> bool {
+    if !writer_may_act(site) || !engage_confirmed(xp, site, 6.0).await {
+        return false;
+    }
+    let level = (alt_ft / 100.0).round() * 100.0;
+    let _ = set_dial(xp, Dial::Altitude, level).await;
+    let vs_on = ensure_on(xp, Button::VerticalSpeed, names::VS_STATUS, site, 3).await;
+    let _ = set_dial(xp, Dial::Vs, fpm).await;
+    let window = read_dial(xp, Dial::Altitude)
+        .await
+        .is_ok_and(|w| (w - level).abs() <= 50.0);
+    crate::blackbox::record(
+        "autoflight",
+        json!({"event": "climb_to", "site": site, "level": level, "fpm": fpm, "vs_on": vs_on, "window": window}),
+    );
+    vs_on && window
+}
+
 /// Every name the owner relies on for a profile that declares its panel,
 /// for the profile probe (`aircraft::profile_references`): the stock
 /// reads and commands behind the intent API.
+#[cfg_attr(not(test), allow(dead_code))] // offered to the other loops
 pub fn stock_references() -> &'static [&'static str] {
     &[
         names::AP_STATE,
@@ -864,11 +1144,13 @@ mod tests {
     fn every_mcp_write_goes_through_the_owner() {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
         let mut bad = Vec::new();
+        let mut scanned = Vec::new();
         for f in crate::test_support::rust_files(&root) {
             if crate::test_support::is_test_file(&f) || f.ends_with("autoflight.rs") {
                 continue;
             }
             let rel = f.strip_prefix(&root).unwrap().to_string_lossy().to_string();
+            scanned.push(rel.clone());
             let text = std::fs::read_to_string(&f).unwrap();
             let production = text.split("#[cfg(test)]\nmod ").next().unwrap();
             // cfg(test) items (the aliases tests assert on) are not production.
@@ -951,6 +1233,10 @@ mod tests {
                     ));
                 }
             }
+        }
+        // The safe hold and the recovery planner are writers like any other.
+        for f in ["safe_hold.rs", "recovery_plan.rs", "autoland.rs", "tools/full_auto.rs"] {
+            assert!(scanned.iter().any(|s| s == f), "{f} not scanned");
         }
         assert!(
             bad.is_empty(),
@@ -1401,6 +1687,40 @@ mod tests {
         let fake = FakeXPlane::new();
         assert_eq!(arm_approach(&fake, "test").await, None);
         assert!(!fake.ran(cmd::APPROACH), "unread: nothing pressed");
+    }
+
+    /// The ledger holds what WE did, from when: a press and a dial write
+    /// through the owner are on it, nothing before `since` is.
+    #[tokio::test]
+    async fn the_ledger_holds_our_presses_and_writes() {
+        let fake = FakeXPlane::new();
+        let t0 = std::time::Instant::now();
+        let _ = press(&fake, Button::AltitudeHold).await;
+        let _ = set_dial(&fake, Dial::Altitude, 4_321.0).await;
+        let ours = Ours(ours_since(t0).into_iter().map(|(_, c)| c).collect());
+        assert!(ours.pressed(Button::AltitudeHold));
+        assert!(ours.wrote(Dial::Altitude, 4_321.0, 1.0));
+        assert!(ours.mode_bits() & Modes::ALT_HOLD != 0);
+        let later = std::time::Instant::now();
+        assert!(!ours_since(later)
+            .iter()
+            .any(|(_, c)| *c == OurChange::Dial(Dial::Altitude, 4_321.0)));
+    }
+
+    /// The climb primitive: the window at the level, V/S on, the wheel after.
+    #[tokio::test]
+    async fn climb_to_sets_the_window_vs_and_wheel() {
+        let fake = FakeXPlane::with_reads(&[
+            (names::SERVOS_ON, 1.0),
+            (names::VS_STATUS, 0.0),
+            (crate::datarefs::AIRSPEED_KTS, 200.0),
+            (Dial::Altitude.read_name(), 6_000.0),
+        ]);
+        fake.set_on_command(cmd::VERTICAL_SPEED, names::VS_STATUS, 2.0);
+        fake.set_on_command(cmd::VERTICAL_SPEED, Dial::Vs.read_name(), 0.0);
+        assert!(climb_to(&fake, 6_049.0, 1_500.0, "test").await);
+        assert_eq!(fake.last_write(Dial::Altitude.read_name()), Some(6_000.0));
+        assert_eq!(fake.last_write(Dial::Vs.read_name()), Some(1_500.0));
     }
 
     #[tokio::test]

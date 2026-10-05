@@ -18,6 +18,7 @@ use serde_json::{json, Value};
 use super::{Tool, ToolCtx};
 use crate::aircraft::FuelSelectorProfile;
 use crate::full_auto::{Mission, Route};
+use crate::recovery_plan::Purpose;
 use crate::tools::autopilot::ApConfig;
 
 /// Which engine start a full-auto sequence runs — one per airframe CLASS, and
@@ -101,30 +102,12 @@ impl StartKind {
     }
 }
 
-/// A resume this near the plan's origin, abeam no leg, is a departure
-/// joining its first fix.
-const DEPARTURE_REJOIN_NM: f64 = 15.0;
-
-/// A resume this near the plan's destination, past the last enroute fix and
-/// abeam no leg, is the ARRIVAL: the approach to the plan's runway. LIPE-LIPK
-/// (2026-09-25): 6.6 nm from Forli at 2,800 ft over the coastal plain, the
-/// plan's last enroute fix LUMAV 51 nm behind, and the refusal said "climb
-/// to 7,500 feet first, the sector altitude" (the Apennines' 25 nm circle)
-/// and "request an approach"; the pilot's "land the aircraft" then
-/// self-picked Cervia.
-pub(crate) const ARRIVAL_REJOIN_NM: f64 = 25.0;
-
-/// Where an airborne resume joins the plan. Pure.
-#[derive(Debug, Clone, PartialEq)]
-pub(crate) enum ResumeJoin {
-    /// The enroute leg ending at this index.
-    Leg(usize),
-    /// Past the route, or on the plan's final, near the destination: fly
-    /// its arrival. `on_final`: how the final judged it, when it did.
-    Arrival { dist_nm: f64, on_final: Option<OnFinal> },
-    /// No flyable join; the line says why, with its number.
-    Refused(String),
-}
+/// A resume this near the plan's destination is its ARRIVAL: the approach
+/// to the plan's runway (`recovery_plan`, the planner's arrival radius for a
+/// resume). LIPE-LIPK (2026-09-25): 6.6 nm from Forli at 2,800 ft over the
+/// coastal plain, the refusal said "climb to 7,500 feet first, the sector
+/// altitude" and the pilot's "land the aircraft" then self-picked Cervia.
+pub(crate) const ARRIVAL_REJOIN_NM: f64 = crate::recovery_plan::RESUME_ARRIVAL_NM;
 
 /// The plan's landing runway as the resume judges a final against it: the
 /// threshold and the landing course, degrees true.
@@ -188,97 +171,32 @@ pub(crate) fn on_final(fc: &FinalCourse, lat: f64, lon: f64, track_true: f64) ->
         .then_some(OnFinal { along_nm, xtk_nm, track_off_deg })
 }
 
-/// The join for an airborne resume at (`lat`, `lon`): on the plan's final
-/// ([`on_final`], with the track `track_true` and the plan runway's
-/// `final_course`), the arrival; else abeam a leg inside the corridor, else
-/// direct to the first fix near the origin (LILB 2026-09-25; the SR22's 8 nm
-/// refusal climbing out of Samedan, LSZS 2026-09-24, is this case), else the
-/// arrival past the route near the destination, else the refusal, naming the
-/// destination's distance when it has nothing better. Pure.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn resume_join(
-    legs: &[crate::nav::ProcLeg],
-    waypoints: &[crate::simbrief::Waypoint],
-    destination: &str,
-    lat: f64,
-    lon: f64,
-    mag_var: Option<f64>,
-    final_course: Option<&FinalCourse>,
-    track_true: Option<f64>,
-) -> ResumeJoin {
-    // The final first: an earlier STAR leg abeam it is behind the flight.
-    let dest = waypoints
-        .last()
-        .filter(|d| d.ident.eq_ignore_ascii_case(destination));
-    if let (Some(d), Some(fc), Some(trk)) = (dest, final_course, track_true) {
-        let to_dest = crate::nav::haversine_nm(lat, lon, d.lat, d.lon);
-        if to_dest <= ARRIVAL_REJOIN_NM {
-            if let Some(f) = on_final(fc, lat, lon, trk) {
-                return ResumeJoin::Arrival { dist_nm: to_dest, on_final: Some(f) };
-            }
-        }
-    }
-    let why = match crate::interaction::rejoin_index(legs, lat, lon, mag_var) {
-        Ok(i) => return ResumeJoin::Leg(i),
-        Err(why) => why,
-    };
-    if legs.is_empty() || !lat.is_finite() || !lon.is_finite() {
-        return ResumeJoin::Refused(why);
-    }
-    if waypoints
-        .first()
-        .is_some_and(|o| crate::nav::haversine_nm(lat, lon, o.lat, o.lon) <= DEPARTURE_REJOIN_NM)
-    {
-        return ResumeJoin::Leg(0);
-    }
-    if let Some(d) = dest {
-        let to_dest = crate::nav::haversine_nm(lat, lon, d.lat, d.lon);
-        let last_fix = legs.iter().rev().find_map(|l| l.fix.as_ref());
-        let past_route =
-            last_fix.is_none_or(|f| to_dest < crate::nav::haversine_nm(f.lat, f.lon, d.lat, d.lon));
-        if to_dest <= ARRIVAL_REJOIN_NM && past_route {
-            return ResumeJoin::Arrival { dist_nm: to_dest, on_final: None };
-        }
-        return ResumeJoin::Refused(format!("{why} {} is {:.0} miles away.", d.ident, to_dest));
-    }
-    ResumeJoin::Refused(why)
-}
-
-/// The airborne resume's state gates, each naming itself: live, in the
-/// air, a thousand feet above the ground, wings level, at the airframe's
-/// floor. `None`: the aircraft may be resumed. Pure.
-pub(crate) fn resume_gate(
-    frozen: bool,
-    on_ground: bool,
-    agl_ft: f64,
-    bank: f64,
-    ias: f64,
-    speed_floor: f64,
-) -> Option<String> {
-    const NOT_TAKEN: &str = "I haven't taken control.";
+/// The airborne recovery's state gates, each naming itself: live, in the
+/// air, and flyable (`recover::unflyable`: a stall, slow under the
+/// configuration's floor, an upset). Everything else (low, off the route,
+/// behind it, a bank) is the planner's to fly from, never a refusal: "Resume
+/// needs a thousand feet" and "wings level first" left a descending 737 to
+/// nobody at LEMG (2026-10-05). `None`: the aircraft may be taken. Pure.
+pub(crate) fn resume_gate(frozen: bool, on_ground: bool, unflyable: Option<&str>) -> Option<String> {
     if frozen {
-        Some(format!("We're paused or in replay. Go back to live and ask again; {NOT_TAKEN}"))
+        Some("We're paused or in replay. Go back to live and ask again.".to_string())
     } else if on_ground {
         Some(
             "We're on the ground. Resume is for the air; say fly the flight plan for the \
              whole mission."
                 .to_string(),
         )
-    } else if agl_ft < 1000.0 {
-        Some(format!(
-            "Resume needs a thousand feet; we're {agl_ft:.0} feet above the ground. {NOT_TAKEN}"
-        ))
-    } else if bank.abs() > 20.0 {
-        Some(format!(
-            "Wings level first; we're in {:.0} degrees of bank. Then ask again. {NOT_TAKEN}",
-            bank.abs()
-        ))
-    } else if ias < speed_floor {
-        Some(format!(
-            "We're slow at {ias:.0} knots; resume needs {speed_floor:.0}. {NOT_TAKEN}"
-        ))
     } else {
-        None
+        unflyable.map(|u| {
+            let what = match u {
+                "stall" => "we're stalling",
+                "slow" => "we're slow for this configuration",
+                "bank" => "we're steeply banked",
+                "nose_high" => "the nose is high",
+                _ => "the nose is low",
+            };
+            format!("Not yet: {what}. Recover first, or say recover, then ask again.")
+        })
     }
 }
 
@@ -357,15 +275,28 @@ async fn steady_read(
     Some(Steady { t_s, lat, lon, alt_ft, vs_fpm, gs_kts: gs_ms * 1.943_844, track_true })
 }
 
-/// What an airborne resume arms: the route follower, or autoland on the
-/// plan's arrival runway.
+/// What the recovery planner arms (`recovery_plan`): the follower over the
+/// route (a climb first when below the way's floor) and then the arrival,
+/// autoland on the destination's approach now, or, for a landing request
+/// only, the nearest suitable runway and why not the destination.
 pub(crate) enum ResumeArm {
     Route(Mission, String),
     Arrival {
         dest: String,
-        rwy: String,
+        /// The plan's runway; `None` lets autoland pick the destination's
+        /// best end (the self-pick keeps to the destination).
+        rwy: Option<String>,
         ack: String,
     },
+    Nearest(String),
+}
+
+/// What a landing request armed through the planner.
+pub(crate) enum LandArm {
+    /// Flying to the destination: the line.
+    Armed(String),
+    /// The nearest suitable runway instead, and why.
+    Nearest(String),
 }
 
 pub struct FullAuto {
@@ -585,28 +516,12 @@ impl Tool for FullAuto {
                 Err(why) => return Ok(why),
             }
         } else if resume {
-            match self.build_resume_mission(ctx).await {
+            match self.build_recovery(ctx, Purpose::Resume).await {
                 Ok(ResumeArm::Route(m, ack)) => (m, ack),
                 Ok(ResumeArm::Arrival { dest, rwy, ack }) => {
-                    // The arrival is autoland's, as a planned arrival hands it
-                    // down: the plan's runway, never a self-pick.
-                    if crate::autoland::ACTIVE.load(std::sync::atomic::Ordering::SeqCst) {
-                        return Ok("I'm already landing.".to_string());
-                    }
-                    crate::autoland::run_autoland_scoped(
-                        ctx.config.xplane_base_url.clone(),
-                        crate::tools::autoland::apt_dat_path(),
-                        self.cfg.clone(),
-                        self.approach_ias,
-                        ctx.voice.cloned(),
-                        ctx.status.cloned(),
-                        Some(crate::autoland::PlannedRunway::at(&dest, &rwy)),
-                        ctx.xplane.cancellation(),
-                    );
-                    crate::flight::note_crew_takeover("resume_arrival");
-                    return Ok(ack);
+                    return Ok(self.arm_arrival(ctx, &dest, rwy.as_deref(), ack, "resume_arrival"));
                 }
-                Err(why) => return Ok(why),
+                Ok(ResumeArm::Nearest(why)) | Err(why) => return Ok(why),
             }
         } else if a.flight {
             match self.build_flight_mission(ctx).await {
@@ -637,6 +552,28 @@ impl Tool for FullAuto {
                 ));
             }
         }
+        let sub = self.sub_tools(mission);
+        if !crate::full_auto::start(
+            ctx.config.xplane_base_url.clone(),
+            ctx.config.clone(),
+            ctx.voice.cloned(),
+            sub,
+        ) {
+            return Ok(
+                "The previous automation is still stopping. Ask again once it has stopped."
+                    .to_string(),
+            );
+        }
+        Ok(ack)
+    }
+}
+
+impl FullAuto {
+
+    /// Every sub-tool a mission flies with, built from this airframe's
+    /// numbers: the one builder for the mission armed by voice and the
+    /// landing a recovery arms (`arm_landing`).
+    fn sub_tools(&self, mission: Mission) -> crate::full_auto::SubTools {
         let kind = start_kind(
             self.turboprop_start.is_some(),
             self.jet_start,
@@ -644,7 +581,7 @@ impl Tool for FullAuto {
             self.scripted_auto_start,
             self.airliner_start.is_some(),
         );
-        let sub = crate::full_auto::SubTools {
+        crate::full_auto::SubTools {
             lights: crate::tools::lights::SetLights::new(self.lights.clone()),
             flood: crate::tools::lights::SetFloodLights::new(
                 self.flood_dataref.clone(),
@@ -742,54 +679,157 @@ impl Tool for FullAuto {
             mission,
             power_up_first: self.power_up_first,
             engine_start_secs: kind.engine_start_secs(),
-        };
-        if !crate::full_auto::start(
-            ctx.config.xplane_base_url.clone(),
-            ctx.config.clone(),
-            ctx.voice.cloned(),
-            sub,
-        ) {
-            return Ok(
-                "The previous automation is still stopping. Ask again once it has stopped."
-                    .to_string(),
-            );
         }
-        Ok(ack)
     }
-}
 
-impl FullAuto {
-    /// An explicit resume uses only the plan on the shelf. It never refetches,
-    /// starts engines or walks the ground stages against an airborne aircraft.
-    /// Every refusal is blackboxed with its reason (five in a row over the
-    /// Gulf of Lion, 2026-09-16, and the debrief could not say why).
-    async fn build_resume_mission(
+    /// Arm autoland on the destination's approach, as a planned arrival
+    /// hands it down: the plan's runway when it names one, else the
+    /// destination's best end (the self-pick keeps to the destination).
+    fn arm_arrival(
         &self,
         ctx: &ToolCtx<'_>,
-    ) -> std::result::Result<ResumeArm, String> {
-        let built = self.resume_mission_checked(ctx).await;
-        match &built {
-            Ok(ResumeArm::Route(_, ack)) => {
-                crate::full_auto::event("resume", json!({ "ack": ack }))
+        dest: &str,
+        rwy: Option<&str>,
+        ack: String,
+        why: &'static str,
+    ) -> String {
+        if crate::autoland::ACTIVE.load(std::sync::atomic::Ordering::SeqCst) {
+            return "I'm already landing.".to_string();
+        }
+        crate::autoland::run_autoland_scoped(
+            ctx.config.xplane_base_url.clone(),
+            crate::tools::autoland::apt_dat_path(),
+            self.cfg.clone(),
+            self.approach_ias,
+            ctx.voice.cloned(),
+            ctx.status.cloned(),
+            rwy.map(|r| crate::autoland::PlannedRunway::at(dest, r)),
+            ctx.xplane.cancellation(),
+        );
+        crate::flight::note_crew_takeover(why);
+        ack
+    }
+
+    /// "Land the aircraft" through the planner: the plan's destination
+    /// from wherever we are (the climb, the join, its approach), or the
+    /// nearest suitable runway when the pilot asked for it or the
+    /// destination is impossible (`recovery_plan::landing_choice`).
+    pub(crate) async fn arm_landing(
+        &self,
+        ctx: &ToolCtx<'_>,
+    ) -> std::result::Result<LandArm, String> {
+        if crate::full_auto::running() {
+            return Err("I'm flying the plan already. Say my controls first to start over.".into());
+        }
+        match self.build_recovery(ctx, Purpose::Land).await? {
+            ResumeArm::Nearest(why) => Ok(LandArm::Nearest(why)),
+            ResumeArm::Arrival { dest, rwy, ack } => {
+                Ok(LandArm::Armed(self.arm_arrival(ctx, &dest, rwy.as_deref(), ack, "land_destination")))
             }
+            ResumeArm::Route(mission, ack) => {
+                let sub = self.sub_tools(mission);
+                if !crate::full_auto::start(
+                    ctx.config.xplane_base_url.clone(),
+                    ctx.config.clone(),
+                    ctx.voice.cloned(),
+                    sub,
+                ) {
+                    return Err("The previous automation is still stopping. Ask again once it has stopped.".into());
+                }
+                crate::flight::note_crew_takeover("land_destination");
+                Ok(LandArm::Armed(ack))
+            }
+        }
+    }
+
+    /// The recovery planner's arm, every outcome blackboxed with its reason
+    /// (five refusals in a row over the Gulf of Lion, 2026-09-16, and the
+    /// debrief could not say why).
+    async fn build_recovery(
+        &self,
+        ctx: &ToolCtx<'_>,
+        purpose: Purpose,
+    ) -> std::result::Result<ResumeArm, String> {
+        let built = self.recovery(ctx, purpose).await;
+        let land = purpose == Purpose::Land;
+        match &built {
+            Ok(ResumeArm::Route(_, ack)) => crate::full_auto::event(
+                if land { "land_route" } else { "resume" },
+                json!({ "ack": ack }),
+            ),
             Ok(ResumeArm::Arrival { dest, rwy, ack }) => crate::full_auto::event(
-                "resume_arrival",
+                if land { "land_arrival" } else { "resume_arrival" },
                 json!({ "dest": dest, "rwy": rwy, "ack": ack }),
             ),
-            Err(why) => crate::full_auto::event("resume_refused", json!({ "why": why })),
+            Ok(ResumeArm::Nearest(why)) => crate::full_auto::event("land_nearest", json!({ "why": why })),
+            Err(why) => crate::full_auto::event(
+                if land { "land_refused" } else { "resume_refused" },
+                json!({ "why": why }),
+            ),
         }
         built
     }
 
-    async fn resume_mission_checked(
+    /// The plan when none is on the shelf: fetched now (the SimBrief plan
+    /// IS the destination), published to the shelf, blackboxed `plan_fetch`
+    /// `fetched_airborne`. The line says why there is none.
+    async fn fetch_airborne(
         &self,
         ctx: &ToolCtx<'_>,
-    ) -> std::result::Result<ResumeArm, String> {
-        let fp = crate::simbrief::loaded_plan().ok_or_else(||
-            "No plan is loaded. I'm monitoring only; you have control. Load and review the flight plan first.".to_string())?;
-        if fp.source == crate::simbrief::PlanSource::Local {
-            return Err("This local route needs a fresh terrain-checked plan after interruption. I haven't taken control. Request an approach or land for me.".into());
+    ) -> std::result::Result<crate::simbrief::FlightPlan, String> {
+        if ctx.config.simbrief_id.trim().is_empty() {
+            return Err("No flight plan is loaded and no SimBrief ID is set.".into());
         }
+        match crate::simbrief::fetch(&ctx.config.simbrief_id).await {
+            Ok(fp) => {
+                crate::simbrief::publish_plan(&fp);
+                crate::full_auto::event(
+                    "plan_fetch",
+                    json!({ "outcome": "fetched_airborne", "origin": fp.origin,
+                            "destination": fp.destination, "route": fp.route }),
+                );
+                Ok(fp)
+            }
+            Err(e) => {
+                tracing::warn!("simbrief fetch failed: {e:#}");
+                crate::full_auto::event(
+                    "plan_fetch",
+                    json!({ "outcome": "failed_airborne", "error": format!("{e:#}") }),
+                );
+                Err("No flight plan is loaded, and SimBrief did not answer.".into())
+            }
+        }
+    }
+
+    /// FROM ANY AIRBORNE STATE, A SAFE PATH TO THE DESTINATION
+    /// (`recovery_plan`). The plan on the shelf, else fetched; the join
+    /// (`choose_join`: on the final, abeam a leg, the departure, the
+    /// arrival, else direct to the fix with the shortest way in); the way's
+    /// floor (the probe along it, else the grid MORA, else the fields'
+    /// MSA) and a climb first when below it, on a heading the climb clears;
+    /// refused only for the physically impossible, with the number (a
+    /// landing request then goes to the nearest runway). LEMG 2026-10-05:
+    /// three refusals in two minutes while the aircraft descended toward
+    /// the hills.
+    async fn recovery(
+        &self,
+        ctx: &ToolCtx<'_>,
+        purpose: Purpose,
+    ) -> std::result::Result<ResumeArm, String> {
+        use crate::recovery_plan as rp;
+        let land = purpose == Purpose::Land;
+        let (fp, fetched) = match crate::simbrief::loaded_plan() {
+            Some(p) => (p, false),
+            None => match self.fetch_airborne(ctx).await {
+                Ok(p) => (p, true),
+                Err(why) if land => return Ok(ResumeArm::Nearest(why)),
+                Err(why) => {
+                    return Err(format!(
+                        "{why} Load the flight plan, or say land for me for the nearest runway."
+                    ))
+                }
+            },
+        };
         let xp = crate::xplane::XPlaneClient::new(ctx.config.xplane_base_url.clone());
         let (ground, agl, lat, lon, altitude, bank, ias, frozen, engines, aircraft, mag_var) = tokio::join!(
             ctx.xplane.get_float(crate::datarefs::ON_GROUND_ANY),
@@ -812,20 +852,31 @@ impl FullAuto {
             ctx.xplane
                 .get_float("sim/flightmodel/position/magnetic_variation"),
         );
-        let Some([ground, agl, lat, lon, altitude, bank, ias]) =
-            crate::control::measurements("resume", [ground, agl, lat, lon, altitude, bank, ias])
-        else {
+        let (elevation, pitch, flap, stall, fuel_kg, flow) = tokio::join!(
+            ctx.xplane.get_float(crate::datarefs::ELEVATION_M),
+            ctx.xplane.get_float(crate::datarefs::PITCH_DEG),
+            ctx.xplane.get_float(crate::datarefs::FLAP_RATIO),
+            ctx.xplane.get_float("sim/cockpit2/annunciators/stall_warning_ratio"),
+            ctx.xplane.get_float(crate::datarefs::FUEL_TOTAL_KG),
+            ctx.xplane.get_float_array(crate::datarefs::FUEL_FLOW_KG_SEC),
+        );
+        let Some([ground, agl, lat, lon, altitude, bank, ias, elevation]) = crate::control::measurements(
+            "resume",
+            [ground, agl, lat, lon, altitude, bank, ias, elevation],
+        ) else {
             return Err("I can't verify the aircraft state. I haven't taken control; try again once the sim is connected.".into());
         };
         // The flight the rejoin is checked against, for the recheck below.
         let clock = std::time::Instant::now();
         let first_read = steady_read(&xp, clock).await;
-        // Each gate names itself: "stable flight" told a pilot in a 28 degree
-        // orbit nothing about what to change (2026-09-16).
-        let speed_floor =
-            crate::aircraft::floored_target(self.approach_ias, crate::aircraft::speed_floor_kts());
-        let agl_ft = agl * 3.28084;
-        if let Some(why) = resume_gate(frozen, ground > 0.5, agl_ft, bank, ias, speed_floor) {
+        let ok = |r: &anyhow::Result<f64>| r.as_ref().ok().copied().filter(|v| v.is_finite());
+        let flap = ok(&flap).unwrap_or(0.0);
+        let floor_kts = crate::aircraft::config_floor_kts(flap)
+            .or_else(crate::aircraft::speed_floor_kts)
+            .map(|f| f * 0.95);
+        let unflyable =
+            crate::tools::recover::unflyable(Some(ias), floor_kts, ok(&pitch), Some(bank), ok(&stall));
+        if let Some(why) = resume_gate(frozen, ground > 0.5, unflyable) {
             return Err(why);
         }
         let running = engines.as_ref().ok().map(|v| {
@@ -834,26 +885,38 @@ impl FullAuto {
                 .filter(|v| v.is_finite() && **v > 0.5)
                 .count()
         });
-        if running != Some(self.engines) {
-            return Err(match running {
-                Some(n) => format!(
-                    "I can confirm {n} of {} engine{} running. I haven't taken control; stabilise the aircraft first.",
+        match running {
+            Some(n) if n == self.engines => {}
+            Some(n) if land => {
+                return Ok(ResumeArm::Nearest(format!(
+                    "Only {n} of {} engines are running.",
+                    self.engines
+                )))
+            }
+            Some(n) => {
+                return Err(format!(
+                    "I can confirm {n} of {} engine{} running. Say land at the nearest for a diversion.",
                     self.engines,
                     if self.engines == 1 { "" } else { "s" }
-                ),
-                None => "I can't read the engines. I haven't taken control; try again once the sim answers.".into(),
-            });
-        }
-        match aircraft.as_ref().map(|a| a.trim().to_string()) {
-            Ok(a) if a.eq_ignore_ascii_case(&fp.aircraft) => {}
-            Ok(a) => {
-                return Err(format!(
-                    "The loaded plan is for a {}, and this is a {a}. Review a matching plan first; you have control.",
-                    fp.aircraft,
                 ))
             }
-            Err(_) => {
-                return Err("I can't read this aircraft's type to check it against the plan. I haven't taken control.".into())
+            None => {
+                return Err("I can't read the engines. I haven't taken control; try again once the sim answers.".into())
+            }
+        }
+        // The plan's numbers are its type's; a landing goes to the place.
+        if !land {
+            match aircraft.as_ref().map(|a| a.trim().to_string()) {
+                Ok(a) if a.eq_ignore_ascii_case(&fp.aircraft) => {}
+                Ok(a) => {
+                    return Err(format!(
+                        "The loaded plan is for a {}, and this is a {a}. Review a matching plan first; you have control.",
+                        fp.aircraft,
+                    ))
+                }
+                Err(_) => {
+                    return Err("I can't read this aircraft's type to check it against the plan. I haven't taken control.".into())
+                }
             }
         }
         let mut legs = crate::procedure::enroute_legs(
@@ -862,162 +925,248 @@ impl FullAuto {
             &fp.destination,
             fp.cruise_alt_ft,
         );
-        if matches!(fp.source, crate::simbrief::PlanSource::SimBrief) {
-            if let Some(dest) = fp
-                .waypoints
-                .last()
-                .filter(|w| w.ident.eq_ignore_ascii_case(&fp.destination))
-            {
-                crate::procedure::extend_to_arrival_gateway(&mut legs, dest);
-            }
+        let dest_wp = rp::destination_of(&fp.waypoints, &fp.destination).cloned();
+        if let Some(dest) = dest_wp.as_ref() {
+            crate::procedure::extend_to_arrival_gateway(&mut legs, dest);
         }
         // The OFP's planned steps, flown where it planned them (#101).
         record_step_climbs(&mut legs, &fp.schedule);
-        // Below the sector altitude of either field, a rejoin heading is
-        // never advice on its own: "steer 343 for WI506" from 3,000 ft west
-        // of Innsbruck pointed across the ridges, and the next thing the log
-        // shows is 971 ft above the ground in 28 degrees of bank (LOWI,
-        // 2026-09-24). Climb first, then the heading.
-        let msa_path = std::path::Path::new(&ctx.config.fix_data_path)
-            .with_file_name("earth_msa.dat")
-            .to_string_lossy()
-            .into_owned();
-        let low_msa = [&fp.origin, &fp.destination].into_iter().find_map(|icao| {
-            let msa = crate::nav::airport_msa_ft(&msa_path, icao)?;
-            (altitude < msa).then_some(msa)
-        });
         // The plan runway's final, read only near the destination: the
         // apt.dat scan takes a moment.
-        let near_dest = fp.waypoints.last().is_some_and(|d| {
-            d.ident.eq_ignore_ascii_case(&fp.destination)
-                && crate::nav::haversine_nm(lat, lon, d.lat, d.lon) <= ARRIVAL_REJOIN_NM
+        let near_dest = dest_wp.as_ref().is_some_and(|d| {
+            crate::nav::haversine_nm(lat, lon, d.lat, d.lon) <= rp::arrival_radius_nm(purpose)
         });
-        let final_fc = match (near_dest, fp.procedures.dest_rwy.clone()) {
-            (true, Some(rwy)) => {
-                let apt = ctx.config.apt_data_path.clone();
-                let dest = fp.destination.clone();
-                tokio::task::spawn_blocking(move || {
-                    let runways = crate::nav::find_runways(&apt, &dest).ok()?;
-                    final_course(&runways, &rwy)
-                })
+        let dest_runways = if near_dest || fp.procedures.dest_rwy.is_some() {
+            let apt = ctx.config.apt_data_path.clone();
+            let dest = fp.destination.clone();
+            tokio::task::spawn_blocking(move || crate::nav::find_runways(&apt, &dest).ok())
                 .await
                 .ok()
                 .flatten()
-            }
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        let final_fc = match (near_dest, fp.procedures.dest_rwy.as_deref()) {
+            (true, Some(rwy)) => final_course(&dest_runways, rwy),
             _ => None,
         };
         let track_true = first_read.map(|r| r.track_true);
-        let index = match resume_join(
+        let mag_var = mag_var.ok().filter(|v| v.is_finite());
+        let Some(join) = rp::choose_join(
             &legs,
             &fp.waypoints,
             &fp.destination,
             lat,
             lon,
-            mag_var.ok().filter(|v| v.is_finite()),
+            mag_var,
             final_fc.as_ref(),
             track_true,
-        ) {
-            ResumeJoin::Leg(i) => i,
-            ResumeJoin::Arrival { dist_nm, on_final } => {
-                crate::full_auto::event(
-                    "resume_join_arrival",
-                    json!({
-                        "dist_nm": dist_nm,
-                        "on_final": on_final.is_some(),
-                        "along_nm": on_final.map(|f| f.along_nm),
-                        "xtk_nm": on_final.map(|f| f.xtk_nm),
-                        "track_off_deg": on_final.map(|f| f.track_off_deg),
-                        "track_true": track_true,
-                        "course_true": final_fc.map(|f| f.course_true),
-                    }),
-                );
-                let Some(rwy) = fp.procedures.dest_rwy.clone() else {
-                    return Err(format!(
-                        "We're past the route, {dist_nm:.0} miles from {}, and the plan names no runway. I haven't taken control; say land for me.",
-                        fp.destination
-                    ));
-                };
-                let spoken = atc::atis::spoken_runway(&rwy);
-                let ack = match on_final {
-                    Some(f) => format!(
-                        "On the final for runway {spoken}, {:.0} miles out. Flying the approach to {}. Say my controls to take over.",
-                        f.along_nm, fp.destination,
-                    ),
-                    None => format!(
-                        "Past the route, {dist_nm:.0} miles from {}. Flying the approach to runway {spoken}. Say my controls to take over.",
-                        fp.destination,
-                    ),
-                };
-                return Ok(ResumeArm::Arrival { ack, dest: fp.destination.clone(), rwy });
+            purpose,
+        ) else {
+            return Err("The plan has no route and no destination I can fly to. Review the plan; you have control.".into());
+        };
+        // The way's floor: the ground along the path to the join, probed out
+        // to 40 nm (the follower's own floor watches the rest in flight),
+        // else the grid MORA along it, else the fields' sector altitude.
+        let true_ft = elevation * 3.280_84;
+        let agl_ft = agl * 3.280_84;
+        let (to_lat, to_lon) = rp::join_point(&join, &legs, dest_wp.as_ref()).unwrap_or((lat, lon));
+        let pts = rp::path_points(lat, lon, to_lat, to_lon);
+        let mut heights: Option<Vec<f64>> = Some(Vec::with_capacity(pts.len()));
+        for chunk in pts.chunks(crate::terrain::MAX_POINTS) {
+            match (crate::terrain::sample_ft(&xp, chunk).await, heights.as_mut()) {
+                (Some(h), Some(all)) => all.extend(h),
+                _ => heights = None,
             }
-            // Below the sector altitude a heading is never advice alone.
-            ResumeJoin::Refused(why) => {
-                return Err(match low_msa {
-                    Some(msa) => format!(
-                        "Climb to {} first, the sector altitude, before turning. {why}",
-                        crate::flightplan::spoken_feet(msa)
+        }
+        let under = true_ft - agl_ft;
+        let (floor_true, source) = match heights.as_ref().and_then(|h| h.iter().copied().reduce(f64::max)) {
+            Some(high) => (high.max(under) + crate::procedure::TERRAIN_CLEARANCE_FT, "terrain"),
+            None => {
+                let mora = crate::safe_hold::mora_grid().and_then(|g| {
+                    std::iter::once((lat, lon))
+                        .chain(pts.iter().copied())
+                        .filter_map(|(a, b)| g.at(a, b))
+                        .reduce(f64::max)
+                });
+                let msa_path = std::path::Path::new(&ctx.config.fix_data_path)
+                    .with_file_name("earth_msa.dat")
+                    .to_string_lossy()
+                    .into_owned();
+                let msa = [&fp.origin, &fp.destination]
+                    .into_iter()
+                    .filter_map(|icao| crate::nav::airport_msa_ft(&msa_path, icao))
+                    .reduce(f64::max);
+                match (mora, msa) {
+                    (Some(m), _) => (m.max(under + crate::procedure::TERRAIN_CLEARANCE_FT), "mora"),
+                    (None, Some(m)) => (m, "msa"),
+                    (None, None) => return Err(
+                        "The terrain probe isn't answering and I have no grid MORA, so I can't check the way. Check the plugin build on the Health screen.".into(),
                     ),
-                    None => why,
-                })
+                }
             }
         };
+        let floor_ind = floor_true + (altitude - true_ft);
+        let climb = rp::climb_first(altitude, floor_ind);
+        // Only the physically impossible is refused.
+        let flow_kg_s: Option<f64> = flow
+            .ok()
+            .map(|v| v.iter().filter(|x| x.is_finite() && **x > 0.0).sum::<f64>())
+            .filter(|f| *f > 0.0);
+        let endurance_min = match (ok(&fuel_kg), flow_kg_s) {
+            (Some(kg), Some(f)) => Some(kg / f / 60.0),
+            _ => None,
+        };
+        let gs_kts = first_read.map(|r| r.gs_kts).unwrap_or(ias);
+        let to_go = rp::to_go_nm(&join, &legs, dest_wp.as_ref(), lat, lon);
+        let runway = fp.procedures.dest_rwy.as_deref().and_then(|rwy| {
+            let r = dest_runways.iter().find(|r| {
+                crate::nav::same_runway_end(&r.ident_a, rwy) || crate::nav::same_runway_end(&r.ident_b, rwy)
+            })?;
+            let have = crate::nav::haversine_nm(r.lat_a, r.lon_a, r.lat_b, r.lon_b) * 1852.0;
+            let need = crate::aircraft::landing_needed_m(crate::aircraft::landing_distance_m(), None, 0.0);
+            (need > 0.0).then_some((rwy, have, need))
+        });
+        crate::full_auto::event(
+            "recovery_plan",
+            json!({
+                "purpose": if land { "land" } else { "resume" }, "join": join.word(),
+                "join_fix": join.leg_index().and_then(|i| legs.get(i)).map(|l| l.fix_ident.clone()),
+                "floor_ft": floor_true.round(), "floor_source": source, "climb_ft": climb,
+                "alt_ft": altitude.round(), "to_go_nm": to_go.round(), "endurance_min": endurance_min.map(f64::round),
+                "fetched": fetched, "destination": fp.destination,
+            }),
+        );
+        if let Some(why) = rp::impossible(
+            &fp.destination,
+            climb.unwrap_or(0.0),
+            self.cfg.service_ceiling_ft,
+            endurance_min,
+            to_go,
+            gs_kts,
+            runway,
+        ) {
+            return if land {
+                Ok(ResumeArm::Nearest(why))
+            } else {
+                Err(format!("{why} I'm not flying there; say land at the nearest for a diversion."))
+            };
+        }
+        // The climb first, on the way's own bearing when the climb clears
+        // its ground, else on the clear heading nearest it.
+        let brg = crate::nav::bearing_deg(lat, lon, to_lat, to_lon);
+        let mut climb_heading_mag: Option<f64> = None;
+        let climb_leg = match climb {
+            None => None,
+            Some(alt) => {
+                let grad = crate::safe_hold::gradient_ft_nm(self.cfg.climb.max_climb_fpm, gs_kts);
+                let path_ray = heights.as_ref().map(|h| crate::safe_hold::Ray {
+                    bearing_true: brg,
+                    ground_ft: pts
+                        .iter()
+                        .map(|&(a, b)| crate::nav::haversine_nm(lat, lon, a, b))
+                        .zip(h.iter().copied())
+                        .collect(),
+                });
+                let clears = path_ray
+                    .as_ref()
+                    .is_none_or(|r| crate::safe_hold::climb_clears(r, true_ft, grad, true));
+                let mut course_true = brg;
+                let mut alt = alt;
+                if !clears {
+                    let air = crate::safe_hold::Air {
+                        lat,
+                        lon,
+                        alt_ft: altitude,
+                        alt_true_ft: true_ft,
+                        agl_ft,
+                        gs_kts,
+                        track_true: brg,
+                        mag_var: mag_var.unwrap_or(0.0),
+                        ..Default::default()
+                    };
+                    let fan = crate::safe_hold::probe_fan(&xp, &air).await;
+                    if let Some((b, need)) = crate::safe_hold::clear_heading(&fan, &air, floor_true, grad) {
+                        course_true = b;
+                        alt = alt.max(crate::safe_hold::up_100(need + (altitude - true_ft)));
+                    }
+                }
+                let course_mag = crate::runway::true_to_mag(course_true, mag_var.unwrap_or(0.0)).round();
+                climb_heading_mag = Some(course_mag);
+                Some(rp::climb_leg(course_mag, alt))
+            }
+        };
+        let climb_words = match (&climb_leg, climb_heading_mag) {
+            (Some(l), Some(h)) => format!(
+                "Climbing to {} first, heading {:03}, the safe altitude on the way. ",
+                crate::flightplan::spoken_feet(l.alt1_ft.unwrap_or(0.0)),
+                (h.round() as i64).rem_euclid(360)
+            ),
+            _ => String::new(),
+        };
+        let lead = if fetched {
+            format!("Fetched your plan, {} to {}. ", fp.origin, fp.destination)
+        } else {
+            String::new()
+        };
+        // The arrival now, with nothing to climb first: autoland's.
+        let arrival_join = matches!(join, rp::Join::OnFinal { .. } | rp::Join::Arrival { .. });
+        if arrival_join && climb_leg.is_none() {
+            let rwy = fp.procedures.dest_rwy.clone();
+            let ack = match (&join, rwy.as_deref()) {
+                (rp::Join::OnFinal { along_nm, .. }, Some(r)) => format!(
+                    "{lead}On the final for runway {}, {along_nm:.0} miles out. Flying the approach to {}. Say my controls to take over.",
+                    atc::atis::spoken_runway(r),
+                    fp.destination,
+                ),
+                (rp::Join::Arrival { dist_nm }, Some(r)) => format!(
+                    "{lead}{dist_nm:.0} miles from {}. Flying the approach to runway {}. Say my controls to take over.",
+                    fp.destination,
+                    atc::atis::spoken_runway(r),
+                ),
+                (_, None) => format!(
+                    "{lead}{to_go:.0} miles from {}. Flying the approach to its best runway for the wind. Say my controls to take over.",
+                    fp.destination,
+                ),
+                _ => format!("{lead}Flying the approach to {}. Say my controls to take over.", fp.destination),
+            };
+            return Ok(ResumeArm::Arrival { ack, dest: fp.destination.clone(), rwy });
+        }
         // Clamped before the drain: a resume inside the arrival still owes
         // the restrictions ahead, and the profile rule runs from the STAR's
         // first fix.
         let (arrival_constraints, _) =
             crate::plan_audit::arrival_restrictions(&ctx.config.cifp_dir, &fp, &mut legs);
-        legs.drain(..index);
-        let first = legs.first().unwrap();
-        let fix = first.fix.as_ref().unwrap();
-        let distance = crate::nav::haversine_nm(lat, lon, fix.lat, fix.lon);
-        if distance > 30.0 {
-            return Err(format!(
-                "{} is {distance:.0} miles away; I check the rejoin terrain within 30. I haven't taken control; follow the GPS or request an approach.",
-                fix.ident
-            ));
-        }
-        let target = first.alt1_ft.unwrap_or(fp.cruise_alt_ft);
-        if !target.is_finite() || target <= 0.0 || target > self.cfg.service_ceiling_ft {
-            return Err(format!(
-                "The plan's {target:.0} feet at {} is outside this aircraft's {:.0} foot ceiling. Review the plan; you have control.",
-                fix.ident, self.cfg.service_ceiling_ft
-            ));
-        }
-        // Use the LOWER of present/target true altitude over the complete join.
-        let true_ft = xp
-            .get_float("sim/flightmodel/position/elevation")
-            .await
-            .map_err(|_| "True altitude unavailable; I haven't taken control.".to_string())?
-            * 3.28084;
-        let floor = altitude.min(target) + (true_ft - altitude) - 1000.0;
-        if !floor.is_finite() {
-            return Err("Altitude unavailable; I haven't taken control.".into());
-        }
-        let count = ((distance * 1852.0 / 150.0).ceil() as usize).max(1);
-        let points: Vec<_> = (0..=count)
-            .map(|i| {
-                let f = i as f64 / count as f64;
-                (lat + (fix.lat - lat) * f, lon + (fix.lon - lon) * f)
-            })
-            .collect();
-        for chunk in points.chunks(crate::terrain::MAX_POINTS) {
-            let terrain = crate::terrain::sample_ft(&xp, chunk).await.ok_or_else(||
-                "The terrain probe isn't answering, so I can't check the rejoin. I haven't taken control. Check the plugin build on the Health screen.".to_string())?;
-            if terrain.iter().any(|h| !h.is_finite()) {
-                return Err("The terrain probe gave no answer on part of the rejoin. I haven't taken control.".into());
+        let fix_name = |i: usize| legs.get(i).map(|l| l.fix_ident.clone()).unwrap_or_default();
+        let join_words = match &join {
+            rp::Join::Abeam(i) => format!("Rejoining the route toward {}", fix_name(*i)),
+            rp::Join::Departure => format!("Joining the route at {}", fix_name(0)),
+            rp::Join::Direct { index, dist_nm, .. } => {
+                format!("Direct {}, {dist_nm:.0} miles", fix_name(*index))
             }
-            if let Some(high) = terrain
-                .iter()
-                .copied()
-                .filter(|h| *h > floor)
-                .reduce(f64::max)
-            {
+            rp::Join::OnFinal { .. } | rp::Join::Arrival { .. } => {
+                format!("Then the arrival into {}, {to_go:.0} miles", fp.destination)
+            }
+        };
+        let mut legs = match join.leg_index() {
+            Some(i) => {
+                legs.drain(..i.min(legs.len()));
+                legs
+            }
+            None => Vec::new(),
+        };
+        if let Some(first) = legs.first() {
+            let target = first.alt1_ft.unwrap_or(fp.cruise_alt_ft);
+            if !target.is_finite() || target <= 0.0 || target > self.cfg.service_ceiling_ft {
                 return Err(format!(
-                    "The ground rises to {high:.0} feet on the way to {}, inside a thousand feet of {:.0}. I haven't taken control.",
-                    fix.ident,
-                    altitude.min(target)
+                    "The plan's {target:.0} feet at {} is outside this aircraft's {:.0} foot ceiling. Review the plan; you have control.",
+                    first.fix_ident, self.cfg.service_ceiling_ft
                 ));
             }
+        }
+        if let Some(c) = climb_leg {
+            legs.insert(0, c);
         }
         let apt = ctx.config.apt_data_path.clone();
         let cifp = ctx.config.cifp_dir.clone();
@@ -1044,7 +1193,10 @@ impl FullAuto {
             );
             return Err(why);
         }
-        let ack = format!("Resuming toward {} at {:.0} feet, continuing to {} and the arrival. {} Say my controls to take over.", fix.ident,target,fp.destination,arrival);
+        let ack = format!(
+            "{lead}{climb_words}{join_words}, continuing to {} and the arrival. {arrival} Say my controls to take over.",
+            fp.destination
+        );
         // THE one payload builder, never a hand-rolled join. This site had a
         // byte-identical copy of its entry format without the middle-thinning
         // or the 511-byte cap, so a resume overwrote full auto's fitted
@@ -1079,6 +1231,7 @@ impl FullAuto {
                 origin_rwy: None,
                 legs,
                 fms_payload: payload,
+                // A joined route is checked here, on the way flown.
                 local_runway: None,
                 sid: None,
                 // Airborne: no clearance to ask for.
@@ -1849,6 +2002,7 @@ pub fn spoken_arm_line(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::recovery_plan::Join;
 
     #[test]
     fn take_us_to_is_checked_against_the_plan() {
@@ -1956,6 +2110,23 @@ mod tests {
             .collect()
     }
 
+    /// The recovery planner's join for a resume (`recovery_plan::choose_join`).
+    fn resume_join(
+        legs: &[crate::nav::ProcLeg],
+        waypoints: &[crate::simbrief::Waypoint],
+        destination: &str,
+        lat: f64,
+        lon: f64,
+        mag_var: Option<f64>,
+        fc: Option<&FinalCourse>,
+        trk: Option<f64>,
+    ) -> Join {
+        crate::recovery_plan::choose_join(
+            legs, waypoints, destination, lat, lon, mag_var, fc, trk, Purpose::Resume,
+        )
+        .expect("a join")
+    }
+
     /// The two recorded resume refusals of #67, joined from their positions.
     /// LSZS-LILO (SR22, 2026-09-24, t 1790265324.8): 3.3 nm out of Samedan at
     /// 7,412 ft, "8 miles right of course on the 4634N01010E to 4626N01003E
@@ -1979,10 +2150,7 @@ mod tests {
         let (lat, lon) = (46.57445, 9.93876);
         assert!(crate::interaction::rejoin_index(&legs, lat, lon, None)
             .is_err_and(|w| w.contains("4634N01010E to 4626N01003E")));
-        assert_eq!(
-            resume_join(&legs, &lszs, "LILO", lat, lon, None, None, None),
-            ResumeJoin::Leg(0)
-        );
+        assert_eq!(resume_join(&legs, &lszs, "LILO", lat, lon, None, None, None), Join::Departure);
 
         let lipk = plan(&[
             ("LIPE", 44.5309, 11.2922),
@@ -1993,20 +2161,20 @@ mod tests {
         let legs = crate::procedure::enroute_legs(&lipk, "LIPE", "LIPK", 5000.0);
         let (lat, lon) = (44.13632, 12.20075);
         match resume_join(&legs, &lipk, "LIPK", lat, lon, None, None, None) {
-            ResumeJoin::Arrival { dist_nm, .. } => assert!((6.0..7.0).contains(&dist_nm), "{dist_nm}"),
+            Join::Arrival { dist_nm } => assert!((6.0..7.0).contains(&dist_nm), "{dist_nm}"),
             other => panic!("the arrival, not {other:?}"),
         }
-        // Past the route but 30 nm out: refused, and the refusal names the
-        // destination's distance.
+        // Past the route and 29 nm out, refused as "LIPK is 29 miles away"
+        // until 2026-10-05: its fixes are 40 nm back, so the arrival direct.
         match resume_join(&legs, &lipk, "LIPK", 43.75, 12.35, None, None, None) {
-            ResumeJoin::Refused(why) => assert!(why.contains("LIPK is 29 miles away"), "{why}"),
-            other => panic!("refused, not {other:?}"),
+            Join::Arrival { dist_nm } => assert!((28.0..31.0).contains(&dist_nm), "{dist_nm}"),
+            other => panic!("the arrival direct, not {other:?}"),
         }
-        // Back up the route, farther from the field than LUMAV is, is not
-        // past it: the corridor refusal stands.
+        // Back up the route, beside it outside the corridor: direct too,
+        // never a refusal.
         assert!(matches!(
             resume_join(&legs, &lipk, "LIPK", 44.95, 11.2, None, None, None),
-            ResumeJoin::Refused(_)
+            Join::Direct { .. }
         ));
     }
 
@@ -2044,41 +2212,38 @@ mod tests {
         let join = |lat, lon, fc: Option<&FinalCourse>, trk| {
             resume_join(&legs, &fp.waypoints, &fp.destination, lat, lon, Some(-1.0), fc, trk)
         };
-        // As flown: no final to judge against, the corridor refusal.
-        match join(lat, lon, None, Some(trk)) {
-            ResumeJoin::Refused(why) => assert!(why.contains("PUFAX to HON"), "{why}"),
-            other => panic!("the recorded refusal, not {other:?}"),
-        }
-        // With the plan runway's final: the arrival, 12 miles out on the line.
+        // As flown, no final to judge against: the recorded refusal ("4
+        // miles left of course on the PUFAX to HON leg") is now the arrival,
+        // 13 nm from EGBB.
+        assert!(matches!(join(lat, lon, None, Some(trk)), Join::Arrival { .. }));
+        // With the plan runway's final: on it, 12 miles out on the line.
         match join(lat, lon, Some(&fc), Some(trk)) {
-            ResumeJoin::Arrival { dist_nm, on_final: Some(f) } => {
+            Join::OnFinal { dist_nm, along_nm } => {
                 assert!((12.0..14.0).contains(&dist_nm), "{dist_nm}");
-                assert!((11.0..13.0).contains(&f.along_nm), "{f:?}");
+                assert!((11.0..13.0).contains(&along_nm), "{along_nm}");
+                let f = on_final(&fc, lat, lon, trk).unwrap();
                 assert!(f.xtk_nm.abs() < 0.5, "{f:?}");
                 assert!(f.track_off_deg < 2.0, "{f:?}");
             }
-            other => panic!("the arrival, not {other:?}"),
+            other => panic!("the final, not {other:?}"),
         }
-        // Crossing the final, not flying it: the refusal stands.
-        assert!(matches!(join(lat, lon, Some(&fc), Some(240.0)), ResumeJoin::Refused(_)));
+        // Crossing the final, not flying it: the arrival, never the final.
+        assert!(matches!(join(lat, lon, Some(&fc), Some(240.0)), Join::Arrival { .. }));
         // No track read: never judged a final.
-        assert!(matches!(join(lat, lon, Some(&fc), None), ResumeJoin::Refused(_)));
+        assert!(matches!(join(lat, lon, Some(&fc), None), Join::Arrival { .. }));
         // Aligned but 5 nm beside the centreline, outside the corridor.
         let (olat, olon) = crate::nav::project_latlon(lat, lon, fc.course_true + 90.0, 5.0);
-        assert!(!matches!(
-            join(olat, olon, Some(&fc), Some(trk)),
-            ResumeJoin::Arrival { on_final: Some(_), .. }
-        ));
+        assert!(!matches!(join(olat, olon, Some(&fc), Some(trk)), Join::OnFinal { .. }));
         // Past the threshold on the runway's heading: behind the final.
         let (plat, plon) = crate::nav::project_latlon(fc.thr_lat, fc.thr_lon, fc.course_true, 6.0);
-        assert!(!matches!(
-            join(plat, plon, Some(&fc), Some(trk)),
-            ResumeJoin::Arrival { on_final: Some(_), .. }
-        ));
+        assert!(!matches!(join(plat, plon, Some(&fc), Some(trk)), Join::OnFinal { .. }));
         // Too far out: 30 nm on the extended centreline is not the arrival.
         let (flat, flon) =
             crate::nav::project_latlon(fc.thr_lat, fc.thr_lon, fc.course_true + 180.0, 30.0);
-        assert!(!matches!(join(flat, flon, Some(&fc), Some(trk)), ResumeJoin::Arrival { .. }));
+        assert!(!matches!(
+            join(flat, flon, Some(&fc), Some(trk)),
+            Join::Arrival { .. } | Join::OnFinal { .. }
+        ));
     }
 
     fn steady(t_s: f64, lat: f64, lon: f64, alt_ft: f64, vs: f64, gs: f64, trk: f64) -> Steady {

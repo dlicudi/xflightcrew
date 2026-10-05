@@ -77,10 +77,12 @@ mod radiofx;
 mod rapport;
 mod roll_steer;
 mod readback;
+mod recovery_plan;
 mod reversal;
 mod route_finder;
 mod router;
 mod runway;
+mod safe_hold;
 mod settings;
 mod shortcuts;
 mod simbrief;
@@ -679,6 +681,17 @@ async fn main() -> Result<()> {
             ));
         });
     }
+
+    // The safe hold: an airborne aircraft nobody flies is never left flying
+    // into the ground, from the first second of the process (a restart
+    // mid-flight is exactly when nothing else holds it, LEMG 2026-10-05).
+    // Its own thread, never stood down, independent of the monitor switch.
+    safe_hold::spawn(
+        config.clone(),
+        live_profile.clone(),
+        voice.clone(),
+        status_sink.clone(),
+    );
 
     if config.ui == "tui" {
         // TUI: the voice loop and the health poll run on background threads,
