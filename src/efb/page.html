@@ -839,7 +839,15 @@ form.say .send { min-height: 52px; }
   // ------------------------------------------------------------ transcript
   function line(r, chan) {
     var row = el('div', 'ln ' + r.cls + (r.dim ? ' dim' : ''));
-    var t = el('span', 't num', hhmm(r.t));
+    // The colon gets the frequency's tight cell: B612 Mono gives
+    // punctuation a full cell, and "09:59" read as "09: 59".
+    var t = el('span', 't num'), hm = hhmm(r.t), ci = hm.indexOf(':');
+    if (ci > 0) {
+      t.appendChild(document.createTextNode(hm.slice(0, ci)));
+      t.appendChild(el('span', 'dp', ':'));
+      t.appendChild(document.createTextNode(hm.slice(ci + 1)));
+      t.setAttribute('aria-label', hm);
+    } else t.textContent = hm;
     t.title = zulu(r.t);
     row.appendChild(t);
     var ft = el('span', 'ft', r.from + ' ');
