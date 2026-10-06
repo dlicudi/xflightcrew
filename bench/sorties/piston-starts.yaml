@@ -1,0 +1,20 @@
+# The piston start's readbacks (#225): each airframe loaded cold on a
+# LXGB stand, "start the engines", and the start_item records checked for
+# a false "didn't" (the mags on a twin read ignition_key 3 on every engine).
+#   xvl sortie bench/sorties/piston-starts.yaml
+after: stop
+
+cases:
+  - name: 172 LXGB cold start
+    setup:
+      aircraft: "Aircraft/Laminar Research/Cessna 172 SP/Cessna_172SP.acf"
+      ramp: { field: LXGB }
+    command: start the engines
+    deadline_min: 1.5
+
+  - name: Baron LXGB cold start
+    setup:
+      aircraft: "Aircraft/Laminar Research/Beechcraft Baron 58/Baron_58.acf"
+      ramp: { field: LXGB }
+    command: start the engines
+    deadline_min: 2
