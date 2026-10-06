@@ -321,6 +321,7 @@
     #[test]
     fn a_committed_flare_stays_committed() {
         let book = Some(4750.0 * M_PER_FT);
+        let need = Some(wheels_need_m(book, None));
         let over = Guidance {
             target_heading_deg: 120.0,
             target_vs_fpm: 1000.0,
@@ -335,16 +336,16 @@
         assert_eq!((first.phase, first.balk), (ApproachPhase::Flare, None));
         let fresh = commit_flare(over, true, 46.1, 150.0, 25.0, 1409.0, book, 297.7);
         assert_eq!(fresh.balk, Some("overflew_the_runway"), "as flown: released");
-        let held = commit_flare_latched(over, true, true, 46.1, 150.0, 25.0, 1409.0, book, 297.7);
+        let held = commit_flare_latched(over, true, need, 46.1, 150.0, 25.0, 1409.0, book, 297.7);
         assert_eq!((held.phase, held.balk), (ApproachPhase::Flare, None));
         assert!(held.arresting);
         // Past the ground roll (1,448 m less the 291 m air segment): around.
-        let short = commit_flare_latched(over, true, true, 30.0, 150.0, 25.0, 1100.0, book, 297.7);
+        let short = commit_flare_latched(over, true, need, 30.0, 150.0, 25.0, 1100.0, book, 297.7);
         assert_eq!(short.balk, Some("overflew_the_runway"));
         // Never above the band, latched or not.
         let (_, band) = arrest_gates_ft(25.0, 150.0);
         let high =
-            commit_flare_latched(over, true, true, band + 1.0, 150.0, 25.0, 2000.0, book, 297.7);
+            commit_flare_latched(over, true, need, band + 1.0, 150.0, 25.0, 2000.0, book, 297.7);
         assert_eq!(high.balk, Some("overflew_the_runway"));
     }
 

@@ -14060,3 +14060,45 @@ pattern law (join point no closer than the FAP, 5 nm) cannot fly, so a 737's
 09 pattern still bases over R-164 when the ground raises its platform. With
 the gateway on the path it arrives 600 to 2,200 ft over its platform and
 no longer extends or holds; check the blackbox before calling it fixed.
+## 2026-10-06: LXGB 09, a float to 631 m and a go-around at 4.5 ft toward the Rock (737)
+
+Sortie 1791275171-full_auto, the stock 737 into Gibraltar 09, wet (09011KT -RA): 1,763 m of strip,
+the threshold displaced 136 m, 1,627 m available against the POM's 1,634. On speed over the
+threshold (145.5 kt against the 145 approach speed, 45 ft over the displaced threshold), the arrest
+took the servos at 79.8 ft, 273 m short of it, and the flare (Flare phase from 36 ft) floated: 20 ft
+at 247 m past the threshold, 10 ft at 364, 5 ft at 505. The final's air read rough (82 fpm rms), so
+the column held 0.30 from 20 ft while the model's ask fell to zero (`flare_ask` 0.00 from 7 ft; the
+sink went -244 at 10.6 ft to -44 at 4.5 against a target of -180). The lever held 0.33 by the height
+key to 20 ft and by the time key to 10.6 (radio over sink stays near 3 s on a 6 s exponential), then
+the float key walked it at the timed cap, 0.04 a second, to 0.25. At 4.5 ft, 0.3535 nm past the
+strip's end, the flare zone's 0.35 nm ended and `overflew_the_runway` stood: the committed flare's
+need there is the book less the air flown (1,369 m), 1,109 m were ahead, and 1,343 even latched.
+"Going around. Full power, climbing straight ahead." toward the Rock; the AP came back, the column
+let go, the wheels touched 1.6 s later at 143 fpm and 136 kt (`balk_landed`, 995.6 m ahead) and
+the rollout stopped it in about 540 m with reverse. The pilot's tool: 604 m past the threshold.
+
+LXGB's flare fits its own plant (5,500 fpm per unit, 1.35 s dead, trim -850; 22 fpm rms open
+loop) and the law as flown, fed the recorded sinks, writes the recorded elevator. Through that fit
+and the recorded air the law as flown floats past 700 m (`the_lxgb_float_lands_in_the_touchdown_zone`).
+
+**The float.** The 737's exponential asks 150 fpm plus 60 / tau a foot, so the 6 s flare is 5 s
+from 20 ft to the wheels: `tau_s` 5.5. A float's thrust comes off at its own rate
+(`retard_float_per_s` 0.08, the roundout's float too), the timed retard keeping 0.04. Replayed:
+477 m and 101 fpm in rough air, 468 m and 148 fpm smooth (the touchdown zone, a third of 1,627, is
+542); shorter at every plant from 4,500 to 5,500 fpm and 1.2 to 1.6 s, never past 300 fpm. The
+other replays: LEMG 13's sixteen 244 mean, 289 worst (277); the 2026-09-26 gates through every
+plant 339 worst (316); EGBB 15 310 (318). The column's rough-air hold stands (a float is the
+retard's, never the column's); the replays that prove the laws as flown fly the 6 s law
+(`model_as_flown`).
+
+**The balk.** Decided once at the roundout gate (`landing_call`, blackbox `landing_call` with
+`touchdown_m`, `remaining_m`, `need_m`, `air_s`): the flare the law flies from this height and
+groundspeed (`flare_time_s`) plus half a second a knot over the approach speed, from this position;
+the touchdown must leave the airframe's ROLL (`wheels_need_m`, profile `landing_roll_ft`; the 737's
+2,600 ft is the POM's factored 5,360 x 0.6, less the 955 ft of air, x 1.15 wet), else "Long landing.
+Going around." with height in hand (`GoAroundLatch::order`). A LAND latches the commit
+(`commit_flare_latched` takes the committed need): LXGB's gate predicts 542 m past the displaced
+threshold and 1,085 m ahead against 792, and the 4.5 ft balk becomes a flare down the course. No
+room for the roll is still a go-around; nothing changes for an airframe without a declared roll.
+Tests: `lxgb09_landing_call_tests`, `the_lxgb_plant_is_fitted_to_its_own_flare`,
+`the_lxgb_float_lands_in_the_touchdown_zone`. Offline only.

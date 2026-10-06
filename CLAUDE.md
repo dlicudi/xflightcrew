@@ -468,13 +468,15 @@ everything blackboxes to `logs/blackbox.jsonl`. A record's kind is the first arg
   at the wheels** (`disconnect_autopilot`). **Once taken, the servos stay out** (`hold_roundout`).
 - **A model flare holds its column in rough air** (`FlareModel::step` `rough`). **The retard is
   keyed on height, time and speed, never on the sink the arrest removes** (`FlarePower`); **a FLOAT
-  takes the thrust off**.
+  takes the thrust off** (at its own `retard_float_per_s`).
 - **The heading knob is set, not rewritten** (`heading_bug::BugHold`); short final and flare still
   steer every tick.
 - **In the flare the column only comes BACK** (`FlarePitch::step` `ratchet`): forward column a few
   feet up is a nosewheel landing. **Except on a RATE plant** (`flare_elevator.model.rate`).
 - **A low flare with room to stop is COMMITTED** (`autoland::commit_flare`) and **stays committed**
-  (`commit_flare_latched`). **A low balk is called on the radio only once it CLIMBS** (`BalkWatch`).
+  (`commit_flare_latched`). **The go/no-go is decided at the roundout gate, never at 4 ft**
+  (`landing_call`, where `landing_roll_ft` is declared): the predicted touchdown must leave the ROLL,
+  else "Long landing. Going around." with height in hand; a LAND commits the flare. **A low balk is called on the radio only once it CLIMBS** (`BalkWatch`).
 - A debrief touchdown is the steepest recent sink (`instructor::touchdown_sink_fpm`).
 
 ### Taxi in

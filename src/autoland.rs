@@ -1569,6 +1569,8 @@ fn spawn_autoland(launch: AutolandLaunch) {
             let mut flaring = false;
             // This flare was committed (`commit_flare_latched`).
             let mut flare_committed = false;
+            // The roundout gate's go/no-go for this approach (`landing_call`).
+            let mut landing_called: Option<LandingCall> = None;
             let mut pitch_yielded = false;
             // The arrest has the servos (see `arrest_hands_step`); the
             // wings-level law that holds the track while it does; the
@@ -2346,10 +2348,56 @@ fn spawn_autoland(launch: AutolandLaunch) {
                 }
                 roundout_held = held_now;
                 let raw = held;
+                // THE GO/NO-GO, once, at the roundout gate, on an airframe
+                // that declares its landing roll (`landing_call`): the
+                // touchdown the energy predicts leaves the room to stop, and
+                // the landing is committed; or it does not, and the
+                // go-around is flown from here with height in hand.
+                let roll_m = crate::aircraft::landing_roll_m();
+                let book_m = crate::aircraft::landing_distance_m();
+                if landing_called.is_none()
+                    && roll_m.is_some()
+                    && raw.arresting
+                    && raw.phase == ApproachPhase::Final
+                    && raw.balk.is_none()
+                    && !runtime.go_around.active()
+                    && on_ground < 0.5
+                {
+                    let model = crate::aircraft::flare_elevator();
+                    let call = landing_call(
+                        along_nm * M_PER_NM,
+                        rwy.length_m,
+                        radio_ft,
+                        gs_kts,
+                        Some(ias),
+                        approach_ias,
+                        flare_tau_s(),
+                        model.and_then(|f| f.model).and_then(|m| m.touchdown_fpm),
+                        wheels_need_m(book_m, roll_m),
+                    );
+                    if let Some(call) = call {
+                        crate::blackbox::record(
+                            "autoland",
+                            serde_json::json!({"event": "landing_call", "land": call.land,
+                                "touchdown_m": call.touchdown_m, "remaining_m": call.remaining_m,
+                                "need_m": call.need_m, "air_s": call.air_s, "radio": radio_ft,
+                                "ias": ias, "gs": gs_kts, "length_m": rwy.length_m}),
+                        );
+                        if !call.land && runtime.go_around.order(false) {
+                            announce(
+                                "Long landing. Going around.".to_string(),
+                                Priority::Caution,
+                            );
+                        }
+                        landing_called = Some(call);
+                    }
+                }
+                let committed_need = (flare_committed || landing_called.is_some_and(|c| c.land))
+                    .then(|| wheels_need_m(book_m, roll_m));
                 let committed = commit_flare_latched(
                     raw,
                     flaring,
-                    flare_committed,
+                    committed_need,
                     radio_ft,
                     gs_kts,
                     25.0,
@@ -2367,12 +2415,16 @@ fn spawn_autoland(launch: AutolandLaunch) {
                     );
                 }
                 // A commitment the room no longer covers is a go-around.
-                if flare_committed && raw.balk.is_some() && !committed_now {
+                if committed_need.is_some()
+                    && matches!(raw.balk, Some("overflew_the_runway" | "balloon"))
+                    && !committed_now
+                {
                     let remaining_m = rwy.length_m + along_nm.min(0.0) * M_PER_NM;
                     crate::blackbox::record(
                         "autoland",
                         serde_json::json!({"event": "commit_released", "why": raw.balk,
-                                           "radio": radio_ft, "remaining_m": remaining_m}),
+                                           "radio": radio_ft, "remaining_m": remaining_m,
+                                           "need_m": committed_need}),
                     );
                 }
                 let (raw, refused) =
@@ -2544,6 +2596,9 @@ fn spawn_autoland(launch: AutolandLaunch) {
                     xtk_now,
                 );
                 flaring = raw.phase == ApproachPhase::Flare && missed.is_none();
+                if missed.is_some() {
+                    landing_called = None;
+                }
                 // The latch lives as long as the flare it committed.
                 flare_committed = flaring && (flare_committed || committed_now);
                 // THE COURSE REVERSAL. Started by the missed approach's
@@ -4278,7 +4333,9 @@ fn spawn_autoland(launch: AutolandLaunch) {
                             vvi_trend,
                             dt_s,
                             cfg.flare_power.map_or(DEFAULT_ROUNDOUT_RETARD_PER_S, |p| {
-                                p.retard_max_per_s.unwrap_or(p.reduction_per_second)
+                                p.retard_float_per_s
+                                    .or(p.retard_max_per_s)
+                                    .unwrap_or(p.reduction_per_second)
                             }),
                         ),
                         _ => None,
@@ -5692,6 +5749,9 @@ fn live_floor_leg(
 #[cfg(test)]
 mod terrain_hold_tests;
 
+#[cfg(test)]
+mod lxgb09_landing_call_tests;
+
 /// Only climb with this much surplus over the approach speed. Climbing slow in a
 /// marginal airframe bleeds energy to a stall (the reason this loop was
 /// descent-only) — so a low-and-slow aircraft holds level and lets the throttle
@@ -6071,7 +6131,11 @@ impl FlarePower {
         let rate = match key {
             // A float has no time to the wheels: the thrust holding it up
             // is what comes off, as quickly as the airframe allows.
-            RetardKey::Float => Some(fastest),
+            RetardKey::Float => Some(
+                cfg.retard_float_per_s
+                    .filter(|r| r.is_finite() && *r > 0.0)
+                    .unwrap_or(fastest),
+            ),
             RetardKey::Timed => Some((current / to_touch_s).clamp(RETARD_MIN_PER_S, fastest)),
             _ => None,
         };
@@ -7970,6 +8034,133 @@ pub fn flare_pavement_need_m(radio_ft: f64, landing_m: Option<f64>) -> f64 {
     }
 }
 
+/// The pavement a landing ON THE WHEELS needs, metres: the airframe's
+/// declared landing ROLL (`landing_roll_ft`) when it has one, else the
+/// committed flare's book need at the wheels ([`flare_pavement_need_m`] at
+/// 0 ft). The book figure is a factored field length from 50 ft on the
+/// jets: the 737's 1,634 m less the 291 m of air is 1,343 m to stop from
+/// the wheels, and LXGB 09 (2026-10-06) went around at 4.5 ft with 1,109 m
+/// ahead, touched 1.6 s later on the spool-up and stopped in about 540.
+/// Pure.
+pub fn wheels_need_m(landing_m: Option<f64>, roll_m: Option<f64>) -> f64 {
+    match roll_m.filter(|r| r.is_finite() && *r > 0.0) {
+        Some(roll) => roll,
+        None => flare_pavement_need_m(0.0, landing_m),
+    }
+}
+
+/// A flare bleeds this much airspeed a second at idle, kt/s, for the float
+/// an approach's excess speed adds to the prediction: each knot over the
+/// approach speed is half a second more in the air (a jet's rule of thumb,
+/// a thousand feet of float for ten knots at 140).
+const FLARE_BLEED_KTS_S: f64 = 2.0;
+
+/// Seconds from `radio_ft` to the wheels on the flare the law FLIES: the
+/// path's sink (at this groundspeed) down to the height where the
+/// exponential asks less, then the exponential `touchdown + 60 h / tau` to
+/// the runway (`flare_target_with`'s shape), so `tau ln((h + h_f) / h_f)`
+/// with `h_f = touchdown x tau / 60`. Without a time constant the flat
+/// flare: the roundout's sink to the flare gate, the flare's below it.
+/// `None` for a measurement that is not one. Pure.
+pub fn flare_time_s(
+    radio_ft: f64,
+    gs_kts: f64,
+    tau_s: Option<f64>,
+    touchdown_fpm: Option<f64>,
+) -> Option<f64> {
+    if !radio_ft.is_finite() || !gs_kts.is_finite() || gs_kts <= 0.0 {
+        return None;
+    }
+    let h = radio_ft.max(0.0);
+    let nominal = (gs_kts / 60.0) * gp_ft_per_nm();
+    let (roundout_vs, flare_vs) = arrest_targets_fpm(-nominal);
+    match tau_s.filter(|t| t.is_finite() && *t > 0.5) {
+        Some(tau) => {
+            let td = touchdown_fpm
+                .filter(|t| t.is_finite() && *t > 0.0)
+                .unwrap_or(-flare_vs)
+                .min(nominal);
+            let h_x = (nominal - td) * tau / 60.0;
+            let h_f = td * tau / 60.0;
+            let on_path = (h - h_x).max(0.0) / nominal * 60.0;
+            Some(on_path + tau * ((h.min(h_x) + h_f) / h_f).ln())
+        }
+        None => {
+            let (flare_ft, _) = arrest_gates_ft(25.0, gs_kts);
+            let above = (h - flare_ft).max(0.0) / -roundout_vs * 60.0;
+            Some(above + h.min(flare_ft) / -flare_vs * 60.0)
+        }
+    }
+}
+
+/// The go/no-go at the roundout gate (see [`landing_call`]).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct LandingCall {
+    /// Land: the touchdown the energy predicts leaves the room to stop.
+    pub land: bool,
+    /// The predicted touchdown, metres past the runway's threshold (its
+    /// apt.dat end; negative short of it).
+    pub touchdown_m: f64,
+    /// The pavement predicted ahead of that touchdown, and what stopping
+    /// needs ([`wheels_need_m`]), metres.
+    pub remaining_m: f64,
+    pub need_m: f64,
+    /// Seconds of flare and float the prediction flew.
+    pub air_s: f64,
+}
+
+/// LAND IN THE ROOM THE ENERGY LEAVES, OR GO AROUND WITH HEIGHT IN HAND.
+/// Decided ONCE, at the roundout gate (the arrest takes the servos), from
+/// where the touchdown will be: the flare the law flies from here
+/// ([`flare_time_s`]) plus the float the speed over the approach speed adds
+/// ([`FLARE_BLEED_KTS_S`]), at this groundspeed, from this position. The
+/// touchdown must leave the room to stop ([`wheels_need_m`]); else the
+/// go-around is flown NOW, on the approach's thrust, 80 ft up, never at
+/// 4 ft from an idle flare. LXGB 09 (737, wet, 2026-10-06, sortie
+/// 1791275171): no decision before the flare; the float allowance's 0.35
+/// nm ran out at 4.5 ft radio and the overflight balk stood (1,109 m ahead
+/// against the book's 1,369), "Going around. Full power, climbing straight
+/// ahead." toward the Rock, the wheels touched 1.6 s later on the spool-up
+/// and it stopped. From that gate (79.8 ft, 137 m short of the strip at
+/// 140 kt over the ground and 146 indicated) the call is LAND with about
+/// 1,085 m predicted ahead against 792. `along_m` is the signed along-track
+/// to the threshold (positive on the approach side), `length_m` the strip.
+/// `None` when a measurement is missing (no guessed decision). Pure.
+#[allow(clippy::too_many_arguments)]
+pub fn landing_call(
+    along_m: f64,
+    length_m: f64,
+    radio_ft: f64,
+    gs_kts: f64,
+    ias_kts: Option<f64>,
+    approach_ias: f64,
+    tau_s: Option<f64>,
+    touchdown_fpm: Option<f64>,
+    need_m: f64,
+) -> Option<LandingCall> {
+    if !along_m.is_finite() || !length_m.is_finite() || !need_m.is_finite() {
+        return None;
+    }
+    let flare_s = flare_time_s(radio_ft, gs_kts, tau_s, touchdown_fpm)?;
+    let excess_kts = match ias_kts {
+        Some(v) if v.is_finite() && approach_ias.is_finite() => (v - approach_ias).max(0.0),
+        _ => 0.0,
+    };
+    let air_s = flare_s + excess_kts / FLARE_BLEED_KTS_S;
+    let touchdown_m = gs_kts * KTS_TO_MPS * air_s - along_m;
+    let remaining_m = length_m - touchdown_m.max(0.0);
+    Some(LandingCall {
+        land: remaining_m >= need_m,
+        touchdown_m,
+        remaining_m,
+        need_m,
+        air_s,
+    })
+}
+
+/// Knots to metres per second.
+const KTS_TO_MPS: f64 = 0.514_444;
+
 /// COMMITTED, ONCE FLARING LOW. A flare below the roundout band is at idle,
 /// slow and nose up, and the go-around the overflight balk hands it cannot
 /// climb: the vertical law climbs only with speed in hand, a flare has none,
@@ -8000,7 +8191,7 @@ pub fn commit_flare(
     commit_flare_latched(
         g,
         was_flaring,
-        false,
+        None,
         radio_ft,
         gs_kts,
         flare_radio_ft,
@@ -8018,16 +8209,18 @@ pub fn commit_flare(
 /// ahead against a need of 1,427, floating level, and 0.3 s and 23 m later
 /// the same test failed, the arrest handed the servos back and it went
 /// around `overflew_the_runway` with 1,409 m of runway left. A commitment
-/// that lasts one tick is no commitment. So once committed (`was_committed`,
-/// the loop's latch for this flare), the landing continues while the
-/// pavement ahead still covers the book's GROUND roll (the need at the
-/// wheels, the whole air segment credited); past that it is still a
-/// go-around. The ceiling heights stand. Pure.
+/// that lasts one tick is no commitment. So once committed
+/// (`committed_need_m`, the loop's latch for this flare or the roundout
+/// gate's [`landing_call`]), the landing continues while the pavement ahead
+/// still covers the room to stop from the wheels ([`wheels_need_m`]: the
+/// declared landing roll, else the book's ground roll with the whole air
+/// segment credited); past that it is still a go-around. The ceiling
+/// heights stand. Pure.
 #[allow(clippy::too_many_arguments)]
 pub fn commit_flare_latched(
     g: Guidance,
     was_flaring: bool,
-    was_committed: bool,
+    committed_need_m: Option<f64>,
     radio_ft: f64,
     gs_kts: f64,
     flare_radio_ft: f64,
@@ -8041,7 +8234,9 @@ pub fn commit_flare_latched(
         Some("balloon") if was_flaring => BALLOON_COMMIT_FT,
         _ => return g,
     };
-    let need_m = flare_pavement_need_m(if was_committed { 0.0 } else { radio_ft }, landing_m);
+    let need_m = committed_need_m
+        .filter(|n| n.is_finite())
+        .unwrap_or_else(|| flare_pavement_need_m(radio_ft, landing_m));
     if radio_ft > ceiling_ft || remaining_m < need_m {
         return g;
     }

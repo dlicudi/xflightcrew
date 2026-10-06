@@ -89,7 +89,7 @@ flare_power:
   # A flare 5 kt under the approach speed keeps its thrust: a knot taken is
   # 63 fpm at the wheels (the fitted plant). Only while it is still sinking
   # and the retard has not begun: a FLOAT (under 100 fpm, now or 1.5 s
-  # ahead on the trend) takes the lever off at retard_max_per_s whatever
+  # ahead on the trend) takes the lever off at retard_float_per_s whatever
   # the height or the speed. EGBB 15 (2026-09-28) floated 4 s at 22.7 ft on
   # 0.30 held by height, time and then this key; replayed through that
   # flare's own fit, the float key lands it with no float, 280 m shorter.
@@ -101,6 +101,10 @@ flare_power:
   # sink-keyed law: 268, 300); the gusty two through nine plants, 293, none
   # climbing; the 2026-09-26 gates through every flare's plant, 316 worst.
   retard_max_per_s: 0.04
+  # ...but a FLOAT's thrust comes off at twice that: at 0.04 LXGB 09's
+  # float (2026-10-06) walked 0.33 to 0.25 from 10.6 to 4.5 ft and held
+  # it up. The roundout's float takes the same rate.
+  retard_float_per_s: 0.08
 # The rudder on the takeoff roll (autotakeoff::RollSteer): yaw rate per unit
 # of steer, growing with the square of the speed. Fitted to both EGKK 26L
 # rolls of 2026-09-27 (8 kt crosswind from the left, 30 to 86 kt; 3 s
@@ -123,9 +127,17 @@ flare_elevator:
   max_push: 0.0
   # Exponential flare: the sink target falls with the height, so the
   # arrest keeps descending instead of floating. The flat -175 floated LEMG
-  # 13 from 36 to 19 ft (2026-09-26). 6 s, to 150 fpm at the wheels (the
-  # model below), taken at the height predicted at the model's horizon.
-  tau_s: 6.0
+  # 13 from 36 to 19 ft (2026-09-26). To 150 fpm at the wheels (the model
+  # below), taken at the height predicted at the model's horizon. 5.5 s,
+  # not 6: the target is 150 fpm plus 60 / tau a foot, so from 20 ft the
+  # 6 s flare is 5 s to the wheels, and LXGB 09 (2026-10-06, wet, rough
+  # air) touched 631 m past a 1,627 m runway's threshold. Replayed through
+  # that flare's own fit (5,500 fpm, 1.35 s) and air: 6 s floats past 700
+  # m, 5.5 s with the float's 0.08 lands at 477 m and 101 fpm, inside the
+  # first third; the sixteen LEMG 13 flares 244 mean, 289 worst (277 at
+  # 6 s), the 2026-09-26 gates through every plant 339 worst (316), EGBB
+  # 15 310 (318).
+  tau_s: 5.5
   # A bounce eases the pull, never drops it: dropped to neutral, the nose
   # came down and the 737 met the runway again (LEMG circuit, 2026-09-26).
   balloon_ease_per_s: 0.15
@@ -429,6 +441,13 @@ reference:
   # recited 8,700 is a factored MTOW field length (the MD-82 lesson, 2026-07-28).
   takeoff_roll_ft: 5500.0
   landing_distance_ft: 5360.0  # POM
+  # LANDING ROLL, touchdown to a stop on a wet runway: the room a landing
+  # already on the wheels needs (autoland::landing_call at the roundout
+  # gate, the committed flare). The 5,360 above is a factored field length
+  # from 50 ft: x 0.6 is 3,216 ft of actual distance, less the 955 ft of
+  # 3 degree air, x 1.15 wet. LXGB 09 wet (2026-10-06) stopped from 136 kt
+  # over the ground in about 540 m (1,770 ft) with reverse.
+  landing_roll_ft: 2600.0
 
 # Nine positions in the aircraft file, 0/3/5/8/10/12/14/18/40 degrees, which
 # are the 737's UP/1/2/5/10/15/25/30/40 handle gates in order. Per-gate limits

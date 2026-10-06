@@ -827,6 +827,7 @@
             retard_at_s: None,
             retard_fast_kts: None,
             hold_from_s: None,
+            retard_float_per_s: None,
         };
         let (ias, app) = (Some(145.0), Some(145.0));
         let mut power = FlarePower::default();

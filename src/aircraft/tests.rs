@@ -75,6 +75,7 @@
         // (module, NAME) -> why it may be a shared constant.
         const REVIEWED: &[(&str, &str, &str)] = &[
             ("procedure", "NOT_CLIMBING_FPM", "a rate that is not a climb, any airframe"),
+            ("autoland", "FLARE_BLEED_KTS_S", "the landing call's float for speed over the airframe's own approach speed, a prediction margin, not a commanded rate; only airframes declaring landing_roll_ft (LXGB 2026-10-06)"),
             ("autoland", "GA_CLIMB_ESTABLISHED_FPM", "a go-around's positive climb, the test for reducing thrust, not a commanded rate; any airframe (#199)"),
             ("autoland", "GA_FAST_KTS", "a band about the airframe's own go-around speed, where the thrust comes back at once; any airframe (#199)"),
             ("autoland", "GA_SLOW_KTS", "a band under the airframe's own go-around speed, where go-around thrust returns; any airframe (#199)"),
