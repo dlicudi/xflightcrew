@@ -2638,9 +2638,9 @@ pub fn ap_inherited(servos: f64, heading: f64, vertical: f64) -> bool {
 /// measurement: nothing is written. `None` = nothing was on (or no reading).
 async fn clear_inherited_autopilot(xp: &dyn crate::xplane::XPlane) -> Option<bool> {
     let (servos, heading, vertical) = tokio::join!(
-        xp.get_float(SERVOS_ON),
-        xp.get_float(HDG_STATUS),
-        xp.get_float(VS_STATUS)
+        crate::autoflight::read_status(&*xp, SERVOS_ON),
+        crate::autoflight::read_status(&*xp, HDG_STATUS),
+        crate::autoflight::read_status(&*xp, VS_STATUS)
     );
     let [servos, heading, vertical] =
         crate::control::measurements("autotakeoff", [servos, heading, vertical])?;
@@ -2648,7 +2648,7 @@ async fn clear_inherited_autopilot(xp: &dyn crate::xplane::XPlane) -> Option<boo
         return None;
     }
     let fired = autoflight::press(xp, Button::DisconnectFd).await.is_ok();
-    let after = xp.get_float(SERVOS_ON).await.ok();
+    let after = crate::autoflight::read_status(&*xp, SERVOS_ON).await.ok();
     let cleared = fired && after.is_some_and(|v| v < 0.5);
     crate::blackbox::record(
         "autotakeoff",
@@ -2722,9 +2722,9 @@ async fn engage_climb(
         return false;
     }
     let (heading, vertical, servos) = tokio::join!(
-        xp.get_float(HDG_STATUS),
-        xp.get_float(VS_STATUS),
-        xp.get_float(SERVOS_ON)
+        crate::autoflight::read_status(&*xp, HDG_STATUS),
+        crate::autoflight::read_status(&*xp, VS_STATUS),
+        crate::autoflight::read_status(&*xp, SERVOS_ON)
     );
     let Some([heading, vertical, servos]) =
         crate::control::measurements("autotakeoff", [heading, vertical, servos])
@@ -2759,9 +2759,9 @@ async fn engage_climb(
         return false;
     }
     let (heading, vertical, servos) = tokio::join!(
-        xp.get_float(HDG_STATUS),
-        xp.get_float(VS_STATUS),
-        xp.get_float(SERVOS_ON)
+        crate::autoflight::read_status(&*xp, HDG_STATUS),
+        crate::autoflight::read_status(&*xp, VS_STATUS),
+        crate::autoflight::read_status(&*xp, SERVOS_ON)
     );
     matches!((heading, vertical, servos), (Ok(h), Ok(v), Ok(s))
         if h.is_finite() && v.is_finite() && s.is_finite() && h > 0.5 && v > 0.5 && s > 0.5)
@@ -3096,12 +3096,13 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, p: Params) {
         // back to the separate reads, still one round, and the tick says
         // which (`pos`).
         let thr_dref = throttle_dataref();
-        let (st, extra) = sim::state::read_with(
-            &xp,
-            sim::state::Want(ROLL_WANT),
-            &[thr_dref.as_str(), autoflight::names::AT_ON, autoflight::names::AT_MODE],
-        )
-        .await;
+        // The panel's reads beside the frame (`autoflight::Panel::tick_names`):
+        // the stock autothrottle, or a declared MCP's lamps.
+        let af_panel = autoflight::panel();
+        let mut extra_names: Vec<String> = vec![thr_dref.clone()];
+        extra_names.extend(af_panel.tick_names());
+        let extra_refs: Vec<&str> = extra_names.iter().map(String::as_str).collect();
+        let (st, extra) = sim::state::read_with(&xp, sim::state::Want(ROLL_WANT), &extra_refs).await;
         // Pause or replay: freeze — no writes, and the stagnation clock
         // slides instead of burning (the recover watcher's rule).
         if st.frozen() {
@@ -3130,11 +3131,8 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, p: Params) {
         // The levers are the takeoff's: an ENGAGED autothrottle (armed is
         // the configuration's, never touched) is taken out and said once.
         {
-            let (on, mode) = (extra.next(), extra.next());
-            let engaged = autoflight::autothrottle_engaged(
-                on.and_then(|r| r.ok()),
-                mode.and_then(|r| r.ok()),
-            );
+            let panel_reads: Vec<Option<f64>> = extra.map(|r| r.ok()).collect();
+            let engaged = af_panel.tick_from(&panel_reads).at_engaged;
             let step = thrust_watch.step(thrust_t0.elapsed().as_secs_f64(), engaged);
             if let Some(line) = autoflight::act_thrust(&xp, step, "autotakeoff").await {
                 alert(&voice, Priority::Caution, line);

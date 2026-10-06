@@ -83,7 +83,9 @@ Rust tools; YAML is per-airframe config.
   angles `sim::angles`; AP engage `ap_engage::ApEngage`; speed ceiling `ceiling_from_vne` (0.9 Vne less 10).
 - **The autopilot panel has ONE owner** (`src/autoflight.rs`, pinned by
   `every_mcp_write_goes_through_the_owner`). Modes' truth is the `autopilot_state` bitfield
-  (`Modes`), the panel the airframe's (`Panel`, `autoflight:`). A loop states INTENT (`Want`);
+  (`Modes`), or a declared MCP's own lamps where the stock modes do not follow it (the Zibo:
+  `lamps:`, `windows:`, switches; every status read is `read_status`, the bitfield
+  `read_ap_state`), the panel the airframe's (`Panel`, `autoflight:`). A loop states INTENT (`Want`);
   `reconcile` presses on a difference only, never over a capture, nothing on a failed read (blind
   presses dropped most 737 captures). The window is parked where no capture takes the wheel
   (`WindowRule`). Primitives: `engage_confirmed`, `hold_level`, `hold_heading`, `climb_to`,

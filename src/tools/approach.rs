@@ -301,7 +301,7 @@ impl Tool for PrepareIls {
             ctx.xplane.get_float(crate::datarefs::ON_GROUND_ANY),
             ctx.xplane.get_float(ils::AP_POWER),
             ctx.xplane.get_float(ils::SERVOS),
-            ctx.xplane.get_float(crate::autoflight::names::AP_STATE),
+            crate::autoflight::read_ap_state(&*ctx.xplane),
             ctx.xplane.get_float(ils::VDEF),
             ctx.xplane.get_float(ils::GS_VALID),
             ctx.xplane.get_float(crate::datarefs::COMPASS_HEADING_DEG),

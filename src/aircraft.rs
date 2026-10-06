@@ -250,6 +250,109 @@ pub struct AutoflightProfile {
     /// (the LEAX rule). Replaces `alt_dial_park_field` (89fe7a6).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub vs_toward_window: bool,
+    /// The panel's own CMD lamp (1 engaged): the servos' read where the
+    /// MCP does not keep the stock `servos_on` (the Zibo's zibomod flies
+    /// its own autopilot; probed 2026-10-07, `autopilot_state` held 132
+    /// through every MCP press). `None` reads `servos_on`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub engage_status: Option<String>,
+    /// The panel's own disconnect (the yoke button, never a latching bar:
+    /// a bar left down blocks every later engage). `None` is the stock
+    /// `servos_off_any`; on a declared panel it also stands in for the
+    /// servos-and-FD disconnect.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disconnect_command: Option<String>,
+    /// The panel's own LVL CHG button (a toggle). `None` is the stock.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub level_change_command: Option<String>,
+    /// The mode lamps, 1 lit: declared, the owner builds `autoflight::Modes`
+    /// from them instead of `autopilot_state`, and every mode status a loop
+    /// reads is the lamp's (`autoflight::read_status`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lamps: Option<ModeLamps>,
+    /// The MCP windows, where they are not the stock dials
+    /// (`autoflight::Dial`): written, or stepped on their knob commands,
+    /// and read back from the window itself.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub windows: Option<McpWindows>,
+    /// The A/T arm switch and the flight director switches: each a toggle,
+    /// read on its position before it is fired, read back after.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub autothrottle_arm: Option<PanelSwitch>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub flight_director: Option<PanelSwitch>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub flight_director_fo: Option<PanelSwitch>,
+    /// The panel's TO/GA: with the A/T armed it sets the takeoff thrust
+    /// itself. Declared and probed only; the takeoff still flies its own
+    /// levers (owed: `autoflight::Panel::toga`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub toga_command: Option<String>,
+}
+
+/// The mode lamps of a panel whose MCP is not the stock autopilot's
+/// (`AutoflightProfile::lamps`): each the lamp's dataref, 1 lit. `None`
+/// fields are modes this panel's lamps do not show.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct ModeLamps {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub heading: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vs: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub altitude_hold: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub level_change: Option<String>,
+    /// APP: lit armed OR captured (the lamp does not tell them apart).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approach: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vorloc: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vnav: Option<String>,
+    /// The autothrottle's SPEED and N1 lamps: either lit is an ENGAGED
+    /// autothrottle for the thrust's one owner.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub speed: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub n1: Option<String>,
+}
+
+/// One MCP window (`AutoflightProfile::windows`): `write` is the dataref a
+/// value is written to; or `up`/`down` are the knob's commands, each press
+/// `step`. `readback` is where the window is read (defaults to `write`).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct McpWindow {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub write: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub up: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub down: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub step: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub readback: Option<String>,
+}
+
+/// The MCP windows a panel declares (`AutoflightProfile::windows`).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct McpWindows {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub heading: Option<McpWindow>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub altitude: Option<McpWindow>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub airspeed: Option<McpWindow>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vs: Option<McpWindow>,
+}
+
+/// A toggle switch on the panel and the position it reads (1 on).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct PanelSwitch {
+    pub command: String,
+    pub position: String,
 }
 
 /// The flare's ELEVATOR law for this airframe (`autoland::FlareGains`): the

@@ -286,7 +286,7 @@ pub async fn engage_confirmed(xp: &dyn XPlane, fd: &[String], kind: &str, site: 
         }
         tokio::time::sleep(std::time::Duration::from_secs_f64(CONFIRM_POLL_S)).await;
         let (servos, ias) = tokio::join!(
-            xp.get_float(crate::datarefs::SERVOS_ON),
+            crate::autoflight::read_status(xp, crate::datarefs::SERVOS_ON),
             xp.get_float(crate::datarefs::AIRSPEED_KTS),
         );
         let ias = ias.ok().filter(|v| v.is_finite()).unwrap_or(0.0);

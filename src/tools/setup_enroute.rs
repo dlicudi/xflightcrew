@@ -721,7 +721,7 @@ async fn engage(xp: &crate::xplane::XPlaneClient, job: &EnrouteJob) -> Engaged {
         }
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         let (servos, ias) = tokio::join!(
-            xp.get_float(crate::datarefs::SERVOS_ON),
+            crate::autoflight::read_status(&*xp, crate::datarefs::SERVOS_ON),
             xp.get_float(crate::datarefs::AIRSPEED_KTS),
         );
         let ias = ias.ok().filter(|v| v.is_finite()).unwrap_or(0.0);
@@ -732,22 +732,22 @@ async fn engage(xp: &crate::xplane::XPlaneClient, job: &EnrouteJob) -> Engaged {
         return out;
     }
     let _ = autoflight::set_dial(xp, Dial::HeadingBug, bug).await;
-    let hdg_st = xp.get_float(crate::datarefs::HEADING_STATUS).await.ok();
+    let hdg_st = crate::autoflight::read_status(&*xp, crate::datarefs::HEADING_STATUS).await.ok();
     autoflight::bring_heading(xp, hdg_st, "setup_enroute").await;
     let _ = autoflight::set_dial(xp, Dial::Altitude, p.alt_ft).await;
     // The vertical by VS toward the dial, never ALT HOLD off the zoom
     // (`vertical_toward_dial`); the settle keeps the wheel on it.
     let alt = xp.get_float(crate::datarefs::ALTITUDE_FT).await.unwrap_or(p.alt_ft);
     if let Vertical::Vs(rate) = vertical_toward_dial(alt, p.alt_ft, 0.0, false) {
-        let vs_st = xp.get_float(VS_STATUS).await.ok();
+        let vs_st = crate::autoflight::read_status(&*xp, VS_STATUS).await.ok();
         autoflight::bring_vs(xp, vs_st, "setup_enroute").await;
         let _ = autoflight::set_dial(xp, Dial::Vs, rate).await;
     }
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     let (hdg, vs, alt) = tokio::join!(
-        xp.get_float(crate::datarefs::HEADING_STATUS),
-        xp.get_float(VS_STATUS),
-        xp.get_float(ALT_HOLD_STATUS),
+        crate::autoflight::read_status(&*xp, crate::datarefs::HEADING_STATUS),
+        crate::autoflight::read_status(&*xp, VS_STATUS),
+        crate::autoflight::read_status(&*xp, ALT_HOLD_STATUS),
     );
     out.heading = hdg.is_ok_and(|v| v > 0.5);
     out.vertical = vs.is_ok_and(|v| v > 0.5) || alt.is_ok_and(|v| v > 1.5);
@@ -777,8 +777,8 @@ async fn settle(
             xp.get_float(crate::datarefs::ALTITUDE_FT),
             xp.get_float(crate::datarefs::AIRSPEED_KTS),
             xp.get_float(crate::datarefs::VVI_FPM),
-            xp.get_float(VS_STATUS),
-            xp.get_float(ALT_HOLD_STATUS),
+            crate::autoflight::read_status(&*xp, VS_STATUS),
+            crate::autoflight::read_status(&*xp, ALT_HOLD_STATUS),
         );
         let t_s = t0.elapsed().as_secs_f64();
         // A failed read is no measurement: the tick is skipped, the clock

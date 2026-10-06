@@ -3545,7 +3545,7 @@ async fn run_session(
             // If this command can switch the autopilot on and it's off right now,
             // undo should switch it back off (not leave it flying the reset dial).
             let ap_was_off = engages_autopilot(&call.name)
-                && matches!(xplane.get_float(datarefs::SERVOS_ON).await, Ok(v) if v <= 0.5);
+                && matches!(crate::autoflight::read_status(&xplane, datarefs::SERVOS_ON).await, Ok(v) if v <= 0.5);
             // Snap the camera to the panel for this action, if the airframe has a
             // saved view for it — so you watch the switch move instead of hunting for
             // it. Remember the current view first (to restore after the glance), then

@@ -573,13 +573,13 @@ struct Handback {
 /// The servos out, read back: a servo left in writes the column back over
 /// ours. `servos_off_any` first, the FD-off disconnect if it did not take.
 async fn servos_out(xp: &XPlaneClient) -> Option<f64> {
-    if xp.get_float(SERVOS_ON).await.is_ok_and(|v| v > 0.5) {
+    if crate::autoflight::read_status(&*xp, SERVOS_ON).await.is_ok_and(|v| v > 0.5) {
         let _ = autoflight::press(xp, Button::Disconnect).await;
-        if xp.get_float(SERVOS_ON).await.is_ok_and(|v| v > 0.5) {
+        if crate::autoflight::read_status(&*xp, SERVOS_ON).await.is_ok_and(|v| v > 0.5) {
             let _ = autoflight::press(xp, Button::DisconnectFd).await;
         }
     }
-    xp.get_float(SERVOS_ON).await.ok()
+    crate::autoflight::read_status(&*xp, SERVOS_ON).await.ok()
 }
 
 /// One tick of column and wheel, through the plugin's channels, or the raw
@@ -824,7 +824,7 @@ fn run_recovery(
                         xp.get_float(PITCH),
                         xp.get_float(BANK),
                         xp.get_float(IAS),
-                        xp.get_float(SERVOS_ON)
+                        crate::autoflight::read_status(&xp, SERVOS_ON)
                     );
                     let (vvi, pitch, bank, ias, servos) =
                         (vvi.ok(), pitch.ok(), bank.ok(), ias.ok(), servos.ok());
@@ -984,7 +984,7 @@ async fn hold_heading_and_altitude(
             json!({"event": "missing_measurement", "what": what, "value": null}),
         )
     };
-    match ok(xp.get_float(HEADING_STATUS).await) {
+    match ok(crate::autoflight::read_status(&*xp, HEADING_STATUS).await) {
         Some(s) if s <= 0.5 => {
             let _ = autoflight::press(xp, Button::Heading).await;
         }
@@ -1006,7 +1006,7 @@ async fn hold_heading_and_altitude(
     };
     let hold = (alt / 100.0).round() * 100.0;
     let _ = autoflight::set_dial(xp, Dial::Altitude, hold).await;
-    match ok(xp.get_float(ALT_HOLD_STATUS).await) {
+    match ok(crate::autoflight::read_status(&*xp, ALT_HOLD_STATUS).await) {
         Some(s) if s <= 0.5 => {
             let _ = autoflight::press(xp, Button::AltitudeHold).await;
         }

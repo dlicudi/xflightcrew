@@ -4434,10 +4434,10 @@ pub(crate) fn airborne_end_verdict(
 
 async fn read_airborne_look(xp: &XPlaneClient) -> AirborneLook {
     let (servos, hdg, vs, alt, vvi, pitch, bank, ias) = tokio::join!(
-        xp.get_float(crate::datarefs::SERVOS_ON),
-        xp.get_float(crate::datarefs::HEADING_STATUS),
-        xp.get_float(autoflight::names::VS_STATUS),
-        xp.get_float(autoflight::names::ALT_HOLD_STATUS),
+        crate::autoflight::read_status(&*xp, crate::datarefs::SERVOS_ON),
+        crate::autoflight::read_status(&*xp, crate::datarefs::HEADING_STATUS),
+        crate::autoflight::read_status(&*xp, autoflight::names::VS_STATUS),
+        crate::autoflight::read_status(&*xp, autoflight::names::ALT_HOLD_STATUS),
         xp.get_float("sim/flightmodel/position/vh_ind_fpm"),
         xp.get_float("sim/flightmodel/position/theta"),
         xp.get_float("sim/flightmodel/position/phi"),

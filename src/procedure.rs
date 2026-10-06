@@ -3029,7 +3029,7 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, plan: Pla
     // The follower carries no `ApConfig`: the live airframe's FD list.
     let ap_fd = crate::ap_engage::fd_commands();
     crate::ap_engage::press_logged(&xp, &ap_fd, "procedure", "seed", 1).await;
-    let hdg_seed = xp.get_float(HDG_STATUS).await.ok();
+    let hdg_seed = crate::autoflight::read_status(&xp, HDG_STATUS).await.ok();
     autoflight::bring_heading(&xp, hdg_seed, "procedure_seed").await;
     let mut servo_watch = crate::ap_engage::ServoWatch::default();
     // What we COMMANDED last tick, a different thing from the leg constraint
@@ -3262,13 +3262,13 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, plan: Pla
             xp.get_float(PSI_TRUE),
             xp.get_float(HPATH),
             xp.get_float(AGL_M),
-            xp.get_float(VS_STATUS),
-            xp.get_float(HDG_STATUS),
+            crate::autoflight::read_status(&xp, VS_STATUS),
+            crate::autoflight::read_status(&xp, HDG_STATUS),
             xp.get_float(IAS),
             xp.get_float(GS_MS),
             xp.get_float(crate::datarefs::BANK_DEG),
             xp.get_float(MAG_VAR),
-            xp.get_float(crate::datarefs::SERVOS_ON),
+            crate::autoflight::read_status(&xp, crate::datarefs::SERVOS_ON),
         );
         let now = std::time::Instant::now();
         let dt = now.duration_since(tick_clock).as_secs_f64();
@@ -4483,7 +4483,7 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, plan: Pla
             VsAction::Write
         } else {
             // A failed read of the hold is no measurement: not holding.
-            let alt_hold_on = xp.get_float(ALT_HOLD_STATUS).await.is_ok_and(|v| v > 1.5);
+            let alt_hold_on = crate::autoflight::read_status(&xp, ALT_HOLD_STATUS).await.is_ok_and(|v| v > 1.5);
             vs_action(false, alt_hold_on, alt_ft, want_alt, dial, vs_cmd, climb_rate_fpm)
         };
         if action == VsAction::Engage {
@@ -4494,7 +4494,7 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, plan: Pla
             {
                 continue;
             }
-            if xp.get_float(VS_STATUS).await.is_ok_and(|v| v > 0.5) {
+            if crate::autoflight::read_status(&xp, VS_STATUS).await.is_ok_and(|v| v > 0.5) {
                 action = VsAction::Write;
                 // A vertical mode engaged: its pitch authority is checked
                 // afresh (#181).

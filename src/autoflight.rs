@@ -26,7 +26,14 @@
 //!   ([`Modes`]), which every stock autopilot and the Laminar 737's xlua MCP
 //!   (its `*_status` lights are computed FROM the stock modes) keep. The
 //!   per-mode `*_status` reads stay for the loops' frames; the bitfield is
-//!   what a coupling, a takeover and the blackbox believe.
+//!   what a coupling, a takeover and the blackbox believe. An MCP the stock
+//!   modes do NOT follow (the Zibo's zibomod: `autopilot_state` held 132
+//!   through every press, 2026-10-07) declares its lamps, windows and
+//!   switches (`autoflight:` `lamps`, `windows`, `engage_status`,
+//!   `flight_director`, `autothrottle_arm`): the bitfield is then BUILT from
+//!   its lamps ([`read_ap_state`], [`modes_from_lamps`]), every status a
+//!   loop reads is the lamp's ([`read_status`], [`PanelTick`]), and every
+//!   dial goes to its own window ([`Window`]).
 //! - **The panel is the airframe's** ([`Panel`], from the profile's
 //!   `autoflight:` block, else the stock commands): the 737's own CMD A,
 //!   HDG SEL, V/S, ALT HLD and APP buttons, which keep its lamps and FMA
@@ -209,10 +216,20 @@ pub fn dial_named(name: &str) -> Option<Dial> {
     .find(|d| d.name() == name)
 }
 
-/// Write a dial.
+/// Write a dial: the stock dial, or the panel's declared window (written,
+/// or stepped on its knob and read back, [`Window`]).
 pub async fn set_dial(xp: &dyn XPlane, d: Dial, v: f64) -> anyhow::Result<()> {
+    set_dial_on(xp, &panel(), d, v).await
+}
+
+/// [`set_dial`] on a given panel.
+pub async fn set_dial_on(xp: &dyn XPlane, p: &Panel, d: Dial, v: f64) -> anyhow::Result<()> {
     note(OurChange::Dial(d, v));
-    xp.set_float(d.name(), v).await
+    match p.window(d) {
+        None => xp.set_float(d.name(), v).await,
+        Some(Window::Write { name, .. }) => xp.set_float(&name, v).await,
+        Some(w @ Window::Knob { .. }) => step_knob(xp, &w, v).await.map(|_| ()),
+    }
 }
 
 /// Write one element of an array dial (the hover vector).
@@ -221,9 +238,17 @@ pub async fn set_dial_elem(xp: &dyn XPlane, d: Dial, index: usize, v: f64) -> an
     xp.set_float_array_elem(d.name(), index, v).await
 }
 
-/// Read a dial.
+/// Read a dial: the stock dial, or the panel's declared window.
 pub async fn read_dial(xp: &dyn XPlane, d: Dial) -> anyhow::Result<f64> {
-    xp.get_float(d.name()).await
+    read_dial_on(xp, &panel(), d).await
+}
+
+/// [`read_dial`] on a given panel.
+pub async fn read_dial_on(xp: &dyn XPlane, p: &Panel, d: Dial) -> anyhow::Result<f64> {
+    match p.window(d) {
+        None => xp.get_float(d.name()).await,
+        Some(w) => xp.get_float(w.readback()).await,
+    }
 }
 
 /// A dial written and read back, only on a change past `change`
@@ -237,8 +262,55 @@ pub async fn set_dial_confirmed(
     last: &mut Option<f64>,
     change: f64,
 ) -> bool {
+    set_dial_confirmed_on(kind, xp, &panel(), d, want, last, change).await
+}
+
+/// [`set_dial_confirmed`] on a given panel.
+pub async fn set_dial_confirmed_on(
+    kind: &str,
+    xp: &dyn XPlane,
+    p: &Panel,
+    d: Dial,
+    want: f64,
+    last: &mut Option<f64>,
+    change: f64,
+) -> bool {
     note(OurChange::Dial(d, want));
-    crate::control::set_confirmed(kind, xp, d.name(), want, last, change).await
+    let w = match p.window(d) {
+        None => return crate::control::set_confirmed(kind, xp, d.name(), want, last, change).await,
+        Some(Window::Write { name, readback }) if name == readback => {
+            return crate::control::set_confirmed(kind, xp, &name, want, last, change).await
+        }
+        Some(w) => w,
+    };
+    // A declared window read back elsewhere, or stepped on its knob: the
+    // same rule (suppressed only once the sim confirmed the last setting).
+    if last.is_some_and(|v| (v - want).abs() <= change) {
+        return true;
+    }
+    let actual = match &w {
+        Window::Knob { .. } => step_knob(xp, &w, want).await.ok(),
+        Window::Write { name, readback } => match xp.set_float(name, want).await {
+            Ok(()) => xp.get_float(readback).await.ok(),
+            Err(_) => None,
+        },
+    }
+    .filter(|v| v.is_finite());
+    let tol = match &w {
+        Window::Knob { step, .. } => step.max(1.0),
+        Window::Write { .. } => 1.0,
+    };
+    if actual.is_some_and(|v| (v - want).abs() <= tol) {
+        *last = Some(want);
+        true
+    } else {
+        *last = None;
+        crate::blackbox::record(
+            kind,
+            json!({"event": "write_unconfirmed", "dataref": w.readback(), "want": want, "actual": actual}),
+        );
+        false
+    }
 }
 
 /// Read an array dial (the hover vector).
@@ -247,9 +319,16 @@ pub async fn read_dial_array(xp: &dyn XPlane, d: Dial) -> anyhow::Result<Vec<f64
 }
 
 /// Put a dial write in a tick's write round (`sim::state::Writes`).
+/// A declared WRITE window is staged under its own name; a knob window
+/// cannot ride a write round (its presses read first) and stages the stock
+/// dial as before: no declared panel stages one (autoland stages the VS
+/// wheel and the bug).
 pub fn stage_dial(writes: &mut sim::state::Writes, d: Dial, v: f64) {
     note(OurChange::Dial(d, v));
-    writes.set(d.name(), v);
+    match panel().window(d) {
+        Some(Window::Write { name, .. }) => writes.set(&name, v),
+        _ => writes.set(d.name(), v),
+    };
 }
 
 // ---------------------------------------------------------------------------
@@ -620,6 +699,24 @@ pub struct Panel {
     /// declared on both, the enroute follower flies the FMS's LNAV (#227).
     pub lnav: Option<String>,
     pub lnav_status: Option<String>,
+    /// The CMD lamp, where the servos are not the stock `servos_on`.
+    pub engage_status: Option<String>,
+    /// The panel's own disconnect and LVL CHG, where declared.
+    pub disconnect: Option<String>,
+    pub level_change: Option<String>,
+    /// The mode lamps: declared, [`Modes`] is built from them
+    /// ([`read_modes`]) and every mode status a loop reads is the lamp's
+    /// ([`read_status`]), never `autopilot_state`.
+    pub lamps: Option<crate::aircraft::ModeLamps>,
+    /// The MCP windows that are not the stock dials ([`Window`]).
+    pub windows: crate::aircraft::McpWindows,
+    /// The A/T arm and flight director switches ([`ensure_switch`]).
+    pub at_arm: Option<crate::aircraft::PanelSwitch>,
+    pub fd: Option<crate::aircraft::PanelSwitch>,
+    pub fd_fo: Option<crate::aircraft::PanelSwitch>,
+    /// TO/GA, declared and probed; nothing presses it yet (owed: the
+    /// takeoff's "A/T takes the thrust").
+    pub toga: Option<String>,
 }
 
 impl Default for Panel {
@@ -635,6 +732,15 @@ impl Default for Panel {
             coupled_ils: false,
             lnav: None,
             lnav_status: None,
+            engage_status: None,
+            disconnect: None,
+            level_change: None,
+            lamps: None,
+            windows: Default::default(),
+            at_arm: None,
+            fd: None,
+            fd_fo: None,
+            toga: None,
         }
     }
 }
@@ -672,6 +778,127 @@ impl Panel {
             lnav_status: a
                 .filter(|a| a.lnav_command.is_some())
                 .and_then(|a| a.lnav_status.clone()),
+            engage_status: a.and_then(|a| a.engage_status.clone()),
+            disconnect: a.and_then(|a| a.disconnect_command.clone()),
+            level_change: a.and_then(|a| a.level_change_command.clone()),
+            lamps: a.and_then(|a| a.lamps.clone()),
+            windows: a.and_then(|a| a.windows.clone()).unwrap_or_default(),
+            at_arm: a.and_then(|a| a.autothrottle_arm.clone()),
+            fd: a.and_then(|a| a.flight_director.clone()),
+            fd_fo: a.and_then(|a| a.flight_director_fo.clone()),
+            toga: a.and_then(|a| a.toga_command.clone()),
+        }
+    }
+
+    /// The window a dial is on this panel, `None` for the stock dial.
+    pub fn window(&self, d: Dial) -> Option<Window> {
+        let w = match d {
+            Dial::HeadingBug => self.windows.heading.as_ref(),
+            Dial::Altitude => self.windows.altitude.as_ref(),
+            Dial::Airspeed | Dial::AirspeedKts => self.windows.airspeed.as_ref(),
+            Dial::Vs | Dial::VviFpm => self.windows.vs.as_ref(),
+            Dial::HoverVector => None,
+        }?;
+        Window::from_profile(w)
+    }
+
+    /// The lamps this panel declares, in a fixed order, the CMD lamp with
+    /// them. Empty on a stock panel.
+    pub fn lamp_names(&self) -> Vec<(Lamp, String)> {
+        let mut out = Vec::new();
+        if let Some(l) = &self.lamps {
+            let lnav = self.lnav_status.as_ref();
+            for (k, n) in [
+                (Lamp::Heading, l.heading.as_ref()),
+                (Lamp::Vs, l.vs.as_ref()),
+                (Lamp::AltitudeHold, l.altitude_hold.as_ref()),
+                (Lamp::LevelChange, l.level_change.as_ref()),
+                (Lamp::Approach, l.approach.as_ref()),
+                (Lamp::Vorloc, l.vorloc.as_ref()),
+                (Lamp::Lnav, lnav),
+                (Lamp::Vnav, l.vnav.as_ref()),
+                (Lamp::Speed, l.speed.as_ref()),
+                (Lamp::N1, l.n1.as_ref()),
+            ] {
+                if let Some(n) = n {
+                    out.push((k, n.clone()));
+                }
+            }
+        }
+        if let Some(n) = &self.engage_status {
+            out.push((Lamp::Cmd, n.clone()));
+        }
+        out
+    }
+
+    /// The lamp standing in for a stock status read on this panel, and the
+    /// stock value a LIT lamp reads as (2 engaged for a mode, 1 for the
+    /// servos). `None`: read the stock name. Pure.
+    pub fn status_lamp(&self, stock: &str) -> Option<(String, f64)> {
+        let key = match stock {
+            names::SERVOS_ON => Lamp::Cmd,
+            names::HDG_STATUS => Lamp::Heading,
+            names::VS_STATUS => Lamp::Vs,
+            names::ALT_HOLD_STATUS => Lamp::AltitudeHold,
+            names::NAV_STATUS => Lamp::Vorloc,
+            names::GPSS_STATUS => Lamp::Lnav,
+            names::SPEED_STATUS => Lamp::LevelChange,
+            _ => return None,
+        };
+        // The CMD lamp stands in on its own; a mode lamp only on a panel
+        // that declares its lamps (a declared LNAV lamp alone is #227's,
+        // read beside the bitfield).
+        if key != Lamp::Cmd && self.lamps.is_none() {
+            return None;
+        }
+        let lit = if key == Lamp::Cmd { 1.0 } else { 2.0 };
+        self.lamp_names()
+            .into_iter()
+            .find(|(k, _)| *k == key)
+            .map(|(_, n)| (n, lit))
+    }
+
+    /// What a loop's tick reads of the panel beside its frame, in order:
+    /// the stock bitfield and autothrottle, or the declared lamps.
+    pub fn tick_names(&self) -> Vec<String> {
+        if self.lamps.is_none() {
+            let mut v: Vec<String> = [names::AP_STATE, names::AT_ON, names::AT_MODE]
+                .iter()
+                .map(|s| s.to_string())
+                .collect();
+            if let Some(n) = &self.engage_status {
+                v.push(n.clone());
+            }
+            return v;
+        }
+        self.lamp_names().into_iter().map(|(_, n)| n).collect()
+    }
+
+    /// The tick's panel reads ([`Panel::tick_names`], in order) as the
+    /// loop uses them. Pure.
+    pub fn tick_from(&self, reads: &[Option<f64>]) -> PanelTick {
+        let get = |i: usize| reads.get(i).copied().flatten().filter(|v| v.is_finite());
+        if self.lamps.is_none() {
+            return PanelTick {
+                modes: get(0).and_then(Modes::from_read),
+                at_engaged: autothrottle_engaged(get(1), get(2)),
+                servos: self.engage_status.as_ref().map(|_| get(3).map(lit_as(1.0))),
+                ..Default::default()
+            };
+        }
+        let lamps: Vec<(Lamp, Option<f64>)> = self
+            .lamp_names()
+            .into_iter()
+            .enumerate()
+            .map(|(i, (k, _))| (k, get(i)))
+            .collect();
+        let find = |k: Lamp| lamps.iter().find(|(x, _)| *x == k).map(|(_, v)| *v);
+        PanelTick {
+            modes: modes_from_lamps(&lamps),
+            at_engaged: autothrottle_from_lamps(&lamps),
+            servos: find(Lamp::Cmd).map(|v| v.map(lit_as(1.0))),
+            heading: find(Lamp::Heading).map(|v| v.map(lit_as(2.0))),
+            vs: find(Lamp::Vs).map(|v| v.map(lit_as(2.0))),
         }
     }
 
@@ -684,12 +911,14 @@ impl Panel {
     pub fn command(&self, b: Button) -> &str {
         match b {
             Button::Engage => &self.engage,
-            Button::Disconnect => cmd::SERVOS_OFF_ANY,
-            Button::DisconnectFd => cmd::SERVOS_FDIR_OFF,
+            Button::Disconnect => self.disconnect.as_deref().unwrap_or(cmd::SERVOS_OFF_ANY),
+            // The panel's own disconnect takes its servos out; its flight
+            // director is a switch, left where the crew put it.
+            Button::DisconnectFd => self.disconnect.as_deref().unwrap_or(cmd::SERVOS_FDIR_OFF),
             Button::Heading => &self.heading,
             Button::VerticalSpeed => &self.vertical_speed,
             Button::AltitudeHold => &self.altitude_hold,
-            Button::LevelChange => cmd::LEVEL_CHANGE,
+            Button::LevelChange => self.level_change.as_deref().unwrap_or(cmd::LEVEL_CHANGE),
             Button::Approach => &self.approach,
             Button::Nav => cmd::NAV,
             Button::Gpss => cmd::GPSS,
@@ -715,21 +944,364 @@ pub fn panel() -> Panel {
         .unwrap_or_default()
 }
 
+// ---------------------------------------------------------------------------
+// A declared MCP: its windows, its lamps, its switches (the Zibo 737-800X,
+// probed parked 2026-10-07: `mcp_hdg_dial` and `mcp_alt_dial` written 270
+// and 5,000, the stock dials followed within a second; the stock dials
+// written 100 and 3,000 were put back to the MCP's 270 and 5,000; HDG SEL,
+// ALT HLD, LVL CHG and APP lit their lamps and left `autopilot_state` at
+// 132 and the stock statuses at 0).
+// ---------------------------------------------------------------------------
+
+/// How a declared window is set ([`Panel::window`]).
+#[derive(Debug, Clone, PartialEq)]
+pub enum Window {
+    /// Written, read back from `readback` (the written name unless declared).
+    Write { name: String, readback: String },
+    /// Stepped on its knob's commands, `step` a press, read back from
+    /// `readback` (a window whose writes the airframe undoes).
+    Knob {
+        up: String,
+        down: String,
+        step: f64,
+        readback: String,
+    },
+}
+
+impl Window {
+    /// From a profile's window: a knob needs both commands, a step and a
+    /// readback; else a write. Pure.
+    pub fn from_profile(w: &crate::aircraft::McpWindow) -> Option<Self> {
+        if let (Some(up), Some(down), Some(step), Some(rb)) = (&w.up, &w.down, w.step, &w.readback) {
+            if step.is_finite() && step > 0.0 {
+                return Some(Window::Knob {
+                    up: up.clone(),
+                    down: down.clone(),
+                    step,
+                    readback: rb.clone(),
+                });
+            }
+        }
+        let name = w.write.clone()?;
+        Some(Window::Write {
+            readback: w.readback.clone().unwrap_or_else(|| name.clone()),
+            name,
+        })
+    }
+
+    pub fn readback(&self) -> &str {
+        match self {
+            Window::Write { readback, .. } | Window::Knob { readback, .. } => readback,
+        }
+    }
+}
+
+/// Presses a knob window takes at most in one setting: past it the window
+/// is read back where it got to (each press is a round trip, a frame).
+pub const KNOB_MAX_PRESSES: u32 = 120;
+
+/// The presses that take a knob window from `from` to `to`: the command
+/// (true up) and how many, bounded by [`KNOB_MAX_PRESSES`]. Pure.
+pub fn knob_presses(from: f64, to: f64, step: f64) -> (bool, u32) {
+    if !(from.is_finite() && to.is_finite() && step > 0.0) {
+        return (true, 0);
+    }
+    let n = ((to - from) / step).round();
+    (n >= 0.0, (n.abs() as u32).min(KNOB_MAX_PRESSES))
+}
+
+/// A knob window stepped to `to`: read, pressed, read back. `Err` when it
+/// could not be read (no measurement: nothing pressed). Taped `autoflight`
+/// `knob` when it ends away from the target.
+async fn step_knob(xp: &dyn XPlane, w: &Window, to: f64) -> anyhow::Result<f64> {
+    let Window::Knob {
+        up,
+        down,
+        step,
+        readback,
+    } = w
+    else {
+        anyhow::bail!("not a knob window");
+    };
+    let from = xp.get_float(readback).await?;
+    let (is_up, n) = knob_presses(from, to, *step);
+    let c = if is_up { up } else { down };
+    for _ in 0..n {
+        if xp.run_command(c).await.is_err() {
+            break;
+        }
+    }
+    let now = xp.get_float(readback).await?;
+    if (now - to).abs() > *step {
+        crate::blackbox::record(
+            "autoflight",
+            json!({"event": "knob", "window": readback, "from": from, "want": to,
+                   "presses": n, "read": now}),
+        );
+    }
+    Ok(now)
+}
+
+/// A lamp of a declared panel ([`Panel::lamp_names`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Lamp {
+    Heading,
+    Vs,
+    AltitudeHold,
+    LevelChange,
+    Approach,
+    Vorloc,
+    Lnav,
+    Vnav,
+    Speed,
+    N1,
+    Cmd,
+}
+
+fn lit(v: f64) -> bool {
+    v >= 0.5
+}
+
+fn lit_as(engaged: f64) -> impl Fn(f64) -> f64 {
+    move |v| if lit(v) { engaged } else { 0.0 }
+}
+
+/// [`Modes`] from a panel's lamps (each `None` unread): a lamp that did not
+/// read is no measurement, so neither is the whole. APP lit is the
+/// localiser and glideslope ARMED (the lamp is lit armed or captured and
+/// does not say which), VOR/LOC lit the localiser armed, LVL CHG the speed
+/// on the elevator, SPEED or N1 the autothrottle. The CMD lamp is not a
+/// mode. Pure.
+pub fn modes_from_lamps(lamps: &[(Lamp, Option<f64>)]) -> Option<Modes> {
+    let mut bits = 0;
+    for (k, v) in lamps {
+        if *k == Lamp::Cmd {
+            continue;
+        }
+        let v = (*v).filter(|v| v.is_finite())?;
+        if !lit(v) {
+            continue;
+        }
+        bits |= match k {
+            Lamp::Heading => Modes::HEADING,
+            Lamp::Vs => Modes::VS,
+            Lamp::AltitudeHold => Modes::ALT_HOLD,
+            Lamp::LevelChange => Modes::LEVEL_CHANGE | Modes::SPEED_ON_PITCH,
+            Lamp::Approach => Modes::LOC_ARMED | Modes::GS_ARMED,
+            Lamp::Vorloc => Modes::LOC_ARMED,
+            Lamp::Lnav => Modes::LNAV,
+            Lamp::Vnav => Modes::VNAV,
+            Lamp::Speed | Lamp::N1 => Modes::AUTOTHROTTLE,
+            Lamp::Cmd => 0,
+        };
+    }
+    Some(Modes(bits))
+}
+
+/// An engaged autothrottle from the SPEED and N1 lamps: either lit is
+/// engaged, both dark is not, neither read (or neither declared) is no
+/// measurement. Pure.
+pub fn autothrottle_from_lamps(lamps: &[(Lamp, Option<f64>)]) -> Option<bool> {
+    let reads: Vec<Option<f64>> = lamps
+        .iter()
+        .filter(|(k, _)| matches!(k, Lamp::Speed | Lamp::N1))
+        .map(|(_, v)| v.filter(|v| v.is_finite()))
+        .collect();
+    if reads.is_empty() || reads.iter().any(Option::is_none) {
+        return None;
+    }
+    Some(reads.iter().flatten().any(|v| lit(*v)))
+}
+
+/// A loop's tick reads of the panel ([`Panel::tick_from`]): the modes, the
+/// autothrottle, and on a lamp panel the statuses its stock frame fields
+/// do not carry.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct PanelTick {
+    pub modes: Option<Modes>,
+    pub at_engaged: Option<bool>,
+    /// `Some(read)` where the panel's lamp stands in for the frame's field
+    /// (stock-scaled, `None` unread); `None` takes the frame's.
+    servos: Option<Option<f64>>,
+    heading: Option<Option<f64>>,
+    vs: Option<Option<f64>>,
+}
+
+impl PanelTick {
+    /// A status the tick uses: the lamp's where the panel declares one,
+    /// else the frame's field (`Servos`, `HdgStatus`, `VsStatus`).
+    pub fn status(&self, st: &sim::state::State, f: sim::state::F) -> anyhow::Result<f64> {
+        use sim::state::F;
+        let lamp = match f {
+            F::Servos => self.servos,
+            F::HdgStatus => self.heading,
+            F::VsStatus => self.vs,
+            _ => None,
+        };
+        match lamp {
+            Some(Some(v)) => Ok(v),
+            Some(None) => Err(anyhow::anyhow!("{f:?} lamp unread")),
+            None => st.get(f),
+        }
+    }
+}
+
+/// A stock status read as this panel has it ([`Panel::status_lamp`]): the
+/// lamp standing in for `stock`, lit read as the stock's engaged value,
+/// else `stock` itself. Every loop's mode and servo status read goes
+/// through here, so a panel whose MCP the stock statuses do not follow
+/// answers from its own lamps.
+pub async fn read_status(xp: &dyn XPlane, stock: &str) -> anyhow::Result<f64> {
+    read_status_on(xp, &panel(), stock).await
+}
+
+/// [`read_status`] on a given panel.
+pub async fn read_status_on(xp: &dyn XPlane, p: &Panel, stock: &str) -> anyhow::Result<f64> {
+    match p.status_lamp(stock) {
+        Some((name, engaged)) => xp.get_float(&name).await.map(lit_as(engaged)),
+        None => xp.get_float(stock).await,
+    }
+}
+
+/// The mode bitfield as this panel has it: `autopilot_state`, or built
+/// from the declared lamps ([`modes_from_lamps`]), read in one round. As a
+/// float, for the sites that read it beside others.
+pub async fn read_ap_state(xp: &dyn XPlane) -> anyhow::Result<f64> {
+    read_ap_state_on(xp, &panel()).await
+}
+
+/// [`read_ap_state`] on a given panel.
+pub async fn read_ap_state_on(xp: &dyn XPlane, p: &Panel) -> anyhow::Result<f64> {
+    if p.lamps.is_none() {
+        return xp.get_float(names::AP_STATE).await;
+    }
+    let lamps = p.lamp_names();
+    let reads = futures::future::join_all(lamps.iter().map(|(_, n)| xp.get_float(n))).await;
+    let read: Vec<(Lamp, Option<f64>)> = lamps
+        .iter()
+        .zip(reads)
+        .map(|((k, _), r)| (*k, r.ok()))
+        .collect();
+    modes_from_lamps(&read)
+        .map(|m| m.0 as f64)
+        .ok_or_else(|| anyhow::anyhow!("a mode lamp unread"))
+}
+
+/// [`read_ap_state`] decoded: `None` unread.
+pub async fn read_modes(xp: &dyn XPlane) -> Option<Modes> {
+    read_ap_state(xp).await.ok().and_then(Modes::from_read)
+}
+
+/// An engaged autothrottle as this panel has it: the stock autothrottle
+/// reads, or the SPEED and N1 lamps. `None` unread.
+pub async fn read_autothrottle_engaged(xp: &dyn XPlane) -> Option<bool> {
+    read_autothrottle_engaged_on(xp, &panel()).await
+}
+
+/// [`read_autothrottle_engaged`] on a given panel.
+pub async fn read_autothrottle_engaged_on(xp: &dyn XPlane, p: &Panel) -> Option<bool> {
+    if p.lamps.is_none() {
+        let (on, mode) = tokio::join!(xp.get_float(names::AT_ON), xp.get_float(names::AT_MODE));
+        return autothrottle_engaged(on.ok(), mode.ok());
+    }
+    let lamps: Vec<(Lamp, String)> = p
+        .lamp_names()
+        .into_iter()
+        .filter(|(k, _)| matches!(k, Lamp::Speed | Lamp::N1))
+        .collect();
+    let reads = futures::future::join_all(lamps.iter().map(|(_, n)| xp.get_float(n))).await;
+    let read: Vec<(Lamp, Option<f64>)> = lamps
+        .iter()
+        .zip(reads)
+        .map(|((k, _), r)| (*k, r.ok()))
+        .collect();
+    autothrottle_from_lamps(&read)
+}
+
+/// A switch on the panel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Switch {
+    AutothrottleArm,
+    FlightDirector,
+    FlightDirectorFo,
+}
+
+impl Panel {
+    /// The declared switch, if any.
+    pub fn switch(&self, s: Switch) -> Option<&crate::aircraft::PanelSwitch> {
+        match s {
+            Switch::AutothrottleArm => self.at_arm.as_ref(),
+            Switch::FlightDirector => self.fd.as_ref(),
+            Switch::FlightDirectorFo => self.fd_fo.as_ref(),
+        }
+    }
+}
+
+/// What a declared toggle switch owes to read `want`: `None` in state (or
+/// unread: no measurement, nothing fired), `Some(())` fire it once. Pure.
+pub fn switch_step(position: Option<f64>, want: bool) -> Option<()> {
+    let at = position.filter(|v| v.is_finite())?;
+    (lit(at) != want).then_some(())
+}
+
+/// A declared switch brought to `want`: its position read, its toggle fired
+/// only on a difference, read back after a settle. `None` when the panel
+/// declares no such switch or the position did not read; `Some(true)` in
+/// state (already, or now), `Some(false)` fired and not taken. Taped
+/// `autoflight` `switch` when fired.
+pub async fn ensure_switch(xp: &dyn XPlane, s: Switch, want: bool, site: &str) -> Option<bool> {
+    ensure_switch_on(xp, &panel(), s, want, site).await
+}
+
+/// [`ensure_switch`] on a given panel.
+pub async fn ensure_switch_on(xp: &dyn XPlane, p: &Panel, s: Switch, want: bool, site: &str) -> Option<bool> {
+    let sw = p.switch(s)?.clone();
+    let before = xp.get_float(&sw.position).await.ok().filter(|v| v.is_finite())?;
+    if switch_step(Some(before), want).is_none() {
+        return Some(true);
+    }
+    let sent = xp.run_command(&sw.command).await.is_ok();
+    tokio::time::sleep(Duration::from_millis(SETTLE_MS)).await;
+    let after = xp.get_float(&sw.position).await.ok();
+    let taken = after.is_some_and(|v| lit(v) == want);
+    crate::blackbox::record(
+        "autoflight",
+        json!({"event": "switch", "switch": s, "want": want, "site": site, "cmd": sw.command,
+               "sent": sent, "before": before, "after": after, "taken": taken}),
+    );
+    Some(taken)
+}
+
 /// Press a button: the airframe's command for it. Routine presses (the
 /// knob's steps, a loop's re-engage every tick) are not taped here; the
 /// sites tape their own decisions, and the mode presses below are taped by
 /// [`press_logged`].
 pub async fn press(xp: &dyn XPlane, b: Button) -> anyhow::Result<()> {
+    press_on(xp, &panel(), b).await
+}
+
+/// [`press`] on a given panel. A declared CMD lamp makes the engage a
+/// read-before-fire press: on a Boeing MCP pushing a LIT engage switch
+/// disengages the autopilot (FCOM), so it is pressed only on a lamp that
+/// reads dark, never on one that reads lit or does not read (`Ok`, nothing
+/// sent: the engage's own watch reads the servos and presses again).
+pub async fn press_on(xp: &dyn XPlane, p: &Panel, b: Button) -> anyhow::Result<()> {
+    if b == Button::Engage {
+        if let Some(lamp) = &p.engage_status {
+            if !xp.get_float(lamp).await.is_ok_and(|v| v.is_finite() && !lit(v)) {
+                return Ok(());
+            }
+        }
+    }
     note(OurChange::Press(b));
-    let p = panel();
     xp.run_command(p.command(b)).await
 }
 
-/// [`press`], on the tape: blackbox `autoflight` `press` with the site and
-/// the command the panel resolved.
-pub async fn press_logged(xp: &dyn XPlane, b: Button, site: &str) -> bool {
+/// [`press_logged`] on a given panel.
+pub async fn press_logged_on(xp: &dyn XPlane, p: &Panel, b: Button, site: &str) -> bool {
     note(OurChange::Press(b));
-    let p = panel();
     let c = p.command(b).to_string();
     let sent = xp.run_command(&c).await.is_ok();
     crate::blackbox::record(
@@ -737,6 +1309,12 @@ pub async fn press_logged(xp: &dyn XPlane, b: Button, site: &str) -> bool {
         json!({"event": "press", "button": b, "cmd": c, "site": site, "sent": sent}),
     );
     sent
+}
+
+/// [`press`], on the tape: blackbox `autoflight` `press` with the site and
+/// the command the panel resolved.
+pub async fn press_logged(xp: &dyn XPlane, b: Button, site: &str) -> bool {
+    press_logged_on(xp, &panel(), b, site).await
 }
 
 /// What a loop wants the autopilot to fly laterally.
@@ -824,9 +1402,14 @@ pub fn reconcile(want: Want, read: ModeRead) -> Vec<Button> {
 /// Press what [`reconcile`] asks, in order, each on the tape. `false` when
 /// any press did not go out (every one is still tried).
 pub async fn apply(xp: &dyn XPlane, presses: &[Button], site: &str) -> bool {
+    apply_on(xp, &panel(), presses, site).await
+}
+
+/// [`apply`] on a given panel.
+pub async fn apply_on(xp: &dyn XPlane, p: &Panel, presses: &[Button], site: &str) -> bool {
     let mut all = true;
     for b in presses {
-        all &= press_logged(xp, *b, site).await;
+        all &= press_logged_on(xp, p, *b, site).await;
     }
     all
 }
@@ -1011,10 +1594,7 @@ pub const SETTLE_MS: u64 = 400;
 /// come out, `None` it was not engaged (or unread: no measurement). Taped.
 #[cfg_attr(not(test), allow(dead_code))] // offered to the other loops
 pub async fn take_thrust(xp: &dyn XPlane, owner: &str) -> Option<bool> {
-    let read = || async {
-        let (on, mode) = tokio::join!(xp.get_float(names::AT_ON), xp.get_float(names::AT_MODE));
-        autothrottle_engaged(on.ok(), mode.ok())
-    };
+    let read = || read_autothrottle_engaged(xp);
     if read().await != Some(true) {
         return None;
     }
@@ -1043,8 +1623,7 @@ pub async fn take_thrust(xp: &dyn XPlane, owner: &str) -> Option<bool> {
 /// airframe's autothrottle-off only when engaged, on the tape. `Some(true)`
 /// pressed, `None` not engaged or unread.
 pub async fn drop_thrust_now(xp: &dyn XPlane, owner: &str) -> Option<bool> {
-    let (on, mode) = tokio::join!(xp.get_float(names::AT_ON), xp.get_float(names::AT_MODE));
-    if autothrottle_engaged(on.ok(), mode.ok()) != Some(true) {
+    if read_autothrottle_engaged(xp).await != Some(true) {
         return None;
     }
     let p = panel();
@@ -1069,17 +1648,13 @@ pub async fn drop_thrust_now(xp: &dyn XPlane, owner: &str) -> Option<bool> {
 /// already), `Some(false)` pressed and not armed, `None` unread. Taped.
 #[cfg_attr(not(test), allow(dead_code))] // offered to the other loops
 pub async fn arm_approach(xp: &dyn XPlane, site: &str) -> Option<bool> {
-    let before = Modes::from_read(xp.get_float(names::AP_STATE).await.ok()?)?;
+    let before = read_modes(xp).await?;
     if before.approach_any() {
         return Some(true);
     }
     press_logged(xp, Button::Approach, site).await;
     tokio::time::sleep(Duration::from_millis(SETTLE_MS)).await;
-    let after = xp
-        .get_float(names::AP_STATE)
-        .await
-        .ok()
-        .and_then(Modes::from_read);
+    let after = read_modes(xp).await;
     crate::blackbox::record(
         "autoflight",
         json!({"event": "approach_arm", "site": site, "before": before.words(),
@@ -1170,7 +1745,7 @@ impl LnavEngage {
 pub async fn read_lnav(xp: &dyn XPlane) -> Option<bool> {
     let p = panel();
     let status_name = p.lnav_status.clone()?;
-    let (status, state) = tokio::join!(xp.get_float(&status_name), xp.get_float(names::AP_STATE));
+    let (status, state) = tokio::join!(xp.get_float(&status_name), read_ap_state(xp));
     lnav_engaged(status.ok(), state.ok().and_then(Modes::from_read))
 }
 
@@ -1188,10 +1763,7 @@ pub async fn press_lnav(xp: &dyn XPlane, site: &str) -> bool {
 pub async fn lnav_out(xp: &dyn XPlane, hdg_mag: f64, site: &str) -> Option<bool> {
     let hdg = hdg_mag.rem_euclid(360.0);
     let bug_ok = set_dial(xp, Dial::HeadingBug, hdg).await.is_ok();
-    let (hdg_r, state_r) = tokio::join!(
-        xp.get_float(names::HDG_STATUS),
-        xp.get_float(names::AP_STATE)
-    );
+    let (hdg_r, state_r) = tokio::join!(read_status(xp, names::HDG_STATUS), read_ap_state(xp));
     let hdg_on = hdg_r.ok().map(|v| v > 0.5);
     let lnav_on = state_r.ok().and_then(Modes::from_read).map(Modes::lnav);
     let press = lnav_on == Some(true) || hdg_on == Some(false);
@@ -1199,10 +1771,7 @@ pub async fn lnav_out(xp: &dyn XPlane, hdg_mag: f64, site: &str) -> Option<bool>
         press_logged(xp, Button::Heading, site).await;
         tokio::time::sleep(Duration::from_millis(SETTLE_MS)).await;
     }
-    let (hdg_r, state_r) = tokio::join!(
-        xp.get_float(names::HDG_STATUS),
-        xp.get_float(names::AP_STATE)
-    );
+    let (hdg_r, state_r) = tokio::join!(read_status(xp, names::HDG_STATUS), read_ap_state(xp));
     let after_hdg = hdg_r.ok().map(|v| v > 0.5);
     let after_lnav = state_r.ok().and_then(Modes::from_read).map(Modes::lnav);
     let taken = match (after_hdg, after_lnav) {
@@ -1235,7 +1804,7 @@ pub async fn engage_confirmed(xp: &dyn XPlane, site: &str, max_s: f64) -> bool {
 /// when off, read back, up to `tries`. `true` when it reads on.
 pub async fn ensure_on(xp: &dyn XPlane, b: Button, status: &str, site: &str, tries: u32) -> bool {
     for _ in 0..tries.max(1) {
-        match xp.get_float(status).await {
+        match read_status(xp, status).await {
             Ok(v) if v >= 0.5 => return true,
             Ok(_) => {
                 press_logged(xp, b, site).await;
@@ -1244,7 +1813,7 @@ pub async fn ensure_on(xp: &dyn XPlane, b: Button, status: &str, site: &str, tri
             Err(_) => return false,
         }
     }
-    xp.get_float(status).await.is_ok_and(|v| v >= 0.5)
+    read_status(xp, status).await.is_ok_and(|v| v >= 0.5)
 }
 
 /// Hold this level: servos in, the window AT the level (rounded to the
@@ -2107,5 +2676,349 @@ mod tests {
         let fake = FakeXPlane::with_reads(&[(names::HDG_STATUS, 2.0), (names::AP_STATE, 16386.0)]);
         assert_eq!(lnav_out(&fake, 90.0, "test").await, Some(true));
         assert!(!fake.ran(cmd::HEADING));
+    }
+
+    // -----------------------------------------------------------------------
+    // A declared MCP: the Zibo 737-800X (probed parked 2026-10-07).
+    // -----------------------------------------------------------------------
+
+    const Z: &str = "laminar/B738/autopilot/";
+
+    fn zibo() -> Panel {
+        Panel::from_profile(&crate::aircraft::load("zibo_738").expect("zibo profile"))
+    }
+
+    fn z(n: &str) -> String {
+        format!("{Z}{n}")
+    }
+
+    /// The Zibo's panel is its own buttons, lamps, windows and switches, and
+    /// every one of them rides the swap's profile probe. CMD B is never
+    /// named; its ILS is not coupled (the APP lamp cannot tell armed from
+    /// captured).
+    #[test]
+    fn the_zibo_panel_is_its_own_lamps_windows_and_switches() {
+        let prof = crate::aircraft::load("zibo_738").expect("zibo profile");
+        let p = Panel::from_profile(&prof);
+        assert_eq!(p.engage, z("cmd_a_press"));
+        assert_eq!(p.engage_status.as_deref(), Some(z("cmd_a_status").as_str()));
+        assert_eq!(p.command(Button::Disconnect), z("capt_disco_press"));
+        assert_eq!(p.command(Button::DisconnectFd), z("capt_disco_press"));
+        assert_eq!(p.command(Button::LevelChange), z("lvl_chg_press"));
+        assert_eq!(p.command(Button::AutothrottleOff), z("left_at_dis_press"));
+        assert!(p.lamps.is_some() && !p.coupled_ils);
+        assert_eq!(
+            p.window(Dial::Altitude),
+            Some(Window::Write {
+                name: z("mcp_alt_dial"),
+                readback: z("mcp_alt_dial")
+            })
+        );
+        assert_eq!(
+            p.window(Dial::HeadingBug).map(|w| w.readback().to_string()),
+            Some(z("mcp_hdg_dial"))
+        );
+        assert!(matches!(
+            p.window(Dial::Airspeed),
+            Some(Window::Knob { step, ref readback, .. }) if step == 1.0 && *readback == z("mcp_speed_dial_kts_mach")
+        ));
+        assert_eq!(p.window(Dial::Vs), p.window(Dial::VviFpm));
+        assert_eq!(p.window(Dial::HoverVector), None);
+        for s in [Switch::AutothrottleArm, Switch::FlightDirector, Switch::FlightDirectorFo] {
+            assert!(p.switch(s).is_some(), "{s:?}");
+        }
+        let names = crate::aircraft::profile_references(&prof);
+        let mut want: Vec<String> = p.lamp_names().into_iter().map(|(_, n)| n).collect();
+        want.extend([
+            z("capt_disco_press"),
+            z("lvl_chg_press"),
+            z("mcp_alt_dial"),
+            z("mcp_hdg_dial"),
+            z("mcp_speed_dial_kts_mach"),
+            "sim/autopilot/airspeed_up".into(),
+            "sim/cockpit2/autopilot/vvi_dial_fpm".into(),
+            z("autothrottle_arm_toggle"),
+            z("autothrottle_arm_pos"),
+            z("flight_director_toggle"),
+            z("flight_director_fo_pos"),
+            z("left_toga_press"),
+        ]);
+        for n in &want {
+            assert!(names.iter().any(|x| x == n), "{n} not probed");
+        }
+        assert!(!names.iter().any(|x| x.contains("cmd_b")), "CMD B is never named");
+    }
+
+    /// The probe on the ramp: HDG SEL lit read as HDG, LVL CHG and APP lit
+    /// as the speed on the elevator and both halves armed, while the stock
+    /// `autopilot_state` sat at 132. A lamp that did not read is no
+    /// measurement; the autothrottle is the SPEED or N1 lamp.
+    #[test]
+    fn a_lamp_panels_modes_are_its_lamps() {
+        let p = zibo();
+        let lamps = p.lamp_names();
+        let with = |lit: &[Lamp]| -> Vec<(Lamp, Option<f64>)> {
+            lamps
+                .iter()
+                .map(|(k, _)| (*k, Some(if lit.contains(k) { 1.0 } else { 0.0 })))
+                .collect()
+        };
+        let m = modes_from_lamps(&with(&[Lamp::Heading])).unwrap();
+        assert!(m.heading() && !m.vs() && !m.approach_any() && !m.autothrottle());
+        let m = modes_from_lamps(&with(&[Lamp::LevelChange, Lamp::Approach])).unwrap();
+        assert!(m.loc_armed() && m.gs_armed() && !m.loc() && !m.gs());
+        assert!(m.0 & Modes::LEVEL_CHANGE != 0);
+        let m = modes_from_lamps(&with(&[Lamp::Lnav, Lamp::AltitudeHold, Lamp::Cmd])).unwrap();
+        assert!(m.lnav() && m.0 & Modes::ALT_HOLD != 0);
+        assert_eq!(modes_from_lamps(&with(&[])), Some(Modes(0)));
+        let mut unread = with(&[Lamp::Heading]);
+        unread[1].1 = None;
+        assert_eq!(modes_from_lamps(&unread), None, "one dark read is no measurement");
+        assert_eq!(autothrottle_from_lamps(&with(&[Lamp::N1])), Some(true));
+        assert_eq!(autothrottle_from_lamps(&with(&[])), Some(false));
+        assert_eq!(autothrottle_from_lamps(&[]), None, "no lamps declared");
+        // The tick: the lamps beside the frame, the frame's stock statuses
+        // never believed over them.
+        let reads: Vec<Option<f64>> = lamps
+            .iter()
+            .map(|(k, _)| Some(if *k == Lamp::Heading || *k == Lamp::Cmd { 1.0 } else { 0.0 }))
+            .collect();
+        let t = p.tick_from(&reads);
+        assert!(t.modes.unwrap().heading());
+        assert_eq!(t.at_engaged, Some(false));
+        use sim::state::{Source, State, F};
+        let st = State::from_parts(
+            Err(anyhow::anyhow!("unread")),
+            &[(F::HdgStatus, 0.0), (F::Servos, 0.0), (F::VsStatus, 2.0)],
+            Source::Split,
+        );
+        assert_eq!(t.status(&st, F::HdgStatus).unwrap(), 2.0);
+        assert_eq!(t.status(&st, F::Servos).unwrap(), 1.0);
+        assert_eq!(t.status(&st, F::VsStatus).unwrap(), 0.0);
+        assert_eq!(p.tick_names().len(), lamps.len());
+    }
+
+    /// A stock panel is untouched: the same reads, in the same order, the
+    /// frame's own statuses, the same names for every status and dial.
+    #[test]
+    fn a_stock_panel_reads_and_writes_what_it_always_did() {
+        let p = Panel::default();
+        assert_eq!(
+            p.tick_names(),
+            vec![names::AP_STATE, names::AT_ON, names::AT_MODE]
+        );
+        let t = p.tick_from(&[Some(1584.0), Some(1.0), Some(1.0)]);
+        assert!(t.modes.unwrap().loc() && t.at_engaged == Some(true));
+        use sim::state::{Source, State, F};
+        let st = State::from_parts(
+            Err(anyhow::anyhow!("unread")),
+            &[(F::HdgStatus, 2.0), (F::Servos, 1.0)],
+            Source::Split,
+        );
+        assert_eq!(t.status(&st, F::HdgStatus).unwrap(), 2.0);
+        assert_eq!(t.status(&st, F::Servos).unwrap(), 1.0);
+        assert!(t.status(&st, F::VsStatus).is_err(), "unread stays unread");
+        for s in [
+            names::SERVOS_ON,
+            names::HDG_STATUS,
+            names::VS_STATUS,
+            names::ALT_HOLD_STATUS,
+        ] {
+            assert_eq!(p.status_lamp(s), None);
+        }
+        for d in [Dial::HeadingBug, Dial::Altitude, Dial::Vs, Dial::Airspeed] {
+            assert_eq!(p.window(d), None);
+        }
+        // Every profile in the tree but the Zibo flies the stock reads.
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("profiles");
+        let mut ids: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .filter_map(|e| {
+                let p = e.ok()?.path();
+                if p.extension()? != "yaml" {
+                    return None;
+                }
+                Some(p.file_stem()?.to_string_lossy().to_string())
+            })
+            .collect();
+        ids.sort();
+        assert!(ids.len() > 5, "{ids:?}");
+        for id in ids {
+            if id == "zibo_738" {
+                continue;
+            }
+            let Some(prof) = crate::aircraft::load(&id) else { continue };
+            let q = Panel::from_profile(&prof);
+            assert!(q.lamps.is_none() && q.engage_status.is_none(), "{id}");
+            assert_eq!(q.windows, Default::default(), "{id}");
+            assert_eq!(q.tick_names(), p.tick_names(), "{id}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_lamp_panels_statuses_and_bitfield_are_read_from_its_lamps() {
+        let p = zibo();
+        let fake = FakeXPlane::with_reads(&[
+            (names::AP_STATE, 132.0),
+            (names::HDG_STATUS, 0.0),
+            (names::SERVOS_ON, 0.0),
+        ]);
+        for (_, n) in p.lamp_names() {
+            fake.set_read(&n, 0.0);
+        }
+        fake.set_read(&z("hdg_sel_status"), 1.0);
+        fake.set_read(&z("cmd_a_status"), 1.0);
+        assert_eq!(read_status_on(&fake, &p, names::HDG_STATUS).await.unwrap(), 2.0);
+        assert_eq!(read_status_on(&fake, &p, names::SERVOS_ON).await.unwrap(), 1.0);
+        assert_eq!(read_status_on(&fake, &p, names::VS_STATUS).await.unwrap(), 0.0);
+        let m = Modes::from_read(read_ap_state_on(&fake, &p).await.unwrap()).unwrap();
+        assert!(m.heading() && !m.has(Modes::PITCH_SYNC), "the lamps, never 132");
+        assert_eq!(read_autothrottle_engaged_on(&fake, &p).await, Some(false));
+        // The stock panel still reads the stock names.
+        let stock = Panel::default();
+        assert_eq!(read_status_on(&fake, &stock, names::SERVOS_ON).await.unwrap(), 0.0);
+        assert_eq!(read_ap_state_on(&fake, &stock).await.unwrap(), 132.0);
+        // A lamp that does not read: no bitfield.
+        let fake = FakeXPlane::with_reads(&[(names::AP_STATE, 132.0)]);
+        assert!(read_ap_state_on(&fake, &p).await.is_err());
+        assert!(read_status_on(&fake, &p, names::HDG_STATUS).await.is_err());
+    }
+
+    /// The intent on the Zibo: the lamps read, the presses its own buttons,
+    /// only on a difference, nothing on a failed read.
+    #[tokio::test]
+    async fn reconcile_presses_the_declared_buttons_on_a_lamp_difference() {
+        let p = zibo();
+        let want = Want {
+            lateral: Some(Lateral::Heading),
+            vertical: Some(Vertical::Vs),
+        };
+        let fake = FakeXPlane::with_reads(&[(&z("hdg_sel_status"), 0.0), (&z("vs_status"), 1.0)]);
+        let read = ModeRead {
+            hdg_status: read_status_on(&fake, &p, names::HDG_STATUS).await.ok(),
+            vs_status: read_status_on(&fake, &p, names::VS_STATUS).await.ok(),
+            modes: None,
+        };
+        let presses = reconcile(want, read);
+        assert_eq!(presses, vec![Button::Heading]);
+        assert!(apply_on(&fake, &p, &presses, "test").await);
+        assert_eq!(fake.ran_count(&z("hdg_sel_press")), 1);
+        assert!(!fake.ran(cmd::HEADING) && !fake.ran(&z("vs_press")));
+        // Unread lamps: nothing pressed.
+        let fake = FakeXPlane::new();
+        let read = ModeRead {
+            hdg_status: read_status_on(&fake, &p, names::HDG_STATUS).await.ok(),
+            vs_status: read_status_on(&fake, &p, names::VS_STATUS).await.ok(),
+            modes: None,
+        };
+        assert!(reconcile(want, read).is_empty());
+        // The coupled intent over a lit APP (armed or captured): no HDG.
+        let mut lamps: Vec<(Lamp, Option<f64>)> =
+            p.lamp_names().into_iter().map(|(k, _)| (k, Some(0.0))).collect();
+        for l in lamps.iter_mut() {
+            if l.0 == Lamp::Approach {
+                l.1 = Some(1.0);
+            }
+        }
+        let coupled = Want {
+            lateral: Some(Lateral::Coupled),
+            vertical: None,
+        };
+        let read = ModeRead {
+            hdg_status: Some(0.0),
+            vs_status: None,
+            modes: modes_from_lamps(&lamps),
+        };
+        assert!(reconcile(coupled, read).is_empty());
+    }
+
+    /// The windows: written to the MCP's own dataref and read back from it
+    /// (the stock dial write the Zibo undoes is never made); the speed
+    /// window stepped on its knob, bounded, and read back.
+    #[tokio::test]
+    async fn a_declared_window_is_written_or_stepped_and_read_back() {
+        let p = zibo();
+        let fake = FakeXPlane::with_reads(&[(&z("mcp_alt_dial"), 5000.0)]);
+        set_dial_on(&fake, &p, Dial::Altitude, 7000.0).await.unwrap();
+        assert_eq!(fake.last_write(&z("mcp_alt_dial")), Some(7000.0));
+        assert!(!fake.wrote(Dial::Altitude.read_name()));
+        assert_eq!(read_dial_on(&fake, &p, Dial::Altitude).await.unwrap(), 5000.0);
+        // Confirmed: the read back says the write did not take.
+        let mut last = None;
+        assert!(!set_dial_confirmed_on("test", &fake, &p, Dial::Altitude, 7000.0, &mut last, 50.0).await);
+        fake.set_read(&z("mcp_alt_dial"), 7000.0);
+        assert!(set_dial_confirmed_on("test", &fake, &p, Dial::Altitude, 7000.0, &mut last, 50.0).await);
+        assert_eq!(last, Some(7000.0));
+        // The knob: 100 to 150 is fifty presses up, read back.
+        let spd = z("mcp_speed_dial_kts_mach");
+        let fake = FakeXPlane::with_reads(&[(&spd, 100.0)]);
+        fake.step_on_command("sim/autopilot/airspeed_up", &spd, 1.0);
+        fake.step_on_command("sim/autopilot/airspeed_down", &spd, -1.0);
+        set_dial_on(&fake, &p, Dial::Airspeed, 150.0).await.unwrap();
+        assert_eq!(fake.ran_count("sim/autopilot/airspeed_up"), 50);
+        assert!(!fake.wrote(&spd) && !fake.wrote(Dial::Airspeed.read_name()));
+        assert_eq!(read_dial_on(&fake, &p, Dial::Airspeed).await.unwrap(), 150.0);
+        let mut last = None;
+        assert!(set_dial_confirmed_on("test", &fake, &p, Dial::Airspeed, 145.0, &mut last, 0.5).await);
+        assert_eq!(fake.ran_count("sim/autopilot/airspeed_down"), 5);
+        // An unread knob is no measurement: nothing pressed.
+        let fake = FakeXPlane::new();
+        assert!(set_dial_on(&fake, &p, Dial::Airspeed, 150.0).await.is_err());
+        assert!(!fake.ran("sim/autopilot/airspeed_up"));
+        assert_eq!(knob_presses(0.0, 10_000.0, 1.0), (true, KNOB_MAX_PRESSES));
+        assert_eq!(knob_presses(150.0, 140.4, 1.0), (false, 10));
+        // The stock panel writes the stock dial, as it always did.
+        let fake = FakeXPlane::new();
+        set_dial_on(&fake, &Panel::default(), Dial::Altitude, 3000.0).await.unwrap();
+        assert_eq!(fake.last_write(Dial::Altitude.read_name()), Some(3000.0));
+    }
+
+    /// A lit CMD A is never pushed (a Boeing's lit engage switch is a
+    /// disengage); dark, it is; unread, nothing goes out. The stock panel's
+    /// `servos_on` is pressed as before.
+    #[tokio::test]
+    async fn a_declared_engage_is_pressed_only_on_a_dark_lamp() {
+        let p = zibo();
+        let (press_a, lamp_a) = (z("cmd_a_press"), z("cmd_a_status"));
+        let fake = FakeXPlane::with_reads(&[(&lamp_a, 1.0)]);
+        press_on(&fake, &p, Button::Engage).await.unwrap();
+        assert!(!fake.ran(&press_a));
+        fake.set_read(&lamp_a, 0.0);
+        press_on(&fake, &p, Button::Engage).await.unwrap();
+        assert_eq!(fake.ran_count(&press_a), 1);
+        let fake = FakeXPlane::new();
+        press_on(&fake, &p, Button::Engage).await.unwrap();
+        assert!(!fake.ran(&press_a));
+        press_on(&fake, &Panel::default(), Button::Engage).await.unwrap();
+        assert!(fake.ran(cmd::SERVOS_ON));
+    }
+
+    /// A toggle switch is read before it is fired, fired only on a
+    /// difference, and read back; unread is no measurement.
+    #[tokio::test]
+    async fn a_declared_switch_is_read_before_its_toggle_is_fired() {
+        let p = zibo();
+        let (cmd_fd, pos_fd) = (z("flight_director_toggle"), z("flight_director_pos"));
+        let fake = FakeXPlane::with_reads(&[(&pos_fd, 0.0)]);
+        fake.set_on_command(&cmd_fd, &pos_fd, 1.0);
+        assert_eq!(ensure_switch_on(&fake, &p, Switch::FlightDirector, true, "test").await, Some(true));
+        assert_eq!(fake.ran_count(&cmd_fd), 1);
+        assert_eq!(ensure_switch_on(&fake, &p, Switch::FlightDirector, true, "test").await, Some(true));
+        assert_eq!(fake.ran_count(&cmd_fd), 1, "on already: never toggled off");
+        // The A/T arm that does not take (the ramp on battery, 2026-10-07).
+        let (cmd_at, pos_at) = (z("autothrottle_arm_toggle"), z("autothrottle_arm_pos"));
+        let fake = FakeXPlane::with_reads(&[(&pos_at, 0.0)]);
+        assert_eq!(ensure_switch_on(&fake, &p, Switch::AutothrottleArm, true, "test").await, Some(false));
+        assert_eq!(fake.ran_count(&cmd_at), 1);
+        let fake = FakeXPlane::new();
+        assert_eq!(ensure_switch_on(&fake, &p, Switch::AutothrottleArm, true, "test").await, None);
+        assert!(!fake.ran(&cmd_at));
+        assert_eq!(
+            ensure_switch_on(&fake, &Panel::default(), Switch::FlightDirector, true, "test").await,
+            None,
+            "no switch declared"
+        );
+        assert_eq!(switch_step(Some(1.0), false), Some(()));
+        assert_eq!(switch_step(None, true), None);
     }
 }

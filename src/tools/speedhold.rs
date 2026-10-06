@@ -1259,13 +1259,11 @@ async fn governor(
         match mode {
             Mode::Flight => {
                 let thr_name = throttle_dataref();
-                let (ias_r, thr_r, at_on, at_mode) = tokio::join!(
+                let (ias_r, thr_r, engaged) = tokio::join!(
                     xp.get_float(IAS),
                     xp.get_float(&thr_name),
-                    xp.get_float(crate::autoflight::names::AT_ON),
-                    xp.get_float(crate::autoflight::names::AT_MODE),
+                    crate::autoflight::read_autothrottle_engaged(&xp),
                 );
-                let engaged = crate::autoflight::autothrottle_engaged(at_on.ok(), at_mode.ok());
                 let step = thrust_watch.step(clock.elapsed().as_secs_f64(), engaged);
                 let took = matches!(step, crate::autoflight::ThrustStep::Take { .. });
                 if let Some(line) = crate::autoflight::act_thrust(&xp, step, "speed_governor").await {

@@ -791,7 +791,7 @@ async fn disconnect_autopilot(xp: &dyn crate::xplane::XPlane) -> Option<bool> {
     // swung 70 degrees right from 91 kt under full left steer, #197).
     let on = |r: Result<f64, _>| r.is_ok_and(|v: f64| v > 0.5);
     let (servos, master, damper) = tokio::join!(
-        xp.get_float(SERVOS_ON),
+        crate::autoflight::read_status(&*xp, SERVOS_ON),
         xp.get_float(AP_MASTER_ON),
         xp.get_float(YAW_DAMPER_ON),
     );
@@ -806,7 +806,7 @@ async fn disconnect_autopilot(xp: &dyn crate::xplane::XPlane) -> Option<bool> {
         let _ = xp.run_command(CMD_YAW_DAMPER_OFF).await;
     }
     let (s2, m2, d2) = tokio::join!(
-        xp.get_float(SERVOS_ON),
+        crate::autoflight::read_status(&*xp, SERVOS_ON),
         xp.get_float(AP_MASTER_ON),
         xp.get_float(YAW_DAMPER_ON),
     );
@@ -1723,21 +1723,17 @@ fn spawn_autoland(launch: AutolandLaunch) {
                 // Beside the frame, in its round: the lever, the autopilot's
                 // mode bitfield and the autothrottle (`crate::autoflight`:
                 // the modes' one truth, and a thrust this loop owns).
-                use autoflight::names as afn;
+                // The panel's reads are the owner's (`Panel::tick_names`):
+                // the stock bitfield and autothrottle, or a declared MCP's
+                // own lamps (the Zibo's), in the same round.
+                let af_panel = autoflight::panel();
+                let mut extra_names: Vec<String> = vec![thr_name.clone()];
+                extra_names.extend(af_panel.tick_names());
+                let extra_refs: Vec<&str> = extra_names.iter().map(String::as_str).collect();
                 let (st, extra) = if ils.is_some() {
-                    sim::state::read_with(
-                        &xp,
-                        sim::state::Want(AUTOLAND_WANT_ILS),
-                        &[thr_name.as_str(), afn::AP_STATE, afn::AT_ON, afn::AT_MODE],
-                    )
-                    .await
+                    sim::state::read_with(&xp, sim::state::Want(AUTOLAND_WANT_ILS), &extra_refs).await
                 } else {
-                    sim::state::read_with(
-                        &xp,
-                        sim::state::Want(AUTOLAND_WANT),
-                        &[thr_name.as_str(), afn::AP_STATE, afn::AT_ON, afn::AT_MODE],
-                    )
-                    .await
+                    sim::state::read_with(&xp, sim::state::Want(AUTOLAND_WANT), &extra_refs).await
                 };
                 if st.frozen() {
                     tokio::time::sleep(std::time::Duration::from_millis(400)).await;
@@ -1746,17 +1742,10 @@ fn spawn_autoland(launch: AutolandLaunch) {
                 let mut extra = extra.into_iter();
                 let mut unread = || Err(anyhow::anyhow!("unread"));
                 let mut throttle_read = Some(extra.next().unwrap_or_else(&mut unread));
-                let ap_modes = extra
-                    .next()
-                    .and_then(|r| r.ok())
-                    .and_then(autoflight::Modes::from_read);
-                let at_engaged = {
-                    let (on, mode) = (extra.next(), extra.next());
-                    autoflight::autothrottle_engaged(
-                        on.and_then(|r| r.ok()),
-                        mode.and_then(|r| r.ok()),
-                    )
-                };
+                let panel_reads: Vec<Option<f64>> = extra.map(|r| r.ok()).collect();
+                let panel_tick = af_panel.tick_from(&panel_reads);
+                let ap_modes = panel_tick.modes;
+                let at_engaged = panel_tick.at_engaged;
                 // Before the lever is written: an engaged autothrottle fights it.
                 {
                     let step = thrust_watch.step(thrust_t0.elapsed().as_secs_f64(), at_engaged);
@@ -3521,7 +3510,7 @@ fn spawn_autoland(launch: AutolandLaunch) {
                 let throttle_read = throttle_read
                     .take()
                     .unwrap_or_else(|| Err(anyhow::anyhow!("unread")));
-                let servos_read = if engage.confirmed() { None } else { st.opt(F::Servos) };
+                let servos_read = if engage.confirmed() { None } else { panel_tick.status(&st, F::Servos).ok() };
                 // The engage watch (see `ApEngage`): re-press until the
                 // servos read on with the sim live, each try on the tape.
                 let engage_now = engage_t0.elapsed().as_secs_f64();
@@ -4079,8 +4068,8 @@ fn spawn_autoland(launch: AutolandLaunch) {
                 // comes from the tick's read, a frame before this tick's
                 // write, and the plugin drops the override on its own frame
                 // either way (the write that follows a yield is ignored).
-                let hdg_st = st.get(F::HdgStatus);
-                let vs_st = st.get(F::VsStatus);
+                let hdg_st = panel_tick.status(&st, F::HdgStatus);
+                let vs_st = panel_tick.status(&st, F::VsStatus);
                 if cpl.own_vertical {
                     autoflight::stage_dial(&mut writes, Dial::Vs, vs_dial);
                 }
