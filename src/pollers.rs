@@ -560,7 +560,9 @@ pub(crate) fn spawn_settings_poller(base_url: String) {
                     continue;
                 };
                 match panel_sync(v, s.published, applied) {
-                    PanelSync::Quiet => {}
+                    // Agreeing is as good as our own write: the next
+                    // difference is judged against this value.
+                    PanelSync::Quiet => s.published = Some(v),
                     PanelSync::Pick => {
                         (s.apply)(v);
                         s.published = Some(v);
