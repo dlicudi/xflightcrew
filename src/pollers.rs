@@ -441,6 +441,8 @@ pub(crate) fn spawn_settings_poller(base_url: String) {
     struct PanelSetting {
         dref: &'static str,
         id: Option<i64>,
+        /// The value we last wrote to the panel (`None` until the first).
+        published: Option<i64>,
         current: fn() -> i64,
         apply: fn(i64),
     }
@@ -448,6 +450,7 @@ pub(crate) fn spawn_settings_poller(base_url: String) {
         PanelSetting {
             dref: DR_OPT_MODE,
             id: None,
+            published: None,
             current: || mode::get().panel_index(),
             apply: |v| {
                 if let Some(m) = mode::Mode::from_panel_index(v) {
@@ -460,6 +463,7 @@ pub(crate) fn spawn_settings_poller(base_url: String) {
         PanelSetting {
             dref: DR_OPT_CABIN,
             id: None,
+            published: None,
             current: || cabin::staffing().panel_index(),
             apply: |v| {
                 if let Some(s) = cabin::Staffing::from_panel_index(v) {
@@ -472,6 +476,7 @@ pub(crate) fn spawn_settings_poller(base_url: String) {
         PanelSetting {
             dref: DR_OPT_AUDIO_BUS,
             id: None,
+            published: None,
             current: || tts::AUDIO_BUS.load(std::sync::atomic::Ordering::Relaxed) as i64,
             apply: |v| {
                 // Pinned on by XCOPILOT_AUDIO_BUS: the pick is refused and
@@ -486,6 +491,7 @@ pub(crate) fn spawn_settings_poller(base_url: String) {
         PanelSetting {
             dref: DR_OPT_UI_SCALE,
             id: None,
+            published: None,
             current: || UI_SCALE.load(std::sync::atomic::Ordering::Relaxed),
             apply: |v| {
                 if (0..=4).contains(&v) {
@@ -539,6 +545,7 @@ pub(crate) fn spawn_settings_poller(base_url: String) {
                         s.id = None;
                         continue;
                     }
+                    s.published = Some(applied);
                 }
                 let Some(id) = s.id else { continue };
                 let read = http
@@ -552,19 +559,53 @@ pub(crate) fn spawn_settings_poller(base_url: String) {
                     s.id = None; // stale id (sim restarted) — re-resolve
                     continue;
                 };
-                if v < 0 {
-                    // Plugin reloaded and lost its state — re-publish the truth.
-                    if !patch(id, applied) {
-                        s.id = None;
+                match panel_sync(v, s.published, applied) {
+                    PanelSync::Quiet => {}
+                    PanelSync::Pick => {
+                        (s.apply)(v);
+                        s.published = Some(v);
                     }
-                    continue;
-                }
-                if v != applied {
-                    (s.apply)(v);
+                    PanelSync::Publish => {
+                        if patch(id, applied) {
+                            s.published = Some(applied);
+                        } else {
+                            s.id = None;
+                        }
+                    }
                 }
             }
         }
     });
+}
+
+/// What one pass of the settings poller does with a panel toggle.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum PanelSync {
+    /// The panel shows what the app holds.
+    Quiet,
+    /// The pilot clicked the panel since our last write: apply it.
+    Pick,
+    /// The panel shows our last write but the app changed since (the
+    /// terminal, the EFB) or the plugin reloaded (`-1`): publish the truth.
+    Publish,
+}
+
+/// Decide a pass from the panel's value `v`, the value we last `published`
+/// and the app's `applied` one. A difference alone is not a pick: the
+/// terminal's or the EFB's change through the registry would read as one and
+/// be reverted by the panel's stale value within half a second. Pure.
+pub(crate) fn panel_sync(v: i64, published: Option<i64>, applied: i64) -> PanelSync {
+    if v < 0 {
+        return PanelSync::Publish;
+    }
+    if v == applied {
+        return PanelSync::Quiet;
+    }
+    if published == Some(v) {
+        PanelSync::Publish
+    } else {
+        PanelSync::Pick
+    }
 }
 
 /// The panel's text settings, app to plugin: one row per registry knob of
@@ -756,6 +797,24 @@ mod tests {
     }
 
     /// A panel edit is `key=value` lines; the value keeps its own '='.
+    /// A change made elsewhere (the terminal, the EFB) is published to the
+    /// panel, never reverted by the panel's stale value; a click on the
+    /// panel is still a pick; a reloaded plugin gets the truth.
+    #[test]
+    fn a_registry_change_is_published_and_a_panel_click_is_a_pick() {
+        assert_eq!(panel_sync(0, Some(0), 0), PanelSync::Quiet);
+        assert_eq!(
+            panel_sync(0, Some(0), 3),
+            PanelSync::Publish,
+            "the EFB set instructor: the panel's 0 is ours, not a pick"
+        );
+        assert_eq!(panel_sync(2, Some(0), 0), PanelSync::Pick);
+        assert_eq!(panel_sync(2, Some(0), 3), PanelSync::Pick);
+        assert_eq!(panel_sync(-1, Some(0), 0), PanelSync::Publish);
+        // A refused pick (the audio bus pinned on): the panel snaps back.
+        assert_eq!(panel_sync(0, Some(0), 1), PanelSync::Publish);
+    }
+
     #[test]
     fn text_edits_split_at_the_first_equals() {
         assert_eq!(
