@@ -44,7 +44,9 @@ impl<T> Scoped<T> {
         self.cell.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// Set it for the generation now.
+    /// Set it for the generation now (tests; a loop writes with [`Self::set_in`],
+    /// stamped with the generation it was launched in).
+    #[cfg(test)]
     pub(crate) fn set(&self, v: T) {
         let mut g = self.lock();
         *g = Some((self.now(), v));
