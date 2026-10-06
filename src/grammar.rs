@@ -795,6 +795,8 @@ pub fn resume_plan_request(t: &str) -> bool {
     // A CLOSED set, so "resume taxi" or "resume the checklist" never lands.
     const RESUME_TAIL: &[&str] = &[
         "the", "my", "flight", "fight", "plan", "now", "right", "like", "that", "9", "nine",
+        // "Resume flight then." (LXGB 2026-10-06).
+        "then", "please",
     ];
     let lead = t.strip_prefix("resumes ").or_else(|| t.strip_prefix("resume "));
     if let Some(rest) = lead {
@@ -2254,7 +2256,11 @@ fn parse_one(t: &str) -> Option<ToolCall> {
 
     // throttle / power ("power" is a throttle synonym: "power thirty percent",
     // "40 percent power", "maximum/full throttle", "idle").
-    if has(t, "throttle") || has(t, "power") {
+    // "Thrust" is the jet pilot's word for the same levers ("reduce thrust
+    // to 20 percent", LEMG 2026-10-05), never the reversers or the A/T.
+    let thrust = has(t, "thrust")
+        && !(has(t, "reverse") || has(t, "reverser") || has(t, "reversers") || has(t, "auto"));
+    if has(t, "throttle") || has(t, "power") || thrust {
         if t.contains("maximum") || t.contains("max") || t.contains("full") {
             return Some(call("set_throttle", json!({ "percent": 100 })));
         }
@@ -2793,6 +2799,13 @@ fn parse_one(t: &str) -> Option<ToolCall> {
     }
     if t.contains("land the aircraft")
         || t == "land aircraft"
+        // "Now you can land." twice before "Please land the aircraft."
+        // (LEGR 2026-10-06); "Bring the aircraft down." (2026-10-04). Exact
+        // shapes: "bring us down to 3000" is a descent.
+        || t.ends_with("you can land")
+        || t == "can you land"
+        || t == "bring the aircraft down"
+        || t == "bring the plane down"
         || t.contains("land the plane")
         || t.contains("land us")
         // The bare ask, which is what a pilot actually says: "Let's land."

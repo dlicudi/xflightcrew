@@ -2333,3 +2333,29 @@ fn sr22_rules_stay_narrow() {
     );
     assert!(one_on("cirrus_sr22", "throttle 50 percent").is_none_or(|(n, _)| n != "hold_speed"));
 }
+
+/// Live misses since 2026-10-04, each the pilot's own words.
+#[test]
+fn thrust_is_the_throttle_and_landing_is_asked_plainly() {
+    // "We reduce thrust to 20 percent." missed, the rephrase "Reduced power
+    // 20 percent" took the lever to 80 (LEMG, 2026-10-05).
+    for (w, want) in [
+        ("We reduce thrust to 20 percent.", json!({ "percent": 20 })),
+        ("set thrust to 20 percent", json!({ "percent": 20 })),
+        ("reduce thrust by 10 percent", json!({ "delta": -10 })),
+        ("thrust idle", json!({ "percent": 0 })),
+    ] {
+        assert_eq!(one(w), Some(("set_throttle".into(), want)), "{w}");
+    }
+    for w in ["reverse thrust", "auto thrust off", "thrust reversers"] {
+        assert!(one(w).is_none_or(|(n, _)| n != "set_throttle"), "{w}");
+    }
+    // "Now you can land." twice, then "Please land the aircraft." (LEGR,
+    // 2026-10-06); "Bring the aircraft down." (2026-10-04).
+    for w in ["Now you can land.", "you can land", "Can you land?", "Bring the aircraft down."] {
+        assert_eq!(one(w).map(|c| c.0), Some("autoland".into()), "{w}");
+    }
+    assert!(one("bring us down to 3000 feet").is_none_or(|c| c.0 != "autoland"));
+    // "Resume flight then." (LXGB, 2026-10-06).
+    assert!(resume_plan_request("Resume flight then."));
+}
