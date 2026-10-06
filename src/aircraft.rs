@@ -60,6 +60,14 @@ pub struct FlarePowerProfile {
     /// against it. `None`: held only in the roundout.
     #[serde(default)]
     pub hold_from_s: Option<f64>,
+    /// The FLOAT's retard, lever per second (absent: `retard_max_per_s`).
+    /// A float has no sink to rebuild too hard: the thrust holding it up is
+    /// what lands it. The timed retard's cap (the 737's 0.04, for the sink
+    /// it rebuilds in the last second) walked 0.33 to 0.25 through LXGB's
+    /// 2 s float at 10 to 4.5 ft (2026-10-06), where the touchdown came
+    /// 631 m past the threshold. The roundout's float takes the same rate.
+    #[serde(default)]
+    pub retard_float_per_s: Option<f64>,
 }
 
 /// How the landing arrest's vertical-speed dial leads THIS autopilot's lag
@@ -2260,6 +2268,16 @@ pub struct ReferenceProfile {
     pub takeoff_roll_ft: Option<f64>,
     #[serde(default)]
     pub landing_distance_ft: Option<f64>,
+    /// LANDING ROLL, feet: touchdown to a stop on a wet runway, the room a
+    /// landing ALREADY ON THE WHEELS needs (`autoland::landing_call`, the
+    /// committed flare). Distinct from `landing_distance_ft`, which on an
+    /// airliner is the factored landing FIELD LENGTH from 50 ft (the
+    /// planner's and the self-pick's figure): asked of a flare at 4 ft, that
+    /// figure less the air flown sent the 737 around toward the Rock with
+    /// 1,109 m of LXGB ahead (2026-10-06), and it stopped in about 540.
+    /// `None` keeps the book figure's rules (no gate decision).
+    #[serde(default)]
+    pub landing_roll_ft: Option<f64>,
     #[serde(default)]
     pub max_rpm: Option<f64>,
     #[serde(default)]
@@ -3774,6 +3792,14 @@ pub fn landing_distance_m() -> Option<f64> {
     *LANDING_DISTANCE_M.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// The live airframe's declared landing ROLL (`landing_roll_ft`), metres.
+pub fn landing_roll_m() -> Option<f64> {
+    live_profile()
+        .and_then(|p| p.reference.as_ref().and_then(|r| r.landing_roll_ft))
+        .filter(|v| v.is_finite() && *v > 0.0)
+        .map(|v| v * 0.3048)
+}
+
 /// `asked`, raised to the floor when it is under it. Pure; the callers say so
 /// aloud and record it.
 pub fn floored_target(asked: f64, floor: Option<f64>) -> f64 {
@@ -3995,6 +4021,7 @@ pub fn generic_from_acf(icao: &str, acf_text: &str) -> AircraftProfile {
         &mut r.endurance_hours,
         &mut r.takeoff_distance_ft,
         &mut r.landing_distance_ft,
+        &mut r.landing_roll_ft,
     ] {
         *f = None; // not in the acf: not recited
     }
@@ -4239,6 +4266,7 @@ fn cessna_172sp() -> AircraftProfile {
             retard_at_s: None,
             retard_fast_kts: None,
             hold_from_s: None,
+            retard_float_per_s: None,
         }),
         approach_thrust_min: None,
         arrest_lead: None,
@@ -4415,6 +4443,7 @@ fn cessna_172sp() -> AircraftProfile {
             // already a sane "runway needed", and it is what has been flown.
             takeoff_roll_ft: None,
             landing_distance_ft: Some(1335.0),
+            landing_roll_ft: None,
             max_rpm: Some(2700.0),
             oil_temp_min_f: Some(100.0),
             oil_temp_max_f: Some(245.0),
@@ -4805,6 +4834,7 @@ fn cirrus_sr22() -> AircraftProfile {
             takeoff_distance_ft: None,
             takeoff_roll_ft: None,
             landing_distance_ft: None,
+            landing_roll_ft: None,
             max_rpm: Some(2700.0),
             oil_temp_min_f: None,
             oil_temp_max_f: None,

@@ -278,6 +278,7 @@
             retard_at_s: Some(1.0),
             retard_fast_kts: None,
             hold_from_s: None,
+            retard_float_per_s: None,
         }
     }
 

@@ -546,6 +546,15 @@
         FlareModel::from_profile(profile_737().flare_elevator).expect("the 737 declares its model")
     }
 
+    /// The model flare as flown from 2026-09-26 to 2026-10-06 (LEMG 13,
+    /// EGBB 15, LXGB 09): the exponential's 6 s, before LXGB's float
+    /// shortened it to 5.5. The replays of those flights fly it.
+    fn model_as_flown() -> FlareModel {
+        let mut p = profile_737().flare_elevator.expect("the 737's block");
+        p.tau_s = Some(6.0);
+        FlareModel::from_profile(Some(p)).expect("the 737 declares its model")
+    }
+
     /// Fly one recorded gate to the wheels: the loop's 0.22 s tick (LEMG
     /// 12's), the flare gate from the loop's own function, the profile's
     /// `flare_power` below it (the model's) or LEMG 12's height-only retard
@@ -890,7 +899,7 @@
         // The law that flew is the law in the harness: fed the recorded
         // sinks in rough air, easing on any climb, it writes what was
         // written (the 0.28 hold, the ease to 0.20 at +1 fpm, the cap).
-        let mut m = model().easing_on_any_climb();
+        let mut m = model_as_flown().easing_on_any_climb();
         let mut worst: f64 = 0.0;
         for (n, k) in a.iter().enumerate() {
             let dt = if n == 0 { 0.22 } else { k.t - a[n - 1].t };
@@ -1000,7 +1009,8 @@
         assert_eq!(p.step(cfg, 0.30, -140.0, 0.25, 22.9, slow, app), Some(0.30));
         let a = p.step(cfg, 0.30, -86.0, 0.25, 22.7, slow, app).unwrap();
         assert_eq!(p.last_key, Some(RetardKey::Float));
-        assert!((a - (0.30 - 0.04 * 0.25)).abs() < 1e-9, "{a}");
+        assert_eq!(cfg.retard_float_per_s, Some(0.08));
+        assert!((a - (0.30 - 0.08 * 0.25)).abs() < 1e-9, "{a}");
         // The sink rebuilding under it: the retard goes on, timed, and the
         // speed never holds it again.
         let b = p.step(cfg, 0.30, -250.0, 0.25, 12.0, slow, app).unwrap();
@@ -1056,6 +1066,7 @@
             .lines()
             .chain(LEMG_13_CALM_FLARES.lines())
             .chain(EGBB_15_FLOAT.lines())
+            .chain(LXGB_09_FLOAT.lines())
         {
             let v: serde_json::Value = serde_json::from_str(line).expect("a bench line");
             if !v["sortie"].as_str().is_some_and(|s| s.starts_with(sortie)) {
@@ -1204,7 +1215,7 @@
         trim: Option<f64>,
         rough: bool,
         with_air: bool,
-        mut power: Retard,
+        power: Retard,
         any_climb: bool,
     ) -> Flown {
         let climb_fpm = if any_climb {
@@ -1217,12 +1228,37 @@
         } else {
             (vec![0.0], Vec::new())
         };
-        let times: Vec<f64> = a.iter().map(|k| k.t - a[0].t).collect();
-        let mut law = if any_climb {
-            model().easing_on_any_climb()
+        let law = if any_climb {
+            model_as_flown().easing_on_any_climb()
         } else {
             model()
         };
+        fly_through_air_law(
+            a,
+            fit,
+            trim,
+            rough,
+            with_air,
+            power,
+            climb_fpm,
+            law,
+            (air, speed),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn fly_through_air_law(
+        a: &[Tick],
+        fit: Fit,
+        trim: Option<f64>,
+        rough: bool,
+        with_air: bool,
+        mut power: Retard,
+        climb_fpm: f64,
+        mut law: FlareModel,
+        (air, speed): (Vec<f64>, Vec<f64>),
+    ) -> Flown {
+        let times: Vec<f64> = a.iter().map(|k| k.t - a[0].t).collect();
         let mut p = Plant::at(gate_of(a, trim), fit);
         let (mut h, approach_lever) = (a[0].radio, a[0].lever);
         let mut lever = approach_lever;
@@ -1405,15 +1441,16 @@
         assert!(short.rms_fpm().is_none(), "a failed read is no sample");
     }
 
-    /// The harness is the law that flew: today's law, fed the recorded
-    /// sinks, writes the elevator that was written (the float hold changes
-    /// nothing there, the model was already pulling), and the fit flown
-    /// open loop through the recorded air gives back the recorded sink.
+    /// The harness is the law that flew: the law as flown that night (its
+    /// 6 s exponential), fed the recorded sinks, writes the elevator that
+    /// was written (the float hold changes nothing there, the model was
+    /// already pulling), and the fit flown open loop through the recorded
+    /// air gives back the recorded sink.
     #[test]
-    fn the_recorded_flares_replay_through_todays_law() {
+    fn the_recorded_flares_replay_through_the_law_that_flew() {
         for sortie in ["1790589309", "1790589773", "1790588609"] {
             let a = recording(sortie).arrest();
-            let mut m = model();
+            let mut m = model_as_flown();
             let mut worst: f64 = 0.0;
             for (n, k) in a.iter().enumerate() {
                 let dt = if n == 0 { 0.22 } else { k.t - a[n - 1].t };
@@ -1507,7 +1544,10 @@
     /// answered 6,429 fpm per unit, and in still air the column held from
     /// the flare gate balloons it and drops it in, where the prediction
     /// eases and lands. The gust and a strong elevator look alike for the
-    /// seconds that matter; only the air tells them apart.
+    /// seconds that matter; only the air tells them apart. The evidence is
+    /// the 6 s exponential's, the law that set the rule (the 5.5 s one held
+    /// in still air lands that plant under 300, but the prediction is still
+    /// what smooth air flies).
     #[test]
     fn a_strong_elevator_in_still_air_keeps_the_prediction() {
         let strong = PLANTS[3];
@@ -1520,7 +1560,7 @@
                 "{:.0}",
                 free.sink_fpm
             );
-            let held = fly(*g, strong, Law::Rough(model()));
+            let held = fly(*g, strong, Law::Rough(model_as_flown()));
             worst_held = worst_held.max(held.sink_fpm);
             climbed |= held.climbed;
         }
@@ -1565,4 +1605,240 @@
         let hi = free.step(60.0, 140.0, -900.0, 0.22, false, true).elev;
         let lo = free.step(58.0, 140.0, -300.0, 0.22, false, true).elev;
         assert!(lo < hi, "the roundout eases: {hi} -> {lo}");
+    }
+
+    // ---- LXGB 09, 2026-10-06: the float to 631 m and the balk at 4.5 ft ----
+
+    /// LXGB 09 (737, wet, 09011KT -RA, sortie 1791275171-full_auto): the
+    /// autoland ticks from 400 ft to the balk at 4.5 ft and the flight
+    /// model's touchdown (143 fpm, 136 kt over the ground). Rough air (82
+    /// fpm rms): the column held 0.30 from 20 ft while the prediction's ask
+    /// fell to zero; the lever held 0.33 by height then time to 10.6 ft,
+    /// then the float key walked it to 0.25 at 0.04 a second.
+    const LXGB_09_FLOAT: &str = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/bench/landings/lxgb09_737_float.jsonl"
+    ));
+
+    /// LXGB's own flare, fitted open loop to the recorded elevator, lever
+    /// and speed from the arrest gate to 4.5 ft (22 fpm rms): 5,500 fpm per
+    /// unit through 1.35 s of dead time, on a trim that held -850.
+    const LXGB_FIT: Fit = Fit {
+        fpm_per_elevator: 5500.0,
+        dead_s: 1.35,
+    };
+    const LXGB_TRIM_FPM: f64 = -850.0;
+    /// 141.5 kt indicated was 136 over the ground at the wheels.
+    const LXGB_HEAD_KTS: f64 = 5.5;
+    /// The arrest gate was 0.0745 nm short of the strip's end, and the
+    /// threshold is displaced 136 m: metres from the gate to the threshold.
+    const LXGB_GATE_TO_THRESHOLD_M: f64 = 0.0745 * 1852.0 + 136.0;
+    /// The touchdown zone of the 1,627 m landing distance available: its
+    /// first third (FAA: the first 3,000 ft or a third, the less).
+    const LXGB_TDZ_M: f64 = 1627.0 / 3.0;
+
+    fn lxgb_fit_rms(a: &[Tick], fit: Fit, trim: Option<f64>) -> f64 {
+        let mut p = Plant::at(gate_of(a, trim), fit);
+        let mut sq = 0.0;
+        for w in a.windows(2) {
+            let (t0, t1) = (w[0].t - a[0].t, w[1].t - a[0].t);
+            p.write(w[0].elev);
+            while p.t + 1e-9 < t1 {
+                let f = (p.t - t0) / (t1 - t0);
+                p.step(
+                    w[0].lever,
+                    w[0].radio,
+                    Some(w[0].ias + (w[1].ias - w[0].ias) * f),
+                    0.01,
+                );
+            }
+            sq += (p.vvi - w[1].vvi).powi(2);
+        }
+        (sq / (a.len() - 1) as f64).sqrt()
+    }
+
+    /// The retard as flown at LXGB: the profile's keys, the float walked at
+    /// the timed retard's 0.04 a second.
+    fn lxgb_retard_as_flown() -> Retard {
+        let cfg = profile_737().flare_power.expect("the 737 retards");
+        Retard::Keyed(
+            FlarePower::default(),
+            crate::aircraft::FlarePowerProfile {
+                retard_float_per_s: None,
+                ..cfg
+            },
+        )
+    }
+
+    struct Run {
+        sink_fpm: f64,
+        /// Metres past the displaced threshold at the wheels.
+        past_m: f64,
+        climbed: bool,
+        lever_at_wheels: f64,
+        /// Seconds from the gate and metres past the threshold at the
+        /// balk's 4.5 ft.
+        at_balk: Option<(f64, f64)>,
+    }
+
+    /// Fly LXGB's gate through a fit and the recorded air with `law` and
+    /// `power`, the loop's own flare gate, the lever held on a climb past
+    /// [`super::BALLOON_CLIMB_FPM`], the distance flown over the ground.
+    fn fly_lxgb(fit: Fit, rough: bool, mut law: FlareModel, mut power: Retard) -> Run {
+        let a = recording("1791275171").arrest();
+        let trim = Some(LXGB_TRIM_FPM);
+        let (air, speed) = air_of(&a, fit, trim);
+        let times: Vec<f64> = a.iter().map(|k| k.t - a[0].t).collect();
+        let mut p = Plant::at(gate_of(&a, trim), fit);
+        let (mut h, approach_lever) = (a[0].radio, a[0].lever);
+        let mut lever = approach_lever;
+        let (dt, mut i, mut next) = (0.01, 0usize, 0.0);
+        let mut prev_t: Option<f64> = None;
+        let mut run_m = -LXGB_GATE_TO_THRESHOLD_M;
+        let mut out = Run {
+            sink_fpm: 0.0,
+            past_m: 0.0,
+            climbed: false,
+            lever_at_wheels: 0.0,
+            at_balk: None,
+        };
+        while h > 0.0 && p.t < 40.0 {
+            if p.t + 1e-9 >= next {
+                let tick = times.get(i + 1).map_or(0.22, |t1| t1 - times[i]);
+                let law_dt = prev_t.map_or(0.22, |t0| p.t - t0);
+                prev_t = Some(p.t);
+                let v = p.vvi;
+                let gs = p.ias - LXGB_HEAD_KTS;
+                let (flare_ft, _) = super::arrest_gates_ft(25.0, gs);
+                let flare = h <= flare_ft;
+                p.write(law.step(h, gs, v, law_dt, flare, rough).elev);
+                if flare {
+                    lever = if v > super::BALLOON_CLIMB_FPM {
+                        approach_lever
+                    } else {
+                        power.step(lever, v, law_dt, h, p.ias).unwrap_or(lever)
+                    };
+                }
+                p.air_kts_s = speed.get(i).copied().unwrap_or(0.0);
+                i += 1;
+                next += tick;
+            }
+            let j = i - 1;
+            p.air_fpm = match (air.get(j), air.get(j + 1), times.get(j + 1)) {
+                (Some(a0), Some(a1), Some(t1)) => {
+                    let f = ((p.t - times[j]) / (t1 - times[j])).clamp(0.0, 1.0);
+                    a0 + (a1 - a0) * f
+                }
+                _ => *air.last().unwrap(),
+            };
+            p.step(lever, h, None, dt);
+            h += p.vvi / 60.0 * dt;
+            run_m += (p.ias - LXGB_HEAD_KTS) * 0.514_444 * dt;
+            out.climbed |= p.vvi > 0.0;
+            if h < 4.54 && out.at_balk.is_none() {
+                out.at_balk = Some((p.t, run_m));
+            }
+        }
+        out.sink_fpm = -p.vvi;
+        out.past_m = run_m;
+        out.lever_at_wheels = lever;
+        out
+    }
+
+    /// The plant is the aircraft and the harness the law that flew: the fit
+    /// gives back the recorded sink open loop, the law as flown (the 6 s
+    /// exponential, held in the rough air the final measured) fed the
+    /// recorded sinks writes the recorded elevator, and flown closed loop
+    /// it reaches the balk's 4.5 ft floating, as the aircraft did (-136
+    /// fpm against -44, 10 s and 430 m in against 11.2 s and 520).
+    #[test]
+    fn the_lxgb_plant_is_fitted_to_its_own_flare() {
+        let r = recording("1791275171");
+        assert!(r.air().rough(), "{:?}", r.air().rms_fpm());
+        assert_eq!(r.touchdown_fpm, 143.0);
+        let a = r.arrest();
+        let rms = lxgb_fit_rms(&a, LXGB_FIT, Some(LXGB_TRIM_FPM));
+        assert!(rms < 25.0, "the fit follows the record: {rms:.0} fpm rms");
+        let mut m = model_as_flown();
+        let mut worst: f64 = 0.0;
+        for (n, k) in a.iter().enumerate() {
+            let dt = if n == 0 { 0.22 } else { k.t - a[n - 1].t };
+            let e = m
+                .step(k.radio, k.ias - LXGB_HEAD_KTS, k.vvi, dt, k.flare, true)
+                .elev;
+            worst = worst.max((e - k.elev).abs());
+        }
+        assert!(worst < 0.05, "elevator {worst:.3} off the record");
+        let flown = fly_lxgb(LXGB_FIT, true, model_as_flown(), lxgb_retard_as_flown());
+        let (t, past) = flown.at_balk.expect("down to the balk's height");
+        assert!(t > 9.0 && t < 12.0, "{t:.1} s");
+        assert!(past > 380.0 && past < 560.0, "{past:.0} m");
+    }
+
+    /// The float, issue: touchdown 604 m past the displaced threshold by the
+    /// pilot's landing-rate tool (631 by the blackbox's `remaining_m`), the
+    /// touchdown zone of a 1,627 m runway is its first 542. Through the
+    /// flare's own fit and the air it carried, the law as flown floats past
+    /// 700 m (the balk's spool-up put the real wheels down sooner). A 5.5 s
+    /// exponential (the 6 s one asks 150 fpm plus 10 a foot: from 20 ft it
+    /// is 5 s to the wheels) and the float's thrust off at 0.08 a second
+    /// land inside the zone, under 300 fpm, the lever coming off, no climb.
+    /// Around the fit (elevator 4,500 to 5,500, dead time 1.2 to 1.6 s) it
+    /// is shorter every time, never firmer than 300.
+    #[test]
+    fn the_lxgb_float_lands_in_the_touchdown_zone() {
+        let flown = fly_lxgb(LXGB_FIT, true, model_as_flown(), lxgb_retard_as_flown());
+        assert!(flown.past_m > 700.0, "as flown: {:.0} m", flown.past_m);
+        let f = fly_lxgb(LXGB_FIT, true, model(), Retard::profile());
+        assert!(
+            f.past_m < LXGB_TDZ_M,
+            "in the zone: {:.0} m against {LXGB_TDZ_M:.0}",
+            f.past_m
+        );
+        assert!(
+            f.past_m < flown.past_m - 250.0,
+            "{:.0} against {:.0}",
+            f.past_m,
+            flown.past_m
+        );
+        assert!(
+            f.sink_fpm > 90.0 && f.sink_fpm < 300.0,
+            "a landing, not firm: {:.0}",
+            f.sink_fpm
+        );
+        assert!(!f.climbed, "no balloon");
+        assert!(
+            f.lever_at_wheels < flown.lever_at_wheels,
+            "{:.2}",
+            f.lever_at_wheels
+        );
+        // In smooth air too.
+        let s = fly_lxgb(LXGB_FIT, false, model(), Retard::profile());
+        assert!(
+            s.past_m < LXGB_TDZ_M && s.sink_fpm < 300.0,
+            "{:.0} m {:.0} fpm",
+            s.past_m,
+            s.sink_fpm
+        );
+        for k in [4500.0, 5500.0] {
+            for d in [1.2, 1.35, 1.6] {
+                let fit = Fit {
+                    fpm_per_elevator: k,
+                    dead_s: d,
+                };
+                let old = fly_lxgb(fit, true, model_as_flown(), lxgb_retard_as_flown());
+                let new = fly_lxgb(fit, true, model(), Retard::profile());
+                assert!(
+                    new.past_m < old.past_m - 20.0,
+                    "{k} {d}: {:.0} against {:.0}",
+                    new.past_m,
+                    old.past_m
+                );
+                assert!(
+                    new.sink_fpm < 300.0 && !new.climbed,
+                    "{k} {d}: {:.0}",
+                    new.sink_fpm
+                );
+            }
+        }
     }

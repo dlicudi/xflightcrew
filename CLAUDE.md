@@ -948,8 +948,8 @@ everything blackboxes to `logs/blackbox.jsonl` (kinds: `atc`, `autotaxi`, `autot
   arrest is removing** (`FlarePower`, `retard_below_ft`, `retard_at_s`, `retard_fast_kts`,
   `retard_slow_kts`, `retard_max_per_s`; `power` `retard`; LEMG 13 2026-09-28), and **a FLOAT takes the
   thrust off** (a sink under `RETARD_FLOAT_FPM` now or `RETARD_FLOAT_LEAD_S` ahead retards at any height
-  and speed; slow only delays a retard not yet begun); a climb is a balloon only past
-  `BALLOON_CLIMB_FPM` (EGBB 15 2026-09-28).
+  and speed, at its own `retard_float_per_s`; slow only delays a retard not yet begun); a climb is
+  a balloon only past `BALLOON_CLIMB_FPM` (EGBB 15 2026-09-28; LXGB 09 2026-10-06).
 - **A slow, low go-around pitches for speed** (`go_around_vs_fpm`: level over the configuration's
   floor, below it a descent no steeper than the ground 10 s away; `go_around_flap_due`): 0 fpm held
   into a stall (EDLP 24 SF50, 2026-09-24).
@@ -970,6 +970,11 @@ everything blackboxes to `logs/blackbox.jsonl` (kinds: `atc`, `autotaxi`, `autot
   (`flare_pavement_need_m`; LFBD 11 missed by 12 m). **Once committed it stays committed**
   (`commit_flare_latched`): judged afresh, a 46 ft commit lasted one tick (LEMG 30 A330, #180);
   latched, it holds while the pavement covers the ground roll, else `commit_released`.
+  **The go/no-go is decided at the roundout gate, never at 4 ft** (`landing_call`, blackbox
+  `landing_call`, where `landing_roll_ft` is declared): the touchdown the flare and the speed predict
+  must leave the ROLL (`wheels_need_m`, never the factored field length less the air), else
+  "Long landing. Going around." with height in hand; a LAND commits the flare (LXGB 09 737
+  2026-10-06: balked at 4.5 ft with 1,109 m ahead toward the Rock, stopped in 540).
   **A low balk is called on the radio only once it CLIMBS** (`go_around_call_due`, `BalkWatch`);
   one the wheels take keeps the clearance (`balk_landed`).
 - A debrief touchdown is the steepest recent sink (`instructor::touchdown_sink_fpm`).
