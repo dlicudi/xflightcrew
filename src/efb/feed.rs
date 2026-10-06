@@ -159,6 +159,9 @@ pub(crate) struct Tick {
     pub(crate) gs_kts: f64,
     pub(crate) on_ground: bool,
     pub(crate) track_deg: Option<f64>,
+    /// True heading (`psi`) as the monitor read it, best-effort: 0 on a
+    /// failed read (the monitor's own `Snapshot::heading_deg`).
+    pub(crate) heading_deg: f64,
     pub(crate) fuel_kg: Option<f64>,
     pub(crate) endurance_min: Option<f64>,
 }
@@ -181,6 +184,25 @@ pub(crate) fn tick() -> Option<Tick> {
         .as_ref()
         .filter(|(at, _)| at.elapsed() < TICK_FRESH)
         .map(|(_, t)| t.clone())
+}
+
+/// The taxi guide's turn card as the monitor computed it for the panel
+/// (`taxi_guide::Guide::turn_card`), `None` with no guide, with its own
+/// expiry ([`TICK_FRESH`]).
+static CARD: Mutex<Option<(Instant, Option<crate::efb::airport::CardFacts>)>> = Mutex::new(None);
+
+pub(crate) fn note_turn_card(card: Option<&crate::taxi_guide::TurnCard>) {
+    *CARD.lock().unwrap_or_else(|e| e.into_inner()) =
+        Some((Instant::now(), card.map(crate::efb::airport::CardFacts::of)));
+}
+
+/// The last turn card, if fresh.
+pub(crate) fn turn_card() -> Option<crate::efb::airport::CardFacts> {
+    CARD.lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .filter(|(at, _)| at.elapsed() < TICK_FRESH)
+        .and_then(|(_, c)| c.clone())
 }
 
 /// COM1 as the runway watch read it (kHz), with its own expiry.

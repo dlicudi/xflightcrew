@@ -279,6 +279,8 @@ pub(crate) struct Facts {
     pub(crate) audit: Option<Verdict>,
     pub(crate) preflight: Option<Verdict>,
     pub(crate) last_sent: Option<(f64, String)>,
+    /// The Airport page's facts (`efb::airport`).
+    pub(crate) airport: crate::efb::airport::AirportFacts,
 }
 
 // ---------------------------------------------------------------- state
@@ -462,6 +464,7 @@ pub(crate) struct EfbState {
     pub(crate) weather: Weather,
     pub(crate) my_controls: Button,
     pub(crate) last_sent: Option<Sent>,
+    pub(crate) airport: crate::efb::airport::AirportOut,
 }
 
 // ---------------------------------------------------------------- build
@@ -1200,6 +1203,20 @@ pub(crate) fn build(f: &Facts) -> EfbState {
             t: *t,
             text: s.clone(),
         }),
+        airport: crate::efb::airport::page(
+            &f.airport,
+            f.tick.as_ref(),
+            f.plan.as_ref(),
+            airborne(f),
+        ),
+    }
+}
+
+/// In the air: the tick says so, else the flight model's phase.
+pub(crate) fn airborne(f: &Facts) -> bool {
+    match &f.tick {
+        Some(t) => !t.on_ground,
+        None => f.flight.as_ref().is_some_and(|s| s.phase.airborne()),
     }
 }
 
@@ -1257,6 +1274,7 @@ pub(crate) mod tests {
                 gs_kts: 461.0,
                 on_ground: false,
                 track_deg: Some(11.6),
+                heading_deg: 9.8,
                 fuel_kg: Some(8_412.0),
                 endurance_min: Some(210.0),
             }),
@@ -1381,6 +1399,7 @@ pub(crate) mod tests {
             }),
             preflight: None,
             last_sent: Some((1_791_280_790.0, "how long to top of descent".into())),
+            airport: Default::default(),
         }
     }
 

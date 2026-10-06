@@ -3317,6 +3317,7 @@ pub async fn run(
                 gs_kts: snap.groundspeed_kts,
                 on_ground: snap.on_ground,
                 track_deg: snap.track_deg,
+                heading_deg: snap.heading_deg,
                 fuel_kg: snap.fuel_kg,
                 endurance_min: snap.endurance_min,
             });
@@ -4032,6 +4033,14 @@ pub async fn run(
             } else if snap.on_ground {
                 crate::world_tick::WorldTick::vectors_unheard(&snap);
             }
+            // The EFB's Airport page draws the same turn card as the panel:
+            // geometry over the guide already held, no read.
+            crate::efb::feed::note_turn_card(
+                taxi_guide
+                    .as_ref()
+                    .and_then(|g| g.turn_card(snap.lat, snap.lon))
+                    .as_ref(),
+            );
 
             // Talk-down: PAR-style callouts down the synthesized approach path,
             // armed by the visual_approach tool. Advisory narration only — the
