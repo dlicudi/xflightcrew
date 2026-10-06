@@ -258,7 +258,7 @@ mod tests {
             .as_ref()
             .and_then(|t| t.tiller.clone())
             .expect("tiller");
-        assert_eq!(t.method, TillerMethod::ZiboVr);
+        assert_eq!(t.method, TillerMethod::ZiboYaw);
         let refs = crate::aircraft::profile_references(&p);
         for name in t.method.references() {
             assert!(refs.iter().any(|r| r == name), "{name}");

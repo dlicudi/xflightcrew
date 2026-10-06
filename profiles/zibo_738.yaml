@@ -456,14 +456,14 @@ taxi:
   # tiller is 78 (acf_nw_steerdeg1). zibomod owns override_wheel_steer and
   # writes tire_steer_command_deg itself; its NOSEWHEEL AXIS option
   # (laminar/B738/effects/nosewheel, 0 ON = hardware tiller, 1 YAW, 2 ROLL,
-  # 3 VR) picks the input, and in VR the input is
-  # laminar/B738/nosewheel_steer_ratio (Zibo README 3.26g). zibo_vr holds the
-  # option at VR while steering and puts the pilot's back at release.
-  # HYPOTHESIS until a reloaded plugin is probed: the method that turns the
-  # nose may yet be zibo_yaw, zibo_override or stock (one reload tests all
-  # four through xcopilot/tiller_method).
+  # 3 VR) picks the input. Probed parked over REST 2026-10-07: in VR the
+  # ratio held at 0.5 but the nose stayed at 0 (also with the override set);
+  # in YAW the existing taxi_steer pulse of 0.5 gave tire_steer_command_deg
+  # 39.0 with the rudder at 0. So zibo_yaw: the option held at YAW while
+  # steering, the pilot's put back at release. The plugin path itself is
+  # still to be probed after a reload.
   tiller:
-    method: zibo_vr
+    method: zibo_yaw
     max_deg: 78.0
     hand_off_kts: 30.0
     full_below_kts: 20.0
