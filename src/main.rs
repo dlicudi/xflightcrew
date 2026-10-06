@@ -1495,7 +1495,7 @@ async fn run_session(
             }
             Some(Input::Spoken(heard, radio)) => {
                 tracing::info!(transcript = %heard.text, confidence = heard.confidence, radio, "heard utterance");
-                reporter.heard(&heard.text, heard.confidence);
+                reporter.heard(&heard.text, heard.confidence, radio);
                 efb::feed::note_pilot(&heard.text, radio);
                 spoken_confidence = Some(heard.confidence);
                 from_radio = radio;

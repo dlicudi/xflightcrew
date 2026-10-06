@@ -397,16 +397,7 @@ fn gather(server: &Server) -> state::Facts {
         })
         .collect();
     drop(metar);
-    let callsign = feed::callsign();
-    let callsign_written = callsign.as_deref().and_then(|spoken| {
-        let i = crate::callsign::inputs();
-        let ids: Vec<String> = i
-            .override_id
-            .into_iter()
-            .chain(i.plan.map(|p| p.id))
-            .collect();
-        transcript::written_callsign(spoken, &ids)
-    });
+    let (callsign, callsign_written) = transcript::ours();
     // The one takeoff rule at the plan's takeoff weight, and the one landing
     // rule's book figure: arithmetic over the profile, never a read.
     let reference = profile.as_ref().and_then(|p| p.reference.clone());

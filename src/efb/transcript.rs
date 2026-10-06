@@ -368,33 +368,71 @@ pub(crate) fn written_callsign(spoken: &str, ids: &[String]) -> Option<String> {
         .or_else(|| Some(compact(spoken)).filter(|s| !s.is_empty()))
 }
 
+/// Our callsign now, spoken and written, as the labels read it: the one
+/// resolver's last word (`feed::callsign`) and the written id it speaks.
+pub(crate) fn ours() -> (Option<String>, Option<String>) {
+    let spoken = crate::efb::feed::callsign();
+    let written = spoken.as_deref().and_then(|s| {
+        let i = crate::callsign::inputs();
+        let ids: Vec<String> = i
+            .override_id
+            .into_iter()
+            .chain(i.plan.map(|p| p.id))
+            .collect();
+        written_callsign(s, &ids)
+    });
+    (spoken, written)
+}
+
+/// What a sim panel transcript row is.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum Panel {
+    /// The pilot's heard line, keyed on the radio (with COM1's position) or
+    /// the intercom.
+    Pilot {
+        radio: bool,
+        tag: Option<&'static str>,
+    },
+    /// A line of the panel feed (`xcopilot/status/action`), read by its
+    /// prefix.
+    Feed,
+    /// The crew's own transmission, keyed on COM1's position.
+    CrewRadio { tag: Option<&'static str> },
+}
+
 /// The sim panel's transcript row label ("COPILOT > YOU", "TOWER >
 /// WAT519"), from the panel feed's own prefix convention: `TWR: `, `APP: `,
 /// `DEP: `, `ATIS: ` a controller, `TFC: ` traffic, `CAB: ` the cabin, a
-/// leading `~` overheard, anything else the copilot; `pilot` for the
-/// pilot's heard line. ASCII only: the panel font has no arrow. Pure.
-pub(crate) fn panel_label(text: &str, pilot: bool, c: &Ctx) -> String {
+/// leading `~` overheard, anything else the copilot. ASCII only: the panel
+/// font has no arrow. Pure.
+pub(crate) fn panel_label(text: &str, kind: Panel, c: &Ctx) -> String {
     let overheard = text.starts_with('~');
     let body = text.trim_start_matches('~');
-    let (who, tag, rest) = if pilot {
-        (Who::Pilot, None, body)
-    } else {
-        let station = [
-            ("TWR: ", Who::Atc, "TWR"),
-            ("APP: ", Who::Atc, "APP"),
-            ("DEP: ", Who::Atc, "DEP"),
-            ("ATIS: ", Who::Atis, "ATIS"),
-            ("TFC: ", Who::Traffic, "TWR"),
-            ("CAB: ", Who::Cabin, ""),
-        ]
-        .into_iter()
-        .find(|(p, _, _)| body.starts_with(p));
-        match station {
-            Some((p, w, t)) => (w, Some(t).filter(|t| !t.is_empty()), &body[p.len()..]),
-            None => (Who::Crew, None, body),
+    let (who, tag, rest, radio) = match kind {
+        Panel::Pilot { radio, tag } => (Who::Pilot, tag, body, radio),
+        Panel::CrewRadio { tag } => (Who::Crew, tag, body, true),
+        Panel::Feed => {
+            let station = [
+                ("TWR: ", Who::Atc, "TWR"),
+                ("APP: ", Who::Atc, "APP"),
+                ("DEP: ", Who::Atc, "DEP"),
+                ("ATIS: ", Who::Atis, "ATIS"),
+                ("TFC: ", Who::Traffic, "TWR"),
+                ("CAB: ", Who::Cabin, ""),
+            ]
+            .into_iter()
+            .find(|(p, _, _)| body.starts_with(p));
+            match station {
+                Some((p, w, t)) => (
+                    w,
+                    Some(t).filter(|t| !t.is_empty()),
+                    &body[p.len()..],
+                    matches!(w, Who::Atc | Who::Atis | Who::Traffic),
+                ),
+                None => (Who::Crew, None, body, false),
+            }
         }
     };
-    let radio = matches!(who, Who::Atc | Who::Atis | Who::Traffic);
     let line = Line {
         t: 0.0,
         who,
@@ -596,20 +634,45 @@ mod tests {
     #[test]
     fn the_panel_rows_carry_the_same_labels() {
         let c = wat();
-        assert_eq!(panel_label("Flaps five.", true, &c), "YOU > COPILOT");
-        assert_eq!(panel_label("Gear down.", false, &c), "COPILOT > YOU");
+        let pilot = Panel::Pilot {
+            radio: false,
+            tag: None,
+        };
+        assert_eq!(panel_label("Flaps five.", pilot, &c), "YOU > COPILOT");
+        let keyed = Panel::Pilot {
+            radio: true,
+            tag: Some("TWR"),
+        };
         assert_eq!(
-            panel_label("Cabin crew, seats for landing.", false, &c),
+            panel_label(
+                "Request taxi, Whiskey Alpha Tango five one niner.",
+                keyed,
+                &c
+            ),
+            "WAT519 > TOWER"
+        );
+        assert_eq!(
+            panel_label(
+                "Whiskey Alpha Tango five one niner, request IFR clearance.",
+                Panel::CrewRadio { tag: Some("TWR") },
+                &c
+            ),
+            "WAT519 > TOWER"
+        );
+        let feed = Panel::Feed;
+        assert_eq!(panel_label("Gear down.", feed, &c), "COPILOT > YOU");
+        assert_eq!(
+            panel_label("Cabin crew, seats for landing.", feed, &c),
             "COPILOT > CABIN"
         );
         assert_eq!(
-            panel_label("CAB: Cabin secure.", false, &c),
+            panel_label("CAB: Cabin secure.", feed, &c),
             "CABIN > FLIGHT DECK"
         );
         assert_eq!(
             panel_label(
                 "TWR: Whiskey Alpha Tango five one niner, cleared to land.",
-                false,
+                feed,
                 &c
             ),
             "TOWER > WAT519"
@@ -617,7 +680,7 @@ mod tests {
         assert_eq!(
             panel_label(
                 "~TWR: Easy eight seven niner one, cleared to land.",
-                false,
+                feed,
                 &c
             ),
             "TOWER > EASY 8791"
@@ -625,7 +688,7 @@ mod tests {
         assert_eq!(
             panel_label(
                 "~TFC: Cleared to land, Easy eight seven niner one.",
-                false,
+                feed,
                 &c
             ),
             "EASY 8791 > TOWER"

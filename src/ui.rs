@@ -131,9 +131,9 @@ impl Reporter {
     }
     /// Report a heard utterance: the desktop log shows the transcript with its
     /// confidence (useful for tuning), the in-sim panel gets just the transcript.
-    pub fn heard(&self, transcript: &str, confidence: f32) {
+    pub fn heard(&self, transcript: &str, confidence: f32, radio: bool) {
         if let Some(s) = &self.status {
-            s.heard(transcript);
+            s.heard(transcript, radio);
         }
         self.send(Report::Log {
             kind: LogKind::Heard,

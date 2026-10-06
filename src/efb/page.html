@@ -353,7 +353,11 @@ form.say .send { min-height: 52px; }
   .toast { left: 16px; max-width: calc(100% - 32px); bottom: calc(var(--bar-h) + var(--tabbar-h) + env(safe-area-inset-bottom) + 6px); }
   .ln { grid-template-columns: 44px minmax(0, 1fr); }
   .ln .tx { grid-column: 1 / -1; }
-  .radio-now { grid-template-columns: minmax(0, 1fr); }
+  /* Three small tiles abreast, so the frequency log is near the top. */
+  .radio-now { gap: 8px; }
+  .radio-now .tile { padding: 10px; }
+  .radio-now .tile .v { font-size: 18px; }
+  .radio-now .tile .note { font-size: 11px; display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden; }
   .now { padding: 14px 16px; }
   body.kb .rail { display: none; }
   body.kb .actions { bottom: 0; }
@@ -447,6 +451,17 @@ form.say .send { min-height: 52px; }
           <div class="tile" id="r-clr-tile"><span class="lbl">Clearance</span><span class="v num" id="r-clr-v">-</span><span class="note" id="r-clr">-</span></div>
           <div class="tile" id="r-owed-tile"><span class="lbl">Readback</span><span class="v num" id="r-owed-v">-</span><span class="note" id="r-owed">-</span></div>
         </div>
+        <section class="card">
+          <div class="ch">
+            <h2>Frequency log</h2>
+            <div class="seg" role="group" aria-label="Show">
+              <button type="button" aria-pressed="true" data-log="radio">Radio</button>
+              <button type="button" aria-pressed="false" data-log="all">All</button>
+            </div>
+          </div>
+          <div class="legend"><span class="l-you">You / our callsign</span><span class="l-cp">Copilot</span><span class="l-cab">Cabin</span><span class="l-atc">ATC</span><span style="color:var(--muted)">Dimmed: other traffic</span></div>
+          <div class="log" id="radio-log"></div>
+        </section>
         <div class="cols">
           <section class="card">
             <h2>Last call to us</h2>
@@ -459,17 +474,6 @@ form.say .send { min-height: 52px; }
             <div class="rows" id="r-services"></div>
           </section>
         </div>
-        <section class="card">
-          <div class="ch">
-            <h2>Frequency log</h2>
-            <div class="seg" role="group" aria-label="Show">
-              <button type="button" aria-pressed="true" data-log="radio">Radio</button>
-              <button type="button" aria-pressed="false" data-log="all">All</button>
-            </div>
-          </div>
-          <div class="legend"><span class="l-you">You / our callsign</span><span class="l-cp">Copilot</span><span class="l-cab">Cabin</span><span class="l-atc">ATC</span><span style="color:var(--muted)">Dimmed: other traffic</span></div>
-          <div class="log" id="radio-log"></div>
-        </section>
       </section>
 
       <!-- SETTINGS -->

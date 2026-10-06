@@ -478,15 +478,40 @@ void StoreText(TextRef* t, void* in, int offset, int len) {
     t->len = len;
 }
 
+// The next transcript row's "FROM > TO" label: the app writes it just
+// before the heard or action line it labels (the same writer thread, in
+// order). Taken by that row, never by a later one: a label older than a
+// couple of seconds belongs to nobody. An older app never writes it, and the
+// rows keep their tags.
+static TextRef g_fromto = {{0}, 0};
+static double g_fromto_at = -1.0;
+static XPLMDataRef g_fromto_dref = nullptr;
+static void WriteFromTo(void* ref, void* in, int offset, int len) {
+    StoreText(static_cast<TextRef*>(ref), in, offset, len);
+    g_fromto_at = XPLMGetElapsedTime();
+}
+static std::string TakeFromTo() {
+    std::string out;
+    if (g_fromto.len > 0 && g_fromto_at >= 0.0 && XPLMGetElapsedTime() - g_fromto_at < 2.0) {
+        out.assign(g_fromto.buf, static_cast<size_t>(g_fromto.len));
+    }
+    g_fromto.len = 0;
+    g_fromto.buf[0] = '\0';
+    g_fromto_at = -1.0;
+    return out;
+}
+
 static void WriteHeard(void*, void* in, int offset, int len) {
     StoreText(&g_heard, in, offset, len);
     // The pilot's own words, named as the speaker they are: the log reads as a
     // three-voice transcript (PILOT / COPILOT / ATC), white because it's the
     // pilot's half of the dialogue.
-    panel::append_log("PILOT", COL_WHITE, g_heard.buf);
+    const std::string route = TakeFromTo();
+    panel::append_log("PILOT", COL_WHITE, g_heard.buf, false, route.c_str());
 }
 static void WriteAction(void*, void* in, int offset, int len) {
     StoreText(&g_action, in, offset, len);
+    const std::string route = TakeFromTo();
     // A leading '~' marks AMBIENCE — the party line's overheard exchanges,
     // not a call addressed to this aircraft. Strip it, remember it: the row
     // keeps its speaker tag but renders dim.
@@ -510,11 +535,11 @@ static void WriteAction(void*, void* in, int offset, int len) {
         if (g_action.len > n && std::strncmp(g_action.buf, s.prefix, n) == 0) {
             std::memmove(g_action.buf, g_action.buf + n, static_cast<size_t>(g_action.len - n + 1));
             g_action.len -= n;
-            panel::append_log(s.tag, COL_AMBER, g_action.buf, ambient);
+            panel::append_log(s.tag, COL_AMBER, g_action.buf, ambient, route.c_str());
             return;
         }
     }
-    panel::append_log("COPILOT", COL_GREEN, g_action.buf, ambient);
+    panel::append_log("COPILOT", COL_GREEN, g_action.buf, ambient, route.c_str());
 }
 // Active aircraft ICAO — shown beside the connection chip, not logged.
 static void WriteAircraft(void*, void* in, int offset, int len) {
@@ -1341,6 +1366,10 @@ void start() {
         "xcopilot/status/callsign", xplmType_Data, 1,
         nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
         nullptr, nullptr, nullptr, nullptr, ReadText, WriteCallsign, &g_callsign, &g_callsign);
+    g_fromto_dref = XPLMRegisterDataAccessor(
+        "xcopilot/status/fromto", xplmType_Data, 1,
+        nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
+        nullptr, nullptr, nullptr, nullptr, ReadText, WriteFromTo, &g_fromto, &g_fromto);
     g_com1_dref = XPLMFindDataRef("sim/cockpit2/radios/actuators/com1_frequency_hz_833");
     g_psi_dref = XPLMFindDataRef("sim/flightmodel/position/psi");
     g_taxi_brake_dref = XPLMRegisterDataAccessor(
@@ -1478,6 +1507,7 @@ void stop_first() {
     if (g_opt_text_dref) { XPLMUnregisterDataAccessor(g_opt_text_dref); g_opt_text_dref = nullptr; }
     if (g_opt_text_edit_dref) { XPLMUnregisterDataAccessor(g_opt_text_edit_dref); g_opt_text_edit_dref = nullptr; }
     if (g_callsign_dref) { XPLMUnregisterDataAccessor(g_callsign_dref); g_callsign_dref = nullptr; }
+    if (g_fromto_dref) { XPLMUnregisterDataAccessor(g_fromto_dref); g_fromto_dref = nullptr; }
     if (g_opt_ui_scale_dref) { XPLMUnregisterDataAccessor(g_opt_ui_scale_dref); g_opt_ui_scale_dref = nullptr; }
     if (g_loadsheet_dref) { XPLMUnregisterDataAccessor(g_loadsheet_dref); g_loadsheet_dref = nullptr; }
     if (g_brief_dref) { XPLMUnregisterDataAccessor(g_brief_dref); g_brief_dref = nullptr; }

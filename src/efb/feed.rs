@@ -137,6 +137,23 @@ pub(crate) fn crew_transmits(text: &str, readback: bool) {
     ));
 }
 
+/// Is this line a crew transmission handed to the speaker and not yet
+/// started? (The panel's transcript labels it as ours on the radio.)
+pub(crate) fn crew_radio_pending(text: &str) -> bool {
+    let text = crate::phrase::scrub_dashes(text.trim());
+    let text = text.trim();
+    RADIO_PENDING
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .any(|(_, t, _)| t == text)
+}
+
+/// COM1's position now ("TWR"), for a label of a line keyed on it.
+pub(crate) fn tuned_tag() -> Option<&'static str> {
+    tuned_now().1
+}
+
 /// An intercom line started playing (the copilot or the cabin).
 pub(crate) fn note_intercom(text: &str, cabin: bool) {
     let text = text.trim();

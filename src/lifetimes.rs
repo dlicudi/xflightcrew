@@ -78,6 +78,7 @@ pub(crate) const LIFETIMES: &[(&str, char)] = &[
     ("efb::feed::CARD", 'S'),
     ("efb::feed::CALLSIGN", 'S'),
     ("efb::feed::COM1", 'S'),
+    ("efb::feed::LATERAL", 'S'),
     ("efb::feed::LINES", 'S'),
     ("efb::feed::PREFLIGHT", 'F'),
     ("efb::feed::RADIO_PENDING", 'S'),

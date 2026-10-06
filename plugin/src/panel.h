@@ -16,7 +16,9 @@ void destroy();
 
 // Append a row to the panel's transmission log. Called by the dataref write
 // handlers in drefs.cpp as heard/action/alert text arrives from the app.
+// `route` is the row's "FROM > TO" label (xcopilot/status/fromto), or
+// empty: the row then shows its tag alone, as before.
 void append_log(const char* tag, ImU32 color, const char* text,
-                bool ambient = false);
+                bool ambient = false, const char* route = nullptr);
 
 } // namespace panel
