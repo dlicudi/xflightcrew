@@ -603,16 +603,55 @@
         // A descent from 2,100 toward a 1,500 constraint, paced: the target
         // walks down, the dial stays at 1,500 the whole way.
         for (want, alt) in [(1990.0, 2105.0), (1850.0, 2000.0), (1600.0, 1750.0)] {
-            assert_eq!(super::dial_target_ft(want, alt, 1500.0, None, None), 1500.0);
+            assert_eq!(super::dial_target_ft(want, alt, 1500.0, None, None, -1350.0), 1500.0);
         }
         // Held level before the top of descent: the level held.
-        assert_eq!(super::dial_target_ft(4020.0, 4000.0, 1500.0, None, None), 4000.0);
+        assert_eq!(super::dial_target_ft(4020.0, 4000.0, 1500.0, None, None, 0.0), 4000.0);
         // A terrain floor above the constraint: never under the floor.
-        assert_eq!(super::dial_target_ft(2340.0, 3000.0, 1500.0, Some(2340.0), None), 2400.0);
+        assert_eq!(super::dial_target_ft(2340.0, 3000.0, 1500.0, Some(2340.0), None, 0.0), 2400.0);
         // Climbing to a minimum above the plan's altitude: the minimum.
-        assert_eq!(super::dial_target_ft(4000.0, 1200.0, 3000.0, None, None), 4000.0);
+        assert_eq!(super::dial_target_ft(4000.0, 1200.0, 3000.0, None, None, 0.0), 4000.0);
         // Down a published path: its bottom, once.
-        assert_eq!(super::dial_target_ft(800.0, 900.0, 1500.0, None, Some(147.0)), 200.0);
+        assert_eq!(super::dial_target_ft(800.0, 900.0, 1500.0, None, Some(147.0), -700.0), 200.0);
+    }
+
+    /// LEGR-LXGB (2026-10-06, sortie 1791275171-full_auto): an aircraft
+    /// that has CAUGHT its paced target sits inside the 100 ft band, and the
+    /// band put the dial at the target, a hundred feet under it. The 737
+    /// captured 18,200, 16,600, 14,800, 13,200 and 12,900 on its way from
+    /// FL190 to 12,700. While the target walks down its path the dial is
+    /// where the descent ends.
+    #[test]
+    fn a_descent_on_its_path_keeps_the_dial_at_the_constraint() {
+        // The recorded leave at 18,302 ft, the paced target at 18,212.
+        assert_eq!(super::dial_target_ft(18212.4, 18302.4, 12700.0, None, None, -1800.0), 12700.0);
+        // ...and the aircraft just under its target (the law overshot).
+        assert_eq!(super::dial_target_ft(16588.7, 16540.0, 12700.0, None, None, -1800.0), 12700.0);
+        // At the bottom the target is the constraint and stops: the level.
+        assert_eq!(super::dial_target_ft(12700.0, 12760.0, 12700.0, None, None, 0.0), 12700.0);
+        // A pilot's level or a terrain floor is a level, not a path: held.
+        assert_eq!(super::dial_target_ft(15000.0, 15040.0, 12700.0, Some(15000.0), None, 0.0), 15000.0);
+
+        // The whole descent flown ON the paced path, from FL190 to 12,700:
+        // the dial never comes within reach of a capture before the bottom.
+        let (cruise, bottom, gs) = (19000.0, 12700.0, 300.0);
+        let mut prev_cmd = cruise;
+        let mut alt = cruise;
+        let mut dist = 40.0;
+        let mut walked = 0;
+        while dist > 0.0 {
+            let (want, rate) = super::descent_target(bottom, prev_cmd, alt, Some(dist), gs, 2000.0);
+            let dial = super::dial_target_ft(want, alt, bottom, None, None, rate);
+            if rate < 0.0 {
+                walked += 1;
+                assert_eq!(dial, bottom, "a dial at {dial} with the aircraft at {alt:.0}, {dist:.1} nm");
+            }
+            prev_cmd = want;
+            // The aircraft tracks its target to within 60 ft, either side.
+            alt = want + if (dist * 10.0).round() as i64 % 2 == 0 { 60.0 } else { -60.0 };
+            dist -= 0.1;
+        }
+        assert!(walked > 50, "the path was walked ({walked} samples)");
     }
 
     #[test]

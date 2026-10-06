@@ -861,6 +861,62 @@
         assert!((v - 30.10).abs() < 0.005, "{v}");
     }
 
+    /// LEGR-LXGB (2026-10-06, sortie 1791275171-full_auto): the follower
+    /// levelled at 12,700 above LXGB's 7,000 ft transition level, autoland
+    /// flew the arrival down from there, and the landing's mute swallowed
+    /// both altimeter checks: the whole approach on 29.92 against a 30.06
+    /// QNH, said only on the ground. The transition is still the crew's
+    /// under a landing; everything else stays muted, a recovery mutes all.
+    #[test]
+    fn an_autoland_descending_through_the_transition_level_still_gets_qnh() {
+        use crate::flight_state::Owner;
+        let c = AltimeterSetting {
+            transition_altitude_ft: 18_000.0,
+            crossing: true,
+        };
+        let mut s = linto_altimeter(true);
+        s.alt_ft = 6_950.0;
+        s.agl_ft = 7_200.0;
+        s.vsi_fpm = -1_500.0;
+        s.baro_inhg = Some(29.92);
+        s.qnh_pa = Some(30.06 * crate::tools::instruments::PA_PER_INHG);
+        // The resume as published (origin 13,000, destination FL70), then
+        // the follower's descent: the destination's level rules.
+        let resumed = crate::tools::instruments::FlightTransition::for_resume(
+            Some(13_000.0),
+            Some(7_000.0),
+            false,
+        );
+        let down = crate::tools::instruments::FlightTransition { descending: true, ..resumed };
+        let ta = crate::tools::instruments::resolve_transition(Some(down), 18_000.0);
+        assert_eq!(ta, 7_000.0);
+        let (was, want) = altimeter_wanted(&s, ta, true).expect("through the level, QNH is owed");
+        assert!((was - 29.92).abs() < 0.005 && (want - 30.06).abs() < 0.005, "{was} {want}");
+        // The crew's job, and the landing's mute lets it through...
+        assert!(c.acts_while_crew_lands(&s));
+        assert!(!check_muted(Some(Owner::Autoland), false, c.acts_while_crew_lands(&s)));
+        // ...but not on short final, nor through a recovery or the panel's mute.
+        s.agl_ft = 600.0;
+        assert!(check_muted(Some(Owner::Autoland), false, c.acts_while_crew_lands(&s)));
+        assert!(check_muted(Some(Owner::Recover), false, true));
+        assert!(check_muted(None, true, true));
+        // Pilot-directed advice stays muted under a landing.
+        assert!(check_muted(Some(Owner::Autoland), false, false));
+        assert!(!check_muted(None, false, false));
+        assert!(!check_muted(Some(Owner::Procedure), false, false));
+    }
+
+    /// A resume onto the arrival has no follower to note the descent: the
+    /// destination's level is the one in force from the arm.
+    #[test]
+    fn a_resume_onto_the_arrival_is_already_descending() {
+        use crate::tools::instruments::{resolve_transition, FlightTransition};
+        let route = FlightTransition::for_resume(Some(13_000.0), Some(7_000.0), false);
+        assert_eq!(resolve_transition(Some(route), 18_000.0), 13_000.0);
+        let arrival = FlightTransition::for_resume(Some(13_000.0), Some(7_000.0), true);
+        assert_eq!(resolve_transition(Some(arrival), 18_000.0), 7_000.0);
+    }
+
     #[test]
     fn altimeter_check_is_quiet_when_set_or_cold() {
         let c = AltimeterSetting {

@@ -499,6 +499,17 @@ pub struct FlightTransition {
     pub descending: bool,
 }
 
+impl FlightTransition {
+    /// The plan's transition as a resume publishes it. A resume that joins
+    /// the ARRIVAL (autoland's, no follower) is past its descent: nobody
+    /// else would note it (`note_descending` is the follower's), so the
+    /// destination's level rules from the start. Else the climb's altitude
+    /// until the follower starts down. Pure.
+    pub fn for_resume(altitude_ft: Option<f64>, level_ft: Option<f64>, arrival: bool) -> Self {
+        FlightTransition { altitude_ft, level_ft, descending: arrival }
+    }
+}
+
 static FLIGHT_TRANSITION: std::sync::Mutex<Option<FlightTransition>> = std::sync::Mutex::new(None);
 
 pub fn publish_flight_transition(t: Option<FlightTransition>) {
