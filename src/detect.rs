@@ -1054,11 +1054,18 @@ mod tests {
                 ),
                 None,
             ),
-            // The Zibo says B738 too, and is NOT the stock 737.
+            // The Zibo says B738 too, and is NOT the stock 737: its own
+            // profile (2026-10-06), as installed and in a parent folder.
             (
-                who("B738", "Aircraft/Zibo/B737-800X/b738_4k.acf", "Zibo"),
-                None,
+                who("B738", "Aircraft/B737-800X/b738_4k.acf", "Alex Unruh"),
+                Some("zibo_738"),
             ),
+            (
+                who("B738", "Aircraft/Zibo/B737-800X/b738.acf", "Alex Unruh"),
+                Some("zibo_738"),
+            ),
+            // A third B738 model is neither.
+            (who("B738", "Aircraft/Other 737/b738.acf", "Someone"), None),
             // Windows reports backslashes.
             (
                 who(
@@ -1095,15 +1102,21 @@ mod tests {
         }
     }
 
-    /// The Zibo on the stock 737's ICAO: an unknown MODEL of a known type,
-    /// flown generic and said so, never the stock profile.
+    /// A B738 that is neither the stock 737 nor the Zibo: an unknown MODEL
+    /// of a known type, flown generic and said so, never the stock profile.
+    /// (The Zibo was this case until it got its own profile, 2026-10-06.)
     #[test]
-    fn a_zibo_is_not_the_stock_737() {
-        let zibo = who("B738", "Aircraft/Zibo/B737-800X/b738_4k.acf", "Zibo");
+    fn an_unknown_738_is_not_the_stock_737() {
+        let other = who("B738", "Aircraft/Other 737/b738_4k.acf", "Someone");
         assert_eq!(
-            resolve(&zibo, &aircraft::profile_matchers()),
+            resolve(&other, &aircraft::profile_matchers()),
             Resolution::UnknownModel
         );
+        let real_zibo = who("B738", "Aircraft/B737-800X/b738_4k.acf", "Alex Unruh");
+        assert!(matches!(
+            resolve(&real_zibo, &aircraft::profile_matchers()),
+            Resolution::Profile { ref id, tied_with: None, .. } if id == "zibo_738"
+        ));
         let tolis = who(
             "A319",
             "Aircraft/ToLissA319_V1p12p1/a319.acf",
@@ -1115,7 +1128,7 @@ mod tests {
         );
         // The file does not exist, so the 172's numbers: said, and under the
         // model's own generic id, never boeing_737_800.
-        let picked = pick_profile(&zibo);
+        let picked = pick_profile(&other);
         assert_eq!(picked.id, "generic_b738_b738_4k");
         let line = picked
             .line
@@ -1129,7 +1142,7 @@ mod tests {
         assert_eq!(p.id, "generic_b738_b738_4k");
         let rec = picked.blackbox();
         assert_eq!(rec["resolution"], "unknown_model");
-        assert_eq!(rec["relative_path"], "Aircraft/Zibo/B737-800X/b738_4k.acf");
+        assert_eq!(rec["relative_path"], "Aircraft/Other 737/b738_4k.acf");
     }
 
     #[test]

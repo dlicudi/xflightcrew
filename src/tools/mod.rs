@@ -539,6 +539,17 @@ impl Registry {
             tools.push(Box::new(jet_start::ScriptedAutoStart));
             tools.push(Box::new(jet_start::StopEngines::new(profile)));
         }
+        // A jet whose START has no shape here yet but whose cutoff levers are
+        // declared (the Zibo 737: a starter knob per engine, 2026-10-06): the
+        // start is the pilot's, the shutdown still ours, read back by the
+        // engines spooling down like every other.
+        if !profile.fuel_cutoff_levers.is_empty()
+            && profile.airliner_start.is_none()
+            && !profile.turbine_start
+            && !profile.scripted_auto_start
+        {
+            tools.push(Box::new(jet_start::StopEngines::new(profile)));
+        }
         // Procedural electrical power-up (step-by-step with callouts).
         if profile.auto_prep {
             tools.push(Box::new(power::PowerUp));

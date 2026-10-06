@@ -1633,3 +1633,54 @@
         );
         assert_eq!(fsel.positions.iter().filter_map(|p| p.value).count(), 3);
     }
+
+    /// The Zibo 737 (2026-10-06): its own profile, never the stock 737's
+    /// names. The stock profile's start, cutoff and baro paths are the stock
+    /// aircraft's xlua (`condition_lever*_target`, `barometer/capt_setting`,
+    /// the scripted `auto_start`), none of which exist on the Zibo (probed
+    /// live, parked). Its toggles are each read from their own position.
+    #[test]
+    fn the_zibo_flies_its_own_names_never_the_stock_737s() {
+        let text = std::fs::read_to_string("profiles/zibo_738.yaml").unwrap();
+        let p: AircraftProfile = serde_yaml::from_str(&text)
+            .unwrap_or_else(|e| panic!("zibo_738.yaml failed to parse: {e:#}"));
+        assert_eq!(p.id, "zibo_738");
+        let m = p.matcher.as_ref().expect("a match block");
+        assert!(m.claims_type("B738"));
+        assert!(m.acf.iter().any(|a| a.contains("B737-800X")));
+        assert!(
+            !p.scripted_auto_start,
+            "auto_start is not the Zibo's: X-Plane's generic start under its systems"
+        );
+        assert_eq!(p.fuel_cutoff_levers.len(), p.engines);
+        let refs = profile_references(&p);
+        // The matcher is a folder, never a name to probe.
+        assert!(
+            !refs.iter().any(|r| r.contains("B737-800X")),
+            "the match block was probed as a name: {refs:?}"
+        );
+        for stock_only in [
+            "condition_lever",
+            "laminar/B738/barometer/capt_setting",
+            "sim/operation/auto_start",
+        ] {
+            assert!(
+                !refs.iter().any(|r| r.contains(stock_only)),
+                "{stock_only}: the stock 737's, not on the Zibo"
+            );
+        }
+        for lever in &p.fuel_cutoff_levers {
+            assert!(refs.contains(lever), "{lever} is not probed");
+        }
+        // Read before fire: every anti-ice toggle reads its own switch.
+        let ice = p.anti_ice.as_ref().expect("its own anti-ice switches");
+        for s in &ice.systems {
+            assert_eq!(s.on_commands.len(), 1, "{:?}: one toggle per entry", s.kind);
+            assert!(s.readback.is_some(), "{:?}: a toggle needs its read", s.kind);
+        }
+        // The panel: its own buttons, LNAV with its lamp, never CMD B.
+        let a = p.autoflight.as_ref().expect("its own MCP buttons");
+        assert!(a.lnav_command.is_some() && a.lnav_status.is_some());
+        assert!(!refs.iter().any(|r| r.contains("cmd_b")));
+        assert!(p.seat_belt_signs.is_some() && p.transponder_mode_knob.is_some());
+    }

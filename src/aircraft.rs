@@ -4264,11 +4264,14 @@ pub fn profile_references(p: &AircraftProfile) -> Vec<String> {
         "positions_spoken",
     ];
     fn walk(v: &serde_yaml::Value, key: &str, out: &mut Vec<String>) {
+        // Skipped whole, not only as a string: `match:` is a mapping, and
+        // its `acf` path was probed as a name ("B737-800X/", "Sparky/
+        // 747-400/": no whitespace, so it passed the name test, 2026-10-06).
+        if SKIP_KEYS.contains(&key) {
+            return;
+        }
         match v {
             serde_yaml::Value::String(s) => {
-                if SKIP_KEYS.contains(&key) {
-                    return;
-                }
                 let name = s.split('[').next().unwrap_or(s).trim();
                 let last = name.rsplit('/').next().unwrap_or("");
                 if name.contains('/')

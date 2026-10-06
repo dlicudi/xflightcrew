@@ -1,0 +1,405 @@
+# Aircraft profile: the Zibo 737-800X (B738), v4.05.35.
+#
+# A DRAFT, written 2026-10-06 from the aircraft's own files and probed
+# read-only against the live sim (parked, cold and dark). Nothing below has
+# been pressed, written or flown. Every name was looked up on the Web API and
+# exists (dataref or command); whether it DOES what this file says is a
+# hypothesis until a ground test reads it back. Lines marked VERIFY are the
+# ones to test first.
+#
+# WHY THIS IS NOT THE STOCK 737's PROFILE. Both say B738, but the Zibo is a
+# different machine under the same skin:
+#   - Its systems live in a binary plugin (`plugins/zibomod`, about 7,400
+#     laminar/B738 names) plus xlua (`B738.glaresheild`, `B738.a_fms`,
+#     `B738.calc`, `B738.zz.sim_cockpit`). The stock 737's `B738.systems.lua`
+#     and its `condition_lever*_target`, `barometer/capt_setting` and
+#     `sim/operation/auto_start` sequence do not exist here (probed missing,
+#     or not replaced), so the stock profile's start, cutoff and baro paths
+#     would all be silent no-ops.
+#   - Its MCP is its own. The windows are `laminar/B738/autopilot/mcp_alt_dial`,
+#     `mcp_hdg_dial` and `mcp_speed_dial_kts_mach` (created by
+#     B738.glaresheild.lua:996-997, :802), copied into the stock dials only by
+#     its own handlers (glaresheild.lua:3926, :7241, :7244). Probed parked:
+#     stock airspeed_dial_kts_mach 210 against the MCP's 100, so the stock
+#     speed window is NOT the MCP. The stock altitude and heading dials agree
+#     with the MCP at load (200, 262) and may be the AP's internal targets.
+#   - It holds the controls: probed parked, override_throttles,
+#     override_joystick_pitch/roll/heading, override_toe_brakes and
+#     override_wheel_steer all read 1, set by zibomod (the Lua only clears them
+#     on unload, B738.zz.sim_cockpit.lua:1139-1148). Our plugin's pitch, steer
+#     and brake channels raise and DROP those same overrides; dropping one
+#     the Zibo holds may hand that axis to the raw joystick. Ground test
+#     before any automation rolls this aircraft.
+#
+# Stock commands the aircraft REWRITES (B738_Commands.txt "Rewrite default
+# commands", and replace_command in B738.glaresheild.lua:3535-3545, :3958):
+# landing_gear_toggle/down/up, take_off_go_around, TOGA_power, the four
+# brakes commands, autopilot altitude_up/down, heading_up/down,
+# heading_sync, airspeed_up/down, obs_HSI_up/down (both sides), and
+# landing_lights_on/off/toggle. zibomod also names the stock speed_brakes_*,
+# flaps_up/down, pitch_trim*, thrust_reverse_*, nav_lights_on/off,
+# strobe_lights_on/off, generator_*_on/off, APU_* and GPU_* commands (a
+# string in the binary; replaced or merely fired is not knowable from the
+# file).
+#
+# Figures: the -800's placards are the type's (the stock profile's, from its
+# POM), the weights and fuel from this aircraft's `b738_4k.acf` (empty
+# 92,670 lb, max 174,700 lb, fuel 46,062 lb, nine flap positions). The acf's
+# own Vs 110 / Vso 100 / Vne 400 are not the placards and are not used.
+# Everything the stock profile FITTED to the Laminar 737's flight model and
+# autopilot (roll rudder, flare model, idle decel per flap) is left out: this
+# is another flight model (zibomod writes its own surfaces) and another
+# autopilot, so those numbers are not this aircraft's.
+
+id: zibo_738
+display_name: Zibo 737-800
+
+# The Zibo says B738 like the stock 737; the folder tells them apart. If the
+# aircraft's folder is renamed, change the acf entry (an unmatched model
+# flies generic, said aloud). The acf's `_author` is "Alex Unruh", the same
+# as the stock 737's, so it cannot be a second key.
+match:
+  icao: [B738]
+  acf: ["B737-800X/"]
+
+# Capability flags.
+# The autopilot tools write the STOCK dials (heading_dial_deg_mag_pilot,
+# altitude_dial_ft, vertical_velocity) and read the stock autopilot_state
+# bitfield. Neither is this MCP's own (see the header). Kept on so the
+# copilot can try and READ BACK; expect "did not take" until the owner can
+# write the Zibo's mcp_* windows. VERIFY first thing on the ground.
+autopilot: true
+throttle: true         # VERIFY: override_throttles is held at 1 by zibomod
+# The `autothrottle` tool is written against laminar/md82 names.
+autothrottle: false
+speedbrake: true       # stock speedbrake_ratio; the Zibo's lever is laminar/B738/flt_ctrls/speedbrake_lever. VERIFY
+# The Zibo's reversers are its own levers (flt_ctrls/reverse_lever1/2) under
+# override_throttles: the stock beta/reverse write is not expected to reach
+# them. Off until probed.
+reverse_thrust: false
+# The Zibo's baro knob is `laminar/B738/EFIS/baro_sel_in_hg_pilot` (writable
+# double, 29.92 parked) and its knob commands `laminar/B738/pilot/
+# barometer_up/down` (glaresheild.lua:3483-3484). The tool writes the stock
+# dial and steps the STOCK knob commands, which this aircraft does not
+# replace. The readback will say whether the stock dial is an input here.
+# VERIFY. No `altimeter:` STD fast path: the STD button exists
+# (`laminar/B738/EFIS_control/capt/push_button/std_press`, glaresheild.lua:3421)
+# but its two-press behaviour is the stock 737's, unproven on this code.
+barometer: true
+pitch_trim: true       # stock elevator_trim; zibomod names the stock trim commands. VERIFY
+com_radio: true        # stock COM/NAV datarefs (the pilot's cockpitdecks reads them)
+com2_radio: true
+nav_radio: true
+transponder: true
+ils: true              # NAV1 tune and the needles are stock
+# Not coupled: the coupling reads the stock autopilot_state bitfield, which
+# is not this MCP's truth (its lamps are laminar/B738/autopilot/*_status).
+ils_coupled: false
+# Its own APP button, created in zibomod (B738_Commands.txt). VERIFY: the
+# setup reads the stock approach status after pressing it.
+approach_command: laminar/B738/autopilot/app_press
+
+# The MCP buttons, all the aircraft's own (zibomod; B738_Commands.txt
+# "glareshield.lua" block; the same names the pilot's cockpitdecks MCP page
+# presses). CMD B is never named (stock 737 lesson, LEMG 2026-10-05).
+# VERIFY: the owner reads modes from `autopilot_state`, which the Zibo may
+# not keep in step with these lamps; and it writes stock dials. A press here
+# is real, a readback may lie. Blackbox `autoflight` `press` and `ap_state`.
+autoflight:
+  engage_command: laminar/B738/autopilot/cmd_a_press
+  heading_command: laminar/B738/autopilot/hdg_sel_press
+  vs_command: laminar/B738/autopilot/vs_press
+  altitude_hold_command: laminar/B738/autopilot/alt_hld_press
+  # LNAV button and its lamp (B738_Datarefs.txt "AUTOPILOT LIGHTS"); the lamp
+  # is the read the follower trusts before pressing this toggle.
+  lnav_command: laminar/B738/autopilot/lnav_press
+  lnav_status: laminar/B738/autopilot/lnav_status
+  # Boeing MCP: a V/S only toward the window (the stock 737's measured
+  # behaviour; the Zibo's is unmeasured). VERIFY.
+  vs_toward_window: true
+
+parking_brake: true    # stock ratio reads 1 with laminar/B738/parking_brake_pos 1 parked. VERIFY the write
+retractable_gear: true
+# The stock gear commands are the Zibo's own (B738_Commands.txt "Rewrite
+# default commands": up = UP, down = "off, down", so a down from UP may need
+# two presses). The readback is the stock handle. VERIFY.
+gear_by_command: true
+cabin_crew: true       # 189 seats and an interphone
+pressurised: true
+engines: 2
+
+# ENGINE START: none of the shapes the code has fits a 737. There is no
+# scripted start (`sim/operation/auto_start` is not replaced here, so it
+# would be X-Plane's generic start under the Zibo's systems), the MD-82
+# sequence is laminar/md82, and `airliner_start` is an Airbus ENG MODE knob
+# plus a master ARRAY. The 737 is a starter knob PER ENGINE
+# (`laminar/B738/rotary/eng1_start_grd`, position `laminar/B738/engine/
+# starter1_pos`, 0 GRD 1 AUTO/OFF 2 CONT 3 FLT) and a start lever per engine
+# brought to IDLE at 25 % N2 (`laminar/B738/engine/mixture1_idle`). Left to
+# the pilot until the code has that shape.
+turbine_start: false
+auto_prep: false
+scripted_auto_start: false
+
+# Cutoff: the start levers. B738_Datarefs.txt lists `laminar/B738/engine/
+# mixture_ratio1/2` as read/write (0..1), and the API says writable. VERIFY:
+# the shutdown watches the engines down, so a lever that is only an
+# animation output is caught and said, never "Roger".
+fuel_cutoff_levers:
+  - laminar/B738/engine/mixture_ratio1
+  - laminar/B738/engine/mixture_ratio2
+
+# Jet: none of the piston systems apply.
+engine: false
+magnetos: false
+carb_heat: false
+fuel_pump: false
+directional_gyro: false
+# The Zibo's tanks are its own (nine stock tanks, the pumps its
+# `laminar/B738/fuel/fuel_tank_pos_*` switches): the stock load sheet write
+# has never been read back here, and `fuel_tank_pumps_off_when_empty` is
+# left out because the stock pump array is not known to be the switch.
+load_sheet: unprobed
+pitot_heat: false      # the probe heat is the Zibo's own pair, below under anti_ice
+
+# Anti-ice on the Zibo's own TOGGLES, one per switch, each read first from
+# its own position (B738_Datarefs.txt "ANTI ICE SWITCHES", read/write
+# positions; B738_Commands.txt antiice.lua toggles; the pilot's cockpitdecks
+# anti-ice page). One entry per switch so a toggle is never fired on another
+# switch's reading. VERIFY: each name is both a command and, for the
+# probes, a dataref of the same string.
+anti_ice:
+  systems:
+    - kind: pitot
+      on_commands: [laminar/B738/toggle_switch/capt_probes_pos]
+      off_commands: [laminar/B738/toggle_switch/capt_probes_pos]
+      readback: laminar/B738/toggle_switch/capt_probes_pos
+    - kind: pitot
+      on_commands: [laminar/B738/toggle_switch/fo_probes_pos]
+      off_commands: [laminar/B738/toggle_switch/fo_probes_pos]
+      readback: laminar/B738/toggle_switch/fo_probes_pos
+    - kind: engine
+      on_commands: [laminar/B738/toggle_switch/eng1_heat]
+      off_commands: [laminar/B738/toggle_switch/eng1_heat]
+      readback: laminar/B738/ice/eng1_heat_pos
+    - kind: engine
+      on_commands: [laminar/B738/toggle_switch/eng2_heat]
+      off_commands: [laminar/B738/toggle_switch/eng2_heat]
+      readback: laminar/B738/ice/eng2_heat_pos
+    - kind: wing_bleed
+      on_commands: [laminar/B738/toggle_switch/wing_heat]
+      off_commands: [laminar/B738/toggle_switch/wing_heat]
+      readback: laminar/B738/ice/wing_heat_pos
+
+# Electrical on the Zibo's own switches. Probed parked: the stock
+# `battery_on` reads 1 while the Zibo's `laminar/B738/electric/battery_pos`
+# reads 0, so the stock battery is NOT this switch. The battery sits under
+# guard cover 02 (`cover_position[2]` reads 1, open, with the battery off).
+# VERIFY: which of battery_up / battery_dn is ON, and that the cover is the
+# battery's (zibomod also has `push_button/batt_full_off`, "Battery and Guard
+# cover off").
+# The generator switches are spring-loaded ON/OFF (gen1_up / gen1_dn); on the
+# real panel OFF is up and ON is down. Read back on the stock generator_on,
+# which reads 0 parked with the engines off. VERIFY both directions.
+# No avionics master on a 737.
+electrical:
+  - key: battery
+    spoken: battery
+    on_commands:  [laminar/B738/switch/battery_up]
+    off_commands: [laminar/B738/switch/battery_dn]
+    readback:     [laminar/B738/electric/battery_pos]
+    guards:
+      - { command: laminar/B738/button_switch_cover02, dataref: "laminar/B738/button_switch/cover_position[2]" }
+  - key: generators
+    spoken: generators
+    on_commands:  [laminar/B738/toggle_switch/gen1_dn, laminar/B738/toggle_switch/gen2_dn]
+    off_commands: [laminar/B738/toggle_switch/gen1_up, laminar/B738/toggle_switch/gen2_up]
+    readback:     ["sim/cockpit/electrical/generator_on[0]", "sim/cockpit/electrical/generator_on[1]"]
+
+# Exterior lights on the Zibo's own commands where it has them, read back on
+# the stock switch datarefs it drives (the pilot's cockpitdecks pages read
+# the same stock names as the lamps' truth).
+# - nav and strobe are ONE switch on a 737 (STROBE & STEADY / OFF / STEADY,
+#   `laminar/B738/toggle_switch/position_light_pos`, read-only): strobes off
+#   is STEADY (nav stays on), nav off is OFF (the strobes go too).
+# - landing: the stock on/off are the Zibo's own "all landing lights"
+#   handlers (B738_Commands.txt rewrite block).
+# - beacon: the stock commands (not named in zibomod; the pilot's deck
+#   fires the stock toggle).
+# - taxi: the Zibo's taxi switch (`taxi_light_brightness_on/off`).
+# VERIFY each readback follows its switch.
+lights:
+  - { key: nav,     spoken: navigation lights, dataref: sim/cockpit2/switches/navigation_lights_on, command_on: laminar/B738/toggle_switch/position_light_steady, command_off: laminar/B738/toggle_switch/position_light_off }
+  - { key: beacon,  spoken: beacon,            dataref: sim/cockpit2/switches/beacon_on,            command_on: sim/lights/beacon_lights_on,  command_off: sim/lights/beacon_lights_off }
+  - { key: strobe,  spoken: strobe lights,     dataref: sim/cockpit2/switches/strobe_lights_on,     command_on: laminar/B738/toggle_switch/position_light_strobe, command_off: laminar/B738/toggle_switch/position_light_steady }
+  - { key: landing, spoken: landing lights,    dataref: sim/cockpit2/switches/landing_lights_on,    command_on: sim/lights/landing_lights_on, command_off: sim/lights/landing_lights_off }
+  - { key: taxi,    spoken: taxi light,        dataref: sim/cockpit2/switches/taxi_light_on,        command_on: laminar/B738/toggle_switch/taxi_light_brightness_on, command_off: laminar/B738/toggle_switch/taxi_light_brightness_off }
+
+# The seat belt switch is the Zibo's: a read-only position stepped by its
+# up/down commands (zibomod: "Seat Belt Switch Up" / "Down"). 0 OFF parked.
+# VERIFY: which way `up` steps, and that 2 is ON (the stock encoding is 0
+# off, 1 auto, 2 on; the stock switch reads 0 with this one).
+seat_belt_signs:
+  position: laminar/B738/toggle_switch/seatbelt_sign_pos
+  on: 2
+  off: 0
+  up_command: laminar/B738/toggle_switch/seatbelt_sign_up
+  down_command: laminar/B738/toggle_switch/seatbelt_sign_dn
+
+# The transponder mode knob is the Zibo's: `laminar/B738/knob/transponder_pos`
+# is read-only (probed), so it is STEPPED by `transponder_mode_up/dn`. Parked
+# it reads 1 with the stock mode at 1 (standby). The 737 panel has no OFF:
+# TEST / STBY / ALT RPTG OFF / XPNDR / TA ONLY / TA-RA, which zibomod's direct
+# commands name stby, altoff, alton, ta, tara. Taken as 0..5 in that order.
+# VERIFY the numbering and that TA-RA (5) puts the stock mode at ALT.
+transponder_mode_knob:
+  dataref: laminar/B738/knob/transponder_pos
+  off: 1
+  standby: 1
+  on: 2
+  altitude: 5
+  up_command: laminar/B738/knob/transponder_mode_up
+  down_command: laminar/B738/knob/transponder_mode_dn
+
+# Vmo 340 KIAS (Mmo 0.82), the placard (the acf's 400 is not).
+vne_kts: 340.0
+# The type's clean stall at mid weight (the stock profile's 139); the acf's
+# 110 is a light-weight arc, not a floor to fly.
+vs_clean_kts: 139.0
+# Gear operating limit (retract 235; the acf's Vle 270 is the extended limit).
+vlo_kts: 235.0
+
+# Boeing practice (the stock 737's, the same airframe type): the speedbrake
+# DOWN for takeoff, armed at the gear. Written on the STOCK speedbrake_ratio:
+# VERIFY that the Zibo's lever (`flt_ctrls/speedbrake_lever`, the
+# `speedbrake_armed` annunciator) follows. The autobrake, flight directors,
+# A/T arm and V2 window are NOT declared: each is written on a stock name
+# this aircraft has its own switch for (autobrake: `laminar/B738/knob/
+# autobrake_rto` and `autobrake_pos`; FD: `autopilot/flight_director_toggle`
+# and `switches/autopilot/fd_ca`; A/T: `autopilot/autothrottle_arm_toggle`
+# and `switches/autopilot/at_arm`; the window: `mcp_speed_dial_kts_mach`).
+takeoff_config:
+  arm_spoilers: true
+  takeoff_speedbrake_down: true
+  # Thrust reduction at 1,000 ft. Lever ratio 0.9 is the stock 737's
+  # hypothesis for CLB. VERIFY: the throttle write itself first.
+  thrust_reduction_agl_ft: 1000.0
+  climb_thrust_ratio: 0.9
+
+# The attitude at which the tail touches: about 11 degrees on the -800.
+tail_strike_deg: 11.0
+# Nose-down elevator the rotation law may command: the type's, VERIFY that
+# the pitch channel reaches this aircraft at all (override_joystick_pitch).
+pitch_authority_down: 0.5
+climb_pitch_max_deg: 18.0
+
+# The approach is flown on thrust; the flare retards progressively (the
+# type, from the stock 737; VERIFY on this flight model).
+approach_thrust_min: 0.3
+flare_power:
+  reduction_per_second: 0.08
+  retard_below_ft: 20.0
+  retard_at_s: 2.0
+  retard_fast_kts: 0.0
+  retard_slow_kts: 5.0
+  retard_max_per_s: 0.04
+  retard_float_per_s: 0.08
+# The flare's elevator: the stock 737's tracker settings, pull-only. Its
+# fitted plant model is NOT carried over (another flight model).
+flare_elevator:
+  gain: 0.6
+  max: 0.45
+  max_push: 0.0
+  tau_s: 5.5
+  balloon_ease_per_s: 0.15
+# How the landing arrest leads the V/S mode: the stock 737's fit, a
+# hypothesis for this autopilot. The MCP V/S wheel here IS the stock
+# vvi_dial_fpm (B738_Datarefs.txt "MCP VVI").
+arrest_lead:
+  gain: 1.5
+  max_climb_fpm: 100.0
+  trend_seconds: 1.5
+
+# Taxi pace: the type's.
+taxi:
+  kts: 18.0
+  turn_kts: 10.0
+  sharp_kts: 6.0
+  max_yaw_dps: 15.0
+
+fuel:
+  reserve_caution_min: 60.0
+  reserve_warning_min: 30.0
+  cruise_burn_kg_hr: 2500.0
+  kg_per_gal: 3.04       # Jet A-1
+  spoken_unit: kg
+
+transition_altitude_ft: 18000.0
+
+# Static reference figures: the type's mid-weight card (the stock 737's POM),
+# weights from this acf.
+reference:
+  kind: twin-engine jet
+  vr_kts: 145.0                # ~150,000 lb flaps 5 (V1 140 / V2 150). VERIFY against the Zibo FMC's own
+  vy_kts: 210.0
+  initial_climb_kts: 170.0     # V2 150 + 20. VERIFY
+  acceleration_height_agl_ft: 1000.0
+  best_climb_fpm: 3000.0
+  cruise_ias_kts: 255.0        # M0.78 at FL360, under Mmo 0.82
+  optimum_alt_ft: 38000.0
+  optimum_alt_at_kg: 65000.0
+  optimum_alt_ft_per_1000kg: 290.0
+  enroute_climb_fpm: 2000.0
+  enroute_descent_fpm: 2000.0
+  approach_kts: 145.0
+  vs0_kts: 114.0               # the type's landing-configuration stall (acf says 100)
+  cruise_kts: 450.0
+  max_gross_lb: 174700.0       # acf _m_max
+  empty_weight_lb: 92670.0     # acf _m_empty
+  useful_load_lb: 82030.0      # max - empty
+  service_ceiling_ft: 41000.0
+  max_crosswind_kts: 33.0      # demonstrated, dry. VERIFY
+  fuel_capacity_gal: 6875.0    # acf 46,062 lb at 6.7 lb/gal
+  endurance_hours: 8.0
+  takeoff_distance_ft: 8700.0  # RECITED: the type's MTOW field length
+  takeoff_roll_ft: 5500.0      # CHECKED: the type's mid-weight ground roll
+  landing_distance_ft: 5360.0
+  landing_roll_ft: 2600.0
+
+# Nine positions in the aircraft file (`_flap_detents` 8), the 737's
+# UP/1/2/5/10/15/25/30/40 handle gates, at eighths of the stock handle
+# (probed parked: stock flap_ratio 0.5 with the Zibo's
+# `laminar/B738/flt_ctrls/flap_lever` 0.5). The tool writes the stock
+# handle; zibomod names the stock flaps_up/down commands and has its own
+# `push_button/flaps_0..40`. VERIFY the stock write moves the lever. Placard
+# limits are the type's; the acf agrees at both ends (Vfe1 250, Vfem 162).
+# No `idle_decel_kts_s`: those were fitted to the stock 737's flight model.
+flaps:
+  takeoff_ratio: 0.375
+  detents:
+    - { label: up,   spoken: up,          ratio: 0.0,   retract_above_kts: 210.0 }
+    - { label: "1",  spoken: one,         ratio: 0.125, vfe_kts: 250.0, retract_above_kts: 190.0 }
+    - { label: "2",  spoken: two,         ratio: 0.25,  vfe_kts: 250.0 }
+    - { label: "5",  spoken: five,        ratio: 0.375, vfe_kts: 250.0 }
+    - { label: "10", spoken: ten,         ratio: 0.5,   vfe_kts: 210.0 }
+    - { label: "15", spoken: fifteen,     ratio: 0.625, vfe_kts: 200.0 }
+    - { label: "25", spoken: twenty five, ratio: 0.75,  vfe_kts: 190.0 }
+    - { label: "30", spoken: thirty,      ratio: 0.875, vfe_kts: 175.0 }
+    - { label: "40", spoken: forty,       ratio: 1.0,   vfe_kts: 162.0 }
+
+# No checklist yet: the Zibo ships its own XChecklist (`clist.txt`, Vin
+# Kaizen's flows, section titles like "DESCENT PROCEDURE (1/2)"), and the
+# stock 737's list reads stock switches this aircraft does not drive.
+
+# Phase-expectation advisor on the Zibo's own switch positions.
+advisor:
+  - dataref: laminar/B738/toggle_switch/yaw_dumper_pos
+    phases: [climb, cruise, approach]
+    say: Yaw damper's still off.
+  - dataref: laminar/B738/toggle_switch/capt_probes_pos
+    phases: [takeoff, climb, cruise, approach, landing]
+    say: Probe heat's off.
+  - dataref: sim/cockpit2/switches/landing_lights_on
+    phases: [takeoff, approach, landing]
+    say: Landing lights on.
+    command: sim/lights/landing_lights_on
