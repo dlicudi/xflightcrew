@@ -9,8 +9,9 @@
 
 use serde::Serialize;
 
-use crate::efb::feed::{Line, Tick, Verdict, Who};
+use crate::efb::feed::{Alert, Line, Tick, Verdict, Who};
 use crate::flight::{ClearanceFact, Control, Phase, Status};
+use crate::flow::{Flavour, ItemState, Sheet};
 
 // ---------------------------------------------------------------- phrases
 
@@ -23,6 +24,10 @@ pub(crate) enum Route {
     Capture(&'static str),
     /// A radio call: a tuned tower takes it (`main::state_capture_note`).
     Radio,
+    /// A checklist's closed reply (`flow::take_reply`) or an answer to its
+    /// proposal (`flow::proposal_reply`), taken at the loop's flow door:
+    /// "proposal run", "reply next" and so on.
+    Checklist(&'static str),
 }
 
 /// A button: its id on the page, its label, the words it sends, and where
@@ -122,6 +127,43 @@ pub(crate) const PHRASES: &[Phrase] = &[
         "Fetch the flight plan",
         "fetch the flight plan",
         Route::Capture("flight plan brief"),
+    ),
+    // The checklist's closed vocabulary: shown only while a list waits for
+    // that answer (or a proposal stands), so each lands at the flow's door.
+    p(
+        "cl_go",
+        "Go ahead",
+        "go ahead",
+        Route::Checklist("proposal run"),
+    ),
+    p(
+        "cl_teach",
+        "Talk me through it",
+        "talk me through it",
+        Route::Checklist("proposal instruct"),
+    ),
+    p(
+        "cl_later",
+        "Not now",
+        "not now",
+        Route::Checklist("proposal decline"),
+    ),
+    p("cl_yes", "Yes", "yes", Route::Checklist("reply yes")),
+    p("cl_no", "No", "no", Route::Checklist("reply no")),
+    p("cl_next", "Next", "next", Route::Checklist("reply next")),
+    p("cl_skip", "Skip", "skip", Route::Checklist("reply skip")),
+    p("cl_wait", "Wait", "wait", Route::Checklist("reply hold")),
+    p(
+        "cl_help",
+        "Do it for me",
+        "help me with that",
+        Route::Checklist("reply do it"),
+    ),
+    p(
+        "cl_stop",
+        "Stop the checklist",
+        "stop the checklist",
+        Route::Checklist("reply abort"),
     ),
 ];
 
@@ -279,8 +321,52 @@ pub(crate) struct Facts {
     pub(crate) audit: Option<Verdict>,
     pub(crate) preflight: Option<Verdict>,
     pub(crate) last_sent: Option<(f64, String)>,
+    /// The settings registry, row by row (`settings::ALL`).
+    pub(crate) settings: Vec<SettingFacts>,
+    /// This flight's crew alerts, oldest first.
+    pub(crate) alerts: Vec<Alert>,
+    /// The panel's activity word ("listening"), `None` before the first.
+    pub(crate) activity: Option<&'static str>,
+    /// This run captures on push to talk (the EFB's button can open it).
+    pub(crate) ptt_available: bool,
+    pub(crate) ptt_held: bool,
+    /// This flight's current or last checklist.
+    pub(crate) checklist: Option<Sheet>,
+    /// The standing proposal's list title.
+    pub(crate) proposal: Option<String>,
+    /// What the running list waits on: "confirm" or "advance".
+    pub(crate) flow_waiting: Option<&'static str>,
     /// The Airport page's facts (`efb::airport`).
     pub(crate) airport: crate::efb::airport::AirportFacts,
+}
+
+/// What a setting accepts, as the registry declares it (`settings::Kind`).
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum SettingKind {
+    Bool,
+    Num {
+        min: f64,
+        max: f64,
+        step: f64,
+        unit: &'static str,
+    },
+    Choice(&'static [&'static str]),
+    Text,
+}
+
+/// One registry row as it stands (`settings::Setting`).
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct SettingFacts {
+    pub(crate) key: &'static str,
+    pub(crate) label: &'static str,
+    pub(crate) help: &'static str,
+    pub(crate) kind: SettingKind,
+    /// The value as the registry parses it back ("on", "0.85", "both").
+    pub(crate) value: String,
+    /// As the terminal shows it ("0.85", "1200 ms", "(none)").
+    pub(crate) shown: String,
+    /// The variable that pins it, when one does.
+    pub(crate) pinned_env: Option<&'static str>,
 }
 
 // ---------------------------------------------------------------- state
@@ -313,6 +399,8 @@ pub(crate) struct Header {
     /// An automation of ours holds the aircraft.
     pub(crate) crew: bool,
     pub(crate) com1: Option<String>,
+    /// "idle", "listening", "thinking" or "speaking".
+    pub(crate) activity: Option<&'static str>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -453,6 +541,88 @@ pub(crate) struct Sent {
     pub(crate) text: String,
 }
 
+/// A question the page asks before it sends a change.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub(crate) struct Confirm {
+    /// The value that needs it; `None`: any change does.
+    pub(crate) when: Option<String>,
+    pub(crate) ask: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub(crate) struct SettingRow {
+    pub(crate) key: String,
+    pub(crate) label: String,
+    pub(crate) help: String,
+    /// "bool", "num", "choice" or "text".
+    pub(crate) kind: &'static str,
+    pub(crate) options: Vec<String>,
+    pub(crate) min: Option<f64>,
+    pub(crate) max: Option<f64>,
+    pub(crate) step: Option<f64>,
+    pub(crate) unit: String,
+    pub(crate) value: String,
+    pub(crate) shown: String,
+    /// Why the page cannot change it, when it cannot.
+    pub(crate) locked: Option<String>,
+    pub(crate) confirm: Option<Confirm>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub(crate) struct AlertOut {
+    pub(crate) id: u64,
+    pub(crate) t: f64,
+    pub(crate) level: &'static str,
+    pub(crate) text: String,
+}
+
+/// The crew's alerts the page shows outside the conversation.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub(crate) struct Alerts {
+    /// Every page's banner until the page acknowledges it (locally).
+    pub(crate) warnings: Vec<AlertOut>,
+    /// The header's chip, newest first.
+    pub(crate) cautions: Vec<AlertOut>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub(crate) struct Ptt {
+    /// This run captures on push to talk: the button can open the mic.
+    pub(crate) available: bool,
+    pub(crate) held: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub(crate) struct ItemOut {
+    pub(crate) line: String,
+    pub(crate) state: &'static str,
+    pub(crate) by: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub(crate) struct ListOut {
+    pub(crate) title: String,
+    /// "crew", "monitor" or "instruct".
+    pub(crate) flavour: &'static str,
+    /// What the flavour means, said plainly.
+    pub(crate) flavour_note: &'static str,
+    pub(crate) running: bool,
+    pub(crate) items: Vec<ItemOut>,
+    /// Items past (any state but pending and now) of all.
+    pub(crate) done: usize,
+    pub(crate) total: usize,
+    pub(crate) summary: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub(crate) struct ChecklistOut {
+    pub(crate) list: Option<ListOut>,
+    /// "Climb checklist?" while the copilot's proposal stands.
+    pub(crate) proposal: Option<String>,
+    pub(crate) waiting: Option<&'static str>,
+    pub(crate) buttons: Vec<Button>,
+}
+
 /// The whole page, one JSON document.
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub(crate) struct EfbState {
@@ -462,6 +632,10 @@ pub(crate) struct EfbState {
     pub(crate) radio: Radio,
     pub(crate) plan: Plan,
     pub(crate) weather: Weather,
+    pub(crate) checklist: ChecklistOut,
+    pub(crate) settings: Vec<SettingRow>,
+    pub(crate) alerts: Alerts,
+    pub(crate) ptt: Ptt,
     pub(crate) my_controls: Button,
     pub(crate) last_sent: Option<Sent>,
     pub(crate) airport: crate::efb::airport::AirportOut,
@@ -1132,6 +1306,196 @@ fn weather(f: &Facts) -> Weather {
     }
 }
 
+// ---------------------------------------------------------------- settings
+
+/// Why the page may not change a setting, when it may not: a pinned one as
+/// the registry refuses it, and the EFB's own link (its port and token are
+/// changed where the link is shown, never from a page that would lose it).
+pub(crate) fn setting_locked(key: &str, pinned_env: Option<&str>) -> Option<String> {
+    if let Some(env) = pinned_env {
+        return Some(format!("Pinned by {env}, edit your .env"));
+    }
+    match key {
+        "efb_port" | "efb_token" => Some("Set in the terminal or the panel".into()),
+        _ => None,
+    }
+}
+
+/// The question a change must be confirmed with, when it must: the mode
+/// (instructor stands every loop down) and turning the EFB itself off.
+pub(crate) fn setting_confirm(key: &str) -> Option<Confirm> {
+    match key {
+        "mode" => Some(Confirm {
+            when: None,
+            ask: "Change the app mode? Instructor stands every automation down and the crew keeps its hands off.".into(),
+        }),
+        "efb" => Some(Confirm {
+            when: Some("off".into()),
+            ask: "Turn the EFB off? This page stops answering until it is turned on again.".into(),
+        }),
+        _ => None,
+    }
+}
+
+/// Does setting `key` to `value` need the page's confirm? Pure: the page
+/// and the server ask the same question.
+pub(crate) fn needs_confirm(key: &str, value: &str) -> bool {
+    setting_confirm(key).is_some_and(|c| match c.when {
+        None => true,
+        Some(w) => w.eq_ignore_ascii_case(value.trim()),
+    })
+}
+
+/// The token as the page shows it: enough to recognise, not to copy.
+fn masked(token: &str) -> String {
+    if token.is_empty() {
+        "(none)".into()
+    } else {
+        format!("{}...", token.chars().take(4).collect::<String>())
+    }
+}
+
+fn setting_row(s: &SettingFacts) -> SettingRow {
+    let (kind, options, min, max, step, unit) = match &s.kind {
+        SettingKind::Bool => ("bool", Vec::new(), None, None, None, ""),
+        SettingKind::Num {
+            min,
+            max,
+            step,
+            unit,
+        } => ("num", Vec::new(), Some(*min), Some(*max), Some(*step), *unit),
+        SettingKind::Choice(o) => (
+            "choice",
+            o.iter().map(|x| x.to_string()).collect(),
+            None,
+            None,
+            None,
+            "",
+        ),
+        SettingKind::Text => ("text", Vec::new(), None, None, None, ""),
+    };
+    let secret = s.key == "efb_token";
+    SettingRow {
+        key: s.key.to_string(),
+        label: capitalise(s.label),
+        help: s.help.to_string(),
+        kind,
+        options,
+        min,
+        max,
+        step,
+        unit: unit.to_string(),
+        value: if secret { masked(&s.value) } else { s.value.clone() },
+        shown: if secret { masked(&s.value) } else { s.shown.clone() },
+        locked: setting_locked(s.key, s.pinned_env),
+        confirm: setting_confirm(s.key),
+    }
+}
+
+// ---------------------------------------------------------------- alerts
+
+/// A warning stays on the banner this long unless acknowledged.
+pub(crate) const WARNING_KEEP_S: f64 = 30.0 * 60.0;
+/// A caution stays in the header chip this long.
+pub(crate) const CAUTION_KEEP_S: f64 = 5.0 * 60.0;
+
+fn alerts(f: &Facts) -> Alerts {
+    let out = |a: &Alert| AlertOut {
+        id: a.id,
+        t: a.t,
+        level: a.level,
+        text: a.text.clone(),
+    };
+    let age = |a: &Alert| f.now_t - a.t;
+    Alerts {
+        warnings: f
+            .alerts
+            .iter()
+            .filter(|a| a.level == "warning" && age(a) < WARNING_KEEP_S)
+            .map(out)
+            .collect(),
+        cautions: f
+            .alerts
+            .iter()
+            .rev()
+            .filter(|a| a.level == "caution" && age(a) < CAUTION_KEEP_S)
+            .take(3)
+            .map(out)
+            .collect(),
+    }
+}
+
+// ---------------------------------------------------------------- checklist
+
+fn flavour_words(f: Flavour) -> (&'static str, &'static str) {
+    match f {
+        Flavour::Crew => (
+            "crew",
+            "The copilot runs it: reads each item, sets what is not in state.",
+        ),
+        Flavour::Monitor => (
+            "monitor",
+            "An automation is flying: a silent cross-check, one line at the end.",
+        ),
+        Flavour::Instruct => (
+            "instruct",
+            "The instructor calls each item; you set it and say next.",
+        ),
+    }
+}
+
+fn checklist(f: &Facts) -> ChecklistOut {
+    let list = f.checklist.as_ref().map(|s| {
+        let (flavour, flavour_note) = flavour_words(s.flavour);
+        let items: Vec<ItemOut> = s
+            .items
+            .iter()
+            .map(|i| ItemOut {
+                line: i.line.clone(),
+                state: i.state.word(),
+                by: i.by.clone(),
+            })
+            .collect();
+        ListOut {
+            title: s.title.clone(),
+            flavour,
+            flavour_note,
+            running: s.running,
+            done: s
+                .items
+                .iter()
+                .filter(|i| !matches!(i.state, ItemState::Pending | ItemState::Now))
+                .count(),
+            total: items.len(),
+            items,
+            summary: s.summary.clone(),
+        }
+    });
+    let running = list.as_ref().is_some_and(|l| l.running);
+    let mut ids: Vec<&str> = Vec::new();
+    if !running && f.proposal.is_some() {
+        ids.extend(["cl_go", "cl_teach", "cl_later"]);
+    }
+    if running {
+        match f.flow_waiting {
+            Some("confirm") => ids.extend(["cl_yes", "cl_no"]),
+            Some("advance") => ids.extend(["cl_next", "cl_skip", "cl_wait", "cl_help"]),
+            _ => {}
+        }
+        ids.push("cl_stop");
+    }
+    ChecklistOut {
+        list,
+        proposal: f
+            .proposal
+            .as_ref()
+            .filter(|_| !running)
+            .map(|t| format!("{} checklist?", capitalise(&t.to_lowercase()))),
+        waiting: f.flow_waiting.filter(|_| running),
+        buttons: ids.into_iter().map(|id| Button::of(phrase(id))).collect(),
+    }
+}
+
 /// The page, from the facts. Pure.
 pub(crate) fn build(f: &Facts) -> EfbState {
     let phase = f.flight.as_ref().map(|s| s.phase);
@@ -1180,6 +1544,7 @@ pub(crate) fn build(f: &Facts) -> EfbState {
             Some(w) => format!("{c} {w}"),
             None => c.clone(),
         }),
+        activity: f.activity,
     };
     let (automation, automation_lines) = automation(&f.auto);
     let talk: Vec<Talk> = f.lines.iter().rev().take(8).rev().map(talk).collect();
@@ -1198,6 +1563,13 @@ pub(crate) fn build(f: &Facts) -> EfbState {
         radio,
         plan: plan(f),
         weather: weather(f),
+        checklist: checklist(f),
+        settings: f.settings.iter().map(setting_row).collect(),
+        alerts: alerts(f),
+        ptt: Ptt {
+            available: f.ptt_available,
+            held: f.ptt_held,
+        },
         my_controls: Button::of(phrase("my_controls")),
         last_sent: f.last_sent.as_ref().map(|(t, s)| Sent {
             t: *t,
@@ -1399,6 +1771,149 @@ pub(crate) mod tests {
             }),
             preflight: None,
             last_sent: Some((1_791_280_790.0, "how long to top of descent".into())),
+            settings: vec![
+                SettingFacts {
+                    key: "mode",
+                    label: "app mode",
+                    help: "both, copilot only, ATC only, instructor",
+                    kind: SettingKind::Choice(&["both", "copilot", "atc", "instructor"]),
+                    value: "both".into(),
+                    shown: "both".into(),
+                    pinned_env: None,
+                },
+                SettingFacts {
+                    key: "voice_volume",
+                    label: "intercom volume",
+                    help: "the copilot and cabin crew, 1.0 = unity",
+                    kind: SettingKind::Num {
+                        min: 0.0,
+                        max: 2.0,
+                        step: 0.05,
+                        unit: "",
+                    },
+                    value: "0.85".into(),
+                    shown: "0.85".into(),
+                    pinned_env: None,
+                },
+                SettingFacts {
+                    key: "taxi_guide",
+                    label: "taxi guide",
+                    help: "turn and crossing calls",
+                    kind: SettingKind::Bool,
+                    value: "on".into(),
+                    shown: "on".into(),
+                    pinned_env: Some("XCOPILOT_TAXI_GUIDE"),
+                },
+                SettingFacts {
+                    key: "callsign",
+                    label: "callsign",
+                    help: "blank = the plan's",
+                    kind: SettingKind::Text,
+                    value: "XVL214".into(),
+                    shown: "XVL214".into(),
+                    pinned_env: None,
+                },
+                SettingFacts {
+                    key: "efb",
+                    label: "EFB",
+                    help: "serve the EFB page on the LAN",
+                    kind: SettingKind::Bool,
+                    value: "on".into(),
+                    shown: "on".into(),
+                    pinned_env: None,
+                },
+                SettingFacts {
+                    key: "efb_port",
+                    label: "EFB port",
+                    help: "the TCP port",
+                    kind: SettingKind::Num {
+                        min: 1024.0,
+                        max: 65535.0,
+                        step: 1.0,
+                        unit: "",
+                    },
+                    value: "8787".into(),
+                    shown: "8787".into(),
+                    pinned_env: None,
+                },
+                SettingFacts {
+                    key: "efb_token",
+                    label: "EFB token",
+                    help: "the link's key",
+                    kind: SettingKind::Text,
+                    value: "3f9a0c1d2b7e4a6f".into(),
+                    shown: "3f9a0c1d2b7e4a6f".into(),
+                    pinned_env: None,
+                },
+            ],
+            alerts: vec![
+                Alert {
+                    id: 7,
+                    t: 1_791_278_700.0,
+                    level: "warning",
+                    text: "Old warning, half an hour ago.".into(),
+                    flight: 0,
+                },
+                Alert {
+                    id: 8,
+                    t: 1_791_280_700.0,
+                    level: "caution",
+                    text: "Centre tank is dry, pumps off.".into(),
+                    flight: 0,
+                },
+                Alert {
+                    id: 9,
+                    t: 1_791_280_780.0,
+                    level: "warning",
+                    text: "Cabin altitude, masks on.".into(),
+                    flight: 0,
+                },
+                Alert {
+                    id: 10,
+                    t: 1_791_280_790.0,
+                    level: "advisory",
+                    text: "Top of descent in five minutes.".into(),
+                    flight: 0,
+                },
+            ],
+            activity: Some("listening"),
+            ptt_available: true,
+            ptt_held: false,
+            checklist: Some(Sheet {
+                title: "Cruise".into(),
+                flavour: Flavour::Monitor,
+                items: vec![
+                    crate::flow::SheetItem {
+                        line: "Cruise power, set.".into(),
+                        state: ItemState::Held,
+                        by: Some("the speed hold".into()),
+                    },
+                    crate::flow::SheetItem {
+                        line: "Altimeters, standard.".into(),
+                        state: ItemState::Done,
+                        by: None,
+                    },
+                    crate::flow::SheetItem {
+                        line: "Fuel balance, checked.".into(),
+                        state: ItemState::Discrepancy,
+                        by: None,
+                    },
+                    crate::flow::SheetItem {
+                        line: "Lights, as required.".into(),
+                        state: ItemState::Now,
+                        by: None,
+                    },
+                    crate::flow::SheetItem {
+                        line: "Seat belt signs, as required.".into(),
+                        state: ItemState::Pending,
+                        by: None,
+                    },
+                ],
+                running: true,
+                summary: None,
+            }),
+            proposal: None,
+            flow_waiting: None,
             airport: Default::default(),
         }
     }
@@ -1498,6 +2013,93 @@ pub(crate) mod tests {
         // The whole thing is JSON.
         let j = serde_json::to_value(&s).unwrap();
         assert_eq!(j["now"]["talk"][0]["kind"], "pilot");
+        assert_eq!(s.header.activity, Some("listening"));
+        assert!(s.ptt.available && !s.ptt.held);
+    }
+
+    /// The Settings page is the registry: every row, its control, the
+    /// pinned one locked with its variable named as the registry refuses
+    /// it, the EFB's own link locked and its token masked, the mode and
+    /// the EFB's off asking first.
+    #[test]
+    fn the_settings_page_is_the_registry_with_its_locks() {
+        let s = build(&cruise());
+        let row = |k: &str| s.settings.iter().find(|r| r.key == k).unwrap().clone();
+        assert_eq!(s.settings.len(), 7);
+        let mode = row("mode");
+        assert_eq!(mode.kind, "choice");
+        assert_eq!(mode.options.len(), 4);
+        assert_eq!(mode.label, "App mode");
+        assert!(mode.locked.is_none());
+        assert!(mode.confirm.as_ref().is_some_and(|c| c.when.is_none()));
+        let vol = row("voice_volume");
+        assert_eq!((vol.kind, vol.min, vol.max, vol.step), ("num", Some(0.0), Some(2.0), Some(0.05)));
+        let pinned = row("taxi_guide");
+        assert_eq!(pinned.locked.as_deref(), Some("Pinned by XCOPILOT_TAXI_GUIDE, edit your .env"));
+        assert_eq!(row("callsign").kind, "text");
+        let efb = row("efb");
+        assert!(efb.locked.is_none());
+        assert_eq!(efb.confirm.as_ref().and_then(|c| c.when.as_deref()), Some("off"));
+        assert!(row("efb_port").locked.is_some());
+        let tok = row("efb_token");
+        assert!(tok.locked.is_some());
+        assert_eq!(tok.value, "3f9a...");
+        assert!(!serde_json::to_string(&s).unwrap().contains("3f9a0c1d2b7e4a6f"), "the token never rides the state");
+        assert!(needs_confirm("efb", "OFF") && !needs_confirm("efb", "on"));
+        assert!(needs_confirm("mode", "both") && !needs_confirm("taxi_guide", "off"));
+    }
+
+    /// A warning is a banner for half an hour, a caution a chip for five
+    /// minutes, an advisory only the conversation's.
+    #[test]
+    fn alerts_are_a_banner_a_chip_or_nothing() {
+        let s = build(&cruise());
+        let w: Vec<u64> = s.alerts.warnings.iter().map(|a| a.id).collect();
+        assert_eq!(w, [9], "the old warning has aged off");
+        let c: Vec<u64> = s.alerts.cautions.iter().map(|a| a.id).collect();
+        assert_eq!(c, [8]);
+        let mut f = cruise();
+        f.now_t += CAUTION_KEEP_S;
+        assert!(build(&f).alerts.cautions.is_empty());
+    }
+
+    /// The checklist page: the list item by item, and only the replies the
+    /// list is waiting for.
+    #[test]
+    fn the_checklist_page_offers_only_the_answers_it_waits_for() {
+        let ids = |s: &EfbState| -> Vec<String> {
+            s.checklist.buttons.iter().map(|b| b.id.clone()).collect()
+        };
+        let s = build(&cruise());
+        let l = s.checklist.list.as_ref().expect("a list");
+        assert_eq!((l.flavour, l.running, l.done, l.total), ("monitor", true, 3, 5));
+        assert_eq!(l.items[0].state, "held");
+        assert_eq!(l.items[0].by.as_deref(), Some("the speed hold"));
+        assert_eq!(l.items[3].state, "now");
+        assert_eq!(ids(&s), ["cl_stop"]);
+        let mut f = cruise();
+        f.flow_waiting = Some("confirm");
+        assert_eq!(ids(&build(&f)), ["cl_yes", "cl_no", "cl_stop"]);
+        f.flow_waiting = Some("advance");
+        assert_eq!(ids(&build(&f)), ["cl_next", "cl_skip", "cl_wait", "cl_help", "cl_stop"]);
+        // Finished, and the copilot proposes the next.
+        let mut f = cruise();
+        let sheet = f.checklist.as_mut().unwrap();
+        sheet.running = false;
+        sheet.summary = Some("Cruise checklist complete.".into());
+        f.proposal = Some("Descent".into());
+        f.flow_waiting = Some("confirm");
+        let s = build(&f);
+        assert_eq!(s.checklist.proposal.as_deref(), Some("Descent checklist?"));
+        assert_eq!(s.checklist.waiting, None, "a finished list waits for nothing");
+        assert_eq!(ids(&s), ["cl_go", "cl_teach", "cl_later"]);
+        assert_eq!(
+            s.checklist.list.unwrap().summary.as_deref(),
+            Some("Cruise checklist complete.")
+        );
+        // Nothing this flight: no list, no buttons.
+        let s = build(&Facts::default());
+        assert!(s.checklist.list.is_none() && s.checklist.buttons.is_empty());
     }
 
     /// Nothing known: every box is None (a dash on the page), no number
@@ -1611,6 +2213,32 @@ pub(crate) mod tests {
             Route::Radio
         };
         for p in PHRASES {
+            if let Route::Checklist(door) = p.route {
+                // Taken at the flow's door, which only a running list or a
+                // standing proposal opens; nothing ahead of it may take the
+                // words first (the undo, the release guard, a tuned tower).
+                use crate::flow::{ProposalReply as P, Reply as R};
+                let got = match door.split_once(' ') {
+                    Some(("proposal", _)) => crate::flow::proposal_reply(p.words).map(|a| match a {
+                        P::Run => "proposal run",
+                        P::Instruct => "proposal instruct",
+                        P::Decline => "proposal decline",
+                    }),
+                    _ => crate::flow::classify(p.words).map(|r| match r {
+                        R::Yes => "reply yes",
+                        R::No => "reply no",
+                        R::Next => "reply next",
+                        R::Skip => "reply skip",
+                        R::Hold => "reply hold",
+                        R::DoIt => "reply do it",
+                        R::Abort => "reply abort",
+                    }),
+                };
+                assert_eq!(got, Some(door), "{} ({:?})", p.id, p.words);
+                assert!(!crate::is_undo(p.words), "{}: the undo takes it", p.id);
+                assert_eq!(crate::state_capture_note(p.words), None, "{}", p.id);
+                continue;
+            }
             assert_eq!(routed(p.words), p.route, "{} ({:?})", p.id, p.words);
         }
         for icao in ["EGKK", "LEMG", "KSFO"] {

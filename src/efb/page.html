@@ -11,7 +11,7 @@
 <meta name="color-scheme" content="dark">
 <title>XVL EFB</title>
 <link rel="icon" href="/icon.svg" type="image/svg+xml">
-<link rel="apple-touch-icon" href="/icon.svg">
+<link rel="apple-touch-icon" href="/apple-touch-icon.png" sizes="180x180">
 <link id="manifest" rel="manifest" href="/manifest.webmanifest" crossorigin="use-credentials">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -287,22 +287,180 @@ nav.bottom { display: none; }
   body.kb nav.bottom { display: none; }
 }
 </style>
+
+<!-- EFB v2 (part A): settings, alerts, push to talk, checklist. Its own block. -->
+<style>
+/* The v2 blocks show and hide by the attribute, over any display rule. */
+.app [hidden] { display: none !important; }
+/* Activity dot (idle, listening, thinking, speaking) beside the connection dot. */
+.act { width: 10px; height: 10px; border-radius: 5px; background: #2E3D4F; flex: 0 0 auto; margin-left: -8px; }
+.act.listening { background: var(--green); }
+.act.thinking { background: var(--amber); }
+.act.speaking { background: var(--cyan); box-shadow: 0 0 0 3px rgba(127, 211, 247, 0.25); }
+/* Caution chip */
+.chip.caution { background: var(--warn-bg); border-color: var(--warn-line); color: var(--warn); max-width: 340px; min-width: 0; overflow: hidden; text-overflow: ellipsis; display: block; line-height: 20px; }
+.chip.caution .k { color: var(--warn); font-weight: 700; margin-right: 6px; }
+/* Warning banner: every page, until acknowledged here */
+.banner {
+  flex: 0 0 auto; display: flex; align-items: center; gap: 12px; padding: 10px 20px; min-height: 52px;
+  padding-left: max(20px, env(safe-area-inset-left)); padding-right: max(20px, env(safe-area-inset-right));
+  background: var(--red-bg); border-bottom: 2px solid var(--red-line); color: #FFC7C2;
+}
+.banner[hidden] { display: none; }
+.banner .bk { font-weight: 700; letter-spacing: 0.1em; color: var(--red); flex: 0 0 auto; }
+.banner .bt { flex: 1 1 auto; min-width: 0; font-size: 16px; line-height: 1.35; overflow-wrap: anywhere; }
+.banner .bn { color: var(--red); font-size: 14px; flex: 0 0 auto; }
+.banner button { min-height: 44px; padding: 0 16px; border-radius: 10px; border: 1px solid var(--red-line); background: #3A1410; color: #FFD9D5; font-size: 15px; font-weight: 700; cursor: pointer; flex: 0 0 auto; }
+/* Push to talk */
+.ptt {
+  min-height: 48px; padding: 0 18px; border-radius: 10px; border: 1px solid var(--green-line);
+  background: var(--green-bg); color: var(--green); font-size: 15px; font-weight: 700; letter-spacing: 0.04em;
+  cursor: pointer; white-space: nowrap; flex: 0 0 auto;
+  touch-action: none; user-select: none; -webkit-user-select: none; -webkit-touch-callout: none; -webkit-tap-highlight-color: transparent;
+}
+.ptt[hidden] { display: none; }
+.ptt.held { background: #1E6B3E; border-color: var(--green); color: #FFFFFF; }
+/* Checklist page */
+.cl-head { display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; }
+.badge { padding: 3px 10px; border-radius: 999px; font-size: 13px; letter-spacing: 0.08em; text-transform: uppercase; border: 1px solid var(--line2); color: var(--soft); background: #16202B; }
+.badge.monitor { border-color: var(--cyan-line); color: var(--cyan); background: var(--cyan-bg); }
+.badge.crew { border-color: var(--green-line); color: var(--green); background: var(--green-bg); }
+.badge.instruct { border-color: #4B3F7A; color: var(--violet); background: #1A1530; }
+.items { display: flex; flex-direction: column; border: 1px solid var(--line); border-radius: 12px; overflow: hidden; }
+.item { display: grid; grid-template-columns: 112px minmax(0, 1fr); gap: 12px; padding: 11px 14px; border-top: 1px solid #1C2530; font-size: 15px; align-items: baseline; }
+.item:first-child { border-top: 0; }
+.item .st { font-size: 13px; letter-spacing: 0.08em; text-transform: uppercase; color: var(--faint); }
+.item .ln { color: var(--body); overflow-wrap: anywhere; }
+.item .by { color: var(--muted); font-size: 14px; }
+.item.now { background: var(--cyan-bg); }
+.item.now .st { color: var(--cyan); font-weight: 700; }
+.item.done .st { color: var(--green); }
+.item.held .st { color: var(--cyan); }
+.item.discrepancy .st, .item.failed .st { color: var(--warn); }
+.item.discrepancy, .item.failed { background: var(--warn-bg); }
+.item.skipped .st, .item.unread .st, .item.said .st { color: var(--muted); }
+.proposal { border-color: var(--cyan-line); }
+/* Settings page */
+.setrows { display: flex; flex-direction: column; border: 1px solid var(--line2); border-radius: 14px; overflow: hidden; background: var(--card); }
+.setrow { display: flex; gap: 16px; padding: 14px 18px; border-top: 1px solid #1C2530; align-items: center; flex-wrap: wrap; }
+.setrow:first-child { border-top: 0; }
+.setrow .sl { flex: 1 1 260px; min-width: 0; display: flex; flex-direction: column; gap: 3px; }
+.setrow .sn { font-size: 16px; font-weight: 700; }
+.setrow .sh { font-size: 14px; color: var(--muted); line-height: 1.35; }
+.setrow .sm { font-size: 14px; color: var(--muted); }
+.setrow .sm.ok { color: var(--green); }
+.setrow .sm.err { color: var(--red); }
+.setrow .sc { flex: 0 1 auto; display: flex; gap: 8px; align-items: center; flex-wrap: wrap; min-width: 0; max-width: 100%; }
+.setrow .lock { font-size: 14px; color: var(--warn); }
+.setrow .val { font-family: var(--mono); font-size: 15px; color: var(--soft); }
+.seg { display: flex; flex-wrap: wrap; border: 1px solid var(--line2); border-radius: 10px; overflow: hidden; max-width: 100%; }
+.seg button { min-height: 44px; padding: 0 14px; border: 0; border-left: 1px solid var(--line2); background: #16202B; color: var(--soft); font-size: 15px; cursor: pointer; }
+.seg button:first-child { border-left: 0; }
+.seg button[aria-pressed="true"] { background: var(--cyan-bg); color: #E6F6FE; font-weight: 700; }
+.switch { min-height: 44px; min-width: 76px; border-radius: 22px; border: 1px solid var(--line2); background: #16202B; color: var(--soft); font-size: 15px; font-weight: 700; cursor: pointer; }
+.switch[aria-checked="true"] { background: var(--green-bg); border-color: var(--green-line); color: var(--green); }
+.setrow input.num, .setrow input.txt {
+  min-height: 44px; border-radius: 10px; border: 1px solid var(--line2); background: var(--card2); color: var(--text);
+  font-family: var(--mono); font-size: 16px; padding: 0 10px; min-width: 0;
+}
+.setrow input.num { width: 104px; text-align: center; }
+.setrow input.txt { width: 240px; max-width: 100%; }
+.setrow input:focus { outline: 2px solid var(--cyan-line); outline-offset: 0; }
+.setrow .step { min-width: 44px; padding: 0; }
+.confirmbar { flex: 1 1 100%; display: flex; gap: 10px; align-items: center; flex-wrap: wrap; padding: 10px 12px; border-radius: 10px; background: var(--warn-bg); border: 1px solid var(--warn-line); color: var(--warn); font-size: 15px; }
+.confirmbar span { flex: 1 1 220px; min-width: 0; }
+
+@media (max-width: 700px) {
+  .chip.caution { max-width: none; flex: 0 0 auto; padding: 4px 10px; text-overflow: clip; }
+  .chip.caution .ct { display: none; }
+  .chip.caution .k { margin: 0; }
+  .banner { padding: 8px 14px; gap: 10px; }
+  .banner .bk, .banner .bn { display: none; }
+  .banner .bt { font-size: 15px; }
+  .banner button { padding: 0 12px; }
+  /* The talk button: a full-width row above the line, under the thumb. */
+  form.say { flex-wrap: wrap; }
+  form.say input { flex: 1 1 0; }
+  form.say .btn { flex: 0 0 auto; }
+  .setrow .step { flex: 0 0 44px; }
+  form.say .ptt { order: -1; flex: 1 0 100%; min-height: 56px; font-size: 16px; }
+  body.kb form.say .ptt { display: none; }
+  .item { grid-template-columns: 96px minmax(0, 1fr); gap: 10px; padding: 10px 12px; }
+  .setrow { padding: 12px 14px; gap: 10px; }
+  .setrow .sl { flex: 1 1 100%; }
+  .setrow .sc { flex: 1 1 100%; }
+  .setrow input.txt { flex: 1 1 auto; width: auto; }
+  .seg { flex: 1 1 100%; }
+  .seg button { flex: 1 1 auto; padding: 0 8px; }
+}
+
+/* Seven pages: a phone's bar (and a phone on its side's rail) shows four
+   and More; More opens a sheet with the rest. Wide and medium show all. */
+nav .more-tab { display: none !important; }
+.more-sheet {
+  position: fixed; z-index: 20; display: flex; flex-direction: column; gap: 6px; padding: 8px;
+  background: var(--bar); border: 1px solid var(--line2); border-radius: 14px; box-shadow: 0 10px 30px rgba(0, 0, 0, 0.5);
+  right: max(10px, env(safe-area-inset-right)); bottom: calc(64px + env(safe-area-inset-bottom)); min-width: 200px;
+}
+.sheet-tab {
+  min-height: 52px; display: flex; align-items: center; gap: 12px; padding: 0 16px; border-radius: 10px;
+  border: 1px solid transparent; background: transparent; color: var(--text); font-size: 16px; cursor: pointer; text-align: left;
+}
+.sheet-tab svg { width: 22px; height: 22px; flex: 0 0 auto; }
+.sheet-tab[aria-current="page"] { border-color: var(--cyan-line); background: var(--cyan-bg); font-weight: 700; }
+@media (max-width: 700px) {
+  nav.bottom .tab[data-more] { display: none; }
+  nav.bottom .more-tab { display: flex !important; }
+}
+@media (max-height: 500px) and (min-width: 701px) {
+  /* Icons two abreast, the words kept for a screen reader: the rail never scrolls. */
+  nav.tabs { width: 100px; padding: 6px; gap: 4px; overflow: hidden; display: grid; grid-template-columns: 1fr 1fr; align-content: start; }
+  nav.tabs .tab[data-more] { display: none; }
+  nav.tabs .more-tab { display: flex !important; }
+  nav.tabs .tab { min-height: 44px; padding: 0; justify-content: center; }
+  nav.tabs .tab span { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
+  nav.tabs .tab svg { width: 22px; height: 22px; }
+  .more-sheet { left: calc(106px + env(safe-area-inset-left)); right: auto; bottom: 64px; }
+}
+/* Medium (iPad portrait): with more tabs the top bar keeps its words and
+   drops its icons, so MY CONTROLS stays in view. */
+@media (max-width: 1000px) and (min-width: 701px) and (min-height: 501px) {
+  nav.tabs { gap: 4px; padding: 8px 10px; }
+  nav.tabs .tab svg { display: none; }
+  nav.tabs .tab { padding: 0 8px; flex: 1 1 auto; }
+  nav.tabs .mc { padding: 0 12px; }
+}
+@media (max-height: 500px) and (min-width: 701px) {
+  .banner { min-height: 40px; padding-top: 4px; padding-bottom: 4px; }
+  .banner .bt { font-size: 14px; }
+  .chip.caution { max-width: 220px; }
+}
+</style>
 </head>
 <body>
 <div class="app" id="app">
   <header class="top">
     <span class="conn" id="conn" title="connection"></span>
+    <span class="act" id="h-act" title="copilot"></span>
     <div class="ident">
       <div class="cs"><span id="h-cs">-</span> <span class="type" id="h-type"></span></div>
       <div class="route" id="h-route">-</div>
     </div>
     <div class="spacer"></div>
     <div class="chips">
+      <div class="chip caution" id="h-caution" hidden><span class="k">!</span><span class="ct" id="h-caution-t"></span></div>
       <div class="chip phase-k"><span class="k">PHASE</span><span id="h-phase">-</span></div>
       <div class="chip who" id="h-who">-</div>
       <div class="chip mono com1"><span class="k">COM1</span><span id="h-com1">-</span></div>
     </div>
   </header>
+  <!-- EFB v2: the crew's warning, on every page until acknowledged here -->
+  <div class="banner" id="banner" role="alert" hidden>
+    <span class="bk">WARNING</span>
+    <span class="bt" id="banner-t"></span>
+    <span class="bn" id="banner-n"></span>
+    <button type="button" id="banner-ack">Acknowledge</button>
+  </div>
 
   <div class="body">
     <nav class="tabs" aria-label="EFB pages" id="rail"></nav>
@@ -405,12 +563,39 @@ nav.bottom { display: none; }
 
       <!-- AIRPORT (drawn by /diagram.js) -->
       <div class="page" id="p-apt"><div class="apt-root" id="apt-root"></div></div>
+
+      <!-- CHECKLIST (EFB v2) -->
+      <div class="page" id="p-check">
+        <div class="cl-head">
+          <h2 id="cl-title">Checklist</h2>
+          <span class="badge" id="cl-flavour" hidden></span>
+          <div class="sub" id="cl-progress"></div>
+        </div>
+        <section class="card proposal" id="cl-proposal" hidden>
+          <div class="label cyan">The copilot asks</div>
+          <div class="big" id="cl-proposal-t"></div>
+        </section>
+        <div class="buttons" id="cl-buttons"></div>
+        <div class="sub" id="cl-note"></div>
+        <div class="items" id="cl-items"></div>
+        <div class="detail" id="cl-summary"></div>
+      </div>
+
+      <!-- SETTINGS (EFB v2) -->
+      <div class="page" id="p-set">
+        <div class="row-head">
+          <h2>Settings</h2>
+          <div class="sub">The same settings as the terminal and the panel. Changes apply at once and are saved.</div>
+        </div>
+        <div class="setrows" id="set-rows"></div>
+      </div>
     </main>
   </div>
 
   <footer class="composer">
     <form class="say" id="say-form" autocomplete="off">
       <button class="mc phone-mc" data-say="mc" type="button">MY CONTROLS</button>
+      <button class="ptt" id="ptt" type="button" hidden aria-label="Hold to talk to the copilot">HOLD TO TALK</button>
       <input id="say-input" type="text" inputmode="text" enterkeyhint="send" autocapitalize="off" autocorrect="off" spellcheck="false" placeholder="Type a line, as you would say it" maxlength="200" aria-label="Type a line for the copilot">
       <button class="btn primary" type="submit">Send</button>
     </form>
@@ -422,6 +607,7 @@ nav.bottom { display: none; }
   </footer>
 
   <nav class="bottom" aria-label="EFB pages" id="bottom"></nav>
+  <div class="more-sheet" id="more-sheet" role="menu" aria-label="More pages" hidden></div>
 </div>
 
 <script src="/diagram.js"></script>
@@ -447,7 +633,14 @@ nav.bottom { display: none; }
     wx: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M7 18h10a4 4 0 0 0 0-8 6 6 0 0 0-11.5 1.5A3.5 3.5 0 0 0 7 18z"/></svg>',
     apt: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 20 20 4"/><path d="M4 9h7v11"/><circle cx="17" cy="17" r="2"/></svg>'
   };
-  var TABS = [['now', 'Now'], ['radio', 'Radio'], ['plan', 'Plan'], ['wx', 'Weather'], ['apt', 'Airport']];
+  // The pages in the order a flight uses them. On a phone (and a phone on
+  // its side) the first four ride the bar and the rest open from More.
+  var TABS = [['now', 'Now'], ['radio', 'Radio'], ['apt', 'Airport'], ['check', 'Checklist'],
+    ['plan', 'Plan'], ['wx', 'Weather'], ['set', 'Settings']];
+  var MORE = { plan: 1, wx: 1, set: 1 };
+  ICONS.more = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="5" cy="12" r="1.6"/><circle cx="12" cy="12" r="1.6"/><circle cx="19" cy="12" r="1.6"/></svg>';
+  ICONS.check = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 6h11M9 12h11M9 18h11"/><path d="m3.5 6 1.5 1.5L7.5 5M3.5 12l1.5 1.5L7.5 11M3.5 18l1.5 1.5L7.5 17"/></svg>';
+  ICONS.set = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 7h10M18 7h2M4 17h4M12 17h8"/><circle cx="16" cy="7" r="2"/><circle cx="10" cy="17" r="2"/></svg>';
   var tab = 'now';
   function known(id) { return TABS.some(function (t) { return t[0] === id; }); }
   try { var saved = localStorage.getItem(TAB_KEY); if (saved && known(saved)) tab = saved; } catch (e) {}
@@ -479,11 +672,35 @@ nav.bottom { display: none; }
         b.type = 'button';
         b.setAttribute('data-tab', t[0]);
         b.setAttribute('aria-current', t[0] === tab ? 'page' : 'false');
+        if (MORE[t[0]]) b.setAttribute('data-more', '1');
+        b.title = t[1];
         b.innerHTML = ICONS[t[0]];
         b.appendChild(el('span', null, t[1]));
         b.addEventListener('click', function () { pick(t[0]); });
         nav.appendChild(b);
       });
+    });
+    // More: shown only where the bar is short (CSS), opens the sheet.
+    [rail, bottom].forEach(function (nav) {
+      var m = el('button', 'tab more-tab');
+      m.type = 'button';
+      m.setAttribute('aria-haspopup', 'true');
+      m.setAttribute('aria-current', MORE[tab] ? 'page' : 'false');
+      m.innerHTML = ICONS.more;
+      m.appendChild(el('span', null, 'More'));
+      m.addEventListener('click', function (e) { e.stopPropagation(); toggleMore(); });
+      nav.appendChild(m);
+    });
+    var sheet = document.getElementById('more-sheet');
+    clear(sheet);
+    TABS.filter(function (t) { return MORE[t[0]]; }).forEach(function (t) {
+      var b = el('button', 'sheet-tab');
+      b.type = 'button';
+      b.setAttribute('data-tab', t[0]);
+      b.innerHTML = ICONS[t[0]];
+      b.appendChild(el('span', null, t[1]));
+      b.addEventListener('click', function () { toggleMore(false); pick(t[0]); });
+      sheet.appendChild(b);
     });
     rail.appendChild(el('div', 'grow'));
     var mc = el('button', 'mc', 'MY CONTROLS');
@@ -492,8 +709,19 @@ nav.bottom { display: none; }
     rail.appendChild(mc);
     wireMc(mc);
   }
+  function toggleMore(open) {
+    var sheet = document.getElementById('more-sheet');
+    sheet.hidden = open === undefined ? !sheet.hidden : !open;
+  }
+  document.addEventListener('click', function (e) {
+    var sheet = document.getElementById('more-sheet');
+    if (!sheet.hidden && !sheet.contains(e.target)) sheet.hidden = true;
+  });
   function pick(id) {
     tab = id;
+    document.querySelectorAll('.more-tab').forEach(function (b) {
+      b.setAttribute('aria-current', MORE[id] ? 'page' : 'false');
+    });
     try { localStorage.setItem(TAB_KEY, id); } catch (e) {}
     document.querySelectorAll('[data-tab]').forEach(function (b) {
       b.setAttribute('aria-current', b.getAttribute('data-tab') === id ? 'page' : 'false');
@@ -722,6 +950,7 @@ nav.bottom { display: none; }
       c.appendChild(bx);
       wl.appendChild(c);
     });
+    renderV2(s);
   }
 
   // Live: Server-Sent Events, falling back to polling /state.
@@ -774,6 +1003,291 @@ nav.bottom { display: none; }
   input.addEventListener('blur', function () { setTimeout(fitKeyboard, 100); });
 
   if (window.matchMedia && window.matchMedia('(max-width: 700px)').matches) input.placeholder = 'Type a line';
+
+  // ------------------------------------------------------------ EFB v2
+  // Settings, alerts, push to talk, checklist. Settings POST /setting
+  // through the registry's own setter; push to talk POSTs /ptt (it only
+  // opens the mic); the checklist's answers are pilot English on /say.
+  function post(path, body) {
+    return fetch(withT(path), {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-EFB-Token': token },
+      credentials: 'same-origin',
+      body: JSON.stringify(body)
+    });
+  }
+
+  // Alerts: the warning banner is acknowledged on this page only.
+  var ACK_KEY = 'xvl_efb_ack';
+  var acked = {};
+  try { (JSON.parse(localStorage.getItem(ACK_KEY) || '[]') || []).forEach(function (id) { acked[id] = 1; }); } catch (e) {}
+  var lastWarnings = [];
+  function unacked() { return lastWarnings.filter(function (w) { return !acked[w.id]; }); }
+  function showBanner() {
+    var open = unacked();
+    var b = document.getElementById('banner');
+    b.hidden = !open.length;
+    if (!open.length) return;
+    var w = open[open.length - 1];
+    document.getElementById('banner-t').textContent = zulu(w.t) + '  ' + w.text;
+    document.getElementById('banner-n').textContent = open.length > 1 ? (open.length - 1) + ' more' : '';
+  }
+  document.getElementById('banner-ack').addEventListener('click', function () {
+    var open = unacked();
+    if (!open.length) return;
+    acked[open[open.length - 1].id] = 1;
+    try { localStorage.setItem(ACK_KEY, JSON.stringify(Object.keys(acked).slice(-200))); } catch (e) {}
+    showBanner();
+  });
+  function renderAlerts(a) {
+    lastWarnings = (a && a.warnings) || [];
+    showBanner();
+    var cs = (a && a.cautions) || [];
+    var chip = document.getElementById('h-caution');
+    chip.hidden = !cs.length;
+    document.getElementById('h-caution-t').textContent = cs.length ? cs[0].text : '';
+    chip.title = cs.map(function (c) { return zulu(c.t) + ' ' + c.text; }).join('\n');
+  }
+
+  // Push to talk: press, a heartbeat every 250 ms while held, release.
+  // The app drops a hold whose heartbeat stops, so a lost touch-up never
+  // leaves the mic open; the hold is capped at a minute either way.
+  var pttBtn = document.getElementById('ptt');
+  var pttBeat = null, pttDown = false;
+  function pttShow(held) {
+    pttBtn.classList.toggle('held', held);
+    pttBtn.textContent = held ? 'TALKING' : 'HOLD TO TALK';
+  }
+  function pttStop(send) {
+    if (pttBeat) { clearInterval(pttBeat); pttBeat = null; }
+    var was = pttDown;
+    pttDown = false;
+    pttShow(false);
+    if (send && was) post('/ptt', { action: 'release' }).catch(function () {});
+  }
+  function pttStart(e) {
+    if (e) { e.preventDefault(); try { pttBtn.setPointerCapture(e.pointerId); } catch (x) {} }
+    if (pttDown) return;
+    pttDown = true;
+    pttShow(true);
+    post('/ptt', { action: 'press' }).then(function (r) {
+      if (r.status === 409) { pttStop(false); showSent(false, 'xvl is not on push to talk in this run:', ''); }
+      else if (!r.ok) { pttStop(false); }
+    }).catch(function () { pttStop(false); showSent(false, 'Talk not sent, xvl unreachable:', ''); });
+    pttBeat = setInterval(function () {
+      if (!pttDown) return;
+      post('/ptt', { action: 'beat' }).then(function (r) { return r.ok ? r.json() : null; })
+        .then(function (j) { if (j && j.held === false) pttStop(false); })
+        .catch(function () {});
+    }, 250);
+  }
+  pttBtn.addEventListener('pointerdown', pttStart);
+  ['pointerup', 'pointercancel', 'lostpointercapture'].forEach(function (ev) {
+    pttBtn.addEventListener(ev, function () { pttStop(true); });
+  });
+  pttBtn.addEventListener('contextmenu', function (e) { e.preventDefault(); });
+  pttBtn.addEventListener('click', function (e) { e.preventDefault(); });
+  document.addEventListener('visibilitychange', function () { if (document.hidden) pttStop(true); });
+  window.addEventListener('pagehide', function () { pttStop(true); });
+  function renderPtt(p) {
+    pttBtn.hidden = !(p && p.available);
+    if (pttBtn.hidden && pttDown) pttStop(true);
+  }
+
+  // Activity dot.
+  function renderActivity(a) {
+    var d = document.getElementById('h-act');
+    d.className = 'act' + (a ? ' ' + a : '');
+    d.title = 'copilot ' + (a || 'unknown');
+  }
+
+  // Checklist.
+  var STATE_WORD = { pending: 'Pending', now: 'Now', done: 'Done', held: 'Held', discrepancy: 'Not as listed', skipped: 'Skipped', failed: 'Did not take', unread: 'Unread', said: 'Said' };
+  function renderChecklist(c) {
+    var l = c.list;
+    setText('cl-title', l ? l.title + ' checklist' : 'Checklist');
+    var fl = document.getElementById('cl-flavour');
+    fl.hidden = !l;
+    if (l) { fl.className = 'badge ' + l.flavour; fl.textContent = l.flavour; }
+    document.getElementById('cl-progress').textContent = l ? (l.running ? 'Running, ' : 'Finished, ') + l.done + ' of ' + l.total : '';
+    var pr = document.getElementById('cl-proposal');
+    pr.hidden = !c.proposal;
+    document.getElementById('cl-proposal-t').textContent = c.proposal || '';
+    buttons('cl-buttons', c.buttons);
+    var note = l ? l.flavour_note : 'No checklist this flight yet. The copilot proposes each at its phase, or say its name: "descent checklist".';
+    if (c.waiting === 'confirm') note = 'The copilot asks for a yes or no before this item.';
+    if (c.waiting === 'advance') note = 'Set the item, then Next.';
+    document.getElementById('cl-note').textContent = note;
+    var box = document.getElementById('cl-items');
+    clear(box);
+    box.hidden = !l;
+    (l ? l.items : []).forEach(function (it) {
+      var r = el('div', 'item ' + it.state);
+      r.appendChild(el('div', 'st', STATE_WORD[it.state] || it.state));
+      var x = el('div', 'ln', it.line);
+      if (it.by) { x.appendChild(document.createTextNode(' ')); x.appendChild(el('span', 'by', '(' + it.by + ' has it)')); }
+      r.appendChild(x);
+      box.appendChild(r);
+    });
+    document.getElementById('cl-summary').textContent = l && l.summary ? l.summary : '';
+  }
+
+  // Settings: built once per set of rows, values refreshed unless the row
+  // is being edited or waits on its confirm.
+  var setSig = '', setRows = {};
+  function setMsg(row, ok, text) {
+    row.msg.className = 'sm' + (ok === true ? ' ok' : ok === false ? ' err' : '');
+    row.msg.textContent = text || '';
+  }
+  function sendSetting(row, value, confirmed) {
+    var r = row.data;
+    if (!confirmed && r.confirm && (!r.confirm.when || r.confirm.when === value) && value !== r.value) {
+      askConfirm(row, value);
+      return;
+    }
+    row.busy = true;
+    setMsg(row, null, 'Saving...');
+    post('/setting', { key: r.key, value: value, confirm: !!confirmed }).then(function (resp) {
+      return resp.text().then(function (t) { return { ok: resp.ok, status: resp.status, text: t }; });
+    }).then(function (x) {
+      row.busy = false;
+      if (x.ok) {
+        var j = {}; try { j = JSON.parse(x.text); } catch (e) {}
+        row.data = Object.assign({}, row.data, { value: value, shown: j.shown || value });
+        setMsg(row, true, 'Set: ' + (j.shown || value));
+      }
+      else setMsg(row, false, x.status === 429 ? 'One change at a time, try again.' : x.text || ('Refused (' + x.status + ')'));
+      row.dirty = false;
+      fillRow(row, true);
+    }).catch(function () { row.busy = false; setMsg(row, false, 'Not sent, xvl unreachable.'); });
+  }
+  function askConfirm(row, value) {
+    if (row.bar) row.bar.remove();
+    row.busy = true;
+    var bar = el('div', 'confirmbar');
+    bar.appendChild(el('span', null, row.data.confirm.ask));
+    var yes = el('button', 'btn armed', 'Confirm');
+    yes.type = 'button';
+    var no = el('button', 'btn', 'Cancel');
+    no.type = 'button';
+    yes.addEventListener('click', function () { bar.remove(); row.bar = null; sendSetting(row, value, true); });
+    no.addEventListener('click', function () { bar.remove(); row.bar = null; row.busy = false; fillRow(row, true); setMsg(row, null, ''); });
+    bar.appendChild(yes); bar.appendChild(no);
+    row.el.appendChild(bar);
+    row.bar = bar;
+  }
+  function numText(r, v) { var n = parseFloat(v); if (isNaN(n)) return v; var d = (String(r.step).split('.')[1] || '').length; return n.toFixed(d); }
+  function buildRow(r) {
+    var row = { data: r, el: el('div', 'setrow'), busy: false, dirty: false, bar: null };
+    var left = el('div', 'sl');
+    left.appendChild(el('div', 'sn', r.label));
+    left.appendChild(el('div', 'sh', r.help));
+    row.msg = el('div', 'sm');
+    left.appendChild(row.msg);
+    row.el.appendChild(left);
+    var c = el('div', 'sc');
+    row.el.appendChild(c);
+    row.ctl = c;
+    if (r.locked) {
+      row.val = el('span', 'val', r.shown);
+      c.appendChild(row.val);
+      c.appendChild(el('span', 'lock', r.locked));
+    } else if (r.kind === 'bool') {
+      var sw = el('button', 'switch');
+      sw.type = 'button';
+      sw.setAttribute('role', 'switch');
+      sw.setAttribute('aria-label', r.label);
+      sw.addEventListener('click', function () { sendSetting(row, row.data.value === 'on' ? 'off' : 'on', false); });
+      c.appendChild(sw);
+      row.sw = sw;
+    } else if (r.kind === 'choice') {
+      var seg = el('div', 'seg');
+      row.segs = {};
+      r.options.forEach(function (o) {
+        var b = el('button', null, o);
+        b.type = 'button';
+        b.addEventListener('click', function () { if (o !== row.data.value) sendSetting(row, o, false); });
+        seg.appendChild(b);
+        row.segs[o] = b;
+      });
+      c.appendChild(seg);
+    } else if (r.kind === 'num') {
+      var minus = el('button', 'btn step', '-');
+      var plus = el('button', 'btn step', '+');
+      minus.type = plus.type = 'button';
+      minus.setAttribute('aria-label', 'Lower ' + r.label);
+      plus.setAttribute('aria-label', 'Raise ' + r.label);
+      var inp = el('input', 'num');
+      inp.type = 'text';
+      inp.inputMode = 'decimal';
+      inp.setAttribute('aria-label', r.label);
+      var timer = null;
+      function later() { row.dirty = true; if (timer) clearTimeout(timer); timer = setTimeout(function () { sendSetting(row, inp.value.trim(), false); }, 700); }
+      function stepBy(dir) {
+        var n = parseFloat(inp.value); if (isNaN(n)) n = parseFloat(row.data.value) || 0;
+        n = Math.min(r.max, Math.max(r.min, n + dir * r.step));
+        inp.value = numText(r, n);
+        later();
+      }
+      minus.addEventListener('click', function () { stepBy(-1); });
+      plus.addEventListener('click', function () { stepBy(1); });
+      inp.addEventListener('input', function () { row.dirty = true; });
+      inp.addEventListener('change', function () { if (timer) clearTimeout(timer); sendSetting(row, inp.value.trim(), false); });
+      c.appendChild(minus); c.appendChild(inp); c.appendChild(plus);
+      if (r.unit) c.appendChild(el('span', 'sm', r.unit));
+      row.inp = inp;
+    } else {
+      var t = el('input', 'txt');
+      t.type = 'text';
+      t.autocomplete = 'off'; t.spellcheck = false;
+      t.setAttribute('autocapitalize', 'off');
+      t.setAttribute('aria-label', r.label);
+      t.placeholder = '(none)';
+      var save = el('button', 'btn', 'Save');
+      save.type = 'button';
+      t.addEventListener('input', function () { row.dirty = true; });
+      t.addEventListener('keydown', function (e) { if (e.key === 'Enter') { e.preventDefault(); sendSetting(row, t.value, false); } });
+      save.addEventListener('click', function () { sendSetting(row, t.value, false); });
+      c.appendChild(t); c.appendChild(save);
+      row.inp = t;
+    }
+    return row;
+  }
+  function fillRow(row, force) {
+    var r = row.data;
+    if (!force && (row.busy || row.dirty || (row.inp && document.activeElement === row.inp))) return;
+    if (row.val) row.val.textContent = r.shown;
+    if (row.sw) { row.sw.setAttribute('aria-checked', r.value === 'on' ? 'true' : 'false'); row.sw.textContent = r.value === 'on' ? 'On' : 'Off'; }
+    if (row.segs) Object.keys(row.segs).forEach(function (o) { row.segs[o].setAttribute('aria-pressed', o === r.value ? 'true' : 'false'); });
+    if (row.inp) row.inp.value = r.kind === 'num' ? numText(r, r.value) : r.value;
+  }
+  function renderSettings(rows) {
+    rows = rows || [];
+    var sig = JSON.stringify(rows.map(function (r) { return [r.key, r.kind, r.locked, r.options]; }));
+    var box = document.getElementById('set-rows');
+    if (sig !== setSig) {
+      setSig = sig;
+      setRows = {};
+      clear(box);
+      rows.forEach(function (r) { var row = buildRow(r); setRows[r.key] = row; box.appendChild(row.el); });
+    }
+    rows.forEach(function (r) {
+      var row = setRows[r.key];
+      if (!row) return;
+      row.data = r;
+      fillRow(row, false);
+    });
+  }
+
+  function renderV2(s) {
+    renderActivity(s.header && s.header.activity);
+    renderAlerts(s.alerts);
+    renderPtt(s.ptt);
+    if (s.checklist) renderChecklist(s.checklist);
+    renderSettings(s.settings);
+  }
+  // ------------------------------------------------------------ end EFB v2
+
   buildTabs();
   pick(tab);
   startEvents();

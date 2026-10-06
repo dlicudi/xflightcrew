@@ -305,6 +305,83 @@ pub(crate) fn note_preflight(generation: u64, verdict: &Result<String, String>) 
     );
 }
 
+/// A crew alert as the voice mirrored it to the panel (`Voice::alert`,
+/// `narrate`, `say_crew`): the level the panel colours it by.
+#[derive(Clone, Debug, PartialEq, serde::Serialize)]
+pub(crate) struct Alert {
+    /// Rises by one per alert in this process: the page keys its local
+    /// acknowledgement on it.
+    pub(crate) id: u64,
+    pub(crate) t: f64,
+    /// "warning", "caution" or "advisory".
+    pub(crate) level: &'static str,
+    pub(crate) text: String,
+    /// The flight it was said in (`flight_state::flight_gen`).
+    #[serde(skip)]
+    pub(crate) flight: u64,
+}
+
+/// Alerts kept: plenty for one flight's warnings and cautions.
+const ALERTS_MAX: usize = 40;
+
+/// The crew's alerts, oldest first, each stamped with its flight; read
+/// through [`alerts`], which keeps this flight's only.
+static ALERTS: Mutex<VecDeque<Alert>> = Mutex::new(VecDeque::new());
+static ALERT_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// An alert the voice mirrored (its priority as the panel's level word).
+pub(crate) fn note_alert(level: &'static str, text: &str) {
+    let text = crate::phrase::scrub_dashes(text.trim());
+    if text.is_empty() {
+        return;
+    }
+    let id = ALERT_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    let mut a = ALERTS.lock().unwrap_or_else(|e| e.into_inner());
+    a.push_back(Alert {
+        id,
+        t: now_unix(),
+        level,
+        text,
+        flight: crate::flight_state::flight_gen(),
+    });
+    while a.len() > ALERTS_MAX {
+        a.pop_front();
+    }
+}
+
+/// This flight's alerts, oldest first: a new flight never shows the last
+/// one's warning.
+pub(crate) fn alerts() -> Vec<Alert> {
+    let now = crate::flight_state::flight_gen();
+    ALERTS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .filter(|a| a.flight == now)
+        .cloned()
+        .collect()
+}
+
+/// The panel's activity code as the reporter last set it (0 idle, 1
+/// listening, 2 thinking, 3 speaking; `u8::MAX` before the first).
+static ACTIVITY: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(u8::MAX);
+
+pub(crate) fn note_activity(code: u8) {
+    ACTIVITY.store(code, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// "idle", "listening", "thinking" or "speaking"; `None` before the
+/// command loop said anything.
+pub(crate) fn activity() -> Option<&'static str> {
+    match ACTIVITY.load(std::sync::atomic::Ordering::Relaxed) {
+        0 => Some("idle"),
+        1 => Some("listening"),
+        2 => Some("thinking"),
+        3 => Some("speaking"),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 pub(crate) static TEST_LOCK: Mutex<()> = Mutex::new(());
 
@@ -327,6 +404,30 @@ mod tests {
         let last_two = &mine[mine.len() - 2..];
         assert!(last_two[0].radio, "the transmission");
         assert!(!last_two[1].radio, "the same words again are the intercom");
+    }
+
+    /// Alerts are numbered, bounded and this flight's only.
+    #[test]
+    fn alerts_are_kept_for_their_flight() {
+        let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        for i in 0..(ALERTS_MAX + 5) {
+            note_alert("caution", &format!("caution {i}"));
+        }
+        note_alert("warning", "Pull up \u{2014} terrain");
+        note_alert("warning", "   ");
+        let a = alerts();
+        assert!(a.len() <= ALERTS_MAX);
+        let last = a.last().unwrap();
+        assert_eq!(last.text, "Pull up, terrain", "no dash reaches the page");
+        assert_eq!(last.level, "warning");
+        assert!(a.windows(2).all(|w| w[0].id < w[1].id));
+        let other = ALERTS.lock().unwrap().back().unwrap().flight + 1;
+        ALERTS.lock().unwrap().back_mut().unwrap().flight = other;
+        assert_ne!(
+            alerts().last().map(|x| x.text.clone()),
+            Some("Pull up, terrain".into()),
+            "another flight's warning is not this one's"
+        );
     }
 
     #[test]

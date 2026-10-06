@@ -604,7 +604,8 @@ no-crew gate is the arbiter's enqueue door (`Voice::alert`); the atc crate never
   way to it (`Voice::say_until`). Native panel-graphics API (SDK 4.4.0; `plugin/src/imgui_xp.cpp`).
 - **The terminal is setup and diagnosis** (`src/ui.rs`, renders under `TestBackend`).
 - **Settings are a registry** (`src/settings.rs`, `settings::live()`): env > pref > default; an
-  env-pinned knob is REFUSED on screen, naming the variable.
+  env-pinned knob is REFUSED on screen, naming the variable. A panel toggle is a pick only when it
+  differs from our LAST PUBLISH (`pollers::panel_sync`); else a terminal or EFB change is published.
 - **Only settings persist** (`prefs.json`, env, geometry). Never a state dump: persisted facts
   outlive their context.
 
@@ -619,6 +620,11 @@ no-crew gate is the arbiter's enqueue door (`Voice::alert`); the atc crate never
   controller line, the METAR file); `efb::feed` taps the speakers, the command loop and the monitor's
   tick as they already run. A fact nobody holds is a dash. The plan check and preflight are kept in
   flight-scoped cells (`feed::AUDIT`, `PREFLIGHT`).
+- **v2 pages**: Settings is the registry through `settings::set` (pinned and the EFB's own link
+  read-only, mode and EFB-off confirmed, server-checked); alerts are tapped where the voice mirrors
+  to the panel (`feed::note_alert`, flight-scoped; a warning banner acknowledged on the page only);
+  Checklist reads `flow::sheet`, a record nothing reads back. **The EFB's PTT is a heartbeat**
+  (`efb::ptt`): held only while beats are fresh (600 ms), capped at 60 s, OR'd into the intercom key.
 - **The Airport page** (`efb::airport`): apt.dat through the nav crate's parsers, built once per
   field in a LOCAL metric frame (`Frame`, east/north metres) and served as `GET /airport` with its
   version as the ETag; the live overlay (tick position, `party_line` taxi route, the guide's

@@ -526,6 +526,8 @@ async fn main() -> Result<()> {
     } else {
         None
     };
+    // The EFB's hold-to-talk button opens a push-to-talk capture only.
+    efb::ptt::set_available(ptt.is_some());
     // Continuous only when not using PTT. "Explicit" = the user clearly addressed
     // the copilot (any push-to-talk); a non-command is then ignored silently rather
     // than answered with an apology.
@@ -843,14 +845,17 @@ impl Ptt {
     /// this is the PILOT/COPLT intercom loop — separate from radio receive, so
     /// keying it cuts only the copilot's own voice, never ATC. The keyboard
     /// PTT is the intercom key (there's no separate radio key).
+    /// The EFB's hold-to-talk button is this key too (`efb::ptt`): it opens
+    /// the mic exactly as the plugin's does, and lapses on its own.
     fn intercom_pressed(&self) -> bool {
-        match self {
-            Ptt::Key(key) => {
-                use device_query::DeviceQuery;
-                device_query::DeviceState::new().get_keys().contains(key)
+        efb::ptt::held()
+            || match self {
+                Ptt::Key(key) => {
+                    use device_query::DeviceQuery;
+                    device_query::DeviceState::new().get_keys().contains(key)
+                }
+                Ptt::Dataref { live, name, .. } => Ptt::dataref_active(live, name),
             }
-            Ptt::Dataref { live, name, .. } => Ptt::dataref_active(live, name),
-        }
     }
 
     /// The RADIO (transmit) PTT: keying the mic to talk to ATC. Half-duplex —
@@ -3937,8 +3942,11 @@ fn listen_once(
             use device_query::DeviceQuery;
             let dev = device_query::DeviceState::new();
             let key = *key;
-            mic.capture(|| dev.get_keys().contains(&key), idle_timeout)
-                .ok()?
+            mic.capture(
+                || efb::ptt::held() || dev.get_keys().contains(&key),
+                idle_timeout,
+            )
+            .ok()?
         }
         // Sim-dataref push-to-talk (the X-Plane plugin's bound buttons), warm
         // mic. Either button captures; the radio one tags the utterance as a
@@ -3949,7 +3957,7 @@ fn listen_once(
             let audio = mic
                 .capture(
                     || {
-                        let intercom = Ptt::dataref_active(live, name);
+                        let intercom = Ptt::dataref_active(live, name) || efb::ptt::held();
                         let tx = !radio.is_empty() && Ptt::dataref_active(live, radio);
                         if tx {
                             radio_seen.store(true, std::sync::atomic::Ordering::Relaxed);

@@ -964,6 +964,111 @@ pub fn status() -> Option<String> {
     ACTIVE.load(SeqCst).then(|| DETAIL.line("checklist"))
 }
 
+// ---- the sheet: what a reader sees of the list (the EFB) ----------------------
+
+/// Where one item of the list stands, as the runner decided it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ItemState {
+    Pending,
+    /// The item being worked now (said, acted on, or waited for).
+    Now,
+    /// In state, confirmed, done or done for the pilot.
+    Done,
+    /// A running loop owns it (`held_by_automation`, or the mission).
+    Held,
+    /// Not as listed (the monitor's), or not done in time (the instructor's).
+    Discrepancy,
+    Skipped,
+    /// Acted on and it did not take.
+    Failed,
+    /// Its dataref did not read: no measurement, no verdict.
+    Unread,
+    /// Words only (a narration or a call-out), said or passed over.
+    Said,
+}
+
+impl ItemState {
+    pub fn word(self) -> &'static str {
+        match self {
+            ItemState::Pending => "pending",
+            ItemState::Now => "now",
+            ItemState::Done => "done",
+            ItemState::Held => "held",
+            ItemState::Discrepancy => "discrepancy",
+            ItemState::Skipped => "skipped",
+            ItemState::Failed => "failed",
+            ItemState::Unread => "unread",
+            ItemState::Said => "said",
+        }
+    }
+}
+
+/// One line of the sheet.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SheetItem {
+    pub line: String,
+    pub state: ItemState,
+    /// Who holds it, for [`ItemState::Held`].
+    pub by: Option<String>,
+}
+
+/// The current or last list of this flight, item by item. A record of what
+/// the runner decided, kept for readers: nothing reads it back to decide.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Sheet {
+    pub title: String,
+    pub flavour: Flavour,
+    pub items: Vec<SheetItem>,
+    pub running: bool,
+    /// The closing line, once said.
+    pub summary: Option<String>,
+}
+
+/// The sheet of this flight's current or last list.
+static SHEET: crate::scoped::Scoped<Sheet> = crate::scoped::Scoped::flight();
+
+/// Change the sheet in the flight it began in (a late write from the last
+/// flight's runner is dropped).
+fn sheet_update(generation: u64, f: impl FnOnce(&mut Sheet)) {
+    if let Some(mut s) = SHEET.get() {
+        f(&mut s);
+        SHEET.set_in(generation, s);
+    }
+}
+
+fn sheet_item(generation: u64, i: usize, state: ItemState, by: Option<&str>) {
+    sheet_update(generation, |s| {
+        if let Some(it) = s.items.get_mut(i) {
+            it.state = state;
+            it.by = by.map(str::to_string);
+        }
+    });
+}
+
+/// This flight's current or last list, item by item.
+pub fn sheet() -> Option<Sheet> {
+    SHEET.get()
+}
+
+/// The standing proposal's list title ("Climb"), if one is answerable.
+pub fn proposal_title() -> Option<String> {
+    let idx = proposal()?;
+    lists().get(idx).map(|c| c.title.clone())
+}
+
+/// What the running list waits on from the pilot: "confirm" (yes/no at a
+/// hazard step) or "advance" (the instructor's next/skip), else `None`.
+pub fn waiting_for() -> Option<&'static str> {
+    if !ACTIVE.load(SeqCst) {
+        return None;
+    }
+    match *lock(&WAITING) {
+        Some(Waiting::Confirm) => Some("confirm"),
+        Some(Waiting::Advance) => Some("advance"),
+        None => None,
+    }
+}
+
 /// Start a flow on the installed list `idx`. `false` if one is already
 /// running, the index is stale, or there is no crew aboard (ATC-only).
 pub fn start(idx: usize, flavour: Flavour, config: Config, voice: Voice) -> bool {
@@ -1289,6 +1394,26 @@ async fn run(cl: &Checklist, flavour: Flavour, xp: &XPlaneClient, config: &Confi
         reminders: None,
     };
     let n = cl.items.len();
+    // The sheet readers see (the EFB): this flight's, item by item.
+    let sheet_gen = SHEET.now();
+    SHEET.set_in(
+        sheet_gen,
+        Sheet {
+            title: cl.title.clone(),
+            flavour,
+            items: cl
+                .items
+                .iter()
+                .map(|it| SheetItem {
+                    line: item_line(it).to_string(),
+                    state: ItemState::Pending,
+                    by: None,
+                })
+                .collect(),
+            running: true,
+            summary: None,
+        },
+    );
     let mut failed = 0usize;
     let mut discrepancies = 0usize;
     // The monitor's discrepancies, named in its one summary line.
@@ -1316,6 +1441,7 @@ async fn run(cl: &Checklist, flavour: Flavour, xp: &XPlaneClient, config: &Confi
             break;
         }
         DETAIL.set(format!("{title_lc}, {} of {n}", i + 1));
+        sheet_item(sheet_gen, i, ItemState::Now, None);
         let cond = item_cond(item);
         let value = match cond {
             Some((d, idx, _)) => checklist::read_dataref(xp, d, idx).await,
@@ -1332,10 +1458,25 @@ async fn run(cl: &Checklist, flavour: Flavour, xp: &XPlaneClient, config: &Confi
                     None
                 }
             });
+        let satisfied = match (cond, value) {
+            (Some((_, _, c)), Some(v)) => Some(c.eval(v)),
+            (Some(_), None) => None,
+            (None, _) => Some(false),
+        };
+        let mark = |state: ItemState| sheet_item(sheet_gen, i, state, None);
+        let read_state = || match satisfied {
+            Some(true) => ItemState::Done,
+            None => ItemState::Unread,
+            Some(false) => ItemState::Said,
+        };
         match plan(flavour, item, value, held) {
-            Step::Skip => {}
-            Step::Say(line) => say(&line),
+            Step::Skip => mark(read_state()),
+            Step::Say(line) => {
+                mark(read_state());
+                say(&line)
+            }
             Step::Held(line) => {
+                sheet_item(sheet_gen, i, ItemState::Held, held);
                 crate::blackbox::record(
                     "checklist",
                     json!({ "event": "held", "title": cl.title, "item": item_line(item), "by": held }),
@@ -1346,6 +1487,7 @@ async fn run(cl: &Checklist, flavour: Flavour, xp: &XPlaneClient, config: &Confi
                 }
             }
             Step::Discrepancy(line) => {
+                mark(ItemState::Discrepancy);
                 discrepancies += 1;
                 crate::blackbox::record(
                     "checklist",
@@ -1360,9 +1502,15 @@ async fn run(cl: &Checklist, flavour: Flavour, xp: &XPlaneClient, config: &Confi
             Step::Wait(line) => {
                 say(&line);
                 match wait_for(xp, cond, INSTRUCT_WAIT_SECS).await {
-                    Waited::Satisfied => say("Good."),
-                    Waited::Advanced => {}
-                    Waited::Skipped => say("Skipped."),
+                    Waited::Satisfied => {
+                        mark(ItemState::Done);
+                        say("Good.")
+                    }
+                    Waited::Advanced => mark(ItemState::Done),
+                    Waited::Skipped => {
+                        mark(ItemState::Skipped);
+                        say("Skipped.")
+                    }
                     // "Help me with that item": the one time the instructor
                     // touches the aircraft, asked to, through the same tool
                     // the crew flavour would use. A call-out item has no
@@ -1373,17 +1521,30 @@ async fn run(cl: &Checklist, flavour: Flavour, xp: &XPlaneClient, config: &Confi
                             json!({ "event": "did_for_pilot", "title": cl.title, "item": item_line(item) }),
                         );
                         match act(cl, item, &ctx, xp, voice).await {
-                            Some(Acted::Ok) => say("Done."),
-                            Some(Acted::Failed(what)) => say(what),
-                            Some(Acted::Skipped) => say("Skipped."),
+                            Some(Acted::Ok) => {
+                                mark(ItemState::Done);
+                                say("Done.")
+                            }
+                            Some(Acted::Failed(what)) => {
+                                mark(ItemState::Failed);
+                                say(what)
+                            }
+                            Some(Acted::Skipped) => {
+                                mark(ItemState::Skipped);
+                                say("Skipped.")
+                            }
                             Some(Acted::Aborted) => {
                                 aborted = true;
                                 break;
                             }
-                            None => say("That one's yours, there's no switch I can reach for it."),
+                            None => {
+                                mark(ItemState::Said);
+                                say("That one's yours, there's no switch I can reach for it.")
+                            }
                         }
                     }
                     Waited::TimedOut => {
+                        mark(ItemState::Discrepancy);
                         discrepancies += 1;
                         crate::blackbox::record(
                             "checklist",
@@ -1399,11 +1560,19 @@ async fn run(cl: &Checklist, flavour: Flavour, xp: &XPlaneClient, config: &Confi
             }
             Step::Act => {
                 let line = item_line(item);
-                if let Some(msg) = act(cl, item, &ctx, xp, voice).await {
-                    match msg {
-                        Acted::Ok => say(line),
-                        Acted::Skipped => say(&format!("{line} Skipped, your call.")),
+                match act(cl, item, &ctx, xp, voice).await {
+                    None => mark(ItemState::Said),
+                    Some(msg) => match msg {
+                        Acted::Ok => {
+                            mark(ItemState::Done);
+                            say(line)
+                        }
+                        Acted::Skipped => {
+                            mark(ItemState::Skipped);
+                            say(&format!("{line} Skipped, your call."))
+                        }
                         Acted::Failed(what) => {
+                            mark(ItemState::Failed);
                             failed += 1;
                             say(&format!("{line} {what}"));
                         }
@@ -1421,6 +1590,14 @@ async fn run(cl: &Checklist, flavour: Flavour, xp: &XPlaneClient, config: &Confi
         Some(why) => stood_down_line(&cl.title, why),
         None => summary_line(&cl.title, flavour, aborted, failed, discrepancies, &not_set),
     };
+    sheet_update(sheet_gen, |s| {
+        s.running = false;
+        s.summary = Some(summary.clone());
+        // A list stopped mid-item leaves that item undone.
+        for it in s.items.iter_mut().filter(|it| it.state == ItemState::Now) {
+            it.state = ItemState::Pending;
+        }
+    });
     crate::blackbox::record(
         "checklist",
         json!({
@@ -1570,6 +1747,39 @@ async fn act(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The sheet records each item's verdict for readers, in the flight the
+    /// list began in only: a late write from the last flight's runner is
+    /// dropped.
+    #[test]
+    fn the_sheet_records_items_in_its_own_flight() {
+        let g = SHEET.now();
+        SHEET.set(Sheet {
+            title: "Climb".into(),
+            flavour: Flavour::Crew,
+            items: vec![
+                SheetItem {
+                    line: "Flaps, up.".into(),
+                    state: ItemState::Pending,
+                    by: None,
+                },
+                SheetItem {
+                    line: "Throttle, full.".into(),
+                    state: ItemState::Pending,
+                    by: None,
+                },
+            ],
+            running: true,
+            summary: None,
+        });
+        sheet_item(g, 0, ItemState::Done, None);
+        sheet_item(g, 1, ItemState::Held, Some("the speed hold"));
+        sheet_item(g.wrapping_sub(1), 0, ItemState::Failed, None);
+        let s = sheet().expect("this flight's sheet");
+        assert_eq!(s.items[0].state, ItemState::Done, "the stale write is dropped");
+        assert_eq!(s.items[1].by.as_deref(), Some("the speed hold"));
+        assert_eq!(ItemState::Held.word(), "held");
+    }
 
     fn p172() -> AircraftProfile {
         crate::aircraft::builtin("cessna_172sp").unwrap()

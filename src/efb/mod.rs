@@ -21,6 +21,7 @@
 
 pub(crate) mod airport;
 pub(crate) mod feed;
+pub(crate) mod ptt;
 pub(crate) mod state;
 
 use std::net::SocketAddr;
@@ -51,6 +52,13 @@ pub(crate) const SAY_MIN_GAP: Duration = Duration::from_millis(500);
 
 /// The longest line accepted (the longest command a pilot says is far shorter).
 const SAY_MAX_CHARS: usize = 200;
+
+/// One setting change per this long, at most (a double tap on a toggle).
+pub(crate) const SETTING_MIN_GAP: Duration = Duration::from_millis(300);
+
+/// The push to talk's heartbeat is every 250 ms; faster than this is a
+/// stuck loop on the page, refused without effect (a release never is).
+const PTT_MIN_GAP: Duration = Duration::from_millis(100);
 
 /// The SSE push period: change-gated, so a quiet flight sends little.
 const PUSH_EVERY: Duration = Duration::from_secs(1);
@@ -147,6 +155,8 @@ pub(crate) struct Server {
     voice: Option<Voice>,
     tx: Mutex<std::sync::mpsc::Sender<String>>,
     last_say: Mutex<Option<Instant>>,
+    last_setting: Mutex<Option<Instant>>,
+    last_ptt: Mutex<Option<Instant>>,
     sent: Mutex<Option<(f64, String)>>,
     metar: Mutex<MetarCache>,
 }
@@ -157,6 +167,8 @@ impl Server {
             voice,
             tx: Mutex::new(tx),
             last_say: Mutex::new(None),
+            last_setting: Mutex::new(None),
+            last_ptt: Mutex::new(None),
             sent: Mutex::new(None),
             metar: Mutex::new(MetarCache::default()),
         })
@@ -280,6 +292,45 @@ fn plan_facts() -> Option<state::PlanFacts> {
     })
 }
 
+/// One registry row as the page reads it: its live value, how the terminal
+/// renders it, and the variable that pins it.
+fn setting_facts(s: &crate::settings::Setting) -> state::SettingFacts {
+    use crate::settings::{Kind, Value};
+    let v = s.value();
+    let value = match (&s.kind, &v) {
+        (_, Value::Bool(b)) => if *b { "on" } else { "off" }.to_string(),
+        (Kind::Num { decimals, .. }, Value::Num(n)) => format!("{n:.*}", *decimals),
+        (_, Value::Num(n)) => n.to_string(),
+        (_, Value::Choice(c)) => c.clone(),
+        (_, Value::Text(t)) => t.clone(),
+    };
+    state::SettingFacts {
+        key: s.key,
+        label: s.label,
+        help: s.help,
+        kind: match s.kind {
+            Kind::Bool => state::SettingKind::Bool,
+            Kind::Num {
+                min,
+                max,
+                step,
+                unit,
+                ..
+            } => state::SettingKind::Num {
+                min,
+                max,
+                step,
+                unit,
+            },
+            Kind::Choice(o) => state::SettingKind::Choice(o),
+            Kind::Text { .. } => state::SettingKind::Text,
+        },
+        value,
+        shown: s.kind.render(&v),
+        pinned_env: s.env_pinned().then_some(s.env),
+    }
+}
+
 /// Every fact the page reads, from the app's own accessors. Locks only,
 /// each taken and dropped in turn; no sim read, no await.
 fn gather(server: &Server) -> state::Facts {
@@ -388,6 +439,20 @@ fn gather(server: &Server) -> state::Facts {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone(),
+        settings: crate::settings::ALL.iter().map(setting_facts).collect(),
+        alerts: feed::alerts(),
+        // A background line (a callout, the cabin) speaks without the loop's
+        // own phase: the voice knows it is talking.
+        activity: if server.voice.as_ref().is_some_and(|v| v.is_speaking()) {
+            Some("speaking")
+        } else {
+            feed::activity()
+        },
+        ptt_available: ptt::available(),
+        ptt_held: ptt::showing_held(),
+        checklist: crate::flow::sheet(),
+        proposal: crate::flow::proposal_title(),
+        flow_waiting: crate::flow::waiting_for(),
         airport: airport_facts(),
     }
 }
@@ -454,6 +519,21 @@ struct SayBody {
     text: String,
 }
 
+#[derive(serde::Deserialize)]
+struct SettingBody {
+    key: String,
+    value: String,
+    /// The page asked its question and the pilot said yes.
+    #[serde(default)]
+    confirm: bool,
+}
+
+#[derive(serde::Deserialize)]
+struct PttBody {
+    /// "press", "beat" or "release".
+    action: String,
+}
+
 fn live_token() -> String {
     crate::settings::live().efb_token.clone()
 }
@@ -510,12 +590,11 @@ pub(crate) fn manifest(token: &str) -> serde_json::Value {
         "orientation": "any",
         "background_color": "#0D1117",
         "theme_color": "#11161D",
-        "icons": [{
-            "src": "/icon.svg",
-            "sizes": "any",
-            "type": "image/svg+xml",
-            "purpose": "any"
-        }]
+        "icons": [
+            { "src": "/icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any" },
+            { "src": "/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any" },
+            { "src": "/icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any" }
+        ]
     })
 }
 
@@ -540,6 +619,23 @@ const ICON: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 180 
 
 async fn icon() -> Response {
     ([(header::CONTENT_TYPE, "image/svg+xml")], ICON).into_response()
+}
+
+/// The home-screen PNGs (`tools/efb_icon.py` draws them): iOS fetches the
+/// touch icon without the page's cookie, so like the SVG they need no token.
+const ICON_180: &[u8] = include_bytes!("icons/icon-180.png");
+const ICON_192: &[u8] = include_bytes!("icons/icon-192.png");
+const ICON_512: &[u8] = include_bytes!("icons/icon-512.png");
+
+fn png(bytes: &'static [u8]) -> Response {
+    (
+        [
+            (header::CONTENT_TYPE, "image/png"),
+            (header::CACHE_CONTROL, "public, max-age=86400"),
+        ],
+        bytes,
+    )
+        .into_response()
 }
 
 async fn state_route(
@@ -707,6 +803,129 @@ async fn say(
     Json(serde_json::json!({ "sent": text })).into_response()
 }
 
+/// A setting change from the page, judged as the registry would: `Ok` with
+/// the value as now shown, else the status and the line the page says. The
+/// EFB's own port and token, and a pinned knob, are refused here as on the
+/// page; the mode and turning the EFB off need the page's confirm.
+pub(crate) fn setting_change(
+    key: &str,
+    raw: &str,
+    confirmed: bool,
+) -> Result<String, (StatusCode, String)> {
+    let s = crate::settings::ALL
+        .iter()
+        .find(|s| s.key == key)
+        .ok_or((StatusCode::NOT_FOUND, format!("no such setting: {key}")))?;
+    if let Some(why) = state::setting_locked(key, s.env_pinned().then_some(s.env)) {
+        return Err((StatusCode::FORBIDDEN, why));
+    }
+    let v = s.kind.parse(raw).ok_or((
+        StatusCode::BAD_REQUEST,
+        format!("{} cannot be {}", s.label, raw.trim()),
+    ))?;
+    if state::needs_confirm(key, &s.kind.render(&v)) && !confirmed {
+        return Err((StatusCode::CONFLICT, "confirm first".into()));
+    }
+    crate::settings::set(key, &v).map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+    Ok(s.rendered())
+}
+
+async fn setting(
+    State(server): State<Arc<Server>>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    Query(q): Query<TokenQuery>,
+    headers: HeaderMap,
+    body: Option<Json<SettingBody>>,
+) -> Response {
+    if !authorised(&live_token(), &headers, q.t.as_deref()) {
+        return refuse(peer, "/setting");
+    }
+    let Some(Json(body)) = body else {
+        return (StatusCode::BAD_REQUEST, "expected {\"key\": ..., \"value\": ...}").into_response();
+    };
+    {
+        let mut last = server
+            .last_setting
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if last.is_some_and(|t| t.elapsed() < SETTING_MIN_GAP) {
+            return (StatusCode::TOO_MANY_REQUESTS, "one change at a time").into_response();
+        }
+        *last = Some(Instant::now());
+    }
+    let (key, value) = (body.key.clone(), body.value.clone());
+    // The registry's setter persists to prefs.json: a file write, off the
+    // runtime's thread.
+    let out = tokio::task::spawn_blocking(move || setting_change(&key, &value, body.confirm))
+        .await
+        .unwrap_or_else(|_| Err((StatusCode::INTERNAL_SERVER_ERROR, "setter failed".into())));
+    // The token is never written to the log, whatever was sent.
+    let logged = if body.key == "efb_token" {
+        String::new()
+    } else {
+        body.value.clone()
+    };
+    match out {
+        Ok(shown) => {
+            tracing::info!(key = %body.key, value = %shown, "EFB setting");
+            crate::blackbox::record(
+                "efb",
+                serde_json::json!({ "event": "setting", "key": body.key, "value": logged }),
+            );
+            Json(serde_json::json!({ "key": body.key, "shown": shown })).into_response()
+        }
+        Err((code, why)) => {
+            crate::blackbox::record(
+                "efb",
+                serde_json::json!({ "event": "setting_refused", "key": body.key, "value": logged, "why": why }),
+            );
+            (code, why).into_response()
+        }
+    }
+}
+
+async fn ptt_route(
+    State(server): State<Arc<Server>>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    Query(q): Query<TokenQuery>,
+    headers: HeaderMap,
+    body: Option<Json<PttBody>>,
+) -> Response {
+    if !authorised(&live_token(), &headers, q.t.as_deref()) {
+        return refuse(peer, "/ptt");
+    }
+    let Some(Json(body)) = body else {
+        return (StatusCode::BAD_REQUEST, "expected {\"action\": ...}").into_response();
+    };
+    let action = body.action.as_str();
+    if action != "release" {
+        let mut last = server.last_ptt.lock().unwrap_or_else(|e| e.into_inner());
+        if last.is_some_and(|t| t.elapsed() < PTT_MIN_GAP) {
+            return (StatusCode::TOO_MANY_REQUESTS, "too fast").into_response();
+        }
+        *last = Some(Instant::now());
+    }
+    let held = match action {
+        "press" => {
+            if !ptt::press() {
+                return (
+                    StatusCode::CONFLICT,
+                    "xvl is not listening on push to talk in this run",
+                )
+                    .into_response();
+            }
+            true
+        }
+        "beat" => ptt::beat(),
+        "release" => {
+            ptt::release();
+            false
+        }
+        _ => return (StatusCode::BAD_REQUEST, "press, beat or release").into_response(),
+    };
+    Json(serde_json::json!({ "held": held })).into_response()
+}
+
 /// The routes, on a server.
 pub(crate) fn router(server: Arc<Server>) -> Router {
     Router::new()
@@ -714,10 +933,16 @@ pub(crate) fn router(server: Arc<Server>) -> Router {
         .route("/state", get(state_route))
         .route("/events", get(events))
         .route("/say", post(say))
+        .route("/setting", post(setting))
+        .route("/ptt", post(ptt_route))
         .route("/airport", get(airport_route))
         .route("/diagram.js", get(diagram_js))
         .route("/manifest.webmanifest", get(manifest_route))
         .route("/icon.svg", get(icon))
+        .route("/apple-touch-icon.png", get(|| async { png(ICON_180) }))
+        .route("/icon-180.png", get(|| async { png(ICON_180) }))
+        .route("/icon-192.png", get(|| async { png(ICON_192) }))
+        .route("/icon-512.png", get(|| async { png(ICON_512) }))
         .with_state(server)
 }
 
@@ -895,6 +1120,48 @@ mod tests {
         let m = manifest("abcdef0123456789");
         assert_eq!(m["display"], "standalone");
         assert_eq!(m["start_url"], "/?t=abcdef0123456789");
+        let sizes: Vec<&str> = m["icons"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|i| i["sizes"].as_str().unwrap())
+            .collect();
+        assert_eq!(sizes, ["192x192", "512x512", "any"]);
+    }
+
+    /// The checked-in icons are the PNGs their names say (`tools/efb_icon.py`).
+    #[test]
+    fn the_icons_are_pngs_of_their_size() {
+        for (bytes, size) in [(ICON_180, 180u32), (ICON_192, 192), (ICON_512, 512)] {
+            assert_eq!(&bytes[..8], b"\x89PNG\r\n\x1a\n");
+            assert_eq!(&bytes[12..16], b"IHDR");
+            let w = u32::from_be_bytes(bytes[16..20].try_into().unwrap());
+            let h = u32::from_be_bytes(bytes[20..24].try_into().unwrap());
+            assert_eq!((w, h), (size, size));
+        }
+    }
+
+    /// The page cannot change its own link, a pinned knob, or the mode
+    /// without its confirm; nothing here reaches the setter (which persists).
+    #[test]
+    fn a_setting_from_the_page_is_judged_before_the_setter() {
+        let _g = crate::settings::TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let code = |k: &str, v: &str, c: bool| setting_change(k, v, c).map_err(|(s, _)| s);
+        assert_eq!(code("efb_token", "abcdefgh1234", true), Err(StatusCode::FORBIDDEN));
+        assert_eq!(code("efb_port", "9000", true), Err(StatusCode::FORBIDDEN));
+        assert_eq!(code("nonsense", "1", true), Err(StatusCode::NOT_FOUND));
+        if std::env::var("XCOPILOT_MODE").is_err() {
+            assert_eq!(code("mode", "instructor", false), Err(StatusCode::CONFLICT));
+            assert_eq!(code("mode", "sideways", true), Err(StatusCode::BAD_REQUEST));
+        }
+        if std::env::var("XCOPILOT_EFB").is_err() {
+            assert_eq!(code("efb", "false", false), Err(StatusCode::CONFLICT), "off needs the confirm");
+        }
+        if std::env::var("XCOPILOT_VOICE_VOL").is_err() {
+            assert_eq!(code("voice_volume", "9", true), Err(StatusCode::BAD_REQUEST));
+        }
     }
 
     /// The page ships in the binary and has no dash a font chokes on.
@@ -974,6 +1241,48 @@ mod tests {
             );
             tokio::time::sleep(SAY_MIN_GAP).await;
             assert_eq!(say("   ").await.unwrap().status(), 400);
+            // The icons load with no token (iOS fetches them cookie-less).
+            let r = http
+                .get(format!("{base}/apple-touch-icon.png"))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(r.status(), 200);
+            assert_eq!(r.headers()["content-type"], "image/png");
+            // A setting the page may not change, refused with the token.
+            let r = http
+                .post(format!("{base}/setting?t=testtoken0123456"))
+                .json(&serde_json::json!({ "key": "efb_token", "value": "zzzzzzzz" }))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(r.status(), 403);
+            let r = http
+                .post(format!("{base}/setting"))
+                .json(&serde_json::json!({ "key": "mode", "value": "both" }))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(r.status(), 403, "no token, no setting");
+            // Push to talk: refused while this run does not capture on it,
+            // a release always taken.
+            let ptt_post = |action: &str| {
+                http.post(format!("{base}/ptt?t=testtoken0123456"))
+                    .json(&serde_json::json!({ "action": action }))
+                    .send()
+            };
+            let _p = ptt::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            ptt::set_available(false);
+            assert_eq!(ptt_post("press").await.unwrap().status(), 409);
+            assert_eq!(ptt_post("release").await.unwrap().status(), 200);
+            ptt::set_available(true);
+            tokio::time::sleep(PTT_MIN_GAP).await;
+            let r = ptt_post("press").await.unwrap();
+            assert_eq!(r.status(), 200);
+            assert!(ptt::held());
+            assert_eq!(ptt_post("release").await.unwrap().status(), 200);
+            assert!(!ptt::held());
+            ptt::set_available(false);
         });
         assert_eq!(rx.try_recv().as_deref(), Ok("my controls"));
         assert!(rx.try_recv().is_err(), "the limited line never queued");
