@@ -1,0 +1,772 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="XVL EFB">
+<meta name="theme-color" content="#11161D">
+<meta name="color-scheme" content="dark">
+<title>XVL EFB</title>
+<link rel="icon" href="/icon.svg" type="image/svg+xml">
+<link rel="apple-touch-icon" href="/icon.svg">
+<link id="manifest" rel="manifest" href="/manifest.webmanifest" crossorigin="use-credentials">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<!-- Non-blocking: a cockpit LAN without internet still renders at once, in the system font. -->
+<link href="https://fonts.googleapis.com/css2?family=B612:wght@400;700&family=B612+Mono:wght@400;700&display=swap" rel="stylesheet" media="print" onload="this.media='all'">
+<style>
+:root {
+  --bg: #07090C;
+  --panel: #0D1117;
+  --bar: #11161D;
+  --rail: #0A0E13;
+  --card: #121A24;
+  --card2: #10161E;
+  --line: #222B36;
+  --line2: #2A3A4C;
+  --text: #E6EDF3;
+  --soft: #B7C2CF;
+  --body: #D3DCE6;
+  --muted: #8B98A8;
+  --faint: #6B7888;
+  --cyan: #7FD3F7;
+  --cyan-bg: #10283A;
+  --cyan-line: #2E6E8E;
+  --green: #7EE2A4;
+  --green-bg: #102418;
+  --green-line: #23573A;
+  --amber: #FFC266;
+  --amber-bg: #2A1A08;
+  --amber-line: #7A4A12;
+  --warn: #FFD58A;
+  --warn-bg: #2A1E08;
+  --warn-line: #7A5A12;
+  --red: #FF8A80;
+  --red-bg: #2A0E0C;
+  --red-line: #7A2620;
+  --violet: #B9A6FF;
+  --mono: 'B612 Mono', ui-monospace, Menlo, monospace;
+  --sans: 'B612', system-ui, -apple-system, sans-serif;
+  --tabbar-h: 0px;
+  --kb: 0px;
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; height: 100%; background: var(--bg); }
+body {
+  color: var(--text); font-family: var(--sans); font-size: 15px;
+  -webkit-text-size-adjust: 100%; overscroll-behavior: none;
+}
+button { font-family: inherit; }
+.app { display: flex; flex-direction: column; height: 100vh; height: 100dvh; background: var(--panel); }
+
+/* Header */
+header.top {
+  display: flex; align-items: center; gap: 14px; flex-wrap: wrap;
+  padding: 12px 20px; padding-top: max(12px, env(safe-area-inset-top));
+  padding-left: max(20px, env(safe-area-inset-left)); padding-right: max(20px, env(safe-area-inset-right));
+  background: var(--bar); border-bottom: 1px solid var(--line);
+}
+.ident { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.ident .cs { font-size: 18px; font-weight: 700; letter-spacing: 0.04em; white-space: nowrap; }
+.ident .cs .type { color: var(--muted); font-weight: 400; }
+.ident .route { font-size: 14px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.spacer { flex: 1 1 auto; }
+.chips { display: flex; gap: 8px; flex-wrap: wrap; }
+.chip {
+  padding: 6px 12px; border-radius: 8px; background: #16202B; border: 1px solid var(--line2);
+  font-size: 14px; white-space: nowrap; min-height: 32px; display: flex; align-items: center; gap: 6px;
+}
+.chip .k { color: var(--muted); }
+.chip.crew { background: var(--green-bg); border-color: var(--green-line); color: var(--green); }
+.chip.mono { font-family: var(--mono); }
+.conn { width: 10px; height: 10px; border-radius: 5px; background: var(--faint); flex: 0 0 auto; }
+.conn.live { background: var(--green); }
+.conn.lost { background: var(--red); }
+.mc {
+  min-height: 48px; padding: 0 18px; border-radius: 10px; border: 1px solid var(--amber-line);
+  background: var(--amber-bg); color: var(--amber); font-size: 15px; font-weight: 700; cursor: pointer;
+  letter-spacing: 0.04em; white-space: nowrap;
+}
+.mc:active { background: #3A2410; }
+.phone-mc { display: none; }
+
+/* Body: rail + main */
+.body { display: flex; flex: 1 1 auto; min-height: 0; }
+nav.tabs {
+  width: 160px; flex-shrink: 0; background: var(--rail); border-right: 1px solid #1C2530;
+  display: flex; flex-direction: column; padding: 12px 10px; gap: 6px;
+  padding-left: max(10px, env(safe-area-inset-left));
+}
+nav.tabs .tab {
+  min-height: 48px; text-align: left; padding: 0 14px; border-radius: 10px; font-size: 15px; cursor: pointer;
+  border: 1px solid transparent; background: transparent; color: #9AA6B4; display: flex; align-items: center; gap: 10px;
+}
+nav.tabs .tab svg { width: 20px; height: 20px; flex: 0 0 auto; }
+nav.tabs .tab[aria-current="page"] { border-color: var(--cyan-line); background: var(--cyan-bg); color: #E6F6FE; font-weight: 700; }
+nav.tabs .grow { flex: 1 1 auto; }
+main {
+  flex: 1 1 auto; min-width: 0; overflow-y: auto; -webkit-overflow-scrolling: touch;
+  padding: 20px 24px; padding-right: max(24px, env(safe-area-inset-right));
+}
+.page { display: none; flex-direction: column; gap: 16px; }
+.page.on { display: flex; }
+h2 { margin: 0; font-size: 22px; }
+.sub { font-size: 14px; color: var(--muted); }
+.label { font-size: 13px; letter-spacing: 0.12em; color: var(--muted); text-transform: uppercase; }
+.label.cyan { color: var(--cyan); }
+section.card { background: var(--card); border: 1px solid var(--line2); border-radius: 14px; padding: 16px 18px; display: flex; flex-direction: column; gap: 10px; min-width: 0; }
+section.card.quiet { background: var(--card2); border-color: var(--line); }
+section.card.call { border-color: var(--cyan-line); }
+.grid { display: grid; gap: 16px; grid-template-columns: repeat(3, minmax(0, 1fr)); }
+.grid .span2 { grid-column: span 2; }
+.grid2 { display: grid; gap: 16px; grid-template-columns: repeat(2, minmax(0, 1fr)); }
+.gauges { display: grid; gap: 12px; grid-template-columns: repeat(5, minmax(0, 1fr)); }
+.gauge { background: var(--card2); border: 1px solid var(--line); border-radius: 12px; padding: 12px 14px; display: flex; flex-direction: column; gap: 4px; min-width: 0; }
+.gauge .v { font-family: var(--mono); font-size: 24px; font-weight: 700; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.gauge .s { font-size: 14px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.strip { display: flex; gap: 4px; }
+.strip div {
+  flex: 1 1 0; text-align: center; padding: 8px 0; font-size: 12px; letter-spacing: 0.06em; border-radius: 6px;
+  background: var(--card2); color: #4E5A68; min-width: 0; overflow: hidden; white-space: nowrap;
+}
+.strip div.past { background: #15202A; color: #5F7A92; }
+.strip div.now { background: #1A4A66; color: #FFFFFF; font-weight: 700; }
+.big { font-size: 26px; font-weight: 700; line-height: 1.2; }
+.detail { font-size: 15px; color: var(--soft); line-height: 1.45; }
+.buttons { display: flex; gap: 10px; flex-wrap: wrap; }
+.btn {
+  min-height: 44px; padding: 0 16px; border-radius: 10px; border: 1px solid var(--line2);
+  background: #16202B; color: var(--text); font-size: 15px; cursor: pointer; touch-action: manipulation;
+}
+.btn.primary { border-color: var(--cyan-line); background: var(--cyan-bg); color: #CDEBFA; }
+.btn.armed { border-color: var(--amber-line); background: var(--amber-bg); color: var(--amber); }
+.btn:active { filter: brightness(1.25); }
+.talk { display: flex; flex-direction: column; gap: 8px; }
+.talk .row { display: flex; gap: 12px; font-size: 15px; line-height: 1.4; min-width: 0; }
+.talk .t { width: 58px; flex-shrink: 0; font-family: var(--mono); color: var(--faint); font-size: 14px; padding-top: 1px; }
+.talk .w { width: 78px; flex-shrink: 0; font-weight: 700; }
+.talk .x { color: var(--body); min-width: 0; overflow-wrap: anywhere; }
+.w.pilot { color: var(--amber); }
+.w.crew { color: var(--cyan); }
+.w.cabin { color: #F5A6C8; }
+.w.atc, .w.atis { color: var(--violet); }
+.w.traffic { color: var(--muted); }
+.radio-tag { font-size: 12px; color: var(--faint); margin-left: 6px; font-weight: 400; }
+.empty { color: var(--faint); font-size: 15px; }
+.auto-lines { font-family: var(--mono); font-size: 14px; color: var(--soft); display: flex; flex-direction: column; gap: 2px; }
+.figs { display: grid; grid-template-columns: max-content minmax(0, 1fr); gap: 6px 16px; font-size: 15px; }
+.figs .k { color: var(--muted); }
+.figs .v { font-family: var(--mono); overflow-wrap: anywhere; }
+.svc { display: flex; justify-content: space-between; align-items: center; min-height: 44px; padding: 0 12px; border-radius: 8px; border: 1px solid var(--line); background: var(--card2); font-size: 15px; }
+.svc .f { font-family: var(--mono); color: var(--cyan); }
+.svc.tuned { border-color: var(--cyan-line); background: var(--cyan-bg); }
+.callline { font-size: 17px; line-height: 1.5; overflow-wrap: anywhere; }
+.verdicts { display: grid; gap: 12px; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); }
+.verdict { border-radius: 12px; padding: 12px 14px; font-size: 15px; display: flex; flex-direction: column; gap: 6px; border: 1px solid var(--line); background: var(--card2); color: var(--soft); }
+.verdict.pass { background: var(--green-bg); border-color: var(--green-line); color: #BDF0CF; }
+.verdict.caution { background: var(--warn-bg); border-color: var(--warn-line); color: var(--warn); }
+.verdict.stop { background: var(--red-bg); border-color: var(--red-line); color: #FFC7C2; }
+.verdict .h { font-weight: 700; }
+.legs { border: 1px solid var(--line); border-radius: 12px; overflow: hidden; }
+.legs .scroll { position: relative; max-height: 60vh; overflow-y: auto; -webkit-overflow-scrolling: touch; }
+.legs .lr { display: grid; grid-template-columns: 1.4fr 1fr 1fr; padding: 11px 14px; font-size: 15px; border-top: 1px solid #1C2530; font-family: var(--mono); color: var(--body); }
+.legs .lh { display: grid; grid-template-columns: 1.4fr 1fr 1fr; padding: 10px 14px; background: var(--card); font-size: 13px; letter-spacing: 0.1em; color: var(--muted); }
+.legs .lr.active { background: var(--cyan-bg); color: #E6F6FE; }
+.legs .lr .fix { font-weight: 700; }
+.metar-raw { font-family: var(--mono); font-size: 14px; color: #CDEBFA; overflow-wrap: anywhere; }
+.row-head { display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; }
+.icao { font-size: 20px; font-weight: 700; }
+
+/* Composer: the type-a-line box and the last words sent */
+footer.composer {
+  display: flex; flex-direction: column; gap: 6px; padding: 10px 20px;
+  padding-left: max(20px, env(safe-area-inset-left)); padding-right: max(20px, env(safe-area-inset-right));
+  background: var(--bar); border-top: 1px solid var(--line);
+}
+.sent { display: flex; align-items: center; gap: 10px; font-size: 14px; min-height: 22px; min-width: 0; }
+.sent .dot { width: 10px; height: 10px; border-radius: 5px; background: #2E3D4F; flex: 0 0 auto; }
+.sent .dot.on { background: var(--cyan); }
+.sent .lbl { color: var(--muted); white-space: nowrap; }
+.sent .txt { color: var(--text); font-style: italic; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.sent.err .dot { background: var(--red); }
+.sent.err .lbl { color: var(--red); }
+form.say { display: flex; gap: 10px; }
+form.say input {
+  flex: 1 1 auto; min-width: 0; min-height: 44px; border-radius: 10px; border: 1px solid var(--line2);
+  background: var(--card2); color: var(--text); font-family: var(--sans); font-size: 16px; padding: 0 14px;
+}
+form.say input:focus { outline: 2px solid var(--cyan-line); outline-offset: 0; }
+
+/* Bottom tab bar: phones only */
+nav.bottom { display: none; }
+
+/* Medium (iPad portrait, a narrow window): the rail becomes a top bar. */
+@media (max-width: 1000px) {
+  .body { flex-direction: column; }
+  nav.tabs {
+    width: auto; flex-direction: row; border-right: 0; border-bottom: 1px solid #1C2530;
+    padding: 8px 12px; overflow-x: auto;
+  }
+  nav.tabs .tab { justify-content: center; flex: 1 1 0; }
+  nav.tabs .grow { display: none; }
+  nav.tabs .mc { flex: 0 0 auto; }
+  .gauges { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+  .grid { grid-template-columns: minmax(0, 1fr); }
+  .grid .span2 { grid-column: auto; }
+}
+
+/* A phone on its side (short and wide): a slim icon rail, a one-line
+   header, the composer on one line, so the page keeps its height. */
+@media (max-height: 500px) and (min-width: 701px) {
+  .body { flex-direction: row; }
+  header.top { flex-wrap: nowrap; padding-top: max(6px, env(safe-area-inset-top)); padding-bottom: 6px; }
+  .ident .route { display: none; }
+  .chips { flex-wrap: nowrap; min-width: 0; overflow: hidden; }
+  nav.tabs {
+    width: 96px; flex-direction: column; border-right: 1px solid #1C2530; border-bottom: 0;
+    padding: 6px; gap: 4px; overflow-y: auto; overflow-x: hidden;
+  }
+  nav.tabs .tab { flex: 0 0 auto; flex-direction: column; gap: 2px; padding: 4px 0; min-height: 52px; font-size: 14px; }
+  nav.tabs .grow, nav.tabs .mc, .chip.com1 { display: none; }
+  .phone-mc { display: block; flex: 0 0 auto; padding: 0 14px; font-size: 14px; }
+  .label, .legs .lh, .radio-tag, .strip div, .sub, .gauge .s { font-size: 14px; }
+  main { padding: 12px 16px; }
+  .gauges { grid-template-columns: repeat(5, minmax(0, 1fr)); }
+  .gauge .v { font-size: 20px; }
+  footer.composer { padding-top: 6px; padding-bottom: max(6px, env(safe-area-inset-bottom)); }
+  .sent { min-height: 18px; } .sent .lbl { display: none; }
+}
+
+/* Phone: one-line header, bottom tab bar, single columns. */
+@media (max-width: 700px) {
+  header.top { flex-wrap: nowrap; gap: 10px; padding-top: max(8px, env(safe-area-inset-top)); padding-bottom: 8px; padding-left: max(14px, env(safe-area-inset-left)); padding-right: max(14px, env(safe-area-inset-right)); }
+  .ident .route, .chip.com1, .chip.phase-k .k { display: none; }
+  .ident .cs { font-size: 16px; }
+  .ident .cs .type { display: none; }
+  .chips { flex-wrap: nowrap; min-width: 0; overflow: hidden; }
+  .chip { padding: 4px 8px; font-size: 14px; min-height: 30px; }
+  .chip.who { flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; display: block; line-height: 22px; }
+  header .spacer { display: none; }
+  .phone-mc { display: block; flex: 0 0 auto; padding: 0 12px; font-size: 14px; }
+  .ident { flex: 0 0 auto; }
+  .chips { flex: 1 1 auto; justify-content: flex-end; }
+  .chip.phase-k { flex: 0 0 auto; }
+  .chip.phase-k span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .sent .lbl { overflow: hidden; text-overflow: ellipsis; flex: 0 1 auto; min-width: 0; }
+  nav.tabs { display: none; }
+  main { padding: 14px; padding-left: max(14px, env(safe-area-inset-left)); padding-right: max(14px, env(safe-area-inset-right)); }
+  .grid, .grid2 { grid-template-columns: minmax(0, 1fr); }
+  .gauges { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .strip div { padding: 8px 0; letter-spacing: 0.04em; }
+  .label, .legs .lh, .radio-tag, .strip div, .sub, .gauge .s { font-size: 14px; }
+  .big { font-size: 22px; }
+  .talk .t { width: 50px; }
+  .talk .w { width: 62px; }
+  .btn { flex: 1 1 auto; }
+  footer.composer { padding: 8px 14px; padding-left: max(14px, env(safe-area-inset-left)); padding-right: max(14px, env(safe-area-inset-right)); }
+  nav.bottom {
+    display: flex; background: var(--rail); border-top: 1px solid var(--line);
+    padding-bottom: env(safe-area-inset-bottom);
+    padding-left: env(safe-area-inset-left); padding-right: env(safe-area-inset-right);
+  }
+  nav.bottom .tab {
+    flex: 1 1 0; min-height: 56px; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 3px;
+    background: transparent; border: 0; color: #9AA6B4; font-size: 14px; cursor: pointer; padding: 6px 0;
+  }
+  nav.bottom .tab svg { width: 22px; height: 22px; }
+  nav.bottom .tab[aria-current="page"] { color: var(--cyan); font-weight: 700; }
+  /* With the keyboard up the tab bar steps aside so the line stays in view. */
+  body.kb nav.bottom { display: none; }
+}
+</style>
+</head>
+<body>
+<div class="app" id="app">
+  <header class="top">
+    <span class="conn" id="conn" title="connection"></span>
+    <div class="ident">
+      <div class="cs"><span id="h-cs">-</span> <span class="type" id="h-type"></span></div>
+      <div class="route" id="h-route">-</div>
+    </div>
+    <div class="spacer"></div>
+    <div class="chips">
+      <div class="chip phase-k"><span class="k">PHASE</span><span id="h-phase">-</span></div>
+      <div class="chip who" id="h-who">-</div>
+      <div class="chip mono com1"><span class="k">COM1</span><span id="h-com1">-</span></div>
+    </div>
+  </header>
+
+  <div class="body">
+    <nav class="tabs" aria-label="EFB pages" id="rail"></nav>
+    <main id="main">
+      <!-- NOW -->
+      <div class="page" id="p-now">
+        <div class="strip" id="strip"></div>
+        <div class="grid">
+          <section class="card span2" id="next-card">
+            <div class="label cyan">Next</div>
+            <div class="big" id="next-title">-</div>
+            <div class="detail" id="next-detail"></div>
+            <div class="buttons" id="now-buttons"></div>
+          </section>
+          <section class="card">
+            <div class="label">Who flies</div>
+            <div class="big" id="who-big">-</div>
+            <div class="detail" id="auto-head"></div>
+            <div class="auto-lines" id="auto-lines"></div>
+          </section>
+        </div>
+        <div class="gauges" id="gauges"></div>
+        <section class="card quiet">
+          <div class="label">Conversation</div>
+          <div class="talk" id="talk"></div>
+        </section>
+      </div>
+
+      <!-- RADIO -->
+      <div class="page" id="p-radio">
+        <h2>Radio</h2>
+        <div class="grid2">
+          <section class="card">
+            <div class="label">COM1</div>
+            <div class="big mono" id="r-com1" style="font-family: var(--mono)">-</div>
+            <div class="detail" id="r-com1-who">-</div>
+            <div class="talk" id="r-services" style="gap: 8px"></div>
+          </section>
+          <section class="card call">
+            <div class="label cyan">Last call to us</div>
+            <div class="callline" id="r-last">-</div>
+            <div class="sub" id="r-last-sub"></div>
+            <div class="buttons" id="r-buttons"></div>
+          </section>
+        </div>
+        <div class="grid2">
+          <section class="card">
+            <div class="label">Clearance, read back</div>
+            <div class="callline" id="r-clr">-</div>
+            <div class="sub" id="r-tower"></div>
+          </section>
+          <section class="card" id="r-owed-card">
+            <div class="label">Readback owed</div>
+            <div class="callline" id="r-owed">-</div>
+          </section>
+        </div>
+        <section class="card quiet">
+          <div class="label">Frequency</div>
+          <div class="talk" id="r-log"></div>
+        </section>
+      </div>
+
+      <!-- PLAN -->
+      <div class="page" id="p-plan">
+        <div class="row-head">
+          <h2>Flight plan</h2>
+          <div class="sub" id="pl-src">-</div>
+        </div>
+        <div class="buttons" id="pl-buttons"></div>
+        <div class="verdicts" id="pl-verdicts"></div>
+        <div class="grid">
+          <section class="card">
+            <div class="label">Route</div>
+            <div class="figs" id="pl-route"></div>
+          </section>
+          <section class="card">
+            <div class="label">Fuel (plan)</div>
+            <div class="figs" id="pl-fuel"></div>
+          </section>
+          <section class="card">
+            <div class="label">Load sheet</div>
+            <div class="figs" id="pl-load"></div>
+          </section>
+        </div>
+        <div class="legs">
+          <div class="lh"><div>FIX</div><div>ALT</div><div>STAGE</div></div>
+          <div class="scroll" id="pl-legs"></div>
+        </div>
+        <div class="sub" id="pl-string"></div>
+      </div>
+
+      <!-- WEATHER -->
+      <div class="page" id="p-wx">
+        <div class="row-head">
+          <h2>Weather</h2>
+          <div class="sub" id="wx-age"></div>
+        </div>
+        <div id="wx-list" style="display: flex; flex-direction: column; gap: 14px"></div>
+      </div>
+    </main>
+  </div>
+
+  <footer class="composer">
+    <form class="say" id="say-form" autocomplete="off">
+      <button class="mc phone-mc" data-say="mc" type="button">MY CONTROLS</button>
+      <input id="say-input" type="text" inputmode="text" enterkeyhint="send" autocapitalize="off" autocorrect="off" spellcheck="false" placeholder="Type a line, as you would say it" maxlength="200" aria-label="Type a line for the copilot">
+      <button class="btn primary" type="submit">Send</button>
+    </form>
+    <div class="sent" id="sent">
+      <span class="dot" id="sent-dot"></span>
+      <span class="lbl" id="sent-lbl">Every button sends the words a pilot would say. Nothing here moves the aircraft by itself.</span>
+      <span class="txt" id="sent-txt"></span>
+    </div>
+  </footer>
+
+  <nav class="bottom" aria-label="EFB pages" id="bottom"></nav>
+</div>
+
+<script>
+(function () {
+  'use strict';
+  var KEY = 'xvl_efb_t';
+  var TAB_KEY = 'xvl_efb_tab';
+  var token = '';
+  try {
+    var q = new URLSearchParams(location.search).get('t');
+    if (q) { token = q; localStorage.setItem(KEY, q); }
+    else { token = localStorage.getItem(KEY) || ''; }
+  } catch (e) {}
+  var man = document.getElementById('manifest');
+  if (token && man) man.href = '/manifest.webmanifest?t=' + encodeURIComponent(token);
+  function withT(path) { return token ? path + (path.indexOf('?') < 0 ? '?' : '&') + 't=' + encodeURIComponent(token) : path; }
+
+  var ICONS = {
+    now: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 3"/></svg>',
+    radio: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 10a8 8 0 0 1 16 0"/><path d="M7.5 11a4.5 4.5 0 0 1 9 0"/><circle cx="12" cy="12" r="1.5"/><path d="M12 14v7"/></svg>',
+    plan: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="5" cy="18" r="2"/><circle cx="19" cy="6" r="2"/><path d="M6.5 16.5 10 12l4 2 3.5-6.5"/></svg>',
+    wx: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M7 18h10a4 4 0 0 0 0-8 6 6 0 0 0-11.5 1.5A3.5 3.5 0 0 0 7 18z"/></svg>'
+  };
+  var TABS = [['now', 'Now'], ['radio', 'Radio'], ['plan', 'Plan'], ['wx', 'Weather']];
+  var tab = 'now';
+  function known(id) { return TABS.some(function (t) { return t[0] === id; }); }
+  try { var saved = localStorage.getItem(TAB_KEY); if (saved && known(saved)) tab = saved; } catch (e) {}
+  if (known(location.hash.slice(1))) tab = location.hash.slice(1);
+
+  function el(tag, cls, text) {
+    var e = document.createElement(tag);
+    if (cls) e.className = cls;
+    if (text !== undefined && text !== null) e.textContent = text;
+    return e;
+  }
+  function dash(v) { return (v === null || v === undefined || v === '') ? '-' : String(v); }
+  function setText(id, v) { var e = document.getElementById(id); if (e) e.textContent = dash(v); }
+  function clear(e) { while (e.firstChild) e.removeChild(e.firstChild); }
+  function zulu(t) {
+    if (!t) return '-';
+    var d = new Date(t * 1000);
+    var h = d.getUTCHours(), m = d.getUTCMinutes();
+    return (h < 10 ? '0' : '') + h + ':' + (m < 10 ? '0' : '') + m + 'Z';
+  }
+
+  function buildTabs() {
+    var rail = document.getElementById('rail');
+    var bottom = document.getElementById('bottom');
+    clear(rail); clear(bottom);
+    TABS.forEach(function (t) {
+      [rail, bottom].forEach(function (nav) {
+        var b = el('button', 'tab');
+        b.type = 'button';
+        b.setAttribute('data-tab', t[0]);
+        b.setAttribute('aria-current', t[0] === tab ? 'page' : 'false');
+        b.innerHTML = ICONS[t[0]];
+        b.appendChild(el('span', null, t[1]));
+        b.addEventListener('click', function () { pick(t[0]); });
+        nav.appendChild(b);
+      });
+    });
+    rail.appendChild(el('div', 'grow'));
+    var mc = el('button', 'mc', 'MY CONTROLS');
+    mc.type = 'button';
+    mc.setAttribute('data-say', 'mc');
+    rail.appendChild(mc);
+    wireMc(mc);
+  }
+  function pick(id) {
+    tab = id;
+    try { localStorage.setItem(TAB_KEY, id); } catch (e) {}
+    document.querySelectorAll('[data-tab]').forEach(function (b) {
+      b.setAttribute('aria-current', b.getAttribute('data-tab') === id ? 'page' : 'false');
+    });
+    TABS.forEach(function (t) {
+      document.getElementById('p-' + t[0]).classList.toggle('on', t[0] === id);
+    });
+    document.getElementById('main').scrollTop = 0;
+  }
+
+  // Sending: every button and the box post pilot English to /say.
+  var myControls = 'my controls';
+  var sending = false;
+  function showSent(ok, label, text) {
+    var s = document.getElementById('sent');
+    s.classList.toggle('err', !ok);
+    document.getElementById('sent-dot').classList.toggle('on', ok);
+    document.getElementById('sent-lbl').textContent = label;
+    document.getElementById('sent-txt').textContent = text ? '"' + text + '"' : '';
+  }
+  function say(words) {
+    if (!words || sending) return Promise.resolve(false);
+    sending = true;
+    return fetch(withT('/say'), {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-EFB-Token': token },
+      credentials: 'same-origin',
+      body: JSON.stringify({ text: words })
+    }).then(function (r) {
+      if (r.ok) { showSent(true, 'Sent to the copilot, as if spoken:', words); return true; }
+      var why = r.status === 429 ? 'One line at a time, try again:' : r.status === 403 ? 'Refused, the link token is wrong:' : 'Not sent (' + r.status + '):';
+      showSent(false, why, words);
+      return false;
+    }).catch(function () {
+      showSent(false, 'Not sent, xvl unreachable:', words);
+      return false;
+    }).then(function (ok) { setTimeout(function () { sending = false; }, 500); return ok; });
+  }
+  function wireMc(b) {
+    b.addEventListener('click', function () { say(myControls); });
+  }
+  document.querySelectorAll('.phone-mc').forEach(wireMc);
+
+  // A mission arm is two taps: a stray touch never arms it.
+  var CONFIRM = { fly_plan: 1, land: 1, load_aircraft: 1 };
+  function button(b) {
+    var e = el('button', 'btn' + (b.id === 'fly_plan' || b.id === 'say_again' ? ' primary' : ''), b.label);
+    e.type = 'button';
+    var armedAt = 0;
+    e.addEventListener('click', function () {
+      if (CONFIRM[b.id]) {
+        var now = Date.now();
+        if (now - armedAt > 3000) {
+          armedAt = now;
+          e.classList.add('armed');
+          e.textContent = 'Tap again: ' + b.label;
+          setTimeout(function () { e.classList.remove('armed'); e.textContent = b.label; }, 3000);
+          return;
+        }
+        armedAt = 0;
+        e.classList.remove('armed');
+        e.textContent = b.label;
+      }
+      say(b.say);
+    });
+    return e;
+  }
+  // Buttons are rebuilt only when their set changes (a rebuild mid-tap loses the tap).
+  var lastButtons = {};
+  function buttons(id, list) {
+    var key = JSON.stringify(list || []);
+    if (lastButtons[id] === key) return;
+    lastButtons[id] = key;
+    var box = document.getElementById(id);
+    clear(box);
+    (list || []).forEach(function (b) { box.appendChild(button(b)); });
+  }
+
+  function talkRows(box, rows, empty) {
+    clear(box);
+    if (!rows || !rows.length) { box.appendChild(el('div', 'empty', empty)); return; }
+    rows.forEach(function (l) {
+      var r = el('div', 'row');
+      r.appendChild(el('div', 't', zulu(l.t)));
+      var w = el('div', 'w ' + l.kind, l.who);
+      r.appendChild(w);
+      var x = el('div', 'x', l.text);
+      if (l.radio && (l.kind === 'pilot' || l.kind === 'crew')) x.appendChild(el('span', 'radio-tag', 'radio'));
+      r.appendChild(x);
+      box.appendChild(r);
+    });
+  }
+  function figs(box, list) {
+    clear(box);
+    (list || []).forEach(function (f) {
+      box.appendChild(el('div', 'k', f.k));
+      box.appendChild(el('div', 'v', dash(f.v)));
+    });
+    if (!list || !list.length) box.appendChild(el('div', 'empty', '-'));
+  }
+
+  function render(s) {
+    var h = s.header;
+    setText('h-cs', h.callsign);
+    document.getElementById('h-type').textContent = h.aircraft || '';
+    setText('h-route', h.route);
+    var narrowHead = window.matchMedia && window.matchMedia('(max-width: 700px)').matches;
+    setText('h-phase', narrowHead && h.phase ? h.phase.replace(/\s+[0-9,]+ ft$/, '') : h.phase);
+    var who = document.getElementById('h-who');
+    who.textContent = dash(h.who);
+    who.classList.toggle('crew', !!h.crew);
+    setText('h-com1', h.com1);
+    myControls = (s.my_controls && s.my_controls.say) || 'my controls';
+
+    // Now
+    var strip = document.getElementById('strip');
+    clear(strip);
+    // A phone shows the phase with its neighbours, full words at a readable size.
+    var narrow = window.matchMedia && window.matchMedia('(max-width: 700px), (max-height: 500px)').matches;
+    var cells = s.now.strip;
+    if (narrow) {
+      var at = cells.findIndex(function (c) { return c.state === 'now'; });
+      var from = at < 0 ? 0 : Math.max(0, Math.min(at - 1, cells.length - 3));
+      cells = cells.slice(from, from + 3);
+    }
+    cells.forEach(function (c) { strip.appendChild(el('div', c.state, c.label)); });
+    var n = s.now.next;
+    setText('next-title', n ? n.title : (s.header.phase ? 'Nothing planned next' : 'Waiting for the copilot'));
+    document.getElementById('next-detail').textContent = n && n.detail ? n.detail : '';
+    buttons('now-buttons', s.now.buttons);
+    setText('who-big', h.who);
+    document.getElementById('auto-head').textContent = s.now.automation || '';
+    var al = document.getElementById('auto-lines');
+    clear(al);
+    (s.now.automation_lines || []).forEach(function (l) { al.appendChild(el('div', null, l)); });
+    var g = document.getElementById('gauges');
+    clear(g);
+    s.now.gauges.forEach(function (x) {
+      var c = el('div', 'gauge');
+      c.appendChild(el('div', 'label', x.k));
+      c.appendChild(el('div', 'v', dash(x.v)));
+      c.appendChild(el('div', 's', x.sub || ' '));
+      g.appendChild(c);
+    });
+    talkRows(document.getElementById('talk'), s.now.talk, 'Nothing said yet.');
+
+    // Radio
+    var r = s.radio;
+    setText('r-com1', r.com1);
+    setText('r-com1-who', r.com1_who || (r.com1 ? 'Not one of ' + (r.station || 'our stations') : null));
+    var sv = document.getElementById('r-services');
+    clear(sv);
+    if (r.station) sv.appendChild(el('div', 'sub', r.station));
+    r.services.forEach(function (x) {
+      var row = el('div', 'svc' + (x.tuned ? ' tuned' : ''));
+      row.appendChild(el('span', null, x.name));
+      row.appendChild(el('span', 'f', x.freq));
+      sv.appendChild(row);
+    });
+    if (r.last_call) {
+      setText('r-last', r.last_call.text);
+      var ago = Math.round(r.last_call.age_s);
+      var agoText = ago < 90 ? ago + ' s ago' : Math.round(ago / 60) + ' min ago';
+      setText('r-last-sub', r.last_call.who + (r.last_call.freq ? ' on ' + r.last_call.freq : '') + ', ' + agoText);
+    } else { setText('r-last', null); document.getElementById('r-last-sub').textContent = ''; }
+    buttons('r-buttons', r.buttons);
+    setText('r-clr', r.clearance);
+    document.getElementById('r-tower').textContent = r.tower_state ? 'Tower: ' + r.tower_state : '';
+    setText('r-owed', r.readback_owed);
+    talkRows(document.getElementById('r-log'), r.log, 'Nothing on the frequency yet.');
+
+    // Plan
+    var P = s.plan, p = P.plan;
+    buttons('pl-buttons', P.buttons);
+    setText('pl-src', p ? (p.source + ' plan, ' + p.origin + ' to ' + p.destination + (p.shelved_t ? ', on the shelf since ' + zulu(p.shelved_t) : '')) : 'No plan on the shelf');
+    var vd = document.getElementById('pl-verdicts');
+    clear(vd);
+    P.verdicts.forEach(function (v) {
+      var c = el('div', 'verdict ' + v.level);
+      c.appendChild(el('div', 'h', v.title + ' at ' + zulu(v.t) + ': ' + (v.level === 'pass' ? 'passed' : v.level === 'stop' ? 'refused' : 'cautions')));
+      v.lines.forEach(function (l) { c.appendChild(el('div', null, l)); });
+      if (v.unchecked && v.unchecked.length) c.appendChild(el('div', null, 'Not checked: ' + v.unchecked.join(', ')));
+      vd.appendChild(c);
+    });
+    if (!P.verdicts.length) vd.appendChild(el('div', 'verdict', 'No plan check or preflight this flight yet.'));
+    figs(document.getElementById('pl-route'), p ? [{ k: 'Origin', v: p.origin }, { k: 'Destination', v: p.destination }, { k: 'Alternate', v: p.alternate }].concat(p.procedures) : []);
+    figs(document.getElementById('pl-fuel'), p ? p.fuel : []);
+    figs(document.getElementById('pl-load'), p && p.load.length ? p.load : (p ? [{ k: 'Load sheet', v: null }] : []));
+    var legs = document.getElementById('pl-legs');
+    clear(legs);
+    var activeRow = null;
+    (p ? p.legs : []).forEach(function (l) {
+      var row = el('div', 'lr' + (l.active ? ' active' : ''));
+      row.appendChild(el('div', 'fix', l.fix));
+      row.appendChild(el('div', null, dash(l.alt)));
+      row.appendChild(el('div', null, dash(l.stage)));
+      legs.appendChild(row);
+      if (l.active) activeRow = row;
+    });
+    if (!p || !p.legs.length) legs.appendChild(el('div', 'lr', 'No legs'));
+    document.getElementById('pl-string').textContent = p && p.route ? 'Route: ' + p.route : '';
+    // The active leg is brought into view inside the table, never by scrolling the page.
+    if (activeRow && legs.dataset.seen !== activeRow.textContent) {
+      legs.scrollTop = Math.max(0, activeRow.offsetTop - legs.clientHeight / 3);
+      legs.dataset.seen = activeRow.textContent;
+    }
+
+    // Weather
+    var w = s.weather;
+    setText('wx-age', w.file_age_s !== null && w.file_age_s !== undefined ? 'METAR file ' + Math.round(w.file_age_s / 60) + ' min old' : null);
+    var wl = document.getElementById('wx-list');
+    clear(wl);
+    if (!w.metars.length) wl.appendChild(el('div', 'empty', 'No plan, so no fields to show. Ask the copilot: "what\'s the weather at" a field.'));
+    w.metars.forEach(function (m) {
+      var c = el('section', 'card');
+      var head = el('div', 'row-head');
+      head.appendChild(el('div', 'icao', m.icao));
+      head.appendChild(el('div', 'sub', m.role));
+      if (m.runway) head.appendChild(el('div', 'sub', m.runway));
+      c.appendChild(head);
+      c.appendChild(el('div', 'metar-raw', m.raw || 'No METAR for ' + m.icao + ' in the sim\'s weather file.'));
+      if (m.plain) c.appendChild(el('div', 'detail', m.plain));
+      var bx = el('div', 'buttons');
+      bx.appendChild(button(m.button));
+      c.appendChild(bx);
+      wl.appendChild(c);
+    });
+  }
+
+  // Live: Server-Sent Events, falling back to polling /state.
+  var conn = document.getElementById('conn');
+  var es = null, poll = null;
+  function setConn(state) { conn.className = 'conn ' + state; }
+  function startPoll() {
+    if (poll) return;
+    poll = setInterval(function () {
+      fetch(withT('/state'), { headers: { 'X-EFB-Token': token }, credentials: 'same-origin' })
+        .then(function (r) { if (!r.ok) throw r.status; return r.json(); })
+        .then(function (s) { setConn('live'); render(s); })
+        .catch(function () { setConn('lost'); });
+    }, 2000);
+  }
+  function startEvents() {
+    if (!window.EventSource) { startPoll(); return; }
+    es = new EventSource(withT('/events'));
+    es.onmessage = function (e) {
+      setConn('live');
+      if (poll) { clearInterval(poll); poll = null; }
+      try { render(JSON.parse(e.data)); } catch (err) {}
+    };
+    es.onerror = function () { setConn('lost'); startPoll(); };
+  }
+
+  // The typed line.
+  var form = document.getElementById('say-form');
+  var input = document.getElementById('say-input');
+  form.addEventListener('submit', function (e) {
+    e.preventDefault();
+    var v = input.value.trim();
+    if (!v) return;
+    say(v).then(function (ok) { if (ok) input.value = ''; });
+  });
+  // The iOS keyboard: keep the line above it.
+  function fitKeyboard() {
+    var vv = window.visualViewport;
+    if (!vv) return;
+    var covered = Math.max(0, window.innerHeight - vv.height - vv.offsetTop);
+    document.body.classList.toggle('kb', covered > 80);
+    document.getElementById('app').style.height = covered > 80 ? vv.height + 'px' : '';
+    if (covered > 80) window.scrollTo(0, 0);
+  }
+  if (window.visualViewport) {
+    window.visualViewport.addEventListener('resize', fitKeyboard);
+    window.visualViewport.addEventListener('scroll', fitKeyboard);
+  }
+  input.addEventListener('focus', function () { setTimeout(function () { fitKeyboard(); input.scrollIntoView({ block: 'nearest' }); }, 250); });
+  input.addEventListener('blur', function () { setTimeout(fitKeyboard, 100); });
+
+  if (window.matchMedia && window.matchMedia('(max-width: 700px)').matches) input.placeholder = 'Type a line';
+  buildTabs();
+  pick(tab);
+  startEvents();
+})();
+</script>
+</body>
+</html>

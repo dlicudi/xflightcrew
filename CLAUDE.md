@@ -608,6 +608,21 @@ no-crew gate is the arbiter's enqueue door (`Voice::alert`); the atc crate never
 - **Only settings persist** (`prefs.json`, env, geometry). Never a state dump: persisted facts
   outlive their context.
 
+## EFB: a page on the LAN (`src/efb/`, `docs/efb.md`)
+
+- **No new actuation path**: a button or the typed box POSTs pilot English (`/say`) onto the
+  command channel exactly like the panel's typed line (`pollers::queue_command`, blackbox `typed`
+  `taken` `source: efb`); the grammar picks the tool, gates and readback included. Phrases live in
+  `efb::state::PHRASES`, each pinned to its route (`every_button_routes_where_it_says`).
+- **No new sim reads**: the page is ONE pure `state::build` over `Facts` gathered from what the app
+  holds (flight model, owners, the shelf's plan, the follower, the party line, the voice's last
+  controller line, the METAR file); `efb::feed` taps the speakers, the command loop and the monitor's
+  tick as they already run. A fact nobody holds is a dash. The plan check and preflight are kept in
+  flight-scoped cells (`feed::AUDIT`, `PREFLIGHT`).
+- Off by default (`XCOPILOT_EFB`, `_PORT`, `_TOKEN`; the registry's `efb*`); every request needs
+  the token, a wrong one is a 403 blackboxed `efb` `auth_failed`; one line per 500 ms. Its own
+  thread and runtime, never the command loop's; no lock held across an await.
+
 ## Web API load is a sim cost
 
 The API runs in X-Plane's flight loop: every request is frame time. `crates/sim/src/xplane.rs`

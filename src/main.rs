@@ -38,6 +38,7 @@ mod sortie_runner;
 mod test_card;
 mod detect;
 mod dialogue;
+mod efb;
 mod failures;
 mod flight;
 mod duty;
@@ -733,6 +734,8 @@ async fn main() -> Result<()> {
         // The plugin panel's emergency buttons feed the same channel.
         let (cmd_tx, cmd_rx) = std::sync::mpsc::channel::<String>();
         spawn_panel_request_poller(config.xplane_base_url.clone(), cmd_tx.clone());
+        // The EFB's lines ride the same channel (off unless XCOPILOT_EFB).
+        efb::spawn(voice.clone(), cmd_tx.clone(), false);
         let mut reporter = Reporter::tui(tx);
         if let Some(s) = status_sink.clone() {
             reporter = reporter.with_status(s);
@@ -774,6 +777,7 @@ async fn main() -> Result<()> {
         // No typed input in plain mode, but the panel's emergency buttons still
         // need a way in — same channel, same consumer.
         let (cmd_tx, cmd_rx) = std::sync::mpsc::channel::<String>();
+        efb::spawn(voice.clone(), cmd_tx.clone(), true);
         spawn_panel_request_poller(config.xplane_base_url.clone(), cmd_tx);
         run_session(
             config,
@@ -1441,6 +1445,7 @@ async fn run_session(
                         if queued_readback {
                             circuit::note_readback_out(&call);
                         }
+                        efb::feed::crew_transmits(&format!("{call}."));
                         say_or(
                             &voice,
                             &reporter,
@@ -1479,11 +1484,13 @@ async fn run_session(
                                         "held_ms": taken_at.elapsed().as_millis() as u64 }),
                 );
                 reporter.log(ui::LogKind::Heard, format!("⌨  \"{text}\""));
+                efb::feed::note_pilot(&text, false);
                 (text, true)
             }
             Some(Input::Spoken(heard, radio)) => {
                 tracing::info!(transcript = %heard.text, confidence = heard.confidence, radio, "heard utterance");
                 reporter.heard(&heard.text, heard.confidence);
+                efb::feed::note_pilot(&heard.text, radio);
                 spoken_confidence = Some(heard.confidence);
                 from_radio = radio;
                 // Blackbox every spoken capture with its confidence, so the drop /

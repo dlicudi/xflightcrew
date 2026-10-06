@@ -674,6 +674,64 @@ pub const ALL: &[Setting] = &[
             true
         },
     },
+    Setting {
+        key: "efb",
+        env: "XCOPILOT_EFB",
+        label: "EFB",
+        help: "serve the EFB page on the LAN (iPad, iPhone, a second screen); the URL is in the log",
+        kind: Kind::Bool,
+        tier: Tier::Live,
+        persist: Persist::Map,
+        get: || Value::Bool(live().efb),
+        apply: |v| {
+            let Some(b) = v.as_bool() else { return false };
+            update(|c| c.efb = b);
+            true
+        },
+    },
+    Setting {
+        key: "efb_port",
+        env: "XCOPILOT_EFB_PORT",
+        label: "EFB port",
+        help: "the TCP port the EFB listens on",
+        kind: Kind::Num {
+            min: 1024.0,
+            max: 65535.0,
+            step: 1.0,
+            decimals: 0,
+            unit: "",
+        },
+        tier: Tier::Live,
+        persist: Persist::Map,
+        get: || Value::Num(live().efb_port as f64),
+        apply: |v| {
+            let Some(n) = v.as_num().filter(|n| (1024.0..=65535.0).contains(n)) else {
+                return false;
+            };
+            update(|c| c.efb_port = n as u16);
+            true
+        },
+    },
+    Setting {
+        key: "efb_token",
+        env: "XCOPILOT_EFB_TOKEN",
+        label: "EFB token",
+        help: "the EFB link's key (letters and digits, 8 or more); blank = a new one at the next enable",
+        kind: Kind::Text { max_len: 64 },
+        tier: Tier::Live,
+        persist: Persist::Map,
+        get: || Value::Text(live().efb_token.clone()),
+        apply: |v| {
+            let Some(t) = v.as_text() else { return false };
+            let t = t.trim();
+            if !crate::efb::token_ok(t) && !t.is_empty() {
+                return false;
+            }
+            let t = t.to_string();
+            update(|c| c.efb_token = t);
+            true
+        },
+    },
 ];
 
 /// The live airline telephony table, as the atc crate's provider hands it

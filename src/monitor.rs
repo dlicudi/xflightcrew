@@ -3306,6 +3306,20 @@ pub async fn run(
                 }
             }
             crate::flight::publish(flight_status);
+            // The EFB's view of the aircraft: this tick's reads, handed over
+            // as they are (it never asks the sim itself).
+            crate::efb::feed::note_tick(crate::efb::feed::Tick {
+                lat: snap.lat,
+                lon: snap.lon,
+                alt_ft: snap.alt_ft,
+                agl_ft: snap.agl_ft,
+                ias_kts: snap.ias_kts,
+                gs_kts: snap.groundspeed_kts,
+                on_ground: snap.on_ground,
+                track_deg: snap.track_deg,
+                fuel_kg: snap.fuel_kg,
+                endurance_min: snap.endurance_min,
+            });
             for ev in &flight_events {
                 crate::blackbox::record("flight", ev.to_json());
             }
@@ -3699,6 +3713,7 @@ pub async fn run(
             };
             let mut heard = world.runway_watch(&tick, gates).await;
             let com1 = heard.com1;
+            crate::efb::feed::note_com1(com1);
             if !quiet {
                 // Tell the speech arbiter what COM1 hears (controllers AND
                 // the ATIS loop): it cuts a live station transmission the
@@ -4179,6 +4194,7 @@ pub async fn run(
                     callsign_at = Some(Instant::now());
                     if let Some(r) = crate::callsign::live(xp.view()).await {
                         s.callsign(&format!("{}|{}", r.spoken, r.source.as_str()));
+                        crate::efb::feed::note_callsign(&r.spoken);
                     }
                 }
                 if auto != last_auto || auto_resend == 0 {

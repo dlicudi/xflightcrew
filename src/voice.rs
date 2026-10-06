@@ -2191,6 +2191,8 @@ fn intercom_loop(inner: &Arc<Inner>, config: Config, gate: MicGate) {
         // subprocess voices start (no buffer, so a re-say), replaced with the
         // rendered buffer when the ONNX path hands it over. The record holds
         // the caller's latch; whoever finishes the sentence fires it.
+        // The EFB's conversation: what started playing, as it was said.
+        crate::efb::feed::note_intercom(&utt.text, utt.cabin);
         if !utt.cabin {
             // A line that starts is no longer owed; a VOLUNTEERED one (no
             // blocking caller: alerts, reminders, cues) is what "say again"
@@ -2313,6 +2315,9 @@ fn radio_loop(inner: &Arc<Inner>, config: Config, gate: MicGate) {
 
         set_channel_speaking(inner, &gate, true, true);
         interrupt_intercom_for_radio(inner);
+        if let Some(who) = utt.station {
+            crate::efb::feed::note_station(&utt.text, who);
+        }
         if !utt.overheard {
             if let Some(who) = utt.station {
                 log_controller_line(inner, &utt.text, who, Instant::now());

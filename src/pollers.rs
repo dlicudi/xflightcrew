@@ -128,6 +128,11 @@ pub(crate) fn queue_command(tx: &std::sync::mpsc::Sender<String>, text: String) 
     true
 }
 
+/// Held by a test that stamps lines on the channel ([`QUEUED`] is
+/// process-wide): the panel's and the EFB's tests share it.
+#[cfg(test)]
+pub(crate) static QUEUE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// Is a pilot's line waiting for the command loop?
 pub(crate) fn command_waiting() -> bool {
     !queued().is_empty()
@@ -718,6 +723,7 @@ mod tests {
     /// waits through this, not through the unconditional `Voice::say`.
     #[test]
     fn a_line_on_the_channel_is_seen_waiting_and_timed() {
+        let _q = QUEUE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let (tx, rx) = std::sync::mpsc::channel::<String>();
         assert!(!command_waiting());
         assert!(queue_command(&tx, "recover the aircraft".into()));
