@@ -36,6 +36,10 @@ const ENGN_RUNNING: &str = "sim/flightmodel/engine/ENGN_running";
 /// Throttle a mission give-up hands the aircraft back with — autoland's own
 /// number, for the same reason: enough to hold level flight dirty.
 const GIVE_UP_THROTTLE: f64 = 0.75;
+/// Any bus above this reads live after the battery commands: the readback
+/// that lets "Battery's on." be said (a 12 volt system's battery reads
+/// about 12, a 24 volt one's about 24; a dead bus 0).
+const BUS_LIVE_VOLTS: f64 = 8.0;
 const COM1_FREQ_KHZ: &str = crate::datarefs::COM1_FREQ_KHZ;
 
 /// True while the full-auto orchestrator runs.
@@ -451,20 +455,19 @@ pub(crate) fn event(stage: &str, detail: serde_json::Value) {
 /// (2026-08-01). A profile that doesn't declare the key simply errors and is
 /// ignored, so an airframe with no beacon is not a failed departure.
 async fn light(tools: &SubTools, ctx: &ToolCtx<'_>, key: &str, on: bool) -> bool {
-    use crate::tools::Tool;
-    // Declared first: the tool answers an unknown light with an Ok QUESTION
-    // ("I didn't catch which light..."), which is right for a misheard pilot
-    // and a lie under `.is_ok()` — the SR22, SF50 and Lancair have no beacon,
-    // and full auto announced "Beacon on" and blackboxed switches it never
-    // touched on all three (audit, 2026-08-02).
-    if !tools.lights.declares(key) {
-        return false;
-    }
-    tools
-        .lights
-        .execute(&json!({ "light": key, "on": on }), ctx)
-        .await
-        .is_ok()
+    light_state(tools, ctx, key, on).await == Some(true)
+}
+
+/// A light driven and READ BACK (`SetLights::switch`): `None` when the
+/// airframe declares no such light or the readback failed, `Some(false)`
+/// when the switch did not take. The tool's reply used to be the test, and
+/// it answers an unknown light with an Ok QUESTION ("I didn't catch which
+/// light...") and a switch that did not move with an Ok "didn't move", both
+/// counted as done under `.is_ok()`: the SR22, SF50 and Lancair have no
+/// beacon, and full auto announced "Beacon on" on all three (audit,
+/// 2026-08-02).
+async fn light_state(tools: &SubTools, ctx: &ToolCtx<'_>, key: &str, on: bool) -> Option<bool> {
+    tools.lights.switch(ctx.xplane, key, on).await
 }
 
 /// A mission's sortie in the blackbox: begun at the mission's start, ended
@@ -1945,15 +1948,30 @@ async fn fly(xp: XPlaneClient, config: Config, voice: Option<Voice>, tools: SubT
             for cmd in &tools.bus_power_on_cmds {
                 let _ = xp.run_command(cmd).await;
             }
-            // The one ramp line said at every chatter; the beat is the
-            // bus coming alive (it used to be a flat 600 ms).
-            if !crate::crew_pace::items_spoken(crate::persona::chatter()) {
-                announce(&voice, Priority::Advisory, "Battery on.");
+            // The beat is the bus coming alive (it used to be a flat 600
+            // ms); then the volts are the readback. The one ramp line said
+            // in both modes, and only once the bus reads live.
+            crate::crew_pace::pause(crate::crew_pace::beat_ms()).await;
+            let live = xp
+                .get_float_array(crate::datarefs::BUS_VOLTS)
+                .await
+                .ok()
+                .map(|v| v.iter().any(|b| *b > BUS_LIVE_VOLTS));
+            match live {
+                Some(true) => crate::crew_pace::milestone(voice.as_ref(), "Battery's on.").await,
+                other => {
+                    crate::crew_pace::checked(
+                        voice.as_ref(),
+                        other,
+                        "Battery's on.",
+                        "The battery didn't come on.",
+                    )
+                    .await
+                }
             }
-            crate::crew_pace::item(voice.as_ref(), "Battery, on.").await;
             event(
                 "bus_power",
-                json!({ "cmds": tools.bus_power_on_cmds.len() }),
+                json!({ "cmds": tools.bus_power_on_cmds.len(), "live": live }),
             );
             bail_if_abort!();
         }
@@ -1962,42 +1980,71 @@ async fn fly(xp: XPlaneClient, config: Config, voice: Option<Voice>, tools: SubT
         // is the one light with an actual safety job on a ramp. Nav lights with
         // it, since they belong on whenever the master is.
         // One item at a time, at a person's pace (`crew_pace`): the whole
-        // ramp used to be done in the same second.
-        let beacon = light(&tools, &ctx, "beacon", true).await;
-        if beacon {
-            crate::crew_pace::item(voice.as_ref(), "Beacon, on.").await;
+        // ramp used to be done in the same second. Each is called only once
+        // its switch READ BACK on, and named when it did not take.
+        let beacon_state = light_state(&tools, &ctx, "beacon", true).await;
+        let beacon = beacon_state == Some(true);
+        if tools.lights.declares("beacon") {
+            crate::crew_pace::checked(
+                voice.as_ref(),
+                beacon_state,
+                "Beacon on.",
+                "The beacon did not come on.",
+            )
+            .await;
         }
-        if light(&tools, &ctx, "nav", true).await {
-            crate::crew_pace::item(voice.as_ref(), "Nav lights, on.").await;
+        if tools.lights.declares("nav") {
+            let nav = light_state(&tools, &ctx, "nav", true).await;
+            crate::crew_pace::checked(
+                voice.as_ref(),
+                nav,
+                "Nav lights on.",
+                "Nav lights did not come on.",
+            )
+            .await;
         }
         // Panel lighting with them. The bus is live and the pilot is about to
-        // be asked to read instruments.
+        // be asked to read instruments. The tool's Ok is not a readback: the
+        // switch is read back here.
         {
             use crate::tools::Tool;
-            let lit = tools
+            let sent = tools
                 .flood
                 .execute(&json!({ "on": true }), &ctx)
                 .await
                 .is_ok();
+            let lit = if sent {
+                tools.flood.read_on(&xp).await
+            } else {
+                Some(false)
+            };
             event("lights_panel", json!({ "on": lit }));
-            if lit {
-                crate::crew_pace::item(voice.as_ref(), "Panel lights, on.").await;
-            }
+            crate::crew_pace::checked(
+                voice.as_ref(),
+                lit,
+                "Panel lights on.",
+                "Panel lights did not come on.",
+            )
+            .await;
         }
-        event("lights_beacon", json!({ "beacon": beacon }));
+        event("lights_beacon", json!({ "beacon": beacon_state }));
         // Seat belt signs on before anything turns (see `tools::signs`).
         if let Some(ok) = crate::tools::signs::set(&xp, true).await {
             event("seat_belt_signs", json!({ "on": true, "ok": ok }));
-            if ok {
-                crate::crew_pace::item(voice.as_ref(), "Seat belt signs, on.").await;
-            }
+            crate::crew_pace::checked(
+                voice.as_ref(),
+                Some(ok),
+                "Seat belt signs on.",
+                "The seat belt signs did not come on.",
+            )
+            .await;
         }
         // Only claim the beacon on an airframe that has one — the Lancair's
         // switch row is NAV / LAND / STRB and nothing else.
         announce(
             &voice,
             Priority::Advisory,
-            if beacon && !crate::crew_pace::items_spoken(crate::persona::chatter()) {
+            if beacon && !crate::crew_pace::items_spoken() {
                 crate::readback::one_of(&[
                     "Beacon on. Starting the engine.",
                     "Beacon's on, spinning up the engine.",
@@ -2017,7 +2064,36 @@ async fn fly(xp: XPlaneClient, config: Config, voice: Option<Voice>, tools: SubT
         // The starter cranks before it catches — for seconds on a piston, for
         // minutes on the jet's two-engine bleed-air sequence.
         waiting("the engine to catch");
-        if !wait_until(tools.engine_start_secs, 500, || engine_running(&xp)).await {
+        // A scripted start (the 737's) is WATCHED by its tool
+        // (`tools::scripted_start`): its verdict ends the wait, an abort at
+        // once, where the class deadline waited five minutes on a sequence
+        // that had stopped at 25% N2 (2026-10-06 09:11Z). Every other start,
+        // and a watch that timed out or stood down, is judged on the engine.
+        let started = wait_until(tools.engine_start_secs, 500, || async {
+            use crate::tools::scripted_start::{state, WatchState};
+            match state() {
+                WatchState::Watching => false,
+                WatchState::Aborted => true,
+                WatchState::Running | WatchState::Idle => engine_running(&xp).await,
+            }
+        })
+        .await;
+        if crate::tools::scripted_start::state()
+            == crate::tools::scripted_start::WatchState::Aborted
+            && !ABORT.load(SeqCst)
+        {
+            // The watch has said why; this is the hand back.
+            give_up(
+                &xp,
+                tools.taxi.park_brake_valve_set,
+                &voice,
+                "I've stopped. Your aircraft.",
+                "start_aborted",
+            )
+            .await;
+            return;
+        }
+        if !started {
             give_up(
                 &xp,
                 tools.taxi.park_brake_valve_set,

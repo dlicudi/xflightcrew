@@ -28,6 +28,8 @@ const FUEL_PUMP: &str = "sim/cockpit2/engine/actuators/fuel_pump_on";
 const IGNITION_KEY: &str = "sim/cockpit2/engine/actuators/ignition_key"; // 0 off,1 R,2 L,3 both,4 start
                                                                          // Per-engine magneto selector (0 off,1 R,2 L,3 both) — for radials whose mags
                                                                          // aren't the single `ignition_key` (e.g. the DC-3, one selector per engine).
+/// The avionics master's position, the readback for `sim/systems/avionics_on`.
+const AVIONICS_POWER: &str = "sim/cockpit2/switches/avionics_power_on";
 const IGNITION_ON: &str = "sim/cockpit/engine/ignition_on";
 const CARB_HEAT: &str = "sim/cockpit2/engine/actuators/carb_heat_ratio"; // 0 cold .. 1 hot
 
@@ -899,7 +901,29 @@ impl Tool for StartEngine {
                 }
                 if let Some(pos) = target {
                     ctx.xplane.run_command(&pos.command).await?;
-                    fuel_note = format!("fuel selector was off, now {}, ", pos.spoken);
+                    // Claimed only once the selector READS the tank: a
+                    // command that did not land is named, never "now both".
+                    let landed = match (&fs.readback, pos.value) {
+                        (Some(dref), Some(want)) => ctx
+                            .xplane
+                            .get_float(dref)
+                            .await
+                            .ok()
+                            .map(|v| (v - want).abs() < 0.5),
+                        _ => None,
+                    };
+                    match landed {
+                        Some(true) => {
+                            fuel_note = format!("fuel selector was off, now {}, ", pos.spoken)
+                        }
+                        Some(false) => {
+                            return Ok(format!(
+                                "The fuel selector is off and didn't move to {}. Check it before I crank.",
+                                pos.spoken
+                            ));
+                        }
+                        None => {}
+                    }
                 }
             }
         }
@@ -928,16 +952,54 @@ impl Tool for StartEngine {
         // and at a person's pace (`crew_pace`): all three used to land in
         // the same few milliseconds.
         let voice = ctx.voice;
+        // Each called only once it READS back (`crew_pace::checked`): a
+        // switch that did not take is named in both modes.
         if !fuel_note.is_empty() {
-            crate::crew_pace::item(voice, &format!("Fuel, {}.", fuel_note.trim_end_matches(", "))).await;
+            let note = fuel_note.trim_end_matches(", ");
+            let mut c = note.chars();
+            let note = match c.next() {
+                Some(f) => format!("{}{}.", f.to_uppercase(), c.as_str()),
+                None => String::new(),
+            };
+            crate::crew_pace::checked(voice, Some(true), &note, &note).await;
         }
-        ctx.xplane.set_float(&crate::aircraft::throttle_dataref(), 0.1).await?; // crack the throttle
-        crate::crew_pace::item(voice, "Throttle, cracked.").await;
+        let throttle = crate::aircraft::throttle_dataref();
+        ctx.xplane.set_float(&throttle, 0.1).await?; // crack the throttle
+        let cracked = ctx
+            .xplane
+            .get_float(&throttle)
+            .await
+            .ok()
+            .map(|v| (v - 0.1).abs() < 0.05);
+        crate::crew_pace::checked(
+            voice,
+            cracked,
+            "Throttle cracked.",
+            "The throttle didn't move.",
+        )
+        .await;
         ctx.xplane.set_float(MIXTURE, 1.0).await?; // full rich
-        crate::crew_pace::item(voice, "Mixture, full rich.").await;
+        let rich = ctx.xplane.get_float(MIXTURE).await.ok().map(|v| v >= 0.95);
+        crate::crew_pace::checked(
+            voice,
+            rich,
+            "Mixture full rich.",
+            "The mixture didn't go rich.",
+        )
+        .await;
         ctx.xplane.run_command(CMD_MAGS_BOTH).await?;
-        crate::crew_pace::item(voice, "Mags, both.").await;
-        crate::crew_pace::item(voice, "Clear prop!").await;
+        let mags = ctx
+            .xplane
+            .get_float_array(IGNITION_KEY)
+            .await
+            .ok()
+            .and_then(|k| {
+                let k: Vec<f64> = k.into_iter().take(engines).collect();
+                (k.len() == engines).then(|| k.iter().all(|v| v.round() as i64 == 3))
+            });
+        crate::crew_pace::checked(voice, mags, "Mags both.", "The mags didn't go to both.").await;
+        // The one call a pilot makes aloud before any crank, in both modes.
+        crate::crew_pace::milestone(voice, "Clear prop!").await;
         crate::crew_pace::pause(crate::crew_pace::CLEAR_PROP_MS).await;
 
         // Crank each DEAD engine in turn, one starter at a time (they share a
@@ -971,9 +1033,16 @@ impl Tool for StartEngine {
                 // when this only fired generator 1), so we charge the bus
                 // instead of draining the battery (and so the monitor doesn't
                 // immediately call out an offline alternator).
-                crate::crew_pace::item(
+                // Read back already: every cranked engine reads running.
+                crate::crew_pace::checked(
                     voice,
-                    if engines > 1 { "Engines running, oil pressure rising." } else { "Engine running, oil pressure rising." },
+                    Some(true),
+                    if engines > 1 {
+                        "Engines running."
+                    } else {
+                        "Engine running."
+                    },
+                    "",
                 )
                 .await;
                 let n_alts = if self.alternator_on_cmds.is_empty() {
@@ -991,12 +1060,18 @@ impl Tool for StartEngine {
                     .await
                     .unwrap_or_default();
                 let alt_on = gens.len() >= n_alts && gens.iter().take(n_alts).all(|g| *g > 0.5);
-                crate::crew_pace::item(
+                crate::crew_pace::checked(
                     voice,
-                    match (alt_on, n_alts > 1) {
-                        (true, true) => "Alternators, on.",
-                        (true, false) => "Alternator, on.",
-                        (false, _) => "Alternator did not come on.",
+                    Some(alt_on),
+                    if n_alts > 1 {
+                        "Alternators on."
+                    } else {
+                        "Alternator on."
+                    },
+                    if n_alts > 1 {
+                        "Alternators did not come on."
+                    } else {
+                        "Alternator did not come on."
                     },
                 )
                 .await;
@@ -1013,11 +1088,25 @@ impl Tool for StartEngine {
                     .run_command("sim/systems/avionics_on")
                     .await
                     .is_ok();
-                if avionics_on {
-                    crate::crew_pace::item(voice, "Avionics, on.").await;
-                }
+                // The command's Ok is not a readback: the master is read.
+                let avionics_read = if avionics_on {
+                    ctx.xplane
+                        .get_float(AVIONICS_POWER)
+                        .await
+                        .ok()
+                        .map(|v| v > 0.5)
+                } else {
+                    Some(false)
+                };
+                crate::crew_pace::checked(
+                    voice,
+                    avionics_read,
+                    "Avionics on.",
+                    "Avionics did not come on.",
+                )
+                .await;
                 // Called item by item already: the closing line is the result.
-                if crate::crew_pace::items_spoken(crate::persona::chatter()) {
+                if crate::crew_pace::items_spoken() {
                     return Ok(if alt_on {
                         "Start complete.".to_string()
                     } else {

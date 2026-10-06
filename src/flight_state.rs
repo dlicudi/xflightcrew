@@ -59,6 +59,9 @@ pub(crate) fn publish_airframe(p: &AircraftProfile) {
     crate::autotakeoff::publish_takeoff_power(p.takeoff_power.clone());
     crate::autotakeoff::publish_gear_warning(p.gear_warning);
     crate::tools::signs::publish(p.seat_belt_signs.clone(), p.cabin_crew);
+    // A scripted start's verdict (an abort latched the last load) is the
+    // last airframe's.
+    crate::tools::scripted_start::forget();
     crate::circuit::publish_ap_altitude_capture(p.ap_altitude_capture);
     crate::tools::lights::publish_exterior(&p.lights);
     crate::aircraft::publish_throttle_dataref(p.throttle_dataref.clone());

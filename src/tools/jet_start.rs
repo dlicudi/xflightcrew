@@ -446,7 +446,7 @@ impl Tool for StopEngines {
 pub struct ScriptedAutoStart;
 
 const CMD_AUTO_START: &str = "sim/operation/auto_start";
-const AUTO_START_IN_PROGRESS: &str = "sim/flightmodel2/misc/auto_start_in_progress";
+const AUTO_START_IN_PROGRESS: &str = super::scripted_start::AUTO_START_IN_PROGRESS;
 
 #[async_trait]
 impl Tool for ScriptedAutoStart {
@@ -462,30 +462,99 @@ impl Tool for ScriptedAutoStart {
         json!({ "type": "object", "properties": {} })
     }
     async fn execute(&self, _args: &Value, ctx: &ToolCtx<'_>) -> Result<String> {
+        use super::scripted_start::{self as watch, WatchState};
+        let engines = crate::aircraft::live_profile()
+            .map(|p| p.engines)
+            .unwrap_or(2)
+            .max(1);
         let running = ctx
             .xplane
             .get_float_array(ENGN_RUNNING)
             .await
-            .map(|v| v.iter().take(2).all(|r| *r > 0.5))
+            .map(|v| v.len() >= engines && v.iter().take(engines).all(|r| *r > 0.5))
             .unwrap_or(false);
         if running {
             return Ok("Engines are already running.".to_string());
         }
-        if ctx
+        let in_progress = ctx
             .xplane
             .get_float(AUTO_START_IN_PROGRESS)
             .await
             .unwrap_or(0.0)
-            > 0.5
-        {
-            return Ok("The start sequence is already running.".to_string());
+            > 0.5;
+        if in_progress {
+            // The script's flag survives its own abort, and then every
+            // later `auto_start` is ignored (2026-10-06 09:11Z: a retry was
+            // answered "The start sequence is already running." of a
+            // sequence that had stopped). A watch that called the abort
+            // knows; otherwise two samples a moment apart decide whether
+            // anything is moving, and the watch takes it from there.
+            if watch::state() == WatchState::Aborted {
+                crate::blackbox::record(
+                    "scripted_start",
+                    json!({ "event": "latched_at_arm", "known": true }),
+                );
+                return Ok(watch::RELOAD_LINE.to_string());
+            }
+            let a = watch::read_sample(ctx.xplane, 0.0).await;
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            let b = watch::read_sample(ctx.xplane, 2.0).await;
+            let moving = match (&a, &b) {
+                (Some(a), Some(b)) => watch::Watcher::moved(a, b, engines),
+                _ => false,
+            };
+            crate::blackbox::record(
+                "scripted_start",
+                json!({ "event": "in_progress_at_arm", "moving": moving }),
+            );
+            spawn_watch(ctx, engines, true);
+            return Ok(if moving {
+                "The aircraft's start is already under way. I'll call it as it goes."
+            } else {
+                "The aircraft's start sequence shows nothing turning. I'm watching it; \
+                 if nothing moves it needs the aircraft reloaded."
+            }
+            .to_string());
         }
         ctx.xplane.run_command(CMD_AUTO_START).await?;
+        spawn_watch(ctx, engines, false);
         Ok(
             "Running the aircraft's own start sequence. About two minutes to both engines."
                 .to_string(),
         )
     }
+}
+
+/// The scripted start's watch on its own thread (a tool's follow-up is a
+/// std::thread, never a `tokio::spawn`), owning the jet start's run so a
+/// stand-down or a second start stops it. Its verdict is published as
+/// `Watching` before this returns, so full auto's wait never reads a stale
+/// one.
+fn spawn_watch(ctx: &ToolCtx<'_>, engines: usize, joined: bool) {
+    use super::scripted_start as watch;
+    watch::publish(watch::WatchState::Watching);
+    let lease = JET_START.take_over();
+    let base = ctx.config.xplane_base_url.clone();
+    let voice = ctx.voice.cloned();
+    std::thread::spawn(move || {
+        let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        else {
+            watch::publish(watch::WatchState::Idle);
+            return;
+        };
+        rt.block_on(async move {
+            let xp = XPlaneClient::new(base).with_cancel(lease.cancel.clone());
+            let out = watch::run(&xp, engines, voice.as_ref(), joined, || lease.live()).await;
+            // Stood down (still ours, cancelled): no watch any more. Taken
+            // over by a new start: its verdict is the new watch's.
+            if out.is_none() && lease.current() && watch::state() == watch::WatchState::Watching {
+                watch::publish(watch::WatchState::Idle);
+            }
+            drop(lease);
+        });
+    });
 }
 
 // ---- The airliner start: ENG MODE + guarded master switches -----------------

@@ -42,6 +42,7 @@ pub mod reminder;
 pub mod reverse;
 pub mod setup;
 pub mod setup_enroute;
+pub mod scripted_start;
 pub mod signs;
 pub mod speedhold;
 pub mod takeoff;
